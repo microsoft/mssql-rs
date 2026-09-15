@@ -1,8 +1,6 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-use std::slice;
-
 use crate::api::odbc_types::{
     SQL_NTS, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlInteger, SqlReturn, SqlSmallInt, SqlWChar,
 };
@@ -124,6 +122,9 @@ pub(crate) unsafe fn read_utf16(ptr: *const SqlWChar, length: SqlSmallInt) -> St
 /// as an empty value rather than faulting: this is an FFI boundary, and a
 /// driver that aborts takes its host process down with it.
 ///
+/// Application buffers need not be aligned for `SqlWChar`; read each unit
+/// without forming a slice over the caller's memory.
+///
 /// # Safety
 /// - `ptr` must be readable for `length` `SQLWCHAR`s, or up to and including the
 ///   first NUL terminator when `length == SQL_NTS`.
@@ -133,21 +134,23 @@ pub(crate) unsafe fn read_utf16_long(ptr: *const SqlWChar, length: SqlInteger) -
     if ptr.is_null() {
         return String::new();
     }
-    let slice = if length == SqlInteger::from(SQL_NTS) {
+    let len = if length == SqlInteger::from(SQL_NTS) {
         let mut len = 0usize;
-        unsafe {
-            while *ptr.add(len) != 0 {
-                len += 1;
-            }
+        while unsafe { ptr.add(len).read_unaligned() } != 0 {
+            len += 1;
         }
-        unsafe { slice::from_raw_parts(ptr, len) }
+        len
     } else {
         match usize::try_from(length) {
             Ok(0) | Err(_) => return String::new(),
-            Ok(len) => unsafe { slice::from_raw_parts(ptr, len) },
+            Ok(len) => len,
         }
     };
-    String::from_utf16_lossy(slice)
+    // The length or terminating NUL bounds every read; alignment is not required.
+    let units = (0..len).map(|index| unsafe { ptr.add(index).read_unaligned() });
+    char::decode_utf16(units)
+        .map(|character| character.unwrap_or(char::REPLACEMENT_CHARACTER))
+        .collect()
 }
 
 /// Read a character connection attribute, whose `StringLength` ODBC defines in
@@ -371,7 +374,7 @@ mod tests {
         copy_utf16_with_nul, copy_with_nul, read_utf16, read_utf16_attr, read_utf16_long,
         rewrite_param_markers, write_if_some,
     };
-    use crate::api::odbc_types::{SQL_NTS, SqlInteger, SqlWChar};
+    use crate::api::odbc_types::{SQL_NTS, SqlInteger, SqlSmallInt, SqlWChar};
 
     mod memory_safety {
         use super::*;
@@ -467,19 +470,61 @@ mod tests {
 
         #[test]
         fn utf16_reads_stop_at_the_initialized_extent() {
-            let mut storage = [MaybeUninit::<u16>::uninit(); 4];
-            storage[0].write(u16::from(b'a'));
-            storage[1].write(0);
-            let ptr = storage.as_ptr().cast::<u16>();
-            for _ in 0..2 {
+            for offset in [0, 1] {
+                let mut storage = AlignedBuffer([MaybeUninit::<u8>::uninit(); 8]);
+                let ptr = storage.0.as_mut_ptr().wrapping_add(offset).cast::<u16>();
+                assert_eq!(ptr.is_aligned(), offset == 0);
                 // Two initialized units, including the terminator; the tail is unreadable.
                 unsafe {
-                    assert_eq!(read_utf16(ptr, SQL_NTS), "a");
-                    assert_eq!(read_utf16_long(ptr, SqlInteger::from(SQL_NTS)), "a");
-                    assert_eq!(read_utf16_attr(ptr, SqlInteger::from(SQL_NTS)), "a");
-                    assert_eq!(read_utf16(ptr, 2), "a\0");
-                    assert_eq!(read_utf16_long(ptr, 2), "a\0");
-                    assert_eq!(read_utf16_attr(ptr, 4), "a\0");
+                    ptr.write_unaligned(u16::from(b'a'));
+                    ptr.add(1).write_unaligned(0);
+                }
+                for _ in 0..2 {
+                    unsafe {
+                        assert_eq!(read_utf16(ptr, SQL_NTS), "a");
+                        assert_eq!(read_utf16_long(ptr, SqlInteger::from(SQL_NTS)), "a");
+                        assert_eq!(read_utf16_attr(ptr, SqlInteger::from(SQL_NTS)), "a");
+                        assert_eq!(read_utf16(ptr, 2), "a\0");
+                        assert_eq!(read_utf16_long(ptr, 2), "a\0");
+                        assert_eq!(read_utf16_attr(ptr, 4), "a\0");
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn utf16_readers_preserve_lossy_decoding_at_both_alignments() {
+            const UNITS: [u16; 9] = [0x61, 0xD83D, 0xDE00, 0xD800, 0x62, 0xDC00, 0, 0x63, 0];
+            for offset in [0, 1] {
+                let mut storage = AlignedBuffer([0u8; UNITS.len() * 2 + 2]);
+                for (index, unit) in UNITS.iter().enumerate() {
+                    let start = offset + index * 2;
+                    storage.0[start..start + 2].copy_from_slice(&unit.to_ne_bytes());
+                }
+                let ptr = storage.0.as_ptr().wrapping_add(offset).cast::<SqlWChar>();
+                assert_eq!(ptr.is_aligned(), offset == 0);
+                for length in 0..=UNITS.len() {
+                    let expected = String::from_utf16_lossy(&UNITS[..length]);
+                    let chars = SqlSmallInt::try_from(length).unwrap();
+                    let bytes = SqlInteger::try_from(length * 2).unwrap();
+                    // Every declared byte is initialized, including the odd trailing byte.
+                    unsafe {
+                        assert_eq!(read_utf16(ptr, chars), expected);
+                        assert_eq!(read_utf16_long(ptr, SqlInteger::from(chars)), expected);
+                        assert_eq!(read_utf16_attr(ptr, bytes), expected);
+                        assert_eq!(read_utf16_attr(ptr, bytes + 1), expected);
+                    }
+                }
+                unsafe {
+                    assert_eq!(read_utf16(ptr, SQL_NTS), "a\u{1f600}\u{fffd}b\u{fffd}");
+                    assert_eq!(
+                        read_utf16_long(ptr, SqlInteger::from(SQL_NTS)),
+                        "a\u{1f600}\u{fffd}b\u{fffd}"
+                    );
+                    assert_eq!(
+                        read_utf16_attr(ptr, SqlInteger::from(SQL_NTS)),
+                        "a\u{1f600}\u{fffd}b\u{fffd}"
+                    );
                 }
             }
         }

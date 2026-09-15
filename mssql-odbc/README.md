@@ -54,7 +54,8 @@ modules and the parameter reader's existing misalignment tests. They cover
 unaligned values and indicators, initialized read extents, string terminators
 and capacities, fixed-width writes, untouched error outputs, and reuse of caller
 buffers. They also run as ordinary unit tests; no production code is replaced
-under Miri.
+under Miri. The UTF-16 reader cases check both aligned and byte-offset input,
+preserving lossy decoding, explicit lengths, and NUL termination.
 
 From the repository root, with `cargo-nextest` installed:
 
