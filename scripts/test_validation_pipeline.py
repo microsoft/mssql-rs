@@ -93,6 +93,11 @@ def test_mssql_python_odbc_failures_fail_the_job():
     assert "continueOnError" not in test_step
     assert 'exit "$rc"' in test_step["script"]
     assert "task.complete result=SucceededWithIssues" not in test_step["script"]
+    runner = (_ROOT / ".pipeline" / "scripts" / "run-mssql-python-odbc-tests.sh").read_text(
+        encoding="utf-8"
+    )
+    assert "propagates every nonzero exit code" in runner
+    assert "reports it as a warning" not in runner
 
 
 @pytest.mark.parametrize("architecture", ["x64", "ARM64"])

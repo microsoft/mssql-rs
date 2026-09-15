@@ -36,13 +36,11 @@
 # Exit codes:
 #   0  every file passed.
 #   1  tests ran but the run was not clean - failures, crashes, timeouts, or
-#      files skipped because the time budget ran out. This is the expected
-#      baseline while the Rust driver is under development, so the calling step
-#      reports it as a warning (yellow) rather than failing the job.
+#      files skipped because the time budget ran out.
 #   2  the harness itself could not run the tests (broken venv, missing
-#      interpreter, or a run in which no file executed a single test) - the
-#      calling step turns this into a real pipeline error, since it says
-#      nothing about the driver.
+#      interpreter, or a run in which no file executed a single test).
+# The calling step propagates every nonzero exit code, so either failure mode
+# fails the pipeline job.
 
 # No `set -e`: a failing or crashing test file must not abort the loop.
 set -uo pipefail
