@@ -11,10 +11,9 @@
 # binary, which is what its own pipeline effectively does when it uninstalls the
 # system driver before testing.
 #
-# The Rust driver is incomplete, so failures and hard crashes are expected. The
-# test step inspects the runner's exit code directly - test failures surface as
-# SucceededWithIssues (yellow) while a broken harness is a real error - and every
-# test file runs in its own bounded pytest process
+# The test step propagates the runner's exit code, so test failures, hard crashes,
+# and a broken harness all fail the job. Every test file runs in its own bounded
+# pytest process
 # (run-mssql-python-odbc-tests.sh), so the job reports results instead of
 # stalling or losing the whole run to one segfault.
 

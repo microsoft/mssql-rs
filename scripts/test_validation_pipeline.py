@@ -84,7 +84,9 @@ def test_alpine_gssapi_compilation_still_runs_on_prs():
 
 
 def test_mssql_python_odbc_failures_fail_the_job():
-    steps = load_template("test-mssql-python-odbc-template.yml")["steps"]
+    template_path = _TEMPLATES / "test-mssql-python-odbc-template.yml"
+    template = template_path.read_text(encoding="utf-8")
+    steps = yaml.safe_load(template)["steps"]
     test_step = next(
         step
         for step in steps
@@ -93,6 +95,7 @@ def test_mssql_python_odbc_failures_fail_the_job():
     assert "continueOnError" not in test_step
     assert 'exit "$rc"' in test_step["script"]
     assert "task.complete result=SucceededWithIssues" not in test_step["script"]
+    assert "SucceededWithIssues" not in template
     runner = (_ROOT / ".pipeline" / "scripts" / "run-mssql-python-odbc-tests.sh").read_text(
         encoding="utf-8"
     )
