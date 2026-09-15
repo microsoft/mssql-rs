@@ -25,7 +25,7 @@ use crate::api::type_rules::{canonical_c_type, is_valid_c_type};
 use crate::error::free_errors;
 use crate::handles::bindings::{BindingError, owned_descriptor};
 use crate::handles::dbc::DbcState;
-use crate::handles::stmt::{ColumnBinding, STMT_STATE_FETCH_IN_PROGRESS};
+use crate::handles::stmt::ColumnBinding;
 use crate::handles::{HandleType, StmtHandle};
 
 /// Implements SQLBindCol.
@@ -122,7 +122,7 @@ fn sql_bind_col_safe(
 
         // A fetch in flight is reading through the ARD it snapshotted, so
         // rebinding now could free a buffer mid-read.
-        if stmt_state.has_state(STMT_STATE_FETCH_IN_PROGRESS) || stmt.row_binding_use.is_active() {
+        if stmt.row_binding_use.is_active() {
             error!("SQLBindCol: a fetch is in progress on this statement");
             post_diag(&mut stmt_state, ERR_FUNCTION_SEQUENCE);
             return SQL_ERROR;
@@ -290,7 +290,7 @@ fn sql_free_stmt_unbind_safe(stmt: &StmtHandle) -> SqlReturn {
             return SQL_ERROR;
         };
         free_errors(&mut stmt_state);
-        if stmt_state.has_state(STMT_STATE_FETCH_IN_PROGRESS) || stmt.row_binding_use.is_active() {
+        if stmt.row_binding_use.is_active() {
             error!("SQLFreeStmt(SQL_UNBIND): a fetch is in progress on this statement");
             post_diag(&mut stmt_state, ERR_FUNCTION_SEQUENCE);
             return SQL_ERROR;
@@ -324,7 +324,6 @@ mod tests {
         SQL_C_CHAR, SQL_C_DATE, SQL_C_DEFAULT, SQL_C_INTERVAL_YEAR, SQL_C_NUMERIC, SQL_C_SLONG,
         SQL_C_TIME, SQL_C_TIMESTAMP, SQL_C_TYPE_DATE, SQL_C_TYPE_TIME, SQL_C_TYPE_TIMESTAMP,
     };
-    use crate::handles::stmt::STMT_STATE_FETCH_IN_PROGRESS;
     use crate::handles::{DescHandle, handle_from_raw};
     use crate::test_support::TestHandles;
 
@@ -666,12 +665,11 @@ mod tests {
     #[test]
     fn binding_is_refused_while_a_fetch_is_in_progress() {
         let h = TestHandles::with_env_dbc_stmt();
-        {
-            let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
-            let stmt = &*stmt_owner;
-            let mut s = stmt.inner.lock().unwrap();
-            s.set_state(STMT_STATE_FETCH_IN_PROGRESS);
-        }
+        let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let row_use = {
+            let gate = stmt.parent_dbc().inner.lock().unwrap();
+            stmt.row_binding_use.acquire(&gate).unwrap()
+        };
         let mut buf = [0i32; 1];
         let rc = unsafe {
             sql_bind_col(
@@ -688,6 +686,8 @@ mod tests {
 
         assert_eq!(unsafe { sql_free_stmt_unbind(h.stmt) }, SQL_ERROR);
         assert_eq!(last_state(&h), *b"HY010");
+        drop(row_use);
+        assert_eq!(unsafe { sql_free_stmt_unbind(h.stmt) }, SQL_SUCCESS);
     }
 
     #[test]

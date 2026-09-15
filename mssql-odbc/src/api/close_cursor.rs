@@ -14,7 +14,10 @@ use crate::api::odbc_types::{
     SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle, SqlReturn,
 };
 use crate::error::free_errors;
-use crate::handles::stmt::{STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT};
+use crate::handles::bindings::{BindingError, BindingUseGuard};
+use crate::handles::stmt::{
+    STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT, STMT_STATE_EXEC_STARTED,
+};
 use crate::handles::{HandleType, StmtHandle, get_handle, process_is_shutting_down};
 
 /// Closes the cursor on `statement_handle` and discards any pending rows.
@@ -60,6 +63,10 @@ unsafe fn sql_close_cursor_impl(statement_handle: SqlHandle) -> SqlReturn {
 }
 
 fn sql_close_cursor_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn {
+    let _result_use = match claim_result_use(stmt) {
+        Ok(guard) => guard,
+        Err(rc) => return rc,
+    };
     let Ok(mut stmt_state) = stmt.inner.lock() else {
         error!("SQLCloseCursor: stmt mutex poisoned");
         return SQL_ERROR;
@@ -129,6 +136,10 @@ unsafe fn sql_free_stmt_close_impl(statement_handle: SqlHandle) -> SqlReturn {
 }
 
 fn sql_free_stmt_close_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn {
+    let _result_use = match claim_result_use(stmt) {
+        Ok(guard) => guard,
+        Err(rc) => return rc,
+    };
     let Ok(mut stmt_state) = stmt.inner.lock() else {
         error!("SQLFreeStmt(SQL_CLOSE): stmt mutex poisoned");
         return SQL_ERROR;
@@ -172,6 +183,38 @@ fn sql_free_stmt_close_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> S
             }
         }
     }
+}
+
+/// Public row read/close/advance must exclude fetch and input staging through the
+/// entire operation, not merely check idleness before releasing the DBC gate.
+pub(super) fn claim_result_use(stmt: &StmtHandle) -> Result<BindingUseGuard, SqlReturn> {
+    let claim = (|| {
+        let gate = stmt
+            .parent_dbc()
+            .inner
+            .lock()
+            .map_err(|_| BindingError::Poisoned)?;
+        let mut state = stmt.inner.lock().map_err(|_| BindingError::Poisoned)?;
+        free_errors(&mut state);
+        if state.has_state(STMT_STATE_EXEC_STARTED) {
+            return Err(BindingError::InUse);
+        }
+        stmt.row_binding_use.ensure_idle(&gate)?;
+        stmt.param_binding_use.ensure_idle(&gate)?;
+        stmt.row_binding_use.acquire(&gate)
+    })();
+    let claim = claim.map_err(|error| {
+        crate::error::diag::with_diagnostics(&stmt.inner, |records| {
+            free_errors(records);
+            error.post(records)
+        })
+    })?;
+    #[cfg(test)]
+    crate::handles::bindings::snapshot_test_hook::pause(
+        stmt,
+        crate::handles::bindings::snapshot_test_hook::Phase::ResultOperation,
+    );
+    Ok(claim)
 }
 
 /// Closes the cursor on a statement as part of a *connection*-scoped operation

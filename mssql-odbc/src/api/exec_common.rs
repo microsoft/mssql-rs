@@ -648,11 +648,30 @@ pub(super) struct ParameterBindingLease {
 pub(super) struct ParameterSnapshot {
     pub(super) records: Vec<Option<BoundParam>>,
     pub(super) lease: ParameterBindingLease,
+    pub(super) key: crate::handles::bindings::ParameterBindingKey,
 }
 
 /// The lease protects application pointers until conversion has materialized
 /// them, not merely until the descriptor records have been copied.
 pub(super) fn snapshot_bound_params(stmt: &StmtHandle) -> Result<ParameterSnapshot, SqlReturn> {
+    snapshot_params(stmt, ParameterUse::Input)
+}
+
+/// Output delivery runs beneath the caller's result-operation or execution
+/// admission. It must not try to acquire that same row-use permission again.
+pub(super) fn snapshot_output_params(stmt: &StmtHandle) -> Result<ParameterSnapshot, SqlReturn> {
+    snapshot_params(stmt, ParameterUse::Output)
+}
+
+enum ParameterUse {
+    Input,
+    Output,
+}
+
+fn snapshot_params(
+    stmt: &StmtHandle,
+    access: ParameterUse,
+) -> Result<ParameterSnapshot, SqlReturn> {
     let snapshot = (|| {
         let odbc_version = {
             let env_state = stmt
@@ -668,22 +687,30 @@ pub(super) fn snapshot_bound_params(stmt: &StmtHandle) -> Result<ParameterSnapsh
             .inner
             .lock()
             .map_err(|_| BindingError::Poisoned)?;
-        let (apd, ipd, controls) = {
+        let (apd_id, apd, ipd, controls) = {
             let mut state = stmt.inner.lock().map_err(|_| BindingError::Poisoned)?;
             free_errors(&mut state);
+            if matches!(access, ParameterUse::Input) {
+                stmt.row_binding_use.ensure_idle(&gate)?;
+            }
             stmt.param_binding_use.ensure_idle(&gate)?;
+            let apd_id = state.effective_apd(stmt);
             (
-                owned_descriptor(state.effective_apd(stmt))?,
+                apd_id,
+                owned_descriptor(apd_id)?,
                 owned_descriptor(stmt.ipd)?,
                 stmt.param_binding_use.acquire(&gate)?,
             )
         };
         let apd_state = apd.inner.lock().map_err(|_| BindingError::Poisoned)?;
         let ipd_state = ipd.inner.lock().map_err(|_| BindingError::Poisoned)?;
-        let apd_lease = BindingLease::acquire(&apd, &gate, &apd_state)?;
-        let ipd_lease = BindingLease::acquire(&ipd, &gate, &ipd_state)?;
+        let apd_lease = BindingLease::acquire(&apd, &gate)?;
+        let ipd_lease = BindingLease::acquire(&ipd, &gate)?;
         Ok::<_, BindingError>(ParameterSnapshot {
             records: BoundParam::all_from_descriptor_states(&apd_state, &ipd_state, odbc_version),
+            key: crate::handles::bindings::ParameterBindingKey::new(
+                apd_id, &apd_state, stmt.ipd, &ipd_state,
+            )?,
             lease: ParameterBindingLease {
                 _apd: apd_lease,
                 _ipd: ipd_lease,
@@ -693,19 +720,19 @@ pub(super) fn snapshot_bound_params(stmt: &StmtHandle) -> Result<ParameterSnapsh
     })();
     let snapshot = snapshot.map_err(|error| {
         error!(?error, "snapshotting parameter bindings failed");
-        if let Ok(mut state) = stmt.inner.lock() {
-            free_errors(&mut state);
+        crate::error::diag::with_diagnostics(&stmt.inner, |records| {
+            free_errors(records);
             if matches!(error, BindingError::Poisoned) {
                 post_sql_error(
-                    &mut state,
+                    records,
                     SQLSTATE_HY000,
                     0,
                     "Internal error reading parameter bindings: poisoned mutex",
                 );
             } else {
-                error.post(&mut *state);
+                error.post(records);
             }
-        }
+        });
         SQL_ERROR
     })?;
     #[cfg(test)]
@@ -1121,7 +1148,7 @@ pub(super) fn finish_execute(
         let mut dml_counts: VecDeque<i64> = client.take_dml_result_counts().into();
         let has_dml_counts = !dml_counts.is_empty();
         let first_count = dml_counts.pop_front().unwrap_or(-1);
-        let bound_params = snapshot_bound_params(stmt);
+        let output_snapshot = (!has_dml_counts).then(|| snapshot_output_params(stmt));
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("{op}: stmt mutex poisoned");
             return_client_idle(dbc, statement_handle, client);
@@ -1133,29 +1160,25 @@ pub(super) fn finish_execute(
         // count, even when the first count is the only one.
         let return_values = client.get_return_values();
         let return_status = client.get_return_status();
-        let output_rc = if has_dml_counts {
-            stmt_state.batch_exhausted = true;
-            stmt_state.pending_output_params = Some((return_values, return_status));
-            SQL_SUCCESS
-        } else if let Ok(snapshot) = bound_params {
-            // Fresh descriptor snapshot; execute-time input pointers may have
-            // been reset or rebound while the results were being consumed.
-            unsafe {
-                crate::api::output_params::write_back_output_params(
-                    &mut stmt_state,
-                    &snapshot.records,
-                    &return_values,
-                    return_status,
-                )
+        let output_rc = match output_snapshot {
+            None => {
+                stmt_state.batch_exhausted = true;
+                stmt_state.pending_output_params = Some((return_values, return_status));
+                SQL_SUCCESS
             }
-        } else {
-            post_sql_error(
-                &mut stmt_state,
-                SQLSTATE_HY000,
-                0,
-                "Internal error snapshotting output parameter bindings",
-            );
-            SQL_ERROR
+            Some(Ok(snapshot)) => {
+                // Fresh descriptor snapshot; execute-time input pointers may have
+                // been reset or rebound while the results were being consumed.
+                unsafe {
+                    crate::api::output_params::write_back_output_params(
+                        &mut stmt_state,
+                        &snapshot.records,
+                        &return_values,
+                        return_status,
+                    )
+                }
+            }
+            Some(Err(rc)) => rc,
         };
         stmt_state.begin_batch(metadata); // empty
         stmt_state.row_count = first_count;
@@ -1506,6 +1529,48 @@ mod tests {
             assert_eq!(unsafe { sql_more_results(h.stmt) }, SQL_NO_DATA);
             assert!(stmt.inner.lock().unwrap().pending_output_params.is_none());
             assert_eq!(unsafe { sql_more_results(h.stmt) }, SQL_NO_DATA);
+        }
+    }
+
+    #[test]
+    fn finish_execute_only_snapshots_outputs_when_delivering_them() {
+        use mssql_tds::test_client_support::done_more_with_count;
+        for deferred in [false, true] {
+            let h = TestHandles::with_env_dbc_stmt();
+            let dbc = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
+            let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+            let parameter_use = {
+                let gate = dbc.inner.lock().unwrap();
+                stmt.param_binding_use.acquire(&gate).unwrap()
+            };
+            let mut tokens = Vec::new();
+            if deferred {
+                tokens.push(done_more_with_count(2));
+            }
+            tokens.push(done_no_more());
+            let mut client = tds_client_from_tokens(tokens);
+            dbc.runtime
+                .block_on(client.execute("UPDATE t SET v=1".to_owned(), ()))
+                .unwrap();
+            dbc.runtime.block_on(client.close_query()).unwrap();
+            assert_eq!(
+                finish_execute(&dbc, &stmt, h.stmt, client, "SQLExecute"),
+                if deferred { SQL_SUCCESS } else { SQL_ERROR }
+            );
+            {
+                let state = stmt.inner.lock().unwrap();
+                assert_eq!(state.pending_output_params.is_some(), deferred);
+                assert_eq!(state.diag_records.len(), usize::from(!deferred));
+                if !deferred {
+                    assert_eq!(state.diag_records[0].sql_state, *b"HY010");
+                }
+                assert!(!state.has_state(STMT_STATE_EXEC_STARTED));
+            }
+            let state = dbc.inner.lock().unwrap();
+            assert!(state.client.is_some());
+            assert!(state.active_stmt.is_none());
+            drop(state);
+            drop(parameter_use);
         }
     }
 

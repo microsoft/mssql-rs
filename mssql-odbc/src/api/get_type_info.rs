@@ -124,6 +124,10 @@ fn sql_get_type_info_w_safe(
             return SQL_ERROR;
         };
         free_errors(&mut stmt_state);
+        if stmt.row_binding_use.is_active() {
+            post_diag(&mut stmt_state, crate::api::sqlstate::ERR_FUNCTION_SEQUENCE);
+            return SQL_ERROR;
+        }
 
         // The cursor/exec state is checked before the data type, matching
         // msodbcsql (sqlcdd.cpp): an open cursor yields 24000 even for an invalid

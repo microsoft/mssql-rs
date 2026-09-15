@@ -161,14 +161,14 @@ pub(super) fn close_all_cursors(dbc: &DbcHandle) -> SqlReturn {
                     ?err,
                     "close_all_cursors: statement lookup failed"
                 );
-                if let Ok(mut state) = dbc.inner.lock() {
+                crate::error::diag::with_diagnostics(&dbc.inner, |records| {
                     post_sql_error(
-                        &mut state,
+                        records,
                         SQLSTATE_HY000,
                         0,
-                        format!("A statement on this connection could not be accessed: {err:?}"),
+                        format!("A statement on this connection could not be accessed: {err}"),
                     );
-                }
+                });
                 worst = SQL_ERROR;
                 continue;
             }

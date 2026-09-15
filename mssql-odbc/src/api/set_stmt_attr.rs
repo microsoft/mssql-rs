@@ -73,9 +73,7 @@ use crate::api::sqlstate::{
 use crate::api::util::{read_utf16_attr, write_if_some, write_wide_attr};
 use crate::error::{free_errors, post_sql_error};
 use crate::handles::desc::DescHandle;
-use crate::handles::stmt::{
-    STMT_STATE_EXEC_STARTED, STMT_STATE_FETCH_IN_PROGRESS, VendorStmtAttrs,
-};
+use crate::handles::stmt::{STMT_STATE_EXEC_STARTED, VendorStmtAttrs};
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 
 /// Clamps a requested `SQL_ATTR_QUERY_TIMEOUT` to the largest value the driver
@@ -180,10 +178,6 @@ unsafe fn sql_set_stmt_attr_w_safe(
         if let Err(error) = result {
             return error.post(&mut *state);
         }
-        if state.has_state(STMT_STATE_FETCH_IN_PROGRESS) {
-            post_diag(&mut state, ERR_FUNCTION_SEQUENCE);
-            return SQL_ERROR;
-        }
     }
 
     match attribute {
@@ -209,8 +203,7 @@ unsafe fn sql_set_stmt_attr_w_safe(
         | SQL_ATTR_ROW_STATUS_PTR
         | SQL_ATTR_ROW_BIND_OFFSET_PTR
         | SQL_ATTR_ROW_BIND_TYPE
-            if state.has_state(STMT_STATE_FETCH_IN_PROGRESS)
-                || stmt.row_binding_use.is_active() =>
+            if stmt.row_binding_use.is_active() =>
         {
             error!(
                 attribute,

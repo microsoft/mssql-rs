@@ -195,7 +195,9 @@ fn sql_describe_param_safe(
             return SQL_SUCCESS;
         }
 
-        if stmt_state.has_state(STMT_STATE_EXEC_STARTED | STMT_STATE_CURSOR_OPEN) {
+        if stmt_state.has_state(STMT_STATE_EXEC_STARTED | STMT_STATE_CURSOR_OPEN)
+            || stmt.row_binding_use.is_active()
+        {
             post_diag(&mut stmt_state, ERR_FUNCTION_SEQUENCE);
             return SQL_ERROR;
         }
@@ -400,67 +402,73 @@ fn sql_describe_param_safe(
 /// locking-order rationale). An inaccessible IPD fails the call rather than
 /// leaving descriptor metadata inconsistent with the returned description.
 fn refine_ipd(stmt: &StmtHandle, descriptions: &[ParameterDescription]) -> Result<(), SqlReturn> {
-    let desc = handle_from_raw::<DescHandle>(stmt.ipd).map_err(|err| {
-        error!(?err, "SQLDescribeParam: ipd lookup failed");
-        if let Ok(mut stmt_state) = stmt.inner.lock() {
-            post_sql_error(
-                &mut stmt_state,
-                SQLSTATE_HY000,
-                0,
-                format!("The implementation parameter descriptor could not be accessed: {err:?}"),
-            );
+    use crate::handles::bindings::BindingError;
+
+    let result = (|| {
+        let gate = stmt
+            .parent_dbc()
+            .inner
+            .lock()
+            .map_err(|_| BindingError::Poisoned)?;
+        let desc = handle_from_raw::<DescHandle>(stmt.ipd).map_err(BindingError::Registry)?;
+        let mut state = desc.inner.lock().map_err(|_| BindingError::Poisoned)?;
+        let needs_change = descriptions.iter().enumerate().any(|(i, description)| {
+            let number = SqlSmallInt::try_from(i + 1).unwrap_or(SqlSmallInt::MAX);
+            !ipd_matches_description(state.record(number), description)
+        });
+        if !needs_change {
+            return Ok(());
         }
-        SQL_ERROR
-    })?;
-    let mut desc_state = match desc.inner.lock() {
-        Ok(state) => state,
-        Err(err) => {
-            drop(err);
-            error!("SQLDescribeParam: ipd mutex poisoned");
-            if let Ok(mut stmt_state) = stmt.inner.lock() {
-                post_sql_error(
-                    &mut stmt_state,
-                    SQLSTATE_HY000,
-                    0,
-                    "The implementation parameter descriptor could not be refreshed",
-                );
+        desc.binding_use.ensure_idle(&gate)?;
+        let count = state.records.len().max(descriptions.len());
+        state.set_record_count(count, desc.kind);
+        for (i, description) in descriptions.iter().enumerate() {
+            let number = SqlSmallInt::try_from(i + 1).unwrap_or(SqlSmallInt::MAX);
+            if ipd_matches_description(state.record(number), description) {
+                continue;
             }
-            return Err(SQL_ERROR);
+            let record = state
+                .record_mut(number)
+                .ok_or(BindingError::InvalidRecord)?;
+            record.concise_type = description.data_type;
+            record.datetime_interval_code = datetime_interval_code_for(description.data_type);
+            record.scale = description.decimal_digits;
+            record.nullable = description.nullable;
+            (record.precision, record.length) = ipd_precision_length(description);
         }
-    };
-    let target_count = desc_state.records.len().max(descriptions.len());
-    desc_state.set_record_count(target_count, desc.kind);
-    for (i, description) in descriptions.iter().enumerate() {
-        let record_number = SqlSmallInt::try_from(i + 1).unwrap_or(SqlSmallInt::MAX);
-        let Some(record) = desc_state.record_mut(record_number) else {
-            continue;
-        };
-        if record.explicitly_bound {
-            // Bound by SQLBindParameter or SQLSetDescField/SQLSetDescRec —
-            // informational metadata must not override an application's
-            // explicit choice.
-            continue;
-        }
-        record.concise_type = description.data_type;
-        record.datetime_interval_code = datetime_interval_code_for(description.data_type);
-        record.scale = description.decimal_digits;
-        record.nullable = description.nullable;
-        if parameter_size_is_precision(description.data_type) {
-            record.precision =
-                SqlSmallInt::try_from(description.parameter_size).unwrap_or(SqlSmallInt::MAX);
-            record.length = 0;
-        } else if record.datetime_interval_code != 0 {
-            // Per ODBC's "Decimal Digits" appendix ("All datetime types" ->
-            // PRECISION): see `BoundParam::write_to_records`'s identical fix
-            // for the same split.
-            record.precision = description.decimal_digits;
-            record.length = description.parameter_size;
-        } else {
-            record.length = description.parameter_size;
-            record.precision = 0;
-        }
+        Ok::<_, BindingError>(())
+    })();
+    result.map_err(|error| {
+        crate::error::diag::with_diagnostics(&stmt.inner, |records| error.post(records))
+    })
+}
+
+fn ipd_precision_length(description: &ParameterDescription) -> (SqlSmallInt, SqlULen) {
+    if parameter_size_is_precision(description.data_type) {
+        (
+            SqlSmallInt::try_from(description.parameter_size).unwrap_or(SqlSmallInt::MAX),
+            0,
+        )
+    } else if datetime_interval_code_for(description.data_type) != 0 {
+        (description.decimal_digits, description.parameter_size)
+    } else {
+        (0, description.parameter_size)
     }
-    Ok(())
+}
+
+fn ipd_matches_description(
+    record: Option<&crate::handles::desc::DescRecord>,
+    description: &ParameterDescription,
+) -> bool {
+    record.is_some_and(|record| {
+        record.explicitly_bound
+            || (record.concise_type == description.data_type
+                && record.datetime_interval_code
+                    == datetime_interval_code_for(description.data_type)
+                && record.scale == description.decimal_digits
+                && record.nullable == description.nullable
+                && (record.precision, record.length) == ipd_precision_length(description))
+    })
 }
 
 fn fail_metadata_response(
@@ -829,6 +837,66 @@ impl DescriptionCollector {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cached_description_only_mutates_an_idle_ipd() {
+        use crate::handles::bindings::BindingLease;
+        let h = crate::test_support::TestHandles::with_env_dbc_stmt();
+        h.mark_dbc_connected();
+        let sql: Vec<u16> = "SELECT ?".encode_utf16().collect();
+        assert_eq!(
+            unsafe { crate::api::SQLPrepareW(h.stmt, sql.as_ptr(), sql.len().try_into().unwrap()) },
+            SQL_SUCCESS
+        );
+        let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let ipd = handle_from_raw::<DescHandle>(h.ipd()).unwrap().into_arc();
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.parameter_metadata = vec![ParameterDescription {
+                data_type: crate::api::odbc_types::SQL_INTEGER,
+                parameter_size: 10,
+                decimal_digits: 0,
+                nullable: crate::api::odbc_types::SQL_NULLABLE,
+            }];
+            state.set_state(STMT_STATE_CURSOR_OPEN);
+        }
+        let lease = {
+            let gate = stmt.parent_dbc().inner.lock().unwrap();
+            BindingLease::acquire(&ipd, &gate).unwrap()
+        };
+        let mut data_type = -1;
+        let describe = |data_type: &mut SqlSmallInt| unsafe {
+            sql_describe_param(
+                h.stmt,
+                1,
+                data_type,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(describe(&mut data_type), SQL_ERROR);
+        assert_eq!(data_type, -1);
+        assert_eq!(
+            stmt.inner.lock().unwrap().diag_records[0].sql_state,
+            *b"HY010"
+        );
+        assert!(ipd.inner.lock().unwrap().records.is_empty());
+        drop(lease);
+        assert_eq!(describe(&mut data_type), SQL_SUCCESS);
+        assert_eq!(data_type, crate::api::odbc_types::SQL_INTEGER);
+        let revision = ipd.inner.lock().unwrap().binding_revision;
+        let _lease = {
+            let gate = stmt.parent_dbc().inner.lock().unwrap();
+            BindingLease::acquire(&ipd, &gate).unwrap()
+        };
+        assert_eq!(describe(&mut data_type), SQL_SUCCESS);
+        assert_eq!(ipd.inner.lock().unwrap().binding_revision, revision);
+        stmt.inner
+            .lock()
+            .unwrap()
+            .clear_state(STMT_STATE_CURSOR_OPEN);
+    }
     use crate::handles::handle_from_raw;
     use crate::test_support::TestHandles;
     use mssql_tds::connection::tds_client::PreparedStatement;

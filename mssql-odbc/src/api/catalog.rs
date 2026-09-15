@@ -536,6 +536,10 @@ fn run_catalog(
             return SQL_ERROR;
         };
         free_errors(&mut stmt_state);
+        if stmt.row_binding_use.is_active() {
+            post_diag(&mut stmt_state, crate::api::sqlstate::ERR_FUNCTION_SEQUENCE);
+            return SQL_ERROR;
+        }
         if stmt_state.has_state(STMT_STATE_EXEC_STARTED | STMT_STATE_CURSOR_OPEN) {
             error!("{name}: statement has an active execute or open cursor");
             post_diag(&mut stmt_state, ERR_INVALID_CURSOR_STATE);

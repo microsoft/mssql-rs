@@ -10,12 +10,12 @@
 
 use tracing::{debug, error};
 
-use crate::api::exec_common::snapshot_bound_params;
+use crate::api::exec_common::snapshot_output_params;
 use crate::api::output_params::write_back_output_params;
 
 use mssql_tds::connection::tds_client::{ResultSet, StatementResult};
 
-use super::close_cursor::reset_cursor_state;
+use super::close_cursor::{claim_result_use, reset_cursor_state};
 use super::ird::populate_ird;
 use crate::api::odbc_types::{
     SQL_ERROR, SQL_INVALID_HANDLE, SQL_NO_DATA, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle,
@@ -54,8 +54,12 @@ unsafe fn sql_more_results_impl(statement_handle: SqlHandle) -> SqlReturn {
 }
 
 fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn {
+    let _result_use = match claim_result_use(stmt) {
+        Ok(guard) => guard,
+        Err(rc) => return rc,
+    };
     // DESC locks must not nest beneath STMT, including the exhausted fast path.
-    let snapshot = match snapshot_bound_params(stmt) {
+    let snapshot = match snapshot_output_params(stmt) {
         Ok(snapshot) => snapshot,
         Err(rc) => return rc,
     };

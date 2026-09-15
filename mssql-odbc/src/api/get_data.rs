@@ -143,6 +143,10 @@ fn sql_get_data_safe(
         buffer_length >= 0,
         "SQLGetData: DM should reject negative buffer_length (HY090)"
     );
+    let _result_use = match super::close_cursor::claim_result_use(stmt) {
+        Ok(guard) => guard,
+        Err(rc) => return rc,
+    };
 
     // The declared ODBC version selects the SQL_C_DEFAULT table, so it is only
     // read for a defaulted retrieval — and before the STMT lock, to preserve

@@ -64,10 +64,7 @@ use crate::conversion::fetch_convert::{
 };
 use crate::error::{free_errors, post_sql_error};
 use crate::handles::OdbcVersion;
-use crate::handles::stmt::{
-    BufferedGetDataRow, ColumnBinding, STMT_STATE_CURSOR_OPEN, STMT_STATE_FETCH_IN_PROGRESS,
-    StmtState,
-};
+use crate::handles::stmt::{BufferedGetDataRow, ColumnBinding, STMT_STATE_CURSOR_OPEN, StmtState};
 use crate::handles::{HandleType, StmtHandle};
 
 #[derive(Clone, Copy)]
@@ -861,7 +858,7 @@ fn fetch_scroll_safe(
             post_diag(&mut stmt_state, ERR_INVALID_CURSOR_STATE);
             return SQL_ERROR;
         }
-        if stmt_state.has_state(STMT_STATE_FETCH_IN_PROGRESS) || stmt.row_binding_use.is_active() {
+        if stmt.row_binding_use.is_active() {
             error!("SQLFetchScroll: a fetch is already in progress on this statement");
             post_diag(&mut stmt_state, ERR_FUNCTION_SEQUENCE);
             return SQL_ERROR;
@@ -954,15 +951,13 @@ fn fetch_scroll_safe(
     let snapshot = (|| {
         use crate::handles::bindings::{BindingError, BindingLease};
         let state = ard.inner.lock().map_err(|_| BindingError::Poisoned)?;
-        let lease = BindingLease::acquire(&ard, &gate, &state)?;
+        let lease = BindingLease::acquire(&ard, &gate)?;
         Ok::<_, BindingError>((lease, ColumnBinding::all_from_ard_state(&state)))
     })();
     let (_binding_lease, mut bindings) = match snapshot {
         Ok(snapshot) => snapshot,
         Err(error) => {
-            if let Ok(mut state) = stmt.inner.lock() {
-                error.post(&mut *state);
-            }
+            crate::error::diag::with_diagnostics(&stmt.inner, |records| error.post(records));
             return SQL_ERROR;
         }
     };

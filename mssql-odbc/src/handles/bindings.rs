@@ -10,12 +10,41 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::dbc::DbcState;
 use super::desc::{DescHandle, DescState};
-use super::{HandleActivity, RegistryError, handle_from_raw};
+use super::{HandleActivity, HandleId, RegistryError, handle_from_raw};
 use crate::api::odbc_types::{SQL_ERROR, SqlHandle, SqlReturn};
 use crate::api::sqlstate::{
     ERR_FUNCTION_SEQUENCE, ERR_MEMORY_ALLOCATION, SQLSTATE_HY000, post_diag,
 };
 use crate::error::{HasDiagnostics, post_sql_error};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ParameterBindingKey {
+    apd: HandleId,
+    apd_revision: u64,
+    ipd: HandleId,
+    ipd_revision: u64,
+}
+
+impl ParameterBindingKey {
+    pub(crate) fn new(
+        apd: SqlHandle,
+        apd_state: &DescState,
+        ipd: SqlHandle,
+        ipd_state: &DescState,
+    ) -> Result<Self, BindingError> {
+        Ok(Self {
+            apd: HandleId::from_raw(apd).map_err(BindingError::Registry)?,
+            apd_revision: apd_state.binding_revision,
+            ipd: HandleId::from_raw(ipd).map_err(BindingError::Registry)?,
+            ipd_revision: ipd_state.binding_revision,
+        })
+    }
+
+    pub(crate) fn matches(&self, current: &Self) -> bool {
+        // Saturated revisions remain writable, but can never authorize reuse.
+        self == current && current.apd_revision != u64::MAX && current.ipd_revision != u64::MAX
+    }
+}
 
 #[derive(Debug)]
 pub(crate) struct BindingUse {
@@ -85,12 +114,11 @@ pub(crate) struct BindingLease {
 }
 
 impl BindingLease {
-    /// Call while both the owning DBC and this descriptor are locked, then
-    /// snapshot the records before releasing those locks.
+    /// Keep the owning DBC gate until the descriptor records have been
+    /// snapshotted under their own mutex.
     pub(crate) fn acquire(
         descriptor: &Arc<DescHandle>,
         gate: &DbcState,
-        _state: &DescState,
     ) -> Result<Self, BindingError> {
         let use_guard = descriptor.binding_use.acquire(gate)?;
         Ok(Self {
@@ -165,6 +193,7 @@ pub(crate) mod snapshot_test_hook {
         Fetch,
         Parameters,
         ParameterRows,
+        ResultOperation,
     }
 
     type Key = (usize, Phase);
@@ -310,7 +339,7 @@ mod tests {
         let (release, resume) = mpsc::channel();
         let registration = snapshot_test_hook::install(stmt, phase, move || {
             arrived.send(()).unwrap();
-            resume.recv().unwrap();
+            resume.recv_timeout(Duration::from_secs(10)).unwrap();
         });
         (registration, ready, release)
     }
@@ -461,6 +490,12 @@ mod tests {
                 ] {
                     assert_stmt_sequence(&stmt, set_attr(h.stmt, attribute, 1_usize as SqlPointer));
                 }
+                assert_stmt_sequence(&stmt, unsafe { crate::api::SQLCloseCursor(h.stmt) });
+                assert_stmt_sequence(&stmt, unsafe { SQLFreeStmt(h.stmt, SQL_CLOSE) });
+                assert_stmt_sequence(&stmt, unsafe { crate::api::SQLMoreResults(h.stmt) });
+                assert_stmt_sequence(&stmt, unsafe {
+                    crate::api::SQLGetData(h.stmt, 1, SQL_C_SLONG, value, 4, indicator)
+                });
                 let mut count = 0_i16;
                 assert_eq!(
                     unsafe {
@@ -520,6 +555,105 @@ mod tests {
                 desc_field(desc_raw, 0, SQL_DESC_COUNT, 2_usize as SqlPointer),
                 SQL_SUCCESS
             );
+        }
+    }
+
+    #[test]
+    fn result_operations_exclude_fetch_and_new_queries_until_completion() {
+        for operation in 0..3 {
+            let h = TestHandles::with_env_dbc_stmt();
+            h.mark_dbc_connected();
+            let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+            let dbc = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
+            let mut client = tds_client_from_int_rows(vec![vec![42]]);
+            dbc.runtime
+                .block_on(client.execute("SELECT 42".to_owned(), ()))
+                .unwrap();
+            {
+                let mut state = dbc.inner.lock().unwrap();
+                state.client = Some(client);
+                state.active_stmt = Some(h.stmt);
+            }
+            {
+                let mut state = stmt.inner.lock().unwrap();
+                state.begin_result_set(int_columns(1));
+                state.set_state(STMT_STATE_CURSOR_OPEN);
+            }
+            let (_registration, ready, release) = pause_at(&stmt, Phase::ResultOperation);
+            let raw = h.stmt.addr();
+            std::thread::scope(|scope| {
+                let result = scope.spawn(move || unsafe {
+                    let raw = std::ptr::without_provenance_mut(raw);
+                    match operation {
+                        0 => crate::api::SQLCloseCursor(raw),
+                        1 => SQLFreeStmt(raw, SQL_CLOSE),
+                        _ => crate::api::SQLMoreResults(raw),
+                    }
+                });
+                ready.recv_timeout(Duration::from_secs(10)).unwrap();
+                assert!(stmt.row_binding_use.is_active());
+                assert!(dbc.inner.try_lock().is_ok());
+                assert!(stmt.inner.try_lock().is_ok());
+                assert_stmt_sequence(&stmt, unsafe {
+                    sql_fetch_scroll(h.stmt, SQL_FETCH_NEXT, 0)
+                });
+                assert_stmt_sequence(&stmt, unsafe { crate::api::SQLCloseCursor(h.stmt) });
+                assert_stmt_sequence(&stmt, unsafe { SQLFreeStmt(h.stmt, SQL_CLOSE) });
+                assert_stmt_sequence(&stmt, unsafe { crate::api::SQLMoreResults(h.stmt) });
+                let mut untouched = -1_i32;
+                assert_stmt_sequence(&stmt, unsafe {
+                    crate::api::SQLGetData(
+                        h.stmt,
+                        1,
+                        SQL_C_SLONG,
+                        (&raw mut untouched).cast(),
+                        4,
+                        ptr::null_mut(),
+                    )
+                });
+                assert_eq!(untouched, -1);
+                let query: Vec<u16> = "SELECT 1".encode_utf16().collect();
+                assert_stmt_sequence(&stmt, unsafe {
+                    sql_exec_direct_w(h.stmt, query.as_ptr(), query.len().try_into().unwrap())
+                });
+                assert_stmt_sequence(&stmt, unsafe {
+                    sql_prepare_w(h.stmt, query.as_ptr(), query.len().try_into().unwrap())
+                });
+                assert_stmt_sequence(&stmt, unsafe {
+                    crate::api::SQLGetTypeInfoW(h.stmt, SQL_INTEGER)
+                });
+                assert_stmt_sequence(&stmt, unsafe {
+                    crate::api::SQLTablesW(
+                        h.stmt,
+                        ptr::null(),
+                        0,
+                        ptr::null(),
+                        0,
+                        ptr::null(),
+                        0,
+                        ptr::null(),
+                        0,
+                    )
+                });
+                {
+                    let state = stmt.inner.lock().unwrap();
+                    assert!(state.has_state(STMT_STATE_CURSOR_OPEN));
+                    assert_eq!(state.column_metadata.len(), 1);
+                }
+                release.send(()).unwrap();
+                assert_eq!(
+                    result.join().unwrap(),
+                    if operation == 2 {
+                        SQL_NO_DATA
+                    } else {
+                        SQL_SUCCESS
+                    }
+                );
+            });
+            assert!(!stmt.row_binding_use.is_active());
+            assert!(!stmt.param_binding_use.is_active());
+            assert!(!stmt.inner.lock().unwrap().has_state(STMT_STATE_CURSOR_OPEN));
+            assert_eq!(unsafe { SQLFreeStmt(h.stmt, SQL_CLOSE) }, SQL_SUCCESS);
         }
     }
 
@@ -751,8 +885,7 @@ mod tests {
         let original_ipd = descriptor_data(&ipd);
         let lease = {
             let gate = stmt.parent_dbc().inner.lock().unwrap();
-            let state = ipd.inner.lock().unwrap();
-            BindingLease::acquire(&ipd, &gate, &state).unwrap()
+            BindingLease::acquire(&ipd, &gate).unwrap()
         };
         assert_stmt_sequence(
             &stmt,
@@ -957,7 +1090,7 @@ mod tests {
             let gate = desc.parent_dbc().inner.lock().unwrap();
             let other_gate = other.parent_dbc().inner.lock().unwrap();
             let mut state = desc.inner.lock().unwrap();
-            let error = BindingLease::acquire(&desc, &other_gate, &state).unwrap_err();
+            let error = BindingLease::acquire(&desc, &other_gate).unwrap_err();
             assert!(matches!(error, BindingError::WrongOwner));
             assert_eq!(error.post(&mut *state), SQL_ERROR);
             assert_eq!(state.diag_records.len(), 1);
@@ -965,11 +1098,11 @@ mod tests {
             assert_eq!(desc.binding_use.active.load(Ordering::Acquire), 0);
             assert_eq!(other.binding_use.active.load(Ordering::Acquire), 0);
 
-            let first = BindingLease::acquire(&desc, &gate, &state).unwrap();
-            let second = BindingLease::acquire(&cloned_desc, &gate, &state).unwrap();
+            let first = BindingLease::acquire(&desc, &gate).unwrap();
+            let second = BindingLease::acquire(&cloned_desc, &gate).unwrap();
             assert_eq!(desc.binding_use.active.load(Ordering::Acquire), 2);
             assert!(matches!(
-                BindingLease::acquire(&desc, &other_gate, &state),
+                BindingLease::acquire(&desc, &other_gate),
                 Err(BindingError::WrongOwner)
             ));
             assert_eq!(desc.binding_use.active.load(Ordering::Acquire), 2);
@@ -987,6 +1120,69 @@ mod tests {
             let gate = desc.parent_dbc().inner.lock().unwrap();
             desc.binding_use.ensure_idle(&gate).unwrap();
         }
+    }
+
+    #[test]
+    fn freeing_a_leased_poisoned_descriptor_posts_a_fresh_diagnostic() {
+        let mut h = TestHandles::with_env_dbc_stmt();
+        let raw = h.alloc_explicit_desc();
+        let desc = owned_descriptor(raw).unwrap();
+        post_sql_error(
+            &mut desc.inner.lock().unwrap(),
+            *b"HY000",
+            0,
+            "stale diagnostic",
+        );
+        let lease = {
+            let gate = desc.parent_dbc().inner.lock().unwrap();
+            BindingLease::acquire(&desc, &gate).unwrap()
+        };
+        let poisoned = Arc::clone(&desc);
+        assert!(
+            std::thread::spawn(move || {
+                let _state = poisoned.inner.lock().unwrap();
+                panic!("poison descriptor state");
+            })
+            .join()
+            .is_err()
+        );
+        assert_eq!(h.free_explicit_desc(raw), SQL_ERROR);
+        let mut state = [0_u16; 6];
+        let mut message = [0_u16; 256];
+        assert_eq!(
+            unsafe {
+                crate::api::SQLGetDiagRecW(
+                    SQL_HANDLE_DESC,
+                    raw,
+                    1,
+                    state.as_mut_ptr(),
+                    ptr::null_mut(),
+                    message.as_mut_ptr(),
+                    message.len().try_into().unwrap(),
+                    ptr::null_mut(),
+                )
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!(state, [72, 89, 48, 49, 48, 0]);
+        assert_eq!(
+            unsafe {
+                crate::api::SQLGetDiagRecW(
+                    SQL_HANDLE_DESC,
+                    raw,
+                    2,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    0,
+                    ptr::null_mut(),
+                )
+            },
+            SQL_NO_DATA
+        );
+        assert!(desc.inner.is_poisoned());
+        drop(lease);
+        assert_eq!(h.free_explicit_desc(raw), SQL_SUCCESS);
     }
 
     #[test]

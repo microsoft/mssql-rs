@@ -103,6 +103,10 @@ fn sql_prepare_w_safe(stmt: &StmtHandle, sql: String) -> SqlReturn {
     };
     free_errors(&mut stmt_state);
 
+    if let Err(error) = stmt.row_binding_use.ensure_idle(&dbc_state) {
+        return error.post(&mut *stmt_state);
+    }
+
     if stmt_state.has_state(STMT_STATE_EXEC_STARTED | STMT_STATE_CURSOR_OPEN) {
         error!("SQLPrepareW: statement has an active execute or open cursor");
         post_diag(&mut stmt_state, ERR_INVALID_CURSOR_STATE);

@@ -165,13 +165,8 @@ impl TestHandles {
         // Connects the DBC (though `alloc_desc` no longer requires it — see
         // its doc comment) so this mirrors a realistic connected-session
         // cross-connection scenario; same technique as `mark_dbc_connected`.
-        handle_from_raw::<DbcHandle>(dbc)
-            .unwrap()
-            .into_arc()
-            .inner
-            .lock()
-            .unwrap()
-            .connection_state = ConnectionState::Connected;
+        let dbc_owner = handle_from_raw::<DbcHandle>(dbc).unwrap().into_arc();
+        dbc_owner.inner.lock().unwrap().connection_state = ConnectionState::Connected;
         let mut desc: SqlHandle = SQL_NULL_HANDLE;
         assert_eq!(
             unsafe { sql_alloc_handle(SQL_HANDLE_DESC, dbc, &mut desc) },

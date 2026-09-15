@@ -341,6 +341,9 @@ pub(crate) struct DescState {
     pub(crate) header: DescHeader,
     /// 1-based descriptor records: `records[0]` is record number 1.
     pub(crate) records: Vec<DescRecord>,
+    /// Binding records must change through `record_mut`/`set_record_count`;
+    /// shared prepared statements compare this revision before server reuse.
+    pub(crate) binding_revision: u64,
 }
 
 impl DescState {
@@ -354,7 +357,9 @@ impl DescState {
     /// Mutable counterpart of [`Self::record`].
     pub(crate) fn record_mut(&mut self, record_number: SqlSmallInt) -> Option<&mut DescRecord> {
         let index = usize::try_from(record_number).ok()?.checked_sub(1)?;
-        self.records.get_mut(index)
+        let record = self.records.get_mut(index)?;
+        self.binding_revision = self.binding_revision.saturating_add(1);
+        Some(record)
     }
 
     /// Grows or shrinks the record list to `count`, per `SQL_DESC_COUNT`
@@ -364,6 +369,9 @@ impl DescState {
     /// `4318-4463` for IPD): existing records are preserved, not
     /// reinitialized, on either grow or shrink.
     pub(crate) fn set_record_count(&mut self, count: usize, kind: DescKind) {
+        if count != self.records.len() {
+            self.binding_revision = self.binding_revision.saturating_add(1);
+        }
         if count < self.records.len() {
             self.records.truncate(count);
         } else {
@@ -397,6 +405,7 @@ impl DescHandle {
                     ..DescHeader::default()
                 },
                 records: Vec::new(),
+                binding_revision: 0,
             }),
         }
     }
@@ -723,6 +732,32 @@ mod tests {
     }
 
     #[test]
+    fn binding_revision_tracks_mutation_without_wrapping() {
+        let mut state = DescState {
+            binding_revision: 0,
+            diag_records: Vec::new(),
+            header: DescHeader::default(),
+            records: Vec::new(),
+        };
+        assert!(state.record_mut(1).is_none());
+        assert_eq!(state.binding_revision, 0);
+        state.set_record_count(1, DescKind::AppParam);
+        assert_eq!(state.binding_revision, 1);
+        state.set_record_count(1, DescKind::AppParam);
+        assert_eq!(state.binding_revision, 1);
+        assert!(state.record(1).is_some());
+        assert_eq!(state.binding_revision, 1);
+        state.record_mut(1).unwrap().scale = 2;
+        assert_eq!(state.binding_revision, 2);
+        state.set_record_count(0, DescKind::AppParam);
+        assert_eq!(state.binding_revision, 3);
+        state.binding_revision = u64::MAX - 1;
+        state.set_record_count(1, DescKind::AppParam);
+        state.record_mut(1).unwrap().scale = 3;
+        assert_eq!(state.binding_revision, u64::MAX);
+    }
+
+    #[test]
     fn new_explicit_descriptor_reports_alloc_user_on_both_copies() {
         let mut h = crate::test_support::TestHandles::with_env_dbc();
         let raw = h.alloc_explicit_desc();
@@ -740,6 +775,7 @@ mod tests {
     #[test]
     fn set_record_count_grows_with_kind_defaults() {
         let mut state = DescState {
+            binding_revision: 0,
             diag_records: Vec::new(),
             header: DescHeader::default(),
             records: Vec::new(),
@@ -754,6 +790,7 @@ mod tests {
         // (mixing kinds on one growing state isn't a real scenario — a
         // descriptor's kind never changes after creation).
         let mut ipd_state = DescState {
+            binding_revision: 0,
             diag_records: Vec::new(),
             header: DescHeader::default(),
             records: Vec::new(),
@@ -767,6 +804,7 @@ mod tests {
     #[test]
     fn set_record_count_shrink_discards_trailing_records_and_preserves_the_rest() {
         let mut state = DescState {
+            binding_revision: 0,
             diag_records: Vec::new(),
             header: DescHeader::default(),
             records: Vec::new(),
@@ -784,6 +822,7 @@ mod tests {
     #[test]
     fn record_and_record_mut_reject_zero_and_negative() {
         let mut state = DescState {
+            binding_revision: 0,
             diag_records: Vec::new(),
             header: DescHeader::default(),
             records: Vec::new(),

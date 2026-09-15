@@ -628,11 +628,26 @@ Driver Manager (DM) provides serialization guarantees that the driver relies on
   verify the DM upheld its guarantees (e.g., no outstanding children). These
   fire in debug builds only — in release builds the driver trusts the DM and
   frees unconditionally, matching msodbcsql.
-- The old `STMT_STATE_FETCH_IN_PROGRESS` bit alone is not a fetch-use guard.
-  Real fetch admission is RAII-managed by `row_binding_use`; keep every
+- Fetch, `SQLGetData`, public cursor close, and result advancement share RAII-managed
+  `row_binding_use`; keep every
   buffer-affecting path on the shared lease protocol, including no-data
   status/count writes. Parameter leases follow actual pointer use, not the
   entire lifetime of a cursor or copied DAE token.
+- Input snapshots reject active row/result use. Output snapshots run beneath
+  their caller's result-operation or execution admission and do not reacquire
+  that permission; avoid making result advancement reject its own snapshot.
+- Mutate descriptor records through `record_mut` and `set_record_count`.
+  Their revisions, together with APD/IPD handle identities, are checked before
+  prepared execution so setters and shared-descriptor reassociation cannot
+  leave a stale server declaration cached. A saturated revision disables reuse
+  rather than wrapping. Tests must materialize a server handle to exercise
+  invalidation; `SQLPrepare` alone is deferred and has no server handle yet.
+- Cached IPD refinement uses the same DBC gate and descriptor-use check before
+  growth or metadata changes. Read-only cache hits do not mutate revisions or
+  require an idle descriptor.
+- Do not use a test-only state flag as a proxy for production lease admission.
+  Guard tests should hold the real lease; isolate row-use checks from descriptor
+  leases so a redundant guard cannot make a mutation test pass.
 
 ## FFI boundary conventions
 

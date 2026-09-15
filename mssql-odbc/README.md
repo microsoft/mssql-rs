@@ -168,6 +168,8 @@ descriptor, including one shared by several statements, returns `HY010`
 rather than allowing an application to reclaim a buffer still being accessed.
 Procedure output delivery takes a fresh leased parameter snapshot, so bindings
 can change between result-processing calls but not during the final output writes.
+`SQLGetData`, public cursor close, and result advancement hold row-use admission until
+completion; they cannot overlap fetch or new input staging on the same statement.
 Association changes, snapshot admission, and binding mutations share a short
 DBC lock; that lock is released before network I/O. Close/disconnect admission
 separately excludes executing dependent calls, without treating an idle cursor
@@ -182,6 +184,12 @@ select a custom allocator or implement SQL OS hosting. A future embedded DLL
 may use a module-scoped allocator, but its memory services must outlive all
 allocations and reference-count control blocks, not merely the last public
 handle ID.
+
+Prepared execution compares the effective APD/IPD identities and record revisions
+before reusing a server plan. Descriptor edits, reassociation, and descriptor free
+therefore force re-preparation on the next execute, including every statement
+sharing an explicit APD. Ordinary value changes in an unchanged binding still
+reuse the plan.
 
 Rejected calls on live, closing handles post retrievable diagnostics. Diagnostic
 access can read a closing handle or the diagnostic list of poisoned handle

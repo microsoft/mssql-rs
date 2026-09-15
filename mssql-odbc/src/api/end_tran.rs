@@ -125,14 +125,14 @@ fn sql_end_tran_env_safe(env: &EnvHandle, completion_type: SqlSmallInt) -> SqlRe
             Ok(dbc) => dbc,
             Err(err) => {
                 error!(?dbc_ptr, ?err, "SQLEndTran: connection lookup failed");
-                if let Ok(mut env_state) = env.inner.lock() {
+                crate::error::diag::with_diagnostics(&env.inner, |records| {
                     post_sql_error(
-                        &mut env_state,
+                        records,
                         SQLSTATE_HY000,
                         0,
                         format!("A connection on this environment could not be accessed: {err}"),
                     );
-                }
+                });
                 worst = SQL_ERROR;
                 failed += 1;
                 continue;
