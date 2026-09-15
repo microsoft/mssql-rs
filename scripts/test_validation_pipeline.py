@@ -3,6 +3,7 @@
 
 """Regression tests for validation pipeline builds, tests, and artifacts."""
 
+import re
 from pathlib import Path
 
 import pytest
@@ -96,6 +97,33 @@ def test_mssql_python_odbc_failures_fail_the_job():
     assert 'exit "$rc"' in test_step["script"]
     assert "task.complete result=SucceededWithIssues" not in test_step["script"]
     assert "SucceededWithIssues" not in template
+
+    # A docker-exec launch failure (125/126/127) means the harness never ran,
+    # so it must still fail the job (exit "$rc"), but through a distinct
+    # branch that says so rather than reporting it as a driver test failure.
+    assert re.search(r"125\|126\|127\)", test_step["script"])
+    assert "exit \"$rc\"" in test_step["script"].rsplit("esac", 1)[-1]
+
+    # The step alone isn't the whole gate: a job-level continueOnError would
+    # silently restore the old non-blocking behavior regardless of exit code.
+    stages = yaml.safe_load(
+        (_TEMPLATES / "validation-stages.yml").read_text(encoding="utf-8")
+    )["stages"]
+    build_mssql_python = next(stage for stage in stages if stage["stage"] == "Build_mssql_python")
+    odbc_job = next(
+        job
+        for job in build_mssql_python["jobs"]
+        if job.get("job") == "Test_mssql_python_on_mssql_odbc"
+    )
+    assert "continueOnError" not in odbc_job
+
+    # A dirty run must still exit nonzero from the runner itself, not just from
+    # the step that wraps it.
+    runner = (_ROOT / ".pipeline" / "scripts" / "run-mssql-python-odbc-tests.sh").read_text(
+        encoding="utf-8"
+    )
+    dirty_run_check = runner.split('if [ "$failed" -gt 0 ]', 1)[1]
+    assert re.search(r"\bexit 1\b", dirty_run_check)
 
 
 @pytest.mark.parametrize("architecture", ["x64", "ARM64"])
