@@ -123,20 +123,20 @@ pub(crate) unsafe fn read_utf16(ptr: *const SqlWChar, length: SqlSmallInt) -> St
 /// as an empty value rather than faulting: this is an FFI boundary, and a
 /// driver that aborts takes its host process down with it.
 ///
-/// Application buffers need not be aligned for `SqlWChar`; read each unit
-/// without forming a slice over the caller's memory.
-///
 /// # Safety
 /// - `ptr` must be readable for `length` `SQLWCHAR`s, or up to and including the
 ///   first NUL terminator when `length == SQL_NTS`.
 /// - `length` must be non-negative or exactly `SQL_NTS`; callers validate that
 ///   first and report `HY090` otherwise.
+/// - The input need not be aligned for `SQLWCHAR`.
 pub(crate) unsafe fn read_utf16_long(ptr: *const SqlWChar, length: SqlInteger) -> String {
     if ptr.is_null() {
         return String::new();
     }
     let len = if length == SqlInteger::from(SQL_NTS) {
         let mut len = 0usize;
+        // SAFETY: the caller provides readable units through the terminator;
+        // application buffers need not be aligned.
         while unsafe { ptr.add(len).read_unaligned() } != 0 {
             len += 1;
         }
@@ -147,10 +147,13 @@ pub(crate) unsafe fn read_utf16_long(ptr: *const SqlWChar, length: SqlInteger) -
             Ok(len) => len,
         }
     };
-    // The length or terminating NUL bounds every read; alignment is not required.
-    let units = (0..len).map(|index| unsafe { ptr.add(index).read_unaligned() });
+    let units = (0..len).map(|index| {
+        // SAFETY: each unit is within the caller's readable extent. Do not
+        // form a slice: even an empty slice requires an aligned pointer.
+        unsafe { ptr.add(index).read_unaligned() }
+    });
     char::decode_utf16(units)
-        .map(|character| character.unwrap_or(char::REPLACEMENT_CHARACTER))
+        .map(|unit| unit.unwrap_or(char::REPLACEMENT_CHARACTER))
         .collect()
 }
 
@@ -417,36 +420,40 @@ mod tests {
 
         #[test]
         fn unaligned_utf16_read_preserves_lossy_decoding() {
-            const UNITS: [u16; 9] = [0x61, 0xD83D, 0xDE00, 0xD800, 0x62, 0xDC00, 0, 0x63, 0];
-            for offset in [0, 1] {
-                let mut storage = AlignedBuffer([MaybeUninit::<u8>::uninit(); 33]);
-                for (index, byte) in UNITS.iter().flat_map(|unit| unit.to_ne_bytes()).enumerate() {
-                    storage.0[offset + index].write(byte);
-                }
-                let ptr = storage.0.as_ptr().wrapping_add(offset).cast::<SqlWChar>();
-                assert_eq!(ptr.is_aligned(), offset == 0);
-                for length in 0..UNITS.len() {
-                    let expected = String::from_utf16_lossy(&UNITS[..length]);
-                    let chars = SqlSmallInt::try_from(length).unwrap();
-                    let bytes = SqlInteger::try_from(length * 2).unwrap();
-                    // Every declared byte is initialized, including the odd trailing byte.
-                    unsafe {
-                        assert_eq!(read_utf16(ptr, chars), expected);
-                        assert_eq!(read_utf16_long(ptr, SqlInteger::from(chars)), expected);
-                        assert_eq!(read_utf16_attr(ptr, bytes), expected);
-                        assert_eq!(read_utf16_attr(ptr, bytes + 1), expected);
+            let cases: &[(&[u16], &str)] = &[
+                (
+                    &[0x61, 0xD83D, 0xDE00, 0xD800, 0x62, 0xDC00, 0, 0x63, 0],
+                    "a\u{1f600}\u{fffd}b\u{fffd}",
+                ),
+                (&[0xD800, 0x0061, 0xDC00, 0], "\u{fffd}a\u{fffd}"),
+            ];
+            for &(units, terminated) in cases {
+                for offset in [0, 1] {
+                    let mut storage = AlignedBuffer([MaybeUninit::<u8>::uninit(); 33]);
+                    for (index, byte) in
+                        units.iter().flat_map(|unit| unit.to_ne_bytes()).enumerate()
+                    {
+                        storage.0[offset + index].write(byte);
                     }
-                }
-                unsafe {
-                    assert_eq!(read_utf16(ptr, SQL_NTS), "a\u{1f600}\u{fffd}b\u{fffd}");
-                    assert_eq!(
-                        read_utf16_long(ptr, SqlInteger::from(SQL_NTS)),
-                        "a\u{1f600}\u{fffd}b\u{fffd}"
-                    );
-                    assert_eq!(
-                        read_utf16_attr(ptr, SqlInteger::from(SQL_NTS)),
-                        "a\u{1f600}\u{fffd}b\u{fffd}"
-                    );
+                    let ptr = storage.0.as_ptr().wrapping_add(offset).cast::<SqlWChar>();
+                    assert_eq!(ptr.is_aligned(), offset == 0);
+                    for length in 0..units.len() {
+                        let expected = String::from_utf16_lossy(&units[..length]);
+                        let chars = SqlSmallInt::try_from(length).unwrap();
+                        let bytes = SqlInteger::try_from(length * 2).unwrap();
+                        // Every declared byte is initialized, including the odd trailing byte.
+                        unsafe {
+                            assert_eq!(read_utf16(ptr, chars), expected);
+                            assert_eq!(read_utf16_long(ptr, SqlInteger::from(chars)), expected);
+                            assert_eq!(read_utf16_attr(ptr, bytes), expected);
+                            assert_eq!(read_utf16_attr(ptr, bytes + 1), expected);
+                        }
+                    }
+                    unsafe {
+                        assert_eq!(read_utf16(ptr, SQL_NTS), terminated);
+                        assert_eq!(read_utf16_long(ptr, SqlInteger::from(SQL_NTS)), terminated);
+                        assert_eq!(read_utf16_attr(ptr, SqlInteger::from(SQL_NTS)), terminated);
+                    }
                 }
             }
         }
