@@ -49,6 +49,12 @@ and publishes JUnit results even when tests fail. Failed tests or missing result
 fail the job. This leg tests the Rust driver only, without msodbcsql comparison
 or C++ e2e coverage collection.
 
+Query-notification string attributes use explicit `SQLSetStmtAttrW` /
+`SQLGetStmtAttrW` calls with UTF-16 buffers. unixODBC does not convert these
+vendor-specific buffers when forwarding ANSI calls to a Unicode-only driver.
+The attribute suite also covers UTF-16 input at a byte offset; native ARM64
+success alone does not establish that the x64 macOS path is alignment-safe.
+
 ```bash
 # From mssql-odbc/tests/e2e/
 ./run_e2e.sh

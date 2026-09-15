@@ -1497,83 +1497,111 @@ TEST_F(AttributesTest, CurrentCommandTracksTheResultSetOrdinal) {
 // -------------------------------------------------------------------
 // Variation 54 - the two query-notification attributes are the only
 // string-valued statement attributes. StringLength is a byte count, so an
-// explicit 6 stores six ANSI characters or three UTF-16 characters, and a
-// truncated get reports the full byte width.
+// explicit 6 stores three UTF-16 characters, and a truncated get reports
+// the full byte width. Use W calls: unixODBC forwards vendor attribute
+// buffers unchanged when routing an ANSI call to a Unicode-only driver.
 // -------------------------------------------------------------------
 TEST_F(AttributesTest, QueryNotificationStringsFollowTheByteLengthContract) {
-    SQLTCHAR buffer[32] = {};
+    SQLWCHAR buffer[32] = {};
     SQLINTEGER written = -1;
 
     // Both default to empty.
     for (SQLINTEGER attribute : {kSsQnMsgtext, kSsQnOptions}) {
         SCOPED_TRACE(attribute);
         written = -1;
-        EXPECT_SQL_OK(SQLGetStmtAttr(stmt_, attribute, buffer, sizeof(buffer),
+        EXPECT_SQL_OK(SQLGetStmtAttrW(stmt_, attribute, buffer, sizeof(buffer),
                                      &written),
                       SQL_HANDLE_STMT, stmt_);
         EXPECT_EQ(0, written);
     }
 
-    SqlTString value = ODBCTestUtils::ToSqlTStr("abcdefghij");
-    SQLTCHAR* msg = const_cast<SQLTCHAR*>(value.c_str());
+    std::basic_string<SQLWCHAR> value = {'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j'};
+    SQLWCHAR* msg = value.data();
     const SQLINTEGER value_bytes =
-        static_cast<SQLINTEGER>(value.size() * sizeof(SQLTCHAR));
+        static_cast<SQLINTEGER>(value.size() * sizeof(SQLWCHAR));
 
     // A NUL-terminated set round-trips, and the two are independent.
-    EXPECT_EQ(SQL_SUCCESS, SQLSetStmtAttr(stmt_, kSsQnMsgtext, msg, SQL_NTS));
+    EXPECT_EQ(SQL_SUCCESS, SQLSetStmtAttrW(stmt_, kSsQnMsgtext, msg, SQL_NTS));
     written = -1;
     EXPECT_SQL_OK(
-        SQLGetStmtAttr(stmt_, kSsQnMsgtext, buffer, sizeof(buffer), &written),
+        SQLGetStmtAttrW(stmt_, kSsQnMsgtext, buffer, sizeof(buffer), &written),
         SQL_HANDLE_STMT, stmt_);
     EXPECT_EQ(value_bytes, written);
+    EXPECT_EQ(value, std::basic_string<SQLWCHAR>(buffer));
 
     written = -1;
     EXPECT_SQL_OK(
-        SQLGetStmtAttr(stmt_, kSsQnOptions, buffer, sizeof(buffer), &written),
+        SQLGetStmtAttrW(stmt_, kSsQnOptions, buffer, sizeof(buffer), &written),
         SQL_HANDLE_STMT, stmt_);
     EXPECT_EQ(0, written) << "options untouched by a msgtext set";
 
-    // StringLength on the set path is bytes in the application's TCHAR mode.
-    EXPECT_EQ(SQL_SUCCESS, SQLSetStmtAttr(stmt_, kSsQnMsgtext, msg, 6));
+    // StringLength on the set path is bytes, not UTF-16 units.
+    EXPECT_EQ(SQL_SUCCESS, SQLSetStmtAttrW(stmt_, kSsQnMsgtext, msg, 6));
     std::memset(buffer, 0, sizeof(buffer));
     written = -1;
     EXPECT_SQL_OK(
-        SQLGetStmtAttr(stmt_, kSsQnMsgtext, buffer, sizeof(buffer), &written),
+        SQLGetStmtAttrW(stmt_, kSsQnMsgtext, buffer, sizeof(buffer), &written),
         SQL_HANDLE_STMT, stmt_);
     EXPECT_EQ(6, written);
-    EXPECT_EQ(value.substr(0, 6 / sizeof(SQLTCHAR)), SqlTString(buffer));
+    EXPECT_EQ(value.substr(0, 6 / sizeof(SQLWCHAR)), std::basic_string<SQLWCHAR>(buffer));
 
     // A short buffer truncates with 01004 but still reports the full width, so
     // a caller can size a second call from the first one's answer. A null
     // pointer is the documented length-only query.
-    EXPECT_EQ(SQL_SUCCESS, SQLSetStmtAttr(stmt_, kSsQnMsgtext, msg, SQL_NTS));
+    EXPECT_EQ(SQL_SUCCESS, SQLSetStmtAttrW(stmt_, kSsQnMsgtext, msg, SQL_NTS));
     written = -1;
     EXPECT_EQ(SQL_SUCCESS_WITH_INFO,
-              SQLGetStmtAttr(stmt_, kSsQnMsgtext, buffer, 10, &written));
+              SQLGetStmtAttrW(stmt_, kSsQnMsgtext, buffer, 10, &written));
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01004");
     EXPECT_EQ(value_bytes, written);
 
     written = -1;
     EXPECT_EQ(SQL_SUCCESS,
-              SQLGetStmtAttr(stmt_, kSsQnMsgtext, nullptr, 0, &written));
+              SQLGetStmtAttrW(stmt_, kSsQnMsgtext, nullptr, 0, &written));
     EXPECT_EQ(value_bytes, written);
 
     // A null set pointer with a zero byte count clears either value. This is
     // distinct from a null get pointer above, which only asks for the current
     // length.
     for (SQLINTEGER attribute : {kSsQnMsgtext, kSsQnOptions}) {
-        ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, attribute, msg, SQL_NTS),
+        ASSERT_SQL_OK(SQLSetStmtAttrW(stmt_, attribute, msg, SQL_NTS),
                       SQL_HANDLE_STMT, stmt_);
-        ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, attribute, nullptr, 0),
+        ASSERT_SQL_OK(SQLSetStmtAttrW(stmt_, attribute, nullptr, 0),
                       SQL_HANDLE_STMT, stmt_);
 
         std::memset(buffer, 0, sizeof(buffer));
         written = -1;
-        ASSERT_SQL_OK(SQLGetStmtAttr(stmt_, attribute, buffer, sizeof(buffer),
+        ASSERT_SQL_OK(SQLGetStmtAttrW(stmt_, attribute, buffer, sizeof(buffer),
                                      &written),
                       SQL_HANDLE_STMT, stmt_);
         EXPECT_EQ(0, written);
-        EXPECT_EQ(SQLTCHAR{0}, buffer[0]);
+        EXPECT_EQ(SQLWCHAR{0}, buffer[0]);
+    }
+}
+
+TEST_F(AttributesTest, QueryNotificationWideStringsAcceptByteOffsets) {
+    const SQLWCHAR value[] = {'a', 0xD83D, 0xDE00, 0};
+    alignas(SQLWCHAR) unsigned char storage[sizeof(value) + 1] = {};
+    std::memcpy(storage + 1, value, sizeof(value));
+    SQLPOINTER input = storage + 1;
+    ASSERT_NE(uintptr_t{0}, reinterpret_cast<uintptr_t>(input) % alignof(SQLWCHAR));
+    const SQLINTEGER bytes = sizeof(value) - sizeof(SQLWCHAR);
+
+    for (SQLINTEGER attribute : {kSsQnMsgtext, kSsQnOptions}) {
+        SCOPED_TRACE(attribute);
+        for (SQLINTEGER length : {SQLINTEGER{SQL_NTS}, bytes}) {
+            SCOPED_TRACE(length);
+            ASSERT_SQL_OK(SQLSetStmtAttrW(stmt_, attribute, input, length),
+                          SQL_HANDLE_STMT, stmt_);
+            SQLWCHAR buffer[8] = {};
+            SQLINTEGER written = -1;
+            ASSERT_SQL_OK(SQLGetStmtAttrW(stmt_, attribute, buffer,
+                                          sizeof(buffer), &written),
+                          SQL_HANDLE_STMT, stmt_);
+            EXPECT_EQ(bytes, written);
+            EXPECT_EQ(std::basic_string<SQLWCHAR>(value),
+                      std::basic_string<SQLWCHAR>(buffer));
+        }
     }
 }
 
@@ -1582,22 +1610,21 @@ TEST_F(AttributesTest, QueryNotificationStringsFollowTheByteLengthContract) {
 TEST_F(AttributesTest, QueryNotificationNullNtsSetClearsWithoutFault) {
     SKIP_IF_COMPARING_MSODBCSQL();
 
-    SqlTString value = ODBCTestUtils::ToSqlTStr("seed");
-    SQLTCHAR* text = const_cast<SQLTCHAR*>(value.c_str());
-    SQLTCHAR buffer[16] = {};
+    SQLWCHAR text[] = {'s', 'e', 'e', 'd', 0};
+    SQLWCHAR buffer[16] = {};
 
     for (SQLINTEGER attribute : {kSsQnMsgtext, kSsQnOptions}) {
-        ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, attribute, text, SQL_NTS),
+        ASSERT_SQL_OK(SQLSetStmtAttrW(stmt_, attribute, text, SQL_NTS),
                       SQL_HANDLE_STMT, stmt_);
-        ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, attribute, nullptr, SQL_NTS),
+        ASSERT_SQL_OK(SQLSetStmtAttrW(stmt_, attribute, nullptr, SQL_NTS),
                       SQL_HANDLE_STMT, stmt_);
 
         SQLINTEGER written = -1;
-        ASSERT_SQL_OK(SQLGetStmtAttr(stmt_, attribute, buffer, sizeof(buffer),
+        ASSERT_SQL_OK(SQLGetStmtAttrW(stmt_, attribute, buffer, sizeof(buffer),
                                      &written),
                       SQL_HANDLE_STMT, stmt_);
         EXPECT_EQ(0, written);
-        EXPECT_EQ(SQLTCHAR{0}, buffer[0]);
+        EXPECT_EQ(SQLWCHAR{0}, buffer[0]);
     }
 }
 
@@ -1683,30 +1710,27 @@ TEST_F(AttributesTest, CurrentCommandAdvancesThroughNonRowResults) {
 // -------------------------------------------------------------------
 TEST_F(AttributesTest, QueryNotificationStringsRejectBadNegativeLengths) {
     const SQLINTEGER attributes[] = {kSsQnMsgtext, kSsQnOptions};
-    SqlTString seed = ODBCTestUtils::ToSqlTStr("SEED");
-    SqlTString other = ODBCTestUtils::ToSqlTStr("REPLACED");
+    SQLWCHAR seed[] = {'S', 'E', 'E', 'D', 0};
+    SQLWCHAR other[] = {'R', 'E', 'P', 'L', 'A', 'C', 'E', 'D', 0};
 
     for (SQLINTEGER attribute : attributes) {
         SCOPED_TRACE(attribute);
-        ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, attribute,
-                                     const_cast<SQLTCHAR*>(seed.c_str()),
-                                     SQL_NTS),
+        ASSERT_SQL_OK(SQLSetStmtAttrW(stmt_, attribute, seed, SQL_NTS),
                       SQL_HANDLE_STMT, stmt_);
 
         for (SQLINTEGER length : {-2, -5, -100}) {
             SCOPED_TRACE(length);
             EXPECT_EQ(SQL_ERROR,
-                      SQLSetStmtAttr(stmt_, attribute,
-                                     const_cast<SQLTCHAR*>(other.c_str()),
-                                     length));
+                      SQLSetStmtAttrW(stmt_, attribute, other, length));
             EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HY024");
 
-            SQLTCHAR buffer[32] = {};
+            SQLWCHAR buffer[32] = {};
             SQLINTEGER written = -1;
-            EXPECT_SQL_OK(SQLGetStmtAttr(stmt_, attribute, buffer,
+            EXPECT_SQL_OK(SQLGetStmtAttrW(stmt_, attribute, buffer,
                                          sizeof(buffer), &written),
                           SQL_HANDLE_STMT, stmt_);
-            EXPECT_EQ("SEED", ODBCTestUtils::ToNarrow(SqlTString(buffer)));
+            EXPECT_EQ(std::basic_string<SQLWCHAR>(seed),
+                      std::basic_string<SQLWCHAR>(buffer));
         }
     }
 }

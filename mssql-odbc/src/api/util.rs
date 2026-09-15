@@ -1,8 +1,6 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-use std::slice;
-
 use crate::api::escape::CodeScan;
 use crate::api::odbc_types::{
     SQL_NTS, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlInteger, SqlReturn, SqlSmallInt, SqlWChar,
@@ -130,25 +128,33 @@ pub(crate) unsafe fn read_utf16(ptr: *const SqlWChar, length: SqlSmallInt) -> St
 ///   first NUL terminator when `length == SQL_NTS`.
 /// - `length` must be non-negative or exactly `SQL_NTS`; callers validate that
 ///   first and report `HY090` otherwise.
+/// - The input need not be aligned for `SQLWCHAR`.
 pub(crate) unsafe fn read_utf16_long(ptr: *const SqlWChar, length: SqlInteger) -> String {
     if ptr.is_null() {
         return String::new();
     }
-    let slice = if length == SqlInteger::from(SQL_NTS) {
+    let len = if length == SqlInteger::from(SQL_NTS) {
         let mut len = 0usize;
-        unsafe {
-            while *ptr.add(len) != 0 {
-                len += 1;
-            }
+        // SAFETY: the caller provides readable units through the terminator;
+        // application buffers need not be aligned.
+        while unsafe { ptr.add(len).read_unaligned() } != 0 {
+            len += 1;
         }
-        unsafe { slice::from_raw_parts(ptr, len) }
+        len
     } else {
         match usize::try_from(length) {
             Ok(0) | Err(_) => return String::new(),
-            Ok(len) => unsafe { slice::from_raw_parts(ptr, len) },
+            Ok(len) => len,
         }
     };
-    String::from_utf16_lossy(slice)
+    let units = (0..len).map(|index| {
+        // SAFETY: each unit is within the caller's readable extent. Do not
+        // form a slice: even an empty slice requires an aligned pointer.
+        unsafe { ptr.add(index).read_unaligned() }
+    });
+    char::decode_utf16(units)
+        .map(|unit| unit.unwrap_or(char::REPLACEMENT_CHARACTER))
+        .collect()
 }
 
 /// Read a character connection attribute, whose `StringLength` ODBC defines in
@@ -265,6 +271,63 @@ mod tests {
         rewrite_param_markers, write_if_some,
     };
     use crate::api::odbc_types::{SQL_NTS, SqlInteger, SqlWChar};
+
+    mod memory_safety {
+        use super::*;
+        use std::mem::MaybeUninit;
+
+        #[repr(align(2))]
+        struct Input([MaybeUninit<u8>; 33]);
+
+        #[test]
+        fn utf16_readers_accept_unaligned_initialized_input() {
+            for text in ["", "master", "a\u{1f600}b", "a\0b"] {
+                let units: Vec<u16> = text.encode_utf16().chain(Some(0)).collect();
+                let mut storage = Input([MaybeUninit::uninit(); 33]);
+                for (index, byte) in units.iter().flat_map(|unit| unit.to_ne_bytes()).enumerate() {
+                    storage.0[index + 1].write(byte);
+                }
+                let ptr = storage.0.as_ptr().wrapping_add(1).cast::<u16>();
+                assert!(!ptr.is_aligned());
+                let count = i16::try_from(units.len() - 1).unwrap();
+                let bytes = i32::from(count) * 2;
+                let terminated = text.split('\0').next().unwrap();
+                // SAFETY: only the initialized units, including the terminator,
+                // are readable; the tail deliberately remains uninitialized.
+                unsafe {
+                    assert_eq!(read_utf16(ptr, count), text);
+                    assert_eq!(read_utf16_long(ptr, i32::from(count)), text);
+                    assert_eq!(read_utf16_attr(ptr, bytes), text);
+                    assert_eq!(read_utf16_attr(ptr, bytes + 1), text);
+                    assert_eq!(read_utf16(ptr, SQL_NTS), terminated);
+                    assert_eq!(read_utf16_long(ptr, i32::from(SQL_NTS)), terminated);
+                    assert_eq!(read_utf16_attr(ptr, i32::from(SQL_NTS)), terminated);
+                }
+            }
+        }
+
+        #[test]
+        fn unaligned_utf16_read_preserves_lossy_decoding() {
+            let mut storage = Input([MaybeUninit::uninit(); 33]);
+            for (index, byte) in [0xD800u16, 0x0061, 0xDC00, 0]
+                .iter()
+                .flat_map(|unit| unit.to_ne_bytes())
+                .enumerate()
+            {
+                storage.0[index + 1].write(byte);
+            }
+            let ptr = storage.0.as_ptr().wrapping_add(1).cast::<u16>();
+            assert!(!ptr.is_aligned());
+            // SAFETY: four initialized units include the NUL terminator.
+            unsafe {
+                assert_eq!(read_utf16_long(ptr, 3), "\u{fffd}a\u{fffd}");
+                assert_eq!(
+                    read_utf16_long(ptr, i32::from(SQL_NTS)),
+                    "\u{fffd}a\u{fffd}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn rewrite_no_markers_is_unchanged() {
