@@ -29,9 +29,20 @@ use super::txn::{claim_dbc_client, close_all_cursors, exec_batch, release_dbc_cl
 use super::util::{read_utf16_attr, write_wide_attr};
 use crate::error::free_errors;
 use crate::handles::DbcHandle;
-use crate::handles::dbc::ConnectionState;
+use crate::handles::dbc::{ConnectionState, DbcState};
 
 const SET_OP: &str = "SQLSetConnectAttrW(SQL_ATTR_CURRENT_CATALOG)";
+
+pub(super) fn resolved_current_catalog(state: &DbcState) -> String {
+    state
+        .client
+        .as_ref()
+        .map(|client| client.database())
+        .filter(|database| !database.is_empty())
+        .map(str::to_string)
+        .or_else(|| state.current_catalog.clone())
+        .unwrap_or_default()
+}
 
 /// Renders `name` as a bracket-quoted T-SQL identifier, doubling any embedded
 /// `]`.
@@ -243,19 +254,9 @@ pub(super) unsafe fn get_current_catalog(
     // `SQLGetDiagRec(1)` would report the stale one.
     free_errors(&mut state);
 
-    let live = state
-        .client
-        .as_ref()
-        .map(|client| client.database())
-        // An unnamed database means the client has nothing better than the
-        // pre-connect value to offer.
-        .filter(|db| !db.is_empty())
-        .map(str::to_string);
     // An empty string is the ODBC answer for "no database chosen yet", which is
     // what a fresh handle reports.
-    let catalog = live
-        .or_else(|| state.current_catalog.clone())
-        .unwrap_or_default();
+    let catalog = resolved_current_catalog(&state);
 
     // SAFETY: forwarded from the FFI boundary, where the caller guarantees
     // `value_ptr` is writable for `buffer_length` bytes and `string_length_ptr`

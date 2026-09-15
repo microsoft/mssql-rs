@@ -56,15 +56,19 @@
 //!   this catalog path can honor it; dispatch therefore remains in pattern mode
 //!   (`@fUsePattern = 1` unconditionally below).
 
+use std::time::Instant;
+
 use tracing::{debug, error};
 
+use mssql_tds::connection::tds_client::ExecuteOptions;
 use mssql_tds::datatypes::sql_string::SqlString;
 use mssql_tds::datatypes::sqltypes::SqlType;
 use mssql_tds::error::Error as TdsError;
 use mssql_tds::message::parameters::rpc_parameters::{RpcParameter, StatusFlags};
 
 use super::exec_common::{
-    claim_connection, fail_with_tds, finish_execute, flush_pending_unprepare,
+    claim_connection, deduct_query_timeout, fail_with_tds, finish_execute, flush_pending_unprepare,
+    query_timeout_expired_error,
 };
 use super::odbc_types::{
     SQL_ERROR, SQL_INVALID_HANDLE, SQL_NTS, SqlHandle, SqlReturn, SqlSmallInt, SqlUSmallInt,
@@ -526,7 +530,7 @@ fn run_catalog(
 ) -> SqlReturn {
     let dbc = stmt.parent_dbc();
 
-    {
+    let query_timeout = {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("{name}: stmt mutex poisoned");
             return SQL_ERROR;
@@ -547,38 +551,112 @@ fn run_catalog(
         stmt_state.prepared = None;
         stmt_state.clear_state(STMT_STATE_PREPARED);
         stmt_state.set_state(STMT_STATE_EXEC_STARTED);
-    }
+        stmt_state.query_timeout
+    };
 
     let mut client = match claim_connection(dbc, stmt, statement_handle, name) {
         Ok(client) => client,
         Err(rc) => return rc,
     };
-    // Catalog functions don't share issue #439's blocked-statement scenario and
-    // are out of scope for the SQL_ATTR_QUERY_TIMEOUT wiring below; `0` keeps
-    // their existing unbounded behavior.
-    flush_pending_unprepare(dbc, stmt, &mut client, name, 0);
+    let budget = query_timeout;
+    let started = Instant::now();
 
-    if let Err(e) = begin_transaction_if_manual(dbc, &mut client, name, 0) {
+    // A catalog function is a result-set-generating statement like any other, so
+    // `SQL_ATTR_QUERY_TIMEOUT` bounds it: msodbcsql runs every one of these
+    // through `SQLExecDirectW` itself (`sqlcdd.cpp:1866`), inheriting
+    // `GetQueryTimeOut(lpstmt)`, and each function's documented SQLSTATE table
+    // lists `HYT00` naming this attribute. `0` (the ODBC default) stays
+    // unlimited. Steps are charged against the *fixed* original budget using
+    // *cumulative* elapsed time, so no step is double-charged and sub-second
+    // remainders accumulate rather than being floored away independently.
+    flush_pending_unprepare(dbc, stmt, &mut client, name, query_timeout);
+
+    let query_timeout = match deduct_query_timeout(budget, started.elapsed()) {
+        Ok(remaining) => remaining,
+        Err(()) => {
+            return fail_with_tds(
+                dbc,
+                stmt,
+                statement_handle,
+                client,
+                &query_timeout_expired_error(),
+            );
+        }
+    };
+
+    if let Err(e) = begin_transaction_if_manual(dbc, &mut client, name, query_timeout) {
         return fail_with_tds(dbc, stmt, statement_handle, client, &e);
     }
+
+    let query_timeout = match deduct_query_timeout(budget, started.elapsed()) {
+        Ok(remaining) => remaining,
+        Err(()) => {
+            return fail_with_tds(
+                dbc,
+                stmt,
+                statement_handle,
+                client,
+                &query_timeout_expired_error(),
+            );
+        }
+    };
 
     let (positional, named) = build_params(false);
     let mut exec_result = dbc.runtime.block_on(client.execute_stored_procedure(
         qualified_proc_name(catalog, proc),
         Some(positional),
         named,
-        (),
+        ExecuteOptions::new().timeout_secs(query_timeout),
     ));
 
     if retry_on_error && matches!(exec_result, Err(TdsError::SqlServerError { .. })) {
         debug!(%proc, "{name}: qualified catalog call failed, retrying unqualified");
         let _ = client.take_info_messages();
+        // The retry is part of the same application-visible call, so it shares
+        // the original budget with whole-second accounting, rather than
+        // restarting the full configured timeout.
+        //
+        // "Shares the budget" is not an exact 1x wall-clock cap:
+        // `deduct_query_timeout` floors elapsed time to whole seconds, so a
+        // first attempt that fails after 900ms charges nothing and the retry
+        // gets another full second — about 1.9s against a 1s timeout. What is
+        // guaranteed is that the retry draws down the *same* budget, so the
+        // overshoot is bounded by the sub-second remainder rather than
+        // doubling.
+        //
+        // DIVERGES from msodbcsql, deliberately: its retry is a recursive
+        // `DoDD` (`sqlcdd.cpp:1894`) whose re-entered `SQLExecDirectW` re-reads
+        // the *undeducted* `GetQueryTimeOut(lpstmt)`, so there the retry starts
+        // from a genuinely fresh budget and a two-attempt call can take a full
+        // 2x the configured timeout. Sharing the budget keeps the attribute's
+        // documented meaning — the caller's deadline for the call they made —
+        // rather than letting a driver-internal fallback double it. Tracked by
+        // mssql-rs#547.
+        //
+        // The gate above, by contrast, MATCHES msodbcsql: only a server error
+        // retries, never a timeout or transport failure, mirroring its
+        // `wStdErr != IDS_S1_T00_1` check (`sqlcdd.cpp:1883`).
+        let retry_timeout = match deduct_query_timeout(budget, started.elapsed()) {
+            Ok(remaining) => remaining,
+            Err(()) => {
+                // The budget ran out before the fallback could run. Report the
+                // qualified attempt's own server error rather than `HYT00`:
+                // "invalid object name" is far more actionable than "the budget
+                // ran out on a retry the application never asked for", and that
+                // error is otherwise dropped here along with the info messages
+                // discarded above. (msodbcsql cannot reach this state, since
+                // its retry never re-checks the budget — see mssql-rs#547.)
+                let original = exec_result.expect_err("matches! above proved this is an Err");
+                error!(%original, "{name}: query timeout expired before the unqualified retry");
+                return fail_with_tds(dbc, stmt, statement_handle, client, &original);
+            }
+        };
         let (retry_positional, retry_named) = build_params(true);
         exec_result = dbc.runtime.block_on(client.execute_stored_procedure(
             qualified_proc_name(&None, proc),
             Some(retry_positional),
             retry_named,
-            (),
+            ExecuteOptions::new().timeout_secs(retry_timeout),
         ));
     }
 
@@ -1815,6 +1893,267 @@ mod tests {
         assert!(is_blank(&None));
         assert!(is_blank(&Some(String::new())));
         assert!(!is_blank(&Some("x".to_string())));
+    }
+
+    /// `SQL_ATTR_QUERY_TIMEOUT` must also bound the implicit transaction begin
+    /// `begin_transaction_if_manual` sends before a catalog RPC when the
+    /// connection is in manual-commit mode — AB#46385's AC2 makes the
+    /// pre-execute steps a first-class requirement, and AC5 requires each
+    /// covered entry point to be mutation-resistant.
+    ///
+    /// The sibling test above only delays the RPC response, so it guards the
+    /// `ExecuteOptions` half and nothing else: reverting the pre-execute
+    /// arguments back to `0` left the whole suite green. This delays only the
+    /// server's answer to the Begin request, so it fails if the wiring into
+    /// `flush_pending_unprepare` / `begin_transaction_if_manual` regresses even
+    /// though the RPC step itself is untouched — mirroring
+    /// `exec_direct_query_timeout_bounds_a_delayed_implicit_transaction_begin`.
+    #[test]
+    fn catalog_query_timeout_bounds_a_delayed_implicit_transaction_begin() {
+        use crate::handles::dbc::DbcHandle;
+        use mssql_mock_tds::QueryResponse;
+        use std::time::{Duration, Instant};
+
+        const BEGIN_DELAY: Duration = Duration::from_secs(8);
+        const STMT_TIMEOUT_SECS: u32 = 1;
+        // Comfortably above STMT_TIMEOUT_SECS plus connection/RTT overhead,
+        // comfortably below BEGIN_DELAY — the gap is what proves the statement
+        // timeout, not the server delay, ended the wait.
+        const BOUND: Duration = Duration::from_secs(5);
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let mock_server =
+            crate::test_support::connect_mock_server(dbc, "SELECT 1", QueryResponse::select_one());
+        mock_server.set_tm_begin_delay(BEGIN_DELAY);
+        // Manual-commit mode with no transaction open yet is what makes
+        // `begin_transaction_if_manual` send a real Begin request instead of
+        // returning immediately.
+        dbc.inner.lock().unwrap().autocommit = false;
+
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        stmt.inner.lock().unwrap().query_timeout = STMT_TIMEOUT_SECS;
+
+        let started = Instant::now();
+        let ret = sql_tables_w_safe(h.stmt, stmt, None, None, None, None);
+        let elapsed = started.elapsed();
+
+        assert_eq!(ret, SQL_ERROR);
+        assert!(
+            elapsed < BOUND,
+            "SQLTablesW took {elapsed:?} — a {STMT_TIMEOUT_SECS}s SQL_ATTR_QUERY_TIMEOUT must \
+             bound the implicit transaction begin well below the server's {BEGIN_DELAY:?} delay"
+        );
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(
+            state.diag_records[0].sql_state, *b"HYT00",
+            "a query-timeout expiry must report HYT00, got {:?}",
+            state.diag_records[0].sql_state
+        );
+    }
+
+    /// A best-effort `sp_unprepare` that eats the whole `SQL_ATTR_QUERY_TIMEOUT`
+    /// must stop the catalog call, not let it proceed unbounded.
+    ///
+    /// `flush_pending_unprepare` swallows its own timeout (a leaked handle must
+    /// not fail the caller), so it is the one pre-execute step that can survive
+    /// exhausting the budget — which is exactly why every call site re-checks
+    /// with `deduct_query_timeout` afterwards. This drives that arm: the
+    /// statement is armed with a pending unprepare, the mock holds the RPC well
+    /// past the budget, and the call must report `HYT00` *before* sending the
+    /// catalog procedure rather than starting it with no bound.
+    #[test]
+    fn catalog_query_timeout_exhausted_by_unprepare_fails_before_sending() {
+        use crate::handles::dbc::DbcHandle;
+        use mssql_mock_tds::QueryResponse;
+        use std::time::{Duration, Instant};
+
+        const RESPONSE_DELAY: Duration = Duration::from_secs(8);
+        const STMT_TIMEOUT_SECS: u32 = 1;
+        // A sanity bound only. The real discriminator is the message
+        // assertion below: timing cannot separate the two paths, because a
+        // bypassed deduction just lets the RPC time out on its own budget
+        // and reproduce HYT00 just as quickly.
+        const BOUND: Duration = Duration::from_secs(5);
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let mock_server =
+            crate::test_support::connect_mock_server(dbc, "SELECT 1", QueryResponse::select_one());
+        mock_server.set_rpc_delay(RESPONSE_DELAY);
+
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        crate::test_support::arm_pending_unprepare(dbc, stmt);
+        stmt.inner.lock().unwrap().query_timeout = STMT_TIMEOUT_SECS;
+
+        let started = Instant::now();
+        let ret = sql_tables_w_safe(h.stmt, stmt, None, None, None, None);
+        let elapsed = started.elapsed();
+
+        assert_eq!(ret, SQL_ERROR);
+        assert!(
+            elapsed < BOUND,
+            "SQLTablesW took {elapsed:?} — the {STMT_TIMEOUT_SECS}s budget was already spent by \
+             the unprepare, so the catalog RPC must not have been sent at all"
+        );
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(
+            state.diag_records[0].sql_state, *b"HYT00",
+            "an exhausted budget must report HYT00, got {:?}",
+            state.diag_records[0].sql_state
+        );
+        // This is what makes the test mutation-resistant: the two paths carry
+        // different text. Reaching the RPC and timing out there yields
+        // "Elapsed: deadline has elapsed", so only the pre-send budget check
+        // produces this message.
+        assert!(
+            state.diag_records[0]
+                .message
+                .contains("expired before the statement could be sent"),
+            "the budget must be found exhausted before the RPC is sent, not by the RPC's own \
+             timeout: {}",
+            state.diag_records[0].message
+        );
+    }
+
+    /// The catalog dispatcher's unqualified retry must share the original
+    /// budget, and must report the qualified attempt's own server error when
+    /// that budget is gone.
+    ///
+    /// Reaching this needs a first attempt that *returns a server error* (only
+    /// that enters the retry branch) while cumulative elapsed time still floors
+    /// to the whole budget. Those pull in opposite directions — an RPC that
+    /// outlives its own remaining budget times out instead of returning — so it
+    /// is only reachable when an earlier step contributes a *fractional* second:
+    /// the pending unprepare spends ~0.6s of the 1s budget (flooring to 0, so
+    /// the qualified call still gets a full second), that call then fails at
+    /// ~0.6s, and the ~1.2s total floors to 1 and exhausts the budget before
+    /// the retry is sent.
+    ///
+    /// The two attempts are told apart without any new mock surface: only the
+    /// qualified name carries the catalog (`[CATALOG].sys.sp_tables` vs the
+    /// retry's `[sys].sp_tables`), so a response registered under the catalog
+    /// name answers the first call only and the retry would fall through to the
+    /// unmatched bare-DONE success. That is what makes this mutation-resistant
+    /// in both directions: letting the retry restart from the full budget
+    /// (msodbcsql's behavior — see mssql-rs#547) makes the call *succeed*,
+    /// failing the `SQL_ERROR` assertion, while reporting `HYT00` here instead
+    /// of the original error fails the native-error assertion.
+    #[test]
+    fn catalog_retry_budget_exhausted_reports_the_original_server_error() {
+        use crate::handles::dbc::DbcHandle;
+        use mssql_mock_tds::{QueryResponse, TerminalError};
+        use std::time::Duration;
+
+        // Spends a sub-second slice of the budget per wire call: one call
+        // floors to 0 (so the qualified call still gets the full second and can
+        // return), but two together floor to 1 and exhaust it. That confines
+        // this to `0.5s <= delay + overhead < 1s`; measured here at 606ms after
+        // the unprepare and 1217ms at the retry check, i.e. ~6ms of overhead
+        // per call, so the sleeps dominate. Only the first bound is
+        // load-sensitive — a slow machine grows both figures, which pushes the
+        // second one further past its floor.
+        const WIRE_DELAY: Duration = Duration::from_millis(600);
+        const STMT_TIMEOUT_SECS: u32 = 1;
+        const INVALID_OBJECT_NAME: u32 = 208;
+        // Upper-case because `QueryRegistry::register` upper-cases its key and
+        // then matches it against the raw request bytes.
+        const CATALOG: &str = "ZZQUALIFIEDZZ";
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        // Answers the qualified `[ZZQUALIFIEDZZ].sys.sp_tables` call only.
+        let mock_server = crate::test_support::connect_mock_server(
+            dbc,
+            CATALOG,
+            QueryResponse::error_only(TerminalError::new(
+                INVALID_OBJECT_NAME,
+                16,
+                "Invalid object name 'sp_tables'.",
+            ))
+            .with_delay(WIRE_DELAY),
+        );
+        // Everything else — the pending unprepare, and the retry if it were
+        // ever sent — is unmatched, and only delayed.
+        mock_server.set_rpc_delay(WIRE_DELAY);
+
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        crate::test_support::arm_pending_unprepare(dbc, stmt);
+        stmt.inner.lock().unwrap().query_timeout = STMT_TIMEOUT_SECS;
+
+        // A non-blank catalog is what turns the unqualified retry on.
+        let ret = sql_tables_w_safe(h.stmt, stmt, Some(CATALOG.to_string()), None, None, None);
+
+        assert_eq!(
+            ret, SQL_ERROR,
+            "the retry must not run on an exhausted budget; had it run, the \
+             unmatched mock would have answered it with success"
+        );
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(
+            state.diag_records[0].native_error, INVALID_OBJECT_NAME as i32,
+            "the qualified attempt's own server error must be reported, not the \
+             budget expiry that stopped the retry: {:?} / {}",
+            state.diag_records[0].sql_state, state.diag_records[0].message
+        );
+        assert_ne!(
+            state.diag_records[0].sql_state, *b"HYT00",
+            "a server error must not be replaced by HYT00"
+        );
+    }
+
+    /// `SQL_ATTR_QUERY_TIMEOUT` must bound catalog functions, not just
+    /// `SQLExecute`/`SQLExecDirectW`. msodbcsql executes every catalog
+    /// procedure through `SQLExecDirectW` itself (`sqlcdd.cpp:1866`), so they
+    /// inherit `GetQueryTimeOut(lpstmt)`, and all ten ODBC catalog functions'
+    /// reference pages list `HYT00` naming this attribute (this crate
+    /// implements seven of them).
+    ///
+    /// Delays the `sp_tables` RPC response itself (via `RPC_DELAY_KEY`) rather
+    /// than the transaction begin, so this fails if the timeout stops reaching
+    /// the RPC's own `ExecuteOptions` — the regression mssql-rs#466 describes,
+    /// where passing `()` left `remaining_request_timeout` unset for the whole
+    /// batch and left the row reads unbounded too.
+    #[test]
+    fn catalog_query_timeout_bounds_a_longer_server_delay() {
+        use crate::handles::dbc::DbcHandle;
+        use mssql_mock_tds::QueryResponse;
+        use std::time::{Duration, Instant};
+
+        const RESPONSE_DELAY: Duration = Duration::from_secs(8);
+        const STMT_TIMEOUT_SECS: u32 = 1;
+        // Comfortably above STMT_TIMEOUT_SECS plus connection/RTT overhead,
+        // comfortably below RESPONSE_DELAY — the gap is what proves the
+        // statement timeout, not the server delay, ended the wait.
+        const BOUND: Duration = Duration::from_secs(5);
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let mock_server =
+            crate::test_support::connect_mock_server(dbc, "SELECT 1", QueryResponse::select_one());
+        mock_server.set_rpc_delay(RESPONSE_DELAY);
+
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        stmt.inner.lock().unwrap().query_timeout = STMT_TIMEOUT_SECS;
+
+        let started = Instant::now();
+        // No catalog argument, so the unqualified-retry path stays off and the
+        // single delayed RPC is what the timeout has to bound.
+        let ret = sql_tables_w_safe(h.stmt, stmt, None, None, None, None);
+        let elapsed = started.elapsed();
+
+        assert_eq!(ret, SQL_ERROR);
+        assert!(
+            elapsed < BOUND,
+            "SQLTablesW took {elapsed:?} — a {STMT_TIMEOUT_SECS}s SQL_ATTR_QUERY_TIMEOUT must \
+             bound the wait well below the server's {RESPONSE_DELAY:?} delay"
+        );
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(
+            state.diag_records[0].sql_state, *b"HYT00",
+            "a query-timeout expiry must report HYT00, got {:?}",
+            state.diag_records[0].sql_state
+        );
     }
 
     #[test]

@@ -309,7 +309,7 @@ pub(crate) unsafe fn sql_fetch_scroll_impl(
 /// Why a bound column write did not land exactly, so the row can report the
 /// same SQLSTATE `SQLGetData` would have for the identical value.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum RowIssue {
+pub(crate) enum RowIssue {
     /// 01004 — the value did not fit the bound buffer.
     StringTruncated,
     /// 01S07 — fractional digits were dropped to fit the target.
@@ -324,10 +324,12 @@ enum RowIssue {
     IndicatorRequired,
     /// HYC00 — a target or source this driver does not deliver yet.
     Unsupported,
+    /// HY000 — a required platform service failed during conversion.
+    Internal,
 }
 
 impl RowIssue {
-    fn post(self, stmt_state: &mut StmtState) {
+    pub(crate) fn post(self, stmt_state: &mut StmtState) {
         match self {
             RowIssue::StringTruncated => post_diag(stmt_state, WARN_STRING_TRUNCATION),
             RowIssue::FractionalTruncated => post_diag(stmt_state, WARN_FRACTIONAL_TRUNCATION),
@@ -335,6 +337,7 @@ impl RowIssue {
             RowIssue::Restricted => post_diag(stmt_state, ERR_RESTRICTED_DATA_TYPE),
             RowIssue::InvalidCharacter => post_diag(stmt_state, ERR_INVALID_CHARACTER_VALUE),
             RowIssue::IndicatorRequired => post_diag(stmt_state, ERR_INDICATOR_REQUIRED),
+            RowIssue::Internal => post_diag(stmt_state, ERR_INTERNAL_CONVERSION),
             RowIssue::Unsupported => post_sql_error(
                 stmt_state,
                 SQLSTATE_HYC00,
@@ -347,7 +350,7 @@ impl RowIssue {
 
 /// The per-row outcome recorded in the row status array.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum RowOutcome {
+pub(crate) enum RowOutcome {
     Success,
     Info(RowIssue),
     Error(RowIssue),
@@ -2169,6 +2172,21 @@ unsafe fn deliver_encoded_string(
     }
 }
 
+/// Delivers one value into a bound buffer outside the rowset machinery.
+///
+/// Used for procedure output parameters, which are the same conversion problem
+/// as a fetched column but arrive on a RETURNVALUE token instead of a row.
+/// Preserves the conversion's warning or error, including its SQLSTATE.
+///
+/// # Safety
+/// `binding`'s buffers must be valid for one element.
+pub(crate) unsafe fn deliver_bound_value(
+    binding: &ColumnBinding,
+    value: &ColumnValues,
+) -> RowOutcome {
+    unsafe { deliver_bound(binding, 0, 0, value) }
+}
+
 /// Writes one column value into its bound buffer slot for row `row_index`.
 ///
 /// # Safety
@@ -2209,8 +2227,11 @@ unsafe fn deliver_bound(
         return RowOutcome::Error(RowIssue::IndicatorRequired);
     }
 
-    let slot =
-        unsafe { (binding.target_value_ptr as *mut u8).add(bind_offset + row_index * stride) };
+    let slot = if binding.target_value_ptr.is_null() {
+        std::ptr::null_mut()
+    } else {
+        unsafe { (binding.target_value_ptr as *mut u8).add(bind_offset + row_index * stride) }
+    };
 
     if is_null {
         unsafe { write_if_some(indicator, SQL_NULL_DATA) };
@@ -2230,14 +2251,7 @@ unsafe fn deliver_bound(
         let converted = unsafe {
             convert_typed_c(value, binding.target_type, slot as SqlPointer, octet_length)
         };
-        return match converted {
-            Ok(ConvOk::Exact) => RowOutcome::Success,
-            Ok(ConvOk::Truncated) => RowOutcome::Info(RowIssue::FractionalTruncated),
-            Err(ConvError::OutOfRange) => RowOutcome::Error(RowIssue::OutOfRange),
-            Err(ConvError::Restricted) => RowOutcome::Error(RowIssue::Restricted),
-            Err(ConvError::InvalidCharacterValue) => RowOutcome::Error(RowIssue::InvalidCharacter),
-            Err(ConvError::NotHandledHere) => RowOutcome::Error(RowIssue::Unsupported),
-        };
+        return typed_conv_outcome(converted);
     }
 
     if binding.target_type == SQL_C_BINARY {
@@ -2278,18 +2292,30 @@ unsafe fn deliver_bound(
         let utf16: Vec<u16> = text.encode_utf16().collect();
         unsafe { write_if_some(octet_length, (utf16.len() * 2) as SqlLen) };
         let truncated = unsafe { copy_with_nul(slot as *mut SqlWChar, buf_elements, &utf16) };
-        if truncated {
+        if truncated || (slot.is_null() && !utf16.is_empty()) {
             return RowOutcome::Info(RowIssue::StringTruncated);
         }
     } else {
         let bytes = text.as_bytes();
         unsafe { write_if_some(octet_length, bytes.len() as SqlLen) };
         let truncated = unsafe { copy_with_nul(slot, buf_elements, bytes) };
-        if truncated {
+        if truncated || (slot.is_null() && !bytes.is_empty()) {
             return RowOutcome::Info(RowIssue::StringTruncated);
         }
     }
     RowOutcome::Success
+}
+
+fn typed_conv_outcome(converted: Result<ConvOk, ConvError>) -> RowOutcome {
+    match converted {
+        Ok(ConvOk::Exact) => RowOutcome::Success,
+        Ok(ConvOk::Truncated) => RowOutcome::Info(RowIssue::FractionalTruncated),
+        Err(ConvError::OutOfRange) => RowOutcome::Error(RowIssue::OutOfRange),
+        Err(ConvError::Restricted) => RowOutcome::Error(RowIssue::Restricted),
+        Err(ConvError::InvalidCharacterValue) => RowOutcome::Error(RowIssue::InvalidCharacter),
+        Err(ConvError::Internal) => RowOutcome::Error(RowIssue::Internal),
+        Err(ConvError::NotHandledHere) => RowOutcome::Error(RowIssue::Unsupported),
+    }
 }
 
 /// Writes one exact fixed-width value and its byte-count indicator.
@@ -4638,6 +4664,7 @@ mod tests {
             (RowIssue::InvalidCharacter, *b"22018"),
             (RowIssue::IndicatorRequired, *b"22002"),
             (RowIssue::Unsupported, *b"HYC00"),
+            (RowIssue::Internal, *b"HY000"),
         ];
         for (issue, state) in cases {
             let h = TestHandles::with_env_dbc_stmt();
@@ -4650,6 +4677,14 @@ mod tests {
                 "{issue:?}"
             );
         }
+    }
+
+    #[test]
+    fn internal_typed_conversion_failure_is_a_row_error() {
+        assert_eq!(
+            typed_conv_outcome(Err(ConvError::Internal)),
+            RowOutcome::Error(RowIssue::Internal)
+        );
     }
 
     /// The rows the fetch did not fill must be marked, or the application reads

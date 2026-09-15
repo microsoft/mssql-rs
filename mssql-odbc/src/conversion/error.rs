@@ -34,4 +34,6 @@ pub(crate) enum ConvError {
     /// A character column's text is not a valid literal for the requested target
     /// (SQLSTATE `22018`). Terminal.
     InvalidCharacterValue,
+    /// A required platform service failed (SQLSTATE `HY000`). Terminal.
+    Internal,
 }

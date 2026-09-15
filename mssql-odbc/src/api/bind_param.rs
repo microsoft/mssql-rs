@@ -8,8 +8,9 @@ use tracing::{debug, error};
 
 use super::sqlstate::*;
 use crate::api::odbc_types::{
-    SQL_C_DEFAULT, SQL_ERROR, SQL_INVALID_HANDLE, SQL_PARAM_INPUT, SQL_SUCCESS, SqlHandle, SqlLen,
-    SqlPointer, SqlReturn, SqlSmallInt, SqlULen, SqlUSmallInt,
+    SQL_C_DEFAULT, SQL_ERROR, SQL_INVALID_HANDLE, SQL_PARAM_INPUT, SQL_PARAM_INPUT_OUTPUT,
+    SQL_PARAM_INPUT_OUTPUT_STREAM, SQL_PARAM_OUTPUT, SQL_PARAM_OUTPUT_STREAM, SQL_RETURN_VALUE,
+    SQL_SUCCESS, SqlHandle, SqlLen, SqlPointer, SqlReturn, SqlSmallInt, SqlULen, SqlUSmallInt,
 };
 use crate::api::type_rules::{
     SqlTypeSupport, canonical_c_type, classify_parameter_sql_type, is_valid_c_type,
@@ -253,21 +254,37 @@ fn sql_bind_parameter_safe(
             return SQL_ERROR;
         }
 
-        // Phase 1: input parameters only. Output / input-output binding is a
-        // deferred feature.
-        if input_output_type != SQL_PARAM_INPUT {
-            error!(
-                input_output_type,
-                "SQLBindParameter: only input parameters are supported"
-            );
-            post_sql_error(
-                &mut stmt_state,
-                SQLSTATE_HYC00,
-                0,
-                "Output parameters not yet implemented",
-            );
-            return SQL_ERROR;
+        // Output values are only ever produced by a procedure call, so a
+        // direction other than input is accepted here and enforced at execute
+        // time. Streamed output (SQL_PARAM_OUTPUT_STREAM / _INPUT_OUTPUT_STREAM)
+        // is data-at-execution output, which this driver does not implement.
+        match input_output_type {
+            SQL_PARAM_INPUT | SQL_PARAM_INPUT_OUTPUT | SQL_PARAM_OUTPUT | SQL_RETURN_VALUE => {}
+            SQL_PARAM_OUTPUT_STREAM | SQL_PARAM_INPUT_OUTPUT_STREAM => {
+                error!(
+                    input_output_type,
+                    "SQLBindParameter: streamed output parameters are not supported"
+                );
+                post_sql_error(
+                    &mut stmt_state,
+                    SQLSTATE_HYC00,
+                    0,
+                    "Streamed output parameters are not implemented",
+                );
+                return SQL_ERROR;
+            }
+            _ => {
+                error!(
+                    input_output_type,
+                    "SQLBindParameter: invalid InputOutputType"
+                );
+                post_diag(&mut stmt_state, ERR_INVALID_PARAMETER_TYPE);
+                return SQL_ERROR;
+            }
         }
+
+        // SQLBindParameter/SetIPDRec in sqlcdesc.cpp retain indicator-only
+        // output bindings; GetReturnValue treats a null destination as size 0.
 
         (stmt_state.effective_apd(stmt), c_type)
     };
@@ -530,7 +547,65 @@ mod tests {
     }
 
     #[test]
-    fn output_parameter_is_rejected_hyc00() {
+    fn output_directions_are_accepted() {
+        for direction in [
+            SQL_PARAM_INPUT,
+            SQL_PARAM_INPUT_OUTPUT,
+            SQL_PARAM_OUTPUT,
+            SQL_RETURN_VALUE,
+        ] {
+            let h = TestHandles::with_env_dbc_stmt();
+            let mut buf: Vec<u8> = b"abc\0".to_vec();
+            let mut ind: SqlLen = 0;
+            let ret = unsafe {
+                sql_bind_parameter(
+                    h.stmt,
+                    1,
+                    direction,
+                    SQL_C_CHAR,
+                    SQL_VARCHAR,
+                    0,
+                    0,
+                    buf.as_mut_ptr() as SqlPointer,
+                    buf.len() as SqlLen,
+                    &mut ind,
+                )
+            };
+            assert_eq!(ret, SQL_SUCCESS, "direction {direction}");
+        }
+    }
+
+    /// Data-at-execution *output* is a separate feature; ODBC's streamed
+    /// directions stay refused rather than silently behaving like plain output.
+    #[test]
+    fn streamed_output_directions_are_refused() {
+        for direction in [SQL_PARAM_OUTPUT_STREAM, SQL_PARAM_INPUT_OUTPUT_STREAM] {
+            let h = TestHandles::with_env_dbc_stmt();
+            let mut buf: Vec<u8> = b"abc\0".to_vec();
+            let mut ind: SqlLen = 0;
+            let ret = unsafe {
+                sql_bind_parameter(
+                    h.stmt,
+                    1,
+                    direction,
+                    SQL_C_CHAR,
+                    SQL_VARCHAR,
+                    0,
+                    0,
+                    buf.as_mut_ptr() as SqlPointer,
+                    buf.len() as SqlLen,
+                    &mut ind,
+                )
+            };
+            assert_eq!(ret, SQL_ERROR, "direction {direction}");
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let state = stmt.inner.lock().unwrap();
+            assert_eq!(state.diag_records[0].sql_state, SQLSTATE_HYC00);
+        }
+    }
+
+    #[test]
+    fn unknown_direction_is_refused() {
         let h = TestHandles::with_env_dbc_stmt();
         let mut buf: Vec<u8> = b"abc\0".to_vec();
         let mut ind: SqlLen = 0;
@@ -538,7 +613,7 @@ mod tests {
             sql_bind_parameter(
                 h.stmt,
                 1,
-                SQL_PARAM_OUTPUT,
+                99,
                 SQL_C_CHAR,
                 SQL_VARCHAR,
                 0,
@@ -549,9 +624,27 @@ mod tests {
             )
         };
         assert_eq!(ret, SQL_ERROR);
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
-        let state = stmt.inner.lock().unwrap();
-        assert_eq!(state.diag_records[0].sql_state, SQLSTATE_HYC00);
+    }
+
+    #[test]
+    fn output_parameter_accepts_an_indicator_without_a_value_buffer() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let mut ind: SqlLen = 0;
+        let ret = unsafe {
+            sql_bind_parameter(
+                h.stmt,
+                1,
+                SQL_PARAM_OUTPUT,
+                SQL_C_CHAR,
+                SQL_VARCHAR,
+                0,
+                0,
+                std::ptr::null_mut(),
+                0,
+                &mut ind,
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS);
     }
 
     #[test]
@@ -977,6 +1070,7 @@ mod tests {
                     mssql_tds::connection::tds_client::StatementId::from_raw_for_test(42),
                 ),
                 marker_count: 0,
+                original_sql: String::new(),
             });
         }
         let mut buf: Vec<u8> = b"abc\0".to_vec();
@@ -1040,6 +1134,7 @@ mod tests {
                     mssql_tds::connection::tds_client::StatementId::from_raw_for_test(42),
                 ),
                 marker_count: 0,
+                original_sql: String::new(),
             });
         }
         poison_apd(h.apd());

@@ -8,6 +8,7 @@ use crate::{
     connection::execution_context::ExecutionContext,
     core::TdsResult,
     datatypes::encoder::GenericEncoder,
+    error::Error,
     io::packet_writer::{PacketWriter, TdsPacketWriter},
     message::messages::PacketType,
     token::tokens::SqlCollation,
@@ -21,6 +22,8 @@ use super::{
 use crate::message::headers::write_headers;
 
 pub(crate) const PROC_ID_SWITCH: u16 = 0xffff;
+// [MS-TDS] 2.2.6.6 limits ProcName to 1046 bytes, encoded as US_VARCHAR.
+const MAX_PROC_NAME_UTF16_UNITS: u16 = 523;
 /// TDS 7.2+ delimiter between RPC requests carried in one RPC message.
 pub(crate) const RPC_BATCH_DELIMITER: u8 = 0xff;
 
@@ -168,10 +171,15 @@ impl<'a> SqlRpc<'a> {
     async fn write_proc(&self, packet_writer: &mut PacketWriter<'_>) -> TdsResult<()> {
         match &self.rpc_type {
             RpcType::Named(stored_proc_name) => {
-                // Write the procedure name to the packet writer
-                packet_writer
-                    .write_i16_async((stored_proc_name.len() as u8).into())
-                    .await?;
+                let name_len = u16::try_from(stored_proc_name.encode_utf16().count())
+                    .ok()
+                    .filter(|&len| len <= MAX_PROC_NAME_UTF16_UNITS)
+                    .ok_or_else(|| {
+                        Error::UsageError(format!(
+                            "RPC procedure name exceeds {MAX_PROC_NAME_UTF16_UNITS} UTF-16 code units."
+                        ))
+                    })?;
+                packet_writer.write_u16_async(name_len).await?;
                 packet_writer
                     .write_string_unicode_async(stored_proc_name.as_str())
                     .await?;
@@ -246,5 +254,152 @@ impl Request for SqlRpc<'_> {
         self.serialize_prefix(packet_writer).await?;
         packet_writer.finalize().await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::io::packet_writer::tests::MockNetworkWriter;
+    use futures::executor::block_on;
+
+    #[test]
+    fn named_proc_serializes_utf16_length_and_options() {
+        for name in [
+            String::new(),
+            "dbo.proc".into(),
+            "[dbo].[路由]".into(),
+            "[dbo].[𐐀proc]".into(),
+            "a".repeat(255),
+            "a".repeat(256),
+            "路".repeat(100),
+            "a".repeat(usize::from(MAX_PROC_NAME_UTF16_UNITS)),
+            "𐐀".repeat(261) + "a",
+        ] {
+            let mut mock = MockNetworkWriter::new(4096);
+            let mut writer = PacketWriter::new(PacketType::RpcRequest, &mut mock, None, None);
+            let collation = SqlCollation::default();
+            let rpc = SqlRpc::new(
+                RpcType::Named(name.clone()),
+                None,
+                None,
+                &collation,
+                &ExecutionContext::new(),
+            );
+            block_on(rpc.write_proc(&mut writer)).unwrap();
+            let mut expected = u16::try_from(name.encode_utf16().count())
+                .unwrap()
+                .to_le_bytes()
+                .to_vec();
+            expected.extend(name.encode_utf16().flat_map(u16::to_le_bytes));
+            expected.extend([0, 0]);
+            assert_eq!(&writer.get_payload().into_inner()[8..], expected);
+        }
+    }
+
+    #[test]
+    fn named_proc_rejects_oversized_names_before_writing() {
+        for name in [
+            "a".repeat(usize::from(MAX_PROC_NAME_UTF16_UNITS) + 1),
+            "𐐀".repeat(262),
+            "a".repeat(usize::from(PROC_ID_SWITCH)),
+            "a".repeat(usize::from(u16::MAX) + 1),
+        ] {
+            let mut mock = MockNetworkWriter::new(4096);
+            let mut writer = PacketWriter::new(PacketType::RpcRequest, &mut mock, None, None);
+            let collation = SqlCollation::default();
+            let rpc = SqlRpc::new(
+                RpcType::Named(name),
+                None,
+                None,
+                &collation,
+                &ExecutionContext::new(),
+            );
+            let before = writer.get_payload().into_inner();
+            assert!(matches!(
+                block_on(rpc.write_proc(&mut writer)),
+                Err(Error::UsageError(_))
+            ));
+            assert_eq!(writer.get_payload().into_inner(), before);
+            drop(writer);
+            assert!(mock.data.is_empty());
+        }
+    }
+
+    #[test]
+    fn named_proc_encoding_is_shared_by_all_serializers() {
+        for name in ["[dbo].[路由]".to_owned(), "a".repeat(256)] {
+            let collation = SqlCollation::default();
+            let mut context = ExecutionContext::new();
+            context.set_transaction_descriptor(1);
+            let rpc = SqlRpc::new(
+                RpcType::Named(name.clone()),
+                None,
+                None,
+                &collation,
+                &context,
+            );
+            let mut expected = Vec::new();
+            for route in 0..4 {
+                let mut mock = MockNetworkWriter::new(4096);
+                let mut writer = PacketWriter::new(PacketType::RpcRequest, &mut mock, None, None);
+                block_on(async {
+                    match route {
+                        0 => rpc.serialize(&mut writer).await.unwrap(),
+                        1 => {
+                            rpc.serialize_prefix(&mut writer).await.unwrap();
+                            writer.finalize().await.unwrap();
+                        }
+                        _ => {
+                            let first = route == 2;
+                            let rpc = SqlRpc::new_batch_command(
+                                RpcType::Named(name.clone()),
+                                None,
+                                None,
+                                &collation,
+                                &context,
+                                first,
+                            );
+                            rpc.serialize_batch_command(&mut writer, first)
+                                .await
+                                .unwrap();
+                            writer.finalize().await.unwrap();
+                        }
+                    }
+                });
+                drop(writer);
+                let payload = &mock.data[8..];
+                if route == 0 {
+                    expected = payload.to_vec();
+                } else if route == 3 {
+                    assert_eq!(payload[0], RPC_BATCH_DELIMITER);
+                    let header_len =
+                        usize::try_from(u32::from_le_bytes(expected[..4].try_into().unwrap()))
+                            .unwrap();
+                    assert_eq!(&payload[1..], &expected[header_len..]);
+                } else {
+                    assert_eq!(payload, expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn proc_id_serialization_is_unchanged() {
+        let mut mock = MockNetworkWriter::new(4096);
+        let mut writer = PacketWriter::new(PacketType::RpcRequest, &mut mock, None, None);
+        let collation = SqlCollation::default();
+        let rpc = SqlRpc::new(
+            RpcType::ProcId(RpcProcs::ExecuteSql),
+            None,
+            None,
+            &collation,
+            &ExecutionContext::new(),
+        );
+        block_on(rpc.write_proc(&mut writer)).unwrap();
+        assert_eq!(
+            &writer.get_payload().into_inner()[8..],
+            &[0xff, 0xff, 10, 0, 0, 0]
+        );
     }
 }

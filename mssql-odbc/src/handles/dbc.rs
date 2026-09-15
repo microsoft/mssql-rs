@@ -121,8 +121,24 @@ pub(crate) struct DbcState {
     /// `SQL_ATTR_CONNECTION_TIMEOUT` in seconds. Stored, not yet honored.
     /// `0` is the ODBC default and means "no timeout".
     pub(crate) connection_timeout: u32,
-    /// `SQL_ATTR_PACKET_SIZE` in bytes. Stored, not yet honored.
+    /// `SQL_ATTR_PACKET_SIZE` in bytes: the app-set attribute (or default),
+    /// surviving `SQLDisconnect` so the next connect attempt on this handle
+    /// starts from it again. Never overwritten with a resolved or negotiated
+    /// value — see [`effective_packet_size`](Self::effective_packet_size).
+    /// `0` is a valid stored value (msodbcsql's "let the connection pick its
+    /// own default" sentinel, exempt from the usual clamp — see
+    /// `set_connect_attr::sql_set_connect_attr_w_impl`); it is resolved to the
+    /// `ClientContext` default at connect time rather than seeded verbatim.
     pub(crate) packet_size: u32,
+    /// The packet size actually resolved for the current connection (attribute
+    /// seed, then any `PacketSize=` override), kept separate from
+    /// [`packet_size`](Self::packet_size) for the same reason as
+    /// [`effective_vendor_settings`](Self::effective_vendor_settings): a
+    /// connection-string keyword must not outlive the connection it came from
+    /// and leak onto the handle's next connect attempt. `None` when
+    /// disconnected; `SQLGetConnectAttr`/`SQLGetInfo` fall back to
+    /// [`packet_size`](Self::packet_size) in that case.
+    pub(crate) effective_packet_size: Option<u32>,
     /// `SQL_ATTR_AUTOCOMMIT`. `true` is the ODBC-mandated default
     /// (msodbcsql `SQL_AUTOCOMMIT_DEFAULT`); `false` selects manual-commit, in
     /// which the driver keeps a transaction open until `SQLEndTran`.
@@ -258,6 +274,7 @@ impl DbcHandle {
                 access_mode: SQL_MODE_READ_WRITE,
                 connection_timeout: 0,
                 packet_size: DEFAULT_PACKET_SIZE,
+                effective_packet_size: None,
                 autocommit: true,
                 txn_isolation: SQL_TXN_READ_COMMITTED,
                 local_tran_started: false,

@@ -15,6 +15,7 @@ pub(crate) use stmt::StmtHandle;
 
 use std::collections::HashMap;
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex, MutexGuard};
 
 use tracing::{debug, trace};
@@ -75,6 +76,7 @@ pub(crate) enum HandleType {
 /// already documents and does not attempt to close here.
 static LIVE_HANDLES: LazyLock<Mutex<HashMap<usize, HandleType>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+static LIVE_ENV_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// Locks `LIVE_HANDLES`, recovering the guard even if the mutex is
 /// poisoned. Its critical sections are a single `HashMap` operation each,
@@ -100,6 +102,10 @@ pub(crate) fn live_type(raw: *mut c_void) -> Option<HandleType> {
     live_handles().get(&(raw as usize)).copied()
 }
 
+pub(crate) fn live_env_count() -> usize {
+    LIVE_ENV_COUNT.load(Ordering::Acquire)
+}
+
 /// Returns whether `raw` currently refers to a live handle of any type.
 /// Only used by tests today — production call sites need the type check
 /// `live_type` itself provides, so they match on it directly.
@@ -116,6 +122,9 @@ pub(crate) fn handle_to_raw<T: HasObjectType>(mut handle: Box<T>) -> *mut c_void
     let object_type = *handle.object_type_mut();
     let raw = Box::into_raw(handle) as *mut c_void;
     live_handles().insert(raw as usize, object_type);
+    if object_type == HandleType::Env {
+        LIVE_ENV_COUNT.fetch_add(1, Ordering::Release);
+    }
     raw
 }
 
@@ -162,6 +171,9 @@ pub(crate) unsafe fn free_handle<T: HasObjectType>(raw: *mut c_void) {
         live_handles().remove(&(raw as usize));
         let handle = unsafe { &mut *(raw as *mut T) };
         let object_type = *handle.object_type_mut();
+        if object_type == HandleType::Env {
+            LIVE_ENV_COUNT.fetch_sub(1, Ordering::Release);
+        }
         debug!(?raw, ?object_type, "Freeing handle");
         *handle.object_type_mut() = HandleType::Invalid;
         let _ = unsafe { Box::from_raw(raw as *mut T) };

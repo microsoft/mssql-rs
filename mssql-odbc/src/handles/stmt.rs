@@ -25,6 +25,7 @@ use mssql_tds::encoding_rs;
 use mssql_tds::encoding_rs::Decoder;
 use mssql_tds::message::parameters::rpc_parameters::RpcParameter;
 use mssql_tds::query::metadata::{ColumnMetadata, PlpEncoding};
+use mssql_tds::query::result::ReturnValue;
 use mssql_tds::token::tokens::SqlCollation;
 
 /// State for a PLP column being streamed across repeated SQLGetData calls.
@@ -434,12 +435,18 @@ pub(crate) struct StmtState {
     /// Cleared by [`StmtState::clear_exhaustion_state`] alongside
     /// `batch_exhausted`.
     pub(crate) pending_fetch_info: Vec<SqlInfoMessage>,
+    /// Owned before the drained client can be reused by another statement.
+    /// Delivered once by SQLMoreResults using the bindings current at that call.
+    pub(crate) pending_output_params: Option<(Vec<ReturnValue>, Option<i32>)>,
     /// The prepared statement (rewritten SQL + server handle once materialized)
     /// stored by `SQLPrepare`, bundled with its `@P1..@Pn` marker count so the
     /// two can only be set together. The server-side prepare is deferred to
     /// `SQLExecute`. `Some` marks the statement as prepared; the handle is filled
     /// after the first execute.
     pub(crate) prepared: Option<PreparedPlan>,
+    /// Marker count of the accepted direct SQL, independent of a prepared plan.
+    /// Retained across cursor close and parameter reset; replaced by new SQL.
+    pub(crate) direct_marker_count: Option<usize>,
     /// Metadata inferred by `SQLDescribeParam`, indexed by parameter ordinal.
     /// The first describe call fills every marker; `SQLPrepare` invalidates it.
     pub(crate) parameter_metadata: Vec<ParameterDescription>,
@@ -456,6 +463,7 @@ pub(crate) struct StmtState {
     /// this: it is what keeps a live orphan from being discarded on the
     /// `sp_execute` reuse path.
     pub(crate) pending_unprepare: Option<StatementId>,
+    pub(crate) parameter_array: Option<crate::api::execute::BatchClientResults>,
     /// `true` when SQLFetch has positioned the cursor on a row ready for SQLGetData.
     pub(crate) row_positioned: bool,
     /// The column value captured by the most recent resume_row_to_column call, with its 1-based column index.
@@ -542,6 +550,10 @@ pub(crate) struct StmtState {
     /// for every `execute*` call, so a non-zero value bounds the wait and
     /// surfaces `HYT00` on expiry, matching msodbcsql.
     pub(crate) query_timeout: u32,
+    /// True only for a direct procedure RPC whose first binding consumes
+    /// RETURNSTATUS. Text/prepared calls receive their return binding through
+    /// a named RETURNVALUE instead of the wrapper RPC's status.
+    pub(crate) call_returns_status: bool,
     /// `SQL_ATTR_MAX_ROWS`: cap on the number of rows returned from each result
     /// set; `0` (the ODBC default) means no cap.
     ///
@@ -651,6 +663,16 @@ impl InertStmtAttrs {
     /// inert identifiers.
     pub(crate) fn get(&self, attribute: SqlInteger) -> Option<SqlULen> {
         Self::index_of(attribute).map(|i| self.0[i])
+    }
+
+    /// True when `SQL_ATTR_NOSCAN` is on, i.e. the application has asked the
+    /// driver not to scan its SQL for ODBC escape sequences.
+    ///
+    /// The attribute keeps its measured get/set behaviour — it is stored and
+    /// round-tripped like the rest of the inert set — but the execution path
+    /// now reads it, so it actually suppresses translation.
+    pub(crate) fn noscan(&self) -> bool {
+        self.get(odbc_types::SQL_ATTR_NOSCAN) == Some(odbc_types::SQL_NOSCAN_ON)
     }
 
     /// Stores `value`, returning whether `attribute` is an inert identifier.
@@ -1226,6 +1248,14 @@ pub(crate) struct PreparedPlan {
     /// Number of `@P1..@Pn` markers in `stmt`'s SQL, computed once at prepare so
     /// `SQLExecute` builds the parameter list without re-scanning the text.
     pub(crate) marker_count: usize,
+    /// The statement text exactly as the application supplied it, before escape
+    /// translation and marker rewriting.
+    ///
+    /// Kept because the rewritten text is lossy for metadata: `SQLDescribeParam`
+    /// has to translate escapes even when `SQL_ATTR_NOSCAN` is on, and by then
+    /// `{? = call proc(?)}` would already have become `{@P1 = call proc(@P2)}`,
+    /// where the canonical return marker is no longer recognisable.
+    pub(crate) original_sql: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1261,6 +1291,7 @@ impl StmtState {
         self.batch_exhausted = false;
         self.pending_fetch_error = None;
         self.pending_fetch_info.clear();
+        self.pending_output_params = None;
     }
 
     /// The statement's currently *effective* ARD: the explicit descriptor
@@ -1481,10 +1512,13 @@ impl StmtHandle {
                 batch_exhausted: false,
                 pending_fetch_error: None,
                 pending_fetch_info: Vec::new(),
+                pending_output_params: None,
                 prepared: None,
+                direct_marker_count: None,
                 parameter_metadata: Vec::new(),
                 bound_params: Vec::new(),
                 pending_unprepare: None,
+                parameter_array: None,
                 row_positioned: false,
                 last_captured: None,
                 buffered_get_data_row: None,
@@ -1508,6 +1542,7 @@ impl StmtHandle {
                 state_flags: 0,
                 dae: None,
                 query_timeout,
+                call_returns_status: false,
                 max_rows: 0,
                 rows_returned: 0,
                 inert_attrs: InertStmtAttrs::default(),

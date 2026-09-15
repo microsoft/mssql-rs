@@ -232,17 +232,18 @@ The project is organized into 15 phases grouped by priority. We start with found
 
 ### Phase 15: Asynchronous Execution (Polling Method)
 
-**Scope decision: mirror msodbcsql — statement-level async only.** Verified against
-the reference driver's observable behavior:
-the reference driver advertises `SQL_ASYNC_MODE = SQL_AM_STATEMENT`,
+**Planned scope: mirror msodbcsql — statement-level async only.** The reference
+driver advertises `SQL_ASYNC_MODE = SQL_AM_STATEMENT`,
 `SQL_MAX_ASYNC_CONCURRENT_STATEMENTS = 1`, and `SQL_ASYNC_DBC_FUNCTIONS = 0`.
-We match this exactly so we remain a drop-in replacement.
+This phase is not implemented yet: `SQLGetInfo(SQL_ASYNC_MODE)` truthfully
+returns `SQL_AM_NONE`. See `docs/sql-get-info-plan.md` for the measured
+AB#48149 capability ledger.
 
-**What we support (statement-level):**
+**What this phase will support (statement-level):**
 - `SQLSetStmtAttr(SQL_ATTR_ASYNC_ENABLE, SQL_ASYNC_ENABLE_ON/OFF)` — writable per
   statement, toggleable between operations. Default is `SQL_ASYNC_ENABLE_OFF`
   (set at statement allocation).
-- `SQLGetInfo` advertises: `SQL_ASYNC_MODE = SQL_AM_STATEMENT`,
+- Once implemented, `SQLGetInfo` will advertise: `SQL_ASYNC_MODE = SQL_AM_STATEMENT`,
   `SQL_MAX_ASYNC_CONCURRENT_STATEMENTS = 1`, `SQL_ASYNC_DBC_FUNCTIONS = 0`.
 - Async-capable statement functions return `SQL_STILL_EXECUTING` while the
   operation is in flight; the app polls by re-calling the *same* function with

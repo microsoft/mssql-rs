@@ -192,6 +192,10 @@ pub(crate) const ERR_RESTRICTED_DATA_TYPE: DiagMsg = DiagMsg {
     state: SQLSTATE_07006,
     text: "Restricted data type attribute violation",
 };
+pub(crate) const ERR_INTERNAL_CONVERSION: DiagMsg = DiagMsg {
+    state: SQLSTATE_HY000,
+    text: "Internal error converting value",
+};
 // `SQL_DEFAULT_PARAM` is only legal for a canonical procedure call, which this
 // driver does not support, so the state is terminal rather than "not yet"
 // (msodbcsql `sqlccmd.cpp` -> IDS_07_S01 on a non-canonical call statement).
@@ -360,6 +364,15 @@ pub(crate) const WARN_ARRAY_SIZE_CHANGED: DiagMsg = DiagMsg {
 pub(crate) const WARN_OPTION_VALUE_CHANGED: DiagMsg = DiagMsg {
     state: SQLSTATE_01S02,
     text: "Option value changed",
+};
+
+/// Posted when a requested `SQL_ATTR_PACKET_SIZE` falls outside the range
+/// `mssql-tds` accepts and is clamped. Matches msodbcsql's `IDS_01_S02_02`
+/// (`dll/res/local.rc:42`), which it posts from the same clamp
+/// (`sqlcmisc.cpp:1909-1917`).
+pub(crate) const WARN_PACKET_SIZE_CHANGED: DiagMsg = DiagMsg {
+    state: SQLSTATE_01S02,
+    text: "Packet size changed",
 };
 
 /// Post a server-originated error under a caller-chosen SQLSTATE, keeping the
