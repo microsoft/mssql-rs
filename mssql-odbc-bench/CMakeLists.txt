@@ -64,3 +64,10 @@ add_executable(mssql_odbc_bench_admin
     src/admin_main.cpp
 )
 target_link_libraries(mssql_odbc_bench_admin PRIVATE mssql_odbc_bench_common)
+
+include(CTest)
+if(BUILD_TESTING)
+    add_executable(mssql_odbc_lob_chunk_test tests/lob_chunk_test.cpp)
+    target_include_directories(mssql_odbc_lob_chunk_test PRIVATE src)
+    add_test(NAME lob_chunk COMMAND mssql_odbc_lob_chunk_test)
+endif()

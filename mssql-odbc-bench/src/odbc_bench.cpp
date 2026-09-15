@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 #include "odbc_bench.hpp"
+#include "lob_chunk.hpp"
 
 #include <algorithm>
 #include <cerrno>
@@ -626,9 +627,8 @@ std::vector<ColumnSpec> columns_for(const TableSpec& table) {
             identity.logical_bytes = 4;
             identity.expected_indicator = sizeof(SQLINTEGER);
             columns.push_back(std::move(identity));
-            // 9000-9999 UTF-16 characters is 18000-19998 bytes, so SQL_C_WCHAR
-            // needs three 8192-byte calls; 20000-20999 narrow bytes needs three
-            // as well. Both stay well inside one TDS PLP value.
+            // Both values need at least three 8192-byte calls. Transcoding may
+            // deliver shorter chunks and require additional calls.
             columns.push_back(make_lob_text(columns, true, 9000, 1000, 1));
             columns.push_back(make_lob_text(columns, false, 20000, 1000, 2));
             break;
@@ -1858,24 +1858,8 @@ private:
                 return;
             }
 
-            // A driver that knows the remaining length reports it; one streaming
-            // an unbounded PLP value reports SQL_NO_TOTAL. Either way a value
-            // longer than the buffer means the call filled it.
-            std::size_t payload = kLobChunkBytes;
-            if (indicator >= 0 && static_cast<std::size_t>(indicator) < kLobChunkBytes) {
-                payload = static_cast<std::size_t>(indicator);
-            }
-            // The driver writes a terminator inside the buffer, so a filled chunk
-            // carries fewer payload bytes than it is long. Trimming trailing NUL
-            // units recovers the exact payload, as mssql-python's
-            // FetchLobColumnData does; it is exact here because the generated
-            // text contains no embedded NUL.
-            payload -= payload % column.unit_bytes;
-            while (payload >= column.unit_bytes &&
-                   chunk_[payload - 1] == 0 &&
-                   (column.unit_bytes == 1 || chunk_[payload - 2] == 0)) {
-                payload -= column.unit_bytes;
-            }
+            const std::size_t payload =
+                lob_chunk_payload_bytes(chunk_.data(), kLobChunkBytes, column.unit_bytes);
             if (payload > 0) {
                 lob_payload_.insert(lob_payload_.end(), chunk_.begin(),
                                     chunk_.begin() + static_cast<std::ptrdiff_t>(payload));
