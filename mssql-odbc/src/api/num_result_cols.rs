@@ -12,7 +12,7 @@ use crate::api::sqlstate::{ERR_FUNCTION_SEQUENCE, post_diag};
 use crate::api::util::write_if_some;
 use crate::error::free_errors;
 use crate::handles::stmt::STMT_STATE_EXEC_CONTEXT;
-use crate::handles::{HandleType, StmtHandle, handle_from_raw};
+use crate::handles::{HandleType, StmtHandle, get_handle};
 
 /// Returns the number of columns in the current result set metadata.
 ///
@@ -46,13 +46,13 @@ unsafe fn sql_num_result_cols_impl(
         return SQL_INVALID_HANDLE;
     }
 
-    let stmt = unsafe { handle_from_raw::<StmtHandle>(statement_handle) };
+    let stmt = get_handle!(StmtHandle, statement_handle);
     debug_assert_eq!(
         stmt.object_type,
         HandleType::Stmt,
         "SQLNumResultCols: handle is not a STMT"
     );
-    sql_num_result_cols_safe(stmt, column_count_ptr)
+    sql_num_result_cols_safe(&stmt, column_count_ptr)
 }
 
 fn sql_num_result_cols_safe(stmt: &StmtHandle, column_count_ptr: *mut SqlSmallInt) -> SqlReturn {
@@ -95,7 +95,7 @@ mod tests {
     fn null_out_ptr_is_tolerated() {
         let h = TestHandles::with_env_dbc_stmt();
 
-        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt_handle = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
         stmt_handle
             .inner
             .lock()
@@ -110,7 +110,7 @@ mod tests {
     fn dml_or_ddl_returns_zero_columns() {
         let h = TestHandles::with_env_dbc_stmt();
 
-        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt_handle = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
         stmt_handle
             .inner
             .lock()
@@ -131,7 +131,7 @@ mod tests {
         let rc = unsafe { sql_num_result_cols(h.stmt, &mut count) };
         assert_eq!(rc, SQL_ERROR);
 
-        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt_handle = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
         let stmt_state = stmt_handle.inner.lock().unwrap();
         assert_eq!(stmt_state.diag_records.len(), 1);
         assert_eq!(

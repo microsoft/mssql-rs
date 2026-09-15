@@ -3,17 +3,18 @@
 
 use std::collections::VecDeque;
 use std::ffi::c_void;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use tracing::error;
 
 use mssql_tds::connection::tds_client::{PreparedStatement, StatementId, TdsClient};
 use mssql_tds::error::{Error as TdsError, SqlInfoMessage};
 
-use super::desc::{DescHandle, DescKind, DescRecord, DescState};
-use super::{DbcHandle, HandleType, HasObjectType, free_handle, handle_to_raw};
+use super::bindings::{BindingUse, ParameterBindingKey};
+use super::desc::{DescHandle, DescRecord, DescState};
+use super::{DbcHandle, Handle, HandleActivity, HandleType};
 use crate::api::odbc_types::{
-    self, SQL_DESC_ALLOC_AUTO, SqlInteger, SqlLen, SqlPointer, SqlSmallInt, SqlULen, SqlUSmallInt,
+    self, SqlHandle, SqlInteger, SqlLen, SqlPointer, SqlSmallInt, SqlULen, SqlUSmallInt,
 };
 use crate::api::set_desc_field::datetime_interval_code_for;
 use crate::conversion::param_convert::{DaeLengthLimit, DaePlan, DaeTranscode};
@@ -314,7 +315,7 @@ impl ColumnBinding {
     /// are indistinguishable to it.
     pub(crate) fn all_from_ard_state(ard_state: &DescState) -> Vec<Self> {
         ard_state
-            .records
+            .records()
             .iter()
             .enumerate()
             .filter_map(|(i, record)| {
@@ -329,25 +330,19 @@ pub(crate) const STMT_STATE_EXEC_STARTED: u32 = 0x0000_0100;
 pub(crate) const STMT_STATE_PREPARED: u32 = 0x0000_0200;
 pub(crate) const STMT_STATE_CURSOR_OPEN: u32 = 0x0000_0800;
 pub(crate) const STMT_STATE_EXEC_CONTEXT: u32 = 0x0000_1000;
-/// A block fetch is between taking its snapshot of the bindings and finishing
-/// its writes. The fetch cannot hold the statement mutex across network I/O, so
-/// this is what stops a concurrent rebind from freeing a buffer the fill loop is
-/// still writing through: the mutating entry points refuse while it is set.
-pub(crate) const STMT_STATE_FETCH_IN_PROGRESS: u32 = 0x0000_2000;
-
 /// Statement handle
 ///
 /// Created by `SQLAllocHandle(SQL_HANDLE_STMT, hdbc, ...)`.
 #[derive(Debug)]
 pub(crate) struct StmtHandle {
     pub(crate) object_type: HandleType,
-    /// Back-pointer to the parent DBC handle. Stored as opaque pointer because
-    /// the DBC owns the STMT's lifetime, not the other way around.
-    /// Mirrors msodbcsql's statement→connection back-pointer.
+    pub(crate) activity: Arc<HandleActivity>,
+    parent: Arc<DbcHandle>,
+    /// Public identity of the strongly retained parent.
     pub(crate) parent_dbc: *mut c_void,
     /// The four automatically-allocated implicit descriptors (ARD/APD/IRD/IPD),
     /// the permanent implicit allocations (cf. msodbcsql's embedded `lpstmt->ARD`
-    /// / `cmdp.APD`, `sqlcfunc.cpp`). Set once in `new()`, freed in `Drop`, never
+    /// / `cmdp.APD`, `sqlcfunc.cpp`). Set once in `new()`, retired on free, never
     /// reassigned — hence sound as plain fields outside `inner`, same set-once
     /// rationale as `parent_dbc`. These are NOT the mutable *active* ARD/APD
     /// association `SQLSetStmtAttr(SQL_ATTR_APP_ROW_DESC / APP_PARAM_DESC)`
@@ -361,6 +356,9 @@ pub(crate) struct StmtHandle {
     pub(crate) apd: *mut c_void,
     pub(crate) ird: *mut c_void,
     pub(crate) ipd: *mut c_void,
+    _implicit_descriptors: [Arc<DescHandle>; 4],
+    pub(crate) row_binding_use: BindingUse,
+    pub(crate) param_binding_use: BindingUse,
     pub(crate) inner: Mutex<StmtState>,
 }
 
@@ -444,6 +442,8 @@ pub(crate) struct StmtState {
     /// `SQLExecute`. `Some` marks the statement as prepared; the handle is filled
     /// after the first execute.
     pub(crate) prepared: Option<PreparedPlan>,
+    /// Retained while the prepared plan is temporarily parked in DAE state.
+    prepared_bindings: Option<ParameterBindingKey>,
     /// Marker count of the accepted direct SQL, independent of a prepared plan.
     /// Retained across cursor close and parameter reset; replaced by new SQL.
     pub(crate) direct_marker_count: Option<usize>,
@@ -1411,6 +1411,19 @@ impl StmtState {
             );
         }
     }
+
+    /// Compare at execution, so descriptor edits and association changes also
+    /// invalidate every statement sharing an APD without a setter-side walk.
+    pub(crate) fn refresh_prepared_bindings(&mut self, current: ParameterBindingKey) {
+        if !self
+            .prepared_bindings
+            .as_ref()
+            .is_some_and(|previous| previous.matches(&current))
+        {
+            self.orphan_prepared_handle();
+        }
+        self.prepared_bindings = Some(current);
+    }
     /// Resets all data-at-execution streaming state and hands back the parked
     /// client, if the sequence still held one. Call after a DAE sequence
     /// completes, is cancelled, or fails.
@@ -1467,10 +1480,8 @@ impl HasDiagnostics for StmtState {
     }
 }
 
-// SAFETY: The raw pointer `parent_dbc` prevents auto-impl of Send/Sync.
-// `parent_dbc` is set once at construction and never mutated. The parent DBC
-// is guaranteed alive because the DM ensures all STMTs are freed before
-// calling SQLFreeConnect on the parent DBC.
+// SAFETY: handle values are opaque IDs. The parent is strongly retained,
+// mutable state is mutex-protected, and application-buffer use is leased.
 unsafe impl Send for StmtHandle {}
 unsafe impl Sync for StmtHandle {}
 
@@ -1479,30 +1490,33 @@ impl StmtHandle {
     /// [`DbcState::stmt_query_timeout`](crate::handles::dbc::DbcState); a
     /// statement starts at the connection-level default rather than always at
     /// zero (msodbcsql `sqlcfunc.cpp:173`).
-    pub(crate) fn new(parent_dbc: *mut c_void, query_timeout: u32) -> Self {
+    pub(crate) fn new(
+        parent_dbc: SqlHandle,
+        parent: Arc<DbcHandle>,
+        activity: Arc<HandleActivity>,
+        descriptors: [(SqlHandle, Arc<DescHandle>); 4],
+        query_timeout: u32,
+    ) -> Self {
+        let [
+            (ard, ard_ref),
+            (apd, apd_ref),
+            (ird, ird_ref),
+            (ipd, ipd_ref),
+        ] = descriptors;
+        let row_binding_use = BindingUse::new(Arc::clone(&parent.activity));
+        let param_binding_use = BindingUse::new(Arc::clone(&parent.activity));
         Self {
             object_type: HandleType::Stmt,
+            activity,
+            parent,
             parent_dbc,
-            ard: handle_to_raw(Box::new(DescHandle::new(
-                DescKind::AppRow,
-                SQL_DESC_ALLOC_AUTO,
-                parent_dbc,
-            ))),
-            apd: handle_to_raw(Box::new(DescHandle::new(
-                DescKind::AppParam,
-                SQL_DESC_ALLOC_AUTO,
-                parent_dbc,
-            ))),
-            ird: handle_to_raw(Box::new(DescHandle::new(
-                DescKind::ImpRow,
-                SQL_DESC_ALLOC_AUTO,
-                parent_dbc,
-            ))),
-            ipd: handle_to_raw(Box::new(DescHandle::new(
-                DescKind::ImpParam,
-                SQL_DESC_ALLOC_AUTO,
-                parent_dbc,
-            ))),
+            ard,
+            apd,
+            ird,
+            ipd,
+            _implicit_descriptors: [ard_ref, apd_ref, ird_ref, ipd_ref],
+            row_binding_use,
+            param_binding_use,
             inner: Mutex::new(StmtState {
                 diag_records: Vec::new(),
                 column_metadata: Vec::new(),
@@ -1514,6 +1528,7 @@ impl StmtHandle {
                 pending_fetch_info: Vec::new(),
                 pending_output_params: None,
                 prepared: None,
+                prepared_bindings: None,
                 direct_marker_count: None,
                 parameter_metadata: Vec::new(),
                 bound_params: Vec::new(),
@@ -1557,33 +1572,26 @@ impl StmtHandle {
     /// Returns a reference to the parent DBC handle.
     ///
     /// The returned reference is bound to `&self` so it cannot outlive this
-    /// statement handle, and the parent DBC is guaranteed alive for at least
-    /// that long because the DM frees all STMT handles before freeing their
-    /// parent DBC.
+    /// statement handle, which strongly retains its parent.
     pub(crate) fn parent_dbc(&self) -> &DbcHandle {
-        // SAFETY: `parent_dbc` is set at construction to a live `DbcHandle`
-        // pointer (allocated by `handle_to_raw::<DbcHandle>`), is never
-        // mutated, and the DBC outlives this STMT per the DM contract.
-        unsafe { &*(self.parent_dbc as *const DbcHandle) }
+        &self.parent
     }
 }
 
-impl HasObjectType for StmtHandle {
-    fn object_type_mut(&mut self) -> &mut HandleType {
-        &mut self.object_type
-    }
-}
+impl Handle for StmtHandle {
+    const TYPE: HandleType = HandleType::Stmt;
+    type State = StmtState;
 
-impl Drop for StmtHandle {
-    fn drop(&mut self) {
-        // Free the four implicit descriptors owned by this statement through the
-        // centralized deallocation path so each one's object type is stamped
-        // `Invalid` (use-after-free detection) rather than raw `Box::from_raw`.
-        // These are never handed to `SQLFreeHandle` (they are implicit), so
-        // dropping the statement is the single owner responsible for them.
-        for raw in [self.ard, self.apd, self.ird, self.ipd] {
-            unsafe { free_handle::<DescHandle>(raw) };
-        }
+    fn state(&self) -> &Mutex<Self::State> {
+        &self.inner
+    }
+
+    fn activity(&self) -> &Arc<HandleActivity> {
+        &self.activity
+    }
+
+    fn implicit_ids(&self) -> Option<[SqlHandle; 4]> {
+        Some([self.ard, self.apd, self.ird, self.ipd])
     }
 }
 
@@ -1591,7 +1599,7 @@ impl Drop for StmtHandle {
 mod tests {
     use super::*;
     use crate::api::odbc_types::{SQL_C_CHAR, SQL_C_SLONG, SQL_WVARCHAR};
-    use crate::handles::desc::{DescHeader, DescKind};
+    use crate::handles::desc::DescKind;
     use mssql_tds::test_client_support::int_columns;
 
     fn binding(column_number: SqlUSmallInt, target_type: SqlSmallInt) -> ColumnBinding {
@@ -1610,16 +1618,15 @@ mod tests {
 
     /// Runs `f` against a fresh, empty ARD-shaped `DescState`.
     fn with_ard_state(f: impl FnOnce(&mut DescState)) {
-        let mut state = DescState {
-            diag_records: Vec::new(),
-            header: DescHeader::default(),
-            records: Vec::new(),
-        };
+        let mut state = DescState::default();
         f(&mut state);
     }
 
     fn with_state(f: impl FnOnce(&mut StmtState)) {
-        let handle = StmtHandle::new(std::ptr::null_mut(), 0);
+        let h = crate::test_support::TestHandles::with_env_dbc_stmt();
+        let handle = crate::handles::handle_from_raw::<StmtHandle>(h.stmt)
+            .unwrap()
+            .into_arc();
         let mut state = handle.inner.lock().unwrap();
         f(&mut state);
     }
@@ -1665,7 +1672,7 @@ mod tests {
     /// `sql_bind_col_safe` uses.
     fn bind(state: &mut DescState, binding: ColumnBinding) {
         let column_number = binding.column_number;
-        let target_count = state.records.len().max(usize::from(column_number));
+        let target_count = state.records().len().max(usize::from(column_number));
         state.set_record_count(target_count, DescKind::AppRow);
         let record = state
             .record_mut(SqlSmallInt::try_from(column_number).unwrap())
@@ -1715,7 +1722,10 @@ mod tests {
         with_ard_state(|s| {
             bind(s, binding(1, SQL_C_SLONG));
             bind(s, binding(2, SQL_C_SLONG));
-            for record in &mut s.records {
+            for number in 1..=s.records().len() {
+                let record = s
+                    .record_mut(SqlSmallInt::try_from(number).unwrap())
+                    .unwrap();
                 record.data_ptr = std::ptr::null_mut();
             }
             assert!(ColumnBinding::all_from_ard_state(s).is_empty());
@@ -1754,7 +1764,10 @@ mod tests {
         with_ard_state(|s| {
             assert!(ColumnBinding::all_from_ard_state(s).is_empty());
         });
-        let handle = StmtHandle::new(std::ptr::null_mut(), 0);
+        let h = crate::test_support::TestHandles::with_env_dbc_stmt();
+        let handle = crate::handles::handle_from_raw::<StmtHandle>(h.stmt)
+            .unwrap()
+            .into_arc();
         assert!(handle.inner.lock().unwrap().row_bind_offset_ptr.is_null());
     }
 

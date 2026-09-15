@@ -135,7 +135,9 @@ impl TestHandles {
     /// `Drop`, and stops tracking it so `Drop` does not free it again.
     pub(crate) fn free_extra_stmt(&mut self, stmt: SqlHandle) -> SqlReturn {
         let ret = unsafe { sql_free_handle(SQL_HANDLE_STMT, stmt) };
-        self.extra_stmts.retain(|&s| s != stmt);
+        if ret == SQL_SUCCESS {
+            self.extra_stmts.retain(|&s| s != stmt);
+        }
         ret
     }
 
@@ -144,7 +146,9 @@ impl TestHandles {
     /// does not free it again.
     pub(crate) fn free_explicit_desc(&mut self, desc: SqlHandle) -> SqlReturn {
         let ret = unsafe { sql_free_handle(SQL_HANDLE_DESC, desc) };
-        self.extra_descs.retain(|&d| d != desc);
+        if ret == SQL_SUCCESS {
+            self.extra_descs.retain(|&d| d != desc);
+        }
         ret
     }
 
@@ -161,11 +165,8 @@ impl TestHandles {
         // Connects the DBC (though `alloc_desc` no longer requires it — see
         // its doc comment) so this mirrors a realistic connected-session
         // cross-connection scenario; same technique as `mark_dbc_connected`.
-        unsafe { handle_from_raw::<DbcHandle>(dbc) }
-            .inner
-            .lock()
-            .unwrap()
-            .connection_state = ConnectionState::Connected;
+        let dbc_owner = handle_from_raw::<DbcHandle>(dbc).unwrap().into_arc();
+        dbc_owner.inner.lock().unwrap().connection_state = ConnectionState::Connected;
         let mut desc: SqlHandle = SQL_NULL_HANDLE;
         assert_eq!(
             unsafe { sql_alloc_handle(SQL_HANDLE_DESC, dbc, &mut desc) },
@@ -180,7 +181,7 @@ impl TestHandles {
     /// that take the `TdsClient` will still see `None` and must not use this.
     pub(crate) fn mark_dbc_connected(&self) {
         assert!(!self.dbc.is_null(), "mark_dbc_connected requires a DBC");
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(self.dbc) };
+        let dbc = handle_from_raw::<DbcHandle>(self.dbc).unwrap().into_arc();
         let Ok(mut state) = dbc.inner.lock() else {
             panic!("dbc mutex poisoned");
         };
@@ -207,9 +208,11 @@ impl TestHandles {
         self.stmt_ref().ipd
     }
 
-    fn stmt_ref(&self) -> &crate::handles::StmtHandle {
+    fn stmt_ref(&self) -> std::sync::Arc<crate::handles::StmtHandle> {
         assert!(!self.stmt.is_null(), "descriptor accessors require a STMT");
-        unsafe { handle_from_raw::<crate::handles::StmtHandle>(self.stmt) }
+        handle_from_raw::<crate::handles::StmtHandle>(self.stmt)
+            .unwrap()
+            .into_arc()
     }
 }
 

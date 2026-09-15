@@ -73,13 +73,13 @@ mod tests {
         let mut h = TestHandles::with_env_dbc_stmt();
         let other_stmt = h.alloc_extra_stmt();
 
-        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt_handle = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
         {
             let mut stmt_state = stmt_handle.inner.lock().unwrap();
             stmt_state.set_state(STMT_STATE_CURSOR_OPEN);
         }
 
-        let dbc_handle = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc_handle = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
         {
             let mut dbc_state = dbc_handle.inner.lock().unwrap();
             dbc_state.active_stmt = Some(other_stmt);
@@ -109,7 +109,7 @@ mod tests {
     fn fetch_after_cursor_drained_returns_no_data() {
         let h = TestHandles::with_env_dbc_stmt();
 
-        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt_handle = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
         {
             let mut stmt_state = stmt_handle.inner.lock().unwrap();
             stmt_state.set_state(STMT_STATE_CURSOR_OPEN);
@@ -136,7 +136,7 @@ mod tests {
         use mssql_tds::test_client_support::{done_no_more, tds_client_from_tokens};
 
         let h = TestHandles::with_env_dbc_stmt();
-        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt_handle = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
         {
             let mut stmt_state = stmt_handle.inner.lock().unwrap();
             stmt_state.set_state(STMT_STATE_CURSOR_OPEN);
@@ -146,7 +146,7 @@ mod tests {
         // A client must be present (the guard runs after it is claimed), but it
         // is never read because the guard returns first.
         let client = tds_client_from_tokens(vec![done_no_more()]);
-        let dbc_handle = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc_handle = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
         {
             let mut dbc_state = dbc_handle.inner.lock().unwrap();
             dbc_state.client = Some(client);

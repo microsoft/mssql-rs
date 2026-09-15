@@ -941,7 +941,7 @@ mod tests {
         use crate::test_support::TestHandles;
 
         let h = TestHandles::with_env_dbc();
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
         let mut state = dbc.inner.lock().unwrap();
         post_tds_error_as(&mut *state, err, forced);
         state.diag_records.clone()

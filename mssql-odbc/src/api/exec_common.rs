@@ -30,15 +30,14 @@ use crate::conversion::param_convert::{
     DaePlan, DaeTranscode, ParamBuildError, bound_param_to_rpc, buffered_dae_to_rpc,
     dae_length_limit, dae_plan, dae_streamed_declaration,
 };
-use crate::error::post_sql_error;
+use crate::error::{free_errors, post_sql_error};
+use crate::handles::bindings::{BindingError, BindingLease, BindingUseGuard, owned_descriptor};
 use crate::handles::dbc::ConnectionState;
 use crate::handles::stmt::{
     DaeParam, DaeState, PreparedPlan, STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT,
     STMT_STATE_EXEC_STARTED, StmtState,
 };
-use crate::handles::{
-    DbcHandle, DescHandle, StmtHandle, handle_from_raw, process_is_shutting_down,
-};
+use crate::handles::{DbcHandle, StmtHandle, process_is_shutting_down};
 use crate::params::{BoundParam, ParamArrayLayoutError};
 
 /// Clears the in-flight `EXEC_STARTED` flag on an execution failure so the
@@ -639,72 +638,107 @@ fn dae_expected_length(indicator: SqlLen) -> Option<usize> {
     }
 }
 
-/// Snapshots every parameter position currently bound on `stmt`'s effective
-/// APD/IPD, in ordinal order.
-///
-/// Read once, immediately before an execute's main STMT-locked critical
-/// section — never while that lock is held (see
-/// ".github/instructions/mssql-odbc.instructions.md", "Locking rules": a
-/// STMT lock must never be held while acquiring a DESC lock) — since ODBC
-/// requires bindings to stay stable across one execute.
-/// `SQLBindParameter` and `SQLSetDescFieldW` write into these same descriptor
-/// records (AB#47437), so this is the one place `build_named_params` and the
-/// data-at-execution lookups need to look, regardless of which API produced
-/// the binding; the snapshot itself is what lets the rest of the execute path
-/// (`build_named_params`, `StmtState::dae_current_c_type`) stay unchanged,
-/// reading `StmtState::bound_params` exactly as it did before AB#47437.
-///
-/// `Err(SQL_ERROR)` on a poisoned STMT/env/APD/IPD mutex: the caller posts a
-/// diagnostic against the statement and fails the execute outright, rather
-/// than silently snapshotting "every parameter unbound" — which used to let
-/// a zero-marker statement execute successfully despite the internal
-/// failure, and reported a misleading `07002` for one with markers.
-pub(super) fn snapshot_bound_params(
+#[derive(Debug)]
+pub(super) struct ParameterBindingLease {
+    _apd: BindingLease,
+    _ipd: BindingLease,
+    _controls: BindingUseGuard,
+}
+
+pub(super) struct ParameterSnapshot {
+    pub(super) records: Vec<Option<BoundParam>>,
+    pub(super) lease: ParameterBindingLease,
+    pub(super) key: crate::handles::bindings::ParameterBindingKey,
+}
+
+/// The lease protects application pointers until conversion has materialized
+/// them, not merely until the descriptor records have been copied.
+pub(super) fn snapshot_bound_params(stmt: &StmtHandle) -> Result<ParameterSnapshot, SqlReturn> {
+    snapshot_params(stmt, ParameterUse::Input)
+}
+
+/// Output delivery runs beneath the caller's result-operation or execution
+/// admission. It must not try to acquire that same row-use permission again.
+pub(super) fn snapshot_output_params(stmt: &StmtHandle) -> Result<ParameterSnapshot, SqlReturn> {
+    snapshot_params(stmt, ParameterUse::Output)
+}
+
+enum ParameterUse {
+    Input,
+    Output,
+}
+
+fn snapshot_params(
     stmt: &StmtHandle,
-) -> Result<Vec<Option<BoundParam>>, SqlReturn> {
-    // Read before the STMT lock below, matching bind_param.rs's own
-    // parent-before-child lock ordering for the same lookup.
-    let odbc_version = {
-        let env = stmt.parent_dbc().parent_env();
-        let Ok(env_state) = env.inner.lock() else {
-            error!("snapshotting parameters: env mutex poisoned");
-            return Err(SQL_ERROR);
+    access: ParameterUse,
+) -> Result<ParameterSnapshot, SqlReturn> {
+    let snapshot = (|| {
+        let odbc_version = {
+            let env_state = stmt
+                .parent_dbc()
+                .parent_env()
+                .inner
+                .lock()
+                .map_err(|_| BindingError::Poisoned)?;
+            env_state.odbc_version
         };
-        env_state.odbc_version
-    };
-
-    let (apd, ipd) = {
-        let Ok(stmt_state) = stmt.inner.lock() else {
-            error!("snapshotting parameters: stmt mutex poisoned");
-            return Err(SQL_ERROR);
+        let gate = stmt
+            .parent_dbc()
+            .inner
+            .lock()
+            .map_err(|_| BindingError::Poisoned)?;
+        let (apd, ipd, controls) = {
+            let mut state = stmt.inner.lock().map_err(|_| BindingError::Poisoned)?;
+            free_errors(&mut state);
+            if matches!(access, ParameterUse::Input) {
+                stmt.row_binding_use.ensure_idle(&gate)?;
+            }
+            stmt.param_binding_use.ensure_idle(&gate)?;
+            (
+                owned_descriptor(state.effective_apd(stmt))?,
+                owned_descriptor(stmt.ipd)?,
+                stmt.param_binding_use.acquire(&gate)?,
+            )
         };
-        (stmt_state.effective_apd(stmt), stmt.ipd)
-    };
-
-    // `apd` can be an explicit descriptor resolved under the STMT lock,
-    // already dropped by now — re-check liveness right before dereferencing
-    // to narrow (not fully close) the race against a concurrent
-    // `SQLFreeHandle(SQL_HANDLE_DESC)` on that same descriptor. `ipd` is
-    // always `stmt.ipd`, freed only with the statement itself.
-    if crate::handles::live_type(apd) != Some(crate::handles::HandleType::Desc) {
-        error!("snapshotting parameters: apd freed concurrently");
-        return Err(SQL_ERROR);
-    }
-    let apd_desc = unsafe { handle_from_raw::<DescHandle>(apd) };
-    let Ok(apd_state) = apd_desc.inner.lock() else {
-        error!("snapshotting parameters: apd mutex poisoned");
-        return Err(SQL_ERROR);
-    };
-    let ipd_desc = unsafe { handle_from_raw::<DescHandle>(ipd) };
-    let Ok(ipd_state) = ipd_desc.inner.lock() else {
-        error!("snapshotting parameters: ipd mutex poisoned");
-        return Err(SQL_ERROR);
-    };
-    Ok(BoundParam::all_from_descriptor_states(
-        &apd_state,
-        &ipd_state,
-        odbc_version,
-    ))
+        let apd_state = apd.inner.lock().map_err(|_| BindingError::Poisoned)?;
+        let ipd_state = ipd.inner.lock().map_err(|_| BindingError::Poisoned)?;
+        let apd_lease = BindingLease::acquire(&apd, &gate)?;
+        let ipd_lease = BindingLease::acquire(&ipd, &gate)?;
+        Ok::<_, BindingError>(ParameterSnapshot {
+            records: BoundParam::all_from_descriptor_states(&apd_state, &ipd_state, odbc_version),
+            key: crate::handles::bindings::ParameterBindingKey::new(
+                &apd, &apd_state, &ipd, &ipd_state,
+            ),
+            lease: ParameterBindingLease {
+                _apd: apd_lease,
+                _ipd: ipd_lease,
+                _controls: controls,
+            },
+        })
+    })();
+    let snapshot = snapshot.map_err(|error| {
+        error!(?error, "snapshotting parameter bindings failed");
+        crate::error::diag::with_diagnostics(&stmt.inner, |records| {
+            free_errors(records);
+            if matches!(error, BindingError::Poisoned) {
+                post_sql_error(
+                    records,
+                    SQLSTATE_HY000,
+                    0,
+                    "Internal error reading parameter bindings: poisoned mutex",
+                );
+            } else {
+                error.post(records);
+            }
+        });
+        SQL_ERROR
+    })?;
+    #[cfg(test)]
+    crate::handles::bindings::snapshot_test_hook::pause(
+        stmt,
+        crate::handles::bindings::snapshot_test_hook::Phase::Parameters,
+    );
+    Ok(snapshot)
 }
 
 /// Builds the parameter list for a TDS RPC, where parameters bind by
@@ -1112,7 +1146,7 @@ pub(super) fn finish_execute(
         let mut dml_counts: VecDeque<i64> = client.take_dml_result_counts().into();
         let has_dml_counts = !dml_counts.is_empty();
         let first_count = dml_counts.pop_front().unwrap_or(-1);
-        let bound_params = snapshot_bound_params(stmt);
+        let output_snapshot = (!has_dml_counts).then(|| snapshot_output_params(stmt));
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("{op}: stmt mutex poisoned");
             return_client_idle(dbc, statement_handle, client);
@@ -1124,29 +1158,25 @@ pub(super) fn finish_execute(
         // count, even when the first count is the only one.
         let return_values = client.get_return_values();
         let return_status = client.get_return_status();
-        let output_rc = if has_dml_counts {
-            stmt_state.batch_exhausted = true;
-            stmt_state.pending_output_params = Some((return_values, return_status));
-            SQL_SUCCESS
-        } else if let Ok(bound_params) = bound_params {
-            // Fresh descriptor snapshot; execute-time input pointers may have
-            // been reset or rebound while the results were being consumed.
-            unsafe {
-                crate::api::output_params::write_back_output_params(
-                    &mut stmt_state,
-                    &bound_params,
-                    &return_values,
-                    return_status,
-                )
+        let output_rc = match output_snapshot {
+            None => {
+                stmt_state.batch_exhausted = true;
+                stmt_state.pending_output_params = Some((return_values, return_status));
+                SQL_SUCCESS
             }
-        } else {
-            post_sql_error(
-                &mut stmt_state,
-                SQLSTATE_HY000,
-                0,
-                "Internal error snapshotting output parameter bindings",
-            );
-            SQL_ERROR
+            Some(Ok(snapshot)) => {
+                // Fresh descriptor snapshot; execute-time input pointers may have
+                // been reset or rebound while the results were being consumed.
+                unsafe {
+                    crate::api::output_params::write_back_output_params(
+                        &mut stmt_state,
+                        &snapshot.records,
+                        &return_values,
+                        return_status,
+                    )
+                }
+            }
+            Some(Err(rc)) => rc,
         };
         stmt_state.begin_batch(metadata); // empty
         stmt_state.row_count = first_count;
@@ -1355,7 +1385,8 @@ mod tests {
     #[test]
     fn try_claim_idle_client_none_when_disconnected() {
         let h = TestHandles::with_env_dbc();
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc_owner = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
+        let dbc = &*dbc_owner;
         // Default state is not connected.
         assert!(try_claim_idle_client(dbc, h.dbc).is_none());
         assert!(dbc.inner.lock().unwrap().active_stmt.is_none());
@@ -1365,7 +1396,8 @@ mod tests {
     fn try_claim_idle_client_none_when_busy() {
         let h = TestHandles::with_env_dbc();
         h.mark_dbc_connected();
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc_owner = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
+        let dbc = &*dbc_owner;
         // A different statement already holds the connection.
         let other = 0x1234 as SqlHandle;
         dbc.inner.lock().unwrap().active_stmt = Some(other);
@@ -1378,8 +1410,10 @@ mod tests {
     fn finish_execute_surfaces_an_error_before_the_first_row() {
         let h = TestHandles::with_env_dbc_stmt();
         h.mark_dbc_connected();
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let dbc_owner = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
+        let dbc = &*dbc_owner;
+        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = &*stmt_owner;
         let mut client = tds_client_from_tokens(vec![
             col_metadata(int_columns(1)),
             sql_error(1222, 16, "Lock request time out period exceeded."),
@@ -1418,8 +1452,10 @@ mod tests {
 
         let h = TestHandles::with_env_dbc_stmt();
         h.mark_dbc_connected();
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let dbc_owner = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
+        let dbc = &*dbc_owner;
+        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = &*stmt_owner;
         let mut client = tds_client_from_tokens(vec![
             col_metadata(int_columns(1)),
             info(
@@ -1453,8 +1489,10 @@ mod tests {
 
         for counts in [vec![], vec![0], vec![2, 1]] {
             let h = TestHandles::with_env_dbc_stmt();
-            let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
-            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let dbc_owner = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
+            let dbc = &*dbc_owner;
+            let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+            let stmt = &*stmt_owner;
             let mut tokens: Vec<_> = counts.iter().copied().map(done_more_with_count).collect();
             tokens.push(done_no_more());
             let mut client = tds_client_from_tokens(tokens);
@@ -1493,14 +1531,58 @@ mod tests {
     }
 
     #[test]
+    fn finish_execute_only_snapshots_outputs_when_delivering_them() {
+        use mssql_tds::test_client_support::done_more_with_count;
+        for deferred in [false, true] {
+            let h = TestHandles::with_env_dbc_stmt();
+            let dbc = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
+            let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+            let parameter_use = {
+                let gate = dbc.inner.lock().unwrap();
+                stmt.param_binding_use.acquire(&gate).unwrap()
+            };
+            let mut tokens = Vec::new();
+            if deferred {
+                tokens.push(done_more_with_count(2));
+            }
+            tokens.push(done_no_more());
+            let mut client = tds_client_from_tokens(tokens);
+            dbc.runtime
+                .block_on(client.execute("UPDATE t SET v=1".to_owned(), ()))
+                .unwrap();
+            dbc.runtime.block_on(client.close_query()).unwrap();
+            assert_eq!(
+                finish_execute(&dbc, &stmt, h.stmt, client, "SQLExecute"),
+                if deferred { SQL_SUCCESS } else { SQL_ERROR }
+            );
+            {
+                let state = stmt.inner.lock().unwrap();
+                assert_eq!(state.pending_output_params.is_some(), deferred);
+                assert_eq!(state.diag_records.len(), usize::from(!deferred));
+                if !deferred {
+                    assert_eq!(state.diag_records[0].sql_state, *b"HY010");
+                }
+                assert!(!state.has_state(STMT_STATE_EXEC_STARTED));
+            }
+            let state = dbc.inner.lock().unwrap();
+            assert!(state.client.is_some());
+            assert!(state.active_stmt.is_none());
+            drop(state);
+            drop(parameter_use);
+        }
+    }
+
+    #[test]
     fn finish_execute_zero_count_preserves_pending_results_and_parameter_warnings() {
         use crate::api::more_results::sql_more_results;
         use mssql_tds::test_client_support::done_more_with_count;
 
         for fractional_truncated in [false, true] {
             let h = TestHandles::with_env_dbc_stmt();
-            let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
-            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let dbc_owner = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
+            let dbc = &*dbc_owner;
+            let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+            let stmt = &*stmt_owner;
             let mut client = tds_client_from_tokens(vec![
                 done_more_with_count(0),
                 done_more_with_count(2),
@@ -1543,8 +1625,10 @@ mod tests {
     fn finish_execute_posts_numeric_fractional_truncation() {
         let h = TestHandles::with_env_dbc_stmt();
         h.mark_dbc_connected();
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let dbc_owner = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
+        let dbc = &*dbc_owner;
+        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = &*stmt_owner;
         let mut client = tds_client_from_tokens(vec![done_no_more()]);
         dbc.runtime
             .block_on(client.execute("SELECT 1".to_string(), ()))
@@ -1565,7 +1649,8 @@ mod tests {
 
         let h = TestHandles::with_env_dbc_stmt();
         h.mark_dbc_connected();
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = &*stmt_owner;
 
         let rc = park_dae_client(
             stmt,
@@ -1589,7 +1674,8 @@ mod tests {
     /// `h.stmt` — mirroring the state left by a fetch that has just consumed a
     /// row's last column.
     fn position_and_inject(h: &TestHandles, tokens: Vec<ScriptedToken>) {
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc_owner = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
+        let dbc = &*dbc_owner;
         let mut client = tds_client_from_tokens(tokens);
         dbc.runtime
             .block_on(client.execute("SELECT 1;".to_string(), ()))
@@ -1609,8 +1695,10 @@ mod tests {
         let h = TestHandles::with_env_dbc_stmt();
         position_and_inject(&h, vec![col_metadata_empty(), done_no_more()]);
 
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let dbc_owner = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
+        let dbc = &*dbc_owner;
+        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = &*stmt_owner;
         let client = dbc.inner.lock().unwrap().client.take().unwrap();
 
         release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, true);
@@ -1642,8 +1730,10 @@ mod tests {
             ],
         );
 
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let dbc_owner = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
+        let dbc = &*dbc_owner;
+        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = &*stmt_owner;
         let client = dbc.inner.lock().unwrap().client.take().unwrap();
 
         release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, true);
@@ -1659,8 +1749,10 @@ mod tests {
         let h = TestHandles::with_env_dbc_stmt();
         position_and_inject(&h, vec![col_metadata_empty(), done_in_proc_more()]);
 
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let dbc_owner = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
+        let dbc = &*dbc_owner;
+        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = &*stmt_owner;
         let client = dbc.inner.lock().unwrap().client.take().unwrap();
 
         release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, true);
@@ -1698,8 +1790,10 @@ mod tests {
             ],
         );
 
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let dbc_owner = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
+        let dbc = &*dbc_owner;
+        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = &*stmt_owner;
         let client = dbc.inner.lock().unwrap().client.take().unwrap();
 
         release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, true);
@@ -1740,8 +1834,10 @@ mod tests {
             ],
         );
 
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let dbc_owner = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
+        let dbc = &*dbc_owner;
+        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = &*stmt_owner;
         let client = dbc.inner.lock().unwrap().client.take().unwrap();
 
         release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, true);
@@ -1779,8 +1875,10 @@ mod tests {
             ],
         );
 
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let dbc_owner = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
+        let dbc = &*dbc_owner;
+        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = &*stmt_owner;
         let client = dbc.inner.lock().unwrap().client.take().unwrap();
 
         release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, true);
@@ -1833,8 +1931,10 @@ mod tests {
         let h = TestHandles::with_env_dbc_stmt();
         // No tokens queued: the peek's `next_row_cursor` read fails immediately.
         position_and_inject(&h, vec![col_metadata_empty()]);
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let dbc_owner = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
+        let dbc = &*dbc_owner;
+        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = &*stmt_owner;
         let client = dbc.inner.lock().unwrap().client.take().unwrap();
 
         release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, true);
@@ -1875,8 +1975,10 @@ mod tests {
             ],
         );
 
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let dbc_owner = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
+        let dbc = &*dbc_owner;
+        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = &*stmt_owner;
         let client = dbc.inner.lock().unwrap().client.take().unwrap();
 
         release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, true);
@@ -1941,8 +2043,10 @@ mod tests {
             ],
         );
 
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let dbc_owner = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
+        let dbc = &*dbc_owner;
+        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = &*stmt_owner;
         let client = dbc.inner.lock().unwrap().client.take().unwrap();
 
         release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, false);
@@ -1997,53 +2101,28 @@ mod tests {
         }
     }
 
-    /// The narrow race `snapshot_bound_params`'s liveness check guards
-    /// against: `effective_apd` resolves an explicit descriptor under the
-    /// STMT lock, which is dropped before the descriptor is actually locked
-    /// and read. If a concurrent `SQLFreeHandle(SQL_HANDLE_DESC)` completes
-    /// in that window, the stale pointer must fail cleanly (`Err`), not
-    /// dereference freed memory. Reassociating the APD and then freeing it
-    /// reproduces the state that window leaves behind — `active_apd` still
-    /// points at the freed handle, since only a *subsequent* `SQLBindCol`/
-    /// `SQLBindParameter`-family call re-resolves it via `free_desc`'s
-    /// association reset.
+    /// An invalid internal association must fail lookup rather than dereference
+    /// the retired ID, even though normal free paths reset associations.
     #[test]
     fn snapshot_bound_params_fails_cleanly_on_a_freed_apd() {
         let mut h = TestHandles::with_env_dbc_stmt();
         let explicit_apd = h.alloc_explicit_desc();
-        unsafe {
-            crate::api::set_stmt_attr::sql_set_stmt_attr_w(
-                h.stmt,
-                crate::api::odbc_types::SQL_ATTR_APP_PARAM_DESC,
-                explicit_apd as crate::api::odbc_types::SqlPointer,
-                0,
-            )
-        };
-        {
-            // Directly clears the tracked association without going through
-            // `free_desc`'s association-reset walk, so `active_apd` is left
-            // dangling exactly as it would be mid-race — `h.free_explicit_desc`
-            // goes through the real `SQLFreeHandle` path, which already resets
-            // the association and would defeat the point of this test.
-            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
-            let mut ss = stmt.inner.lock().unwrap();
-            ss.active_apd = None;
-        }
-        unsafe {
-            crate::handles::free_handle::<DescHandle>(explicit_apd);
-        }
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        assert_eq!(h.free_explicit_desc(explicit_apd), SQL_SUCCESS);
+        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = &*stmt_owner;
         {
             let mut ss = stmt.inner.lock().unwrap();
             ss.active_apd = Some(explicit_apd);
         }
         assert!(snapshot_bound_params(stmt).is_err());
+        stmt.inner.lock().unwrap().active_apd = None;
     }
 
     #[test]
     fn build_named_params_zero_markers_yields_empty() {
         let h = TestHandles::with_env_dbc_stmt();
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = &*stmt_owner;
         let mut state = stmt.inner.lock().unwrap();
         let built = unsafe { build_named_params(&mut state, 0, "test") }.unwrap();
         assert!(built.params.is_empty());
@@ -2055,7 +2134,8 @@ mod tests {
         use crate::api::odbc_types::{SQL_PARAM_OUTPUT, SQL_RETURN_VALUE};
         use mssql_tds::message::parameters::rpc_parameters::StatusFlags;
         let h = TestHandles::with_env_dbc_stmt();
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = &*stmt_owner;
         let mut state = stmt.inner.lock().unwrap();
         for direction in [SQL_PARAM_OUTPUT, SQL_RETURN_VALUE] {
             let mut buffer = vec![b'x'; 8];
@@ -2081,7 +2161,8 @@ mod tests {
         use mssql_tds::test_client_support::rpc_parameter_status;
 
         let h = TestHandles::with_env_dbc_stmt();
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = &*stmt_owner;
         let mut state = stmt.inner.lock().unwrap();
         for (direction, expected) in [
             (SQL_PARAM_INPUT, StatusFlags::NONE),
@@ -2127,7 +2208,8 @@ mod tests {
     #[test]
     fn build_named_params_builds_one_per_marker() {
         let h = TestHandles::with_env_dbc_stmt();
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = &*stmt_owner;
 
         let mut buf1: Vec<u8> = b"abc\0".to_vec();
         let mut ind1: SqlLen = SQL_NTS as SqlLen;
@@ -2150,7 +2232,8 @@ mod tests {
     #[test]
     fn build_named_params_unbound_marker_posts_07002() {
         let h = TestHandles::with_env_dbc_stmt();
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = &*stmt_owner;
         // One marker expected, but nothing bound.
         let mut state = stmt.inner.lock().unwrap();
         let ret = unsafe { build_named_params(&mut state, 1, "test") };
@@ -2164,7 +2247,8 @@ mod tests {
     #[test]
     fn build_named_params_default_param_posts_07s01() {
         let h = TestHandles::with_env_dbc_stmt();
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = &*stmt_owner;
 
         let mut buf: Vec<u8> = b"x\0".to_vec();
         let mut ind: SqlLen = SQL_DEFAULT_PARAM;
@@ -2187,7 +2271,8 @@ mod tests {
     #[test]
     fn build_named_params_keeps_streamed_marker_in_position() {
         let h = TestHandles::with_env_dbc_stmt();
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = &*stmt_owner;
 
         let mut first: Vec<u8> = b"a\0".to_vec();
         let mut first_ind: SqlLen = SQL_NTS as SqlLen;
@@ -2229,7 +2314,8 @@ mod tests {
         use crate::api::odbc_types::{SQL_C_NUMERIC, SQL_DECIMAL, SqlNumericStruct};
 
         let h = TestHandles::with_env_dbc_stmt();
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = &*stmt_owner;
 
         let mut streamed_ind: SqlLen = SQL_DATA_AT_EXEC;
         // 123.45 rescaled to scale 1 drops the trailing "5" (`Truncated`)
@@ -2313,7 +2399,8 @@ mod tests {
         ));
 
         let h = TestHandles::with_env_dbc_stmt();
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = &*stmt_owner;
         let mut state = stmt.inner.lock().unwrap();
         let mut param = buffered_decimal_param(0);
         param.binding.c_type = SQL_C_NUMERIC;
@@ -2357,7 +2444,8 @@ mod tests {
     #[test]
     fn rebuild_deferred_params_rejects_missing_binding_and_slot() {
         let h = TestHandles::with_env_dbc_stmt();
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = &*stmt_owner;
         let mut state = stmt.inner.lock().unwrap();
 
         let missing_binding = rebuild_deferred_params(
@@ -2391,7 +2479,8 @@ mod tests {
     #[test]
     fn rebuild_deferred_params_posts_conversion_error() {
         let h = TestHandles::with_env_dbc_stmt();
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = &*stmt_owner;
         let mut state = stmt.inner.lock().unwrap();
 
         let result = rebuild_deferred_params(
@@ -2411,7 +2500,8 @@ mod tests {
     #[test]
     fn build_named_params_records_declared_length() {
         let h = TestHandles::with_env_dbc_stmt();
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = &*stmt_owner;
 
         let mut ind: SqlLen = sql_len_data_at_exec(7);
 
@@ -2459,7 +2549,8 @@ mod tests {
             (SQL_C_CHAR, crate::api::odbc_types::SQL_VARBINARY, false),
         ] {
             let h = TestHandles::with_env_dbc_stmt();
-            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+            let stmt = &*stmt_owner;
 
             let mut ind: SqlLen = SQL_DATA_AT_EXEC;
             let mut state = stmt.inner.lock().unwrap();
@@ -2500,7 +2591,8 @@ mod tests {
     #[test]
     fn build_named_params_without_indicator_is_never_streamed() {
         let h = TestHandles::with_env_dbc_stmt();
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = &*stmt_owner;
 
         let mut buf: Vec<u8> = b"abc".to_vec();
         let mut state = stmt.inner.lock().unwrap();
@@ -2530,7 +2622,8 @@ mod tests {
     #[test]
     fn build_named_params_unstreamable_dae_c_type_posts_hyc00() {
         let h = TestHandles::with_env_dbc_stmt();
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = &*stmt_owner;
 
         let mut value: i32 = 0;
         let mut ind: SqlLen = SQL_DATA_AT_EXEC;
@@ -2575,7 +2668,8 @@ mod tests {
     #[test]
     fn build_named_params_reads_the_dae_indicator_through_the_bind_offset() {
         let h = TestHandles::with_env_dbc_stmt();
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = &*stmt_owner;
 
         // Two rows of a parameter array. Row 0 is an ordinary bound value;
         // only row 1 carries the data-at-execution marker.
@@ -2616,7 +2710,8 @@ mod tests {
     #[test]
     fn bind_offset_preserves_a_misaligned_dae_indicator_and_shifted_token() {
         let h = TestHandles::with_env_dbc_stmt();
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = &*stmt_owner;
         let mut value = [0u8; 8];
         let mut indicator_storage: [SqlLen; 2] = [0; 2];
         let shifted_indicator = unsafe {
@@ -2668,7 +2763,8 @@ mod tests {
     #[test]
     fn build_named_params_without_a_bind_offset_reads_the_unshifted_indicator() {
         let h = TestHandles::with_env_dbc_stmt();
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = &*stmt_owner;
 
         let mut values: [i32; 4] = [7; 4];
         let mut inds: [SqlLen; 2] = [4, SQL_DATA_AT_EXEC];
@@ -2717,8 +2813,10 @@ mod tests {
 
         let h = TestHandles::with_env_dbc_stmt();
         h.mark_dbc_connected();
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let dbc_owner = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
+        let dbc = &*dbc_owner;
+        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = &*stmt_owner;
 
         // Park a client mid-DAE with no tokens queued behind it: a real cancel
         // would have nothing to read and would fail rather than quietly pass.

@@ -328,6 +328,14 @@ cmake --build build --config Debug
 cd build && ctest --output-on-failure -C Debug
 ```
 
+## Direct-driver handle identity regression (no server)
+
+`handle_identity_test` loads the Rust driver exports directly on Windows, Linux, and macOS, without driver registration or a SQL Server connection. The Driver Manager owns separate application handles and may reuse them, so testing their values would not test the driver's ID allocation policy. The regression covers ENV, DBC, STMT, explicit descriptors, and all four implicit descriptors, including rejection of retired IDs before namespace reuse. Registry unit tests separately force cursor wrap and verify live-ID collision avoidance and continued allocation. It supplements, rather than replaces, the Windows-only live `dll_unload_stress_test`.
+
+Both runners set `MSSQL_ODBC_DRIVER_PATH` to the finalized Rust artifact (`mssqlodbc.dll`, `mssqlodbc.so`, or `mssqlodbc.dylib`) on the Rust leg and clear it on the reference leg. For a manual focused run, build the `handle_identity_test` CMake target, set that variable to the artifact's absolute path, then run `ctest --test-dir build -R '^handle_identity_test$' --output-on-failure` (add `-C Debug` on Windows). No installed driver is modified.
+
+A missing driver path fails this test rather than skipping it. `ODBC_TEST_TARGET=msodbcsql` explicitly skips the entire binary with CTest return code 77: the driver's ID recycling policy is internal to this implementation, not a reference-driver parity assertion. Comparison reports therefore show `skipped (not compared)`.
+
 ## Running Connected Tests
 
 Tests that require a live SQL Server **fail** when no connection is configured,
@@ -391,9 +399,10 @@ cmake --build build && ctest --test-dir build --output-on-failure
 
 ## How It Works
 
-Each test calls standard ODBC C APIs (`SQLAllocHandle`, `SQLDriverConnect`,
+Most tests call standard ODBC C APIs (`SQLAllocHandle`, `SQLDriverConnect`,
 etc.) through the Driver Manager, which loads our shared library — the same
-code path a real application uses.
+code path a real application uses. The direct-driver identity and Windows
+unload regressions bypass the Driver Manager to observe driver-owned lifetimes.
 
 ## CI: prebuilt artifact flow (build once, test on many distros)
 

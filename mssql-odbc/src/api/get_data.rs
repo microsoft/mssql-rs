@@ -24,7 +24,7 @@ use crate::api::type_rules::{canonical_c_type, is_valid_c_type, resolve_default_
 use crate::api::util::{copy_with_nul, write_if_some};
 use crate::error::{free_errors, post_sql_error};
 use crate::handles::stmt::{ActivePlpStream, STMT_STATE_CURSOR_OPEN, StmtState};
-use crate::handles::{HandleType, OdbcVersion, StmtHandle, handle_from_raw};
+use crate::handles::{HandleType, OdbcVersion, StmtHandle, get_handle};
 use mssql_tds::connection::tds_client::{CursorColumn, CursorPoll, PlpChunk};
 use mssql_tds::core::TdsResult;
 use mssql_tds::encoding_rs::{self, Decoder};
@@ -112,7 +112,7 @@ unsafe fn sql_get_data_impl(
         return SQL_INVALID_HANDLE;
     }
 
-    let stmt = unsafe { handle_from_raw::<StmtHandle>(statement_handle) };
+    let stmt = get_handle!(StmtHandle, statement_handle);
     debug_assert_eq!(
         stmt.object_type,
         HandleType::Stmt,
@@ -121,7 +121,7 @@ unsafe fn sql_get_data_impl(
 
     sql_get_data_safe(
         statement_handle,
-        stmt,
+        &stmt,
         column_number,
         target_type,
         target_value_ptr,
@@ -143,6 +143,10 @@ fn sql_get_data_safe(
         buffer_length >= 0,
         "SQLGetData: DM should reject negative buffer_length (HY090)"
     );
+    let _result_use = match super::close_cursor::claim_result_use(stmt) {
+        Ok(guard) => guard,
+        Err(rc) => return rc,
+    };
 
     // The declared ODBC version selects the SQL_C_DEFAULT table, so it is only
     // read for a defaulted retrieval — and before the STMT lock, to preserve
@@ -3223,6 +3227,7 @@ mod tests {
     use crate::api::odbc_types::{SQL_C_SLONG, SQL_C_TYPE_TIMESTAMP, SqlSsTime2Struct};
     use crate::api::odbc_types::{SQL_NO_DATA, SQL_NULL_HANDLE};
     use crate::error::diag::DiagRecord;
+    use crate::handles::handle_from_raw;
     use crate::handles::stmt::BufferedGetDataRow;
     use crate::handles::{DbcHandle, EnvHandle};
     use crate::test_support::TestHandles;
@@ -3247,7 +3252,7 @@ mod tests {
     #[test]
     fn internal_typed_conversion_failure_posts_driver_error() {
         let h = TestHandles::with_env_dbc_stmt();
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
         let mut state = stmt.inner.lock().unwrap();
 
         assert_eq!(
@@ -3474,7 +3479,7 @@ mod tests {
     fn get_data_without_cursor_returns_24000() {
         let h = TestHandles::with_env_dbc_stmt();
         let stmt = h.stmt;
-        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(stmt) };
+        let stmt_handle = handle_from_raw::<StmtHandle>(stmt).unwrap().into_arc();
         let mut buf = [0u8; 16];
         let mut ind: SqlLen = 0;
         let ret = unsafe {
@@ -3498,7 +3503,7 @@ mod tests {
     #[test]
     fn get_data_column_zero_is_invalid() {
         let h = TestHandles::with_env_dbc_stmt();
-        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt_handle = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
         {
             let mut s = stmt_handle.inner.lock().unwrap();
             s.set_state(STMT_STATE_CURSOR_OPEN);
@@ -3527,7 +3532,7 @@ mod tests {
     #[test]
     fn get_data_cursor_open_but_no_active_row_returns_24000() {
         let h = TestHandles::with_env_dbc_stmt();
-        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt_handle = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
         {
             let mut s = stmt_handle.inner.lock().unwrap();
             s.set_state(STMT_STATE_CURSOR_OPEN);
@@ -3564,7 +3569,7 @@ mod tests {
     #[test]
     fn get_data_backward_column_is_rejected() {
         let h = TestHandles::with_env_dbc_stmt();
-        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt_handle = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
         {
             let mut s = stmt_handle.inner.lock().unwrap();
             s.set_state(STMT_STATE_CURSOR_OPEN);
@@ -3596,7 +3601,7 @@ mod tests {
     #[test]
     fn get_data_reread_just_consumed_column_returns_no_data() {
         let h = TestHandles::with_env_dbc_stmt();
-        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt_handle = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
         {
             let mut s = stmt_handle.inner.lock().unwrap();
             s.set_state(STMT_STATE_CURSOR_OPEN);
@@ -4228,7 +4233,7 @@ mod tests {
     /// for column 1, which is the state `SQLGetData` sees after the row decoder
     /// has resumed to that column.
     fn stmt_with_captured(h: &TestHandles, value: ColumnValues) {
-        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt_handle = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
         let mut s = stmt_handle.inner.lock().unwrap();
         s.set_state(STMT_STATE_CURSOR_OPEN);
         s.column_metadata = int_columns(2);
@@ -4238,14 +4243,14 @@ mod tests {
 
     fn stmt_with_buffered_ints(h: &TestHandles, values: Vec<i32>) {
         h.mark_dbc_connected();
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
         {
             let mut state = stmt.inner.lock().unwrap();
             state.set_state(STMT_STATE_CURSOR_OPEN);
             state.column_metadata = int_columns(values.len());
             state.row_positioned = true;
         }
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
         let mut client = tds_client_from_int_rows(vec![values]);
         dbc.runtime
             .block_on(client.execute("SELECT buffered row".to_string(), ()))
@@ -4257,7 +4262,7 @@ mod tests {
     }
 
     fn stmt_with_buffered_values(h: &TestHandles, values: Vec<ColumnValues>) {
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
         let mut state = stmt.inner.lock().unwrap();
         state.set_state(STMT_STATE_CURSOR_OPEN);
         state.column_metadata = int_columns(values.len());
@@ -4275,7 +4280,7 @@ mod tests {
     }
 
     fn stmt_with_buffered_string(h: &TestHandles, value: SqlString) {
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
         let mut state = stmt.inner.lock().unwrap();
         state.set_state(STMT_STATE_CURSOR_OPEN);
         state.column_metadata = int_columns(1);
@@ -4290,7 +4295,7 @@ mod tests {
 
     fn stmt_with_buffered_prefix_and_deferred_client(h: &TestHandles) {
         h.mark_dbc_connected();
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
         {
             let mut state = stmt.inner.lock().unwrap();
             state.set_state(STMT_STATE_CURSOR_OPEN);
@@ -4303,7 +4308,7 @@ mod tests {
                 wire_deferred: false,
             });
         }
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
         let mut client = tds_client_from_int_rows(vec![vec![10, 20]]);
         dbc.runtime
             .block_on(client.execute("SELECT deferred column".to_string(), ()))
@@ -4344,7 +4349,7 @@ mod tests {
         assert_eq!(value, 20);
         assert_eq!(indicator, 4);
 
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
         let state = stmt.inner.lock().unwrap();
         assert_eq!(state.current_row_last_col, 2);
         assert!(state.last_captured.is_none());
@@ -4380,7 +4385,7 @@ mod tests {
         assert_eq!(&output, b"hi\0");
         assert_eq!(indicator, 2);
 
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
         let state = stmt.inner.lock().unwrap();
         let row = state.buffered_get_data_row.as_ref().unwrap();
         assert_eq!(row.consumed, 1);
@@ -4414,7 +4419,7 @@ mod tests {
         assert_eq!(&output, b".4500\0");
         assert_eq!(indicator, 5);
 
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
         assert_eq!(
             stmt.inner
                 .lock()
@@ -4453,7 +4458,7 @@ mod tests {
             SqlLen::try_from(std::mem::size_of::<i64>()).unwrap()
         );
 
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
         let state = stmt.inner.lock().unwrap();
         let row = state.spare_get_data_row.as_ref().unwrap();
         assert_eq!(row.values[0], None);
@@ -4481,7 +4486,7 @@ mod tests {
             SQL_SUCCESS_WITH_INFO
         );
         {
-            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
             let state = stmt.inner.lock().unwrap();
             assert_eq!(state.partial_text_offset, Some((1, 3)));
             assert_eq!(state.direct_text_target, Some((1, SQL_C_CHAR)));
@@ -4501,7 +4506,7 @@ mod tests {
             SQL_SUCCESS
         );
 
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
         let state = stmt.inner.lock().unwrap();
         assert_eq!(state.direct_text_target, None);
         let value = state
@@ -4552,7 +4557,7 @@ mod tests {
     fn buffered_get_data_preserves_variant_base_for_probe() {
         let h = TestHandles::with_env_dbc_stmt();
         stmt_with_buffered_get_data_row(&h, vec![42]);
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
         stmt.inner
             .lock()
             .unwrap()
@@ -4641,7 +4646,7 @@ mod tests {
     fn buffered_binary_probe_reports_truncation_and_leaves_value_resident() {
         let h = TestHandles::with_env_dbc_stmt();
         stmt_with_buffered_get_data_row(&h, vec![42]);
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
 
         let mut probe = 0_u8;
         let mut indicator: SqlLen = 0;
@@ -4691,7 +4696,7 @@ mod tests {
     fn buffered_typed_get_data_preserves_variant_base() {
         let h = TestHandles::with_env_dbc_stmt();
         stmt_with_buffered_get_data_row(&h, vec![42]);
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
         stmt.inner
             .lock()
             .unwrap()
@@ -4758,7 +4763,7 @@ mod tests {
             SQL_SUCCESS
         );
         assert_eq!(value, 20);
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
         let state = stmt.inner.lock().unwrap();
         assert!(state.buffered_get_data_row.is_none());
         let row = state.spare_get_data_row.as_ref().unwrap();
@@ -4789,7 +4794,7 @@ mod tests {
         );
         assert_eq!(value, 20);
 
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
         let state = stmt.inner.lock().unwrap();
         assert!(state.buffered_get_data_row.is_none());
         let row = state.spare_get_data_row.as_ref().unwrap();
@@ -4816,10 +4821,10 @@ mod tests {
     fn resume_row_to_column_keeps_ready_client_installed_and_captures_value() {
         let h = TestHandles::with_env_dbc_stmt();
         stmt_with_buffered_ints(&h, vec![42]);
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let dbc = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
 
-        assert_eq!(resume_row_to_column(stmt, h.stmt, 1), SQL_SUCCESS);
+        assert_eq!(resume_row_to_column(&stmt, h.stmt, 1), SQL_SUCCESS);
 
         {
             let state = dbc.inner.lock().unwrap();
@@ -4837,7 +4842,7 @@ mod tests {
     fn get_data_resolves_a_buffered_cursor_column() {
         let h = TestHandles::with_env_dbc_stmt();
         stmt_with_buffered_ints(&h, vec![42]);
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
         let mut value = 0_i32;
         let mut indicator = 0;
 
@@ -4863,10 +4868,10 @@ mod tests {
     fn resume_row_to_column_restores_client_after_pending_fallback() {
         let h = TestHandles::with_env_dbc_stmt();
         stmt_with_buffered_ints(&h, vec![10, 17]);
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let dbc = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
 
-        assert_eq!(resume_row_to_column(stmt, h.stmt, 1), SQL_SUCCESS);
+        assert_eq!(resume_row_to_column(&stmt, h.stmt, 1), SQL_SUCCESS);
 
         let dbc_state = dbc.inner.lock().unwrap();
         assert!(dbc_state.client.is_some());
@@ -5263,7 +5268,7 @@ mod tests {
         assert_eq!(ret, SQL_SUCCESS_WITH_INFO);
         assert_eq!(ind, 4);
         {
-            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
             let s = stmt.inner.lock().unwrap();
             assert_eq!(s.diag_records.last().unwrap().sql_state, SQLSTATE_01004);
         }
@@ -5299,7 +5304,7 @@ mod tests {
         assert_eq!(ret, SQL_SUCCESS);
         assert_eq!(ind, 0);
         {
-            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
             let s = stmt.inner.lock().unwrap();
             assert!(s.diag_records.is_empty());
         }
@@ -5412,7 +5417,7 @@ mod tests {
         // Guard the premise: this test is only meaningful while the value maps
         // to SQL_NO_TOTAL rather than a byte count.
         {
-            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
             let s = stmt.inner.lock().unwrap();
             let (_, value) = s.last_captured.as_ref().unwrap();
             assert_eq!(binary_length(value), SQL_NO_TOTAL);
@@ -5424,7 +5429,7 @@ mod tests {
         assert_eq!(ret, SQL_SUCCESS_WITH_INFO);
         assert_eq!(ind, SQL_NO_TOTAL);
         {
-            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
             let s = stmt.inner.lock().unwrap();
             assert_eq!(s.diag_records.last().unwrap().sql_state, SQLSTATE_01004);
         }
@@ -5474,7 +5479,7 @@ mod tests {
         // A fixed-width target's buffer is left untouched on NULL.
         assert_eq!(buf, [0xAAu8; 8]);
 
-        let sh = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let sh = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
         let s = sh.inner.lock().unwrap();
         assert!(
             s.diag_records.is_empty(),
@@ -5503,7 +5508,7 @@ mod tests {
             )
         };
         assert_eq!(ret, SQL_ERROR);
-        let sh = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let sh = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
         let s = sh.inner.lock().unwrap();
         assert_eq!(s.diag_records.last().unwrap().sql_state, SQLSTATE_HY003);
     }
@@ -5528,7 +5533,7 @@ mod tests {
             )
         };
         assert_eq!(ret, SQL_ERROR);
-        let sh = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let sh = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
         let s = sh.inner.lock().unwrap();
         assert_eq!(s.diag_records.last().unwrap().sql_state, SQLSTATE_HYC00);
     }
@@ -5563,7 +5568,7 @@ mod tests {
         metadata: Vec<mssql_tds::query::metadata::ColumnMetadata>,
         value: ColumnValues,
     ) {
-        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt_handle = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
         let mut s = stmt_handle.inner.lock().unwrap();
         s.set_state(STMT_STATE_CURSOR_OPEN);
         s.column_metadata = metadata;
@@ -5650,7 +5655,7 @@ mod tests {
 
         let h = TestHandles::with_env_dbc_stmt();
         {
-            let env = unsafe { handle_from_raw::<EnvHandle>(h.env) };
+            let env = handle_from_raw::<EnvHandle>(h.env).unwrap().into_arc();
             env.inner.lock().unwrap().odbc_version = version;
         }
         // 13:45:30.1234567 in 100 ns ticks since midnight.
@@ -5726,7 +5731,7 @@ mod tests {
             )
         };
         assert_eq!(ret, SQL_ERROR);
-        let sh = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let sh = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
         let s = sh.inner.lock().unwrap();
         assert_eq!(s.diag_records.last().unwrap().sql_state, SQLSTATE_HYC00);
     }
@@ -5766,7 +5771,7 @@ mod tests {
             backing.iter().all(|&b| b == 0xEE),
             "nothing may be written into a buffer too narrow for the resolved target"
         );
-        let sh = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let sh = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
         let s = sh.inner.lock().unwrap();
         assert_eq!(s.diag_records.last().unwrap().sql_state, SQLSTATE_HYC00);
     }
@@ -5805,7 +5810,7 @@ mod tests {
             out, [0xEEu8; 16],
             "nothing may be written under a zero width"
         );
-        let sh = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let sh = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
         let s = sh.inner.lock().unwrap();
         assert_eq!(s.diag_records.last().unwrap().sql_state, SQLSTATE_HYC00);
     }
@@ -5841,7 +5846,7 @@ mod tests {
             out, [0xEEu8; 16],
             "a NULL leaves a fixed-width buffer untouched"
         );
-        let sh = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let sh = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
         let s = sh.inner.lock().unwrap();
         assert!(
             s.diag_records.is_empty(),
@@ -5886,7 +5891,7 @@ mod tests {
     #[test]
     fn deliver_captured_binary_without_a_value_reports_24000() {
         let h = TestHandles::with_env_dbc_stmt();
-        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt_handle = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
         let mut s = stmt_handle.inner.lock().unwrap();
         s.last_captured = None;
 
@@ -5940,7 +5945,7 @@ mod tests {
         );
         assert_eq!(ind, 5);
         {
-            let sh = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let sh = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
             let s = sh.inner.lock().unwrap();
             assert_eq!(
                 s.diag_records.last().unwrap().sql_state,
@@ -5987,7 +5992,7 @@ mod tests {
         assert_eq!(ret, SQL_ERROR);
         assert_eq!(out, -1_066_579_696, "NULL must not disturb the data slot");
         {
-            let sh = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let sh = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
             let s = sh.inner.lock().unwrap();
             assert_last_diag(&s.diag_records, ERR_INDICATOR_REQUIRED);
         }
@@ -6029,7 +6034,7 @@ mod tests {
         };
         assert_eq!(ret, SQL_ERROR);
         assert_eq!(buf, [b'X'; 8], "NULL must not disturb the data slot");
-        let sh = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let sh = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
         let s = sh.inner.lock().unwrap();
         assert_last_diag(&s.diag_records, ERR_INDICATOR_REQUIRED);
     }
@@ -6046,7 +6051,7 @@ mod tests {
     #[test]
     fn get_data_null_without_indicator_does_not_block_later_columns_in_the_row() {
         let h = TestHandles::with_env_dbc_stmt();
-        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt_handle = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
         {
             let mut s = stmt_handle.inner.lock().unwrap();
             s.set_state(STMT_STATE_CURSOR_OPEN);
@@ -6167,10 +6172,8 @@ mod tests {
             )
         };
         assert_eq!(ret, SQL_ERROR);
-        let s = unsafe { handle_from_raw::<StmtHandle>(h.stmt) }
-            .inner
-            .lock()
-            .unwrap();
+        let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let s = stmt.inner.lock().unwrap();
         assert_last_diag(&s.diag_records, ERR_NUMERIC_OUT_OF_RANGE);
     }
 
@@ -6193,10 +6196,8 @@ mod tests {
             )
         };
         assert_eq!(ret, SQL_ERROR);
-        let s = unsafe { handle_from_raw::<StmtHandle>(h.stmt) }
-            .inner
-            .lock()
-            .unwrap();
+        let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let s = stmt.inner.lock().unwrap();
         assert_last_diag(&s.diag_records, ERR_RESTRICTED_DATA_TYPE);
     }
 
@@ -6313,10 +6314,8 @@ mod tests {
             )
         };
         assert_eq!(ret, SQL_ERROR);
-        let s = unsafe { handle_from_raw::<StmtHandle>(h.stmt) }
-            .inner
-            .lock()
-            .unwrap();
+        let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let s = stmt.inner.lock().unwrap();
         assert_last_diag(&s.diag_records, ERR_INVALID_CHARACTER_VALUE);
     }
 
@@ -6374,10 +6373,8 @@ mod tests {
             )
         };
         assert_eq!(ret, SQL_ERROR);
-        let s = unsafe { handle_from_raw::<StmtHandle>(h.stmt) }
-            .inner
-            .lock()
-            .unwrap();
+        let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let s = stmt.inner.lock().unwrap();
         let last = s.diag_records.last().unwrap();
         assert_eq!(&last.sql_state, b"22018");
     }
@@ -6393,11 +6390,11 @@ mod tests {
         let h = TestHandles::with_env_dbc_stmt();
         stmt_with_captured(&h, ColumnValues::Null);
         {
-            let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let stmt_handle = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
             stmt_handle.inner.lock().unwrap().column_metadata = int_columns(1);
         }
         h.mark_dbc_connected();
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
         let mut client = mssql_tds::test_client_support::tds_client_from_tokens(vec![
             mssql_tds::test_client_support::col_metadata_empty(),
             mssql_tds::test_client_support::done_no_more(),
@@ -6426,7 +6423,7 @@ mod tests {
 
         assert_eq!(rc, SQL_SUCCESS);
         assert!(dbc.inner.lock().unwrap().active_stmt.is_none());
-        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt_handle = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
         assert!(stmt_handle.inner.lock().unwrap().result_set_exhausted);
     }
 
@@ -6435,7 +6432,7 @@ mod tests {
         let h = TestHandles::with_env_dbc_stmt();
         stmt_with_buffered_get_data_row(&h, vec![42]);
         h.mark_dbc_connected();
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
         let mut client = mssql_tds::test_client_support::tds_client_from_tokens(vec![
             mssql_tds::test_client_support::col_metadata_empty(),
             mssql_tds::test_client_support::done_no_more(),
@@ -6465,7 +6462,7 @@ mod tests {
         assert_eq!(rc, SQL_SUCCESS);
         assert_eq!(value, 42);
         assert!(dbc.inner.lock().unwrap().active_stmt.is_none());
-        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt_handle = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
         assert!(stmt_handle.inner.lock().unwrap().result_set_exhausted);
     }
 
@@ -6479,7 +6476,7 @@ mod tests {
     fn get_data_keeps_busy_when_a_trailing_column_remains() {
         let h = TestHandles::with_env_dbc_stmt();
         stmt_with_captured(&h, ColumnValues::Null); // int_columns(2) by default
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
         dbc.inner.lock().unwrap().active_stmt = Some(h.stmt);
 
         let mut buf = [0u8; 8];
@@ -6497,7 +6494,7 @@ mod tests {
 
         assert_eq!(rc, SQL_SUCCESS);
         assert_eq!(dbc.inner.lock().unwrap().active_stmt, Some(h.stmt));
-        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt_handle = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
         assert!(!stmt_handle.inner.lock().unwrap().result_set_exhausted);
     }
 
@@ -6513,13 +6510,13 @@ mod tests {
     fn finish_get_data_releases_busy_purely_on_delivery_state_even_when_rc_is_sql_error() {
         let h = TestHandles::with_env_dbc_stmt();
         {
-            let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let stmt_handle = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
             let mut s = stmt_handle.inner.lock().unwrap();
             s.column_metadata = int_columns(1);
             s.current_row_last_col = 1; // as if column 1 (the only column) was just fully delivered.
         }
         h.mark_dbc_connected();
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
         let mut client = mssql_tds::test_client_support::tds_client_from_tokens(vec![
             mssql_tds::test_client_support::col_metadata_empty(),
             mssql_tds::test_client_support::done_no_more(),
@@ -6533,9 +6530,9 @@ mod tests {
             ds.active_stmt = Some(h.stmt);
         }
 
-        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt_handle = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
         let stmt_state = stmt_handle.inner.lock().unwrap();
-        let rc = finish_get_data(stmt_handle, h.stmt, stmt_state, 1, SQL_ERROR);
+        let rc = finish_get_data(&stmt_handle, h.stmt, stmt_state, 1, SQL_ERROR);
 
         assert_eq!(rc, SQL_ERROR);
         assert!(dbc.inner.lock().unwrap().active_stmt.is_none());
@@ -6552,14 +6549,14 @@ mod tests {
     fn finish_get_data_keeps_busy_while_a_plp_stream_is_still_active() {
         let h = TestHandles::with_env_dbc_stmt();
         {
-            let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let stmt_handle = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
             let mut s = stmt_handle.inner.lock().unwrap();
             s.column_metadata = int_columns(1);
             s.current_row_last_col = 1; // the only column, otherwise fully delivered.
             s.active_plp = Some(ActivePlpStream::new(1, PlpEncoding::SingleByteText, None));
         }
         h.mark_dbc_connected();
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
         // A real, positioned client: if the PLP guard were missing, `ready`
         // would wrongly read true and the peek below would actually run
         // (and succeed, since the scripted stream is well-formed) — the
@@ -6578,9 +6575,9 @@ mod tests {
             ds.active_stmt = Some(h.stmt);
         }
 
-        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt_handle = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
         let stmt_state = stmt_handle.inner.lock().unwrap();
-        let rc = finish_get_data(stmt_handle, h.stmt, stmt_state, 1, SQL_SUCCESS);
+        let rc = finish_get_data(&stmt_handle, h.stmt, stmt_state, 1, SQL_SUCCESS);
 
         assert_eq!(rc, SQL_SUCCESS);
         assert_eq!(
@@ -6595,7 +6592,7 @@ mod tests {
     #[test]
     fn deferred_plp_prefetch_error_surfaces_on_next_get_data_call() {
         let h = TestHandles::with_env_dbc_stmt();
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
         // Recreate the state left after one call returns its current chunk while
         // the read-ahead for the following chunk fails.
         let mut stream = ActivePlpStream::new(1, PlpEncoding::SingleByteText, None);

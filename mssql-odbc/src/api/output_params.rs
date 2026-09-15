@@ -37,7 +37,8 @@ use crate::params::BoundParam;
 /// Every bound output parameter's value and indicator buffers must still be
 /// writable at the current parameter binding offset. `bound_params` must be a
 /// fresh effective APD/IPD snapshot, taken before acquiring the STMT lock, not
-/// the execution-time input snapshot.
+/// the execution-time input snapshot. Its `ParameterSnapshot` lease must remain
+/// alive until every value and indicator write has completed.
 pub(crate) unsafe fn write_back_output_params(
     stmt_state: &mut StmtState,
     bound_params: &[Option<BoundParam>],
@@ -259,8 +260,10 @@ mod tests {
         for reset in [false, true] {
             let mut h = TestHandles::with_env_dbc_stmt();
             let other = h.alloc_extra_stmt();
-            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
-            let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+            let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+            let stmt = &*stmt_owner;
+            let dbc_owner = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
+            let dbc = &*dbc_owner;
             let mut old = -1i32;
             let mut new = -2i32;
             let old_param = output_param(
@@ -271,7 +274,7 @@ mod tests {
                 std::ptr::null_mut(),
             );
             bind(&h, old_param);
-            let stale = snapshot_bound_params(stmt).unwrap();
+            let stale = snapshot_bound_params(stmt).unwrap().records;
             {
                 let mut state = stmt.inner.lock().unwrap();
                 state.bound_params = stale;
@@ -307,6 +310,137 @@ mod tests {
     }
 
     #[test]
+    fn pending_output_writes_hold_binding_leases_until_delivery_finishes() {
+        use crate::api::bind_col::sql_bind_col;
+        use crate::api::odbc_types::{
+            SQL_ATTR_APP_PARAM_DESC, SQL_ATTR_APP_ROW_DESC, SQL_ATTR_PARAM_BIND_OFFSET_PTR,
+            SQL_DESC_DATA_PTR, SQL_SUCCESS,
+        };
+        use crate::api::set_desc_field::sql_set_desc_field_w;
+        use crate::api::set_stmt_attr::sql_set_stmt_attr_w;
+        use crate::handles::DescHandle;
+        use crate::handles::bindings::snapshot_test_hook::{self, Phase};
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let mut h = TestHandles::with_env_dbc_stmt();
+        let other = h.alloc_extra_stmt();
+        let desc_raw = h.alloc_explicit_desc();
+        let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let desc = handle_from_raw::<DescHandle>(desc_raw).unwrap().into_arc();
+        assert_eq!(
+            unsafe { sql_set_stmt_attr_w(h.stmt, SQL_ATTR_APP_PARAM_DESC, desc_raw, 0) },
+            SQL_SUCCESS
+        );
+        assert_eq!(
+            unsafe { sql_set_stmt_attr_w(other, SQL_ATTR_APP_ROW_DESC, desc_raw, 0) },
+            SQL_SUCCESS
+        );
+        let mut values = [91_i32, -1, 92];
+        let mut indicators = [93_isize, -1, 94];
+        let mut replacement = -2_i32;
+        bind(
+            &h,
+            output_param(
+                SQL_C_SLONG,
+                SQL_INTEGER,
+                (&raw mut values[1]).cast(),
+                4,
+                &raw mut indicators[1],
+            ),
+        );
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.batch_exhausted = true;
+            state.pending_output_params =
+                Some((vec![returned("@P1", 0, ColumnValues::Int(73))], None));
+        }
+        let (arrived, ready) = mpsc::channel();
+        let (resume, release) = mpsc::channel();
+        let _hook = snapshot_test_hook::install(&stmt, Phase::Parameters, move || {
+            arrived.send(()).unwrap();
+            release.recv_timeout(Duration::from_secs(10)).unwrap();
+        });
+        let id = h.stmt.addr();
+        std::thread::scope(|scope| {
+            let delivery = scope
+                .spawn(move || unsafe { sql_more_results(std::ptr::without_provenance_mut(id)) });
+            ready.recv_timeout(Duration::from_secs(10)).unwrap();
+            assert!(stmt.param_binding_use.is_active());
+            assert!(desc.binding_use.is_active());
+            assert!(stmt.parent_dbc().inner.try_lock().is_ok());
+            assert!(stmt.inner.try_lock().is_ok());
+            assert!(desc.inner.try_lock().is_ok());
+
+            let rebind = unsafe {
+                sql_bind_parameter(
+                    h.stmt,
+                    1,
+                    SQL_PARAM_OUTPUT,
+                    SQL_C_SLONG,
+                    SQL_INTEGER,
+                    8,
+                    0,
+                    (&raw mut replacement).cast(),
+                    4,
+                    std::ptr::null_mut(),
+                )
+            };
+            let reset = unsafe { sql_free_stmt_reset_params(h.stmt) };
+            let reassociate = unsafe {
+                sql_set_stmt_attr_w(h.stmt, SQL_ATTR_APP_PARAM_DESC, std::ptr::null_mut(), 0)
+            };
+            let offset = unsafe {
+                sql_set_stmt_attr_w(
+                    h.stmt,
+                    SQL_ATTR_PARAM_BIND_OFFSET_PTR,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            let shared_bind = unsafe {
+                sql_bind_col(
+                    other,
+                    1,
+                    SQL_C_SLONG,
+                    (&raw mut replacement).cast(),
+                    4,
+                    std::ptr::null_mut(),
+                )
+            };
+            let field = unsafe {
+                sql_set_desc_field_w(
+                    desc_raw,
+                    1,
+                    SQL_DESC_DATA_PTR.try_into().unwrap(),
+                    (&raw mut replacement).cast(),
+                    0,
+                )
+            };
+            let stmt_diag = stmt.inner.lock().unwrap().diag_records[0].sql_state;
+            let desc_diag = desc.inner.lock().unwrap().diag_records[0].sql_state;
+            let free = h.free_explicit_desc(desc_raw);
+            resume.send(()).unwrap();
+            let result = delivery.join().unwrap();
+            assert_eq!(
+                [rebind, reset, reassociate, offset, shared_bind, field, free],
+                [SQL_ERROR; 7]
+            );
+            assert_eq!(stmt_diag, *b"HY010");
+            assert_eq!(desc_diag, *b"HY010");
+            assert_eq!(result, SQL_NO_DATA);
+        });
+
+        assert_eq!(values, [91, 73, 92]);
+        assert_eq!(indicators, [93, 4, 94]);
+        assert_eq!(replacement, -2);
+        assert!(!stmt.param_binding_use.is_active());
+        assert!(!desc.binding_use.is_active());
+        assert_eq!(unsafe { sql_free_stmt_reset_params(h.stmt) }, SQL_SUCCESS);
+        assert_eq!(h.free_explicit_desc(desc_raw), SQL_SUCCESS);
+    }
+
+    #[test]
     fn pending_output_diagnostics_preserve_severity_and_fractional_sqlstate() {
         for (value, c_type, expected_rc, expected_state) in [
             (
@@ -329,7 +463,8 @@ mod tests {
             ),
         ] {
             let h = TestHandles::with_env_dbc_stmt();
-            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+            let stmt = &*stmt_owner;
             let mut value_buffer = [0u8; 4];
             bind(
                 &h,
@@ -359,7 +494,8 @@ mod tests {
     #[test]
     fn return_status_requires_the_direct_rpc_route_even_for_return_value_direction() {
         let h = TestHandles::with_env_dbc_stmt();
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = &*stmt_owner;
         let mut value = -1i32;
         let mut param = output_param(
             SQL_C_SLONG,
@@ -384,7 +520,8 @@ mod tests {
     #[test]
     fn unmatched_named_output_never_falls_back_to_another_binding() {
         let h = TestHandles::with_env_dbc_stmt();
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = &*stmt_owner;
         let mut value = -1i32;
         let param = output_param(
             SQL_C_SLONG,
@@ -423,7 +560,8 @@ mod tests {
     #[test]
     fn output_error_dominates_warnings_without_losing_diagnostics() {
         let h = TestHandles::with_env_dbc_stmt();
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = &*stmt_owner;
         let mut invalid = -1i32;
         let mut truncated = [0u8; 4];
         let mut fractional = -1i32;

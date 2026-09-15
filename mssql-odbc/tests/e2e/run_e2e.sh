@@ -227,6 +227,7 @@ build_rust_driver() {
             echo "Error: Rust driver not found at $RUST_DRIVER_PATH" >&2
             exit 1
         fi
+        RUST_DRIVER_PATH="$(cd "$(dirname "$RUST_DRIVER_PATH")" && pwd)/$(basename "$RUST_DRIVER_PATH")"
         return
     fi
 
@@ -407,6 +408,11 @@ run_tests() {
 
     local rc=0
     (
+        if [ "$label" = "mssql-odbc" ]; then
+            export MSSQL_ODBC_DRIVER_PATH="$RUST_DRIVER_PATH"
+        else
+            unset MSSQL_ODBC_DRIVER_PATH
+        fi
         cd "$BUILD_DIR"
         # ODBC_TEST_TARGET tells tests which driver implementation this leg runs
         # against ("mssql-odbc" or "msodbcsql") so mssql-odbc-specific tests can

@@ -324,7 +324,7 @@ mod tests {
     }
 
     fn sqlstate(dbc: SqlHandle) -> String {
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(dbc) };
+        let dbc = handle_from_raw::<DbcHandle>(dbc).unwrap().into_arc();
         let state = dbc.inner.lock().unwrap();
         String::from_utf8_lossy(&state.diag_records[0].sql_state).into_owned()
     }
@@ -418,7 +418,7 @@ mod tests {
     fn set_accepts_an_empty_name_before_connect() {
         let h = TestHandles::with_env_dbc();
         assert_eq!(set_catalog(h.dbc, ""), SQL_SUCCESS);
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
         assert_eq!(
             dbc.inner.lock().unwrap().current_catalog.as_deref(),
             Some("")
@@ -523,7 +523,7 @@ mod tests {
         let stmt = h.alloc_extra_stmt();
         h.mark_dbc_connected();
         {
-            let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+            let dbc = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
             dbc.inner.lock().unwrap().active_stmt = Some(stmt);
         }
         assert_eq!(set_catalog(h.dbc, "master"), SQL_ERROR);
@@ -533,7 +533,7 @@ mod tests {
         // Clear `active_stmt` and let `TestHandles::drop` free the statement:
         // freeing it here would leave the raw pointer in `extra_stmts` and free
         // it twice.
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
         dbc.inner.lock().unwrap().active_stmt = None;
     }
 
@@ -557,7 +557,7 @@ mod tests {
         let h = TestHandles::with_env_dbc();
         assert_eq!(set_catalog(h.dbc, DEFAULT_CATALOG), SQL_SUCCESS);
 
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
         assert_eq!(
             dbc.inner.lock().unwrap().current_catalog.as_deref(),
             Some(DEFAULT_CATALOG)
@@ -573,7 +573,7 @@ mod tests {
         let h = TestHandles::with_env_dbc();
         assert_eq!(set_catalog(h.dbc, "reporting"), SQL_SUCCESS);
         {
-            let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+            let dbc = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
             let mut state = dbc.inner.lock().unwrap();
             post_diag(&mut state, ERR_CONNECTION_BUSY);
             assert_eq!(state.diag_records.len(), 1);
@@ -600,7 +600,7 @@ mod tests {
 
     /// Panics while holding the DBC lock, leaving the mutex poisoned.
     fn poison_dbc(dbc: SqlHandle) {
-        let handle = unsafe { handle_from_raw::<DbcHandle>(dbc) };
+        let handle = handle_from_raw::<DbcHandle>(dbc).unwrap().into_arc();
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _guard = handle.inner.lock().unwrap();
             panic!("poison the dbc lock");
@@ -627,7 +627,7 @@ mod tests {
         // guard is only reachable directly.
         let h = TestHandles::with_env_dbc();
         poison_dbc(h.dbc);
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
-        assert!(matches!(decide(dbc, "master"), Err(SQL_ERROR)));
+        let dbc = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
+        assert!(matches!(decide(&dbc, "master"), Err(SQL_ERROR)));
     }
 }

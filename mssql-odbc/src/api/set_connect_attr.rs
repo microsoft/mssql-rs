@@ -31,7 +31,7 @@ use crate::api::odbc_types::{
 use crate::api::odbc_types::{SQL_NTS, SYSNAMELEN, SqlWChar};
 use crate::error::{free_errors, post_sql_error};
 use crate::handles::dbc::ConnectionState;
-use crate::handles::{DbcHandle, HandleType, StmtHandle, handle_from_raw};
+use crate::handles::{DbcHandle, HandleType, StmtHandle, get_handle, handle_from_raw};
 
 /// Largest login timeout the driver accepts, in seconds.
 ///
@@ -175,7 +175,7 @@ unsafe fn sql_set_connect_attr_w_impl(
         return SQL_INVALID_HANDLE;
     }
 
-    let dbc = unsafe { handle_from_raw::<DbcHandle>(connection_handle) };
+    let dbc = get_handle!(DbcHandle, connection_handle);
     debug_assert_eq!(
         dbc.object_type,
         HandleType::Dbc,
@@ -185,25 +185,25 @@ unsafe fn sql_set_connect_attr_w_impl(
     // The transaction attributes talk to the server, which must not happen while
     // the DBC mutex is held, so they manage their own locking.
     match attribute {
-        SQL_ATTR_AUTOCOMMIT => return set_autocommit(dbc, value_ptr as usize as u64),
+        SQL_ATTR_AUTOCOMMIT => return set_autocommit(&dbc, value_ptr as usize as u64),
         // Both spellings drive the same session setting. The vendor attribute is
         // the only one that can carry SQL_TXN_SS_SNAPSHOT, because the Driver
         // Manager screens SQL_ATTR_TXN_ISOLATION down to the four standard bits.
         SQL_ATTR_TXN_ISOLATION | SQL_COPT_SS_TXN_ISOLATION => {
-            return set_txn_isolation(dbc, value_ptr as usize as u64);
+            return set_txn_isolation(&dbc, value_ptr as usize as u64);
         }
         // Pool-reuse reset: rolls back any live local transaction and arms the
         // RESETCONNECTION bit, so it must not run under the DBC mutex either.
         SQL_ATTR_RESET_CONNECTION | SQL_COPT_SS_RESET_CONNECTION => {
-            return reset_connection(dbc, value_ptr as usize as u64);
+            return reset_connection(&dbc, value_ptr as usize as u64);
         }
         // Sends `USE` when connected — likewise not under the mutex.
         SQL_ATTR_CURRENT_CATALOG => {
-            return unsafe { set_current_catalog(dbc, value_ptr, string_length) };
+            return unsafe { set_current_catalog(&dbc, value_ptr, string_length) };
         }
         // Fans out to every statement on the connection, so it takes statement
         // locks and must not hold the DBC mutex while doing so.
-        SQL_ATTR_QUERY_TIMEOUT => return set_query_timeout(dbc, value_ptr as usize as u64),
+        SQL_ATTR_QUERY_TIMEOUT => return set_query_timeout(&dbc, value_ptr as usize as u64),
         _ => {}
     }
 
@@ -437,15 +437,20 @@ fn set_query_timeout(dbc: &DbcHandle, requested: u64) -> SqlReturn {
         state.statements.clone()
     };
 
-    let mut poisoned = false;
+    let mut unusable = false;
     for stmt_ptr in statements {
-        // SAFETY: every pointer in `statements` came from
-        // `handle_to_raw::<StmtHandle>` and is owned by this DBC.
-        // A concurrent `SQLFreeHandle(SQL_HANDLE_STMT)` could still free it
-        // between the clone above and this call — the same handle-lifetime gap
-        // `close_all_cursors` and `SQLDisconnect` document (see the TODO in
-        // `disconnect.rs`), which refcounted handles will close driver-wide.
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(stmt_ptr) };
+        let stmt = match handle_from_raw::<StmtHandle>(stmt_ptr) {
+            Ok(stmt) => stmt,
+            Err(err) => {
+                error!(
+                    ?stmt_ptr,
+                    ?err,
+                    "SQLSetConnectAttrW: statement lookup failed"
+                );
+                unusable = true;
+                continue;
+            }
+        };
         match stmt.inner.lock() {
             Ok(mut stmt_state) => stmt_state.query_timeout = seconds,
             // One unusable statement must not abort the fan-out — the others
@@ -453,14 +458,14 @@ fn set_query_timeout(dbc: &DbcHandle, requested: u64) -> SqlReturn {
             // applied everywhere, so the call cannot report plain success.
             Err(_) => {
                 error!(?stmt_ptr, "SQLSetConnectAttrW: stmt mutex poisoned");
-                poisoned = true;
+                unusable = true;
             }
         }
     }
     debug!(seconds, "SQLSetConnectAttrW: query timeout applied");
 
     // Worst-wins: a statement that never received the value outranks clamping.
-    let outcome = if poisoned {
+    let outcome = if unusable {
         (ERR_STATEMENT_UNUSABLE, SQL_ERROR)
     } else if clamped {
         (WARN_OPTION_VALUE_CHANGED, SQL_SUCCESS_WITH_INFO)
@@ -522,6 +527,7 @@ mod tests {
     };
     use crate::error::HasDiagnostics;
     use crate::handles::dbc::VendorConnOverrides;
+    use crate::handles::handle_from_raw;
     use crate::test_support::TestHandles;
 
     /// Build a `SQL_COPT_SS_ACCESS_TOKEN` struct the way msodbcsql apps do:
@@ -572,7 +578,7 @@ mod tests {
         };
         assert_eq!(ret, SQL_SUCCESS);
 
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
         assert_eq!(
             dbc.inner.lock().unwrap().current_catalog.as_deref(),
             Some("reporting")
@@ -594,7 +600,7 @@ mod tests {
         };
         assert_eq!(ret, SQL_SUCCESS);
 
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
         assert_eq!(
             dbc.inner.lock().unwrap().current_catalog.as_deref(),
             Some("tempdb")
@@ -630,7 +636,7 @@ mod tests {
             )
         };
         assert_eq!(ret, SQL_SUCCESS);
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
         let state = dbc.inner.lock().unwrap();
         assert_eq!(state.access_token.as_deref(), Some(jwt));
     }
@@ -654,7 +660,7 @@ mod tests {
             )
         };
         assert_eq!(ret, SQL_ERROR);
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
         let state = dbc.inner.lock().unwrap();
         assert_eq!(state.diag_records()[0].sql_state, SQLSTATE_HY011);
         assert!(
@@ -681,7 +687,7 @@ mod tests {
         // choice: it is a real undocumented SQL_COPT_SS_* id msodbcsql accepts.)
         let ret = unsafe { sql_set_connect_attr_w(h.dbc, 99999, std::ptr::null_mut(), 0) };
         assert_eq!(ret, SQL_ERROR);
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
         let state = dbc.inner.lock().unwrap();
         assert_eq!(state.diag_records[0].sql_state, SQLSTATE_HY092);
     }
@@ -695,7 +701,7 @@ mod tests {
         let h = TestHandles::with_env_dbc();
         let ret = unsafe { sql_set_connect_attr_w(h.dbc, 1224, std::ptr::null_mut(), 0) };
         assert_eq!(ret, SQL_ERROR);
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
         let state = dbc.inner.lock().unwrap();
         assert_eq!(state.diag_records[0].sql_state, SQLSTATE_HYC00);
     }
@@ -709,7 +715,7 @@ mod tests {
         let h = TestHandles::with_env_dbc();
         let ret = unsafe { sql_set_connect_attr_w(h.dbc, 1, 10 as SqlPointer, 0) };
         assert_eq!(ret, SQL_ERROR);
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
         let state = dbc.inner.lock().unwrap();
         assert_eq!(state.diag_records[0].sql_state, SQLSTATE_HYC00);
     }
@@ -721,7 +727,7 @@ mod tests {
         let h = TestHandles::with_env_dbc();
         let ret = unsafe { sql_set_connect_attr_w(h.dbc, 27, 10 as SqlPointer, 0) };
         assert_eq!(ret, SQL_ERROR);
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
         let state = dbc.inner.lock().unwrap();
         assert_eq!(state.diag_records[0].sql_state, SQLSTATE_HY092);
     }
@@ -740,12 +746,12 @@ mod tests {
         assert_eq!(ret, SQL_SUCCESS);
 
         // Already open when the attribute was set.
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(existing) };
+        let stmt = handle_from_raw::<StmtHandle>(existing).unwrap().into_arc();
         assert_eq!(stmt.inner.lock().unwrap().query_timeout, 17);
 
         // Allocated afterwards: seeded from the connection default.
         let later = h.alloc_extra_stmt();
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(later) };
+        let stmt = handle_from_raw::<StmtHandle>(later).unwrap().into_arc();
         assert_eq!(stmt.inner.lock().unwrap().query_timeout, 17);
     }
 
@@ -758,14 +764,16 @@ mod tests {
         };
         assert_eq!(ret, SQL_SUCCESS_WITH_INFO);
 
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
         assert_eq!(
             dbc.inner.lock().unwrap().diag_records[0].sql_state,
             *b"01S02"
         );
 
         // The clamped value, not the requested one, is what statements receive.
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(stmt_handle) };
+        let stmt = handle_from_raw::<StmtHandle>(stmt_handle)
+            .unwrap()
+            .into_arc();
         assert_eq!(stmt.inner.lock().unwrap().query_timeout, 0xfffe);
     }
 
@@ -776,7 +784,7 @@ mod tests {
             sql_set_connect_attr_w(h.dbc, SQL_ATTR_QUERY_TIMEOUT, 42usize as SqlPointer, 0)
         };
         assert_eq!(ret, SQL_SUCCESS);
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
         assert_eq!(dbc.inner.lock().unwrap().stmt_query_timeout, 42);
     }
 
@@ -790,7 +798,7 @@ mod tests {
         let bad = h.alloc_extra_stmt();
         let good = h.alloc_extra_stmt();
 
-        let bad_stmt = unsafe { handle_from_raw::<StmtHandle>(bad) };
+        let bad_stmt = handle_from_raw::<StmtHandle>(bad).unwrap().into_arc();
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _guard = bad_stmt.inner.lock().unwrap();
             panic!("poison the stmt lock");
@@ -801,20 +809,20 @@ mod tests {
         };
         assert_eq!(ret, SQL_ERROR);
 
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
         {
             let state = dbc.inner.lock().unwrap();
             assert_eq!(state.diag_records[0].sql_state, SQLSTATE_HY000);
         }
         assert_eq!(dbc.inner.lock().unwrap().stmt_query_timeout, 19);
-        let good_stmt = unsafe { handle_from_raw::<StmtHandle>(good) };
+        let good_stmt = handle_from_raw::<StmtHandle>(good).unwrap().into_arc();
         assert_eq!(good_stmt.inner.lock().unwrap().query_timeout, 19);
     }
 
     #[test]
     fn query_timeout_fails_cleanly_on_a_poisoned_connection() {
         let h = TestHandles::with_env_dbc();
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _guard = dbc.inner.lock().unwrap();
             panic!("poison the dbc lock");
@@ -834,7 +842,7 @@ mod tests {
             sql_set_connect_attr_w(h.dbc, SQL_ATTR_CONNECTION_TIMEOUT, std::ptr::null_mut(), 0)
         };
         assert_eq!(ret, SQL_SUCCESS);
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
         assert_eq!(dbc.inner.lock().unwrap().connection_timeout, 0);
     }
 
@@ -846,7 +854,7 @@ mod tests {
             sql_set_connect_attr_w(h.dbc, SQL_ATTR_LOGIN_TIMEOUT, 45usize as SqlPointer, 0)
         };
         assert_eq!(ret, SQL_SUCCESS);
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
         let state = dbc.inner.lock().unwrap();
         assert_eq!(state.login_timeout, Some(45));
     }
@@ -860,7 +868,7 @@ mod tests {
             sql_set_connect_attr_w(h.dbc, SQL_ATTR_LOGIN_TIMEOUT, std::ptr::null_mut(), 0)
         };
         assert_eq!(ret, SQL_SUCCESS);
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
         let state = dbc.inner.lock().unwrap();
         assert_eq!(state.login_timeout, Some(0));
     }
@@ -877,7 +885,7 @@ mod tests {
             )
         };
         assert_eq!(ret, SQL_SUCCESS);
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
         let state = dbc.inner.lock().unwrap();
         assert_eq!(state.login_timeout, Some(MAX_LOGIN_TIMEOUT_SECS as u32));
     }
@@ -896,7 +904,7 @@ mod tests {
             )
         };
         assert_eq!(ret, SQL_SUCCESS_WITH_INFO);
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
         let state = dbc.inner.lock().unwrap();
         assert_eq!(state.login_timeout, Some(MAX_LOGIN_TIMEOUT_SECS as u32));
         assert_eq!(state.diag_records()[0].sql_state, SQLSTATE_01S02);
@@ -918,7 +926,7 @@ mod tests {
             )
         };
         assert_eq!(ret, SQL_SUCCESS_WITH_INFO);
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
         let state = dbc.inner.lock().unwrap();
         assert_eq!(state.connection_timeout, MAX_LOGIN_TIMEOUT_SECS as u32);
 
@@ -953,7 +961,7 @@ mod tests {
             )
         };
         assert_eq!(ret, SQL_SUCCESS_WITH_INFO);
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
         let state = dbc.inner.lock().unwrap();
         assert_eq!(state.login_timeout, Some(MAX_LOGIN_TIMEOUT_SECS as u32));
     }
@@ -965,7 +973,7 @@ mod tests {
         // attributes carry. The value is not dead: SQLDisconnect leaves it in
         // place, so it applies to the next connect on this reusable handle.
         let h = TestHandles::with_env_dbc();
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
         dbc.inner.lock().unwrap().connection_state = ConnectionState::Connected;
 
         let ret = unsafe {
@@ -980,7 +988,7 @@ mod tests {
         // Packet size is fixed by the LOGIN7 handshake, so a late set could
         // never apply. msodbcsql posts HY011 for it (`sqlcmisc.cpp:1901-1906`).
         let h = TestHandles::with_env_dbc();
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
         dbc.inner.lock().unwrap().connection_state = ConnectionState::Connected;
 
         let ret = unsafe {
@@ -1012,7 +1020,8 @@ mod tests {
             )
         };
         assert_eq!(ret, SQL_SUCCESS_WITH_INFO);
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc_owner = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
+        let dbc = &*dbc_owner;
         let state = dbc.inner.lock().unwrap();
         assert_eq!(state.packet_size, MAX_PACKET_SIZE);
         let record = &state.diag_records()[0];
@@ -1030,7 +1039,8 @@ mod tests {
         let ret =
             unsafe { sql_set_connect_attr_w(h.dbc, SQL_ATTR_PACKET_SIZE, 1usize as SqlPointer, 0) };
         assert_eq!(ret, SQL_SUCCESS_WITH_INFO);
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc_owner = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
+        let dbc = &*dbc_owner;
         let state = dbc.inner.lock().unwrap();
         assert_eq!(state.packet_size, MIN_PACKET_SIZE);
     }
@@ -1045,7 +1055,8 @@ mod tests {
         let ret =
             unsafe { sql_set_connect_attr_w(h.dbc, SQL_ATTR_PACKET_SIZE, 0usize as SqlPointer, 0) };
         assert_eq!(ret, SQL_SUCCESS);
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc_owner = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
+        let dbc = &*dbc_owner;
         let state = dbc.inner.lock().unwrap();
         assert_eq!(state.packet_size, 0);
         assert!(state.diag_records().is_empty());
@@ -1054,7 +1065,8 @@ mod tests {
     #[test]
     fn packet_size_nonzero_to_zero_is_stored_without_a_warning() {
         let h = TestHandles::with_env_dbc();
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc_owner = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
+        let dbc = &*dbc_owner;
         unsafe { sql_set_connect_attr_w(h.dbc, SQL_ATTR_PACKET_SIZE, 16384usize as SqlPointer, 0) };
         assert_eq!(dbc.inner.lock().unwrap().packet_size, 16384);
         free_errors(&mut dbc.inner.lock().unwrap());
@@ -1070,7 +1082,8 @@ mod tests {
     #[test]
     fn packet_size_repeated_zero_never_warns() {
         let h = TestHandles::with_env_dbc();
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc_owner = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
+        let dbc = &*dbc_owner;
         for _ in 0..3 {
             let ret = unsafe {
                 sql_set_connect_attr_w(h.dbc, SQL_ATTR_PACKET_SIZE, 0usize as SqlPointer, 0)
@@ -1093,7 +1106,7 @@ mod tests {
             let ret = unsafe { sql_set_connect_attr_w(h.dbc, attribute, value as SqlPointer, 0) };
             assert_eq!(ret, SQL_SUCCESS, "setting {attribute}");
         }
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
         let state = dbc.inner.lock().unwrap();
         assert_eq!(state.access_mode, 1);
         assert_eq!(state.connection_timeout, 30);
@@ -1112,7 +1125,7 @@ mod tests {
             )
         };
         assert_eq!(ret, SQL_SUCCESS);
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
         assert!(!dbc.inner.lock().unwrap().autocommit);
     }
 
@@ -1121,7 +1134,7 @@ mod tests {
         // ODBC's default is SQL_AUTOCOMMIT_ON; msodbcsql short-circuits a set to
         // the current mode (`sqlcmisc.cpp:1720`) instead of touching the server.
         let h = TestHandles::with_env_dbc();
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
         assert!(dbc.inner.lock().unwrap().autocommit);
         let ret = unsafe {
             sql_set_connect_attr_w(
@@ -1140,7 +1153,7 @@ mod tests {
         let h = TestHandles::with_env_dbc();
         let ret = unsafe { sql_set_connect_attr_w(h.dbc, SQL_ATTR_AUTOCOMMIT, 7 as SqlPointer, 0) };
         assert_eq!(ret, SQL_ERROR);
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
         let state = dbc.inner.lock().unwrap();
         assert_eq!(state.diag_records()[0].sql_state, SQLSTATE_HY024);
         assert!(state.autocommit, "a rejected set must not change the mode");
@@ -1149,7 +1162,7 @@ mod tests {
     #[test]
     fn isolation_levels_are_stored_before_connect() {
         let h = TestHandles::with_env_dbc();
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
         for level in [
             SQL_TXN_READ_UNCOMMITTED,
             SQL_TXN_READ_COMMITTED,
@@ -1176,7 +1189,7 @@ mod tests {
         // Manager screens SQL_ATTR_TXN_ISOLATION down to the four standard bits
         // before the driver is called.
         let h = TestHandles::with_env_dbc();
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
         let ret = unsafe {
             sql_set_connect_attr_w(
                 h.dbc,
@@ -1194,7 +1207,7 @@ mod tests {
         // Matches the same-value short-circuit autocommit uses
         // (`sqlcmisc.cpp:1720`): no cursor sweep and no round trip.
         let h = TestHandles::with_env_dbc();
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
         h.mark_dbc_connected();
         assert_eq!(
             dbc.inner.lock().unwrap().txn_isolation,
@@ -1221,7 +1234,7 @@ mod tests {
         let ret =
             unsafe { sql_set_connect_attr_w(h.dbc, SQL_ATTR_TXN_ISOLATION, 0x10 as SqlPointer, 0) };
         assert_eq!(ret, SQL_ERROR);
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
         let state = dbc.inner.lock().unwrap();
         assert_eq!(state.diag_records()[0].sql_state, SQLSTATE_HYC00);
         assert_eq!(
@@ -1233,7 +1246,7 @@ mod tests {
     #[test]
     fn isolation_is_rejected_while_a_transaction_is_open() {
         let h = TestHandles::with_env_dbc();
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
         dbc.inner.lock().unwrap().local_tran_started = true;
 
         let ret = unsafe {
@@ -1270,7 +1283,7 @@ mod tests {
             let ret = unsafe { sql_set_connect_attr_w(h.dbc, attribute, raw as SqlPointer, 0) };
             assert_eq!(ret, SQL_SUCCESS, "attribute {attribute} value {raw}");
 
-            let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+            let dbc = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
             let overrides = dbc.inner.lock().unwrap().vendor_overrides.clone();
             let stored = match attribute {
                 SQL_COPT_SS_ENCRYPT => overrides.encrypt,
@@ -1292,7 +1305,7 @@ mod tests {
             SQL_COPT_SS_INTEGRATED_SECURITY,
         ] {
             let h = TestHandles::with_env_dbc();
-            let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+            let dbc = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
             dbc.inner.lock().unwrap().connection_state = ConnectionState::Connected;
 
             let ret = unsafe { sql_set_connect_attr_w(h.dbc, attribute, 1usize as SqlPointer, 0) };

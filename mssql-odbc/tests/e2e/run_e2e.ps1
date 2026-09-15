@@ -303,6 +303,7 @@ function Invoke-CtestRun([string]$Label, [string]$JunitName, [string]$DriverName
     $prevTarget = $env:ODBC_TEST_TARGET
     $prevDriver = $env:ODBC_TEST_DRIVER
     $prevDll = $env:MSSQL_ODBC_DLL
+    $prevDriverPath = $env:MSSQL_ODBC_DRIVER_PATH
     try {
         $ctestArgs = @('--output-on-failure', '-C', 'Debug', '--output-junit', $JunitName)
         if ($Retries -gt 0) {
@@ -318,6 +319,8 @@ function Invoke-CtestRun([string]$Label, [string]$JunitName, [string]$DriverName
         # ODBC_TEST_DRIVER selects the driver by name in the connection string.
         $env:ODBC_TEST_TARGET = $Label
         $env:ODBC_TEST_DRIVER = $DriverName
+        # Portable direct-ABI tests require the Rust artifact, not DM-owned handles.
+        $env:MSSQL_ODBC_DRIVER_PATH = $RustDriverDll
         # dll_unload_stress_test loads the driver directly with LoadLibrary to
         # exercise free-then-unload (AB#47831), so it needs a path rather than a
         # registered name and skips without one. Set only for the Rust leg: the
@@ -337,6 +340,7 @@ function Invoke-CtestRun([string]$Label, [string]$JunitName, [string]$DriverName
         $env:ODBC_TEST_TARGET = $prevTarget
         $env:ODBC_TEST_DRIVER = $prevDriver
         $env:MSSQL_ODBC_DLL = $prevDll
+        $env:MSSQL_ODBC_DRIVER_PATH = $prevDriverPath
         Pop-Location
     }
 }

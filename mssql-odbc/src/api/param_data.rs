@@ -41,7 +41,7 @@ use crate::api::odbc_types::{
 };
 use crate::error::free_errors;
 use crate::handles::stmt::STMT_STATE_EXEC_STARTED;
-use crate::handles::{HandleType, StmtHandle, handle_from_raw};
+use crate::handles::{HandleType, StmtHandle};
 /// Advances the data-at-execution parameter protocol.
 ///
 /// `value_ptr_ptr`, when non-null, receives the `ParameterValuePtr` that was
@@ -74,7 +74,8 @@ unsafe fn sql_param_data_impl(
         return SQL_INVALID_HANDLE;
     }
 
-    let stmt = unsafe { handle_from_raw::<StmtHandle>(statement_handle) };
+    let stmt_owner = crate::handles::get_handle!(StmtHandle, statement_handle);
+    let stmt = &*stmt_owner;
     debug_assert_eq!(
         stmt.object_type,
         HandleType::Stmt,
@@ -699,6 +700,7 @@ fn run_deferred_execute(
 mod tests {
     use super::*;
     use crate::api::odbc_types::{SQL_C_CHAR, SQL_NULL_HANDLE};
+    use crate::handles::handle_from_raw;
     use crate::handles::stmt::{DaeParam, DaeState};
     use crate::test_support::TestHandles;
 
@@ -722,7 +724,8 @@ mod tests {
         let mut p: SqlPointer = std::ptr::null_mut();
         let ret = unsafe { sql_param_data(h.stmt, &mut p) };
         assert_eq!(ret, SQL_ERROR);
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = &*stmt_owner;
         let state = stmt.inner.lock().unwrap();
         assert_eq!(state.diag_records[0].sql_state, ERR_FUNCTION_SEQUENCE.state);
     }
@@ -730,7 +733,8 @@ mod tests {
     #[test]
     fn first_call_returns_the_staged_dae_token() {
         let h = TestHandles::with_env_dbc_stmt();
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = &*stmt_owner;
         let mut token = 0u8;
         let token_ptr = (&raw mut token).cast();
         {
@@ -750,7 +754,8 @@ mod tests {
     #[test]
     fn second_call_without_put_data_returns_hy010() {
         let h = TestHandles::with_env_dbc_stmt();
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = &*stmt_owner;
         {
             let mut state = stmt.inner.lock().unwrap();
             state.dae = Some(open_dae(None));
@@ -775,7 +780,8 @@ mod tests {
     #[test]
     fn failed_checkout_leaves_the_carry_and_the_sequence_intact() {
         let h = TestHandles::with_env_dbc_stmt();
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = &*stmt_owner;
         {
             let mut state = stmt.inner.lock().unwrap();
             let mut param = DaeParam::unbounded(0, std::ptr::null_mut(), None);
@@ -808,7 +814,8 @@ mod tests {
     #[test]
     fn short_declared_dae_length_returns_22026() {
         let h = TestHandles::with_env_dbc_stmt();
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = &*stmt_owner;
         {
             let mut state = stmt.inner.lock().unwrap();
             let mut dae = open_dae(Some(3));

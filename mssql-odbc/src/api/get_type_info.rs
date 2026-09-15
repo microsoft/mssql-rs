@@ -38,7 +38,7 @@ use crate::error::free_errors;
 use crate::handles::stmt::{
     STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT, STMT_STATE_EXEC_STARTED, STMT_STATE_PREPARED,
 };
-use crate::handles::{HandleType, OdbcVersion, StmtHandle, handle_from_raw};
+use crate::handles::{HandleType, OdbcVersion, StmtHandle, get_handle};
 
 /// Catalog procedure returning the ODBC `SQLGetTypeInfo` result set. This
 /// driver targets SQL Server 2016+, so the Katmai (`_100`) form is always
@@ -85,14 +85,14 @@ unsafe fn sql_get_type_info_w_impl(
         return SQL_INVALID_HANDLE;
     }
 
-    let stmt = unsafe { handle_from_raw::<StmtHandle>(statement_handle) };
+    let stmt = get_handle!(StmtHandle, statement_handle);
     debug_assert_eq!(
         stmt.object_type,
         HandleType::Stmt,
         "SQLGetTypeInfoW: handle is not a STMT"
     );
 
-    sql_get_type_info_w_safe(statement_handle, stmt, data_type)
+    sql_get_type_info_w_safe(statement_handle, &stmt, data_type)
 }
 
 fn sql_get_type_info_w_safe(
@@ -124,6 +124,10 @@ fn sql_get_type_info_w_safe(
             return SQL_ERROR;
         };
         free_errors(&mut stmt_state);
+        if stmt.row_binding_use.is_active() {
+            post_diag(&mut stmt_state, crate::api::sqlstate::ERR_FUNCTION_SEQUENCE);
+            return SQL_ERROR;
+        }
 
         // The cursor/exec state is checked before the data type, matching
         // msodbcsql (sqlcdd.cpp): an open cursor yields 24000 even for an invalid
@@ -420,12 +424,14 @@ mod tests {
         const BOUND: Duration = Duration::from_secs(5);
 
         let h = TestHandles::with_env_dbc_stmt();
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc_owner = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
+        let dbc = &*dbc_owner;
         let mock_server =
             crate::test_support::connect_mock_server(dbc, "SELECT 1", QueryResponse::select_one());
         mock_server.set_rpc_delay(RESPONSE_DELAY);
 
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = &*stmt_owner;
         stmt.inner.lock().unwrap().query_timeout = STMT_TIMEOUT_SECS;
 
         let started = Instant::now();
@@ -461,13 +467,15 @@ mod tests {
         const BOUND: Duration = Duration::from_secs(5);
 
         let h = TestHandles::with_env_dbc_stmt();
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc_owner = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
+        let dbc = &*dbc_owner;
         let mock_server =
             crate::test_support::connect_mock_server(dbc, "SELECT 1", QueryResponse::select_one());
         mock_server.set_tm_begin_delay(BEGIN_DELAY);
         dbc.inner.lock().unwrap().autocommit = false;
 
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = &*stmt_owner;
         stmt.inner.lock().unwrap().query_timeout = STMT_TIMEOUT_SECS;
 
         let started = Instant::now();
@@ -508,12 +516,14 @@ mod tests {
         const BOUND: Duration = Duration::from_secs(5);
 
         let h = TestHandles::with_env_dbc_stmt();
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc_owner = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
+        let dbc = &*dbc_owner;
         let mock_server =
             crate::test_support::connect_mock_server(dbc, "SELECT 1", QueryResponse::select_one());
         mock_server.set_rpc_delay(RESPONSE_DELAY);
 
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = &*stmt_owner;
         crate::test_support::arm_pending_unprepare(dbc, stmt);
         stmt.inner.lock().unwrap().query_timeout = STMT_TIMEOUT_SECS;
 
@@ -613,28 +623,28 @@ mod tests {
     #[test]
     fn rename_type_info_columns_is_a_noop_without_metadata() {
         let h = TestHandles::with_env_dbc_stmt();
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
         // With no result set, the rename walks the empty metadata and mutates
         // nothing, for both ODBC versions, without panicking.
-        rename_type_info_columns(stmt, false);
-        rename_type_info_columns(stmt, true);
+        rename_type_info_columns(&stmt, false);
+        rename_type_info_columns(&stmt, true);
         assert!(stmt.inner.lock().unwrap().column_metadata.is_empty());
     }
 
     #[test]
     fn clear_type_info_nullable_is_a_noop_without_metadata() {
         let h = TestHandles::with_env_dbc_stmt();
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
         // No result set: the walk over the not-null ordinals mutates nothing and
         // does not panic on the empty metadata.
-        clear_type_info_nullable(stmt);
+        clear_type_info_nullable(&stmt);
         assert!(stmt.inner.lock().unwrap().column_metadata.is_empty());
     }
 
     #[test]
     fn odbc2_app_omits_odbc_ver_and_remaps_date() {
         let h = TestHandles::with_env_dbc_stmt();
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
         stmt.parent_dbc()
             .parent_env()
             .inner
@@ -655,7 +665,7 @@ mod tests {
         let ret = unsafe { sql_get_type_info_w(h.stmt, 999) };
         assert_eq!(ret, SQL_ERROR);
 
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
         let state = stmt.inner.lock().unwrap();
         assert_eq!(state.diag_records[0].sql_state, SQLSTATE_HY004);
         // A rejected type must leave the statement unchanged.
@@ -668,7 +678,7 @@ mod tests {
         let ret = unsafe { sql_get_type_info_w(h.stmt, SQL_SS_UDT) };
         assert_eq!(ret, SQL_ERROR);
 
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
         let state = stmt.inner.lock().unwrap();
         assert_eq!(state.diag_records[0].sql_state, SQLSTATE_HYC00);
         assert!(!state.has_state(STMT_STATE_EXEC_STARTED));
@@ -685,7 +695,7 @@ mod tests {
     #[test]
     fn open_cursor_returns_24000() {
         let h = TestHandles::with_env_dbc_stmt();
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
         stmt.inner.lock().unwrap().set_state(STMT_STATE_CURSOR_OPEN);
 
         let ret = unsafe { sql_get_type_info_w(h.stmt, SQL_ALL_TYPES) };
@@ -698,7 +708,7 @@ mod tests {
     #[test]
     fn open_cursor_wins_over_invalid_type() {
         let h = TestHandles::with_env_dbc_stmt();
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
         stmt.inner.lock().unwrap().set_state(STMT_STATE_CURSOR_OPEN);
 
         // msodbcsql checks cursor state before the data type, so an open cursor
