@@ -58,7 +58,7 @@ pub(crate) async fn materialize(
 }
 
 fn python_type<'py>(py: Python<'py>, metadata: &ColumnMetadata) -> PyResult<Bound<'py, PyType>> {
-    let python_type = match metadata.data_type {
+    let python_type = match metadata.effective_data_type() {
         TdsDataType::Int1
         | TdsDataType::Int2
         | TdsDataType::Int4
@@ -111,16 +111,16 @@ fn imported_python_type<'py>(
 }
 
 fn column_size(metadata: &ColumnMetadata) -> u64 {
-    if metadata.is_plp() {
+    if metadata.effective_is_plp() {
         return 0;
     }
 
-    match metadata.data_type {
+    match metadata.effective_data_type() {
         TdsDataType::Int1 => 3,
         TdsDataType::Int2 => 5,
         TdsDataType::Int4 => 10,
         TdsDataType::Int8 => 19,
-        TdsDataType::IntN => match metadata.type_info.length {
+        TdsDataType::IntN => match metadata.effective_type_info().length {
             1 => 3,
             2 => 5,
             4 => 10,
@@ -130,7 +130,7 @@ fn column_size(metadata: &ColumnMetadata) -> u64 {
         TdsDataType::Bit | TdsDataType::BitN => 1,
         TdsDataType::Flt4 => 7,
         TdsDataType::Flt8 => 15,
-        TdsDataType::FltN => match metadata.type_info.length {
+        TdsDataType::FltN => match metadata.effective_type_info().length {
             4 => 7,
             8 => 15,
             _ => 0,
@@ -142,7 +142,7 @@ fn column_size(metadata: &ColumnMetadata) -> u64 {
         }
         TdsDataType::DateTime => 23,
         TdsDataType::DateTim4 => 16,
-        TdsDataType::DateTimeN => match metadata.type_info.length {
+        TdsDataType::DateTimeN => match metadata.effective_type_info().length {
             8 => 23,
             4 => 16,
             _ => 0,
@@ -163,18 +163,18 @@ fn column_size(metadata: &ColumnMetadata) -> u64 {
         | TdsDataType::Money4
         | TdsDataType::MoneyN => u64::from(metadata.get_precision().unwrap_or(0)),
         TdsDataType::NChar | TdsDataType::NVarChar | TdsDataType::NText => {
-            (metadata.type_info.length / 2) as u64
+            (metadata.effective_type_info().length / 2) as u64
         }
-        _ => metadata.type_info.length as u64,
+        _ => metadata.effective_type_info().length as u64,
     }
 }
 
 fn decimal_digits(metadata: &ColumnMetadata) -> u8 {
-    match metadata.data_type {
+    match metadata.effective_data_type() {
         TdsDataType::Money | TdsDataType::Money4 | TdsDataType::MoneyN => 4,
         TdsDataType::DateTime => 3,
         TdsDataType::DateTim4 => 0,
-        TdsDataType::DateTimeN => match metadata.type_info.length {
+        TdsDataType::DateTimeN => match metadata.effective_type_info().length {
             8 => 3,
             _ => 0,
         },
@@ -212,7 +212,9 @@ fn description_to_python<'py>(
 
 #[cfg(test)]
 mod tests {
+    use super::description_to_python;
     use mssql_tds::datatypes::sqldatatypes::VectorBaseType;
+    use mssql_tds::query::metadata::ColumnMetadata;
     use pyo3::Python;
     use pyo3::types::{PyAnyMethods, PyList, PyString};
 
@@ -230,6 +232,40 @@ mod tests {
                     .is(py.get_type::<PyString>())
             );
             assert!(vector_python_type(py, None).is(py.get_type::<PyString>()));
+        });
+    }
+
+    #[test]
+    fn test_description_to_python_uses_effective_plp_for_bounded_encrypted_string() {
+        Python::attach(|py| {
+            let metadata = ColumnMetadata::test_encrypted_nvarchar_4000();
+
+            assert!(metadata.is_plp());
+            assert!(!metadata.effective_is_plp());
+
+            let description = description_to_python(py, &[metadata]).unwrap();
+            let column = description.get_item(0).unwrap();
+
+            assert!(column.get_item(1).unwrap().is(py.get_type::<PyString>()));
+            assert_eq!(column.get_item(3).unwrap().extract::<u64>().unwrap(), 4000);
+            assert_eq!(column.get_item(4).unwrap().extract::<u64>().unwrap(), 4000);
+        });
+    }
+
+    #[test]
+    fn test_description_to_python_uses_effective_plp_for_encrypted_max_string() {
+        Python::attach(|py| {
+            let metadata = ColumnMetadata::test_encrypted_nvarchar_max();
+
+            assert!(metadata.is_plp());
+            assert!(metadata.effective_is_plp());
+
+            let description = description_to_python(py, &[metadata]).unwrap();
+            let column = description.get_item(0).unwrap();
+
+            assert!(column.get_item(1).unwrap().is(py.get_type::<PyString>()));
+            assert_eq!(column.get_item(3).unwrap().extract::<u64>().unwrap(), 0);
+            assert_eq!(column.get_item(4).unwrap().extract::<u64>().unwrap(), 0);
         });
     }
 }

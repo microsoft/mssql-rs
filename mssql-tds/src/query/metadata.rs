@@ -6,6 +6,9 @@ use crate::{
     token::tokens::SqlCollation,
 };
 
+#[cfg(feature = "test-util")]
+use crate::datatypes::sqldatatypes::{PartialLengthType, VariableLengthTypes};
+
 use std::fmt;
 
 /// Schema, type, and flag information for a single column in a result set.
@@ -125,7 +128,7 @@ impl ColumnMetadata {
     /// Returns `Some(scale)` for types that include scale information (e.g., `decimal(18,4)`, `time(7)`),
     /// or `None` for types where scale is not applicable.
     pub fn get_scale(&self) -> Option<u8> {
-        match self.type_info.type_info_variant {
+        match self.effective_type_info().type_info_variant {
             TypeInfoVariant::VarLenScale(_, scale) => Some(scale),
             TypeInfoVariant::VarLenPrecisionScale(_, _, _, scale) => Some(scale),
             _ => None,
@@ -141,7 +144,7 @@ impl ColumnMetadata {
     pub fn get_precision(&self) -> Option<u8> {
         use crate::datatypes::sqldatatypes::{FixedLengthTypes, VariableLengthTypes};
 
-        match self.type_info.type_info_variant {
+        match self.effective_type_info().type_info_variant {
             TypeInfoVariant::VarLenPrecisionScale(_, _, precision, _) => Some(precision),
             TypeInfoVariant::FixedLen(FixedLengthTypes::Money) => Some(19),
             TypeInfoVariant::FixedLen(FixedLengthTypes::Money4) => Some(10),
@@ -158,11 +161,152 @@ impl ColumnMetadata {
     pub fn get_collation(&self) -> Option<SqlCollation> {
         // Collation is only applicable to string types which are either VarLen strings
         // Or PLP types with a collation.
-        match self.type_info.type_info_variant {
+        match self.effective_type_info().type_info_variant {
             TypeInfoVariant::VarLenString(_, _, collation) => collation,
             TypeInfoVariant::PartialLen(_, _, collation, _, _) => collation,
             _ => None,
         }
+    }
+
+    /// Returns the logical SQL Server data type of the column.
+    ///
+    /// For an Always Encrypted column, this is the plaintext type defined by the
+    /// column's encryption metadata. For non-encrypted columns, this is the same
+    /// as [`ColumnMetadata::data_type`].
+    ///
+    /// [`ColumnMetadata::data_type`] describes the type used for the value on the
+    /// TDS wire, which may be a ciphertext/binary type for encrypted columns.
+    pub fn effective_data_type(&self) -> TdsDataType {
+        self.crypto_metadata
+            .as_ref()
+            .map(|c| c.base_data_type)
+            .unwrap_or(self.data_type)
+    }
+
+    /// Returns type information for the logical SQL Server column.
+    ///
+    /// For an Always Encrypted column, this is the plaintext type information
+    /// defined by the column's encryption metadata. For non-encrypted columns,
+    /// this is the same as [`ColumnMetadata::type_info`].
+    ///
+    /// [`ColumnMetadata::type_info`] describes the type information used for the
+    /// value on the TDS wire.
+    pub fn effective_type_info(&self) -> &TypeInfo {
+        self.crypto_metadata
+            .as_ref()
+            .map(|c| &c.base_type_info)
+            .unwrap_or(&self.type_info)
+    }
+
+    /// Returns whether the logical SQL Server column type uses PLP encoding.
+    ///
+    /// For an Always Encrypted column, this is determined from the plaintext
+    /// type information in the column's encryption metadata. For non-encrypted
+    /// columns, this is equivalent to [`ColumnMetadata::is_plp`].
+    pub fn effective_is_plp(&self) -> bool {
+        matches!(
+            self.effective_type_info().type_info_variant,
+            TypeInfoVariant::PartialLen(_, _, _, _, _)
+        )
+    }
+
+    /// Creates encrypted `nvarchar(4000)` column metadata for testing consumers
+    /// of logical column metadata.
+    #[cfg(feature = "test-util")]
+    pub fn test_encrypted_nvarchar_4000() -> Self {
+        let collation = SqlCollation {
+            info: 0,
+            sort_id: 0,
+            col_flags: 0,
+            lcid_language_id: 0,
+        };
+
+        let mut metadata = Self {
+            user_type: 0,
+            flags: 0x0800,
+            type_info: TypeInfo {
+                tds_type: TdsDataType::BigVarBinary,
+                length: 4,
+                type_info_variant: TypeInfoVariant::PartialLen(
+                    PartialLengthType::BigVarBinary,
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+            },
+            data_type: TdsDataType::BigVarBinary,
+            column_name: "test_column".to_string(),
+            multi_part_name: None,
+            crypto_metadata: None,
+        };
+
+        metadata.crypto_metadata = Some(CryptoMetadata {
+            cek_table_ordinal: 0,
+            base_data_type: TdsDataType::NVarChar,
+            base_type_info: TypeInfo {
+                tds_type: TdsDataType::NVarChar,
+                length: 8000,
+                type_info_variant: TypeInfoVariant::VarLenString(
+                    VariableLengthTypes::NVarChar,
+                    8000,
+                    Some(collation),
+                ),
+            },
+            cipher_algorithm_id: 2,
+            cipher_algorithm_name: None,
+            encryption_type: 1,
+            normalization_rule_version: 1,
+        });
+
+        metadata
+    }
+
+    /// Creates encrypted `nvarchar(max)` column metadata for testing consumers
+    /// of logical column metadata.
+    #[cfg(feature = "test-util")]
+    pub fn test_encrypted_nvarchar_max() -> Self {
+        let mut metadata = Self {
+            user_type: 0,
+            flags: 0x0800,
+            type_info: TypeInfo {
+                tds_type: TdsDataType::BigVarBinary,
+                length: 4,
+                type_info_variant: TypeInfoVariant::PartialLen(
+                    PartialLengthType::BigVarBinary,
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+            },
+            data_type: TdsDataType::BigVarBinary,
+            column_name: "test_column".to_string(),
+            multi_part_name: None,
+            crypto_metadata: None,
+        };
+
+        metadata.crypto_metadata = Some(CryptoMetadata {
+            cek_table_ordinal: 0,
+            base_data_type: TdsDataType::NVarChar,
+            base_type_info: TypeInfo {
+                tds_type: TdsDataType::NVarChar,
+                length: 0,
+                type_info_variant: TypeInfoVariant::PartialLen(
+                    PartialLengthType::NVarChar,
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+            },
+            cipher_algorithm_id: 2,
+            cipher_algorithm_name: None,
+            encryption_type: 1,
+            normalization_rule_version: 1,
+        });
+
+        metadata
     }
 }
 
@@ -329,6 +473,28 @@ mod tests {
             multi_part_name: None,
             crypto_metadata: None,
         }
+    }
+
+    fn create_encrypted_test_column_metadata(
+        wire_data_type: TdsDataType,
+        wire_type_info_variant: TypeInfoVariant,
+        base_type_info: TypeInfo,
+    ) -> ColumnMetadata {
+        let mut metadata = create_test_column_metadata(0x0800, wire_type_info_variant);
+
+        metadata.data_type = wire_data_type;
+        metadata.type_info.tds_type = wire_data_type;
+        metadata.crypto_metadata = Some(CryptoMetadata {
+            cek_table_ordinal: 0,
+            base_data_type: base_type_info.tds_type,
+            base_type_info,
+            cipher_algorithm_id: 2,
+            cipher_algorithm_name: None,
+            encryption_type: 1,
+            normalization_rule_version: 1,
+        });
+
+        metadata
     }
 
     #[test]
@@ -739,5 +905,123 @@ mod tests {
         assert!(!rendered.contains("AZURE_KEY_VAULT"));
         assert!(rendered.contains("encrypted_key_len: 4"));
         assert!(rendered.contains("RSA_OAEP"));
+    }
+
+    #[test]
+    fn test_effective_data_type_encrypted() {
+        let metadata = create_encrypted_test_column_metadata(
+            TdsDataType::VarBinary,
+            TypeInfoVariant::VarLen(VariableLengthTypes::VarBinary, 8000),
+            TypeInfo {
+                tds_type: TdsDataType::Int4,
+                length: 4,
+                type_info_variant: TypeInfoVariant::FixedLen(FixedLengthTypes::Int4),
+            },
+        );
+
+        assert!(metadata.is_encrypted());
+        // Wire metadata remains the ciphertext representation.
+        assert_eq!(metadata.data_type, TdsDataType::VarBinary);
+        // Effective metadata describes the decrypted value.
+        assert_eq!(metadata.effective_data_type(), TdsDataType::Int4);
+    }
+
+    #[test]
+    fn test_effective_data_type_unencrypted() {
+        let metadata =
+            create_test_column_metadata(0x00, TypeInfoVariant::FixedLen(FixedLengthTypes::Int4));
+
+        assert!(!metadata.is_encrypted());
+        assert_eq!(metadata.data_type, TdsDataType::IntN);
+        assert_eq!(metadata.effective_data_type(), TdsDataType::IntN);
+    }
+
+    #[test]
+    fn test_precision_and_scale_use_effective_type_info_for_encrypted_column() {
+        let metadata = create_encrypted_test_column_metadata(
+            TdsDataType::VarBinary,
+            TypeInfoVariant::VarLen(VariableLengthTypes::VarBinary, 8000),
+            TypeInfo {
+                tds_type: TdsDataType::DecimalN,
+                length: 17,
+                type_info_variant: TypeInfoVariant::VarLenPrecisionScale(
+                    VariableLengthTypes::DecimalN,
+                    17,
+                    18,
+                    4,
+                ),
+            },
+        );
+
+        assert_eq!(metadata.get_precision(), Some(18));
+        assert_eq!(metadata.get_scale(), Some(4));
+    }
+
+    #[test]
+    fn test_effective_type_info_encrypted() {
+        let metadata = create_encrypted_test_column_metadata(
+            TdsDataType::VarBinary,
+            TypeInfoVariant::VarLen(VariableLengthTypes::VarBinary, 8000),
+            TypeInfo {
+                tds_type: TdsDataType::Int4,
+                length: 4,
+                type_info_variant: TypeInfoVariant::FixedLen(FixedLengthTypes::Int4),
+            },
+        );
+
+        assert!(matches!(
+            metadata.effective_type_info().type_info_variant,
+            TypeInfoVariant::FixedLen(FixedLengthTypes::Int4)
+        ));
+    }
+
+    #[test]
+    fn test_effective_is_plp_uses_logical_type() {
+        let collation = SqlCollation {
+            info: 0,
+            sort_id: 0,
+            col_flags: 0,
+            lcid_language_id: 0,
+        };
+
+        let metadata = create_encrypted_test_column_metadata(
+            TdsDataType::BigVarBinary,
+            TypeInfoVariant::PartialLen(PartialLengthType::BigVarBinary, None, None, None, None),
+            TypeInfo {
+                tds_type: TdsDataType::BigVarChar,
+                length: 50,
+                type_info_variant: TypeInfoVariant::VarLenString(
+                    VariableLengthTypes::BigVarChar,
+                    50,
+                    Some(collation),
+                ),
+            },
+        );
+
+        assert!(metadata.is_plp());
+        assert!(!metadata.effective_is_plp());
+        assert_eq!(metadata.get_collation(), Some(collation));
+    }
+
+    #[test]
+    fn test_effective_is_plp_uses_logical_type_when_logical_type_is_plp() {
+        let metadata = create_encrypted_test_column_metadata(
+            TdsDataType::BigVarBinary,
+            TypeInfoVariant::PartialLen(PartialLengthType::BigVarBinary, None, None, None, None),
+            TypeInfo {
+                tds_type: TdsDataType::BigVarChar,
+                length: 0,
+                type_info_variant: TypeInfoVariant::PartialLen(
+                    PartialLengthType::BigVarChar,
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+            },
+        );
+
+        assert!(metadata.is_plp());
+        assert!(metadata.effective_is_plp());
     }
 }
