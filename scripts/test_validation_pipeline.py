@@ -154,3 +154,12 @@ def test_miri_is_limited_to_windows_and_linux_x64_pr_jobs():
         assert publish["inputs"]["failTaskOnFailedTests"] is True
         assert publish["inputs"]["failTaskOnMissingResultsFile"] is True
     assert found == expected.keys()
+
+
+def test_shared_miri_filter_does_not_require_the_odbc_package():
+    config = (_ROOT / ".config" / "nextest.toml").read_text(encoding="utf-8")
+    profile = config.split("[profile.miri-odbc]\n", 1)[1].split("\n[", 1)[0]
+    assert (
+        "default-filter = 'test(::memory_safety::) | "
+        "test(conversion::param_buffer::tests::misaligned_)'"
+    ) in profile
