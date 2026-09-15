@@ -103,6 +103,8 @@ SA password through the `sql-ready` artifact).
 Both the SQL host job and the test jobs invoke
 `sql-host/derive-sql-password.sh`, which deterministically produces the same
 policy-compliant value from build context without any cross-job transport.
+It combines a fixed character-class prefix, which satisfies SQL Server's
+password policy, with a hash of the build context for the remaining characters.
 The script uses the same `SQL_PASSWORD_GENERATED` marker as the random template
 so the two are interchangeable.
 

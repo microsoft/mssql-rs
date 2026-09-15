@@ -10,8 +10,8 @@ the pipeline fail in seconds instead of building seven wheels and only hitting
 the duplicate-version rejection at ``twine upload``.
 
 The ``mssql-rs_Public`` feed allows anonymous reads, so the simple index URL is
-passed in directly (no credentials). Authenticated simple index URLs are also
-accepted, as is a fallback to the ``PIP_INDEX_URL`` environment variable.
+preferred. URLs containing user information are accepted for compatibility.
+The ``PIP_INDEX_URL`` environment variable is also supported as a fallback.
 
 Best-effort: if the feed cannot be reached or the index URL is missing, we WARN
 and exit 0. The duplicate-version rejection at upload time remains the
