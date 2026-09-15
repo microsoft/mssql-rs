@@ -493,17 +493,46 @@ mod tests {
         }
 
         #[test]
-        fn utf16_readers_preserve_lossy_decoding_at_both_alignments() {
+        fn utf16_readers_accept_unaligned_initialized_input() {
+            for text in ["", "master", "a\u{1f600}b", "a\0b"] {
+                let units: Vec<u16> = text.encode_utf16().chain(Some(0)).collect();
+                for offset in [0, 1] {
+                    let mut storage = AlignedBuffer([MaybeUninit::<u8>::uninit(); 33]);
+                    for (index, byte) in
+                        units.iter().flat_map(|unit| unit.to_ne_bytes()).enumerate()
+                    {
+                        storage.0[offset + index].write(byte);
+                    }
+                    let ptr = storage.0.as_ptr().wrapping_add(offset).cast::<SqlWChar>();
+                    assert_eq!(ptr.is_aligned(), offset == 0);
+                    let count = SqlSmallInt::try_from(units.len() - 1).unwrap();
+                    let bytes = SqlInteger::from(count) * 2;
+                    let terminated = text.split('\0').next().unwrap();
+                    // The payload and terminator are initialized; the tail is not.
+                    unsafe {
+                        assert_eq!(read_utf16(ptr, count), text);
+                        assert_eq!(read_utf16_long(ptr, SqlInteger::from(count)), text);
+                        assert_eq!(read_utf16_attr(ptr, bytes), text);
+                        assert_eq!(read_utf16_attr(ptr, bytes + 1), text);
+                        assert_eq!(read_utf16(ptr, SQL_NTS), terminated);
+                        assert_eq!(read_utf16_long(ptr, SqlInteger::from(SQL_NTS)), terminated);
+                        assert_eq!(read_utf16_attr(ptr, SqlInteger::from(SQL_NTS)), terminated);
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn unaligned_utf16_read_preserves_lossy_decoding() {
             const UNITS: [u16; 9] = [0x61, 0xD83D, 0xDE00, 0xD800, 0x62, 0xDC00, 0, 0x63, 0];
             for offset in [0, 1] {
-                let mut storage = AlignedBuffer([0u8; UNITS.len() * 2 + 2]);
-                for (index, unit) in UNITS.iter().enumerate() {
-                    let start = offset + index * 2;
-                    storage.0[start..start + 2].copy_from_slice(&unit.to_ne_bytes());
+                let mut storage = AlignedBuffer([MaybeUninit::<u8>::uninit(); 33]);
+                for (index, byte) in UNITS.iter().flat_map(|unit| unit.to_ne_bytes()).enumerate() {
+                    storage.0[offset + index].write(byte);
                 }
                 let ptr = storage.0.as_ptr().wrapping_add(offset).cast::<SqlWChar>();
                 assert_eq!(ptr.is_aligned(), offset == 0);
-                for length in 0..=UNITS.len() {
+                for length in 0..UNITS.len() {
                     let expected = String::from_utf16_lossy(&UNITS[..length]);
                     let chars = SqlSmallInt::try_from(length).unwrap();
                     let bytes = SqlInteger::try_from(length * 2).unwrap();

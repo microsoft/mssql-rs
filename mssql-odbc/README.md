@@ -55,7 +55,11 @@ unaligned values and indicators, initialized read extents, string terminators
 and capacities, fixed-width writes, untouched error outputs, and reuse of caller
 buffers. They also run as ordinary unit tests; no production code is replaced
 under Miri. The UTF-16 reader cases check both aligned and byte-offset input,
-preserving lossy decoding, explicit lengths, and NUL termination.
+preserving lossy decoding, explicit lengths, and NUL termination. Parameter
+cases vary value, indicator, and length alignment independently, including
+temporal inputs, ignored storage, and length sentinels. Column-wise arrays and
+packed row-wise parameter bindings exercise production address calculations
+with nonzero offsets and distinct first/last values.
 
 From the repository root, with `cargo-nextest` installed:
 
