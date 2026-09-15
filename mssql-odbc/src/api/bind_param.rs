@@ -357,9 +357,9 @@ fn bind_param_records(
     let record_number =
         SqlSmallInt::try_from(parameter_number).map_err(|_| BindingError::InvalidRecord)?;
 
-    let target_count = apd_state.records.len().max(usize::from(parameter_number));
+    let target_count = apd_state.records().len().max(usize::from(parameter_number));
     apd_state.set_record_count(target_count, apd_desc.kind);
-    let target_count = ipd_state.records.len().max(usize::from(parameter_number));
+    let target_count = ipd_state.records().len().max(usize::from(parameter_number));
     ipd_state.set_record_count(target_count, ipd_desc.kind);
 
     let apd_record = apd_state
@@ -467,14 +467,14 @@ mod tests {
     fn apd_record_count(h: &TestHandles) -> usize {
         let apd_owner = handle_from_raw::<DescHandle>(h.apd()).unwrap().into_arc();
         let apd = &*apd_owner;
-        apd.inner.lock().unwrap().records.len()
+        apd.inner.lock().unwrap().records().len()
     }
 
     /// `SQL_DESC_COUNT` on `h`'s implicit IPD.
     fn ipd_record_count(h: &TestHandles) -> usize {
         let ipd_owner = handle_from_raw::<DescHandle>(h.ipd()).unwrap().into_arc();
         let ipd = &*ipd_owner;
-        ipd.inner.lock().unwrap().records.len()
+        ipd.inner.lock().unwrap().records().len()
     }
 
     #[test]
@@ -1174,7 +1174,7 @@ mod tests {
             .into_arc();
         let explicit = &*explicit_owner;
         assert_eq!(
-            explicit.inner.lock().unwrap().records.len(),
+            explicit.inner.lock().unwrap().records().len(),
             1,
             "the bind must land on the reassociated descriptor"
         );

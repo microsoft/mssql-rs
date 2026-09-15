@@ -223,7 +223,7 @@ class HandleIdentityTest : public ::testing::Test {
     std::vector<Handle> current_;
 };
 
-TEST_F(HandleIdentityTest, FreedIdsNeverRevive) {
+TEST_F(HandleIdentityTest, RetiredIdsAreRejectedBeforeNamespaceReuse) {
     std::unordered_set<SQLHANDLE> issued;
     std::vector<Handle> retired;
     for (int generation = 0; generation < 4; ++generation) {
@@ -282,7 +282,7 @@ int main(int argc, char** argv) {
     ::testing::InitGoogleTest(&argc, argv);
     const char* target = std::getenv("ODBC_TEST_TARGET");
     if (target && std::string(target) == "msodbcsql") {
-        std::cout << "Rust driver ID nonreuse is intentional; not compared with msodbcsql.\n";
+        std::cout << "Rust driver ID recycling policy is internal; not compared with msodbcsql.\n";
         return 77;
     }
     return RUN_ALL_TESTS();

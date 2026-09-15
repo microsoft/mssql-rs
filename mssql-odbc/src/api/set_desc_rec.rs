@@ -173,7 +173,7 @@ fn sql_set_desc_rec_safe(
     // msodbcsql calls AllocPlex before the field-specific setter for any
     // record write, which can grow SQL_DESC_COUNT even if a setter further
     // down this sequence later fails.
-    if count > state.records.len() {
+    if count > state.records().len() {
         state.set_record_count(count, desc.kind);
     }
 
@@ -272,13 +272,13 @@ mod tests {
     fn record_count(handle: SqlHandle) -> usize {
         let desc_owner = handle_from_raw::<DescHandle>(handle).unwrap().into_arc();
         let desc = &*desc_owner;
-        desc.inner.lock().unwrap().records.len()
+        desc.inner.lock().unwrap().records().len()
     }
 
     fn cloned_record(handle: SqlHandle, index: usize) -> DescRecord {
         let desc_owner = handle_from_raw::<DescHandle>(handle).unwrap().into_arc();
         let desc = &*desc_owner;
-        desc.inner.lock().unwrap().records[index].clone()
+        desc.inner.lock().unwrap().records()[index].clone()
     }
 
     fn get_small_int(handle: SqlHandle, record: SqlSmallInt, field: SqlSmallInt) -> SqlSmallInt {

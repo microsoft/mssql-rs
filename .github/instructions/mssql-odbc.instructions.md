@@ -509,6 +509,10 @@ Rules of thumb:
   conversion.
 - Handle identity, type, and lifecycle admission are always checked by the
   registry, including release builds. IDs are never allocation pointers.
+- Public IDs may be recycled after retirement when their pointer-sized cursor
+  wraps; no lifetime allocation budget is permitted. Do not use their numeric
+  values as enduring internal identity: cached prepared bindings retain
+  descriptor identity markers independently of public ID reuse.
 - Other preconditions the DM is contractually required to enforce (non-null
   required pointers and valid length/option values) are checked with
   `debug_assert!` only — **do not** promote them to a release-build
@@ -617,13 +621,12 @@ Driver Manager (DM) provides serialization guarantees that the driver relies on
   IDs through public admission. Test that the cursor drain and rollback really
   execute while new acquisitions remain blocked; `SQL_SUCCESS` from disconnect
   alone does not prove its best-effort cleanup ran.
-- **APD before IPD**: `SQLBindParameter`'s `bind_param_records` is the only
-  place in this crate that holds two DESC locks at once (writing a
-  parameter's APD and IPD records together). It locks APD before IPD, and
-  that must stay the only order used anywhere both are locked together —
-  `BoundParam::all_from_descriptor_states` (used by
-  `snapshot_bound_params`) only ever reads them, never locks both
-  simultaneously, so it does not need to follow this rule itself.
+- **APD before IPD**: always acquire these two descriptor locks in that order.
+  `bind_param_records`, input/output parameter snapshots (`snapshot_params`,
+  including `ParameterBindingKey` construction), and
+  `sql_free_stmt_reset_params_safe` all hold them simultaneously.
+  `BoundParam::all_from_descriptor_states` takes no locks itself; its callers
+  must preserve this order when obtaining the states it reads.
 - **`debug_assert!` for DM invariants**: The free path uses `debug_assert!` to
   verify the DM upheld its guarantees (e.g., no outstanding children). These
   fire in debug builds only — in release builds the driver trusts the DM and
@@ -636,8 +639,9 @@ Driver Manager (DM) provides serialization guarantees that the driver relies on
 - Input snapshots reject active row/result use. Output snapshots run beneath
   their caller's result-operation or execution admission and do not reacquire
   that permission; avoid making result advancement reject its own snapshot.
-- Mutate descriptor records through `record_mut` and `set_record_count`.
-  Their revisions, together with APD/IPD handle identities, are checked before
+- Descriptor storage and its revision are private. Read through `records` or
+  `record`; mutate only through `record_mut` and `set_record_count`.
+  Their revisions, together with retained APD/IPD identity markers, are checked before
   prepared execution so setters and shared-descriptor reassociation cannot
   leave a stale server declaration cached. A saturated revision disables reuse
   rather than wrapping. Tests must materialize a server handle to exercise

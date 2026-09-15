@@ -335,18 +335,31 @@ impl DescRecord {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub(crate) struct DescState {
     pub(crate) diag_records: Vec<DiagRecord>,
     pub(crate) header: DescHeader,
     /// 1-based descriptor records: `records[0]` is record number 1.
-    pub(crate) records: Vec<DescRecord>,
+    records: Vec<DescRecord>,
     /// Binding records must change through `record_mut`/`set_record_count`;
     /// shared prepared statements compare this revision before server reuse.
-    pub(crate) binding_revision: u64,
+    binding_revision: u64,
 }
 
 impl DescState {
+    pub(crate) fn records(&self) -> &[DescRecord] {
+        &self.records
+    }
+
+    pub(crate) fn binding_revision(&self) -> u64 {
+        self.binding_revision
+    }
+
+    #[cfg(test)]
+    pub(crate) fn exhaust_binding_revision_for_test(&mut self) {
+        self.binding_revision = u64::MAX;
+    }
+
     /// Returns the record at 1-based `record_number`, or `None` if it does
     /// not exist (`record_number < 1` or `> SQL_DESC_COUNT`).
     pub(crate) fn record(&self, record_number: SqlSmallInt) -> Option<&DescRecord> {

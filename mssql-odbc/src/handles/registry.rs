@@ -34,7 +34,7 @@ pub(crate) enum RegistryError {
     NotFound,
     WrongType,
     Busy,
-    IdExhausted,
+    IdSpaceFull,
     Capacity,
     ActivityOverflow,
     InvalidActivity,
@@ -49,7 +49,7 @@ impl fmt::Display for RegistryError {
             Self::NotFound => "handle is missing or retired",
             Self::WrongType => "handle type does not match",
             Self::Busy => "handle or ancestor is in use or closing",
-            Self::IdExhausted => "handle identities are exhausted",
+            Self::IdSpaceFull => "all handle identities are currently in use",
             Self::Capacity => "handle registry capacity could not be reserved",
             Self::ActivityOverflow => "handle activity count would overflow",
             Self::InvalidActivity => {
@@ -205,7 +205,9 @@ struct RegistryEntry {
 
 struct RegistryState {
     entries: HashMap<HandleId, RegistryEntry>,
-    next_id: Option<NonZeroUsize>,
+    next_id: NonZeroUsize,
+    #[cfg(test)]
+    id_limit: NonZeroUsize,
     #[cfg(test)]
     reserve_additional: usize,
     #[cfg(test)]
@@ -213,6 +215,29 @@ struct RegistryState {
 }
 
 impl RegistryState {
+    fn successor(&self, id: NonZeroUsize) -> NonZeroUsize {
+        let next = id.checked_add(1).unwrap_or(NonZeroUsize::MIN);
+        #[cfg(test)]
+        if next > self.id_limit {
+            return NonZeroUsize::MIN;
+        }
+        next
+    }
+
+    fn available_id(&self) -> Result<HandleId, RegistryError> {
+        let mut candidate = self.next_id;
+        loop {
+            let id = HandleId(candidate);
+            if !self.entries.contains_key(&id) {
+                return Ok(id);
+            }
+            candidate = self.successor(candidate);
+            if candidate == self.next_id {
+                return Err(RegistryError::IdSpaceFull);
+            }
+        }
+    }
+
     #[cfg(test)]
     fn check_retirement(&mut self) -> Result<(), RegistryError> {
         match self.fail_retirement_after {
@@ -255,7 +280,9 @@ impl HandleRegistry {
         Self {
             state: Mutex::new(RegistryState {
                 entries: HashMap::new(),
-                next_id: Some(NonZeroUsize::MIN),
+                next_id: NonZeroUsize::MIN,
+                #[cfg(test)]
+                id_limit: NonZeroUsize::MAX,
                 #[cfg(test)]
                 reserve_additional: 1,
                 #[cfg(test)]
@@ -289,6 +316,12 @@ impl HandleRegistry {
         self.lock().fail_retirement_after = Some(successes);
     }
 
+    #[cfg(test)]
+    pub(super) fn force_wrap_for_test(&self) {
+        let mut state = self.lock();
+        state.next_id = state.id_limit;
+    }
+
     /// An activity may be registered once. Its ancestors need not have entries:
     /// claiming their common root binds the entire activity tree to this registry.
     pub(crate) fn register<T: Any + Send + Sync>(
@@ -311,7 +344,7 @@ impl HandleRegistry {
             return Err(RegistryError::InvalidActivity);
         }
         activity.check_open()?;
-        let id = HandleId(state.next_id.ok_or(RegistryError::IdExhausted)?);
+        let id = state.available_id()?;
         state.reserve_entry()?;
         let owner = root.owner.get_or_init(|| Arc::clone(&self.identity));
         if !Arc::ptr_eq(owner, &self.identity) {
@@ -319,7 +352,7 @@ impl HandleRegistry {
         }
 
         activity.registered.store(true, Ordering::Release);
-        // next_id is never reset, including when the table becomes empty.
+        // The candidate remains vacant through insertion under this lock.
         let previous = state.entries.insert(
             id,
             RegistryEntry {
@@ -328,7 +361,7 @@ impl HandleRegistry {
                 activity,
             },
         );
-        state.next_id = id.0.get().checked_add(1).and_then(NonZeroUsize::new);
+        state.next_id = state.successor(id.0);
         drop(state);
         drop(previous);
         Ok(id)
@@ -531,7 +564,13 @@ mod tests {
     impl HandleRegistry {
         fn with_next_id(next: usize) -> Self {
             let registry = Self::new();
-            registry.state.lock().unwrap().next_id = NonZeroUsize::new(next);
+            registry.state.lock().unwrap().next_id = NonZeroUsize::new(next).unwrap();
+            registry
+        }
+
+        fn with_id_limit(limit: usize) -> Self {
+            let registry = Self::new();
+            registry.state.lock().unwrap().id_limit = NonZeroUsize::new(limit).unwrap();
             registry
         }
     }
@@ -577,7 +616,7 @@ mod tests {
     }
 
     #[test]
-    fn ids_are_monotonic_even_when_reregistering_the_same_allocation() {
+    fn ids_advance_before_wrap_even_when_reregistering_the_same_allocation() {
         let registry = HandleRegistry::default();
         let value = Arc::new(42_u32);
         let mut previous = 0;
@@ -663,29 +702,220 @@ mod tests {
     }
 
     #[test]
-    fn last_identity_is_valid_and_exhaustion_never_wraps_or_resets() {
+    fn last_identity_is_valid_and_wrap_does_not_reset_when_empty() {
         let registry = HandleRegistry::with_next_id(usize::MAX - 1);
         let (first, _) = register(&registry, HandleType::Env, None);
         let (last, _) = register(&registry, HandleType::Env, None);
         assert_eq!(first.to_raw().addr(), usize::MAX - 1);
         assert_eq!(last.to_raw().addr(), usize::MAX);
         assert_eq!(HandleId::from_raw(last.to_raw()), Ok(last));
-        let activity = HandleActivity::new(None);
-        for empty in [false, true] {
-            if empty {
-                registry
-                    .retire_batch(&[(first, HandleType::Env), (last, HandleType::Env)])
-                    .unwrap();
-            }
-            assert_eq!(
-                registry.register(HandleType::Env, Arc::new(0_u32), Arc::clone(&activity)),
-                Err(RegistryError::IdExhausted)
-            );
-            assert_eq!(count(&activity), 0);
-            assert!(activity.owner.get().is_none());
+        let (wrapped, _) = register(&registry, HandleType::Env, None);
+        assert_eq!(wrapped.to_raw().addr(), 1);
+        for id in [first, last, wrapped] {
+            assert_eq!(*registry.acquire::<u32>(id, HandleType::Env).unwrap(), 42);
         }
+        registry
+            .retire_batch(&[
+                (first, HandleType::Env),
+                (last, HandleType::Env),
+                (wrapped, HandleType::Env),
+            ])
+            .unwrap();
         assert!(registry.state.lock().unwrap().entries.is_empty());
-        assert!(registry.state.lock().unwrap().next_id.is_none());
+        let (next, _) = register(&registry, HandleType::Env, None);
+        assert_eq!(next.to_raw().addr(), 2);
+    }
+
+    #[test]
+    fn wrap_skips_live_ids_and_reuses_only_retired_entries() {
+        let registry = HandleRegistry::new();
+        let (first, _) = register(&registry, HandleType::Env, None);
+        let (second, _) = register(&registry, HandleType::Env, None);
+        let (third, _) = register(&registry, HandleType::Env, None);
+        registry.retire(second, HandleType::Env).unwrap();
+        assert_eq!(registry.kind(second), Ok(None));
+        registry.force_wrap_for_test();
+        let (last, _) = register(&registry, HandleType::Env, None);
+        assert_eq!(last.to_raw().addr(), usize::MAX);
+        let (recycled, _) = register(&registry, HandleType::Env, None);
+        assert_eq!(recycled, second);
+        let (fourth, _) = register(&registry, HandleType::Env, None);
+        assert_eq!(fourth.to_raw().addr(), 4);
+        registry.force_wrap_for_test();
+        let (fifth, _) = register(&registry, HandleType::Env, None);
+        assert_eq!(fifth.to_raw().addr(), 5);
+        assert_live_entries(
+            &registry,
+            &[
+                (first, 42),
+                (recycled, 42),
+                (third, 42),
+                (fourth, 42),
+                (fifth, 42),
+                (last, 42),
+            ],
+        );
+    }
+
+    fn assert_live_entries(registry: &HandleRegistry, live: &[(HandleId, u32)]) {
+        let ids: std::collections::HashSet<_> = live.iter().map(|(id, _)| *id).collect();
+        assert_eq!(ids.len(), live.len());
+        assert_eq!(registry.state.lock().unwrap().entries.len(), live.len());
+        for (id, value) in live {
+            assert_eq!(HandleId::from_raw(id.to_raw()), Ok(*id));
+            assert_eq!(registry.kind(*id), Ok(Some(HandleType::Env)));
+            assert_eq!(
+                *registry.acquire::<u32>(*id, HandleType::Env).unwrap(),
+                *value
+            );
+        }
+    }
+
+    #[test]
+    fn full_namespace_allows_retry_after_retirement_without_claiming_activity() {
+        for limit in [1, 3, 7] {
+            let registry = HandleRegistry::with_id_limit(limit);
+            let mut live = Vec::new();
+            for value in 1..=limit {
+                let value = u32::try_from(value).unwrap();
+                let id = registry
+                    .register(HandleType::Env, Arc::new(value), HandleActivity::new(None))
+                    .unwrap();
+                live.push((id, value));
+                assert_live_entries(&registry, &live);
+            }
+            let activity = HandleActivity::new(None);
+            let candidate = registry.state.lock().unwrap().next_id;
+            for _ in 0..2 {
+                assert_eq!(
+                    registry.register(HandleType::Env, Arc::new(42_u32), Arc::clone(&activity)),
+                    Err(RegistryError::IdSpaceFull)
+                );
+                assert_eq!(registry.state.lock().unwrap().next_id, candidate);
+                assert!(!activity.registered.load(Ordering::Acquire));
+                assert!(activity.owner.get().is_none());
+                assert_eq!(count(&activity), 0);
+                assert_eq!(activity.admission.load(Ordering::Acquire), OPEN);
+                assert_live_entries(&registry, &live);
+            }
+            let (retired, _) = live.remove(limit / 2);
+            registry.retire(retired, HandleType::Env).unwrap();
+            assert_live_entries(&registry, &live);
+            let recycled = registry
+                .register(HandleType::Env, Arc::new(42_u32), Arc::clone(&activity))
+                .unwrap();
+            assert_eq!(recycled, retired);
+            assert!(activity.registered.load(Ordering::Acquire));
+            live.push((recycled, 42));
+            assert_live_entries(&registry, &live);
+        }
+    }
+
+    #[test]
+    fn bounded_live_entries_remain_unique_through_thousands_of_recycling_cycles() {
+        for limit in [3, 7] {
+            let registry = HandleRegistry::with_id_limit(limit);
+            let mut live = Vec::new();
+            for value in 0..2048_u32 {
+                if live.len() == limit {
+                    let (retired, _) = live.remove(usize::try_from(value).unwrap() % limit);
+                    registry.retire(retired, HandleType::Env).unwrap();
+                    assert_eq!(registry.kind(retired), Ok(None));
+                    assert_live_entries(&registry, &live);
+                }
+                let id = registry
+                    .register(HandleType::Env, Arc::new(value), HandleActivity::new(None))
+                    .unwrap();
+                assert!(id.to_raw().addr() <= limit);
+                live.push((id, value));
+                assert_live_entries(&registry, &live);
+            }
+            let batch: Vec<_> = live.iter().map(|(id, _)| (*id, HandleType::Env)).collect();
+            registry.retire_batch(&batch).unwrap();
+            assert_live_entries(&registry, &[]);
+            register(&registry, HandleType::Env, None);
+        }
+    }
+
+    #[test]
+    fn retired_reference_cannot_close_recycled_id_even_with_the_same_payload() {
+        for reuse_payload in [false, true] {
+            let original = Arc::new(42_u32);
+            let replacement = if reuse_payload {
+                Arc::clone(&original)
+            } else {
+                Arc::new(7_u32)
+            };
+            let registry = HandleRegistry::with_id_limit(1);
+            let old_activity = HandleActivity::new(None);
+            let id = registry
+                .register(HandleType::Env, original, Arc::clone(&old_activity))
+                .unwrap();
+            let old = registry.acquire::<u32>(id, HandleType::Env).unwrap();
+            let old_closing = registry.begin_close(&old).unwrap();
+            registry.retire(id, HandleType::Env).unwrap();
+            assert_eq!(registry.kind(id), Ok(None));
+            let new_activity = HandleActivity::new(None);
+            let recycled = registry
+                .register(
+                    HandleType::Env,
+                    Arc::clone(&replacement),
+                    Arc::clone(&new_activity),
+                )
+                .unwrap();
+            assert_eq!(recycled, id);
+            assert_eq!(*old, 42);
+            assert_eq!(
+                registry.begin_close(&old).err(),
+                Some(RegistryError::OwnershipMismatch)
+            );
+            assert_eq!(count(&new_activity), 0);
+            assert_eq!(new_activity.admission.load(Ordering::Acquire), OPEN);
+            let new = registry.acquire::<u32>(recycled, HandleType::Env).unwrap();
+            assert_eq!(*new, *replacement);
+            assert_eq!(
+                *registry.diagnostics::<u32>(id, HandleType::Env).unwrap(),
+                *replacement
+            );
+            let new_closing = registry.begin_close(&new).unwrap();
+            drop(old_closing);
+            drop(old);
+            assert_eq!(count(&old_activity), 0);
+            assert_eq!(old_activity.admission.load(Ordering::Acquire), RETIRED);
+            assert_eq!(count(&new_activity), 1);
+            assert_eq!(new_activity.admission.load(Ordering::Acquire), CLOSING);
+            registry.retire(recycled, HandleType::Env).unwrap();
+            drop(new_closing);
+            assert_eq!(*new, *replacement);
+        }
+    }
+
+    #[test]
+    fn recycled_id_uses_the_replacement_kind_and_payload_type() {
+        let registry = HandleRegistry::with_id_limit(1);
+        let (old, _) = register(&registry, HandleType::Env, None);
+        registry.retire(old, HandleType::Env).unwrap();
+        let recycled = registry
+            .register(HandleType::Desc, Arc::new(7_u64), HandleActivity::new(None))
+            .unwrap();
+        assert_eq!(recycled, old);
+        assert_eq!(registry.kind(old), Ok(Some(HandleType::Desc)));
+        for kind in [HandleType::Env, HandleType::Desc] {
+            assert_eq!(
+                registry.acquire::<u32>(old, kind).err(),
+                Some(RegistryError::WrongType)
+            );
+            assert_eq!(
+                registry.diagnostics::<u32>(old, kind).err(),
+                Some(RegistryError::WrongType)
+            );
+        }
+        assert_eq!(
+            registry.retire(old, HandleType::Env),
+            Err(RegistryError::WrongType)
+        );
+        assert_eq!(*registry.acquire::<u64>(old, HandleType::Desc).unwrap(), 7);
+        registry.retire(recycled, HandleType::Desc).unwrap();
     }
 
     #[test]
@@ -1077,21 +1307,34 @@ mod tests {
 
     #[test]
     fn failed_reservation_does_not_consume_identity_bind_activity_or_insert() {
-        let registry = HandleRegistry::new();
-        let activity = HandleActivity::new(None);
-        registry.state.lock().unwrap().reserve_additional = usize::MAX;
-        assert_eq!(
-            registry.register(HandleType::Env, Arc::new(42_u32), Arc::clone(&activity)),
-            Err(RegistryError::Capacity)
-        );
-        assert!(registry.state.lock().unwrap().entries.is_empty());
-        assert!(activity.owner.get().is_none());
-        assert_eq!(count(&activity), 0);
-        registry.state.lock().unwrap().reserve_additional = 1;
-        let id = registry
-            .register(HandleType::Env, Arc::new(42_u32), activity)
-            .unwrap();
-        assert_eq!(id.to_raw().addr(), 1);
+        for wrap in [false, true] {
+            let registry = HandleRegistry::new();
+            let mut live = Vec::new();
+            if wrap {
+                let (first, _) = register(&registry, HandleType::Env, None);
+                registry.force_wrap_for_test();
+                let (last, _) = register(&registry, HandleType::Env, None);
+                live.extend([(first, 42), (last, 42)]);
+            }
+            let activity = HandleActivity::new(None);
+            registry.state.lock().unwrap().reserve_additional = usize::MAX;
+            assert_eq!(
+                registry.register(HandleType::Env, Arc::new(42_u32), Arc::clone(&activity)),
+                Err(RegistryError::Capacity)
+            );
+            assert_live_entries(&registry, &live);
+            assert_eq!(registry.state.lock().unwrap().next_id, NonZeroUsize::MIN);
+            assert!(!activity.registered.load(Ordering::Acquire));
+            assert!(activity.owner.get().is_none());
+            assert_eq!(count(&activity), 0);
+            registry.state.lock().unwrap().reserve_additional = 1;
+            let id = registry
+                .register(HandleType::Env, Arc::new(42_u32), activity)
+                .unwrap();
+            assert_eq!(id.to_raw().addr(), if wrap { 2 } else { 1 });
+            live.push((id, 42));
+            assert_live_entries(&registry, &live);
+        }
     }
 
     #[test]
@@ -1165,19 +1408,50 @@ mod tests {
 
     #[test]
     fn failed_parent_registration_allows_unpublished_children_to_be_rolled_back() {
-        let registry = HandleRegistry::with_next_id(usize::MAX);
+        let registry = HandleRegistry::with_id_limit(3);
         let parent = HandleActivity::new(None);
-        let (child, child_activity) =
-            register(&registry, HandleType::Desc, Some(Arc::clone(&parent)));
+        let children: Vec<_> = (0..3)
+            .map(|_| register(&registry, HandleType::Desc, Some(Arc::clone(&parent))))
+            .collect();
         assert_eq!(
             registry.register(HandleType::Stmt, Arc::new(42_u32), Arc::clone(&parent)),
-            Err(RegistryError::IdExhausted)
+            Err(RegistryError::IdSpaceFull)
         );
-        registry.retire(child, HandleType::Desc).unwrap();
+        let batch: Vec<_> = children
+            .iter()
+            .map(|(id, _)| (*id, HandleType::Desc))
+            .collect();
+        registry.retire_batch(&batch).unwrap();
         assert_eq!(count(&parent), 0);
-        assert_eq!(count(&child_activity), 0);
+        for (_, activity) in children {
+            assert_eq!(count(&activity), 0);
+            assert_eq!(activity.admission.load(Ordering::Acquire), RETIRED);
+            assert_eq!(
+                registry.register(HandleType::Desc, Arc::new(42_u32), activity),
+                Err(RegistryError::InvalidActivity)
+            );
+        }
         assert!(!parent.registered.load(Ordering::Acquire));
         assert!(registry.state.lock().unwrap().entries.is_empty());
+        let (child, _) = register(&registry, HandleType::Desc, Some(Arc::clone(&parent)));
+        let parent_id = registry
+            .register(HandleType::Stmt, Arc::new(42_u32), Arc::clone(&parent))
+            .unwrap();
+        assert_ne!(parent_id, child);
+        assert_eq!(parent_id.to_raw().addr(), 2);
+        assert_eq!(
+            *registry.acquire::<u32>(child, HandleType::Desc).unwrap(),
+            42
+        );
+        assert_eq!(
+            *registry
+                .acquire::<u32>(parent_id, HandleType::Stmt)
+                .unwrap(),
+            42
+        );
+        registry
+            .retire_batch(&[(child, HandleType::Desc), (parent_id, HandleType::Stmt)])
+            .unwrap();
     }
 
     #[test]
@@ -1231,6 +1505,7 @@ mod tests {
             } else {
                 assert_eq!(root_result, Err(RegistryError::InvalidActivity));
                 assert!(registry.state.lock().unwrap().entries.is_empty());
+                assert_eq!(registry.state.lock().unwrap().next_id, NonZeroUsize::MIN);
             }
         }
         assert_eq!(receive(&dropped_rx), Ok(None));
@@ -1271,7 +1546,7 @@ mod tests {
         );
         let state = registry.state.lock().unwrap();
         assert_eq!(state.entries.len(), 1);
-        assert_eq!(state.next_id, NonZeroUsize::new(2));
+        assert_eq!(state.next_id.get(), 2);
         assert_eq!(count(&activity), 0);
     }
 
@@ -1604,10 +1879,15 @@ mod tests {
             RegistryError::InvalidActivity,
             RegistryError::Busy,
             RegistryError::NotFound,
-            RegistryError::IdExhausted,
+            RegistryError::IdSpaceFull,
             RegistryError::Capacity,
         ] {
-            let registry = Arc::new(HandleRegistry::new());
+            let limit = if expected == RegistryError::IdSpaceFull {
+                1
+            } else {
+                usize::MAX
+            };
+            let registry = Arc::new(HandleRegistry::with_id_limit(limit));
             let (probe, parent_activity) = register(&registry, HandleType::Env, None);
             let mut activity = HandleActivity::new(Some(Arc::clone(&parent_activity)));
             let mut kind = HandleType::Dbc;
@@ -1620,7 +1900,7 @@ mod tests {
                     closing = Some(registry.begin_close(&parent_ref).unwrap());
                 }
                 RegistryError::NotFound => registry.retire(probe, HandleType::Env).unwrap(),
-                RegistryError::IdExhausted => registry.state.lock().unwrap().next_id = None,
+                RegistryError::IdSpaceFull => {}
                 RegistryError::Capacity => {
                     registry.state.lock().unwrap().reserve_additional = usize::MAX;
                 }

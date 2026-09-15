@@ -103,7 +103,7 @@ mod tests {
 
     fn ird_records(h: &TestHandles) -> Vec<DescRecord> {
         let desc = handle_from_raw::<DescHandle>(h.ird()).unwrap().into_arc();
-        desc.inner.lock().unwrap().records.clone()
+        desc.inner.lock().unwrap().records().to_vec()
     }
 
     /// Every field lands where `SQLDescribeColW`/`SQLColAttributeW` would

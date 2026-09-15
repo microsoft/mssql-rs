@@ -155,7 +155,7 @@ fn sql_get_desc_field_w_safe(
             // 5207-5213 — all three report `CItemsPl(...)`, the live plex
             // size, at `sizeof(SQLSMALLINT)`).
             FieldValue::SmallInt(
-                SqlSmallInt::try_from(state.records.len()).unwrap_or(SqlSmallInt::MAX),
+                SqlSmallInt::try_from(state.records().len()).unwrap_or(SqlSmallInt::MAX),
             )
         }
         FieldScope::Header => match header_field_value(&state.header, field) {

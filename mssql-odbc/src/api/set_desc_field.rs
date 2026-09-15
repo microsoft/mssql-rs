@@ -190,7 +190,7 @@ fn sql_set_desc_field_w_safe(
             // SQL_DESC_COUNT even if that setter later fails
             // (sqlcdesc.cpp:1587-1614). Mirrored here rather than validating
             // first, so behavior matches on the failure path too.
-            if count > state.records.len() {
+            if count > state.records().len() {
                 state.set_record_count(count, desc.kind);
             }
             set_record_field(

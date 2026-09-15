@@ -3265,7 +3265,7 @@ mod tests {
         let implicit_owner = handle_from_raw::<DescHandle>(h.ard()).unwrap().into_arc();
         let implicit = &*implicit_owner;
         assert_eq!(
-            implicit.inner.lock().unwrap().records.len(),
+            implicit.inner.lock().unwrap().records().len(),
             0,
             "the implicit ARD it replaced must never have been bound"
         );

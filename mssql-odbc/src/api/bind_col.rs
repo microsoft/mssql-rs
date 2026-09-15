@@ -226,7 +226,7 @@ fn bind_ard_column(
     let record_number =
         SqlSmallInt::try_from(binding.column_number).map_err(|_| BindingError::InvalidRecord)?;
     let target_count = desc_state
-        .records
+        .records()
         .len()
         .max(usize::from(binding.column_number));
     desc_state.set_record_count(target_count, desc.kind);
@@ -350,7 +350,7 @@ mod tests {
     fn record_count(h: &TestHandles) -> usize {
         let ard_owner = handle_from_raw::<DescHandle>(h.ard()).unwrap().into_arc();
         let ard = &*ard_owner;
-        ard.inner.lock().unwrap().records.len()
+        ard.inner.lock().unwrap().records().len()
     }
 
     fn last_state(h: &TestHandles) -> [u8; 5] {
@@ -737,14 +737,14 @@ mod tests {
             .into_arc();
         let explicit = &*explicit_owner;
         assert_eq!(
-            explicit.inner.lock().unwrap().records.len(),
+            explicit.inner.lock().unwrap().records().len(),
             1,
             "the bind must land on the reassociated descriptor"
         );
         let implicit_owner = handle_from_raw::<DescHandle>(h.ard()).unwrap().into_arc();
         let implicit = &*implicit_owner;
         assert_eq!(
-            implicit.inner.lock().unwrap().records.len(),
+            implicit.inner.lock().unwrap().records().len(),
             0,
             "the implicit ARD it replaced must be untouched"
         );
@@ -788,11 +788,11 @@ mod tests {
             .unwrap()
             .into_arc();
         let explicit = &*explicit_owner;
-        assert_eq!(explicit.inner.lock().unwrap().records.len(), 1);
+        assert_eq!(explicit.inner.lock().unwrap().records().len(), 1);
 
         assert_eq!(unsafe { sql_free_stmt_unbind(h.stmt) }, SQL_SUCCESS);
         assert_eq!(
-            explicit.inner.lock().unwrap().records.len(),
+            explicit.inner.lock().unwrap().records().len(),
             0,
             "unbind must clear the reassociated descriptor, not the implicit one"
         );

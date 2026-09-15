@@ -34,7 +34,7 @@ pub(crate) enum HandleType {
 static HANDLES: LazyLock<HandleRegistry> = LazyLock::new(HandleRegistry::new);
 static LIVE_ENV_COUNT: AtomicUsize = AtomicUsize::new(0);
 
-/// Only handle identity crosses the ABI. Allocation ownership stays in Rust.
+/// Only the current handle ID crosses the ABI. Allocation ownership stays in Rust.
 pub(crate) trait Handle: Send + Sync + 'static {
     const TYPE: HandleType;
     type State: HasDiagnostics;
@@ -62,7 +62,7 @@ impl RegistryError {
         };
         match self {
             Self::Busy => post_diag(state, ERR_FUNCTION_SEQUENCE),
-            Self::IdExhausted | Self::Capacity | Self::ActivityOverflow => {
+            Self::IdSpaceFull | Self::Capacity | Self::ActivityOverflow => {
                 post_diag(state, ERR_MEMORY_ALLOCATION);
             }
             _ => crate::error::post_sql_error(state, SQLSTATE_HY000, 0, self.to_string()),
@@ -110,7 +110,7 @@ pub(crate) fn diagnostics_from_raw<T: Handle>(
         .map(|handle| HandleDiagnostics { handle })
 }
 
-/// SQL_INVALID_HANDLE never posts: null, stale and wrong-type inputs have no
+/// SQL_INVALID_HANDLE never posts: null, missing and wrong-type inputs have no
 /// valid diagnostic target. A concurrently retired target stays invalid.
 pub(crate) fn report_handle_error<T: Handle>(raw: SqlHandle, error: RegistryError) -> SqlReturn {
     if error.sql_return() == SQL_INVALID_HANDLE {
@@ -352,6 +352,69 @@ mod tests {
             SQL_INVALID_HANDLE
         );
         assert_eq!(diagnostic_state(h.dbc, SQL_HANDLE_DBC), *b"08003");
+    }
+
+    #[test]
+    fn recycled_public_id_does_not_match_a_cached_descriptor_identity() {
+        use crate::api::odbc_types::SQL_ATTR_APP_PARAM_DESC;
+        use crate::handles::bindings::ParameterBindingKey;
+        use crate::handles::stmt::PreparedPlan;
+        use mssql_tds::connection::tds_client::{PreparedStatement, StatementId};
+        let mut h = TestHandles::with_env_dbc_stmt();
+        let old_id = h.alloc_explicit_desc();
+        let old = handle_from_raw::<DescHandle>(old_id).unwrap().into_arc();
+        let weak_old = Arc::downgrade(&old);
+        let ipd = handle_from_raw::<DescHandle>(h.ipd()).unwrap().into_arc();
+        let old_key = ParameterBindingKey::new(
+            &old,
+            &old.inner.lock().unwrap(),
+            &ipd,
+            &ipd.inner.lock().unwrap(),
+        );
+        let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        assert_eq!(
+            unsafe { crate::api::SQLSetStmtAttrW(h.stmt, SQL_ATTR_APP_PARAM_DESC, old_id, 0) },
+            SQL_SUCCESS
+        );
+        let prepared_id = StatementId::from_raw_for_test(42);
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.refresh_prepared_bindings(old_key.clone());
+            state.prepared = Some(PreparedPlan {
+                stmt: PreparedStatement::materialized_for_test("SELECT 1", prepared_id),
+                marker_count: 0,
+                original_sql: String::new(),
+            });
+        }
+        assert_eq!(h.free_explicit_desc(old_id), SQL_SUCCESS);
+        drop(old);
+        assert!(
+            weak_old.upgrade().is_none(),
+            "a cached key must not retain descriptor payload"
+        );
+
+        HANDLES.force_wrap_for_test();
+        let last = h.alloc_explicit_desc();
+        assert_eq!(last.addr(), usize::MAX);
+        let recycled = h.alloc_explicit_desc();
+        assert_eq!(recycled, old_id);
+        let new = handle_from_raw::<DescHandle>(recycled).unwrap().into_arc();
+        let new_key = ParameterBindingKey::new(
+            &new,
+            &new.inner.lock().unwrap(),
+            &ipd,
+            &ipd.inner.lock().unwrap(),
+        );
+        assert!(!old_key.matches(&new_key));
+        assert!(new_key.matches(&new_key));
+        assert_eq!(
+            unsafe { crate::api::SQLSetStmtAttrW(h.stmt, SQL_ATTR_APP_PARAM_DESC, recycled, 0) },
+            SQL_SUCCESS
+        );
+        let mut state = stmt.inner.lock().unwrap();
+        state.refresh_prepared_bindings(new_key);
+        assert!(state.prepared.as_ref().unwrap().stmt.id().is_none());
+        assert_eq!(state.pending_unprepare, Some(prepared_id));
     }
 
     #[test]

@@ -10,39 +10,46 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::dbc::DbcState;
 use super::desc::{DescHandle, DescState};
-use super::{HandleActivity, HandleId, RegistryError, handle_from_raw};
+use super::{HandleActivity, RegistryError, handle_from_raw};
 use crate::api::odbc_types::{SQL_ERROR, SqlHandle, SqlReturn};
 use crate::api::sqlstate::{
     ERR_FUNCTION_SEQUENCE, ERR_MEMORY_ALLOCATION, SQLSTATE_HY000, post_diag,
 };
 use crate::error::{HasDiagnostics, post_sql_error};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub(crate) struct ParameterBindingKey {
-    apd: HandleId,
+    // Keep only identity markers, not descriptor buffers. Public IDs may be
+    // recycled after retirement while a statement still caches its old plan.
+    apd: Arc<HandleActivity>,
     apd_revision: u64,
-    ipd: HandleId,
+    ipd: Arc<HandleActivity>,
     ipd_revision: u64,
 }
 
 impl ParameterBindingKey {
     pub(crate) fn new(
-        apd: SqlHandle,
+        apd: &DescHandle,
         apd_state: &DescState,
-        ipd: SqlHandle,
+        ipd: &DescHandle,
         ipd_state: &DescState,
-    ) -> Result<Self, BindingError> {
-        Ok(Self {
-            apd: HandleId::from_raw(apd).map_err(BindingError::Registry)?,
-            apd_revision: apd_state.binding_revision,
-            ipd: HandleId::from_raw(ipd).map_err(BindingError::Registry)?,
-            ipd_revision: ipd_state.binding_revision,
-        })
+    ) -> Self {
+        Self {
+            apd: Arc::clone(&apd.activity),
+            apd_revision: apd_state.binding_revision(),
+            ipd: Arc::clone(&ipd.activity),
+            ipd_revision: ipd_state.binding_revision(),
+        }
     }
 
     pub(crate) fn matches(&self, current: &Self) -> bool {
         // Saturated revisions remain writable, but can never authorize reuse.
-        self == current && current.apd_revision != u64::MAX && current.ipd_revision != u64::MAX
+        Arc::ptr_eq(&self.apd, &current.apd)
+            && Arc::ptr_eq(&self.ipd, &current.ipd)
+            && self.apd_revision == current.apd_revision
+            && self.ipd_revision == current.ipd_revision
+            && current.apd_revision != u64::MAX
+            && current.ipd_revision != u64::MAX
     }
 }
 
@@ -346,7 +353,7 @@ mod tests {
 
     fn descriptor_data(desc: &DescHandle) -> String {
         let state = desc.inner.lock().unwrap();
-        format!("{:?} {:?}", state.header, state.records)
+        format!("{:?} {:?}", state.header, state.records())
     }
 
     #[test]

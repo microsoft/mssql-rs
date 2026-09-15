@@ -157,11 +157,24 @@ arrays still complete during `SQLExecute` and report their aggregate row count.
 
 ## Handle and binding lifetimes
 
-Driver handles are nonreused, pointer-sized IDs, not allocation addresses.
+Driver handles are opaque, pointer-sized IDs, not allocation addresses.
 Typed registry acquisition returns an owned guard that keeps the handle and
 its parents alive through the call. Free retires the ID; storage is released
 after its remaining owners finish. A statement's four implicit descriptor IDs
 retire with the statement, even if its allocation is still retained.
+
+Allocation cycles through the full nonzero pointer-sized namespace and skips
+IDs that are still live. There is no cumulative allocation budget: retiring
+handles releases capacity, including after the cursor wraps. Exhausting the
+currently available IDs or memory is an allocation error, not a permanent
+process-lifetime failure.
+
+Applications must stop using a handle after its final release, including
+statement/descriptor cleanup by `SQLDisconnect`. A retired value is rejected
+until it is reassigned, but no fixed-width handle scheme can distinguish an
+arbitrarily old copy from a new handle after value reuse. The driver preserves
+owned operations and internal identities independently of these public values;
+it does not promise perpetual rejection of post-lifetime handle copies.
 
 Binding snapshots also hold use leases. Changing or freeing an in-use
 descriptor, including one shared by several statements, returns `HY010`
@@ -185,7 +198,7 @@ may use a module-scoped allocator, but its memory services must outlive all
 allocations and reference-count control blocks, not merely the last public
 handle ID.
 
-Prepared execution compares the effective APD/IPD identities and record revisions
+Prepared execution compares retained internal APD/IPD identity markers and record revisions
 before reusing a server plan. Descriptor edits, reassociation, and descriptor free
 therefore force re-preparation on the next execute, including every statement
 sharing an explicit APD. Ordinary value changes in an unchanged binding still

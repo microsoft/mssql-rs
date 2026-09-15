@@ -171,7 +171,7 @@ unsafe fn free_dbc(handle: SqlHandle) -> SqlReturn {
 
 /// Mirrors msodbcsql's `SQLFreeStmt(SQL_DROP)` behavior.
 ///
-/// If the handle was already freed by an earlier `SQLDisconnect` cascading
+/// If the ID is no longer registered after an earlier `SQLDisconnect` cascading
 /// cleanup (`sql_disconnect_safe`), returns `SQL_SUCCESS` immediately without
 /// dereferencing it — that cleanup happens behind the Driver Manager's back,
 /// so an application legitimately holding this now-stale handle can still
@@ -258,7 +258,7 @@ unsafe fn free_stmt(handle: SqlHandle) -> SqlReturn {
 /// several statements at once is a supported case, not an error: every one of
 /// them is reset, not just the first found.
 ///
-/// If the handle was already freed by an earlier `SQLDisconnect` cascading
+/// If the ID is no longer registered after an earlier `SQLDisconnect` cascading
 /// cleanup (`sql_disconnect_safe`), returns `SQL_SUCCESS` immediately without
 /// dereferencing it — mirrors `free_stmt`'s identical guard and the same
 /// reasoning (mssql-rs#400). Returns `SQL_INVALID_HANDLE`, per spec, if the
@@ -325,10 +325,8 @@ unsafe fn free_desc(handle: SqlHandle) -> SqlReturn {
         return SQL_ERROR;
     };
 
-    if desc.binding_use.is_active() {
-        error!("SQLFreeHandle(DESC): descriptor bindings are in use");
-        post_handle_error(&desc, RegistryError::Busy);
-        return SQL_ERROR;
+    if let Err(error) = desc.binding_use.ensure_idle(&dbc_state) {
+        return with_diagnostics(&desc.inner, |records| error.post(records));
     }
     let _closing = claim_close!(&desc);
 

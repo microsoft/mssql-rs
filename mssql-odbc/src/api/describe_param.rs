@@ -420,7 +420,7 @@ fn refine_ipd(stmt: &StmtHandle, descriptions: &[ParameterDescription]) -> Resul
             return Ok(());
         }
         desc.binding_use.ensure_idle(&gate)?;
-        let count = state.records.len().max(descriptions.len());
+        let count = state.records().len().max(descriptions.len());
         state.set_record_count(count, desc.kind);
         for (i, description) in descriptions.iter().enumerate() {
             let number = SqlSmallInt::try_from(i + 1).unwrap_or(SqlSmallInt::MAX);
@@ -881,17 +881,17 @@ mod tests {
             stmt.inner.lock().unwrap().diag_records[0].sql_state,
             *b"HY010"
         );
-        assert!(ipd.inner.lock().unwrap().records.is_empty());
+        assert!(ipd.inner.lock().unwrap().records().is_empty());
         drop(lease);
         assert_eq!(describe(&mut data_type), SQL_SUCCESS);
         assert_eq!(data_type, crate::api::odbc_types::SQL_INTEGER);
-        let revision = ipd.inner.lock().unwrap().binding_revision;
+        let revision = ipd.inner.lock().unwrap().binding_revision();
         let _lease = {
             let gate = stmt.parent_dbc().inner.lock().unwrap();
             BindingLease::acquire(&ipd, &gate).unwrap()
         };
         assert_eq!(describe(&mut data_type), SQL_SUCCESS);
-        assert_eq!(ipd.inner.lock().unwrap().binding_revision, revision);
+        assert_eq!(ipd.inner.lock().unwrap().binding_revision(), revision);
         stmt.inner
             .lock()
             .unwrap()
@@ -1438,7 +1438,7 @@ mod tests {
 
     fn ipd_records(h: &TestHandles) -> Vec<crate::handles::desc::DescRecord> {
         let desc = handle_from_raw::<DescHandle>(h.ipd()).unwrap().into_arc();
-        desc.inner.lock().unwrap().records.clone()
+        desc.inner.lock().unwrap().records().to_vec()
     }
 
     fn param_description(

@@ -320,11 +320,11 @@ impl BoundParam {
         odbc_version: OdbcVersion,
     ) -> Vec<Option<Self>> {
         apd_state
-            .records
+            .records()
             .iter()
             .enumerate()
             .map(|(i, apd_record)| {
-                Self::from_records(apd_record, ipd_state.records.get(i), odbc_version)
+                Self::from_records(apd_record, ipd_state.records().get(i), odbc_version)
             })
             .collect()
     }
@@ -336,7 +336,7 @@ mod tests {
     use crate::api::odbc_types::{
         SQL_BIND_BY_COLUMN, SQL_C_CHAR, SQL_C_SLONG, SQL_PARAM_INPUT, SQL_VARCHAR,
     };
-    use crate::handles::desc::{DescHeader, DescKind};
+    use crate::handles::desc::DescKind;
 
     const ODBC_VERSION: OdbcVersion = OdbcVersion::Odbc3_80;
 
@@ -470,12 +470,7 @@ mod tests {
     }
 
     fn empty_state() -> DescState {
-        DescState {
-            binding_revision: 0,
-            diag_records: Vec::new(),
-            header: DescHeader::default(),
-            records: Vec::new(),
-        }
+        DescState::default()
     }
 
     /// `write_to_records` must split fields onto the correct side: C type and
@@ -775,13 +770,13 @@ mod tests {
         let mut ipd_one = DescRecord::default_for(DescKind::ImpParam);
         param(std::ptr::null_mut(), std::ptr::null_mut())
             .write_to_records(&mut apd_one, &mut ipd_one);
-        apd_state.records.push(apd_one);
-        ipd_state.records.push(ipd_one);
+        apd_state.set_record_count(1, DescKind::AppParam);
+        ipd_state.set_record_count(1, DescKind::ImpParam);
+        *apd_state.record_mut(1).unwrap() = apd_one;
+        *ipd_state.record_mut(1).unwrap() = ipd_one;
         // Position 2: never bound — a growth placeholder on the APD side,
         // with no IPD record allocated at all yet.
-        apd_state
-            .records
-            .push(DescRecord::default_for(DescKind::AppParam));
+        apd_state.set_record_count(2, DescKind::AppParam);
 
         let params = BoundParam::all_from_descriptor_states(&apd_state, &ipd_state, ODBC_VERSION);
         assert_eq!(params.len(), 2);

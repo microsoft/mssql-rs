@@ -1373,7 +1373,10 @@ mod tests {
         let mut value = 7;
         bind_cached_test_value(h.stmt, &mut value);
         let apd = handle_from_raw::<DescHandle>(h.apd()).unwrap().into_arc();
-        apd.inner.lock().unwrap().binding_revision = u64::MAX;
+        apd.inner
+            .lock()
+            .unwrap()
+            .exhaust_binding_revision_for_test();
         let id = StatementId::from_raw_for_test(42);
         materialize_test_plan(h.stmt, id);
         assert_cached_plan_reuse(h.stmt, id, false);

@@ -687,17 +687,15 @@ fn snapshot_params(
             .inner
             .lock()
             .map_err(|_| BindingError::Poisoned)?;
-        let (apd_id, apd, ipd, controls) = {
+        let (apd, ipd, controls) = {
             let mut state = stmt.inner.lock().map_err(|_| BindingError::Poisoned)?;
             free_errors(&mut state);
             if matches!(access, ParameterUse::Input) {
                 stmt.row_binding_use.ensure_idle(&gate)?;
             }
             stmt.param_binding_use.ensure_idle(&gate)?;
-            let apd_id = state.effective_apd(stmt);
             (
-                apd_id,
-                owned_descriptor(apd_id)?,
+                owned_descriptor(state.effective_apd(stmt))?,
                 owned_descriptor(stmt.ipd)?,
                 stmt.param_binding_use.acquire(&gate)?,
             )
@@ -709,8 +707,8 @@ fn snapshot_params(
         Ok::<_, BindingError>(ParameterSnapshot {
             records: BoundParam::all_from_descriptor_states(&apd_state, &ipd_state, odbc_version),
             key: crate::handles::bindings::ParameterBindingKey::new(
-                apd_id, &apd_state, stmt.ipd, &ipd_state,
-            )?,
+                &apd, &apd_state, &ipd, &ipd_state,
+            ),
             lease: ParameterBindingLease {
                 _apd: apd_lease,
                 _ipd: ipd_lease,

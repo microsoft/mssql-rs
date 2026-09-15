@@ -315,7 +315,7 @@ impl ColumnBinding {
     /// are indistinguishable to it.
     pub(crate) fn all_from_ard_state(ard_state: &DescState) -> Vec<Self> {
         ard_state
-            .records
+            .records()
             .iter()
             .enumerate()
             .filter_map(|(i, record)| {
@@ -1417,6 +1417,7 @@ impl StmtState {
     pub(crate) fn refresh_prepared_bindings(&mut self, current: ParameterBindingKey) {
         if !self
             .prepared_bindings
+            .as_ref()
             .is_some_and(|previous| previous.matches(&current))
         {
             self.orphan_prepared_handle();
@@ -1598,7 +1599,7 @@ impl Handle for StmtHandle {
 mod tests {
     use super::*;
     use crate::api::odbc_types::{SQL_C_CHAR, SQL_C_SLONG, SQL_WVARCHAR};
-    use crate::handles::desc::{DescHeader, DescKind};
+    use crate::handles::desc::DescKind;
     use mssql_tds::test_client_support::int_columns;
 
     fn binding(column_number: SqlUSmallInt, target_type: SqlSmallInt) -> ColumnBinding {
@@ -1617,12 +1618,7 @@ mod tests {
 
     /// Runs `f` against a fresh, empty ARD-shaped `DescState`.
     fn with_ard_state(f: impl FnOnce(&mut DescState)) {
-        let mut state = DescState {
-            binding_revision: 0,
-            diag_records: Vec::new(),
-            header: DescHeader::default(),
-            records: Vec::new(),
-        };
+        let mut state = DescState::default();
         f(&mut state);
     }
 
@@ -1676,7 +1672,7 @@ mod tests {
     /// `sql_bind_col_safe` uses.
     fn bind(state: &mut DescState, binding: ColumnBinding) {
         let column_number = binding.column_number;
-        let target_count = state.records.len().max(usize::from(column_number));
+        let target_count = state.records().len().max(usize::from(column_number));
         state.set_record_count(target_count, DescKind::AppRow);
         let record = state
             .record_mut(SqlSmallInt::try_from(column_number).unwrap())
@@ -1726,7 +1722,10 @@ mod tests {
         with_ard_state(|s| {
             bind(s, binding(1, SQL_C_SLONG));
             bind(s, binding(2, SQL_C_SLONG));
-            for record in &mut s.records {
+            for number in 1..=s.records().len() {
+                let record = s
+                    .record_mut(SqlSmallInt::try_from(number).unwrap())
+                    .unwrap();
                 record.data_ptr = std::ptr::null_mut();
             }
             assert!(ColumnBinding::all_from_ard_state(s).is_empty());
