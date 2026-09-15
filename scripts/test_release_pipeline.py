@@ -113,6 +113,82 @@ def test_release_defaults_are_safe():
     assert pipeline["resources"]["pipelines"][0]["source"] == "Official Python Wheels Build"
 
 
+@pytest.mark.parametrize("is_official", [False, True])
+@pytest.mark.parametrize("build_products", [False, True])
+def test_cpp_codeql_build_is_official_only(is_official, build_products):
+    source = yaml.safe_load(_BUILD_STAGES.read_text(encoding="utf-8"))
+    flags = {parameter["name"]: parameter["default"] for parameter in source["parameters"]}
+    flags.update(
+        isOfficial=is_official,
+        buildPythonWheels=build_products,
+        buildOdbcNative=build_products,
+    )
+    jobs = expand(source, flags)["stages"][0]["jobs"]
+    job = next(job for job in jobs if job["job"] == "Windows_x64")
+    codeql = {
+        variable["name"]: variable["value"]
+        for variable in job["variables"]
+        if variable.get("name", "").startswith("Codeql.")
+    }
+    assert codeql == ({
+        "Codeql.Enabled": True,
+        "Codeql.Language": "cpp",
+        "Codeql.BuildIdentifier": "mssql_odbc_cpp",
+    } if is_official else {})
+    steps = [
+        step for step in job["steps"]
+        if step.get("displayName") == "Build ODBC C++ targets for CodeQL"
+    ]
+    assert len(steps) == int(is_official)
+    for other in jobs:
+        if other["job"] != "Windows_x64":
+            assert "Codeql." not in str(other)
+    if is_official:
+        step = steps[0]
+        assert "condition" not in step
+        assert not step.get("continueOnError", False)
+        assert r"-S mssql-odbc\tests\e2e" in step["pwsh"]
+        assert '-G "Visual Studio 17 2022"' in step["pwsh"]
+        assert "-A x64 -DCMAKE_BUILD_TYPE=Debug -DODBC_E2E_FORCE_UNICODE=ON" in step["pwsh"]
+        assert "--config Debug --clean-first" in step["pwsh"]
+        assert "ctest" not in step["pwsh"]
+        assert "run_e2e" not in step["pwsh"]
+        assert "Build.ArtifactStagingDirectory" not in step["pwsh"]
+
+    official = yaml.safe_load(
+        (_BUILD_STAGES.parent / "OfficialPythonWheelsBuild.yml").read_text(encoding="utf-8")
+    )
+    assert official["trigger"]["branches"]["include"] == ["stable"]
+    assert official["extends"]["parameters"]["stages"][0]["parameters"]["isOfficial"] is True
+
+
+@pytest.mark.parametrize(("configure_exit", "build_exit"), [(0, 0), (1, 0), (0, 1)])
+def test_cpp_codeql_build_propagates_cmake_failures(configure_exit, build_exit):
+    source = yaml.safe_load(_BUILD_STAGES.read_text(encoding="utf-8"))
+    flags = {parameter["name"]: parameter["default"] for parameter in source["parameters"]}
+    flags["isOfficial"] = True
+    job = next(
+        job for job in expand(source, flags)["stages"][0]["jobs"]
+        if job["job"] == "Windows_x64"
+    )
+    script = next(
+        step["pwsh"] for step in job["steps"]
+        if step.get("displayName") == "Build ODBC C++ targets for CodeQL"
+    )
+    stub = f"""
+    function cmake {{
+        Write-Output "cmake $args"
+        $global:LASTEXITCODE = if ($args[0] -eq '-S') {{ {configure_exit} }} else {{ {build_exit} }}
+    }}
+    """
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-Command", stub + script],
+        capture_output=True, text=True, check=False,
+    )
+    assert (result.returncode == 0) == (configure_exit == build_exit == 0)
+    assert ("cmake --build" in result.stdout) == (configure_exit == 0)
+
+
 @pytest.mark.parametrize("publish", [False, True])
 def test_pypi_release_switch_graph(publish: bool) -> None:
     source = yaml.safe_load(_PYPI_PIPELINE.read_text(encoding="utf-8"))
