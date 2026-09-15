@@ -1137,13 +1137,13 @@ pub(super) fn finish_execute(
             stmt_state.batch_exhausted = true;
             stmt_state.pending_output_params = Some((return_values, return_status));
             SQL_SUCCESS
-        } else if let Ok(bound_params) = bound_params {
+        } else if let Ok(snapshot) = bound_params {
             // Fresh descriptor snapshot; execute-time input pointers may have
             // been reset or rebound while the results were being consumed.
             unsafe {
                 crate::api::output_params::write_back_output_params(
                     &mut stmt_state,
-                    &bound_params,
+                    &snapshot.records,
                     &return_values,
                     return_status,
                 )
@@ -1468,8 +1468,10 @@ mod tests {
 
         for counts in [vec![], vec![0], vec![2, 1]] {
             let h = TestHandles::with_env_dbc_stmt();
-            let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
-            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let dbc_owner = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
+            let dbc = &*dbc_owner;
+            let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+            let stmt = &*stmt_owner;
             let mut tokens: Vec<_> = counts.iter().copied().map(done_more_with_count).collect();
             tokens.push(done_no_more());
             let mut client = tds_client_from_tokens(tokens);
@@ -1514,8 +1516,10 @@ mod tests {
 
         for fractional_truncated in [false, true] {
             let h = TestHandles::with_env_dbc_stmt();
-            let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
-            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let dbc_owner = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
+            let dbc = &*dbc_owner;
+            let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+            let stmt = &*stmt_owner;
             let mut client = tds_client_from_tokens(vec![
                 done_more_with_count(0),
                 done_more_with_count(2),
@@ -2067,7 +2071,8 @@ mod tests {
         use crate::api::odbc_types::{SQL_PARAM_OUTPUT, SQL_RETURN_VALUE};
         use mssql_tds::message::parameters::rpc_parameters::StatusFlags;
         let h = TestHandles::with_env_dbc_stmt();
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = &*stmt_owner;
         let mut state = stmt.inner.lock().unwrap();
         for direction in [SQL_PARAM_OUTPUT, SQL_RETURN_VALUE] {
             let mut buffer = vec![b'x'; 8];
@@ -2093,7 +2098,8 @@ mod tests {
         use mssql_tds::test_client_support::rpc_parameter_status;
 
         let h = TestHandles::with_env_dbc_stmt();
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = &*stmt_owner;
         let mut state = stmt.inner.lock().unwrap();
         for (direction, expected) in [
             (SQL_PARAM_INPUT, StatusFlags::NONE),

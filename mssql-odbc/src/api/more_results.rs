@@ -55,7 +55,10 @@ unsafe fn sql_more_results_impl(statement_handle: SqlHandle) -> SqlReturn {
 
 fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn {
     // DESC locks must not nest beneath STMT, including the exhausted fast path.
-    let bound_params = snapshot_bound_params(stmt);
+    let snapshot = match snapshot_bound_params(stmt) {
+        Ok(snapshot) => snapshot,
+        Err(rc) => return rc,
+    };
     // Free any stale diagnostics and observe cursor state.
     let cursor_open = {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
@@ -63,15 +66,6 @@ fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
             return SQL_ERROR;
         };
         free_errors(&mut stmt_state);
-        if bound_params.is_err() {
-            post_sql_error(
-                &mut stmt_state,
-                SQLSTATE_HY000,
-                0,
-                "Internal error snapshotting output parameter bindings",
-            );
-            return SQL_ERROR;
-        }
         if let Some(e) = stmt_state.pending_fetch_error.take() {
             // A prior fetch's read-ahead peek already discovered this result
             // set ends in a SQL Server error (see AB#47508's
@@ -118,12 +112,7 @@ fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
                 // The values belong to this statement, not to the client that
                 // may already be executing a different statement.
                 unsafe {
-                    write_back_output_params(
-                        &mut stmt_state,
-                        bound_params.as_deref().unwrap_or_default(),
-                        &values,
-                        status,
-                    )
+                    write_back_output_params(&mut stmt_state, &snapshot.records, &values, status)
                 }
             } else {
                 SQL_SUCCESS
@@ -352,7 +341,7 @@ fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
             let output_rc = unsafe {
                 write_back_output_params(
                     &mut stmt_state,
-                    bound_params.as_deref().unwrap_or_default(),
+                    &snapshot.records,
                     &return_values,
                     return_status,
                 )
@@ -878,7 +867,8 @@ mod tests {
             ),
         ] {
             let h = TestHandles::with_env_dbc_stmt();
-            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+            let stmt = &*stmt_owner;
             let mut buffer = [0u8; 4];
             let mut length = -1;
             assert_eq!(

@@ -166,6 +166,8 @@ retire with the statement, even if its allocation is still retained.
 Binding snapshots also hold use leases. Changing or freeing an in-use
 descriptor, including one shared by several statements, returns `HY010`
 rather than allowing an application to reclaim a buffer still being accessed.
+Procedure output delivery takes a fresh leased parameter snapshot, so bindings
+can change between result-processing calls but not during the final output writes.
 Association changes, snapshot admission, and binding mutations share a short
 DBC lock; that lock is released before network I/O. Close/disconnect admission
 separately excludes executing dependent calls, without treating an idle cursor

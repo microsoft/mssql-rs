@@ -1020,7 +1020,8 @@ mod tests {
             )
         };
         assert_eq!(ret, SQL_SUCCESS_WITH_INFO);
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc_owner = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
+        let dbc = &*dbc_owner;
         let state = dbc.inner.lock().unwrap();
         assert_eq!(state.packet_size, MAX_PACKET_SIZE);
         let record = &state.diag_records()[0];
@@ -1038,7 +1039,8 @@ mod tests {
         let ret =
             unsafe { sql_set_connect_attr_w(h.dbc, SQL_ATTR_PACKET_SIZE, 1usize as SqlPointer, 0) };
         assert_eq!(ret, SQL_SUCCESS_WITH_INFO);
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc_owner = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
+        let dbc = &*dbc_owner;
         let state = dbc.inner.lock().unwrap();
         assert_eq!(state.packet_size, MIN_PACKET_SIZE);
     }
@@ -1053,7 +1055,8 @@ mod tests {
         let ret =
             unsafe { sql_set_connect_attr_w(h.dbc, SQL_ATTR_PACKET_SIZE, 0usize as SqlPointer, 0) };
         assert_eq!(ret, SQL_SUCCESS);
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc_owner = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
+        let dbc = &*dbc_owner;
         let state = dbc.inner.lock().unwrap();
         assert_eq!(state.packet_size, 0);
         assert!(state.diag_records().is_empty());
@@ -1062,7 +1065,8 @@ mod tests {
     #[test]
     fn packet_size_nonzero_to_zero_is_stored_without_a_warning() {
         let h = TestHandles::with_env_dbc();
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc_owner = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
+        let dbc = &*dbc_owner;
         unsafe { sql_set_connect_attr_w(h.dbc, SQL_ATTR_PACKET_SIZE, 16384usize as SqlPointer, 0) };
         assert_eq!(dbc.inner.lock().unwrap().packet_size, 16384);
         free_errors(&mut dbc.inner.lock().unwrap());
@@ -1078,7 +1082,8 @@ mod tests {
     #[test]
     fn packet_size_repeated_zero_never_warns() {
         let h = TestHandles::with_env_dbc();
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc_owner = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
+        let dbc = &*dbc_owner;
         for _ in 0..3 {
             let ret = unsafe {
                 sql_set_connect_attr_w(h.dbc, SQL_ATTR_PACKET_SIZE, 0usize as SqlPointer, 0)

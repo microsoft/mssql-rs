@@ -1001,7 +1001,8 @@ mod tests {
     #[test]
     fn database_name_reports_current_catalog() {
         let h = TestHandles::with_env_dbc();
-        let dbc_ref = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc_ref_owner = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
+        let dbc_ref = &*dbc_ref_owner;
         dbc_ref.inner.lock().unwrap().current_catalog = Some("reporting".to_string());
 
         let (rc, value, len) = get_wide_str(h.dbc, SQL_DATABASE_NAME);
@@ -1115,7 +1116,8 @@ mod tests {
     #[test]
     fn sql_text_limits_use_preconnect_packet_size() {
         let h = TestHandles::with_env_dbc();
-        let dbc_ref = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc_ref_owner = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
+        let dbc_ref = &*dbc_ref_owner;
         dbc_ref.inner.lock().unwrap().packet_size = 16_384;
 
         for info_type in [
@@ -1140,7 +1142,8 @@ mod tests {
         // eventual default. A disconnected handle with the zero sentinel must
         // report the same 0, matching that measured behavior exactly.
         let h = TestHandles::with_env_dbc();
-        let dbc_ref = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc_ref_owner = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
+        let dbc_ref = &*dbc_ref_owner;
         dbc_ref.inner.lock().unwrap().packet_size = 0;
 
         for info_type in [
@@ -1287,7 +1290,8 @@ mod tests {
             )
         };
         assert_eq!(rc, SQL_ERROR);
-        let dbc_ref = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc_ref_owner = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
+        let dbc_ref = &*dbc_ref_owner;
         let state = dbc_ref.inner.lock().unwrap();
         assert_eq!(state.diag_records.len(), 1);
         assert_eq!(state.diag_records[0].sql_state, *b"HY090");
@@ -1314,7 +1318,8 @@ mod tests {
         let (rc, _, _) = get_u16(h.dbc, SQL_ACTIVE_STATEMENTS);
         assert_eq!(rc, SQL_SUCCESS);
 
-        let dbc_ref = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc_ref_owner = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
+        let dbc_ref = &*dbc_ref_owner;
         assert!(dbc_ref.inner.lock().unwrap().diag_records.is_empty());
     }
 

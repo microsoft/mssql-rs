@@ -1223,7 +1223,8 @@ mod tests {
             );
         }
         assert_eq!(unsafe { sql_execute(h.stmt) }, SQL_ERROR);
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = &*stmt_owner;
         let state = stmt.inner.lock().unwrap();
         assert_eq!(state.diag_records.len(), 1);
         assert_eq!(state.diag_records[0].sql_state, expected_state);
@@ -1297,8 +1298,12 @@ mod tests {
                     "UPDATE t SET v=1; UPDATE t SET v=2; SELECT v FROM t"
                 },
             );
-            let dbc = unsafe { handle_from_raw::<crate::handles::DbcHandle>(h.dbc) };
-            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let dbc_owner = handle_from_raw::<crate::handles::DbcHandle>(h.dbc)
+                .unwrap()
+                .into_arc();
+            let dbc = &*dbc_owner;
+            let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+            let stmt = &*stmt_owner;
             dbc.inner.lock().unwrap().client = Some(tds_client_from_tokens(vec![
                 done_more_with_count(2),
                 done_more_with_count(1),

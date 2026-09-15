@@ -1923,7 +1923,8 @@ mod tests {
         const BOUND: Duration = Duration::from_secs(5);
 
         let h = TestHandles::with_env_dbc_stmt();
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc_owner = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
+        let dbc = &*dbc_owner;
         let mock_server =
             crate::test_support::connect_mock_server(dbc, "SELECT 1", QueryResponse::select_one());
         mock_server.set_tm_begin_delay(BEGIN_DELAY);
@@ -1932,7 +1933,8 @@ mod tests {
         // returning immediately.
         dbc.inner.lock().unwrap().autocommit = false;
 
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = &*stmt_owner;
         stmt.inner.lock().unwrap().query_timeout = STMT_TIMEOUT_SECS;
 
         let started = Instant::now();
@@ -1978,12 +1980,14 @@ mod tests {
         const BOUND: Duration = Duration::from_secs(5);
 
         let h = TestHandles::with_env_dbc_stmt();
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc_owner = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
+        let dbc = &*dbc_owner;
         let mock_server =
             crate::test_support::connect_mock_server(dbc, "SELECT 1", QueryResponse::select_one());
         mock_server.set_rpc_delay(RESPONSE_DELAY);
 
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = &*stmt_owner;
         crate::test_support::arm_pending_unprepare(dbc, stmt);
         stmt.inner.lock().unwrap().query_timeout = STMT_TIMEOUT_SECS;
 
@@ -2062,7 +2066,8 @@ mod tests {
         const CATALOG: &str = "ZZQUALIFIEDZZ";
 
         let h = TestHandles::with_env_dbc_stmt();
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc_owner = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
+        let dbc = &*dbc_owner;
         // Answers the qualified `[ZZQUALIFIEDZZ].sys.sp_tables` call only.
         let mock_server = crate::test_support::connect_mock_server(
             dbc,
@@ -2078,7 +2083,8 @@ mod tests {
         // ever sent — is unmatched, and only delayed.
         mock_server.set_rpc_delay(WIRE_DELAY);
 
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = &*stmt_owner;
         crate::test_support::arm_pending_unprepare(dbc, stmt);
         stmt.inner.lock().unwrap().query_timeout = STMT_TIMEOUT_SECS;
 
@@ -2129,12 +2135,14 @@ mod tests {
         const BOUND: Duration = Duration::from_secs(5);
 
         let h = TestHandles::with_env_dbc_stmt();
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc_owner = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
+        let dbc = &*dbc_owner;
         let mock_server =
             crate::test_support::connect_mock_server(dbc, "SELECT 1", QueryResponse::select_one());
         mock_server.set_rpc_delay(RESPONSE_DELAY);
 
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = &*stmt_owner;
         stmt.inner.lock().unwrap().query_timeout = STMT_TIMEOUT_SECS;
 
         let started = Instant::now();

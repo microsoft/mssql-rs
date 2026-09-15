@@ -589,6 +589,9 @@ Driver Manager (DM) provides serialization guarantees that the driver relies on
   reject conflicting use with `ERR_FUNCTION_SEQUENCE` before mutation.
   Check the descriptor's use state, not just the calling statement: an
   explicit descriptor can be another statement's active ARD or APD.
+  Procedure outputs take a fresh `ParameterSnapshot` at delivery, not at
+  execute time. Keep that snapshot's lease alive through the final value and
+  indicator writes; extracting only `.records` would reopen the mutation race.
 - **No check-then-unowned-use.** `handle_from_raw` returns an owned reference;
   neither `live_type` nor a raw cast is a valid lifetime check. Registry
   acquisition never locks a handle's state. Never acquire state locks,

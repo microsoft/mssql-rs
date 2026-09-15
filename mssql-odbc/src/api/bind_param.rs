@@ -549,7 +549,8 @@ mod tests {
                 )
             };
             assert_eq!(ret, SQL_ERROR, "direction {direction}");
-            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+            let stmt = &*stmt_owner;
             let state = stmt.inner.lock().unwrap();
             assert_eq!(state.diag_records[0].sql_state, SQLSTATE_HYC00);
         }

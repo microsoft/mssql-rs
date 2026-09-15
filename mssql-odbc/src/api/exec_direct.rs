@@ -621,7 +621,8 @@ mod tests {
             unsafe { sql_exec_direct_w(h.stmt, sql.as_ptr(), SQL_NTS) },
             SQL_ERROR
         );
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = &*stmt_owner;
         let state = stmt.inner.lock().unwrap();
         assert_eq!(state.diag_records.len(), 1);
         assert_eq!(state.diag_records[0].sql_state, expected_state);

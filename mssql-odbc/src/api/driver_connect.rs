@@ -1275,7 +1275,8 @@ mod tests {
             "connect failed: {ret}"
         );
 
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc_owner = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
+        let dbc = &*dbc_owner;
         let negotiated = dbc
             .inner
             .lock()
@@ -1453,7 +1454,8 @@ mod tests {
         };
         assert_eq!(ret, SQL_ERROR, "connect to an unused port must fail");
 
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc_owner = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
+        let dbc = &*dbc_owner;
         assert_eq!(
             dbc.inner.lock().unwrap().connection_state,
             ConnectionState::Disconnected
