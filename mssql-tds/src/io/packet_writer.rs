@@ -6,7 +6,6 @@ use crate::core::{CancelHandle, TdsResult};
 use crate::error::Error::TimeoutError;
 use crate::error::TimeoutErrorType;
 use crate::message::messages::{PacketStatusFlags, PacketType, ResetConnectionMode};
-use async_trait::async_trait;
 use byteorder::{BigEndian, WriteBytesExt};
 use std::io::Cursor;
 use std::time::Instant;
@@ -44,7 +43,8 @@ pub(crate) trait TdsPacketWriterUnchecked {
     async fn check_overflow(&mut self) -> TdsResult<()>;
 }
 
-#[async_trait]
+// This trait is statically dispatched: native async methods avoid allocating a
+// boxed future for every primitive written to a packet.
 pub(crate) trait TdsPacketWriter {
     /// Writes a byte to the buffer.
     async fn write_byte_async(&mut self, value: u8) -> TdsResult<()>;
@@ -527,7 +527,6 @@ impl<'a> PacketWriter<'a> {
     }
 }
 
-#[async_trait]
 impl TdsPacketWriter for PacketWriter<'_> {
     async fn finalize(&mut self) -> TdsResult<()> {
         // Send a final EOM packet when there is buffered payload, or when the
