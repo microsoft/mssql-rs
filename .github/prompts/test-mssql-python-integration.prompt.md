@@ -198,37 +198,20 @@ git push origin <your-branch-name>
 # Create PR in GitHub
 ```
 
-### 2. Link mssql-python branch in your mssql-tds PR
+### 2. Validate the mssql-python branch locally
 
-In your **mssql-tds PR description**, add this line so CI tests against your mssql-python branch instead of `main`:
+Check out the desired branch in the sibling `mssql-python` repository, then run
+`./dev/test-python.sh --mssql-python` from this repository.
 
-```
-mssql-python-branch: <your-branch-name>
-```
-
-**Example mssql-tds PR description:**
-```
-## Summary
-
-Add explicit parameters to bulkcopy API
-
-mssql-python-branch: bewithgaurav/fix-bulkcopy-kwargs
-
-## Changes
-- Updated mssql-py-core bulkcopy signature
-- Added integration tests
-```
-
-The CI pipeline (`test-mssql-python-template.yml`) will:
-1. Parse `mssql-python-branch:` from PR description
-2. Clone that branch instead of `main`
-3. Run tests against the linked mssql-python changes
+The Linux `Build mssql-python (cross-repo)` job has been removed: the Rust runtime
+is published separately as `mssql-python-rs`, so this repository no longer builds
+or publishes a combined mssql-python wheel through that job. The macOS cross-repo
+tests and the mssql-odbc driver-swap compatibility job remain enabled.
 
 ### 3. Merge order
 
 1. **First:** Merge mssql-python PR (so `main` has the changes)
-2. **Then:** Remove `mssql-python-branch:` line from mssql-tds PR description
-3. **Finally:** Merge mssql-tds PR
+2. **Then:** Merge mssql-tds PR
 
 ---
 

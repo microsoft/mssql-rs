@@ -704,17 +704,6 @@ stages:
   condition: and(not(canceled()), eq(variables['Build.Reason'], 'PullRequest'), eq('${{ parameters.RunFuzz }}', 'false'), eq('${{ parameters.RunLongHaul }}', 'false'), ne(dependencies.EvaluateDuplicate.outputs['Evaluate.SetDuplicateState.skipDuplicate'], 'true'))
   displayName: Build mssql-python
   jobs:
-  - job: Build_mssql_python_Linux
-    displayName: Build mssql-python (cross-repo)
-    pool:
-      name: ${{ parameters.poolName }}
-      demands:
-        - imageOverride -equals RUST-UBUSLIM
-    variables:
-      CARGO_TARGET_DIR: $(Build.SourcesDirectory)
-    steps:
-      - template: test-mssql-python-template.yml
-
   - job: Build_mssql_python_MacOS
     displayName: Build mssql-python macOS (cross-repo)
     pool:
