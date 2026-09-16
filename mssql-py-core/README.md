@@ -16,7 +16,7 @@ components:
 
 Prebuilt CPython 3.10+ wheels for:
 
-- **Windows** — x64, ARM64
+- **Windows** — x64, and ARM64 (CPython 3.11+)
 - **macOS** — universal2 (x86_64 + arm64)
 - **Linux** — glibc (`manylinux_2_28`, `manylinux_2_34`) and musl
   (`musllinux_1_2`), on x86_64 and aarch64
