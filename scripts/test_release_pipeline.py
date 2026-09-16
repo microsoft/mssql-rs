@@ -502,6 +502,7 @@ def test_manylinux_repair_does_not_depend_on_odbc(architecture: str, build_odbc:
         "buildPythonWheels": True,
         "buildOdbcNative": build_odbc,
         "buildRustCrates": False,
+        "testPythonWheelInstalls": False,
         "isOfficial": False,
         "publishToFeed": True,
     }
@@ -558,6 +559,7 @@ def test_nonofficial_nuget_versions_follow_python_distribution(
         "buildPythonWheels": True,
         "buildOdbcNative": True,
         "buildRustCrates": False,
+        "testPythonWheelInstalls": False,
         "isOfficial": is_official,
         "publishToFeed": True,
     }
@@ -618,6 +620,7 @@ def test_manylinux_228_builds_use_isolated_cargo_targets(
         "buildPythonWheels": True,
         "buildOdbcNative": True,
         "buildRustCrates": False,
+        "testPythonWheelInstalls": False,
         "isOfficial": False,
         "publishToFeed": False,
     }
@@ -650,6 +653,7 @@ def test_manylinux_228_odbc_builds_enforce_glibc_ceiling(job_name: str) -> None:
         "buildPythonWheels": True,
         "buildOdbcNative": True,
         "buildRustCrates": False,
+        "testPythonWheelInstalls": False,
         "isOfficial": False,
         "publishToFeed": False,
     }

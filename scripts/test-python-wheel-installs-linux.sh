@@ -45,7 +45,7 @@ case "$architecture" in
 esac
 
 for platform_tag in manylinux_2_34 manylinux_2_28 musllinux_1_2; do
-    image="ghcr.io/microsoft/mssql-rs/python-build/${platform_tag}_${image_arch}_rust:latest"
+    image="quay.io/pypa/${platform_tag}_${image_arch}:latest"
     docker pull "$image"
     docker run --rm \
         -v "$wheel_dir:/wheels:ro" \
