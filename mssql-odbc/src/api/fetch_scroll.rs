@@ -56,7 +56,7 @@ use crate::api::odbc_types::{
     SqlUSmallInt, SqlWChar,
 };
 use crate::api::type_rules::resolve_default_c_type;
-use crate::api::util::{copy_with_nul, write_if_some};
+use crate::api::util::{copy_with_nul, is_valid_utf16le, write_if_some};
 use crate::conversion::datetime::DateTimeParts;
 use crate::conversion::error::{ConvError, ConvOk};
 use crate::conversion::fetch_convert::{
@@ -2106,13 +2106,7 @@ unsafe fn deliver_encoded_string(
             || matches!(encoding, EncodingType::LcidBased(_)) && bytes.is_ascii());
     let direct_wchar = binding.target_type == SQL_C_WCHAR
         && matches!(encoding, EncodingType::Utf16)
-        && bytes.len().is_multiple_of(2)
-        && std::char::decode_utf16(
-            bytes
-                .chunks_exact(2)
-                .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]])),
-        )
-        .all(|unit| unit.is_ok());
+        && is_valid_utf16le(&bytes);
 
     if !direct_char && !direct_wchar {
         return unsafe {
