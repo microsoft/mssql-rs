@@ -164,7 +164,8 @@ after its remaining owners finish. A statement's four implicit descriptor IDs
 retire with the statement, even if its allocation is still retained.
 
 Lookup indexes a segmented table and checks generation and type under the slot's
-read lock. Slots are aligned to 128 bytes to avoid false sharing. Directory pages
+read lock. Slots and activity records are aligned to 128 bytes to avoid false
+sharing between independent calls; this adds bounded per-handle padding. Directory pages
 are published once and remain stable for the registry's lifetime; metadata grows
 with the slot high-water mark, not the number of historical allocations.
 Only allocation and retirement take the free-list mutex. Admission and active-call

@@ -615,7 +615,7 @@ Driver Manager (DM) provides serialization guarantees that the driver relies on
   perform I/O, or destroy extracted payloads while holding the registry lock.
 - Registry lookup checks generation and type under the individual slot's read
   lock, never before locking. Segmented pages stay stable for the registry's
-  lifetime; slots are cache-line isolated. Allocation/retirement serialize the
+  lifetime; slots and activity records are cache-line isolated. Allocation/retirement serialize the
   free list, but lookup and close do not take that mutex.
   Admission and count share one atomic word so a cross-slot parent close cannot
   pass between a check and reservation. Readers reserve with checked atomic
