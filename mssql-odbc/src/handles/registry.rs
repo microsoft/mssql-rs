@@ -1204,7 +1204,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_descriptor_call_blocks_connection_but_not_statement() {
+    fn explicit_descriptor_call_blocks_connection_but_not_statement_or_environment() {
         let tree = Tree::new();
         let descriptor = tree.acquire(tree.explicit_desc, HandleType::Desc);
         assert_eq!(count(&tree.stmt_activity), 0);
@@ -1225,7 +1225,7 @@ mod tests {
     }
 
     #[test]
-    fn statement_call_blocks_connection_close_but_not_dm_ordered_environment_close() {
+    fn in_flight_statement_call_blocks_connection_close_but_not_environment_close() {
         let tree = Tree::new();
         let statement = tree.acquire(tree.stmt, HandleType::Stmt);
         let connection = tree.acquire(tree.dbc, HandleType::Dbc);
@@ -1389,7 +1389,7 @@ mod tests {
                     .err(),
                 Some(RegistryError::ActivityOverflow)
             );
-            for activity in [&tree.env_activity, &tree.dbc_activity, &tree.stmt_activity] {
+            for activity in [&tree.dbc_activity, &tree.stmt_activity] {
                 assert_eq!(
                     count(activity),
                     if Arc::ptr_eq(activity, saturated) {
@@ -1399,6 +1399,7 @@ mod tests {
                     }
                 );
             }
+            assert_eq!(count(&tree.env_activity), 0);
             let state = tree.registry.state.read().unwrap();
             assert_eq!(
                 count(&state.entries.get(&tree.implicit_desc).unwrap().activity),
@@ -1430,7 +1431,7 @@ mod tests {
     fn concurrent_readers_cannot_overflow_a_shared_ancestor() {
         let registry = Arc::new(HandleRegistry::new());
         let (_, root) = register(&registry, HandleType::Env, None);
-        let (_, parent) = register(&registry, HandleType::Dbc, Some(root));
+        let (_, parent) = register(&registry, HandleType::Dbc, Some(Arc::clone(&root)));
         let children: Vec<_> = (0..32)
             .map(|_| register(&registry, HandleType::Stmt, Some(Arc::clone(&parent))))
             .collect();
@@ -1464,6 +1465,7 @@ mod tests {
 
         let results = results.unwrap();
         assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(count(&root), 0);
         assert_eq!(count(&parent), usize::MAX);
         for error in results.iter().filter_map(|result| result.as_ref().err()) {
             assert_eq!(*error, RegistryError::ActivityOverflow);
@@ -2023,12 +2025,14 @@ mod tests {
             (tree.dbc, HandleType::Dbc, &tree.dbc_activity),
             (tree.stmt, HandleType::Stmt, &tree.stmt_activity),
         ];
-        assert_eq!(count(&tree.env_activity), 0);
         let mut blocked_results = Vec::new();
         for (id, kind, activity) in ancestors {
             let ancestor = tree.acquire(id, kind);
             blocked_results.push((tree.registry.begin_close(&ancestor).err(), count(activity)));
         }
+        assert_eq!(count(&tree.env_activity), 0);
+        let env = tree.acquire(tree.env, HandleType::Env);
+        assert!(tree.registry.begin_close(&env).is_ok());
         let leaf_count = count(&activity);
         finish_tx.send(()).unwrap();
         receive(&done_rx);
