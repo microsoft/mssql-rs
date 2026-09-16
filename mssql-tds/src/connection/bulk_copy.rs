@@ -1257,7 +1257,7 @@ impl<'a> BulkCopy<'a> {
 ///
 /// ```rust,no_run
 /// use async_trait::async_trait;
-/// use mssql_tds::connection::bulk_copy::BulkLoadRow;
+/// use mssql_tds::connection::bulk_copy::{BulkCopy, BulkLoadRow};
 /// use mssql_tds::core::TdsResult;
 /// use mssql_tds::datatypes::column_values::ColumnValues;
 /// use mssql_tds::datatypes::sql_string::SqlString;
@@ -1289,6 +1289,14 @@ impl<'a> BulkCopy<'a> {
 ///         *column_index += 1;
 ///         Ok(())
 ///     }
+/// }
+///
+/// async fn write_products(bulk_copy: &mut BulkCopy<'_>) -> TdsResult<()> {
+///     let products = vec![
+///         Product { id: 1, name: "Widget".to_string(), price: 9.99 },
+///     ];
+///     bulk_copy.write_to_server_zerocopy(products.into_iter()).await?;
+///     Ok(())
 /// }
 /// ```
 #[async_trait]
