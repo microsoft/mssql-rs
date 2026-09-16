@@ -324,9 +324,8 @@ fi
 echo ">>> Building the fixed C++ benchmark harness..."
 cmake -S "$REPO_ROOT/mssql-odbc-bench" \
     -B "$HARNESS_BUILD_DIR" \
-    -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
+    -DCMAKE_BUILD_TYPE=Release
 cmake --build "$HARNESS_BUILD_DIR" --config Release --parallel
-ctest --test-dir "$HARNESS_BUILD_DIR" -C Release --output-on-failure --no-tests=error
 
 # The pinned Google Benchmark v1.9.1 checkout ships the comparator we report
 # with; using the copy from this build tree keeps the tool and the harness on

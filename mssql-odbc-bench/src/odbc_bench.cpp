@@ -2,7 +2,6 @@
 // Licensed under the MIT License.
 
 #include "odbc_bench.hpp"
-#include "lob_chunk.hpp"
 
 #include <algorithm>
 #include <cerrno>
@@ -1858,8 +1857,20 @@ private:
                 return;
             }
 
-            const std::size_t payload =
-                lob_chunk_payload_bytes(chunk_.data(), kLobChunkBytes, column.unit_bytes);
+            // Generated text has no embedded NUL. Short chunks can leave stale
+            // bytes after the current terminator in this reused buffer.
+            std::size_t payload = 0;
+            for (; payload + column.unit_bytes <= kLobChunkBytes;
+                 payload += column.unit_bytes) {
+                if (std::all_of(chunk_.data() + payload,
+                                chunk_.data() + payload + column.unit_bytes,
+                                [](unsigned char byte) { return byte == 0; })) {
+                    break;
+                }
+            }
+            if (payload + column.unit_bytes > kLobChunkBytes) {
+                throw std::runtime_error("SQLGetData returned LOB text without a terminator");
+            }
             if (payload > 0) {
                 lob_payload_.insert(lob_payload_.end(), chunk_.begin(),
                                     chunk_.begin() + static_cast<std::ptrdiff_t>(payload));

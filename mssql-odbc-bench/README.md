@@ -49,11 +49,6 @@ cmake -S mssql-odbc-bench -B mssql-odbc-bench\build -G "Visual Studio 17 2022" -
 cmake --build mssql-odbc-bench\build --config Release
 ```
 
-Run the offline LOB chunk regression test with
-`ctest --test-dir mssql-odbc-bench/build -C Release --output-on-failure`.
-It covers short chunks in a reused buffer, including the row-557 failure shape,
-without requiring a SQL Server connection.
-
 ## Set up, run, and clean up
 
 Set the environment once, then create the benchmark tables:

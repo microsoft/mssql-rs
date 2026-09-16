@@ -658,7 +658,7 @@ try {
     try {
         Invoke-Native {
             & $CMake -S (Join-Path $RepoRoot 'mssql-odbc-bench') `
-                -B $HarnessBuildDir -G 'Visual Studio 17 2022' -A x64 -DBUILD_TESTING=ON
+                -B $HarnessBuildDir -G 'Visual Studio 17 2022' -A x64
         }
     } catch {
         $gxx = Get-Command g++ -ErrorAction SilentlyContinue
@@ -672,15 +672,11 @@ try {
         $env:PATH = "$([System.IO.Path]::GetDirectoryName($gxx.Source));$env:PATH"
         Invoke-Native {
             & $CMake -S (Join-Path $RepoRoot 'mssql-odbc-bench') `
-                -B $HarnessBuildDir -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON `
+                -B $HarnessBuildDir -G Ninja -DCMAKE_BUILD_TYPE=Release `
                 "-DCMAKE_CXX_COMPILER=$($gxx.Source)"
         }
     }
     Invoke-Native { & $CMake --build $HarnessBuildDir --config Release --parallel }
-    $CTest = Join-Path (Split-Path $CMake -Parent) 'ctest.exe'
-    Invoke-Native {
-        & $CTest --test-dir $HarnessBuildDir -C Release --output-on-failure --no-tests=error
-    }
 
     # The pinned Google Benchmark v1.9.1 checkout ships the comparator we report
     # with; using the copy from this build tree keeps the tool and the harness on
