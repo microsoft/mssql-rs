@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 _SCRIPT = Path(__file__).with_name("test-python-wheel-install.py")
+_LINUX_SCRIPT = Path(__file__).with_name("test-python-wheel-installs-linux.sh")
 _SPEC = importlib.util.spec_from_file_location("wheel_install", _SCRIPT)
 assert _SPEC and _SPEC.loader
 wheel_install = importlib.util.module_from_spec(_SPEC)
@@ -35,6 +36,13 @@ def test_wheel_version_rejects_wrong_distribution(tmp_path: Path) -> None:
 
     with pytest.raises(RuntimeError, match="Unexpected distribution name"):
         wheel_install.wheel_version(wheel)
+
+
+def test_linux_installs_use_mirrored_consumer_images() -> None:
+    script = _LINUX_SCRIPT.read_text(encoding="utf-8")
+
+    assert "ghcr.io/microsoft/mssql-rs/import/python-build/" in script
+    assert "quay.io" not in script
 
 
 def test_select_driver_uses_native_slice_for_universal2(
