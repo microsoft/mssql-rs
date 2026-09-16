@@ -428,7 +428,7 @@ impl<'a> BoundRowWriter<'a> {
 
     /// Advances the ordered binding cursor to `col`, returning its binding when
     /// present and skipping unbound columns without losing the wire ordinal.
-    fn take_binding(&mut self, col: usize) -> Option<ColumnBinding> {
+    fn take_binding(&mut self, col: usize) -> Option<&'a ColumnBinding> {
         let ordinal = col + 1;
         while self
             .bindings
@@ -437,7 +437,7 @@ impl<'a> BoundRowWriter<'a> {
         {
             self.next_binding += 1;
         }
-        let binding = *self.bindings.get(self.next_binding)?;
+        let binding = self.bindings.get(self.next_binding)?;
         if usize::from(binding.column_number) != ordinal {
             return None;
         }
@@ -451,8 +451,7 @@ impl<'a> BoundRowWriter<'a> {
         let Some(binding) = self.take_binding(col) else {
             return;
         };
-        let delivered =
-            unsafe { deliver_bound(&binding, self.row_index, self.bind_offset, &value) };
+        let delivered = unsafe { deliver_bound(binding, self.row_index, self.bind_offset, &value) };
         self.outcome = self.outcome.merge(delivered);
     }
 
@@ -467,9 +466,9 @@ impl<'a> BoundRowWriter<'a> {
             return;
         };
         let delivered = if binding.target_type == target_type {
-            unsafe { deliver_fixed_bound(&binding, self.row_index, self.bind_offset, value) }
+            unsafe { deliver_fixed_bound(binding, self.row_index, self.bind_offset, value) }
         } else {
-            unsafe { deliver_bound(&binding, self.row_index, self.bind_offset, &fallback()) }
+            unsafe { deliver_bound(binding, self.row_index, self.bind_offset, &fallback()) }
         };
         self.outcome = self.outcome.merge(delivered);
     }
@@ -495,12 +494,12 @@ impl<'a> BoundRowWriter<'a> {
         let delivered = if binding.target_type == target_type {
             match parts() {
                 Some(parts) => unsafe {
-                    deliver_fixed_bound(&binding, self.row_index, self.bind_offset, convert(parts))
+                    deliver_fixed_bound(binding, self.row_index, self.bind_offset, convert(parts))
                 },
                 None => RowOutcome::Error(RowIssue::Restricted),
             }
         } else {
-            unsafe { deliver_bound(&binding, self.row_index, self.bind_offset, &value()) }
+            unsafe { deliver_bound(binding, self.row_index, self.bind_offset, &value()) }
         };
         self.outcome = self.outcome.merge(delivered);
     }
@@ -553,7 +552,7 @@ impl RowWriter for BoundRowWriter<'_> {
             return;
         };
         let delivered = unsafe {
-            deliver_encoded_string(&binding, self.row_index, self.bind_offset, bytes, encoding)
+            deliver_encoded_string(binding, self.row_index, self.bind_offset, bytes, encoding)
         };
         self.outcome = self.outcome.merge(delivered);
     }
@@ -831,7 +830,6 @@ fn fetch_scroll_safe(
     // fetch on the same statement, so the snapshot cannot go stale under us.
     let (
         ard,
-        column_sql_types,
         row_array_size,
         rows_fetched_ptr,
         row_status_ptr,
@@ -918,15 +916,6 @@ fn fetch_scroll_safe(
         // "Locking rules": a STMT lock must never be held while acquiring a
         // DESC lock.
         let ard = stmt_state.effective_ard(stmt);
-        // Resolving SQL_C_DEFAULT needs this result set's SQL types, which live
-        // under the STMT lock, but the bindings it applies to are read from the
-        // ARD after this lock is released. Snapshot the types here and carry
-        // them out rather than re-locking the statement.
-        let column_sql_types: Vec<SqlSmallInt> = stmt_state
-            .column_metadata
-            .iter()
-            .map(odbc_sql_type)
-            .collect();
         // Claiming the statement here is what stops a concurrent SQLBindCol
         // from freeing an application buffer the fill loop is still reading
         // through after this lock is released; the mutating entry points
@@ -939,7 +928,6 @@ fn fetch_scroll_safe(
             == Some(PlpEncoding::Utf16Text);
         (
             ard,
-            column_sql_types,
             stmt_state.row_array_size,
             stmt_state.rows_fetched_ptr,
             stmt_state.row_status_ptr,
@@ -992,7 +980,21 @@ fn fetch_scroll_safe(
         };
         let mut bindings = ColumnBinding::all_from_ard_state(&desc_state);
         drop(desc_state);
-        resolve_default_bindings(&mut bindings, &column_sql_types, odbc_version);
+        if bindings
+            .iter()
+            .any(|binding| binding.target_type == SQL_C_DEFAULT)
+        {
+            let Ok(stmt_state) = stmt.inner.lock() else {
+                error!("SQLFetchScroll: stmt mutex poisoned resolving default bindings");
+                return SQL_ERROR;
+            };
+            let column_sql_types: Vec<SqlSmallInt> = stmt_state
+                .column_metadata
+                .iter()
+                .map(odbc_sql_type)
+                .collect();
+            resolve_default_bindings(&mut bindings, &column_sql_types, odbc_version);
+        }
         bindings
     };
     let get_data_fetch = row_array_size == 1 && bindings.is_empty();
@@ -1140,7 +1142,9 @@ fn fill_rowset(
     // inside the fill loop would make a poisoned mutex indistinguishable from a
     // column that simply is not PLP, which would silently downgrade a supported
     // column to "unsupported" and drain it.
-    let plp_columns: Vec<Option<PlpColumnInfo>> = {
+    let plp_columns: Vec<Option<PlpColumnInfo>> = if client.current_result_supports_row_into() {
+        Vec::new()
+    } else {
         let Ok(ss) = stmt.inner.lock() else {
             error!("SQLFetchScroll: stmt mutex poisoned reading column metadata");
             if let Ok(mut ds) = dbc.inner.lock() {
@@ -2325,13 +2329,14 @@ fn typed_conv_outcome(converted: Result<ConvOk, ConvError>) -> RowOutcome {
 /// The binding's target pointer, after applying `bind_offset` and `row_index`,
 /// must be null or writable for `T`; its displaced indicator and octet-length
 /// pointers must each be null or writable for one `SqlLen`.
+/// `T` must be the exact fixed-width C type selected by the binding.
 unsafe fn deliver_fixed_bound<T: Copy>(
     binding: &ColumnBinding,
     row_index: usize,
     bind_offset: usize,
     value: T,
 ) -> RowOutcome {
-    let stride = element_stride(binding.target_type, binding.buffer_length);
+    let stride = std::mem::size_of::<T>();
     // Independent of the indicator per the ODBC "Deferred Fields" spec: see
     // `deliver_bound`'s comment on `octet_length`. This path never delivers
     // NULL (that goes through `deliver_bound` via `write_null`), so the

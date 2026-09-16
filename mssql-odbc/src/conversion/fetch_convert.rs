@@ -354,24 +354,19 @@ pub(crate) fn datetime2_parts(datetime: &SqlDateTime2) -> DateTimeParts {
 ///
 /// Returns `None` when applying the offset falls outside the TDS date range.
 pub(crate) fn datetimeoffset_parts(datetime: &SqlDateTimeOffset) -> Option<DateTimeParts> {
-    // The wire value is UTC; ODBC returns the local wall clock obtained by
-    // applying the stored offset. Compute in i128: a corrupt or hostile server
-    // can decode a `time_nanoseconds` far outside a single day, because the TDS
-    // decoder takes the time-field width from the row's length byte and the
-    // scale from the column metadata without cross-checking them, so
-    // `scale_time_value` can inflate a 5-byte value past the i64 range. The
-    // day-range check below then rejects any such unrepresentable value as
-    // `None` instead of overflowing the addition.
-    let ticks_per_day = i128::from(TICKS_PER_DAY);
-    let utc_ticks = i128::from(datetime.datetime2.time.time_nanoseconds)
-        + i128::from(datetime.offset) * 60 * 10_000_000;
-    let days = i128::from(datetime.datetime2.days) + utc_ticks.div_euclid(ticks_per_day);
-    if !(0..=i128::from(MAX_DAYS_SINCE_0001)).contains(&days) {
+    // A time that cannot fit in i64 already exceeds 10 million days; even
+    // the most negative i16 minute offset cannot bring it into the TDS range.
+    // Checked arithmetic retains that rejection without per-value i128 division.
+    let utc_ticks = i64::try_from(datetime.datetime2.time.time_nanoseconds)
+        .ok()?
+        .checked_add(i64::from(datetime.offset) * 60 * 10_000_000)?;
+    let days = i64::from(datetime.datetime2.days) + utc_ticks.div_euclid(TICKS_PER_DAY);
+    if !(0..=MAX_DAYS_SINCE_0001).contains(&days) {
         return None;
     }
 
-    let date = civil_from_days_since_0001(days as i64);
-    let t = hms_from_ticks_100ns(utc_ticks.rem_euclid(ticks_per_day) as u64);
+    let date = civil_from_days_since_0001(days);
+    let t = hms_from_ticks_100ns(u64::try_from(utc_ticks.rem_euclid(TICKS_PER_DAY)).ok()?);
     Some(DateTimeParts {
         year: date.year,
         month: date.month,
@@ -2276,6 +2271,70 @@ mod tests {
         }
         .unwrap_err();
         assert_eq!(err, ConvError::Restricted);
+    }
+
+    #[test]
+    fn datetimeoffset_checked_arithmetic_matches_wide_arithmetic() {
+        let day_ticks = u64::try_from(TICKS_PER_DAY).unwrap();
+        for days in [0, 1, 738_685, 3_652_057, 3_652_058, u32::MAX] {
+            for ticks in [
+                0,
+                1,
+                day_ticks - 1,
+                day_ticks,
+                day_ticks * 3_652_059,
+                u64::try_from(i64::MAX).unwrap() - 1,
+                u64::try_from(i64::MAX).unwrap(),
+                u64::MAX,
+            ] {
+                for offset in [i16::MIN, -840, -1, 0, 1, 840, i16::MAX] {
+                    let value = SqlDateTimeOffset {
+                        datetime2: SqlDateTime2 {
+                            days,
+                            time: SqlTime {
+                                time_nanoseconds: ticks,
+                                scale: 7,
+                            },
+                        },
+                        offset,
+                    };
+                    let wide_ticks = i128::from(ticks) + i128::from(offset) * 60 * 10_000_000;
+                    let wide_days =
+                        i128::from(days) + wide_ticks.div_euclid(i128::from(TICKS_PER_DAY));
+                    let actual = datetimeoffset_parts(&value);
+                    if (0..=i128::from(MAX_DAYS_SINCE_0001)).contains(&wide_days) {
+                        let actual = actual.unwrap();
+                        let date = civil_from_days_since_0001(i64::try_from(wide_days).unwrap());
+                        let time = hms_from_ticks_100ns(
+                            u64::try_from(wide_ticks.rem_euclid(i128::from(TICKS_PER_DAY)))
+                                .unwrap(),
+                        );
+                        assert_eq!(
+                            (actual.year, actual.month, actual.day),
+                            (date.year, date.month, date.day)
+                        );
+                        assert_eq!(
+                            (
+                                actual.hour,
+                                actual.minute,
+                                actual.second,
+                                actual.fraction_ns
+                            ),
+                            (time.hour, time.minute, time.second, time.fraction_ns)
+                        );
+                        assert_eq!(
+                            (actual.tz_hour, actual.tz_minute),
+                            (offset / 60, offset % 60)
+                        );
+                    } else {
+                        assert!(
+                            actual.is_none(),
+                            "days={days}, ticks={ticks}, offset={offset}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

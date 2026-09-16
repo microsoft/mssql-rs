@@ -623,7 +623,20 @@ async fn drive_row_columns<R: TdsPacketReader + Send + Sync, W: RowWriter + Send
             }
         }
 
-        decode_or_decrypt_column(&decoder, reader, meta, decryptor, col, writer).await?;
+        // A packet-boundary continuation should not force the rest of a wide
+        // row through one asynchronous decoder future per resident column.
+        if !reader.buffered_slice().is_empty()
+            && let Some(consumed) =
+                decoder.try_decode_buffered_into(reader.buffered_slice(), meta, col, writer)?
+        {
+            reader.try_read_slice(consumed).ok_or_else(|| {
+                crate::error::Error::ProtocolError(
+                    "Buffered column bytes disappeared before consumption".to_string(),
+                )
+            })?;
+        } else {
+            decode_or_decrypt_column(&decoder, reader, meta, decryptor, col, writer).await?;
+        }
 
         if stop_here {
             return Ok(pause_after_column(col, metadata, bitmap, decryptor));
@@ -1398,6 +1411,8 @@ mod tests {
     struct TestByteReader {
         data: Vec<u8>,
         pos: usize,
+        buffered: bool,
+        async_scalar_reads: usize,
         /// When set, the next `read_bytes` fills only this many bytes and
         /// reports that count, modelling a reader that does not fully fill.
         short_read: Option<usize>,
@@ -1408,12 +1423,19 @@ mod tests {
             Self {
                 data,
                 pos: 0,
+                buffered: false,
+                async_scalar_reads: 0,
                 short_read: None,
             }
         }
 
         fn with_short_read(mut self, filled: usize) -> Self {
             self.short_read = Some(filled);
+            self
+        }
+
+        fn with_buffered_reads(mut self) -> Self {
+            self.buffered = true;
             self
         }
 
@@ -1430,6 +1452,22 @@ mod tests {
     }
 
     impl TdsPacketReader for TestByteReader {
+        fn buffered_slice(&self) -> &[u8] {
+            if self.buffered {
+                &self.data[self.pos..]
+            } else {
+                &[]
+            }
+        }
+
+        fn try_read_slice(&mut self, length: usize) -> Option<&[u8]> {
+            if self.buffered {
+                self.take(length).ok()
+            } else {
+                None
+            }
+        }
+
         async fn read_byte(&mut self) -> TdsResult<u8> {
             Ok(self.take(1)?[0])
         }
@@ -1443,6 +1481,7 @@ mod tests {
         }
 
         async fn read_int32(&mut self) -> TdsResult<i32> {
+            self.async_scalar_reads += 1;
             let raw = self.take(4)?;
             Ok(i32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]))
         }
@@ -1632,6 +1671,54 @@ mod tests {
             columns: vec![int4_metadata("c1"), int4_metadata("c2")],
             cek_table: vec![],
         })
+    }
+
+    #[tokio::test]
+    async fn row_continuation_decodes_buffered_columns_without_async_scalar_reads() {
+        use crate::datatypes::row_writer::DefaultRowWriter;
+
+        for buffered in [false, true] {
+            let mut reader = TestByteReader::new(
+                [42_i32, -7_i32, 99_i32]
+                    .into_iter()
+                    .flat_map(i32::to_le_bytes)
+                    .collect(),
+            );
+            if buffered {
+                reader = reader.with_buffered_reads();
+            }
+            let mut writer = DefaultRowWriter::new(2);
+            let state = RowPauseState {
+                next_column_index: 0,
+                metadata: two_int4_metadata(),
+                nbc_null_bitmap: None,
+                decryptor: None,
+            };
+            let RowReadResult::RowPaused(state) = resume_row_into_internal(
+                &mut reader,
+                state,
+                ColumnPolicy::DecodePrefix(1),
+                &mut writer,
+            )
+            .await
+            .unwrap() else {
+                panic!("expected prefix pause");
+            };
+            assert_eq!(state.next_column_index, 1);
+            assert_eq!(reader.pos, 4);
+            assert!(matches!(
+                resume_row_into_internal(&mut reader, state, ColumnPolicy::DecodeAll, &mut writer)
+                    .await
+                    .unwrap(),
+                RowReadResult::RowWritten
+            ));
+            assert_eq!(
+                writer.take_row(),
+                vec![ColumnValues::Int(42), ColumnValues::Int(-7)]
+            );
+            assert_eq!(reader.pos, 8);
+            assert_eq!(reader.async_scalar_reads, if buffered { 0 } else { 2 });
+        }
     }
 
     // The pause states below must borrow the ParserContext's metadata rather than

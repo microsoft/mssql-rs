@@ -143,6 +143,16 @@ but returning row N can now wait on row N+1's header arriving. See
 `release_busy_if_row_exhausted` in `src/api/exec_common.rs` for the full
 trade-off and why it was accepted as-is.
 
+## Bound fetch performance
+
+Bound fetches borrow their per-fetch descriptor snapshot rather than copying a
+binding for every cell. SQL type resolution is deferred until a binding requests
+`SQL_C_DEFAULT`, and complete inline rows need no PLP metadata snapshot.
+After a packet-boundary continuation, resident columns return to synchronous
+decoding; network waits retain the existing cancellation and timeout handling.
+Datetimeoffset conversion uses checked 64-bit arithmetic while preserving the
+out-of-range rejection of the wider calculation.
+
 ## Parameter array results
 
 Prepared parameter arrays can return rows from `SELECT`, `INSERT ... OUTPUT`,

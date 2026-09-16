@@ -1957,6 +1957,11 @@ impl TransportSslHandler for NetworkTransport {
 }
 
 impl TdsPacketReader for NetworkTransport {
+    #[inline]
+    fn buffered_slice(&self) -> &[u8] {
+        self.tds_read_buffer.get_buffered_slice()
+    }
+
     fn reset_reader(&mut self) {
         // Callers reset before starting a new message, so the buffer is
         // expected to be fully consumed. Log a violation instead of asserting:
@@ -4759,7 +4764,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn buffered_row_writer_keeps_partial_column_for_async_continuation() {
-        let expected = [0x1234_5678_i32, -42_i32];
+        let expected = [0x1234_5678_i32, -42_i32, 123_i32, -456_i32];
         let second = expected[1].to_le_bytes();
         let mut first_payload = vec![TokenType::Row as u8];
         first_payload.extend_from_slice(&expected[0].to_le_bytes());
@@ -4768,7 +4773,10 @@ pub(crate) mod tests {
         let mut first = TestPacketBuilder::new(PacketType::TabularResult);
         let mut second_packet = TestPacketBuilder::new(PacketType::TabularResult);
         let mut stream = first.continuation().append_bytes(&first_payload).build();
-        stream.extend_from_slice(&second_packet.append_bytes(&second[2..]).build());
+        let mut remaining = second[2..].to_vec();
+        remaining.extend(expected[2..].iter().flat_map(|value| value.to_le_bytes()));
+        remaining.push(TokenType::Done as u8);
+        stream.extend_from_slice(&second_packet.append_bytes(&remaining).build());
         let mut reader = create_network_transport_with_data(&stream);
         reader.read_tds_packet().await.unwrap();
 
@@ -4808,6 +4816,7 @@ pub(crate) mod tests {
                 .map(ColumnValues::Int)
                 .collect::<Vec<_>>()
         );
+        assert_eq!(reader.buffered_slice(), &[TokenType::Done as u8]);
     }
 
     #[tokio::test]
