@@ -1,40 +1,19 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 //
-// fork_safety_test  –  POSIX fork() safety of an ODBC environment that is still
-// live in the parent process.
-//
-// An HENV that has driven a connection owns a Tokio runtime and its worker
-// threads. fork() duplicates only the calling thread, so in the child those
-// workers do not exist while every lock they held at fork time is still
-// observed as locked. A driver call made in the child on that inherited HENV
-// then waits on a futex nothing will ever post, and the child deadlocks.
-//
-// Whether this is reachable depends on where the child's HENV comes from, which
-// is why the cases below separate the two:
-//
-//   * A child that allocates a fresh HENV builds a new runtime and is fine.
-//   * A child that connects on the HENV it inherited deadlocks.
-//
-// The second is the shape real callers have. mssql-python allocates one
-// process-wide HENV at import and every connection hangs off it, so any
-// fork()-based worker inherits it. That is not hypothetical: SQLAlchemy's
-// test/aaa_profiling/test_memusage.py wraps its cases in @profile_memory, which
-// runs each body in a `multiprocessing.get_context("fork")` child. Running that
-// file through mssql-python against this driver hangs; msodbcsql18 completes it
-// in 17s. msodbcsql18 passes every case here.
-//
-// Every driver call that can deadlock runs inside a forked, time-bounded
-// process, and the scenario process is reaped with a deadline, so a deadlock is
-// reported as a failure instead of hanging the suite.
-//
-// Tests that require a live SQL Server are gated by
-// ODBCTestConfig::HasConnection().
+// Regression coverage for #566 and SQLAlchemy's fork-based memory tests.
+// Fork outside application ODBC calls, while the ENV's Tokio worker is alive.
+// Driver calls run in bounded subprocesses so a regression fails, not hangs.
 
 #include "odbc_test_fixture.h"
 
+#include <atomic>
 #include <cstring>
+#include <chrono>
+#include <iostream>
 #include <string>
+#include <thread>
+#include <vector>
 
 #ifndef _WIN32
 #include <csignal>
@@ -67,6 +46,13 @@ enum class ChildAction {
     kNothing,        // control: never calls the driver
     kOwnEnv,         // allocates a fresh HENV of its own
     kInheritedEnv,   // connects on the HENV inherited from the parent
+    kCleanup,
+    kDeadConnection,
+    kConcurrentConnections,
+    kSecondFork,
+    kDataAtExecution,
+    kOpenCursor,
+    kTransaction,
 };
 
 // Reported by the scenario process through its exit status.
@@ -96,12 +82,12 @@ SQLHENV AllocEnv() {
 }
 
 // Run SELECT 1 on an already-connected HDBC.
-bool Query(SQLHDBC dbc) {
+bool Query(SQLHDBC dbc, const std::string& text = "SELECT 1") {
     SQLHSTMT stmt = SQL_NULL_HSTMT;
     if (!SQL_SUCCEEDED(SQLAllocHandle(SQL_HANDLE_STMT, dbc, &stmt))) {
         return false;
     }
-    SqlTString sql = ODBCTestUtils::ToSqlTStr("SELECT 1");
+    SqlTString sql = ODBCTestUtils::ToSqlTStr(text);
     SQLINTEGER value = 0;
     SQLLEN ind = 0;
     const bool ok =
@@ -110,6 +96,24 @@ bool Query(SQLHDBC dbc) {
         SQL_SUCCEEDED(SQLGetData(stmt, 1, SQL_C_SLONG, &value, 0, &ind)) && value == 1;
     SQLFreeHandle(SQL_HANDLE_STMT, stmt);
     return ok;
+}
+
+bool InheritedConnectionIsDead(SQLHDBC dbc) {
+    SQLUINTEGER dead = SQL_CD_FALSE;
+    if (!SQL_SUCCEEDED(SQLGetConnectAttr(dbc, SQL_ATTR_CONNECTION_DEAD, &dead,
+                                        sizeof(dead), nullptr)) || dead != SQL_CD_TRUE) {
+        return false;
+    }
+    SQLHSTMT stmt = SQL_NULL_HSTMT;
+    if (!SQL_SUCCEEDED(SQLAllocHandle(SQL_HANDLE_STMT, dbc, &stmt))) {
+        return false;
+    }
+    SqlTString sql = ODBCTestUtils::ToSqlTStr("SELECT 1");
+    const SQLRETURN rc = SQLExecDirect(stmt, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS);
+    const bool rejected = rc == SQL_ERROR &&
+        ODBCTestUtils::GetDiagState(SQL_HANDLE_STMT, stmt) == "08003";
+    SQLFreeHandle(SQL_HANDLE_STMT, stmt);
+    return rejected;
 }
 
 // Allocate an HDBC on |env| and connect it. Returns SQL_NULL_HDBC on failure.
@@ -135,11 +139,12 @@ SQLHDBC Connect(SQLHENV env) {
     return dbc;
 }
 
-void Disconnect(SQLHDBC dbc) {
+bool Disconnect(SQLHDBC dbc) {
     if (dbc != SQL_NULL_HDBC) {
-        SQLDisconnect(dbc);
-        SQLFreeHandle(SQL_HANDLE_DBC, dbc);
+        if (!SQL_SUCCEEDED(SQLDisconnect(dbc))) return false;
+        return SQL_SUCCEEDED(SQLFreeHandle(SQL_HANDLE_DBC, dbc));
     }
+    return true;
 }
 
 // Connect on |env|, run SELECT 1, and drop the connection. The HENV is left
@@ -150,14 +155,13 @@ bool ConnectAndQuery(SQLHENV env) {
         return false;
     }
     const bool ok = Query(dbc);
-    Disconnect(dbc);
-    return ok;
+    return Disconnect(dbc) && ok;
 }
 
 // Reap |pid|, giving up after |timeout_sec|. On expiry the process is killed
 // and reaped so no deadlocked child outlives the run, and false is returned.
 bool WaitFor(pid_t pid, int timeout_sec, int* status) {
-    const time_t deadline = ::time(nullptr) + timeout_sec;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeout_sec);
     for (;;) {
         const pid_t reaped = ::waitpid(pid, status, WNOHANG);
         if (reaped == pid) {
@@ -166,14 +170,14 @@ bool WaitFor(pid_t pid, int timeout_sec, int* status) {
         if (reaped < 0 && errno != EINTR) {
             break;
         }
-        if (::time(nullptr) >= deadline) {
+        if (std::chrono::steady_clock::now() >= deadline) {
             break;
         }
         timespec pause{0, 50 * 1000 * 1000};
         ::nanosleep(&pause, nullptr);
     }
     ::kill(pid, SIGKILL);
-    ::waitpid(pid, status, 0);
+    while (::waitpid(pid, status, 0) < 0 && errno == EINTR) {}
     return false;
 }
 
@@ -181,15 +185,45 @@ bool WaitFor(pid_t pid, int timeout_sec, int* status) {
 // parent's HENV. Runs as its own process so a deadlock anywhere in here is
 // bounded by the caller.
 [[noreturn]] void RunScenario(ChildAction action, bool check_parent_after) {
-    // Both the HENV and a connection on it are kept open across the fork. The
-    // connection is what pins the runtime: unixODBC unloads the driver once the
-    // last connection on it goes away, which would join the worker threads and
-    // leave the child nothing hazardous to inherit. Callers that hold a pool
-    // open, as mssql-python does, are in exactly this state.
+    // Keep a DBC open so unixODBC retains the driver's ENV/runtime at fork.
     SQLHENV env = AllocEnv();
     SQLHDBC dbc = Connect(env);
     if (dbc == SQL_NULL_HDBC || !Query(dbc)) {
         ::_exit(kWarmupFailed);
+    }
+    if (action == ChildAction::kTransaction &&
+        (!SQL_SUCCEEDED(SQLSetConnectAttr(dbc, SQL_ATTR_AUTOCOMMIT,
+            reinterpret_cast<SQLPOINTER>(SQL_AUTOCOMMIT_OFF), 0)) ||
+         !Query(dbc, "SET NOCOUNT ON; CREATE TABLE #fork_preserved(v int); "
+                     "INSERT INTO #fork_preserved VALUES (1); SELECT 1"))) {
+        ::_exit(kWarmupFailed);
+    }
+    SQLHSTMT dae_stmt = SQL_NULL_HSTMT;
+    SQLHSTMT open_stmt = SQL_NULL_HSTMT;
+    SQLLEN dae_length = SQL_DATA_AT_EXEC;
+    char dae_token = 0;
+    if (action == ChildAction::kDataAtExecution) {
+        SqlTString sql = ODBCTestUtils::ToSqlTStr("SELECT ?");
+        SQLPOINTER token = nullptr;
+        std::vector<char> chunk(20000, 'x');
+        if (!SQL_SUCCEEDED(SQLAllocHandle(SQL_HANDLE_STMT, dbc, &dae_stmt)) ||
+            !SQL_SUCCEEDED(SQLPrepare(dae_stmt, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS)) ||
+            !SQL_SUCCEEDED(SQLBindParameter(dae_stmt, 1, SQL_PARAM_INPUT, SQL_C_CHAR,
+                SQL_VARCHAR, 0, 0, &dae_token, 0, &dae_length)) ||
+            SQLExecute(dae_stmt) != SQL_NEED_DATA ||
+            SQLParamData(dae_stmt, &token) != SQL_NEED_DATA ||
+            !SQL_SUCCEEDED(SQLPutData(dae_stmt, chunk.data(), chunk.size()))) {
+            ::_exit(kWarmupFailed);
+        }
+    }
+    if (action == ChildAction::kOpenCursor) {
+        SqlTString sql = ODBCTestUtils::ToSqlTStr(
+            "SELECT TOP (2000) 1 FROM sys.all_objects a CROSS JOIN sys.all_objects b");
+        if (!SQL_SUCCEEDED(SQLAllocHandle(SQL_HANDLE_STMT, dbc, &open_stmt)) ||
+            !SQL_SUCCEEDED(SQLExecDirect(open_stmt, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS)) ||
+            !SQL_SUCCEEDED(SQLFetch(open_stmt))) {
+            ::_exit(kWarmupFailed);
+        }
     }
 
     const pid_t child = ::fork();
@@ -206,6 +240,63 @@ bool WaitFor(pid_t pid, int timeout_sec, int* status) {
                 ::_exit(ConnectAndQuery(AllocEnv()) ? 0 : 1);
             case ChildAction::kInheritedEnv:
                 ::_exit(ConnectAndQuery(env) ? 0 : 1);
+            case ChildAction::kTransaction:
+            case ChildAction::kCleanup: {
+                const bool ok = ConnectAndQuery(env) && Disconnect(dbc) &&
+                    SQL_SUCCEEDED(SQLFreeHandle(SQL_HANDLE_ENV, env));
+                ::_exit(ok ? 0 : 1);
+            }
+            case ChildAction::kDataAtExecution:
+                ::_exit(ConnectAndQuery(env) &&
+                    SQL_SUCCEEDED(SQLCancel(dae_stmt)) &&
+                    SQL_SUCCEEDED(SQLFreeHandle(SQL_HANDLE_STMT, dae_stmt)) &&
+                    Disconnect(dbc) &&
+                    SQL_SUCCEEDED(SQLFreeHandle(SQL_HANDLE_ENV, env)) ? 0 : 1);
+            case ChildAction::kOpenCursor:
+                ::_exit(SQL_SUCCEEDED(SQLFreeStmt(open_stmt, SQL_CLOSE)) &&
+                    SQL_SUCCEEDED(SQLFreeHandle(SQL_HANDLE_STMT, open_stmt)) &&
+                    Disconnect(dbc) && ConnectAndQuery(env) &&
+                    SQL_SUCCEEDED(SQLFreeHandle(SQL_HANDLE_ENV, env)) ? 0 : 1);
+            case ChildAction::kDeadConnection:
+                ::_exit(InheritedConnectionIsDead(dbc) && Disconnect(dbc) &&
+                    ConnectAndQuery(env) &&
+                    SQL_SUCCEEDED(SQLFreeHandle(SQL_HANDLE_ENV, env)) ? 0 : 1);
+            case ChildAction::kConcurrentConnections: {
+                // All threads enter the driver for the first time after fork.
+                std::vector<std::thread> threads;
+                std::atomic<int> ready{0};
+                std::atomic<bool> start{false};
+                int results[4] = {};
+                for (int i = 0; i < 4; ++i) {
+                    threads.emplace_back([&, i] {
+                        ++ready;
+                        while (!start.load()) std::this_thread::yield();
+                        results[i] = ConnectAndQuery(env) ? 1 : 0;
+                    });
+                }
+                while (ready.load() != 4) std::this_thread::yield();
+                start.store(true);
+                for (auto& thread : threads) thread.join();
+                for (int result : results) {
+                    if (result != 1) ::_exit(1);
+                }
+                ::_exit(0);
+            }
+            case ChildAction::kSecondFork: {
+                SQLHDBC child_dbc = Connect(env);
+                if (child_dbc == SQL_NULL_HDBC || !Query(child_dbc)) ::_exit(1);
+                const pid_t grandchild = ::fork();
+                if (grandchild < 0) ::_exit(1);
+                if (grandchild == 0) {
+                    ::alarm(kChildBudgetSec / 2);
+                    ::_exit(ConnectAndQuery(env) ? 0 : 1);
+                }
+                int nested_status = 0;
+                const bool ok = WaitFor(grandchild, kChildBudgetSec / 2 + 2, &nested_status) &&
+                    WIFEXITED(nested_status) && WEXITSTATUS(nested_status) == 0 &&
+                    Query(child_dbc) && Disconnect(child_dbc);
+                ::_exit(ok ? 0 : 1);
+            }
         }
         ::_exit(1);
     }
@@ -217,15 +308,32 @@ bool WaitFor(pid_t pid, int timeout_sec, int* status) {
     if (WIFSIGNALED(status)) {
         ::_exit(WTERMSIG(status) == SIGALRM ? kChildDeadlocked : kChildFailed);
     }
-    if (WEXITSTATUS(status) != 0) {
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
         ::_exit(kChildFailed);
+    }
+    if (dae_stmt != SQL_NULL_HSTMT &&
+        (!SQL_SUCCEEDED(SQLCancel(dae_stmt)) ||
+         !SQL_SUCCEEDED(SQLFreeHandle(SQL_HANDLE_STMT, dae_stmt)))) {
+        ::_exit(kParentAfterForkFailed);
+    }
+    if (open_stmt != SQL_NULL_HSTMT &&
+        (!SQL_SUCCEEDED(SQLFetch(open_stmt)) ||
+         !SQL_SUCCEEDED(SQLFreeStmt(open_stmt, SQL_CLOSE)) ||
+         !SQL_SUCCEEDED(SQLFreeHandle(SQL_HANDLE_STMT, open_stmt)))) {
+        ::_exit(kParentAfterForkFailed);
     }
 
     if (check_parent_after && (!Query(dbc) || !ConnectAndQuery(env))) {
         ::_exit(kParentAfterForkFailed);
     }
-    Disconnect(dbc);
-    SQLFreeHandle(SQL_HANDLE_ENV, env);
+    if (action == ChildAction::kTransaction &&
+        (!Query(dbc, "SELECT COUNT(*) FROM #fork_preserved") ||
+         !SQL_SUCCEEDED(SQLEndTran(SQL_HANDLE_DBC, dbc, SQL_ROLLBACK)))) {
+        ::_exit(kParentAfterForkFailed);
+    }
+    if (!Disconnect(dbc) || !SQL_SUCCEEDED(SQLFreeHandle(SQL_HANDLE_ENV, env))) {
+        ::_exit(kParentAfterForkFailed);
+    }
     ::_exit(kScenarioOk);
 }
 
@@ -262,40 +370,65 @@ protected:
         const bool reaped = WaitFor(pid, kScenarioBudgetSec, &status);
         ASSERT_TRUE(reaped) << "scenario did not finish within " << kScenarioBudgetSec
                             << "s; the driver is deadlocked";
-        ASSERT_FALSE(WIFSIGNALED(status))
-            << "scenario was killed by signal " << WTERMSIG(status);
+        ASSERT_TRUE(WIFEXITED(status)) << "scenario did not exit normally: " << status;
 
         const int code = WEXITSTATUS(status);
         EXPECT_EQ(kScenarioOk, code) << DescribeExit(code);
     }
 };
 
-// Control: forking is harmless as long as the child leaves the driver alone.
-// Establishes that the fixture, the connection settings, and fork() itself are
-// not the cause of the failures below.
 TEST_F(ForkSafetyTest, ForkWithChildNotUsingDriverIsSafe) {
     ExpectScenarioSucceeds(ChildAction::kNothing, /*check_parent_after=*/true);
 }
 
-// Boundary: a child that builds its own HENV gets a fresh runtime and works.
-// Pinning this down separates "fork() plus threads is inherently undefined"
-// from the actual defect, which is specific to the inherited handle.
 TEST_F(ForkSafetyTest, ChildCanConnectOnItsOwnEnvAfterFork) {
     ExpectScenarioSucceeds(ChildAction::kOwnEnv, /*check_parent_after=*/false);
 }
 
-// The reported bug: connecting on the inherited HENV never returns in the child.
 TEST_F(ForkSafetyTest, ChildCanConnectOnInheritedEnvAfterFork) {
     ExpectScenarioSucceeds(ChildAction::kInheritedEnv, /*check_parent_after=*/false);
 }
 
-// The damage is not confined to the child. Once one has hung and been reaped,
-// the forking process can no longer use the HENV it kept open either, which is
-// what turns a single profiled test case into a hung test run. Today this stops
-// at the same child deadlock as the case above; it starts covering the parent
-// once that is fixed.
 TEST_F(ForkSafetyTest, ParentRemainsUsableAfterChildUsesInheritedEnv) {
     ExpectScenarioSucceeds(ChildAction::kInheritedEnv, /*check_parent_after=*/true);
+}
+
+TEST_F(ForkSafetyTest, ChildCanFreeInheritedHandlesWithoutAffectingParent) {
+    // msodbcsql 18.05.0001: the parent's next query receives SIGPIPE.
+    SKIP_IF_COMPARING_MSODBCSQL();
+    ExpectScenarioSucceeds(ChildAction::kCleanup, true);
+}
+
+TEST_F(ForkSafetyTest, InheritedConnectionIsDeadAndRejectsQueries) {
+    // msodbcsql 18.05.0001 does not invalidate the inherited connection.
+    SKIP_IF_COMPARING_MSODBCSQL();
+    ExpectScenarioSucceeds(ChildAction::kDeadConnection, true);
+}
+
+TEST_F(ForkSafetyTest, ConcurrentFirstChildCallsShareRecoveredEnvironment) {
+    ExpectScenarioSucceeds(ChildAction::kConcurrentConnections, true);
+}
+
+TEST_F(ForkSafetyTest, RecoveryWorksAcrossTwoForkGenerations) {
+    ExpectScenarioSucceeds(ChildAction::kSecondFork, true);
+}
+
+TEST_F(ForkSafetyTest, ChildDiscardsInheritedDataAtExecutionWithoutAffectingParent) {
+    // msodbcsql 18.05.0001: child cleanup leaves the parent's query failing.
+    SKIP_IF_COMPARING_MSODBCSQL();
+    ExpectScenarioSucceeds(ChildAction::kDataAtExecution, true);
+}
+
+TEST_F(ForkSafetyTest, ChildClosesInheritedCursorLocally) {
+    // msodbcsql 18.05.0001: the parent's fetch/query fails after child close.
+    SKIP_IF_COMPARING_MSODBCSQL();
+    ExpectScenarioSucceeds(ChildAction::kOpenCursor, true);
+}
+
+TEST_F(ForkSafetyTest, ChildCleanupPreservesParentTransaction) {
+    // msodbcsql 18.05.0001 fails the child-side inherited-transaction cleanup.
+    SKIP_IF_COMPARING_MSODBCSQL();
+    ExpectScenarioSucceeds(ChildAction::kTransaction, true);
 }
 
 }  // namespace

@@ -20,6 +20,9 @@ pub(crate) enum ConnectionState {
     Connecting,
     /// Connected to a data source (C4/C5/C6 in ODBC state table).
     Connected,
+    /// Inherited across fork; only local cleanup may use this connection.
+    #[cfg(unix)]
+    Forked,
 }
 
 /// Connection handle
