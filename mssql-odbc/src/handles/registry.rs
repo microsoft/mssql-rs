@@ -7,7 +7,7 @@ use std::fmt;
 use std::hash::{BuildHasherDefault, Hasher};
 use std::num::NonZeroUsize;
 use std::ops::Deref;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, LockResult, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use super::HandleType;
@@ -94,6 +94,21 @@ impl Hasher for IdHasher {
 }
 
 type IdBuildHasher = BuildHasherDefault<IdHasher>;
+
+#[cfg(test)]
+const GEN_BITS: usize = 20;
+#[cfg(test)]
+const PROBE_SLOT_COUNT: usize = 4096;
+
+#[cfg(test)]
+#[repr(align(128))]
+struct ProbeSlot {
+    generation: AtomicU64,
+    value: RwLock<Option<(HandleType, Arc<dyn Any + Send + Sync>, Arc<HandleActivity>)>>,
+}
+
+#[cfg(test)]
+static PROBE_SLOTS: OnceLock<Box<[ProbeSlot]>> = OnceLock::new();
 
 const OPEN: u8 = 0;
 const CLOSING: u8 = 1;
@@ -458,6 +473,86 @@ impl HandleRegistry {
             value,
             lease: ActivityLease { activity },
         })
+    }
+
+    /// Attribution probe: registry lookup with no ancestor reservation.
+    #[cfg(test)]
+    pub(crate) fn probe_lookup<T: Any + Send + Sync>(
+        &self,
+        id: HandleId,
+        expected: HandleType,
+    ) -> Result<Arc<T>, RegistryError> {
+        let state = self.read();
+        let entry = state.entries.get(&id).ok_or(RegistryError::NotFound)?;
+        if entry.kind != expected {
+            return Err(RegistryError::WrongType);
+        }
+        entry.activity.check_open()?;
+        let value = Arc::clone(&entry.value)
+            .downcast::<T>()
+            .map_err(|_| RegistryError::WrongType)?;
+        drop(state);
+        Ok(value)
+    }
+
+    /// Attribution probe: ancestor reservation with no registry lookup.
+    #[cfg(test)]
+    pub(crate) fn probe_reserve(activity: &Arc<HandleActivity>) {
+        for ancestor in activity.reserved() {
+            ancestor.active.fetch_add(1, Ordering::AcqRel);
+        }
+        for ancestor in activity.reserved() {
+            ancestor.active.fetch_sub(1, Ordering::Release);
+        }
+    }
+
+    /// Floor probe: what a slot-indexed table costs instead of a
+    /// process-global locked map. Index+generation decode, per-slot lock.
+    #[cfg(test)]
+    pub(crate) fn probe_slot_lookup<T: Any + Send + Sync>(
+        packed: usize,
+        expected: HandleType,
+    ) -> Result<Arc<T>, RegistryError> {
+        let index = packed >> GEN_BITS;
+        let generation = (packed & ((1 << GEN_BITS) - 1)) as u64;
+        let slots = PROBE_SLOTS.get().ok_or(RegistryError::NotFound)?;
+        let slot = slots.get(index).ok_or(RegistryError::NotFound)?;
+        if slot.generation.load(Ordering::Acquire) != generation {
+            return Err(RegistryError::NotFound);
+        }
+        let guard = slot.value.read().unwrap_or_else(|e| e.into_inner());
+        let (kind, value, activity) = guard.as_ref().ok_or(RegistryError::NotFound)?;
+        if *kind != expected {
+            return Err(RegistryError::WrongType);
+        }
+        activity.check_open()?;
+        let value = Arc::clone(value)
+            .downcast::<T>()
+            .map_err(|_| RegistryError::WrongType)?;
+        drop(guard);
+        Ok(value)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn probe_slot_install<T: Any + Send + Sync>(
+        index: usize,
+        generation: u64,
+        kind: HandleType,
+        value: Arc<T>,
+        activity: Arc<HandleActivity>,
+    ) -> usize {
+        let slots = PROBE_SLOTS.get_or_init(|| {
+            (0..PROBE_SLOT_COUNT)
+                .map(|_| ProbeSlot {
+                    generation: AtomicU64::new(u64::MAX),
+                    value: RwLock::new(None),
+                })
+                .collect()
+        });
+        let slot = &slots[index];
+        *slot.value.write().unwrap() = Some((kind, value, activity));
+        slot.generation.store(generation, Ordering::Release);
+        (index << GEN_BITS) | generation as usize
     }
 
     #[cfg(test)]
