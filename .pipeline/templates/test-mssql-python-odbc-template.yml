@@ -1,11 +1,8 @@
 # Run the microsoft/mssql-python test suite against the Rust mssql-odbc driver.
 #
-# This is the driver-swap counterpart to test-mssql-python-template.yml. That
-# template validates fresh mssql-py-core bindings while keeping the shipped
-# Microsoft ODBC Driver 18; this one keeps mssql-python exactly as released
+# This keeps mssql-python's Rust runtime unchanged
 # (mssql_py_core from NuGet, pybind bindings built from its own source) and
 # swaps only the bundled libmsodbcsql binary for the one mssql-odbc produces.
-# The delta between the two jobs is therefore attributable to our driver.
 #
 # mssql-python source is never modified - the swap overwrites one packaged
 # binary, which is what its own pipeline effectively does when it uninstalls the
