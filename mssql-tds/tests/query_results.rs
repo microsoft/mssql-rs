@@ -660,6 +660,86 @@ mod query_result_reads {
         run_query_and_check_results(&mut connection, "SELECT 1".to_string(), &expected).await;
     }
 
+    /// With deferral on, a statement that fails mid-batch no longer hides the
+    /// result sets after it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deferred_errors_expose_result_sets_after_the_failing_statement() {
+        let mut connection = begin_connection(&build_tcp_datasource()).await;
+        connection.set_defer_batch_errors(true);
+
+        connection
+            .execute(
+                "SELECT 1 AS a; RAISERROR('boom', 16, 1); SELECT 2 AS b;".to_string(),
+                (),
+            )
+            .await
+            .unwrap();
+
+        let mut values = Vec::new();
+        loop {
+            if connection.on_rows() {
+                while let Some(row) = connection.next_row().await.unwrap() {
+                    if let ColumnValues::Int(v) = row[0] {
+                        values.push(v);
+                    }
+                }
+            }
+            if !connection.advance_to_rows().await.unwrap() {
+                break;
+            }
+        }
+        connection.close_query().await.unwrap();
+
+        assert_eq!(
+            values,
+            vec![1, 2],
+            "both result sets should be reachable across the error"
+        );
+
+        let errors = connection.take_pending_errors();
+        assert_eq!(errors.len(), 1, "the error should still be reported");
+        assert!(errors[0].message.contains("boom"), "got {:?}", errors[0]);
+
+        // The connection is still usable afterwards.
+        let expected = [ExpectedQueryResultType::Result(1)];
+        run_query_and_check_results(&mut connection, "SELECT 1".to_string(), &expected).await;
+    }
+
+    /// Deferral is opt-in: without it the batch still ends at the first error.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn batch_errors_still_end_the_batch_by_default() {
+        let mut connection = begin_connection(&build_tcp_datasource()).await;
+
+        connection
+            .execute(
+                "SELECT 1 AS a; RAISERROR('boom', 16, 1); SELECT 2 AS b;".to_string(),
+                (),
+            )
+            .await
+            .unwrap();
+
+        let mut hit_error = false;
+        loop {
+            if connection.on_rows() {
+                while let Ok(Some(_)) = connection.next_row().await {}
+            }
+            match connection.advance_to_rows().await {
+                Ok(true) => continue,
+                Ok(false) => break,
+                Err(SqlServerError { .. }) => {
+                    hit_error = true;
+                    break;
+                }
+                Err(e) => panic!("Expected SqlServerError, got: {e:?}"),
+            }
+        }
+        assert!(hit_error, "the default should surface the error as Err");
+        assert!(
+            connection.take_pending_errors().is_empty(),
+            "nothing should be deferred when the mode is off"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_error_within_batch() {
         let mut connection = begin_connection(&build_tcp_datasource()).await;

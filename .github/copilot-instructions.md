@@ -8,7 +8,7 @@ Rust implementation of the TDS (Tabular Data Stream) protocol for SQL Server. Ca
 |---|---|---|
 | `mssql-tds` | Core TDS protocol library | 2024 |
 | `mssql-js` | Node.js bindings (NAPI-RS) | 2024 |
-| `mssql-tds-cli` | Interactive CLI client | 2024 |
+| `mssql-tds-cli` | `sqlcmd` — ODBC and go-sqlcmd compatible CLI | 2024 |
 | `mssql-mock-tds` | Mock TDS server for testing | 2024 |
 | `mssql-py-core` | Python bindings (PyO3/maturin) — **excluded from workspace** | 2021 |
 | `mssql-odbc` | ODBC driver (msodbcsql18) | 2026 |

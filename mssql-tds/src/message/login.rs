@@ -969,9 +969,12 @@ impl<'a, 'n, 'context> Serializer<'a, 'n, 'context> {
                         .await?;
                 }
                 LoginDeferredPayload::ServerName => {
-                    let server_name = self.model.transport_context.get_login_server_name();
-                    // Use get_login_server_name() to get DataSource format (host,port)
-                    // This matches SqlClient behavior for redirected connections
+                    // Same accessor as write_server_name: the length written
+                    // there and this payload must agree.
+                    let server_name = self
+                        .model
+                        .user_input
+                        .login_server_name(self.model.transport_context);
                     info!("Login Server name: {}", server_name);
                     self.payload_writer
                         .write_string_unicode_async(server_name.as_str())
@@ -1117,14 +1120,17 @@ impl<'a, 'n, 'context> Serializer<'a, 'n, 'context> {
     }
 
     /// Writes the value of the target sql server to the login packet.
-    /// Uses get_login_server_name() to get DataSource format (host,port) for TCP connections.
+    ///
+    /// Defaults to the dialled address in DataSource format (`host,port`),
+    /// which matches SqlClient for redirected connections; an explicit
+    /// `login_server_name` replaces it. The length written here and the payload
+    /// written later must agree, so both go through the same accessor.
     async fn write_server_name(&mut self) -> TdsResult<()> {
-        if self
-            .write_metadata(utf16_code_units(
-                &self.model.transport_context.get_login_server_name(),
-            )?)
-            .await?
-        {
+        let server_name = self
+            .model
+            .user_input
+            .login_server_name(self.model.transport_context);
+        if self.write_metadata(utf16_code_units(&server_name)?).await? {
             self.deferred_actions_indicator
                 .push(LoginDeferredPayload::ServerName);
         }

@@ -57,12 +57,6 @@ mod connectivity {
             ..Default::default()
         };
         let token_response = match auth_method {
-            TdsAuthenticationMethod::Password => todo!(),
-            TdsAuthenticationMethod::SSPI => todo!(),
-            TdsAuthenticationMethod::ActiveDirectoryPassword => todo!(),
-            TdsAuthenticationMethod::ActiveDirectoryInteractive => todo!(),
-            TdsAuthenticationMethod::ActiveDirectoryDeviceCodeFlow => todo!(),
-            TdsAuthenticationMethod::ActiveDirectoryServicePrincipal => todo!(),
             TdsAuthenticationMethod::ActiveDirectoryManagedIdentity => {
                 let options = ManagedIdentityCredentialOptions {
                     client_options,
@@ -75,10 +69,9 @@ mod connectivity {
                 let credential = DeveloperToolsCredential::new(None);
                 credential.unwrap().get_token(scopes, None).await
             }
-            TdsAuthenticationMethod::ActiveDirectoryMSI => todo!(),
-            TdsAuthenticationMethod::ActiveDirectoryWorkloadIdentity => todo!(),
-            TdsAuthenticationMethod::ActiveDirectoryIntegrated => todo!(),
-            TdsAuthenticationMethod::AccessToken => todo!(),
+            // This fixture only ever runs with the two methods above; the rest
+            // are listed here only so the compiler is satisfied.
+            other => unimplemented!("no test token factory for {other:?}"),
         };
 
         let secret = token_response.as_ref().unwrap().token.secret();
