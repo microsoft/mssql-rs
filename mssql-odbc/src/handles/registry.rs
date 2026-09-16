@@ -63,6 +63,34 @@ impl fmt::Display for RegistryError {
 
 impl std::error::Error for RegistryError {}
 
+
+/// Handle IDs are dense integers, so the default SipHash is pure overhead.
+/// Fibonacci multiply-shift, the same mix `rustc-hash` uses.
+#[derive(Default)]
+pub(crate) struct IdHasher(u64);
+
+impl std::hash::Hasher for IdHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.write_u64(u64::from(b));
+        }
+    }
+
+    fn write_usize(&mut self, value: usize) {
+        self.write_u64(value as u64);
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        self.0 = (self.0 ^ value).wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(26);
+    }
+}
+
+type IdBuildHasher = std::hash::BuildHasherDefault<IdHasher>;
+
 const OPEN: u8 = 0;
 const CLOSING: u8 = 1;
 const RETIRED: u8 = 2;
@@ -90,6 +118,15 @@ impl HandleActivity {
 
     fn ancestors(&self) -> impl Iterator<Item = &Self> {
         std::iter::successors(Some(self), |activity| activity.parent.as_deref())
+    }
+
+    /// Ancestors whose in-flight counter this call reserves. The root ENV is
+    /// excluded unless it is the target: `SQLFreeHandle(ENV)` is DM-ordered
+    /// after every child and already debug_asserted, so a process-shared
+    /// counter on every call buys no safety the Arc parents do not give.
+    fn reserved(&self) -> impl Iterator<Item = &Self> {
+        self.ancestors()
+            .filter(|a| a.parent.is_some() || std::ptr::eq(*a, self))
     }
 
     fn root(&self) -> &Self {
@@ -174,7 +211,7 @@ impl<T> Deref for HandleRef<T> {
 
 impl Drop for ActivityLease {
     fn drop(&mut self) {
-        for activity in self.activity.ancestors() {
+        for activity in self.activity.reserved() {
             activity.active.fetch_sub(1, Ordering::Release);
         }
     }
@@ -204,7 +241,7 @@ struct RegistryEntry {
 }
 
 struct RegistryState {
-    entries: HashMap<HandleId, RegistryEntry>,
+    entries: HashMap<HandleId, RegistryEntry, IdBuildHasher>,
     next_id: NonZeroUsize,
     #[cfg(test)]
     id_limit: NonZeroUsize,
@@ -279,7 +316,7 @@ impl HandleRegistry {
     pub(crate) fn new() -> Self {
         Self {
             state: RwLock::new(RegistryState {
-                entries: HashMap::new(),
+                entries: HashMap::default(),
                 next_id: NonZeroUsize::MIN,
                 #[cfg(test)]
                 id_limit: NonZeroUsize::MAX,
@@ -397,7 +434,7 @@ impl HandleRegistry {
         let activity = Arc::clone(&entry.activity);
         // Readers may reserve the same ancestors concurrently. Close and
         // retirement take the write lock and cannot observe partial reservations.
-        for (reserved, ancestor) in activity.ancestors().enumerate() {
+        for (reserved, ancestor) in activity.reserved().enumerate() {
             if ancestor
                 .active
                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
@@ -405,7 +442,7 @@ impl HandleRegistry {
                 })
                 .is_err()
             {
-                for previous in activity.ancestors().take(reserved) {
+                for previous in activity.reserved().take(reserved) {
                     previous.active.fetch_sub(1, Ordering::Release);
                 }
                 drop(state);
@@ -419,6 +456,37 @@ impl HandleRegistry {
             value,
             lease: ActivityLease { activity },
         })
+    }
+
+    /// Attribution probe: registry lookup with no ancestor reservation.
+    #[cfg(test)]
+    pub(crate) fn probe_lookup<T: Any + Send + Sync>(
+        &self,
+        id: HandleId,
+        expected: HandleType,
+    ) -> Result<Arc<T>, RegistryError> {
+        let state = self.read();
+        let entry = state.entries.get(&id).ok_or(RegistryError::NotFound)?;
+        if entry.kind != expected {
+            return Err(RegistryError::WrongType);
+        }
+        entry.activity.check_open()?;
+        let value = Arc::clone(&entry.value)
+            .downcast::<T>()
+            .map_err(|_| RegistryError::WrongType)?;
+        drop(state);
+        Ok(value)
+    }
+
+    /// Attribution probe: ancestor reservation with no registry lookup.
+    #[cfg(test)]
+    pub(crate) fn probe_reserve(activity: &Arc<HandleActivity>) {
+        for ancestor in activity.ancestors() {
+            ancestor.active.fetch_add(1, Ordering::AcqRel);
+        }
+        for ancestor in activity.ancestors() {
+            ancestor.active.fetch_sub(1, Ordering::Release);
+        }
     }
 
     #[cfg(test)]

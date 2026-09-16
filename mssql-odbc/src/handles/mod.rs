@@ -162,6 +162,16 @@ pub(crate) fn live_env_count() -> usize {
 }
 
 #[cfg(test)]
+pub(crate) fn probe_lookup<T: Handle>(raw: SqlHandle) -> Result<Arc<T>, RegistryError> {
+    HANDLES.probe_lookup(HandleId::from_raw(raw)?, T::TYPE)
+}
+
+#[cfg(test)]
+pub(crate) fn probe_reserve(activity: &Arc<HandleActivity>) {
+    registry::HandleRegistry::probe_reserve(activity);
+}
+
+#[cfg(test)]
 pub(crate) fn is_live(raw: SqlHandle) -> bool {
     HandleId::from_raw(raw)
         .and_then(|id| HANDLES.kind(id))

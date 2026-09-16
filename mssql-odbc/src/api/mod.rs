@@ -39,6 +39,8 @@ mod num_params;
 mod num_result_cols;
 pub(crate) mod odbc_types;
 pub(crate) mod output_params;
+#[cfg(test)]
+mod perf_probe;
 mod param_data;
 mod prepare;
 mod put_data;
