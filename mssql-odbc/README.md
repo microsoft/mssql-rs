@@ -157,33 +157,38 @@ arrays still complete during `SQLExecute` and report their aggregate row count.
 
 ## Handle and binding lifetimes
 
-Driver handles are opaque, pointer-sized IDs, not allocation addresses.
+Driver handles are opaque, pointer-sized slot/generation IDs, not allocation addresses.
 Typed registry acquisition returns an owned guard that keeps the handle and
 its parents alive through the call. Free retires the ID; storage is released
 after its remaining owners finish. A statement's four implicit descriptor IDs
 retire with the statement, even if its allocation is still retained.
 
-Registry lookups share read access. Allocation, close admission, and retirement
-take exclusive registry access; concurrent acquisitions reserve ancestor activity
-counts with checked atomic updates and roll back earlier reservations on failure.
-Handle-state locks and payload destruction remain outside the registry lock.
+Lookup indexes a segmented table and checks generation and type under the slot's
+read lock. Slots are aligned to 128 bytes to avoid false sharing. Directory pages
+are published once and remain stable for the registry's lifetime; metadata grows
+with the slot high-water mark, not the number of historical allocations.
+Only allocation and retirement take the free-list mutex. Admission and active-call
+count share one atomic word, so close and reservation remain indivisible even for
+calls on different slots. Failed reservations roll back their completed prefix.
+Payload destruction and handle-state locks remain outside registry/slot locks.
 Only calls targeting ENV reserve its activity counter; ENV free remains subject
 to the DM's child-before-parent ordering contract. Descendants still check ENV
 admission and retain its storage/runtime through owning references. Connection
 and statement close still reject executing dependent calls. A caller violating
 ENV free ordering may retire the ENV and invalidate later child calls rather
-than receive a busy error in release builds. The registry uses an integer hasher
-for its allocator-issued keys.
+than receive a busy error in release builds.
 
-Allocation cycles through the full nonzero pointer-sized namespace and skips
-IDs that are still live. There is no cumulative allocation budget: retiring
-handles releases capacity, including after the cursor wraps. Exhausting the
-currently available IDs or memory is an allocation error, not a permanent
-process-lifetime failure.
+Retired slots are reused with an advanced generation, wrapping to one rather than
+permanently exhausting the slot. On 64-bit targets the ID has a 32-bit index and
+32-bit generation; on 32-bit targets it has a 20-bit index and 12-bit generation.
+Live-slot capacity and memory are finite, but there is no cumulative allocation
+budget. Retirement releases capacity even after generation wrap. Two bits of the
+separate activity word encode admission; its remaining bits bound concurrent calls,
+not historical calls.
 
 Applications must stop using a handle after its final release, including
 statement/descriptor cleanup by `SQLDisconnect`. A retired value is rejected
-until it is reassigned, but no fixed-width handle scheme can distinguish an
+until its slot/generation value is reassigned, but no fixed-width handle scheme can distinguish an
 arbitrarily old copy from a new handle after value reuse. The driver preserves
 owned operations and internal identities independently of these public values;
 it does not promise perpetual rejection of post-lifetime handle copies.

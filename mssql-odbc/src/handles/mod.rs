@@ -394,8 +394,6 @@ mod tests {
         );
 
         HANDLES.force_wrap_for_test();
-        let last = h.alloc_explicit_desc();
-        assert_eq!(last.addr(), usize::MAX);
         let recycled = h.alloc_explicit_desc();
         assert_eq!(recycled, old_id);
         let new = handle_from_raw::<DescHandle>(recycled).unwrap().into_arc();

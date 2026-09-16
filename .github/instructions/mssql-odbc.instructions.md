@@ -509,7 +509,7 @@ Rules of thumb:
   conversion.
 - Handle identity, type, and lifecycle admission are always checked by the
   registry, including release builds. IDs are never allocation pointers.
-- Public IDs may be recycled after retirement when their pointer-sized cursor
+- Public IDs may be recycled after retirement when their slot generation
   wraps; no lifetime allocation budget is permitted. Do not use their numeric
   values as enduring internal identity: cached prepared bindings retain
   descriptor identity markers independently of public ID reuse.
@@ -613,10 +613,14 @@ Driver Manager (DM) provides serialization guarantees that the driver relies on
   neither `live_type` nor a raw cast is a valid lifetime check. Registry
   acquisition never locks a handle's state. Never acquire state locks,
   perform I/O, or destroy extracted payloads while holding the registry lock.
-- Registry lookup uses read access; allocation, close, and retirement require
-  write access. Readers reserve ancestor activity with checked atomic updates
-  and roll back preceding reservations on failure. A separate overflow preflight
-  followed by unchecked increments is not safe with concurrent readers.
+- Registry lookup checks generation and type under the individual slot's read
+  lock, never before locking. Segmented pages stay stable for the registry's
+  lifetime; slots are cache-line isolated. Allocation/retirement serialize the
+  free list, but lookup and close do not take that mutex.
+  Admission and count share one atomic word so a cross-slot parent close cannot
+  pass between a check and reservation. Readers reserve with checked atomic
+  updates and roll back preceding reservations on failure. Do not split the
+  admission check from its count update or restore unchecked increments.
   Only direct ENV calls reserve the root counter: ENV free is DM-ordered after
   child cleanup. Descendants must still check ENV admission and retain its
   storage/runtime; keep DBC/STMT reservations through final payload destruction.
