@@ -22,7 +22,8 @@ use crate::api::fetch_scroll::element_stride;
 use crate::api::odbc_types::SqlWChar;
 use crate::api::type_rules::{canonical_c_type, is_valid_c_type, resolve_default_c_type};
 use crate::api::util::{copy_with_nul, write_if_some};
-use crate::error::{free_errors, post_sql_error};
+use crate::error::post_sql_error;
+use crate::handles::bindings::BindingError;
 use crate::handles::stmt::{ActivePlpStream, STMT_STATE_CURSOR_OPEN, StmtState};
 use crate::handles::{HandleType, OdbcVersion, StmtHandle, get_handle};
 use mssql_tds::connection::tds_client::{CursorColumn, CursorPoll, PlpChunk};
@@ -143,35 +144,28 @@ fn sql_get_data_safe(
         buffer_length >= 0,
         "SQLGetData: DM should reject negative buffer_length (HY090)"
     );
-    let _result_use = match super::close_cursor::claim_result_use(stmt) {
-        Ok(guard) => guard,
-        Err(rc) => return rc,
-    };
-
     // The declared ODBC version selects the SQL_C_DEFAULT table, so it is only
-    // read for a defaulted retrieval — and before the STMT lock, to preserve
-    // parent-before-child lock ordering (the same order as `bind_param.rs`,
-    // `catalog.rs`, and `fetch_scroll.rs`). Gating costs nothing here, unlike
-    // on the fetch path: the placeholder arrives as a scalar argument rather
-    // than having to be read out of the bindings first, so there is no
-    // lock-order inversion to avoid.
+    // read for a defaulted retrieval, before admission retains the STMT lock.
+    // Defer an ENV error until admission has cleared diagnostics and checked
+    // for conflicting use, preserving HY010 precedence.
     let default_odbc_version = if target_type == SQL_C_DEFAULT {
         let env = stmt.parent_dbc().parent_env();
-        let Ok(env_state) = env.inner.lock() else {
-            error!("SQLGetData: env mutex poisoned");
-            return SQL_ERROR;
-        };
-        Some(env_state.odbc_version)
+        env.inner
+            .lock()
+            .map(|state| Some(state.odbc_version))
+            .map_err(|_| BindingError::Poisoned)
     } else {
-        None
+        Ok(None)
     };
 
-    let Ok(mut stmt_state) = stmt.inner.lock() else {
-        error!("SQLGetData: stmt mutex poisoned");
-        return SQL_ERROR;
+    let (_result_use, mut stmt_state) = match super::close_cursor::claim_result_use_locked(stmt) {
+        Ok(claim) => claim,
+        Err(rc) => return rc,
     };
-
-    free_errors(&mut stmt_state);
+    let default_odbc_version = match default_odbc_version {
+        Ok(version) => version,
+        Err(error) => return error.post(&mut stmt_state),
+    };
 
     if !stmt_state.has_state(STMT_STATE_CURSOR_OPEN) {
         post_diag(&mut stmt_state, ERR_INVALID_CURSOR_STATE);
@@ -5609,6 +5603,72 @@ mod tests {
         assert_eq!(ret, SQL_SUCCESS);
         assert_eq!(out, -2_000_000);
         assert_eq!(ind, std::mem::size_of::<i32>() as SqlLen);
+    }
+
+    #[test]
+    fn get_data_env_poison_only_affects_default_targets_after_admission() {
+        for target in [SQL_C_DEFAULT, SQL_C_SLONG] {
+            for conflicting_use in [false, true] {
+                let h = TestHandles::with_env_dbc_stmt();
+                stmt_with_buffered_values(&h, vec![ColumnValues::Int(42), ColumnValues::Int(43)]);
+                let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+                post_diag(
+                    &mut stmt.inner.lock().unwrap(),
+                    ERR_INVALID_DESCRIPTOR_INDEX,
+                );
+                let existing_use = conflicting_use.then(|| {
+                    let gate = stmt.parent_dbc().inner.lock().unwrap();
+                    stmt.row_binding_use.acquire(&gate).unwrap()
+                });
+                std::thread::scope(|scope| {
+                    assert!(
+                        scope
+                            .spawn(|| {
+                                let _state = stmt.parent_dbc().parent_env().inner.lock().unwrap();
+                                panic!("poison ENV before SQLGetData");
+                            })
+                            .join()
+                            .is_err()
+                    );
+                });
+
+                let mut value = -1_i32;
+                let mut indicator = -1;
+                let rc = unsafe {
+                    sql_get_data(
+                        h.stmt,
+                        1,
+                        target,
+                        (&raw mut value).cast(),
+                        4,
+                        &raw mut indicator,
+                    )
+                };
+                let state = stmt.inner.lock().unwrap();
+                if conflicting_use || target == SQL_C_DEFAULT {
+                    assert_eq!(rc, SQL_ERROR);
+                    assert_eq!((value, indicator), (-1, -1));
+                    assert_eq!(state.diag_records.len(), 1);
+                    assert_eq!(
+                        state.diag_records[0].sql_state,
+                        if conflicting_use {
+                            ERR_FUNCTION_SEQUENCE.state
+                        } else {
+                            SQLSTATE_HY000
+                        }
+                    );
+                    assert_eq!(state.current_row_last_col, 0);
+                } else {
+                    assert_eq!(rc, SQL_SUCCESS);
+                    assert_eq!((value, indicator), (42, 4));
+                    assert!(state.diag_records.is_empty());
+                }
+                drop(state);
+                drop(existing_use);
+                assert!(!stmt.row_binding_use.is_active());
+                assert!(stmt.parent_dbc().parent_env().inner.is_poisoned());
+            }
+        }
     }
 
     /// The resolver is shared with `SQLBindParameter` and `SQLFetchScroll`, so

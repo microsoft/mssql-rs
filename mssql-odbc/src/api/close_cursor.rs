@@ -7,6 +7,8 @@
 //! connection-level "busy" claim, allowing other statements on the same DBC
 //! to execute.
 
+use std::sync::MutexGuard;
+
 use tracing::{debug, error};
 
 use super::sqlstate::*;
@@ -16,7 +18,7 @@ use crate::api::odbc_types::{
 use crate::error::free_errors;
 use crate::handles::bindings::{BindingError, BindingUseGuard};
 use crate::handles::stmt::{
-    STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT, STMT_STATE_EXEC_STARTED,
+    STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT, STMT_STATE_EXEC_STARTED, StmtState,
 };
 use crate::handles::{HandleType, StmtHandle, get_handle, process_is_shutting_down};
 
@@ -63,15 +65,10 @@ unsafe fn sql_close_cursor_impl(statement_handle: SqlHandle) -> SqlReturn {
 }
 
 fn sql_close_cursor_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn {
-    let _result_use = match claim_result_use(stmt) {
-        Ok(guard) => guard,
+    let (_result_use, mut stmt_state) = match claim_result_use_locked(stmt) {
+        Ok(claim) => claim,
         Err(rc) => return rc,
     };
-    let Ok(mut stmt_state) = stmt.inner.lock() else {
-        error!("SQLCloseCursor: stmt mutex poisoned");
-        return SQL_ERROR;
-    };
-    free_errors(&mut stmt_state);
     if !stmt_state.has_state(STMT_STATE_CURSOR_OPEN) {
         error!("SQLCloseCursor: no cursor is open — SQLSTATE 24000");
         post_diag(&mut stmt_state, ERR_INVALID_CURSOR_STATE);
@@ -136,15 +133,10 @@ unsafe fn sql_free_stmt_close_impl(statement_handle: SqlHandle) -> SqlReturn {
 }
 
 fn sql_free_stmt_close_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn {
-    let _result_use = match claim_result_use(stmt) {
-        Ok(guard) => guard,
+    let (_result_use, mut stmt_state) = match claim_result_use_locked(stmt) {
+        Ok(claim) => claim,
         Err(rc) => return rc,
     };
-    let Ok(mut stmt_state) = stmt.inner.lock() else {
-        error!("SQLFreeStmt(SQL_CLOSE): stmt mutex poisoned");
-        return SQL_ERROR;
-    };
-    free_errors(&mut stmt_state);
     // No-op if cursor is already closed.
     if !stmt_state.has_state(STMT_STATE_CURSOR_OPEN) {
         return SQL_SUCCESS;
@@ -188,6 +180,17 @@ fn sql_free_stmt_close_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> S
 /// Public row read/close/advance must exclude fetch and input staging through the
 /// entire operation, not merely check idleness before releasing the DBC gate.
 pub(super) fn claim_result_use(stmt: &StmtHandle) -> Result<BindingUseGuard, SqlReturn> {
+    let (result_use, state) = claim_result_use_locked(stmt)?;
+    drop(state);
+    Ok(result_use)
+}
+
+/// Retains the admission's STMT lock and clears diagnostics once. Drop the state
+/// guard before acquiring ENV/DBC/DESC or doing I/O; keep result use until the
+/// operation's final buffer access. The state guard borrows the caller's STMT.
+pub(super) fn claim_result_use_locked(
+    stmt: &StmtHandle,
+) -> Result<(BindingUseGuard, MutexGuard<'_, StmtState>), SqlReturn> {
     let claim = (|| {
         let gate = stmt
             .parent_dbc()
@@ -201,20 +204,36 @@ pub(super) fn claim_result_use(stmt: &StmtHandle) -> Result<BindingUseGuard, Sql
         }
         stmt.row_binding_use.ensure_idle(&gate)?;
         stmt.param_binding_use.ensure_idle(&gate)?;
-        stmt.row_binding_use.acquire(&gate)
+        let result_use = stmt.row_binding_use.acquire(&gate)?;
+        Ok((result_use, state))
     })();
-    let claim = claim.map_err(|error| {
+    let (result_use, state) = claim.map_err(|error: BindingError| {
         crate::error::diag::with_diagnostics(&stmt.inner, |records| {
             free_errors(records);
             error.post(records)
         })
     })?;
     #[cfg(test)]
-    crate::handles::bindings::snapshot_test_hook::pause(
+    let state = if let Some(hook) = crate::handles::bindings::snapshot_test_hook::take(
         stmt,
         crate::handles::bindings::snapshot_test_hook::Phase::ResultOperation,
-    );
-    Ok(claim)
+    ) {
+        // Mutators must reach HY010 while paused, not block on the state lock.
+        drop(state);
+        hook();
+        stmt.inner
+            .lock()
+            .map_err(|_| BindingError::Poisoned)
+            .map_err(|error| {
+                crate::error::diag::with_diagnostics(&stmt.inner, |records| {
+                    free_errors(records);
+                    error.post(records)
+                })
+            })?
+    } else {
+        state
+    };
+    Ok((result_use, state))
 }
 
 /// Closes the cursor on a statement as part of a *connection*-scoped operation
@@ -423,8 +442,172 @@ fn drain_and_release_inner(
 mod tests {
     use super::*;
     use crate::api::odbc_types::SQL_NULL_HANDLE;
+    use crate::handles::bindings::snapshot_test_hook::{self, Phase};
     use crate::handles::handle_from_raw;
     use crate::test_support::TestHandles;
+
+    #[test]
+    fn locked_result_use_retains_statement_state_until_caller_releases_it() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        post_diag(
+            &mut stmt.inner.lock().unwrap(),
+            ERR_INVALID_DESCRIPTOR_INDEX,
+        );
+        let (result_use, state) = claim_result_use_locked(&stmt).unwrap();
+        assert!(state.diag_records.is_empty());
+        assert!(stmt.row_binding_use.is_active());
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let dbc = stmt.parent_dbc();
+                    assert!(dbc.parent_env().inner.try_lock().is_ok());
+                    let _gate = dbc.inner.try_lock().unwrap();
+                    assert!(matches!(
+                        stmt.inner.try_lock(),
+                        Err(std::sync::TryLockError::WouldBlock)
+                    ));
+                })
+                .join()
+                .unwrap();
+        });
+        drop(state);
+        assert!(stmt.inner.try_lock().is_ok());
+        assert!(stmt.row_binding_use.is_active());
+        drop(result_use);
+        assert!(!stmt.row_binding_use.is_active());
+
+        let result_use = claim_result_use(&stmt).unwrap();
+        assert!(stmt.inner.try_lock().is_ok());
+        assert!(stmt.row_binding_use.is_active());
+        drop(result_use);
+        assert!(!stmt.row_binding_use.is_active());
+    }
+
+    #[test]
+    fn locked_result_use_posts_fresh_errors_for_execution_row_and_parameter_use() {
+        for conflict in 0..3 {
+            let h = TestHandles::with_env_dbc_stmt();
+            let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+            let existing_use = {
+                let gate = stmt.parent_dbc().inner.lock().unwrap();
+                let mut state = stmt.inner.lock().unwrap();
+                post_diag(&mut state, ERR_INVALID_DESCRIPTOR_INDEX);
+                match conflict {
+                    0 => {
+                        state.set_state(STMT_STATE_EXEC_STARTED);
+                        None
+                    }
+                    1 => Some(stmt.row_binding_use.acquire(&gate).unwrap()),
+                    _ => Some(stmt.param_binding_use.acquire(&gate).unwrap()),
+                }
+            };
+            assert_eq!(claim_result_use_locked(&stmt).err(), Some(SQL_ERROR));
+            assert!(stmt.parent_dbc().inner.try_lock().is_ok());
+            let mut state = stmt.inner.lock().unwrap();
+            assert_eq!(state.diag_records.len(), 1);
+            assert_eq!(state.diag_records[0].sql_state, ERR_FUNCTION_SEQUENCE.state);
+            state.clear_state(STMT_STATE_EXEC_STARTED);
+            drop(state);
+            drop(existing_use);
+            assert!(!stmt.row_binding_use.is_active());
+            assert!(!stmt.param_binding_use.is_active());
+        }
+    }
+
+    #[test]
+    fn locked_result_use_posts_poison_errors_without_recovering_business_state() {
+        for poison_statement in [false, true] {
+            let h = TestHandles::with_env_dbc_stmt();
+            let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+            post_diag(
+                &mut stmt.inner.lock().unwrap(),
+                ERR_INVALID_DESCRIPTOR_INDEX,
+            );
+            std::thread::scope(|scope| {
+                assert!(
+                    scope
+                        .spawn(|| {
+                            if poison_statement {
+                                let _state = stmt.inner.lock().unwrap();
+                                panic!("poison result-operation statement");
+                            } else {
+                                let _gate = stmt.parent_dbc().inner.lock().unwrap();
+                                panic!("poison result-operation connection");
+                            }
+                        })
+                        .join()
+                        .is_err()
+                );
+            });
+            assert_eq!(claim_result_use_locked(&stmt).err(), Some(SQL_ERROR));
+            crate::error::diag::with_diagnostics(&stmt.inner, |records| {
+                assert_eq!(records.len(), 1);
+                assert_eq!(records[0].sql_state, SQLSTATE_HY000);
+                assert!(records[0].message.contains("poisoned mutex"));
+            });
+            assert_eq!(stmt.inner.is_poisoned(), poison_statement);
+            assert_eq!(stmt.parent_dbc().inner.is_poisoned(), !poison_statement);
+            assert!(!stmt.row_binding_use.is_active());
+        }
+    }
+
+    #[test]
+    fn result_use_hook_runs_unlocked_without_clearing_new_diagnostics() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let paused_stmt = std::sync::Arc::clone(&stmt);
+        let _registration = snapshot_test_hook::install(&stmt, Phase::ResultOperation, move || {
+            assert!(paused_stmt.parent_dbc().inner.try_lock().is_ok());
+            let mut state = paused_stmt.inner.try_lock().unwrap();
+            assert!(paused_stmt.row_binding_use.is_active());
+            post_diag(&mut state, ERR_FUNCTION_SEQUENCE);
+        });
+        assert_eq!(unsafe { sql_free_stmt_close(h.stmt) }, SQL_SUCCESS);
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(state.diag_records.len(), 1);
+        assert_eq!(state.diag_records[0].sql_state, ERR_FUNCTION_SEQUENCE.state);
+        assert!(!stmt.row_binding_use.is_active());
+    }
+
+    #[test]
+    fn result_use_hook_unwind_releases_admission_without_poisoning_state() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let _registration = snapshot_test_hook::install(&stmt, Phase::ResultOperation, || {
+            panic!("after result admission");
+        });
+        assert_eq!(unsafe { sql_free_stmt_close(h.stmt) }, SQL_ERROR);
+        assert!(!stmt.row_binding_use.is_active());
+        assert!(!stmt.inner.is_poisoned());
+        assert!(!stmt.parent_dbc().inner.is_poisoned());
+    }
+
+    #[test]
+    fn result_use_hook_relock_failure_releases_admission_and_posts_poison() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let paused_stmt = std::sync::Arc::clone(&stmt);
+        let _registration = snapshot_test_hook::install(&stmt, Phase::ResultOperation, move || {
+            assert!(
+                std::thread::spawn(move || {
+                    let _state = paused_stmt.inner.lock().unwrap();
+                    panic!("poison statement during result hook");
+                })
+                .join()
+                .is_err()
+            );
+        });
+        assert_eq!(unsafe { sql_free_stmt_close(h.stmt) }, SQL_ERROR);
+        assert!(!stmt.row_binding_use.is_active());
+        assert!(stmt.inner.is_poisoned());
+        assert!(!stmt.parent_dbc().inner.is_poisoned());
+        crate::error::diag::with_diagnostics(&stmt.inner, |records| {
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].sql_state, SQLSTATE_HY000);
+            assert!(records[0].message.contains("poisoned mutex"));
+        });
+    }
 
     #[test]
     fn close_cursor_null_handle() {

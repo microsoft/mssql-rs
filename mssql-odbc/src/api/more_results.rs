@@ -25,7 +25,6 @@ use crate::api::sqlstate::{
     ERR_CONNECTION_BUSY, ERR_NO_ACTIVE_TDS_CLIENT, SQLSTATE_HY000, post_diag, post_tds_error,
     post_tds_info_messages,
 };
-use crate::error::free_errors;
 use crate::error::post_sql_error;
 use crate::handles::stmt::STMT_STATE_CURSOR_OPEN;
 use crate::handles::{HandleType, StmtHandle, get_handle};
@@ -63,13 +62,11 @@ fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
         Ok(snapshot) => snapshot,
         Err(rc) => return rc,
     };
-    // Free any stale diagnostics and observe cursor state.
     let cursor_open = {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("SQLMoreResults: stmt mutex poisoned");
             return SQL_ERROR;
         };
-        free_errors(&mut stmt_state);
         if let Some(e) = stmt_state.pending_fetch_error.take() {
             // A prior fetch's read-ahead peek already discovered this result
             // set ends in a SQL Server error (see AB#47508's

@@ -241,16 +241,19 @@ pub(crate) mod snapshot_test_hook {
     }
 
     pub(crate) fn pause(stmt: &StmtHandle, phase: Phase) {
-        if INSTALLED.load(Ordering::Acquire) == 0 {
-            return;
-        }
-        let hook = hooks()
-            .lock()
-            .unwrap()
-            .remove(&(std::ptr::from_ref(stmt) as usize, phase));
-        if let Some(hook) = hook {
+        if let Some(hook) = take(stmt, phase) {
             hook();
         }
+    }
+
+    pub(crate) fn take(stmt: &StmtHandle, phase: Phase) -> Option<Hook> {
+        if INSTALLED.load(Ordering::Acquire) == 0 {
+            return None;
+        }
+        hooks()
+            .lock()
+            .unwrap()
+            .remove(&(std::ptr::from_ref(stmt) as usize, phase))
     }
 
     #[test]
@@ -629,7 +632,7 @@ mod tests {
 
     #[test]
     fn result_operations_exclude_fetch_and_new_queries_until_completion() {
-        for operation in 0..3 {
+        for operation in 0..5 {
             let h = TestHandles::with_env_dbc_stmt();
             h.mark_dbc_connected();
             let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
@@ -648,6 +651,12 @@ mod tests {
                 state.begin_result_set(int_columns(1));
                 state.set_state(STMT_STATE_CURSOR_OPEN);
             }
+            if operation >= 3 {
+                assert_eq!(
+                    unsafe { sql_fetch_scroll(h.stmt, SQL_FETCH_NEXT, 0) },
+                    SQL_SUCCESS
+                );
+            }
             let (_registration, ready, release) = pause_at(&stmt, Phase::ResultOperation);
             let raw = h.stmt.addr();
             std::thread::scope(|scope| {
@@ -656,7 +665,24 @@ mod tests {
                     match operation {
                         0 => crate::api::SQLCloseCursor(raw),
                         1 => SQLFreeStmt(raw, SQL_CLOSE),
-                        _ => crate::api::SQLMoreResults(raw),
+                        2 => crate::api::SQLMoreResults(raw),
+                        _ => {
+                            let mut value = -1_i32;
+                            let rc = crate::api::SQLGetData(
+                                raw,
+                                1,
+                                if operation == 3 {
+                                    SQL_C_SLONG
+                                } else {
+                                    SQL_C_DEFAULT
+                                },
+                                (&raw mut value).cast(),
+                                4,
+                                ptr::null_mut(),
+                            );
+                            assert_eq!(value, 42);
+                            rc
+                        }
                     }
                 });
                 ready.recv_timeout(Duration::from_secs(10)).unwrap();
@@ -721,7 +747,10 @@ mod tests {
             });
             assert!(!stmt.row_binding_use.is_active());
             assert!(!stmt.param_binding_use.is_active());
-            assert!(!stmt.inner.lock().unwrap().has_state(STMT_STATE_CURSOR_OPEN));
+            assert_eq!(
+                stmt.inner.lock().unwrap().has_state(STMT_STATE_CURSOR_OPEN),
+                operation >= 3
+            );
             assert_eq!(unsafe { SQLFreeStmt(h.stmt, SQL_CLOSE) }, SQL_SUCCESS);
         }
     }

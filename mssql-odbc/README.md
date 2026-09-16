@@ -204,6 +204,9 @@ Association changes, snapshot admission, and binding mutations share a short
 DBC lock; that lock is released before network I/O. Connection/statement close
 and disconnect admission exclude executing dependent calls, without treating an
 idle cursor or parked data-at-execution sequence as a permanently active API call.
+`SQLGetData` and public cursor close reuse admission's STMT lock for their initial
+state work, releasing it before parent/descriptor access or I/O. Result advancement
+releases it immediately so its output-parameter snapshot can acquire descriptors.
 
 The public ODBC ABI is unchanged. Applications must still keep bound buffers
 valid and must not unload the driver while calls are executing. Normal final
