@@ -69,6 +69,23 @@ def test_linux_drop_publication_is_non_pr_only():
     }
 
 
+def test_obsolete_mssql_python_linux_build_is_removed():
+    stages = load_template("validation-stages.yml")["stages"]
+    stage = next(stage for stage in stages if stage["stage"] == "Build_mssql_python")
+    jobs = {job["job"]: job for job in stage["jobs"]}
+    assert "Build_mssql_python_Linux" not in jobs
+    assert jobs["Build_mssql_python_MacOS"]["steps"] == [
+        {"template": "test-mssql-python-macos-template.yml"}
+    ]
+    assert jobs["Test_mssql_python_on_mssql_odbc"]["steps"] == [
+        {"template": "test-mssql-python-odbc-template.yml"}
+    ]
+    removed_template = "test-mssql-python-template.yml"
+    assert not (_TEMPLATES / removed_template).exists()
+    for path in _TEMPLATES.glob("*.yml"):
+        assert removed_template not in path.read_text(encoding="utf-8"), path.name
+
+
 def test_alpine_gssapi_compilation_still_runs_on_prs():
     steps = load_template("build-template-alpine.yml")["steps"]
     build = next(

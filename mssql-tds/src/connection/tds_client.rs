@@ -6484,11 +6484,17 @@ impl TdsClient {
     }
 
     /// Attempts to position the cursor from bytes already buffered by the transport.
+    /// A row parked by lookahead is claimed without reading from the transport.
     ///
     /// Returns [`CursorPoll::Pending`] without consuming bytes or cursor state
     /// when the current row must first be drained, the next token needs async
     /// parsing, encryption keys need resolving, or the row header is incomplete.
     pub fn try_next_row_cursor(&mut self) -> TdsResult<CursorPoll<bool>> {
+        if self.row_already_positioned {
+            self.row_already_positioned = false;
+            return Ok(CursorPoll::Ready(true));
+        }
+
         let Some(metadata) = self.current_metadata.as_ref().map(Arc::clone) else {
             return Err(UsageError(
                 "No metadata found while fetching the next row. Have you called the execute method or was the query supposed to return resultset?".to_string(),
@@ -9751,6 +9757,78 @@ mod tests {
 
         assert!(client.next_row_cursor().await.unwrap());
         assert!(!client.row_already_positioned);
+    }
+
+    #[tokio::test]
+    async fn sync_cursor_claims_parked_rows_without_advancing() {
+        let expected = [42_i32, 84_i32];
+        let mut payload = vec![0xff];
+        for value in expected {
+            payload.push(TokenType::Row as u8);
+            payload.extend_from_slice(&value.to_le_bytes());
+        }
+        let mut packet =
+            TestPacketBuilder::new(crate::message::messages::PacketType::TabularResult);
+        let mut transport =
+            create_network_transport_with_data(&packet.append_bytes(&payload).build());
+        assert_eq!(transport.read_byte().await.unwrap(), 0xff);
+        let mut client = create_test_client_with_any_transport(AnyTransport::network(transport));
+        client.current_metadata = Some(int_column_metadata(1));
+        client.current_result_set_has_been_read_till_end = false;
+
+        for value in expected {
+            for _ in 0..2 {
+                assert_eq!(
+                    client.try_peek_past_current_row().unwrap(),
+                    CursorPoll::Ready(true)
+                );
+                assert!(client.row_already_positioned);
+            }
+            assert_eq!(
+                client.try_next_row_cursor().unwrap(),
+                CursorPoll::Ready(true)
+            );
+            assert!(!client.row_already_positioned);
+            assert_eq!(client.try_next_row_cursor().unwrap(), CursorPoll::Pending);
+            assert_eq!(
+                client.try_read_row_column(0).unwrap(),
+                CursorPoll::Ready(CursorColumn::Value {
+                    value: ColumnValues::Int(value),
+                    variant_base: None,
+                })
+            );
+        }
+        assert_eq!(client.try_next_row_cursor().unwrap(), CursorPoll::Pending);
+    }
+
+    #[tokio::test]
+    async fn sync_cursor_claims_cancelled_parked_rows_like_async() {
+        for synchronous in [false, true] {
+            let mut transport = TestTransport::new();
+            transport.sync_header_available = true;
+            transport.sync_columns.push_back(ColumnValues::Int(42));
+            let mut client = create_test_client_with_transport(transport);
+            client.current_metadata = Some(int_column_metadata(1));
+            client.current_result_set_has_been_read_till_end = false;
+            assert_eq!(
+                client.try_peek_past_current_row().unwrap(),
+                CursorPoll::Ready(true)
+            );
+            let cancellation = CancelHandle::new();
+            client.cancel_handle = Some(cancellation.child_handle());
+            cancellation.cancel();
+
+            if synchronous {
+                assert_eq!(
+                    client.try_next_row_cursor().unwrap(),
+                    CursorPoll::Ready(true)
+                );
+            } else {
+                assert!(client.next_row_cursor().await.unwrap());
+            }
+            assert!(!client.row_already_positioned);
+            assert_eq!(client.try_read_row_column(0).unwrap(), CursorPoll::Pending);
+        }
     }
 
     #[tokio::test]
