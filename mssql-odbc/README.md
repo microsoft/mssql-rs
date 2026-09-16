@@ -163,6 +163,11 @@ its parents alive through the call. Free retires the ID; storage is released
 after its remaining owners finish. A statement's four implicit descriptor IDs
 retire with the statement, even if its allocation is still retained.
 
+Registry lookups share read access. Allocation, close admission, and retirement
+take exclusive registry access; concurrent acquisitions reserve ancestor activity
+counts with checked atomic updates and roll back earlier reservations on failure.
+Handle-state locks and payload destruction remain outside the registry lock.
+
 Allocation cycles through the full nonzero pointer-sized namespace and skips
 IDs that are still live. There is no cumulative allocation budget: retiring
 handles releases capacity, including after the cursor wraps. Exhausting the

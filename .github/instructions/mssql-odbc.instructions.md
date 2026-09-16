@@ -613,6 +613,10 @@ Driver Manager (DM) provides serialization guarantees that the driver relies on
   neither `live_type` nor a raw cast is a valid lifetime check. Registry
   acquisition never locks a handle's state. Never acquire state locks,
   perform I/O, or destroy extracted payloads while holding the registry lock.
+- Registry lookup uses read access; allocation, close, and retirement require
+  write access. Readers reserve ancestor activity with checked atomic updates
+  and roll back preceding reservations on failure. A separate overflow preflight
+  followed by unchecked increments is not safe with concurrent readers.
 - **Close admission is distinct from binding use.** An executing dependent
   API blocks close/disconnect; an idle cursor or parked DAE sequence can still
   be cleaned up. Do not let late client hand-back repopulate a disconnected

@@ -7,7 +7,7 @@ use std::fmt;
 use std::num::NonZeroUsize;
 use std::ops::Deref;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, LockResult, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use super::HandleType;
 use crate::api::odbc_types::SqlHandle;
@@ -265,7 +265,7 @@ impl RegistryState {
 }
 
 pub(crate) struct HandleRegistry {
-    state: Mutex<RegistryState>,
+    state: RwLock<RegistryState>,
     identity: Arc<()>,
 }
 
@@ -278,7 +278,7 @@ impl Default for HandleRegistry {
 impl HandleRegistry {
     pub(crate) fn new() -> Self {
         Self {
-            state: Mutex::new(RegistryState {
+            state: RwLock::new(RegistryState {
                 entries: HashMap::new(),
                 next_id: NonZeroUsize::MIN,
                 #[cfg(test)]
@@ -292,11 +292,19 @@ impl HandleRegistry {
         }
     }
 
-    fn lock(&self) -> MutexGuard<'_, RegistryState> {
+    fn read(&self) -> RwLockReadGuard<'_, RegistryState> {
+        self.recover(self.state.read())
+    }
+
+    fn write(&self) -> RwLockWriteGuard<'_, RegistryState> {
+        self.recover(self.state.write())
+    }
+
+    fn recover<T>(&self, result: LockResult<T>) -> T {
         // Critical sections contain only map operations on primitive keys,
         // reserved-capacity insertions, Arc clones and atomics. No user code or
         // payload destructor can unwind here and leave a partial update.
-        self.state.lock().unwrap_or_else(|poisoned| {
+        result.unwrap_or_else(|poisoned| {
             tracing::error!("recovering poisoned handle registry");
             self.state.clear_poison();
             poisoned.into_inner()
@@ -306,19 +314,19 @@ impl HandleRegistry {
     #[cfg(test)]
     pub(super) fn poison_for_test(&self) {
         let _ = std::panic::catch_unwind(|| {
-            let _state = self.state.lock().unwrap();
+            let _state = self.state.write().unwrap();
             panic!("poison the registry without changing its invariants");
         });
     }
 
     #[cfg(test)]
     pub(super) fn fail_retirement_after(&self, successes: usize) {
-        self.lock().fail_retirement_after = Some(successes);
+        self.write().fail_retirement_after = Some(successes);
     }
 
     #[cfg(test)]
     pub(super) fn force_wrap_for_test(&self) {
-        let mut state = self.lock();
+        let mut state = self.write();
         state.next_id = state.id_limit;
     }
 
@@ -330,7 +338,7 @@ impl HandleRegistry {
         value: Arc<T>,
         activity: Arc<HandleActivity>,
     ) -> Result<HandleId, RegistryError> {
-        let mut state = self.lock();
+        let mut state = self.write();
         if kind == HandleType::Invalid {
             return Err(RegistryError::WrongType);
         }
@@ -372,17 +380,12 @@ impl HandleRegistry {
         id: HandleId,
         expected: HandleType,
     ) -> Result<HandleRef<T>, RegistryError> {
-        let state = self.lock();
+        let state = self.read();
         let entry = state.entries.get(&id).ok_or(RegistryError::NotFound)?;
         if entry.kind != expected {
             return Err(RegistryError::WrongType);
         }
         entry.activity.check_open()?;
-        for activity in entry.activity.ancestors() {
-            if activity.active.load(Ordering::Acquire) == usize::MAX {
-                return Err(RegistryError::ActivityOverflow);
-            }
-        }
         let value = match Arc::clone(&entry.value).downcast::<T>() {
             Ok(value) => value,
             Err(value) => {
@@ -392,10 +395,22 @@ impl HandleRegistry {
             }
         };
         let activity = Arc::clone(&entry.activity);
-        // Registration binds the entire chain to this mutex. Only drops can
-        // change these counters concurrently, and those only decrement them.
-        for ancestor in activity.ancestors() {
-            ancestor.active.fetch_add(1, Ordering::Relaxed);
+        // Readers may reserve the same ancestors concurrently. Close and
+        // retirement take the write lock and cannot observe partial reservations.
+        for (reserved, ancestor) in activity.ancestors().enumerate() {
+            if ancestor
+                .active
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                    count.checked_add(1)
+                })
+                .is_err()
+            {
+                for previous in activity.ancestors().take(reserved) {
+                    previous.active.fetch_sub(1, Ordering::Release);
+                }
+                drop(state);
+                return Err(RegistryError::ActivityOverflow);
+            }
         }
         drop(state);
         Ok(HandleRef {
@@ -408,7 +423,7 @@ impl HandleRegistry {
 
     #[cfg(test)]
     pub(crate) fn kind(&self, id: HandleId) -> Result<Option<HandleType>, RegistryError> {
-        Ok(self.lock().entries.get(&id).map(|entry| entry.kind))
+        Ok(self.read().entries.get(&id).map(|entry| entry.kind))
     }
 
     /// Diagnostic access ignores closing admission and activity limits, but
@@ -419,7 +434,7 @@ impl HandleRegistry {
         expected: HandleType,
     ) -> Result<Arc<T>, RegistryError> {
         let value = {
-            let state = self.lock();
+            let state = self.read();
             let entry = state.entries.get(&id).ok_or(RegistryError::NotFound)?;
             if entry.kind != expected {
                 return Err(RegistryError::WrongType);
@@ -444,7 +459,7 @@ impl HandleRegistry {
         expected: HandleType,
     ) -> Result<Arc<T>, RegistryError> {
         let value = {
-            let state = self.lock();
+            let state = self.read();
             let entry = state.entries.get(&id).ok_or(RegistryError::NotFound)?;
             if entry.kind != expected {
                 return Err(RegistryError::WrongType);
@@ -458,7 +473,7 @@ impl HandleRegistry {
         &self,
         handle: &HandleRef<T>,
     ) -> Result<CloseGuard, RegistryError> {
-        let state = self.lock();
+        let state = self.write();
         let entry = state
             .entries
             .get(&handle.id())
@@ -488,7 +503,7 @@ impl HandleRegistry {
     /// existing HandleRefs and structural Arcs continue to own their payloads.
     pub(crate) fn retire(&self, id: HandleId, expected: HandleType) -> Result<(), RegistryError> {
         let removed = {
-            let mut state = self.lock();
+            let mut state = self.write();
             #[cfg(test)]
             state.check_retirement()?;
             match state.entries.entry(id) {
@@ -513,7 +528,7 @@ impl HandleRegistry {
     }
 
     /// Preflights the entire batch before removing anything. No payload
-    /// destructor runs while the registry mutex is held.
+    /// destructor runs while the registry write lock is held.
     pub(crate) fn retire_batch(
         &self,
         handles: &[(HandleId, HandleType)],
@@ -522,7 +537,7 @@ impl HandleRegistry {
         removed
             .try_reserve(handles.len())
             .map_err(|_| RegistryError::Capacity)?;
-        let mut state = self.lock();
+        let mut state = self.write();
         #[cfg(test)]
         state.check_retirement()?;
         for (index, (id, expected)) in handles.iter().enumerate() {
@@ -554,8 +569,8 @@ impl HandleRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Weak;
     use std::sync::mpsc::{self, Receiver, Sender};
+    use std::sync::{Barrier, Mutex, Weak};
     use std::thread;
     use std::time::Duration;
 
@@ -564,13 +579,13 @@ mod tests {
     impl HandleRegistry {
         fn with_next_id(next: usize) -> Self {
             let registry = Self::new();
-            registry.state.lock().unwrap().next_id = NonZeroUsize::new(next).unwrap();
+            registry.state.write().unwrap().next_id = NonZeroUsize::new(next).unwrap();
             registry
         }
 
         fn with_id_limit(limit: usize) -> Self {
             let registry = Self::new();
-            registry.state.lock().unwrap().id_limit = NonZeroUsize::new(limit).unwrap();
+            registry.state.write().unwrap().id_limit = NonZeroUsize::new(limit).unwrap();
             registry
         }
     }
@@ -650,7 +665,7 @@ mod tests {
                 registry.acquire::<u32>(id, HandleType::Env).err(),
                 Some(RegistryError::NotFound)
             );
-            assert!(registry.state.lock().unwrap().entries.is_empty());
+            assert!(registry.state.read().unwrap().entries.is_empty());
             previous = id.to_raw().addr();
         }
     }
@@ -721,7 +736,7 @@ mod tests {
                 (wrapped, HandleType::Env),
             ])
             .unwrap();
-        assert!(registry.state.lock().unwrap().entries.is_empty());
+        assert!(registry.state.read().unwrap().entries.is_empty());
         let (next, _) = register(&registry, HandleType::Env, None);
         assert_eq!(next.to_raw().addr(), 2);
     }
@@ -760,7 +775,7 @@ mod tests {
     fn assert_live_entries(registry: &HandleRegistry, live: &[(HandleId, u32)]) {
         let ids: std::collections::HashSet<_> = live.iter().map(|(id, _)| *id).collect();
         assert_eq!(ids.len(), live.len());
-        assert_eq!(registry.state.lock().unwrap().entries.len(), live.len());
+        assert_eq!(registry.state.read().unwrap().entries.len(), live.len());
         for (id, value) in live {
             assert_eq!(HandleId::from_raw(id.to_raw()), Ok(*id));
             assert_eq!(registry.kind(*id), Ok(Some(HandleType::Env)));
@@ -785,13 +800,13 @@ mod tests {
                 assert_live_entries(&registry, &live);
             }
             let activity = HandleActivity::new(None);
-            let candidate = registry.state.lock().unwrap().next_id;
+            let candidate = registry.state.read().unwrap().next_id;
             for _ in 0..2 {
                 assert_eq!(
                     registry.register(HandleType::Env, Arc::new(42_u32), Arc::clone(&activity)),
                     Err(RegistryError::IdSpaceFull)
                 );
-                assert_eq!(registry.state.lock().unwrap().next_id, candidate);
+                assert_eq!(registry.state.read().unwrap().next_id, candidate);
                 assert!(!activity.registered.load(Ordering::Acquire));
                 assert!(activity.owner.get().is_none());
                 assert_eq!(count(&activity), 0);
@@ -1258,7 +1273,7 @@ mod tests {
     }
 
     #[test]
-    fn overflow_preflight_changes_no_counter_at_any_depth() {
+    fn overflow_rolls_back_preceding_counters_at_any_depth() {
         let tree = Tree::new();
         for saturated in [&tree.env_activity, &tree.dbc_activity, &tree.stmt_activity] {
             saturated.active.store(usize::MAX, Ordering::Release);
@@ -1278,7 +1293,7 @@ mod tests {
                     }
                 );
             }
-            let state = tree.registry.state.lock().unwrap();
+            let state = tree.registry.state.read().unwrap();
             assert_eq!(
                 count(&state.entries.get(&tree.implicit_desc).unwrap().activity),
                 0
@@ -1306,6 +1321,59 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_readers_cannot_overflow_a_shared_ancestor() {
+        let registry = Arc::new(HandleRegistry::new());
+        let (_, parent) = register(&registry, HandleType::Env, None);
+        let children: Vec<_> = (0..32)
+            .map(|_| register(&registry, HandleType::Dbc, Some(Arc::clone(&parent))))
+            .collect();
+        parent.active.store(usize::MAX - 1, Ordering::Release);
+
+        let state = registry.read();
+        let start = Arc::new(Barrier::new(children.len() + 1));
+        let (sender, receiver) = mpsc::channel();
+        let workers: Vec<_> = children
+            .iter()
+            .map(|&(id, _)| {
+                let registry = Arc::clone(&registry);
+                let start = Arc::clone(&start);
+                let sender = sender.clone();
+                thread::spawn(move || {
+                    start.wait();
+                    sender
+                        .send(registry.acquire::<u32>(id, HandleType::Dbc))
+                        .unwrap();
+                })
+            })
+            .collect();
+        start.wait();
+        let results: Result<Vec<_>, _> = (0..children.len())
+            .map(|_| receiver.recv_timeout(TIMEOUT))
+            .collect();
+        drop(state);
+        for worker in workers {
+            worker.join().unwrap();
+        }
+
+        let results = results.unwrap();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(count(&parent), usize::MAX);
+        for error in results.iter().filter_map(|result| result.as_ref().err()) {
+            assert_eq!(*error, RegistryError::ActivityOverflow);
+        }
+        for (id, activity) in &children {
+            let acquired = results
+                .iter()
+                .any(|result| result.as_ref().is_ok_and(|handle| handle.id() == *id));
+            assert_eq!(count(activity), usize::from(acquired));
+        }
+        drop(results);
+        assert_eq!(count(&parent), usize::MAX - 1);
+        assert!(children.iter().all(|(_, activity)| count(activity) == 0));
+        parent.active.store(0, Ordering::Release);
+    }
+
+    #[test]
     fn failed_reservation_does_not_consume_identity_bind_activity_or_insert() {
         for wrap in [false, true] {
             let registry = HandleRegistry::new();
@@ -1317,17 +1385,17 @@ mod tests {
                 live.extend([(first, 42), (last, 42)]);
             }
             let activity = HandleActivity::new(None);
-            registry.state.lock().unwrap().reserve_additional = usize::MAX;
+            registry.state.write().unwrap().reserve_additional = usize::MAX;
             assert_eq!(
                 registry.register(HandleType::Env, Arc::new(42_u32), Arc::clone(&activity)),
                 Err(RegistryError::Capacity)
             );
             assert_live_entries(&registry, &live);
-            assert_eq!(registry.state.lock().unwrap().next_id, NonZeroUsize::MIN);
+            assert_eq!(registry.state.read().unwrap().next_id, NonZeroUsize::MIN);
             assert!(!activity.registered.load(Ordering::Acquire));
             assert!(activity.owner.get().is_none());
             assert_eq!(count(&activity), 0);
-            registry.state.lock().unwrap().reserve_additional = 1;
+            registry.state.write().unwrap().reserve_additional = 1;
             let id = registry
                 .register(HandleType::Env, Arc::new(42_u32), activity)
                 .unwrap();
@@ -1361,8 +1429,8 @@ mod tests {
             first.register(HandleType::Env, Arc::new(0_u32), activity),
             Err(RegistryError::InvalidActivity)
         );
-        assert!(first.state.lock().unwrap().entries.is_empty());
-        assert!(second.state.lock().unwrap().entries.is_empty());
+        assert!(first.state.read().unwrap().entries.is_empty());
+        assert!(second.state.read().unwrap().entries.is_empty());
     }
 
     #[test]
@@ -1432,7 +1500,7 @@ mod tests {
             );
         }
         assert!(!parent.registered.load(Ordering::Acquire));
-        assert!(registry.state.lock().unwrap().entries.is_empty());
+        assert!(registry.state.read().unwrap().entries.is_empty());
         let (child, _) = register(&registry, HandleType::Desc, Some(Arc::clone(&parent)));
         let parent_id = registry
             .register(HandleType::Stmt, Arc::new(42_u32), Arc::clone(&parent))
@@ -1504,8 +1572,8 @@ mod tests {
                 registry.retire(id, HandleType::Desc).unwrap();
             } else {
                 assert_eq!(root_result, Err(RegistryError::InvalidActivity));
-                assert!(registry.state.lock().unwrap().entries.is_empty());
-                assert_eq!(registry.state.lock().unwrap().next_id, NonZeroUsize::MIN);
+                assert!(registry.state.read().unwrap().entries.is_empty());
+                assert_eq!(registry.state.read().unwrap().next_id, NonZeroUsize::MIN);
             }
         }
         assert_eq!(receive(&dropped_rx), Ok(None));
@@ -1544,7 +1612,7 @@ mod tests {
                 .count(),
             1
         );
-        let state = registry.state.lock().unwrap();
+        let state = registry.state.read().unwrap();
         assert_eq!(state.entries.len(), 1);
         assert_eq!(state.next_id.get(), 2);
         assert_eq!(count(&activity), 0);
@@ -1633,7 +1701,7 @@ mod tests {
         registry
             .retire_batch(&[(first, HandleType::Env), (second, HandleType::Dbc)])
             .unwrap();
-        assert!(registry.state.lock().unwrap().entries.is_empty());
+        assert!(registry.state.read().unwrap().entries.is_empty());
         assert_eq!(first_activity.admission.load(Ordering::Acquire), RETIRED);
         assert_eq!(second_activity.admission.load(Ordering::Acquire), RETIRED);
     }
@@ -1642,7 +1710,7 @@ mod tests {
         let registry = Arc::clone(registry);
         assert!(
             thread::spawn(move || {
-                let _guard = registry.state.lock().unwrap();
+                let _guard = registry.state.write().unwrap();
                 panic!("poison the test registry");
             })
             .join()
@@ -1902,7 +1970,7 @@ mod tests {
                 RegistryError::NotFound => registry.retire(probe, HandleType::Env).unwrap(),
                 RegistryError::IdSpaceFull => {}
                 RegistryError::Capacity => {
-                    registry.state.lock().unwrap().reserve_additional = usize::MAX;
+                    registry.state.write().unwrap().reserve_additional = usize::MAX;
                 }
                 _ => unreachable!("not a registration error"),
             }
