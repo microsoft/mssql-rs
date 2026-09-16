@@ -1,0 +1,69 @@
+parameters:
+- name: osType
+  type: string
+  values:
+  - Linux
+  - MacOS
+  - Windows
+- name: architecture
+  type: string
+- name: pythonVersions
+  type: object
+  default:
+  - '3.10'
+  - '3.11'
+  - '3.12'
+  - '3.13'
+  - '3.14'
+
+steps:
+- ${{ if eq(parameters.osType, 'Linux') }}:
+  - script: |
+      set -euo pipefail
+      architecture='${{ parameters.architecture }}'
+      if [ "$architecture" = 'x64' ]; then
+        architecture='x86_64'
+      elif [ "$architecture" = 'arm64' ]; then
+        architecture='aarch64'
+      fi
+      bash "$(Build.SourcesDirectory)/scripts/test-python-wheel-installs-linux.sh" \
+        "$(ob_outputDirectory)/wheels" "$architecture"
+    displayName: 'Clean-install final Linux wheels'
+
+- ${{ if eq(parameters.osType, 'Windows') }}:
+  - ${{ each pythonVersion in parameters.pythonVersions }}:
+    - task: UsePythonVersion@0
+      displayName: 'Use Python ${{ pythonVersion }} for install test'
+      inputs:
+        versionSpec: '${{ pythonVersion }}'
+        architecture: '${{ parameters.architecture }}'
+        addToPath: true
+    - pwsh: |
+        $ErrorActionPreference = 'Stop'
+        $pythonTag = 'cp' + '${{ pythonVersion }}'.Replace('.', '')
+        $platformTag = if ('${{ parameters.architecture }}' -eq 'arm64') { 'win_arm64' } else { 'win_amd64' }
+        $wheels = @(Get-ChildItem "$(ob_outputDirectory)\wheels" -File -Filter "mssql_python_rs-*-$pythonTag-$pythonTag-$platformTag.whl")
+        if ($wheels.Count -ne 1) {
+          throw "Expected one $pythonTag $platformTag wheel, found $($wheels.Count)"
+        }
+        python "$(Build.SourcesDirectory)\scripts\test-python-wheel-install.py" --wheel $wheels[0].FullName
+      displayName: 'Clean-install Python ${{ pythonVersion }} wheel (Windows ${{ parameters.architecture }})'
+
+- ${{ if eq(parameters.osType, 'MacOS') }}:
+  - ${{ each pythonVersion in parameters.pythonVersions }}:
+    - task: UsePythonVersion@0
+      displayName: 'Use Python ${{ pythonVersion }} for install test'
+      inputs:
+        versionSpec: '${{ pythonVersion }}'
+        addToPath: true
+    - script: |
+        set -euo pipefail
+        python_tag="cp$(echo '${{ pythonVersion }}' | tr -d '.')"
+        shopt -s nullglob
+        wheels=("$(ob_outputDirectory)/wheels"/mssql_python_rs-*-${python_tag}-${python_tag}-macosx_15_0_universal2.whl)
+        if [ "${#wheels[@]}" -ne 1 ]; then
+          echo "Expected one ${python_tag} macOS universal2 wheel, found ${#wheels[@]}" >&2
+          exit 1
+        fi
+        python "$(Build.SourcesDirectory)/scripts/test-python-wheel-install.py" --wheel "${wheels[0]}"
+      displayName: 'Clean-install Python ${{ pythonVersion }} wheel (macOS universal2)'
