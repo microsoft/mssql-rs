@@ -52,4 +52,5 @@ extends:
         buildPythonWheels: true
         buildOdbcNative: true
         buildRustCrates: true
+        testPythonWheelInstalls: true
         isOfficial: true
