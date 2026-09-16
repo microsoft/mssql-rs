@@ -213,9 +213,13 @@ pub(crate) mod snapshot_test_hook {
 
     pub(crate) struct Registration(Key);
 
+    /// Lets `pause` skip the global hook map when no test has installed one.
+    static INSTALLED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
     impl Drop for Registration {
         fn drop(&mut self) {
             hooks().lock().unwrap().remove(&self.0);
+            INSTALLED.fetch_sub(1, std::sync::atomic::Ordering::Release);
         }
     }
 
@@ -232,10 +236,14 @@ pub(crate) mod snapshot_test_hook {
                 .insert(key, Box::new(hook))
                 .is_none()
         );
+        INSTALLED.fetch_add(1, std::sync::atomic::Ordering::Release);
         Registration(key)
     }
 
     pub(crate) fn pause(stmt: &StmtHandle, phase: Phase) {
+        if INSTALLED.load(std::sync::atomic::Ordering::Acquire) == 0 {
+            return;
+        }
         let hook = hooks()
             .lock()
             .unwrap()

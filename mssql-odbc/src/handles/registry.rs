@@ -63,6 +63,35 @@ impl fmt::Display for RegistryError {
 
 impl std::error::Error for RegistryError {}
 
+/// Handle IDs are dense integers, so the default SipHash is pure overhead.
+/// Fibonacci multiply-shift, the same mix `rustc-hash` uses.
+#[derive(Default)]
+pub(crate) struct IdHasher(u64);
+
+impl std::hash::Hasher for IdHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.write_u64(u64::from(b));
+        }
+    }
+
+    fn write_usize(&mut self, value: usize) {
+        self.write_u64(value as u64);
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        self.0 = (self.0 ^ value)
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            .rotate_left(26);
+    }
+}
+
+type IdBuildHasher = std::hash::BuildHasherDefault<IdHasher>;
+
 const OPEN: u8 = 0;
 const CLOSING: u8 = 1;
 const RETIRED: u8 = 2;
@@ -90,6 +119,15 @@ impl HandleActivity {
 
     fn ancestors(&self) -> impl Iterator<Item = &Self> {
         std::iter::successors(Some(self), |activity| activity.parent.as_deref())
+    }
+
+    /// Ancestors whose in-flight counter this call reserves. The root ENV is
+    /// excluded unless it is the target: `SQLFreeHandle(ENV)` is DM-ordered
+    /// after every child and already debug_asserted, so a process-shared
+    /// counter on every call buys no safety the Arc parents do not give.
+    fn reserved(&self) -> impl Iterator<Item = &Self> {
+        self.ancestors()
+            .filter(|a| a.parent.is_some() || std::ptr::eq(*a, self))
     }
 
     fn root(&self) -> &Self {
@@ -174,7 +212,7 @@ impl<T> Deref for HandleRef<T> {
 
 impl Drop for ActivityLease {
     fn drop(&mut self) {
-        for activity in self.activity.ancestors() {
+        for activity in self.activity.reserved() {
             activity.active.fetch_sub(1, Ordering::Release);
         }
     }
@@ -204,7 +242,7 @@ struct RegistryEntry {
 }
 
 struct RegistryState {
-    entries: HashMap<HandleId, RegistryEntry>,
+    entries: HashMap<HandleId, RegistryEntry, IdBuildHasher>,
     next_id: NonZeroUsize,
     #[cfg(test)]
     id_limit: NonZeroUsize,
@@ -279,7 +317,7 @@ impl HandleRegistry {
     pub(crate) fn new() -> Self {
         Self {
             state: RwLock::new(RegistryState {
-                entries: HashMap::new(),
+                entries: HashMap::default(),
                 next_id: NonZeroUsize::MIN,
                 #[cfg(test)]
                 id_limit: NonZeroUsize::MAX,
@@ -397,7 +435,7 @@ impl HandleRegistry {
         let activity = Arc::clone(&entry.activity);
         // Readers may reserve the same ancestors concurrently. Close and
         // retirement take the write lock and cannot observe partial reservations.
-        for (reserved, ancestor) in activity.ancestors().enumerate() {
+        for (reserved, ancestor) in activity.reserved().enumerate() {
             if ancestor
                 .active
                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
@@ -405,7 +443,7 @@ impl HandleRegistry {
                 })
                 .is_err()
             {
-                for previous in activity.ancestors().take(reserved) {
+                for previous in activity.reserved().take(reserved) {
                     previous.active.fetch_sub(1, Ordering::Release);
                 }
                 drop(state);
@@ -974,7 +1012,9 @@ mod tests {
             Some(Arc::clone(&parent_activity)),
         );
         let handle = registry.acquire::<u32>(child, HandleType::Dbc).unwrap();
-        assert_eq!(count(&parent_activity), 1);
+        // The root ENV is not reserved for a call on its child DBC: `SQLFreeHandle(ENV)`
+        // is DM-ordered after every child and already `debug_assert!`s an empty child set.
+        assert_eq!(count(&parent_activity), 0);
         assert_eq!(count(&child_activity), 1);
         let structural = handle.into_arc();
         assert_eq!(count(&parent_activity), 0);
@@ -1119,31 +1159,30 @@ mod tests {
         let tree = Tree::new();
         let descriptor = tree.acquire(tree.implicit_desc, HandleType::Desc);
         assert_eq!(count(&tree.stmt_activity), 1);
-        for (id, kind) in [
-            (tree.stmt, HandleType::Stmt),
-            (tree.dbc, HandleType::Dbc),
-            (tree.env, HandleType::Env),
-        ] {
+        for (id, kind) in [(tree.stmt, HandleType::Stmt), (tree.dbc, HandleType::Dbc)] {
             let parent = tree.acquire(id, kind);
             assert_eq!(
                 tree.registry.begin_close(&parent).err(),
                 Some(RegistryError::Busy)
             );
         }
+        // The root ENV is not reserved by a descendant's call, so its own
+        // close admission is unaffected by the in-flight descriptor.
+        assert_eq!(count(&tree.env_activity), 0);
         drop(descriptor);
         let stmt = tree.acquire(tree.stmt, HandleType::Stmt);
         drop(tree.registry.begin_close(&stmt).unwrap());
     }
 
     #[test]
-    fn explicit_descriptor_call_blocks_connection_and_environment_but_not_statement() {
+    fn explicit_descriptor_call_blocks_connection_but_not_statement_or_environment() {
         let tree = Tree::new();
         let descriptor = tree.acquire(tree.explicit_desc, HandleType::Desc);
         assert_eq!(count(&tree.stmt_activity), 0);
         assert_eq!(count(&tree.dbc_activity), 1);
-        assert_eq!(count(&tree.env_activity), 1);
-        for (id, kind) in [(tree.dbc, HandleType::Dbc), (tree.env, HandleType::Env)] {
-            let parent = tree.acquire(id, kind);
+        assert_eq!(count(&tree.env_activity), 0);
+        {
+            let parent = tree.acquire(tree.dbc, HandleType::Dbc);
             assert_eq!(
                 tree.registry.begin_close(&parent).err(),
                 Some(RegistryError::Busy)
@@ -1155,6 +1194,24 @@ mod tests {
         assert_eq!(count(&tree.dbc_activity), 1);
         drop(stmt);
         assert_eq!(count(&tree.dbc_activity), 0);
+    }
+
+    /// P1 traded process-wide ENV admission checks for per-call cost: an
+    /// in-flight call on a descendant no longer blocks `SQLFreeHandle(ENV)`.
+    /// `SQLFreeHandle(ENV)` is DM-ordered after every child handle is freed,
+    /// so this is only reachable by a contract-violating application.
+    #[test]
+    fn in_flight_statement_call_blocks_connection_close_but_not_environment_close() {
+        let tree = Tree::new();
+        let stmt = tree.acquire(tree.stmt, HandleType::Stmt);
+        let dbc = tree.acquire(tree.dbc, HandleType::Dbc);
+        assert_eq!(
+            tree.registry.begin_close(&dbc).err(),
+            Some(RegistryError::Busy)
+        );
+        let env = tree.acquire(tree.env, HandleType::Env);
+        assert!(tree.registry.begin_close(&env).is_ok());
+        drop(stmt);
     }
 
     #[test]
@@ -1275,7 +1332,7 @@ mod tests {
     #[test]
     fn overflow_rolls_back_preceding_counters_at_any_depth() {
         let tree = Tree::new();
-        for saturated in [&tree.env_activity, &tree.dbc_activity, &tree.stmt_activity] {
+        for saturated in [&tree.dbc_activity, &tree.stmt_activity] {
             saturated.active.store(usize::MAX, Ordering::Release);
             assert_eq!(
                 tree.registry
@@ -1283,7 +1340,9 @@ mod tests {
                     .err(),
                 Some(RegistryError::ActivityOverflow)
             );
-            for activity in [&tree.env_activity, &tree.dbc_activity, &tree.stmt_activity] {
+            // The root ENV is never reserved by a descendant call, so it is
+            // excluded from both the saturation sweep and the rollback check.
+            for activity in [&tree.dbc_activity, &tree.stmt_activity] {
                 assert_eq!(
                     count(activity),
                     if Arc::ptr_eq(activity, saturated) {
@@ -1293,6 +1352,7 @@ mod tests {
                     }
                 );
             }
+            assert_eq!(count(&tree.env_activity), 0);
             let state = tree.registry.state.read().unwrap();
             assert_eq!(
                 count(&state.entries.get(&tree.implicit_desc).unwrap().activity),
@@ -1323,9 +1383,10 @@ mod tests {
     #[test]
     fn concurrent_readers_cannot_overflow_a_shared_ancestor() {
         let registry = Arc::new(HandleRegistry::new());
-        let (_, parent) = register(&registry, HandleType::Env, None);
+        let (_, root) = register(&registry, HandleType::Env, None);
+        let (_, parent) = register(&registry, HandleType::Dbc, Some(Arc::clone(&root)));
         let children: Vec<_> = (0..32)
-            .map(|_| register(&registry, HandleType::Dbc, Some(Arc::clone(&parent))))
+            .map(|_| register(&registry, HandleType::Stmt, Some(Arc::clone(&parent))))
             .collect();
         parent.active.store(usize::MAX - 1, Ordering::Release);
 
@@ -1341,7 +1402,7 @@ mod tests {
                 thread::spawn(move || {
                     start.wait();
                     sender
-                        .send(registry.acquire::<u32>(id, HandleType::Dbc))
+                        .send(registry.acquire::<u32>(id, HandleType::Stmt))
                         .unwrap();
                 })
             })
@@ -1912,8 +1973,9 @@ mod tests {
             done_tx.send(()).unwrap();
         });
         receive(&entered_rx);
+        // The root ENV is not reserved by this descendant's in-flight call, so
+        // it is checked separately and is expected to close successfully.
         let ancestors = [
-            (tree.env, HandleType::Env, &tree.env_activity),
             (tree.dbc, HandleType::Dbc, &tree.dbc_activity),
             (tree.stmt, HandleType::Stmt, &tree.stmt_activity),
         ];
@@ -1922,6 +1984,9 @@ mod tests {
             let ancestor = tree.acquire(id, kind);
             blocked_results.push((tree.registry.begin_close(&ancestor).err(), count(activity)));
         }
+        assert_eq!(count(&tree.env_activity), 0);
+        let env = tree.acquire(tree.env, HandleType::Env);
+        assert!(tree.registry.begin_close(&env).is_ok());
         let leaf_count = count(&activity);
         finish_tx.send(()).unwrap();
         receive(&done_rx);
