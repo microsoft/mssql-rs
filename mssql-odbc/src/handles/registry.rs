@@ -96,6 +96,7 @@ const RETIRED: usize = 2 << ACTIVITY_BITS;
 
 /// In-flight calls, independent of the Arcs that own handle storage.
 #[derive(Debug)]
+#[repr(align(128))]
 pub(crate) struct HandleActivity {
     parent: Option<Arc<Self>>,
     owner: OnceLock<Arc<()>>,
@@ -766,6 +767,16 @@ mod tests {
         }
         assert!(table.get(257).is_some());
         assert!(table.get(1 << 17).is_none());
+    }
+
+    #[test]
+    fn activity_words_do_not_share_cache_lines_between_allocations() {
+        let activities: Vec<_> = (0..32).map(|_| HandleActivity::new(None)).collect();
+        let mut lines = std::collections::HashSet::new();
+        for activity in activities {
+            assert_eq!(std::ptr::from_ref(&*activity).addr() % 128, 0);
+            assert!(lines.insert(std::ptr::from_ref(&activity.state).addr() / 128));
+        }
     }
 
     #[test]
