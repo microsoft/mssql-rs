@@ -162,8 +162,11 @@ def test_cpp_codeql_build_is_official_only(is_official, build_products):
     assert official["extends"]["parameters"]["stages"][0]["parameters"]["isOfficial"] is True
 
 
-@pytest.mark.parametrize(("configure_exit", "build_exit"), [(0, 0), (1, 0), (0, 1)])
-def test_cpp_codeql_build_propagates_cmake_failures(configure_exit, build_exit):
+@pytest.mark.parametrize(
+    ("configure_exit", "build_exit", "cmake_source"),
+    [(0, 0, "path"), (1, 0, "path"), (0, 1, "path"), (0, 0, "vs"), (0, 0, "missing")],
+)
+def test_cpp_codeql_build_propagates_cmake_failures(configure_exit, build_exit, cmake_source):
     source = yaml.safe_load(_BUILD_STAGES.read_text(encoding="utf-8"))
     flags = {parameter["name"]: parameter["default"] for parameter in source["parameters"]}
     flags["isOfficial"] = True
@@ -177,16 +180,40 @@ def test_cpp_codeql_build_propagates_cmake_failures(configure_exit, build_exit):
     )
     stub = f"""
     function cmake {{
+        if ('{cmake_source}' -eq 'vs' -and $env:PATH -cne "C:\\Mock VS\\CMake\\bin;$originalPath") {{
+            throw 'Discovered CMake directory was not prepended to PATH.'
+        }}
         Write-Output "cmake $args"
         $global:LASTEXITCODE = if ($args[0] -eq '-S') {{ {configure_exit} }} else {{ {build_exit} }}
     }}
     """
+    if cmake_source != "path":
+        stub += rf"""
+        $originalPath = $env:PATH
+        ${{env:ProgramFiles(x86)}} = 'C:\Mock Program Files'
+        function Get-Command {{
+            param($Name, $ErrorAction)
+            if ($Name -ne 'cmake') {{ throw "Unexpected lookup: $Name" }}
+        }}
+        Set-Item 'Function:\global:C:\Mock Program Files\Microsoft Visual Studio\Installer\vswhere.exe' {{
+            Write-Host 'vswhere called'
+            if ('{cmake_source}' -eq 'vs') {{ 'C:\Mock VS\CMake\bin\cmake.exe' }}
+        }}
+        """
     result = subprocess.run(
         ["pwsh", "-NoProfile", "-Command", stub + script],
         capture_output=True, text=True, check=False,
     )
-    assert (result.returncode == 0) == (configure_exit == build_exit == 0)
-    assert ("cmake --build" in result.stdout) == (configure_exit == 0)
+    assert (result.returncode == 0) == (
+        configure_exit == build_exit == 0 and cmake_source != "missing"
+    ), result.stderr
+    assert ("cmake --build" in result.stdout) == (
+        configure_exit == 0 and cmake_source != "missing"
+    )
+    assert ("vswhere called" in result.stdout) == (cmake_source != "path")
+    if cmake_source == "missing":
+        assert "CMake not found on PATH or in Visual Studio." in result.stderr
+        assert "cmake -S" not in result.stdout
 
 
 @pytest.mark.parametrize("publish", [False, True])
