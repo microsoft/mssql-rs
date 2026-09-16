@@ -191,6 +191,7 @@ pub(crate) fn owned_descriptor(raw: SqlHandle) -> Result<Arc<DescHandle>, Bindin
 #[cfg(test)]
 pub(crate) mod snapshot_test_hook {
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Mutex, OnceLock};
 
     use crate::handles::StmtHandle;
@@ -213,9 +214,12 @@ pub(crate) mod snapshot_test_hook {
 
     pub(crate) struct Registration(Key);
 
+    static INSTALLED: AtomicUsize = AtomicUsize::new(0);
+
     impl Drop for Registration {
         fn drop(&mut self) {
             hooks().lock().unwrap().remove(&self.0);
+            INSTALLED.fetch_sub(1, Ordering::Release);
         }
     }
 
@@ -232,16 +236,74 @@ pub(crate) mod snapshot_test_hook {
                 .insert(key, Box::new(hook))
                 .is_none()
         );
+        INSTALLED.fetch_add(1, Ordering::Release);
         Registration(key)
     }
 
     pub(crate) fn pause(stmt: &StmtHandle, phase: Phase) {
+        if INSTALLED.load(Ordering::Acquire) == 0 {
+            return;
+        }
         let hook = hooks()
             .lock()
             .unwrap()
             .remove(&(std::ptr::from_ref(stmt) as usize, phase));
         if let Some(hook) = hook {
             hook();
+        }
+    }
+
+    #[test]
+    fn idle_pause_does_not_lock_the_hook_map() {
+        use crate::handles::handle_from_raw;
+        use crate::test_support::TestHandles;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let handles = TestHandles::with_env_dbc_stmt();
+        let stmt = handle_from_raw::<StmtHandle>(handles.stmt)
+            .unwrap()
+            .into_arc();
+        assert_eq!(INSTALLED.load(Ordering::Acquire), 0);
+        let map = hooks().lock().unwrap();
+        let (sender, receiver) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            pause(&stmt, Phase::Fetch);
+            sender.send(()).unwrap();
+        });
+        let result = receiver.recv_timeout(Duration::from_secs(10));
+        drop(map);
+        worker.join().unwrap();
+        result.unwrap();
+    }
+
+    #[test]
+    fn registration_lifetime_preserves_one_shot_hooks_and_restores_idle() {
+        use crate::handles::handle_from_raw;
+        use crate::test_support::TestHandles;
+        use std::sync::Arc;
+
+        let handles = TestHandles::with_env_dbc_stmt();
+        let stmt = handle_from_raw::<StmtHandle>(handles.stmt)
+            .unwrap()
+            .into_arc();
+        let calls = Arc::new(AtomicUsize::new(0));
+        for consume in [true, false] {
+            let called = Arc::clone(&calls);
+            let registration = install(&stmt, Phase::Fetch, move || {
+                called.fetch_add(1, Ordering::Relaxed);
+            });
+            assert_eq!(INSTALLED.load(Ordering::Acquire), 1);
+            pause(&stmt, Phase::Parameters);
+            if consume {
+                pause(&stmt, Phase::Fetch);
+                pause(&stmt, Phase::Fetch);
+            }
+            drop(registration);
+            assert_eq!(INSTALLED.load(Ordering::Acquire), 0);
+            pause(&stmt, Phase::Fetch);
+            assert!(hooks().lock().unwrap().is_empty());
+            assert_eq!(calls.load(Ordering::Relaxed), 1);
         }
     }
 }
