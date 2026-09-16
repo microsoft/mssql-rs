@@ -617,10 +617,13 @@ Driver Manager (DM) provides serialization guarantees that the driver relies on
   write access. Readers reserve ancestor activity with checked atomic updates
   and roll back preceding reservations on failure. A separate overflow preflight
   followed by unchecked increments is not safe with concurrent readers.
+  Only direct ENV calls reserve the root counter: ENV free is DM-ordered after
+  child cleanup. Descendants must still check ENV admission and retain its
+  storage/runtime; keep DBC/STMT reservations through final payload destruction.
 - **Close admission is distinct from binding use.** An executing dependent
-  API blocks close/disconnect; an idle cursor or parked DAE sequence can still
-  be cleaned up. Do not let late client hand-back repopulate a disconnected
-  connection. RAII guards must release use on all error/unwind paths.
+  API blocks connection/statement close and disconnect; an idle cursor or parked
+  DAE sequence can still be cleaned up. Do not let late client hand-back repopulate
+  a disconnected connection. RAII guards must release use on all error/unwind paths.
   Cleanup beneath a close claim must use retained owners, not reacquire child
   IDs through public admission. Test that the cursor drain and rollback really
   execute while new acquisitions remain blocked; `SQL_SUCCESS` from disconnect

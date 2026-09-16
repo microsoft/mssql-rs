@@ -4,6 +4,7 @@
 use std::any::Any;
 use std::collections::HashMap;
 use std::fmt;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::num::NonZeroUsize;
 use std::ops::Deref;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
@@ -63,6 +64,37 @@ impl fmt::Display for RegistryError {
 
 impl std::error::Error for RegistryError {}
 
+// The registry inserts only allocator-issued integer keys.
+#[derive(Default)]
+struct IdHasher(u64);
+
+impl Hasher for IdHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.write_u64(u64::from(byte));
+        }
+    }
+
+    fn write_usize(&mut self, value: usize) {
+        match u64::try_from(value) {
+            Ok(value) => self.write_u64(value),
+            Err(_) => self.write(&value.to_ne_bytes()),
+        }
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        self.0 = (self.0 ^ value)
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            .rotate_left(26);
+    }
+}
+
+type IdBuildHasher = BuildHasherDefault<IdHasher>;
+
 const OPEN: u8 = 0;
 const CLOSING: u8 = 1;
 const RETIRED: u8 = 2;
@@ -90,6 +122,13 @@ impl HandleActivity {
 
     fn ancestors(&self) -> impl Iterator<Item = &Self> {
         std::iter::successors(Some(self), |activity| activity.parent.as_deref())
+    }
+
+    /// Only direct ENV calls reserve the root: child-before-parent ENV free is
+    /// DM-ordered. Descendants still check its admission.
+    fn reserved(&self) -> impl Iterator<Item = &Self> {
+        self.ancestors()
+            .filter(|activity| activity.parent.is_some() || std::ptr::eq(*activity, self))
     }
 
     fn root(&self) -> &Self {
@@ -174,7 +213,7 @@ impl<T> Deref for HandleRef<T> {
 
 impl Drop for ActivityLease {
     fn drop(&mut self) {
-        for activity in self.activity.ancestors() {
+        for activity in self.activity.reserved() {
             activity.active.fetch_sub(1, Ordering::Release);
         }
     }
@@ -204,7 +243,7 @@ struct RegistryEntry {
 }
 
 struct RegistryState {
-    entries: HashMap<HandleId, RegistryEntry>,
+    entries: HashMap<HandleId, RegistryEntry, IdBuildHasher>,
     next_id: NonZeroUsize,
     #[cfg(test)]
     id_limit: NonZeroUsize,
@@ -279,7 +318,7 @@ impl HandleRegistry {
     pub(crate) fn new() -> Self {
         Self {
             state: RwLock::new(RegistryState {
-                entries: HashMap::new(),
+                entries: HashMap::default(),
                 next_id: NonZeroUsize::MIN,
                 #[cfg(test)]
                 id_limit: NonZeroUsize::MAX,
@@ -397,7 +436,7 @@ impl HandleRegistry {
         let activity = Arc::clone(&entry.activity);
         // Readers may reserve the same ancestors concurrently. Close and
         // retirement take the write lock and cannot observe partial reservations.
-        for (reserved, ancestor) in activity.ancestors().enumerate() {
+        for (reserved, ancestor) in activity.reserved().enumerate() {
             if ancestor
                 .active
                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
@@ -405,7 +444,7 @@ impl HandleRegistry {
                 })
                 .is_err()
             {
-                for previous in activity.ancestors().take(reserved) {
+                for previous in activity.reserved().take(reserved) {
                     previous.active.fetch_sub(1, Ordering::Release);
                 }
                 drop(state);
@@ -569,6 +608,7 @@ impl HandleRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::hash::BuildHasher;
     use std::sync::mpsc::{self, Receiver, Sender};
     use std::sync::{Barrier, Mutex, Weak};
     use std::thread;
@@ -628,6 +668,34 @@ mod tests {
         fn drop(&mut self) {
             self.drops.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    #[test]
+    fn handle_ids_hash_as_whole_integers_at_pointer_width_boundaries() {
+        let hasher = IdBuildHasher::default();
+        let mut hashes = std::collections::HashSet::new();
+        for value in [1, 2, 255, 256, usize::MAX >> 1, usize::MAX] {
+            let id = HandleId(NonZeroUsize::new(value).unwrap());
+            let hash = hasher.hash_one(id);
+            let expected = u64::try_from(value)
+                .unwrap()
+                .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                .rotate_left(26);
+            assert_eq!(hash, expected);
+            assert!(hashes.insert(hash));
+        }
+    }
+
+    #[test]
+    fn integer_hasher_byte_writes_preserve_streaming_state() {
+        let mut combined = IdHasher::default();
+        combined.write(&[1, 2, 3]);
+        let mut split = IdHasher::default();
+        split.write(&[1]);
+        split.write(&[]);
+        split.write(&[2, 3]);
+        assert_eq!(combined.finish(), split.finish());
+        assert_ne!(combined.finish(), IdHasher::default().finish());
     }
 
     #[test]
@@ -967,22 +1035,25 @@ mod tests {
     #[test]
     fn into_arc_ends_the_call_without_releasing_structural_ownership() {
         let registry = HandleRegistry::new();
-        let (parent, parent_activity) = register(&registry, HandleType::Env, None);
+        let (_, root) = register(&registry, HandleType::Env, None);
+        let (parent, parent_activity) =
+            register(&registry, HandleType::Dbc, Some(Arc::clone(&root)));
         let (child, child_activity) = register(
             &registry,
-            HandleType::Dbc,
+            HandleType::Stmt,
             Some(Arc::clone(&parent_activity)),
         );
-        let handle = registry.acquire::<u32>(child, HandleType::Dbc).unwrap();
+        let handle = registry.acquire::<u32>(child, HandleType::Stmt).unwrap();
+        assert_eq!(count(&root), 0);
         assert_eq!(count(&parent_activity), 1);
         assert_eq!(count(&child_activity), 1);
         let structural = handle.into_arc();
         assert_eq!(count(&parent_activity), 0);
         assert_eq!(count(&child_activity), 0);
-        let parent_ref = registry.acquire::<u32>(parent, HandleType::Env).unwrap();
+        let parent_ref = registry.acquire::<u32>(parent, HandleType::Dbc).unwrap();
         let closing = registry.begin_close(&parent_ref).unwrap();
         registry
-            .retire_batch(&[(parent, HandleType::Env), (child, HandleType::Dbc)])
+            .retire_batch(&[(parent, HandleType::Dbc), (child, HandleType::Stmt)])
             .unwrap();
         assert_eq!(*structural, 42);
         drop(closing);
@@ -1115,15 +1186,12 @@ mod tests {
     }
 
     #[test]
-    fn implicit_descriptor_call_blocks_statement_connection_and_environment_close() {
+    fn implicit_descriptor_call_blocks_statement_and_connection_close() {
         let tree = Tree::new();
         let descriptor = tree.acquire(tree.implicit_desc, HandleType::Desc);
         assert_eq!(count(&tree.stmt_activity), 1);
-        for (id, kind) in [
-            (tree.stmt, HandleType::Stmt),
-            (tree.dbc, HandleType::Dbc),
-            (tree.env, HandleType::Env),
-        ] {
+        assert_eq!(count(&tree.env_activity), 0);
+        for (id, kind) in [(tree.stmt, HandleType::Stmt), (tree.dbc, HandleType::Dbc)] {
             let parent = tree.acquire(id, kind);
             assert_eq!(
                 tree.registry.begin_close(&parent).err(),
@@ -1136,25 +1204,63 @@ mod tests {
     }
 
     #[test]
-    fn explicit_descriptor_call_blocks_connection_and_environment_but_not_statement() {
+    fn explicit_descriptor_call_blocks_connection_but_not_statement() {
         let tree = Tree::new();
         let descriptor = tree.acquire(tree.explicit_desc, HandleType::Desc);
         assert_eq!(count(&tree.stmt_activity), 0);
         assert_eq!(count(&tree.dbc_activity), 1);
-        assert_eq!(count(&tree.env_activity), 1);
-        for (id, kind) in [(tree.dbc, HandleType::Dbc), (tree.env, HandleType::Env)] {
-            let parent = tree.acquire(id, kind);
-            assert_eq!(
-                tree.registry.begin_close(&parent).err(),
-                Some(RegistryError::Busy)
-            );
-        }
+        assert_eq!(count(&tree.env_activity), 0);
+        let connection = tree.acquire(tree.dbc, HandleType::Dbc);
+        assert_eq!(
+            tree.registry.begin_close(&connection).err(),
+            Some(RegistryError::Busy)
+        );
+        drop(connection);
         let stmt = tree.acquire(tree.stmt, HandleType::Stmt);
         drop(tree.registry.begin_close(&stmt).unwrap());
         drop(descriptor);
         assert_eq!(count(&tree.dbc_activity), 1);
         drop(stmt);
         assert_eq!(count(&tree.dbc_activity), 0);
+    }
+
+    #[test]
+    fn statement_call_blocks_connection_close_but_not_dm_ordered_environment_close() {
+        let tree = Tree::new();
+        let statement = tree.acquire(tree.stmt, HandleType::Stmt);
+        let connection = tree.acquire(tree.dbc, HandleType::Dbc);
+        assert_eq!(
+            tree.registry.begin_close(&connection).err(),
+            Some(RegistryError::Busy)
+        );
+        assert_eq!(count(&tree.env_activity), 0);
+
+        let environment = tree.acquire(tree.env, HandleType::Env);
+        let another_env_call = tree.acquire(tree.env, HandleType::Env);
+        assert_eq!(
+            tree.registry.begin_close(&environment).err(),
+            Some(RegistryError::Busy)
+        );
+        drop(another_env_call);
+        let closing = tree.registry.begin_close(&environment).unwrap();
+        assert_eq!(count(&tree.env_activity), 1);
+        assert_eq!(
+            tree.registry
+                .acquire::<u32>(tree.stmt, HandleType::Stmt)
+                .err(),
+            Some(RegistryError::Busy)
+        );
+        assert_eq!(*statement, 42);
+        drop(closing);
+        drop(tree.acquire(tree.stmt, HandleType::Stmt));
+        tree.registry.retire(tree.env, HandleType::Env).unwrap();
+        assert_eq!(
+            tree.registry
+                .acquire::<u32>(tree.stmt, HandleType::Stmt)
+                .err(),
+            Some(RegistryError::NotFound)
+        );
+        assert_eq!(*statement, 42);
     }
 
     #[test]
@@ -1275,7 +1381,7 @@ mod tests {
     #[test]
     fn overflow_rolls_back_preceding_counters_at_any_depth() {
         let tree = Tree::new();
-        for saturated in [&tree.env_activity, &tree.dbc_activity, &tree.stmt_activity] {
+        for saturated in [&tree.dbc_activity, &tree.stmt_activity] {
             saturated.active.store(usize::MAX, Ordering::Release);
             assert_eq!(
                 tree.registry
@@ -1323,9 +1429,10 @@ mod tests {
     #[test]
     fn concurrent_readers_cannot_overflow_a_shared_ancestor() {
         let registry = Arc::new(HandleRegistry::new());
-        let (_, parent) = register(&registry, HandleType::Env, None);
+        let (_, root) = register(&registry, HandleType::Env, None);
+        let (_, parent) = register(&registry, HandleType::Dbc, Some(root));
         let children: Vec<_> = (0..32)
-            .map(|_| register(&registry, HandleType::Dbc, Some(Arc::clone(&parent))))
+            .map(|_| register(&registry, HandleType::Stmt, Some(Arc::clone(&parent))))
             .collect();
         parent.active.store(usize::MAX - 1, Ordering::Release);
 
@@ -1341,7 +1448,7 @@ mod tests {
                 thread::spawn(move || {
                     start.wait();
                     sender
-                        .send(registry.acquire::<u32>(id, HandleType::Dbc))
+                        .send(registry.acquire::<u32>(id, HandleType::Stmt))
                         .unwrap();
                 })
             })
@@ -1913,10 +2020,10 @@ mod tests {
         });
         receive(&entered_rx);
         let ancestors = [
-            (tree.env, HandleType::Env, &tree.env_activity),
             (tree.dbc, HandleType::Dbc, &tree.dbc_activity),
             (tree.stmt, HandleType::Stmt, &tree.stmt_activity),
         ];
+        assert_eq!(count(&tree.env_activity), 0);
         let mut blocked_results = Vec::new();
         for (id, kind, activity) in ancestors {
             let ancestor = tree.acquire(id, kind);

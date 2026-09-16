@@ -167,6 +167,13 @@ Registry lookups share read access. Allocation, close admission, and retirement
 take exclusive registry access; concurrent acquisitions reserve ancestor activity
 counts with checked atomic updates and roll back earlier reservations on failure.
 Handle-state locks and payload destruction remain outside the registry lock.
+Only calls targeting ENV reserve its activity counter; ENV free remains subject
+to the DM's child-before-parent ordering contract. Descendants still check ENV
+admission and retain its storage/runtime through owning references. Connection
+and statement close still reject executing dependent calls. A caller violating
+ENV free ordering may retire the ENV and invalidate later child calls rather
+than receive a busy error in release builds. The registry uses an integer hasher
+for its allocator-issued keys.
 
 Allocation cycles through the full nonzero pointer-sized namespace and skips
 IDs that are still live. There is no cumulative allocation budget: retiring
@@ -189,9 +196,9 @@ can change between result-processing calls but not during the final output write
 `SQLGetData`, public cursor close, and result advancement hold row-use admission until
 completion; they cannot overlap fetch or new input staging on the same statement.
 Association changes, snapshot admission, and binding mutations share a short
-DBC lock; that lock is released before network I/O. Close/disconnect admission
-separately excludes executing dependent calls, without treating an idle cursor
-or parked data-at-execution sequence as a permanently active API call.
+DBC lock; that lock is released before network I/O. Connection/statement close
+and disconnect admission exclude executing dependent calls, without treating an
+idle cursor or parked data-at-execution sequence as a permanently active API call.
 
 The public ODBC ABI is unchanged. Applications must still keep bound buffers
 valid and must not unload the driver while calls are executing. Normal final

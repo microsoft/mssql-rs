@@ -67,7 +67,7 @@ pub(crate) unsafe fn sql_free_handle(handle_type: SqlSmallInt, handle: SqlHandle
     })
 }
 
-/// Retires an ENV after excluding dependent calls. The DM still guarantees
+/// Retires an ENV after excluding other ENV calls. The DM guarantees
 /// child DBCs are freed first; final allocation release joins its runtime.
 ///
 /// # Safety
