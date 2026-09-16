@@ -369,15 +369,16 @@ TEST_F(GetDataLiveTest, BackwardColumnRejectedRereadIsNoData) {
 // SQLGetData calls. Each partial call returns SQL_SUCCESS_WITH_INFO (01004);
 // the final call returns SQL_SUCCESS.
 TEST_F(GetDataLiveTest, PlpVarcharMaxStreamed) {
-    const int kTotal = 9000;
+    const int kTotal = 20000;
     ASSERT_SQL_OK(ExecDirect(
-                      "SELECT REPLICATE(CAST('A' AS VARCHAR(MAX)), 9000) AS c1"),
+                      "SELECT REPLICATE(CAST('A' COLLATE SQL_Latin1_General_CP1_CI_AS "
+                      "AS VARCHAR(MAX)), 20000) AS c1"),
                   SQL_HANDLE_STMT, stmt_);
 
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
 
     std::string assembled;
-    SQLCHAR buf[1024];
+    SQLCHAR buf[8192];
     SQLLEN ind = 0;
     SQLRETURN rc;
     int guard = 0;
@@ -392,6 +393,7 @@ TEST_F(GetDataLiveTest, PlpVarcharMaxStreamed) {
     EXPECT_EQ(SQL_SUCCESS, rc);
     EXPECT_EQ(static_cast<size_t>(kTotal), assembled.size());
     EXPECT_EQ(std::string(kTotal, 'A'), assembled);
+    EXPECT_EQ(3, guard) << "ASCII should fill each 8191-byte payload slot";
 
     // Stream exhausted: a further call for the same column yields SQL_NO_DATA.
     rc = SQLGetData(stmt_, 1, SQL_C_CHAR, buf, sizeof(buf), &ind);
@@ -1146,8 +1148,8 @@ TEST_F(GetDataLiveTest, VarcharMaxDbcsToCharSplitsCharacterAcrossChunks) {
 
 // Chunking must be invisible on the SQL_C_CHAR path too: the same column read
 // in one call and in many must produce the same value. A buffer of 7 is the
-// tightest interesting size -- decoding expands, so the driver's read has to be
-// sized down from the caller's capacity or output overruns every call.
+// tightest interesting size -- decoding expands, so surplus output must carry
+// into later calls without being lost or decoded twice.
 TEST_F(GetDataLiveTest, VarcharMaxCp1252ToCharChunkSizeDoesNotChangeValue) {
     const char* kQuery =
         "SELECT REPLICATE(CAST(N'caf' + NCHAR(0xE9) + N' Gr' + NCHAR(0xF6) + NCHAR(0xDF) "
