@@ -7,7 +7,11 @@ components:
 - **`mssql_py_core`** — a PyO3 extension that implements the SQL Server TDS
   protocol in Rust. It backs high-throughput paths (such as bulk copy) for the
   [`mssql-python`](https://github.com/microsoft/mssql-python) driver.
-- **`mssqlodbc`** — a Rust ODBC driver for SQL Server.
+- **`mssqlodbc`** (alpha) — an ODBC driver for SQL Server, implemented in
+  Rust. It exposes the native ODBC C API. It is under active development and
+  validation for use as an opt-in backend for the `mssql-python` driver. It is
+  not yet a complete general-purpose replacement for Microsoft ODBC Driver 18
+  for SQL Server.
 
 `mssql-python-rs` is the native runtime that
 [`mssql-python`](https://github.com/microsoft/mssql-python) depends on.
