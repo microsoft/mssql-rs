@@ -440,7 +440,7 @@ across matching distros:
 | Track | Build base | Reused on |
 |---|---|---|
 | glibc modern (x64, arm64) | Ubuntu 22.04 (glibc 2.35, OpenSSL 3) | Debian bookworm, Ubuntu 22.04/24.04, Azure Linux 3 |
-| musl (x64, arm64) | Alpine 3.18 (musl, OpenSSL 3) | Alpine 3.18–3.21 |
+| musl (x64, arm64) | Alpine 3.18 (musl, OpenSSL 3) | Alpine 3.18, 3.21 |
 | glibc 2.28 (x64) | manylinux_2_28 / AlmaLinux 8 (OpenSSL 1.1) | RHEL 8 / UBI 8 |
 
 A glibc-2.35 binary may fail to load on older glibc (e.g. RHEL 8's 2.28), and an

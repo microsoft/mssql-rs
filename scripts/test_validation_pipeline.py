@@ -161,6 +161,81 @@ def test_linux_compilation_and_pr_tests_remain_enabled(architecture):
     assert "/workspace/.pipeline/scripts/containerized-test.sh" in tests["script"]
 
 
+def test_miri_is_limited_to_windows_and_linux_x64_pr_jobs():
+    build = next(
+        stage for stage in load_template("validation-stages.yml")["stages"]
+        if stage["stage"] == "Build"
+    )
+    toolchain = build["variables"]["miriToolchain"]
+    assert re.fullmatch(r"nightly-\d{4}-\d{2}-\d{2}", toolchain)
+    readme = (_ROOT / "mssql-odbc" / "README.md").read_text(encoding="utf-8")
+    assert set(re.findall(r"nightly-\d{4}-\d{2}-\d{2}", readme)) == {toolchain}, (
+        "Update the README's Miri version when changing miriToolchain"
+    )
+    expected = {
+        "Build_Windows": ("pwsh", "x86_64-pc-windows-msvc", "Windows x64"),
+        "Build_Linux": ("bash", "x86_64-unknown-linux-gnu", "Linux x64"),
+    }
+    found = set()
+    for job in build["jobs"]:
+        runs = [
+            step for step in job.get("steps", [])
+            if step.get("displayName", "").startswith("Run ODBC Miri tests")
+        ]
+        if not runs:
+            continue
+        found.add(job["job"])
+        shell, target, label = expected[job["job"]]
+        assert len(runs) == 1
+        run = runs[0]
+        assert run["condition"] == _PR
+        assert not run.get("continueOnError", False)
+        command = run[shell]
+        assert "rustup toolchain install $(miriToolchain)" in command
+        assert "--component miri,rust-src" in command
+        assert f"cargo +$(miriToolchain) miri setup --target {target}" in command
+        assert "cargo +$(miriToolchain) miri nextest run" in command
+        assert command.count("$(miriToolchain)") == 3
+        assert "nightly-" not in command
+        assert f"--target {target}" in command
+        for argument in (
+            "--frozen", "--package mssqlodbc", "--lib",
+            "--profile miri-odbc", "--no-fail-fast", "--no-tests=fail",
+        ):
+            assert argument in command
+        if shell == "pwsh":
+            assert command.count("if ($LASTEXITCODE -ne 0) { throw ") == 3
+            assert run["env"]["MIRIFLAGS"] == "-Zmiri-seed=0"
+        else:
+            assert command.count("set -euo pipefail") == 2
+            assert "docker-cargo-run.sh --rm" in command
+            assert "ghcr.io/microsoft/mssql-rs/build/ubuntu:22.04" in command
+            assert "-e MIRIFLAGS=-Zmiri-seed=0" in command
+        publish = next(
+            step for step in job["steps"]
+            if step.get("displayName") == f"Publish ODBC Miri test results ({label})"
+        )
+        assert job["steps"].index(run) < job["steps"].index(publish)
+        assert publish["task"] == "PublishTestResults@2"
+        assert publish["condition"] == _PR.replace("succeeded()", "succeededOrFailed()")
+        assert publish["inputs"]["testResultsFormat"] == "JUnit"
+        assert publish["inputs"]["testResultsFiles"] == (
+            "$(Build.SourcesDirectory)/target/nextest/miri-odbc/junit.xml"
+        )
+        assert publish["inputs"]["failTaskOnFailedTests"] is True
+        assert publish["inputs"]["failTaskOnMissingResultsFile"] is True
+    assert found == expected.keys()
+
+
+def test_shared_miri_filter_does_not_require_the_odbc_package():
+    config = (_ROOT / ".config" / "nextest.toml").read_text(encoding="utf-8")
+    profile = config.split("[profile.miri-odbc]\n", 1)[1].split("\n[", 1)[0]
+    assert (
+        "default-filter = 'test(::memory_safety::) | "
+        "test(conversion::param_buffer::tests::misaligned_)'"
+    ) in profile
+
+
 def test_macos_pr_runs_native_odbc_e2e_against_existing_sql():
     stages = load_template("validation-stages.yml")["stages"]
     build = next(stage for stage in stages if stage["stage"] == "Build")

@@ -91,6 +91,75 @@ Run the Rust test suite from the repository root:
 cargo nextest run -p mssqlodbc --lib
 ```
 
+### Buffer safety with Miri
+
+The `miri-odbc` nextest profile selects the opt-in `memory_safety` unit-test
+modules and the parameter reader's existing misalignment tests. They cover
+unaligned values and indicators, initialized read extents, string terminators
+and capacities, fixed-width writes, untouched error outputs, and reuse of caller
+buffers. They also run as ordinary unit tests; no production code is replaced
+under Miri. The UTF-16 reader cases check both aligned and byte-offset input,
+preserving lossy decoding, explicit lengths, and NUL termination. Parameter
+cases vary value, indicator, and length alignment independently, including
+temporal inputs, ignored storage, and length sentinels. Column-wise arrays and
+packed row-wise parameter bindings exercise production address calculations
+with nonzero offsets and distinct first/last values.
+
+The SQL NULL case with an uninitialized octet-length slot tests only
+`read_indicator`'s early return, not full execution. Execution's earlier
+data-at-execution probes still require readable, initialized non-null
+octet-length slots for input and input/output parameters.
+
+PR validation runs this profile under Miri on **Windows x64 and Linux x64**
+only, using `nightly-2026-09-06` and seed 0. The Linux job uses the existing
+Ubuntu build container. Test failures and empty selections fail the job, and
+each platform publishes a separate ODBC Miri JUnit report. The ordinary native
+test run still includes these tests; ARM64, macOS, and Alpine do not run Miri.
+The `--package mssqlodbc` option scopes the run to the driver. The shared filter
+uses only test names so it also parses in the smaller Kerberos workspace,
+which omits ODBC.
+
+The Build stage's `miriToolchain` variable in
+`.pipeline/templates/validation-stages.yml` holds the CI pin; keep the local
+commands below on the same version when updating it.
+
+From the repository root, with `cargo-nextest` installed:
+
+```powershell
+cargo fetch
+rustup toolchain install nightly-2026-09-06 --profile minimal --component miri,rust-src
+cargo +nightly-2026-09-06 miri nextest run --frozen -p mssqlodbc --lib --profile miri-odbc
+```
+
+`cargo fetch` creates the local, gitignored lockfile and restores dependencies
+before the frozen run. On Windows, a long checkout path can make Cargo use a
+compiler response file, which this Miri version does not support. In that case,
+set a short, dedicated build directory before running Miri:
+
+```powershell
+$env:CARGO_TARGET_DIR = Join-Path $env:TEMP "odbc-miri"
+```
+
+Run the same selection natively with:
+
+```powershell
+cargo nextest run --frozen -p mssqlodbc --lib --profile miri-odbc
+```
+
+The tests keep unread input tails uninitialized so Miri can detect over-reads
+that stay inside an allocation. Output sentinels additionally catch writes
+outside the declared slot even when those writes remain inside the backing
+allocation. Deliberate misalignment is asserted before the call, and C struct
+padding is not assumed to be initialized.
+
+This profile intentionally excludes handle fixtures (which start an I/O-enabled
+Tokio runtime), socket-based mock servers, native authentication/TLS, and the
+C++ Driver Manager tests. It does not test Windows DLL unloading or replace
+native end-to-end tests or fuzzing. Keep Miri's alignment and aliasing checks
+enabled; a passing run covers only the inputs and executions exercised.
+
+### C++ end-to-end tests
+
 The C++ end-to-end suite loads the built library through the real ODBC Driver
 Manager and exercises the exported API:
 

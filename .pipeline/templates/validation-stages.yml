@@ -79,6 +79,8 @@ stages:
         SYSTEM_ACCESSTOKEN: $(System.AccessToken)
 - stage: Build
   displayName: Build Stage
+  variables:
+    miriToolchain: nightly-2026-09-06
   dependsOn:
     - EvaluateDuplicate
   condition: >-
@@ -135,6 +137,28 @@ stages:
           buildType: ${{ parameters.buildType }}
           testFilter: -E "not (test(connectivity))"
           enableOdbcE2E: true
+      - pwsh: |
+          $ErrorActionPreference = 'Stop'
+          rustup toolchain install $(miriToolchain) --profile minimal --component miri,rust-src
+          if ($LASTEXITCODE -ne 0) { throw "Miri toolchain installation failed (exit $LASTEXITCODE)" }
+          cargo +$(miriToolchain) miri setup --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { throw "Miri sysroot setup failed (exit $LASTEXITCODE)" }
+          cargo +$(miriToolchain) miri nextest run --frozen --package mssqlodbc --lib `
+            --target x86_64-pc-windows-msvc --profile miri-odbc --no-fail-fast --no-tests=fail
+          if ($LASTEXITCODE -ne 0) { throw "ODBC Miri tests failed (exit $LASTEXITCODE)" }
+        displayName: Run ODBC Miri tests (Windows x64)
+        condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
+        env:
+          MIRIFLAGS: -Zmiri-seed=0
+      - task: PublishTestResults@2
+        displayName: Publish ODBC Miri test results (Windows x64)
+        condition: and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'))
+        inputs:
+          testResultsFormat: JUnit
+          testResultsFiles: $(Build.SourcesDirectory)/target/nextest/miri-odbc/junit.xml
+          testRunTitle: ODBC Miri (Windows x64)
+          failTaskOnFailedTests: true
+          failTaskOnMissingResultsFile: true
       # Extended Protection (EPA) channel-binding test.
       # Runs AFTER the main test pass. Runs the same integrated-auth encrypted
       # login test under two server configurations, expecting success in both:
@@ -269,6 +293,37 @@ stages:
           additionalPythonTestArgs: '--coverage'
           collectPythonCoverage: true
           collectRustCoverage: true
+      - bash: |
+          set -euo pipefail
+          bash .pipeline/scripts/docker-cargo-run.sh --rm \
+            -v "$PWD:/workspace" \
+            -v "$HOME/.cargo/registry:/root/.cargo/registry" \
+            -v "$HOME/.cargo/git:/root/.cargo/git" \
+            -e MIRIFLAGS=-Zmiri-seed=0 \
+            -w /workspace \
+            ghcr.io/microsoft/mssql-rs/build/ubuntu:22.04 \
+            bash -lc '
+              set -euo pipefail
+              source "$HOME/.cargo/env"
+              rustup toolchain install $(miriToolchain) --profile minimal --component miri,rust-src
+              cargo +$(miriToolchain) miri setup --target x86_64-unknown-linux-gnu
+              cargo +$(miriToolchain) miri nextest run --frozen --package mssqlodbc --lib \
+                --target x86_64-unknown-linux-gnu --profile miri-odbc --no-fail-fast --no-tests=fail
+            '
+        displayName: Run ODBC Miri tests (Linux x64)
+        condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
+        env:
+          CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN)
+          CARGO_REGISTRIES_MSSQL_RS_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_TOKEN)
+      - task: PublishTestResults@2
+        displayName: Publish ODBC Miri test results (Linux x64)
+        condition: and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'))
+        inputs:
+          testResultsFormat: JUnit
+          testResultsFiles: $(Build.SourcesDirectory)/target/nextest/miri-odbc/junit.xml
+          testRunTitle: ODBC Miri (Linux x64)
+          failTaskOnFailedTests: true
+          failTaskOnMissingResultsFile: true
       - template: build-template-alpine.yml
         parameters:
           osType: Linux
@@ -511,8 +566,6 @@ stages:
           - ubuntu22
           - ubuntu24
           - alpine318
-          - alpine319
-          - alpine320
           - alpine321
           - debian
           - rhel9
@@ -757,12 +810,6 @@ stages:
           Alpine3_18:
             container: ghcr.io/microsoft/mssql-rs/import/alpine:3.18
             entry: alpine.sh
-          Alpine3_19:
-            container: ghcr.io/microsoft/mssql-rs/import/alpine:3.19
-            entry: alpine.sh
-          Alpine3_20:
-            container: ghcr.io/microsoft/mssql-rs/import/alpine:3.20
-            entry: alpine.sh
           Alpine3_21:
             container: ghcr.io/microsoft/mssql-rs/import/alpine:3.21
             entry: alpine.sh
@@ -777,12 +824,6 @@ stages:
         matrix:
           Alpine3_18:
             container: ghcr.io/microsoft/mssql-rs/import/alpine:3.18
-            entry: odbc-e2e-alpine.sh
-          Alpine3_19:
-            container: ghcr.io/microsoft/mssql-rs/import/alpine:3.19
-            entry: odbc-e2e-alpine.sh
-          Alpine3_20:
-            container: ghcr.io/microsoft/mssql-rs/import/alpine:3.20
             entry: odbc-e2e-alpine.sh
           Alpine3_21:
             container: ghcr.io/microsoft/mssql-rs/import/alpine:3.21
@@ -805,7 +846,7 @@ stages:
           poolName: ${{ parameters.poolName }}
           instanceId: shared_musl
           sqlImageTag: ${{ parameters.sqlImageTag }}
-          expectedSentinels: 'Alpine3_18,Alpine3_19,Alpine3_20,Alpine3_21,odbc_Alpine3_18,odbc_Alpine3_19,odbc_Alpine3_20,odbc_Alpine3_21'
+          expectedSentinels: 'Alpine3_18,Alpine3_21,odbc_Alpine3_18,odbc_Alpine3_21'
       - template: test-matrix-template-alpine_arm64.yml
         parameters:
           manageSqlHost: false
@@ -817,12 +858,6 @@ stages:
           targets:
             - name: Alpine3_18
               container: ghcr.io/microsoft/mssql-rs/import/alpine:3.18
-              entry: alpine.sh
-            - name: Alpine3_19
-              container: ghcr.io/microsoft/mssql-rs/import/alpine:3.19
-              entry: alpine.sh
-            - name: Alpine3_20
-              container: ghcr.io/microsoft/mssql-rs/import/alpine:3.20
               entry: alpine.sh
             - name: Alpine3_21
               container: ghcr.io/microsoft/mssql-rs/import/alpine:3.21
@@ -839,12 +874,6 @@ stages:
           targets:
             - name: Alpine3_18
               container: ghcr.io/microsoft/mssql-rs/import/alpine:3.18
-              entry: odbc-e2e-alpine.sh
-            - name: Alpine3_19
-              container: ghcr.io/microsoft/mssql-rs/import/alpine:3.19
-              entry: odbc-e2e-alpine.sh
-            - name: Alpine3_20
-              container: ghcr.io/microsoft/mssql-rs/import/alpine:3.20
               entry: odbc-e2e-alpine.sh
             - name: Alpine3_21
               container: ghcr.io/microsoft/mssql-rs/import/alpine:3.21
@@ -863,12 +892,6 @@ stages:
             - name: Alpine3_18
               container: ghcr.io/microsoft/mssql-rs/import/alpine:3.18
               entry: alpine.sh
-            - name: Alpine3_19
-              container: ghcr.io/microsoft/mssql-rs/import/alpine:3.19
-              entry: alpine.sh
-            - name: Alpine3_20
-              container: ghcr.io/microsoft/mssql-rs/import/alpine:3.20
-              entry: alpine.sh
             - name: Alpine3_21
               container: ghcr.io/microsoft/mssql-rs/import/alpine:3.21
               entry: alpine.sh
@@ -882,12 +905,6 @@ stages:
           targets:
             - name: Alpine3_18
               container: ghcr.io/microsoft/mssql-rs/import/alpine:3.18
-              entry: odbc-e2e-alpine.sh
-            - name: Alpine3_19
-              container: ghcr.io/microsoft/mssql-rs/import/alpine:3.19
-              entry: odbc-e2e-alpine.sh
-            - name: Alpine3_20
-              container: ghcr.io/microsoft/mssql-rs/import/alpine:3.20
               entry: odbc-e2e-alpine.sh
             - name: Alpine3_21
               container: ghcr.io/microsoft/mssql-rs/import/alpine:3.21

@@ -12328,6 +12328,62 @@ mod tests {
         );
     }
 
+    // ── Autocommit OutstandingRequestCount wire format ──
+    //
+    // MS-TDS 2.2.5.3.2 requires OutstandingRequestCount to be 1 on every
+    // request while the connection has no active transaction descriptor
+    // (autocommit mode). It used to come from a single process-wide `static`
+    // counter (see the fix for the "outstanding request count" bug), so it
+    // grew across *every* non-transactional request issued anywhere in the
+    // test binary — even ones from unrelated connections — instead of
+    // staying pinned at 1 per request.
+
+    /// Extracts, in wire order, the OutstandingRequestCount carried by every
+    /// autocommit TransactionDescriptor (ALL_HEADERS) header found in `sent`.
+    fn autocommit_outstanding_request_counts(sent: &[u8]) -> Vec<u32> {
+        // TransactionDescriptorHeader::write_async serializes, in order:
+        // HeaderLength=18 (u32 LE), HeaderType=0x0002 (u16 LE),
+        // TransactionDescriptor=0 (u64 LE — autocommit), then
+        // OutstandingRequestCount (u32 LE), which this scan reads off the end.
+        const PREFIX: [u8; 14] = [18, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        sent.windows(PREFIX.len())
+            .enumerate()
+            .filter(|(_, window)| *window == PREFIX)
+            .map(|(i, _)| {
+                let start = i + PREFIX.len();
+                u32::from_le_bytes(sent[start..start + 4].try_into().unwrap())
+            })
+            .collect()
+    }
+
+    /// Repro for the bug fixed by replacing the static counter: two
+    /// interleaved, independent connections must each see a constant `1`,
+    /// never a value influenced by requests sent on the other connection.
+    #[tokio::test]
+    async fn autocommit_requests_always_report_outstanding_count_of_one() {
+        let (mut client_a, sent_a) = create_capturing_client(vec![done_no_more(), done_no_more()]);
+        let (mut client_b, sent_b) = create_capturing_client(vec![done_no_more()]);
+
+        client_a.execute("SELECT 1".to_string(), ()).await.unwrap();
+        client_b.execute("SELECT 2".to_string(), ()).await.unwrap();
+        client_a.execute("SELECT 3".to_string(), ()).await.unwrap();
+
+        let counts_a = autocommit_outstanding_request_counts(&sent_a.lock().unwrap());
+        let counts_b = autocommit_outstanding_request_counts(&sent_b.lock().unwrap());
+
+        assert_eq!(
+            counts_a,
+            vec![1, 1],
+            "connection A's autocommit requests must each report count 1"
+        );
+        assert_eq!(
+            counts_b,
+            vec![1],
+            "connection B's autocommit request must report count 1, \
+             not a value bumped by connection A's requests"
+        );
+    }
+
     // The server can report an error and still return a `@handle` for the plan
     // it allocated. The drain records that handle, so the statement must carry
     // the id naming it or the entry — and the server-side plan — is unreachable.
