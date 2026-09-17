@@ -61,10 +61,12 @@ use crate::{
     token::tokens::{CurrentCommand, DoneStatus},
 };
 
+pub(crate) const DONE_PAYLOAD_LEN: usize = 12;
+
 pub(crate) async fn read_done_token<T: TdsPacketReader + Send + Sync>(
     reader: &mut T,
 ) -> TdsResult<DoneToken> {
-    if let Some(bytes) = reader.try_read_slice(12) {
+    if let Some(bytes) = reader.try_read_slice(DONE_PAYLOAD_LEN) {
         return buffered_done_token(bytes).ok_or_else(|| {
             crate::error::Error::ProtocolError("Buffered DONE payload is incomplete".to_string())
         });
@@ -80,7 +82,7 @@ pub(crate) async fn read_done_token<T: TdsPacketReader + Send + Sync>(
 }
 
 pub(crate) fn buffered_done_token(bytes: &[u8]) -> Option<DoneToken> {
-    let bytes: &[u8; 12] = bytes.get(..12)?.try_into().ok()?;
+    let bytes: &[u8; DONE_PAYLOAD_LEN] = bytes.get(..DONE_PAYLOAD_LEN)?.try_into().ok()?;
     Some(DoneToken {
         status: DoneStatus::from(u16::from_le_bytes([bytes[0], bytes[1]])),
         cur_cmd: CurrentCommand::try_from(u16::from_le_bytes([bytes[2], bytes[3]]))

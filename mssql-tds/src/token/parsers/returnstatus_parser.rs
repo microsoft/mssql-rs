@@ -78,10 +78,12 @@ use crate::{core::TdsResult, io::packet_reader::TdsPacketReader};
 #[derive(Default)]
 pub(crate) struct ReturnStatusTokenParser {}
 
+pub(crate) const RETURN_STATUS_PAYLOAD_LEN: usize = size_of::<i32>();
+
 pub(crate) async fn read_return_status<T: TdsPacketReader + Send + Sync>(
     reader: &mut T,
 ) -> TdsResult<ReturnStatusToken> {
-    let value = if let Some(bytes) = reader.try_read_slice(4) {
+    let value = if let Some(bytes) = reader.try_read_slice(RETURN_STATUS_PAYLOAD_LEN) {
         i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
     } else {
         reader.read_int32().await?

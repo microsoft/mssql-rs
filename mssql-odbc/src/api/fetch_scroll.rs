@@ -1720,11 +1720,10 @@ unsafe fn deliver_bound_plp(
     scratch: &mut [u8],
 ) -> Result<RowOutcome, TdsError> {
     // Unreachable today, kept as a guard rather than an `unreachable!()`.
-    // Getting here means the cursor classified this column as
-    // `CursorColumn::PlpStreaming` while `plp_encoding()` answered `None` for
-    // the same column. Both decide on `ColumnMetadata::is_plp()` over the same
-    // COLMETADATA (`plp_columns` snapshots the statement's copy, whose length
-    // also fixes `column_count`, so the lookup is always in range), and
+    // The PLP snapshot is skipped only when every column is non-PLP, so
+    // `CursorColumn::PlpStreaming` cannot reach this function on that path.
+    // Otherwise `plp_columns` snapshots the statement's COLMETADATA and the
+    // lookup is in range. Both the cursor and `plp_encoding` use `is_plp()`, and
     // `plp_encoding` maps every PLP type to `Some` -- new ones included, via its
     // catch-all to `Binary`. So the two cannot disagree unless a future type
     // makes PLP-ness visible only in the wire framing and not in TYPE_INFO.
@@ -2331,6 +2330,10 @@ unsafe fn deliver_fixed_bound<T: Copy>(
     value: T,
 ) -> RowOutcome {
     let stride = std::mem::size_of::<T>();
+    debug_assert_eq!(
+        stride,
+        element_stride(binding.target_type, binding.buffer_length)
+    );
     // Independent of the indicator per the ODBC "Deferred Fields" spec: see
     // `deliver_bound`'s comment on `octet_length`. This path never delivers
     // NULL (that goes through `deliver_bound` via `write_null`), so the

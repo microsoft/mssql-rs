@@ -811,6 +811,15 @@ mod tests {
 
     #[test]
     fn ordinary_parameters_do_not_inline_streaming_and_encryption_metadata() {
+        let parameter = RpcParameter::new(None, StatusFlags::NONE, SqlType::Int(Some(42)));
+        assert_eq!(
+            std::mem::size_of_val(&parameter.streamed_declaration),
+            size_of::<usize>()
+        );
+        assert_eq!(
+            std::mem::size_of_val(&parameter.encrypted),
+            size_of::<usize>()
+        );
         assert!(
             size_of::<RpcParameter>()
                 <= size_of::<SqlType>() + size_of::<Option<String>>() + 6 * size_of::<usize>()

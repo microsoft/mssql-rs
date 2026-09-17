@@ -9,8 +9,8 @@ use crate::io::packet_reader::TdsPacketReader;
 use crate::query::metadata::ColumnMetadata;
 use crate::security::cell_decryptor::CellDecryptor;
 use crate::token::parsers::TokenParser;
-use crate::token::parsers::done_parser::{buffered_done_token, read_done_token};
-use crate::token::parsers::returnstatus_parser::read_return_status;
+use crate::token::parsers::done_parser::{DONE_PAYLOAD_LEN, buffered_done_token, read_done_token};
+use crate::token::parsers::returnstatus_parser::{RETURN_STATUS_PAYLOAD_LEN, read_return_status};
 use crate::token::parsers::{
     ColInfoTokenParser, ColMetadataTokenParser, DoneInProcTokenParser, DoneProcTokenParser,
     DoneTokenParser, EnvChangeTokenParser, ErrorTokenParser, FeatureExtAckTokenParser,
@@ -482,15 +482,16 @@ pub(crate) fn buffered_control_token(bytes: &[u8]) -> Option<(Tokens, usize)> {
             Tokens::DoneInProc(buffered_done_token(payload)?)
         }
         kind if kind == TokenType::ReturnStatus as u8 => {
-            let value = i32::from_le_bytes(payload.get(..4)?.try_into().ok()?);
+            let value =
+                i32::from_le_bytes(payload.get(..RETURN_STATUS_PAYLOAD_LEN)?.try_into().ok()?);
             return Some((
                 Tokens::ReturnStatus(crate::token::tokens::ReturnStatusToken { value }),
-                5,
+                1 + RETURN_STATUS_PAYLOAD_LEN,
             ));
         }
         _ => return None,
     };
-    Some((token, 13))
+    Some((token, 1 + DONE_PAYLOAD_LEN))
 }
 
 pub(crate) async fn receive_token_internal<R: TdsPacketReader + Send + Sync>(
