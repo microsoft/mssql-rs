@@ -1716,14 +1716,7 @@ impl TdsClient {
         let mut first = true;
         let handle_parameter =
             RpcParameter::new(None, StatusFlags::NONE, SqlType::Int(Some(handle)));
-        let rpc = SqlRpc::new_batch_command(
-            RpcType::ProcId(RpcProcs::Execute),
-            None,
-            None,
-            &database_collation,
-            &self.execution_context,
-            true,
-        );
+        let mut rpc = None;
         let encoder = GenericEncoder::new();
         let serialization_result = async {
             while let Some(row) = first_row
@@ -1751,6 +1744,16 @@ impl TdsClient {
                             .to_string(),
                     ));
                 }
+                let rpc = rpc.get_or_insert_with(|| {
+                    SqlRpc::new_batch_command(
+                        RpcType::ProcId(RpcProcs::Execute),
+                        None,
+                        None,
+                        &database_collation,
+                        &self.execution_context,
+                        true,
+                    )
+                });
                 rpc.serialize_batch_header(&mut packet_writer, first)
                     .await?;
                 handle_parameter
