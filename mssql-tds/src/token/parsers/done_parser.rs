@@ -61,6 +61,36 @@ use crate::{
     token::tokens::{CurrentCommand, DoneStatus},
 };
 
+pub(crate) async fn read_done_token<T: TdsPacketReader + Send + Sync>(
+    reader: &mut T,
+) -> TdsResult<DoneToken> {
+    if let Some(bytes) = reader.try_read_slice(12) {
+        return buffered_done_token(bytes).ok_or_else(|| {
+            crate::error::Error::ProtocolError("Buffered DONE payload is incomplete".to_string())
+        });
+    }
+    let status = reader.read_uint16().await?;
+    let command = reader.read_uint16().await?;
+    let row_count = reader.read_uint64().await?;
+    Ok(DoneToken {
+        status: DoneStatus::from(status),
+        cur_cmd: CurrentCommand::try_from(command).unwrap_or(CurrentCommand::None),
+        row_count,
+    })
+}
+
+pub(crate) fn buffered_done_token(bytes: &[u8]) -> Option<DoneToken> {
+    let bytes: &[u8; 12] = bytes.get(..12)?.try_into().ok()?;
+    Some(DoneToken {
+        status: DoneStatus::from(u16::from_le_bytes([bytes[0], bytes[1]])),
+        cur_cmd: CurrentCommand::try_from(u16::from_le_bytes([bytes[2], bytes[3]]))
+            .unwrap_or(CurrentCommand::None),
+        row_count: u64::from_le_bytes([
+            bytes[4], bytes[5], bytes[6], bytes[7], bytes[8], bytes[9], bytes[10], bytes[11],
+        ]),
+    })
+}
+
 /// Parser for DONE token (0xFD) - signals completion of a SQL statement
 #[cfg(not(fuzzing))]
 #[derive(Default)]
@@ -79,24 +109,7 @@ where
     T: TdsPacketReader + Send + Sync,
 {
     async fn parse(&self, reader: &mut T, _context: &ParserContext) -> TdsResult<Tokens> {
-        // Read status flags (2 bytes) - indicates completion state
-        let status = reader.read_uint16().await?;
-        let done_status = DoneStatus::from(status);
-
-        // Read current command type (2 bytes) - what operation completed
-        let current_command_value = reader.read_uint16().await?;
-        let current_command =
-            CurrentCommand::try_from(current_command_value).unwrap_or(CurrentCommand::None);
-
-        // Read row count (8 bytes) - number of rows affected
-        // Valid only if DONE_COUNT flag (0x10) is set in status
-        let row_count = reader.read_uint64().await?;
-
-        Ok(Tokens::Done(DoneToken {
-            status: done_status,
-            cur_cmd: current_command,
-            row_count,
-        }))
+        read_done_token(reader).await.map(Tokens::Done)
     }
 }
 
@@ -113,19 +126,7 @@ where
     T: TdsPacketReader + Send + Sync,
 {
     async fn parse(&self, reader: &mut T, _context: &ParserContext) -> TdsResult<Tokens> {
-        // Same structure as DONE token, different semantic meaning
-        let status = reader.read_uint16().await?;
-        let done_status = DoneStatus::from(status);
-        let current_command_value = reader.read_uint16().await?;
-        let current_command =
-            CurrentCommand::try_from(current_command_value).unwrap_or(CurrentCommand::None);
-        let row_count = reader.read_uint64().await?;
-
-        Ok(Tokens::DoneInProc(DoneToken {
-            status: done_status,
-            cur_cmd: current_command,
-            row_count,
-        }))
+        read_done_token(reader).await.map(Tokens::DoneInProc)
     }
 }
 
@@ -141,19 +142,7 @@ where
     T: TdsPacketReader + Send + Sync,
 {
     async fn parse(&self, reader: &mut T, _context: &ParserContext) -> TdsResult<Tokens> {
-        // Same structure as DONE token, indicates stored procedure completion
-        let status = reader.read_uint16().await?;
-        let done_status = DoneStatus::from(status);
-        let current_command_value = reader.read_uint16().await?;
-        let current_command =
-            CurrentCommand::try_from(current_command_value).unwrap_or(CurrentCommand::None);
-        let row_count = reader.read_uint64().await?;
-
-        Ok(Tokens::DoneProc(DoneToken {
-            status: done_status,
-            cur_cmd: current_command,
-            row_count,
-        }))
+        read_done_token(reader).await.map(Tokens::DoneProc)
     }
 }
 

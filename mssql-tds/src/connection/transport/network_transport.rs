@@ -2691,6 +2691,16 @@ impl NetworkTransport {
             self.column_encryption_supported = *enabled;
         }
         self.attention_settlement = None;
+        // A ready read also wins over a zero timeout in await_read_or_interrupt.
+        // A pre-cancelled read must take its existing ATTENTION settlement path.
+        if !cancel_handle.is_some_and(|handle| handle.cancel_token.is_cancelled())
+            && let Some((token, consumed)) = crate::io::token_stream::buffered_control_token(
+                self.tds_read_buffer.get_buffered_slice(),
+            )
+        {
+            self.tds_read_buffer.consume_bytes(consumed)?;
+            return Ok(token);
+        }
         let attention_stream = self.stream.as_ref().cloned();
         let already_dead = self.known_dead;
         let outcome = {
@@ -6114,6 +6124,44 @@ pub(crate) mod tests {
             is_known_dead(&transport),
             "a connection whose attention went unacknowledged must not be reused"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn buffered_control_token_is_ready_with_zero_timeout() {
+        let (mut transport, _written) =
+            create_network_transport_with_live_peer_capturing_writes(&[]);
+        let message = done_token_message(DoneStatus::COUNT.bits());
+        let payload = &message[PacketWriter::PACKET_HEADER_SIZE..];
+        transport.tds_read_buffer.working_buffer[..payload.len()].copy_from_slice(payload);
+        transport.tds_read_buffer.buffer_position = 0;
+        transport.tds_read_buffer.buffer_length = payload.len();
+
+        let token = transport
+            .receive_token(&ParserContext::None(()), Some(Duration::ZERO), None)
+            .await
+            .unwrap();
+        assert!(matches!(token, Tokens::Done(_)));
+        assert!(transport.tds_read_buffer.get_buffered_slice().is_empty());
+        assert!(!is_known_dead(&transport));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn buffered_control_token_does_not_bypass_cancellation() {
+        let (mut transport, mut written) = create_network_transport_with_live_peer_capturing_writes(
+            &done_token_message(DoneStatus::ATTN.bits()),
+        );
+        let message = done_token_message(DoneStatus::COUNT.bits());
+        let payload = &message[PacketWriter::PACKET_HEADER_SIZE..];
+        transport.tds_read_buffer.working_buffer[..payload.len()].copy_from_slice(payload);
+        transport.tds_read_buffer.buffer_position = 0;
+        transport.tds_read_buffer.buffer_length = payload.len();
+
+        let result = transport
+            .receive_token(&ParserContext::None(()), None, Some(&cancelled_handle()))
+            .await;
+        assert!(matches!(result, Err(OperationCancelledError(_))));
+        assert!(written.try_recv().is_ok());
+        assert!(!is_known_dead(&transport));
     }
 
     /// The check must stay quiet on a healthy cancellation: a server that

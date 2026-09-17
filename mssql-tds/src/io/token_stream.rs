@@ -9,6 +9,8 @@ use crate::io::packet_reader::TdsPacketReader;
 use crate::query::metadata::ColumnMetadata;
 use crate::security::cell_decryptor::CellDecryptor;
 use crate::token::parsers::TokenParser;
+use crate::token::parsers::done_parser::{buffered_done_token, read_done_token};
+use crate::token::parsers::returnstatus_parser::read_return_status;
 use crate::token::parsers::{
     ColInfoTokenParser, ColMetadataTokenParser, DoneInProcTokenParser, DoneProcTokenParser,
     DoneTokenParser, EnvChangeTokenParser, ErrorTokenParser, FeatureExtAckTokenParser,
@@ -448,9 +450,9 @@ pub(crate) async fn dispatch_token<R: TdsPacketReader + Send + Sync>(
     match parser {
         TokenParsers::EnvChange(parser) => parser.parse(reader, context).await,
         TokenParsers::LoginAck(parser) => parser.parse(reader, context).await,
-        TokenParsers::Done(parser) => parser.parse(reader, context).await,
-        TokenParsers::DoneInProc(parser) => parser.parse(reader, context).await,
-        TokenParsers::DoneProc(parser) => parser.parse(reader, context).await,
+        TokenParsers::Done(_) => read_done_token(reader).await.map(Tokens::Done),
+        TokenParsers::DoneInProc(_) => read_done_token(reader).await.map(Tokens::DoneInProc),
+        TokenParsers::DoneProc(_) => read_done_token(reader).await.map(Tokens::DoneProc),
         TokenParsers::Info(parser) => parser.parse(reader, context).await,
         TokenParsers::Error(parser) => parser.parse(reader, context).await,
         TokenParsers::FedAuthInfo(parser) => parser.parse(reader, context).await,
@@ -458,7 +460,7 @@ pub(crate) async fn dispatch_token<R: TdsPacketReader + Send + Sync>(
         TokenParsers::ColMetadata(parser) => parser.parse(reader, context).await,
         TokenParsers::Row(parser) => parser.parse(reader, context).await,
         TokenParsers::Order(parser) => parser.parse(reader, context).await,
-        TokenParsers::ReturnStatus(parser) => parser.parse(reader, context).await,
+        TokenParsers::ReturnStatus(_) => read_return_status(reader).await.map(Tokens::from),
         TokenParsers::NbcRow(parser) => parser.parse(reader, context).await,
         TokenParsers::ReturnValue(parser) => parser.parse(reader, context).await,
         TokenParsers::SessionState(parser) => parser.parse(reader, context).await,
@@ -466,6 +468,29 @@ pub(crate) async fn dispatch_token<R: TdsPacketReader + Send + Sync>(
         TokenParsers::ColInfo(parser) => parser.parse(reader, context).await,
         TokenParsers::Sspi(parser) => parser.parse(reader, context).await,
     }
+}
+
+/// Recognizes complete control tokens without consuming an incomplete token.
+pub(crate) fn buffered_control_token(bytes: &[u8]) -> Option<(Tokens, usize)> {
+    let (&kind, payload) = bytes.split_first()?;
+    let token = match kind {
+        kind if kind == TokenType::Done as u8 => Tokens::Done(buffered_done_token(payload)?),
+        kind if kind == TokenType::DoneProc as u8 => {
+            Tokens::DoneProc(buffered_done_token(payload)?)
+        }
+        kind if kind == TokenType::DoneInProc as u8 => {
+            Tokens::DoneInProc(buffered_done_token(payload)?)
+        }
+        kind if kind == TokenType::ReturnStatus as u8 => {
+            let value = i32::from_le_bytes(payload.get(..4)?.try_into().ok()?);
+            return Some((
+                Tokens::ReturnStatus(crate::token::tokens::ReturnStatusToken { value }),
+                5,
+            ));
+        }
+        _ => return None,
+    };
+    Some((token, 13))
 }
 
 pub(crate) async fn receive_token_internal<R: TdsPacketReader + Send + Sync>(
@@ -1412,6 +1437,7 @@ mod tests {
         data: Vec<u8>,
         pos: usize,
         buffered: bool,
+        buffered_limit: Option<usize>,
         async_scalar_reads: usize,
         /// When set, the next `read_bytes` fills only this many bytes and
         /// reports that count, modelling a reader that does not fully fill.
@@ -1424,6 +1450,7 @@ mod tests {
                 data,
                 pos: 0,
                 buffered: false,
+                buffered_limit: None,
                 async_scalar_reads: 0,
                 short_read: None,
             }
@@ -1454,14 +1481,16 @@ mod tests {
     impl TdsPacketReader for TestByteReader {
         fn buffered_slice(&self) -> &[u8] {
             if self.buffered {
-                &self.data[self.pos..]
+                self.data
+                    .get(self.pos..self.buffered_limit.unwrap_or(self.data.len()))
+                    .unwrap_or_default()
             } else {
                 &[]
             }
         }
 
         fn try_read_slice(&mut self, length: usize) -> Option<&[u8]> {
-            if self.buffered {
+            if self.buffered && length <= self.buffered_slice().len() {
                 self.take(length).ok()
             } else {
                 None
@@ -1477,7 +1506,9 @@ mod tests {
         }
 
         async fn read_uint16(&mut self) -> TdsResult<u16> {
-            unimplemented!("unused in test")
+            self.async_scalar_reads += 1;
+            let raw = self.take(2)?;
+            Ok(u16::from_le_bytes([raw[0], raw[1]]))
         }
 
         async fn read_int32(&mut self) -> TdsResult<i32> {
@@ -1499,7 +1530,11 @@ mod tests {
         }
 
         async fn read_uint64(&mut self) -> TdsResult<u64> {
-            unimplemented!("unused in test")
+            self.async_scalar_reads += 1;
+            let raw = self.take(8)?;
+            Ok(u64::from_le_bytes([
+                raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7],
+            ]))
         }
 
         async fn read_float32(&mut self) -> TdsResult<f32> {
@@ -1671,6 +1706,112 @@ mod tests {
             columns: vec![int4_metadata("c1"), int4_metadata("c2")],
             cek_table: vec![],
         })
+    }
+
+    #[tokio::test]
+    async fn completion_tokens_preserve_values_at_every_buffer_boundary() {
+        use crate::token::tokens::{CurrentCommand, DoneStatus};
+
+        let registry = GenericTokenParserRegistry::default();
+        let flags = DoneStatus::COUNT | DoneStatus::RPC_IN_BATCH | DoneStatus::ERROR;
+        for kind in [
+            TokenType::Done,
+            TokenType::DoneProc,
+            TokenType::DoneInProc,
+            TokenType::ReturnStatus,
+        ]
+        .map(|kind| kind as u8)
+        {
+            let payload = if kind == TokenType::ReturnStatus as u8 {
+                i32::MIN.to_le_bytes().to_vec()
+            } else {
+                [
+                    flags.bits().to_le_bytes().as_slice(),
+                    u16::MAX.to_le_bytes().as_slice(),
+                    u64::MAX.to_le_bytes().as_slice(),
+                ]
+                .concat()
+            };
+            for prefix in 0..=payload.len() {
+                let mut data = vec![kind];
+                data.extend_from_slice(&payload);
+                data.push(0xa5);
+                let control = buffered_control_token(&data[..1 + prefix]);
+                assert_eq!(control.is_some(), prefix == payload.len());
+                let mut reader = TestByteReader::new(data).with_buffered_reads();
+                reader.buffered_limit = Some(1 + prefix);
+                let token =
+                    receive_token_internal(&mut reader, &registry, &ParserContext::default())
+                        .await
+                        .unwrap();
+                if let Some((control, consumed)) = control {
+                    assert_eq!(consumed, 1 + payload.len());
+                    assert_eq!(format!("{control:?}"), format!("{token:?}"));
+                }
+                match (TokenType::try_from(kind).unwrap(), token) {
+                    (TokenType::Done, Tokens::Done(done))
+                    | (TokenType::DoneProc, Tokens::DoneProc(done))
+                    | (TokenType::DoneInProc, Tokens::DoneInProc(done)) => {
+                        assert_eq!(done.status, flags);
+                        assert_eq!(done.cur_cmd, CurrentCommand::None);
+                        assert_eq!(done.row_count, u64::MAX);
+                    }
+                    (TokenType::ReturnStatus, Tokens::ReturnStatus(status)) => {
+                        assert_eq!(status.value, i32::MIN);
+                    }
+                    (_, token) => panic!("wrong completion variant: {token:?}"),
+                }
+                let fallback_reads = if kind == TokenType::ReturnStatus as u8 {
+                    1
+                } else {
+                    3
+                };
+                assert_eq!(
+                    reader.async_scalar_reads,
+                    if prefix == payload.len() {
+                        0
+                    } else {
+                        fallback_reads
+                    },
+                );
+                assert_eq!(reader.pos, 1 + payload.len());
+                assert_eq!(reader.read_byte().await.unwrap(), 0xa5);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn incomplete_completion_tokens_still_fail() {
+        let registry = GenericTokenParserRegistry::default();
+        assert!(buffered_control_token(&[TokenType::Error as u8; 32]).is_none());
+        assert!(buffered_control_token(&[TokenType::ColMetadata as u8; 32]).is_none());
+        for kind in [
+            TokenType::Done,
+            TokenType::DoneProc,
+            TokenType::DoneInProc,
+            TokenType::ReturnStatus,
+        ]
+        .map(|kind| kind as u8)
+        {
+            let length = if kind == TokenType::ReturnStatus as u8 {
+                4
+            } else {
+                12
+            };
+            for prefix in 0..length {
+                for buffered in [false, true] {
+                    let mut data = vec![kind];
+                    data.resize(1 + prefix, 0);
+                    let mut reader = TestByteReader::new(data);
+                    reader.buffered = buffered;
+                    assert!(
+                        receive_token_internal(&mut reader, &registry, &ParserContext::default())
+                            .await
+                            .is_err()
+                    );
+                }
+            }
+        }
     }
 
     #[tokio::test]

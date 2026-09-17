@@ -167,6 +167,11 @@ unread results without executing any parameter set again.
 `SQLGetInfo(SQL_PARAM_ARRAY_SELECTS)` reports `SQL_PAS_BATCH`. Non-row-returning
 arrays still complete during `SQLExecute` and report their aggregate row count.
 
+RPC value encoding avoids per-parameter boxed futures. Complete buffered
+DONE-family and RETURNSTATUS tokens are decoded without constructing the
+asynchronous parser; cancellation still uses the normal ATTENTION settlement
+path, and incomplete tokens retain the existing network-read behavior.
+
 ## Conventions
 
 Before writing or modifying code in this crate, read
