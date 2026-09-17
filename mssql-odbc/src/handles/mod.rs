@@ -143,22 +143,6 @@ pub(crate) unsafe fn handle_from_raw<'a, T>(raw: *mut c_void) -> &'a T {
     unsafe { &*(raw as *const T) }
 }
 
-/// Recovers a mutable reference to a typed handle from an opaque `*mut c_void`.
-///
-/// Same caller-chosen lifetime as `handle_from_raw`. The caller is responsible
-/// for ensuring exclusive access — creating two `&mut` references to the same
-/// handle is instant UB. Prefer `handle_from_raw` (shared ref) + interior
-/// mutability (`Mutex`) when concurrent access is possible.
-///
-/// # Safety
-/// - All requirements of `handle_from_raw`, plus:
-/// - The caller must guarantee exclusive access to the handle for the
-///   duration of the returned reference.
-#[allow(dead_code)]
-pub(crate) unsafe fn handle_from_raw_mut<'a, T>(raw: *mut c_void) -> &'a mut T {
-    unsafe { &mut *(raw as *mut T) }
-}
-
 /// Frees a handle that was allocated via `handle_to_raw`.
 ///
 /// Marks the handle's `object_type` as `Invalid` before dropping, so that

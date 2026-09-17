@@ -675,7 +675,7 @@ Driver Manager (DM) provides serialization guarantees that the driver relies on
   handle the error. `as` silently truncates.
 - Pointer casts between handle types must go through the well-defined
   conversion functions in `crate::handles`: `handle_to_raw`,
-  `handle_from_raw`, `handle_from_raw_mut`, `free_handle`.
+  `handle_from_raw`, `free_handle`.
 
 ## Testing
 
