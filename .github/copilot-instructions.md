@@ -159,6 +159,20 @@ When processing rows, tokens, packets, parameters, or FFI buffers:
 - Do not use `unsafe` to avoid a copy unless the safety invariant is explicit,
   narrow, and reviewed.
 
-For performance-sensitive changes, identify the hot loop and support meaningful
-performance claims with a benchmark, profile, allocation measurement, or
-before/after workload where practical.
+For performance-sensitive changes:
+
+- Start from a measured hot path or workload. Prefer a benchmark, profile,
+  allocation measurement, or before/after workload over source-level intuition.
+- Preserve the existing behavior on fallback paths. A fast path must be guarded
+  by an exact representation or state invariant, and unsupported or boundary
+  cases must continue through the established conversion or error path.
+- Treat async continuation state, lock ordering, cancellation, timeout accounting,
+  and packet synchronization as part of correctness when removing awaits or
+  moving work between synchronous and asynchronous paths.
+- Do not add `#[inline]` or other hints by habit. Use them for small, profiled
+  dispatch or conversion boundaries and let the compiler decide for larger code.
+- Make conditional snapshots and metadata work lazy when the common path does not
+  need them.
+- Record user-visible performance behavior and intentional trade-offs in the
+  nearest component README when the optimization changes architecture or
+  buffering.
