@@ -221,7 +221,11 @@ TEST_P(CatalogOdbcVersionLiveTest, ColumnsAndSpecialColumnsMatchOdbc3Contract) {
                                     const_cast<SQLTCHAR*>(table.c_str()), SQL_NTS,
                                     SQL_SCOPE_CURROW, SQL_NO_NULLS),
                   SQL_HANDLE_STMT, stmt_);
-    EXPECT_EQ("COLUMN_SIZE", DescribeColName(stmt_, 6));
+    // SQLSpecialColumns renames ordinals 5/6/7, not 7/8/9 as SQLColumns does
+    // (`sqlcdd.cpp:826-841`, `fNewNameCols = COL(5)|COL(6)|COL(7)`).
+    EXPECT_EQ("COLUMN_SIZE", DescribeColName(stmt_, 5));
+    EXPECT_EQ("BUFFER_LENGTH", DescribeColName(stmt_, 6));
+    EXPECT_EQ("DECIMAL_DIGITS", DescribeColName(stmt_, 7));
     EXPECT_GT(DrainRows(stmt_), 0);
     EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }

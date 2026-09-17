@@ -48,8 +48,12 @@ use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 const DATATYPE_INFO_PROC: &str = "[sys].sp_datatype_info_100";
 
 /// `@ODBCVer` value sent for ODBC 3.x applications against a Katmai+ server.
-// Classic SQLGetTypeInfoW sends pseudo-version 4 on Yukon-or-newer servers so
-// sp_datatype_info reports NULL precision for XML (sqlcdd.cpp, fODBCVer).
+// Classic SQLGetTypeInfoW sends this pseudo-version 4 on Yukon-or-newer servers
+// (`sqlcdd.cpp:2206`, `fODBCVer = ISYUKON(lpdbc) ? 4 : 3`), where the catalog
+// functions send 3. The comment beside it attributes the 4 to making
+// sp_datatype_info report NULL precision for XML; that effect no longer shows
+// on a modern server (both drivers report a non-NULL COLUMN_SIZE there), but
+// the value msodbcsql sends is 4 regardless, which is what parity requires.
 const ODBC_VER_YUKON: u8 = 4;
 
 /// 1-based ODBC ordinals of the `SQLGetTypeInfo` columns the ODBC specification
@@ -635,6 +639,15 @@ mod tests {
             TypeClass::NotAnOdbcType
         ));
         assert_eq!(DATATYPE_INFO_PROC, "[sys].sp_datatype_info_100");
+    }
+
+    /// `SQLGetTypeInfo` sends the Yukon pseudo-version, not the 3 the catalog
+    /// functions send (`sqlcdd.cpp:2206` versus `sqlcdd.cpp:1814`). Pinned here
+    /// because the live suite cannot observe the value: the XML NULL-precision
+    /// effect msodbcsql's comment attributes to it no longer reproduces.
+    #[test]
+    fn odbc_ver_is_the_yukon_pseudo_version() {
+        assert_eq!(ODBC_VER_YUKON, 4);
     }
 
     #[test]

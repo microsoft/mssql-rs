@@ -103,12 +103,16 @@ TEST_P(GetTypeInfoOdbcVersionLiveTest, TimestampFilterAndColumnContractMatch) {
     EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }
 
-// Classic SQLGetTypeInfoW sends pseudo-version 4 on Yukon-or-newer servers
-// specifically so the XML row reports NULL precision. This observable check
-// also distinguishes that RPC parameter from the catalog functions' value 3.
-// Benefits-from-mock-tds: request capture could assert @ODBCVer=4 directly;
-// the live server exposes its XML COLUMN_SIZE effect.
-TEST_P(GetTypeInfoOdbcVersionLiveTest, XmlColumnSizeIsNull) {
+// msodbcsql sends pseudo-version 4 here rather than the catalog functions'
+// value 3 (`sqlcdd.cpp:2206`, `fODBCVer = ISYUKON(lpdbc) ? 4 : 3`), and the
+// comment beside it attributes that to making sp_datatype_info report NULL
+// precision for XML. That effect does not reproduce on a modern server: in
+// build 176155 both this driver and msodbcsql 18.6.2.1 returned a non-NULL,
+// one-character COLUMN_SIZE for the XML row on all 16 runs, against both
+// SQL_OV_ODBC3 and SQL_OV_ODBC3_80. The RPC parameter itself is pinned by the
+// `odbc_ver_is_the_yukon_pseudo_version` unit test; what stays worth checking
+// live is that the XML row is returned and reports a column size at all.
+TEST_P(GetTypeInfoOdbcVersionLiveTest, XmlColumnSizeIsReported) {
     ASSERT_SQL_OK(SQLGetTypeInfo(stmt_, SQL_SS_XML), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
 
@@ -116,7 +120,8 @@ TEST_P(GetTypeInfoOdbcVersionLiveTest, XmlColumnSizeIsNull) {
     SQLLEN indicator = 0;
     ASSERT_SQL_OK(SQLGetData(stmt_, 3, SQL_C_CHAR, columnSize, sizeof(columnSize), &indicator),
                   SQL_HANDLE_STMT, stmt_);
-    EXPECT_EQ(SQL_NULL_DATA, indicator);
+    EXPECT_NE(SQL_NULL_DATA, indicator)
+        << "sp_datatype_info_100 reported no COLUMN_SIZE for the XML row";
     EXPECT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
     EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }
