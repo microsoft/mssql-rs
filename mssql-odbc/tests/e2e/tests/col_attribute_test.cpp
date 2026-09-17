@@ -43,6 +43,7 @@
 #include "odbc_test_fixture.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <string>
 
 // SQL Server-specific identifiers not in standard <sqlext.h>.
@@ -643,14 +644,28 @@ TEST_F(ColAttributeLiveTest, EmptyVariantProbeConsumesValueButKeepsBaseType) {
     SQLCloseCursor(stmt_);
 }
 
+// The one divergence on this path, asserted on both legs rather than skipped so
+// CI keeps measuring the reference driver. msodbcsql 18.6.2.1 — the build
+// pinned by `msodbcsqlVersion` in `.pipeline/validation-pipeline.yml` — answers
+// SQL_SUCCESS_WITH_INFO/01004 for a variant wrapping an empty value, where this
+// driver answers SQL_SUCCESS. Registry entry 13 records the decision; if a
+// later msodbcsql build stops warning here, this test is what reports it.
 TEST_F(ColAttributeLiveTest, EmptyVariantProbeReturnsSuccessWithoutWarning) {
-    SKIP_IF_COMPARING_MSODBCSQL();
+    const char* target = std::getenv("ODBC_TEST_TARGET");
+    const bool comparing_msodbcsql = target && std::string(target) == "msodbcsql";
+
     ExecDirect("SELECT CAST(CAST('' AS VARBINARY(8)) AS SQL_VARIANT) AS v");
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
 
     SQLCHAR probe = 0;
     SQLLEN indicator = -999;
-    EXPECT_EQ(SQL_SUCCESS, SQLGetData(stmt_, 1, SQL_C_BINARY, &probe, 0, &indicator));
+    SQLRETURN rc = SQLGetData(stmt_, 1, SQL_C_BINARY, &probe, 0, &indicator);
+    if (comparing_msodbcsql) {
+        EXPECT_EQ(SQL_SUCCESS_WITH_INFO, rc);
+        EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01004");
+    } else {
+        EXPECT_EQ(SQL_SUCCESS, rc);
+    }
     EXPECT_EQ(0, indicator);
 
     SQLCloseCursor(stmt_);

@@ -276,7 +276,9 @@ msodbcsql build is measured.
    This policy applies to both bound-column and `SQLGetData` conversions.
 13. A zero-length `SQL_C_BINARY` probe of a `sql_variant` wrapping an empty
    value reports `SQL_SUCCESS`, while msodbcsql reports
-   `SQL_SUCCESS_WITH_INFO` / `01004`. A bare empty `varbinary(8)` reports
+   `SQL_SUCCESS_WITH_INFO` / `01004`. Measured against msodbcsql
+   `18.6.2.1`, the build pinned by `msodbcsqlVersion` in
+   `.pipeline/validation-pipeline.yml`. A bare empty `varbinary(8)` reports
    `SQL_SUCCESS` in both drivers. Matching the variant-only warning would
    require preserving wrapper identity after the value has been captured;
    this driver deliberately treats the captured value like its base type in
@@ -290,5 +292,8 @@ msodbcsql build is measured.
    `SQL_SUCCEEDED`. `EmptyVariantProbeConsumesValueButKeepsBaseType` accepts
    either successful return so its parity leg can still compare the base type
    and the subsequent `SQL_NO_DATA` read;
-   `EmptyVariantProbeReturnsSuccessWithoutWarning` pins this driver's exact
-   return. Signed off by Theekshna Kotian on 2026-09-17.
+   `EmptyVariantProbeReturnsSuccessWithoutWarning` asserts each driver's exact
+   return rather than skipping the reference leg, so the measurement is
+   re-taken on every `--compare-with-msodbcsql` run and a future msodbcsql
+   build that stops warning here fails that test instead of going unnoticed.
+   Signed off by Theekshna Kotian on 2026-09-17.

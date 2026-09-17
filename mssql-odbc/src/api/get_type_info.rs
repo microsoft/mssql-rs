@@ -264,6 +264,9 @@ enum TypeClass {
 /// 3. `IsValidSqlType` runs last, but only its HY004 verdict aborts: line 2042
 ///    discards a HYC00 from it, so the interval types reach the RPC and come
 ///    back as an empty result set rather than an error.
+///
+/// `SQL_SS_VECTOR` is the one id that deliberately does not follow msodbcsql
+/// yet; see its arm below.
 fn classify_sql_type(data_type: SqlSmallInt) -> TypeClass {
     match data_type {
         SQL_ALL_TYPES
@@ -296,7 +299,6 @@ fn classify_sql_type(data_type: SqlSmallInt) -> TypeClass {
         | SQL_SS_TIME2
         | SQL_SS_TIMESTAMPOFFSET
         | SQL_SS_VARIANT
-        | SQL_SS_VECTOR
         | SQL_SS_XML => TypeClass::Valid,
         // Step 3: `IsValidSqlType` calls these HYC00, which `SQLGetTypeInfoW`
         // then discards, so the caller gets an empty result set.
@@ -304,6 +306,17 @@ fn classify_sql_type(data_type: SqlSmallInt) -> TypeClass {
         // Step 1: a table type is HY004, not HYC00, even though its id is far
         // below the driver-range bound checked next.
         SQL_SS_TABLE => TypeClass::Invalid,
+        // Deliberately not msodbcsql's answer. msodbcsql accepts this id, but
+        // only because it also switches the catalog proc: `sp_datatype_info_170`
+        // when the connection negotiated vector support, `sp_datatype_info_100`
+        // otherwise (`sqlcdd.cpp:1931`, selected at lines 2049-2056). This
+        // driver always calls `_100`, which has no vector row, so accepting the
+        // id would report success while telling the application the type does
+        // not exist. HYC00 says "not implemented", which is true until the
+        // negotiated vector capability is surfaced from `mssql-tds` to this
+        // layer and `_170` can be selected; accept it in the arm above at that
+        // point.
+        SQL_SS_VECTOR => TypeClass::NotAnOdbcType,
         // Step 2: unlike the SS types above, `SQL_SS_UDT` has no internal
         // "MAPPED" form, so it — and every other unmapped id in the driver
         // range — falls through to the HYC00 bound.
@@ -569,7 +582,6 @@ mod tests {
             SQL_SS_XML,
             SQL_SS_TIME2,
             SQL_SS_TIMESTAMPOFFSET,
-            SQL_SS_VECTOR,
         ] {
             assert!(
                 matches!(classify_sql_type(data_type), TypeClass::Valid),
@@ -611,6 +623,18 @@ mod tests {
                 "{data_type} is not a recognized SQL type"
             );
         }
+    }
+
+    /// The deliberate exception: msodbcsql accepts `SQL_SS_VECTOR`, but only
+    /// together with the `sp_datatype_info_170` selection this driver does not
+    /// have yet. Flip this to `Valid` when that lands.
+    #[test]
+    fn vector_is_deferred_until_the_170_catalog_proc_is_selectable() {
+        assert!(matches!(
+            classify_sql_type(SQL_SS_VECTOR),
+            TypeClass::NotAnOdbcType
+        ));
+        assert_eq!(DATATYPE_INFO_PROC, "[sys].sp_datatype_info_100");
     }
 
     #[test]
