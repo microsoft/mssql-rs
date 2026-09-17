@@ -13,15 +13,11 @@ resources:
       type: git
       name: InternalDriverTools/PerfTest
       ref: refs/heads/main
-    - repository: corePerfTestTemplates
-      type: git
-      name: InternalDriverTools/PerfTest
-      ref: refs/heads/main
 
 extends:
   template: v1/Perf.Test.Job.yml@PerfTemplates
   parameters:
-    useExistingCoreRepository: true
+    coreTemplateRef: refs/heads/dev/saurabh/repair-shared-network-discovery
     platform: linux
     testRootDir: $(Build.SourcesDirectory)/mssql-rs
     testScript: mssql-odbc-bench/perf-lab/run-benchmarks.sh
