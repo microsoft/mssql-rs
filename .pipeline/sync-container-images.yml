@@ -302,6 +302,10 @@ stages:
       retryCountOnTaskFailure: 3
 
   # Alpine 3.18 & 3.19 (Docker Hub - rate limited)
+  # 3.19/3.20 are no longer in the CI test matrices (validation-stages.yml) but
+  # stay synced deliberately: kerberos-test/docker-compose-matrix.yml,
+  # run-all-distros.sh, and validate-local.sh still expose alpine319/alpine320
+  # profiles for local repro. Don't prune these as "dead".
   - job: Alpine1
     displayName: 'Import Alpine 3.18 & 3.19'
     condition: eq('${{ parameters.syncAlpine1 }}', 'true')
