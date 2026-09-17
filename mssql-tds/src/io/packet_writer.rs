@@ -339,6 +339,21 @@ impl<'a> PacketWriter<'a> {
         (self.payload_cursor.position() - Self::PACKET_HEADER_SIZE as u64) as i32
     }
 
+    pub(crate) async fn write_fixed_bytes<const N: usize>(
+        &mut self,
+        bytes: &[u8; N],
+    ) -> TdsResult<()> {
+        // Keep exact-boundary sends on the ordinary overflow/cancellation path.
+        if self.has_space(N + 1) {
+            std::io::Write::write_all(&mut self.payload_cursor, bytes)?;
+        } else {
+            for &byte in bytes {
+                self.write_byte_async(byte).await?;
+            }
+        }
+        Ok(())
+    }
+
     async fn handle_overflow_if_needed(&mut self) -> TdsResult<()> {
         // If the payload size is greater than the max payload size, send the packet.
         if self.position() >= (self.max_payload_size as i32) {
@@ -805,6 +820,77 @@ pub(crate) mod tests {
         async fn disable_ssl(&mut self) -> TdsResult<()> {
             unimplemented!()
         }
+    }
+
+    #[test]
+    fn fixed_bytes_preserve_packet_boundaries_and_reset_flags() {
+        fn serialize<const N: usize>(
+            packet_size: u32,
+            padding: usize,
+            reset_mode: ResetConnectionMode,
+            metadata: &[u8; N],
+            batched: bool,
+            trailing_byte: bool,
+        ) -> Vec<u8> {
+            let mut mock = MockNetworkWriter::new(packet_size);
+            mock.set_reset_mode(reset_mode);
+            let mut writer = PacketWriter::new(PacketType::RpcRequest, &mut mock, None, None);
+            block_on(async {
+                writer.write_async(&vec![0x55; padding]).await.unwrap();
+                if batched {
+                    writer.write_fixed_bytes(metadata).await.unwrap();
+                } else {
+                    for &byte in metadata {
+                        writer.write_byte_async(byte).await.unwrap();
+                    }
+                }
+                if trailing_byte {
+                    writer.write_byte_async(0x5a).await.unwrap();
+                }
+                writer.finalize().await.unwrap();
+            });
+            drop(writer);
+            mock.data
+        }
+
+        fn check<const N: usize>(metadata: &[u8; N]) {
+            for packet_size in [512, 4096, 8000, 16192] {
+                let boundary = packet_size as usize - PacketWriter::PACKET_HEADER_SIZE;
+                for padding in (boundary - N - 1)..=(boundary + 1) {
+                    for reset_mode in [
+                        ResetConnectionMode::None,
+                        ResetConnectionMode::Reset,
+                        ResetConnectionMode::ResetSkipTran,
+                    ] {
+                        for trailing_byte in [false, true] {
+                            assert_eq!(
+                                serialize(
+                                    packet_size,
+                                    padding,
+                                    reset_mode,
+                                    metadata,
+                                    true,
+                                    trailing_byte
+                                ),
+                                serialize(
+                                    packet_size,
+                                    padding,
+                                    reset_mode,
+                                    metadata,
+                                    false,
+                                    trailing_byte
+                                ),
+                                "packet_size={packet_size}, padding={padding}, trailing={trailing_byte}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        check(&[0, 0]);
+        check(&[0xff, 0xff, 12, 0, 0, 0]);
+        check(&[0xe7, 30, 0, 9, 4, 0xd0, 0, 0x34]);
     }
 
     #[test]

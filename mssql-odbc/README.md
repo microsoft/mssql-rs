@@ -171,6 +171,10 @@ RPC value encoding avoids per-parameter boxed futures. Complete buffered
 DONE-family and RETURNSTATUS tokens are decoded without constructing the
 asynchronous parser; cancellation still uses the normal ATTENTION settlement
 path, and incomplete tokens retain the existing network-read behavior.
+Optional streaming declarations and encryption metadata are stored out of line
+so ordinary parameter arrays do not copy their unused storage for every value.
+Small RPC headers and type metadata are written together when buffered space
+allows; packet-boundary writes retain normal overflow and cancellation handling.
 
 ## Conventions
 

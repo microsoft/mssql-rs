@@ -185,12 +185,14 @@ impl<'a> SqlRpc<'a> {
                     .await?;
             }
             RpcType::ProcId(proc) => {
-                // Write the procedure ID to the packet writer
-                packet_writer.write_u16_async(PROC_ID_SWITCH).await?;
-                // Write the int32 value for the procedure ID
-                packet_writer
-                    .write_i16_async(proc.get_u8_value().into())
-                    .await?;
+                let switch = PROC_ID_SWITCH.to_le_bytes();
+                let id = i16::from(proc.get_u8_value()).to_le_bytes();
+                let options = (self.proc_options as i16).to_le_bytes();
+                return packet_writer
+                    .write_fixed_bytes(&[
+                        switch[0], switch[1], id[0], id[1], options[0], options[1],
+                    ])
+                    .await;
             }
         }
         packet_writer
@@ -328,7 +330,7 @@ mod tests {
             expected.extend([0, 0, 0x26, 8, 8]);
             expected.extend((i64::from(row) * 1000).to_le_bytes());
         }
-        for packet_size in [512, 4096, 8000] {
+        for packet_size in [512, 4096, 8000, 16192] {
             let wire = serialize_insert_batch(packet_size);
             let mut remaining = wire.as_slice();
             let mut payload = Vec::new();
