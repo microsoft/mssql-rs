@@ -31,6 +31,7 @@ _WHEEL_INSTALL_TEMPLATE = (
     _ROOT / ".pipeline" / "templates" / "test-python-wheel-installs-template.yml"
 )
 _METADATA = _ROOT / ".pipeline" / "scripts" / "get-python-release-metadata.ps1"
+_VERIFY_WHEELS_SCRIPT = _ROOT / ".pipeline" / "scripts" / "verify-python-wheels.ps1"
 _SWITCHES = (
     "publishNuGet",
     "publishMssqlTds",
@@ -456,6 +457,61 @@ def test_python_wheel_install_gate_precedes_artifact_publication(
     assert parameters["architecture"] == architecture
     assert parameters.get("pythonVersions", default_versions) == python_versions
     assert install_index < publish_index
+
+
+def _canonical_python_versions() -> set[str]:
+    ps1 = _VERIFY_WHEELS_SCRIPT.read_text(encoding="utf-8")
+    match = re.search(r"\$pythonTags\s*=\s*(.+)", ps1)
+    assert match
+    tags = re.findall(r"'cp(\d)(\d+)'", match[1])
+    return {f"{major}.{minor}" for major, minor in tags}
+
+
+def test_windows_and_macos_install_matrix_tracks_release_python_tags() -> None:
+    """Guards the same class of drift the Linux fix in 9ed77aa7 closed: unlike
+    the Linux script, Windows/macOS install coverage is driven by this
+    template's own `pythonVersions` default (and the Windows ARM64 override in
+    stages.yml), neither of which was cross-checked against the canonical
+    matrix in verify-python-wheels.ps1."""
+    canonical = _canonical_python_versions()
+
+    install_template = yaml.safe_load(
+        _WHEEL_INSTALL_TEMPLATE.read_text(encoding="utf-8")
+    )
+    default_versions = next(
+        parameter["default"]
+        for parameter in install_template["parameters"]
+        if parameter["name"] == "pythonVersions"
+    )
+    assert set(default_versions) == canonical
+
+    source = yaml.safe_load(_BUILD_STAGES.read_text(encoding="utf-8"))
+    flags = {
+        "buildAllTargets": True,
+        "buildPythonWheels": True,
+        "buildOdbcNative": True,
+        "buildRustCrates": False,
+        "testPythonWheelInstalls": True,
+        "isOfficial": True,
+        "publishToFeed": False,
+    }
+    pipeline = expand(source, flags)
+    build = next(stage for stage in pipeline["stages"] if stage["stage"] == "Build")
+    arm64_job = next(job for job in build["jobs"] if job.get("job") == "Windows_ARM64")
+
+    # Python 3.10 is deliberately excluded on Windows ARM64 (limited support,
+    # per the comment in stages.yml) - both call sites must agree on that.
+    expected_arm64_versions = canonical - {"3.10"}
+    for template_name in (
+        "build-python-wheels-template.yml",
+        "test-python-wheel-installs-template.yml",
+    ):
+        step = next(
+            step
+            for step in arm64_job["steps"]
+            if step.get("template") == f"/.pipeline/templates/{template_name}"
+        )
+        assert set(step["parameters"]["pythonVersions"]) == expected_arm64_versions
 
 
 def test_macos_wheel_install_gate_verifies_both_architectures() -> None:
