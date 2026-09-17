@@ -7,6 +7,8 @@ parameters:
   - Windows
 - name: architecture
   type: string
+# Windows and macOS only. Linux validates the fixed release matrix in
+# test-python-wheel-installs-linux.sh.
 - name: pythonVersions
   type: object
   default:

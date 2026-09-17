@@ -27,6 +27,9 @@ _ROOT = Path(__file__).parents[1]
 _PIPELINE = _ROOT / ".pipeline" / "OneBranch" / "OfficialPythonWheelsRelease.yml"
 _PYPI_PIPELINE = _ROOT / ".pipeline" / "OneBranch" / "PyPIRelease.yml"
 _BUILD_STAGES = _ROOT / ".pipeline" / "OneBranch" / "stages.yml"
+_WHEEL_INSTALL_TEMPLATE = (
+    _ROOT / ".pipeline" / "templates" / "test-python-wheel-installs-template.yml"
+)
 _METADATA = _ROOT / ".pipeline" / "scripts" / "get-python-release-metadata.ps1"
 _SWITCHES = (
     "publishNuGet",
@@ -492,6 +495,85 @@ def test_crate_templates_resolve_in_self_repository():
         re.MULTILINE,
     )
     assert templates == ["/.pipeline/templates/validate-release-crates.yml@self"] * 6
+
+
+@pytest.mark.parametrize(
+    ("job_name", "os_type", "architecture", "python_versions"),
+    [
+        (
+            "Windows_x64",
+            "Windows",
+            "x64",
+            ["3.10", "3.11", "3.12", "3.13", "3.14"],
+        ),
+        ("Windows_ARM64", "Windows", "arm64", ["3.11", "3.12", "3.13", "3.14"]),
+        (
+            "Linux_x64",
+            "Linux",
+            "x64",
+            ["3.10", "3.11", "3.12", "3.13", "3.14"],
+        ),
+        (
+            "Linux_ARM64",
+            "Linux",
+            "arm64",
+            ["3.10", "3.11", "3.12", "3.13", "3.14"],
+        ),
+        (
+            "MacOS_universal2",
+            "MacOS",
+            "universal2",
+            ["3.10", "3.11", "3.12", "3.13", "3.14"],
+        ),
+    ],
+)
+def test_python_wheel_install_gate_precedes_artifact_publication(
+    job_name: str,
+    os_type: str,
+    architecture: str,
+    python_versions: list[str],
+) -> None:
+    source = yaml.safe_load(_BUILD_STAGES.read_text(encoding="utf-8"))
+    install_template = yaml.safe_load(
+        _WHEEL_INSTALL_TEMPLATE.read_text(encoding="utf-8")
+    )
+    default_versions = next(
+        parameter["default"]
+        for parameter in install_template["parameters"]
+        if parameter["name"] == "pythonVersions"
+    )
+    flags = {
+        "buildAllTargets": True,
+        "buildPythonWheels": True,
+        "buildOdbcNative": True,
+        "buildRustCrates": False,
+        "testPythonWheelInstalls": True,
+        "isOfficial": True,
+        "publishToFeed": False,
+    }
+    pipeline = expand(source, flags)
+    build = next(stage for stage in pipeline["stages"] if stage["stage"] == "Build")
+    job = next(job for job in build["jobs"] if job.get("job") == job_name)
+    steps = job["steps"]
+    install_steps = [
+        (index, step)
+        for index, step in enumerate(steps)
+        if step.get("template")
+        == "/.pipeline/templates/test-python-wheel-installs-template.yml"
+    ]
+
+    assert len(install_steps) == 1
+    install_index, install_step = install_steps[0]
+    publish_index = next(
+        index
+        for index, step in enumerate(steps)
+        if step.get("task") == "PublishPipelineArtifact@1"
+    )
+    parameters = install_step["parameters"]
+    assert parameters["osType"] == os_type
+    assert parameters["architecture"] == architecture
+    assert parameters.get("pythonVersions", default_versions) == python_versions
+    assert install_index < publish_index
 
 
 @pytest.mark.parametrize("architecture", ("x64", "ARM64"))
