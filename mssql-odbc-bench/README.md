@@ -177,9 +177,13 @@ four measure that path.
   separates the call shape from the cadence.
 - `getdata/rowwise_1k_c3_lob_max/chunked_8192` — `NVARCHAR(MAX)` of 9,000-9,999
   characters and `VARCHAR(MAX)` of 20,000-20,999 bytes. Both are past one
-  8192-byte chunk, so each non-NULL value needs three calls total (the initial
-  call plus two continuations); preflight fails the run if a value arrives in
-  fewer, because then the loop under test never ran.
+  8192-byte chunk, so each non-NULL value needs at least three calls total (the
+  initial call plus two continuations); conversion may produce shorter chunks and
+  require more calls. Preflight fails the run if a value arrives in fewer, because
+  then the loop under test never ran.
+  Payload is read up to the first NUL character in each chunk, not inferred from
+  the remaining-length indicator or unused buffer contents. The generated text
+  contains no embedded NULs.
 - `getdata/rowwise_20k_c16_mixed_lob/whole_result_rowwise` — the 15-column fixed
   pattern plus one *small* `NVARCHAR(MAX)`. The payload is tiny on purpose: what
   this measures is one PLP column moving all sixteen onto the row-at-a-time path.

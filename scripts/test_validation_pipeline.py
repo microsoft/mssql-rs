@@ -3,6 +3,7 @@
 
 """Regression tests for validation pipeline builds, tests, and artifacts."""
 
+import re
 from pathlib import Path
 
 import pytest
@@ -68,6 +69,23 @@ def test_linux_drop_publication_is_non_pr_only():
     }
 
 
+def test_obsolete_mssql_python_linux_build_is_removed():
+    stages = load_template("validation-stages.yml")["stages"]
+    stage = next(stage for stage in stages if stage["stage"] == "Build_mssql_python")
+    jobs = {job["job"]: job for job in stage["jobs"]}
+    assert "Build_mssql_python_Linux" not in jobs
+    assert jobs["Build_mssql_python_MacOS"]["steps"] == [
+        {"template": "test-mssql-python-macos-template.yml"}
+    ]
+    assert jobs["Test_mssql_python_on_mssql_odbc"]["steps"] == [
+        {"template": "test-mssql-python-odbc-template.yml"}
+    ]
+    removed_template = "test-mssql-python-template.yml"
+    assert not (_TEMPLATES / removed_template).exists()
+    for path in _TEMPLATES.glob("*.yml"):
+        assert removed_template not in path.read_text(encoding="utf-8"), path.name
+
+
 def test_alpine_gssapi_compilation_still_runs_on_prs():
     steps = load_template("build-template-alpine.yml")["steps"]
     build = next(
@@ -81,6 +99,51 @@ def test_alpine_gssapi_compilation_still_runs_on_prs():
     )
     assert "cargo nextest archive" in script
     assert "--features gssapi" in script
+
+
+def test_mssql_python_odbc_failures_fail_the_job():
+    template_path = _TEMPLATES / "test-mssql-python-odbc-template.yml"
+    template = template_path.read_text(encoding="utf-8")
+    steps = yaml.safe_load(template)["steps"]
+    test_step = next(
+        step
+        for step in steps
+        if step.get("displayName") == "Run mssql-python tests against mssql-odbc"
+    )
+    assert "continueOnError" not in test_step
+    assert 'exit "$rc"' in test_step["script"]
+    assert "task.complete result=SucceededWithIssues" not in test_step["script"]
+    assert "SucceededWithIssues" not in template
+
+    # A docker-exec launch failure (125/126/127), or the runner's own exit 2
+    # for a broken harness, both mean the tests said nothing about the driver,
+    # so each must still fail the job (exit "$rc") through a branch that says
+    # so rather than reporting it as a driver test failure.
+    assert re.search(r"\b2\)", test_step["script"])
+    assert re.search(r"125\|126\|127\)", test_step["script"])
+    assert "exit \"$rc\"" in test_step["script"].rsplit("esac", 1)[-1]
+
+    # The step alone isn't the whole gate: a job-level continueOnError would
+    # silently restore the old non-blocking behavior regardless of exit code.
+    stages = yaml.safe_load(
+        (_TEMPLATES / "validation-stages.yml").read_text(encoding="utf-8")
+    )["stages"]
+    build_mssql_python = next(stage for stage in stages if stage["stage"] == "Build_mssql_python")
+    odbc_job = next(
+        job
+        for job in build_mssql_python["jobs"]
+        if job.get("job") == "Test_mssql_python_on_mssql_odbc"
+    )
+    assert "continueOnError" not in odbc_job
+
+    # A dirty run must still exit nonzero from the runner itself, not just from
+    # the step that wraps it.
+    runner = (_ROOT / ".pipeline" / "scripts" / "run-mssql-python-odbc-tests.sh").read_text(
+        encoding="utf-8"
+    )
+    dirty_run_parts = runner.split('if [ "$failed" -gt 0 ]', 1)
+    assert len(dirty_run_parts) == 2, "dirty-run guard line not found in runner script"
+    assert re.search(r"\bexit 1\b", dirty_run_parts[1])
 
 
 @pytest.mark.parametrize("architecture", ["x64", "ARM64"])
