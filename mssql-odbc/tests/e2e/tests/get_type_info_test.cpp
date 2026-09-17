@@ -15,6 +15,9 @@
 #ifndef SQL_SS_XML
 #define SQL_SS_XML (-152)
 #endif
+#ifndef SQL_SS_TABLE
+#define SQL_SS_TABLE (-153)
+#endif
 
 namespace {
 
@@ -227,6 +230,36 @@ TEST_F(GetTypeInfoLiveTest, UdtReturnsHYC00) {
     SQLRETURN rc = SQLGetTypeInfo(stmt_, SQL_SS_UDT);
     EXPECT_EQ(SQL_ERROR, rc);
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HYC00");
+}
+
+// SQL_SS_UDT is not special: msodbcsql answers HYC00 for every unmapped id at
+// or below SQL_TYPE_DRIVER_START (-80), not just the UDT id.
+TEST_F(GetTypeInfoLiveTest, DriverRangeTypeReturnsHYC00) {
+    SQLRETURN rc = SQLGetTypeInfo(stmt_, -200);
+    EXPECT_EQ(SQL_ERROR, rc);
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HYC00");
+}
+
+// A table type sits far below SQL_TYPE_DRIVER_START but is still HY004, because
+// msodbcsql's FInternalSqlType check runs before the driver-range bound.
+TEST_F(GetTypeInfoLiveTest, TableTypeReturnsHY004) {
+    SQLRETURN rc = SQLGetTypeInfo(stmt_, SQL_SS_TABLE);
+    EXPECT_EQ(SQL_ERROR, rc);
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HY004");
+}
+
+// SQL Server supports no interval types, but the request is not an error:
+// msodbcsql discards IsValidSqlType's HYC00 verdict for these ids and sends the
+// RPC anyway, so the call succeeds with an empty result set.
+TEST_F(GetTypeInfoLiveTest, IntervalTypeReturnsEmptyResultSet) {
+    SQLRETURN rc = SQLGetTypeInfo(stmt_, SQL_INTERVAL_YEAR);
+    ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+
+    rc = SQLFetch(stmt_);
+    EXPECT_EQ(SQL_NO_DATA, rc);
+
+    rc = SQLCloseCursor(stmt_);
+    EXPECT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
 }
 
 // The type-info cursor is fully drainable: every row fetches cleanly until

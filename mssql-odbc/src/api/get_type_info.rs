@@ -28,11 +28,12 @@ use super::txn::begin_transaction_if_manual;
 use super::util::COLMETA_NULLABLE_FLAG;
 use crate::api::odbc_types::{
     SQL_ALL_TYPES, SQL_BIGINT, SQL_BINARY, SQL_BIT, SQL_CHAR, SQL_DATETIME, SQL_DECIMAL,
-    SQL_DOUBLE, SQL_ERROR, SQL_FLOAT, SQL_GUID, SQL_INTEGER, SQL_INVALID_HANDLE, SQL_LONGVARBINARY,
-    SQL_LONGVARCHAR, SQL_NUMERIC, SQL_REAL, SQL_SMALLINT, SQL_SS_TIME2, SQL_SS_TIMESTAMPOFFSET,
-    SQL_SS_UDT, SQL_SS_VARIANT, SQL_SS_XML, SQL_TIME, SQL_TIMESTAMP, SQL_TINYINT, SQL_TYPE_DATE,
-    SQL_TYPE_TIME, SQL_TYPE_TIMESTAMP, SQL_VARBINARY, SQL_VARCHAR, SQL_WCHAR, SQL_WLONGVARCHAR,
-    SQL_WVARCHAR, SqlHandle, SqlReturn, SqlSmallInt,
+    SQL_DOUBLE, SQL_ERROR, SQL_FLOAT, SQL_GUID, SQL_INTEGER, SQL_INTERVAL_MINUTE_TO_SECOND,
+    SQL_INTERVAL_YEAR, SQL_INVALID_HANDLE, SQL_LONGVARBINARY, SQL_LONGVARCHAR, SQL_NUMERIC,
+    SQL_REAL, SQL_SMALLINT, SQL_SS_TABLE, SQL_SS_TIME2, SQL_SS_TIMESTAMPOFFSET, SQL_SS_VARIANT,
+    SQL_SS_VECTOR, SQL_SS_XML, SQL_TIME, SQL_TIMESTAMP, SQL_TINYINT, SQL_TYPE_DATE,
+    SQL_TYPE_DRIVER_START, SQL_TYPE_TIME, SQL_TYPE_TIMESTAMP, SQL_VARBINARY, SQL_VARCHAR,
+    SQL_WCHAR, SQL_WLONGVARCHAR, SQL_WVARCHAR, SqlHandle, SqlReturn, SqlSmallInt,
 };
 use crate::error::free_errors;
 use crate::handles::stmt::{
@@ -121,8 +122,11 @@ fn sql_get_type_info_w_safe(
 
         match classify_sql_type(data_type) {
             TypeClass::Valid => {}
-            TypeClass::Udt => {
-                error!(data_type, "SQLGetTypeInfoW: UDT types are not reported");
+            TypeClass::NotAnOdbcType => {
+                error!(
+                    data_type,
+                    "SQLGetTypeInfoW: driver-range type is not reported as an ODBC type"
+                );
                 post_diag(&mut stmt_state, ERR_OPTIONAL_FEATURE_NOT_IMPLEMENTED);
                 return SQL_ERROR;
             }
@@ -242,18 +246,24 @@ fn sql_get_type_info_w_safe(
 enum TypeClass {
     /// A supported SQL type, or `SQL_ALL_TYPES` — run the catalog proc.
     Valid,
-    /// A user-defined type — reported as HYC00 (not surfaced as an ODBC type).
-    Udt,
+    /// An id in the driver-specific range that is not surfaced as an ODBC data
+    /// type — reported as HYC00.
+    NotAnOdbcType,
     /// Not a recognized SQL type — reported as HY004.
     Invalid,
 }
 
 /// Classifies a `DataType` argument the same way msodbcsql does before issuing
-/// the catalog RPC: `SQL_ALL_TYPES` and every base/SS type the driver reports
-/// (including `sql_variant`) are valid, the CLR user-defined type id
-/// (`SQL_SS_UDT`) is HYC00, and anything else is HY004. The legacy date/time
-/// identifiers (`9`/`10`/`11`) remain valid aliases alongside the ODBC 3.x
-/// identifiers (`91`/`92`/`93`).
+/// the catalog RPC (`odbc/sqlcdd.cpp`, `SQLGetTypeInfoW`), which is a three-step
+/// sequence rather than a single table:
+///
+/// 1. `FInternalSqlType` (`odbc/sqlcprot.h`) rejects the internal "MAPPED" ids
+///    and `SQL_SS_TABLE` with HY004 (line 1999).
+/// 2. The SS ids msodbcsql surfaces are folded to an internal id, and anything
+///    still at or below `SQL_TYPE_DRIVER_START` (-80) is HYC00 (line 2035).
+/// 3. `IsValidSqlType` runs last, but only its HY004 verdict aborts: line 2042
+///    discards a HYC00 from it, so the interval types reach the RPC and come
+///    back as an empty result set rather than an error.
 fn classify_sql_type(data_type: SqlSmallInt) -> TypeClass {
     match data_type {
         SQL_ALL_TYPES
@@ -286,11 +296,18 @@ fn classify_sql_type(data_type: SqlSmallInt) -> TypeClass {
         | SQL_SS_TIME2
         | SQL_SS_TIMESTAMPOFFSET
         | SQL_SS_VARIANT
+        | SQL_SS_VECTOR
         | SQL_SS_XML => TypeClass::Valid,
-        // Unlike the SS types above, SQL_SS_UDT has no internal "MAPPED" form,
-        // so msodbcsql's `fSqlTypeT <= SQL_TYPE_DRIVER_START` guard sends it to
-        // HYC00 — UDTs are not surfaced as ODBC data types.
-        SQL_SS_UDT => TypeClass::Udt,
+        // Step 3: `IsValidSqlType` calls these HYC00, which `SQLGetTypeInfoW`
+        // then discards, so the caller gets an empty result set.
+        SQL_INTERVAL_YEAR..=SQL_INTERVAL_MINUTE_TO_SECOND => TypeClass::Valid,
+        // Step 1: a table type is HY004, not HYC00, even though its id is far
+        // below the driver-range bound checked next.
+        SQL_SS_TABLE => TypeClass::Invalid,
+        // Step 2: unlike the SS types above, `SQL_SS_UDT` has no internal
+        // "MAPPED" form, so it — and every other unmapped id in the driver
+        // range — falls through to the HYC00 bound.
+        d if d <= SQL_TYPE_DRIVER_START => TypeClass::NotAnOdbcType,
         _ => TypeClass::Invalid,
     }
 }
@@ -345,7 +362,7 @@ fn clear_type_info_nullable(stmt: &StmtHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::odbc_types::SQL_NULL_HANDLE;
+    use crate::api::odbc_types::{SQL_NULL_HANDLE, SQL_SS_UDT};
     use crate::handles::handle_from_raw;
     use crate::test_support::TestHandles;
 
@@ -539,6 +556,60 @@ mod tests {
             SQL_TYPE_TIMESTAMP,
         ] {
             assert!(matches!(classify_sql_type(data_type), TypeClass::Valid));
+        }
+    }
+
+    /// Every arm of the classification table, against the three-step sequence in
+    /// `SQLGetTypeInfoW` (`odbc/sqlcdd.cpp` lines 1999 / 2035 / 2042).
+    #[test]
+    fn classification_matches_msodbcsql_for_every_arm() {
+        // Mapped to an internal id before the driver-range bound, so valid.
+        for data_type in [
+            SQL_SS_VARIANT,
+            SQL_SS_XML,
+            SQL_SS_TIME2,
+            SQL_SS_TIMESTAMPOFFSET,
+            SQL_SS_VECTOR,
+        ] {
+            assert!(
+                matches!(classify_sql_type(data_type), TypeClass::Valid),
+                "{data_type} is folded to a *_MAPPED id and accepted"
+            );
+        }
+
+        // `IsValidSqlType` answers HYC00 for these, and line 2042 discards it.
+        for data_type in [
+            SQL_INTERVAL_YEAR,
+            SQL_INTERVAL_YEAR + 6,
+            SQL_INTERVAL_MINUTE_TO_SECOND,
+        ] {
+            assert!(
+                matches!(classify_sql_type(data_type), TypeClass::Valid),
+                "interval {data_type} reaches the RPC and returns no rows"
+            );
+        }
+
+        // `FInternalSqlType` rejects a table type outright, so it is HY004 even
+        // though -153 is below the driver-range bound tested afterwards.
+        assert!(matches!(
+            classify_sql_type(SQL_SS_TABLE),
+            TypeClass::Invalid
+        ));
+
+        // Unmapped ids at or below the bound are HYC00.
+        for data_type in [SQL_SS_UDT, SQL_TYPE_DRIVER_START, -200] {
+            assert!(
+                matches!(classify_sql_type(data_type), TypeClass::NotAnOdbcType),
+                "{data_type} is in the driver range"
+            );
+        }
+
+        // Just above the bound, and unrecognized, so HY004 rather than HYC00.
+        for data_type in [SQL_TYPE_DRIVER_START + 1, -21, -22, 999] {
+            assert!(
+                matches!(classify_sql_type(data_type), TypeClass::Invalid),
+                "{data_type} is not a recognized SQL type"
+            );
         }
     }
 

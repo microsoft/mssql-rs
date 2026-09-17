@@ -43,6 +43,12 @@ unsafe layer, and delegate to safe Rust implementations. The driver targets
 the behavior of Microsoft ODBC Driver 18 where practical while documenting and
 testing deliberate differences.
 
+Design notes for individual subsystems live beside the code: the parameter
+binding and array-execution model in [`docs/parameters_plan.md`](docs/parameters_plan.md),
+the fetch path in [`docs/typed-columnar-fetch-plan.md`](docs/typed-columnar-fetch-plan.md),
+and the deliberate departures from msodbcsql in
+[`docs/parity-deviations.md`](docs/parity-deviations.md).
+
 ## Platform artifacts
 
 | Platform | Driver Manager | Library |
