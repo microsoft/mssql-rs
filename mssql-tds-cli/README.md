@@ -16,27 +16,19 @@ A command-line interface (CLI) tool for interacting with Microsoft SQL Server us
 ## Usage
 
 ```
-cargo run --bin mssql-tds-cli -- --config-file-path <PATH_TO_CONFIG>
+cargo run --bin mssql-tds-cli
 ```
 
 Or, if installed:
 
 ```
-mssql-tds-cli --config-file-path <PATH_TO_CONFIG>
+mssql-tds-cli
 ```
-
-### Options
-
-- `--config-file-path <PATH>`: Path to a configuration file (required)
 
 **Note:**
-Currently, all connection details (host, port, user, password, database, etc.) are hardcoded in the CLI source code. The only configurable option via the command line is the path to a configuration file. You may extend the CLI to support more options as needed.
-
-## Example
-
-```
-cargo run --bin mssql-tds-cli -- --config-file-path ./config.toml
-```
+The CLI does not parse command-line options or read a configuration file.
+It connects to `tcp:localhost,1433` as `sa`, uses the `master` database, and
+reads the password from `/tmp/password`.
 
 ## Why use this CLI?
 

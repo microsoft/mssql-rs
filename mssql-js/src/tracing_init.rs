@@ -1,15 +1,14 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-use once_cell::sync::OnceCell;
 use std::fs::{OpenOptions, create_dir_all};
 use std::path::{Path, PathBuf};
-use std::sync::Once;
+use std::sync::{Once, OnceLock};
 use tracing_appender::non_blocking;
 use tracing_subscriber::{EnvFilter, Registry, layer::SubscriberExt};
 
 static INIT: Once = Once::new();
-static GUARD: OnceCell<tracing_appender::non_blocking::WorkerGuard> = OnceCell::new();
+static GUARD: OnceLock<tracing_appender::non_blocking::WorkerGuard> = OnceLock::new();
 // === Environment Variable and Constant Strings ===
 const ENV_TRACE: &str = "MSSQLJS_TRACE";
 const ENV_TRACE_OUTPUTS: &str = "MSSQLJS_TRACE_OUTPUTS";

@@ -3,8 +3,6 @@
 
 use std::io::Error;
 
-use clap::Parser;
-
 use mssql_tds::core::EncryptionOptions;
 use mssql_tds::core::EncryptionSetting;
 use rustyline::Helper;
@@ -23,13 +21,6 @@ async fn main() {
     if let Err(e) = Box::pin(main_cli()).await {
         eprintln!("Application error: {e}");
     }
-}
-
-#[derive(Parser, Debug)]
-#[command(version, about, long_about = None)]
-struct Args {
-    #[arg(short, long)]
-    config_file_path: String,
 }
 
 /// Define commands for auto-completion
