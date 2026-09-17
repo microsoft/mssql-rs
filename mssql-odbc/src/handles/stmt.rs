@@ -3,7 +3,7 @@
 
 use std::collections::VecDeque;
 use std::ffi::c_void;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use tracing::error;
 
@@ -12,6 +12,7 @@ use mssql_tds::error::{Error as TdsError, SqlInfoMessage};
 
 use super::desc::{DescHandle, DescKind, DescRecord, DescState};
 use super::{DbcHandle, HandleType, HasObjectType, free_handle, handle_to_raw};
+use crate::api::describe_col::odbc_sql_type;
 use crate::api::odbc_types::{
     self, SQL_DESC_ALLOC_AUTO, SqlInteger, SqlLen, SqlPointer, SqlSmallInt, SqlULen, SqlUSmallInt,
 };
@@ -20,6 +21,7 @@ use crate::conversion::param_convert::{DaeLengthLimit, DaePlan, DaeTranscode};
 use crate::error::{DiagRecord, HasDiagnostics};
 use crate::params::BoundParam;
 use mssql_tds::datatypes::column_values::ColumnValues;
+use mssql_tds::datatypes::sql_string::{EncodingType, get_encoding_type};
 use mssql_tds::datatypes::sqldatatypes::TdsDataType;
 use mssql_tds::encoding_rs;
 use mssql_tds::encoding_rs::Decoder;
@@ -27,6 +29,12 @@ use mssql_tds::message::parameters::rpc_parameters::RpcParameter;
 use mssql_tds::query::metadata::{ColumnMetadata, PlpEncoding};
 use mssql_tds::query::result::ReturnValue;
 use mssql_tds::token::tokens::SqlCollation;
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PlpColumnInfo {
+    pub(crate) wire_encoding: PlpEncoding,
+    pub(crate) text_encoding: Option<EncodingType>,
+}
 
 /// State for a PLP column being streamed across repeated SQLGetData calls.
 pub(crate) struct ActivePlpStream {
@@ -372,6 +380,12 @@ pub(crate) struct StmtState {
     pub(crate) column_metadata: Vec<ColumnMetadata>,
     /// UTF-16 column names built once when result metadata changes.
     pub(crate) column_names_utf16: Vec<Vec<u16>>,
+    /// Bound-fetch metadata for result sets containing PLP columns.
+    pub(crate) plp_columns: Option<Arc<[Option<PlpColumnInfo>]>>,
+    /// ODBC SQL type per column, built once when result metadata changes so
+    /// resolving `SQL_C_DEFAULT` bindings does not need to re-lock the
+    /// statement after the fetch path has released it.
+    pub(crate) column_sql_types: Arc<[SqlSmallInt]>,
     /// Reused by bounded PLP read-ahead so each MAX value does not allocate a
     /// fresh carry buffer.
     pub(crate) plp_prefetch_scratch: Vec<u8>,
@@ -1334,12 +1348,37 @@ impl StmtState {
                 .iter()
                 .map(|column| column.column_name.encode_utf16().collect()),
         );
+        self.column_sql_types = self.column_metadata.iter().map(odbc_sql_type).collect();
+        self.plp_columns = self
+            .column_metadata
+            .iter()
+            .any(ColumnMetadata::is_plp)
+            .then(|| {
+                self.column_metadata
+                    .iter()
+                    .map(|metadata| {
+                        let wire_encoding = metadata.plp_encoding()?;
+                        let text_encoding = match wire_encoding {
+                            PlpEncoding::Utf16Text => Some(EncodingType::Utf16),
+                            PlpEncoding::Utf8Text => Some(EncodingType::Utf8),
+                            PlpEncoding::SingleByteText => Some(get_encoding_type(metadata)),
+                            PlpEncoding::Binary => None,
+                        };
+                        Some(PlpColumnInfo {
+                            wire_encoding,
+                            text_encoding,
+                        })
+                    })
+                    .collect::<Arc<[_]>>()
+            });
     }
 
     /// Clears result metadata and every cache derived from it.
     pub(crate) fn clear_result_metadata(&mut self) {
         self.column_metadata.clear();
         self.column_names_utf16.clear();
+        self.plp_columns = None;
+        self.column_sql_types = Arc::from([]);
     }
 
     /// Makes `metadata` the first result set of a new execution.
@@ -1507,6 +1546,8 @@ impl StmtHandle {
                 diag_records: Vec::new(),
                 column_metadata: Vec::new(),
                 column_names_utf16: Vec::new(),
+                plp_columns: None,
+                column_sql_types: Arc::from([]),
                 plp_prefetch_scratch: Vec::new(),
                 result_set_exhausted: false,
                 batch_exhausted: false,
@@ -1592,7 +1633,7 @@ mod tests {
     use super::*;
     use crate::api::odbc_types::{SQL_C_CHAR, SQL_C_SLONG, SQL_WVARCHAR};
     use crate::handles::desc::{DescHeader, DescKind};
-    use mssql_tds::test_client_support::int_columns;
+    use mssql_tds::test_client_support::{int_columns, mixed_lob_columns};
 
     fn binding(column_number: SqlUSmallInt, target_type: SqlSmallInt) -> ColumnBinding {
         ColumnBinding {
@@ -1805,6 +1846,63 @@ mod tests {
 
             assert!(s.column_metadata.is_empty());
             assert!(s.column_names_utf16.is_empty());
+        });
+    }
+
+    /// The fill loop reads this cache instead of re-deriving encodings from
+    /// `column_metadata`, so an entry surviving into a later result set would
+    /// silently mis-decode a bound LOB rather than fail. Covers the rebuild,
+    /// the explicit clear, and the non-PLP result set that follows a PLP one —
+    /// that last transition is the one where a stale cache would be consulted.
+    #[test]
+    fn plp_column_cache_does_not_outlive_its_result_set() {
+        with_state(|s| {
+            s.begin_result_set(mixed_lob_columns(2));
+            let cached = s
+                .plp_columns
+                .clone()
+                .expect("the nvarchar(max) column is PLP");
+            assert_eq!(cached.len(), 3);
+            assert!(cached[0].is_none(), "int columns are not PLP");
+            assert_eq!(
+                cached[2].expect("the lob column is PLP").wire_encoding,
+                PlpEncoding::Utf16Text
+            );
+
+            s.clear_result_metadata();
+            assert!(s.plp_columns.is_none());
+
+            s.begin_result_set(int_columns(2));
+            assert!(
+                s.plp_columns.is_none(),
+                "a non-PLP result set must not inherit the previous set's cache"
+            );
+        });
+    }
+
+    /// `SQLFetchScroll` resolves `SQL_C_DEFAULT` bindings from this cache after
+    /// it has released the statement lock, so a stale entry would map a
+    /// binding against the previous result set's types instead of failing.
+    /// Covers the rebuild, the explicit clear, and the shrinking result set
+    /// that follows a wider one — that transition is where a stale tail would
+    /// still be indexable.
+    #[test]
+    fn column_sql_type_cache_does_not_outlive_its_result_set() {
+        with_state(|s| {
+            s.begin_result_set(mixed_lob_columns(2));
+            assert_eq!(s.column_sql_types.len(), 3);
+            assert_eq!(s.column_sql_types[0], odbc_types::SQL_INTEGER);
+            assert_eq!(s.column_sql_types[2], odbc_types::SQL_WVARCHAR);
+
+            s.clear_result_metadata();
+            assert!(s.column_sql_types.is_empty());
+
+            s.begin_result_set(int_columns(1));
+            assert_eq!(
+                &*s.column_sql_types,
+                &[odbc_types::SQL_INTEGER],
+                "a narrower result set must not inherit the previous set's tail"
+            );
         });
     }
 
