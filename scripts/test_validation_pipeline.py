@@ -3,6 +3,7 @@
 
 """Regression tests for validation pipeline builds, tests, and artifacts."""
 
+import re
 from pathlib import Path
 
 import pytest
@@ -103,6 +104,12 @@ def test_miri_is_limited_to_windows_and_linux_x64_pr_jobs():
         stage for stage in load_template("validation-stages.yml")["stages"]
         if stage["stage"] == "Build"
     )
+    toolchain = build["variables"]["miriToolchain"]
+    assert re.fullmatch(r"nightly-\d{4}-\d{2}-\d{2}", toolchain)
+    readme = (_ROOT / "mssql-odbc" / "README.md").read_text(encoding="utf-8")
+    assert set(re.findall(r"nightly-\d{4}-\d{2}-\d{2}", readme)) == {toolchain}, (
+        "Update the README's Miri version when changing miriToolchain"
+    )
     expected = {
         "Build_Windows": ("pwsh", "x86_64-pc-windows-msvc", "Windows x64"),
         "Build_Linux": ("bash", "x86_64-unknown-linux-gnu", "Linux x64"),
@@ -122,10 +129,12 @@ def test_miri_is_limited_to_windows_and_linux_x64_pr_jobs():
         assert run["condition"] == _PR
         assert not run.get("continueOnError", False)
         command = run[shell]
-        assert "rustup toolchain install nightly-2026-09-06" in command
+        assert "rustup toolchain install $(miriToolchain)" in command
         assert "--component miri,rust-src" in command
-        assert f"miri setup --target {target}" in command
-        assert "cargo +nightly-2026-09-06 miri nextest run" in command
+        assert f"cargo +$(miriToolchain) miri setup --target {target}" in command
+        assert "cargo +$(miriToolchain) miri nextest run" in command
+        assert command.count("$(miriToolchain)") == 3
+        assert "nightly-" not in command
         assert f"--target {target}" in command
         for argument in (
             "--frozen", "--package mssqlodbc", "--lib",

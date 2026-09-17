@@ -79,6 +79,8 @@ stages:
         SYSTEM_ACCESSTOKEN: $(System.AccessToken)
 - stage: Build
   displayName: Build Stage
+  variables:
+    miriToolchain: nightly-2026-09-06
   dependsOn:
     - EvaluateDuplicate
   condition: >-
@@ -137,11 +139,11 @@ stages:
           enableOdbcE2E: true
       - pwsh: |
           $ErrorActionPreference = 'Stop'
-          rustup toolchain install nightly-2026-09-06 --profile minimal --component miri,rust-src
+          rustup toolchain install $(miriToolchain) --profile minimal --component miri,rust-src
           if ($LASTEXITCODE -ne 0) { throw "Miri toolchain installation failed (exit $LASTEXITCODE)" }
-          cargo +nightly-2026-09-06 miri setup --target x86_64-pc-windows-msvc
+          cargo +$(miriToolchain) miri setup --target x86_64-pc-windows-msvc
           if ($LASTEXITCODE -ne 0) { throw "Miri sysroot setup failed (exit $LASTEXITCODE)" }
-          cargo +nightly-2026-09-06 miri nextest run --frozen --package mssqlodbc --lib `
+          cargo +$(miriToolchain) miri nextest run --frozen --package mssqlodbc --lib `
             --target x86_64-pc-windows-msvc --profile miri-odbc --no-fail-fast --no-tests=fail
           if ($LASTEXITCODE -ne 0) { throw "ODBC Miri tests failed (exit $LASTEXITCODE)" }
         displayName: Run ODBC Miri tests (Windows x64)
@@ -303,9 +305,9 @@ stages:
             bash -lc '
               set -euo pipefail
               source "$HOME/.cargo/env"
-              rustup toolchain install nightly-2026-09-06 --profile minimal --component miri,rust-src
-              cargo +nightly-2026-09-06 miri setup --target x86_64-unknown-linux-gnu
-              cargo +nightly-2026-09-06 miri nextest run --frozen --package mssqlodbc --lib \
+              rustup toolchain install $(miriToolchain) --profile minimal --component miri,rust-src
+              cargo +$(miriToolchain) miri setup --target x86_64-unknown-linux-gnu
+              cargo +$(miriToolchain) miri nextest run --frozen --package mssqlodbc --lib \
                 --target x86_64-unknown-linux-gnu --profile miri-odbc --no-fail-fast --no-tests=fail
             '
         displayName: Run ODBC Miri tests (Linux x64)

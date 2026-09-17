@@ -70,6 +70,10 @@ The `--package mssqlodbc` option scopes the run to the driver. The shared filter
 uses only test names so it also parses in the smaller Kerberos workspace,
 which omits ODBC.
 
+The Build stage's `miriToolchain` variable in
+`.pipeline/templates/validation-stages.yml` holds the CI pin; keep the local
+commands below on the same version when updating it.
+
 From the repository root, with `cargo-nextest` installed:
 
 ```powershell

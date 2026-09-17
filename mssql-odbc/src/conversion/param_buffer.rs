@@ -156,8 +156,9 @@ pub(crate) enum Indicator {
 ///
 /// # Safety
 /// `param.strlen_or_ind_ptr`, if non-null, must point to one valid `SqlLen`.
-/// Unless it specifies `SQL_NULL_DATA`, `param.octet_length_ptr`, if non-null,
-/// must also point to one valid `SqlLen`.
+/// `param.octet_length_ptr`, if non-null, must also point to one valid `SqlLen`,
+/// except when `param.strlen_or_ind_ptr` is non-null and points to `SQL_NULL_DATA`.
+/// In that case, the octet-length slot is not read.
 pub(crate) unsafe fn read_indicator(param: &BoundParam) -> Result<Indicator, ParamBuildError> {
     // `SQLBindParameter` aims `SQL_DESC_INDICATOR_PTR` and
     // `SQL_DESC_OCTET_LENGTH_PTR` at one address, so reading NULL from the
