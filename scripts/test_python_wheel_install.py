@@ -93,7 +93,6 @@ def test_select_driver_uses_native_slice_for_universal2(
         def locate_file(file: PackagePath) -> Path:
             return tmp_path / file
 
-    monkeypatch.setattr(wheel_install.sys, "platform", "darwin")
     monkeypatch.setattr(wheel_install.platform, "machine", lambda: "arm64")
 
     driver = wheel_install.select_driver(
