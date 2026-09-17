@@ -79,6 +79,10 @@ created when no bump is needed. If a bump becomes unnecessary without merging
 the PR, close its tracking issue manually. Generated PRs preserve the PR
 template and leave validation checkboxes unchecked.
 
+The shared validation pipeline runs `scripts/test_bump_released_crate_versions.py`
+in its Windows Python test step for both PR validation and main-branch CI.
+Registry and GitHub requests are mocked; these tests create no issues or PRs.
+
 Before enabling the workflow:
 
 - Allow GitHub Actions to create pull requests in the repository's Actions
