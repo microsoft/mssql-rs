@@ -281,9 +281,11 @@ msodbcsql build is measured.
    require preserving wrapper identity after the value has been captured;
    this driver deliberately treats the captured value like its base type in
    both `SQLGetData` delivery and the subsequent
-   `SQLColAttribute(SQL_CA_SS_VARIANT_TYPE)` lookup. msodbcsql short-circuits
-   on `if (!cbDataAvail) goto Return3;` in `InternalGetColData`
-   (`odbc/sqlcdata.h`) before marking the column consumed.
+   `SQLColAttribute(SQL_CA_SS_VARIANT_TYPE)` lookup. In
+   `InternalGetColData` (`odbc/sqlcdata.h`, around line 542), msodbcsql posts
+   `IDS_01_004` when the output policy is binary, `cbBuf == 0`, and
+   `IsVariantColumn(pColInfo)`; the warning is gated by the zero user buffer
+   and variant wrapper, not by the amount of data available.
    The difference is invisible to mssql-python, whose probe is gated on
    `SQL_SUCCEEDED`. `EmptyVariantProbeConsumesValueButKeepsBaseType` accepts
    either successful return so its parity leg can still compare the base type
