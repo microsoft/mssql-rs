@@ -51,7 +51,11 @@ on the `master` branch.
   `.pipeline/validation-pipeline.yml`. Use the e2e runner's
   `--compare-with-msodbcsql` mode for observable parity checks.
 - Add or retain `SKIP_IF_COMPARING_MSODBCSQL()` only for a measured divergence;
-  the skip removes the assertion from the reference-driver leg.
+  the skip removes the assertion from the reference-driver leg. When the test
+  exists solely to pin one divergence that already has a registry entry, prefer
+  asserting each leg's expected result over skipping, so the reference stays
+  measured on every run; see the carve-out in
+  [the e2e README](../../mssql-odbc/tests/e2e/README.md).
 - A consumer-based divergence requires evidence from both the consumer's
   routing path and its delivery path.
 - Record every deliberate deviation that meets the registry's

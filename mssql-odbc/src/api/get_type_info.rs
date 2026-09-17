@@ -157,16 +157,7 @@ fn sql_get_type_info_w_safe(
     };
 
     // `@data_type` is positional and uses the ODBC 3.x identifier unchanged.
-    let positional = vec![RpcParameter::new(
-        None,
-        StatusFlags::NONE,
-        SqlType::SmallInt(Some(data_type)),
-    )];
-    let named = Some(vec![RpcParameter::new(
-        Some("@ODBCVer".to_string()),
-        StatusFlags::NONE,
-        SqlType::TinyInt(Some(ODBC_VER_YUKON)),
-    )]);
+    let (positional, named) = type_info_rpc_params(data_type);
 
     let mut client = match claim_connection(dbc, stmt, statement_handle, "SQLGetTypeInfoW") {
         Ok(client) => client,
@@ -244,6 +235,24 @@ fn sql_get_type_info_w_safe(
     rename_type_info_columns(stmt);
     clear_type_info_nullable(stmt);
     rc
+}
+
+/// Builds the RPC arguments for the type-info catalog proc: the positional
+/// `@data_type`, forwarded unchanged, and the named `@ODBCVer`. Split out so a
+/// test can assert what actually goes on the wire — pinning `ODBC_VER_YUKON`
+/// alone would still pass if this call site stopped using it.
+fn type_info_rpc_params(data_type: SqlSmallInt) -> (Vec<RpcParameter>, Option<Vec<RpcParameter>>) {
+    let positional = vec![RpcParameter::new(
+        None,
+        StatusFlags::NONE,
+        SqlType::SmallInt(Some(data_type)),
+    )];
+    let named = Some(vec![RpcParameter::new(
+        Some("@ODBCVer".to_string()),
+        StatusFlags::NONE,
+        SqlType::TinyInt(Some(ODBC_VER_YUKON)),
+    )]);
+    (positional, named)
 }
 
 /// Outcome of validating a caller-supplied `SQLGetTypeInfo` `DataType`.
@@ -642,12 +651,37 @@ mod tests {
     }
 
     /// `SQLGetTypeInfo` sends the Yukon pseudo-version, not the 3 the catalog
-    /// functions send (`sqlcdd.cpp:2206` versus `sqlcdd.cpp:1814`). Pinned here
-    /// because the live suite cannot observe the value: the XML NULL-precision
-    /// effect msodbcsql's comment attributes to it no longer reproduces.
+    /// functions send (`sqlcdd.cpp:2206` versus `sqlcdd.cpp:1814`). Asserted
+    /// over the constructed parameters rather than the constant, so replacing
+    /// the call site's `ODBC_VER_YUKON` with a literal, or dropping the named
+    /// parameter entirely, fails here. The live suite cannot cover this: the
+    /// XML NULL-precision effect msodbcsql's comment attributes to the value no
+    /// longer reproduces. Capturing the RPC in `mssql-mock-tds` would assert it
+    /// end to end, but that crate exposes no request-capture API yet.
     #[test]
-    fn odbc_ver_is_the_yukon_pseudo_version() {
+    fn type_info_rpc_sends_the_yukon_pseudo_version_and_the_unmodified_type() {
         assert_eq!(ODBC_VER_YUKON, 4);
+
+        let (positional, named) = type_info_rpc_params(SQL_TYPE_TIMESTAMP);
+
+        assert_eq!(positional.len(), 1);
+        let positional_debug = format!("{:?}", positional[0]);
+        assert!(
+            positional_debug.contains(&format!("SmallInt(Some({SQL_TYPE_TIMESTAMP}))")),
+            "the requested type must be forwarded unchanged, got: {positional_debug}"
+        );
+
+        let named = named.expect("@ODBCVer is sent for every 3.x application");
+        assert_eq!(named.len(), 1);
+        let named_debug = format!("{:?}", named[0]);
+        assert!(
+            named_debug.contains("\"@ODBCVer\""),
+            "expected an @-prefixed parameter name, got: {named_debug}"
+        );
+        assert!(
+            named_debug.contains("TinyInt(Some(4))"),
+            "@ODBCVer must be TINYINT 4, got: {named_debug}"
+        );
     }
 
     #[test]
