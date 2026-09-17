@@ -18,6 +18,9 @@
 #ifndef SQL_SS_TABLE
 #define SQL_SS_TABLE (-153)
 #endif
+#ifndef SQL_SS_VECTOR
+#define SQL_SS_VECTOR (-156)
+#endif
 
 namespace {
 
@@ -256,6 +259,27 @@ TEST_F(GetTypeInfoLiveTest, IntervalTypeReturnsEmptyResultSet) {
     ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
 
     rc = SQLFetch(stmt_);
+    EXPECT_EQ(SQL_NO_DATA, rc);
+
+    rc = SQLCloseCursor(stmt_);
+    EXPECT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+}
+
+// A vector type id is accepted and reaches the catalog RPC rather than being
+// rejected client-side: msodbcsql folds SQL_SS_VECTOR to SQL_VECTOR_MAPPED,
+// which clears the driver-range bound. Whether the server reports a row depends
+// on its vector support, so only the cursor is asserted, not the row count.
+TEST_F(GetTypeInfoLiveTest, VectorTypeReachesTheCatalogProc) {
+    SQLRETURN rc = SQLGetTypeInfo(stmt_, SQL_SS_VECTOR);
+    ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+
+    SQLSMALLINT columns = 0;
+    rc = SQLNumResultCols(stmt_, &columns);
+    ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+    EXPECT_GT(columns, 0);
+
+    while ((rc = SQLFetch(stmt_)) == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO) {
+    }
     EXPECT_EQ(SQL_NO_DATA, rc);
 
     rc = SQLCloseCursor(stmt_);

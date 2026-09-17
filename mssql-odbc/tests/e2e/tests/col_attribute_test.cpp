@@ -11,30 +11,34 @@
 //   4.  UnknownFieldIdentifier            - unreported field id → HY091
 //   5.  DescCountIgnoresColumnNumber      - SQL_DESC_COUNT describes the result set
 //   6.  ConciseTypePerColumnType          - int/varchar/nvarchar/decimal concise types
-//   7.  TypeNameAndRadix                  - SQL_DESC_TYPE_NAME, SQL_DESC_NUM_PREC_RADIX
-//   8.  PrecisionScaleAndNullable         - DECIMAL(10,2), NOT NULL vs NULL
-//   9.  UnsignedIsFalseOnlyForSignedNumerics - nonnumeric columns are "unsigned"
-//   10. DisplaySizeIsRenderedWidth        - sign, hex expansion, characters not bytes
-//   11. DisplaySizeForApproximateNumerics - real/float exponential form
-//   12. OctetLengthIsTransferSize         - ODBC C struct size, not TDS wire width
-//   13. VerboseTypeDiffersFromConciseForTimestamps - SQL_DATETIME + subtype
-//   14. VerboseTypeMatchesConciseForNonTimestamps
-//   15. SearchableIsDerivedFromTheType    - LIKE-only, unsearchable, full
-//   16. IdentityColumnReportsAutoUniqueValue
-//   17. AliasedColumnDoesNotReportTheAliasAsBaseColumnName
-//   18. NameIsReportedInBytes             - SQL_DESC_NAME length is a byte count
-//   19. NameTruncationReturnsInfo         - short buffer → SUCCESS_WITH_INFO + 01004
-//   20. VariantTypeOnNonVariantColumn     - HY113
-//   21. VariantUnderlyingTypeAfterProbe   - probe then SQL_CA_SS_VARIANT_TYPE
-//   22. Odbc3TemporalVariantTypes          - legacy codes and SS binary fallback
-//   23. Odbc38TemporalVariantTypes         - legacy codes and SS extended types
-//   25. EmptyVariantProbeConsumesValueButKeepsBaseType - base type survives the probe
-//   26. VariantTypeBeforeProbeIsSequenceError - attribute before the value is read
-//   27. ClrUdtDescriptorFields             - CLR UDT type, size, and identity fields
-//   28. ClrUdtIdentityFieldsAreEmptyForNonUdtColumns - non-UDT identity fields are empty
-//   29. VariantExactNumericsReportNumeric - decimal/numeric/money/smallmoney → SQL_C_NUMERIC
-//   30. VariantDecimalStillDeliversAsCharacter - the SQL_C_CHAR read after the attribute
-//   31. VariantBaseTypesMatchMsodbcsql    - every measured-parity base type
+//   7.  ClrUdtDescriptorFields            - CLR UDT type, size, and identity fields
+//   8.  ClrUdtIdentityFieldsAreEmptyForNonUdtColumns - non-UDT identity fields are empty
+//   9.  TypeNameAndRadix                  - SQL_DESC_TYPE_NAME, SQL_DESC_NUM_PREC_RADIX
+//   10. PrecisionScaleAndNullable         - DECIMAL(10,2), NOT NULL vs NULL
+//   11. UnsignedIsFalseOnlyForSignedNumerics - nonnumeric columns are "unsigned"
+//   12. DisplaySizeIsRenderedWidth        - sign, hex expansion, characters not bytes
+//   13. DisplaySizeForApproximateNumerics - real/float exponential form
+//   14. OctetLengthIsTransferSize         - ODBC C struct size, not TDS wire width
+//   15. VerboseTypeDiffersFromConciseForTimestamps - SQL_DATETIME + subtype
+//   16. DatetimeSubtypeAccompaniesTheVerboseType - SQL_DESC_DATETIME_INTERVAL_CODE
+//   17. VerboseTypeMatchesConciseForNonTimestamps
+//   18. SearchableIsDerivedFromTheType    - LIKE-only, unsearchable, full
+//   19. IdentityColumnReportsAutoUniqueValue
+//   20. AliasedColumnDoesNotReportTheAliasAsBaseColumnName
+//   21. NameIsReportedInBytes             - SQL_DESC_NAME length is a byte count
+//   22. NameTruncationReturnsInfo         - short buffer → SUCCESS_WITH_INFO + 01004
+//   23. VariantTypeOnNonVariantColumn     - HY113
+//   24. VariantUnderlyingTypeAfterProbe   - probe then SQL_CA_SS_VARIANT_TYPE
+//   25. Odbc3TemporalVariantTypes         - legacy codes and SS binary fallback
+//   26. Odbc38TemporalVariantTypes        - legacy codes and SS extended types
+//   27. EmptyVariantProbeConsumesValueButKeepsBaseType - base type survives the probe
+//   28. EmptyVariantProbeReturnsSuccessWithoutWarning - this driver's exact return
+//   29. NullVariantDoesNotDisturbTheFollowingColumn - no base type byte to consume
+//   30. VariantTypeIsPerColumn            - a probe answers only for its own column
+//   31. VariantTypeBeforeProbeIsSequenceError - attribute before the value is read
+//   32. VariantExactNumericsReportNumeric - decimal/numeric/money/smallmoney → SQL_C_NUMERIC
+//   33. VariantDecimalStillDeliversAsCharacter - the SQL_C_CHAR read after the attribute
+//   34. VariantBaseTypesMatchMsodbcsql    - every measured-parity base type
 
 #include "odbc_test_fixture.h"
 
