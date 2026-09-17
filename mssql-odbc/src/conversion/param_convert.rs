@@ -193,27 +193,55 @@ pub(crate) unsafe fn data_at_exec_indicator(param: &BoundParam) -> Option<SqlLen
 /// (`@P1`-style).
 ///
 /// # Safety
-/// See [`bound_param_to_value_with_outcome`].
+/// See [`bound_param_to_value_with_family`].
 #[inline(always)]
 pub(crate) unsafe fn bound_param_to_rpc(
     name: impl Into<Option<String>>,
     param: &BoundParam,
 ) -> Result<(RpcParameter, ConvOk), ParamBuildError> {
-    let ((value, type_metadata), outcome) = unsafe { bound_param_to_value_with_outcome(param) }?;
-    // BY_REF_VALUE is what makes the server send a RETURNVALUE token back for
-    // this parameter; without it an OUTPUT binding would be sent as a plain
-    // input and silently produce nothing.
-    let status = if is_output_direction(param.input_output_type) {
-        StatusFlags::BY_REF_VALUE
-    } else {
-        StatusFlags::NONE
-    };
-    let parameter = RpcParameter::new(name.into(), status, value);
-    let parameter = match type_metadata {
-        Some(metadata) => parameter.with_type_metadata(metadata),
-        None => parameter,
-    };
-    Ok((parameter, outcome))
+    unsafe { ParamConversion::new(param).convert_rpc(name.into(), param) }
+}
+
+/// Conversion decisions valid for one descriptor snapshot, never for row data.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ParamConversion {
+    family: Option<SqlFamily>,
+    status: StatusFlags,
+}
+
+impl ParamConversion {
+    pub(crate) fn new(param: &BoundParam) -> Self {
+        Self {
+            family: sql_family(param.sql_type),
+            status: if is_output_direction(param.input_output_type) {
+                StatusFlags::BY_REF_VALUE
+            } else {
+                StatusFlags::NONE
+            },
+        }
+    }
+
+    /// # Safety
+    /// The binding must be from the snapshot used to compile this conversion,
+    /// with readable buffers as required by `bound_param_to_value_with_family`.
+    #[inline(always)]
+    pub(crate) unsafe fn convert_rpc(
+        &self,
+        name: Option<String>,
+        param: &BoundParam,
+    ) -> Result<(RpcParameter, ConvOk), ParamBuildError> {
+        let ((value, type_metadata), outcome) =
+            unsafe { bound_param_to_value_with_family(param, self.family) }?;
+        // BY_REF_VALUE is what makes the server send a RETURNVALUE token back for
+        // this parameter; without it an OUTPUT binding would be sent as a plain
+        // input and silently produce nothing.
+        let parameter = RpcParameter::new(name, self.status, value);
+        let parameter = match type_metadata {
+            Some(metadata) => parameter.with_type_metadata(metadata),
+            None => parameter,
+        };
+        Ok((parameter, outcome))
+    }
 }
 
 /// Reads the application's value buffer and produces the corresponding
@@ -233,8 +261,20 @@ pub(crate) unsafe fn bound_param_to_value(
 /// length, and their non-null indicator pointers must address an initialized
 /// `SqlLen`. Output-only buffers are not read.
 #[inline(always)]
+#[cfg(test)]
 unsafe fn bound_param_to_value_with_outcome(
     param: &BoundParam,
+) -> Result<(TypedValue, ConvOk), ParamBuildError> {
+    unsafe { bound_param_to_value_with_family(param, sql_family(param.sql_type)) }
+}
+
+/// # Safety
+/// Value and indicator buffers must satisfy `SQLBindParameter`'s readable
+/// extents. `family` must describe this binding's SQL type.
+#[inline(always)]
+unsafe fn bound_param_to_value_with_family(
+    param: &BoundParam,
+    family: Option<SqlFamily>,
 ) -> Result<(TypedValue, ConvOk), ParamBuildError> {
     if is_output_only(param.input_output_type) {
         return typed_null(param.sql_type, param.column_size, param.decimal_digits)
@@ -251,8 +291,7 @@ unsafe fn bound_param_to_value_with_outcome(
     };
 
     let app_value = unsafe { read_param_value(param, len_spec) }?;
-    let family =
-        sql_family(param.sql_type).ok_or(ParamBuildError::UnsupportedSqlType(param.sql_type))?;
+    let family = family.ok_or(ParamBuildError::UnsupportedSqlType(param.sql_type))?;
 
     let value = match (app_value, family) {
         (AppValue::Integer(v), SqlFamily::Integer) => convert_integer_sql(param.sql_type, v)?,
@@ -1938,6 +1977,55 @@ mod tests {
             buffer_length: 0,
             strlen_or_ind_ptr: ind,
             octet_length_ptr: ind,
+        }
+    }
+
+    #[test]
+    fn compiled_conversion_preserves_values_nulls_lengths_and_errors() {
+        let narrow = b"12\0invalid\0";
+        let wide: Vec<u16> = "12\0invalid\0".encode_utf16().collect();
+        for (c_type, ptr) in [
+            (SQL_C_CHAR, narrow.as_ptr().cast_mut().cast()),
+            (SQL_C_WCHAR, wide.as_ptr().cast_mut().cast()),
+        ] {
+            for sql_type in [
+                SQL_INTEGER,
+                SQL_BIGINT,
+                SQL_VARCHAR,
+                SQL_WVARCHAR,
+                SQL_DECIMAL,
+                SQL_TYPE_TIMESTAMP,
+                SQL_SS_VARIANT,
+                SQL_SS_XML,
+                SQL_BINARY,
+                0,
+            ] {
+                let mut indicator = 0;
+                let mut bound = param(c_type, ptr, &raw mut indicator);
+                bound.sql_type = sql_type;
+                bound.column_size = 3;
+                let conversion = ParamConversion::new(&bound);
+                for length in [
+                    0,
+                    2,
+                    4,
+                    10,
+                    SQL_NTS.into(),
+                    SQL_NULL_DATA,
+                    SQL_DEFAULT_PARAM,
+                    SQL_DATA_AT_EXEC,
+                    -6,
+                ] {
+                    indicator = length;
+                    let expected = unsafe { bound_param_to_rpc(None, &bound) };
+                    let actual = unsafe { conversion.convert_rpc(None, &bound) };
+                    assert_eq!(
+                        format!("{actual:?}"),
+                        format!("{expected:?}"),
+                        "C {c_type}, SQL {sql_type}, indicator {indicator}"
+                    );
+                }
+            }
         }
     }
 

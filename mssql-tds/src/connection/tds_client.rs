@@ -1674,15 +1674,17 @@ impl TdsClient {
         self.position_on_first_result().await
     }
 
-    async fn execute_sp_execute_batch<'a, I>(
+    async fn execute_sp_execute_batch<'a, F>(
         &mut self,
         statement_id: StatementId,
-        rows: I,
+        mut rows: F,
+        mut positional_params: Vec<RpcParameter>,
+        mut first_row: Option<usize>,
         options: impl Into<ExecuteOptions<'a>>,
         preserve_rows: bool,
     ) -> TdsResult<PreparedBatchResult>
     where
-        I: IntoIterator<Item = TdsResult<(usize, Vec<RpcParameter>)>>,
+        F: FnMut(&mut Vec<RpcParameter>) -> Option<TdsResult<usize>>,
     {
         let Some(handle) = self.prepared_handles.get(&statement_id).copied() else {
             return Err(UsageError(
@@ -1705,17 +1707,30 @@ impl TdsClient {
 
         let database_collation = self.negotiated_settings.database_collation;
         let send_started = self.request_timeout_start();
-        let rows = rows.into_iter();
         let mut packet_writer = PacketType::RpcRequest.create_packet_writer(
             self.transport.as_writer(),
             timeout_sec,
             cancel_handle,
         );
-        let (row_count, _) = rows.size_hint();
-        let mut row_indices = Vec::with_capacity(row_count);
+        let mut row_indices = Vec::new();
         let mut first = true;
+        let handle_parameter =
+            RpcParameter::new(None, StatusFlags::NONE, SqlType::Int(Some(handle)));
+        let rpc = SqlRpc::new_batch_command(
+            RpcType::ProcId(RpcProcs::Execute),
+            None,
+            None,
+            &database_collation,
+            &self.execution_context,
+            true,
+        );
+        let encoder = GenericEncoder::new();
         let serialization_result = async {
-            for row in rows {
+            while let Some(row) = first_row
+                .take()
+                .map(Ok)
+                .or_else(|| rows(&mut positional_params))
+            {
                 // A row's parameters are all converted before any of its bytes
                 // reach the writer, so a build failure leaves no partial
                 // command behind: skipping it keeps the batch well-formed and
@@ -1723,7 +1738,7 @@ impl TdsClient {
                 // state by retracting the started command with
                 // RPCBATCH_IGNORELAST (tdsrpc.cpp:258-268); it needs the byte
                 // because it streams conversion straight into the RPC buffer.
-                let Ok((row_index, mut positional_params)) = row else {
+                let Ok(row_index) = row else {
                     continue;
                 };
                 RpcParameter::reject_data_at_exec(positional_params.iter())?;
@@ -1736,19 +1751,16 @@ impl TdsClient {
                             .to_string(),
                     ));
                 }
-                let handle_parameter =
-                    RpcParameter::new(None, StatusFlags::NONE, SqlType::Int(Some(handle)));
-                positional_params.insert(0, handle_parameter);
-                let rpc = SqlRpc::new_batch_command(
-                    RpcType::ProcId(RpcProcs::Execute),
-                    Some(positional_params),
-                    None,
-                    &database_collation,
-                    &self.execution_context,
-                    first,
-                );
-                rpc.serialize_batch_command(&mut packet_writer, first)
+                rpc.serialize_batch_header(&mut packet_writer, first)
                     .await?;
+                handle_parameter
+                    .serialize(&mut packet_writer, &database_collation, true, &encoder)
+                    .await?;
+                for parameter in &positional_params {
+                    parameter
+                        .serialize(&mut packet_writer, &database_collation, true, &encoder)
+                        .await?;
+                }
                 first = false;
                 row_indices.push(row_index);
             }
@@ -2167,8 +2179,23 @@ impl TdsClient {
         I: IntoIterator<Item = TdsResult<(usize, Vec<RpcParameter>)>>,
     {
         self.begin_command();
-        self.execute_sp_execute_batch(statement_id, rows, ExecuteOptions::default(), false)
-            .await
+        let mut rows = rows.into_iter();
+        self.execute_sp_execute_batch(
+            statement_id,
+            |params| {
+                rows.next().map(|row| {
+                    row.map(|(index, values)| {
+                        *params = values;
+                        index
+                    })
+                })
+            },
+            Vec::new(),
+            None,
+            ExecuteOptions::default(),
+            false,
+        )
+        .await
     }
 
     /// Opens the command boundary, recovers a dead connection, and resolves the
@@ -3770,26 +3797,76 @@ impl TdsClient {
     where
         I: IntoIterator<Item = TdsResult<(usize, Vec<RpcParameter>)>>,
     {
+        let mut rows = rows.into_iter();
+        self.execute_prepared_batch_with_buffer(
+            statement,
+            |params| {
+                rows.next().map(|row| {
+                    row.map(|(index, values)| {
+                        *params = values;
+                        index
+                    })
+                })
+            },
+            orphaned,
+            options,
+            preserve_rows,
+        )
+        .await
+    }
+
+    /// Row-preserving prepared execution with reusable, driver-owned row storage.
+    ///
+    /// `fill_row` must fully replace the row before returning its index. It must
+    /// copy application data into owned parameters; no application-buffer borrow
+    /// may survive the callback. An error skips that row, as in the iterator API.
+    pub async fn begin_execute_prepared_batch_with_buffer<'a, F>(
+        &mut self,
+        statement: &mut PreparedStatement,
+        fill_row: F,
+        orphaned: &mut Option<StatementId>,
+        options: impl Into<ExecuteOptions<'a>>,
+    ) -> TdsResult<PreparedBatchResult>
+    where
+        F: FnMut(&mut Vec<RpcParameter>) -> Option<TdsResult<usize>>,
+    {
+        self.execute_prepared_batch_with_buffer(statement, fill_row, orphaned, options, true)
+            .await
+    }
+
+    async fn execute_prepared_batch_with_buffer<'a, F>(
+        &mut self,
+        statement: &mut PreparedStatement,
+        mut rows: F,
+        orphaned: &mut Option<StatementId>,
+        options: impl Into<ExecuteOptions<'a>>,
+        preserve_rows: bool,
+    ) -> TdsResult<PreparedBatchResult>
+    where
+        F: FnMut(&mut Vec<RpcParameter>) -> Option<TdsResult<usize>>,
+    {
         if self.command_is_busy() {
             return Err(UsageError(ALREADY_EXECUTING_ERROR.to_string()));
         }
 
-        let mut rows = rows.into_iter().peekable();
+        let mut params = Vec::new();
         // A row that fails to build is skipped rather than aborting the batch,
         // so the parameter declaration comes from the first row that builds -
         // not from row 0. The caller's iterator has already recorded the ones
         // skipped here, so consuming them loses nothing.
-        while matches!(rows.peek(), Some(Err(_))) {
-            rows.next();
-        }
-        let Some(Ok((_, first_params))) = rows.peek() else {
-            return Ok(PreparedBatchResult {
-                rows: Vec::new(),
-                complete: true,
-            });
+        let first_row = loop {
+            match rows(&mut params) {
+                Some(Ok(index)) => break index,
+                Some(Err(_)) => continue,
+                None => {
+                    return Ok(PreparedBatchResult {
+                        rows: Vec::new(),
+                        complete: true,
+                    });
+                }
+            }
         };
-        let declaration_params = first_params.clone();
-        RpcParameter::reject_data_at_exec(declaration_params.iter())?;
+        RpcParameter::reject_data_at_exec(params.iter())?;
         let mut opts = options.into();
         self.current_command_ce_setting = opts.column_encryption;
         if self.should_encrypt_parameters() {
@@ -3818,7 +3895,7 @@ impl TdsClient {
                     opts.timeout = budget.into_timeout()?.seconds();
                 }
 
-                let declaration_params = declaration_params
+                let declaration_params = params
                     .iter()
                     .cloned()
                     .enumerate()
@@ -3842,8 +3919,15 @@ impl TdsClient {
             }
         };
 
-        self.execute_sp_execute_batch(statement_id, rows, opts, preserve_rows)
-            .await
+        self.execute_sp_execute_batch(
+            statement_id,
+            rows,
+            params,
+            Some(first_row),
+            opts,
+            preserve_rows,
+        )
+        .await
     }
 
     /// Streaming counterpart to [`execute_prepared`](Self::execute_prepared) for
@@ -14900,6 +14984,81 @@ mod tests {
         assert!(last.complete);
         assert!(!client.has_open_batch());
         assert_eq!(client.advance().await.unwrap(), StatementResult::End);
+    }
+
+    #[tokio::test]
+    async fn prepared_batch_buffer_skips_partial_rows_and_matches_owned_wire() {
+        let tokens = || {
+            vec![
+                batch_done_in_proc(1),
+                batch_done_proc(true, false),
+                batch_done_in_proc(1),
+                batch_done_proc(false, false),
+            ]
+        };
+        let parameter =
+            |value| RpcParameter::new(None, StatusFlags::NONE, SqlType::Int(Some(value)));
+        let (mut owned, owned_wire) = create_capturing_client(tokens());
+        owned.execution_context.set_transaction_descriptor(1);
+        let id = owned.register_prepared_handle_for_test(42);
+        let mut statement =
+            PreparedStatement::materialized_for_test("INSERT INTO t VALUES (@P1)", id);
+        owned
+            .begin_execute_prepared_batch(
+                &mut statement,
+                vec![Ok((0, vec![parameter(10)])), Ok((2, vec![parameter(20)]))],
+                &mut None,
+                (),
+            )
+            .await
+            .unwrap();
+
+        let (mut buffered, buffered_wire) = create_capturing_client(tokens());
+        buffered.execution_context.set_transaction_descriptor(1);
+        let id = buffered.register_prepared_handle_for_test(42);
+        let mut statement =
+            PreparedStatement::materialized_for_test("INSERT INTO t VALUES (@P1)", id);
+        let mut row = 0;
+        let mut allocation = None;
+        let result = buffered
+            .begin_execute_prepared_batch_with_buffer(
+                &mut statement,
+                |params| {
+                    if row == 3 {
+                        return None;
+                    }
+                    params.clear();
+                    params.push(parameter([10, 777, 20][row]));
+                    if let Some(ptr) = allocation {
+                        assert_eq!(params.as_ptr(), ptr);
+                    } else {
+                        allocation = Some(params.as_ptr());
+                    }
+                    let index = row;
+                    row += 1;
+                    Some(if index == 1 {
+                        Err(UsageError("second parameter conversion failed".into()))
+                    } else {
+                        Ok(index)
+                    })
+                },
+                &mut None,
+                (),
+            )
+            .await
+            .unwrap();
+        assert!(result.complete);
+        assert_eq!(
+            result
+                .rows
+                .iter()
+                .map(|row| row.row_index)
+                .collect::<Vec<_>>(),
+            [0, 2]
+        );
+        assert_eq!(*owned_wire.lock().unwrap(), *buffered_wire.lock().unwrap());
+        assert!(!buffered.has_open_batch());
+        assert!(!buffered.is_connection_dead());
     }
 
     #[tokio::test]

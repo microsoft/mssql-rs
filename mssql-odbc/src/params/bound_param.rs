@@ -75,6 +75,59 @@ pub(crate) enum ParamArrayLayoutError {
     },
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ParamArrayBinding {
+    base: BoundParam,
+    strides: Option<(usize, usize)>,
+}
+
+impl ParamArrayBinding {
+    pub(crate) fn new(base: BoundParam, bind_offset: isize, bind_type: SqlULen) -> Self {
+        let strides = if bind_type == SQL_BIND_BY_COLUMN {
+            parameter_value_stride(base.c_type, base.buffer_length)
+                .map(|stride| (stride, std::mem::size_of::<SqlLen>()))
+        } else {
+            Some((bind_type, bind_type))
+        };
+        Self {
+            base: base.with_bind_offset(bind_offset),
+            strides,
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn for_row(&self, row: usize) -> Result<BoundParam, ParamArrayLayoutError> {
+        let mut positioned = self.base;
+        if row == 0 {
+            return Ok(positioned);
+        }
+        let Some((value_stride, indicator_stride)) = self.strides else {
+            return Err(ParamArrayLayoutError::InvalidValueStride {
+                c_type: self.base.c_type,
+                buffer_length: self.base.buffer_length,
+            });
+        };
+        let value_offset = row.wrapping_mul(value_stride);
+        let indicator_offset = row.wrapping_mul(indicator_stride);
+        if !positioned.parameter_value_ptr.is_null() {
+            positioned.parameter_value_ptr = positioned
+                .parameter_value_ptr
+                .wrapping_byte_add(value_offset);
+        }
+        if !positioned.strlen_or_ind_ptr.is_null() {
+            positioned.strlen_or_ind_ptr = positioned
+                .strlen_or_ind_ptr
+                .wrapping_byte_add(indicator_offset);
+        }
+        if !positioned.octet_length_ptr.is_null() {
+            positioned.octet_length_ptr = positioned
+                .octet_length_ptr
+                .wrapping_byte_add(indicator_offset);
+        }
+        Ok(positioned)
+    }
+}
+
 impl BoundParam {
     /// Returns the binding with `SQL_ATTR_PARAM_BIND_OFFSET_PTR` applied.
     ///
@@ -107,40 +160,7 @@ impl BoundParam {
         bind_offset: isize,
         param_bind_type: SqlULen,
     ) -> Result<Self, ParamArrayLayoutError> {
-        let mut positioned = self.with_bind_offset(bind_offset);
-        if row == 0 {
-            return Ok(positioned);
-        }
-        let (value_stride, indicator_stride) = if param_bind_type == SQL_BIND_BY_COLUMN {
-            let Some(value_stride) = parameter_value_stride(self.c_type, self.buffer_length) else {
-                return Err(ParamArrayLayoutError::InvalidValueStride {
-                    c_type: self.c_type,
-                    buffer_length: self.buffer_length,
-                });
-            };
-            (value_stride, std::mem::size_of::<SqlLen>())
-        } else {
-            let row_stride = param_bind_type;
-            (row_stride, row_stride)
-        };
-        let value_offset = row.wrapping_mul(value_stride);
-        let indicator_offset = row.wrapping_mul(indicator_stride);
-        if !positioned.parameter_value_ptr.is_null() {
-            positioned.parameter_value_ptr = positioned
-                .parameter_value_ptr
-                .wrapping_byte_add(value_offset);
-        }
-        if !positioned.strlen_or_ind_ptr.is_null() {
-            positioned.strlen_or_ind_ptr = positioned
-                .strlen_or_ind_ptr
-                .wrapping_byte_add(indicator_offset);
-        }
-        if !positioned.octet_length_ptr.is_null() {
-            positioned.octet_length_ptr = positioned
-                .octet_length_ptr
-                .wrapping_byte_add(indicator_offset);
-        }
-        Ok(positioned)
+        ParamArrayBinding::new(self, bind_offset, param_bind_type).for_row(row)
     }
 
     /// Writes this binding into the matching APD and IPD records at the same

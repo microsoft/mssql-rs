@@ -153,7 +153,18 @@ impl<'a> SqlRpc<'a> {
     /// introduced by the TDS 7.2+ `0xff` RPC delimiter and contain only their
     /// procedure and parameters. The caller finalizes the packet writer once
     /// after the last command.
+    #[cfg(test)]
     pub(crate) async fn serialize_batch_command(
+        &self,
+        packet_writer: &mut PacketWriter<'_>,
+        first: bool,
+    ) -> TdsResult<()> {
+        self.serialize_batch_header(packet_writer, first).await?;
+        self.write_positional_parameters(packet_writer).await?;
+        self.write_named_parameters(packet_writer).await
+    }
+
+    pub(crate) async fn serialize_batch_header(
         &self,
         packet_writer: &mut PacketWriter<'_>,
         first: bool,
@@ -163,9 +174,7 @@ impl<'a> SqlRpc<'a> {
         } else {
             packet_writer.write_byte_async(RPC_BATCH_DELIMITER).await?;
         }
-        self.write_proc(packet_writer).await?;
-        self.write_positional_parameters(packet_writer).await?;
-        self.write_named_parameters(packet_writer).await
+        self.write_proc(packet_writer).await
     }
 
     async fn write_proc(&self, packet_writer: &mut PacketWriter<'_>) -> TdsResult<()> {
@@ -279,7 +288,7 @@ mod tests {
         .collect()
     }
 
-    fn serialize_insert_batch(packet_size: u32) -> Vec<u8> {
+    fn serialize_insert_batch(packet_size: u32, borrowed: bool) -> Vec<u8> {
         let mut mock = MockNetworkWriter::new(packet_size);
         let mut writer = PacketWriter::new(PacketType::RpcRequest, &mut mock, None, None);
         let collation = SqlCollation::default();
@@ -295,9 +304,21 @@ mod tests {
                     &context,
                     row == 0,
                 );
-                rpc.serialize_batch_command(&mut writer, row == 0)
-                    .await
-                    .unwrap();
+                if borrowed {
+                    rpc.serialize_batch_header(&mut writer, row == 0)
+                        .await
+                        .unwrap();
+                    for parameter in rpc.positional_parameters.as_ref().unwrap() {
+                        parameter
+                            .serialize(&mut writer, &collation, true, &GenericEncoder::new())
+                            .await
+                            .unwrap();
+                    }
+                } else {
+                    rpc.serialize_batch_command(&mut writer, row == 0)
+                        .await
+                        .unwrap();
+                }
             }
             writer.finalize().await.unwrap();
         });
@@ -331,7 +352,8 @@ mod tests {
             expected.extend((i64::from(row) * 1000).to_le_bytes());
         }
         for packet_size in [512, 4096, 8000, 16192] {
-            let wire = serialize_insert_batch(packet_size);
+            let wire = serialize_insert_batch(packet_size, false);
+            assert_eq!(wire, serialize_insert_batch(packet_size, true));
             let mut remaining = wire.as_slice();
             let mut payload = Vec::new();
             let mut packet_id = 1u8;

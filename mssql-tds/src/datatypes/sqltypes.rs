@@ -699,6 +699,24 @@ impl SqlType {
         self.write_rpc_type_metadata(packet_writer, db_collation, type_metadata)
             .await?;
 
+        // Share the ordinary context and string encoder without cloning the
+        // driver-owned payload into a second owned value for this await.
+        let string = match self {
+            Self::Varchar(Some(value), length) => Some((value, Self::Varchar(None, *length))),
+            Self::NVarchar(Some(value), length) => Some((value, Self::NVarchar(None, *length))),
+            Self::Char(Some(value), length) => Some((value, Self::Char(None, *length))),
+            Self::NChar(Some(value), length) => Some((value, Self::NChar(None, *length))),
+            Self::VarcharMax(Some(value)) => Some((value, Self::VarcharMax(None))),
+            Self::NVarcharMax(Some(value)) => Some((value, Self::NVarcharMax(None))),
+            Self::Text(Some(value)) => Some((value, Self::Text(None))),
+            Self::NText(Some(value)) => Some((value, Self::NText(None))),
+            _ => None,
+        };
+        if let Some((value, template)) = string {
+            let (_, ctx) = template.to_column_value_and_context(db_collation);
+            return TdsValueSerializer::serialize_string(packet_writer, value, &ctx).await;
+        }
+
         // Step 2: Convert to ColumnValues + TdsTypeContext and serialize value
         let (column_value, ctx) = self.to_column_value_and_context(db_collation);
         TdsValueSerializer::serialize_value(packet_writer, &column_value, &ctx).await?;
@@ -1673,6 +1691,8 @@ mod variant_tests {
 
 #[cfg(test)]
 mod coverage_tests {
+    use super::TdsValueSerializer;
+    use crate::datatypes::sql_string::{EncodingType, SqlString};
     use crate::datatypes::{
         column_values::{
             ColumnValues, SqlDate, SqlDateTime2, SqlDateTimeOffset, SqlMoney, SqlSmallDateTime,
@@ -1682,6 +1702,8 @@ mod coverage_tests {
         sqldatatypes::{FixedLengthTypes, TdsDataType},
         sqltypes::{SqlType, get_time_length_from_scale},
     };
+    use crate::io::packet_writer::{PacketWriter, TdsPacketWriter, tests::MockNetworkWriter};
+    use crate::message::messages::PacketType;
     use crate::token::tokens::SqlCollation;
 
     fn default_collation() -> SqlCollation {
@@ -1690,6 +1712,62 @@ mod coverage_tests {
             lcid_language_id: 0,
             col_flags: 0,
             sort_id: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn borrowed_rpc_strings_match_owned_value_serialization() {
+        let collation = SqlCollation::default();
+        for text in [
+            "".into(),
+            "hello".into(),
+            "caf\u{e9}-\u{4f60}\u{597d}-\u{10400}".into(),
+            "x".repeat(17000),
+        ] {
+            let length = u16::try_from(text.len().max(50)).unwrap();
+            for value in [
+                None,
+                Some(SqlString::from_utf8_string(text.clone())),
+                Some(SqlString::new(
+                    text.encode_utf16().flat_map(u16::to_le_bytes).collect(),
+                    EncodingType::Utf16,
+                )),
+            ] {
+                for sql in [
+                    SqlType::Varchar(value.clone(), length),
+                    SqlType::NVarchar(value.clone(), length),
+                    SqlType::Char(value.clone(), length),
+                    SqlType::NChar(value.clone(), length),
+                    SqlType::VarcharMax(value.clone()),
+                    SqlType::NVarcharMax(value.clone()),
+                    SqlType::Text(value.clone()),
+                    SqlType::NText(value.clone()),
+                ] {
+                    for packet_size in [512, 4096, 8000, 16192] {
+                        let mut wires = Vec::new();
+                        for borrowed in [false, true] {
+                            let mut mock = MockNetworkWriter::new(packet_size);
+                            let mut writer =
+                                PacketWriter::new(PacketType::RpcRequest, &mut mock, None, None);
+                            if borrowed {
+                                sql.serialize(&mut writer, &collation, None).await.unwrap();
+                            } else {
+                                sql.write_rpc_type_metadata(&mut writer, &collation, None)
+                                    .await
+                                    .unwrap();
+                                let (value, ctx) = sql.to_column_value_and_context(&collation);
+                                TdsValueSerializer::serialize_value(&mut writer, &value, &ctx)
+                                    .await
+                                    .unwrap();
+                            }
+                            writer.finalize().await.unwrap();
+                            drop(writer);
+                            wires.push(mock.data);
+                        }
+                        assert_eq!(wires[0], wires[1], "{sql:?}, packet size {packet_size}");
+                    }
+                }
+            }
         }
     }
 
