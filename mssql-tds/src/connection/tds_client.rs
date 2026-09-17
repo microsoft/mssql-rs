@@ -5248,7 +5248,7 @@ impl TdsClient {
         if let Some(token) = self.parked_token.take() {
             return Ok(*token);
         }
-        let start = Instant::now();
+        let start = self.request_timeout_start();
         let result = self
             .transport
             .receive_token(
@@ -5257,7 +5257,9 @@ impl TdsClient {
                 self.cancel_handle.as_ref(),
             )
             .await;
-        self.update_remaining_timeout(start);
+        if let Some(start) = start {
+            self.update_remaining_timeout(start);
+        }
         let token = match result {
             Ok(token) => token,
             Err(error) => {
@@ -12030,6 +12032,63 @@ mod tests {
         client.update_remaining_timeout(start);
 
         assert_eq!(client.remaining_request_timeout, Some(Duration::ZERO));
+    }
+
+    #[tokio::test]
+    async fn response_tokens_preserve_unlimited_and_finite_timeout_budgets() {
+        use crate::token::tokens::ReturnStatusToken;
+
+        for budget in [None, Some(Duration::ZERO), Some(Duration::from_secs(1))] {
+            let transport = TestTransport::with_tokens(vec![
+                Tokens::ReturnStatus(ReturnStatusToken { value: 1 }),
+                Tokens::ReturnStatus(ReturnStatusToken { value: 2 }),
+            ]);
+            let timeouts = transport.receive_timeouts.clone();
+            let mut client = create_test_client_with_transport(transport);
+            client.remaining_request_timeout = budget;
+            let context = ParserContext::None(());
+
+            assert!(matches!(
+                client.next_response_token(&context).await.unwrap(),
+                Tokens::ReturnStatus(ReturnStatusToken { value: 1 })
+            ));
+            let remaining = client.remaining_request_timeout;
+            match budget {
+                None => assert_eq!(remaining, None),
+                Some(budget) => assert!(remaining.unwrap() <= budget),
+            }
+            assert!(matches!(
+                client.next_response_token(&context).await.unwrap(),
+                Tokens::ReturnStatus(ReturnStatusToken { value: 2 })
+            ));
+            assert_eq!(*timeouts.lock().unwrap(), vec![budget, remaining]);
+        }
+    }
+
+    #[tokio::test]
+    async fn replaying_a_parked_token_does_not_charge_the_timeout_again() {
+        use crate::token::tokens::ReturnStatusToken;
+
+        let transport = TestTransport::new();
+        let timeouts = transport.receive_timeouts.clone();
+        let mut client = create_test_client_with_transport(transport);
+        client.parked_token = Some(Box::new(Tokens::ReturnStatus(ReturnStatusToken {
+            value: 42,
+        })));
+        client.remaining_request_timeout = Some(Duration::from_secs(1));
+
+        assert!(matches!(
+            client
+                .next_response_token(&ParserContext::None(()))
+                .await
+                .unwrap(),
+            Tokens::ReturnStatus(ReturnStatusToken { value: 42 })
+        ));
+        assert_eq!(
+            client.remaining_request_timeout,
+            Some(Duration::from_secs(1))
+        );
+        assert!(timeouts.lock().unwrap().is_empty());
     }
 
     #[test]

@@ -175,6 +175,8 @@ Optional streaming declarations and encryption metadata are stored out of line
 so ordinary parameter arrays do not copy their unused storage for every value.
 Small RPC headers and type metadata are written together when buffered space
 allows; packet-boundary writes retain normal overflow and cancellation handling.
+Response-token reads skip clock sampling for unlimited query timeouts while
+retaining elapsed-time accounting for finite and exhausted budgets.
 
 ## Conventions
 
