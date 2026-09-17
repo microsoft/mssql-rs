@@ -61,9 +61,74 @@ def test_select_driver_uses_native_slice_for_universal2(
     monkeypatch.setattr(wheel_install.sys, "platform", "darwin")
     monkeypatch.setattr(wheel_install.platform, "machine", lambda: "arm64")
 
-    driver = wheel_install.select_driver(Distribution())
+    driver = wheel_install.select_driver(
+        Distribution(),
+        "mssql_python_rs-0.1.0-cp314-cp314-macosx_15_0_universal2.whl",
+    )
 
     assert driver.parts[-3:] == ("arm64", "lib", "mssqlodbc.dylib")
+
+
+@pytest.mark.parametrize(
+    ("wheel_name", "expected"),
+    [
+        (
+            "mssql_python_rs-0.1.0-cp314-cp314-win_amd64.whl",
+            "mssql_py_core/libs/windows/x64/mssqlodbc.dll",
+        ),
+        (
+            "mssql_python_rs-0.1.0-cp314-cp314-win_arm64.whl",
+            "mssql_py_core/libs/windows/arm64/mssqlodbc.dll",
+        ),
+        (
+            "mssql_python_rs-0.1.0-cp314-cp314-manylinux_2_34_x86_64.whl",
+            "mssql_py_core/libs/linux/glibc/x86_64/lib/mssqlodbc.so",
+        ),
+        (
+            "mssql_python_rs-0.1.0-cp314-cp314-manylinux_2_28_aarch64.whl",
+            "mssql_py_core/libs/linux/glibc/arm64/lib/mssqlodbc.so",
+        ),
+        (
+            "mssql_python_rs-0.1.0-cp314-cp314-musllinux_1_2_x86_64.whl",
+            "mssql_py_core/libs/linux/musl/x86_64/lib/mssqlodbc.so",
+        ),
+        (
+            "mssql_python_rs-0.1.0-cp314-cp314-musllinux_1_2_aarch64.whl",
+            "mssql_py_core/libs/linux/musl/arm64/lib/mssqlodbc.so",
+        ),
+    ],
+)
+def test_expected_driver_path_matches_consumer_resolver(
+    wheel_name: str, expected: str
+) -> None:
+    assert wheel_install.expected_driver_path(wheel_name) == expected
+
+
+@pytest.mark.parametrize(
+    ("wheel_name", "wrong_path"),
+    [
+        (
+            "mssql_python_rs-0.1.0-cp314-cp314-manylinux_2_34_x86_64.whl",
+            "mssql_py_core/libs/linux/glibc/arm64/lib/mssqlodbc.so",
+        ),
+        (
+            "mssql_python_rs-0.1.0-cp314-cp314-win_amd64.whl",
+            "mssql_py_core/libs/windows/arm64/mssqlodbc.dll",
+        ),
+    ],
+)
+def test_select_driver_rejects_wrong_package_path(
+    tmp_path: Path, wheel_name: str, wrong_path: str
+) -> None:
+    class Distribution:
+        files = [PackagePath(wrong_path)]
+
+        @staticmethod
+        def locate_file(file: PackagePath) -> Path:
+            return tmp_path / file
+
+    with pytest.raises(RuntimeError, match="expected package path"):
+        wheel_install.select_driver(Distribution(), wheel_name)
 
 
 def test_verify_driver_allocates_and_frees_environment_handle(

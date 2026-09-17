@@ -46,20 +46,42 @@ def environment_python(environment: Path) -> Path:
     return environment / "bin" / "python"
 
 
-def select_driver(distribution: importlib.metadata.Distribution) -> Path:
-    files = distribution.files or []
-    drivers = [
-        distribution.locate_file(file)
-        for file in files
-        if file.name in {"mssqlodbc.dll", "mssqlodbc.so", "mssqlodbc.dylib"}
-    ]
-    if sys.platform == "darwin":
+def expected_driver_path(wheel_name: str) -> str:
+    platform_tag = Path(wheel_name).stem.rsplit("-", 1)[-1].lower()
+    if platform_tag == "win_amd64":
+        return "mssql_py_core/libs/windows/x64/mssqlodbc.dll"
+    if platform_tag == "win_arm64":
+        return "mssql_py_core/libs/windows/arm64/mssqlodbc.dll"
+    if "macosx" in platform_tag and "universal2" in platform_tag:
         architecture = "arm64" if platform.machine().lower() == "arm64" else "x86_64"
-        drivers = [driver for driver in drivers if architecture in driver.parts]
+        return f"mssql_py_core/libs/macos/{architecture}/lib/mssqlodbc.dylib"
+    if "musllinux" in platform_tag:
+        libc = "musl"
+    elif "manylinux" in platform_tag:
+        libc = "glibc"
+    else:
+        raise RuntimeError(f"Unsupported wheel platform: {platform_tag}")
 
-    if len(drivers) != 1:
-        raise RuntimeError(f"Expected one loadable ODBC driver, found: {drivers}")
-    return drivers[0]
+    if platform_tag.endswith("_x86_64"):
+        architecture = "x86_64"
+    elif platform_tag.endswith("_aarch64"):
+        architecture = "arm64"
+    else:
+        raise RuntimeError(f"Unsupported wheel architecture: {platform_tag}")
+    return f"mssql_py_core/libs/linux/{libc}/{architecture}/lib/mssqlodbc.so"
+
+
+def select_driver(
+    distribution: importlib.metadata.Distribution, wheel_name: str
+) -> Path:
+    expected = expected_driver_path(wheel_name)
+    files = [file for file in distribution.files or [] if str(file) == expected]
+
+    if len(files) != 1:
+        raise RuntimeError(
+            f"ODBC driver not found at expected package path: {expected}"
+        )
+    return distribution.locate_file(files[0])
 
 
 def load_driver(driver: Path):
@@ -90,7 +112,7 @@ def verify_driver(driver: Path) -> None:
         raise RuntimeError(f"SQLFreeHandle(SQL_HANDLE_ENV) failed with {result}")
 
 
-def verify_install(expected_version: str) -> None:
+def verify_install(expected_version: str, wheel_name: str) -> None:
     distribution = importlib.metadata.distribution(DIST_NAME)
     if distribution.version != expected_version:
         raise RuntimeError(
@@ -104,7 +126,7 @@ def verify_install(expected_version: str) -> None:
             "mssql_py_core did not resolve to an installed native module"
         )
 
-    driver = select_driver(distribution)
+    driver = select_driver(distribution, wheel_name)
     if not driver.is_file() or driver.stat().st_size == 0:
         raise RuntimeError(f"ODBC driver is missing or empty: {driver}")
     verify_driver(driver)
@@ -132,7 +154,14 @@ def install_and_verify(wheel: Path) -> None:
             check=True,
         )
         subprocess.run(
-            [str(python), str(Path(__file__).resolve()), "--verify", expected_version],
+            [
+                str(python),
+                str(Path(__file__).resolve()),
+                "--verify",
+                expected_version,
+                "--wheel-name",
+                wheel.name,
+            ],
             check=True,
         )
 
@@ -142,10 +171,13 @@ def main() -> None:
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--wheel", type=Path)
     group.add_argument("--verify", metavar="VERSION")
+    parser.add_argument("--wheel-name")
     args = parser.parse_args()
 
     if args.verify:
-        verify_install(args.verify)
+        if not args.wheel_name:
+            parser.error("--wheel-name is required with --verify")
+        verify_install(args.verify, args.wheel_name)
     else:
         install_and_verify(args.wheel)
 
