@@ -494,6 +494,13 @@ pub(crate) fn buffered_control_token(bytes: &[u8]) -> Option<(Tokens, usize)> {
     Some((token, 1 + DONE_PAYLOAD_LEN))
 }
 
+pub(crate) fn log_received_token(token_type: &TokenType, token_type_byte: u8) {
+    debug!(
+        "Received token type: {:?} ({})",
+        token_type, token_type_byte
+    );
+}
+
 pub(crate) async fn receive_token_internal<R: TdsPacketReader + Send + Sync>(
     reader: &mut R,
     registry: &impl TokenParserRegistry,
@@ -501,10 +508,7 @@ pub(crate) async fn receive_token_internal<R: TdsPacketReader + Send + Sync>(
 ) -> TdsResult<Tokens> {
     let token_type_byte = reader.read_byte().await?;
     let token_type: TokenType = token_type_byte.try_into()?;
-    debug!(
-        "Received token type: {:?} ({})",
-        token_type, token_type_byte
-    );
+    log_received_token(&token_type, token_type_byte);
     dispatch_token(reader, registry, token_type, context).await
 }
 

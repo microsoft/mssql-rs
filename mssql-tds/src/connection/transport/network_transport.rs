@@ -23,8 +23,9 @@ use crate::io::packet_writer::PacketWriter;
 use crate::io::reader_writer::{NetworkReader, NetworkReaderWriter, NetworkWriter};
 use crate::io::token_stream::{
     ColumnPolicy, ParserContext, PlpPauseState, RowHeader, RowPauseState, RowReadResult,
-    TdsTokenStreamReader, read_active_plp_bytes_internal, receive_row_header_internal,
-    receive_row_into_internal, receive_token_internal, resume_row_into_internal,
+    TdsTokenStreamReader, log_received_token, read_active_plp_bytes_internal,
+    receive_row_header_internal, receive_row_into_internal, receive_token_internal,
+    resume_row_into_internal,
 };
 use crate::message::attention::AttentionRequest;
 use crate::message::login_options::TdsVersion;
@@ -2698,6 +2699,8 @@ impl NetworkTransport {
                 self.tds_read_buffer.get_buffered_slice(),
             )
         {
+            let token_type_byte = self.tds_read_buffer.get_buffered_slice()[0];
+            log_received_token(&TokenType::try_from(token_type_byte)?, token_type_byte);
             self.tds_read_buffer.consume_bytes(consumed)?;
             return Ok(token);
         }
@@ -6124,6 +6127,71 @@ pub(crate) mod tests {
             is_known_dead(&transport),
             "a connection whose attention went unacknowledged must not be reused"
         );
+    }
+
+    #[tokio::test]
+    async fn completion_tokens_log_once_on_buffered_and_fallback_paths() {
+        use tracing::instrument::WithSubscriber;
+
+        for kind in [
+            TokenType::Done,
+            TokenType::DoneProc,
+            TokenType::DoneInProc,
+            TokenType::ReturnStatus,
+        ]
+        .map(|kind| kind as u8)
+        {
+            let mut payload = vec![kind];
+            payload.extend(if kind == TokenType::ReturnStatus as u8 {
+                vec![0; 4]
+            } else {
+                vec![0; 12]
+            });
+            for prefix in [0, 1, payload.len()] {
+                let mut packet = TestPacketBuilder::new(PacketType::TabularResult);
+                let wire = if prefix == 1 {
+                    let mut wire = packet
+                        .continuation()
+                        .append_bytes(&payload[..prefix])
+                        .build();
+                    let mut rest = TestPacketBuilder::new(PacketType::TabularResult);
+                    wire.extend(rest.append_bytes(&payload[prefix..]).build());
+                    wire
+                } else {
+                    packet.append_bytes(&payload).build()
+                };
+                let mut transport = create_network_transport_with_data(&wire);
+                if prefix != 0 {
+                    transport.read_tds_packet().await.unwrap();
+                }
+                let logs = tempfile::NamedTempFile::new().unwrap();
+                let subscriber = tracing_subscriber::fmt()
+                    .with_env_filter("off,mssql_tds::io::token_stream=debug")
+                    .without_time()
+                    .with_ansi(false)
+                    .with_writer(logs.reopen().unwrap())
+                    .finish();
+                transport
+                    .receive_token(&ParserContext::None(()), None, None)
+                    .with_subscriber(subscriber)
+                    .await
+                    .unwrap();
+                let logs = std::fs::read_to_string(logs.path()).unwrap();
+                let expected = format!(
+                    "DEBUG mssql_tds::io::token_stream: Received token type: {:?} ({kind})",
+                    TokenType::try_from(kind).unwrap()
+                );
+                let received: Vec<_> = logs
+                    .lines()
+                    .filter(|line| line.contains("Received token type:"))
+                    .collect();
+                assert_eq!(
+                    received,
+                    vec![expected.as_str()],
+                    "buffered prefix: {prefix}"
+                );
+            }
+        }
     }
 
     #[tokio::test(start_paused = true)]
