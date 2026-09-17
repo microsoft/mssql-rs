@@ -121,7 +121,7 @@ impl TdsValueSerializer {
     ///
     /// Type metadata (TDS type byte, max_size, precision, scale, collation)
     /// must be written separately by the caller.
-    #[inline(always)]
+    #[inline]
     pub async fn serialize_value<'a, 'b>(
         writer: &'a mut PacketWriter<'b>,
         value: &ColumnValues,
@@ -2555,7 +2555,7 @@ impl TdsValueSerializer {
     ///
     /// This is used internally by serialize_as_variant to avoid infinite recursion.
     /// It performs the same serialization as serialize_value but skips the variant check.
-    #[inline(always)]
+    #[inline]
     async fn serialize_value_inner<'a, 'b>(
         writer: &'a mut PacketWriter<'b>,
         value: &ColumnValues,

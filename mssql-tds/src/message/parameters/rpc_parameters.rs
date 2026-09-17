@@ -439,7 +439,7 @@ impl RpcParameter {
     /// The `encoder` is used to encode the parameter value based on its data type.
     /// The `db_collation` is used for string types to determine the collation.
     /// The `is_positional` flag indicates whether the parameter is positional or named.
-    #[inline(always)]
+    #[inline]
     pub(crate) async fn serialize<T: SqlValueEncoder>(
         &self,
         packet_writer: &mut PacketWriter<'_>,
