@@ -18,7 +18,7 @@ use crate::api::odbc_types::{
 use crate::api::set_desc_field::datetime_interval_code_for;
 use crate::conversion::param_convert::{DaeLengthLimit, DaePlan, DaeTranscode};
 use crate::error::{DiagRecord, HasDiagnostics};
-use crate::params::{BoundParam, ParamBindingMetadata};
+use crate::params::BoundParam;
 use mssql_tds::datatypes::column_values::ColumnValues;
 use mssql_tds::datatypes::sqldatatypes::TdsDataType;
 use mssql_tds::encoding_rs;
@@ -1248,9 +1248,6 @@ impl VendorStmtAttrs {
 #[derive(Debug)]
 pub(crate) struct PreparedPlan {
     pub(crate) stmt: PreparedStatement,
-    /// Metadata from the execution that materialized this plan. Travels with
-    /// the plan while DAE parks it or parameter-array staging takes its bindings.
-    pub(crate) parameter_bindings: Vec<Option<ParamBindingMetadata>>,
     /// Number of `@P1..@Pn` markers in `stmt`'s SQL, computed once at prepare so
     /// `SQLExecute` builds the parameter list without re-scanning the text.
     pub(crate) marker_count: usize,
@@ -1418,30 +1415,6 @@ impl StmtState {
         }
     }
 
-    /// Compare the effective descriptor inputs, not descriptor addresses: shared
-    /// APDs and partial descriptor writes must invalidate every affected plan.
-    pub(crate) fn refresh_prepared_bindings(&mut self) {
-        let Some(plan) = self.prepared.as_ref() else {
-            return;
-        };
-        let current = self
-            .bound_params
-            .iter()
-            .map(|param| param.map(BoundParam::metadata));
-        if plan.parameter_bindings.iter().copied().eq(current) {
-            return;
-        }
-        self.orphan_prepared_handle();
-        if let Some(plan) = self.prepared.as_mut() {
-            plan.parameter_bindings.clear();
-            plan.parameter_bindings.extend(
-                self.bound_params
-                    .iter()
-                    .map(|param| param.map(BoundParam::metadata)),
-            );
-        }
-    }
-
     /// Resets all data-at-execution streaming state and hands back the parked
     /// client, if the sequence still held one. Call after a DAE sequence
     /// completes, is cancelled, or fails.
@@ -1506,6 +1479,23 @@ unsafe impl Send for StmtHandle {}
 unsafe impl Sync for StmtHandle {}
 
 impl StmtHandle {
+    /// Called after releasing descriptor locks. Records beyond this SQL's
+    /// markers cannot change its prepared declaration.
+    pub(crate) fn invalidate_parameter_definition(&self, first_changed: usize) -> Result<(), ()> {
+        let Ok(mut state) = self.inner.lock() else {
+            error!("invalidating parameter definition: stmt mutex poisoned");
+            return Err(());
+        };
+        if state
+            .prepared
+            .as_ref()
+            .is_some_and(|plan| first_changed <= plan.marker_count)
+        {
+            state.orphan_prepared_handle();
+        }
+        Ok(())
+    }
+
     /// `query_timeout` is the parent connection's current
     /// [`DbcState::stmt_query_timeout`](crate::handles::dbc::DbcState); a
     /// statement starts at the connection-level default rather than always at

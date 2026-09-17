@@ -63,18 +63,20 @@
 use std::ffi::c_void;
 use std::sync::Mutex;
 
-use super::{HandleType, HasObjectType};
+use super::{DbcHandle, HandleType, HasObjectType, StmtHandle, handle_from_raw};
 use crate::api::odbc_types::{
     SQL_C_DEFAULT, SQL_DESC_ALLOC_AUTO, SQL_DESC_ALLOC_TYPE, SQL_DESC_ALLOC_USER,
     SQL_DESC_ARRAY_SIZE, SQL_DESC_ARRAY_STATUS_PTR, SQL_DESC_BIND_OFFSET_PTR, SQL_DESC_BIND_TYPE,
     SQL_DESC_CONCISE_TYPE, SQL_DESC_COUNT, SQL_DESC_DATA_PTR, SQL_DESC_DATETIME_INTERVAL_CODE,
     SQL_DESC_INDICATOR_PTR, SQL_DESC_LENGTH, SQL_DESC_NAME, SQL_DESC_NULLABLE,
     SQL_DESC_OCTET_LENGTH, SQL_DESC_OCTET_LENGTH_PTR, SQL_DESC_PARAMETER_TYPE, SQL_DESC_PRECISION,
-    SQL_DESC_ROWS_PROCESSED_PTR, SQL_DESC_SCALE, SQL_DESC_TYPE, SQL_DESC_UNNAMED, SQL_NULLABLE,
-    SQL_PARAM_INPUT, SQL_ROWSET_SIZE_DEFAULT, SqlInteger, SqlLen, SqlPointer, SqlSmallInt, SqlULen,
-    SqlUSmallInt,
+    SQL_DESC_ROWS_PROCESSED_PTR, SQL_DESC_SCALE, SQL_DESC_TYPE, SQL_DESC_UNNAMED, SQL_ERROR,
+    SQL_NULLABLE, SQL_PARAM_INPUT, SQL_ROWSET_SIZE_DEFAULT, SqlInteger, SqlLen, SqlPointer,
+    SqlReturn, SqlSmallInt, SqlULen, SqlUSmallInt,
 };
-use crate::error::{DiagRecord, HasDiagnostics};
+use crate::api::sqlstate::SQLSTATE_HY000;
+use crate::error::{DiagRecord, HasDiagnostics, free_errors, post_sql_error};
+use tracing::error;
 
 /// The five descriptor shapes this driver constructs: the four
 /// automatically-allocated implicit descriptors owned by every statement
@@ -261,7 +263,48 @@ pub(crate) struct DescRecord {
     pub(crate) explicitly_bound: bool,
 }
 
+/// SQL-side inputs to the prepared declaration, compared only during IPD writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ParameterDefinition {
+    direction: SqlSmallInt,
+    sql_type: SqlSmallInt,
+    length: SqlULen,
+    precision: SqlSmallInt,
+    scale: SqlSmallInt,
+}
+
 impl DescRecord {
+    pub(crate) fn parameter_definition(&self) -> ParameterDefinition {
+        use crate::api::odbc_types::{
+            SQL_BIGINT, SQL_BINARY, SQL_BIT, SQL_CHAR, SQL_DECIMAL, SQL_DOUBLE, SQL_FLOAT,
+            SQL_GUID, SQL_INTEGER, SQL_LONGVARBINARY, SQL_LONGVARCHAR, SQL_NUMERIC, SQL_REAL,
+            SQL_SMALLINT, SQL_SS_TIME2, SQL_SS_TIMESTAMPOFFSET, SQL_TINYINT, SQL_TYPE_DATE,
+            SQL_TYPE_TIME, SQL_TYPE_TIMESTAMP, SQL_VARBINARY, SQL_VARCHAR, SQL_WCHAR,
+            SQL_WLONGVARCHAR, SQL_WVARCHAR,
+        };
+        let (length, precision, scale) = match self.concise_type {
+            SQL_CHAR | SQL_VARCHAR | SQL_LONGVARCHAR | SQL_WCHAR | SQL_WVARCHAR
+            | SQL_WLONGVARCHAR | SQL_BINARY | SQL_VARBINARY | SQL_LONGVARBINARY => {
+                (self.length, 0, 0)
+            }
+            SQL_NUMERIC | SQL_DECIMAL => (0, self.precision, self.scale),
+            SQL_BIGINT | SQL_BIT | SQL_TINYINT | SQL_SMALLINT | SQL_INTEGER | SQL_REAL
+            | SQL_FLOAT | SQL_DOUBLE | SQL_GUID | SQL_TYPE_DATE => (0, 0, 0),
+            // datetime_metadata always declares scale 7; the application scale
+            // controls conversion validation, not time/datetime2/offset SQL.
+            SQL_TYPE_TIME | SQL_TYPE_TIMESTAMP | SQL_SS_TIME2 | SQL_SS_TIMESTAMPOFFSET => (0, 0, 0),
+            // Special types can encode dimensions or other SQL shape here.
+            _ => (self.length, self.precision, self.scale),
+        };
+        ParameterDefinition {
+            direction: self.parameter_type,
+            sql_type: self.concise_type,
+            length,
+            precision,
+            scale,
+        }
+    }
+
     /// A freshly grown record's defaults, keyed by descriptor kind. Mirrors
     /// msodbcsql's `FastSetADRecDefaults` (`fCType = SQL_C_DEFAULT`,
     /// `sqlcdesc.cpp:136-148`) and `FastSetIPDRecDefaults`
@@ -370,6 +413,78 @@ impl DescState {
 }
 
 impl DescHandle {
+    /// Captures partial failed writes too. Never acquires DBC/STMT while DESC
+    /// is locked, and APD/ARD writes never inspect statement ownership.
+    pub(crate) fn update_definition(
+        &self,
+        record_number: SqlSmallInt,
+        op: &str,
+        update: impl FnOnce(&mut DescState) -> SqlReturn,
+    ) -> SqlReturn {
+        let Ok(mut state) = self.inner.lock() else {
+            error!("{op}: desc mutex poisoned");
+            return SQL_ERROR;
+        };
+        free_errors(&mut state);
+        let is_ipd = self.kind == DescKind::ImpParam;
+        let previous_count = state.records.len();
+        let previous = is_ipd
+            .then(|| {
+                state
+                    .record(record_number)
+                    .map(DescRecord::parameter_definition)
+            })
+            .flatten();
+        let rc = update(&mut state);
+        let first_changed = if !is_ipd {
+            None
+        } else if previous_count != state.records.len() {
+            Some(previous_count.min(state.records.len()) + 1)
+        } else if previous
+            != state
+                .record(record_number)
+                .map(DescRecord::parameter_definition)
+        {
+            usize::try_from(record_number).ok()
+        } else {
+            None
+        };
+        drop(state);
+        if let Some(first_changed) = first_changed
+            && self.invalidate_prepared_owner(first_changed).is_err()
+        {
+            error!("{op}: failed invalidating prepared parameter definition");
+            if let Ok(mut state) = self.inner.lock() {
+                post_sql_error(
+                    &mut state,
+                    SQLSTATE_HY000,
+                    0,
+                    "Internal error invalidating prepared parameter definition",
+                );
+            }
+            return SQL_ERROR;
+        }
+        rc
+    }
+
+    fn invalidate_prepared_owner(&self, first_changed: usize) -> Result<(), ()> {
+        // The DM keeps the parent alive; its child list is protected for the
+        // walk, matching SQLFreeHandle(DESC)'s existing DBC -> STMT traversal.
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(self.parent_dbc) };
+        let Ok(state) = dbc.inner.lock() else {
+            error!("invalidating IPD definition: dbc mutex poisoned");
+            return Err(());
+        };
+        for &raw in &state.statements {
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(raw) };
+            if std::ptr::eq(stmt.ipd.cast::<DescHandle>(), self) {
+                return stmt.invalidate_parameter_definition(first_changed);
+            }
+        }
+        error!("invalidating IPD definition: owning statement not found");
+        Err(())
+    }
+
     pub(crate) fn new(kind: DescKind, alloc_type: SqlSmallInt, parent_dbc: *mut c_void) -> Self {
         Self {
             object_type: HandleType::Desc,
@@ -534,6 +649,25 @@ mod tests {
         DescKind::ImpParam,
         DescKind::Ad,
     ];
+
+    #[test]
+    fn special_parameter_definitions_keep_size_precision_and_scale() {
+        use crate::api::odbc_types::{SQL_SS_UDT, SQL_SS_VECTOR};
+
+        for sql_type in [SQL_SS_VECTOR, SQL_SS_UDT] {
+            let mut record = DescRecord::default_for(DescKind::ImpParam);
+            record.concise_type = sql_type;
+            for field in 0..3 {
+                let previous = record.parameter_definition();
+                match field {
+                    0 => record.length += 4,
+                    1 => record.precision += 1,
+                    _ => record.scale += 1,
+                }
+                assert_ne!(record.parameter_definition(), previous);
+            }
+        }
+    }
 
     #[test]
     fn alloc_type_is_read_only_header_field_everywhere() {

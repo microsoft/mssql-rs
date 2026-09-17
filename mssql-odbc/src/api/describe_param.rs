@@ -402,6 +402,7 @@ fn refine_ipd(stmt: &StmtHandle, descriptions: &[ParameterDescription]) {
     };
     let target_count = desc_state.records.len().max(descriptions.len());
     desc_state.set_record_count(target_count, desc.kind);
+    let mut first_changed = None;
     for (i, description) in descriptions.iter().enumerate() {
         let record_number = SqlSmallInt::try_from(i + 1).unwrap_or(SqlSmallInt::MAX);
         let Some(record) = desc_state.record_mut(record_number) else {
@@ -413,6 +414,7 @@ fn refine_ipd(stmt: &StmtHandle, descriptions: &[ParameterDescription]) {
             // explicit choice.
             continue;
         }
+        let previous = record.parameter_definition();
         record.concise_type = description.data_type;
         record.datetime_interval_code = datetime_interval_code_for(description.data_type);
         record.scale = description.decimal_digits;
@@ -431,6 +433,15 @@ fn refine_ipd(stmt: &StmtHandle, descriptions: &[ParameterDescription]) {
             record.length = description.parameter_size;
             record.precision = 0;
         }
+        if previous != record.parameter_definition() {
+            first_changed.get_or_insert(i + 1);
+        }
+    }
+    drop(desc_state);
+    if let Some(first_changed) = first_changed
+        && stmt.invalidate_parameter_definition(first_changed).is_err()
+    {
+        error!("SQLDescribeParam: failed invalidating refined parameter definition");
     }
 }
 
@@ -892,7 +903,6 @@ mod tests {
                 stmt: PreparedStatement::new("SELECT @P1".to_string()),
                 original_sql: "SELECT ?".to_string(),
                 marker_count: 1,
-                parameter_bindings: Vec::new(),
             });
             state.query_timeout = STMT_TIMEOUT_SECS;
         }
@@ -952,7 +962,6 @@ mod tests {
                 stmt: PreparedStatement::new("SELECT @P1".to_string()),
                 original_sql: "SELECT ?".to_string(),
                 marker_count: 1,
-                parameter_bindings: Vec::new(),
             });
             state.query_timeout = STMT_TIMEOUT_SECS;
         }
@@ -1016,7 +1025,6 @@ mod tests {
                 stmt: PreparedStatement::new("SELECT @P1".to_string()),
                 original_sql: "SELECT ?".to_string(),
                 marker_count: 1,
-                parameter_bindings: Vec::new(),
             });
             state.query_timeout = STMT_TIMEOUT_SECS;
         }
@@ -1069,7 +1077,6 @@ mod tests {
                 stmt: PreparedStatement::new("SELECT @P1".to_string()),
                 marker_count: 1,
                 original_sql: String::new(),
-                parameter_bindings: Vec::new(),
             });
         }
 
@@ -1100,7 +1107,6 @@ mod tests {
                 stmt: PreparedStatement::new("SELECT @P1".to_string()),
                 marker_count: 1,
                 original_sql: String::new(),
-                parameter_bindings: Vec::new(),
             });
             state.parameter_metadata.push(ParameterDescription {
                 data_type: SQL_INTEGER,
@@ -1157,7 +1163,6 @@ mod tests {
                 stmt: PreparedStatement::new("SELECT @P1".to_string()),
                 marker_count: 1,
                 original_sql: String::new(),
-                parameter_bindings: Vec::new(),
             });
         }
 
