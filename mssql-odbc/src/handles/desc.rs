@@ -61,10 +61,9 @@
 //! data), unlike `SQLGetDescRecW`'s `Name` output.
 
 use std::ffi::c_void;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
-use super::bindings::BindingUse;
-use super::{DbcHandle, Handle, HandleActivity, HandleType};
+use super::{HandleType, HasObjectType};
 use crate::api::odbc_types::{
     SQL_C_DEFAULT, SQL_DESC_ALLOC_AUTO, SQL_DESC_ALLOC_TYPE, SQL_DESC_ALLOC_USER,
     SQL_DESC_ARRAY_SIZE, SQL_DESC_ARRAY_STATUS_PTR, SQL_DESC_BIND_OFFSET_PTR, SQL_DESC_BIND_TYPE,
@@ -113,8 +112,6 @@ impl DescKind {
 #[derive(Debug)]
 pub(crate) struct DescHandle {
     pub(crate) object_type: HandleType,
-    pub(crate) activity: Arc<HandleActivity>,
-    parent: Arc<DbcHandle>,
     pub(crate) kind: DescKind,
     /// `SQL_DESC_ALLOC_TYPE`: `SQL_DESC_ALLOC_AUTO` for the four implicit
     /// descriptors, `SQL_DESC_ALLOC_USER` for one allocated by
@@ -136,7 +133,6 @@ pub(crate) struct DescHandle {
     /// once at construction, never mutated — same soundness rationale as
     /// `StmtHandle::parent_dbc`.
     pub(crate) parent_dbc: *mut c_void,
-    pub(crate) binding_use: BindingUse,
     pub(crate) inner: Mutex<DescState>,
 }
 
@@ -335,31 +331,15 @@ impl DescRecord {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct DescState {
     pub(crate) diag_records: Vec<DiagRecord>,
     pub(crate) header: DescHeader,
     /// 1-based descriptor records: `records[0]` is record number 1.
-    records: Vec<DescRecord>,
-    /// Binding records must change through `record_mut`/`set_record_count`;
-    /// shared prepared statements compare this revision before server reuse.
-    binding_revision: u64,
+    pub(crate) records: Vec<DescRecord>,
 }
 
 impl DescState {
-    pub(crate) fn records(&self) -> &[DescRecord] {
-        &self.records
-    }
-
-    pub(crate) fn binding_revision(&self) -> u64 {
-        self.binding_revision
-    }
-
-    #[cfg(test)]
-    pub(crate) fn exhaust_binding_revision_for_test(&mut self) {
-        self.binding_revision = u64::MAX;
-    }
-
     /// Returns the record at 1-based `record_number`, or `None` if it does
     /// not exist (`record_number < 1` or `> SQL_DESC_COUNT`).
     pub(crate) fn record(&self, record_number: SqlSmallInt) -> Option<&DescRecord> {
@@ -370,9 +350,7 @@ impl DescState {
     /// Mutable counterpart of [`Self::record`].
     pub(crate) fn record_mut(&mut self, record_number: SqlSmallInt) -> Option<&mut DescRecord> {
         let index = usize::try_from(record_number).ok()?.checked_sub(1)?;
-        let record = self.records.get_mut(index)?;
-        self.binding_revision = self.binding_revision.saturating_add(1);
-        Some(record)
+        self.records.get_mut(index)
     }
 
     /// Grows or shrinks the record list to `count`, per `SQL_DESC_COUNT`
@@ -382,9 +360,6 @@ impl DescState {
     /// `4318-4463` for IPD): existing records are preserved, not
     /// reinitialized, on either grow or shrink.
     pub(crate) fn set_record_count(&mut self, count: usize, kind: DescKind) {
-        if count != self.records.len() {
-            self.binding_revision = self.binding_revision.saturating_add(1);
-        }
         if count < self.records.len() {
             self.records.truncate(count);
         } else {
@@ -395,22 +370,12 @@ impl DescState {
 }
 
 impl DescHandle {
-    pub(crate) fn new(
-        kind: DescKind,
-        alloc_type: SqlSmallInt,
-        parent_dbc: *mut c_void,
-        parent: Arc<DbcHandle>,
-        activity: Arc<HandleActivity>,
-    ) -> Self {
-        let binding_use = BindingUse::new(Arc::clone(&parent.activity));
+    pub(crate) fn new(kind: DescKind, alloc_type: SqlSmallInt, parent_dbc: *mut c_void) -> Self {
         Self {
             object_type: HandleType::Desc,
-            activity,
-            parent,
             kind,
             alloc_type,
             parent_dbc,
-            binding_use,
             inner: Mutex::new(DescState {
                 diag_records: Vec::new(),
                 header: DescHeader {
@@ -418,7 +383,6 @@ impl DescHandle {
                     ..DescHeader::default()
                 },
                 records: Vec::new(),
-                binding_revision: 0,
             }),
         }
     }
@@ -429,22 +393,11 @@ impl DescHandle {
     pub(crate) fn is_explicit(&self) -> bool {
         self.alloc_type == SQL_DESC_ALLOC_USER
     }
-
-    pub(crate) fn parent_dbc(&self) -> &DbcHandle {
-        &self.parent
-    }
 }
 
-impl Handle for DescHandle {
-    const TYPE: HandleType = HandleType::Desc;
-    type State = DescState;
-
-    fn state(&self) -> &Mutex<Self::State> {
-        &self.inner
-    }
-
-    fn activity(&self) -> &Arc<HandleActivity> {
-        &self.activity
+impl HasObjectType for DescHandle {
+    fn object_type_mut(&mut self) -> &mut HandleType {
+        &mut self.object_type
     }
 }
 
@@ -467,8 +420,10 @@ impl HasDiagnostics for DescState {
 // opaque application-owned address: copied in by
 // `SQLSetDescFieldW`/`SQLSetStmtAttrW`, copied out by
 // `SQLGetDescFieldW`/`SQLGetStmtAttrW`, and never dereferenced by this
-// module. `parent_dbc` is an immutable ID; the parent DBC is strongly retained.
-// Binding-use leases exclude mutation while snapshots use application buffers. The
+// module. `parent_dbc` is set once at construction and never mutated, and the
+// parent DBC is guaranteed alive because the DM ensures every descriptor —
+// implicit (freed with its owning statement) or explicit (freed by
+// `SQLFreeHandle(SQL_HANDLE_DESC)`) — is freed before its connection. The
 // Driver Manager may legitimately call ODBC entry points for the same handle
 // from different threads (serialized by `inner`'s mutex), so the handle
 // itself must be `Send + Sync`.
@@ -734,10 +689,11 @@ mod tests {
 
     #[test]
     fn new_descriptor_starts_with_no_records_and_default_header() {
-        let h = crate::test_support::TestHandles::with_env_dbc_stmt();
-        let handle = crate::handles::handle_from_raw::<DescHandle>(h.apd())
-            .unwrap()
-            .into_arc();
+        let handle = DescHandle::new(
+            DescKind::AppParam,
+            SQL_DESC_ALLOC_AUTO,
+            std::ptr::null_mut(),
+        );
         let state = handle.inner.lock().unwrap();
         assert!(state.records.is_empty());
         assert_eq!(state.header.alloc_type, SQL_DESC_ALLOC_AUTO);
@@ -745,40 +701,11 @@ mod tests {
     }
 
     #[test]
-    fn binding_revision_tracks_mutation_without_wrapping() {
-        let mut state = DescState {
-            binding_revision: 0,
-            diag_records: Vec::new(),
-            header: DescHeader::default(),
-            records: Vec::new(),
-        };
-        assert!(state.record_mut(1).is_none());
-        assert_eq!(state.binding_revision, 0);
-        state.set_record_count(1, DescKind::AppParam);
-        assert_eq!(state.binding_revision, 1);
-        state.set_record_count(1, DescKind::AppParam);
-        assert_eq!(state.binding_revision, 1);
-        assert!(state.record(1).is_some());
-        assert_eq!(state.binding_revision, 1);
-        state.record_mut(1).unwrap().scale = 2;
-        assert_eq!(state.binding_revision, 2);
-        state.set_record_count(0, DescKind::AppParam);
-        assert_eq!(state.binding_revision, 3);
-        state.binding_revision = u64::MAX - 1;
-        state.set_record_count(1, DescKind::AppParam);
-        state.record_mut(1).unwrap().scale = 3;
-        assert_eq!(state.binding_revision, u64::MAX);
-    }
-
-    #[test]
     fn new_explicit_descriptor_reports_alloc_user_on_both_copies() {
-        let mut h = crate::test_support::TestHandles::with_env_dbc();
-        let raw = h.alloc_explicit_desc();
-        let handle = crate::handles::handle_from_raw::<DescHandle>(raw)
-            .unwrap()
-            .into_arc();
+        let dbc = 0x1234_usize as *mut c_void;
+        let handle = DescHandle::new(DescKind::Ad, SQL_DESC_ALLOC_USER, dbc);
         assert!(handle.is_explicit());
-        assert_eq!(handle.parent_dbc, h.dbc);
+        assert_eq!(handle.parent_dbc, dbc);
         assert_eq!(
             handle.inner.lock().unwrap().header.alloc_type,
             SQL_DESC_ALLOC_USER
@@ -788,7 +715,6 @@ mod tests {
     #[test]
     fn set_record_count_grows_with_kind_defaults() {
         let mut state = DescState {
-            binding_revision: 0,
             diag_records: Vec::new(),
             header: DescHeader::default(),
             records: Vec::new(),
@@ -803,7 +729,6 @@ mod tests {
         // (mixing kinds on one growing state isn't a real scenario — a
         // descriptor's kind never changes after creation).
         let mut ipd_state = DescState {
-            binding_revision: 0,
             diag_records: Vec::new(),
             header: DescHeader::default(),
             records: Vec::new(),
@@ -817,7 +742,6 @@ mod tests {
     #[test]
     fn set_record_count_shrink_discards_trailing_records_and_preserves_the_rest() {
         let mut state = DescState {
-            binding_revision: 0,
             diag_records: Vec::new(),
             header: DescHeader::default(),
             records: Vec::new(),
@@ -835,7 +759,6 @@ mod tests {
     #[test]
     fn record_and_record_mut_reject_zero_and_negative() {
         let mut state = DescState {
-            binding_revision: 0,
             diag_records: Vec::new(),
             header: DescHeader::default(),
             records: Vec::new(),

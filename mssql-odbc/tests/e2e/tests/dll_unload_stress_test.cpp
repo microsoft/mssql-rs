@@ -64,10 +64,6 @@ using SQLDriverConnectWFn = SQLRETURN(SQL_API*)(SQLHDBC, SQLHWND, SQLWCHAR*, SQL
                                                 SQLUSMALLINT);
 using SQLExecDirectWFn = SQLRETURN(SQL_API*)(SQLHSTMT, SQLWCHAR*, SQLINTEGER);
 using SQLFetchFn = SQLRETURN(SQL_API*)(SQLHSTMT);
-using SQLGetDescFieldWFn = SQLRETURN(SQL_API*)(SQLHDESC, SQLSMALLINT, SQLSMALLINT,
-                                              SQLPOINTER, SQLINTEGER, SQLINTEGER*);
-using SQLGetDiagRecWFn = SQLRETURN(SQL_API*)(SQLSMALLINT, SQLHANDLE, SQLSMALLINT, SQLWCHAR*,
-                                            SQLINTEGER*, SQLWCHAR*, SQLSMALLINT, SQLSMALLINT*);
 using SQLDisconnectFn = SQLRETURN(SQL_API*)(SQLHDBC);
 using SQLFreeHandleFn = SQLRETURN(SQL_API*)(SQLSMALLINT, SQLHANDLE);
 
@@ -159,8 +155,7 @@ std::string BuildConnectionString(const std::string& dll_path) {
 // One full load / connect / query / free / unload cycle. Failures are fatal to
 // the iteration rather than logged: continuing past a failed load would turn a
 // real regression into a silent pass.
-void LoadUseUnload(const std::string& dll_path, const std::wstring& conn_str, int iteration,
-                   bool replace_disconnected_handles = false) {
+void LoadUseUnload(const std::string& dll_path, const std::wstring& conn_str, int iteration) {
     HMODULE driver = LoadLibraryA(dll_path.c_str());
     ASSERT_NE(driver, nullptr) << "iteration " << iteration << ": LoadLibraryA(" << dll_path
                                << ") failed with " << GetLastError();
@@ -171,14 +166,10 @@ void LoadUseUnload(const std::string& dll_path, const std::wstring& conn_str, in
         reinterpret_cast<SQLDriverConnectWFn>(GetProcAddress(driver, "SQLDriverConnectW"));
     auto exec_direct = reinterpret_cast<SQLExecDirectWFn>(GetProcAddress(driver, "SQLExecDirectW"));
     auto fetch = reinterpret_cast<SQLFetchFn>(GetProcAddress(driver, "SQLFetch"));
-    auto get_desc_field =
-        reinterpret_cast<SQLGetDescFieldWFn>(GetProcAddress(driver, "SQLGetDescFieldW"));
-    auto get_diag_rec =
-        reinterpret_cast<SQLGetDiagRecWFn>(GetProcAddress(driver, "SQLGetDiagRecW"));
     auto disconnect = reinterpret_cast<SQLDisconnectFn>(GetProcAddress(driver, "SQLDisconnect"));
     auto free_handle = reinterpret_cast<SQLFreeHandleFn>(GetProcAddress(driver, "SQLFreeHandle"));
     ASSERT_TRUE(alloc_handle && set_env_attr && driver_connect && exec_direct && fetch &&
-                get_desc_field && get_diag_rec && disconnect && free_handle)
+                disconnect && free_handle)
         << "iteration " << iteration << ": driver is missing a required export";
 
     SQLHANDLE env = SQL_NULL_HANDLE;
@@ -206,49 +197,6 @@ void LoadUseUnload(const std::string& dll_path, const std::wstring& conn_str, in
     ASSERT_TRUE(SQL_SUCCEEDED(exec_direct(stmt, query.data(), SQL_NTS)))
         << "iteration " << iteration << ": SQLExecDirectW failed";
     ASSERT_TRUE(SQL_SUCCEEDED(fetch(stmt))) << "iteration " << iteration << ": SQLFetch failed";
-
-    if (replace_disconnected_handles) {
-        const SQLHANDLE stale_stmt = stmt;
-        SQLHANDLE stale_desc = SQL_NULL_HANDLE;
-        ASSERT_TRUE(SQL_SUCCEEDED(alloc_handle(SQL_HANDLE_DESC, dbc, &stale_desc)))
-            << "iteration " << iteration << ": SQLAllocHandle(DESC) failed";
-        ASSERT_TRUE(SQL_SUCCEEDED(disconnect(dbc)))
-            << "iteration " << iteration << ": SQLDisconnect with live children failed";
-        EXPECT_EQ(get_diag_rec(SQL_HANDLE_DBC, dbc, 1, nullptr, nullptr, nullptr, 0, nullptr),
-                  SQL_NO_DATA)
-            << "iteration " << iteration << ": successful disconnect left cleanup diagnostics";
-
-        conn_mutable = conn_str;
-        ASSERT_TRUE(SQL_SUCCEEDED(driver_connect(dbc, nullptr, conn_mutable.data(), SQL_NTS,
-                                                 nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT)))
-            << "iteration " << iteration << ": reconnect failed";
-        ASSERT_TRUE(SQL_SUCCEEDED(alloc_handle(SQL_HANDLE_STMT, dbc, &stmt)))
-            << "iteration " << iteration << ": replacement STMT allocation failed";
-        SQLHANDLE desc = SQL_NULL_HANDLE;
-        ASSERT_TRUE(SQL_SUCCEEDED(alloc_handle(SQL_HANDLE_DESC, dbc, &desc)))
-            << "iteration " << iteration << ": replacement DESC allocation failed";
-
-        EXPECT_NE(stmt, stale_stmt) << "statement identity was reused";
-        EXPECT_NE(desc, stale_desc) << "descriptor identity was reused";
-        EXPECT_EQ(exec_direct(stale_stmt, query.data(), SQL_NTS), SQL_INVALID_HANDLE);
-        SQLSMALLINT record_count = -1;
-        EXPECT_EQ(get_desc_field(stale_desc, 0, SQL_DESC_COUNT, &record_count, 0, nullptr),
-                  SQL_INVALID_HANDLE);
-        EXPECT_EQ(record_count, -1);
-        // Post-disconnect frees are successful no-ops for Driver Manager compatibility.
-        EXPECT_EQ(free_handle(SQL_HANDLE_STMT, stale_stmt), SQL_SUCCESS);
-        EXPECT_EQ(free_handle(SQL_HANDLE_DESC, stale_desc), SQL_SUCCESS);
-
-        ASSERT_TRUE(SQL_SUCCEEDED(exec_direct(stmt, query.data(), SQL_NTS)))
-            << "iteration " << iteration << ": replacement statement execution failed";
-        ASSERT_TRUE(SQL_SUCCEEDED(fetch(stmt)))
-            << "iteration " << iteration << ": replacement statement fetch failed";
-        ASSERT_TRUE(SQL_SUCCEEDED(
-            get_desc_field(desc, 0, SQL_DESC_COUNT, &record_count, 0, nullptr)));
-        EXPECT_EQ(record_count, 0);
-        ASSERT_TRUE(SQL_SUCCEEDED(free_handle(SQL_HANDLE_DESC, desc)))
-            << "iteration " << iteration << ": replacement descriptor free failed";
-    }
 
     ASSERT_TRUE(SQL_SUCCEEDED(free_handle(SQL_HANDLE_STMT, stmt)))
         << "iteration " << iteration << ": SQLFreeHandle(STMT) failed";
@@ -281,24 +229,6 @@ TEST(DllUnloadStress, FreeEnvThenUnloadRepeatedly) {
     const std::wstring wide_conn = Widen(conn_str);
     for (int i = 1; i <= iterations; ++i) {
         ASSERT_NO_FATAL_FAILURE(LoadUseUnload(dll_path, wide_conn, i));
-    }
-}
-
-TEST(DllUnloadStress, DisconnectRetiresStaleHandlesBeforeReplacement) {
-    const std::string dll_path = GetEnvOr("MSSQL_ODBC_DLL", "");
-    if (dll_path.empty()) {
-        GTEST_SKIP() << "MSSQL_ODBC_DLL is not set; skipping the DLL unload stress test";
-    }
-    const std::string conn_str = BuildConnectionString(dll_path);
-    if (conn_str.empty()) {
-        GTEST_SKIP() << "No ODBC_TEST_CONNSTR or ODBC_TEST_SERVER; this test needs a live connection";
-    }
-    const int iterations = std::atoi(GetEnvOr("MSSQL_ODBC_UNLOAD_ITERS", "200").c_str());
-    ASSERT_GT(iterations, 0) << "MSSQL_ODBC_UNLOAD_ITERS must be a positive integer";
-
-    const std::wstring wide_conn = Widen(conn_str);
-    for (int i = 1; i <= iterations; ++i) {
-        ASSERT_NO_FATAL_FAILURE(LoadUseUnload(dll_path, wide_conn, i, true));
     }
 }
 

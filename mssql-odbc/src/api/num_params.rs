@@ -11,7 +11,7 @@ use crate::api::odbc_types::{
 use crate::api::sqlstate::{ERR_FUNCTION_SEQUENCE, post_diag};
 use crate::api::util::write_if_some;
 use crate::error::free_errors;
-use crate::handles::{HandleType, StmtHandle, get_handle};
+use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 
 /// Returns the number of parameter markers in prepared or directly executed SQL.
 ///
@@ -51,14 +51,14 @@ unsafe fn sql_num_params_impl(
         error!("SQLNumParams: statement_handle is null");
         return SQL_INVALID_HANDLE;
     }
-    let stmt = get_handle!(StmtHandle, statement_handle);
+    let stmt = unsafe { handle_from_raw::<StmtHandle>(statement_handle) };
     debug_assert_eq!(
         stmt.object_type,
         HandleType::Stmt,
         "SQLNumParams: handle is not a STMT"
     );
 
-    sql_num_params_safe(&stmt, parameter_count_ptr)
+    sql_num_params_safe(stmt, parameter_count_ptr)
 }
 
 fn sql_num_params_safe(stmt: &StmtHandle, parameter_count_ptr: *mut SqlSmallInt) -> SqlReturn {
@@ -93,7 +93,6 @@ mod tests {
     use crate::api::odbc_types::*;
     use crate::api::prepare::sql_prepare_w;
     use crate::api::sqlstate::SQLSTATE_HY010;
-    use crate::handles::handle_from_raw;
     use crate::test_support::TestHandles;
 
     #[test]
@@ -105,23 +104,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn wrong_type_and_retired_handles_leave_count_untouched() {
-        let h = TestHandles::with_env();
-        let retired = {
-            let old = TestHandles::with_env_dbc_stmt();
-            old.stmt
-        };
-        for handle in [h.env, retired] {
-            let mut count = -1;
-            assert_eq!(
-                unsafe { sql_num_params(handle, &mut count) },
-                SQL_INVALID_HANDLE
-            );
-            assert_eq!(count, -1);
-        }
-    }
-
     /// ODBC: SQLNumParams on an unprepared statement is a sequence error.
     #[test]
     fn unprepared_statement_posts_hy010() {
@@ -129,8 +111,7 @@ mod tests {
         let mut n: SqlSmallInt = -1;
         assert_eq!(unsafe { sql_num_params(h.stmt, &mut n) }, SQL_ERROR);
         assert_eq!(n, -1, "the out parameter must be left alone on error");
-        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
-        let stmt = &*stmt_owner;
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         assert_eq!(
             stmt.inner.lock().unwrap().diag_records[0].sql_state,
             SQLSTATE_HY010
@@ -209,8 +190,7 @@ mod tests {
             SQL_ERROR
         );
         assert_count(&h, 1);
-        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
-        let stmt = &*stmt_owner;
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         assert!(stmt.inner.lock().unwrap().diag_records.is_empty());
         assert!(stmt.inner.lock().unwrap().prepared.is_none());
         assert_eq!(unsafe { sql_free_stmt_close(h.stmt) }, SQL_SUCCESS);
@@ -243,8 +223,7 @@ mod tests {
             SQL_SUCCESS
         );
         assert_count(&h, 1);
-        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
-        let stmt = &*stmt_owner;
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         assert_eq!(stmt.inner.lock().unwrap().direct_marker_count, None);
     }
 

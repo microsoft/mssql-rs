@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use tokio::runtime::Runtime;
 use tracing::error;
 
-use super::{Handle, HandleActivity, HandleType};
+use super::{HandleType, HasObjectType};
 use crate::api::odbc_types::{SQL_OV_ODBC2, SQL_OV_ODBC3, SQL_OV_ODBC3_80};
 use crate::error::{DiagRecord, HasDiagnostics};
 
@@ -205,7 +205,6 @@ impl Drop for SharedRuntime {
 #[derive(Debug)]
 pub(crate) struct EnvHandle {
     pub(crate) object_type: HandleType,
-    pub(crate) activity: Arc<HandleActivity>,
     pub(crate) inner: Mutex<EnvState>,
     /// Shared Tokio runtime for all connections on this ENV, in an `Arc` so
     /// DBCs can hold a reference without lifetime issues. Shutdown is handled
@@ -224,10 +223,6 @@ pub(crate) struct EnvState {
     /// Active child DBC handles
     pub(crate) connections: Vec<*mut c_void>,
 }
-
-// SAFETY: connections contains opaque IDs, never allocation pointers. EnvHandle
-// serializes access to this state with its mutex.
-unsafe impl Send for EnvState {}
 
 impl HasDiagnostics for EnvState {
     fn diag_records(&self) -> &[DiagRecord] {
@@ -255,7 +250,6 @@ impl EnvHandle {
         let runtime = new_runtime()?;
         Ok(Self {
             object_type: HandleType::Env,
-            activity: HandleActivity::new(None),
             inner: Mutex::new(EnvState {
                 diag_records: Vec::new(),
                 odbc_version: OdbcVersion::Unset,
@@ -267,16 +261,9 @@ impl EnvHandle {
     }
 }
 
-impl Handle for EnvHandle {
-    const TYPE: HandleType = HandleType::Env;
-    type State = EnvState;
-
-    fn state(&self) -> &Mutex<Self::State> {
-        &self.inner
-    }
-
-    fn activity(&self) -> &Arc<HandleActivity> {
-        &self.activity
+impl HasObjectType for EnvHandle {
+    fn object_type_mut(&mut self) -> &mut HandleType {
+        &mut self.object_type
     }
 }
 

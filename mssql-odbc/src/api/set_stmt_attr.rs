@@ -73,7 +73,9 @@ use crate::api::sqlstate::{
 use crate::api::util::{read_utf16_attr, write_if_some, write_wide_attr};
 use crate::error::{free_errors, post_sql_error};
 use crate::handles::desc::DescHandle;
-use crate::handles::stmt::{STMT_STATE_EXEC_STARTED, VendorStmtAttrs};
+use crate::handles::stmt::{
+    STMT_STATE_EXEC_STARTED, STMT_STATE_FETCH_IN_PROGRESS, VendorStmtAttrs,
+};
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 
 /// Clamps a requested `SQL_ATTR_QUERY_TIMEOUT` to the largest value the driver
@@ -133,8 +135,7 @@ unsafe fn sql_set_stmt_attr_w_impl(
         return SQL_INVALID_HANDLE;
     }
 
-    let stmt_owner = crate::handles::get_handle!(StmtHandle, statement_handle);
-    let stmt = &*stmt_owner;
+    let stmt = unsafe { handle_from_raw::<StmtHandle>(statement_handle) };
     debug_assert_eq!(
         stmt.object_type,
         HandleType::Stmt,
@@ -155,30 +156,11 @@ unsafe fn sql_set_stmt_attr_w_safe(
     value_ptr: SqlPointer,
     string_length: SqlInteger,
 ) -> SqlReturn {
-    let Ok(gate) = stmt.parent_dbc().inner.lock() else {
-        error!("SQLSetStmtAttrW: dbc mutex poisoned");
-        return SQL_ERROR;
-    };
     let Ok(mut state) = stmt.inner.lock() else {
         error!("SQLSetStmtAttrW: stmt mutex poisoned");
         return SQL_ERROR;
     };
     free_errors(&mut state);
-
-    if matches!(attribute, SQL_ATTR_APP_ROW_DESC | SQL_ATTR_APP_PARAM_DESC) {
-        let (current, use_state) = if attribute == SQL_ATTR_APP_ROW_DESC {
-            (state.effective_ard(stmt), &stmt.row_binding_use)
-        } else {
-            (state.effective_apd(stmt), &stmt.param_binding_use)
-        };
-        let result = use_state.ensure_idle(&gate).and_then(|()| {
-            let descriptor = crate::handles::bindings::owned_descriptor(current)?;
-            descriptor.binding_use.ensure_idle(&gate)
-        });
-        if let Err(error) = result {
-            return error.post(&mut *state);
-        }
-    }
 
     match attribute {
         SQL_ATTR_PARAMSET_SIZE
@@ -187,7 +169,7 @@ unsafe fn sql_set_stmt_attr_w_safe(
         | SQL_ATTR_PARAM_OPERATION_PTR
         | SQL_ATTR_PARAM_STATUS_PTR
         | SQL_ATTR_PARAMS_PROCESSED_PTR
-            if state.has_state(STMT_STATE_EXEC_STARTED) || stmt.param_binding_use.is_active() =>
+            if state.has_state(STMT_STATE_EXEC_STARTED) =>
         {
             error!(
                 attribute,
@@ -203,7 +185,7 @@ unsafe fn sql_set_stmt_attr_w_safe(
         | SQL_ATTR_ROW_STATUS_PTR
         | SQL_ATTR_ROW_BIND_OFFSET_PTR
         | SQL_ATTR_ROW_BIND_TYPE
-            if stmt.row_binding_use.is_active() =>
+            if state.has_state(STMT_STATE_FETCH_IN_PROGRESS) =>
         {
             error!(
                 attribute,
@@ -543,13 +525,14 @@ fn validate_descriptor_association(
         return Ok(None);
     }
 
-    let target = handle_from_raw::<DescHandle>(value).map_err(|error| {
-        error!(
-            ?error,
-            "SQLSetStmtAttrW: cannot acquire descriptor association"
-        );
-        ERR_INVALID_ATTRIBUTE_VALUE
-    })?;
+    // SAFETY: trusts the Driver Manager to pass a live descriptor handle, per
+    // this crate's FFI-boundary convention (see module docs / README.md).
+    let target = unsafe { handle_from_raw::<DescHandle>(value) };
+    debug_assert_eq!(
+        target.object_type,
+        HandleType::Desc,
+        "SQLSetStmtAttrW: SQL_ATTR_APP_ROW_DESC/APP_PARAM_DESC value is not a DESC handle"
+    );
 
     if !target.is_explicit() {
         return Err(ERR_INVALID_USE_OF_AUTO_DESC);
@@ -609,8 +592,7 @@ unsafe fn sql_get_stmt_attr_w_impl(
         return SQL_INVALID_HANDLE;
     }
 
-    let stmt_owner = crate::handles::get_handle!(StmtHandle, statement_handle);
-    let stmt = &*stmt_owner;
+    let stmt = unsafe { handle_from_raw::<StmtHandle>(statement_handle) };
     debug_assert_eq!(
         stmt.object_type,
         HandleType::Stmt,
@@ -824,8 +806,7 @@ mod tests {
     /// called before any `sql_get_stmt_attr_w` helper, which frees diagnostics
     /// on entry.
     fn stmt_sql_state(stmt: SqlHandle) -> [u8; 5] {
-        let stmt_owner = handle_from_raw::<StmtHandle>(stmt).unwrap().into_arc();
-        let stmt = &*stmt_owner;
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(stmt) };
         let state = stmt.inner.lock().unwrap();
         state.diag_records[0].sql_state
     }
@@ -885,8 +866,7 @@ mod tests {
         // Clamped rather than rejected, so the statement stays usable.
         assert_eq!(ret, SQL_SUCCESS_WITH_INFO);
         {
-            let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
-            let stmt = &*stmt_owner;
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
             let state = stmt.inner.lock().unwrap();
             assert_eq!(state.diag_records[0].sql_state, SQLSTATE_01S02);
         }
@@ -917,8 +897,7 @@ mod tests {
             unsafe { sql_set_stmt_attr_w(h.stmt, SQL_ATTR_ROW_ARRAY_SIZE, 128 as SqlPointer, 0) };
         assert_eq!(ret, SQL_SUCCESS);
 
-        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
-        let stmt = &*stmt_owner;
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         assert_eq!(stmt.inner.lock().unwrap().row_array_size, 128);
 
         let mut out: SqlULen = 0;
@@ -942,8 +921,7 @@ mod tests {
             unsafe { sql_set_stmt_attr_w(h.stmt, SQL_ATTR_ROW_ARRAY_SIZE, 0 as SqlPointer, 0) };
         assert_eq!(ret, SQL_ERROR);
         // The previous (default) value must be left untouched.
-        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
-        let stmt = &*stmt_owner;
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         assert_eq!(stmt.inner.lock().unwrap().row_array_size, 1);
     }
 
@@ -954,8 +932,7 @@ mod tests {
         let ptr = &mut rows_fetched as *mut SqlULen;
         let ret = unsafe { sql_set_stmt_attr_w(h.stmt, SQL_ATTR_ROWS_FETCHED_PTR, ptr.cast(), 0) };
         assert_eq!(ret, SQL_SUCCESS);
-        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
-        let stmt = &*stmt_owner;
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         assert_eq!(stmt.inner.lock().unwrap().rows_fetched_ptr, ptr);
     }
 
@@ -969,8 +946,7 @@ mod tests {
         let ret =
             unsafe { sql_set_stmt_attr_w(h.stmt, SQL_ATTR_ROW_BIND_OFFSET_PTR, ptr.cast(), 0) };
         assert_eq!(ret, SQL_SUCCESS);
-        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
-        let stmt = &*stmt_owner;
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         assert_eq!(stmt.inner.lock().unwrap().row_bind_offset_ptr, ptr);
 
         // An attribute that can be set has to be readable back: reading the
@@ -996,8 +972,7 @@ mod tests {
         let ptr = &mut status as *mut SqlUSmallInt;
         let ret = unsafe { sql_set_stmt_attr_w(h.stmt, SQL_ATTR_ROW_STATUS_PTR, ptr.cast(), 0) };
         assert_eq!(ret, SQL_SUCCESS);
-        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
-        let stmt = &*stmt_owner;
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         assert_eq!(stmt.inner.lock().unwrap().row_status_ptr, ptr);
     }
 
@@ -1375,8 +1350,7 @@ mod tests {
     #[test]
     fn get_returns_the_four_implicit_descriptors() {
         let h = TestHandles::with_env_dbc_stmt();
-        let stmt_ref_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
-        let stmt_ref = &*stmt_ref_owner;
+        let stmt_ref = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
 
         for (attr, expected) in [
             (SQL_ATTR_APP_ROW_DESC, stmt_ref.ard),
@@ -1429,8 +1403,7 @@ mod tests {
             )
         };
         assert_eq!(ret, SQL_ERROR);
-        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
-        let stmt = &*stmt_owner;
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         assert!(!stmt.inner.lock().unwrap().diag_records.is_empty());
 
         let (rc, _) = read_desc(h.stmt, SQL_ATTR_APP_PARAM_DESC);
@@ -1855,8 +1828,7 @@ mod tests {
     fn row_number_on_a_positioned_cursor_is_zero() {
         let h = TestHandles::with_env_dbc_stmt();
         {
-            let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
-            let stmt = &*stmt_owner;
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
             stmt.inner.lock().unwrap().row_positioned = true;
         }
         assert_eq!(get_attr(h.stmt, SQL_ATTR_ROW_NUMBER), 0);
@@ -1868,8 +1840,7 @@ mod tests {
     #[test]
     fn inert_attribute_identifiers_are_unique() {
         let h = TestHandles::with_env_dbc_stmt();
-        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
-        let stmt = &*stmt_owner;
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let state = stmt.inner.lock().unwrap();
         let ids: Vec<SqlInteger> = InertStmtAttrs::identifiers().collect();
         assert!(!ids.is_empty());
@@ -2137,8 +2108,7 @@ mod tests {
         let h = TestHandles::with_env_dbc_stmt();
         assert_eq!(get_attr(h.stmt, SQL_SOPT_SS_CURRENT_COMMAND), 0);
 
-        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
-        let stmt = &*stmt_owner;
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         stmt.inner.lock().unwrap().begin_batch(Vec::new());
         assert_eq!(get_attr(h.stmt, SQL_SOPT_SS_CURRENT_COMMAND), 1);
 
@@ -2420,8 +2390,7 @@ mod tests {
             set_desc(h.stmt, SQL_ATTR_APP_ROW_DESC, other_ard),
             SQL_ERROR
         );
-        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
-        let stmt = &*stmt_owner;
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         assert_eq!(
             stmt.inner
                 .lock()
@@ -2459,8 +2428,7 @@ mod tests {
             set_desc(h.stmt, SQL_ATTR_APP_ROW_DESC, other.desc),
             SQL_ERROR
         );
-        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
-        let stmt = &*stmt_owner;
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         assert_eq!(
             stmt.inner
                 .lock()

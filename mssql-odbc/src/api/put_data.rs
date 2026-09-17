@@ -22,7 +22,7 @@ use crate::api::odbc_types::{
 };
 use crate::conversion::param_convert::reserve_dae_buffer;
 use crate::error::free_errors;
-use crate::handles::{HandleType, StmtHandle};
+use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 
 /// Supplies a data chunk for the current data-at-execution parameter.
 ///
@@ -68,8 +68,7 @@ unsafe fn sql_put_data_impl(
         return SQL_INVALID_HANDLE;
     }
 
-    let stmt_owner = crate::handles::get_handle!(StmtHandle, statement_handle);
-    let stmt = &*stmt_owner;
+    let stmt = unsafe { handle_from_raw::<StmtHandle>(statement_handle) };
     debug_assert_eq!(
         stmt.object_type,
         HandleType::Stmt,
@@ -616,7 +615,6 @@ unsafe fn sql_put_data_safe(
 mod tests {
     use super::*;
     use crate::api::odbc_types::{SQL_C_CHAR, SQL_NULL_HANDLE, SQL_VARCHAR};
-    use crate::handles::handle_from_raw;
     use crate::handles::stmt::{DaeParam, DaeState};
     use crate::test_support::TestHandles;
 
@@ -646,8 +644,7 @@ mod tests {
         let h = TestHandles::with_env_dbc_stmt();
         let ret = unsafe { sql_put_data(h.stmt, std::ptr::null_mut(), SQL_NULL_DATA) };
         assert_eq!(ret, SQL_ERROR);
-        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
-        let stmt = &*stmt_owner;
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let state = stmt.inner.lock().unwrap();
         assert_eq!(state.diag_records[0].sql_state, ERR_FUNCTION_SEQUENCE.state);
     }
@@ -657,8 +654,7 @@ mod tests {
         // The sequence is active but no parameter is open yet — SQLPutData must
         // reject this as a sequencing error.
         let h = TestHandles::with_env_dbc_stmt();
-        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
-        let stmt = &*stmt_owner;
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         {
             let mut state = stmt.inner.lock().unwrap();
             state.dae = Some(DaeState::for_test(Vec::new(), None));
@@ -711,8 +707,7 @@ mod tests {
     #[test]
     fn nts_uses_the_snapshotted_c_type_with_bound_params_cleared() {
         let h = TestHandles::with_env_dbc_stmt();
-        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
-        let stmt = &*stmt_owner;
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         {
             let mut state = stmt.inner.lock().unwrap();
             // `open_dae`'s DaeParam snapshots SQL_C_CHAR; bound_params stays
@@ -742,8 +737,7 @@ mod tests {
     #[test]
     fn invalid_negative_strlen_returns_hy090() {
         let h = TestHandles::with_env_dbc_stmt();
-        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
-        let stmt = &*stmt_owner;
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         {
             let mut state = stmt.inner.lock().unwrap();
             state.dae = Some(open_dae(None));
@@ -760,8 +754,7 @@ mod tests {
     #[test]
     fn null_pointer_with_positive_length_returns_hy009() {
         let h = TestHandles::with_env_dbc_stmt();
-        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
-        let stmt = &*stmt_owner;
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         {
             let mut state = stmt.inner.lock().unwrap();
             state.dae = Some(open_dae(None));
@@ -782,8 +775,7 @@ mod tests {
     #[test]
     fn zero_length_non_null_chunk_marks_current_param_supplied() {
         let h = TestHandles::with_env_dbc_stmt();
-        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
-        let stmt = &*stmt_owner;
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         {
             let mut state = stmt.inner.lock().unwrap();
             state.dae = Some(open_dae(None));
@@ -803,8 +795,7 @@ mod tests {
     #[test]
     fn deferred_null_write_rejects_an_in_flight_sequence() {
         let h = TestHandles::with_env_dbc_stmt();
-        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
-        let stmt = &*stmt_owner;
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         {
             let mut state = stmt.inner.lock().unwrap();
             let mut dae = open_dae(None);
@@ -831,8 +822,7 @@ mod tests {
         // A mismatch aborts the sequence, so `dae` being gone is the tell.
         for (declared, expect_overrun) in [(3usize, false), (2usize, true)] {
             let h = TestHandles::with_env_dbc_stmt();
-            let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
-            let stmt = &*stmt_owner;
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
             {
                 let mut state = stmt.inner.lock().unwrap();
                 state.dae = Some(open_dae(Some(declared)));
@@ -859,8 +849,7 @@ mod tests {
     fn wide_nts_chunk_length_is_counted_in_bytes() {
         for (declared, expect_overrun) in [(4usize, false), (3usize, true)] {
             let h = TestHandles::with_env_dbc_stmt();
-            let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
-            let stmt = &*stmt_owner;
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
             {
                 let mut state = stmt.inner.lock().unwrap();
                 state.dae = Some(DaeState::for_test(
@@ -893,8 +882,7 @@ mod tests {
         // A call that cannot write must not move the parameter's counters, or a
         // retry would resume from a byte total the server never received.
         let h = TestHandles::with_env_dbc_stmt();
-        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
-        let stmt = &*stmt_owner;
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         {
             let mut state = stmt.inner.lock().unwrap();
             state.dae = Some(open_dae(None));
@@ -935,8 +923,7 @@ mod tests {
         .expect("and therefore has a limit");
 
         let h = TestHandles::with_env_dbc_stmt();
-        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
-        let stmt = &*stmt_owner;
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         {
             let mut state = stmt.inner.lock().unwrap();
             state.dae = Some(DaeState::for_test(
@@ -976,8 +963,7 @@ mod tests {
     #[test]
     fn transcoded_param_without_a_client_returns_hy010() {
         let h = TestHandles::with_env_dbc_stmt();
-        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
-        let stmt = &*stmt_owner;
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         {
             let mut state = stmt.inner.lock().unwrap();
             let mut param = DaeParam::unbounded(0, std::ptr::null_mut(), None)
@@ -1021,8 +1007,7 @@ mod tests {
         .expect("and therefore has a limit");
 
         let h = TestHandles::with_env_dbc_stmt();
-        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
-        let stmt = &*stmt_owner;
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         {
             let mut state = stmt.inner.lock().unwrap();
             // Wide in, wide out: no transcoder, so the bytes pass through and
@@ -1065,8 +1050,7 @@ mod tests {
     #[test]
     fn oversized_transcoded_chunk_returns_hy001_without_aborting() {
         let h = TestHandles::with_env_dbc_stmt();
-        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
-        let stmt = &*stmt_owner;
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         {
             let mut state = stmt.inner.lock().unwrap();
             state.dae = Some(DaeState::for_test(
@@ -1094,8 +1078,7 @@ mod tests {
     #[test]
     fn over_declared_dae_length_returns_22026() {
         let h = TestHandles::with_env_dbc_stmt();
-        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
-        let stmt = &*stmt_owner;
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         {
             let mut state = stmt.inner.lock().unwrap();
             state.dae = Some(open_dae(Some(2)));
@@ -1116,8 +1099,7 @@ mod tests {
     #[test]
     fn null_after_value_chunks_returns_hy020() {
         let h = TestHandles::with_env_dbc_stmt();
-        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
-        let stmt = &*stmt_owner;
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         {
             let mut state = stmt.inner.lock().unwrap();
             let mut dae = open_dae(None);
@@ -1143,8 +1125,7 @@ mod tests {
     #[test]
     fn null_after_empty_value_chunk_returns_hy020() {
         let h = TestHandles::with_env_dbc_stmt();
-        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
-        let stmt = &*stmt_owner;
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         {
             let mut state = stmt.inner.lock().unwrap();
             let mut dae = open_dae(None);
@@ -1166,8 +1147,7 @@ mod tests {
     #[test]
     fn value_chunk_after_null_returns_hy020() {
         let h = TestHandles::with_env_dbc_stmt();
-        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
-        let stmt = &*stmt_owner;
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         {
             let mut state = stmt.inner.lock().unwrap();
             let mut dae = open_dae(None);

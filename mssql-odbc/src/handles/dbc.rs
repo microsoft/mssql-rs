@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use mssql_tds::connection::tds_client::TdsClient;
 
 use super::env::SharedRuntime;
-use super::{EnvHandle, Handle, HandleActivity, HandleType};
+use super::{EnvHandle, HandleType, HasObjectType};
 use crate::api::odbc_types::{DEFAULT_PACKET_SIZE, SQL_MODE_READ_WRITE, SQL_TXN_READ_COMMITTED};
 use crate::error::{DiagRecord, HasDiagnostics};
 
@@ -25,22 +25,26 @@ pub(crate) enum ConnectionState {
 /// Connection handle
 ///
 /// Created by `SQLAllocHandle(SQL_HANDLE_DBC, henv, ...)`.
-/// Retains its parent environment and connection-level state.
+/// Holds a back-pointer to the parent environment and connection-level state.
 ///
 /// Thread-safety: The `inner` mutex protects mutable state, mirroring
 /// msodbcsql's connection-level critical section.
 #[derive(Debug)]
 pub(crate) struct DbcHandle {
     pub(crate) object_type: HandleType,
-    pub(crate) activity: Arc<HandleActivity>,
-    parent: Arc<EnvHandle>,
+    /// Back-pointer to the parent ENV handle. Stored as opaque pointer because
+    /// the ENV owns the DBC's lifetime, not the other way around.
+    pub(crate) parent_env: *mut c_void,
     /// Shared Tokio runtime from the parent ENV.
     pub(crate) runtime: Arc<SharedRuntime>,
     pub(crate) inner: Mutex<DbcState>,
 }
 
-// SAFETY: child handle values are opaque IDs and mutable connection state is
-// mutex-protected. The parent ENV is strongly retained.
+// SAFETY: The raw pointer `parent_env` prevents auto-impl of Send/Sync.
+// We assert these are safe because `parent_env` is set once at construction
+// and never mutated. The parent ENV is guaranteed alive because the DM
+// ensures all DBCs are freed before calling SQLFreeEnv.
+// All mutable state is Mutex-protected.
 unsafe impl Send for DbcHandle {}
 unsafe impl Sync for DbcHandle {}
 
@@ -78,7 +82,6 @@ pub(crate) struct VendorConnOverrides {
 
 /// Mutable state within a connection handle, protected by `inner`.
 pub(crate) struct DbcState {
-    gate_identity: Arc<HandleActivity>,
     pub(crate) diag_records: Vec<DiagRecord>,
     pub(crate) connection_state: ConnectionState,
     /// Active child STMT handles
@@ -216,12 +219,6 @@ pub(crate) struct ConnectionIdentity {
     pub(crate) user_name: String,
 }
 
-impl DbcState {
-    pub(super) fn gate_identity(&self) -> &Arc<HandleActivity> {
-        &self.gate_identity
-    }
-}
-
 // Manual `Debug` so the bearer access token is never rendered in logs or panic
 // messages; presence is shown, the value is redacted (mirrors `ConnectionParams`).
 impl std::fmt::Debug for DbcState {
@@ -258,15 +255,12 @@ impl HasDiagnostics for DbcState {
 }
 
 impl DbcHandle {
-    pub(crate) fn new(parent: Arc<EnvHandle>) -> Self {
-        let activity = HandleActivity::new(Some(Arc::clone(&parent.activity)));
+    pub(crate) fn new(parent_env: *mut c_void, runtime: Arc<SharedRuntime>) -> Self {
         Self {
             object_type: HandleType::Dbc,
-            activity: Arc::clone(&activity),
-            runtime: Arc::clone(&parent.runtime),
-            parent,
+            parent_env,
+            runtime,
             inner: Mutex::new(DbcState {
-                gate_identity: activity,
                 diag_records: Vec::new(),
                 connection_state: ConnectionState::Disconnected,
                 statements: Vec::new(),
@@ -300,20 +294,16 @@ impl DbcHandle {
     /// long because the DM frees all DBC handles before freeing their parent
     /// ENV.
     pub(crate) fn parent_env(&self) -> &EnvHandle {
-        &self.parent
+        // SAFETY: `parent_env` is set at construction to a live `EnvHandle`
+        // pointer (allocated by `handle_to_raw::<EnvHandle>`), is never mutated,
+        // and the ENV outlives this DBC per the DM contract.
+        unsafe { &*(self.parent_env as *const EnvHandle) }
     }
 }
 
-impl Handle for DbcHandle {
-    const TYPE: HandleType = HandleType::Dbc;
-    type State = DbcState;
-
-    fn state(&self) -> &Mutex<Self::State> {
-        &self.inner
-    }
-
-    fn activity(&self) -> &Arc<HandleActivity> {
-        &self.activity
+impl HasObjectType for DbcHandle {
+    fn object_type_mut(&mut self) -> &mut HandleType {
+        &mut self.object_type
     }
 }
 
@@ -327,7 +317,7 @@ mod tests {
     #[test]
     fn debug_redacts_the_token_and_reports_the_attribute_state() {
         let h = TestHandles::with_env_dbc();
-        let dbc = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         let mut state = dbc.inner.lock().unwrap();
         state.access_token = Some("super-secret-jwt".into());
         state.current_catalog = Some("reporting".into());

@@ -10,12 +10,12 @@
 
 use tracing::{debug, error};
 
-use crate::api::exec_common::snapshot_output_params;
+use crate::api::exec_common::snapshot_bound_params;
 use crate::api::output_params::write_back_output_params;
 
 use mssql_tds::connection::tds_client::{ResultSet, StatementResult};
 
-use super::close_cursor::{claim_result_use, reset_cursor_state};
+use super::close_cursor::reset_cursor_state;
 use super::ird::populate_ird;
 use crate::api::odbc_types::{
     SQL_ERROR, SQL_INVALID_HANDLE, SQL_NO_DATA, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle,
@@ -25,9 +25,10 @@ use crate::api::sqlstate::{
     ERR_CONNECTION_BUSY, ERR_NO_ACTIVE_TDS_CLIENT, SQLSTATE_HY000, post_diag, post_tds_error,
     post_tds_info_messages,
 };
+use crate::error::free_errors;
 use crate::error::post_sql_error;
 use crate::handles::stmt::STMT_STATE_CURSOR_OPEN;
-use crate::handles::{HandleType, StmtHandle, get_handle};
+use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 
 /// Advances to the next result set on a statement.
 ///
@@ -47,26 +48,30 @@ unsafe fn sql_more_results_impl(statement_handle: SqlHandle) -> SqlReturn {
         error!("SQLMoreResults: statement_handle is null");
         return SQL_INVALID_HANDLE;
     }
-    let stmt = get_handle!(StmtHandle, statement_handle);
+    let stmt = unsafe { handle_from_raw::<StmtHandle>(statement_handle) };
     debug_assert_eq!(stmt.object_type, HandleType::Stmt);
-    sql_more_results_safe(statement_handle, &stmt)
+    sql_more_results_safe(statement_handle, stmt)
 }
 
 fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn {
-    let _result_use = match claim_result_use(stmt) {
-        Ok(guard) => guard,
-        Err(rc) => return rc,
-    };
     // DESC locks must not nest beneath STMT, including the exhausted fast path.
-    let snapshot = match snapshot_output_params(stmt) {
-        Ok(snapshot) => snapshot,
-        Err(rc) => return rc,
-    };
+    let bound_params = snapshot_bound_params(stmt);
+    // Free any stale diagnostics and observe cursor state.
     let cursor_open = {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("SQLMoreResults: stmt mutex poisoned");
             return SQL_ERROR;
         };
+        free_errors(&mut stmt_state);
+        if bound_params.is_err() {
+            post_sql_error(
+                &mut stmt_state,
+                SQLSTATE_HY000,
+                0,
+                "Internal error snapshotting output parameter bindings",
+            );
+            return SQL_ERROR;
+        }
         if let Some(e) = stmt_state.pending_fetch_error.take() {
             // A prior fetch's read-ahead peek already discovered this result
             // set ends in a SQL Server error (see AB#47508's
@@ -113,7 +118,12 @@ fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
                 // The values belong to this statement, not to the client that
                 // may already be executing a different statement.
                 unsafe {
-                    write_back_output_params(&mut stmt_state, &snapshot.records, &values, status)
+                    write_back_output_params(
+                        &mut stmt_state,
+                        bound_params.as_deref().unwrap_or_default(),
+                        &values,
+                        status,
+                    )
                 }
             } else {
                 SQL_SUCCESS
@@ -342,7 +352,7 @@ fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
             let output_rc = unsafe {
                 write_back_output_params(
                     &mut stmt_state,
-                    &snapshot.records,
+                    bound_params.as_deref().unwrap_or_default(),
                     &return_values,
                     return_status,
                 )
@@ -394,7 +404,6 @@ mod tests {
     use crate::api::odbc_types::{SQL_NO_DATA, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO};
     use crate::api::sqlstate::ERR_NO_ACTIVE_TDS_CLIENT;
     use crate::handles::dbc::DbcHandle;
-    use crate::handles::handle_from_raw;
     use crate::test_support::TestHandles;
     use mssql_tds::error::Error as TdsError;
     use mssql_tds::test_client_support::{
@@ -406,8 +415,8 @@ mod tests {
     /// open cursor — mirroring the state left by a successful `SQLExecDirect`.
     /// Returns the first statement's result so callers can assert on it.
     fn position_first_and_inject(h: &TestHandles, tokens: Vec<ScriptedToken>) -> StatementResult {
-        let dbc = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
-        let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let mut client = tds_client_from_tokens(tokens);
         let first = dbc
             .runtime
@@ -443,7 +452,7 @@ mod tests {
         let ret = unsafe { sql_more_results(h.stmt) };
         assert_eq!(ret, SQL_SUCCESS);
 
-        let dbc = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         assert_eq!(dbc.inner.lock().unwrap().active_stmt, Some(h.stmt));
     }
 
@@ -468,7 +477,7 @@ mod tests {
         );
         assert_eq!(first, StatementResult::Rows);
 
-        let dbc = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         // Simulate stmt1 having been fetched to exhaustion: active_stmt was
         // already released, but the cursor (and client) are still there.
         dbc.inner.lock().unwrap().active_stmt = None;
@@ -500,14 +509,14 @@ mod tests {
         );
         assert_eq!(first, StatementResult::Rows);
         {
-            let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
             stmt.inner.lock().unwrap().result_set_exhausted = true;
         }
 
         let ret = unsafe { sql_more_results(h.stmt) };
         assert_eq!(ret, SQL_SUCCESS);
 
-        let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         assert!(!stmt.inner.lock().unwrap().result_set_exhausted);
     }
 
@@ -531,13 +540,13 @@ mod tests {
         // Advance onto the no-row statement result.
         let ret = unsafe { sql_more_results(h.stmt) };
         assert_eq!(ret, SQL_SUCCESS_WITH_INFO);
-        let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         assert!(stmt.inner.lock().unwrap().column_metadata.is_empty());
 
         // Advance again: batch exhausted -> SQL_NO_DATA, cursor closed, released.
         let ret = unsafe { sql_more_results(h.stmt) };
         assert_eq!(ret, SQL_NO_DATA);
-        let dbc = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         assert!(dbc.inner.lock().unwrap().active_stmt.is_none());
     }
 
@@ -559,7 +568,7 @@ mod tests {
         );
         assert_eq!(first, StatementResult::Rows);
 
-        let dbc = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         dbc.inner.lock().unwrap().active_stmt = None;
 
         let ret = unsafe { sql_more_results(h.stmt) };
@@ -581,7 +590,7 @@ mod tests {
     #[test]
     fn more_results_surfaces_a_pending_fetch_error() {
         let h = TestHandles::with_env_dbc_stmt();
-        let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         {
             let mut ss = stmt.inner.lock().unwrap();
             ss.set_state(STMT_STATE_CURSOR_OPEN);
@@ -590,7 +599,7 @@ mod tests {
                 "simulated trailing SQL Server error".to_string(),
             ));
         }
-        let dbc = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         dbc.inner.lock().unwrap().active_stmt = Some(h.stmt);
 
         let ret = unsafe { sql_more_results(h.stmt) };
@@ -625,7 +634,7 @@ mod tests {
         use mssql_tds::error::SqlInfoMessage;
 
         let h = TestHandles::with_env_dbc_stmt();
-        let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         {
             let mut ss = stmt.inner.lock().unwrap();
             ss.set_state(STMT_STATE_CURSOR_OPEN);
@@ -643,7 +652,7 @@ mod tests {
                 line_number: None,
             }];
         }
-        let dbc = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         dbc.inner.lock().unwrap().active_stmt = Some(h.stmt);
 
         let ret = unsafe { sql_more_results(h.stmt) };
@@ -683,7 +692,7 @@ mod tests {
     fn more_results_fast_path_reports_no_data_when_batch_already_exhausted() {
         let mut h = TestHandles::with_env_dbc_stmt();
         let stmt_b = h.alloc_extra_stmt();
-        let stmt_a = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt_a = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         {
             let mut sa = stmt_a.inner.lock().unwrap();
             sa.set_state(STMT_STATE_CURSOR_OPEN);
@@ -696,7 +705,7 @@ mod tests {
         }
 
         // B has since claimed the connection and is actively using it.
-        let dbc = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         dbc.inner.lock().unwrap().active_stmt = Some(stmt_b);
         // No client configured at all: if the fast path reached for the
         // connection this would fail with a different SQLSTATE (busy / no
@@ -736,7 +745,7 @@ mod tests {
         use mssql_tds::error::SqlInfoMessage;
 
         let h = TestHandles::with_env_dbc_stmt();
-        let stmt_a = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt_a = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         {
             let mut sa = stmt_a.inner.lock().unwrap();
             sa.set_state(STMT_STATE_CURSOR_OPEN);
@@ -784,12 +793,12 @@ mod tests {
     #[test]
     fn more_results_no_active_client_errors() {
         let h = TestHandles::with_env_dbc_stmt();
-        let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         {
             let mut ss = stmt.inner.lock().unwrap();
             ss.set_state(STMT_STATE_CURSOR_OPEN);
         }
-        let dbc = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         dbc.inner.lock().unwrap().active_stmt = Some(h.stmt);
 
         let ret = unsafe { sql_more_results(h.stmt) };
@@ -814,12 +823,12 @@ mod tests {
         let ret = unsafe { sql_more_results(h.stmt) };
         assert_eq!(ret, SQL_ERROR);
 
-        let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         assert_eq!(
             stmt.inner.lock().unwrap().diag_records[0].sql_state,
             SQLSTATE_HY000
         );
-        let dbc = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         assert!(dbc.inner.lock().unwrap().active_stmt.is_none());
     }
 
@@ -868,8 +877,7 @@ mod tests {
             ),
         ] {
             let h = TestHandles::with_env_dbc_stmt();
-            let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
-            let stmt = &*stmt_owner;
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
             let mut buffer = [0u8; 4];
             let mut length = -1;
             assert_eq!(
@@ -938,7 +946,7 @@ mod tests {
     #[test]
     fn pending_dml_counts_stepped_then_exhausted() {
         let h = TestHandles::with_env_dbc_stmt();
-        let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         {
             let mut s = stmt.inner.lock().unwrap();
             s.row_count = 3;
@@ -964,7 +972,7 @@ mod tests {
     #[test]
     fn stepping_pending_dml_counts_advances_the_command_ordinal() {
         let h = TestHandles::with_env_dbc_stmt();
-        let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         {
             let mut s = stmt.inner.lock().unwrap();
             s.begin_batch(Vec::new());

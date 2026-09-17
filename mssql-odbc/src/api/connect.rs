@@ -16,7 +16,7 @@ use crate::api::odbc_types::{
     SQL_DRIVER_NOPROMPT, SQL_INVALID_HANDLE, SqlHandle, SqlReturn, SqlSmallInt, SqlWChar,
 };
 use crate::handles::DbcHandle;
-use crate::handles::{HandleType, get_handle};
+use crate::handles::{HandleType, handle_from_raw};
 
 use super::driver_connect::sql_driver_connect_w_safe;
 use super::util::read_utf16;
@@ -79,7 +79,7 @@ unsafe fn sql_connect_w_impl(
         return SQL_INVALID_HANDLE;
     }
 
-    let dbc = get_handle!(DbcHandle, connection_handle);
+    let dbc = unsafe { handle_from_raw::<DbcHandle>(connection_handle) };
     debug_assert_eq!(
         dbc.object_type,
         HandleType::Dbc,
@@ -101,7 +101,7 @@ unsafe fn sql_connect_w_impl(
     );
 
     sql_driver_connect_w_safe(
-        &dbc,
+        dbc,
         conn_str,
         std::ptr::null_mut(),
         0,

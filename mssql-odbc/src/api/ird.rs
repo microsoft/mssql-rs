@@ -50,9 +50,7 @@ use crate::handles::{DescHandle, StmtHandle, handle_from_raw};
 /// empty. The caller posts a diagnostic against the statement and fails the
 /// call outright.
 pub(super) fn populate_ird(stmt: &StmtHandle, metadata: &[ColumnMetadata]) -> Result<(), ()> {
-    let desc = handle_from_raw::<DescHandle>(stmt.ird).map_err(|err| {
-        error!(?err, "populating IRD: descriptor lookup failed");
-    })?;
+    let desc = unsafe { handle_from_raw::<DescHandle>(stmt.ird) };
     let Ok(mut desc_state) = desc.inner.lock() else {
         error!("populating IRD: mutex poisoned");
         return Err(());
@@ -102,8 +100,8 @@ mod tests {
     use mssql_tds::test_client_support::int_columns;
 
     fn ird_records(h: &TestHandles) -> Vec<DescRecord> {
-        let desc = handle_from_raw::<DescHandle>(h.ird()).unwrap().into_arc();
-        desc.inner.lock().unwrap().records().to_vec()
+        let desc = unsafe { handle_from_raw::<DescHandle>(h.ird()) };
+        desc.inner.lock().unwrap().records.clone()
     }
 
     /// Every field lands where `SQLDescribeColW`/`SQLColAttributeW` would
@@ -113,8 +111,7 @@ mod tests {
     fn populate_ird_writes_records_consistent_with_describe_col() {
         let h = TestHandles::with_env_dbc_stmt();
         let metadata = int_columns(2);
-        let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
-        populate_ird(&stmt, &metadata).unwrap();
+        populate_ird(unsafe { handle_from_raw::<StmtHandle>(h.stmt) }, &metadata).unwrap();
 
         let records = ird_records(&h);
         assert_eq!(records.len(), 2);
@@ -131,11 +128,11 @@ mod tests {
     #[test]
     fn populate_ird_shrinks_to_a_narrower_later_result_set() {
         let h = TestHandles::with_env_dbc_stmt();
-        let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
-        populate_ird(&stmt, &int_columns(3)).unwrap();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        populate_ird(stmt, &int_columns(3)).unwrap();
         assert_eq!(ird_records(&h).len(), 3);
 
-        populate_ird(&stmt, &int_columns(1)).unwrap();
+        populate_ird(stmt, &int_columns(1)).unwrap();
         assert_eq!(ird_records(&h).len(), 1);
     }
 
@@ -145,17 +142,17 @@ mod tests {
     #[test]
     fn populate_ird_with_empty_metadata_empties_the_ird() {
         let h = TestHandles::with_env_dbc_stmt();
-        let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
-        populate_ird(&stmt, &int_columns(2)).unwrap();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        populate_ird(stmt, &int_columns(2)).unwrap();
         assert_eq!(ird_records(&h).len(), 2);
 
-        populate_ird(&stmt, &[]).unwrap();
+        populate_ird(stmt, &[]).unwrap();
         assert!(ird_records(&h).is_empty());
     }
 
     /// Panics while holding the IRD lock, leaving the mutex poisoned.
     fn poison_ird(ird: SqlHandle) {
-        let handle = handle_from_raw::<DescHandle>(ird).unwrap().into_arc();
+        let handle = unsafe { handle_from_raw::<DescHandle>(ird) };
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _guard = handle.inner.lock().unwrap();
             panic!("poison the ird lock");
@@ -169,8 +166,8 @@ mod tests {
     #[test]
     fn populate_ird_fails_on_a_poisoned_mutex() {
         let h = TestHandles::with_env_dbc_stmt();
-        let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         poison_ird(h.ird());
-        assert!(populate_ird(&stmt, &int_columns(1)).is_err());
+        assert!(populate_ird(stmt, &int_columns(1)).is_err());
     }
 }

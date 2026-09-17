@@ -385,12 +385,7 @@ does not grow every time a new msodbcsql build is measured.
   there are caught by the test harness.
 - Use `.unwrap_or()`, `.unwrap_or_else()`, `.unwrap_or_default()`, or
   pattern matching instead.
-- For business-state `Mutex::lock()`, return `SQL_ERROR` on poison; do not
-  resume business operations via `e.into_inner()`. Two narrow exceptions are
-  audited: the registry recovers metadata-only critical sections with no
-  unwinding callbacks/destructors, and `error::diag::with_diagnostics` exposes
-  only the diagnostic Vec of poisoned handle state. Diagnostic access never
-  clears the business-state poison flag.
+- For `Mutex::lock()`, return `SQL_ERROR` on poison — use `let Ok(state) = handle.inner.lock() else { return SQL_ERROR; }`. Do **not** recover via `e.into_inner()`.
 - Every FFI entry point must be wrapped in the `crate::ffi_entry!` macro
   (see [FFI boundary conventions](#ffi-boundary-conventions)). The macro is
   a last-resort safety net — write code that cannot panic in the first place.
@@ -407,11 +402,6 @@ does not grow every time a new msodbcsql build is measured.
   error types at the call site.
 - At FFI boundaries, convert every `Result::Err` into the appropriate
   `SqlReturn` code (`SQL_ERROR`, `SQL_INVALID_HANDLE`, etc.).
-- `get_handle!` posts fresh `HY010`/`HY001` diagnostics for rejected live-handle
-  admission. Its diagnostic-only lookup bypasses closing/activity limits, not
-  identity/type validation, and exposes no business-state reference.
-  `SQL_INVALID_HANDLE` deliberately posts nothing. Diagnostic getters use the
-  same restricted lookup so callers can retrieve errors while a parent closes.
 - Store diagnostic info on the handle so `SQLGetDiagRec` / `SQLGetDiagField`
   can report it — don't discard error details. Three posters, choose by source:
   - `post_diag(state, DiagMsg)` — **preferred for driver-raised diagnostics
@@ -477,15 +467,12 @@ does not grow every time a new msodbcsql build is measured.
 
 Push `unsafe` to the edges. Each FFI implementation is split into two layers:
 
-- A thin `unsafe fn sql_xxx_impl(...)` **shim** acquires owned handles and
-  validates application buffers:
+- A thin `unsafe fn sql_xxx_impl(...)` **shim** whose only job is to turn raw
+  C pointers into validated Rust references:
   1. Null-check the handle → `SQL_INVALID_HANDLE`.
-  2. `get_handle!(T, handle)` obtains a typed `HandleRef<T>` or logs and returns
-     an acquisition error. Helpers not returning `SqlReturn` handle
-     `handle_from_raw::<T>(handle)`'s `Result` explicitly.
-  3. Keep the guard alive through the safe core and final output writes; pass
-     `&h` to a core expecting `&T`. Never return a reference out of a temporary
-     owned lookup.
+  2. `unsafe { handle_from_raw::<T>(handle) }` to obtain `&T`.
+  3. `debug_assert_eq!(h.object_type, HandleType::X)` to catch DM contract
+     violations in debug builds.
   4. Decode any input strings (`read_utf16`, etc.).
   5. Delegate everything else to the safe core.
 - A safe `fn sql_xxx_safe(handle: &T, ...) -> SqlReturn` **core** that holds all
@@ -507,14 +494,8 @@ Rules of thumb:
   `debug_assert!(buffer_length >= 0, ...)`) belongs in the safe core, not the
   shim. The shim should be limited to null-checks and pointer→reference
   conversion.
-- Handle identity, type, and lifecycle admission are always checked by the
-  registry, including release builds. IDs are never allocation pointers.
-- Public IDs may be recycled after retirement when their slot generation
-  wraps; no lifetime allocation budget is permitted. Do not use their numeric
-  values as enduring internal identity: cached prepared bindings retain
-  descriptor identity markers independently of public ID reuse.
-- Other preconditions the DM is contractually required to enforce (non-null
-  required pointers and valid length/option values) are checked with
+- Preconditions the DM is contractually required to enforce (non-null required
+  pointers, valid length/option values, correct handle type) are checked with
   `debug_assert!` only — **do not** promote them to a release-build
   `if`/error-return. The assert documents the DM contract and catches
   violations in debug builds; in release the driver trusts the DM, matching
@@ -527,9 +508,9 @@ Rules of thumb:
 
 - **Same side allocates and frees.** Whoever produced an allocation owns
   freeing it; the FFI boundary never transfers deallocation responsibility:
-  - Rust-allocated memory (`Arc`, `Box`, `Vec`, `String`) must be freed by Rust
-    through its matching owner. `SQLFreeHandle` retires an opaque ID; the
-    registry and outstanding owners release the allocation. Never expect the
+  - Rust-allocated memory (`Box`, `Vec`, `String`, anything from
+    `Box::into_raw` / `handle_to_raw`) must be freed by Rust via the
+    matching `SQLFreeHandle` / `Box::from_raw` path. Never expect the
     caller (DM or app) to `free()` it, and never `mem::forget` it without
     a paired free path.
   - Caller-provided out-buffers (`*mut SQLCHAR` for `SQLGetData`, output
@@ -538,15 +519,27 @@ Rules of thumb:
     doing so hands them to Rust's allocator and corrupts the caller's
     memory.
 - Prefer `Box` for single-owner heap objects; use `Arc` only when shared
-  ownership is genuinely required, as it is for acquired ODBC handles.
-- Keep handle construction and acquisition in `handles`. Children retain
-  parents; parent child-lists retain IDs, not owning references back to children.
-  Implicit descriptors retain the DBC, not the STMT, to avoid a cycle.
-- Retire all four implicit descriptor IDs with their STMT, not in its final
-  destructor. Drop extracted registry entries outside the registry lock.
-- A public live-handle count is not a physical-allocation or module-quiescence
-  count. Preserve runtime shutdown and final-ENV trace cleanup when changing
-  ownership. A future hosted allocator must survive final control-block frees.
+  ownership is genuinely required.
+
+### Application lifetime contracts and bug scope
+
+- Applications must not use a handle after it is freed. `SQLDisconnect` also
+  releases associated statements and explicitly allocated descriptors. A
+  surviving Driver Manager wrapper does not establish that its old driver
+  handle is still usable. See [SQLFreeHandle](https://learn.microsoft.com/sql/odbc/reference/syntax/sqlfreehandle-function).
+- Applications own buffer allocation and must preserve buffers while the
+  driver still requires them. Do not infer that a concurrent descriptor setter
+  returning success makes an earlier outstanding fetch's buffers safe to free.
+  See [Allocating and Freeing Buffers](https://learn.microsoft.com/sql/odbc/reference/develop-app/allocating-and-freeing-buffers).
+- Crash prevention for freed application handles or prematurely freed buffers
+  is not a driver requirement. Do not add global identity, ownership, or
+  per-call admission machinery solely to harden those invalid uses.
+- Concurrent calls are not automatically misuse: ODBC requires thread safety.
+  Before redesigning synchronization for a reported race, establish a supported
+  call sequence, what the Driver Manager already enforces, and a reproducer
+  with valid submitted handles and buffers retained through call completion.
+  A source-level race or the absence of a classic-driver lock alone does not
+  establish the application contract. Keep proven internal fixes narrowly scoped.
 
 ## Concurrency
 
@@ -592,77 +585,34 @@ Driver Manager (DM) provides serialization guarantees that the driver relies on
   walks DBC → STMT to clear a freed descriptor's association from every
   statement that had it active, so the STMT lock and a DESC lock must never
   nest the other way: **never hold a STMT lock while acquiring a DESC lock**.
-  Binding operations first hold the owning DBC gate, then lock STMT to
-  validate and acquire the effective descriptor, release STMT, and acquire
-  DESC to admit a snapshot or mutate records. Keep the DBC gate across those
-  short phases, but release every state mutex before network I/O.
-- **Object ownership is not buffer-use permission.** Snapshots hold
-  `BindingLease` and row/parameter control-use guards until their final
-  application-buffer access. All binding setters, unbind/reset operations,
-  descriptor reassociation, and descriptor free use the same DBC gate and
-  reject conflicting use with `ERR_FUNCTION_SEQUENCE` before mutation.
-  Binding-use counters validate that the supplied DBC gate has their owning
-  connection's identity; a guard from another connection must fail before
-  reading or modifying the use count.
-  Check the descriptor's use state, not just the calling statement: an
-  explicit descriptor can be another statement's active ARD or APD.
-  Procedure outputs take a fresh `ParameterSnapshot` at delivery, not at
-  execute time. Keep that snapshot's lease alive through the final value and
-  indicator writes; extracting only `.records` would reopen the mutation race.
-- **No check-then-unowned-use.** `handle_from_raw` returns an owned reference;
-  neither `live_type` nor a raw cast is a valid lifetime check. Registry
-  acquisition never locks a handle's state. Never acquire state locks,
-  perform I/O, or destroy extracted payloads while holding the registry lock.
-- Registry lookup checks generation and type under the individual slot's read
-  lock, never before locking. Segmented pages stay stable for the registry's
-  lifetime; slots and activity records are cache-line isolated. Allocation/retirement serialize the
-  free list, but lookup and close do not take that mutex.
-  Admission and count share one atomic word so a cross-slot parent close cannot
-  pass between a check and reservation. Readers reserve with checked atomic
-  updates and roll back preceding reservations on failure. Do not split the
-  admission check from its count update or restore unchecked increments.
-  Only direct ENV calls reserve the root counter: ENV free is DM-ordered after
-  child cleanup. Descendants must still check ENV admission and retain its
-  storage/runtime; keep DBC/STMT reservations through final payload destruction.
-- **Close admission is distinct from binding use.** An executing dependent
-  API blocks connection/statement close and disconnect; an idle cursor or parked
-  DAE sequence can still be cleaned up. Do not let late client hand-back repopulate
-  a disconnected connection. RAII guards must release use on all error/unwind paths.
-  Cleanup beneath a close claim must use retained owners, not reacquire child
-  IDs through public admission. Test that the cursor drain and rollback really
-  execute while new acquisitions remain blocked; `SQL_SUCCESS` from disconnect
-  alone does not prove its best-effort cleanup ran.
-- **APD before IPD**: always acquire these two descriptor locks in that order.
-  `bind_param_records`, input/output parameter snapshots (`snapshot_params`,
-  including `ParameterBindingKey` construction), and
-  `sql_free_stmt_reset_params_safe` all hold them simultaneously.
-  `BoundParam::all_from_descriptor_states` takes no locks itself; its callers
-  must preserve this order when obtaining the states it reads.
+  Every entry point that both validates STMT state and writes to a
+  descriptor (`SQLBindCol`, `SQLBindParameter`, `SQLFetchScroll`,
+  `SQLFreeStmt(SQL_UNBIND | SQL_RESET_PARAMS)`, execute's parameter
+  snapshot) follows the same two-phase shape: lock STMT, validate and
+  resolve the target descriptor handle (`effective_ard`/`effective_apd`),
+  drop the STMT lock, *then* lock the descriptor. A descriptor pointer
+  resolved this way can be freed by a concurrent `SQLFreeHandle` before it
+  is dereferenced. Existing `handles::live_type` rechecks narrow that window,
+  but are not a complete lifetime guarantee. Establish the supported concurrent
+  call sequence before treating [#441](https://github.com/microsoft/mssql-rs/issues/441)
+  as a requirement for a broader ownership redesign.
+- **APD before IPD**: `SQLBindParameter`'s `bind_param_records` is the only
+  place in this crate that holds two DESC locks at once (writing a
+  parameter's APD and IPD records together). It locks APD before IPD, and
+  that must stay the only order used anywhere both are locked together —
+  `BoundParam::all_from_descriptor_states` (used by
+  `snapshot_bound_params`) only ever reads them, never locks both
+  simultaneously, so it does not need to follow this rule itself.
 - **`debug_assert!` for DM invariants**: The free path uses `debug_assert!` to
   verify the DM upheld its guarantees (e.g., no outstanding children). These
   fire in debug builds only — in release builds the driver trusts the DM and
   frees unconditionally, matching msodbcsql.
-- Fetch, `SQLGetData`, public cursor close, and result advancement share RAII-managed
-  `row_binding_use`; keep every
-  buffer-affecting path on the shared lease protocol, including no-data
-  status/count writes. Parameter leases follow actual pointer use, not the
-  entire lifetime of a cursor or copied DAE token.
-- Input snapshots reject active row/result use. Output snapshots run beneath
-  their caller's result-operation or execution admission and do not reacquire
-  that permission; avoid making result advancement reject its own snapshot.
-- Descriptor storage and its revision are private. Read through `records` or
-  `record`; mutate only through `record_mut` and `set_record_count`.
-  Their revisions, together with retained APD/IPD identity markers, are checked before
-  prepared execution so setters and shared-descriptor reassociation cannot
-  leave a stale server declaration cached. A saturated revision disables reuse
-  rather than wrapping. Tests must materialize a server handle to exercise
-  invalidation; `SQLPrepare` alone is deferred and has no server handle yet.
-- Cached IPD refinement uses the same DBC gate and descriptor-use check before
-  growth or metadata changes. Read-only cache hits do not mutate revisions or
-  require an idle descriptor.
-- Do not use a test-only state flag as a proxy for production lease admission.
-  Guard tests should hold the real lease; isolate row-use checks from descriptor
-  leases so a redundant guard cannot make a mutation test pass.
+- **Descriptor mutation during fetch**: the different admission checks in
+  `SQLBindCol`/`SQLFreeStmt`/`SQLSetStmtAttr` and the direct descriptor setters
+  are tracked in [#472](https://github.com/microsoft/mssql-rs/issues/472).
+  Do not justify a new buffer-use protocol by an application freeing storage
+  that an outstanding fetch still needs. Establish the supported concurrency
+  and completion guarantees first; preserve existing guards meanwhile.
 
 ## FFI boundary conventions
 
@@ -682,11 +632,12 @@ Driver Manager (DM) provides serialization guarantees that the driver relies on
       crate::ffi_entry!("SQLXxx", unsafe { sql_xxx_impl(/* raw args */) })
   }
 
-  // Thin unsafe shim: owned handle acquisition, then delegate.
+  // Thin unsafe shim: raw pointers -> validated references, then delegate.
   unsafe fn sql_xxx_impl(/* raw args */) -> SqlReturn {
       if handle.is_null() { return SQL_INVALID_HANDLE; }
-      let h = get_handle!(XxxHandle, handle);
-      sql_xxx_safe(&h, /* scalar/decoded args */)
+      let h = unsafe { handle_from_raw::<XxxHandle>(handle) };
+      debug_assert_eq!(h.object_type, HandleType::Xxx);
+      sql_xxx_safe(h, /* scalar/decoded args */)
   }
 
   // Safe core: all business logic; only small unsafe out-pointer writes.
@@ -741,9 +692,9 @@ Driver Manager (DM) provides serialization guarantees that the driver relies on
   raw `i16` / `*mut c_void` in business logic.
 - Avoid `as` casts for numeric conversions — use `TryFrom` / `TryInto` and
   handle the error. `as` silently truncates.
-- Handle encoding and typed acquisition go through `crate::handles`.
-  Never cast a `SqlHandle` to an object pointer. Application-buffer casts
-  are a separate FFI concern and still require their own validation.
+- Pointer casts between handle types must go through the well-defined
+  conversion functions in `crate::handles`: `handle_to_raw`,
+  `handle_from_raw`, `handle_from_raw_mut`, `free_handle`.
 
 ## Testing
 
@@ -758,11 +709,6 @@ Driver Manager (DM) provides serialization guarantees that the driver relies on
     `sql_free_handle` calls risk double-frees.
   - If you need a handle shape the constructors don't cover, extend
     `TestHandles` rather than open-coding allocation in the test.
-- State-inspection helpers in tests can use
-  `handle_from_raw::<T>(raw).unwrap().into_arc()` without claiming an executing
-  API. Retain the counted `HandleRef` when testing active-call admission.
-  Bind the owner to a local before keeping a mutex guard; audit multiline
-  `.into_arc().inner.lock()` chains as well as single-line expressions.
 - End-to-end tests that exercise the loadable `.so`/`.dll` through a real
   Driver Manager live in `tests/e2e/` as a CMake-built C++ suite (run via
   `tests/e2e/run_e2e.sh` / `.ps1`).

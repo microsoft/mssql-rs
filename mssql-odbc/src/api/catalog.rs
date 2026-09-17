@@ -81,7 +81,7 @@ use crate::error::free_errors;
 use crate::handles::stmt::{
     STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT, STMT_STATE_EXEC_STARTED, STMT_STATE_PREPARED,
 };
-use crate::handles::{HandleType, OdbcVersion, StmtHandle, get_handle};
+use crate::handles::{HandleType, OdbcVersion, StmtHandle, handle_from_raw};
 
 /// Maximum SQL Server identifier length (`SYSNAMELEN` in msodbcsql
 /// `sqlcdd.cpp`). Declared length for every catalog/schema/table/column
@@ -536,10 +536,6 @@ fn run_catalog(
             return SQL_ERROR;
         };
         free_errors(&mut stmt_state);
-        if stmt.row_binding_use.is_active() {
-            post_diag(&mut stmt_state, crate::api::sqlstate::ERR_FUNCTION_SEQUENCE);
-            return SQL_ERROR;
-        }
         if stmt_state.has_state(STMT_STATE_EXEC_STARTED | STMT_STATE_CURSOR_OPEN) {
             error!("{name}: statement has an active execute or open cursor");
             post_diag(&mut stmt_state, ERR_INVALID_CURSOR_STATE);
@@ -796,7 +792,7 @@ unsafe fn sql_tables_w_impl(
         error!("SQLTablesW: statement_handle is null");
         return SQL_INVALID_HANDLE;
     }
-    let stmt = get_handle!(StmtHandle, statement_handle);
+    let stmt = unsafe { handle_from_raw::<StmtHandle>(statement_handle) };
     debug_assert_eq!(
         stmt.object_type,
         HandleType::Stmt,
@@ -808,7 +804,7 @@ unsafe fn sql_tables_w_impl(
     let table = unsafe { opt_arg(table_name, name_length_3) };
     let table_type = unsafe { opt_arg(table_type, name_length_4) };
 
-    sql_tables_w_safe(statement_handle, &stmt, catalog, schema, table, table_type)
+    sql_tables_w_safe(statement_handle, stmt, catalog, schema, table, table_type)
 }
 
 fn sql_tables_w_safe(
@@ -945,7 +941,7 @@ unsafe fn sql_columns_w_impl(
         error!("SQLColumnsW: statement_handle is null");
         return SQL_INVALID_HANDLE;
     }
-    let stmt = get_handle!(StmtHandle, statement_handle);
+    let stmt = unsafe { handle_from_raw::<StmtHandle>(statement_handle) };
     debug_assert_eq!(
         stmt.object_type,
         HandleType::Stmt,
@@ -957,7 +953,7 @@ unsafe fn sql_columns_w_impl(
     let table = unsafe { opt_arg(table_name, name_length_3) };
     let column = unsafe { opt_arg(column_name, name_length_4) };
 
-    sql_columns_w_safe(statement_handle, &stmt, catalog, schema, table, column)
+    sql_columns_w_safe(statement_handle, stmt, catalog, schema, table, column)
 }
 
 fn sql_columns_w_safe(
@@ -1092,7 +1088,7 @@ unsafe fn sql_primary_keys_w_impl(
         error!("SQLPrimaryKeysW: statement_handle is null");
         return SQL_INVALID_HANDLE;
     }
-    let stmt = get_handle!(StmtHandle, statement_handle);
+    let stmt = unsafe { handle_from_raw::<StmtHandle>(statement_handle) };
     debug_assert_eq!(
         stmt.object_type,
         HandleType::Stmt,
@@ -1103,7 +1099,7 @@ unsafe fn sql_primary_keys_w_impl(
     let schema = unsafe { opt_arg(schema_name, name_length_2) };
     let table = unsafe { opt_arg(table_name, name_length_3) };
 
-    sql_primary_keys_w_safe(statement_handle, &stmt, catalog, schema, table)
+    sql_primary_keys_w_safe(statement_handle, stmt, catalog, schema, table)
 }
 
 fn sql_primary_keys_w_safe(
@@ -1240,7 +1236,7 @@ unsafe fn sql_foreign_keys_w_impl(
         error!("SQLForeignKeysW: statement_handle is null");
         return SQL_INVALID_HANDLE;
     }
-    let stmt = get_handle!(StmtHandle, statement_handle);
+    let stmt = unsafe { handle_from_raw::<StmtHandle>(statement_handle) };
     debug_assert_eq!(
         stmt.object_type,
         HandleType::Stmt,
@@ -1256,7 +1252,7 @@ unsafe fn sql_foreign_keys_w_impl(
 
     sql_foreign_keys_w_safe(
         statement_handle,
-        &stmt,
+        stmt,
         pk_catalog,
         pk_schema,
         pk_table,
@@ -1436,7 +1432,7 @@ unsafe fn sql_statistics_w_impl(
         error!("SQLStatisticsW: statement_handle is null");
         return SQL_INVALID_HANDLE;
     }
-    let stmt = get_handle!(StmtHandle, statement_handle);
+    let stmt = unsafe { handle_from_raw::<StmtHandle>(statement_handle) };
     debug_assert_eq!(
         stmt.object_type,
         HandleType::Stmt,
@@ -1449,7 +1445,7 @@ unsafe fn sql_statistics_w_impl(
 
     sql_statistics_w_safe(
         statement_handle,
-        &stmt,
+        stmt,
         catalog,
         schema,
         table,
@@ -1607,7 +1603,7 @@ unsafe fn sql_special_columns_w_impl(
         error!("SQLSpecialColumnsW: statement_handle is null");
         return SQL_INVALID_HANDLE;
     }
-    let stmt = get_handle!(StmtHandle, statement_handle);
+    let stmt = unsafe { handle_from_raw::<StmtHandle>(statement_handle) };
     debug_assert_eq!(
         stmt.object_type,
         HandleType::Stmt,
@@ -1620,7 +1616,7 @@ unsafe fn sql_special_columns_w_impl(
 
     sql_special_columns_w_safe(
         statement_handle,
-        &stmt,
+        stmt,
         identifier_type,
         catalog,
         schema,
@@ -1793,7 +1789,7 @@ unsafe fn sql_procedures_w_impl(
         error!("SQLProceduresW: statement_handle is null");
         return SQL_INVALID_HANDLE;
     }
-    let stmt = get_handle!(StmtHandle, statement_handle);
+    let stmt = unsafe { handle_from_raw::<StmtHandle>(statement_handle) };
     debug_assert_eq!(
         stmt.object_type,
         HandleType::Stmt,
@@ -1804,7 +1800,7 @@ unsafe fn sql_procedures_w_impl(
     let schema = unsafe { opt_arg(schema_name, name_length_2) };
     let proc = unsafe { opt_arg(proc_name, name_length_3) };
 
-    sql_procedures_w_safe(statement_handle, &stmt, catalog, schema, proc)
+    sql_procedures_w_safe(statement_handle, stmt, catalog, schema, proc)
 }
 
 fn sql_procedures_w_safe(
@@ -1865,7 +1861,6 @@ fn sql_procedures_w_safe(
 mod tests {
     use super::*;
     use crate::api::odbc_types::SQL_NULL_HANDLE;
-    use crate::handles::handle_from_raw;
     use crate::test_support::TestHandles;
 
     fn w(s: &str) -> Vec<u16> {
@@ -1927,8 +1922,7 @@ mod tests {
         const BOUND: Duration = Duration::from_secs(5);
 
         let h = TestHandles::with_env_dbc_stmt();
-        let dbc_owner = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
-        let dbc = &*dbc_owner;
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         let mock_server =
             crate::test_support::connect_mock_server(dbc, "SELECT 1", QueryResponse::select_one());
         mock_server.set_tm_begin_delay(BEGIN_DELAY);
@@ -1937,8 +1931,7 @@ mod tests {
         // returning immediately.
         dbc.inner.lock().unwrap().autocommit = false;
 
-        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
-        let stmt = &*stmt_owner;
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         stmt.inner.lock().unwrap().query_timeout = STMT_TIMEOUT_SECS;
 
         let started = Instant::now();
@@ -1984,14 +1977,12 @@ mod tests {
         const BOUND: Duration = Duration::from_secs(5);
 
         let h = TestHandles::with_env_dbc_stmt();
-        let dbc_owner = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
-        let dbc = &*dbc_owner;
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         let mock_server =
             crate::test_support::connect_mock_server(dbc, "SELECT 1", QueryResponse::select_one());
         mock_server.set_rpc_delay(RESPONSE_DELAY);
 
-        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
-        let stmt = &*stmt_owner;
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         crate::test_support::arm_pending_unprepare(dbc, stmt);
         stmt.inner.lock().unwrap().query_timeout = STMT_TIMEOUT_SECS;
 
@@ -2070,8 +2061,7 @@ mod tests {
         const CATALOG: &str = "ZZQUALIFIEDZZ";
 
         let h = TestHandles::with_env_dbc_stmt();
-        let dbc_owner = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
-        let dbc = &*dbc_owner;
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         // Answers the qualified `[ZZQUALIFIEDZZ].sys.sp_tables` call only.
         let mock_server = crate::test_support::connect_mock_server(
             dbc,
@@ -2087,8 +2077,7 @@ mod tests {
         // ever sent — is unmatched, and only delayed.
         mock_server.set_rpc_delay(WIRE_DELAY);
 
-        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
-        let stmt = &*stmt_owner;
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         crate::test_support::arm_pending_unprepare(dbc, stmt);
         stmt.inner.lock().unwrap().query_timeout = STMT_TIMEOUT_SECS;
 
@@ -2139,14 +2128,12 @@ mod tests {
         const BOUND: Duration = Duration::from_secs(5);
 
         let h = TestHandles::with_env_dbc_stmt();
-        let dbc_owner = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
-        let dbc = &*dbc_owner;
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         let mock_server =
             crate::test_support::connect_mock_server(dbc, "SELECT 1", QueryResponse::select_one());
         mock_server.set_rpc_delay(RESPONSE_DELAY);
 
-        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
-        let stmt = &*stmt_owner;
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         stmt.inner.lock().unwrap().query_timeout = STMT_TIMEOUT_SECS;
 
         let started = Instant::now();
@@ -2172,7 +2159,7 @@ mod tests {
     #[test]
     fn apply_catalog_metadata_poisoned_mutex_returns_error() {
         let h = TestHandles::with_env_dbc_stmt();
-        let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
 
         // Poison the stmt mutex by panicking while it is held.
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -2183,7 +2170,7 @@ mod tests {
         // A poisoned mutex must fail loudly, not silently report success with
         // stale column metadata (raw stored-procedure names, still-nullable
         // flags) a conforming ODBC 3.x application would fail to bind by name.
-        assert_eq!(apply_catalog_metadata(&stmt, &[], &[]), Err(SQL_ERROR));
+        assert_eq!(apply_catalog_metadata(stmt, &[], &[]), Err(SQL_ERROR));
     }
 
     #[test]
@@ -2201,14 +2188,14 @@ mod tests {
         assert_eq!(unescape_search_pattern(&raw).chars().count(), 128);
 
         let h = TestHandles::with_env_dbc_stmt();
-        let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let arg = Some(raw);
-        assert_eq!(check_arg_length(&stmt, &arg, SYSNAME_LEN, true), Ok(()));
+        assert_eq!(check_arg_length(stmt, &arg, SYSNAME_LEN, true), Ok(()));
         // The same raw value measured WITHOUT unescaping (as a non-pattern
         // argument, e.g. `TableType`) is correctly rejected: at 129 raw
         // characters it exceeds the 128 limit and there is no escape
         // convention to strip.
-        assert!(check_arg_length(&stmt, &arg, SYSNAME_LEN, false).is_err());
+        assert!(check_arg_length(stmt, &arg, SYSNAME_LEN, false).is_err());
     }
 
     #[test]
@@ -2219,9 +2206,9 @@ mod tests {
         assert_eq!(unescape_search_pattern(&raw).chars().count(), 129);
 
         let h = TestHandles::with_env_dbc_stmt();
-        let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let arg = Some(raw);
-        assert!(check_arg_length(&stmt, &arg, SYSNAME_LEN, true).is_err());
+        assert!(check_arg_length(stmt, &arg, SYSNAME_LEN, true).is_err());
     }
 
     #[test]
@@ -2635,7 +2622,7 @@ mod tests {
         // one test per entry point prevents the gap the single-function
         // version of this test used to leave for the other six.
         let h = TestHandles::with_env_dbc_stmt();
-        let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         stmt.inner.lock().unwrap().set_state(STMT_STATE_CURSOR_OPEN);
 
         let calls: [NamedCall; 7] = [

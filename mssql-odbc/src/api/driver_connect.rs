@@ -20,7 +20,7 @@ use crate::api::util::{copy_with_nul, write_if_some};
 use crate::error::{free_errors, post_sql_error};
 use crate::handles::DbcHandle;
 use crate::handles::dbc::{ConnectionIdentity, ConnectionState, DbcState, VendorConnOverrides};
-use crate::handles::{HandleType, get_handle};
+use crate::handles::{HandleType, handle_from_raw};
 
 use mssql_tds::connection::client_context::{ClientContext, IPAddressPreference};
 use mssql_tds::connection_provider::tds_connection_provider::TdsConnectionProvider;
@@ -99,7 +99,7 @@ unsafe fn sql_driver_connect_w_impl(
         return SQL_INVALID_HANDLE;
     }
 
-    let dbc = get_handle!(DbcHandle, connection_handle);
+    let dbc = unsafe { handle_from_raw::<DbcHandle>(connection_handle) };
     debug_assert_eq!(
         dbc.object_type,
         HandleType::Dbc,
@@ -121,7 +121,7 @@ unsafe fn sql_driver_connect_w_impl(
     };
 
     sql_driver_connect_w_safe(
-        &dbc,
+        dbc,
         conn_str,
         out_connection_string,
         buffer_length,
@@ -595,7 +595,6 @@ mod tests {
     use crate::api::odbc_types::{
         SQL_DRIVER_COMPLETE, SQL_HANDLE_DBC, SQL_INVALID_HANDLE, SQL_NTS, SQL_NULL_HANDLE,
     };
-    use crate::handles::handle_from_raw;
     use crate::test_support::{TestHandles, cs};
 
     #[test]
@@ -910,7 +909,7 @@ mod tests {
             };
             assert_eq!(ret, SQL_ERROR, "attempt with Encrypt={encrypt}");
 
-            let dbc = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
+            let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
             let state = dbc.inner.lock().unwrap();
             assert_eq!(state.connection_state, ConnectionState::Disconnected);
             assert_eq!(state.vendor_overrides, VendorConnOverrides::default());
@@ -1275,8 +1274,7 @@ mod tests {
             "connect failed: {ret}"
         );
 
-        let dbc_owner = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
-        let dbc = &*dbc_owner;
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         let negotiated = dbc
             .inner
             .lock()
@@ -1454,8 +1452,7 @@ mod tests {
         };
         assert_eq!(ret, SQL_ERROR, "connect to an unused port must fail");
 
-        let dbc_owner = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
-        let dbc = &*dbc_owner;
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         assert_eq!(
             dbc.inner.lock().unwrap().connection_state,
             ConnectionState::Disconnected

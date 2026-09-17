@@ -23,7 +23,7 @@ use crate::api::odbc_types::{
     SQL_INVALID_HANDLE, SQL_SUCCESS, SQL_TRUE, SqlHandle, SqlReturn, SqlUSmallInt,
 };
 use crate::error::free_errors;
-use crate::handles::{DbcHandle, HandleType, get_handle};
+use crate::handles::{DbcHandle, HandleType, handle_from_raw};
 
 /// Returns function-support metadata for a connection handle.
 ///
@@ -66,13 +66,13 @@ unsafe fn sql_get_functions_impl(
         return SQL_INVALID_HANDLE;
     }
 
-    let dbc = get_handle!(DbcHandle, connection_handle);
+    let dbc = unsafe { handle_from_raw::<DbcHandle>(connection_handle) };
     debug_assert_eq!(
         dbc.object_type,
         HandleType::Dbc,
         "SQLGetFunctions: handle is not a DBC"
     );
-    sql_get_functions_safe(&dbc, function_id, supported_ptr)
+    sql_get_functions_safe(dbc, function_id, supported_ptr)
 }
 
 fn sql_get_functions_safe(

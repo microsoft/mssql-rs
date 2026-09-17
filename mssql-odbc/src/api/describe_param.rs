@@ -27,9 +27,7 @@ use super::util::write_if_some;
 use crate::api::type_rules::parameter_size_is_precision;
 use crate::error::{free_errors, post_sql_error};
 use crate::handles::stmt::{ParameterDescription, STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_STARTED};
-use crate::handles::{
-    DescHandle, HandleType, OdbcVersion, StmtHandle, get_handle, handle_from_raw,
-};
+use crate::handles::{DescHandle, HandleType, OdbcVersion, StmtHandle, handle_from_raw};
 
 use super::set_desc_field::datetime_interval_code_for;
 
@@ -106,7 +104,7 @@ unsafe fn sql_describe_param_impl(
         return SQL_INVALID_HANDLE;
     }
 
-    let stmt = get_handle!(StmtHandle, statement_handle);
+    let stmt = unsafe { handle_from_raw::<StmtHandle>(statement_handle) };
     debug_assert_eq!(
         stmt.object_type,
         HandleType::Stmt,
@@ -115,7 +113,7 @@ unsafe fn sql_describe_param_impl(
 
     sql_describe_param_safe(
         statement_handle,
-        &stmt,
+        stmt,
         parameter_number,
         data_type_ptr,
         parameter_size_ptr,
@@ -182,9 +180,7 @@ fn sql_describe_param_safe(
             // up one that was unbound (or never bound) since the last call.
             let cached = stmt_state.parameter_metadata.clone();
             drop(stmt_state);
-            if let Err(rc) = refine_ipd(stmt, &cached) {
-                return rc;
-            }
+            refine_ipd(stmt, &cached);
             write_description(
                 description,
                 data_type_ptr,
@@ -195,9 +191,7 @@ fn sql_describe_param_safe(
             return SQL_SUCCESS;
         }
 
-        if stmt_state.has_state(STMT_STATE_EXEC_STARTED | STMT_STATE_CURSOR_OPEN)
-            || stmt.row_binding_use.is_active()
-        {
+        if stmt_state.has_state(STMT_STATE_EXEC_STARTED | STMT_STATE_CURSOR_OPEN) {
             post_diag(&mut stmt_state, ERR_FUNCTION_SEQUENCE);
             return SQL_ERROR;
         }
@@ -355,9 +349,7 @@ fn sql_describe_param_safe(
     // Dropped before refine_ipd locks the IPD: this crate never holds a
     // STMT lock while acquiring a DESC lock (see bind_col.rs's rationale).
     drop(stmt_state);
-    if let Err(rc) = refine_ipd(stmt, &descriptions) {
-        return rc;
-    }
+    refine_ipd(stmt, &descriptions);
     write_description(
         description,
         data_type_ptr,
@@ -399,76 +391,47 @@ fn sql_describe_param_safe(
 /// `SQLBindParameter` (or the record's un-bound default) set them.
 ///
 /// Call only after the STMT lock has been dropped (see `bind_col.rs`'s
-/// locking-order rationale). An inaccessible IPD fails the call rather than
-/// leaving descriptor metadata inconsistent with the returned description.
-fn refine_ipd(stmt: &StmtHandle, descriptions: &[ParameterDescription]) -> Result<(), SqlReturn> {
-    use crate::handles::bindings::BindingError;
-
-    let result = (|| {
-        let gate = stmt
-            .parent_dbc()
-            .inner
-            .lock()
-            .map_err(|_| BindingError::Poisoned)?;
-        let desc = handle_from_raw::<DescHandle>(stmt.ipd).map_err(BindingError::Registry)?;
-        let mut state = desc.inner.lock().map_err(|_| BindingError::Poisoned)?;
-        let needs_change = descriptions.iter().enumerate().any(|(i, description)| {
-            let number = SqlSmallInt::try_from(i + 1).unwrap_or(SqlSmallInt::MAX);
-            !ipd_matches_description(state.record(number), description)
-        });
-        if !needs_change {
-            return Ok(());
+/// locking-order rationale). A poisoned IPD mutex is logged and otherwise
+/// ignored: `SQLDescribeParam`'s own answer, already written from the
+/// in-memory `descriptions`, does not depend on this refinement succeeding.
+fn refine_ipd(stmt: &StmtHandle, descriptions: &[ParameterDescription]) {
+    let desc = unsafe { handle_from_raw::<DescHandle>(stmt.ipd) };
+    let Ok(mut desc_state) = desc.inner.lock() else {
+        error!("SQLDescribeParam: ipd mutex poisoned; parameter metadata left unrefined");
+        return;
+    };
+    let target_count = desc_state.records.len().max(descriptions.len());
+    desc_state.set_record_count(target_count, desc.kind);
+    for (i, description) in descriptions.iter().enumerate() {
+        let record_number = SqlSmallInt::try_from(i + 1).unwrap_or(SqlSmallInt::MAX);
+        let Some(record) = desc_state.record_mut(record_number) else {
+            continue;
+        };
+        if record.explicitly_bound {
+            // Bound by SQLBindParameter or SQLSetDescField/SQLSetDescRec —
+            // informational metadata must not override an application's
+            // explicit choice.
+            continue;
         }
-        desc.binding_use.ensure_idle(&gate)?;
-        let count = state.records().len().max(descriptions.len());
-        state.set_record_count(count, desc.kind);
-        for (i, description) in descriptions.iter().enumerate() {
-            let number = SqlSmallInt::try_from(i + 1).unwrap_or(SqlSmallInt::MAX);
-            if ipd_matches_description(state.record(number), description) {
-                continue;
-            }
-            let record = state
-                .record_mut(number)
-                .ok_or(BindingError::InvalidRecord)?;
-            record.concise_type = description.data_type;
-            record.datetime_interval_code = datetime_interval_code_for(description.data_type);
-            record.scale = description.decimal_digits;
-            record.nullable = description.nullable;
-            (record.precision, record.length) = ipd_precision_length(description);
+        record.concise_type = description.data_type;
+        record.datetime_interval_code = datetime_interval_code_for(description.data_type);
+        record.scale = description.decimal_digits;
+        record.nullable = description.nullable;
+        if parameter_size_is_precision(description.data_type) {
+            record.precision =
+                SqlSmallInt::try_from(description.parameter_size).unwrap_or(SqlSmallInt::MAX);
+            record.length = 0;
+        } else if record.datetime_interval_code != 0 {
+            // Per ODBC's "Decimal Digits" appendix ("All datetime types" ->
+            // PRECISION): see `BoundParam::write_to_records`'s identical fix
+            // for the same split.
+            record.precision = description.decimal_digits;
+            record.length = description.parameter_size;
+        } else {
+            record.length = description.parameter_size;
+            record.precision = 0;
         }
-        Ok::<_, BindingError>(())
-    })();
-    result.map_err(|error| {
-        crate::error::diag::with_diagnostics(&stmt.inner, |records| error.post(records))
-    })
-}
-
-fn ipd_precision_length(description: &ParameterDescription) -> (SqlSmallInt, SqlULen) {
-    if parameter_size_is_precision(description.data_type) {
-        (
-            SqlSmallInt::try_from(description.parameter_size).unwrap_or(SqlSmallInt::MAX),
-            0,
-        )
-    } else if datetime_interval_code_for(description.data_type) != 0 {
-        (description.decimal_digits, description.parameter_size)
-    } else {
-        (0, description.parameter_size)
     }
-}
-
-fn ipd_matches_description(
-    record: Option<&crate::handles::desc::DescRecord>,
-    description: &ParameterDescription,
-) -> bool {
-    record.is_some_and(|record| {
-        record.explicitly_bound
-            || (record.concise_type == description.data_type
-                && record.datetime_interval_code
-                    == datetime_interval_code_for(description.data_type)
-                && record.scale == description.decimal_digits
-                && record.nullable == description.nullable
-                && (record.precision, record.length) == ipd_precision_length(description))
-    })
 }
 
 fn fail_metadata_response(
@@ -837,67 +800,6 @@ impl DescriptionCollector {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn cached_description_only_mutates_an_idle_ipd() {
-        use crate::handles::bindings::BindingLease;
-        let h = crate::test_support::TestHandles::with_env_dbc_stmt();
-        h.mark_dbc_connected();
-        let sql: Vec<u16> = "SELECT ?".encode_utf16().collect();
-        assert_eq!(
-            unsafe { crate::api::SQLPrepareW(h.stmt, sql.as_ptr(), sql.len().try_into().unwrap()) },
-            SQL_SUCCESS
-        );
-        let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
-        let ipd = handle_from_raw::<DescHandle>(h.ipd()).unwrap().into_arc();
-        {
-            let mut state = stmt.inner.lock().unwrap();
-            state.parameter_metadata = vec![ParameterDescription {
-                data_type: crate::api::odbc_types::SQL_INTEGER,
-                parameter_size: 10,
-                decimal_digits: 0,
-                nullable: crate::api::odbc_types::SQL_NULLABLE,
-            }];
-            state.set_state(STMT_STATE_CURSOR_OPEN);
-        }
-        let lease = {
-            let gate = stmt.parent_dbc().inner.lock().unwrap();
-            BindingLease::acquire(&ipd, &gate).unwrap()
-        };
-        let mut data_type = -1;
-        let describe = |data_type: &mut SqlSmallInt| unsafe {
-            sql_describe_param(
-                h.stmt,
-                1,
-                data_type,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            )
-        };
-        assert_eq!(describe(&mut data_type), SQL_ERROR);
-        assert_eq!(data_type, -1);
-        assert_eq!(
-            stmt.inner.lock().unwrap().diag_records[0].sql_state,
-            *b"HY010"
-        );
-        assert!(ipd.inner.lock().unwrap().records().is_empty());
-        drop(lease);
-        assert_eq!(describe(&mut data_type), SQL_SUCCESS);
-        assert_eq!(data_type, crate::api::odbc_types::SQL_INTEGER);
-        let revision = ipd.inner.lock().unwrap().binding_revision();
-        let _lease = {
-            let gate = stmt.parent_dbc().inner.lock().unwrap();
-            BindingLease::acquire(&ipd, &gate).unwrap()
-        };
-        assert_eq!(describe(&mut data_type), SQL_SUCCESS);
-        assert_eq!(ipd.inner.lock().unwrap().binding_revision(), revision);
-        stmt.inner
-            .lock()
-            .unwrap()
-            .clear_state(STMT_STATE_CURSOR_OPEN);
-    }
-    use crate::handles::handle_from_raw;
     use crate::test_support::TestHandles;
     use mssql_tds::connection::tds_client::PreparedStatement;
 
@@ -947,7 +849,7 @@ mod tests {
         };
         assert_eq!(rc, SQL_ERROR);
 
-        let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         assert_eq!(
             stmt.inner.lock().unwrap().diag_records[0].sql_state,
             SQLSTATE_HY010
@@ -978,14 +880,12 @@ mod tests {
         const BOUND: Duration = Duration::from_secs(5);
 
         let h = TestHandles::with_env_dbc_stmt();
-        let dbc_owner = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
-        let dbc = &*dbc_owner;
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         let mock_server =
             crate::test_support::connect_mock_server(dbc, "SELECT 1", QueryResponse::select_one());
         mock_server.set_rpc_delay(RESPONSE_DELAY);
 
-        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
-        let stmt = &*stmt_owner;
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         {
             let mut state = stmt.inner.lock().unwrap();
             state.prepared = Some(crate::handles::stmt::PreparedPlan {
@@ -1038,15 +938,13 @@ mod tests {
         const BOUND: Duration = Duration::from_secs(5);
 
         let h = TestHandles::with_env_dbc_stmt();
-        let dbc_owner = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
-        let dbc = &*dbc_owner;
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         let mock_server =
             crate::test_support::connect_mock_server(dbc, "SELECT 1", QueryResponse::select_one());
         mock_server.set_tm_begin_delay(BEGIN_DELAY);
         dbc.inner.lock().unwrap().autocommit = false;
 
-        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
-        let stmt = &*stmt_owner;
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         {
             let mut state = stmt.inner.lock().unwrap();
             state.prepared = Some(crate::handles::stmt::PreparedPlan {
@@ -1103,14 +1001,12 @@ mod tests {
         const BOUND: Duration = Duration::from_secs(5);
 
         let h = TestHandles::with_env_dbc_stmt();
-        let dbc_owner = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
-        let dbc = &*dbc_owner;
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         let mock_server =
             crate::test_support::connect_mock_server(dbc, "SELECT 1", QueryResponse::select_one());
         mock_server.set_rpc_delay(RESPONSE_DELAY);
 
-        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
-        let stmt = &*stmt_owner;
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         crate::test_support::arm_pending_unprepare(dbc, stmt);
         {
             let mut state = stmt.inner.lock().unwrap();
@@ -1163,7 +1059,7 @@ mod tests {
     #[test]
     fn invalid_ordinal_returns_07009_without_io() {
         let h = TestHandles::with_env_dbc_stmt();
-        let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         {
             let mut state = stmt.inner.lock().unwrap();
             state.prepared = Some(crate::handles::stmt::PreparedPlan {
@@ -1193,7 +1089,7 @@ mod tests {
     #[test]
     fn cached_description_allows_null_output_pointers() {
         let h = TestHandles::with_env_dbc_stmt();
-        let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         {
             let mut state = stmt.inner.lock().unwrap();
             state.prepared = Some(crate::handles::stmt::PreparedPlan {
@@ -1238,7 +1134,7 @@ mod tests {
 
         let h = TestHandles::with_env_dbc_stmt();
         h.mark_dbc_connected();
-        let dbc = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         let client = tds_client_from_tokens(vec![
             info(50000, 0, "a server message"),
             col_metadata_empty(),
@@ -1249,7 +1145,7 @@ mod tests {
             ds.client = Some(client);
         }
 
-        let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         {
             let mut state = stmt.inner.lock().unwrap();
             state.prepared = Some(crate::handles::stmt::PreparedPlan {
@@ -1437,8 +1333,8 @@ mod tests {
     }
 
     fn ipd_records(h: &TestHandles) -> Vec<crate::handles::desc::DescRecord> {
-        let desc = handle_from_raw::<DescHandle>(h.ipd()).unwrap().into_arc();
-        desc.inner.lock().unwrap().records().to_vec()
+        let desc = unsafe { handle_from_raw::<DescHandle>(h.ipd()) };
+        desc.inner.lock().unwrap().records.clone()
     }
 
     fn param_description(
@@ -1456,30 +1352,11 @@ mod tests {
     }
 
     #[test]
-    fn refine_ipd_reports_a_poisoned_descriptor() {
-        let h = TestHandles::with_env_dbc_stmt();
-        let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
-        let ipd = handle_from_raw::<DescHandle>(h.ipd()).unwrap().into_arc();
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = ipd.inner.lock().unwrap();
-            panic!("poison the ipd lock");
-        }));
-
-        assert_eq!(
-            refine_ipd(&stmt, &[param_description(SQL_INTEGER, 0, 0, SQL_NULLABLE)]),
-            Err(SQL_ERROR)
-        );
-        let state = stmt.inner.lock().unwrap();
-        assert_eq!(state.diag_records.len(), 1);
-        assert_eq!(state.diag_records[0].sql_state, SQLSTATE_HY000);
-    }
-
-    #[test]
     fn refine_ipd_writes_type_scale_and_nullable() {
         let h = TestHandles::with_env_dbc_stmt();
-        let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let descriptions = vec![param_description(SQL_VARCHAR, 50, 0, SQL_NULLABLE)];
-        refine_ipd(&stmt, &descriptions).unwrap();
+        refine_ipd(stmt, &descriptions);
 
         let records = ipd_records(&h);
         assert_eq!(records.len(), 1);
@@ -1497,12 +1374,12 @@ mod tests {
     #[test]
     fn refine_ipd_splits_precision_and_length_by_type() {
         let h = TestHandles::with_env_dbc_stmt();
-        let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let descriptions = vec![
             param_description(SQL_DECIMAL, 12, 3, SQL_NULLABLE),
             param_description(SQL_VARCHAR, 80, 0, SQL_NO_NULLS),
         ];
-        refine_ipd(&stmt, &descriptions).unwrap();
+        refine_ipd(stmt, &descriptions);
 
         let records = ipd_records(&h);
         assert_eq!(records[0].precision, 12);
@@ -1527,12 +1404,11 @@ mod tests {
     #[test]
     fn refine_ipd_puts_datetime_decimal_digits_in_precision() {
         let h = TestHandles::with_env_dbc_stmt();
-        let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         refine_ipd(
-            &stmt,
+            stmt,
             &[param_description(SQL_TYPE_TIMESTAMP, 27, 7, SQL_NULLABLE)],
-        )
-        .unwrap();
+        );
 
         let record = &ipd_records(&h)[0];
         assert_eq!(
@@ -1549,13 +1425,13 @@ mod tests {
     #[test]
     fn refine_ipd_never_shrinks_an_already_larger_ipd() {
         let h = TestHandles::with_env_dbc_stmt();
-        let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         {
-            let desc = handle_from_raw::<DescHandle>(h.ipd()).unwrap().into_arc();
+            let desc = unsafe { handle_from_raw::<DescHandle>(h.ipd()) };
             let mut state = desc.inner.lock().unwrap();
             state.set_record_count(3, desc.kind);
         }
-        refine_ipd(&stmt, &[param_description(SQL_INTEGER, 0, 0, SQL_NULLABLE)]).unwrap();
+        refine_ipd(stmt, &[param_description(SQL_INTEGER, 0, 0, SQL_NULLABLE)]);
         assert_eq!(
             ipd_records(&h).len(),
             3,
@@ -1568,14 +1444,14 @@ mod tests {
     #[test]
     fn refine_ipd_leaves_parameter_type_untouched() {
         let h = TestHandles::with_env_dbc_stmt();
-        let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         {
-            let desc = handle_from_raw::<DescHandle>(h.ipd()).unwrap().into_arc();
+            let desc = unsafe { handle_from_raw::<DescHandle>(h.ipd()) };
             let mut state = desc.inner.lock().unwrap();
             state.set_record_count(1, desc.kind);
             state.record_mut(1).unwrap().parameter_type = SQL_PARAM_INPUT;
         }
-        refine_ipd(&stmt, &[param_description(SQL_INTEGER, 0, 0, SQL_NULLABLE)]).unwrap();
+        refine_ipd(stmt, &[param_description(SQL_INTEGER, 0, 0, SQL_NULLABLE)]);
         assert_eq!(ipd_records(&h)[0].parameter_type, SQL_PARAM_INPUT);
     }
 
@@ -1588,9 +1464,9 @@ mod tests {
     #[test]
     fn refine_ipd_leaves_an_already_bound_marker_untouched() {
         let h = TestHandles::with_env_dbc_stmt();
-        let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         {
-            let desc = handle_from_raw::<DescHandle>(h.ipd()).unwrap().into_arc();
+            let desc = unsafe { handle_from_raw::<DescHandle>(h.ipd()) };
             let mut state = desc.inner.lock().unwrap();
             state.set_record_count(1, desc.kind);
             let record = state.record_mut(1).unwrap();
@@ -1599,7 +1475,7 @@ mod tests {
             record.scale = 7;
             record.explicitly_bound = true;
         }
-        refine_ipd(&stmt, &[param_description(SQL_INTEGER, 4, 0, SQL_NO_NULLS)]).unwrap();
+        refine_ipd(stmt, &[param_description(SQL_INTEGER, 4, 0, SQL_NO_NULLS)]);
 
         let record = &ipd_records(&h)[0];
         assert_eq!(
@@ -1621,18 +1497,14 @@ mod tests {
     #[test]
     fn refine_ipd_refreshes_a_marker_it_previously_auto_filled_itself() {
         let h = TestHandles::with_env_dbc_stmt();
-        let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
-        refine_ipd(&stmt, &[param_description(SQL_INTEGER, 0, 0, SQL_NULLABLE)]).unwrap();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        refine_ipd(stmt, &[param_description(SQL_INTEGER, 0, 0, SQL_NULLABLE)]);
         assert_eq!(ipd_records(&h)[0].concise_type, SQL_INTEGER);
 
         // Simulates a re-SQLPrepare landing a different query with a
         // differently-typed marker 1, without any application bind ever
         // touching this IPD record in between.
-        refine_ipd(
-            &stmt,
-            &[param_description(SQL_VARCHAR, 80, 0, SQL_NO_NULLS)],
-        )
-        .unwrap();
+        refine_ipd(stmt, &[param_description(SQL_VARCHAR, 80, 0, SQL_NO_NULLS)]);
 
         let record = &ipd_records(&h)[0];
         assert_eq!(

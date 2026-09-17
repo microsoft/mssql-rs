@@ -159,12 +159,3 @@ add_odbc_test(numeric_types_test  tests/numeric_types_test.cpp)
 add_odbc_test(text_money_types_test tests/text_money_types_test.cpp)
 add_odbc_test(fetch_error_semantics_test tests/fetch_error_semantics_test.cpp)
 add_odbc_test(dll_unload_stress_test tests/dll_unload_stress_test.cpp)
-
-# Driver IDs must be tested below the Driver Manager, which owns different handles.
-add_executable(handle_identity_test tests/handle_identity_test.cpp)
-if(ODBC_INCLUDE_DIR)
-    target_include_directories(handle_identity_test PRIVATE ${ODBC_INCLUDE_DIR})
-endif()
-target_link_libraries(handle_identity_test PRIVATE gtest ${CMAKE_DL_LIBS})
-add_test(NAME handle_identity_test COMMAND handle_identity_test)
-set_tests_properties(handle_identity_test PROPERTIES SKIP_RETURN_CODE 77)

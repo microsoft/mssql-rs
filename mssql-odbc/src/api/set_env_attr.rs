@@ -14,7 +14,7 @@ use crate::api::odbc_types::{
     SqlPointer, SqlReturn,
 };
 use crate::error::free_errors;
-use crate::handles::{EnvHandle, HandleType, OdbcVersion, get_handle};
+use crate::handles::{EnvHandle, HandleType, OdbcVersion, handle_from_raw};
 
 /// Sets an attribute on an environment handle.
 ///
@@ -52,14 +52,14 @@ unsafe fn sql_set_env_attr_impl(
         return SQL_INVALID_HANDLE;
     }
 
-    let env = get_handle!(EnvHandle, environment_handle);
+    let env = unsafe { handle_from_raw::<EnvHandle>(environment_handle) };
     debug_assert_eq!(
         env.object_type,
         HandleType::Env,
         "SQLSetEnvAttr: input_handle is not an ENV handle"
     );
 
-    sql_set_env_attr_safe(&env, attribute, value_ptr)
+    sql_set_env_attr_safe(env, attribute, value_ptr)
 }
 
 fn sql_set_env_attr_safe(
@@ -107,7 +107,6 @@ mod tests {
     use crate::api::odbc_types::{
         SQL_HANDLE_ENV, SQL_NULL_HANDLE, SQL_OV_ODBC2, SQL_OV_ODBC3, SQL_OV_ODBC3_80,
     };
-    use crate::handles::handle_from_raw;
 
     fn alloc_env() -> SqlHandle {
         let mut h: SqlHandle = ptr::null_mut();
@@ -129,7 +128,7 @@ mod tests {
         let env = alloc_env();
         let ret = set_attr(env, SQL_ATTR_ODBC_VERSION, SQL_OV_ODBC3_80);
         assert_eq!(ret, SQL_SUCCESS);
-        let env_ref = handle_from_raw::<EnvHandle>(env).unwrap().into_arc();
+        let env_ref = unsafe { &*(env as *const EnvHandle) };
         assert_eq!(
             env_ref.inner.lock().unwrap().odbc_version,
             OdbcVersion::Odbc3_80
@@ -142,7 +141,7 @@ mod tests {
         let env = alloc_env();
         let ret = set_attr(env, SQL_ATTR_ODBC_VERSION, SQL_OV_ODBC3);
         assert_eq!(ret, SQL_SUCCESS);
-        let env_ref = handle_from_raw::<EnvHandle>(env).unwrap().into_arc();
+        let env_ref = unsafe { &*(env as *const EnvHandle) };
         assert_eq!(
             env_ref.inner.lock().unwrap().odbc_version,
             OdbcVersion::Odbc3
@@ -155,7 +154,7 @@ mod tests {
         let env = alloc_env();
         let ret = set_attr(env, SQL_ATTR_ODBC_VERSION, SQL_OV_ODBC2);
         assert_eq!(ret, SQL_SUCCESS);
-        let env_ref = handle_from_raw::<EnvHandle>(env).unwrap().into_arc();
+        let env_ref = unsafe { &*(env as *const EnvHandle) };
         assert_eq!(
             env_ref.inner.lock().unwrap().odbc_version,
             OdbcVersion::Odbc2
@@ -168,7 +167,7 @@ mod tests {
         let env = alloc_env();
         let ret = set_attr(env, SQL_ATTR_ODBC_VERSION, 9999);
         assert_eq!(ret, SQL_ERROR);
-        let env_ref = handle_from_raw::<EnvHandle>(env).unwrap().into_arc();
+        let env_ref = unsafe { &*(env as *const EnvHandle) };
         assert_eq!(
             env_ref.inner.lock().unwrap().odbc_version,
             OdbcVersion::Unset
@@ -210,7 +209,7 @@ mod tests {
             set_attr(env, SQL_ATTR_ODBC_VERSION, SQL_OV_ODBC3_80),
             SQL_SUCCESS
         );
-        let env_ref = handle_from_raw::<EnvHandle>(env).unwrap().into_arc();
+        let env_ref = unsafe { &*(env as *const EnvHandle) };
         assert_eq!(
             env_ref.inner.lock().unwrap().odbc_version,
             OdbcVersion::Odbc3_80
@@ -227,7 +226,7 @@ mod tests {
             SQL_SUCCESS
         );
         assert_eq!(set_attr(env, SQL_ATTR_ODBC_VERSION, 9999), SQL_ERROR);
-        let env_ref = handle_from_raw::<EnvHandle>(env).unwrap().into_arc();
+        let env_ref = unsafe { &*(env as *const EnvHandle) };
         assert_eq!(
             env_ref.inner.lock().unwrap().odbc_version,
             OdbcVersion::Odbc3_80
@@ -249,7 +248,7 @@ mod tests {
             )
         };
         assert_eq!(ret, SQL_SUCCESS);
-        let env_ref = handle_from_raw::<EnvHandle>(env).unwrap().into_arc();
+        let env_ref = unsafe { &*(env as *const EnvHandle) };
         assert_eq!(
             env_ref.inner.lock().unwrap().odbc_version,
             OdbcVersion::Odbc3_80
@@ -261,7 +260,7 @@ mod tests {
     fn invalid_version_posts_hy024_diag() {
         let env = alloc_env();
         assert_eq!(set_attr(env, SQL_ATTR_ODBC_VERSION, 9999), SQL_ERROR);
-        let env_ref = handle_from_raw::<EnvHandle>(env).unwrap().into_arc();
+        let env_ref = unsafe { &*(env as *const EnvHandle) };
         let state = env_ref.inner.lock().unwrap();
         assert_eq!(state.diag_records.len(), 1);
         assert_eq!(&state.diag_records[0].sql_state, b"HY024");
@@ -273,7 +272,7 @@ mod tests {
     fn unknown_attribute_posts_hy092_diag() {
         let env = alloc_env();
         assert_eq!(set_attr(env, 12345, 0), SQL_ERROR);
-        let env_ref = handle_from_raw::<EnvHandle>(env).unwrap().into_arc();
+        let env_ref = unsafe { &*(env as *const EnvHandle) };
         let state = env_ref.inner.lock().unwrap();
         assert_eq!(state.diag_records.len(), 1);
         assert_eq!(&state.diag_records[0].sql_state, b"HY092");
@@ -285,7 +284,7 @@ mod tests {
     fn successful_call_clears_prior_diag_records() {
         let env = alloc_env();
         assert_eq!(set_attr(env, SQL_ATTR_ODBC_VERSION, 9999), SQL_ERROR);
-        let env_ref = handle_from_raw::<EnvHandle>(env).unwrap().into_arc();
+        let env_ref = unsafe { &*(env as *const EnvHandle) };
         assert_eq!(env_ref.inner.lock().unwrap().diag_records.len(), 1);
         assert_eq!(
             set_attr(env, SQL_ATTR_ODBC_VERSION, SQL_OV_ODBC3_80),

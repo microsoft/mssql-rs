@@ -8,50 +8,16 @@ use std::sync::Arc;
 use tracing::{debug, error};
 
 use crate::api::odbc_types::{
-    SQL_DESC_ALLOC_AUTO, SQL_DESC_ALLOC_USER, SQL_ERROR, SQL_HANDLE_DBC, SQL_HANDLE_DESC,
-    SQL_HANDLE_ENV, SQL_HANDLE_STMT, SQL_INVALID_HANDLE, SQL_NULL_HANDLE, SQL_SUCCESS, SqlHandle,
-    SqlReturn, SqlSmallInt,
+    SQL_DESC_ALLOC_USER, SQL_ERROR, SQL_HANDLE_DBC, SQL_HANDLE_DESC, SQL_HANDLE_ENV,
+    SQL_HANDLE_STMT, SQL_INVALID_HANDLE, SQL_NULL_HANDLE, SQL_SUCCESS, SqlHandle, SqlReturn,
+    SqlSmallInt,
 };
-use crate::api::sqlstate::{ERR_MEMORY_ALLOCATION, post_diag};
 use crate::error::free_errors;
 use crate::handles::desc::DescKind;
 use crate::handles::{
-    DbcHandle, DescHandle, EnvHandle, Handle, HandleActivity, HandleType, OdbcVersion,
-    RegistryError, StmtHandle, get_handle, handle_to_raw, retire_handle,
+    DbcHandle, DescHandle, EnvHandle, HandleType, OdbcVersion, StmtHandle, handle_from_raw,
+    handle_to_raw,
 };
-
-struct PendingHandle<T: Handle> {
-    value: Arc<T>,
-    raw: SqlHandle,
-    published: bool,
-}
-
-impl<T: Handle> PendingHandle<T> {
-    fn new(value: T) -> Result<Self, RegistryError> {
-        let value = Arc::new(value);
-        let raw = handle_to_raw(Arc::clone(&value))?;
-        Ok(Self {
-            value,
-            raw,
-            published: false,
-        })
-    }
-
-    fn publish(mut self) -> SqlHandle {
-        self.published = true;
-        self.raw
-    }
-}
-
-impl<T: Handle> Drop for PendingHandle<T> {
-    fn drop(&mut self) {
-        if !self.published
-            && let Err(error) = retire_handle(&*self.value, self.raw)
-        {
-            error!(?error, "Rolling back unpublished ODBC handle failed");
-        }
-    }
-}
 
 /// Implementation of [`SQLAllocHandle`](super::exports::SQLAllocHandle).
 ///
@@ -106,18 +72,12 @@ unsafe fn alloc_env(input_handle: SqlHandle, output_handle: *mut SqlHandle) -> S
     }
 
     let env = match EnvHandle::new() {
-        Ok(e) => e,
+        Ok(e) => Box::new(e),
         Err(_) => {
             return SQL_ERROR;
         }
     };
-    let raw = match PendingHandle::new(env) {
-        Ok(env) => env.publish(),
-        Err(error) => {
-            error!(?error, "SQLAllocHandle(ENV): registration failed");
-            return SQL_ERROR;
-        }
-    };
+    let raw = handle_to_raw(env);
 
     unsafe { output_handle.write(raw) };
 
@@ -143,7 +103,7 @@ unsafe fn alloc_dbc(input_handle: SqlHandle, output_handle: *mut SqlHandle) -> S
     }
 
     // Validate that the parent handle is actually an ENV.
-    let env = get_handle!(EnvHandle, input_handle);
+    let env = unsafe { handle_from_raw::<EnvHandle>(input_handle) };
     debug_assert_eq!(
         env.object_type,
         HandleType::Env,
@@ -163,19 +123,8 @@ unsafe fn alloc_dbc(input_handle: SqlHandle, output_handle: *mut SqlHandle) -> S
         "SQLAllocHandle(DBC): SQL_ATTR_ODBC_VERSION not set on env"
     );
 
-    if env_state.connections.try_reserve(1).is_err() {
-        post_diag(&mut env_state, ERR_MEMORY_ALLOCATION);
-        return SQL_ERROR;
-    }
-    let dbc = match PendingHandle::new(DbcHandle::new(env.clone_arc())) {
-        Ok(dbc) => dbc,
-        Err(error) => {
-            error!(?error, "SQLAllocHandle(DBC): registration failed");
-            error.post(&mut env_state);
-            return SQL_ERROR;
-        }
-    };
-    let raw = dbc.publish();
+    let dbc = Box::new(DbcHandle::new(input_handle, Arc::clone(&env.runtime)));
+    let raw = handle_to_raw(dbc);
     env_state.connections.push(raw);
 
     unsafe { output_handle.write(raw) };
@@ -201,7 +150,7 @@ unsafe fn alloc_stmt(input_handle: SqlHandle, output_handle: *mut SqlHandle) -> 
         return SQL_INVALID_HANDLE;
     }
 
-    let dbc = get_handle!(DbcHandle, input_handle);
+    let dbc = unsafe { handle_from_raw::<DbcHandle>(input_handle) };
     debug_assert_eq!(
         dbc.object_type,
         HandleType::Dbc,
@@ -214,72 +163,8 @@ unsafe fn alloc_stmt(input_handle: SqlHandle, output_handle: *mut SqlHandle) -> 
     };
     free_errors(&mut dbc_state);
 
-    if dbc_state.statements.try_reserve(1).is_err() {
-        post_diag(&mut dbc_state, ERR_MEMORY_ALLOCATION);
-        return SQL_ERROR;
-    }
-    let activity = HandleActivity::new(Some(Arc::clone(&dbc.activity)));
-    let mut descriptors = [const { None }; 4];
-    for (slot, kind) in descriptors.iter_mut().zip([
-        DescKind::AppRow,
-        DescKind::AppParam,
-        DescKind::ImpRow,
-        DescKind::ImpParam,
-    ]) {
-        let desc = DescHandle::new(
-            kind,
-            SQL_DESC_ALLOC_AUTO,
-            input_handle,
-            dbc.clone_arc(),
-            HandleActivity::new(Some(Arc::clone(&activity))),
-        );
-        match PendingHandle::new(desc) {
-            Ok(desc) => *slot = Some(desc),
-            Err(error) => {
-                error!(
-                    ?error,
-                    "SQLAllocHandle(STMT): implicit descriptor registration failed"
-                );
-                error.post(&mut dbc_state);
-                return SQL_ERROR;
-            }
-        }
-    }
-    let [Some(ard), Some(apd), Some(ird), Some(ipd)] = descriptors else {
-        error!("SQLAllocHandle(STMT): implicit descriptors incomplete");
-        crate::error::post_sql_error(
-            &mut dbc_state,
-            crate::api::sqlstate::SQLSTATE_HY000,
-            0,
-            "Internal error allocating statement descriptors",
-        );
-        debug_assert!(false, "implicit descriptors incomplete");
-        return SQL_ERROR;
-    };
-    let stmt = StmtHandle::new(
-        input_handle,
-        dbc.clone_arc(),
-        activity,
-        [
-            (ard.raw, Arc::clone(&ard.value)),
-            (apd.raw, Arc::clone(&apd.value)),
-            (ird.raw, Arc::clone(&ird.value)),
-            (ipd.raw, Arc::clone(&ipd.value)),
-        ],
-        dbc_state.stmt_query_timeout,
-    );
-    let stmt = match PendingHandle::new(stmt) {
-        Ok(stmt) => stmt,
-        Err(error) => {
-            error!(?error, "SQLAllocHandle(STMT): registration failed");
-            error.post(&mut dbc_state);
-            return SQL_ERROR;
-        }
-    };
-    for desc in [ard, apd, ird, ipd] {
-        desc.publish();
-    }
-    let raw = stmt.publish();
+    let stmt = Box::new(StmtHandle::new(input_handle, dbc_state.stmt_query_timeout));
+    let raw = handle_to_raw(stmt);
     dbc_state.statements.push(raw);
 
     unsafe { output_handle.write(raw) };
@@ -323,7 +208,7 @@ unsafe fn alloc_desc(input_handle: SqlHandle, output_handle: *mut SqlHandle) -> 
         return SQL_INVALID_HANDLE;
     }
 
-    let dbc = get_handle!(DbcHandle, input_handle);
+    let dbc = unsafe { handle_from_raw::<DbcHandle>(input_handle) };
     debug_assert_eq!(
         dbc.object_type,
         HandleType::Dbc,
@@ -336,25 +221,12 @@ unsafe fn alloc_desc(input_handle: SqlHandle, output_handle: *mut SqlHandle) -> 
     };
     free_errors(&mut dbc_state);
 
-    if dbc_state.descriptors.try_reserve(1).is_err() {
-        post_diag(&mut dbc_state, ERR_MEMORY_ALLOCATION);
-        return SQL_ERROR;
-    }
-    let desc = DescHandle::new(
+    let desc = Box::new(DescHandle::new(
         DescKind::Ad,
         SQL_DESC_ALLOC_USER,
         input_handle,
-        dbc.clone_arc(),
-        HandleActivity::new(Some(Arc::clone(&dbc.activity))),
-    );
-    let raw = match PendingHandle::new(desc) {
-        Ok(desc) => desc.publish(),
-        Err(error) => {
-            error!(?error, "SQLAllocHandle(DESC): registration failed");
-            error.post(&mut dbc_state);
-            return SQL_ERROR;
-        }
-    };
+    ));
+    let raw = handle_to_raw(desc);
     dbc_state.descriptors.push(raw);
 
     unsafe { output_handle.write(raw) };
@@ -371,7 +243,7 @@ mod tests {
     use crate::api::free_handle::sql_free_handle;
     use crate::api::odbc_types::{SQL_ATTR_ODBC_VERSION, SQL_OV_ODBC3_80};
     use crate::api::set_env_attr::sql_set_env_attr;
-    use crate::handles::{HandleType, free_handle, handle_from_raw};
+    use crate::handles::{HandleType, free_handle};
 
     /// Helper: alloc env and set ODBC version so DBC allocation is permitted.
     fn alloc_env_v3_80() -> SqlHandle {
@@ -398,11 +270,11 @@ mod tests {
         assert!(!handle.is_null());
 
         // Verify the handle header is correctly set.
-        let env = handle_from_raw::<EnvHandle>(handle).unwrap().into_arc();
+        let env = unsafe { &*(handle as *const EnvHandle) };
         assert_eq!(env.object_type, HandleType::Env);
 
         // Cleanup
-        free_handle::<EnvHandle>(handle).unwrap();
+        unsafe { free_handle::<EnvHandle>(handle) };
     }
 
     #[test]
@@ -437,10 +309,9 @@ mod tests {
         assert_eq!(ret, SQL_SUCCESS);
         assert!(!dbc_handle.is_null());
 
-        let dbc = handle_from_raw::<DbcHandle>(dbc_handle).unwrap().into_arc();
+        let dbc = unsafe { &*(dbc_handle as *const DbcHandle) };
         assert_eq!(dbc.object_type, HandleType::Dbc);
-        let env = handle_from_raw::<EnvHandle>(env_handle).unwrap().into_arc();
-        assert!(std::ptr::eq(dbc.parent_env(), &*env));
+        assert_eq!(dbc.parent_env, env_handle);
 
         unsafe { sql_free_handle(SQL_HANDLE_DBC, dbc_handle) };
         unsafe { sql_free_handle(SQL_HANDLE_ENV, env_handle) };
@@ -464,7 +335,7 @@ mod tests {
         let ret = unsafe { sql_alloc_handle(SQL_HANDLE_DBC, env_handle, &mut dbc_handle) };
         assert_eq!(ret, SQL_SUCCESS);
 
-        let dbc = handle_from_raw::<DbcHandle>(dbc_handle).unwrap().into_arc();
+        let dbc = unsafe { &*(dbc_handle as *const DbcHandle) };
         let state = dbc.inner.lock().unwrap();
         assert_eq!(state.connection_state, ConnectionState::Disconnected);
         drop(state);
@@ -499,13 +370,13 @@ mod tests {
         let ret = unsafe { sql_alloc_handle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &mut handle) };
         assert_eq!(ret, SQL_SUCCESS);
 
-        let env = handle_from_raw::<EnvHandle>(handle).unwrap().into_arc();
+        let env = unsafe { &*(handle as *const EnvHandle) };
         let state = env.inner.lock().unwrap();
         assert_eq!(state.odbc_version, OdbcVersion::Unset);
         assert!(state.output_nts);
         drop(state);
 
-        free_handle::<EnvHandle>(handle).unwrap();
+        unsafe { free_handle::<EnvHandle>(handle) };
     }
 
     // --- Helper: alloc ENV + DBC for STMT tests ---
@@ -527,7 +398,7 @@ mod tests {
         use crate::handles::dbc::ConnectionState;
 
         let (env, dbc) = alloc_env_dbc();
-        let dbc_ref = handle_from_raw::<DbcHandle>(dbc).unwrap().into_arc();
+        let dbc_ref = unsafe { &*(dbc as *const DbcHandle) };
         dbc_ref.inner.lock().unwrap().connection_state = ConnectionState::Connected;
         (env, dbc)
     }
@@ -541,7 +412,7 @@ mod tests {
         assert_eq!(ret, SQL_SUCCESS);
         assert!(!stmt.is_null());
 
-        let s = handle_from_raw::<StmtHandle>(stmt).unwrap().into_arc();
+        let s = unsafe { &*(stmt as *const StmtHandle) };
         assert_eq!(s.object_type, HandleType::Stmt);
         assert_eq!(s.parent_dbc, dbc);
 
@@ -575,7 +446,7 @@ mod tests {
         assert_ne!(stmt1, stmt2);
 
         // Verify DBC tracks both.
-        let dbc_ref = handle_from_raw::<DbcHandle>(dbc).unwrap().into_arc();
+        let dbc_ref = unsafe { &*(dbc as *const DbcHandle) };
         let state = dbc_ref.inner.lock().unwrap();
         assert_eq!(state.statements.len(), 2);
         drop(state);
@@ -590,7 +461,7 @@ mod tests {
     fn alloc_stmt_registers_in_parent_dbc() {
         let (env, dbc) = alloc_env_dbc();
 
-        let dbc_ref = handle_from_raw::<DbcHandle>(dbc).unwrap().into_arc();
+        let dbc_ref = unsafe { &*(dbc as *const DbcHandle) };
         assert!(dbc_ref.inner.lock().unwrap().statements.is_empty());
 
         let mut stmt: SqlHandle = ptr::null_mut();
@@ -618,7 +489,7 @@ mod tests {
         assert_eq!(ret, SQL_SUCCESS);
         assert!(!desc.is_null());
 
-        let d = handle_from_raw::<DescHandle>(desc).unwrap().into_arc();
+        let d = unsafe { &*(desc as *const DescHandle) };
         assert_eq!(d.object_type, HandleType::Desc);
         assert!(d.is_explicit());
         assert_eq!(d.parent_dbc, dbc);
@@ -651,7 +522,7 @@ mod tests {
         assert_eq!(ret, SQL_SUCCESS);
         assert!(!desc.is_null());
 
-        let dbc_ref = handle_from_raw::<DbcHandle>(dbc).unwrap().into_arc();
+        let dbc_ref = unsafe { &*(dbc as *const DbcHandle) };
         assert_eq!(dbc_ref.inner.lock().unwrap().descriptors.len(), 1);
 
         unsafe { sql_free_handle(SQL_HANDLE_DESC, desc) };
@@ -663,7 +534,7 @@ mod tests {
     fn alloc_desc_registers_in_parent_dbc() {
         let (env, dbc) = alloc_env_dbc_connected();
 
-        let dbc_ref = handle_from_raw::<DbcHandle>(dbc).unwrap().into_arc();
+        let dbc_ref = unsafe { &*(dbc as *const DbcHandle) };
         assert!(dbc_ref.inner.lock().unwrap().descriptors.is_empty());
 
         let mut desc: SqlHandle = ptr::null_mut();
@@ -698,7 +569,7 @@ mod tests {
         );
         assert_ne!(desc1, desc2);
 
-        let dbc_ref = handle_from_raw::<DbcHandle>(dbc).unwrap().into_arc();
+        let dbc_ref = unsafe { &*(dbc as *const DbcHandle) };
         assert_eq!(dbc_ref.inner.lock().unwrap().descriptors.len(), 2);
 
         unsafe { sql_free_handle(SQL_HANDLE_DESC, desc2) };

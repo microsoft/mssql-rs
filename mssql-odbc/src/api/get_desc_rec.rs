@@ -21,7 +21,7 @@ use crate::api::odbc_types::{
 use crate::api::sqlstate::{ERR_INVALID_DESCRIPTOR_INDEX, WARN_STRING_TRUNCATION, post_diag};
 use crate::api::util::{copy_with_nul, write_if_some};
 use crate::error::free_errors;
-use crate::handles::{DescHandle, HandleType, get_handle};
+use crate::handles::{DescHandle, HandleType, handle_from_raw};
 
 /// Implementation of [`SQLGetDescRecW`](super::exports::SQLGetDescRecW).
 ///
@@ -99,7 +99,7 @@ unsafe fn sql_get_desc_rec_w_impl(
         return SQL_INVALID_HANDLE;
     }
 
-    let desc = get_handle!(DescHandle, descriptor_handle);
+    let desc = unsafe { handle_from_raw::<DescHandle>(descriptor_handle) };
     debug_assert_eq!(
         desc.object_type,
         HandleType::Desc,
@@ -107,7 +107,7 @@ unsafe fn sql_get_desc_rec_w_impl(
     );
 
     sql_get_desc_rec_w_safe(
-        &desc,
+        desc,
         record_number,
         name,
         buffer_length,
@@ -196,7 +196,6 @@ mod tests {
         SQL_C_SLONG, SQL_DATETIME, SQL_INTEGER, SQL_NULL_HANDLE, SQL_NULLABLE, SQL_TYPE_TIMESTAMP,
     };
     use crate::handles::desc::{DescKind, DescRecord};
-    use crate::handles::handle_from_raw;
     use crate::test_support::TestHandles;
 
     struct GetRecResult {
@@ -256,7 +255,7 @@ mod tests {
     }
 
     fn set_ird_record(h: &TestHandles, record: DescRecord) {
-        let desc = handle_from_raw::<DescHandle>(h.ird()).unwrap().into_arc();
+        let desc = unsafe { handle_from_raw::<DescHandle>(h.ird()) };
         let mut state = desc.inner.lock().unwrap();
         state.set_record_count(1, DescKind::ImpRow);
         *state.record_mut(1).unwrap() = record;
@@ -273,7 +272,7 @@ mod tests {
         let h = TestHandles::with_env_dbc_stmt();
         let result = get_rec(h.ird(), 0, 0);
         assert_eq!(result.rc, SQL_ERROR);
-        let desc = handle_from_raw::<DescHandle>(h.ird()).unwrap().into_arc();
+        let desc = unsafe { handle_from_raw::<DescHandle>(h.ird()) };
         assert_eq!(
             desc.inner.lock().unwrap().diag_records[0].sql_state,
             ERR_INVALID_DESCRIPTOR_INDEX.state
@@ -357,7 +356,7 @@ mod tests {
         assert_eq!(result.rc, SQL_SUCCESS_WITH_INFO);
         assert_eq!(result.name_len, 18, "reports the untruncated length");
         assert_eq!(result.name.len(), 4, "buffer holds buffer_length - 1 chars");
-        let desc = handle_from_raw::<DescHandle>(h.ird()).unwrap().into_arc();
+        let desc = unsafe { handle_from_raw::<DescHandle>(h.ird()) };
         assert_eq!(
             desc.inner.lock().unwrap().diag_records[0].sql_state,
             WARN_STRING_TRUNCATION.state

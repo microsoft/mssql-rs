@@ -13,7 +13,7 @@ use super::sqlstate::{ERR_INVALID_TRANSACTION_OPERATION_CODE, SQLSTATE_HY000, po
 use super::txn::end_transaction;
 use crate::error::{free_errors, post_sql_error};
 use crate::handles::dbc::ConnectionState;
-use crate::handles::{DbcHandle, EnvHandle, HandleType, get_handle, handle_from_raw};
+use crate::handles::{DbcHandle, EnvHandle, HandleType, handle_from_raw};
 
 /// Implementation of `SQLEndTran`.
 ///
@@ -49,22 +49,22 @@ unsafe fn sql_end_tran_impl(
 
     match handle_type {
         SQL_HANDLE_DBC => {
-            let dbc = get_handle!(DbcHandle, handle);
+            let dbc = unsafe { handle_from_raw::<DbcHandle>(handle) };
             debug_assert_eq!(
                 dbc.object_type,
                 HandleType::Dbc,
                 "SQLEndTran: handle is not a DBC"
             );
-            sql_end_tran_dbc_safe(&dbc, completion_type)
+            sql_end_tran_dbc_safe(dbc, completion_type)
         }
         SQL_HANDLE_ENV => {
-            let env = get_handle!(EnvHandle, handle);
+            let env = unsafe { handle_from_raw::<EnvHandle>(handle) };
             debug_assert_eq!(
                 env.object_type,
                 HandleType::Env,
                 "SQLEndTran: handle is not an ENV"
             );
-            sql_end_tran_env_safe(&env, completion_type)
+            unsafe { sql_end_tran_env_safe(env, completion_type) }
         }
         _ => {
             error!(handle_type, "SQLEndTran: handle type is not ENV or DBC");
@@ -102,42 +102,35 @@ fn sql_end_tran_dbc_safe(dbc: &DbcHandle, completion_type: SqlSmallInt) -> SqlRe
 }
 
 /// Fans the request out over every connection on `env`.
-fn sql_end_tran_env_safe(env: &EnvHandle, completion_type: SqlSmallInt) -> SqlReturn {
-    let connections = {
-        let Ok(mut env_state) = env.inner.lock() else {
-            error!("SQLEndTran: env mutex poisoned");
-            return SQL_ERROR;
-        };
-        free_errors(&mut env_state);
-
-        if commit_flag(completion_type).is_none() {
-            error!(completion_type, "SQLEndTran: invalid completion type");
-            post_diag(&mut env_state, ERR_INVALID_TRANSACTION_OPERATION_CODE);
-            return SQL_ERROR;
-        }
-        env_state.connections.clone()
+///
+/// # Safety
+/// Every pointer in `EnvState::connections` must be a live `DbcHandle`.
+unsafe fn sql_end_tran_env_safe(env: &EnvHandle, completion_type: SqlSmallInt) -> SqlReturn {
+    let Ok(mut env_state) = env.inner.lock() else {
+        error!("SQLEndTran: env mutex poisoned");
+        return SQL_ERROR;
     };
+    free_errors(&mut env_state);
+
+    if commit_flag(completion_type).is_none() {
+        error!(completion_type, "SQLEndTran: invalid completion type");
+        post_diag(&mut env_state, ERR_INVALID_TRANSACTION_OPERATION_CODE);
+        return SQL_ERROR;
+    }
+
+    let connections = env_state.connections.clone();
+    drop(env_state);
 
     let mut worst = SQL_SUCCESS;
     let mut failed = 0usize;
     for dbc_ptr in connections {
-        let dbc = match handle_from_raw::<DbcHandle>(dbc_ptr) {
-            Ok(dbc) => dbc,
-            Err(err) => {
-                error!(?dbc_ptr, ?err, "SQLEndTran: connection lookup failed");
-                crate::error::diag::with_diagnostics(&env.inner, |records| {
-                    post_sql_error(
-                        records,
-                        SQLSTATE_HY000,
-                        0,
-                        format!("A connection on this environment could not be accessed: {err}"),
-                    );
-                });
-                worst = SQL_ERROR;
-                failed += 1;
-                continue;
-            }
-        };
+        // SAFETY: pointers in `connections` came from `handle_to_raw::<DbcHandle>`
+        // and are owned by this ENV. A concurrent
+        // `SQLFreeHandle(SQL_HANDLE_DBC)` could still free one between the clone
+        // above and this call — the same handle-lifetime gap `SQLDisconnect`
+        // documents (see the TODO in `disconnect.rs`), which refcounted handles
+        // will close for the whole driver at once.
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(dbc_ptr) };
 
         // SQLEndTran: "the driver will attempt to commit or roll back
         // transactions ... on all connections that are in a connected state on
@@ -166,7 +159,7 @@ fn sql_end_tran_env_safe(env: &EnvHandle, completion_type: SqlSmallInt) -> SqlRe
             continue;
         }
 
-        let ret = sql_end_tran_dbc_safe(&dbc, completion_type);
+        let ret = sql_end_tran_dbc_safe(dbc, completion_type);
         // msodbcsql `PromoteRetcode`: the worst outcome wins. SQL_ERROR on any
         // connection must survive a later SQL_SUCCESS_WITH_INFO, otherwise a
         // failed commit is reported to the app as a warning.
@@ -210,13 +203,13 @@ mod tests {
     use crate::test_support::TestHandles;
 
     fn dbc_state(handle: SqlHandle) -> [u8; 5] {
-        let dbc = handle_from_raw::<DbcHandle>(handle).unwrap().into_arc();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(handle) };
         let state = dbc.inner.lock().expect("dbc mutex poisoned");
         state.diag_records()[0].sql_state
     }
 
     fn env_state(handle: SqlHandle) -> [u8; 5] {
-        let env = handle_from_raw::<EnvHandle>(handle).unwrap().into_arc();
+        let env = unsafe { handle_from_raw::<EnvHandle>(handle) };
         let state = env.inner.lock().expect("env mutex poisoned");
         state.diag_records()[0].sql_state
     }
@@ -279,7 +272,7 @@ mod tests {
         let h = TestHandles::with_env_dbc();
         let ret = unsafe { sql_end_tran(SQL_HANDLE_ENV, h.env, SQL_COMMIT) };
         assert_eq!(ret, SQL_SUCCESS);
-        let dbc = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         assert!(
             dbc.inner.lock().unwrap().diag_records().is_empty(),
             "a skipped connection must not be given a diagnostic"
@@ -293,7 +286,7 @@ mod tests {
         // SQL_ERROR rather than the initial SUCCESS.
         let h = TestHandles::with_env_dbc();
         h.mark_dbc_connected();
-        let dbc = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         dbc.inner.lock().unwrap().local_tran_started = true;
         let ret = unsafe { sql_end_tran(SQL_HANDLE_ENV, h.env, SQL_COMMIT) };
         assert_eq!(ret, SQL_ERROR);
@@ -313,7 +306,7 @@ mod tests {
         h.mark_dbc_connected();
         let ret = unsafe { sql_end_tran(SQL_HANDLE_ENV, h.env, SQL_COMMIT) };
         assert_eq!(ret, SQL_SUCCESS);
-        let env = handle_from_raw::<EnvHandle>(h.env).unwrap().into_arc();
+        let env = unsafe { handle_from_raw::<EnvHandle>(h.env) };
         assert!(env.inner.lock().unwrap().diag_records().is_empty());
     }
 

@@ -7,7 +7,7 @@ use tracing::{debug, error};
 
 use crate::api::odbc_types::{SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS, SqlHandle, SqlReturn};
 use crate::api::sqlstate::{
-    ERR_CONNECTION_DOES_NOT_EXIST, ERR_INVALID_TRANSACTION_STATE, ERR_MEMORY_ALLOCATION, post_diag,
+    ERR_CONNECTION_DOES_NOT_EXIST, ERR_INVALID_TRANSACTION_STATE, post_diag,
 };
 use crate::api::txn::rollback_before_disconnect;
 use crate::error::free_errors;
@@ -15,9 +15,7 @@ use crate::handles::DbcHandle;
 use crate::handles::StmtHandle;
 use crate::handles::dbc::{ConnectionIdentity, ConnectionState};
 use crate::handles::desc::DescHandle;
-use crate::handles::{
-    HandleRef, HandleType, begin_close, get_handle, handle_from_raw, retire_handle,
-};
+use crate::handles::{HandleType, free_handle, handle_from_raw};
 
 /// Implementation of `SQLDisconnect`.
 ///
@@ -38,19 +36,19 @@ unsafe fn sql_disconnect_impl(connection_handle: SqlHandle) -> SqlReturn {
         error!("SQLDisconnect: connection_handle is null");
         return SQL_INVALID_HANDLE;
     }
-    let dbc = get_handle!(DbcHandle, connection_handle);
+    let dbc = unsafe { handle_from_raw::<DbcHandle>(connection_handle) };
     debug_assert_eq!(
         dbc.object_type,
         HandleType::Dbc,
         "SQLDisconnect: handle is not a DBC"
     );
-    sql_disconnect_safe(&dbc)
+    sql_disconnect_safe(dbc)
 }
 
-fn sql_disconnect_safe(dbc: &HandleRef<DbcHandle>) -> SqlReturn {
+fn sql_disconnect_safe(dbc: &DbcHandle) -> SqlReturn {
     // Validate under a short lock; the rollback that may follow needs network
     // I/O and must not run while the mutex is held.
-    let (_closing, statements, descriptors) = {
+    {
         let Ok(mut state) = dbc.inner.lock() else {
             error!("SQLDisconnect: dbc mutex poisoned");
             return SQL_ERROR;
@@ -84,76 +82,45 @@ fn sql_disconnect_safe(dbc: &HandleRef<DbcHandle>) -> SqlReturn {
             post_diag(&mut state, ERR_INVALID_TRANSACTION_STATE);
             return SQL_ERROR;
         }
-        let mut statements = Vec::new();
-        let mut descriptors = Vec::new();
-        if statements.try_reserve(state.statements.len()).is_err()
-            || descriptors.try_reserve(state.descriptors.len()).is_err()
-        {
-            post_diag(&mut state, ERR_MEMORY_ALLOCATION);
-            return SQL_ERROR;
-        }
-        for &raw in &state.statements {
-            match handle_from_raw::<StmtHandle>(raw) {
-                Ok(stmt) => statements.push((raw, stmt.into_arc())),
-                Err(error) => {
-                    error!(?error, "SQLDisconnect: statement acquisition failed");
-                    error.post(&mut state);
-                    return SQL_ERROR;
-                }
-            }
-        }
-        for &raw in &state.descriptors {
-            match handle_from_raw::<DescHandle>(raw) {
-                Ok(desc) => descriptors.push((raw, desc.into_arc())),
-                Err(error) => {
-                    error!(?error, "SQLDisconnect: descriptor acquisition failed");
-                    error.post(&mut state);
-                    return SQL_ERROR;
-                }
-            }
-        }
-        let closing = match begin_close(dbc) {
-            Ok(closing) => closing,
-            Err(error) => {
-                error!(?error, "SQLDisconnect: dependent operation is active");
-                error.post(&mut state);
-                return SQL_ERROR;
-            }
-        };
-        (closing, statements, descriptors)
-    };
+    }
 
     // Manual-commit mode leaves a driver-begun transaction open between
     // statements. It holds no user work, so roll it back explicitly instead of
     // relying on the server's cleanup when the socket closes.
-    rollback_before_disconnect(
-        dbc,
-        statements.iter().map(|(raw, stmt)| (*raw, stmt.as_ref())),
-    );
+    rollback_before_disconnect(dbc);
 
     let Ok(mut state) = dbc.inner.lock() else {
         error!("SQLDisconnect: dbc mutex poisoned");
         return SQL_ERROR;
     };
 
-    // The close claim excludes new calls and was refused if an older call
-    // still owned the client. Cleanup cannot race a late client hand-back.
-    // Retire from the tail so removing each successful entry is O(1). If a
-    // retirement fails, the remaining IDs stay tracked and can be retried.
-    for (stmt_ptr, stmt) in statements.iter().rev() {
+    // Drop all child STMT handles.
+    // Note: the DBC lock prevents any *new* SQLExecDirectW from taking the client (it needs
+    // the DBC lock). However, a call that already took the client and is mid-execute() holds
+    // no locks during I/O, so it can race here and access a STMT handle we are about to free.
+    // TODO: fix with refcounted handle lifetimes so STMT handles cannot be freed while in use.
+    //
+    // Locking each STMT's own mutex here is pure synchronization, not a read
+    // of its data: a poisoning panic still fully releases the lock on
+    // unwind, so a poisoned outcome doesn't change whether it's safe to free
+    // the box, only whether the STMT's *contents* were left consistent —
+    // irrelevant here, since the box is dropped whole. Treating it as fatal
+    // instead (returning `SQL_ERROR` without freeing) would orphan the
+    // handle: no longer in `state.statements` for a retry to find, yet never
+    // freed either. Tolerating it and freeing anyway, matching `free_stmt`'s
+    // identical tolerance for its own handle's lock, closes that gap instead
+    // of deferring it.
+    while let Some(stmt_ptr) = state.statements.pop() {
+        // SAFETY: `stmt_ptr` came from `handle_to_raw::<StmtHandle>` and is still
+        // live (the DBC owns it).
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(stmt_ptr) };
         if stmt.inner.lock().is_err() {
             error!(
                 ?stmt_ptr,
                 "SQLDisconnect: stmt mutex poisoned; freeing anyway"
             );
         }
-        if let Err(error) = retire_handle(&**stmt, *stmt_ptr) {
-            error!(?error, "SQLDisconnect: statement retirement failed");
-            error.post(&mut state);
-            return SQL_ERROR;
-        }
-        debug_assert_eq!(state.statements.last(), Some(stmt_ptr));
-        state.statements.pop();
+        unsafe { free_handle::<StmtHandle>(stmt_ptr) };
     }
 
     // Drop all explicitly-allocated DESC handles, after the statements: an
@@ -167,20 +134,17 @@ fn sql_disconnect_safe(dbc: &HandleRef<DbcHandle>) -> SqlReturn {
     // Same poison-tolerant shape as the statement loop above, for the same
     // reason: synchronization only, and treating poison as fatal here would
     // equally orphan the descriptor rather than actually resolve anything.
-    for (desc_ptr, desc) in descriptors.iter().rev() {
+    while let Some(desc_ptr) = state.descriptors.pop() {
+        // SAFETY: `desc_ptr` came from `handle_to_raw::<DescHandle>` and is
+        // still live (the DBC owns it).
+        let desc = unsafe { handle_from_raw::<DescHandle>(desc_ptr) };
         if desc.inner.lock().is_err() {
             error!(
                 ?desc_ptr,
                 "SQLDisconnect: desc mutex poisoned; freeing anyway"
             );
         }
-        if let Err(error) = retire_handle(&**desc, *desc_ptr) {
-            error!(?error, "SQLDisconnect: descriptor retirement failed");
-            error.post(&mut state);
-            return SQL_ERROR;
-        }
-        debug_assert_eq!(state.descriptors.last(), Some(desc_ptr));
-        state.descriptors.pop();
+        unsafe { free_handle::<DescHandle>(desc_ptr) };
     }
 
     // Drop the TDS client (closes the connection) and clear connection-level cursor claim.
@@ -190,7 +154,6 @@ fn sql_disconnect_safe(dbc: &HandleRef<DbcHandle>) -> SqlReturn {
     state.effective_packet_size = None;
     state.identity = ConnectionIdentity::default();
     state.connection_state = ConnectionState::Disconnected;
-    drop(state);
 
     debug!("SQLDisconnect: disconnected successfully");
     SQL_SUCCESS
@@ -247,7 +210,7 @@ mod tests {
     #[test]
     fn disconnect_while_connecting_returns_connection_does_not_exist() {
         let h = crate::test_support::TestHandles::with_env_dbc();
-        let dbc = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         dbc.inner.lock().unwrap().connection_state = ConnectionState::Connecting;
 
         assert_eq!(unsafe { sql_disconnect(h.dbc) }, SQL_ERROR);
@@ -264,25 +227,6 @@ mod tests {
         let ret = unsafe { sql_disconnect(SQL_NULL_HANDLE) };
         assert_eq!(ret, SQL_INVALID_HANDLE);
         // TODO: verify SQLSTATE HY009 via SQLGetDiagRec
-    }
-
-    #[test]
-    fn disconnect_sweeps_idle_statements_without_posting_lookup_errors() {
-        let h = crate::test_support::TestHandles::with_env_dbc_stmt();
-        h.mark_dbc_connected();
-        let dbc = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
-        let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
-        crate::error::post_sql_error(
-            &mut stmt.inner.lock().unwrap(),
-            crate::api::sqlstate::SQLSTATE_HY000,
-            0,
-            "old statement diagnostic",
-        );
-
-        assert_eq!(unsafe { sql_disconnect(h.dbc) }, SQL_SUCCESS);
-        assert!(dbc.inner.lock().unwrap().diag_records.is_empty());
-        assert!(stmt.inner.lock().unwrap().diag_records.is_empty());
-        assert!(!crate::handles::is_live(h.stmt));
     }
 
     /// `SQLDisconnect` must free any outstanding explicitly-allocated
@@ -321,7 +265,7 @@ mod tests {
         // Simulate a connected DBC without a real TDS client — sufficient for
         // this test, since `rollback_before_disconnect` no-ops when there is
         // no client to roll back.
-        let dbc_ref = handle_from_raw::<DbcHandle>(dbc).unwrap().into_arc();
+        let dbc_ref = unsafe { handle_from_raw::<DbcHandle>(dbc) };
         dbc_ref.inner.lock().unwrap().connection_state = ConnectionState::Connected;
 
         let mut desc: SqlHandle = SQL_NULL_HANDLE;
@@ -383,7 +327,7 @@ mod tests {
             unsafe { sql_alloc_handle(SQL_HANDLE_DBC, env, &mut dbc) },
             SQL_SUCCESS
         );
-        let dbc_ref = handle_from_raw::<DbcHandle>(dbc).unwrap().into_arc();
+        let dbc_ref = unsafe { handle_from_raw::<DbcHandle>(dbc) };
         dbc_ref.inner.lock().unwrap().connection_state = ConnectionState::Connected;
 
         let mut stmt1: SqlHandle = SQL_NULL_HANDLE;
@@ -398,7 +342,7 @@ mod tests {
         );
 
         // Poison stmt2's mutex; stmt1's is left untouched.
-        let stmt2_ref = handle_from_raw::<StmtHandle>(stmt2).unwrap().into_arc();
+        let stmt2_ref = unsafe { handle_from_raw::<StmtHandle>(stmt2) };
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _guard = stmt2_ref.inner.lock().unwrap();
             panic!("poison the stmt lock");

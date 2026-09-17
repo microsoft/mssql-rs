@@ -15,7 +15,7 @@ use crate::api::sqlstate::{
 };
 use crate::api::util::{copy_with_nul, read_utf16_long, write_if_some};
 use crate::error::{free_errors, post_sql_error};
-use crate::handles::{DbcHandle, HandleType, get_handle};
+use crate::handles::{DbcHandle, HandleType, handle_from_raw};
 
 /// Returns the statement as the driver would send it, with ODBC escape
 /// sequences translated.
@@ -81,7 +81,7 @@ unsafe fn sql_native_sql_w_impl(
         error!("SQLNativeSqlW: connection_handle is null");
         return SQL_INVALID_HANDLE;
     }
-    let dbc = get_handle!(DbcHandle, connection_handle);
+    let dbc = unsafe { handle_from_raw::<DbcHandle>(connection_handle) };
     debug_assert_eq!(
         dbc.object_type,
         HandleType::Dbc,
@@ -89,7 +89,7 @@ unsafe fn sql_native_sql_w_impl(
     );
 
     sql_native_sql_w_safe(
-        &dbc,
+        dbc,
         text_length1,
         out_statement_text,
         buffer_length,
@@ -159,40 +159,10 @@ fn sql_native_sql_w_safe(
 mod tests {
     use super::*;
     use crate::api::odbc_types::{SQL_NTS, SQL_NULL_HANDLE};
-    use crate::handles::handle_from_raw;
     use crate::test_support::TestHandles;
 
     fn wide(s: &str) -> Vec<SqlWChar> {
         s.encode_utf16().chain(std::iter::once(0)).collect()
-    }
-
-    #[test]
-    fn wrong_type_and_retired_handles_leave_output_untouched() {
-        let h = TestHandles::with_env_dbc_stmt();
-        let retired = {
-            let old = TestHandles::with_env_dbc();
-            old.dbc
-        };
-        let input = wide("SELECT 1");
-        for handle in [h.stmt, retired] {
-            let mut output = [0x1234; 16];
-            let mut length = -1;
-            assert_eq!(
-                unsafe {
-                    sql_native_sql_w(
-                        handle,
-                        input.as_ptr(),
-                        SQL_NTS.into(),
-                        output.as_mut_ptr(),
-                        output.len().try_into().unwrap(),
-                        &mut length,
-                    )
-                },
-                SQL_INVALID_HANDLE
-            );
-            assert_eq!(output, [0x1234; 16]);
-            assert_eq!(length, -1);
-        }
     }
 
     fn native_sql(dbc: SqlHandle, sql: &str, cap: usize) -> (SqlReturn, String, SqlInteger) {
@@ -339,8 +309,7 @@ mod tests {
             );
             assert_eq!(out, [77u16; 32]);
             assert_eq!(len, -42);
-            let dbc_owner = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
-            let dbc = &*dbc_owner;
+            let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
             let state = dbc.inner.lock().unwrap();
             assert_eq!(state.diag_records.len(), 1);
             assert_eq!(state.diag_records[0].sql_state, SQLSTATE_HY090);
@@ -371,8 +340,7 @@ mod tests {
             assert_eq!(len, length);
             assert_eq!(String::from_utf16_lossy(&out[..length as usize]), expected);
             assert_eq!(out[length as usize], 0);
-            let dbc_owner = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
-            let dbc = &*dbc_owner;
+            let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
             assert!(dbc.inner.lock().unwrap().diag_records.is_empty());
         }
     }

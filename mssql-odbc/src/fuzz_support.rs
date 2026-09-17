@@ -584,13 +584,7 @@ pub fn fuzz_ffi_execute(data: &[u8]) {
 /// a socket.
 fn install_fuzz_client(dbc: SqlHandle, server_bytes: &[u8]) {
     let client = create_fuzz_tds_client(FuzzPacketReader::from_data(server_bytes), 4096);
-    let dbc_ref = match handle_from_raw::<DbcHandle>(dbc) {
-        Ok(dbc) => dbc,
-        Err(error) => {
-            tracing::error!(?error, "fuzz client handle acquisition failed");
-            return;
-        }
-    };
+    let dbc_ref = unsafe { handle_from_raw::<DbcHandle>(dbc) };
     let Ok(mut state) = dbc_ref.inner.lock() else {
         return;
     };

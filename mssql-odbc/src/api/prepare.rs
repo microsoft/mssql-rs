@@ -20,7 +20,7 @@ use crate::handles::stmt::{
     PreparedPlan, STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT, STMT_STATE_EXEC_STARTED,
     STMT_STATE_PREPARED,
 };
-use crate::handles::{HandleType, StmtHandle, get_handle};
+use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 
 /// Implementation of `SQLPrepareW`.
 ///
@@ -63,7 +63,7 @@ unsafe fn sql_prepare_w_impl(
         return SQL_INVALID_HANDLE;
     }
 
-    let stmt = get_handle!(StmtHandle, statement_handle);
+    let stmt = unsafe { handle_from_raw::<StmtHandle>(statement_handle) };
     debug_assert_eq!(
         stmt.object_type,
         HandleType::Stmt,
@@ -81,7 +81,7 @@ unsafe fn sql_prepare_w_impl(
     );
 
     let sql = unsafe { read_utf16(statement_text, text_length) };
-    sql_prepare_w_safe(&stmt, sql)
+    sql_prepare_w_safe(stmt, sql)
 }
 
 fn sql_prepare_w_safe(stmt: &StmtHandle, sql: String) -> SqlReturn {
@@ -102,10 +102,6 @@ fn sql_prepare_w_safe(stmt: &StmtHandle, sql: String) -> SqlReturn {
         return SQL_ERROR;
     };
     free_errors(&mut stmt_state);
-
-    if let Err(error) = stmt.row_binding_use.ensure_idle(&dbc_state) {
-        return error.post(&mut *stmt_state);
-    }
 
     if stmt_state.has_state(STMT_STATE_EXEC_STARTED | STMT_STATE_CURSOR_OPEN) {
         error!("SQLPrepareW: statement has an active execute or open cursor");
@@ -155,7 +151,6 @@ fn sql_prepare_w_safe(stmt: &StmtHandle, sql: String) -> SqlReturn {
 mod tests {
     use super::*;
     use crate::api::odbc_types::{SQL_NTS, SQL_NULL_HANDLE};
-    use crate::handles::handle_from_raw;
     use crate::test_support::TestHandles;
 
     #[test]
@@ -180,7 +175,7 @@ mod tests {
         let ret = unsafe { sql_prepare_w(h.stmt, sql.as_ptr(), SQL_NTS) };
         assert_eq!(ret, SQL_SUCCESS);
 
-        let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let state = stmt.inner.lock().unwrap();
         assert_eq!(
             state.prepared.as_ref().map(|p| p.stmt.sql()),
@@ -196,7 +191,7 @@ mod tests {
         let h = TestHandles::with_env_dbc_stmt();
         h.mark_dbc_connected();
 
-        let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         {
             let mut state = stmt.inner.lock().unwrap();
             state.prepared = Some(PreparedPlan {

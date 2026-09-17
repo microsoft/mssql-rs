@@ -16,6 +16,11 @@
 //! (unlike `SQLGetDescRecW`'s `Name`), so the ODBC spec defines only the one
 //! entry point — `sql.h` declares `SQLSetDescRec` directly, with no
 //! `SQLSetDescRecW`/`SQLSetDescRecA` pair.
+//!
+//! Shares `SQLSetDescFieldW`'s known, deferred gap: no
+//! `STMT_STATE_FETCH_IN_PROGRESS` check before writing an ARD/APD record a
+//! fetch may still be reading through — see
+//! [#472](https://github.com/microsoft/mssql-rs/issues/472).
 
 use tracing::{debug, error};
 
@@ -29,7 +34,7 @@ use crate::api::set_desc_field::{
 use crate::api::sqlstate::{ERR_CANNOT_MODIFY_IRD, ERR_INVALID_DESCRIPTOR_INDEX, post_diag};
 use crate::error::free_errors;
 use crate::handles::desc::DescKind;
-use crate::handles::{DescHandle, HandleType};
+use crate::handles::{DescHandle, HandleType, handle_from_raw};
 
 /// Implementation of [`SQLSetDescRec`](super::exports::SQLSetDescRec).
 ///
@@ -101,8 +106,7 @@ unsafe fn sql_set_desc_rec_impl(
         return SQL_INVALID_HANDLE;
     }
 
-    let desc_owner = crate::handles::get_handle!(DescHandle, descriptor_handle);
-    let desc = &*desc_owner;
+    let desc = unsafe { handle_from_raw::<DescHandle>(descriptor_handle) };
     debug_assert_eq!(
         desc.object_type,
         HandleType::Desc,
@@ -136,10 +140,6 @@ fn sql_set_desc_rec_safe(
     string_length_ptr: *mut SqlLen,
     indicator_ptr: *mut SqlLen,
 ) -> SqlReturn {
-    let Ok(gate) = desc.parent_dbc().inner.lock() else {
-        error!("SQLSetDescRec: dbc mutex poisoned");
-        return SQL_ERROR;
-    };
     let Ok(mut state) = desc.inner.lock() else {
         error!("SQLSetDescRec: desc mutex poisoned");
         return SQL_ERROR;
@@ -166,14 +166,11 @@ fn sql_set_desc_rec_safe(
         post_diag(&mut state, ERR_INVALID_DESCRIPTOR_INDEX);
         return SQL_ERROR;
     };
-    if let Err(error) = desc.binding_use.ensure_idle(&gate) {
-        return error.post(&mut *state);
-    }
     // Growing on demand, same as SQLSetDescFieldW's per-record-field growth:
     // msodbcsql calls AllocPlex before the field-specific setter for any
     // record write, which can grow SQL_DESC_COUNT even if a setter further
     // down this sequence later fails.
-    if count > state.records().len() {
+    if count > state.records.len() {
         state.set_record_count(count, desc.kind);
     }
 
@@ -254,12 +251,10 @@ mod tests {
     use crate::api::sqlstate::ERR_CANNOT_MODIFY_IRD;
     use crate::api::type_rules::canonical_c_type;
     use crate::handles::desc::DescRecord;
-    use crate::handles::handle_from_raw;
     use crate::test_support::TestHandles;
 
     fn desc_diag_states(handle: SqlHandle) -> Vec<[u8; 5]> {
-        let desc_owner = handle_from_raw::<DescHandle>(handle).unwrap().into_arc();
-        let desc = &*desc_owner;
+        let desc = unsafe { handle_from_raw::<DescHandle>(handle) };
         desc.inner
             .lock()
             .unwrap()
@@ -270,15 +265,13 @@ mod tests {
     }
 
     fn record_count(handle: SqlHandle) -> usize {
-        let desc_owner = handle_from_raw::<DescHandle>(handle).unwrap().into_arc();
-        let desc = &*desc_owner;
-        desc.inner.lock().unwrap().records().len()
+        let desc = unsafe { handle_from_raw::<DescHandle>(handle) };
+        desc.inner.lock().unwrap().records.len()
     }
 
     fn cloned_record(handle: SqlHandle, index: usize) -> DescRecord {
-        let desc_owner = handle_from_raw::<DescHandle>(handle).unwrap().into_arc();
-        let desc = &*desc_owner;
-        desc.inner.lock().unwrap().records()[index].clone()
+        let desc = unsafe { handle_from_raw::<DescHandle>(handle) };
+        desc.inner.lock().unwrap().records[index].clone()
     }
 
     fn get_small_int(handle: SqlHandle, record: SqlSmallInt, field: SqlSmallInt) -> SqlSmallInt {

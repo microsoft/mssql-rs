@@ -30,7 +30,7 @@ use crate::api::sqlstate::{
 use crate::api::util::{copy_with_nul, write_if_some};
 use crate::error::{HasDiagnostics, free_errors};
 use crate::handles::desc::{DescHeader, DescRecord, FieldScope, classify_field};
-use crate::handles::{DescHandle, HandleType, get_handle};
+use crate::handles::{DescHandle, HandleType, handle_from_raw};
 
 /// Implementation of [`SQLGetDescFieldW`](super::exports::SQLGetDescFieldW).
 ///
@@ -90,7 +90,7 @@ unsafe fn sql_get_desc_field_w_impl(
         return SQL_INVALID_HANDLE;
     }
 
-    let desc = get_handle!(DescHandle, descriptor_handle);
+    let desc = unsafe { handle_from_raw::<DescHandle>(descriptor_handle) };
     debug_assert_eq!(
         desc.object_type,
         HandleType::Desc,
@@ -98,7 +98,7 @@ unsafe fn sql_get_desc_field_w_impl(
     );
 
     sql_get_desc_field_w_safe(
-        &desc,
+        desc,
         record_number,
         field_identifier,
         value_ptr,
@@ -155,7 +155,7 @@ fn sql_get_desc_field_w_safe(
             // 5207-5213 — all three report `CItemsPl(...)`, the live plex
             // size, at `sizeof(SQLSMALLINT)`).
             FieldValue::SmallInt(
-                SqlSmallInt::try_from(state.records().len()).unwrap_or(SqlSmallInt::MAX),
+                SqlSmallInt::try_from(state.records.len()).unwrap_or(SqlSmallInt::MAX),
             )
         }
         FieldScope::Header => match header_field_value(&state.header, field) {
@@ -361,7 +361,7 @@ mod tests {
     }
 
     fn desc_diags(handle: SqlHandle) -> Vec<DiagRecord> {
-        let desc = handle_from_raw::<DescHandle>(handle).unwrap().into_arc();
+        let desc = unsafe { handle_from_raw::<DescHandle>(handle) };
         desc.inner.lock().unwrap().diag_records.clone()
     }
 
