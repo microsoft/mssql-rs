@@ -10,7 +10,7 @@ use tokio::runtime::Runtime;
 use tracing::error;
 
 use super::{HandleType, HasObjectType};
-use crate::api::odbc_types::{SQL_OV_ODBC2, SQL_OV_ODBC3, SQL_OV_ODBC3_80};
+use crate::api::odbc_types::{SQL_OV_ODBC3, SQL_OV_ODBC3_80};
 use crate::error::{DiagRecord, HasDiagnostics};
 
 /// ODBC environment attributes.
@@ -18,7 +18,6 @@ use crate::error::{DiagRecord, HasDiagnostics};
 pub(crate) enum OdbcVersion {
     /// Not yet set — calls requiring a version will fail with HY010.
     Unset = 0,
-    Odbc2 = 2,
     Odbc3 = 3,
     Odbc3_80 = 380,
 }
@@ -40,7 +39,6 @@ impl TryFrom<u32> for OdbcVersion {
 
     fn try_from(value: u32) -> Result<Self, Self::Error> {
         match value {
-            SQL_OV_ODBC2 => Ok(OdbcVersion::Odbc2),
             SQL_OV_ODBC3 => Ok(OdbcVersion::Odbc3),
             SQL_OV_ODBC3_80 => Ok(OdbcVersion::Odbc3_80),
             _ => Err(()),
@@ -302,7 +300,6 @@ mod tests {
     #[test]
     fn only_odbc_3_80_uses_the_extended_c_types() {
         assert!(!OdbcVersion::Unset.uses_3_80_types());
-        assert!(!OdbcVersion::Odbc2.uses_3_80_types());
         assert!(!OdbcVersion::Odbc3.uses_3_80_types());
         assert!(OdbcVersion::Odbc3_80.uses_3_80_types());
     }

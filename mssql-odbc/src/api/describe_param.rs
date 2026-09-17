@@ -27,7 +27,7 @@ use super::util::write_if_some;
 use crate::api::type_rules::parameter_size_is_precision;
 use crate::error::{free_errors, post_sql_error};
 use crate::handles::stmt::{ParameterDescription, STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_STARTED};
-use crate::handles::{DescHandle, HandleType, OdbcVersion, StmtHandle, handle_from_raw};
+use crate::handles::{DescHandle, HandleType, StmtHandle, handle_from_raw};
 
 use super::set_desc_field::datetime_interval_code_for;
 
@@ -133,14 +133,6 @@ fn sql_describe_param_safe(
     nullable_ptr: *mut SqlSmallInt,
 ) -> SqlReturn {
     let dbc = stmt.parent_dbc();
-    let is_odbc3 = {
-        let env = dbc.parent_env();
-        let Ok(env_state) = env.inner.lock() else {
-            error!("SQLDescribeParam: env mutex poisoned");
-            return SQL_ERROR;
-        };
-        env_state.odbc_version != OdbcVersion::Odbc2
-    };
 
     let (sql, marker_count, return_status, query_timeout) = {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
@@ -295,7 +287,7 @@ fn sql_describe_param_safe(
     // *after* the drain, rather than propagated with `?` or an early `return`.
     let parse_result = loop {
         match dbc.runtime.block_on(client.next_row()) {
-            Ok(Some(row)) => match parse_parameter_row(&row, described_count, is_odbc3) {
+            Ok(Some(row)) => match parse_parameter_row(&row, described_count) {
                 Ok((index, description)) => {
                     if let Err(e) = collector.accept(index, description) {
                         break Err(e);
@@ -479,7 +471,6 @@ fn write_description(
 fn parse_parameter_row(
     row: &[ColumnValues],
     marker_count: usize,
-    is_odbc3: bool,
 ) -> Result<(usize, ParameterDescription), String> {
     let ordinal = read_i32(row, PARAMETER_ORDINAL, "parameter_ordinal")?;
     let index = usize::try_from(ordinal)
@@ -498,7 +489,7 @@ fn parse_parameter_row(
 
     Ok((
         index,
-        describe_tds_type(data_type, length, precision, scale, is_odbc3)?,
+        describe_tds_type(data_type, length, precision, scale)?,
     ))
 }
 
@@ -507,7 +498,6 @@ fn describe_tds_type(
     length: i32,
     precision: Option<u8>,
     scale: Option<u8>,
-    is_odbc3: bool,
 ) -> Result<ParameterDescription, String> {
     let (data_type, parameter_size, decimal_digits) = match data_type {
         TdsDataType::Bit | TdsDataType::BitN => (SQL_BIT, 1, 0),
@@ -522,11 +512,11 @@ fn describe_tds_type(
             8 => (SQL_BIGINT, 19, 0),
             _ => return Err(format!("invalid INTN length {length}")),
         },
-        TdsDataType::Flt4 => (SQL_REAL, float_precision(SQL_REAL, is_odbc3), 0),
-        TdsDataType::Flt8 => (SQL_FLOAT, float_precision(SQL_FLOAT, is_odbc3), 0),
+        TdsDataType::Flt4 => (SQL_REAL, float_precision(SQL_REAL), 0),
+        TdsDataType::Flt8 => (SQL_FLOAT, float_precision(SQL_FLOAT), 0),
         TdsDataType::FltN => match length {
-            4 => (SQL_REAL, float_precision(SQL_REAL, is_odbc3), 0),
-            8 => (SQL_FLOAT, float_precision(SQL_FLOAT, is_odbc3), 0),
+            4 => (SQL_REAL, float_precision(SQL_REAL), 0),
+            8 => (SQL_FLOAT, float_precision(SQL_FLOAT), 0),
             _ => return Err(format!("invalid FLTN length {length}")),
         },
         TdsDataType::Decimal | TdsDataType::DecimalN => {
@@ -653,17 +643,14 @@ fn describe_tds_type(
     })
 }
 
-/// ODBC 3.x reports binary precision for the approximate numeric types, ODBC 2.x
-/// decimal digits.
-fn float_precision(data_type: SqlSmallInt, is_odbc3: bool) -> SqlULen {
-    match (data_type, is_odbc3) {
-        (SQL_REAL, true) => 24,
-        (SQL_FLOAT, true) => 53,
-        (SQL_REAL, false) => 7,
-        (SQL_FLOAT, false) => 15,
+/// ODBC 3.x reports binary precision for the approximate numeric types.
+fn float_precision(data_type: SqlSmallInt) -> SqlULen {
+    match data_type {
+        SQL_REAL => 24,
+        SQL_FLOAT => 53,
         _ => {
             debug_assert!(false, "float_precision called with {data_type}");
-            15
+            53
         }
     }
 }
@@ -1190,7 +1177,7 @@ mod tests {
     #[test]
     fn parses_mssql_python_integer_metadata() {
         let (_, description) =
-            parse_parameter_row(&row(1, TdsDataType::IntN, 4, 10, 0), 1, true).unwrap();
+            parse_parameter_row(&row(1, TdsDataType::IntN, 4, 10, 0), 1).unwrap();
         assert_eq!(
             description,
             ParameterDescription {
@@ -1245,7 +1232,7 @@ mod tests {
         ];
 
         for (row, expected) in cases {
-            assert_eq!(parse_parameter_row(&row, 1, true).unwrap().1, expected);
+            assert_eq!(parse_parameter_row(&row, 1).unwrap().1, expected);
         }
     }
 
@@ -1253,7 +1240,7 @@ mod tests {
     fn udt_parameter_size_matches_msodbcsql() {
         for length in [892, -1, i32::from(u16::MAX)] {
             let (_, description) =
-                parse_parameter_row(&row(1, TdsDataType::Udt, length, 0, 0), 1, true).unwrap();
+                parse_parameter_row(&row(1, TdsDataType::Udt, length, 0, 0), 1).unwrap();
 
             assert_eq!(
                 description,
@@ -1269,9 +1256,9 @@ mod tests {
 
     #[test]
     fn rejects_invalid_server_metadata() {
-        assert!(parse_parameter_row(&row(2, TdsDataType::IntN, 4, 10, 0), 1, true).is_err());
-        assert!(parse_parameter_row(&row(1, TdsDataType::DecimalN, 17, 0, 0), 1, true).is_err());
-        assert!(parse_parameter_row(&row(1, TdsDataType::TimeN, 5, 0, 8), 1, true).is_err());
+        assert!(parse_parameter_row(&row(2, TdsDataType::IntN, 4, 10, 0), 1).is_err());
+        assert!(parse_parameter_row(&row(1, TdsDataType::DecimalN, 17, 0, 0), 1).is_err());
+        assert!(parse_parameter_row(&row(1, TdsDataType::TimeN, 5, 0, 8), 1).is_err());
     }
 
     /// A scale-bearing type whose scale column is NULL describes something other
@@ -1280,14 +1267,14 @@ mod tests {
     fn rejects_missing_scale_for_scale_bearing_types() {
         let mut time_row = row(1, TdsDataType::TimeN, 5, 0, 3);
         time_row[SUGGESTED_SCALE] = ColumnValues::Null;
-        assert!(parse_parameter_row(&time_row, 1, true).is_err());
+        assert!(parse_parameter_row(&time_row, 1).is_err());
 
         let mut decimal_row = row(1, TdsDataType::DecimalN, 17, 12, 3);
         decimal_row[SUGGESTED_PRECISION] = ColumnValues::Null;
-        assert!(parse_parameter_row(&decimal_row, 1, true).is_err());
+        assert!(parse_parameter_row(&decimal_row, 1).is_err());
 
         // A type with no scale is unaffected by the NULL its row already carries.
-        assert!(parse_parameter_row(&row(1, TdsDataType::Int4, 4, 0, 0), 1, true).is_ok());
+        assert!(parse_parameter_row(&row(1, TdsDataType::Int4, 4, 0, 0), 1).is_ok());
     }
 
     /// The metadata RPC must send the statement text as `nvarchar(max)`:
@@ -1304,7 +1291,7 @@ mod tests {
 
     #[test]
     fn collector_requires_one_row_per_marker() {
-        let description = describe_tds_type(TdsDataType::Int4, 4, None, None, true).unwrap();
+        let description = describe_tds_type(TdsDataType::Int4, 4, None, None).unwrap();
 
         let mut collector = DescriptionCollector::new(2);
         collector.accept(0, description).unwrap();

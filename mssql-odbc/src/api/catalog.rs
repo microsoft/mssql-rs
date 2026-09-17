@@ -81,7 +81,7 @@ use crate::error::free_errors;
 use crate::handles::stmt::{
     STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT, STMT_STATE_EXEC_STARTED, STMT_STATE_PREPARED,
 };
-use crate::handles::{HandleType, OdbcVersion, StmtHandle, handle_from_raw};
+use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 
 /// Maximum SQL Server identifier length (`SYSNAMELEN` in msodbcsql
 /// `sqlcdd.cpp`). Declared length for every catalog/schema/table/column
@@ -460,20 +460,6 @@ fn qualifier_value(catalog: &Arg, unmatchable: bool) -> Option<String> {
     } else {
         catalog.as_deref().map(unescape_search_pattern)
     }
-}
-
-/// Whether the application declared ODBC 2.x (`SQLSetEnvAttr(SQL_ATTR_ODBC_VERSION,
-/// SQL_OV_ODBC2)`), read from the parent ENV. Selects `@ODBCVer` / `@fUsePattern`
-/// inclusion exactly as `get_type_info::sql_get_type_info_w_safe` does for
-/// `SQLGetTypeInfo`. Returns `Err(SQL_ERROR)` on a poisoned ENV mutex instead
-/// of guessing a version, matching `get_type_info.rs`'s identical check.
-fn is_2x_app(stmt: &StmtHandle) -> Result<bool, SqlReturn> {
-    let env = stmt.parent_dbc().parent_env();
-    let Ok(env_state) = env.inner.lock() else {
-        error!("catalog function: env mutex poisoned reading ODBC version");
-        return Err(SQL_ERROR);
-    };
-    Ok(env_state.odbc_version == OdbcVersion::Odbc2)
 }
 
 /// Runs a catalog-function stored procedure and leaves its result set open
@@ -975,10 +961,6 @@ fn sql_columns_w_safe(
     ) {
         return rc;
     }
-    let is_2x = match is_2x_app(stmt) {
-        Ok(is_2x) => is_2x,
-        Err(rc) => return rc,
-    };
     let qualify_catalog = qualification_catalog(&catalog, &table, &schema);
     let retry_on_error = !is_blank(&catalog);
     let build_params = |unmatchable: bool| {
@@ -998,14 +980,9 @@ fn sql_columns_w_safe(
             ),
             nvarchar(column_pattern.as_deref(), PATTERN_ARG_LEN),
         ];
-        // `@ODBCVer` / `@fUsePattern` are both sent only for 3.x apps
-        // (`sqlcdd.cpp` lines 1809-1812, 1827-1843); `sp_columns_100` runs the
-        // ODBC 2.x column-name/type behavior unless told otherwise.
-        let named = if is_2x {
-            None
-        } else {
-            Some(vec![odbc_ver_param(), named_bit("fUsePattern", true)])
-        };
+        // `@ODBCVer` / `@fUsePattern` select the ODBC 3.x column-name/type
+        // behavior (`sqlcdd.cpp` lines 1809-1812, 1827-1843).
+        let named = Some(vec![odbc_ver_param(), named_bit("fUsePattern", true)]);
         (positional, named)
     };
 
@@ -1682,10 +1659,6 @@ fn sql_special_columns_w_safe(
         && scope != SQL_SCOPE_CURROW
         && (scope != SQL_SCOPE_TRANSACTION || txn_isolation != SQL_TXN_SERIALIZABLE);
 
-    let is_2x = match is_2x_app(stmt) {
-        Ok(is_2x) => is_2x,
-        Err(rc) => return rc,
-    };
     let qualify_catalog = qualification_catalog(&catalog, &table, &schema);
     let retry_on_error = !is_blank(&catalog);
     let build_params = move |unmatchable: bool| {
@@ -1705,11 +1678,7 @@ fn sql_special_columns_w_safe(
             nvarchar(Some(scope_char), 1),
             nvarchar(Some(nullable_char), 1),
         ];
-        let named = if is_2x {
-            None
-        } else {
-            Some(vec![odbc_ver_param()])
-        };
+        let named = Some(vec![odbc_ver_param()]);
         (positional, named)
     };
 

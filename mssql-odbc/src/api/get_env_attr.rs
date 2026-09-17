@@ -80,7 +80,6 @@ fn sql_get_env_attr_safe(
         SQL_ATTR_ODBC_VERSION => {
             let v = match state.odbc_version {
                 OdbcVersion::Unset => 0u32,
-                OdbcVersion::Odbc2 => crate::api::odbc_types::SQL_OV_ODBC2,
                 OdbcVersion::Odbc3 => crate::api::odbc_types::SQL_OV_ODBC3,
                 OdbcVersion::Odbc3_80 => crate::api::odbc_types::SQL_OV_ODBC3_80,
             };

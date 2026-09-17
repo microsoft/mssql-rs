@@ -2,383 +2,117 @@
 applyTo: "mssql-odbc/**"
 ---
 
-# mssql-odbc — Rust Guidelines
+# mssql-odbc Engineering Instructions
 
-Rules for writing safe, panic-free Rust in the ODBC driver. This crate produces
-a C shared library loaded via `dlopen` into arbitrary host processes — panics
-unwinding across the FFI boundary, undefined behavior, and memory errors are all
-fatal and unrecoverable.
+Crate-specific requirements for changes under `mssql-odbc/`.
 
-## Project context
+## Index
 
-Before making changes, also read [mssql-odbc/README.md](../../mssql-odbc/README.md)
-for architecture, supported features, and build/run instructions.
+- [1. Before making changes](#1-before-making-changes)
+- [2. Parity reference: the classic C++ msodbcsql driver](#2-parity-reference-the-classic-c-msodbcsql-driver)
+- [2.1. Verifying parity claims and recording deviations](#21-verifying-parity-claims-and-recording-deviations)
+- [2.2. ODBC version handling](#22-odbc-version-handling)
+- [3. No panics](#3-no-panics)
+- [4. Diagnostics and error handling](#4-diagnostics-and-error-handling)
+- [5. Unsafe code](#5-unsafe-code)
+- [6. Ownership and memory](#6-ownership-and-memory)
+- [7. Concurrency](#7-concurrency)
+- [7.1. Handle hierarchy and locking](#71-handle-hierarchy-and-locking)
+- [7.1.1. DM guarantees we rely on](#711-dm-guarantees-we-rely-on)
+- [7.1.2. Locking rules](#712-locking-rules-mirroring-msodbcsql)
+- [7.2. Known descriptor concurrency gap](#72-known-descriptor-concurrency-gap)
+- [8. FFI boundary conventions](#8-ffi-boundary-conventions)
+- [9. Types and casts](#9-types-and-casts)
+- [10. Testing](#10-testing)
 
-## Parity reference: the classic C++ msodbcsql driver
+## 1. Before making changes
 
-The classic C++ **msodbcsql** driver (Microsoft ODBC Driver for SQL Server) is the
-authoritative parity reference for this crate. Its source lives in the
-`SqlClientDrivers` Azure DevOps org (`msodbcsql` project/repo, `master`).
+- Read [mssql-odbc/README.md](../../mssql-odbc/README.md) for project status,
+  architecture, and build/test instructions.
+- Follow the repository-wide conventions in
+  [copilot-instructions.md](../copilot-instructions.md).
 
-- Before adding, changing, or **rejecting** any behavior for parity reasons — auth
-  keywords, connection-string attributes, error/SQLSTATE mapping, Driver Manager
-  interaction — verify it against the actual msodbcsql source. Do **not** rely on
-  MS Learn docs or sibling drivers (JDBC/.NET/go-sqlcmd), which frequently differ
-  from what the C++ driver actually does.
-- When reporting a parity finding, cite the msodbcsql source (file + what it does),
-  and state explicitly whether the decision **matches**, **exceeds**, or **diverges
-  from** msodbcsql so the trade-off is visible.
-- **A behavioral parity claim needs a measurement, not just a source reading, and
-  must name the build.** Record the driver's `SQL_DRIVER_VER`; retail and debug
-  msodbcsql have been observed to disagree with each other and with the source on
-  the same binding. CI compares against retail 18.6.2.1, pinned by
-  `msodbcsqlVersion` (`.pipeline/validation-pipeline.yml`) and installed by
-  `.pipeline/scripts/install-msodbcsql.ps1`; a measurement against any other
-  build settles what that build does, not what the compare leg will do. A
-  `SKIP_IF_COMPARING_MSODBCSQL()` is itself such a claim - it deletes the only
-  check that could contradict the comment above it - so add or keep one only
-  against a compare run that actually fails.
-- **This driver targets ODBC 3.x only.** That scopes out support for ODBC 2.x
-  *applications* — deprecated 2.x entry points, 2.x-only attribute values, and
-  the paths msodbcsql keeps for them. The Driver Manager maps a 2.x application
-  onto the 3.x interface before the call reaches a 3.x driver, so a msodbcsql
-  code path that exists solely for 2.x compatibility is not a parity gap. Say so
-  rather than porting it.
-  - **It does not scope out 2.x-era identifiers.** `SQL_C_DATE` / `SQL_C_TIME` /
-    `SQL_C_TIMESTAMP` are deprecated but still defined in the ODBC 3.x headers, so
-    a 3.x application may legally pass them and the DM remaps nothing. Accept
-    them and fold them onto the 3.x form (`api::type_rules::canonical_c_type`).
-    Check each identifier before assuming the rule applies — the SQL side is not
-    symmetric, ODBC 3.x reuses the 2.x date/time SQL values: `9` is both `SQL_DATE`
-    (2.x concise) and `SQL_DATETIME` (3.x verbose), and `10` is both `SQL_TIME` and
-    `SQL_INTERVAL`. A `ParameterType` of `9` is therefore ambiguous, so it is
-    rejected (`HY004`) rather than folded - 3.x applications use `SQL_TYPE_*`
-    (91-93), and the DM remaps a 2.x application's spelling first. msodbcsql
-    accepts both SQL spellings because it also serves 2.x applications and can
-    disambiguate on the declared version.
-  - **It does not cover 3.0/3.5 vs 3.8.** `SQL_OV_ODBC3` and `SQL_OV_ODBC3_80`
-    are both ODBC 3.x and both in scope. msodbcsql branches on this separately —
-    `Sql2CDefault` selects `rgbTRANSTYPE` when `IS351ORLESSAPP(wStatus)` and
-    `rgbTRANSTYPE380` otherwise — so a version-keyed branch is only out of scope
-    once you have checked *which* version boundary it keys on.
-  - Beware that msodbcsql normalizes types to their 2.x values on entry
-    (`SQLBindParameter` in `Sql/Ntdbms/sqlncli/odbc/sqlcdesc.cpp` maps
-    `SQL_TYPE_*` down to `SQL_DATE`/`SQL_TIME`/`SQL_TIMESTAMP`, and `SQL_DOUBLE`
-    to `SQL_FLOAT`, before validating). Downstream code accepting a 2.x spelling
-    therefore does **not** prove it supports 2.x applications, and a branch that
-    looks reachable in a validator may be dead once the caller's normalization is
-    accounted for. Read the caller before concluding either way.
-- **A divergence justified by "the consumer does not need parity here" is a claim
-  about the consumer's code, and needs the same evidence as a claim about
-  msodbcsql: cite the file and function you read.** `SQL_CA_SS_VARIANT_TYPE` was
-  recorded as a *permanent* divergence returning `SQL_C_CHAR` for exact numerics
-  on the reasoning that mssql-python "requests decimal as character data, so
-  `SQL_NUMERIC_STRUCT` is not needed". mssql-python does fetch the characters —
-  but only after routing on a `SQL_C_NUMERIC` answer
-  (`ddbc_bindings.cpp`, `MapVariantCTypeToSQLType` → the `SQL_DECIMAL`/`SQL_NUMERIC`
-  case), so answering `SQL_C_CHAR` made it hand back `str` instead of
-  `decimal.Decimal` (AB#47702). The delivery path was read correctly and the
-  routing that selects it was never read at all. Never mark a divergence
-  "permanent" on an unread consumer.
+## 2. Parity reference: the classic C++ msodbcsql driver
 
-## Deliberate deviations
+The classic C++ Microsoft ODBC Driver for SQL Server is the authoritative
+implementation reference for compatibility work. Its source is in the
+`SqlClientDrivers` Azure DevOps organization, `msodbcsql` project and repository,
+on the `master` branch.
 
-Entries here are **decisions**: we know what msodbcsql does, we could match it,
-and we chose not to.
+### 2.1. Verifying parity claims and recording deviations
 
-Add one only when both are true:
+- Read the owning msodbcsql caller and implementation before matching,
+  rejecting, or documenting behavior. Do not infer behavior from MS Learn or
+  another SQL Server driver.
+- A source reading does not establish retail behavior. Support every behavioral
+  parity claim with both a source citation (file, function, and relevant branch)
+  and a measurement that records `SQL_DRIVER_VER` and the tested build.
+- CI compares against the version pinned by `msodbcsqlVersion` in
+  `.pipeline/validation-pipeline.yml`. Use the e2e runner's
+  `--compare-with-msodbcsql` mode for observable parity checks.
+- Add or retain `SKIP_IF_COMPARING_MSODBCSQL()` only for a measured divergence;
+  the skip removes the assertion from the reference-driver leg.
+- A consumer-based divergence requires evidence from both the consumer's
+  routing path and its delivery path.
+- Record every deliberate deviation that meets the registry's
+  [entry criteria](../../mssql-odbc/docs/parity-deviations.md#updating-this-document)
+  in that file as part of the same change. The registry entry must state what
+  msodbcsql does, what this driver does instead, why the difference is
+  intentional, and any required sign-off. Link a work item when one tracks
+  follow-up work. Update the entry whenever the decision changes.
+- Do not register an unimplemented behavior as a deliberate deviation. Track
+  it as an implementation gap instead. The registry explains the exact
+  boundary between these categories.
 
-- **An application can tell the difference.** Rejecting something msodbcsql
-  accepts always qualifies; accepting something it rejects is milder but counts.
-- **The decision is bigger than one function.** It sets a rule other code has to
-  follow - an encoding, a connection-string keyword, a length unit - or it
-  needed sign-off that a reader must be able to find without reading code.
+### 2.2. ODBC version handling
 
-Two things that look like deviations but are not:
+- **Supported contract: ODBC 3.x only.** The exported
+  `SQLSetEnvAttr(SQL_ATTR_ODBC_VERSION)` implementation accepts
+  `SQL_OV_ODBC3` and `SQL_OV_ODBC3_80`. It rejects `SQL_OV_ODBC2` and every
+  other value with `SQL_ERROR` / `HY024` without changing the environment's
+  previously selected version. **Preserve this behavior** and its
+  `api::set_env_attr` unit tests.
+- **Driver Manager behavior is not driver behavior.** A Driver Manager may
+  accept `SQL_OV_ODBC2` from a 2.x application and map that application onto
+  the ODBC 3.x driver interface before loading or calling this driver. A test
+  that invokes `SQLSetEnvAttr` through a Driver Manager therefore measures the
+  Driver Manager, not necessarily this driver's setter. **Do not add ODBC 2.x
+  application behavior to the driver.**
+- **Advertised driver version: ODBC 3.80.** The implemented
+  `SQLGetInfo(SQL_DRIVER_ODBC_VER)` response is `"03.80"`.
+  `SQL_ODBC_VER` describes the Driver Manager when one is present; the direct
+  driver entry point also currently returns `"03.80"`. This represents the highest
+  supported ODBC interface version for this driver.
+- **Deprecated C identifiers remain valid in ODBC 3.x.** Normalize
+  `SQL_C_DATE`, `SQL_C_TIME`, and `SQL_C_TIMESTAMP` to `SQL_C_TYPE_DATE`,
+  `SQL_C_TYPE_TIME`, and `SQL_C_TYPE_TIMESTAMP` with
+  `api::type_rules::canonical_c_type` before validation or conversion. **Do
+  not reject an identifier merely because it originated in ODBC 2.x.**
+  **Why:** ODBC 3.x headers still define these deprecated aliases, so a 3.x
+  application may legally pass them without any Driver Manager translation.
+- **C-type normalization does not apply to SQL type identifiers.** Values `9`
+  and `10` are ambiguous in ODBC 3.x (`SQL_DATE`/`SQL_DATETIME` and
+  `SQL_TIME`/`SQL_INTERVAL`). Parameter SQL types use the ODBC 3.x concise
+  identifiers `SQL_TYPE_DATE`, `SQL_TYPE_TIME`, and `SQL_TYPE_TIMESTAMP` (`91`
+  through `93`); ambiguous values are rejected with `HY004`. **Why:** folding
+  an ambiguous SQL identifier would guess the caller's intent and could bind a
+  different SQL type; the corresponding C identifiers have no such ambiguity.
+- **Preserve the ODBC 3.0-to-3.8 behavior boundary.** Both versions are
+  supported, but `SQL_C_DEFAULT` resolution uses `SQL_C_SS_TIME2` and
+  `SQL_C_SS_TIMESTAMPOFFSET` only when the environment selected
+  `SQL_OV_ODBC3_80`; `SQL_OV_ODBC3` uses the pre-3.8 defaults. **Keep this check
+  centralized in `OdbcVersion::uses_3_80_types`.** **Why:** those extended C
+  types entered the contract at ODBC 3.8; returning them to a 3.0 application
+  would expose types and buffer layouts it did not declare support for.
+- **Read the msodbcsql API entry point before interpreting downstream
+  validators.** Its `SQLBindParameter` path maps `SQL_TYPE_DATE`,
+  `SQL_TYPE_TIME`, and `SQL_TYPE_TIMESTAMP` to their older values, and maps
+  `SQL_DOUBLE` to `SQL_FLOAT`, before validation. A downstream 2.x identifier
+  therefore does not establish that an ODBC 2.x branch belongs in this driver.
+  **Why:** reading only the validator loses the caller's normalization context
+  and can make a transformed ODBC 3.x input look like native ODBC 2.x support.
 
-- **A gap** - something not built yet, however deliberately deferred.
-  Ex: `SQLBindCol` rejects `SQL_C_DEFAULT` where msodbcsql resolves it at fetch
-  time; that is a code comment plus a work item, not an entry here.
-- **A difference nothing can observe**, or one that lives in a single function.
-  Explain those where they happen.
-
-Each entry gives: what msodbcsql does, with a source citation; what this driver
-does instead; why; the work item; and, where applications can regress, who
-signed off and when. Keep per-build measurements in the work item so this file
-does not grow every time a new msodbcsql build is measured.
-
-1. `ActiveDirectoryManagedIdentity` is accepted as an alias for managed-identity
-   authentication. msodbcsql recognizes only `ActiveDirectoryMSI`
-   (`Sql/Ntdbms/sqlncli/msdart/inc/dlgattr.h` → `OPTIONADMSI L"ActiveDirectoryMSI"`);
-   `ActiveDirectoryManagedIdentity` does not appear anywhere in the msodbcsql source.
-   Added to match MS Learn and the sibling drivers (JDBC/.NET/go-sqlcmd). Tracked in AB#46066.
-2. `SQL_C_DEFAULT` resolves the wide character SQL types to `SQL_C_WCHAR`, and
-   `SQL_GUID` to `SQL_C_GUID`, following the ODBC 3.x default-C-type table.
-   Applies to every direction: `SQLBindParameter` resolves at bind time,
-   `SQLFetchScroll` resolves a bound column per fetch from the IRD, and
-   `SQLGetData` resolves per call from the same column metadata, all through the
-   same `type_rules::resolve_default_c_type`.
-   msodbcsql's `Sql2CDefault` reads `rgbTRANSTYPE380`
-   (`Sql/Ntdbms/sqlncli/odbc/sqlcmisc.cpp`), which resolves both to `SQL_C_CHAR`
-   — an ANSI-transfer default this driver has no equivalent for, since its
-   `SQL_C_CHAR` is UTF-8. Resolving UTF-16 application input to a UTF-8 buffer
-   type would silently corrupt data. On the fetch side the same choice avoids
-   transcoding every wide column by default. Confirmed against msodbcsql18 for
-   `nvarchar` (three narrow bytes, indicator 3) and `uniqueidentifier` (the
-   36-character text form, indicator 36). Note this covers only those two rows:
-   `SQL_SS_XML` resolves to `SQL_C_WCHAR` in *both* drivers
-   (`sqlcmisc.cpp:179` and `:218`, measured as UTF-16 with indicator 30), so it
-   is **not** a deviation. `DefaultCTypeWideCharParam` and
-   `DefaultCTypeGuidRoundTrips` carry `SKIP_IF_COMPARING_MSODBCSQL()` for the
-   two parameter-side halves. Tracked in AB#47365.
-3. `SQL_C_CHAR` is **UTF-8** in both directions; the driver never reads or
-   writes the client code page. msodbcsql uses the client code page -
-   `dwClientCodePage = SystemLocale::Singleton().AnsiCP()`
-   (`odbc/sqlcprot.h:2830`), which is `GetACP()` on Windows
-   (`Common/include/Localization.hpp:742`) and `nl_langinfo(CODESET)` elsewhere
-   (`LocalizationImpl.hpp:386`); the parameter path reads it directly at
-   `sqlcfunc.cpp:2913`. The two therefore agree under a UTF-8 locale and differ
-   on a default Windows one. Taken because mssql-python, the only supported
-   consumer, is UTF-8 native; the ODBC "C Data Types" appendix fixes no encoding
-   for `SQL_C_CHAR`, so neither choice is more conformant. Revisit if a second
-   consumer targets this driver on Windows. Tracked in AB#47564 (fetch) and
-   AB#47565 (parameters). `SQL_C_WCHAR` is UTF-16LE on both drivers.
-4. **Parameter length is measured in UTF-16 units for both character C types.**
-   msodbcsql counts UTF-16 units in three of its four arms - both wide-source
-   arms, and the narrow-to-wide walk, which counts an astral character as two
-   (`odbc/sqlcfunc.cpp:2935`) - but counts source bytes for narrow-to-narrow
-   (`cchDest = cbData`, `:2952`). That byte count is the wire length only while
-   no client-side transcode happens: TDS carries a collation with char data, so
-   the bytes normally ship under a declared collation and the server converts.
-   `DoCharToCharConversion` (`odbc/sqlcprot.h:4113`) enables client-side
-   conversion for an encoding TDS cannot name - a UTF-8 client against a
-   non-UTF-8 server, or the ISO-8859-x range - and translation is on by default
-   (`SQL_XL_DEFAULT`). In that configuration msodbcsql transcodes yet still
-   measures the *pre-transcode* UTF-8 bytes, so it rejects a four-character
-   accented string from a `varchar(4)` that the four bytes it actually sends
-   would fit, while accepting the same value as `SQL_C_WCHAR`. Because this
-   driver's `SQL_C_CHAR` is always UTF-8, copying the byte rule made that
-   latent msodbcsql defect unconditional. The uniform unit is therefore taken
-   to stop the two C types disagreeing on one value, not to match msodbcsql -
-   it is a divergence in the configuration closest to this driver, on the same
-   footing as the narrow-to-wide off-by-one at `sqlcfunc.cpp:2926` that is also
-   deliberately not replicated. The count still errs low against a `_UTF8` or
-   DBCS collation: a bounded `char`/`varchar` surfaces `HY000` from
-   `serialize_char_varchar_direct` rather than `22001`, and the `max` and
-   `text`/`ntext` types carry no check at all and send the over-long value.
-   **This regresses a subset of inputs rather than being a pure win** - three
-   U+2615 into `varchar(3)` was a correct `22001` and is now an opaque failure,
-   so CJK and astral input bound with an exact character count is the shape that
-   suffers. Taken because over-rejection has no application workaround while
-   under-rejection still errors, and because byte-counting both C types would
-   break the wide arm that msodbcsql gets right. Exactness needs the collation at
-   this layer. Signed off by Theekshna Kotian (product owner) on 2026-08-27.
-   Tracked in AB#47584.
-5. **An integer parameter bound to a character type is length-checked.**
-   msodbcsql length-checks no integer C type (`odbc/sqlcfunc.cpp:2586`, `:2854`,
-   `:3165`, `:3177`); what it does instead is undefined per build. Binding
-   `12345` as `SQL_C_SLONG` to a `SQL_VARCHAR` of `ColumnSize` 3: retail
-   18.05.0002 returns `SQL_SUCCESS` with no diagnostic and sends `varchar(3)`
-   holding `"123"`, debug 18.06.0002 aborts on
-   `assert(*pstMaxLen > 0 && *pstMaxLen >= stLen)` (`odbc/sqlcmisc.cpp:7458`),
-   retail 18.6.2.1 hangs in `SQLExecute`. This driver reports `22001`. The
-   fallthrough at `:7459` reads as *widening* the declaration and no measured
-   build does that, so do not re-derive this one from source.
-   `IntegerParamTooWideForColumnSizeIs22001` and
-   `NegativeSignCountsAgainstColumnSize` carry `SKIP_IF_COMPARING_MSODBCSQL()`.
-   Signed off by Theekshna Kotian (product owner) on 2026-08-28. Tracked in
-   AB#47369.
-6. **A `SQL_C_WCHAR` buffer of nothing but blanks bound to an integer type is
-   `22018`; msodbcsql answers `HY000`** (retail 18.05.0002). The only input on
-   this path where the two differ - the same blanks as `SQL_C_CHAR`, a
-   zero-length wide buffer, and every other invalid literal in either width
-   answer `22018` on both, so `CharParamInvalidLiteralIs22018` and
-   `LocaleFormattedNumbersAreRejected` run unskipped. Mechanism not established;
-   only the state is evidence. Do not generalise it - `CVT_ERROR` =
-   `IDS_22_005` otherwise resolves to `22018` through the `std_error` branch of
-   `SQL_DIAG_SQLSTATE` (`odbc/sqlcerr.cpp:990`) and
-   `cli_common/src/clntcomn.cpp:1015`, not the server-keyed table at
-   `odbc/sqlcstr.cpp:136`. `BlankOnlyWideLiteralIs22018` carries
-   `SKIP_IF_COMPARING_MSODBCSQL()`. Tracked in AB#47369, which is where the
-   outstanding 18.6.2.1 measurements land - keep the running record there
-   rather than growing this file per build.
-7. **A bound `max`/LOB text column converted to a typed C target is refused
-   above 1 MiB; msodbcsql converts a truncated prefix and warns.** Both drivers
-   cap what a typed conversion may materialize - a `varchar(max)` carries up to
-   2 GB and the converter needs one contiguous literal. This driver's cap is
-   `PLP_TYPED_MATERIALIZE_LIMIT` (`api/fetch_scroll.rs`) at 1 MiB; past it the
-   value is drained to keep the row synchronized and answered `HYC00`.
-   msodbcsql clamps to `2*CONVBUF_SIZE` (~1244 bytes, sized for the longest
-   legal `double` literal) in `EstimateBytesToRead` (`odbc/sqlcdata.cpp`), then
-   converts that prefix and reports `01004` rather than failing.
-   **Measured on 18.06.0001**, `varchar(max)` bound to a typed target:
-   `'0'`×2000 + `'1'` returns `SQL_SUCCESS_WITH_INFO` with `01004` and a value
-   of **`0`** - the truncated prefix, not the `1` in the column - for both
-   `SQL_C_SBIGINT` and `SQL_C_SLONG`, and the same past 1 MiB; `'x'`×5000
-   returns `22018` (the parse fails before truncation is considered, so both
-   drivers agree there); a short `'42'` returns `42` on both. The skipped
-   case's own payload, `'1'`×1048577 into `SQL_C_SLONG`, overflows even the
-   clamped prefix and returns `22003` there against this driver's `HYC00` - so
-   both drivers error on it, with different states, and
-   `AOversizedBoundVarcharMaxTypedConversionIsRefusedAndDrained` carries
-   `SKIP_IF_COMPARING_MSODBCSQL()` on a measured divergence rather than an
-   assumed one. Refusing is deliberate: `01004` is "string data, right
-   truncated", which application code routinely ignores on a numeric fetch
-   because scalars are not expected to be truncatable, so on the prefix-parses
-   shape msodbcsql's answer is a silently wrong number. Note the cap keys on
-   the column's byte count, not on whether the text parses, so any large
-   `varchar(max)` bound to a typed target reaches it - schema drift, not a
-   contrived input. CI compares against 18.6.2.1; this measurement is
-   18.06.0001, so re-measure there before relying on the exact prefix length.
-   Tracked in AB#47767.
-8. **Widening a bound narrow `max` column to `SQL_C_WCHAR` truncates on a whole
-   character.** A buffer with no room for the final surrogate pair ends before
-   it; msodbcsql leaves the lone high surrogate in the last payload slot on this
-   narrow-source widening path, though its wide-source path is surrogate-safe
-   (`GetColDataSurrogateSafe`, and `TrimPartialCodePt` for partial sequences).
-   This driver's existing bound `nvarchar(max)` delivery already trims to a
-   character boundary, and handing back text that does not decode from one `max`
-   type but not the other would be worse than the divergence.
-   `ABoundUtf8VarcharMaxDoesNotSplitASurrogatePairWhenWidening` carries
-   `SKIP_IF_COMPARING_MSODBCSQL()`. Tracked in AB#47767.
-
-   The same rule applies to a bound UTF-8-collation `varchar(max)` delivered as
-   `SQL_C_CHAR`, which is verbatim on both drivers because the wire bytes are
-   already UTF-8. Measured on build 173919 with a 3-byte character against an
-   8-byte payload slot: msodbcsql fills all 8 and returns
-   `"\xE4\xBD\xA0\xE4\xBD\xA0\xE4\xBD"`, ending mid-character, where this driver
-   stops at 6. `ABoundUtf8CollationVarcharMaxTruncatesOnACharacterBoundary`
-   splits per-leg on `ODBC_TEST_TARGET` rather than skipping, so the shared part
-   — both truncate, report `01004`, and deliver a prefix — stays measured.
-9. A bound `time` / `datetimeoffset` column strides by
-    `sizeof(SQL_SS_TIME2_STRUCT)` (12) and
-    `sizeof(SQL_SS_TIMESTAMPOFFSET_STRUCT)` (20) rather than by `BufferLength`.
-    Both drivers resolve these to the same C types under ODBC 3.8
-    (`rgbTRANSTYPE380`, `sqlcmisc.cpp:220-221`), but msodbcsql's `BindOffset`
-    switch has no case for them and falls through to
-    `default: dwOffset = lpbindinfo->cbValueMax` (`sqlcfunc.cpp:2280-2283`).
-    Measured: a two-row rowset bound `SQL_C_DEFAULT` with `BufferLength` 40 puts
-    msodbcsql's second row at byte offset 40, where this driver puts it at 12;
-    the indicator is 12 in both, so only the stride differs. This is the safer
-    direction — msodbcsql with `BufferLength` 0 strides 0 and stacks every row in
-    slot 0 — so the behaviour is kept and registered rather than matched.
-    Pre-existing for an explicit `SQL_C_SS_TIME2` bind; deferred
-    `SQL_C_DEFAULT` resolution makes it reachable without the application naming
-    the C type.
-10. A `SQL_C_DEFAULT` binding that resolves to a fixed-width C type wider than
-    the application's declared `BufferLength` is left unresolved and fails the
-    row (`HYC00`) rather than writing. `BufferLength` is ignored for a
-    fixed-width target, which is safe when the application named that type; a
-    `SQL_C_DEFAULT` binding names nothing, so honouring the C type's width would
-    put 16 bytes into a 4-byte slot for a `uniqueidentifier` column, where
-    msodbcsql resolves to `SQL_C_CHAR` and truncates inside `BufferLength`.
-    `BufferLength` 0 is exempt — the documented idiom for a fixed-width target,
-    carrying no width claim. `SQLGetData` refuses the same shape but does **not**
-    carry that zero exemption, because there 0 is *also* how an application asks
-    for a length without wanting a value written (the `SQL_C_BINARY` probe), so
-    honouring the C type's width would put up to 20 bytes into a buffer the
-    caller declared as holding none. Whether these should instead report `01004`
-    with a truncated value, closer to msodbcsql, is open and untracked.
-11. A `varbinary` / `image` / CLR UDT column bound `SQL_C_DEFAULT` resolves to
-    `SQL_C_BINARY` (`describe_col.rs` → `SQL_VARBINARY` / `SQL_LONGVARBINARY` /
-    `SQL_SS_UDT`, then `resolve_default_c_type`), which bound delivery does not
-    implement yet (AB#47239), so it fails per row with `HYC00`. For `varbinary`
-    and `image`, deferred resolution exposes the pre-existing explicit
-    `SQL_C_BINARY` gap without the application naming the C type. A UDT's former
-    `SQL_C_CHAR` default was already unsupported, so the new mapping does not
-    regress observable fetch behavior. msodbcsql resolves all three to
-    `SQL_C_BINARY` and delivers the bytes. `SQLGetData` answers the same way
-    through the resolved target, but how much of the `SQL_C_BINARY` contract
-    survives depends on the path: a non-PLP `varbinary(n)` still answers the
-    zero-length length probe, while a `varbinary(max)` / `image` refuses even
-    that, because `stream_active_plp_chunk` admits only the two character
-    targets before it looks at `BufferLength` (AB#47815).
-12. A zero-length `SQL_C_BINARY` `SQLGetData` on a column whose **source SQL
-    type is fixed-length** reports `01004` / `SQL_SUCCESS_WITH_INFO`, where
-    msodbcsql reports `22003` / `SQL_ERROR` and leaves the indicator untouched.
-    The indicator carries a byte count where `binary_length` has an explicit arm
-    (`int` → 4, `money` → 8, `uniqueidentifier` → 16) and `SQL_NO_TOTAL` where it
-    falls through to the catch-all. That `SQL_NO_TOTAL` class is **decimal and
-    numeric as well as every temporal type** (`date`, `time`, `datetime2`,
-    `datetimeoffset`) — this driver has no binary encoding for any of them to
-    promise a length for.
-    **Source-verified.** msodbcsql selects between two policy classes on
-    `IsFixedSqlType()` (`Sql/Ntdbms/sqlncli/odbc/sqlcprot.h`), which
-    deliberately classifies `SQL_BINARY`, `SQL_CHAR`, `SQL_WCHAR` and every
-    partial-length type (`sqlcprot.h`, `IsPartialLenType`) as *not* fixed —
-    so the boundary is the **SQL** type, not the C type, and `binary(9)` sits
-    on the variable side, while `decimal` / `numeric` sit on the fixed side
-    (absent from both the `IsPartialLenType` case list and the
-    `IsFixedSqlType` exclusion set). `ColDataRetriever<>::GetColData`
-    (`odbc/sqlcdata.h`) instantiates `BinaryOutputWithFixedLengthSqlType` for a
-    fixed source type, where delivery to `SQL_C_BINARY` is all-or-nothing (the
-    source comments that such data "is fetched in one call"), so a short buffer
-    is a data overflow rather than a truncation:
-    `if (... == BinaryWithFixedLengthSqlType && (SIZE_T)cbBuf < cbDataAvail)
-    { wError = IDS_22_003; }` in `InternalGetColData`, and `Error = CVT_PREC`
-    (`#define CVT_PREC IDS_22_003`, `sqlcprot.h`) out of `ConvertToBinary`
-    (`odbc/sqlccnvt.cpp`) on the converting route that `datetime2` takes.
-    `IDS_22_003` maps to `22003` in `cli_common/src/clntcomn.cpp`. A variable
-    source type instead reads `min(cbBuf, avail)` bytes and reports
-    `if (!IsFixedOrBinaryWithFixedServerType() && cbDataAvail)
-    wError = IDS_01_004;` with the full remaining length in the indicator.
-    Line numbers are deliberately omitted: the reading is from `master`
-    (`7a0c3d59`), not the 18.6.2.1 release branch, so the file + function +
-    condition are the durable part of the citation.
-    **Measured against 18.6.2.1** (`SQL_DRIVER_VER` `18.06.0002`) — every
-    fixed-source type below answers `SQL_ERROR` / `22003` there, and `01004` /
-    `SQL_SUCCESS_WITH_INFO` here, differing only in the indicator this driver
-    reports:
-
-    | column | msodbcsql | this driver |
-    |---|---|---|
-    | `int`, `money`, `smallmoney`, `uniqueidentifier` | `22003` | `01004`, byte count (4 / 8 / 4 / 16) |
-    | `decimal(10,2)`, `decimal(38,10)`, `numeric(18,4)` | `22003` | `01004`, `SQL_NO_TOTAL` |
-    | `date`, `time(7)`, `datetime2(3)`, `datetimeoffset(3)` | `22003` | `01004`, `SQL_NO_TOTAL` |
-    | `binary(9)`, `varbinary(max)`, `nvarchar(10)` | `01004` + length | `01004` + length (agrees) |
-
-    This driver does not distinguish a `sql_variant` column from the value it
-    captured, and mssql-python's `sql_variant` support depends on that same
-    zero-length probe succeeding (`ddbc_bindings.cpp`,
-    `SQLGetData_ptr(hStmt, i, SQL_C_BINARY, NULL, 0, ...)` gated on
-    `SQL_SUCCEEDED`), so matching `22003` would break every integer variant. The
-    reported truncation is the important half — it is what stops a caller
-    treating an undelivered value as delivered (AB#47537) — and the exact
-    fixed-width SQLSTATE is left to AB#47239, which reworks binary delivery.
-13. An **empty** (zero-length, non-NULL) value answers that same probe with
-    `SQL_SUCCESS` and consumes the column, so a repeat reports `SQL_NO_DATA`;
-    a value with bytes still pending stays resident and repeats its `01004`.
-    This matches msodbcsql, which short-circuits ahead of both checks above on
-    `if (!cbDataAvail) goto Return3;` (`sqlcdata.h`, `InternalGetColData`) and
-    then marks the column `STMT_ST_GETDATA_DONE` because the TDS layer reports
-    nothing remaining (`FIsLenRemaining()`, `tds/TdsParser.h`); the non-empty
-    case is never discarded because `SQLGetData` passes `fFlush = FALSE`
-    (`odbc/sqlcdata.cpp`). Measured identical on 18.6.2.1. One residual
-    divergence, deliberately not matched: a `sql_variant` wrapping an empty
-    value answers `SQL_SUCCESS_WITH_INFO` / `01004` on msodbcsql where this
-    driver answers `SQL_SUCCESS` (a bare empty `varbinary(8)` is `SQL_SUCCESS`
-    on both). It is invisible to mssql-python, whose probe is gated on
-    `SQL_SUCCEEDED`, and
-    `ColAttributeLiveTest.EmptyVariantProbeConsumesValueButKeepsBaseType`
-    accepts either so the parity leg still compares the base type and the
-    `SQL_NO_DATA` re-read.
-14. A numeric parameter truncated before a later data-at-execution parameter
-    posts `01S07` while `SQLExecute` / `SQLExecDirect` returns `SQL_NEED_DATA`.
-    This matches msodbcsql on Windows: `AddRPCUserParameters` posts the
-    `IDS_01_S07` returned by `ParamToSQLType` (`odbc/sqlcmisc.cpp`), and its
-    caller restores `SQL_NEED_DATA` without clearing that diagnostic
-    (`odbc/sqlccmd.cpp`). This driver stores the diagnostic on every platform,
-    pinned by `park_dae_client_posts_numeric_fractional_truncation`. On
-    unixODBC platforms (Linux and macOS), `function_return_ex`
-    (`DriverManager/__info.c`) extracts driver diagnostics for
-    `SQL_SUCCESS_WITH_INFO`, `SQL_ERROR`, and `SQL_NO_DATA`, but not
-    `SQL_NEED_DATA`; therefore the E2E tests key off `_WIN32` and expect no
-    visible diagnostic for either driver everywhere else. Windows expects
-    `01S07`. Build 173710 confirms both outcomes against retail msodbcsql
-    18.6.2.1. Truncation after the first DAE parameter remains silent. Signed
-    off by Theekshna Kotian on 2026-09-09. Tracked in AB#47946.
-
-## No panics
+## 3. No panics
 
 - **Never** use `.unwrap()` or `.expect()` on `Result` or `Option` in
   non-test code. Tests under `#[cfg(test)]` may use them since panics
@@ -386,15 +120,12 @@ does not grow every time a new msodbcsql build is measured.
 - Use `.unwrap_or()`, `.unwrap_or_else()`, `.unwrap_or_default()`, or
   pattern matching instead.
 - For `Mutex::lock()`, return `SQL_ERROR` on poison — use `let Ok(state) = handle.inner.lock() else { return SQL_ERROR; }`. Do **not** recover via `e.into_inner()`.
-- Every FFI entry point must be wrapped in the `crate::ffi_entry!` macro
-  (see [FFI boundary conventions](#ffi-boundary-conventions)). The macro is
-  a last-resort safety net — write code that cannot panic in the first place.
 - Never use `unreachable!()`, `todo!()`, or `unimplemented!()` in non-test code.
   Use explicit error returns instead.
 - Array/slice access: prefer `.get()` over indexing (`[]`), which panics on
   out-of-bounds.
 
-## Error handling
+## 4. Diagnostics and error handling
 
 - All fallible internal functions should return `Result<T, E>` — never panic on
   failure.
@@ -435,8 +166,12 @@ does not grow every time a new msodbcsql build is measured.
 - Every ODBC entry point must clear the handle's diagnostic records at API
   entry by calling `free_errors(...)` after acquiring the handle lock, so a
   fresh call starts without stale diagnostics.
+- **A success code is a promise about the caller's buffer, so never report
+  `SQL_SUCCESS` for a call that wrote less than the indicator claims.** Report
+  `SQL_SUCCESS_WITH_INFO` with `01004` when a read truncates, so the caller knows
+  to grow its buffer.
 
-## Unsafe code
+## 5. Unsafe code
 
 - Minimize `unsafe` blocks — keep them as small as possible and comment
   the safety invariant they rely on.
@@ -460,51 +195,12 @@ does not grow every time a new msodbcsql build is measured.
   `__unaligned`) — see `Sql/Ntdbms/sqlncli/odbc/sqlccnvt.cpp:1677-1714`, where
   each integer source read from an application buffer is
   `*(UNALIGNED SCHAR *)` / `SHORT` / `LONG` and so on.
-- Use `#[unsafe(no_mangle)]` only in `exports.rs` — keep implementations
-  in separate modules as `pub(crate)` safe functions.
+- Use `unsafe fn` only when correctness relies on an unverifiable caller
+  promise. Otherwise use a safe function with small, justified `unsafe` blocks.
+- Use `#[unsafe(no_mangle)]` only in `exports.rs`; keep implementation
+  functions in separate modules with `pub(crate)` visibility.
 
-### Safe-core / unsafe-shell split
-
-Push `unsafe` to the edges. Each FFI implementation is split into two layers:
-
-- A thin `unsafe fn sql_xxx_impl(...)` **shim** whose only job is to turn raw
-  C pointers into validated Rust references:
-  1. Null-check the handle → `SQL_INVALID_HANDLE`.
-  2. `unsafe { handle_from_raw::<T>(handle) }` to obtain `&T`.
-  3. `debug_assert_eq!(h.object_type, HandleType::X)` to catch DM contract
-     violations in debug builds.
-  4. Decode any input strings (`read_utf16`, etc.).
-  5. Delegate everything else to the safe core.
-- A safe `fn sql_xxx_safe(handle: &T, ...) -> SqlReturn` **core** that holds all
-  business logic: locking, state mutation, value mapping. It receives validated
-  references (never raw handle pointers) and only opens small, locally-justified
-  `unsafe { write_if_some(...) }` / `unsafe { copy_with_nul(...) }` blocks to
-  write to caller out-pointers.
-
-Rules of thumb:
-
-- A function should be a **safe `fn`** (even if it contains `unsafe {}` blocks)
-  whenever it can discharge the safety obligation from its own arguments and
-  invariants — e.g. an accessor like `StmtHandle::parent_dbc(&self) -> &DbcHandle`,
-  where `&self` already guarantees a valid handle.
-- A function should be an **`unsafe fn`** only when it relies on an
-  unverifiable caller promise — e.g. the validity of a raw pointer passed
-  across the FFI boundary (the `*_impl` shims).
-- Validation that only inspects scalar arguments (e.g.
-  `debug_assert!(buffer_length >= 0, ...)`) belongs in the safe core, not the
-  shim. The shim should be limited to null-checks and pointer→reference
-  conversion.
-- Preconditions the DM is contractually required to enforce (non-null required
-  pointers, valid length/option values, correct handle type) are checked with
-  `debug_assert!` only — **do not** promote them to a release-build
-  `if`/error-return. The assert documents the DM contract and catches
-  violations in debug builds; in release the driver trusts the DM, matching
-  msodbcsql (which asserts rather than re-validates). Asserts worded
-  *"... — DM should have rejected this"* are intentionally debug-only; leave
-  them as `debug_assert!`. Only values the DM does **not** validate (genuine
-  application inputs) get a runtime check.
-
-## Memory management
+## 6. Ownership and memory
 
 - **Same side allocates and frees.** Whoever produced an allocation owns
   freeing it; the FFI boundary never transfers deallocation responsibility:
@@ -521,7 +217,7 @@ Rules of thumb:
 - Prefer `Box` for single-owner heap objects; use `Arc` only when shared
   ownership is genuinely required.
 
-## Concurrency
+## 7. Concurrency
 
 - The ODBC spec allows Driver Manager to call functions on the same handle
   from different threads. Protect mutable state with `Mutex` or `RwLock`.
@@ -531,13 +227,14 @@ Rules of thumb:
   rule above for the canonical `let Ok(state) = ... else { return SQL_ERROR; }`
   pattern.
 
-### Cross-handle thread safety (alloc / free)
+### 7.1. Handle hierarchy and locking
 
-ODBC handles form a parent–child hierarchy (ENV → DBC → STMT → DESC). The
-Driver Manager (DM) provides serialization guarantees that the driver relies on
-- verified against msodbcsql's behavior:
+ODBC handles form an ownership hierarchy: ENV owns DBCs, and a DBC owns both
+STMTs and DESCs. A STMT may associate with a DESC but does not own it. The
+Driver Manager (DM) provides serialization guarantees that the driver relies
+on; these guarantees were verified against msodbcsql's behavior.
 
-#### DM guarantees we rely on
+#### 7.1.1. DM guarantees we rely on
 
 - The DM ensures all child handles are freed before freeing a parent:
   all DBCs freed before `SQLFreeEnv`, all STMTs freed before `SQLFreeConnect`.
@@ -552,7 +249,7 @@ Driver Manager (DM) provides serialization guarantees that the driver relies on
   call to `SQLDisconnect`, and `SQLDisconnect` automatically drops all
   statements and descriptors.
 
-#### Locking rules (mirroring msodbcsql)
+#### 7.1.2. Locking rules (mirroring msodbcsql)
 
 - **Alloc path**: Lock the parent's mutex to register the new child in its list.
 - **Free path**: Lock the parent's mutex to unregister from its child list.
@@ -585,17 +282,18 @@ Driver Manager (DM) provides serialization guarantees that the driver relies on
   verify the DM upheld its guarantees (e.g., no outstanding children). These
   fire in debug builds only — in release builds the driver trusts the DM and
   frees unconditionally, matching msodbcsql.
-- **Known gap: `SQLSetDescRec`/`SQLSetDescFieldW` don't check
-  `STMT_STATE_FETCH_IN_PROGRESS`**: `SQLBindCol`, `SQLFreeStmt(SQL_UNBIND)`,
-  and `SQLSetStmtAttr` all refuse to touch the ARD while a fetch snapshotted
-  it and is still writing through that snapshot — but the descriptor-field
-  API writes the same records with no such guard, and (unlike those three)
-  would need a DBC → STMT walk to find every statement an explicit,
-  possibly-reassociated descriptor is currently associated with. Tracked in
-  [#472](https://github.com/microsoft/mssql-rs/issues/472); this is a
-  deliberate deferral, not an oversight.
 
-## FFI boundary conventions
+### 7.2. Known descriptor concurrency gap
+
+`SQLSetDescRec` and `SQLSetDescFieldW` do not check
+`STMT_STATE_FETCH_IN_PROGRESS`. `SQLBindCol`, `SQLFreeStmt(SQL_UNBIND)`, and
+`SQLSetStmtAttr` refuse to touch the ARD while a fetch is writing through its
+snapshot, but the descriptor-field API writes the same records without that
+guard. Fixing it requires a DBC → STMT walk to find every statement associated
+with an explicit, possibly reassociated descriptor. This is tracked in
+[#472](https://github.com/microsoft/mssql-rs/issues/472).
+
+## 8. FFI boundary conventions
 
 - Every exported function goes through `exports.rs` as a thin
   `pub extern "C"` wrapper.
@@ -626,10 +324,12 @@ Driver Manager (DM) provides serialization guarantees that the driver relies on
       // ...
   }
   ```
-
-  See [Safe-core / unsafe-shell split](#safe-core--unsafe-shell-split) for the
-  full rationale.
-
+- Keep the `*_impl` shim limited to validating handles, converting raw pointers
+  to references, decoding input strings, and delegating. Put scalar validation,
+  locking, state mutation, and value mapping in the safe core.
+- Check Driver Manager-enforced preconditions with `debug_assert!`; do not turn
+  them into release-build error paths. Runtime-check application inputs that the
+  Driver Manager does not validate.
 - The first line of every FFI implementation function must be a `debug!` log
   of every argument (pointers logged with `?` — no deref).
 - The `pub extern "C"` wrapper in `exports.rs` must call
@@ -638,48 +338,27 @@ Driver Manager (DM) provides serialization guarantees that the driver relies on
 - Never call `std::panic::catch_unwind` directly in this crate; always go
   through `ffi_entry!` so the panic-log message, return-code mapping, and
   trailing trace are uniform.
-- Use `SqlReturn` (not raw `i16`) as the return type of internal functions
-  to keep intent clear.
 - Pointer parameters from C must be treated as potentially null, invalid, or
   misaligned — validate before use.
-- **A success code is a promise about the caller's buffer, so never report
-  `SQL_SUCCESS` for a call that wrote less than the indicator claims.** Any
-  out-buffer entry point that could not deliver everything must say so —
-  `SQL_SUCCESS_WITH_INFO` with `01004` for a truncated read — because that is
-  the only signal telling the caller to grow its buffer and come back. The
-  memory safety of this driver ends at the ABI: a caller that believes an
-  undelivered value landed will read out of bounds and take the host process
-  down with it, and no amount of care on our side of the boundary prevents it.
-  AB#47537 is the worked example — a zero-length `SQL_C_BINARY` probe answered
-  `SQL_SUCCESS` with the byte count, and mssql-python copied those bytes out of
-  the empty buffer it had passed.
 - **When an entry point answers the same request in more than one place, route
   the answer through one shared function rather than repeating the rule.**
-  `SQLGetData` answers the zero-length `SQL_C_BINARY` probe both on the buffered
-  fast path in `sql_get_data_safe` and in `write_captured_column`, ~750 lines
-  apart in different functions. AB#47537 was fixed in the second and reopened by
-  a concurrent change that added the first: the merge was textually clean, every
-  unit test kept passing because they drove the fixed function directly, and the
-  crash came back on the only path the reporting application actually takes.
-  Both now go through `answer_binary_probe`. Two lessons worth generalising: a
-  test that calls an inner function directly proves nothing about which branch
-  production traffic reaches, so cover the entry point as the application calls
-  it; and duplicated protocol rules do not announce themselves when they drift,
-  because nothing conflicts.
 
-## Types and casts
+## 9. Types and casts
 
-- Use explicit types for FFI: `SqlSmallInt`, `SqlHandle`, `SqlReturn` — never
-  raw `i16` / `*mut c_void` in business logic.
+- Use the explicit FFI aliases (`SqlSmallInt`, `SqlHandle`, `SqlReturn`) rather
+  than raw `i16` / `*mut c_void` in business logic. Internal functions that
+  return an ODBC status use `SqlReturn` to keep intent clear.
 - Avoid `as` casts for numeric conversions — use `TryFrom` / `TryInto` and
   handle the error. `as` silently truncates.
 - Pointer casts between handle types must go through the well-defined
   conversion functions in `crate::handles`: `handle_to_raw`,
   `handle_from_raw`, `handle_from_raw_mut`, `free_handle`.
 
-## Testing
+## 10. Testing
 
 - Unit tests for pure logic go in `#[cfg(test)]` modules inside the source file.
+- Cover the exported entry point as the application calls it; an inner-function
+  test alone does not prove that production traffic reaches the tested branch.
 - Allocate ODBC handles in unit tests **only** through
   `crate::test_support::TestHandles`:
   - Use `with_env()`, `with_env_dbc()`, `with_env_dbc_stmt()`, or
@@ -711,13 +390,6 @@ Driver Manager (DM) provides serialization guarantees that the driver relies on
 - PLP routing is gated by `is_plp()` alone, not size, so an e2e targeting
   `deliver_bound_plp` does not need a large payload. Do not confuse this with
   `PLP_TYPED_MATERIALIZE_LIMIT`, the separate 1 MiB cap on how much a typed
-  conversion will materialize (see the parity note above).
+  conversion will materialize (see deviation 7 in the
+  [parity decision registry](../../mssql-odbc/docs/parity-deviations.md)).
 - Use `cargo nextest` (via `cargo btest`), not `cargo test`.
-
-## Code style
-
-- Follow the conventions in the repo-level
-  [copilot-instructions.md](../.github/copilot-instructions.md).
-- Every `.rs` file starts with the copyright header.
-- Prefer `pub(crate)` over `pub` for internal APIs.
-- No AI-slop comments — don't restate what the code already says.

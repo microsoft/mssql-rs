@@ -26,9 +26,8 @@
 //   19. NameTruncationReturnsInfo         - short buffer → SUCCESS_WITH_INFO + 01004
 //   20. VariantTypeOnNonVariantColumn     - HY113
 //   21. VariantUnderlyingTypeAfterProbe   - probe then SQL_CA_SS_VARIANT_TYPE
-//   22. Odbc2TemporalVariantTypes          - legacy codes and SS binary fallback
-//   23. Odbc3TemporalVariantTypes          - legacy codes and SS binary fallback
-//   24. Odbc38TemporalVariantTypes         - legacy codes and SS extended types
+//   22. Odbc3TemporalVariantTypes          - legacy codes and SS binary fallback
+//   23. Odbc38TemporalVariantTypes         - legacy codes and SS extended types
 //   25. EmptyVariantProbeConsumesValueButKeepsBaseType - base type survives the probe
 //   26. VariantTypeBeforeProbeIsSequenceError - attribute before the value is read
 //   27. ClrUdtDescriptorFields             - CLR UDT type, size, and identity fields
@@ -91,20 +90,6 @@ protected:
         }
         ASSERT_SQL_OK(SQLSetEnvAttr(env_, SQL_ATTR_ODBC_VERSION,
                                     reinterpret_cast<SQLPOINTER>(SQL_OV_ODBC3), 0),
-                      SQL_HANDLE_ENV, env_);
-        Connect();
-    }
-};
-
-class ColAttributeOdbc2LiveTest : public ODBCTest {
-protected:
-    void SetUp() override {
-        ODBCTest::SetUp();
-        if (!ODBCTestConfig::Instance().HasConnection()) {
-            FAIL() << "No connection configured - set ODBC_TEST_SERVER or ODBC_TEST_CONNSTR";
-        }
-        ASSERT_SQL_OK(SQLSetEnvAttr(env_, SQL_ATTR_ODBC_VERSION,
-                                    reinterpret_cast<SQLPOINTER>(SQL_OV_ODBC2), 0),
                       SQL_HANDLE_ENV, env_);
         Connect();
     }
@@ -582,22 +567,6 @@ TEST_F(ColAttributeLiveTest, VariantUnderlyingTypeAfterProbe) {
     ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_BINARY, &probe, 0, &indicator),
                   SQL_HANDLE_STMT, stmt_);
     EXPECT_EQ(SQL_C_CHAR, NumericAttr(stmt_, 1, SQL_CA_SS_VARIANT_TYPE));
-
-    SQLCloseCursor(stmt_);
-}
-
-// ODBC 3.8 introduced the SQL Server temporal C types. Applications declaring
-// ODBC 2 or 3 receive the binary fallback for time and datetimeoffset.
-TEST_F(ColAttributeOdbc2LiveTest, Odbc2TemporalVariantTypes) {
-    ExecDirect(TEMPORAL_VARIANTS_QUERY);
-
-    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
-    ASSERT_NO_FATAL_FAILURE(ExpectVariantType(stmt_, 1, SQL_C_DATE));
-    ASSERT_NO_FATAL_FAILURE(ExpectVariantType(stmt_, 2, SQL_C_TIMESTAMP));
-    ASSERT_NO_FATAL_FAILURE(ExpectVariantType(stmt_, 3, SQL_C_TIMESTAMP));
-    ASSERT_NO_FATAL_FAILURE(ExpectVariantType(stmt_, 4, SQL_C_TIMESTAMP));
-    ASSERT_NO_FATAL_FAILURE(ExpectVariantType(stmt_, 5, SQL_C_BINARY));
-    ASSERT_NO_FATAL_FAILURE(ExpectVariantType(stmt_, 6, SQL_C_BINARY));
 
     SQLCloseCursor(stmt_);
 }

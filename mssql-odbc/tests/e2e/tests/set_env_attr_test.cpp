@@ -4,7 +4,7 @@
 // Exercises the driver through the unixODBC Driver Manager, validating:
 //   1. SetGetOdbcVersion3_80    - round-trip SQL_OV_ODBC3_80
 //   2. SetGetOdbcVersion3       - round-trip SQL_OV_ODBC3
-//   3. SetGetOdbcVersion2       - round-trip SQL_OV_ODBC2
+//   3. SetGetOdbcVersion2       - DM accepts an ODBC 2.x application declaration
 //   4. SetOdbcVersionInvalid    - bogus version value -> SQL_ERROR
 //   5. SetUnknownAttribute      - unknown attribute -> error
 //   6. SetVersionOverwrites     - subsequent SQLSetEnvAttr replaces prior value
@@ -63,7 +63,9 @@ TEST_F(SetEnvAttrTest, SetGetOdbcVersion3) {
 }
 
 // -------------------------------------------------------------------
-// Variation 3 - round-trip SQL_OV_ODBC2
+// Variation 3 - the DM accepts an ODBC 2.x application declaration
+// No driver is loaded at this point, so this does not test which values the
+// driver's exported SQLSetEnvAttr implementation accepts.
 // -------------------------------------------------------------------
 TEST_F(SetEnvAttrTest, SetGetOdbcVersion2) {
     EXPECT_SQL_OK(SetVersion(SQL_OV_ODBC2), SQL_HANDLE_ENV, henv_);
