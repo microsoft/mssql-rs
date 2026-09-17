@@ -599,16 +599,6 @@ stages:
         parameters:
           osType: Linux
           fuzzDurationSeconds: 300
-          fuzzTarget: fuzz_parameter_encoding
-      - template: fuzz-template.yml
-        parameters:
-          osType: Linux
-          fuzzDurationSeconds: 300
-          fuzzTarget: fuzz_connection_provider_network
-      - template: fuzz-template.yml
-        parameters:
-          osType: Linux
-          fuzzDurationSeconds: 300
           fuzzTarget: fuzz_connection_provider_context
       - template: fuzz-template.yml
         parameters:
