@@ -725,6 +725,28 @@ impl SqlType {
         .await
     }
 
+    async fn write_collated_type_info(
+        packet_writer: &mut PacketWriter<'_>,
+        tds_type: u8,
+        length: u16,
+        collation: &SqlCollation,
+    ) -> TdsResult<()> {
+        let length = length.to_le_bytes();
+        let info = collation.info.to_le_bytes();
+        packet_writer
+            .write_fixed_bytes(&[
+                tds_type,
+                length[0],
+                length[1],
+                info[0],
+                info[1],
+                info[2],
+                info[3],
+                collation.sort_id,
+            ])
+            .await
+    }
+
     /// Write the TDS `TYPE_INFO` for this type: the type byte followed by its
     /// length/precision/scale/collation metadata.
     ///
@@ -754,8 +776,9 @@ impl SqlType {
             | SqlType::Real(_)
             | SqlType::Float(_) => {
                 let type_size = self.get_fixed_length_size();
-                packet_writer.write_byte_async(nullable_type as u8).await?;
-                packet_writer.write_byte_async(type_size as u8).await?;
+                packet_writer
+                    .write_fixed_bytes(&[nullable_type as u8, type_size as u8])
+                    .await?;
             }
 
             // Decimal/Numeric: type byte + 17 + precision + scale
@@ -843,16 +866,22 @@ impl SqlType {
                 } else {
                     *param_len * 2
                 };
-                packet_writer.write_byte_async(nullable_type as u8).await?;
-                packet_writer.write_u16_async(param_len).await?;
-                packet_writer.write_u32_async(db_collation.info).await?;
-                packet_writer.write_byte_async(db_collation.sort_id).await?;
+                Self::write_collated_type_info(
+                    packet_writer,
+                    nullable_type as u8,
+                    param_len,
+                    db_collation,
+                )
+                .await?;
             }
             SqlType::NVarcharMax(_) => {
-                packet_writer.write_byte_async(nullable_type as u8).await?;
-                packet_writer.write_u16_async(MAX_U16_LENGTH).await?;
-                packet_writer.write_u32_async(db_collation.info).await?;
-                packet_writer.write_byte_async(db_collation.sort_id).await?;
+                Self::write_collated_type_info(
+                    packet_writer,
+                    nullable_type as u8,
+                    MAX_U16_LENGTH,
+                    db_collation,
+                )
+                .await?;
             }
 
             // Varchar: type byte + param_len(u16) + collation(5 bytes)
@@ -862,16 +891,22 @@ impl SqlType {
                 } else {
                     *param_len
                 };
-                packet_writer.write_byte_async(nullable_type as u8).await?;
-                packet_writer.write_u16_async(param_len).await?;
-                packet_writer.write_u32_async(db_collation.info).await?;
-                packet_writer.write_byte_async(db_collation.sort_id).await?;
+                Self::write_collated_type_info(
+                    packet_writer,
+                    nullable_type as u8,
+                    param_len,
+                    db_collation,
+                )
+                .await?;
             }
             SqlType::VarcharMax(_) => {
-                packet_writer.write_byte_async(nullable_type as u8).await?;
-                packet_writer.write_u16_async(MAX_U16_LENGTH).await?;
-                packet_writer.write_u32_async(db_collation.info).await?;
-                packet_writer.write_byte_async(db_collation.sort_id).await?;
+                Self::write_collated_type_info(
+                    packet_writer,
+                    nullable_type as u8,
+                    MAX_U16_LENGTH,
+                    db_collation,
+                )
+                .await?;
             }
 
             // Char: type byte + param_len(u16) + collation(5 bytes)
@@ -881,10 +916,13 @@ impl SqlType {
                 } else {
                     *param_len
                 };
-                packet_writer.write_byte_async(nullable_type as u8).await?;
-                packet_writer.write_u16_async(param_len).await?;
-                packet_writer.write_u32_async(db_collation.info).await?;
-                packet_writer.write_byte_async(db_collation.sort_id).await?;
+                Self::write_collated_type_info(
+                    packet_writer,
+                    nullable_type as u8,
+                    param_len,
+                    db_collation,
+                )
+                .await?;
             }
             SqlType::NChar(_, param_len) => {
                 let param_len = if *param_len > 4000 {
@@ -892,10 +930,13 @@ impl SqlType {
                 } else {
                     *param_len * 2
                 };
-                packet_writer.write_byte_async(nullable_type as u8).await?;
-                packet_writer.write_u16_async(param_len).await?;
-                packet_writer.write_u32_async(db_collation.info).await?;
-                packet_writer.write_byte_async(db_collation.sort_id).await?;
+                Self::write_collated_type_info(
+                    packet_writer,
+                    nullable_type as u8,
+                    param_len,
+                    db_collation,
+                )
+                .await?;
             }
 
             // Text/NText: type byte + u32 max_size + collation(5 bytes) + table name parts

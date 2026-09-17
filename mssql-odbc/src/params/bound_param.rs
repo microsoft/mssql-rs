@@ -143,6 +143,7 @@ impl BoundParam {
     }
 
     /// Positions a binding on one parameter-set row.
+    #[inline(always)]
     pub(crate) fn for_row(
         self,
         row: usize,

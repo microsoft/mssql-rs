@@ -185,12 +185,14 @@ impl<'a> SqlRpc<'a> {
                     .await?;
             }
             RpcType::ProcId(proc) => {
-                // Write the procedure ID to the packet writer
-                packet_writer.write_u16_async(PROC_ID_SWITCH).await?;
-                // Write the int32 value for the procedure ID
-                packet_writer
-                    .write_i16_async(proc.get_u8_value().into())
-                    .await?;
+                let switch = PROC_ID_SWITCH.to_le_bytes();
+                let id = i16::from(proc.get_u8_value()).to_le_bytes();
+                let options = (self.proc_options as i16).to_le_bytes();
+                return packet_writer
+                    .write_fixed_bytes(&[
+                        switch[0], switch[1], id[0], id[1], options[0], options[1],
+                    ])
+                    .await;
             }
         }
         packet_writer
@@ -260,8 +262,96 @@ impl Request for SqlRpc<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::datatypes::{sql_string::SqlString, sqltypes::SqlType};
     use crate::io::packet_writer::tests::MockNetworkWriter;
+    use crate::message::parameters::rpc_parameters::StatusFlags;
     use futures::executor::block_on;
+
+    fn insert_parameters(row: i32) -> Vec<RpcParameter> {
+        [
+            SqlType::Int(Some(42)),
+            SqlType::Int(Some(row)),
+            SqlType::NVarchar(Some(SqlString::from_utf8_string("row-你好-𐐀".into())), 15),
+            SqlType::BigInt(Some(i64::from(row) * 1000)),
+        ]
+        .into_iter()
+        .map(|value| RpcParameter::new(None, StatusFlags::NONE, value))
+        .collect()
+    }
+
+    fn serialize_insert_batch(packet_size: u32) -> Vec<u8> {
+        let mut mock = MockNetworkWriter::new(packet_size);
+        let mut writer = PacketWriter::new(PacketType::RpcRequest, &mut mock, None, None);
+        let collation = SqlCollation::default();
+        let mut context = ExecutionContext::new();
+        context.set_transaction_descriptor(1);
+        block_on(async {
+            for row in 0..2000 {
+                let rpc = SqlRpc::new_batch_command(
+                    RpcType::ProcId(RpcProcs::Execute),
+                    Some(insert_parameters(row)),
+                    None,
+                    &collation,
+                    &context,
+                    row == 0,
+                );
+                rpc.serialize_batch_command(&mut writer, row == 0)
+                    .await
+                    .unwrap();
+            }
+            writer.finalize().await.unwrap();
+        });
+        drop(writer);
+        mock.data
+    }
+
+    #[test]
+    fn prepared_insert_batch_preserves_parameters_across_packet_boundaries() {
+        let collation = SqlCollation::default();
+        let mut expected = Vec::new();
+        for row in 0i32..2000 {
+            if row != 0 {
+                expected.push(RPC_BATCH_DELIMITER);
+            }
+            expected.extend([0xff, 0xff, 12, 0, 0, 0]);
+            for value in [42, row] {
+                expected.extend([0, 0, 0x26, 4, 4]);
+                expected.extend(value.to_le_bytes());
+            }
+            expected.extend([0, 0, 0xe7, 30, 0]);
+            expected.extend(collation.info.to_le_bytes());
+            expected.push(collation.sort_id);
+            let text: Vec<u8> = "row-你好-𐐀"
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes)
+                .collect();
+            expected.extend(u16::try_from(text.len()).unwrap().to_le_bytes());
+            expected.extend(text);
+            expected.extend([0, 0, 0x26, 8, 8]);
+            expected.extend((i64::from(row) * 1000).to_le_bytes());
+        }
+        for packet_size in [512, 4096, 8000, 16192] {
+            let wire = serialize_insert_batch(packet_size);
+            let mut remaining = wire.as_slice();
+            let mut payload = Vec::new();
+            let mut packet_id = 1u8;
+            while !remaining.is_empty() {
+                assert_eq!(remaining[0], 3);
+                assert_eq!(remaining[6], packet_id);
+                packet_id = packet_id.wrapping_add(1);
+                let length = usize::from(u16::from_be_bytes([remaining[2], remaining[3]]));
+                assert!(length <= usize::try_from(packet_size).unwrap());
+                assert_eq!(remaining[1], u8::from(length == remaining.len()));
+                payload.extend_from_slice(&remaining[8..length]);
+                remaining = &remaining[length..];
+            }
+            let header_len =
+                usize::try_from(u32::from_le_bytes(payload[..4].try_into().unwrap())).unwrap();
+            assert_eq!(header_len, 22);
+            assert_eq!(&payload[10..18], &1u64.to_le_bytes());
+            assert_eq!(&payload[header_len..], expected);
+        }
+    }
 
     #[test]
     fn named_proc_serializes_utf16_length_and_options() {

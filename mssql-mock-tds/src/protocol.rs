@@ -1163,6 +1163,63 @@ pub fn parse_sql_batch(data: &[u8]) -> Result<String, ProtocolError> {
     Ok(sql.trim().to_string())
 }
 
+/// Header type for the TransactionDescriptor entry within ALL_HEADERS
+/// (MS-TDS 2.2.5.3.1).
+const HEADER_TYPE_TRANSACTION_DESCRIPTOR: u16 = 0x0002;
+
+/// Parses the ALL_HEADERS block that leads a `SqlBatch`/`RpcRequest` packet
+/// body and returns the TransactionDescriptor header's
+/// `(TransactionDescriptor, OutstandingRequestCount)`, if one is present.
+///
+/// `ConnectionProcessor` records the result of every call in
+/// [`ConnectionInfo::transaction_descriptor_headers`], so a test can assert a
+/// client honored MS-TDS 2.2.5.3.2 — "The TransactionDescriptor MUST be 0,
+/// and OutstandingRequestCount MUST be 1 if the connection is operating in
+/// autocommit mode" — without the mock server itself enforcing it.
+///
+/// [`ConnectionInfo::transaction_descriptor_headers`]: crate::server::ConnectionInfo::transaction_descriptor_headers
+pub fn parse_transaction_descriptor_header(data: &[u8]) -> Option<(u64, u32)> {
+    if data.len() < 4 {
+        return None;
+    }
+    let all_headers_len = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+    if !(4..=data.len()).contains(&all_headers_len) {
+        return None;
+    }
+
+    // Walk the individual headers within [4, all_headers_len): each starts
+    // with its own 4-byte length (inclusive of itself) followed by a 2-byte
+    // HeaderType.
+    let mut offset = 4;
+    while offset + 6 <= all_headers_len {
+        let header_len = u32::from_le_bytes([
+            data[offset],
+            data[offset + 1],
+            data[offset + 2],
+            data[offset + 3],
+        ]) as usize;
+        let header_type = u16::from_le_bytes([data[offset + 4], data[offset + 5]]);
+
+        if header_len < 6 || offset + header_len > all_headers_len {
+            return None;
+        }
+
+        if header_type == HEADER_TYPE_TRANSACTION_DESCRIPTOR && header_len >= 18 {
+            let td_start = offset + 6;
+            let transaction_descriptor =
+                u64::from_le_bytes(data[td_start..td_start + 8].try_into().ok()?);
+            let count_start = td_start + 8;
+            let outstanding_request_count =
+                u32::from_le_bytes(data[count_start..count_start + 4].try_into().ok()?);
+            return Some((transaction_descriptor, outstanding_request_count));
+        }
+
+        offset += header_len;
+    }
+
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1381,5 +1438,47 @@ mod tests {
             without_error[PACKET_HEADER_SIZE],
             TokenType::ColMetadata as u8
         );
+    }
+
+    /// Builds the ALL_HEADERS bytes a real client sends: a total-length DWORD
+    /// followed by a single TransactionDescriptor header
+    /// (length=18, type=0x0002, transaction_descriptor, outstanding_request_count).
+    fn all_headers_with_transaction_descriptor(
+        transaction_descriptor: u64,
+        outstanding_request_count: u32,
+    ) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(&22u32.to_le_bytes()); // ALL_HEADERS total length
+        data.extend_from_slice(&18u32.to_le_bytes()); // this header's length
+        data.extend_from_slice(&HEADER_TYPE_TRANSACTION_DESCRIPTOR.to_le_bytes());
+        data.extend_from_slice(&transaction_descriptor.to_le_bytes());
+        data.extend_from_slice(&outstanding_request_count.to_le_bytes());
+        data
+    }
+
+    #[test]
+    fn test_parse_transaction_descriptor_header_extracts_autocommit_values() {
+        let data = all_headers_with_transaction_descriptor(0, 1);
+        assert_eq!(parse_transaction_descriptor_header(&data), Some((0, 1)));
+    }
+
+    #[test]
+    fn test_parse_transaction_descriptor_header_extracts_in_transaction_values() {
+        let data = all_headers_with_transaction_descriptor(42, 3);
+        assert_eq!(parse_transaction_descriptor_header(&data), Some((42, 3)));
+    }
+
+    #[test]
+    fn test_parse_transaction_descriptor_header_none_without_all_headers() {
+        assert_eq!(parse_transaction_descriptor_header(&[]), None);
+        assert_eq!(parse_transaction_descriptor_header(&[1, 2, 3]), None);
+    }
+
+    #[test]
+    fn test_parse_transaction_descriptor_header_none_when_length_exceeds_data() {
+        // Claims a 100-byte ALL_HEADERS block but supplies far fewer bytes.
+        let mut data = Vec::new();
+        data.extend_from_slice(&100u32.to_le_bytes());
+        assert_eq!(parse_transaction_descriptor_header(&data), None);
     }
 }

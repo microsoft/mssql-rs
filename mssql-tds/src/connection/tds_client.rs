@@ -5244,11 +5244,12 @@ impl TdsClient {
     /// A parked token was already timed and observed when it was first read, so
     /// it is replayed as-is; re-observing it would charge one token's evidence
     /// to the reset acknowledgement twice.
+    #[inline]
     async fn next_response_token(&mut self, parser_context: &ParserContext) -> TdsResult<Tokens> {
         if let Some(token) = self.parked_token.take() {
             return Ok(*token);
         }
-        let start = Instant::now();
+        let start = self.request_timeout_start();
         let result = self
             .transport
             .receive_token(
@@ -5257,7 +5258,9 @@ impl TdsClient {
                 self.cancel_handle.as_ref(),
             )
             .await;
-        self.update_remaining_timeout(start);
+        if let Some(start) = start {
+            self.update_remaining_timeout(start);
+        }
         let token = match result {
             Ok(token) => token,
             Err(error) => {
@@ -12032,6 +12035,63 @@ mod tests {
         assert_eq!(client.remaining_request_timeout, Some(Duration::ZERO));
     }
 
+    #[tokio::test]
+    async fn response_tokens_preserve_unlimited_and_finite_timeout_budgets() {
+        use crate::token::tokens::ReturnStatusToken;
+
+        for budget in [None, Some(Duration::ZERO), Some(Duration::from_secs(1))] {
+            let transport = TestTransport::with_tokens(vec![
+                Tokens::ReturnStatus(ReturnStatusToken { value: 1 }),
+                Tokens::ReturnStatus(ReturnStatusToken { value: 2 }),
+            ]);
+            let timeouts = transport.receive_timeouts.clone();
+            let mut client = create_test_client_with_transport(transport);
+            client.remaining_request_timeout = budget;
+            let context = ParserContext::None(());
+
+            assert!(matches!(
+                client.next_response_token(&context).await.unwrap(),
+                Tokens::ReturnStatus(ReturnStatusToken { value: 1 })
+            ));
+            let remaining = client.remaining_request_timeout;
+            match budget {
+                None => assert_eq!(remaining, None),
+                Some(budget) => assert!(remaining.unwrap() <= budget),
+            }
+            assert!(matches!(
+                client.next_response_token(&context).await.unwrap(),
+                Tokens::ReturnStatus(ReturnStatusToken { value: 2 })
+            ));
+            assert_eq!(*timeouts.lock().unwrap(), vec![budget, remaining]);
+        }
+    }
+
+    #[tokio::test]
+    async fn replaying_a_parked_token_does_not_charge_the_timeout_again() {
+        use crate::token::tokens::ReturnStatusToken;
+
+        let transport = TestTransport::new();
+        let timeouts = transport.receive_timeouts.clone();
+        let mut client = create_test_client_with_transport(transport);
+        client.parked_token = Some(Box::new(Tokens::ReturnStatus(ReturnStatusToken {
+            value: 42,
+        })));
+        client.remaining_request_timeout = Some(Duration::from_secs(1));
+
+        assert!(matches!(
+            client
+                .next_response_token(&ParserContext::None(()))
+                .await
+                .unwrap(),
+            Tokens::ReturnStatus(ReturnStatusToken { value: 42 })
+        ));
+        assert_eq!(
+            client.remaining_request_timeout,
+            Some(Duration::from_secs(1))
+        );
+        assert!(timeouts.lock().unwrap().is_empty());
+    }
+
     #[test]
     fn deduct_timeout_subtracts_elapsed() {
         let result = TdsClient::deduct_timeout(Some(30), Duration::from_secs(12));
@@ -12325,6 +12385,62 @@ mod tests {
         assert!(
             bytes.windows(expected.len()).any(|w| w == expected),
             "sp_execute must address the cached handle on the wire"
+        );
+    }
+
+    // ── Autocommit OutstandingRequestCount wire format ──
+    //
+    // MS-TDS 2.2.5.3.2 requires OutstandingRequestCount to be 1 on every
+    // request while the connection has no active transaction descriptor
+    // (autocommit mode). It used to come from a single process-wide `static`
+    // counter (see the fix for the "outstanding request count" bug), so it
+    // grew across *every* non-transactional request issued anywhere in the
+    // test binary — even ones from unrelated connections — instead of
+    // staying pinned at 1 per request.
+
+    /// Extracts, in wire order, the OutstandingRequestCount carried by every
+    /// autocommit TransactionDescriptor (ALL_HEADERS) header found in `sent`.
+    fn autocommit_outstanding_request_counts(sent: &[u8]) -> Vec<u32> {
+        // TransactionDescriptorHeader::write_async serializes, in order:
+        // HeaderLength=18 (u32 LE), HeaderType=0x0002 (u16 LE),
+        // TransactionDescriptor=0 (u64 LE — autocommit), then
+        // OutstandingRequestCount (u32 LE), which this scan reads off the end.
+        const PREFIX: [u8; 14] = [18, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        sent.windows(PREFIX.len())
+            .enumerate()
+            .filter(|(_, window)| *window == PREFIX)
+            .map(|(i, _)| {
+                let start = i + PREFIX.len();
+                u32::from_le_bytes(sent[start..start + 4].try_into().unwrap())
+            })
+            .collect()
+    }
+
+    /// Repro for the bug fixed by replacing the static counter: two
+    /// interleaved, independent connections must each see a constant `1`,
+    /// never a value influenced by requests sent on the other connection.
+    #[tokio::test]
+    async fn autocommit_requests_always_report_outstanding_count_of_one() {
+        let (mut client_a, sent_a) = create_capturing_client(vec![done_no_more(), done_no_more()]);
+        let (mut client_b, sent_b) = create_capturing_client(vec![done_no_more()]);
+
+        client_a.execute("SELECT 1".to_string(), ()).await.unwrap();
+        client_b.execute("SELECT 2".to_string(), ()).await.unwrap();
+        client_a.execute("SELECT 3".to_string(), ()).await.unwrap();
+
+        let counts_a = autocommit_outstanding_request_counts(&sent_a.lock().unwrap());
+        let counts_b = autocommit_outstanding_request_counts(&sent_b.lock().unwrap());
+
+        assert_eq!(
+            counts_a,
+            vec![1, 1],
+            "connection A's autocommit requests must each report count 1"
+        );
+        assert_eq!(
+            counts_b,
+            vec![1],
+            "connection B's autocommit request must report count 1, \
+             not a value bumped by connection A's requests"
         );
     }
 

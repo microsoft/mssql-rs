@@ -13,6 +13,13 @@ macro_rules! define_tds_packet_reader {
     ($visibility:vis) => {
         /// Low-level TDS packet reading operations.
         $visibility trait TdsPacketReader {
+            /// Bytes available for non-consuming column decoding. Readers without
+            /// a contiguous buffer retain the asynchronous decode path.
+            #[inline]
+            fn buffered_slice(&self) -> &[u8] {
+                &[]
+            }
+
             /// Returns a buffered byte, or `None` without consuming data if one is unavailable.
             #[inline]
             fn try_read_byte(&mut self) -> Option<u8> {
