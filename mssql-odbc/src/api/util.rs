@@ -32,6 +32,18 @@ pub(crate) unsafe fn write_if_some<T: Copy>(ptr: *mut T, value: T) {
     }
 }
 
+pub(crate) fn is_valid_utf16le(bytes: &[u8]) -> bool {
+    bytes.len().is_multiple_of(2)
+        // ASCII-valued bytes cannot form a UTF-16 surrogate code unit.
+        && (bytes.is_ascii()
+            || char::decode_utf16(
+                bytes
+                    .chunks_exact(2)
+                    .map(|unit| u16::from_le_bytes([unit[0], unit[1]])),
+            )
+            .all(|unit| unit.is_ok()))
+}
+
 /// Copies `src` into a caller buffer, NUL-terminating within the buffer.
 /// Returns `true` if `src` was truncated (i.e., did not fit including the NUL
 /// terminator). A null `dst` reports no truncation - callers use it to query
@@ -267,10 +279,43 @@ pub(crate) fn rewrite_param_markers(sql: &str) -> (String, usize) {
 #[cfg(test)]
 mod tests {
     use super::{
-        copy_utf16_with_nul, copy_with_nul, read_utf16, read_utf16_attr, read_utf16_long,
-        rewrite_param_markers, write_if_some,
+        copy_utf16_with_nul, copy_with_nul, is_valid_utf16le, read_utf16, read_utf16_attr,
+        read_utf16_long, rewrite_param_markers, write_if_some,
     };
     use crate::api::odbc_types::{SQL_NTS, SqlInteger, SqlSmallInt, SqlWChar};
+
+    #[test]
+    fn utf16le_validation_matches_every_single_code_unit() {
+        for unit in 0..=u16::MAX {
+            assert_eq!(
+                is_valid_utf16le(&unit.to_le_bytes()),
+                String::from_utf16(&[unit]).is_ok(),
+                "unit={unit:#06x}"
+            );
+        }
+        assert!(is_valid_utf16le(&[]));
+        assert!(!is_valid_utf16le(b"a"));
+        assert!(!is_valid_utf16le(b"a\0b"));
+    }
+
+    #[test]
+    fn utf16le_validation_preserves_surrogate_pair_rules() {
+        let units = [
+            0, 0x7f, 0x80, 0xd7ff, 0xd800, 0xdbff, 0xdc00, 0xdfff, 0xe000, 0xffff,
+        ];
+        for first in units {
+            for second in units {
+                let pair = [first, second];
+                let mut bytes = vec![0xff];
+                bytes.extend(pair.into_iter().flat_map(u16::to_le_bytes));
+                assert_eq!(
+                    is_valid_utf16le(&bytes[1..]),
+                    String::from_utf16(&pair).is_ok(),
+                    "pair={pair:x?}"
+                );
+            }
+        }
+    }
 
     mod memory_safety {
         use super::*;

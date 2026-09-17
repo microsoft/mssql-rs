@@ -177,6 +177,55 @@ See the [end-to-end test guide](tests/e2e/README.md) for prerequisites,
 connection configuration, targeted runs, coverage, and comparison testing
 against `msodbcsql18`.
 
+## Connection busy gate
+
+`SQLFetch`/`SQLFetchScroll`/`SQLGetData` release the connection's busy claim
+(`DbcState::active_stmt`) as soon as the wire is drained for the current
+statement, instead of holding it for the statement's whole cursor lifetime —
+matching msodbcsql's wire-state `FIsBusyReadingData` gate (see AB#47508).
+This costs a one-token read-ahead on ordinary fetches: no extra round trip,
+but returning row N can now wait on row N+1's header arriving. See
+`release_busy_if_row_exhausted` in `src/api/exec_common.rs` for the full
+trade-off and why it was accepted as-is.
+
+## Bound fetch performance
+
+Bound fetches borrow their per-fetch descriptor snapshot rather than copying a
+binding for every cell. SQL type resolution is deferred until a binding requests
+`SQL_C_DEFAULT`, and complete inline rows need no PLP metadata snapshot.
+After a packet-boundary continuation, resident columns return to synchronous
+decoding; network waits retain the existing cancellation and timeout handling.
+Datetimeoffset conversion uses checked 64-bit arithmetic while preserving the
+out-of-range rejection of the wider calculation.
+Bound and row-wise wide-string delivery share UTF-16 validation, using a
+bytewise ASCII check when it can rule out surrogates without decoding each unit.
+
+## Parameter array results
+
+Prepared parameter arrays can return rows from `SELECT`, `INSERT ... OUTPUT`,
+and procedures. Fetch the current result normally and use `SQLMoreResults` to
+advance through the results in parameter-set order. Completion counts and
+statuses are deferred until the corresponding sets finish; inspect the final
+bookkeeping after navigation reaches `SQL_NO_DATA`. Closing the cursor drains
+unread results without executing any parameter set again.
+
+`SQLGetInfo(SQL_PARAM_ARRAY_SELECTS)` reports `SQL_PAS_BATCH`. Non-row-returning
+arrays still complete during `SQLExecute` and report their aggregate row count.
+
+RPC value encoding avoids per-parameter boxed futures. Complete buffered
+DONE-family and RETURNSTATUS tokens are decoded without constructing the
+asynchronous parser; cancellation still uses the normal ATTENTION settlement
+path, and incomplete tokens retain the existing network-read behavior.
+Optional streaming declarations and encryption metadata are stored out of line
+so ordinary parameter arrays do not copy their unused storage for every value.
+Small RPC headers and type metadata are written together when buffered space
+allows; packet-boundary writes retain normal overflow and cancellation handling.
+Response-token reads skip clock sampling for unlimited query timeouts while
+retaining elapsed-time accounting for finite and exhausted budgets.
+Inlining hints target parameter positioning, conversion, RPC encoding, and
+response/value dispatch. The large conversion and serialization functions use
+`#[inline]`, leaving the final inlining decision to the compiler.
+
 ## Tracing
 
 Tracing is disabled by default and is intended for diagnostics.

@@ -313,15 +313,18 @@ impl ColumnBinding {
     /// rather than cached, so a descriptor-field bind and a `SQLBindCol` bind
     /// are indistinguishable to it.
     pub(crate) fn all_from_ard_state(ard_state: &DescState) -> Vec<Self> {
-        ard_state
-            .records
-            .iter()
-            .enumerate()
-            .filter_map(|(i, record)| {
-                let column_number = SqlUSmallInt::try_from(i + 1).ok()?;
-                Self::from_record(column_number, record)
-            })
-            .collect()
+        let mut bindings = Vec::with_capacity(ard_state.records.len());
+        bindings.extend(
+            ard_state
+                .records
+                .iter()
+                .enumerate()
+                .filter_map(|(i, record)| {
+                    let column_number = SqlUSmallInt::try_from(i + 1).ok()?;
+                    Self::from_record(column_number, record)
+                }),
+        );
+        bindings
     }
 }
 
