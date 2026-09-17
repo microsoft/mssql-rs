@@ -2,6 +2,7 @@
 set -euo pipefail
 
 PYTHON_TAGS=(cp310 cp311 cp312 cp313 cp314)
+PLATFORM_TAGS=(manylinux_2_34 manylinux_2_28 musllinux_1_2)
 
 if [ "${1:-}" = "--container" ]; then
     wheel_dir="$2"
@@ -44,7 +45,7 @@ case "$architecture" in
         ;;
 esac
 
-for platform_tag in manylinux_2_34 manylinux_2_28 musllinux_1_2; do
+for platform_tag in "${PLATFORM_TAGS[@]}"; do
     image="ghcr.io/microsoft/mssql-rs/import/python-build/${platform_tag}_${image_arch}:latest"
     docker pull "$image"
     docker run --rm \

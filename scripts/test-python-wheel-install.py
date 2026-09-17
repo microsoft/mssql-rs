@@ -20,6 +20,47 @@ from pathlib import Path
 DIST_NAME = "mssql-python-rs"
 SQL_HANDLE_ENV = 1
 SQL_SUCCESS = 0
+REQUIRED_ODBC_SYMBOLS = (
+    "SQLAllocHandle",
+    "SQLSetEnvAttr",
+    "SQLSetConnectAttrW",
+    "SQLSetStmtAttrW",
+    "SQLGetConnectAttrW",
+    "SQLDriverConnectW",
+    "SQLExecDirectW",
+    "SQLPrepareW",
+    "SQLBindParameter",
+    "SQLExecute",
+    "SQLRowCount",
+    "SQLGetStmtAttrW",
+    "SQLSetDescFieldW",
+    "SQLFetch",
+    "SQLFetchScroll",
+    "SQLGetData",
+    "SQLNumResultCols",
+    "SQLBindCol",
+    "SQLDescribeColW",
+    "SQLMoreResults",
+    "SQLColAttributeW",
+    "SQLGetTypeInfoW",
+    "SQLProceduresW",
+    "SQLForeignKeysW",
+    "SQLPrimaryKeysW",
+    "SQLSpecialColumnsW",
+    "SQLStatisticsW",
+    "SQLColumnsW",
+    "SQLGetInfoW",
+    "SQLEndTran",
+    "SQLDisconnect",
+    "SQLFreeHandle",
+    "SQLFreeStmt",
+    "SQLCancel",
+    "SQLGetDiagRecW",
+    "SQLParamData",
+    "SQLPutData",
+    "SQLTablesW",
+    "SQLDescribeParam",
+)
 
 
 def wheel_version(wheel: Path) -> str:
@@ -89,25 +130,53 @@ def load_driver(driver: Path):
     return loader(str(driver))
 
 
+def verify_driver_exports(driver: Path) -> None:
+    result = subprocess.run(
+        ["nm", "-gU", str(driver.resolve(strict=True))],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    exports = {
+        line.rsplit(maxsplit=1)[-1].removeprefix("_")
+        for line in result.stdout.splitlines()
+        if line.split()
+    }
+    missing = [name for name in REQUIRED_ODBC_SYMBOLS if name not in exports]
+    if missing:
+        raise RuntimeError(
+            f"ODBC driver is missing required exports: {', '.join(missing)}"
+        )
+
+
 def verify_driver(driver: Path) -> None:
     library = load_driver(driver)
-    library.SQLAllocHandle.argtypes = [
+    symbols = {}
+    for name in REQUIRED_ODBC_SYMBOLS:
+        try:
+            symbols[name] = getattr(library, name)
+        except AttributeError as error:
+            raise RuntimeError(
+                f"ODBC driver is missing required export: {name}"
+            ) from error
+
+    allocate_handle = symbols["SQLAllocHandle"]
+    free_handle = symbols["SQLFreeHandle"]
+    allocate_handle.argtypes = [
         ctypes.c_short,
         ctypes.c_void_p,
         ctypes.POINTER(ctypes.c_void_p),
     ]
-    library.SQLAllocHandle.restype = ctypes.c_short
-    library.SQLFreeHandle.argtypes = [ctypes.c_short, ctypes.c_void_p]
-    library.SQLFreeHandle.restype = ctypes.c_short
+    allocate_handle.restype = ctypes.c_short
+    free_handle.argtypes = [ctypes.c_short, ctypes.c_void_p]
+    free_handle.restype = ctypes.c_short
 
     environment_handle = ctypes.c_void_p()
-    result = library.SQLAllocHandle(
-        SQL_HANDLE_ENV, None, ctypes.byref(environment_handle)
-    )
+    result = allocate_handle(SQL_HANDLE_ENV, None, ctypes.byref(environment_handle))
     if result != SQL_SUCCESS or not environment_handle.value:
         raise RuntimeError(f"SQLAllocHandle(SQL_HANDLE_ENV) failed with {result}")
 
-    result = library.SQLFreeHandle(SQL_HANDLE_ENV, environment_handle)
+    result = free_handle(SQL_HANDLE_ENV, environment_handle)
     if result != SQL_SUCCESS:
         raise RuntimeError(f"SQLFreeHandle(SQL_HANDLE_ENV) failed with {result}")
 
@@ -121,9 +190,13 @@ def verify_install(expected_version: str, wheel_name: str) -> None:
 
     import mssql_py_core
 
-    if not Path(mssql_py_core.__file__).is_file():
+    module_path = Path(mssql_py_core.__file__).resolve(strict=True)
+    distribution_paths = {
+        distribution.locate_file(file).resolve() for file in distribution.files or []
+    }
+    if module_path not in distribution_paths:
         raise RuntimeError(
-            "mssql_py_core did not resolve to an installed native module"
+            f"mssql_py_core resolved outside the installed distribution: {module_path}"
         )
 
     driver = select_driver(distribution, wheel_name)
@@ -156,6 +229,7 @@ def install_and_verify(wheel: Path) -> None:
         subprocess.run(
             [
                 str(python),
+                "-I",
                 str(Path(__file__).resolve()),
                 "--verify",
                 expected_version,
@@ -171,10 +245,13 @@ def main() -> None:
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--wheel", type=Path)
     group.add_argument("--verify", metavar="VERSION")
+    group.add_argument("--verify-driver-exports", type=Path)
     parser.add_argument("--wheel-name")
     args = parser.parse_args()
 
-    if args.verify:
+    if args.verify_driver_exports:
+        verify_driver_exports(args.verify_driver_exports)
+    elif args.verify:
         if not args.wheel_name:
             parser.error("--wheel-name is required with --verify")
         verify_install(args.verify, args.wheel_name)

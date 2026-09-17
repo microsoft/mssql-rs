@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import importlib.util
+import sys
+import types
 import zipfile
 from importlib.metadata import PackagePath
 from pathlib import Path
@@ -43,6 +45,14 @@ def test_linux_installs_use_mirrored_consumer_images() -> None:
 
     assert "ghcr.io/microsoft/mssql-rs/import/python-build/" in script
     assert "quay.io" not in script
+
+
+def test_linux_installs_cover_release_matrix() -> None:
+    script = _LINUX_SCRIPT.read_text(encoding="utf-8")
+
+    assert "PYTHON_TAGS=(cp310 cp311 cp312 cp313 cp314)" in script
+    assert "PLATFORM_TAGS=(manylinux_2_34 manylinux_2_28 musllinux_1_2)" in script
+    assert 'for platform_tag in "${PLATFORM_TAGS[@]}"' in script
 
 
 def test_select_driver_uses_native_slice_for_universal2(
@@ -159,6 +169,10 @@ def test_verify_driver_allocates_and_frees_environment_handle(
         SQLAllocHandle = Function(allocate)
         SQLFreeHandle = Function(free)
 
+        def __getattr__(self, name):
+            assert name in wheel_install.REQUIRED_ODBC_SYMBOLS
+            return Function(lambda *_: wheel_install.SQL_SUCCESS)
+
     monkeypatch.setattr(wheel_install, "load_driver", lambda _: Library())
 
     wheel_install.verify_driver(Path("mssqlodbc.so"))
@@ -183,7 +197,135 @@ def test_verify_driver_rejects_failed_environment_allocation(
         SQLAllocHandle = Function()
         SQLFreeHandle = Function()
 
+        def __getattr__(self, name):
+            assert name in wheel_install.REQUIRED_ODBC_SYMBOLS
+            return Function()
+
     monkeypatch.setattr(wheel_install, "load_driver", lambda _: Library())
 
     with pytest.raises(RuntimeError, match=r"SQLAllocHandle.*failed with -1"):
         wheel_install.verify_driver(Path("mssqlodbc.so"))
+
+
+def test_verify_driver_rejects_missing_consumer_export(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Function:
+        argtypes = None
+        restype = None
+
+        def __call__(self, *_):
+            return wheel_install.SQL_SUCCESS
+
+    class Library:
+        def __getattr__(self, name):
+            if name == "SQLExecDirectW":
+                raise AttributeError(name)
+            return Function()
+
+    monkeypatch.setattr(wheel_install, "load_driver", lambda _: Library())
+
+    with pytest.raises(RuntimeError, match="missing required export: SQLExecDirectW"):
+        wheel_install.verify_driver(Path("mssqlodbc.so"))
+
+
+def test_verify_driver_exports_rejects_missing_consumer_export(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    driver = tmp_path / "mssqlodbc.dylib"
+    driver.write_bytes(b"driver")
+    calls = []
+    exports = "\n".join(
+        f"0000000000000000 T _{name}"
+        for name in wheel_install.REQUIRED_ODBC_SYMBOLS
+        if name != "SQLExecDirectW"
+    )
+
+    monkeypatch.setattr(
+        wheel_install.subprocess,
+        "run",
+        lambda *args, **kwargs: (
+            calls.append((args, kwargs)) or types.SimpleNamespace(stdout=exports)
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="missing required exports: SQLExecDirectW"):
+        wheel_install.verify_driver_exports(driver)
+    assert calls == [
+        (
+            (["nm", "-gU", str(driver.resolve())],),
+            {"check": True, "capture_output": True, "text": True},
+        )
+    ]
+
+
+def test_verify_driver_exports_accepts_consumer_contract(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    driver = tmp_path / "mssqlodbc.dylib"
+    driver.write_bytes(b"driver")
+    exports = "\n".join(
+        f"0000000000000000 T _{name}" for name in wheel_install.REQUIRED_ODBC_SYMBOLS
+    )
+
+    monkeypatch.setattr(
+        wheel_install.subprocess,
+        "run",
+        lambda *_args, **_kwargs: types.SimpleNamespace(stdout=exports),
+    )
+
+    wheel_install.verify_driver_exports(driver)
+
+
+def test_verify_install_rejects_module_outside_distribution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    external_module = tmp_path / "external" / "mssql_py_core.py"
+    external_module.parent.mkdir()
+    external_module.write_text("", encoding="utf-8")
+    installed_module = tmp_path / "site-packages" / "mssql_py_core.py"
+
+    class Distribution:
+        version = "0.1.0"
+        files = [PackagePath("mssql_py_core.py")]
+
+        @staticmethod
+        def locate_file(file: PackagePath) -> Path:
+            return installed_module.parent / file
+
+    module = types.ModuleType("mssql_py_core")
+    module.__file__ = str(external_module)
+    monkeypatch.setattr(
+        wheel_install.importlib.metadata, "distribution", lambda _: Distribution()
+    )
+    monkeypatch.setitem(sys.modules, "mssql_py_core", module)
+
+    with pytest.raises(RuntimeError, match="outside the installed distribution"):
+        wheel_install.verify_install("0.1.0", "package-0.1-cp314-cp314-win_amd64.whl")
+
+
+def test_install_verification_uses_isolated_python(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    wheel = write_wheel(tmp_path)
+    commands = []
+
+    class EnvironmentBuilder:
+        def create(self, _):
+            pass
+
+    monkeypatch.setattr(
+        wheel_install.venv, "EnvBuilder", lambda **_: EnvironmentBuilder()
+    )
+    monkeypatch.setattr(
+        wheel_install.subprocess,
+        "run",
+        lambda command, check: commands.append((command, check)),
+    )
+
+    wheel_install.install_and_verify(wheel)
+
+    verify_command, check = commands[1]
+    assert check is True
+    assert verify_command[1] == "-I"
+    assert verify_command[-2:] == ["--wheel-name", wheel.name]

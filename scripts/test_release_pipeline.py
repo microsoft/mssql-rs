@@ -576,6 +576,21 @@ def test_python_wheel_install_gate_precedes_artifact_publication(
     assert install_index < publish_index
 
 
+def test_macos_wheel_install_gate_verifies_both_architectures() -> None:
+    template = _WHEEL_INSTALL_TEMPLATE.read_text(encoding="utf-8")
+
+    assert 'lipo -verify_arch x86_64 arm64 "${extensions[0]}"' in template
+    assert (
+        'lipo -verify_arch x86_64 "$extract_dir/mssql_py_core/libs/macos/'
+        'x86_64/lib/mssqlodbc.dylib"' in template
+    )
+    assert (
+        'lipo -verify_arch arm64 "$extract_dir/mssql_py_core/libs/macos/'
+        'arm64/lib/mssqlodbc.dylib"' in template
+    )
+    assert template.count("--verify-driver-exports") == 2
+
+
 @pytest.mark.parametrize("architecture", ("x64", "ARM64"))
 @pytest.mark.parametrize("build_odbc", (False, True))
 def test_manylinux_repair_does_not_depend_on_odbc(architecture: str, build_odbc: bool) -> None:
