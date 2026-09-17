@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import re
 import sys
 import types
 import zipfile
@@ -13,6 +14,9 @@ import pytest
 
 _SCRIPT = Path(__file__).with_name("test-python-wheel-install.py")
 _LINUX_SCRIPT = Path(__file__).with_name("test-python-wheel-installs-linux.sh")
+_VERIFY_WHEELS_SCRIPT = (
+    Path(__file__).parents[1] / ".pipeline" / "scripts" / "verify-python-wheels.ps1"
+)
 _SPEC = importlib.util.spec_from_file_location("wheel_install", _SCRIPT)
 assert _SPEC and _SPEC.loader
 wheel_install = importlib.util.module_from_spec(_SPEC)
@@ -48,10 +52,31 @@ def test_linux_installs_use_mirrored_consumer_images() -> None:
 
 
 def test_linux_installs_cover_release_matrix() -> None:
+    """The Linux install-test matrix must track verify-python-wheels.ps1, the
+    canonical source the release gate enforces - not restate its own literals."""
     script = _LINUX_SCRIPT.read_text(encoding="utf-8")
+    ps1 = _VERIFY_WHEELS_SCRIPT.read_text(encoding="utf-8")
 
-    assert "PYTHON_TAGS=(cp310 cp311 cp312 cp313 cp314)" in script
-    assert "PLATFORM_TAGS=(manylinux_2_34 manylinux_2_28 musllinux_1_2)" in script
+    python_tags_match = re.search(r"\$pythonTags\s*=\s*(.+)", ps1)
+    assert python_tags_match
+    canonical_python_tags = set(re.findall(r"'([^']+)'", python_tags_match[1]))
+
+    platforms_match = re.search(r"\$platforms\s*=\s*@\((.*?)\)", ps1, re.DOTALL)
+    assert platforms_match
+    canonical_platforms = re.findall(r"'([^']+)'", platforms_match[1])
+    canonical_platform_prefixes = {
+        re.sub(r"_(x86_64|aarch64)$", "", platform)
+        for platform in canonical_platforms
+        if "manylinux" in platform or "musllinux" in platform
+    }
+
+    script_python_tags_match = re.search(r"PYTHON_TAGS=\(([^)]*)\)", script)
+    assert script_python_tags_match
+    script_platform_tags_match = re.search(r"PLATFORM_TAGS=\(([^)]*)\)", script)
+    assert script_platform_tags_match
+
+    assert set(script_python_tags_match[1].split()) == canonical_python_tags
+    assert set(script_platform_tags_match[1].split()) == canonical_platform_prefixes
     assert 'for platform_tag in "${PLATFORM_TAGS[@]}"' in script
 
 
