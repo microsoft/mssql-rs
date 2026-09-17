@@ -35,8 +35,23 @@ requires them.
 - Do not use `unsafe` merely to remove a copy. Document the ownership and
   synchronization invariant for every unsafe optimization, especially `Send` impls
   involving application buffers.
-- Support material performance claims with a benchmark, profile, allocation
-  measurement, or before/after workload where practical.
+
+When changing a fetch, token, packet, or parameter hot path:
+
+- Begin with a measured workload or profile. Test call counts, allocations, and
+  packet behavior when those are the claimed source of improvement.
+- Keep exact fast-path guards and established fallback conversion/error behavior.
+  Do not trade ODBC semantics, truncation reporting, cancellation, or timeout
+  accounting for an optimization without an explicit decision and test coverage.
+- Treat row-continuation state, packet synchronization, lock ordering, and
+  `Send`/raw-pointer invariants as correctness constraints when changing async
+  boundaries or moving work into buffered synchronous paths.
+- Make metadata snapshots and lock acquisition conditional on the path that needs
+  them; do not pay for PLP, SQL-type, or timeout work on paths that can avoid it.
+- Use `#[inline]` selectively for small profiled dispatch/conversion boundaries;
+  prefer leaving larger inlining decisions to the compiler.
+- Document architecture-level buffering or decoding trade-offs in `mssql-odbc`
+  README.md so later optimizations do not lose the rationale.
 
 ## Parity reference: the classic C++ msodbcsql driver
 
