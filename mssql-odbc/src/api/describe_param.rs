@@ -892,6 +892,7 @@ mod tests {
                 stmt: PreparedStatement::new("SELECT @P1".to_string()),
                 original_sql: "SELECT ?".to_string(),
                 marker_count: 1,
+                parameter_bindings: Vec::new(),
             });
             state.query_timeout = STMT_TIMEOUT_SECS;
         }
@@ -951,6 +952,7 @@ mod tests {
                 stmt: PreparedStatement::new("SELECT @P1".to_string()),
                 original_sql: "SELECT ?".to_string(),
                 marker_count: 1,
+                parameter_bindings: Vec::new(),
             });
             state.query_timeout = STMT_TIMEOUT_SECS;
         }
@@ -1014,6 +1016,7 @@ mod tests {
                 stmt: PreparedStatement::new("SELECT @P1".to_string()),
                 original_sql: "SELECT ?".to_string(),
                 marker_count: 1,
+                parameter_bindings: Vec::new(),
             });
             state.query_timeout = STMT_TIMEOUT_SECS;
         }
@@ -1066,6 +1069,7 @@ mod tests {
                 stmt: PreparedStatement::new("SELECT @P1".to_string()),
                 marker_count: 1,
                 original_sql: String::new(),
+                parameter_bindings: Vec::new(),
             });
         }
 
@@ -1096,6 +1100,7 @@ mod tests {
                 stmt: PreparedStatement::new("SELECT @P1".to_string()),
                 marker_count: 1,
                 original_sql: String::new(),
+                parameter_bindings: Vec::new(),
             });
             state.parameter_metadata.push(ParameterDescription {
                 data_type: SQL_INTEGER,
@@ -1152,6 +1157,7 @@ mod tests {
                 stmt: PreparedStatement::new("SELECT @P1".to_string()),
                 marker_count: 1,
                 original_sql: String::new(),
+                parameter_bindings: Vec::new(),
             });
         }
 

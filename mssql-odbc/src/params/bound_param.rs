@@ -67,6 +67,21 @@ pub(crate) struct BoundParam {
     pub(crate) octet_length_ptr: *mut SqlLen,
 }
 
+/// Descriptor inputs to parameter conversion, without application addresses or
+/// values. A prepared plan can retain these after an APD is freed or reassociated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ParamBindingMetadata {
+    input_output_type: SqlSmallInt,
+    c_type: SqlSmallInt,
+    sql_type: SqlSmallInt,
+    column_size: SqlULen,
+    decimal_digits: SqlSmallInt,
+    app_precision: SqlSmallInt,
+    app_scale: SqlSmallInt,
+    precision_scale_explicit: bool,
+    buffer_length: SqlLen,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ParamArrayLayoutError {
     InvalidValueStride {
@@ -76,6 +91,34 @@ pub(crate) enum ParamArrayLayoutError {
 }
 
 impl BoundParam {
+    pub(crate) fn metadata(self) -> ParamBindingMetadata {
+        let Self {
+            input_output_type,
+            c_type,
+            sql_type,
+            column_size,
+            decimal_digits,
+            app_precision,
+            app_scale,
+            precision_scale_explicit,
+            buffer_length,
+            parameter_value_ptr: _,
+            strlen_or_ind_ptr: _,
+            octet_length_ptr: _,
+        } = self;
+        ParamBindingMetadata {
+            input_output_type,
+            c_type,
+            sql_type,
+            column_size,
+            decimal_digits,
+            app_precision,
+            app_scale,
+            precision_scale_explicit,
+            buffer_length,
+        }
+    }
+
     /// Returns the binding with `SQL_ATTR_PARAM_BIND_OFFSET_PTR` applied.
     ///
     /// ODBC adds the offset, in bytes, to the value pointer and the

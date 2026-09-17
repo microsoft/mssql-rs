@@ -133,6 +133,7 @@ fn sql_prepare_w_safe(stmt: &StmtHandle, sql: String) -> SqlReturn {
     stmt_state.direct_marker_count = None;
     stmt_state.prepared = Some(PreparedPlan {
         stmt: PreparedStatement::new(rewritten_sql),
+        parameter_bindings: Vec::new(),
         marker_count,
         original_sql: sql,
     });
@@ -201,6 +202,7 @@ mod tests {
                 ),
                 marker_count: 0,
                 original_sql: String::new(),
+                parameter_bindings: Vec::new(),
             });
             state.set_state(STMT_STATE_PREPARED);
             state.parameter_metadata.push(ParameterDescription {

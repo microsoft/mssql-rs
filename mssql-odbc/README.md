@@ -155,6 +155,20 @@ unread results without executing any parameter set again.
 `SQLGetInfo(SQL_PARAM_ARRAY_SELECTS)` reports `SQL_PAS_BATCH`. Non-row-returning
 arrays still complete during `SQLExecute` and report their aggregate row count.
 
+## Prepared parameter bindings
+
+`SQLExecute` compares the current APD/IPD binding metadata with the metadata
+used by its cached prepared plan. Changes through descriptor fields or records,
+shared APDs, descriptor reassociation/free fallback, and parameter reset cause
+the next execute to release the old server handle and reprepare when the
+effective metadata differs. `SQLBindParameter` retains its eager invalidation.
+
+The comparison retains only scalar conversion metadata, not descriptor handles,
+application buffer addresses, or values. Unchanged metadata reuses the plan,
+including when only buffer values or addresses change. Equivalent descriptors
+can reuse the same plan after reassociation. Parameter arrays and data-at-execution
+retain this metadata with the prepared plan while execution is staged or parked.
+
 ## Conventions
 
 Before writing or modifying code in this crate, read
