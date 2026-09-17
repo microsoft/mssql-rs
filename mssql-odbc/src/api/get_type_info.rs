@@ -47,7 +47,9 @@ use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 const DATATYPE_INFO_PROC: &str = "[sys].sp_datatype_info_100";
 
 /// `@ODBCVer` value sent for ODBC 3.x applications against a Katmai+ server.
-const ODBC_VER_KATMAI: u8 = 3;
+// Classic SQLGetTypeInfoW sends pseudo-version 4 on Yukon-or-newer servers so
+// sp_datatype_info reports NULL precision for XML (sqlcdd.cpp, fODBCVer).
+const ODBC_VER_YUKON: u8 = 4;
 
 /// 1-based ODBC ordinals of the `SQLGetTypeInfo` columns the ODBC specification
 /// defines as NOT NULL. msodbcsql clears their nullable flag so `SQLDescribeCol`
@@ -155,7 +157,7 @@ fn sql_get_type_info_w_safe(
     let named = Some(vec![RpcParameter::new(
         Some("@ODBCVer".to_string()),
         StatusFlags::NONE,
-        SqlType::TinyInt(Some(ODBC_VER_KATMAI)),
+        SqlType::TinyInt(Some(ODBC_VER_YUKON)),
     )]);
 
     let mut client = match claim_connection(dbc, stmt, statement_handle, "SQLGetTypeInfoW") {
@@ -524,6 +526,20 @@ mod tests {
             type_info_column_names(),
             ["COLUMN_SIZE", "FIXED_PREC_SCALE", "AUTO_UNIQUE_VALUE"]
         );
+    }
+
+    #[test]
+    fn legacy_and_odbc3_datetime_identifiers_remain_valid() {
+        for data_type in [
+            SQL_DATETIME,
+            SQL_TIME,
+            SQL_TIMESTAMP,
+            SQL_TYPE_DATE,
+            SQL_TYPE_TIME,
+            SQL_TYPE_TIMESTAMP,
+        ] {
+            assert!(matches!(classify_sql_type(data_type), TypeClass::Valid));
+        }
     }
 
     #[test]

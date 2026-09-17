@@ -304,6 +304,18 @@ mod tests {
         assert!(OdbcVersion::Odbc3_80.uses_3_80_types());
     }
 
+    #[test]
+    fn only_supported_odbc_3_versions_are_representable() {
+        assert_eq!(OdbcVersion::try_from(SQL_OV_ODBC3), Ok(OdbcVersion::Odbc3));
+        assert_eq!(
+            OdbcVersion::try_from(SQL_OV_ODBC3_80),
+            Ok(OdbcVersion::Odbc3_80)
+        );
+        assert_eq!(OdbcVersion::try_from(2), Err(()));
+        assert_eq!(OdbcVersion::try_from(0), Err(()));
+        assert_eq!(OdbcVersion::try_from(u32::MAX), Err(()));
+    }
+
     /// The regression guard for AB#47831. Returning from `SQLFreeHandle(ENV)`
     /// is the host's cue that it may unload the DLL, so a live-process release
     /// must not return while a runtime thread is still executing code from this

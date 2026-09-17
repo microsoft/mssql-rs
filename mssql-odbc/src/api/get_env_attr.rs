@@ -94,3 +94,108 @@ fn sql_get_env_attr_safe(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::ptr;
+
+    use super::*;
+    use crate::api::odbc_types::{SQL_OV_ODBC2, SQL_OV_ODBC3, SQL_OV_ODBC3_80};
+    use crate::test_support::TestHandles;
+
+    #[test]
+    fn exported_set_and_get_round_trip_supported_odbc_3_versions() {
+        let h = TestHandles::with_unset_env();
+        for version in [SQL_OV_ODBC3, SQL_OV_ODBC3_80] {
+            assert_eq!(
+                unsafe {
+                    crate::api::exports::SQLSetEnvAttr(
+                        h.env,
+                        SQL_ATTR_ODBC_VERSION,
+                        version as usize as SqlPointer,
+                        0,
+                    )
+                },
+                SQL_SUCCESS
+            );
+
+            let mut actual = 0u32;
+            let mut length = 0;
+            assert_eq!(
+                unsafe {
+                    crate::api::exports::SQLGetEnvAttr(
+                        h.env,
+                        SQL_ATTR_ODBC_VERSION,
+                        ptr::from_mut(&mut actual).cast(),
+                        std::mem::size_of::<u32>() as SqlInteger,
+                        &mut length,
+                    )
+                },
+                SQL_SUCCESS
+            );
+            assert_eq!(actual, version);
+            assert_eq!(length, std::mem::size_of::<u32>() as SqlInteger);
+        }
+    }
+
+    #[test]
+    fn rejected_odbc_2_does_not_change_the_getter_result() {
+        let h = TestHandles::with_unset_env();
+        assert_eq!(
+            unsafe {
+                crate::api::exports::SQLSetEnvAttr(
+                    h.env,
+                    SQL_ATTR_ODBC_VERSION,
+                    SQL_OV_ODBC3 as usize as SqlPointer,
+                    0,
+                )
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!(
+            unsafe {
+                crate::api::exports::SQLSetEnvAttr(
+                    h.env,
+                    SQL_ATTR_ODBC_VERSION,
+                    SQL_OV_ODBC2 as usize as SqlPointer,
+                    0,
+                )
+            },
+            SQL_ERROR
+        );
+
+        let mut actual = 0u32;
+        assert_eq!(
+            unsafe {
+                crate::api::exports::SQLGetEnvAttr(
+                    h.env,
+                    SQL_ATTR_ODBC_VERSION,
+                    ptr::from_mut(&mut actual).cast(),
+                    std::mem::size_of::<u32>() as SqlInteger,
+                    ptr::null_mut(),
+                )
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!(actual, SQL_OV_ODBC3);
+    }
+
+    #[test]
+    fn unset_version_reads_as_zero() {
+        let h = TestHandles::with_unset_env();
+        let mut actual = u32::MAX;
+        assert_eq!(
+            unsafe {
+                sql_get_env_attr(
+                    h.env,
+                    SQL_ATTR_ODBC_VERSION,
+                    ptr::from_mut(&mut actual).cast(),
+                    std::mem::size_of::<u32>() as SqlInteger,
+                    ptr::null_mut(),
+                )
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!(actual, 0);
+    }
+}

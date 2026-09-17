@@ -12,6 +12,9 @@
 #ifndef SQL_SS_UDT
 #define SQL_SS_UDT (-151)
 #endif
+#ifndef SQL_SS_XML
+#define SQL_SS_XML (-152)
+#endif
 
 namespace {
 
@@ -48,14 +51,73 @@ TEST(GetTypeInfoTest, NullHandle) {
 
 class GetTypeInfoLiveTest : public ODBCTest {
 protected:
+    virtual SQLUINTEGER OdbcVersion() const { return SQL_OV_ODBC3_80; }
+
     void SetUp() override {
         ODBCTest::SetUp();
         if (!ODBCTestConfig::Instance().HasConnection()) {
             GTEST_SKIP() << "No connection configured – set ODBC_TEST_SERVER or ODBC_TEST_CONNSTR";
         }
+        ASSERT_SQL_OK(SQLSetEnvAttr(env_, SQL_ATTR_ODBC_VERSION,
+                                    reinterpret_cast<SQLPOINTER>(OdbcVersion()), 0),
+                      SQL_HANDLE_ENV, env_);
         Connect();
     }
 };
+
+class GetTypeInfoOdbcVersionLiveTest
+    : public GetTypeInfoLiveTest,
+      public ::testing::WithParamInterface<SQLUINTEGER> {
+protected:
+    SQLUINTEGER OdbcVersion() const override { return GetParam(); }
+};
+
+// Benefits-from-mock-tds: request capture could assert the positional
+// SQL_TYPE_TIMESTAMP and named @ODBCVer=4 parameters directly for both app
+// versions; the live server exposes only their result-set effects.
+TEST_P(GetTypeInfoOdbcVersionLiveTest, TimestampFilterAndColumnContractMatch) {
+    ASSERT_SQL_OK(SQLGetTypeInfo(stmt_, SQL_TYPE_TIMESTAMP), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("TYPE_NAME", DescribeColName(stmt_, 1));
+    EXPECT_EQ("DATA_TYPE", DescribeColName(stmt_, 2));
+    EXPECT_EQ("COLUMN_SIZE", DescribeColName(stmt_, 3));
+    EXPECT_EQ("FIXED_PREC_SCALE", DescribeColName(stmt_, 11));
+    EXPECT_EQ("AUTO_UNIQUE_VALUE", DescribeColName(stmt_, 12));
+    int rows = 0;
+    SQLRETURN rc;
+    while ((rc = SQLFetch(stmt_)) == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO) {
+        char dataType[16] = {};
+        SQLLEN indicator = 0;
+        ASSERT_SQL_OK(SQLGetData(stmt_, 2, SQL_C_CHAR, dataType, sizeof(dataType), &indicator),
+                      SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ(std::to_string(SQL_TYPE_TIMESTAMP), std::string(dataType));
+        ++rows;
+    }
+    EXPECT_EQ(SQL_NO_DATA, rc);
+    EXPECT_GT(rows, 0);
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+}
+
+// Classic SQLGetTypeInfoW sends pseudo-version 4 on Yukon-or-newer servers
+// specifically so the XML row reports NULL precision. This observable check
+// also distinguishes that RPC parameter from the catalog functions' value 3.
+// Benefits-from-mock-tds: request capture could assert @ODBCVer=4 directly;
+// the live server exposes its XML COLUMN_SIZE effect.
+TEST_P(GetTypeInfoOdbcVersionLiveTest, XmlColumnSizeIsNull) {
+    ASSERT_SQL_OK(SQLGetTypeInfo(stmt_, SQL_SS_XML), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    char columnSize[32] = {};
+    SQLLEN indicator = 0;
+    ASSERT_SQL_OK(SQLGetData(stmt_, 3, SQL_C_CHAR, columnSize, sizeof(columnSize), &indicator),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(SQL_NULL_DATA, indicator);
+    EXPECT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+}
+
+INSTANTIATE_TEST_SUITE_P(Odbc3And38, GetTypeInfoOdbcVersionLiveTest,
+                         ::testing::Values(static_cast<SQLUINTEGER>(SQL_OV_ODBC3),
+                                           static_cast<SQLUINTEGER>(SQL_OV_ODBC3_80)));
 
 // SQL_ALL_TYPES opens a fetchable result set with the full ODBC type-info
 // column contract (at least 19 columns) and at least one row.

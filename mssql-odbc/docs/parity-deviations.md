@@ -273,4 +273,20 @@ msodbcsql build is measured.
    input, and `DatetimeoffsetIntoSsTime2Succeeds` pins a native
    `datetimeoffset` column while skipping the msodbcsql comparison leg.
 
-      This policy applies to both bound-column and `SQLGetData` conversions.
+   This policy applies to both bound-column and `SQLGetData` conversions.
+13. A zero-length `SQL_C_BINARY` probe of a `sql_variant` wrapping an empty
+   value reports `SQL_SUCCESS`, while msodbcsql reports
+   `SQL_SUCCESS_WITH_INFO` / `01004`. A bare empty `varbinary(8)` reports
+   `SQL_SUCCESS` in both drivers. Matching the variant-only warning would
+   require preserving wrapper identity after the value has been captured;
+   this driver deliberately treats the captured value like its base type in
+   both `SQLGetData` delivery and the subsequent
+   `SQLColAttribute(SQL_CA_SS_VARIANT_TYPE)` lookup. msodbcsql short-circuits
+   on `if (!cbDataAvail) goto Return3;` in `InternalGetColData`
+   (`odbc/sqlcdata.h`) before marking the column consumed.
+   The difference is invisible to mssql-python, whose probe is gated on
+   `SQL_SUCCEEDED`. `EmptyVariantProbeConsumesValueButKeepsBaseType` accepts
+   either successful return so its parity leg can still compare the base type
+   and the subsequent `SQL_NO_DATA` read;
+   `EmptyVariantProbeReturnsSuccessWithoutWarning` pins this driver's exact
+   return. Signed off by Theekshna Kotian on 2026-09-17.

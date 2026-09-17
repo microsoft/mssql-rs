@@ -639,6 +639,19 @@ TEST_F(ColAttributeLiveTest, EmptyVariantProbeConsumesValueButKeepsBaseType) {
     SQLCloseCursor(stmt_);
 }
 
+TEST_F(ColAttributeLiveTest, EmptyVariantProbeReturnsSuccessWithoutWarning) {
+    SKIP_IF_COMPARING_MSODBCSQL();
+    ExecDirect("SELECT CAST(CAST('' AS VARBINARY(8)) AS SQL_VARIANT) AS v");
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    SQLCHAR probe = 0;
+    SQLLEN indicator = -999;
+    EXPECT_EQ(SQL_SUCCESS, SQLGetData(stmt_, 1, SQL_C_BINARY, &probe, 0, &indicator));
+    EXPECT_EQ(0, indicator);
+
+    SQLCloseCursor(stmt_);
+}
+
 // A NULL sql_variant is just a zero length on the wire, with no base type or
 // property byte following it. Reading those anyway would consume the next
 // column's bytes, so the column after the variant is what actually proves it.

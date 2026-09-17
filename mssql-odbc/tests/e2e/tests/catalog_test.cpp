@@ -129,6 +129,8 @@ TEST(CatalogTest, ProceduresNullHandle) {
 
 class CatalogLiveTest : public ODBCTest {
 protected:
+    virtual SQLUINTEGER OdbcVersion() const { return SQL_OV_ODBC3_80; }
+
     // Permanent tables (unlike other e2e files' #temp tables — catalog
     // functions need a table sp_tables et al. can actually report by name).
     // A per-process suffix (UniqueSuffix() above) keeps them collision-free
@@ -152,6 +154,9 @@ protected:
         if (!ODBCTestConfig::Instance().HasConnection()) {
             GTEST_SKIP() << "No connection configured – set ODBC_TEST_SERVER or ODBC_TEST_CONNSTR";
         }
+        ASSERT_SQL_OK(SQLSetEnvAttr(env_, SQL_ATTR_ODBC_VERSION,
+                                    reinterpret_cast<SQLPOINTER>(OdbcVersion()), 0),
+                      SQL_HANDLE_ENV, env_);
         Connect();
         DropTestTables();
         ExecDirect(
@@ -190,6 +195,40 @@ protected:
         ExecDirectIgnoreError("DROP TABLE IF EXISTS " + kParentTable);
     }
 };
+
+class CatalogOdbcVersionLiveTest
+    : public CatalogLiveTest,
+      public ::testing::WithParamInterface<SQLUINTEGER> {
+protected:
+    SQLUINTEGER OdbcVersion() const override { return GetParam(); }
+};
+
+// Benefits-from-mock-tds: request capture could assert @ODBCVer=3 on both RPCs
+// and @fUsePattern=true on SQLColumns for each supported application version;
+// the live test observes the resulting metadata and rows.
+TEST_P(CatalogOdbcVersionLiveTest, ColumnsAndSpecialColumnsMatchOdbc3Contract) {
+    SqlTString table = ODBCTestUtils::ToSqlTStr(kParentTable);
+    ASSERT_SQL_OK(SQLColumns(stmt_, nullptr, 0, nullptr, 0,
+                             const_cast<SQLTCHAR*>(table.c_str()), SQL_NTS, nullptr, 0),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("COLUMN_SIZE", DescribeColName(stmt_, 7));
+    EXPECT_EQ("BUFFER_LENGTH", DescribeColName(stmt_, 8));
+    EXPECT_EQ("DECIMAL_DIGITS", DescribeColName(stmt_, 9));
+    EXPECT_EQ(3, DrainRows(stmt_));
+    ASSERT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_SQL_OK(SQLSpecialColumns(stmt_, SQL_BEST_ROWID, nullptr, 0, nullptr, 0,
+                                    const_cast<SQLTCHAR*>(table.c_str()), SQL_NTS,
+                                    SQL_SCOPE_CURROW, SQL_NO_NULLS),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("COLUMN_SIZE", DescribeColName(stmt_, 6));
+    EXPECT_GT(DrainRows(stmt_), 0);
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+}
+
+INSTANTIATE_TEST_SUITE_P(Odbc3And38, CatalogOdbcVersionLiveTest,
+                         ::testing::Values(static_cast<SQLUINTEGER>(SQL_OV_ODBC3),
+                                           static_cast<SQLUINTEGER>(SQL_OV_ODBC3_80)));
 
 // Finds exactly the created table and reports the ODBC 3.x column names.
 TEST_F(CatalogLiveTest, TablesFindsCreatedTable) {

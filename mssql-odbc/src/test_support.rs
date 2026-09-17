@@ -46,26 +46,14 @@ pub(crate) struct TestHandles {
 }
 
 impl TestHandles {
-    /// Allocate an ENV handle and set `SQL_ATTR_ODBC_VERSION` to 3.80 so that
-    /// DBC allocation is permitted.
-    pub(crate) fn with_env() -> Self {
+    /// Allocate an ENV handle without selecting an ODBC version.
+    pub(crate) fn with_unset_env() -> Self {
         let mut env: SqlHandle = SQL_NULL_HANDLE;
         assert_eq!(
             unsafe { sql_alloc_handle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &mut env) },
             SQL_SUCCESS
         );
         assert!(!env.is_null());
-        assert_eq!(
-            unsafe {
-                sql_set_env_attr(
-                    env,
-                    SQL_ATTR_ODBC_VERSION,
-                    SQL_OV_ODBC3_80 as usize as *mut c_void,
-                    0,
-                )
-            },
-            SQL_SUCCESS
-        );
         Self {
             env,
             dbc: SQL_NULL_HANDLE,
@@ -73,6 +61,24 @@ impl TestHandles {
             extra_stmts: Vec::new(),
             extra_descs: Vec::new(),
         }
+    }
+
+    /// Allocate an ENV handle and set `SQL_ATTR_ODBC_VERSION` to 3.80 so that
+    /// DBC allocation is permitted.
+    pub(crate) fn with_env() -> Self {
+        let h = Self::with_unset_env();
+        assert_eq!(
+            unsafe {
+                sql_set_env_attr(
+                    h.env,
+                    SQL_ATTR_ODBC_VERSION,
+                    SQL_OV_ODBC3_80 as usize as *mut c_void,
+                    0,
+                )
+            },
+            SQL_SUCCESS
+        );
+        h
     }
 
     /// Allocate ENV + DBC.

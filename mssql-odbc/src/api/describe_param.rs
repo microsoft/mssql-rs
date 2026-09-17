@@ -1290,6 +1290,25 @@ mod tests {
     }
 
     #[test]
+    fn approximate_numeric_precision_matches_msodbcsql_odbc3() {
+        for (tds_type, length, expected_type, expected_precision) in [
+            (TdsDataType::Flt4, 4, SQL_REAL, 24),
+            (TdsDataType::Flt8, 8, SQL_FLOAT, 53),
+            (TdsDataType::FltN, 4, SQL_REAL, 24),
+            (TdsDataType::FltN, 8, SQL_FLOAT, 53),
+        ] {
+            let description = describe_tds_type(tds_type, length, None, None).unwrap();
+            assert_eq!(description.data_type, expected_type, "{tds_type:?}");
+            assert_eq!(
+                description.parameter_size, expected_precision,
+                "{tds_type:?}({length})"
+            );
+            assert_eq!(description.decimal_digits, 0, "{tds_type:?}");
+            assert_eq!(description.nullable, SQL_NULLABLE, "{tds_type:?}");
+        }
+    }
+
+    #[test]
     fn collector_requires_one_row_per_marker() {
         let description = describe_tds_type(TdsDataType::Int4, 4, None, None).unwrap();
 
