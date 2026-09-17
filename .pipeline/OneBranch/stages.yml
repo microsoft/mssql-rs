@@ -115,6 +115,12 @@ stages:
     variables:
     - ${{ if eq(parameters.isOfficial, true) }}:
       - group: 'ESRP Federated Creds (AME)'
+      - name: Codeql.Enabled
+        value: true
+      - name: Codeql.Language
+        value: cpp
+      - name: Codeql.BuildIdentifier
+        value: mssql_odbc_cpp
     - name: ob_outputDirectory
       value: '$(Build.ArtifactStagingDirectory)'
     - name: ob_artifactSuffix
@@ -131,6 +137,26 @@ stages:
         skipPythonSetup: true
         skipRustupInstall: false
         enableJsDeps: false
+    - ${{ if eq(parameters.isOfficial, true) }}:
+      # Auto-injected CodeQL Initialize/Finalize tasks wrap this native build.
+      - pwsh: |
+          $ErrorActionPreference = 'Stop'
+          if (-not (Get-Command cmake -ErrorAction SilentlyContinue)) {
+            $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+            $cmake = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.CMake.Project -find 'Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe' | Select-Object -First 1
+            if (-not $cmake) { throw 'CMake not found on PATH or in Visual Studio.' }
+            $env:PATH = "$(Split-Path $cmake);$env:PATH"
+          }
+          cmake -S mssql-odbc\tests\e2e -B mssql-odbc\tests\e2e\build_codeql -G "Visual Studio 17 2022" -A x64 -DODBC_E2E_FORCE_UNICODE=ON
+          if ($LASTEXITCODE -ne 0) { throw "CMake configure failed with exit code $LASTEXITCODE" }
+          # Reused agents must compile again for each CodeQL database.
+          cmake --build mssql-odbc\tests\e2e\build_codeql --config Debug --clean-first
+          if ($LASTEXITCODE -ne 0) { throw "CMake build failed with exit code $LASTEXITCODE" }
+          cmake -S mssql-odbc-bench -B mssql-odbc-bench\build_codeql -G "Visual Studio 17 2022" -A x64
+          if ($LASTEXITCODE -ne 0) { throw "Benchmark CMake configure failed with exit code $LASTEXITCODE" }
+          cmake --build mssql-odbc-bench\build_codeql --config Debug --clean-first
+          if ($LASTEXITCODE -ne 0) { throw "Benchmark CMake build failed with exit code $LASTEXITCODE" }
+        displayName: 'Build ODBC C++ targets for CodeQL'
     - ${{ if eq(parameters.buildPythonWheels, true) }}:
       - template: /.pipeline/templates/build-python-wheels-template.yml
         parameters:
