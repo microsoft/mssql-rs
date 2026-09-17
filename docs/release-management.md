@@ -46,6 +46,52 @@ PyPI: mssql-python
 
 ## Version Scheme
 
+### Scheduled Rust crate version bumps
+
+The **Bump Released Crate Versions** GitHub workflow checks the default branch
+against crates.io every three UTC days. A daily trigger at 08:23 UTC runs the
+check on days whose Unix day number is divisible by three; unlike `*/3` in the
+day-of-month field, this does not reset at month boundaries. GitHub may delay or
+skip scheduled runs. **Run workflow** bypasses the date check and still targets
+the default branch.
+
+`mssql-tds` and `mssql-mock-tds` are checked independently. If a crate's exact
+`[package].version` exists among its published versions (including older or
+yanked releases), the workflow proposes the next minor version: `0.1.7` becomes
+`0.2.0`. Unpublished source versions and crates that return HTTP 404 are left
+alone. Other registry errors fail the run rather than assuming a crate is
+unpublished. If the proposed next minor version is also published, the run fails
+and a maintainer must choose a new version.
+
+One draft PR on `automation/bump-released-crate-versions` contains all needed
+bumps. Later checks update that PR rather than opening duplicates. A core crate
+bump also updates the mock crate's versioned local dependency; other local
+consumers use path-only dependencies and need no edits. Cargo lockfiles are
+ignored by this repository. The workflow neither publishes nor merges anything,
+and it does not change the release pipeline's existing version-stamping policy.
+
+When a bump is needed, the workflow creates a GitHub tracking issue and adds
+`Fixes #<issue-number>` to the PR so merging it closes the issue. Repeat runs
+reuse the open issue, updating its version summary if needed, even if an earlier
+run created the issue but failed before opening the PR. The issue is identified
+by a workflow marker in its body; keep that marker when editing it. No issue is
+created when no bump is needed. If a bump becomes unnecessary without merging
+the PR, close its tracking issue manually. Generated PRs preserve the PR
+template and leave validation checkboxes unchecked.
+
+Before enabling the workflow:
+
+- Allow GitHub Actions to create pull requests in the repository's Actions
+  settings. The workflow needs contents, issues, and pull-request write permissions.
+- Optionally set `CRATE_VERSION_BUMP_TOKEN` to a suitably scoped automation
+  token with those same permissions if the generated PR must trigger other
+  GitHub Actions workflows.
+  The fallback `GITHUB_TOKEN` does not trigger ordinary `pull_request` workflows;
+  arrange validation manually when using it. Normal local validation and review
+  are required before marking the draft ready.
+
+### Python and NuGet versions
+
 The NuGet transport package and `mssql-python-rs` Python distribution share the
 version from `mssql-py-core/pyproject.toml`. The Rust crate has an independent
 version in `mssql-py-core/Cargo.toml`. For example, NuGet
