@@ -985,6 +985,7 @@ fn fetch_scroll_safe(
             .any(|binding| binding.target_type == SQL_C_DEFAULT)
         {
             let Ok(stmt_state) = stmt.inner.lock() else {
+                // Clearing the fetch flag or posting a diagnostic requires this poisoned lock.
                 error!("SQLFetchScroll: stmt mutex poisoned resolving default bindings");
                 return SQL_ERROR;
             };

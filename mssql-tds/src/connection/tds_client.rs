@@ -5244,7 +5244,7 @@ impl TdsClient {
     /// A parked token was already timed and observed when it was first read, so
     /// it is replayed as-is; re-observing it would charge one token's evidence
     /// to the reset acknowledgement twice.
-    #[inline(always)]
+    #[inline]
     async fn next_response_token(&mut self, parser_context: &ParserContext) -> TdsResult<Tokens> {
         if let Some(token) = self.parked_token.take() {
             return Ok(*token);
