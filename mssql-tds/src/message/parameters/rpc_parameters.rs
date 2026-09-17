@@ -173,12 +173,13 @@ pub struct RpcParameter {
 
     /// Declaration for a streamed parameter whose `@params` type is narrower
     /// than its PLP body. See [`RpcParameter::with_streamed_declaration`].
-    streamed_declaration: Option<SqlType>,
+    /// Cold metadata stays boxed to keep ordinary parameter arrays compact.
+    streamed_declaration: Option<Box<SqlType>>,
 
     /// When present, the parameter is sent encrypted (Always Encrypted): the
     /// ciphertext is serialized as a BIGVARBINARY with the ENCRYPTED status flag
     /// and a trailing CryptoMetaData block, bypassing the plaintext `value`.
-    encrypted: Option<EncryptedRpcValue>,
+    encrypted: Option<Box<EncryptedRpcValue>>,
 
     /// When `true`, the caller requires this parameter to be encrypted: if
     /// `sp_describe_parameter_encryption` reports the target column as not
@@ -233,7 +234,7 @@ impl RpcParameter {
     /// Ignored for a materialized parameter, whose declaration comes from its
     /// own value.
     pub fn with_streamed_declaration(mut self, declaration: SqlType) -> Self {
-        self.streamed_declaration = Some(declaration);
+        self.streamed_declaration = Some(Box::new(declaration));
         self
     }
 
@@ -438,6 +439,7 @@ impl RpcParameter {
     /// The `encoder` is used to encode the parameter value based on its data type.
     /// The `db_collation` is used for string types to determine the collation.
     /// The `is_positional` flag indicates whether the parameter is positional or named.
+    #[inline]
     pub(crate) async fn serialize<T: SqlValueEncoder>(
         &self,
         packet_writer: &mut PacketWriter<'_>,
@@ -445,11 +447,20 @@ impl RpcParameter {
         is_positional: bool,
         encoder: &T,
     ) -> TdsResult<()> {
+        let options_written = is_positional
+            && self.encrypted.is_none()
+            && matches!(self.value, RpcValue::Materialized(_));
         // If the parameter is positional, then we dont need to write the name.
         if is_positional {
             // Indicates that the parameter name is 0 length, since this is
             // a positional parameter.
-            packet_writer.write_byte_async(0).await?;
+            if options_written {
+                packet_writer
+                    .write_fixed_bytes(&[0, self.options.bits()])
+                    .await?;
+            } else {
+                packet_writer.write_byte_async(0).await?;
+            }
         } else {
             match self.name {
                 Some(ref name) => {
@@ -508,7 +519,9 @@ impl RpcParameter {
         }
 
         // Write the options byte.
-        packet_writer.write_byte_async(self.options.bits()).await?;
+        if !options_written {
+            packet_writer.write_byte_async(self.options.bits()).await?;
+        }
 
         let value = match &self.value {
             RpcValue::Materialized(value) => value,
@@ -529,10 +542,10 @@ impl RpcParameter {
         ciphertext: Option<Vec<u8>>,
         metadata: RpcEncryptionMetadata,
     ) {
-        self.encrypted = Some(EncryptedRpcValue {
+        self.encrypted = Some(Box::new(EncryptedRpcValue {
             ciphertext,
             metadata,
-        });
+        }));
     }
 
     /// Returns the parameter's plaintext value. Used by the parameter-encryption
@@ -795,6 +808,23 @@ mod tests {
     use crate::message::messages::PacketType;
     use crate::token::tokens::SqlCollation;
     use futures::executor::block_on;
+
+    #[test]
+    fn ordinary_parameters_do_not_inline_streaming_and_encryption_metadata() {
+        let parameter = RpcParameter::new(None, StatusFlags::NONE, SqlType::Int(Some(42)));
+        assert_eq!(
+            std::mem::size_of_val(&parameter.streamed_declaration),
+            size_of::<usize>()
+        );
+        assert_eq!(
+            std::mem::size_of_val(&parameter.encrypted),
+            size_of::<usize>()
+        );
+        assert!(
+            size_of::<RpcParameter>()
+                <= size_of::<SqlType>() + size_of::<Option<String>>() + 6 * size_of::<usize>()
+        );
+    }
 
     /// Returns the RPC payload bytes written to the packet writer, stripping the
     /// 8-byte packet header.

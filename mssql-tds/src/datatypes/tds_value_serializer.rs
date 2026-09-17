@@ -2555,6 +2555,7 @@ impl TdsValueSerializer {
     ///
     /// This is used internally by serialize_as_variant to avoid infinite recursion.
     /// It performs the same serialization as serialize_value but skips the variant check.
+    #[inline]
     async fn serialize_value_inner<'a, 'b>(
         writer: &'a mut PacketWriter<'b>,
         value: &ColumnValues,
