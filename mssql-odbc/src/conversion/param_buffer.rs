@@ -158,7 +158,10 @@ pub(crate) enum Indicator {
 /// `param.strlen_or_ind_ptr`, if non-null, must point to one valid `SqlLen`.
 /// `param.octet_length_ptr`, if non-null, must also point to one valid `SqlLen`,
 /// except when `param.strlen_or_ind_ptr` is non-null and points to `SQL_NULL_DATA`.
-/// In that case, the octet-length slot is not read.
+/// In that case, this function does not read the octet-length slot. Execution's
+/// earlier data-at-execution probes still require initialized octet-length
+/// storage for input/input-output bindings; see
+/// [`super::param_convert::data_at_exec_indicator`].
 pub(crate) unsafe fn read_indicator(param: &BoundParam) -> Result<Indicator, ParamBuildError> {
     // `SQLBindParameter` aims `SQL_DESC_INDICATOR_PTR` and
     // `SQL_DESC_OCTET_LENGTH_PTR` at one address, so reading NULL from the
@@ -754,7 +757,7 @@ mod tests {
                 for &c_type in PARAMETER_C_TYPES {
                     let mut p = param(c_type, value, indicator);
                     p.octet_length_ptr = length;
-                    // SQL NULL ignores both the value and the uninitialized length slot.
+                    // This checks read_indicator's early return, not execution's earlier DAE probes.
                     assert_eq!(read(&p).unwrap(), None);
                     assert_eq!(unsafe { indicator.read_unaligned() }, SQL_NULL_DATA);
                 }

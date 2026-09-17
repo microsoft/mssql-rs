@@ -61,6 +61,11 @@ temporal inputs, ignored storage, and length sentinels. Column-wise arrays and
 packed row-wise parameter bindings exercise production address calculations
 with nonzero offsets and distinct first/last values.
 
+The SQL NULL case with an uninitialized octet-length slot tests only
+`read_indicator`'s early return, not full execution. Execution's earlier
+data-at-execution probes still require readable, initialized non-null
+octet-length slots for input and input/output parameters.
+
 PR validation runs this profile under Miri on **Windows x64 and Linux x64**
 only, using `nightly-2026-09-06` and seed 0. The Linux job uses the existing
 Ubuntu build container. Test failures and empty selections fail the job, and
