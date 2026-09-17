@@ -106,9 +106,8 @@ impl FedAuthFeature {
             TdsAuthenticationMethod::ActiveDirectoryWorkloadIdentity => {
                 Ok(active_directory_workload_identity)
             }
-            // Every remaining flow resolves to a bearer token out of band, so
-            // the server is told the same thing as for any other non-password
-            // credential.
+            // Every remaining flow resolves to a bearer token out of band, so the
+            // server is told the same thing as for any other non-password credential.
             TdsAuthenticationMethod::ActiveDirectoryDefault
             | TdsAuthenticationMethod::ActiveDirectoryAzCli
             | TdsAuthenticationMethod::ActiveDirectoryAzureDeveloperCli

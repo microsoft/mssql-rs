@@ -490,7 +490,13 @@ pub struct TdsClient {
     count_map: HashMap<CurrentCommand, u64>,
     /// Rows affected by the most recent statement; see [`last_rows_affected`](Self::last_rows_affected).
     last_rows_affected: i64,
-    /// Per-statement affected-row counts captured (in order) from every counted DONE token.
+    /// Per-statement affected-row counts captured (in order) from every counted
+    /// DONE token seen since the last COLMETADATA or command start, excluding
+    /// `SQLSELECT`-tagged counts (see
+    /// [`last_rows_affected`](Self::last_rows_affected)). For a pure-DML batch
+    /// (`UPDATE; DELETE; INSERT`) this holds one entry per statement so the ODBC
+    /// layer can surface each as its own result set via
+    /// [`take_dml_result_counts`](Self::take_dml_result_counts).
     dml_result_counts: Vec<i64>,
     prepared_batch: Option<Box<PreparedBatchReadState>>,
     /// Row counts from each DONE token of the current request, in arrival order.
@@ -837,9 +843,6 @@ impl TdsClient {
                         info_messages,
                         &session_state_tokens,
                     )?;
-                    self.done_row_counts.clear();
-                    self.pending_errors.clear();
-                    self.unreported_error = false;
 
                     self.recovery_context.recovery_count += 1;
                     info!(
@@ -4648,11 +4651,22 @@ impl TdsClient {
     /// Drains all remaining tokens from the stream until a terminal DONE token.
     /// Collects any ERROR tokens encountered and returns them.
     ///
-    /// A statement-scoped error does not abort the batch, so subsequent result
-    /// sets must be consumed through the row-decoding path before reuse.
+    /// A statement-scoped error (for example lock timeout 1222) does not abort
+    /// the batch, so the server keeps streaming any result sets that follow it.
+    /// A trailing row-returning result set must therefore be consumed through
+    /// the row-decoding path: ROW/NBCROW tokens carry no length prefix and can
+    /// only be parsed with the preceding COLMETADATA in the parser context.
+    /// Skipping that step would leave unparsed row bytes in the transport and
+    /// corrupt the connection for reuse.
     pub(in crate::connection) async fn drain_stream(&mut self) -> TdsResult<Vec<SqlErrorInfo>> {
         self.interrupted_read_settled = false;
         let mut collected_errors: Vec<SqlErrorInfo> = Vec::new();
+        // A COLMETADATA reached at the top level of the drain must be parsed with
+        // the same Always Encrypted awareness as advance_to_result_boundary: when
+        // column encryption is negotiated the token carries a CEK-table prefix
+        // (empty or not) before the first column, and reading it with
+        // ParserContext::None would misinterpret those bytes and desynchronize the
+        // stream — the very corruption this drain exists to prevent.
         let parser_context = ParserContext::ColumnEncryption(
             self.negotiated_settings.is_column_encryption_supported(),
         );
@@ -4671,7 +4685,9 @@ impl TdsClient {
                     }
                 }
                 Tokens::ColMetadata(colmetadata) => {
-                    // Consume rows so the trailing DONE can determine whether the batch continues.
+                    // A row-returning result set began. Consume its rows via the
+                    // row-decoding path; the trailing DONE tells us whether the
+                    // batch continues.
                     let batch_ended = self
                         .drain_result_set_rows(Arc::new(colmetadata), &mut collected_errors)
                         .await?;
@@ -5135,6 +5151,11 @@ impl TdsClient {
                     }
                     let mut all_errors = vec![self.record_error_token(&error_token)];
                     let drain_result = self.drain_stream().await;
+                    // Reset batch state before propagating: the error terminates
+                    // the batch regardless of whether the drain fully consumed
+                    // it, so a subsequent `next_row` / `advance` must not pass
+                    // the `maybe_has_unread_rows` guard and read a stream we have
+                    // given up on (mirrors `handle_row_read_token`).
                     self.execution_context.set_has_open_batch(false);
                     self.current_result_set_has_been_read_till_end = true;
                     self.current_metadata = None;
@@ -6481,11 +6502,17 @@ impl TdsClient {
     }
 
     /// Attempts to position the cursor from bytes already buffered by the transport.
+    /// A row parked by lookahead is claimed without reading from the transport.
     ///
     /// Returns [`CursorPoll::Pending`] without consuming bytes or cursor state
     /// when the current row must first be drained, the next token needs async
     /// parsing, encryption keys need resolving, or the row header is incomplete.
     pub fn try_next_row_cursor(&mut self) -> TdsResult<CursorPoll<bool>> {
+        if self.row_already_positioned {
+            self.row_already_positioned = false;
+            return Ok(CursorPoll::Ready(true));
+        }
+
         let Some(metadata) = self.current_metadata.as_ref().map(Arc::clone) else {
             return Err(UsageError(
                 "No metadata found while fetching the next row. Have you called the execute method or was the query supposed to return resultset?".to_string(),
@@ -7516,6 +7543,10 @@ impl TdsClient {
                 }
                 let mut all_errors = vec![self.record_error_token(&error_token)];
                 let drain_result = self.drain_stream().await;
+                // Reset batch state before propagating: the error terminates the
+                // batch regardless of whether the drain fully consumed it, so a
+                // subsequent `close_query` / `advance` does not block trying to
+                // read a stream we have given up on.
                 self.execution_context.set_has_open_batch(false);
                 self.current_result_set_has_been_read_till_end = true;
                 self.current_metadata = None;
@@ -7523,6 +7554,9 @@ impl TdsClient {
                     Ok(drain_errors) => all_errors.extend(drain_errors),
                     Err(e) => {
                         warn!(error = ?e, "Drain after statement error failed; retiring the connection");
+                        // Mirrors the ERROR arm in `advance_to_result_boundary`:
+                        // the SQL error still surfaces, but a stream we gave up on
+                        // must not be handed back to a pool as `SqlServerError`.
                         self.retire_after_failed_drain(&e);
                     }
                 }
@@ -7553,8 +7587,8 @@ impl TdsClient {
     ) -> TdsResult<Option<bool>> {
         info!("done while get_next_row: {:?}", done);
 
-        // A deferred error has already been collected and will be reported by
-        // the caller, so it does not make this DONE a protocol violation.
+        // A deferred error was already collected and will be reported by the
+        // caller, so it does not make this DONE a protocol violation.
         if done.has_error() && self.prepared_batch.is_none() && !self.consumed_pending_error() {
             return Err(crate::error::Error::ProtocolError(
                 "Server reported error in DONE token without preceding ERROR token".to_string(),
@@ -7572,6 +7606,16 @@ impl TdsClient {
             self.execution_context.set_has_open_batch(false);
         }
         Ok(Some(false))
+    }
+
+    /// Returns a clone of all [`ReturnValue`]s collected during the current
+    /// batch — output parameters and UDF return values.
+    ///
+    /// Values accumulate as the token stream is read; call this after the
+    /// result set is fully consumed (e.g. after [`close_query()`](Self::close_query)
+    /// or after [`advance_to_rows()`](Self::advance_to_rows) returns `false`).
+    pub fn get_return_values(&self) -> Vec<ReturnValue> {
+        self.return_values.clone()
     }
 
     /// Whether the DONE token now being handled is the one closing a statement
@@ -7595,8 +7639,8 @@ impl TdsClient {
     /// server-side batch — `sqlcmd` and friends — need this to interleave rows
     /// and messages the way the server sent them.
     ///
-    /// Errors that end the batch outright still surface as `Err`; only those
-    /// the server continued past are deferred.
+    /// Errors that end the batch outright still surface as `Err`; only those the
+    /// server continued past are deferred.
     pub fn set_defer_batch_errors(&mut self, defer: bool) {
         self.defer_batch_errors = defer;
     }
@@ -7605,30 +7649,6 @@ impl TdsClient {
     /// [`set_defer_batch_errors`](Self::set_defer_batch_errors), in arrival order.
     pub fn take_pending_errors(&mut self) -> Vec<SqlErrorInfo> {
         std::mem::take(&mut self.pending_errors)
-    }
-
-    /// Returns a clone of all [`ReturnValue`]s collected during the current
-    /// batch — output parameters and UDF return values.
-    ///
-    /// Values accumulate as the token stream is read; call this after the
-    /// result set is fully consumed (e.g. after [`close_query()`](Self::close_query)
-    /// or after [`advance_to_rows()`](Self::advance_to_rows) returns `false`).
-    pub fn get_return_values(&self) -> Vec<ReturnValue> {
-        self.return_values.clone()
-    }
-
-    /// Returns the procedure's `RETURN` value from the most recent RPC, or
-    /// `None` when the server sent no `ReturnStatus` (0x79) token.
-    ///
-    /// Like [`get_return_values()`](Self::get_return_values) this is only
-    /// populated once the token stream has been read, so call it after the
-    /// result sets are consumed. ODBC surfaces it as the `{? = call ...}`
-    /// return-status parameter.
-    pub fn get_return_status(&self) -> Option<i32> {
-        match self.last_return_status {
-            ReturnStatus::Received(value) => Some(value),
-            ReturnStatus::NotReceived => None,
-        }
     }
 
     /// Row counts reported by each statement of the current or most recent
@@ -7644,6 +7664,20 @@ impl TdsClient {
     fn record_done_row_count(&mut self, done: &DoneToken) {
         self.done_row_counts
             .push(done.has_count().then_some(done.row_count));
+    }
+
+    /// Returns the procedure's `RETURN` value from the most recent RPC, or
+    /// `None` when the server sent no `ReturnStatus` (0x79) token.
+    ///
+    /// Like [`get_return_values()`](Self::get_return_values) this is only
+    /// populated once the token stream has been read, so call it after the
+    /// result sets are consumed. ODBC surfaces it as the `{? = call ...}`
+    /// return-status parameter.
+    pub fn get_return_status(&self) -> Option<i32> {
+        match self.last_return_status {
+            ReturnStatus::Received(value) => Some(value),
+            ReturnStatus::NotReceived => None,
+        }
     }
 
     /// Returns the informational (INFO-token) messages captured from the
@@ -7707,6 +7741,11 @@ impl TdsClient {
         // fully-navigated prior RPC does not leave `get_return_values()` /
         // `retrieve_output_params()` reporting stale values for this new command.
         self.return_values.clear();
+        // Every execution RPC path (plain batch, sp_executesql, sp_execute,
+        // sp_prepexec, stored proc) funnels through here, so reset the
+        // affected-row count for the new command. A prior DML count must not
+        // leak into `SQLRowCount` when this command reports none (DDL /
+        // `SET NOCOUNT ON` / SELECT).
         self.last_rows_affected = -1;
         self.dml_result_counts.clear();
         self.done_row_counts.clear();
@@ -8103,7 +8142,6 @@ impl TdsClient {
                     let count = self.count_map.entry(done.cur_cmd).or_insert(0);
                     // Use saturating_add to prevent integer overflow from malicious/corrupted TDS responses
                     *count = count.saturating_add(done.row_count);
-                    self.record_done_row_count(&done);
 
                     if !done.has_more() {
                         info!("No more rows for current command: {:?}", done.cur_cmd);
@@ -9796,6 +9834,78 @@ mod tests {
 
         assert!(client.next_row_cursor().await.unwrap());
         assert!(!client.row_already_positioned);
+    }
+
+    #[tokio::test]
+    async fn sync_cursor_claims_parked_rows_without_advancing() {
+        let expected = [42_i32, 84_i32];
+        let mut payload = vec![0xff];
+        for value in expected {
+            payload.push(TokenType::Row as u8);
+            payload.extend_from_slice(&value.to_le_bytes());
+        }
+        let mut packet =
+            TestPacketBuilder::new(crate::message::messages::PacketType::TabularResult);
+        let mut transport =
+            create_network_transport_with_data(&packet.append_bytes(&payload).build());
+        assert_eq!(transport.read_byte().await.unwrap(), 0xff);
+        let mut client = create_test_client_with_any_transport(AnyTransport::network(transport));
+        client.current_metadata = Some(int_column_metadata(1));
+        client.current_result_set_has_been_read_till_end = false;
+
+        for value in expected {
+            for _ in 0..2 {
+                assert_eq!(
+                    client.try_peek_past_current_row().unwrap(),
+                    CursorPoll::Ready(true)
+                );
+                assert!(client.row_already_positioned);
+            }
+            assert_eq!(
+                client.try_next_row_cursor().unwrap(),
+                CursorPoll::Ready(true)
+            );
+            assert!(!client.row_already_positioned);
+            assert_eq!(client.try_next_row_cursor().unwrap(), CursorPoll::Pending);
+            assert_eq!(
+                client.try_read_row_column(0).unwrap(),
+                CursorPoll::Ready(CursorColumn::Value {
+                    value: ColumnValues::Int(value),
+                    variant_base: None,
+                })
+            );
+        }
+        assert_eq!(client.try_next_row_cursor().unwrap(), CursorPoll::Pending);
+    }
+
+    #[tokio::test]
+    async fn sync_cursor_claims_cancelled_parked_rows_like_async() {
+        for synchronous in [false, true] {
+            let mut transport = TestTransport::new();
+            transport.sync_header_available = true;
+            transport.sync_columns.push_back(ColumnValues::Int(42));
+            let mut client = create_test_client_with_transport(transport);
+            client.current_metadata = Some(int_column_metadata(1));
+            client.current_result_set_has_been_read_till_end = false;
+            assert_eq!(
+                client.try_peek_past_current_row().unwrap(),
+                CursorPoll::Ready(true)
+            );
+            let cancellation = CancelHandle::new();
+            client.cancel_handle = Some(cancellation.child_handle());
+            cancellation.cancel();
+
+            if synchronous {
+                assert_eq!(
+                    client.try_next_row_cursor().unwrap(),
+                    CursorPoll::Ready(true)
+                );
+            } else {
+                assert!(client.next_row_cursor().await.unwrap());
+            }
+            assert!(!client.row_already_positioned);
+            assert_eq!(client.try_read_row_column(0).unwrap(), CursorPoll::Pending);
+        }
     }
 
     #[tokio::test]

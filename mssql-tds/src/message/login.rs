@@ -969,8 +969,8 @@ impl<'a, 'n, 'context> Serializer<'a, 'n, 'context> {
                         .await?;
                 }
                 LoginDeferredPayload::ServerName => {
-                    // Same accessor as write_server_name: the length written
-                    // there and this payload must agree.
+                    // Same accessor as write_server_name: the length written there
+                    // and this payload must agree.
                     let server_name = self
                         .model
                         .user_input
@@ -1120,11 +1120,8 @@ impl<'a, 'n, 'context> Serializer<'a, 'n, 'context> {
     }
 
     /// Writes the value of the target sql server to the login packet.
-    ///
-    /// Defaults to the dialled address in DataSource format (`host,port`),
-    /// which matches SqlClient for redirected connections; an explicit
-    /// `login_server_name` replaces it. The length written here and the payload
-    /// written later must agree, so both go through the same accessor.
+    /// Uses get_login_server_name() to get DataSource format (host,port) for TCP connections,
+    /// unless `login_server_name` overrides it.
     async fn write_server_name(&mut self) -> TdsResult<()> {
         let server_name = self
             .model

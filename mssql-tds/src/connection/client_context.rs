@@ -319,11 +319,10 @@ pub struct ClientContext {
     /// This separates *where to connect* from *what name to present at login*,
     /// which is what a connection through a tunnel, proxy or port-forward
     /// needs: the socket goes to `localhost:1433` while the login must still
-    /// name the real server so the server-side routing and any name-based
-    /// policy see the intended target.
+    /// name the real server so server-side routing and any name-based policy
+    /// see the intended target.
     ///
-    /// `None` (the default) writes the dialled address, matching the previous
-    /// behaviour.
+    /// `None` writes the dialled address, which is the previous behaviour.
     pub login_server_name: Option<String>,
     pub(crate) transport_context: TransportContext,
     /// Protocol vector version for feature negotiation.
@@ -695,6 +694,18 @@ impl ClientContext {
         validator.validate(self)
     }
 
+    /// The server name to write into LOGIN7: the `login_server_name` override
+    /// when one is set, otherwise the address being dialled.
+    ///
+    /// LOGIN7 stores this as an offset/length pair separate from the payload,
+    /// so both must come from the same value — hence one accessor rather than
+    /// two call sites reading the override independently.
+    pub(crate) fn login_server_name(&self, transport: &TransportContext) -> String {
+        self.login_server_name
+            .clone()
+            .unwrap_or_else(|| transport.get_login_server_name())
+    }
+
     /// Looks up the Entra ID token factory for the current authentication method.
     pub(crate) fn entra_id_token_factory(&self) -> TdsResult<&dyn CloneableEntraIdTokenFactory> {
         self.auth_method_map
@@ -707,19 +718,6 @@ impl ClientContext {
                     self.tds_authentication_method
                 ))
             })
-    }
-
-    /// The server name to write into LOGIN7: the `login_server_name` override
-    /// when one is set, otherwise the address being dialled.
-    ///
-    /// The login packet stores this as an offset/length pair separate from the
-    /// payload, so the length and the bytes must be derived from the same
-    /// value — hence a single accessor rather than two call sites reading the
-    /// override independently.
-    pub(crate) fn login_server_name(&self, transport: &TransportContext) -> String {
-        self.login_server_name
-            .clone()
-            .unwrap_or_else(|| transport.get_login_server_name())
     }
 }
 
