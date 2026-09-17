@@ -31,6 +31,7 @@ steps:
       bash "$(Build.SourcesDirectory)/scripts/test-python-wheel-installs-linux.sh" \
         "$(ob_outputDirectory)/wheels" "$architecture"
     displayName: 'Clean-install final Linux wheels'
+    condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
 
 - ${{ if eq(parameters.osType, 'Windows') }}:
   - ${{ each pythonVersion in parameters.pythonVersions }}:
@@ -50,6 +51,7 @@ steps:
         }
         python "$(Build.SourcesDirectory)\scripts\test-python-wheel-install.py" --wheel $wheels[0].FullName
       displayName: 'Clean-install Python ${{ pythonVersion }} wheel (Windows ${{ parameters.architecture }})'
+      condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
 
 - ${{ if eq(parameters.osType, 'MacOS') }}:
   - ${{ each pythonVersion in parameters.pythonVersions }}:
@@ -86,3 +88,4 @@ steps:
         rm -rf "$extract_dir"
         trap - EXIT
       displayName: 'Clean-install Python ${{ pythonVersion }} wheel (macOS universal2)'
+      condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
