@@ -3871,17 +3871,18 @@ impl TdsClient {
     /// [`cancel_streamed_write`](Self::cancel_streamed_write), a mid-stream
     /// failure) leaves it inert and the next execute re-prepares.
     ///
-    /// Unlike [`execute_prepared`](Self::execute_prepared), `orphaned` is never
-    /// consumed here: its drop is not piggybacked onto the `@handle` argument.
-    /// The request stays open for the whole application-driven chunk sequence
-    /// and may be discarded server-side, which would evict the orphan from the
-    /// client's map while the server still held the plan. The caller keeps it
-    /// and releases it with [`unprepare`](Self::unprepare).
+    /// Unlike [`execute_prepared`](Self::execute_prepared), a streamed request
+    /// releases `orphaned` in a separate `sp_unprepare` before opening the RPC,
+    /// charging both operations to the command timeout. Piggybacking the drop
+    /// would let cancellation discard it while the server still held the plan.
+    /// An error before release leaves the orphan with the caller; after the
+    /// release send boundary it is consumed, even if the response fails.
     ///
     /// # Errors
     /// Returns a usage error for invalid streamed parameters, for an already
     /// executing command, or when Always Encrypted is active for this command,
-    /// plus transport/serialization errors from the parked request.
+    /// plus orphan-release or transport/serialization errors. A failed release
+    /// does not open a new streamed request.
     pub async fn begin_execute_prepared<'a>(
         &mut self,
         statement: &mut PreparedStatement,
@@ -3914,8 +3915,32 @@ impl TdsClient {
             ));
         }
 
-        let (timeout_sec, _request_timeout, database_collation) =
+        let started = Instant::now();
+        let (mut timeout_sec, _request_timeout, database_collation) =
             self.prepare_rpc_command(opts.timeout, opts.cancel).await?;
+
+        if orphaned.is_some_and(|id| !self.prepared_handles.contains_key(&id)) {
+            *orphaned = None;
+        }
+        if let Some(orphan_id) = *orphaned {
+            let release = self
+                .execute_sp_unprepare(
+                    orphan_id,
+                    true,
+                    ExecuteOptions {
+                        timeout: timeout_sec,
+                        ..opts.clone()
+                    },
+                )
+                .await;
+            if !self.prepared_handles.contains_key(&orphan_id) {
+                *orphaned = None;
+            }
+            release?;
+            let remaining = Self::deduct_timeout(opts.timeout, started.elapsed()).into_timeout()?;
+            timeout_sec = remaining.seconds();
+            self.remaining_request_timeout = remaining.duration();
+        }
 
         // Reuse the statement's handle when the client still holds one; a
         // reconnect clears the map, so an id from a dead session re-prepares.
@@ -15812,16 +15837,203 @@ mod tests {
         );
     }
 
-    /// The orphan's drop is not piggybacked onto a streamed prepexec: the
-    /// request stays open for the whole chunk sequence and may never reach the
-    /// server, so releasing it here could lose a live server-side plan.
     #[tokio::test]
-    async fn begin_execute_prepared_keeps_the_orphan_for_the_caller() {
-        let (mut client, _sent) = create_capturing_client(vec![]);
-        let orphan_id = sid(1);
+    async fn begin_execute_prepared_releases_each_orphan_before_a_cancellable_stream() {
+        let tokens = (78..82)
+            .flat_map(|handle| {
+                [
+                    done_no_more(),
+                    Tokens::ReturnValue(ae_return_value_token(
+                        "@handle",
+                        ColumnValues::Int(handle),
+                        None,
+                    )),
+                    done_no_more(),
+                ]
+            })
+            .collect();
+        let (mut client, sent) = create_capturing_client(tokens);
+        let first_id = client.issue_statement_id();
+        client.prepared_handles.insert(first_id, 77);
+        let mut statement =
+            PreparedStatement::materialized_for_test("INSERT INTO t(v) VALUES (@v)", first_id);
+
+        for handle in 77i32..81 {
+            let mut orphaned = statement.take_id();
+            let old_id = orphaned.unwrap();
+            let offset = sent.lock().unwrap().len();
+            let status = client
+                .begin_execute_prepared(
+                    &mut statement,
+                    vec![streamed_varbinary("@v")],
+                    &mut orphaned,
+                    (),
+                )
+                .await
+                .unwrap();
+            assert!(matches!(status, StreamedParamStatus::NeedData { .. }));
+            assert!(orphaned.is_none());
+            assert!(client.prepared_handles.is_empty());
+
+            let release = sent.lock().unwrap()[offset..].to_vec();
+            assert_eq!(
+                release
+                    .windows(4)
+                    .filter(|w| *w == [0xFF, 0xFF, 0x0F, 0x00])
+                    .count(),
+                1,
+                "one standalone sp_unprepare must precede the parked stream"
+            );
+            let mut parameter = vec![0, 0, 0x26, 4, 4];
+            parameter.extend_from_slice(&handle.to_le_bytes());
+            assert!(release.windows(parameter.len()).any(|w| w == parameter));
+            assert!(!release.windows(4).any(|w| w == [0xFF, 0xFF, 0x0D, 0x00]));
+
+            client.cancel_streamed_write().await;
+            assert!(!client.prepared_handles.contains_key(&old_id));
+            assert!(client.pending_capture.is_none());
+            assert_eq!(sent.lock().unwrap().len(), offset + release.len());
+
+            client
+                .begin_execute_prepared(
+                    &mut statement,
+                    vec![streamed_varbinary("@v")],
+                    &mut orphaned,
+                    (),
+                )
+                .await
+                .unwrap();
+            client.write_streamed_chunk(&[0xAA]).await.unwrap();
+            assert!(matches!(
+                client.end_streamed_param().await.unwrap(),
+                StreamedParamStatus::Complete(_)
+            ));
+            assert_eq!(client.prepared_handles.len(), 1);
+            assert_eq!(
+                client.prepared_handles.get(&statement.id().unwrap()),
+                Some(&(handle + 1))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn begin_execute_prepared_skips_absent_orphans_without_unprepare() {
+        for orphaned in [None, Some(sid(77))] {
+            let (mut client, sent) = create_capturing_client(vec![]);
+            let mut orphaned = orphaned;
+            let mut statement = PreparedStatement::new("INSERT INTO t(v) VALUES (@v)");
+            client
+                .begin_execute_prepared(
+                    &mut statement,
+                    vec![streamed_varbinary("@v")],
+                    &mut orphaned,
+                    ExecuteOptions::new().timeout_secs(1),
+                )
+                .await
+                .unwrap();
+            assert!(orphaned.is_none());
+            assert!(
+                sent.lock().unwrap().is_empty(),
+                "no cleanup RPC for an absent handle"
+            );
+            client.cancel_streamed_write().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn begin_execute_prepared_release_failure_does_not_open_a_stream() {
+        let (mut client, sent) = create_capturing_client(vec![]);
+        let orphan_id = client.issue_statement_id();
         client.prepared_handles.insert(orphan_id, 77);
         let mut statement = PreparedStatement::new("INSERT INTO t(v) VALUES (@v)");
         let mut orphaned = Some(orphan_id);
+
+        assert!(
+            client
+                .begin_execute_prepared(
+                    &mut statement,
+                    vec![streamed_varbinary("@v")],
+                    &mut orphaned,
+                    (),
+                )
+                .await
+                .is_err()
+        );
+        assert!(orphaned.is_none(), "the release crossed its send boundary");
+        assert!(client.prepared_handles.is_empty());
+        assert!(client.pending_capture.is_none());
+        assert!(statement.id().is_none());
+        assert!(matches!(
+            client.streamed_write_state,
+            StreamedWriteState::Idle
+        ));
+        let bytes = sent.lock().unwrap();
+        assert!(bytes.windows(4).any(|w| w == [0xFF, 0xFF, 0x0F, 0x00]));
+        assert!(!bytes.windows(4).any(|w| w == [0xFF, 0xFF, 0x0D, 0x00]));
+    }
+
+    #[tokio::test]
+    async fn begin_execute_prepared_invalid_parameter_keeps_orphan_without_io() {
+        let (mut client, sent) = create_capturing_client(vec![]);
+        let orphan_id = client.issue_statement_id();
+        client.prepared_handles.insert(orphan_id, 77);
+        let mut statement = PreparedStatement::new("INSERT INTO t(v) VALUES (@v)");
+        let mut orphaned = Some(orphan_id);
+        let mut param = streamed_varbinary("@v");
+        param.name = None;
+        assert!(matches!(
+            client
+                .begin_execute_prepared(&mut statement, vec![param], &mut orphaned, ())
+                .await,
+            Err(UsageError(_))
+        ));
+        assert_eq!(orphaned, Some(orphan_id));
+        assert_eq!(client.prepared_handles.get(&orphan_id), Some(&77));
+        assert!(sent.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn begin_execute_prepared_release_server_error_preserves_connection_reuse() {
+        let (mut client, sent) = create_capturing_client(vec![
+            Tokens::Error(crate::token::tokens::ErrorToken {
+                number: 8179,
+                state: 1,
+                severity: 16,
+                message: "Could not find prepared statement with handle 77.".to_string(),
+                server_name: "test".to_string(),
+                proc_name: String::new(),
+                line_number: 1,
+            }),
+            done_no_more(),
+            Tokens::ReturnValue(ae_return_value_token(
+                "@handle",
+                ColumnValues::Int(78),
+                None,
+            )),
+            done_no_more(),
+        ]);
+        let orphan_id = client.issue_statement_id();
+        client.prepared_handles.insert(orphan_id, 77);
+        let mut orphaned = Some(orphan_id);
+        let mut statement = PreparedStatement::new("INSERT INTO t(v) VALUES (@v)");
+
+        let error = client
+            .begin_execute_prepared(
+                &mut statement,
+                vec![streamed_varbinary("@v")],
+                &mut orphaned,
+                (),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(expect_sql_error(error).errors[0].number, 8179);
+        assert!(orphaned.is_none());
+        assert!(statement.id().is_none());
+        assert!(matches!(
+            client.streamed_write_state,
+            StreamedWriteState::Idle
+        ));
+        assert!(!client.is_connection_dead());
 
         client
             .begin_execute_prepared(
@@ -15831,17 +16043,21 @@ mod tests {
                 (),
             )
             .await
-            .expect("begin must park for the streamed value");
-
+            .unwrap();
+        client.write_streamed_chunk(&[0xAA]).await.unwrap();
+        assert!(matches!(
+            client.end_streamed_param().await.unwrap(),
+            StreamedParamStatus::Complete(_)
+        ));
+        assert_eq!(client.prepared_handles.len(), 1);
         assert_eq!(
-            orphaned,
-            Some(orphan_id),
-            "the caller keeps ownership of the orphan's release"
-        );
-        assert_eq!(
-            client.prepared_handles.get(&orphan_id).copied(),
-            Some(77),
-            "the orphan's handle must stay live and releasable via unprepare"
+            sent.lock()
+                .unwrap()
+                .windows(4)
+                .filter(|w| *w == [0xFF, 0xFF, 0x0F, 0x00])
+                .count(),
+            1,
+            "retry must not release the old handle twice"
         );
     }
 

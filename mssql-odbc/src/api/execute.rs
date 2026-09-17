@@ -388,10 +388,8 @@ fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn
             // streams the values into the same `sp_execute` / `sp_prepexec` RPC a
             // materialized execute would have used, so the statement stays
             // prepared and reuses its handle across executes (msodbcsql parity).
-            // The orphan is not piggybacked here — the request stays open for the
-            // whole SQLPutData sequence and may never reach the server — so it
-            // rides along with the parked state and is released by the next
-            // execute or by SQLFreeHandle.
+            // TDS releases the orphan before opening the stream, so cancelling
+            // SQLPutData cannot discard its unprepare along with the request.
             let begin_result = dbc.runtime.block_on(client.begin_execute_prepared(
                 &mut prepared.stmt,
                 params,
