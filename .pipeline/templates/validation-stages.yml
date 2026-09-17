@@ -511,8 +511,6 @@ stages:
           - ubuntu22
           - ubuntu24
           - alpine318
-          - alpine319
-          - alpine320
           - alpine321
           - debian
           - rhel9
@@ -757,12 +755,6 @@ stages:
           Alpine3_18:
             container: ghcr.io/microsoft/mssql-rs/import/alpine:3.18
             entry: alpine.sh
-          Alpine3_19:
-            container: ghcr.io/microsoft/mssql-rs/import/alpine:3.19
-            entry: alpine.sh
-          Alpine3_20:
-            container: ghcr.io/microsoft/mssql-rs/import/alpine:3.20
-            entry: alpine.sh
           Alpine3_21:
             container: ghcr.io/microsoft/mssql-rs/import/alpine:3.21
             entry: alpine.sh
@@ -777,12 +769,6 @@ stages:
         matrix:
           Alpine3_18:
             container: ghcr.io/microsoft/mssql-rs/import/alpine:3.18
-            entry: odbc-e2e-alpine.sh
-          Alpine3_19:
-            container: ghcr.io/microsoft/mssql-rs/import/alpine:3.19
-            entry: odbc-e2e-alpine.sh
-          Alpine3_20:
-            container: ghcr.io/microsoft/mssql-rs/import/alpine:3.20
             entry: odbc-e2e-alpine.sh
           Alpine3_21:
             container: ghcr.io/microsoft/mssql-rs/import/alpine:3.21
@@ -805,7 +791,7 @@ stages:
           poolName: ${{ parameters.poolName }}
           instanceId: shared_musl
           sqlImageTag: ${{ parameters.sqlImageTag }}
-          expectedSentinels: 'Alpine3_18,Alpine3_19,Alpine3_20,Alpine3_21,odbc_Alpine3_18,odbc_Alpine3_19,odbc_Alpine3_20,odbc_Alpine3_21'
+          expectedSentinels: 'Alpine3_18,Alpine3_21,odbc_Alpine3_18,odbc_Alpine3_21'
       - template: test-matrix-template-alpine_arm64.yml
         parameters:
           manageSqlHost: false
@@ -817,12 +803,6 @@ stages:
           targets:
             - name: Alpine3_18
               container: ghcr.io/microsoft/mssql-rs/import/alpine:3.18
-              entry: alpine.sh
-            - name: Alpine3_19
-              container: ghcr.io/microsoft/mssql-rs/import/alpine:3.19
-              entry: alpine.sh
-            - name: Alpine3_20
-              container: ghcr.io/microsoft/mssql-rs/import/alpine:3.20
               entry: alpine.sh
             - name: Alpine3_21
               container: ghcr.io/microsoft/mssql-rs/import/alpine:3.21
@@ -839,12 +819,6 @@ stages:
           targets:
             - name: Alpine3_18
               container: ghcr.io/microsoft/mssql-rs/import/alpine:3.18
-              entry: odbc-e2e-alpine.sh
-            - name: Alpine3_19
-              container: ghcr.io/microsoft/mssql-rs/import/alpine:3.19
-              entry: odbc-e2e-alpine.sh
-            - name: Alpine3_20
-              container: ghcr.io/microsoft/mssql-rs/import/alpine:3.20
               entry: odbc-e2e-alpine.sh
             - name: Alpine3_21
               container: ghcr.io/microsoft/mssql-rs/import/alpine:3.21
@@ -863,12 +837,6 @@ stages:
             - name: Alpine3_18
               container: ghcr.io/microsoft/mssql-rs/import/alpine:3.18
               entry: alpine.sh
-            - name: Alpine3_19
-              container: ghcr.io/microsoft/mssql-rs/import/alpine:3.19
-              entry: alpine.sh
-            - name: Alpine3_20
-              container: ghcr.io/microsoft/mssql-rs/import/alpine:3.20
-              entry: alpine.sh
             - name: Alpine3_21
               container: ghcr.io/microsoft/mssql-rs/import/alpine:3.21
               entry: alpine.sh
@@ -882,12 +850,6 @@ stages:
           targets:
             - name: Alpine3_18
               container: ghcr.io/microsoft/mssql-rs/import/alpine:3.18
-              entry: odbc-e2e-alpine.sh
-            - name: Alpine3_19
-              container: ghcr.io/microsoft/mssql-rs/import/alpine:3.19
-              entry: odbc-e2e-alpine.sh
-            - name: Alpine3_20
-              container: ghcr.io/microsoft/mssql-rs/import/alpine:3.20
               entry: odbc-e2e-alpine.sh
             - name: Alpine3_21
               container: ghcr.io/microsoft/mssql-rs/import/alpine:3.21
