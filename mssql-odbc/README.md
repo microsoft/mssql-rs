@@ -169,6 +169,10 @@ including when only buffer values or addresses change. Equivalent descriptors
 can reuse the same plan after reassociation. Parameter arrays and data-at-execution
 retain this metadata with the prepared plan while execution is staged or parked.
 
+This comparison covers descriptor metadata, not type information carried inside
+application values. In particular, changing only the precision/scale fields of
+a `SQL_NUMERIC_STRUCT` is outside this invalidation check.
+
 ## Conventions
 
 Before writing or modifying code in this crate, read
