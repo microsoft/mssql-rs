@@ -104,15 +104,15 @@ impl SourcePythonType {
 /// to be serialized directly to TDS packets without allocating intermediate
 /// Vec<ColumnValues>. The GIL is acquired only when reading Python values.
 ///
-/// When destination metadata is provided, the adapter will attempt to perform
-/// type conversions (e.g., string to int) to match the target column types.
+/// The adapter uses destination metadata to perform type conversions
+/// (e.g., string to int) to match the target column types.
 pub struct PythonRowAdapter {
     /// Python tuple containing row data (stored as Py<PyAny> for Send + Sync)
     row: Py<PyAny>,
-    /// Optional destination column metadata for type coercion (wrapped in Arc for efficient sharing across rows)
-    destination_metadata: Option<Arc<Vec<BulkCopyColumnMetadata>>>,
-    /// Optional resolved column mappings for reordering columns (wrapped in Arc for efficient sharing across rows)
-    resolved_mappings: Option<Arc<Vec<ResolvedColumnMapping>>>,
+    /// Destination column metadata for type coercion (wrapped in Arc for efficient sharing across rows)
+    destination_metadata: Arc<Vec<BulkCopyColumnMetadata>>,
+    /// Resolved column mappings for reordering columns (wrapped in Arc for efficient sharing across rows)
+    resolved_mappings: Arc<Vec<ResolvedColumnMapping>>,
     /// Expected number of source columns (from first row), used to validate row consistency
     expected_source_columns: Option<usize>,
 }
@@ -124,7 +124,7 @@ impl PythonRowAdapter {
     ///
     /// * `row` - Python tuple containing column values
     /// * `destination_metadata` - Destination column metadata for type conversion (wrapped in Arc for efficient sharing)
-    /// * `resolved_mappings` - Optional resolved column mappings for reordering (wrapped in Arc for efficient sharing)
+    /// * `resolved_mappings` - Resolved column mappings for reordering (wrapped in Arc for efficient sharing)
     ///
     /// # Returns
     ///
@@ -132,12 +132,12 @@ impl PythonRowAdapter {
     pub fn with_metadata(
         row: Py<PyAny>,
         destination_metadata: Arc<Vec<BulkCopyColumnMetadata>>,
-        resolved_mappings: Option<Arc<Vec<ResolvedColumnMapping>>>,
+        resolved_mappings: Arc<Vec<ResolvedColumnMapping>>,
         expected_source_columns: Option<usize>,
     ) -> Self {
         Self {
             row,
-            destination_metadata: Some(destination_metadata),
+            destination_metadata,
             resolved_mappings,
             expected_source_columns,
         }
@@ -163,7 +163,7 @@ impl PythonRowAdapter {
     /// | (default)          | Any                             | py_to_column_value()         |
     fn convert_with_coercion(
         py_obj: &Bound<'_, PyAny>,
-        target_metadata: Option<&BulkCopyColumnMetadata>,
+        target_metadata: &BulkCopyColumnMetadata,
     ) -> TdsResult<ColumnValues> {
         // Step 1: Fast source type detection
         let source_type = SourcePythonType::detect(py_obj);
@@ -177,13 +177,11 @@ impl PythonRowAdapter {
         }
 
         // Step 3: Check if we need type coercion based on source → target mapping
-        if let Some(meta) = target_metadata
-            && let Some(coerced_value) = Self::try_type_coercion(py_obj, source_type, meta)
-                .map_err(|e| {
-                    tracing::error!("Type coercion failed: {}", e);
-                    e
-                })?
-        {
+        if let Some(coerced_value) = Self::try_type_coercion(py_obj, source_type, target_metadata)
+            .map_err(|e| {
+            tracing::error!("Type coercion failed: {}", e);
+            e
+        })? {
             return Ok(coerced_value);
         }
 
@@ -200,22 +198,16 @@ impl PythonRowAdapter {
         // This handles:
         // - Python datetime.date → SQL DATE conversion
         // - Native type conversions (float→float, bytes→bytes, etc.)
-        // - Bulk copy without explicit column metadata
-        //
-        py_to_column_value(py_obj, target_metadata)
+        py_to_column_value(py_obj, Some(target_metadata))
     }
 
     /// Handle NULL value insertion with nullability validation.
     #[inline]
-    fn handle_null_value(
-        target_metadata: Option<&BulkCopyColumnMetadata>,
-    ) -> TdsResult<ColumnValues> {
-        if let Some(meta) = target_metadata
-            && !meta.is_nullable
-        {
+    fn handle_null_value(target_metadata: &BulkCopyColumnMetadata) -> TdsResult<ColumnValues> {
+        if !target_metadata.is_nullable {
             return Err(Error::UsageError(format!(
                 "Cannot insert NULL value into non-nullable column '{}'. Conversion not possible for NULL to non-nullable column",
-                meta.column_name
+                target_metadata.column_name
             )));
         }
         Ok(ColumnValues::Null)
@@ -238,10 +230,7 @@ impl PythonRowAdapter {
             (
                 SourcePythonType::String,
                 SqlDbType::Int | SqlDbType::BigInt | SqlDbType::SmallInt | SqlDbType::TinyInt,
-            ) => {
-                let result = Self::coerce_string_to_integer(py_obj, target_meta.sql_type)?;
-                Ok(Some(result))
-            }
+            ) => Self::coerce_string_to_integer(py_obj, target_meta.sql_type).map(Some),
 
             // Int → Integer types: Validate range for target type
             // This ensures Python integers that exceed the target type's range are rejected
@@ -249,10 +238,7 @@ impl PythonRowAdapter {
             (
                 SourcePythonType::Int,
                 SqlDbType::Int | SqlDbType::BigInt | SqlDbType::SmallInt | SqlDbType::TinyInt,
-            ) => {
-                let result = Self::coerce_python_int_to_integer(py_obj, target_meta.sql_type)?;
-                Ok(Some(result))
-            }
+            ) => Self::coerce_python_int_to_integer(py_obj, target_meta.sql_type).map(Some),
 
             // Int → Bit: Convert Python integer to boolean
             // 0 = false, non-zero = true (matches SQL Server's implicit conversion)
@@ -289,158 +275,130 @@ impl PythonRowAdapter {
 
             // String → Decimal/Numeric: Parse string as decimal
             (SourcePythonType::String, SqlDbType::Decimal | SqlDbType::Numeric) => {
-                let result = Self::coerce_string_to_decimal(py_obj, target_meta)?;
-                Ok(Some(result))
+                Self::coerce_string_to_decimal(py_obj, target_meta).map(Some)
             }
 
             // Int → Decimal/Numeric: Convert integer to decimal
             (SourcePythonType::Int, SqlDbType::Decimal | SqlDbType::Numeric) => {
-                let result = Self::coerce_int_to_decimal(py_obj, target_meta)?;
-                Ok(Some(result))
+                Self::coerce_int_to_decimal(py_obj, target_meta).map(Some)
             }
 
             // Float → Decimal/Numeric: Convert float to decimal
             (SourcePythonType::Float, SqlDbType::Decimal | SqlDbType::Numeric) => {
-                let result = Self::coerce_float_to_decimal(py_obj, target_meta)?;
-                Ok(Some(result))
+                Self::coerce_float_to_decimal(py_obj, target_meta).map(Some)
             }
 
             // Decimal → Decimal/Numeric: Validate precision/scale
             (SourcePythonType::Decimal, SqlDbType::Decimal | SqlDbType::Numeric) => {
-                let result = Self::coerce_decimal_to_decimal(py_obj, target_meta)?;
-                Ok(Some(result))
+                Self::coerce_decimal_to_decimal(py_obj, target_meta).map(Some)
             }
 
             // String → Money/SmallMoney: Parse string as money
             (SourcePythonType::String, SqlDbType::Money | SqlDbType::SmallMoney) => {
-                let result = Self::coerce_string_to_money(py_obj, target_meta.sql_type)?;
-                Ok(Some(result))
+                Self::coerce_string_to_money(py_obj, target_meta.sql_type).map(Some)
             }
 
             // Int → Money/SmallMoney: Convert integer to money
             (SourcePythonType::Int, SqlDbType::Money | SqlDbType::SmallMoney) => {
-                let result = Self::coerce_int_to_money(py_obj, target_meta.sql_type)?;
-                Ok(Some(result))
+                Self::coerce_int_to_money(py_obj, target_meta.sql_type).map(Some)
             }
 
             // Float → Money/SmallMoney: Convert float to money
             (SourcePythonType::Float, SqlDbType::Money | SqlDbType::SmallMoney) => {
-                let result = Self::coerce_float_to_money(py_obj, target_meta.sql_type)?;
-                Ok(Some(result))
+                Self::coerce_float_to_money(py_obj, target_meta.sql_type).map(Some)
             }
 
             // Decimal → Money/SmallMoney: Convert decimal to money
             (SourcePythonType::Decimal, SqlDbType::Money | SqlDbType::SmallMoney) => {
-                let result = Self::coerce_decimal_to_money(py_obj, target_meta.sql_type)?;
-                Ok(Some(result))
+                Self::coerce_decimal_to_money(py_obj, target_meta.sql_type).map(Some)
             }
 
             // DateTime → Date: Extract date part
             (SourcePythonType::DateTime, SqlDbType::Date) => {
-                let result = Self::coerce_datetime_to_date(py_obj)?;
-                Ok(Some(result))
+                Self::coerce_datetime_to_date(py_obj).map(Some)
             }
 
             // String → Date: Parse ISO format date string (YYYY-MM-DD)
             (SourcePythonType::String, SqlDbType::Date) => {
-                let result = Self::coerce_string_to_date(py_obj)?;
-                Ok(Some(result))
+                Self::coerce_string_to_date(py_obj).map(Some)
             }
 
             // String → Time: Parse ISO format time string (HH:MM:SS or HH:MM:SS.ffffff)
             (SourcePythonType::String, SqlDbType::Time) => {
-                let result = Self::coerce_string_to_time(py_obj)?;
-                Ok(Some(result))
+                Self::coerce_string_to_time(py_obj).map(Some)
             }
 
             // String → DateTime/SmallDateTime: Parse ISO format datetime string
             (SourcePythonType::String, SqlDbType::DateTime | SqlDbType::SmallDateTime) => {
-                let result = Self::coerce_string_to_datetime(py_obj, target_meta.sql_type)?;
-                Ok(Some(result))
+                Self::coerce_string_to_datetime(py_obj, target_meta.sql_type).map(Some)
             }
 
             // String → DateTime2: Parse ISO format datetime string for DATETIME2
             (SourcePythonType::String, SqlDbType::DateTime2) => {
-                let result = Self::coerce_string_to_datetime2(py_obj, target_meta)?;
-                Ok(Some(result))
+                Self::coerce_string_to_datetime2(py_obj, target_meta).map(Some)
             }
 
             // DateTime → DateTime2: Convert Python datetime to DATETIME2
             (SourcePythonType::DateTime, SqlDbType::DateTime2) => {
-                let result = Self::coerce_datetime_to_datetime2(py_obj, target_meta)?;
-                Ok(Some(result))
+                Self::coerce_datetime_to_datetime2(py_obj, target_meta).map(Some)
             }
 
             // String → DateTimeOffset: Parse ISO format datetime string with timezone
             (SourcePythonType::String, SqlDbType::DateTimeOffset) => {
-                let result = Self::coerce_string_to_datetimeoffset(py_obj, target_meta)?;
-                Ok(Some(result))
+                Self::coerce_string_to_datetimeoffset(py_obj, target_meta).map(Some)
             }
 
             // DateTime → DateTimeOffset: Convert Python datetime to DATETIMEOFFSET
             (SourcePythonType::DateTime, SqlDbType::DateTimeOffset) => {
-                let result = Self::coerce_datetime_to_datetimeoffset(py_obj, target_meta)?;
-                Ok(Some(result))
+                Self::coerce_datetime_to_datetimeoffset(py_obj, target_meta).map(Some)
             }
 
             // Float → Float: Direct mapping (no coercion needed, but validate range)
             (SourcePythonType::Float, SqlDbType::Float) => {
-                let result = Self::coerce_float_to_float(py_obj)?;
-                Ok(Some(result))
+                Self::coerce_float_to_float(py_obj).map(Some)
             }
 
             // Float → Real: Convert f64 to f32 with precision loss warning
             (SourcePythonType::Float, SqlDbType::Real) => {
-                let result = Self::coerce_float_to_real(py_obj)?;
-                Ok(Some(result))
+                Self::coerce_float_to_real(py_obj).map(Some)
             }
 
             // String → Float: Parse string as f64
             (SourcePythonType::String, SqlDbType::Float) => {
-                let result = Self::coerce_string_to_float(py_obj)?;
-                Ok(Some(result))
+                Self::coerce_string_to_float(py_obj).map(Some)
             }
 
             // String → Real: Parse string as f32
             (SourcePythonType::String, SqlDbType::Real) => {
-                let result = Self::coerce_string_to_real(py_obj)?;
-                Ok(Some(result))
+                Self::coerce_string_to_real(py_obj).map(Some)
             }
 
             // Int → Float: Convert integer to f64
             (SourcePythonType::Int, SqlDbType::Float) => {
-                let result = Self::coerce_int_to_float(py_obj)?;
-                Ok(Some(result))
+                Self::coerce_int_to_float(py_obj).map(Some)
             }
 
             // Int → Real: Convert integer to f32
-            (SourcePythonType::Int, SqlDbType::Real) => {
-                let result = Self::coerce_int_to_real(py_obj)?;
-                Ok(Some(result))
-            }
+            (SourcePythonType::Int, SqlDbType::Real) => Self::coerce_int_to_real(py_obj).map(Some),
 
             // String → JSON: Parse string as JSON (validate it's valid JSON)
             (SourcePythonType::String, SqlDbType::Json) => {
-                let result = Self::coerce_string_to_json(py_obj)?;
-                Ok(Some(result))
+                Self::coerce_string_to_json(py_obj).map(Some)
             }
 
             // Dict → JSON: Serialize Python dict to JSON
             (SourcePythonType::Dict, SqlDbType::Json) => {
-                let result = Self::coerce_dict_to_json(py_obj)?;
-                Ok(Some(result))
+                Self::coerce_dict_to_json(py_obj).map(Some)
             }
 
             // List → JSON: Serialize Python list to JSON
             (SourcePythonType::List, SqlDbType::Json) => {
-                let result = Self::coerce_list_to_json(py_obj)?;
-                Ok(Some(result))
+                Self::coerce_list_to_json(py_obj).map(Some)
             }
 
             // String → XML: Convert string to XML
             (SourcePythonType::String, SqlDbType::Xml) => {
-                let result = Self::coerce_string_to_xml(py_obj)?;
-                Ok(Some(result))
+                Self::coerce_string_to_xml(py_obj).map(Some)
             }
 
             // Int → NVarChar/VarChar/NChar/Char/NText/Text: Convert integer to string
@@ -452,10 +410,7 @@ impl PythonRowAdapter {
                 | SqlDbType::Char
                 | SqlDbType::NText
                 | SqlDbType::Text,
-            ) => {
-                let result = Self::coerce_int_to_string(py_obj)?;
-                Ok(Some(result))
-            }
+            ) => Self::coerce_int_to_string(py_obj).map(Some),
 
             // Float → NVarChar/VarChar/NChar/Char/NText/Text: Convert float to string
             (
@@ -466,10 +421,7 @@ impl PythonRowAdapter {
                 | SqlDbType::Char
                 | SqlDbType::NText
                 | SqlDbType::Text,
-            ) => {
-                let result = Self::coerce_float_to_string(py_obj)?;
-                Ok(Some(result))
-            }
+            ) => Self::coerce_float_to_string(py_obj).map(Some),
 
             // Bool → NVarChar/VarChar/NChar/Char/NText/Text: Convert boolean to string ('True'/'False')
             (
@@ -480,10 +432,7 @@ impl PythonRowAdapter {
                 | SqlDbType::Char
                 | SqlDbType::NText
                 | SqlDbType::Text,
-            ) => {
-                let result = Self::coerce_bool_to_string(py_obj)?;
-                Ok(Some(result))
-            }
+            ) => Self::coerce_bool_to_string(py_obj).map(Some),
 
             // Decimal → NVarChar/VarChar/NChar/Char/NText/Text: Convert decimal to string
             (
@@ -494,27 +443,21 @@ impl PythonRowAdapter {
                 | SqlDbType::Char
                 | SqlDbType::NText
                 | SqlDbType::Text,
-            ) => {
-                let result = Self::coerce_decimal_to_string(py_obj)?;
-                Ok(Some(result))
-            }
+            ) => Self::coerce_decimal_to_string(py_obj).map(Some),
 
             // List → Vector: Convert Python list to SQL Server vector type
             (SourcePythonType::List, SqlDbType::Vector) => {
-                let result = Self::coerce_list_to_vector(py_obj, target_meta)?;
-                Ok(Some(result))
+                Self::coerce_list_to_vector(py_obj, target_meta).map(Some)
             }
 
             // String → Vector: Parse JSON float array string to VECTOR
             (SourcePythonType::String, SqlDbType::Vector) => {
-                let result = PythonRowAdapter::coerce_string_to_vector(py_obj, target_meta)?;
-                Ok(Some(result))
+                PythonRowAdapter::coerce_string_to_vector(py_obj, target_meta).map(Some)
             }
 
             // String → UniqueIdentifier: Parse UUID string to UNIQUEIDENTIFIER
             (SourcePythonType::String, SqlDbType::UniqueIdentifier) => {
-                let result = Self::coerce_string_to_uuid(py_obj)?;
-                Ok(Some(result))
+                Self::coerce_string_to_uuid(py_obj).map(Some)
             }
 
             // No coercion needed - use default conversion
@@ -1513,37 +1456,37 @@ impl PythonRowAdapter {
         meta: &BulkCopyColumnMetadata,
     ) -> TdsResult<ColumnValues> {
         if py_obj.is_none() {
-            return Self::handle_null_value(Some(meta));
+            return Self::handle_null_value(meta);
         }
 
         match meta.sql_type {
             SqlDbType::BigInt => match py_obj.extract::<i64>() {
                 Ok(val) => Ok(ColumnValues::BigInt(val)),
-                Err(_) => Self::convert_with_coercion(py_obj, Some(meta)),
+                Err(_) => Self::convert_with_coercion(py_obj, meta),
             },
             SqlDbType::Int => match py_obj.extract::<i32>() {
                 Ok(val) => Ok(ColumnValues::Int(val)),
-                Err(_) => Self::convert_with_coercion(py_obj, Some(meta)),
+                Err(_) => Self::convert_with_coercion(py_obj, meta),
             },
             SqlDbType::SmallInt => match py_obj.extract::<i16>() {
                 Ok(val) => Ok(ColumnValues::SmallInt(val)),
-                Err(_) => Self::convert_with_coercion(py_obj, Some(meta)),
+                Err(_) => Self::convert_with_coercion(py_obj, meta),
             },
             SqlDbType::TinyInt => match py_obj.extract::<u8>() {
                 Ok(val) => Ok(ColumnValues::TinyInt(val)),
-                Err(_) => Self::convert_with_coercion(py_obj, Some(meta)),
+                Err(_) => Self::convert_with_coercion(py_obj, meta),
             },
             SqlDbType::Float => match py_obj.extract::<f64>() {
                 Ok(val) => Ok(ColumnValues::Float(val)),
-                Err(_) => Self::convert_with_coercion(py_obj, Some(meta)),
+                Err(_) => Self::convert_with_coercion(py_obj, meta),
             },
             SqlDbType::Real => match py_obj.extract::<f32>() {
                 Ok(val) => Ok(ColumnValues::Real(val)),
-                Err(_) => Self::convert_with_coercion(py_obj, Some(meta)),
+                Err(_) => Self::convert_with_coercion(py_obj, meta),
             },
             SqlDbType::Bit => match py_obj.extract::<bool>() {
                 Ok(val) => Ok(ColumnValues::Bit(val)),
-                Err(_) => Self::convert_with_coercion(py_obj, Some(meta)),
+                Err(_) => Self::convert_with_coercion(py_obj, meta),
             },
             SqlDbType::NVarChar
             | SqlDbType::VarChar
@@ -1554,9 +1497,9 @@ impl PythonRowAdapter {
                 Ok(s) => Ok(ColumnValues::String(
                     mssql_tds::datatypes::sql_string::SqlString::from_utf8_string(s),
                 )),
-                Err(_) => Self::convert_with_coercion(py_obj, Some(meta)),
+                Err(_) => Self::convert_with_coercion(py_obj, meta),
             },
-            _ => Self::convert_with_coercion(py_obj, Some(meta)),
+            _ => Self::convert_with_coercion(py_obj, meta),
         }
     }
 
@@ -1938,74 +1881,46 @@ impl BulkLoadRow for PythonRowAdapter {
                 Error::UsageError(format!("Expected tuple, got: {}", e))
             })?;
 
-            // If we have resolved mappings, use them to determine column order and indices
-            if let Some(mappings) = &self.resolved_mappings {
-                Self::validate_column_count(tuple.len(), self.expected_source_columns)?;
+            Self::validate_column_count(tuple.len(), self.expected_source_columns)?;
 
-                // Use mappings to read columns in the correct order
-                let mut values = Vec::with_capacity(mappings.len());
+            // Use mappings to read columns in the correct order
+            let mut values = Vec::with_capacity(self.resolved_mappings.len());
 
-                for mapping in mappings.iter() {
-                    // Read from source column index specified in the mapping
-                    let item = tuple.get_item(mapping.source_index).map_err(|e| {
-                        tracing::error!(
-                            "Source column index {} out of bounds (tuple has {} columns): {}",
-                            mapping.source_index,
-                            tuple.len(),
-                            e
-                        );
+            for mapping in self.resolved_mappings.iter() {
+                // Read from source column index specified in the mapping
+                let item = tuple.get_item(mapping.source_index).map_err(|e| {
+                    tracing::error!(
+                        "Source column index {} out of bounds (tuple has {} columns): {}",
+                        mapping.source_index,
+                        tuple.len(),
+                        e
+                    );
+                    Error::UsageError(format!(
+                        "Source column index {} out of bounds (tuple has {} columns): {}",
+                        mapping.source_index,
+                        tuple.len(),
+                        e
+                    ))
+                })?;
+
+                // Get target metadata from destination_metadata using destination_index
+                let meta = self
+                    .destination_metadata
+                    .get(mapping.destination_index)
+                    .ok_or_else(|| {
                         Error::UsageError(format!(
-                            "Source column index {} out of bounds (tuple has {} columns): {}",
-                            mapping.source_index,
-                            tuple.len(),
-                            e
+                            "Unexpected missing destination metadata for column index {}",
+                            mapping.destination_index
                         ))
                     })?;
 
-                    // Get target metadata from destination_metadata using destination_index
-                    let meta = self
-                        .destination_metadata
-                        .as_ref()
-                        .and_then(|meta| meta.get(mapping.destination_index))
-                        .ok_or_else(|| {
-                            Error::UsageError(format!(
-                                "Unexpected missing destination metadata for column index {}",
-                                mapping.destination_index
-                            ))
-                        })?;
+                // Try conversion with type coercion and null validation
+                let column_value = Self::convert_by_target_type(&item, meta)?;
 
-                    // Try conversion with type coercion and null validation
-                    let column_value = Self::convert_by_target_type(&item, meta)?;
-
-                    values.push(column_value);
-                }
-
-                Ok::<Vec<_>, Error>(values)
-            } else {
-                // No mappings - use sequential reading (original behavior)
-                let mut values = Vec::with_capacity(tuple.len());
-
-                for (i, item) in tuple.iter().enumerate() {
-                    // Get target metadata if available
-                    let meta = self
-                        .destination_metadata
-                        .as_ref()
-                        .and_then(|meta| meta.get(i))
-                        .ok_or_else(|| {
-                            Error::UsageError(format!(
-                                "Unexpected missing destination metadata for column index {}",
-                                i
-                            ))
-                        })?;
-
-                    // Try conversion with type coercion and null validation
-                    let column_value = Self::convert_by_target_type(&item, meta)?;
-
-                    values.push(column_value);
-                }
-
-                Ok::<Vec<_>, Error>(values)
+                values.push(column_value);
             }
+
+            Ok::<Vec<_>, Error>(values)
         })?;
 
         // Step 2: GIL is now released, write values to packet asynchronously

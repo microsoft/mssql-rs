@@ -480,7 +480,7 @@ impl PyCoreCursor {
                 PythonRowAdapter::with_metadata(
                     row,
                     Arc::clone(&metadata_arc),
-                    Some(Arc::clone(&resolved_mappings_arc)),
+                    Arc::clone(&resolved_mappings_arc),
                     first_row_col_count,
                 )
             });

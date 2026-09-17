@@ -2,11 +2,10 @@
 // Licensed under the MIT License.
 
 use chrono::Local;
-use once_cell::sync::OnceCell;
 use std::fmt;
 use std::fs::{OpenOptions, create_dir_all};
 use std::path::PathBuf;
-use std::sync::Once;
+use std::sync::{Once, OnceLock};
 use tracing::Subscriber;
 use tracing_appender::non_blocking;
 use tracing_subscriber::fmt::{FmtContext, FormatEvent, FormatFields, FormattedFields};
@@ -16,7 +15,7 @@ use tracing_subscriber::{EnvFilter, Registry, layer::SubscriberExt};
 use crate::async_tracing::{CURSOR_OPERATION_SPAN_NAME, CURSOR_OPERATION_SPAN_TARGET};
 
 static INIT: Once = Once::new();
-static GUARD: OnceCell<tracing_appender::non_blocking::WorkerGuard> = OnceCell::new();
+static GUARD: OnceLock<tracing_appender::non_blocking::WorkerGuard> = OnceLock::new();
 
 // Environment variable names
 const ENV_TRACE: &str = "MSSQL_TDS_TRACE";
