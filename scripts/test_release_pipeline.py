@@ -147,10 +147,12 @@ def test_cpp_codeql_build_is_official_only(is_official, build_products):
         step = steps[0]
         assert "condition" not in step
         assert not step.get("continueOnError", False)
-        assert r"-S mssql-odbc\tests\e2e" in step["pwsh"]
         assert '-G "Visual Studio 17 2022"' in step["pwsh"]
-        assert "-A x64 -DCMAKE_BUILD_TYPE=Debug -DODBC_E2E_FORCE_UNICODE=ON" in step["pwsh"]
-        assert "--config Debug --clean-first" in step["pwsh"]
+        assert "-A x64 -DODBC_E2E_FORCE_UNICODE=ON" in step["pwsh"]
+        assert "CMAKE_BUILD_TYPE" not in step["pwsh"]
+        for project in (r"mssql-odbc\tests\e2e", "mssql-odbc-bench"):
+            assert f"-S {project} -B {project}\\build_codeql" in step["pwsh"]
+            assert f"--build {project}\\build_codeql --config Debug --clean-first" in step["pwsh"]
         assert "ctest" not in step["pwsh"]
         assert "run_e2e" not in step["pwsh"]
         assert "Build.ArtifactStagingDirectory" not in step["pwsh"]
@@ -166,7 +168,10 @@ def test_cpp_codeql_build_is_official_only(is_official, build_products):
     ("configure_exit", "build_exit", "cmake_source"),
     [(0, 0, "path"), (1, 0, "path"), (0, 1, "path"), (0, 0, "vs"), (0, 0, "missing")],
 )
-def test_cpp_codeql_build_propagates_cmake_failures(configure_exit, build_exit, cmake_source):
+@pytest.mark.parametrize("failure_project", [r"mssql-odbc\tests\e2e", "mssql-odbc-bench"])
+def test_cpp_codeql_build_propagates_cmake_failures(
+    configure_exit, build_exit, cmake_source, failure_project
+):
     source = yaml.safe_load(_BUILD_STAGES.read_text(encoding="utf-8"))
     flags = {parameter["name"]: parameter["default"] for parameter in source["parameters"]}
     flags["isOfficial"] = True
@@ -178,13 +183,18 @@ def test_cpp_codeql_build_propagates_cmake_failures(configure_exit, build_exit, 
         step["pwsh"] for step in job["steps"]
         if step.get("displayName") == "Build ODBC C++ targets for CodeQL"
     )
-    stub = f"""
+    stub = rf"""
     function cmake {{
-        if ('{cmake_source}' -eq 'vs' -and $env:PATH -cne "C:\\Mock VS\\CMake\\bin;$originalPath") {{
+        if ('{cmake_source}' -eq 'vs' -and $env:PATH -cne "C:\Mock VS\CMake\bin;$originalPath") {{
             throw 'Discovered CMake directory was not prepended to PATH.'
         }}
         Write-Output "cmake $args"
-        $global:LASTEXITCODE = if ($args[0] -eq '-S') {{ {configure_exit} }} else {{ {build_exit} }}
+        $global:LASTEXITCODE = 0
+        if ($args[0] -eq '-S' -and $args[1] -eq '{failure_project}') {{
+            $global:LASTEXITCODE = {configure_exit}
+        }} elseif ($args[0] -eq '--build' -and $args[1] -eq '{failure_project}\build_codeql') {{
+            $global:LASTEXITCODE = {build_exit}
+        }}
     }}
     """
     if cmake_source != "path":
@@ -207,9 +217,14 @@ def test_cpp_codeql_build_propagates_cmake_failures(configure_exit, build_exit, 
     assert (result.returncode == 0) == (
         configure_exit == build_exit == 0 and cmake_source != "missing"
     ), result.stderr
-    assert ("cmake --build" in result.stdout) == (
-        configure_exit == 0 and cmake_source != "missing"
-    )
+    calls = [line for line in result.stdout.splitlines() if line.startswith("cmake ")]
+    expected_calls = 4
+    if cmake_source == "missing":
+        expected_calls = 0
+    elif configure_exit or build_exit:
+        expected_calls = (0 if failure_project == r"mssql-odbc\tests\e2e" else 2)
+        expected_calls += 1 if configure_exit else 2
+    assert len(calls) == expected_calls
     assert ("vswhere called" in result.stdout) == (cmake_source != "path")
     if cmake_source == "missing":
         assert "CMake not found on PATH or in Visual Studio." in result.stderr
