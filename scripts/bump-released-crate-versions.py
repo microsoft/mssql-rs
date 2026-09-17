@@ -5,20 +5,13 @@
 
 import json
 import os
-import re
 import subprocess
-import tomllib
-from datetime import date, datetime, timezone
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 CRATES = ("mssql-tds", "mssql-mock-tds")
 ISSUE_MARKER = "<!-- mssql-rs:released-crate-version-bump -->"
-
-
-def is_due(today):
-    return (today - date(1970, 1, 1)).days % 3 == 0
 
 
 def published_versions(crate):
@@ -40,60 +33,32 @@ def published_versions(crate):
     return versions
 
 
-def next_minor(version):
-    match = re.fullmatch(
-        r"(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z.-]+)?"
-        r"(?:\+[0-9A-Za-z.-]+)?",
-        version,
+def cargo_versions(root):
+    result = subprocess.run(
+        ["cargo", "metadata", "--no-deps", "--format-version", "1", "--offline"],
+        cwd=root, check=True, stdout=subprocess.PIPE, text=True,
     )
-    if not match:
-        raise ValueError(f"Unsupported crate version: {version}")
-    return f"{match[1]}.{int(match[2]) + 1}.0"
-
-
-def replace_once(pattern, replacement, text):
-    updated, count = re.subn(pattern, replacement, text, flags=re.MULTILINE)
-    if count != 1:
-        raise ValueError(f"Expected one manifest match for {pattern!r}, found {count}")
-    return updated
-
-
-def prepare_bump(root, versions):
-    contents = {
-        crate: (root / crate / "Cargo.toml").read_text(encoding="utf-8")
-        for crate in CRATES
+    return {
+        package["name"]: package["version"]
+        for package in json.loads(result.stdout)["packages"]
     }
-    changes = {}
-    for crate in CRATES:
-        current = tomllib.loads(contents[crate])["package"]["version"]
-        if current not in versions[crate]:
-            print(f"{crate} {current}: not published; leaving its version unchanged.")
-            continue
-        bumped = next_minor(current)
-        if bumped in versions[crate]:
-            raise ValueError(f"{crate} {bumped} is already published; bump it manually.")
-        changes[crate] = (current, bumped)
-        contents[crate] = replace_once(
-            r'(^\[package\][\s\S]*?^version\s*=\s*)"' + re.escape(current) + r'"',
-            lambda match: f'{match[1]}"{bumped}"',
-            contents[crate],
-        )
 
-    if "mssql-tds" in changes:
-        bumped = changes["mssql-tds"][1]
-        contents["mssql-mock-tds"] = replace_once(
-            r'(^mssql-tds\s*=\s*\{[^\r\n}]*?\bversion\s*=\s*)"[^"]+"',
-            lambda match: f'{match[1]}"{bumped}"',
-            contents["mssql-mock-tds"],
-        )
-        dependency = tomllib.loads(contents["mssql-mock-tds"])["dependencies"]["mssql-tds"]
-        if dependency["version"] != bumped or dependency["path"] != "../mssql-tds":
-            raise ValueError("The mock crate must depend on the updated local mssql-tds")
 
-    for crate, (_, bumped) in changes.items():
-        if tomllib.loads(contents[crate])["package"]["version"] != bumped:
-            raise ValueError(f"Failed to update {crate}'s package version")
-    return contents, changes
+def bump_versions(root, published):
+    before = cargo_versions(root)
+    selected = [crate for crate in CRATES if before[crate] in published[crate]]
+    if not selected:
+        return {}
+    subprocess.run(
+        ["cargo", "set-version", "--bump", "minor"]
+        + [arg for crate in selected for arg in ("--package", crate)],
+        cwd=root, check=True,
+    )
+    after = cargo_versions(root)
+    for crate in selected:
+        if after[crate] in published[crate]:
+            raise ValueError(f"{crate} {after[crate]} is already published; bump it manually.")
+    return {crate: (before[crate], after[crate]) for crate in selected}
 
 
 def ensure_bump_issue(summary, crates):
@@ -147,16 +112,10 @@ def ensure_bump_issue(summary, crates):
 
 
 def main():
-    if os.environ.get("GITHUB_EVENT_NAME") == "schedule" and not is_due(
-        datetime.now(timezone.utc).date()
-    ):
-        print("Not a three-day check date; skipping.")
-        return
-
     root = Path(__file__).resolve().parents[1]
     # Fetch both before editing: a registry outage must not produce a partial PR.
     versions = {crate: published_versions(crate) for crate in CRATES}
-    contents, changes = prepare_bump(root, versions)
+    changes = bump_versions(root, versions)
     body = (root / ".github" / "PULL_REQUEST_TEMPLATE.md").read_text(encoding="utf-8")
     if changes:
         summary = "\n".join(
@@ -171,10 +130,6 @@ def main():
             f"{summary}\n\nLocal versioned dependencies are kept in sync. "
             "This PR does not publish crates. Validation and review are still required.\n",
         ).replace("## Related Issues\n", f"## Related Issues\n\nFixes #{issue}\n")
-        for crate, content in contents.items():
-            path = root / crate / "Cargo.toml"
-            if path.read_text(encoding="utf-8") != content:
-                path.write_text(content, encoding="utf-8", newline="\n")
         print(summary)
     else:
         print("No version bumps needed.")
@@ -183,8 +138,6 @@ def main():
     (Path(os.environ["RUNNER_TEMP"]) / "crate-version-bump-pr.md").write_text(
         body, encoding="utf-8"
     )
-    with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
-        output.write("due=true\n")
 
 
 if __name__ == "__main__":

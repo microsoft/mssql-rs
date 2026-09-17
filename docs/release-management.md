@@ -63,6 +63,14 @@ alone. Other registry errors fail the run rather than assuming a crate is
 unpublished. If the proposed next minor version is also published, the run fails
 and a maintainer must choose a new version.
 
+Local versions come from `cargo metadata`; `cargo set-version --bump minor`
+from cargo-edit updates the selected manifests and their versioned workspace
+dependencies. The cargo-edit version is pinned only in this workflow and installed
+under `$RUNNER_TEMP/cargo-edit`, with no workspace dependency or repo-wide tool
+pin. Off-days skip installation. Cargo-edit resolves dependencies, so registry
+access is needed. The crates.io JSON lookup remains separate so an unpublished
+crate can be distinguished from a registry failure.
+
 One draft PR on `automation/bump-released-crate-versions` contains all needed
 bumps. Later checks update that PR rather than opening duplicates. A core crate
 bump also updates the mock crate's versioned local dependency; other local
@@ -81,7 +89,8 @@ template and leave validation checkboxes unchecked.
 
 The shared validation pipeline runs `scripts/test_bump_released_crate_versions.py`
 in its Windows Python test step for both PR validation and main-branch CI.
-Registry and GitHub requests are mocked; these tests create no issues or PRs.
+Cargo commands and registry/GitHub requests are mocked; these tests need no
+cargo-edit installation and create no issues or PRs.
 
 Before enabling the workflow:
 

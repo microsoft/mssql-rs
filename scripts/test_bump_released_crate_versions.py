@@ -5,8 +5,7 @@ import importlib.util
 import io
 import json
 import subprocess
-import tomllib
-from datetime import date, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from unittest.mock import Mock, patch
@@ -22,81 +21,57 @@ bump = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(bump)
 
 
-@pytest.fixture
-def manifests(tmp_path):
-    for crate in bump.CRATES:
-        directory = tmp_path / crate
-        directory.mkdir()
-        (directory / "Cargo.toml").write_text(
-            '[package]\nname = "' + crate + '"\nversion = "0.1.7"\n'
-            '[dependencies]\nother = "0.1.7"\n'
-            + (
-                'mssql-tds = { path = "../mssql-tds", version = "0.1.7", '
-                'default-features = false }\n'
-                if crate == "mssql-mock-tds" else ""
-            ),
-            encoding="utf-8",
-        )
-    return tmp_path
-
-
 @pytest.mark.parametrize("released", [(), ("mssql-tds",), ("mssql-mock-tds",), bump.CRATES])
-def test_independent_bumps_and_repeat(manifests, released):
-    versions = {
-        crate: {"0.1.7", "0.0.1"} if crate in released else {"0.1.6"}
-        for crate in bump.CRATES
-    }
-    contents, changes = bump.prepare_bump(manifests, versions)
-    assert set(changes) == set(released)
-    for crate, content in contents.items():
-        manifest = tomllib.loads(content)
-        assert manifest["package"]["version"] == (
-            "0.2.0" if crate in released else "0.1.7"
+def test_selects_only_released_crates_and_repeat_is_quiet(tmp_path, released):
+    before = dict.fromkeys(bump.CRATES, "0.1.7")
+    after = {crate: "0.2.0" if crate in released else before[crate] for crate in bump.CRATES}
+    published = {crate: {"0.1.7"} if crate in released else set() for crate in bump.CRATES}
+    with patch.object(bump, "cargo_versions", side_effect=[before, after, after]), patch.object(
+        bump.subprocess, "run"
+    ) as cargo:
+        assert bump.bump_versions(tmp_path, published) == {
+            crate: ("0.1.7", "0.2.0") for crate in released
+        }
+        assert bump.bump_versions(tmp_path, published) == {}
+    if released:
+        cargo.assert_called_once_with(
+            ["cargo", "set-version", "--bump", "minor"]
+            + [arg for crate in released for arg in ("--package", crate)],
+            cwd=tmp_path, check=True,
         )
-        assert manifest["dependencies"]["other"] == "0.1.7"
-        (manifests / crate / "Cargo.toml").write_text(content, encoding="utf-8")
-    dependency = tomllib.loads(contents["mssql-mock-tds"])["dependencies"]["mssql-tds"]
-    assert dependency == {
-        "path": "../mssql-tds",
-        "version": "0.2.0" if "mssql-tds" in released else "0.1.7",
-        "default-features": False,
-    }
-    repeated, changes = bump.prepare_bump(manifests, versions)
-    assert changes == {}
-    assert repeated == contents
+    else:
+        cargo.assert_not_called()
 
 
-def test_unpublished_crates_are_unchanged(manifests):
-    before = {crate: (manifests / crate / "Cargo.toml").read_bytes() for crate in bump.CRATES}
-    _, changes = bump.prepare_bump(manifests, dict.fromkeys(bump.CRATES, set()))
-    assert changes == {}
-    assert before == {
-        crate: (manifests / crate / "Cargo.toml").read_bytes() for crate in bump.CRATES
-    }
+def test_metadata_uses_cargo_json(tmp_path):
+    packages = [{"name": crate, "version": "0.1.7"} for crate in bump.CRATES]
+    with patch.object(bump.subprocess, "run", return_value=subprocess.CompletedProcess(
+        "cargo", 0, stdout=json.dumps({"packages": packages})
+    )) as cargo:
+        assert bump.cargo_versions(tmp_path) == dict.fromkeys(bump.CRATES, "0.1.7")
+    cargo.assert_called_once_with(
+        ["cargo", "metadata", "--no-deps", "--format-version", "1", "--offline"],
+        cwd=tmp_path, check=True, stdout=subprocess.PIPE, text=True,
+    )
 
 
-def test_already_published_target_fails_before_writing(manifests):
-    with pytest.raises(ValueError, match="already published"):
-        bump.prepare_bump(manifests, dict.fromkeys(bump.CRATES, {"0.1.7", "0.2.0"}))
-    for crate in bump.CRATES:
-        assert tomllib.loads((manifests / crate / "Cargo.toml").read_text())[
-            "package"
-        ]["version"] == "0.1.7"
+def test_already_published_target_fails(tmp_path):
+    with patch.object(bump, "cargo_versions", side_effect=[
+        dict.fromkeys(bump.CRATES, "0.1.7"), dict.fromkeys(bump.CRATES, "0.2.0")
+    ]), patch.object(bump.subprocess, "run"):
+        with pytest.raises(ValueError, match="already published"):
+            bump.bump_versions(tmp_path, dict.fromkeys(bump.CRATES, {"0.1.7", "0.2.0"}))
 
 
-@pytest.mark.parametrize("version", ["1.9.8", "1.9.8-rc.1", "1.9.8+build.7"])
-def test_minor_bump_resets_patch_and_suffix(version):
-    assert bump.next_minor(version) == "1.10.0"
-
-
-def test_three_day_cadence_across_month_year_and_leap_day():
-    start = date(2023, 12, 25)
-    due = [
-        start + timedelta(days=day) for day in range(440)
-        if bump.is_due(start + timedelta(days=day))
-    ]
-    assert len(due) in (146, 147)
-    assert all((right - left).days == 3 for left, right in zip(due, due[1:]))
+@pytest.mark.parametrize("operation", ["metadata", "set-version"])
+def test_cargo_errors_propagate(tmp_path, operation):
+    with patch.object(bump.subprocess, "run", side_effect=subprocess.CalledProcessError(1, "cargo")):
+        with pytest.raises(subprocess.CalledProcessError):
+            if operation == "metadata":
+                bump.cargo_versions(tmp_path)
+            else:
+                with patch.object(bump, "cargo_versions", return_value=dict.fromkeys(bump.CRATES, "0.1.7")):
+                    bump.bump_versions(tmp_path, dict.fromkeys(bump.CRATES, {"0.1.7"}))
 
 
 def test_registry_response_includes_yanked_and_old_versions():
@@ -134,91 +109,81 @@ def test_registry_timeout_fails():
 
 
 @pytest.fixture
-def workflow_environment(manifests, monkeypatch):
-    template = manifests / ".github" / "PULL_REQUEST_TEMPLATE.md"
+def workflow_environment(tmp_path, monkeypatch):
+    template = tmp_path / ".github" / "PULL_REQUEST_TEMPLATE.md"
     template.parent.mkdir()
     template.write_text(
         (ROOT / ".github" / "PULL_REQUEST_TEMPLATE.md").read_text(encoding="utf-8"),
         encoding="utf-8",
     )
-    monkeypatch.setattr(bump, "__file__", str(manifests / "scripts" / "bump.py"))
-    monkeypatch.setenv("GITHUB_EVENT_NAME", "workflow_dispatch")
-    monkeypatch.setenv("RUNNER_TEMP", str(manifests))
-    monkeypatch.setenv("GITHUB_OUTPUT", str(manifests / "output"))
+    monkeypatch.setattr(bump, "__file__", str(tmp_path / "scripts" / "bump.py"))
+    monkeypatch.setenv("RUNNER_TEMP", str(tmp_path))
     monkeypatch.setenv("GITHUB_REPOSITORY", "microsoft/mssql-rs")
     monkeypatch.setattr(
-        bump.subprocess, "run", Mock(side_effect=AssertionError("Unexpected GitHub call"))
+        bump.subprocess, "run", Mock(side_effect=AssertionError("Unexpected external command"))
     )
-    return manifests
+    return tmp_path
 
 
-def test_main_writes_manifests_template_and_output(workflow_environment):
+def test_main_links_issue_and_preserves_template(workflow_environment):
     root = workflow_environment
     with patch.object(bump, "published_versions", return_value={"0.1.7"}), patch.object(
+        bump, "bump_versions", return_value=dict.fromkeys(bump.CRATES, ("0.1.7", "0.2.0"))
+    ) as versions, patch.object(
         bump, "ensure_bump_issue", return_value=123
     ) as issue:
         bump.main()
         first_body = (root / "crate-version-bump-pr.md").read_text()
         for crate in bump.CRATES:
             assert f"`{crate}`: `0.1.7` -> `0.2.0`" in first_body
-            assert tomllib.loads((root / crate / "Cargo.toml").read_text())[
-                "package"
-            ]["version"] == "0.2.0"
         assert "## Related Issues\n\nFixes #123" in first_body
         assert "- [ ] `cargo bclippy` passes" in first_body
         assert "<!--" in first_body
-        bump.main()
+    versions.assert_called_once_with(root, dict.fromkeys(bump.CRATES, {"0.1.7"}))
     issue.assert_called_once()
     assert set(issue.call_args.args[1]) == set(bump.CRATES)
-    assert (root / "output").read_text() == "due=true\ndue=true\n"
-    for crate in bump.CRATES:
-        assert tomllib.loads((root / crate / "Cargo.toml").read_text())[
-            "package"
-        ]["version"] == "0.2.0"
 
 
-def test_issue_failure_stops_before_writing(workflow_environment):
+def test_issue_failure_stops_before_pr_body(workflow_environment):
     with patch.object(bump, "published_versions", return_value={"0.1.7"}), patch.object(
+        bump, "bump_versions", return_value={"mssql-tds": ("0.1.7", "0.2.0")}
+    ), patch.object(
         bump, "ensure_bump_issue", side_effect=subprocess.CalledProcessError(1, "gh")
     ):
         with pytest.raises(subprocess.CalledProcessError):
             bump.main()
-    for crate in bump.CRATES:
-        assert tomllib.loads((workflow_environment / crate / "Cargo.toml").read_text())[
-            "package"
-        ]["version"] == "0.1.7"
-    assert not (workflow_environment / "output").exists()
+    assert not (workflow_environment / "crate-version-bump-pr.md").exists()
 
 
 def test_main_does_not_partially_bump_on_registry_failure(workflow_environment):
-    with patch.object(bump, "published_versions", side_effect=[{"0.1.7"}, URLError("offline")]):
+    with patch.object(bump, "published_versions", side_effect=[{"0.1.7"}, URLError("offline")]), patch.object(
+        bump, "bump_versions"
+    ) as versions:
         with pytest.raises(URLError):
             bump.main()
-    for crate in bump.CRATES:
-        assert tomllib.loads((workflow_environment / crate / "Cargo.toml").read_text())[
-            "package"
-        ]["version"] == "0.1.7"
-    assert not (workflow_environment / "output").exists()
+    versions.assert_not_called()
+    assert not (workflow_environment / "crate-version-bump-pr.md").exists()
 
 
 def test_main_no_changes_needs_no_issue_and_allows_pr_cleanup(workflow_environment):
     with patch.object(bump, "published_versions", return_value=set()), patch.object(
+        bump, "bump_versions", return_value={}
+    ), patch.object(
         bump, "ensure_bump_issue"
     ) as issue:
         bump.main()
     issue.assert_not_called()
-    assert (workflow_environment / "output").read_text() == "due=true\n"
     assert (workflow_environment / "crate-version-bump-pr.md").is_file()
 
 
-def test_schedule_skips_registry_and_pr_on_off_days(workflow_environment, monkeypatch):
-    monkeypatch.setenv("GITHUB_EVENT_NAME", "schedule")
-    with patch.object(bump, "is_due", return_value=False), patch.object(
-        bump, "published_versions"
-    ) as lookup:
-        bump.main()
-    lookup.assert_not_called()
-    assert not (workflow_environment / "output").exists()
+def test_cargo_failure_does_not_create_issue(workflow_environment):
+    with patch.object(bump, "published_versions", return_value={"0.1.7"}), patch.object(
+        bump, "bump_versions", side_effect=subprocess.CalledProcessError(1, "cargo")
+    ), patch.object(bump, "ensure_bump_issue") as issue:
+        with pytest.raises(subprocess.CalledProcessError):
+            bump.main()
+    issue.assert_not_called()
+    assert not (workflow_environment / "crate-version-bump-pr.md").exists()
 
 
 def test_issue_created_once_then_reused_and_updated(monkeypatch):
@@ -318,12 +283,19 @@ def test_workflow_scope_and_pr_safety():
     steps = workflow["jobs"]["bump"]["steps"]
     assert steps[0]["with"]["ref"] == "${{ github.event.repository.default_branch }}"
     assert steps[0]["with"]["persist-credentials"] is False
-    assert steps[1]["run"] == "python3 scripts/bump-released-crate-versions.py"
-    assert steps[1]["env"] == {
+    assert steps[1]["id"] == "cadence"
+    install = steps[2]["run"]
+    assert "cargo install cargo-edit --version " in install
+    assert "--locked --no-default-features --features set-version" in install
+    assert '--root "$RUNNER_TEMP/cargo-edit"' in install
+    assert 'echo "$RUNNER_TEMP/cargo-edit/bin" >> "$GITHUB_PATH"' in install
+    for step in steps[2:]:
+        assert step["if"] == "steps.cadence.outputs.due == 'true'"
+    assert steps[3]["run"] == "python3 scripts/bump-released-crate-versions.py"
+    assert steps[3]["env"] == {
         "GH_TOKEN": "${{ secrets.CRATE_VERSION_BUMP_TOKEN || github.token }}"
     }
-    pr = steps[2]
-    assert pr["if"] == "steps.check.outputs.due == 'true'"
+    pr = steps[4]
     assert pr["with"]["branch"] == "automation/bump-released-crate-versions"
     assert pr["with"]["draft"] == "always-true"
     assert set(pr["with"]["add-paths"].split()) == {
@@ -332,3 +304,26 @@ def test_workflow_scope_and_pr_safety():
     assert all(
         len(step["uses"].split("@")[1]) == 40 for step in steps if "uses" in step
     )
+
+
+@pytest.mark.parametrize("event", ["schedule", "workflow_dispatch"])
+def test_workflow_cadence_across_month_year_and_leap_day(tmp_path, monkeypatch, event):
+    workflow = yaml.safe_load(
+        (ROOT / ".github" / "workflows" / "bump-released-crate-versions.yml").read_text()
+    )
+    script = workflow["jobs"]["bump"]["steps"][1]["run"]
+    code = script.removeprefix("python3 - <<'PY'\n").removesuffix("PY\n")
+    output = tmp_path / "output"
+    monkeypatch.setenv("GITHUB_OUTPUT", str(output))
+    monkeypatch.setenv("GITHUB_EVENT_NAME", event)
+    start = datetime(2023, 12, 25, tzinfo=timezone.utc)
+    with patch("datetime.datetime") as clock:
+        for day in range(440):
+            clock.now.return_value = start + timedelta(days=day)
+            exec(code, {})
+    due = [day for day, line in enumerate(output.read_text().splitlines()) if line == "due=true"]
+    if event == "schedule":
+        assert len(due) in (146, 147)
+        assert all(right - left == 3 for left, right in zip(due, due[1:]))
+    else:
+        assert due == list(range(440))

@@ -2,7 +2,7 @@ name: Bump Released Crate Versions
 
 on:
   schedule:
-    # The script checks every third UTC day, without resetting at month boundaries.
+    # Check every third UTC day, without resetting at month boundaries.
     - cron: '23 8 * * *'
   workflow_dispatch:
 
@@ -15,7 +15,7 @@ concurrency:
 jobs:
   bump:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 30
     permissions:
       contents: write
       issues: write
@@ -27,14 +27,32 @@ jobs:
           ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
 
+      - name: Check cadence
+        id: cadence
+        run: |
+          python3 - <<'PY'
+          import os
+          from datetime import date, datetime, timezone
+          days = (datetime.now(timezone.utc).date() - date(1970, 1, 1)).days
+          due = os.environ["GITHUB_EVENT_NAME"] != "schedule" or days % 3 == 0
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"due={str(due).lower()}\n")
+          PY
+
+      - name: Install cargo-edit for this workflow
+        if: steps.cadence.outputs.due == 'true'
+        run: |
+          cargo install cargo-edit --version 0.13.13 --locked --no-default-features --features set-version --root "$RUNNER_TEMP/cargo-edit"
+          echo "$RUNNER_TEMP/cargo-edit/bin" >> "$GITHUB_PATH"
+
       - name: Check published versions and create tracking issue
-        id: check
+        if: steps.cadence.outputs.due == 'true'
         env:
           GH_TOKEN: ${{ secrets.CRATE_VERSION_BUMP_TOKEN || github.token }}
         run: python3 scripts/bump-released-crate-versions.py
 
       - name: Create or update version bump PR
-        if: steps.check.outputs.due == 'true'
+        if: steps.cadence.outputs.due == 'true'
         uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8
         with:
           token: ${{ secrets.CRATE_VERSION_BUMP_TOKEN || github.token }}
