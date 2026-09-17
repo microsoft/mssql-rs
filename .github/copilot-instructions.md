@@ -132,3 +132,33 @@ The hook at `dev/hooks/pre-commit` auto-runs `cargo fmt` on workspace + `mssql-p
 - Don't add `cfg(test)` modules for integration tests — use the `tests/` directory
 - Don't invent new test patterns — follow existing fixtures, helpers, and env-loading conventions from `conftest.py` and sibling test files
 - Don't add guards, rejections, or platform checks without grepping the codebase first — check CI configs, test infrastructure (`kerberos-test/`, `tests/`), and README for existing support. A spec saying "X is platform-specific" doesn't mean this codebase hasn't already solved it cross-platform.
+
+## Performance and Data Movement
+
+Performance is a primary design constraint. Treat copies, allocations, conversions,
+locks, and network round trips as costs that require justification on hot paths.
+
+When processing rows, tokens, packets, parameters, or FFI buffers:
+
+- Prefer borrowing existing data with `&T`, `&[T]`, `&str`, or `Cow` over cloning,
+  copying, or materializing temporary owned values.
+- Prefer slices and views over copied sub-`Vec`s, and reuse existing buffers and
+  capacity where possible.
+- Avoid `clone()`, `to_owned()`, `to_vec()`, `collect::<Vec<_>>()`, and temporary
+  wrapper objects in per-row, per-column, per-token, and per-packet loops.
+- Preserve borrowed data through helper boundaries; do not force ownership merely
+  because a helper currently accepts an owned value.
+- Use lifetime parameters when they express that a returned reference is tied to an
+  input snapshot, such as `&'a [ColumnBinding] -> &'a ColumnBinding`.
+- Use direct typed delivery when source and destination representations match.
+  Defer conversion and allocation until the fast path cannot be used.
+- Do not replace a borrow with a copy solely to satisfy the borrow checker. First
+  consider narrowing scopes or restructuring the API.
+- A copy is acceptable when it is required for ownership, concurrency, safety, or
+  a measured improvement. State the reason in the change or review.
+- Do not use `unsafe` to avoid a copy unless the safety invariant is explicit,
+  narrow, and reviewed.
+
+For performance-sensitive changes, identify the hot loop and support meaningful
+performance claims with a benchmark, profile, allocation measurement, or
+before/after workload where practical.

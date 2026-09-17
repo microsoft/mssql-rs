@@ -9,6 +9,7 @@ Crate-specific requirements for changes under `mssql-odbc/`.
 ## Index
 
 - [1. Before making changes](#1-before-making-changes)
+- [1.1. Performance and FFI data movement](#11-performance-and-ffi-data-movement)
 - [2. Parity reference: the classic C++ msodbcsql driver](#2-parity-reference-the-classic-c-msodbcsql-driver)
 - [2.1. Verifying parity claims and recording deviations](#21-verifying-parity-claims-and-recording-deviations)
 - [2.2. ODBC version handling](#22-odbc-version-handling)
@@ -31,6 +32,30 @@ Crate-specific requirements for changes under `mssql-odbc/`.
   architecture, and build/test instructions.
 - Follow the repository-wide conventions in
   [copilot-instructions.md](../copilot-instructions.md).
+
+### 1.1. Performance and FFI data movement
+
+The ODBC fetch, conversion, parameter, and packet paths are performance-critical.
+Avoid copies and allocations unless ownership, concurrency, safety, or measurement
+requires them.
+
+- Borrow binding metadata and descriptor snapshots through hot loops instead of
+  copying records per row or column. Use explicit lifetimes when they tie returned
+  references to the snapshot that owns them.
+- Keep wire payloads borrowed while they can be delivered directly. Materialize
+  `ColumnValues` only when conversion requires it.
+- Prefer slices and reusable buffers over copied sub-`Vec`s. Treat `clone()`,
+  `to_owned()`, `to_vec()`, `collect::<Vec<_>>()`, and temporary wrappers inside
+  row, column, token, or packet loops as review points.
+- Preserve borrowed data through helper boundaries rather than changing a helper
+  to require ownership for convenience.
+- Use direct fixed-width or encoded delivery when source and destination
+  representations match, while retaining the existing raw-pointer safety contract.
+- Do not use `unsafe` merely to remove a copy. Document the ownership and
+  synchronization invariant for every unsafe optimization, especially `Send` impls
+  involving application buffers.
+- Support material performance claims with a benchmark, profile, allocation
+  measurement, or before/after workload where practical.
 
 ## 2. Parity reference: the classic C++ msodbcsql driver
 
