@@ -869,8 +869,8 @@ pub(crate) struct DaeState {
     /// [`StmtState::prepared`] when it ends. `None` for `SQLExecDirect`, which
     /// runs ad-hoc `sp_executesql` and has no plan to restore.
     prepared: Option<PreparedPlan>,
-    /// Orphaned server handle to release at next-execute time, stashed
-    /// identically to the non-DAE path.
+    /// Superseded handle retained until the deferred RPC opens. TDS releases
+    /// it before streaming, or piggybacks it on a materialized execute.
     orphaned: Option<StatementId>,
     /// The streamed parameters, in original parameter order.
     params: Vec<DaeParam>,
@@ -994,8 +994,8 @@ impl DaeState {
         self.prepared.take()
     }
 
-    /// Takes the orphaned handle so the deferred execute can piggyback its
-    /// release, exactly as an immediate execute does.
+    /// Transfers orphan cleanup to the deferred execute, whether it opens a
+    /// stream or sends the collected values together.
     pub(crate) fn take_orphaned(&mut self) -> Option<StatementId> {
         self.orphaned.take()
     }
