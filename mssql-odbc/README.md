@@ -177,8 +177,8 @@ Small RPC headers and type metadata are written together when buffered space
 allows; packet-boundary writes retain normal overflow and cancellation handling.
 Response-token reads skip clock sampling for unlimited query timeouts while
 retaining elapsed-time accounting for finite and exhausted budgets.
-Profile-guided inlining keeps parameter positioning, conversion, and value
-dispatch in their callers to reduce intermediate result copies.
+Profile-guided inlining keeps parameter positioning, conversion, RPC encoding,
+and response/value dispatch in their callers to reduce copies and call overhead.
 
 ## Conventions
 
