@@ -2631,24 +2631,14 @@ pub(crate) fn widen_into_pending(
 
 /// Picks how many narrow wire bytes to read for the UTF-8 room still free.
 ///
-/// A single wire byte can decode to three UTF-8 bytes — CP1252 0x80 is U+20AC —
-/// and a DBCS lead/trail pair is two bytes in for at most three out, so `room /
-/// 3` is the ratio that does not overshoot within a single chunk. It is not an
-/// absolute bound: `encoding_rs::GBK` decodes gb18030, so a 4-byte sequence
-/// whose first three bytes are already carried emits 4 UTF-8 bytes from the one
-/// byte fed on the next call. Overshoot is harmless — it lands in `pending_utf8`
-/// like any other surplus — so the ratio only has to be right often enough to
-/// keep the carry small.
-///
-/// Never below one byte, so a buffer with any payload room still consumes wire
-/// rather than stalling.
+/// Budget one source byte per free output byte so ASCII fills the caller's
+/// buffer. Expansion lands in `pending_utf8`, which reduces the next read to
+/// zero when the carry alone fills the buffer. Cap source chunks at 64 KiB to
+/// bound speculative conversion even when the application supplies a huge buffer.
 fn narrow_max_read(payload_capacity: usize, pending_utf8_len: usize) -> usize {
-    let remaining = payload_capacity.saturating_sub(pending_utf8_len);
-    if remaining == 0 {
-        0
-    } else {
-        (remaining / 3).max(1)
-    }
+    payload_capacity
+        .saturating_sub(pending_utf8_len)
+        .min(64 * 1024)
 }
 
 /// Decodes one chunk of narrow PLP wire bytes to UTF-8 for `SQL_C_CHAR`
@@ -4146,21 +4136,18 @@ mod tests {
     }
 
     #[test]
-    fn narrow_max_read_floors_to_whole_characters() {
-        // (payload_capacity, pending_utf8_len) -> expected wire bytes to read.
-        // One wire byte can expand to three UTF-8 bytes, so room/3 is the ratio
-        // that cannot overshoot; the .max(1) floor keeps a buffer too small for
-        // that ratio consuming wire instead of stalling.
+    fn narrow_max_read_uses_available_room() {
         let cases = [
             ((0, 0), 0),
             ((1, 0), 1),
-            ((2, 0), 1),
-            ((3, 0), 1),
-            ((9, 0), 3),
-            ((8192, 0), 2730),
-            ((10, 4), 2), // carry shrinks the room to 6
-            ((3, 3), 0),  // carry fills the room: drain only
-            ((3, 5), 0),  // carry over-fills, saturating to no read
+            ((2, 0), 2),
+            ((3, 0), 3),
+            ((9, 0), 9),
+            ((8191, 0), 8191),
+            ((10, 4), 6),
+            ((3, 3), 0), // carry fills the room: drain only
+            ((3, 5), 0), // carry over-fills, saturating to no read
+            ((usize::MAX, 0), 64 * 1024),
         ];
         for ((capacity, carry), expected) in cases {
             assert_eq!(
@@ -4168,6 +4155,57 @@ mod tests {
                 expected,
                 "narrow_max_read({capacity}, {carry})"
             );
+        }
+    }
+
+    #[test]
+    fn narrow_transcode_read_budget_preserves_output_and_bounds_carry() {
+        for (encoding, token) in [
+            (encoding_rs::WINDOWS_1252, "ASCII"),
+            (encoding_rs::WINDOWS_1252, "\u{20ac}"),
+            (encoding_rs::WINDOWS_1252, "caf\u{e9}\0"),
+            (encoding_rs::GBK, "\u{4f60}\u{597d}abc"),
+            (encoding_rs::SHIFT_JIS, "\u{65e5}\u{672c}abc"),
+        ] {
+            let wire = encoding.encode(&token.repeat(20_000)).0.into_owned();
+            let expected = encoding.decode(&wire).0.into_owned();
+            for out in [1, 2, 3, 7, 8191, 128 * 1024] {
+                let mut decoder = encoding.new_decoder_without_bom_handling();
+                let mut pending = Vec::new();
+                let mut delivered = Vec::new();
+                let mut offset = 0;
+                let mut calls = 0;
+                loop {
+                    let read = narrow_max_read(out, pending.len()).min(wire.len() - offset);
+                    let end = offset + read;
+                    let emit = transcode_narrow_into_pending(
+                        &mut decoder,
+                        &mut pending,
+                        &wire[offset..end],
+                        end == wire.len(),
+                        out,
+                    );
+                    delivered.extend_from_slice(&pending[..emit]);
+                    pending.drain(..emit);
+                    offset = end;
+                    calls += 1;
+                    assert!(pending.len() <= 3 * out.min(64 * 1024) + 16);
+                    if offset == wire.len() && pending.is_empty() {
+                        break;
+                    }
+                    assert!(read > 0 || emit > 0);
+                    assert!(calls <= wire.len() + expected.len());
+                }
+                assert_eq!(
+                    delivered,
+                    expected.as_bytes(),
+                    "{} out={out}",
+                    encoding.name()
+                );
+                if token == "ASCII" && out == 8191 {
+                    assert_eq!(calls, wire.len().div_ceil(out));
+                }
+            }
         }
     }
 

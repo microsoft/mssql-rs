@@ -143,6 +143,14 @@ but returning row N can now wait on row N+1's header arriving. See
 `release_busy_if_row_exhausted` in `src/api/exec_common.rs` for the full
 trade-off and why it was accepted as-is.
 
+## Streaming text output
+
+For codepage `varchar(max)` and `text` read as `SQL_C_CHAR`, source reads use
+the available output capacity, capped at 64 KiB per call. ASCII can fill an
+8191-byte payload in an 8192-byte application buffer; expanding characters
+remain in the incremental decoder's output carry until subsequent calls drain
+them. This controls driver-to-application chunks, not SQL network packet sizes.
+
 ## Parameter array results
 
 Prepared parameter arrays can return rows from `SELECT`, `INSERT ... OUTPUT`,
