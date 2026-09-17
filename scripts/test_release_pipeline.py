@@ -579,14 +579,15 @@ def test_python_wheel_install_gate_precedes_artifact_publication(
 def test_macos_wheel_install_gate_verifies_both_architectures() -> None:
     template = _WHEEL_INSTALL_TEMPLATE.read_text(encoding="utf-8")
 
-    assert 'lipo -verify_arch x86_64 arm64 "${extensions[0]}"' in template
+    assert 'extensions=("$extract_dir"/mssql_py_core/mssql_py_core*.so)' in template
+    assert 'lipo "${extensions[0]}" -verify_arch x86_64 arm64' in template
     assert (
-        'lipo -verify_arch x86_64 "$extract_dir/mssql_py_core/libs/macos/'
-        'x86_64/lib/mssqlodbc.dylib"' in template
+        'lipo "$extract_dir/mssql_py_core/libs/macos/x86_64/lib/'
+        'mssqlodbc.dylib" -verify_arch x86_64' in template
     )
     assert (
-        'lipo -verify_arch arm64 "$extract_dir/mssql_py_core/libs/macos/'
-        'arm64/lib/mssqlodbc.dylib"' in template
+        'lipo "$extract_dir/mssql_py_core/libs/macos/arm64/lib/'
+        'mssqlodbc.dylib" -verify_arch arm64' in template
     )
     assert template.count("--verify-driver-exports") == 2
 

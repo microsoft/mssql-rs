@@ -70,14 +70,14 @@ steps:
         extract_dir="$(mktemp -d)"
         trap 'rm -rf "$extract_dir"' EXIT
         python -m zipfile -e "${wheels[0]}" "$extract_dir"
-        extensions=("$extract_dir"/mssql_py_core*.so)
+        extensions=("$extract_dir"/mssql_py_core/mssql_py_core*.so)
         if [ "${#extensions[@]}" -ne 1 ]; then
           echo "Expected one mssql_py_core extension, found ${#extensions[@]}" >&2
           exit 1
         fi
-        lipo -verify_arch x86_64 arm64 "${extensions[0]}"
-        lipo -verify_arch x86_64 "$extract_dir/mssql_py_core/libs/macos/x86_64/lib/mssqlodbc.dylib"
-        lipo -verify_arch arm64 "$extract_dir/mssql_py_core/libs/macos/arm64/lib/mssqlodbc.dylib"
+        lipo "${extensions[0]}" -verify_arch x86_64 arm64
+        lipo "$extract_dir/mssql_py_core/libs/macos/x86_64/lib/mssqlodbc.dylib" -verify_arch x86_64
+        lipo "$extract_dir/mssql_py_core/libs/macos/arm64/lib/mssqlodbc.dylib" -verify_arch arm64
         python "$(Build.SourcesDirectory)/scripts/test-python-wheel-install.py" \
           --verify-driver-exports "$extract_dir/mssql_py_core/libs/macos/x86_64/lib/mssqlodbc.dylib"
         python "$(Build.SourcesDirectory)/scripts/test-python-wheel-install.py" \
