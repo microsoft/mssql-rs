@@ -250,21 +250,33 @@ response/value dispatch. The large conversion and serialization functions use
 
 ## Prepared parameter bindings
 
-`SQLExecute` compares the current APD/IPD binding metadata with the metadata
-used by its cached prepared plan. Changes through descriptor fields or records,
-shared APDs, descriptor reassociation/free fallback, and parameter reset cause
-the next execute to release the old server handle and reprepare when the
-effective metadata differs. `SQLBindParameter` retains its eager invalidation.
+Parameter mutations compare the old and new IPD SQL definition: direction and
+SQL type, character/binary SQL length, and numeric/decimal precision and scale.
+Relevant changes invalidate only the owning statement's materialized plan;
+unchanged definitions and records beyond its parameter markers do not.
+Temporal application scales affect conversion checks, not the fixed-scale SQL
+declaration; special types conservatively include their size/precision/scale.
 
-The comparison retains only scalar conversion metadata, not descriptor handles,
-application buffer addresses, or values. Unchanged metadata reuses the plan,
-including when only buffer values or addresses change. Equivalent descriptors
-can reuse the same plan after reassociation. Parameter arrays and data-at-execution
-retain this metadata with the prepared plan while execution is staged or parked.
+`SQLBindParameter`, IPD `SQLSetDescField`/`SQLSetDescRec`, parameter reset, and
+actual IPD refinement use this policy, including retained edits from a partially
+failed setter. Descriptor locks are released before statement invalidation.
+Direct IPD setters locate the owner through the DBC's statement list only when
+the SQL definition changes; there is no per-execute metadata key or comparison.
+The existing plan and deferred-unprepare state still travel through arrays and
+data-at-execution.
 
-This comparison covers descriptor metadata, not type information carried inside
-application values. In particular, changing only the precision/scale fields of
-a `SQL_NUMERIC_STRUCT` is outside this invalidation check.
+Pointer-only rebinding and APD-only C type, buffer length, precision/scale, or
+descriptor reassociation changes reuse the plan when the IPD SQL definition is
+unchanged. Application buffers retain their existing validity requirements.
+Numeric prepared declarations always use IPD precision/scale, independently of
+the numeric value's wire precision/scale; the existing conversion fast path and
+wire representation are preserved.
+
+The selective policy follows msodbcsql's `ParamInfoSnapshot`/`SetIPDRec` path.
+Direct IPD-field invalidation is an intentional extension: retail 18.06.0001
+accepted an INTEGER-to-SMALLINT `SQLSetDescField` change but reused the old
+INTEGER declaration, whereas this driver applies the new definition at the
+next execute. This observation is not a measurement of retail 18.6.2.1.
 
 ## Conventions
 

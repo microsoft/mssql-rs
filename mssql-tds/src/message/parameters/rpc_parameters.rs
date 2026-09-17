@@ -174,7 +174,7 @@ pub struct RpcParameter {
     value: RpcValue,
 
     /// Precision/scale for a value template that cannot carry them itself.
-    /// Applied to both the SQL declaration and the wire `TYPE_INFO`.
+    /// Applied to wire `TYPE_INFO` and, absent an override, the SQL declaration.
     type_metadata: Option<RpcTypeMetadata>,
 
     /// A bound SQL numeric definition may differ from its incoming wire value.

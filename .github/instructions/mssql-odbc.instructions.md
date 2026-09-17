@@ -378,6 +378,18 @@ does not grow every time a new msodbcsql build is measured.
     18.6.2.1. Truncation after the first DAE parameter remains silent. Signed
     off by Theekshna Kotian on 2026-09-09. Tracked in AB#47946.
 
+15. **Direct IPD field edits invalidate a cached plan when its SQL definition
+    changes.** msodbcsql's `ParamInfoSnapshot::FHasChanged` in
+    `Sql/Ntdbms/sqlncli/odbc/sqlcprot.h` is used by `SetIPDRec` in `sqlcdesc.cpp`,
+    not by the direct `SQLSetDescFieldW` route. On retail 18.06.0001 through the
+    Windows Driver Manager, an IPD INTEGER-to-SMALLINT field edit retained
+    `sp_execute` and an INTEGER result; `SQLSetDescRec` reparsed as SMALLINT.
+    This driver handles both routes consistently so the next execute reflects
+    the changed SQL definition. Approved by David Engel on 2026-09-17 in the
+    scope of [PR #564](https://github.com/microsoft/mssql-rs/pull/564).
+    Retail 18.6.2.1 was not measured for this distinction; do not infer it from
+    the driver's compatibility version string or add a parity-test skip.
+
 ## No panics
 
 - **Never** use `.unwrap()` or `.expect()` on `Result` or `Option` in
@@ -550,6 +562,20 @@ Rules of thumb:
 - Handle poison explicitly with `std::sync::Mutex` — see the no-panics
   rule above for the canonical `let Ok(state) = ... else { return SQL_ERROR; }`
   pattern.
+
+### Prepared parameter definitions
+
+- Compare SQL definitions during IPD mutation, not APD addresses or conversion
+  metadata on every execute. Preserve plans for equivalent `SQLBindParameter`
+  calls and APD-only changes. `DESC_CONSISTENT` in msodbcsql controls validation,
+  not plan invalidation; its `ParamInfoSnapshot`/`RE_PREPARE` path is the reference.
+- Use the shared definition projection for binding, direct IPD fields/records,
+  and refinement. Account for partial failed writes and parameter-count changes.
+  Release descriptor locks before invalidating the owning statement.
+- Keep numeric SQL declarations IPD-based without overwriting the value's wire
+  precision/scale. A `SQL_NUMERIC_STRUCT` header is not the prepared declaration.
+- No descriptor identity, lifetime counter, or persistent metadata snapshot is
+  needed for this sequential cache-invalidation policy.
 
 ### Cross-handle thread safety (alloc / free)
 

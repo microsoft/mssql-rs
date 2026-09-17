@@ -126,12 +126,13 @@ pub(crate) struct DescHandle {
     /// the two copies can never diverge.
     pub(crate) alloc_type: SqlSmallInt,
     /// Back-pointer to the owning DBC. Every descriptor has one — including
-    /// the four implicit descriptors, owned by their statement's parent DBC —
-    /// but only explicit descriptors need it: it is what
+    /// the four implicit descriptors, owned by their statement's parent DBC.
+    /// It is what
     /// `SQLSetStmtAttrW(SQL_ATTR_APP_ROW_DESC/APP_PARAM_DESC)` compares
     /// against the target statement's own `parent_dbc` (HY024 on mismatch),
     /// and what `SQLFreeHandle(SQL_HANDLE_DESC)` uses to find every statement
-    /// that might currently have this descriptor as its active ARD/APD. Set
+    /// that might currently have this descriptor as its active ARD/APD.
+    /// IPD definition changes also use it to find the owning statement. Set
     /// once at construction, never mutated — same soundness rationale as
     /// `StmtHandle::parent_dbc`.
     pub(crate) parent_dbc: *mut c_void,
