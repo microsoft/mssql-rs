@@ -2913,7 +2913,7 @@ impl TdsClient {
     /// * `options` - Bulk copy options
     /// * `timeout_sec` - Optional timeout in seconds
     /// * `cancel_handle` - Optional cancellation handle
-    /// * `rows` - Vector of rows to insert
+    /// * `rows` - Fallible stream of rows to insert
     /// * `resolved_mappings` - Column mapping information
     ///
     /// # Returns
@@ -2926,17 +2926,18 @@ impl TdsClient {
     /// count changes from triggers on the destination table.
     #[instrument(skip(self, rows), level = "info")]
     #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn execute_bulk_load_streaming_zerocopy<R>(
+    pub(crate) async fn execute_bulk_load_stream<S, R>(
         &mut self,
         table_name: String,
         column_metadata: Vec<BulkCopyColumnMetadata>,
         options: BulkCopyOptions,
         timeout_sec: Option<u32>,
         cancel_handle: Option<&CancelHandle>,
-        rows: impl Iterator<Item = R>,
+        rows: S,
         resolved_mappings: &[ResolvedColumnMapping],
     ) -> TdsResult<u64>
     where
+        S: futures::Stream<Item = TdsResult<R>>,
         R: BulkLoadRow,
     {
         if self.command_is_busy() {
@@ -3070,7 +3071,15 @@ impl TdsClient {
         // If an error occurs during row writing, we need to send an attention packet
         // to gracefully cancel the bulk load operation and leave the connection usable.
         let mut row_write_error: Option<crate::error::Error> = None;
-        for row in rows {
+        let mut rows = std::pin::pin!(rows);
+        while let Some(row) = futures::StreamExt::next(&mut rows).await {
+            let row = match row {
+                Ok(row) => row,
+                Err(e) => {
+                    row_write_error = Some(e);
+                    break;
+                }
+            };
             // Write the row directly using the streaming writer
             if let Err(e) = writer.write_row_zerocopy(&row).await {
                 row_write_error = Some(e);
@@ -3102,6 +3111,30 @@ impl TdsClient {
         self.consume_done_token().await?;
 
         Ok(rows_written)
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_bulk_load_streaming_zerocopy<R: BulkLoadRow>(
+        &mut self,
+        table_name: String,
+        column_metadata: Vec<BulkCopyColumnMetadata>,
+        options: BulkCopyOptions,
+        timeout_sec: Option<u32>,
+        cancel_handle: Option<&CancelHandle>,
+        rows: impl Iterator<Item = R>,
+        resolved_mappings: &[ResolvedColumnMapping],
+    ) -> TdsResult<u64> {
+        self.execute_bulk_load_stream(
+            table_name,
+            column_metadata,
+            options,
+            timeout_sec,
+            cancel_handle,
+            futures::stream::iter(rows.map(Ok)),
+            resolved_mappings,
+        )
+        .await
     }
 
     /// Consumes response tokens until a DONE token is received.
@@ -11410,6 +11443,270 @@ mod tests {
             *column_index += 1;
             Ok(())
         }
+    }
+
+    struct BulkStreamMetadata;
+
+    #[async_trait]
+    impl crate::connection::metadata_retriever::MetadataRetriever for BulkStreamMetadata {
+        async fn retrieve_metadata(
+            &mut self,
+            _client: &mut TdsClient,
+            _table_name: &str,
+            _timeout_sec: u32,
+        ) -> TdsResult<Vec<BulkCopyColumnMetadata>> {
+            use crate::datatypes::bulk_copy_metadata::{SqlDbType, TypeLength};
+            Ok(vec![
+                BulkCopyColumnMetadata::new("id", SqlDbType::Int, TdsDataType::Int4 as u8)
+                    .with_length(4, TypeLength::Fixed(4)),
+            ])
+        }
+    }
+
+    fn stream_bulk_copy(client: &mut TdsClient) -> crate::connection::bulk_copy::BulkCopy<'_> {
+        crate::connection::bulk_copy::BulkCopy::with_retriever(
+            client,
+            "#stream",
+            Box::new(BulkStreamMetadata),
+        )
+        .batch_size(2)
+    }
+
+    struct LazyBulkRow {
+        index: usize,
+        completed: Arc<std::sync::atomic::AtomicUsize>,
+        delay: Duration,
+    }
+
+    #[async_trait]
+    impl BulkLoadRow for LazyBulkRow {
+        async fn write_to_packet(
+            &self,
+            writer: &mut StreamingBulkLoadWriter<'_>,
+            column_index: &mut usize,
+        ) -> TdsResult<()> {
+            tokio::task::yield_now().await;
+            if !self.delay.is_zero() {
+                tokio::time::sleep(self.delay).await;
+            }
+            IntRow(self.index as i32)
+                .write_to_packet(writer, column_index)
+                .await?;
+            self.completed
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn bulk_stream_async_lazy_rows_match_iterator_batches() {
+        use futures::StreamExt;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        for count in [0usize, 1, 4, 5] {
+            let tokens = || {
+                (0..count.div_ceil(2))
+                    .flat_map(|_| [done_no_more(), done_no_more()])
+                    .collect()
+            };
+            let transport = TestTransport::with_tokens(tokens());
+            let sent = transport.sent.clone();
+            let mut client = create_test_client_with_transport(transport);
+            let completed = Arc::new(AtomicUsize::new(0));
+            let source_completed = completed.clone();
+            // `then` deliberately supplies a !Unpin source.
+            let rows = futures::stream::iter(0..count).then(move |index| {
+                let completed = source_completed.clone();
+                async move {
+                    assert_eq!(completed.load(Ordering::SeqCst), index);
+                    tokio::task::yield_now().await;
+                    Ok(LazyBulkRow {
+                        index,
+                        completed,
+                        delay: Duration::ZERO,
+                    })
+                }
+            });
+            let result = stream_bulk_copy(&mut client)
+                .write_to_server_stream(rows)
+                .await
+                .unwrap();
+            assert_eq!(result.rows_affected, count as u64);
+            assert_eq!(completed.load(Ordering::SeqCst), count);
+
+            let transport = TestTransport::with_tokens(tokens());
+            let iterator_sent = transport.sent.clone();
+            let mut iterator_client = create_test_client_with_transport(transport);
+            let result = stream_bulk_copy(&mut iterator_client)
+                .write_to_server_zerocopy((0..count).map(|index| IntRow(index as i32)))
+                .await
+                .unwrap();
+            assert_eq!(result.rows_affected, count as u64);
+            assert_eq!(*sent.lock().unwrap(), *iterator_sent.lock().unwrap());
+            if count == 0 {
+                assert!(sent.lock().unwrap().is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn bulk_stream_source_errors_do_not_become_eof_or_start_empty_batches() {
+        use futures::StreamExt;
+        use std::sync::atomic::Ordering;
+
+        for count in [0, 1, 2] {
+            let tokens = match count {
+                0 => vec![],
+                1 => vec![info_token(0, 0, "batch info"), done_no_more()],
+                _ => vec![
+                    done_no_more(),
+                    info_token(0, 0, "batch info"),
+                    done_no_more(),
+                ],
+            };
+            let transport = TestTransport::with_tokens(tokens);
+            let attentions = transport.attentions.clone();
+            let sent = transport.sent.clone();
+            let mut client = create_test_client_with_transport(transport);
+            let rows = futures::stream::iter((0..count).map(|i| Ok(IntRow(i)))).chain(
+                futures::stream::once(async {
+                    Err(crate::error::Error::UsageError("source failed".into()))
+                }),
+            );
+            let error = stream_bulk_copy(&mut client)
+                .write_to_server_stream(rows)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, crate::error::Error::UsageError(ref s) if s == "source failed")
+            );
+            assert_eq!(attentions.load(Ordering::SeqCst), usize::from(count == 1));
+            assert!(!client.is_connection_dead());
+            assert!(!client.has_open_batch());
+            if count == 0 {
+                assert!(sent.lock().unwrap().is_empty());
+            }
+            if count > 0 {
+                assert_eq!(client.info_messages()[0].message, "batch info");
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bulk_stream_pending_source_obeys_timeout_at_each_batch_position() {
+        use futures::StreamExt;
+        use std::sync::atomic::Ordering;
+
+        for count in [0, 1, 2] {
+            let tokens = match count {
+                0 => vec![],
+                1 => vec![done_no_more()],
+                _ => vec![
+                    done_no_more(),
+                    info_token(0, 0, "batch info"),
+                    done_no_more(),
+                ],
+            };
+            let transport = TestTransport::with_tokens(tokens);
+            let attentions = transport.attentions.clone();
+            let mut client = create_test_client_with_transport(transport);
+            let rows = futures::stream::iter((0..count).map(|i| Ok(IntRow(i))))
+                .chain(futures::stream::pending());
+            let error = stream_bulk_copy(&mut client)
+                .timeout(Duration::from_secs(1))
+                .write_to_server_stream(rows)
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                crate::error::Error::BulkCopyError(
+                    crate::error::bulk_copy_errors::BulkCopyError::Timeout(_)
+                )
+            ));
+            assert_eq!(attentions.load(Ordering::SeqCst), usize::from(count == 1));
+            assert!(!client.is_connection_dead());
+            if count == 2 {
+                assert_eq!(client.info_messages()[0].message, "batch info");
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bulk_stream_timeout_does_not_drop_row_serialization() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let transport = TestTransport::with_tokens(vec![done_no_more()]);
+        let attentions = transport.attentions.clone();
+        let mut client = create_test_client_with_transport(transport);
+        let completed = Arc::new(AtomicUsize::new(0));
+        let rows = futures::stream::iter([Ok(LazyBulkRow {
+            index: 0,
+            completed: completed.clone(),
+            delay: Duration::from_secs(2),
+        })]);
+        let error = stream_bulk_copy(&mut client)
+            .timeout(Duration::from_secs(1))
+            .write_to_server_stream(rows)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            crate::error::Error::BulkCopyError(
+                crate::error::bulk_copy_errors::BulkCopyError::Timeout(_)
+            )
+        ));
+        assert_eq!(completed.load(Ordering::SeqCst), 1);
+        assert_eq!(attentions.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bulk_stream_zero_timeout_allows_slow_source() {
+        let mut client = create_test_client_with_tokens(vec![done_no_more(), done_no_more()]);
+        let rows = futures::stream::once(async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            Ok(IntRow(1))
+        });
+        let result = stream_bulk_copy(&mut client)
+            .timeout(Duration::ZERO)
+            .write_to_server_stream(rows)
+            .await
+            .unwrap();
+        assert_eq!(result.rows_affected, 1);
+    }
+
+    #[tokio::test]
+    async fn bulk_stream_source_error_rolls_back_internal_transaction_after_attention() {
+        use crate::token::tokens::EnvChangeToken;
+        use std::sync::atomic::Ordering;
+
+        let transport = TestTransport::with_tokens(vec![
+            Tokens::EnvChange(EnvChangeToken {
+                sub_type: EnvChangeTokenSubType::BeginTransaction,
+                change_type: (0u64, 42u64).into(),
+            }),
+            done_no_more(),
+            done_no_more(),
+            Tokens::EnvChange(EnvChangeToken {
+                sub_type: EnvChangeTokenSubType::RollbackTransaction,
+                change_type: (42u64, 0u64).into(),
+            }),
+            done_no_more(),
+        ]);
+        let attentions = transport.attentions.clone();
+        let mut client = create_test_client_with_transport(transport);
+        let rows = futures::stream::iter([
+            Ok(IntRow(1)),
+            Err(crate::error::Error::UsageError("source failed".into())),
+        ]);
+        let error = stream_bulk_copy(&mut client)
+            .use_internal_transaction(true)
+            .write_to_server_stream(rows)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, crate::error::Error::UsageError(ref s) if s == "source failed"));
+        assert_eq!(attentions.load(Ordering::SeqCst), 1);
+        assert!(!client.has_active_transaction());
+        assert!(!client.is_connection_dead());
     }
 
     #[tokio::test]

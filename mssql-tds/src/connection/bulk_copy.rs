@@ -56,7 +56,60 @@ use crate::error::bulk_copy_errors::{
 };
 use crate::message::transaction_management::TransactionIsolationLevel;
 use async_trait::async_trait;
+use futures::{Stream, StreamExt};
+use std::pin::{Pin, pin};
 use std::time::{Duration, Instant};
+
+fn source_with_timeout<S, R>(
+    rows: Pin<&mut S>,
+    timeout_sec: u32,
+    start_time: Instant,
+) -> impl Stream<Item = TdsResult<R>> + '_
+where
+    S: Stream<Item = TdsResult<R>>,
+{
+    let deadline = (timeout_sec != 0).then(|| {
+        tokio::time::Instant::now()
+            + Duration::from_secs(timeout_sec as u64).saturating_sub(start_time.elapsed())
+    });
+    futures::stream::unfold(
+        (rows, 0, false),
+        move |(mut rows, rows_read, finished)| async move {
+            if finished {
+                return None;
+            }
+            // Only source polling is cancellation-safe. Destination writes must
+            // complete before this stream is polled again.
+            let next = match deadline {
+                Some(deadline) => {
+                    if tokio::time::Instant::now() >= deadline {
+                        None
+                    } else {
+                        tokio::time::timeout_at(deadline, rows.next()).await.ok()
+                    }
+                }
+                None => Some(rows.next().await),
+            };
+            match next {
+                Some(Some(row)) => {
+                    let finished = row.is_err();
+                    Some((row, (rows, rows_read + u64::from(!finished), finished)))
+                }
+                Some(None) => None,
+                None => Some((
+                    Err(Error::BulkCopyError(BulkCopyError::Timeout(
+                        BulkCopyTimeoutError::new(
+                            rows_read,
+                            timeout_sec,
+                            Some("Bulk copy timed out waiting for the source".to_string()),
+                        ),
+                    ))),
+                    (rows, rows_read, true),
+                )),
+            }
+        },
+    )
+}
 
 /// Options for configuring bulk copy operations.
 ///
@@ -909,6 +962,22 @@ impl<'a> BulkCopy<'a> {
         I: IntoIterator<Item = R>,
         R: BulkLoadRow,
     {
+        self.write_to_server_stream(futures::stream::iter(rows.into_iter().map(Ok)))
+            .await
+    }
+
+    /// Copies a fallible asynchronous source without buffering rows.
+    ///
+    /// Each row is fully serialized before the source is polled again, allowing
+    /// rows to lazily read their values from another connection. Source errors
+    /// cancel an active bulk batch before any internal transaction is rolled back.
+    /// The operation timeout also covers waiting for the source, but never
+    /// interrupts a destination write in flight. The source need not be `Unpin`.
+    pub async fn write_to_server_stream<S, R>(&mut self, rows: S) -> TdsResult<BulkCopyResult>
+    where
+        S: Stream<Item = TdsResult<R>>,
+        R: BulkLoadRow,
+    {
         let start_time = Instant::now();
         let mut total_rows = 0u64;
 
@@ -922,8 +991,9 @@ impl<'a> BulkCopy<'a> {
         // ═══════════════════════════════════════════════════════════════════════
         self.validate_transaction_state()?;
 
-        // Peek-able iterator for batch boundary detection
-        let mut rows = rows.into_iter().peekable();
+        let rows = pin!(rows);
+        let rows = source_with_timeout(rows, self.options.timeout_sec, start_time).peekable();
+        let mut rows = pin!(rows);
 
         // Ensure destination table exists and retrieve metadata
         if self.destination_metadata.is_none() {
@@ -934,6 +1004,10 @@ impl<'a> BulkCopy<'a> {
             .destination_metadata
             .as_ref()
             .ok_or_else(|| Error::UsageError("Destination metadata not available".to_string()))?;
+
+        if matches!(rows.as_mut().peek().await, Some(Err(_))) {
+            return Err(rows.next().await.unwrap().err().unwrap());
+        }
 
         // If no column mappings are configured, peek at first row to determine source column count
         // and create ordinal mappings for min(source_columns, destination_columns)
@@ -953,7 +1027,7 @@ impl<'a> BulkCopy<'a> {
             };
 
             // Peek at first row to determine source column count
-            let source_column_count = if let Some(_first_row) = rows.peek() {
+            let source_column_count = if rows.as_mut().peek().await.is_some() {
                 // For BulkLoadRow trait, we can't easily determine column count without consuming
                 // So we'll map all destination columns and let the row writer handle it
                 // This is a limitation of the current design - the Python layer handles this better
@@ -972,7 +1046,7 @@ impl<'a> BulkCopy<'a> {
         }
 
         // Prepare metadata only if we have rows to process
-        if rows.peek().is_some() {
+        if rows.as_mut().peek().await.is_some() {
             // Retrieve destination metadata
             let destination_metadata = self.retrieve_destination_metadata().await?;
 
@@ -1015,16 +1089,16 @@ impl<'a> BulkCopy<'a> {
     /// - Rows are serialized directly to packet writer via BulkLoadRow trait
     /// - No intermediate Vec allocations (0 allocations per row)
     /// - Column contexts are created once and reused across all rows
-    async fn write_rows_to_server_zerocopy<I, R>(
+    async fn write_rows_to_server_zerocopy<S, R>(
         &mut self,
-        mut rows: std::iter::Peekable<I>,
+        mut rows: Pin<&mut futures::stream::Peekable<S>>,
         resolved_mappings: &[ResolvedColumnMapping],
         dest_column_metadata: Vec<BulkCopyColumnMetadata>,
         total_rows: &mut u64,
         start_time: Instant,
     ) -> TdsResult<()>
     where
-        I: Iterator<Item = R>,
+        S: Stream<Item = TdsResult<R>>,
         R: BulkLoadRow,
     {
         // Determine batch size (0 means all rows in one batch)
@@ -1045,15 +1119,22 @@ impl<'a> BulkCopy<'a> {
 
         // Accumulate INFO messages across all batches so the whole bulk copy operation's
         // diagnostics are retrievable via `client.info_messages()` after it returns.
-        // Each `execute_bulk_load_streaming_zerocopy` call resets the client's buffer via
+        // Each `execute_bulk_load_stream` call resets the client's buffer via
         // `begin_command`, and the internal `commit_transaction` (when enabled) would clear
         // it as well, so we drain each batch's INFO before commit and restore the full set
         // once the loop completes.
         let mut accumulated_info: Vec<SqlInfoMessage> = Vec::new();
 
         loop {
-            if rows.peek().is_none() {
-                break;
+            match rows.as_mut().peek().await {
+                None => break,
+                Some(Err(_)) => {
+                    let error = rows.next().await.unwrap().err().unwrap();
+                    let _ = self.client.take_info_messages();
+                    self.client.extend_info_messages(accumulated_info);
+                    return Err(error);
+                }
+                Some(Ok(_)) => {}
             }
 
             // Check timeout before starting next batch
@@ -1095,9 +1176,8 @@ impl<'a> BulkCopy<'a> {
                 }
             }
 
-            // Create a batch iterator that yields up to batch_size rows
-            // The take() adaptor just sets an upper bound, but the actual iteration ends when the input is finished.
-            let batch_iter = (&mut rows).take(batch_size);
+            // Stop at the batch boundary without polling the next source row.
+            let batch_iter = rows.as_mut().take(batch_size);
 
             // ═══════════════════════════════════════════════════════════════════
             // BEGIN TRANSACTION: Start internal transaction before each batch
@@ -1113,7 +1193,7 @@ impl<'a> BulkCopy<'a> {
             // Execute streaming bulk load with zero-copy path
             let batch_result = self
                 .client
-                .execute_bulk_load_streaming_zerocopy(
+                .execute_bulk_load_stream(
                     self.table_name.clone(),
                     dest_column_metadata.clone(),
                     self.options.clone(),
