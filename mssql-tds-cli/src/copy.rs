@@ -1,13 +1,16 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-use std::time::{Duration, Instant};
+use std::{
+    future::Future,
+    time::{Duration, Instant},
+};
 
 use async_trait::async_trait;
 use clap::Args;
 use mssql_tds::{
     connection::{
-        bulk_copy::{BulkCopy, BulkLoadRow},
+        bulk_copy::{BulkCopy, BulkCopyResult, BulkLoadRow},
         client_context::ClientContext,
         tds_client::{ResultSet, StatementResult, TdsClient},
     },
@@ -139,6 +142,16 @@ async fn read_batch(source: &mut TdsClient, batch_size: usize) -> TdsResult<Vec<
     Ok(rows)
 }
 
+async fn pipeline_batch(
+    read: impl Future<Output = TdsResult<Vec<CopyRow>>>,
+    write: impl Future<Output = TdsResult<BulkCopyResult>>,
+) -> TdsResult<(Vec<CopyRow>, BulkCopyResult)> {
+    // Source errors wait for the destination transaction to finish; destination errors
+    // abandon the source read immediately. Neither connection is reused on failure.
+    let (next, written) = tokio::try_join!(async { Ok::<_, Error>(read.await) }, write)?;
+    Ok((next?, written))
+}
+
 async fn transfer(
     source: &mut TdsClient,
     destination: &mut TdsClient,
@@ -177,12 +190,13 @@ async fn transfer(
     let mut copied = 0;
     while !rows.is_empty() {
         // Overlap the next source read with the destination write, keeping at most two batches.
-        let (next, written) = tokio::join!(
+        let (next, written) = Box::pin(pipeline_batch(
             read_batch(source, args.batch_size as usize),
-            bulk.write_to_server_zerocopy(rows)
-        );
-        copied += written?.rows_affected;
-        rows = next?;
+            bulk.write_to_server_zerocopy(rows),
+        ))
+        .await?;
+        copied += written.rows_affected;
+        rows = next;
     }
     loop {
         match source.advance().await? {
@@ -261,5 +275,34 @@ mod tests {
         ] {
             assert!(validate_schema(&[binary_column()], &[column]).is_err());
         }
+    }
+
+    #[tokio::test]
+    async fn destination_failure_does_not_wait_for_source() {
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            pipeline_batch(std::future::pending(), async {
+                Err(Error::UsageError("destination failed".into()))
+            }),
+        )
+        .await
+        .expect("Destination failure must not wait for a blocked source");
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn source_failure_waits_for_destination_cleanup() {
+        let mut finished = false;
+        let result = pipeline_batch(
+            async { Err(Error::UsageError("source failed".into())) },
+            async {
+                tokio::task::yield_now().await;
+                finished = true;
+                Ok(BulkCopyResult::new(2, Duration::ZERO))
+            },
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(finished);
     }
 }
