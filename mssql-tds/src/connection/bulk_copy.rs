@@ -971,8 +971,11 @@ impl<'a> BulkCopy<'a> {
     /// Each row is fully serialized before the source is polled again, allowing
     /// rows to lazily read their values from another connection. Source errors
     /// cancel an active bulk batch before any internal transaction is rolled back.
-    /// The operation timeout also covers waiting for the source, but never
-    /// interrupts a destination write in flight. The source need not be `Unpin`.
+    /// The operation timeout is shared across all batches and also covers
+    /// waiting for the source, but never interrupts a destination write in
+    /// flight. On timeout, the pending source poll is cancelled and the supplied
+    /// stream is dropped. Reads performed inside `BulkLoadRow::write_to_packet`
+    /// must enforce their own timeout. The source need not be `Unpin`.
     pub async fn write_to_server_stream<S, R>(&mut self, rows: S) -> TdsResult<BulkCopyResult>
     where
         S: Stream<Item = TdsResult<R>>,
@@ -1006,7 +1009,7 @@ impl<'a> BulkCopy<'a> {
             .ok_or_else(|| Error::UsageError("Destination metadata not available".to_string()))?;
 
         if matches!(rows.as_mut().peek().await, Some(Err(_))) {
-            return Err(rows.next().await.unwrap().err().unwrap());
+            let _ = rows.next().await.transpose()?;
         }
 
         // If no column mappings are configured, peek at first row to determine source column count
@@ -1129,10 +1132,10 @@ impl<'a> BulkCopy<'a> {
             match rows.as_mut().peek().await {
                 None => break,
                 Some(Err(_)) => {
-                    let error = rows.next().await.unwrap().err().unwrap();
+                    let result = rows.next().await.transpose();
                     let _ = self.client.take_info_messages();
                     self.client.extend_info_messages(accumulated_info);
-                    return Err(error);
+                    return result.map(|_| ());
                 }
                 Some(Ok(_)) => {}
             }
