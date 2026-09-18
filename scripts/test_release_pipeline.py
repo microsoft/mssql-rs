@@ -585,6 +585,23 @@ def _canonical_python_versions() -> set[str]:
     return {f"{major}.{minor}" for major, minor in tags}
 
 
+def _canonical_win_arm64_python_versions() -> set[str]:
+    """The win_arm64 tags are the pythonTags filtered by the Where-Object
+    clause preceding the win_arm64 wheel-name loop in Get-ExpectedWheelNames -
+    read that filter's excluded tags rather than restating them."""
+    ps1 = _VERIFY_WHEELS_SCRIPT.read_text(encoding="utf-8")
+    match = re.search(
+        r"foreach\s*\(\$pythonTag in \$pythonTags \| Where-Object \{(.*?)\}\)"
+        r"\s*\{\s*\"[^\"]*-win_arm64\.whl\"",
+        ps1,
+        re.DOTALL,
+    )
+    assert match, "could not find the win_arm64 Where-Object filter in verify-python-wheels.ps1"
+    excluded = re.findall(r"-ne\s+'cp(\d)(\d+)'", match[1])
+    excluded_versions = {f"{major}.{minor}" for major, minor in excluded}
+    return _canonical_python_versions() - excluded_versions
+
+
 def test_windows_and_macos_install_matrix_tracks_release_python_tags() -> None:
     """Guards the same class of drift the Linux fix in 9ed77aa7 closed: unlike
     the Linux script, Windows/macOS install coverage is driven by this
@@ -617,9 +634,10 @@ def test_windows_and_macos_install_matrix_tracks_release_python_tags() -> None:
     build = next(stage for stage in pipeline["stages"] if stage["stage"] == "Build")
     arm64_job = next(job for job in build["jobs"] if job.get("job") == "Windows_ARM64")
 
-    # Python 3.10 is deliberately excluded on Windows ARM64 (limited support,
-    # per the comment in stages.yml) - both call sites must agree on that.
-    expected_arm64_versions = canonical - {"3.10"}
+    # win_arm64 excludes cp310 today (limited support, per the comment in
+    # stages.yml) - derived from verify-python-wheels.ps1's own filter so a
+    # change to that exclusion is caught here too.
+    expected_arm64_versions = _canonical_win_arm64_python_versions()
     for template_name in (
         "build-python-wheels-template.yml",
         "test-python-wheel-installs-template.yml",
