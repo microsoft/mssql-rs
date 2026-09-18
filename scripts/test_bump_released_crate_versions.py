@@ -21,7 +21,7 @@ bump = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(bump)
 
 
-@pytest.mark.parametrize("released", [(), ("mssql-tds",), ("mssql-mock-tds",), bump.CRATES])
+@pytest.mark.parametrize("released", [(), ("mssql-tds",), bump.CRATES])
 def test_selects_only_released_crates_and_repeat_is_quiet(tmp_path, released):
     before = dict.fromkeys(bump.CRATES, "0.1.7")
     after = {crate: "0.2.0" if crate in released else before[crate] for crate in bump.CRATES}
@@ -41,6 +41,17 @@ def test_selects_only_released_crates_and_repeat_is_quiet(tmp_path, released):
         )
     else:
         cargo.assert_not_called()
+
+
+def test_mock_bump_waits_for_published_core(tmp_path, capsys):
+    before = dict.fromkeys(bump.CRATES, "0.1.7")
+    published = {"mssql-tds": set(), "mssql-mock-tds": {"0.1.7"}}
+    with patch.object(bump, "cargo_versions", return_value=before), patch.object(
+        bump.subprocess, "run"
+    ) as cargo:
+        assert bump.bump_versions(tmp_path, published) == {}
+    cargo.assert_not_called()
+    assert "waiting for its mssql-tds dependency" in capsys.readouterr().out
 
 
 def test_metadata_uses_cargo_json(tmp_path):

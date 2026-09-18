@@ -61,7 +61,9 @@ yanked releases), the workflow proposes the next minor version: `0.1.7` becomes
 `0.2.0`. Unpublished source versions and crates that return HTTP 404 are left
 alone. Other registry errors fail the run rather than assuming a crate is
 unpublished. If the proposed next minor version is also published, the run fails
-and a maintainer must choose a new version.
+and a maintainer must choose a new version. A mock-only bump is deferred until
+the current `mssql-tds` version is published, because the mock crate's exact
+versioned dependency must resolve from the registry when it is packaged.
 
 Local versions come from `cargo metadata`; `cargo set-version --bump minor`
 from cargo-edit updates the selected manifests and their versioned workspace

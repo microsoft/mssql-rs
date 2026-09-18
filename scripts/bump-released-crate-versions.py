@@ -47,6 +47,12 @@ def cargo_versions(root):
 def bump_versions(root, published):
     before = cargo_versions(root)
     selected = [crate for crate in CRATES if before[crate] in published[crate]]
+    # The mock package has an exact, versioned dependency on mssql-tds. Do not
+    # create a mock-only bump while that dependency version is unpublished:
+    # Cargo drops the path when packaging, so the release cannot resolve it.
+    if "mssql-mock-tds" in selected and "mssql-tds" not in selected:
+        selected.remove("mssql-mock-tds")
+        print("mssql-mock-tds: waiting for its mssql-tds dependency to be published.")
     if not selected:
         return {}
     subprocess.run(
