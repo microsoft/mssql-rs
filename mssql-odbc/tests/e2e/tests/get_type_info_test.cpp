@@ -110,7 +110,8 @@ TEST_P(GetTypeInfoOdbcVersionLiveTest, TimestampFilterAndColumnContractMatch) {
 // build 176155 both this driver and msodbcsql 18.6.2.1 returned a non-NULL,
 // one-character COLUMN_SIZE for the XML row on all 16 runs, against both
 // SQL_OV_ODBC3 and SQL_OV_ODBC3_80. The RPC parameter itself is pinned by the
-// `odbc_ver_is_the_yukon_pseudo_version` unit test; what stays worth checking
+// `type_info_rpc_sends_the_yukon_pseudo_version_and_the_unmodified_type` unit
+// test; what stays worth checking
 // live is that the XML row is returned and reports a column size at all.
 TEST_P(GetTypeInfoOdbcVersionLiveTest, XmlColumnSizeIsReported) {
     ASSERT_SQL_OK(SQLGetTypeInfo(stmt_, SQL_SS_XML), SQL_HANDLE_STMT, stmt_);
@@ -275,6 +276,11 @@ TEST_F(GetTypeInfoLiveTest, IntervalTypeReturnsEmptyResultSet) {
 // driver always calls _100, which has no vector row, so it answers HYC00 ("not
 // implemented") rather than reporting success with no vector metadata. Update
 // this expectation when the _170 selection lands.
+//
+// The skip is the gap-driven form permitted by §2.1 of the ODBC engineering
+// instructions: asserting msodbcsql's answer here would need a vector-capable
+// server this suite cannot assume. That clause requires a tracking work item
+// for the gap, which still needs to be filed for the _170 selection.
 TEST_F(GetTypeInfoLiveTest, VectorTypeIsNotImplementedYet) {
     SKIP_IF_COMPARING_MSODBCSQL();
     SQLRETURN rc = SQLGetTypeInfo(stmt_, SQL_SS_VECTOR);

@@ -297,3 +297,27 @@ msodbcsql build is measured.
    re-taken on every `--compare-with-msodbcsql` run and a future msodbcsql
    build that stops warning here fails that test instead of going unnoticed.
    Signed off by Theekshna Kotian on 2026-09-17.
+14. `SQLSetEnvAttr(SQL_ATTR_ODBC_VERSION, SQL_OV_ODBC2)` is rejected with
+   `SQL_ERROR` / `HY024`, and the previously selected version is left
+   unchanged. msodbcsql accepts it: `SQLSetEnvAttr`
+   (`odbc/sqlcmisc.cpp`, line 1021) validates only the attribute's range and
+   then stores the value verbatim
+   (`lpEnv->dwOptionsE[fAttribute] = (UINT_PTR)rgbValue;`), with no check on
+   the version itself; `IS2xAPPE` (`odbc/sqlcprot.h`, line 1546) reads it back
+   as `SQL_OV_ODBC2`, and the driver then branches on it throughout — for
+   example `odbc/sqlcconn.cpp`, line 585.
+   This driver supports no ODBC 2.x application contract, so accepting the
+   declaration and then behaving as 3.x would be the worse outcome: the
+   application would be told its request succeeded while silently receiving
+   3.x identifiers, column names, and defaults. The rule is recorded in
+   §2.2 of the engineering instructions ("Do not add ODBC 2.x application
+   behavior to the driver"), and removing it took version branches out of
+   `catalog.rs`, `describe_param.rs`, `get_type_info.rs`, `type_rules.rs`,
+   and `handles/env.rs`.
+   Applications are largely insulated because the Driver Manager maps a 2.x
+   application onto the 3.x interface before the driver is loaded, so a real
+   2.x application does not reach this rejection; `SetGetOdbcVersion2` in the
+   Driver Manager e2e tests documents that interception. A 3.x-linked
+   application that declares `SQL_OV_ODBC2` directly against this driver does
+   see the change — it previously got `SQL_SUCCESS`. Tracked in AB#48256.
+   Signed off by Theekshna Kotian on 2026-09-18.

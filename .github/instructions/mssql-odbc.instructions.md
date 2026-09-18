@@ -50,11 +50,13 @@ on the `master` branch.
 - CI compares against the version pinned by `msodbcsqlVersion` in
   `.pipeline/validation-pipeline.yml`. Use the e2e runner's
   `--compare-with-msodbcsql` mode for observable parity checks.
-- Add or retain `SKIP_IF_COMPARING_MSODBCSQL()` only for a measured divergence;
-  the skip removes the assertion from the reference-driver leg. When the test
-  exists solely to pin one divergence that already has a registry entry, prefer
-  asserting each leg's expected result over skipping, so the reference stays
-  measured on every run; see the carve-out in
+- Add or retain `SKIP_IF_COMPARING_MSODBCSQL()` only for a measured divergence,
+  or for a documented gap tracked by a work item where asserting the reference
+  leg would need a server capability the suite cannot assume; the skip removes
+  the assertion from the reference-driver leg. When the test exists solely to
+  pin one divergence that already has a registry entry, prefer asserting each
+  leg's expected result over skipping, so the reference stays measured on every
+  run; see the carve-out in
   [the e2e README](../../mssql-odbc/tests/e2e/README.md).
 - A consumer-based divergence requires evidence from both the consumer's
   routing path and its delivery path.
