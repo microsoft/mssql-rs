@@ -3,7 +3,9 @@
 
 use std::io::Error;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
+
+mod copy;
 
 use mssql_tds::core::EncryptionOptions;
 use mssql_tds::core::EncryptionSetting;
@@ -22,6 +24,7 @@ use mssql_tds::core::TdsResult;
 async fn main() {
     if let Err(e) = Box::pin(main_cli()).await {
         eprintln!("Application error: {e}");
+        std::process::exit(1);
     }
 }
 
@@ -29,7 +32,15 @@ async fn main() {
 #[command(version, about, long_about = None)]
 struct Args {
     #[arg(short, long)]
-    config_file_path: String,
+    config_file_path: Option<String>,
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Copy one query result to an existing table using TDS bulk load.
+    Copy(Box<copy::CopyArgs>),
 }
 
 /// Define commands for auto-completion
@@ -145,7 +156,66 @@ impl Session {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn copy_args() -> Vec<&'static str> {
+        vec![
+            "mssql-tds-cli",
+            "copy",
+            "--source-server",
+            "tcp:source,1433",
+            "--source-database",
+            "source",
+            "--source-user",
+            "reader",
+            "--destination-server",
+            "tcp:destination,1433",
+            "--destination-database",
+            "destination",
+            "--destination-user",
+            "writer",
+            "--query",
+            "SELECT payload FROM dbo.source",
+            "--destination-table",
+            "dbo.destination",
+        ]
+    }
+
+    #[test]
+    fn copy_does_not_require_legacy_config() {
+        assert!(matches!(
+            Args::try_parse_from(copy_args()).unwrap().command,
+            Some(Command::Copy(_))
+        ));
+    }
+
+    #[test]
+    fn interactive_invocations_still_parse() {
+        assert!(Args::try_parse_from(["mssql-tds-cli"]).is_ok());
+        assert!(
+            Args::try_parse_from(["mssql-tds-cli", "--config-file-path", "config.toml"]).is_ok()
+        );
+    }
+
+    #[test]
+    fn copy_rejects_invalid_batch_sizes_and_missing_options() {
+        for size in ["0", "1000001", "-1"] {
+            let mut args = copy_args();
+            args.extend(["--batch-size", size]);
+            assert!(Args::try_parse_from(args).is_err());
+        }
+        assert!(Args::try_parse_from(["mssql-tds-cli", "copy"]).is_err());
+    }
+}
+
 pub async fn main_cli() -> Result<(), Box<dyn std::error::Error>> {
+    let args = Args::parse();
+    if let Some(Command::Copy(args)) = args.command {
+        return copy::run(*args).await;
+    }
+
     use mssql_tds::{
         connection::client_context::ClientContext,
         connection_provider::tds_connection_provider::TdsConnectionProvider,
