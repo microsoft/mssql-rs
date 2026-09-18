@@ -1,6 +1,6 @@
 # Performance baseline commit for mssql-odbc.
 #
-# This pin records the accepted optimized production state after PR #418.
+# This pin records the accepted optimized production state after PR #586.
 # Future baseline moves require a pull request, so every change is
 # reviewed and recorded in git history.
 #
