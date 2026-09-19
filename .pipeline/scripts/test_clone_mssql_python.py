@@ -129,6 +129,29 @@ class PinnedCheckout(unittest.TestCase):
         self.assertIn("Cannot fetch mssql-python pin", result.stderr)
         self.assertFalse((self.root / "checkout" / "content.txt").exists())
 
+    def test_failed_fetch_cleans_up_checkout_for_retry(self):
+        self.remote.rename(self.root / "unavailable-upstream")
+
+        result = self.checkout()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Cannot fetch mssql-python pin", result.stderr)
+        self.assertFalse((self.root / "checkout").exists())
+
+        (self.root / "unavailable-upstream").rename(self.remote)
+        self.assert_pinned("checkout")
+
+    def test_existing_option_like_checkout_is_not_removed(self):
+        checkout = self.root / "--version"
+        checkout.mkdir()
+        marker = checkout / "marker"
+        marker.write_text("preserve")
+
+        result = self.checkout("--version")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertTrue(checkout.exists())
+        self.assertTrue(marker.exists())
+        self.assertEqual(marker.read_text(), "preserve")
 
 if __name__ == "__main__":
     unittest.main()

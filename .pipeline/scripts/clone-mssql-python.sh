@@ -10,6 +10,15 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PIN_FILE="$SCRIPT_DIR/../mssql-python-revision.txt"
 CLONE_DIR="${MSSQL_PYTHON_CLONE_DIR:-../mssql-python}"
+CREATED_CLONE_DIR=0
+CHECKOUT_SUCCEEDED=0
+
+cleanup() {
+  if [ "$CREATED_CLONE_DIR" -eq 1 ] && [ "$CHECKOUT_SUCCEEDED" -eq 0 ]; then
+    rm -rf -- "$CLONE_DIR"
+  fi
+}
+trap cleanup EXIT
 
 if [ ! -f "$PIN_FILE" ]; then
   echo "##[error]Missing mssql-python pin: $PIN_FILE" >&2
@@ -23,8 +32,9 @@ fi
 
 echo "##[section]mssql-python requested pin: $REVISION"
 # Refuse to reuse a checkout or overwrite a developer's existing work.
-mkdir "$CLONE_DIR"
-git init --quiet "$CLONE_DIR"
+mkdir -- "$CLONE_DIR"
+CREATED_CLONE_DIR=1
+git -C "$CLONE_DIR" init --quiet
 git -C "$CLONE_DIR" remote add origin https://github.com/microsoft/mssql-python.git
 if ! git -C "$CLONE_DIR" fetch --depth 1 origin "$REVISION"; then
   echo "##[error]Cannot fetch mssql-python pin $REVISION; no branch fallback is allowed" >&2
@@ -37,3 +47,5 @@ if [ "$HEAD" != "$REVISION" ]; then
   echo "##[error]mssql-python HEAD does not match requested pin $REVISION" >&2
   exit 1
 fi
+
+CHECKOUT_SUCCEEDED=1
