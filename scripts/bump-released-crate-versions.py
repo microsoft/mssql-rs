@@ -57,6 +57,10 @@ def planned_bumps(root, published):
         selected.remove("mssql-mock-tds")
         print("mssql-mock-tds: waiting for its mssql-tds dependency to be published.")
     changes = {crate: (current[crate], next_minor(current[crate])) for crate in selected}
+    if "mssql-tds" in changes:
+        core_target = changes["mssql-tds"][1]
+        if current["mssql-mock-tds"] != core_target:
+            changes["mssql-mock-tds"] = (current["mssql-mock-tds"], core_target)
     for crate, (_old, new) in changes.items():
         if new in published[crate]:
             raise ValueError(f"{crate} {new} is already published; choose the next version manually.")

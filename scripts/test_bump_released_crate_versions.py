@@ -21,14 +21,16 @@ bump = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(bump)
 
 
-@pytest.mark.parametrize("released", [(), ("mssql-tds",), bump.CRATES])
-def test_plans_only_released_crates(tmp_path, released):
+@pytest.mark.parametrize(("released", "expected"), [
+    ((), {}),
+    (("mssql-tds",), dict.fromkeys(bump.CRATES, ("0.1.7", "0.2.0"))),
+    (bump.CRATES, dict.fromkeys(bump.CRATES, ("0.1.7", "0.2.0"))),
+])
+def test_plans_released_crates(tmp_path, released, expected):
     current = dict.fromkeys(bump.CRATES, "0.1.7")
     published = {crate: {"0.1.7"} if crate in released else set() for crate in bump.CRATES}
     with patch.object(bump, "cargo_versions", return_value=current):
-        assert bump.planned_bumps(tmp_path, published) == {
-            crate: ("0.1.7", "0.2.0") for crate in released
-        }
+        assert bump.planned_bumps(tmp_path, published) == expected
 
 
 def test_mock_bump_waits_for_published_core(tmp_path, capsys):

@@ -63,7 +63,9 @@ alone. Other registry errors fail the run rather than assuming a crate is
 unpublished. If the proposed next minor version is also published, the run fails
 and a maintainer must choose a new version. A mock-only bump is deferred until
 the current `mssql-tds` version is published, because the mock crate's exact
-versioned dependency must resolve from the registry when it is packaged.
+versioned dependency must resolve from the registry when it is packaged. When
+`mssql-tds` is bumped, the mock source version is kept aligned with the core
+target because the release pipeline stamps the mock crate from the core version.
 
 Local versions come from `cargo metadata`. The workflow does not edit files,
 push branches, create PRs, publish crates, merge anything, or change the release
