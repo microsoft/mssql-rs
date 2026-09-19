@@ -231,6 +231,14 @@ Bound buffers trim a real surrogate pair if truncation would split it, but keep
 already-unpaired units. `SQLGetData` can split a pair across calls because the
 caller retrieves the remaining units on its next call.
 
+Materialized CP1252 `varchar` values delivered as `SQL_C_WCHAR` decode directly
+to bounded UTF-16 scratch space, without allocating a UTF-8 string or copying
+borrowed source bytes. Each CP1252 byte produces one UTF-16 unit, so repeated
+`SQLGetData` calls decode only the next requested chunk and report the exact
+remaining byte length. This applies to buffered/captured reads, bound row
+arrays and output parameters. Other encodings, `SQL_C_CHAR`, and streaming MAX
+conversion retain their existing paths.
+
 ## Parameter array results
 
 Prepared parameter arrays can return rows from `SELECT`, `INSERT ... OUTPUT`,

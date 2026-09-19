@@ -56,7 +56,9 @@ use crate::api::odbc_types::{
     SqlUSmallInt, SqlWChar,
 };
 use crate::api::type_rules::resolve_default_c_type;
-use crate::api::util::{copy_utf16le_with_nul, copy_with_nul, write_if_some};
+use crate::api::util::{
+    copy_cp1252_with_nul, copy_utf16le_with_nul, copy_with_nul, is_cp1252, write_if_some,
+};
 use crate::conversion::datetime::DateTimeParts;
 use crate::conversion::error::{ConvError, ConvOk};
 use crate::conversion::fetch_convert::{
@@ -2111,8 +2113,9 @@ unsafe fn deliver_encoded_string(
     let direct_wchar = binding.target_type == SQL_C_WCHAR
         && matches!(encoding, EncodingType::Utf16)
         && bytes.len().is_multiple_of(2);
+    let cp1252 = binding.target_type == SQL_C_WCHAR && is_cp1252(&encoding);
 
-    if !direct_char && !direct_wchar {
+    if !direct_char && !direct_wchar && !cp1252 {
         return unsafe {
             deliver_bound(
                 binding,
@@ -2144,9 +2147,26 @@ unsafe fn deliver_encoded_string(
         };
     }
 
-    unsafe { write_if_some(octet_length, bytes.len() as SqlLen) };
+    let byte_len = if cp1252 {
+        bytes.len().saturating_mul(2)
+    } else {
+        bytes.len()
+    };
+    unsafe {
+        write_if_some(
+            octet_length,
+            SqlLen::try_from(byte_len).unwrap_or(SqlLen::MAX),
+        )
+    };
     let buf_elements = char_buf_elements(binding.target_type, stride);
-    if unsafe { copy_bound_utf16le_with_nul(slot.cast(), buf_elements, &bytes) } {
+    let truncated = unsafe {
+        if cp1252 {
+            copy_cp1252_with_nul(slot.cast(), buf_elements, &bytes)
+        } else {
+            copy_bound_utf16le_with_nul(slot.cast(), buf_elements, &bytes)
+        }
+    };
+    if truncated {
         RowOutcome::Info(RowIssue::StringTruncated)
     } else {
         RowOutcome::Success
@@ -2280,18 +2300,32 @@ unsafe fn deliver_bound(
         return RowOutcome::Error(RowIssue::Unsupported);
     }
 
+    let cp1252 = binding.target_type == SQL_C_WCHAR
+        && matches!(value, ColumnValues::String(value) if is_cp1252(value.encoding_type()));
     if binding.target_type == SQL_C_WCHAR
         && let ColumnValues::String(value) = value
-        && matches!(value.encoding_type(), EncodingType::Utf16)
-        && value.bytes.len().is_multiple_of(2)
+        && (cp1252
+            || (matches!(value.encoding_type(), EncodingType::Utf16)
+                && value.bytes.len().is_multiple_of(2)))
     {
-        unsafe { write_if_some(octet_length, value.bytes.len() as SqlLen) };
-        let truncated = unsafe {
-            copy_bound_utf16le_with_nul(
-                slot.cast(),
-                char_buf_elements(binding.target_type, stride),
-                &value.bytes,
+        let byte_len = if cp1252 {
+            value.bytes.len().saturating_mul(2)
+        } else {
+            value.bytes.len()
+        };
+        unsafe {
+            write_if_some(
+                octet_length,
+                SqlLen::try_from(byte_len).unwrap_or(SqlLen::MAX),
             )
+        };
+        let truncated = unsafe {
+            let capacity = char_buf_elements(binding.target_type, stride);
+            if cp1252 {
+                copy_cp1252_with_nul(slot.cast(), capacity, &value.bytes)
+            } else {
+                copy_bound_utf16le_with_nul(slot.cast(), capacity, &value.bytes)
+            }
         };
         return if truncated || (slot.is_null() && !value.bytes.is_empty()) {
             RowOutcome::Info(RowIssue::StringTruncated)
@@ -4442,6 +4476,117 @@ mod tests {
         writer.write_string(0, Cow::Borrowed(b"h\0i\0"), EncodingType::Utf16);
         assert_eq!(truncated, [u16::from(b'h'), 0]);
         assert_eq!(writer.outcome, RowOutcome::Info(RowIssue::StringTruncated));
+    }
+
+    #[test]
+    fn cp1252_bound_borrowed_materialized_and_output_slots_match() {
+        use mssql_tds::token::tokens::SqlCollation;
+        let encoding = EncodingType::LcidBased(SqlCollation {
+            info: 0x0409,
+            lcid_language_id: 0x0409,
+            col_flags: 0,
+            sort_id: 0,
+        });
+        assert!(is_cp1252(&encoding));
+        for bytes in [
+            (0..=255).cycle().take(769).collect::<Vec<u8>>(),
+            b"\xEF\xBB\xBF\xFF\xFE\xFE\xFFA\0".to_vec(),
+            vec![],
+        ] {
+            let units: Vec<u16> = SqlString::decode(&bytes, encoding).encode_utf16().collect();
+            assert_eq!(units.len(), bytes.len());
+            for capacity in [0, 1, 2, 3, 4, 33, 513, bytes.len() * 2 + 2] {
+                for path in 0..3 {
+                    let mut output = vec![0xA5_u8; capacity * 2 + 4];
+                    let mut lengths = crate::test_support::AlignedBuffer([0xA5_u8; 32]);
+                    let mut indicators = crate::test_support::AlignedBuffer([0xA5_u8; 32]);
+                    for row in 0..2 {
+                        let offset = 1 + row * capacity;
+                        let length_offset = 1 + row * size_of::<SqlLen>();
+                        let b = ColumnBinding {
+                            column_number: 1,
+                            target_type: SQL_C_WCHAR,
+                            target_value_ptr: output.as_mut_ptr().cast(),
+                            buffer_length: capacity as SqlLen,
+                            strlen_or_ind_ptr: indicators.0.as_mut_ptr().cast(),
+                            octet_length_ptr: lengths.0.as_mut_ptr().cast(),
+                        };
+                        let value = ColumnValues::String(SqlString::new(bytes.clone(), encoding));
+                        let outcome = unsafe {
+                            match path {
+                                0 => deliver_encoded_string(
+                                    &b,
+                                    row,
+                                    1,
+                                    Cow::Borrowed(&bytes),
+                                    encoding,
+                                ),
+                                1 => deliver_bound(&b, row, 1, &value),
+                                _ => {
+                                    let b = ColumnBinding {
+                                        target_value_ptr: output.as_mut_ptr().add(offset).cast(),
+                                        strlen_or_ind_ptr: indicators
+                                            .0
+                                            .as_mut_ptr()
+                                            .add(length_offset)
+                                            .cast(),
+                                        octet_length_ptr: lengths
+                                            .0
+                                            .as_mut_ptr()
+                                            .add(length_offset)
+                                            .cast(),
+                                        ..b
+                                    };
+                                    deliver_bound_value(&b, &value)
+                                }
+                            }
+                        };
+                        let copied = units.len().min((capacity / 2).saturating_sub(1));
+                        assert_eq!(
+                            outcome,
+                            if copied < units.len() {
+                                RowOutcome::Info(RowIssue::StringTruncated)
+                            } else {
+                                RowOutcome::Success
+                            }
+                        );
+                        assert_eq!(
+                            unsafe {
+                                lengths
+                                    .0
+                                    .as_ptr()
+                                    .add(length_offset)
+                                    .cast::<SqlLen>()
+                                    .read_unaligned()
+                            },
+                            (units.len() * 2) as SqlLen
+                        );
+                        assert_eq!(
+                            unsafe {
+                                indicators
+                                    .0
+                                    .as_ptr()
+                                    .add(length_offset)
+                                    .cast::<SqlLen>()
+                                    .read_unaligned()
+                            },
+                            0
+                        );
+                        if capacity >= 2 {
+                            let expected: Vec<u8> = units[..copied]
+                                .iter()
+                                .copied()
+                                .chain(std::iter::once(0))
+                                .flat_map(u16::to_ne_bytes)
+                                .collect();
+                            assert_eq!(&output[offset..offset + expected.len()], &expected);
+                        }
+                        assert_eq!(output[offset + capacity], 0xA5);
+                    }
+                    assert_eq!(output[0], 0xA5);
+                }
+            }
+        }
     }
 
     #[test]
