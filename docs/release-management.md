@@ -99,11 +99,12 @@ Before enabling the workflow:
 - Allow GitHub Actions to create pull requests in the repository's Actions
   settings. The workflow needs contents, issues, and pull-request write permissions.
 - Optionally set `CRATE_VERSION_BUMP_TOKEN` to a suitably scoped automation
-  token with those same permissions if the generated PR must trigger other
-  GitHub Actions workflows.
-  The fallback `GITHUB_TOKEN` does not trigger ordinary `pull_request` workflows;
-  arrange validation manually when using it. Normal local validation and review
-  are required before marking the draft ready.
+  token with those same permissions to run generated PR workflows without
+  manual approval.
+  With the fallback `GITHUB_TOKEN`, `pull_request` workflows for `opened`,
+  `synchronize`, and `reopened` require a user with write access to select
+  **Approve workflows to run**. See [GitHub's token behavior](https://docs.github.com/en/actions/concepts/security/github_token#when-github_token-triggers-workflow-runs).
+  Normal local validation and review are required before marking the draft ready.
 
 ### Python and NuGet versions
 
