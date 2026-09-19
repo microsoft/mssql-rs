@@ -150,15 +150,27 @@ mod tests {
     }
 
     #[test]
-    fn set_odbc_version_2_success() {
+    fn set_odbc_version_2_is_rejected() {
         let env = alloc_env();
-        let ret = set_attr(env, SQL_ATTR_ODBC_VERSION, SQL_OV_ODBC2);
-        assert_eq!(ret, SQL_SUCCESS);
-        let env_ref = unsafe { &*(env as *const EnvHandle) };
         assert_eq!(
-            env_ref.inner.lock().unwrap().odbc_version,
-            OdbcVersion::Odbc2
+            set_attr(env, SQL_ATTR_ODBC_VERSION, SQL_OV_ODBC3_80),
+            SQL_SUCCESS
         );
+        let ret = unsafe {
+            crate::api::exports::SQLSetEnvAttr(
+                env,
+                SQL_ATTR_ODBC_VERSION,
+                SQL_OV_ODBC2 as usize as SqlPointer,
+                0,
+            )
+        };
+        assert_eq!(ret, SQL_ERROR);
+        let env_ref = unsafe { &*(env as *const EnvHandle) };
+        let state = env_ref.inner.lock().unwrap();
+        assert_eq!(state.odbc_version, OdbcVersion::Odbc3_80);
+        assert_eq!(state.diag_records.len(), 1);
+        assert_eq!(&state.diag_records[0].sql_state, b"HY024");
+        drop(state);
         free_env(env);
     }
 
@@ -202,7 +214,7 @@ mod tests {
         // DBC; the last write wins.
         let env = alloc_env();
         assert_eq!(
-            set_attr(env, SQL_ATTR_ODBC_VERSION, SQL_OV_ODBC2),
+            set_attr(env, SQL_ATTR_ODBC_VERSION, SQL_OV_ODBC3),
             SQL_SUCCESS
         );
         assert_eq!(
