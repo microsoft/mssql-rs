@@ -221,9 +221,10 @@ Datetimeoffset conversion uses checked 64-bit arithmetic while preserving the
 out-of-range rejection of the wider calculation.
 Same-encoding wide delivery in bound fetches and `SQLGetData` copies complete
 UTF-16 code units without decoding them. This preserves unpaired surrogates,
-BOM-like units, and embedded NULs for the application's decoding policy;
-actual encoding conversions remain
-separate. The materialized-value fast paths require an even byte length before
+BOM-like units, and embedded NULs for the application's decoding policy.
+Actual encoding conversions use the explicit encoding without BOM sniffing:
+leading BOM-shaped bytes remain data, including in non-Unicode `varchar` values.
+The materialized-value fast paths require an even byte length before
 using the raw-unit copy helper. Odd-length PLP streams retain their existing
 behavior and are not covered by this parity claim.
 Bound buffers trim a real surrogate pair if truncation would split it, but keep

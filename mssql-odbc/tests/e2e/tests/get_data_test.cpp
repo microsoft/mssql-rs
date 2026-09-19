@@ -283,7 +283,75 @@ protected:
                       SQL_HANDLE_DBC, dbc_);
         RecordProperty("driver_version", reinterpret_cast<const char*>(version));
     }
+
+    void CheckVarcharBomCollation(bool utf8) {
+        struct Value {
+            const char* hex;
+            std::vector<SQLCHAR> bytes;
+            std::vector<SQLWCHAR> units;
+        };
+        const std::vector<Value> values = {
+            {"0xEFBBBF41", {0xEF, 0xBB, 0xBF, 0x41},
+                utf8 ? std::vector<SQLWCHAR>{0xFEFF, 0x0041}
+                     : std::vector<SQLWCHAR>{0x00EF, 0x00BB, 0x00BF, 0x0041}},
+            {"0x414243", {0x41, 0x42, 0x43}, {0x0041, 0x0042, 0x0043}},
+            utf8 ? Value{"0x41C3A942", {0x41, 0xC3, 0xA9, 0x42}, {0x0041, 0x00E9, 0x0042}}
+                 : Value{"0x41E942", {0x41, 0xE9, 0x42}, {0x0041, 0x00E9, 0x0042}},
+        };
+        const std::string collation = utf8 ? "Latin1_General_100_BIN2_UTF8"
+                                          : "Latin1_General_100_CI_AS";
+        for (const char* type : {"varchar(32)", "varchar(max)"}) {
+            SCOPED_TRACE(type);
+            for (const auto& value : values) {
+                SCOPED_TRACE(value.hex);
+                for (bool bound : {false, true}) {
+                    SCOPED_TRACE(bound);
+                    const size_t capacity = value.units.size() + 1;
+                    std::vector<SQLWCHAR> wide(capacity + 2, 0xCCCC);
+                    SQLLEN wide_indicator = -99;
+                    const SQLLEN capacity_bytes = static_cast<SQLLEN>(capacity * sizeof(SQLWCHAR));
+                    if (bound) {
+                        ASSERT_EQ(SQL_SUCCESS, SQLBindCol(stmt_, 1, SQL_C_WCHAR, wide.data() + 1,
+                                                         capacity_bytes, &wide_indicator));
+                    }
+                    ASSERT_EQ(SQL_SUCCESS, ExecDirect(
+                        "SET NOCOUNT ON; DECLARE @t TABLE(v " + std::string(type) +
+                        " COLLATE " + collation + "); INSERT @t VALUES(" + value.hex +
+                        "); SELECT v,v FROM @t"));
+                    ASSERT_EQ(SQL_SUCCESS, SQLFetch(stmt_));
+                    std::vector<SQLCHAR> binary(value.bytes.size() + 2, 0xCC);
+                    SQLLEN binary_indicator = -99;
+                    ASSERT_EQ(SQL_SUCCESS, SQLGetData(stmt_, bound ? 2 : 1, SQL_C_BINARY,
+                        binary.data() + 1, static_cast<SQLLEN>(value.bytes.size()), &binary_indicator));
+                    EXPECT_EQ(static_cast<SQLLEN>(value.bytes.size()), binary_indicator);
+                    EXPECT_TRUE(std::equal(value.bytes.begin(), value.bytes.end(), binary.begin() + 1));
+                    EXPECT_EQ(0xCC, binary.front());
+                    EXPECT_EQ(0xCC, binary.back());
+                    if (!bound) {
+                        ASSERT_EQ(SQL_SUCCESS, SQLGetData(stmt_, 2, SQL_C_WCHAR, wide.data() + 1,
+                                                         capacity_bytes, &wide_indicator));
+                    }
+                    EXPECT_EQ(static_cast<SQLLEN>(value.units.size() * sizeof(SQLWCHAR)), wide_indicator);
+                    EXPECT_TRUE(std::equal(value.units.begin(), value.units.end(), wide.begin() + 1));
+                    EXPECT_EQ(0, wide[capacity]);
+                    EXPECT_EQ(0xCCCC, wide.front());
+                    EXPECT_EQ(0xCCCC, wide.back());
+                    EXPECT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
+                    ASSERT_EQ(SQL_SUCCESS, SQLCloseCursor(stmt_));
+                    ASSERT_EQ(SQL_SUCCESS, SQLFreeStmt(stmt_, SQL_UNBIND));
+                }
+            }
+        }
+    }
 };
+
+TEST_F(GetDataUtf16Test, Cp1252VarcharPreservesBomShapedBytes) {
+    CheckVarcharBomCollation(false);
+}
+
+TEST_F(GetDataUtf16Test, Utf8VarcharPreservesBomAndHighBytes) {
+    CheckVarcharBomCollation(true);
+}
 
 // #604: compare code units, not decoded strings or NUL-terminated lengths.
 TEST_F(GetDataUtf16Test, RawUnitsBesideNvarcharMax) {
