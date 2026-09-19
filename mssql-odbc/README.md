@@ -248,6 +248,36 @@ Inlining hints target parameter positioning, conversion, RPC encoding, and
 response/value dispatch. The large conversion and serialization functions use
 `#[inline]`, leaving the final inlining decision to the compiler.
 
+## Prepared parameter bindings
+
+Parameter mutations compare the old and new IPD SQL definition: direction and
+SQL type, character/binary SQL length, and numeric/decimal precision and scale.
+Relevant changes invalidate only the owning statement's materialized plan;
+unchanged definitions and records beyond its parameter markers do not.
+Temporal application scales affect conversion checks, not the fixed-scale SQL
+declaration; special types conservatively include their size/precision/scale.
+
+`SQLBindParameter`, IPD `SQLSetDescField`/`SQLSetDescRec`, parameter reset, and
+actual IPD refinement use this policy, including retained edits from a partially
+failed setter. Descriptor locks are released before statement invalidation.
+Direct IPD setters locate the owner through the DBC's statement list only when
+the SQL definition changes; there is no per-execute metadata key or comparison.
+The existing plan and deferred-unprepare state still travel through arrays and
+data-at-execution.
+
+Pointer-only rebinding and APD-only C type, buffer length, precision/scale, or
+descriptor reassociation changes reuse the plan when the IPD SQL definition is
+unchanged. Application buffers retain their existing validity requirements.
+Numeric prepared declarations always use IPD precision/scale, independently of
+the numeric value's wire precision/scale; the existing conversion fast path and
+wire representation are preserved.
+
+The selective policy follows msodbcsql's `ParamInfoSnapshot`/`SetIPDRec` path.
+Direct IPD-field invalidation is an intentional extension: retail 18.06.0001
+accepted an INTEGER-to-SMALLINT `SQLSetDescField` change but reused the old
+INTEGER declaration, whereas this driver applies the new definition at the
+next execute. This observation is not a measurement of retail 18.6.2.1.
+
 ## Conventions
 
 Before writing or modifying code in this crate, read

@@ -378,6 +378,18 @@ does not grow every time a new msodbcsql build is measured.
     18.6.2.1. Truncation after the first DAE parameter remains silent. Signed
     off by Theekshna Kotian on 2026-09-09. Tracked in AB#47946.
 
+15. **Direct IPD field edits invalidate a cached plan when its SQL definition
+    changes.** msodbcsql's `ParamInfoSnapshot::FHasChanged` in
+    `Sql/Ntdbms/sqlncli/odbc/sqlcprot.h` is used by `SetIPDRec` in `sqlcdesc.cpp`,
+    not by the direct `SQLSetDescFieldW` route. On retail 18.06.0001 through the
+    Windows Driver Manager, an IPD INTEGER-to-SMALLINT field edit retained
+    `sp_execute` and an INTEGER result; `SQLSetDescRec` reparsed as SMALLINT.
+    This driver handles both routes consistently so the next execute reflects
+    the changed SQL definition. Approved by David Engel on 2026-09-17 in the
+    scope of [PR #564](https://github.com/microsoft/mssql-rs/pull/564).
+    Retail 18.6.2.1 was not measured for this distinction; do not infer it from
+    the driver's compatibility version string or add a parity-test skip.
+
 ## No panics
 
 - **Never** use `.unwrap()` or `.expect()` on `Result` or `Option` in
@@ -521,6 +533,26 @@ Rules of thumb:
 - Prefer `Box` for single-owner heap objects; use `Arc` only when shared
   ownership is genuinely required.
 
+### Application lifetime contracts and bug scope
+
+- Applications must not use a handle after it is freed. `SQLDisconnect` also
+  releases associated statements and explicitly allocated descriptors. A
+  surviving Driver Manager wrapper does not establish that its old driver
+  handle is still usable. See [SQLFreeHandle](https://learn.microsoft.com/sql/odbc/reference/syntax/sqlfreehandle-function).
+- Applications own buffer allocation and must preserve buffers while the
+  driver still requires them. Do not infer that a concurrent descriptor setter
+  returning success makes an earlier outstanding fetch's buffers safe to free.
+  See [Allocating and Freeing Buffers](https://learn.microsoft.com/sql/odbc/reference/develop-app/allocating-and-freeing-buffers).
+- Crash prevention for freed application handles or prematurely freed buffers
+  is not a driver requirement. Do not add global identity, ownership, or
+  per-call admission machinery solely to harden those invalid uses.
+- Concurrent calls are not automatically misuse: ODBC requires thread safety.
+  Before redesigning synchronization for a reported race, establish a supported
+  call sequence, what the Driver Manager already enforces, and a reproducer
+  with valid submitted handles and buffers retained through call completion.
+  A source-level race or the absence of a classic-driver lock alone does not
+  establish the application contract. Keep proven internal fixes narrowly scoped.
+
 ## Concurrency
 
 - The ODBC spec allows Driver Manager to call functions on the same handle
@@ -530,6 +562,20 @@ Rules of thumb:
 - Handle poison explicitly with `std::sync::Mutex` — see the no-panics
   rule above for the canonical `let Ok(state) = ... else { return SQL_ERROR; }`
   pattern.
+
+### Prepared parameter definitions
+
+- Compare SQL definitions during IPD mutation, not APD addresses or conversion
+  metadata on every execute. Preserve plans for equivalent `SQLBindParameter`
+  calls and APD-only changes. `DESC_CONSISTENT` in msodbcsql controls validation,
+  not plan invalidation; its `ParamInfoSnapshot`/`RE_PREPARE` path is the reference.
+- Use the shared definition projection for binding, direct IPD fields/records,
+  and refinement. Account for partial failed writes and parameter-count changes.
+  Release descriptor locks before invalidating the owning statement.
+- Keep numeric SQL declarations IPD-based without overwriting the value's wire
+  precision/scale. A `SQL_NUMERIC_STRUCT` header is not the prepared declaration.
+- No descriptor identity, lifetime counter, or persistent metadata snapshot is
+  needed for this sequential cache-invalidation policy.
 
 ### Cross-handle thread safety (alloc / free)
 
@@ -572,8 +618,10 @@ Driver Manager (DM) provides serialization guarantees that the driver relies on
   resolve the target descriptor handle (`effective_ard`/`effective_apd`),
   drop the STMT lock, *then* lock the descriptor. A descriptor pointer
   resolved this way can be freed by a concurrent `SQLFreeHandle` before it
-  is dereferenced; re-check `handles::live_type` immediately before the
-  dereference to fail cleanly instead of touching freed memory.
+  is dereferenced. Existing `handles::live_type` rechecks narrow that window,
+  but are not a complete lifetime guarantee. Establish the supported concurrent
+  call sequence before treating [#441](https://github.com/microsoft/mssql-rs/issues/441)
+  as a requirement for a broader ownership redesign.
 - **APD before IPD**: `SQLBindParameter`'s `bind_param_records` is the only
   place in this crate that holds two DESC locks at once (writing a
   parameter's APD and IPD records together). It locks APD before IPD, and
@@ -585,15 +633,12 @@ Driver Manager (DM) provides serialization guarantees that the driver relies on
   verify the DM upheld its guarantees (e.g., no outstanding children). These
   fire in debug builds only — in release builds the driver trusts the DM and
   frees unconditionally, matching msodbcsql.
-- **Known gap: `SQLSetDescRec`/`SQLSetDescFieldW` don't check
-  `STMT_STATE_FETCH_IN_PROGRESS`**: `SQLBindCol`, `SQLFreeStmt(SQL_UNBIND)`,
-  and `SQLSetStmtAttr` all refuse to touch the ARD while a fetch snapshotted
-  it and is still writing through that snapshot — but the descriptor-field
-  API writes the same records with no such guard, and (unlike those three)
-  would need a DBC → STMT walk to find every statement an explicit,
-  possibly-reassociated descriptor is currently associated with. Tracked in
-  [#472](https://github.com/microsoft/mssql-rs/issues/472); this is a
-  deliberate deferral, not an oversight.
+- **Descriptor mutation during fetch**: the different admission checks in
+  `SQLBindCol`/`SQLFreeStmt`/`SQLSetStmtAttr` and the direct descriptor setters
+  are tracked in [#472](https://github.com/microsoft/mssql-rs/issues/472).
+  Do not justify a new buffer-use protocol by an application freeing storage
+  that an outstanding fetch still needs. Establish the supported concurrency
+  and completion guarantees first; preserve existing guards meanwhile.
 
 ## FFI boundary conventions
 

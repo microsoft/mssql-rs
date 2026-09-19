@@ -32,8 +32,7 @@ use crate::api::set_desc_field::{
     set_data_ptr, set_precision, set_scale, set_type, write_record_field,
 };
 use crate::api::sqlstate::{ERR_CANNOT_MODIFY_IRD, ERR_INVALID_DESCRIPTOR_INDEX, post_diag};
-use crate::error::free_errors;
-use crate::handles::desc::DescKind;
+use crate::handles::desc::{DescKind, DescState};
 use crate::handles::{DescHandle, HandleType, handle_from_raw};
 
 /// Implementation of [`SQLSetDescRec`](super::exports::SQLSetDescRec).
@@ -140,17 +139,42 @@ fn sql_set_desc_rec_safe(
     string_length_ptr: *mut SqlLen,
     indicator_ptr: *mut SqlLen,
 ) -> SqlReturn {
-    let Ok(mut state) = desc.inner.lock() else {
-        error!("SQLSetDescRec: desc mutex poisoned");
-        return SQL_ERROR;
-    };
-    free_errors(&mut state);
+    desc.update_definition(record_number, "SQLSetDescRec", |state| {
+        set_desc_rec(
+            state,
+            desc.kind,
+            record_number,
+            field_type,
+            sub_type,
+            length,
+            precision,
+            scale,
+            data_ptr,
+            string_length_ptr,
+            indicator_ptr,
+        )
+    })
+}
 
+#[allow(clippy::too_many_arguments)]
+fn set_desc_rec(
+    state: &mut DescState,
+    kind: DescKind,
+    record_number: SqlSmallInt,
+    field_type: SqlSmallInt,
+    sub_type: SqlSmallInt,
+    length: SqlLen,
+    precision: SqlSmallInt,
+    scale: SqlSmallInt,
+    data_ptr: SqlPointer,
+    string_length_ptr: *mut SqlLen,
+    indicator_ptr: *mut SqlLen,
+) -> SqlReturn {
     // "must not be an IRD handle" (spec) — mirrors SQLSetDescFieldW's own
     // blanket IRD gate (set_desc_field.rs).
-    if desc.kind == DescKind::ImpRow {
+    if kind == DescKind::ImpRow {
         error!("SQLSetDescRec: cannot modify an implementation row descriptor");
-        post_diag(&mut state, ERR_CANNOT_MODIFY_IRD);
+        post_diag(state, ERR_CANNOT_MODIFY_IRD);
         return SQL_ERROR;
     }
 
@@ -159,11 +183,11 @@ fn sql_set_desc_rec_safe(
     // SQLGetDescRecW's matching gate — so record 0 is out of range here too.
     if record_number < 1 {
         error!(record_number, "SQLSetDescRec: invalid record number");
-        post_diag(&mut state, ERR_INVALID_DESCRIPTOR_INDEX);
+        post_diag(state, ERR_INVALID_DESCRIPTOR_INDEX);
         return SQL_ERROR;
     }
     let Ok(count) = usize::try_from(record_number) else {
-        post_diag(&mut state, ERR_INVALID_DESCRIPTOR_INDEX);
+        post_diag(state, ERR_INVALID_DESCRIPTOR_INDEX);
         return SQL_ERROR;
     };
     // Growing on demand, same as SQLSetDescFieldW's per-record-field growth:
@@ -171,7 +195,7 @@ fn sql_set_desc_rec_safe(
     // record write, which can grow SQL_DESC_COUNT even if a setter further
     // down this sequence later fails.
     if count > state.records.len() {
-        state.set_record_count(count, desc.kind);
+        state.set_record_count(count, kind);
     }
 
     // Order matters, and matches the field list order the ODBC spec itself
@@ -182,7 +206,7 @@ fn sql_set_desc_rec_safe(
     //   (see `set_type`'s own doc comment) — so it must land before Type.
     // - DataPtr last: `set_data_ptr` reruns the SQL_C_NUMERIC precision/scale
     //   consistency check, which needs Precision/Scale already written.
-    let sub_type_write = write_record_field(&mut state, record_number, |r| {
+    let sub_type_write = write_record_field(state, record_number, |r| {
         r.datetime_interval_code = sub_type;
         r.explicitly_bound = true;
     });
@@ -190,8 +214,8 @@ fn sql_set_desc_rec_safe(
         return sub_type_write;
     }
     let type_write = set_type(
-        &mut state,
-        desc.kind,
+        state,
+        kind,
         record_number,
         SQL_DESC_TYPE,
         field_type as SqlPointer,
@@ -199,34 +223,34 @@ fn sql_set_desc_rec_safe(
     if type_write != SQL_SUCCESS {
         return type_write;
     }
-    let length_write = write_record_field(&mut state, record_number, |r| {
+    let length_write = write_record_field(state, record_number, |r| {
         r.octet_length = length;
         r.explicitly_bound = true;
     });
     if length_write != SQL_SUCCESS {
         return length_write;
     }
-    let precision_write = set_precision(&mut state, record_number, precision as SqlPointer);
+    let precision_write = set_precision(state, record_number, precision as SqlPointer);
     if precision_write != SQL_SUCCESS {
         return precision_write;
     }
-    let scale_write = set_scale(&mut state, desc.kind, record_number, scale as SqlPointer);
+    let scale_write = set_scale(state, kind, record_number, scale as SqlPointer);
     if scale_write != SQL_SUCCESS {
         return scale_write;
     }
-    let string_length_write = write_record_field(&mut state, record_number, |r| {
+    let string_length_write = write_record_field(state, record_number, |r| {
         r.octet_length_ptr = string_length_ptr as SqlPointer
     });
     if string_length_write != SQL_SUCCESS {
         return string_length_write;
     }
-    let indicator_write = write_record_field(&mut state, record_number, |r| {
+    let indicator_write = write_record_field(state, record_number, |r| {
         r.indicator_ptr = indicator_ptr as SqlPointer
     });
     if indicator_write != SQL_SUCCESS {
         return indicator_write;
     }
-    let data_ptr_write = set_data_ptr(&mut state, record_number, data_ptr);
+    let data_ptr_write = set_data_ptr(state, record_number, data_ptr);
     if data_ptr_write != SQL_SUCCESS {
         return data_ptr_write;
     }

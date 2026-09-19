@@ -1414,6 +1414,7 @@ impl StmtState {
             );
         }
     }
+
     /// Resets all data-at-execution streaming state and hands back the parked
     /// client, if the sequence still held one. Call after a DAE sequence
     /// completes, is cancelled, or fails.
@@ -1478,6 +1479,23 @@ unsafe impl Send for StmtHandle {}
 unsafe impl Sync for StmtHandle {}
 
 impl StmtHandle {
+    /// Called after releasing descriptor locks. Records beyond this SQL's
+    /// markers cannot change its prepared declaration.
+    pub(crate) fn invalidate_parameter_definition(&self, first_changed: usize) -> Result<(), ()> {
+        let Ok(mut state) = self.inner.lock() else {
+            error!("invalidating parameter definition: stmt mutex poisoned");
+            return Err(());
+        };
+        if state
+            .prepared
+            .as_ref()
+            .is_some_and(|plan| first_changed <= plan.marker_count)
+        {
+            state.orphan_prepared_handle();
+        }
+        Ok(())
+    }
+
     /// `query_timeout` is the parent connection's current
     /// [`DbcState::stmt_query_timeout`](crate::handles::dbc::DbcState); a
     /// statement starts at the connection-level default rather than always at
