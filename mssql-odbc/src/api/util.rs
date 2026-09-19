@@ -324,10 +324,11 @@ mod tests {
                 let pair = [first, second];
                 let mut bytes = vec![0xff];
                 bytes.extend(pair.into_iter().flat_map(u16::to_le_bytes));
-                let mut out = [0xAA_u8; 9];
-                assert!(!unsafe {
-                    copy_utf16le_with_nul(out.as_mut_ptr().add(1).cast(), 3, &bytes[1..])
-                });
+                let mut storage = crate::test_support::AlignedBuffer([0xAA_u8; 9]);
+                let out = &mut storage.0;
+                let destination = out.as_mut_ptr().wrapping_add(1).cast::<SqlWChar>();
+                assert!(!destination.is_aligned());
+                assert!(!unsafe { copy_utf16le_with_nul(destination, 3, &bytes[1..]) });
                 assert_eq!(&out[1..5], &bytes[1..]);
                 assert_eq!(&out[5..], &[0, 0, 0xAA, 0xAA]);
                 assert_eq!(out[0], 0xAA);
@@ -345,7 +346,8 @@ mod tests {
         fn wide_copies_respect_capacity_at_a_byte_offset() {
             for text in ["", "a", "a\u{1f600}b"] {
                 let source: Vec<u16> = text.encode_utf16().collect();
-                for direct_encoding in [false, true] {
+                let bytes: Vec<u8> = source.iter().flat_map(|unit| unit.to_le_bytes()).collect();
+                for encoding in 0..3 {
                     for capacity in 0..=source.len() + 2 {
                         let mut storage = AlignedBuffer([0xA5u8; 17]);
                         assert!(capacity * size_of::<u16>() < storage.0.len());
@@ -354,10 +356,10 @@ mod tests {
                             assert!(!ptr.is_aligned());
                             // The displaced destination has room for every declared unit.
                             let truncated = unsafe {
-                                if direct_encoding {
-                                    copy_utf16_with_nul(ptr, capacity, text)
-                                } else {
-                                    copy_with_nul(ptr, capacity, &source)
+                                match encoding {
+                                    0 => copy_with_nul(ptr, capacity, &source),
+                                    1 => copy_utf16_with_nul(ptr, capacity, text),
+                                    _ => copy_utf16le_with_nul(ptr, capacity, &bytes),
                                 }
                             };
                             assert_eq!(truncated, source.len() > capacity.saturating_sub(1));
@@ -385,16 +387,17 @@ mod tests {
         fn wide_copies_initialize_only_the_written_prefix() {
             let text = "a\u{1f600}b";
             let source: Vec<u16> = text.encode_utf16().collect();
-            for direct_encoding in [false, true] {
+            let bytes: Vec<u8> = source.iter().flat_map(|unit| unit.to_le_bytes()).collect();
+            for encoding in 0..3 {
                 for capacity in [0usize, 1, 2, 5] {
                     let mut storage = [MaybeUninit::<u16>::uninit(); 5];
                     let ptr = storage.as_mut_ptr().cast::<u16>();
                     // The output is writable but has no initialized value to read.
                     let truncated = unsafe {
-                        if direct_encoding {
-                            copy_utf16_with_nul(ptr, capacity, text)
-                        } else {
-                            copy_with_nul(ptr, capacity, &source)
+                        match encoding {
+                            0 => copy_with_nul(ptr, capacity, &source),
+                            1 => copy_utf16_with_nul(ptr, capacity, text),
+                            _ => copy_utf16le_with_nul(ptr, capacity, &bytes),
                         }
                     };
                     assert_eq!(truncated, source.len() > capacity.saturating_sub(1));
