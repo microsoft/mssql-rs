@@ -4481,6 +4481,73 @@ mod tests {
     }
 
     #[test]
+    fn null_data_descriptors_do_not_reach_encoded_delivery() {
+        use mssql_tds::token::tokens::SqlCollation;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let mut indicators = [SQL_NULL_DATA; 4];
+        let mut lengths = [-99 as SqlLen; 4];
+        let ard = h.ard();
+        for (field, value) in [
+            (SQL_DESC_CONCISE_TYPE, SQL_C_WCHAR as isize as SqlPointer),
+            (SQL_DESC_DATA_PTR, ptr::null_mut()),
+            (SQL_DESC_INDICATOR_PTR, indicators.as_mut_ptr().cast()),
+            (SQL_DESC_OCTET_LENGTH_PTR, lengths.as_mut_ptr().cast()),
+        ] {
+            assert_eq!(
+                unsafe {
+                    crate::api::set_desc_field::sql_set_desc_field_w(
+                        ard,
+                        1,
+                        field as SqlSmallInt,
+                        value,
+                        0,
+                    )
+                },
+                SQL_SUCCESS
+            );
+        }
+        let descriptor = unsafe { handle_from_raw::<DescHandle>(ard) };
+        let bindings = {
+            let state = descriptor.inner.lock().unwrap();
+            assert!(state.records[0].data_ptr.is_null());
+            assert_eq!(
+                state.records[0].indicator_ptr,
+                indicators.as_mut_ptr().cast()
+            );
+            assert_eq!(
+                state.records[0].octet_length_ptr,
+                lengths.as_mut_ptr().cast()
+            );
+            ColumnBinding::all_from_ard_state(&state)
+        };
+        assert!(bindings.is_empty());
+
+        let cp1252 = EncodingType::LcidBased(SqlCollation {
+            info: 0x0409,
+            lcid_language_id: 0x0409,
+            col_flags: 0,
+            sort_id: 0,
+        });
+        for (encoding, bytes) in [
+            (cp1252, &[0x80][..]),
+            (EncodingType::Utf16, &[0x00, 0xD8][..]),
+            (EncodingType::Utf8, b"A".as_slice()),
+        ] {
+            for row in [0, 2] {
+                for offset in [0, 1] {
+                    let mut writer = BoundRowWriter::new(&bindings, row, offset);
+                    writer.write_string(0, Cow::Borrowed(bytes), encoding);
+                    assert_eq!(writer.outcome, RowOutcome::Success);
+                    assert_eq!(writer.last_column_read, 0);
+                    assert_eq!(indicators, [SQL_NULL_DATA; 4]);
+                    assert_eq!(lengths, [-99; 4]);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn cp1252_bound_borrowed_materialized_and_output_slots_match() {
         use mssql_tds::token::tokens::SqlCollation;
         let encoding = EncodingType::LcidBased(SqlCollation {
