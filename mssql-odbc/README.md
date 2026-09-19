@@ -223,6 +223,9 @@ Bound and row-wise wide-string delivery copy complete UTF-16 code units without
 decoding them. This preserves unpaired surrogates, BOM-like units, and embedded
 NULs for the application's decoding policy; actual encoding conversions remain
 separate. Incomplete (odd-byte) values do not enter the raw-unit copy path.
+Bound buffers trim a real surrogate pair if truncation would split it, but keep
+already-unpaired units. `SQLGetData` can split a pair across calls because the
+caller retrieves the remaining units on its next call.
 
 ## Parameter array results
 
