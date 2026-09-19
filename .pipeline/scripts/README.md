@@ -24,6 +24,52 @@ See `.pipeline/docs/arm-sql-host-design.md` for the full design.
 
 ## Scripts
 
+### clone-mssql-python.sh
+
+Both the macOS cross-repo tests and the full upstream suite against the Rust
+ODBC replacement use the full commit SHA in
+[`../mssql-python-revision.txt`](../mssql-python-revision.txt). The script fetches
+that commit directly, checks it out detached, and logs and verifies HEAD.
+Missing, malformed, or unavailable pins fail the job; there is no branch fallback
+or PR-description override.
+
+From the repository root, with Bash and Git installed, reproduce the checkout:
+
+```bash
+bash .pipeline/scripts/clone-mssql-python.sh
+```
+
+The default destination is `../mssql-python` and must not already exist. To avoid
+touching a developer checkout, select a new destination explicitly:
+
+```bash
+MSSQL_PYTHON_CLONE_DIR=/tmp/mssql-python-pinned bash .pipeline/scripts/clone-mssql-python.sh
+```
+
+Existing local workflows such as `dev/test-python.sh --mssql-python` still use
+the developer's sibling checkout; only use the pinned checkout when reproducing
+CI. A source pin does not freeze container tags or package indexes.
+
+To update manually, inspect
+`https://github.com/microsoft/mssql-python/compare/<old-sha>...<new-sha>`,
+replace the pin with the reviewed full lowercase SHA, and open a draft PR.
+Run the script tests (`python -m unittest discover -s .pipeline/scripts -p
+'test_*.py'`) and repository checks, then require both cross-repo jobs to pass on
+that exact proposed pin before merging. Revert a broken pin-update commit in a
+new PR rather than falling back to upstream main. Scheduled update PRs are a
+separate follow-up in #605.
+
+Keep the pin under `.pipeline/`: the public PR pipeline's configured path
+exclusions cover documentation and `.github/`, not `.pipeline/`. Both cross-repo
+jobs run in `Build_mssql_python` on PRs. Duplicate validation is reusable only
+for a successful run of the same PR head SHA; a pin edit changes that SHA and
+must receive fresh validation. Do not exclude the pin from the pipeline's
+server-side PR trigger filters.
+
+The initial candidate came from historical green build 176345. That is not
+evidence that it passes on a newer mssql-rs revision; the pin PR's current
+cross-repo results are the acceptance check.
+
 ### Generate-SqlCertificates.ps1
 Generates and installs self-signed certificates for SQL Server TLS encryption.
 
