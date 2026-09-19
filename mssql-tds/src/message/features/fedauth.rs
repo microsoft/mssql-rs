@@ -101,13 +101,19 @@ impl FedAuthFeature {
             TdsAuthenticationMethod::ActiveDirectoryDeviceCodeFlow => {
                 Ok(active_directory_device_code_flow)
             }
-            TdsAuthenticationMethod::ActiveDirectoryManagedIdentity => {
-                Ok(active_directory_managed_identity)
-            }
+            TdsAuthenticationMethod::ActiveDirectoryManagedIdentity
+            | TdsAuthenticationMethod::ActiveDirectoryMSI => Ok(active_directory_managed_identity),
             TdsAuthenticationMethod::ActiveDirectoryWorkloadIdentity => {
                 Ok(active_directory_workload_identity)
             }
-            TdsAuthenticationMethod::ActiveDirectoryDefault => {
+            // Every remaining flow resolves to a bearer token out of band, so the
+            // server is told the same thing as for any other non-password credential.
+            TdsAuthenticationMethod::ActiveDirectoryDefault
+            | TdsAuthenticationMethod::ActiveDirectoryAzCli
+            | TdsAuthenticationMethod::ActiveDirectoryAzureDeveloperCli
+            | TdsAuthenticationMethod::ActiveDirectoryAzurePipelines
+            | TdsAuthenticationMethod::ActiveDirectoryEnvironment
+            | TdsAuthenticationMethod::ActiveDirectoryClientAssertion => {
                 Ok(active_directory_token_credential)
             }
             _ => Err(crate::error::Error::ProtocolError(format!(
@@ -231,6 +237,45 @@ mod unittests {
     fn test_get_work_flow_identifier_unsupported() {
         let feature = FedAuthFeature::new(TdsAuthenticationMethod::Password, None, false);
         assert!(feature.get_work_flow_identifier().is_err());
+    }
+
+    /// Every credential that resolves to a bearer token out of band is announced
+    /// to the server the same way, so a new one must not silently fall through
+    /// to the unsupported arm.
+    #[test]
+    fn token_credential_flows_share_one_workflow_identifier() {
+        for method in [
+            TdsAuthenticationMethod::ActiveDirectoryDefault,
+            TdsAuthenticationMethod::ActiveDirectoryAzCli,
+            TdsAuthenticationMethod::ActiveDirectoryAzureDeveloperCli,
+            TdsAuthenticationMethod::ActiveDirectoryAzurePipelines,
+            TdsAuthenticationMethod::ActiveDirectoryEnvironment,
+            TdsAuthenticationMethod::ActiveDirectoryClientAssertion,
+        ] {
+            let name = format!("{method:?}");
+            let feature = FedAuthFeature::new(method, None, false);
+            assert_eq!(
+                feature.get_work_flow_identifier().unwrap(),
+                0x03,
+                "{name} should announce the interactive identifier"
+            );
+        }
+    }
+
+    /// MSI is managed identity; the two spellings had been separate arms
+    /// returning different constants.
+    #[test]
+    fn msi_and_managed_identity_agree() {
+        let msi = FedAuthFeature::new(TdsAuthenticationMethod::ActiveDirectoryMSI, None, false);
+        let managed = FedAuthFeature::new(
+            TdsAuthenticationMethod::ActiveDirectoryManagedIdentity,
+            None,
+            false,
+        );
+        assert_eq!(
+            msi.get_work_flow_identifier().unwrap(),
+            managed.get_work_flow_identifier().unwrap()
+        );
     }
 
     #[test]

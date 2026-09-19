@@ -660,6 +660,142 @@ mod query_result_reads {
         run_query_and_check_results(&mut connection, "SELECT 1".to_string(), &expected).await;
     }
 
+    /// With deferral on, a statement that fails mid-batch no longer hides the
+    /// result sets after it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deferred_errors_expose_result_sets_after_the_failing_statement() {
+        let mut connection = begin_connection(&build_tcp_datasource()).await;
+        connection.set_defer_batch_errors(true);
+
+        connection
+            .execute(
+                "SELECT 1 AS a; RAISERROR('boom', 16, 1); SELECT 2 AS b;".to_string(),
+                (),
+            )
+            .await
+            .unwrap();
+
+        let mut values = Vec::new();
+        loop {
+            if connection.on_rows() {
+                while let Some(row) = connection.next_row().await.unwrap() {
+                    if let ColumnValues::Int(v) = row[0] {
+                        values.push(v);
+                    }
+                }
+            }
+            if !connection.advance_to_rows().await.unwrap() {
+                break;
+            }
+        }
+        connection.close_query().await.unwrap();
+
+        assert_eq!(
+            values,
+            vec![1, 2],
+            "both result sets should be reachable across the error"
+        );
+
+        let errors = connection.take_pending_errors();
+        assert_eq!(errors.len(), 1, "the error should still be reported");
+        assert!(errors[0].message.contains("boom"), "got {:?}", errors[0]);
+
+        // The connection is still usable afterwards.
+        let expected = [ExpectedQueryResultType::Result(1)];
+        run_query_and_check_results(&mut connection, "SELECT 1".to_string(), &expected).await;
+    }
+
+    /// Deferral is opt-in: without it the batch still ends at the first error.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn batch_errors_still_end_the_batch_by_default() {
+        let mut connection = begin_connection(&build_tcp_datasource()).await;
+
+        connection
+            .execute(
+                "SELECT 1 AS a; RAISERROR('boom', 16, 1); SELECT 2 AS b;".to_string(),
+                (),
+            )
+            .await
+            .unwrap();
+
+        let mut hit_error = false;
+        loop {
+            if connection.on_rows() {
+                while let Ok(Some(_)) = connection.next_row().await {}
+            }
+            match connection.advance_to_rows().await {
+                Ok(true) => continue,
+                Ok(false) => break,
+                Err(SqlServerError { .. }) => {
+                    hit_error = true;
+                    break;
+                }
+                Err(e) => panic!("Expected SqlServerError, got: {e:?}"),
+            }
+        }
+        assert!(hit_error, "the default should surface the error as Err");
+        assert!(
+            connection.take_pending_errors().is_empty(),
+            "nothing should be deferred when the mode is off"
+        );
+    }
+
+    /// A DML batch reports one count per statement, in order, rather than a
+    /// running total — which is what a tool printing "(N rows affected)" after
+    /// each statement needs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn done_row_counts_arrive_one_per_statement() {
+        let mut connection = begin_connection(&build_tcp_datasource()).await;
+
+        connection
+            .execute(
+                "CREATE TABLE #counts (i int); \
+                 INSERT INTO #counts VALUES (1), (2), (3); \
+                 UPDATE #counts SET i = i * 2 WHERE i > 1; \
+                 DELETE FROM #counts;"
+                    .to_string(),
+                (),
+            )
+            .await
+            .unwrap();
+        while connection.advance_to_rows().await.unwrap() {}
+        connection.close_query().await.unwrap();
+
+        // CREATE reports no count; the three DML statements report 3, 2 and 3.
+        assert_eq!(
+            connection.take_done_row_counts(),
+            vec![None, Some(3), Some(2), Some(3)]
+        );
+        assert!(
+            connection.take_done_row_counts().is_empty(),
+            "taking the counts should empty the log"
+        );
+    }
+
+    /// `SET NOCOUNT ON` suppresses the count itself, which must read as "no
+    /// count reported" rather than "affected zero rows".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn nocount_reports_none_not_zero() {
+        let mut connection = begin_connection(&build_tcp_datasource()).await;
+
+        connection
+            .execute(
+                "SET NOCOUNT ON; CREATE TABLE #nc (i int); INSERT INTO #nc VALUES (1), (2);"
+                    .to_string(),
+                (),
+            )
+            .await
+            .unwrap();
+        while connection.advance_to_rows().await.unwrap() {}
+        connection.close_query().await.unwrap();
+
+        let counts = connection.take_done_row_counts();
+        assert!(
+            counts.iter().all(Option::is_none),
+            "no statement should report a count under SET NOCOUNT ON, got {counts:?}"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_error_within_batch() {
         let mut connection = begin_connection(&build_tcp_datasource()).await;

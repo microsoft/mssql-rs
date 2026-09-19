@@ -499,6 +499,14 @@ pub struct TdsClient {
     /// [`take_dml_result_counts`](Self::take_dml_result_counts).
     dml_result_counts: Vec<i64>,
     prepared_batch: Option<Box<PreparedBatchReadState>>,
+    /// Row counts from each DONE token of the current request, in arrival order.
+    done_row_counts: Vec<Option<u64>>,
+    /// When set, errors in a batch are collected while later results are read.
+    defer_batch_errors: bool,
+    /// Errors collected under [`Self::defer_batch_errors`], in arrival order.
+    pending_errors: Vec<SqlErrorInfo>,
+    /// An ERROR token has been collected whose closing DONE has not arrived.
+    unreported_error: bool,
 
     pub(in crate::connection) return_values: Vec<ReturnValue>,
     info_messages: Vec<SqlInfoMessage>,
@@ -664,6 +672,10 @@ impl TdsClient {
             last_rows_affected: -1,
             dml_result_counts: Vec::new(),
             prepared_batch: None,
+            done_row_counts: Vec::new(),
+            defer_batch_errors: false,
+            pending_errors: Vec::new(),
+            unreported_error: false,
             return_values: Vec::new(),
             info_messages: Vec::new(),
             prepared_param_encryption: HashMap::new(),
@@ -4998,7 +5010,7 @@ impl TdsClient {
                         done.has_more()
                     );
 
-                    if done.has_error() {
+                    if done.has_error() && !self.consumed_pending_error() {
                         return Err(crate::error::Error::ProtocolError(
                             "Server reported error in DONE token without preceding ERROR token"
                                 .to_string(),
@@ -5008,6 +5020,7 @@ impl TdsClient {
                     let count = self.count_map.entry(done.cur_cmd).or_insert(0);
                     // Use saturating_add to prevent integer overflow from malicious/corrupted TDS responses
                     *count = count.saturating_add(done.row_count);
+                    self.record_done_row_count(&done);
                     self.current_result_set_has_been_read_till_end = true;
                     self.current_result_ended_with_done_in_proc = is_done_in_proc;
 
@@ -5131,6 +5144,11 @@ impl TdsClient {
                 }
                 Tokens::Error(error_token) => {
                     info!(?error_token);
+                    if self.defer_batch_errors {
+                        self.pending_errors.push(SqlErrorInfo::from(&error_token));
+                        self.unreported_error = true;
+                        continue;
+                    }
                     let mut all_errors = vec![self.record_error_token(&error_token)];
                     let drain_result = self.drain_stream().await;
                     // Reset batch state before propagating: the error terminates
@@ -7517,6 +7535,11 @@ impl TdsClient {
             }
             Tokens::Error(error_token) => {
                 info!(?error_token);
+                if self.defer_batch_errors {
+                    self.pending_errors.push(SqlErrorInfo::from(&error_token));
+                    self.unreported_error = true;
+                    return Ok(None);
+                }
                 if self.prepared_batch.is_some() {
                     self.record_error_token(&error_token);
                     return Ok(None);
@@ -7567,7 +7590,9 @@ impl TdsClient {
     ) -> TdsResult<Option<bool>> {
         info!("done while get_next_row: {:?}", done);
 
-        if done.has_error() && self.prepared_batch.is_none() {
+        // A deferred error was already collected and will be reported by the
+        // caller, so it does not make this DONE a protocol violation.
+        if done.has_error() && self.prepared_batch.is_none() && !self.consumed_pending_error() {
             return Err(crate::error::Error::ProtocolError(
                 "Server reported error in DONE token without preceding ERROR token".to_string(),
             ));
@@ -7575,6 +7600,7 @@ impl TdsClient {
 
         let count = self.count_map.entry(done.cur_cmd).or_insert(0);
         *count = count.saturating_add(done.row_count);
+        self.record_done_row_count(&done);
         self.current_result_set_has_been_read_till_end = true;
         self.current_result_ended_with_done_in_proc = ended_with_done_in_proc;
         let has_more = done.has_more() || self.prepared_batch.is_some();
@@ -7593,6 +7619,54 @@ impl TdsClient {
     /// or after [`advance_to_rows()`](Self::advance_to_rows) returns `false`).
     pub fn get_return_values(&self) -> Vec<ReturnValue> {
         self.return_values.clone()
+    }
+
+    /// Whether the DONE token now being handled is the one closing a statement
+    /// whose ERROR token was already collected.
+    ///
+    /// A DONE carrying the error flag is normally a protocol violation, because
+    /// the ERROR token that explains it should have ended the batch. Under
+    /// [`set_defer_batch_errors`](Self::set_defer_batch_errors) that token was
+    /// collected instead, so the flag is expected exactly once per error.
+    fn consumed_pending_error(&mut self) -> bool {
+        std::mem::take(&mut self.unreported_error)
+    }
+
+    /// Collects mid-batch errors instead of ending the batch at the first one.
+    ///
+    /// A batch such as `SELECT 1; RAISERROR('boom', 16, 1); SELECT 2` normally
+    /// returns the error and abandons the rest, so the second result set is
+    /// unreachable. With deferral on, iteration follows the DONE tokens'
+    /// `has_more` flag to the end and the errors are retrieved with
+    /// [`take_pending_errors`](Self::take_pending_errors). Tools that mirror a
+    /// server-side batch — `sqlcmd` and friends — need this to interleave rows
+    /// and messages the way the server sent them.
+    ///
+    /// Errors that end the batch outright still surface as `Err`; only those the
+    /// server continued past are deferred.
+    pub fn set_defer_batch_errors(&mut self, defer: bool) {
+        self.defer_batch_errors = defer;
+    }
+
+    /// Takes the errors collected under
+    /// [`set_defer_batch_errors`](Self::set_defer_batch_errors), in arrival order.
+    pub fn take_pending_errors(&mut self) -> Vec<SqlErrorInfo> {
+        std::mem::take(&mut self.pending_errors)
+    }
+
+    /// Row counts reported by each statement of the current or most recent
+    /// command, in arrival order, leaving the log empty.
+    ///
+    /// `None` marks a statement that completed without reporting a count, which
+    /// is what `SET NOCOUNT ON` produces; that is deliberately distinct from
+    /// `Some(0)`, which means the statement ran and affected no rows.
+    pub fn take_done_row_counts(&mut self) -> Vec<Option<u64>> {
+        std::mem::take(&mut self.done_row_counts)
+    }
+
+    fn record_done_row_count(&mut self, done: &DoneToken) {
+        self.done_row_counts
+            .push(done.has_count().then_some(done.row_count));
     }
 
     /// Returns the procedure's `RETURN` value from the most recent RPC, or
@@ -7677,6 +7751,9 @@ impl TdsClient {
         // `SET NOCOUNT ON` / SELECT).
         self.last_rows_affected = -1;
         self.dml_result_counts.clear();
+        self.done_row_counts.clear();
+        self.pending_errors.clear();
+        self.unreported_error = false;
     }
 
     /// The live server handle the client holds for `statement_id`, if any.
@@ -9080,6 +9157,73 @@ mod tests {
             cur_cmd: CurrentCommand::Insert,
             row_count: 0,
         })
+    }
+
+    /// `SET NOCOUNT ON` produces a DONE with no `DONE_COUNT`; the log must be
+    /// able to say "ran, reported nothing", which is not the same as "affected
+    /// zero rows".
+    #[test]
+    fn a_done_without_a_count_is_logged_as_none() {
+        let mut client = create_test_client();
+        let no_count = DoneToken {
+            status: DoneStatus::FINAL,
+            cur_cmd: CurrentCommand::Select,
+            row_count: 7,
+        };
+        let zero_rows = DoneToken {
+            status: DoneStatus::COUNT,
+            cur_cmd: CurrentCommand::Delete,
+            row_count: 0,
+        };
+
+        client.record_done_row_count(&no_count);
+        client.record_done_row_count(&zero_rows);
+
+        assert_eq!(client.take_done_row_counts(), vec![None, Some(0)]);
+    }
+
+    /// Counts arrive one per statement and in order, and taking them empties
+    /// the log so the next command starts clean.
+    #[test]
+    fn done_row_counts_are_per_statement_and_taken_once() {
+        let mut client = create_test_client();
+        for rows in [2_u64, 5, 1] {
+            client.record_done_row_count(&DoneToken {
+                status: DoneStatus::COUNT,
+                cur_cmd: CurrentCommand::Update,
+                row_count: rows,
+            });
+        }
+
+        assert_eq!(
+            client.take_done_row_counts(),
+            vec![Some(2), Some(5), Some(1)]
+        );
+        assert!(client.take_done_row_counts().is_empty());
+    }
+
+    /// The flag excuses exactly one error-flagged DONE. A second one with no
+    /// intervening ERROR is still the protocol violation the check exists for.
+    #[test]
+    fn a_collected_error_excuses_exactly_one_done() {
+        let mut client = create_test_client();
+        assert!(!client.consumed_pending_error());
+
+        client.unreported_error = true;
+        assert!(client.consumed_pending_error());
+        assert!(!client.consumed_pending_error());
+    }
+
+    /// Deferral is off unless asked for, so existing callers keep the
+    /// end-at-first-error behaviour.
+    #[test]
+    fn batch_error_deferral_is_opt_in() {
+        let mut client = create_test_client();
+        assert!(!client.defer_batch_errors);
+
+        client.set_defer_batch_errors(true);
+        assert!(client.defer_batch_errors);
+        assert!(client.take_pending_errors().is_empty());
     }
 
     /// A DONE token carrying the `DONE_COUNT` flag (a DML row count). `more`
