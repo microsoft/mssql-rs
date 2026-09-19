@@ -13,6 +13,7 @@ from urllib.request import Request, urlopen
 
 CRATES = ("mssql-tds", "mssql-mock-tds")
 BUMP_BRANCH = "automation/bump-released-crate-versions"
+ISSUE_LABEL = "automation:crate-version-bump"
 ISSUE_MARKER = "<!-- mssql-rs:released-crate-version-bump -->"
 
 
@@ -99,9 +100,9 @@ def ensure_bump_issue(summary, crates):
     owner, name = os.environ["GITHUB_REPOSITORY"].split("/")
     # The REST listing can lag writes; use the direct issues connection, not search.
     query = """
-    query($owner: String!, $name: String!, $endCursor: String) {
+    query($owner: String!, $name: String!, $label: String!, $endCursor: String) {
       repository(owner: $owner, name: $name) {
-        issues(first: 100, after: $endCursor, states: OPEN) {
+        issues(first: 100, after: $endCursor, states: OPEN, labels: [$label]) {
           nodes { number body }
           pageInfo { hasNextPage endCursor }
         }
@@ -110,7 +111,7 @@ def ensure_bump_issue(summary, crates):
     """
     result = subprocess.run(
         ["gh", "api", "graphql", "-f", f"query={query}", "-f", f"owner={owner}",
-         "-f", f"name={name}", "--paginate", "--slurp"],
+         "-f", f"name={name}", "-f", f"label={ISSUE_LABEL}", "--paginate", "--slurp"],
         check=True, stdout=subprocess.PIPE, text=True,
     )
     matches = [
@@ -157,7 +158,14 @@ def ensure_bump_issue(summary, crates):
         endpoint += f"/{matches[0]['number']}"
         method = "PATCH"
     else:
+        subprocess.run(
+            ["gh", "label", "create", ISSUE_LABEL, "--repo", os.environ["GITHUB_REPOSITORY"],
+             "--color", "0e8a16", "--description", "Tracking issues for automated Rust crate version bumps",
+             "--force"],
+            check=True, stdout=subprocess.PIPE, text=True,
+        )
         payload["title"] = "Bump released crates to the next minor version"
+        payload["labels"] = [ISSUE_LABEL]
         method = "POST"
     result = subprocess.run(
         ["gh", "api", endpoint, "--method", method, "--input", "-"],

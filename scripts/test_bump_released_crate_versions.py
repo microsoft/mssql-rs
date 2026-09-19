@@ -291,18 +291,28 @@ def test_issue_created_once_then_reused_and_updated(monkeypatch):
     monkeypatch.setenv("DEFAULT_BRANCH", "release/next")
     stored = []
     writes = []
+    labels_created = []
 
     def github(args, **kwargs):
         assert kwargs["check"] is True
         assert kwargs["stdout"] is subprocess.PIPE
         assert "stderr" not in kwargs  # API diagnostics remain visible in the job log.
+        if args[:3] == ["gh", "label", "create"]:
+            assert args[3] == bump.ISSUE_LABEL
+            assert args[args.index("--repo") + 1] == "microsoft/mssql-rs"
+            assert "--force" in args
+            labels_created.append(args[3])
+            return subprocess.CompletedProcess(args, 0, stdout="")
         endpoint = "repos/microsoft/mssql-rs/issues"
         if "--method" not in args:
             assert args[:3] == ["gh", "api", "graphql"]
-            assert args[5:] == ["-f", "owner=microsoft", "-f", "name=mssql-rs", "--paginate", "--slurp"]
-            assert "issues(first: 100, after: $endCursor, states: OPEN)" in args[4]
+            assert args[5:] == [
+                "-f", "owner=microsoft", "-f", "name=mssql-rs",
+                "-f", f"label={bump.ISSUE_LABEL}", "--paginate", "--slurp",
+            ]
+            assert "issues(first: 100, after: $endCursor, states: OPEN, labels: [$label])" in args[4]
             assert "pageInfo { hasNextPage endCursor }" in args[4]
-            # The matching issue is on the second page.
+            # Labeled but unrelated issues must not be overwritten.
             pages = issue_pages([
                 {"number": 10, "body": "Unrelated"},
                 {"number": 11, "body": None},
@@ -318,9 +328,11 @@ def test_issue_created_once_then_reused_and_updated(monkeypatch):
         if method == "POST":
             assert not stored
             assert payload["title"] == "Bump released crates to the next minor version"
+            assert payload["labels"] == [bump.ISSUE_LABEL]
             stored.append({"number": 123, **payload})
         else:
             assert method == "PATCH"
+            assert "labels" not in payload
             stored[0].update(payload)
         return subprocess.CompletedProcess(args, 0, stdout=json.dumps(stored[0]))
 
@@ -330,6 +342,7 @@ def test_issue_created_once_then_reused_and_updated(monkeypatch):
         assert writes == ["POST"]
         assert bump.ensure_bump_issue("Both bumps", bump.CRATES) == 123
     assert writes == ["POST", "PATCH"]
+    assert labels_created == [bump.ISSUE_LABEL]
     assert len(stored) == 1
     assert stored[0]["body"].startswith(bump.ISSUE_MARKER)
     assert "Both bumps" in stored[0]["body"]
@@ -353,15 +366,19 @@ def test_issue_created_once_then_reused_and_updated(monkeypatch):
             assert f"### {field['attributes']['label']}\n" in stored[0]["body"]
 
 
-@pytest.mark.parametrize("operation", ["list", "create", "update"])
+@pytest.mark.parametrize("operation", ["list", "label", "create", "update"])
 def test_issue_api_errors_propagate(monkeypatch, operation):
     monkeypatch.setenv("GITHUB_REPOSITORY", "microsoft/mssql-rs")
     monkeypatch.setenv("DEFAULT_BRANCH", "main")
     failure = subprocess.CalledProcessError(1, "gh")
     pages = [[{"number": 123, "body": bump.ISSUE_MARKER}]] if operation == "update" else [[]]
-    results = [failure] if operation == "list" else [
-        subprocess.CompletedProcess("gh", 0, stdout=issue_pages(*pages)), failure
-    ]
+    listed = subprocess.CompletedProcess("gh", 0, stdout=issue_pages(*pages))
+    results = {
+        "list": [failure],
+        "label": [listed, failure],
+        "create": [listed, subprocess.CompletedProcess("gh", 0, stdout=""), failure],
+        "update": [listed, failure],
+    }[operation]
     with patch.object(bump.subprocess, "run", side_effect=results) as github:
         with pytest.raises(subprocess.CalledProcessError):
             bump.ensure_bump_issue("Bump", bump.CRATES)

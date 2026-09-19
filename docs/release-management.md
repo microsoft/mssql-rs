@@ -95,7 +95,10 @@ then choose one of these options:
 
 For either option, include `Fixes #<issue-number>` in the PR description and
 complete validation and review before merging.
-The issue is identified by a marker in its body; keep that marker when editing it.
+The workflow queries only open issues labeled `automation:crate-version-bump`,
+then checks the hidden marker in their bodies before reusing or updating one.
+Keep both the label and marker when editing the issue. The label is created
+automatically when needed; multiple matching open issues fail the run for manual cleanup.
 If issue creation fails after the push, rerunning reuses the prepared branch.
 When no bump is needed, no branch or issue is changed. If a bump becomes
 unnecessary, close its issue and any unmerged PR manually.
