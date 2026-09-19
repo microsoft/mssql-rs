@@ -19,14 +19,13 @@ jobs:
         with:
           ref: dev/saurabh/crates-version-check
           persist-credentials: true
-      - name: Inspect issue listing visibility
+      - name: Test branch and issue writes twice
         env:
           GH_TOKEN: ${{ github.token }}
           DEFAULT_BRANCH: dev/saurabh/crates-version-check
         run: |
           python3 - <<'PY'
           import importlib.util
-          import json
           import os
           import subprocess
           from pathlib import Path
@@ -35,20 +34,6 @@ jobs:
           spec = importlib.util.spec_from_file_location("bump", root / "scripts" / "bump-released-crate-versions.py")
           bump = importlib.util.module_from_spec(spec)
           spec.loader.exec_module(bump)
-          endpoint = f"repos/{os.environ['GITHUB_REPOSITORY']}/issues"
-          result = subprocess.run(
-              ["gh", "api", f"{endpoint}?state=open&per_page=100", "--paginate", "--slurp",
-               "--header", "Cache-Control: no-cache"],
-              check=True, capture_output=True, text=True,
-          )
-          pages = json.loads(result.stdout)
-          print(f"Pages: {len(pages)}; counts: {[len(page) for page in pages]}")
-          for page in pages:
-              for issue in page:
-                  if issue["number"] in (607, 608, 609, 610):
-                      print(json.dumps(issue))
-          subprocess.run(["gh", "api", f"{endpoint}/609"], check=True)
-          raise SystemExit(0)
           run_id = os.environ["GITHUB_RUN_ID"]
           bump.BUMP_BRANCH = f"automation/crate-version-issue-probe-{run_id}"
           bump.ISSUE_MARKER = f"<!-- mssql-rs:permission-probe-{run_id} -->"

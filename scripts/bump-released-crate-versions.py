@@ -96,16 +96,27 @@ def push_bump_branch(root):
 
 def ensure_bump_issue(summary, crates):
     endpoint = f"repos/{os.environ['GITHUB_REPOSITORY']}/issues"
-    # Avoid both search-index lag and a cached listing from the previous run.
+    owner, name = os.environ["GITHUB_REPOSITORY"].split("/")
+    # The REST listing can lag writes; use the direct issues connection, not search.
+    query = """
+    query($owner: String!, $name: String!, $endCursor: String) {
+      repository(owner: $owner, name: $name) {
+        issues(first: 100, after: $endCursor, states: OPEN) {
+          nodes { number body }
+          pageInfo { hasNextPage endCursor }
+        }
+      }
+    }
+    """
     result = subprocess.run(
-        ["gh", "api", f"{endpoint}?state=open&per_page=100", "--paginate", "--slurp",
-         "--header", "Cache-Control: no-cache"],
+        ["gh", "api", "graphql", "-f", f"query={query}", "-f", f"owner={owner}",
+         "-f", f"name={name}", "--paginate", "--slurp"],
         check=True, stdout=subprocess.PIPE, text=True,
     )
     matches = [
-        issue for page in json.loads(result.stdout) for issue in page
-        if "pull_request" not in issue
-        and (issue.get("body") or "").startswith(ISSUE_MARKER)
+        issue for page in json.loads(result.stdout)
+        for issue in page["data"]["repository"]["issues"]["nodes"]
+        if (issue.get("body") or "").startswith(ISSUE_MARKER)
     ]
     if len(matches) > 1:
         raise ValueError("Multiple open version bump tracking issues; resolve duplicates manually.")

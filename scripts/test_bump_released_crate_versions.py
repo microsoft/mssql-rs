@@ -280,6 +280,12 @@ def test_push_failure_does_not_create_issue(workflow_environment):
     issue.assert_not_called()
 
 
+def issue_pages(*pages):
+    return json.dumps([
+        {"data": {"repository": {"issues": {"nodes": page}}}} for page in pages
+    ])
+
+
 def test_issue_created_once_then_reused_and_updated(monkeypatch):
     monkeypatch.setenv("GITHUB_REPOSITORY", "microsoft/mssql-rs")
     monkeypatch.setenv("DEFAULT_BRANCH", "release/next")
@@ -292,16 +298,16 @@ def test_issue_created_once_then_reused_and_updated(monkeypatch):
         assert "stderr" not in kwargs  # API diagnostics remain visible in the job log.
         endpoint = "repos/microsoft/mssql-rs/issues"
         if "--method" not in args:
-            assert args == [
-                "gh", "api", f"{endpoint}?state=open&per_page=100", "--paginate", "--slurp",
-                "--header", "Cache-Control: no-cache"
-            ]
-            # The real issue is on the second page; PRs and unrelated issues must not match.
-            pages = [[
-                {"number": 10, "body": bump.ISSUE_MARKER, "pull_request": {}},
+            assert args[:3] == ["gh", "api", "graphql"]
+            assert args[5:] == ["-f", "owner=microsoft", "-f", "name=mssql-rs", "--paginate", "--slurp"]
+            assert "issues(first: 100, after: $endCursor, states: OPEN)" in args[4]
+            assert "pageInfo { hasNextPage endCursor }" in args[4]
+            # The matching issue is on the second page.
+            pages = issue_pages([
+                {"number": 10, "body": "Unrelated"},
                 {"number": 11, "body": None},
-            ], stored]
-            return subprocess.CompletedProcess(args, 0, stdout=json.dumps(pages))
+            ], stored)
+            return subprocess.CompletedProcess(args, 0, stdout=pages)
         method = args[args.index("--method") + 1]
         writes.append(method)
         assert args == [
@@ -351,7 +357,7 @@ def test_issue_api_errors_propagate(monkeypatch, operation):
     failure = subprocess.CalledProcessError(1, "gh")
     pages = [[{"number": 123, "body": bump.ISSUE_MARKER}]] if operation == "update" else [[]]
     results = [failure] if operation == "list" else [
-        subprocess.CompletedProcess("gh", 0, stdout=json.dumps(pages)), failure
+        subprocess.CompletedProcess("gh", 0, stdout=issue_pages(*pages)), failure
     ]
     with patch.object(bump.subprocess, "run", side_effect=results) as github:
         with pytest.raises(subprocess.CalledProcessError):
@@ -363,7 +369,7 @@ def test_duplicate_tracking_issues_fail_without_writing(monkeypatch):
     monkeypatch.setenv("GITHUB_REPOSITORY", "microsoft/mssql-rs")
     pages = [[{"number": number, "body": bump.ISSUE_MARKER} for number in (123, 456)]]
     with patch.object(bump.subprocess, "run", return_value=subprocess.CompletedProcess(
-        "gh", 0, stdout=json.dumps(pages)
+        "gh", 0, stdout=issue_pages(*pages)
     )) as github:
         with pytest.raises(ValueError, match="Multiple open"):
             bump.ensure_bump_issue("Bump", bump.CRATES)
