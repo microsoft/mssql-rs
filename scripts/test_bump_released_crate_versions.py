@@ -147,6 +147,43 @@ def test_open_bump_pr_ignores_unrelated_crate_mentions(workflow_environment):
         )
 
 
+def test_open_bump_pr_requires_every_selected_crate(workflow_environment):
+    changes = dict.fromkeys(bump.CRATES, ("0.1.7", "0.2.0"))
+    with patch.object(
+        bump.subprocess, "run",
+        return_value=subprocess.CompletedProcess(
+            "gh", 0,
+            stdout=json.dumps([
+                {
+                    "number": 600,
+                    "title": "Bump mssql-tds",
+                    "body": "- `mssql-tds`: `0.1.7` -> `0.2.0`",
+                }
+            ]),
+        ),
+    ):
+        assert not bump.has_open_bump_pr(workflow_environment, changes)
+
+
+def test_open_bump_pr_requires_exact_transition(workflow_environment):
+    with patch.object(
+        bump.subprocess, "run",
+        return_value=subprocess.CompletedProcess(
+            "gh", 0,
+            stdout=json.dumps([
+                {
+                    "number": 601,
+                    "title": "Bump mssql-tds to 0.2.0",
+                    "body": "- `mssql-tds`: `0.1.6` -> `0.2.0`",
+                }
+            ]),
+        ),
+    ):
+        assert not bump.has_open_bump_pr(
+            workflow_environment, {"mssql-tds": ("0.1.7", "0.2.0")}
+        )
+
+
 def test_main_creates_issue_for_planned_bumps(workflow_environment):
     with patch.object(bump, "published_versions", return_value={"0.1.7"}), patch.object(
         bump, "planned_bumps", return_value=dict.fromkeys(bump.CRATES, ("0.1.7", "0.2.0"))
