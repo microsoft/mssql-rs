@@ -121,7 +121,7 @@ def test_has_open_bump_pr(workflow_environment):
             "gh", 0,
             stdout=json.dumps([
                 {"number": 584, "title": "Fix mssql-tds docs", "body": "Mentions mssql-tds only"},
-                {"number": 597, "title": "Bump mssql-tds", "body": "`mssql-tds`: `0.1.7` -> `0.2.0`"},
+                {"number": 597, "title": "Bump mssql-tds", "body": "- `mssql-tds`: `0.1.7` -> `0.2.0`"},
             ]),
         ),
     ) as gh:
@@ -175,6 +175,25 @@ def test_open_bump_pr_requires_exact_transition(workflow_environment):
                     "number": 601,
                     "title": "Bump mssql-tds to 0.2.0",
                     "body": "- `mssql-tds`: `0.1.6` -> `0.2.0`",
+                }
+            ]),
+        ),
+    ):
+        assert not bump.has_open_bump_pr(
+            workflow_environment, {"mssql-tds": ("0.1.7", "0.2.0")}
+        )
+
+
+def test_open_bump_pr_requires_summary_line_format(workflow_environment):
+    with patch.object(
+        bump.subprocess, "run",
+        return_value=subprocess.CompletedProcess(
+            "gh", 0,
+            stdout=json.dumps([
+                {
+                    "number": 602,
+                    "title": "Compatibility notes",
+                    "body": "Compatibility notes for mssql-tds 0.1.7 and 0.2.0",
                 }
             ]),
         ),

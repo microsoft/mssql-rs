@@ -73,7 +73,7 @@ def has_open_bump_pr(root, changes):
     )
     return any(
         all(
-            crate in text and old in text and new in text
+            f"- `{crate}`: `{old}` -> `{new}`" in text
             for crate, (old, new) in changes.items()
         )
         for pr in json.loads(result.stdout)
