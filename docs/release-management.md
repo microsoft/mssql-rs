@@ -46,6 +46,59 @@ PyPI: mssql-python
 
 ## Version Scheme
 
+### Scheduled Rust crate version bumps
+
+The **Bump Released Crate Versions** GitHub workflow checks the default branch
+against crates.io every three UTC days. A daily trigger at 08:23 UTC runs the
+check on days whose Unix day number is divisible by three; unlike `*/3` in the
+day-of-month field, this does not reset at month boundaries. GitHub may delay or
+skip scheduled runs. **Run workflow** bypasses the date check and still targets
+the default branch.
+
+`mssql-tds` and `mssql-mock-tds` are checked independently. If a crate's exact
+`[package].version` exists among its published versions (including older or
+yanked releases), the workflow suggests the next minor version: `0.1.7` becomes
+`0.2.0`. Unpublished source versions and crates that return HTTP 404 are left
+alone. Other registry errors fail the run rather than assuming a crate is
+unpublished. If the proposed next minor version is also published, the run fails
+and a maintainer must choose a new version. A mock-only bump is deferred until
+the current `mssql-tds` version is published, because the mock crate's exact
+versioned dependency must resolve from the registry when it is packaged.
+
+Local versions come from `cargo metadata`. The workflow does not edit files,
+push branches, create PRs, publish crates, merge anything, or change the release
+pipeline's existing version-stamping policy. If a matching open version-bump PR
+already exists, the workflow skips issue creation.
+
+When a bump is needed, the workflow creates or updates one tracking issue labeled
+`crates.io:new-version`. The issue includes:
+
+1. the affected crates and suggested next minor versions;
+2. TOML snippets for the manifest edits, including the mock crate's versioned
+   `mssql-tds` dependency when the core crate is bumped;
+3. crisp maintainer instructions to apply the snippets, run `cargo bfmt`,
+   `cargo bclippy`, and `cargo btest`, then open a PR with
+   `Fixes #<issue-number>`.
+
+The workflow queries only open issues labeled `crates.io:new-version`, then
+checks the hidden marker in their bodies before reusing or updating one. Keep
+both the label and marker when editing the issue. The label is created
+automatically when needed; multiple matching open issues fail the run for manual cleanup.
+When no bump is needed, no issue is changed. If a bump becomes unnecessary, close
+its issue manually.
+
+The shared validation pipeline runs `scripts/test_bump_released_crate_versions.py`
+in its Windows Python test step for both PR validation and main-branch CI.
+Cargo commands and registry/GitHub requests are mocked. Branch tests use local
+temporary Git repositories; no cargo-edit installation or live issue/PR writes
+are needed.
+
+The workflow uses the built-in `GITHUB_TOKEN` with contents read, issues write,
+and pull request read permissions. No custom secret or permission to create PRs
+is needed. Normal validation and review are still required before merging.
+
+### Python and NuGet versions
+
 The NuGet transport package and `mssql-python-rs` Python distribution share the
 version from `mssql-py-core/pyproject.toml`. The Rust crate has an independent
 version in `mssql-py-core/Cargo.toml`. For example, NuGet

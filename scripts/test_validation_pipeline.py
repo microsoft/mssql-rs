@@ -19,6 +19,20 @@ def load_template(name):
     return yaml.safe_load((_TEMPLATES / name).read_text(encoding="utf-8"))
 
 
+def test_version_bump_tests_run_in_shared_validation():
+    stages = load_template("validation-stages.yml")["stages"]
+    build = next(stage for stage in stages if stage["stage"] == "Build")
+    windows = next(job for job in build["jobs"] if job.get("job") == "Build_Windows")
+    step = next(
+        step for step in windows["steps"]
+        if step.get("displayName") == "Unit test packaging scripts and pipeline configuration"
+    )
+    command = next(line for line in step["pwsh"].splitlines() if "python -m pytest" in line)
+    assert "scripts/test_bump_released_crate_versions.py" in command.split()
+    assert step.get("condition", "succeeded()") == "succeeded()"
+    assert not step.get("continueOnError", False)
+
+
 @pytest.mark.parametrize(
     ("job_name", "architecture"), [("Build_Linux", "x64"), ("Build_Linux_ARM", "ARM64")]
 )
