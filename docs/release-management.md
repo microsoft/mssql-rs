@@ -85,8 +85,16 @@ publish crates, or merge anything, and does not change the release pipeline's
 existing version-stamping policy.
 
 After pushing successfully, the workflow creates or updates one tracking issue
-with the version summary and a **Create PR** link. Open the PR yourself, or review
-the existing PR for that branch, and add `Fixes #<issue-number>` to its description.
+with the version summary and a **Create PR** link. Check for an existing PR first,
+then choose one of these options:
+
+1. Click **Create PR** in the issue to open a PR from the prepared branch.
+2. Open the issue's **Assignees** menu and select **Copilot**, if cloud agent is
+   enabled for you and the repository. Ask it to open a PR against the default
+   branch using the prepared branch's changes, without bumping the versions again.
+
+For either option, include `Fixes #<issue-number>` in the PR description and
+complete validation and review before merging.
 The issue is identified by a marker in its body; keep that marker when editing it.
 If issue creation fails after the push, rerunning reuses the prepared branch.
 When no bump is needed, no branch or issue is changed. If a bump becomes
@@ -100,14 +108,13 @@ are needed.
 
 The workflow uses the built-in `GITHUB_TOKEN` with contents and issues write
 permissions. No custom secret or permission to create PRs is needed. Normal
-validation and review are still required before merging the manually opened PR.
+validation and review are still required before merging.
 Later branch pushes use `GITHUB_TOKEN`, so they do not trigger `push` workflows;
 PR synchronization workflows may require **Approve workflows to run**.
 See [GitHub's token behavior](https://docs.github.com/en/actions/concepts/security/github_token#when-github_token-triggers-workflow-runs).
 
-You can manually assign the issue to Copilot when cloud agent is enabled for
-you and the repository. Automatic assignment through the API requires a user
-token, not `GITHUB_TOKEN`, and is not performed by this workflow.
+Copilot assignment is a manual step. Automatic assignment through the API
+requires a user token, not `GITHUB_TOKEN`, and is not performed by this workflow.
 
 ### Python and NuGet versions
 

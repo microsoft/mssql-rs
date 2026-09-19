@@ -338,6 +338,9 @@ def test_issue_created_once_then_reused_and_updated(monkeypatch):
         "[Create PR](https://github.com/microsoft/mssql-rs/compare/"
         "release%2Fnext...automation%2Fbump-released-crate-versions?expand=1)"
     ) in stored[0]["body"]
+    assert "Assign this issue to Copilot through **Assignees**" in stored[0]["body"]
+    assert "open a PR against `release/next`" in stored[0]["body"]
+    assert "Do not bump the versions again." in stored[0]["body"]
     assert "Fixes #<this issue number>" in stored[0]["body"]
     assert "assignees" not in stored[0]
     for crate in bump.CRATES:
