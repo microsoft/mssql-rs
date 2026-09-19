@@ -308,7 +308,7 @@ def test_workflow_scope_and_pr_safety():
     }
     pr = steps[4]
     assert pr["with"]["branch"] == "automation/bump-released-crate-versions"
-    assert pr["with"]["draft"] == "always-true"
+    assert pr["with"]["draft"] is False
     assert set(pr["with"]["add-paths"].split()) == {
         f"{crate}/Cargo.toml" for crate in bump.CRATES
     }

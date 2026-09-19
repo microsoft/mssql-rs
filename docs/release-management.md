@@ -73,8 +73,9 @@ pin. Off-days skip installation. Cargo-edit resolves dependencies, so registry
 access is needed. The crates.io JSON lookup remains separate so an unpublished
 crate can be distinguished from a registry failure.
 
-One draft PR on `automation/bump-released-crate-versions` contains all needed
-bumps. Later checks update that PR rather than opening duplicates. A core crate
+One ready-for-review PR on `automation/bump-released-crate-versions` contains all
+needed bumps. Later checks update that PR rather than opening duplicates or
+returning it to draft. A core crate
 bump also updates the mock crate's versioned local dependency; other local
 consumers use path-only dependencies and need no edits. Cargo lockfiles are
 ignored by this repository. The workflow neither publishes nor merges anything,
@@ -104,7 +105,7 @@ Before enabling the workflow:
   With the fallback `GITHUB_TOKEN`, `pull_request` workflows for `opened`,
   `synchronize`, and `reopened` require a user with write access to select
   **Approve workflows to run**. See [GitHub's token behavior](https://docs.github.com/en/actions/concepts/security/github_token#when-github_token-triggers-workflow-runs).
-  Normal local validation and review are required before marking the draft ready.
+  Normal local validation and review are required before merging.
 
 ### Python and NuGet versions
 

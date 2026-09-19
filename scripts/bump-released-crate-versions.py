@@ -1,7 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""Prepare a draft PR when either source crate version is already on crates.io."""
+"""Prepare a PR when either source crate version is already on crates.io."""
 
 import json
 import os
@@ -93,7 +93,7 @@ def ensure_bump_issue(summary, crates):
         + "\n\n### Alternatives considered\n\nBump the versions manually.\n\n"
         "### Additional context\n\n"
         "Managed by the Bump Released Crate Versions workflow. "
-        "The draft PR links this issue and keeps local versioned dependencies in sync. "
+        "The PR links this issue and keeps local versioned dependencies in sync. "
         "No crates are published by this workflow.\n"
     )
     if matches and matches[0]["body"] == body:

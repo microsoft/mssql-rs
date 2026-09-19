@@ -64,4 +64,4 @@ jobs:
           commit-message: Bump released crates to the next minor version
           title: Bump released crates to the next minor version
           body-path: ${{ runner.temp }}/crate-version-bump-pr.md
-          draft: always-true
+          draft: false
