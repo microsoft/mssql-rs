@@ -2442,6 +2442,119 @@ mod tests {
         s.diag_records.last().unwrap().sql_state
     }
 
+    #[test]
+    fn bound_wide_plp_preserves_units_across_wire_chunks() {
+        use mssql_mock_tds::{ColumnDefinition, ColumnValue, QueryResponse, Row, SqlDataType};
+
+        const PREFIX: usize = 1;
+        const SENTINEL: u16 = 0xCCCC;
+        let cases: [(u16, &[u16], bool); 4] = [
+            (0xD83D, &[], false),
+            (0xD83D, &[0xDE00, 0x42], true),
+            (0xD83D, &[0x42, 0x43], false),
+            (0xDE00, &[0x42, 0x43], false),
+        ];
+        let rows = cases
+            .iter()
+            .map(|(last, tail, _)| {
+                let mut first = vec![0x41; PREFIX];
+                first.push(*last);
+                assert_eq!(first.len() * 2, 4);
+                let mut chunks = vec![first];
+                if !tail.is_empty() {
+                    chunks.push(tail.to_vec());
+                }
+                Row::new(vec![ColumnValue::NVarCharMax(chunks), ColumnValue::Int(42)])
+            })
+            .collect();
+        let response = QueryResponse::new(
+            vec![
+                ColumnDefinition::new("", SqlDataType::NVarCharMax),
+                ColumnDefinition::new("", SqlDataType::Int),
+            ],
+            rows,
+        );
+        // High surrogate, next PLP chunk length, then low surrogate and 'B'.
+        let boundary = [0x3D, 0xD8, 4, 0, 0, 0, 0, 0xDE, 0x42, 0];
+        let wire = mssql_mock_tds::protocol::build_query_result(&response);
+        assert!(wire.windows(boundary.len()).any(|w| w == boundary));
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let _server = crate::test_support::connect_mock_server(dbc, "SELECT raw_units", response);
+        let mut state = dbc.inner.lock().unwrap();
+        let client = state.client.as_mut().unwrap();
+        let mut output = vec![SENTINEL; PREFIX + 4];
+        let mut indicator = SQL_NULL_DATA;
+        let b = binding(
+            1,
+            SQL_C_WCHAR,
+            unsafe { output.as_mut_ptr().add(1).cast() },
+            ((PREFIX + 2) * 2) as SqlLen,
+            &mut indicator,
+        );
+        let mut scratch = [0; 4];
+        assert_eq!(
+            scratch.len(),
+            4,
+            "each read must end at the wire chunk boundary"
+        );
+        for _ in 0..2 {
+            dbc.runtime
+                .block_on(client.execute("SELECT raw_units".to_string(), ()))
+                .unwrap();
+            for (last, tail, trim_pair) in cases {
+                assert!(dbc.runtime.block_on(client.next_row_cursor()).unwrap());
+                assert!(matches!(
+                    dbc.runtime.block_on(client.read_row_column(0)).unwrap(),
+                    CursorColumn::PlpStreaming { .. }
+                ));
+                let outcome = unsafe {
+                    deliver_bound_plp(
+                        client,
+                        &dbc.runtime,
+                        &b,
+                        0,
+                        0,
+                        Some(PlpColumnInfo {
+                            wire_encoding: PlpEncoding::Utf16Text,
+                            text_encoding: Some(EncodingType::Utf16),
+                        }),
+                        &mut scratch,
+                    )
+                }
+                .unwrap();
+                assert_eq!(
+                    outcome,
+                    if tail.is_empty() {
+                        RowOutcome::Success
+                    } else {
+                        RowOutcome::Info(RowIssue::StringTruncated)
+                    }
+                );
+                assert_eq!(indicator, ((PREFIX + 1 + tail.len()) * 2) as SqlLen);
+                assert_eq!(output[0], SENTINEL);
+                assert!(output[1..=PREFIX].iter().all(|unit| *unit == 0x41));
+                let terminator = if trim_pair {
+                    PREFIX + 1
+                } else {
+                    assert_eq!(output[PREFIX + 1], last);
+                    PREFIX + 2
+                };
+                assert_eq!(output[terminator], 0);
+                assert_eq!(output[PREFIX + 3], SENTINEL);
+                assert!(matches!(
+                    dbc.runtime.block_on(client.read_row_column(1)).unwrap(),
+                    CursorColumn::Value {
+                        value: ColumnValues::Int(42),
+                        ..
+                    }
+                ));
+            }
+            assert!(!dbc.runtime.block_on(client.next_row_cursor()).unwrap());
+        }
+    }
+
     /// The `uniqueidentifier` SQL type, the only default-resolved target wide
     /// enough to overrun a plausibly-sized application slot.
     fn guid_columns(n: usize) -> Vec<SqlSmallInt> {
