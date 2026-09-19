@@ -57,7 +57,8 @@ use crate::api::odbc_types::{
 };
 use crate::api::type_rules::resolve_default_c_type;
 use crate::api::util::{
-    copy_cp1252_with_nul, copy_utf16le_with_nul, copy_with_nul, is_cp1252, write_if_some,
+    copy_cp1252_with_nul, copy_utf16le_with_nul, copy_with_nul, is_cp1252, is_surrogate_pair,
+    write_if_some,
 };
 use crate::conversion::datetime::DateTimeParts;
 use crate::conversion::error::{ConvError, ConvOk};
@@ -1947,8 +1948,7 @@ unsafe fn deliver_bound_plp(
             let mut emit = remaining.min(decoded_units.len());
             if emit > 0
                 && emit < decoded_units.len()
-                && (0xD800..=0xDBFF).contains(&decoded_units[emit - 1])
-                && (0xDC00..=0xDFFF).contains(&decoded_units[emit])
+                && is_surrogate_pair(decoded_units[emit - 1], decoded_units[emit])
             {
                 emit -= 1;
             }
@@ -1974,10 +1974,9 @@ unsafe fn deliver_bound_plp(
                 } else {
                     // Look at the first unit that does not fit, even across
                     // chunks: an isolated high surrogate must not be dropped.
-                    if (0xDC00..=0xDFFF).contains(&unit)
-                        && out_units
-                            .last()
-                            .is_some_and(|last| (0xD800..=0xDBFF).contains(last))
+                    if out_units
+                        .last()
+                        .is_some_and(|&last| is_surrogate_pair(last, unit))
                     {
                         out_units.pop();
                     }
@@ -2183,14 +2182,15 @@ unsafe fn copy_bound_utf16le_with_nul(
     capacity: usize,
     bytes: &[u8],
 ) -> bool {
-    let copied = (bytes.len() / 2).min(capacity.saturating_sub(1));
+    let (units, _) = bytes.as_chunks::<2>();
+    let copied = units.len().min(capacity.saturating_sub(1));
     let splits_pair = copied > 0
-        && bytes
-            .get(copied * 2 - 1)
-            .is_some_and(|b| (0xD8..=0xDB).contains(b))
-        && bytes
-            .get(copied * 2 + 1)
-            .is_some_and(|b| (0xDC..=0xDF).contains(b));
+        && units.get(copied).is_some_and(|next| {
+            is_surrogate_pair(
+                u16::from_le_bytes(units[copied - 1]),
+                u16::from_le_bytes(*next),
+            )
+        });
     let capacity = capacity - usize::from(splits_pair);
     // SAFETY: reducing capacity cannot extend the caller's writable range.
     unsafe { copy_utf16le_with_nul(destination, capacity, bytes) }
@@ -2476,6 +2476,8 @@ mod tests {
         s.diag_records.last().unwrap().sql_state
     }
 
+    // The live BoundTruncationPreservesOnlyCompletePairs test covers SQL Server.
+    // This mock additionally forces the pair across a PLP wire-chunk boundary.
     #[test]
     fn bound_wide_plp_preserves_units_across_wire_chunks() {
         use mssql_mock_tds::{ColumnDefinition, ColumnValue, QueryResponse, Row, SqlDataType};

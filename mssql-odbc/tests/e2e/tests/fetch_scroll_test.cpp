@@ -276,6 +276,8 @@ TEST_F(FetchScrollUtf16Test, RawUnitsFitExactBoundCapacity) {
     }
 }
 
+// Live SQL Server reproduction; bound_wide_plp_preserves_units_across_wire_chunks
+// in api/fetch_scroll.rs additionally forces a pair across a PLP chunk boundary.
 TEST_F(FetchScrollUtf16Test, BoundTruncationPreservesOnlyCompletePairs) {
     struct Boundary {
         const char* hex;

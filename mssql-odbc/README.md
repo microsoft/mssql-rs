@@ -231,6 +231,14 @@ Bound buffers trim a real surrogate pair if truncation would split it, but keep
 already-unpaired units. `SQLGetData` can split a pair across calls because the
 caller retrieves the remaining units on its next call.
 
+The native `GetDataUtf16Test` and `FetchScrollUtf16Test` cases reproduce these
+fetch behaviors against SQL Server through the Driver Manager, comparing raw
+units rather than decoded strings. `BoundTruncationPreservesOnlyCompletePairs`
+checks real-server truncation; the Rust
+`bound_wide_plp_preserves_units_across_wire_chunks` test additionally uses a mock
+server to force a surrogate pair across a PLP chunk boundary that a SQL query
+cannot control.
+
 Materialized CP1252 `varchar` values delivered as `SQL_C_WCHAR` decode directly
 to bounded UTF-16 scratch space, without allocating a UTF-8 string or copying
 borrowed source bytes. Each CP1252 byte produces one UTF-16 unit, so repeated

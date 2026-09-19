@@ -60,6 +60,26 @@ pub(crate) unsafe fn copy_cp1252_with_nul(
 /// that clears it on the ODBC-mandated NOT NULL columns after execution.
 pub(crate) const COLMETA_NULLABLE_FLAG: u16 = 0x01;
 
+const UTF16_HIGH_SURROGATE_START: u16 = 0xD800;
+const UTF16_HIGH_SURROGATE_END: u16 = 0xDBFF;
+const UTF16_LOW_SURROGATE_START: u16 = 0xDC00;
+const UTF16_LOW_SURROGATE_END: u16 = 0xDFFF;
+
+#[inline]
+pub(crate) fn is_high_surrogate(unit: u16) -> bool {
+    (UTF16_HIGH_SURROGATE_START..=UTF16_HIGH_SURROGATE_END).contains(&unit)
+}
+
+#[inline]
+fn is_low_surrogate(unit: u16) -> bool {
+    (UTF16_LOW_SURROGATE_START..=UTF16_LOW_SURROGATE_END).contains(&unit)
+}
+
+#[inline]
+pub(crate) fn is_surrogate_pair(high: u16, low: u16) -> bool {
+    is_high_surrogate(high) && is_low_surrogate(low)
+}
+
 /// Write `value` to `ptr` if non-null. Every ODBC out-parameter pointer may
 /// legitimately be null (caller opting out of that value), so the
 /// `if (p) *p = v;` idiom appears at almost every entry point. Centralizing
@@ -349,7 +369,8 @@ pub(crate) fn rewrite_param_markers(sql: &str) -> (String, usize) {
 mod tests {
     use super::{
         copy_cp1252_with_nul, copy_utf16_with_nul, copy_utf16le_with_nul, copy_with_nul, is_cp1252,
-        read_utf16, read_utf16_attr, read_utf16_long, rewrite_param_markers, write_if_some,
+        is_high_surrogate, is_low_surrogate, is_surrogate_pair, read_utf16, read_utf16_attr,
+        read_utf16_long, rewrite_param_markers, write_if_some,
     };
     use crate::api::odbc_types::{SQL_NTS, SqlInteger, SqlSmallInt, SqlWChar};
 
@@ -377,6 +398,22 @@ mod tests {
             EncodingType::DelayedSet,
         ] {
             assert!(!is_cp1252(&encoding));
+        }
+    }
+
+    #[test]
+    fn surrogate_checks_match_utf16_decoding() {
+        for unit in 0..=u16::MAX {
+            let mut high_candidate = char::decode_utf16([unit, 0xDC00]);
+            let high =
+                matches!(high_candidate.next(), Some(Ok(_))) && high_candidate.next().is_none();
+            assert_eq!(is_high_surrogate(unit), high, "unit={unit:#06x}");
+            assert_eq!(is_surrogate_pair(unit, 0xDC00), high, "unit={unit:#06x}");
+
+            let mut low_candidate = char::decode_utf16([0xD800, unit]);
+            let low = matches!(low_candidate.next(), Some(Ok(_))) && low_candidate.next().is_none();
+            assert_eq!(is_low_surrogate(unit), low, "unit={unit:#06x}");
+            assert_eq!(is_surrogate_pair(0xD800, unit), low, "unit={unit:#06x}");
         }
     }
 

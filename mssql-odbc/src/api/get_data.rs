@@ -22,7 +22,8 @@ use crate::api::fetch_scroll::element_stride;
 use crate::api::odbc_types::SqlWChar;
 use crate::api::type_rules::{canonical_c_type, is_valid_c_type, resolve_default_c_type};
 use crate::api::util::{
-    copy_cp1252_with_nul, copy_utf16le_with_nul, copy_with_nul, is_cp1252, write_if_some,
+    copy_cp1252_with_nul, copy_utf16le_with_nul, copy_with_nul, is_cp1252, is_high_surrogate,
+    write_if_some,
 };
 use crate::error::{free_errors, post_sql_error};
 use crate::handles::stmt::{ActivePlpStream, STMT_STATE_CURSOR_OPEN, StmtState};
@@ -2772,7 +2773,7 @@ pub(crate) fn utf16le_chunk_to_utf8(
     // surrogate arriving next chunk rather than decode to U+FFFD now.
     if !reached_end
         && let Some(&last) = units.last()
-        && (0xD800..=0xDBFF).contains(&last)
+        && is_high_surrogate(last)
     {
         *pending_high_surrogate = Some(last);
         units.pop();

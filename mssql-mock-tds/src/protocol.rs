@@ -14,6 +14,9 @@ pub const PACKET_HEADER_SIZE: usize = 8;
 /// Maximum packet size
 pub const MAX_PACKET_SIZE: usize = 4096;
 
+const PLP_TYPE_LENGTH_MARKER: u16 = 0xFFFF;
+const MAX_BOUNDED_STRING_BYTES: u16 = 8000;
+
 #[derive(Debug, Error)]
 pub enum ProtocolError {
     #[error("IO error: {0}")]
@@ -945,9 +948,9 @@ pub fn build_query_result(response: &crate::query_response::QueryResponse) -> By
             // TDS ColMetadata mandates a 5-byte collation suffix for variable-length types.
             result.put_u16_le(
                 if col.data_type == crate::query_response::SqlDataType::NVarCharMax {
-                    0xFFFF
+                    PLP_TYPE_LENGTH_MARKER
                 } else {
-                    8000
+                    MAX_BOUNDED_STRING_BYTES
                 },
             );
             result.put_slice(&[0x09, 0x04, 0xD0, 0x00, 0x34]); // SQL_Latin1_General_CP1_CI_AS
