@@ -56,7 +56,7 @@ use crate::api::odbc_types::{
     SqlUSmallInt, SqlWChar,
 };
 use crate::api::type_rules::resolve_default_c_type;
-use crate::api::util::{copy_with_nul, is_valid_utf16le, write_if_some};
+use crate::api::util::{copy_utf16le_with_nul, copy_with_nul, write_if_some};
 use crate::conversion::datetime::DateTimeParts;
 use crate::conversion::error::{ConvError, ConvOk};
 use crate::conversion::fetch_convert::{
@@ -2106,7 +2106,7 @@ unsafe fn deliver_encoded_string(
             || matches!(encoding, EncodingType::LcidBased(_)) && bytes.is_ascii());
     let direct_wchar = binding.target_type == SQL_C_WCHAR
         && matches!(encoding, EncodingType::Utf16)
-        && is_valid_utf16le(&bytes);
+        && bytes.len().is_multiple_of(2);
 
     if !direct_char && !direct_wchar {
         return unsafe {
@@ -2140,30 +2140,9 @@ unsafe fn deliver_encoded_string(
         };
     }
 
-    let source_len = bytes.len() / 2;
     unsafe { write_if_some(octet_length, bytes.len() as SqlLen) };
-    if slot.is_null() {
-        return RowOutcome::Success;
-    }
     let buf_elements = char_buf_elements(binding.target_type, stride);
-    if buf_elements == 0 {
-        return if source_len == 0 {
-            RowOutcome::Success
-        } else {
-            RowOutcome::Info(RowIssue::StringTruncated)
-        };
-    }
-    let destination = slot.cast::<SqlWChar>();
-    let copy_len = source_len.min(buf_elements - 1);
-    for (index, chunk) in bytes.chunks_exact(2).take(copy_len).enumerate() {
-        unsafe {
-            destination
-                .add(index)
-                .write_unaligned(u16::from_le_bytes([chunk[0], chunk[1]]))
-        };
-    }
-    unsafe { destination.add(copy_len).write_unaligned(0) };
-    if copy_len < source_len {
+    if unsafe { copy_utf16le_with_nul(slot.cast(), buf_elements, &bytes) } {
         RowOutcome::Info(RowIssue::StringTruncated)
     } else {
         RowOutcome::Success
@@ -2272,6 +2251,26 @@ unsafe fn deliver_bound(
 
     if binding.target_type != SQL_C_CHAR && binding.target_type != SQL_C_WCHAR {
         return RowOutcome::Error(RowIssue::Unsupported);
+    }
+
+    if binding.target_type == SQL_C_WCHAR
+        && let ColumnValues::String(value) = value
+        && matches!(value.encoding_type(), EncodingType::Utf16)
+        && value.bytes.len().is_multiple_of(2)
+    {
+        unsafe { write_if_some(octet_length, value.bytes.len() as SqlLen) };
+        let truncated = unsafe {
+            copy_utf16le_with_nul(
+                slot.cast(),
+                char_buf_elements(binding.target_type, stride),
+                &value.bytes,
+            )
+        };
+        return if truncated || (slot.is_null() && !value.bytes.is_empty()) {
+            RowOutcome::Info(RowIssue::StringTruncated)
+        } else {
+            RowOutcome::Success
+        };
     }
 
     let text = match column_value_to_text(value) {
@@ -4303,6 +4302,78 @@ mod tests {
         writer.write_string(0, Cow::Borrowed(b"h\0i\0"), EncodingType::Utf16);
         assert_eq!(truncated, [u16::from(b'h'), 0]);
         assert_eq!(writer.outcome, RowOutcome::Info(RowIssue::StringTruncated));
+    }
+
+    #[test]
+    fn bound_wide_copies_preserve_raw_units_on_both_paths() {
+        for units in [
+            vec![0xD800_u16],
+            vec![0xDC00],
+            vec![0xFEFF, 0xFFFE, 0, 0xD800, 0x61, 0xDC00, 0],
+            vec![0xD83D, 0xDE00],
+            vec![],
+        ] {
+            let bytes: Vec<u8> = units.iter().flat_map(|unit| unit.to_le_bytes()).collect();
+            for direct in [false, true] {
+                for capacity in [0, 1, 2, units.len() + 1, units.len() + 2] {
+                    let mut output = vec![0xAA_u8; 2 * capacity + 3];
+                    let mut indicator = [-99; 2];
+                    let b = binding(
+                        1,
+                        SQL_C_WCHAR,
+                        output.as_mut_ptr().cast(),
+                        (capacity * 2) as SqlLen,
+                        indicator.as_mut_ptr(),
+                    );
+                    // Exercise a displaced, potentially unaligned row slot.
+                    let outcome = if direct {
+                        unsafe {
+                            deliver_encoded_string(
+                                &b,
+                                0,
+                                1,
+                                Cow::Borrowed(&bytes),
+                                EncodingType::Utf16,
+                            )
+                        }
+                    } else {
+                        unsafe {
+                            deliver_bound(
+                                &b,
+                                0,
+                                1,
+                                &ColumnValues::String(SqlString::new(
+                                    bytes.clone(),
+                                    EncodingType::Utf16,
+                                )),
+                            )
+                        }
+                    };
+                    let copied = units.len().min(capacity.saturating_sub(1));
+                    let expected = if copied < units.len() {
+                        RowOutcome::Info(RowIssue::StringTruncated)
+                    } else {
+                        RowOutcome::Success
+                    };
+                    assert_eq!(outcome, expected);
+                    let length = unsafe {
+                        indicator
+                            .as_ptr()
+                            .cast::<u8>()
+                            .add(1)
+                            .cast::<SqlLen>()
+                            .read_unaligned()
+                    };
+                    assert_eq!(length, bytes.len() as SqlLen);
+                    assert_eq!(&output[1..1 + copied * 2], &bytes[..copied * 2]);
+                    if capacity > 0 {
+                        assert_eq!(&output[1 + copied * 2..3 + copied * 2], &[0, 0]);
+                    }
+                    assert_eq!(output[0], 0xAA);
+                    assert!(output[1 + capacity * 2..].iter().all(|b| *b == 0xAA));
+                }
+            }
+        }
     }
 
     /// NULL is reported through the indicator; the data slot is left alone for

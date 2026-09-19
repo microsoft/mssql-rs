@@ -32,16 +32,37 @@ pub(crate) unsafe fn write_if_some<T: Copy>(ptr: *mut T, value: T) {
     }
 }
 
-pub(crate) fn is_valid_utf16le(bytes: &[u8]) -> bool {
-    bytes.len().is_multiple_of(2)
-        // ASCII-valued bytes cannot form a UTF-16 surrogate code unit.
-        && (bytes.is_ascii()
-            || char::decode_utf16(
-                bytes
-                    .chunks_exact(2)
-                    .map(|unit| u16::from_le_bytes([unit[0], unit[1]])),
-            )
-            .all(|unit| unit.is_ok()))
+/// Copies complete UTF-16LE code units without decoding or replacing surrogates.
+/// Capacity and truncation follow [`copy_with_nul`], in `SqlWChar` units.
+///
+/// # Safety
+/// - `dst`, if non-null, must be writable for `buf_len` `SqlWChar`s.
+/// - `dst` and `bytes` must not overlap.
+/// - `bytes` must contain an even number of bytes.
+pub(crate) unsafe fn copy_utf16le_with_nul(
+    dst: *mut SqlWChar,
+    buf_len: usize,
+    bytes: &[u8],
+) -> bool {
+    debug_assert!(bytes.len().is_multiple_of(2));
+    if dst.is_null() {
+        return false;
+    }
+    if buf_len == 0 {
+        return !bytes.is_empty();
+    }
+    let units = bytes.len() / 2;
+    let copied = units.min(buf_len - 1);
+    for (index, unit) in bytes.chunks_exact(2).take(copied).enumerate() {
+        // SAFETY: index and the terminator are within the caller's capacity;
+        // application buffers need not be aligned.
+        unsafe {
+            dst.add(index)
+                .write_unaligned(u16::from_le_bytes([unit[0], unit[1]]))
+        };
+    }
+    unsafe { dst.add(copied).write_unaligned(0) };
+    copied < units
 }
 
 /// Copies `src` into a caller buffer, NUL-terminating within the buffer.
@@ -279,27 +300,22 @@ pub(crate) fn rewrite_param_markers(sql: &str) -> (String, usize) {
 #[cfg(test)]
 mod tests {
     use super::{
-        copy_utf16_with_nul, copy_with_nul, is_valid_utf16le, read_utf16, read_utf16_attr,
+        copy_utf16_with_nul, copy_utf16le_with_nul, copy_with_nul, read_utf16, read_utf16_attr,
         read_utf16_long, rewrite_param_markers, write_if_some,
     };
     use crate::api::odbc_types::{SQL_NTS, SqlInteger, SqlSmallInt, SqlWChar};
 
     #[test]
-    fn utf16le_validation_matches_every_single_code_unit() {
+    fn utf16le_copy_preserves_every_single_code_unit() {
         for unit in 0..=u16::MAX {
-            assert_eq!(
-                is_valid_utf16le(&unit.to_le_bytes()),
-                String::from_utf16(&[unit]).is_ok(),
-                "unit={unit:#06x}"
-            );
+            let mut out = [0xAAAA; 3];
+            assert!(!unsafe { copy_utf16le_with_nul(out.as_mut_ptr(), 2, &unit.to_le_bytes()) });
+            assert_eq!(out, [unit, 0, 0xAAAA], "unit={unit:#06x}");
         }
-        assert!(is_valid_utf16le(&[]));
-        assert!(!is_valid_utf16le(b"a"));
-        assert!(!is_valid_utf16le(b"a\0b"));
     }
 
     #[test]
-    fn utf16le_validation_preserves_surrogate_pair_rules() {
+    fn utf16le_copy_preserves_pairs_at_byte_offsets() {
         let units = [
             0, 0x7f, 0x80, 0xd7ff, 0xd800, 0xdbff, 0xdc00, 0xdfff, 0xe000, 0xffff,
         ];
@@ -308,11 +324,13 @@ mod tests {
                 let pair = [first, second];
                 let mut bytes = vec![0xff];
                 bytes.extend(pair.into_iter().flat_map(u16::to_le_bytes));
-                assert_eq!(
-                    is_valid_utf16le(&bytes[1..]),
-                    String::from_utf16(&pair).is_ok(),
-                    "pair={pair:x?}"
-                );
+                let mut out = [0xAA_u8; 9];
+                assert!(!unsafe {
+                    copy_utf16le_with_nul(out.as_mut_ptr().add(1).cast(), 3, &bytes[1..])
+                });
+                assert_eq!(&out[1..5], &bytes[1..]);
+                assert_eq!(&out[5..], &[0, 0, 0xAA, 0xAA]);
+                assert_eq!(out[0], 0xAA);
             }
         }
     }

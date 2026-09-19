@@ -219,8 +219,10 @@ After a packet-boundary continuation, resident columns return to synchronous
 decoding; network waits retain the existing cancellation and timeout handling.
 Datetimeoffset conversion uses checked 64-bit arithmetic while preserving the
 out-of-range rejection of the wider calculation.
-Bound and row-wise wide-string delivery share UTF-16 validation, using a
-bytewise ASCII check when it can rule out surrogates without decoding each unit.
+Bound and row-wise wide-string delivery copy complete UTF-16 code units without
+decoding them. This preserves unpaired surrogates, BOM-like units, and embedded
+NULs for the application's decoding policy; actual encoding conversions remain
+separate. Incomplete (odd-byte) values do not enter the raw-unit copy path.
 
 ## Parameter array results
 
