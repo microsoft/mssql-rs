@@ -21,7 +21,7 @@ use crate::api::exec_common::release_busy_if_row_exhausted;
 use crate::api::fetch_scroll::element_stride;
 use crate::api::odbc_types::SqlWChar;
 use crate::api::type_rules::{canonical_c_type, is_valid_c_type, resolve_default_c_type};
-use crate::api::util::{copy_with_nul, write_if_some};
+use crate::api::util::{copy_with_nul, is_valid_utf16le, write_if_some};
 use crate::error::{free_errors, post_sql_error};
 use crate::handles::stmt::{ActivePlpStream, STMT_STATE_CURSOR_OPEN, StmtState};
 use crate::handles::{HandleType, OdbcVersion, StmtHandle, handle_from_raw};
@@ -613,13 +613,7 @@ unsafe fn try_write_complete_buffered_string(
 
     let direct_wchar = target_type == SQL_C_WCHAR
         && matches!(value.encoding_type(), EncodingType::Utf16)
-        && bytes.len().is_multiple_of(2)
-        && std::char::decode_utf16(
-            bytes
-                .chunks_exact(2)
-                .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]])),
-        )
-        .all(|unit| unit.is_ok());
+        && is_valid_utf16le(bytes);
     let required = bytes.len().saturating_add(std::mem::size_of::<SqlWChar>());
     if !direct_wchar || usize::try_from(buffer_length).map_or(true, |len| len < required) {
         return false;
@@ -1387,13 +1381,7 @@ unsafe fn try_write_direct_captured_string_chunk(
     if target_type != SQL_C_WCHAR
         || !matches!(value.encoding_type(), EncodingType::Utf16)
         || !bytes.len().is_multiple_of(2)
-        || !validated
-            && !std::char::decode_utf16(
-                bytes
-                    .chunks_exact(2)
-                    .map(|unit| u16::from_le_bytes([unit[0], unit[1]])),
-            )
-            .all(|unit| unit.is_ok())
+        || !validated && !is_valid_utf16le(bytes)
     {
         return None;
     }

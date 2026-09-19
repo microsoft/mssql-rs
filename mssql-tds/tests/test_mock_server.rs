@@ -247,6 +247,93 @@ mod mock_server_tests {
         Ok(())
     }
 
+    /// Repro for https://github.com/microsoft/mssql-rs/issues/587: a series
+    /// of plain autocommit queries, each fully drained before the next is
+    /// sent, used to carry a growing `OutstandingRequestCount` on the wire —
+    /// against a real server this surfaces as error 3981 ("The transaction
+    /// operation cannot be performed because there are pending requests
+    /// working on this transaction"). The cause was a process-wide `static`
+    /// counter backing `OutstandingRequestCount` instead of the constant `1`
+    /// MS-TDS 2.2.5.3.2 requires for autocommit requests.
+    ///
+    /// The mock server doesn't enforce this invariant itself (that would make
+    /// every future test that touches `SqlBatch`/`RpcRequest` implicitly
+    /// depend on getting the emulation exactly right); instead it passively
+    /// records each request's header, and this test asserts directly on that
+    /// recording — the same regression coverage without the shared-server
+    /// risk.
+    #[tokio::test]
+    async fn test_sequential_autocommit_queries_report_outstanding_count_of_one()
+    -> Result<(), Box<dyn std::error::Error>> {
+        init_tracing();
+
+        let server = MockTdsServer::new("127.0.0.1:0").await?;
+        let server_addr = server.local_addr();
+        let connection_store = server.connection_store();
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let server_handle =
+            tokio::spawn(async move { server.run_with_shutdown(shutdown_rx).await });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        let datasource = format!("tcp:{},{}", server_addr.ip(), server_addr.port());
+        let mut context = ClientContext::default();
+        context.user_name = "sa".to_string();
+        context.password = generate_test_password();
+        context.database = "master".to_string();
+        context.encryption_options = EncryptionOptions {
+            mode: EncryptionSetting::PreferOff,
+            trust_server_certificate: true,
+            host_name_in_cert: None,
+            server_certificate: None,
+        };
+
+        let provider = TdsConnectionProvider {};
+        let mut client = provider.create_client(context, &datasource, None).await?;
+
+        // Mirrors the issue's repro: execute an autocommit query, fully drain
+        // it, then execute another — repeated a few times so a monotonically
+        // growing (rather than constant) OutstandingRequestCount would show up
+        // in the recorded history from the second request onward.
+        for i in 0..4 {
+            client.execute("SELECT 1".to_string(), ()).await?;
+
+            let mut row_count = 0;
+            if client.on_rows() {
+                while let Some(_row) = client.next_row().await? {
+                    row_count += 1;
+                }
+            }
+            assert_eq!(row_count, 1, "query #{i} should return exactly one row");
+            client.close_query().await?;
+        }
+
+        client.close_connection().await?;
+        drop(client);
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        let store = connection_store.lock().await;
+        let conn_info = store
+            .all()
+            .values()
+            .next()
+            .expect("should have at least one connection");
+
+        assert_eq!(
+            conn_info.transaction_descriptor_headers,
+            vec![(0, 1); 4],
+            "every autocommit request must carry TransactionDescriptor=0 \
+             and OutstandingRequestCount=1"
+        );
+
+        let _ = shutdown_tx.send(());
+        let _ = tokio::time::timeout(tokio::time::Duration::from_secs(2), server_handle).await;
+
+        Ok(())
+    }
+
     /// Test connection reuse
     #[tokio::test]
     async fn test_connection_reuse() -> Result<(), Box<dyn std::error::Error>> {

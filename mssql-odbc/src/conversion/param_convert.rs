@@ -194,6 +194,7 @@ pub(crate) unsafe fn data_at_exec_indicator(param: &BoundParam) -> Option<SqlLen
 ///
 /// # Safety
 /// See [`bound_param_to_value_with_outcome`].
+#[inline]
 pub(crate) unsafe fn bound_param_to_rpc(
     name: impl Into<Option<String>>,
     param: &BoundParam,
@@ -231,6 +232,7 @@ pub(crate) unsafe fn bound_param_to_value(
 /// Input and input/output value buffers must be readable for the indicated
 /// length, and their non-null indicator pointers must address an initialized
 /// `SqlLen`. Output-only buffers are not read.
+#[inline]
 unsafe fn bound_param_to_value_with_outcome(
     param: &BoundParam,
 ) -> Result<(TypedValue, ConvOk), ParamBuildError> {

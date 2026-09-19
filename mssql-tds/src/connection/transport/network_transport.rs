@@ -23,8 +23,9 @@ use crate::io::packet_writer::PacketWriter;
 use crate::io::reader_writer::{NetworkReader, NetworkReaderWriter, NetworkWriter};
 use crate::io::token_stream::{
     ColumnPolicy, ParserContext, PlpPauseState, RowHeader, RowPauseState, RowReadResult,
-    TdsTokenStreamReader, read_active_plp_bytes_internal, receive_row_header_internal,
-    receive_row_into_internal, receive_token_internal, resume_row_into_internal,
+    TdsTokenStreamReader, log_received_token, read_active_plp_bytes_internal,
+    receive_row_header_internal, receive_row_into_internal, receive_token_internal,
+    resume_row_into_internal,
 };
 use crate::message::attention::AttentionRequest;
 use crate::message::login_options::TdsVersion;
@@ -1957,6 +1958,11 @@ impl TransportSslHandler for NetworkTransport {
 }
 
 impl TdsPacketReader for NetworkTransport {
+    #[inline]
+    fn buffered_slice(&self) -> &[u8] {
+        self.tds_read_buffer.get_buffered_slice()
+    }
+
     fn reset_reader(&mut self) {
         // Callers reset before starting a new message, so the buffer is
         // expected to be fully consumed. Log a violation instead of asserting:
@@ -2686,6 +2692,18 @@ impl NetworkTransport {
             self.column_encryption_supported = *enabled;
         }
         self.attention_settlement = None;
+        // A ready read also wins over a zero timeout in await_read_or_interrupt.
+        // A pre-cancelled read must take its existing ATTENTION settlement path.
+        if !cancel_handle.is_some_and(|handle| handle.cancel_token.is_cancelled())
+            && let Some((token, consumed)) = crate::io::token_stream::buffered_control_token(
+                self.tds_read_buffer.get_buffered_slice(),
+            )
+        {
+            let token_type_byte = self.tds_read_buffer.get_buffered_slice()[0];
+            log_received_token(&TokenType::try_from(token_type_byte)?, token_type_byte);
+            self.tds_read_buffer.consume_bytes(consumed)?;
+            return Ok(token);
+        }
         let attention_stream = self.stream.as_ref().cloned();
         let already_dead = self.known_dead;
         let outcome = {
@@ -4759,7 +4777,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn buffered_row_writer_keeps_partial_column_for_async_continuation() {
-        let expected = [0x1234_5678_i32, -42_i32];
+        let expected = [0x1234_5678_i32, -42_i32, 123_i32, -456_i32];
         let second = expected[1].to_le_bytes();
         let mut first_payload = vec![TokenType::Row as u8];
         first_payload.extend_from_slice(&expected[0].to_le_bytes());
@@ -4768,7 +4786,10 @@ pub(crate) mod tests {
         let mut first = TestPacketBuilder::new(PacketType::TabularResult);
         let mut second_packet = TestPacketBuilder::new(PacketType::TabularResult);
         let mut stream = first.continuation().append_bytes(&first_payload).build();
-        stream.extend_from_slice(&second_packet.append_bytes(&second[2..]).build());
+        let mut remaining = second[2..].to_vec();
+        remaining.extend(expected[2..].iter().flat_map(|value| value.to_le_bytes()));
+        remaining.push(TokenType::Done as u8);
+        stream.extend_from_slice(&second_packet.append_bytes(&remaining).build());
         let mut reader = create_network_transport_with_data(&stream);
         reader.read_tds_packet().await.unwrap();
 
@@ -4808,6 +4829,7 @@ pub(crate) mod tests {
                 .map(ColumnValues::Int)
                 .collect::<Vec<_>>()
         );
+        assert_eq!(reader.buffered_slice(), &[TokenType::Done as u8]);
     }
 
     #[tokio::test]
@@ -6105,6 +6127,109 @@ pub(crate) mod tests {
             is_known_dead(&transport),
             "a connection whose attention went unacknowledged must not be reused"
         );
+    }
+
+    #[tokio::test]
+    async fn completion_tokens_log_once_on_buffered_and_fallback_paths() {
+        use tracing::instrument::WithSubscriber;
+
+        for kind in [
+            TokenType::Done,
+            TokenType::DoneProc,
+            TokenType::DoneInProc,
+            TokenType::ReturnStatus,
+        ]
+        .map(|kind| kind as u8)
+        {
+            let mut payload = vec![kind];
+            payload.extend(if kind == TokenType::ReturnStatus as u8 {
+                vec![0; 4]
+            } else {
+                vec![0; 12]
+            });
+            for prefix in [0, 1, payload.len()] {
+                let mut packet = TestPacketBuilder::new(PacketType::TabularResult);
+                let wire = if prefix == 1 {
+                    let mut wire = packet
+                        .continuation()
+                        .append_bytes(&payload[..prefix])
+                        .build();
+                    let mut rest = TestPacketBuilder::new(PacketType::TabularResult);
+                    wire.extend(rest.append_bytes(&payload[prefix..]).build());
+                    wire
+                } else {
+                    packet.append_bytes(&payload).build()
+                };
+                let mut transport = create_network_transport_with_data(&wire);
+                if prefix != 0 {
+                    transport.read_tds_packet().await.unwrap();
+                }
+                let logs = tempfile::NamedTempFile::new().unwrap();
+                let subscriber = tracing_subscriber::fmt()
+                    .with_env_filter("off,mssql_tds::io::token_stream=debug")
+                    .without_time()
+                    .with_ansi(false)
+                    .with_writer(logs.reopen().unwrap())
+                    .finish();
+                transport
+                    .receive_token(&ParserContext::None(()), None, None)
+                    .with_subscriber(subscriber)
+                    .await
+                    .unwrap();
+                let logs = std::fs::read_to_string(logs.path()).unwrap();
+                let expected = format!(
+                    "DEBUG mssql_tds::io::token_stream: Received token type: {:?} ({kind})",
+                    TokenType::try_from(kind).unwrap()
+                );
+                let received: Vec<_> = logs
+                    .lines()
+                    .filter(|line| line.contains("Received token type:"))
+                    .collect();
+                assert_eq!(
+                    received,
+                    vec![expected.as_str()],
+                    "buffered prefix: {prefix}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn buffered_control_token_is_ready_with_zero_timeout() {
+        let (mut transport, _written) =
+            create_network_transport_with_live_peer_capturing_writes(&[]);
+        let message = done_token_message(DoneStatus::COUNT.bits());
+        let payload = &message[PacketWriter::PACKET_HEADER_SIZE..];
+        transport.tds_read_buffer.working_buffer[..payload.len()].copy_from_slice(payload);
+        transport.tds_read_buffer.buffer_position = 0;
+        transport.tds_read_buffer.buffer_length = payload.len();
+
+        let token = transport
+            .receive_token(&ParserContext::None(()), Some(Duration::ZERO), None)
+            .await
+            .unwrap();
+        assert!(matches!(token, Tokens::Done(_)));
+        assert!(transport.tds_read_buffer.get_buffered_slice().is_empty());
+        assert!(!is_known_dead(&transport));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn buffered_control_token_does_not_bypass_cancellation() {
+        let (mut transport, mut written) = create_network_transport_with_live_peer_capturing_writes(
+            &done_token_message(DoneStatus::ATTN.bits()),
+        );
+        let message = done_token_message(DoneStatus::COUNT.bits());
+        let payload = &message[PacketWriter::PACKET_HEADER_SIZE..];
+        transport.tds_read_buffer.working_buffer[..payload.len()].copy_from_slice(payload);
+        transport.tds_read_buffer.buffer_position = 0;
+        transport.tds_read_buffer.buffer_length = payload.len();
+
+        let result = transport
+            .receive_token(&ParserContext::None(()), None, Some(&cancelled_handle()))
+            .await;
+        assert!(matches!(result, Err(OperationCancelledError(_))));
+        assert!(written.try_recv().is_ok());
+        assert!(!is_known_dead(&transport));
     }
 
     /// The check must stay quiet on a healthy cancellation: a server that

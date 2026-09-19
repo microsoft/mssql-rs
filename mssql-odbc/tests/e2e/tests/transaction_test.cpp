@@ -279,6 +279,35 @@ TEST_F(TransactionLiveTest, AutocommitInsertIsImmediatelyDurable) {
     EXPECT_EQ(1, RowCountOf("#auto_t"));
 }
 
+// Regression test for https://github.com/microsoft/mssql-rs/issues/587:
+// sequential autocommit requests must each carry OutstandingRequestCount=1 on
+// the wire (MS-TDS 2.2.5.3.2). A stale, ever-incrementing count previously
+// made a later request that begins/commits its own transaction fail with SQL
+// Server error 3981 ("The transaction operation cannot be performed because
+// there are pending requests working on this transaction"), even though every
+// prior response had been fully drained and autocommit was in effect the
+// whole time. Must pass identically on msodbcsql, which never had this bug.
+TEST_F(TransactionLiveTest, SequentialAutocommitQueriesToleratePriorTransactionProc) {
+    Exec(
+        "CREATE PROCEDURE #mssql_rs_587_repro AS "
+        "BEGIN SET NOCOUNT ON; BEGIN TRANSACTION; COMMIT TRANSACTION; END");
+
+    // Several plain autocommit queries, each fully drained before the next is
+    // sent — mirrors the issue's repro exactly.
+    for (int i = 0; i < 4; ++i) {
+        SCOPED_TRACE("autocommit query #" + std::to_string(i));
+        Exec("SELECT 1");
+        ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+        SQLCloseCursor(stmt_);
+    }
+
+    // The procedure begins and commits its own transaction. Before the fix
+    // this failed with SQL Server error 3981.
+    SQLRETURN rc = Run(stmt_, "EXEC #mssql_rs_587_repro");
+    ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+    SQLCloseCursor(stmt_);
+}
+
 // msodbcsql returns plain SQL_SUCCESS when no transaction was ever started —
 // no warning, no error (`CommitAbortTran`, sqlctran.cpp).
 TEST_F(TransactionLiveTest, EndTranWithoutTransactionSucceeds) {

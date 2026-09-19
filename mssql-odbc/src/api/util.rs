@@ -32,6 +32,18 @@ pub(crate) unsafe fn write_if_some<T: Copy>(ptr: *mut T, value: T) {
     }
 }
 
+pub(crate) fn is_valid_utf16le(bytes: &[u8]) -> bool {
+    bytes.len().is_multiple_of(2)
+        // ASCII-valued bytes cannot form a UTF-16 surrogate code unit.
+        && (bytes.is_ascii()
+            || char::decode_utf16(
+                bytes
+                    .chunks_exact(2)
+                    .map(|unit| u16::from_le_bytes([unit[0], unit[1]])),
+            )
+            .all(|unit| unit.is_ok()))
+}
+
 /// Copies `src` into a caller buffer, NUL-terminating within the buffer.
 /// Returns `true` if `src` was truncated (i.e., did not fit including the NUL
 /// terminator). A null `dst` reports no truncation - callers use it to query
@@ -267,64 +279,227 @@ pub(crate) fn rewrite_param_markers(sql: &str) -> (String, usize) {
 #[cfg(test)]
 mod tests {
     use super::{
-        copy_utf16_with_nul, copy_with_nul, read_utf16, read_utf16_attr, read_utf16_long,
-        rewrite_param_markers, write_if_some,
+        copy_utf16_with_nul, copy_with_nul, is_valid_utf16le, read_utf16, read_utf16_attr,
+        read_utf16_long, rewrite_param_markers, write_if_some,
     };
-    use crate::api::odbc_types::{SQL_NTS, SqlInteger, SqlWChar};
+    use crate::api::odbc_types::{SQL_NTS, SqlInteger, SqlSmallInt, SqlWChar};
+
+    #[test]
+    fn utf16le_validation_matches_every_single_code_unit() {
+        for unit in 0..=u16::MAX {
+            assert_eq!(
+                is_valid_utf16le(&unit.to_le_bytes()),
+                String::from_utf16(&[unit]).is_ok(),
+                "unit={unit:#06x}"
+            );
+        }
+        assert!(is_valid_utf16le(&[]));
+        assert!(!is_valid_utf16le(b"a"));
+        assert!(!is_valid_utf16le(b"a\0b"));
+    }
+
+    #[test]
+    fn utf16le_validation_preserves_surrogate_pair_rules() {
+        let units = [
+            0, 0x7f, 0x80, 0xd7ff, 0xd800, 0xdbff, 0xdc00, 0xdfff, 0xe000, 0xffff,
+        ];
+        for first in units {
+            for second in units {
+                let pair = [first, second];
+                let mut bytes = vec![0xff];
+                bytes.extend(pair.into_iter().flat_map(u16::to_le_bytes));
+                assert_eq!(
+                    is_valid_utf16le(&bytes[1..]),
+                    String::from_utf16(&pair).is_ok(),
+                    "pair={pair:x?}"
+                );
+            }
+        }
+    }
 
     mod memory_safety {
         use super::*;
+        use crate::api::odbc_types::SqlLen;
+        use crate::test_support::AlignedBuffer;
         use std::mem::MaybeUninit;
 
-        #[repr(align(2))]
-        struct Input([MaybeUninit<u8>; 33]);
+        #[test]
+        fn wide_copies_respect_capacity_at_a_byte_offset() {
+            for text in ["", "a", "a\u{1f600}b"] {
+                let source: Vec<u16> = text.encode_utf16().collect();
+                for direct_encoding in [false, true] {
+                    for capacity in 0..=source.len() + 2 {
+                        let mut storage = AlignedBuffer([0xA5u8; 17]);
+                        assert!(capacity * size_of::<u16>() < storage.0.len());
+                        for _ in 0..2 {
+                            let ptr = storage.0.as_mut_ptr().wrapping_add(1).cast::<u16>();
+                            assert!(!ptr.is_aligned());
+                            // The displaced destination has room for every declared unit.
+                            let truncated = unsafe {
+                                if direct_encoding {
+                                    copy_utf16_with_nul(ptr, capacity, text)
+                                } else {
+                                    copy_with_nul(ptr, capacity, &source)
+                                }
+                            };
+                            assert_eq!(truncated, source.len() > capacity.saturating_sub(1));
+                            let mut expected = [0xA5; 17];
+                            if capacity != 0 {
+                                for (i, unit) in source
+                                    .iter()
+                                    .copied()
+                                    .take(capacity - 1)
+                                    .chain(std::iter::once(0))
+                                    .enumerate()
+                                {
+                                    expected[1 + i * 2..1 + (i + 1) * 2]
+                                        .copy_from_slice(&unit.to_ne_bytes());
+                                }
+                            }
+                            assert_eq!(storage.0, expected);
+                        }
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn wide_copies_initialize_only_the_written_prefix() {
+            let text = "a\u{1f600}b";
+            let source: Vec<u16> = text.encode_utf16().collect();
+            for direct_encoding in [false, true] {
+                for capacity in [0usize, 1, 2, 5] {
+                    let mut storage = [MaybeUninit::<u16>::uninit(); 5];
+                    let ptr = storage.as_mut_ptr().cast::<u16>();
+                    // The output is writable but has no initialized value to read.
+                    let truncated = unsafe {
+                        if direct_encoding {
+                            copy_utf16_with_nul(ptr, capacity, text)
+                        } else {
+                            copy_with_nul(ptr, capacity, &source)
+                        }
+                    };
+                    assert_eq!(truncated, source.len() > capacity.saturating_sub(1));
+                    if capacity != 0 {
+                        let expected = source
+                            .iter()
+                            .copied()
+                            .take(capacity - 1)
+                            .chain(std::iter::once(0));
+                        for (actual, expected) in storage.iter().zip(expected) {
+                            // Only the copied prefix and its terminator are initialized.
+                            assert_eq!(unsafe { actual.assume_init() }, expected);
+                        }
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn scalar_out_parameter_writes_stay_inside_the_unaligned_slot() {
+            let mut storage = AlignedBuffer([0xA5u8; 24]);
+            for value in [SqlLen::MIN, 42, SqlLen::MAX] {
+                let ptr = storage.0.as_mut_ptr().wrapping_add(1).cast::<SqlLen>();
+                assert!(!ptr.is_aligned());
+                // The slot is writable for one SqlLen, independently of its alignment.
+                unsafe { write_if_some(ptr, value) };
+                let mut expected = [0xA5; 24];
+                expected[1..1 + size_of::<SqlLen>()].copy_from_slice(&value.to_ne_bytes());
+                assert_eq!(storage.0, expected);
+            }
+        }
+
+        #[test]
+        fn utf16_reads_stop_at_the_initialized_extent() {
+            for offset in [0, 1] {
+                let mut storage = AlignedBuffer([MaybeUninit::<u8>::uninit(); 8]);
+                let ptr = storage.0.as_mut_ptr().wrapping_add(offset).cast::<u16>();
+                assert_eq!(ptr.is_aligned(), offset == 0);
+                // Two initialized units, including the terminator; the tail is unreadable.
+                unsafe {
+                    ptr.write_unaligned(u16::from(b'a'));
+                    ptr.add(1).write_unaligned(0);
+                }
+                for _ in 0..2 {
+                    unsafe {
+                        assert_eq!(read_utf16(ptr, SQL_NTS), "a");
+                        assert_eq!(read_utf16_long(ptr, SqlInteger::from(SQL_NTS)), "a");
+                        assert_eq!(read_utf16_attr(ptr, SqlInteger::from(SQL_NTS)), "a");
+                        assert_eq!(read_utf16(ptr, 2), "a\0");
+                        assert_eq!(read_utf16_long(ptr, 2), "a\0");
+                        assert_eq!(read_utf16_attr(ptr, 4), "a\0");
+                    }
+                }
+            }
+        }
 
         #[test]
         fn utf16_readers_accept_unaligned_initialized_input() {
             for text in ["", "master", "a\u{1f600}b", "a\0b"] {
                 let units: Vec<u16> = text.encode_utf16().chain(Some(0)).collect();
-                let mut storage = Input([MaybeUninit::uninit(); 33]);
-                for (index, byte) in units.iter().flat_map(|unit| unit.to_ne_bytes()).enumerate() {
-                    storage.0[index + 1].write(byte);
-                }
-                let ptr = storage.0.as_ptr().wrapping_add(1).cast::<u16>();
-                assert!(!ptr.is_aligned());
-                let count = i16::try_from(units.len() - 1).unwrap();
-                let bytes = i32::from(count) * 2;
-                let terminated = text.split('\0').next().unwrap();
-                // SAFETY: only the initialized units, including the terminator,
-                // are readable; the tail deliberately remains uninitialized.
-                unsafe {
-                    assert_eq!(read_utf16(ptr, count), text);
-                    assert_eq!(read_utf16_long(ptr, i32::from(count)), text);
-                    assert_eq!(read_utf16_attr(ptr, bytes), text);
-                    assert_eq!(read_utf16_attr(ptr, bytes + 1), text);
-                    assert_eq!(read_utf16(ptr, SQL_NTS), terminated);
-                    assert_eq!(read_utf16_long(ptr, i32::from(SQL_NTS)), terminated);
-                    assert_eq!(read_utf16_attr(ptr, i32::from(SQL_NTS)), terminated);
+                for offset in [0, 1] {
+                    let mut storage = AlignedBuffer([MaybeUninit::<u8>::uninit(); 33]);
+                    for (index, byte) in
+                        units.iter().flat_map(|unit| unit.to_ne_bytes()).enumerate()
+                    {
+                        storage.0[offset + index].write(byte);
+                    }
+                    let ptr = storage.0.as_ptr().wrapping_add(offset).cast::<SqlWChar>();
+                    assert_eq!(ptr.is_aligned(), offset == 0);
+                    let count = SqlSmallInt::try_from(units.len() - 1).unwrap();
+                    let bytes = SqlInteger::from(count) * 2;
+                    let terminated = text.split('\0').next().unwrap();
+                    // The payload and terminator are initialized; the tail is not.
+                    unsafe {
+                        assert_eq!(read_utf16(ptr, count), text);
+                        assert_eq!(read_utf16_long(ptr, SqlInteger::from(count)), text);
+                        assert_eq!(read_utf16_attr(ptr, bytes), text);
+                        assert_eq!(read_utf16_attr(ptr, bytes + 1), text);
+                        assert_eq!(read_utf16(ptr, SQL_NTS), terminated);
+                        assert_eq!(read_utf16_long(ptr, SqlInteger::from(SQL_NTS)), terminated);
+                        assert_eq!(read_utf16_attr(ptr, SqlInteger::from(SQL_NTS)), terminated);
+                    }
                 }
             }
         }
 
         #[test]
         fn unaligned_utf16_read_preserves_lossy_decoding() {
-            let mut storage = Input([MaybeUninit::uninit(); 33]);
-            for (index, byte) in [0xD800u16, 0x0061, 0xDC00, 0]
-                .iter()
-                .flat_map(|unit| unit.to_ne_bytes())
-                .enumerate()
-            {
-                storage.0[index + 1].write(byte);
-            }
-            let ptr = storage.0.as_ptr().wrapping_add(1).cast::<u16>();
-            assert!(!ptr.is_aligned());
-            // SAFETY: four initialized units include the NUL terminator.
-            unsafe {
-                assert_eq!(read_utf16_long(ptr, 3), "\u{fffd}a\u{fffd}");
-                assert_eq!(
-                    read_utf16_long(ptr, i32::from(SQL_NTS)),
-                    "\u{fffd}a\u{fffd}"
-                );
+            let cases: &[(&[u16], &str)] = &[
+                (
+                    &[0x61, 0xD83D, 0xDE00, 0xD800, 0x62, 0xDC00, 0, 0x63, 0],
+                    "a\u{1f600}\u{fffd}b\u{fffd}",
+                ),
+                (&[0xD800, 0x0061, 0xDC00, 0], "\u{fffd}a\u{fffd}"),
+            ];
+            for &(units, terminated) in cases {
+                for offset in [0, 1] {
+                    let mut storage = AlignedBuffer([MaybeUninit::<u8>::uninit(); 33]);
+                    for (index, byte) in
+                        units.iter().flat_map(|unit| unit.to_ne_bytes()).enumerate()
+                    {
+                        storage.0[offset + index].write(byte);
+                    }
+                    let ptr = storage.0.as_ptr().wrapping_add(offset).cast::<SqlWChar>();
+                    assert_eq!(ptr.is_aligned(), offset == 0);
+                    for length in 0..units.len() {
+                        let expected = String::from_utf16_lossy(&units[..length]);
+                        let chars = SqlSmallInt::try_from(length).unwrap();
+                        let bytes = SqlInteger::try_from(length * 2).unwrap();
+                        // Every declared byte is initialized, including the odd trailing byte.
+                        unsafe {
+                            assert_eq!(read_utf16(ptr, chars), expected);
+                            assert_eq!(read_utf16_long(ptr, SqlInteger::from(chars)), expected);
+                            assert_eq!(read_utf16_attr(ptr, bytes), expected);
+                            assert_eq!(read_utf16_attr(ptr, bytes + 1), expected);
+                        }
+                    }
+                    unsafe {
+                        assert_eq!(read_utf16(ptr, SQL_NTS), terminated);
+                        assert_eq!(read_utf16_long(ptr, SqlInteger::from(SQL_NTS)), terminated);
+                        assert_eq!(read_utf16_attr(ptr, SqlInteger::from(SQL_NTS)), terminated);
+                    }
+                }
             }
         }
     }

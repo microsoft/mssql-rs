@@ -6,7 +6,6 @@ use crate::core::{CancelHandle, TdsResult};
 use crate::error::Error::TimeoutError;
 use crate::error::TimeoutErrorType;
 use crate::message::messages::{PacketStatusFlags, PacketType, ResetConnectionMode};
-use async_trait::async_trait;
 use byteorder::{BigEndian, WriteBytesExt};
 use std::io::Cursor;
 use std::time::Instant;
@@ -44,7 +43,8 @@ pub(crate) trait TdsPacketWriterUnchecked {
     async fn check_overflow(&mut self) -> TdsResult<()>;
 }
 
-#[async_trait]
+// This trait is statically dispatched: native async methods avoid allocating a
+// boxed future for every primitive written to a packet.
 pub(crate) trait TdsPacketWriter {
     /// Writes a byte to the buffer.
     async fn write_byte_async(&mut self, value: u8) -> TdsResult<()>;
@@ -350,6 +350,21 @@ impl<'a> PacketWriter<'a> {
         (self.payload_cursor.position() - Self::PACKET_HEADER_SIZE as u64) as i32
     }
 
+    pub(crate) async fn write_fixed_bytes<const N: usize>(
+        &mut self,
+        bytes: &[u8; N],
+    ) -> TdsResult<()> {
+        // Keep exact-boundary sends on the ordinary overflow/cancellation path.
+        if self.has_space(N + 1) {
+            std::io::Write::write_all(&mut self.payload_cursor, bytes)?;
+        } else {
+            for &byte in bytes {
+                self.write_byte_async(byte).await?;
+            }
+        }
+        Ok(())
+    }
+
     async fn handle_overflow_if_needed(&mut self) -> TdsResult<()> {
         // If the payload size is greater than the max payload size, send the packet.
         if self.position() >= (self.max_payload_size as i32) {
@@ -538,7 +553,6 @@ impl<'a> PacketWriter<'a> {
     }
 }
 
-#[async_trait]
 impl TdsPacketWriter for PacketWriter<'_> {
     async fn finalize(&mut self) -> TdsResult<()> {
         // Send a final EOM packet when there is buffered payload, or when the
@@ -837,6 +851,77 @@ pub(crate) mod tests {
             message = PacketWriter::resume(message, &mut mock).suspend();
         }
         assert_eq!(mock.data.len(), 9);
+    }
+
+    #[test]
+    fn fixed_bytes_preserve_packet_boundaries_and_reset_flags() {
+        fn serialize<const N: usize>(
+            packet_size: u32,
+            padding: usize,
+            reset_mode: ResetConnectionMode,
+            metadata: &[u8; N],
+            batched: bool,
+            trailing_byte: bool,
+        ) -> Vec<u8> {
+            let mut mock = MockNetworkWriter::new(packet_size);
+            mock.set_reset_mode(reset_mode);
+            let mut writer = PacketWriter::new(PacketType::RpcRequest, &mut mock, None, None);
+            block_on(async {
+                writer.write_async(&vec![0x55; padding]).await.unwrap();
+                if batched {
+                    writer.write_fixed_bytes(metadata).await.unwrap();
+                } else {
+                    for &byte in metadata {
+                        writer.write_byte_async(byte).await.unwrap();
+                    }
+                }
+                if trailing_byte {
+                    writer.write_byte_async(0x5a).await.unwrap();
+                }
+                writer.finalize().await.unwrap();
+            });
+            drop(writer);
+            mock.data
+        }
+
+        fn check<const N: usize>(metadata: &[u8; N]) {
+            for packet_size in [512, 4096, 8000, 16192] {
+                let boundary = packet_size as usize - PacketWriter::PACKET_HEADER_SIZE;
+                for padding in (boundary - N - 1)..=(boundary + 1) {
+                    for reset_mode in [
+                        ResetConnectionMode::None,
+                        ResetConnectionMode::Reset,
+                        ResetConnectionMode::ResetSkipTran,
+                    ] {
+                        for trailing_byte in [false, true] {
+                            assert_eq!(
+                                serialize(
+                                    packet_size,
+                                    padding,
+                                    reset_mode,
+                                    metadata,
+                                    true,
+                                    trailing_byte
+                                ),
+                                serialize(
+                                    packet_size,
+                                    padding,
+                                    reset_mode,
+                                    metadata,
+                                    false,
+                                    trailing_byte
+                                ),
+                                "packet_size={packet_size}, padding={padding}, trailing={trailing_byte}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        check(&[0, 0]);
+        check(&[0xff, 0xff, 12, 0, 0, 0]);
+        check(&[0xe7, 30, 0, 9, 4, 0xd0, 0, 0x34]);
     }
 
     #[test]
