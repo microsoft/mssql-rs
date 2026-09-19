@@ -9,6 +9,7 @@
 // Tests that require a live SQL Server are gated by ODBCTestConfig::HasConnection().
 
 #include "odbc_test_fixture.h"
+#include "utf16_test_data.h"
 
 #include <algorithm>
 #include <cstring>
@@ -271,6 +272,280 @@ protected:
         return std::string(reinterpret_cast<const char*>(buf));
     }
 };
+
+class GetDataUtf16Test : public GetDataLiveTest {
+protected:
+    void SetUp() override {
+        ASSERT_TRUE(ODBCTestConfig::Instance().HasConnection());
+        ASSERT_NO_FATAL_FAILURE(GetDataLiveTest::SetUp());
+        SQLCHAR version[32] = {};
+        ASSERT_SQL_OK(SQLGetInfoA(dbc_, SQL_DRIVER_VER, version, sizeof(version), nullptr),
+                      SQL_HANDLE_DBC, dbc_);
+        RecordProperty("driver_version", reinterpret_cast<const char*>(version));
+    }
+};
+
+// #604: compare code units, not decoded strings or NUL-terminated lengths.
+TEST_F(GetDataUtf16Test, RawUnitsBesideNvarcharMax) {
+    static_assert(sizeof(SQLWCHAR) == 2);
+    constexpr SQLWCHAR sentinel = 0xCCCC;
+    for (const auto& value : Utf16TestData::Values()) {
+        SCOPED_TRACE(value.name);
+        const std::string expression = "CONVERT(nvarchar(32), " + std::string(value.hex) + ")";
+        ASSERT_EQ(SQL_SUCCESS, ExecDirect("SELECT " + expression + ", CAST(" + expression +
+            " AS nchar(8)), CAST(" + expression + " AS nvarchar(max)), 42"));
+        ASSERT_EQ(SQL_SUCCESS, SQLFetch(stmt_));
+        for (SQLUSMALLINT column = 1; column <= 3; ++column) {
+            SCOPED_TRACE(column);
+            const auto expected = Utf16TestData::Expected(value, column == 2);
+            const bool is_null = std::string(value.hex) == "NULL";
+            const size_t capacity = expected.size() + 1;
+            std::vector<SQLWCHAR> buffer(capacity + 2, sentinel);
+            SQLLEN indicator = -99;
+            ASSERT_EQ(SQL_SUCCESS, SQLGetData(stmt_, column, SQL_C_WCHAR, buffer.data() + 1,
+                static_cast<SQLLEN>(capacity * sizeof(SQLWCHAR)), &indicator));
+            EXPECT_EQ(is_null ? SQL_NULL_DATA :
+                      static_cast<SQLLEN>(expected.size() * sizeof(SQLWCHAR)), indicator);
+            EXPECT_EQ(sentinel, buffer.front());
+            EXPECT_EQ(sentinel, buffer.back());
+            if (!is_null) {
+                EXPECT_TRUE(std::equal(expected.begin(), expected.end(), buffer.begin() + 1));
+                EXPECT_EQ(0, buffer[capacity]);
+            }
+            for (int repeat = 0; repeat < 2; ++repeat) {
+                EXPECT_EQ(SQL_NO_DATA, SQLGetData(stmt_, column, SQL_C_WCHAR, buffer.data() + 1,
+                    static_cast<SQLLEN>(capacity * sizeof(SQLWCHAR)), &indicator));
+            }
+        }
+        SQLINTEGER following = 0;
+        SQLLEN indicator = -99;
+        ASSERT_EQ(SQL_SUCCESS, SQLGetData(stmt_, 4, SQL_C_SLONG, &following,
+                                         sizeof(following), &indicator));
+        EXPECT_EQ(42, following);
+        EXPECT_EQ(static_cast<SQLLEN>(sizeof(following)), indicator);
+        EXPECT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
+        ASSERT_EQ(SQL_SUCCESS, SQLCloseCursor(stmt_));
+    }
+}
+
+// Eight bounded columns select the complete-buffered SQLGetData entry route.
+TEST_F(GetDataUtf16Test, RawUnitsThroughCompleteBufferedRows) {
+    for (const auto& value : Utf16TestData::Values()) {
+        SCOPED_TRACE(value.name);
+        for (const char* type : {"nvarchar(32)", "nchar(8)"}) {
+            SCOPED_TRACE(type);
+            const auto expected = Utf16TestData::Expected(value, std::string(type) == "nchar(8)");
+            const bool is_null = std::string(value.hex) == "NULL";
+            const std::string expression =
+                "CONVERT(" + std::string(type) + ", " + value.hex + ")";
+            std::string sql = "SELECT " + expression;
+            for (int column = 2; column <= 8; ++column) {
+                sql += ", " + expression;
+            }
+            ASSERT_EQ(SQL_SUCCESS, ExecDirect(sql));
+            SQLSMALLINT column_count = 0;
+            ASSERT_EQ(SQL_SUCCESS, SQLNumResultCols(stmt_, &column_count));
+            ASSERT_EQ(8, column_count);
+            ASSERT_EQ(SQL_SUCCESS, SQLFetch(stmt_));
+            for (SQLUSMALLINT column = 1; column <= 8; ++column) {
+                SCOPED_TRACE(column);
+                const size_t capacity = expected.size() + 1;
+                std::vector<SQLWCHAR> buffer(capacity + 2, 0xCCCC);
+                SQLLEN indicator = -99;
+                ASSERT_EQ(SQL_SUCCESS, SQLGetData(stmt_, column, SQL_C_WCHAR, buffer.data() + 1,
+                    static_cast<SQLLEN>(capacity * sizeof(SQLWCHAR)), &indicator));
+                EXPECT_EQ(is_null ? SQL_NULL_DATA :
+                          static_cast<SQLLEN>(expected.size() * sizeof(SQLWCHAR)), indicator);
+                EXPECT_EQ(0xCCCC, buffer.front());
+                EXPECT_EQ(0xCCCC, buffer.back());
+                if (!is_null) {
+                    EXPECT_TRUE(std::equal(expected.begin(), expected.end(), buffer.begin() + 1));
+                    EXPECT_EQ(0, buffer[capacity]);
+                }
+                EXPECT_EQ(SQL_NO_DATA, SQLGetData(stmt_, column, SQL_C_WCHAR, buffer.data() + 1,
+                    static_cast<SQLLEN>(capacity * sizeof(SQLWCHAR)), &indicator));
+            }
+            EXPECT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
+            ASSERT_EQ(SQL_SUCCESS, SQLCloseCursor(stmt_));
+        }
+    }
+}
+
+// Benefits-from-mock-tds: inspect RETURNVALUE token bytes independently of the
+// server's binary-to-nvarchar conversion; this checks their public delivery.
+TEST_F(GetDataUtf16Test, RawUnitsInWideOutputParameter) {
+    for (const auto& value : Utf16TestData::Values()) {
+        SCOPED_TRACE(value.name);
+        ASSERT_EQ(SQL_SUCCESS, ExecDirect(
+            "CREATE PROCEDURE #utf16_output @v nvarchar(32) OUTPUT AS "
+            "SET NOCOUNT ON; SELECT 1; SET @v=CONVERT(nvarchar(32), " +
+            std::string(value.hex) + ")"));
+        ASSERT_EQ(SQL_SUCCESS, SQLFreeStmt(stmt_, SQL_CLOSE));
+        const bool is_null = std::string(value.hex) == "NULL";
+        const size_t capacity = value.units.size() + 1;
+        std::vector<SQLWCHAR> buffer(capacity + 2, 0xCCCC);
+        SQLLEN indicator = -99;
+        ASSERT_EQ(SQL_SUCCESS, SQLBindParameter(stmt_, 1, SQL_PARAM_OUTPUT, SQL_C_WCHAR,
+            SQL_WVARCHAR, 32, 0, buffer.data() + 1,
+            static_cast<SQLLEN>(capacity * sizeof(SQLWCHAR)), &indicator));
+        ASSERT_EQ(SQL_SUCCESS, ExecDirect("{call #utf16_output(?)}"));
+        ASSERT_EQ(SQL_SUCCESS, SQLFetch(stmt_));
+        SQLINTEGER row = 0;
+        ASSERT_EQ(SQL_SUCCESS, SQLGetData(stmt_, 1, SQL_C_SLONG, &row, sizeof(row), nullptr));
+        EXPECT_EQ(1, row);
+        ASSERT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
+        ASSERT_EQ(SQL_NO_DATA, SQLMoreResults(stmt_));
+        EXPECT_EQ(is_null ? SQL_NULL_DATA :
+                  static_cast<SQLLEN>(value.units.size() * sizeof(SQLWCHAR)), indicator);
+        EXPECT_EQ(0xCCCC, buffer.front());
+        EXPECT_EQ(0xCCCC, buffer.back());
+        if (!is_null) {
+            EXPECT_TRUE(std::equal(value.units.begin(), value.units.end(), buffer.begin() + 1));
+            EXPECT_EQ(0, buffer[capacity]);
+        }
+        std::fill(buffer.begin(), buffer.end(), 0xAAAA);
+        indicator = -99;
+        EXPECT_EQ(SQL_NO_DATA, SQLMoreResults(stmt_));
+        EXPECT_EQ(-99, indicator);
+        EXPECT_TRUE(std::all_of(buffer.begin(), buffer.end(),
+                               [](SQLWCHAR unit) { return unit == 0xAAAA; }));
+        ASSERT_EQ(SQL_SUCCESS, SQLFreeStmt(stmt_, SQL_RESET_PARAMS));
+        ASSERT_EQ(SQL_SUCCESS, SQLFreeStmt(stmt_, SQL_CLOSE));
+        ASSERT_EQ(SQL_SUCCESS, ExecDirect("DROP PROCEDURE #utf16_output"));
+        ASSERT_EQ(SQL_SUCCESS, SQLFreeStmt(stmt_, SQL_CLOSE));
+    }
+}
+
+TEST_F(GetDataUtf16Test, NullThenRawUnitsReuseDestination) {
+    for (bool bound : {false, true}) {
+        SCOPED_TRACE(bound);
+        for (const char* type : {"nvarchar(32)", "nchar(4)", "nvarchar(max)"}) {
+            SCOPED_TRACE(type);
+            SQLWCHAR buffer[] = {0xCCCC, 0xCCCC, 0xCCCC, 0xCCCC, 0xCCCC, 0xCCCC, 0xCCCC};
+            SQLLEN indicator = -99;
+            constexpr SQLLEN capacity_bytes = 5 * sizeof(SQLWCHAR);
+            if (bound) {
+                ASSERT_EQ(SQL_SUCCESS, SQLBindCol(stmt_, 1, SQL_C_WCHAR, buffer + 1,
+                                                 capacity_bytes, &indicator));
+            }
+            ASSERT_EQ(SQL_SUCCESS, ExecDirect("SELECT CONVERT(" + std::string(type) +
+                ", v), 1, 2, 3, 4, 5, 6, 7 FROM "
+                "(VALUES (1, CONVERT(varbinary(8), NULL)), (2, 0x410000D800004200)) "
+                "AS t(ord, v) ORDER BY ord"));
+            for (int row = 0; row < 2; ++row) {
+                ASSERT_EQ(SQL_SUCCESS, SQLFetch(stmt_));
+                if (!bound) {
+                    ASSERT_EQ(SQL_SUCCESS, SQLGetData(stmt_, 1, SQL_C_WCHAR, buffer + 1,
+                                                     capacity_bytes, &indicator));
+                }
+                EXPECT_EQ("", ODBCTestUtils::GetDiagState(SQL_HANDLE_STMT, stmt_));
+                EXPECT_EQ(row == 0 ? SQL_NULL_DATA : 8, indicator);
+                EXPECT_EQ(0xCCCC, buffer[0]);
+                EXPECT_EQ(0xCCCC, buffer[6]);
+                if (row != 0) {
+                    const SQLWCHAR expected[] = {0x0041, 0xD800, 0, 0x0042, 0};
+                    EXPECT_TRUE(std::equal(std::begin(expected), std::end(expected), buffer + 1));
+                }
+            }
+            EXPECT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
+            ASSERT_EQ(SQL_SUCCESS, SQLCloseCursor(stmt_));
+            ASSERT_EQ(SQL_SUCCESS, SQLFreeStmt(stmt_, SQL_UNBIND));
+        }
+    }
+}
+
+TEST_F(GetDataUtf16Test, BoundedRawUnitsAcrossRepeatedReads) {
+    const std::vector<SQLWCHAR> expected = {
+        0xD800, 0x0041, 0xDC00, 0x0042, 0xFEFF, 0xFFFE,
+        0, 0x0043, 0xD83D, 0xDE00, 0, 0};
+    for (const char* type : {"nvarchar(32)", "nchar(12)"}) {
+        SCOPED_TRACE(type);
+        ASSERT_EQ(SQL_SUCCESS, ExecDirect("SELECT CONVERT(" + std::string(type) +
+            ", 0x00D8410000DC4200FFFEFEFF000043003DD800DE00000000), 42"));
+        ASSERT_EQ(SQL_SUCCESS, SQLFetch(stmt_));
+        SQLLEN indicator = -99;
+        // Neither a length probe nor a terminator-only buffer consumes payload.
+        for (SQLLEN capacity : {0, 2, 0, 2}) {
+            SQLWCHAR buffer[] = {0xCCCC, 0xCCCC, 0xCCCC};
+            ASSERT_EQ(SQL_SUCCESS_WITH_INFO,
+                      SQLGetData(stmt_, 1, SQL_C_WCHAR, buffer + 1, capacity, &indicator));
+            EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01004");
+            EXPECT_EQ(24, indicator);
+            EXPECT_EQ(0xCCCC, buffer[0]);
+            EXPECT_EQ(capacity == 0 ? 0xCCCC : 0, buffer[1]);
+            EXPECT_EQ(0xCCCC, buffer[2]);
+        }
+        for (size_t offset = 0; offset < expected.size(); offset += 2) {
+            SCOPED_TRACE(offset);
+            SQLWCHAR buffer[] = {0xCCCC, 0xCCCC, 0xCCCC, 0xCCCC, 0xCCCC};
+            const bool last = offset + 2 == expected.size();
+            ASSERT_EQ(last ? SQL_SUCCESS : SQL_SUCCESS_WITH_INFO,
+                      SQLGetData(stmt_, 1, SQL_C_WCHAR, buffer + 1, 6, &indicator));
+            if (!last) {
+                EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01004");
+            }
+            EXPECT_EQ(static_cast<SQLLEN>((expected.size() - offset) * sizeof(SQLWCHAR)), indicator);
+            EXPECT_EQ(expected[offset], buffer[1]);
+            EXPECT_EQ(expected[offset + 1], buffer[2]);
+            EXPECT_EQ(0, buffer[3]);
+            EXPECT_EQ(0xCCCC, buffer[0]);
+            EXPECT_EQ(0xCCCC, buffer[4]);
+        }
+        SQLWCHAR buffer[3] = {};
+        EXPECT_EQ(SQL_NO_DATA, SQLGetData(stmt_, 1, SQL_C_WCHAR, buffer, sizeof(buffer), &indicator));
+        EXPECT_EQ(SQL_NO_DATA, SQLGetData(stmt_, 1, SQL_C_WCHAR, buffer, sizeof(buffer), &indicator));
+        SQLINTEGER following = 0;
+        ASSERT_EQ(SQL_SUCCESS, SQLGetData(stmt_, 2, SQL_C_SLONG, &following,
+                                         sizeof(following), &indicator));
+        EXPECT_EQ(42, following);
+        EXPECT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
+        ASSERT_EQ(SQL_SUCCESS, SQLCloseCursor(stmt_));
+    }
+}
+
+// The application read boundary is fixed here; SQL Server chooses the wire's
+// PLP chunk layout, which needs a mock TDS server to control independently.
+TEST_F(GetDataUtf16Test, RawNvarcharMaxCrossesEightKiBReadBoundary) {
+    std::vector<SQLWCHAR> expected(4095, 0x0041);
+    const std::vector<SQLWCHAR> tail = {
+        0xD83D, 0xDE00, 0xD800, 0x0042, 0xDC00, 0xFEFF, 0xFFFE, 0, 0x0043, 0};
+    expected.insert(expected.end(), tail.begin(), tail.end());
+    ASSERT_GT(expected.size() * sizeof(SQLWCHAR), 8192u);
+    ASSERT_EQ(0xD83D, expected[4095]);
+    ASSERT_EQ(0xDE00, expected[4096]);
+    ASSERT_EQ(SQL_SUCCESS, ExecDirect(
+        "SELECT REPLICATE(CAST(N'A' AS nvarchar(max)), 4095) + "
+        "CONVERT(nvarchar(max), 0x3DD800DE00D8420000DCFFFEFEFF000043000000), 42"));
+    ASSERT_EQ(SQL_SUCCESS, SQLFetch(stmt_));
+    constexpr size_t payload_units = 4096;
+    std::vector<SQLWCHAR> buffer(payload_units + 3, 0xCCCC);
+    SQLLEN indicator = -99;
+    for (size_t offset = 0; offset < expected.size(); offset += payload_units) {
+        const size_t count = (std::min)(payload_units, expected.size() - offset);
+        const bool last = offset + count == expected.size();
+        std::fill(buffer.begin(), buffer.end(), 0xCCCC);
+        ASSERT_EQ(last ? SQL_SUCCESS : SQL_SUCCESS_WITH_INFO,
+                  SQLGetData(stmt_, 1, SQL_C_WCHAR, buffer.data() + 1,
+                      static_cast<SQLLEN>((payload_units + 1) * sizeof(SQLWCHAR)), &indicator));
+        if (!last) {
+            EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01004");
+        }
+        EXPECT_EQ(static_cast<SQLLEN>((expected.size() - offset) * sizeof(SQLWCHAR)), indicator);
+        EXPECT_TRUE(std::equal(expected.begin() + offset, expected.begin() + offset + count,
+                               buffer.begin() + 1));
+        EXPECT_EQ(0, buffer[count + 1]);
+        EXPECT_EQ(0xCCCC, buffer.front());
+        EXPECT_EQ(0xCCCC, buffer.back());
+    }
+    EXPECT_EQ(SQL_NO_DATA, SQLGetData(stmt_, 1, SQL_C_WCHAR, buffer.data() + 1,
+        static_cast<SQLLEN>((payload_units + 1) * sizeof(SQLWCHAR)), &indicator));
+    SQLINTEGER following = 0;
+    ASSERT_EQ(SQL_SUCCESS, SQLGetData(stmt_, 2, SQL_C_SLONG, &following,
+                                     sizeof(following), &indicator));
+    EXPECT_EQ(42, following);
+    EXPECT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
+    ASSERT_EQ(SQL_SUCCESS, SQLCloseCursor(stmt_));
+}
 
 // SQLGetData without a positioned row (no SQLFetch yet) fails with 24000.
 TEST_F(GetDataLiveTest, NoCurrentRow) {

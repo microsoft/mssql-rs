@@ -19,7 +19,9 @@
 //         truncation, unbind, rebind, and mixed SQLGetData afterwards
 
 #include "odbc_test_fixture.h"
+#include "utf16_test_data.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -49,6 +51,218 @@ protected:
         return ok;
     }
 };
+
+class FetchScrollUtf16Test : public FetchScrollLiveTest {
+protected:
+    void SetUp() override {
+        ASSERT_NO_FATAL_FAILURE(FetchScrollLiveTest::SetUp());
+        SQLCHAR version[32] = {};
+        ASSERT_SQL_OK(SQLGetInfoA(dbc_, SQL_DRIVER_VER, version, sizeof(version), nullptr),
+                      SQL_HANDLE_DBC, dbc_);
+        RecordProperty("driver_version", reinterpret_cast<const char*>(version));
+    }
+};
+
+TEST_F(FetchScrollUtf16Test, RawUnitsInBoundRowArrays) {
+    constexpr size_t row_count = 4;
+    struct Column {
+        SQLWCHAR before;
+        SQLWCHAR text[row_count][9];
+        SQLWCHAR after;
+        SQLLEN lengths[row_count];
+    };
+    Column varying;
+    Column fixed;
+    SQLULEN fetched = 0;
+    SQLUSMALLINT status[row_count] = {};
+    ASSERT_EQ(SQL_SUCCESS, SQLSetStmtAttr(stmt_, SQL_ATTR_ROW_ARRAY_SIZE,
+                                         reinterpret_cast<SQLPOINTER>(row_count), 0));
+    ASSERT_EQ(SQL_SUCCESS, SQLSetStmtAttr(stmt_, SQL_ATTR_ROWS_FETCHED_PTR, &fetched, 0));
+    ASSERT_EQ(SQL_SUCCESS, SQLSetStmtAttr(stmt_, SQL_ATTR_ROW_STATUS_PTR, status, 0));
+    ASSERT_EQ(SQL_SUCCESS, SQLBindCol(stmt_, 1, SQL_C_WCHAR, varying.text,
+                                     sizeof(varying.text[0]), varying.lengths));
+    ASSERT_EQ(SQL_SUCCESS, SQLBindCol(stmt_, 2, SQL_C_WCHAR, fixed.text,
+                                     sizeof(fixed.text[0]), fixed.lengths));
+    const auto& values = Utf16TestData::Values();
+    std::string sql = "SELECT CONVERT(nvarchar(32), v), CONVERT(nchar(8), v) FROM (VALUES ";
+    for (size_t i = 0; i < values.size(); ++i) {
+        if (i != 0) sql += ", ";
+        sql += "(" + std::to_string(i) + ", CONVERT(varbinary(32), " + values[i].hex + "))";
+    }
+    ExecDirect(sql + ") AS t(ord, v) ORDER BY ord");
+    for (size_t start = 0; start < values.size(); start += row_count) {
+        for (Column* column : {&varying, &fixed}) {
+            column->before = column->after = 0xCCCC;
+            for (auto& text : column->text) {
+                std::fill(std::begin(text), std::end(text), 0xCCCC);
+            }
+            std::fill(std::begin(column->lengths), std::end(column->lengths), -99);
+        }
+        ASSERT_EQ(SQL_SUCCESS, SQLFetchScroll(stmt_, SQL_FETCH_NEXT, 0))
+            << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_STMT, stmt_);
+        const size_t count = (std::min)(row_count, values.size() - start);
+        ASSERT_EQ(count, fetched);
+        for (Column* column : {&varying, &fixed}) {
+            EXPECT_EQ(0xCCCC, column->before);
+            EXPECT_EQ(0xCCCC, column->after);
+        }
+        for (size_t i = 0; i < row_count; ++i) {
+            SCOPED_TRACE(start + i);
+            EXPECT_EQ(i < count ? SQL_ROW_SUCCESS : SQL_ROW_NOROW, status[i]);
+            for (const Column* column : {&varying, &fixed}) {
+                const SQLWCHAR* buffer = column->text[i];
+                const SQLLEN indicator = column->lengths[i];
+                if (i >= count || std::string(values[start + i].hex) == "NULL") {
+                    EXPECT_EQ(i >= count ? -99 : SQL_NULL_DATA, indicator);
+                    if (i >= count) {
+                        EXPECT_TRUE(std::all_of(buffer, buffer + 9,
+                                               [](SQLWCHAR unit) { return unit == 0xCCCC; }));
+                    }
+                } else {
+                    const auto expected = Utf16TestData::Expected(values[start + i], column == &fixed);
+                    EXPECT_EQ(static_cast<SQLLEN>(expected.size() * sizeof(SQLWCHAR)), indicator);
+                    EXPECT_TRUE(std::equal(expected.begin(), expected.end(), buffer));
+                    EXPECT_EQ(0, buffer[expected.size()]);
+                    EXPECT_TRUE(std::all_of(buffer + expected.size() + 1, buffer + 9,
+                                           [](SQLWCHAR unit) { return unit == 0xCCCC; }));
+                }
+            }
+        }
+    }
+    EXPECT_EQ(SQL_NO_DATA, SQLFetchScroll(stmt_, SQL_FETCH_NEXT, 0));
+    EXPECT_EQ(SQL_NO_DATA, SQLFetchScroll(stmt_, SQL_FETCH_NEXT, 0));
+    ASSERT_EQ(SQL_SUCCESS, SQLCloseCursor(stmt_));
+}
+
+TEST_F(FetchScrollUtf16Test, BoundedRawUnitsTruncateBoundRows) {
+    constexpr size_t row_count = 3;
+    struct Column {
+        SQLWCHAR before;
+        SQLWCHAR text[row_count][3];
+        SQLWCHAR after;
+        SQLLEN lengths[row_count];
+    } column;
+    SQLULEN fetched = 0;
+    SQLUSMALLINT status[row_count] = {};
+    ASSERT_EQ(SQL_SUCCESS, SQLSetStmtAttr(stmt_, SQL_ATTR_ROW_ARRAY_SIZE,
+                                         reinterpret_cast<SQLPOINTER>(row_count), 0));
+    ASSERT_EQ(SQL_SUCCESS, SQLSetStmtAttr(stmt_, SQL_ATTR_ROWS_FETCHED_PTR, &fetched, 0));
+    ASSERT_EQ(SQL_SUCCESS, SQLSetStmtAttr(stmt_, SQL_ATTR_ROW_STATUS_PTR, status, 0));
+    ASSERT_EQ(SQL_SUCCESS, SQLBindCol(stmt_, 1, SQL_C_WCHAR, column.text,
+                                     sizeof(column.text[0]), column.lengths));
+    const SQLWCHAR expected[3][2] = {{0xD800, 0x0041}, {0xDC00, 0}, {0xD83D, 0xDE00}};
+    for (const char* type : {"nvarchar(32)", "nchar(4)"}) {
+        SCOPED_TRACE(type);
+        ExecDirect("SELECT CONVERT(" + std::string(type) +
+            ", v) FROM (VALUES (1, 0x00D84100FFFEFEFF), (2, 0x00DC000041000000), "
+            "(3, 0x3DD800DE41000000)) AS t(ord, v) ORDER BY ord");
+        column.before = column.after = 0xCCCC;
+        for (auto& text : column.text) {
+            std::fill(std::begin(text), std::end(text), 0xCCCC);
+        }
+        std::fill(std::begin(column.lengths), std::end(column.lengths), -99);
+        ASSERT_EQ(SQL_SUCCESS_WITH_INFO, SQLFetchScroll(stmt_, SQL_FETCH_NEXT, 0))
+            << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_STMT, stmt_);
+        EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01004");
+        ASSERT_EQ(row_count, fetched);
+        EXPECT_EQ(0xCCCC, column.before);
+        EXPECT_EQ(0xCCCC, column.after);
+        for (size_t i = 0; i < row_count; ++i) {
+            SCOPED_TRACE(i);
+            EXPECT_EQ(SQL_ROW_SUCCESS_WITH_INFO, status[i]);
+            EXPECT_EQ(8, column.lengths[i]);
+            EXPECT_EQ(expected[i][0], column.text[i][0]);
+            EXPECT_EQ(expected[i][1], column.text[i][1]);
+            EXPECT_EQ(0, column.text[i][2]);
+        }
+        EXPECT_EQ(SQL_NO_DATA, SQLFetchScroll(stmt_, SQL_FETCH_NEXT, 0));
+        ASSERT_EQ(SQL_SUCCESS, SQLCloseCursor(stmt_));
+    }
+}
+
+TEST_F(FetchScrollUtf16Test, RawUnitsFitExactBoundCapacity) {
+    for (const auto& value : Utf16TestData::Values()) {
+        SCOPED_TRACE(value.name);
+        for (const char* type : {"nvarchar(32)", "nchar(8)", "nvarchar(max)"}) {
+            SCOPED_TRACE(type);
+            const auto expected = Utf16TestData::Expected(value, std::string(type) == "nchar(8)");
+            const bool is_null = std::string(value.hex) == "NULL";
+            const size_t capacity = expected.size() + 1;
+            std::vector<SQLWCHAR> buffer(capacity + 2, 0xCCCC);
+            SQLLEN indicator = -99;
+            ASSERT_EQ(SQL_SUCCESS, SQLBindCol(stmt_, 1, SQL_C_WCHAR, buffer.data() + 1,
+                static_cast<SQLLEN>(capacity * sizeof(SQLWCHAR)), &indicator));
+            ExecDirect("SELECT CONVERT(" + std::string(type) + ", " + value.hex + ")");
+            ASSERT_EQ(SQL_SUCCESS, SQLFetchScroll(stmt_, SQL_FETCH_NEXT, 0));
+            EXPECT_EQ(is_null ? SQL_NULL_DATA :
+                      static_cast<SQLLEN>(expected.size() * sizeof(SQLWCHAR)), indicator);
+            EXPECT_EQ(0xCCCC, buffer.front());
+            EXPECT_EQ(0xCCCC, buffer.back());
+            if (!is_null) {
+                EXPECT_TRUE(std::equal(expected.begin(), expected.end(), buffer.begin() + 1));
+                EXPECT_EQ(0, buffer[capacity]);
+            }
+            EXPECT_EQ(SQL_NO_DATA, SQLFetchScroll(stmt_, SQL_FETCH_NEXT, 0));
+            ASSERT_EQ(SQL_SUCCESS, SQLCloseCursor(stmt_));
+            ASSERT_EQ(SQL_SUCCESS, SQLFreeStmt(stmt_, SQL_UNBIND));
+        }
+    }
+}
+
+TEST_F(FetchScrollUtf16Test, BoundTruncationPreservesOnlyCompletePairs) {
+    struct Boundary {
+        const char* hex;
+        size_t capacity;
+        std::vector<SQLWCHAR> expected;
+    };
+    const Boundary cases[] = {
+        {"0x41003DD800DE4200", 2, {0x0041}},
+        {"0x41003DD800DE4200", 3, {0x0041}},
+        {"0x41003DD800DE4200", 4, {0x0041, 0xD83D, 0xDE00}},
+        {"0x41003DD800DE4200", 5, {0x0041, 0xD83D, 0xDE00, 0x0042}},
+        {"0x410000D842004300", 2, {0x0041}},
+        {"0x410000D842004300", 3, {0x0041, 0xD800}},
+        {"0x410000D842004300", 4, {0x0041, 0xD800, 0x0042}},
+        {"0x410000D842004300", 5, {0x0041, 0xD800, 0x0042, 0x0043}},
+        {"0x3DD800DE41004200", 2, {}},
+        {"0x3DD800DE41004200", 3, {0xD83D, 0xDE00}},
+        {"0x3DD800DE41004200", 4, {0xD83D, 0xDE00, 0x0041}},
+        {"0x3DD800DE41004200", 5, {0xD83D, 0xDE00, 0x0041, 0x0042}},
+    };
+    for (const char* type : {"nvarchar(32)", "nchar(4)", "nvarchar(max)"}) {
+        SCOPED_TRACE(type);
+        for (const auto& boundary : cases) {
+            SCOPED_TRACE(boundary.hex);
+            SCOPED_TRACE(boundary.capacity);
+            std::vector<SQLWCHAR> buffer(boundary.capacity + 2, 0xCCCC);
+            SQLLEN indicator = -99;
+            ASSERT_EQ(SQL_SUCCESS, SQLBindCol(stmt_, 1, SQL_C_WCHAR, buffer.data() + 1,
+                static_cast<SQLLEN>(boundary.capacity * sizeof(SQLWCHAR)), &indicator));
+            ExecDirect("SELECT CONVERT(" + std::string(type) +
+                ", v) FROM (VALUES (1, " + boundary.hex +
+                "), (2, 0x4100420043004400)) AS t(ord, v) ORDER BY ord");
+            std::vector<SQLWCHAR> ordinary = {0x0041, 0x0042, 0x0043, 0x0044};
+            ordinary.resize(boundary.capacity - 1);
+            // The second row reuses the binding and buffer without resetting them.
+            for (const auto& expected : {boundary.expected, ordinary}) {
+                const bool truncated = boundary.capacity < 5;
+                ASSERT_EQ(truncated ? SQL_SUCCESS_WITH_INFO : SQL_SUCCESS,
+                          SQLFetchScroll(stmt_, SQL_FETCH_NEXT, 0));
+                if (truncated) {
+                    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01004");
+                }
+                EXPECT_EQ(8, indicator);
+                EXPECT_TRUE(std::equal(expected.begin(), expected.end(), buffer.begin() + 1));
+                EXPECT_EQ(0, buffer[expected.size() + 1]);
+                EXPECT_EQ(0xCCCC, buffer.front());
+                EXPECT_EQ(0xCCCC, buffer.back());
+            }
+            EXPECT_EQ(SQL_NO_DATA, SQLFetchScroll(stmt_, SQL_FETCH_NEXT, 0));
+            ASSERT_EQ(SQL_SUCCESS, SQLCloseCursor(stmt_));
+            ASSERT_EQ(SQL_SUCCESS, SQLFreeStmt(stmt_, SQL_UNBIND));
+        }
+    }
+}
 
 TEST(FetchScrollTest, NullHandle) {
     EXPECT_EQ(SQL_INVALID_HANDLE, SQLFetchScroll(SQL_NULL_HSTMT, SQL_FETCH_NEXT, 0));
