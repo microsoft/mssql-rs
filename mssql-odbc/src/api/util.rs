@@ -317,6 +317,39 @@ mod tests {
         }
     }
 
+    #[test]
+    fn utf16le_validation_matches_every_single_code_unit() {
+        for unit in 0..=u16::MAX {
+            assert_eq!(
+                is_valid_utf16le(&unit.to_le_bytes()),
+                String::from_utf16(&[unit]).is_ok(),
+                "unit={unit:#06x}"
+            );
+        }
+        assert!(is_valid_utf16le(&[]));
+        assert!(!is_valid_utf16le(b"a"));
+        assert!(!is_valid_utf16le(b"a\0b"));
+    }
+
+    #[test]
+    fn utf16le_validation_preserves_surrogate_pair_rules() {
+        let units = [
+            0, 0x7f, 0x80, 0xd7ff, 0xd800, 0xdbff, 0xdc00, 0xdfff, 0xe000, 0xffff,
+        ];
+        for first in units {
+            for second in units {
+                let pair = [first, second];
+                let mut bytes = vec![0xff];
+                bytes.extend(pair.into_iter().flat_map(u16::to_le_bytes));
+                assert_eq!(
+                    is_valid_utf16le(&bytes[1..]),
+                    String::from_utf16(&pair).is_ok(),
+                    "pair={pair:x?}"
+                );
+            }
+        }
+    }
+
     mod memory_safety {
         use super::*;
         use crate::api::odbc_types::SqlLen;
