@@ -1390,7 +1390,8 @@ unsafe fn try_write_direct_captured_string_chunk(
     if target_type != SQL_C_WCHAR {
         return None;
     }
-    let cp1252 = is_cp1252(value.encoding_type());
+    let cp1252 = matches!(value.encoding_type(), EncodingType::LcidBased(_))
+        && (validated || is_cp1252(value.encoding_type()));
     if !(cp1252
         || matches!(value.encoding_type(), EncodingType::Utf16) && bytes.len().is_multiple_of(2))
     {
@@ -4505,7 +4506,7 @@ mod tests {
             .finish();
         tracing::subscriber::with_default(subscriber, || {
             let h = TestHandles::with_env_dbc_stmt();
-            for capacity in [4, 8] {
+            for capacity in [4, 8, 4, 8] {
                 logs.lock().unwrap().clear();
                 let value = ColumnValues::String(SqlString::new(
                     vec![0x80, 0x91],
@@ -4543,6 +4544,30 @@ mod tests {
                 );
                 assert_eq!(indicator, 4);
                 assert_eq!(output[0], 0x20AC);
+                if capacity == 4 {
+                    for (bytes, expected_rc) in [(2, SQL_SUCCESS_WITH_INFO), (4, SQL_SUCCESS)] {
+                        output.fill(0xAAAA);
+                        assert_eq!(
+                            unsafe {
+                                sql_get_data(
+                                    h.stmt,
+                                    1,
+                                    SQL_C_WCHAR,
+                                    output.as_mut_ptr().cast(),
+                                    bytes,
+                                    &mut indicator,
+                                )
+                            },
+                            expected_rc
+                        );
+                        assert_eq!(indicator, 2);
+                        if bytes == 2 {
+                            assert_eq!(output, [0, 0xAAAA, 0xAAAA, 0xAAAA]);
+                        } else {
+                            assert_eq!(output, [0x2018, 0, 0xAAAA, 0xAAAA]);
+                        }
+                    }
+                }
                 let log = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
                 assert_eq!(log.matches("Unsupported LCID").count(), 1, "{log}");
                 assert_eq!(log.lines().count(), 1, "{log}");
