@@ -276,8 +276,10 @@ protected:
 class GetDataUtf16Test : public GetDataLiveTest {
 protected:
     void SetUp() override {
-        ASSERT_TRUE(ODBCTestConfig::Instance().HasConnection());
         ASSERT_NO_FATAL_FAILURE(GetDataLiveTest::SetUp());
+        if (IsSkipped()) {
+            return;
+        }
         SQLCHAR version[32] = {};
         ASSERT_SQL_OK(SQLGetInfoA(dbc_, SQL_DRIVER_VER, version, sizeof(version), nullptr),
                       SQL_HANDLE_DBC, dbc_);
