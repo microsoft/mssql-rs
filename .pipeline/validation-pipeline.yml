@@ -1,70 +1,127 @@
-# CI trigger only on development. Main-branch builds are produced by the
-# Official pipeline (OneBranch/OfficialPythonWheelsBuild.yml) on merge.
+# TEMPORARY — this branch ONLY. Do not merge.
+#
+# The real contents of this file are replaced so that the existing PR validation
+# definition (2267 in `public`) runs the Azure Linux 3 probe instead of the normal
+# validation suite. That avoids standing up a throwaway pipeline in ADO. Revert
+# this file before the branch merges; the only changes that should survive are
+# whatever image/pool adjustments the evaluation concludes we need.
+#
+# WHY: three findings against the Ubuntu agent images (USN-7977-1 git-lfs,
+# USN-7588-1 gss-ntlmssp, USN-8344-1 python3-pip) are fixed on jammy only under
+# Ubuntu Pro, so RUST-UBUSLIM cannot be patched clean. RUST-AZL3 is the candidate
+# replacement and is already present in the x64 and utility pools at
+# poolBufferPercentage 0, reachable only through the imageOverride demands below.
+#
+# WHAT THIS ANSWERS:
+#   1. what the AZL3 starter image already provides, az especially, since the
+#      linux-azcli artifact is apt-only and was dropped from the image
+#   2. whether the three CVE packages are present and patched, and whether
+#      anything is still pending
+#   3. which host-level Debian assumptions in our scripts actually break:
+#      printinfo.sh is dpkg-based, scripts/install-deps.sh is apt-based, and
+#      install-dependencies.yml disables unattended-upgrades
+#
+# Pool names are resolved at COMPILE time, as in the file this replaces. The pools
+# are project-scoped, so a wrong branch fails with "pool not found" rather than
+# putting unreviewed code on a trusted agent.
 trigger:
 - development
 
 parameters:
-- name: buildType
-  displayName: Type of the build to produce
-  type: string
-  values:
-  - Both
-  - Debug
-  - Release
-  default: Both
+- name: runHostBringUp
+  displayName: Run the real install-dependencies template on AZL3 (failures are the point)
+  type: boolean
+  default: true
 
-- name: RunFuzz
-  displayName: Run Fuzz Tests (30 min)
+# RUST-AZL3-ARM64 does not exist yet: its base gallery image requires
+# TrustedLaunch and no v5 ARM SKU supports it, including the Standard_D8pds_v5 the
+# ARM pools run. Until that is resolved the image is in no pool and this demand
+# could never be satisfied.
+- name: runArm64
+  displayName: Include the ARM64 probe (only once RUST-AZL3-ARM64 exists in the pools)
   type: boolean
   default: false
-
-- name: RunLongHaul
-  displayName: Run Long-Haul BCP Test (30 min)
-  type: boolean
-  default: false
-
-- name: sqlInstanceMode
-  displayName: SQL host cardinality for ARM test stages
-  type: string
-  values:
-  - shared
-  - per-job
-  default: shared
-
-- name: sqlImageTag
-  displayName: SQL Server docker image tag for ARM test stages
-  type: string
-  default: '2025-latest'
-
-variables:
-  # msodbcsql18 reference-driver version for the ODBC C++ e2e parity comparison.
-  # Pinned so an upstream release can't silently change what the parity table
-  # compares against. Consumed on Windows by install-msodbcsql.ps1 and on Linux
-  # by containerized-odbc-e2e.sh (which appends the Debian package revision).
-  msodbcsqlVersion: '18.6.2.1'
 
 stages:
-- template: templates/validation-stages.yml
-  parameters:
-    buildType: ${{ parameters.buildType }}
-    RunFuzz: ${{ parameters.RunFuzz }}
-    RunLongHaul: ${{ parameters.RunLongHaul }}
-    sqlInstanceMode: ${{ parameters.sqlInstanceMode }}
-    sqlImageTag: ${{ parameters.sqlImageTag }}
-    # This file is shared by TWO pipeline definitions: 2267 in the `public`
-    # project (GitHub PRs, i.e. unreviewed code) and 2204 in `mssql-rs` (the ADO
-    # mirror). Pool names must resolve at compile time, so this is a template
-    # rather than a runtime variable. The pools are project-scoped, so a wrong
-    # branch here fails with "pool not found" rather than putting unreviewed
-    # code on a trusted agent.
-    ${{ if eq(variables['System.TeamProject'], 'public') }}:
-      poolName: RUST-PUBLIC-X64-WUS3
-      armPoolName: RUST-PUBLIC-ARM64-WUS3
-      utilPoolName: RUST-PUBLIC-UTIL-WUS3
-    ${{ else }}:
-      poolName: RUST-X64-WUS3
-      armPoolName: RUST-ARM64-WUS3
-      utilPoolName: RUST-UTIL-WUS3
-    # PR validation for internal ADO and GitHub PRs. GitHub PRs run in the public
-    # project, which lacks 'Magnitude Test', so exclude the infra stages here.
-    includeInfraStages: false
+- stage: Probe
+  displayName: Azure Linux 3 probe
+  jobs:
+
+  - job: Inventory_AZL3_Util
+    displayName: 'AZL3 x64 on the utility pool'
+    pool:
+      ${{ if eq(variables['System.TeamProject'], 'public') }}:
+        name: RUST-PUBLIC-UTIL-WUS3
+      ${{ else }}:
+        name: RUST-UTIL-WUS3
+      demands:
+      - imageOverride -equals RUST-AZL3
+    steps:
+    - checkout: none
+    - template: templates/azl3-inventory-steps.yml
+      parameters:
+        label: 'AZL3 x64 (utility pool, D2ads_v6)'
+
+  - job: Inventory_AZL3_X64
+    displayName: 'AZL3 x64 on the build pool'
+    pool:
+      ${{ if eq(variables['System.TeamProject'], 'public') }}:
+        name: RUST-PUBLIC-X64-WUS3
+      ${{ else }}:
+        name: RUST-X64-WUS3
+      demands:
+      - imageOverride -equals RUST-AZL3
+    steps:
+    - checkout: none
+    - template: templates/azl3-inventory-steps.yml
+      parameters:
+        label: 'AZL3 x64 (build pool, D8ads_v6)'
+
+  # Baseline on the image being replaced, so the comparison is like for like
+  # rather than against expectations.
+  - job: Inventory_Ubuntu_Baseline
+    displayName: 'RUST-UBUSLIM baseline for comparison'
+    pool:
+      ${{ if eq(variables['System.TeamProject'], 'public') }}:
+        name: RUST-PUBLIC-X64-WUS3
+      ${{ else }}:
+        name: RUST-X64-WUS3
+      demands:
+      - imageOverride -equals RUST-UBUSLIM
+    steps:
+    - checkout: none
+    - template: templates/azl3-inventory-steps.yml
+      parameters:
+        label: 'RUST-UBUSLIM x64 (current production image)'
+
+  - ${{ if eq(parameters.runArm64, true) }}:
+    - job: Inventory_AZL3_ARM64
+      displayName: 'AZL3 ARM64 on the build pool'
+      pool:
+        ${{ if eq(variables['System.TeamProject'], 'public') }}:
+          name: RUST-PUBLIC-ARM64-WUS3
+        ${{ else }}:
+          name: RUST-ARM64-WUS3
+        demands:
+        - imageOverride -equals RUST-AZL3-ARM64
+      steps:
+      - checkout: none
+      - template: templates/azl3-inventory-steps.yml
+        parameters:
+          label: 'AZL3 ARM64 (build pool, D8pds_v5)'
+
+  - ${{ if eq(parameters.runHostBringUp, true) }}:
+    - job: HostBringUp_AZL3
+      displayName: 'Run install-dependencies on AZL3 (expected to fail)'
+      pool:
+        ${{ if eq(variables['System.TeamProject'], 'public') }}:
+          name: RUST-PUBLIC-X64-WUS3
+        ${{ else }}:
+          name: RUST-X64-WUS3
+        demands:
+        - imageOverride -equals RUST-AZL3
+      steps:
+      - checkout: self
+      - template: templates/install-dependencies.yml
+        parameters:
+          osType: Linux
