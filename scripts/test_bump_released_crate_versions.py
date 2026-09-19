@@ -261,6 +261,7 @@ def test_issue_created_once_then_reused_and_updated(monkeypatch):
     assert 'mssql-tds = { path = "../mssql-tds", version = "0.2.0", default-features = false }' in stored[0]["body"]
     assert "Run `cargo bfmt`, `cargo bclippy`, and `cargo btest`." in stored[0]["body"]
     assert "Fixes #<this issue number>" in stored[0]["body"]
+    assert "plus the version summary above" in stored[0]["body"]
     assert "put maintainer notes in issue comments" in stored[0]["body"]
     template = yaml.safe_load(
         (ROOT / ".github" / "ISSUE_TEMPLATE" / "feature_request.yml").read_text()

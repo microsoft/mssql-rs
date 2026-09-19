@@ -78,7 +78,7 @@ When a bump is needed, the workflow creates or updates one tracking issue labele
    `mssql-tds` dependency when the core crate is bumped;
 3. crisp maintainer instructions to apply the snippets, run `cargo bfmt`,
    `cargo bclippy`, and `cargo btest`, then open a PR with
-   `Fixes #<issue-number>`.
+   `Fixes #<issue-number>` and the version summary in the PR description.
 
 The workflow queries only open issues labeled `automation:crate-version-bump`,
 then checks the hidden marker in their bodies before reusing or updating one.

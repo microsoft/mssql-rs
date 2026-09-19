@@ -103,7 +103,8 @@ def issue_body(summary, changes):
         + "\n\nInstructions:\n\n"
         "1. Apply the version changes above.\n"
         "2. Run `cargo bfmt`, `cargo bclippy`, and `cargo btest`.\n"
-        "3. Open a PR and include `Fixes #<this issue number>` in the description.\n\n"
+        "3. Open a PR and include `Fixes #<this issue number>` plus the version "
+        "summary above in the description.\n\n"
         "### Affected crate\n\n"
         + ", ".join(f"`{crate}`" for crate in changes)
         + "\n\n"
