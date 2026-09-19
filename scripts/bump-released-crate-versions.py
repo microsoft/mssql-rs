@@ -96,9 +96,10 @@ def push_bump_branch(root):
 
 def ensure_bump_issue(summary, crates):
     endpoint = f"repos/{os.environ['GITHUB_REPOSITORY']}/issues"
-    # List directly rather than searching: search indexing can lag a previous run.
+    # Avoid both search-index lag and a cached listing from the previous run.
     result = subprocess.run(
-        ["gh", "api", f"{endpoint}?state=open&per_page=100", "--paginate", "--slurp"],
+        ["gh", "api", f"{endpoint}?state=open&per_page=100", "--paginate", "--slurp",
+         "--header", "Cache-Control: no-cache"],
         check=True, stdout=subprocess.PIPE, text=True,
     )
     matches = [

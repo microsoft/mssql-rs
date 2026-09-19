@@ -293,7 +293,8 @@ def test_issue_created_once_then_reused_and_updated(monkeypatch):
         endpoint = "repos/microsoft/mssql-rs/issues"
         if "--method" not in args:
             assert args == [
-                "gh", "api", f"{endpoint}?state=open&per_page=100", "--paginate", "--slurp"
+                "gh", "api", f"{endpoint}?state=open&per_page=100", "--paginate", "--slurp",
+                "--header", "Cache-Control: no-cache"
             ]
             # The real issue is on the second page; PRs and unrelated issues must not match.
             pages = [[
