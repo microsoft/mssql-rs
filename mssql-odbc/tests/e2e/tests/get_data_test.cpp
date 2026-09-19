@@ -10,8 +10,10 @@
 
 #include "odbc_test_fixture.h"
 #include "utf16_test_data.h"
+#include "cp1252_test_data.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -353,6 +355,201 @@ TEST_F(GetDataUtf16Test, Cp1252VarcharPreservesBomShapedBytes) {
 
 TEST_F(GetDataUtf16Test, Utf8VarcharPreservesBomAndHighBytes) {
     CheckVarcharBomCollation(true);
+}
+
+TEST_F(GetDataUtf16Test, Cp1252MaterializedRoutesFitExactCapacity) {
+    for (const auto &value : Cp1252TestData::Values()) {
+        SCOPED_TRACE(value.name);
+        const bool is_null = value.hex == "NULL";
+        for (int route = 0; route < 3; ++route) {
+            SCOPED_TRACE(route);
+            const std::string expression = route == 2 ? "CAST(v AS sql_variant)" : "v";
+            // The MAX column keeps route 0 on captured delivery; eight
+            // bounded columns exercise complete-buffered delivery instead.
+            const std::string columns =
+                route == 0 ? ", CAST('tail' AS varchar(max))" : ", 1, 2, 3, 4, 5";
+            ASSERT_EQ(SQL_SUCCESS,
+                      ExecDirect("SET NOCOUNT ON; DECLARE @t TABLE(v varchar(256) "
+                                 "COLLATE Latin1_General_100_CI_AS); INSERT @t VALUES(" +
+                                 value.hex + "); SELECT " + expression +
+                                 ", CONVERT(varbinary(256), v), " +
+                                 Cp1252TestData::CodePageExpression + columns + " FROM @t"));
+            SQLSMALLINT column_count = 0;
+            ASSERT_EQ(SQL_SUCCESS, SQLNumResultCols(stmt_, &column_count));
+            ASSERT_EQ(route == 0 ? 4 : 8, column_count);
+            ASSERT_EQ(SQL_SUCCESS, SQLFetch(stmt_));
+            SQLLEN indicator = -99;
+            const size_t capacity = (value.units.size() + 1) * 2;
+            std::vector<unsigned char> buffer(capacity + 2, 0xCC);
+            ASSERT_EQ(1u, reinterpret_cast<uintptr_t>(buffer.data() + 1) % alignof(SQLWCHAR));
+            ASSERT_EQ(SQL_SUCCESS,
+                      SQLGetData(stmt_, 1, SQL_C_WCHAR, buffer.data() + 1, capacity, &indicator));
+            EXPECT_EQ(is_null ? SQL_NULL_DATA : static_cast<SQLLEN>(value.units.size() * 2),
+                      indicator);
+            EXPECT_EQ("", StmtDiagState());
+            EXPECT_EQ(0xCC, buffer.front());
+            EXPECT_EQ(0xCC, buffer.back());
+            if (!is_null) {
+                Cp1252TestData::CheckBytes(buffer, 1, capacity, value.units);
+            }
+            for (int repeat = 0; repeat < 2; ++repeat) {
+                std::vector<unsigned char> buffer(10, 0xCC);
+                EXPECT_EQ(SQL_NO_DATA,
+                          SQLGetData(stmt_, 1, SQL_C_WCHAR, buffer.data() + 1, 8, &indicator));
+                EXPECT_EQ(std::vector<unsigned char>(10, 0xCC), buffer);
+            }
+            std::vector<unsigned char> binary(value.bytes.size() + 2, 0xCC);
+            ASSERT_EQ(SQL_SUCCESS, SQLGetData(stmt_, 2, SQL_C_BINARY, binary.data() + 1,
+                                              value.bytes.size(), &indicator));
+            EXPECT_EQ(is_null ? SQL_NULL_DATA : static_cast<SQLLEN>(value.bytes.size()), indicator);
+            EXPECT_EQ(0xCC, binary.front());
+            EXPECT_EQ(0xCC, binary.back());
+            if (!is_null) {
+                EXPECT_TRUE(std::equal(value.bytes.begin(), value.bytes.end(), binary.begin() + 1));
+            }
+            SQLINTEGER codepage = 0;
+            ASSERT_EQ(SQL_SUCCESS,
+                      SQLGetData(stmt_, 3, SQL_C_SLONG, &codepage, sizeof(codepage), nullptr));
+            ASSERT_EQ(1252, codepage);
+            EXPECT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
+            ASSERT_EQ(SQL_SUCCESS, SQLCloseCursor(stmt_));
+        }
+    }
+}
+
+TEST_F(GetDataUtf16Test, NonCp1252MaterializedHealthyControls) {
+    struct Control {
+        const char* collation;
+        SQLINTEGER codepage;
+        const char* hex;
+        std::vector<unsigned char> bytes;
+        std::vector<SQLWCHAR> units;
+    };
+    const Control controls[] = {
+        {"Cyrillic_General_CI_AS", 1251, "0xC0E0", {0xC0, 0xE0}, {0x0410, 0x0430}},
+        {"Japanese_XJIS_100_CI_AS", 932, "0x82A082A2",
+            {0x82, 0xA0, 0x82, 0xA2}, {0x3042, 0x3044}},
+    };
+    for (const auto& control : controls) {
+        SCOPED_TRACE(control.collation);
+        for (bool bound : {false, true}) {
+            SCOPED_TRACE(bound);
+            std::vector<unsigned char> buffer(8, 0xCC);
+            SQLLEN indicator = -99;
+            if (bound) {
+                ASSERT_EQ(SQL_SUCCESS, SQLBindCol(stmt_, 1, SQL_C_WCHAR,
+                    buffer.data() + 1, 6, &indicator));
+            }
+            ASSERT_EQ(SQL_SUCCESS, ExecDirect(
+                "SET NOCOUNT ON; DECLARE @t TABLE(v varchar(32) COLLATE " +
+                std::string(control.collation) + "); INSERT @t VALUES(" + control.hex +
+                "); SELECT v, CONVERT(varbinary(32), v), " +
+                Cp1252TestData::CodePageExpression + ", 1, 2, 3, 4, 5 FROM @t"));
+            ASSERT_EQ(SQL_SUCCESS, SQLFetch(stmt_));
+            if (!bound) {
+                ASSERT_EQ(SQL_SUCCESS, SQLGetData(stmt_, 1, SQL_C_WCHAR,
+                    buffer.data() + 1, 6, &indicator));
+            }
+            EXPECT_EQ(4, indicator);
+            Cp1252TestData::CheckBytes(buffer, 1, 6, control.units);
+            std::vector<unsigned char> binary(control.bytes.size());
+            ASSERT_EQ(SQL_SUCCESS, SQLGetData(stmt_, 2, SQL_C_BINARY,
+                binary.data(), binary.size(), &indicator));
+            EXPECT_EQ(control.bytes, binary);
+            EXPECT_EQ(static_cast<SQLLEN>(control.bytes.size()), indicator);
+            SQLINTEGER codepage = 0;
+            ASSERT_EQ(SQL_SUCCESS, SQLGetData(stmt_, 3, SQL_C_SLONG,
+                &codepage, sizeof(codepage), nullptr));
+            EXPECT_EQ(control.codepage, codepage);
+            EXPECT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
+            ASSERT_EQ(SQL_SUCCESS, SQLCloseCursor(stmt_));
+            ASSERT_EQ(SQL_SUCCESS, SQLFreeStmt(stmt_, SQL_UNBIND));
+        }
+    }
+}
+
+TEST_F(GetDataUtf16Test, Cp1252WideOutputParameterFitsExactCapacity) {
+    for (const auto& value : Cp1252TestData::Values()) {
+        SCOPED_TRACE(value.name);
+        ASSERT_EQ(SQL_SUCCESS,
+                  ExecDirect("CREATE PROCEDURE #cp1252_output @v varchar(256) OUTPUT AS "
+                             "SET NOCOUNT ON; SELECT 1; SET @v=CONVERT(varchar(256), " +
+                             value.hex + ") COLLATE Latin1_General_100_CI_AS"));
+        ASSERT_EQ(SQL_SUCCESS, SQLFreeStmt(stmt_, SQL_CLOSE));
+        const size_t capacity = (value.units.size() + 1) * 2;
+        const bool is_null = value.hex == "NULL";
+        std::vector<unsigned char> buffer(capacity + 2, 0xCC);
+        SQLLEN indicator = -99;
+        ASSERT_EQ(SQL_SUCCESS,
+                  SQLBindParameter(stmt_, 1, SQL_PARAM_OUTPUT, SQL_C_WCHAR, SQL_VARCHAR, 256, 0,
+                                   buffer.data() + 1, capacity, &indicator));
+        ASSERT_EQ(SQL_SUCCESS, SQLSetStmtAttr(stmt_, SQL_ATTR_ROW_ARRAY_SIZE,
+                                              reinterpret_cast<SQLPOINTER>(1), 0));
+        ASSERT_EQ(SQL_SUCCESS, ExecDirect("{call #cp1252_output(?)}"))
+            << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_STMT, stmt_);
+        ASSERT_EQ(SQL_SUCCESS, SQLSetStmtAttr(stmt_, SQL_ATTR_ROW_ARRAY_SIZE,
+                                              reinterpret_cast<SQLPOINTER>(2), 0));
+        auto observe = [&](SQLRETURN rc) {
+            EXPECT_TRUE(rc == SQL_SUCCESS || rc == SQL_NO_DATA);
+            EXPECT_EQ("", StmtDiagState());
+        };
+        observe(SQLFetch(stmt_));
+        observe(SQLFetch(stmt_));
+        observe(SQLMoreResults(stmt_));
+        EXPECT_EQ(is_null ? SQL_NULL_DATA : static_cast<SQLLEN>(value.units.size() * 2), indicator);
+        EXPECT_EQ(0xCC, buffer.front());
+        EXPECT_EQ(0xCC, buffer.back());
+        if (!is_null) {
+            Cp1252TestData::CheckBytes(buffer, 1, capacity, value.units);
+        }
+        std::fill(buffer.begin(), buffer.end(), 0xCC);
+        indicator = -99;
+        EXPECT_EQ(SQL_NO_DATA, SQLMoreResults(stmt_));
+        EXPECT_EQ(-99, indicator);
+        EXPECT_EQ(std::vector<unsigned char>(buffer.size(), 0xCC), buffer);
+        ASSERT_EQ(SQL_SUCCESS, SQLFreeStmt(stmt_, SQL_RESET_PARAMS));
+        ASSERT_EQ(SQL_SUCCESS, SQLFreeStmt(stmt_, SQL_CLOSE));
+        ASSERT_EQ(SQL_SUCCESS, ExecDirect("DROP PROCEDURE #cp1252_output"));
+        ASSERT_EQ(SQL_SUCCESS, SQLFreeStmt(stmt_, SQL_CLOSE));
+    }
+}
+
+TEST_F(GetDataUtf16Test, Cp1252NullEmptyThenValueReusesDestination) {
+    const std::vector<SQLWCHAR> expected = {0x20AC, 0, 0x2019, 0};
+    for (bool bound : {false, true}) {
+        SCOPED_TRACE(bound);
+        std::vector<unsigned char> buffer(12, 0xCC);
+        SQLLEN indicator = -99;
+        if (bound) {
+            ASSERT_EQ(SQL_SUCCESS, SQLBindCol(stmt_, 1, SQL_C_WCHAR,
+                buffer.data() + 1, 10, &indicator));
+        }
+        ASSERT_EQ(SQL_SUCCESS, ExecDirect(
+            "SET NOCOUNT ON; DECLARE @t TABLE(ord int, v varchar(8) "
+            "COLLATE Latin1_General_100_CI_AS); INSERT @t VALUES"
+            "(1,NULL),(2,0x),(3,0x80009200); SELECT v,1,2,3,4,5,6,7 FROM @t ORDER BY ord"));
+        for (int row = 0; row < 3; ++row) {
+            ASSERT_EQ(SQL_SUCCESS, SQLFetch(stmt_));
+            if (!bound) {
+                ASSERT_EQ(SQL_SUCCESS, SQLGetData(stmt_, 1, SQL_C_WCHAR,
+                    buffer.data() + 1, row == 0 ? 0 : row == 1 ? 2 : 10, &indicator));
+            }
+            EXPECT_EQ(row == 0 ? SQL_NULL_DATA : row == 1 ? 0 : 8, indicator);
+            EXPECT_EQ("", StmtDiagState());
+            if (row == 2) {
+                Cp1252TestData::CheckBytes(buffer, 1, 10, expected);
+            } else if (row == 1) {
+                Cp1252TestData::CheckBytes(buffer, 1, 10, {});
+            }
+            if (!bound) {
+                EXPECT_EQ(SQL_NO_DATA, SQLGetData(stmt_, 1, SQL_C_WCHAR,
+                    buffer.data() + 1, 10, &indicator));
+            }
+        }
+        EXPECT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
+        ASSERT_EQ(SQL_SUCCESS, SQLCloseCursor(stmt_));
+        ASSERT_EQ(SQL_SUCCESS, SQLFreeStmt(stmt_, SQL_UNBIND));
+    }
 }
 
 // #604: compare code units, not decoded strings or NUL-terminated lengths.
