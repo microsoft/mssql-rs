@@ -219,10 +219,13 @@ After a packet-boundary continuation, resident columns return to synchronous
 decoding; network waits retain the existing cancellation and timeout handling.
 Datetimeoffset conversion uses checked 64-bit arithmetic while preserving the
 out-of-range rejection of the wider calculation.
-Bound and row-wise wide-string delivery copy complete UTF-16 code units without
-decoding them. This preserves unpaired surrogates, BOM-like units, and embedded
-NULs for the application's decoding policy; actual encoding conversions remain
-separate. Incomplete (odd-byte) values do not enter the raw-unit copy path.
+Same-encoding wide delivery in bound fetches and `SQLGetData` copies complete
+UTF-16 code units without decoding them. This preserves unpaired surrogates,
+BOM-like units, and embedded NULs for the application's decoding policy;
+actual encoding conversions remain
+separate. The materialized-value fast paths require an even byte length before
+using the raw-unit copy helper. Odd-length PLP streams retain their existing
+behavior and are not covered by this parity claim.
 Bound buffers trim a real surrogate pair if truncation would split it, but keep
 already-unpaired units. `SQLGetData` can split a pair across calls because the
 caller retrieves the remaining units on its next call.
