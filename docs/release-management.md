@@ -71,7 +71,7 @@ pipeline's existing version-stamping policy. If a matching open version-bump PR
 already exists, the workflow skips issue creation.
 
 When a bump is needed, the workflow creates or updates one tracking issue labeled
-`crates.io:new-version`. The issue includes:
+`automation:crate-version-bump`. The issue includes:
 
 1. the affected crates and suggested next minor versions;
 2. TOML snippets for the manifest edits, including the mock crate's versioned
@@ -80,18 +80,18 @@ When a bump is needed, the workflow creates or updates one tracking issue labele
    `cargo bclippy`, and `cargo btest`, then open a PR with
    `Fixes #<issue-number>`.
 
-The workflow queries only open issues labeled `crates.io:new-version`, then
-checks the hidden marker in their bodies before reusing or updating one. Keep
-both the label and marker when editing the issue. The label is created
-automatically when needed; multiple matching open issues fail the run for manual cleanup.
+The workflow queries only open issues labeled `automation:crate-version-bump`,
+then checks the hidden marker in their bodies before reusing or updating one.
+It regenerates the issue body while the bump is pending; put maintainer notes
+in issue comments. The label is created automatically when needed; multiple
+matching open issues fail the run for manual cleanup.
 When no bump is needed, no issue is changed. If a bump becomes unnecessary, close
 its issue manually.
 
 The shared validation pipeline runs `scripts/test_bump_released_crate_versions.py`
 in its Windows Python test step for both PR validation and main-branch CI.
-Cargo commands and registry/GitHub requests are mocked. Branch tests use local
-temporary Git repositories; no cargo-edit installation or live issue/PR writes
-are needed.
+Cargo metadata, registry, pull request, and issue requests are mocked. No
+cargo-edit installation or live issue/PR writes are needed.
 
 The workflow uses the built-in `GITHUB_TOKEN` with contents read, issues write,
 and pull request read permissions. No custom secret or permission to create PRs

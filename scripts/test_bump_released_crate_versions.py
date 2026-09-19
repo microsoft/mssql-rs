@@ -117,17 +117,34 @@ def test_has_open_bump_pr(workflow_environment):
     changes = {"mssql-tds": ("0.1.7", "0.2.0")}
     with patch.object(
         bump.subprocess, "run",
-        return_value=subprocess.CompletedProcess("gh", 0, stdout='[{"number": 597}]'),
+        return_value=subprocess.CompletedProcess(
+            "gh", 0,
+            stdout=json.dumps([
+                {"number": 584, "title": "Fix mssql-tds docs", "body": "Mentions mssql-tds only"},
+                {"number": 597, "title": "Bump mssql-tds", "body": "`mssql-tds`: `0.1.7` -> `0.2.0`"},
+            ]),
+        ),
     ) as gh:
         assert bump.has_open_bump_pr(workflow_environment, changes)
     gh.assert_called_once_with(
         [
             "gh", "pr", "list", "--repo", "microsoft/mssql-rs",
-            "--state", "open", "--search", "mssql-tds", "--json", "number",
-            "--limit", "1",
+            "--state", "open", "--json", "number,title,body", "--limit", "100",
         ],
         cwd=workflow_environment, check=True, stdout=subprocess.PIPE, text=True,
     )
+
+
+def test_open_bump_pr_ignores_unrelated_crate_mentions(workflow_environment):
+    with patch.object(
+        bump.subprocess, "run",
+        return_value=subprocess.CompletedProcess(
+            "gh", 0, stdout='[{"number": 584, "title": "Fix mssql-tds docs", "body": ""}]'
+        ),
+    ):
+        assert not bump.has_open_bump_pr(
+            workflow_environment, {"mssql-tds": ("0.1.7", "0.2.0")}
+        )
 
 
 def test_main_creates_issue_for_planned_bumps(workflow_environment):
@@ -244,6 +261,7 @@ def test_issue_created_once_then_reused_and_updated(monkeypatch):
     assert 'mssql-tds = { path = "../mssql-tds", version = "0.2.0", default-features = false }' in stored[0]["body"]
     assert "Run `cargo bfmt`, `cargo bclippy`, and `cargo btest`." in stored[0]["body"]
     assert "Fixes #<this issue number>" in stored[0]["body"]
+    assert "put maintainer notes in issue comments" in stored[0]["body"]
     template = yaml.safe_load(
         (ROOT / ".github" / "ISSUE_TEMPLATE" / "feature_request.yml").read_text()
     )

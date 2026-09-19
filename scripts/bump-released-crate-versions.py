@@ -11,7 +11,7 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 CRATES = ("mssql-tds", "mssql-mock-tds")
-ISSUE_LABEL = "crates.io:new-version"
+ISSUE_LABEL = "automation:crate-version-bump"
 ISSUE_MARKER = "<!-- mssql-rs:released-crate-version-bump -->"
 
 
@@ -64,16 +64,21 @@ def planned_bumps(root, published):
 
 
 def has_open_bump_pr(root, changes):
-    search = " ".join(changes)
     result = subprocess.run(
         [
             "gh", "pr", "list", "--repo", os.environ["GITHUB_REPOSITORY"],
-            "--state", "open", "--search", search, "--json", "number",
-            "--limit", "1",
+            "--state", "open", "--json", "number,title,body", "--limit", "100",
         ],
         cwd=root, check=True, stdout=subprocess.PIPE, text=True,
     )
-    return bool(json.loads(result.stdout))
+    return any(
+        all(
+            crate in text and old in text and new in text
+            for crate, (old, new) in changes.items()
+        )
+        for pr in json.loads(result.stdout)
+        for text in [f"{pr.get('title') or ''}\n{pr.get('body') or ''}"]
+    )
 
 
 def issue_body(summary, changes):
@@ -105,6 +110,8 @@ def issue_body(summary, changes):
         "### Alternatives considered\n\nBump the versions manually.\n\n"
         "### Additional context\n\n"
         "Managed by the Bump Released Crate Versions workflow. "
+        "This workflow regenerates the issue body while the bump remains pending; "
+        "put maintainer notes in issue comments. "
         "This workflow creates or updates this issue only; maintainers own the PR and validation.\n"
     )
 
@@ -148,7 +155,7 @@ def ensure_bump_issue(summary, changes):
     else:
         subprocess.run(
             ["gh", "label", "create", ISSUE_LABEL, "--repo", os.environ["GITHUB_REPOSITORY"],
-             "--color", "0e8a16", "--description", "Crate versions already published on crates.io",
+             "--color", "0e8a16", "--description", "Tracking issues for automated Rust crate version bumps",
              "--force"],
             check=True, stdout=subprocess.PIPE, text=True,
         )
