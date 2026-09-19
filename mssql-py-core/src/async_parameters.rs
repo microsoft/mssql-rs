@@ -1012,4 +1012,34 @@ mod tests {
         assert_eq!(sql, "SELECT @__mssql_py_0_1");
         assert_eq!(names[0].source_name.as_deref(), Some(""));
     }
+
+    #[test]
+    fn rewrites_markers_in_odbc_escape_looking_text() {
+        let sql = "SELECT {fn ABS(?)}, '{d ''2020-01-02''}', [q?mark], -- ?\n?";
+        let (sql, names) = rewrite_placeholders(sql, false).unwrap();
+
+        assert_eq!(
+            sql,
+            "SELECT {fn ABS(@__mssql_py_0_1)}, '{d ''2020-01-02''}', [q?mark], -- ?\n@__mssql_py_0_2"
+        );
+        assert_eq!(names.len(), 2);
+    }
+
+    #[test]
+    fn rewrite_placeholders_treats_canonical_odbc_extension_as_line_comment() {
+        // This uses the same input as the corresponding CodeScan test above.
+        // The behavior is intentionally different: CodeScan recognizes the
+        // canonical ODBC comment extension, while rewrite_placeholders sees
+        // the leading "--" and treats the entire first line as an ordinary
+        // SQL line comment. Consequently, only the marker after the newline
+        // is rewritten. (#561)
+        let sql = "--(* Vendor(Microsoft), Product(ODBC) x *)-- ?\n?";
+        let (sql, names) = rewrite_placeholders(sql, false).unwrap();
+
+        assert_eq!(
+            sql,
+            "--(* Vendor(Microsoft), Product(ODBC) x *)-- ?\n@__mssql_py_0_1"
+        );
+        assert_eq!(names.len(), 1);
+    }
 }
