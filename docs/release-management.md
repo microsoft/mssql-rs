@@ -57,7 +57,7 @@ the default branch.
 
 `mssql-tds` and `mssql-mock-tds` are checked independently. If a crate's exact
 `[package].version` exists among its published versions (including older or
-yanked releases), the workflow proposes the next minor version: `0.1.7` becomes
+yanked releases), the workflow suggests the next minor version: `0.1.7` becomes
 `0.2.0`. Unpublished source versions and crates that return HTTP 404 are left
 alone. Other registry errors fail the run rather than assuming a crate is
 unpublished. If the proposed next minor version is also published, the run fails
@@ -65,43 +65,27 @@ and a maintainer must choose a new version. A mock-only bump is deferred until
 the current `mssql-tds` version is published, because the mock crate's exact
 versioned dependency must resolve from the registry when it is packaged.
 
-Local versions come from `cargo metadata`; `cargo set-version --bump minor`
-from cargo-edit updates the selected manifests and their versioned workspace
-dependencies. The cargo-edit version is pinned only in this workflow and installed
-under `$RUNNER_TEMP/cargo-edit`, with no workspace dependency or repo-wide tool
-pin. Off-days skip installation. Cargo-edit resolves dependencies, so registry
-access is needed. The crates.io JSON lookup remains separate so an unpublished
-crate can be distinguished from a registry failure.
+Local versions come from `cargo metadata`. The workflow does not edit files,
+push branches, create PRs, publish crates, merge anything, or change the release
+pipeline's existing version-stamping policy. If a matching open version-bump PR
+already exists, the workflow skips issue creation.
 
-The workflow pushes all needed bumps to `automation/bump-released-crate-versions`.
-Later checks reuse that branch, leaving it unchanged when its contents already
-match. Updates use an explicit Git lease so a concurrent push fails rather than
-being overwritten. This is an automation-owned branch: do not make manual edits
-there, because later runs regenerate it from the default branch.
-A core crate bump also updates the mock crate's versioned local dependency;
-other local consumers use path-only dependencies and need no edits. Cargo
-lockfiles are ignored by this repository. The workflow does not create PRs,
-publish crates, or merge anything, and does not change the release pipeline's
-existing version-stamping policy.
+When a bump is needed, the workflow creates or updates one tracking issue labeled
+`crates.io:new-version`. The issue includes:
 
-After pushing successfully, the workflow creates or updates one tracking issue
-with the version summary and a **Create PR** link. Check for an existing PR first,
-then choose one of these options:
+1. the affected crates and suggested next minor versions;
+2. TOML snippets for the manifest edits, including the mock crate's versioned
+   `mssql-tds` dependency when the core crate is bumped;
+3. crisp maintainer instructions to apply the snippets, run `cargo bfmt`,
+   `cargo bclippy`, and `cargo btest`, then open a PR with
+   `Fixes #<issue-number>`.
 
-1. Click **Create PR** in the issue to open a PR from the prepared branch.
-2. Open the issue's **Assignees** menu and select **Copilot**, if cloud agent is
-   enabled for you and the repository. Ask it to open a PR against the default
-   branch using the prepared branch's changes, without bumping the versions again.
-
-For either option, include `Fixes #<issue-number>` in the PR description and
-complete validation and review before merging.
-The workflow queries only open issues labeled `automation:crate-version-bump`,
-then checks the hidden marker in their bodies before reusing or updating one.
-Keep both the label and marker when editing the issue. The label is created
+The workflow queries only open issues labeled `crates.io:new-version`, then
+checks the hidden marker in their bodies before reusing or updating one. Keep
+both the label and marker when editing the issue. The label is created
 automatically when needed; multiple matching open issues fail the run for manual cleanup.
-If issue creation fails after the push, rerunning reuses the prepared branch.
-When no bump is needed, no branch or issue is changed. If a bump becomes
-unnecessary, close its issue and any unmerged PR manually.
+When no bump is needed, no issue is changed. If a bump becomes unnecessary, close
+its issue manually.
 
 The shared validation pipeline runs `scripts/test_bump_released_crate_versions.py`
 in its Windows Python test step for both PR validation and main-branch CI.
@@ -109,16 +93,9 @@ Cargo commands and registry/GitHub requests are mocked. Branch tests use local
 temporary Git repositories; no cargo-edit installation or live issue/PR writes
 are needed.
 
-The workflow uses the built-in `GITHUB_TOKEN` with contents and issues write
-permissions, plus pull request read permission to avoid updating the bump branch
-while a PR is already open. No custom secret or permission to create PRs is needed. Normal
-validation and review are still required before merging.
-Later branch pushes use `GITHUB_TOKEN`, so they do not trigger `push` workflows;
-PR synchronization workflows may require **Approve workflows to run**.
-See [GitHub's token behavior](https://docs.github.com/en/actions/concepts/security/github_token#when-github_token-triggers-workflow-runs).
-
-Copilot assignment is a manual step. Automatic assignment through the API
-requires a user token, not `GITHUB_TOKEN`, and is not performed by this workflow.
+The workflow uses the built-in `GITHUB_TOKEN` with contents read, issues write,
+and pull request read permissions. No custom secret or permission to create PRs
+is needed. Normal validation and review are still required before merging.
 
 ### Python and NuGet versions
 

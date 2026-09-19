@@ -1,19 +1,17 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""Push version bumps and open a tracking issue with a manual PR link."""
+"""Create or update a tracking issue when source crate versions are already published."""
 
 import json
 import os
 import subprocess
 from pathlib import Path
 from urllib.error import HTTPError
-from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 CRATES = ("mssql-tds", "mssql-mock-tds")
-BUMP_BRANCH = "automation/bump-released-crate-versions"
-ISSUE_LABEL = "automation:crate-version-bump"
+ISSUE_LABEL = "crates.io:new-version"
 ISSUE_MARKER = "<!-- mssql-rs:released-crate-version-bump -->"
 
 
@@ -47,73 +45,30 @@ def cargo_versions(root):
     }
 
 
-def bump_versions(root, published):
-    before = cargo_versions(root)
-    selected = [crate for crate in CRATES if before[crate] in published[crate]]
-    # The mock package has an exact, versioned dependency on mssql-tds. Do not
-    # create a mock-only bump while that dependency version is unpublished:
-    # Cargo drops the path when packaging, so the release cannot resolve it.
+def next_minor(version):
+    major, minor, _patch = version.split(".", 2)
+    return f"{int(major)}.{int(minor) + 1}.0"
+
+
+def planned_bumps(root, published):
+    current = cargo_versions(root)
+    selected = [crate for crate in CRATES if current[crate] in published[crate]]
     if "mssql-mock-tds" in selected and "mssql-tds" not in selected:
         selected.remove("mssql-mock-tds")
         print("mssql-mock-tds: waiting for its mssql-tds dependency to be published.")
-    if not selected:
-        return {}
-    subprocess.run(
-        ["cargo", "set-version", "--bump", "minor"]
-        + [arg for crate in selected for arg in ("--package", crate)],
-        cwd=root, check=True,
-    )
-    expected_crates = set(selected)
-    if "mssql-tds" in selected:
-        expected_crates.add("mssql-mock-tds")
-    expected = {(Path(crate) / "Cargo.toml").as_posix() for crate in expected_crates}
-    status = subprocess.run(
-        ["git", "status", "--porcelain", "--untracked-files=all"],
-        cwd=root, check=True, stdout=subprocess.PIPE, text=True,
-    ).stdout.splitlines()
-    changed = {line[3:].replace("\\", "/") for line in status if len(line) >= 3}
-    if changed != expected:
-        raise ValueError(
-            "cargo set-version changed unexpected files: "
-            f"expected {sorted(expected)}, found {sorted(changed)}"
-        )
-    after = cargo_versions(root)
-    for crate in selected:
-        if after[crate] in published[crate]:
-            raise ValueError(f"{crate} {after[crate]} is already published; bump it manually.")
-    return {crate: (before[crate], after[crate]) for crate in selected}
+    changes = {crate: (current[crate], next_minor(current[crate])) for crate in selected}
+    for crate, (_old, new) in changes.items():
+        if new in published[crate]:
+            raise ValueError(f"{crate} {new} is already published; choose the next version manually.")
+    return changes
 
 
-def push_bump_branch(root):
-    def git(*args):
-        return subprocess.run(
-            ["git", *args], cwd=root, check=True, stdout=subprocess.PIPE, text=True,
-        ).stdout.strip()
-
-    ref = f"refs/heads/{BUMP_BRANCH}"
-    remote = git("ls-remote", "--heads", "origin", ref)
-    previous = remote.split()[0] if remote else ""
-    git(
-        "-c", "user.name=github-actions[bot]",
-        "-c", "user.email=41898282+github-actions[bot]@users.noreply.github.com",
-        "commit", "--only", "-m", "Bump released crates to the next minor version",
-        "--", *(str(Path(crate) / "Cargo.toml") for crate in CRATES),
-    )
-    if previous:
-        git("fetch", "--no-tags", "--depth=1", "origin", previous)
-        if git("rev-parse", "HEAD^{tree}") == git("rev-parse", "FETCH_HEAD^{tree}"):
-            print(f"{BUMP_BRANCH}: already up to date.")
-            return
-    # An explicit expected SHA also protects first creation from a concurrent push.
-    git("push", f"--force-with-lease={ref}:{previous}", "origin", f"HEAD:{ref}")
-    print(f"Updated {BUMP_BRANCH}.")
-
-
-def has_open_bump_pr(root):
+def has_open_bump_pr(root, changes):
+    search = " ".join(changes)
     result = subprocess.run(
         [
             "gh", "pr", "list", "--repo", os.environ["GITHUB_REPOSITORY"],
-            "--head", BUMP_BRANCH, "--state", "open", "--json", "number",
+            "--state", "open", "--search", search, "--json", "number",
             "--limit", "1",
         ],
         cwd=root, check=True, stdout=subprocess.PIPE, text=True,
@@ -121,10 +76,42 @@ def has_open_bump_pr(root):
     return bool(json.loads(result.stdout))
 
 
-def ensure_bump_issue(summary, crates):
+def issue_body(summary, changes):
+    snippets = []
+    for crate, (_old, new) in changes.items():
+        snippets.append(f"{crate}/Cargo.toml\n```toml\nversion = \"{new}\"\n```")
+    if "mssql-tds" in changes:
+        snippets.append(
+            "mssql-mock-tds/Cargo.toml dependency\n"
+            "```toml\n"
+            f"mssql-tds = {{ path = \"../mssql-tds\", version = \"{changes['mssql-tds'][1]}\", default-features = false }}\n"
+            "```"
+        )
+    return (
+        f"{ISSUE_MARKER}\n\n"
+        "### Problem statement\n\n"
+        "The default branch uses crate versions that are already published on crates.io.\n\n"
+        "### Proposed solution\n\n"
+        f"Update these versions:\n\n{summary}\n\n"
+        "Suggested edits:\n\n"
+        + "\n\n".join(snippets)
+        + "\n\nInstructions:\n\n"
+        "1. Apply the version changes above.\n"
+        "2. Run `cargo bfmt`, `cargo bclippy`, and `cargo btest`.\n"
+        "3. Open a PR and include `Fixes #<this issue number>` in the description.\n\n"
+        "### Affected crate\n\n"
+        + ", ".join(f"`{crate}`" for crate in changes)
+        + "\n\n"
+        "### Alternatives considered\n\nBump the versions manually.\n\n"
+        "### Additional context\n\n"
+        "Managed by the Bump Released Crate Versions workflow. "
+        "This workflow creates or updates this issue only; maintainers own the PR and validation.\n"
+    )
+
+
+def ensure_bump_issue(summary, changes):
     endpoint = f"repos/{os.environ['GITHUB_REPOSITORY']}/issues"
     owner, name = os.environ["GITHUB_REPOSITORY"].split("/")
-    # The REST listing can lag writes; use the direct issues connection, not search.
     query = """
     query($owner: String!, $name: String!, $label: String!, $endCursor: String) {
       repository(owner: $owner, name: $name) {
@@ -148,32 +135,7 @@ def ensure_bump_issue(summary, crates):
     if len(matches) > 1:
         raise ValueError("Multiple open version bump tracking issues; resolve duplicates manually.")
 
-    base = quote(os.environ["DEFAULT_BRANCH"], safe="")
-    branch = quote(BUMP_BRANCH, safe="")
-    compare = f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/compare/{base}...{branch}?expand=1"
-    body = (
-        f"{ISSUE_MARKER}\n\n"
-        "### Problem statement\n\n"
-        "The default branch uses crate versions that are already published on crates.io.\n\n"
-        "### Proposed solution\n\n"
-        f"Start the next minor development versions:\n\n{summary}\n\n"
-        f"The changes are prepared on `{BUMP_BRANCH}`. "
-        "Check for an existing PR before choosing one of these options:\n\n"
-        f"1. [Create PR]({compare}) yourself using the prepared branch.\n"
-        "2. Assign this issue to Copilot through **Assignees** "
-        "(if enabled for you and this repository). "
-        f"Ask it to open a PR against `{os.environ['DEFAULT_BRANCH']}` "
-        "using the prepared branch's changes. Do not bump the versions again.\n\n"
-        "For either option, include `Fixes #<this issue number>` in the PR description.\n\n"
-        "### Affected crate\n\n"
-        + ", ".join(f"`{crate}`" for crate in crates)
-        + "\n\n### Alternatives considered\n\nBump the versions manually.\n\n"
-        "### Additional context\n\n"
-        "Managed by the Bump Released Crate Versions workflow. "
-        "Local versioned dependencies are kept in sync. "
-        "This workflow does not create PRs, publish crates, or merge changes. "
-        "Validation and review are required before merging.\n"
-    )
+    body = issue_body(summary, changes)
     if matches and matches[0]["body"] == body:
         number = matches[0]["number"]
         print(f"Reusing version bump issue #{number}.")
@@ -186,7 +148,7 @@ def ensure_bump_issue(summary, crates):
     else:
         subprocess.run(
             ["gh", "label", "create", ISSUE_LABEL, "--repo", os.environ["GITHUB_REPOSITORY"],
-             "--color", "0e8a16", "--description", "Tracking issues for automated Rust crate version bumps",
+             "--color", "0e8a16", "--description", "Crate versions already published on crates.io",
              "--force"],
             check=True, stdout=subprocess.PIPE, text=True,
         )
@@ -204,22 +166,20 @@ def ensure_bump_issue(summary, crates):
 
 def main():
     root = Path(__file__).resolve().parents[1]
-    if has_open_bump_pr(root):
-        print(f"{BUMP_BRANCH}: open pull request already exists; skipping regeneration.")
-        return
-    # Fetch both before editing: a registry outage must not produce a partial bump.
     versions = {crate: published_versions(crate) for crate in CRATES}
-    changes = bump_versions(root, versions)
-    if changes:
-        summary = "\n".join(
-            f"- `{crate}`: `{current}` -> `{bumped}`"
-            for crate, (current, bumped) in changes.items()
-        )
-        push_bump_branch(root)
-        ensure_bump_issue(summary, changes)
-        print(summary)
-    else:
+    changes = planned_bumps(root, versions)
+    if not changes:
         print("No version bumps needed.")
+        return
+    if has_open_bump_pr(root, changes):
+        print("Open version bump PR already exists; skipping issue creation.")
+        return
+    summary = "\n".join(
+        f"- `{crate}`: `{current}` -> `{bumped}`"
+        for crate, (current, bumped) in changes.items()
+    )
+    ensure_bump_issue(summary, changes)
+    print(summary)
 
 
 if __name__ == "__main__":
