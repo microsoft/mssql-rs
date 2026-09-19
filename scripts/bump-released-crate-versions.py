@@ -63,6 +63,17 @@ def bump_versions(root, published):
         + [arg for crate in selected for arg in ("--package", crate)],
         cwd=root, check=True,
     )
+    expected = {(Path(crate) / "Cargo.toml").as_posix() for crate in selected}
+    status = subprocess.run(
+        ["git", "status", "--porcelain", "--untracked-files=all"],
+        cwd=root, check=True, stdout=subprocess.PIPE, text=True,
+    ).stdout.splitlines()
+    changed = {line[3:].replace("\\", "/") for line in status if len(line) >= 3}
+    if changed != expected:
+        raise ValueError(
+            "cargo set-version changed unexpected files: "
+            f"expected {sorted(expected)}, found {sorted(changed)}"
+        )
     after = cargo_versions(root)
     for crate in selected:
         if after[crate] in published[crate]:
@@ -93,6 +104,18 @@ def push_bump_branch(root):
     # An explicit expected SHA also protects first creation from a concurrent push.
     git("push", f"--force-with-lease={ref}:{previous}", "origin", f"HEAD:{ref}")
     print(f"Updated {BUMP_BRANCH}.")
+
+
+def has_open_bump_pr(root):
+    result = subprocess.run(
+        [
+            "gh", "pr", "list", "--repo", os.environ["GITHUB_REPOSITORY"],
+            "--head", BUMP_BRANCH, "--state", "open", "--json", "number",
+            "--limit", "1",
+        ],
+        cwd=root, check=True, stdout=subprocess.PIPE, text=True,
+    )
+    return bool(json.loads(result.stdout))
 
 
 def ensure_bump_issue(summary, crates):
@@ -178,6 +201,9 @@ def ensure_bump_issue(summary, crates):
 
 def main():
     root = Path(__file__).resolve().parents[1]
+    if has_open_bump_pr(root):
+        print(f"{BUMP_BRANCH}: open pull request already exists; skipping regeneration.")
+        return
     # Fetch both before editing: a registry outage must not produce a partial bump.
     versions = {crate: published_versions(crate) for crate in CRATES}
     changes = bump_versions(root, versions)

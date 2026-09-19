@@ -27,18 +27,23 @@ def test_selects_only_released_crates_and_repeat_is_quiet(tmp_path, released):
     after = {crate: "0.2.0" if crate in released else before[crate] for crate in bump.CRATES}
     published = {crate: {"0.1.7"} if crate in released else set() for crate in bump.CRATES}
     with patch.object(bump, "cargo_versions", side_effect=[before, after, after]), patch.object(
-        bump.subprocess, "run"
+        bump.subprocess, "run",
+        return_value=subprocess.CompletedProcess(
+            "git", 0,
+            stdout="".join(f" M {crate}/Cargo.toml\n" for crate in released),
+        ),
     ) as cargo:
         assert bump.bump_versions(tmp_path, published) == {
             crate: ("0.1.7", "0.2.0") for crate in released
         }
         assert bump.bump_versions(tmp_path, published) == {}
     if released:
-        cargo.assert_called_once_with(
+        cargo.assert_any_call(
             ["cargo", "set-version", "--bump", "minor"]
             + [arg for crate in released for arg in ("--package", crate)],
             cwd=tmp_path, check=True,
         )
+        assert cargo.call_count == 2
     else:
         cargo.assert_not_called()
 
@@ -69,9 +74,28 @@ def test_metadata_uses_cargo_json(tmp_path):
 def test_already_published_target_fails(tmp_path):
     with patch.object(bump, "cargo_versions", side_effect=[
         dict.fromkeys(bump.CRATES, "0.1.7"), dict.fromkeys(bump.CRATES, "0.2.0")
-    ]), patch.object(bump.subprocess, "run"):
+    ]), patch.object(
+        bump.subprocess, "run",
+        return_value=subprocess.CompletedProcess(
+            "git", 0,
+            stdout="".join(f" M {crate}/Cargo.toml\n" for crate in bump.CRATES),
+        ),
+    ):
         with pytest.raises(ValueError, match="already published"):
             bump.bump_versions(tmp_path, dict.fromkeys(bump.CRATES, {"0.1.7", "0.2.0"}))
+
+
+def test_set_version_rejects_unexpected_manifest_changes(tmp_path):
+    before = dict.fromkeys(bump.CRATES, "0.1.7")
+    after = dict.fromkeys(bump.CRATES, "0.2.0")
+    with patch.object(bump, "cargo_versions", side_effect=[before, after]), patch.object(
+        bump.subprocess, "run",
+        return_value=subprocess.CompletedProcess(
+            "git", 0, stdout=" M mssql-tds/Cargo.toml\n M Cargo.toml\n"
+        ),
+    ):
+        with pytest.raises(ValueError, match="unexpected files"):
+            bump.bump_versions(tmp_path, dict.fromkeys(bump.CRATES, {"0.1.7"}))
 
 
 @pytest.mark.parametrize("operation", ["metadata", "set-version"])
@@ -202,14 +226,33 @@ def test_branch_push_rejects_concurrent_creation_or_update(git_repository, exist
     assert git("ls-remote", "--heads", "origin", ref).split()[0] == base
 
 
+def test_has_open_bump_pr(workflow_environment):
+    with patch.object(
+        bump.subprocess, "run",
+        return_value=subprocess.CompletedProcess("gh", 0, stdout='[{"number": 597}]'),
+    ) as gh:
+        assert bump.has_open_bump_pr(workflow_environment)
+    gh.assert_called_once_with(
+        [
+            "gh", "pr", "list", "--repo", "microsoft/mssql-rs",
+            "--head", bump.BUMP_BRANCH, "--state", "open", "--json", "number",
+            "--limit", "1",
+        ],
+        cwd=workflow_environment, check=True, stdout=subprocess.PIPE, text=True,
+    )
+
+
 @pytest.fixture
 def workflow_environment(tmp_path, monkeypatch):
     monkeypatch.setattr(bump, "__file__", str(tmp_path / "scripts" / "bump.py"))
     monkeypatch.setenv("GITHUB_REPOSITORY", "microsoft/mssql-rs")
     monkeypatch.setenv("DEFAULT_BRANCH", "main")
-    monkeypatch.setattr(
-        bump.subprocess, "run", Mock(side_effect=AssertionError("Unexpected external command"))
-    )
+    def unexpected_command(args, **kwargs):
+        if args[:3] == ["gh", "pr", "list"]:
+            return subprocess.CompletedProcess(args, 0, stdout="[]")
+        raise AssertionError("Unexpected external command")
+
+    monkeypatch.setattr(bump.subprocess, "run", Mock(side_effect=unexpected_command))
     return tmp_path
 
 
@@ -258,6 +301,20 @@ def test_main_no_changes_needs_no_branch_or_issue(workflow_environment):
         bump.main()
     issue.assert_not_called()
     push.assert_not_called()
+
+
+def test_main_skips_open_bump_pr(workflow_environment):
+    with patch.object(bump, "has_open_bump_pr", return_value=True) as open_pr, patch.object(
+        bump, "published_versions"
+    ) as versions, patch.object(bump, "bump_versions") as bump_versions, patch.object(
+        bump, "push_bump_branch"
+    ) as push, patch.object(bump, "ensure_bump_issue") as issue:
+        bump.main()
+    open_pr.assert_called_once_with(workflow_environment)
+    versions.assert_not_called()
+    bump_versions.assert_not_called()
+    push.assert_not_called()
+    issue.assert_not_called()
 
 
 def test_cargo_failure_does_not_create_issue(workflow_environment):
