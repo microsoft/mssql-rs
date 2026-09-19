@@ -1,16 +1,18 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""Prepare a PR when either source crate version is already on crates.io."""
+"""Push version bumps and open a tracking issue with a manual PR link."""
 
 import json
 import os
 import subprocess
 from pathlib import Path
 from urllib.error import HTTPError
+from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 CRATES = ("mssql-tds", "mssql-mock-tds")
+BUMP_BRANCH = "automation/bump-released-crate-versions"
 ISSUE_MARKER = "<!-- mssql-rs:released-crate-version-bump -->"
 
 
@@ -67,6 +69,31 @@ def bump_versions(root, published):
     return {crate: (before[crate], after[crate]) for crate in selected}
 
 
+def push_bump_branch(root):
+    def git(*args):
+        return subprocess.run(
+            ["git", *args], cwd=root, check=True, stdout=subprocess.PIPE, text=True,
+        ).stdout.strip()
+
+    ref = f"refs/heads/{BUMP_BRANCH}"
+    remote = git("ls-remote", "--heads", "origin", ref)
+    previous = remote.split()[0] if remote else ""
+    git(
+        "-c", "user.name=github-actions[bot]",
+        "-c", "user.email=41898282+github-actions[bot]@users.noreply.github.com",
+        "commit", "--only", "-m", "Bump released crates to the next minor version",
+        "--", *(str(Path(crate) / "Cargo.toml") for crate in CRATES),
+    )
+    if previous:
+        git("fetch", "--no-tags", "--depth=1", "origin", previous)
+        if git("rev-parse", "HEAD^{tree}") == git("rev-parse", "FETCH_HEAD^{tree}"):
+            print(f"{BUMP_BRANCH}: already up to date.")
+            return
+    # An explicit expected SHA also protects first creation from a concurrent push.
+    git("push", f"--force-with-lease={ref}:{previous}", "origin", f"HEAD:{ref}")
+    print(f"Updated {BUMP_BRANCH}.")
+
+
 def ensure_bump_issue(summary, crates):
     endpoint = f"repos/{os.environ['GITHUB_REPOSITORY']}/issues"
     # List directly rather than searching: search indexing can lag a previous run.
@@ -82,19 +109,26 @@ def ensure_bump_issue(summary, crates):
     if len(matches) > 1:
         raise ValueError("Multiple open version bump tracking issues; resolve duplicates manually.")
 
+    base = quote(os.environ["DEFAULT_BRANCH"], safe="")
+    branch = quote(BUMP_BRANCH, safe="")
+    compare = f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/compare/{base}...{branch}?expand=1"
     body = (
         f"{ISSUE_MARKER}\n\n"
         "### Problem statement\n\n"
         "The default branch uses crate versions that are already published on crates.io.\n\n"
         "### Proposed solution\n\n"
         f"Start the next minor development versions:\n\n{summary}\n\n"
+        f"The changes are prepared on `{BUMP_BRANCH}`. [Create PR]({compare}) "
+        "(or review the existing PR for that branch). "
+        "Include `Fixes #<this issue number>` in the PR description.\n\n"
         "### Affected crate\n\n"
         + ", ".join(f"`{crate}`" for crate in crates)
         + "\n\n### Alternatives considered\n\nBump the versions manually.\n\n"
         "### Additional context\n\n"
         "Managed by the Bump Released Crate Versions workflow. "
-        "The PR links this issue and keeps local versioned dependencies in sync. "
-        "No crates are published by this workflow.\n"
+        "Local versioned dependencies are kept in sync. "
+        "This workflow does not create PRs, publish crates, or merge changes. "
+        "Validation and review are required before merging.\n"
     )
     if matches and matches[0]["body"] == body:
         number = matches[0]["number"]
@@ -119,31 +153,19 @@ def ensure_bump_issue(summary, crates):
 
 def main():
     root = Path(__file__).resolve().parents[1]
-    # Fetch both before editing: a registry outage must not produce a partial PR.
+    # Fetch both before editing: a registry outage must not produce a partial bump.
     versions = {crate: published_versions(crate) for crate in CRATES}
     changes = bump_versions(root, versions)
-    body = (root / ".github" / "PULL_REQUEST_TEMPLATE.md").read_text(encoding="utf-8")
     if changes:
         summary = "\n".join(
             f"- `{crate}`: `{current}` -> `{bumped}`"
             for crate, (current, bumped) in changes.items()
         )
-        issue = ensure_bump_issue(summary, changes)
-        body = body.replace(
-            "## Description\n",
-            "## Description\n\nThese source versions are already published on crates.io. "
-            "Start the next minor development version:\n\n"
-            f"{summary}\n\nLocal versioned dependencies are kept in sync. "
-            "This PR does not publish crates. Validation and review are still required.\n",
-        ).replace("## Related Issues\n", f"## Related Issues\n\nFixes #{issue}\n")
+        push_bump_branch(root)
+        ensure_bump_issue(summary, changes)
         print(summary)
     else:
         print("No version bumps needed.")
-
-    # Run the PR action even without changes so it can close an obsolete bump PR.
-    (Path(os.environ["RUNNER_TEMP"]) / "crate-version-bump-pr.md").write_text(
-        body, encoding="utf-8"
-    )
 
 
 if __name__ == "__main__":

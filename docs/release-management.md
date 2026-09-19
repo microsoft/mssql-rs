@@ -73,39 +73,41 @@ pin. Off-days skip installation. Cargo-edit resolves dependencies, so registry
 access is needed. The crates.io JSON lookup remains separate so an unpublished
 crate can be distinguished from a registry failure.
 
-One ready-for-review PR on `automation/bump-released-crate-versions` contains all
-needed bumps. Later checks update that PR rather than opening duplicates or
-returning it to draft. A core crate
-bump also updates the mock crate's versioned local dependency; other local
-consumers use path-only dependencies and need no edits. Cargo lockfiles are
-ignored by this repository. The workflow neither publishes nor merges anything,
-and it does not change the release pipeline's existing version-stamping policy.
+The workflow pushes all needed bumps to `automation/bump-released-crate-versions`.
+Later checks reuse that branch, leaving it unchanged when its contents already
+match. Updates use an explicit Git lease so a concurrent push fails rather than
+being overwritten. This is an automation-owned branch: do not make manual edits
+there, because later runs regenerate it from the default branch.
+A core crate bump also updates the mock crate's versioned local dependency;
+other local consumers use path-only dependencies and need no edits. Cargo
+lockfiles are ignored by this repository. The workflow does not create PRs,
+publish crates, or merge anything, and does not change the release pipeline's
+existing version-stamping policy.
 
-When a bump is needed, the workflow creates a GitHub tracking issue and adds
-`Fixes #<issue-number>` to the PR so merging it closes the issue. Repeat runs
-reuse the open issue, updating its version summary if needed, even if an earlier
-run created the issue but failed before opening the PR. The issue is identified
-by a workflow marker in its body; keep that marker when editing it. No issue is
-created when no bump is needed. If a bump becomes unnecessary without merging
-the PR, close its tracking issue manually. Generated PRs preserve the PR
-template and leave validation checkboxes unchecked.
+After pushing successfully, the workflow creates or updates one tracking issue
+with the version summary and a **Create PR** link. Open the PR yourself, or review
+the existing PR for that branch, and add `Fixes #<issue-number>` to its description.
+The issue is identified by a marker in its body; keep that marker when editing it.
+If issue creation fails after the push, rerunning reuses the prepared branch.
+When no bump is needed, no branch or issue is changed. If a bump becomes
+unnecessary, close its issue and any unmerged PR manually.
 
 The shared validation pipeline runs `scripts/test_bump_released_crate_versions.py`
 in its Windows Python test step for both PR validation and main-branch CI.
-Cargo commands and registry/GitHub requests are mocked; these tests need no
-cargo-edit installation and create no issues or PRs.
+Cargo commands and registry/GitHub requests are mocked. Branch tests use local
+temporary Git repositories; no cargo-edit installation or live issue/PR writes
+are needed.
 
-Before enabling the workflow:
+The workflow uses the built-in `GITHUB_TOKEN` with contents and issues write
+permissions. No custom secret or permission to create PRs is needed. Normal
+validation and review are still required before merging the manually opened PR.
+Later branch pushes use `GITHUB_TOKEN`, so they do not trigger `push` workflows;
+PR synchronization workflows may require **Approve workflows to run**.
+See [GitHub's token behavior](https://docs.github.com/en/actions/concepts/security/github_token#when-github_token-triggers-workflow-runs).
 
-- Allow GitHub Actions to create pull requests in the repository's Actions
-  settings. The workflow needs contents, issues, and pull-request write permissions.
-- Optionally set `CRATE_VERSION_BUMP_TOKEN` to a suitably scoped automation
-  token with those same permissions to run generated PR workflows without
-  manual approval.
-  With the fallback `GITHUB_TOKEN`, `pull_request` workflows for `opened`,
-  `synchronize`, and `reopened` require a user with write access to select
-  **Approve workflows to run**. See [GitHub's token behavior](https://docs.github.com/en/actions/concepts/security/github_token#when-github_token-triggers-workflow-runs).
-  Normal local validation and review are required before merging.
+You can manually assign the issue to Copilot when cloud agent is enabled for
+you and the repository. Automatic assignment through the API requires a user
+token, not `GITHUB_TOKEN`, and is not performed by this workflow.
 
 ### Python and NuGet versions
 

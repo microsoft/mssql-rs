@@ -120,50 +120,124 @@ def test_registry_timeout_fails():
 
 
 @pytest.fixture
+def git_repository(tmp_path):
+    root = tmp_path / "checkout"
+    root.mkdir()
+    remote = tmp_path / "remote.git"
+
+    def git(*args):
+        return subprocess.run(
+            ["git", "-C", str(root), *args],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+
+    git("init", "--bare", str(remote))
+    git("init", "-b", "main")
+    git("config", "commit.gpgsign", "false")
+    for crate in bump.CRATES:
+        (root / crate).mkdir()
+        (root / crate / "Cargo.toml").write_text('version = "0.1.7"\n')
+    (root / "unrelated.txt").write_text("Original\n")
+    git("add", ".")
+    git("-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+        "commit", "-m", "Initial manifests")
+    git("remote", "add", "origin", str(remote))
+    git("push", "-u", "origin", "main")
+    return root, remote, git
+
+
+def test_branch_create_repeat_and_update_only_publish_manifests(git_repository, monkeypatch, capsys):
+    root, _, git = git_repository
+    base = git("rev-parse", "HEAD")
+    (root / "unrelated.txt").write_text("Must not be published\n")
+    git("add", "unrelated.txt")
+    first = None
+    for day, version in enumerate(("0.2.0", "0.2.0", "0.3.0"), start=1):
+        git("checkout", "--detach", base)
+        monkeypatch.setenv("GIT_AUTHOR_DATE", f"2026-01-0{day}T00:00:00+00:00")
+        for crate in bump.CRATES:
+            (root / crate / "Cargo.toml").write_text(f'version = "{version}"\n')
+        bump.push_bump_branch(root)
+        published = git("ls-remote", "--heads", "origin", f"refs/heads/{bump.BUMP_BRANCH}").split()[0]
+        assert git("ls-remote", "--heads", "origin", "refs/heads/main").split()[0] == base
+        assert set(git("diff", "--name-only", base, published).splitlines()) == {
+            f"{crate}/Cargo.toml" for crate in bump.CRATES
+        }
+        assert git("show", f"{published}:unrelated.txt") == "Original"
+        if day == 1:
+            first = published
+        elif day == 2:
+            assert published == first
+            assert git("rev-parse", "HEAD") != first
+            assert "already up to date" in capsys.readouterr().out
+        else:
+            assert published != first
+            assert 'version = "0.3.0"' in git("show", f"{published}:mssql-tds/Cargo.toml")
+
+
+@pytest.mark.parametrize("existing", [False, True])
+def test_branch_push_rejects_concurrent_creation_or_update(git_repository, existing):
+    root, remote, git = git_repository
+    base = git("rev-parse", "HEAD")
+    if existing:
+        (root / "mssql-tds" / "Cargo.toml").write_text('version = "0.2.0"\n')
+        bump.push_bump_branch(root)
+        git("checkout", "--detach", base)
+    (root / "mssql-tds" / "Cargo.toml").write_text('version = "0.3.0"\n')
+    ref = f"refs/heads/{bump.BUMP_BRANCH}"
+    run = subprocess.run
+    raced = False
+
+    def race(args, **kwargs):
+        nonlocal raced
+        if args[:2] == ["git", "push"]:
+            run(["git", "--git-dir", str(remote), "update-ref", ref, base], check=True)
+            raced = True
+        return run(args, **kwargs)
+
+    with patch.object(bump.subprocess, "run", side_effect=race):
+        with pytest.raises(subprocess.CalledProcessError):
+            bump.push_bump_branch(root)
+    assert raced
+    assert git("ls-remote", "--heads", "origin", ref).split()[0] == base
+
+
+@pytest.fixture
 def workflow_environment(tmp_path, monkeypatch):
-    template = tmp_path / ".github" / "PULL_REQUEST_TEMPLATE.md"
-    template.parent.mkdir()
-    template.write_text(
-        (ROOT / ".github" / "PULL_REQUEST_TEMPLATE.md").read_text(encoding="utf-8"),
-        encoding="utf-8",
-    )
     monkeypatch.setattr(bump, "__file__", str(tmp_path / "scripts" / "bump.py"))
-    monkeypatch.setenv("RUNNER_TEMP", str(tmp_path))
     monkeypatch.setenv("GITHUB_REPOSITORY", "microsoft/mssql-rs")
+    monkeypatch.setenv("DEFAULT_BRANCH", "main")
     monkeypatch.setattr(
         bump.subprocess, "run", Mock(side_effect=AssertionError("Unexpected external command"))
     )
     return tmp_path
 
 
-def test_main_links_issue_and_preserves_template(workflow_environment):
+def test_main_pushes_branch_before_creating_issue(workflow_environment):
     root = workflow_environment
     with patch.object(bump, "published_versions", return_value={"0.1.7"}), patch.object(
         bump, "bump_versions", return_value=dict.fromkeys(bump.CRATES, ("0.1.7", "0.2.0"))
-    ) as versions, patch.object(
+    ) as versions, patch.object(bump, "push_bump_branch") as push, patch.object(
         bump, "ensure_bump_issue", return_value=123
     ) as issue:
+        issue.side_effect = lambda *args: push.assert_called_once_with(root)
         bump.main()
-        first_body = (root / "crate-version-bump-pr.md").read_text()
-        for crate in bump.CRATES:
-            assert f"`{crate}`: `0.1.7` -> `0.2.0`" in first_body
-        assert "## Related Issues\n\nFixes #123" in first_body
-        assert "- [ ] `cargo bclippy` passes" in first_body
-        assert "<!--" in first_body
     versions.assert_called_once_with(root, dict.fromkeys(bump.CRATES, {"0.1.7"}))
     issue.assert_called_once()
     assert set(issue.call_args.args[1]) == set(bump.CRATES)
+    for crate in bump.CRATES:
+        assert f"`{crate}`: `0.1.7` -> `0.2.0`" in issue.call_args.args[0]
 
 
-def test_issue_failure_stops_before_pr_body(workflow_environment):
+def test_issue_failure_propagates_after_branch_push(workflow_environment):
     with patch.object(bump, "published_versions", return_value={"0.1.7"}), patch.object(
         bump, "bump_versions", return_value={"mssql-tds": ("0.1.7", "0.2.0")}
-    ), patch.object(
+    ), patch.object(bump, "push_bump_branch") as push, patch.object(
         bump, "ensure_bump_issue", side_effect=subprocess.CalledProcessError(1, "gh")
     ):
         with pytest.raises(subprocess.CalledProcessError):
             bump.main()
-    assert not (workflow_environment / "crate-version-bump-pr.md").exists()
+    push.assert_called_once_with(workflow_environment)
 
 
 def test_main_does_not_partially_bump_on_registry_failure(workflow_environment):
@@ -173,18 +247,17 @@ def test_main_does_not_partially_bump_on_registry_failure(workflow_environment):
         with pytest.raises(URLError):
             bump.main()
     versions.assert_not_called()
-    assert not (workflow_environment / "crate-version-bump-pr.md").exists()
 
 
-def test_main_no_changes_needs_no_issue_and_allows_pr_cleanup(workflow_environment):
+def test_main_no_changes_needs_no_branch_or_issue(workflow_environment):
     with patch.object(bump, "published_versions", return_value=set()), patch.object(
         bump, "bump_versions", return_value={}
-    ), patch.object(
+    ), patch.object(bump, "push_bump_branch") as push, patch.object(
         bump, "ensure_bump_issue"
     ) as issue:
         bump.main()
     issue.assert_not_called()
-    assert (workflow_environment / "crate-version-bump-pr.md").is_file()
+    push.assert_not_called()
 
 
 def test_cargo_failure_does_not_create_issue(workflow_environment):
@@ -194,11 +267,22 @@ def test_cargo_failure_does_not_create_issue(workflow_environment):
         with pytest.raises(subprocess.CalledProcessError):
             bump.main()
     issue.assert_not_called()
-    assert not (workflow_environment / "crate-version-bump-pr.md").exists()
+
+
+def test_push_failure_does_not_create_issue(workflow_environment):
+    with patch.object(bump, "published_versions", return_value={"0.1.7"}), patch.object(
+        bump, "bump_versions", return_value={"mssql-tds": ("0.1.7", "0.2.0")}
+    ), patch.object(
+        bump, "push_bump_branch", side_effect=subprocess.CalledProcessError(1, "git")
+    ), patch.object(bump, "ensure_bump_issue") as issue:
+        with pytest.raises(subprocess.CalledProcessError):
+            bump.main()
+    issue.assert_not_called()
 
 
 def test_issue_created_once_then_reused_and_updated(monkeypatch):
     monkeypatch.setenv("GITHUB_REPOSITORY", "microsoft/mssql-rs")
+    monkeypatch.setenv("DEFAULT_BRANCH", "release/next")
     stored = []
     writes = []
 
@@ -235,7 +319,6 @@ def test_issue_created_once_then_reused_and_updated(monkeypatch):
 
     with patch.object(bump.subprocess, "run", side_effect=github):
         assert bump.ensure_bump_issue("First bump", ["mssql-tds"]) == 123
-        # Also covers a rerun after issue creation succeeded but PR creation failed.
         assert bump.ensure_bump_issue("First bump", ["mssql-tds"]) == 123
         assert writes == ["POST"]
         assert bump.ensure_bump_issue("Both bumps", bump.CRATES) == 123
@@ -244,6 +327,12 @@ def test_issue_created_once_then_reused_and_updated(monkeypatch):
     assert stored[0]["body"].startswith(bump.ISSUE_MARKER)
     assert "Both bumps" in stored[0]["body"]
     assert "First bump" not in stored[0]["body"]
+    assert (
+        "[Create PR](https://github.com/microsoft/mssql-rs/compare/"
+        "release%2Fnext...automation%2Fbump-released-crate-versions?expand=1)"
+    ) in stored[0]["body"]
+    assert "Fixes #<this issue number>" in stored[0]["body"]
+    assert "assignees" not in stored[0]
     for crate in bump.CRATES:
         assert f"`{crate}`" in stored[0]["body"]
     template = yaml.safe_load(
@@ -257,6 +346,7 @@ def test_issue_created_once_then_reused_and_updated(monkeypatch):
 @pytest.mark.parametrize("operation", ["list", "create", "update"])
 def test_issue_api_errors_propagate(monkeypatch, operation):
     monkeypatch.setenv("GITHUB_REPOSITORY", "microsoft/mssql-rs")
+    monkeypatch.setenv("DEFAULT_BRANCH", "main")
     failure = subprocess.CalledProcessError(1, "gh")
     pages = [[{"number": 123, "body": bump.ISSUE_MARKER}]] if operation == "update" else [[]]
     results = [failure] if operation == "list" else [
@@ -279,7 +369,7 @@ def test_duplicate_tracking_issues_fail_without_writing(monkeypatch):
     github.assert_called_once()
 
 
-def test_workflow_scope_and_pr_safety():
+def test_workflow_scope_and_branch_issue_permissions():
     workflow = yaml.safe_load(
         (ROOT / ".github" / "workflows" / "bump-released-crate-versions.yml").read_text()
     )
@@ -288,12 +378,12 @@ def test_workflow_scope_and_pr_safety():
     assert "workflow_dispatch" in triggers
     assert workflow["permissions"] == {}
     assert workflow["jobs"]["bump"]["permissions"] == {
-        "contents": "write", "issues": "write", "pull-requests": "write"
+        "contents": "write", "issues": "write"
     }
     assert workflow["concurrency"]["cancel-in-progress"] is False
     steps = workflow["jobs"]["bump"]["steps"]
     assert steps[0]["with"]["ref"] == "${{ github.event.repository.default_branch }}"
-    assert steps[0]["with"]["persist-credentials"] is False
+    assert steps[0]["with"]["persist-credentials"] is True
     assert steps[1]["id"] == "cadence"
     install = steps[2]["run"]
     assert "cargo install cargo-edit --version " in install
@@ -304,14 +394,10 @@ def test_workflow_scope_and_pr_safety():
         assert step["if"] == "steps.cadence.outputs.due == 'true'"
     assert steps[3]["run"] == "python3 scripts/bump-released-crate-versions.py"
     assert steps[3]["env"] == {
-        "GH_TOKEN": "${{ secrets.CRATE_VERSION_BUMP_TOKEN || github.token }}"
+        "GH_TOKEN": "${{ github.token }}",
+        "DEFAULT_BRANCH": "${{ github.event.repository.default_branch }}",
     }
-    pr = steps[4]
-    assert pr["with"]["branch"] == "automation/bump-released-crate-versions"
-    assert pr["with"]["draft"] is False
-    assert set(pr["with"]["add-paths"].split()) == {
-        f"{crate}/Cargo.toml" for crate in bump.CRATES
-    }
+    assert len(steps) == 4
     assert all(
         len(step["uses"].split("@")[1]) == 40 for step in steps if "uses" in step
     )

@@ -19,13 +19,12 @@ jobs:
     permissions:
       contents: write
       issues: write
-      pull-requests: write
     steps:
       - name: Checkout default branch
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.repository.default_branch }}
-          persist-credentials: false
+          persist-credentials: true
 
       - name: Check cadence
         id: cadence
@@ -45,23 +44,9 @@ jobs:
           cargo install cargo-edit --version 0.13.13 --locked --no-default-features --features set-version --root "$RUNNER_TEMP/cargo-edit"
           echo "$RUNNER_TEMP/cargo-edit/bin" >> "$GITHUB_PATH"
 
-      - name: Check published versions and create tracking issue
+      - name: Push version bumps and create tracking issue
         if: steps.cadence.outputs.due == 'true'
         env:
-          GH_TOKEN: ${{ secrets.CRATE_VERSION_BUMP_TOKEN || github.token }}
+          GH_TOKEN: ${{ github.token }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: python3 scripts/bump-released-crate-versions.py
-
-      - name: Create or update version bump PR
-        if: steps.cadence.outputs.due == 'true'
-        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8
-        with:
-          token: ${{ secrets.CRATE_VERSION_BUMP_TOKEN || github.token }}
-          branch: automation/bump-released-crate-versions
-          base: ${{ github.event.repository.default_branch }}
-          add-paths: |
-            mssql-tds/Cargo.toml
-            mssql-mock-tds/Cargo.toml
-          commit-message: Bump released crates to the next minor version
-          title: Bump released crates to the next minor version
-          body-path: ${{ runner.temp }}/crate-version-bump-pr.md
-          draft: false
