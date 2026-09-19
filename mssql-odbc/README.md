@@ -247,6 +247,13 @@ retaining elapsed-time accounting for finite and exhausted budgets.
 Inlining hints target parameter positioning, conversion, RPC encoding, and
 response/value dispatch. The large conversion and serialization functions use
 `#[inline]`, leaving the final inlining decision to the compiler.
+Parameter arrays compile binding strides and conversion-family/status decisions
+for each execution's descriptor snapshot, then refill one driver-owned parameter
+vector. Values and indicators are reread for every row; each row is fully converted
+before any of its RPC bytes are emitted. The prepared handle is serialized
+separately without shifting the row's parameters. String RPC values borrow only
+driver-owned storage while using the shared value encoder, avoiding an additional
+payload clone. The core owned-vector iterator API remains supported.
 
 ## Conventions
 

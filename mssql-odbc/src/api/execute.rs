@@ -16,10 +16,10 @@ use mssql_tds::error::Error as TdsError;
 use mssql_tds::message::parameters::rpc_parameters::RpcParameter;
 
 use super::exec_common::{
-    ParamsWithDae, build_named_params, build_named_params_for_row, claim_connection,
-    deduct_query_timeout, fail_with_tds, finish_execute_with_param_warning, park_dae_client,
-    park_deferred_dae, publish_scalar_processed, query_timeout_expired_error, return_client_idle,
-    snapshot_bound_params,
+    ParamRowBuildError, ParamsWithDae, build_named_params, build_named_params_for_row,
+    claim_connection, deduct_query_timeout, fail_with_tds, finish_execute_with_param_warning,
+    park_dae_client, park_deferred_dae, publish_scalar_processed, query_timeout_expired_error,
+    return_client_idle, snapshot_bound_params,
 };
 use super::sqlstate::*;
 use super::txn::begin_transaction_if_manual;
@@ -30,7 +30,10 @@ use crate::api::odbc_types::{
     SQL_PARAM_SUCCESS, SQL_PARAM_SUCCESS_WITH_INFO, SQL_PARAM_UNUSED, SQL_SUCCESS,
     SQL_SUCCESS_WITH_INFO, SqlHandle, SqlReturn, SqlULen, SqlUSmallInt,
 };
-use crate::conversion::param_convert::{is_data_at_exec_indicator, is_output_direction};
+use crate::conversion::error::ConvOk;
+use crate::conversion::param_convert::{
+    ParamConversion, data_at_exec_indicator, is_data_at_exec_indicator, is_output_direction,
+};
 use crate::error::free_errors;
 use crate::error::post_sql_error;
 use crate::handles::stmt::{
@@ -38,6 +41,7 @@ use crate::handles::stmt::{
     STMT_STATE_EXEC_STARTED,
 };
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
+use crate::params::ParamArrayBinding;
 
 /// Executes the prepared statement on `statement_handle`.
 ///
@@ -151,29 +155,86 @@ struct PreparedRows<'a> {
     marker_count: usize,
     bind_offset: isize,
     param_bind_type: SqlULen,
+    bindings: Vec<Option<(ParamArrayBinding, ParamConversion)>>,
     failures: Vec<(usize, DiagMsg)>,
     truncated_rows: Vec<usize>,
 }
 
-impl Iterator for PreparedRows<'_> {
-    type Item = Result<(usize, Vec<RpcParameter>), TdsError>;
+impl<'a> PreparedRows<'a> {
+    fn new(
+        bound_params: &'a [Option<crate::params::BoundParam>],
+        active_rows: &'a [usize],
+        marker_count: usize,
+        bind_offset: isize,
+        param_bind_type: SqlULen,
+    ) -> Self {
+        Self {
+            bound_params,
+            active_rows: active_rows.iter(),
+            marker_count,
+            bind_offset,
+            param_bind_type,
+            bindings: bound_params
+                .iter()
+                .take(marker_count)
+                .map(|bound| {
+                    bound.map(|bound| {
+                        (
+                            ParamArrayBinding::new(bound, bind_offset, param_bind_type),
+                            ParamConversion::new(&bound),
+                        )
+                    })
+                })
+                .collect(),
+            failures: Vec::new(),
+            truncated_rows: Vec::new(),
+        }
+    }
 
-    fn next(&mut self) -> Option<Self::Item> {
+    fn fill_row(&mut self, params: &mut Vec<RpcParameter>) -> Option<Result<usize, TdsError>> {
         let row = *self.active_rows.next()?;
-        // Unnamed: every row of a batch serializes positionally, which writes a
-        // zero-length name and never reads `RpcParameter::name`. The @P{n} names
-        // the declaration needs are applied by `execute_prepared_batch`, which
-        // renames its own clone of the first row that builds.
-        let built = match unsafe {
-            build_named_params_for_row(
-                self.bound_params,
-                self.marker_count,
-                self.bind_offset,
-                self.param_bind_type,
-                row,
-                false,
-            )
-        } {
+        params.clear();
+        let built =
+            (|| {
+                let mut fractional_truncated = false;
+                for i in 0..self.marker_count {
+                    let Some(Some((binding, conversion))) = self.bindings.get(i) else {
+                        return Err(ParamRowBuildError::Unbound { parameter: i + 1 });
+                    };
+                    let bound = binding
+                        .for_row(row)
+                        .map_err(|_| ParamRowBuildError::Layout { parameter: i + 1 })?;
+                    // Preserve the existing DAE validation and diagnostic precedence
+                    // if an application changes an indicator after preflight.
+                    if unsafe { data_at_exec_indicator(&bound) }.is_some() {
+                        return unsafe {
+                            build_named_params_for_row(
+                                self.bound_params,
+                                self.marker_count,
+                                self.bind_offset,
+                                self.param_bind_type,
+                                row,
+                                false,
+                            )
+                        }
+                        .map(|built| {
+                            let result = (built.fractional_truncated, !built.dae_params.is_empty());
+                            *params = built.params;
+                            result
+                        });
+                    }
+                    // The callback completes synchronously; only owned values reach the writer.
+                    let (param, outcome) = unsafe { conversion.convert_rpc(None, &bound) }
+                        .map_err(|source| ParamRowBuildError::Conversion {
+                            parameter: i + 1,
+                            source,
+                        })?;
+                    fractional_truncated |= outcome == ConvOk::Truncated;
+                    params.push(param);
+                }
+                Ok((fractional_truncated, false))
+            })();
+        let (fractional_truncated, has_dae) = match built {
             Ok(built) => built,
             Err(error) => {
                 self.failures.push((row, error.diag()));
@@ -184,7 +245,7 @@ impl Iterator for PreparedRows<'_> {
                 ))));
             }
         };
-        if !built.dae_params.is_empty() {
+        if has_dae {
             self.failures
                 .push((row, ERR_OPTIONAL_FEATURE_NOT_IMPLEMENTED));
             return Some(Err(TdsError::UsageError(format!(
@@ -192,12 +253,22 @@ impl Iterator for PreparedRows<'_> {
                 row + 1
             ))));
         }
-        if built.fractional_truncated {
+        if fractional_truncated {
             self.truncated_rows.push(row);
         }
-        Some(Ok((row, built.params)))
+        Some(Ok(row))
     }
+}
 
+#[cfg(test)]
+impl Iterator for PreparedRows<'_> {
+    type Item = Result<(usize, Vec<RpcParameter>), TdsError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut params = Vec::new();
+        self.fill_row(&mut params)
+            .map(|result| result.map(|row| (row, params)))
+    }
     fn size_hint(&self) -> (usize, Option<usize>) {
         self.active_rows.size_hint()
     }
@@ -506,21 +577,21 @@ fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn
                 }
             };
 
-            let mut rows = PreparedRows {
-                bound_params: &bound_params,
-                active_rows: active_rows.iter(),
+            let mut rows = PreparedRows::new(
+                &bound_params,
+                &active_rows,
                 marker_count,
                 bind_offset,
                 param_bind_type,
-                failures: Vec::new(),
-                truncated_rows: Vec::new(),
-            };
-            let batch_result = dbc.runtime.block_on(client.begin_execute_prepared_batch(
-                &mut prepared.stmt,
-                &mut rows,
-                &mut orphaned,
-                ExecuteOptions::new().timeout_secs(query_timeout),
-            ));
+            );
+            let batch_result =
+                dbc.runtime
+                    .block_on(client.begin_execute_prepared_batch_with_buffer(
+                        &mut prepared.stmt,
+                        |params| rows.fill_row(params),
+                        &mut orphaned,
+                        ExecuteOptions::new().timeout_secs(query_timeout),
+                    ));
             if let Ok(mut stmt_state) = stmt.inner.lock() {
                 stmt_state.prepared = Some(prepared);
                 stmt_state.pending_unprepare = orphaned;
@@ -1604,15 +1675,13 @@ mod tests {
         assert_eq!(statuses, [SQL_PARAM_UNUSED; 3]);
         assert_eq!(processed, 0);
 
-        let rows = PreparedRows {
-            bound_params: &batch.bound_params,
-            active_rows: batch.active_rows.iter(),
-            marker_count: batch.marker_count,
-            bind_offset: batch.bind_offset,
-            param_bind_type: batch.param_bind_type,
-            failures: Vec::new(),
-            truncated_rows: Vec::new(),
-        }
+        let rows = PreparedRows::new(
+            &batch.bound_params,
+            &batch.active_rows,
+            batch.marker_count,
+            batch.bind_offset,
+            batch.param_bind_type,
+        )
         .collect::<Result<Vec<_>, _>>()
         .expect("validated parameter rows should build again");
         assert_eq!(
@@ -1777,15 +1846,13 @@ mod tests {
         unsafe { indicators.as_mut_ptr().add(1).write(SQL_DATA_AT_EXEC) };
         unsafe { indicators.as_mut_ptr().add(3).write(SQL_DATA_AT_EXEC) };
 
-        let mut rows = PreparedRows {
-            bound_params: &batch.bound_params,
-            active_rows: batch.active_rows.iter(),
-            marker_count: batch.marker_count,
-            bind_offset: batch.bind_offset,
-            param_bind_type: batch.param_bind_type,
-            failures: Vec::new(),
-            truncated_rows: Vec::new(),
-        };
+        let mut rows = PreparedRows::new(
+            &batch.bound_params,
+            &batch.active_rows,
+            batch.marker_count,
+            batch.bind_offset,
+            batch.param_bind_type,
+        );
         let built = rows.by_ref().collect::<Vec<_>>();
 
         assert_eq!(built.len(), 4);
@@ -1804,6 +1871,117 @@ mod tests {
             vec![1, 3],
             "every failing row has to be reportable, not just one of them"
         );
+    }
+
+    #[test]
+    fn prepared_rows_reuses_storage_and_reads_current_values_and_indicators() {
+        use crate::api::odbc_types::SQL_NULL_DATA;
+        use mssql_tds::datatypes::sqltypes::SqlType;
+        use mssql_tds::message::parameters::rpc_parameters::StatusFlags;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let mut values = [10i32, 20, 30, 40];
+        let mut indicators = [size_of::<i32>() as SqlLen; 4];
+        let mut statuses = [SQL_PARAM_UNUSED; 4];
+        let mut processed = 0;
+        let batch = stage_three_rows(
+            &h,
+            &mut values,
+            &mut indicators,
+            &mut statuses,
+            &mut processed,
+        );
+        let mut rows = PreparedRows::new(
+            &batch.bound_params,
+            &batch.active_rows,
+            batch.marker_count,
+            batch.bind_offset,
+            batch.param_bind_type,
+        );
+        let mut params = Vec::new();
+        assert_eq!(rows.fill_row(&mut params).unwrap().unwrap(), 0);
+        let allocation = params.as_ptr();
+        let capacity = params.capacity();
+        unsafe {
+            indicators.as_mut_ptr().add(1).write(SQL_NULL_DATA);
+            values.as_mut_ptr().add(2).write(123);
+        }
+        for (row, value) in [(1, None), (2, Some(123)), (3, Some(40))] {
+            assert_eq!(rows.fill_row(&mut params).unwrap().unwrap(), row);
+            assert_eq!(params.as_ptr(), allocation);
+            assert_eq!(params.capacity(), capacity);
+            assert_eq!(params.len(), 1);
+            let expected = RpcParameter::new(None, StatusFlags::NONE, SqlType::Int(value));
+            assert_eq!(format!("{:?}", params[0]), format!("{expected:?}"));
+        }
+        assert!(rows.fill_row(&mut params).is_none());
+    }
+
+    #[test]
+    fn prepared_rows_recompiles_descriptor_changes_between_executions() {
+        use crate::api::odbc_types::SQL_BIGINT;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let mut values = [10i32, 20, 30, 40];
+        let mut indicators = [size_of::<i32>() as SqlLen; 4];
+        let mut statuses = [SQL_PARAM_UNUSED; 4];
+        let mut processed = 0;
+        let batch = stage_three_rows(
+            &h,
+            &mut values,
+            &mut indicators,
+            &mut statuses,
+            &mut processed,
+        );
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.prepared = Some(batch.prepared);
+            state.clear_state(STMT_STATE_EXEC_STARTED);
+        }
+        let mut changed = [45i32, 55, 65, 75];
+        assert_eq!(
+            unsafe {
+                sql_bind_parameter(
+                    h.stmt,
+                    1,
+                    SQL_PARAM_INPUT,
+                    SQL_C_SLONG,
+                    SQL_BIGINT,
+                    0,
+                    0,
+                    changed.as_mut_ptr().cast(),
+                    0,
+                    indicators.as_mut_ptr(),
+                )
+            },
+            SQL_SUCCESS
+        );
+        let ExecutionStaging::Batch(next) = stage_execution(stmt).unwrap() else {
+            panic!("expected array staging");
+        };
+        let mut rows = PreparedRows::new(
+            &next.bound_params,
+            &next.active_rows,
+            next.marker_count,
+            next.bind_offset,
+            next.param_bind_type,
+        );
+        let mut params = Vec::new();
+        rows.fill_row(&mut params).unwrap().unwrap();
+        let expected = unsafe {
+            build_named_params_for_row(
+                &next.bound_params,
+                next.marker_count,
+                next.bind_offset,
+                next.param_bind_type,
+                0,
+                false,
+            )
+        }
+        .unwrap_or_else(|error| panic!("{}", error.diag().text));
+        assert_eq!(format!("{params:?}"), format!("{:?}", expected.params));
+        assert!(format!("{params:?}").contains("BigInt(Some(45))"));
     }
 
     #[test]
