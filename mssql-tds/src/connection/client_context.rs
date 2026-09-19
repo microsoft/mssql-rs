@@ -174,6 +174,16 @@ pub enum TdsAuthenticationMethod {
     ActiveDirectoryWorkloadIdentity,
     /// Azure AD integrated authentication using current user's Kerberos ticket.
     ActiveDirectoryIntegrated,
+    /// Azure CLI (`az login`) credentials.
+    ActiveDirectoryAzCli,
+    /// Azure Developer CLI (`azd auth login`) credentials.
+    ActiveDirectoryAzureDeveloperCli,
+    /// Azure Pipelines workload identity federation via a service connection.
+    ActiveDirectoryAzurePipelines,
+    /// Credentials taken from the standard `AZURE_*` environment variables.
+    ActiveDirectoryEnvironment,
+    /// Confidential client authenticating with a signed client assertion.
+    ActiveDirectoryClientAssertion,
     /// Pre-acquired access token (bearer JWT).
     AccessToken,
 }
@@ -303,6 +313,17 @@ pub struct ClientContext {
     /// If not provided, the SPN will be automatically generated from the server address.
     /// Format: MSSQLSvc/<hostname>:<port> or MSSQLSvc/<hostname>:<instance>
     pub server_spn: Option<String>,
+    /// Overrides the server name written into the LOGIN7 packet, leaving the
+    /// address actually dialled untouched.
+    ///
+    /// This separates *where to connect* from *what name to present at login*,
+    /// which is what a connection through a tunnel, proxy or port-forward
+    /// needs: the socket goes to `localhost:1433` while the login must still
+    /// name the real server so server-side routing and any name-based policy
+    /// see the intended target.
+    ///
+    /// `None` writes the dialled address, which is the previous behaviour.
+    pub login_server_name: Option<String>,
     pub(crate) transport_context: TransportContext,
     /// Protocol vector version for feature negotiation.
     pub vector_version: VectorVersion,
@@ -501,6 +522,7 @@ impl ClientContext {
             pooling: false,
             replication: false,
             server_spn: None,
+            login_server_name: None,
             tds_authentication_method: TdsAuthenticationMethod::Password,
             user_instance: false,
             user_name: "".to_string(),
@@ -568,6 +590,7 @@ impl ClientContext {
             user_name: "".to_string(),
             workstation_id: ClientContext::default_workstation_id(hostname::get),
             server_spn: None,
+            login_server_name: None,
             access_token: None,
             transport_context: TransportContext::Tcp {
                 host: "localhost".to_string(),
@@ -669,6 +692,18 @@ impl ClientContext {
     /// Ok(()) if validation passes, or an Error if validation fails.
     pub fn validate_with<V: ClientContextValidator>(&self, validator: &V) -> TdsResult<()> {
         validator.validate(self)
+    }
+
+    /// The server name to write into LOGIN7: the `login_server_name` override
+    /// when one is set, otherwise the address being dialled.
+    ///
+    /// LOGIN7 stores this as an offset/length pair separate from the payload,
+    /// so both must come from the same value — hence one accessor rather than
+    /// two call sites reading the override independently.
+    pub(crate) fn login_server_name(&self, transport: &TransportContext) -> String {
+        self.login_server_name
+            .clone()
+            .unwrap_or_else(|| transport.get_login_server_name())
     }
 
     /// Looks up the Entra ID token factory for the current authentication method.
@@ -814,6 +849,7 @@ impl Clone for ClientContext {
             user_name: self.user_name.clone(),
             workstation_id: self.workstation_id.clone(),
             server_spn: self.server_spn.clone(),
+            login_server_name: self.login_server_name.clone(),
             access_token: self.access_token.clone(),
             transport_context: self.transport_context.clone(),
             vector_version: self.vector_version,
@@ -1775,6 +1811,45 @@ mod tests {
             ctx.get_login_server_name(),
             "myhost.database.windows.net,1433"
         );
+    }
+
+    /// Without an override the login name is the dialled address, so existing
+    /// callers see no change.
+    #[test]
+    fn login_server_name_falls_back_to_the_dialled_address() {
+        let transport = TransportContext::from_routing_token("myhost".to_string(), 1433);
+        let context = ClientContext::default();
+        assert!(context.login_server_name.is_none());
+        assert_eq!(context.login_server_name(&transport), "myhost,1433");
+    }
+
+    /// The override replaces the name at login while the dialled address, which
+    /// the socket still uses, is left alone.
+    #[test]
+    fn login_server_name_override_replaces_only_the_login_name() {
+        let transport = TransportContext::from_routing_token("localhost".to_string(), 1433);
+        let context = ClientContext {
+            login_server_name: Some("real-server.contoso.com".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            context.login_server_name(&transport),
+            "real-server.contoso.com"
+        );
+        assert_eq!(transport.get_login_server_name(), "localhost,1433");
+    }
+
+    /// An override is taken verbatim: it is a name the caller chose, not an
+    /// address to be reformatted into DataSource form.
+    #[test]
+    fn login_server_name_override_is_not_reformatted() {
+        let transport = TransportContext::from_routing_token("localhost".to_string(), 1433);
+        let mut context = ClientContext::default();
+        for name in ["bare-name", "host\\INSTANCE", "host,9999", ""] {
+            context.login_server_name = Some(name.to_string());
+            assert_eq!(context.login_server_name(&transport), name);
+        }
     }
 
     #[test]
