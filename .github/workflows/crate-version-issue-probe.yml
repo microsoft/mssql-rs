@@ -1,0 +1,58 @@
+name: Crate Version Branch and Issue Probe
+
+on:
+  push:
+    branches: [dev/saurabh/crates-version-check]
+    paths: [.github/workflows/crate-version-issue-probe.yml]
+
+permissions: {}
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      issues: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: dev/saurabh/crates-version-check
+          persist-credentials: true
+      - name: Test branch and issue writes twice
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEFAULT_BRANCH: dev/saurabh/crates-version-check
+        run: |
+          python3 - <<'PY'
+          import importlib.util
+          import os
+          import subprocess
+          from pathlib import Path
+
+          root = Path.cwd()
+          spec = importlib.util.spec_from_file_location("bump", root / "scripts" / "bump-released-crate-versions.py")
+          bump = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(bump)
+          run_id = os.environ["GITHUB_RUN_ID"]
+          bump.BUMP_BRANCH = f"automation/crate-version-issue-probe-{run_id}"
+          bump.ISSUE_MARKER = f"<!-- mssql-rs:permission-probe-{run_id} -->"
+          base = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+          summary = "TEMPORARY PERMISSION TEST ONLY. No version changes. Do not merge or assign."
+          first_issue = None
+          for attempt in range(2):
+              if attempt:
+                  subprocess.run(["git", "checkout", "--detach", base], check=True)
+              manifest = root / "mssql-tds" / "Cargo.toml"
+              manifest.write_text(manifest.read_text() + "\n# Temporary workflow permission test; do not merge.\n")
+              bump.push_bump_branch(root)
+              number = bump.ensure_bump_issue(summary, ["mssql-tds"])
+              print(f"PERMISSION_PROBE_ISSUE={number}", flush=True)
+              if first_issue is None:
+                  first_issue = number
+                  subprocess.run([
+                      "gh", "api", f"repos/{os.environ['GITHUB_REPOSITORY']}/issues/{number}",
+                      "--method", "PATCH", "-f", "title=[Permission test] Version bump branch and issue - do not act",
+                  ], check=True, stdout=subprocess.DEVNULL)
+              assert number == first_issue
+          PY
