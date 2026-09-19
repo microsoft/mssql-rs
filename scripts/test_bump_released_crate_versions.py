@@ -26,11 +26,14 @@ def test_selects_only_released_crates_and_repeat_is_quiet(tmp_path, released):
     before = dict.fromkeys(bump.CRATES, "0.1.7")
     after = {crate: "0.2.0" if crate in released else before[crate] for crate in bump.CRATES}
     published = {crate: {"0.1.7"} if crate in released else set() for crate in bump.CRATES}
+    changed = set(released)
+    if "mssql-tds" in released:
+        changed.add("mssql-mock-tds")
     with patch.object(bump, "cargo_versions", side_effect=[before, after, after]), patch.object(
         bump.subprocess, "run",
         return_value=subprocess.CompletedProcess(
             "git", 0,
-            stdout="".join(f" M {crate}/Cargo.toml\n" for crate in released),
+            stdout="".join(f" M {crate}/Cargo.toml\n" for crate in changed),
         ),
     ) as cargo:
         assert bump.bump_versions(tmp_path, published) == {
@@ -462,7 +465,7 @@ def test_workflow_scope_and_branch_issue_permissions():
     assert "workflow_dispatch" in triggers
     assert workflow["permissions"] == {}
     assert workflow["jobs"]["bump"]["permissions"] == {
-        "contents": "write", "issues": "write"
+        "contents": "write", "issues": "write", "pull-requests": "read"
     }
     assert workflow["concurrency"]["cancel-in-progress"] is False
     steps = workflow["jobs"]["bump"]["steps"]

@@ -110,7 +110,8 @@ temporary Git repositories; no cargo-edit installation or live issue/PR writes
 are needed.
 
 The workflow uses the built-in `GITHUB_TOKEN` with contents and issues write
-permissions. No custom secret or permission to create PRs is needed. Normal
+permissions, plus pull request read permission to avoid updating the bump branch
+while a PR is already open. No custom secret or permission to create PRs is needed. Normal
 validation and review are still required before merging.
 Later branch pushes use `GITHUB_TOKEN`, so they do not trigger `push` workflows;
 PR synchronization workflows may require **Approve workflows to run**.

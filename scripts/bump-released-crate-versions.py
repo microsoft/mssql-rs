@@ -63,7 +63,10 @@ def bump_versions(root, published):
         + [arg for crate in selected for arg in ("--package", crate)],
         cwd=root, check=True,
     )
-    expected = {(Path(crate) / "Cargo.toml").as_posix() for crate in selected}
+    expected_crates = set(selected)
+    if "mssql-tds" in selected:
+        expected_crates.add("mssql-mock-tds")
+    expected = {(Path(crate) / "Cargo.toml").as_posix() for crate in expected_crates}
     status = subprocess.run(
         ["git", "status", "--porcelain", "--untracked-files=all"],
         cwd=root, check=True, stdout=subprocess.PIPE, text=True,
