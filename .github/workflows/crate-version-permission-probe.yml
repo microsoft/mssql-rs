@@ -1,0 +1,45 @@
+name: Crate Version PR Permission Probe
+
+on:
+  push:
+    branches: [dev/saurabh/crates-version-check]
+    paths: [.github/workflows/crate-version-permission-probe.yml]
+
+permissions: {}
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: dev/saurabh/crates-version-check
+          persist-credentials: false
+
+      - name: Prepare isolated permission test
+        env:
+          CUSTOM_TOKEN_CONFIGURED: ${{ secrets.CRATE_VERSION_BUMP_TOKEN != '' }}
+        run: |
+          echo "Custom token configured: $CUSTOM_TOKEN_CONFIGURED"
+          printf 'Temporary PR permission test for run %s. Do not merge.\n' "$GITHUB_RUN_ID" > .github/crate-version-permission-probe.txt
+
+      - name: Try creating a draft test PR
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8
+        with:
+          token: ${{ secrets.CRATE_VERSION_BUMP_TOKEN || github.token }}
+          branch: automation/crate-version-permission-probe-${{ github.run_id }}
+          base: dev/saurabh/crates-version-check
+          add-paths: .github/crate-version-permission-probe.txt
+          commit-message: Test workflow PR creation permission
+          title: "[Permission test] Version bump automation - do not merge"
+          body: |
+            Temporary permission test for #597, targeting its feature branch only.
+            This PR will be closed after checking the result. Do not merge.
+
+            Related to #596.
+          draft: true
