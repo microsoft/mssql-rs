@@ -5,6 +5,7 @@
 
 #include "odbc_test_fixture.h"
 
+#include <algorithm>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -720,6 +721,129 @@ TEST_F(PrepareExecuteLiveTest, SQLCancelAfterAFlushRetractsTheRequest) {
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
     EXPECT_EQ("after-cancel", GetColumnChar(1));
     EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+}
+
+// Benefits-from-mock-tds: values and reuse cannot prove superseded handles were
+// released. The prepared-stream ownership unit tests check the unprepare RPC.
+TEST_F(PrepareExecuteLiveTest, RebindAfterCancelledStreamReleasesPriorHandle) {
+    SQLTCHAR driver_version[64] = {};
+    ASSERT_SQL_OK(SQLGetInfo(dbc_, SQL_DRIVER_VER, driver_version,
+                            sizeof(driver_version), nullptr),
+                  SQL_HANDLE_DBC, dbc_);
+    RecordProperty("driver_version", ODBCTestUtils::ToNarrow(driver_version));
+    ASSERT_SQL_OK(ExecDirect("CREATE TABLE #stream_rebind (v varchar(max))"),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_CLOSE), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(Prepare("INSERT INTO #stream_rebind VALUES (?)"),
+                  SQL_HANDLE_STMT, stmt_);
+    SQLHSTMT probe = AllocStmt();
+    ASSERT_NE(nullptr, probe);
+
+    std::string payload(65537, '\0');
+    for (size_t i = 0; i < payload.size(); ++i) {
+        payload[i] = static_cast<char>('!' + (i * 31 + i / 97) % 90);
+    }
+    SQLUINTEGER packet_size = 0;
+    ASSERT_SQL_OK(SQLGetConnectAttr(dbc_, SQL_ATTR_PACKET_SIZE, &packet_size,
+                                   sizeof(packet_size), nullptr),
+                  SQL_HANDLE_DBC, dbc_);
+    ASSERT_GT(packet_size, 0u);
+    ASSERT_GT(payload.size(), packet_size) << "cancel must follow a packet flush";
+
+    SQLCHAR token = 0;
+    SQLLEN indicator = SQL_DATA_AT_EXEC;
+    for (int cycle = 0; cycle < 4; ++cycle) {
+        SCOPED_TRACE(cycle);
+        ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_CHAR,
+                                      SQL_VARCHAR, 0, 0, &token, 0, &indicator),
+                      SQL_HANDLE_STMT, stmt_);
+        for (bool cancel : {true, false}) {
+            SCOPED_TRACE(cancel);
+            SQLPOINTER value_ptr = nullptr;
+            ASSERT_EQ(SQL_NEED_DATA, SQLExecute(stmt_));
+            ASSERT_EQ(SQL_NEED_DATA, SQLParamData(stmt_, &value_ptr));
+            ASSERT_EQ(&token, value_ptr);
+            for (size_t offset = 0; offset < payload.size(); offset += 8191) {
+                const size_t length = (std::min)(size_t{8191}, payload.size() - offset);
+                ASSERT_SQL_OK(SQLPutData(stmt_, payload.data() + offset,
+                                        static_cast<SQLLEN>(length)),
+                              SQL_HANDLE_STMT, stmt_);
+            }
+            if (cancel) {
+                ASSERT_SQL_OK(SQLCancel(stmt_), SQL_HANDLE_STMT, stmt_);
+            } else {
+                ASSERT_SQL_OK(SQLParamData(stmt_, &value_ptr), SQL_HANDLE_STMT, stmt_);
+                ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_CLOSE), SQL_HANDLE_STMT, stmt_);
+            }
+
+            SqlTString query = ODBCTestUtils::ToSqlTStr("SELECT v FROM #stream_rebind");
+            ASSERT_SQL_OK(SQLExecDirect(probe, const_cast<SQLTCHAR*>(query.c_str()), SQL_NTS),
+                          SQL_HANDLE_STMT, probe);
+            if (!cancel) {
+                ASSERT_SQL_OK(SQLFetch(probe), SQL_HANDLE_STMT, probe);
+                std::string actual;
+                for (;;) {
+                    char chunk[4096] = {};
+                    SQLLEN length = 0;
+                    SQLRETURN rc = SQLGetData(probe, 1, SQL_C_CHAR, chunk,
+                                              sizeof(chunk), &length);
+                    if (rc == SQL_NO_DATA) break;
+                    ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, probe);
+                    actual.append(chunk);
+                    ASSERT_LE(actual.size(), payload.size());
+                    if (rc == SQL_SUCCESS) break;
+                    ASSERT_NE('\0', chunk[0]) << "partial read must make progress";
+                }
+                ASSERT_EQ(payload, actual);
+            }
+            ASSERT_EQ(SQL_NO_DATA, SQLFetch(probe));
+            ASSERT_SQL_OK(SQLFreeStmt(probe, SQL_CLOSE), SQL_HANDLE_STMT, probe);
+        }
+        SqlTString truncate = ODBCTestUtils::ToSqlTStr("TRUNCATE TABLE #stream_rebind");
+        ASSERT_SQL_OK(SQLExecDirect(probe, const_cast<SQLTCHAR*>(truncate.c_str()), SQL_NTS),
+                      SQL_HANDLE_STMT, probe);
+        ASSERT_SQL_OK(SQLFreeStmt(probe, SQL_CLOSE), SQL_HANDLE_STMT, probe);
+        ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_RESET_PARAMS), SQL_HANDLE_STMT, stmt_);
+    }
+}
+
+// Benefits-from-mock-tds: the shared TDS ownership tests check actual release;
+// this pins the deferred SQLParamData caller's plan restoration across rebinds.
+TEST_F(PrepareExecuteLiveTest, RebindAfterDeferredStreamReleasesPriorHandle) {
+    ASSERT_SQL_OK(Prepare("SELECT ? + ? AS v"), SQL_HANDLE_STMT, stmt_);
+    SQLCHAR buffered_token = 0, streamed_token = 0;
+    SQLLEN buffered_ind = SQL_DATA_AT_EXEC, streamed_ind = SQL_DATA_AT_EXEC;
+    for (int cycle = 0; cycle < 4; ++cycle) {
+        SCOPED_TRACE(cycle);
+        ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_CHAR,
+                                      SQL_CHAR, 4, 0, &buffered_token, 0, &buffered_ind),
+                      SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(SQLBindParameter(stmt_, 2, SQL_PARAM_INPUT, SQL_C_CHAR,
+                                      SQL_VARCHAR, 0, 0, &streamed_token, 0, &streamed_ind),
+                      SQL_HANDLE_STMT, stmt_);
+        for (bool cancel : {true, false}) {
+            SCOPED_TRACE(cancel);
+            SQLPOINTER token = nullptr;
+            ASSERT_EQ(SQL_NEED_DATA, SQLExecute(stmt_));
+            ASSERT_EQ(SQL_NEED_DATA, SQLParamData(stmt_, &token));
+            ASSERT_EQ(&buffered_token, token);
+            char buffered[] = "head";
+            ASSERT_SQL_OK(SQLPutData(stmt_, buffered, 4), SQL_HANDLE_STMT, stmt_);
+            ASSERT_EQ(SQL_NEED_DATA, SQLParamData(stmt_, &token));
+            ASSERT_EQ(&streamed_token, token);
+            char streamed[] = "tail";
+            ASSERT_SQL_OK(SQLPutData(stmt_, streamed, 4), SQL_HANDLE_STMT, stmt_);
+            if (cancel) {
+                ASSERT_SQL_OK(SQLCancel(stmt_), SQL_HANDLE_STMT, stmt_);
+            } else {
+                ASSERT_SQL_OK(SQLParamData(stmt_, &token), SQL_HANDLE_STMT, stmt_);
+                ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+                ASSERT_EQ("headtail", GetColumnChar(1));
+                ASSERT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+            }
+        }
+        ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_RESET_PARAMS), SQL_HANDLE_STMT, stmt_);
+    }
 }
 
 // A data-at-execution parameter may resolve to NULL: the first SQLPutData

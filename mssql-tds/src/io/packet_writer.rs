@@ -102,6 +102,7 @@ pub struct PacketWriter<'a> {
     /// the first-packet callback, so it still reads `true` on error paths where
     /// the bytes are already gone.
     any_packet_flushed: bool,
+    send_attempted: bool,
     /// Whether the final packet of this message reached the network. Like
     /// `any_packet_flushed`, set with the flush rather than after the checks that
     /// follow it, so a budget expiry on the last packet cannot make a message the
@@ -138,6 +139,7 @@ pub(crate) struct SuspendedMessage {
     packet_size: usize,
     is_first_packet: bool,
     any_packet_flushed: bool,
+    send_attempted: bool,
     message_complete: bool,
     max_timeout_sec: Option<u32>,
     cancel_handle: Option<CancelHandle>,
@@ -146,6 +148,12 @@ pub(crate) struct SuspendedMessage {
 }
 
 impl SuspendedMessage {
+    /// A polled send may have written bytes even if cancellation prevented it
+    /// from completing. False proves the server never saw this message.
+    pub(crate) fn send_attempted(&self) -> bool {
+        self.send_attempted
+    }
+
     /// `true` while no packet of this message has reached the network yet, so
     /// the request can be abandoned locally without the server ever learning it
     /// existed.
@@ -246,6 +254,7 @@ impl<'a> PacketWriter<'a> {
             packet_size,
             is_first_packet: true,
             any_packet_flushed: false,
+            send_attempted: false,
             message_complete: false,
             start_time: Instant::now(),
             max_timeout_sec: effective_timeout,
@@ -281,6 +290,7 @@ impl<'a> PacketWriter<'a> {
             packet_size: self.packet_size,
             is_first_packet: self.is_first_packet,
             any_packet_flushed: self.any_packet_flushed,
+            send_attempted: self.send_attempted,
             message_complete: self.message_complete,
             max_timeout_sec: self.max_timeout_sec,
             cancel_handle: self.cancel_handle,
@@ -310,6 +320,7 @@ impl<'a> PacketWriter<'a> {
             packet_size: state.packet_size,
             is_first_packet: state.is_first_packet,
             any_packet_flushed: state.any_packet_flushed,
+            send_attempted: state.send_attempted,
             message_complete: state.message_complete,
             start_time: Instant::now(),
             max_timeout_sec: state.max_timeout_sec,
@@ -434,10 +445,10 @@ impl<'a> PacketWriter<'a> {
         // next write to panic (issue #513). The timeout is checked *after*
         // the write finishes so that the stream always remains in a clean
         // state and attention packets can be sent safely on timeout.
-        let send_data_fut = CancelHandle::run_until_cancelled(
-            self.cancel_handle.as_ref(),
-            self.network_writer.send(data_slice),
-        );
+        let send_data_fut = CancelHandle::run_until_cancelled(self.cancel_handle.as_ref(), async {
+            self.send_attempted = true;
+            self.network_writer.send(data_slice).await
+        });
 
         send_data_fut.await?;
 
@@ -820,6 +831,26 @@ pub(crate) mod tests {
         async fn disable_ssl(&mut self) -> TdsResult<()> {
             unimplemented!()
         }
+    }
+
+    #[test]
+    fn send_attempt_survives_suspend_and_resume() {
+        let mut mock = MockNetworkWriter::new(512);
+        let mut writer = PacketWriter::new(PacketType::RpcRequest, &mut mock, None, None);
+        block_on(writer.write_byte_async(0xAB)).unwrap();
+        let mut message = writer.suspend();
+        for _ in 0..2 {
+            assert!(!message.send_attempted());
+            message = PacketWriter::resume(message, &mut mock).suspend();
+        }
+        let mut writer = PacketWriter::resume(message, &mut mock);
+        block_on(writer.finalize()).unwrap();
+        let mut message = writer.suspend();
+        for _ in 0..2 {
+            assert!(message.send_attempted());
+            message = PacketWriter::resume(message, &mut mock).suspend();
+        }
+        assert_eq!(mock.data.len(), 9);
     }
 
     #[test]
