@@ -4318,6 +4318,13 @@ mod tests {
                 for capacity in [0, 1, 2, units.len() + 1, units.len() + 2] {
                     let mut output = vec![0xAA_u8; 2 * capacity + 3];
                     let mut indicator = [-99; 2];
+                    assert!(
+                        !output
+                            .as_ptr()
+                            .wrapping_add(1)
+                            .cast::<SqlWChar>()
+                            .is_aligned()
+                    );
                     let b = binding(
                         1,
                         SQL_C_WCHAR,
