@@ -481,13 +481,13 @@ impl CursorClient for TdsClient {
         self.finish_send(serialize_result, message).await?;
 
         let metadata = self.next_rowset().await?;
-        if metadata.is_none() {
-            self.execution_context.set_has_open_batch(false);
-            self.current_result_set_has_been_read_till_end = true;
-        } else {
-            self.current_metadata = metadata;
+        if let Some(metadata) = metadata {
+            self.set_current_metadata(metadata);
             self.current_result_set_has_been_read_till_end = false;
             self.execution_context.set_has_open_batch(true);
+        } else {
+            self.execution_context.set_has_open_batch(false);
+            self.current_result_set_has_been_read_till_end = true;
         }
         Ok(())
     }
@@ -1156,12 +1156,14 @@ impl TdsClient {
     async fn drain_cursor_response(&mut self) -> TdsResult<()> {
         // Clear any stale metadata up-front so an error here cannot leak columns
         // from a previous result set through get_metadata().
-        self.current_metadata = None;
+        self.clear_current_metadata();
         // Clear any stale return status so a missing ReturnStatus token surfaces
         // as Succeeded rather than the previous RPC's status.
         self.last_return_status = ReturnStatus::NotReceived;
         let metadata = self.next_rowset().await?;
-        self.current_metadata = metadata;
+        if let Some(metadata) = metadata {
+            self.set_current_metadata(metadata);
+        }
         let server_errors = self.drain_stream_or_retire().await?;
         self.execution_context.set_has_open_batch(false);
         self.current_result_set_has_been_read_till_end = true;

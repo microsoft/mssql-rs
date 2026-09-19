@@ -6,7 +6,7 @@
 use std::sync::Mutex as StdMutex;
 
 use mssql_tds::datatypes::sqldatatypes::{TdsDataType, VectorBaseType};
-use mssql_tds::query::metadata::ColumnMetadata;
+use mssql_tds::query::metadata::ResultColumnMetadata;
 use pyo3::prelude::*;
 use pyo3::types::{
     PyBool, PyBytes, PyDate, PyDateTime, PyFloat, PyInt, PyList, PyModule, PyString, PyTime,
@@ -41,7 +41,7 @@ impl DescriptionState {
 }
 
 pub(crate) async fn materialize(
-    metadata: Option<Vec<ColumnMetadata>>,
+    metadata: Option<Vec<ResultColumnMetadata>>,
 ) -> PyResult<Option<Py<PyTuple>>> {
     let Some(metadata) = metadata else {
         return Ok(None);
@@ -57,8 +57,11 @@ pub(crate) async fn materialize(
     })?
 }
 
-fn python_type<'py>(py: Python<'py>, metadata: &ColumnMetadata) -> PyResult<Bound<'py, PyType>> {
-    let python_type = match metadata.effective_data_type() {
+fn python_type<'py>(
+    py: Python<'py>,
+    metadata: &ResultColumnMetadata,
+) -> PyResult<Bound<'py, PyType>> {
+    let python_type = match metadata.data_type() {
         TdsDataType::Int1
         | TdsDataType::Int2
         | TdsDataType::Int4
@@ -110,17 +113,17 @@ fn imported_python_type<'py>(
         .cast_into::<PyType>()?)
 }
 
-fn column_size(metadata: &ColumnMetadata) -> u64 {
-    if metadata.effective_is_plp() {
+fn column_size(metadata: &ResultColumnMetadata) -> u64 {
+    if metadata.is_plp() {
         return 0;
     }
 
-    match metadata.effective_data_type() {
+    match metadata.data_type() {
         TdsDataType::Int1 => 3,
         TdsDataType::Int2 => 5,
         TdsDataType::Int4 => 10,
         TdsDataType::Int8 => 19,
-        TdsDataType::IntN => match metadata.effective_type_info().length {
+        TdsDataType::IntN => match metadata.type_info().length {
             1 => 3,
             2 => 5,
             4 => 10,
@@ -130,7 +133,7 @@ fn column_size(metadata: &ColumnMetadata) -> u64 {
         TdsDataType::Bit | TdsDataType::BitN => 1,
         TdsDataType::Flt4 => 7,
         TdsDataType::Flt8 => 15,
-        TdsDataType::FltN => match metadata.effective_type_info().length {
+        TdsDataType::FltN => match metadata.type_info().length {
             4 => 7,
             8 => 15,
             _ => 0,
@@ -142,7 +145,7 @@ fn column_size(metadata: &ColumnMetadata) -> u64 {
         }
         TdsDataType::DateTime => 23,
         TdsDataType::DateTim4 => 16,
-        TdsDataType::DateTimeN => match metadata.effective_type_info().length {
+        TdsDataType::DateTimeN => match metadata.type_info().length {
             8 => 23,
             4 => 16,
             _ => 0,
@@ -163,18 +166,18 @@ fn column_size(metadata: &ColumnMetadata) -> u64 {
         | TdsDataType::Money4
         | TdsDataType::MoneyN => u64::from(metadata.get_precision().unwrap_or(0)),
         TdsDataType::NChar | TdsDataType::NVarChar | TdsDataType::NText => {
-            (metadata.effective_type_info().length / 2) as u64
+            (metadata.type_info().length / 2) as u64
         }
-        _ => metadata.effective_type_info().length as u64,
+        _ => metadata.type_info().length as u64,
     }
 }
 
-fn decimal_digits(metadata: &ColumnMetadata) -> u8 {
-    match metadata.effective_data_type() {
+fn decimal_digits(metadata: &ResultColumnMetadata) -> u8 {
+    match metadata.data_type() {
         TdsDataType::Money | TdsDataType::Money4 | TdsDataType::MoneyN => 4,
         TdsDataType::DateTime => 3,
         TdsDataType::DateTim4 => 0,
-        TdsDataType::DateTimeN => match metadata.effective_type_info().length {
+        TdsDataType::DateTimeN => match metadata.type_info().length {
             8 => 3,
             _ => 0,
         },
@@ -185,7 +188,7 @@ fn decimal_digits(metadata: &ColumnMetadata) -> u8 {
 
 fn description_to_python<'py>(
     py: Python<'py>,
-    metadata: &[ColumnMetadata],
+    metadata: &[ResultColumnMetadata],
 ) -> PyResult<Bound<'py, PyTuple>> {
     let mut description = Vec::with_capacity(metadata.len());
     for column in metadata {
@@ -193,7 +196,7 @@ fn description_to_python<'py>(
         description.push(PyTuple::new(
             py,
             [
-                column.column_name.clone().into_pyobject(py)?.into_any(),
+                column.column_name().into_pyobject(py)?.into_any(),
                 python_type(py, column)?.into_any(),
                 py.None().into_bound(py),
                 size.into_pyobject(py)?.into_any(),
@@ -214,9 +217,9 @@ fn description_to_python<'py>(
 mod tests {
     use super::description_to_python;
     use mssql_tds::datatypes::sqldatatypes::VectorBaseType;
-    use mssql_tds::query::metadata::ColumnMetadata;
+    use mssql_tds::query::metadata::{ColumnMetadata, ResultColumnMetadata};
     use pyo3::Python;
-    use pyo3::types::{PyAnyMethods, PyList, PyString};
+    use pyo3::types::{PyAnyMethods, PyBytes, PyList, PyString};
 
     use super::vector_python_type;
 
@@ -239,11 +242,12 @@ mod tests {
     fn test_description_to_python_uses_effective_plp_for_bounded_encrypted_string() {
         Python::attach(|py| {
             let metadata = ColumnMetadata::test_encrypted_nvarchar_4000();
+            let result_metadata = ResultColumnMetadata::new(metadata.clone(), true);
 
             assert!(metadata.is_plp());
-            assert!(!metadata.effective_is_plp());
+            assert!(!result_metadata.is_plp());
 
-            let description = description_to_python(py, &[metadata]).unwrap();
+            let description = description_to_python(py, &[result_metadata]).unwrap();
             let column = description.get_item(0).unwrap();
 
             assert!(column.get_item(1).unwrap().is(py.get_type::<PyString>()));
@@ -256,14 +260,46 @@ mod tests {
     fn test_description_to_python_uses_effective_plp_for_encrypted_max_string() {
         Python::attach(|py| {
             let metadata = ColumnMetadata::test_encrypted_nvarchar_max();
+            let result_metadata = ResultColumnMetadata::new(metadata.clone(), true);
 
             assert!(metadata.is_plp());
-            assert!(metadata.effective_is_plp());
+            assert!(result_metadata.is_plp());
 
-            let description = description_to_python(py, &[metadata]).unwrap();
+            let description = description_to_python(py, &[result_metadata]).unwrap();
             let column = description.get_item(0).unwrap();
 
             assert!(column.get_item(1).unwrap().is(py.get_type::<PyString>()));
+            assert_eq!(column.get_item(3).unwrap().extract::<u64>().unwrap(), 0);
+            assert_eq!(column.get_item(4).unwrap().extract::<u64>().unwrap(), 0);
+        });
+    }
+
+    #[test]
+    fn test_description_to_python_uses_wire_metadata_when_result_decryption_is_disabled() {
+        Python::attach(|py| {
+            let metadata = ColumnMetadata::test_encrypted_nvarchar_4000();
+            let result_metadata = ResultColumnMetadata::new(metadata, false);
+
+            let description = description_to_python(py, &[result_metadata]).unwrap();
+            let column = description.get_item(0).unwrap();
+
+            assert!(column.get_item(1).unwrap().is(py.get_type::<PyBytes>()));
+            assert_eq!(column.get_item(3).unwrap().extract::<u64>().unwrap(), 0);
+            assert_eq!(column.get_item(4).unwrap().extract::<u64>().unwrap(), 0);
+        });
+    }
+
+    #[test]
+    fn test_description_to_python_uses_wire_metadata_when_result_decryption_is_disabled_for_max_string()
+     {
+        Python::attach(|py| {
+            let metadata = ColumnMetadata::test_encrypted_nvarchar_max();
+            let result_metadata = ResultColumnMetadata::new(metadata, false);
+
+            let description = description_to_python(py, &[result_metadata]).unwrap();
+            let column = description.get_item(0).unwrap();
+
+            assert!(column.get_item(1).unwrap().is(py.get_type::<PyBytes>()));
             assert_eq!(column.get_item(3).unwrap().extract::<u64>().unwrap(), 0);
             assert_eq!(column.get_item(4).unwrap().extract::<u64>().unwrap(), 0);
         });

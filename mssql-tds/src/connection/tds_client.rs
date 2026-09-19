@@ -47,7 +47,7 @@ use tracing::{debug, error, info, instrument, warn};
 
 use crate::{
     core::{CancelHandle, NegotiatedEncryptionSetting, TdsResult},
-    query::metadata::ColumnMetadata,
+    query::metadata::{ColumnMetadata, ResultColumnMetadata},
 };
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -480,6 +480,14 @@ pub struct TdsClient {
     /// [`on_reset_connection_ack`](TdsClient::on_reset_connection_ack).
     reset_state: ResetAckState,
 
+    /// Whether result values for the current result set are decrypted.
+    ///
+    /// This is captured from the effective command Column Encryption setting when
+    /// the result-set boundary is applied. Result metadata and row decoding must
+    /// use the same decision so they cannot disagree about whether encrypted values
+    /// are exposed as plaintext or ciphertext.
+    current_result_set_decrypt_results: bool,
+
     // pub(crate) batch_result: Option<BatchResult<'static>>,
     pub(crate) current_metadata: Option<Arc<ColMetadataToken>>,
     /// Memoized cell decryptor for `current_metadata`'s CEK table, paired with
@@ -657,6 +665,7 @@ impl TdsClient {
             execution_context,
             recovery_context: Box::new(recovery_context),
             reset_state: ResetAckState::Idle,
+            current_result_set_decrypt_results: false,
             current_metadata: None,
             current_decryptor: None,
             buffered_row_support: None,
@@ -874,7 +883,7 @@ impl TdsClient {
         self.execution_context = execution_context;
 
         // Reset per-request state
-        self.current_metadata = None;
+        self.clear_current_metadata();
         self.count_map.clear();
         self.return_values.clear();
         self.info_messages.clear();
@@ -1242,6 +1251,24 @@ impl TdsClient {
 
     pub(crate) fn get_current_metadata(&self) -> Option<&ColMetadataToken> {
         self.current_metadata.as_deref()
+    }
+
+    pub(crate) fn get_current_result_metadata(&self) -> Vec<ResultColumnMetadata> {
+        self.current_metadata
+            .as_ref()
+            .map(|metadata| {
+                metadata
+                    .columns
+                    .iter()
+                    .map(|column| {
+                        ResultColumnMetadata::new(
+                            column.clone(),
+                            self.current_result_set_decrypt_results,
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Rows affected by the most recently executed statement.
@@ -1774,7 +1801,7 @@ impl TdsClient {
                 completed: Vec::new(),
             }));
             self.current_result_set_has_been_read_till_end = true;
-            self.current_metadata = None;
+            self.clear_current_metadata();
             self.advance_prepared_batch().await.map(|_| {
                 self.take_prepared_batch_results()
                     .unwrap_or(PreparedBatchResult {
@@ -1789,7 +1816,7 @@ impl TdsClient {
             self.prepared_batch = None;
             self.execution_context.set_has_open_batch(false);
             self.current_result_set_has_been_read_till_end = true;
-            self.current_metadata = None;
+            self.clear_current_metadata();
         }
         result
     }
@@ -1866,7 +1893,7 @@ impl TdsClient {
     async fn advance_prepared_batch(&mut self) -> TdsResult<StatementResult> {
         let result = self.read_prepared_batch_result().await;
         if let Err(error) = &result {
-            self.current_metadata = None;
+            self.clear_current_metadata();
             self.current_result_set_has_been_read_till_end = true;
             self.execution_context.set_has_open_batch(false);
             self.prepared_batch = None;
@@ -2050,7 +2077,7 @@ impl TdsClient {
 
         self.execution_context.set_has_open_batch(false);
         self.current_result_set_has_been_read_till_end = true;
-        self.current_metadata = None;
+        self.clear_current_metadata();
 
         let result = PreparedBatchResult {
             rows: results,
@@ -4809,7 +4836,7 @@ impl TdsClient {
     /// timeout, row cursor, or open-batch flag would expose stale state.
     fn normalize_after_attention(&mut self) {
         self.prepared_batch = None;
-        self.current_metadata = None;
+        self.clear_current_metadata();
         self.current_decryptor = None;
         self.buffered_row_support = None;
         self.count_map.clear();
@@ -5140,7 +5167,7 @@ impl TdsClient {
                     // given up on (mirrors `handle_row_read_token`).
                     self.execution_context.set_has_open_batch(false);
                     self.current_result_set_has_been_read_till_end = true;
-                    self.current_metadata = None;
+                    self.clear_current_metadata();
                     match drain_result {
                         Ok(mut drain_errors) => all_errors.append(&mut drain_errors),
                         Err(e) => {
@@ -5205,7 +5232,7 @@ impl TdsClient {
     fn apply_result_boundary(&mut self, boundary: ResultBoundaryKind) -> StatementResult {
         match boundary {
             ResultBoundaryKind::RowSet(md) => {
-                self.current_metadata = Some(md);
+                self.set_current_metadata(md);
                 self.execution_context.set_has_open_batch(true);
                 self.current_result_set_has_been_read_till_end = false;
                 self.current_result_ended_with_done_in_proc = false;
@@ -5214,11 +5241,11 @@ impl TdsClient {
             ResultBoundaryKind::NoRows { rows_affected } => {
                 // A no-row statement has zero columns; `has_open_batch` was set
                 // by `advance_to_result_boundary` based on the DONE MORE flag.
-                self.current_metadata = None;
+                self.clear_current_metadata();
                 StatementResult::NoRows { rows_affected }
             }
             ResultBoundaryKind::End => {
-                self.current_metadata = None;
+                self.clear_current_metadata();
                 self.execution_context.set_has_open_batch(false);
                 self.current_result_set_has_been_read_till_end = true;
                 StatementResult::End
@@ -5504,7 +5531,7 @@ impl TdsClient {
             self.negotiated_settings.is_column_encryption_supported(),
         );
         if let Err(error) = self.settle_rpc_terminator(&parser_context).await {
-            self.current_metadata = None;
+            self.clear_current_metadata();
             self.abort_pending_prepare_capture();
             return Err(error);
         }
@@ -5680,6 +5707,20 @@ impl TdsClient {
         }
     }
 
+    /// Returns whether encrypted values in result sets should be decrypted for
+    /// the current command.
+    ///
+    /// Result decryption is enabled for [`ExecutionColumnEncryptionSetting::Enabled`]
+    /// and [`ExecutionColumnEncryptionSetting::ResultSetOnly`], and disabled for
+    /// [`ExecutionColumnEncryptionSetting::Disabled`].
+    pub fn should_decrypt_results(&self) -> bool {
+        matches!(
+            self.effective_command_ce_setting(),
+            ExecutionColumnEncryptionSetting::Enabled
+                | ExecutionColumnEncryptionSetting::ResultSetOnly
+        )
+    }
+
     /// Calls `sp_describe_parameter_encryption` for the given statement and
     /// parameter declaration, parsing the two result sets into a
     /// [`DescribeParameterEncryptionResult`](crate::security::describe_parameter_encryption::DescribeParameterEncryptionResult).
@@ -5735,13 +5776,13 @@ impl TdsClient {
         // Result set 1: CEK table metadata.
         match self.next_rowset().await? {
             Some(metadata) => {
-                self.current_metadata = Some(metadata);
+                self.set_current_metadata(metadata);
                 self.execution_context.set_has_open_batch(true);
                 self.current_result_set_has_been_read_till_end = false;
             }
             None => {
                 self.execution_context.set_has_open_batch(false);
-                self.current_metadata = None;
+                self.clear_current_metadata();
                 self.current_result_set_has_been_read_till_end = true;
                 return Err(crate::error::Error::ColumnEncryptionError(
                     "sp_describe_parameter_encryption returned no result sets".to_string(),
@@ -6178,10 +6219,9 @@ impl TdsClient {
         use crate::security::keystore::ResolvedCekDecryptor;
 
         // No CEK table normally means no encrypted columns in this result set.
-        // A per-command `Disabled` override suppresses result decryption: any
-        // encrypted column is then decoded as varbinary and its ciphertext is
-        // returned through the normal decode path.
-        if self.effective_command_ce_setting() == ExecutionColumnEncryptionSetting::Disabled {
+        // Result decryption is disabled for this execution, so encrypted columns
+        // remain ciphertext and are decoded through the normal binary path.
+        if !self.current_result_set_decrypt_results {
             return Ok(None);
         }
 
@@ -7529,7 +7569,7 @@ impl TdsClient {
                 // read a stream we have given up on.
                 self.execution_context.set_has_open_batch(false);
                 self.current_result_set_has_been_read_till_end = true;
-                self.current_metadata = None;
+                self.clear_current_metadata();
                 match drain_result {
                     Ok(drain_errors) => all_errors.extend(drain_errors),
                     Err(e) => {
@@ -7742,7 +7782,7 @@ impl TdsClient {
         // `drain_and_release` path). Clearing them here would discard them.
         // The sp_prepexec @handle, if any, was captured during the drain above
         // (see push_return_value) and survives this clear.
-        self.current_metadata = None;
+        self.clear_current_metadata();
         self.current_result_ended_with_done_in_proc = false;
         self.return_values.clear();
         self.abort_pending_prepare_capture();
@@ -8037,12 +8077,12 @@ impl TdsClient {
         // GetDtcAddress returns a result set, unlike other transaction commands
         // Set up execution state for result iteration (similar to execute())
         let metadata = self.next_rowset().await?;
-        if metadata.is_none() {
-            self.execution_context.set_has_open_batch(false);
-            self.current_metadata = None;
-        } else {
-            self.current_metadata = metadata;
+        if let Some(metadata) = metadata {
+            self.set_current_metadata(metadata);
             self.execution_context.set_has_open_batch(true);
+        } else {
+            self.execution_context.set_has_open_batch(false);
+            self.clear_current_metadata();
         }
 
         Ok(())
@@ -8111,6 +8151,22 @@ impl TdsClient {
 
         Ok(())
     }
+
+    /// Sets the metadata for the current result set and captures whether its
+    /// encrypted values should be decrypted.
+    ///
+    /// The captured decryption state is used to keep result metadata and row
+    /// decoding consistent for the lifetime of the result set.
+    pub(crate) fn set_current_metadata(&mut self, metadata: Arc<ColMetadataToken>) {
+        self.current_metadata = Some(metadata);
+        self.current_result_set_decrypt_results = self.should_decrypt_results();
+    }
+
+    /// Clears the metadata and captured decryption state for the current result set.
+    pub(crate) fn clear_current_metadata(&mut self) {
+        self.current_metadata = None;
+        self.current_result_set_decrypt_results = false;
+    }
 }
 
 impl ResultSet for TdsClient {
@@ -8122,6 +8178,10 @@ impl ResultSet for TdsClient {
             .as_ref()
             .map(|m| &m.columns)
             .unwrap_or(&self.empty_metadata)
+    }
+
+    fn get_result_metadata(&self) -> Vec<ResultColumnMetadata> {
+        self.get_current_result_metadata()
     }
 
     fn next_row(&mut self) -> impl Future<Output = TdsResult<Option<Vec<ColumnValues>>>> + Send {
@@ -8352,6 +8412,14 @@ pub trait ResultSet {
     /// Returns the metadata of the result set.
     /// This metadata includes information about the columns in the result set.
     fn get_metadata(&self) -> &Vec<ColumnMetadata>;
+
+    /// Returns metadata describing the values exposed by the current result set.
+    ///
+    /// For encrypted columns, the returned metadata reflects the effective
+    /// column-encryption setting for the current execution: logical plaintext
+    /// metadata when result decryption is enabled and wire ciphertext metadata
+    /// otherwise.
+    fn get_result_metadata(&self) -> Vec<ResultColumnMetadata>;
 
     /// Returns the next row of data as a vector of column values.
     /// If there is no more data, it returns None.

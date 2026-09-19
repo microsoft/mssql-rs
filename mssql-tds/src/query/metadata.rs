@@ -40,6 +40,17 @@ pub struct ColumnMetadata {
     pub(crate) crypto_metadata: Option<CryptoMetadata>,
 }
 
+/// Metadata describing the values exposed for a result column.
+///
+/// For encrypted columns, the metadata is derived from either the logical
+/// plaintext metadata or the wire metadata according to whether result
+/// decryption is enabled for the execution.
+#[derive(Debug, Clone)]
+pub struct ResultColumnMetadata {
+    metadata: ColumnMetadata,
+    decrypt_results: bool,
+}
+
 impl ColumnMetadata {
     /// Column allows `NULL` values.
     pub fn is_nullable(&self) -> bool {
@@ -123,28 +134,32 @@ impl ColumnMetadata {
             _ => PlpEncoding::Binary,
         })
     }
-    /// Returns the scale for decimal/numeric/time types.
-    ///
-    /// Returns `Some(scale)` for types that include scale information (e.g., `decimal(18,4)`, `time(7)`),
-    /// or `None` for types where scale is not applicable.
-    pub fn get_scale(&self) -> Option<u8> {
-        match self.effective_type_info().type_info_variant {
+
+    fn get_scale_from_type_info(type_info: &TypeInfo) -> Option<u8> {
+        match type_info.type_info_variant {
             TypeInfoVariant::VarLenScale(_, scale) => Some(scale),
             TypeInfoVariant::VarLenPrecisionScale(_, _, _, scale) => Some(scale),
             _ => None,
         }
     }
 
-    /// Returns the precision (max decimal digits) for numeric types.
+    /// Returns the scale derived from the column's wire type information.
+    fn wire_get_scale(&self) -> Option<u8> {
+        Self::get_scale_from_type_info(&self.type_info)
+    }
+
+    /// Returns the scale for decimal/numeric/time types.
     ///
-    /// - `decimal`/`numeric` → declared precision (1–38).
-    /// - `money` → 19, `smallmoney` → 10 (T-SQL fixed precisions).
-    /// - `MoneyN` → 19 if 8-byte payload, 10 if 4-byte payload.
-    /// - All other types → `None`.
-    pub fn get_precision(&self) -> Option<u8> {
+    /// Returns `Some(scale)` for types that include scale information (e.g., `decimal(18,4)`, `time(7)`),
+    /// or `None` for types where scale is not applicable.
+    pub fn get_scale(&self) -> Option<u8> {
+        Self::get_scale_from_type_info(self.effective_type_info())
+    }
+
+    fn get_precision_from_type_info(type_info: &TypeInfo) -> Option<u8> {
         use crate::datatypes::sqldatatypes::{FixedLengthTypes, VariableLengthTypes};
 
-        match self.effective_type_info().type_info_variant {
+        match type_info.type_info_variant {
             TypeInfoVariant::VarLenPrecisionScale(_, _, precision, _) => Some(precision),
             TypeInfoVariant::FixedLen(FixedLengthTypes::Money) => Some(19),
             TypeInfoVariant::FixedLen(FixedLengthTypes::Money4) => Some(10),
@@ -157,15 +172,39 @@ impl ColumnMetadata {
         }
     }
 
-    /// Returns the SQL collation for string-typed columns, or `None` for non-string types.
-    pub fn get_collation(&self) -> Option<SqlCollation> {
-        // Collation is only applicable to string types which are either VarLen strings
-        // Or PLP types with a collation.
-        match self.effective_type_info().type_info_variant {
+    /// Returns the precision derived from the column's wire type information.
+    fn wire_get_precision(&self) -> Option<u8> {
+        Self::get_precision_from_type_info(&self.type_info)
+    }
+
+    /// Returns the precision (max decimal digits) for numeric types.
+    ///
+    /// - `decimal`/`numeric` → declared precision (1–38).
+    /// - `money` → 19, `smallmoney` → 10 (T-SQL fixed precisions).
+    /// - `MoneyN` → 19 if 8-byte payload, 10 if 4-byte payload.
+    /// - All other types → `None`.
+    pub fn get_precision(&self) -> Option<u8> {
+        Self::get_precision_from_type_info(self.effective_type_info())
+    }
+
+    fn get_collation_from_type_info(type_info: &TypeInfo) -> Option<SqlCollation> {
+        match type_info.type_info_variant {
             TypeInfoVariant::VarLenString(_, _, collation) => collation,
             TypeInfoVariant::PartialLen(_, _, collation, _, _) => collation,
             _ => None,
         }
+    }
+
+    /// Returns the collation derived from the column's wire type information.
+    fn wire_get_collation(&self) -> Option<SqlCollation> {
+        Self::get_collation_from_type_info(&self.type_info)
+    }
+
+    /// Returns the SQL collation for string-typed columns, or `None` for non-string types.
+    pub fn get_collation(&self) -> Option<SqlCollation> {
+        // Collation is only applicable to string types which are either VarLen strings
+        // Or PLP types with a collation.
+        Self::get_collation_from_type_info(self.effective_type_info())
     }
 
     /// Returns the logical SQL Server data type of the column.
@@ -307,6 +346,99 @@ impl ColumnMetadata {
         });
 
         metadata
+    }
+}
+
+impl ResultColumnMetadata {
+    /// Creates result metadata using `metadata` and the specified result
+    /// decryption behavior.
+    ///
+    /// When `decrypt_results` is `true`, encrypted columns expose their
+    /// logical plaintext metadata. When it is `false`, they expose the
+    /// metadata of the ciphertext representation received from the server.
+    pub fn new(metadata: ColumnMetadata, decrypt_results: bool) -> Self {
+        Self {
+            metadata,
+            decrypt_results,
+        }
+    }
+
+    /// Returns the SQL Server data type exposed to the result consumer.
+    ///
+    /// Encrypted columns use their logical plaintext type when result
+    /// decryption is enabled and their wire type otherwise.
+    pub fn data_type(&self) -> TdsDataType {
+        if self.decrypt_results {
+            self.metadata.effective_data_type()
+        } else {
+            self.metadata.data_type
+        }
+    }
+
+    /// Returns the type information exposed to the result consumer.
+    ///
+    /// Encrypted columns use logical type information when result decryption
+    /// is enabled and wire type information otherwise.
+    pub fn type_info(&self) -> &TypeInfo {
+        if self.decrypt_results {
+            self.metadata.effective_type_info()
+        } else {
+            &self.metadata.type_info
+        }
+    }
+
+    /// Returns whether the exposed result value uses PLP encoding.
+    ///
+    /// The result follows the logical type when result decryption is enabled
+    /// and the wire type when it is disabled.
+    pub fn is_plp(&self) -> bool {
+        if self.decrypt_results {
+            self.metadata.effective_is_plp()
+        } else {
+            self.metadata.is_plp()
+        }
+    }
+
+    /// Returns the precision of the exposed result type, when applicable.
+    pub fn get_precision(&self) -> Option<u8> {
+        if self.decrypt_results {
+            self.metadata.get_precision()
+        } else {
+            self.metadata.wire_get_precision()
+        }
+    }
+
+    /// Returns the scale of the exposed result type, when applicable.
+    pub fn get_scale(&self) -> Option<u8> {
+        if self.decrypt_results {
+            self.metadata.get_scale()
+        } else {
+            self.metadata.wire_get_scale()
+        }
+    }
+
+    /// Returns the SQL collation of the exposed result type, when applicable.
+    pub fn get_collation(&self) -> Option<SqlCollation> {
+        if self.decrypt_results {
+            self.metadata.get_collation()
+        } else {
+            self.metadata.wire_get_collation()
+        }
+    }
+
+    /// Returns the result column name.
+    pub fn column_name(&self) -> &str {
+        &self.metadata.column_name
+    }
+
+    /// Returns whether the result column allows `NULL` values.
+    pub fn is_nullable(&self) -> bool {
+        self.metadata.is_nullable()
+    }
+
+    /// Returns whether the result column is Always Encrypted.
+    pub fn is_encrypted(&self) -> bool {
+        self.metadata.is_encrypted()
     }
 }
 
@@ -1023,5 +1155,62 @@ mod tests {
 
         assert!(metadata.is_plp());
         assert!(metadata.effective_is_plp());
+    }
+
+    #[test]
+    fn result_column_metadata_uses_effective_metadata_when_decrypting() {
+        let metadata = ColumnMetadata::test_encrypted_nvarchar_4000();
+        let result_metadata = ResultColumnMetadata::new(metadata.clone(), true);
+
+        assert_eq!(result_metadata.data_type(), TdsDataType::NVarChar);
+        assert_eq!(result_metadata.type_info().length, 8000);
+        assert!(!result_metadata.is_plp());
+        assert_eq!(result_metadata.get_collation(), metadata.get_collation());
+    }
+
+    #[test]
+    fn result_column_metadata_uses_wire_metadata_when_not_decrypting() {
+        let metadata = ColumnMetadata::test_encrypted_nvarchar_4000();
+        let result_metadata = ResultColumnMetadata::new(metadata.clone(), false);
+
+        assert_eq!(result_metadata.data_type(), TdsDataType::BigVarBinary);
+        assert_eq!(result_metadata.type_info().length, 4);
+        assert!(result_metadata.is_plp());
+        assert_eq!(
+            result_metadata.get_precision(),
+            metadata.wire_get_precision()
+        );
+        assert_eq!(result_metadata.get_scale(), metadata.wire_get_scale());
+        assert_eq!(
+            result_metadata.get_collation(),
+            metadata.wire_get_collation()
+        );
+        assert!(result_metadata.is_encrypted());
+    }
+
+    #[test]
+    fn result_column_metadata_preserves_unencrypted_metadata() {
+        let metadata =
+            create_test_column_metadata(0x01, TypeInfoVariant::FixedLen(FixedLengthTypes::Int4));
+        let result_metadata = ResultColumnMetadata::new(metadata.clone(), true);
+
+        assert_eq!(result_metadata.data_type(), metadata.data_type);
+        assert_eq!(
+            result_metadata.type_info().length,
+            metadata.type_info.length
+        );
+        assert_eq!(result_metadata.is_plp(), metadata.is_plp());
+        assert_eq!(result_metadata.is_nullable(), metadata.is_nullable());
+    }
+
+    #[test]
+    fn result_column_metadata_preserves_common_metadata() {
+        let metadata =
+            create_test_column_metadata(0x01, TypeInfoVariant::FixedLen(FixedLengthTypes::Int4));
+        let result_metadata = ResultColumnMetadata::new(metadata.clone(), true);
+
+        assert_eq!(result_metadata.column_name(), metadata.column_name);
+        assert_eq!(result_metadata.is_nullable(), metadata.is_nullable());
+        assert_eq!(result_metadata.is_encrypted(), metadata.is_encrypted());
     }
 }
