@@ -1297,6 +1297,14 @@ impl StmtState {
         self.pending_output_params = None;
     }
 
+    pub(crate) fn reset_cursor_state(&mut self) {
+        self.clear_state(STMT_STATE_CURSOR_OPEN | STMT_STATE_EXEC_CONTEXT);
+        self.reset_row_stream();
+        self.clear_result_metadata();
+        self.pending_row_counts.clear();
+        self.clear_exhaustion_state();
+    }
+
     /// The statement's currently *effective* ARD: the explicit descriptor
     /// associated via `SQLSetStmtAttrW(SQL_ATTR_APP_ROW_DESC, ...)`, or the
     /// permanent implicit `stmt.ard` when none is associated. This is the

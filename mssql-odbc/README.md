@@ -199,6 +199,30 @@ layered impl: panic boundary (`ffi_entry!` macro) → unsafe shim (raw-pointer
 validation) → safe core (business logic). See the conventions file below for
 details.
 
+## POSIX process creation
+
+On Linux and macOS, a child created by `fork()` can open new connections on an
+inherited environment (`HENV`). On its first ODBC call the child creates fresh
+multi-threaded Tokio runtimes and invalidates inherited connections. The parent
+keeps its original runtimes and connections.
+
+Fork only when **all application ODBC calls have finished**. Forking concurrently
+with driver calls, authentication, or driver loading/unloading is unsupported.
+This does not require stopping the driver's idle Tokio workers. Recovery runs
+in a normal API call, not inside a `pthread_atfork` callback.
+
+Do not use inherited connections or cursors in the child. An inherited connection
+reports `SQL_CD_TRUE` through `SQL_ATTR_CONNECTION_DEAD`; executing a new query on
+it reports `08003`. Discard it and open a new connection. Child-side cleanup does
+not roll back, reset, or shut down the parent's SQL session.
+
+Inherited Tokio runtimes and transports cannot safely be dropped through their
+old synchronization machinery. Their child-side resources, including inherited
+socket descriptors, are retained until that child exits. Use `spawn` or
+`forkserver`, or close connections and free environments before forking, when
+that retention is unsuitable for long-lived workers. This support does not
+extend to `vfork()` or make other libraries in the application fork-safe.
+
 ## Connection busy gate
 
 `SQLFetch`/`SQLFetchScroll`/`SQLGetData` release the connection's busy claim

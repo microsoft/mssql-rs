@@ -4,6 +4,8 @@
 pub(crate) mod dbc;
 pub(crate) mod desc;
 mod env;
+#[cfg(unix)]
+mod fork;
 pub(crate) mod stmt;
 
 pub(crate) use dbc::DbcHandle;
@@ -11,6 +13,8 @@ pub(crate) use desc::DescHandle;
 pub(crate) use env::EnvHandle;
 pub(crate) use env::OdbcVersion;
 pub(crate) use env::process_is_shutting_down;
+#[cfg(unix)]
+pub(crate) use fork::ensure_current_process;
 pub(crate) use stmt::StmtHandle;
 
 use std::collections::HashMap;

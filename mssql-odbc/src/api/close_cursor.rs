@@ -14,7 +14,7 @@ use crate::api::odbc_types::{
     SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle, SqlReturn,
 };
 use crate::error::free_errors;
-use crate::handles::stmt::{STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT};
+use crate::handles::stmt::STMT_STATE_CURSOR_OPEN;
 use crate::handles::{HandleType, StmtHandle, handle_from_raw, process_is_shutting_down};
 
 /// Closes the cursor on `statement_handle` and discards any pending rows.
@@ -233,11 +233,7 @@ pub(super) fn close_cursor_for_connection_op(stmt: &StmtHandle, handle: SqlHandl
 
 /// Resets cursor state on the statement (cursor is no longer open, metadata cleared).
 pub(super) fn reset_cursor_state(stmt_state: &mut crate::handles::stmt::StmtState) {
-    stmt_state.clear_state(STMT_STATE_CURSOR_OPEN | STMT_STATE_EXEC_CONTEXT);
-    stmt_state.reset_row_stream();
-    stmt_state.clear_result_metadata();
-    stmt_state.pending_row_counts.clear();
-    stmt_state.clear_exhaustion_state();
+    stmt_state.reset_cursor_state();
 }
 
 /// Outcome of draining the TDS stream and releasing the connection on cursor close.
