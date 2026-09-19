@@ -64,8 +64,6 @@ steps:
     set -euo pipefail
     bash .pipeline/scripts/clone-mssql-python.sh
   displayName: Clone mssql-python
-  env:
-    AZURE_DEVOPS_EXT_PAT: $(System.AccessToken)
 
 - script: |
     set -euo pipefail
