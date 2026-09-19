@@ -1704,10 +1704,9 @@ unsafe fn displaced_len_ptr(ptr: *mut SqlLen, bind_offset: usize, row_index: usi
 /// chunks are read but not decoded, so an oversized LOB costs the wire read
 /// rather than the value.
 ///
-/// Truncation stops on a character boundary, never mid-sequence: a partial
-/// UTF-8 sequence or a lone surrogate would leave the caller holding text that
-/// does not decode. msodbcsql trims the same way (`TrimPartialCodePt`, and
-/// `GetColDataSurrogateSafe` for the wide target).
+/// Truncation does not split a valid character. Wide-to-wide delivery preserves
+/// malformed units, trimming only a real surrogate pair at the boundary
+/// (`GetColDataSurrogateSafe` in msodbcsql).
 ///
 /// # Safety
 /// Same contract as `deliver_bound`.
@@ -1968,13 +1967,18 @@ unsafe fn deliver_bound_plp(
             }
             for pair in bytes[..even].chunks_exact(2) {
                 let unit = u16::from_le_bytes([pair[0], pair[1]]);
-                let is_high_surrogate = (0xD800..0xDC00).contains(&unit);
-                // A high surrogate is only worth keeping if its low half fits
-                // too; alone it is not a character.
-                let need = if is_high_surrogate { 2 } else { 1 };
-                if out_units.len() + need <= capacity_elements {
+                if out_units.len() < capacity_elements {
                     out_units.push(unit);
                 } else {
+                    // Look at the first unit that does not fit, even across
+                    // chunks: an isolated high surrogate must not be dropped.
+                    if (0xDC00..=0xDFFF).contains(&unit)
+                        && out_units
+                            .last()
+                            .is_some_and(|last| (0xD800..=0xDBFF).contains(last))
+                    {
+                        out_units.pop();
+                    }
                     truncated = true;
                     break;
                 }
@@ -2142,11 +2146,34 @@ unsafe fn deliver_encoded_string(
 
     unsafe { write_if_some(octet_length, bytes.len() as SqlLen) };
     let buf_elements = char_buf_elements(binding.target_type, stride);
-    if unsafe { copy_utf16le_with_nul(slot.cast(), buf_elements, &bytes) } {
+    if unsafe { copy_bound_utf16le_with_nul(slot.cast(), buf_elements, &bytes) } {
         RowOutcome::Info(RowIssue::StringTruncated)
     } else {
         RowOutcome::Success
     }
+}
+
+/// Unlike resumable SQLGetData, bound delivery discards the truncated tail.
+/// Trim a split pair, but leave already-unpaired source units unchanged.
+///
+/// # Safety
+/// Same contract as [`copy_utf16le_with_nul`].
+unsafe fn copy_bound_utf16le_with_nul(
+    destination: *mut SqlWChar,
+    capacity: usize,
+    bytes: &[u8],
+) -> bool {
+    let copied = (bytes.len() / 2).min(capacity.saturating_sub(1));
+    let splits_pair = copied > 0
+        && bytes
+            .get(copied * 2 - 1)
+            .is_some_and(|b| (0xD8..=0xDB).contains(b))
+        && bytes
+            .get(copied * 2 + 1)
+            .is_some_and(|b| (0xDC..=0xDF).contains(b));
+    let capacity = capacity - usize::from(splits_pair);
+    // SAFETY: reducing capacity cannot extend the caller's writable range.
+    unsafe { copy_utf16le_with_nul(destination, capacity, bytes) }
 }
 
 /// Delivers one value into a bound buffer outside the rowset machinery.
@@ -2260,7 +2287,7 @@ unsafe fn deliver_bound(
     {
         unsafe { write_if_some(octet_length, value.bytes.len() as SqlLen) };
         let truncated = unsafe {
-            copy_utf16le_with_nul(
+            copy_bound_utf16le_with_nul(
                 slot.cast(),
                 char_buf_elements(binding.target_type, stride),
                 &value.bytes,
@@ -4356,7 +4383,11 @@ mod tests {
                             )
                         }
                     };
-                    let copied = units.len().min(capacity.saturating_sub(1));
+                    let copied = if units == [0xD83D, 0xDE00] && capacity == 2 {
+                        0
+                    } else {
+                        units.len().min(capacity.saturating_sub(1))
+                    };
                     let expected = if copied < units.len() {
                         RowOutcome::Info(RowIssue::StringTruncated)
                     } else {
