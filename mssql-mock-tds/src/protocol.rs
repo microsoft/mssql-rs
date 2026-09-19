@@ -936,10 +936,20 @@ pub fn build_query_result(response: &crate::query_response::QueryResponse) -> By
         result.put_u32_le(0); // UserType
         result.put_u16_le(0x0000); // Flags: not nullable, no special flags
         result.put_u8(col.data_type.tds_type_code());
-        if col.data_type == crate::query_response::SqlDataType::NVarChar {
+        if matches!(
+            col.data_type,
+            crate::query_response::SqlDataType::NVarChar
+                | crate::query_response::SqlDataType::NVarCharMax
+        ) {
             // Required to support string responses (e.g., @@USERAGENT).
             // TDS ColMetadata mandates a 5-byte collation suffix for variable-length types.
-            result.put_u16_le(8000); // NVARCHAR(4000) max byte capacity
+            result.put_u16_le(
+                if col.data_type == crate::query_response::SqlDataType::NVarCharMax {
+                    0xFFFF
+                } else {
+                    8000
+                },
+            );
             result.put_slice(&[0x09, 0x04, 0xD0, 0x00, 0x34]); // SQL_Latin1_General_CP1_CI_AS
         } else {
             result.put_u8(col.data_type.max_length());
