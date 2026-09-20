@@ -227,7 +227,7 @@ def test_main_creates_issue_for_planned_bumps(workflow_environment):
     issue.assert_called_once()
     assert set(issue.call_args.args[1]) == set(bump.CRATES)
     for crate in bump.CRATES:
-        assert f"`{crate}`: `0.1.7` -> `0.2.0`" in issue.call_args.args[0]
+        assert f"- `{crate}`: `0.1.7` -> `0.2.0`" in issue.call_args.args[0]
 
 
 def test_main_skips_issue_when_bump_pr_exists(workflow_environment):

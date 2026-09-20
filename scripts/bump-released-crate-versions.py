@@ -50,6 +50,10 @@ def next_minor(version):
     return f"{int(major)}.{int(minor) + 1}.0"
 
 
+def summary_line(crate, old, new):
+    return f"- `{crate}`: `{old}` -> `{new}`"
+
+
 def planned_bumps(root, published):
     current = cargo_versions(root)
     selected = [crate for crate in CRATES if current[crate] in published[crate]]
@@ -77,7 +81,7 @@ def has_open_bump_pr(root, changes):
     )
     return any(
         all(
-            f"- `{crate}`: `{old}` -> `{new}`" in text
+            summary_line(crate, old, new) in text
             for crate, (old, new) in changes.items()
         )
         for pr in json.loads(result.stdout)
@@ -187,7 +191,7 @@ def main():
         print("Open version bump PR already exists; skipping issue creation.")
         return
     summary = "\n".join(
-        f"- `{crate}`: `{current}` -> `{bumped}`"
+        summary_line(crate, current, bumped)
         for crate, (current, bumped) in changes.items()
     )
     ensure_bump_issue(summary, changes)
