@@ -76,7 +76,9 @@ def planned_bumps(root, published):
                 "choose versions manually."
             )
         elif mock_version in published["mssql-mock-tds"]:
-            changes["mssql-mock-tds"] = (mock_version, core_target)
+            raise ValueError(
+                f"mssql-mock-tds {mock_version} is already published; choose the next version manually."
+            )
         else:
             changes.pop("mssql-mock-tds", None)
     for crate, (_old, new) in changes.items():
