@@ -76,6 +76,8 @@ steps:
     condition: and(succeeded(), or(eq('${{parameters.buildType}}', 'Debug'), eq('${{parameters.buildType}}', 'Both')), eq(variables['Build.Reason'], 'PullRequest'))
 
 - ${{ if ne(parameters.osType, 'Windows') }}:
+  # Hosted macOS has the pinned clippy component, but rustfmt may be absent.
+  # Install only the missing formatter before bfmt.sh calls cargo fmt.
   - script: rustup component add rustfmt
     displayName: Install Rustfmt
     condition: and(succeeded(), or(eq('${{parameters.buildType}}', 'Debug'), eq('${{parameters.buildType}}', 'Both')), eq(variables['Build.Reason'], 'PullRequest'))
