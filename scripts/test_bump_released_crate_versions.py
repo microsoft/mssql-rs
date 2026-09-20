@@ -51,6 +51,15 @@ def test_mock_target_follows_core_target(tmp_path):
         }
 
 
+def test_mock_already_at_core_target_is_not_bumped_past_core(tmp_path):
+    current = {"mssql-tds": "0.2.0", "mssql-mock-tds": "0.3.0"}
+    published = {"mssql-tds": {"0.2.0"}, "mssql-mock-tds": {"0.3.0"}}
+    with patch.object(bump, "cargo_versions", return_value=current):
+        assert bump.planned_bumps(tmp_path, published) == {
+            "mssql-tds": ("0.2.0", "0.3.0"),
+        }
+
+
 def test_already_published_target_fails(tmp_path):
     with patch.object(bump, "cargo_versions", return_value=dict.fromkeys(bump.CRATES, "0.1.7")):
         with pytest.raises(ValueError, match="already published"):

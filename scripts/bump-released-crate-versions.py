@@ -65,6 +65,8 @@ def planned_bumps(root, published):
         core_target = changes["mssql-tds"][1]
         if current["mssql-mock-tds"] != core_target:
             changes["mssql-mock-tds"] = (current["mssql-mock-tds"], core_target)
+        else:
+            changes.pop("mssql-mock-tds", None)
     for crate, (_old, new) in changes.items():
         if new in published[crate]:
             raise ValueError(f"{crate} {new} is already published; choose the next version manually.")
