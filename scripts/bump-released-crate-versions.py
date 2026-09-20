@@ -45,6 +45,10 @@ def cargo_versions(root):
     }
 
 
+def version_tuple(version):
+    return tuple(int(part) for part in version.split(".", 2))
+
+
 def next_minor(version):
     major, minor, _patch = version.split(".", 2)
     return f"{int(major)}.{int(minor) + 1}.0"
@@ -63,8 +67,16 @@ def planned_bumps(root, published):
     changes = {crate: (current[crate], next_minor(current[crate])) for crate in selected}
     if "mssql-tds" in changes:
         core_target = changes["mssql-tds"][1]
-        if current["mssql-mock-tds"] != core_target:
-            changes["mssql-mock-tds"] = (current["mssql-mock-tds"], core_target)
+        mock_version = current["mssql-mock-tds"]
+        if version_tuple(mock_version) < version_tuple(core_target):
+            changes["mssql-mock-tds"] = (mock_version, core_target)
+        elif version_tuple(mock_version) > version_tuple(core_target):
+            raise ValueError(
+                f"mssql-mock-tds {mock_version} is ahead of mssql-tds target {core_target}; "
+                "choose versions manually."
+            )
+        elif mock_version in published["mssql-mock-tds"]:
+            changes["mssql-mock-tds"] = (mock_version, core_target)
         else:
             changes.pop("mssql-mock-tds", None)
     for crate, (_old, new) in changes.items():

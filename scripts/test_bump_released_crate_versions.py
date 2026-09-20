@@ -51,13 +51,29 @@ def test_mock_target_follows_core_target(tmp_path):
         }
 
 
-def test_mock_already_at_core_target_is_not_bumped_past_core(tmp_path):
+def test_unpublished_mock_at_core_target_is_not_bumped_past_core(tmp_path):
     current = {"mssql-tds": "0.2.0", "mssql-mock-tds": "0.3.0"}
-    published = {"mssql-tds": {"0.2.0"}, "mssql-mock-tds": {"0.3.0"}}
+    published = {"mssql-tds": {"0.2.0"}, "mssql-mock-tds": set()}
     with patch.object(bump, "cargo_versions", return_value=current):
         assert bump.planned_bumps(tmp_path, published) == {
             "mssql-tds": ("0.2.0", "0.3.0"),
         }
+
+
+def test_published_mock_at_core_target_fails(tmp_path):
+    current = {"mssql-tds": "0.2.0", "mssql-mock-tds": "0.3.0"}
+    published = {"mssql-tds": {"0.2.0"}, "mssql-mock-tds": {"0.3.0"}}
+    with patch.object(bump, "cargo_versions", return_value=current):
+        with pytest.raises(ValueError, match="already published"):
+            bump.planned_bumps(tmp_path, published)
+
+
+def test_mock_ahead_of_core_target_fails(tmp_path):
+    current = {"mssql-tds": "0.2.0", "mssql-mock-tds": "0.4.0"}
+    published = {"mssql-tds": {"0.2.0"}, "mssql-mock-tds": set()}
+    with patch.object(bump, "cargo_versions", return_value=current):
+        with pytest.raises(ValueError, match="ahead of mssql-tds target"):
+            bump.planned_bumps(tmp_path, published)
 
 
 def test_already_published_target_fails(tmp_path):
@@ -334,7 +350,7 @@ def test_issue_created_once_then_reused_and_updated(monkeypatch):
     assert len(stored) == 1
     assert stored[0]["body"].startswith(bump.ISSUE_MARKER)
     assert "Both bumps" in stored[0]["body"]
-    assert "First bump" not in stored[0]["body"]
+    assert "- `mssql-tds`: `0.1.7` -> `0.2.0`" not in stored[0]["body"]
     assert "mssql-tds/Cargo.toml" in stored[0]["body"]
     assert 'version = "0.2.0"' in stored[0]["body"]
     assert 'mssql-tds = { path = "../mssql-tds", version = "0.2.0", default-features = false }' in stored[0]["body"]
