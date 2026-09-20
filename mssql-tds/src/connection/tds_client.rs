@@ -5145,7 +5145,10 @@ impl TdsClient {
                 Tokens::Error(error_token) => {
                     info!(?error_token);
                     if self.defer_batch_errors {
-                        self.pending_errors.push(SqlErrorInfo::from(&error_token));
+                        // Through the helper: deferring must not skip retiring
+                        // the connection on a fatal error.
+                        let error = self.record_error_token(&error_token);
+                        self.pending_errors.push(error);
                         self.unreported_error = true;
                         continue;
                     }
@@ -7536,7 +7539,11 @@ impl TdsClient {
             Tokens::Error(error_token) => {
                 info!(?error_token);
                 if self.defer_batch_errors {
-                    self.pending_errors.push(SqlErrorInfo::from(&error_token));
+                    // Through the helper: it also retires the connection on a
+                    // fatal error and attaches the error to the prepared row,
+                    // which observe_prepared_batch_done expects to find.
+                    let error = self.record_error_token(&error_token);
+                    self.pending_errors.push(error);
                     self.unreported_error = true;
                     return Ok(None);
                 }
@@ -7642,8 +7649,16 @@ impl TdsClient {
     /// server-side batch — `sqlcmd` and friends — need this to interleave rows
     /// and messages the way the server sent them.
     ///
-    /// Errors that end the batch outright still surface as `Err`; only those the
-    /// server continued past are deferred.
+    /// While deferral is on, **every** server error is collected rather than
+    /// returned, including the one that ends the batch: iteration reports the
+    /// end of the results, not an `Err`. Splitting the two would make the same
+    /// logical condition arrive down two different paths depending on where in
+    /// the batch it happened, which is the ambiguity this mode exists to
+    /// remove. A caller that enables deferral must therefore call
+    /// `take_pending_errors` — an empty result is the only "no error" signal.
+    ///
+    /// A fatal error still retires the connection, so a deferred one cannot be
+    /// handed back to a pool for reuse.
     pub fn set_defer_batch_errors(&mut self, defer: bool) {
         self.defer_batch_errors = defer;
     }
@@ -9224,6 +9239,39 @@ mod tests {
         client.set_defer_batch_errors(true);
         assert!(client.defer_batch_errors);
         assert!(client.take_pending_errors().is_empty());
+    }
+
+    /// Collecting an error must not cost the connection its retirement. A
+    /// severity >= 20 error kills the session server-side, so a deferred one
+    /// still has to leave the client known-dead — otherwise a pool would hand
+    /// the corpse to the next caller.
+    #[tokio::test]
+    async fn a_deferred_fatal_error_still_retires_the_connection() {
+        use crate::token::tokens::ErrorToken;
+
+        let mut client = create_test_client_with_tokens(vec![
+            Tokens::Error(ErrorToken {
+                number: 50000,
+                state: 1,
+                severity: FATAL_ERROR_SEVERITY,
+                message: "connection is doomed".to_string(),
+                server_name: String::new(),
+                proc_name: String::new(),
+                line_number: 1,
+            }),
+            done_no_more(),
+        ]);
+        client.set_defer_batch_errors(true);
+
+        let _ = client.advance_to_result_boundary().await;
+
+        assert!(
+            client.is_connection_dead(),
+            "a fatal error must retire the connection even when deferred"
+        );
+        let collected = client.take_pending_errors();
+        assert_eq!(collected.len(), 1, "the error is still reported, not lost");
+        assert_eq!(collected[0].number, 50000);
     }
 
     /// A DONE token carrying the `DONE_COUNT` flag (a DML row count). `more`

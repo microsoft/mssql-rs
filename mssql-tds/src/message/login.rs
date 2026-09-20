@@ -810,7 +810,15 @@ impl<'a, 'n, 'context> Serializer<'a, 'n, 'context> {
     fn calculate_login_record_length(&self) -> TdsResult<(i32, i32)> {
         let mut login_record_length = FIXED_LOGIN_RECORD_LENGTH as usize;
         login_record_length += self.model.user_input.len_bytes();
-        login_record_length += self.model.transport_context.len_bytes();
+        // Same accessor as write_server_name: this length and the bytes written
+        // later must come from the same value, or an override of a different
+        // length would leave the record Length and feature offset describing the
+        // dialled name instead of what was serialized.
+        login_record_length += self
+            .model
+            .user_input
+            .login_server_name(self.model.transport_context)
+            .len_bytes();
         login_record_length += 4; // Feature extension offset size.
 
         // Add SSPI token length if present
@@ -1631,13 +1639,54 @@ mod tests {
 
     // ── FeaturesRequest::features() ──
 
+    /// The record Length and feature-extension offset must describe the bytes
+    /// actually serialized. A ServerName override of a different length than
+    /// the dialled address is where the two can diverge, and the wire tests do
+    /// not catch it: they read the name back but never validate LOGIN7's own
+    /// embedded Length.
+    #[test]
+    fn the_record_length_follows_the_server_name_actually_written() {
+        fn lengths(override_name: Option<&str>) -> (i32, i32) {
+            let context = ClientContext {
+                connect_retry_count: 0,
+                login_server_name: override_name.map(str::to_string),
+                ..ClientContext::default()
+            };
+            let transport_context = context.transport_context.clone();
+            let model = LoginRequestModel::from_context(&context, false, &transport_context, None);
+            let mut mock = MockNetworkWriter::new(131_072);
+            let mut packet_writer = PacketWriter::new(PacketType::Login7, &mut mock, None, None);
+            Serializer::new(&model, &mut packet_writer)
+                .calculate_login_record_length()
+                .unwrap()
+        }
+
+        let dialled = ClientContext::default()
+            .transport_context
+            .get_login_server_name();
+        let (base_len, base_offset) = lengths(None);
+
+        for name in ["db", "a-much-longer-name.database.windows.net", "n\u{e9}"] {
+            let (len, offset) = lengths(Some(name));
+            let delta = name.to_string().len_bytes() as i32 - dialled.len_bytes() as i32;
+            assert_eq!(
+                len - base_len,
+                delta,
+                "record length should move with the written name for {name:?}"
+            );
+            assert_eq!(
+                offset - base_offset,
+                delta,
+                "feature offset should move with the written name for {name:?}"
+            );
+        }
+    }
+
     #[test]
     fn features_request_features_returns_all() {
         let req = make_features_request();
         assert_eq!(req.features().len(), 2);
-    }
-
-    // ── FeaturesRequest::is_acknowledged ──
+    } // ── FeaturesRequest::is_acknowledged ──
 
     #[test]
     fn features_request_is_acknowledged_returns_none_for_unacknowledged() {
