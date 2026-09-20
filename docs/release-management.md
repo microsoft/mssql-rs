@@ -70,7 +70,7 @@ target because the release pipeline stamps the mock crate from the core version.
 Local versions come from `cargo metadata`. The workflow does not edit files,
 push branches, create PRs, publish crates, merge anything, or change the release
 pipeline's existing version-stamping policy. If a matching open version-bump PR
-already exists, the workflow skips issue creation.
+targets the default branch, the workflow skips issue creation.
 
 When a bump is needed, the workflow creates or updates one tracking issue labeled
 `automation:crate-version-bump`. The issue includes:

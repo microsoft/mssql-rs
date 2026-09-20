@@ -77,7 +77,8 @@ def has_open_bump_pr(root, changes):
     result = subprocess.run(
         [
             "gh", "pr", "list", "--repo", os.environ["GITHUB_REPOSITORY"],
-            "--state", "open", "--json", "number,title,body", "--limit", "100",
+            "--base", os.environ["DEFAULT_BRANCH"], "--state", "open",
+            "--json", "number,title,body", "--limit", "100",
         ],
         cwd=root, check=True, stdout=subprocess.PIPE, text=True,
     )

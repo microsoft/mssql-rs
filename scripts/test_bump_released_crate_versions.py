@@ -124,6 +124,7 @@ def test_registry_timeout_fails():
 def workflow_environment(tmp_path, monkeypatch):
     monkeypatch.setattr(bump, "__file__", str(tmp_path / "scripts" / "bump.py"))
     monkeypatch.setenv("GITHUB_REPOSITORY", "microsoft/mssql-rs")
+    monkeypatch.setenv("DEFAULT_BRANCH", "main")
 
     def unexpected_command(args, **kwargs):
         if args[:3] == ["gh", "pr", "list"]:
@@ -150,7 +151,8 @@ def test_has_open_bump_pr(workflow_environment):
     gh.assert_called_once_with(
         [
             "gh", "pr", "list", "--repo", "microsoft/mssql-rs",
-            "--state", "open", "--json", "number,title,body", "--limit", "100",
+            "--base", "main", "--state", "open",
+            "--json", "number,title,body", "--limit", "100",
         ],
         cwd=workflow_environment, check=True, stdout=subprocess.PIPE, text=True,
     )
@@ -396,7 +398,10 @@ def test_workflow_scope_and_issue_permissions():
     for step in steps[2:]:
         assert step["if"] == "steps.cadence.outputs.due == 'true'"
     assert steps[2]["run"] == "python3 scripts/bump-released-crate-versions.py"
-    assert steps[2]["env"] == {"GH_TOKEN": "${{ github.token }}"}
+    assert steps[2]["env"] == {
+        "DEFAULT_BRANCH": "${{ github.event.repository.default_branch }}",
+        "GH_TOKEN": "${{ github.token }}",
+    }
     assert len(steps) == 3
     assert all(
         len(step["uses"].split("@")[1]) == 40 for step in steps if "uses" in step
