@@ -41,6 +41,16 @@ def test_mock_bump_waits_for_published_core(tmp_path, capsys):
     assert "waiting for its mssql-tds dependency" in capsys.readouterr().out
 
 
+def test_mock_target_follows_core_target(tmp_path):
+    current = {"mssql-tds": "0.2.0", "mssql-mock-tds": "0.1.0"}
+    published = {"mssql-tds": {"0.2.0"}, "mssql-mock-tds": set()}
+    with patch.object(bump, "cargo_versions", return_value=current):
+        assert bump.planned_bumps(tmp_path, published) == {
+            "mssql-tds": ("0.2.0", "0.3.0"),
+            "mssql-mock-tds": ("0.1.0", "0.3.0"),
+        }
+
+
 def test_already_published_target_fails(tmp_path):
     with patch.object(bump, "cargo_versions", return_value=dict.fromkeys(bump.CRATES, "0.1.7")):
         with pytest.raises(ValueError, match="already published"):
