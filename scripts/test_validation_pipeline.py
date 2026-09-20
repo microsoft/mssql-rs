@@ -235,3 +235,21 @@ def test_macos_pr_runs_native_odbc_e2e_against_existing_sql():
         "failTaskOnFailedTests": True,
         "failTaskOnMissingResultsFile": True,
     }
+
+
+def test_non_windows_format_installs_rustfmt_first():
+    steps = load_template("build-template.yml")["steps"]
+    non_windows = next(
+        group for group in steps
+        if "${{ if ne(parameters.osType, 'Windows') }}" in group
+    )
+    branch = non_windows["${{ if ne(parameters.osType, 'Windows') }}"]
+    install = next(step for step in branch if step.get("displayName") == "Install Rustfmt")
+    fmt = next(
+        step for step in branch
+        if step.get("displayName") == "Check Format (workspace + mssql-py-core)"
+    )
+    assert branch.index(install) < branch.index(fmt)
+    assert install["script"] == "rustup component add rustfmt"
+    assert install["condition"] == fmt["condition"]
+    assert install["retryCountOnTaskFailure"] == 3

@@ -76,6 +76,11 @@ steps:
     condition: and(succeeded(), or(eq('${{parameters.buildType}}', 'Debug'), eq('${{parameters.buildType}}', 'Both')), eq(variables['Build.Reason'], 'PullRequest'))
 
 - ${{ if ne(parameters.osType, 'Windows') }}:
+  - script: rustup component add rustfmt
+    displayName: Install Rustfmt
+    condition: and(succeeded(), or(eq('${{parameters.buildType}}', 'Debug'), eq('${{parameters.buildType}}', 'Both')), eq(variables['Build.Reason'], 'PullRequest'))
+    retryCountOnTaskFailure: 3
+
   - script: ./scripts/bfmt.sh
     displayName: Check Format (workspace + mssql-py-core)
     condition: and(succeeded(), or(eq('${{parameters.buildType}}', 'Debug'), eq('${{parameters.buildType}}', 'Both')), eq(variables['Build.Reason'], 'PullRequest'))
