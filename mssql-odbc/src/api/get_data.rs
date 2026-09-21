@@ -628,11 +628,12 @@ unsafe fn try_write_complete_buffered_string(
             strlen_or_ind_ptr,
             SqlLen::try_from(bytes.len()).unwrap_or(SqlLen::MAX),
         );
-        copy_utf16le_with_nul(
+        let truncated = copy_utf16le_with_nul(
             target_value_ptr.cast(),
             buffer_length as usize / std::mem::size_of::<SqlWChar>(),
             bytes,
         );
+        debug_assert!(!truncated, "complete buffered wide string must fit");
     }
     true
 }
@@ -5122,6 +5123,22 @@ mod tests {
         });
         assert_eq!(wide_out, [b'h' as u16, b'i' as u16, 0]);
         assert_eq!(indicator, 4);
+
+        for buffer_length in 0..std::mem::size_of_val(&wide_out) {
+            wide_out.fill(0xAAAA);
+            indicator = -99;
+            assert!(!unsafe {
+                try_write_complete_buffered_string(
+                    &wide,
+                    SQL_C_WCHAR,
+                    wide_out.as_mut_ptr().cast(),
+                    buffer_length as SqlLen,
+                    &mut indicator,
+                )
+            });
+            assert_eq!(wide_out, [0xAAAA; 3]);
+            assert_eq!(indicator, -99);
+        }
 
         let mut utf8_out = [0_u8; 3];
         assert!(unsafe {
