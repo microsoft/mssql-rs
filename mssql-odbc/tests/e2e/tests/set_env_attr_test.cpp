@@ -10,13 +10,15 @@
 //   6. SetVersionOverwrites     - subsequent SQLSetEnvAttr replaces prior value
 //   6a. Odbc2ApplicationIsRefused - the DM forwards SQL_OV_ODBC2 rather than
 //                                 mapping it, and the driver refuses at
-//                                 connect time (surfaced as IM005)
+//                                 connect time (IM005 or HY024, per DM)
 //   6b. Odbc3ApplicationConnectsAndQueries - the same sequence under 3.80
 //                                 connects and queries
 //   7. SetVersionThenAllocDbc   - happy path exercising the AllocHandle gate
 //   8. SetEnvAttrNullHandle     - DM rejects null henv before reaching driver
 
 #include "odbc_test_fixture.h"
+
+#include <string>
 
 // All tests manage their own HENV - do NOT use the ODBCTest fixture which
 // pre-allocates one and pre-sets the ODBC version.
@@ -123,10 +125,10 @@ TEST_F(SetEnvAttrTest, SetVersionOverwrites) {
 // loaded at SQLDriverConnect, and only then does the DM replay the environment
 // setup onto it: our exported SQLSetEnvAttr sees SQL_OV_ODBC2 and rejects it,
 // so no version is recorded, and our SQLAllocHandle(SQL_HANDLE_DBC) refuses.
-// unixODBC surfaces that to the application as IM005, "Driver's SQLAllocHandle
-// on SQL_HANDLE_DBC failed" - our HY010 wrapped by the DM. Were the DM to
-// convert 2 -> 3, the version would arrive as SQL_OV_ODBC3 and the connect
-// would succeed.
+// The SQLSTATE the application then reads depends on the DM - unixODBC wraps
+// our HY010 as IM005, the Windows DM propagates our HY024 - so only the failure
+// itself is asserted unconditionally. Were the DM to convert 2 -> 3, the
+// version would arrive as SQL_OV_ODBC3 and the connect would succeed.
 //
 // Second, the driver refuses to serve such an application rather than handing
 // it the 3.x contract it never asked for - COLUMN_SIZE where it expects
@@ -159,7 +161,16 @@ TEST_F(SetEnvAttrTest, Odbc2ApplicationIsRefused) {
     // (SQLConnect.c:1532-1538, passing the application's value verbatim rather
     // than mapping it), our SQLSetEnvAttr rejects SQL_OV_ODBC2, and the
     // driver-side allocation at :1599 reaches our SQLAllocHandle(DBC), which
-    // refuses. The DM posts its own IM005 at :1613-1616.
+    // refuses. unixODBC posts its own IM005 at :1613-1616.
+    //
+    // The SQLSTATE the application reads is Driver-Manager-specific, measured
+    // in build 176958: unixODBC reports IM005, "Driver's SQLAllocHandle on
+    // SQL_HANDLE_DBC failed", wrapping our HY010 from the refused allocation;
+    // the Windows Driver Manager propagates our HY024 from the rejected
+    // SQLSetEnvAttr instead. Both mean the same thing - the driver declined
+    // the declaration and the connection did not open - so accept either
+    // rather than pinning one platform's wrapping. What must hold everywhere
+    // is that the connect failed.
     SqlTString connstr = ODBCTestUtils::BuildConnectionString();
     SQLTCHAR outStr[1024] = {};
     SQLSMALLINT outLen = 0;
@@ -173,7 +184,15 @@ TEST_F(SetEnvAttrTest, Odbc2ApplicationIsRefused) {
         << "a 2.x declaration must not yield a usable connection; if this "
            "succeeded, the Driver Manager mapped SQL_OV_ODBC2 to SQL_OV_ODBC3 "
            "before the driver saw it";
-    EXPECT_SQLSTATE(SQL_HANDLE_DBC, hdbc, "IM005");
+
+    const std::string firstState = ODBCTestUtils::GetDiagState(SQL_HANDLE_DBC, hdbc);
+    const bool refused = ODBCTestUtils::HasDiagState(SQL_HANDLE_DBC, hdbc, "IM005") ||
+                         ODBCTestUtils::HasDiagState(SQL_HANDLE_DBC, hdbc, "HY024");
+    EXPECT_TRUE(refused)
+        << "expected the Driver Manager to report the driver's refusal as "
+           "IM005 (unixODBC, wrapping our HY010) or HY024 (Windows DM, "
+           "propagating our SQLSetEnvAttr rejection); first record was "
+        << firstState;
 
     SQLFreeHandle(SQL_HANDLE_DBC, hdbc);
 }

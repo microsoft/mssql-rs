@@ -340,11 +340,16 @@ msodbcsql build is measured.
    `SQL_OV_ODBC2`, nothing is recorded, and the driver-side allocation at
    `:1599` reaches this driver's `SQLAllocHandle(SQL_HANDLE_DBC)`, which
    refuses with `HY010` — the SQLSTATE ODBC defines for allocating a
-   connection before `SQL_ATTR_ODBC_VERSION` is set. The DM posts its own
-   `IM005` (`:1613-1616`), so the application reads "Driver's SQLAllocHandle
-   on SQL_HANDLE_DBC failed": `HY010` is what this driver posts on its own
-   environment handle, `IM005` is what a Driver Manager application sees.
-   Measured on unixODBC in build 176929.
+   connection before `SQL_ATTR_ODBC_VERSION` is set.
+   What the application finally reads is Driver-Manager-specific, measured in
+   build 176958: unixODBC posts its own `IM005` (`:1613-1616`), "Driver's
+   SQLAllocHandle on SQL_HANDLE_DBC failed", wrapping the `HY010`; the Windows
+   Driver Manager instead propagates this driver's `HY024` from the rejected
+   `SQLSetEnvAttr`. Both platforms fail the connect — that part is invariant —
+   so `Odbc2ApplicationIsRefused` asserts the failure plus either SQLSTATE
+   rather than pinning one Driver Manager's wrapping. `HY010` remains what
+   this driver posts on its own environment handle, which no Driver Manager
+   application holds.
    One side effect worth knowing: unixODBC treats the rejection as evidence
    about the *driver* rather than the application — `if (ret) {
    connection->driver_version = SQL_OV_ODBC2; }`, commented "if it don't set

@@ -116,12 +116,13 @@ pub(crate) const ERR_FUNCTION_SEQUENCE: DiagMsg = DiagMsg {
 /// Note the text below reaches only a caller that loads this driver directly.
 /// It is posted on *this driver's* environment handle, which a Driver Manager
 /// application never holds — the application's `henv` is the DM's own. On the
-/// path this exists for, unixODBC discards it and posts its own `IM005`
-/// ("Driver's SQLAllocHandle on SQL_HANDLE_DBC failed",
-/// `DriverManager/SQLConnect.c:1613-1616`), which is what the application
-/// reads. `post_diag` only appends to `diag_records` and does not trace, so
-/// the refusal site in `alloc_handle.rs` logs this `text` verbatim — that log
-/// is the only place the reason survives for a Driver Manager user.
+/// path this exists for, the DM substitutes its own diagnostic: unixODBC posts
+/// `IM005` ("Driver's SQLAllocHandle on SQL_HANDLE_DBC failed",
+/// `DriverManager/SQLConnect.c:1613-1616`), while the Windows DM propagates
+/// the `HY024` from the rejected `SQLSetEnvAttr` instead. `post_diag` only
+/// appends to `diag_records` and does not trace, so the refusal site in
+/// `alloc_handle.rs` logs this `text` verbatim — that log is the only place
+/// the reason survives for a Driver Manager user on either platform.
 pub(crate) const ERR_ODBC_VERSION_NOT_SET: DiagMsg = DiagMsg {
     state: SQLSTATE_HY010,
     text: "SQL_ATTR_ODBC_VERSION must be set to SQL_OV_ODBC3 or SQL_OV_ODBC3_80 \
