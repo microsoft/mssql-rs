@@ -87,7 +87,25 @@ impl TestHandles {
 
     /// Allocate ENV + DBC.
     pub(crate) fn with_env_dbc() -> Self {
-        let mut h = Self::with_env();
+        Self::with_env_dbc_version(SQL_OV_ODBC3_80)
+    }
+
+    /// Allocate ENV + DBC after declaring a specific `SQL_ATTR_ODBC_VERSION`,
+    /// for tests that must cover more than the 3.80 default.
+    pub(crate) fn with_env_dbc_version(version: u32) -> Self {
+        let mut h = Self::with_unset_env();
+        assert_eq!(
+            unsafe {
+                sql_set_env_attr(
+                    h.env,
+                    SQL_ATTR_ODBC_VERSION,
+                    version as usize as *mut c_void,
+                    0,
+                )
+            },
+            SQL_SUCCESS,
+            "SQL_OV version {version} must be accepted"
+        );
         let mut dbc: SqlHandle = SQL_NULL_HANDLE;
         assert_eq!(
             unsafe { sql_alloc_handle(SQL_HANDLE_DBC, h.env, &mut dbc) },

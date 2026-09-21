@@ -326,16 +326,23 @@ msodbcsql build is measured.
    and `handles/env.rs`.
    The refusal is carried through to the connection, which is the part an
    application actually notices. The Driver Manager does **not** map a 2.x
-   declaration onto 3.x on the driver's behalf — measured, not assumed: it
-   stores `SQL_OV_ODBC2`, answers the application, then forwards it here,
-   where it is rejected, so nothing is recorded. The DM then allocates the
-   connection anyway. `SQLAllocHandle(SQL_HANDLE_DBC)` therefore refuses with
-   `HY010` (the SQLSTATE ODBC defines for allocating a connection before
-   `SQL_ATTR_ODBC_VERSION` is set) rather than proceeding, because proceeding
-   would hand the application the 3.x contract it never asked for —
-   `COLUMN_SIZE` where it expects `PRECISION`, `91`/`92`/`93` where it expects
-   `9`/`10`/`11` — which it would read as its own. Failing at connect time is
-   diagnosable; wrong metadata at fetch time is not.
+   declaration onto 3.x on the driver's behalf — measured, not assumed. It
+   stores `SQL_OV_ODBC2` and answers the application, and
+   `SQLAllocHandle(SQL_HANDLE_DBC)` also succeeds, because that handle is the
+   Driver Manager's own and no driver has been loaded yet. The driver is
+   loaded at `SQLDriverConnect`, and only then does the DM replay the
+   environment onto it: this driver's `SQLSetEnvAttr` rejects `SQL_OV_ODBC2`,
+   nothing is recorded, and this driver's `SQLAllocHandle(SQL_HANDLE_DBC)`
+   then refuses with `HY010` — the SQLSTATE ODBC defines for allocating a
+   connection before `SQL_ATTR_ODBC_VERSION` is set. unixODBC surfaces that to
+   the application as `IM005`, "Driver's SQLAllocHandle on SQL_HANDLE_DBC
+   failed"; `HY010` is what this driver posts, `IM005` is what the application
+   reads. Measured on unixODBC in build 176929.
+   Refusing beats proceeding, because proceeding would hand the application
+   the 3.x contract it never asked for — `COLUMN_SIZE` where it expects
+   `PRECISION`, `91`/`92`/`93` where it expects `9`/`10`/`11` — which it would
+   read as its own. Failing at connect time is diagnosable; wrong metadata at
+   fetch time is not.
    msodbcsql serves such an application instead: it accepts the declaration,
    and `SQLAllocConnect` asserts in debug builds only
    (`odbc/sqlcconn.cpp`, line 527) before setting the 2.x/3.5.1 flags on an
@@ -344,7 +351,7 @@ msodbcsql build is measured.
    the intended consequence of not supporting ODBC 2.x, not an oversight.
    `Odbc2ApplicationIsRefused` pins it end to end and doubles as the proof
    that the Driver Manager does not convert 2 to 3 — were it to convert, the
-   version would arrive as `SQL_OV_ODBC3` and the connection would succeed.
+   version would arrive as `SQL_OV_ODBC3` and the connect would succeed.
    `Odbc3ApplicationConnectsAndQueries` runs the identical sequence under
    `SQL_OV_ODBC3_80` to show the refusal is keyed on the declared version
    rather than the fixture, and `SetGetOdbcVersion2` covers only the Driver

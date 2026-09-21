@@ -255,11 +255,10 @@ mod tests {
 
     use super::*;
     use crate::api::free_handle::sql_free_handle;
-    use crate::api::odbc_types::{
-        SQL_ATTR_ODBC_VERSION, SQL_OV_ODBC2, SQL_OV_ODBC3, SQL_OV_ODBC3_80,
-    };
+    use crate::api::odbc_types::{SQL_ATTR_ODBC_VERSION, SQL_OV_ODBC3, SQL_OV_ODBC3_80};
     use crate::api::set_env_attr::sql_set_env_attr;
-    use crate::handles::{HandleType, free_handle};
+    use crate::handles::{HandleType, free_handle, handle_from_raw};
+    use crate::test_support::TestHandles;
 
     /// Helper: alloc env and set ODBC version so DBC allocation is permitted.
     fn alloc_env_v3_80() -> SqlHandle {
@@ -280,81 +279,38 @@ mod tests {
 
     /// A 2.x application's `SQL_OV_ODBC2` is rejected by `SQLSetEnvAttr`, so
     /// nothing is recorded on the environment — and the Driver Manager still
-    /// allocates the connection. Refuse it with `HY010` rather than serving a
-    /// 3.x contract the application never asked for. Anchors
+    /// asks the driver for a connection. Refuse it with `HY010` rather than
+    /// serving a 3.x contract the application never asked for. Anchors
     /// `SetEnvAttrTest.Odbc2ApplicationIsRefused` in the e2e suite.
     #[test]
     fn alloc_dbc_is_refused_when_no_odbc_version_was_recorded() {
-        let mut env: SqlHandle = ptr::null_mut();
+        let h = TestHandles::with_unset_env();
+        let env = unsafe { handle_from_raw::<EnvHandle>(h.env) };
         assert_eq!(
-            unsafe { sql_alloc_handle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &mut env) },
-            SQL_SUCCESS
-        );
-
-        let rejected = unsafe {
-            sql_set_env_attr(
-                env,
-                SQL_ATTR_ODBC_VERSION,
-                SQL_OV_ODBC2 as usize as *mut std::ffi::c_void,
-                0,
-            )
-        };
-        assert_eq!(rejected, SQL_ERROR, "SQL_OV_ODBC2 must still be rejected");
-
-        let env_ref = unsafe { &*(env as *const EnvHandle) };
-        assert_eq!(
-            env_ref.inner.lock().unwrap().odbc_version,
+            env.inner.lock().unwrap().odbc_version,
             OdbcVersion::Unset,
-            "the rejection must leave the version unrecorded"
+            "precondition: no version recorded"
         );
 
         let mut dbc: SqlHandle = ptr::null_mut();
         assert_eq!(
-            unsafe { sql_alloc_handle(SQL_HANDLE_DBC, env, &mut dbc) },
+            unsafe { sql_alloc_handle(SQL_HANDLE_DBC, h.env, &mut dbc) },
             SQL_ERROR
         );
         assert!(dbc.is_null(), "no connection handle may be handed back");
         assert_eq!(
-            env_ref.inner.lock().unwrap().diag_records[0].sql_state,
+            env.inner.lock().unwrap().diag_records[0].sql_state,
             *b"HY010"
         );
-
-        unsafe { free_handle::<EnvHandle>(env) };
     }
 
-    /// The refusal above must not catch an application that declared a
-    /// supported version: 3.0 and 3.80 both still allocate.
+    /// The refusal above must be keyed on the declared version, not on the
+    /// environment being fresh: both supported versions still allocate.
     #[test]
     fn alloc_dbc_succeeds_for_every_supported_odbc_version() {
         for version in [SQL_OV_ODBC3, SQL_OV_ODBC3_80] {
-            let mut env: SqlHandle = ptr::null_mut();
-            assert_eq!(
-                unsafe { sql_alloc_handle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &mut env) },
-                SQL_SUCCESS
-            );
-            assert_eq!(
-                unsafe {
-                    sql_set_env_attr(
-                        env,
-                        SQL_ATTR_ODBC_VERSION,
-                        version as usize as *mut std::ffi::c_void,
-                        0,
-                    )
-                },
-                SQL_SUCCESS,
-                "{version} must be accepted"
-            );
-
-            let mut dbc: SqlHandle = ptr::null_mut();
-            assert_eq!(
-                unsafe { sql_alloc_handle(SQL_HANDLE_DBC, env, &mut dbc) },
-                SQL_SUCCESS,
-                "{version} must still allocate a connection"
-            );
-            assert!(!dbc.is_null());
-
-            unsafe { sql_free_handle(SQL_HANDLE_DBC, dbc) };
-            unsafe { free_handle::<EnvHandle>(env) };
+            let h = TestHandles::with_env_dbc_version(version);
+            assert!(!h.dbc.is_null(), "{version} must allocate a connection");
         }
     }
 

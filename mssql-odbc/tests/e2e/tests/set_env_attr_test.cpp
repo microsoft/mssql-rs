@@ -9,7 +9,8 @@
 //   5. SetUnknownAttribute      - unknown attribute -> error
 //   6. SetVersionOverwrites     - subsequent SQLSetEnvAttr replaces prior value
 //   6a. Odbc2ApplicationIsRefused - the DM forwards SQL_OV_ODBC2 rather than
-//                                 mapping it, and the driver refuses (HY010)
+//                                 mapping it, and the driver refuses at
+//                                 connect time (surfaced as IM005)
 //   6b. Odbc3ApplicationConnectsAndQueries - the same sequence under 3.80
 //                                 connects and queries
 //   7. SetVersionThenAllocDbc   - happy path exercising the AllocHandle gate
@@ -113,11 +114,20 @@ TEST_F(SetEnvAttrTest, SetVersionOverwrites) {
 // Variation 6a - an ODBC 2.x application is refused, through the DM
 //
 // This is the load-bearing test for the ODBC 3.x-only contract, and it proves
-// two things at once. First, the Driver Manager does *not* map a 2.x
-// declaration onto 3.x on the driver's behalf: it stores SQL_OV_ODBC2, answers
-// the application (variation 3), then forwards it to this driver, whose
-// exported SQLSetEnvAttr rejects it. If the DM did convert 2 -> 3, the version
-// would arrive as SQL_OV_ODBC3 and the connection below would succeed.
+// two things at once.
+//
+// First, the Driver Manager does *not* map a 2.x declaration onto 3.x on the
+// driver's behalf. It stores SQL_OV_ODBC2 and answers the application
+// (variation 3), and SQLAllocHandle(SQL_HANDLE_DBC) below also succeeds - that
+// handle is the DM's own, allocated before any driver is loaded. The driver is
+// loaded at SQLDriverConnect, and only then does the DM replay the environment
+// setup onto it: our exported SQLSetEnvAttr sees SQL_OV_ODBC2 and rejects it,
+// so no version is recorded, and our SQLAllocHandle(SQL_HANDLE_DBC) refuses.
+// unixODBC surfaces that to the application as IM005, "Driver's SQLAllocHandle
+// on SQL_HANDLE_DBC failed" - our HY010 wrapped by the DM. Were the DM to
+// convert 2 -> 3, the version would arrive as SQL_OV_ODBC3 and the connect
+// would succeed.
+//
 // Second, the driver refuses to serve such an application rather than handing
 // it the 3.x contract it never asked for - COLUMN_SIZE where it expects
 // PRECISION, 91/92/93 where it expects 9/10/11.
@@ -137,19 +147,29 @@ TEST_F(SetEnvAttrTest, Odbc2ApplicationIsRefused) {
     // The DM stores the declaration and reports success to the application.
     ASSERT_SQL_OK(SetVersion(SQL_OV_ODBC2), SQL_HANDLE_ENV, henv_);
 
-    // It reaches the driver regardless, which never recorded a version, so the
-    // connection handle is refused with HY010 rather than silently allocated.
+    // Still the DM's own handle - no driver has been selected or loaded yet,
+    // so this says nothing about the driver and must succeed.
     SQLHDBC hdbc = SQL_NULL_HDBC;
-    SQLRETURN rc = SQLAllocHandle(SQL_HANDLE_DBC, henv_, &hdbc);
+    ASSERT_SQL_OK(SQLAllocHandle(SQL_HANDLE_DBC, henv_, &hdbc), SQL_HANDLE_ENV, henv_);
+
+    // Connecting loads the driver and replays the environment onto it. This is
+    // where the refusal becomes observable.
+    SqlTString connstr = ODBCTestUtils::BuildConnectionString();
+    SQLTCHAR outStr[1024] = {};
+    SQLSMALLINT outLen = 0;
+    SQLRETURN rc = SQLDriverConnect(hdbc, nullptr,
+                                    const_cast<SQLTCHAR*>(connstr.c_str()),
+                                    static_cast<SQLSMALLINT>(connstr.size()),
+                                    outStr,
+                                    static_cast<SQLSMALLINT>(sizeof(outStr) / sizeof(SQLTCHAR)),
+                                    &outLen, SQL_DRIVER_NOPROMPT);
     EXPECT_EQ(SQL_ERROR, rc)
         << "a 2.x declaration must not yield a usable connection; if this "
            "succeeded, the Driver Manager mapped SQL_OV_ODBC2 to SQL_OV_ODBC3 "
            "before the driver saw it";
-    EXPECT_SQLSTATE(SQL_HANDLE_ENV, henv_, "HY010");
+    EXPECT_SQLSTATE(SQL_HANDLE_DBC, hdbc, "IM005");
 
-    if (hdbc != SQL_NULL_HDBC) {
-        SQLFreeHandle(SQL_HANDLE_DBC, hdbc);
-    }
+    SQLFreeHandle(SQL_HANDLE_DBC, hdbc);
 }
 
 // -------------------------------------------------------------------
