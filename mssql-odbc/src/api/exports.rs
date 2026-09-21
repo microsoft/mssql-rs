@@ -672,8 +672,8 @@ pub unsafe extern "C" fn SQLFetch(statement_handle: SqlHandle) -> SqlReturn {
 
 /// Binds an application buffer to a result-set column.
 ///
-/// A null `target_value_ptr` unbinds the column even when `strlen_or_ind_ptr`
-/// is non-null. Indicator-only bindings are not retained.
+/// A null `target_value_ptr` unbinds the column, regardless of
+/// `strlen_or_ind_ptr`; indicator-only bindings are not retained.
 ///
 /// # Safety
 /// `statement_handle` must be a valid statement handle or null. The buffers

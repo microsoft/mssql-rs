@@ -16,6 +16,13 @@ components:
 `mssql-python-rs` is the native runtime that
 [`mssql-python`](https://github.com/microsoft/mssql-python) depends on.
 
+## SQL string decoding
+
+The `mssql_py_core` cursor uses the shared
+[TDS string decoding rules](../mssql-tds/README.md#sql-string-decoding).
+Leading BOM-shaped bytes in SQL values remain data in the column's encoding;
+they are not removed or used to select another encoding.
+
 ## Platforms
 
 Prebuilt CPython 3.10+ wheels for:

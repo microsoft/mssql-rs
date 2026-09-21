@@ -617,11 +617,13 @@ unsafe fn try_write_complete_buffered_string(
     let direct_wchar = target_type == SQL_C_WCHAR
         && matches!(value.encoding_type(), EncodingType::Utf16)
         && bytes.len().is_multiple_of(2);
+    let Ok(buffer_bytes) = usize::try_from(buffer_length) else {
+        return false;
+    };
     // Check capacity before resolving the LCID: a failed complete-value probe
     // must not duplicate the fallback warning from captured delivery.
     let cp1252 = target_type == SQL_C_WCHAR
-        && usize::try_from(buffer_length)
-            .is_ok_and(|len| len >= bytes.len().saturating_mul(2).saturating_add(2))
+        && buffer_bytes >= bytes.len().saturating_mul(2).saturating_add(2)
         && is_cp1252(value.encoding_type());
     let byte_len = if cp1252 {
         bytes.len().saturating_mul(2)
@@ -629,9 +631,7 @@ unsafe fn try_write_complete_buffered_string(
         bytes.len()
     };
     let required = byte_len.saturating_add(std::mem::size_of::<SqlWChar>());
-    if !(direct_wchar || cp1252)
-        || usize::try_from(buffer_length).map_or(true, |len| len < required)
-    {
+    if !(direct_wchar || cp1252) || buffer_bytes < required {
         return false;
     }
 
@@ -644,12 +644,13 @@ unsafe fn try_write_complete_buffered_string(
             strlen_or_ind_ptr,
             SqlLen::try_from(byte_len).unwrap_or(SqlLen::MAX),
         );
-        let capacity = buffer_length as usize / std::mem::size_of::<SqlWChar>();
-        if cp1252 {
-            copy_cp1252_with_nul(target_value_ptr.cast(), capacity, bytes);
+        let capacity = buffer_bytes / std::mem::size_of::<SqlWChar>();
+        let truncated = if cp1252 {
+            copy_cp1252_with_nul(target_value_ptr.cast(), capacity, bytes)
         } else {
-            copy_utf16le_with_nul(target_value_ptr.cast(), capacity, bytes);
-        }
+            copy_utf16le_with_nul(target_value_ptr.cast(), capacity, bytes)
+        };
+        debug_assert!(!truncated, "complete buffered wide string must fit");
     }
     true
 }
@@ -5471,6 +5472,22 @@ mod tests {
         });
         assert_eq!(wide_out, [b'h' as u16, b'i' as u16, 0]);
         assert_eq!(indicator, 4);
+
+        for buffer_length in -1..SqlLen::try_from(std::mem::size_of_val(&wide_out)).unwrap() {
+            wide_out.fill(0xAAAA);
+            indicator = -99;
+            assert!(!unsafe {
+                try_write_complete_buffered_string(
+                    &wide,
+                    SQL_C_WCHAR,
+                    wide_out.as_mut_ptr().cast(),
+                    buffer_length,
+                    &mut indicator,
+                )
+            });
+            assert_eq!(wide_out, [0xAAAA; 3]);
+            assert_eq!(indicator, -99);
+        }
 
         let mut utf8_out = [0_u8; 3];
         assert!(unsafe {
