@@ -86,6 +86,57 @@ def test_obsolete_mssql_python_linux_build_is_removed():
         assert removed_template not in path.read_text(encoding="utf-8"), path.name
 
 
+@pytest.mark.parametrize(
+    "template",
+    ["test-mssql-python-macos-template.yml", "test-mssql-python-odbc-template.yml"],
+)
+def test_cross_repo_jobs_share_the_pinned_checkout(template):
+    steps = load_template(template)["steps"]
+    clone = next(step for step in steps if step.get("displayName") == "Clone mssql-python")
+    assert "bash .pipeline/scripts/clone-mssql-python.sh" in clone["script"]
+    assert "env" not in clone
+    assert "continueOnError" not in clone
+    text = (_TEMPLATES / template).read_text(encoding="utf-8")
+    assert "git clone" not in text
+    assert "mssql-python-branch" not in text
+
+
+def test_mssql_python_macos_failures_fail_the_job():
+    steps = load_template("test-mssql-python-macos-template.yml")["steps"]
+    run = next(step for step in steps if step.get("displayName") == "Run mssql-python tests")
+    assert "continueOnError" not in run
+    publish = next(step for step in steps if step.get("task") == "PublishTestResults@2")
+    assert publish["condition"] == "succeededOrFailed()"
+    assert publish["inputs"]["failTaskOnFailedTests"] is True
+    assert publish["inputs"]["failTaskOnMissingResultsFile"] is True
+
+
+def test_pin_validation_is_not_path_filtered_or_optional():
+    pipeline = yaml.safe_load(
+        (_ROOT / ".pipeline" / "validation-pipeline.yml").read_text(encoding="utf-8")
+    )
+    # Server-side PR filters also need to include .pipeline/ (see scripts/README.md).
+    assert "pr" not in pipeline
+    stages = load_template("validation-stages.yml")["stages"]
+    stage = next(stage for stage in stages if stage["stage"] == "Build_mssql_python")
+    assert stage["dependsOn"] == ["EvaluateDuplicate"]
+    assert stage["condition"] == (
+        "and(not(canceled()), eq(variables['Build.Reason'], 'PullRequest'), "
+        "eq('${{ parameters.RunFuzz }}', 'false'), "
+        "eq('${{ parameters.RunLongHaul }}', 'false'), "
+        "ne(dependencies.EvaluateDuplicate.outputs['Evaluate.SetDuplicateState.skipDuplicate'], 'true'))"
+    )
+    for job in stage["jobs"]:
+        assert "condition" not in job
+        assert "continueOnError" not in job
+    build = next(stage for stage in stages if stage["stage"] == "Build")
+    linux = next(job for job in build["jobs"] if job.get("job") == "Build_Linux")
+    assert any(
+        "unittest discover -s .pipeline/scripts" in step.get("bash", "")
+        for step in linux["steps"]
+    )
+
+
 def test_alpine_gssapi_compilation_still_runs_on_prs():
     steps = load_template("build-template-alpine.yml")["steps"]
     build = next(
