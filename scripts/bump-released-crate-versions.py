@@ -36,7 +36,7 @@ def published_versions(crate):
                 time.sleep(2 ** attempt)
                 continue
             raise
-        except URLError as error:
+        except URLError:
             if attempt < 2:
                 time.sleep(2 ** attempt)
                 continue
