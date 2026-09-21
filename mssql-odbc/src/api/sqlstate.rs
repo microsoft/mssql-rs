@@ -112,6 +112,15 @@ pub(crate) const ERR_FUNCTION_SEQUENCE: DiagMsg = DiagMsg {
 /// driver rejected (`HY024`) — the Driver Manager forwards that declaration
 /// rather than mapping it, then allocates the connection regardless. ODBC
 /// specifies `HY010` for allocating a connection before the version is set.
+///
+/// Note the text below reaches only a caller that loads this driver directly.
+/// It is posted on *this driver's* environment handle, which a Driver Manager
+/// application never holds — the application's `henv` is the DM's own. On the
+/// path this exists for, unixODBC discards it and posts its own `IM005`
+/// ("Driver's SQLAllocHandle on SQL_HANDLE_DBC failed",
+/// `DriverManager/SQLConnect.c:1613-1616`), which is what the application
+/// reads. Keep the text actionable anyway: a direct loader does see it, and it
+/// is what turns up in driver tracing for everyone else.
 pub(crate) const ERR_ODBC_VERSION_NOT_SET: DiagMsg = DiagMsg {
     state: SQLSTATE_HY010,
     text: "SQL_ATTR_ODBC_VERSION must be set to SQL_OV_ODBC3 or SQL_OV_ODBC3_80 \

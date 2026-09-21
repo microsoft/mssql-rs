@@ -152,8 +152,14 @@ TEST_F(SetEnvAttrTest, Odbc2ApplicationIsRefused) {
     SQLHDBC hdbc = SQL_NULL_HDBC;
     ASSERT_SQL_OK(SQLAllocHandle(SQL_HANDLE_DBC, henv_, &hdbc), SQL_HANDLE_ENV, henv_);
 
-    // Connecting loads the driver and replays the environment onto it. This is
-    // where the refusal becomes observable.
+    // unixODBC services SQLAllocHandle(SQL_HANDLE_DBC) entirely inside the DM
+    // — its only gate is `requested_version == 0` and no driver is consulted —
+    // so the call above proves nothing about this driver. The driver is loaded
+    // at SQLDriverConnect, where the DM replays the environment onto it
+    // (SQLConnect.c:1532-1538, passing the application's value verbatim rather
+    // than mapping it), our SQLSetEnvAttr rejects SQL_OV_ODBC2, and the
+    // driver-side allocation at :1599 reaches our SQLAllocHandle(DBC), which
+    // refuses. The DM posts its own IM005 at :1613-1616.
     SqlTString connstr = ODBCTestUtils::BuildConnectionString();
     SQLTCHAR outStr[1024] = {};
     SQLSMALLINT outLen = 0;

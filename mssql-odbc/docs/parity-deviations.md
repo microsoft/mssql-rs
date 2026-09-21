@@ -326,18 +326,35 @@ msodbcsql build is measured.
    and `handles/env.rs`.
    The refusal is carried through to the connection, which is the part an
    application actually notices. The Driver Manager does **not** map a 2.x
-   declaration onto 3.x on the driver's behalf — measured, not assumed. It
-   stores `SQL_OV_ODBC2` and answers the application, and
-   `SQLAllocHandle(SQL_HANDLE_DBC)` also succeeds, because that handle is the
-   Driver Manager's own and no driver has been loaded yet. The driver is
-   loaded at `SQLDriverConnect`, and only then does the DM replay the
-   environment onto it: this driver's `SQLSetEnvAttr` rejects `SQL_OV_ODBC2`,
-   nothing is recorded, and this driver's `SQLAllocHandle(SQL_HANDLE_DBC)`
-   then refuses with `HY010` — the SQLSTATE ODBC defines for allocating a
-   connection before `SQL_ATTR_ODBC_VERSION` is set. unixODBC surfaces that to
-   the application as `IM005`, "Driver's SQLAllocHandle on SQL_HANDLE_DBC
-   failed"; `HY010` is what this driver posts, `IM005` is what the application
-   reads. Measured on unixODBC in build 176929.
+   declaration onto 3.x on the driver's behalf — cited, not inferred: unixODBC
+   replays the application's value verbatim onto the driver environment,
+   passing `connection->environment->requested_version` straight into the
+   driver's `SQLSetEnvAttr(SQL_ATTR_ODBC_VERSION, ...)`
+   (`DriverManager/SQLConnect.c`, lines 1532-1538).
+   The sequence is therefore: the DM stores `SQL_OV_ODBC2` and answers the
+   application; `SQLAllocHandle(SQL_HANDLE_DBC)` also succeeds, because
+   unixODBC services that call entirely inside the DM — its only gate is
+   `requested_version == 0`, and no driver is consulted — so it says nothing
+   about this driver. The driver is loaded at `SQLDriverConnect`, the DM
+   replays the environment at `:1532`, this driver's `SQLSetEnvAttr` rejects
+   `SQL_OV_ODBC2`, nothing is recorded, and the driver-side allocation at
+   `:1599` reaches this driver's `SQLAllocHandle(SQL_HANDLE_DBC)`, which
+   refuses with `HY010` — the SQLSTATE ODBC defines for allocating a
+   connection before `SQL_ATTR_ODBC_VERSION` is set. The DM posts its own
+   `IM005` (`:1613-1616`), so the application reads "Driver's SQLAllocHandle
+   on SQL_HANDLE_DBC failed": `HY010` is what this driver posts on its own
+   environment handle, `IM005` is what a Driver Manager application sees.
+   Measured on unixODBC in build 176929.
+   One side effect worth knowing: unixODBC treats the rejection as evidence
+   about the *driver* rather than the application — `if (ret) {
+   connection->driver_version = SQL_OV_ODBC2; }`, commented "if it don't set
+   then assume a 2.x driver" — so for that connection the DM classifies this
+   driver as 2.x. It does not change the outcome here, since the connection is
+   refused moments later, but it is the DM's reading of an `HY024` from this
+   attribute.
+   A 3.x application is unaffected by the gate: the env-attr replay at `:1532`
+   runs before the driver-side allocation at `:1599`, so a supported version is
+   always recorded first.
    Refusing beats proceeding, because proceeding would hand the application
    the 3.x contract it never asked for — `COLUMN_SIZE` where it expects
    `PRECISION`, `91`/`92`/`93` where it expects `9`/`10`/`11` — which it would
