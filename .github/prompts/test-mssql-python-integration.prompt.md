@@ -21,8 +21,12 @@ ls -d ../mssql-python 2>/dev/null && echo "✅ mssql-python found" || echo "❌ 
 
 If missing:
 ```bash
-cd .. && git clone https://github.com/microsoft/mssql-python.git
+bash .pipeline/scripts/clone-mssql-python.sh
 ```
+
+Run from the mssql-rs repository root. This reproduces CI's approved commit
+from `.pipeline/mssql-python-revision.txt`, not floating upstream main.
+An existing sibling checkout is an explicit local developer choice.
 
 ### 2. SQL Server Running
 A local SQL Server must be running on port 1433:
@@ -211,7 +215,9 @@ tests and the mssql-odbc driver-swap compatibility job remain enabled.
 ### 3. Merge order
 
 1. **First:** Merge mssql-python PR (so `main` has the changes)
-2. **Then:** Merge mssql-tds PR
+2. **Then:** Update `.pipeline/mssql-python-revision.txt` in the mssql-rs PR to
+   the required full upstream commit SHA and pass both cross-repo jobs before
+   merging. PR-description branch overrides are not supported.
 
 ---
 
