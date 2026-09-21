@@ -163,3 +163,34 @@ stages:
           Write-Host "---- agent work folder ----"
           Write-Host $env:AGENT_WORKFOLDER
         displayName: 'Inventory: RUST-WINSRV-ARM on Standard_D8pds_v6'
+
+    # These two differ ONLY in the image's enableNVMe flag, and this pool's
+    # Standard_D8pds_v6 reports DiskControllerTypes SCSI with no NVMe. Both
+    # images built, so the question left is whether an NVMe-enabled image can be
+    # scheduled onto a SCSI-only SKU. If the NVME job gets an agent, the flag is
+    # additive and there is no reason to leave it off anywhere. If it never
+    # schedules while its twin does, the flag restricts the image to
+    # NVMe-controller SKUs.
+    - job: Arm64V6_Azl3
+      displayName: 'v6 ARM SKU: AZL3 ARM64 (enableNVMe off)'
+      pool:
+        name: RUST-PUBLIC-ARM64-V6-TEST
+        demands:
+        - imageOverride -equals RUST-AZL3-ARM64
+      steps:
+      - checkout: none
+      - template: templates/azl3-inventory-steps.yml
+        parameters:
+          label: 'RUST-AZL3-ARM64 (enableNVMe off) on Standard_D8pds_v6'
+
+    - job: Arm64V6_Azl3Nvme
+      displayName: 'v6 ARM SKU: AZL3 ARM64 (enableNVMe TRUE)'
+      pool:
+        name: RUST-PUBLIC-ARM64-V6-TEST
+        demands:
+        - imageOverride -equals RUST-AZL3-ARM64-NVME
+      steps:
+      - checkout: none
+      - template: templates/azl3-inventory-steps.yml
+        parameters:
+          label: 'RUST-AZL3-ARM64-NVME (enableNVMe TRUE) on Standard_D8pds_v6'
