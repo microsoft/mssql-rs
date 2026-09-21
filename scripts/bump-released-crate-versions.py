@@ -67,6 +67,11 @@ def summary_line(crate, old, new):
 
 def planned_bumps(root, published):
     current = cargo_versions(root)
+    if current["mssql-tds"] != current["mssql-mock-tds"]:
+        raise ValueError(
+            f"mssql-tds {current['mssql-tds']} and mssql-mock-tds {current['mssql-mock-tds']} "
+            "must match for a release; choose versions manually."
+        )
     selected = [crate for crate in CRATES if current[crate] in published[crate]]
     if "mssql-mock-tds" in selected and "mssql-tds" not in selected:
         selected.remove("mssql-mock-tds")
