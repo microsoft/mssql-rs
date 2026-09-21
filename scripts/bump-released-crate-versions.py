@@ -6,8 +6,9 @@
 import json
 import os
 import subprocess
+import time
 from pathlib import Path
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 CRATES = ("mssql-tds", "mssql-mock-tds")
@@ -16,20 +17,33 @@ ISSUE_MARKER = "<!-- mssql-rs:released-crate-version-bump -->"
 
 
 def published_versions(crate):
-    request = Request(
-        f"https://crates.io/api/v1/crates/{crate}",
-        headers={
-            "User-Agent": "microsoft/mssql-rs version check (https://github.com/microsoft/mssql-rs)",
-        },
-    )
-    try:
-        with urlopen(request, timeout=30) as response:
-            data = json.load(response)
-    except HTTPError as error:
-        if error.code != 404:
+    last_error = None
+    for attempt in range(3):
+        request = Request(
+            f"https://crates.io/api/v1/crates/{crate}",
+            headers={
+                "User-Agent": "microsoft/mssql-rs version check (https://github.com/microsoft/mssql-rs)",
+            },
+        )
+        try:
+            with urlopen(request, timeout=30) as response:
+                data = json.load(response)
+            break
+        except HTTPError as error:
+            last_error = error
+            if error.code == 404:
+                print(f"{crate}: not published on crates.io; leaving its version unchanged.")
+                return set()
+            if error.code in {429, 500, 502, 503, 504} and attempt < 2:
+                time.sleep(2 ** attempt)
+                continue
             raise
-        print(f"{crate}: not published on crates.io; leaving its version unchanged.")
-        return set()
+        except URLError as error:
+            last_error = error
+            if attempt < 2:
+                time.sleep(2 ** attempt)
+                continue
+            raise
     versions = {entry["num"] for entry in data["versions"]}
     if not versions or not all(isinstance(version, str) for version in versions):
         raise ValueError(f"{crate}: invalid crates.io versions response")
@@ -41,10 +55,14 @@ def cargo_versions(root):
         ["cargo", "metadata", "--no-deps", "--format-version", "1", "--locked"],
         cwd=root, check=True, stdout=subprocess.PIPE, text=True,
     )
-    return {
+    current = {
         package["name"]: package["version"]
         for package in json.loads(result.stdout)["packages"]
     }
+    missing = [crate for crate in CRATES if crate not in current]
+    if missing:
+        raise ValueError(f"{', '.join(missing)} not found in cargo metadata; update CRATES.")
+    return current
 
 
 def version_tuple(version):
@@ -67,6 +85,11 @@ def summary_line(crate, old, new):
 
 def planned_bumps(root, published):
     current = cargo_versions(root)
+    if current["mssql-tds"] != current["mssql-mock-tds"]:
+        raise ValueError(
+            f"mssql-tds {current['mssql-tds']} and mssql-mock-tds {current['mssql-mock-tds']} "
+            "must match for a release; choose versions manually."
+        )
     selected = [crate for crate in CRATES if current[crate] in published[crate]]
     if "mssql-mock-tds" in selected and "mssql-tds" not in selected:
         selected.remove("mssql-mock-tds")

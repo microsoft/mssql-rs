@@ -42,26 +42,35 @@ def test_mock_bump_waits_for_published_core(tmp_path, capsys):
 
 
 def test_mock_target_follows_core_target(tmp_path):
-    current = {"mssql-tds": "0.2.0", "mssql-mock-tds": "0.1.0"}
+    current = {"mssql-tds": "0.2.0", "mssql-mock-tds": "0.2.0"}
     published = {"mssql-tds": {"0.2.0"}, "mssql-mock-tds": set()}
     with patch.object(bump, "cargo_versions", return_value=current):
         assert bump.planned_bumps(tmp_path, published) == {
             "mssql-tds": ("0.2.0", "0.3.0"),
-            "mssql-mock-tds": ("0.1.0", "0.3.0"),
+            "mssql-mock-tds": ("0.2.0", "0.3.0"),
         }
 
 
+def test_drifted_core_and_mock_versions_fail(tmp_path):
+    current = {"mssql-tds": "0.2.0", "mssql-mock-tds": "0.1.0"}
+    published = {"mssql-tds": {"0.2.0"}, "mssql-mock-tds": set()}
+    with patch.object(bump, "cargo_versions", return_value=current):
+        with pytest.raises(ValueError, match="must match for a release"):
+            bump.planned_bumps(tmp_path, published)
+
+
 def test_unpublished_mock_at_core_target_is_not_bumped_past_core(tmp_path):
-    current = {"mssql-tds": "0.2.0", "mssql-mock-tds": "0.3.0"}
+    current = {"mssql-tds": "0.2.0", "mssql-mock-tds": "0.2.0"}
     published = {"mssql-tds": {"0.2.0"}, "mssql-mock-tds": set()}
     with patch.object(bump, "cargo_versions", return_value=current):
         assert bump.planned_bumps(tmp_path, published) == {
             "mssql-tds": ("0.2.0", "0.3.0"),
+            "mssql-mock-tds": ("0.2.0", "0.3.0"),
         }
 
 
 def test_published_mock_at_core_target_fails(tmp_path):
-    current = {"mssql-tds": "0.2.0", "mssql-mock-tds": "0.3.0"}
+    current = {"mssql-tds": "0.2.0", "mssql-mock-tds": "0.2.0"}
     published = {"mssql-tds": {"0.2.0"}, "mssql-mock-tds": {"0.3.0"}}
     with patch.object(bump, "cargo_versions", return_value=current):
         with pytest.raises(ValueError, match="already published"):
@@ -69,7 +78,7 @@ def test_published_mock_at_core_target_fails(tmp_path):
 
 
 def test_aligned_mock_target_already_published_fails(tmp_path):
-    current = {"mssql-tds": "0.2.0", "mssql-mock-tds": "0.1.0"}
+    current = {"mssql-tds": "0.2.0", "mssql-mock-tds": "0.2.0"}
     published = {
         "mssql-tds": {"0.2.0"},
         "mssql-mock-tds": {"0.3.0"},
@@ -83,7 +92,7 @@ def test_mock_ahead_of_core_target_fails(tmp_path):
     current = {"mssql-tds": "0.2.0", "mssql-mock-tds": "0.4.0"}
     published = {"mssql-tds": {"0.2.0"}, "mssql-mock-tds": set()}
     with patch.object(bump, "cargo_versions", return_value=current):
-        with pytest.raises(ValueError, match="ahead of mssql-tds target"):
+        with pytest.raises(ValueError, match="must match for a release"):
             bump.planned_bumps(tmp_path, published)
 
 
@@ -149,10 +158,29 @@ def test_bad_registry_data_fails(payload):
             bump.published_versions("mssql-tds")
 
 
+def test_registry_retries_transient_failures():
+    payload = json.dumps({"versions": [{"num": "0.2.0"}]}).encode()
+    error = HTTPError("https://crates.io", 503, "temporary outage", {}, None)
+    with patch.object(bump, "urlopen", side_effect=[error, io.BytesIO(payload)]) as request:
+        with patch.object(bump.time, "sleep") as sleep:
+            assert bump.published_versions("mssql-tds") == {"0.2.0"}
+    assert request.call_count == 2
+    sleep.assert_called_once_with(1)
+
+
 def test_registry_timeout_fails():
     with patch.object(bump, "urlopen", side_effect=URLError("timed out")):
         with pytest.raises(URLError):
             bump.published_versions("mssql-tds")
+
+
+def test_missing_crate_in_cargo_metadata_fails(tmp_path):
+    packages = [{"name": "mssql-tds", "version": "0.1.7"}]
+    with patch.object(bump.subprocess, "run", return_value=subprocess.CompletedProcess(
+        "cargo", 0, stdout=json.dumps({"packages": packages})
+    )):
+        with pytest.raises(ValueError, match="mssql-mock-tds not found"):
+            bump.cargo_versions(tmp_path)
 
 
 @pytest.fixture
