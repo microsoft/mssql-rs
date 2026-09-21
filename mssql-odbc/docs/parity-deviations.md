@@ -326,8 +326,12 @@ msodbcsql build is measured.
    and `handles/env.rs`.
    Applications are largely insulated because the Driver Manager maps a 2.x
    application onto the 3.x interface before the driver is loaded, so a real
-   2.x application does not reach this rejection; `SetGetOdbcVersion2` in the
-   Driver Manager e2e tests documents that interception. A 3.x-linked
+   2.x application does not reach this rejection.
+   `Odbc2ApplicationConnectsAndQueries` is the evidence for that: it declares
+   `SQL_OV_ODBC2`, connects through the Driver Manager, and executes and
+   fetches a query. `SetGetOdbcVersion2` alone does not establish it — that
+   case stops before a driver is loaded, so it only shows the Driver Manager
+   storing the value. A 3.x-linked
    application that declares `SQL_OV_ODBC2` directly against this driver does
    see the change — it previously got `SQL_SUCCESS`. Tracked in AB#48256.
    Signed off by Theekshna Kotian on 2026-09-18.
