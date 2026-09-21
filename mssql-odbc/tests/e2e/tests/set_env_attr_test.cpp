@@ -8,6 +8,8 @@
 //   4. SetOdbcVersionInvalid    - bogus version value -> SQL_ERROR
 //   5. SetUnknownAttribute      - unknown attribute -> error
 //   6. SetVersionOverwrites     - subsequent SQLSetEnvAttr replaces prior value
+//   6a. Odbc2ApplicationConnectsAndQueries - a 2.x declaration still connects
+//                                 through the DM and runs a query
 //   7. SetVersionThenAllocDbc   - happy path exercising the AllocHandle gate
 //   8. SetEnvAttrNullHandle     - DM rejects null henv before reaching driver
 
@@ -103,6 +105,57 @@ TEST_F(SetEnvAttrTest, SetVersionOverwrites) {
     EXPECT_SQL_OK(SetVersion(SQL_OV_ODBC2), SQL_HANDLE_ENV, henv_);
     EXPECT_SQL_OK(SetVersion(SQL_OV_ODBC3_80), SQL_HANDLE_ENV, henv_);
     EXPECT_EQ(static_cast<SQLINTEGER>(SQL_OV_ODBC3_80), GetVersion());
+}
+
+// -------------------------------------------------------------------
+// Variation 6a - an ODBC 2.x application still connects and queries
+//
+// This is the claim that makes rejecting SQL_OV_ODBC2 in the driver's own
+// exported SQLSetEnvAttr safe: the Driver Manager maps a 2.x application onto
+// the 3.x interface before the driver is loaded, so the rejection is never
+// reached through a normal application path. Variation 3 only proves the DM
+// stores the value; this one proves the mapped connection actually works.
+// Registry entry 14 in docs/parity-deviations.md depends on it.
+// -------------------------------------------------------------------
+TEST_F(SetEnvAttrTest, Odbc2ApplicationConnectsAndQueries) {
+    if (!ODBCTestConfig::Instance().HasConnection()) {
+        GTEST_SKIP() << "No connection configured - set ODBC_TEST_DSN, "
+                        "ODBC_TEST_SERVER, or ODBC_TEST_CONNSTR";
+    }
+
+    ASSERT_SQL_OK(SetVersion(SQL_OV_ODBC2), SQL_HANDLE_ENV, henv_);
+
+    SQLHDBC hdbc = SQL_NULL_HDBC;
+    ASSERT_SQL_OK(SQLAllocHandle(SQL_HANDLE_DBC, henv_, &hdbc), SQL_HANDLE_ENV, henv_);
+
+    SqlTString connstr = ODBCTestUtils::BuildConnectionString();
+    SQLTCHAR outStr[1024] = {};
+    SQLSMALLINT outLen = 0;
+    SQLRETURN rc = SQLDriverConnect(hdbc, nullptr,
+                                    const_cast<SQLTCHAR*>(connstr.c_str()),
+                                    static_cast<SQLSMALLINT>(connstr.size()),
+                                    outStr,
+                                    static_cast<SQLSMALLINT>(sizeof(outStr) / sizeof(SQLTCHAR)),
+                                    &outLen, SQL_DRIVER_NOPROMPT);
+    ASSERT_SQL_OK(rc, SQL_HANDLE_DBC, hdbc);
+
+    SQLHSTMT hstmt = SQL_NULL_HSTMT;
+    ASSERT_SQL_OK(SQLAllocHandle(SQL_HANDLE_STMT, hdbc, &hstmt), SQL_HANDLE_DBC, hdbc);
+
+    SqlTString sql = ODBCTestUtils::ToSqlTStr("SELECT 1");
+    ASSERT_SQL_OK(SQLExecDirect(hstmt, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS),
+                  SQL_HANDLE_STMT, hstmt);
+    ASSERT_SQL_OK(SQLFetch(hstmt), SQL_HANDLE_STMT, hstmt);
+
+    SQLINTEGER value = 0;
+    SQLLEN indicator = 0;
+    ASSERT_SQL_OK(SQLGetData(hstmt, 1, SQL_C_SLONG, &value, sizeof(value), &indicator),
+                  SQL_HANDLE_STMT, hstmt);
+    EXPECT_EQ(1, value);
+
+    SQLFreeHandle(SQL_HANDLE_STMT, hstmt);
+    SQLDisconnect(hdbc);
+    SQLFreeHandle(SQL_HANDLE_DBC, hdbc);
 }
 
 // -------------------------------------------------------------------
