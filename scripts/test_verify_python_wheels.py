@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import subprocess
 import zipfile
 from pathlib import Path
@@ -40,6 +41,7 @@ def write_wheel(
     requires_python: str = ">=3.10",
     metadata_name: str = "mssql-python-rs",
     metadata_version: str = "0.1.0",
+    wheel_tag: str | None = None,
 ) -> Path:
     wheel_path = directory / f"{distribution}-0.1.0-{python_tag}-{abi_tag}-{platform}.whl"
     with zipfile.ZipFile(wheel_path, "w") as wheel:
@@ -52,7 +54,7 @@ def write_wheel(
         )
         wheel.writestr(
             "mssql_python_rs-0.1.0.dist-info/WHEEL",
-            f"Wheel-Version: 1.0\nTag: {python_tag}-{abi_tag}-{platform}\n",
+            f"Wheel-Version: 1.0\nTag: {wheel_tag or f'{python_tag}-{abi_tag}-{platform}'}\n",
         )
         wheel.writestr("mssql_py_core/__init__.py", "")
         if include_extension:
@@ -248,13 +250,14 @@ def test_validator_rejects_unsupported_python_floor(tmp_path: Path) -> None:
 def test_validator_rejects_non_abi3_tag(tmp_path: Path) -> None:
     wheels = write_wheel_matrix(tmp_path)
     wheels[0].unlink()
-    write_wheel(tmp_path, "win_amd64", abi_tag="cp310")
+    write_wheel(tmp_path, "win_amd64", wheel_tag="cp310-cp310-win_amd64")
 
     result = run_validator(tmp_path)
 
+    stderr = re.sub(r"\x1b\[[0-9;]*m", "", result.stderr)
+    normalized = "".join(stderr.split()).replace("|", "")
     assert result.returncode != 0
-    assert "Wheel matrix mismatch" in result.stderr
-    assert "cp310-abi3-win_amd64" in result.stderr
+    assert "WHEELmetadatadoesnotcontainTag:cp310-abi3-win_amd64" in normalized
 
 
 def test_validator_rejects_missing_stable_abi_extension(tmp_path: Path) -> None:

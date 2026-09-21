@@ -37,7 +37,7 @@ dependency declared by `mssql-python`.
 | Platform | Wheel tag | Supported CPython versions |
 |---|---|---|
 | Windows x64 (`win_amd64`) | `cp310-abi3` | 3.10+ |
-| Windows ARM64 (`win_arm64`) | `cp310-abi3` | 3.10+ |
+| Windows ARM64 (`win_arm64`) | `cp310-abi3` | 3.11+ |
 | Linux glibc 2.28 x64 (`manylinux_2_28_x86_64`) | `cp310-abi3` | 3.10+ |
 | Linux glibc 2.28 ARM64 (`manylinux_2_28_aarch64`) | `cp310-abi3` | 3.10+ |
 | Linux glibc 2.34 x64 (`manylinux_2_34_x86_64`) | `cp310-abi3` | 3.10+ |
