@@ -46,7 +46,10 @@ on the `master` branch.
   another SQL Server driver.
 - A source reading does not establish retail behavior. Support every behavioral
   parity claim with both a source citation (file, function, and relevant branch)
-  and a measurement that records `SQL_DRIVER_VER` and the tested build.
+  and a measurement that records `SQL_DRIVER_VER` and the tested build. Where
+  the Driver Manager prevents the claim from being measured through a normal
+  application path, a source citation alone is admissible if the entry states
+  its evidence level and names the measurement that would close it.
 - CI compares against the version pinned by `msodbcsqlVersion` in
   `.pipeline/validation-pipeline.yml`. Use the e2e runner's
   `--compare-with-msodbcsql` mode for observable parity checks.

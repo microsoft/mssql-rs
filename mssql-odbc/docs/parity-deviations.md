@@ -276,7 +276,7 @@ msodbcsql build is measured.
    This policy applies to both bound-column and `SQLGetData` conversions.
 13. A zero-length `SQL_C_BINARY` probe of a `sql_variant` wrapping an empty
    value reports `SQL_SUCCESS`, while msodbcsql reports
-   `SUCCESS_WITH_INFO` / `01004`. Measured against msodbcsql
+   `SQL_SUCCESS_WITH_INFO` / `01004`. Measured against msodbcsql
    `18.6.2.1` (`SQL_DRIVER_VER` `18.06.0002`), the build pinned by
    `msodbcsqlVersion` in
    `.pipeline/validation-pipeline.yml`. A bare empty `varbinary(8)` reports
