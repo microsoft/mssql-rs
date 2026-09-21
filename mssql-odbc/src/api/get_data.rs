@@ -614,8 +614,11 @@ unsafe fn try_write_complete_buffered_string(
     let direct_wchar = target_type == SQL_C_WCHAR
         && matches!(value.encoding_type(), EncodingType::Utf16)
         && bytes.len().is_multiple_of(2);
+    let Ok(buffer_bytes) = usize::try_from(buffer_length) else {
+        return false;
+    };
     let required = bytes.len().saturating_add(std::mem::size_of::<SqlWChar>());
-    if !direct_wchar || usize::try_from(buffer_length).map_or(true, |len| len < required) {
+    if !direct_wchar || buffer_bytes < required {
         return false;
     }
 
@@ -630,7 +633,7 @@ unsafe fn try_write_complete_buffered_string(
         );
         let truncated = copy_utf16le_with_nul(
             target_value_ptr.cast(),
-            buffer_length as usize / std::mem::size_of::<SqlWChar>(),
+            buffer_bytes / std::mem::size_of::<SqlWChar>(),
             bytes,
         );
         debug_assert!(!truncated, "complete buffered wide string must fit");
@@ -5124,7 +5127,7 @@ mod tests {
         assert_eq!(wide_out, [b'h' as u16, b'i' as u16, 0]);
         assert_eq!(indicator, 4);
 
-        for buffer_length in 0..std::mem::size_of_val(&wide_out) {
+        for buffer_length in -1..SqlLen::try_from(std::mem::size_of_val(&wide_out)).unwrap() {
             wide_out.fill(0xAAAA);
             indicator = -99;
             assert!(!unsafe {
@@ -5132,7 +5135,7 @@ mod tests {
                     &wide,
                     SQL_C_WCHAR,
                     wide_out.as_mut_ptr().cast(),
-                    buffer_length as SqlLen,
+                    buffer_length,
                     &mut indicator,
                 )
             });
