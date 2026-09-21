@@ -125,3 +125,41 @@ stages:
       - template: templates/install-dependencies.yml
         parameters:
           osType: Linux
+
+  # RUST-PUBLIC-ARM64-V6-TEST is a throwaway single-agent pool on
+  # Standard_D8pds_v6, carrying the SAME ARM images production uses. It exists to
+  # answer two things before any real pool is converted: do those images boot on
+  # v6 at all, and what happens to scratch space now that the SKU has no resource
+  # volume (v5 exposes 300 GB, v6 exposes none and offers 440 GB of local NVMe
+  # instead). It is scoped to the public project only.
+  - ${{ if eq(variables['System.TeamProject'], 'public') }}:
+    - job: Arm64V6_Ubuntu
+      displayName: 'v6 ARM SKU: RUST-UBUNTU-ARM64 boots and has scratch?'
+      pool:
+        name: RUST-PUBLIC-ARM64-V6-TEST
+        demands:
+        - imageOverride -equals RUST-UBUNTU-ARM64
+      steps:
+      - checkout: none
+      - template: templates/azl3-inventory-steps.yml
+        parameters:
+          label: 'RUST-UBUNTU-ARM64 on Standard_D8pds_v6'
+
+    - job: Arm64V6_WinSrv
+      displayName: 'v6 ARM SKU: RUST-WINSRV-ARM boots?'
+      pool:
+        name: RUST-PUBLIC-ARM64-V6-TEST
+        demands:
+        - imageOverride -equals RUST-WINSRV-ARM
+      steps:
+      - checkout: none
+      - powershell: |
+          Write-Host "---- identity ----"
+          Get-ComputerInfo -Property OsName,OsVersion,CsSystemType | Format-List
+          Write-Host "---- volumes (v6 has no resource volume; v5 gave 300 GB) ----"
+          Get-Volume | Where-Object DriveLetter | Format-Table DriveLetter,FileSystemLabel,
+            @{N='SizeGB';E={[math]::Round($_.Size/1GB,1)}},
+            @{N='FreeGB';E={[math]::Round($_.SizeRemaining/1GB,1)}} -AutoSize
+          Write-Host "---- agent work folder ----"
+          Write-Host $env:AGENT_WORKFOLDER
+        displayName: 'Inventory: RUST-WINSRV-ARM on Standard_D8pds_v6'
