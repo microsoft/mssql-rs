@@ -80,8 +80,9 @@ When a bump is needed, the workflow creates or updates one tracking issue labele
 1. the affected crates and suggested next minor versions;
 2. TOML snippets for the manifest edits, including the mock crate's versioned
    `mssql-tds` dependency when the core crate is bumped;
-3. crisp maintainer instructions to apply the snippets, run `cargo bfmt`,
-   `cargo bclippy`, and `cargo btest`, then open a PR with
+3. crisp maintainer instructions to apply the snippets, run `cargo fetch` (or
+   `cargo update --workspace --offline`) to refresh `Cargo.lock`, then run
+   `cargo bfmt`, `cargo bclippy`, and `cargo btest`, and finally open a PR with
    `Fixes #<issue-number>` and the version summary in the PR description.
 
 The workflow queries only open issues labeled `automation:crate-version-bump`,

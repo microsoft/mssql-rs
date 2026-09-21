@@ -109,7 +109,9 @@ def test_registry_response_includes_yanked_and_old_versions():
     with patch.object(bump, "urlopen", return_value=response) as request:
         assert bump.published_versions("mssql-tds") == {"0.1.0", "0.2.0"}
     assert request.call_args.kwargs["timeout"] == 30
-    assert request.call_args.args[0].get_header("User-agent")
+    assert request.call_args.args[0].get_header("User-agent") == (
+        "microsoft/mssql-rs version check (https://github.com/microsoft/mssql-rs)"
+    )
 
 
 @pytest.mark.parametrize("code", [404, 403, 429, 500])
@@ -354,6 +356,7 @@ def test_issue_created_once_then_reused_and_updated(monkeypatch):
     assert "mssql-tds/Cargo.toml" in stored[0]["body"]
     assert 'version = "0.2.0"' in stored[0]["body"]
     assert 'mssql-tds = { path = "../mssql-tds", version = "0.2.0", default-features = false }' in stored[0]["body"]
+    assert "Run `cargo fetch` (or `cargo update --workspace --offline`) to refresh `Cargo.lock` after the version bump." in stored[0]["body"]
     assert "Run `cargo bfmt`, `cargo bclippy`, and `cargo btest`." in stored[0]["body"]
     assert "Fixes #<this issue number>" in stored[0]["body"]
     assert "plus the version summary above" in stored[0]["body"]
@@ -417,6 +420,7 @@ def test_workflow_scope_and_issue_permissions():
     assert steps[2]["env"] == {
         "DEFAULT_BRANCH": "${{ github.event.repository.default_branch }}",
         "GH_TOKEN": "${{ github.token }}",
+        "RUSTUP_TOOLCHAIN": "stable",
     }
     assert len(steps) == 3
     assert all(

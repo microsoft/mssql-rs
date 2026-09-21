@@ -18,7 +18,9 @@ ISSUE_MARKER = "<!-- mssql-rs:released-crate-version-bump -->"
 def published_versions(crate):
     request = Request(
         f"https://crates.io/api/v1/crates/{crate}",
-        headers={"User-Agent": "microsoft/mssql-rs scheduled version check"},
+        headers={
+            "User-Agent": "microsoft/mssql-rs version check (https://github.com/microsoft/mssql-rs)",
+        },
     )
     try:
         with urlopen(request, timeout=30) as response:
@@ -127,8 +129,9 @@ def issue_body(summary, changes):
         + "\n\n".join(snippets)
         + "\n\nInstructions:\n\n"
         "1. Apply the version changes above.\n"
-        "2. Run `cargo bfmt`, `cargo bclippy`, and `cargo btest`.\n"
-        "3. Open a PR and include `Fixes #<this issue number>` plus the version "
+        "2. Run `cargo fetch` (or `cargo update --workspace --offline`) to refresh `Cargo.lock` after the version bump.\n"
+        "3. Run `cargo bfmt`, `cargo bclippy`, and `cargo btest`.\n"
+        "4. Open a PR and include `Fixes #<this issue number>` plus the version "
         "summary above in the description.\n\n"
         "### Affected crate\n\n"
         + ", ".join(f"`{crate}`" for crate in changes)
