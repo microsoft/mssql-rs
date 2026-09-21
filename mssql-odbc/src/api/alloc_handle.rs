@@ -132,7 +132,10 @@ unsafe fn alloc_dbc(input_handle: SqlHandle, output_handle: *mut SqlHandle) -> S
     // asserts in debug builds only, `odbc/sqlcconn.cpp:527`), because it
     // accepts the 2.x declaration in the first place. Registry entry 14.
     if env_state.odbc_version == OdbcVersion::Unset {
-        error!("SQLAllocHandle(DBC): no supported SQL_ATTR_ODBC_VERSION was set");
+        // Log the diagnostic's own text, not a paraphrase: on the Driver
+        // Manager path the application never sees it (the DM substitutes
+        // IM005), so tracing is the only place the reason survives.
+        error!("SQLAllocHandle(DBC): {}", ERR_ODBC_VERSION_NOT_SET.text);
         post_diag(&mut env_state, ERR_ODBC_VERSION_NOT_SET);
         return SQL_ERROR;
     }
