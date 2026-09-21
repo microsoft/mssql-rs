@@ -57,13 +57,13 @@ def test_unrecognized_tag_returns_empty(tag):
 @pytest.mark.parametrize(
     "wheel_name, expected_tag",
     [
-        ("mssql_python_rs-0.1.0-cp312-cp312-win_amd64.whl", "win_amd64"),
+        ("mssql_python_rs-0.1.0-cp310-abi3-win_amd64.whl", "win_amd64"),
         (
-            "mssql_python_rs-0.1.0-cp313-cp313-musllinux_1_2_aarch64.whl",
+            "mssql_python_rs-0.1.0-cp310-abi3-musllinux_1_2_aarch64.whl",
             "musllinux_1_2_aarch64",
         ),
         (
-            "mssql_python_rs-0.1.0-cp311-cp311-macosx_15_0_universal2.whl",
+            "mssql_python_rs-0.1.0-cp310-abi3-macosx_15_0_universal2.whl",
             "macosx_15_0_universal2",
         ),
     ],
@@ -96,7 +96,7 @@ def test_inject_roundtrip(tmp_path):
     driver_bytes = b"\x4d\x5aFAKE-DLL"
     (drivers / "windows" / "x64" / "mssqlodbc.dll").write_bytes(driver_bytes)
 
-    wheel = tmp_path / "mssql_python_rs-0.1.0-cp312-cp312-win_amd64.whl"
+    wheel = tmp_path / "mssql_python_rs-0.1.0-cp310-abi3-win_amd64.whl"
     _make_wheel(wheel)
 
     inject.inject_wheel(wheel, drivers)
@@ -118,7 +118,7 @@ def test_inject_preserves_entry_modes(tmp_path):
     (drivers / "windows" / "x64").mkdir(parents=True)
     (drivers / "windows" / "x64" / "mssqlodbc.dll").write_bytes(b"MZ")
 
-    wheel = tmp_path / "mssql_python_rs-0.1.0-cp312-cp312-win_amd64.whl"
+    wheel = tmp_path / "mssql_python_rs-0.1.0-cp310-abi3-win_amd64.whl"
     with zipfile.ZipFile(wheel, "w") as zf:
         exe = zipfile.ZipInfo("mssql_py_core/_core.pyd")
         exe.external_attr = 0o755 << 16
@@ -138,20 +138,19 @@ def test_inject_preserves_entry_modes(tmp_path):
     assert modes["mssql_py_core/_core.pyd"] == 0o755
     # Injected driver gets an explicit world-readable, non-executable mode.
     assert modes[driver_arc] == 0o644
-    # ...and a fixed timestamp so the same driver is byte-identical across the
-    # per-Python-version wheels that receive it.
+    # ...and a fixed timestamp so wheel generation remains deterministic.
     assert infos[driver_arc].date_time == (1980, 1, 1, 0, 0, 0)
 
 
 def test_inject_missing_driver_fails(tmp_path):
-    wheel = tmp_path / "mssql_python_rs-0.1.0-cp312-cp312-win_amd64.whl"
+    wheel = tmp_path / "mssql_python_rs-0.1.0-cp310-abi3-win_amd64.whl"
     _make_wheel(wheel)
     with pytest.raises(SystemExit):
         inject.inject_wheel(wheel, tmp_path / "empty-drivers")
 
 
 def test_inject_unknown_tag_fails(tmp_path):
-    wheel = tmp_path / "mssql_python_rs-0.1.0-cp312-cp312-win_ia64.whl"
+    wheel = tmp_path / "mssql_python_rs-0.1.0-cp310-abi3-win_ia64.whl"
     _make_wheel(wheel)
     with pytest.raises(SystemExit):
         inject.inject_wheel(wheel, tmp_path / "drivers")
