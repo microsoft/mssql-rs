@@ -42,8 +42,10 @@ def write_wheel(
     metadata_name: str = "mssql-python-rs",
     metadata_version: str = "0.1.0",
     wheel_tag: str | None = None,
+    extra_wheel_tags: tuple[str, ...] = (),
 ) -> Path:
     wheel_path = directory / f"{distribution}-0.1.0-{python_tag}-{abi_tag}-{platform}.whl"
+    tags = (wheel_tag or f"{python_tag}-{abi_tag}-{platform}", *extra_wheel_tags)
     with zipfile.ZipFile(wheel_path, "w") as wheel:
         wheel.writestr(
             "mssql_python_rs-0.1.0.dist-info/METADATA",
@@ -54,7 +56,7 @@ def write_wheel(
         )
         wheel.writestr(
             "mssql_python_rs-0.1.0.dist-info/WHEEL",
-            f"Wheel-Version: 1.0\nTag: {wheel_tag or f'{python_tag}-{abi_tag}-{platform}'}\n",
+            "Wheel-Version: 1.0\n" + "".join(f"Tag: {tag}\n" for tag in tags),
         )
         wheel.writestr("mssql_py_core/__init__.py", "")
         if include_extension:
@@ -101,6 +103,11 @@ def run_validator(
         text=True,
         check=False,
     )
+
+
+def normalized_stderr(result: subprocess.CompletedProcess[str]) -> str:
+    stderr = re.sub(r"\x1b\[[0-9;]*m", "", result.stderr)
+    return "".join(stderr.split()).replace("|", "")
 
 
 def test_validator_accepts_expected_wheel_matrix(tmp_path: Path) -> None:
@@ -196,7 +203,7 @@ def test_validator_rejects_wrong_metadata(tmp_path: Path, metadata: dict, messag
     result = run_validator(tmp_path)
 
     assert result.returncode != 0
-    assert message in result.stderr
+    assert "".join(message.split()) in normalized_stderr(result)
 
 
 def test_validator_rejects_wrong_filename_version(tmp_path: Path) -> None:
@@ -244,7 +251,7 @@ def test_validator_rejects_unsupported_python_floor(tmp_path: Path) -> None:
     result = run_validator(tmp_path)
 
     assert result.returncode != 0
-    assert "is '>=3.8', expected '>=3.10'" in result.stderr
+    assert "is'>=3.8',expected'>=3.10'" in normalized_stderr(result)
 
 
 def test_validator_rejects_non_abi3_tag(tmp_path: Path) -> None:
@@ -254,10 +261,26 @@ def test_validator_rejects_non_abi3_tag(tmp_path: Path) -> None:
 
     result = run_validator(tmp_path)
 
-    stderr = re.sub(r"\x1b\[[0-9;]*m", "", result.stderr)
-    normalized = "".join(stderr.split()).replace("|", "")
+    normalized = normalized_stderr(result)
     assert result.returncode != 0
-    assert "WHEELmetadatadoesnotcontainTag:cp310-abi3-win_amd64" in normalized
+    assert "expectedonlyTag:cp310-abi3-win_amd64" in normalized
+
+
+def test_validator_rejects_extra_wheel_tag(tmp_path: Path) -> None:
+    wheels = write_wheel_matrix(tmp_path)
+    wheels[0].unlink()
+    write_wheel(
+        tmp_path,
+        "win_amd64",
+        extra_wheel_tags=("cp310-cp310-win_amd64",),
+    )
+
+    result = run_validator(tmp_path)
+
+    normalized = normalized_stderr(result)
+    assert result.returncode != 0
+    assert "cp310-abi3-win_amd64,cp310-cp310-win_amd64" in normalized
+    assert "expectedonlyTag:cp310-abi3-win_amd64" in normalized
 
 
 def test_validator_rejects_missing_stable_abi_extension(tmp_path: Path) -> None:

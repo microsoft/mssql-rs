@@ -171,8 +171,12 @@ foreach ($wheel in $wheels) {
         }
         $platformTag = [System.IO.Path]::GetFileNameWithoutExtension($wheel.Name).Split('-')[-1]
         $expectedTag = "cp310-abi3-$platformTag"
-        if ($wheelMetadata -notmatch "(?m)^Tag:\s*$([regex]::Escape($expectedTag))\r?$") {
-            throw "$($wheel.Name): WHEEL metadata does not contain Tag: $expectedTag"
+        $wheelTags = @(
+            [regex]::Matches($wheelMetadata, '(?m)^Tag:\s*(\S+)\r?$') |
+                ForEach-Object { $_.Groups[1].Value }
+        )
+        if ($wheelTags.Count -ne 1 -or $wheelTags[0] -ne $expectedTag) {
+            throw "$($wheel.Name): WHEEL metadata tags are [$($wheelTags -join ', ')], expected only Tag: $expectedTag"
         }
 
         $expectedExtension = if ($platformTag -like 'win_*') {
