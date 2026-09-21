@@ -38,7 +38,7 @@ def published_versions(crate):
 
 def cargo_versions(root):
     result = subprocess.run(
-        ["cargo", "metadata", "--no-deps", "--format-version", "1", "--offline"],
+        ["cargo", "metadata", "--no-deps", "--format-version", "1", "--locked"],
         cwd=root, check=True, stdout=subprocess.PIPE, text=True,
     )
     return {

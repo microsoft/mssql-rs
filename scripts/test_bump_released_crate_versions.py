@@ -114,7 +114,7 @@ def test_metadata_uses_cargo_json(tmp_path):
     )) as cargo:
         assert bump.cargo_versions(tmp_path) == dict.fromkeys(bump.CRATES, "0.1.7")
     cargo.assert_called_once_with(
-        ["cargo", "metadata", "--no-deps", "--format-version", "1", "--offline"],
+        ["cargo", "metadata", "--no-deps", "--format-version", "1", "--locked"],
         cwd=tmp_path, check=True, stdout=subprocess.PIPE, text=True,
     )
 
