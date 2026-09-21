@@ -27,14 +27,14 @@ pytestmark = pytest.mark.skipif(
 )
 
 _GLIBC = [
-    "mssql_python_rs-0.1.0-cp310-cp310-linux_x86_64.whl",
-    "mssql_python_rs-0.1.0-cp310-cp310-linux_aarch64.whl",
+    "mssql_python_rs-0.1.0-cp310-abi3-linux_x86_64.whl",
+    "mssql_python_rs-0.1.0-cp310-abi3-linux_aarch64.whl",
 ]
 _OTHERS = [
-    "mssql_python_rs-0.1.0-cp310-cp310-win_amd64.whl",
-    "mssql_python_rs-0.1.0-cp310-cp310-musllinux_1_2_x86_64.whl",
-    "mssql_python_rs-0.1.0-cp310-cp310-musllinux_1_2_aarch64.whl",
-    "mssql_python_rs-0.1.0-cp310-cp310-macosx_15_0_universal2.whl",
+    "mssql_python_rs-0.1.0-cp310-abi3-win_amd64.whl",
+    "mssql_python_rs-0.1.0-cp310-abi3-musllinux_1_2_x86_64.whl",
+    "mssql_python_rs-0.1.0-cp310-abi3-musllinux_1_2_aarch64.whl",
+    "mssql_python_rs-0.1.0-cp310-abi3-macosx_15_0_universal2.whl",
 ]
 
 # Fake auditwheel: log the invocation, then emit a retagged wheel whose platform
@@ -127,10 +127,10 @@ def test_repairs_bare_glibc_and_leaves_others(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr
     wheels = tmp_path / "wheels"
     present = {p.name for p in wheels.glob("*.whl")}
-    assert "mssql_python_rs-0.1.0-cp310-cp310-manylinux_2_34_x86_64.whl" in present
-    assert "mssql_python_rs-0.1.0-cp310-cp310-manylinux_2_34_aarch64.whl" in present
-    assert "mssql_python_rs-0.1.0-cp310-cp310-linux_x86_64.whl" not in present
-    assert "mssql_python_rs-0.1.0-cp310-cp310-linux_aarch64.whl" not in present
+    assert "mssql_python_rs-0.1.0-cp310-abi3-manylinux_2_34_x86_64.whl" in present
+    assert "mssql_python_rs-0.1.0-cp310-abi3-manylinux_2_34_aarch64.whl" in present
+    assert "mssql_python_rs-0.1.0-cp310-abi3-linux_x86_64.whl" not in present
+    assert "mssql_python_rs-0.1.0-cp310-abi3-linux_aarch64.whl" not in present
     for other in _OTHERS:
         assert (wheels / other).read_text() == other
     assert "Repaired 2 glibc wheel(s)" in result.stdout
@@ -154,8 +154,8 @@ def test_repairs_manylinux_228_with_openssl_11_exclusions(tmp_path: Path) -> Non
 
     assert result.returncode == 0, result.stderr
     present = {p.name for p in (tmp_path / "wheels").glob("*.whl")}
-    assert "mssql_python_rs-0.1.0-cp310-cp310-manylinux_2_28_x86_64.whl" in present
-    assert "mssql_python_rs-0.1.0-cp310-cp310-manylinux_2_28_aarch64.whl" in present
+    assert "mssql_python_rs-0.1.0-cp310-abi3-manylinux_2_28_x86_64.whl" in present
+    assert "mssql_python_rs-0.1.0-cp310-abi3-manylinux_2_28_aarch64.whl" in present
     invocations = (tmp_path / "auditwheel.log").read_text()
     assert "--plat manylinux_2_28_x86_64" in invocations
     assert "--plat manylinux_2_28_aarch64" in invocations
@@ -205,5 +205,5 @@ def test_ignores_stray_auditwheel_plat_env(tmp_path: Path) -> None:
 
     assert result.returncode == 0, result.stderr
     present = {p.name for p in (tmp_path / "wheels").glob("*.whl")}
-    assert "mssql_python_rs-0.1.0-cp310-cp310-manylinux_2_34_x86_64.whl" in present
-    assert "mssql_python_rs-0.1.0-cp310-cp310-manylinux_2_34_aarch64.whl" in present
+    assert "mssql_python_rs-0.1.0-cp310-abi3-manylinux_2_34_x86_64.whl" in present
+    assert "mssql_python_rs-0.1.0-cp310-abi3-manylinux_2_34_aarch64.whl" in present

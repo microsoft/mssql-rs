@@ -90,22 +90,21 @@ steps:
       rustup target add aarch64-apple-darwin
     displayName: Install maturin and Rust targets
 
-  - ${{ each pythonVersion in parameters.pythonVersions }}:
-    - task: UsePythonVersion@0
-      displayName: 'Use Python ${{ pythonVersion }}'
-      inputs:
-        versionSpec: '${{ pythonVersion }}'
-        addToPath: true
-    
-    - script: |
-        echo "Building universal2 Python wheel for Python ${{ pythonVersion }}..."
-        export PATH="$HOME/.local/bin:$PATH"
-        export MACOSX_DEPLOYMENT_TARGET=15.0
-        python${{ pythonVersion }} --version
-        cd mssql-py-core
-        maturin build --release --target universal2-apple-darwin --interpreter python${{ pythonVersion }} --out $(ob_outputDirectory)/wheels
-        echo "Universal2 wheel built successfully for Python ${{ pythonVersion }}"
-      displayName: 'Build universal2 wheel for Python ${{ pythonVersion }} (MacOS)'
+  - task: UsePythonVersion@0
+    displayName: 'Use Python ${{ parameters.pythonVersions[0] }} to build abi3 wheel'
+    inputs:
+      versionSpec: '${{ parameters.pythonVersions[0] }}'
+      addToPath: true
+
+  - script: |
+      echo "Building universal2 abi3 wheel..."
+      export PATH="$HOME/.local/bin:$PATH"
+      export MACOSX_DEPLOYMENT_TARGET=15.0
+      python --version
+      cd mssql-py-core
+      maturin build --release --target universal2-apple-darwin --interpreter python --out $(ob_outputDirectory)/wheels
+      echo "Universal2 abi3 wheel built successfully"
+    displayName: 'Build universal2 abi3 wheel (MacOS)'
   
   - script: |
       echo "Re-tagging macOS wheels to use single universal2 platform tag..."
@@ -164,32 +163,26 @@ steps:
 
 # Native builds for Windows
 - ${{ if eq(parameters.osType, 'Windows') }}:
-  - ${{ each pythonVersion in parameters.pythonVersions }}:
-    - task: UsePythonVersion@0
-      displayName: 'Use Python ${{ pythonVersion }}'
-      inputs:
-        versionSpec: '${{ pythonVersion }}'
-        architecture: '${{ parameters.architecture }}'
-        addToPath: true
-    
-    - pwsh: |
-        $ErrorActionPreference = 'Stop'
-        
-        Write-Host "Building Python wheel for Python ${{ pythonVersion }}..."
-        python --version
-        
-        # Install build tooling (maturin) and wheel utilities for this Python version
-        pip install maturin wheel
-        
-        # Create wheels output directory
-        New-Item -ItemType Directory -Force -Path "$(ob_outputDirectory)\wheels"
-        
-        # Build the wheel
-        cd mssql-py-core
-        maturin build --release --interpreter python --out "$(ob_outputDirectory)\wheels"
-        
-        Write-Host "Wheel built successfully for Python ${{ pythonVersion }}"
-      displayName: 'Build wheel for Python ${{ pythonVersion }} (Windows ${{ parameters.architecture }})'
+  - task: UsePythonVersion@0
+    displayName: 'Use Python ${{ parameters.pythonVersions[0] }} to build abi3 wheel'
+    inputs:
+      versionSpec: '${{ parameters.pythonVersions[0] }}'
+      architecture: '${{ parameters.architecture }}'
+      addToPath: true
+
+  - pwsh: |
+      $ErrorActionPreference = 'Stop'
+
+      Write-Host "Building abi3 wheel..."
+      python --version
+      pip install maturin wheel
+      New-Item -ItemType Directory -Force -Path "$(ob_outputDirectory)\wheels"
+
+      cd mssql-py-core
+      maturin build --release --interpreter python --out "$(ob_outputDirectory)\wheels"
+
+      Write-Host "abi3 wheel built successfully"
+    displayName: 'Build abi3 wheel (Windows ${{ parameters.architecture }})'
 
   - ${{ if eq(parameters.signWindowsWheels, true) }}:
     - pwsh: |
