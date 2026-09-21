@@ -576,6 +576,19 @@ def test_python_wheel_install_gate_precedes_artifact_publication(
     assert parameters.get("pythonVersions", default_versions) == python_versions
     assert install_index < publish_index
 
+    # The gate only proves anything if it runs after every step that mutates the
+    # wheel it installs - ODBC injection and (on Linux) the glibc/glibc-2.28
+    # auditwheel repair - otherwise it can pass while install-testing a wheel
+    # with no driver in it.
+    transform_indices = [
+        index
+        for index, step in enumerate(steps)
+        if "Inject ODBC driver into" in str(step.get("displayName", ""))
+        or "Repair glibc" in str(step.get("displayName", ""))
+    ]
+    assert transform_indices, "expected a wheel-transforming step in this job"
+    assert max(transform_indices) < install_index
+
 
 def _canonical_python_versions() -> set[str]:
     ps1 = _VERIFY_WHEELS_SCRIPT.read_text(encoding="utf-8")
