@@ -74,9 +74,9 @@ function Get-ExpectedOdbcMembers {
 function Get-ExpectedWheelNames {
     param([string]$Prefix, [string]$Version)
 
-    $pythonTags = 'cp310', 'cp311', 'cp312', 'cp313', 'cp314'
     $platforms = @(
         'win_amd64',
+        'win_arm64',
         'manylinux_2_34_x86_64',
         'manylinux_2_34_aarch64',
         'manylinux_2_28_x86_64',
@@ -86,15 +86,9 @@ function Get-ExpectedWheelNames {
         'macosx_15_0_universal2'
     )
 
-    $expected = foreach ($pythonTag in $pythonTags) {
-        foreach ($platform in $platforms) {
-            "$Prefix-$Version-$pythonTag-$pythonTag-$platform.whl"
-        }
+    foreach ($platform in $platforms) {
+        "$Prefix-$Version-cp310-abi3-$platform.whl"
     }
-    foreach ($pythonTag in $pythonTags | Where-Object { $_ -ne 'cp310' }) {
-        "$Prefix-$Version-$pythonTag-$pythonTag-win_arm64.whl"
-    }
-    return @($expected)
 }
 
 $canonicalExpectedName = ConvertTo-CanonicalName $ExpectedName
@@ -160,6 +154,35 @@ foreach ($wheel in $wheels) {
         }
         if ($requiresPythonMatch.Groups[1].Value -ne '>=3.10') {
             throw "$($wheel.Name): metadata Requires-Python is '$($requiresPythonMatch.Groups[1].Value)', expected '>=3.10'"
+        }
+
+        $wheelMetadataEntries = @(
+            $archive.Entries | Where-Object { $_.FullName.EndsWith('.dist-info/WHEEL') }
+        )
+        if ($wheelMetadataEntries.Count -ne 1) {
+            throw "$($wheel.Name): expected one WHEEL metadata file, found $($wheelMetadataEntries.Count)"
+        }
+        $reader = [System.IO.StreamReader]::new($wheelMetadataEntries[0].Open())
+        try {
+            $wheelMetadata = $reader.ReadToEnd()
+        }
+        finally {
+            $reader.Dispose()
+        }
+        $platformTag = [System.IO.Path]::GetFileNameWithoutExtension($wheel.Name).Split('-')[-1]
+        $expectedTag = "cp310-abi3-$platformTag"
+        if ($wheelMetadata -notmatch "(?m)^Tag:\s*$([regex]::Escape($expectedTag))\r?$") {
+            throw "$($wheel.Name): WHEEL metadata does not contain Tag: $expectedTag"
+        }
+
+        $expectedExtension = if ($platformTag -like 'win_*') {
+            'mssql_py_core/mssql_py_core.pyd'
+        }
+        else {
+            'mssql_py_core/mssql_py_core.abi3.so'
+        }
+        if ($members -cnotcontains $expectedExtension) {
+            throw "$($wheel.Name): missing stable-ABI extension: $expectedExtension"
         }
 
         if ($RequireOdbc) {

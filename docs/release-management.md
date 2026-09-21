@@ -1,6 +1,7 @@
 # mssql-python-rs Release Management
 
-How changes in `mssql-rs` (Rust) flow to `mssql-python` (Python) through the wheel build and NuGet publishing pipeline.
+How changes in `mssql-rs` (Rust) flow to `mssql-python` (Python) through the
+wheel build, internal NuGet transport, and public PyPI release pipelines.
 
 ## Architecture
 
@@ -10,37 +11,43 @@ mssql-rs repo (Rust)
 ├── mssql-py-core/      ← PyO3 bindings (cdylib), produces Python wheels
 └── .pipeline/OneBranch/ ← Builds wheels, packages into NuGet
 
-        │  builds 44 wheels (5 Python × 9 platforms, minus CPython 3.10/Windows ARM64)
+        │  builds 9 stable-ABI wheels (one per supported platform)
         │  packages into NuGet: mssql-python-rs-wheels
         ▼
 
 Azure Artifacts feed: mssql-rs/mssql-rs
-        │  NuGet contains wheels/ folder with all .whl files
+  │  NuGet transports the same wheels for pre-release CI validation
         ▼
 
-mssql-python repo (Python)
-        │  downloads NuGet, extracts native .so/.dll/.dylib from wheels
-        │  repackages into mssql-python distribution
+PyPI: mssql-python-rs
+  │  standalone runtime dependency
+  │  exact version pinned by mssql-python
         ▼
 
 PyPI: mssql-python
 ```
 
-## Wheel Matrix (44 wheels)
+`mssql-python` does not embed or repackage `mssql_py_core`. Its build and test
+pipelines stage the NuGet-transported wheels and let pip select the compatible
+wheel. Public users install `mssql-python-rs` from PyPI through the exact runtime
+dependency declared by `mssql-python`.
 
-| Platform | Python 3.10 | 3.11 | 3.12 | 3.13 | 3.14 |
-|---|---|---|---|---|---|
-| Windows x64 (`win_amd64`) | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Windows ARM64 (`win_arm64`) | — | ✅ | ✅ | ✅ | ✅ |
-| Linux glibc 2.28 x64 (`manylinux_2_28_x86_64`) | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Linux glibc 2.28 ARM64 (`manylinux_2_28_aarch64`) | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Linux glibc 2.34 x64 (`manylinux_2_34_x86_64`) | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Linux glibc 2.34 ARM64 (`manylinux_2_34_aarch64`) | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Linux musl x64 (`musllinux_1_2_x86_64`) | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Linux musl ARM64 (`musllinux_1_2_aarch64`) | ✅ | ✅ | ✅ | ✅ | ✅ |
-| macOS universal2 (`macosx_15_0_universal2`) | ✅ | ✅ | ✅ | ✅ | ✅ |
+## Wheel Matrix (9 wheels)
 
-> Python 3.10 does not produce `win_arm64` wheels due to limited platform support.
+| Platform | Wheel tag | Supported CPython versions |
+|---|---|---|
+| Windows x64 (`win_amd64`) | `cp310-abi3` | 3.10+ |
+| Windows ARM64 (`win_arm64`) | `cp310-abi3` | 3.10+ |
+| Linux glibc 2.28 x64 (`manylinux_2_28_x86_64`) | `cp310-abi3` | 3.10+ |
+| Linux glibc 2.28 ARM64 (`manylinux_2_28_aarch64`) | `cp310-abi3` | 3.10+ |
+| Linux glibc 2.34 x64 (`manylinux_2_34_x86_64`) | `cp310-abi3` | 3.10+ |
+| Linux glibc 2.34 ARM64 (`manylinux_2_34_aarch64`) | `cp310-abi3` | 3.10+ |
+| Linux musl x64 (`musllinux_1_2_x86_64`) | `cp310-abi3` | 3.10+ |
+| Linux musl ARM64 (`musllinux_1_2_aarch64`) | `cp310-abi3` | 3.10+ |
+| macOS universal2 (`macosx_15_0_universal2`) | `cp310-abi3` | 3.10+ |
+
+Each wheel uses Python's stable ABI and replaces the per-minor CPython wheels for
+its platform. Free-threaded CPython is not supported by `abi3`.
 
 ---
 
@@ -80,7 +87,7 @@ prerelease across all versions.
 
 ```
 1. Schedule triggers at 2 AM UTC
-2. Pipeline builds 44 wheels across all platforms
+2. Pipeline builds 9 stable-ABI wheels across all platforms
 3. Publish stage:
   - Extracts the Python distribution version from mssql-py-core/pyproject.toml (e.g., 0.2.0)
    - Appends -nightly.YYYYMMDD suffix
@@ -121,7 +128,7 @@ nuget install mssql-python-rs-wheels -Version 0.2.0-nightly.20260217 -Source mss
 ```
 1. Developer merges PR to main or development
 2. CI trigger fires immediately
-3. Pipeline builds 44 wheels
+3. Pipeline builds 9 stable-ABI wheels
 4. Publish stage produces: mssql-python-rs-wheels.0.2.0-dev.20260217.140071
    (BuildId ensures uniqueness even with multiple merges per day)
 5. Developer tells mssql-python to use this specific version
@@ -131,7 +138,7 @@ nuget install mssql-python-rs-wheels -Version 0.2.0-nightly.20260217 -Source mss
 
 ```
 1. Developer triggers pipeline manually from any branch
-2. Pipeline builds 44 wheels
+2. Pipeline builds 9 stable-ABI wheels
 3. Publish stage produces: mssql-python-rs-wheels.0.2.0-dev.20260217.140095
 4. Developer uses this version in mssql-python for testing
 ```
@@ -371,18 +378,15 @@ If a critical bug is found after release:
 mssql-python-rs-wheels.0.1.0.nupkg
 ├── mssql-python-rs-wheels.nuspec
 └── wheels/
-  ├── mssql_python_rs-0.1.0-cp310-cp310-win_amd64.whl
-  ├── mssql_python_rs-0.1.0-cp310-cp310-manylinux_2_28_x86_64.whl
-  ├── mssql_python_rs-0.1.0-cp310-cp310-manylinux_2_28_aarch64.whl
-  ├── mssql_python_rs-0.1.0-cp310-cp310-manylinux_2_34_x86_64.whl
-  ├── mssql_python_rs-0.1.0-cp310-cp310-manylinux_2_34_aarch64.whl
-  ├── mssql_python_rs-0.1.0-cp310-cp310-musllinux_1_2_x86_64.whl
-  ├── mssql_python_rs-0.1.0-cp310-cp310-musllinux_1_2_aarch64.whl
-  ├── mssql_python_rs-0.1.0-cp310-cp310-macosx_15_0_universal2.whl
-  ├── mssql_python_rs-0.1.0-cp311-cp311-win_amd64.whl
-  ├── mssql_python_rs-0.1.0-cp311-cp311-win_arm64.whl
-  ├── ... (44 wheels total)
-  └── mssql_python_rs-0.1.0-cp314-cp314-macosx_15_0_universal2.whl
+  ├── mssql_python_rs-0.1.0-cp310-abi3-win_amd64.whl
+  ├── mssql_python_rs-0.1.0-cp310-abi3-win_arm64.whl
+  ├── mssql_python_rs-0.1.0-cp310-abi3-manylinux_2_28_x86_64.whl
+  ├── mssql_python_rs-0.1.0-cp310-abi3-manylinux_2_28_aarch64.whl
+  ├── mssql_python_rs-0.1.0-cp310-abi3-manylinux_2_34_x86_64.whl
+  ├── mssql_python_rs-0.1.0-cp310-abi3-manylinux_2_34_aarch64.whl
+  ├── mssql_python_rs-0.1.0-cp310-abi3-musllinux_1_2_x86_64.whl
+  ├── mssql_python_rs-0.1.0-cp310-abi3-musllinux_1_2_aarch64.whl
+  └── mssql_python_rs-0.1.0-cp310-abi3-macosx_15_0_universal2.whl
 ```
 
 ## Traceability
