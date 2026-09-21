@@ -106,6 +106,17 @@ pub(crate) const ERR_FUNCTION_SEQUENCE: DiagMsg = DiagMsg {
     state: SQLSTATE_HY010,
     text: "Function sequence error",
 };
+/// No supported `SQL_ATTR_ODBC_VERSION` was recorded before the application
+/// allocated a connection. Reached either by a caller that skipped the
+/// attribute entirely, or by a 2.x application whose `SQL_OV_ODBC2` this
+/// driver rejected (`HY024`) — the Driver Manager forwards that declaration
+/// rather than mapping it, then allocates the connection regardless. ODBC
+/// specifies `HY010` for allocating a connection before the version is set.
+pub(crate) const ERR_ODBC_VERSION_NOT_SET: DiagMsg = DiagMsg {
+    state: SQLSTATE_HY010,
+    text: "SQL_ATTR_ODBC_VERSION must be set to SQL_OV_ODBC3 or SQL_OV_ODBC3_80 \
+           before allocating a connection; this driver does not support ODBC 2.x",
+};
 /// A fallible allocation failed. Used where the byte count comes from the
 /// application rather than a bounded internal computation -- e.g. buffering
 /// a data-at-execution value with no declared total (`SQL_DATA_AT_EXEC`) --

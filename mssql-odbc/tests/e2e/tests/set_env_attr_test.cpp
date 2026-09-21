@@ -8,8 +8,10 @@
 //   4. SetOdbcVersionInvalid    - bogus version value -> SQL_ERROR
 //   5. SetUnknownAttribute      - unknown attribute -> error
 //   6. SetVersionOverwrites     - subsequent SQLSetEnvAttr replaces prior value
-//   6a. Odbc2ApplicationConnectsAndQueries - a 2.x declaration still connects
-//                                 through the DM and runs a query
+//   6a. Odbc2ApplicationIsRefused - the DM forwards SQL_OV_ODBC2 rather than
+//                                 mapping it, and the driver refuses (HY010)
+//   6b. Odbc3ApplicationConnectsAndQueries - the same sequence under 3.80
+//                                 connects and queries
 //   7. SetVersionThenAllocDbc   - happy path exercising the AllocHandle gate
 //   8. SetEnvAttrNullHandle     - DM rejects null henv before reaching driver
 
@@ -108,22 +110,61 @@ TEST_F(SetEnvAttrTest, SetVersionOverwrites) {
 }
 
 // -------------------------------------------------------------------
-// Variation 6a - an ODBC 2.x application still connects and queries
+// Variation 6a - an ODBC 2.x application is refused, through the DM
 //
-// This is the claim that makes rejecting SQL_OV_ODBC2 in the driver's own
-// exported SQLSetEnvAttr safe: the Driver Manager maps a 2.x application onto
-// the 3.x interface before the driver is loaded, so the rejection is never
-// reached through a normal application path. Variation 3 only proves the DM
-// stores the value; this one proves the mapped connection actually works.
-// Registry entry 14 in docs/parity-deviations.md depends on it.
+// This is the load-bearing test for the ODBC 3.x-only contract, and it proves
+// two things at once. First, the Driver Manager does *not* map a 2.x
+// declaration onto 3.x on the driver's behalf: it stores SQL_OV_ODBC2, answers
+// the application (variation 3), then forwards it to this driver, whose
+// exported SQLSetEnvAttr rejects it. If the DM did convert 2 -> 3, the version
+// would arrive as SQL_OV_ODBC3 and the connection below would succeed.
+// Second, the driver refuses to serve such an application rather than handing
+// it the 3.x contract it never asked for - COLUMN_SIZE where it expects
+// PRECISION, 91/92/93 where it expects 9/10/11.
+//
+// msodbcsql accepts the declaration and connects, so this asserts
+// mssql-odbc-specific behavior the reference does not share at all; that is the
+// first admissible reason for the skip macro in instructions.md 2.1. Registry
+// entry 14 records the divergence.
 // -------------------------------------------------------------------
-TEST_F(SetEnvAttrTest, Odbc2ApplicationConnectsAndQueries) {
+TEST_F(SetEnvAttrTest, Odbc2ApplicationIsRefused) {
+    SKIP_IF_COMPARING_MSODBCSQL();
     if (!ODBCTestConfig::Instance().HasConnection()) {
         GTEST_SKIP() << "No connection configured - set ODBC_TEST_DSN, "
                         "ODBC_TEST_SERVER, or ODBC_TEST_CONNSTR";
     }
 
+    // The DM stores the declaration and reports success to the application.
     ASSERT_SQL_OK(SetVersion(SQL_OV_ODBC2), SQL_HANDLE_ENV, henv_);
+
+    // It reaches the driver regardless, which never recorded a version, so the
+    // connection handle is refused with HY010 rather than silently allocated.
+    SQLHDBC hdbc = SQL_NULL_HDBC;
+    SQLRETURN rc = SQLAllocHandle(SQL_HANDLE_DBC, henv_, &hdbc);
+    EXPECT_EQ(SQL_ERROR, rc)
+        << "a 2.x declaration must not yield a usable connection; if this "
+           "succeeded, the Driver Manager mapped SQL_OV_ODBC2 to SQL_OV_ODBC3 "
+           "before the driver saw it";
+    EXPECT_SQLSTATE(SQL_HANDLE_ENV, henv_, "HY010");
+
+    if (hdbc != SQL_NULL_HDBC) {
+        SQLFreeHandle(SQL_HANDLE_DBC, hdbc);
+    }
+}
+
+// -------------------------------------------------------------------
+// Variation 6b - the same application succeeds once it declares 3.x
+//
+// Pins that variation 6a rejects the declared version, not the fixture: the
+// identical sequence with SQL_OV_ODBC3_80 connects and queries.
+// -------------------------------------------------------------------
+TEST_F(SetEnvAttrTest, Odbc3ApplicationConnectsAndQueries) {
+    if (!ODBCTestConfig::Instance().HasConnection()) {
+        GTEST_SKIP() << "No connection configured - set ODBC_TEST_DSN, "
+                        "ODBC_TEST_SERVER, or ODBC_TEST_CONNSTR";
+    }
+
+    ASSERT_SQL_OK(SetVersion(SQL_OV_ODBC3_80), SQL_HANDLE_ENV, henv_);
 
     SQLHDBC hdbc = SQL_NULL_HDBC;
     ASSERT_SQL_OK(SQLAllocHandle(SQL_HANDLE_DBC, henv_, &hdbc), SQL_HANDLE_ENV, henv_);
