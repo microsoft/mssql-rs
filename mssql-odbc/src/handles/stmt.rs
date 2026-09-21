@@ -894,11 +894,9 @@ pub(crate) struct DaeState {
     /// time, data-at-execution slots included as placeholders. The deferred
     /// execute replaces only those slots and keeps the rest verbatim.
     ///
-    /// Held rather than re-read because `bound_params` is itself an
-    /// execute-time snapshot that `SQLFreeStmt(SQL_RESET_PARAMS)` does not
-    /// clear: an application that releases its bindings mid-sequence -- which
-    /// that call invites -- would otherwise have its freed buffers dereferenced
-    /// when the last `SQLParamData` rebuilt the list.
+    /// Retains already-converted non-DAE values while deferred parameters
+    /// arrive. This snapshot does not permit rebinding or parameter reset
+    /// during Need Data; the Driver Manager rejects those calls with HY010.
     pub(crate) prebuilt: Vec<RpcParameter>,
     /// Rewritten SQL for a deferred `SQLExecDirect`, which runs ad-hoc
     /// `sp_executesql` and has no prepared plan to execute instead.
@@ -1452,8 +1450,8 @@ impl StmtState {
     /// The C type of the open DAE parameter, which `SQLPutData` needs to size
     /// an `SQL_NTS` chunk. Reads the binding snapshot taken at execute time
     /// rather than `bound_params`, so it agrees with the type the chunks are
-    /// transcoded with even if `SQLFreeStmt(SQL_RESET_PARAMS)` or a rebind
-    /// changes or clears the live binding while the sequence is open.
+    /// transcoded with. Rebinding/reset during Need Data is a DM-enforced
+    /// HY010 sequence error, not a supported way to change this snapshot.
     pub(crate) fn dae_current_c_type(&self) -> Option<SqlSmallInt> {
         self.dae
             .as_ref()?
@@ -1481,6 +1479,8 @@ unsafe impl Sync for StmtHandle {}
 impl StmtHandle {
     /// Called after releasing descriptor locks. Records beyond this SQL's
     /// markers cannot change its prepared declaration.
+    /// A plan parked in DAE is not a mutation target: SQLBindParameter and
+    /// associated descriptor setters are disallowed during Need Data (HY010).
     pub(crate) fn invalidate_parameter_definition(&self, first_changed: usize) -> Result<(), ()> {
         let Ok(mut state) = self.inner.lock() else {
             error!("invalidating parameter definition: stmt mutex poisoned");

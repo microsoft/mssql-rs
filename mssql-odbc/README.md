@@ -265,6 +265,11 @@ the SQL definition changes; there is no per-execute metadata key or comparison.
 The existing plan and deferred-unprepare state still travel through arrays and
 data-at-execution.
 
+Definition changes must occur outside a data-at-execution Need Data sequence.
+`SQLBindParameter` and associated `SQLSetDescField`/`SQLSetDescRec` calls in that
+state are DM-enforced `HY010` errors. Keeping execution snapshots does not grant
+permission to rebind or reset parameters while the sequence is parked.
+
 Pointer-only rebinding and APD-only C type, buffer length, precision/scale, or
 descriptor reassociation changes reuse the plan when the IPD SQL definition is
 unchanged. Application buffers retain their existing validity requirements.

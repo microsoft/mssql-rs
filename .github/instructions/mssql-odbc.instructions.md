@@ -576,6 +576,12 @@ Rules of thumb:
   precision/scale. A `SQL_NUMERIC_STRUCT` header is not the prepared declaration.
 - No descriptor identity, lifetime counter, or persistent metadata snapshot is
   needed for this sequential cache-invalidation policy.
+- A DAE binding snapshot is not permission to change the live definition while
+  the statement is in Need Data. `SQLBindParameter` and associated descriptor
+  setters are DM-enforced `HY010` errors in that state (see their
+  [diagnostic contract](https://learn.microsoft.com/sql/odbc/reference/syntax/sqlbindparameter-function#diagnostics)).
+  Cover valid mutations before DAE starts or after it ends, not a new deferred
+  invalidation protocol for out-of-contract rebinding.
 
 ### Cross-handle thread safety (alloc / free)
 
