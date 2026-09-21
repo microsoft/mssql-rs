@@ -48,12 +48,17 @@ def cargo_versions(root):
 
 
 def version_tuple(version):
-    return tuple(int(part) for part in version.split(".", 2))
+    parts = version.split(".")
+    if len(parts) != 3 or any(not part.isdigit() for part in parts):
+        raise ValueError(
+            f"{version} is not a valid three-part release version; choose the next version manually."
+        )
+    return tuple(int(part) for part in parts)
 
 
 def next_minor(version):
-    major, minor, _patch = version.split(".", 2)
-    return f"{int(major)}.{int(minor) + 1}.0"
+    major, minor, _patch = version_tuple(version)
+    return f"{major}.{minor + 1}.0"
 
 
 def summary_line(crate, old, new):

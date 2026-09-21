@@ -68,6 +68,17 @@ def test_published_mock_at_core_target_fails(tmp_path):
             bump.planned_bumps(tmp_path, published)
 
 
+def test_aligned_mock_target_already_published_fails(tmp_path):
+    current = {"mssql-tds": "0.2.0", "mssql-mock-tds": "0.1.0"}
+    published = {
+        "mssql-tds": {"0.2.0", "0.3.0"},
+        "mssql-mock-tds": {"0.3.0"},
+    }
+    with patch.object(bump, "cargo_versions", return_value=current):
+        with pytest.raises(ValueError, match="already published"):
+            bump.planned_bumps(tmp_path, published)
+
+
 def test_mock_ahead_of_core_target_fails(tmp_path):
     current = {"mssql-tds": "0.2.0", "mssql-mock-tds": "0.4.0"}
     published = {"mssql-tds": {"0.2.0"}, "mssql-mock-tds": set()}
@@ -88,6 +99,12 @@ def test_already_published_target_fails(tmp_path):
 )
 def test_next_minor(current, expected):
     assert bump.next_minor(current) == expected
+
+
+@pytest.mark.parametrize("version", ["0.2.0-rc.1", "0.2.0-dev.20240101"])
+def test_next_minor_rejects_prerelease_versions(version):
+    with pytest.raises(ValueError, match="not a valid three-part release version"):
+        bump.next_minor(version)
 
 
 def test_metadata_uses_cargo_json(tmp_path):
