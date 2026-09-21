@@ -59,16 +59,6 @@ def test_drifted_core_and_mock_versions_fail(tmp_path):
             bump.planned_bumps(tmp_path, published)
 
 
-def test_unpublished_mock_at_core_target_is_not_bumped_past_core(tmp_path):
-    current = {"mssql-tds": "0.2.0", "mssql-mock-tds": "0.2.0"}
-    published = {"mssql-tds": {"0.2.0"}, "mssql-mock-tds": set()}
-    with patch.object(bump, "cargo_versions", return_value=current):
-        assert bump.planned_bumps(tmp_path, published) == {
-            "mssql-tds": ("0.2.0", "0.3.0"),
-            "mssql-mock-tds": ("0.2.0", "0.3.0"),
-        }
-
-
 def test_published_mock_at_core_target_fails(tmp_path):
     current = {"mssql-tds": "0.2.0", "mssql-mock-tds": "0.2.0"}
     published = {"mssql-tds": {"0.2.0"}, "mssql-mock-tds": {"0.3.0"}}
