@@ -328,7 +328,7 @@ fn classify_sql_type(data_type: SqlSmallInt) -> TypeClass {
         // not exist. HYC00 says "not implemented", which is true until the
         // negotiated vector capability is surfaced from `mssql-tds` to this
         // layer and `_170` can be selected; accept it in the arm above at that
-        // point.
+        // point. Tracked by https://github.com/microsoft/mssql-rs/issues/623.
         SQL_SS_VECTOR => TypeClass::NotAnOdbcType,
         // Step 2: unlike the SS types above, `SQL_SS_UDT` has no internal
         // "MAPPED" form, so it — and every other unmapped id in the driver

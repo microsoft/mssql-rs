@@ -151,8 +151,10 @@ difference nobody chose. That remains discouraged, and
 mssql-odbc-specific behavior the reference does not share at all. This carve-out
 matches §2.1 of
 [`.github/instructions/mssql-odbc.instructions.md`](../../../.github/instructions/mssql-odbc.instructions.md),
-which permits the macro only for a *measured* divergence: if the divergence is
-measured, asserting both legs records the measurement continuously.
+which permits the macro for a *measured* divergence, or for a documented gap
+tracked by a work item where asserting the reference leg would need a server
+capability the suite cannot assume. When the divergence is measured, asserting
+both legs records the measurement continuously.
 
 **Granularity:** ctest compares at the *test-binary* level — each `*_test`
 executable is a single ctest case and the parity table is keyed on that binary

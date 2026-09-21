@@ -279,8 +279,8 @@ TEST_F(GetTypeInfoLiveTest, IntervalTypeReturnsEmptyResultSet) {
 //
 // The skip is the gap-driven form permitted by §2.1 of the ODBC engineering
 // instructions: asserting msodbcsql's answer here would need a vector-capable
-// server this suite cannot assume. That clause requires a tracking work item
-// for the gap, which still needs to be filed for the _170 selection.
+// server this suite cannot assume. The gap is tracked by
+// https://github.com/microsoft/mssql-rs/issues/623.
 TEST_F(GetTypeInfoLiveTest, VectorTypeIsNotImplementedYet) {
     SKIP_IF_COMPARING_MSODBCSQL();
     SQLRETURN rc = SQLGetTypeInfo(stmt_, SQL_SS_VECTOR);
