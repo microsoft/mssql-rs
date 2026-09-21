@@ -17,7 +17,6 @@ ISSUE_MARKER = "<!-- mssql-rs:released-crate-version-bump -->"
 
 
 def published_versions(crate):
-    last_error = None
     for attempt in range(3):
         request = Request(
             f"https://crates.io/api/v1/crates/{crate}",
@@ -30,7 +29,6 @@ def published_versions(crate):
                 data = json.load(response)
             break
         except HTTPError as error:
-            last_error = error
             if error.code == 404:
                 print(f"{crate}: not published on crates.io; leaving its version unchanged.")
                 return set()
@@ -39,7 +37,6 @@ def published_versions(crate):
                 continue
             raise
         except URLError as error:
-            last_error = error
             if attempt < 2:
                 time.sleep(2 ** attempt)
                 continue

@@ -61,8 +61,12 @@ yanked releases), the workflow suggests the next minor version: `0.1.7` becomes
 `0.2.0`. Unpublished source versions and crates that return HTTP 404 are left
 alone. Other registry errors fail the run rather than assuming a crate is
 unpublished. If the proposed next minor version is also published, the run fails
-and a maintainer must choose a new version. If the mock source version is ahead
-of the core target, the run also fails so a maintainer can choose the versions
+and a maintainer must choose a new version. Before any bump is planned, the
+workflow also fails when the current `mssql-tds` and `mssql-mock-tds` source
+versions differ in either direction (`mssql-tds` and `mssql-mock-tds` must stay
+aligned for a release), because silently tolerating a drifted state can leave the
+repo in a release-invalid configuration. If the mock source version is ahead of
+the core target, the run also fails so a maintainer can choose the versions
 manually. A mock-only bump is deferred until the current `mssql-tds` version is
 published, because the mock crate's exact versioned dependency must resolve from
 the registry when it is packaged. When `mssql-tds` is bumped, the mock source
