@@ -338,9 +338,11 @@ with an explicit, possibly reassociated descriptor. This is tracked in
   Driver Manager does not validate.
 - The first line of every FFI implementation function must be a `debug!` log
   of every argument (pointers logged with `?` — no deref).
-- The `pub extern "C"` wrapper in `exports.rs` must call
-  `crate::init_tracing()` before delegating to the impl — `ffi_entry!` does
-  not initialize tracing itself.
+- Do not call `crate::init_tracing()` from the `pub extern "C"` wrapper in
+  `exports.rs`. `ffi_entry!` already calls it as the first statement inside its
+  `catch_unwind` (`src/lib.rs`), so the wrappers stay thin delegates; adding a
+  second call would both duplicate initialization and move it outside the panic
+  boundary.
 - Never call `std::panic::catch_unwind` directly in this crate; always go
   through `ffi_entry!` so the panic-log message, return-code mapping, and
   trailing trace are uniform.

@@ -276,8 +276,9 @@ msodbcsql build is measured.
    This policy applies to both bound-column and `SQLGetData` conversions.
 13. A zero-length `SQL_C_BINARY` probe of a `sql_variant` wrapping an empty
    value reports `SQL_SUCCESS`, while msodbcsql reports
-   `SQL_SUCCESS_WITH_INFO` / `01004`. Measured against msodbcsql
-   `18.6.2.1`, the build pinned by `msodbcsqlVersion` in
+   `SUCCESS_WITH_INFO` / `01004`. Measured against msodbcsql
+   `18.6.2.1` (`SQL_DRIVER_VER` `18.06.0002`), the build pinned by
+   `msodbcsqlVersion` in
    `.pipeline/validation-pipeline.yml`. A bare empty `varbinary(8)` reports
    `SQL_SUCCESS` in both drivers. Matching the variant-only warning would
    require preserving wrapper identity after the value has been captured;
@@ -306,6 +307,15 @@ msodbcsql build is measured.
    the version itself; `IS2xAPPE` (`odbc/sqlcprot.h`, line 1546) reads it back
    as `SQL_OV_ODBC2`, and the driver then branches on it throughout — for
    example `odbc/sqlcconn.cpp`, line 585.
+   Evidence level: this rests on a source reading, not a direct-export
+   measurement. `SQLSetEnvAttr` performs no validation of the value at all, so
+   the reading is unambiguous, but no observed `SQL_DRIVER_VER` is recorded
+   here because the claim is about the *driver's* exported entry point and the
+   Driver Manager intercepts `SQL_ATTR_ODBC_VERSION` before the driver is
+   loaded. `SetGetOdbcVersion2` does not close this: its own comment notes that
+   no driver is loaded at that point, so it measures the DM, not msodbcsql.
+   Loading msodbcsql directly and calling its exported `SQLSetEnvAttr` with
+   `SQL_OV_ODBC2` would close it.
    This driver supports no ODBC 2.x application contract, so accepting the
    declaration and then behaving as 3.x would be the worse outcome: the
    application would be told its request succeeded while silently receiving
