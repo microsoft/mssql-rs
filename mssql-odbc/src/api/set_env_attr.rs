@@ -122,6 +122,8 @@ mod tests {
     use crate::api::odbc_types::{
         SQL_HANDLE_ENV, SQL_NULL_HANDLE, SQL_OV_ODBC2, SQL_OV_ODBC3, SQL_OV_ODBC3_80,
     };
+    use crate::handles::handle_from_raw;
+    use crate::test_support::TestHandles;
 
     fn alloc_env() -> SqlHandle {
         let mut h: SqlHandle = ptr::null_mut();
@@ -171,50 +173,52 @@ mod tests {
     #[cfg(target_pointer_width = "64")]
     #[test]
     fn set_odbc_version_rejects_a_value_wider_than_32_bits() {
-        let env = alloc_env();
+        let h = TestHandles::with_unset_env();
         assert_eq!(
-            set_attr(env, SQL_ATTR_ODBC_VERSION, SQL_OV_ODBC3_80),
+            set_attr(h.env, SQL_ATTR_ODBC_VERSION, SQL_OV_ODBC3_80),
             SQL_SUCCESS
         );
 
         let tagged = 0x1_0000_0000usize | SQL_OV_ODBC3 as usize;
         let ret = unsafe {
-            crate::api::exports::SQLSetEnvAttr(env, SQL_ATTR_ODBC_VERSION, tagged as SqlPointer, 0)
+            crate::api::exports::SQLSetEnvAttr(
+                h.env,
+                SQL_ATTR_ODBC_VERSION,
+                tagged as SqlPointer,
+                0,
+            )
         };
         assert_eq!(ret, SQL_ERROR, "the low half must not be read in isolation");
 
-        let env_ref = unsafe { &*(env as *const EnvHandle) };
+        let env_ref = unsafe { handle_from_raw::<EnvHandle>(h.env) };
         assert_eq!(
             env_ref.inner.lock().unwrap().odbc_version,
             OdbcVersion::Odbc3_80,
             "a rejected value must leave the prior version intact"
         );
-        free_env(env);
     }
 
     #[test]
     fn set_odbc_version_2_is_rejected() {
-        let env = alloc_env();
+        let h = TestHandles::with_unset_env();
         assert_eq!(
-            set_attr(env, SQL_ATTR_ODBC_VERSION, SQL_OV_ODBC3_80),
+            set_attr(h.env, SQL_ATTR_ODBC_VERSION, SQL_OV_ODBC3_80),
             SQL_SUCCESS
         );
         let ret = unsafe {
             crate::api::exports::SQLSetEnvAttr(
-                env,
+                h.env,
                 SQL_ATTR_ODBC_VERSION,
                 SQL_OV_ODBC2 as usize as SqlPointer,
                 0,
             )
         };
         assert_eq!(ret, SQL_ERROR);
-        let env_ref = unsafe { &*(env as *const EnvHandle) };
+        let env_ref = unsafe { handle_from_raw::<EnvHandle>(h.env) };
         let state = env_ref.inner.lock().unwrap();
         assert_eq!(state.odbc_version, OdbcVersion::Odbc3_80);
         assert_eq!(state.diag_records.len(), 1);
         assert_eq!(&state.diag_records[0].sql_state, b"HY024");
-        drop(state);
-        free_env(env);
     }
 
     #[test]
