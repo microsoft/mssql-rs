@@ -24,9 +24,8 @@ If missing:
 bash .pipeline/scripts/clone-mssql-python.sh
 ```
 
-Run from the mssql-rs repository root. This uses CI's revision
-from `.pipeline/mssql-python-revision.txt`, which defaults to the latest upstream
-`main`. A full lowercase commit SHA can be used instead to pin the checkout.
+Run from the mssql-rs repository root. This uses CI's pin from
+`.pipeline/mssql-python-revision.txt`: a commit SHA or branch name (currently `main`).
 An existing sibling checkout is an explicit local developer choice.
 
 ### 2. SQL Server Running
@@ -217,8 +216,8 @@ tests and the mssql-odbc driver-swap compatibility job remain enabled.
 
 1. **First:** Merge mssql-python PR (so `main` has the changes)
 2. **Then:** Run the mssql-rs cross-repo jobs, which fetch the latest `main`
-   by default. If `.pipeline/mssql-python-revision.txt` is pinned, update it to
-   the required full upstream commit SHA or restore `main`. Test failures are
+   by default. If `.pipeline/mssql-python-revision.txt` pins a different SHA or
+   branch, update it as needed. Test failures are
    advisory warnings; checkout, build, and harness failures still block.
    PR-description branch overrides are not supported.
 

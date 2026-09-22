@@ -13,7 +13,7 @@ import unittest
 HERE = Path(__file__).resolve().parent
 
 
-class RevisionCheckout(unittest.TestCase):
+class PinnedCheckout(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -77,7 +77,7 @@ class RevisionCheckout(unittest.TestCase):
         self.assertEqual(self.git(checkout, "rev-parse", "--abbrev-ref", "HEAD"), "HEAD")
         self.assertEqual(self.git(checkout, "rev-list", "--count", "HEAD"), "1")
         self.assertEqual((checkout / "content.txt").read_text(), "approved")
-        self.assertIn(f"requested revision: {self.pin}", result.stdout)
+        self.assertIn(f"requested pin: {self.pin}", result.stdout)
         self.assertIn(f"mssql-python HEAD: {self.pin}", result.stdout)
         self.assertNotIn("##[error]", result.stdout + result.stderr)
 
@@ -89,31 +89,28 @@ class RevisionCheckout(unittest.TestCase):
         self.assertEqual(self.git(self.remote, "rev-parse", "main"), latest)
         self.assert_pinned("second checkout")
 
-    def test_main_tracks_latest_commit_on_each_checkout(self):
-        self.pin_file.write_text("main\n", encoding="ascii")
-        for destination in ("first checkout", "second checkout"):
-            latest = self.commit(destination)
-            result = self.checkout(destination)
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            checkout = self.root / destination
-            self.assertEqual(self.git(checkout, "rev-parse", "HEAD"), latest)
-            self.assertEqual(self.git(checkout, "rev-parse", "--abbrev-ref", "HEAD"), "HEAD")
-            self.assertEqual(self.git(checkout, "rev-list", "--count", "HEAD"), "1")
-            self.assertEqual((checkout / "content.txt").read_text(), destination)
-            self.assertIn("requested revision: main", result.stdout)
-            self.assertIn(f"mssql-python HEAD: {latest}", result.stdout)
+    def test_branch_pin_tracks_latest_commit_on_each_checkout(self):
+        for branch in ("main", "feature/test"):
+            self.git(self.remote, "checkout", "-B", branch)
+            self.pin_file.write_text(branch + "\n", encoding="ascii")
+            for attempt in range(2):
+                with self.subTest(branch=branch, attempt=attempt):
+                    destination = f"{branch.replace('/', '-')}-{attempt}"
+                    latest = self.commit(destination)
+                    result = self.checkout(destination)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    checkout = self.root / destination
+                    self.assertEqual(self.git(checkout, "rev-parse", "HEAD"), latest)
+                    self.assertEqual(self.git(checkout, "rev-parse", "--abbrev-ref", "HEAD"), "HEAD")
+                    self.assertEqual(self.git(checkout, "rev-list", "--count", "HEAD"), "1")
+                    self.assertIn(f"requested pin: {branch}", result.stdout)
+                    self.assertIn(f"mssql-python HEAD: {latest}", result.stdout)
 
-    def test_repository_defaults_to_main(self):
-        self.assertEqual(
-            (HERE.parent / "mssql-python-revision.txt").read_text().strip(), "main"
-        )
-
-    def test_missing_main_never_falls_back_to_another_branch(self):
-        self.pin_file.write_text("main\n", encoding="ascii")
-        self.git(self.remote, "branch", "-m", "different-default")
+    def test_unavailable_branch_never_falls_back_to_main(self):
+        self.pin_file.write_text("missing-branch\n", encoding="ascii")
         result = self.checkout()
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("Cannot fetch mssql-python revision main", result.stderr)
+        self.assertIn("Cannot fetch mssql-python pin missing-branch", result.stderr)
         self.assertFalse((self.root / "checkout" / "content.txt").exists())
 
     def test_existing_checkout_is_not_modified(self):
@@ -129,11 +126,11 @@ class RevisionCheckout(unittest.TestCase):
         self.pin_file.unlink()
         result = self.checkout()
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("Missing mssql-python revision", result.stderr)
+        self.assertIn("Missing mssql-python pin", result.stderr)
         self.assertFalse((self.root / "checkout").exists())
 
     def test_invalid_pin_fails_before_creating_destination(self):
-        for pin in ("", "develop", self.pin[:7], "g" * 40, self.pin.upper(),
+        for pin in ("", "-branch", "bad..branch", "branch name",
                     f"{self.pin}\n{self.newer}", f" {self.pin}"):
             with self.subTest(pin=pin):
                 self.pin_file.write_text(pin, encoding="ascii")
@@ -146,14 +143,14 @@ class RevisionCheckout(unittest.TestCase):
         self.pin_file.write_text("0" * 40 + "\n", encoding="ascii")
         result = self.checkout()
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("Cannot fetch mssql-python revision", result.stderr)
+        self.assertIn("Cannot fetch mssql-python pin", result.stderr)
         self.assertFalse((self.root / "checkout" / "content.txt").exists())
 
     def test_unavailable_remote_fails_without_fallback(self):
         self.remote.rename(self.root / "unavailable-upstream")
         result = self.checkout()
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("Cannot fetch mssql-python revision", result.stderr)
+        self.assertIn("Cannot fetch mssql-python pin", result.stderr)
         self.assertFalse((self.root / "checkout" / "content.txt").exists())
 
 

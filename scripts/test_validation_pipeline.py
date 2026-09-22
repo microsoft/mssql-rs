@@ -106,7 +106,7 @@ def test_obsolete_mssql_python_linux_build_is_removed():
     "template",
     ["test-mssql-python-macos-template.yml", "test-mssql-python-odbc-template.yml"],
 )
-def test_cross_repo_jobs_share_the_revision_checkout(template):
+def test_cross_repo_jobs_share_the_pinned_checkout(template):
     steps = load_template(template)["steps"]
     clone = next(step for step in steps if step.get("displayName") == "Clone mssql-python")
     assert "bash .pipeline/scripts/clone-mssql-python.sh" in clone["script"]
@@ -128,7 +128,7 @@ def test_mssql_python_macos_failures_are_advisory():
     assert publish["inputs"]["failTaskOnMissingResultsFile"] is True
 
 
-def test_cross_repo_validation_is_not_path_filtered_or_optional():
+def test_pin_validation_is_not_path_filtered_or_optional():
     pipeline = yaml.safe_load(
         (_ROOT / ".pipeline" / "validation-pipeline.yml").read_text(encoding="utf-8")
     )
