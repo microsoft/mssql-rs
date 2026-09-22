@@ -1893,10 +1893,14 @@ fn stream_active_plp_chunk_once<'a>(
     };
     let buffer_length =
         buffer_length.saturating_sub(SqlLen::try_from(progress.written).unwrap_or(SqlLen::MAX));
-    let target_value_ptr: SqlPointer = target_value_ptr
-        .cast::<u8>()
-        .wrapping_add(progress.written)
-        .cast();
+    let target_value_ptr: SqlPointer = if target_value_ptr.is_null() {
+        target_value_ptr
+    } else {
+        target_value_ptr
+            .cast::<u8>()
+            .wrapping_add(progress.written)
+            .cast()
+    };
     let payload_capacity = (buffer_length as usize).saturating_sub(terminator_bytes);
     let widen_out_units = if widen_narrow_to_utf16 {
         payload_capacity / std::mem::size_of::<SqlWChar>()
@@ -2041,10 +2045,14 @@ fn stream_active_plp_chunk_once<'a>(
     let prefix_fills_buffer =
         target_type != SQL_C_BINARY && carried_bytes > 0 && prefix_bytes == text_capacity;
     let buffer_length = buffer_length - SqlLen::try_from(prefix_bytes).unwrap_or(SqlLen::MAX);
-    let target_value_ptr: SqlPointer = target_value_ptr
-        .cast::<u8>()
-        .wrapping_add(prefix_bytes)
-        .cast();
+    let target_value_ptr: SqlPointer = if target_value_ptr.is_null() {
+        target_value_ptr
+    } else {
+        target_value_ptr
+            .cast::<u8>()
+            .wrapping_add(prefix_bytes)
+            .cast()
+    };
     let payload_capacity = (buffer_length as usize).saturating_sub(terminator_bytes);
     let widen_out_units = payload_capacity / std::mem::size_of::<SqlWChar>();
     let max_read = if retry_bytes > 0 {
@@ -7038,6 +7046,84 @@ mod tests {
             )
         };
         (rc, indicator)
+    }
+
+    #[test]
+    fn plp_null_target_survives_utf16_completion_after_output() {
+        let (h, _server) = open_mock_plp(vec![vec![0x41, 0x42, 0xd83d, 0xde00, 0x43]]);
+        let mut indicator = -999;
+        assert_eq!(
+            unsafe {
+                sql_get_data(
+                    h.stmt,
+                    1,
+                    SQL_C_CHAR,
+                    std::ptr::null_mut(),
+                    10,
+                    &mut indicator,
+                )
+            },
+            SQL_SUCCESS_WITH_INFO
+        );
+        assert_eq!(indicator, SQL_NO_TOTAL);
+        let mut rest = [0xcc; 8];
+        assert_eq!(
+            read_plp_test_chunk(&h, SQL_C_CHAR, &mut rest),
+            (SQL_SUCCESS, 1)
+        );
+        assert_eq!(&rest[..2], b"C\0");
+    }
+
+    #[test]
+    fn plp_null_target_survives_narrow_completion_after_output() {
+        let (h, _server) = open_mock_gbk_plp(vec![vec![b'A', 0xc4, 0xe3, b'B', b'C']]);
+        let mut indicator = -999;
+        assert_eq!(
+            unsafe {
+                sql_get_data(
+                    h.stmt,
+                    1,
+                    SQL_C_CHAR,
+                    std::ptr::null_mut(),
+                    7,
+                    &mut indicator,
+                )
+            },
+            SQL_SUCCESS_WITH_INFO
+        );
+        assert_eq!(indicator, 5);
+        let mut rest = [0xcc; 8];
+        assert_eq!(
+            read_plp_test_chunk(&h, SQL_C_BINARY, &mut rest),
+            (SQL_SUCCESS, 2)
+        );
+        assert_eq!(&rest[..2], b"BC");
+    }
+
+    #[test]
+    fn plp_null_target_survives_widening_refill() {
+        let (h, _server) = open_mock_gbk_plp(vec![[0xc4, 0xe3].repeat(6)]);
+        let mut indicator = -999;
+        assert_eq!(
+            unsafe {
+                sql_get_data(
+                    h.stmt,
+                    1,
+                    SQL_C_WCHAR,
+                    std::ptr::null_mut(),
+                    10,
+                    &mut indicator,
+                )
+            },
+            SQL_SUCCESS_WITH_INFO
+        );
+        assert_eq!(indicator, SQL_NO_TOTAL);
+        let mut rest = [0xcc; 8];
+        assert_eq!(
+            read_plp_test_chunk(&h, SQL_C_WCHAR, &mut rest),
+            (SQL_SUCCESS, 4)
+        );
+        assert_eq!(&rest[..6], &[0x60, 0x4f, 0x60, 0x4f, 0, 0]);
     }
 
     #[test]
