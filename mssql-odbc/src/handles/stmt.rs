@@ -56,8 +56,8 @@ pub(crate) struct ActivePlpStream {
     /// [`Self::ensure_narrow_decoder`] the first time a target actually needs to
     /// convert. Serves both directions: to UTF-16LE for `SQL_C_WCHAR`
     /// (`varchar(max)`/`json`) and to UTF-8 for `SQL_C_CHAR` under a non-UTF-8
-    /// collation (AB#47566). One decoder for both, so a target switch mid-stream
-    /// reuses a carry that is still meaningful.
+    /// collation (AB#47566). SQLGetData completes any partial source character
+    /// before returning, so a later target switch cannot strand decoder input.
     ///
     /// A decoder rather than a byte carry because the column's codepage can be
     /// multi-byte (`lcid_to_encoding` reaches SHIFT_JIS, GBK, BIG5, EUC-KR and

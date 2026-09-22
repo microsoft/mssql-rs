@@ -248,6 +248,10 @@ the unread wire payload ends. This matches msodbcsql's `InternalGetColData`
 (`odbc/sqlcdata.h`) and completion gate (`odbc/sqlcdata.cpp`), measured on Linux
 with retail 18.6.2.1 (`SQL_DRIVER_VER` `18.06.0002`). See AB#48046.
 
+Text conversions finish a trailing partial source character before returning,
+even if earlier characters already produced output. Internal completion reads
+append to that output and preserve the call's length accounting.
+
 One reference-driver quirk remains: after a narrow read exhausts an
 `nvarchar(max)` value's wire bytes, a WCHAR probe with no payload room reports
 `01004` with indicator **0**, even when converted carry remains. The indicator

@@ -901,6 +901,71 @@ TEST_F(GetDataUtf16Test, PlpTargetSwitchAfterBinaryProbeOrPartialCharacter) {
     }
 }
 
+TEST_F(GetDataUtf16Test, PlpTargetSwitchCompletesSurrogateAfterPriorOutput) {
+    SKIP_IF_COMPARING_MSODBCSQL_ON_WINDOWS();
+    ASSERT_SQL_OK(
+        ExecDirect("SELECT CAST(N'A' + NCHAR(0xD83D) + NCHAR(0xDE00) AS nvarchar(max)), 42"),
+        SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    SQLCHAR output[8] = {};
+    SQLLEN ind = 0;
+    ASSERT_EQ(SQL_SUCCESS, SQLGetData(stmt_, 1, SQL_C_CHAR, output, sizeof(output), &ind));
+    EXPECT_EQ(5, ind);
+    const SQLCHAR expected[] = {'A', 0xF0, 0x9F, 0x98, 0x80, 0};
+    EXPECT_EQ(0, std::memcmp(output, expected, sizeof(expected)));
+    EXPECT_EQ(SQL_NO_DATA,
+              SQLGetData(stmt_, 1, SQL_C_BINARY, output, sizeof(output), &ind));
+    ASSERT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+}
+
+TEST_F(GetDataUtf16Test, PlpTargetSwitchCompletesDbcsAfterPriorOutput) {
+    SKIP_IF_COMPARING_MSODBCSQL_ON_WINDOWS();
+    ASSERT_SQL_OK(
+        ExecDirect("SELECT CAST((N'A' + NCHAR(0x03B1) + REPLICATE(N'B', 8)) "
+                   "COLLATE Chinese_PRC_CI_AS AS varchar(max)), 42"),
+        SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    SQLCHAR first[7] = {};
+    SQLLEN ind = 0;
+    ASSERT_EQ(SQL_SUCCESS_WITH_INFO,
+              SQLGetData(stmt_, 1, SQL_C_CHAR, first, sizeof(first), &ind));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01004");
+    EXPECT_EQ(11, ind);
+    std::string delivered(reinterpret_cast<const char*>(first));
+    SQLCHAR rest[32] = {};
+    ASSERT_EQ(SQL_SUCCESS, SQLGetData(stmt_, 1, SQL_C_BINARY, rest, sizeof(rest), &ind));
+    ASSERT_GE(ind, 0);
+    ASSERT_LE(ind, static_cast<SQLLEN>(sizeof(rest)));
+    delivered.append(reinterpret_cast<const char*>(rest), static_cast<size_t>(ind));
+    EXPECT_EQ(std::string("A\xCE\xB1") + std::string(8, 'B'), delivered);
+    EXPECT_EQ(SQL_NO_DATA, SQLGetData(stmt_, 1, SQL_C_BINARY, rest, sizeof(rest), &ind));
+    ASSERT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+}
+
+TEST_F(GetDataUtf16Test, PlpTargetSwitchCompletesWideningAfterPriorOutput) {
+    ASSERT_SQL_OK(
+        ExecDirect("SELECT CAST((N'A' + NCHAR(0xD83D) + NCHAR(0xDE00) + N'BC') "
+                   "COLLATE Latin1_General_100_CI_AS_SC_UTF8 AS varchar(max)), 42"),
+        SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    SQLWCHAR first[4] = {};
+    SQLLEN ind = 0;
+    ASSERT_EQ(SQL_SUCCESS_WITH_INFO,
+              SQLGetData(stmt_, 1, SQL_C_WCHAR, first, sizeof(first), &ind));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01004");
+    EXPECT_EQ(SQL_NO_TOTAL, ind);
+    EXPECT_EQ('A', first[0]);
+    EXPECT_EQ(0xD83D, first[1]);
+    EXPECT_EQ(0xDE00, first[2]);
+    EXPECT_EQ(0, first[3]);
+    SQLCHAR rest[8] = {};
+    ASSERT_EQ(SQL_SUCCESS, SQLGetData(stmt_, 1, SQL_C_BINARY, rest, sizeof(rest), &ind));
+    EXPECT_EQ(2, ind);
+    EXPECT_EQ(0, std::memcmp(rest, "BC", 2));
+    EXPECT_EQ(SQL_NO_DATA, SQLGetData(stmt_, 1, SQL_C_BINARY, rest, sizeof(rest), &ind));
+    ASSERT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+}
+
 TEST_F(GetDataLiveTest, PlpVarcharMaxStreamed) {
     const int kTotal = 9000;
     ASSERT_SQL_OK(ExecDirect(
