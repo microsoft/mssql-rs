@@ -134,6 +134,7 @@ impl SqlString {
     }
 
     /// Decodes wire bytes in `encoding_type` into a Rust `String`.
+    /// The explicit encoding is authoritative; BOM-shaped prefixes are payload.
     ///
     /// Lets a writer handed borrowed bytes by
     /// [`RowWriter::write_string`](crate::datatypes::row_writer::RowWriter::write_string)
@@ -145,7 +146,7 @@ impl SqlString {
             EncodingType::Utf8 => String::from_utf8(bytes.to_vec()).unwrap(),
             EncodingType::Utf16 => {
                 // Use encoding_rs for efficient UTF-16LE decoding without intermediate Vec<u16> allocation
-                let (decoded, _, _) = encoding_rs::UTF_16LE.decode(bytes);
+                let (decoded, _) = encoding_rs::UTF_16LE.decode_without_bom_handling(bytes);
                 decoded.into_owned()
             }
             EncodingType::LcidBased(collation) => {
@@ -154,7 +155,7 @@ impl SqlString {
                 let encoding = lcid_encoding_or_fallback(collation);
 
                 // Decode bytes using the determined encoding
-                let (decoded, _used_encoding, had_errors) = encoding.decode(bytes);
+                let (decoded, had_errors) = encoding.decode_without_bom_handling(bytes);
 
                 if had_errors {
                     warn!(
@@ -362,6 +363,41 @@ mod tests {
                 SqlString::decode(&bytes, encoding_type),
                 SqlString::new(bytes.clone(), encoding_type).to_utf8_string(),
                 "mismatch for {encoding_type:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_preserves_bom_shaped_sql_payloads() {
+        let cp1252 = EncodingType::LcidBased(collation(0x0409));
+        assert_eq!(cp1252.encoding(), Some(encoding_rs::WINDOWS_1252));
+        let cases: &[(&[u8], EncodingType, &str)] = &[
+            (b"\xEF\xBB\xBFA", cp1252, "\u{EF}\u{BB}\u{BF}A"),
+            (b"\xFF\xFEA\0", cp1252, "\u{FF}\u{FE}A\0"),
+            (b"\xFE\xFFA\0", cp1252, "\u{FE}\u{FF}A\0"),
+            (b"\xFF\xFEA\0", EncodingType::Utf16, "\u{FEFF}A"),
+            (b"\xFE\xFFA\0", EncodingType::Utf16, "\u{FFFE}A"),
+            (b"\xEF\xBB\xBFA", EncodingType::Utf8, "\u{FEFF}A"),
+            (b"A\xEF\xBB\xBF", cp1252, "A\u{EF}\u{BB}\u{BF}"),
+            (b"caf\xE9", cp1252, "caf\u{E9}"),
+            (b"A\0", EncodingType::Utf16, "A"),
+            (b"\x3D\xD8\0\xDE\0\0", EncodingType::Utf16, "\u{1F600}\0"),
+            (b"\0\xD8", EncodingType::Utf16, "\u{FFFD}"),
+            (b"\0\xDC", EncodingType::Utf16, "\u{FFFD}"),
+            (b"A\0B", EncodingType::Utf16, "A\u{FFFD}"),
+            (b"", cp1252, ""),
+            (b"", EncodingType::Utf16, ""),
+        ];
+        for &(bytes, encoding, expected) in cases {
+            assert_eq!(
+                SqlString::decode(bytes, encoding),
+                expected,
+                "{encoding:?}: {bytes:02X?}"
+            );
+            assert_eq!(
+                SqlString::new(bytes.to_vec(), encoding).to_utf8_string(),
+                expected,
+                "{encoding:?}: {bytes:02X?}"
             );
         }
     }

@@ -12,6 +12,26 @@ use crate::error::HasDiagnostics;
 /// that clears it on the ODBC-mandated NOT NULL columns after execution.
 pub(crate) const COLMETA_NULLABLE_FLAG: u16 = 0x01;
 
+const UTF16_HIGH_SURROGATE_START: u16 = 0xD800;
+const UTF16_HIGH_SURROGATE_END: u16 = 0xDBFF;
+const UTF16_LOW_SURROGATE_START: u16 = 0xDC00;
+const UTF16_LOW_SURROGATE_END: u16 = 0xDFFF;
+
+#[inline]
+pub(crate) fn is_high_surrogate(unit: u16) -> bool {
+    (UTF16_HIGH_SURROGATE_START..=UTF16_HIGH_SURROGATE_END).contains(&unit)
+}
+
+#[inline]
+fn is_low_surrogate(unit: u16) -> bool {
+    (UTF16_LOW_SURROGATE_START..=UTF16_LOW_SURROGATE_END).contains(&unit)
+}
+
+#[inline]
+pub(crate) fn is_surrogate_pair(high: u16, low: u16) -> bool {
+    is_high_surrogate(high) && is_low_surrogate(low)
+}
+
 /// Write `value` to `ptr` if non-null. Every ODBC out-parameter pointer may
 /// legitimately be null (caller opting out of that value), so the
 /// `if (p) *p = v;` idiom appears at almost every entry point. Centralizing
@@ -32,16 +52,37 @@ pub(crate) unsafe fn write_if_some<T: Copy>(ptr: *mut T, value: T) {
     }
 }
 
-pub(crate) fn is_valid_utf16le(bytes: &[u8]) -> bool {
-    bytes.len().is_multiple_of(2)
-        // ASCII-valued bytes cannot form a UTF-16 surrogate code unit.
-        && (bytes.is_ascii()
-            || char::decode_utf16(
-                bytes
-                    .chunks_exact(2)
-                    .map(|unit| u16::from_le_bytes([unit[0], unit[1]])),
-            )
-            .all(|unit| unit.is_ok()))
+/// Copies complete UTF-16LE code units without decoding or replacing surrogates.
+/// Capacity and truncation follow [`copy_with_nul`], in `SqlWChar` units.
+///
+/// # Safety
+/// - `dst`, if non-null, must be writable for `buf_len` `SqlWChar`s.
+/// - `dst` and `bytes` must not overlap.
+/// - `bytes` must contain an even number of bytes.
+pub(crate) unsafe fn copy_utf16le_with_nul(
+    dst: *mut SqlWChar,
+    buf_len: usize,
+    bytes: &[u8],
+) -> bool {
+    debug_assert!(bytes.len().is_multiple_of(2));
+    if dst.is_null() {
+        return false;
+    }
+    if buf_len == 0 {
+        return !bytes.is_empty();
+    }
+    let units = bytes.len() / 2;
+    let copied = units.min(buf_len - 1);
+    for (index, unit) in bytes.chunks_exact(2).take(copied).enumerate() {
+        // SAFETY: index and the terminator are within the caller's capacity;
+        // application buffers need not be aligned.
+        unsafe {
+            dst.add(index)
+                .write_unaligned(u16::from_le_bytes([unit[0], unit[1]]))
+        };
+    }
+    unsafe { dst.add(copied).write_unaligned(0) };
+    copied < units
 }
 
 /// Copies `src` into a caller buffer, NUL-terminating within the buffer.
@@ -279,27 +320,39 @@ pub(crate) fn rewrite_param_markers(sql: &str) -> (String, usize) {
 #[cfg(test)]
 mod tests {
     use super::{
-        copy_utf16_with_nul, copy_with_nul, is_valid_utf16le, read_utf16, read_utf16_attr,
-        read_utf16_long, rewrite_param_markers, write_if_some,
+        copy_utf16_with_nul, copy_utf16le_with_nul, copy_with_nul, is_high_surrogate,
+        is_low_surrogate, is_surrogate_pair, read_utf16, read_utf16_attr, read_utf16_long,
+        rewrite_param_markers, write_if_some,
     };
     use crate::api::odbc_types::{SQL_NTS, SqlInteger, SqlSmallInt, SqlWChar};
 
     #[test]
-    fn utf16le_validation_matches_every_single_code_unit() {
+    fn surrogate_checks_match_utf16_decoding() {
         for unit in 0..=u16::MAX {
-            assert_eq!(
-                is_valid_utf16le(&unit.to_le_bytes()),
-                String::from_utf16(&[unit]).is_ok(),
-                "unit={unit:#06x}"
-            );
+            let mut high_candidate = char::decode_utf16([unit, 0xDC00]);
+            let high =
+                matches!(high_candidate.next(), Some(Ok(_))) && high_candidate.next().is_none();
+            assert_eq!(is_high_surrogate(unit), high, "unit={unit:#06x}");
+            assert_eq!(is_surrogate_pair(unit, 0xDC00), high, "unit={unit:#06x}");
+
+            let mut low_candidate = char::decode_utf16([0xD800, unit]);
+            let low = matches!(low_candidate.next(), Some(Ok(_))) && low_candidate.next().is_none();
+            assert_eq!(is_low_surrogate(unit), low, "unit={unit:#06x}");
+            assert_eq!(is_surrogate_pair(0xD800, unit), low, "unit={unit:#06x}");
         }
-        assert!(is_valid_utf16le(&[]));
-        assert!(!is_valid_utf16le(b"a"));
-        assert!(!is_valid_utf16le(b"a\0b"));
     }
 
     #[test]
-    fn utf16le_validation_preserves_surrogate_pair_rules() {
+    fn utf16le_copy_preserves_every_single_code_unit() {
+        for unit in 0..=u16::MAX {
+            let mut out = [0xAAAA; 3];
+            assert!(!unsafe { copy_utf16le_with_nul(out.as_mut_ptr(), 2, &unit.to_le_bytes()) });
+            assert_eq!(out, [unit, 0, 0xAAAA], "unit={unit:#06x}");
+        }
+    }
+
+    #[test]
+    fn utf16le_copy_preserves_pairs_at_byte_offsets() {
         let units = [
             0, 0x7f, 0x80, 0xd7ff, 0xd800, 0xdbff, 0xdc00, 0xdfff, 0xe000, 0xffff,
         ];
@@ -308,11 +361,14 @@ mod tests {
                 let pair = [first, second];
                 let mut bytes = vec![0xff];
                 bytes.extend(pair.into_iter().flat_map(u16::to_le_bytes));
-                assert_eq!(
-                    is_valid_utf16le(&bytes[1..]),
-                    String::from_utf16(&pair).is_ok(),
-                    "pair={pair:x?}"
-                );
+                let mut storage = crate::test_support::AlignedBuffer([0xAA_u8; 9]);
+                let out = &mut storage.0;
+                let destination = out.as_mut_ptr().wrapping_add(1).cast::<SqlWChar>();
+                assert!(!destination.is_aligned());
+                assert!(!unsafe { copy_utf16le_with_nul(destination, 3, &bytes[1..]) });
+                assert_eq!(&out[1..5], &bytes[1..]);
+                assert_eq!(&out[5..], &[0, 0, 0xAA, 0xAA]);
+                assert_eq!(out[0], 0xAA);
             }
         }
     }
@@ -327,7 +383,8 @@ mod tests {
         fn wide_copies_respect_capacity_at_a_byte_offset() {
             for text in ["", "a", "a\u{1f600}b"] {
                 let source: Vec<u16> = text.encode_utf16().collect();
-                for direct_encoding in [false, true] {
+                let bytes: Vec<u8> = source.iter().flat_map(|unit| unit.to_le_bytes()).collect();
+                for encoding in 0..3 {
                     for capacity in 0..=source.len() + 2 {
                         let mut storage = AlignedBuffer([0xA5u8; 17]);
                         assert!(capacity * size_of::<u16>() < storage.0.len());
@@ -336,10 +393,10 @@ mod tests {
                             assert!(!ptr.is_aligned());
                             // The displaced destination has room for every declared unit.
                             let truncated = unsafe {
-                                if direct_encoding {
-                                    copy_utf16_with_nul(ptr, capacity, text)
-                                } else {
-                                    copy_with_nul(ptr, capacity, &source)
+                                match encoding {
+                                    0 => copy_with_nul(ptr, capacity, &source),
+                                    1 => copy_utf16_with_nul(ptr, capacity, text),
+                                    _ => copy_utf16le_with_nul(ptr, capacity, &bytes),
                                 }
                             };
                             assert_eq!(truncated, source.len() > capacity.saturating_sub(1));
@@ -367,16 +424,17 @@ mod tests {
         fn wide_copies_initialize_only_the_written_prefix() {
             let text = "a\u{1f600}b";
             let source: Vec<u16> = text.encode_utf16().collect();
-            for direct_encoding in [false, true] {
+            let bytes: Vec<u8> = source.iter().flat_map(|unit| unit.to_le_bytes()).collect();
+            for encoding in 0..3 {
                 for capacity in [0usize, 1, 2, 5] {
                     let mut storage = [MaybeUninit::<u16>::uninit(); 5];
                     let ptr = storage.as_mut_ptr().cast::<u16>();
                     // The output is writable but has no initialized value to read.
                     let truncated = unsafe {
-                        if direct_encoding {
-                            copy_utf16_with_nul(ptr, capacity, text)
-                        } else {
-                            copy_with_nul(ptr, capacity, &source)
+                        match encoding {
+                            0 => copy_with_nul(ptr, capacity, &source),
+                            1 => copy_utf16_with_nul(ptr, capacity, text),
+                            _ => copy_utf16le_with_nul(ptr, capacity, &bytes),
                         }
                     };
                     assert_eq!(truncated, source.len() > capacity.saturating_sub(1));
