@@ -24,14 +24,26 @@ steps:
 
 - ${{ if eq(parameters.installDocker, true) }}:
   - script: |
+      # Only ARM has ever needed this; the x64 images ship a docker daemon.
       ARCH=$(arch)
-      if [ "$ARCH" = "aarch64" ]; then
-          export DEBIAN_FRONTEND=noninteractive
+      if [ "$ARCH" = "aarch64" ] && ! command -v docker >/dev/null 2>&1; then
           echo "Docker not found, installing..."
-          sudo apt-get update
-          sudo apt-get install docker.io -y
+          if command -v apt-get >/dev/null 2>&1; then
+              export DEBIAN_FRONTEND=noninteractive
+              sudo apt-get update
+              sudo apt-get install docker.io -y
+          elif command -v tdnf >/dev/null 2>&1; then
+              sudo tdnf install moby-engine moby-cli -y
+              sudo systemctl enable --now docker
+          elif command -v dnf >/dev/null 2>&1; then
+              sudo dnf install moby-engine moby-cli -y
+              sudo systemctl enable --now docker
+          else
+              echo "ERROR: no supported package manager to install docker"
+              exit 1
+          fi
+          sudo groupadd -f docker
           sudo usermod -aG docker $USER
-          sudo groupadd docker
       fi
       echo "Changing permissions for docker.sock"
       sudo chmod 666 /var/run/docker.sock
