@@ -5,13 +5,10 @@
 //!
 //! The [`TlsEngine`] trait separates *which* TLS implementation runs the
 //! handshake from the surrounding TDS plumbing (prelogin framing,
-//! connection-state callbacks, certificate-pinning hooks). Today there is
-//! exactly one implementation: [`native_tls_engine::NativeTlsEngine`].
-//! A subsequent PR in this stack will add a Windows-only Schannel-direct
-//! engine and route to it on `cfg(windows)` from [`default_engine`].
-//!
-//! This module is purely a refactor — no behavior changes.
+//! connection-state callbacks, certificate-pinning hooks). Windows uses the
+//! Schannel-direct engine by default; other configurations use native-tls.
 
+#[cfg(any(test, not(all(windows, feature = "tls-schannel-direct"))))]
 pub(crate) mod native_tls_engine;
 
 use crate::connection::transport::network_transport::Stream;
@@ -67,13 +64,9 @@ pub(crate) trait TlsEngine: Send + Sync {
 /// Returns the default TLS engine for this platform.
 ///
 /// On Windows, returns the in-tree Schannel-direct engine when the
-/// `tls-schannel-direct` feature is enabled (default) and no custom CA
-/// trust root is configured. On all other platforms, when the feature is
-/// disabled, and for connections with a custom CA, returns the
-/// `native-tls`-backed engine.
-///
-/// Note: the `native-tls` engine does not expose TLS channel bindings, so
-/// custom-CA connections cannot satisfy Extended Protection.
+/// `tls-schannel-direct` feature is enabled (default), including connections
+/// with custom CA roots. On other platforms or when the feature is disabled,
+/// returns the `native-tls`-backed engine.
 ///
 /// The Schannel-direct engine fixes two Windows-only TLS bugs that
 /// produced the bulkcopy timeout regression observed in production:
@@ -82,22 +75,13 @@ pub(crate) trait TlsEngine: Send + Sync {
 /// waker-park race in `tokio-native-tls`. See
 /// `.github/prompts/plan-decoupleTlsBackendSchannelOdbcParity.prompt.md`
 /// for the full analysis.
-pub(crate) fn default_engine(validation: &TlsValidationConfig) -> &'static dyn TlsEngine {
+pub(crate) fn default_engine(_validation: &TlsValidationConfig) -> &'static dyn TlsEngine {
     #[cfg(all(windows, feature = "tls-schannel-direct"))]
     {
-        // The Schannel-direct engine has no hook for supplemental trust
-        // roots, so connections configured with a custom CA use the
-        // native-tls engine (Schannel-backed on Windows), which adds the
-        // CA to an in-memory store scoped to the connector.
-        if validation.server_ca_path.is_none() {
-            return &crate::connection::transport::win_tls::engine::SCHANNEL_ENGINE;
-        }
-        tracing::warn!(
-            "ServerCA is configured: using the native-tls engine instead of the Schannel-direct engine. \
-             TLS channel bindings are unavailable on this path, so integrated authentication against a \
-             server requiring Extended Protection will fail."
-        );
+        &crate::connection::transport::win_tls::engine::SCHANNEL_ENGINE
     }
-    let _ = validation;
-    &native_tls_engine::NATIVE_TLS_ENGINE
+    #[cfg(not(all(windows, feature = "tls-schannel-direct")))]
+    {
+        &native_tls_engine::NATIVE_TLS_ENGINE
+    }
 }

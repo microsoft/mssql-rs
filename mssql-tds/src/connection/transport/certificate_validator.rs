@@ -77,15 +77,14 @@ pub fn load_certificate_from_file(path: &Path) -> TdsResult<Vec<u8>> {
 pub fn load_ca_certificates_from_file(path: &Path) -> TdsResult<Vec<Certificate>> {
     debug!("Loading CA certificate(s) from file: {path:?}");
 
-    if !path.exists() {
-        return Err(Error::CertificateNotFound {
+    let cert_data = fs::read(path).map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => Error::CertificateNotFound {
             path: path.to_path_buf(),
-        });
-    }
-
-    let cert_data = fs::read(path).map_err(|e| Error::CertificateFileIoError {
-        path: path.to_path_buf(),
-        error: e.to_string(),
+        },
+        _ => Error::CertificateFileIoError {
+            path: path.to_path_buf(),
+            error: e.to_string(),
+        },
     })?;
 
     let invalid_format = || Error::InvalidCertificateFormat {
@@ -449,6 +448,27 @@ mod tests {
         assert!(matches!(
             load_ca_certificates_from_file(path),
             Err(Error::CertificateNotFound { .. })
+        ));
+    }
+
+    #[test]
+    fn test_load_ca_certificates_io_error() {
+        let directory = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            load_ca_certificates_from_file(directory.path()),
+            Err(Error::CertificateFileIoError { .. })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_load_ca_certificates_metadata_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("loop.pem");
+        std::os::unix::fs::symlink("loop.pem", &path).unwrap();
+        assert!(matches!(
+            load_ca_certificates_from_file(&path),
+            Err(Error::CertificateFileIoError { .. })
         ));
     }
 

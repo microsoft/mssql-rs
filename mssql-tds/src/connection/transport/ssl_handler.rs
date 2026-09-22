@@ -84,22 +84,7 @@ impl SslHandler {
         base_stream: Box<dyn Stream>,
         negotiated_encryption: NegotiatedEncryptionSetting,
     ) -> TdsResult<Box<dyn Stream>> {
-        // ServerCA requires the validation it asks for, so conflicting options
-        // that would disable or replace chain validation are rejected.
-        if self.encryption_options.server_ca.is_some() {
-            if self.encryption_options.trust_server_certificate {
-                return Err(crate::error::Error::UsageError(
-                    "ServerCA and TrustServerCertificate are mutually exclusive. TrustServerCertificate would disable the requested CA validation."
-                        .to_string(),
-                ));
-            }
-            if self.encryption_options.server_certificate.is_some() {
-                return Err(crate::error::Error::UsageError(
-                    "ServerCA and ServerCertificate are mutually exclusive. Use ServerCA to trust an issuing CA or ServerCertificate to pin a certificate."
-                        .to_string(),
-                ));
-            }
-        }
+        self.encryption_options.validate()?;
 
         // Check if ServerCertificate and TrustServerCertificate are both specified
         if self.encryption_options.server_certificate.is_some()

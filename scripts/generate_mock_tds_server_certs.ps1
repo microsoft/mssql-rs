@@ -101,8 +101,7 @@ catch {
 }
 
 # Generate the ServerCA fixtures: a private CA, a leaf issued by it, and an
-# unrelated CA. Failures here are reported but do not fail the script, so the
-# self-signed fixtures above stay usable.
+# unrelated CA.
 try {
     $CaCertPath = Join-Path $CertDir "ca_cert.pem"
     $CaKeyPath = Join-Path $CertDir "ca_key.pem"
@@ -208,7 +207,8 @@ try {
     $leafWithKey.Dispose()
 }
 catch {
-    Write-Warning "Failed to generate ServerCA test certificates: $_"
+    Write-Error "Failed to generate ServerCA test certificates: $_"
+    exit 1
 }
 
 Write-Host "Test certificates generated in $CertDir`:"

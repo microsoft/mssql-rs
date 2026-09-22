@@ -249,6 +249,24 @@ pub struct EncryptionOptions {
 }
 
 impl EncryptionOptions {
+    pub(crate) fn validate(&self) -> TdsResult<()> {
+        if self.server_ca.is_some() {
+            if self.trust_server_certificate {
+                return Err(crate::error::Error::UsageError(
+                    "ServerCA and TrustServerCertificate are mutually exclusive. TrustServerCertificate would disable the requested CA validation."
+                        .to_string(),
+                ));
+            }
+            if self.server_certificate.is_some() {
+                return Err(crate::error::Error::UsageError(
+                    "ServerCA and ServerCertificate are mutually exclusive. Use ServerCA to trust an issuing CA or ServerCertificate to pin a certificate."
+                        .to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Creates encryption options defaulting to `Strict` mode.
     pub fn new() -> Self {
         EncryptionOptions {

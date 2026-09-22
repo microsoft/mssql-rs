@@ -14,10 +14,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   (certificate pinning) it keeps chain, validity and host name validation
   enabled, so a private CA can be trusted without installing it system wide.
   Combining it with `trust_server_certificate` or `server_certificate` is
-  rejected with a usage error. On Windows such connections use the `native-tls`
-  engine, which does not expose TLS channel bindings, so they cannot satisfy
-  Extended Protection. Also exposed as the `server_ca` connection keyword in
-  `mssql-py-core`.
+  rejected with a usage error. On Windows the default Schannel-direct engine
+  retains TLS channel bindings with custom CA roots. The Python binding sets
+  `server_ca` to `None`; it does not expose a custom-CA connection keyword.
 
 - `mssql-odbc`: input parameter binding (`SQLBindParameter` with
   `SQL_PARAM_INPUT`) for the character and integer type families. Any other

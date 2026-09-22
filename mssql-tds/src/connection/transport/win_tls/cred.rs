@@ -248,7 +248,7 @@ fn cred_flags_for(kind: CredKind) -> u32 {
 /// care (e.g. `TrustServerCertificate=Yes` against a self-signed cert
 /// whose CN does not match the connect string). Differentiating the
 /// dwFlags per kind avoids that.
-fn acquire_client_cred(kind: CredKind) -> io::Result<CredHandle> {
+pub(crate) fn acquire_client_cred(kind: CredKind) -> io::Result<CredHandle> {
     let cred_flags = cred_flags_for(kind);
 
     // SAFETY: all pointers below are either valid Rust references or the

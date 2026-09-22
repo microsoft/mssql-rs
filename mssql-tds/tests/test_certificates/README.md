@@ -28,6 +28,8 @@ An invalid file that doesn't contain a valid certificate, used to test error han
 ## Generating Test Certificates
 
 Before running TLS tests, generate the test certificates locally.
+The ServerCA tests require these fixtures on every platform; missing, unreadable,
+or malformed files fail the tests rather than silently skipping TLS coverage.
 
 ### From repository root (recommended for CI/CD):
 

@@ -259,17 +259,12 @@ impl PyCoreConnection {
             .get_item("server_certificate")?
             .and_then(|v| v.extract::<PathBuf>().ok());
 
-        // ServerCA - path to a CA certificate trusted to issue the server certificate
-        let server_ca = dict
-            .get_item("server_ca")?
-            .and_then(|v| v.extract::<PathBuf>().ok());
-
         let encryption_options = EncryptionOptions {
             mode: encryption_mode,
             trust_server_certificate,
             host_name_in_cert,
             server_certificate,
-            server_ca,
+            server_ca: None,
         };
 
         // Parse application intent (case-insensitive)
