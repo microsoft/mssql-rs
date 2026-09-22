@@ -11,11 +11,18 @@ from importlib.metadata import PackagePath
 from pathlib import Path
 
 import pytest
+import yaml
 
 _SCRIPT = Path(__file__).with_name("test-python-wheel-install.py")
 _LINUX_SCRIPT = Path(__file__).with_name("test-python-wheel-installs-linux.sh")
 _VERIFY_WHEELS_SCRIPT = (
     Path(__file__).parents[1] / ".pipeline" / "scripts" / "verify-python-wheels.ps1"
+)
+_WHEEL_INSTALL_TEMPLATE = (
+    Path(__file__).parents[1]
+    / ".pipeline"
+    / "templates"
+    / "test-python-wheel-installs-template.yml"
 )
 _SPEC = importlib.util.spec_from_file_location("wheel_install", _SCRIPT)
 assert _SPEC and _SPEC.loader
@@ -52,20 +59,16 @@ def test_linux_installs_use_mirrored_consumer_images() -> None:
 
 
 def test_linux_installs_cover_release_matrix() -> None:
-    """The Linux install-test matrix must track verify-python-wheels.ps1, the
-    canonical source the release gate enforces - not restate its own literals.
-    The wheel is a single stable-ABI (cp310-abi3) build per platform, so there
-    is no per-version tag list left to check the platform script's interpreter
-    list against; the floor of that list must still match the wheel's
-    declared Requires-Python minimum."""
+    """The Linux install-test matrix must track the same canonical sources as
+    the Windows/macOS side, not restate its own literals. The wheel is a
+    single stable-ABI (cp310-abi3) build per platform, so there is no
+    per-version wheel-tag list left in verify-python-wheels.ps1; instead, tie
+    the Linux interpreter list to the install template's own `pythonVersions`
+    default - the same source that already gates Windows/macOS - so all
+    three platforms move together and a narrowed or drifted Linux matrix is
+    caught."""
     script = _LINUX_SCRIPT.read_text(encoding="utf-8")
     ps1 = _VERIFY_WHEELS_SCRIPT.read_text(encoding="utf-8")
-
-    floor_match = re.search(r"-ne\s+'>=(3\.\d+)'", ps1)
-    assert (
-        floor_match
-    ), "could not find the Requires-Python floor in verify-python-wheels.ps1"
-    floor_minor = int(floor_match[1].split(".")[1])
 
     platforms_match = re.search(r"\$platforms\s*=\s*@\((.*?)\)", ps1, re.DOTALL)
     assert platforms_match
@@ -81,13 +84,17 @@ def test_linux_installs_cover_release_matrix() -> None:
     script_platform_tags_match = re.search(r"PLATFORM_TAGS=\(([^)]*)\)", script)
     assert script_platform_tags_match
 
-    script_python_minors = [
-        int(tag.removeprefix("cp3")) for tag in script_python_tags_match[1].split()
-    ]
-    assert min(script_python_minors) == floor_minor, (
-        "the lowest interpreter this script install-tests must match the "
-        "wheel's Requires-Python floor enforced by verify-python-wheels.ps1"
+    install_template = yaml.safe_load(
+        _WHEEL_INSTALL_TEMPLATE.read_text(encoding="utf-8")
     )
+    default_versions = next(
+        parameter["default"]
+        for parameter in install_template["parameters"]
+        if parameter["name"] == "pythonVersions"
+    )
+    assert set(script_python_tags_match[1].split()) == {
+        "cp" + version.replace(".", "") for version in default_versions
+    }
     assert set(script_platform_tags_match[1].split()) == canonical_platform_prefixes
     assert 'for platform_tag in "${PLATFORM_TAGS[@]}"' in script
 
