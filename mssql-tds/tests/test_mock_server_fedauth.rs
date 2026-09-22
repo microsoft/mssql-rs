@@ -93,6 +93,7 @@ mod mock_server_fedauth_tests {
             trust_server_certificate: true,
             host_name_in_cert: None,
             server_certificate: None,
+            server_ca: None,
         };
 
         // Connect to mock server
@@ -177,6 +178,7 @@ mod mock_server_fedauth_tests {
             trust_server_certificate: true,
             host_name_in_cert: None,
             server_certificate: None,
+            server_ca: None,
         };
 
         // Connect and execute query
@@ -260,6 +262,7 @@ mod mock_server_fedauth_tests {
             trust_server_certificate: true,
             host_name_in_cert: None,
             server_certificate: None,
+            server_ca: None,
         };
 
         // This should succeed if FedAuth negotiation works
@@ -344,6 +347,7 @@ mod mock_server_fedauth_tests {
             trust_server_certificate: true,
             host_name_in_cert: None,
             server_certificate: None,
+            server_ca: None,
         };
 
         let provider = TdsConnectionProvider {};
@@ -413,6 +417,7 @@ mod mock_server_fedauth_tests {
             trust_server_certificate: true,
             host_name_in_cert: None,
             server_certificate: None,
+            server_ca: None,
         };
         context.auth_method_map.insert(
             TdsAuthenticationMethod::ActiveDirectoryServicePrincipal,
@@ -502,6 +507,7 @@ mod mock_server_fedauth_tests {
             trust_server_certificate: true,
             host_name_in_cert: None,
             server_certificate: None,
+            server_ca: None,
         };
 
         let provider = TdsConnectionProvider {};

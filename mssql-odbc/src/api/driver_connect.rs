@@ -397,6 +397,7 @@ fn do_connect(
         mode: encryption_setting(params.encrypt.as_deref()),
         host_name_in_cert: None,
         server_certificate: None,
+        server_ca: None,
     };
 
     seed_and_apply_connection_params(&mut context, state.packet_size, &params);

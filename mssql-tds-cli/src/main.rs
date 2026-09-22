@@ -167,6 +167,7 @@ pub async fn main_cli() -> Result<(), Box<dyn std::error::Error>> {
         trust_server_certificate: true,
         host_name_in_cert: None,
         server_certificate: None,
+        server_ca: None,
     };
     let provider = TdsConnectionProvider {};
     let datasource = "tcp:localhost,1433";

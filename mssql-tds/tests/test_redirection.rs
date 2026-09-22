@@ -23,6 +23,7 @@ mod redirection_tests {
             trust_server_certificate: true,
             host_name_in_cert: None,
             server_certificate: None,
+            server_ca: None,
         };
         context.connect_timeout = 30;
         context

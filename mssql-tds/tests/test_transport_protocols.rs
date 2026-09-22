@@ -69,6 +69,7 @@ mod transport_protocols {
             trust_server_certificate: trust_server_certificate(),
             host_name_in_cert: get_cert_hostname(),
             server_certificate: None,
+            server_ca: None,
         };
 
         let provider = TdsConnectionProvider {};
@@ -91,6 +92,7 @@ mod transport_protocols {
             trust_server_certificate: trust_server_certificate(),
             host_name_in_cert: get_cert_hostname(),
             server_certificate: None,
+            server_ca: None,
         };
 
         let provider = TdsConnectionProvider {};

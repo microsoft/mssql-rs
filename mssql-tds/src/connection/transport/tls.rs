@@ -24,6 +24,10 @@ pub(crate) struct TlsValidationConfig {
     pub accept_invalid_certs: bool,
     pub accept_invalid_hostnames: bool,
     pub use_alpn: bool,
+    /// Optional path to a CA certificate (or PEM bundle) added to this
+    /// connection's trust roots on top of the platform roots. Chain and
+    /// host name validation remain enabled.
+    pub server_ca_path: Option<std::path::PathBuf>,
 }
 
 /// Inputs passed to [`TlsEngine::connect`] for a single handshake.
@@ -62,9 +66,10 @@ pub(crate) trait TlsEngine: Send + Sync {
 
 /// Returns the default TLS engine for this platform.
 ///
-/// On Windows, returns the in-tree Schannel-direct engine
-/// when the `tls-schannel-direct` feature is enabled (default). On all
-/// other platforms and when the feature is disabled, returns the
+/// On Windows, returns the in-tree Schannel-direct engine when the
+/// `tls-schannel-direct` feature is enabled (default) and no custom CA
+/// trust root is configured. On all other platforms, when the feature is
+/// disabled, and for connections with a custom CA, returns the
 /// `native-tls`-backed engine.
 ///
 /// The Schannel-direct engine fixes two Windows-only TLS bugs that
@@ -74,11 +79,18 @@ pub(crate) trait TlsEngine: Send + Sync {
 /// waker-park race in `tokio-native-tls`. See
 /// `.github/prompts/plan-decoupleTlsBackendSchannelOdbcParity.prompt.md`
 /// for the full analysis.
-pub(crate) fn default_engine() -> &'static dyn TlsEngine {
+pub(crate) fn default_engine(validation: &TlsValidationConfig) -> &'static dyn TlsEngine {
     #[cfg(all(windows, feature = "tls-schannel-direct"))]
     {
-        return &crate::connection::transport::win_tls::engine::SCHANNEL_ENGINE;
+        // The Schannel-direct engine has no hook for supplemental trust
+        // roots, so connections configured with a custom CA use the
+        // native-tls engine (Schannel-backed on Windows), which adds the
+        // CA to an in-memory store scoped to the connector.
+        if validation.server_ca_path.is_none() {
+            return &crate::connection::transport::win_tls::engine::SCHANNEL_ENGINE;
+        }
     }
+    let _ = validation;
     #[allow(unreachable_code)]
     {
         &native_tls_engine::NATIVE_TLS_ENGINE

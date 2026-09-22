@@ -54,6 +54,7 @@ fn make_context() -> ClientContext {
         trust_server_certificate: true,
         host_name_in_cert: None,
         server_certificate: None,
+        server_ca: None,
     };
     context
 }

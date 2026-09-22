@@ -100,6 +100,7 @@ mod connectivity {
             trust_server_certificate: false,
             host_name_in_cert: env::var("CERT_HOST_NAME").ok(),
             server_certificate: None,
+            server_ca: None,
         };
         context.tds_authentication_method = TdsAuthenticationMethod::AccessToken;
         context.access_token = Some(access_token);
@@ -131,6 +132,7 @@ mod connectivity {
             trust_server_certificate: false,
             host_name_in_cert: env::var("CERT_HOST_NAME").ok(),
             server_certificate: None,
+            server_ca: None,
         };
         context.tds_authentication_method = auth_method;
         context.auth_method_map = auth_method_map;

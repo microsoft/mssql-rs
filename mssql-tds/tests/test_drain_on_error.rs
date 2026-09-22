@@ -80,6 +80,7 @@ mod drain_on_error_tests {
             trust_server_certificate: true,
             host_name_in_cert: None,
             server_certificate: None,
+            server_ca: None,
         };
 
         let provider = TdsConnectionProvider {};

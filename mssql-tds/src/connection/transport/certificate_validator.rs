@@ -65,6 +65,76 @@ pub fn load_certificate_from_file(path: &Path) -> TdsResult<Vec<u8>> {
     Ok(der_data)
 }
 
+/// Load one or more CA certificates from a file for use as custom trust roots.
+/// Accepts a PEM file (single certificate or bundle) or a single DER certificate.
+///
+/// # Arguments
+/// * `path` - Path to the CA certificate file
+///
+/// # Returns
+/// * `Ok(Vec<Certificate>)` - Parsed CA certificates, in file order
+/// * `Err(Error)` - File not found, IO error, or invalid format
+pub fn load_ca_certificates_from_file(path: &Path) -> TdsResult<Vec<Certificate>> {
+    debug!("Loading CA certificate(s) from file: {path:?}");
+
+    if !path.exists() {
+        return Err(Error::CertificateNotFound {
+            path: path.to_path_buf(),
+        });
+    }
+
+    let cert_data = fs::read(path).map_err(|e| Error::CertificateFileIoError {
+        path: path.to_path_buf(),
+        error: e.to_string(),
+    })?;
+
+    let invalid_format = || Error::InvalidCertificateFormat {
+        path: path.to_path_buf(),
+    };
+
+    let certificates = if let Some(pem_blocks) = split_pem_certificates(&cert_data) {
+        pem_blocks
+            .iter()
+            .map(|block| Certificate::from_pem(block).map_err(|_| invalid_format()))
+            .collect::<TdsResult<Vec<_>>>()?
+    } else {
+        vec![Certificate::from_der(&cert_data).map_err(|_| invalid_format())?]
+    };
+
+    if certificates.is_empty() {
+        return Err(invalid_format());
+    }
+
+    info!(
+        "Successfully loaded {} CA certificate(s) from: {path:?}",
+        certificates.len()
+    );
+    Ok(certificates)
+}
+
+/// Split PEM data into individual certificate blocks so bundles are fully
+/// loaded (`Certificate::from_pem` only parses the first block).
+/// Returns `None` when the data contains no PEM certificate header.
+fn split_pem_certificates(data: &[u8]) -> Option<Vec<Vec<u8>>> {
+    const BEGIN: &str = "-----BEGIN CERTIFICATE-----";
+    const END: &str = "-----END CERTIFICATE-----";
+
+    let text = std::str::from_utf8(data).ok()?;
+    if !text.contains(BEGIN) {
+        return None;
+    }
+
+    let mut blocks = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find(BEGIN) {
+        let after_begin = &rest[start..];
+        let end = after_begin.find(END)? + END.len();
+        blocks.push(after_begin[..end].as_bytes().to_vec());
+        rest = &after_begin[end..];
+    }
+    Some(blocks)
+}
+
 /// Check if a certificate has expired.
 /// Uses the X.509 notAfter field to determine expiry.
 ///
@@ -339,5 +409,73 @@ mod tests {
             constant_time_compare(&a, &b),
             "Empty slices should compare equal"
         );
+    }
+
+    #[test]
+    fn test_load_ca_certificates_from_pem() {
+        let certs = load_ca_certificates_from_file(Path::new(
+            "tests/test_certificates/valid_cert.pem",
+        ))
+        .expect("PEM CA certificate should load");
+        assert_eq!(certs.len(), 1);
+    }
+
+    #[test]
+    fn test_load_ca_certificates_from_der() {
+        let certs =
+            load_ca_certificates_from_file(Path::new("tests/test_certificates/valid_cert.der"))
+                .expect("DER CA certificate should load");
+        assert_eq!(certs.len(), 1);
+    }
+
+    #[test]
+    fn test_load_ca_certificates_from_pem_bundle() {
+        let single = fs::read("tests/test_certificates/valid_cert.pem")
+            .expect("test certificate should exist");
+        let bundle_path = std::env::temp_dir().join("mssql_tds_ca_bundle_test.pem");
+        let mut bundle = single.clone();
+        bundle.extend_from_slice(&single);
+        fs::write(&bundle_path, &bundle).expect("bundle should be writable");
+
+        let certs =
+            load_ca_certificates_from_file(&bundle_path).expect("PEM bundle should load fully");
+        assert_eq!(certs.len(), 2);
+
+        let _ = fs::remove_file(&bundle_path);
+    }
+
+    #[test]
+    fn test_load_ca_certificates_not_found() {
+        let path = Path::new("/nonexistent/path/ca.pem");
+        assert!(matches!(
+            load_ca_certificates_from_file(path),
+            Err(Error::CertificateNotFound { .. })
+        ));
+    }
+
+    #[test]
+    fn test_load_ca_certificates_invalid_format() {
+        let path = Path::new("tests/test_certificates/invalid_format.txt");
+        assert!(matches!(
+            load_ca_certificates_from_file(path),
+            Err(Error::InvalidCertificateFormat { .. })
+        ));
+    }
+
+    #[test]
+    fn test_load_ca_certificates_truncated_pem() {
+        let truncated_path = std::env::temp_dir().join("mssql_tds_ca_truncated_test.pem");
+        fs::write(
+            &truncated_path,
+            b"-----BEGIN CERTIFICATE-----\nnot a certificate\n",
+        )
+        .expect("file should be writable");
+
+        assert!(matches!(
+            load_ca_certificates_from_file(&truncated_path),
+            Err(Error::InvalidCertificateFormat { .. })
+        ));
+
+        let _ = fs::remove_file(&truncated_path);
     }
 }

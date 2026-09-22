@@ -91,6 +91,7 @@ async fn test_windows_integrated_auth_connection() -> TdsResult<()> {
         trust_server_certificate: true,
         host_name_in_cert: None,
         server_certificate: None,
+        server_ca: None,
     };
 
     let provider = TdsConnectionProvider {};
@@ -152,6 +153,7 @@ async fn test_localdb_integrated_auth_connection() -> TdsResult<()> {
         trust_server_certificate: true,
         host_name_in_cert: None,
         server_certificate: None,
+        server_ca: None,
     };
 
     let provider = TdsConnectionProvider {};
@@ -225,6 +227,7 @@ async fn test_ssrp_named_pipe_integrated_auth() -> TdsResult<()> {
         trust_server_certificate: true,
         host_name_in_cert: None,
         server_certificate: None,
+        server_ca: None,
     };
 
     let provider = TdsConnectionProvider {};
@@ -266,6 +269,7 @@ async fn connect_and_get_transport(datasource: &str) -> TdsResult<String> {
         trust_server_certificate: true,
         host_name_in_cert: None,
         server_certificate: None,
+        server_ca: None,
     };
 
     let provider = TdsConnectionProvider {};
@@ -354,6 +358,7 @@ async fn test_sspi_localhost_select_one() -> TdsResult<()> {
         trust_server_certificate: true,
         host_name_in_cert: None,
         server_certificate: None,
+        server_ca: None,
     };
 
     let provider = TdsConnectionProvider {};
@@ -406,6 +411,7 @@ async fn test_sspi_named_instance_select_one() -> TdsResult<()> {
         trust_server_certificate: true,
         host_name_in_cert: None,
         server_certificate: None,
+        server_ca: None,
     };
 
     let provider = TdsConnectionProvider {};

@@ -54,6 +54,11 @@ fn get_or_build_connector(
     if validation.use_alpn {
         builder.request_alpns(&[TDS_8_ALPN_PROTOCOL]);
     }
+    if let Some(ca_path) = validation.server_ca_path.as_deref() {
+        for certificate in certificate_validator::load_ca_certificates_from_file(ca_path)? {
+            builder.add_root_certificate(certificate);
+        }
+    }
     let connector = builder.build()?;
 
     CONNECTOR_CACHE
@@ -182,6 +187,7 @@ mod tests {
             accept_invalid_certs: certs,
             accept_invalid_hostnames: hosts,
             use_alpn: alpn,
+            server_ca_path: None,
         }
     }
 

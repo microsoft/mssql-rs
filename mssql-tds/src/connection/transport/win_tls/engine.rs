@@ -145,6 +145,7 @@ mod tests {
             accept_invalid_certs: true,
             accept_invalid_hostnames: false,
             use_alpn: false,
+            server_ca_path: None,
         };
         assert_eq!(pick_cred_kind(&validation, false), CredKind::NoValidate);
     }
@@ -159,6 +160,7 @@ mod tests {
             accept_invalid_certs: true,
             accept_invalid_hostnames: true,
             use_alpn: false,
+            server_ca_path: None,
         };
         assert_eq!(pick_cred_kind(&validation, true), CredKind::ManualValidate);
     }
@@ -169,6 +171,7 @@ mod tests {
             accept_invalid_certs: false,
             accept_invalid_hostnames: false,
             use_alpn: false,
+            server_ca_path: None,
         };
         assert_eq!(pick_cred_kind(&validation, true), CredKind::ManualValidate);
     }
@@ -179,6 +182,7 @@ mod tests {
             accept_invalid_certs: false,
             accept_invalid_hostnames: false,
             use_alpn: false,
+            server_ca_path: None,
         };
         assert_eq!(pick_cred_kind(&validation, false), CredKind::AutoValidate);
     }
@@ -203,6 +207,7 @@ mod tests {
             accept_invalid_certs: true,
             accept_invalid_hostnames: false,
             use_alpn: true,
+            server_ca_path: None,
         };
         let params = TlsConnectParams {
             validation: &validation,

@@ -240,6 +240,12 @@ pub struct EncryptionOptions {
     /// When specified, the driver performs an exact binary match between the provided
     /// certificate and the server's certificate, bypassing standard CA chain validation.
     pub server_certificate: Option<PathBuf>,
+    /// Path to a DER or PEM encoded X.509 CA certificate (or PEM bundle) trusted
+    /// to issue the server's certificate. The certificates are added to the trust
+    /// roots of this connection only, supplementing the platform roots. Standard
+    /// chain, validity and host name validation stay enabled. Mutually exclusive
+    /// with `trust_server_certificate` and `server_certificate`.
+    pub server_ca: Option<PathBuf>,
 }
 
 impl EncryptionOptions {
@@ -250,6 +256,7 @@ impl EncryptionOptions {
             trust_server_certificate: false,
             host_name_in_cert: None,
             server_certificate: None,
+            server_ca: None,
         }
     }
 }

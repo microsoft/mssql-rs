@@ -38,6 +38,7 @@ fn sql_auth_context(trust_cert: bool, encryption: EncryptionSetting) -> ClientCo
         trust_server_certificate: trust_cert,
         host_name_in_cert: None,
         server_certificate: None,
+        server_ca: None,
     };
     ctx
 }

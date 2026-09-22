@@ -70,6 +70,7 @@ mod no_protocol_resolution {
             trust_server_certificate: trust_server_certificate(),
             host_name_in_cert: get_cert_hostname(),
             server_certificate: None,
+            server_ca: None,
         };
 
         let provider = TdsConnectionProvider {};
@@ -96,6 +97,7 @@ mod no_protocol_resolution {
             trust_server_certificate: trust_cert,
             host_name_in_cert: get_cert_hostname(),
             server_certificate: None,
+            server_ca: None,
         };
 
         let provider = TdsConnectionProvider {};

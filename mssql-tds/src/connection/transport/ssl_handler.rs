@@ -32,12 +32,24 @@ impl SslHandler {
     ) -> TlsValidationConfig {
         let use_alpn = negotiated_encryption == NegotiatedEncryptionSetting::Strict;
 
-        if encryption_options.server_certificate.is_some() {
+        let server_ca_path = encryption_options.server_ca.clone();
+
+        if server_ca_path.is_some() {
+            // Custom trust root: full chain and host name validation against
+            // the platform roots plus the supplied CA.
+            TlsValidationConfig {
+                accept_invalid_certs: false,
+                accept_invalid_hostnames: false,
+                use_alpn,
+                server_ca_path,
+            }
+        } else if encryption_options.server_certificate.is_some() {
             // Certificate pinning mode: bypass CA validation, custom check later
             TlsValidationConfig {
                 accept_invalid_certs: true,
                 accept_invalid_hostnames: true,
                 use_alpn,
+                server_ca_path,
             }
         } else if negotiated_encryption == NegotiatedEncryptionSetting::LoginOnly {
             // ODBC parity: LoginOnly skips cert validation unconditionally
@@ -45,6 +57,7 @@ impl SslHandler {
                 accept_invalid_certs: true,
                 accept_invalid_hostnames: false,
                 use_alpn,
+                server_ca_path,
             }
         } else if encryption_options.trust_server_certificate
             && encryption_options.mode != EncryptionSetting::Strict
@@ -53,12 +66,14 @@ impl SslHandler {
                 accept_invalid_certs: true,
                 accept_invalid_hostnames: false,
                 use_alpn,
+                server_ca_path,
             }
         } else {
             TlsValidationConfig {
                 accept_invalid_certs: false,
                 accept_invalid_hostnames: false,
                 use_alpn,
+                server_ca_path,
             }
         }
     }
@@ -68,6 +83,23 @@ impl SslHandler {
         base_stream: Box<dyn Stream>,
         negotiated_encryption: NegotiatedEncryptionSetting,
     ) -> TdsResult<Box<dyn Stream>> {
+        // ServerCA requires the validation it asks for, so conflicting options
+        // that would disable or replace chain validation are rejected.
+        if self.encryption_options.server_ca.is_some() {
+            if self.encryption_options.trust_server_certificate {
+                return Err(crate::error::Error::UsageError(
+                    "ServerCA and TrustServerCertificate are mutually exclusive. TrustServerCertificate would disable the requested CA validation."
+                        .to_string(),
+                ));
+            }
+            if self.encryption_options.server_certificate.is_some() {
+                return Err(crate::error::Error::UsageError(
+                    "ServerCA and ServerCertificate are mutually exclusive. Use ServerCA to trust an issuing CA or ServerCertificate to pin a certificate."
+                        .to_string(),
+                ));
+            }
+        }
+
         // Check if ServerCertificate and TrustServerCertificate are both specified
         if self.encryption_options.server_certificate.is_some()
             && self.encryption_options.trust_server_certificate
@@ -115,10 +147,11 @@ impl SslHandler {
             );
 
         info!(
-            "TLS config: encryption_mode={:?}, trust_server_certificate={}, server_certificate={:?}, host_name_in_cert={:?}, resolved_host_name={}, server_host_name={}",
+            "TLS config: encryption_mode={:?}, trust_server_certificate={}, server_certificate={:?}, server_ca={:?}, host_name_in_cert={:?}, resolved_host_name={}, server_host_name={}",
             self.encryption_options.mode,
             self.encryption_options.trust_server_certificate,
             self.encryption_options.server_certificate,
+            self.encryption_options.server_ca,
             self.encryption_options.host_name_in_cert,
             host_name,
             self.server_host_name,
@@ -131,7 +164,7 @@ impl SslHandler {
             server_certificate_path: self.encryption_options.server_certificate.as_ref(),
         };
 
-        default_engine().connect(base_stream, params).await
+        default_engine(&validation).connect(base_stream, params).await
     }
 }
 
@@ -693,6 +726,7 @@ mod tests {
             trust_server_certificate: false,
             host_name_in_cert: None,
             server_certificate: None,
+            server_ca: None,
         }
     }
 
@@ -809,5 +843,76 @@ mod tests {
         assert!(config.use_alpn);
         assert!(config.accept_invalid_certs);
         assert!(config.accept_invalid_hostnames);
+    }
+
+    #[test]
+    fn server_ca_keeps_full_validation() {
+        let mut opts = default_options();
+        opts.server_ca = Some("ca.pem".into());
+        let config =
+            SslHandler::resolve_tls_validation(&opts, NegotiatedEncryptionSetting::Mandatory);
+        assert!(!config.accept_invalid_certs);
+        assert!(!config.accept_invalid_hostnames);
+        assert_eq!(config.server_ca_path, Some("ca.pem".into()));
+    }
+
+    #[test]
+    fn server_ca_keeps_full_validation_for_login_only() {
+        let mut opts = default_options();
+        opts.server_ca = Some("ca.pem".into());
+        let config =
+            SslHandler::resolve_tls_validation(&opts, NegotiatedEncryptionSetting::LoginOnly);
+        assert!(!config.accept_invalid_certs);
+        assert!(!config.accept_invalid_hostnames);
+    }
+
+    #[test]
+    fn server_ca_is_absent_without_configuration() {
+        let opts = default_options();
+        let config =
+            SslHandler::resolve_tls_validation(&opts, NegotiatedEncryptionSetting::Mandatory);
+        assert_eq!(config.server_ca_path, None);
+    }
+
+    async fn enable_ssl_error(opts: EncryptionOptions) -> crate::error::Error {
+        let handler = SslHandler {
+            server_host_name: "localhost".to_string(),
+            encryption_options: opts,
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        match handler
+            .enable_ssl_async(Box::new(client), NegotiatedEncryptionSetting::Mandatory)
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("expected a usage error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn server_ca_with_trust_server_certificate_is_rejected() {
+        let mut opts = default_options();
+        opts.server_ca = Some("ca.pem".into());
+        opts.trust_server_certificate = true;
+        let error = enable_ssl_error(opts).await;
+        assert!(
+            matches!(&error, crate::error::Error::UsageError(message) if message.contains("TrustServerCertificate")),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn server_ca_with_server_certificate_is_rejected() {
+        let mut opts = default_options();
+        opts.server_ca = Some("ca.pem".into());
+        opts.server_certificate = Some("cert.pem".into());
+        let error = enable_ssl_error(opts).await;
+        assert!(
+            matches!(&error, crate::error::Error::UsageError(message) if message.contains("ServerCertificate")),
+            "unexpected error: {error:?}"
+        );
     }
 }

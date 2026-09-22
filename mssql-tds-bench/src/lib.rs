@@ -98,6 +98,7 @@ pub fn create_context() -> ClientContext {
             .unwrap_or(false),
         host_name_in_cert: env::var("CERT_HOST_NAME").ok(),
         server_certificate: None,
+        server_ca: None,
     };
     context
 }

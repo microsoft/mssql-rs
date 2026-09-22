@@ -40,6 +40,7 @@ mod encryption_tests {
             trust_server_certificate: trust_server_certificate(),
             host_name_in_cert: env::var("CERT_HOST_NAME").ok(),
             server_certificate: None,
+            server_ca: None,
         };
         context
     }

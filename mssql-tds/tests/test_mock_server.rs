@@ -113,6 +113,7 @@ mod mock_server_tests {
             trust_server_certificate: true,
             host_name_in_cert: None,
             server_certificate: None,
+            server_ca: None,
         };
 
         // Connect to mock server
@@ -155,6 +156,7 @@ mod mock_server_tests {
             trust_server_certificate: true,
             host_name_in_cert: None,
             server_certificate: None,
+            server_ca: None,
         };
 
         let provider = TdsConnectionProvider {};
@@ -216,6 +218,7 @@ mod mock_server_tests {
             trust_server_certificate: true,
             host_name_in_cert: None,
             server_certificate: None,
+            server_ca: None,
         };
 
         let provider = TdsConnectionProvider {};
@@ -287,6 +290,7 @@ mod mock_server_tests {
             trust_server_certificate: true,
             host_name_in_cert: None,
             server_certificate: None,
+            server_ca: None,
         };
 
         let provider = TdsConnectionProvider {};
@@ -360,6 +364,7 @@ mod mock_server_tests {
             trust_server_certificate: true,
             host_name_in_cert: None,
             server_certificate: None,
+            server_ca: None,
         };
 
         let provider = TdsConnectionProvider {};
@@ -434,6 +439,7 @@ mod mock_server_tests {
             trust_server_certificate: true,
             host_name_in_cert: None,
             server_certificate: None,
+            server_ca: None,
         };
 
         let provider = TdsConnectionProvider {};
@@ -522,6 +528,7 @@ mod mock_server_tests {
             trust_server_certificate: true,
             host_name_in_cert: None,
             server_certificate: None,
+            server_ca: None,
         };
 
         let provider = TdsConnectionProvider {};
@@ -578,6 +585,7 @@ mod mock_server_tests {
             trust_server_certificate: true,
             host_name_in_cert: None,
             server_certificate: Some("/nonexistent/path/certificate.cer".into()),
+            server_ca: None,
         };
 
         // Attempt to connect - should succeed since encryption is off
@@ -643,6 +651,7 @@ mod mock_server_tests {
             trust_server_certificate: true, // This should be ignored
             host_name_in_cert: None,
             server_certificate: Some(cert_path.clone()),
+            server_ca: None,
         };
 
         // Attempt to connect - ServerCertificate should take precedence
@@ -714,6 +723,7 @@ mod mock_server_tests {
             trust_server_certificate: true,
             host_name_in_cert: Some("custom.hostname.com".to_string()),
             server_certificate: Some(cert_path.clone()),
+            server_ca: None,
         };
 
         // Attempt to connect - with PreferOff, may succeed but both options set is unusual
@@ -774,6 +784,7 @@ mod mock_server_tests {
                 trust_server_certificate: false,
                 host_name_in_cert: None,
                 server_certificate: Some("tests/test_certificates/valid_cert.pem".into()),
+                server_ca: None,
             };
 
             let provider = TdsConnectionProvider {};
@@ -793,6 +804,7 @@ mod mock_server_tests {
                 trust_server_certificate: true,
                 host_name_in_cert: None,
                 server_certificate: None,
+                server_ca: None,
             };
 
             let provider = TdsConnectionProvider {};
@@ -812,6 +824,7 @@ mod mock_server_tests {
                 trust_server_certificate: false,
                 host_name_in_cert: None,
                 server_certificate: Some("tests/test_certificates/valid_cert.pem".into()),
+                server_ca: None,
             };
 
             let provider = TdsConnectionProvider {};
@@ -877,6 +890,7 @@ mod mock_server_tests {
                 trust_server_certificate: false,
                 host_name_in_cert: None,
                 server_certificate: Some("tests/test_certificates/valid_cert.pem".into()),
+                server_ca: None,
             };
 
             let provider = TdsConnectionProvider {};
@@ -897,6 +911,7 @@ mod mock_server_tests {
                 trust_server_certificate: true, // This is ignored in Strict mode
                 host_name_in_cert: None,
                 server_certificate: None,
+                server_ca: None,
             };
 
             let provider = TdsConnectionProvider {};
@@ -921,6 +936,7 @@ mod mock_server_tests {
                 trust_server_certificate: false,
                 host_name_in_cert: None,
                 server_certificate: Some("tests/test_certificates/valid_cert.pem".into()),
+                server_ca: None,
             };
 
             let provider = TdsConnectionProvider {};
@@ -977,6 +993,7 @@ mod mock_server_tests {
             trust_server_certificate: true,
             host_name_in_cert: None,
             server_certificate: None,
+            server_ca: None,
         };
 
         let provider = TdsConnectionProvider {};
@@ -1066,6 +1083,7 @@ mod mock_server_tests {
             trust_server_certificate: true,
             host_name_in_cert: None,
             server_certificate: None,
+            server_ca: None,
         };
 
         let provider = TdsConnectionProvider {};
@@ -1157,6 +1175,7 @@ mod mock_server_tests {
             trust_server_certificate: true,
             host_name_in_cert: None,
             server_certificate: None,
+            server_ca: None,
         };
 
         let provider = TdsConnectionProvider {};
@@ -1256,6 +1275,7 @@ mod mock_server_tests {
             trust_server_certificate: true,
             host_name_in_cert: None,
             server_certificate: None,
+            server_ca: None,
         };
 
         let provider = TdsConnectionProvider {};

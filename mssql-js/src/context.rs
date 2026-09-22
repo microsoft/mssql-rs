@@ -25,6 +25,7 @@ impl From<JsClientContext> for ClientContext {
             trust_server_certificate: js_ctx.trust_server_certificate,
             host_name_in_cert: None,
             server_certificate: None,
+            server_ca: None,
         };
 
         info!(

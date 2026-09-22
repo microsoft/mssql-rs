@@ -66,6 +66,7 @@ mod timeout_and_cancel_tests {
             trust_server_certificate: trust_server_certificate(),
             host_name_in_cert: None,
             server_certificate: None,
+            server_ca: None,
         };
 
         let provider = TdsConnectionProvider {};
@@ -167,6 +168,7 @@ mod timeout_and_cancel_tests {
             trust_server_certificate: false,
             host_name_in_cert: None,
             server_certificate: None,
+            server_ca: None,
         };
         client_context.connect_timeout = 2;
         client_context.connect_retry_count = retry_count as u32;
