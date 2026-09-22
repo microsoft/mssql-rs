@@ -2,7 +2,7 @@
 // Licensed under the MIT License.
 
 use encoding_rs::{CoderResult, Decoder, Encoding};
-use std::{borrow::Cow, io::Write};
+use std::borrow::Cow;
 
 /// A wire encoding, including OEM code pages that `encoding_rs` does not support.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -39,24 +39,17 @@ impl ResolvedEncoding {
         }
     }
 
-    fn oem_table(self) -> &'static [char; 128] {
-        match self {
-            Self::Oem437 => &CP437,
-            Self::Oem850 => &CP850,
-            Self::EncodingRs(_) => unreachable!("not an OEM encoding"),
-        }
-    }
-
     /// Decodes without treating BOM-shaped bytes as an encoding override.
     /// The boolean reports malformed input, as in `encoding_rs`.
     pub fn decode_without_bom_handling(self, bytes: &[u8]) -> (Cow<'_, str>, bool) {
-        if let Self::EncodingRs(encoding) = self {
-            return encoding.decode_without_bom_handling(bytes);
-        }
+        let table = match self {
+            Self::EncodingRs(encoding) => return encoding.decode_without_bom_handling(bytes),
+            Self::Oem437 => &CP437,
+            Self::Oem850 => &CP850,
+        };
         if bytes.is_ascii() {
-            return (Cow::Borrowed(std::str::from_utf8(bytes).unwrap()), false);
+            return (String::from_utf8_lossy(bytes), false);
         }
-        let table = self.oem_table();
         (
             Cow::Owned(bytes.iter().map(|&byte| decode_oem(table, byte)).collect()),
             false,
@@ -67,14 +60,17 @@ impl ResolvedEncoding {
     /// character references, matching `encoding_rs`. Returns the encoding used
     /// and whether any characters were unmappable.
     pub fn encode(self, text: &str) -> (Cow<'_, [u8]>, Self, bool) {
-        if let Self::EncodingRs(encoding) = self {
-            let (bytes, used, errors) = encoding.encode(text);
-            return (bytes, used.into(), errors);
-        }
+        let table = match self {
+            Self::EncodingRs(encoding) => {
+                let (bytes, used, errors) = encoding.encode(text);
+                return (bytes, used.into(), errors);
+            }
+            Self::Oem437 => &CP437,
+            Self::Oem850 => &CP850,
+        };
         if text.is_ascii() {
             return (Cow::Borrowed(text.as_bytes()), self, false);
         }
-        let table = self.oem_table();
         let mut bytes = Vec::with_capacity(text.len());
         let mut errors = false;
         for character in text.chars() {
@@ -83,7 +79,7 @@ impl ResolvedEncoding {
             } else if let Some(index) = table.iter().position(|&entry| entry == character) {
                 bytes.push(index as u8 + 128);
             } else {
-                write!(bytes, "&#{};", u32::from(character)).unwrap();
+                bytes.extend_from_slice(format!("&#{};", u32::from(character)).as_bytes());
                 errors = true;
             }
         }
@@ -97,7 +93,8 @@ impl ResolvedEncoding {
                 Self::EncodingRs(encoding) => {
                     DecoderKind::EncodingRs(Box::new(encoding.new_decoder_without_bom_handling()))
                 }
-                Self::Oem437 | Self::Oem850 => DecoderKind::Oem(self.oem_table()),
+                Self::Oem437 => DecoderKind::Oem(&CP437),
+                Self::Oem850 => DecoderKind::Oem(&CP850),
             },
         }
     }
@@ -343,8 +340,9 @@ mod tests {
 
     #[test]
     fn oem_ascii_empty_and_unmappable_characters() {
+        let ascii: String = (0..128).map(char::from).collect();
         for (encoding, _) in OEM_FIXTURES {
-            for text in ["", "\0\t\n\r\u{1a}\u{7f}ASCII"] {
+            for text in ["", ascii.as_str()] {
                 let (decoded, errors) = encoding.decode_without_bom_handling(text.as_bytes());
                 assert!(matches!(decoded, Cow::Borrowed(_)));
                 assert_eq!(decoded, text);
@@ -355,8 +353,8 @@ mod tests {
                 assert_eq!(used, encoding);
                 assert!(!errors);
             }
-            let (encoded, _, errors) = encoding.encode("é日😀");
-            assert_eq!(encoded.as_ref(), b"\x82&#26085;&#128512;");
+            let (encoded, _, errors) = encoding.encode("é日😀\u{10ffff}");
+            assert_eq!(encoded.as_ref(), b"\x82&#26085;&#128512;&#1114111;");
             assert!(errors);
             assert_eq!(encoding.as_encoding_rs(), None);
             assert!(encoding.name().starts_with("IBM"));
