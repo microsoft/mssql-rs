@@ -776,6 +776,55 @@ TEST_F(GetDataUtf16Test, PlpTargetSwitchFromConvertedChar) {
     }
 }
 
+TEST_F(GetDataUtf16Test, PlpTargetSwitchFromOddNarrowCarry) {
+    SKIP_IF_COMPARING_MSODBCSQL_ON_WINDOWS();
+    const char* target = std::getenv("ODBC_TEST_TARGET");
+    const bool reference = target != nullptr && std::strcmp(target, "msodbcsql") == 0;
+    for (const size_t offset : {2, 3}) {
+        SCOPED_TRACE(offset);
+        ASSERT_SQL_OK(
+            ExecDirect("SELECT CAST((NCHAR(0x20AC) + NCHAR(0x00E9) + N'A') "
+                       "COLLATE SQL_Latin1_General_CP1_CI_AS AS varchar(max)), 42"),
+            SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+        SQLCHAR first[3] = {};
+        SQLLEN ind = -99;
+        ASSERT_EQ(SQL_SUCCESS_WITH_INFO,
+                  SQLGetData(stmt_, 1, SQL_C_CHAR, first, sizeof(first), &ind));
+        EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01004");
+        const SQLCHAR first_expected[] = {0xE2, 0x82, 0};
+        EXPECT_EQ(0, std::memcmp(first, first_expected, sizeof(first)));
+
+        // An odd carry precedes the newly widened units, so an aligned
+        // application buffer becomes unaligned inside the driver (and vice versa).
+        alignas(SQLWCHAR) SQLCHAR output[16];
+        std::fill(std::begin(output), std::end(output), 0xCC);
+        SQLCHAR expected[] = {0xAC, 0xE9, 0, 0x41, 0, 0, 0};
+        if (reference) {
+            // Retail 18.6.2.1 converts both source bytes on the first read:
+            // its carry includes UTF-8 e-acute; ours widens that character here.
+            expected[1] = 0xC3;
+            expected[2] = 0xA9;
+        }
+        constexpr SQLLEN capacity = 5 * sizeof(SQLWCHAR);
+        ASSERT_EQ(SQL_SUCCESS,
+                  SQLGetData(stmt_, 1, SQL_C_WCHAR, output + offset, capacity, &ind));
+        EXPECT_EQ(5, ind);
+        EXPECT_EQ(0, std::memcmp(output + offset, expected, sizeof(expected)));
+        EXPECT_TRUE(std::all_of(output, output + offset,
+                                [](SQLCHAR ch) { return ch == 0xCC; }));
+        EXPECT_TRUE(std::all_of(output + offset + sizeof(expected), std::end(output),
+                                [](SQLCHAR ch) { return ch == 0xCC; }));
+        EXPECT_EQ(SQL_NO_DATA,
+                  SQLGetData(stmt_, 1, SQL_C_WCHAR, output + offset, capacity, &ind));
+        SQLINTEGER following = 0;
+        ASSERT_SQL_OK(SQLGetData(stmt_, 2, SQL_C_SLONG, &following, 0, &ind),
+                      SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ(42, following);
+        ASSERT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+    }
+}
+
 TEST_F(GetDataUtf16Test, PlpTargetSwitchFromWcharDoesNotOverread) {
     for (const SQLSMALLINT target : {SQL_C_CHAR, SQL_C_BINARY}) {
         ASSERT_SQL_OK(ExecDirect("SELECT CAST('ABCDE' AS varchar(max)), 42"),
