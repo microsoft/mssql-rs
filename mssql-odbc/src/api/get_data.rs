@@ -30,7 +30,7 @@ use crate::handles::stmt::{ActivePlpStream, STMT_STATE_CURSOR_OPEN, StmtState};
 use crate::handles::{HandleType, OdbcVersion, StmtHandle, handle_from_raw};
 use mssql_tds::connection::tds_client::{CursorColumn, CursorPoll, PlpChunk};
 use mssql_tds::core::TdsResult;
-use mssql_tds::encoding_rs::{self, Decoder};
+use mssql_tds::encoding_rs;
 
 use crate::conversion::error::{ConvError, ConvOk};
 use crate::conversion::fetch_convert::{
@@ -41,7 +41,7 @@ use crate::conversion::fetch_convert::{
 };
 use mssql_tds::datatypes::column_values::ColumnValues;
 use mssql_tds::datatypes::decoder::DECIMAL_STR_LEN;
-use mssql_tds::datatypes::sql_string::EncodingType;
+use mssql_tds::datatypes::sql_string::{EncodingType, ResolvedDecoder, ResolvedEncoding};
 use mssql_tds::query::metadata::PlpEncoding;
 
 /// Maximum speculative PLP read-ahead retained by one `SQLGetData` stream.
@@ -1625,12 +1625,7 @@ fn stream_active_plp_chunk<'a>(
     buffer_length: SqlLen,
     strlen_or_ind_ptr: *mut SqlLen,
     starting_new_stream: bool,
-    prepared_stream: Option<(
-        PlpEncoding,
-        usize,
-        usize,
-        Option<&'static encoding_rs::Encoding>,
-    )>,
+    prepared_stream: Option<(PlpEncoding, usize, usize, Option<ResolvedEncoding>)>,
     mut retained_stmt_state: Option<MutexGuard<'a, StmtState>>,
 ) -> SqlReturn {
     if target_type != SQL_C_CHAR && target_type != SQL_C_WCHAR && target_type != SQL_C_BINARY {
@@ -1652,7 +1647,7 @@ fn stream_active_plp_chunk<'a>(
         return SQL_ERROR;
     }
 
-    let (plp_encoding, widen_carry_len, utf8_carry_len, narrow_encoding) =
+    let (plp_encoding, widen_carry_len, mut utf8_carry_len, narrow_encoding) =
         if let Some((encoding, widen_carry_len, utf8_carry_len, narrow_encoding)) = prepared_stream
         {
             let decoder_ready = narrow_encoding.is_some();
@@ -1724,15 +1719,11 @@ fn stream_active_plp_chunk<'a>(
                 // across the FFI boundary is UB.
                 let narrow_encoding = match encoding {
                     // json is UTF-8 on the wire and carries no collation.
-                    PlpEncoding::Utf8Text => Some(encoding_rs::UTF_8),
+                    PlpEncoding::Utf8Text => Some(encoding_rs::UTF_8.into()),
                     PlpEncoding::SingleByteText => column_meta
                         .and_then(|m| m.get_collation())
                         .and_then(|collation| {
-                            if collation.utf8() {
-                                Some(encoding_rs::UTF_8)
-                            } else {
-                                EncodingType::LcidBased(collation).encoding()
-                            }
+                            EncodingType::LcidBased(collation).resolved_encoding()
                         }),
                     _ => None,
                 };
@@ -1826,7 +1817,7 @@ fn stream_active_plp_chunk<'a>(
     // into U+FFFD.
     let transcode_narrow_to_utf8 = target_type == SQL_C_CHAR
         && matches!(plp_encoding, Some(PlpEncoding::SingleByteText))
-        && narrow_encoding.is_some_and(|encoding| encoding != encoding_rs::UTF_8);
+        && narrow_encoding.is_some_and(|encoding| encoding != encoding_rs::UTF_8.into());
     // SQL_C_WCHAR delivery of a narrow (codepage or UTF-8) PLP column must
     // widen on the fly. Mirrors the compatibility gate above so the two cannot
     // drift: a Binary column never reaches here.
@@ -1867,592 +1858,635 @@ fn stream_active_plp_chunk<'a>(
     } else {
         usize::MAX
     };
-    let max_read = if hex_stream {
-        if target_type == SQL_C_WCHAR {
-            payload_capacity / (2 * std::mem::size_of::<SqlWChar>())
+    let converting_to_utf8 = transcode_utf16_to_utf8 || transcode_narrow_to_utf8;
+    let output_capacity = payload_capacity;
+    let mut emitted_utf8 = 0;
+    let (read, reached_end, known_total, total_read) = loop {
+        let payload_capacity = payload_capacity.saturating_sub(emitted_utf8);
+        let buffer_length = buffer_length - SqlLen::try_from(emitted_utf8).unwrap_or(SqlLen::MAX);
+        // SAFETY: converted output never exceeds the original payload capacity.
+        // Keep null probes null rather than doing pointer arithmetic on them.
+        let target_value_ptr = if target_value_ptr.is_null() {
+            target_value_ptr
         } else {
-            payload_capacity / 2
-        }
-    } else if widen_narrow_to_utf16 {
-        // Wire bytes in, UTF-16 code units out, so the caller's capacity does
-        // not bound the read directly.
-        //
-        // With nothing carried over, read at least the longest single-character
-        // sequence any reachable encoding produces (4 bytes) so a chunk always
-        // completes at least one character while data remains — otherwise a call
-        // could consume input, emit nothing, and still report truncation, which
-        // an application sees as a stream that never advances.
-        //
-        // Once the carry alone can already fill the caller's buffer, drop to one
-        // byte: the call is satisfied either way, and reading a full chunk every
-        // time would grow the carry without bound when the buffer only has room
-        // for a character or two.
-        if widen_out_units == 0 {
-            0
-        } else if widen_carry_len >= widen_out_units {
-            1
-        } else {
-            widen_out_units.max(4)
-        }
-    } else if target_type == SQL_C_WCHAR {
-        // Whole UTF-16 code units only.
-        payload_capacity & !1
-    } else if transcode_utf16_to_utf8 {
-        utf16le_max_read(payload_capacity, utf8_carry_len)
-    } else if transcode_narrow_to_utf8 {
-        narrow_max_read(payload_capacity, utf8_carry_len)
-    } else {
-        payload_capacity
-    };
-
-    // A buffer with no payload room at all is a length probe: the application
-    // asking how much is there before sizing a real one. `SQLDescribeCol`
-    // reports ColumnSize 0 for a MAX column, so a caller sizing as
-    // `(ColumnSize + 1) * sizeof(SQLWCHAR)` arrives with 2 bytes. The read
-    // consumes nothing (`PlpColumnStream::read_into` returns early on an empty
-    // buffer), so the value stays resident while the terminator, the bytes
-    // available and 01004 are reported as usual. msodbcsql answers this shape
-    // the same way.
-    //
-    // For text, too little room for one whole wide character is a different
-    // case: a SQL_C_WCHAR buffer of 1 or 3 bytes cannot make progress and is
-    // rejected with HY090. UTF-8 output has a byte carry, so any SQL_C_CHAR
-    // buffer with payload room can make progress.
-    //
-    // Text probes use a zero-length buffer or one sized for the terminator.
-    // Hex also treats buffers too small for a complete pair as probes.
-    // Other text buffers that cannot make progress are errors -- widening sizes
-    // its read from output units rather than byte capacity, so its own
-    // zero-progress shapes have to be spelled out rather than inferred from
-    // `max_read`.
-    let is_length_probe = buffer_length == 0 || buffer_length as usize == terminator_bytes;
-    let makes_no_progress = if widen_narrow_to_utf16 {
-        widen_out_units == 0
-    } else if transcode_utf16_to_utf8 || transcode_narrow_to_utf8 {
-        max_read == 0 && utf8_carry_len == 0
-    } else {
-        max_read == 0
-    };
-    if makes_no_progress && !is_length_probe && !hex_stream {
-        if let Some(mut state) = retained_stmt_state.take() {
-            post_sql_error(
-                &mut state,
-                SQLSTATE_HY090,
-                0,
-                "Buffer length too small to hold a single character and null terminator",
-            );
-        } else if let Ok(mut s) = stmt.inner.lock() {
-            post_sql_error(
-                &mut s,
-                SQLSTATE_HY090,
-                0,
-                "Buffer length too small to hold a single character and null terminator",
-            );
-        }
-        return SQL_ERROR;
-    }
-
-    // The first binary read may discover an empty PLP value. Use temporary
-    // storage for that read so initializing a Rust byte slice cannot overwrite
-    // a caller buffer when no payload is delivered. Later chunks can stream
-    // directly because a prior read established that the value is non-empty.
-    let first_binary_read = target_type == SQL_C_BINARY && starting_new_stream;
-    // Whether the wire bytes are already in the shape the caller asked for, so
-    // the read can land straight in their buffer. A transcoding read never can:
-    // the wire bytes are the decoder's input, not its output, so they need
-    // storage of their own. That also disables the read-ahead below for this
-    // path, which is a throughput cost rather than a correctness one.
-    // Hex rendering is excluded too: it expands two characters per wire byte.
-    let wire_shaped_output = matches!(
-        (target_type, plp_encoding),
-        (SQL_C_WCHAR, Some(PlpEncoding::Utf16Text))
-            | (
-                SQL_C_CHAR,
-                Some(PlpEncoding::SingleByteText | PlpEncoding::Utf8Text)
-            )
-            | (SQL_C_BINARY, Some(_))
-    ) && !transcode_narrow_to_utf8;
-    let direct_wire_output =
-        max_read > 0 && !target_value_ptr.is_null() && !first_binary_read && wire_shaped_output;
-    let mut inline_payload = [0_u8; 256];
-    let mut heap_payload = Vec::new();
-    let payload = if direct_wire_output {
-        // The application owns this writable buffer for the duration of the ODBC
-        // call. Initialize it before forming a byte slice because ODBC output
-        // buffers may contain uninitialized storage; `max_read` reserves the
-        // required terminator bytes.
-        //
-        // SAFETY: `direct_wire_output` required a non-null `target_value_ptr`,
-        // which the DM guarantees is writable for `buffer_length` bytes, and
-        // `max_read <= buffer_length - terminator_bytes`. The zeroing above
-        // initializes every byte the slice exposes, and the slice is the only
-        // live reference to that range for its lifetime.
-        unsafe {
-            std::ptr::write_bytes(target_value_ptr.cast::<u8>(), 0, max_read);
-            std::slice::from_raw_parts_mut(target_value_ptr.cast::<u8>(), max_read)
-        }
-    } else if max_read <= inline_payload.len() {
-        &mut inline_payload[..max_read]
-    } else {
-        heap_payload.resize(max_read, 0);
-        heap_payload.as_mut_slice()
-    };
-    let (prefetch_error, prefetched_read) = if let Some(stmt_state) = retained_stmt_state.as_mut() {
-        if let Some(stream) = stmt_state.active_plp.as_mut() {
-            (
-                stream.take_prefetch_error(),
-                stream.read_prefetched_wire(payload),
-            )
-        } else {
-            (None, None)
-        }
-    } else {
-        let Ok(mut stmt_state) = stmt.inner.lock() else {
-            error!("SQLGetData: stmt mutex poisoned while reading prefetched PLP bytes");
-            return SQL_ERROR;
+            unsafe { target_value_ptr.cast::<u8>().add(emitted_utf8).cast() }
         };
-        if let Some(stream) = stmt_state.active_plp.as_mut() {
-            (
-                stream.take_prefetch_error(),
-                stream.read_prefetched_wire(payload),
-            )
-        } else {
-            (None, None)
-        }
-    };
-
-    let read_result = if let Some(error) = prefetch_error {
-        Err(error)
-    } else if let Some((read, reached_end, known_total, total_read)) = prefetched_read {
-        Ok(PlpChunk {
-            read,
-            reached_end,
-            known_total,
-            total_read,
-        })
-    } else {
-        drop(retained_stmt_state.take());
-        let dbc = stmt.parent_dbc();
-        let mut dbc_state = match dbc.inner.lock() {
-            Ok(state) => state,
-            Err(_) => {
-                error!("SQLGetData: dbc mutex poisoned while reading PLP stream");
-                return SQL_ERROR;
+        let max_read = if hex_stream {
+            if target_type == SQL_C_WCHAR {
+                payload_capacity / (2 * std::mem::size_of::<SqlWChar>())
+            } else {
+                payload_capacity / 2
             }
+        } else if widen_narrow_to_utf16 {
+            // Wire bytes in, UTF-16 code units out, so the caller's capacity does
+            // not bound the read directly.
+            //
+            // With nothing carried over, read at least the longest single-character
+            // sequence any reachable encoding produces (4 bytes) so a chunk always
+            // completes at least one character while data remains — otherwise a call
+            // could consume input, emit nothing, and still report truncation, which
+            // an application sees as a stream that never advances.
+            //
+            // Once the carry alone can already fill the caller's buffer, drop to one
+            // byte: the call is satisfied either way, and reading a full chunk every
+            // time would grow the carry without bound when the buffer only has room
+            // for a character or two.
+            if widen_out_units == 0 {
+                0
+            } else if widen_carry_len >= widen_out_units {
+                1
+            } else {
+                widen_out_units.max(4)
+            }
+        } else if target_type == SQL_C_WCHAR {
+            // Whole UTF-16 code units only.
+            payload_capacity & !1
+        } else if transcode_utf16_to_utf8 {
+            utf16le_max_read(payload_capacity, utf8_carry_len)
+        } else if transcode_narrow_to_utf8 {
+            narrow_max_read(payload_capacity, utf8_carry_len)
+        } else {
+            payload_capacity
         };
-        if let Some(busy_stmt) = dbc_state.active_stmt
-            && busy_stmt != statement_handle
-        {
-            drop(dbc_state);
-            if let Ok(mut s) = stmt.inner.lock() {
-                post_diag(&mut s, ERR_CONNECTION_BUSY);
+
+        // A buffer with no payload room at all is a length probe: the application
+        // asking how much is there before sizing a real one. `SQLDescribeCol`
+        // reports ColumnSize 0 for a MAX column, so a caller sizing as
+        // `(ColumnSize + 1) * sizeof(SQLWCHAR)` arrives with 2 bytes. The read
+        // consumes nothing (`PlpColumnStream::read_into` returns early on an empty
+        // buffer), so the value stays resident while the terminator, the bytes
+        // available and 01004 are reported as usual. msodbcsql answers this shape
+        // the same way.
+        //
+        // For text, too little room for one whole wide character is a different
+        // case: a SQL_C_WCHAR buffer of 1 or 3 bytes cannot make progress and is
+        // rejected with HY090. UTF-8 output has a byte carry, so any SQL_C_CHAR
+        // buffer with payload room can make progress.
+        //
+        // Text probes use a zero-length buffer or one sized for the terminator.
+        // Hex also treats buffers too small for a complete pair as probes.
+        // Other text buffers that cannot make progress are errors -- widening sizes
+        // its read from output units rather than byte capacity, so its own
+        // zero-progress shapes have to be spelled out rather than inferred from
+        // `max_read`.
+        let is_length_probe = buffer_length == 0 || buffer_length as usize == terminator_bytes;
+        let makes_no_progress = if widen_narrow_to_utf16 {
+            widen_out_units == 0
+        } else if transcode_utf16_to_utf8 || transcode_narrow_to_utf8 {
+            max_read == 0 && utf8_carry_len == 0
+        } else {
+            max_read == 0
+        };
+        if makes_no_progress && !is_length_probe && !hex_stream {
+            if let Some(mut state) = retained_stmt_state.take() {
+                post_sql_error(
+                    &mut state,
+                    SQLSTATE_HY090,
+                    0,
+                    "Buffer length too small to hold a single character and null terminator",
+                );
+            } else if let Ok(mut s) = stmt.inner.lock() {
+                post_sql_error(
+                    &mut s,
+                    SQLSTATE_HY090,
+                    0,
+                    "Buffer length too small to hold a single character and null terminator",
+                );
             }
             return SQL_ERROR;
         }
-        let buffered_read = {
-            let Some(client) = dbc_state.client.as_mut() else {
+
+        // The first binary read may discover an empty PLP value. Use temporary
+        // storage for that read so initializing a Rust byte slice cannot overwrite
+        // a caller buffer when no payload is delivered. Later chunks can stream
+        // directly because a prior read established that the value is non-empty.
+        let first_binary_read = target_type == SQL_C_BINARY && starting_new_stream;
+        // Whether the wire bytes are already in the shape the caller asked for, so
+        // the read can land straight in their buffer. A transcoding read never can:
+        // the wire bytes are the decoder's input, not its output, so they need
+        // storage of their own. That also disables the read-ahead below for this
+        // path, which is a throughput cost rather than a correctness one.
+        // Hex rendering is excluded too: it expands two characters per wire byte.
+        let wire_shaped_output = matches!(
+            (target_type, plp_encoding),
+            (SQL_C_WCHAR, Some(PlpEncoding::Utf16Text))
+                | (
+                    SQL_C_CHAR,
+                    Some(PlpEncoding::SingleByteText | PlpEncoding::Utf8Text)
+                )
+                | (SQL_C_BINARY, Some(_))
+        ) && !transcode_narrow_to_utf8;
+        let direct_wire_output =
+            max_read > 0 && !target_value_ptr.is_null() && !first_binary_read && wire_shaped_output;
+        let mut inline_payload = [0_u8; 256];
+        let mut heap_payload = Vec::new();
+        let payload = if direct_wire_output {
+            // The application owns this writable buffer for the duration of the ODBC
+            // call. Initialize it before forming a byte slice because ODBC output
+            // buffers may contain uninitialized storage; `max_read` reserves the
+            // required terminator bytes.
+            //
+            // SAFETY: `direct_wire_output` required a non-null `target_value_ptr`,
+            // which the DM guarantees is writable for `buffer_length` bytes, and
+            // `max_read <= buffer_length - terminator_bytes`. The zeroing above
+            // initializes every byte the slice exposes, and the slice is the only
+            // live reference to that range for its lifetime.
+            unsafe {
+                std::ptr::write_bytes(target_value_ptr.cast::<u8>(), 0, max_read);
+                std::slice::from_raw_parts_mut(target_value_ptr.cast::<u8>(), max_read)
+            }
+        } else if max_read <= inline_payload.len() {
+            &mut inline_payload[..max_read]
+        } else {
+            heap_payload.resize(max_read, 0);
+            heap_payload.as_mut_slice()
+        };
+        let (prefetch_error, prefetched_read) =
+            if let Some(stmt_state) = retained_stmt_state.as_mut() {
+                if let Some(stream) = stmt_state.active_plp.as_mut() {
+                    (
+                        stream.take_prefetch_error(),
+                        stream.read_prefetched_wire(payload),
+                    )
+                } else {
+                    (None, None)
+                }
+            } else {
+                let Ok(mut stmt_state) = stmt.inner.lock() else {
+                    error!("SQLGetData: stmt mutex poisoned while reading prefetched PLP bytes");
+                    return SQL_ERROR;
+                };
+                if let Some(stream) = stmt_state.active_plp.as_mut() {
+                    (
+                        stream.take_prefetch_error(),
+                        stream.read_prefetched_wire(payload),
+                    )
+                } else {
+                    (None, None)
+                }
+            };
+
+        let read_result = if let Some(error) = prefetch_error {
+            Err(error)
+        } else if let Some((read, reached_end, known_total, total_read)) = prefetched_read {
+            Ok(PlpChunk {
+                read,
+                reached_end,
+                known_total,
+                total_read,
+            })
+        } else {
+            drop(retained_stmt_state.take());
+            let dbc = stmt.parent_dbc();
+            let mut dbc_state = match dbc.inner.lock() {
+                Ok(state) => state,
+                Err(_) => {
+                    error!("SQLGetData: dbc mutex poisoned while reading PLP stream");
+                    return SQL_ERROR;
+                }
+            };
+            if let Some(busy_stmt) = dbc_state.active_stmt
+                && busy_stmt != statement_handle
+            {
                 drop(dbc_state);
                 if let Ok(mut s) = stmt.inner.lock() {
-                    post_diag(&mut s, ERR_NO_ACTIVE_TDS_CLIENT);
+                    post_diag(&mut s, ERR_CONNECTION_BUSY);
                 }
                 return SQL_ERROR;
-            };
-            client.try_read_active_plp_chunk(payload)
-        };
-        dbc_state.active_stmt = Some(statement_handle);
-        match buffered_read {
-            Ok(CursorPoll::Ready(chunk)) => {
-                drop(dbc_state);
-                Ok(chunk)
             }
-            Err(error) => {
-                drop(dbc_state);
-                Err(error)
-            }
-            Ok(CursorPoll::Pending) => {
-                let Some(mut client) = dbc_state.client.take() else {
+            let buffered_read = {
+                let Some(client) = dbc_state.client.as_mut() else {
                     drop(dbc_state);
                     if let Ok(mut s) = stmt.inner.lock() {
                         post_diag(&mut s, ERR_NO_ACTIVE_TDS_CLIENT);
                     }
                     return SQL_ERROR;
                 };
-                drop(dbc_state);
-                let mut prefetch_scratch = {
-                    let Ok(mut stmt_state) = stmt.inner.lock() else {
-                        error!("SQLGetData: stmt mutex poisoned while taking PLP prefetch buffer");
+                client.try_read_active_plp_chunk(payload)
+            };
+            dbc_state.active_stmt = Some(statement_handle);
+            match buffered_read {
+                Ok(CursorPoll::Ready(chunk)) => {
+                    drop(dbc_state);
+                    Ok(chunk)
+                }
+                Err(error) => {
+                    drop(dbc_state);
+                    Err(error)
+                }
+                Ok(CursorPoll::Pending) => {
+                    let Some(mut client) = dbc_state.client.take() else {
+                        drop(dbc_state);
+                        if let Ok(mut s) = stmt.inner.lock() {
+                            post_diag(&mut s, ERR_NO_ACTIVE_TDS_CLIENT);
+                        }
                         return SQL_ERROR;
                     };
-                    std::mem::take(&mut stmt_state.plp_prefetch_scratch)
-                };
-                let result = dbc.runtime.block_on(async {
-                    let chunk = client.read_active_plp_chunk(payload).await?;
-                    let remaining = chunk
-                        .known_total
-                        .and_then(|total| total.checked_sub(chunk.total_read as u64))
-                        .and_then(|bytes| usize::try_from(bytes).ok());
-                    let prefetch_len = remaining.filter(|remaining| {
-                        direct_wire_output
-                            && *remaining > 0
-                            && *remaining <= MAX_PLP_PREFETCH_BYTES
-                            && !chunk.reached_end
-                    });
-                    let Some(prefetch_len) = prefetch_len else {
-                        return Ok((chunk, None, Some(prefetch_scratch), None));
-                    };
-
-                    prefetch_scratch.resize(prefetch_len, 0);
-                    match client.read_active_plp_chunk(&mut prefetch_scratch).await {
-                        Ok(tail) => {
-                            let carry = (prefetch_scratch, tail, chunk.total_read);
-                            Ok((chunk, Some(carry), None, None))
-                        }
-                        Err(error) => Ok((chunk, None, Some(prefetch_scratch), Some(error))),
-                    }
-                });
-                let Ok(mut dbc_state) = dbc.inner.lock() else {
-                    error!("SQLGetData: dbc mutex poisoned after PLP read");
-                    return SQL_ERROR;
-                };
-                dbc_state.client = Some(client);
-                dbc_state.active_stmt = Some(statement_handle);
-                drop(dbc_state);
-                match result {
-                    Ok((chunk, carry, unused_scratch, prefetch_error)) => {
+                    drop(dbc_state);
+                    let mut prefetch_scratch = {
                         let Ok(mut stmt_state) = stmt.inner.lock() else {
                             error!(
-                                "SQLGetData: stmt mutex poisoned while saving PLP prefetch buffer"
+                                "SQLGetData: stmt mutex poisoned while taking PLP prefetch buffer"
                             );
                             return SQL_ERROR;
                         };
-                        if let Some((bytes, tail, total_read_before)) = carry {
-                            let Some(stream) = stmt_state.active_plp.as_mut() else {
+                        std::mem::take(&mut stmt_state.plp_prefetch_scratch)
+                    };
+                    let result = dbc.runtime.block_on(async {
+                        let chunk = client.read_active_plp_chunk(payload).await?;
+                        let remaining = chunk
+                            .known_total
+                            .and_then(|total| total.checked_sub(chunk.total_read as u64))
+                            .and_then(|bytes| usize::try_from(bytes).ok());
+                        let prefetch_len = remaining.filter(|remaining| {
+                            direct_wire_output
+                                && *remaining > 0
+                                && *remaining <= MAX_PLP_PREFETCH_BYTES
+                                && !chunk.reached_end
+                        });
+                        let Some(prefetch_len) = prefetch_len else {
+                            return Ok((chunk, None, Some(prefetch_scratch), None));
+                        };
+
+                        prefetch_scratch.resize(prefetch_len, 0);
+                        match client.read_active_plp_chunk(&mut prefetch_scratch).await {
+                            Ok(tail) => {
+                                let carry = (prefetch_scratch, tail, chunk.total_read);
+                                Ok((chunk, Some(carry), None, None))
+                            }
+                            Err(error) => Ok((chunk, None, Some(prefetch_scratch), Some(error))),
+                        }
+                    });
+                    let Ok(mut dbc_state) = dbc.inner.lock() else {
+                        error!("SQLGetData: dbc mutex poisoned after PLP read");
+                        return SQL_ERROR;
+                    };
+                    dbc_state.client = Some(client);
+                    dbc_state.active_stmt = Some(statement_handle);
+                    drop(dbc_state);
+                    match result {
+                        Ok((chunk, carry, unused_scratch, prefetch_error)) => {
+                            let Ok(mut stmt_state) = stmt.inner.lock() else {
                                 error!(
-                                    "SQLGetData: PLP stream vanished while saving prefetched bytes"
+                                    "SQLGetData: stmt mutex poisoned while saving PLP prefetch buffer"
                                 );
                                 return SQL_ERROR;
                             };
-                            stream.set_prefetched_wire(
-                                bytes,
-                                tail.read,
-                                total_read_before,
-                                tail.known_total,
-                                tail.reached_end,
-                            );
-                        } else if let Some(buffer) = unused_scratch {
-                            stmt_state.plp_prefetch_scratch = buffer;
-                        }
-                        if let Some(error) = prefetch_error {
-                            let Some(stream) = stmt_state.active_plp.as_mut() else {
-                                error!(
-                                    "SQLGetData: PLP stream vanished while saving prefetch error"
+                            if let Some((bytes, tail, total_read_before)) = carry {
+                                let Some(stream) = stmt_state.active_plp.as_mut() else {
+                                    error!(
+                                        "SQLGetData: PLP stream vanished while saving prefetched bytes"
+                                    );
+                                    return SQL_ERROR;
+                                };
+                                stream.set_prefetched_wire(
+                                    bytes,
+                                    tail.read,
+                                    total_read_before,
+                                    tail.known_total,
+                                    tail.reached_end,
                                 );
-                                return SQL_ERROR;
-                            };
-                            stream.set_prefetch_error(error);
+                            } else if let Some(buffer) = unused_scratch {
+                                stmt_state.plp_prefetch_scratch = buffer;
+                            }
+                            if let Some(error) = prefetch_error {
+                                let Some(stream) = stmt_state.active_plp.as_mut() else {
+                                    error!(
+                                        "SQLGetData: PLP stream vanished while saving prefetch error"
+                                    );
+                                    return SQL_ERROR;
+                                };
+                                stream.set_prefetch_error(error);
+                            }
+                            Ok(chunk)
                         }
-                        Ok(chunk)
+                        Err(error) => Err(error),
                     }
-                    Err(error) => Err(error),
                 }
             }
-        }
-    };
+        };
 
-    let PlpChunk {
-        read,
-        reached_end,
-        known_total,
-        total_read,
-    } = match read_result {
-        Ok(chunk) => chunk,
-        Err(e) => {
-            if let Some(mut s) = retained_stmt_state.take() {
-                s.clear_state(STMT_STATE_CURSOR_OPEN);
-                post_tds_error(&mut s, &e, SQLSTATE_HY000);
-            } else if let Ok(mut s) = stmt.inner.lock() {
-                s.clear_state(STMT_STATE_CURSOR_OPEN);
-                post_tds_error(&mut s, &e, SQLSTATE_HY000);
+        let PlpChunk {
+            read,
+            reached_end,
+            known_total,
+            total_read,
+        } = match read_result {
+            Ok(chunk) => chunk,
+            Err(e) => {
+                if let Some(mut s) = retained_stmt_state.take() {
+                    s.clear_state(STMT_STATE_CURSOR_OPEN);
+                    post_tds_error(&mut s, &e, SQLSTATE_HY000);
+                } else if let Ok(mut s) = stmt.inner.lock() {
+                    s.clear_state(STMT_STATE_CURSOR_OPEN);
+                    post_tds_error(&mut s, &e, SQLSTATE_HY000);
+                }
+                return SQL_ERROR;
             }
-            return SQL_ERROR;
+        };
+
+        if widen_narrow_to_utf16 || transcode_utf16_to_utf8 || transcode_narrow_to_utf8 {
+            drop(retained_stmt_state.take());
         }
-    };
 
-    if widen_narrow_to_utf16 || transcode_utf16_to_utf8 || transcode_narrow_to_utf8 {
-        drop(retained_stmt_state.take());
-    }
-
-    if widen_narrow_to_utf16 {
-        // varchar(max)/json wire bytes are narrow; widen them to UTF-16LE for
-        // SQL_C_WCHAR. The decoder lives in the stream state so a character
-        // split across a chunk boundary is carried rather than corrupted.
-        let buf_elements = (buffer_length as usize) / std::mem::size_of::<SqlWChar>();
-        let emitted = {
-            let Ok(mut ss) = stmt.inner.lock() else {
-                return SQL_ERROR;
-            };
-            let Some(stream) = ss.active_plp.as_mut() else {
-                error!("SQLGetData: narrow PLP stream vanished mid-call");
-                return SQL_ERROR;
-            };
-            stream.ensure_narrow_decoder();
-            let ActivePlpStream {
-                narrow_decoder,
-                pending_units,
-                ..
-            } = stream;
-            let Some(decoder) = narrow_decoder.as_mut() else {
-                error!("SQLGetData: narrow PLP stream has no encoding to widen through");
-                return SQL_ERROR;
-            };
-            let emit = widen_into_pending(
-                decoder,
-                pending_units,
-                &payload[..read],
-                reached_end,
-                widen_out_units,
-            );
-            unsafe {
-                copy_with_nul(
-                    target_value_ptr as *mut SqlWChar,
-                    buf_elements,
-                    &pending_units[..emit],
+        if widen_narrow_to_utf16 {
+            // varchar(max)/json wire bytes are narrow; widen them to UTF-16LE for
+            // SQL_C_WCHAR. The decoder lives in the stream state so a character
+            // split across a chunk boundary is carried rather than corrupted.
+            let buf_elements = (buffer_length as usize) / std::mem::size_of::<SqlWChar>();
+            let emitted = {
+                let Ok(mut ss) = stmt.inner.lock() else {
+                    return SQL_ERROR;
+                };
+                let Some(stream) = ss.active_plp.as_mut() else {
+                    error!("SQLGetData: narrow PLP stream vanished mid-call");
+                    return SQL_ERROR;
+                };
+                stream.ensure_narrow_decoder();
+                let ActivePlpStream {
+                    narrow_decoder,
+                    pending_units,
+                    ..
+                } = stream;
+                let Some(decoder) = narrow_decoder.as_mut() else {
+                    error!("SQLGetData: narrow PLP stream has no encoding to widen through");
+                    return SQL_ERROR;
+                };
+                let emit = widen_into_pending(
+                    decoder,
+                    pending_units,
+                    &payload[..read],
+                    reached_end,
+                    widen_out_units,
                 );
+                unsafe {
+                    copy_with_nul(
+                        target_value_ptr as *mut SqlWChar,
+                        buf_elements,
+                        &pending_units[..emit],
+                    );
+                    write_if_some(
+                        strlen_or_ind_ptr,
+                        (emit * std::mem::size_of::<SqlWChar>()) as SqlLen,
+                    );
+                }
+                pending_units.drain(..emit);
+                emit
+            };
+            // Reading at least one whole character's worth of bytes, plus the carry,
+            // is what keeps every truncated call carrying a payload. A zero-length
+            // one would look to an application like a stream that stopped advancing.
+            // The exception is a caller whose buffer has no payload room at all —
+            // that is a length probe, and answering it with an empty chunk is the
+            // point.
+            debug_assert!(
+                emitted > 0 || reached_end || widen_out_units == 0,
+                "narrow PLP widening made no forward progress"
+            );
+        } else if target_type == SQL_C_WCHAR && !hex_stream {
+            let usable = read & !1;
+            let buf_elements = (buffer_length as usize) / std::mem::size_of::<SqlWChar>();
+            if buf_elements > 0 && !target_value_ptr.is_null() {
+                let copy_bytes = usable.min((buf_elements - 1) * std::mem::size_of::<SqlWChar>());
+                // SAFETY: `target_value_ptr` is non-null and writable for
+                // `buffer_length` bytes, and `copy_bytes <= (buf_elements - 1) *
+                // size_of::<SqlWChar>()`, so the payload and the terminator that
+                // follows it stay in bounds. The copy is skipped for
+                // `direct_wire_output`, where `payload` already aliases this buffer.
+                unsafe {
+                    if !direct_wire_output {
+                        std::ptr::copy_nonoverlapping(
+                            payload.as_ptr(),
+                            target_value_ptr.cast::<u8>(),
+                            copy_bytes,
+                        );
+                    }
+                    target_value_ptr
+                        .cast::<u8>()
+                        .add(copy_bytes)
+                        .cast::<SqlWChar>()
+                        .write_unaligned(0);
+                }
+            }
+            // SAFETY: per the SQLGetData contract `strlen_or_ind_ptr` is null or
+            // writable for one `SqlLen`.
+            unsafe { write_if_some(strlen_or_ind_ptr, usable as SqlLen) };
+        } else if transcode_utf16_to_utf8 {
+            // The wire carries nvarchar as UTF-16; the caller asked for UTF-8
+            // (SQL_C_CHAR). A code unit or a surrogate pair split across a chunk
+            // boundary is carried on the input side (pending_byte /
+            // pending_high_surrogate). Output can overrun too: a surrogate pair
+            // becomes a 4-byte character, so a chunk may transcode to more UTF-8
+            // than the buffer holds. Transcode the whole chunk, copy only what
+            // fits, and keep the rest in pending_utf8 for the next call.
+            {
+                let Ok(mut ss) = stmt.inner.lock() else {
+                    return SQL_ERROR;
+                };
+                let Some(stream) = ss.active_plp.as_mut() else {
+                    return SQL_ERROR;
+                };
+                let ActivePlpStream {
+                    pending_byte,
+                    pending_high_surrogate,
+                    pending_utf8,
+                    ..
+                } = stream;
+                let emit = transcode_utf16le_into_pending(
+                    &payload[..read],
+                    reached_end,
+                    pending_byte,
+                    pending_high_surrogate,
+                    pending_utf8,
+                    payload_capacity,
+                );
+                unsafe {
+                    copy_with_nul(
+                        target_value_ptr as *mut u8,
+                        buffer_length as usize,
+                        &pending_utf8[..emit],
+                    );
+                    write_if_some(
+                        strlen_or_ind_ptr,
+                        SqlLen::try_from(emit).unwrap_or(SqlLen::MAX),
+                    );
+                }
+                pending_utf8.drain(..emit);
+                emitted_utf8 += emit;
+                // Forward progress, mirroring the widening branch's guard. The
+                // extra read > 0 term is the UTF-16 difference: a chunk can be a
+                // lone carried high surrogate (the #211 straddle), consuming wire
+                // input while emitting nothing yet -- progress, not a stall.
+                debug_assert!(
+                    emit > 0 || read > 0 || reached_end || payload_capacity == 0,
+                    "UTF-16 to UTF-8 transcode made no forward progress"
+                );
+            };
+        } else if hex_stream {
+            // Two characters per wire byte, so `max_read` already capped the read at
+            // what the caller's buffer can hold and nothing is carried between calls.
+            let hex = bytes_to_hex(&payload[..read]);
+            unsafe {
+                if target_type == SQL_C_WCHAR {
+                    let units: Vec<u16> = hex.encode_utf16().collect();
+                    copy_with_nul(
+                        target_value_ptr as *mut SqlWChar,
+                        buffer_length as usize / std::mem::size_of::<SqlWChar>(),
+                        &units,
+                    );
+                } else {
+                    copy_with_nul(
+                        target_value_ptr as *mut u8,
+                        buffer_length as usize,
+                        hex.as_bytes(),
+                    );
+                }
+                // Overwritten with the remaining count if this chunk truncates.
                 write_if_some(
                     strlen_or_ind_ptr,
-                    (emit * std::mem::size_of::<SqlWChar>()) as SqlLen,
+                    (read as SqlLen).saturating_mul(hex_scale),
                 );
             }
-            pending_units.drain(..emit);
-            emit
-        };
-        // Reading at least one whole character's worth of bytes, plus the carry,
-        // is what keeps every truncated call carrying a payload. A zero-length
-        // one would look to an application like a stream that stopped advancing.
-        // The exception is a caller whose buffer has no payload room at all —
-        // that is a length probe, and answering it with an empty chunk is the
-        // point.
-        debug_assert!(
-            emitted > 0 || reached_end || widen_out_units == 0,
-            "narrow PLP widening made no forward progress"
-        );
-    } else if target_type == SQL_C_WCHAR && !hex_stream {
-        let usable = read & !1;
-        let buf_elements = (buffer_length as usize) / std::mem::size_of::<SqlWChar>();
-        if buf_elements > 0 && !target_value_ptr.is_null() {
-            let copy_bytes = usable.min((buf_elements - 1) * std::mem::size_of::<SqlWChar>());
-            // SAFETY: `target_value_ptr` is non-null and writable for
-            // `buffer_length` bytes, and `copy_bytes <= (buf_elements - 1) *
-            // size_of::<SqlWChar>()`, so the payload and the terminator that
-            // follows it stay in bounds. The copy is skipped for
-            // `direct_wire_output`, where `payload` already aliases this buffer.
+        } else if target_type == SQL_C_BINARY {
+            // Binary delivery is a straight byte copy with no terminator, whatever
+            // the column's encoding. The first chunk uses temporary storage so an
+            // empty value leaves the caller's buffer untouched; subsequent chunks
+            // are read directly into that buffer.
+            debug_assert!(
+                direct_wire_output
+                    || (starting_new_stream && !target_value_ptr.is_null())
+                    || read == 0,
+                "binary chunk read {read} bytes without a caller buffer to put them in"
+            );
             unsafe {
-                if !direct_wire_output {
+                if !direct_wire_output && !target_value_ptr.is_null() {
                     std::ptr::copy_nonoverlapping(
                         payload.as_ptr(),
                         target_value_ptr.cast::<u8>(),
-                        copy_bytes,
+                        read,
                     );
                 }
-                target_value_ptr
-                    .cast::<u8>()
-                    .add(copy_bytes)
-                    .cast::<SqlWChar>()
-                    .write_unaligned(0);
+                write_if_some(strlen_or_ind_ptr, read as SqlLen);
+            }
+        } else if transcode_narrow_to_utf8 {
+            // varchar(max)/char/text under a non-UTF-8 collation. The wire carries
+            // codepage text and SQL_C_CHAR output is UTF-8, so the bytes must be
+            // decoded through the column's own collation — the same conversion
+            // `SqlString::to_utf8_string` performs on the non-PLP path, so a value
+            // delivered inline and the same value streamed agree byte for byte
+            // (AB#47566).
+            //
+            // The decoder carries a multi-byte sequence split across a chunk
+            // boundary (a DBCS collation puts two wire bytes on some characters),
+            // and pending_utf8 carries output the caller's buffer had no room for,
+            // since decoding expands: CP1252 0x80 is three UTF-8 bytes.
+            {
+                let Ok(mut ss) = stmt.inner.lock() else {
+                    return SQL_ERROR;
+                };
+                let Some(stream) = ss.active_plp.as_mut() else {
+                    return SQL_ERROR;
+                };
+                stream.ensure_narrow_decoder();
+                let ActivePlpStream {
+                    narrow_decoder,
+                    pending_utf8,
+                    ..
+                } = stream;
+                let Some(decoder) = narrow_decoder.as_mut() else {
+                    error!("SQLGetData: narrow PLP stream has no encoding to convert through");
+                    return SQL_ERROR;
+                };
+                let emit = transcode_narrow_into_pending(
+                    decoder,
+                    pending_utf8,
+                    &payload[..read],
+                    reached_end,
+                    payload_capacity,
+                );
+                unsafe {
+                    copy_with_nul(
+                        target_value_ptr as *mut u8,
+                        buffer_length as usize,
+                        &pending_utf8[..emit],
+                    );
+                    write_if_some(
+                        strlen_or_ind_ptr,
+                        SqlLen::try_from(emit).unwrap_or(SqlLen::MAX),
+                    );
+                }
+                pending_utf8.drain(..emit);
+                emitted_utf8 += emit;
+                // Same forward-progress guard as the widening branch: consuming wire
+                // while emitting nothing is progress (the decoder is holding a
+                // partial sequence); doing neither is a stalled stream.
+                debug_assert!(
+                    emit > 0 || read > 0 || reached_end || payload_capacity == 0,
+                    "narrow to UTF-8 transcode made no forward progress"
+                );
+            }
+        } else {
+            // SQL_C_CHAR delivery of a text PLP column whose wire bytes are already
+            // UTF-8, copied verbatim. `SingleByteText` reaches here only when its
+            // collation is UTF-8 (or did not resolve, where there is nothing to
+            // decode through); anything else took the transcode branch above. The
+            // two arms are kept separate so the distinction stays recorded: `json`
+            // (`Utf8Text`) carries no collation at all and must never be folded into
+            // the codepage conversion, or non-ASCII json silently corrupts.
+            let copy_verbatim = || unsafe {
+                if direct_wire_output {
+                    target_value_ptr.cast::<u8>().add(read).write_unaligned(0);
+                } else {
+                    copy_with_nul(
+                        target_value_ptr as *mut u8,
+                        buffer_length as usize,
+                        &payload[..read],
+                    );
+                }
+                write_if_some(strlen_or_ind_ptr, read as SqlLen);
+            };
+            match plp_encoding {
+                // varchar(max)/char/text under a UTF-8 collation — already UTF-8 on
+                // the wire, so verbatim is the conversion.
+                Some(PlpEncoding::SingleByteText) => copy_verbatim(),
+                // json — UTF-8 on the wire; delivered verbatim to SQL_C_CHAR. Must
+                // stay distinct from SingleByteText (see above).
+                Some(PlpEncoding::Utf8Text) => copy_verbatim(),
+                // Utf16Text/Binary/None never reach this branch: the compatibility
+                // gate rejects them or an earlier arm handles them. Assert the
+                // invariant in debug/tests; fall back to a verbatim copy in release
+                // rather than panicking across the FFI boundary (which would be UB).
+                other => {
+                    debug_assert!(
+                        false,
+                        "SQL_C_CHAR PLP delivery reached with unexpected encoding {other:?}"
+                    );
+                    copy_verbatim();
+                }
             }
         }
-        // SAFETY: per the SQLGetData contract `strlen_or_ind_ptr` is null or
-        // writable for one `SqlLen`.
-        unsafe { write_if_some(strlen_or_ind_ptr, usable as SqlLen) };
-    } else if transcode_utf16_to_utf8 {
-        // The wire carries nvarchar as UTF-16; the caller asked for UTF-8
-        // (SQL_C_CHAR). A code unit or a surrogate pair split across a chunk
-        // boundary is carried on the input side (pending_byte /
-        // pending_high_surrogate). Output can overrun too: a surrogate pair
-        // becomes a 4-byte character, so a chunk may transcode to more UTF-8
-        // than the buffer holds. Transcode the whole chunk, copy only what
-        // fits, and keep the rest in pending_utf8 for the next call.
-        {
-            let Ok(mut ss) = stmt.inner.lock() else {
-                return SQL_ERROR;
-            };
-            let Some(stream) = ss.active_plp.as_mut() else {
-                return SQL_ERROR;
-            };
-            let ActivePlpStream {
-                pending_byte,
-                pending_high_surrogate,
-                pending_utf8,
-                ..
-            } = stream;
-            let emit = transcode_utf16le_into_pending(
-                &payload[..read],
-                reached_end,
-                pending_byte,
-                pending_high_surrogate,
-                pending_utf8,
-                payload_capacity,
-            );
-            unsafe {
-                copy_with_nul(
-                    target_value_ptr as *mut u8,
-                    buffer_length as usize,
-                    &pending_utf8[..emit],
-                );
-                write_if_some(
-                    strlen_or_ind_ptr,
-                    SqlLen::try_from(emit).unwrap_or(SqlLen::MAX),
-                );
-            }
-            pending_utf8.drain(..emit);
-            // Forward progress, mirroring the widening branch's guard. The
-            // extra read > 0 term is the UTF-16 difference: a chunk can be a
-            // lone carried high surrogate (the #211 straddle), consuming wire
-            // input while emitting nothing yet -- progress, not a stall.
-            debug_assert!(
-                emit > 0 || read > 0 || reached_end || payload_capacity == 0,
-                "UTF-16 to UTF-8 transcode made no forward progress"
-            );
+
+        if !converting_to_utf8 || reached_end || emitted_utf8 >= output_capacity {
+            break (read, reached_end, known_total, total_read);
+        }
+        let Ok(state) = stmt.inner.lock() else {
+            error!("SQLGetData: stmt mutex poisoned while continuing conversion");
+            return SQL_ERROR;
         };
-    } else if hex_stream {
-        // Two characters per wire byte, so `max_read` already capped the read at
-        // what the caller's buffer can hold and nothing is carried between calls.
-        let hex = bytes_to_hex(&payload[..read]);
+        utf8_carry_len = state
+            .active_plp
+            .as_ref()
+            .map_or(0, |stream| stream.pending_utf8.len());
+    };
+
+    if converting_to_utf8 {
+        // SAFETY: the indicator is null or writable for one unaligned SQLLEN.
         unsafe {
-            if target_type == SQL_C_WCHAR {
-                let units: Vec<u16> = hex.encode_utf16().collect();
-                copy_with_nul(
-                    target_value_ptr as *mut SqlWChar,
-                    buffer_length as usize / std::mem::size_of::<SqlWChar>(),
-                    &units,
-                );
-            } else {
-                copy_with_nul(
-                    target_value_ptr as *mut u8,
-                    buffer_length as usize,
-                    hex.as_bytes(),
-                );
-            }
-            // Overwritten with the remaining count if this chunk truncates.
             write_if_some(
                 strlen_or_ind_ptr,
-                (read as SqlLen).saturating_mul(hex_scale),
-            );
-        }
-    } else if target_type == SQL_C_BINARY {
-        // Binary delivery is a straight byte copy with no terminator, whatever
-        // the column's encoding. The first chunk uses temporary storage so an
-        // empty value leaves the caller's buffer untouched; subsequent chunks
-        // are read directly into that buffer.
-        debug_assert!(
-            direct_wire_output || (starting_new_stream && !target_value_ptr.is_null()) || read == 0,
-            "binary chunk read {read} bytes without a caller buffer to put them in"
-        );
-        unsafe {
-            if !direct_wire_output && !target_value_ptr.is_null() {
-                std::ptr::copy_nonoverlapping(
-                    payload.as_ptr(),
-                    target_value_ptr.cast::<u8>(),
-                    read,
-                );
-            }
-            write_if_some(strlen_or_ind_ptr, read as SqlLen);
-        }
-    } else if transcode_narrow_to_utf8 {
-        // varchar(max)/char/text under a non-UTF-8 collation. The wire carries
-        // codepage text and SQL_C_CHAR output is UTF-8, so the bytes must be
-        // decoded through the column's own collation — the same conversion
-        // `SqlString::to_utf8_string` performs on the non-PLP path, so a value
-        // delivered inline and the same value streamed agree byte for byte
-        // (AB#47566).
-        //
-        // The decoder carries a multi-byte sequence split across a chunk
-        // boundary (a DBCS collation puts two wire bytes on some characters),
-        // and pending_utf8 carries output the caller's buffer had no room for,
-        // since decoding expands: CP1252 0x80 is three UTF-8 bytes.
-        {
-            let Ok(mut ss) = stmt.inner.lock() else {
-                return SQL_ERROR;
-            };
-            let Some(stream) = ss.active_plp.as_mut() else {
-                return SQL_ERROR;
-            };
-            stream.ensure_narrow_decoder();
-            let ActivePlpStream {
-                narrow_decoder,
-                pending_utf8,
-                ..
-            } = stream;
-            let Some(decoder) = narrow_decoder.as_mut() else {
-                error!("SQLGetData: narrow PLP stream has no encoding to convert through");
-                return SQL_ERROR;
-            };
-            let emit = transcode_narrow_into_pending(
-                decoder,
-                pending_utf8,
-                &payload[..read],
-                reached_end,
-                payload_capacity,
-            );
-            unsafe {
-                copy_with_nul(
-                    target_value_ptr as *mut u8,
-                    buffer_length as usize,
-                    &pending_utf8[..emit],
-                );
-                write_if_some(
-                    strlen_or_ind_ptr,
-                    SqlLen::try_from(emit).unwrap_or(SqlLen::MAX),
-                );
-            }
-            pending_utf8.drain(..emit);
-            // Same forward-progress guard as the widening branch: consuming wire
-            // while emitting nothing is progress (the decoder is holding a
-            // partial sequence); doing neither is a stalled stream.
-            debug_assert!(
-                emit > 0 || read > 0 || reached_end || payload_capacity == 0,
-                "narrow to UTF-8 transcode made no forward progress"
-            );
-        }
-    } else {
-        // SQL_C_CHAR delivery of a text PLP column whose wire bytes are already
-        // UTF-8, copied verbatim. `SingleByteText` reaches here only when its
-        // collation is UTF-8 (or did not resolve, where there is nothing to
-        // decode through); anything else took the transcode branch above. The
-        // two arms are kept separate so the distinction stays recorded: `json`
-        // (`Utf8Text`) carries no collation at all and must never be folded into
-        // the codepage conversion, or non-ASCII json silently corrupts.
-        let copy_verbatim = || unsafe {
-            if direct_wire_output {
-                target_value_ptr.cast::<u8>().add(read).write_unaligned(0);
-            } else {
-                copy_with_nul(
-                    target_value_ptr as *mut u8,
-                    buffer_length as usize,
-                    &payload[..read],
-                );
-            }
-            write_if_some(strlen_or_ind_ptr, read as SqlLen);
+                SqlLen::try_from(emitted_utf8).unwrap_or(SqlLen::MAX),
+            )
         };
-        match plp_encoding {
-            // varchar(max)/char/text under a UTF-8 collation — already UTF-8 on
-            // the wire, so verbatim is the conversion.
-            Some(PlpEncoding::SingleByteText) => copy_verbatim(),
-            // json — UTF-8 on the wire; delivered verbatim to SQL_C_CHAR. Must
-            // stay distinct from SingleByteText (see above).
-            Some(PlpEncoding::Utf8Text) => copy_verbatim(),
-            // Utf16Text/Binary/None never reach this branch: the compatibility
-            // gate rejects them or an earlier arm handles them. Assert the
-            // invariant in debug/tests; fall back to a verbatim copy in release
-            // rather than panicking across the FFI boundary (which would be UB).
-            other => {
-                debug_assert!(
-                    false,
-                    "SQL_C_CHAR PLP delivery reached with unexpected encoding {other:?}"
-                );
-                copy_verbatim();
-            }
-        }
     }
 
     let mut stmt_state = match retained_stmt_state {
@@ -2483,79 +2517,27 @@ fn stream_active_plp_chunk<'a>(
         return finish_get_data(stmt, statement_handle, stmt_state, col_index, SQL_SUCCESS);
     }
 
-    // active_plp already holds this column's stream state; leave it in place so
-    // the next SQLGetData call continues from where this one stopped.
-    //
-    // StrLen_or_Ind reports the bytes still available *before* this call's copy,
-    // matching the reference msodbcsql driver: for a known-length PLP value the
-    // server sends the total up front, so each truncated chunk reports a concrete
-    // decreasing remaining count rather than SQL_NO_TOTAL. `total_read` already
-    // includes this read, so the remaining-before-this-call count is
-    // `known_total - (total_read - read)`.
-    //
-    // Two cases still report SQL_NO_TOTAL, and both match msodbcsql:
-    //   * unknown-length (streamed) PLP, where `known_total` is None; and
-    //   * the nvarchar->SQL_C_CHAR transcode path, where delivered UTF-8 bytes do
-    //     not equal wire UTF-16 bytes, so the wire-byte remaining count would be
-    //     the wrong unit. msodbcsql behaves identically here: its GetColData
-    //     length logic (sqlcdata.h) deliberately reports SQL_NO_TOTAL whenever the
-    //     source and destination C types differ in encoding (SQL_C_WCHAR<->
-    //     SQL_C_CHAR), because "we can't know the full size of the converted data
-    //     value until we have converted all of it ... as per spec." Its own tests
-    //     assert this (RegressionsODBC nvarchar->SQL_C_TCHAR under an ANSI client,
-    //     and SQLVariantODBC's "Mplat driver conversion to UTF8 results in
-    //     SQL_NO_TOTAL").
-    //
-    // The varchar->SQL_C_WCHAR widening falls under the same rule and for the
-    // same reason: delivered UTF-16 code units are not wire bytes, so it reports
-    // SQL_NO_TOTAL too.
-    //
-    // The codepage varchar->SQL_C_CHAR conversion does NOT, even though it also
-    // transcodes. msodbcsql keys this decision on the C types, not on whether a
-    // conversion happens: `sqlcdata.h:1230` takes CHAR->CHAR on the first branch
-    // and reports `cbDataAvail` on an explicit "assume a 1:1 conversion ratio"
-    // comment, reaching `VARMAX_LENGTH_UNLIMITED`/SQL_NO_TOTAL only on the
-    // CHAR<->WCHAR branch below it. So a `varchar(max)` read as SQL_C_CHAR keeps
-    // its concrete wire-byte count under every collation. `PlpKnownLengthIndicatorCountsDown`
-    // and `ABoundVarcharMaxTruncatedReportsFullLength` are unskipped cross-leg
-    // parity tests that measure exactly this, and they hold msodbcsql to it.
-    //
-    // Decoded output can outlive the wire, so the carry is added to the wire
-    // count: converting fills `pending_utf8` faster than a small caller buffer
-    // drains it, and once the wire is exhausted the wire term alone is 0. Without
-    // this a drain-only call would report "0 bytes remaining" alongside the
-    // 01004 truncation warning it returns below -- self-contradictory, and it
-    // strands a caller that sizes its next buffer from the indicator rather than
-    // looping on the return code. This is also the term msodbcsql carries as
-    // `cbTruncatedCharsInConvBuf` in the same `sqlcdata.h:1230` expression.
-    //
-    // `utf8_carry_len` is the carry as it stood at entry, which is the value
-    // this indicator is defined in terms of: `wire_remaining` already includes
-    // the bytes read by this call, and the post-drain carry holds output decoded
-    // from those same bytes, so reading it after the fact would count this
-    // call's read twice. `pending_units` needs no equivalent: it is only filled
-    // by the widening path, which reports SQL_NO_TOTAL above.
-    //
-    // Scoped to the arm that owns the carry. `pending_utf8` is only ever filled
-    // by a SQL_C_CHAR call, but it outlives that call, and the compatibility
-    // gate admits a different target on a continuation (`(SQL_C_BINARY, _)`
-    // unconditionally, and SQL_C_WCHAR on a Utf16Text column takes this same
-    // branch). Adding UTF-8 bytes to a binary or UTF-16 delivery's count would
-    // report a number in neither unit; those targets keep the plain wire count
-    // they have on main. Reaching that state needs the mid-stream target switch
-    // tracked in AB#48046, which strands the stream on 01004 regardless -- this
-    // line just does not depend on that being fixed.
-    let held_converted_bytes = if transcode_narrow_to_utf8 {
-        utf8_carry_len as u64
-    } else {
-        0
-    };
+    // Match sqlcdata.h's CHAR->CHAR accounting: unread wire bytes are estimated
+    // 1:1, but bytes already converted must be counted in the output encoding.
+    // Cross-width and unknown-length truncated reads still report SQL_NO_TOTAL.
     let remaining_indicator = if transcode_utf16_to_utf8 || widen_narrow_to_utf16 {
         SQL_NO_TOTAL
+    } else if transcode_narrow_to_utf8 {
+        let pending = stmt_state
+            .active_plp
+            .as_ref()
+            .map_or(0, |s| s.pending_utf8.len());
+        converted_narrow_indicator(
+            known_total,
+            total_read,
+            emitted_utf8.saturating_add(pending),
+        )
     } else if let Some(total) = known_total {
         let consumed_before = total_read.saturating_sub(read) as u64;
         let wire_remaining = total.saturating_sub(consumed_before);
-        (wire_remaining.saturating_add(held_converted_bytes) as SqlLen).saturating_mul(hex_scale)
+        SqlLen::try_from(wire_remaining)
+            .unwrap_or(SqlLen::MAX)
+            .saturating_mul(hex_scale)
     } else {
         SQL_NO_TOTAL
     };
@@ -2563,6 +2545,21 @@ fn stream_active_plp_chunk<'a>(
     post_diag(&mut stmt_state, WARN_STRING_TRUNCATION);
 
     SQL_SUCCESS_WITH_INFO
+}
+
+/// Converted bytes include both emitted output and decoded bytes withheld by
+/// truncation. `total_read` must precede any discard-only drain of the wire.
+/// Bound delivery also excludes any unconverted source abandoned in its decoder.
+pub(crate) fn converted_narrow_indicator(
+    known_total: Option<u64>,
+    total_read: usize,
+    converted_bytes: usize,
+) -> SqlLen {
+    known_total.map_or(SQL_NO_TOTAL, |total| {
+        let remaining = total.saturating_sub(u64::try_from(total_read).unwrap_or(u64::MAX));
+        let converted = u64::try_from(converted_bytes).unwrap_or(u64::MAX);
+        SqlLen::try_from(remaining.saturating_add(converted)).unwrap_or(SqlLen::MAX)
+    })
 }
 
 /// Decodes one chunk of narrow PLP wire bytes to UTF-16 for `SQL_C_WCHAR`
@@ -2578,7 +2575,7 @@ fn stream_active_plp_chunk<'a>(
 /// the wire and the caller advance at rates that are unrelated when the
 /// encoding is variable-width.
 pub(crate) fn widen_into_pending(
-    decoder: &mut Decoder,
+    decoder: &mut ResolvedDecoder,
     pending: &mut Vec<u16>,
     payload: &[u8],
     reached_end: bool,
@@ -2655,20 +2652,12 @@ fn narrow_max_read(payload_capacity: usize, pending_utf8_len: usize) -> usize {
 /// and the caller advance at unrelated rates once the encoding is
 /// variable-width on either side.
 pub(crate) fn transcode_narrow_into_pending(
-    decoder: &mut Decoder,
+    decoder: &mut ResolvedDecoder,
     pending: &mut Vec<u8>,
     payload: &[u8],
     reached_end: bool,
     out_bytes: usize,
 ) -> usize {
-    // Decode onto the tail of `pending`, sized by the decoder's own worst-case
-    // bound so the output slice cannot be short: the consumed-byte count is
-    // discarded below, so `OutputFull` would drop wire bytes silently.
-    // `max_utf8_buffer_length` also accounts for a partial sequence the decoder
-    // is already holding, which a fixed ratio could not. `None` means the length
-    // would overflow `usize`, unreachable while the read is bounded by the
-    // caller's buffer.
-    //
     // `reached_end` flushes any half-formed sequence to U+FFFD, and the decoder
     // must not be used afterwards. Once the wire is exhausted there is nothing
     // left to feed it, so later calls only drain what is already decoded.
@@ -2679,24 +2668,33 @@ pub(crate) fn transcode_narrow_into_pending(
     // than replaced. Same shape as `widen_into_pending` above, which has carried
     // this guard since before this path existed; tracked in AB#48073.
     if !(payload.is_empty() && reached_end) {
-        let base = pending.len();
-        let headroom = decoder
-            .max_utf8_buffer_length(payload.len())
-            .unwrap_or_else(|| payload.len().saturating_mul(3).saturating_add(3));
-        pending.resize(base + headroom, 0);
-        let (result, _, written, _) =
-            decoder.decode_to_utf8(payload, &mut pending[base..], reached_end);
-        debug_assert_eq!(
-            result,
-            encoding_rs::CoderResult::InputEmpty,
-            "narrow transcode output slice was too short, so input bytes were dropped"
-        );
-        pending.truncate(base + written);
+        decode_narrow_into_pending(decoder, pending, payload, reached_end);
     }
     // A character may be split across two SQLGetData calls at the byte level,
     // exactly as the UTF-16 transcode does it: the application concatenates the
     // chunks, so a boundary anywhere in the byte stream is lossless.
     out_bytes.min(pending.len())
+}
+
+/// Appends all decoded output, finalizing the decoder when `last` is true.
+/// The caller must not reuse a finalized decoder, even for an empty input.
+pub(crate) fn decode_narrow_into_pending(
+    decoder: &mut ResolvedDecoder,
+    pending: &mut Vec<u8>,
+    payload: &[u8],
+    last: bool,
+) {
+    let base = pending.len();
+    // The decoder's bound includes held source bytes; a fixed expansion ratio
+    // alone can leave too little room when a chunk completes a partial character.
+    let headroom = decoder
+        .max_utf8_buffer_length(payload.len())
+        .unwrap_or_else(|| payload.len().saturating_mul(3).saturating_add(3));
+    pending.resize(base + headroom, 0);
+    let (result, read, written, _) = decoder.decode_to_utf8(payload, &mut pending[base..], last);
+    debug_assert_eq!(result, encoding_rs::CoderResult::InputEmpty);
+    debug_assert_eq!(read, payload.len());
+    pending.truncate(base + written);
 }
 
 /// Picks how many UTF-16LE wire bytes to read for the UTF-8 room still free.
@@ -3821,7 +3819,7 @@ mod tests {
         chunk_bytes: usize,
         out_units: usize,
     ) -> (String, Vec<usize>) {
-        let mut decoder = encoding.new_decoder_without_bom_handling();
+        let mut decoder = ResolvedEncoding::from(encoding).new_decoder_without_bom_handling();
         let mut pending: Vec<u16> = Vec::new();
         let mut delivered: Vec<u16> = Vec::new();
         let mut per_call = Vec::new();
@@ -3879,7 +3877,8 @@ mod tests {
     #[test]
     fn widening_drains_pending_units_after_the_wire_is_exhausted() {
         let wire = b"abcdef";
-        let mut decoder = encoding_rs::UTF_8.new_decoder_without_bom_handling();
+        let mut decoder =
+            ResolvedEncoding::from(encoding_rs::UTF_8).new_decoder_without_bom_handling();
         let mut pending = Vec::new();
 
         // Whole value arrives at once, but the caller can only take two units.
@@ -3914,7 +3913,8 @@ mod tests {
     /// nothing decoded is lost.
     #[test]
     fn widening_emits_nothing_for_a_zero_capacity_buffer() {
-        let mut decoder = encoding_rs::UTF_8.new_decoder_without_bom_handling();
+        let mut decoder =
+            ResolvedEncoding::from(encoding_rs::UTF_8).new_decoder_without_bom_handling();
         let mut pending = Vec::new();
         let emit = widen_into_pending(&mut decoder, &mut pending, b"abc", false, 0);
         assert_eq!(emit, 0);
@@ -3976,7 +3976,7 @@ mod tests {
         chunk_bytes: usize,
         out_bytes: usize,
     ) -> (String, Vec<usize>) {
-        let mut decoder = encoding.new_decoder_without_bom_handling();
+        let mut decoder = ResolvedEncoding::from(encoding).new_decoder_without_bom_handling();
         let mut pending: Vec<u8> = Vec::new();
         let mut delivered: Vec<u8> = Vec::new();
         let mut per_call = Vec::new();
@@ -4023,7 +4023,8 @@ mod tests {
     /// `widen_into_pending`, tracked in AB#48073.
     #[test]
     fn narrow_transcode_malformed_sequence_at_end_is_replacement() {
-        let mut decoder = encoding_rs::GBK.new_decoder_without_bom_handling();
+        let mut decoder =
+            ResolvedEncoding::from(encoding_rs::GBK).new_decoder_without_bom_handling();
         let mut pending: Vec<u8> = Vec::new();
 
         let emit =
@@ -4109,7 +4110,8 @@ mod tests {
     #[test]
     fn narrow_transcode_drains_pending_after_the_wire_is_exhausted() {
         let wire = encoding_rs::WINDOWS_1252.encode("abcdef").0.into_owned();
-        let mut decoder = encoding_rs::WINDOWS_1252.new_decoder_without_bom_handling();
+        let mut decoder =
+            ResolvedEncoding::from(encoding_rs::WINDOWS_1252).new_decoder_without_bom_handling();
         let mut pending = Vec::new();
 
         let emit = transcode_narrow_into_pending(&mut decoder, &mut pending, &wire, true, 2);
@@ -4129,7 +4131,8 @@ mod tests {
     /// nothing decoded is lost.
     #[test]
     fn narrow_transcode_emits_nothing_for_a_zero_capacity_buffer() {
-        let mut decoder = encoding_rs::WINDOWS_1252.new_decoder_without_bom_handling();
+        let mut decoder =
+            ResolvedEncoding::from(encoding_rs::WINDOWS_1252).new_decoder_without_bom_handling();
         let mut pending = Vec::new();
         let emit = transcode_narrow_into_pending(&mut decoder, &mut pending, b"abc", false, 0);
         assert_eq!(emit, 0);
@@ -7053,6 +7056,205 @@ mod tests {
         );
         assert!(dbc.inner.lock().unwrap().client.is_some());
         assert!(!stmt_handle.inner.lock().unwrap().result_set_exhausted);
+    }
+
+    #[test]
+    fn narrow_counting_flushes_source_held_before_an_empty_final_chunk() {
+        let mut decoder =
+            ResolvedEncoding::from(encoding_rs::SHIFT_JIS).new_decoder_without_bom_handling();
+        let mut output = Vec::new();
+        decode_narrow_into_pending(&mut decoder, &mut output, b"A\x82", false);
+        assert_eq!(output, b"A");
+        decode_narrow_into_pending(&mut decoder, &mut output, &[], true);
+        assert_eq!(output, b"A\xef\xbf\xbd");
+    }
+
+    #[test]
+    fn converted_narrow_lengths_account_for_expansion_contraction_and_unread_wire() {
+        for (total, read, converted, expected) in [
+            (Some(1), 1, 3, 3),
+            (Some(10), 1, 3, 12),
+            (Some(10), 4, 2, 8),
+            (Some(1), 1, 2, 2),
+            (None, 1, 3, SQL_NO_TOTAL),
+            (Some(u64::MAX), 0, usize::MAX, SqlLen::MAX),
+        ] {
+            assert_eq!(converted_narrow_indicator(total, read, converted), expected);
+        }
+    }
+
+    fn prefetched_text_stream(
+        h: &TestHandles,
+        encoding: PlpEncoding,
+        narrow_encoding: Option<ResolvedEncoding>,
+        wire: Vec<u8>,
+        known_total: Option<u64>,
+    ) {
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let mut stream = ActivePlpStream::new(1, encoding, narrow_encoding);
+        let len = wire.len();
+        stream.set_prefetched_wire(wire, len, 0, known_total, true);
+        let mut state = stmt.inner.lock().unwrap();
+        state.set_state(STMT_STATE_CURSOR_OPEN);
+        state.column_metadata = int_columns(1);
+        state.current_row_last_col = 1;
+        state.row_positioned = true;
+        state.active_plp = Some(stream);
+    }
+
+    #[test]
+    fn streamed_char_fills_fitting_values_in_one_call() {
+        for (encoding, narrow, wire, expected) in [
+            (
+                PlpEncoding::SingleByteText,
+                Some(encoding_rs::WINDOWS_1252.into()),
+                b"ab".to_vec(),
+                b"ab".to_vec(),
+            ),
+            (
+                PlpEncoding::Utf16Text,
+                None,
+                utf16le("abc"),
+                b"abc".to_vec(),
+            ),
+            (
+                PlpEncoding::SingleByteText,
+                Some(encoding_rs::GBK.into()),
+                vec![0x81, 0x30, 0x81, 0x30],
+                vec![0xc2, 0x80],
+            ),
+        ] {
+            for known in [false, true] {
+                let h = TestHandles::with_env_dbc_stmt();
+                let total = known.then_some(wire.len() as u64);
+                prefetched_text_stream(&h, encoding, narrow, wire.clone(), total);
+                let mut buffer = [0xcc_u8; 5];
+                let mut indicator = -99;
+                let rc = unsafe {
+                    sql_get_data(
+                        h.stmt,
+                        1,
+                        SQL_C_CHAR,
+                        buffer.as_mut_ptr().cast(),
+                        4,
+                        &mut indicator,
+                    )
+                };
+                assert_eq!(rc, SQL_SUCCESS);
+                assert_eq!(indicator, expected.len() as SqlLen);
+                assert_eq!(&buffer[..expected.len()], expected);
+                assert_eq!(buffer[expected.len()], 0);
+                assert!(buffer[expected.len() + 1..].iter().all(|&b| b == 0xcc));
+                let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+                assert!(stmt.inner.lock().unwrap().diag_records.is_empty());
+                assert_eq!(
+                    unsafe {
+                        sql_get_data(
+                            h.stmt,
+                            1,
+                            SQL_C_CHAR,
+                            buffer.as_mut_ptr().cast(),
+                            4,
+                            &mut indicator,
+                        )
+                    },
+                    SQL_NO_DATA
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn streamed_char_probes_and_carry_preserve_remaining_lengths() {
+        for (encoding, wire, output) in [
+            (
+                encoding_rs::WINDOWS_1252,
+                vec![0x80, b'a'],
+                vec![0xe2, 0x82, 0xac, b'a'],
+            ),
+            // The GBK decoder also accepts GB18030: four input bytes become two.
+            (
+                encoding_rs::GBK,
+                vec![0x81, 0x30, 0x81, 0x30, b'a'],
+                vec![0xc2, 0x80, b'a'],
+            ),
+        ] {
+            for known in [false, true] {
+                let h = TestHandles::with_env_dbc_stmt();
+                prefetched_text_stream(
+                    &h,
+                    PlpEncoding::SingleByteText,
+                    Some(encoding.into()),
+                    wire.clone(),
+                    known.then_some(wire.len() as u64),
+                );
+                for capacity in [0, 1] {
+                    let mut buffer = [0xcc_u8; 3];
+                    let mut indicator = -99;
+                    assert_eq!(
+                        unsafe {
+                            sql_get_data(
+                                h.stmt,
+                                1,
+                                SQL_C_CHAR,
+                                buffer.as_mut_ptr().cast(),
+                                capacity,
+                                &mut indicator,
+                            )
+                        },
+                        SQL_SUCCESS_WITH_INFO
+                    );
+                    assert_eq!(
+                        indicator,
+                        if known {
+                            wire.len() as SqlLen
+                        } else {
+                            SQL_NO_TOTAL
+                        }
+                    );
+                    assert_eq!(
+                        buffer,
+                        if capacity == 0 {
+                            [0xcc; 3]
+                        } else {
+                            [0, 0xcc, 0xcc]
+                        }
+                    );
+                }
+                for (index, &byte) in output.iter().enumerate() {
+                    let mut buffer = [0xcc_u8; 3];
+                    let mut indicator = -99;
+                    let rc = unsafe {
+                        sql_get_data(
+                            h.stmt,
+                            1,
+                            SQL_C_CHAR,
+                            buffer.as_mut_ptr().cast(),
+                            2,
+                            &mut indicator,
+                        )
+                    };
+                    assert_eq!(buffer, [byte, 0, 0xcc]);
+                    let complete = index == output.len() - 1;
+                    assert_eq!(
+                        rc,
+                        if complete {
+                            SQL_SUCCESS
+                        } else {
+                            SQL_SUCCESS_WITH_INFO
+                        }
+                    );
+                    assert_eq!(
+                        indicator,
+                        if complete || known {
+                            (output.len() - index) as SqlLen
+                        } else {
+                            SQL_NO_TOTAL
+                        }
+                    );
+                }
+            }
+        }
     }
 
     #[test]

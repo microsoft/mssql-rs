@@ -1574,16 +1574,17 @@ impl TdsValueSerializer {
         Ok(())
     }
 
-    /// Encodes `text` into the single-byte wire representation used for
-    /// VARCHAR/CHAR/TEXT: `collation`'s codepage, or a Latin-1-like mapping
+    /// Encodes `text` into the legacy wire representation used for
+    /// VARCHAR/CHAR/TEXT: `collation`'s LCID codepage, or a Latin-1-like mapping
     /// (anything above U+00FF becomes `?`) when no collation is known.
     ///
     /// Extracted from [`Self::serialize_string`]'s `VARCHAR | CHAR | TEXT` arm
     /// so it stays available to a caller needing that exact behaviour.
-    /// Deliberately does not special-case a UTF-8-aware collation the way
-    /// [`encode_narrow`] does -- changing that here would alter
-    /// `serialize_string`'s already-shipped behaviour, which is out of scope;
-    /// tracked separately under AB#47590. This is `serialize_string`'s helper
+    /// Unlike [`encode_narrow`], ignores both the UTF-8 flag and SQL sort ID.
+    /// Unifying this path with the shared resolver changes inline parameter
+    /// serialization and is deferred alongside the UTF-8 discrepancy in
+    /// AB#47590, rather than folded into the fetch fix in #627.
+    /// This is `serialize_string`'s helper
     /// only: [`Self::resolve_narrow_wire_bytes`] always resolves a concrete
     /// collation (see [`DEFAULT_VARIANT_COLLATION`]) and calls [`encode_narrow`]
     /// directly, so it never reaches this function's own no-collation case.

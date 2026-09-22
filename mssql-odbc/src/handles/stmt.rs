@@ -20,9 +20,8 @@ use crate::conversion::param_convert::{DaeLengthLimit, DaePlan, DaeTranscode};
 use crate::error::{DiagRecord, HasDiagnostics};
 use crate::params::BoundParam;
 use mssql_tds::datatypes::column_values::ColumnValues;
+use mssql_tds::datatypes::sql_string::{ResolvedDecoder, ResolvedEncoding};
 use mssql_tds::datatypes::sqldatatypes::TdsDataType;
-use mssql_tds::encoding_rs;
-use mssql_tds::encoding_rs::Decoder;
 use mssql_tds::message::parameters::rpc_parameters::RpcParameter;
 use mssql_tds::query::metadata::{ColumnMetadata, PlpEncoding};
 use mssql_tds::query::result::ReturnValue;
@@ -52,7 +51,7 @@ pub(crate) struct ActivePlpStream {
     /// only on a continuation call still finds it — unlike a decoder built from
     /// the first call's target, which would leave a `SQL_C_BINARY`-first stream
     /// unable to convert later.
-    pub(crate) narrow_encoding: Option<&'static encoding_rs::Encoding>,
+    pub(crate) narrow_encoding: Option<ResolvedEncoding>,
     /// Incremental decoder over `narrow_encoding`, built by
     /// [`Self::ensure_narrow_decoder`] the first time a target actually needs to
     /// convert. Serves both directions: to UTF-16LE for `SQL_C_WCHAR`
@@ -65,7 +64,7 @@ pub(crate) struct ActivePlpStream {
     /// UTF-8), so a chunk boundary can split one character across two reads.
     /// `encoding_rs::Decoder` already holds that partial sequence internally,
     /// which keeps the boundary rule in one place instead of one per codepage.
-    pub(crate) narrow_decoder: Option<Decoder>,
+    pub(crate) narrow_decoder: Option<ResolvedDecoder>,
     /// Code units already decoded on a previous call that did not fit the
     /// caller's buffer, delivered before any further wire bytes.
     ///
@@ -105,7 +104,7 @@ impl ActivePlpStream {
     pub(crate) fn new(
         column: usize,
         encoding: PlpEncoding,
-        narrow_encoding: Option<&'static encoding_rs::Encoding>,
+        narrow_encoding: Option<ResolvedEncoding>,
     ) -> Self {
         Self {
             column,

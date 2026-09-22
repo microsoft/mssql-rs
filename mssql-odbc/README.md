@@ -217,6 +217,14 @@ checks real-server truncation; the Rust
 server to force a surrogate pair across a PLP chunk boundary that a SQL query
 cannot control.
 
+Bound narrow-codepage `SQL_C_CHAR` truncation converts only a buffer-sized
+prefix, then drains the remaining wire bytes without conversion. For a known
+length, the indicator estimates unread source bytes at 1:1 plus converted
+output (including withheld characters), matching classic msodbcsql's
+`sqlcdata.h` accounting before `FlushData`. Source held by a DBCS decoder stays
+in the unconverted count; unknown lengths remain `SQL_NO_TOTAL`. A fitting
+value reports its exact UTF-8 length. `SQLGetData` keeps its resumable behavior.
+
 Materialized CP1252 `varchar` values delivered as `SQL_C_WCHAR` decode directly
 to bounded UTF-16 scratch space, without allocating a UTF-8 string or copying
 borrowed source bytes. Each CP1252 byte produces one UTF-16 unit, so repeated
