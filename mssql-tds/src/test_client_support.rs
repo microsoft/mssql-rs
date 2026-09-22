@@ -19,6 +19,13 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 
+/// Metadata strategy for testing bulk copy with custom or cached metadata.
+pub use crate::connection::metadata_retriever::MetadataRetriever;
+/// Quote identifiers used in test setup SQL.
+pub use crate::sql_identifier::escape_identifier;
+
+pub use crate::message::parameters::rpc_parameters::rpc_parameter_status;
+
 use crate::connection::client_context::ClientContext;
 use crate::connection::execution_context::ExecutionContext;
 use crate::connection::tds_client::TdsClient;
@@ -27,7 +34,9 @@ use crate::connection::transport::network_transport::TransportSslHandler;
 use crate::connection::transport::tds_transport::TdsTransport;
 use crate::core::{CancelHandle, NegotiatedEncryptionSetting, TdsResult};
 use crate::datatypes::row_writer::RowWriter;
-use crate::datatypes::sqldatatypes::{TdsDataType, TypeInfo};
+use crate::datatypes::sqldatatypes::{
+    PartialLengthType, TdsDataType, TypeInfo, TypeInfoVariant, UdtInfo, UdtInfoInColMetadata,
+};
 use crate::handler::handler_factory::create_test_negotiated_settings_internal;
 use crate::io::reader_writer::{NetworkReader, NetworkWriter};
 use crate::io::token_stream::{
@@ -285,7 +294,11 @@ impl TdsTransport for TokenReplayTransport {
     async fn close_transport(&mut self) -> TdsResult<()> {
         Ok(())
     }
-    async fn send_attention_with_timeout(&mut self, _timeout: Duration) -> TdsResult<bool> {
+    async fn send_attention_with_timeout(
+        &mut self,
+        _context: &ParserContext,
+        _timeout: Duration,
+    ) -> TdsResult<bool> {
         Ok(false)
     }
     fn is_connection_dead(&self) -> bool {
@@ -444,6 +457,31 @@ pub fn udt_column(max_byte_size: u16) -> ColumnMetadata {
         multi_part_name: None,
         crypto_metadata: None,
     }
+}
+
+/// A nullable CLR UDT column with identity metadata from `COLMETADATA`.
+pub fn udt_column_with_metadata(
+    max_byte_size: u16,
+    db_name: &str,
+    schema_name: &str,
+    type_name: &str,
+    assembly_qualified_name: &str,
+) -> ColumnMetadata {
+    let mut column = udt_column(max_byte_size);
+    column.type_info.type_info_variant = TypeInfoVariant::PartialLen(
+        PartialLengthType::Udt,
+        Some(usize::from(max_byte_size)),
+        None,
+        None,
+        Some(UdtInfo::InColMetadata(UdtInfoInColMetadata::new(
+            max_byte_size,
+            db_name.to_string(),
+            schema_name.to_string(),
+            type_name.to_string(),
+            assembly_qualified_name.to_string(),
+        ))),
+    );
+    column
 }
 
 /// Inline integer columns followed by one deferred `nvarchar(max)` column.
@@ -777,7 +815,11 @@ pub(crate) mod byte_stream {
         async fn close_transport(&mut self) -> TdsResult<()> {
             Ok(())
         }
-        async fn send_attention_with_timeout(&mut self, _timeout: Duration) -> TdsResult<bool> {
+        async fn send_attention_with_timeout(
+            &mut self,
+            _context: &ParserContext,
+            _timeout: Duration,
+        ) -> TdsResult<bool> {
             Ok(false)
         }
         fn is_connection_dead(&self) -> bool {

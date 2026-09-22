@@ -3,9 +3,13 @@
 
 //! Implementation of SQLDescribeParam.
 
+use std::time::Instant;
+
 use tracing::{debug, error};
 
-use mssql_tds::connection::tds_client::ResultSet;
+use crate::api::escape::describe_text;
+
+use mssql_tds::connection::tds_client::{ExecuteOptions, ResultSet};
 use mssql_tds::datatypes::column_values::ColumnValues;
 use mssql_tds::datatypes::sql_string::SqlString;
 use mssql_tds::datatypes::sqldatatypes::TdsDataType;
@@ -13,7 +17,8 @@ use mssql_tds::datatypes::sqltypes::SqlType;
 use mssql_tds::message::parameters::rpc_parameters::{RpcParameter, StatusFlags};
 
 use super::exec_common::{
-    claim_connection, fail_with_tds, flush_pending_unprepare, return_client_idle,
+    claim_connection, deduct_query_timeout, fail_with_tds, flush_pending_unprepare,
+    query_timeout_expired_error, return_client_idle,
 };
 use super::odbc_types::*;
 use super::sqlstate::*;
@@ -22,7 +27,7 @@ use super::util::write_if_some;
 use crate::api::type_rules::parameter_size_is_precision;
 use crate::error::{free_errors, post_sql_error};
 use crate::handles::stmt::{ParameterDescription, STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_STARTED};
-use crate::handles::{DescHandle, HandleType, OdbcVersion, StmtHandle, handle_from_raw};
+use crate::handles::{DescHandle, HandleType, StmtHandle, handle_from_raw};
 
 use super::set_desc_field::datetime_interval_code_for;
 
@@ -33,6 +38,16 @@ const SUGGESTED_PRECISION: usize = 5;
 const SUGGESTED_SCALE: usize = 6;
 const SUGGESTED_TDS_TYPE_ID: usize = 22;
 const SUGGESTED_TDS_LENGTH: usize = 23;
+
+/// The description msodbcsql reports for the return-status parameter of
+/// `{? = call ...}`: a nullable `SQL_INTEGER` of precision 10, scale 0.
+/// Measured against msodbcsql 18.6.2.1.
+const RETURN_STATUS_DESCRIPTION: ParameterDescription = ParameterDescription {
+    data_type: SQL_INTEGER,
+    parameter_size: 10,
+    decimal_digits: 0,
+    nullable: SQL_NULLABLE,
+};
 
 /// Describes a prepared statement parameter.
 ///
@@ -118,16 +133,8 @@ fn sql_describe_param_safe(
     nullable_ptr: *mut SqlSmallInt,
 ) -> SqlReturn {
     let dbc = stmt.parent_dbc();
-    let is_odbc3 = {
-        let env = dbc.parent_env();
-        let Ok(env_state) = env.inner.lock() else {
-            error!("SQLDescribeParam: env mutex poisoned");
-            return SQL_ERROR;
-        };
-        env_state.odbc_version != OdbcVersion::Odbc2
-    };
 
-    let (sql, marker_count) = {
+    let (sql, marker_count, return_status, query_timeout) = {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("SQLDescribeParam: stmt mutex poisoned");
             return SQL_ERROR;
@@ -181,29 +188,74 @@ fn sql_describe_param_safe(
             return SQL_ERROR;
         }
 
-        let sql = plan.stmt.sql().to_string();
+        // Described from the text the application supplied, re-translated
+        // here rather than reused from the prepared plan: the metadata RPC
+        // cannot parse `{call ...}`, so describe must translate even when
+        // SQL_ATTR_NOSCAN suppressed it at prepare time.
+        let (sql, return_status) = match describe_text(&plan.original_sql) {
+            Ok(parts) => parts,
+            Err(e) => {
+                error!(error = %e, "SQLDescribeParam: escape translation failed");
+                post_sql_error(&mut stmt_state, e.state(), 0, e.message());
+                return SQL_ERROR;
+            }
+        };
         stmt_state.set_state(STMT_STATE_EXEC_STARTED);
-        (sql, marker_count)
+        (sql, marker_count, return_status, stmt_state.query_timeout)
     };
 
     let mut client = match claim_connection(dbc, stmt, statement_handle, "SQLDescribeParam") {
         Ok(client) => client,
         Err(rc) => return rc,
     };
-    // Not SQLExecute/SQLExecDirectW, so out of scope for the
-    // SQL_ATTR_QUERY_TIMEOUT wiring; `0` keeps existing unbounded behavior.
-    flush_pending_unprepare(dbc, stmt, &mut client, "SQLDescribeParam", 0);
+    let budget = query_timeout;
+    let started = Instant::now();
 
-    if let Err(e) = begin_transaction_if_manual(dbc, &mut client, "SQLDescribeParam", 0) {
+    // `sp_describe_undeclared_parameters` is a real server round trip, so
+    // `SQL_ATTR_QUERY_TIMEOUT` bounds it. The ODBC reference page for
+    // SQLDescribeParam does not list `HYT00`, but msodbcsql bounds this path
+    // regardless — `SQLDescribeParam` reaches `AutoFillIPD`, which reads
+    // `GetQueryTimeOut(lpstmt)` (`sqlcdesc.cpp:9379`) — so matching it is a
+    // parity requirement, not a discretionary extra. `0` stays unlimited.
+    flush_pending_unprepare(dbc, stmt, &mut client, "SQLDescribeParam", query_timeout);
+
+    let query_timeout = match deduct_query_timeout(budget, started.elapsed()) {
+        Ok(remaining) => remaining,
+        Err(()) => {
+            return fail_with_tds(
+                dbc,
+                stmt,
+                statement_handle,
+                client,
+                &query_timeout_expired_error(),
+            );
+        }
+    };
+
+    if let Err(e) = begin_transaction_if_manual(dbc, &mut client, "SQLDescribeParam", query_timeout)
+    {
         return fail_with_tds(dbc, stmt, statement_handle, client, &e);
     }
+
+    let query_timeout = match deduct_query_timeout(budget, started.elapsed()) {
+        Ok(remaining) => remaining,
+        Err(()) => {
+            return fail_with_tds(
+                dbc,
+                stmt,
+                statement_handle,
+                client,
+                &query_timeout_expired_error(),
+            );
+        }
+    };
 
     let command = RpcParameter::new(None, StatusFlags::NONE, metadata_request_value(sql));
     let execute_result = dbc.runtime.block_on(client.execute_stored_procedure(
         DESCRIBE_PARAMETERS_PROC.to_string(),
         Some(vec![command]),
         None,
-        (),
+        ExecuteOptions::new().timeout_secs(query_timeout),
     ));
     if let Err(e) = execute_result {
         error!(%e, "SQLDescribeParam: metadata RPC failed");
@@ -226,7 +278,8 @@ fn sql_describe_param_safe(
         }
     }
 
-    let mut collector = DescriptionCollector::new(marker_count);
+    let described_count = marker_count - usize::from(return_status);
+    let mut collector = DescriptionCollector::new(described_count);
     // INVARIANT: a row that cannot be mapped must not leave this loop early.
     // The result set has to be drained and `close_query()` called below, or the
     // connection is left mid-result and every later operation on it fails. That
@@ -234,7 +287,7 @@ fn sql_describe_param_safe(
     // *after* the drain, rather than propagated with `?` or an early `return`.
     let parse_result = loop {
         match dbc.runtime.block_on(client.next_row()) {
-            Ok(Some(row)) => match parse_parameter_row(&row, marker_count, is_odbc3) {
+            Ok(Some(row)) => match parse_parameter_row(&row, described_count) {
                 Ok((index, description)) => {
                     if let Err(e) = collector.accept(index, description) {
                         break Err(e);
@@ -251,12 +304,20 @@ fn sql_describe_param_safe(
         return fail_with_tds(dbc, stmt, statement_handle, client, &e);
     }
 
-    let descriptions = match parse_result.and_then(|()| collector.finish()) {
+    let mut descriptions = match parse_result.and_then(|()| collector.finish()) {
         Ok(descriptions) => descriptions,
         Err(e) => {
             return fail_metadata_response(dbc, stmt, statement_handle, client, &e);
         }
     };
+
+    // `{? = call ...}` puts the procedure's return status in parameter 1. The
+    // server never describes it — it is not an argument — so it is prepended
+    // here as the integer msodbcsql reports for it (measured: SQL_INTEGER,
+    // precision 10, scale 0, nullable).
+    if return_status {
+        descriptions.insert(0, RETURN_STATUS_DESCRIPTION);
+    }
 
     let info_messages = client.take_info_messages();
     return_client_idle(dbc, statement_handle, client);
@@ -410,7 +471,6 @@ fn write_description(
 fn parse_parameter_row(
     row: &[ColumnValues],
     marker_count: usize,
-    is_odbc3: bool,
 ) -> Result<(usize, ParameterDescription), String> {
     let ordinal = read_i32(row, PARAMETER_ORDINAL, "parameter_ordinal")?;
     let index = usize::try_from(ordinal)
@@ -429,7 +489,7 @@ fn parse_parameter_row(
 
     Ok((
         index,
-        describe_tds_type(data_type, length, precision, scale, is_odbc3)?,
+        describe_tds_type(data_type, length, precision, scale)?,
     ))
 }
 
@@ -438,7 +498,6 @@ fn describe_tds_type(
     length: i32,
     precision: Option<u8>,
     scale: Option<u8>,
-    is_odbc3: bool,
 ) -> Result<ParameterDescription, String> {
     let (data_type, parameter_size, decimal_digits) = match data_type {
         TdsDataType::Bit | TdsDataType::BitN => (SQL_BIT, 1, 0),
@@ -453,11 +512,11 @@ fn describe_tds_type(
             8 => (SQL_BIGINT, 19, 0),
             _ => return Err(format!("invalid INTN length {length}")),
         },
-        TdsDataType::Flt4 => (SQL_REAL, float_precision(SQL_REAL, is_odbc3), 0),
-        TdsDataType::Flt8 => (SQL_FLOAT, float_precision(SQL_FLOAT, is_odbc3), 0),
+        TdsDataType::Flt4 => (SQL_REAL, float_precision(SQL_REAL), 0),
+        TdsDataType::Flt8 => (SQL_FLOAT, float_precision(SQL_FLOAT), 0),
         TdsDataType::FltN => match length {
-            4 => (SQL_REAL, float_precision(SQL_REAL, is_odbc3), 0),
-            8 => (SQL_FLOAT, float_precision(SQL_FLOAT, is_odbc3), 0),
+            4 => (SQL_REAL, float_precision(SQL_REAL), 0),
+            8 => (SQL_FLOAT, float_precision(SQL_FLOAT), 0),
             _ => return Err(format!("invalid FLTN length {length}")),
         },
         TdsDataType::Decimal | TdsDataType::DecimalN => {
@@ -584,17 +643,14 @@ fn describe_tds_type(
     })
 }
 
-/// ODBC 3.x reports binary precision for the approximate numeric types, ODBC 2.x
-/// decimal digits.
-fn float_precision(data_type: SqlSmallInt, is_odbc3: bool) -> SqlULen {
-    match (data_type, is_odbc3) {
-        (SQL_REAL, true) => 24,
-        (SQL_FLOAT, true) => 53,
-        (SQL_REAL, false) => 7,
-        (SQL_FLOAT, false) => 15,
+/// ODBC 3.x reports binary precision for the approximate numeric types.
+fn float_precision(data_type: SqlSmallInt) -> SqlULen {
+    match data_type {
+        SQL_REAL => 24,
+        SQL_FLOAT => 53,
         _ => {
             debug_assert!(false, "float_precision called with {data_type}");
-            15
+            53
         }
     }
 }
@@ -787,6 +843,206 @@ mod tests {
         );
     }
 
+    /// `SQL_ATTR_QUERY_TIMEOUT` must bound `SQLDescribeParam`'s
+    /// `sp_describe_undeclared_parameters` round trip.
+    ///
+    /// The ODBC reference page for `SQLDescribeParam` does not list `HYT00`,
+    /// but msodbcsql bounds this path anyway — `SQLDescribeParam` reaches
+    /// `AutoFillIPD`, which reads `GetQueryTimeOut(lpstmt)`
+    /// (`sqlcdesc.cpp:9379`) — so matching it is a parity requirement, not a
+    /// discretionary extra. Delays the RPC response itself (via
+    /// `RPC_DELAY_KEY`), so this fails if the timeout stops reaching the RPC's
+    /// own `ExecuteOptions` (mssql-rs#466).
+    #[test]
+    fn describe_param_query_timeout_bounds_a_longer_server_delay() {
+        use crate::handles::dbc::DbcHandle;
+        use mssql_mock_tds::QueryResponse;
+        use std::time::{Duration, Instant};
+
+        const RESPONSE_DELAY: Duration = Duration::from_secs(8);
+        const STMT_TIMEOUT_SECS: u32 = 1;
+        // Comfortably above STMT_TIMEOUT_SECS plus connection/RTT overhead,
+        // comfortably below RESPONSE_DELAY — the gap is what proves the
+        // statement timeout, not the server delay, ended the wait.
+        const BOUND: Duration = Duration::from_secs(5);
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let mock_server =
+            crate::test_support::connect_mock_server(dbc, "SELECT 1", QueryResponse::select_one());
+        mock_server.set_rpc_delay(RESPONSE_DELAY);
+
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.prepared = Some(crate::handles::stmt::PreparedPlan {
+                stmt: PreparedStatement::new("SELECT @P1".to_string()),
+                original_sql: "SELECT ?".to_string(),
+                marker_count: 1,
+            });
+            state.query_timeout = STMT_TIMEOUT_SECS;
+        }
+
+        let started = Instant::now();
+        let rc = sql_describe_param_safe(
+            h.stmt,
+            stmt,
+            1,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        );
+        let elapsed = started.elapsed();
+
+        assert_eq!(rc, SQL_ERROR);
+        assert!(
+            elapsed < BOUND,
+            "SQLDescribeParam took {elapsed:?} — a {STMT_TIMEOUT_SECS}s SQL_ATTR_QUERY_TIMEOUT \
+             must bound the wait well below the server's {RESPONSE_DELAY:?} delay"
+        );
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(
+            state.diag_records[0].sql_state, *b"HYT00",
+            "a query-timeout expiry must report HYT00, got {:?}",
+            state.diag_records[0].sql_state
+        );
+    }
+
+    /// The AC2 counterpart to the test above: `SQL_ATTR_QUERY_TIMEOUT` must
+    /// also bound the implicit transaction begin that precedes the metadata
+    /// RPC. The sibling only delays the RPC response, so reverting the
+    /// pre-execute arguments to `0` left it green; this delays only the Begin
+    /// request.
+    #[test]
+    fn describe_param_query_timeout_bounds_a_delayed_implicit_transaction_begin() {
+        use crate::handles::dbc::DbcHandle;
+        use mssql_mock_tds::QueryResponse;
+        use std::time::{Duration, Instant};
+
+        const BEGIN_DELAY: Duration = Duration::from_secs(8);
+        const STMT_TIMEOUT_SECS: u32 = 1;
+        const BOUND: Duration = Duration::from_secs(5);
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let mock_server =
+            crate::test_support::connect_mock_server(dbc, "SELECT 1", QueryResponse::select_one());
+        mock_server.set_tm_begin_delay(BEGIN_DELAY);
+        dbc.inner.lock().unwrap().autocommit = false;
+
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.prepared = Some(crate::handles::stmt::PreparedPlan {
+                stmt: PreparedStatement::new("SELECT @P1".to_string()),
+                original_sql: "SELECT ?".to_string(),
+                marker_count: 1,
+            });
+            state.query_timeout = STMT_TIMEOUT_SECS;
+        }
+
+        let started = Instant::now();
+        let rc = sql_describe_param_safe(
+            h.stmt,
+            stmt,
+            1,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        );
+        let elapsed = started.elapsed();
+
+        assert_eq!(rc, SQL_ERROR);
+        assert!(
+            elapsed < BOUND,
+            "SQLDescribeParam took {elapsed:?} — a {STMT_TIMEOUT_SECS}s SQL_ATTR_QUERY_TIMEOUT \
+             must bound the implicit transaction begin well below the server's \
+             {BEGIN_DELAY:?} delay"
+        );
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(
+            state.diag_records[0].sql_state, *b"HYT00",
+            "a query-timeout expiry must report HYT00, got {:?}",
+            state.diag_records[0].sql_state
+        );
+    }
+
+    /// The `SQLDescribeParam` counterpart to `catalog.rs`'s
+    /// `catalog_query_timeout_exhausted_by_unprepare_fails_before_sending`:
+    /// a swallowed best-effort unprepare timeout must leave the budget
+    /// exhausted and stop the call before the metadata RPC is sent.
+    #[test]
+    fn describe_param_query_timeout_exhausted_by_unprepare_fails_before_sending() {
+        use crate::handles::dbc::DbcHandle;
+        use mssql_mock_tds::QueryResponse;
+        use std::time::{Duration, Instant};
+
+        const RESPONSE_DELAY: Duration = Duration::from_secs(8);
+        const STMT_TIMEOUT_SECS: u32 = 1;
+        // A sanity bound, not the discriminator: the call must finish far
+        // inside the server's delay. What this test actually pins down is the
+        // budget-exhausted arm itself — a bypassed deduction also fails fast
+        // here, so that would not show up as a timing difference.
+        const BOUND: Duration = Duration::from_secs(5);
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let mock_server =
+            crate::test_support::connect_mock_server(dbc, "SELECT 1", QueryResponse::select_one());
+        mock_server.set_rpc_delay(RESPONSE_DELAY);
+
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        crate::test_support::arm_pending_unprepare(dbc, stmt);
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.prepared = Some(crate::handles::stmt::PreparedPlan {
+                stmt: PreparedStatement::new("SELECT @P1".to_string()),
+                original_sql: "SELECT ?".to_string(),
+                marker_count: 1,
+            });
+            state.query_timeout = STMT_TIMEOUT_SECS;
+        }
+
+        let started = Instant::now();
+        let rc = sql_describe_param_safe(
+            h.stmt,
+            stmt,
+            1,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        );
+        let elapsed = started.elapsed();
+
+        assert_eq!(rc, SQL_ERROR);
+        assert!(
+            elapsed < BOUND,
+            "SQLDescribeParam took {elapsed:?} — the {STMT_TIMEOUT_SECS}s budget was already \
+             spent by the unprepare, so the metadata RPC must not have been sent at all"
+        );
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(
+            state.diag_records[0].sql_state, *b"HYT00",
+            "an exhausted budget must report HYT00, got {:?}",
+            state.diag_records[0].sql_state
+        );
+        // This is what makes the test mutation-resistant: the two paths carry
+        // different text. Reaching the RPC and timing out there yields
+        // "Elapsed: deadline has elapsed", so only the pre-send budget check
+        // produces this message.
+        assert!(
+            state.diag_records[0]
+                .message
+                .contains("expired before the statement could be sent"),
+            "the budget must be found exhausted before the RPC is sent, not by the RPC's own \
+             timeout: {}",
+            state.diag_records[0].message
+        );
+    }
+
     #[test]
     fn invalid_ordinal_returns_07009_without_io() {
         let h = TestHandles::with_env_dbc_stmt();
@@ -796,6 +1052,7 @@ mod tests {
             state.prepared = Some(crate::handles::stmt::PreparedPlan {
                 stmt: PreparedStatement::new("SELECT @P1".to_string()),
                 marker_count: 1,
+                original_sql: String::new(),
             });
         }
 
@@ -825,6 +1082,7 @@ mod tests {
             state.prepared = Some(crate::handles::stmt::PreparedPlan {
                 stmt: PreparedStatement::new("SELECT @P1".to_string()),
                 marker_count: 1,
+                original_sql: String::new(),
             });
             state.parameter_metadata.push(ParameterDescription {
                 data_type: SQL_INTEGER,
@@ -880,6 +1138,7 @@ mod tests {
             state.prepared = Some(crate::handles::stmt::PreparedPlan {
                 stmt: PreparedStatement::new("SELECT @P1".to_string()),
                 marker_count: 1,
+                original_sql: String::new(),
             });
         }
 
@@ -918,7 +1177,7 @@ mod tests {
     #[test]
     fn parses_mssql_python_integer_metadata() {
         let (_, description) =
-            parse_parameter_row(&row(1, TdsDataType::IntN, 4, 10, 0), 1, true).unwrap();
+            parse_parameter_row(&row(1, TdsDataType::IntN, 4, 10, 0), 1).unwrap();
         assert_eq!(
             description,
             ParameterDescription {
@@ -973,7 +1232,7 @@ mod tests {
         ];
 
         for (row, expected) in cases {
-            assert_eq!(parse_parameter_row(&row, 1, true).unwrap().1, expected);
+            assert_eq!(parse_parameter_row(&row, 1).unwrap().1, expected);
         }
     }
 
@@ -981,7 +1240,7 @@ mod tests {
     fn udt_parameter_size_matches_msodbcsql() {
         for length in [892, -1, i32::from(u16::MAX)] {
             let (_, description) =
-                parse_parameter_row(&row(1, TdsDataType::Udt, length, 0, 0), 1, true).unwrap();
+                parse_parameter_row(&row(1, TdsDataType::Udt, length, 0, 0), 1).unwrap();
 
             assert_eq!(
                 description,
@@ -997,9 +1256,9 @@ mod tests {
 
     #[test]
     fn rejects_invalid_server_metadata() {
-        assert!(parse_parameter_row(&row(2, TdsDataType::IntN, 4, 10, 0), 1, true).is_err());
-        assert!(parse_parameter_row(&row(1, TdsDataType::DecimalN, 17, 0, 0), 1, true).is_err());
-        assert!(parse_parameter_row(&row(1, TdsDataType::TimeN, 5, 0, 8), 1, true).is_err());
+        assert!(parse_parameter_row(&row(2, TdsDataType::IntN, 4, 10, 0), 1).is_err());
+        assert!(parse_parameter_row(&row(1, TdsDataType::DecimalN, 17, 0, 0), 1).is_err());
+        assert!(parse_parameter_row(&row(1, TdsDataType::TimeN, 5, 0, 8), 1).is_err());
     }
 
     /// A scale-bearing type whose scale column is NULL describes something other
@@ -1008,14 +1267,14 @@ mod tests {
     fn rejects_missing_scale_for_scale_bearing_types() {
         let mut time_row = row(1, TdsDataType::TimeN, 5, 0, 3);
         time_row[SUGGESTED_SCALE] = ColumnValues::Null;
-        assert!(parse_parameter_row(&time_row, 1, true).is_err());
+        assert!(parse_parameter_row(&time_row, 1).is_err());
 
         let mut decimal_row = row(1, TdsDataType::DecimalN, 17, 12, 3);
         decimal_row[SUGGESTED_PRECISION] = ColumnValues::Null;
-        assert!(parse_parameter_row(&decimal_row, 1, true).is_err());
+        assert!(parse_parameter_row(&decimal_row, 1).is_err());
 
         // A type with no scale is unaffected by the NULL its row already carries.
-        assert!(parse_parameter_row(&row(1, TdsDataType::Int4, 4, 0, 0), 1, true).is_ok());
+        assert!(parse_parameter_row(&row(1, TdsDataType::Int4, 4, 0, 0), 1).is_ok());
     }
 
     /// The metadata RPC must send the statement text as `nvarchar(max)`:
@@ -1031,8 +1290,27 @@ mod tests {
     }
 
     #[test]
+    fn approximate_numeric_precision_matches_msodbcsql_odbc3() {
+        for (tds_type, length, expected_type, expected_precision) in [
+            (TdsDataType::Flt4, 4, SQL_REAL, 24),
+            (TdsDataType::Flt8, 8, SQL_FLOAT, 53),
+            (TdsDataType::FltN, 4, SQL_REAL, 24),
+            (TdsDataType::FltN, 8, SQL_FLOAT, 53),
+        ] {
+            let description = describe_tds_type(tds_type, length, None, None).unwrap();
+            assert_eq!(description.data_type, expected_type, "{tds_type:?}");
+            assert_eq!(
+                description.parameter_size, expected_precision,
+                "{tds_type:?}({length})"
+            );
+            assert_eq!(description.decimal_digits, 0, "{tds_type:?}");
+            assert_eq!(description.nullable, SQL_NULLABLE, "{tds_type:?}");
+        }
+    }
+
+    #[test]
     fn collector_requires_one_row_per_marker() {
-        let description = describe_tds_type(TdsDataType::Int4, 4, None, None, true).unwrap();
+        let description = describe_tds_type(TdsDataType::Int4, 4, None, None).unwrap();
 
         let mut collector = DescriptionCollector::new(2);
         collector.accept(0, description).unwrap();

@@ -184,3 +184,64 @@ TEST_F(GetDiagFieldTest, DiagNumberAfterSuccessIsZero) {
     EXPECT_EQ(SQL_SUCCESS, rc);
     EXPECT_EQ(0, count);
 }
+
+// ===================================================================
+// Tests that require a live SQL Server (SQL_DIAG_ROW_NUMBER is scoped to
+// SQL_HANDLE_STMT only, so it needs a real statement-level diagnostic).
+// ===================================================================
+
+class DiagFieldRowNumberLiveTest : public ODBCTest {
+protected:
+    void SetUp() override {
+        ODBCTest::SetUp();
+        if (!ODBCTestConfig::Instance().HasConnection()) {
+            FAIL() << "No connection configured – set ODBC_TEST_SERVER or ODBC_TEST_CONNSTR";
+        }
+        Connect();
+    }
+};
+
+// This driver doesn't track per-row batch failures yet (see divergence 9 in
+// docs/parameters_plan.md, tracked by microsoft/mssql-rs#541), so it always
+// reports SQL_NO_ROW_NUMBER on a stmt-level diagnostic. Asserting the literal
+// spec constant (rather than the driver's own SQL_NO_ROW_NUMBER back at
+// itself) catches a transcription slip.
+//
+// mssql-odbc only. Measured on msodbcsql 18.6.2.1: it answers 1 here, not
+// SQL_NO_ROW_NUMBER, so this cannot run on the compare leg.
+TEST_F(DiagFieldRowNumberLiveTest, ReportsNoRowNumberOnStmtError) {
+    SKIP_IF_COMPARING_MSODBCSQL();
+
+    SQLRETURN rc = SQLExecDirect(stmt_,
+        const_cast<SQLTCHAR*>(ODBCTestUtils::ToSqlTStr(
+            "SELECT * FROM mssql_rs_nonexistent_table_xyz").c_str()),
+        SQL_NTS);
+    ASSERT_EQ(SQL_ERROR, rc);
+
+    // SQL_DIAG_ROW_NUMBER is an SQLLEN field (8 bytes on every 64-bit target
+    // this ships on); a narrower buffer here would let the driver's write
+    // clobber adjacent stack memory.
+    SQLLEN row_number = 0;
+    rc = SQLGetDiagFieldW(SQL_HANDLE_STMT, stmt_, 1,
+                          SQL_DIAG_ROW_NUMBER,
+                          &row_number, 0, nullptr);
+    EXPECT_TRUE(SQL_SUCCEEDED(rc));
+    EXPECT_EQ(-1 /* SQL_NO_ROW_NUMBER */, row_number);
+}
+
+// SQL_DIAG_ROW_NUMBER is scoped to SQL_HANDLE_STMT per spec; other handle
+// types must refuse it (mirrors the driver's existing refusal of the sibling
+// SQL_DIAG_COLUMN_NUMBER on non-STMT handles). msodbcsql 18.6.2.1 refuses it
+// too, measured: SQL_ERROR with nothing written to the buffer.
+TEST_F(DiagFieldRowNumberLiveTest, RefusedOnDbcHandle) {
+    SQLRETURN rc = SQLSetConnectAttr(dbc_, kUnknownAttribute,
+                                     reinterpret_cast<SQLPOINTER>(0), 0);
+    ASSERT_NE(SQL_SUCCESS, rc);
+    ASSERT_NE(SQL_SUCCESS_WITH_INFO, rc);
+
+    SQLLEN row_number = 0;
+    rc = SQLGetDiagFieldW(SQL_HANDLE_DBC, dbc_, 1,
+                          SQL_DIAG_ROW_NUMBER,
+                          &row_number, 0, nullptr);
+    EXPECT_EQ(SQL_ERROR, rc);
+}

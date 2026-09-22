@@ -42,6 +42,19 @@ tests/e2e/
 
 ### Linux / macOS
 
+macOS PR validation runs this suite natively in `Test_MacOS`, using unixODBC
+and the SQL Server container already running under Colima. The job builds the
+Rust `.dylib` and C++ tests, retries failing test executables up to three times,
+and publishes JUnit results even when tests fail. Failed tests or missing results
+fail the job. This leg tests the Rust driver only, without msodbcsql comparison
+or C++ e2e coverage collection.
+
+Query-notification string attributes use explicit `SQLSetStmtAttrW` /
+`SQLGetStmtAttrW` calls with UTF-16 buffers. unixODBC does not convert these
+vendor-specific buffers when forwarding ANSI calls to a Unicode-only driver.
+The attribute suite also covers UTF-16 input at a byte offset; native ARM64
+success alone does not establish that the x64 macOS path is alignment-safe.
+
 ```bash
 # From mssql-odbc/tests/e2e/
 ./run_e2e.sh
@@ -121,6 +134,28 @@ comparison honest; put a genuinely reference-incompatible case in its own test
 (as `DriverConnectLiveTest.InvalidConnectionAttributeValuesRejected` is) so the
 surrounding parity assertions still compare.
 
+**One carve-out: a test dedicated to a single registered divergence may assert
+per leg.** When a case exists only to pin one documented difference — it is in
+its own test, it covers nothing else, and it has a numbered entry in
+[`docs/parity-deviations.md`](../../docs/parity-deviations.md) — spelling out
+what *each* driver returns is better than skipping the reference leg, because it
+keeps measuring the reference instead of asserting the divergence from memory. A
+build where msodbcsql stops behaving as recorded then fails the test rather than
+going unnoticed. `ColAttributeLiveTest.EmptyVariantProbeReturnsSuccessWithoutWarning`
+(registry entry 13) is the precedent.
+
+The hazard the preference above guards against is a per-leg guard wrapped around
+*some* assertions inside a broader test, where `PASS`/`PASS` conceals a
+difference nobody chose. That remains discouraged, and
+`SKIP_IF_COMPARING_MSODBCSQL()` remains the right tool for a case that asserts
+mssql-odbc-specific behavior the reference does not share at all. This carve-out
+matches §2.1 of
+[`.github/instructions/mssql-odbc.instructions.md`](../../../.github/instructions/mssql-odbc.instructions.md),
+which admits the macro for three reasons — reference-incompatible behavior, a
+measured divergence, or a documented gap tracked by a work item — and asks that
+anything else assert on both legs. When the divergence is measured, asserting
+both legs records the measurement continuously.
+
 **Granularity:** ctest compares at the *test-binary* level — each `*_test`
 executable is a single ctest case and the parity table is keyed on that binary
 name, not on individual gtest cases. A gtest skip is not a failure, so a case
@@ -133,7 +168,13 @@ CI runs this comparison on the Linux x64 PR build, which owns a SQL Server in
 docker. `.pipeline/scripts/containerized-odbc-e2e.sh` installs a pinned
 `msodbcsql18` from `packages.microsoft.com` when `ODBC_E2E_COMPARE=1`.
 
+Run new or changed parity tests against both drivers before pushing. For output-parameter tests, change pending bindings before fetching can consume the return tokens, and inspect diagnostics immediately after each result-draining API call. A later `SQLMoreResults` call need not preserve a diagnostic already reported by `SQLFetch`. Keep exact SQLSTATE and output-value assertions, including single-delivery checks, rather than skipping the reference leg.
+
+Exercise warning-bearing output tails with a nonempty final rowset (for example, one row with `SQL_ATTR_ROW_ARRAY_SIZE=2`). With the pinned Linux reference driver, unixODBC hides warnings returned alongside an empty `SQL_NO_DATA` fetch. The nonempty rowset keeps the warning observable and permits exact `SQL_SUCCESS_WITH_INFO`/SQLSTATE assertions on both drivers. `output_params_test` records `SQL_DRIVER_VER` in its test properties; verify Linux as well as Windows rather than extrapolating between Driver Managers.
+
 ### Failure modes that are never silently green
+
+Setup DML must account for zero affected rows: deleting from an empty table returns `SQL_NO_DATA` under ODBC 3.x. Assert that result explicitly when zero rows are expected; do not treat it as an execution error or broadly relax the assertions on the operation under test.
 
 Both runners abort — locally and in CI — when:
 
@@ -401,7 +442,7 @@ across matching distros:
 | Track | Build base | Reused on |
 |---|---|---|
 | glibc modern (x64, arm64) | Ubuntu 22.04 (glibc 2.35, OpenSSL 3) | Debian bookworm, Ubuntu 22.04/24.04, Azure Linux 3 |
-| musl (x64, arm64) | Alpine 3.18 (musl, OpenSSL 3) | Alpine 3.18–3.21 |
+| musl (x64, arm64) | Alpine 3.18 (musl, OpenSSL 3) | Alpine 3.18, 3.21 |
 | glibc 2.28 (x64) | manylinux_2_28 / AlmaLinux 8 (OpenSSL 1.1) | RHEL 8 / UBI 8 |
 
 A glibc-2.35 binary may fail to load on older glibc (e.g. RHEL 8's 2.28), and an

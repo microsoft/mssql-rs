@@ -32,7 +32,7 @@ those attributes drive — that is already split into sibling stories.
 | `SQL_ATTR_APP_PARAM_DESC` / `APP_ROW_DESC` as attributes | **46377** |
 | Descriptor handle semantics behind them | AB#46374 Descriptors |
 | `SQL_ATTR_PARAMSET_SIZE` accept/store | **46377** |
-| Array-bound `executemany` execution | AB#46576 Batch insert |
+| Array-bound `executemany` execution | AB#47905 |
 | `SQL_ATTR_RESET_CONNECTION`, `SQL_ATTR_CONNECTION_DEAD` | AB#47317 (Closed) |
 | `SQL_ATTR_AUTOCOMMIT`, `SQL_ATTR_TXN_ISOLATION` | AB#46379 (Closed) |
 | Connection-string keyword parsing | AB#46372 (Closed) |
@@ -284,13 +284,32 @@ by unit + e2e tests.
 - `SQLGetConnectAttrW` deliberately has **no** arm, so it falls through to
   `HY092` exactly as msodbcsql does (`sqlcmisc.cpp:4378`).
 
-**Enforcement (AB#46385 — delivered):** `SQLExecute` / `SQLExecDirectW` thread
-`StmtState::query_timeout` into `ExecuteOptions::timeout_secs`, so a non-zero
-value bounds the wait for a response: on expiry the client sends `ATTENTION`
-and reports the failure as `HYT00`, matching msodbcsql. `0` (the default)
-stays unlimited — no behavior change for the common case. See mssql-rs#439,
-where the timeout being silently dropped left a blocked statement with no
-client-side escape hatch.
+**Enforcement (AB#46385 — delivered):** the statement-scoped entry points that
+run a wire operation thread `StmtState::query_timeout` into
+`ExecuteOptions::timeout_secs`, so a non-zero value bounds the wait for a
+response: on expiry the client sends `ATTENTION` and reports the failure as
+`HYT00`, matching msodbcsql. `0` (the default) stays unlimited — no behavior
+change for the common case. See mssql-rs#439, where the timeout being silently
+dropped left a blocked statement with no client-side escape hatch.
+
+The covered surface is `SQLExecute` / `SQLExecDirectW` (mssql-rs#442) plus the
+seven implemented catalog functions, `SQLGetTypeInfoW` and `SQLDescribeParam`
+(mssql-rs#466) — the latter group was left on `ExecuteOptions::default()` by
+\#442 and closed separately. The budget lives on the client for the lifetime of
+the batch (`remaining_request_timeout`), so it also bounds the row reads on the
+result set each of these opens; passing `()` disabled it end to end, not just
+for the initial RPC. msodbcsql reaches the same coverage structurally: catalog
+functions and `SQLGetTypeInfo` are executed *through `SQLExecDirectW` itself*
+(`sqlcdd.cpp:1866`, `:2239`) and `SQLDescribeParam` reaches `AutoFillIPD`
+(`sqlcdesc.cpp:9379`), all reading the same `GetQueryTimeOut(lpstmt)`
+(`sqlcprot.h:1607`). `SQLPrepare` needs no wiring because this driver defers
+the server-side prepare to execute.
+
+**Known exception:** `SQLFreeHandle(SQL_HANDLE_STMT)`'s best-effort
+`sp_unprepare` (`free_handle.rs:497`) still runs unbounded. msodbcsql bounds
+its equivalent in `DropPrepHandle` (`sqlcfunc.cpp:790-830`); closing the gap
+here needs the timeout captured before the statement state is torn down, so it
+is tracked separately by mssql-rs#546 rather than folded into #466.
 
 **Acceptance:** `cursor.timeout = N` in mssql-python stops logging
 "Failed to set query timeout"; value round-trips through get; clamp + `01S02`
@@ -406,8 +425,9 @@ ideal rather than what this driver does.
 | 14 | `ROW_NUMBER` | — | get-only; `24000` unless positioned on a row, else 0 |
 | 15 | `ENABLE_AUTO_IPD` | 0 | stored |
 | 17 | `PARAM_BIND_OFFSET_PTR` | 0 (null) | **enforced**: dereferenced at execute and added to both bound pointers |
-| 16, 18–21, 23–24 | bind/offset/status pointers | 0 | stored |
-| 22 | `PARAMSET_SIZE` | 1 | 1 → success; above 1 → `HYC00` (array binding is a deferred feature) |
+| 16, 23–24 | fetch/row operation pointers | 0 | stored |
+| 18–21 | parameter bind/operation/status pointers | 0 | consumed by parameter-array execution — see the divergence table in [parameters_plan.md](parameters_plan.md) |
+| 22 | `PARAMSET_SIZE` | 1 | positive sizes accepted; 0 never reaches the driver (the DM rejects it with `HY024`); non-DAE input arrays execute as one batched RPC request |
 | 10014 | `METADATA_ID` | 0 | `SQL_FALSE` accepted; `SQL_TRUE` → `HYC00` |
 | -1 | `CURSOR_SCROLLABLE` | `SQL_NONSCROLLABLE` | the boolean face of `CURSOR_TYPE` |
 | -2 | `CURSOR_SENSITIVITY` | `SQL_INSENSITIVE` | `SQL_UNSPECIFIED` normalises to insensitive, silently |
@@ -454,6 +474,18 @@ msodbcsql and reports `01S02` here, because scrollable cursors are a deferred
 feature. It is the same single divergence already recorded for
 `SQL_ATTR_CURSOR_TYPE`, since the two are one setting. Variation 40 asserts the
 shared invariant on both drivers and the per-driver state separately.
+
+#### Parameter-array divergences live in `parameters_plan.md`
+
+S4 owns only the accept/store/read-back contract for the array attributes. What
+they *do* once `PARAMSET_SIZE > 1` executes an array — including the points where
+that execution diverges from msodbcsql, and the work items tracking each — is
+documented in
+[parameters_plan.md § Parameter arrays](parameters_plan.md#parameter-arrays-executemany).
+None of those divergences is visible from this side: measured through the Driver
+Manager, every value of `PARAMSET_SIZE` this driver accepts or refuses matches
+msodbcsql, including 0, which the DM rejects with `HY024` for both drivers
+before either sees it.
 
 **Cross-story notes:** `SQL_ATTR_NOSCAN` is now readable for AB#46384.
 `SQL_ATTR_METADATA_ID = SQL_FALSE` succeeds and reads back. `SQL_TRUE` returns

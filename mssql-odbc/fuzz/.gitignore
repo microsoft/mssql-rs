@@ -1,0 +1,15 @@
+# Fuzz testing artifacts
+artifacts/
+corpus/
+coverage/
+target/
+
+# Fuzzing build files
+*.profdata
+*.profraw
+
+# Coverage reports (HTML/CSS/JS generated files)
+coverage-reports/
+*.html
+*.css
+*.js

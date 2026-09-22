@@ -78,17 +78,26 @@ use crate::{core::TdsResult, io::packet_reader::TdsPacketReader};
 #[derive(Default)]
 pub(crate) struct ReturnStatusTokenParser {}
 
+pub(crate) const RETURN_STATUS_PAYLOAD_LEN: usize = size_of::<i32>();
+
+pub(crate) async fn read_return_status<T: TdsPacketReader + Send + Sync>(
+    reader: &mut T,
+) -> TdsResult<ReturnStatusToken> {
+    let value = if let Some(bytes) = reader.try_read_slice(RETURN_STATUS_PAYLOAD_LEN) {
+        i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+    } else {
+        reader.read_int32().await?
+    };
+    Ok(ReturnStatusToken { value })
+}
+
 #[async_trait]
 impl<T> TokenParser<T> for ReturnStatusTokenParser
 where
     T: TdsPacketReader + Send + Sync,
 {
     async fn parse(&self, reader: &mut T, _context: &ParserContext) -> TdsResult<Tokens> {
-        // Read the return value (4 bytes) - signed 32-bit integer
-        // This is the value from a stored procedure's RETURN statement
-        let value = reader.read_int32().await?;
-
-        Ok(Tokens::from(ReturnStatusToken { value }))
+        read_return_status(reader).await.map(Tokens::from)
     }
 }
 

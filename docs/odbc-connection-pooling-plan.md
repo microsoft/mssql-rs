@@ -191,11 +191,11 @@ A verdict is only ever valid against the response of the request that carried
 the bit. When that response is abandoned before any token is read, the
 suspicion must not be carried forward.
 
-Cancellation and timeout are the reachable case. `NetworkTransport::receive_token`
-answers both by draining to the attention acknowledgement, and that drain
-discards every other token — the `ResetConnection` ENVCHANGE included. The
-carrying request therefore ends with the bit on the wire and nothing observed
-about it.
+Cancellation and timeout are the reachable case. `NetworkTransport` answers both
+by draining to the attention acknowledgement. The drain retains connection-level
+side effects, including the `ResetConnection` ENVCHANGE, and replays them through
+`TdsClient`; a retention overflow retires the connection rather than applying an
+incomplete state prefix.
 
 `begin_command` and `check_and_reconnect` both settle this. Between them they
 cover every request path — the cursor RPCs never call `begin_command`, and the

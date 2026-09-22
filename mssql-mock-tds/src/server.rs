@@ -9,9 +9,10 @@ use crate::protocol::{
     build_feature_ext_ack_fedauth, build_fedauth_challenge_response, build_login_ack,
     build_prelogin_response, build_prelogin_response_with_fedauth, build_query_result,
     build_routing_response, build_transaction_manager_response, parse_fedauth_token,
-    parse_login7_auth, parse_sql_batch, parse_transaction_manager_request,
+    parse_login7_auth, parse_sql_batch, parse_transaction_descriptor_header,
+    parse_transaction_manager_request,
 };
-use crate::query_response::{QueryRegistry, TM_BEGIN_DELAY_KEY};
+use crate::query_response::{QueryRegistry, RPC_DELAY_KEY, TM_BEGIN_DELAY_KEY};
 use bytes::BytesMut;
 use native_tls::Identity;
 use std::collections::BTreeMap;
@@ -93,6 +94,11 @@ pub struct ConnectionProcessor {
     redirection: Option<RedirectionConfig>,
     /// Shared store used to record connection state as soon as it is known
     connection_store: Option<Arc<Mutex<ConnectionStore>>>,
+    /// The ALL_HEADERS TransactionDescriptor header — `(TransactionDescriptor,
+    /// OutstandingRequestCount)` — recorded from every `SqlBatch`/`RpcRequest`
+    /// this connection has sent, in order. See
+    /// [`ConnectionInfo::transaction_descriptor_headers`].
+    transaction_descriptor_headers: Vec<(u64, u32)>,
 }
 
 impl ConnectionProcessor {
@@ -115,6 +121,7 @@ impl ConnectionProcessor {
             buffer: BytesMut::with_capacity(4096),
             redirection: None,
             connection_store,
+            transaction_descriptor_headers: Vec::new(),
         }
     }
 
@@ -138,6 +145,7 @@ impl ConnectionProcessor {
             buffer: BytesMut::with_capacity(4096),
             redirection,
             connection_store,
+            transaction_descriptor_headers: Vec::new(),
         }
     }
 
@@ -188,6 +196,12 @@ impl ConnectionProcessor {
         &mut self.buffer
     }
 
+    /// Get the ALL_HEADERS TransactionDescriptor header recorded from every
+    /// `SqlBatch`/`RpcRequest` this connection has sent so far, in order.
+    pub fn transaction_descriptor_headers(&self) -> &[(u64, u32)] {
+        &self.transaction_descriptor_headers
+    }
+
     /// Upsert this connection's current state into the shared store.
     /// Called eagerly during login so tokens are visible to callers the
     /// moment the client's blocking LoginAck read returns.
@@ -233,6 +247,18 @@ impl ConnectionProcessor {
                     // Not a (complete) Attention — keep waiting out the remaining delay.
                 }
             }
+        }
+    }
+
+    /// Records `packet_body`'s ALL_HEADERS TransactionDescriptor header (if
+    /// present) in [`Self::transaction_descriptor_headers`], so a test can
+    /// assert a client honored MS-TDS 2.2.5.3.2 — "The TransactionDescriptor
+    /// MUST be 0, and OutstandingRequestCount MUST be 1 if the connection is
+    /// operating in AutoCommit mode" — for every `SqlBatch`/`RpcRequest` it
+    /// sent. Purely observational: never affects the response sent back.
+    fn record_transaction_descriptor_header(&mut self, packet_body: &[u8]) {
+        if let Some(header) = parse_transaction_descriptor_header(packet_body) {
+            self.transaction_descriptor_headers.push(header);
         }
     }
 
@@ -432,6 +458,8 @@ impl ConnectionProcessor {
 
                     // Extract packet body (skip header)
                     let packet_body = &packet_data[PACKET_HEADER_SIZE..];
+                    self.record_transaction_descriptor_header(packet_body);
+                    self.record_to_store().await;
 
                     // Parse SQL
                     match parse_sql_batch(packet_body) {
@@ -487,6 +515,8 @@ impl ConnectionProcessor {
                 } else {
                     debug!("Handling RPC request from {}", self.addr);
                     let packet_body = &packet_data[PACKET_HEADER_SIZE..];
+                    self.record_transaction_descriptor_header(packet_body);
+                    self.record_to_store().await;
 
                     // No general RPC parameter parser: a registered response is
                     // matched by finding its (upper-cased) SQL text as a UTF-16LE
@@ -512,6 +542,23 @@ impl ConnectionProcessor {
                         Some(build_query_result(&response_data))
                     } else {
                         info!("No registered response for RPC request, returning empty result");
+                        // A test can still delay this answer via the reserved
+                        // `RPC_DELAY_KEY`, which is how a catalog /
+                        // `sp_datatype_info` / `sp_describe_undeclared_parameters`
+                        // call — whose lower-case proc name the substring match
+                        // cannot address — is held back long enough to prove
+                        // SQL_ATTR_QUERY_TIMEOUT bounds the RPC itself.
+                        let delay = self
+                            .query_registry
+                            .lock()
+                            .await
+                            .get(RPC_DELAY_KEY)
+                            .and_then(|r| r.delay);
+                        match self.wait_out_delay_or_attention(socket, delay).await? {
+                            DelayOutcome::Attention(ack) => return Ok(Some(ack)),
+                            DelayOutcome::Closed => return Ok(None),
+                            DelayOutcome::Elapsed => {}
+                        }
                         let response = build_done_token(0);
                         let total_length = (PACKET_HEADER_SIZE + response.len()) as u16;
                         let mut packet = BytesMut::with_capacity(total_length as usize);
@@ -634,6 +681,13 @@ pub struct ConnectionInfo {
     pub user_agent: Option<String>,
     /// ServerName received in the Login7 packet
     pub received_server_name: Option<String>,
+    /// The ALL_HEADERS TransactionDescriptor header — `(TransactionDescriptor,
+    /// OutstandingRequestCount)` — recorded from every `SqlBatch`/`RpcRequest`
+    /// this connection has sent, in order. Lets a test assert a client
+    /// honored MS-TDS 2.2.5.3.2 — the invariant that autocommit requests
+    /// (`TransactionDescriptor == 0`) must carry `OutstandingRequestCount ==
+    /// 1` — without the mock server itself enforcing it.
+    pub transaction_descriptor_headers: Vec<(u64, u32)>,
 }
 
 impl ConnectionInfo {
@@ -674,6 +728,7 @@ impl ConnectionStore {
             authenticated: processor.is_authenticated(),
             user_agent: processor.user_agent.clone(),
             received_server_name: processor.received_server_name().map(|s| s.to_string()),
+            transaction_descriptor_headers: processor.transaction_descriptor_headers().to_vec(),
         };
         self.connections.insert(processor.conn_id(), info);
     }

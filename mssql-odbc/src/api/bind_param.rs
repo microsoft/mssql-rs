@@ -8,8 +8,9 @@ use tracing::{debug, error};
 
 use super::sqlstate::*;
 use crate::api::odbc_types::{
-    SQL_C_DEFAULT, SQL_ERROR, SQL_INVALID_HANDLE, SQL_PARAM_INPUT, SQL_SUCCESS, SqlHandle, SqlLen,
-    SqlPointer, SqlReturn, SqlSmallInt, SqlULen, SqlUSmallInt,
+    SQL_C_DEFAULT, SQL_ERROR, SQL_INVALID_HANDLE, SQL_PARAM_INPUT, SQL_PARAM_INPUT_OUTPUT,
+    SQL_PARAM_INPUT_OUTPUT_STREAM, SQL_PARAM_OUTPUT, SQL_PARAM_OUTPUT_STREAM, SQL_RETURN_VALUE,
+    SQL_SUCCESS, SqlHandle, SqlLen, SqlPointer, SqlReturn, SqlSmallInt, SqlULen, SqlUSmallInt,
 };
 use crate::api::type_rules::{
     SqlTypeSupport, canonical_c_type, classify_parameter_sql_type, is_valid_c_type,
@@ -253,21 +254,37 @@ fn sql_bind_parameter_safe(
             return SQL_ERROR;
         }
 
-        // Phase 1: input parameters only. Output / input-output binding is a
-        // deferred feature.
-        if input_output_type != SQL_PARAM_INPUT {
-            error!(
-                input_output_type,
-                "SQLBindParameter: only input parameters are supported"
-            );
-            post_sql_error(
-                &mut stmt_state,
-                SQLSTATE_HYC00,
-                0,
-                "Output parameters not yet implemented",
-            );
-            return SQL_ERROR;
+        // Output values are only ever produced by a procedure call, so a
+        // direction other than input is accepted here and enforced at execute
+        // time. Streamed output (SQL_PARAM_OUTPUT_STREAM / _INPUT_OUTPUT_STREAM)
+        // is data-at-execution output, which this driver does not implement.
+        match input_output_type {
+            SQL_PARAM_INPUT | SQL_PARAM_INPUT_OUTPUT | SQL_PARAM_OUTPUT | SQL_RETURN_VALUE => {}
+            SQL_PARAM_OUTPUT_STREAM | SQL_PARAM_INPUT_OUTPUT_STREAM => {
+                error!(
+                    input_output_type,
+                    "SQLBindParameter: streamed output parameters are not supported"
+                );
+                post_sql_error(
+                    &mut stmt_state,
+                    SQLSTATE_HYC00,
+                    0,
+                    "Streamed output parameters are not implemented",
+                );
+                return SQL_ERROR;
+            }
+            _ => {
+                error!(
+                    input_output_type,
+                    "SQLBindParameter: invalid InputOutputType"
+                );
+                post_diag(&mut stmt_state, ERR_INVALID_PARAMETER_TYPE);
+                return SQL_ERROR;
+            }
         }
+
+        // SQLBindParameter/SetIPDRec in sqlcdesc.cpp retain indicator-only
+        // output bindings; GetReturnValue treats a null destination as size 0.
 
         (stmt_state.effective_apd(stmt), c_type)
     };
@@ -278,6 +295,9 @@ fn sql_bind_parameter_safe(
         sql_type: parameter_type,
         column_size,
         decimal_digits,
+        app_precision: 0,
+        app_scale: 0,
+        precision_scale_explicit: false,
         parameter_value_ptr,
         buffer_length,
         strlen_or_ind_ptr,
@@ -474,8 +494,8 @@ fn sql_free_stmt_reset_params_safe(stmt: &StmtHandle) -> SqlReturn {
 mod tests {
     use super::*;
     use crate::api::odbc_types::{
-        SQL_C_CHAR, SQL_C_FLOAT, SQL_C_SLONG, SQL_GUID, SQL_INTEGER, SQL_NULL_DATA,
-        SQL_NULL_HANDLE, SQL_PARAM_OUTPUT, SQL_SS_UDT, SQL_VARBINARY, SQL_VARCHAR,
+        SQL_C_CHAR, SQL_C_SLONG, SQL_GUID, SQL_INTEGER, SQL_NULL_DATA, SQL_NULL_HANDLE,
+        SQL_PARAM_OUTPUT, SQL_SS_UDT, SQL_VARBINARY, SQL_VARCHAR,
     };
     use crate::handles::handle_from_raw;
     use crate::test_support::TestHandles;
@@ -527,7 +547,65 @@ mod tests {
     }
 
     #[test]
-    fn output_parameter_is_rejected_hyc00() {
+    fn output_directions_are_accepted() {
+        for direction in [
+            SQL_PARAM_INPUT,
+            SQL_PARAM_INPUT_OUTPUT,
+            SQL_PARAM_OUTPUT,
+            SQL_RETURN_VALUE,
+        ] {
+            let h = TestHandles::with_env_dbc_stmt();
+            let mut buf: Vec<u8> = b"abc\0".to_vec();
+            let mut ind: SqlLen = 0;
+            let ret = unsafe {
+                sql_bind_parameter(
+                    h.stmt,
+                    1,
+                    direction,
+                    SQL_C_CHAR,
+                    SQL_VARCHAR,
+                    0,
+                    0,
+                    buf.as_mut_ptr() as SqlPointer,
+                    buf.len() as SqlLen,
+                    &mut ind,
+                )
+            };
+            assert_eq!(ret, SQL_SUCCESS, "direction {direction}");
+        }
+    }
+
+    /// Data-at-execution *output* is a separate feature; ODBC's streamed
+    /// directions stay refused rather than silently behaving like plain output.
+    #[test]
+    fn streamed_output_directions_are_refused() {
+        for direction in [SQL_PARAM_OUTPUT_STREAM, SQL_PARAM_INPUT_OUTPUT_STREAM] {
+            let h = TestHandles::with_env_dbc_stmt();
+            let mut buf: Vec<u8> = b"abc\0".to_vec();
+            let mut ind: SqlLen = 0;
+            let ret = unsafe {
+                sql_bind_parameter(
+                    h.stmt,
+                    1,
+                    direction,
+                    SQL_C_CHAR,
+                    SQL_VARCHAR,
+                    0,
+                    0,
+                    buf.as_mut_ptr() as SqlPointer,
+                    buf.len() as SqlLen,
+                    &mut ind,
+                )
+            };
+            assert_eq!(ret, SQL_ERROR, "direction {direction}");
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let state = stmt.inner.lock().unwrap();
+            assert_eq!(state.diag_records[0].sql_state, SQLSTATE_HYC00);
+        }
+    }
+
+    #[test]
+    fn unknown_direction_is_refused() {
         let h = TestHandles::with_env_dbc_stmt();
         let mut buf: Vec<u8> = b"abc\0".to_vec();
         let mut ind: SqlLen = 0;
@@ -535,7 +613,7 @@ mod tests {
             sql_bind_parameter(
                 h.stmt,
                 1,
-                SQL_PARAM_OUTPUT,
+                99,
                 SQL_C_CHAR,
                 SQL_VARCHAR,
                 0,
@@ -546,9 +624,27 @@ mod tests {
             )
         };
         assert_eq!(ret, SQL_ERROR);
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
-        let state = stmt.inner.lock().unwrap();
-        assert_eq!(state.diag_records[0].sql_state, SQLSTATE_HYC00);
+    }
+
+    #[test]
+    fn output_parameter_accepts_an_indicator_without_a_value_buffer() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let mut ind: SqlLen = 0;
+        let ret = unsafe {
+            sql_bind_parameter(
+                h.stmt,
+                1,
+                SQL_PARAM_OUTPUT,
+                SQL_C_CHAR,
+                SQL_VARCHAR,
+                0,
+                0,
+                std::ptr::null_mut(),
+                0,
+                &mut ind,
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS);
     }
 
     #[test]
@@ -731,22 +827,23 @@ mod tests {
     }
 
     #[test]
-    fn real_but_unconvertible_c_type_returns_hyc00() {
-        // SQL_C_FLOAT is a legal ODBC C type the driver cannot convert yet, so it
-        // must fail the conversion check rather than the HY003 type check.
+    fn valid_c_type_with_no_matrix_row_returns_hyc00() {
+        // SQL_C_SS_VECTOR is a legal ODBC C type with no row in the conversion
+        // matrix, so it must fail the conversion check rather than the HY003
+        // identifier check - the two are different answers to the application.
         let h = TestHandles::with_env_dbc_stmt();
-        let mut val: f32 = 0.0;
+        let mut val: [u8; 8] = [0; 8];
         let mut ind: SqlLen = 0;
         let ret = unsafe {
             sql_bind_parameter(
                 h.stmt,
                 1,
                 SQL_PARAM_INPUT,
-                SQL_C_FLOAT,
+                crate::api::odbc_types::SQL_C_SS_VECTOR,
                 SQL_INTEGER,
                 0,
                 0,
-                &mut val as *mut f32 as SqlPointer,
+                val.as_mut_ptr() as SqlPointer,
                 0,
                 &mut ind,
             )
@@ -808,7 +905,6 @@ mod tests {
         assert_eq!(state.diag_records[0].sql_state, SQLSTATE_HYC00);
     }
 
-    #[ignore = "SQL_GUID has no conversion row yet; re-enable with GUID support - AB#47500"]
     #[test]
     fn default_c_type_guid_is_accepted_and_stored() {
         let h = TestHandles::with_env_dbc_stmt();
@@ -828,22 +924,20 @@ mod tests {
             )
         };
         assert_eq!(ret, SQL_SUCCESS);
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
-        let state = stmt.inner.lock().unwrap();
-        let bound = state.bound_params[0].expect("parameter 1 should be bound");
+        let bound = bound_params(&h)[0].expect("parameter 1 should be bound");
         assert_eq!(bound.c_type, crate::api::odbc_types::SQL_C_GUID);
         assert_eq!(bound.sql_type, SQL_GUID);
     }
 
-    /// `resolve_default_c_type` maps some non-character SQL types onto a
-    /// character C type - ODBC says their default application representation is
-    /// a string. Those are the ones a widened `SQL_C_CHAR` / `SQL_C_WCHAR`
-    /// matrix row could start admitting by accident, and a defaulted
-    /// `SQL_DECIMAL` admitted that way would have its buffer read as text and
-    /// sent as `varchar(max)` rather than `decimal(p,s)`. The set is derived
-    /// rather than listed so it cannot drift as types are added.
+    /// ODBC gives some non-character SQL types a character default C type. The
+    /// bind result must agree with the implemented conversion row after that
+    /// default is resolved.
+    ///
+    /// The set is derived from `resolve_default_c_type` rather than listed, so a
+    /// type that starts defaulting to a character C type is covered here without
+    /// anyone remembering to add it.
     #[test]
-    fn default_bind_rejects_sql_types_whose_default_c_type_is_character() {
+    fn default_bind_matches_character_conversion_rows() {
         use crate::api::type_rules::classify_parameter_sql_type;
         use crate::handles::OdbcVersion;
 
@@ -882,17 +976,25 @@ mod tests {
                     SQL_PARAM_INPUT,
                     SQL_C_DEFAULT,
                     sql_type,
-                    0,
-                    0,
+                    // A real precision and scale: `decimal` rejects 0 as a
+                    // precision, and this path is about the C type, not the size.
+                    18,
+                    2,
                     std::ptr::null_mut(),
                     0,
                     &mut ind,
                 )
             };
-            assert_eq!(ret, SQL_ERROR, "sql_type {sql_type}");
-            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
-            let state = stmt.inner.lock().unwrap();
-            assert_eq!(state.diag_records[0].sql_state, SQLSTATE_HYC00);
+            if is_supported_conversion(default_c, sql_type) {
+                assert_eq!(ret, SQL_SUCCESS, "sql_type {sql_type}");
+                let bound = bound_params(&h)[0].expect("parameter 1 should be bound");
+                assert_eq!(bound.c_type, default_c, "sql_type {sql_type}");
+            } else {
+                assert_eq!(ret, SQL_ERROR, "sql_type {sql_type}");
+                let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+                let state = stmt.inner.lock().unwrap();
+                assert_eq!(state.diag_records[0].sql_state, SQLSTATE_HYC00);
+            }
         }
         assert!(checked > 0, "no SQL type defaults to a character C type");
     }
@@ -924,9 +1026,9 @@ mod tests {
     }
 
     #[test]
-    fn deprecated_c_type_spelling_passes_the_hy003_gate() {
-        // SQL_C_TIMESTAMP is folded to SQL_C_TYPE_TIMESTAMP before validation, so
-        // it must fail on the missing conversion row, not as an unknown C type.
+    fn deprecated_c_type_spelling_is_stored_canonically() {
+        // SQL_C_TIMESTAMP is folded to SQL_C_TYPE_TIMESTAMP before validation,
+        // so only one spelling per type reaches conversion and storage.
         let h = TestHandles::with_env_dbc_stmt();
         let mut ind: SqlLen = 0;
         let ret = unsafe {
@@ -943,10 +1045,13 @@ mod tests {
                 &mut ind,
             )
         };
-        assert_eq!(ret, SQL_ERROR);
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
-        let state = stmt.inner.lock().unwrap();
-        assert_eq!(state.diag_records[0].sql_state, SQLSTATE_HYC00);
+        assert_eq!(ret, SQL_SUCCESS);
+        let bound = bound_params(&h)[0].expect("parameter 1 should be bound");
+        assert_eq!(
+            bound.c_type,
+            crate::api::odbc_types::SQL_C_TYPE_TIMESTAMP,
+            "the deprecated spelling must be stored canonically"
+        );
     }
 
     #[test]
@@ -965,6 +1070,7 @@ mod tests {
                     mssql_tds::connection::tds_client::StatementId::from_raw_for_test(42),
                 ),
                 marker_count: 0,
+                original_sql: String::new(),
             });
         }
         let mut buf: Vec<u8> = b"abc\0".to_vec();
@@ -1028,6 +1134,7 @@ mod tests {
                     mssql_tds::connection::tds_client::StatementId::from_raw_for_test(42),
                 ),
                 marker_count: 0,
+                original_sql: String::new(),
             });
         }
         poison_apd(h.apd());
@@ -1175,6 +1282,9 @@ mod tests {
             sql_type: crate::api::odbc_types::SQL_INTEGER,
             column_size: 0,
             decimal_digits: 0,
+            app_precision: 0,
+            app_scale: 0,
+            precision_scale_explicit: false,
             parameter_value_ptr: &mut buf as *mut i32 as SqlPointer,
             buffer_length: 4,
             strlen_or_ind_ptr: std::ptr::null_mut(),

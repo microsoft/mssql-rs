@@ -29,8 +29,14 @@ use crate::api::odbc_types::{
 };
 use crate::api::type_rules::is_integer_c_type;
 use crate::api::util::write_if_some;
+use crate::conversion::datetime::{
+    DAYS_0001_TO_1900, DateTimeParts, MAX_DAYS_SINCE_0001, TICKS_PER_DAY,
+    civil_from_days_since_0001, current_local_date, hms_from_ticks_100ns, parse_datetime_literal,
+};
 use crate::conversion::error::{ConvError, ConvOk};
-use crate::conversion::numeric::{NumericSource, narrow_i128, parse_numeric_text};
+use crate::conversion::numeric::{
+    NumericSource, narrow_f64_to_f32, narrow_i128, parse_numeric_text,
+};
 use mssql_tds::datatypes::column_values::{
     ColumnValues, SqlDate, SqlDateTime2, SqlDateTimeOffset, SqlTime,
 };
@@ -261,14 +267,15 @@ pub(crate) unsafe fn convert_float_c(
     }
     let v = numeric_source_or_parse(value)?.as_f64();
     let ret = match target_type {
-        // SQL_C_FLOAT is 32-bit. A finite value outside the f32 range must be
-        // reported as an overflow (22003) rather than silently becoming
-        // infinity; a source that is already infinite passes through.
+        // SQL_C_FLOAT is 32-bit. A `real` column is already that width, so it is
+        // copied rather than range-checked, matching the exact-write path in
+        // `try_write_exact_buffered_scalar` that normally serves this pairing.
         SQL_C_FLOAT => {
-            if v.is_finite() && v.abs() > f64::from(f32::MAX) {
-                return Err(ConvError::OutOfRange);
-            }
-            unsafe { write_fixed(target_value_ptr, v as f32, strlen_or_ind_ptr) }
+            let narrowed = match value {
+                ColumnValues::Real(x) => *x,
+                _ => narrow_f64_to_f32(v)?,
+            };
+            unsafe { write_fixed(target_value_ptr, narrowed, strlen_or_ind_ptr) }
         }
         SQL_C_DOUBLE => unsafe { write_fixed(target_value_ptr, v, strlen_or_ind_ptr) },
         _ => return Err(ConvError::NotHandledHere),
@@ -306,50 +313,13 @@ pub(crate) unsafe fn convert_guid_c(
     Ok(unsafe { write_fixed(target_value_ptr, guid, strlen_or_ind_ptr) })
 }
 
-/// Days from 0001-01-01 (proleptic Gregorian) to 1900-01-01, used to rebase the
-/// `datetime` / `smalldatetime` epoch onto the common day-0 = 0001-01-01 axis.
-const DAYS_0001_TO_1900: i64 = 693_595;
-
-/// A normalized calendar breakdown shared by every date/time column type, so
-/// each target C struct can be filled from a single representation.
-#[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct DateTimeParts {
-    /// Proleptic Gregorian year.
-    pub year: i16,
-    /// Calendar month in `1..=12`.
-    pub month: u16,
-    /// Calendar day in `1..=31`.
-    pub day: u16,
-    /// Hour in `0..=23`.
-    pub hour: u16,
-    /// Minute in `0..=59`.
-    pub minute: u16,
-    /// Second in `0..=59`.
-    pub second: u16,
-    /// Fractional seconds in nanoseconds.
-    pub fraction_ns: u32,
-    /// Declared fractional-seconds scale (0-7) of the source column. Character
-    /// rendering pads to exactly this many digits, matching msodbcsql.
-    pub scale: u8,
-    /// Signed timezone hour component.
-    pub tz_hour: i16,
-    /// Signed timezone minute component.
-    pub tz_minute: i16,
-    /// Whether the source carries a date component.
-    pub has_date: bool,
-    /// Whether the source carries a time component.
-    pub has_time: bool,
-    /// Whether the source carries a timezone offset.
-    pub has_tz: bool,
-}
-
 /// Converts a TDS `date` into normalized calendar fields.
 pub(crate) fn date_parts(date: &SqlDate) -> DateTimeParts {
-    let (year, month, day) = civil_from_days_since_0001(i64::from(date.get_days()));
+    let date = civil_from_days_since_0001(i64::from(date.get_days()));
     DateTimeParts {
-        year,
-        month,
-        day,
+        year: date.year,
+        month: date.month,
+        day: date.day,
         has_date: true,
         ..Default::default()
     }
@@ -357,12 +327,12 @@ pub(crate) fn date_parts(date: &SqlDate) -> DateTimeParts {
 
 /// Converts a TDS `time` into normalized clock fields.
 pub(crate) fn time_parts(time: &SqlTime) -> DateTimeParts {
-    let (hour, minute, second, fraction_ns) = hms_from_ticks_100ns(time.time_nanoseconds);
+    let t = hms_from_ticks_100ns(time.time_nanoseconds);
     DateTimeParts {
-        hour,
-        minute,
-        second,
-        fraction_ns,
+        hour: t.hour,
+        minute: t.minute,
+        second: t.second,
+        fraction_ns: t.fraction_ns,
         scale: time.scale,
         has_time: true,
         ..Default::default()
@@ -371,11 +341,11 @@ pub(crate) fn time_parts(time: &SqlTime) -> DateTimeParts {
 
 /// Converts a TDS `datetime2` into normalized calendar and clock fields.
 pub(crate) fn datetime2_parts(datetime: &SqlDateTime2) -> DateTimeParts {
-    let (year, month, day) = civil_from_days_since_0001(i64::from(datetime.days));
+    let date = civil_from_days_since_0001(i64::from(datetime.days));
     let mut parts = time_parts(&datetime.time);
-    parts.year = year;
-    parts.month = month;
-    parts.day = day;
+    parts.year = date.year;
+    parts.month = date.month;
+    parts.day = date.day;
     parts.has_date = true;
     parts
 }
@@ -384,26 +354,27 @@ pub(crate) fn datetime2_parts(datetime: &SqlDateTime2) -> DateTimeParts {
 ///
 /// Returns `None` when applying the offset falls outside the TDS date range.
 pub(crate) fn datetimeoffset_parts(datetime: &SqlDateTimeOffset) -> Option<DateTimeParts> {
-    // The wire value is UTC; ODBC returns the local wall clock obtained by
-    // applying the stored offset.
-    let utc_ticks = datetime.datetime2.time.time_nanoseconds as i64
-        + i64::from(datetime.offset) * 60 * 10_000_000;
+    // A time that cannot fit in i64 already exceeds 10 million days; even
+    // the most negative i16 minute offset cannot bring it into the TDS range.
+    // Checked arithmetic retains that rejection without per-value i128 division.
+    let utc_ticks = i64::try_from(datetime.datetime2.time.time_nanoseconds)
+        .ok()?
+        .checked_add(i64::from(datetime.offset) * 60 * 10_000_000)?;
     let days = i64::from(datetime.datetime2.days) + utc_ticks.div_euclid(TICKS_PER_DAY);
     if !(0..=MAX_DAYS_SINCE_0001).contains(&days) {
         return None;
     }
 
-    let (year, month, day) = civil_from_days_since_0001(days);
-    let (hour, minute, second, fraction_ns) =
-        hms_from_ticks_100ns(utc_ticks.rem_euclid(TICKS_PER_DAY) as u64);
+    let date = civil_from_days_since_0001(days);
+    let t = hms_from_ticks_100ns(u64::try_from(utc_ticks.rem_euclid(TICKS_PER_DAY)).ok()?);
     Some(DateTimeParts {
-        year,
-        month,
-        day,
-        hour,
-        minute,
-        second,
-        fraction_ns,
+        year: date.year,
+        month: date.month,
+        day: date.day,
+        hour: t.hour,
+        minute: t.minute,
+        second: t.second,
+        fraction_ns: t.fraction_ns,
         scale: datetime.datetime2.time.scale,
         tz_hour: datetime.offset / 60,
         tz_minute: datetime.offset % 60,
@@ -411,45 +382,6 @@ pub(crate) fn datetimeoffset_parts(datetime: &SqlDateTimeOffset) -> Option<DateT
         has_time: true,
         has_tz: true,
     })
-}
-
-/// (year, month, day) from a day count where day 0 = 0001-01-01, using Howard
-/// Hinnant's `civil_from_days` algorithm rebased from its 1970 epoch.
-fn civil_from_days_since_0001(days_since_0001: i64) -> (i16, u16, u16) {
-    // Hinnant's algorithm works in days since 1970-01-01 with a +719468 shift.
-    let z = days_since_0001 - 719_162 + 719_468;
-    let era = (if z >= 0 { z } else { z - 146_096 }) / 146_097;
-    let doe = z - era * 146_097; // [0, 146096]
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365; // [0, 399]
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
-    let mp = (5 * doy + 2) / 153; // [0, 11]
-    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
-    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
-    let year = if m <= 2 { y + 1 } else { y };
-    (year as i16, m as u16, d as u16)
-}
-
-/// Number of 100 ns ticks in one day.
-const TICKS_PER_DAY: i64 = 864_000_000_000;
-
-/// Day number of `9999-12-31`, the maximum SQL Server date. Used to reject a
-/// `datetimeoffset` whose offset adjustment would leave the representable range.
-const MAX_DAYS_SINCE_0001: i64 = 3_652_058;
-
-/// (hour, minute, second, fraction_ns) from 100-nanosecond ticks since midnight.
-///
-/// `SqlTime::time_nanoseconds` is a misnomer: the decoder normalizes every
-/// fractional-seconds scale to 100 ns ticks, not nanoseconds.
-fn hms_from_ticks_100ns(ticks: u64) -> (u16, u16, u16, u32) {
-    let secs = ticks / 10_000_000;
-    let fraction_ns = ((ticks % 10_000_000) * 100) as u32;
-    (
-        (secs / 3600) as u16,
-        ((secs % 3600) / 60) as u16,
-        (secs % 60) as u16,
-        fraction_ns,
-    )
 }
 
 /// Extracts a [`DateTimeParts`] from any date/time column value, or `None` for
@@ -462,28 +394,29 @@ pub(crate) fn extract_datetime_parts(value: &ColumnValues) -> Option<DateTimePar
         ColumnValues::DateTime2(datetime) => return Some(datetime2_parts(datetime)),
         ColumnValues::DateTimeOffset(datetime) => return datetimeoffset_parts(datetime),
         ColumnValues::DateTime(dt) => {
-            let (y, m, day) = civil_from_days_since_0001(i64::from(dt.days) + DAYS_0001_TO_1900);
+            let date = civil_from_days_since_0001(i64::from(dt.days) + DAYS_0001_TO_1900);
             // `datetime` time is counted in 1/300-second ticks since midnight.
             let ticks = u64::from(dt.time);
             let secs = ticks / 300;
-            let fraction_ns = ((ticks % 300) * 1_000_000_000 / 300) as u32;
-            p.year = y;
-            p.month = m;
-            p.day = day;
+            // ODBC exposes the legacy type rounded to millisecond precision.
+            let fraction_ms = ((dt.time % 300) * 1_000 + 150) / 300;
+            p.year = date.year;
+            p.month = date.month;
+            p.day = date.day;
             p.hour = (secs / 3600) as u16;
             p.minute = ((secs % 3600) / 60) as u16;
             p.second = (secs % 60) as u16;
-            p.fraction_ns = fraction_ns;
+            p.fraction_ns = fraction_ms * 1_000_000;
             // `datetime` always renders 3 fractional digits.
             p.scale = 3;
             p.has_date = true;
             p.has_time = true;
         }
         ColumnValues::SmallDateTime(dt) => {
-            let (y, m, day) = civil_from_days_since_0001(i64::from(dt.days) + DAYS_0001_TO_1900);
-            p.year = y;
-            p.month = m;
-            p.day = day;
+            let date = civil_from_days_since_0001(i64::from(dt.days) + DAYS_0001_TO_1900);
+            p.year = date.year;
+            p.month = date.month;
+            p.day = date.day;
             p.hour = dt.time / 60;
             p.minute = dt.time % 60;
             p.has_date = true;
@@ -510,162 +443,14 @@ pub(crate) fn is_datetime_c_target(target_type: SqlSmallInt) -> bool {
     )
 }
 
-/// Days in `month` of `year` under the proleptic Gregorian leap rule.
-fn days_in_month(year: i16, month: u16) -> u16 {
-    match month {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        2 => {
-            let y = i32::from(year);
-            if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 {
-                29
-            } else {
-                28
-            }
-        }
-        _ => 0,
-    }
-}
-
-/// Parses `YYYY-MM-DD`.
-fn parse_date_literal(s: &str) -> Option<(i16, u16, u16)> {
-    let mut it = s.split('-');
-    let (y, m, d) = (it.next()?, it.next()?, it.next()?);
-    if it.next().is_some() || y.len() != 4 {
-        return None;
-    }
-    // `str::parse` accepts a leading `+`, which would make `+123-01-01` a valid
-    // date; require plain digits.
-    if !y
-        .bytes()
-        .chain(m.bytes())
-        .chain(d.bytes())
-        .all(|b| b.is_ascii_digit())
-    {
-        return None;
-    }
-    let year: i16 = y.parse().ok()?;
-    let month: u16 = m.parse().ok()?;
-    let day: u16 = d.parse().ok()?;
-    if !(1..=9999).contains(&year) || !(1..=12).contains(&month) {
-        return None;
-    }
-    // Reject impossible days (2023-02-31, or 02-29 outside a leap year) rather
-    // than writing them into a date struct as a successful conversion.
-    if !(1..=days_in_month(year, month)).contains(&day) {
-        return None;
-    }
-    Some((year, month, day))
-}
-
-/// Parses `HH:MM[:SS[.f{1,9}]]`, returning the components plus the number of
-/// fractional digits supplied (the effective scale).
-fn parse_time_literal(s: &str) -> Option<(u16, u16, u16, u32, u8)> {
-    let mut it = s.split(':');
-    let hour_s = it.next()?;
-    let minute_s = it.next()?;
-    let sec_part = it.next().unwrap_or("0");
-    if it.next().is_some() {
-        return None;
-    }
-    let (sec_digits, frac_digits) = match sec_part.split_once('.') {
-        Some((a, b)) => (a, b),
-        None => (sec_part, ""),
-    };
-    // `str::parse` accepts a leading `+`, which would make `+1:00:00` a valid
-    // time; require plain digits.
-    if !hour_s
-        .bytes()
-        .chain(minute_s.bytes())
-        .chain(sec_digits.bytes())
-        .all(|b| b.is_ascii_digit())
-    {
-        return None;
-    }
-    let hour: u16 = hour_s.parse().ok()?;
-    let minute: u16 = minute_s.parse().ok()?;
-    let second: u16 = sec_digits.parse().ok()?;
-    if hour > 23 || minute > 59 || second > 59 {
-        return None;
-    }
-    if !frac_digits.is_empty() && !frac_digits.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    // `SQL_TIMESTAMP_STRUCT.fraction` is nanoseconds, so a character literal can
-    // carry 9 exact digits; msodbcsql rejects anything longer rather than
-    // truncating it, and a character source has no server-side scale to cap it.
-    if frac_digits.len() > 9 {
-        return None;
-    }
-    let mut nanos: u32 = 0;
-    for i in 0..9 {
-        let digit = frac_digits
-            .as_bytes()
-            .get(i)
-            .map_or(0, |b| u32::from(b - b'0'));
-        nanos = nanos * 10 + digit;
-    }
-    Some((hour, minute, second, nanos, frac_digits.len() as u8))
-}
-
-/// Parses the character forms of `date`, `time`, `datetime2` and
-/// `datetimeoffset` into [`DateTimeParts`].
-fn parse_datetime_literal(text: &str) -> Option<DateTimeParts> {
-    let mut s = text.trim();
-    let mut p = DateTimeParts::default();
-
-    // A trailing "+HH:MM" / "-HH:MM" is a UTC offset. Match it only in that
-    // exact shape so the hyphens inside a date are never mistaken for one.
-    // Compared as bytes: slicing the `str` would panic when a multi-byte
-    // character straddles the boundary, and the payload is server data.
-    if let Some(tail) = s.len().checked_sub(6).and_then(|i| s.as_bytes().get(i..))
-        && (tail[0] == b'+' || tail[0] == b'-')
-        && tail[3] == b':'
-        && tail[1..3].iter().chain(&tail[4..6]).all(u8::is_ascii_digit)
-    {
-        let sign: i16 = if tail[0] == b'+' { 1 } else { -1 };
-        let hh = i16::from(tail[1] - b'0') * 10 + i16::from(tail[2] - b'0');
-        let mm = i16::from(tail[4] - b'0') * 10 + i16::from(tail[5] - b'0');
-        if hh > 14 || mm > 59 {
-            return None;
-        }
-        p.tz_hour = sign * hh;
-        p.tz_minute = sign * mm;
-        p.has_tz = true;
-        // The matched tail is all ASCII, so this boundary is a char boundary.
-        s = s[..s.len() - 6].trim_end();
-    }
-
-    let (date_str, time_str) = match s.split_once(['T', ' ']) {
-        Some((d, t)) => (Some(d), Some(t.trim())),
-        None if s.contains(':') => (None, Some(s)),
-        None => (Some(s), None),
-    };
-
-    if let Some(d) = date_str {
-        let (y, m, day) = parse_date_literal(d)?;
-        p.year = y;
-        p.month = m;
-        p.day = day;
-        p.has_date = true;
-    }
-    if let Some(t) = time_str.filter(|t| !t.is_empty()) {
-        let (h, mi, sec, frac_ns, scale) = parse_time_literal(t)?;
-        p.hour = h;
-        p.minute = mi;
-        p.second = sec;
-        p.fraction_ns = frac_ns;
-        p.scale = scale;
-        p.has_time = true;
-    }
-    if !p.has_date && !p.has_time {
-        return None;
-    }
-    // An offset is only meaningful alongside a date and time.
-    if p.has_tz && !(p.has_date && p.has_time) {
-        return None;
-    }
-    Some(p)
+/// Returns `true` if `target_type` is one of the fixed-width C targets
+/// `get_data::convert_typed_c` routes: the integer, float, GUID, and date/time structs.
+/// `SQLGetData` and block fetch gate their typed-conversion path on this.
+pub(crate) fn is_typed_c_target(target_type: SqlSmallInt) -> bool {
+    is_integer_c_target(target_type)
+        || is_float_c_target(target_type)
+        || target_type == SQL_C_GUID
+        || is_datetime_c_target(target_type)
 }
 
 /// Converts a date/time column value, or a character column holding a date/time
@@ -690,6 +475,19 @@ pub(crate) unsafe fn convert_datetime_c(
         // A date/time C target for a non-temporal column is illegal.
         _ => extract_datetime_parts(value).ok_or(ConvError::Restricted)?,
     };
+
+    // Appendix D: a time value converted to a timestamp takes the current date.
+    // Filling it in here lets the timestamp arms keep their `has_date` guard, so
+    // the date-only targets below still refuse a time value.
+    let mut p = p;
+    if p.has_time && !p.has_date && matches!(target_type, SQL_C_TYPE_TIMESTAMP | SQL_C_TIMESTAMP) {
+        let (year, month, day) = current_local_date().ok_or(ConvError::Internal)?;
+        p.year = year;
+        p.month = month;
+        p.day = day;
+        p.has_date = true;
+    }
+
     let ret = match target_type {
         SQL_C_TYPE_DATE | SQL_C_DATE if p.has_date => {
             let written = unsafe {
@@ -773,12 +571,10 @@ pub(crate) unsafe fn convert_datetime_c(
                 strlen_or_ind_ptr,
             )
         },
-        // Reached when the value lacks the component the target needs. Two
-        // cases land here: `time` into `SQL_C_TYPE_DATE`, which is correct, and
-        // `time` into `SQL_C_TYPE_TIMESTAMP`, which Appendix D says should fill
-        // in the current date instead (AB#47247). For character input the
-        // pairing is legal and it is the text that is wrong for this target, so
-        // that stays 22018 rather than becoming 07006.
+        // Reached when the value lacks the component the target needs, such as
+        // `time` into `SQL_C_TYPE_DATE`. For character input the pairing is
+        // legal and it is the text that is wrong for this target, so that stays
+        // 22018 rather than becoming 07006.
         _ => {
             return Err(if from_character {
                 ConvError::InvalidCharacterValue
@@ -832,6 +628,226 @@ pub(crate) fn format_datetime_parts(p: &DateTimeParts) -> String {
 mod tests {
     use super::*;
     use crate::api::odbc_types::SqlPointer;
+
+    mod memory_safety {
+        use super::*;
+        use crate::test_support::AlignedBuffer;
+        use std::fmt::Debug;
+        use std::mem::MaybeUninit;
+
+        fn check_write<T: Copy + Debug + PartialEq>(
+            expected: T,
+            convert: impl Fn(SqlPointer, *mut SqlLen) -> Result<ConvOk, ConvError>,
+        ) {
+            let width = size_of::<T>();
+            let mut output = AlignedBuffer([0xA5u8; 64]);
+            let mut indicator = AlignedBuffer([0xA5u8; 24]);
+            assert!(width < output.0.len());
+            for _ in 0..2 {
+                let ptr = output.0.as_mut_ptr().wrapping_add(1).cast::<T>();
+                let ind = indicator.0.as_mut_ptr().wrapping_add(1).cast::<SqlLen>();
+                if align_of::<T>() > 1 {
+                    assert!(!ptr.is_aligned());
+                }
+                assert!(!ind.is_aligned());
+                assert_eq!(convert(ptr.cast(), ind), Ok(ConvOk::Exact));
+                // Success initializes the value and indicator, but not struct padding.
+                assert_eq!(unsafe { ptr.read_unaligned() }, expected);
+                assert_eq!(
+                    unsafe { ind.read_unaligned() },
+                    SqlLen::try_from(width).unwrap()
+                );
+                assert_eq!(output.0[0], 0xA5);
+                assert!(output.0[1 + width..].iter().all(|&b| b == 0xA5));
+                assert_eq!(indicator.0[0], 0xA5);
+                assert!(
+                    indicator.0[1 + size_of::<SqlLen>()..]
+                        .iter()
+                        .all(|&b| b == 0xA5)
+                );
+            }
+
+            let mut output = MaybeUninit::<T>::uninit();
+            let mut indicator = MaybeUninit::<SqlLen>::uninit();
+            assert_eq!(
+                convert(output.as_mut_ptr().cast(), indicator.as_mut_ptr()),
+                Ok(ConvOk::Exact)
+            );
+            // Neither output had an initial value; the converter must only write them.
+            assert_eq!(unsafe { output.assume_init() }, expected);
+            assert_eq!(
+                unsafe { indicator.assume_init() },
+                SqlLen::try_from(width).unwrap()
+            );
+
+            let mut indicator = MaybeUninit::<SqlLen>::uninit();
+            assert_eq!(
+                convert(std::ptr::null_mut(), indicator.as_mut_ptr()),
+                Ok(ConvOk::Exact)
+            );
+            assert_eq!(
+                unsafe { indicator.assume_init() },
+                SqlLen::try_from(width).unwrap()
+            );
+            let mut output = MaybeUninit::<T>::uninit();
+            assert_eq!(
+                convert(output.as_mut_ptr().cast(), std::ptr::null_mut()),
+                Ok(ConvOk::Exact)
+            );
+            assert_eq!(unsafe { output.assume_init() }, expected);
+        }
+
+        #[test]
+        fn integer_targets_write_only_their_own_slots() {
+            macro_rules! check {
+                ($ty:ty, $($target:ident),+ $(,)?) => {
+                    $(
+                        let expected: $ty = 7;
+                        check_write(expected, |ptr, ind| unsafe {
+                            convert_integer_c(&ColumnValues::Int(7), $target, ptr, ind)
+                        });
+                    )+
+                };
+            }
+            check!(i8, SQL_C_TINYINT, SQL_C_STINYINT);
+            check!(u8, SQL_C_UTINYINT);
+            check!(i16, SQL_C_SHORT, SQL_C_SSHORT);
+            check!(u16, SQL_C_USHORT);
+            check!(i32, SQL_C_LONG, SQL_C_SLONG);
+            check!(u32, SQL_C_ULONG);
+            check!(i64, SQL_C_SBIGINT);
+            check!(u64, SQL_C_UBIGINT);
+            check_write(1u8, |ptr, ind| unsafe {
+                convert_integer_c(&ColumnValues::Bit(true), SQL_C_BIT, ptr, ind)
+            });
+        }
+
+        #[test]
+        fn floating_targets_write_only_their_own_slots() {
+            check_write(1.5f32, |ptr, ind| unsafe {
+                convert_float_c(&ColumnValues::Real(1.5), SQL_C_FLOAT, ptr, ind)
+            });
+            check_write(-2.5f64, |ptr, ind| unsafe {
+                convert_float_c(&ColumnValues::Float(-2.5), SQL_C_DOUBLE, ptr, ind)
+            });
+        }
+
+        #[test]
+        fn guid_target_writes_only_its_own_slot() {
+            let expected = SqlGuid {
+                data1: 0x12345678,
+                data2: 0x9ABC,
+                data3: 0xDEF0,
+                data4: [1, 2, 3, 4, 5, 6, 7, 8],
+            };
+            let source = ColumnValues::Uuid(uuid::Uuid::from_fields(
+                expected.data1,
+                expected.data2,
+                expected.data3,
+                &expected.data4,
+            ));
+            check_write(expected, |ptr, ind| unsafe {
+                convert_guid_c(&source, SQL_C_GUID, ptr, ind)
+            });
+        }
+
+        #[test]
+        fn temporal_targets_initialize_fields_without_reading_padding() {
+            let source = ColumnValues::DateTime2(SqlDateTime2 {
+                days: 0,
+                time: SqlTime {
+                    time_nanoseconds: 0,
+                    scale: 7,
+                },
+            });
+            for target in [SQL_C_TYPE_DATE, SQL_C_DATE] {
+                check_write(
+                    SqlDateStruct {
+                        year: 1,
+                        month: 1,
+                        day: 1,
+                    },
+                    |ptr, ind| unsafe { convert_datetime_c(&source, target, ptr, ind) },
+                );
+            }
+            for target in [SQL_C_TYPE_TIME, SQL_C_TIME] {
+                check_write(SqlTimeStruct::default(), |ptr, ind| unsafe {
+                    convert_datetime_c(&source, target, ptr, ind)
+                });
+            }
+            check_write(SqlSsTime2Struct::default(), |ptr, ind| unsafe {
+                convert_datetime_c(&source, SQL_C_SS_TIME2, ptr, ind)
+            });
+            for target in [SQL_C_TYPE_TIMESTAMP, SQL_C_TIMESTAMP] {
+                check_write(
+                    SqlTimestampStruct {
+                        year: 1,
+                        month: 1,
+                        day: 1,
+                        ..Default::default()
+                    },
+                    |ptr, ind| unsafe { convert_datetime_c(&source, target, ptr, ind) },
+                );
+            }
+            check_write(
+                SqlSsTimestampoffsetStruct {
+                    year: 1,
+                    month: 1,
+                    day: 1,
+                    ..Default::default()
+                },
+                |ptr, ind| unsafe {
+                    convert_datetime_c(&source, SQL_C_SS_TIMESTAMPOFFSET, ptr, ind)
+                },
+            );
+        }
+
+        #[test]
+        fn rejected_conversions_leave_both_buffers_untouched() {
+            type Convert = unsafe fn(
+                &ColumnValues,
+                SqlSmallInt,
+                SqlPointer,
+                *mut SqlLen,
+            ) -> Result<ConvOk, ConvError>;
+            let cases: [(Convert, ColumnValues, SqlSmallInt, ConvError); 4] = [
+                (
+                    convert_integer_c,
+                    ColumnValues::Int(40000),
+                    SQL_C_SSHORT,
+                    ConvError::OutOfRange,
+                ),
+                (
+                    convert_float_c,
+                    ColumnValues::Float(f64::MAX),
+                    SQL_C_FLOAT,
+                    ConvError::OutOfRange,
+                ),
+                (
+                    convert_guid_c,
+                    ColumnValues::Int(7),
+                    SQL_C_GUID,
+                    ConvError::Restricted,
+                ),
+                (
+                    convert_datetime_c,
+                    ColumnValues::Int(7),
+                    SQL_C_TYPE_DATE,
+                    ConvError::Restricted,
+                ),
+            ];
+            for (convert, source, target, expected) in cases {
+                let mut output = [0xA5u8; 64];
+                let mut indicator: SqlLen = -99;
+                // Both outputs are valid even though these conversions must not write.
+                let result =
+                    unsafe { convert(&source, target, output.as_mut_ptr().cast(), &mut indicator) };
+                assert_eq!(result, Err(expected));
+                assert_eq!(output, [0xA5; 64]);
+                assert_eq!(indicator, -99);
+            }
+        }
+    }
 
     fn conv(
         v: &ColumnValues,
@@ -1256,6 +1272,44 @@ mod tests {
         assert_eq!(err, ConvError::OutOfRange);
     }
 
+    /// A `real` column into `SQL_C_FLOAT` is the identity pairing, so it is
+    /// copied. Routing it through the narrowing check would make a subnormal
+    /// that the column already holds exactly come back as `22003`, and would
+    /// disagree with `try_write_exact_buffered_scalar`, which serves this
+    /// pairing on the buffered path.
+    ///
+    /// Measured on retail 18.6.2.1: round-tripping `1e-40` through a `real`
+    /// parameter and reading it back into a `SQL_C_FLOAT` buffer returns
+    /// `SQL_SUCCESS` and `9.99995e-41`.
+    #[test]
+    fn a_real_column_reaches_a_single_precision_target_unchecked() {
+        for v in [1e-40f32, -1e-40f32, f32::MIN_POSITIVE / 2.0] {
+            let mut out: f32 = 0.0;
+            let mut ind: SqlLen = 0;
+            conv_f(
+                &ColumnValues::Real(v),
+                SQL_C_FLOAT,
+                (&mut out as *mut f32).cast(),
+                &mut ind,
+            )
+            .unwrap();
+            assert_eq!(out, v, "value {v:e}");
+            assert_eq!(ind, 4);
+        }
+
+        // A genuine 64-bit source still meets the rule.
+        let mut out: f32 = 0.0;
+        let mut ind: SqlLen = 0;
+        let err = conv_f(
+            &ColumnValues::Float(1e-40),
+            SQL_C_FLOAT,
+            (&mut out as *mut f32).cast(),
+            &mut ind,
+        )
+        .unwrap_err();
+        assert_eq!(err, ConvError::OutOfRange);
+    }
+
     #[test]
     fn character_source_with_fraction_truncates() {
         let mut out: i32 = 0;
@@ -1614,6 +1668,28 @@ mod tests {
         assert_eq!((out.hour, out.minute, out.second), (12, 34, 56));
     }
 
+    /// The offset bound is on the total, so `+14:30` fails here too even though
+    /// the target never reads the offset back out. AB#47851 moved this rule
+    /// into the shared parser; before that the fetch direction bounded hours
+    /// and minutes independently and converted this literal. No SQL Server
+    /// `datetimeoffset` renders such a value, so only a character column can
+    /// carry one to this path.
+    #[test]
+    fn an_out_of_range_offset_is_rejected_for_non_offset_targets() {
+        let mut out = SqlTimestampStruct::default();
+        let mut ind: SqlLen = 0;
+        let err = unsafe {
+            convert_datetime_c(
+                &utf8_col("2023-01-01 12:34:56+14:30"),
+                SQL_C_TYPE_TIMESTAMP,
+                (&mut out as *mut SqlTimestampStruct).cast(),
+                &mut ind,
+            )
+        }
+        .unwrap_err();
+        assert_eq!(err, ConvError::InvalidCharacterValue);
+    }
+
     /// Digits that overflow `f64` are out of range, not unparseable text.
     /// `f64::from_str` folds both into `Ok(inf)`, so they have to be split.
     #[test]
@@ -1896,6 +1972,48 @@ mod tests {
         assert_eq!(err, ConvError::OutOfRange);
     }
 
+    #[test]
+    fn float_target_underflow_is_out_of_range() {
+        for v in [1.0e-40f64, -1.0e-40] {
+            let mut out: f32 = 9.0;
+            let mut ind: SqlLen = -99;
+            let err = conv_f(
+                &ColumnValues::Float(v),
+                SQL_C_FLOAT,
+                (&mut out as *mut f32).cast(),
+                &mut ind,
+            )
+            .unwrap_err();
+            assert_eq!(err, ConvError::OutOfRange, "value {v}");
+            // A rejected conversion writes neither the buffer nor the indicator.
+            assert_eq!(out, 9.0);
+            assert_eq!(ind, -99);
+        }
+
+        // Zero is not underflow, and `SQL_C_DOUBLE` never narrows so it takes
+        // the same value unchanged.
+        let mut out: f32 = 9.0;
+        let mut ind: SqlLen = 0;
+        conv_f(
+            &ColumnValues::Float(0.0),
+            SQL_C_FLOAT,
+            (&mut out as *mut f32).cast(),
+            &mut ind,
+        )
+        .unwrap();
+        assert_eq!(out, 0.0);
+
+        let mut wide: f64 = 0.0;
+        conv_f(
+            &ColumnValues::Float(1.0e-40),
+            SQL_C_DOUBLE,
+            (&mut wide as *mut f64).cast(),
+            &mut ind,
+        )
+        .unwrap();
+        assert_eq!(wide, 1.0e-40);
+    }
+
     // ---- GUID ------------------------------------------------------------
     #[test]
     fn uuid_to_guid_struct() {
@@ -1938,15 +2056,6 @@ mod tests {
     }
 
     // ---- Date / time -----------------------------------------------------
-    #[test]
-    fn civil_anchor_dates() {
-        assert_eq!(civil_from_days_since_0001(0), (1, 1, 1));
-        assert_eq!(civil_from_days_since_0001(693_595), (1900, 1, 1));
-        assert_eq!(civil_from_days_since_0001(730_178), (2000, 2, 29));
-        assert_eq!(civil_from_days_since_0001(738_685), (2023, 6, 15));
-        assert_eq!(civil_from_days_since_0001(3_652_058), (9999, 12, 31));
-    }
-
     #[test]
     fn date_to_date_struct() {
         use mssql_tds::datatypes::column_values::SqlDate;
@@ -2001,6 +2110,71 @@ mod tests {
                 fraction: 123_456_700
             }
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_process_timezone_controls_timestamp_date() {
+        const CHILD_ENV: &str = "MSSQL_ODBC_TZ_DATE_CHILD";
+        const TEST_NAME: &str =
+            "conversion::fetch_convert::tests::windows_process_timezone_controls_timestamp_date";
+
+        if std::env::var_os(CHILD_ENV).is_none() {
+            for timezone in ["UTC-12", "UTC+12"] {
+                let output = std::process::Command::new(
+                    std::env::current_exe().expect("test executable should have a path"),
+                )
+                .args(["--exact", TEST_NAME, "--nocapture"])
+                .env(CHILD_ENV, "1")
+                .env("TZ", timezone)
+                .output()
+                .expect("child test process should start");
+                assert!(
+                    output.status.success(),
+                    "child failed for {timezone}:\n{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                if String::from_utf8_lossy(&output.stdout).contains("TZ_DATE_VERIFIED") {
+                    return;
+                }
+            }
+            panic!("neither extreme TZ setting differed from the machine-local calendar date");
+        }
+
+        let crt_date = current_local_date().expect("CRT should provide the process-local date");
+        let machine = unsafe { windows::Win32::System::SystemInformation::GetLocalTime() };
+        let machine_date = (
+            i16::try_from(machine.wYear).expect("SYSTEMTIME year should fit"),
+            machine.wMonth,
+            machine.wDay,
+        );
+        if crt_date == machine_date {
+            return;
+        }
+
+        use mssql_tds::datatypes::column_values::SqlTime;
+        for value in [
+            ColumnValues::Time(SqlTime {
+                time_nanoseconds: 0,
+                scale: 0,
+            }),
+            utf8_col("00:00:00"),
+        ] {
+            let mut out = SqlTimestampStruct::default();
+            let mut ind: SqlLen = 0;
+            unsafe {
+                convert_datetime_c(
+                    &value,
+                    SQL_C_TYPE_TIMESTAMP,
+                    (&mut out as *mut SqlTimestampStruct).cast(),
+                    &mut ind,
+                )
+            }
+            .expect("time-to-timestamp conversion should succeed");
+            assert_eq!((out.year, out.month, out.day), crt_date);
+            assert_ne!((out.year, out.month, out.day), machine_date);
+        }
+        println!("TZ_DATE_VERIFIED");
     }
 
     #[test]
@@ -2289,6 +2463,101 @@ mod tests {
     }
 
     #[test]
+    fn datetimeoffset_overflowing_time_is_rejected_not_panicked() {
+        use mssql_tds::datatypes::column_values::{SqlDateTime2, SqlDateTimeOffset, SqlTime};
+        // A corrupt/hostile server can decode a `time_nanoseconds` near the i64
+        // ceiling (the decoder derives the time width from the row length byte,
+        // not the column scale). Applying a positive offset used to overflow the
+        // i64 tick addition and panic across the FFI boundary; it must now be
+        // rejected as an out-of-range conversion instead.
+        let mut out = SqlSsTimestampoffsetStruct::default();
+        let mut ind: SqlLen = 0;
+        let err = unsafe {
+            convert_datetime_c(
+                &ColumnValues::DateTimeOffset(SqlDateTimeOffset {
+                    datetime2: SqlDateTime2 {
+                        days: 0,
+                        time: SqlTime {
+                            time_nanoseconds: i64::MAX as u64,
+                            scale: 7,
+                        },
+                    },
+                    offset: 60,
+                }),
+                SQL_C_SS_TIMESTAMPOFFSET,
+                (&mut out as *mut SqlSsTimestampoffsetStruct).cast(),
+                &mut ind,
+            )
+        }
+        .unwrap_err();
+        assert_eq!(err, ConvError::Restricted);
+    }
+
+    #[test]
+    fn datetimeoffset_checked_arithmetic_matches_wide_arithmetic() {
+        let day_ticks = u64::try_from(TICKS_PER_DAY).unwrap();
+        for days in [0, 1, 738_685, 3_652_057, 3_652_058, u32::MAX] {
+            for ticks in [
+                0,
+                1,
+                day_ticks - 1,
+                day_ticks,
+                day_ticks * 3_652_059,
+                u64::try_from(i64::MAX).unwrap() - 1,
+                u64::try_from(i64::MAX).unwrap(),
+                u64::MAX,
+            ] {
+                for offset in [i16::MIN, -840, -1, 0, 1, 840, i16::MAX] {
+                    let value = SqlDateTimeOffset {
+                        datetime2: SqlDateTime2 {
+                            days,
+                            time: SqlTime {
+                                time_nanoseconds: ticks,
+                                scale: 7,
+                            },
+                        },
+                        offset,
+                    };
+                    let wide_ticks = i128::from(ticks) + i128::from(offset) * 60 * 10_000_000;
+                    let wide_days =
+                        i128::from(days) + wide_ticks.div_euclid(i128::from(TICKS_PER_DAY));
+                    let actual = datetimeoffset_parts(&value);
+                    if (0..=i128::from(MAX_DAYS_SINCE_0001)).contains(&wide_days) {
+                        let actual = actual.unwrap();
+                        let date = civil_from_days_since_0001(i64::try_from(wide_days).unwrap());
+                        let time = hms_from_ticks_100ns(
+                            u64::try_from(wide_ticks.rem_euclid(i128::from(TICKS_PER_DAY)))
+                                .unwrap(),
+                        );
+                        assert_eq!(
+                            (actual.year, actual.month, actual.day),
+                            (date.year, date.month, date.day)
+                        );
+                        assert_eq!(
+                            (
+                                actual.hour,
+                                actual.minute,
+                                actual.second,
+                                actual.fraction_ns
+                            ),
+                            (time.hour, time.minute, time.second, time.fraction_ns)
+                        );
+                        assert_eq!(
+                            (actual.tz_hour, actual.tz_minute),
+                            (offset / 60, offset % 60)
+                        );
+                    } else {
+                        assert!(
+                            actual.is_none(),
+                            "days={days}, ticks={ticks}, offset={offset}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn datetime_legacy_epoch_and_ticks() {
         use mssql_tds::datatypes::column_values::SqlDateTime;
         // days = 0 -> 1900-01-01; time = 300 ticks -> 1 second past midnight.
@@ -2307,6 +2576,30 @@ mod tests {
         assert_eq!(out.month, 1);
         assert_eq!(out.day, 1);
         assert_eq!(out.second, 1);
+    }
+
+    #[test]
+    fn datetime_legacy_fraction_rounds_to_milliseconds() {
+        use mssql_tds::datatypes::column_values::SqlDateTime;
+
+        for ticks in 0u32..300 {
+            let expected_fraction = ((ticks * 20 + 3) / 6) * 1_000_000;
+            let mut out = SqlTimestampStruct::default();
+            let mut ind: SqlLen = 0;
+            unsafe {
+                convert_datetime_c(
+                    &ColumnValues::DateTime(SqlDateTime {
+                        days: 0,
+                        time: ticks,
+                    }),
+                    SQL_C_TYPE_TIMESTAMP,
+                    (&mut out as *mut SqlTimestampStruct).cast(),
+                    &mut ind,
+                )
+            }
+            .unwrap();
+            assert_eq!(out.fraction, expected_fraction, "ticks: {ticks}");
+        }
     }
 
     #[test]

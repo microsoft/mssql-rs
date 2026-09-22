@@ -23,7 +23,7 @@
 //! preserved.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
 use mssql_tds::connection::tds_client::TdsClient;
 use mssql_tds::error::Error;
@@ -36,7 +36,7 @@ use tracing::instrument::WithSubscriber;
 use crate::async_description::DescriptionState;
 use crate::async_errors::ProgrammingError;
 use crate::async_execute::{ExecuteResources, PreparedState, release_prepared_statements};
-use crate::async_fetch::FetchState;
+use crate::async_fetch::{BufferedResults, FetchState};
 use crate::async_session::{
     AsyncConnectionState, ClaimError, CursorCloseClaim, CursorId, SessionOperationGuard,
 };
@@ -58,6 +58,16 @@ pub(crate) fn map_claim_error(error: ClaimError) -> PyErr {
     map_claim_error_with_busy_message(error, "Connection is busy with another cursor operation")
 }
 
+fn clear_result_state(
+    fetch_state: &FetchState,
+    description_state: &DescriptionState,
+    buffered_results: &BufferedResults,
+) {
+    buffered_results.replace(Default::default());
+    description_state.replace(None);
+    fetch_state.set(crate::async_fetch::FetchStatus::NoResultSet);
+}
+
 /// Python-independent resources required to drain and release a cursor.
 struct CursorCleanup {
     client: Arc<Mutex<TdsClient>>,
@@ -66,9 +76,20 @@ struct CursorCleanup {
     cursor_id: CursorId,
     timeout: u32,
     closed: Arc<AtomicBool>,
+    fetch_state: Arc<FetchState>,
+    description_state: Arc<DescriptionState>,
+    buffered_results: Arc<BufferedResults>,
 }
 
 impl CursorCleanup {
+    fn clear_result_state(&self) {
+        clear_result_state(
+            &self.fetch_state,
+            &self.description_state,
+            &self.buffered_results,
+        );
+    }
+
     async fn run(self, claim: CursorCloseClaim) -> Result<(), Error> {
         let mut cleanup_guard =
             SessionOperationGuard::new(self.session_state.clone(), claim.operation_id);
@@ -89,6 +110,7 @@ impl CursorCleanup {
 
         cleanup_guard.settle(has_open_batch);
         // Cleanup consumes the close attempt even when draining or unprepare fails.
+        self.clear_result_state();
         self.closed.store(true, Ordering::Release);
         result?;
         Ok(())
@@ -179,6 +201,8 @@ pub struct PyAsyncCursor {
     closed: Arc<AtomicBool>,
     fetch_state: Arc<FetchState>,
     description_state: Arc<DescriptionState>,
+    rowcount: Arc<AtomicI64>,
+    buffered_results: Arc<BufferedResults>,
 }
 
 impl PyAsyncCursor {
@@ -209,6 +233,8 @@ impl PyAsyncCursor {
             closed: Arc::new(AtomicBool::new(false)),
             fetch_state: Arc::new(FetchState::new()),
             description_state: Arc::new(DescriptionState::new()),
+            rowcount: Arc::new(AtomicI64::new(-1)),
+            buffered_results: Arc::new(BufferedResults::default()),
         }
     }
 
@@ -220,6 +246,9 @@ impl PyAsyncCursor {
             cursor_id: self.cursor_id,
             timeout: self.default_query_timeout,
             closed: self.closed.clone(),
+            fetch_state: self.fetch_state.clone(),
+            description_state: self.description_state.clone(),
+            buffered_results: self.buffered_results.clone(),
         }
     }
 
@@ -234,6 +263,8 @@ impl PyAsyncCursor {
             self.cursor_id,
             self.fetch_state.clone(),
             self.description_state.clone(),
+            self.buffered_results.clone(),
+            self.rowcount.clone(),
         ))
     }
 
@@ -252,8 +283,11 @@ impl PyAsyncCursor {
             self.input_sizes.clone(),
             self.input_sizes_generation,
             self.cleanup_required.clone(),
+            self.closed.clone(),
             self.fetch_state.clone(),
             self.description_state.clone(),
+            self.rowcount.clone(),
+            self.buffered_results.clone(),
         ))
     }
 
@@ -333,13 +367,35 @@ impl Drop for PyAsyncCursor {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
     use std::sync::Arc;
 
     use pyo3::Python;
 
-    use super::{FinalizerCompletionGuard, map_claim_error};
+    use super::{FinalizerCompletionGuard, clear_result_state, map_claim_error};
+    use crate::async_description::DescriptionState;
     use crate::async_errors::ProgrammingError;
+    use crate::async_fetch::{BufferedResults, BufferedRowSet, FetchState, FetchStatus};
     use crate::async_session::{AsyncConnectionState, ClaimError, ConnectionLifecycle};
+    use crate::row_writer::PyRowWriter;
+
+    #[test]
+    fn clear_result_state_discards_buffered_results() {
+        let fetch_state = FetchState::new();
+        fetch_state.set(FetchStatus::Ready);
+        let description_state = DescriptionState::new();
+        let buffered_results = BufferedResults::default();
+        buffered_results.replace(VecDeque::from([BufferedRowSet {
+            metadata: Vec::new(),
+            rows: VecDeque::from([PyRowWriter::new(0)]),
+        }]));
+        assert!(buffered_results.has_current());
+
+        clear_result_state(&fetch_state, &description_state, &buffered_results);
+
+        assert!(!buffered_results.has_current());
+        assert!(fetch_state.status() == FetchStatus::NoResultSet);
+    }
 
     #[test]
     fn no_result_set_claim_maps_to_programming_error() {
@@ -390,6 +446,12 @@ impl PyAsyncCursor {
         self.description_state.get(py)
     }
 
+    /// Number of rows affected by the most recent operation, or `-1` when unknown.
+    #[getter]
+    fn rowcount(&self) -> i64 {
+        self.rowcount.load(Ordering::Acquire)
+    }
+
     /// Number of rows requested by `fetchmany()` when no size is supplied.
     #[getter]
     fn arraysize(&self) -> isize {
@@ -425,6 +487,31 @@ impl PyAsyncCursor {
         reset_cursor: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
         crate::async_execute::execute(slf, py, operation, parameters, use_prepare, reset_cursor)
+    }
+
+    /// Execute T-SQL once for each parameter row and return this cursor.
+    ///
+    /// Rows execute sequentially after the complete input iterable is validated.
+    /// Positional rows use `?`; mapping rows use `%(name)s`. A SQL error stops
+    /// execution and reports its zero-based parameter-row index. Earlier rows may
+    /// already be committed when autocommit is enabled; an explicit transaction
+    /// remains open for the caller to commit or roll back.
+    ///
+    /// DML row counts are aggregated. The aggregate is `-1` if any surfaced
+    /// statement result has an unknown row count. Row-producing results also set
+    /// `rowcount` to `-1`, are buffered, and retain their boundaries for
+    /// `fetch*()` and `nextset()`. The query timeout applies separately to each execution.
+    /// Peak memory scales with the complete parameter input plus all buffered
+    /// result rows; the input iterable is not streamed during execution.
+    #[pyo3(signature = (operation, seq_of_parameters, *, use_prepare=true))]
+    fn executemany<'py>(
+        slf: Py<Self>,
+        py: Python<'py>,
+        operation: String,
+        seq_of_parameters: &Bound<'_, PyAny>,
+        use_prepare: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        crate::async_execute::executemany(slf, py, operation, seq_of_parameters, use_prepare)
     }
 
     /// Fetch the next row and return an awaitable resolving to a tuple or `None`.
@@ -480,6 +567,7 @@ impl PyAsyncCursor {
         let claim = match session_state.claim_cursor_close(cleanup.cursor_id) {
             Ok(claim) => claim,
             Err(ClaimError::Closing | ClaimError::Closed) => {
+                cleanup.clear_result_state();
                 cleanup.closed.store(true, Ordering::Release);
                 return pyo3_async_runtimes::tokio::future_into_py(py, async move {
                     Python::attach(|py| Ok(py.None()))

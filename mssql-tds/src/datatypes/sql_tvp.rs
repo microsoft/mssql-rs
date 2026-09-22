@@ -18,6 +18,8 @@
 use bitflags::bitflags;
 
 use crate::core::TdsResult;
+use crate::datatypes::column_values::{ColumnValues, DEFAULT_VARTIME_SCALE, SqlTime};
+use crate::datatypes::decoder::DecimalParts;
 use crate::datatypes::sqltypes::SqlType;
 use crate::datatypes::tds_value_serializer::TdsValueSerializer;
 use crate::error::Error;
@@ -119,10 +121,12 @@ pub struct TvpColumnDef {
     pub column_type: SqlType,
     /// Per-column flags. `NULLABLE` is always set during serialization.
     pub flags: TvpColumnFlags,
-    /// Precision override for `Decimal`/`Numeric` columns.
+    /// Precision override for `Decimal`/`Numeric` columns. Values that exceed
+    /// this precision are rejected.
     pub precision: Option<u8>,
     /// Scale override for `Decimal`/`Numeric`/`Time`/`DateTime2`/
-    /// `DateTimeOffset` columns.
+    /// `DateTimeOffset` columns. Row values are converted to this scale;
+    /// conversions that would discard fractional data are rejected.
     pub scale: Option<u8>,
 }
 
@@ -137,6 +141,161 @@ impl TvpColumnDef {
             scale: None,
         }
     }
+
+    fn decimal_metadata(&self) -> Option<(u8, u8)> {
+        match &self.column_type {
+            SqlType::Decimal(value) | SqlType::Numeric(value) => Some((
+                self.precision
+                    .or_else(|| value.as_ref().map(|value| value.precision))
+                    .unwrap_or(1),
+                self.scale
+                    .or_else(|| value.as_ref().map(|value| value.scale))
+                    .unwrap_or(0),
+            )),
+            _ => None,
+        }
+    }
+
+    fn temporal_scale(&self) -> Option<u8> {
+        match &self.column_type {
+            SqlType::Time(value) => Some(
+                self.scale
+                    .or_else(|| value.as_ref().map(|value| value.scale))
+                    .unwrap_or(DEFAULT_VARTIME_SCALE),
+            ),
+            SqlType::DateTime2(value) => Some(
+                self.scale
+                    .or_else(|| value.as_ref().map(|value| value.time.scale))
+                    .unwrap_or(DEFAULT_VARTIME_SCALE),
+            ),
+            SqlType::DateTimeOffset(value) => Some(
+                self.scale
+                    .or_else(|| value.as_ref().map(|value| value.datetime2.time.scale))
+                    .unwrap_or(DEFAULT_VARTIME_SCALE),
+            ),
+            _ => None,
+        }
+    }
+
+    fn validate(&self) -> TdsResult<()> {
+        if let Some((precision, scale)) = self.decimal_metadata() {
+            validate_decimal_metadata(precision, scale)?;
+        }
+
+        if let Some(scale) = self.temporal_scale()
+            && scale > DEFAULT_VARTIME_SCALE
+        {
+            return Err(Error::UsageError(format!(
+                "TVP temporal scale must be between 0 and {DEFAULT_VARTIME_SCALE}, got {scale}"
+            )));
+        }
+
+        Ok(())
+    }
+}
+
+fn validate_decimal_metadata(precision: u8, scale: u8) -> TdsResult<()> {
+    if !(1..=38).contains(&precision) {
+        return Err(Error::UsageError(format!(
+            "TVP decimal/numeric precision must be between 1 and 38, got {precision}"
+        )));
+    }
+    if scale > precision {
+        return Err(Error::UsageError(format!(
+            "TVP decimal/numeric scale {scale} exceeds precision {precision}"
+        )));
+    }
+
+    Ok(())
+}
+
+fn apply_decimal_metadata(value: &mut DecimalParts, precision: u8, scale: u8) -> TdsResult<()> {
+    validate_decimal_metadata(precision, scale)?;
+
+    let mut magnitude = value.magnitude();
+    if value.scale > scale {
+        let scale_factor = 10_u128
+            .checked_pow(u32::from(value.scale - scale))
+            .ok_or_else(|| {
+                Error::UsageError(format!(
+                    "TVP decimal/numeric value scale {} cannot be converted to scale {scale}",
+                    value.scale
+                ))
+            })?;
+        if !magnitude.is_multiple_of(scale_factor) {
+            return Err(Error::UsageError(format!(
+                "TVP decimal/numeric value at scale {} cannot be represented at scale {scale} \
+                 without truncation",
+                value.scale
+            )));
+        }
+        magnitude /= scale_factor;
+    } else if value.scale < scale {
+        let scale_factor = 10_u128.pow(u32::from(scale - value.scale));
+        magnitude = magnitude.checked_mul(scale_factor).ok_or_else(|| {
+            Error::UsageError(format!(
+                "TVP decimal/numeric value magnitude is too large to rescale to scale {scale}"
+            ))
+        })?;
+    }
+
+    let digits = if magnitude == 0 {
+        1
+    } else {
+        magnitude.ilog10() + 1
+    };
+    if digits > u32::from(precision) {
+        return Err(Error::UsageError(format!(
+            "TVP decimal/numeric value has {digits} digits after scaling, exceeding precision \
+             {precision}"
+        )));
+    }
+
+    *value = DecimalParts::new(value.is_positive, precision, scale, magnitude);
+    Ok(())
+}
+
+fn apply_temporal_scale(value: &mut ColumnValues, scale: u8) -> TdsResult<()> {
+    let time = match value {
+        ColumnValues::Time(value) => value,
+        ColumnValues::DateTime2(value) => &mut value.time,
+        ColumnValues::DateTimeOffset(value) => &mut value.datetime2.time,
+        _ => return Ok(()),
+    };
+
+    if !temporal_value_fits_scale(time, scale) {
+        return Err(Error::UsageError(format!(
+            "TVP temporal value cannot be represented at scale {scale}"
+        )));
+    }
+
+    time.scale = scale;
+    Ok(())
+}
+
+fn temporal_value_fits_scale(value: &SqlTime, scale: u8) -> bool {
+    if scale > DEFAULT_VARTIME_SCALE {
+        return false;
+    }
+
+    // Despite the name, `time_nanoseconds` counts 100-ns ticks (scale 7), so a
+    // value survives scale N only when it is a multiple of 10^(7-N) ticks.
+    let scale_factor = 10_u64.pow(u32::from(DEFAULT_VARTIME_SCALE - scale));
+    value.time_nanoseconds.is_multiple_of(scale_factor)
+}
+
+fn apply_column_metadata(column: &TvpColumnDef, value: &mut ColumnValues) -> TdsResult<()> {
+    if let Some((precision, scale)) = column.decimal_metadata()
+        && let ColumnValues::Decimal(value) | ColumnValues::Numeric(value) = value
+    {
+        apply_decimal_metadata(value, precision, scale)?;
+    }
+
+    if let Some(scale) = column.temporal_scale() {
+        apply_temporal_scale(value, scale)?;
+    }
+
+    Ok(())
 }
 
 /// An order/unique hint for a single TVP column.
@@ -193,6 +352,10 @@ impl TvpTableData {
             )));
         }
 
+        for column in &self.columns {
+            column.validate()?;
+        }
+
         for (row_idx, row) in self.rows.iter().enumerate() {
             if row.len() != self.columns.len() {
                 return Err(Error::UsageError(format!(
@@ -209,6 +372,31 @@ impl TvpTableData {
                          but the column is declared as {:?}",
                         column.column_type
                     )));
+                }
+
+                let temporal_value = match cell {
+                    SqlType::Time(Some(value)) => Some(value),
+                    SqlType::DateTime2(Some(value)) => Some(&value.time),
+                    SqlType::DateTimeOffset(Some(value)) => Some(&value.datetime2.time),
+                    _ => None,
+                };
+                if let (Some(scale), Some(value)) = (column.temporal_scale(), temporal_value)
+                    && !temporal_value_fits_scale(value, scale)
+                {
+                    return Err(Error::UsageError(format!(
+                        "TVP row {row_idx} column {col_idx} value cannot be represented at \
+                         temporal scale {scale}"
+                    )));
+                }
+
+                if let Some((precision, scale)) = column.decimal_metadata()
+                    && let SqlType::Decimal(Some(value)) | SqlType::Numeric(Some(value)) = cell
+                {
+                    // Rescale a copy and discard it: this only pre-flights the
+                    // conversion that `write_tvp_rows` performs for real, so a
+                    // rejectable value fails before any bytes reach the wire.
+                    let mut value = *value;
+                    apply_decimal_metadata(&mut value, precision, scale)?;
                 }
             }
         }
@@ -365,7 +553,11 @@ pub(crate) async fn write_tvp_rows(
             // Context from the column definition keeps the encoding aligned with
             // the declared metadata; the value bytes come from the cell.
             let (_, ctx) = column.column_type.to_column_value_and_context(db_collation);
-            let (value, _) = cell.to_column_value_and_context(db_collation);
+            let (mut value, _) = cell.to_column_value_and_context(db_collation);
+            // Callers must have run `TvpTableData::validate` first: this can
+            // reject a value after `TVP_ROW_TOKEN` and earlier cells are already
+            // buffered, which would leave a half-written TVP on the wire.
+            apply_column_metadata(column, &mut value)?;
             TdsValueSerializer::serialize_value(packet_writer, &value, &ctx).await?;
         }
     }
@@ -378,6 +570,7 @@ pub(crate) async fn write_tvp_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::datatypes::column_values::{SqlDateTime2, SqlDateTimeOffset};
     use crate::io::packet_writer::PacketWriter;
     use crate::io::packet_writer::tests::MockNetworkWriter;
     use crate::message::messages::PacketType;
@@ -404,6 +597,26 @@ mod tests {
         writer.finalize().await.unwrap();
         let payload = mock.data;
         payload[PacketWriter::PACKET_HEADER_SIZE..].to_vec()
+    }
+
+    async fn column_metadata_bytes(columns: &[TvpColumnDef]) -> Vec<u8> {
+        let mut mock = MockNetworkWriter::new(4096);
+        let mut writer = PacketWriter::new(PacketType::RpcRequest, &mut mock, None, None);
+        write_tvp_column_metadata(&mut writer, columns, &default_collation())
+            .await
+            .unwrap();
+        writer.finalize().await.unwrap();
+        mock.data[PacketWriter::PACKET_HEADER_SIZE..].to_vec()
+    }
+
+    async fn row_bytes(columns: &[TvpColumnDef], rows: &[Vec<SqlType>]) -> Vec<u8> {
+        let mut mock = MockNetworkWriter::new(4096);
+        let mut writer = PacketWriter::new(PacketType::RpcRequest, &mut mock, None, None);
+        write_tvp_rows(&mut writer, columns, rows, &default_collation())
+            .await
+            .unwrap();
+        writer.finalize().await.unwrap();
+        mock.data[PacketWriter::PACKET_HEADER_SIZE..].to_vec()
     }
 
     #[tokio::test]
@@ -606,6 +819,281 @@ mod tests {
             vec![vec![SqlType::Int(Some(1))], vec![SqlType::Int(None)]],
         );
         assert!(data.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_precision_and_scale_overrides() {
+        for (precision, scale) in [(0, 0), (39, 0), (9, 10)] {
+            let mut column = TvpColumnDef::new(SqlType::Decimal(None));
+            column.precision = Some(precision);
+            column.scale = Some(scale);
+            let data = TvpTableData::new(vec![column], Vec::new());
+            assert!(matches!(data.validate(), Err(Error::UsageError(_))));
+        }
+
+        let mut column = TvpColumnDef::new(SqlType::Time(None));
+        column.scale = Some(8);
+        let data = TvpTableData::new(vec![column], Vec::new());
+        assert!(matches!(data.validate(), Err(Error::UsageError(_))));
+    }
+
+    #[test]
+    fn test_validate_unrepresentable_temporal_value() {
+        let time = SqlTime {
+            time_nanoseconds: 10_000_001,
+            scale: 7,
+        };
+        let cases = [
+            (SqlType::Time(None), SqlType::Time(Some(time.clone()))),
+            (
+                SqlType::DateTime2(None),
+                SqlType::DateTime2(Some(SqlDateTime2 {
+                    days: 1,
+                    time: time.clone(),
+                })),
+            ),
+            (
+                SqlType::DateTimeOffset(None),
+                SqlType::DateTimeOffset(Some(SqlDateTimeOffset {
+                    datetime2: SqlDateTime2 {
+                        days: 1,
+                        time: time.clone(),
+                    },
+                    offset: 60,
+                })),
+            ),
+        ];
+
+        for (column_type, value) in cases {
+            let mut column = TvpColumnDef::new(column_type);
+            column.scale = Some(3);
+            let data = TvpTableData::new(vec![column], vec![vec![value]]);
+
+            assert!(matches!(data.validate(), Err(Error::UsageError(_))));
+        }
+    }
+
+    #[test]
+    fn test_validate_unrepresentable_decimal_values() {
+        let mut column = TvpColumnDef::new(SqlType::Decimal(None));
+        column.precision = Some(9);
+        column.scale = Some(2);
+        let data = TvpTableData::new(
+            vec![column],
+            vec![vec![SqlType::Decimal(Some(DecimalParts::new(
+                true, 9, 3, 123_456,
+            )))]],
+        );
+        assert!(matches!(data.validate(), Err(Error::UsageError(_))));
+
+        let mut column = TvpColumnDef::new(SqlType::Numeric(None));
+        column.precision = Some(3);
+        column.scale = Some(2);
+        let data = TvpTableData::new(
+            vec![column],
+            vec![vec![SqlType::Numeric(Some(DecimalParts::new(
+                true, 5, 2, 12_345,
+            )))]],
+        );
+        assert!(matches!(data.validate(), Err(Error::UsageError(_))));
+    }
+
+    #[test]
+    fn test_apply_decimal_metadata_rejects_scale_factor_overflow() {
+        let mut value = DecimalParts::new(true, 38, u8::MAX, 1);
+
+        let error = apply_decimal_metadata(&mut value, 38, 0).unwrap_err();
+
+        assert!(matches!(
+            error,
+            Error::UsageError(message)
+                if message == "TVP decimal/numeric value scale 255 cannot be converted to scale 0"
+        ));
+    }
+
+    #[test]
+    fn test_apply_decimal_metadata_rejects_magnitude_overflow() {
+        let mut value = DecimalParts::new(true, 38, 0, u128::MAX);
+
+        let error = apply_decimal_metadata(&mut value, 38, 1).unwrap_err();
+
+        assert!(matches!(
+            error,
+            Error::UsageError(message)
+                if message
+                    == "TVP decimal/numeric value magnitude is too large to rescale to scale 1"
+        ));
+    }
+
+    #[test]
+    fn test_apply_decimal_metadata_preserves_zero() {
+        let mut value = DecimalParts::new(false, 4, 2, 0);
+
+        apply_decimal_metadata(&mut value, 4, 4).unwrap();
+
+        assert_eq!(value, DecimalParts::new(false, 4, 4, 0));
+    }
+
+    #[test]
+    fn test_apply_temporal_scale_rejects_invalid_scale() {
+        let mut value = ColumnValues::Time(SqlTime {
+            time_nanoseconds: 0,
+            scale: DEFAULT_VARTIME_SCALE,
+        });
+        let invalid_scale = DEFAULT_VARTIME_SCALE + 1;
+
+        let error = apply_temporal_scale(&mut value, invalid_scale).unwrap_err();
+
+        assert!(matches!(
+            error,
+            Error::UsageError(message)
+                if message
+                    == format!("TVP temporal value cannot be represented at scale {invalid_scale}")
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_decimal_and_numeric_rows_use_odbc_fixed_width() {
+        let mut decimal_column = TvpColumnDef::new(SqlType::Decimal(None));
+        decimal_column.precision = Some(9);
+        decimal_column.scale = Some(2);
+        let mut numeric_column = TvpColumnDef::new(SqlType::Numeric(None));
+        numeric_column.precision = Some(9);
+        numeric_column.scale = Some(2);
+        let columns = vec![decimal_column, numeric_column];
+
+        assert_eq!(
+            column_metadata_bytes(&columns).await,
+            vec![
+                0x02, 0x00, // column count
+                0x00, 0x00, 0x00, 0x00, // user type
+                0x01, 0x00, // flags
+                0x6C, 0x11, 0x09, 0x02, // decimal(9,2), max length 17
+                0x00, // column name
+                0x00, 0x00, 0x00, 0x00, // user type
+                0x01, 0x00, // flags
+                0x6C, 0x11, 0x09, 0x02, // numeric(9,2), max length 17
+                0x00, // column name
+            ]
+        );
+
+        let decimal = DecimalParts::new(true, 9, 4, 1_234_500);
+        let numeric = DecimalParts::new(true, 9, 1, 1_234);
+        let rows = vec![vec![
+            SqlType::Decimal(Some(decimal)),
+            SqlType::Numeric(Some(numeric)),
+        ]];
+        let mut expected = vec![TVP_ROW_TOKEN];
+        for magnitude in [12_345_u128, 12_340] {
+            expected.push(17);
+            expected.push(1);
+            expected.extend_from_slice(&magnitude.to_le_bytes());
+        }
+        expected.push(TVP_END_TOKEN);
+
+        assert_eq!(row_bytes(&columns, &rows).await, expected);
+    }
+
+    #[tokio::test]
+    async fn test_temporal_rows_use_column_scale() {
+        let mut time_column = TvpColumnDef::new(SqlType::Time(None));
+        time_column.scale = Some(3);
+        let mut datetime2_column = TvpColumnDef::new(SqlType::DateTime2(None));
+        datetime2_column.scale = Some(3);
+        let mut datetimeoffset_column = TvpColumnDef::new(SqlType::DateTimeOffset(None));
+        datetimeoffset_column.scale = Some(3);
+        let columns = vec![time_column, datetime2_column, datetimeoffset_column];
+
+        let time = SqlTime {
+            time_nanoseconds: 10_000_000,
+            scale: 7,
+        };
+        let rows = vec![
+            vec![
+                SqlType::Time(Some(time.clone())),
+                SqlType::DateTime2(Some(crate::datatypes::column_values::SqlDateTime2 {
+                    days: 1,
+                    time: time.clone(),
+                })),
+                SqlType::DateTimeOffset(Some(crate::datatypes::column_values::SqlDateTimeOffset {
+                    datetime2: crate::datatypes::column_values::SqlDateTime2 { days: 2, time },
+                    offset: 60,
+                })),
+            ],
+            vec![
+                SqlType::Time(None),
+                SqlType::DateTime2(None),
+                SqlType::DateTimeOffset(None),
+            ],
+        ];
+
+        assert_eq!(
+            row_bytes(&columns, &rows).await,
+            vec![
+                TVP_ROW_TOKEN,
+                4,
+                0xE8,
+                0x03,
+                0x00,
+                0x00, // time(3): one second
+                7,
+                0xE8,
+                0x03,
+                0x00,
+                0x00,
+                0x01,
+                0x00,
+                0x00, // datetime2(3)
+                9,
+                0xE8,
+                0x03,
+                0x00,
+                0x00,
+                0x02,
+                0x00,
+                0x00,
+                0x3C,
+                0x00,
+                TVP_ROW_TOKEN,
+                0,
+                0,
+                0,
+                TVP_END_TOKEN,
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_temporal_rows_honor_zero_and_default_scales() {
+        let mut zero_scale_column = TvpColumnDef::new(SqlType::Time(None));
+        zero_scale_column.scale = Some(0);
+        let columns = vec![zero_scale_column, TvpColumnDef::new(SqlType::Time(None))];
+        let time = SqlTime {
+            time_nanoseconds: 10_000_000,
+            scale: 3,
+        };
+        let rows = vec![vec![
+            SqlType::Time(Some(time.clone())),
+            SqlType::Time(Some(time)),
+        ]];
+
+        assert_eq!(
+            row_bytes(&columns, &rows).await,
+            vec![
+                TVP_ROW_TOKEN,
+                3,
+                0x01,
+                0x00,
+                0x00, // time(0): one second
+                5,
+                0x80,
+                0x96,
+                0x98,
+                0x00,
+                0x00, // default time(7)
+                TVP_END_TOKEN,
+            ]
+        );
     }
 
     /// A name part exceeding the B_VARCHAR `u8` character-count limit (255) is

@@ -20,6 +20,8 @@ pub enum SqlDataType {
     BigInt,
     /// NVarChar - UTF16 string
     NVarChar,
+    /// NVarChar(MAX) with caller-chosen PLP chunk boundaries.
+    NVarCharMax,
 }
 
 impl SqlDataType {
@@ -30,7 +32,7 @@ impl SqlDataType {
             SqlDataType::SmallInt => 0x26, // IntN with length 2
             SqlDataType::Int => 0x26,      // IntN with length 4
             SqlDataType::BigInt => 0x26,   // IntN with length 8
-            SqlDataType::NVarChar => 0xE7, // NVarCharType
+            SqlDataType::NVarChar | SqlDataType::NVarCharMax => 0xE7, // NVarCharType
         }
     }
 
@@ -41,7 +43,7 @@ impl SqlDataType {
             SqlDataType::SmallInt => 2,
             SqlDataType::Int => 4,
             SqlDataType::BigInt => 8,
-            SqlDataType::NVarChar => 255, // Handled specially
+            SqlDataType::NVarChar | SqlDataType::NVarCharMax => 255, // Handled specially
         }
     }
 }
@@ -54,6 +56,8 @@ pub enum ColumnValue {
     Int(i32),
     BigInt(i64),
     NVarChar(String),
+    /// Nonempty wire chunks of raw UTF-16 units, including malformed sequences.
+    NVarCharMax(Vec<Vec<u16>>),
     Null,
 }
 
@@ -66,6 +70,7 @@ impl ColumnValue {
             ColumnValue::Int(_) => SqlDataType::Int,
             ColumnValue::BigInt(_) => SqlDataType::BigInt,
             ColumnValue::NVarChar(_) => SqlDataType::NVarChar,
+            ColumnValue::NVarCharMax(_) => SqlDataType::NVarCharMax,
             ColumnValue::Null => SqlDataType::Int, // Default to Int for NULL
         }
     }
@@ -96,6 +101,18 @@ impl ColumnValue {
                     .collect();
                 buf.put_u16_le(utf16_bytes.len() as u16);
                 buf.put_slice(&utf16_bytes);
+            }
+            ColumnValue::NVarCharMax(chunks) => {
+                let total: u64 = chunks.iter().map(|chunk| chunk.len() as u64 * 2).sum();
+                buf.put_u64_le(total);
+                for chunk in chunks {
+                    assert!(!chunk.is_empty(), "an empty PLP chunk ends the value");
+                    buf.put_u32_le((chunk.len() * 2).try_into().expect("PLP chunk length"));
+                    for unit in chunk {
+                        buf.put_u16_le(*unit);
+                    }
+                }
+                buf.put_u32_le(0);
             }
             ColumnValue::Null => {
                 buf.put_u8(0); // Length 0 means NULL for IntN
@@ -310,6 +327,20 @@ impl QueryResponse {
 /// [`QueryResponse::delay`] is consulted — its result-set/error fields are
 /// ignored, since `Begin` always acknowledges with an `EnvChange` + `DONE`.
 pub const TM_BEGIN_DELAY_KEY: &str = "__MOCK_TDS_TM_BEGIN_DELAY__";
+
+/// Reserved [`QueryRegistry`] key that delays the mock server's answer to an
+/// RPC request that matched no specific registration.
+///
+/// RPC responses are otherwise matched by finding the registered (upper-cased)
+/// query text inside the request body, which works for `sp_prepexec`-style
+/// calls that carry caller-controlled SQL. It cannot address a call whose
+/// wire text the test does not choose — a catalog procedure, `sp_datatype_info`
+/// or `sp_describe_undeclared_parameters` — because the driver sends those
+/// proc names in lower case. This key delays those instead, so a test can
+/// prove `SQL_ATTR_QUERY_TIMEOUT` bounds the RPC itself rather than only the
+/// steps around it. Like [`TM_BEGIN_DELAY_KEY`], only its
+/// [`QueryResponse::delay`] is consulted.
+pub const RPC_DELAY_KEY: &str = "__MOCK_TDS_RPC_DELAY__";
 
 /// Registry of query responses
 pub struct QueryRegistry {

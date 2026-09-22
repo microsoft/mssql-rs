@@ -27,6 +27,8 @@ pub(crate) const SQLSTATE_08S01: [u8; 5] = *b"08S01";
 pub(crate) const SQLSTATE_22001: [u8; 5] = *b"22001";
 pub(crate) const SQLSTATE_22002: [u8; 5] = *b"22002";
 pub(crate) const SQLSTATE_22003: [u8; 5] = *b"22003";
+pub(crate) const SQLSTATE_22007: [u8; 5] = *b"22007";
+pub(crate) const SQLSTATE_22008: [u8; 5] = *b"22008";
 pub(crate) const SQLSTATE_22018: [u8; 5] = *b"22018";
 pub(crate) const SQLSTATE_22026: [u8; 5] = *b"22026";
 pub(crate) const SQLSTATE_24000: [u8; 5] = *b"24000";
@@ -103,6 +105,28 @@ pub(crate) const ERR_STATEMENT_UNUSABLE: DiagMsg = DiagMsg {
 pub(crate) const ERR_FUNCTION_SEQUENCE: DiagMsg = DiagMsg {
     state: SQLSTATE_HY010,
     text: "Function sequence error",
+};
+/// No supported `SQL_ATTR_ODBC_VERSION` was recorded before the application
+/// allocated a connection. Reached either by a caller that skipped the
+/// attribute entirely, or by a 2.x application whose `SQL_OV_ODBC2` this
+/// driver rejected (`HY024`) — the Driver Manager forwards that declaration
+/// rather than mapping it, then allocates the connection regardless. ODBC
+/// specifies `HY010` for allocating a connection before the version is set.
+///
+/// Note the text below reaches only a caller that loads this driver directly.
+/// It is posted on *this driver's* environment handle, which a Driver Manager
+/// application never holds — the application's `henv` is the DM's own. On the
+/// path this exists for, the DM substitutes its own diagnostic: unixODBC posts
+/// `IM005` ("Driver's SQLAllocHandle on SQL_HANDLE_DBC failed",
+/// `DriverManager/SQLConnect.c:1613-1616`), while the Windows DM propagates
+/// the `HY024` from the rejected `SQLSetEnvAttr` instead. `post_diag` only
+/// appends to `diag_records` and does not trace, so the refusal site in
+/// `alloc_handle.rs` logs this `text` verbatim — that log is the only place
+/// the reason survives for a Driver Manager user on either platform.
+pub(crate) const ERR_ODBC_VERSION_NOT_SET: DiagMsg = DiagMsg {
+    state: SQLSTATE_HY010,
+    text: "SQL_ATTR_ODBC_VERSION must be set to SQL_OV_ODBC3 or SQL_OV_ODBC3_80 \
+           before allocating a connection; this driver does not support ODBC 2.x",
 };
 /// A fallible allocation failed. Used where the byte count comes from the
 /// application rather than a bounded internal computation -- e.g. buffering
@@ -190,6 +214,10 @@ pub(crate) const ERR_RESTRICTED_DATA_TYPE: DiagMsg = DiagMsg {
     state: SQLSTATE_07006,
     text: "Restricted data type attribute violation",
 };
+pub(crate) const ERR_INTERNAL_CONVERSION: DiagMsg = DiagMsg {
+    state: SQLSTATE_HY000,
+    text: "Internal error converting value",
+};
 // `SQL_DEFAULT_PARAM` is only legal for a canonical procedure call, which this
 // driver does not support, so the state is terminal rather than "not yet"
 // (msodbcsql `sqlccmd.cpp` -> IDS_07_S01 on a non-canonical call statement).
@@ -234,6 +262,23 @@ pub(crate) const ERR_NUMERIC_OUT_OF_RANGE: DiagMsg = DiagMsg {
 pub(crate) const ERR_INVALID_CHARACTER_VALUE: DiagMsg = DiagMsg {
     state: SQLSTATE_22018,
     text: "Invalid character value for cast specification",
+};
+/// A date/time C struct that names no real instant - month 13, 31 February, a
+/// year outside `0001`..`9999`, or an out-of-range time or UTC offset.
+pub(crate) const ERR_INVALID_DATETIME_FORMAT: DiagMsg = DiagMsg {
+    state: SQLSTATE_22007,
+    text: "Invalid datetime format",
+};
+/// A fraction dropped by a temporal target's declared scale. Retail 18.6.2.1
+/// answers this state for `time`, `datetime2` and `datetimeoffset` alike.
+///
+/// `ParamToSQLType` (`sqlcfunc.cpp:3350`) reads as a split - this state for the
+/// timestamp family, `22001` otherwise - but that gate is the legacy datetime
+/// arm and is not what these targets reach; see `convert_datetime_sql`. Do not
+/// re-derive the split from source.
+pub(crate) const ERR_DATETIME_FIELD_OVERFLOW: DiagMsg = DiagMsg {
+    state: SQLSTATE_22008,
+    text: "Datetime field overflow",
 };
 pub(crate) const ERR_DAE_LENGTH_MISMATCH: DiagMsg = DiagMsg {
     state: SQLSTATE_22026,
@@ -341,6 +386,15 @@ pub(crate) const WARN_ARRAY_SIZE_CHANGED: DiagMsg = DiagMsg {
 pub(crate) const WARN_OPTION_VALUE_CHANGED: DiagMsg = DiagMsg {
     state: SQLSTATE_01S02,
     text: "Option value changed",
+};
+
+/// Posted when a requested `SQL_ATTR_PACKET_SIZE` falls outside the range
+/// `mssql-tds` accepts and is clamped. Matches msodbcsql's `IDS_01_S02_02`
+/// (`dll/res/local.rc:42`), which it posts from the same clamp
+/// (`sqlcmisc.cpp:1909-1917`).
+pub(crate) const WARN_PACKET_SIZE_CHANGED: DiagMsg = DiagMsg {
+    state: SQLSTATE_01S02,
+    text: "Packet size changed",
 };
 
 /// Post a server-originated error under a caller-chosen SQLSTATE, keeping the

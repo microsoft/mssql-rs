@@ -1,110 +1,181 @@
 # mssql-odbc
 
-Rust implementation of the Microsoft ODBC Driver 18 for SQL Server (`msodbcsql18`),
-built on top of [mssql-tds](../mssql-tds).
+`mssql-odbc` is a cross-platform ODBC 3.x driver for Microsoft SQL Server and
+Azure SQL, written in Rust and built on [mssql-tds](../mssql-tds). It exposes
+the native ODBC C API as a shared library that applications load through the
+platform's ODBC Driver Manager.
 
-## What it does
+> [!IMPORTANT]
+> The driver is alpha software under active development. It is being validated
+> as an opt-in backend for
+> [mssql-python](https://github.com/microsoft/mssql-python), but it is not yet a
+> complete, general-purpose replacement for Microsoft ODBC Driver 18 for SQL
+> Server.
 
-Ships a shared library (`mssqlodbc.so` / `mssqlodbc.dylib` / `mssqlodbc.dll`) that implements
-the ODBC C API. The ODBC Driver Manager (`unixODBC` on Linux/macOS, `odbc32` on Windows)
-loads it via `dlopen` — applications use standard ODBC calls without knowing the driver
-is written in Rust.
+## Distribution
 
-## Build
+The driver is included in
+[`mssql-python-rs`](https://pypi.org/project/mssql-python-rs/0.1.0/), the native
+runtime used by `mssql-python`. Version `0.1.0` is the latest release on PyPI,
+with prebuilt wheels for supported Windows, macOS, and Linux targets.
 
-```bash
-cargo build
-bash scripts/finalize-artifact.sh debug
+This crate is not published independently to crates.io. Build it from this
+workspace when developing or testing the ODBC library directly.
 
-cargo build --release
-bash scripts/finalize-artifact.sh release
+## How it works
+
+```mermaid
+flowchart TD
+    application[Application]
+    driverManager[ODBC Driver Manager<br/>Windows or unixODBC]
+    odbcDriver[mssql-odbc<br/>Native shared library]
+    tdsClient[mssql-tds<br/>TDS protocol client]
+    sqlServer[SQL Server or Azure SQL]
+
+    application -->|ODBC C API| driverManager
+    driverManager -->|Loads driver| odbcDriver
+    odbcDriver -->|Rust API| tdsClient
+    tdsClient -->|TDS protocol| sqlServer
 ```
 
-On Windows, run `scripts/finalize-artifact.ps1` with `-BuildProfile debug` or
-`-BuildProfile release` after the corresponding Cargo build. Cargo uses the internal
-target name `mssqlodbc`; on Linux and macOS the finalization scripts create the
-shipped artifact, while on Windows Cargo already emits it and the script resolves
-its path.
+ODBC entry points cross a panic boundary, validate raw pointers in a small
+unsafe layer, and delegate to safe Rust implementations. The driver targets
+the behavior of Microsoft ODBC Driver 18 where practical while documenting and
+testing deliberate differences.
 
-Output location: `target/{debug,release}/` with a platform-specific filename:
+Design notes for individual subsystems live beside the code: the parameter
+binding and array-execution model in [`docs/parameters_plan.md`](docs/parameters_plan.md),
+the fetch path in [`docs/typed-columnar-fetch-plan.md`](docs/typed-columnar-fetch-plan.md),
+and the deliberate departures from msodbcsql in
+[`docs/parity-deviations.md`](docs/parity-deviations.md).
 
-| Platform | Output file |
-|---|---|
-| Linux | `mssqlodbc.so` |
-| macOS | `mssqlodbc.dylib` |
-| Windows | `mssqlodbc.dll` |
+## Platform artifacts
 
-The `build.rs` script embeds platform-specific metadata:
-- **Linux:** `soname` → `mssqlodbc.so`
-- **macOS:** `install_name` → `mssqlodbc.dylib`
-- **Windows:** no extra linker args needed
-
-## Testing
-
-### Rust unit tests
-
-```bash
-cargo btest -p mssqlodbc
-```
-
-### C++ e2e tests (Google Test)
-
-End-to-end tests that exercise the driver through the ODBC Driver Manager,
-matching the msodbcsql gtest infrastructure. See [tests/e2e/README.md](tests/e2e/README.md).
-
-```bash
-cd tests/e2e
-./run_e2e.sh               # builds driver + registers + cmake + ctest
-```
-
-Or run test binaries directly (self-registers the driver automatically):
-
-```bash
-./build/smoke_test
-./build/alloc_env_test
-```
-
-## Tracing
-
-Tracing is disabled by default. Enable it with environment variables:
-
-| Variable | Default | Description |
+| Platform | Driver Manager | Library |
 |---|---|---|
-| `MSSQL_TDS_TRACE` | `false` | Set to `true` to enable tracing output |
-| `MSSQL_TDS_TRACE_LEVEL` | `warn` | Tracing filter expression (`tracing_subscriber::EnvFilter`) |
+| Windows | Windows ODBC Driver Manager | `mssqlodbc.dll` |
+| macOS | unixODBC | `mssqlodbc.dylib` |
+| Linux | unixODBC | `mssqlodbc.so` |
 
-Examples:
+## Build from source
+
+Install the repository's pinned Rust toolchain. Linux and macOS builds also
+need unixODBC development headers; the C++ end-to-end tests additionally need
+CMake and a C++17 compiler.
+
+From the repository root:
 
 ```bash
-# Enable default warn-level logging
-MSSQL_TDS_TRACE=true cargo btest -p mssqlodbc
-
-# ODBC-driver-focused debug logs only
-MSSQL_TDS_TRACE=true MSSQL_TDS_TRACE_LEVEL="warn,mssqlodbc=debug" cargo btest -p mssqlodbc
-
-# Full filter syntax is supported
-MSSQL_TDS_TRACE=true MSSQL_TDS_TRACE_LEVEL="warn,mssqlodbc=debug,mssql_tds=off" cargo btest -p mssqlodbc
+cargo build -p mssqlodbc
+bash mssql-odbc/scripts/finalize-artifact.sh debug
 ```
 
-## Architecture
+For an optimized build, add `--release` to `cargo build` and pass `release` to
+the finalization script.
 
-```
-Application
-    ↓ ODBC C API (SQLAllocHandle, SQLDriverConnect, ...)
-Driver Manager (unixODBC / odbc32)
-    ↓ dlopen / LoadLibrary
-mssqlodbc.so (this crate)
-    ↓
-mssql-tds (TDS protocol)
-    ↓
-SQL Server
+On Windows, use PowerShell after building:
+
+```powershell
+cargo build -p mssqlodbc
+./mssql-odbc/scripts/finalize-artifact.ps1 -BuildProfile debug
 ```
 
-Each ODBC entry point is a thin `pub unsafe extern "C"` wrapper in `exports.rs`
-that the Driver Manager resolves by symbol name. The wrapper delegates to a
-layered impl: panic boundary (`ffi_entry!` macro) → unsafe shim (raw-pointer
-validation) → safe core (business logic). See the conventions file below for
-details.
+The finalization script prints the artifact path under the workspace Cargo
+target directory.
+
+## Test
+
+Run the Rust test suite from the repository root:
+
+```bash
+cargo nextest run -p mssqlodbc --lib
+```
+
+### Buffer safety with Miri
+
+The `miri-odbc` nextest profile selects the opt-in `memory_safety` unit-test
+modules and the parameter reader's existing misalignment tests. They cover
+unaligned values and indicators, initialized read extents, string terminators
+and capacities, fixed-width writes, untouched error outputs, and reuse of caller
+buffers. They also run as ordinary unit tests; no production code is replaced
+under Miri. The UTF-16 reader cases check both aligned and byte-offset input,
+preserving lossy decoding, explicit lengths, and NUL termination. Parameter
+cases vary value, indicator, and length alignment independently, including
+temporal inputs, ignored storage, and length sentinels. Column-wise arrays and
+packed row-wise parameter bindings exercise production address calculations
+with nonzero offsets and distinct first/last values.
+
+The SQL NULL case with an uninitialized octet-length slot tests only
+`read_indicator`'s early return, not full execution. Execution's earlier
+data-at-execution probes still require readable, initialized non-null
+octet-length slots for input and input/output parameters.
+
+PR validation runs this profile under Miri on **Windows x64 and Linux x64**
+only, using `nightly-2026-09-06` and seed 0. The Linux job uses the existing
+Ubuntu build container. Test failures and empty selections fail the job, and
+each platform publishes a separate ODBC Miri JUnit report. The ordinary native
+test run still includes these tests; ARM64, macOS, and Alpine do not run Miri.
+The `--package mssqlodbc` option scopes the run to the driver. The shared filter
+uses only test names so it also parses in the smaller Kerberos workspace,
+which omits ODBC.
+
+The Build stage's `miriToolchain` variable in
+`.pipeline/templates/validation-stages.yml` holds the CI pin; keep the local
+commands below on the same version when updating it.
+
+From the repository root, with `cargo-nextest` installed:
+
+```powershell
+cargo fetch
+rustup toolchain install nightly-2026-09-06 --profile minimal --component miri,rust-src
+cargo +nightly-2026-09-06 miri nextest run --frozen -p mssqlodbc --lib --profile miri-odbc
+```
+
+`cargo fetch` creates the local, gitignored lockfile and restores dependencies
+before the frozen run. On Windows, a long checkout path can make Cargo use a
+compiler response file, which this Miri version does not support. In that case,
+set a short, dedicated build directory before running Miri:
+
+```powershell
+$env:CARGO_TARGET_DIR = Join-Path $env:TEMP "odbc-miri"
+```
+
+Run the same selection natively with:
+
+```powershell
+cargo nextest run --frozen -p mssqlodbc --lib --profile miri-odbc
+```
+
+The tests keep unread input tails uninitialized so Miri can detect over-reads
+that stay inside an allocation. Output sentinels additionally catch writes
+outside the declared slot even when those writes remain inside the backing
+allocation. Deliberate misalignment is asserted before the call, and C struct
+padding is not assumed to be initialized.
+
+This profile intentionally excludes handle fixtures (which start an I/O-enabled
+Tokio runtime), socket-based mock servers, native authentication/TLS, and the
+C++ Driver Manager tests. It does not test Windows DLL unloading or replace
+native end-to-end tests or fuzzing. Keep Miri's alignment and aliasing checks
+enabled; a passing run covers only the inputs and executions exercised.
+
+### C++ end-to-end tests
+
+The C++ end-to-end suite loads the built library through the real ODBC Driver
+Manager and exercises the exported API:
+
+```bash
+bash mssql-odbc/tests/e2e/run_e2e.sh
+```
+
+On Windows, run:
+
+```powershell
+./mssql-odbc/tests/e2e/run_e2e.ps1
+```
+
+See the [end-to-end test guide](tests/e2e/README.md) for prerequisites,
+connection configuration, targeted runs, coverage, and comparison testing
+against `msodbcsql18`.
 
 ## Connection busy gate
 
@@ -117,12 +188,115 @@ but returning row N can now wait on row N+1's header arriving. See
 `release_busy_if_row_exhausted` in `src/api/exec_common.rs` for the full
 trade-off and why it was accepted as-is.
 
-## Conventions
+## Bound fetch performance
 
-Before writing or modifying code in this crate, read
-[`.github/instructions/mssql-odbc.instructions.md`](../.github/instructions/mssql-odbc.instructions.md).
-It covers panic safety, FFI boundary conventions (the mandatory `ffi_entry!`
-macro and safe-core/unsafe-shell split), unsafe-code rules, memory ownership
-rules, concurrency and handle-hierarchy locking, diagnostic posting
-(`post_sql_error` vs. `post_tds_error`), and testing requirements (the
-`TestHandles` helper).
+Bound fetches borrow their per-fetch descriptor snapshot rather than copying a
+binding for every cell. SQL type resolution is deferred until a binding requests
+`SQL_C_DEFAULT`, and complete inline rows need no PLP metadata snapshot.
+After a packet-boundary continuation, resident columns return to synchronous
+decoding; network waits retain the existing cancellation and timeout handling.
+Datetimeoffset conversion uses checked 64-bit arithmetic while preserving the
+out-of-range rejection of the wider calculation.
+Same-encoding wide delivery in bound fetches and `SQLGetData` copies complete
+UTF-16 code units without decoding them. This preserves unpaired surrogates,
+BOM-like units, and embedded NULs for the application's decoding policy.
+Actual encoding conversions use the explicit encoding without BOM sniffing:
+leading BOM-shaped bytes remain data, including in non-Unicode `varchar` values.
+The materialized-value fast paths require an even byte length before
+using the raw-unit copy helper. Odd-length PLP streams retain their existing
+behavior and are not covered by this parity claim.
+Bound buffers trim a real surrogate pair if truncation would split it, but keep
+already-unpaired units. `SQLGetData` can split a pair across calls because the
+caller retrieves the remaining units on its next call.
+
+The native `GetDataUtf16Test` and `FetchScrollUtf16Test` cases reproduce these
+fetch behaviors against SQL Server through the Driver Manager, comparing raw
+units rather than decoded strings. `BoundTruncationPreservesOnlyCompletePairs`
+checks real-server truncation; the Rust
+`bound_wide_plp_preserves_units_across_wire_chunks` test additionally uses a mock
+server to force a surrogate pair across a PLP chunk boundary that a SQL query
+cannot control.
+
+Bound narrow-codepage `SQL_C_CHAR` truncation converts only a buffer-sized
+prefix, then drains the remaining wire bytes without conversion. For a known
+length, the indicator estimates unread source bytes at 1:1 plus converted
+output (including withheld characters), matching classic msodbcsql's
+`sqlcdata.h` accounting before `FlushData`. Source held by a DBCS decoder stays
+in the unconverted count; unknown lengths remain `SQL_NO_TOTAL`. A fitting
+value reports its exact UTF-8 length. `SQLGetData` keeps its resumable behavior.
+
+Materialized CP1252 `varchar` values delivered as `SQL_C_WCHAR` decode directly
+to bounded UTF-16 scratch space, without allocating a UTF-8 string or copying
+borrowed source bytes. Each CP1252 byte produces one UTF-16 unit, so repeated
+`SQLGetData` calls decode only the next requested chunk and report the exact
+remaining byte length. This applies to buffered/captured reads, bound row
+arrays and output parameters. Other encodings, `SQL_C_CHAR`, and streaming MAX
+conversion retain their existing paths.
+
+## Parameter array results
+
+Prepared parameter arrays can return rows from `SELECT`, `INSERT ... OUTPUT`,
+and procedures. Fetch the current result normally and use `SQLMoreResults` to
+advance through the results in parameter-set order. Completion counts and
+statuses are deferred until the corresponding sets finish; inspect the final
+bookkeeping after navigation reaches `SQL_NO_DATA`. Closing the cursor drains
+unread results without executing any parameter set again.
+
+`SQLGetInfo(SQL_PARAM_ARRAY_SELECTS)` reports `SQL_PAS_BATCH`. Non-row-returning
+arrays still complete during `SQLExecute` and report their aggregate row count.
+
+RPC value encoding avoids per-parameter boxed futures. Complete buffered
+DONE-family and RETURNSTATUS tokens are decoded without constructing the
+asynchronous parser; cancellation still uses the normal ATTENTION settlement
+path, and incomplete tokens retain the existing network-read behavior.
+Optional streaming declarations and encryption metadata are stored out of line
+so ordinary parameter arrays do not copy their unused storage for every value.
+Small RPC headers and type metadata are written together when buffered space
+allows; packet-boundary writes retain normal overflow and cancellation handling.
+Response-token reads skip clock sampling for unlimited query timeouts while
+retaining elapsed-time accounting for finite and exhausted budgets.
+Inlining hints target parameter positioning, conversion, RPC encoding, and
+response/value dispatch. The large conversion and serialization functions use
+`#[inline]`, leaving the final inlining decision to the compiler.
+
+## Tracing
+
+Tracing is disabled by default and is intended for diagnostics.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `MSSQL_TDS_TRACE` | `false` | Set to `true` to enable tracing |
+| `MSSQL_TDS_TRACE_LEVEL` | `warn` | Set a `tracing_subscriber::EnvFilter` expression |
+| `MSSQL_TDS_TRACE_DIR` | unset | Write per-process trace files to this directory instead of stderr |
+
+For example:
+
+```bash
+MSSQL_TDS_TRACE=true \
+MSSQL_TDS_TRACE_LEVEL="warn,mssqlodbc=debug" \
+MSSQL_TDS_TRACE_DIR="./traces" \
+cargo nextest run -p mssqlodbc --lib
+```
+
+Trace events can contain SQL text and parameter values. On Unix the driver
+creates trace files with mode `0600`, and warns on stderr when
+`MSSQL_TDS_TRACE_DIR` is writable by group or other users, or points inside the
+system temporary directory. Configuration is captured on the first ODBC call: a
+relative directory is resolved to an absolute path at that point, and the
+settings cannot be changed while the driver stays loaded. Trace files are not
+rotated or deleted automatically.
+
+## Contributing
+
+Start with the repository [contribution guide](../CONTRIBUTING.md). Changes to
+this crate must also follow the
+[ODBC driver engineering guidelines](../.github/instructions/mssql-odbc.instructions.md),
+which define the FFI safety, error handling, concurrency, parity, and testing
+requirements.
+
+Report security vulnerabilities according to the repository
+[security policy](../SECURITY.md).
+
+## License
+
+Licensed under the [MIT License](../LICENSE).
