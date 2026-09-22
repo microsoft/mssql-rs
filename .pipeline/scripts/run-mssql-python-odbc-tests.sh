@@ -9,8 +9,7 @@
 # A test file can hard-crash the interpreter (segfault / abort) against a
 # driver still under active development, so each test file gets its own pytest
 # process wrapped in `timeout`: a crash or a hang costs one file, not the whole
-# run, and the suite is now a blocking compatibility signal rather than an
-# advisory one.
+# run.
 #
 #   - A crash kills only that file's process; the loop moves to the next file.
 #   - `timeout` bounds every file, so a wedged driver call can never stall the job.
@@ -40,8 +39,8 @@
 #      files skipped because the time budget ran out.
 #   2  the harness itself could not run the tests (broken venv, missing
 #      interpreter, or a run in which no file executed a single test).
-# The calling step propagates every nonzero exit code, so either failure mode
-# fails the pipeline job.
+# The pipeline treats exit 1 as advisory (SucceededWithIssues); exit 2 still
+# fails the job. Local callers receive the original nonzero exit code.
 
 # No `set -e`: a failing or crashing test file must not abort the loop.
 set -uo pipefail

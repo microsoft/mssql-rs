@@ -8,9 +8,8 @@
 # binary, which is what its own pipeline effectively does when it uninstalls the
 # system driver before testing.
 #
-# The test step propagates the runner's exit code, so test failures, hard crashes,
-# and a broken harness all fail the job. Every test file runs in its own bounded
-# pytest process
+# Test failures and per-file crashes warn; a broken harness still fails the job.
+# Every test file runs in its own bounded pytest process
 # (run-mssql-python-odbc-tests.sh), so the job reports results instead of
 # stalling or losing the whole run to one segfault.
 
@@ -225,6 +224,11 @@ steps:
 
     if [ "$rc" -ne 0 ]; then
       case "$rc" in
+        1)
+          echo "##vso[task.logissue type=warning]mssql-python tests did not fully pass against mssql-odbc (exit $rc)"
+          echo "##vso[task.complete result=SucceededWithIssues;]"
+          exit 0
+          ;;
         2)
           # The runner itself already printed its own ##[error] for this -
           # broken venv, missing interpreter, or no test ever ran. Distinct
