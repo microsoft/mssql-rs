@@ -41,11 +41,10 @@ pub(crate) struct ActivePlpStream {
     /// High surrogate whose low half lands in the next chunk. Held back so the
     /// pair is transcoded together instead of each half becoming U+FFFD.
     pub(crate) pending_high_surrogate: Option<u16>,
-    /// Transcoded UTF-8 that did not fit in the caller's `SQL_C_CHAR` buffer,
-    /// held until later calls deliver it. Output can exceed the buffer because a
-    /// UTF-16 surrogate pair becomes a 4-byte UTF-8 character, so a chunk is
-    /// transcoded whole and only the bytes that fit are copied out.
-    pub(crate) pending_utf8: Vec<u8>,
+    /// Converted output that did not fit. Usually UTF-8, but a continuation
+    /// also moves pending UTF-16 units here so either text target can drain
+    /// their bytes verbatim, including a byte split after a target switch.
+    pub(crate) pending_bytes: Vec<u8>,
     /// Narrow wire encoding resolved from the column's collation (or UTF-8 for
     /// `json`, which carries none), or `None` when the column is not narrow
     /// text. This is a property of the *column*, so a target type that arrives
@@ -112,7 +111,7 @@ impl ActivePlpStream {
             encoding,
             pending_byte: None,
             pending_high_surrogate: None,
-            pending_utf8: Vec::new(),
+            pending_bytes: Vec::new(),
             narrow_encoding,
             narrow_decoder: None,
             pending_units: Vec::new(),
@@ -223,7 +222,7 @@ impl std::fmt::Debug for ActivePlpStream {
             .field("encoding", &self.encoding)
             .field("pending_byte", &self.pending_byte)
             .field("pending_high_surrogate", &self.pending_high_surrogate)
-            .field("pending_utf8", &self.pending_utf8.len())
+            .field("pending_bytes", &self.pending_bytes.len())
             .field("narrow_decoder", &self.narrow_decoder.is_some())
             .field("pending_units", &self.pending_units.len())
             .field(

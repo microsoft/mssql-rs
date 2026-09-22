@@ -239,6 +239,19 @@ checks real-server truncation; the Rust
 server to force a surrogate pair across a PLP chunk boundary that a SQL query
 cannot control.
 
+## SQLGetData target switches
+
+An active PLP value can change between `SQL_C_CHAR`, `SQL_C_WCHAR`, and
+`SQL_C_BINARY`. Both text targets first copy any pending converted bytes
+**without re-encoding them**; binary bypasses those bytes and completes when
+the unread wire payload ends. This matches msodbcsql's `InternalGetColData`
+(`odbc/sqlcdata.h`) and completion gate (`odbc/sqlcdata.cpp`), measured on Linux
+with retail 18.6.2.1 (`SQL_DRIVER_VER` `18.06.0002`). See AB#48046.
+
+A zero-length binary probe before text conversion consumes nothing. A consuming
+binary read followed by text conversion resumes at the next unread byte, even
+if that position splits a multibyte character, as in the reference driver.
+
 ## Parameter array results
 
 Prepared parameter arrays can return rows from `SELECT`, `INSERT ... OUTPUT`,
