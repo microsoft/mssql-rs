@@ -602,7 +602,7 @@ TEST_F(GetDataUtf16Test, Issue627BoundCharIndicatorRetainsUnreadWire) {
     // Conversion read sizes differ, but both must account for expansion and
     // retain the unread source contribution while discarding the truncated tail.
     EXPECT_GT(indicator, 20000);
-    EXPECT_LE(indicator, 60000);
+    EXPECT_LT(indicator, 20064) << "the discarded tail must not be fully converted";
     EXPECT_EQ(0xCC, bytes[2]);
     SQLINTEGER following = 0;
     ASSERT_EQ(SQL_SUCCESS, SQLGetData(

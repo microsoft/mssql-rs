@@ -1865,13 +1865,18 @@ unsafe fn deliver_bound_plp(
     let mut converted_wire_read = 0;
 
     loop {
-        let chunk = runtime.block_on(client.read_active_plp_chunk(scratch))?;
+        let read_limit = if transcode_narrow_to_utf8 && !truncated {
+            capacity_elements
+                .saturating_sub(out_bytes.len())
+                .max(1)
+                .min(scratch.len())
+        } else {
+            scratch.len()
+        };
+        let chunk = runtime.block_on(client.read_active_plp_chunk(&mut scratch[..read_limit]))?;
         wire_total = chunk.known_total;
 
-        // Known-length narrow text must finish decoding even after the slot
-        // fills: a chunk can leave source bytes held inside the DBCS decoder.
-        // Other truncated deliveries do not need a converted length.
-        if truncated && (!transcode_narrow_to_utf8 || wire_total.is_none()) {
+        if truncated {
             if chunk.reached_end {
                 break;
             }
@@ -1925,16 +1930,30 @@ unsafe fn deliver_bound_plp(
             converted_wire_read = chunk.total_read;
             // Whole characters only: a partial UTF-8 sequence left in the
             // caller's buffer would not decode.
-            if !truncated {
-                for ch in String::from_utf8_lossy(&decoded_utf8).chars() {
-                    let need = ch.len_utf8();
-                    if out_bytes.len() + need <= capacity_elements {
-                        let mut enc = [0u8; 4];
-                        out_bytes.extend_from_slice(ch.encode_utf8(&mut enc).as_bytes());
-                    } else {
-                        truncated = true;
-                        break;
-                    }
+            for ch in String::from_utf8_lossy(&decoded_utf8).chars() {
+                let need = ch.len_utf8();
+                if out_bytes.len() + need <= capacity_elements {
+                    let mut enc = [0u8; 4];
+                    out_bytes.extend_from_slice(ch.encode_utf8(&mut enc).as_bytes());
+                } else {
+                    truncated = true;
+                    break;
+                }
+            }
+            if truncated && !chunk.reached_end {
+                // Finalize without replacement before abandoning the decoder.
+                // A trailing partial character is still unconverted source, not
+                // lost input or a synthetic U+FFFD. Malformed's two lengths count
+                // that sequence plus any source buffered after it (e.g. GB18030).
+                decoded_utf8.resize(decoder.max_utf8_buffer_length(0).unwrap_or(16), 0);
+                let (result, read, written) =
+                    decoder.decode_to_utf8_without_replacement(&[], &mut decoded_utf8, true);
+                debug_assert_eq!(read, 0);
+                debug_assert_ne!(result, encoding_rs::DecoderResult::OutputFull);
+                converted_bytes = converted_bytes.saturating_add(written);
+                if let encoding_rs::DecoderResult::Malformed(length, after) = result {
+                    converted_wire_read = converted_wire_read
+                        .saturating_sub(usize::from(length) + usize::from(after));
                 }
             }
         } else if let Some(decoder) = narrow_decoder.as_mut() {
@@ -2571,11 +2590,12 @@ mod tests {
         use mssql_tds::token::tokens::SqlCollation;
 
         for (lcid, lead, trail) in [(0x0411, 0x82, 0xa0), (0x0804, 0xc4, 0xe3)] {
-            // The mock's raw-unit PLP carrier supplies A, a DBCS character, a
+            // The mock's raw-unit PLP carrier supplies A, two DBCS characters, a
             // held lead byte | its trail byte, Z. Override only the converter's
             // encoding metadata; PLP framing is identical for narrow text.
             let first = vec![
                 u16::from_le_bytes([b'A', lead]),
+                u16::from_le_bytes([trail, lead]),
                 u16::from_le_bytes([trail, lead]),
             ];
             let tail = vec![u16::from_le_bytes([trail, b'Z'])];
@@ -2594,7 +2614,7 @@ mod tests {
             let _server = crate::test_support::connect_mock_server(dbc, "SELECT dbcs", response);
             let mut state = dbc.inner.lock().unwrap();
             let client = state.client.as_mut().unwrap();
-            for capacity in [1, 2, 4] {
+            for (capacity, expected_indicator) in [(1, 8), (2, 9), (4, 9), (7, 10)] {
                 dbc.runtime
                     .block_on(client.execute("SELECT dbcs".to_string(), ()))
                     .unwrap();
@@ -2603,7 +2623,7 @@ mod tests {
                     dbc.runtime.block_on(client.read_row_column(0)).unwrap(),
                     CursorColumn::PlpStreaming { .. }
                 ));
-                let mut output = [0xcc_u8; 5];
+                let mut output = [0xcc_u8; 8];
                 let mut indicator = -99;
                 let binding = binding(
                     1,
@@ -2612,7 +2632,7 @@ mod tests {
                     capacity,
                     &mut indicator,
                 );
-                let mut scratch = [0; 4];
+                let mut scratch = [0; 6];
                 let outcome = unsafe {
                     deliver_bound_plp(
                         client,
@@ -2634,10 +2654,16 @@ mod tests {
                 }
                 .unwrap();
                 assert_eq!(outcome, RowOutcome::Info(RowIssue::StringTruncated));
-                assert_eq!(indicator, 8, "A + two three-byte UTF-8 characters + Z");
-                assert_eq!(output[4], 0xcc);
+                assert_eq!(
+                    indicator, expected_indicator,
+                    "converted prefix + unconverted source"
+                );
+                assert_eq!(output[capacity as usize], 0xcc);
                 if capacity == 1 {
                     assert_eq!(output[0], 0);
+                } else if capacity == 7 {
+                    let expected = if lcid == 0x0411 { "Aあ\0" } else { "A你\0" };
+                    assert_eq!(&output[..5], expected.as_bytes());
                 } else {
                     assert_eq!(&output[..2], b"A\0");
                 }
@@ -2654,7 +2680,7 @@ mod tests {
     }
 
     #[test]
-    fn bound_narrow_plp_does_not_resume_output_after_truncation() {
+    fn bound_narrow_plp_estimates_expanding_tail_without_resuming_output() {
         use mssql_mock_tds::{ColumnDefinition, ColumnValue, QueryResponse, Row, SqlDataType};
         use mssql_tds::token::tokens::SqlCollation;
 
@@ -2669,6 +2695,7 @@ mod tests {
                 ColumnValue::NVarCharMax(vec![
                     vec![u16::from_le_bytes([0x80, 0x80])],
                     vec![u16::from_le_bytes(*b"ab")],
+                    vec![u16::from_le_bytes([0x80, 0x80]); 1_500],
                 ]),
                 ColumnValue::Int(42),
             ])],
@@ -2720,7 +2747,10 @@ mod tests {
         assert_eq!(&output[1..5], b"\xe2\x82\xac\0");
         assert_eq!(output[0], 0xcc);
         assert_eq!(output[6], 0xcc);
-        assert_eq!(indicator, 8, "two three-byte euros plus two ASCII bytes");
+        assert_eq!(
+            indicator, 3_008,
+            "six converted bytes + two ASCII bytes + 3,000 unread euro bytes, not 9,008"
+        );
         assert!(matches!(
             dbc.runtime.block_on(client.read_row_column(1)).unwrap(),
             CursorColumn::Value {

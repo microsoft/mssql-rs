@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-use encoding_rs::{CoderResult, Decoder, Encoding};
+use encoding_rs::{CoderResult, Decoder, DecoderResult, Encoding};
 use std::borrow::Cow;
 
 /// A wire encoding, including OEM code pages that `encoding_rs` does not support.
@@ -154,6 +154,25 @@ impl ResolvedDecoder {
         (CoderResult::InputEmpty, src.len(), written, false)
     }
 
+    /// Like `encoding_rs`, stops at malformed input and reports its source length
+    /// and the number of bytes consumed after it, without emitting U+FFFD.
+    pub fn decode_to_utf8_without_replacement(
+        &mut self,
+        src: &[u8],
+        dst: &mut [u8],
+        last: bool,
+    ) -> (DecoderResult, usize, usize) {
+        if let DecoderKind::EncodingRs(decoder) = &mut self.inner {
+            return decoder.decode_to_utf8_without_replacement(src, dst, last);
+        }
+        let (result, read, written, _) = self.decode_to_utf8(src, dst, last);
+        let result = match result {
+            CoderResult::InputEmpty => DecoderResult::InputEmpty,
+            CoderResult::OutputFull => DecoderResult::OutputFull,
+        };
+        (result, read, written)
+    }
+
     /// Returns status, bytes consumed, code units written, and whether input was malformed.
     pub fn decode_to_utf16(
         &mut self,
@@ -229,6 +248,59 @@ const CP850: [char; 128] = [
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finalizing_without_replacement_reports_buffered_source() {
+        for (encoding, bytes, held) in [
+            (encoding_rs::SHIFT_JIS, &b"A\x82"[..], 1),
+            (encoding_rs::GBK, &b"A\xc4"[..], 1),
+            (encoding_rs::GBK, &b"A\x81\x30"[..], 2),
+            (encoding_rs::GBK, &b"A\x81\x30\x81"[..], 3),
+            (encoding_rs::BIG5, &b"A\xa4"[..], 1),
+            (encoding_rs::EUC_KR, &b"A\xb0"[..], 1),
+        ] {
+            for split in 0..=bytes.len() {
+                let mut decoder =
+                    ResolvedEncoding::from(encoding).new_decoder_without_bom_handling();
+                let mut output = [0; 32];
+                let (result, read, written, _) =
+                    decoder.decode_to_utf8(&bytes[..split], &mut output, false);
+                assert_eq!(result, CoderResult::InputEmpty);
+                assert_eq!(read, split);
+                let (result, read, rest, _) =
+                    decoder.decode_to_utf8(&bytes[split..], &mut output[written..], false);
+                assert_eq!(result, CoderResult::InputEmpty);
+                assert_eq!(read, bytes.len() - split);
+                assert_eq!(&output[..written + rest], b"A");
+                let (result, read, written) =
+                    decoder.decode_to_utf8_without_replacement(&[], &mut output, true);
+                assert_eq!((read, written), (0, 0));
+                let DecoderResult::Malformed(length, after) = result else {
+                    panic!("expected buffered source for {}", encoding.name());
+                };
+                assert_eq!(length + after, held, "{}", encoding.name());
+            }
+        }
+        for encoding in [
+            ResolvedEncoding::Oem437,
+            ResolvedEncoding::Oem850,
+            encoding_rs::WINDOWS_1252.into(),
+        ] {
+            let mut decoder = encoding.new_decoder_without_bom_handling();
+            assert_eq!(
+                decoder.decode_to_utf8_without_replacement(b"\x82", &mut [], false),
+                (DecoderResult::OutputFull, 0, 0)
+            );
+            let (result, read, written) =
+                decoder.decode_to_utf8_without_replacement(b"\x82", &mut [0; 8], false);
+            assert_eq!((result, read), (DecoderResult::InputEmpty, 1));
+            assert!(written > 1);
+            assert_eq!(
+                decoder.decode_to_utf8_without_replacement(&[], &mut [0; 8], true),
+                (DecoderResult::InputEmpty, 0, 0)
+            );
+        }
+    }
 
     // Unicode output of bytes(range(128, 256)).decode("cp437"/"cp850").
     const OEM_FIXTURES: [(ResolvedEncoding, &str); 2] = [

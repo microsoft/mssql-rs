@@ -1121,9 +1121,8 @@ TEST_F(FetchScrollLiveTest, ABoundVarcharMaxDbcsCarriesCharactersAcrossWireChunk
 // A slot too small for the converted value truncates on a character boundary.
 // Retail uses converted output plus a 1:1 estimate for unread source
 // (sqlcdata.h:1230): Linux package 18.6.2.1-1, SQL_DRIVER_VER 18.06.0002, reports
-// 5008 under C.UTF-8. Rust's bound delivery instead decodes through the drain
-// and reports the exact 10,000 UTF-8 bytes, including decoder-held DBCS input.
-// This bound-only precision difference does not change GetData's estimate.
+// 5008 under C.UTF-8. Bound delivery uses the same estimate and raw-drains the
+// discarded tail instead of converting all 10,000 UTF-8 bytes.
 TEST_F(FetchScrollLiveTest, ABoundVarcharMaxTruncatedToCharKeepsConcreteLength) {
     // Windows-only skip: the payload assertion expects UTF-8, which msodbcsql
     // does not deliver there (AB#47564), and its ANSI output also changes how
@@ -1145,13 +1144,7 @@ TEST_F(FetchScrollLiveTest, ABoundVarcharMaxTruncatedToCharKeepsConcreteLength) 
     EXPECT_NE(SQL_NO_TOTAL, ind) << "known-length CHAR->CHAR includes converted bytes";
     EXPECT_STREQ("\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9", reinterpret_cast<const char*>(buf));
 
-    const char* target = std::getenv("ODBC_TEST_TARGET");
-    if (target && std::string(target) == "msodbcsql") {
-        // 5000 on the wire + 8 delivered, per the sqlcdata.h formula above.
-        EXPECT_EQ(5008, ind);
-    } else {
-        EXPECT_EQ(10000, ind) << "all source bytes were converted before the drain";
-    }
+    EXPECT_EQ(5008, ind) << "4992 unread bytes + 16 converted bytes (emitted and carry)";
     SQLFreeStmt(stmt_, SQL_UNBIND);
     SQLCloseCursor(stmt_);
 }

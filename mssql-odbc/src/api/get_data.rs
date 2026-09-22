@@ -2525,6 +2525,7 @@ fn stream_active_plp_chunk<'a>(
 
 /// Converted bytes include both emitted output and decoded bytes withheld by
 /// truncation. `total_read` must precede any discard-only drain of the wire.
+/// Bound delivery also excludes any unconverted source abandoned in its decoder.
 pub(crate) fn converted_narrow_indicator(
     known_total: Option<u64>,
     total_read: usize,
