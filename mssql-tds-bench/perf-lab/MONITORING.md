@@ -89,17 +89,17 @@ is not decisive.
 
 ## Advancing the baseline
 
-Advancing makes the candidate's numbers the new floor: a later change that gives
-the gains back trips the gate instead of silently settling at the old level. That
-cuts both ways — a bump that carries an unaddressed slowdown legitimizes it, and
-the next gate is then measured from the degraded point.
+Advancing makes the candidate commit the new reference: a later change that
+gives real gains back can trip the gate instead of silently settling at the old
+level. Both runners rebuild the baseline `mssql-tds` crate from
+`baseline-commit.txt` and measure it afresh on every run; they do not preserve
+the earlier timing as a permanent floor.
 
-This is why a false *improvement* is the more expensive error. A false regression
-is self-correcting: someone investigates, finds nothing, and moves on. A false
-improvement is self-perpetuating — it advances the floor to a number that was
-never real, and every later run is then measured against that number, so the
-noise is converted into a permanent regression for whoever comes next. The
-criteria below are therefore stricter about the win than about the run.
+A false *improvement* can therefore advance the reference commit without
+evidence of a real gain. If that commit carries an unaddressed slowdown,
+subsequent comparisons accept the degraded code as their baseline, making the
+slowdown harder to detect. The fresh-VM requirement below guards against an
+unsupported bump, not against retaining a noisy measurement.
 
 Bump only when **all** of the following hold:
 
@@ -111,12 +111,13 @@ Bump only when **all** of the following hold:
    regression re-runs — one `VERIFY_IDS` set, one loop — so they carry exactly
    the limitation described above, and a session biased toward the candidate
    yields a 4/4 "verified" win from nothing. One session is not evidence for a
-   change that becomes the floor; a win that survives two sessions is.
+   change that becomes the reference; a win that survives two sessions is.
 4. No benchmark on **either** platform is more than **5%** slower than baseline.
    This is the gate's own magnitude, but applied with no quorum: a benchmark that
    trips in only 1–2 of the 4 re-runs is cleared by the gate, yet its published
    Δ% (the median of those re-runs) can still sit above 5%. Criterion 4 declines
-   to bake that drift into the floor, so it is investigated rather than absorbed.
+   to accept that drift in the reference commit, so it is investigated rather
+   than absorbed.
 
 Criteria 3 and 4 are usually satisfiable from the same pair of runs, since
 criterion 3 already calls for a second one — read both from the confirming run.
