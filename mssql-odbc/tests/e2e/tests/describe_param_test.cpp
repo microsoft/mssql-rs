@@ -28,12 +28,17 @@ TEST(DescribeParamTest, NullHandle) {
 
 class DescribeParamLiveTest : public ODBCTest {
 protected:
+    virtual SQLUINTEGER OdbcVersion() const { return SQL_OV_ODBC3_80; }
+
     void SetUp() override {
         ODBCTest::SetUp();
         if (!ODBCTestConfig::Instance().HasConnection()) {
             FAIL() << "No connection configured - set ODBC_TEST_SERVER or "
                       "ODBC_TEST_CONNSTR";
         }
+        ASSERT_SQL_OK(SQLSetEnvAttr(env_, SQL_ATTR_ODBC_VERSION,
+                                    reinterpret_cast<SQLPOINTER>(OdbcVersion()), 0),
+                      SQL_HANDLE_ENV, env_);
         Connect();
     }
 
@@ -75,6 +80,37 @@ protected:
                    : std::string(reinterpret_cast<const char*>(value));
     }
 };
+
+class DescribeParamOdbcVersionLiveTest
+    : public DescribeParamLiveTest,
+      public ::testing::WithParamInterface<SQLUINTEGER> {
+protected:
+    SQLUINTEGER OdbcVersion() const override { return GetParam(); }
+};
+
+// Benefits-from-mock-tds: request capture could assert that both application
+// versions take the same metadata RPC path; the live test observes the
+// precision values produced from its rows.
+TEST_P(DescribeParamOdbcVersionLiveTest, ApproximateNumericPrecisionMatchesMsodbcsql) {
+    ASSERT_SQL_OK(Prepare("SELECT CAST(? AS REAL), CAST(? AS FLOAT)"), SQL_HANDLE_STMT, stmt_);
+
+    ParamDescription real;
+    ParamDescription floating;
+    ASSERT_TRUE(Describe(1, real));
+    ASSERT_TRUE(Describe(2, floating));
+    EXPECT_EQ(SQL_REAL, real.data_type);
+    EXPECT_EQ(24U, real.size);
+    EXPECT_EQ(0, real.scale);
+    EXPECT_EQ(SQL_NULLABLE, real.nullable);
+    EXPECT_EQ(SQL_FLOAT, floating.data_type);
+    EXPECT_EQ(53U, floating.size);
+    EXPECT_EQ(0, floating.scale);
+    EXPECT_EQ(SQL_NULLABLE, floating.nullable);
+}
+
+INSTANTIATE_TEST_SUITE_P(Odbc3And38, DescribeParamOdbcVersionLiveTest,
+                         ::testing::Values(static_cast<SQLUINTEGER>(SQL_OV_ODBC3),
+                                           static_cast<SQLUINTEGER>(SQL_OV_ODBC3_80)));
 
 TEST_F(DescribeParamLiveTest, IsAdvertised) {
     SQLUSMALLINT supported = SQL_FALSE;

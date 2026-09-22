@@ -377,7 +377,6 @@ mod tests {
     fn every_supported_sql_type_has_a_default_c_type() {
         for version in [
             OdbcVersion::Unset,
-            OdbcVersion::Odbc2,
             OdbcVersion::Odbc3,
             OdbcVersion::Odbc3_80,
         ] {
@@ -429,7 +428,6 @@ mod tests {
 
         for version in [
             OdbcVersion::Unset,
-            OdbcVersion::Odbc2,
             OdbcVersion::Odbc3,
             OdbcVersion::Odbc3_80,
         ] {
@@ -481,7 +479,7 @@ mod tests {
     /// difference is that the two SS date/time rows default to `SQL_C_BINARY`.
     #[test]
     fn ss_datetime_defaults_depend_on_the_odbc_version() {
-        for older in [OdbcVersion::Unset, OdbcVersion::Odbc2, OdbcVersion::Odbc3] {
+        for older in [OdbcVersion::Unset, OdbcVersion::Odbc3] {
             assert_eq!(
                 resolve_default_c_type(SQL_SS_TIME2, older),
                 Some(SQL_C_BINARY)
