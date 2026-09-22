@@ -21,7 +21,10 @@ use crate::api::exec_common::release_busy_if_row_exhausted;
 use crate::api::fetch_scroll::element_stride;
 use crate::api::odbc_types::SqlWChar;
 use crate::api::type_rules::{canonical_c_type, is_valid_c_type, resolve_default_c_type};
-use crate::api::util::{copy_utf16le_with_nul, copy_with_nul, is_high_surrogate, write_if_some};
+use crate::api::util::{
+    copy_cp1252_with_nul, copy_utf16le_with_nul, copy_with_nul, is_cp1252, is_high_surrogate,
+    write_if_some,
+};
 use crate::error::{free_errors, post_sql_error};
 use crate::handles::stmt::{ActivePlpStream, STMT_STATE_CURSOR_OPEN, StmtState};
 use crate::handles::{HandleType, OdbcVersion, StmtHandle, handle_from_raw};
@@ -542,10 +545,10 @@ fn sql_get_data_safe(
 }
 
 /// Delivers a buffered string straight into the application buffer when the
-/// stored encoding already matches `target_type`, skipping the decode and
-/// intermediate allocation that the general conversion path performs.
+/// stored encoding matches `target_type` or is CP1252 widened to UTF-16,
+/// skipping the intermediate allocations of the general conversion path.
 ///
-/// Returns `false` when the value cannot be delivered verbatim, leaving the
+/// Returns `false` when the value cannot be delivered completely, leaving the
 /// application buffer untouched so the caller can fall back.
 ///
 /// # Safety
@@ -617,25 +620,36 @@ unsafe fn try_write_complete_buffered_string(
     let Ok(buffer_bytes) = usize::try_from(buffer_length) else {
         return false;
     };
-    let required = bytes.len().saturating_add(std::mem::size_of::<SqlWChar>());
-    if !direct_wchar || buffer_bytes < required {
+    // Check capacity before resolving the LCID: a failed complete-value probe
+    // must not duplicate the fallback warning from captured delivery.
+    let cp1252 = target_type == SQL_C_WCHAR
+        && buffer_bytes >= bytes.len().saturating_mul(2).saturating_add(2)
+        && is_cp1252(value.encoding_type());
+    let byte_len = if cp1252 {
+        bytes.len().saturating_mul(2)
+    } else {
+        bytes.len()
+    };
+    let required = byte_len.saturating_add(std::mem::size_of::<SqlWChar>());
+    if !(direct_wchar || cp1252) || buffer_bytes < required {
         return false;
     }
 
     // SAFETY: same caller contract; the check above proved `buffer_length >=
-    // bytes.len() + size_of::<SqlWChar>()`, so the copy and its terminator both
+    // byte_len + size_of::<SqlWChar>()`, so the copy and its terminator both
     // fit. `bytes` belongs to `value`, which the caller guarantees does not
     // alias the application buffer.
     unsafe {
         write_if_some(
             strlen_or_ind_ptr,
-            SqlLen::try_from(bytes.len()).unwrap_or(SqlLen::MAX),
+            SqlLen::try_from(byte_len).unwrap_or(SqlLen::MAX),
         );
-        let truncated = copy_utf16le_with_nul(
-            target_value_ptr.cast(),
-            buffer_bytes / std::mem::size_of::<SqlWChar>(),
-            bytes,
-        );
+        let capacity = buffer_bytes / std::mem::size_of::<SqlWChar>();
+        let truncated = if cp1252 {
+            copy_cp1252_with_nul(target_value_ptr.cast(), capacity, bytes)
+        } else {
+            copy_utf16le_with_nul(target_value_ptr.cast(), capacity, bytes)
+        };
         debug_assert!(!truncated, "complete buffered wide string must fit");
     }
     true
@@ -1323,14 +1337,14 @@ fn write_captured_column(
 }
 
 /// Delivers one chunk of an already-buffered string from `offset` onward without
-/// re-decoding it. The general path rebuilds and re-transcodes the whole value on
+/// decoding its prefix again. The general path rebuilds and re-transcodes the whole value on
 /// every call, which is quadratic across a chunked `SQLGetData` loop.
 ///
 /// `validated` reports that eligibility was already established for this
 /// column and target type, so the encoding scan is skipped on later chunks;
 /// see `StmtState::direct_text_target`.
 ///
-/// Returns `None` when the value cannot be delivered verbatim, leaving the
+/// Returns `None` for unsupported encodings, leaving the
 /// application buffer untouched. On success returns whether the chunk was
 /// truncated, how many elements were consumed, and how many remained.
 ///
@@ -1381,14 +1395,19 @@ unsafe fn try_write_direct_captured_string_chunk(
         return Some((truncated, consumed, remaining.len()));
     }
 
-    if target_type != SQL_C_WCHAR
-        || !matches!(value.encoding_type(), EncodingType::Utf16)
-        || !bytes.len().is_multiple_of(2)
+    if target_type != SQL_C_WCHAR {
+        return None;
+    }
+    let cp1252 = matches!(value.encoding_type(), EncodingType::LcidBased(_))
+        && (validated || is_cp1252(value.encoding_type()));
+    if !(cp1252
+        || matches!(value.encoding_type(), EncodingType::Utf16) && bytes.len().is_multiple_of(2))
     {
         return None;
     }
 
-    let total_units = bytes.len() / 2;
+    let source_unit_size = if cp1252 { 1 } else { 2 };
+    let total_units = bytes.len() / source_unit_size;
     let offset = offset.min(total_units);
     let remaining_units = total_units - offset;
     let remaining_bytes = remaining_units.saturating_mul(std::mem::size_of::<SqlWChar>());
@@ -1404,7 +1423,12 @@ unsafe fn try_write_direct_captured_string_chunk(
     // SAFETY: the source has complete units; the caller provides `buf_elements`
     // writable units, without aliasing the captured source.
     let truncated = unsafe {
-        copy_utf16le_with_nul(target_value_ptr.cast(), buf_elements, &bytes[offset * 2..])
+        let remaining = &bytes[offset * source_unit_size..];
+        if cp1252 {
+            copy_cp1252_with_nul(target_value_ptr.cast(), buf_elements, remaining)
+        } else {
+            copy_utf16le_with_nul(target_value_ptr.cast(), buf_elements, remaining)
+        }
     };
     Some((truncated, consumed, remaining_units))
 }
@@ -4378,6 +4402,328 @@ mod tests {
         let row = state.buffered_get_data_row.as_ref().unwrap();
         assert_eq!(row.consumed, 1);
         assert!(state.last_captured.is_none());
+    }
+
+    #[test]
+    fn cp1252_get_data_resumes_in_source_bytes_and_resets() {
+        use mssql_tds::token::tokens::SqlCollation;
+        let encoding = EncodingType::LcidBased(SqlCollation {
+            info: 0x0409,
+            lcid_language_id: 0x0409,
+            col_flags: 0,
+            sort_id: 0,
+        });
+        assert!(is_cp1252(&encoding));
+        let mut bytes: Vec<u8> = (0..=255).cycle().take(769).collect();
+        bytes.splice(0..0, [0xEF, 0xBB, 0xBF, 0xFF, 0xFE, 0xFE, 0xFF]);
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        for source in [bytes, b"ASCII\0tail\0".to_vec(), vec![]] {
+            let units: Vec<u16> = SqlString::decode(&source, encoding)
+                .encode_utf16()
+                .collect();
+            assert_eq!(units.len(), source.len());
+            for columns in [0, 2, 8] {
+                for initial_capacity in [0, 1, 2, 3, 4, 33, 513, source.len() * 2 + 2] {
+                    for _ in 0..2 {
+                        stmt.inner.lock().unwrap().reset_row_stream();
+                        let value = ColumnValues::String(SqlString::new(source.clone(), encoding));
+                        if columns == 0 {
+                            stmt_with_captured(&h, value);
+                        } else {
+                            let mut values = vec![ColumnValues::Null; columns];
+                            values[0] = value;
+                            stmt_with_buffered_values(&h, values);
+                        }
+                        let mut offset = 0;
+                        let mut capacity = initial_capacity;
+                        let mut calls = 0;
+                        loop {
+                            let mut storage = crate::test_support::AlignedBuffer([0xA5_u8; 1604]);
+                            let output = storage.0.as_mut_ptr().wrapping_add(1);
+                            assert!(!output.cast::<u16>().is_aligned());
+                            let mut indicator = -99;
+                            let rc = unsafe {
+                                sql_get_data(
+                                    h.stmt,
+                                    1,
+                                    SQL_C_WCHAR,
+                                    output.cast(),
+                                    capacity as SqlLen,
+                                    &mut indicator,
+                                )
+                            };
+                            let remaining = units.len() - offset;
+                            let copied = remaining.min((capacity / 2).saturating_sub(1));
+                            assert_eq!(indicator, (remaining * 2) as SqlLen);
+                            let mut expected = [0xA5_u8; 1604];
+                            if capacity >= 2 {
+                                for (i, unit) in units[offset..offset + copied]
+                                    .iter()
+                                    .copied()
+                                    .chain(std::iter::once(0))
+                                    .enumerate()
+                                {
+                                    expected[1 + i * 2..3 + i * 2]
+                                        .copy_from_slice(&unit.to_ne_bytes());
+                                }
+                            }
+                            assert_eq!(storage.0, expected);
+                            offset += copied;
+                            calls += 1;
+                            let state = stmt.inner.lock().unwrap();
+                            if copied == remaining {
+                                assert_eq!(rc, SQL_SUCCESS);
+                                assert!(state.diag_records.is_empty());
+                                assert_eq!(state.partial_text_offset, None);
+                                assert_eq!(state.direct_text_target, None);
+                                break;
+                            }
+                            assert_eq!(rc, SQL_SUCCESS_WITH_INFO);
+                            assert_eq!(state.diag_records.len(), 1);
+                            assert_last_diag(&state.diag_records, WARN_STRING_TRUNCATION);
+                            assert_eq!(state.partial_text_offset, Some((1, offset)));
+                            assert_eq!(state.direct_text_target, Some((1, SQL_C_WCHAR)));
+                            assert!(calls <= units.len() + 2, "chunking must make progress");
+                            // Repeat no-progress probes before providing payload capacity.
+                            if calls >= 2 {
+                                capacity = capacity.max(4);
+                            }
+                        }
+                        assert_eq!(offset, units.len());
+                        assert_eq!(
+                            unsafe {
+                                sql_get_data(
+                                    h.stmt,
+                                    1,
+                                    SQL_C_WCHAR,
+                                    std::ptr::null_mut(),
+                                    0,
+                                    std::ptr::null_mut(),
+                                )
+                            },
+                            SQL_NO_DATA
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cp1252_probe_does_not_duplicate_unknown_lcid_warning() {
+        use mssql_tds::token::tokens::SqlCollation;
+        use std::sync::{Arc, Mutex};
+        struct LogWriter(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for LogWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        let writer = logs.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(move || LogWriter(writer.clone()))
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let h = TestHandles::with_env_dbc_stmt();
+            for capacity in [4, 8, 4, 8] {
+                logs.lock().unwrap().clear();
+                let value = ColumnValues::String(SqlString::new(
+                    vec![0x80, 0x91],
+                    EncodingType::LcidBased(SqlCollation {
+                        info: 0xFFFFF,
+                        lcid_language_id: 0xFFFFF,
+                        col_flags: 0,
+                        sort_id: 0,
+                    }),
+                ));
+                let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+                stmt.inner.lock().unwrap().reset_row_stream();
+                let mut values = vec![ColumnValues::Null; 8];
+                values[0] = value;
+                stmt_with_buffered_values(&h, values);
+                let mut output = [0xAAAA_u16; 4];
+                let mut indicator = -99;
+                let rc = unsafe {
+                    sql_get_data(
+                        h.stmt,
+                        1,
+                        SQL_C_WCHAR,
+                        output.as_mut_ptr().cast(),
+                        capacity,
+                        &mut indicator,
+                    )
+                };
+                assert_eq!(
+                    rc,
+                    if capacity == 4 {
+                        SQL_SUCCESS_WITH_INFO
+                    } else {
+                        SQL_SUCCESS
+                    }
+                );
+                assert_eq!(indicator, 4);
+                assert_eq!(output[0], 0x20AC);
+                if capacity == 4 {
+                    for (bytes, expected_rc) in [(2, SQL_SUCCESS_WITH_INFO), (4, SQL_SUCCESS)] {
+                        output.fill(0xAAAA);
+                        assert_eq!(
+                            unsafe {
+                                sql_get_data(
+                                    h.stmt,
+                                    1,
+                                    SQL_C_WCHAR,
+                                    output.as_mut_ptr().cast(),
+                                    bytes,
+                                    &mut indicator,
+                                )
+                            },
+                            expected_rc
+                        );
+                        assert_eq!(indicator, 2);
+                        if bytes == 2 {
+                            assert_eq!(output, [0, 0xAAAA, 0xAAAA, 0xAAAA]);
+                        } else {
+                            assert_eq!(output, [0x2018, 0, 0xAAAA, 0xAAAA]);
+                        }
+                    }
+                }
+                let log = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+                assert_eq!(log.matches("Unsupported LCID").count(), 1, "{log}");
+                assert_eq!(log.lines().count(), 1, "{log}");
+            }
+        });
+    }
+
+    #[test]
+    fn cp1252_fast_path_keeps_other_encodings_and_invalid_utf8_behavior() {
+        use mssql_tds::token::tokens::SqlCollation;
+        let lcid = |info| {
+            EncodingType::LcidBased(SqlCollation {
+                info,
+                lcid_language_id: info as i32,
+                col_flags: 0,
+                sort_id: 0,
+            })
+        };
+        for (encoding, bytes, expected) in [
+            (lcid(0x0419), vec![0xC0], vec![0x0410]),
+            (lcid(0x0411), vec![0x82, 0xA0], vec![0x3042]),
+            (
+                EncodingType::Utf8,
+                vec![0xF0, 0x9F, 0x98, 0x80],
+                vec![0xD83D, 0xDE00],
+            ),
+            (EncodingType::Utf8, vec![0xFF], vec![]),
+        ] {
+            for columns in [2, 8] {
+                let h = TestHandles::with_env_dbc_stmt();
+                let mut values = vec![ColumnValues::Null; columns];
+                values[0] = ColumnValues::String(SqlString::new(bytes.clone(), encoding));
+                stmt_with_buffered_values(&h, values);
+                let mut output = [0xAAAA_u16; 4];
+                let mut indicator = -99;
+                let rc = unsafe {
+                    sql_get_data(
+                        h.stmt,
+                        1,
+                        SQL_C_WCHAR,
+                        output.as_mut_ptr().cast(),
+                        8,
+                        &mut indicator,
+                    )
+                };
+                if expected.is_empty() {
+                    assert_eq!(rc, SQL_ERROR);
+                    assert_eq!(indicator, -99);
+                    assert_eq!(output, [0xAAAA; 4]);
+                    let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+                    {
+                        let state = stmt.inner.lock().unwrap();
+                        assert_eq!(state.diag_records.len(), 1);
+                        assert_last_diag(&state.diag_records, ERR_INVALID_CHARACTER_VALUE);
+                    }
+                    let mut binary = [0xAA; 2];
+                    assert_eq!(
+                        unsafe {
+                            sql_get_data(
+                                h.stmt,
+                                1,
+                                SQL_C_BINARY,
+                                binary.as_mut_ptr().cast(),
+                                2,
+                                &mut indicator,
+                            )
+                        },
+                        SQL_SUCCESS
+                    );
+                    assert_eq!(binary, [0xFF, 0xAA]);
+                    assert_eq!(indicator, 1);
+                } else {
+                    assert_eq!(rc, SQL_SUCCESS);
+                    assert_eq!(indicator, (expected.len() * 2) as SqlLen);
+                    assert_eq!(&output[..expected.len()], &expected);
+                    assert_eq!(output[expected.len()], 0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cp1252_complete_probe_requires_room_and_keeps_other_encodings_out() {
+        use mssql_tds::token::tokens::SqlCollation;
+        for (encoding, accepted) in [
+            (
+                EncodingType::LcidBased(SqlCollation {
+                    info: 0x0409,
+                    lcid_language_id: 0x0409,
+                    col_flags: 0,
+                    sort_id: 0,
+                }),
+                true,
+            ),
+            (
+                EncodingType::LcidBased(SqlCollation {
+                    info: 0x0419,
+                    lcid_language_id: 0x0419,
+                    col_flags: 0,
+                    sort_id: 0,
+                }),
+                false,
+            ),
+            (EncodingType::Utf8, false),
+        ] {
+            let value = ColumnValues::String(SqlString::new(vec![0x80, 0x91], encoding));
+            for capacity in 0..=7 {
+                let mut output = [0xAAAA_u16; 4];
+                let mut indicator = -99;
+                let delivered = unsafe {
+                    try_write_complete_buffered_string(
+                        &value,
+                        SQL_C_WCHAR,
+                        output.as_mut_ptr().cast(),
+                        capacity,
+                        &mut indicator,
+                    )
+                };
+                assert_eq!(delivered, accepted && capacity >= 6);
+                if delivered {
+                    assert_eq!(output, [0x20AC, 0x2018, 0, 0xAAAA]);
+                    assert_eq!(indicator, 4);
+                } else {
+                    assert_eq!(output, [0xAAAA; 4]);
+                    assert_eq!(indicator, -99);
+                }
+            }
+        }
     }
 
     #[test]

@@ -20,9 +20,11 @@
 
 #include "odbc_test_fixture.h"
 #include "utf16_test_data.h"
+#include "cp1252_test_data.h"
 
 #include <algorithm>
 #include <cstdlib>
+#include <cstdint>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -132,6 +134,152 @@ TEST_F(FetchScrollUtf16Test, RawUnitsInBoundRowArrays) {
     EXPECT_EQ(SQL_NO_DATA, SQLFetchScroll(stmt_, SQL_FETCH_NEXT, 0));
     EXPECT_EQ(SQL_NO_DATA, SQLFetchScroll(stmt_, SQL_FETCH_NEXT, 0));
     ASSERT_EQ(SQL_SUCCESS, SQLCloseCursor(stmt_));
+}
+
+TEST_F(FetchScrollUtf16Test, Cp1252UnalignedColumnArrayFitsExactCapacity) {
+    constexpr size_t row_count = 3;
+    constexpr size_t capacity = 514;
+    SQLULEN fetched = 0;
+    SQLUSMALLINT status[row_count] = {};
+    SQLLEN bind_offset = 1;
+    ASSERT_EQ(SQL_SUCCESS, SQLSetStmtAttr(stmt_, SQL_ATTR_ROW_ARRAY_SIZE,
+        reinterpret_cast<SQLPOINTER>(row_count), 0));
+    ASSERT_EQ(SQL_SUCCESS, SQLSetStmtAttr(stmt_, SQL_ATTR_ROWS_FETCHED_PTR, &fetched, 0));
+    ASSERT_EQ(SQL_SUCCESS, SQLSetStmtAttr(stmt_, SQL_ATTR_ROW_STATUS_PTR, status, 0));
+    ASSERT_EQ(SQL_SUCCESS, SQLSetStmtAttr(stmt_, SQL_ATTR_ROW_BIND_OFFSET_PTR, &bind_offset, 0));
+    const size_t stride = capacity;
+    std::vector<unsigned char> buffer(1 + row_count * (std::max)(stride, size_t{1}) + 2, 0xCC);
+    const size_t indicator_stride = sizeof(SQLLEN);
+    std::vector<unsigned char> lengths(1 + row_count * indicator_stride + sizeof(SQLLEN), 0xCC);
+    ASSERT_EQ(1u, reinterpret_cast<uintptr_t>(buffer.data() + 1) % alignof(SQLWCHAR));
+    ASSERT_EQ(1u, reinterpret_cast<uintptr_t>(lengths.data() + 1) % alignof(SQLLEN));
+    ASSERT_EQ(SQL_SUCCESS, SQLBindCol(stmt_, 1, SQL_C_WCHAR, buffer.data(), capacity,
+        reinterpret_cast<SQLLEN*>(lengths.data())));
+    const auto& values = Cp1252TestData::Values();
+    ASSERT_FALSE(values.empty());
+    ASSERT_EQ(capacity, (values.front().units.size() + 1) * sizeof(SQLWCHAR));
+    ASSERT_EQ(0u, values.size() % row_count);
+    std::string sql = "SET NOCOUNT ON; DECLARE @t TABLE(ord int, v varchar(256) "
+        "COLLATE Latin1_General_100_CI_AS); INSERT @t VALUES ";
+    for (size_t i = 0; i < values.size(); ++i) {
+        if (i != 0) sql += ",";
+        sql += "(" + std::to_string(i) + "," + values[i].hex + ")";
+    }
+    ExecDirect(sql + "; SELECT v FROM @t ORDER BY ord");
+    for (size_t start = 0; start < values.size(); start += row_count) {
+        std::fill(buffer.begin(), buffer.end(), 0xCC);
+        std::fill(lengths.begin(), lengths.end(), 0xCC);
+        ASSERT_EQ(SQL_SUCCESS, SQLFetchScroll(stmt_, SQL_FETCH_NEXT, 0))
+            << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ("", StmtDiagState());
+        EXPECT_EQ(row_count, fetched);
+        auto expected_lengths = std::vector<unsigned char>(lengths.size(), 0xCC);
+        for (size_t row = 0; row < row_count; ++row) {
+            SCOPED_TRACE(start + row);
+            const auto& value = values[start + row];
+            const bool is_null = value.hex == "NULL";
+            ASSERT_LT(value.units.size(), capacity / sizeof(SQLWCHAR));
+            EXPECT_EQ(SQL_ROW_SUCCESS, status[row]);
+            const SQLLEN length = is_null ? SQL_NULL_DATA :
+                static_cast<SQLLEN>(value.units.size() * 2);
+            std::memcpy(expected_lengths.data() + 1 + row * indicator_stride, &length, sizeof(length));
+            if (!is_null) {
+                const auto* payload = buffer.data() + 1 + row * stride;
+                if (!value.units.empty()) {
+                    EXPECT_EQ(0, std::memcmp(payload, value.units.data(), value.units.size() * 2));
+                }
+                SQLWCHAR terminator = 0xCCCC;
+                std::memcpy(&terminator, payload + value.units.size() * 2, sizeof(terminator));
+                EXPECT_EQ(0, terminator);
+            }
+        }
+        EXPECT_EQ(0xCC, buffer.front());
+        EXPECT_EQ(0xCC, buffer.back());
+        EXPECT_EQ(expected_lengths, lengths);
+    }
+    EXPECT_EQ(SQL_NO_DATA, SQLFetchScroll(stmt_, SQL_FETCH_NEXT, 0));
+    EXPECT_EQ(SQL_NO_DATA, SQLFetchScroll(stmt_, SQL_FETCH_NEXT, 0));
+    ASSERT_EQ(SQL_SUCCESS, SQLCloseCursor(stmt_));
+    ASSERT_EQ(SQL_SUCCESS, SQLFreeStmt(stmt_, SQL_UNBIND));
+}
+
+TEST_F(FetchScrollUtf16Test, NullDataPointersStayUnboundWithOffsetAndLiveIndicators) {
+    constexpr size_t row_count = 2;
+    constexpr size_t capacity = 6;
+    SQLLEN bind_offset = 1;
+    SQLULEN fetched = 0;
+    SQLUSMALLINT status[row_count] = {};
+    ASSERT_EQ(SQL_SUCCESS, SQLSetStmtAttr(stmt_, SQL_ATTR_ROW_ARRAY_SIZE,
+        reinterpret_cast<SQLPOINTER>(row_count), 0));
+    ASSERT_EQ(SQL_SUCCESS, SQLSetStmtAttr(stmt_, SQL_ATTR_ROW_BIND_OFFSET_PTR, &bind_offset, 0));
+    ASSERT_EQ(SQL_SUCCESS, SQLSetStmtAttr(stmt_, SQL_ATTR_ROWS_FETCHED_PTR, &fetched, 0));
+    ASSERT_EQ(SQL_SUCCESS, SQLSetStmtAttr(stmt_, SQL_ATTR_ROW_STATUS_PTR, status, 0));
+    const SQLWCHAR expected[][3] = {
+        {0x20AC, 0x2018, 0}, {0x0041, 0x00E9, 0},
+        {0x2019, 0, 0}, {0x00FF, 0x00FE, 0},
+    };
+    for (bool manual_ard : {false, true}) {
+        SCOPED_TRACE(manual_ard);
+        std::vector<unsigned char> unused(row_count * capacity + 2, 0xCC);
+        std::vector<unsigned char> unused_lengths(row_count * sizeof(SQLLEN) + 2, 0xCC);
+        std::vector<unsigned char> bound(unused.size(), 0xCC);
+        std::vector<unsigned char> bound_lengths(unused_lengths.size(), 0xCC);
+        auto* indicators = reinterpret_cast<SQLLEN*>(unused_lengths.data());
+        ASSERT_EQ(SQL_SUCCESS, SQLBindCol(stmt_, 1, SQL_C_WCHAR,
+            unused.data(), capacity, indicators));
+        ASSERT_EQ(SQL_SUCCESS, SQLBindCol(stmt_, 2, SQL_C_WCHAR,
+            bound.data(), capacity, reinterpret_cast<SQLLEN*>(bound_lengths.data())));
+        if (manual_ard) {
+            SQLHDESC ard = SQL_NULL_HDESC;
+            ASSERT_EQ(SQL_SUCCESS, SQLGetStmtAttrW(stmt_, SQL_ATTR_APP_ROW_DESC, &ard, 0, nullptr));
+            ASSERT_SQL_OK(SQLSetDescFieldW(ard, 1, SQL_DESC_DATA_PTR, nullptr, 0),
+                SQL_HANDLE_DESC, ard);
+            SQLPOINTER pointer = unused.data();
+            ASSERT_SQL_OK(SQLGetDescFieldW(ard, 1, SQL_DESC_DATA_PTR, &pointer, 0, nullptr),
+                SQL_HANDLE_DESC, ard);
+            ASSERT_EQ(nullptr, pointer);
+            ASSERT_SQL_OK(SQLGetDescFieldW(ard, 1, SQL_DESC_INDICATOR_PTR, &pointer, 0, nullptr),
+                SQL_HANDLE_DESC, ard);
+            ASSERT_EQ(static_cast<SQLPOINTER>(indicators), pointer);
+            ASSERT_SQL_OK(SQLGetDescFieldW(ard, 1, SQL_DESC_OCTET_LENGTH_PTR, &pointer, 0, nullptr),
+                SQL_HANDLE_DESC, ard);
+            ASSERT_EQ(static_cast<SQLPOINTER>(indicators), pointer);
+        } else {
+            ASSERT_EQ(SQL_SUCCESS, SQLBindCol(stmt_, 1, SQL_C_WCHAR, nullptr, capacity, indicators));
+        }
+        ExecDirect("SET NOCOUNT ON; DECLARE @t TABLE(ord int, v varchar(2) "
+            "COLLATE Latin1_General_100_CI_AS); INSERT @t VALUES "
+            "(1,0x8091),(2,0x41E9),(3,0x9200),(4,0xFFFE); SELECT v,v FROM @t ORDER BY ord");
+        for (size_t start = 0; start < 4; start += row_count) {
+            SCOPED_TRACE(start);
+            std::fill(bound.begin(), bound.end(), 0xCC);
+            std::fill(bound_lengths.begin(), bound_lengths.end(), 0xCC);
+            ASSERT_EQ(SQL_SUCCESS, SQLFetchScroll(stmt_, SQL_FETCH_NEXT, 0))
+                << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_STMT, stmt_);
+            EXPECT_EQ("", StmtDiagState());
+            ASSERT_EQ(row_count, fetched);
+            EXPECT_EQ(std::vector<unsigned char>(unused.size(), 0xCC), unused);
+            EXPECT_EQ(std::vector<unsigned char>(unused_lengths.size(), 0xCC), unused_lengths);
+            for (size_t row = 0; row < row_count; ++row) {
+                EXPECT_EQ(SQL_ROW_SUCCESS, status[row]);
+                EXPECT_EQ(0, std::memcmp(bound.data() + bind_offset + row * capacity,
+                    expected[start + row], capacity));
+                SQLLEN length = -99;
+                std::memcpy(&length, bound_lengths.data() + bind_offset + row * sizeof(SQLLEN),
+                    sizeof(length));
+                EXPECT_EQ(4, length);
+            }
+            EXPECT_EQ(0xCC, bound.front());
+            EXPECT_EQ(0xCC, bound.back());
+            EXPECT_EQ(0xCC, bound_lengths.front());
+            EXPECT_EQ(0xCC, bound_lengths.back());
+        }
+        EXPECT_EQ(SQL_NO_DATA, SQLFetchScroll(stmt_, SQL_FETCH_NEXT, 0));
+        EXPECT_EQ(0u, fetched);
+        EXPECT_EQ(std::vector<unsigned char>(unused_lengths.size(), 0xCC), unused_lengths);
+        ASSERT_EQ(SQL_SUCCESS, SQLCloseCursor(stmt_));
+        ASSERT_EQ(SQL_SUCCESS, SQLFreeStmt(stmt_, SQL_UNBIND));
+    }
 }
 
 TEST_F(FetchScrollUtf16Test, BoundedRawUnitsTruncateBoundRows) {
