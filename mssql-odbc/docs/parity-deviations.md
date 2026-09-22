@@ -403,3 +403,16 @@ msodbcsql build is measured.
    application, so this is visible only to a caller that loads the driver
    directly. Tracked in AB#48256.
    Signed off by Theekshna Kotian on 2026-09-18.
+15. The TDS 8 user-agent `Driver Name` field is `MS-ODBCRS`; msodbcsql sends
+   `MS-ODBC` (`tds/TdsSend.cpp`, around line 299). The classic Login7
+   `ClientInterfaceName` field is not part of this deviation: this driver sends
+   `ODBC` there to match msodbcsql's `pwszClientInterface` assignment in
+   `odbc/sqlcconn.cpp` and the corresponding `L"ODBC"` assertion in
+   `tds/TdsSend.cpp`, preserving `sys.dm_exec_sessions.client_interface_name`
+   parity.
+
+   The user-agent name intentionally distinguishes this Rust ODBC driver from
+   the classic C++ driver in server-side telemetry while staying within the same
+   Microsoft ODBC driver family. This mirrors the sibling binding precedent where
+   Python sets a distinct user-agent driver name (`MS-PYTHON`) instead of using
+   the generic TDS default. Tracked in #634.

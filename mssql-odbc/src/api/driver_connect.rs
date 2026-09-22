@@ -278,7 +278,7 @@ fn initial_database(database_keyword: &str, current_catalog: Option<&str>) -> St
     }
 }
 
-const ODBC_LIBRARY_NAME: &str = "MS-ODBC";
+const ODBC_LIBRARY_NAME: &str = "ODBC";
 const ODBC_USER_AGENT_LIBRARY_NAME: &str = "MS-ODBCRS";
 const ODBC_DRIVER_VERSION_STRING: &str = env!("CARGO_PKG_VERSION");
 static ODBC_DRIVER_VERSION: OnceLock<DriverVersion> = OnceLock::new();
@@ -659,13 +659,24 @@ mod tests {
     fn odbc_driver_identity_is_seeded_into_client_context() {
         let mut context = ClientContext::default();
         configure_driver_identity(&mut context);
+        let expected_driver_version = DriverVersion::new(
+            env!("CARGO_PKG_VERSION_MAJOR")
+                .parse()
+                .expect("major version should parse"),
+            env!("CARGO_PKG_VERSION_MINOR")
+                .parse()
+                .expect("minor version should parse"),
+            env!("CARGO_PKG_VERSION_PATCH")
+                .parse()
+                .expect("patch version should parse"),
+        );
 
         assert_eq!(context.library_name, ODBC_LIBRARY_NAME);
         assert_eq!(
             context.user_agent.library_name,
             ODBC_USER_AGENT_LIBRARY_NAME
         );
-        assert_eq!(context.driver_version, odbc_driver_version());
+        assert_eq!(context.driver_version, expected_driver_version);
         assert_eq!(
             context.user_agent.driver_version,
             ODBC_DRIVER_VERSION_STRING
