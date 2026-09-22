@@ -109,10 +109,11 @@ pub fn encode_narrow(text: &str, collation: SqlCollation) -> Vec<u8> {
     let (encoded, encoding_used, had_errors) = resolve_collation(collation).encode(text);
     if had_errors {
         warn!(
-            "Encountered encoding errors while converting string to LCID 0x{:04X} ({}) encoding. \
+            "Encountered encoding errors while converting string to {} (LCID 0x{:04X}, SQL sort ID {}). \
              Some characters may have been replaced.",
+            encoding_used.name(),
             collation.info & 0x000F_FFFF,
-            encoding_used.name()
+            collation.sort_id
         );
     }
     encoded.into_owned()
@@ -203,9 +204,11 @@ impl SqlString {
 
                 if had_errors {
                     warn!(
-                        "Encountered decoding errors while converting LCID 0x{:04X} ({}) encoded data. \
+                        "Encountered decoding errors while converting {} encoded data (LCID 0x{:04X}, SQL sort ID {}). \
                          Some characters may have been replaced with U+FFFD.",
-                        lcid, lcid
+                        encoding.name(),
+                        lcid,
+                        collation.sort_id
                     );
                 }
 
