@@ -6927,19 +6927,33 @@ mod tests {
     }
 
     fn open_mock_plp(chunks: Vec<Vec<u16>>) -> (TestHandles, crate::test_support::MockServer) {
+        use mssql_mock_tds::{ColumnDefinition, ColumnValue, SqlDataType};
+
+        open_mock_plp_column(
+            ColumnDefinition::new("value", SqlDataType::NVarCharMax),
+            ColumnValue::NVarCharMax(chunks),
+        )
+    }
+
+    fn open_mock_gbk_plp(chunks: Vec<Vec<u8>>) -> (TestHandles, crate::test_support::MockServer) {
+        use mssql_mock_tds::{ColumnDefinition, ColumnValue, SqlDataType};
+
+        let mut column = ColumnDefinition::new("value", SqlDataType::VarCharMax);
+        column.collation = [0x04, 0x08, 0, 0, 0]; // zh-CN, codepage 936 (GBK)
+        open_mock_plp_column(column, ColumnValue::VarCharMax(chunks))
+    }
+
+    fn open_mock_plp_column(
+        column: mssql_mock_tds::ColumnDefinition,
+        value: mssql_mock_tds::ColumnValue,
+    ) -> (TestHandles, crate::test_support::MockServer) {
         use mssql_mock_tds::{ColumnDefinition, ColumnValue, QueryResponse, Row, SqlDataType};
 
         let h = TestHandles::with_env_dbc_stmt();
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         let response = QueryResponse::new(
-            vec![
-                ColumnDefinition::new("value", SqlDataType::NVarCharMax),
-                ColumnDefinition::new("following", SqlDataType::Int),
-            ],
-            vec![Row::new(vec![
-                ColumnValue::NVarCharMax(chunks),
-                ColumnValue::Int(42),
-            ])],
+            vec![column, ColumnDefinition::new("following", SqlDataType::Int)],
+            vec![Row::new(vec![value, ColumnValue::Int(42)])],
         );
         let server = crate::test_support::connect_mock_server(dbc, "SELECT plp_switch", response);
         let sql: Vec<u16> = "SELECT plp_switch\0".encode_utf16().collect();
@@ -6968,6 +6982,93 @@ mod tests {
             )
         };
         (rc, indicator)
+    }
+
+    #[test]
+    fn plp_gbk_widening_refills_remaining_output_capacity() {
+        for chunks in [
+            vec![vec![0xc4, 0xe3, 0xc4, 0xe3, 0xc4, 0xe3, 0xc4, 0xe3]],
+            vec![
+                vec![0xc4],
+                vec![0xe3, 0xc4, 0xe3],
+                vec![0xc4, 0xe3, 0xc4, 0xe3],
+            ],
+        ] {
+            let (h, _server) = open_mock_gbk_plp(chunks);
+            let mut output = [0xcc; 10];
+            assert_eq!(
+                read_plp_test_chunk(&h, SQL_C_WCHAR, &mut output),
+                (SQL_SUCCESS, 8)
+            );
+            assert_eq!(
+                output,
+                [0x60, 0x4f, 0x60, 0x4f, 0x60, 0x4f, 0x60, 0x4f, 0, 0]
+            );
+            assert_eq!(
+                read_plp_test_chunk(&h, SQL_C_BINARY, &mut output),
+                (SQL_NO_DATA, -999)
+            );
+        }
+    }
+
+    #[test]
+    fn plp_gbk_completes_source_character_before_binary_switch() {
+        for target in [SQL_C_CHAR, SQL_C_WCHAR] {
+            for chunks in [
+                vec![vec![b'A', 0xc4, 0xe3, b'B', b'C']],
+                vec![vec![b'A', 0xc4], vec![0xe3], vec![b'B', b'C']],
+            ] {
+                let (h, _server) = open_mock_gbk_plp(chunks);
+                let mut first = [0xcc; 7];
+                let (length, indicator, expected): (_, _, &[u8]) = if target == SQL_C_CHAR {
+                    (7, 5, b"A\xe4\xbd\xa0\0")
+                } else {
+                    (6, SQL_NO_TOTAL, &[b'A', 0, 0x60, 0x4f, 0, 0])
+                };
+                assert_eq!(
+                    read_plp_test_chunk(&h, target, &mut first[..length]),
+                    (SQL_SUCCESS_WITH_INFO, indicator)
+                );
+                assert_eq!(&first[..expected.len()], expected);
+                let mut binary = [0xcc; 8];
+                assert_eq!(
+                    read_plp_test_chunk(&h, SQL_C_BINARY, &mut binary),
+                    (SQL_SUCCESS, 2)
+                );
+                assert_eq!(&binary[..2], b"BC");
+                assert_eq!(
+                    read_plp_test_chunk(&h, SQL_C_BINARY, &mut binary),
+                    (SQL_NO_DATA, -999)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn plp_binary_after_intervening_text_exhaustion_leaves_buffer_untouched() {
+        let (h, _server) = open_mock_plp(vec![vec![0x20ac, 0x41, 0x20ac]]);
+        assert_eq!(
+            read_plp_test_chunk(&h, SQL_C_CHAR, &mut [0; 2]),
+            (SQL_SUCCESS_WITH_INFO, SQL_NO_TOTAL)
+        );
+        let mut binary = [0xcc; 2];
+        assert_eq!(
+            read_plp_test_chunk(&h, SQL_C_BINARY, &mut binary),
+            (SQL_SUCCESS_WITH_INFO, 4)
+        );
+        assert_eq!(binary, [b'A', 0]);
+        let mut text = [0xcc; 4];
+        assert_eq!(
+            read_plp_test_chunk(&h, SQL_C_CHAR, &mut text),
+            (SQL_SUCCESS_WITH_INFO, SQL_NO_TOTAL)
+        );
+        assert_eq!(text, [0x82, 0xac, 0xe2, 0]);
+        binary.fill(0xcc);
+        assert_eq!(
+            read_plp_test_chunk(&h, SQL_C_BINARY, &mut binary),
+            (SQL_SUCCESS, 0)
+        );
+        assert_eq!(binary, [0xcc; 2]);
     }
 
     #[test]
