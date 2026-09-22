@@ -92,6 +92,7 @@ class PinnedCheckout(unittest.TestCase):
     def test_branch_pin_tracks_latest_commit_on_each_checkout(self):
         for branch in ("main", "feature/test"):
             self.git(self.remote, "checkout", "-B", branch)
+            self.git(self.remote, "tag", branch, self.pin)
             self.pin_file.write_text(branch + "\n", encoding="ascii")
             for attempt in range(2):
                 with self.subTest(branch=branch, attempt=attempt):
@@ -108,6 +109,7 @@ class PinnedCheckout(unittest.TestCase):
 
     def test_unavailable_branch_never_falls_back_to_main(self):
         self.pin_file.write_text("missing-branch\n", encoding="ascii")
+        self.git(self.remote, "tag", "missing-branch", self.pin)
         result = self.checkout()
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Cannot fetch mssql-python pin missing-branch", result.stderr)

@@ -22,11 +22,15 @@ if [[ ! "$REVISION" =~ ^[0-9a-f]{40}$ ]] && ! git check-ref-format --branch "$RE
 fi
 
 echo "##[section]mssql-python requested pin: $REVISION"
+FETCH_REF="$REVISION"
+if [[ ! "$REVISION" =~ ^[0-9a-f]{40}$ ]]; then
+  FETCH_REF="refs/heads/$REVISION"
+fi
 # Refuse to reuse a checkout or overwrite a developer's existing work.
 mkdir "$CLONE_DIR"
 git init --quiet "$CLONE_DIR"
 git -C "$CLONE_DIR" remote add origin https://github.com/microsoft/mssql-python.git
-if ! git -C "$CLONE_DIR" fetch --depth 1 origin "$REVISION"; then
+if ! git -C "$CLONE_DIR" fetch --depth 1 origin "$FETCH_REF"; then
   echo "##[error]Cannot fetch mssql-python pin $REVISION; no branch fallback is allowed" >&2
   exit 1
 fi
