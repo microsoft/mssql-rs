@@ -83,12 +83,16 @@ on the `master` branch.
   other value with `SQL_ERROR` / `HY024` without changing the environment's
   previously selected version. **Preserve this behavior** and its
   `api::set_env_attr` unit tests.
-- **Driver Manager behavior is not driver behavior.** A Driver Manager may
-  accept `SQL_OV_ODBC2` from a 2.x application and map that application onto
-  the ODBC 3.x driver interface before loading or calling this driver. A test
-  that invokes `SQLSetEnvAttr` through a Driver Manager therefore measures the
-  Driver Manager, not necessarily this driver's setter. **Do not add ODBC 2.x
-  application behavior to the driver.**
+- **Driver Manager behavior is not driver behavior.** A Driver Manager owns its
+  own environment state and answers the application from it, so a test that
+  invokes `SQLSetEnvAttr` through a Driver Manager measures the Driver Manager,
+  not this driver's setter. Do **not** assume the Driver Manager maps a 2.x
+  application onto the 3.x interface on the driver's behalf: unixODBC replays
+  the application's declared version verbatim
+  (`DriverManager/SQLConnect.c:1532-1538`), which is why the driver enforces
+  the contract itself at `SQLAllocHandle(SQL_HANDLE_DBC)`. See
+  [registry entry 14](../../mssql-odbc/docs/parity-deviations.md). **Do not add
+  ODBC 2.x application behavior to the driver.**
 - **Advertised driver version: ODBC 3.80.** The implemented
   `SQLGetInfo(SQL_DRIVER_ODBC_VER)` response is `"03.80"`.
   `SQL_ODBC_VER` describes the Driver Manager when one is present; the direct

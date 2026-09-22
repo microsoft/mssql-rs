@@ -1849,12 +1849,16 @@ mod tests {
     }
 
     #[test]
-    fn odbc_ver_param_includes_at_prefix() {
-        assert_eq!(ODBC_VER_KATMAI, 3);
+    fn odbc_ver_param_sends_version_3_with_an_at_prefix() {
         let debug = format!("{:?}", odbc_ver_param());
         assert!(
             debug.contains("\"@ODBCVer\""),
             "expected an @-prefixed parameter name, got: {debug}"
+        );
+        assert!(
+            debug.contains("TinyInt(Some(3))"),
+            "catalog functions send @ODBCVer 3, not SQLGetTypeInfo's 4 \
+             (sqlcdd.cpp:1814 vs :2206), got: {debug}"
         );
     }
 

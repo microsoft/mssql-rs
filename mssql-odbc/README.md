@@ -262,8 +262,13 @@ MSSQL_TDS_TRACE_DIR="./traces" \
 cargo nextest run -p mssqlodbc --lib
 ```
 
-Trace events can contain sensitive data. Use a trusted directory with
-appropriate permissions. Trace files are not rotated or deleted automatically.
+Trace events can contain SQL text and parameter values. On Unix the driver
+creates trace files with mode `0600`, and warns on stderr when
+`MSSQL_TDS_TRACE_DIR` is writable by group or other users, or points inside the
+system temporary directory. Configuration is captured on the first ODBC call: a
+relative directory is resolved to an absolute path at that point, and the
+settings cannot be changed while the driver stays loaded. Trace files are not
+rotated or deleted automatically.
 
 ## Contributing
 
