@@ -416,3 +416,11 @@ msodbcsql build is measured.
    Microsoft ODBC driver family. This mirrors the sibling binding precedent where
    Python sets a distinct user-agent driver name (`MS-PYTHON`) instead of using
    the generic TDS default. Tracked in #634.
+
+   Evidence level: source reading only. No observed `SQL_DRIVER_VER` or tested
+   msodbcsql build is recorded here because the claim is about a Login7 feature
+   extension field that this driver's current parity suite can capture through
+   `mssql-mock-tds`, but the comparison leg has no equivalent server-side user
+   agent capture for msodbcsql. A parity measurement that connects msodbcsql
+   18.6.2.1 (the build pinned in CI) to a server or proxy that records the TDS 8
+   user-agent feature would close this evidence gap.
