@@ -24,7 +24,7 @@ _SPEC.loader.exec_module(wheel_install)
 
 
 def write_wheel(path: Path, name: str = "mssql_python_rs") -> Path:
-    wheel = path / "mssql_python_rs-0.1.0-cp314-cp314-win_amd64.whl"
+    wheel = path / "mssql_python_rs-0.1.0-cp310-abi3-win_amd64.whl"
     with zipfile.ZipFile(wheel, "w") as archive:
         archive.writestr(
             "mssql_python_rs-0.1.0.dist-info/METADATA",
@@ -53,13 +53,19 @@ def test_linux_installs_use_mirrored_consumer_images() -> None:
 
 def test_linux_installs_cover_release_matrix() -> None:
     """The Linux install-test matrix must track verify-python-wheels.ps1, the
-    canonical source the release gate enforces - not restate its own literals."""
+    canonical source the release gate enforces - not restate its own literals.
+    The wheel is a single stable-ABI (cp310-abi3) build per platform, so there
+    is no per-version tag list left to check the platform script's interpreter
+    list against; the floor of that list must still match the wheel's
+    declared Requires-Python minimum."""
     script = _LINUX_SCRIPT.read_text(encoding="utf-8")
     ps1 = _VERIFY_WHEELS_SCRIPT.read_text(encoding="utf-8")
 
-    python_tags_match = re.search(r"\$pythonTags\s*=\s*(.+)", ps1)
-    assert python_tags_match
-    canonical_python_tags = set(re.findall(r"'([^']+)'", python_tags_match[1]))
+    floor_match = re.search(r"-ne\s+'>=(3\.\d+)'", ps1)
+    assert (
+        floor_match
+    ), "could not find the Requires-Python floor in verify-python-wheels.ps1"
+    floor_minor = int(floor_match[1].split(".")[1])
 
     platforms_match = re.search(r"\$platforms\s*=\s*@\((.*?)\)", ps1, re.DOTALL)
     assert platforms_match
@@ -75,7 +81,13 @@ def test_linux_installs_cover_release_matrix() -> None:
     script_platform_tags_match = re.search(r"PLATFORM_TAGS=\(([^)]*)\)", script)
     assert script_platform_tags_match
 
-    assert set(script_python_tags_match[1].split()) == canonical_python_tags
+    script_python_minors = [
+        int(tag.removeprefix("cp3")) for tag in script_python_tags_match[1].split()
+    ]
+    assert min(script_python_minors) == floor_minor, (
+        "the lowest interpreter this script install-tests must match the "
+        "wheel's Requires-Python floor enforced by verify-python-wheels.ps1"
+    )
     assert set(script_platform_tags_match[1].split()) == canonical_platform_prefixes
     assert 'for platform_tag in "${PLATFORM_TAGS[@]}"' in script
 
@@ -97,7 +109,7 @@ def test_select_driver_uses_native_slice_for_universal2(
 
     driver = wheel_install.select_driver(
         Distribution(),
-        "mssql_python_rs-0.1.0-cp314-cp314-macosx_15_0_universal2.whl",
+        "mssql_python_rs-0.1.0-cp310-abi3-macosx_15_0_universal2.whl",
     )
 
     assert driver.parts[-3:] == ("arm64", "lib", "mssqlodbc.dylib")
@@ -107,27 +119,27 @@ def test_select_driver_uses_native_slice_for_universal2(
     ("wheel_name", "expected"),
     [
         (
-            "mssql_python_rs-0.1.0-cp314-cp314-win_amd64.whl",
+            "mssql_python_rs-0.1.0-cp310-abi3-win_amd64.whl",
             "mssql_py_core/libs/windows/x64/mssqlodbc.dll",
         ),
         (
-            "mssql_python_rs-0.1.0-cp314-cp314-win_arm64.whl",
+            "mssql_python_rs-0.1.0-cp310-abi3-win_arm64.whl",
             "mssql_py_core/libs/windows/arm64/mssqlodbc.dll",
         ),
         (
-            "mssql_python_rs-0.1.0-cp314-cp314-manylinux_2_34_x86_64.whl",
+            "mssql_python_rs-0.1.0-cp310-abi3-manylinux_2_34_x86_64.whl",
             "mssql_py_core/libs/linux/glibc/x86_64/lib/mssqlodbc.so",
         ),
         (
-            "mssql_python_rs-0.1.0-cp314-cp314-manylinux_2_28_aarch64.whl",
+            "mssql_python_rs-0.1.0-cp310-abi3-manylinux_2_28_aarch64.whl",
             "mssql_py_core/libs/linux/glibc/arm64/lib/mssqlodbc.so",
         ),
         (
-            "mssql_python_rs-0.1.0-cp314-cp314-musllinux_1_2_x86_64.whl",
+            "mssql_python_rs-0.1.0-cp310-abi3-musllinux_1_2_x86_64.whl",
             "mssql_py_core/libs/linux/musl/x86_64/lib/mssqlodbc.so",
         ),
         (
-            "mssql_python_rs-0.1.0-cp314-cp314-musllinux_1_2_aarch64.whl",
+            "mssql_python_rs-0.1.0-cp310-abi3-musllinux_1_2_aarch64.whl",
             "mssql_py_core/libs/linux/musl/arm64/lib/mssqlodbc.so",
         ),
     ],
@@ -142,11 +154,11 @@ def test_expected_driver_path_matches_consumer_resolver(
     ("wheel_name", "wrong_path"),
     [
         (
-            "mssql_python_rs-0.1.0-cp314-cp314-manylinux_2_34_x86_64.whl",
+            "mssql_python_rs-0.1.0-cp310-abi3-manylinux_2_34_x86_64.whl",
             "mssql_py_core/libs/linux/glibc/arm64/lib/mssqlodbc.so",
         ),
         (
-            "mssql_python_rs-0.1.0-cp314-cp314-win_amd64.whl",
+            "mssql_python_rs-0.1.0-cp310-abi3-win_amd64.whl",
             "mssql_py_core/libs/windows/arm64/mssqlodbc.dll",
         ),
     ],
@@ -325,7 +337,7 @@ def test_verify_install_rejects_module_outside_distribution(
     monkeypatch.setitem(sys.modules, "mssql_py_core", module)
 
     with pytest.raises(RuntimeError, match="outside the installed distribution"):
-        wheel_install.verify_install("0.1.0", "package-0.1-cp314-cp314-win_amd64.whl")
+        wheel_install.verify_install("0.1.0", "package-0.1-cp310-abi3-win_amd64.whl")
 
 
 def test_install_verification_uses_isolated_python(

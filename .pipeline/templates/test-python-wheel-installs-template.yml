@@ -43,11 +43,13 @@ steps:
         addToPath: true
     - pwsh: |
         $ErrorActionPreference = 'Stop'
-        $pythonTag = 'cp' + '${{ pythonVersion }}'.Replace('.', '')
+        # The wheel is a single stable-ABI (cp310-abi3) build per platform,
+        # forward-compatible with every interpreter in this loop - it is not
+        # rebuilt or reselected per Python version.
         $platformTag = if ('${{ parameters.architecture }}' -eq 'arm64') { 'win_arm64' } else { 'win_amd64' }
-        $wheels = @(Get-ChildItem "$(ob_outputDirectory)\wheels" -File -Filter "mssql_python_rs-*-$pythonTag-$pythonTag-$platformTag.whl")
+        $wheels = @(Get-ChildItem "$(ob_outputDirectory)\wheels" -File -Filter "mssql_python_rs-*-cp310-abi3-$platformTag.whl")
         if ($wheels.Count -ne 1) {
-          throw "Expected one $pythonTag $platformTag wheel, found $($wheels.Count)"
+          throw "Expected one cp310-abi3 $platformTag wheel, found $($wheels.Count)"
         }
         python "$(Build.SourcesDirectory)\scripts\test-python-wheel-install.py" --wheel $wheels[0].FullName
       displayName: 'Clean-install Python ${{ pythonVersion }} wheel (Windows ${{ parameters.architecture }})'
@@ -62,11 +64,13 @@ steps:
         addToPath: true
     - script: |
         set -euo pipefail
-        python_tag="cp$(echo '${{ pythonVersion }}' | tr -d '.')"
+        # The wheel is a single stable-ABI (cp310-abi3) build per platform,
+        # forward-compatible with every interpreter in this loop - it is not
+        # rebuilt or reselected per Python version.
         shopt -s nullglob
-        wheels=("$(ob_outputDirectory)/wheels"/mssql_python_rs-*-${python_tag}-${python_tag}-macosx_15_0_universal2.whl)
+        wheels=("$(ob_outputDirectory)/wheels"/mssql_python_rs-*-cp310-abi3-macosx_15_0_universal2.whl)
         if [ "${#wheels[@]}" -ne 1 ]; then
-          echo "Expected one ${python_tag} macOS universal2 wheel, found ${#wheels[@]}" >&2
+          echo "Expected one cp310-abi3 macOS universal2 wheel, found ${#wheels[@]}" >&2
           exit 1
         fi
         extract_dir="$(mktemp -d)"

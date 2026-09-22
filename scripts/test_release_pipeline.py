@@ -590,29 +590,17 @@ def test_python_wheel_install_gate_precedes_artifact_publication(
     assert max(transform_indices) < install_index
 
 
-def _canonical_python_versions() -> set[str]:
+def _wheel_requires_python_floor() -> str:
+    """The minimum Python version the released wheel declares support for,
+    read from verify-python-wheels.ps1's Requires-Python assertion - the
+    canonical source the release gate enforces. Since the wheel is a single
+    stable-ABI (cp310-abi3) build, there is no per-version tag list to track
+    anymore; the floor is the one canonical constraint left to drift-check
+    the install-test matrix against."""
     ps1 = _VERIFY_WHEELS_SCRIPT.read_text(encoding="utf-8")
-    match = re.search(r"\$pythonTags\s*=\s*(.+)", ps1)
-    assert match
-    tags = re.findall(r"'cp(\d)(\d+)'", match[1])
-    return {f"{major}.{minor}" for major, minor in tags}
-
-
-def _canonical_win_arm64_python_versions() -> set[str]:
-    """The win_arm64 tags are the pythonTags filtered by the Where-Object
-    clause preceding the win_arm64 wheel-name loop in Get-ExpectedWheelNames -
-    read that filter's excluded tags rather than restating them."""
-    ps1 = _VERIFY_WHEELS_SCRIPT.read_text(encoding="utf-8")
-    match = re.search(
-        r"foreach\s*\(\$pythonTag in \$pythonTags \| Where-Object \{(.*?)\}\)"
-        r"\s*\{\s*\"[^\"]*-win_arm64\.whl\"",
-        ps1,
-        re.DOTALL,
-    )
-    assert match, "could not find the win_arm64 Where-Object filter in verify-python-wheels.ps1"
-    excluded = re.findall(r"-ne\s+'cp(\d)(\d+)'", match[1])
-    excluded_versions = {f"{major}.{minor}" for major, minor in excluded}
-    return _canonical_python_versions() - excluded_versions
+    match = re.search(r"-ne\s+'>=(3\.\d+)'", ps1)
+    assert match, "could not find the Requires-Python floor in verify-python-wheels.ps1"
+    return match[1]
 
 
 def test_windows_and_macos_install_matrix_tracks_release_python_tags() -> None:
@@ -620,8 +608,8 @@ def test_windows_and_macos_install_matrix_tracks_release_python_tags() -> None:
     the Linux script, Windows/macOS install coverage is driven by this
     template's own `pythonVersions` default (and the Windows ARM64 override in
     stages.yml), neither of which was cross-checked against the canonical
-    matrix in verify-python-wheels.ps1."""
-    canonical = _canonical_python_versions()
+    Requires-Python floor in verify-python-wheels.ps1."""
+    floor = _wheel_requires_python_floor()
 
     install_template = yaml.safe_load(
         _WHEEL_INSTALL_TEMPLATE.read_text(encoding="utf-8")
@@ -631,7 +619,7 @@ def test_windows_and_macos_install_matrix_tracks_release_python_tags() -> None:
         for parameter in install_template["parameters"]
         if parameter["name"] == "pythonVersions"
     )
-    assert set(default_versions) == canonical
+    assert min(default_versions, key=lambda v: tuple(map(int, v.split(".")))) == floor
 
     source = yaml.safe_load(_BUILD_STAGES.read_text(encoding="utf-8"))
     flags = {
@@ -647,10 +635,9 @@ def test_windows_and_macos_install_matrix_tracks_release_python_tags() -> None:
     build = next(stage for stage in pipeline["stages"] if stage["stage"] == "Build")
     arm64_job = next(job for job in build["jobs"] if job.get("job") == "Windows_ARM64")
 
-    # win_arm64 excludes cp310 today (limited support, per the comment in
-    # stages.yml) - derived from verify-python-wheels.ps1's own filter so a
-    # change to that exclusion is caught here too.
-    expected_arm64_versions = _canonical_win_arm64_python_versions()
+    # win_arm64 excludes the floor version today (limited hosted-agent
+    # support for it, per the comment in stages.yml), nothing else.
+    expected_arm64_versions = set(default_versions) - {floor}
     for template_name in (
         "build-python-wheels-template.yml",
         "test-python-wheel-installs-template.yml",

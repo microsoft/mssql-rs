@@ -9,6 +9,17 @@ if [ "${1:-}" = "--container" ]; then
     platform_tag="$3"
     architecture="$4"
 
+    # The wheel is a single stable-ABI (cp310-abi3) build per platform,
+    # forward-compatible with every interpreter below - it is not rebuilt or
+    # reselected per Python version.
+    mapfile -t wheels < <(find "$wheel_dir" -maxdepth 1 -type f \
+        -name "mssql_python_rs-*-cp310-abi3-${platform_tag}_${architecture}.whl")
+    if [ "${#wheels[@]}" -ne 1 ]; then
+        echo "Expected one cp310-abi3 ${platform_tag}_${architecture} wheel, found ${#wheels[@]}" >&2
+        printf '  %s\n' "${wheels[@]}" >&2
+        exit 1
+    fi
+
     for python_tag in "${PYTHON_TAGS[@]}"; do
         python_bin="/opt/python/${python_tag}-${python_tag}/bin/python"
         if [ ! -x "$python_bin" ]; then
@@ -16,13 +27,6 @@ if [ "${1:-}" = "--container" ]; then
             exit 1
         fi
 
-        mapfile -t wheels < <(find "$wheel_dir" -maxdepth 1 -type f \
-            -name "mssql_python_rs-*-${python_tag}-${python_tag}-${platform_tag}_${architecture}.whl")
-        if [ "${#wheels[@]}" -ne 1 ]; then
-            echo "Expected one ${python_tag} ${platform_tag}_${architecture} wheel, found ${#wheels[@]}" >&2
-            printf '  %s\n' "${wheels[@]}" >&2
-            exit 1
-        fi
         "$python_bin" /scripts/test-python-wheel-install.py --wheel "${wheels[0]}"
     done
     exit 0
