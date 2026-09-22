@@ -2637,8 +2637,11 @@ fn stream_active_plp_chunk_once<'a>(
     // from those same bytes, so reading it after the fact would count this
     // call's read twice. Widening reports SQL_NO_TOTAL instead.
     //
-    // A text target receives any prior conversion's bytes verbatim. Binary
-    // ignores the conversion carry, including in its remaining-length count.
+    // WCHAR on a UTF-16 source follows msodbcsql's !fConvNeeded branch in
+    // InternalGetColData: truncation reports only the wire length, even when
+    // carry remains. Retail 18.6.2.1 reports 01004 + indicator 0 for a WCHAR
+    // probe after CHAR exhausts the wire; a buffer with payload room drains it.
+    // Binary also omits carry, but bypasses its delivery altogether.
     let held_converted_bytes = if target_type == SQL_C_CHAR {
         carried_bytes as u64
     } else {
@@ -7047,16 +7050,17 @@ mod tests {
             read_plp_test_chunk(&h, SQL_C_CHAR, &mut [0; 2]).0,
             SQL_SUCCESS_WITH_INFO
         );
-        for _ in 0..2 {
+        let mut probe = [0xcc; 2];
+        for size in [0, 2, 0, 2] {
             assert_eq!(
-                read_plp_test_chunk(&h, SQL_C_WCHAR, &mut []).0,
-                SQL_SUCCESS_WITH_INFO
+                read_plp_test_chunk(&h, SQL_C_WCHAR, &mut probe[..size]),
+                (SQL_SUCCESS_WITH_INFO, 0)
             );
         }
         let mut exact = [0xcc; 4];
         assert_eq!(
-            read_plp_test_chunk(&h, SQL_C_WCHAR, &mut exact).0,
-            SQL_SUCCESS_WITH_INFO
+            read_plp_test_chunk(&h, SQL_C_WCHAR, &mut exact),
+            (SQL_SUCCESS_WITH_INFO, 0)
         );
         assert_eq!(exact, [0x82, 0xac, 0, 0]);
         assert_eq!(

@@ -828,6 +828,48 @@ TEST_F(GetDataUtf16Test, PlpTargetSwitchBinaryBypassesButRetainsTextCarry) {
     ASSERT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }
 
+TEST_F(GetDataUtf16Test, PlpTargetSwitchWcharProbeReportsWireLength) {
+    SKIP_IF_COMPARING_MSODBCSQL_ON_WINDOWS();
+    for (const SQLLEN capacity : {4, 8}) {
+        ASSERT_SQL_OK(ExecDirect("SELECT CAST(NCHAR(0x20AC) AS nvarchar(max)), 42"),
+                      SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+        SQLCHAR first[2] = {};
+        SQLLEN ind = 0;
+        ASSERT_EQ(SQL_SUCCESS_WITH_INFO,
+                  SQLGetData(stmt_, 1, SQL_C_CHAR, first, sizeof(first), &ind));
+        EXPECT_EQ(SQL_NO_TOTAL, ind);
+        EXPECT_EQ(0xE2, first[0]);
+
+        SQLWCHAR output[4] = {};
+        for (const SQLLEN probe_size : {0, 2, 0, 2}) {
+            ASSERT_EQ(SQL_SUCCESS_WITH_INFO,
+                      SQLGetData(stmt_, 1, SQL_C_WCHAR, output, probe_size, &ind));
+            EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01004");
+            EXPECT_EQ(0, ind);
+        }
+
+        const SQLRETURN rc =
+            SQLGetData(stmt_, 1, SQL_C_WCHAR, output, capacity, &ind);
+        EXPECT_EQ(0xAC82, output[0]);
+        EXPECT_EQ(0, output[1]);
+        if (capacity == 4) {
+            ASSERT_EQ(SQL_SUCCESS_WITH_INFO, rc);
+            EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01004");
+            EXPECT_EQ(0, ind);
+            ASSERT_EQ(SQL_SUCCESS,
+                      SQLGetData(stmt_, 1, SQL_C_WCHAR, output, sizeof(output), &ind));
+            EXPECT_EQ(0, ind);
+        } else {
+            ASSERT_EQ(SQL_SUCCESS, rc);
+            EXPECT_EQ(2, ind);
+        }
+        EXPECT_EQ(SQL_NO_DATA,
+                  SQLGetData(stmt_, 1, SQL_C_WCHAR, output, sizeof(output), &ind));
+        ASSERT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+    }
+}
+
 // A probe leaves the UTF-8 sequence intact. A consuming binary read does not:
 // retail 18.6.2.1 resumes at the next byte and replaces both orphaned continuations.
 TEST_F(GetDataUtf16Test, PlpTargetSwitchAfterBinaryProbeOrPartialCharacter) {
