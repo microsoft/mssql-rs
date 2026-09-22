@@ -129,7 +129,7 @@ fn split_pem_certificates(data: &[u8]) -> Option<Vec<Vec<u8>>> {
     while let Some(start) = rest.find(BEGIN) {
         let after_begin = &rest[start..];
         let end = after_begin.find(END)? + END.len();
-        blocks.push(after_begin[..end].as_bytes().to_vec());
+        blocks.push(after_begin.as_bytes()[..end].to_vec());
         rest = &after_begin[end..];
     }
     Some(blocks)
@@ -413,10 +413,9 @@ mod tests {
 
     #[test]
     fn test_load_ca_certificates_from_pem() {
-        let certs = load_ca_certificates_from_file(Path::new(
-            "tests/test_certificates/valid_cert.pem",
-        ))
-        .expect("PEM CA certificate should load");
+        let certs =
+            load_ca_certificates_from_file(Path::new("tests/test_certificates/valid_cert.pem"))
+                .expect("PEM CA certificate should load");
         assert_eq!(certs.len(), 1);
     }
 

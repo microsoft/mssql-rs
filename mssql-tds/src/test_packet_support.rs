@@ -100,7 +100,7 @@ pub(crate) fn build_duplex_transport(client_side: DuplexStream) -> NetworkTransp
         Box::new(client_side),
         SslHandler {
             server_host_name: context.transport_context.get_server_name().clone(),
-            encryption_options: context.encryption_options.clone(),
+            encryption_options: Box::new(context.encryption_options.clone()),
         },
         context.packet_size as u32,
         context.encryption_options.mode,

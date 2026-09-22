@@ -91,8 +91,5 @@ pub(crate) fn default_engine(validation: &TlsValidationConfig) -> &'static dyn T
         }
     }
     let _ = validation;
-    #[allow(unreachable_code)]
-    {
-        &native_tls_engine::NATIVE_TLS_ENGINE
-    }
+    &native_tls_engine::NATIVE_TLS_ENGINE
 }

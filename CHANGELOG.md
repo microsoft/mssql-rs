@@ -8,6 +8,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ### Added
 
+- `mssql-tds`: `EncryptionOptions::server_ca`, a path to a DER or PEM encoded CA
+  certificate (or PEM bundle) that is added to the trust roots of that
+  connection only, on top of the platform roots. Unlike `server_certificate`
+  (certificate pinning) it keeps chain, validity and host name validation
+  enabled, so a private CA can be trusted without installing it system wide.
+  Combining it with `trust_server_certificate` or `server_certificate` is
+  rejected with a usage error.
+
 - `mssql-odbc`: input parameter binding (`SQLBindParameter` with
   `SQL_PARAM_INPUT`) for the character and integer type families. Any other
   `ValueType` → `ParameterType` pairing is rejected at bind time with `HYC00`,

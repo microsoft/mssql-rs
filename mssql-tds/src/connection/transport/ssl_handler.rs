@@ -20,7 +20,8 @@ use std::io::{ErrorKind, Write};
 #[derive(Debug)]
 pub(crate) struct SslHandler {
     pub(crate) server_host_name: String,
-    pub(crate) encryption_options: EncryptionOptions,
+    /// Boxed to keep `NetworkTransport` (and the futures holding it) small.
+    pub(crate) encryption_options: Box<EncryptionOptions>,
 }
 
 impl SslHandler {
@@ -164,7 +165,9 @@ impl SslHandler {
             server_certificate_path: self.encryption_options.server_certificate.as_ref(),
         };
 
-        default_engine(&validation).connect(base_stream, params).await
+        default_engine(&validation)
+            .connect(base_stream, params)
+            .await
     }
 }
 
@@ -877,7 +880,7 @@ mod tests {
     async fn enable_ssl_error(opts: EncryptionOptions) -> crate::error::Error {
         let handler = SslHandler {
             server_host_name: "localhost".to_string(),
-            encryption_options: opts,
+            encryption_options: Box::new(opts),
         };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let client = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
