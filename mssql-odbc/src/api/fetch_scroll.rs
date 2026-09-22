@@ -4347,21 +4347,20 @@ mod tests {
             SQL_C_WCHAR,
         ] {
             for (value, issue, expected_diagnostic) in &values {
-                let (issue, expected_diagnostic) = if matches!(value, ColumnValues::Time(_))
-                    && matches!(target, SQL_C_TYPE_DATE | SQL_C_SS_TIMESTAMPOFFSET)
-                {
-                    (RowIssue::Restricted, ERR_RESTRICTED_DATA_TYPE)
-                } else if matches!(target, SQL_C_CHAR | SQL_C_WCHAR) {
-                    (
-                        RowIssue::Unsupported,
-                        DiagMsg {
-                            state: SQLSTATE_HYC00,
-                            text: "Column type conversion not yet implemented",
-                        },
-                    )
-                } else {
-                    (*issue, *expected_diagnostic)
-                };
+                let (issue, expected_diagnostic) =
+                    if matches!(value, ColumnValues::Time(_)) && target == SQL_C_TYPE_DATE {
+                        (RowIssue::Restricted, ERR_RESTRICTED_DATA_TYPE)
+                    } else if matches!(target, SQL_C_CHAR | SQL_C_WCHAR) {
+                        (
+                            RowIssue::Unsupported,
+                            DiagMsg {
+                                state: SQLSTATE_HYC00,
+                                text: "Column type conversion not yet implemented",
+                            },
+                        )
+                    } else {
+                        (*issue, *expected_diagnostic)
+                    };
                 let mut output = [0xA5_u8; 80];
                 let mut indicators = [0xA5_u8; 40];
                 let mut octet_lengths = [0xB6_u8; 40];

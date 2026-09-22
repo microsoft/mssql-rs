@@ -6713,13 +6713,12 @@ mod tests {
                 SQL_C_SS_TIMESTAMPOFFSET,
             ] {
                 for (value, diagnostic) in &values {
-                    let diagnostic = if matches!(value, ColumnValues::Time(_))
-                        && matches!(target, SQL_C_TYPE_DATE | SQL_C_SS_TIMESTAMPOFFSET)
-                    {
-                        ERR_RESTRICTED_DATA_TYPE
-                    } else {
-                        *diagnostic
-                    };
+                    let diagnostic =
+                        if matches!(value, ColumnValues::Time(_)) && target == SQL_C_TYPE_DATE {
+                            ERR_RESTRICTED_DATA_TYPE
+                        } else {
+                            *diagnostic
+                        };
                     let h = TestHandles::with_env_dbc_stmt();
                     if buffered {
                         stmt_with_buffered_values(&h, vec![value.clone()]);

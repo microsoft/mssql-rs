@@ -488,13 +488,11 @@ pub(crate) unsafe fn convert_datetime_c(
 ) -> Result<ConvOk, ConvError> {
     if matches!(
         (value, target_type),
-        (
-            ColumnValues::Time(_),
-            SQL_C_TYPE_DATE | SQL_C_DATE | SQL_C_SS_TIMESTAMPOFFSET
-        ) | (
-            ColumnValues::Date(_),
-            SQL_C_TYPE_TIME | SQL_C_TIME | SQL_C_SS_TIME2
-        )
+        (ColumnValues::Time(_), SQL_C_TYPE_DATE | SQL_C_DATE)
+            | (
+                ColumnValues::Date(_),
+                SQL_C_TYPE_TIME | SQL_C_TIME | SQL_C_SS_TIME2
+            )
     ) {
         return Err(ConvError::Restricted);
     }
@@ -512,8 +510,17 @@ pub(crate) unsafe fn convert_datetime_c(
     // Appendix D: a time value converted to a timestamp takes the current date.
     // Filling it in here lets the timestamp arms keep their `has_date` guard, so
     // the date-only targets below still refuse a time value.
+    // Native time also widens to timestampoffset with a zero offset
+    // (ConvertToDateTime's SQL_TIME2_MAPPED branch); character input is separate.
     let mut p = p;
-    if p.has_time && !p.has_date && matches!(target_type, SQL_C_TYPE_TIMESTAMP | SQL_C_TIMESTAMP) {
+    if p.has_time
+        && !p.has_date
+        && (matches!(target_type, SQL_C_TYPE_TIMESTAMP | SQL_C_TIMESTAMP)
+            || matches!(
+                (value, target_type),
+                (ColumnValues::Time(_), SQL_C_SS_TIMESTAMPOFFSET)
+            ))
+    {
         let (year, month, day) = current_local_date().ok_or(ConvError::Internal)?;
         p.year = year;
         p.month = month;
@@ -2211,6 +2218,37 @@ mod tests {
     }
 
     #[test]
+    fn native_time_to_timestampoffset_uses_today_and_zero_offset() {
+        let value = ColumnValues::Time(SqlTime {
+            time_nanoseconds: 452_961_234_567,
+            scale: 7,
+        });
+        let mut out = SqlSsTimestampoffsetStruct::default();
+        let mut indicator = -42;
+        let before = current_local_date().unwrap();
+        assert_eq!(
+            unsafe {
+                convert_datetime_c(
+                    &value,
+                    SQL_C_SS_TIMESTAMPOFFSET,
+                    (&mut out as *mut SqlSsTimestampoffsetStruct).cast(),
+                    &mut indicator,
+                )
+            },
+            Ok(ConvOk::Exact)
+        );
+        let after = current_local_date().unwrap();
+        assert!([before, after].contains(&(out.year, out.month, out.day)));
+        assert_eq!((out.hour, out.minute, out.second), (12, 34, 56));
+        assert_eq!(out.fraction, 123_456_700);
+        assert_eq!((out.timezone_hour, out.timezone_minute), (0, 0));
+        assert_eq!(
+            indicator,
+            SqlLen::try_from(std::mem::size_of::<SqlSsTimestampoffsetStruct>()).unwrap()
+        );
+    }
+
+    #[test]
     fn datetime2_to_timestamp_struct() {
         use mssql_tds::datatypes::column_values::{SqlDateTime2, SqlTime};
         // 01:02:03.5 in 100 ns ticks since midnight.
@@ -2715,10 +2753,7 @@ mod tests {
                     result,
                     Err(
                         if matches!(value, ColumnValues::Time(_))
-                            && matches!(
-                                target,
-                                SQL_C_TYPE_DATE | SQL_C_DATE | SQL_C_SS_TIMESTAMPOFFSET
-                            )
+                            && matches!(target, SQL_C_TYPE_DATE | SQL_C_DATE)
                         {
                             ConvError::Restricted
                         } else {
