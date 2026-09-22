@@ -365,8 +365,23 @@ Report when:
 - A step cost time without changing the outcome, or you raised a class of finding that
   a lint, test, or CI check could have caught before review.
 
-File each one separately, with the evidence rather than a conclusion. Interactively, use
-the form so it prompts you for the fields:
+Search before filing, including closed issues; recurrence belongs on the existing issue,
+where it is the evidence that promotes it:
+
+```bash
+gh issue list --repo microsoft/mssql-rs --label skill:code-review --state all --search "<symbol>"
+```
+
+Read potential matches to confirm they describe the same drift, not just the same symbol.
+If a match exists, append the structured report below as a comment and do not create a
+new issue:
+
+```bash
+gh issue comment <number> --repo microsoft/mssql-rs --body-file <path>
+```
+
+Only if no match exists, file a separate issue for the observation, with the evidence
+rather than a conclusion. Interactively, use the form so it prompts you for the fields:
 
 <https://github.com/microsoft/mssql-rs/issues/new?template=code_review_skill_drift.yml>
 
@@ -389,23 +404,20 @@ retracted blocking finding | retracted lesser finding | defect reached main |
 review time only | nothing yet
 ```
 
+For a new issue only:
+
 ```bash
 gh issue create --repo microsoft/mssql-rs --label skill:code-review \
   --title "[review-skill] <one-line drift>" --body-file <path>
 ```
 
-Search the label before filing; recurrence belongs on the existing issue, where it is the
-evidence that promotes it:
-
-```bash
-gh issue list --repo microsoft/mssql-rs --label skill:code-review --state all --search "<symbol>"
-```
-
 These issues are the queue a periodic maintenance pass reads, so one that isn't acted on
 immediately is still doing its job. The bar is whether a future review would repeat the
-mistake — a one-off you could not have anticipated is not drift. Unattended runs file
-these too, with the same body; it is the one write worth making when no human is
-watching, since nothing else preserves the observation.
+mistake — a one-off you could not have anticipated is not drift. The confirmation and
+authorization rules in step 6 apply to both issue creation and comments. Unattended
+runs capture these too, with the same body, but write only when the run explicitly
+authorizes that action; permission to post a PR review alone does not authorize issue
+writes. Otherwise, include the prepared report in the chat output without posting it.
 
 ## Principles
 
