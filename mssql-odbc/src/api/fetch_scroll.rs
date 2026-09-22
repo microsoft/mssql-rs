@@ -4413,6 +4413,51 @@ mod tests {
     }
 
     #[test]
+    fn bound_native_time_to_timestampoffset() {
+        use crate::conversion::datetime::current_local_date;
+
+        for use_writer in [false, true] {
+            let value = SqlTime {
+                time_nanoseconds: 452_961_234_567,
+                scale: 7,
+            };
+            let mut output = SqlSsTimestampoffsetStruct {
+                timezone_hour: 12,
+                timezone_minute: 34,
+                ..Default::default()
+            };
+            let mut indicator = SQL_NULL_DATA;
+            let mut octet_length = -99;
+            let length = SqlLen::try_from(std::mem::size_of_val(&output)).unwrap();
+            let bindings = [ColumnBinding {
+                column_number: 1,
+                target_type: SQL_C_SS_TIMESTAMPOFFSET,
+                target_value_ptr: (&mut output as *mut SqlSsTimestampoffsetStruct).cast(),
+                buffer_length: length,
+                strlen_or_ind_ptr: &mut indicator,
+                octet_length_ptr: &mut octet_length,
+            }];
+            let before = current_local_date().unwrap();
+            let outcome = if use_writer {
+                let mut writer = BoundRowWriter::new(&bindings, 0, 0);
+                writer.write_time(0, value);
+                assert_eq!(writer.last_column_read, 1);
+                writer.outcome
+            } else {
+                unsafe { deliver_bound(&bindings[0], 0, 0, &ColumnValues::Time(value)) }
+            };
+            let after = current_local_date().unwrap();
+            assert_eq!(outcome, RowOutcome::Success, "use_writer={use_writer}");
+            assert!([before, after].contains(&(output.year, output.month, output.day)));
+            assert_eq!((output.hour, output.minute, output.second), (12, 34, 56));
+            assert_eq!(output.fraction, 123_456_700);
+            assert_eq!((output.timezone_hour, output.timezone_minute), (0, 0));
+            assert_eq!(indicator, 0);
+            assert_eq!(octet_length, length);
+        }
+    }
+
+    #[test]
     fn bound_row_writer_matches_established_conversion_path() {
         macro_rules! check {
             ($target:expr, $target_rust_type:ty, $column_value:expr, $write:expr) => {{

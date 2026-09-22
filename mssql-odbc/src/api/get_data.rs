@@ -6862,6 +6862,55 @@ mod tests {
     }
 
     #[test]
+    fn exported_get_data_native_time_to_timestampoffset() {
+        use crate::conversion::datetime::current_local_date;
+        use mssql_tds::datatypes::column_values::SqlTime;
+
+        for buffered in [false, true] {
+            let h = TestHandles::with_env_dbc_stmt();
+            let value = ColumnValues::Time(SqlTime {
+                time_nanoseconds: 452_961_234_567,
+                scale: 7,
+            });
+            if buffered {
+                stmt_with_buffered_values(&h, vec![value]);
+            } else {
+                stmt_with_captured(&h, value);
+            }
+            let mut output = SqlSsTimestampoffsetStruct {
+                timezone_hour: 12,
+                timezone_minute: 34,
+                ..Default::default()
+            };
+            let mut indicator = SQL_NULL_DATA;
+            let length = SqlLen::try_from(std::mem::size_of_val(&output)).unwrap();
+            let before = current_local_date().unwrap();
+            assert_eq!(
+                unsafe {
+                    crate::api::exports::SQLGetData(
+                        h.stmt,
+                        1,
+                        SQL_C_SS_TIMESTAMPOFFSET,
+                        (&mut output as *mut SqlSsTimestampoffsetStruct).cast(),
+                        length,
+                        &mut indicator,
+                    )
+                },
+                SQL_SUCCESS,
+                "buffered={buffered}"
+            );
+            let after = current_local_date().unwrap();
+            assert!([before, after].contains(&(output.year, output.month, output.day)));
+            assert_eq!((output.hour, output.minute, output.second), (12, 34, 56));
+            assert_eq!(output.fraction, 123_456_700);
+            assert_eq!((output.timezone_hour, output.timezone_minute), (0, 0));
+            assert_eq!(indicator, length);
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            assert!(stmt.inner.lock().unwrap().diag_records.is_empty());
+        }
+    }
+
+    #[test]
     fn get_data_typed_timestamp_target() {
         use crate::api::odbc_types::SqlTimestampStruct;
         use mssql_tds::datatypes::column_values::{SqlDateTime2, SqlTime};
