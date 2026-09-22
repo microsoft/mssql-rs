@@ -41,8 +41,9 @@ use super::sqlstate::*;
 use crate::api::describe_col::odbc_sql_type;
 use crate::api::exec_common::release_busy_if_row_exhausted;
 use crate::api::get_data::{
-    TextError, column_value_to_bytes, column_value_to_text, convert_typed_c, hex_buffer_elements,
-    transcode_narrow_into_pending, utf16le_chunk_to_utf8, widen_into_pending,
+    TextError, column_value_to_bytes, column_value_to_text, convert_typed_c,
+    converted_narrow_indicator, decode_narrow_into_pending, hex_buffer_elements,
+    utf16le_chunk_to_utf8, widen_into_pending,
 };
 use crate::api::odbc_types::{
     SQL_BIND_BY_COLUMN, SQL_C_BINARY, SQL_C_BIT, SQL_C_CHAR, SQL_C_DEFAULT, SQL_C_DOUBLE,
@@ -1791,13 +1792,13 @@ unsafe fn deliver_bound_plp(
         );
     let narrow_wire_encoding = column_info
         .text_encoding
-        .and_then(|encoding| encoding.encoding());
+        .and_then(|encoding| encoding.resolved_encoding());
     // Codepage text delivered as SQL_C_CHAR must be decoded through the column's
     // collation, since SQL_C_CHAR output is UTF-8 (AB#47566). A UTF-8 collation
     // is already in the target encoding, so it stays on the verbatim path.
     let transcode_narrow_to_utf8 = target == SQL_C_CHAR
         && matches!(encoding, PlpEncoding::SingleByteText)
-        && narrow_wire_encoding.is_some_and(|encoding| encoding != encoding_rs::UTF_8);
+        && narrow_wire_encoding.is_some_and(|encoding| encoding != encoding_rs::UTF_8.into());
     let mut narrow_decoder = if widen_narrow_to_utf16 || transcode_narrow_to_utf8 {
         narrow_wire_encoding.map(|encoding| encoding.new_decoder_without_bom_handling())
     } else {
@@ -1838,15 +1839,11 @@ unsafe fn deliver_bound_plp(
         && !transcode_narrow_to_utf8
         && match encoding {
             PlpEncoding::Utf8Text => true,
-            PlpEncoding::SingleByteText => narrow_wire_encoding == Some(encoding_rs::UTF_8),
+            PlpEncoding::SingleByteText => narrow_wire_encoding == Some(encoding_rs::UTF_8.into()),
             _ => false,
         };
-    // Deliberately excludes `transcode_narrow_to_utf8`: msodbcsql keys the
-    // indicator on the C types rather than on whether a conversion happens, and
-    // `sqlcdata.h:1230` takes CHAR->CHAR on its "assume a 1:1 conversion ratio"
-    // branch, so a codepage `varchar(max)` read as SQL_C_CHAR keeps a concrete
-    // count. `ABoundVarcharMaxTruncatedReportsFullLength` measures this on both
-    // legs.
+    // CHAR->CHAR has separate conversion-aware accounting below; only
+    // cross-width truncation unconditionally reports SQL_NO_TOTAL.
     let transcode = transcode_utf16_to_utf8 || widen_narrow_to_utf16;
     let buf_elements = char_buf_elements(target, stride);
     let hex_stream =
@@ -1867,13 +1864,21 @@ unsafe fn deliver_bound_plp(
     let mut pending_high_surrogate: Option<u16> = None;
     let mut truncated = false;
     let mut wire_total: Option<u64>;
+    let mut converted_bytes = 0_usize;
+    let mut converted_wire_read = 0;
 
     loop {
-        let chunk = runtime.block_on(client.read_active_plp_chunk(scratch))?;
+        let read_limit = if transcode_narrow_to_utf8 && !truncated {
+            capacity_elements
+                .saturating_sub(out_bytes.len())
+                .max(1)
+                .min(scratch.len())
+        } else {
+            scratch.len()
+        };
+        let chunk = runtime.block_on(client.read_active_plp_chunk(&mut scratch[..read_limit]))?;
         wire_total = chunk.known_total;
 
-        // Once the buffer is full the rest of the value still has to come off
-        // the wire, but decoding it would be pure waste.
         if truncated {
             if chunk.reached_end {
                 break;
@@ -1916,13 +1921,16 @@ unsafe fn deliver_bound_plp(
                 return Ok(RowOutcome::Error(RowIssue::Unsupported));
             };
             decoded_utf8.clear();
-            transcode_narrow_into_pending(
+            // This bound-only decoder is finalized exactly once, including
+            // when the PLP terminator arrives separately from the final bytes.
+            decode_narrow_into_pending(
                 decoder,
                 &mut decoded_utf8,
                 &scratch[..chunk.read],
                 chunk.reached_end,
-                usize::MAX,
             );
+            converted_bytes = converted_bytes.saturating_add(decoded_utf8.len());
+            converted_wire_read = chunk.total_read;
             // Whole characters only: a partial UTF-8 sequence left in the
             // caller's buffer would not decode.
             for ch in String::from_utf8_lossy(&decoded_utf8).chars() {
@@ -1933,6 +1941,22 @@ unsafe fn deliver_bound_plp(
                 } else {
                     truncated = true;
                     break;
+                }
+            }
+            if truncated && !chunk.reached_end {
+                // Finalize without replacement before abandoning the decoder.
+                // A trailing partial character is still unconverted source, not
+                // lost input or a synthetic U+FFFD. Malformed's two lengths count
+                // that sequence plus any source buffered after it (e.g. GB18030).
+                decoded_utf8.resize(decoder.max_utf8_buffer_length(0).unwrap_or(16), 0);
+                let (result, read, written) =
+                    decoder.decode_to_utf8_without_replacement(&[], &mut decoded_utf8, true);
+                debug_assert_eq!(read, 0);
+                debug_assert_ne!(result, encoding_rs::DecoderResult::OutputFull);
+                converted_bytes = converted_bytes.saturating_add(written);
+                if let encoding_rs::DecoderResult::Malformed(length, after) = result {
+                    converted_wire_read = converted_wire_read
+                        .saturating_sub(usize::from(length) + usize::from(after));
                 }
             }
         } else if let Some(decoder) = narrow_decoder.as_mut() {
@@ -2049,12 +2073,16 @@ unsafe fn deliver_bound_plp(
     unsafe {
         write_if_some(
             octet_length,
-            plp_indicator(
-                produced_bytes,
-                truncated,
-                transcode,
-                wire_total.map(|t| t.saturating_mul(hex_scale)),
-            ),
+            if truncated && transcode_narrow_to_utf8 {
+                converted_narrow_indicator(wire_total, converted_wire_read, converted_bytes)
+            } else {
+                plp_indicator(
+                    produced_bytes,
+                    truncated,
+                    transcode,
+                    wire_total.map(|t| t.saturating_mul(hex_scale)),
+                )
+            },
         )
     };
 
@@ -2589,6 +2617,183 @@ mod tests {
             }
             assert!(!dbc.runtime.block_on(client.next_row_cursor()).unwrap());
         }
+    }
+
+    #[test]
+    fn bound_narrow_plp_counts_dbcs_source_held_at_truncation() {
+        use mssql_mock_tds::{ColumnDefinition, ColumnValue, QueryResponse, Row, SqlDataType};
+        use mssql_tds::token::tokens::SqlCollation;
+
+        for (lcid, lead, trail) in [(0x0411, 0x82, 0xa0), (0x0804, 0xc4, 0xe3)] {
+            // The mock's raw-unit PLP carrier supplies A, two DBCS characters, a
+            // held lead byte | its trail byte, Z. Override only the converter's
+            // encoding metadata; PLP framing is identical for narrow text.
+            let first = vec![
+                u16::from_le_bytes([b'A', lead]),
+                u16::from_le_bytes([trail, lead]),
+                u16::from_le_bytes([trail, lead]),
+            ];
+            let tail = vec![u16::from_le_bytes([trail, b'Z'])];
+            let response = QueryResponse::new(
+                vec![
+                    ColumnDefinition::new("", SqlDataType::NVarCharMax),
+                    ColumnDefinition::new("", SqlDataType::Int),
+                ],
+                vec![Row::new(vec![
+                    ColumnValue::NVarCharMax(vec![first, tail]),
+                    ColumnValue::Int(42),
+                ])],
+            );
+            let h = TestHandles::with_env_dbc_stmt();
+            let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+            let _server = crate::test_support::connect_mock_server(dbc, "SELECT dbcs", response);
+            let mut state = dbc.inner.lock().unwrap();
+            let client = state.client.as_mut().unwrap();
+            for (capacity, expected_indicator) in [(1, 8), (2, 9), (4, 9), (7, 10)] {
+                dbc.runtime
+                    .block_on(client.execute("SELECT dbcs".to_string(), ()))
+                    .unwrap();
+                assert!(dbc.runtime.block_on(client.next_row_cursor()).unwrap());
+                assert!(matches!(
+                    dbc.runtime.block_on(client.read_row_column(0)).unwrap(),
+                    CursorColumn::PlpStreaming { .. }
+                ));
+                let mut output = [0xcc_u8; 8];
+                let mut indicator = -99;
+                let binding = binding(
+                    1,
+                    SQL_C_CHAR,
+                    output.as_mut_ptr().cast(),
+                    capacity,
+                    &mut indicator,
+                );
+                let mut scratch = [0; 6];
+                let outcome = unsafe {
+                    deliver_bound_plp(
+                        client,
+                        &dbc.runtime,
+                        &binding,
+                        0,
+                        0,
+                        Some(PlpColumnInfo {
+                            wire_encoding: PlpEncoding::SingleByteText,
+                            text_encoding: Some(EncodingType::LcidBased(SqlCollation {
+                                info: lcid,
+                                lcid_language_id: lcid as i32,
+                                col_flags: 0,
+                                sort_id: 0,
+                            })),
+                        }),
+                        &mut scratch,
+                    )
+                }
+                .unwrap();
+                assert_eq!(outcome, RowOutcome::Info(RowIssue::StringTruncated));
+                assert_eq!(
+                    indicator, expected_indicator,
+                    "converted prefix + unconverted source"
+                );
+                assert_eq!(output[capacity as usize], 0xcc);
+                if capacity == 1 {
+                    assert_eq!(output[0], 0);
+                } else if capacity == 7 {
+                    let expected = if lcid == 0x0411 { "Aあ\0" } else { "A你\0" };
+                    assert_eq!(&output[..5], expected.as_bytes());
+                } else {
+                    assert_eq!(&output[..2], b"A\0");
+                }
+                assert!(matches!(
+                    dbc.runtime.block_on(client.read_row_column(1)).unwrap(),
+                    CursorColumn::Value {
+                        value: ColumnValues::Int(42),
+                        ..
+                    }
+                ));
+                assert!(!dbc.runtime.block_on(client.next_row_cursor()).unwrap());
+            }
+        }
+    }
+
+    #[test]
+    fn bound_narrow_plp_estimates_expanding_tail_without_resuming_output() {
+        use mssql_mock_tds::{ColumnDefinition, ColumnValue, QueryResponse, Row, SqlDataType};
+        use mssql_tds::token::tokens::SqlCollation;
+
+        // Raw PLP bytes carry CP1252 euros followed by ASCII in a later read.
+        // The second euro cannot fit, but a later ASCII byte could fill the gap.
+        let response = QueryResponse::new(
+            vec![
+                ColumnDefinition::new("", SqlDataType::NVarCharMax),
+                ColumnDefinition::new("", SqlDataType::Int),
+            ],
+            vec![Row::new(vec![
+                ColumnValue::NVarCharMax(vec![
+                    vec![u16::from_le_bytes([0x80, 0x80])],
+                    vec![u16::from_le_bytes(*b"ab")],
+                    vec![u16::from_le_bytes([0x80, 0x80]); 1_500],
+                ]),
+                ColumnValue::Int(42),
+            ])],
+        );
+        let h = TestHandles::with_env_dbc_stmt();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let _server = crate::test_support::connect_mock_server(dbc, "SELECT euros", response);
+        let mut state = dbc.inner.lock().unwrap();
+        let client = state.client.as_mut().unwrap();
+        dbc.runtime
+            .block_on(client.execute("SELECT euros".to_string(), ()))
+            .unwrap();
+        assert!(dbc.runtime.block_on(client.next_row_cursor()).unwrap());
+        assert!(matches!(
+            dbc.runtime.block_on(client.read_row_column(0)).unwrap(),
+            CursorColumn::PlpStreaming { .. }
+        ));
+        let mut output = [0xcc_u8; 7];
+        let mut indicator = -99;
+        let binding = binding(
+            1,
+            SQL_C_CHAR,
+            unsafe { output.as_mut_ptr().add(1).cast() },
+            5,
+            &mut indicator,
+        );
+        let mut scratch = [0; 2];
+        let outcome = unsafe {
+            deliver_bound_plp(
+                client,
+                &dbc.runtime,
+                &binding,
+                0,
+                0,
+                Some(PlpColumnInfo {
+                    wire_encoding: PlpEncoding::SingleByteText,
+                    text_encoding: Some(EncodingType::LcidBased(SqlCollation {
+                        info: 0x0409,
+                        lcid_language_id: 0x0409,
+                        col_flags: 0,
+                        sort_id: 0,
+                    })),
+                }),
+                &mut scratch,
+            )
+        }
+        .unwrap();
+        assert_eq!(outcome, RowOutcome::Info(RowIssue::StringTruncated));
+        assert_eq!(&output[1..5], b"\xe2\x82\xac\0");
+        assert_eq!(output[0], 0xcc);
+        assert_eq!(output[6], 0xcc);
+        assert_eq!(
+            indicator, 3_008,
+            "six converted bytes + two ASCII bytes + 3,000 unread euro bytes, not 9,008"
+        );
+        assert!(matches!(
+            dbc.runtime.block_on(client.read_row_column(1)).unwrap(),
+            CursorColumn::Value {
+                value: ColumnValues::Int(42),
+                ..
+            }
+        ));
+        assert!(!dbc.runtime.block_on(client.next_row_cursor()).unwrap());
     }
 
     /// The `uniqueidentifier` SQL type, the only default-resolved target wide
