@@ -395,7 +395,10 @@ with an explicit, possibly reassociated descriptor. This is tracked in
 - If an e2e test asserts mssql-odbc-specific behavior the full msodbcsql driver
   does not share (e.g. a Phase-1 "not implemented" response), start it with the
   `SKIP_IF_COMPARING_MSODBCSQL()` macro so it self-skips on the msodbcsql leg of
-  a `--compare-with-msodbcsql` run instead of failing the parity binary.
+  a `--compare-with-msodbcsql` run instead of failing the parity binary. That is
+  the first of the three reasons the macro is admissible; see §2.1 for the other
+  two and for the preference against skipping when the test exists solely to pin
+  one registered divergence.
 - Every new `SQLXxx` function must have at least:
   - A success-path test.
   - A null-output-handle test.

@@ -4,7 +4,11 @@
 //! Implementation of SQLSetEnvAttr.
 //!
 //! Mirrors msodbcsql's `SQLSetEnvAttr`, replacing its internal options table
-//! with typed fields on `EnvState`. The DM owns HY010 enforcement.
+//! with typed fields on `EnvState`. The Driver Manager gates
+//! `SQLAllocHandle(SQL_HANDLE_DBC)` on the version *it* recorded, not on the
+//! driver's; because rejecting `SQL_OV_ODBC2` here leaves this driver's
+//! environment `Unset` while the DM's is `2`, `alloc_handle::alloc_dbc`
+//! enforces `HY010` independently. See registry entry 14.
 
 use tracing::{debug, error};
 
@@ -74,21 +78,32 @@ fn sql_set_env_attr_safe(
 
     free_errors(&mut state);
 
-    // ODBC tagged-pointer: integer values arrive as `(SQLPOINTER)(uintptr_t)value`.
-    let value = value_ptr as usize as u32;
-
     match attribute {
-        SQL_ATTR_ODBC_VERSION => match OdbcVersion::try_from(value) {
-            Ok(v) => {
-                state.odbc_version = v;
-                SQL_SUCCESS
+        SQL_ATTR_ODBC_VERSION => {
+            // ODBC tagged-pointer: integer values arrive as
+            // `(SQLPOINTER)(uintptr_t)value`. Narrow with `try_into` rather
+            // than `as`: on a 64-bit target a truncating cast would let a
+            // value whose high half is set — say `0x1_0000_0003` — arrive as a
+            // legitimate `SQL_OV_ODBC3`. No Driver Manager produces that, but
+            // §2.2 and registry entry 14 state that every value other than the
+            // two supported versions is `HY024`, and a truncating cast would
+            // not quite deliver it.
+            let raw = value_ptr as usize;
+            let version = u32::try_from(raw)
+                .ok()
+                .and_then(|v| OdbcVersion::try_from(v).ok());
+            match version {
+                Some(v) => {
+                    state.odbc_version = v;
+                    SQL_SUCCESS
+                }
+                None => {
+                    error!(raw, "SQLSetEnvAttr: invalid ODBC_VERSION value");
+                    post_diag(&mut state, ERR_INVALID_ATTRIBUTE_VALUE);
+                    SQL_ERROR
+                }
             }
-            Err(()) => {
-                error!(value, "SQLSetEnvAttr: invalid ODBC_VERSION value");
-                post_diag(&mut state, ERR_INVALID_ATTRIBUTE_VALUE);
-                SQL_ERROR
-            }
-        },
+        }
         _ => {
             error!(attribute, "SQLSetEnvAttr: unknown attribute");
             post_diag(&mut state, ERR_INVALID_ATTRIBUTE_IDENTIFIER);
@@ -145,6 +160,34 @@ mod tests {
         assert_eq!(
             env_ref.inner.lock().unwrap().odbc_version,
             OdbcVersion::Odbc3
+        );
+        free_env(env);
+    }
+
+    /// The exported path narrows the tagged pointer to `u32` before matching a
+    /// version, so a 64-bit value whose low half looks supported must still be
+    /// rejected — otherwise §2.2's "every other value is `HY024`" would not
+    /// hold on the export, only on `OdbcVersion::try_from`.
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn set_odbc_version_rejects_a_value_wider_than_32_bits() {
+        let env = alloc_env();
+        assert_eq!(
+            set_attr(env, SQL_ATTR_ODBC_VERSION, SQL_OV_ODBC3_80),
+            SQL_SUCCESS
+        );
+
+        let tagged = 0x1_0000_0000usize | SQL_OV_ODBC3 as usize;
+        let ret = unsafe {
+            crate::api::exports::SQLSetEnvAttr(env, SQL_ATTR_ODBC_VERSION, tagged as SqlPointer, 0)
+        };
+        assert_eq!(ret, SQL_ERROR, "the low half must not be read in isolation");
+
+        let env_ref = unsafe { &*(env as *const EnvHandle) };
+        assert_eq!(
+            env_ref.inner.lock().unwrap().odbc_version,
+            OdbcVersion::Odbc3_80,
+            "a rejected value must leave the prior version intact"
         );
         free_env(env);
     }

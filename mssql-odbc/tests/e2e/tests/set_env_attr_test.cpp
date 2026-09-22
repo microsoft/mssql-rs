@@ -9,8 +9,9 @@
 //   5. SetUnknownAttribute      - unknown attribute -> error
 //   6. SetVersionOverwrites     - subsequent SQLSetEnvAttr replaces prior value
 //   6a. Odbc2ApplicationIsRefused - the DM forwards SQL_OV_ODBC2 rather than
-//                                 mapping it, and the driver refuses at
-//                                 connect time (IM005 or HY024, per DM)
+//                                 mapping it; mssql-odbc refuses at connect
+//                                 (IM005 or HY024, per DM) while msodbcsql
+//                                 connects - both legs asserted
 //   6b. Odbc3ApplicationConnectsAndQueries - the same sequence under 3.80
 //                                 connects and queries
 //   7. SetVersionThenAllocDbc   - happy path exercising the AllocHandle gate
@@ -18,6 +19,7 @@
 
 #include "odbc_test_fixture.h"
 
+#include <cstdlib>
 #include <string>
 
 // All tests manage their own HENV - do NOT use the ODBCTest fixture which
@@ -134,43 +136,39 @@ TEST_F(SetEnvAttrTest, SetVersionOverwrites) {
 // it the 3.x contract it never asked for - COLUMN_SIZE where it expects
 // PRECISION, 91/92/93 where it expects 9/10/11.
 //
-// msodbcsql accepts the declaration and connects, so this asserts
-// mssql-odbc-specific behavior the reference does not share at all; that is the
-// first admissible reason for the skip macro in instructions.md 2.1. Registry
-// entry 14 records the divergence.
+// The divergence itself is measured rather than skipped: msodbcsql accepts the
+// declaration and connects, so the msodbcsql leg asserts a *successful* connect
+// while the mssql-odbc leg asserts the refusal. That is what registry entry 14
+// claims - "a real ODBC 2.x application works against msodbcsql and cannot
+// connect at all against this driver" - and asserting per leg is what §2.1
+// prefers for a test that exists solely to pin one registered divergence.
+// EmptyVariantProbeReturnsSuccessWithoutWarning (entry 13) is the precedent.
 // -------------------------------------------------------------------
 TEST_F(SetEnvAttrTest, Odbc2ApplicationIsRefused) {
-    SKIP_IF_COMPARING_MSODBCSQL();
     if (!ODBCTestConfig::Instance().HasConnection()) {
         GTEST_SKIP() << "No connection configured - set ODBC_TEST_DSN, "
                         "ODBC_TEST_SERVER, or ODBC_TEST_CONNSTR";
     }
+    const char* target = std::getenv("ODBC_TEST_TARGET");
+    const bool comparing_msodbcsql = target && std::string(target) == "msodbcsql";
 
     // The DM stores the declaration and reports success to the application.
     ASSERT_SQL_OK(SetVersion(SQL_OV_ODBC2), SQL_HANDLE_ENV, henv_);
 
     // Still the DM's own handle - no driver has been selected or loaded yet,
-    // so this says nothing about the driver and must succeed.
+    // so this says nothing about the driver and must succeed on both legs.
     SQLHDBC hdbc = SQL_NULL_HDBC;
     ASSERT_SQL_OK(SQLAllocHandle(SQL_HANDLE_DBC, henv_, &hdbc), SQL_HANDLE_ENV, henv_);
 
     // unixODBC services SQLAllocHandle(SQL_HANDLE_DBC) entirely inside the DM
     // — its only gate is `requested_version == 0` and no driver is consulted —
-    // so the call above proves nothing about this driver. The driver is loaded
-    // at SQLDriverConnect, where the DM replays the environment onto it
+    // so the call above proves nothing about either driver. The driver is
+    // loaded at SQLDriverConnect, where the DM replays the environment onto it
     // (SQLConnect.c:1532-1538, passing the application's value verbatim rather
-    // than mapping it), our SQLSetEnvAttr rejects SQL_OV_ODBC2, and the
-    // driver-side allocation at :1599 reaches our SQLAllocHandle(DBC), which
-    // refuses. unixODBC posts its own IM005 at :1613-1616.
-    //
-    // The SQLSTATE the application reads is Driver-Manager-specific, measured
-    // in build 176958: unixODBC reports IM005, "Driver's SQLAllocHandle on
-    // SQL_HANDLE_DBC failed", wrapping our HY010 from the refused allocation;
-    // the Windows Driver Manager propagates our HY024 from the rejected
-    // SQLSetEnvAttr instead. Both mean the same thing - the driver declined
-    // the declaration and the connection did not open - so accept either
-    // rather than pinning one platform's wrapping. What must hold everywhere
-    // is that the connect failed.
+    // than mapping it). msodbcsql accepts SQL_OV_ODBC2 there and connects;
+    // this driver rejects it, so the driver-side allocation at :1599 reaches
+    // our SQLAllocHandle(DBC), which refuses, and unixODBC posts IM005 at
+    // :1613-1616.
     SqlTString connstr = ODBCTestUtils::BuildConnectionString();
     SQLTCHAR outStr[1024] = {};
     SQLSMALLINT outLen = 0;
@@ -180,19 +178,34 @@ TEST_F(SetEnvAttrTest, Odbc2ApplicationIsRefused) {
                                     outStr,
                                     static_cast<SQLSMALLINT>(sizeof(outStr) / sizeof(SQLTCHAR)),
                                     &outLen, SQL_DRIVER_NOPROMPT);
-    EXPECT_EQ(SQL_ERROR, rc)
-        << "a 2.x declaration must not yield a usable connection; if this "
-           "succeeded, the Driver Manager mapped SQL_OV_ODBC2 to SQL_OV_ODBC3 "
-           "before the driver saw it";
 
-    const std::string firstState = ODBCTestUtils::GetDiagState(SQL_HANDLE_DBC, hdbc);
-    const bool refused = ODBCTestUtils::HasDiagState(SQL_HANDLE_DBC, hdbc, "IM005") ||
-                         ODBCTestUtils::HasDiagState(SQL_HANDLE_DBC, hdbc, "HY024");
-    EXPECT_TRUE(refused)
-        << "expected the Driver Manager to report the driver's refusal as "
-           "IM005 (unixODBC, wrapping our HY010) or HY024 (Windows DM, "
-           "propagating our SQLSetEnvAttr rejection); first record was "
-        << firstState;
+    if (comparing_msodbcsql) {
+        // The other half of entry 14, and the reason the divergence matters:
+        // the same 2.x application msodbcsql serves is the one this driver
+        // turns away.
+        ASSERT_SQL_OK(rc, SQL_HANDLE_DBC, hdbc);
+        SQLDisconnect(hdbc);
+    } else {
+        EXPECT_EQ(SQL_ERROR, rc)
+            << "a 2.x declaration must not yield a usable connection; if this "
+               "succeeded, the Driver Manager mapped SQL_OV_ODBC2 to "
+               "SQL_OV_ODBC3 before the driver saw it";
+
+        // The SQLSTATE is Driver-Manager-specific, measured in build 176958:
+        // unixODBC reports IM005, "Driver's SQLAllocHandle on SQL_HANDLE_DBC
+        // failed", wrapping our HY010 from the refused allocation; the Windows
+        // DM propagates our HY024 from the rejected SQLSetEnvAttr instead.
+        // Both mean the driver declined and the connection did not open, so
+        // accept either rather than pinning one platform's wrapping.
+        const std::string firstState = ODBCTestUtils::GetDiagState(SQL_HANDLE_DBC, hdbc);
+        const bool refused = ODBCTestUtils::HasDiagState(SQL_HANDLE_DBC, hdbc, "IM005") ||
+                             ODBCTestUtils::HasDiagState(SQL_HANDLE_DBC, hdbc, "HY024");
+        EXPECT_TRUE(refused)
+            << "expected the Driver Manager to report the driver's refusal as "
+               "IM005 (unixODBC, wrapping our HY010) or HY024 (Windows DM, "
+               "propagating our SQLSetEnvAttr rejection); first record was "
+            << firstState;
+    }
 
     SQLFreeHandle(SQL_HANDLE_DBC, hdbc);
 }

@@ -371,9 +371,14 @@ msodbcsql build is measured.
    exact match (line 587). **A real ODBC 2.x application therefore works
    against msodbcsql and cannot connect at all against this driver.** That is
    the intended consequence of not supporting ODBC 2.x, not an oversight.
-   `Odbc2ApplicationIsRefused` pins it end to end and doubles as the proof
+   `Odbc2ApplicationIsRefused` measures both halves rather than skipping the
+   reference leg: on the msodbcsql leg it asserts the connect *succeeds*, on
+   the mssql-odbc leg that it is refused. The bolded claim above is therefore
+   re-measured on every `--compare-with-msodbcsql` run instead of resting on a
+   source reading, which is what §2.1 prefers for a test that exists solely to
+   pin one registered divergence. It also doubles as the proof
    that the Driver Manager does not convert 2 to 3 — were it to convert, the
-   version would arrive as `SQL_OV_ODBC3` and the connect would succeed.
+   version would arrive as `SQL_OV_ODBC3` and both legs would connect.
    `Odbc3ApplicationConnectsAndQueries` runs the identical sequence under
    `SQL_OV_ODBC3_80` to show the refusal is keyed on the declared version
    rather than the fixture, and `SetGetOdbcVersion2` covers only the Driver
