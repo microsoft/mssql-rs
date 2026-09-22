@@ -266,12 +266,26 @@ msodbcsql build is measured.
 12. A `datetimeoffset` value converted to any target other than
    `SQL_C_SS_TIMESTAMPOFFSET` retains its written wall-clock fields after the
    offset is validated. msodbcsql instead shifts those fields into the client
-   machine's local time zone through `ConvertOffsetToLocal`. Matching that
+   machine's local time zone through `ConvertOffsetToLocal`
+   (`odbc/sqlccnvt.cpp`, defined at line 9084 and called from the conversion
+   paths at lines 3926 and 4836). Matching that
    behavior would make the returned value depend on the client machine's time
    zone, so this driver deliberately ignores the offset for non-offset
    targets. `offset_is_ignored_for_non_offset_targets` pins parsed character
    input, and `DatetimeoffsetIntoSsTime2Succeeds` pins a native
    `datetimeoffset` column while skipping the msodbcsql comparison leg.
+
+   Evidence level: source reading only. No `SQL_DRIVER_VER` or tested build is
+   recorded, and unlike entry 14 nothing prevents measuring this — the
+   divergence is reachable through a Driver Manager, so a
+   `--compare-with-msodbcsql` case that fetches a `datetimeoffset` into a
+   non-offset target on an agent whose time zone is not UTC would close it.
+   That case does not exist yet: the Rust test covers only this driver, and the
+   e2e case skips the reference leg. The claim predates this change — it was
+   carried over verbatim from the deviation table in
+   `docs/typed-columnar-fetch-plan.md`, which recorded the same behavior, the
+   same citations and the same skipped leg — so promoting it into this registry
+   neither introduced nor closed the gap.
 
    This policy applies to both bound-column and `SQLGetData` conversions.
 13. A zero-length `SQL_C_BINARY` probe of a `sql_variant` wrapping an empty
