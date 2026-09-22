@@ -366,14 +366,11 @@ pub(crate) fn datetime2_parts(datetime: &SqlDateTime2) -> Result<DateTimeParts, 
 pub(crate) fn datetimeoffset_parts(
     datetime: &SqlDateTimeOffset,
 ) -> Result<DateTimeParts, ConvError> {
-    if i64::from(datetime.datetime2.days) > MAX_DAYS_SINCE_0001
-        || datetime.datetime2.time.scale > 7
-        || datetime.datetime2.time.time_nanoseconds >= TICKS_PER_DAY.unsigned_abs()
-        || !(-840..=840).contains(&datetime.offset)
-    {
+    datetime2_parts(&datetime.datetime2)?;
+    if !(-840..=840).contains(&datetime.offset) {
         return Err(ConvError::InvalidDatetimeFormat);
     }
-    // The guards above make these overflow errors unreachable. Keep checked
+    // The validation above makes these overflow errors unreachable. Keep checked
     // arithmetic as a defensive backstop, mapped to CVT_DT_OVERFLOW / 22008
     // rather than invalid decoded fields / 22007 (sqlcprot.h; clntcomn.cpp).
     let utc_ticks = i64::try_from(datetime.datetime2.time.time_nanoseconds)

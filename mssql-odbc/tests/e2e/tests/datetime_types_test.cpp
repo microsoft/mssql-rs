@@ -98,7 +98,7 @@ protected:
                                             + sql_type + ")"),
                                   SQL_HANDLE_STMT, stmt_);
                     alignas(SQL_SS_TIMESTAMPOFFSET_STRUCT) std::array<unsigned char, 32> out{};
-                    SQLLEN indicator = -42;
+                    SQLLEN indicator = 0;
                     if (bound) {
                         ASSERT_SQL_OK(SQLBindCol(stmt_, 1, target, out.data(), out.size(),
                                                 &indicator),
@@ -110,6 +110,8 @@ protected:
                                                        out.size(), &indicator));
                     }
                     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "22018");
+                    // ODBC leaves out/indicator undefined on SQL_ERROR; preservation
+                    // is a Rust regression assertion, not a retail parity contract.
                     ASSERT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
                     ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_UNBIND), SQL_HANDLE_STMT, stmt_);
                 }
