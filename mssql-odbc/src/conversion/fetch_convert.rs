@@ -318,10 +318,15 @@ pub(crate) fn date_parts(date: &SqlDate) -> Result<DateTimeParts, ConvError> {
     checked_date_parts(i64::from(date.get_days()))
 }
 
-fn checked_date_parts(days: i64) -> Result<DateTimeParts, ConvError> {
+fn validate_date_days(days: i64) -> Result<(), ConvError> {
     if !(0..=MAX_DAYS_SINCE_0001).contains(&days) {
         return Err(ConvError::InvalidDatetimeFormat);
     }
+    Ok(())
+}
+
+fn checked_date_parts(days: i64) -> Result<DateTimeParts, ConvError> {
+    validate_date_days(days)?;
     let date = civil_from_days_since_0001(days);
     Ok(DateTimeParts {
         year: date.year,
@@ -332,11 +337,16 @@ fn checked_date_parts(days: i64) -> Result<DateTimeParts, ConvError> {
     })
 }
 
-/// Converts a TDS `time` into normalized clock fields.
-pub(crate) fn time_parts(time: &SqlTime) -> Result<DateTimeParts, ConvError> {
+fn validate_time_fields(time: &SqlTime) -> Result<(), ConvError> {
     if time.scale > 7 || time.time_nanoseconds >= TICKS_PER_DAY.unsigned_abs() {
         return Err(ConvError::InvalidDatetimeFormat);
     }
+    Ok(())
+}
+
+/// Converts a TDS `time` into normalized clock fields.
+pub(crate) fn time_parts(time: &SqlTime) -> Result<DateTimeParts, ConvError> {
+    validate_time_fields(time)?;
     let t = hms_from_ticks_100ns(time.time_nanoseconds);
     Ok(DateTimeParts {
         hour: t.hour,
@@ -366,7 +376,8 @@ pub(crate) fn datetime2_parts(datetime: &SqlDateTime2) -> Result<DateTimeParts, 
 pub(crate) fn datetimeoffset_parts(
     datetime: &SqlDateTimeOffset,
 ) -> Result<DateTimeParts, ConvError> {
-    datetime2_parts(&datetime.datetime2)?;
+    validate_date_days(i64::from(datetime.datetime2.days))?;
+    validate_time_fields(&datetime.datetime2.time)?;
     if !(-840..=840).contains(&datetime.offset) {
         return Err(ConvError::InvalidDatetimeFormat);
     }
