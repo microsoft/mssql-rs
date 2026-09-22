@@ -30,7 +30,7 @@ use crate::handles::stmt::{ActivePlpStream, STMT_STATE_CURSOR_OPEN, StmtState};
 use crate::handles::{HandleType, OdbcVersion, StmtHandle, handle_from_raw};
 use mssql_tds::connection::tds_client::{CursorColumn, CursorPoll, PlpChunk};
 use mssql_tds::core::TdsResult;
-use mssql_tds::encoding_rs::{self, Decoder};
+use mssql_tds::encoding_rs;
 
 use crate::conversion::error::{ConvError, ConvOk};
 use crate::conversion::fetch_convert::{
@@ -41,7 +41,7 @@ use crate::conversion::fetch_convert::{
 };
 use mssql_tds::datatypes::column_values::ColumnValues;
 use mssql_tds::datatypes::decoder::DECIMAL_STR_LEN;
-use mssql_tds::datatypes::sql_string::EncodingType;
+use mssql_tds::datatypes::sql_string::{EncodingType, ResolvedDecoder, ResolvedEncoding};
 use mssql_tds::query::metadata::PlpEncoding;
 
 /// Maximum speculative PLP read-ahead retained by one `SQLGetData` stream.
@@ -1635,12 +1635,7 @@ fn stream_active_plp_chunk<'a>(
     buffer_length: SqlLen,
     strlen_or_ind_ptr: *mut SqlLen,
     mut starting_new_stream: bool,
-    mut prepared_stream: Option<(
-        PlpEncoding,
-        usize,
-        usize,
-        Option<&'static encoding_rs::Encoding>,
-    )>,
+    mut prepared_stream: Option<(PlpEncoding, usize, usize, Option<ResolvedEncoding>)>,
     mut retained_stmt_state: Option<MutexGuard<'a, StmtState>>,
 ) -> SqlReturn {
     let mut progress = PlpReadProgress::default();
@@ -1675,12 +1670,7 @@ fn stream_active_plp_chunk_once<'a>(
     buffer_length: SqlLen,
     strlen_or_ind_ptr: *mut SqlLen,
     starting_new_stream: bool,
-    prepared_stream: Option<(
-        PlpEncoding,
-        usize,
-        usize,
-        Option<&'static encoding_rs::Encoding>,
-    )>,
+    prepared_stream: Option<(PlpEncoding, usize, usize, Option<ResolvedEncoding>)>,
     mut retained_stmt_state: Option<MutexGuard<'a, StmtState>>,
     progress: &mut PlpReadProgress,
 ) -> SqlReturn {
@@ -1778,15 +1768,11 @@ fn stream_active_plp_chunk_once<'a>(
                 // across the FFI boundary is UB.
                 let narrow_encoding = match encoding {
                     // json is UTF-8 on the wire and carries no collation.
-                    PlpEncoding::Utf8Text => Some(encoding_rs::UTF_8),
+                    PlpEncoding::Utf8Text => Some(encoding_rs::UTF_8.into()),
                     PlpEncoding::SingleByteText => column_meta
                         .and_then(|m| m.get_collation())
                         .and_then(|collation| {
-                            if collation.utf8() {
-                                Some(encoding_rs::UTF_8)
-                            } else {
-                                EncodingType::LcidBased(collation).encoding()
-                            }
+                            EncodingType::LcidBased(collation).resolved_encoding()
                         }),
                     _ => None,
                 };
@@ -1880,7 +1866,7 @@ fn stream_active_plp_chunk_once<'a>(
     // into U+FFFD.
     let transcode_narrow_to_utf8 = target_type == SQL_C_CHAR
         && matches!(plp_encoding, Some(PlpEncoding::SingleByteText))
-        && narrow_encoding.is_some_and(|encoding| encoding != encoding_rs::UTF_8);
+        && narrow_encoding.is_some_and(|encoding| encoding != encoding_rs::UTF_8.into());
     // SQL_C_WCHAR delivery of a narrow (codepage or UTF-8) PLP column must
     // widen on the fly. Mirrors the compatibility gate above so the two cannot
     // drift: a Binary column never reaches here.
@@ -2676,14 +2662,14 @@ fn stream_active_plp_chunk_once<'a>(
             0
         };
         if progress.retry_bytes == 0
-            && widen_narrow_to_utf16
+            && (widen_narrow_to_utf16 || transcode_utf16_to_utf8 || transcode_narrow_to_utf8)
             && stream.pending_units.is_empty()
             && stream.pending_bytes.is_empty()
         {
             // Multibyte input can leave output slots unused by the conservative
             // wire budget. Refill only those slots before reporting truncation.
             progress.retry_bytes =
-                payload_capacity.saturating_sub(chunk_written) / std::mem::size_of::<SqlWChar>();
+                max_read_for(payload_capacity.saturating_sub(chunk_written), 0, 0);
         }
         if progress.retry_bytes > 0 {
             return SQL_SUCCESS_WITH_INFO;
@@ -2744,30 +2730,9 @@ fn stream_active_plp_chunk_once<'a>(
     // same reason: delivered UTF-16 code units are not wire bytes, so it reports
     // SQL_NO_TOTAL too.
     //
-    // The codepage varchar->SQL_C_CHAR conversion does NOT, even though it also
-    // transcodes. msodbcsql keys this decision on the C types, not on whether a
-    // conversion happens: `sqlcdata.h:1230` takes CHAR->CHAR on the first branch
-    // and reports `cbDataAvail` on an explicit "assume a 1:1 conversion ratio"
-    // comment, reaching `VARMAX_LENGTH_UNLIMITED`/SQL_NO_TOTAL only on the
-    // CHAR<->WCHAR branch below it. So a `varchar(max)` read as SQL_C_CHAR keeps
-    // its concrete wire-byte count under every collation. `PlpKnownLengthIndicatorCountsDown`
-    // and `ABoundVarcharMaxTruncatedReportsFullLength` are unskipped cross-leg
-    // parity tests that measure exactly this, and they hold msodbcsql to it.
-    //
-    // Decoded output can outlive the wire, so the carry is added to the wire
-    // count: converting fills `pending_utf8` faster than a small caller buffer
-    // drains it, and once the wire is exhausted the wire term alone is 0. Without
-    // this a drain-only call would report "0 bytes remaining" alongside the
-    // 01004 truncation warning it returns below -- self-contradictory, and it
-    // strands a caller that sizes its next buffer from the indicator rather than
-    // looping on the return code. This is also the term msodbcsql carries as
-    // `cbTruncatedCharsInConvBuf` in the same `sqlcdata.h:1230` expression.
-    //
-    // `carry_before` is the carry as it stood at entry, which is the value
-    // this indicator is defined in terms of: `wire_remaining` already includes
-    // the bytes read by this call, and the post-drain carry holds output decoded
-    // from those same bytes, so reading it after the fact would count this
-    // call's read twice. Widening reports SQL_NO_TOTAL instead.
+    // CHAR->CHAR estimates unread wire bytes 1:1, but counts already converted
+    // bytes in their output encoding, including carry drained after a switch.
+    // Replayed source prefixes have already been removed from total_read.
     //
     // WCHAR on a UTF-16 source follows msodbcsql's !fConvNeeded branch in
     // InternalGetColData: truncation reports only the wire length, even when
@@ -2781,10 +2746,23 @@ fn stream_active_plp_chunk_once<'a>(
     };
     let remaining_indicator = if transcode_utf16_to_utf8 || widen_narrow_to_utf16 {
         SQL_NO_TOTAL
+    } else if transcode_narrow_to_utf8 {
+        let pending = stmt_state.active_plp.as_ref().map_or(0, |s| {
+            s.pending_bytes
+                .len()
+                .saturating_add(s.pending_units.len().saturating_mul(2))
+        });
+        converted_narrow_indicator(
+            known_total,
+            total_read,
+            progress.written.saturating_add(pending),
+        )
     } else if let Some(total) = known_total {
         let consumed_before = total_read.saturating_sub(progress.wire_read) as u64;
         let wire_remaining = total.saturating_sub(consumed_before);
-        (wire_remaining.saturating_add(held_converted_bytes) as SqlLen).saturating_mul(hex_scale)
+        SqlLen::try_from(wire_remaining.saturating_add(held_converted_bytes))
+            .unwrap_or(SqlLen::MAX)
+            .saturating_mul(hex_scale)
     } else {
         SQL_NO_TOTAL
     };
@@ -2794,12 +2772,23 @@ fn stream_active_plp_chunk_once<'a>(
     SQL_SUCCESS_WITH_INFO
 }
 
-fn narrow_decoder_has_partial_character(decoder: &Decoder) -> bool {
-    // All narrow SQL encodings are ASCII-compatible and BOM handling is off.
-    // On empty input this query reports only whether the decoder is neutral;
-    // call it before finalization, since a finished decoder cannot be queried.
-    debug_assert!(decoder.encoding().is_ascii_compatible());
-    decoder.latin1_byte_compatible_up_to(&[]).is_none()
+fn narrow_decoder_has_partial_character(decoder: &ResolvedDecoder) -> bool {
+    decoder.has_pending_narrow_character()
+}
+
+/// Converted bytes include both emitted output and decoded bytes withheld by
+/// truncation. `total_read` must precede any discard-only drain of the wire.
+/// Bound delivery also excludes any unconverted source abandoned in its decoder.
+pub(crate) fn converted_narrow_indicator(
+    known_total: Option<u64>,
+    total_read: usize,
+    converted_bytes: usize,
+) -> SqlLen {
+    known_total.map_or(SQL_NO_TOTAL, |total| {
+        let remaining = total.saturating_sub(u64::try_from(total_read).unwrap_or(u64::MAX));
+        let converted = u64::try_from(converted_bytes).unwrap_or(u64::MAX);
+        SqlLen::try_from(remaining.saturating_add(converted)).unwrap_or(SqlLen::MAX)
+    })
 }
 
 /// Decodes one chunk of narrow PLP wire bytes to UTF-16 for `SQL_C_WCHAR`
@@ -2815,7 +2804,7 @@ fn narrow_decoder_has_partial_character(decoder: &Decoder) -> bool {
 /// the wire and the caller advance at rates that are unrelated when the
 /// encoding is variable-width.
 pub(crate) fn widen_into_pending(
-    decoder: &mut Decoder,
+    decoder: &mut ResolvedDecoder,
     pending: &mut Vec<u16>,
     payload: &[u8],
     reached_end: bool,
@@ -2892,20 +2881,12 @@ fn narrow_max_read(payload_capacity: usize, pending_utf8_len: usize) -> usize {
 /// and the caller advance at unrelated rates once the encoding is
 /// variable-width on either side.
 pub(crate) fn transcode_narrow_into_pending(
-    decoder: &mut Decoder,
+    decoder: &mut ResolvedDecoder,
     pending: &mut Vec<u8>,
     payload: &[u8],
     reached_end: bool,
     out_bytes: usize,
 ) -> usize {
-    // Decode onto the tail of `pending`, sized by the decoder's own worst-case
-    // bound so the output slice cannot be short: the consumed-byte count is
-    // discarded below, so `OutputFull` would drop wire bytes silently.
-    // `max_utf8_buffer_length` also accounts for a partial sequence the decoder
-    // is already holding, which a fixed ratio could not. `None` means the length
-    // would overflow `usize`, unreachable while the read is bounded by the
-    // caller's buffer.
-    //
     // `reached_end` flushes any half-formed sequence to U+FFFD, and the decoder
     // must not be used afterwards. Once the wire is exhausted there is nothing
     // left to feed it, so later calls only drain what is already decoded.
@@ -2916,24 +2897,33 @@ pub(crate) fn transcode_narrow_into_pending(
     // than replaced. Same shape as `widen_into_pending` above, which has carried
     // this guard since before this path existed; tracked in AB#48073.
     if !(payload.is_empty() && reached_end) {
-        let base = pending.len();
-        let headroom = decoder
-            .max_utf8_buffer_length(payload.len())
-            .unwrap_or_else(|| payload.len().saturating_mul(3).saturating_add(3));
-        pending.resize(base + headroom, 0);
-        let (result, _, written, _) =
-            decoder.decode_to_utf8(payload, &mut pending[base..], reached_end);
-        debug_assert_eq!(
-            result,
-            encoding_rs::CoderResult::InputEmpty,
-            "narrow transcode output slice was too short, so input bytes were dropped"
-        );
-        pending.truncate(base + written);
+        decode_narrow_into_pending(decoder, pending, payload, reached_end);
     }
     // A character may be split across two SQLGetData calls at the byte level,
     // exactly as the UTF-16 transcode does it: the application concatenates the
     // chunks, so a boundary anywhere in the byte stream is lossless.
     out_bytes.min(pending.len())
+}
+
+/// Appends all decoded output, finalizing the decoder when `last` is true.
+/// The caller must not reuse a finalized decoder, even for an empty input.
+pub(crate) fn decode_narrow_into_pending(
+    decoder: &mut ResolvedDecoder,
+    pending: &mut Vec<u8>,
+    payload: &[u8],
+    last: bool,
+) {
+    let base = pending.len();
+    // The decoder's bound includes held source bytes; a fixed expansion ratio
+    // alone can leave too little room when a chunk completes a partial character.
+    let headroom = decoder
+        .max_utf8_buffer_length(payload.len())
+        .unwrap_or_else(|| payload.len().saturating_mul(3).saturating_add(3));
+    pending.resize(base + headroom, 0);
+    let (result, read, written, _) = decoder.decode_to_utf8(payload, &mut pending[base..], last);
+    debug_assert_eq!(result, encoding_rs::CoderResult::InputEmpty);
+    debug_assert_eq!(read, payload.len());
+    pending.truncate(base + written);
 }
 
 /// Picks how many UTF-16LE wire bytes to read for the UTF-8 room still free.
@@ -4054,7 +4044,7 @@ mod tests {
         chunk_bytes: usize,
         out_units: usize,
     ) -> (String, Vec<usize>) {
-        let mut decoder = encoding.new_decoder_without_bom_handling();
+        let mut decoder = ResolvedEncoding::from(encoding).new_decoder_without_bom_handling();
         let mut pending: Vec<u16> = Vec::new();
         let mut delivered: Vec<u16> = Vec::new();
         let mut per_call = Vec::new();
@@ -4112,7 +4102,8 @@ mod tests {
     #[test]
     fn widening_drains_pending_units_after_the_wire_is_exhausted() {
         let wire = b"abcdef";
-        let mut decoder = encoding_rs::UTF_8.new_decoder_without_bom_handling();
+        let mut decoder =
+            ResolvedEncoding::from(encoding_rs::UTF_8).new_decoder_without_bom_handling();
         let mut pending = Vec::new();
 
         // Whole value arrives at once, but the caller can only take two units.
@@ -4147,7 +4138,8 @@ mod tests {
     /// nothing decoded is lost.
     #[test]
     fn widening_emits_nothing_for_a_zero_capacity_buffer() {
-        let mut decoder = encoding_rs::UTF_8.new_decoder_without_bom_handling();
+        let mut decoder =
+            ResolvedEncoding::from(encoding_rs::UTF_8).new_decoder_without_bom_handling();
         let mut pending = Vec::new();
         let emit = widen_into_pending(&mut decoder, &mut pending, b"abc", false, 0);
         assert_eq!(emit, 0);
@@ -4209,7 +4201,7 @@ mod tests {
         chunk_bytes: usize,
         out_bytes: usize,
     ) -> (String, Vec<usize>) {
-        let mut decoder = encoding.new_decoder_without_bom_handling();
+        let mut decoder = ResolvedEncoding::from(encoding).new_decoder_without_bom_handling();
         let mut pending: Vec<u8> = Vec::new();
         let mut delivered: Vec<u8> = Vec::new();
         let mut per_call = Vec::new();
@@ -4256,7 +4248,8 @@ mod tests {
     /// `widen_into_pending`, tracked in AB#48073.
     #[test]
     fn narrow_transcode_malformed_sequence_at_end_is_replacement() {
-        let mut decoder = encoding_rs::GBK.new_decoder_without_bom_handling();
+        let mut decoder =
+            ResolvedEncoding::from(encoding_rs::GBK).new_decoder_without_bom_handling();
         let mut pending: Vec<u8> = Vec::new();
 
         let emit =
@@ -4342,7 +4335,8 @@ mod tests {
     #[test]
     fn narrow_transcode_drains_pending_after_the_wire_is_exhausted() {
         let wire = encoding_rs::WINDOWS_1252.encode("abcdef").0.into_owned();
-        let mut decoder = encoding_rs::WINDOWS_1252.new_decoder_without_bom_handling();
+        let mut decoder =
+            ResolvedEncoding::from(encoding_rs::WINDOWS_1252).new_decoder_without_bom_handling();
         let mut pending = Vec::new();
 
         let emit = transcode_narrow_into_pending(&mut decoder, &mut pending, &wire, true, 2);
@@ -4362,7 +4356,8 @@ mod tests {
     /// nothing decoded is lost.
     #[test]
     fn narrow_transcode_emits_nothing_for_a_zero_capacity_buffer() {
-        let mut decoder = encoding_rs::WINDOWS_1252.new_decoder_without_bom_handling();
+        let mut decoder =
+            ResolvedEncoding::from(encoding_rs::WINDOWS_1252).new_decoder_without_bom_handling();
         let mut pending = Vec::new();
         let emit = transcode_narrow_into_pending(&mut decoder, &mut pending, b"abc", false, 0);
         assert_eq!(emit, 0);
@@ -7289,6 +7284,253 @@ mod tests {
     }
 
     #[test]
+    fn narrow_counting_flushes_source_held_before_an_empty_final_chunk() {
+        let mut decoder =
+            ResolvedEncoding::from(encoding_rs::SHIFT_JIS).new_decoder_without_bom_handling();
+        let mut output = Vec::new();
+        decode_narrow_into_pending(&mut decoder, &mut output, b"A\x82", false);
+        assert_eq!(output, b"A");
+        decode_narrow_into_pending(&mut decoder, &mut output, &[], true);
+        assert_eq!(output, b"A\xef\xbf\xbd");
+    }
+
+    #[test]
+    fn converted_narrow_lengths_account_for_expansion_contraction_and_unread_wire() {
+        for (total, read, converted, expected) in [
+            (Some(1), 1, 3, 3),
+            (Some(10), 1, 3, 12),
+            (Some(10), 4, 2, 8),
+            (Some(1), 1, 2, 2),
+            (None, 1, 3, SQL_NO_TOTAL),
+            (Some(u64::MAX), 0, usize::MAX, SqlLen::MAX),
+        ] {
+            assert_eq!(converted_narrow_indicator(total, read, converted), expected);
+        }
+    }
+
+    fn prefetched_text_stream(
+        h: &TestHandles,
+        encoding: PlpEncoding,
+        narrow_encoding: Option<ResolvedEncoding>,
+        wire: Vec<u8>,
+        known_total: Option<u64>,
+    ) {
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let mut stream = ActivePlpStream::new(1, encoding, narrow_encoding);
+        let len = wire.len();
+        stream.set_prefetched_wire(wire, len, 0, known_total, true);
+        let mut state = stmt.inner.lock().unwrap();
+        state.set_state(STMT_STATE_CURSOR_OPEN);
+        state.column_metadata = int_columns(1);
+        state.current_row_last_col = 1;
+        state.row_positioned = true;
+        state.active_plp = Some(stream);
+    }
+
+    #[test]
+    fn streamed_char_fills_fitting_values_in_one_call() {
+        for (encoding, narrow, wire, expected) in [
+            (
+                PlpEncoding::SingleByteText,
+                Some(encoding_rs::WINDOWS_1252.into()),
+                b"ab".to_vec(),
+                b"ab".to_vec(),
+            ),
+            (
+                PlpEncoding::Utf16Text,
+                None,
+                utf16le("abc"),
+                b"abc".to_vec(),
+            ),
+            (
+                PlpEncoding::SingleByteText,
+                Some(encoding_rs::GBK.into()),
+                vec![0x81, 0x30, 0x81, 0x30],
+                vec![0xc2, 0x80],
+            ),
+        ] {
+            for known in [false, true] {
+                let h = TestHandles::with_env_dbc_stmt();
+                let total = known.then_some(wire.len() as u64);
+                prefetched_text_stream(&h, encoding, narrow, wire.clone(), total);
+                let mut buffer = [0xcc_u8; 5];
+                let mut indicator = -99;
+                let rc = unsafe {
+                    sql_get_data(
+                        h.stmt,
+                        1,
+                        SQL_C_CHAR,
+                        buffer.as_mut_ptr().cast(),
+                        4,
+                        &mut indicator,
+                    )
+                };
+                assert_eq!(rc, SQL_SUCCESS);
+                assert_eq!(indicator, expected.len() as SqlLen);
+                assert_eq!(&buffer[..expected.len()], expected);
+                assert_eq!(buffer[expected.len()], 0);
+                assert!(buffer[expected.len() + 1..].iter().all(|&b| b == 0xcc));
+                let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+                assert!(stmt.inner.lock().unwrap().diag_records.is_empty());
+                assert_eq!(
+                    unsafe {
+                        sql_get_data(
+                            h.stmt,
+                            1,
+                            SQL_C_CHAR,
+                            buffer.as_mut_ptr().cast(),
+                            4,
+                            &mut indicator,
+                        )
+                    },
+                    SQL_NO_DATA
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn oem_plp_target_switch_preserves_carry_and_refills_text() {
+        for encoding in [ResolvedEncoding::Oem437, ResolvedEncoding::Oem850] {
+            for target in [SQL_C_CHAR, SQL_C_WCHAR, SQL_C_BINARY] {
+                for total in [None, Some(3)] {
+                    let h = TestHandles::with_env_dbc_stmt();
+                    prefetched_text_stream(
+                        &h,
+                        PlpEncoding::SingleByteText,
+                        Some(encoding),
+                        vec![0xb3, b'A', b'B'],
+                        total,
+                    );
+                    let mut first = [0xcc; 2];
+                    assert_eq!(
+                        read_plp_test_chunk(&h, SQL_C_CHAR, &mut first),
+                        (SQL_SUCCESS_WITH_INFO, total.map_or(SQL_NO_TOTAL, |_| 5))
+                    );
+                    assert_eq!(first, [0xe2, 0]);
+
+                    let (expected, capacity): (&[u8], _) = match target {
+                        SQL_C_CHAR => (&[0x94, 0x82, b'A', b'B', 0], 5),
+                        SQL_C_WCHAR => (&[0x94, 0x82, b'A', 0, b'B', 0, 0, 0], 8),
+                        _ => (b"AB", 2),
+                    };
+                    let mut output = [0xcc; 9];
+                    let payload_length = if target == SQL_C_BINARY {
+                        2
+                    } else if target == SQL_C_WCHAR {
+                        6
+                    } else {
+                        4
+                    };
+                    assert_eq!(
+                        read_plp_test_chunk(&h, target, &mut output[..capacity]),
+                        (SQL_SUCCESS, payload_length)
+                    );
+                    assert_eq!(&output[..expected.len()], expected);
+                    assert!(output[expected.len()..].iter().all(|&byte| byte == 0xcc));
+                    assert_eq!(
+                        read_plp_test_chunk(&h, target, &mut output),
+                        (SQL_NO_DATA, -999)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn streamed_char_probes_and_carry_preserve_remaining_lengths() {
+        for (encoding, wire, output) in [
+            (
+                encoding_rs::WINDOWS_1252,
+                vec![0x80, b'a'],
+                vec![0xe2, 0x82, 0xac, b'a'],
+            ),
+            // The GBK decoder also accepts GB18030: four input bytes become two.
+            (
+                encoding_rs::GBK,
+                vec![0x81, 0x30, 0x81, 0x30, b'a'],
+                vec![0xc2, 0x80, b'a'],
+            ),
+        ] {
+            for known in [false, true] {
+                let h = TestHandles::with_env_dbc_stmt();
+                prefetched_text_stream(
+                    &h,
+                    PlpEncoding::SingleByteText,
+                    Some(encoding.into()),
+                    wire.clone(),
+                    known.then_some(wire.len() as u64),
+                );
+                for capacity in [0, 1] {
+                    let mut buffer = [0xcc_u8; 3];
+                    let mut indicator = -99;
+                    assert_eq!(
+                        unsafe {
+                            sql_get_data(
+                                h.stmt,
+                                1,
+                                SQL_C_CHAR,
+                                buffer.as_mut_ptr().cast(),
+                                capacity,
+                                &mut indicator,
+                            )
+                        },
+                        SQL_SUCCESS_WITH_INFO
+                    );
+                    assert_eq!(
+                        indicator,
+                        if known {
+                            wire.len() as SqlLen
+                        } else {
+                            SQL_NO_TOTAL
+                        }
+                    );
+                    assert_eq!(
+                        buffer,
+                        if capacity == 0 {
+                            [0xcc; 3]
+                        } else {
+                            [0, 0xcc, 0xcc]
+                        }
+                    );
+                }
+                for (index, &byte) in output.iter().enumerate() {
+                    let mut buffer = [0xcc_u8; 3];
+                    let mut indicator = -99;
+                    let rc = unsafe {
+                        sql_get_data(
+                            h.stmt,
+                            1,
+                            SQL_C_CHAR,
+                            buffer.as_mut_ptr().cast(),
+                            2,
+                            &mut indicator,
+                        )
+                    };
+                    assert_eq!(buffer, [byte, 0, 0xcc]);
+                    let complete = index == output.len() - 1;
+                    assert_eq!(
+                        rc,
+                        if complete {
+                            SQL_SUCCESS
+                        } else {
+                            SQL_SUCCESS_WITH_INFO
+                        }
+                    );
+                    assert_eq!(
+                        indicator,
+                        if complete || known {
+                            (output.len() - index) as SqlLen
+                        } else {
+                            SQL_NO_TOTAL
+                        }
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn deferred_plp_prefetch_error_surfaces_on_next_get_data_call() {
         let h = TestHandles::with_env_dbc_stmt();
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
@@ -7405,7 +7647,7 @@ mod tests {
                     1,
                     SQL_C_CHAR,
                     std::ptr::null_mut(),
-                    10,
+                    7,
                     &mut indicator,
                 )
             },
@@ -7431,13 +7673,13 @@ mod tests {
                     1,
                     SQL_C_CHAR,
                     std::ptr::null_mut(),
-                    7,
+                    5,
                     &mut indicator,
                 )
             },
             SQL_SUCCESS_WITH_INFO
         );
-        assert_eq!(indicator, 5);
+        assert_eq!(indicator, 6);
         let mut rest = [0xcc; 8];
         assert_eq!(
             read_plp_test_chunk(&h, SQL_C_BINARY, &mut rest),
@@ -7599,7 +7841,7 @@ mod tests {
                 let (h, _server) = open_mock_gbk_plp(chunks);
                 let mut first = [0xcc; 7];
                 let (length, indicator, expected): (_, _, &[u8]) = if target == SQL_C_CHAR {
-                    (7, 5, b"A\xe4\xbd\xa0\0")
+                    (5, 6, b"A\xe4\xbd\xa0\0")
                 } else {
                     (6, SQL_NO_TOTAL, &[b'A', 0, 0x60, 0x4f, 0, 0])
                 };
@@ -7836,7 +8078,7 @@ mod tests {
             vec![vec![0x41, 0xd83d], vec![0xde00], vec![0x42, 0x43]],
         ] {
             let (h, _server) = open_mock_plp(chunks);
-            let mut first = [0xcc; 8];
+            let mut first = [0xcc; 6];
             assert_eq!(
                 read_plp_test_chunk(&h, SQL_C_CHAR, &mut first),
                 (SQL_SUCCESS_WITH_INFO, SQL_NO_TOTAL)
@@ -7899,7 +8141,8 @@ mod tests {
             (encoding_rs::SHIFT_JIS, b"\x82\xa0".as_slice()),
         ] {
             for wide in [false, true] {
-                let mut decoder = encoding.new_decoder_without_bom_handling();
+                let mut decoder =
+                    ResolvedEncoding::from(encoding).new_decoder_without_bom_handling();
                 assert!(!narrow_decoder_has_partial_character(&decoder));
                 let mut utf8 = Vec::new();
                 let mut utf16 = Vec::new();
