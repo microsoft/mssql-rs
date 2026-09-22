@@ -14,8 +14,7 @@ mssql_py_core package directory:
     Windows     : libs/windows/<winArch>/mssqlodbc.dll
 
 where <arch> is ``x86_64`` or ``arm64`` (Linux/macOS) and <winArch> is ``x64``
-or ``arm64`` (Windows). The driver is per platform+arch, so the same binary is
-duplicated across the per-Python-version wheels for a given platform.
+or ``arm64`` (Windows).
 
 The staged --drivers-dir mirrors the ``libs/`` subtree exactly, e.g.
 

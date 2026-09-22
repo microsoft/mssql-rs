@@ -850,8 +850,13 @@ impl<'a> BulkCopy<'a> {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
-    /// use mssql_tds::connection::bulk_copy::{BulkLoadRow, BulkRowWriter};
+    /// ```rust,no_run
+    /// use async_trait::async_trait;
+    /// use mssql_tds::connection::bulk_copy::{BulkCopy, BulkLoadRow};
+    /// use mssql_tds::core::TdsResult;
+    /// use mssql_tds::datatypes::column_values::ColumnValues;
+    /// use mssql_tds::datatypes::sql_string::SqlString;
+    /// use mssql_tds::message::bulk_load::StreamingBulkLoadWriter;
     ///
     /// struct User {
     ///     id: i32,
@@ -861,20 +866,34 @@ impl<'a> BulkCopy<'a> {
     ///
     /// #[async_trait]
     /// impl BulkLoadRow for User {
-    ///     async fn write_to_packet(&self, writer: &mut BulkRowWriter<'_>) -> TdsResult<()> {
-    ///         writer.write_int(0, self.id).await?;
-    ///         writer.write_string(1, &self.name).await?;
-    ///         writer.write_bit(2, self.active).await?;
+    ///     async fn write_to_packet(
+    ///         &self,
+    ///         writer: &mut StreamingBulkLoadWriter<'_>,
+    ///         column_index: &mut usize,
+    ///     ) -> TdsResult<()> {
+    ///         writer.write_column_value(*column_index, &ColumnValues::Int(self.id)).await?;
+    ///         *column_index += 1;
+    ///         writer
+    ///             .write_column_value(
+    ///                 *column_index,
+    ///                 &ColumnValues::String(SqlString::from_utf8_string(self.name.clone())),
+    ///             )
+    ///             .await?;
+    ///         *column_index += 1;
+    ///         writer.write_column_value(*column_index, &ColumnValues::Bit(self.active)).await?;
+    ///         *column_index += 1;
     ///         Ok(())
     ///     }
     /// }
     ///
-    /// let users = vec![
-    ///     User { id: 1, name: "Alice".to_string(), active: true },
-    ///     User { id: 2, name: "Bob".to_string(), active: false },
-    /// ];
-    ///
-    /// bulk_copy.write_to_server_zerocopy(users.into_iter()).await?;
+    /// async fn write_users(bulk_copy: &mut BulkCopy<'_>) -> TdsResult<()> {
+    ///     let users = vec![
+    ///         User { id: 1, name: "Alice".to_string(), active: true },
+    ///         User { id: 2, name: "Bob".to_string(), active: false },
+    ///     ];
+    ///     bulk_copy.write_to_server_zerocopy(users.into_iter()).await?;
+    ///     Ok(())
+    /// }
     /// ```
     ///
     /// # Errors
@@ -1236,9 +1255,13 @@ impl<'a> BulkCopy<'a> {
 ///
 /// # Example
 ///
-/// ```rust,ignore
-/// use mssql_tds::connection::bulk_copy::{BulkLoadRow, BulkRowWriter};
+/// ```rust,no_run
+/// use async_trait::async_trait;
+/// use mssql_tds::connection::bulk_copy::{BulkCopy, BulkLoadRow};
 /// use mssql_tds::core::TdsResult;
+/// use mssql_tds::datatypes::column_values::ColumnValues;
+/// use mssql_tds::datatypes::sql_string::SqlString;
+/// use mssql_tds::message::bulk_load::StreamingBulkLoadWriter;
 ///
 /// struct Product {
 ///     id: i32,
@@ -1246,19 +1269,35 @@ impl<'a> BulkCopy<'a> {
 ///     price: f64,
 /// }
 ///
+/// #[async_trait]
 /// impl BulkLoadRow for Product {
-///     async fn write_to_packet(&self, writer: &mut BulkRowWriter<'_>) -> TdsResult<()> {
-///         writer.write_int(self.id).await?;
-///         writer.write_string(&self.name).await?;
-///         writer.write_float(self.price).await?;
+///     async fn write_to_packet(
+///         &self,
+///         writer: &mut StreamingBulkLoadWriter<'_>,
+///         column_index: &mut usize,
+///     ) -> TdsResult<()> {
+///         writer.write_column_value(*column_index, &ColumnValues::Int(self.id)).await?;
+///         *column_index += 1;
+///         writer
+///             .write_column_value(
+///                 *column_index,
+///                 &ColumnValues::String(SqlString::from_utf8_string(self.name.clone())),
+///             )
+///             .await?;
+///         *column_index += 1;
+///         writer.write_column_value(*column_index, &ColumnValues::Float(self.price)).await?;
+///         *column_index += 1;
 ///         Ok(())
 ///     }
 /// }
 ///
-/// // Use it:
-/// let products = vec![Product { id: 1, name: "Widget".to_string(), price: 9.99 }];
-/// let bulk_copy = BulkCopy::new(&mut client, "Products");
-/// bulk_copy.write_to_server_zerocopy(products.into_iter()).await?;
+/// async fn write_products(bulk_copy: &mut BulkCopy<'_>) -> TdsResult<()> {
+///     let products = vec![
+///         Product { id: 1, name: "Widget".to_string(), price: 9.99 },
+///     ];
+///     bulk_copy.write_to_server_zerocopy(products.into_iter()).await?;
+///     Ok(())
+/// }
 /// ```
 #[async_trait]
 pub trait BulkLoadRow {

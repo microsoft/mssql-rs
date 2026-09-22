@@ -134,6 +134,28 @@ comparison honest; put a genuinely reference-incompatible case in its own test
 (as `DriverConnectLiveTest.InvalidConnectionAttributeValuesRejected` is) so the
 surrounding parity assertions still compare.
 
+**One carve-out: a test dedicated to a single registered divergence may assert
+per leg.** When a case exists only to pin one documented difference — it is in
+its own test, it covers nothing else, and it has a numbered entry in
+[`docs/parity-deviations.md`](../../docs/parity-deviations.md) — spelling out
+what *each* driver returns is better than skipping the reference leg, because it
+keeps measuring the reference instead of asserting the divergence from memory. A
+build where msodbcsql stops behaving as recorded then fails the test rather than
+going unnoticed. `ColAttributeLiveTest.EmptyVariantProbeReturnsSuccessWithoutWarning`
+(registry entry 13) is the precedent.
+
+The hazard the preference above guards against is a per-leg guard wrapped around
+*some* assertions inside a broader test, where `PASS`/`PASS` conceals a
+difference nobody chose. That remains discouraged, and
+`SKIP_IF_COMPARING_MSODBCSQL()` remains the right tool for a case that asserts
+mssql-odbc-specific behavior the reference does not share at all. This carve-out
+matches §2.1 of
+[`.github/instructions/mssql-odbc.instructions.md`](../../../.github/instructions/mssql-odbc.instructions.md),
+which admits the macro for three reasons — reference-incompatible behavior, a
+measured divergence, or a documented gap tracked by a work item — and asks that
+anything else assert on both legs. When the divergence is measured, asserting
+both legs records the measurement continuously.
+
 **Granularity:** ctest compares at the *test-binary* level — each `*_test`
 executable is a single ctest case and the parity table is keyed on that binary
 name, not on individual gtest cases. A gtest skip is not a failure, so a case
@@ -420,7 +442,7 @@ across matching distros:
 | Track | Build base | Reused on |
 |---|---|---|
 | glibc modern (x64, arm64) | Ubuntu 22.04 (glibc 2.35, OpenSSL 3) | Debian bookworm, Ubuntu 22.04/24.04, Azure Linux 3 |
-| musl (x64, arm64) | Alpine 3.18 (musl, OpenSSL 3) | Alpine 3.18–3.21 |
+| musl (x64, arm64) | Alpine 3.18 (musl, OpenSSL 3) | Alpine 3.18, 3.21 |
 | glibc 2.28 (x64) | manylinux_2_28 / AlmaLinux 8 (OpenSSL 1.1) | RHEL 8 / UBI 8 |
 
 A glibc-2.35 binary may fail to load on older glibc (e.g. RHEL 8's 2.28), and an

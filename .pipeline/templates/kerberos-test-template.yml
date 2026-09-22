@@ -23,7 +23,7 @@
 #   # For merge/CI builds (full matrix)  
 #   - template: templates/kerberos-test-template.yml
 #     parameters:
-#       profiles: ['ubuntu22', 'ubuntu24', 'alpine318', 'alpine319', 'alpine320', 'alpine321', 'debian', 'rhel9', 'oracle9']
+#       profiles: ['ubuntu22', 'ubuntu24', 'alpine318', 'alpine321', 'debian', 'rhel9', 'oracle9']
 
 parameters:
   - name: profiles

@@ -27,7 +27,11 @@ _ROOT = Path(__file__).parents[1]
 _PIPELINE = _ROOT / ".pipeline" / "OneBranch" / "OfficialPythonWheelsRelease.yml"
 _PYPI_PIPELINE = _ROOT / ".pipeline" / "OneBranch" / "PyPIRelease.yml"
 _BUILD_STAGES = _ROOT / ".pipeline" / "OneBranch" / "stages.yml"
+_WHEEL_INSTALL_TEMPLATE = (
+    _ROOT / ".pipeline" / "templates" / "test-python-wheel-installs-template.yml"
+)
 _METADATA = _ROOT / ".pipeline" / "scripts" / "get-python-release-metadata.ps1"
+_VERIFY_WHEELS_SCRIPT = _ROOT / ".pipeline" / "scripts" / "verify-python-wheels.ps1"
 _SWITCHES = (
     "publishNuGet",
     "publishMssqlTds",
@@ -111,6 +115,124 @@ def test_release_defaults_are_safe():
     assert pipeline["trigger"] == "none"
     assert pipeline["pr"] == "none"
     assert pipeline["resources"]["pipelines"][0]["source"] == "Official Python Wheels Build"
+
+
+@pytest.mark.parametrize("is_official", [False, True])
+@pytest.mark.parametrize("build_products", [False, True])
+def test_cpp_codeql_build_is_official_only(is_official, build_products):
+    source = yaml.safe_load(_BUILD_STAGES.read_text(encoding="utf-8"))
+    flags = {parameter["name"]: parameter["default"] for parameter in source["parameters"]}
+    flags.update(
+        isOfficial=is_official,
+        buildPythonWheels=build_products,
+        buildOdbcNative=build_products,
+    )
+    jobs = expand(source, flags)["stages"][0]["jobs"]
+    job = next(job for job in jobs if job["job"] == "Windows_x64")
+    codeql = {
+        variable["name"]: variable["value"]
+        for variable in job["variables"]
+        if variable.get("name", "").startswith("Codeql.")
+    }
+    assert codeql == ({
+        "Codeql.Enabled": True,
+        "Codeql.Language": "cpp",
+        "Codeql.BuildIdentifier": "mssql_odbc_cpp",
+    } if is_official else {})
+    steps = [
+        step for step in job["steps"]
+        if step.get("displayName") == "Build ODBC C++ targets for CodeQL"
+    ]
+    assert len(steps) == int(is_official)
+    for other in jobs:
+        if other["job"] != "Windows_x64":
+            assert "Codeql." not in str(other)
+    if is_official:
+        step = steps[0]
+        assert "condition" not in step
+        assert not step.get("continueOnError", False)
+        assert '-G "Visual Studio 17 2022"' in step["pwsh"]
+        assert "-A x64 -DODBC_E2E_FORCE_UNICODE=ON" in step["pwsh"]
+        assert "CMAKE_BUILD_TYPE" not in step["pwsh"]
+        for project in (r"mssql-odbc\tests\e2e", "mssql-odbc-bench"):
+            assert f"-S {project} -B {project}\\build_codeql" in step["pwsh"]
+            assert f"--build {project}\\build_codeql --config Debug --clean-first" in step["pwsh"]
+        assert "ctest" not in step["pwsh"]
+        assert "run_e2e" not in step["pwsh"]
+        assert "Build.ArtifactStagingDirectory" not in step["pwsh"]
+
+    official = yaml.safe_load(
+        (_BUILD_STAGES.parent / "OfficialPythonWheelsBuild.yml").read_text(encoding="utf-8")
+    )
+    assert official["trigger"]["branches"]["include"] == ["stable"]
+    assert official["extends"]["parameters"]["stages"][0]["parameters"]["isOfficial"] is True
+
+
+@pytest.mark.parametrize(
+    ("configure_exit", "build_exit", "cmake_source"),
+    [(0, 0, "path"), (1, 0, "path"), (0, 1, "path"), (0, 0, "vs"), (0, 0, "missing")],
+)
+@pytest.mark.parametrize("failure_project", [r"mssql-odbc\tests\e2e", "mssql-odbc-bench"])
+def test_cpp_codeql_build_propagates_cmake_failures(
+    configure_exit, build_exit, cmake_source, failure_project
+):
+    source = yaml.safe_load(_BUILD_STAGES.read_text(encoding="utf-8"))
+    flags = {parameter["name"]: parameter["default"] for parameter in source["parameters"]}
+    flags["isOfficial"] = True
+    job = next(
+        job for job in expand(source, flags)["stages"][0]["jobs"]
+        if job["job"] == "Windows_x64"
+    )
+    script = next(
+        step["pwsh"] for step in job["steps"]
+        if step.get("displayName") == "Build ODBC C++ targets for CodeQL"
+    )
+    stub = rf"""
+    function cmake {{
+        if ('{cmake_source}' -eq 'vs' -and $env:PATH -cne "C:\Mock VS\CMake\bin;$originalPath") {{
+            throw 'Discovered CMake directory was not prepended to PATH.'
+        }}
+        Write-Output "cmake $args"
+        $global:LASTEXITCODE = 0
+        if ($args[0] -eq '-S' -and $args[1] -eq '{failure_project}') {{
+            $global:LASTEXITCODE = {configure_exit}
+        }} elseif ($args[0] -eq '--build' -and $args[1] -eq '{failure_project}\build_codeql') {{
+            $global:LASTEXITCODE = {build_exit}
+        }}
+    }}
+    """
+    if cmake_source != "path":
+        stub += rf"""
+        $originalPath = $env:PATH
+        ${{env:ProgramFiles(x86)}} = 'C:\Mock Program Files'
+        function Get-Command {{
+            param($Name, $ErrorAction)
+            if ($Name -ne 'cmake') {{ throw "Unexpected lookup: $Name" }}
+        }}
+        Set-Item 'Function:\global:C:\Mock Program Files\Microsoft Visual Studio\Installer\vswhere.exe' {{
+            Write-Host 'vswhere called'
+            if ('{cmake_source}' -eq 'vs') {{ 'C:\Mock VS\CMake\bin\cmake.exe' }}
+        }}
+        """
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-Command", stub + script],
+        capture_output=True, text=True, check=False,
+    )
+    assert (result.returncode == 0) == (
+        configure_exit == build_exit == 0 and cmake_source != "missing"
+    ), result.stderr
+    calls = [line for line in result.stdout.splitlines() if line.startswith("cmake ")]
+    expected_calls = 4
+    if cmake_source == "missing":
+        expected_calls = 0
+    elif configure_exit or build_exit:
+        expected_calls = (0 if failure_project == r"mssql-odbc\tests\e2e" else 2)
+        expected_calls += 1 if configure_exit else 2
+    assert len(calls) == expected_calls
+    assert ("vswhere called" in result.stdout) == (cmake_source != "path")
+    if cmake_source == "missing":
+        assert "CMake not found on PATH or in Visual Studio." in result.stderr
+        assert "cmake -S" not in result.stdout
 
 
 @pytest.mark.parametrize("publish", [False, True])
@@ -350,7 +472,7 @@ def test_pypi_release_stages_selected_commit_wheels_unchanged(tmp_path: Path) ->
 
     assert result.returncode == 0, result.stderr
     assert f"Selected source commit: {selected}" in result.stdout
-    assert "Staged 44 mssql-python-rs 0.1.0 wheels unchanged." in result.stdout
+    assert "Staged 9 mssql-python-rs 0.1.0 wheels unchanged." in result.stdout
     staged = sorted(staging.glob("*.whl"))
     assert [wheel.name for wheel in staged] == sorted(wheel.name for wheel in originals)
     for wheel in originals:
@@ -376,6 +498,174 @@ def test_crate_templates_resolve_in_self_repository():
     assert templates == ["/.pipeline/templates/validate-release-crates.yml@self"] * 6
 
 
+@pytest.mark.parametrize(
+    ("job_name", "os_type", "architecture", "python_versions"),
+    [
+        (
+            "Windows_x64",
+            "Windows",
+            "x64",
+            ["3.10", "3.11", "3.12", "3.13", "3.14"],
+        ),
+        ("Windows_ARM64", "Windows", "arm64", ["3.11", "3.12", "3.13", "3.14"]),
+        (
+            "Linux_x64",
+            "Linux",
+            "x64",
+            ["3.10", "3.11", "3.12", "3.13", "3.14"],
+        ),
+        (
+            "Linux_ARM64",
+            "Linux",
+            "arm64",
+            ["3.10", "3.11", "3.12", "3.13", "3.14"],
+        ),
+        (
+            "MacOS_universal2",
+            "MacOS",
+            "universal2",
+            ["3.10", "3.11", "3.12", "3.13", "3.14"],
+        ),
+    ],
+)
+def test_python_wheel_install_gate_precedes_artifact_publication(
+    job_name: str,
+    os_type: str,
+    architecture: str,
+    python_versions: list[str],
+) -> None:
+    source = yaml.safe_load(_BUILD_STAGES.read_text(encoding="utf-8"))
+    install_template = yaml.safe_load(
+        _WHEEL_INSTALL_TEMPLATE.read_text(encoding="utf-8")
+    )
+    default_versions = next(
+        parameter["default"]
+        for parameter in install_template["parameters"]
+        if parameter["name"] == "pythonVersions"
+    )
+    flags = {
+        "buildAllTargets": True,
+        "buildPythonWheels": True,
+        "buildOdbcNative": True,
+        "buildRustCrates": False,
+        "testPythonWheelInstalls": True,
+        "isOfficial": True,
+        "publishToFeed": False,
+    }
+    pipeline = expand(source, flags)
+    build = next(stage for stage in pipeline["stages"] if stage["stage"] == "Build")
+    job = next(job for job in build["jobs"] if job.get("job") == job_name)
+    steps = job["steps"]
+    install_steps = [
+        (index, step)
+        for index, step in enumerate(steps)
+        if step.get("template")
+        == "/.pipeline/templates/test-python-wheel-installs-template.yml"
+    ]
+
+    assert len(install_steps) == 1
+    install_index, install_step = install_steps[0]
+    publish_index = next(
+        index
+        for index, step in enumerate(steps)
+        if step.get("task") == "PublishPipelineArtifact@1"
+    )
+    parameters = install_step["parameters"]
+    assert parameters["osType"] == os_type
+    assert parameters["architecture"] == architecture
+    assert parameters.get("pythonVersions", default_versions) == python_versions
+    assert install_index < publish_index
+
+    # The gate only proves anything if it runs after every step that mutates the
+    # wheel it installs - ODBC injection and (on Linux) the glibc/glibc-2.28
+    # auditwheel repair - otherwise it can pass while install-testing a wheel
+    # with no driver in it.
+    transform_indices = [
+        index
+        for index, step in enumerate(steps)
+        if "Inject ODBC driver into" in str(step.get("displayName", ""))
+        or "Repair glibc" in str(step.get("displayName", ""))
+    ]
+    assert transform_indices, "expected a wheel-transforming step in this job"
+    assert max(transform_indices) < install_index
+
+
+def _wheel_requires_python_floor() -> str:
+    """The minimum Python version the released wheel declares support for,
+    read from verify-python-wheels.ps1's Requires-Python assertion - the
+    canonical source the release gate enforces. Since the wheel is a single
+    stable-ABI (cp310-abi3) build, there is no per-version tag list to track
+    anymore; the floor is the one canonical constraint left to drift-check
+    the install-test matrix against."""
+    ps1 = _VERIFY_WHEELS_SCRIPT.read_text(encoding="utf-8")
+    match = re.search(r"-ne\s+'>=(3\.\d+)'", ps1)
+    assert match, "could not find the Requires-Python floor in verify-python-wheels.ps1"
+    return match[1]
+
+
+def test_windows_and_macos_install_matrix_tracks_release_python_tags() -> None:
+    """Guards the same class of drift the Linux fix in 9ed77aa7 closed: unlike
+    the Linux script, Windows/macOS install coverage is driven by this
+    template's own `pythonVersions` default (and the Windows ARM64 override in
+    stages.yml), neither of which was cross-checked against the canonical
+    Requires-Python floor in verify-python-wheels.ps1."""
+    floor = _wheel_requires_python_floor()
+
+    install_template = yaml.safe_load(
+        _WHEEL_INSTALL_TEMPLATE.read_text(encoding="utf-8")
+    )
+    default_versions = next(
+        parameter["default"]
+        for parameter in install_template["parameters"]
+        if parameter["name"] == "pythonVersions"
+    )
+    assert min(default_versions, key=lambda v: tuple(map(int, v.split(".")))) == floor
+
+    source = yaml.safe_load(_BUILD_STAGES.read_text(encoding="utf-8"))
+    flags = {
+        "buildAllTargets": True,
+        "buildPythonWheels": True,
+        "buildOdbcNative": True,
+        "buildRustCrates": False,
+        "testPythonWheelInstalls": True,
+        "isOfficial": True,
+        "publishToFeed": False,
+    }
+    pipeline = expand(source, flags)
+    build = next(stage for stage in pipeline["stages"] if stage["stage"] == "Build")
+    arm64_job = next(job for job in build["jobs"] if job.get("job") == "Windows_ARM64")
+
+    # win_arm64 excludes the floor version today (limited hosted-agent
+    # support for it, per the comment in stages.yml), nothing else.
+    expected_arm64_versions = set(default_versions) - {floor}
+    for template_name in (
+        "build-python-wheels-template.yml",
+        "test-python-wheel-installs-template.yml",
+    ):
+        step = next(
+            step
+            for step in arm64_job["steps"]
+            if step.get("template") == f"/.pipeline/templates/{template_name}"
+        )
+        assert set(step["parameters"]["pythonVersions"]) == expected_arm64_versions
+
+
+def test_macos_wheel_install_gate_verifies_both_architectures() -> None:
+    template = _WHEEL_INSTALL_TEMPLATE.read_text(encoding="utf-8")
+
+    assert 'extensions=("$extract_dir"/mssql_py_core/mssql_py_core*.so)' in template
+    assert 'lipo "${extensions[0]}" -verify_arch x86_64 arm64' in template
+    assert (
+        'lipo "$extract_dir/mssql_py_core/libs/macos/x86_64/lib/'
+        'mssqlodbc.dylib" -verify_arch x86_64' in template
+    )
+    assert (
+        'lipo "$extract_dir/mssql_py_core/libs/macos/arm64/lib/'
+        'mssqlodbc.dylib" -verify_arch arm64' in template
+    )
+    assert template.count("--verify-driver-exports") == 2
+
+
 @pytest.mark.parametrize("architecture", ("x64", "ARM64"))
 @pytest.mark.parametrize("build_odbc", (False, True))
 def test_manylinux_repair_does_not_depend_on_odbc(architecture: str, build_odbc: bool) -> None:
@@ -384,6 +674,7 @@ def test_manylinux_repair_does_not_depend_on_odbc(architecture: str, build_odbc:
         "buildPythonWheels": True,
         "buildOdbcNative": build_odbc,
         "buildRustCrates": False,
+        "testPythonWheelInstalls": False,
         "isOfficial": False,
         "publishToFeed": True,
     }
@@ -440,6 +731,7 @@ def test_nonofficial_nuget_versions_follow_python_distribution(
         "buildPythonWheels": True,
         "buildOdbcNative": True,
         "buildRustCrates": False,
+        "testPythonWheelInstalls": False,
         "isOfficial": is_official,
         "publishToFeed": True,
     }
@@ -500,6 +792,7 @@ def test_manylinux_228_builds_use_isolated_cargo_targets(
         "buildPythonWheels": True,
         "buildOdbcNative": True,
         "buildRustCrates": False,
+        "testPythonWheelInstalls": False,
         "isOfficial": False,
         "publishToFeed": False,
     }
@@ -532,6 +825,7 @@ def test_manylinux_228_odbc_builds_enforce_glibc_ceiling(job_name: str) -> None:
         "buildPythonWheels": True,
         "buildOdbcNative": True,
         "buildRustCrates": False,
+        "testPythonWheelInstalls": False,
         "isOfficial": False,
         "publishToFeed": False,
     }
@@ -1040,7 +1334,7 @@ def test_wheel_validation_and_optional_nuspec(source_repositories, tmp_path, nug
         return
 
     assert result.returncode == 0, result.stderr
-    assert "Validated 44 mssql-python-rs wheels" in result.stdout
+    assert "Validated 9 mssql-python-rs wheels" in result.stdout
     variables.update(re.findall(r"##vso\[task.setvariable variable=(\w+)\](.*)", result.stdout))
     assert variables["releaseVersion"] == "0.1.0"
     assert variables["sourceCommit"] == selected
