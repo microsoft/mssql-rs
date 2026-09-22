@@ -334,7 +334,7 @@ fn checked_date_parts(days: i64) -> Result<DateTimeParts, ConvError> {
 
 /// Converts a TDS `time` into normalized clock fields.
 pub(crate) fn time_parts(time: &SqlTime) -> Result<DateTimeParts, ConvError> {
-    if time.time_nanoseconds >= TICKS_PER_DAY.unsigned_abs() {
+    if time.scale > 7 || time.time_nanoseconds >= TICKS_PER_DAY.unsigned_abs() {
         return Err(ConvError::InvalidDatetimeFormat);
     }
     let t = hms_from_ticks_100ns(time.time_nanoseconds);
@@ -367,6 +367,7 @@ pub(crate) fn datetimeoffset_parts(
     datetime: &SqlDateTimeOffset,
 ) -> Result<DateTimeParts, ConvError> {
     if i64::from(datetime.datetime2.days) > MAX_DAYS_SINCE_0001
+        || datetime.datetime2.time.scale > 7
         || datetime.datetime2.time.time_nanoseconds >= TICKS_PER_DAY.unsigned_abs()
         || !(-840..=840).contains(&datetime.offset)
     {
@@ -2722,6 +2723,35 @@ mod tests {
                 );
                 assert_eq!(output, [0xA5; 32]);
                 assert_eq!(indicator, -42);
+            }
+        }
+    }
+
+    #[test]
+    fn decoded_temporal_scales_are_limited_to_seven() {
+        for scale in 0..=u8::MAX {
+            let time = SqlTime {
+                time_nanoseconds: 0,
+                scale,
+            };
+            let datetime2 = SqlDateTime2 {
+                days: 0,
+                time: time.clone(),
+            };
+            let offset = SqlDateTimeOffset {
+                datetime2: datetime2.clone(),
+                offset: 0,
+            };
+            for result in [
+                time_parts(&time),
+                datetime2_parts(&datetime2),
+                datetimeoffset_parts(&offset),
+            ] {
+                if scale <= 7 {
+                    assert_eq!(result.unwrap().scale, scale);
+                } else {
+                    assert_eq!(result, Err(ConvError::InvalidDatetimeFormat));
+                }
             }
         }
     }

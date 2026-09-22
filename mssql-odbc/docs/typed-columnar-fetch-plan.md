@@ -114,6 +114,11 @@ msodbcsql 18.6.2.1-1 (`SQL_DRIVER_VER=18.06.0002`) by
 Malformed decoded native values are covered by Rust regressions, not a retail
 wire-level comparison: a normal SQL Server cannot produce them. Decoded fields
 are validated before arithmetic, so even extreme ticks report `22007`.
+Decoded temporal scales outside 0..7 also report `22007`; this does not limit
+character literals, whose fractional fields can carry nine digits.
+An offset-adjusted date outside years 1..9999 remains `22007`: the reference
+timestampoffset target reaches `ValidateDateTimeOffsetStruct` after decoding
+(`sqlccnvt.cpp:3904-3933,8765-8766`), which returns `CVT_DT_ERROR`.
 Rejecting invalid wire fields, including legacy `datetime` before 1753-01-01,
 is driver hardening, not a claim that msodbcsql handles identical corrupt
 bytes the same way. Closing that

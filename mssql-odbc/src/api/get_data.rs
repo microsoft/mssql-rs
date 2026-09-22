@@ -6274,7 +6274,23 @@ mod tests {
             time_nanoseconds: 864_000_000_000,
             scale: 7,
         };
+        let invalid_scale = SqlTime {
+            time_nanoseconds: 0,
+            scale: 8,
+        };
         let values = [
+            ColumnValues::Time(invalid_scale.clone()),
+            ColumnValues::DateTime2(SqlDateTime2 {
+                days: 0,
+                time: invalid_scale.clone(),
+            }),
+            ColumnValues::DateTimeOffset(SqlDateTimeOffset {
+                datetime2: SqlDateTime2 {
+                    days: 0,
+                    time: invalid_scale,
+                },
+                offset: 0,
+            }),
             ColumnValues::Time(invalid_time.clone()),
             ColumnValues::DateTime2(SqlDateTime2 {
                 days: 3_652_059,
