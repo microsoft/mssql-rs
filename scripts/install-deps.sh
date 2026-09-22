@@ -13,7 +13,32 @@ print_info
 # Parse optional arch argument
 ARCH=$(arch)
 
-if [ "$ARCH" = "x86_64" ]; then
+if [ "$ARCH" != "x86_64" ] && [ "$ARCH" != "aarch64" ]; then
+    echo "Unknown arch: $ARCH"
+    exit 1
+fi
+
+# Azure Linux 3 agents are replacing the Ubuntu ones, whose git-lfs,
+# gss-ntlmssp and python3-pip CVEs are fixed on jammy only under Ubuntu Pro. So
+# resolve the package manager rather than assuming apt.
+if [ -r /etc/os-release ]; then
+    . /etc/os-release
+fi
+
+if command -v apt-get >/dev/null 2>&1; then
+    PKG_MGR="apt"
+elif command -v tdnf >/dev/null 2>&1; then
+    PKG_MGR="tdnf"
+elif command -v dnf >/dev/null 2>&1; then
+    PKG_MGR="dnf"
+else
+    echo "ERROR: no supported package manager found (looked for apt-get, tdnf, dnf)"
+    echo "       ID=${ID:-unknown} VERSION_ID=${VERSION_ID:-unknown}"
+    exit 1
+fi
+echo "INFO: package manager is $PKG_MGR (ID=${ID:-unknown} VERSION_ID=${VERSION_ID:-unknown})"
+
+if [ "$PKG_MGR" = "apt" ]; then
     DEPS="jq \
         unzip \
         build-essential \
@@ -27,73 +52,93 @@ if [ "$ARCH" = "x86_64" ]; then
         wget \
         apt-transport-https \
         software-properties-common"
-elif [ "$ARCH" = "aarch64" ]; then
+    DOCKER_PKG="docker.io"
+    SSH_SERVICE="ssh"
+else
+    # apt-transport-https and software-properties-common are apt plumbing with no
+    # rpm equivalent; python-is-python3 is replaced by the symlink below.
     DEPS="jq \
         unzip \
         build-essential \
         pkg-config \
-        libssl-dev \
-        libkrb5-dev \
-        python-is-python3 \
-        python3.10-venv \
-        pip \
+        openssl-devel \
+        krb5-devel \
+        python3 \
         python3-pip \
+        python3-devel \
         wget \
-        apt-transport-https \
-        software-properties-common \
-        docker.io"
-else
-    echo "Unknown arch: $ARCH"
-    exit 1
+        ca-certificates"
+    DOCKER_PKG="moby-engine"
+    SSH_SERVICE="sshd"
 fi
 
-# pushd /tmp  
+# Docker is baked into the x64 images; only ARM has ever installed it here.
+if [ "$ARCH" = "aarch64" ]; then
+    DEPS="$DEPS $DOCKER_PKG"
+fi
 
-# wget -q https://packages.microsoft.com/config/ubuntu/$(lsb_release -rs)/packages-microsoft-prod.deb
+pkg_update() {
+    case "$PKG_MGR" in
+        apt)  sudo apt update ;;
+        tdnf) sudo tdnf -y makecache ;;
+        dnf)  sudo dnf -y makecache ;;
+    esac
+}
 
-# for i in {1..5}; do
-#     sudo dpkg -i packages-microsoft-prod.deb && break
-#     echo "dpkg install failed, retrying in $((5 * i)) seconds... (attempt $i/5)"
-#     sleep $((5 * i))
-# done
+pkg_install() {
+    case "$PKG_MGR" in
+        apt)  sudo apt install "$@" -y ;;
+        tdnf) sudo tdnf install "$@" -y ;;
+        dnf)  sudo dnf install "$@" -y ;;
+    esac
+}
 
-apt_update_ok=false
+update_ok=false
 for i in {1..5}; do
-    sudo apt update && { apt_update_ok=true; break; }
-    echo "apt update failed, retrying in 5 seconds... (attempt $i/5)"
+    pkg_update && { update_ok=true; break; }
+    echo "$PKG_MGR update failed, retrying in 5 seconds... (attempt $i/5)"
     sleep $((30 * i))
 done
-if [ "$apt_update_ok" != true ]; then
-    echo "ERROR: apt update failed after 5 attempts"
+if [ "$update_ok" != true ]; then
+    echo "ERROR: $PKG_MGR update failed after 5 attempts"
     exit 1
 fi
 
 # Needed for msrustup download and essentials for building rust binaries.
 # Try installing dependencies up to 5 times if it fails
-apt_install_ok=false
+install_ok=false
 for i in {1..5}; do
-    sudo apt install $DEPS -y && { apt_install_ok=true; break; }
-    echo "apt install failed, retrying in 5 seconds... (attempt $i/5)"
+    pkg_install $DEPS && { install_ok=true; break; }
+    echo "$PKG_MGR install failed, retrying in 5 seconds... (attempt $i/5)"
     sleep $((30 * i))
 done
-if [ "$apt_install_ok" != true ]; then
-    echo "ERROR: apt install failed after 5 attempts"
+if [ "$install_ok" != true ]; then
+    echo "ERROR: $PKG_MGR install failed after 5 attempts"
     exit 1
+fi
+
+# apt ships a `pip` shim and a `python` alias via python-is-python3; rpm distros
+# ship neither, and parts of the build call the unsuffixed names.
+if ! command -v pip >/dev/null 2>&1 && command -v pip3 >/dev/null 2>&1; then
+    sudo ln -sf "$(command -v pip3)" /usr/local/bin/pip
+fi
+if ! command -v python >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
+    sudo ln -sf "$(command -v python3)" /usr/local/bin/python
 fi
 
 pip --version && pip install pipenv
 
 # Enable and start SSH service
-sudo apt install openssh-server -y
-sudo systemctl enable ssh
-sudo systemctl start ssh
+pkg_install openssh-server
+sudo systemctl enable "$SSH_SERVICE"
+sudo systemctl start "$SSH_SERVICE"
 
 # Create a new user for SSH login
 # Check for openssl and install if not present
 if ! command -v openssl &> /dev/null
 then
     echo "OpenSSL not found, installing..."
-    sudo apt install openssl -y
+    pkg_install openssl
 fi
 
 if [ "$ARCH" = "aarch64" ]; then
@@ -105,12 +150,17 @@ fi
 SSH_USER="sshuser"
 SSH_PASS=$(openssl rand -base64 16)
 
-echo "======================== Generated SSH password for $SSH_USER: $SSH_PASS"
+# Not echoed: PR validation logs in the `public` project are world-readable.
 
 if ! id "$SSH_USER" &>/dev/null; then
     sudo useradd -m -s /bin/bash "$SSH_USER"
     echo "$SSH_USER:$SSH_PASS" | sudo chpasswd
-    sudo usermod -aG sudo "$SSH_USER"
+    # Administrative group is `sudo` on Debian, `wheel` on rpm distros.
+    if getent group sudo >/dev/null 2>&1; then
+        sudo usermod -aG sudo "$SSH_USER"
+    else
+        sudo usermod -aG wheel "$SSH_USER"
+    fi
     echo "User $SSH_USER created with password for SSH login."
 else
     echo "User $SSH_USER already exists."

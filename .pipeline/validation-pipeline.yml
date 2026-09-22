@@ -29,7 +29,12 @@ trigger:
 
 parameters:
 - name: runHostBringUp
-  displayName: Run the real install-dependencies template on AZL3 (failures are the point)
+  displayName: Run the real install-dependencies template on AZL3
+  type: boolean
+  default: true
+
+- name: runFuzz
+  displayName: Run a real fuzz target on AZL3 (settles whether clang/llvm is needed)
   type: boolean
   default: true
 
@@ -112,7 +117,7 @@ stages:
 
   - ${{ if eq(parameters.runHostBringUp, true) }}:
     - job: HostBringUp_AZL3
-      displayName: 'Run install-dependencies on AZL3 (expected to fail)'
+      displayName: 'Run install-dependencies on AZL3'
       pool:
         ${{ if eq(variables['System.TeamProject'], 'public') }}:
           name: RUST-PUBLIC-X64-WUS3
@@ -125,6 +130,50 @@ stages:
       - template: templates/install-dependencies.yml
         parameters:
           osType: Linux
+
+  # The Fuzz jobs are one of only two paths that reach install-deps.sh, so this is
+  # the real test of the port. It also settles whether cargo-fuzz needs clang and
+  # llvm-config on the host: nothing in the tree references bindgen or libclang,
+  # which suggests it rides on rustc's bundled LLVM and needs only a linker. That
+  # was inferred from a grep, not observed, so run it rather than assume.
+  - ${{ if eq(parameters.runFuzz, true) }}:
+    - job: Fuzz_AZL3
+      displayName: 'Fuzz on AZL3 (real install-deps + cargo-fuzz)'
+      timeoutInMinutes: 45
+      pool:
+        ${{ if eq(variables['System.TeamProject'], 'public') }}:
+          name: RUST-PUBLIC-X64-WUS3
+        ${{ else }}:
+          name: RUST-X64-WUS3
+        demands:
+        - imageOverride -equals RUST-AZL3
+      variables:
+        CARGO_TARGET_DIR: $(Build.SourcesDirectory)
+      steps:
+      - checkout: self
+      - template: templates/cargo-authenticate-template.yml
+        parameters:
+          osType: Linux
+      - template: templates/install-dependencies.yml
+        parameters:
+          osType: Linux
+          enableJsDeps: false
+      - script: |
+          set +e
+          echo "---- did the port leave us a usable toolchain? ----"
+          for c in cc gcc ld pkg-config jq unzip wget python3 pip cargo rustup clang llvm-config; do
+            printf '  %-14s %s\n' "$c" "$(command -v $c 2>/dev/null || echo MISSING)"
+          done
+          echo "  openssl-devel: $(rpm -q openssl-devel 2>/dev/null || echo MISSING)"
+          echo "  krb5-devel:    $(rpm -q krb5-devel 2>/dev/null || echo MISSING)"
+          exit 0
+        displayName: 'Post-install toolchain check'
+      # Short run: this is a build-and-start check, not a hunt for findings.
+      - template: templates/fuzz-template.yml
+        parameters:
+          osType: Linux
+          fuzzDurationSeconds: 120
+          fuzzTarget: fuzz_token_stream
 
   # RUST-PUBLIC-ARM64-V6-TEST is a throwaway single-agent pool on
   # Standard_D8pds_v6, carrying the SAME ARM images production uses. It exists to
