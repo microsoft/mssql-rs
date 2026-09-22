@@ -117,7 +117,7 @@ def test_cross_repo_jobs_share_the_pinned_checkout(template):
     assert "mssql-python-branch" not in text
 
 
-def test_mssql_python_macos_failures_are_advisory():
+def test_mssql_python_macos_failures_are_advisory_only_in_ci():
     steps = load_template("test-mssql-python-macos-template.yml")["steps"]
     run = next(step for step in steps if step.get("displayName") == "Run mssql-python tests")
     assert "continueOnError" not in run
@@ -138,10 +138,11 @@ def test_pin_validation_is_not_path_filtered_or_optional():
     stage = next(stage for stage in stages if stage["stage"] == "Build_mssql_python")
     assert stage["dependsOn"] == ["EvaluateDuplicate"]
     assert stage["condition"] == (
-        "and(not(canceled()), eq(variables['Build.Reason'], 'PullRequest'), "
+        "and(not(canceled()), "
         "eq('${{ parameters.RunFuzz }}', 'false'), "
         "eq('${{ parameters.RunLongHaul }}', 'false'), "
-        "ne(dependencies.EvaluateDuplicate.outputs['Evaluate.SetDuplicateState.skipDuplicate'], 'true'))"
+        "or(ne(variables['Build.Reason'], 'PullRequest'), "
+        "ne(dependencies.EvaluateDuplicate.outputs['Evaluate.SetDuplicateState.skipDuplicate'], 'true')))"
     )
     for job in stage["jobs"]:
         assert "condition" not in job
@@ -169,7 +170,7 @@ def test_alpine_gssapi_compilation_still_runs_on_prs():
     assert "--features gssapi" in script
 
 
-def test_mssql_python_odbc_failures_are_advisory():
+def test_mssql_python_odbc_failures_are_advisory_only_in_ci():
     template_path = _TEMPLATES / "test-mssql-python-odbc-template.yml"
     template = template_path.read_text(encoding="utf-8")
     steps = yaml.safe_load(template)["steps"]
@@ -257,7 +258,8 @@ def test_odbc_runner_distinguishes_harness_errors(tmp_path, pytest_exit, runner_
     ],
 )
 @pytest.mark.parametrize("exit_code", [0, 1, 2, 3, 4, 5, 125, 126, 127, 137])
-def test_python_pipeline_test_exit_codes(template, display_name, command, exit_code):
+@pytest.mark.parametrize("reason", ["PullRequest", "IndividualCI", "BatchedCI", "Manual", "Schedule", ""])
+def test_python_pipeline_test_exit_codes(template, display_name, command, exit_code, reason):
     step = next(
         step for step in load_template(template)["steps"]
         if step.get("displayName") == display_name
@@ -265,12 +267,13 @@ def test_python_pipeline_test_exit_codes(template, display_name, command, exit_c
     script = step["script"].replace("$(Build.SourcesDirectory)", "/workspace")
     script = re.sub(r"\$\{\{.*?\}\}", "10m", script)
     result = subprocess.run(
-        ["bash", "-c", f"{command}() {{ return {exit_code}; }}\n{script}"],
+        ["bash", "-c", f"BUILD_REASON='{reason}'\n{command}() {{ return {exit_code}; }}\n{script}"],
         capture_output=True, text=True,
     )
-    assert result.returncode == (0 if exit_code == 1 else exit_code), result.stderr
-    assert ("task.logissue type=warning" in result.stdout) == (exit_code == 1)
-    assert ("task.complete result=SucceededWithIssues;" in result.stdout) == (exit_code == 1)
+    advisory = exit_code == 1 and reason not in ("PullRequest", "")
+    assert result.returncode == (0 if advisory else exit_code), result.stderr
+    assert ("task.logissue type=warning" in result.stdout) == advisory
+    assert ("task.complete result=SucceededWithIssues;" in result.stdout) == advisory
 
 
 @pytest.mark.parametrize("architecture", ["x64", "ARM64"])

@@ -27,11 +27,14 @@ See `.pipeline/docs/arm-sql-host-design.md` for the full design.
 ### clone-mssql-python.sh
 
 Both the macOS cross-repo tests and the full upstream suite against the Rust
-ODBC replacement use the commit SHA or branch name in
-[`../mssql-python-revision.txt`](../mssql-python-revision.txt) (currently `main`).
-The script fetches that pin directly, checks it out detached, and logs HEAD.
-Missing, malformed, or unavailable pins fail the job; there is no branch fallback
-or PR-description override.
+ODBC replacement use the full commit SHA in
+[`../mssql-python-revision.txt`](../mssql-python-revision.txt) for PR validation.
+Non-PR pipeline runs fetch the latest upstream `main` instead. The shared script
+uses Azure Pipelines' `BUILD_REASON`: `PullRequest` (or unset for local use) selects
+the pin; other reasons, including manual and scheduled CI, select `main`.
+Both modes check out detached and log HEAD. Invalid or unavailable PR pins fail
+without falling back to main; an unavailable CI main fails without using the pin.
+PR-description overrides are not supported.
 
 From the repository root, with Bash and Git installed, reproduce the checkout:
 
@@ -47,19 +50,26 @@ MSSQL_PYTHON_CLONE_DIR=/tmp/mssql-python-pinned bash .pipeline/scripts/clone-mss
 ```
 
 Existing local workflows such as `dev/test-python.sh --mssql-python` still use
-the developer's sibling checkout; only use the pinned checkout when reproducing
-CI. For branch pins, use the logged HEAD to reproduce a specific run.
+the developer's sibling checkout. Set `BUILD_REASON=IndividualCI` when invoking
+the clone script to follow main locally. Use the logged HEAD as the pin to
+reproduce a specific CI run.
 A source pin does not freeze container tags or package indexes.
 
-Python test failures in both cross-repo jobs report warnings and mark the test
-step `SucceededWithIssues`, without blocking the pipeline. Per-file crashes and
-timeouts reported as test failures by the ODBC runner are also advisory.
-Checkout, build, and test-harness failures remain blocking. JUnit results are
-still published, including failed tests.
+Python test failures in both cross-repo jobs block PR validation against the pin.
+In non-PR CI they report warnings and mark the test step `SucceededWithIssues`,
+without blocking the pipeline. Per-file crashes and timeouts reported as test
+failures by the ODBC runner follow the same policy. Checkout, build, and
+test-harness failures remain blocking in both modes. JUnit results are still
+published, including failed tests.
+
+To advance the pin, review the upstream commit comparison, replace the full SHA,
+and validate both cross-repo jobs in the pin-update PR. CI following main never
+updates the pin automatically.
 
 Keep the pin under `.pipeline/`: the public PR pipeline's configured path
 exclusions cover documentation and `.github/`, not `.pipeline/`. Both cross-repo
-jobs run in `Build_mssql_python` on PRs. Duplicate validation is reusable only
+jobs run in `Build_mssql_python` on PRs and in non-PR CI, except dedicated fuzz
+and long-haul runs. Duplicate PR validation is reusable only
 for a successful run of the same PR head SHA; a pin edit changes that SHA and
 must receive fresh validation. Do not exclude the pin from the pipeline's
 server-side PR trigger filters.

@@ -8,7 +8,8 @@
 # binary, which is what its own pipeline effectively does when it uninstalls the
 # system driver before testing.
 #
-# Test failures and per-file crashes warn; a broken harness still fails the job.
+# Test failures and per-file crashes block PRs but warn in CI.
+# A broken harness still fails the job in either mode.
 # Every test file runs in its own bounded pytest process
 # (run-mssql-python-odbc-tests.sh), so the job reports results instead of
 # stalling or losing the whole run to one segfault.
@@ -225,6 +226,10 @@ steps:
     if [ "$rc" -ne 0 ]; then
       case "$rc" in
         1)
+          if [ "${BUILD_REASON:-PullRequest}" = "PullRequest" ]; then
+            echo "##vso[task.logissue type=error]mssql-python tests did not fully pass against the pinned commit"
+            exit "$rc"
+          fi
           echo "##vso[task.logissue type=warning]mssql-python tests did not fully pass against mssql-odbc (exit $rc)"
           echo "##vso[task.complete result=SucceededWithIssues;]"
           exit 0

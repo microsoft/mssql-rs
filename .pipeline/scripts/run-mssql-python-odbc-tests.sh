@@ -39,8 +39,8 @@
 #      files skipped because the time budget ran out.
 #   2  the harness itself could not run the tests (broken venv, missing
 #      interpreter, or a run in which no file executed a single test).
-# The pipeline treats exit 1 as advisory (SucceededWithIssues); exit 2 still
-# fails the job. Local callers receive the original nonzero exit code.
+# Non-PR CI treats exit 1 as advisory (SucceededWithIssues); PRs and exit 2 still
+# fail the job. Local callers receive the original nonzero exit code.
 
 # No `set -e`: a failing or crashing test file must not abort the loop.
 set -uo pipefail

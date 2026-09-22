@@ -80,7 +80,7 @@ steps:
     set -euo pipefail
     rc=0
     pytest $(Build.SourcesDirectory)/mssql-py-core/tests/mssql_python/ -v --tb=short --junitxml=$(Build.SourcesDirectory)/pytest-mssql-python-macos-results.xml || rc=$?
-    if [ "$rc" -eq 1 ]; then
+    if [ "$rc" -eq 1 ] && [ "${BUILD_REASON:-PullRequest}" != "PullRequest" ]; then
       echo "##vso[task.logissue type=warning]mssql-python macOS tests did not fully pass"
       echo "##vso[task.complete result=SucceededWithIssues;]"
       exit 0

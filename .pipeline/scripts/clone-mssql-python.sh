@@ -4,6 +4,7 @@
 #
 # Check out the approved microsoft/mssql-python revision for cross-repo tests.
 # MSSQL_PYTHON_CLONE_DIR sets the destination (default: ../mssql-python).
+# PR and local runs use the SHA pin; non-PR pipeline runs follow main.
 
 set -euo pipefail
 
@@ -11,14 +12,17 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PIN_FILE="$SCRIPT_DIR/../mssql-python-revision.txt"
 CLONE_DIR="${MSSQL_PYTHON_CLONE_DIR:-../mssql-python}"
 
-if [ ! -f "$PIN_FILE" ]; then
-  echo "##[error]Missing mssql-python pin: $PIN_FILE" >&2
-  exit 1
-fi
-REVISION="$(cat "$PIN_FILE")"
-if [[ ! "$REVISION" =~ ^[0-9a-f]{40}$ ]] && ! git check-ref-format --branch "$REVISION" >/dev/null 2>&1; then
-  echo "##[error]mssql-python pin must contain a full lowercase 40-character commit SHA or branch name: $PIN_FILE" >&2
-  exit 1
+REVISION="main"
+if [ "${BUILD_REASON:-PullRequest}" = "PullRequest" ]; then
+  if [ ! -f "$PIN_FILE" ]; then
+    echo "##[error]Missing mssql-python pin: $PIN_FILE" >&2
+    exit 1
+  fi
+  REVISION="$(cat "$PIN_FILE")"
+  if [[ ! "$REVISION" =~ ^[0-9a-f]{40}$ ]]; then
+    echo "##[error]mssql-python pin must contain one full lowercase 40-character commit SHA: $PIN_FILE" >&2
+    exit 1
+  fi
 fi
 
 echo "##[section]mssql-python requested pin: $REVISION"

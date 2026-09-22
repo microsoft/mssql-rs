@@ -30,6 +30,7 @@ class PinnedCheckout(unittest.TestCase):
             "GIT_COMMITTER_NAME": "Checkout test",
             "GIT_COMMITTER_EMAIL": "checkout@example.invalid",
             "BUILD_REPOSITORY_PROVIDER": "TfsGit",
+            "BUILD_REASON": "PullRequest",
             "SYSTEM_PULLREQUEST_PULLREQUESTID": "123",
             "MSSQL_PYTHON_BRANCH": "main",
         }
@@ -89,14 +90,13 @@ class PinnedCheckout(unittest.TestCase):
         self.assertEqual(self.git(self.remote, "rev-parse", "main"), latest)
         self.assert_pinned("second checkout")
 
-    def test_branch_pin_tracks_latest_commit_on_each_checkout(self):
-        for branch in ("main", "feature/test"):
-            self.git(self.remote, "checkout", "-B", branch)
-            self.git(self.remote, "tag", branch, self.pin)
-            self.pin_file.write_text(branch + "\n", encoding="ascii")
+    def test_ci_tracks_main_instead_of_pin_on_each_checkout(self):
+        self.git(self.remote, "tag", "main", self.pin)
+        for reason in ("IndividualCI", "BatchedCI", "Manual", "Schedule"):
+            self.env["BUILD_REASON"] = reason
             for attempt in range(2):
-                with self.subTest(branch=branch, attempt=attempt):
-                    destination = f"{branch.replace('/', '-')}-{attempt}"
+                with self.subTest(reason=reason, attempt=attempt):
+                    destination = f"{reason}-{attempt}"
                     latest = self.commit(destination)
                     result = self.checkout(destination)
                     self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -104,15 +104,17 @@ class PinnedCheckout(unittest.TestCase):
                     self.assertEqual(self.git(checkout, "rev-parse", "HEAD"), latest)
                     self.assertEqual(self.git(checkout, "rev-parse", "--abbrev-ref", "HEAD"), "HEAD")
                     self.assertEqual(self.git(checkout, "rev-list", "--count", "HEAD"), "1")
-                    self.assertIn(f"requested pin: {branch}", result.stdout)
+                    self.assertIn("requested pin: main", result.stdout)
                     self.assertIn(f"mssql-python HEAD: {latest}", result.stdout)
 
-    def test_unavailable_branch_never_falls_back_to_main(self):
-        self.pin_file.write_text("missing-branch\n", encoding="ascii")
-        self.git(self.remote, "tag", "missing-branch", self.pin)
+    def test_ci_missing_main_never_falls_back_to_tag_or_pin(self):
+        self.env["BUILD_REASON"] = "IndividualCI"
+        self.git(self.remote, "tag", "main", self.pin)
+        self.git(self.remote, "symbolic-ref", "HEAD", "refs/heads/other")
+        self.git(self.remote, "update-ref", "-d", "refs/heads/main")
         result = self.checkout()
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("Cannot fetch mssql-python pin missing-branch", result.stderr)
+        self.assertIn("Cannot fetch mssql-python pin main", result.stderr)
         self.assertFalse((self.root / "checkout" / "content.txt").exists())
 
     def test_existing_checkout_is_not_modified(self):
@@ -132,7 +134,7 @@ class PinnedCheckout(unittest.TestCase):
         self.assertFalse((self.root / "checkout").exists())
 
     def test_invalid_pin_fails_before_creating_destination(self):
-        for pin in ("", "-branch", "bad..branch", "branch name",
+        for pin in ("", "main", "feature/test", self.pin[:7], "g" * 40, self.pin.upper(),
                     f"{self.pin}\n{self.newer}", f" {self.pin}"):
             with self.subTest(pin=pin):
                 self.pin_file.write_text(pin, encoding="ascii")
@@ -154,6 +156,10 @@ class PinnedCheckout(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Cannot fetch mssql-python pin", result.stderr)
         self.assertFalse((self.root / "checkout" / "content.txt").exists())
+
+    def test_local_checkout_defaults_to_pin(self):
+        self.env.pop("BUILD_REASON")
+        self.assert_pinned("local checkout")
 
 
 if __name__ == "__main__":
