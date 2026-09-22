@@ -2653,6 +2653,84 @@ mod tests {
         }
     }
 
+    #[test]
+    fn bound_narrow_plp_does_not_resume_output_after_truncation() {
+        use mssql_mock_tds::{ColumnDefinition, ColumnValue, QueryResponse, Row, SqlDataType};
+        use mssql_tds::token::tokens::SqlCollation;
+
+        // Raw PLP bytes carry CP1252 euros followed by ASCII in a later read.
+        // The second euro cannot fit, but a later ASCII byte could fill the gap.
+        let response = QueryResponse::new(
+            vec![
+                ColumnDefinition::new("", SqlDataType::NVarCharMax),
+                ColumnDefinition::new("", SqlDataType::Int),
+            ],
+            vec![Row::new(vec![
+                ColumnValue::NVarCharMax(vec![
+                    vec![u16::from_le_bytes([0x80, 0x80])],
+                    vec![u16::from_le_bytes(*b"ab")],
+                ]),
+                ColumnValue::Int(42),
+            ])],
+        );
+        let h = TestHandles::with_env_dbc_stmt();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let _server = crate::test_support::connect_mock_server(dbc, "SELECT euros", response);
+        let mut state = dbc.inner.lock().unwrap();
+        let client = state.client.as_mut().unwrap();
+        dbc.runtime
+            .block_on(client.execute("SELECT euros".to_string(), ()))
+            .unwrap();
+        assert!(dbc.runtime.block_on(client.next_row_cursor()).unwrap());
+        assert!(matches!(
+            dbc.runtime.block_on(client.read_row_column(0)).unwrap(),
+            CursorColumn::PlpStreaming { .. }
+        ));
+        let mut output = [0xcc_u8; 7];
+        let mut indicator = -99;
+        let binding = binding(
+            1,
+            SQL_C_CHAR,
+            unsafe { output.as_mut_ptr().add(1).cast() },
+            5,
+            &mut indicator,
+        );
+        let mut scratch = [0; 2];
+        let outcome = unsafe {
+            deliver_bound_plp(
+                client,
+                &dbc.runtime,
+                &binding,
+                0,
+                0,
+                Some(PlpColumnInfo {
+                    wire_encoding: PlpEncoding::SingleByteText,
+                    text_encoding: Some(EncodingType::LcidBased(SqlCollation {
+                        info: 0x0409,
+                        lcid_language_id: 0x0409,
+                        col_flags: 0,
+                        sort_id: 0,
+                    })),
+                }),
+                &mut scratch,
+            )
+        }
+        .unwrap();
+        assert_eq!(outcome, RowOutcome::Info(RowIssue::StringTruncated));
+        assert_eq!(&output[1..5], b"\xe2\x82\xac\0");
+        assert_eq!(output[0], 0xcc);
+        assert_eq!(output[6], 0xcc);
+        assert_eq!(indicator, 8, "two three-byte euros plus two ASCII bytes");
+        assert!(matches!(
+            dbc.runtime.block_on(client.read_row_column(1)).unwrap(),
+            CursorColumn::Value {
+                value: ColumnValues::Int(42),
+                ..
+            }
+        ));
+        assert!(!dbc.runtime.block_on(client.next_row_cursor()).unwrap());
+    }
+
     /// The `uniqueidentifier` SQL type, the only default-resolved target wide
     /// enough to overrun a plausibly-sized application slot.
     fn guid_columns(n: usize) -> Vec<SqlSmallInt> {
