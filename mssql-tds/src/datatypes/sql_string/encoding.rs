@@ -73,6 +73,8 @@ impl ResolvedEncoding {
         }
         let mut bytes = Vec::with_capacity(text.len());
         let mut errors = false;
+        // Non-ASCII uses a bounded 128-entry scan to keep one mapping table
+        // rather than allocate and maintain a separate reverse index.
         for character in text.chars() {
             if character.is_ascii() {
                 bytes.push(character as u8);
