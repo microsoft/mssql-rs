@@ -126,7 +126,9 @@ malformed fields report `22007`. This follows `IsValidColumnConversion`'s
 `SQLTIMEN` arm (`sqlcresl.cpp:460-473`) and `ConvertToDateTime`'s
 `SQL_TIME2_MAPPED` branch (`sqlccnvt.cpp:3869-3902`). Measured on the same retail
 build by `TimeToTimestampoffsetViaGetData` and `TimeToTimestampoffsetViaBoundFetch`
-for `time(0)` and `time(7)`, including a run with `TZ=UTC-12`.
+for `time(0)` and `time(7)`. A one-off manual Linux comparison also passed with
+`TZ=UTC-12` exported before invoking the e2e runner. The tests use the ambient
+process timezone; they do not set `TZ` or provide an automated timezone matrix.
 Character time-only literals to timestampoffset remain outside this change.
 
 Malformed decoded native values are covered by Rust regressions, not a retail
