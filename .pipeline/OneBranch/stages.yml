@@ -42,6 +42,11 @@ parameters:
   default: false
   displayName: 'Create publishable Rust crate artifacts'
 
+- name: testPythonWheelInstalls
+  type: boolean
+  default: false
+  displayName: 'Clean-install every final Python wheel'
+
 - name: isOfficial
   type: boolean
   default: false
@@ -179,6 +184,11 @@ stages:
           python "$(Build.SourcesDirectory)\scripts\inject-odbc-into-wheels.py" --wheels-dir "$(ob_outputDirectory)\wheels" --drivers-dir "$(Build.SourcesDirectory)\drivers"
         displayName: 'Inject ODBC driver into wheels (Windows x64)'
         condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+    - ${{ if and(eq(parameters.testPythonWheelInstalls, true), eq(parameters.buildOdbcNative, true), eq(parameters.buildPythonWheels, true)) }}:
+      - template: /.pipeline/templates/test-python-wheel-installs-template.yml
+        parameters:
+          osType: Windows
+          architecture: x64
     - task: PublishPipelineArtifact@1
       displayName: 'Publish Windows x64 Artifacts'
       inputs:
@@ -250,6 +260,16 @@ stages:
             python "$(Build.SourcesDirectory)\scripts\inject-odbc-into-wheels.py" --wheels-dir "$(ob_outputDirectory)\wheels" --drivers-dir "$(Build.SourcesDirectory)\drivers"
           displayName: 'Inject ODBC driver into wheels (Windows ARM64)'
           condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+      - ${{ if and(eq(parameters.testPythonWheelInstalls, true), eq(parameters.buildOdbcNative, true), eq(parameters.buildPythonWheels, true)) }}:
+        - template: /.pipeline/templates/test-python-wheel-installs-template.yml
+          parameters:
+            osType: Windows
+            architecture: arm64
+            pythonVersions:
+            - '3.11'
+            - '3.12'
+            - '3.13'
+            - '3.14'
       - task: PublishPipelineArtifact@1
         displayName: 'Publish Windows ARM64 Artifacts'
         inputs:
@@ -393,6 +413,11 @@ stages:
           cp "$(Build.SourcesDirectory)/wheels-228"/*.whl "$(ob_outputDirectory)/wheels/"
         displayName: 'Repair glibc-2.28 wheels (Linux x64)'
         condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+    - ${{ if and(eq(parameters.testPythonWheelInstalls, true), eq(parameters.buildOdbcNative, true), eq(parameters.buildPythonWheels, true)) }}:
+      - template: /.pipeline/templates/test-python-wheel-installs-template.yml
+        parameters:
+          osType: Linux
+          architecture: x64
     - task: PublishPipelineArtifact@1
       displayName: 'Publish Linux x64 Artifacts'
       inputs:
@@ -533,6 +558,11 @@ stages:
             cp "$(Build.SourcesDirectory)/wheels-228"/*.whl "$(ob_outputDirectory)/wheels/"
           displayName: 'Repair glibc-2.28 wheels (Linux ARM64)'
           condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+      - ${{ if and(eq(parameters.testPythonWheelInstalls, true), eq(parameters.buildOdbcNative, true), eq(parameters.buildPythonWheels, true)) }}:
+        - template: /.pipeline/templates/test-python-wheel-installs-template.yml
+          parameters:
+            osType: Linux
+            architecture: arm64
       - task: PublishPipelineArtifact@1
         displayName: 'Publish Linux ARM64 Artifacts'
         inputs:
@@ -553,7 +583,7 @@ stages:
         type: linux
         isCustom: true
         name: Azure Pipelines
-        vmImage: macOS-14
+        vmImage: macOS-15
       variables:
         ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
         ob_artifactSuffix: '_macos_universal2'
@@ -601,6 +631,11 @@ stages:
               --drivers-dir "$(Build.SourcesDirectory)/drivers"
           displayName: 'Inject ODBC driver into macOS wheels'
           condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+      - ${{ if and(eq(parameters.testPythonWheelInstalls, true), eq(parameters.buildOdbcNative, true), eq(parameters.buildPythonWheels, true)) }}:
+        - template: /.pipeline/templates/test-python-wheel-installs-template.yml
+          parameters:
+            osType: MacOS
+            architecture: universal2
       - task: PublishPipelineArtifact@1
         displayName: 'Publish macOS Artifacts'
         inputs:
