@@ -53,6 +53,68 @@ its platform. Free-threaded CPython is not supported by `abi3`.
 
 ## Version Scheme
 
+### Scheduled Rust crate version bumps
+
+The **Bump Released Crate Versions** GitHub workflow checks the default branch
+against crates.io every three UTC days. A daily trigger at 08:23 UTC runs the
+check on days whose Unix day number is divisible by three; unlike `*/3` in the
+day-of-month field, this does not reset at month boundaries. GitHub may delay or
+skip scheduled runs. **Run workflow** bypasses the date check and still targets
+the default branch.
+
+`mssql-tds` and `mssql-mock-tds` are checked independently. If a crate's exact
+`[package].version` exists among its published versions (including older or
+yanked releases), the workflow suggests the next minor version: `0.1.7` becomes
+`0.2.0`. Unpublished source versions and crates that return HTTP 404 are left
+alone. Other registry errors fail the run rather than assuming a crate is
+unpublished. If the proposed next minor version is also published, the run fails
+and a maintainer must choose a new version. Before any bump is planned, the
+workflow also fails when the current `mssql-tds` and `mssql-mock-tds` source
+versions differ in either direction (`mssql-tds` and `mssql-mock-tds` must stay
+aligned for a release), because silently tolerating a drifted state can leave the
+repo in a release-invalid configuration. If the mock source version is ahead of
+the core target, the run also fails so a maintainer can choose the versions
+manually. A mock-only bump is deferred until the current `mssql-tds` version is
+published, because the mock crate's exact versioned dependency must resolve from
+the registry when it is packaged. When `mssql-tds` is bumped, the mock source
+version is kept aligned with the core target because the release pipeline stamps
+the mock crate from the core version.
+
+Local versions come from `cargo metadata`. The workflow does not edit files,
+push branches, create PRs, publish crates, merge anything, or change the release
+pipeline's existing version-stamping policy. If a matching open version-bump PR
+targets the default branch, the workflow skips issue creation.
+
+When a bump is needed, the workflow creates or updates one tracking issue labeled
+`automation:crate-version-bump`. The issue includes:
+
+1. the affected crates and suggested next minor versions;
+2. TOML snippets for the manifest edits, including the mock crate's versioned
+   `mssql-tds` dependency when the core crate is bumped;
+3. crisp maintainer instructions to apply the snippets, run `cargo fetch` (or
+   `cargo update --workspace --offline`) to refresh `Cargo.lock`, then run
+   `cargo bfmt`, `cargo bclippy`, and `cargo btest`, and finally open a PR with
+   `Fixes #<issue-number>` and the version summary in the PR description.
+
+The workflow queries only open issues labeled `automation:crate-version-bump`,
+then checks the hidden marker in their bodies before reusing or updating one.
+It regenerates the issue body while the bump is pending; put maintainer notes
+in issue comments. The label is created automatically when needed; multiple
+matching open issues fail the run for manual cleanup.
+When no bump is needed, no issue is changed. If a bump becomes unnecessary, close
+its issue manually.
+
+The shared validation pipeline runs `scripts/test_bump_released_crate_versions.py`
+in its Windows Python test step for both PR validation and main-branch CI.
+Cargo metadata, registry, pull request, and issue requests are mocked. No
+cargo-edit installation or live issue/PR writes are needed.
+
+The workflow uses the built-in `GITHUB_TOKEN` with contents read, issues write,
+and pull request read permissions. No custom secret or permission to create PRs
+is needed. Normal validation and review are still required before merging.
+
+### Python and NuGet versions
+
 The NuGet transport package and `mssql-python-rs` Python distribution share the
 version from `mssql-py-core/pyproject.toml`. The Rust crate has an independent
 version in `mssql-py-core/Cargo.toml`. For example, NuGet

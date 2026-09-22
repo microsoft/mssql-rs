@@ -678,7 +678,7 @@ pub unsafe extern "C" fn SQLFetch(statement_handle: SqlHandle) -> SqlReturn {
 /// # Safety
 /// `statement_handle` must be a valid statement handle or null. The buffers
 /// must stay valid until the column is unbound or the statement is freed. At
-/// each fetch, `target_value_ptr` must be writable for
+/// each fetch, a non-null `target_value_ptr` must be writable for
 /// `SQL_ATTR_ROW_ARRAY_SIZE` elements of `buffer_length` bytes for a character
 /// or binary target, or of the full C type size for a fixed-width target, even
 /// when `buffer_length` is zero or smaller. `strlen_or_ind_ptr`, when non-null,

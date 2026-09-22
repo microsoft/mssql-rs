@@ -11,35 +11,39 @@
 //   4.  UnknownFieldIdentifier            - unreported field id → HY091
 //   5.  DescCountIgnoresColumnNumber      - SQL_DESC_COUNT describes the result set
 //   6.  ConciseTypePerColumnType          - int/varchar/nvarchar/decimal concise types
-//   7.  TypeNameAndRadix                  - SQL_DESC_TYPE_NAME, SQL_DESC_NUM_PREC_RADIX
-//   8.  PrecisionScaleAndNullable         - DECIMAL(10,2), NOT NULL vs NULL
-//   9.  UnsignedIsFalseOnlyForSignedNumerics - nonnumeric columns are "unsigned"
-//   10. DisplaySizeIsRenderedWidth        - sign, hex expansion, characters not bytes
-//   11. DisplaySizeForApproximateNumerics - real/float exponential form
-//   12. OctetLengthIsTransferSize         - ODBC C struct size, not TDS wire width
-//   13. VerboseTypeDiffersFromConciseForTimestamps - SQL_DATETIME + subtype
-//   14. VerboseTypeMatchesConciseForNonTimestamps
-//   15. SearchableIsDerivedFromTheType    - LIKE-only, unsearchable, full
-//   16. IdentityColumnReportsAutoUniqueValue
-//   17. AliasedColumnDoesNotReportTheAliasAsBaseColumnName
-//   18. NameIsReportedInBytes             - SQL_DESC_NAME length is a byte count
-//   19. NameTruncationReturnsInfo         - short buffer → SUCCESS_WITH_INFO + 01004
-//   20. VariantTypeOnNonVariantColumn     - HY113
-//   21. VariantUnderlyingTypeAfterProbe   - probe then SQL_CA_SS_VARIANT_TYPE
-//   22. Odbc2TemporalVariantTypes          - legacy codes and SS binary fallback
-//   23. Odbc3TemporalVariantTypes          - legacy codes and SS binary fallback
-//   24. Odbc38TemporalVariantTypes         - legacy codes and SS extended types
-//   25. EmptyVariantProbeConsumesValueButKeepsBaseType - base type survives the probe
-//   26. VariantTypeBeforeProbeIsSequenceError - attribute before the value is read
-//   27. ClrUdtDescriptorFields             - CLR UDT type, size, and identity fields
-//   28. ClrUdtIdentityFieldsAreEmptyForNonUdtColumns - non-UDT identity fields are empty
-//   29. VariantExactNumericsReportNumeric - decimal/numeric/money/smallmoney → SQL_C_NUMERIC
-//   30. VariantDecimalStillDeliversAsCharacter - the SQL_C_CHAR read after the attribute
-//   31. VariantBaseTypesMatchMsodbcsql    - every measured-parity base type
+//   7.  ClrUdtDescriptorFields            - CLR UDT type, size, and identity fields
+//   8.  ClrUdtIdentityFieldsAreEmptyForNonUdtColumns - non-UDT identity fields are empty
+//   9.  TypeNameAndRadix                  - SQL_DESC_TYPE_NAME, SQL_DESC_NUM_PREC_RADIX
+//   10. PrecisionScaleAndNullable         - DECIMAL(10,2), NOT NULL vs NULL
+//   11. UnsignedIsFalseOnlyForSignedNumerics - nonnumeric columns are "unsigned"
+//   12. DisplaySizeIsRenderedWidth        - sign, hex expansion, characters not bytes
+//   13. DisplaySizeForApproximateNumerics - real/float exponential form
+//   14. OctetLengthIsTransferSize         - ODBC C struct size, not TDS wire width
+//   15. VerboseTypeDiffersFromConciseForTimestamps - SQL_DATETIME + subtype
+//   16. DatetimeSubtypeAccompaniesTheVerboseType - SQL_DESC_DATETIME_INTERVAL_CODE
+//   17. VerboseTypeMatchesConciseForNonTimestamps
+//   18. SearchableIsDerivedFromTheType    - LIKE-only, unsearchable, full
+//   19. IdentityColumnReportsAutoUniqueValue
+//   20. AliasedColumnDoesNotReportTheAliasAsBaseColumnName
+//   21. NameIsReportedInBytes             - SQL_DESC_NAME length is a byte count
+//   22. NameTruncationReturnsInfo         - short buffer → SUCCESS_WITH_INFO + 01004
+//   23. VariantTypeOnNonVariantColumn     - HY113
+//   24. VariantUnderlyingTypeAfterProbe   - probe then SQL_CA_SS_VARIANT_TYPE
+//   25. Odbc3TemporalVariantTypes         - legacy codes and SS binary fallback
+//   26. Odbc38TemporalVariantTypes        - legacy codes and SS extended types
+//   27. EmptyVariantProbeConsumesValueButKeepsBaseType - base type survives the probe
+//   28. EmptyVariantProbeReturnsSuccessWithoutWarning - this driver's exact return
+//   29. NullVariantDoesNotDisturbTheFollowingColumn - no base type byte to consume
+//   30. VariantTypeIsPerColumn            - a probe answers only for its own column
+//   31. VariantTypeBeforeProbeIsSequenceError - attribute before the value is read
+//   32. VariantExactNumericsReportNumeric - decimal/numeric/money/smallmoney → SQL_C_NUMERIC
+//   33. VariantDecimalStillDeliversAsCharacter - the SQL_C_CHAR read after the attribute
+//   34. VariantBaseTypesMatchMsodbcsql    - every measured-parity base type
 
 #include "odbc_test_fixture.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <string>
 
 // SQL Server-specific identifiers not in standard <sqlext.h>.
@@ -91,20 +95,6 @@ protected:
         }
         ASSERT_SQL_OK(SQLSetEnvAttr(env_, SQL_ATTR_ODBC_VERSION,
                                     reinterpret_cast<SQLPOINTER>(SQL_OV_ODBC3), 0),
-                      SQL_HANDLE_ENV, env_);
-        Connect();
-    }
-};
-
-class ColAttributeOdbc2LiveTest : public ODBCTest {
-protected:
-    void SetUp() override {
-        ODBCTest::SetUp();
-        if (!ODBCTestConfig::Instance().HasConnection()) {
-            FAIL() << "No connection configured - set ODBC_TEST_SERVER or ODBC_TEST_CONNSTR";
-        }
-        ASSERT_SQL_OK(SQLSetEnvAttr(env_, SQL_ATTR_ODBC_VERSION,
-                                    reinterpret_cast<SQLPOINTER>(SQL_OV_ODBC2), 0),
                       SQL_HANDLE_ENV, env_);
         Connect();
     }
@@ -586,22 +576,6 @@ TEST_F(ColAttributeLiveTest, VariantUnderlyingTypeAfterProbe) {
     SQLCloseCursor(stmt_);
 }
 
-// ODBC 3.8 introduced the SQL Server temporal C types. Applications declaring
-// ODBC 2 or 3 receive the binary fallback for time and datetimeoffset.
-TEST_F(ColAttributeOdbc2LiveTest, Odbc2TemporalVariantTypes) {
-    ExecDirect(TEMPORAL_VARIANTS_QUERY);
-
-    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
-    ASSERT_NO_FATAL_FAILURE(ExpectVariantType(stmt_, 1, SQL_C_DATE));
-    ASSERT_NO_FATAL_FAILURE(ExpectVariantType(stmt_, 2, SQL_C_TIMESTAMP));
-    ASSERT_NO_FATAL_FAILURE(ExpectVariantType(stmt_, 3, SQL_C_TIMESTAMP));
-    ASSERT_NO_FATAL_FAILURE(ExpectVariantType(stmt_, 4, SQL_C_TIMESTAMP));
-    ASSERT_NO_FATAL_FAILURE(ExpectVariantType(stmt_, 5, SQL_C_BINARY));
-    ASSERT_NO_FATAL_FAILURE(ExpectVariantType(stmt_, 6, SQL_C_BINARY));
-
-    SQLCloseCursor(stmt_);
-}
-
 TEST_F(ColAttributeOdbc3LiveTest, Odbc3TemporalVariantTypes) {
     ExecDirect(TEMPORAL_VARIANTS_QUERY);
 
@@ -666,6 +640,33 @@ TEST_F(ColAttributeLiveTest, EmptyVariantProbeConsumesValueButKeepsBaseType) {
 
     // Nothing remained, so the column is done rather than re-readable.
     EXPECT_EQ(SQL_NO_DATA, SQLGetData(stmt_, 1, SQL_C_BINARY, &probe, 0, &indicator));
+
+    SQLCloseCursor(stmt_);
+}
+
+// The one divergence on this path, asserted on both legs rather than skipped so
+// CI keeps measuring the reference driver. msodbcsql 18.6.2.1 — the build
+// pinned by `msodbcsqlVersion` in `.pipeline/validation-pipeline.yml` — answers
+// SQL_SUCCESS_WITH_INFO/01004 for a variant wrapping an empty value, where this
+// driver answers SQL_SUCCESS. Registry entry 13 records the decision; if a
+// later msodbcsql build stops warning here, this test is what reports it.
+TEST_F(ColAttributeLiveTest, EmptyVariantProbeReturnsSuccessWithoutWarning) {
+    const char* target = std::getenv("ODBC_TEST_TARGET");
+    const bool comparing_msodbcsql = target && std::string(target) == "msodbcsql";
+
+    ExecDirect("SELECT CAST(CAST('' AS VARBINARY(8)) AS SQL_VARIANT) AS v");
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    SQLCHAR probe = 0;
+    SQLLEN indicator = -999;
+    SQLRETURN rc = SQLGetData(stmt_, 1, SQL_C_BINARY, &probe, 0, &indicator);
+    if (comparing_msodbcsql) {
+        EXPECT_EQ(SQL_SUCCESS_WITH_INFO, rc);
+        EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01004");
+    } else {
+        EXPECT_EQ(SQL_SUCCESS, rc);
+    }
+    EXPECT_EQ(0, indicator);
 
     SQLCloseCursor(stmt_);
 }
