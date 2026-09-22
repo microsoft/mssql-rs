@@ -51,6 +51,11 @@ parameters:
   type: boolean
   default: false
 
+- name: linuxImage
+  displayName: 'Agent image for the Linux jobs'
+  type: string
+  default: RUST-UBUSLIM
+
 # The architectures a version covers, deliberately a set rather than a toggle
 # each: they publish together or not at all.
 - name: architectures
@@ -107,7 +112,7 @@ stages:
     pool:
       name: RUST-UTIL-WUS3
       demands:
-        - imageOverride -equals RUST-UBUSLIM
+        - imageOverride -equals ${{ parameters.linuxImage }}
     steps:
     - checkout: self
     # Every run-dialog value is passed as an environment variable, never
@@ -145,3 +150,4 @@ stages:
         macosMajorFloor: ${{ parameters.macosMajorFloor }}
         dryRun: ${{ parameters.dryRun }}
         feed: ${{ parameters.feed }}
+        poolImageOverride: imageOverride -equals ${{ parameters.linuxImage }}

@@ -31,6 +31,16 @@ trigger: none
 pr: none
 
 parameters:
+- name: linuxImage
+  displayName: 'Agent image for x64 Linux jobs'
+  type: string
+  default: RUST-UBUSLIM
+
+- name: linuxArmImage
+  displayName: 'Agent image for ARM64 Linux jobs'
+  type: string
+  default: RUST-UBUNTU-ARM64
+
 # Publishing is opt-in for safety. When false (the default) the corresponding
 # stage still BUILDS everything but logs a clear DRY RUN message instead of
 # uploading to the feed.
@@ -146,7 +156,7 @@ extends:
           isCustom: true
           name: RUST-X64-WUS3
           demands:
-            - imageOverride -equals RUST-UBUSLIM
+            - imageOverride -equals ${{ parameters.linuxImage }}
         variables:
           ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
           ob_artifactSuffix: '_mock_linux_x64'
@@ -197,7 +207,7 @@ extends:
           isCustom: true
           name: RUST-ARM64-WUS3
           demands:
-            - imageOverride -equals RUST-UBUNTU-ARM64
+            - imageOverride -equals ${{ parameters.linuxArmImage }}
         variables:
           ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
           ob_artifactSuffix: '_mock_linux_arm64'
@@ -250,7 +260,7 @@ extends:
           isCustom: true
           name: RUST-X64-WUS3
           demands:
-            - imageOverride -equals RUST-UBUSLIM
+            - imageOverride -equals ${{ parameters.linuxImage }}
         variables:
           ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
           ob_artifactSuffix: '_mock_linux_musl_x64'
@@ -303,7 +313,7 @@ extends:
           isCustom: true
           name: RUST-ARM64-WUS3
           demands:
-            - imageOverride -equals RUST-UBUNTU-ARM64
+            - imageOverride -equals ${{ parameters.linuxArmImage }}
         variables:
           ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
           ob_artifactSuffix: '_mock_linux_musl_arm64'

@@ -2,6 +2,7 @@
 parameters:
   matrix: {}
   poolName: 'RUST-X64-WUS3'
+  poolImageOverride: 'imageOverride -equals RUST-UBUSLIM'
 
 jobs:
   - job: Test_Matrix
@@ -11,7 +12,7 @@ jobs:
     pool:
       name: ${{ parameters.poolName }}
       demands:
-        - imageOverride -equals RUST-UBUSLIM
+        - ${{ parameters.poolImageOverride }}
     steps:
       - template: generate-sql-password-template.yml
         parameters:

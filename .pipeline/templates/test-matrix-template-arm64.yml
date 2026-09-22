@@ -51,6 +51,9 @@ parameters:
   - name: poolName
     type: string
     default: 'RUST-ARM64-WUS3'
+  - name: poolImageOverride
+    type: string
+    default: 'imageOverride -equals RUST-UBUNTU-ARM64'
 
 jobs:
   # ------------------------------------------------------------------
@@ -80,7 +83,7 @@ jobs:
       pool:
         name: ${{ parameters.poolName }}
         demands:
-          - imageOverride -equals RUST-UBUNTU-ARM64
+          - ${{ parameters.poolImageOverride }}
       steps:
         - bash: |
             set -euo pipefail
@@ -195,7 +198,7 @@ jobs:
         pool:
           name: ${{ parameters.poolName }}
           demands:
-            - imageOverride -equals RUST-UBUNTU-ARM64
+            - ${{ parameters.poolImageOverride }}
         steps:
           - bash: |
               set -euo pipefail

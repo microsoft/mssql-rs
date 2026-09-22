@@ -11,6 +11,7 @@ parameters:
   artifactName: 'Odbc_Linux_x64'
   nameSuffix: ''
   poolName: 'RUST-X64-WUS3'
+  poolImageOverride: 'imageOverride -equals RUST-UBUSLIM'
 
 jobs:
   - job: Test_Odbc_Matrix${{ parameters.nameSuffix }}
@@ -20,7 +21,7 @@ jobs:
     pool:
       name: ${{ parameters.poolName }}
       demands:
-        - imageOverride -equals RUST-UBUSLIM
+        - ${{ parameters.poolImageOverride }}
     steps:
       - template: generate-sql-password-template.yml
         parameters:

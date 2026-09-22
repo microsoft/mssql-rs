@@ -12,6 +12,16 @@
 trigger: none
 
 parameters:
+# Defaulted to the current images so nothing changes unless a run overrides them.
+- name: linuxImage
+  displayName: 'Agent image for x64 Linux jobs'
+  type: string
+  default: RUST-UBUSLIM
+- name: linuxArmImage
+  displayName: 'Agent image for ARM64 Linux jobs'
+  type: string
+  default: RUST-UBUNTU-ARM64
+
 # STAGE 1 (Import) is gated on the queue-time Docker Hub credential variables
 # (DOCKERHUB_USERNAME + DOCKERHUB_PAT): the import stage runs ONLY when
 # DOCKERHUB_USERNAME is set, and is skipped entirely otherwise. The per-image
@@ -149,7 +159,7 @@ stages:
     pool:
       name: RUST-X64-WUS3
       demands:
-        - imageOverride -equals RUST-UBUSLIM
+        - imageOverride -equals ${{ parameters.linuxImage }}
     steps:
     - checkout: none
     - task: AzureCLI@2
@@ -212,7 +222,7 @@ stages:
     pool:
       name: RUST-X64-WUS3
       demands:
-        - imageOverride -equals RUST-UBUSLIM
+        - imageOverride -equals ${{ parameters.linuxImage }}
     steps:
     - checkout: none
     - task: AzureCLI@2
@@ -249,7 +259,7 @@ stages:
     pool:
       name: RUST-X64-WUS3
       demands:
-        - imageOverride -equals RUST-UBUSLIM
+        - imageOverride -equals ${{ parameters.linuxImage }}
     steps:
     - checkout: none
     - task: AzureCLI@2
@@ -312,7 +322,7 @@ stages:
     pool:
       name: RUST-X64-WUS3
       demands:
-        - imageOverride -equals RUST-UBUSLIM
+        - imageOverride -equals ${{ parameters.linuxImage }}
     steps:
     - checkout: none
     - task: AzureCLI@2
@@ -371,7 +381,7 @@ stages:
     pool:
       name: RUST-X64-WUS3
       demands:
-        - imageOverride -equals RUST-UBUSLIM
+        - imageOverride -equals ${{ parameters.linuxImage }}
     steps:
     - checkout: none
     - task: AzureCLI@2
@@ -430,7 +440,7 @@ stages:
     pool:
       name: RUST-X64-WUS3
       demands:
-        - imageOverride -equals RUST-UBUSLIM
+        - imageOverride -equals ${{ parameters.linuxImage }}
     steps:
     - checkout: none
     - task: AzureCLI@2
@@ -489,7 +499,7 @@ stages:
     pool:
       name: RUST-X64-WUS3
       demands:
-        - imageOverride -equals RUST-UBUSLIM
+        - imageOverride -equals ${{ parameters.linuxImage }}
     steps:
     - checkout: none
     - task: AzureCLI@2
@@ -635,7 +645,7 @@ stages:
     pool:
       name: RUST-X64-WUS3
       demands:
-        - imageOverride -equals RUST-UBUSLIM
+        - imageOverride -equals ${{ parameters.linuxImage }}
     steps:
     - checkout: none
     - task: AzureCLI@2
@@ -670,7 +680,7 @@ stages:
     pool:
       name: RUST-X64-WUS3
       demands:
-        - imageOverride -equals RUST-UBUSLIM
+        - imageOverride -equals ${{ parameters.linuxImage }}
     steps:
     - checkout: none
     - task: AzureCLI@2
@@ -694,7 +704,7 @@ stages:
     pool:
       name: RUST-X64-WUS3
       demands:
-        - imageOverride -equals RUST-UBUSLIM
+        - imageOverride -equals ${{ parameters.linuxImage }}
     steps:
     - checkout: none
     - task: AzureCLI@2
@@ -741,7 +751,7 @@ stages:
     pool:
       name: RUST-X64-WUS3
       demands:
-        - imageOverride -equals RUST-UBUSLIM
+        - imageOverride -equals ${{ parameters.linuxImage }}
     steps:
     - checkout: self
       displayName: Checkout repository
@@ -864,7 +874,7 @@ stages:
     pool:
       name: RUST-X64-WUS3
       demands:
-        - imageOverride -equals RUST-UBUSLIM
+        - imageOverride -equals ${{ parameters.linuxImage }}
     steps:
     - checkout: self
       displayName: Checkout repository
@@ -942,7 +952,7 @@ stages:
     pool:
       name: RUST-ARM64-WUS3
       demands:
-        - imageOverride -equals RUST-UBUNTU-ARM64
+        - imageOverride -equals ${{ parameters.linuxArmImage }}
     steps:
     - checkout: self
       displayName: Checkout repository
@@ -1077,7 +1087,7 @@ stages:
     pool:
       name: RUST-X64-WUS3
       demands:
-        - imageOverride -equals RUST-UBUSLIM
+        - imageOverride -equals ${{ parameters.linuxImage }}
     steps:
     - checkout: none
 
@@ -1138,7 +1148,7 @@ stages:
     pool:
       name: RUST-X64-WUS3
       demands:
-        - imageOverride -equals RUST-UBUSLIM
+        - imageOverride -equals ${{ parameters.linuxImage }}
     steps:
     - checkout: none
 
@@ -1274,7 +1284,7 @@ stages:
     pool:
       name: RUST-X64-WUS3
       demands:
-        - imageOverride -equals RUST-UBUSLIM
+        - imageOverride -equals ${{ parameters.linuxImage }}
     steps:
     - checkout: none
 

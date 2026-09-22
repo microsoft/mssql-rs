@@ -16,6 +16,10 @@ parameters:
     displayName: 'Baseline branch (for manual runs; PR builds auto-detect target)'
     type: string
     default: main
+  - name: linuxImage
+    displayName: 'Agent image for x64 Linux jobs'
+    type: string
+    default: RUST-UBUSLIM
 
 stages:
   - stage: Benchmark
@@ -27,7 +31,7 @@ stages:
         pool:
           name: RUST-X64-WUS3
           demands:
-            - imageOverride -equals RUST-UBUSLIM
+            - imageOverride -equals ${{ parameters.linuxImage }}
         variables:
           ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
 

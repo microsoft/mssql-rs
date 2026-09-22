@@ -22,6 +22,16 @@
 #################################################################################
 
 parameters:
+- name: linuxImage
+  type: string
+  default: RUST-UBUSLIM
+  displayName: 'Agent image for x64 Linux jobs'
+
+- name: linuxArmImage
+  type: string
+  default: RUST-UBUNTU-ARM64
+  displayName: 'Agent image for ARM64 Linux jobs'
+
 - name: buildAllTargets
   type: boolean
   default: true
@@ -287,7 +297,7 @@ stages:
       isCustom: true
       name: RUST-X64-WUS3
       demands:
-        - imageOverride -equals RUST-UBUSLIM
+        - imageOverride -equals ${{ parameters.linuxImage }}
     variables:
       ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
       ob_artifactSuffix: '_linux_x64'
@@ -436,7 +446,7 @@ stages:
         isCustom: true
         name: RUST-ARM64-WUS3
         demands:
-          - imageOverride -equals RUST-UBUNTU-ARM64
+          - imageOverride -equals ${{ parameters.linuxArmImage }}
       variables:
         ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
         ob_artifactSuffix: '_linux_arm64'

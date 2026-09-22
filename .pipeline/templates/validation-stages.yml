@@ -2,6 +2,19 @@
 # and validation-pipeline-ci.yml (GitHub main CI). Single source of truth for stages.
 
 parameters:
+# Defaulted so any caller that does not pass them keeps the current images. These
+# exist so the Linux fleet can be moved between agent images, and moved back,
+# without editing every job.
+- name: linuxImage
+  displayName: Agent image for x64 Linux jobs
+  type: string
+  default: RUST-UBUSLIM
+
+- name: linuxArmImage
+  displayName: Agent image for ARM64 Linux jobs
+  type: string
+  default: RUST-UBUNTU-ARM64
+
 - name: buildType
   displayName: Type of the build to produce
   type: string
@@ -68,7 +81,7 @@ stages:
     pool:
       name: ${{ parameters.utilPoolName }}
       demands:
-        - imageOverride -equals RUST-UBUSLIM
+        - imageOverride -equals ${{ parameters.linuxImage }}
     steps:
     - bash: |
         set -euo pipefail
@@ -102,6 +115,7 @@ stages:
   - template: sql-host-template.yml
     parameters:
       poolName: ${{ parameters.poolName }}
+      poolImageOverride: imageOverride -equals ${{ parameters.linuxImage }}
       instanceId: build_arm
       expectedSentinels: build_arm,build_win_arm
       sqlImageTag: ${{ parameters.sqlImageTag }}
@@ -271,7 +285,7 @@ stages:
     pool:
       name: ${{ parameters.poolName }}
       demands:
-        - imageOverride -equals RUST-UBUSLIM
+        - imageOverride -equals ${{ parameters.linuxImage }}
     variables:
       CARGO_TARGET_DIR: $(Build.SourcesDirectory)
       ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
@@ -358,7 +372,7 @@ stages:
     pool:
       name: ${{ parameters.armPoolName }}
       demands:
-        - imageOverride -equals RUST-UBUNTU-ARM64
+        - imageOverride -equals ${{ parameters.linuxArmImage }}
     variables:
       CARGO_TARGET_DIR: $(Build.SourcesDirectory)
       ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
@@ -543,6 +557,7 @@ stages:
     - template: kerberos-test-template.yml
       parameters:
         poolName: ${{ parameters.poolName }}
+        poolImageOverride: imageOverride -equals ${{ parameters.linuxImage }}
         profiles:
           - ubuntu22
           - alpine318
@@ -562,6 +577,7 @@ stages:
     - template: kerberos-test-template.yml
       parameters:
         poolName: ${{ parameters.poolName }}
+        poolImageOverride: imageOverride -equals ${{ parameters.linuxImage }}
         profiles:
           - ubuntu22
           - ubuntu24
@@ -583,7 +599,7 @@ stages:
     pool:
       name: ${{ parameters.poolName }}
       demands:
-        - imageOverride -equals RUST-UBUSLIM
+        - imageOverride -equals ${{ parameters.linuxImage }}
     variables:
       CARGO_TARGET_DIR: $(Build.SourcesDirectory)
     steps:
@@ -605,7 +621,7 @@ stages:
     pool:
       name: ${{ parameters.poolName }}
       demands:
-        - imageOverride -equals RUST-UBUSLIM
+        - imageOverride -equals ${{ parameters.linuxImage }}
     variables:
       CARGO_TARGET_DIR: $(Build.SourcesDirectory)
     steps:
@@ -627,7 +643,7 @@ stages:
     pool:
       name: ${{ parameters.poolName }}
       demands:
-        - imageOverride -equals RUST-UBUSLIM
+        - imageOverride -equals ${{ parameters.linuxImage }}
     variables:
       CARGO_TARGET_DIR: $(Build.SourcesDirectory)
     steps:
@@ -674,7 +690,7 @@ stages:
     pool:
       name: ${{ parameters.poolName }}
       demands:
-        - imageOverride -equals RUST-UBUSLIM
+        - imageOverride -equals ${{ parameters.linuxImage }}
     variables:
       CARGO_TARGET_DIR: $(Build.SourcesDirectory)
     steps:
@@ -697,7 +713,7 @@ stages:
     pool:
       name: ${{ parameters.poolName }}
       demands:
-        - imageOverride -equals RUST-UBUSLIM
+        - imageOverride -equals ${{ parameters.linuxImage }}
     variables:
       CARGO_TARGET_DIR: $(Build.SourcesDirectory)
     steps:
@@ -792,7 +808,7 @@ stages:
     pool:
       name: ${{ parameters.poolName }}
       demands:
-        - imageOverride -equals RUST-UBUSLIM
+        - imageOverride -equals ${{ parameters.linuxImage }}
     steps:
       - template: test-mssql-python-odbc-template.yml
 
@@ -805,6 +821,7 @@ stages:
     - template: test-matrix-template-alpine.yml
       parameters:
         poolName: ${{ parameters.poolName }}
+        poolImageOverride: imageOverride -equals ${{ parameters.linuxImage }}
         artifactName: 'Build_Linux'
         matrix:
           Alpine3_18:
@@ -819,6 +836,7 @@ stages:
     - template: test-matrix-odbc-template.yml
       parameters:
         poolName: ${{ parameters.poolName }}
+        poolImageOverride: imageOverride -equals ${{ parameters.linuxImage }}
         artifactName: 'Odbc_Musl_x64'
         nameSuffix: _musl
         matrix:
@@ -844,6 +862,7 @@ stages:
       - template: sql-host-template.yml
         parameters:
           poolName: ${{ parameters.poolName }}
+          poolImageOverride: imageOverride -equals ${{ parameters.linuxImage }}
           instanceId: shared_musl
           sqlImageTag: ${{ parameters.sqlImageTag }}
           expectedSentinels: 'Alpine3_18,Alpine3_21,odbc_Alpine3_18,odbc_Alpine3_21'
@@ -852,7 +871,7 @@ stages:
           manageSqlHost: false
           artifactName: 'Build_Linux_ARM'
           poolName: ${{ parameters.armPoolName }}
-          poolImageOverride: imageOverride -equals RUST-UBUNTU-ARM64
+          poolImageOverride: imageOverride -equals ${{ parameters.linuxArmImage }}
           sqlInstanceMode: shared
           sqlImageTag: ${{ parameters.sqlImageTag }}
           targets:
@@ -865,6 +884,7 @@ stages:
       - template: test-matrix-odbc-template-arm64.yml
         parameters:
           poolName: ${{ parameters.armPoolName }}
+          poolImageOverride: imageOverride -equals ${{ parameters.linuxArmImage }}
           manageSqlHost: false
           sqlReadyInstanceId: shared_musl
           sentinelPrefix: 'odbc_'
@@ -885,7 +905,7 @@ stages:
         parameters:
           artifactName: 'Build_Linux_ARM'
           poolName: ${{ parameters.armPoolName }}
-          poolImageOverride: imageOverride -equals RUST-UBUNTU-ARM64
+          poolImageOverride: imageOverride -equals ${{ parameters.linuxArmImage }}
           sqlInstanceMode: per-job
           sqlImageTag: ${{ parameters.sqlImageTag }}
           targets:
@@ -898,6 +918,7 @@ stages:
       - template: test-matrix-odbc-template-arm64.yml
         parameters:
           poolName: ${{ parameters.armPoolName }}
+          poolImageOverride: imageOverride -equals ${{ parameters.linuxArmImage }}
           sqlInstanceMode: per-job
           sentinelPrefix: 'odbc_'
           sqlImageTag: ${{ parameters.sqlImageTag }}
@@ -919,6 +940,7 @@ stages:
     - template: test-matrix-template.yml
       parameters:
         poolName: ${{ parameters.poolName }}
+        poolImageOverride: imageOverride -equals ${{ parameters.linuxImage }}
         matrix:
           DebianBookworm:
             container: ghcr.io/microsoft/mssql-rs/import/debian:bookworm
@@ -950,6 +972,7 @@ stages:
     - template: test-matrix-odbc-template.yml
       parameters:
         poolName: ${{ parameters.poolName }}
+        poolImageOverride: imageOverride -equals ${{ parameters.linuxImage }}
         artifactName: 'Odbc_Linux_x64'
         matrix:
           DebianBookworm:
@@ -970,6 +993,7 @@ stages:
     - template: test-matrix-odbc-template.yml
       parameters:
         poolName: ${{ parameters.poolName }}
+        poolImageOverride: imageOverride -equals ${{ parameters.linuxImage }}
         artifactName: 'Odbc_glibc228_x64'
         nameSuffix: _glibc228
         matrix:
@@ -993,12 +1017,14 @@ stages:
       - template: sql-host-template.yml
         parameters:
           poolName: ${{ parameters.poolName }}
+          poolImageOverride: imageOverride -equals ${{ parameters.linuxImage }}
           instanceId: shared
           sqlImageTag: ${{ parameters.sqlImageTag }}
           expectedSentinels: 'DebianBookworm,AzLinux3,RHEL9,OracleLinux9,SLES15,Ubuntu22,Ubuntu24,odbc_DebianBookworm,odbc_Ubuntu22,odbc_Ubuntu24,odbc_AzLinux3,odbc_RHEL8'
       - template: test-matrix-template-arm64.yml
         parameters:
           poolName: ${{ parameters.armPoolName }}
+          poolImageOverride: imageOverride -equals ${{ parameters.linuxArmImage }}
           manageSqlHost: false
           sqlInstanceMode: shared
           sqlImageTag: ${{ parameters.sqlImageTag }}
@@ -1027,6 +1053,7 @@ stages:
       - template: test-matrix-odbc-template-arm64.yml
         parameters:
           poolName: ${{ parameters.armPoolName }}
+          poolImageOverride: imageOverride -equals ${{ parameters.linuxArmImage }}
           manageSqlHost: false
           sqlReadyInstanceId: shared
           sentinelPrefix: 'odbc_'
@@ -1053,6 +1080,7 @@ stages:
       - template: test-matrix-odbc-template-arm64.yml
         parameters:
           poolName: ${{ parameters.armPoolName }}
+          poolImageOverride: imageOverride -equals ${{ parameters.linuxArmImage }}
           manageSqlHost: false
           sqlReadyInstanceId: shared
           sentinelPrefix: 'odbc_'
@@ -1070,6 +1098,7 @@ stages:
       - template: test-matrix-template-arm64.yml
         parameters:
           poolName: ${{ parameters.armPoolName }}
+          poolImageOverride: imageOverride -equals ${{ parameters.linuxArmImage }}
           sqlInstanceMode: per-job
           sqlImageTag: ${{ parameters.sqlImageTag }}
           targets:
@@ -1097,6 +1126,7 @@ stages:
       - template: test-matrix-odbc-template-arm64.yml
         parameters:
           poolName: ${{ parameters.armPoolName }}
+          poolImageOverride: imageOverride -equals ${{ parameters.linuxArmImage }}
           sqlInstanceMode: per-job
           sentinelPrefix: 'odbc_'
           sqlImageTag: ${{ parameters.sqlImageTag }}
@@ -1119,6 +1149,7 @@ stages:
       - template: test-matrix-odbc-template-arm64.yml
         parameters:
           poolName: ${{ parameters.armPoolName }}
+          poolImageOverride: imageOverride -equals ${{ parameters.linuxArmImage }}
           sqlInstanceMode: per-job
           sentinelPrefix: 'odbc_'
           nameSuffix: _glibc228
@@ -1147,7 +1178,7 @@ stages:
     pool:
       name: ${{ parameters.utilPoolName }}
       demands:
-        - imageOverride -equals RUST-UBUSLIM
+        - imageOverride -equals ${{ parameters.linuxImage }}
     steps:
       - checkout: self
       - task: DownloadPipelineArtifact@2
@@ -1268,7 +1299,7 @@ stages:
       pool:
         name: ${{ parameters.poolName }}
         demands:
-          - imageOverride -equals RUST-UBUSLIM
+          - imageOverride -equals ${{ parameters.linuxImage }}
       variables:
         CARGO_TARGET_DIR: $(Build.SourcesDirectory)
       steps:
@@ -1287,7 +1318,7 @@ stages:
       pool:
         name: ${{ parameters.poolName }}
         demands:
-          - imageOverride -equals RUST-UBUSLIM
+          - imageOverride -equals ${{ parameters.linuxImage }}
       variables:
         CARGO_TARGET_DIR: $(Build.SourcesDirectory)
       steps:
@@ -1313,3 +1344,4 @@ stages:
       - template: private-link-smoke-template.yml
         parameters:
           poolName: ${{ parameters.poolName }}
+          poolImageOverride: imageOverride -equals ${{ parameters.linuxImage }}
