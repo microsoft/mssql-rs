@@ -183,9 +183,9 @@ for idx in "${!TEST_FILES[@]}"; do
     case "$rc" in
         0)   status="PASSED";              kind="ok";      passed=$((passed + 1)) ;;
         1)   status="FAILED";              kind="error";   failed=$((failed + 1)) ;;
-        2)   status="INTERRUPTED";         kind="error";   failed=$((failed + 1)) ;;
-        3)   status="INTERNAL ERROR";      kind="error";   failed=$((failed + 1)) ;;
-        4)   status="USAGE ERROR";         kind="error";   failed=$((failed + 1)) ;;
+        2)   status="INTERRUPTED";         kind="error";   harness_error=$((harness_error + 1)) ;;
+        3)   status="INTERNAL ERROR";      kind="error";   harness_error=$((harness_error + 1)) ;;
+        4)   status="USAGE ERROR";         kind="error";   harness_error=$((harness_error + 1)) ;;
         # Every test in the file was deselected by pytest.ini's `-m "not stress"`.
         5)   status="NO TESTS COLLECTED";  kind="skipped"; empty=$((empty + 1)) ;;
         # `timeout` could not run the command at all - a broken venv or missing

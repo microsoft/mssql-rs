@@ -216,6 +216,36 @@ def test_mssql_python_odbc_failures_are_advisory():
 
 @pytest.mark.skipif(shutil.which("bash") is None, reason="Bash is required")
 @pytest.mark.parametrize(
+    ("pytest_exit", "runner_exit"),
+    [(0, 0), (1, 1), (2, 2), (3, 2), (4, 2), (5, 0),
+     (124, 1), (125, 2), (126, 2), (127, 2), (137, 1), (139, 1)],
+)
+def test_odbc_runner_distinguishes_harness_errors(tmp_path, pytest_exit, runner_exit):
+    tests = tmp_path / "tests"
+    tests.mkdir()
+    (tests / "test_pass.py").touch()
+    (tests / "test_result.py").touch()
+    runner = _ROOT / ".pipeline" / "scripts" / "run-mssql-python-odbc-tests.sh"
+    script = f"""
+    python() {{ return 0; }}
+    timeout() {{
+        if [ "$6" = "tests/test_pass.py" ]; then return 0; fi
+        return {pytest_exit}
+    }}
+    MSSQL_PYTHON_DIR="$2" TEST_RESULTS_DIR="$2/test-results" \
+        PYTEST_FILE_TIMEOUT=10s PYTEST_TOTAL_BUDGET=120s source "$1"
+    """
+    result = subprocess.run(
+        ["bash", "-c", script, "bash", str(runner), str(tmp_path)],
+        capture_output=True, text=True,
+    )
+    assert result.returncode == runner_exit, result.stdout + result.stderr
+    assert f"harness errors: {int(runner_exit == 2)}" in result.stdout
+    assert len(list((tmp_path / "test-results").glob("*.xml"))) == 2
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="Bash is required")
+@pytest.mark.parametrize(
     ("template", "display_name", "command"),
     [
         ("test-mssql-python-macos-template.yml", "Run mssql-python tests", "pytest"),
