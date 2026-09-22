@@ -358,8 +358,20 @@ TEST_F(GetDataUtf16Test, Utf8VarcharPreservesBomAndHighBytes) {
 }
 
 TEST_F(GetDataUtf16Test, Cp1252MaterializedRoutesFitExactCapacity) {
-    for (const auto &value : Cp1252TestData::Values()) {
+    const auto& values = Cp1252TestData::Values();
+    ASSERT_FALSE(values.empty());
+    const auto& exhaustive = values.front().bytes;
+    ASSERT_EQ(256u, exhaustive.size());
+    auto distinct = exhaustive;
+    std::sort(distinct.begin(), distinct.end());
+    distinct.erase(std::unique(distinct.begin(), distinct.end()), distinct.end());
+    ASSERT_EQ(251u, distinct.size());
+    for (const auto &value : values) {
         SCOPED_TRACE(value.name);
+        for (int undefined : {0x81, 0x8D, 0x8F, 0x90, 0x9D}) {
+            ASSERT_EQ(value.bytes.end(), std::find(value.bytes.begin(), value.bytes.end(), undefined))
+                << "Live parity requires defined CP1252 bytes";
+        }
         const bool is_null = value.hex == "NULL";
         for (int route = 0; route < 3; ++route) {
             SCOPED_TRACE(route);

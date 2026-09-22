@@ -429,6 +429,9 @@ mod tests {
         assert_eq!(expected.len(), bytes.len());
         assert_eq!(expected[0x80], 0x20AC);
         assert_eq!(&expected[0x91..=0x94], &[0x2018, 0x2019, 0x201C, 0x201D]);
+        for unit in [0x81_u16, 0x8D, 0x8F, 0x90, 0x9D] {
+            assert_eq!(expected[usize::from(unit)], unit);
+        }
         for capacity in [0, 1, 2, 255, 256, 257, 258, 1025, 1026, 1027] {
             let mut actual = vec![0xAAAA; capacity + 1];
             let truncated = unsafe { copy_cp1252_with_nul(actual.as_mut_ptr(), capacity, &bytes) };

@@ -24,7 +24,6 @@ inline constexpr const char* CodePageExpression =
     "SQL_VARIANT_PROPERTY(COALESCE(v, ''), 'Collation')), 'CodePage'))";
 
 inline Value FromBytes(const char* name, const std::vector<unsigned char>& bytes) {
-    // Undefined CP1252 bytes retain their C1 code points on both platforms.
     constexpr SQLWCHAR c1[] = {
         0x20AC, 0x0081, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021,
         0x02C6, 0x2030, 0x0160, 0x2039, 0x0152, 0x008D, 0x017D, 0x008F,
@@ -43,12 +42,21 @@ inline Value FromBytes(const char* name, const std::vector<unsigned char>& bytes
 
 inline const std::vector<Value>& Values() {
     static const auto values = [] {
-        std::vector<unsigned char> all(256);
-        for (size_t i = 0; i < all.size(); ++i) all[i] = static_cast<unsigned char>(i);
+        // Retail 18.6.2.1 preserves undefined C1 bytes on Windows but substitutes
+        // '?' on Linux. Replace them without changing payload lengths: shared
+        // parity covers defined CP1252, not all 256 byte mappings. Rust's
+        // cp1252_copy_all_bytes_across_scratch_boundaries test covers all 256.
+        std::vector<unsigned char> defined(256);
+        for (size_t i = 0; i < defined.size(); ++i) defined[i] = static_cast<unsigned char>(i);
+        defined[0x81] = 0x82;
+        defined[0x8D] = 0x8C;
+        defined[0x8F] = 0x8E;
+        defined[0x90] = 0x91;
+        defined[0x9D] = 0x9C;
         return std::vector<Value>{
-            FromBytes("all256", all),
+            FromBytes("defined_256_bytes", defined),
             FromBytes("ascii", {0x41, 0x42, 0x43}),
-            FromBytes("high", {0x80, 0x81, 0x8D, 0x91, 0x92, 0x93, 0x94, 0xE9, 0xFF}),
+            FromBytes("high", {0x80, 0x82, 0x8C, 0x91, 0x92, 0x93, 0x94, 0xE9, 0xFF}),
             FromBytes("utf8_bom", {0xEF, 0xBB, 0xBF, 0x41}),
             FromBytes("utf16_bom", {0xFF, 0xFE}),
             FromBytes("reversed_bom", {0xFE, 0xFF}),

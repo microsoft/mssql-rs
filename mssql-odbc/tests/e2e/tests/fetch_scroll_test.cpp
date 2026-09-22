@@ -156,6 +156,8 @@ TEST_F(FetchScrollUtf16Test, Cp1252UnalignedColumnArrayFitsExactCapacity) {
     ASSERT_EQ(SQL_SUCCESS, SQLBindCol(stmt_, 1, SQL_C_WCHAR, buffer.data(), capacity,
         reinterpret_cast<SQLLEN*>(lengths.data())));
     const auto& values = Cp1252TestData::Values();
+    ASSERT_FALSE(values.empty());
+    ASSERT_EQ(capacity, (values.front().units.size() + 1) * sizeof(SQLWCHAR));
     ASSERT_EQ(0u, values.size() % row_count);
     std::string sql = "SET NOCOUNT ON; DECLARE @t TABLE(ord int, v varchar(256) "
         "COLLATE Latin1_General_100_CI_AS); INSERT @t VALUES ";
