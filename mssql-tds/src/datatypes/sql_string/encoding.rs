@@ -97,7 +97,7 @@ impl ResolvedEncoding {
                 Self::EncodingRs(encoding) => {
                     DecoderKind::EncodingRs(Box::new(encoding.new_decoder_without_bom_handling()))
                 }
-                _ => DecoderKind::Oem(self.oem_table()),
+                Self::Oem437 | Self::Oem850 => DecoderKind::Oem(self.oem_table()),
             },
         }
     }
