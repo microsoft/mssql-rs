@@ -248,7 +248,7 @@ pub enum Error {
 
     /// Certificate file does not exist on disk.
     #[error(
-        "Certificate file not found: {path}. Verify the ServerCertificate path is correct and the file exists."
+        "Certificate file not found: {path}. Verify the ServerCertificate / ServerCA path is correct and the file exists."
     )]
     CertificateNotFound {
         /// File path that was looked up.

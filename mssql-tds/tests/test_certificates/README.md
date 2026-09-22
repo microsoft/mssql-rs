@@ -16,6 +16,8 @@ A private test CA used by the ServerCA (custom trust root) tests.
 
 ### ca_signed_cert.pem / ca_signed_key.pem
 A leaf certificate for `localhost` / `127.0.0.1` issued by the test CA above.
+The PowerShell generator additionally writes `ca_signed_identity.pfx` for
+Windows, where identities are loaded from PKCS#12 files.
 
 ### unrelated_ca_cert.pem / unrelated_ca_key.pem
 A second, unrelated CA used to verify that trusting one CA does not trust another.

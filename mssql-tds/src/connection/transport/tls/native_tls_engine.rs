@@ -29,17 +29,23 @@ static CONNECTOR_CACHE: std::sync::LazyLock<
     RwLock<HashMap<super::TlsValidationConfig, NativeTlsConnector>>,
 > = std::sync::LazyLock::new(|| RwLock::new(HashMap::new()));
 
+/// Connections with a custom CA are not cached: the trust material is re-read
+/// from disk for every handshake so a rotated, removed, or corrupted CA file
+/// takes effect immediately instead of being masked by a cached connector.
 fn get_or_build_connector(
     validation: &super::TlsValidationConfig,
 ) -> TdsResult<NativeTlsConnector> {
-    if let Some(connector) = CONNECTOR_CACHE
-        .read()
-        .map_err(|_| {
-            crate::error::Error::ImplementationError(
-                "TLS connector cache read lock poisoned".to_string(),
-            )
-        })?
-        .get(validation)
+    let cacheable = validation.server_ca_path.is_none();
+
+    if cacheable
+        && let Some(connector) = CONNECTOR_CACHE
+            .read()
+            .map_err(|_| {
+                crate::error::Error::ImplementationError(
+                    "TLS connector cache read lock poisoned".to_string(),
+                )
+            })?
+            .get(validation)
     {
         return Ok(connector.clone());
     }
@@ -60,6 +66,10 @@ fn get_or_build_connector(
         }
     }
     let connector = builder.build()?;
+
+    if !cacheable {
+        return Ok(connector);
+    }
 
     CONNECTOR_CACHE
         .write()
@@ -199,6 +209,29 @@ mod tests {
     #[test]
     fn builds_connector_with_all_danger_flags_and_alpn() {
         assert!(get_or_build_connector(&cfg(true, true, true)).is_ok());
+    }
+
+    #[test]
+    fn missing_ca_file_is_reported_on_every_call() {
+        let mut config = cfg(false, false, false);
+        config.server_ca_path = Some("/nonexistent/path/ca.pem".into());
+        for _ in 0..2 {
+            assert!(matches!(
+                get_or_build_connector(&config),
+                Err(crate::error::Error::CertificateNotFound { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn custom_ca_connector_reloads_the_file() {
+        let mut config = cfg(false, false, false);
+        config.server_ca_path = Some("tests/test_certificates/valid_cert.pem".into());
+        assert!(get_or_build_connector(&config).is_ok());
+        assert!(
+            !CONNECTOR_CACHE.read().unwrap().contains_key(&config),
+            "custom-CA connectors must not be cached"
+        );
     }
 
     #[test]

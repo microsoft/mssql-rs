@@ -72,6 +72,9 @@ pub(crate) trait TlsEngine: Send + Sync {
 /// disabled, and for connections with a custom CA, returns the
 /// `native-tls`-backed engine.
 ///
+/// Note: the `native-tls` engine does not expose TLS channel bindings, so
+/// custom-CA connections cannot satisfy Extended Protection.
+///
 /// The Schannel-direct engine fixes two Windows-only TLS bugs that
 /// produced the bulkcopy timeout regression observed in production:
 /// (1) chain-build / CTL auto-update being triggered even with
@@ -89,6 +92,11 @@ pub(crate) fn default_engine(validation: &TlsValidationConfig) -> &'static dyn T
         if validation.server_ca_path.is_none() {
             return &crate::connection::transport::win_tls::engine::SCHANNEL_ENGINE;
         }
+        tracing::warn!(
+            "ServerCA is configured: using the native-tls engine instead of the Schannel-direct engine. \
+             TLS channel bindings are unavailable on this path, so integrated authentication against a \
+             server requiring Extended Protection will fail."
+        );
     }
     let _ = validation;
     &native_tls_engine::NATIVE_TLS_ENGINE
