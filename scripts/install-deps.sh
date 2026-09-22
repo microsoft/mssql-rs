@@ -53,7 +53,6 @@ if [ "$PKG_MGR" = "apt" ]; then
         apt-transport-https \
         software-properties-common"
     DOCKER_PKG="docker.io"
-    SSH_SERVICE="ssh"
 else
     # apt-transport-https and software-properties-common are apt plumbing with no
     # rpm equivalent; python-is-python3 is replaced by the symlink below.
@@ -69,7 +68,6 @@ else
         wget \
         ca-certificates"
     DOCKER_PKG="moby-engine"
-    SSH_SERVICE="sshd"
 fi
 
 # Docker is baked into the x64 images; only ARM has ever installed it here.
@@ -128,13 +126,7 @@ fi
 
 pip --version && pip install pipenv
 
-# Enable and start SSH service
-pkg_install openssh-server
-sudo systemctl enable "$SSH_SERVICE"
-sudo systemctl start "$SSH_SERVICE"
-
-# Create a new user for SSH login
-# Check for openssl and install if not present
+# openssl is used by the build, not by any agent login path.
 if ! command -v openssl &> /dev/null
 then
     echo "OpenSSL not found, installing..."
@@ -144,26 +136,6 @@ fi
 if [ "$ARCH" = "aarch64" ]; then
     echo "Changing permissions for docker.sock"
     sudo chmod 666 /var/run/docker.sock
-fi
-
-# Create a new user for SSH login
-SSH_USER="sshuser"
-SSH_PASS=$(openssl rand -base64 16)
-
-# Not echoed: PR validation logs in the `public` project are world-readable.
-
-if ! id "$SSH_USER" &>/dev/null; then
-    sudo useradd -m -s /bin/bash "$SSH_USER"
-    echo "$SSH_USER:$SSH_PASS" | sudo chpasswd
-    # Administrative group is `sudo` on Debian, `wheel` on rpm distros.
-    if getent group sudo >/dev/null 2>&1; then
-        sudo usermod -aG sudo "$SSH_USER"
-    else
-        sudo usermod -aG wheel "$SSH_USER"
-    fi
-    echo "User $SSH_USER created with password for SSH login."
-else
-    echo "User $SSH_USER already exists."
 fi
 
 sudo groupadd docker

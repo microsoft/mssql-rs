@@ -74,8 +74,23 @@ steps:
       done
     fi
     echo
-    echo "---- scratch space (RUST-AZL3 is capped at diskSize 100 for the D2) ----"
-    df -h / /mnt 2>/dev/null
+    echo "---- scratch space ----"
+    echo "  NOTE: 'df -h /mnt' is misleading. /mnt is not itself a mountpoint, so"
+    echo "  it resolves to the root filesystem. The local NVMe is mounted at"
+    echo "  /mnt/azure_nvme_temp and is where the agent puts _work."
+    echo "  all mounts:"
+    df -h 2>/dev/null | grep -vE "^(tmpfs|devtmpfs|overlay|shm)" | sed 's/^/    /'
+    echo "  agent work root: ${AGENT_WORKFOLDER:-unset}"
+    echo "  build sources:   ${BUILD_SOURCESDIRECTORY:-unset}"
+    for d in /mnt /mnt/azure_nvme_temp "${AGENT_WORKFOLDER:-/nonexistent}"; do
+      if [ -d "$d" ]; then
+        printf '    %-26s %s\n' "$d" "$(df -h --output=source,size,avail "$d" 2>/dev/null | tail -1)"
+      else
+        printf '    %-26s ABSENT\n' "$d"
+      fi
+    done
+    echo "  block devices:"
+    lsblk -o NAME,SIZE,TYPE,MOUNTPOINT 2>/dev/null | sed 's/^/    /'
     echo
     echo "---- can the host run a container at all? ----"
     docker info >/dev/null 2>&1 && echo "  docker daemon: reachable" || echo "  docker daemon: NOT reachable"
