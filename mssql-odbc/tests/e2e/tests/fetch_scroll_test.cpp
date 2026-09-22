@@ -1119,23 +1119,10 @@ TEST_F(FetchScrollLiveTest, ABoundVarcharMaxDbcsCarriesCharactersAcrossWireChunk
 }
 
 // A slot too small for the converted value truncates on a character boundary.
-// The indicator stays a concrete count rather than SQL_NO_TOTAL: msodbcsql keys
-// it on the C types, and `sqlcdata.h:1230` takes CHAR->CHAR on its "assume a
-// 1:1 conversion ratio" branch, so converting through the collation does not
-// make the value unmeasurable.
-//
-// Measured on the msodbcsql leg of build 173873. The shared, load-bearing claim
-// holds on both drivers: the indicator is NOT SQL_NO_TOTAL. The exact number
-// diverges, because msodbcsql's estimate is
-// `cbDataAvail + dwDataOffset + cbTruncatedCharsInConvBuf` -- it adds back the
-// bytes already delivered plus whatever its internal conversion buffer is
-// holding, so it reports 5008 where this driver reports the 5000 wire bytes
-// still available. Neither equals the true converted length (10,000 UTF-8
-// bytes); the msodbcsql comment says as much by calling it an assumption.
-// That internal accounting is not reproducible from outside the driver, so the
-// exact value is asserted per-leg rather than skipping the case outright --
-// skipping would also delete the SQL_NO_TOTAL check, which is the part that
-// actually pins this PR's behaviour.
+// Both drivers count converted output plus a 1:1 estimate for unread source
+// (sqlcdata.h:1230). Their conversion read sizes differ: retail 18.6.2.1 reports
+// 5008, while Rust decodes all 5000 source bytes in its first 8 KiB read and can
+// report the exact 10,000 UTF-8 bytes. #627 fixes Rust's former raw-wire count.
 TEST_F(FetchScrollLiveTest, ABoundVarcharMaxTruncatedToCharKeepsConcreteLength) {
     // Windows-only skip: the payload assertion expects UTF-8, which msodbcsql
     // does not deliver there (AB#47564), and its ANSI output also changes how
@@ -1154,9 +1141,7 @@ TEST_F(FetchScrollLiveTest, ABoundVarcharMaxTruncatedToCharKeepsConcreteLength) 
     EXPECT_EQ(SQL_SUCCESS_WITH_INFO, SQLFetch(stmt_));
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01004");
 
-    // The shared assertion: CHAR->CHAR keeps a concrete 1:1 estimate on both
-    // drivers and never degrades to SQL_NO_TOTAL.
-    EXPECT_NE(SQL_NO_TOTAL, ind) << "CHAR->CHAR keeps the 1:1 wire-byte estimate";
+    EXPECT_NE(SQL_NO_TOTAL, ind) << "known-length CHAR->CHAR includes converted bytes";
     EXPECT_STREQ("\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9", reinterpret_cast<const char*>(buf));
 
     const char* target = std::getenv("ODBC_TEST_TARGET");
@@ -1164,7 +1149,7 @@ TEST_F(FetchScrollLiveTest, ABoundVarcharMaxTruncatedToCharKeepsConcreteLength) 
         // 5000 on the wire + 8 delivered, per the sqlcdata.h formula above.
         EXPECT_EQ(5008, ind);
     } else {
-        EXPECT_EQ(5000, ind) << "wire bytes still available before this call's copy";
+        EXPECT_EQ(10000, ind) << "all source bytes were converted before the drain";
     }
     SQLFreeStmt(stmt_, SQL_UNBIND);
     SQLCloseCursor(stmt_);

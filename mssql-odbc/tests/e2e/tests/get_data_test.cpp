@@ -286,6 +286,148 @@ protected:
         RecordProperty("driver_version", reinterpret_cast<const char*>(version));
     }
 
+    void CheckIssue627Collation(SQLSMALLINT target) {
+        struct Case {
+            const char* collation;
+            SQLINTEGER codepage;
+            const char* hex;
+            std::vector<SQLCHAR> utf8;
+            SQLWCHAR wide;
+        };
+        const Case cases[] = {
+            {"SQL_Latin1_General_CP437_CI_AS", 437, "0x82", {0xC3, 0xA9}, 0x00E9},
+            {"SQL_Latin1_General_CP437_CI_AS", 437, "0x9B", {0xC2, 0xA2}, 0x00A2},
+            {"SQL_Latin1_General_CP850_CI_AS", 850, "0x9B", {0xC3, 0xB8}, 0x00F8},
+            {"Latin1_General_100_CI_AS", 1252, "0x80", {0xE2, 0x82, 0xAC}, 0x20AC},
+            {"Latin1_General_100_BIN2_UTF8", 65001, "0xE282AC",
+             {0xE2, 0x82, 0xAC}, 0x20AC},
+        };
+        struct Shape {
+            const char* type;
+            const char* projection;
+        };
+        const Shape shapes[] = {
+            {"varchar(3)", "v"},
+            {"varchar(max)", "v"},
+            {"varchar(3)", "v,1,2,3,4,5,6,7"},
+            {"varchar(max)", "v,1,2,3,4,5,6,7"},
+            {"varchar(3)", "CAST(v AS sql_variant)"},
+        };
+        for (const auto& test : cases) {
+            SCOPED_TRACE(test.collation);
+            SCOPED_TRACE(test.hex);
+            ASSERT_EQ(SQL_SUCCESS, ExecDirect(
+                "SELECT CONVERT(int, COLLATIONPROPERTY('" + std::string(test.collation) +
+                "', 'CodePage'))"));
+            ASSERT_EQ(SQL_SUCCESS, SQLFetch(stmt_));
+            SQLINTEGER codepage = 0;
+            ASSERT_EQ(SQL_SUCCESS, SQLGetData(stmt_, 1, SQL_C_SLONG, &codepage,
+                                              sizeof(codepage), nullptr));
+            ASSERT_EQ(test.codepage, codepage);
+            ASSERT_EQ(SQL_SUCCESS, SQLCloseCursor(stmt_));
+
+            for (const auto& shape : shapes) {
+                SCOPED_TRACE(shape.type);
+                SCOPED_TRACE(shape.projection);
+                for (bool bound : {false, true}) {
+                    SCOPED_TRACE(bound);
+                    // Inserting binary into the declared column avoids a server-side
+                    // transcode from the database default collation.
+                    ASSERT_EQ(SQL_SUCCESS, ExecDirect(
+                        "SET NOCOUNT ON; DECLARE @t TABLE(v " + std::string(shape.type) +
+                        " COLLATE " + test.collation + "); INSERT @t VALUES(" + test.hex +
+                        "); SELECT " + shape.projection + " FROM @t"));
+                    std::vector<SQLCHAR> bytes(65, 0xCC);
+                    auto expected = bytes;
+                    const SQLLEN length = target == SQL_C_CHAR
+                        ? static_cast<SQLLEN>(test.utf8.size()) : sizeof(SQLWCHAR);
+                    if (target == SQL_C_CHAR) {
+                        std::copy(test.utf8.begin(), test.utf8.end(), expected.begin());
+                        expected[length] = 0;
+                    } else {
+                        const SQLWCHAR units[] = {test.wide, 0};
+                        std::memcpy(expected.data(), units, sizeof(units));
+                    }
+                    SQLLEN indicator = -99;
+                    if (bound) {
+                        ASSERT_EQ(SQL_SUCCESS, SQLBindCol(
+                            stmt_, 1, target, bytes.data(), 64, &indicator));
+                    }
+                    ASSERT_EQ(SQL_SUCCESS, SQLFetch(stmt_));
+                    if (!bound) {
+                        EXPECT_EQ(SQL_SUCCESS, SQLGetData(
+                            stmt_, 1, target, bytes.data(), 64, &indicator));
+                    }
+                    EXPECT_EQ("", StmtDiagState());
+                    EXPECT_EQ(length, indicator);
+                    const size_t written = length + (target == SQL_C_WCHAR ? sizeof(SQLWCHAR) : 1);
+                    EXPECT_TRUE(std::equal(expected.begin(), expected.begin() + written, bytes.begin()));
+                    EXPECT_EQ(0xCC, bytes.back());
+                    ASSERT_EQ(SQL_SUCCESS, SQLCloseCursor(stmt_));
+                    ASSERT_EQ(SQL_SUCCESS, SQLFreeStmt(stmt_, SQL_UNBIND));
+                }
+            }
+        }
+    }
+
+    void CheckIssue627EuroIndicator(bool bound) {
+        for (const char* type : {"varchar(1)", "varchar(max)"}) {
+            SCOPED_TRACE(type);
+            for (const char* projection : {"v", "v,1,2,3,4,5,6,7"}) {
+                SCOPED_TRACE(projection);
+                for (SQLLEN capacity : {2, 3, 4}) {
+                    SCOPED_TRACE(capacity);
+                    ASSERT_EQ(SQL_SUCCESS, ExecDirect(
+                        "SET NOCOUNT ON; DECLARE @t TABLE(v " + std::string(type) +
+                        " COLLATE SQL_Latin1_General_CP1_CI_AS); "
+                        "INSERT @t VALUES(0x80); SELECT " + projection + " FROM @t"));
+                    std::vector<SQLCHAR> bytes(capacity + 1, 0xCC);
+                    SQLLEN indicator = -99;
+                    if (bound) {
+                        ASSERT_EQ(SQL_SUCCESS, SQLBindCol(
+                            stmt_, 1, SQL_C_CHAR, bytes.data(), capacity, &indicator));
+                    }
+                    SQLRETURN rc = SQLFetch(stmt_);
+                    if (!bound) {
+                        ASSERT_EQ(SQL_SUCCESS, rc);
+                        rc = SQLGetData(stmt_, 1, SQL_C_CHAR, bytes.data(), capacity, &indicator);
+                    }
+                    const bool truncated = capacity < 4;
+                    EXPECT_EQ(truncated ? SQL_SUCCESS_WITH_INFO : SQL_SUCCESS, rc);
+                    EXPECT_EQ(truncated ? "01004" : "", StmtDiagState());
+                    EXPECT_EQ(3, indicator);
+                    EXPECT_EQ(0xCC, bytes.back());
+                    const std::vector<SQLCHAR> euro = {0xE2, 0x82, 0xAC};
+                    if (!bound || !truncated) {
+                        auto expected = std::vector<SQLCHAR>(capacity + 1, 0xCC);
+                        std::copy_n(euro.begin(), capacity - 1, expected.begin());
+                        expected[capacity - 1] = 0;
+                        EXPECT_EQ(expected, bytes);
+                    } else {
+                        // Bound truncation intentionally keeps whole characters in
+                        // Rust; retail can split a character. Both must terminate.
+                        EXPECT_NE(bytes.begin() + capacity,
+                                  std::find(bytes.begin(), bytes.begin() + capacity, 0));
+                    }
+                    if (!bound && truncated) {
+                        bytes.assign(5, 0xCC);
+                        EXPECT_EQ(SQL_SUCCESS, SQLGetData(
+                            stmt_, 1, SQL_C_CHAR, bytes.data(), 4, &indicator));
+                        EXPECT_EQ("", StmtDiagState());
+                        const SQLLEN remaining = 4 - capacity;
+                        EXPECT_EQ(remaining, indicator);
+                        auto expected = std::vector<SQLCHAR>(5, 0xCC);
+                        std::copy(euro.begin() + capacity - 1, euro.end(), expected.begin());
+                        expected[remaining] = 0;
+                        EXPECT_EQ(expected, bytes);
+                    }
+                    ASSERT_EQ(SQL_SUCCESS, SQLCloseCursor(stmt_));
+                    ASSERT_EQ(SQL_SUCCESS, SQLFreeStmt(stmt_, SQL_UNBIND));
+                }
+            }
+        }
+    }
+
     void CheckVarcharBomCollation(bool utf8) {
         struct Value {
             const char* hex;
@@ -346,6 +488,94 @@ protected:
         }
     }
 };
+
+TEST_F(GetDataUtf16Test, Issue627SqlSortIdControlsCharDecoding) {
+    SKIP_IF_COMPARING_MSODBCSQL_ON_WINDOWS();
+    CheckIssue627Collation(SQL_C_CHAR);
+}
+
+TEST_F(GetDataUtf16Test, Issue627SqlSortIdControlsWcharDecoding) {
+    CheckIssue627Collation(SQL_C_WCHAR);
+}
+
+TEST_F(GetDataUtf16Test, Issue627FittingMaxCharReadCompletesImmediately) {
+    struct Case {
+        const char* type;
+        const char* hex;
+        std::vector<SQLCHAR> expected;
+        SQLLEN length;
+    };
+    const Case cases[] = {
+        {"varchar(max)", "0x6162", {0x61, 0x62, 0, 0xCC, 0xCC}, 2},
+        {"nvarchar(max)", "0x610062006300", {0x61, 0x62, 0x63, 0, 0xCC}, 3},
+        {"varchar(10)", "0x6162", {0x61, 0x62, 0, 0xCC, 0xCC}, 2},
+        {"nvarchar(10)", "0x610062006300", {0x61, 0x62, 0x63, 0, 0xCC}, 3},
+    };
+    for (const auto& test : cases) {
+        SCOPED_TRACE(test.type);
+        for (bool bound : {false, true}) {
+            SCOPED_TRACE(bound);
+            ASSERT_EQ(SQL_SUCCESS, ExecDirect(
+                "SET NOCOUNT ON; DECLARE @t TABLE(v " + std::string(test.type) +
+                " COLLATE SQL_Latin1_General_CP1_CI_AS); INSERT @t VALUES(" +
+                test.hex + "); SELECT v FROM @t"));
+            std::vector<SQLCHAR> bytes(5, 0xCC);
+            SQLLEN indicator = -99;
+            if (bound) {
+                ASSERT_EQ(SQL_SUCCESS, SQLBindCol(
+                    stmt_, 1, SQL_C_CHAR, bytes.data(), 4, &indicator));
+            }
+            ASSERT_EQ(SQL_SUCCESS, SQLFetch(stmt_));
+            if (!bound) {
+                EXPECT_EQ(SQL_SUCCESS, SQLGetData(
+                    stmt_, 1, SQL_C_CHAR, bytes.data(), 4, &indicator));
+            }
+            EXPECT_EQ("", StmtDiagState());
+            EXPECT_EQ(test.length, indicator);
+            EXPECT_EQ(test.expected, bytes);
+            if (!bound) {
+                EXPECT_EQ(SQL_NO_DATA, SQLGetData(
+                    stmt_, 1, SQL_C_CHAR, bytes.data(), 4, &indicator));
+            }
+            ASSERT_EQ(SQL_SUCCESS, SQLCloseCursor(stmt_));
+            ASSERT_EQ(SQL_SUCCESS, SQLFreeStmt(stmt_, SQL_UNBIND));
+        }
+    }
+}
+
+TEST_F(GetDataUtf16Test, Issue627CharGetDataIndicatorIncludesExpansion) {
+    SKIP_IF_COMPARING_MSODBCSQL_ON_WINDOWS();
+    CheckIssue627EuroIndicator(false);
+}
+
+TEST_F(GetDataUtf16Test, Issue627BoundCharIndicatorIncludesExpansion) {
+    SKIP_IF_COMPARING_MSODBCSQL_ON_WINDOWS();
+    CheckIssue627EuroIndicator(true);
+}
+
+TEST_F(GetDataUtf16Test, Issue627BoundCharIndicatorRetainsUnreadWire) {
+    SKIP_IF_COMPARING_MSODBCSQL_ON_WINDOWS();
+    ASSERT_EQ(SQL_SUCCESS, ExecDirect(
+        "SET NOCOUNT ON; DECLARE @t TABLE(v varchar(max) "
+        "COLLATE SQL_Latin1_General_CP1_CI_AS); INSERT @t VALUES(0x80); "
+        "SELECT REPLICATE(v,20000),42 FROM @t"));
+    SQLCHAR bytes[3] = {0xCC, 0xCC, 0xCC};
+    SQLLEN indicator = -99;
+    ASSERT_EQ(SQL_SUCCESS, SQLBindCol(stmt_, 1, SQL_C_CHAR, bytes, 2, &indicator));
+    ASSERT_EQ(SQL_SUCCESS_WITH_INFO, SQLFetch(stmt_));
+    EXPECT_EQ("01004", StmtDiagState());
+    // Conversion read sizes differ, but both must account for expansion and
+    // retain the unread source contribution while discarding the truncated tail.
+    EXPECT_GT(indicator, 20000);
+    EXPECT_LE(indicator, 60000);
+    EXPECT_EQ(0xCC, bytes[2]);
+    SQLINTEGER following = 0;
+    ASSERT_EQ(SQL_SUCCESS, SQLGetData(
+        stmt_, 2, SQL_C_SLONG, &following, sizeof(following), nullptr));
+    EXPECT_EQ(42, following);
+    ASSERT_EQ(SQL_SUCCESS, SQLCloseCursor(stmt_));
+    ASSERT_EQ(SQL_SUCCESS, SQLFreeStmt(stmt_, SQL_UNBIND));
+}
 
 TEST_F(GetDataUtf16Test, Cp1252VarcharPreservesBomShapedBytes) {
     CheckVarcharBomCollation(false);

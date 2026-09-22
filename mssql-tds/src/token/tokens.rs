@@ -506,7 +506,6 @@ mod sql_collation_tests {
 }
 
 /// Static lookup table for code pages by SortID
-#[allow(dead_code)]
 pub(crate) static CODE_PAGE_FROM_SORT_ID: [Option<u16>; 256] = [
     None,       // 0
     None,       // 1

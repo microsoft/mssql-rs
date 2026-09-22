@@ -41,8 +41,9 @@ use super::sqlstate::*;
 use crate::api::describe_col::odbc_sql_type;
 use crate::api::exec_common::release_busy_if_row_exhausted;
 use crate::api::get_data::{
-    TextError, column_value_to_bytes, column_value_to_text, convert_typed_c, hex_buffer_elements,
-    transcode_narrow_into_pending, utf16le_chunk_to_utf8, widen_into_pending,
+    TextError, column_value_to_bytes, column_value_to_text, convert_typed_c,
+    converted_narrow_indicator, hex_buffer_elements, transcode_narrow_into_pending,
+    utf16le_chunk_to_utf8, widen_into_pending,
 };
 use crate::api::odbc_types::{
     SQL_BIND_BY_COLUMN, SQL_C_BINARY, SQL_C_BIT, SQL_C_CHAR, SQL_C_DEFAULT, SQL_C_DOUBLE,
@@ -1788,13 +1789,13 @@ unsafe fn deliver_bound_plp(
         );
     let narrow_wire_encoding = column_info
         .text_encoding
-        .and_then(|encoding| encoding.encoding());
+        .and_then(|encoding| encoding.resolved_encoding());
     // Codepage text delivered as SQL_C_CHAR must be decoded through the column's
     // collation, since SQL_C_CHAR output is UTF-8 (AB#47566). A UTF-8 collation
     // is already in the target encoding, so it stays on the verbatim path.
     let transcode_narrow_to_utf8 = target == SQL_C_CHAR
         && matches!(encoding, PlpEncoding::SingleByteText)
-        && narrow_wire_encoding.is_some_and(|encoding| encoding != encoding_rs::UTF_8);
+        && narrow_wire_encoding.is_some_and(|encoding| encoding != encoding_rs::UTF_8.into());
     let mut narrow_decoder = if widen_narrow_to_utf16 || transcode_narrow_to_utf8 {
         narrow_wire_encoding.map(|encoding| encoding.new_decoder_without_bom_handling())
     } else {
@@ -1835,15 +1836,11 @@ unsafe fn deliver_bound_plp(
         && !transcode_narrow_to_utf8
         && match encoding {
             PlpEncoding::Utf8Text => true,
-            PlpEncoding::SingleByteText => narrow_wire_encoding == Some(encoding_rs::UTF_8),
+            PlpEncoding::SingleByteText => narrow_wire_encoding == Some(encoding_rs::UTF_8.into()),
             _ => false,
         };
-    // Deliberately excludes `transcode_narrow_to_utf8`: msodbcsql keys the
-    // indicator on the C types rather than on whether a conversion happens, and
-    // `sqlcdata.h:1230` takes CHAR->CHAR on its "assume a 1:1 conversion ratio"
-    // branch, so a codepage `varchar(max)` read as SQL_C_CHAR keeps a concrete
-    // count. `ABoundVarcharMaxTruncatedReportsFullLength` measures this on both
-    // legs.
+    // CHAR->CHAR has separate conversion-aware accounting below; only
+    // cross-width truncation unconditionally reports SQL_NO_TOTAL.
     let transcode = transcode_utf16_to_utf8 || widen_narrow_to_utf16;
     let buf_elements = char_buf_elements(target, stride);
     let hex_stream =
@@ -1864,6 +1861,8 @@ unsafe fn deliver_bound_plp(
     let mut pending_high_surrogate: Option<u16> = None;
     let mut truncated = false;
     let mut wire_total: Option<u64>;
+    let mut converted_bytes = 0_usize;
+    let mut converted_wire_read = 0;
 
     loop {
         let chunk = runtime.block_on(client.read_active_plp_chunk(scratch))?;
@@ -1920,6 +1919,8 @@ unsafe fn deliver_bound_plp(
                 chunk.reached_end,
                 usize::MAX,
             );
+            converted_bytes = converted_bytes.saturating_add(decoded_utf8.len());
+            converted_wire_read = chunk.total_read;
             // Whole characters only: a partial UTF-8 sequence left in the
             // caller's buffer would not decode.
             for ch in String::from_utf8_lossy(&decoded_utf8).chars() {
@@ -2046,12 +2047,16 @@ unsafe fn deliver_bound_plp(
     unsafe {
         write_if_some(
             octet_length,
-            plp_indicator(
-                produced_bytes,
-                truncated,
-                transcode,
-                wire_total.map(|t| t.saturating_mul(hex_scale)),
-            ),
+            if truncated && transcode_narrow_to_utf8 {
+                converted_narrow_indicator(wire_total, converted_wire_read, converted_bytes)
+            } else {
+                plp_indicator(
+                    produced_bytes,
+                    truncated,
+                    transcode,
+                    wire_total.map(|t| t.saturating_mul(hex_scale)),
+                )
+            },
         )
     };
 
