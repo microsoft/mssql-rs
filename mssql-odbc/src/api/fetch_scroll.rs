@@ -2263,14 +2263,13 @@ unsafe fn deliver_bound(
         }
         return typed_conv_outcome(converted);
     }
-    unsafe { clear_stale_null_indicator(indicator, octet_length) };
-
     if binding.target_type == SQL_C_BINARY {
         // Binary is not a string: no terminator, and the untruncated byte count
         // goes to `octet_length` exactly as the character targets do.
         let Some(bytes) = column_value_to_bytes(value) else {
             return RowOutcome::Error(RowIssue::Unsupported);
         };
+        unsafe { clear_stale_null_indicator(indicator, octet_length) };
         unsafe { write_if_some(octet_length, bytes.len() as SqlLen) };
         let take = bytes.len().min(stride);
         if take > 0 {
@@ -2292,6 +2291,7 @@ unsafe fn deliver_bound(
         && matches!(value.encoding_type(), EncodingType::Utf16)
         && value.bytes.len().is_multiple_of(2)
     {
+        unsafe { clear_stale_null_indicator(indicator, octet_length) };
         unsafe { write_if_some(octet_length, value.bytes.len() as SqlLen) };
         let truncated = unsafe {
             copy_bound_utf16le_with_nul(
@@ -2312,6 +2312,7 @@ unsafe fn deliver_bound(
         Err(TextError::Malformed) => return RowOutcome::Error(RowIssue::InvalidCharacter),
         Err(TextError::Unsupported) => return RowOutcome::Error(RowIssue::Unsupported),
     };
+    unsafe { clear_stale_null_indicator(indicator, octet_length) };
 
     let buf_elements = char_buf_elements(binding.target_type, stride);
     let buf_elements = if matches!(value, ColumnValues::Bytes(_)) {
@@ -4175,6 +4176,40 @@ mod tests {
     }
 
     #[test]
+    fn temporal_text_success_clears_split_indicator() {
+        let value = ColumnValues::DateTime2(SqlDateTime2 {
+            days: 0,
+            time: SqlTime {
+                time_nanoseconds: 0,
+                scale: 0,
+            },
+        });
+        for target in [SQL_C_CHAR, SQL_C_WCHAR] {
+            for capacity in [2, 64] {
+                let mut output = [0xA5_u8; 64];
+                let mut indicator = SQL_NULL_DATA;
+                let mut length = -99;
+                let column = ColumnBinding {
+                    column_number: 1,
+                    target_type: target,
+                    target_value_ptr: output.as_mut_ptr().cast(),
+                    buffer_length: capacity,
+                    strlen_or_ind_ptr: &mut indicator,
+                    octet_length_ptr: &mut length,
+                };
+                let expected = if capacity == 2 {
+                    RowOutcome::Info(RowIssue::StringTruncated)
+                } else {
+                    RowOutcome::Success
+                };
+                assert_eq!(unsafe { deliver_bound(&column, 0, 0, &value) }, expected);
+                assert_eq!(indicator, 0);
+                assert_eq!(length, if target == SQL_C_WCHAR { 38 } else { 19 });
+            }
+        }
+    }
+
+    #[test]
     fn temporal_arithmetic_overflow_is_a_row_error() {
         assert_eq!(
             typed_conv_outcome(Err(ConvError::DatetimeFieldOverflow)),
@@ -4273,11 +4308,21 @@ mod tests {
             SQL_C_TYPE_TIMESTAMP,
             SQL_C_SS_TIME2,
             SQL_C_SS_TIMESTAMPOFFSET,
+            SQL_C_CHAR,
+            SQL_C_WCHAR,
         ] {
             for (value, issue, expected_diagnostic) in &values {
                 let (issue, expected_diagnostic) =
                     if matches!(value, ColumnValues::Time(_)) && target == SQL_C_TYPE_DATE {
                         (RowIssue::Restricted, ERR_RESTRICTED_DATA_TYPE)
+                    } else if matches!(target, SQL_C_CHAR | SQL_C_WCHAR) {
+                        (
+                            RowIssue::Unsupported,
+                            DiagMsg {
+                                state: SQLSTATE_HYC00,
+                                text: "Column type conversion not yet implemented",
+                            },
+                        )
                     } else {
                         (*issue, *expected_diagnostic)
                     };
