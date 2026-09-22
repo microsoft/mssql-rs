@@ -1119,10 +1119,11 @@ TEST_F(FetchScrollLiveTest, ABoundVarcharMaxDbcsCarriesCharactersAcrossWireChunk
 }
 
 // A slot too small for the converted value truncates on a character boundary.
-// Both drivers count converted output plus a 1:1 estimate for unread source
-// (sqlcdata.h:1230). Their conversion read sizes differ: retail 18.6.2.1 reports
-// 5008, while Rust decodes all 5000 source bytes in its first 8 KiB read and can
-// report the exact 10,000 UTF-8 bytes. #627 fixes Rust's former raw-wire count.
+// Retail uses converted output plus a 1:1 estimate for unread source
+// (sqlcdata.h:1230): Linux package 18.6.2.1-1, SQL_DRIVER_VER 18.06.0002, reports
+// 5008 under C.UTF-8. Rust's bound delivery instead decodes through the drain
+// and reports the exact 10,000 UTF-8 bytes, including decoder-held DBCS input.
+// This bound-only precision difference does not change GetData's estimate.
 TEST_F(FetchScrollLiveTest, ABoundVarcharMaxTruncatedToCharKeepsConcreteLength) {
     // Windows-only skip: the payload assertion expects UTF-8, which msodbcsql
     // does not deliver there (AB#47564), and its ANSI output also changes how

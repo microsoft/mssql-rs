@@ -78,7 +78,13 @@ fn resolve_collation(collation: SqlCollation) -> ResolvedEncoding {
             1255 => encoding_rs::WINDOWS_1255,
             1256 => encoding_rs::WINDOWS_1256,
             1257 => encoding_rs::WINDOWS_1257,
-            _ => unreachable!("unmapped code page in CODE_PAGE_FROM_SORT_ID"),
+            _ => {
+                warn!(
+                    "Unsupported code page {} for SQL sort ID {}, falling back to LCID",
+                    code_page, collation.sort_id
+                );
+                return lcid_encoding_or_fallback(collation).into();
+            }
         };
         return encoding.into();
     }
@@ -94,12 +100,11 @@ fn resolve_collation(collation: SqlCollation) -> ResolvedEncoding {
 /// directly instead of routing through the parameter serializer -- e.g. a
 /// data-at-execution write, which streams bytes to the wire before the normal
 /// parameter-serialization path runs. Does *not* mirror that serializer's own
-/// `VARCHAR | CHAR | TEXT` arm (`tds_value_serializer.rs`): that arm predates
-/// the UTF-8-collation flag and always encodes through the single-byte LCID
-/// codepage regardless of `collation.utf8()`, so a UTF-8-collation database
-/// gets correct UTF-8 wire bytes from a value streamed through this function
-/// but single-byte-miscoded bytes from the same value bound inline. Tracked
-/// under AB#47590.
+/// `VARCHAR | CHAR | TEXT` arm (`tds_value_serializer.rs`): that arm still
+/// resolves only the LCID, ignoring both the UTF-8 flag and SQL sort ID.
+/// Inline string parameters can therefore encode differently from this helper
+/// and from fetched values under UTF-8 or SQL sort-ID collations. Unifying that
+/// serializer path is deferred alongside the UTF-8 discrepancy in AB#47590.
 pub fn encode_narrow(text: &str, collation: SqlCollation) -> Vec<u8> {
     let (encoded, encoding_used, had_errors) = resolve_collation(collation).encode(text);
     if had_errors {
@@ -119,10 +124,9 @@ impl EncodingType {
     /// unavailable in `encoding_rs`. Use [`Self::resolved_encoding`] for all
     /// supported SQL collations.
     ///
-    /// Exists so a writer handed borrowed wire bytes by
-    /// [`RowWriter::write_string`](crate::datatypes::row_writer::RowWriter::write_string)
-    /// can transcode straight into its own buffer instead of building an owned
-    /// [`SqlString`] first.
+    /// Retained for compatibility with callers using `encoding_rs` directly.
+    /// New conversion code should use [`Self::resolved_encoding`] to include
+    /// the OEM codecs.
     ///
     /// Decoding through this substitutes U+FFFD on malformed input, whereas
     /// [`SqlString::to_utf8_string`] panics on invalid UTF-8 under
