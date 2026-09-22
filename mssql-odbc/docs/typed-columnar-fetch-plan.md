@@ -112,9 +112,11 @@ msodbcsql 18.6.2.1-1 (`SQL_DRIVER_VER=18.06.0002`) by
 `InvalidCharacterTemporalValuesViaBoundFetch`.
 
 Malformed decoded native values are covered by Rust regressions, not a retail
-wire-level comparison: a normal SQL Server cannot produce them. In particular,
-checked-arithmetic rejection of extreme ticks is driver hardening, not a claim
-that msodbcsql handles identical corrupt bytes the same way. Closing that
+wire-level comparison: a normal SQL Server cannot produce them. Decoded fields
+are validated before arithmetic, so even extreme ticks report `22007`.
+Rejecting invalid wire fields, including legacy `datetime` before 1753-01-01,
+is driver hardening, not a claim that msodbcsql handles identical corrupt
+bytes the same way. Closing that
 evidence gap requires replaying malformed temporal TDS rows to both drivers.
 
 #### Known divergences from msodbcsql

@@ -3226,6 +3226,18 @@ mod tests {
     }
 
     #[test]
+    fn temporal_arithmetic_overflow_posts_22008() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let mut state = stmt.inner.lock().unwrap();
+        assert_eq!(
+            finish_typed_conv(&mut state, Err(ConvError::DatetimeFieldOverflow)),
+            SQL_ERROR
+        );
+        assert_last_diag(&state.diag_records, ERR_DATETIME_FIELD_OVERFLOW);
+    }
+
+    #[test]
     fn internal_typed_conversion_failure_posts_driver_error() {
         let h = TestHandles::with_env_dbc_stmt();
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
@@ -6294,6 +6306,10 @@ mod tests {
                 time: 0,
             }),
             ColumnValues::DateTime(SqlDateTime {
+                days: -53_691,
+                time: 0,
+            }),
+            ColumnValues::DateTime(SqlDateTime {
                 days: 0,
                 time: 25_920_000,
             }),
@@ -6317,7 +6333,7 @@ mod tests {
                         },
                         offset: 1,
                     }),
-                    ERR_DATETIME_FIELD_OVERFLOW,
+                    ERR_INVALID_DATETIME_FORMAT,
                 )
             }))
             .chain([(

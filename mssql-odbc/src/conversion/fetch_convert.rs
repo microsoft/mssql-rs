@@ -366,6 +366,12 @@ pub(crate) fn datetime2_parts(datetime: &SqlDateTime2) -> Result<DateTimeParts, 
 pub(crate) fn datetimeoffset_parts(
     datetime: &SqlDateTimeOffset,
 ) -> Result<DateTimeParts, ConvError> {
+    if i64::from(datetime.datetime2.days) > MAX_DAYS_SINCE_0001
+        || datetime.datetime2.time.time_nanoseconds >= TICKS_PER_DAY.unsigned_abs()
+        || !(-840..=840).contains(&datetime.offset)
+    {
+        return Err(ConvError::InvalidDatetimeFormat);
+    }
     // Keep conversion arithmetic overflow distinct from invalid decoded fields:
     // msodbcsql's CVT_DT_OVERFLOW is 22008, while CVT_DT/TM_ERROR map to 22007
     // for ODBC 3 (sqlcprot.h; clntcomn.cpp's SQLSTATE table).
@@ -373,12 +379,6 @@ pub(crate) fn datetimeoffset_parts(
         .map_err(|_| ConvError::DatetimeFieldOverflow)?
         .checked_add(i64::from(datetime.offset) * 60 * 10_000_000)
         .ok_or(ConvError::DatetimeFieldOverflow)?;
-    if i64::from(datetime.datetime2.days) > MAX_DAYS_SINCE_0001
-        || datetime.datetime2.time.time_nanoseconds >= TICKS_PER_DAY.unsigned_abs()
-        || !(-840..=840).contains(&datetime.offset)
-    {
-        return Err(ConvError::InvalidDatetimeFormat);
-    }
     let days = i64::from(datetime.datetime2.days) + utc_ticks.div_euclid(TICKS_PER_DAY);
     let date = checked_date_parts(days)?;
     let t = hms_from_ticks_100ns(
@@ -412,7 +412,7 @@ pub(crate) fn extract_datetime_parts(value: &ColumnValues) -> Result<DateTimePar
         ColumnValues::DateTimeOffset(datetime) => return datetimeoffset_parts(datetime),
         ColumnValues::DateTime(dt) => {
             let date = checked_date_parts(i64::from(dt.days) + DAYS_0001_TO_1900)?;
-            if dt.time >= 24 * 60 * 60 * 300 {
+            if date.year < 1753 || dt.time >= 24 * 60 * 60 * 300 {
                 return Err(ConvError::InvalidDatetimeFormat);
             }
             // `datetime` time is counted in 1/300-second ticks since midnight.
@@ -2523,7 +2523,7 @@ mod tests {
             )
         }
         .unwrap_err();
-        assert_eq!(err, ConvError::DatetimeFieldOverflow);
+        assert_eq!(err, ConvError::InvalidDatetimeFormat);
     }
 
     #[test]
@@ -2584,16 +2584,9 @@ mod tests {
                             (offset / 60, offset % 60)
                         );
                     } else {
-                        let expected = if i64::try_from(ticks).is_err()
-                            || i64::try_from(wide_ticks).is_err()
-                        {
-                            ConvError::DatetimeFieldOverflow
-                        } else {
-                            ConvError::InvalidDatetimeFormat
-                        };
                         assert_eq!(
                             actual,
-                            Err(expected),
+                            Err(ConvError::InvalidDatetimeFormat),
                             "days={days}, ticks={ticks}, offset={offset}"
                         );
                     }
@@ -2681,6 +2674,10 @@ mod tests {
                 time: 0,
             }),
             ColumnValues::DateTime(SqlDateTime {
+                days: -53_691,
+                time: 0,
+            }),
+            ColumnValues::DateTime(SqlDateTime {
                 days: i32::MAX,
                 time: 0,
             }),
@@ -2761,6 +2758,26 @@ mod tests {
             extract_datetime_parts(&ColumnValues::Int(1)),
             Err(ConvError::Restricted)
         );
+    }
+
+    #[test]
+    fn legacy_datetime_lower_bound_does_not_restrict_datetime2() {
+        use mssql_tds::datatypes::column_values::SqlDateTime;
+        let parts = extract_datetime_parts(&ColumnValues::DateTime(SqlDateTime {
+            days: -53_690,
+            time: 0,
+        }))
+        .unwrap();
+        assert_eq!((parts.year, parts.month, parts.day), (1753, 1, 1));
+        let parts = datetime2_parts(&SqlDateTime2 {
+            days: 0,
+            time: SqlTime {
+                time_nanoseconds: 0,
+                scale: 7,
+            },
+        })
+        .unwrap();
+        assert_eq!((parts.year, parts.month, parts.day), (1, 1, 1));
     }
 
     #[test]

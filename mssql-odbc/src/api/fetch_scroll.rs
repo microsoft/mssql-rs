@@ -2254,14 +2254,16 @@ unsafe fn deliver_bound(
         }
         return RowOutcome::Success;
     }
-    unsafe { clear_stale_null_indicator(indicator, octet_length) };
-
     if is_typed_c_target(binding.target_type) {
         let converted = unsafe {
             convert_typed_c(value, binding.target_type, slot as SqlPointer, octet_length)
         };
+        if converted.is_ok() {
+            unsafe { clear_stale_null_indicator(indicator, octet_length) };
+        }
         return typed_conv_outcome(converted);
     }
+    unsafe { clear_stale_null_indicator(indicator, octet_length) };
 
     if binding.target_type == SQL_C_BINARY {
         // Binary is not a string: no terminator, and the untruncated byte count
@@ -4139,6 +4141,48 @@ mod tests {
     }
 
     #[test]
+    fn typed_bound_success_clears_split_indicator_after_conversion() {
+        for (ticks, expected) in [
+            (0, RowOutcome::Success),
+            (1, RowOutcome::Info(RowIssue::FractionalTruncated)),
+        ] {
+            let mut output = SqlDateStruct::default();
+            let mut indicator = SQL_NULL_DATA;
+            let mut length = -99;
+            let column = ColumnBinding {
+                column_number: 1,
+                target_type: SQL_C_TYPE_DATE,
+                target_value_ptr: (&mut output as *mut SqlDateStruct).cast(),
+                buffer_length: 0,
+                strlen_or_ind_ptr: &mut indicator,
+                octet_length_ptr: &mut length,
+            };
+            let value = ColumnValues::DateTime2(SqlDateTime2 {
+                days: 0,
+                time: SqlTime {
+                    time_nanoseconds: ticks,
+                    scale: 7,
+                },
+            });
+            assert_eq!(unsafe { deliver_bound(&column, 0, 0, &value) }, expected);
+            assert_eq!(indicator, 0);
+            assert_eq!(
+                length,
+                SqlLen::try_from(size_of::<SqlDateStruct>()).unwrap()
+            );
+            assert_eq!((output.year, output.month, output.day), (1, 1, 1));
+        }
+    }
+
+    #[test]
+    fn temporal_arithmetic_overflow_is_a_row_error() {
+        assert_eq!(
+            typed_conv_outcome(Err(ConvError::DatetimeFieldOverflow)),
+            RowOutcome::Error(RowIssue::DatetimeFieldOverflow)
+        );
+    }
+
+    #[test]
     fn bound_temporal_errors_preserve_row_buffers_and_indicators() {
         let midnight = SqlTime {
             time_nanoseconds: 0,
@@ -4171,6 +4215,10 @@ mod tests {
                 days: i32::MAX,
                 time: 0,
             }),
+            ColumnValues::DateTime(SqlDateTime {
+                days: -53_691,
+                time: 0,
+            }),
             ColumnValues::SmallDateTime(SqlSmallDateTime {
                 days: 0,
                 time: 1_440,
@@ -4197,8 +4245,8 @@ mod tests {
                         },
                         offset: 1,
                     }),
-                    RowIssue::DatetimeFieldOverflow,
-                    ERR_DATETIME_FIELD_OVERFLOW,
+                    RowIssue::InvalidDatetimeFormat,
+                    ERR_INVALID_DATETIME_FORMAT,
                 )
             }))
             .collect();
@@ -4219,13 +4267,15 @@ mod tests {
                     };
                 let mut output = [0xA5_u8; 80];
                 let mut indicators = [0xA5_u8; 40];
-                let column = binding(
-                    2,
-                    target,
-                    output.as_mut_ptr().cast(),
-                    32,
-                    indicators.as_mut_ptr().cast(),
-                );
+                let mut octet_lengths = [0xB6_u8; 40];
+                let column = ColumnBinding {
+                    column_number: 2,
+                    target_type: target,
+                    target_value_ptr: output.as_mut_ptr().cast(),
+                    buffer_length: 32,
+                    strlen_or_ind_ptr: indicators.as_mut_ptr().cast(),
+                    octet_length_ptr: octet_lengths.as_mut_ptr().cast(),
+                };
                 let bindings = [column];
                 let mut writer = BoundRowWriter::new(&bindings, 1, 1);
                 match value {
@@ -4253,6 +4303,7 @@ mod tests {
                 );
                 assert_eq!(output, [0xA5; 80]);
                 assert_eq!(indicators, [0xA5; 40]);
+                assert_eq!(octet_lengths, [0xB6; 40]);
 
                 let h = TestHandles::with_env_dbc_stmt();
                 let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
