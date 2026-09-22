@@ -966,6 +966,38 @@ TEST_F(GetDataUtf16Test, PlpTargetSwitchCompletesWideningAfterPriorOutput) {
     ASSERT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }
 
+TEST_F(GetDataUtf16Test, PlpWideningFillsRemainingCapacityWithoutOverreading) {
+    for (const std::string tail : {"", "BC"}) {
+        SCOPED_TRACE(tail);
+        ASSERT_SQL_OK(
+            ExecDirect("SELECT CAST((NCHAR(0x20AC) + N'A" + tail + "') "
+                       "COLLATE Latin1_General_100_CI_AS_SC_UTF8 AS varchar(max)), 42"),
+            SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+        SQLWCHAR first[5] = {0xCCCC, 0xCCCC, 0xCCCC, 0xCCCC, 0xCCCC};
+        SQLLEN ind = -99;
+        ASSERT_EQ(tail.empty() ? SQL_SUCCESS : SQL_SUCCESS_WITH_INFO,
+                  SQLGetData(stmt_, 1, SQL_C_WCHAR, first + 1, 3 * sizeof(SQLWCHAR), &ind));
+        EXPECT_EQ(tail.empty() ? 4 : SQL_NO_TOTAL, ind);
+        if (!tail.empty()) {
+            EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01004");
+        }
+        EXPECT_EQ(0xCCCC, first[0]);
+        EXPECT_EQ(0x20AC, first[1]);
+        EXPECT_EQ('A', first[2]);
+        EXPECT_EQ(0, first[3]);
+        EXPECT_EQ(0xCCCC, first[4]);
+        SQLCHAR rest[8] = {};
+        if (!tail.empty()) {
+            ASSERT_EQ(SQL_SUCCESS, SQLGetData(stmt_, 1, SQL_C_BINARY, rest, sizeof(rest), &ind));
+            ASSERT_EQ(static_cast<SQLLEN>(tail.size()), ind);
+            EXPECT_EQ(0, std::memcmp(rest, tail.data(), tail.size()));
+        }
+        EXPECT_EQ(SQL_NO_DATA, SQLGetData(stmt_, 1, SQL_C_BINARY, rest, sizeof(rest), &ind));
+        ASSERT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+    }
+}
+
 TEST_F(GetDataLiveTest, PlpVarcharMaxStreamed) {
     const int kTotal = 9000;
     ASSERT_SQL_OK(ExecDirect(

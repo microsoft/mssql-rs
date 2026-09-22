@@ -1591,7 +1591,7 @@ struct PlpReadProgress {
     written: usize,
     wire_read: usize,
     carry_before: usize,
-    completion_bytes: usize,
+    retry_bytes: usize,
 }
 
 /// Reads and returns one SQLGetData chunk directly from the active PLP stream.
@@ -1632,7 +1632,7 @@ fn stream_active_plp_chunk<'a>(
             retained_stmt_state.take(),
             &mut progress,
         );
-        if progress.completion_bytes == 0 {
+        if progress.retry_bytes == 0 {
             return rc;
         }
         starting_new_stream = false;
@@ -1658,7 +1658,7 @@ fn stream_active_plp_chunk_once<'a>(
     mut retained_stmt_state: Option<MutexGuard<'a, StmtState>>,
     progress: &mut PlpReadProgress,
 ) -> SqlReturn {
-    let completion_bytes = std::mem::take(&mut progress.completion_bytes);
+    let retry_bytes = std::mem::take(&mut progress.retry_bytes);
     if target_type != SQL_C_CHAR && target_type != SQL_C_WCHAR && target_type != SQL_C_BINARY {
         if let Some(mut state) = retained_stmt_state.take() {
             post_sql_error(
@@ -1913,8 +1913,8 @@ fn stream_active_plp_chunk_once<'a>(
             //
             // Do not convert unrelated characters merely to complete a partial
             // sequence: a later target switch must find them still on the wire.
-            // The outer loop completes a trailing partial character before
-            // returning, even when earlier characters already produced output.
+            // The outer loop completes partial characters and fills remaining
+            // output slots without reading ahead after the buffer is full.
             widen_out_units.saturating_sub(widen_carry_len)
         } else if target_type == SQL_C_WCHAR {
             // Whole UTF-16 code units only.
@@ -1957,7 +1957,7 @@ fn stream_active_plp_chunk_once<'a>(
     } else {
         max_read == 0
     };
-    if makes_no_progress && !is_length_probe && !hex_stream && completion_bytes == 0 {
+    if makes_no_progress && !is_length_probe && !hex_stream && retry_bytes == 0 {
         if let Some(mut state) = retained_stmt_state.take() {
             post_sql_error(
                 &mut state,
@@ -1980,7 +1980,7 @@ fn stream_active_plp_chunk_once<'a>(
     // overflow verbatim before either text target, even after a type switch.
     // Binary bypasses that overflow and completes on wire exhaustion.
     let carried_bytes = utf8_carry_len.saturating_add(widen_carry_len.saturating_mul(2));
-    if completion_bytes == 0 {
+    if retry_bytes == 0 {
         progress.carry_before = carried_bytes;
     }
     let prefix_bytes = if target_type != SQL_C_BINARY && carried_bytes > 0 {
@@ -2043,8 +2043,8 @@ fn stream_active_plp_chunk_once<'a>(
         .cast();
     let payload_capacity = (buffer_length as usize).saturating_sub(terminator_bytes);
     let widen_out_units = payload_capacity / std::mem::size_of::<SqlWChar>();
-    let max_read = if completion_bytes > 0 {
-        completion_bytes
+    let max_read = if retry_bytes > 0 {
+        retry_bytes
     } else if prefix_bytes > 0 {
         max_read_for(payload_capacity, 0, carried_bytes - prefix_bytes)
     } else {
@@ -2568,15 +2568,16 @@ fn stream_active_plp_chunk_once<'a>(
         }
     };
 
-    progress.written = progress.written.saturating_add(
-        prefix_bytes.saturating_add(usize::try_from(chunk_indicator).unwrap_or(usize::MAX)),
-    );
+    let chunk_written = usize::try_from(chunk_indicator).unwrap_or(usize::MAX);
+    progress.written = progress
+        .written
+        .saturating_add(prefix_bytes.saturating_add(chunk_written));
     progress.wire_read = progress.wire_read.saturating_add(read);
     if !reached_end
         && read > 0
         && let Some(stream) = stmt_state.active_plp.as_ref()
     {
-        progress.completion_bytes = if transcode_utf16_to_utf8 {
+        progress.retry_bytes = if transcode_utf16_to_utf8 {
             if stream.pending_byte.is_some() {
                 1
             } else if stream.pending_high_surrogate.is_some() {
@@ -2594,7 +2595,17 @@ fn stream_active_plp_chunk_once<'a>(
         } else {
             0
         };
-        if progress.completion_bytes > 0 {
+        if progress.retry_bytes == 0
+            && widen_narrow_to_utf16
+            && stream.pending_units.is_empty()
+            && stream.pending_bytes.is_empty()
+        {
+            // Multibyte input can leave output slots unused by the conservative
+            // wire budget. Refill only those slots before reporting truncation.
+            progress.retry_bytes =
+                payload_capacity.saturating_sub(chunk_written) / std::mem::size_of::<SqlWChar>();
+        }
+        if progress.retry_bytes > 0 {
             return SQL_SUCCESS_WITH_INFO;
         }
     }
@@ -2633,7 +2644,7 @@ fn stream_active_plp_chunk_once<'a>(
     // matching the reference msodbcsql driver: for a known-length PLP value the
     // server sends the total up front, so each truncated chunk reports a concrete
     // decreasing remaining count rather than SQL_NO_TOTAL. Count all internal
-    // completion reads together: the remaining-before-this-call count is
+    // reads together: the remaining-before-this-call count is
     // `known_total - (total_read - progress.wire_read)`.
     //
     // Two cases still report SQL_NO_TOTAL, and both match msodbcsql:
