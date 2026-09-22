@@ -317,7 +317,11 @@ fn classify_sql_type(data_type: SqlSmallInt) -> TypeClass {
         // then discards, so the caller gets an empty result set.
         SQL_INTERVAL_YEAR..=SQL_INTERVAL_MINUTE_TO_SECOND => TypeClass::Valid,
         // Step 1: a table type is HY004, not HYC00, even though its id is far
-        // below the driver-range bound checked next.
+        // below the driver-range bound checked next. It is the only member of
+        // `FInternalSqlType`'s set that sits below that bound and so needs an
+        // arm of its own — the internal `*_MAPPED` ids are `SQL_VARCHAR + 1..7`
+        // (13-19) and the `SQL_NATIVE_*` ids are -21/-22, so all of them reach
+        // the final `Invalid` arm and get HY004 without special-casing.
         SQL_SS_TABLE => TypeClass::Invalid,
         // Deliberately not msodbcsql's answer. msodbcsql accepts this id, but
         // only because it also switches the catalog proc: `sp_datatype_info_170`
@@ -588,6 +592,38 @@ mod tests {
 
     /// Every arm of the classification table, against the three-step sequence in
     /// `SQLGetTypeInfoW` (`odbc/sqlcdd.cpp` lines 1999 / 2035 / 2042).
+    /// Every id `FInternalSqlType` rejects (`odbc/sqlcprot.h:2388`) must be
+    /// HY004, not HYC00. The internal `*_MAPPED` ids are `SQL_VARCHAR + 1..=7`
+    /// (13-19) and `SQL_NATIVE_SMALLDATETIME`/`SQL_NATIVE_LEGACY_DATETIME` are
+    /// -21/-22, so none of them reaches the `<= SQL_TYPE_DRIVER_START` (-80)
+    /// arm; only `SQL_SS_TABLE` (-153) does, which is why it is the one
+    /// special case. Pinned so widening the driver-range arm cannot silently
+    /// turn any of these into HYC00.
+    #[test]
+    fn internal_mapped_identifiers_are_hy004_not_hyc00() {
+        const SQL_VARIANT_MAPPED: SqlSmallInt = SQL_VARCHAR + 1;
+        const SQL_VECTOR_MAPPED: SqlSmallInt = SQL_VARCHAR + 7;
+        const SQL_NATIVE_SMALLDATETIME: SqlSmallInt = -21;
+        const SQL_NATIVE_LEGACY_DATETIME: SqlSmallInt = -22;
+
+        for data_type in SQL_VARIANT_MAPPED..=SQL_VECTOR_MAPPED {
+            assert!(
+                matches!(classify_sql_type(data_type), TypeClass::Invalid),
+                "mapped id {data_type} must be HY004"
+            );
+        }
+        for data_type in [SQL_NATIVE_SMALLDATETIME, SQL_NATIVE_LEGACY_DATETIME] {
+            assert!(
+                matches!(classify_sql_type(data_type), TypeClass::Invalid),
+                "native id {data_type} must be HY004"
+            );
+        }
+        assert!(matches!(
+            classify_sql_type(SQL_SS_TABLE),
+            TypeClass::Invalid
+        ));
+    }
+
     #[test]
     fn classification_matches_msodbcsql_for_every_arm() {
         // Mapped to an internal id before the driver-range bound, so valid.
