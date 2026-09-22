@@ -413,6 +413,7 @@ the full option list. An issue missing the required fields is a note, not someth
 later pass can promote:
 
 ```markdown
+<!-- Before posting an issue or comment, redact sensitive information from all report fields and evidence, including commands, output, and diff excerpts. Do not include connection strings, passwords, access tokens, customer data, or non-public source. -->
 ### Drift class
 <one exact option from the form's Drift class dropdown>
 ### Where it happened
@@ -422,7 +423,7 @@ later pass can promote:
 ### What actually turned out to be true
 <the observation, in the terms a future reviewer would need>
 ### Evidence
-<file:line, the command and its output, or the thread where it was settled; include the relevant diff excerpt for uncommitted changes>
+<redacted file:line, command and output, or thread where it was settled; include only a redacted relevant diff excerpt for uncommitted changes>
 ### What it cost
 <one exact option from the form's What it cost dropdown>
 ```

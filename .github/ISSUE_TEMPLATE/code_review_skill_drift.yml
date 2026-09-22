@@ -12,6 +12,8 @@ body:
         These issues are the queue a periodic maintenance pass reads when proposing skill edits, so
         favor a precise observation with evidence over a polished suggestion.
 
+        **Important:** Before posting, redact sensitive information from all report fields and evidence, including commands, output, and diff excerpts. Do not include connection strings, passwords, access tokens, customer data, or non-public source.
+
   - type: dropdown
     id: class
     attributes:
@@ -59,7 +61,7 @@ body:
     attributes:
       label: Evidence
       description: >-
-        `file:line`, the command you ran and its output, the reference-driver source, or the
+        Redacted evidence: `file:line`, the command you ran and its output, public reference-driver source, or the
         thread where it was settled. An assertion without one of these can't be promoted.
     validations:
       required: true
