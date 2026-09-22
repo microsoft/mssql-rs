@@ -390,8 +390,12 @@ use the local symbol only as an optional additional query. Recurrence belongs on
 existing issue, where it is the evidence that promotes it:
 
 ```bash
-gh issue list --repo microsoft/mssql-rs --label skill:code-review --state all --search "<drift mechanism terms>"
+gh issue list --repo microsoft/mssql-rs --label skill:code-review --state all --limit 1000 --search "in:title,body,comments <drift mechanism terms>"
 ```
+
+Search includes comments because recurrence evidence is appended there. If the result
+count reaches the limit, split the query into non-overlapping `created:` date ranges
+and inspect every range; a truncated or failed search cannot establish that no match exists.
 
 Read potential matches to confirm they describe the same drift, not just the same symbol.
 If a match exists, append the structured report below as a comment and do not create a
@@ -407,7 +411,7 @@ rather than a conclusion. Interactively, use the form so it prompts you for the 
 <https://github.com/microsoft/mssql-rs/issues/new?template=code_review_skill_drift.yml>
 
 `gh issue create` does not apply the form, so write the body yourself with the same
-headings. For each dropdown, select one exact option from
+required headings. For each dropdown, select one exact option from
 [the form](../../ISSUE_TEMPLATE/code_review_skill_drift.yml), rather than an alias or
 the full option list. An issue missing the required fields is a note, not something a
 later pass can promote:
