@@ -22,11 +22,11 @@ use crate::handles::DbcHandle;
 use crate::handles::dbc::{ConnectionIdentity, ConnectionState, DbcState, VendorConnOverrides};
 use crate::handles::{HandleType, handle_from_raw};
 
-use mssql_tds::connection::client_context::{ClientContext, IPAddressPreference};
+use mssql_tds::connection::client_context::{ClientContext, DriverVersion, IPAddressPreference};
 use mssql_tds::connection_provider::tds_connection_provider::TdsConnectionProvider;
 use mssql_tds::core::{EncryptionOptions, EncryptionSetting};
 use mssql_tds::message::login_options::ApplicationIntent;
-use std::path::PathBuf;
+use std::{path::PathBuf, sync::OnceLock};
 
 use super::util::read_utf16;
 use crate::auth::{UnsupportedAuth, configure_auth};
@@ -278,6 +278,52 @@ fn initial_database(database_keyword: &str, current_catalog: Option<&str>) -> St
     }
 }
 
+const ODBC_LIBRARY_NAME: &str = "MS-ODBC";
+const ODBC_USER_AGENT_LIBRARY_NAME: &str = "MS-ODBCRS";
+const ODBC_DRIVER_VERSION_STRING: &str = env!("CARGO_PKG_VERSION");
+static ODBC_DRIVER_VERSION: OnceLock<DriverVersion> = OnceLock::new();
+
+fn odbc_driver_version() -> DriverVersion {
+    *ODBC_DRIVER_VERSION.get_or_init(parse_odbc_driver_version)
+}
+
+fn parse_version_part_u8(part: Option<&str>) -> u8 {
+    part.and_then(|part| part.parse().ok()).unwrap_or(0)
+}
+
+fn parse_build_part(part: Option<&str>) -> u16 {
+    let Some(part) = part else {
+        return 0;
+    };
+    let digit_len = part
+        .find(|character: char| !character.is_ascii_digit())
+        .unwrap_or(part.len());
+    if digit_len == 0 {
+        return 0;
+    }
+    part[..digit_len].parse().unwrap_or(0)
+}
+
+fn parse_odbc_driver_version() -> DriverVersion {
+    let mut parts = ODBC_DRIVER_VERSION_STRING.split('.');
+    DriverVersion::new(
+        parse_version_part_u8(parts.next()),
+        parse_version_part_u8(parts.next()),
+        parse_build_part(parts.next()),
+    )
+}
+
+fn configure_driver_identity(context: &mut ClientContext) {
+    context.library_name = ODBC_LIBRARY_NAME.to_string();
+    context.driver_version = odbc_driver_version();
+    context
+        .user_agent
+        .set_library_name(ODBC_USER_AGENT_LIBRARY_NAME.to_string());
+    context
+        .user_agent
+        .set_driver_version(ODBC_DRIVER_VERSION_STRING.to_string());
+}
+
 /// Inner connect logic, separated so the caller can reset state on failure.
 fn do_connect(
     dbc: &DbcHandle,
@@ -354,6 +400,7 @@ fn do_connect(
     // Off Windows an interactive request is reported as AD integrated, the same
     // method msodbcsql falls through to there.
     let mut context = ClientContext::default();
+    configure_driver_identity(&mut context);
     // The connection string wins over a pre-connect
     // `SQLSetConnectAttr(SQL_ATTR_CURRENT_CATALOG)`: msodbcsql overwrites the
     // attribute's `conninfo.DataBase` while parsing the keywords, so a caller
@@ -606,6 +653,23 @@ mod tests {
         assert_eq!(initial_database("", Some("attribute_db")), "attribute_db");
         assert_eq!(initial_database("", Some("")), "");
         assert_eq!(initial_database("", None), "");
+    }
+
+    #[test]
+    fn odbc_driver_identity_is_seeded_into_client_context() {
+        let mut context = ClientContext::default();
+        configure_driver_identity(&mut context);
+
+        assert_eq!(context.library_name, ODBC_LIBRARY_NAME);
+        assert_eq!(
+            context.user_agent.library_name,
+            ODBC_USER_AGENT_LIBRARY_NAME
+        );
+        assert_eq!(context.driver_version, odbc_driver_version());
+        assert_eq!(
+            context.user_agent.driver_version,
+            ODBC_DRIVER_VERSION_STRING
+        );
     }
 
     /// The value a get reports must match the encryption the connection
