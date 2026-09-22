@@ -1266,6 +1266,53 @@ TEST_F(FetchScrollLiveTest, ABoundVarcharMaxDbcsCarriesCharactersAcrossWireChunk
     SQLCloseCursor(stmt_);
 }
 
+TEST_F(FetchScrollLiveTest, ABoundVarcharMaxDbcsTruncationCountsHeldSource) {
+    SKIP_IF_COMPARING_MSODBCSQL_ON_WINDOWS();
+    SQLCHAR version[32] = {};
+    ASSERT_SQL_OK(SQLGetInfoA(dbc_, SQL_DRIVER_VER, version, sizeof(version), nullptr),
+                  SQL_HANDLE_DBC, dbc_);
+    RecordProperty("driver_version", reinterpret_cast<const char*>(version));
+
+    // GBK prefix: C4 E3 C4 E3 C4 E3 C4 E3 A1 E8 (你你你你¤). A nine-byte
+    // source read converts four 你 (12 UTF-8 bytes) and holds the lead of ¤.
+    // Both slots truncate; only BufferLength=10 leaves source in the decoder
+    // for decode_to_utf8_without_replacement to discard.
+    // Classic InternalGetColData (sqlcdata.h, TrimPartialCodePt) reads the trail
+    // before conversion. ¤ uses two bytes in both encodings, so that lookahead
+    // leaves the same estimate: 214/215 on retail 18.06.0002 under C.UTF-8,
+    // not the full converted length of 315.
+    for (SQLLEN buffer_length : {7, 10}) {
+        SCOPED_TRACE(buffer_length);
+        ASSERT_NO_FATAL_FAILURE(ExecDirect(
+            "SELECT CAST((REPLICATE(NCHAR(0x4F60), 4) + NCHAR(0x00A4)) "
+            "COLLATE Chinese_PRC_CI_AS AS varchar(max)) + "
+            "REPLICATE(CAST(NCHAR(0x4F60) COLLATE Chinese_PRC_CI_AS AS varchar(max)), 100) "
+            "+ 'Z', 42"));
+        std::vector<SQLCHAR> output(static_cast<size_t>(buffer_length) + 2, 0xCC);
+        SQLLEN indicator = -99;
+        ASSERT_EQ(SQL_SUCCESS, SQLBindCol(
+            stmt_, 1, SQL_C_CHAR, output.data() + 1, buffer_length, &indicator));
+        ASSERT_EQ(SQL_SUCCESS_WITH_INFO, SQLFetch(stmt_));
+        EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01004");
+        const std::string character = "\xE4\xBD\xA0";
+        const std::string prefix = buffer_length == 7 ?
+            character + character : character + character + character;
+        EXPECT_EQ(0, std::memcmp(output.data() + 1, prefix.c_str(), prefix.size() + 1));
+        EXPECT_EQ(0xCC, output.front());
+        EXPECT_EQ(0xCC, output.back());
+        EXPECT_EQ(buffer_length == 7 ? 214 : 215, indicator)
+            << "211 wire bytes plus expansion of three or four converted characters";
+
+        SQLINTEGER following = 0;
+        ASSERT_EQ(SQL_SUCCESS, SQLGetData(
+            stmt_, 2, SQL_C_SLONG, &following, sizeof(following), nullptr));
+        EXPECT_EQ(42, following);
+        EXPECT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
+        ASSERT_EQ(SQL_SUCCESS, SQLCloseCursor(stmt_));
+        ASSERT_EQ(SQL_SUCCESS, SQLFreeStmt(stmt_, SQL_UNBIND));
+    }
+}
+
 // A slot too small for the converted value truncates on a character boundary.
 // Retail uses converted output plus a 1:1 estimate for unread source
 // (sqlcdata.h:1230): Linux package 18.6.2.1-1, SQL_DRIVER_VER 18.06.0002, reports
