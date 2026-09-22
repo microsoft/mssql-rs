@@ -384,11 +384,13 @@ Report when:
 - A step cost time without changing the outcome, or you raised a class of finding that
   a lint, test, or CI check could have caught before review.
 
-Search before filing, including closed issues; recurrence belongs on the existing issue,
-where it is the evidence that promotes it:
+Search before filing, including closed issues, using distinctive terms for the underlying
+drift mechanism. The same mistake can recur in different functions, tests, or files;
+use the local symbol only as an optional additional query. Recurrence belongs on the
+existing issue, where it is the evidence that promotes it:
 
 ```bash
-gh issue list --repo microsoft/mssql-rs --label skill:code-review --state all --search "<symbol>"
+gh issue list --repo microsoft/mssql-rs --label skill:code-review --state all --search "<drift mechanism terms>"
 ```
 
 Read potential matches to confirm they describe the same drift, not just the same symbol.
@@ -405,22 +407,24 @@ rather than a conclusion. Interactively, use the form so it prompts you for the 
 <https://github.com/microsoft/mssql-rs/issues/new?template=code_review_skill_drift.yml>
 
 `gh issue create` does not apply the form, so write the body yourself with the same
-headings. An issue missing them is a note, not something a later pass can promote:
+headings. For each dropdown, select one exact option from
+[the form](../../ISSUE_TEMPLATE/code_review_skill_drift.yml), rather than an alias or
+the full option list. An issue missing the required fields is a note, not something a
+later pass can promote:
 
 ```markdown
 ### Drift class
-wrong finding | missed defect | stale fact | wasted step | mechanizable
+<one exact option from the form's Drift class dropdown>
 ### Where it happened
-<PR, review thread, or comment URL>
+<PR, review thread, or comment URL; for a local review, repository and base/HEAD commit IDs>
 ### What the skill says today
 <quote the bullet, or state that nothing covers this>
 ### What actually turned out to be true
 <the observation, in the terms a future reviewer would need>
 ### Evidence
-<file:line, the command and its output, or the thread where it was settled>
+<file:line, the command and its output, or the thread where it was settled; include the relevant diff excerpt for uncommitted changes>
 ### What it cost
-retracted blocking finding | retracted lesser finding | defect reached main |
-review time only | nothing yet
+<one exact option from the form's What it cost dropdown>
 ```
 
 For a new issue only:

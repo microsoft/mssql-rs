@@ -29,7 +29,10 @@ body:
     id: source
     attributes:
       label: Where it happened
-      description: PR, review thread, or comment URL.
+      description: >-
+        PR, review thread, or comment URL. For a local review without a PR, identify the
+        repository and base/HEAD commit IDs, and include the relevant diff excerpt in
+        Evidence for uncommitted changes.
     validations:
       required: true
 
