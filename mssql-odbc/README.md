@@ -251,6 +251,9 @@ with retail 18.6.2.1 (`SQL_DRIVER_VER` `18.06.0002`). See AB#48046.
 Text conversions finish a trailing partial source character before returning,
 even if earlier characters already produced output. Internal completion reads
 append to that output and preserve the call's length accounting.
+If malformed input starts a new character during completion, its bytes are
+returned to the raw stream for the next read. Completion does not keep consuming
+a chain of malformed characters after the output buffer fills.
 
 One reference-driver quirk remains: after a narrow read exhausts an
 `nvarchar(max)` value's wire bytes, a WCHAR probe with no payload room reports

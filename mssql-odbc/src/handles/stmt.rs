@@ -74,9 +74,8 @@ pub(crate) struct ActivePlpStream {
     /// having consumed nothing). Holding the surplus here lets a caller ask for
     /// one character at a time without stalling the stream.
     pub(crate) pending_units: Vec<u16>,
-    /// Wire bytes read ahead while the first async read for this value was
-    /// already in flight. Later SQLGetData calls consume these without entering
-    /// the runtime again.
+    /// Raw bytes awaiting delivery: async read-ahead or replayed character
+    /// lookahead. Later reads consume these without entering the runtime again.
     prefetched_wire: Vec<u8>,
     prefetched_offset: usize,
     prefetched_total_read_before: usize,
@@ -156,6 +155,24 @@ impl ActivePlpStream {
         self.prefetched_total_read_before = total_read_before;
         self.prefetched_known_total = known_total;
         self.prefetched_reached_end = reached_end;
+    }
+
+    /// Returns lookahead for a new source character to the raw stream.
+    pub(crate) fn restore_source_prefix(
+        &mut self,
+        bytes: &[u8],
+        total_read: usize,
+        known_total: Option<u64>,
+        reached_end: bool,
+    ) {
+        self.prefetched_wire.drain(..self.prefetched_offset);
+        if self.prefetched_wire.is_empty() {
+            self.prefetched_reached_end = reached_end;
+        }
+        self.prefetched_wire.splice(..0, bytes.iter().copied());
+        self.prefetched_offset = 0;
+        self.prefetched_total_read_before = total_read.saturating_sub(bytes.len());
+        self.prefetched_known_total = known_total;
     }
 
     /// Copies the next prefetched PLP bytes into `out`.
@@ -1829,6 +1846,42 @@ mod tests {
         );
         assert_eq!(&second[..4], &[3, 4, 5, 6]);
         assert_eq!(stream.read_prefetched_wire(&mut second), None);
+    }
+
+    #[test]
+    fn restored_source_prefix_preserves_prefetched_tail_and_accounting() {
+        let mut stream = ActivePlpStream::new(1, PlpEncoding::Utf16Text, None);
+        stream.set_prefetched_wire(
+            vec![0x00, 0xd8, 0x3d, 0xd8, 0x00, 0xde],
+            6,
+            8,
+            Some(14),
+            true,
+        );
+        assert_eq!(
+            stream.read_prefetched_wire(&mut [0; 4]),
+            Some((4, false, Some(14), 12))
+        );
+        stream.restore_source_prefix(&[0x3d, 0xd8], 12, Some(14), false);
+        let mut output = [0; 4];
+        assert_eq!(
+            stream.read_prefetched_wire(&mut output),
+            Some((4, true, Some(14), 14))
+        );
+        assert_eq!(output, [0x3d, 0xd8, 0x00, 0xde]);
+    }
+
+    #[test]
+    fn restored_source_prefix_preserves_unknown_length_without_a_prefetched_tail() {
+        let mut stream = ActivePlpStream::new(1, PlpEncoding::Utf8Text, Some(encoding_rs::UTF_8));
+        stream.restore_source_prefix(&[0xf0], 2, None, false);
+        let mut output = [0; 4];
+        assert_eq!(
+            stream.read_prefetched_wire(&mut output),
+            Some((1, false, None, 2))
+        );
+        assert_eq!(output[0], 0xf0);
+        assert_eq!(stream.read_prefetched_wire(&mut output), None);
     }
 
     #[test]
