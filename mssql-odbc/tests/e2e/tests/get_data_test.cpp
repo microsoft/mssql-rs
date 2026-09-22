@@ -286,20 +286,32 @@ protected:
         RecordProperty("driver_version", reinterpret_cast<const char*>(version));
     }
 
-    void CheckIssue627Collation(SQLSMALLINT target) {
+    void CheckIssue627Collation(SQLSMALLINT target, bool server_extensions = false) {
         struct Case {
             const char* collation;
             SQLINTEGER codepage;
+            SQLINTEGER sort_id;
             const char* hex;
             std::vector<SQLCHAR> utf8;
             SQLWCHAR wide;
         };
         const Case cases[] = {
-            {"SQL_Latin1_General_CP437_CI_AS", 437, "0x82", {0xC3, 0xA9}, 0x00E9},
-            {"SQL_Latin1_General_CP437_CI_AS", 437, "0x9B", {0xC2, 0xA2}, 0x00A2},
-            {"SQL_Latin1_General_CP850_CI_AS", 850, "0x9B", {0xC3, 0xB8}, 0x00F8},
-            {"Latin1_General_100_CI_AS", 1252, "0x80", {0xE2, 0x82, 0xAC}, 0x20AC},
-            {"Latin1_General_100_BIN2_UTF8", 65001, "0xE282AC",
+            {"SQL_Latin1_General_CP437_CI_AS", 437, 32, "0x82", {0xC3, 0xA9}, 0x00E9},
+            {"SQL_Latin1_General_CP437_CI_AS", 437, 32, "0x9B", {0xC2, 0xA2}, 0x00A2},
+            {"SQL_Latin1_General_CP850_CI_AS", 850, 42, "0x9B", {0xC3, 0xB8}, 0x00F8},
+            {"SQL_Latin1_General_CP1250_CS_AS", 1250, 81, "0xA3", {0xC5, 0x81}, 0x0141},
+            {"SQL_Latin1_General_CP1251_CS_AS", 1251, 105, "0xC6", {0xD0, 0x96}, 0x0416},
+            {"SQL_Latin1_General_CP1253_CS_AS", 1253, 113, "0xC1", {0xCE, 0x91}, 0x0391},
+            {"SQL_AltDiction2_CP1253_CS_AS", 1253, 122, "0xC1", {0xCE, 0x91}, 0x0391},
+            {"SQL_Latin1_General_CP1254_CI_AS", 1254, 130, "0xD0", {0xC4, 0x9E}, 0x011E},
+            {"SQL_Latin1_General_CP1255_CS_AS", 1255, 137, "0xE0", {0xD7, 0x90}, 0x05D0},
+            {"SQL_Latin1_General_CP1256_CS_AS", 1256, 145, "0xC7", {0xD8, 0xA7}, 0x0627},
+            {"SQL_Latin1_General_CP1257_CS_AS", 1257, 153, "0xC0", {0xC4, 0x84}, 0x0104},
+            {"SQL_Danish_Pref_CP1_CI_AS", 1252, 183, "0xE9", {0xC3, 0xA9}, 0x00E9},
+            {"SQL_EBCDIC037_CP1_CS_AS", 1252, 210, "0xE9", {0xC3, 0xA9}, 0x00E9},
+            {"SQL_EBCDIC297_CP1_CS_AS", 1252, 217, "0xE9", {0xC3, 0xA9}, 0x00E9},
+            {"Latin1_General_100_CI_AS", 1252, 0, "0x80", {0xE2, 0x82, 0xAC}, 0x20AC},
+            {"Latin1_General_100_BIN2_UTF8", 65001, 0, "0xE282AC",
              {0xE2, 0x82, 0xAC}, 0x20AC},
         };
         struct Shape {
@@ -314,16 +326,25 @@ protected:
             {"varchar(3)", "CAST(v AS sql_variant)"},
         };
         for (const auto& test : cases) {
+            const bool extension = test.sort_id == 122 || test.sort_id >= 210;
+            if (extension != server_extensions) {
+                continue;
+            }
             SCOPED_TRACE(test.collation);
             SCOPED_TRACE(test.hex);
             ASSERT_EQ(SQL_SUCCESS, ExecDirect(
                 "SELECT CONVERT(int, COLLATIONPROPERTY('" + std::string(test.collation) +
-                "', 'CodePage'))"));
+                "', 'CodePage')), CONVERT(int, SUBSTRING(CONVERT(varbinary(5), "
+                "COLLATIONPROPERTY('" + test.collation + "', 'TDSCollation')), 5, 1))"));
             ASSERT_EQ(SQL_SUCCESS, SQLFetch(stmt_));
             SQLINTEGER codepage = 0;
             ASSERT_EQ(SQL_SUCCESS, SQLGetData(stmt_, 1, SQL_C_SLONG, &codepage,
                                               sizeof(codepage), nullptr));
             ASSERT_EQ(test.codepage, codepage);
+            SQLINTEGER sort_id = -1;
+            ASSERT_EQ(SQL_SUCCESS, SQLGetData(stmt_, 2, SQL_C_SLONG, &sort_id,
+                                              sizeof(sort_id), nullptr));
+            ASSERT_EQ(test.sort_id, sort_id);
             ASSERT_EQ(SQL_SUCCESS, SQLCloseCursor(stmt_));
 
             for (const auto& shape : shapes) {
@@ -496,6 +517,20 @@ TEST_F(GetDataUtf16Test, Issue627SqlSortIdControlsCharDecoding) {
 
 TEST_F(GetDataUtf16Test, Issue627SqlSortIdControlsWcharDecoding) {
     CheckIssue627Collation(SQL_C_WCHAR);
+}
+
+// tdssort.h omits IDs 122 and 210..217, which SQL Server 2022 emits. Retail
+// 18.6.2.1-1 (SQL_DRIVER_VER 18.06.0002), Linux C.UTF-8, fails the CHAR/WCHAR
+// payload assertions for these cases. Rust exceeds that coverage by using the
+// server's CodePage; the common sort-ID matrix above still runs on both legs.
+TEST_F(GetDataUtf16Test, Issue627SqlServerExtendedSortIdsCharDecoding) {
+    SKIP_IF_COMPARING_MSODBCSQL();
+    CheckIssue627Collation(SQL_C_CHAR, true);
+}
+
+TEST_F(GetDataUtf16Test, Issue627SqlServerExtendedSortIdsWcharDecoding) {
+    SKIP_IF_COMPARING_MSODBCSQL();
+    CheckIssue627Collation(SQL_C_WCHAR, true);
 }
 
 TEST_F(GetDataUtf16Test, Issue627FittingMaxCharReadCompletesImmediately) {

@@ -672,8 +672,21 @@ mod tests {
             (40, b"\x82\xb3\xd0".as_slice(), "é│ð"),
             (50, b"\xe9".as_slice(), "é"),
             (85, b"\xa3".as_slice(), "Ł"),
-            (109, b"\xc6".as_slice(), "Ж"),
-            (203, b"\x82\xa0".as_slice(), "あ"),
+            (105, b"\xc6".as_slice(), "Ж"),
+            (112, b"\xc1".as_slice(), "Α"),
+            (122, b"\xc1".as_slice(), "Α"),
+            (130, b"\xd0".as_slice(), "Ğ"),
+            (137, b"\xe0".as_slice(), "א"),
+            (145, b"\xc7".as_slice(), "ا"),
+            (153, b"\xc0".as_slice(), "Ą"),
+            (183, b"\xe9".as_slice(), "é"),
+            (192, b"\x82\xa0".as_slice(), "あ"),
+            (194, b"\xb0\xa1".as_slice(), "가"),
+            (196, b"\xa4\xa4".as_slice(), "中"),
+            (203, b"\xd6\xd0".as_slice(), "中"),
+            (204, b"\xa1".as_slice(), "ก"),
+            (210, b"\xe9".as_slice(), "é"),
+            (217, b"\xe9".as_slice(), "é"),
         ] {
             let collation = SqlCollation {
                 info: 0x0409,
@@ -687,6 +700,33 @@ mod tests {
             if matches!(sort_id, 30 | 40) {
                 assert_eq!(encoding.encoding(), None);
             }
+        }
+    }
+
+    #[test]
+    fn sort_id_table_matches_reference_assignments() {
+        // msodbcsql Sql/Common/include/tdssort.h, x_rguiCodepageFromSortid.
+        // SQL Server 2022 also emits 122 and 210..=217, absent from that header.
+        for (sort_id, actual) in CODE_PAGE_FROM_SORT_ID.iter().enumerate() {
+            let expected = match sort_id {
+                30..=34 => Some(437),
+                40..=44 | 49 | 55..=61 => Some(850),
+                50..=54 | 71..=75 | 183..=186 | 210..=217 => Some(1252),
+                80..=97 => Some(1250),
+                104..=108 => Some(1251),
+                112..=114 | 120..=122 | 124 => Some(1253),
+                128..=130 => Some(1254),
+                136..=138 => Some(1255),
+                144..=146 => Some(1256),
+                152..=160 => Some(1257),
+                192 | 193 | 200 => Some(932),
+                194 | 195 | 201 => Some(949),
+                196 | 197 | 202 => Some(950),
+                198 | 199 | 203 => Some(936),
+                204..=206 => Some(874),
+                _ => None,
+            };
+            assert_eq!(*actual, expected, "sort ID {sort_id}");
         }
     }
 
