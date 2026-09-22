@@ -26,39 +26,8 @@ steps:
   displayName: 'Install CMake'
 
 # ── 2. Clone mssql-python ────────────────────────────────────────────────────
-- script: |
-    set -euo pipefail
-
-    MSSQL_PYTHON_BRANCH="main"
-
-    if [ -n "${SYSTEM_PULLREQUEST_PULLREQUESTID:-}" ]; then
-      echo "PR build detected (PR #${SYSTEM_PULLREQUEST_PULLREQUESTID})"
-
-      az extension add --name azure-devops --yes --allow-preview true 2>/dev/null || echo "Extension may already be installed"
-      az devops configure --defaults organization="${SYSTEM_COLLECTIONURI}" project="${SYSTEM_TEAMPROJECT}"
-
-      PR_DESC=$(az repos pr show --id "${SYSTEM_PULLREQUEST_PULLREQUESTID}" --query description -o tsv 2>&1) || {
-        echo "##[warning]Failed to get PR description: $PR_DESC"
-        PR_DESC=""
-      }
-
-      if [ -n "$PR_DESC" ]; then
-        BRANCH_OVERRIDE=$(echo "$PR_DESC" | grep -oP 'mssql-python-branch:\s*\K[a-zA-Z0-9_/.-]+' | head -1 | tr -d '[:space:]' || true)
-        if [ -n "$BRANCH_OVERRIDE" ]; then
-          MSSQL_PYTHON_BRANCH="$BRANCH_OVERRIDE"
-          echo "##[section]Using mssql-python branch override: $MSSQL_PYTHON_BRANCH"
-        fi
-      fi
-    fi
-
-    echo "Cloning microsoft/mssql-python (branch: $MSSQL_PYTHON_BRANCH)..."
-    if ! git clone --depth 1 -b "$MSSQL_PYTHON_BRANCH" https://github.com/microsoft/mssql-python.git ../mssql-python 2>/dev/null; then
-      echo "##[warning]Branch '$MSSQL_PYTHON_BRANCH' not found, falling back to main"
-      git clone --depth 1 -b main https://github.com/microsoft/mssql-python.git ../mssql-python
-    fi
+- script: bash .pipeline/scripts/clone-mssql-python.sh
   displayName: Clone mssql-python
-  env:
-    AZURE_DEVOPS_EXT_PAT: $(System.AccessToken)
 
 # ── 3. Build bindings (no Docker needed) ─────────────────────────────────────
 - script: |
@@ -97,11 +66,7 @@ steps:
     CARGO_REGISTRIES_MSSQL_RS_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_TOKEN)
 
 # ── 4. Start Docker via Colima ───────────────────────────────────────────────
-# timeoutInMinutes backstops the scripts' own wall-clock budgets: the macOS job
-# caps at 60 minutes and SQL setup must not be what exhausts it.
-- script: bash .pipeline/scripts/start-colima-macos.sh
-  displayName: 'Install and start Colima-based Docker'
-  timeoutInMinutes: 13
+- template: macos-docker-steps.yml
 
 # ── 5. Start SQL Server (no TLS certs) ──────────────────────────────────────
 - script: bash .pipeline/scripts/start-sql-server-macos.sh
@@ -123,7 +88,6 @@ steps:
     SQL_SERVER: '127.0.0.1'
     SQL_DATABASE: 'master'
     TRUST_SERVER_CERTIFICATE: 'true'
-  continueOnError: true
 
 - task: PublishTestResults@2
   condition: succeededOrFailed()
@@ -131,6 +95,8 @@ steps:
   inputs:
     testResultsFiles: '**/pytest-mssql-python-macos-results.xml'
     testRunTitle: 'mssql-python macOS tests'
+    failTaskOnFailedTests: true
+    failTaskOnMissingResultsFile: true
 
 - script: |
     docker stop sqlserver || true

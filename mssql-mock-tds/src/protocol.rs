@@ -14,6 +14,9 @@ pub const PACKET_HEADER_SIZE: usize = 8;
 /// Maximum packet size
 pub const MAX_PACKET_SIZE: usize = 4096;
 
+const PLP_TYPE_LENGTH_MARKER: u16 = 0xFFFF;
+const MAX_BOUNDED_STRING_BYTES: u16 = 8000;
+
 #[derive(Debug, Error)]
 pub enum ProtocolError {
     #[error("IO error: {0}")]
@@ -672,15 +675,18 @@ pub fn build_login_ack() -> BytesMut {
     token_data
 }
 
-/// Build a DONE token
-pub fn build_done_token(row_count: u64) -> BytesMut {
+/// Build a DONE token with explicit status flags (MS-TDS `DONE_STATUS`) and
+/// row count. The lower-level primitive behind [`build_done_token`] (which
+/// always passes `DONE_FINAL`) and [`build_attention_ack_packet`] (which needs
+/// `DONE_ATTN` instead).
+fn build_done_token_with_status(status: u16, row_count: u64) -> BytesMut {
     let mut token_data = BytesMut::new();
 
     // DONE token (0xFD)
     token_data.put_u8(TokenType::Done as u8);
 
-    // Status: DONE_FINAL (0x00) - little-endian
-    token_data.put_u16_le(0x0000);
+    // Status - little-endian
+    token_data.put_u16_le(status);
 
     // CurCmd: SELECT (0xC1) - little-endian
     token_data.put_u16_le(0x00C1);
@@ -689,6 +695,19 @@ pub fn build_done_token(row_count: u64) -> BytesMut {
     token_data.put_u64_le(row_count);
 
     token_data
+}
+
+/// Build a DONE token
+pub fn build_done_token(row_count: u64) -> BytesMut {
+    build_done_token_with_status(0x0000, row_count) // DONE_FINAL
+}
+
+/// Build the full packet answering an `Attention` (0x06) request: a DONE
+/// token carrying the DONE_ATTN flag (0x0020), matching real SQL Server's
+/// acknowledgment that it stopped processing the cancelled request.
+pub fn build_attention_ack_packet() -> BytesMut {
+    let response = build_done_token_with_status(0x0020, 0); // DONE_ATTN
+    wrap_in_packet(PacketType::TabularResult, response)
 }
 
 /// Transaction Manager request types (MS-TDS SQLTransactionManagerRequest).
@@ -856,9 +875,54 @@ pub fn build_leading_error_tokens(error: &crate::query_response::LeadingError) -
     buf
 }
 
+/// Build a raw ERROR token (0xAA) followed by a DONE token carrying only the
+/// ERROR flag. Models a statement that fails outright — no MORE flag, no
+/// further result set — e.g. SQL Server error 1222 on a lock-timed-out
+/// `SELECT`. The returned bytes are raw tokens (no packet wrapper).
+pub fn build_terminal_error_tokens(error: &crate::query_response::TerminalError) -> BytesMut {
+    let mut buf = BytesMut::new();
+
+    buf.put_u8(TokenType::Error as u8);
+    let length_pos = buf.len();
+    buf.put_u16_le(0); // placeholder for token length
+
+    buf.put_u32_le(error.number);
+    buf.put_u8(1); // state
+    buf.put_u8(error.severity);
+
+    let message_utf16: Vec<u16> = error.message.encode_utf16().collect();
+    buf.put_u16_le(message_utf16.len() as u16);
+    for ch in message_utf16 {
+        buf.put_u16_le(ch);
+    }
+
+    buf.put_u8(0); // server name (empty)
+    buf.put_u8(0); // procedure name (empty)
+    buf.put_u32_le(1); // line number
+
+    let token_length = (buf.len() - length_pos - 2) as u16;
+    let mut length_bytes = &mut buf[length_pos..length_pos + 2];
+    length_bytes.put_u16_le(token_length);
+
+    // DONE with DONE_ERROR (0x02) only: the batch ends here, no MORE.
+    buf.put_u8(TokenType::Done as u8);
+    buf.put_u16_le(0x0002);
+    buf.put_u16_le(0x00C1); // CurCmd: SELECT
+    buf.put_u64_le(0); // row count
+
+    buf
+}
+
 /// Build a query result from a QueryResponse
 pub fn build_query_result(response: &crate::query_response::QueryResponse) -> BytesMut {
     let mut result = BytesMut::new();
+
+    // A terminal error replaces the result set entirely: no ColMetadata, no
+    // rows, no trailing DONE — the error's own DONE ends the batch.
+    if let Some(terminal_error) = &response.terminal_error {
+        result.extend_from_slice(&build_terminal_error_tokens(terminal_error));
+        return wrap_in_packet(PacketType::TabularResult, result);
+    }
 
     // A statement-scoped error preceding the result set: emit the ERROR token
     // and its DONE (MORE) before the ColMetadata so the row set still streams.
@@ -875,10 +939,20 @@ pub fn build_query_result(response: &crate::query_response::QueryResponse) -> By
         result.put_u32_le(0); // UserType
         result.put_u16_le(0x0000); // Flags: not nullable, no special flags
         result.put_u8(col.data_type.tds_type_code());
-        if col.data_type == crate::query_response::SqlDataType::NVarChar {
+        if matches!(
+            col.data_type,
+            crate::query_response::SqlDataType::NVarChar
+                | crate::query_response::SqlDataType::NVarCharMax
+        ) {
             // Required to support string responses (e.g., @@USERAGENT).
             // TDS ColMetadata mandates a 5-byte collation suffix for variable-length types.
-            result.put_u16_le(8000); // NVARCHAR(4000) max byte capacity
+            result.put_u16_le(
+                if col.data_type == crate::query_response::SqlDataType::NVarCharMax {
+                    PLP_TYPE_LENGTH_MARKER
+                } else {
+                    MAX_BOUNDED_STRING_BYTES
+                },
+            );
             result.put_slice(&[0x09, 0x04, 0xD0, 0x00, 0x34]); // SQL_Latin1_General_CP1_CI_AS
         } else {
             result.put_u8(col.data_type.max_length());
@@ -1102,6 +1176,63 @@ pub fn parse_sql_batch(data: &[u8]) -> Result<String, ProtocolError> {
     Ok(sql.trim().to_string())
 }
 
+/// Header type for the TransactionDescriptor entry within ALL_HEADERS
+/// (MS-TDS 2.2.5.3.1).
+const HEADER_TYPE_TRANSACTION_DESCRIPTOR: u16 = 0x0002;
+
+/// Parses the ALL_HEADERS block that leads a `SqlBatch`/`RpcRequest` packet
+/// body and returns the TransactionDescriptor header's
+/// `(TransactionDescriptor, OutstandingRequestCount)`, if one is present.
+///
+/// `ConnectionProcessor` records the result of every call in
+/// [`ConnectionInfo::transaction_descriptor_headers`], so a test can assert a
+/// client honored MS-TDS 2.2.5.3.2 — "The TransactionDescriptor MUST be 0,
+/// and OutstandingRequestCount MUST be 1 if the connection is operating in
+/// autocommit mode" — without the mock server itself enforcing it.
+///
+/// [`ConnectionInfo::transaction_descriptor_headers`]: crate::server::ConnectionInfo::transaction_descriptor_headers
+pub fn parse_transaction_descriptor_header(data: &[u8]) -> Option<(u64, u32)> {
+    if data.len() < 4 {
+        return None;
+    }
+    let all_headers_len = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+    if !(4..=data.len()).contains(&all_headers_len) {
+        return None;
+    }
+
+    // Walk the individual headers within [4, all_headers_len): each starts
+    // with its own 4-byte length (inclusive of itself) followed by a 2-byte
+    // HeaderType.
+    let mut offset = 4;
+    while offset + 6 <= all_headers_len {
+        let header_len = u32::from_le_bytes([
+            data[offset],
+            data[offset + 1],
+            data[offset + 2],
+            data[offset + 3],
+        ]) as usize;
+        let header_type = u16::from_le_bytes([data[offset + 4], data[offset + 5]]);
+
+        if header_len < 6 || offset + header_len > all_headers_len {
+            return None;
+        }
+
+        if header_type == HEADER_TYPE_TRANSACTION_DESCRIPTOR && header_len >= 18 {
+            let td_start = offset + 6;
+            let transaction_descriptor =
+                u64::from_le_bytes(data[td_start..td_start + 8].try_into().ok()?);
+            let count_start = td_start + 8;
+            let outstanding_request_count =
+                u32::from_le_bytes(data[count_start..count_start + 4].try_into().ok()?);
+            return Some((transaction_descriptor, outstanding_request_count));
+        }
+
+        offset += header_len;
+    }
+
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1320,5 +1451,47 @@ mod tests {
             without_error[PACKET_HEADER_SIZE],
             TokenType::ColMetadata as u8
         );
+    }
+
+    /// Builds the ALL_HEADERS bytes a real client sends: a total-length DWORD
+    /// followed by a single TransactionDescriptor header
+    /// (length=18, type=0x0002, transaction_descriptor, outstanding_request_count).
+    fn all_headers_with_transaction_descriptor(
+        transaction_descriptor: u64,
+        outstanding_request_count: u32,
+    ) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(&22u32.to_le_bytes()); // ALL_HEADERS total length
+        data.extend_from_slice(&18u32.to_le_bytes()); // this header's length
+        data.extend_from_slice(&HEADER_TYPE_TRANSACTION_DESCRIPTOR.to_le_bytes());
+        data.extend_from_slice(&transaction_descriptor.to_le_bytes());
+        data.extend_from_slice(&outstanding_request_count.to_le_bytes());
+        data
+    }
+
+    #[test]
+    fn test_parse_transaction_descriptor_header_extracts_autocommit_values() {
+        let data = all_headers_with_transaction_descriptor(0, 1);
+        assert_eq!(parse_transaction_descriptor_header(&data), Some((0, 1)));
+    }
+
+    #[test]
+    fn test_parse_transaction_descriptor_header_extracts_in_transaction_values() {
+        let data = all_headers_with_transaction_descriptor(42, 3);
+        assert_eq!(parse_transaction_descriptor_header(&data), Some((42, 3)));
+    }
+
+    #[test]
+    fn test_parse_transaction_descriptor_header_none_without_all_headers() {
+        assert_eq!(parse_transaction_descriptor_header(&[]), None);
+        assert_eq!(parse_transaction_descriptor_header(&[1, 2, 3]), None);
+    }
+
+    #[test]
+    fn test_parse_transaction_descriptor_header_none_when_length_exceeds_data() {
+        // Claims a 100-byte ALL_HEADERS block but supplies far fewer bytes.
+        let mut data = Vec::new();
+        data.extend_from_slice(&100u32.to_le_bytes());
+        assert_eq!(parse_transaction_descriptor_header(&data), None);
     }
 }

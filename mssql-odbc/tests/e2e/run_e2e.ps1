@@ -295,13 +295,14 @@ function Restore-Registration {
 
 # Run the (already-built) ctest suite, writing JUnit XML to $JunitName inside
 # the build dir. Returns ctest's exit code without aborting the script.
-function Invoke-CtestRun([string]$Label, [string]$JunitName, [string]$DriverName) {
+function Invoke-CtestRun([string]$Label, [string]$JunitName, [string]$DriverName, [string]$RustDriverDll) {
     Write-Host ""
     Write-Host "=== Running e2e tests against $Label ==="
     Write-Host "ODBC_TEST_DRIVER=$DriverName"
     Push-Location (Join-Path $ScriptDir "build")
     $prevTarget = $env:ODBC_TEST_TARGET
     $prevDriver = $env:ODBC_TEST_DRIVER
+    $prevDll = $env:MSSQL_ODBC_DLL
     try {
         $ctestArgs = @('--output-on-failure', '-C', 'Debug', '--output-junit', $JunitName)
         if ($Retries -gt 0) {
@@ -317,6 +318,17 @@ function Invoke-CtestRun([string]$Label, [string]$JunitName, [string]$DriverName
         # ODBC_TEST_DRIVER selects the driver by name in the connection string.
         $env:ODBC_TEST_TARGET = $Label
         $env:ODBC_TEST_DRIVER = $DriverName
+        # dll_unload_stress_test loads the driver directly with LoadLibrary to
+        # exercise free-then-unload (AB#47831), so it needs a path rather than a
+        # registered name and skips without one. Set only for the Rust leg: the
+        # runtime whose teardown it guards is ours, so pointing it at the
+        # reference driver would test nothing. Skipping on the msodbcsql leg is
+        # parity-neutral — parity_report.py classifies a SKIP on either side as
+        # "skipped (not compared)".
+        $env:MSSQL_ODBC_DLL = $RustDriverDll
+        if ($RustDriverDll) {
+            Write-Host "MSSQL_ODBC_DLL=$RustDriverDll"
+        }
         # Stream ctest output to the host so only the exit code is returned
         # from this function (an uncaptured pipeline would be returned too).
         ctest @ctestArgs | Out-Host
@@ -324,6 +336,7 @@ function Invoke-CtestRun([string]$Label, [string]$JunitName, [string]$DriverName
     } finally {
         $env:ODBC_TEST_TARGET = $prevTarget
         $env:ODBC_TEST_DRIVER = $prevDriver
+        $env:MSSQL_ODBC_DLL = $prevDll
         Pop-Location
     }
 }
@@ -432,7 +445,7 @@ function Write-ParityReport([string]$RustXml, [string]$MsXml) {
 # distinct gtest processes and ctest retries never clobber each other's .profraw).
 # PowerShell has no `eval`, so parse each KEY=VALUE line (stripping surrounding
 # quotes) into the process env. The subsequent `cargo build` then produces an
-# instrumented msodbcsql18.dll, and every ctest child process inherits
+# instrumented mssqlodbc.dll, and every ctest child process inherits
 # LLVM_PROFILE_FILE from this environment. The llvm-cov target dir is also
 # exported so the later `cargo metadata` resolves the INSTRUMENTED DLL.
 function Enable-CoverageInstrumentation {
@@ -488,7 +501,7 @@ function New-CoverageReport([string]$OutputPath) {
     }
     Push-Location $WorkspaceDir
     try {
-        cargo llvm-cov report --package mssql-tds --package mssql-odbc `
+        cargo llvm-cov report --package mssql-tds --package mssqlodbc `
             --cobertura --output-path $OutputPath
         if ($LASTEXITCODE -eq 0) {
             Write-Host "Coverage report written to $OutputPath"
@@ -581,6 +594,26 @@ function Initialize-CMake {
     }
 }
 
+# CMake build trees are not portable across Windows and WSL: each environment
+# records a different absolute source path in CMakeCache.txt. Remove a tree
+# configured from another path before asking Windows CMake to reuse it.
+function Remove-IncompatibleCMakeBuildTree([string]$BuildDir) {
+    $cachePath = Join-Path $BuildDir "CMakeCache.txt"
+    if (-not (Test-Path $cachePath)) { return }
+
+    $sourceEntry = Get-Content -Path $cachePath |
+        Where-Object { $_ -match '^CMAKE_HOME_DIRECTORY:INTERNAL=' } |
+        Select-Object -First 1
+    if (-not $sourceEntry) { return }
+
+    $cachedSource = ($sourceEntry -replace '^CMAKE_HOME_DIRECTORY:INTERNAL=', '').Replace('\', '/').TrimEnd('/')
+    $windowsSource = $ScriptDir.Replace('\', '/').TrimEnd('/')
+    if (-not [string]::Equals($cachedSource, $windowsSource, [System.StringComparison]::OrdinalIgnoreCase)) {
+        Write-Host "Removing incompatible CMake build tree (cached source: $cachedSource)"
+        Remove-Item -Path $BuildDir -Recurse -Force
+    }
+}
+
 try {
     if ($Retries -gt 0) {
         Write-Host "Retries enabled: each failing test reruns up to $Retries time(s)."
@@ -604,23 +637,7 @@ try {
         Pop-Location
     }
 
-    # Cargo builds into the workspace root's target/ by default, but honors
-    # CARGO_TARGET_DIR (set by CI). Resolve via `cargo metadata` so the driver is
-    # found regardless of where it landed.
-    $TargetDir = $null
-    Push-Location $OdbcCrateDir
-    try {
-        $meta = cargo metadata --format-version 1 --no-deps 2>$null | ConvertFrom-Json
-        if ($meta -and $meta.target_directory) { $TargetDir = $meta.target_directory }
-    } catch { }
-    Pop-Location
-    if (-not $TargetDir) { $TargetDir = Join-Path $WorkspaceDir "target" }
-
-    $DriverPath = Join-Path $TargetDir "$BuildType\msodbcsql18.dll"
-    if (-not (Test-Path $DriverPath)) {
-        Write-Error "Driver not found at $DriverPath"
-    }
-    $DriverPath = (Resolve-Path $DriverPath).Path
+    $DriverPath = & (Join-Path $OdbcCrateDir "scripts\finalize-artifact.ps1") -BuildProfile $BuildType
     Write-Host "Rust driver: $DriverPath"
 
     if ($Coverage) {
@@ -665,6 +682,7 @@ try {
     Write-Host ""
     Write-Host "=== Configuring e2e tests (CMake) ==="
     Initialize-CMake
+    Remove-IncompatibleCMakeBuildTree (Join-Path $ScriptDir "build")
     Push-Location $ScriptDir
     try {
         try {
@@ -693,7 +711,7 @@ try {
 
     # Run 1: the Rust driver, registered under its own name.
     Register-RustDriver $DriverPath
-    $RustExit = Invoke-CtestRun "mssql-odbc" "junit-mssql-odbc.xml" $RustDriverName
+    $RustExit = Invoke-CtestRun "mssql-odbc" "junit-mssql-odbc.xml" $RustDriverName $DriverPath
     Assert-TestsExecuted $RustJunit "mssql-odbc"
 
     # Report on the instrumented mssql-odbc leg before the (uninstrumented)

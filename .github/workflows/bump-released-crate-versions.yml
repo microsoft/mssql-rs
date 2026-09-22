@@ -1,0 +1,48 @@
+name: Bump Released Crate Versions
+
+on:
+  schedule:
+    # Check every third UTC day, without resetting at month boundaries.
+    - cron: '23 8 * * *'
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: bump-released-crate-versions
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: read
+    steps:
+      - name: Checkout default branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Check cadence
+        id: cadence
+        run: |
+          python3 - <<'PY'
+          import os
+          from datetime import date, datetime, timezone
+          days = (datetime.now(timezone.utc).date() - date(1970, 1, 1)).days
+          due = os.environ["GITHUB_EVENT_NAME"] != "schedule" or days % 3 == 0
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"due={str(due).lower()}\n")
+          PY
+
+      - name: Create or update tracking issue
+        if: steps.cadence.outputs.due == 'true'
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          GH_TOKEN: ${{ github.token }}
+          RUSTUP_TOOLCHAIN: stable
+        run: python3 scripts/bump-released-crate-versions.py

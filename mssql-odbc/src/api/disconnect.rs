@@ -13,7 +13,7 @@ use crate::api::txn::rollback_before_disconnect;
 use crate::error::free_errors;
 use crate::handles::DbcHandle;
 use crate::handles::StmtHandle;
-use crate::handles::dbc::ConnectionState;
+use crate::handles::dbc::{ConnectionIdentity, ConnectionState};
 use crate::handles::desc::DescHandle;
 use crate::handles::{HandleType, free_handle, handle_from_raw};
 
@@ -29,6 +29,8 @@ pub(crate) unsafe fn sql_disconnect(connection_handle: SqlHandle) -> SqlReturn {
     })
 }
 
+/// # Safety
+/// `connection_handle` must be null or point to a live `DbcHandle`.
 unsafe fn sql_disconnect_impl(connection_handle: SqlHandle) -> SqlReturn {
     if connection_handle.is_null() {
         error!("SQLDisconnect: connection_handle is null");
@@ -149,6 +151,8 @@ fn sql_disconnect_safe(dbc: &DbcHandle) -> SqlReturn {
     state.client = None;
     state.active_stmt = None;
     state.effective_vendor_settings = None;
+    state.effective_packet_size = None;
+    state.identity = ConnectionIdentity::default();
     state.connection_state = ConnectionState::Disconnected;
 
     debug!("SQLDisconnect: disconnected successfully");

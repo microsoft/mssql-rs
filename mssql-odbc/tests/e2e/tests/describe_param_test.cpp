@@ -6,6 +6,10 @@
 #include <array>
 #include <string>
 
+#ifndef SQL_SS_UDT
+#define SQL_SS_UDT (-151)
+#endif
+
 namespace {
 
 struct ParamDescription {
@@ -24,12 +28,17 @@ TEST(DescribeParamTest, NullHandle) {
 
 class DescribeParamLiveTest : public ODBCTest {
 protected:
+    virtual SQLUINTEGER OdbcVersion() const { return SQL_OV_ODBC3_80; }
+
     void SetUp() override {
         ODBCTest::SetUp();
         if (!ODBCTestConfig::Instance().HasConnection()) {
             FAIL() << "No connection configured - set ODBC_TEST_SERVER or "
                       "ODBC_TEST_CONNSTR";
         }
+        ASSERT_SQL_OK(SQLSetEnvAttr(env_, SQL_ATTR_ODBC_VERSION,
+                                    reinterpret_cast<SQLPOINTER>(OdbcVersion()), 0),
+                      SQL_HANDLE_ENV, env_);
         Connect();
     }
 
@@ -71,6 +80,37 @@ protected:
                    : std::string(reinterpret_cast<const char*>(value));
     }
 };
+
+class DescribeParamOdbcVersionLiveTest
+    : public DescribeParamLiveTest,
+      public ::testing::WithParamInterface<SQLUINTEGER> {
+protected:
+    SQLUINTEGER OdbcVersion() const override { return GetParam(); }
+};
+
+// Benefits-from-mock-tds: request capture could assert that both application
+// versions take the same metadata RPC path; the live test observes the
+// precision values produced from its rows.
+TEST_P(DescribeParamOdbcVersionLiveTest, ApproximateNumericPrecisionMatchesMsodbcsql) {
+    ASSERT_SQL_OK(Prepare("SELECT CAST(? AS REAL), CAST(? AS FLOAT)"), SQL_HANDLE_STMT, stmt_);
+
+    ParamDescription real;
+    ParamDescription floating;
+    ASSERT_TRUE(Describe(1, real));
+    ASSERT_TRUE(Describe(2, floating));
+    EXPECT_EQ(SQL_REAL, real.data_type);
+    EXPECT_EQ(24U, real.size);
+    EXPECT_EQ(0, real.scale);
+    EXPECT_EQ(SQL_NULLABLE, real.nullable);
+    EXPECT_EQ(SQL_FLOAT, floating.data_type);
+    EXPECT_EQ(53U, floating.size);
+    EXPECT_EQ(0, floating.scale);
+    EXPECT_EQ(SQL_NULLABLE, floating.nullable);
+}
+
+INSTANTIATE_TEST_SUITE_P(Odbc3And38, DescribeParamOdbcVersionLiveTest,
+                         ::testing::Values(static_cast<SQLUINTEGER>(SQL_OV_ODBC3),
+                                           static_cast<SQLUINTEGER>(SQL_OV_ODBC3_80)));
 
 TEST_F(DescribeParamLiveTest, IsAdvertised) {
     SQLUSMALLINT supported = SQL_FALSE;
@@ -117,6 +157,28 @@ TEST_F(DescribeParamLiveTest, ReportsRepresentativeMetadata) {
         {SQL_VARBINARY, 16, 0, SQL_NULLABLE},
         {SQL_DECIMAL, 12, 3, SQL_NULLABLE},
         {SQL_TYPE_TIMESTAMP, 24, 4, SQL_NULLABLE},
+    }};
+
+    for (SQLUSMALLINT ordinal = 1; ordinal <= expected.size(); ++ordinal) {
+        ParamDescription actual;
+        ASSERT_TRUE(Describe(ordinal, actual)) << "ordinal " << ordinal;
+        const ParamDescription& wanted = expected[ordinal - 1];
+        EXPECT_EQ(wanted.data_type, actual.data_type) << "ordinal " << ordinal;
+        EXPECT_EQ(wanted.size, actual.size) << "ordinal " << ordinal;
+        EXPECT_EQ(wanted.scale, actual.scale) << "ordinal " << ordinal;
+        EXPECT_EQ(wanted.nullable, actual.nullable) << "ordinal " << ordinal;
+    }
+}
+
+TEST_F(DescribeParamLiveTest, DescribesClrUdtMetadata) {
+    ASSERT_SQL_OK(
+        Prepare("SELECT CAST(? AS geography), CAST(? AS geometry), CAST(? AS hierarchyid)"),
+        SQL_HANDLE_STMT, stmt_);
+
+    const std::array<ParamDescription, 3> expected = {{
+        {SQL_SS_UDT, 0, 0, SQL_NULLABLE},
+        {SQL_SS_UDT, 0, 0, SQL_NULLABLE},
+        {SQL_SS_UDT, 0, 0, SQL_NULLABLE},
     }};
 
     for (SQLUSMALLINT ordinal = 1; ordinal <= expected.size(); ++ordinal) {
@@ -199,13 +261,7 @@ TEST_F(DescribeParamLiveTest, ReprepareInvalidatesMetadata) {
 
 // `*(max)` parameters have no bounded length; both drivers report a size of 0,
 // and a bind from that description must still round-trip.
-//
-// Disabled: every bind is now checked against the conversion matrix, defaulted
-// ones included, and `SQL_VARBINARY` has no row yet - so the second parameter is
-// rejected at bind with HYC00. A deliberate phase 0 scope restriction, not a
-// defect; `typed_null` already handles the type. Re-enable when binary
-// conversions land: AB#47500. See the design rules in docs/parameters_plan.md.
-TEST_F(DescribeParamLiveTest, DISABLED_DescribesMaxLengthParameters) {
+TEST_F(DescribeParamLiveTest, DescribesMaxLengthParameters) {
     ASSERT_SQL_OK(Prepare("SELECT CAST(? AS NVARCHAR(MAX)), CAST(? AS VARBINARY(MAX))"),
                   SQL_HANDLE_STMT, stmt_);
 
@@ -228,18 +284,14 @@ TEST_F(DescribeParamLiveTest, DISABLED_DescribesMaxLengthParameters) {
     SQLLEN result = 0;
     GetColumn(1, &result);
     EXPECT_EQ(SQL_NULL_DATA, result);
+    GetColumn(2, &result);
+    EXPECT_EQ(SQL_NULL_DATA, result);
     EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }
 
 // A described decimal must be re-declared with the same precision and scale, or
 // the first non-NULL value bound from that description would be truncated.
-//
-// Disabled for the same reason as DISABLED_DescribesMaxLengthParameters:
-// `SQL_DECIMAL` resolves to `SQL_C_CHAR`, which the matrix pairs only with the
-// character SQL types, so the bind is rejected with HYC00. Re-enable when
-// decimal conversions land (AB#47500) - this test also guards the scale-0
-// wire-metadata regression, so it should come back with them.
-TEST_F(DescribeParamLiveTest, DISABLED_DescribedDecimalRoundTripsPrecisionAndScale) {
+TEST_F(DescribeParamLiveTest, DescribedDecimalRoundTripsPrecisionAndScale) {
     ASSERT_SQL_OK(Prepare("SELECT ISNULL(?, CAST(1.5 AS DECIMAL(12,3)))"),
                   SQL_HANDLE_STMT, stmt_);
 

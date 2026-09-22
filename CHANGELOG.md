@@ -55,6 +55,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ### Changed
 
+- `mssql-odbc`: `SQLBindCol` now accepts `SQL_C_DEFAULT` and resolves it at
+  fetch time from the current result column's SQL type, using the same mapping
+  as `SQLBindParameter`. Wide character columns resolve to `SQL_C_WCHAR` and
+  `uniqueidentifier` to `SQL_C_GUID`, where msodbcsql resolves both to its ANSI
+  `SQL_C_CHAR`.
+
 - `mssql-tds`: LOGIN7 now encodes Unicode field lengths as UTF-16 code units
   and rejects oversized records instead of producing malformed packets. This
   fixes login failures with non-ASCII usernames, passwords, database names,
@@ -115,6 +121,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ### Fixed
 
+- `mssql-odbc`: `SQL_ATTR_QUERY_TIMEOUT` is now enforced for the implemented
+  catalog functions (`SQLTables`, `SQLColumns`, `SQLPrimaryKeys`,
+  `SQLForeignKeys`, `SQLSpecialColumns`, `SQLStatistics`, `SQLProcedures`),
+  `SQLGetTypeInfo` and `SQLDescribeParam`. These passed a hard-coded "no
+  timeout" to both their pre-execute steps and the RPC itself, so a configured
+  timeout bounded nothing — including the row reads on the result set they
+  open, because the budget is carried on the connection for the lifetime of the
+  batch. A blocked catalog query could therefore wait forever where msodbcsql
+  returns `HYT00`. msodbcsql runs these through `SQLExecDirectW`
+  (`sqlcdd.cpp:1866`, `:2239`) and `AutoFillIPD` (`sqlcdesc.cpp:9379`), all
+  applying the same statement timeout; the ODBC reference also documents
+  `HYT00` for every catalog function and `SQLGetTypeInfo`, naming this
+  attribute as its source. `0` (the ODBC default) still means unlimited.
+
 - `mssql-odbc`: the `APP` connection-string keyword is now sent as the TDS login
   application name. It was recognized but ignored, so `APP_NAME()` reported the
   default `TDSX Rust Client` value without warning that `APP` had been dropped.
@@ -150,3 +170,45 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   rejected as a protocol error. Such a packet is malformed — it neither carries
   payload nor terminates a message — but was previously consumed as a
   zero-length packet. Empty end-of-message packets remain legal.
+
+- `mssql-odbc`: a data-at-execution (`SQLPutData`) character parameter whose C
+  type and declared SQL type disagreed on wideness — most commonly
+  `SQL_C_WCHAR` streamed against a narrow `SQL_VARCHAR`/`SQL_LONGVARCHAR`,
+  which is how mssql-python binds every ASCII string parameter once it exceeds
+  the ~4000-character inline threshold — was rejected outright with `HYC00`
+  ("Parameter conversion not yet implemented") instead of being bound.
+  `SQLPutData` cannot transcode a chunk in isolation, since a multi-byte
+  character can straddle two calls, so such a parameter's chunks are now
+  buffered instead of streamed untranscoded, and the complete value is
+  transcoded once, as a whole, when `SQLParamData` closes it.
+
+- `mssql-odbc`: `SQL_ATTR_QUERY_TIMEOUT` is now enforced (AB#46385). Previously
+  it was stored and reported back but silently ignored by `SQLExecute` and
+  `SQLExecDirectW`, so a statement blocked server-side (e.g. behind another
+  session's row lock) had no client-side escape hatch and could wait
+  indefinitely even with a timeout configured. A non-zero value now bounds the
+  wait — including the implicit transaction begin and deferred `sp_unprepare`
+  that can run ahead of the statement itself — and on expiry the driver sends
+  `ATTENTION` and reports `HYT00`, matching msodbcsql. `0` (the ODBC default)
+  remains unlimited. Motivated by issue #439, though that report's own
+  reproduction never sets `SQL_ATTR_QUERY_TIMEOUT` and so is not itself
+  resolved by this change; see the issue for the still-open live-server
+  investigation.
+
+- `mssql-tds`: TCP connect no longer resolves the server hostname with the
+  blocking `std::net::ToSocketAddrs`. That call never yields to the async
+  runtime, so a slow or unresponsive resolver silently escaped the
+  `ConnectTimeout`/`LoginTimeout` deadline that wraps the rest of the connect
+  sequence — on `mssql-odbc`, whose `SQLDriverConnectW` drives this via
+  `block_on` on the calling thread, this could hang the caller (and, since
+  ODBC is a blocking API, the whole calling process) indefinitely instead of
+  failing within the configured timeout. Resolution now goes through
+  `tokio::net::lookup_host`, the same async primitive already used for SSRP
+  instance lookups, so it is a genuine, cancellable `.await` point instead of
+  a blocking one. `parallel_connect` (`MultiSubnetFailover`) now also folds
+  DNS resolution into the single overall deadline its `timeout_ms` already
+  documents, instead of only timing the connection race that follows it, and
+  idle-connection reconnect (`TdsClient::reconnect`) now wraps each attempt's
+  full connect (DNS through login) in the attempt's remaining budget instead
+  of only capping the post-resolution TCP connect step.
+

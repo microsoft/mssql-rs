@@ -10,6 +10,8 @@
 //! parameter as SQL `NULL` (no chunks); any other valid value is a byte count
 //! for `data_ptr`.
 
+use std::borrow::Cow;
+
 use tracing::{debug, error};
 
 use super::exec_common::{abort_dae_with_diag, fail_with_tds, return_client_idle};
@@ -18,6 +20,7 @@ use crate::api::odbc_types::{
     SQL_C_WCHAR, SQL_ERROR, SQL_INVALID_HANDLE, SQL_NTS, SQL_NULL_DATA, SQL_SUCCESS, SqlHandle,
     SqlLen, SqlPointer, SqlReturn,
 };
+use crate::conversion::param_convert::reserve_dae_buffer;
 use crate::error::free_errors;
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 
@@ -29,11 +32,11 @@ use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 /// - `data_ptr`, when `strlen_or_ind` is a positive byte count, must be
 ///   readable for that many bytes and must remain valid for the duration of
 ///   this call.
-/// - `data_ptr`, when `strlen_or_ind` is `SQL_NTS`, must be non-null, aligned
-///   for the bound parameter's C type, and NUL-terminated within an allocation
-///   it owns: the terminator search reads `u16` units for `SQL_C_WCHAR` and
-///   `u8` units otherwise, and runs off the end of the allocation if no
-///   terminator is present.
+/// - `data_ptr`, when `strlen_or_ind` is `SQL_NTS`, must be non-null and
+///   NUL-terminated within an allocation it owns: the terminator search
+///   reads potentially unaligned `u16` units for `SQL_C_WCHAR` and `u8` units
+///   otherwise, and runs off the end of the allocation if no terminator is
+///   present.
 pub(crate) unsafe fn sql_put_data(
     statement_handle: SqlHandle,
     data_ptr: SqlPointer,
@@ -50,6 +53,11 @@ pub(crate) unsafe fn sql_put_data(
     })
 }
 
+/// # Safety
+/// `statement_handle` must be null or point to a live `StmtHandle`. For a
+/// positive `strlen_or_ind`, `data_ptr` must be readable for that many bytes.
+/// For `SQL_NTS`, it must be non-null and readable through a NUL terminator as
+/// the bound C type.
 unsafe fn sql_put_data_impl(
     statement_handle: SqlHandle,
     data_ptr: SqlPointer,
@@ -70,11 +78,15 @@ unsafe fn sql_put_data_impl(
     unsafe { sql_put_data_safe(statement_handle, stmt, data_ptr, strlen_or_ind) }
 }
 
+/// # Safety
+/// `data_ptr` must be non-null and point to an allocation readable through a
+/// NUL terminator. The allocation is read as potentially unaligned `u16` units
+/// when `c_type` is `SQL_C_WCHAR`, and as `u8` units otherwise.
 unsafe fn nts_byte_count(data_ptr: SqlPointer, c_type: i16) -> usize {
     if c_type == SQL_C_WCHAR {
         let ptr = data_ptr as *const u16;
         let mut units = 0usize;
-        while unsafe { *ptr.add(units) } != 0 {
+        while unsafe { ptr.add(units).read_unaligned() } != 0 {
             units += 1;
         }
         units * std::mem::size_of::<u16>()
@@ -88,6 +100,11 @@ unsafe fn nts_byte_count(data_ptr: SqlPointer, c_type: i16) -> usize {
     }
 }
 
+/// # Safety
+/// `statement_handle` must identify the live `stmt`. For a positive
+/// `strlen_or_ind`, `data_ptr` must be readable for that many bytes. For
+/// `SQL_NTS`, it must be non-null and readable through a NUL terminator as the
+/// currently bound C type.
 unsafe fn sql_put_data_safe(
     statement_handle: SqlHandle,
     stmt: &StmtHandle,
@@ -144,6 +161,28 @@ unsafe fn sql_put_data_safe(
                     statement_handle,
                     ERR_ATTEMPT_TO_CONCATENATE_NULL,
                 );
+            }
+        }
+
+        // A deferred sequence has no open request to signal NULL on: the flag is
+        // recorded and `SQLParamData` builds a typed NULL from it, exactly as a
+        // materialized parameter with a `SQL_NULL_DATA` indicator produces one.
+        {
+            let Ok(mut stmt_state) = stmt.inner.lock() else {
+                error!("SQLPutData: stmt mutex poisoned marking a buffered parameter NULL");
+                return SQL_ERROR;
+            };
+            if let Some(dae) = stmt_state.dae.as_mut()
+                && dae.deferred
+            {
+                if dae.call_in_flight() {
+                    error!("SQLPutData: DAE sequence is in use by another call");
+                    post_diag(&mut stmt_state, ERR_FUNCTION_SEQUENCE);
+                    return SQL_ERROR;
+                }
+                dae.progress.put_data_called = true;
+                dae.progress.is_null = true;
+                return SQL_SUCCESS;
             }
         }
 
@@ -222,11 +261,15 @@ unsafe fn sql_put_data_safe(
             // there is no safe default: 0 is not "unknown" but a value that
             // scans the buffer for a single terminating byte, so a lost
             // SQL_C_WCHAR binding would silently stream one byte of a wide
-            // string. A binding can vanish under SQLFreeStmt(SQL_RESET_PARAMS);
-            // a driver manager rejects that in the Need Data state, but this
-            // driver is also loaded directly, so refuse rather than guess.
+            // string. `dae_current_c_type()` reads the `DaeParam` snapshot
+            // taken at execute time, so `SQLFreeStmt(SQL_RESET_PARAMS)`
+            // clearing `bound_params` mid-sequence no longer reaches this
+            // guard at all (`nts_uses_the_snapshotted_c_type_with_bound_params_cleared`
+            // asserts that). What remains reachable here is no current
+            // parameter -- the sequence ended or never had one -- so refuse
+            // rather than guess.
             let Some(c_type) = stmt_state.dae_current_c_type() else {
-                error!("SQLPutData: open data-at-execution parameter has no binding");
+                error!("SQLPutData: open data-at-execution parameter has no snapshotted C type");
                 post_diag(&mut stmt_state, ERR_FUNCTION_SEQUENCE);
                 return SQL_ERROR;
             };
@@ -282,16 +325,206 @@ unsafe fn sql_put_data_safe(
                 ERR_ATTEMPT_TO_CONCATENATE_NULL,
             );
         }
-        let new_total = dae.progress.bytes_sent.saturating_add(byte_count);
+        let app_total = dae.progress.bytes_sent.saturating_add(byte_count);
         if let Some(expected) = dae.current_param().and_then(|param| param.expected_len)
-            && new_total > expected
+            && app_total > expected
         {
             drop(stmt_state);
             error!("SQLPutData: DAE data exceeds SQL_LEN_DATA_AT_EXEC length");
             return abort_dae_with_diag(dbc, stmt, statement_handle, ERR_DAE_LENGTH_MISMATCH);
         }
 
-        let client = if byte_count == 0 {
+        let plan = dae.current_param().map(|param| param.plan);
+        let Some(plan) = plan else {
+            error!("SQLPutData: open data-at-execution parameter has no plan");
+            post_diag(&mut stmt_state, ERR_FUNCTION_SEQUENCE);
+            return SQL_ERROR;
+        };
+
+        let will_buffer = plan.is_buffered() || dae.deferred;
+
+        // `SQL_DATA_AT_EXEC` declares no total, so nothing bounds how large a
+        // chunk can claim to be, and every allocation that follows --
+        // `extend_from_slice` on the accumulator, the conversion buffer inside
+        // `DaeTranscode::push` -- allocates infallibly and would abort the whole
+        // host process on a failure it cannot report. `try_reserve` turns that
+        // into a diagnostic the application can act on instead. Checked against
+        // `byte_count` directly and before the slice below is built, so a length
+        // this process could never satisfy never has to construct a slice
+        // claiming that many bytes are valid just to read its length back out,
+        // and before any client is checked out, so an unsatisfiable reservation
+        // abandons the sequence the way the `is_null` and `expected_len` guards
+        // above do rather than looking like the retriable "something else holds
+        // this sequence" failure further down.
+        //
+        // Reserved on the vector the chosen path eventually grows: `buffer` for
+        // a value converted whole at close, `carry` for one converted on the way
+        // out, and `unit_carry` for an untranscoded stream. A bounded path also
+        // probes `unit_carry`, because `fit_chunk` joins the chunk there before
+        // the eventual destination is touched.
+        let has_transcode = dae
+            .current_param()
+            .and_then(|param| param.transcode)
+            .is_some();
+        let length_limit = dae.current_param().and_then(|param| param.length_limit);
+        let carries_partial_units = length_limit.is_some_and(|limit| limit.carries_partial_units());
+        let retains_across_calls = will_buffer || has_transcode || carries_partial_units;
+        if byte_count > 0 {
+            let target = if will_buffer {
+                &mut dae.progress.buffer
+            } else if has_transcode {
+                &mut dae.progress.carry
+            } else {
+                // Grown by `fit_chunk` when a unit straddles chunks; otherwise
+                // borrowed capacity, released just below.
+                &mut dae.progress.unit_carry
+            };
+            if reserve_dae_buffer(target, byte_count).is_err() {
+                drop(stmt_state);
+                error!(
+                    "SQLPutData: failed to reserve {byte_count} bytes for a data-at-execution value (HY001)"
+                );
+                return abort_dae_with_diag(dbc, stmt, statement_handle, ERR_MEMORY_ALLOCATION);
+            }
+            if length_limit.is_some()
+                && !std::ptr::eq(target, &dae.progress.unit_carry)
+                && reserve_dae_buffer(&mut dae.progress.unit_carry, byte_count).is_err()
+            {
+                drop(stmt_state);
+                error!(
+                    "SQLPutData: failed to reserve {byte_count} bytes for data-at-execution length fitting (HY001)"
+                );
+                return abort_dae_with_diag(dbc, stmt, statement_handle, ERR_MEMORY_ALLOCATION);
+            }
+            if !retains_across_calls {
+                // Borrowed capacity only: release it so a passthrough stream
+                // does not retain a buffer as large as its largest chunk.
+                dae.progress.unit_carry = Vec::new();
+            }
+        }
+
+        // Safety: the caller guarantees `data_ptr` is readable for `byte_count`
+        // bytes; the null and zero cases returned above.
+        let chunk: &[u8] = if byte_count == 0 {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(data_ptr as *const u8, byte_count) }
+        };
+
+        // `ColumnSize` bounds the accumulated value, and it is applied here -
+        // before the streamed/buffered split and against the *application*
+        // buffer - exactly where msodbcsql applies `ValidatePutDataLength`
+        // (`odbc/sqlccmd.cpp:4571`), so the `22001` lands on the `SQLPutData`
+        // that overflows rather than at close (AB#47590).
+        //
+        // Measured against the *retained* running total, not the application's:
+        // trimmed padding must not consume the declaration's budget. The two
+        // totals are tracked separately because the declared-length promise
+        // above counts what the application supplied.
+        //
+        // Counted in the bound's own unit, which is not always bytes -- a
+        // `SQL_C_CHAR` buffer is measured in the UTF-16 units the materialized
+        // path uses -- so the running total accumulates what `fit` reports
+        // rather than the length of what it kept.
+        let retained_before = dae.progress.retained_units;
+        // A unit the chunk ended part-way through is carried into the next call
+        // rather than measured or dropped: dropping it would shift every later
+        // chunk off the application's code-unit grid and silently change the
+        // value, and measuring it would misread a split pad unit as overflow.
+        let limit = dae.current_param().and_then(|param| param.length_limit);
+        let mut unit_carry = std::mem::take(&mut dae.progress.unit_carry);
+        // `fit_chunk` consumes the carry it is handed, so the retriable failures
+        // below can run after this call's realignment is already folded in.
+        // Neither tears the sequence down, so an application may retry the same
+        // chunk -- and a retry against an advanced `unit_carry` would re-join
+        // bytes this call already took, prepending a stray leading byte with no
+        // diagnostic. Keeping the entry state costs at most one unit.
+        let unit_carry_restore = unit_carry.clone();
+        let fitted: Cow<'_, [u8]>;
+        let consumed: usize;
+        match limit {
+            Some(limit) => match limit.fit_chunk(&mut unit_carry, chunk, retained_before) {
+                Ok((kept, used)) => {
+                    fitted = Cow::Owned(kept);
+                    consumed = used;
+                }
+                Err(e) => {
+                    drop(stmt_state);
+                    error!("SQLPutData: data-at-execution chunk fitting failed");
+                    return abort_dae_with_diag(dbc, stmt, statement_handle, e.diag());
+                }
+            },
+            None => {
+                fitted = Cow::Borrowed(chunk);
+                consumed = chunk.len();
+            }
+        }
+        let Some(dae) = stmt_state.dae.as_mut() else {
+            error!("SQLPutData: DAE sequence ended between locks");
+            return SQL_ERROR;
+        };
+        dae.progress.unit_carry = unit_carry;
+        let retained_total = retained_before.saturating_add(consumed);
+
+        // A buffered parameter never touches the wire here: it accumulates and
+        // is converted whole when `SQLParamData` closes it. In a deferred
+        // sequence there is no open request at all, so every parameter
+        // accumulates, whatever its own plan says.
+        if will_buffer {
+            let Some(dae) = stmt_state.dae.as_mut() else {
+                error!("SQLPutData: DAE sequence ended between locks");
+                return SQL_ERROR;
+            };
+            // `SQLParamData` holds the client across the whole close, snapshots
+            // this accumulator and advances the cursor. Appending while that is
+            // in flight would land the chunk in the *next* parameter's buffer --
+            // with `put_data_called` set on it -- and still report `SQL_SUCCESS`.
+            // Checking the same in-flight flag the checkout raises gives the two
+            // halves one mutual-exclusion signal without this branch needing a
+            // client it never writes with.
+            if dae.call_in_flight() {
+                dae.progress.unit_carry = unit_carry_restore;
+                error!("SQLPutData: DAE sequence is in use by another call");
+                post_diag(&mut stmt_state, ERR_FUNCTION_SEQUENCE);
+                return SQL_ERROR;
+            }
+            dae.progress.buffer.extend_from_slice(&fitted);
+            dae.progress.bytes_sent = app_total;
+            dae.progress.retained_units = retained_total;
+            dae.progress.put_data_called = true;
+            return SQL_SUCCESS;
+        }
+
+        // A transcoded stream converts on the way out, holding back a character
+        // that this chunk ended part-way through. An untranscoded one is already
+        // the wire's bytes, so it is forwarded borrowed.
+        let transcode = dae.current_param().and_then(|param| param.transcode);
+        // `push` consumes the carry it is handed, so the checkout below can fail
+        // after the partial character it held is already gone -- and that
+        // failure is the retriable "something else holds this sequence" one, so
+        // the retry would decode the continuation bytes alone and emit U+FFFD.
+        // The carry is at most one incomplete character, so keeping a copy
+        // across the checkout costs a few bytes and makes the failure free of
+        // side effects.
+        let mut carry_restore: Option<Vec<u8>> = None;
+        let outgoing: Cow<'_, [u8]> = match transcode {
+            Some(transcode) => match stmt_state.dae.as_mut() {
+                Some(dae) => {
+                    let mut carry = std::mem::take(&mut dae.progress.carry);
+                    carry_restore = Some(carry.clone());
+                    let out = transcode.push(&mut carry, &fitted);
+                    dae.progress.carry = carry;
+                    Cow::Owned(out)
+                }
+                None => {
+                    error!("SQLPutData: DAE sequence ended between locks");
+                    return SQL_ERROR;
+                }
+            },
+            None => fitted,
+        };
+
+        let client = if outgoing.is_empty() {
             None
         } else {
             match stmt_state
@@ -301,6 +534,14 @@ unsafe fn sql_put_data_safe(
             {
                 Some(client) => Some(client),
                 None => {
+                    // Put the partial character and the realignment carry back,
+                    // so a retry sees exactly the state this call found.
+                    if let Some(dae) = stmt_state.dae.as_mut() {
+                        if let Some(restore) = carry_restore {
+                            dae.progress.carry = restore;
+                        }
+                        dae.progress.unit_carry = unit_carry_restore;
+                    }
                     error!("SQLPutData: DAE client is unavailable — internal state corruption");
                     post_diag(&mut stmt_state, ERR_FUNCTION_SEQUENCE);
                     return SQL_ERROR;
@@ -309,22 +550,21 @@ unsafe fn sql_put_data_safe(
         };
 
         if let Some(dae) = stmt_state.dae.as_mut() {
-            dae.progress.bytes_sent = new_total;
+            dae.progress.bytes_sent = app_total;
+            dae.progress.retained_units = retained_total;
             dae.progress.put_data_called = true;
         }
-        client
+        client.map(|client| (client, outgoing))
     };
 
-    let Some(mut client) = checked_out else {
-        // Zero-length chunk with a non-null pointer supplies an empty value.
+    let Some((mut client, outgoing)) = checked_out else {
+        // Zero-length chunk with a non-null pointer supplies an empty value, as
+        // does one held entirely in the transcoder pending its continuation.
         // NULL/0 is handled above as SQL NULL to match msodbcsql.
         return SQL_SUCCESS;
     };
 
-    // Safety: caller guarantees data_ptr is readable for byte_count bytes.
-    let chunk = unsafe { std::slice::from_raw_parts(data_ptr as *const u8, byte_count) };
-
-    let write_result = dbc.runtime.block_on(client.write_streamed_chunk(chunk));
+    let write_result = dbc.runtime.block_on(client.write_streamed_chunk(&outgoing));
 
     match write_result {
         Ok(()) => {
@@ -374,18 +614,21 @@ unsafe fn sql_put_data_safe(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::odbc_types::{SQL_C_CHAR, SQL_NULL_HANDLE};
+    use crate::api::odbc_types::{SQL_C_CHAR, SQL_NULL_HANDLE, SQL_VARCHAR};
     use crate::handles::stmt::{DaeParam, DaeState};
     use crate::test_support::TestHandles;
 
     /// A sequence with one parameter, already opened by `SQLParamData`.
+    ///
+    /// Bound narrow-to-narrow so `SQL_NTS` sizing has a single-byte C type to
+    /// read, which is what `nts_uses_the_snapshotted_c_type_with_bound_params_cleared`
+    /// checks the snapshot supplies.
     fn open_dae(expected_len: Option<usize>) -> DaeState {
         DaeState::for_test(
-            vec![DaeParam {
-                bound_index: 0,
-                value_ptr: std::ptr::null_mut(),
-                expected_len,
-            }],
+            vec![
+                DaeParam::unbounded(0, std::ptr::null_mut(), expected_len)
+                    .with_binding_types(SQL_C_CHAR, SQL_VARCHAR),
+            ],
             Some(0),
         )
     }
@@ -435,29 +678,49 @@ mod tests {
         assert_eq!(unsafe { nts_byte_count(ptr, 0) }, 1);
     }
 
-    /// A binding can disappear under an open sequence via
-    /// `SQLFreeStmt(SQL_RESET_PARAMS)`, leaving no C type to size `SQL_NTS`
-    /// with. The call is rejected instead of guessing.
-    ///
-    /// This asserts the outcome, not the branch: `for_test` parks no client, so
-    /// a sequence that got past the guard would post the same `HY010` when it
-    /// failed to check one out. The truncation the guard prevents is pinned by
+    #[test]
+    fn nts_byte_count_reads_a_misaligned_wide_buffer() {
+        let mut storage = [0u16; 4];
+        let ptr = unsafe { storage.as_mut_ptr().cast::<u8>().add(1) };
+        assert_ne!(
+            ptr as usize % std::mem::align_of::<u16>(),
+            0,
+            "test pointer must be misaligned"
+        );
+        unsafe {
+            ptr.cast::<u16>().write_unaligned(0x0041);
+            ptr.add(2).cast::<u16>().write_unaligned(0x0000);
+        }
+
+        assert_eq!(unsafe { nts_byte_count(ptr.cast(), SQL_C_WCHAR) }, 2);
+    }
+
+    /// `SQLFreeStmt(SQL_RESET_PARAMS)` can clear `bound_params` while a
+    /// data-at-execution sequence is still open. Sizing an `SQL_NTS` chunk no
+    /// longer needs that live binding: `dae_current_c_type()` reads
+    /// `DaeParam::c_type`, snapshotted at execute time, so the call reaches
+    /// the same "no client parked" state
+    /// `failed_client_checkout_leaves_progress_untouched` covers, rather than
+    /// being rejected earlier for a binding that no longer exists. The
+    /// truncation a lost snapshot would risk is pinned by
     /// `nts_byte_count_narrows_a_wide_buffer_when_the_c_type_defaults`.
     #[test]
-    fn nts_without_a_binding_returns_hy010() {
+    fn nts_uses_the_snapshotted_c_type_with_bound_params_cleared() {
         let h = TestHandles::with_env_dbc_stmt();
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         {
             let mut state = stmt.inner.lock().unwrap();
-            // `open_dae` points at bound index 0, which was never bound.
+            // `open_dae`'s DaeParam snapshots SQL_C_CHAR; bound_params stays
+            // empty, as SQL_RESET_PARAMS would leave it.
             state.dae = Some(open_dae(None));
-            assert!(state.dae_current_c_type().is_none());
+            assert!(state.bound_params.is_empty());
+            assert_eq!(state.dae_current_c_type(), Some(SQL_C_CHAR));
         }
-        let wide: [u16; 3] = [0x0041, 0x0042, 0x0000];
+        let narrow = b"AB\0";
         let ret = unsafe {
             sql_put_data(
                 h.stmt,
-                wide.as_ptr() as *mut std::ffi::c_void,
+                narrow.as_ptr() as *mut std::ffi::c_void,
                 SQL_NTS as SqlLen,
             )
         };
@@ -530,6 +793,28 @@ mod tests {
     }
 
     #[test]
+    fn deferred_null_write_rejects_an_in_flight_sequence() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            let mut dae = open_dae(None);
+            dae.deferred = true;
+            dae.set_call_in_flight(true);
+            state.dae = Some(dae);
+        }
+
+        let ret = unsafe { sql_put_data(h.stmt, std::ptr::null_mut(), SQL_NULL_DATA) };
+        assert_eq!(ret, SQL_ERROR);
+
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(state.diag_records[0].sql_state, ERR_FUNCTION_SEQUENCE.state);
+        let dae = state.dae.as_ref().expect("sequence still active");
+        assert!(!dae.progress.put_data_called);
+        assert!(!dae.progress.is_null);
+    }
+
+    #[test]
     fn nts_chunk_length_is_counted_before_terminator() {
         // Counting the terminator would make "abc\0" four bytes. The length
         // guard is what makes that observable without a live client: declared
@@ -541,16 +826,6 @@ mod tests {
             {
                 let mut state = stmt.inner.lock().unwrap();
                 state.dae = Some(open_dae(Some(declared)));
-                state.bound_params.push(Some(crate::params::BoundParam {
-                    input_output_type: crate::api::odbc_types::SQL_PARAM_INPUT,
-                    c_type: SQL_C_CHAR,
-                    sql_type: crate::api::odbc_types::SQL_VARCHAR,
-                    column_size: 0,
-                    decimal_digits: 0,
-                    parameter_value_ptr: std::ptr::null_mut(),
-                    buffer_length: 0,
-                    strlen_or_ind_ptr: std::ptr::null_mut(),
-                }));
             }
 
             let mut bytes = b"abc\0".to_vec();
@@ -577,17 +852,16 @@ mod tests {
             let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
             {
                 let mut state = stmt.inner.lock().unwrap();
-                state.dae = Some(open_dae(Some(declared)));
-                state.bound_params.push(Some(crate::params::BoundParam {
-                    input_output_type: crate::api::odbc_types::SQL_PARAM_INPUT,
-                    c_type: crate::api::odbc_types::SQL_C_WCHAR,
-                    sql_type: crate::api::odbc_types::SQL_WVARCHAR,
-                    column_size: 0,
-                    decimal_digits: 0,
-                    parameter_value_ptr: std::ptr::null_mut(),
-                    buffer_length: 0,
-                    strlen_or_ind_ptr: std::ptr::null_mut(),
-                }));
+                state.dae = Some(DaeState::for_test(
+                    vec![
+                        DaeParam::unbounded(0, std::ptr::null_mut(), Some(declared))
+                            .with_binding_types(
+                                crate::api::odbc_types::SQL_C_WCHAR,
+                                crate::api::odbc_types::SQL_WVARCHAR,
+                            ),
+                    ],
+                    Some(0),
+                ));
             }
 
             let mut units: Vec<u16> = "hi".encode_utf16().chain(std::iter::once(0)).collect();
@@ -622,6 +896,183 @@ mod tests {
         let dae = state.dae.as_ref().expect("sequence still active");
         assert_eq!(dae.progress.bytes_sent, 0);
         assert!(!dae.progress.put_data_called);
+    }
+
+    /// A parameter whose C type and SQL type disagree on wideness still needs
+    /// the checked-out client as this sequence's only mutual-exclusion signal
+    /// against a concurrent `SQLParamData` -- the transcoded write still needs
+    /// the client, because its output goes to the wire like any other chunk.
+    /// No client to check out is therefore the same "something else is using
+    /// this sequence" state `failed_client_checkout_leaves_progress_untouched`
+    /// covers for the untranscoded path, and a rejected call must leave the
+    /// parameter's counters and carry where they were.
+    /// `SQL_LEN_DATA_AT_EXEC(n)` promises `n` *application* bytes, while
+    /// `ColumnSize` bounds what survives trimming. Conflating the two makes a
+    /// value that satisfies both fail at close: `"ab  "` is four bytes the
+    /// application really did supply, and two after the overflowing blanks are
+    /// trimmed to `varchar(2)`, so a single counter would report `2 != 4` and
+    /// reject a correct sequence. The totals are tracked separately.
+    #[test]
+    fn trimmed_padding_does_not_break_the_declared_length_promise() {
+        let limit = crate::conversion::param_convert::dae_length_limit(
+            crate::api::odbc_types::SQL_C_CHAR,
+            SQL_VARCHAR,
+            2,
+        )
+        .expect("varchar(2) is a bounded declaration")
+        .expect("and therefore has a limit");
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.dae = Some(DaeState::for_test(
+                vec![
+                    DaeParam::unbounded(0, std::ptr::null_mut(), Some(4))
+                        .with_binding_types(crate::api::odbc_types::SQL_C_CHAR, SQL_VARCHAR)
+                        .with_length_limit(limit),
+                ],
+                Some(0),
+            ));
+        }
+        // Buffered rather than streamed, so the chunk lands in the accumulator
+        // without needing a parked client.
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            let dae = state.dae.as_mut().unwrap();
+            dae.deferred = true;
+        }
+
+        let mut chunk = *b"ab  ";
+        let ret = unsafe { sql_put_data(h.stmt, chunk.as_mut_ptr().cast(), 4) };
+        assert_eq!(ret, SQL_SUCCESS, "four supplied bytes satisfy the promise");
+
+        let state = stmt.inner.lock().unwrap();
+        let dae = state.dae.as_ref().expect("sequence still active");
+        assert_eq!(
+            dae.progress.bytes_sent, 4,
+            "the declared-length promise counts what the application supplied"
+        );
+        assert_eq!(
+            dae.progress.retained_units, 2,
+            "the ColumnSize budget counts only what survived trimming"
+        );
+        assert_eq!(dae.progress.buffer, b"ab", "the blanks were trimmed away");
+    }
+
+    #[test]
+    fn transcoded_param_without_a_client_returns_hy010() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            let mut param = DaeParam::unbounded(0, std::ptr::null_mut(), None)
+                .with_binding_types(crate::api::odbc_types::SQL_C_WCHAR, SQL_VARCHAR);
+            param.transcode = Some(crate::conversion::param_convert::DaeTranscode::new(
+                crate::api::odbc_types::SQL_C_WCHAR,
+                SQL_VARCHAR,
+                mssql_tds::token::tokens::SqlCollation::default(),
+            ));
+            state.dae = Some(DaeState::for_test(vec![param], Some(0)));
+        }
+
+        let mut bytes: Vec<u8> = "ab".encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let len = bytes.len() as SqlLen;
+        let ret = unsafe { sql_put_data(h.stmt, bytes.as_mut_ptr().cast(), len) };
+        assert_eq!(ret, SQL_ERROR);
+
+        let state = stmt.inner.lock().unwrap();
+        let dae = state.dae.as_ref().expect("sequence still active");
+        assert_eq!(dae.progress.bytes_sent, 0);
+        assert!(!dae.progress.put_data_called);
+        assert!(dae.progress.carry.is_empty());
+    }
+
+    /// The realignment carry needs the same rollback the transcoder carry gets.
+    /// `fit_chunk` folds this call's split unit into `unit_carry` before the
+    /// checkout runs, and a failed checkout is retriable -- it neither advances
+    /// the counters nor tears the sequence down -- so an application may hand
+    /// the same chunk over again. Against an advanced `unit_carry` the retry
+    /// re-joins bytes this call already took: `[61 00 62]` would store `[62]`,
+    /// and the retry would build `[62 61 00 62]`, prepending a stray byte with
+    /// no diagnostic. Restoring the entry state keeps the retry faithful.
+    #[test]
+    fn failed_checkout_restores_the_partial_unit_carry() {
+        let limit = crate::conversion::param_convert::dae_length_limit(
+            crate::api::odbc_types::SQL_C_WCHAR,
+            crate::api::odbc_types::SQL_WVARCHAR,
+            10,
+        )
+        .expect("nvarchar(10) is a bounded declaration")
+        .expect("and therefore has a limit");
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            // Wide in, wide out: no transcoder, so the bytes pass through and
+            // only the split-unit realignment holds anything back.
+            let param = DaeParam::unbounded(0, std::ptr::null_mut(), None)
+                .with_binding_types(
+                    crate::api::odbc_types::SQL_C_WCHAR,
+                    crate::api::odbc_types::SQL_WVARCHAR,
+                )
+                .with_length_limit(limit);
+            state.dae = Some(DaeState::for_test(vec![param], Some(0)));
+        }
+
+        // Ends part-way through a code unit, so `fit_chunk` holds `0x62` back.
+        let mut chunk = [0x61u8, 0x00, 0x62];
+        let ret = unsafe { sql_put_data(h.stmt, chunk.as_mut_ptr().cast(), 3) };
+        assert_eq!(ret, SQL_ERROR, "the fixture parks no client to check out");
+
+        let state = stmt.inner.lock().unwrap();
+        let dae = state.dae.as_ref().expect("sequence still active");
+        assert!(
+            dae.progress.unit_carry.is_empty(),
+            "a failed checkout must leave the realignment carry as it found it"
+        );
+        assert_eq!(dae.progress.bytes_sent, 0);
+        assert_eq!(dae.progress.retained_units, 0);
+        assert!(!dae.progress.put_data_called);
+    }
+
+    /// `SQL_DATA_AT_EXEC` declares no total, so nothing bounds how large
+    /// The accumulator behind a data-at-execution parameter can grow to
+    /// whatever `SQLPutData` claims. A reservation this call can never satisfy
+    /// must fail cleanly with `HY001` instead of letting `Vec`'s default
+    /// infallible allocation abort the process this driver is loaded into.
+    /// Checked before any client is checked out, so this doesn't need one
+    /// parked: a byte count near `usize::MAX` fails `try_reserve` on any real
+    /// system without actually exhausting its memory, and `data_ptr` is never
+    /// read at that length -- the call returns before the unsafe slice is
+    /// constructed.
+    #[test]
+    fn oversized_transcoded_chunk_returns_hy001_without_aborting() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.dae = Some(DaeState::for_test(
+                vec![
+                    DaeParam::unbounded(0, std::ptr::null_mut(), None)
+                        .with_binding_types(crate::api::odbc_types::SQL_C_WCHAR, SQL_VARCHAR),
+                ],
+                Some(0),
+            ));
+        }
+
+        let mut token = 0u8;
+        let ret =
+            unsafe { sql_put_data(h.stmt, (&mut token as *mut u8).cast(), isize::MAX as SqlLen) };
+        assert_eq!(ret, SQL_ERROR);
+
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(state.diag_records[0].sql_state, ERR_MEMORY_ALLOCATION.state);
+        assert!(
+            !state.needs_data(),
+            "an unsatisfiable reservation must abandon the sequence, not leave it retriable"
+        );
     }
 
     #[test]

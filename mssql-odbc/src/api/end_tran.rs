@@ -34,6 +34,9 @@ pub(crate) unsafe fn sql_end_tran(
     })
 }
 
+/// # Safety
+/// `handle` must be null or point to a live `DbcHandle` or `EnvHandle` matching
+/// `handle_type`.
 unsafe fn sql_end_tran_impl(
     handle_type: SqlSmallInt,
     handle: SqlHandle,

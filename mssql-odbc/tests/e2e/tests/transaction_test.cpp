@@ -11,6 +11,8 @@
 
 #include "odbc_test_fixture.h"
 
+#include <chrono>
+#include <functional>
 #include <string>
 
 // SQL_TXN_SS_SNAPSHOT lives in msodbcsql.h, which these tests do not include.
@@ -202,6 +204,43 @@ TEST_F(TransactionLiveTest, RollbackDiscardsInsert) {
     EXPECT_EQ(0, RowCountOf("#rollback_t"));
 }
 
+// The batch-processing shape mssql-python's test suite uses: commit a batch,
+// roll the next one back, commit a third, and expect only the committed batches
+// to survive. It read back zero rows because the parameterized INSERTs — not
+// the transaction handling — failed with 24000 from the second execute onward,
+// so every batch ended in the caller's error path (AB#47531).
+TEST_F(TransactionLiveTest, CommitRollbackCommitKeepsOnlyCommittedBatches) {
+    Exec("CREATE TABLE #batch_t(id int, batch int)");
+    ASSERT_SQL_OK(SetAutocommit(dbc_, SQL_AUTOCOMMIT_OFF), SQL_HANDLE_DBC, dbc_);
+    ASSERT_SQL_OK(SQLEndTran(SQL_HANDLE_DBC, dbc_, SQL_COMMIT), SQL_HANDLE_DBC, dbc_);
+
+    SqlTString insert = ODBCTestUtils::ToSqlTStr("INSERT INTO #batch_t VALUES (?, ?)");
+    for (SQLINTEGER batch = 0; batch < 3; ++batch) {
+        const bool rollback = (batch == 1);
+        for (SQLINTEGER i = 0; i < 5; ++i) {
+            SCOPED_TRACE("batch " + std::to_string(batch) + " row " + std::to_string(i));
+            SQLINTEGER id = batch * 5 + i + 1;
+            SQLINTEGER batch_value = batch;
+            ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER, 0,
+                                           0, &id, 0, nullptr),
+                          SQL_HANDLE_STMT, stmt_);
+            ASSERT_SQL_OK(SQLBindParameter(stmt_, 2, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER, 0,
+                                           0, &batch_value, 0, nullptr),
+                          SQL_HANDLE_STMT, stmt_);
+            ASSERT_SQL_OK(SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(insert.c_str()), SQL_NTS),
+                          SQL_HANDLE_STMT, stmt_);
+        }
+        ASSERT_SQL_OK(SQLEndTran(SQL_HANDLE_DBC, dbc_, rollback ? SQL_ROLLBACK : SQL_COMMIT),
+                      SQL_HANDLE_DBC, dbc_);
+    }
+    ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_RESET_PARAMS), SQL_HANDLE_STMT, stmt_);
+
+    EXPECT_EQ(10, RowCountOf("#batch_t")) << "the two committed batches must both survive";
+    EXPECT_EQ(5, Scalar("SELECT COUNT(*) FROM #batch_t WHERE batch = 0"));
+    EXPECT_EQ(0, Scalar("SELECT COUNT(*) FROM #batch_t WHERE batch = 1"));
+    EXPECT_EQ(5, Scalar("SELECT COUNT(*) FROM #batch_t WHERE batch = 2"));
+}
+
 // A committed row is visible to a completely separate connection, proving the
 // commit reached the server rather than only clearing driver state.
 TEST_F(TransactionLiveTest, CommittedRowIsVisibleToAnotherConnection) {
@@ -238,6 +277,35 @@ TEST_F(TransactionLiveTest, AutocommitInsertIsImmediatelyDurable) {
 
     ASSERT_SQL_OK(SQLEndTran(SQL_HANDLE_DBC, dbc_, SQL_ROLLBACK), SQL_HANDLE_DBC, dbc_);
     EXPECT_EQ(1, RowCountOf("#auto_t"));
+}
+
+// Regression test for https://github.com/microsoft/mssql-rs/issues/587:
+// sequential autocommit requests must each carry OutstandingRequestCount=1 on
+// the wire (MS-TDS 2.2.5.3.2). A stale, ever-incrementing count previously
+// made a later request that begins/commits its own transaction fail with SQL
+// Server error 3981 ("The transaction operation cannot be performed because
+// there are pending requests working on this transaction"), even though every
+// prior response had been fully drained and autocommit was in effect the
+// whole time. Must pass identically on msodbcsql, which never had this bug.
+TEST_F(TransactionLiveTest, SequentialAutocommitQueriesToleratePriorTransactionProc) {
+    Exec(
+        "CREATE PROCEDURE #mssql_rs_587_repro AS "
+        "BEGIN SET NOCOUNT ON; BEGIN TRANSACTION; COMMIT TRANSACTION; END");
+
+    // Several plain autocommit queries, each fully drained before the next is
+    // sent — mirrors the issue's repro exactly.
+    for (int i = 0; i < 4; ++i) {
+        SCOPED_TRACE("autocommit query #" + std::to_string(i));
+        Exec("SELECT 1");
+        ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+        SQLCloseCursor(stmt_);
+    }
+
+    // The procedure begins and commits its own transaction. Before the fix
+    // this failed with SQL Server error 3981.
+    SQLRETURN rc = Run(stmt_, "EXEC #mssql_rs_587_repro");
+    ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+    SQLCloseCursor(stmt_);
 }
 
 // msodbcsql returns plain SQL_SUCCESS when no transaction was ever started —
@@ -507,6 +575,121 @@ TEST_F(TransactionLiveTest, IsolationIsAppliedOnTheServer) {
         EXPECT_EQ(server_level, ServerIsolation()) << "level 0x" << std::hex << odbc_level;
     }
     ASSERT_SQL_OK(SetIsolation(dbc_, SQL_TXN_READ_COMMITTED), SQL_HANDLE_DBC, dbc_);
+}
+
+// A server-side lock timeout is a statement error, not a client query timeout.
+// Execution must consume the ERROR/DONE response and return it instead of
+// waiting indefinitely for another token (AB#47771).
+//
+// Both execution paths are covered: mssql-python's cursor.execute() defaults to
+// use_prepare=True and so drives SQLPrepare + SQLExecute, not SQLExecDirect
+// (AB#47510). The fix lives in the shared finish_execute, but only a test per
+// path can prove neither branch regresses.
+class BlockedSelectTest : public TransactionLiveTest {
+  protected:
+    // Frees the second connection's handles even when an ASSERT_* returns early
+    // from the helper below. The fixture's TearDown covers dbc_ only, so a
+    // reader left connected would trip HY010 when the environment handle is
+    // freed — turning one assertion failure into a confusing second one.
+    class ScopedConnection {
+      public:
+        ScopedConnection() = default;
+        ~ScopedConnection() {
+            if (stmt != SQL_NULL_HSTMT) {
+                SQLFreeHandle(SQL_HANDLE_STMT, stmt);
+            }
+            if (dbc != SQL_NULL_HDBC) {
+                SQLDisconnect(dbc);
+                SQLFreeHandle(SQL_HANDLE_DBC, dbc);
+            }
+        }
+        ScopedConnection(const ScopedConnection&) = delete;
+        ScopedConnection& operator=(const ScopedConnection&) = delete;
+
+        SQLHDBC dbc = SQL_NULL_HDBC;
+        SQLHSTMT stmt = SQL_NULL_HSTMT;
+    };
+
+    // Holds an exclusive row lock on |table| from dbc_, then runs a blocked
+    // SELECT on a second connection via |execute_blocked| and asserts it
+    // reports native error 1222 rather than hanging or succeeding.
+    void RunBlockedSelect(const std::string& suffix,
+                          const std::function<SQLRETURN(SQLHSTMT, const std::string&)>&
+                              execute_blocked) {
+        const std::string table = GlobalTempTable(suffix);
+        Exec("CREATE TABLE " + table + "(id int PRIMARY KEY, value int)");
+        Exec("INSERT INTO " + table + " VALUES (1, 0)");
+
+        ASSERT_SQL_OK(SetAutocommit(dbc_, SQL_AUTOCOMMIT_OFF), SQL_HANDLE_DBC, dbc_);
+        Exec("UPDATE " + table + " SET value = 1 WHERE id = 1");
+
+        ScopedConnection reader;
+        ASSERT_SQL_OK(SQLAllocHandle(SQL_HANDLE_DBC, env_, &reader.dbc), SQL_HANDLE_ENV, env_);
+        SqlTString connstr = ODBCTestUtils::BuildConnectionString();
+        SQLTCHAR out_str[1024] = {};
+        SQLSMALLINT out_len = 0;
+        ASSERT_SQL_OK(SQLDriverConnect(reader.dbc, nullptr,
+                                       const_cast<SQLTCHAR*>(connstr.c_str()),
+                                       static_cast<SQLSMALLINT>(connstr.size()), out_str,
+                                       static_cast<SQLSMALLINT>(std::size(out_str)), &out_len,
+                                       SQL_DRIVER_NOPROMPT),
+                      SQL_HANDLE_DBC, reader.dbc);
+
+        ASSERT_SQL_OK(SQLAllocHandle(SQL_HANDLE_STMT, reader.dbc, &reader.stmt), SQL_HANDLE_DBC,
+                      reader.dbc);
+        SQLHSTMT reader_stmt = reader.stmt;
+        // Bounds the wait if execution regresses to waiting for a token the
+        // server will never send. This is a real deadline only once the
+        // query-timeout enforcement of AB#46385 (#442) is in; this PR merges
+        // after it.
+        ASSERT_SQL_OK(SQLSetStmtAttr(reader_stmt, SQL_ATTR_QUERY_TIMEOUT,
+                                     reinterpret_cast<SQLPOINTER>(static_cast<SQLULEN>(10)), 0),
+                      SQL_HANDLE_STMT, reader_stmt);
+        ASSERT_SQL_OK(Run(reader_stmt, "SET LOCK_TIMEOUT 1000"), SQL_HANDLE_STMT, reader_stmt);
+
+        const auto start = std::chrono::steady_clock::now();
+        const SQLRETURN rc = execute_blocked(reader_stmt, table);
+        const auto elapsed = std::chrono::steady_clock::now() - start;
+
+        EXPECT_EQ(SQL_ERROR, rc) << "the lock timeout must surface from execution, not a later "
+                                    "SQLFetch";
+        SQLINTEGER native = 0;
+        SQLTCHAR message[1024] = {};
+        SQLSMALLINT length = 0;
+        SQLTCHAR state[6] = {};
+        ASSERT_SQL_OK(SQLGetDiagRec(SQL_HANDLE_STMT, reader_stmt, 1, state, &native, message,
+                                    static_cast<SQLSMALLINT>(std::size(message)), &length),
+                      SQL_HANDLE_STMT, reader_stmt);
+        EXPECT_EQ(1222, native);
+        // 1222 is in neither driver's per-error table, so both fall through to
+        // their severity rule: class 16 maps to 42000. Asserted so a SQLSTATE
+        // divergence on this exact error cannot pass, and the msodbcsql parity
+        // leg validates it for free.
+        EXPECT_SQLSTATE(SQL_HANDLE_STMT, reader_stmt, "42000");
+        EXPECT_LT(elapsed, std::chrono::seconds(5));
+
+        ASSERT_SQL_OK(SQLEndTran(SQL_HANDLE_DBC, dbc_, SQL_ROLLBACK), SQL_HANDLE_DBC, dbc_);
+    }
+};
+
+TEST_F(BlockedSelectTest, ExecDirectReturnsServerLockTimeout) {
+    RunBlockedSelect("lock_timeout", [](SQLHSTMT hstmt, const std::string& table) {
+        return Run(hstmt, "SELECT value FROM " + table + " WHERE id = 1");
+    });
+}
+
+// The path mssql-python actually uses. SQLPrepare materializes the statement
+// (its COLMETADATA arrives before the row), so the ERROR token trails metadata
+// on SQLExecute exactly as it does on SQLExecDirect.
+TEST_F(BlockedSelectTest, PreparedExecuteReturnsServerLockTimeout) {
+    RunBlockedSelect("lock_timeout_prep", [](SQLHSTMT hstmt, const std::string& table) {
+        SqlTString sql =
+            ODBCTestUtils::ToSqlTStr("SELECT value FROM " + table + " WHERE id = 1");
+        SQLRETURN prepare_rc =
+            SQLPrepare(hstmt, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS);
+        EXPECT_SQL_OK(prepare_rc, SQL_HANDLE_STMT, hstmt);
+        return SQLExecute(hstmt);
+    });
 }
 
 // The isolation level survives commit and rollback — it is a session setting.

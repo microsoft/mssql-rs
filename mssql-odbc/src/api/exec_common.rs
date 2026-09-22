@@ -7,28 +7,39 @@
 //! execution paths stay in lockstep. None of these helpers hold a lock across
 //! network I/O.
 
-use tracing::error;
+use tracing::{debug, error};
 
 use std::collections::VecDeque;
+use std::time::Duration;
 
-use mssql_tds::connection::tds_client::{ResultSet, StatementId, TdsClient};
-use mssql_tds::error::Error as TdsError;
-use mssql_tds::message::parameters::rpc_parameters::RpcParameter;
+use mssql_tds::connection::tds_client::{
+    CursorPoll, ExecuteOptions, ResultSet, StatementId, TdsClient,
+};
+use mssql_tds::error::{Error as TdsError, TimeoutErrorType};
+use mssql_tds::message::parameters::rpc_parameters::{RpcParameter, StreamedSqlType};
 
+use super::ird::populate_ird;
 use super::sqlstate::*;
 use crate::api::odbc_types::{
-    SQL_DATA_AT_EXEC, SQL_ERROR, SQL_LEN_DATA_AT_EXEC_OFFSET, SQL_NEED_DATA, SQL_SUCCESS,
-    SQL_SUCCESS_WITH_INFO, SqlHandle, SqlLen, SqlReturn,
+    SQL_ATTR_PARAMS_PROCESSED_PTR, SQL_DATA_AT_EXEC, SQL_ERROR, SQL_LEN_DATA_AT_EXEC_OFFSET,
+    SQL_NEED_DATA, SQL_NO_DATA, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle, SqlLen, SqlReturn,
+    SqlULen,
 };
+use crate::conversion::error::ConvOk;
 use crate::conversion::param_convert::{
-    ParamBuildError, bound_param_to_rpc, dae_placeholder_type, is_data_at_exec_indicator,
+    DaePlan, DaeTranscode, ParamBuildError, bound_param_to_rpc, buffered_dae_to_rpc,
+    dae_length_limit, dae_plan, dae_streamed_declaration,
 };
+use crate::error::post_sql_error;
 use crate::handles::dbc::ConnectionState;
 use crate::handles::stmt::{
     DaeParam, DaeState, PreparedPlan, STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT,
     STMT_STATE_EXEC_STARTED, StmtState,
 };
-use crate::handles::{DbcHandle, StmtHandle};
+use crate::handles::{
+    DbcHandle, DescHandle, StmtHandle, handle_from_raw, process_is_shutting_down,
+};
+use crate::params::{BoundParam, ParamArrayLayoutError};
 
 /// Clears the in-flight `EXEC_STARTED` flag on an execution failure so the
 /// statement is reusable.
@@ -55,6 +66,25 @@ pub(super) fn unwind_dae(
     statement_handle: SqlHandle,
     diag: Option<DiagMsg>,
 ) {
+    unwind_dae_inner(
+        dbc,
+        stmt,
+        statement_handle,
+        diag,
+        process_is_shutting_down(),
+    )
+}
+
+/// The body of [`unwind_dae`], with the loader's shutdown flag passed in rather
+/// than read, so the skip arm below — unreachable in a live process — is
+/// testable.
+fn unwind_dae_inner(
+    dbc: &DbcHandle,
+    stmt: &StmtHandle,
+    statement_handle: SqlHandle,
+    diag: Option<DiagMsg>,
+    process_is_shutting_down: bool,
+) {
     let client = {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("stmt mutex poisoned unwinding DAE sequence");
@@ -69,7 +99,19 @@ pub(super) fn unwind_dae(
     };
 
     if let Some(mut client) = client {
-        dbc.runtime.block_on(client.cancel_streamed_write());
+        // `cancel_streamed_write` writes the request's cancel and drains the
+        // response, so it needs the scheduler's worker to drive the socket.
+        // During `DLL_PROCESS_DETACH` that worker is already terminated and
+        // `block_on` would park this thread forever (AB#47510) — reachable
+        // because `SQLFreeHandle(SQL_HANDLE_STMT)` unwinds a parked DAE
+        // sequence before freeing. The half-written request dies with the
+        // connection the exiting process is about to drop, so only the client
+        // hand-back below still matters.
+        if process_is_shutting_down {
+            debug!("unwind_dae: process is exiting — skipping the cancel round-trip");
+        } else {
+            dbc.runtime.block_on(client.cancel_streamed_write());
+        }
         return_client_idle(dbc, statement_handle, client);
     }
 }
@@ -80,14 +122,38 @@ pub(super) fn unwind_dae(
 ///
 /// `prepared` is `None` for `SQLExecDirect`, which runs ad-hoc `sp_executesql`
 /// and has no plan to restore when the sequence completes.
+/// A pre-DAE truncation is posted before `SQL_NEED_DATA`, matching
+/// `AddRPCUserParameters` and its caller in `sqlccmd.cpp`.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn park_dae_client(
     stmt: &StmtHandle,
     client: TdsClient,
     prepared: Option<PreparedPlan>,
     orphaned: Option<StatementId>,
-    dae_params: Vec<DaeParam>,
+    mut dae_params: Vec<DaeParam>,
+    fractional_truncated: bool,
     op: &str,
 ) -> SqlReturn {
+    // The wire encoding of a narrow target comes from the database collation,
+    // which is only knowable with the connection in hand — `write_streamed_chunk`
+    // writes bytes verbatim, so the re-encoding has to happen before them
+    // (AB#47590).
+    let collation = client.get_collation();
+    for param in &mut dae_params {
+        if !param.plan.is_buffered() {
+            let transcode =
+                DaeTranscode::new(param.binding.c_type, param.binding.sql_type, collation);
+            // A pairing whose buffer bytes already are the wire's bytes keeps
+            // `None`, so `SQLPutData` forwards its chunks borrowed instead of
+            // copying each one through a conversion that would return them
+            // unchanged. Skipping the transcode also skips the close-time
+            // flush, which is right: a passthrough parameter never holds back a
+            // partial character to carry.
+            if !transcode.is_passthrough() {
+                param.transcode = Some(transcode);
+            }
+        }
+    }
     let Ok(mut stmt_state) = stmt.inner.lock() else {
         // The client has nowhere to go: the statement that owns it is
         // unreachable and the DBC still records it as busy.
@@ -95,6 +161,42 @@ pub(super) fn park_dae_client(
         return SQL_ERROR;
     };
     stmt_state.dae = Some(DaeState::new(client, prepared, orphaned, dae_params));
+    if fractional_truncated {
+        post_diag(&mut stmt_state, WARN_FRACTIONAL_TRUNCATION);
+    }
+    SQL_NEED_DATA
+}
+
+/// Parks a sequence whose execute is deferred: at least one parameter buffers,
+/// so no RPC has been opened and the client sits idle on the statement until
+/// the last `SQLParamData` builds the complete parameter list and runs it.
+///
+/// The connection still counts as busy for the duration, exactly as the
+/// streaming sequence does, so an application cannot start another command on it
+/// mid-sequence.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn park_deferred_dae(
+    stmt: &StmtHandle,
+    client: TdsClient,
+    prepared: Option<PreparedPlan>,
+    orphaned: Option<StatementId>,
+    dae_params: Vec<DaeParam>,
+    prebuilt: Vec<RpcParameter>,
+    sql: Option<String>,
+    timeout_secs: u32,
+    fractional_truncated: bool,
+    op: &str,
+) -> SqlReturn {
+    let Ok(mut stmt_state) = stmt.inner.lock() else {
+        error!("{op}: stmt mutex poisoned while parking deferred DAE state");
+        return SQL_ERROR;
+    };
+    stmt_state.dae = Some(
+        DaeState::new(client, prepared, orphaned, dae_params).deferred(prebuilt, sql, timeout_secs),
+    );
+    if fractional_truncated {
+        post_diag(&mut stmt_state, WARN_FRACTIONAL_TRUNCATION);
+    }
     SQL_NEED_DATA
 }
 
@@ -160,6 +262,27 @@ pub(super) fn claim_connection(
     };
 
     Ok(client)
+}
+
+/// Publishes the processed count for a scalar (single parameter set) execute.
+///
+/// msodbcsql writes this whether or not parameter arrays are in play: the
+/// non-bulk branch sets `iRowEnd = 1` (`sqlccmd.cpp:3203`) and the row loop then
+/// writes `*pRowsProcessed = 1` (`:3212`), with four more explicit `= 1` sites
+/// (`sqlccmd.cpp:1688`, `:3493`, `:6700`, `deprecate.cpp:2114`) covering the
+/// paths that skip that loop. Written before the set is converted or sent, so a
+/// set that then fails is still counted.
+///
+/// Without this, `executemany(sql, [one_row])` - which sets `PARAMSET_SIZE = 1`
+/// and a processed pointer - reads back whatever was in its own buffer.
+pub(super) fn publish_scalar_processed(stmt_state: &crate::handles::stmt::StmtState) {
+    let ptr = stmt_state
+        .inert_attrs
+        .get(SQL_ATTR_PARAMS_PROCESSED_PTR)
+        .unwrap_or(0) as *mut SqlULen;
+    if !ptr.is_null() {
+        unsafe { ptr.write_unaligned(1) };
+    }
 }
 
 /// Returns `client` to the DBC and releases the busy claim. Used on the
@@ -230,6 +353,13 @@ pub(super) fn return_client_busy(dbc: &DbcHandle, client: TdsClient) {
 /// posting it here too would attach a diagnostic to this call's own
 /// still-successful return.
 ///
+/// If an RPC row set ends on `DONEINPROC` with MORE, the TDS layer consumes
+/// only trailing RPC control tokens and parks the first non-tail token for
+/// `SQLMoreResults`. A failure while consuming that completion tail always
+/// ends the batch — [`TdsClient::complete_current_result`] abandons whatever
+/// is left rather than stranding it — so it takes the deferred-error route
+/// above, never the unposted one.
+///
 /// `row_delivered` tells this call whether it actually delivered data —
 /// `true` for `SQLGetData` (a column was just captured) and for a
 /// `SQLFetch`/`SQLFetchScroll` whose rowset held at least one row, `false`
@@ -258,8 +388,11 @@ pub(super) fn release_busy_if_row_exhausted(
     mut client: TdsClient,
     row_delivered: bool,
 ) {
-    let peek_result = dbc.runtime.block_on(client.peek_past_current_row());
-    let batch_done = !client.has_open_batch();
+    let peek_result = match client.try_peek_past_current_row() {
+        Ok(CursorPoll::Ready(has_row)) => Ok(has_row),
+        Ok(CursorPoll::Pending) => dbc.runtime.block_on(client.peek_past_current_row()),
+        Err(error) => Err(error),
+    };
 
     // `Ok(true)`: another row, already parked for the next fetch — never
     // exhausted. `Ok(false)`: the current result set's own DONE token was
@@ -270,9 +403,29 @@ pub(super) fn release_busy_if_row_exhausted(
     // the wire itself has given up on the whole batch (see doc comment).
     let result_set_exhausted = match &peek_result {
         Ok(has_more) => !has_more,
-        Err(_) => batch_done,
+        Err(_) => !client.has_open_batch(),
+    };
+
+    // A row-returning RPC can end its visible row set with DONEINPROC MORE because
+    // RETURNVALUE, RETURNSTATUS, and a terminal DONE still follow. Consume
+    // those protocol-only tokens now. The first non-tail token is parked inside
+    // TdsClient, so SQLMoreResults still observes it in order. Plain batch DONE
+    // tokens return immediately without probing the next result.
+    let completion_result = if result_set_exhausted && peek_result.is_ok() {
+        Some(dbc.runtime.block_on(client.complete_current_result()))
+    } else {
+        None
+    };
+    let batch_done = match &completion_result {
+        Some(Ok(done)) => *done,
+        _ => !client.has_open_batch(),
     };
     let release = result_set_exhausted && batch_done;
+
+    let mut read_error = peek_result.err();
+    if let Some(Err(error)) = completion_result {
+        read_error = Some(error);
+    }
 
     let drained_info = if release {
         client.take_info_messages()
@@ -280,23 +433,18 @@ pub(super) fn release_busy_if_row_exhausted(
         Vec::new()
     };
 
-    if let Ok(mut dbc_state) = dbc.inner.lock() {
-        dbc_state.client = Some(client);
-        dbc_state.active_stmt = if release {
-            None
-        } else {
-            Some(statement_handle)
-        };
-    }
-
     if let Ok(mut stmt_state) = stmt.inner.lock() {
+        if release {
+            stmt_state.pending_output_params =
+                Some((client.get_return_values(), client.get_return_status()));
+        }
         if row_delivered {
             post_tds_info_messages(&mut stmt_state, &drained_info);
         } else {
             stmt_state.pending_fetch_info = drained_info;
         }
-        if let Err(e) = peek_result {
-            error!(%e, "release_busy_if_row_exhausted: peek past current row failed");
+        if let Some(e) = read_error {
+            error!(%e, "release_busy_if_row_exhausted: finishing current result failed");
             if batch_done {
                 stmt_state.pending_fetch_error = Some(e);
             }
@@ -307,6 +455,16 @@ pub(super) fn release_busy_if_row_exhausted(
         if release {
             stmt_state.batch_exhausted = true;
         }
+    }
+    // Capture outputs before publishing the idle client: another statement's
+    // execution clears the client's RETURNVALUE/RETURNSTATUS collections.
+    if let Ok(mut dbc_state) = dbc.inner.lock() {
+        dbc_state.client = Some(client);
+        dbc_state.active_stmt = if release {
+            None
+        } else {
+            Some(statement_handle)
+        };
     }
 }
 
@@ -342,12 +500,19 @@ pub(super) fn fail_with_tds(
 /// `unprepare`: a transparent reconnect already discarded it server-side, so an
 /// `sp_unprepare` would target a nonexistent handle on the new session.
 ///
+/// `timeout_secs` bounds the wait the same way `SQL_ATTR_QUERY_TIMEOUT` bounds
+/// the execute that follows — `0` means unlimited. Being best-effort, a
+/// timeout here is logged like any other failure rather than propagated: the
+/// caller's own budget (deducted by its elapsed wall-clock time) still gates
+/// the execute that follows.
+///
 /// No lock is held across the network I/O.
 pub(super) fn flush_pending_unprepare(
     dbc: &DbcHandle,
     stmt: &StmtHandle,
     client: &mut TdsClient,
     op: &str,
+    timeout_secs: u32,
 ) {
     let pending = match stmt.inner.lock() {
         Ok(mut stmt_state) => stmt_state.pending_unprepare.take(),
@@ -362,9 +527,52 @@ pub(super) fn flush_pending_unprepare(
     // `unprepare` recovers a dead connection first, then drops the handle only
     // if it still belongs to the (recovered) session — a superseded handle is
     // already gone server-side and is skipped without an RPC.
-    if let Err(e) = dbc.runtime.block_on(client.unprepare(handle, ())) {
+    if let Err(e) = dbc
+        .runtime
+        .block_on(client.unprepare(handle, ExecuteOptions::new().timeout_secs(timeout_secs)))
+    {
         error!(%e, "{op}: sp_unprepare failed — handle leaked until disconnect");
     }
+}
+
+/// Deducts elapsed wall-clock time from a `SQL_ATTR_QUERY_TIMEOUT` budget
+/// spent across multiple wire operations performed in sequence before the
+/// caller's own execute — e.g. releasing an orphaned prepared handle, then
+/// beginning an implicit transaction, then the real execute. Mirrors
+/// msodbcsql's `DropPrepHandle` / `CheckOptions`, which charge the same
+/// deducted timeout to each step (`sqlcfunc.cpp:787-828`, `sqlccmd.cpp:10572-10586`).
+///
+/// `0` means unlimited and passes through unchanged. A positive budget is
+/// reduced by `elapsed`, truncated *down* to whole seconds — unlike
+/// `mssql-tds`'s own internal `deduct_timeout`, which rounds a *measured*
+/// recovery duration up to charge it conservatively, `elapsed` here is
+/// measured across steps that may have done no I/O at all (e.g. an
+/// autocommit-on connection skips the transaction begin entirely), so its
+/// value is often a few microseconds of local bookkeeping (mutex locks,
+/// staging). Rounding that up would charge a full second against the budget
+/// for every step regardless of whether it touched the network, spuriously
+/// exhausting a small timeout (e.g. `1`) before any wire wait ever happened.
+/// Truncating instead only ever under-charges by less than one second, and
+/// elapsed time that genuinely meets or exceeds the budget still exhausts it.
+/// Returns `Err(())` once exhausted; the caller must fail with a timeout
+/// rather than send the next step unbounded.
+pub(super) fn deduct_query_timeout(timeout_secs: u32, elapsed: Duration) -> Result<u32, ()> {
+    if timeout_secs == 0 {
+        return Ok(0);
+    }
+    let elapsed_secs = u32::try_from(elapsed.as_secs()).unwrap_or(u32::MAX);
+    match timeout_secs.checked_sub(elapsed_secs) {
+        Some(remaining) if remaining > 0 => Ok(remaining),
+        _ => Err(()),
+    }
+}
+
+/// Builds the [`TdsError`] reported when [`deduct_query_timeout`] finds the
+/// budget already exhausted ahead of the caller's own execute.
+pub(super) fn query_timeout_expired_error() -> TdsError {
+    TdsError::TimeoutError(TimeoutErrorType::String(
+        "SQL_ATTR_QUERY_TIMEOUT expired before the statement could be sent".to_string(),
+    ))
 }
 
 /// Result of [`build_named_params`]: the full RPC parameter list (with
@@ -376,6 +584,40 @@ pub(super) struct ParamsWithDae {
     pub(super) params: Vec<RpcParameter>,
     /// Every DAE entry, in original parameter order.
     pub(super) dae_params: Vec<DaeParam>,
+    /// Whether a parameter before the first DAE marker lost fractional digits.
+    /// With no DAE marker, covers the full parameter list.
+    pub(super) fractional_truncated: bool,
+}
+
+pub(super) enum ParamRowBuildError {
+    Unbound {
+        parameter: usize,
+    },
+    Layout {
+        parameter: usize,
+    },
+    Conversion {
+        parameter: usize,
+        source: ParamBuildError,
+    },
+}
+
+impl ParamRowBuildError {
+    pub(super) fn diag(&self) -> DiagMsg {
+        match self {
+            Self::Unbound { .. } => ERR_UNBOUND_PARAMETER,
+            Self::Layout { .. } => ERR_INVALID_STRING_OR_BUFFER_LENGTH,
+            Self::Conversion { source, .. } => source.diag(),
+        }
+    }
+
+    pub(super) fn parameter(&self) -> usize {
+        match self {
+            Self::Unbound { parameter }
+            | Self::Layout { parameter }
+            | Self::Conversion { parameter, .. } => *parameter,
+        }
+    }
 }
 
 /// The byte total an application declared with `SQL_LEN_DATA_AT_EXEC(n)`, or
@@ -397,6 +639,120 @@ fn dae_expected_length(indicator: SqlLen) -> Option<usize> {
     }
 }
 
+/// Snapshots every parameter position currently bound on `stmt`'s effective
+/// APD/IPD, in ordinal order.
+///
+/// Read once, immediately before an execute's main STMT-locked critical
+/// section — never while that lock is held (see
+/// ".github/instructions/mssql-odbc.instructions.md", "Locking rules": a
+/// STMT lock must never be held while acquiring a DESC lock) — since ODBC
+/// requires bindings to stay stable across one execute.
+/// `SQLBindParameter` and `SQLSetDescFieldW` write into these same descriptor
+/// records (AB#47437), so this is the one place `build_named_params` and the
+/// data-at-execution lookups need to look, regardless of which API produced
+/// the binding; the snapshot itself is what lets the rest of the execute path
+/// (`build_named_params`, `StmtState::dae_current_c_type`) stay unchanged,
+/// reading `StmtState::bound_params` exactly as it did before AB#47437.
+///
+/// `Err(SQL_ERROR)` on a poisoned STMT/env/APD/IPD mutex: the caller posts a
+/// diagnostic against the statement and fails the execute outright, rather
+/// than silently snapshotting "every parameter unbound" — which used to let
+/// a zero-marker statement execute successfully despite the internal
+/// failure, and reported a misleading `07002` for one with markers.
+pub(super) fn snapshot_bound_params(
+    stmt: &StmtHandle,
+) -> Result<Vec<Option<BoundParam>>, SqlReturn> {
+    // Read before the STMT lock below, matching bind_param.rs's own
+    // parent-before-child lock ordering for the same lookup.
+    let odbc_version = {
+        let env = stmt.parent_dbc().parent_env();
+        let Ok(env_state) = env.inner.lock() else {
+            error!("snapshotting parameters: env mutex poisoned");
+            return Err(SQL_ERROR);
+        };
+        env_state.odbc_version
+    };
+
+    let (apd, ipd) = {
+        let Ok(stmt_state) = stmt.inner.lock() else {
+            error!("snapshotting parameters: stmt mutex poisoned");
+            return Err(SQL_ERROR);
+        };
+        (stmt_state.effective_apd(stmt), stmt.ipd)
+    };
+
+    // `apd` can be an explicit descriptor resolved under the STMT lock,
+    // already dropped by now — re-check liveness right before dereferencing
+    // to narrow (not fully close) the race against a concurrent
+    // `SQLFreeHandle(SQL_HANDLE_DESC)` on that same descriptor. `ipd` is
+    // always `stmt.ipd`, freed only with the statement itself.
+    if crate::handles::live_type(apd) != Some(crate::handles::HandleType::Desc) {
+        error!("snapshotting parameters: apd freed concurrently");
+        return Err(SQL_ERROR);
+    }
+    let apd_desc = unsafe { handle_from_raw::<DescHandle>(apd) };
+    let Ok(apd_state) = apd_desc.inner.lock() else {
+        error!("snapshotting parameters: apd mutex poisoned");
+        return Err(SQL_ERROR);
+    };
+    let ipd_desc = unsafe { handle_from_raw::<DescHandle>(ipd) };
+    let Ok(ipd_state) = ipd_desc.inner.lock() else {
+        error!("snapshotting parameters: ipd mutex poisoned");
+        return Err(SQL_ERROR);
+    };
+    Ok(BoundParam::all_from_descriptor_states(
+        &apd_state,
+        &ipd_state,
+        odbc_version,
+    ))
+}
+
+/// Builds the parameter list for a TDS RPC, where parameters bind by
+/// **position** rather than by name.
+///
+/// The `@P1..@Pn` names the sp_executesql path uses would be wrong here: the
+/// server matches an RPC's named parameters against the procedure's own
+/// parameter names, so `@P1` fails with "expects parameter '@a', which was not
+/// supplied". msodbcsql likewise sends canonical-call parameters positionally.
+///
+/// `skip` drops leading bindings that are not RPC parameters at all — the
+/// `{? = call ...}` return status is bound as parameter 1 but travels on the
+/// RETURNSTATUS token, not as an argument.
+///
+/// # Safety
+/// Same as [`build_named_params`].
+pub(super) unsafe fn build_positional_params(
+    stmt_state: &mut StmtState,
+    marker_count: usize,
+    skip: usize,
+    op: &str,
+) -> Result<ParamsWithDae, SqlReturn> {
+    let bind_offset = unsafe { stmt_state.inert_attrs.param_bind_offset() };
+    let bound: Vec<Option<BoundParam>> =
+        stmt_state.bound_params.iter().skip(skip).copied().collect();
+    match unsafe {
+        build_named_params_for_row(
+            &bound,
+            marker_count.saturating_sub(skip),
+            bind_offset,
+            crate::api::odbc_types::SQL_BIND_BY_COLUMN,
+            0,
+            false,
+        )
+    } {
+        Ok(params) => Ok(params),
+        Err(error) => {
+            error!(
+                "{op}: parameter {} could not be built: {}",
+                error.parameter() + skip,
+                error.diag().text
+            );
+            post_diag(stmt_state, error.diag());
+            Err(SQL_ERROR)
+        }
+    }
+}
+
 /// Builds the ordered `@P1..@Pn` RPC parameter list from the statement's bound
 /// parameters, reading application value buffers by reference. Shared by
 /// `SQLExecute` and `SQLExecDirect`; `op` names the entry point for traceable
@@ -411,85 +767,262 @@ fn dae_expected_length(indicator: SqlLen) -> Option<usize> {
 ///
 /// # Safety
 /// Each bound parameter's value/indicator pointers must still satisfy the
-/// `SQLBindParameter` contract; the buffers are read here.
+/// `SQLBindParameter` contract; the buffers are read here. When
+/// `SQL_ATTR_PARAM_BIND_OFFSET_PTR` is non-null, their readable extents begin at
+/// each bound base plus the pointed-to signed byte offset, which may be
+/// negative, so every allocation must cover that displaced range.
 pub(super) unsafe fn build_named_params(
     stmt_state: &mut StmtState,
     marker_count: usize,
     op: &str,
 ) -> Result<ParamsWithDae, SqlReturn> {
-    use mssql_tds::message::parameters::rpc_parameters::StatusFlags;
-
-    let mut params = Vec::with_capacity(marker_count);
-    let mut dae_params = Vec::new();
     // Read once per execution: the attribute holds a pointer, and every
     // binding shifts by the same amount.
     let bind_offset = unsafe { stmt_state.inert_attrs.param_bind_offset() };
+    match unsafe {
+        build_named_params_for_row(
+            &stmt_state.bound_params,
+            marker_count,
+            bind_offset,
+            crate::api::odbc_types::SQL_BIND_BY_COLUMN,
+            0,
+            true,
+        )
+    } {
+        Ok(params) => Ok(params),
+        Err(error) => {
+            error!(
+                "{op}: parameter {} could not be built: {}",
+                error.parameter(),
+                error.diag().text
+            );
+            post_diag(stmt_state, error.diag());
+            Err(SQL_ERROR)
+        }
+    }
+}
 
+/// Builds one row of an ODBC parameter array without retaining any other row.
+///
+/// # Safety
+/// Every pointer in `bound_params`, after applying `bind_offset` and the
+/// row-specific stride, must satisfy the original `SQLBindParameter` contract.
+pub(super) unsafe fn build_named_params_for_row(
+    bound_params: &[Option<BoundParam>],
+    marker_count: usize,
+    bind_offset: isize,
+    param_bind_type: crate::api::odbc_types::SqlULen,
+    row: usize,
+    named: bool,
+) -> Result<ParamsWithDae, ParamRowBuildError> {
+    use mssql_tds::message::parameters::rpc_parameters::StatusFlags;
+
+    let mut params = Vec::with_capacity(marker_count + usize::from(!named));
+    let mut dae_params = Vec::new();
+    let mut fractional_truncated = false;
     for i in 0..marker_count {
-        let Some(Some(bound_param)) = stmt_state.bound_params.get(i) else {
-            error!("{op}: parameter {} has no bound value", i + 1);
+        let Some(Some(bound_param)) = bound_params.get(i) else {
+            return Err(ParamRowBuildError::Unbound { parameter: i + 1 });
+        };
+        let bound_param = bound_param
+            .for_row(row, bind_offset, param_bind_type)
+            .map_err(|ParamArrayLayoutError::InvalidValueStride { .. }| {
+                ParamRowBuildError::Layout { parameter: i + 1 }
+            })?;
+        let name = named.then(|| parameter_name(i));
+        let dae_indicator =
+            unsafe { crate::conversion::param_convert::data_at_exec_indicator(&bound_param) };
+
+        if let Some(indicator) = dae_indicator {
+            let plan = dae_plan(bound_param.c_type, bound_param.sql_type).map_err(|source| {
+                ParamRowBuildError::Conversion {
+                    parameter: i + 1,
+                    source,
+                }
+            })?;
+            let length_limit = dae_length_limit(
+                bound_param.c_type,
+                bound_param.sql_type,
+                bound_param.column_size,
+            )
+            .map_err(|source| ParamRowBuildError::Conversion {
+                parameter: i + 1,
+                source,
+            })?;
+            dae_params.push(DaeParam::new(
+                i,
+                dae_expected_length(indicator),
+                plan,
+                length_limit,
+                bound_param,
+            ));
+            // Nothing to declare for a buffered parameter yet: its bytes are
+            // not in, so its type and length are not known. The slot is filled
+            // to keep parameter positions lined up and is rebuilt by
+            // `rebuild_deferred_params` before anything reaches the wire.
+            let status = if crate::conversion::param_convert::is_output_direction(
+                bound_param.input_output_type,
+            ) {
+                StatusFlags::BY_REF_VALUE
+            } else {
+                StatusFlags::NONE
+            };
+            let rpc = match plan {
+                DaePlan::Stream(streamed) => {
+                    let param = RpcParameter::data_at_exec(name, status, streamed);
+                    // The body is PLP whatever `ColumnSize` says, but the
+                    // variable it lands in is declared from `ParameterType`,
+                    // matching the materialized path and msodbcsql (AB#47590).
+                    //
+                    // Only narrowed when the bound above can actually be
+                    // enforced. A streamed parameter never reaches a close-time
+                    // conversion, so an unenforced bound would have the client
+                    // declare `varchar(n)` and then stream past it, leaving the
+                    // overflow to the server instead of the `22001` the
+                    // declaration implies. Staying `max` keeps the value intact
+                    // until the bound is measurable on this path too
+                    // (AB#47590).
+                    let declaration = if length_limit.is_some() {
+                        dae_streamed_declaration(bound_param.sql_type, bound_param.column_size)
+                    } else {
+                        Ok(None)
+                    };
+                    match declaration {
+                        Ok(Some(declaration)) => param.with_streamed_declaration(declaration),
+                        Ok(None) => param,
+                        Err(source) => {
+                            return Err(ParamRowBuildError::Conversion {
+                                parameter: i + 1,
+                                source,
+                            });
+                        }
+                    }
+                }
+                DaePlan::Buffer => {
+                    RpcParameter::data_at_exec(name, status, StreamedSqlType::VarBinaryMax)
+                }
+            };
+            params.push(rpc);
+        } else {
+            let (param, outcome) =
+                unsafe { bound_param_to_rpc(name, &bound_param) }.map_err(|source| {
+                    ParamRowBuildError::Conversion {
+                        parameter: i + 1,
+                        source,
+                    }
+                })?;
+            if outcome == ConvOk::Truncated && dae_params.is_empty() {
+                fractional_truncated = true;
+            }
+            params.push(param);
+        }
+    }
+
+    Ok(ParamsWithDae {
+        params,
+        dae_params,
+        fractional_truncated,
+    })
+}
+
+fn parameter_name(index: usize) -> String {
+    format!("@P{}", index + 1)
+}
+
+pub(super) fn finish_execute_with_param_warning(
+    dbc: &DbcHandle,
+    stmt: &StmtHandle,
+    statement_handle: SqlHandle,
+    client: TdsClient,
+    op: &str,
+    fractional_truncated: bool,
+) -> SqlReturn {
+    let rc = finish_execute(dbc, stmt, statement_handle, client, op);
+    if !fractional_truncated || !matches!(rc, SQL_SUCCESS | SQL_SUCCESS_WITH_INFO | SQL_NO_DATA) {
+        return rc;
+    }
+    let Ok(mut stmt_state) = stmt.inner.lock() else {
+        error!("{op}: stmt mutex poisoned posting parameter truncation");
+        return SQL_ERROR;
+    };
+    post_diag(&mut stmt_state, WARN_FRACTIONAL_TRUNCATION);
+    SQL_SUCCESS_WITH_INFO
+}
+
+/// Rebuilds the RPC parameter list once every data-at-execution value has been
+/// collected, for a sequence that deferred its execute.
+///
+/// Only the data-at-execution slots are rebuilt, from the bytes
+/// [`buffered_dae_to_rpc`] converts; every other parameter is the one
+/// `build_named_params` already materialized at execute time and is kept
+/// verbatim. A buffered value therefore still goes through the same conversion
+/// the materialized path uses, so it is declared and bounded exactly like a
+/// value supplied in a single buffer (AB#47590).
+///
+/// Nothing here reads application memory. Re-reading it would be unsound rather
+/// than merely redundant: `bound_params` is an execute-time snapshot that
+/// `SQLFreeStmt(SQL_RESET_PARAMS)` leaves in place while releasing the bindings
+/// it describes, so an application that resets its parameters mid-sequence --
+/// which this driver explicitly supports -- would have freed buffers
+/// dereferenced here.
+pub(super) fn rebuild_deferred_params(
+    stmt_state: &mut StmtState,
+    prebuilt: Vec<RpcParameter>,
+    collected: &[(usize, Vec<u8>, bool)],
+    dae_params: &[DaeParam],
+    op: &str,
+) -> Result<(Vec<RpcParameter>, bool), SqlReturn> {
+    let mut params = prebuilt;
+    let mut fractional_truncated = false;
+
+    for (index, bytes, is_null) in collected {
+        let Some(dae) = dae_params.iter().find(|p| p.bound_index == *index) else {
+            error!(
+                "{op}: collected value for parameter {} has no binding",
+                index + 1
+            );
             post_diag(stmt_state, ERR_UNBOUND_PARAMETER);
             return Err(SQL_ERROR);
         };
-        // Applied before anything reads the binding: ODBC shifts the
-        // indicator pointer alongside the value pointer, so the
-        // data-at-execution check below has to see the shifted indicator.
-        let bound_param = bound_param.with_bind_offset(bind_offset);
-
-        let name = format!("@P{}", i + 1);
-
-        // Check for a data-at-execution indicator before dereferencing the
-        // value buffer: DAE params carry no value at bind time.
-        let dae_indicator = if !bound_param.strlen_or_ind_ptr.is_null() {
-            let ind = unsafe { bound_param.strlen_or_ind_ptr.read_unaligned() };
-            is_data_at_exec_indicator(ind).then_some(ind)
-        } else {
-            None
+        let Some(slot) = params.get_mut(*index) else {
+            error!(
+                "{op}: collected value for parameter {} has no slot",
+                index + 1
+            );
+            post_diag(stmt_state, ERR_UNBOUND_PARAMETER);
+            return Err(SQL_ERROR);
         };
-
-        if let Some(indicator) = dae_indicator {
-            let placeholder_type =
-                match dae_placeholder_type(bound_param.c_type, bound_param.sql_type) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        error!(
-                            "{op}: parameter {} DAE type not streamable: {}",
-                            i + 1,
-                            e.diag().text
-                        );
-                        post_diag(stmt_state, e.diag());
-                        return Err(SQL_ERROR);
-                    }
-                };
-            let rpc = RpcParameter::data_at_exec(Some(name), StatusFlags::NONE, placeholder_type);
-            dae_params.push(DaeParam {
-                bound_index: i,
-                value_ptr: bound_param.parameter_value_ptr,
-                expected_len: dae_expected_length(indicator),
-            });
-            params.push(rpc);
-        } else {
-            match unsafe { bound_param_to_rpc(name, &bound_param) } {
-                Ok(param) => params.push(param),
-                Err(ParamBuildError::InvalidLength(len)) => {
-                    error!("{op}: parameter {} has invalid StrLen_or_Ind {len}", i + 1);
-                    post_diag(stmt_state, ParamBuildError::InvalidLength(len).diag());
-                    return Err(SQL_ERROR);
-                }
-                Err(e) => {
-                    error!(
-                        "{op}: parameter {} conversion failed: {}",
-                        i + 1,
-                        e.diag().text
-                    );
-                    post_diag(stmt_state, e.diag());
-                    return Err(SQL_ERROR);
-                }
+        let name = parameter_name(*index);
+        match buffered_dae_to_rpc(name, &dae.binding, bytes, *is_null) {
+            Ok((param, outcome)) => {
+                *slot = param;
+                fractional_truncated |= outcome == ConvOk::Truncated;
+            }
+            Err(e) => {
+                error!(
+                    "{op}: parameter {} conversion failed: {}",
+                    index + 1,
+                    e.diag().text
+                );
+                post_diag(stmt_state, e.diag());
+                return Err(SQL_ERROR);
             }
         }
     }
 
-    Ok(ParamsWithDae { params, dae_params })
+    Ok((params, fractional_truncated))
+}
+
+fn no_row_execute_return(row_count: i64, has_server_info: bool) -> SqlReturn {
+    if has_server_info {
+        SQL_SUCCESS_WITH_INFO
+    } else if row_count == 0 {
+        // msodbcsql's sqlccmd.cpp returns SQL_NO_DATA for an ODBC 3.x
+        // execution positioned on an RS_COUNT with zero affected rows.
+        SQL_NO_DATA
+    } else {
+        SQL_SUCCESS
+    }
 }
 
 /// Captures result metadata after a successful execution and finalizes the
@@ -498,7 +1031,9 @@ pub(super) unsafe fn build_named_params(
 /// - **Result set** (non-empty `COLMETADATA`): the cursor is left open for
 ///   `SQLFetch`; the connection stays busy.
 /// - **DDL/DML** (no `COLMETADATA`): the wire is drained via `close_query` and
-///   the connection returns to idle so the statement can re-execute.
+///   the connection returns to idle. Collected DML counts remain navigable;
+///   output parameters wait until `SQLMoreResults` consumes the final count.
+///   A zero first count returns `SQL_NO_DATA` without consuming that result.
 ///
 /// `EXEC_STARTED` is always cleared. No lock is held across the drain I/O.
 pub(super) fn finish_execute(
@@ -510,6 +1045,18 @@ pub(super) fn finish_execute(
 ) -> SqlReturn {
     let metadata = client.get_metadata().clone();
     let has_result_set = !metadata.is_empty();
+
+    // Populated before `metadata` is moved into `stmt_state.begin_batch`
+    // below (each arm), while it's still owned locally — avoids a clone per
+    // arm purely to keep a copy alive across the STMT lock drop.
+    // `populate_ird` only ever touches the IRD's own DescHandle, with no
+    // dependency on `stmt_state`/`client`/`dbc`, so running it before the
+    // STMT-locked bookkeeping instead of after doesn't change what state ends
+    // up where — only whether an IRD failure is checked before or after that
+    // bookkeeping runs, and every arm already runs the bookkeeping
+    // unconditionally and reports the IRD failure (if any) in its return
+    // value regardless.
+    let ird_ok = populate_ird(stmt, &metadata).is_ok();
 
     if !has_result_set && client.has_open_batch() {
         // Statement-wise navigation: positioned on a no-row statement result
@@ -528,18 +1075,26 @@ pub(super) fn finish_execute(
         // Statement-wise: report this no-row (DML/PRINT/RAISERROR) statement's
         // own affected-row count for SQLRowCount. Later statements' counts are
         // surfaced as SQLMoreResults advances onto each in turn (not pre-queued).
-        stmt_state.row_count = client.last_rows_affected();
+        let row_count = client.last_rows_affected();
+        stmt_state.row_count = row_count;
         stmt_state.clear_exhaustion_state();
         stmt_state.set_state(STMT_STATE_EXEC_CONTEXT | STMT_STATE_CURSOR_OPEN);
         stmt_state.clear_state(STMT_STATE_EXEC_STARTED);
         let has_server_info = post_tds_info_messages(&mut stmt_state, &info_messages);
         drop(stmt_state);
         return_client_busy(dbc, client);
-        return if has_server_info {
-            SQL_SUCCESS_WITH_INFO
-        } else {
-            SQL_SUCCESS
-        };
+        if !ird_ok {
+            if let Ok(mut stmt_state) = stmt.inner.lock() {
+                post_sql_error(
+                    &mut stmt_state,
+                    SQLSTATE_HY000,
+                    0,
+                    "Internal error refreshing result-set metadata",
+                );
+            }
+            return SQL_ERROR;
+        }
+        return no_row_execute_return(row_count, has_server_info);
     }
 
     if !has_result_set {
@@ -555,29 +1110,82 @@ pub(super) fn finish_execute(
         // statement. Report the first here; queue the rest for SQLMoreResults to
         // step through, matching msodbcsql's one result set per DML statement.
         let mut dml_counts: VecDeque<i64> = client.take_dml_result_counts().into();
+        let has_dml_counts = !dml_counts.is_empty();
         let first_count = dml_counts.pop_front().unwrap_or(-1);
+        let bound_params = snapshot_bound_params(stmt);
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("{op}: stmt mutex poisoned");
             return_client_idle(dbc, statement_handle, client);
             return SQL_ERROR;
         };
+        stmt_state.clear_exhaustion_state();
+        // Draining the wire does not consume application-visible DML counts.
+        // Keep the return tokens until SQLMoreResults advances past the last
+        // count, even when the first count is the only one.
+        let return_values = client.get_return_values();
+        let return_status = client.get_return_status();
+        let output_rc = if has_dml_counts {
+            stmt_state.batch_exhausted = true;
+            stmt_state.pending_output_params = Some((return_values, return_status));
+            SQL_SUCCESS
+        } else if let Ok(bound_params) = bound_params {
+            // Fresh descriptor snapshot; execute-time input pointers may have
+            // been reset or rebound while the results were being consumed.
+            unsafe {
+                crate::api::output_params::write_back_output_params(
+                    &mut stmt_state,
+                    &bound_params,
+                    &return_values,
+                    return_status,
+                )
+            }
+        } else {
+            post_sql_error(
+                &mut stmt_state,
+                SQLSTATE_HY000,
+                0,
+                "Internal error snapshotting output parameter bindings",
+            );
+            SQL_ERROR
+        };
         stmt_state.begin_batch(metadata); // empty
         stmt_state.row_count = first_count;
         stmt_state.pending_row_counts = dml_counts;
-        stmt_state.clear_exhaustion_state();
         stmt_state.set_state(STMT_STATE_EXEC_CONTEXT);
         stmt_state.clear_state(STMT_STATE_CURSOR_OPEN | STMT_STATE_EXEC_STARTED);
         let has_server_info = post_tds_info_messages(&mut stmt_state, &info_messages);
         drop(stmt_state);
         return_client_idle(dbc, statement_handle, client);
-        return if has_server_info {
-            SQL_SUCCESS_WITH_INFO
+        if !ird_ok {
+            if let Ok(mut stmt_state) = stmt.inner.lock() {
+                post_sql_error(
+                    &mut stmt_state,
+                    SQLSTATE_HY000,
+                    0,
+                    "Internal error refreshing result-set metadata",
+                );
+            }
+            return SQL_ERROR;
+        }
+        return if output_rc != SQL_SUCCESS {
+            output_rc
         } else {
-            SQL_SUCCESS
+            no_row_execute_return(first_count, has_server_info)
         };
     }
 
-    // Result-bearing query: leave the cursor open for SQLFetch.
+    // SQL Server can send COLMETADATA before the statement has produced its
+    // first row. Wait for that row, end-of-set, or an ERROR token so execution
+    // errors surface from SQLExecDirect/SQLExecute instead of a later SQLFetch.
+    // A row is only positioned and parked; SQLFetch still receives it normally.
+    if let Err(e) = dbc.runtime.block_on(client.peek_past_current_row()) {
+        error!(%e, "{op}: failed before the first result row");
+        return fail_with_tds(dbc, stmt, statement_handle, client, &e);
+    }
+
+    // Result-bearing query: leave the cursor open for SQLFetch. This must stay
+    // below the peek: the peek drains any INFO token in the post-metadata
+    // window, and taking the messages first would leave them for a later fetch.
     let info_messages = client.take_info_messages();
     let Ok(mut stmt_state) = stmt.inner.lock() else {
         error!("{op}: stmt mutex poisoned");
@@ -593,6 +1201,17 @@ pub(super) fn finish_execute(
     let has_server_info = post_tds_info_messages(&mut stmt_state, &info_messages);
     drop(stmt_state);
     return_client_busy(dbc, client);
+    if !ird_ok {
+        if let Ok(mut stmt_state) = stmt.inner.lock() {
+            post_sql_error(
+                &mut stmt_state,
+                SQLSTATE_HY000,
+                0,
+                "Internal error refreshing result-set metadata",
+            );
+        }
+        return SQL_ERROR;
+    }
     if has_server_info {
         SQL_SUCCESS_WITH_INFO
     } else {
@@ -611,7 +1230,8 @@ mod tests {
     use crate::params::BoundParam;
     use crate::test_support::TestHandles;
     use mssql_tds::test_client_support::{
-        ScriptedToken, col_metadata_empty, done_more, done_no_more, tds_client_from_tokens,
+        ScriptedToken, col_metadata, col_metadata_empty, done_in_proc_more, done_more,
+        done_no_more, done_proc_no_more, int_columns, sql_error, tds_client_from_tokens,
     };
     use std::ffi::c_void;
 
@@ -628,6 +1248,108 @@ mod tests {
         assert_eq!(dae_expected_length(sql_len_data_at_exec(0)), None);
         assert_eq!(dae_expected_length(sql_len_data_at_exec(1)), Some(1));
         assert_eq!(dae_expected_length(sql_len_data_at_exec(4)), Some(4));
+    }
+
+    #[test]
+    fn deduct_query_timeout_zero_is_unlimited() {
+        assert_eq!(deduct_query_timeout(0, Duration::from_secs(1_000)), Ok(0));
+    }
+
+    #[test]
+    fn deduct_query_timeout_truncates_sub_second_elapsed() {
+        // 1.9s truncates to 1s, so a 10s budget leaves 9s, not 8s.
+        assert_eq!(
+            deduct_query_timeout(10, Duration::from_millis(1_900)),
+            Ok(9)
+        );
+    }
+
+    #[test]
+    fn deduct_query_timeout_exhausted_at_or_past_budget_errs() {
+        assert_eq!(deduct_query_timeout(5, Duration::from_secs(5)), Err(()));
+        assert_eq!(deduct_query_timeout(5, Duration::from_secs(6)), Err(()));
+    }
+
+    /// The error `execute.rs`/`exec_direct.rs` report when a pre-execute
+    /// `deduct_query_timeout` call finds the budget already exhausted — a
+    /// `TimeoutError`, matching every other query-timeout expiry, so
+    /// `post_tds_error` maps it to `HYT00` (see `sqlstate.rs`'s
+    /// `post_tds_error_timeout_maps_to_hyt00_regardless_of_default`) the same
+    /// way whether the budget ran out before or during the wire call.
+    #[test]
+    fn query_timeout_expired_error_is_a_timeout_error() {
+        match query_timeout_expired_error() {
+            TdsError::TimeoutError(TimeoutErrorType::String(msg)) => {
+                assert!(
+                    msg.contains("SQL_ATTR_QUERY_TIMEOUT"),
+                    "message should name the attribute that expired: {msg}"
+                );
+            }
+            other => panic!("expected TimeoutError(String(_)), got: {other:?}"),
+        }
+    }
+
+    /// `SQLExecDirectW` calls `deduct_query_timeout` twice in sequence — once
+    /// after `flush_pending_unprepare`, once after `begin_transaction_if_manual`
+    /// — each time measuring the *cumulative* elapsed time since the call
+    /// began against the *original, fixed* budget (not the previous call's
+    /// return value). Composing them must charge each step's elapsed time
+    /// exactly once and must not floor away sub-second remainders
+    /// independently at each step: a 10s budget with a 3s unprepare and a 2s
+    /// implicit transaction begin must leave 5s (10 - (3+2)), not the 2s an
+    /// earlier version of this code produced by re-deducting from its own
+    /// shrinking result (`(10-3)-(3+2)=2`, double-charging the first step), or
+    /// the loss a per-step-floored version would suffer with sub-second steps
+    /// — both caught in mssql-rs#442 review by an independent reviewer tracing
+    /// the exact arithmetic; the numbers here are theirs.
+    #[test]
+    fn deduct_query_timeout_composed_twice_charges_each_step_once() {
+        let budget = 10;
+        let after_unprepare = deduct_query_timeout(budget, Duration::from_secs(3)).unwrap();
+        assert_eq!(
+            after_unprepare, 7,
+            "remaining allowance handed to the next step"
+        );
+        let after_begin = deduct_query_timeout(budget, Duration::from_secs(3 + 2)).unwrap();
+        assert_eq!(
+            after_begin, 5,
+            "budget minus total elapsed, not double-charged"
+        );
+    }
+
+    /// Composing from a *fixed* original budget with *cumulative* elapsed
+    /// (what `SQLExecDirectW` now does) is stricter than composing from a
+    /// shrinking budget with each step's own elapsed measured in isolation:
+    /// the latter floors sub-second remainders away independently at every
+    /// step, so two 0.99s pre-execute steps against a 1s budget would each
+    /// charge nothing, letting the following execute start with a fresh 1s —
+    /// about 3x the configured timeout in wall-clock terms before any
+    /// network wait even begins. Deducting cumulatively from the original
+    /// budget catches this instead: composing across the same two steps
+    /// exhausts a 1s budget, matching msodbcsql's own millisecond-granularity
+    /// deduction (`dwQueryTimeoutInMS` in `DropPrepHandle`) not losing
+    /// sub-second remainders.
+    #[test]
+    fn deduct_query_timeout_cumulative_composition_catches_accumulated_sub_second_cost() {
+        let budget = 1;
+        let step_1 = Duration::from_millis(990);
+        let step_2 = Duration::from_millis(990);
+
+        let per_step_reseeded =
+            deduct_query_timeout(deduct_query_timeout(budget, step_1).unwrap(), step_2);
+        assert_eq!(
+            per_step_reseeded,
+            Ok(1),
+            "per-step composition floors each sub-second cost away independently"
+        );
+
+        let cumulative_fixed_budget = deduct_query_timeout(budget, step_1)
+            .and_then(|_| deduct_query_timeout(budget, step_1 + step_2));
+        assert_eq!(
+            cumulative_fixed_budget,
+            Err(()),
+            "cumulative composition against the fixed budget must see the combined cost"
+        );
     }
 
     #[test]
@@ -650,6 +1372,215 @@ mod tests {
         assert!(try_claim_idle_client(dbc, h.dbc).is_none());
         // The existing claim must be left untouched.
         assert_eq!(dbc.inner.lock().unwrap().active_stmt, Some(other));
+    }
+
+    #[test]
+    fn finish_execute_surfaces_an_error_before_the_first_row() {
+        let h = TestHandles::with_env_dbc_stmt();
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let mut client = tds_client_from_tokens(vec![
+            col_metadata(int_columns(1)),
+            sql_error(1222, 16, "Lock request time out period exceeded."),
+            done_no_more(),
+        ]);
+        dbc.runtime
+            .block_on(client.execute("SELECT blocked".to_string(), ()))
+            .unwrap();
+
+        let rc = finish_execute(dbc, stmt, h.stmt, client, "SQLExecDirectW");
+
+        assert_eq!(rc, SQL_ERROR);
+        let stmt_state = stmt.inner.lock().unwrap();
+        assert!(
+            stmt_state
+                .diag_records
+                .iter()
+                .any(|record| record.native_error == 1222)
+        );
+    }
+
+    /// The peek does not stop at rows and errors: `handle_row_read_token`'s
+    /// `Tokens::Info` arm captures and continues, so an INFO token sitting
+    /// between `COLMETADATA` and the first `ROW`/`DONE` is now drained during
+    /// execution rather than by the first `SQLFetch`. The success tail posts it,
+    /// which turns `SQL_SUCCESS` into `SQL_SUCCESS_WITH_INFO` for that window.
+    ///
+    /// This matches msodbcsql, whose parse loop covers the same window before
+    /// parking at the first row. It is pinned here because the behaviour is
+    /// otherwise invisible: moving the peek below `take_info_messages()` would
+    /// silently restore execute-time `SQL_SUCCESS` and defer the diagnostic
+    /// back to `SQLFetch`, and no other test would fail.
+    #[test]
+    fn finish_execute_reports_an_info_message_arriving_before_the_first_row() {
+        use mssql_tds::test_client_support::info;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let mut client = tds_client_from_tokens(vec![
+            col_metadata(int_columns(1)),
+            info(
+                8153,
+                10,
+                "Null value is eliminated by an aggregate or other SET operation.",
+            ),
+            done_no_more(),
+        ]);
+        dbc.runtime
+            .block_on(client.execute("SELECT SUM(col) FROM t".to_string(), ()))
+            .unwrap();
+
+        let rc = finish_execute(dbc, stmt, h.stmt, client, "SQLExecDirectW");
+
+        assert_eq!(rc, SQL_SUCCESS_WITH_INFO);
+        let stmt_state = stmt.inner.lock().unwrap();
+        assert!(
+            stmt_state
+                .diag_records
+                .iter()
+                .any(|record| record.native_error == 8153),
+            "the warning must be posted under the execute that drained it"
+        );
+    }
+
+    #[test]
+    fn finish_execute_retains_outputs_until_drained_dml_counts_are_consumed() {
+        use crate::api::more_results::sql_more_results;
+        use mssql_tds::test_client_support::done_more_with_count;
+
+        for counts in [vec![], vec![0], vec![2, 1]] {
+            let h = TestHandles::with_env_dbc_stmt();
+            let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let mut tokens: Vec<_> = counts.iter().copied().map(done_more_with_count).collect();
+            tokens.push(done_no_more());
+            let mut client = tds_client_from_tokens(tokens);
+            dbc.runtime
+                .block_on(client.execute("UPDATE t SET v=1".to_owned(), ()))
+                .unwrap();
+            // RPC execution can already have consumed the whole response before
+            // handing the drained client and its collected counts to ODBC.
+            dbc.runtime.block_on(client.close_query()).unwrap();
+            assert_eq!(
+                finish_execute(dbc, stmt, h.stmt, client, "SQLExecute"),
+                if counts.first() == Some(&0) {
+                    SQL_NO_DATA
+                } else {
+                    SQL_SUCCESS
+                }
+            );
+            if counts.is_empty() {
+                let state = stmt.inner.lock().unwrap();
+                assert!(state.pending_output_params.is_none());
+                assert!(!state.batch_exhausted);
+            }
+            for (index, count) in counts.iter().enumerate() {
+                if index != 0 {
+                    assert_eq!(unsafe { sql_more_results(h.stmt) }, SQL_SUCCESS);
+                }
+                let state = stmt.inner.lock().unwrap();
+                assert_eq!(state.row_count, i64::try_from(*count).unwrap());
+                assert!(state.pending_output_params.is_some());
+                assert!(state.batch_exhausted);
+            }
+            assert_eq!(unsafe { sql_more_results(h.stmt) }, SQL_NO_DATA);
+            assert!(stmt.inner.lock().unwrap().pending_output_params.is_none());
+            assert_eq!(unsafe { sql_more_results(h.stmt) }, SQL_NO_DATA);
+        }
+    }
+
+    #[test]
+    fn finish_execute_zero_count_preserves_pending_results_and_parameter_warnings() {
+        use crate::api::more_results::sql_more_results;
+        use mssql_tds::test_client_support::done_more_with_count;
+
+        for fractional_truncated in [false, true] {
+            let h = TestHandles::with_env_dbc_stmt();
+            let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let mut client = tds_client_from_tokens(vec![
+                done_more_with_count(0),
+                done_more_with_count(2),
+                done_no_more(),
+            ]);
+            dbc.runtime
+                .block_on(client.execute("UPDATE t SET v=1".to_owned(), ()))
+                .unwrap();
+            assert_eq!(
+                finish_execute_with_param_warning(
+                    dbc,
+                    stmt,
+                    h.stmt,
+                    client,
+                    "SQLExecute",
+                    fractional_truncated,
+                ),
+                if fractional_truncated {
+                    SQL_SUCCESS_WITH_INFO
+                } else {
+                    SQL_NO_DATA
+                }
+            );
+            {
+                let state = stmt.inner.lock().unwrap();
+                assert_eq!(state.row_count, 0);
+                assert!(state.has_state(STMT_STATE_CURSOR_OPEN));
+                assert_eq!(state.diag_records.len(), usize::from(fractional_truncated));
+                if fractional_truncated {
+                    assert_eq!(state.diag_records[0].sql_state, SQLSTATE_01S07);
+                }
+            }
+            assert_eq!(unsafe { sql_more_results(h.stmt) }, SQL_SUCCESS);
+            assert_eq!(stmt.inner.lock().unwrap().row_count, 2);
+            assert!(stmt.inner.lock().unwrap().diag_records.is_empty());
+        }
+    }
+
+    #[test]
+    fn finish_execute_posts_numeric_fractional_truncation() {
+        let h = TestHandles::with_env_dbc_stmt();
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let mut client = tds_client_from_tokens(vec![done_no_more()]);
+        dbc.runtime
+            .block_on(client.execute("SELECT 1".to_string(), ()))
+            .unwrap();
+
+        let rc = finish_execute_with_param_warning(dbc, stmt, h.stmt, client, "SQLExecute", true);
+
+        assert_eq!(rc, SQL_SUCCESS_WITH_INFO);
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(state.diag_records.len(), 1);
+        assert_eq!(state.diag_records[0].sql_state, SQLSTATE_01S07);
+    }
+
+    #[test]
+    fn park_dae_client_posts_numeric_fractional_truncation() {
+        use crate::test_support::TestHandles;
+        use mssql_tds::test_client_support::tds_client_from_tokens;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        h.mark_dbc_connected();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+
+        let rc = park_dae_client(
+            stmt,
+            tds_client_from_tokens(Vec::new()),
+            None,
+            None,
+            Vec::new(),
+            true,
+            "SQLExecute",
+        );
+
+        assert_eq!(rc, SQL_NEED_DATA);
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(state.diag_records.len(), 1);
+        assert_eq!(state.diag_records[0].sql_state, SQLSTATE_01S07);
     }
 
     /// Builds a scripted client positioned on a row-returning result (empty
@@ -694,6 +1625,54 @@ mod tests {
              SQLMoreResults must also be able to fast-path without touching \
              the connection"
         );
+    }
+
+    #[test]
+    fn release_busy_if_row_exhausted_drains_a_protocol_only_rpc_tail() {
+        // A SELECT inside sp_executesql/sp_prepexec ends with DONE_MORE even
+        // when no application-visible result follows. The RPC's terminal DONE
+        // must be consumed before another statement can safely use the wire.
+        let h = TestHandles::with_env_dbc_stmt();
+        position_and_inject(
+            &h,
+            vec![
+                col_metadata_empty(),
+                done_in_proc_more(),
+                done_proc_no_more(),
+            ],
+        );
+
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let client = dbc.inner.lock().unwrap().client.take().unwrap();
+
+        release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, true);
+
+        assert!(dbc.inner.lock().unwrap().active_stmt.is_none());
+        let ss = stmt.inner.lock().unwrap();
+        assert!(ss.result_set_exhausted);
+        assert!(ss.batch_exhausted);
+    }
+
+    #[test]
+    fn release_busy_if_row_exhausted_defers_a_truncated_rpc_tail() {
+        let h = TestHandles::with_env_dbc_stmt();
+        position_and_inject(&h, vec![col_metadata_empty(), done_in_proc_more()]);
+
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let client = dbc.inner.lock().unwrap().client.take().unwrap();
+
+        release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, true);
+
+        assert!(dbc.inner.lock().unwrap().active_stmt.is_none());
+        let ss = stmt.inner.lock().unwrap();
+        assert!(ss.result_set_exhausted);
+        assert!(ss.batch_exhausted);
+        assert!(matches!(
+            ss.pending_fetch_error,
+            Some(TdsError::ConnectionClosed(_))
+        ));
     }
 
     /// The reviewer-flagged AB#47508 regression: `SELECT 1; SELECT 2;` as one
@@ -1008,10 +1987,57 @@ mod tests {
             sql_type: SQL_VARCHAR,
             column_size: 0,
             decimal_digits: 0,
+            app_precision: 0,
+            app_scale: 0,
+            precision_scale_explicit: false,
             parameter_value_ptr: buf.as_mut_ptr() as *mut c_void,
             buffer_length: buf.len() as SqlLen,
             strlen_or_ind_ptr: ind as *mut SqlLen,
+            octet_length_ptr: ind as *mut SqlLen,
         }
+    }
+
+    /// The narrow race `snapshot_bound_params`'s liveness check guards
+    /// against: `effective_apd` resolves an explicit descriptor under the
+    /// STMT lock, which is dropped before the descriptor is actually locked
+    /// and read. If a concurrent `SQLFreeHandle(SQL_HANDLE_DESC)` completes
+    /// in that window, the stale pointer must fail cleanly (`Err`), not
+    /// dereference freed memory. Reassociating the APD and then freeing it
+    /// reproduces the state that window leaves behind — `active_apd` still
+    /// points at the freed handle, since only a *subsequent* `SQLBindCol`/
+    /// `SQLBindParameter`-family call re-resolves it via `free_desc`'s
+    /// association reset.
+    #[test]
+    fn snapshot_bound_params_fails_cleanly_on_a_freed_apd() {
+        let mut h = TestHandles::with_env_dbc_stmt();
+        let explicit_apd = h.alloc_explicit_desc();
+        unsafe {
+            crate::api::set_stmt_attr::sql_set_stmt_attr_w(
+                h.stmt,
+                crate::api::odbc_types::SQL_ATTR_APP_PARAM_DESC,
+                explicit_apd as crate::api::odbc_types::SqlPointer,
+                0,
+            )
+        };
+        {
+            // Directly clears the tracked association without going through
+            // `free_desc`'s association-reset walk, so `active_apd` is left
+            // dangling exactly as it would be mid-race — `h.free_explicit_desc`
+            // goes through the real `SQLFreeHandle` path, which already resets
+            // the association and would defeat the point of this test.
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let mut ss = stmt.inner.lock().unwrap();
+            ss.active_apd = None;
+        }
+        unsafe {
+            crate::handles::free_handle::<DescHandle>(explicit_apd);
+        }
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut ss = stmt.inner.lock().unwrap();
+            ss.active_apd = Some(explicit_apd);
+        }
+        assert!(snapshot_bound_params(stmt).is_err());
     }
 
     #[test]
@@ -1022,6 +2048,80 @@ mod tests {
         let built = unsafe { build_named_params(&mut state, 0, "test") }.unwrap();
         assert!(built.params.is_empty());
         assert!(built.dae_params.is_empty());
+    }
+
+    #[test]
+    fn output_only_indicators_never_stage_data_at_execution() {
+        use crate::api::odbc_types::{SQL_PARAM_OUTPUT, SQL_RETURN_VALUE};
+        use mssql_tds::message::parameters::rpc_parameters::StatusFlags;
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let mut state = stmt.inner.lock().unwrap();
+        for direction in [SQL_PARAM_OUTPUT, SQL_RETURN_VALUE] {
+            let mut buffer = vec![b'x'; 8];
+            let mut indicator = SQL_DATA_AT_EXEC;
+            let mut param = char_param(&mut buffer, &mut indicator);
+            param.input_output_type = direction;
+            param.column_size = 8;
+            state.bound_params = vec![Some(param)];
+            let built = unsafe { build_named_params(&mut state, 1, "test") }.unwrap();
+            assert!(built.dae_params.is_empty());
+            assert_eq!(built.params.len(), 1);
+            assert!(
+                mssql_tds::test_client_support::rpc_parameter_status(&built.params[0])
+                    .contains(StatusFlags::BY_REF_VALUE)
+            );
+        }
+    }
+
+    #[test]
+    fn dae_parameter_direction_retains_output_flag_through_rebuild() {
+        use crate::api::odbc_types::{SQL_INTEGER, SQL_PARAM_INPUT_OUTPUT};
+        use mssql_tds::message::parameters::rpc_parameters::StatusFlags;
+        use mssql_tds::test_client_support::rpc_parameter_status;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let mut state = stmt.inner.lock().unwrap();
+        for (direction, expected) in [
+            (SQL_PARAM_INPUT, StatusFlags::NONE),
+            (SQL_PARAM_INPUT_OUTPUT, StatusFlags::BY_REF_VALUE),
+        ] {
+            for (sql_type, plan) in [
+                (SQL_VARCHAR, DaePlan::Stream(StreamedSqlType::VarcharMax)),
+                (SQL_INTEGER, DaePlan::Buffer),
+            ] {
+                let mut buffer = *b"42";
+                let mut indicator = SQL_DATA_AT_EXEC;
+                let mut param = char_param(&mut buffer, &mut indicator);
+                param.input_output_type = direction;
+                param.sql_type = sql_type;
+                state.bound_params = vec![Some(param)];
+                let built = unsafe { build_named_params(&mut state, 1, "test") }.unwrap();
+                assert_eq!(built.dae_params.len(), 1);
+                assert_eq!(built.dae_params[0].plan, plan);
+                assert_eq!(
+                    rpc_parameter_status(&built.params[0]).bits(),
+                    expected.bits(),
+                    "{direction}, {sql_type}"
+                );
+                if plan == DaePlan::Buffer {
+                    let (rebuilt, _) = rebuild_deferred_params(
+                        &mut state,
+                        built.params,
+                        &[(0, b"42".to_vec(), false)],
+                        &built.dae_params,
+                        "test",
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        rpc_parameter_status(&rebuilt[0]).bits(),
+                        expected.bits(),
+                        "{direction}, rebuilt"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -1105,9 +2205,13 @@ mod tests {
             sql_type: SQL_VARCHAR,
             column_size: 0,
             decimal_digits: 0,
+            app_precision: 0,
+            app_scale: 0,
+            precision_scale_explicit: false,
             parameter_value_ptr: std::ptr::null_mut(),
             buffer_length: 0,
             strlen_or_ind_ptr: &mut streamed_ind as *mut SqlLen,
+            octet_length_ptr: &mut streamed_ind as *mut SqlLen,
         }));
         state
             .bound_params
@@ -1115,14 +2219,191 @@ mod tests {
 
         let dae = unsafe { build_named_params(&mut state, 3, "test") }.unwrap();
         assert_eq!(dae.params.len(), 3);
-        assert_eq!(
-            dae.dae_params,
-            vec![DaeParam {
-                bound_index: 1,
-                value_ptr: std::ptr::null_mut(),
-                expected_len: None
-            }]
+        assert_eq!(dae.dae_params.len(), 1);
+        assert_eq!(dae.dae_params[0].bound_index, 1);
+        assert_eq!(dae.dae_params[0].expected_len, None);
+    }
+
+    #[test]
+    fn build_named_params_ignores_truncation_after_first_dae_param() {
+        use crate::api::odbc_types::{SQL_C_NUMERIC, SQL_DECIMAL, SqlNumericStruct};
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+
+        let mut streamed_ind: SqlLen = SQL_DATA_AT_EXEC;
+        // 123.45 rescaled to scale 1 drops the trailing "5" (`Truncated`)
+        // without overflowing `decimal(5,1)`'s magnitude bound.
+        let mut numeric = SqlNumericStruct {
+            precision: 38,
+            scale: 2,
+            sign: 1,
+            val: {
+                let mut v = [0u8; 16];
+                v[..2].copy_from_slice(&12345u16.to_le_bytes());
+                v
+            },
+        };
+        let mut numeric_ind: SqlLen = std::mem::size_of::<SqlNumericStruct>() as SqlLen;
+
+        let mut state = stmt.inner.lock().unwrap();
+        state.bound_params.push(Some(BoundParam {
+            input_output_type: SQL_PARAM_INPUT,
+            c_type: SQL_C_CHAR,
+            sql_type: SQL_VARCHAR,
+            column_size: 0,
+            decimal_digits: 0,
+            app_precision: 0,
+            app_scale: 0,
+            precision_scale_explicit: false,
+            parameter_value_ptr: std::ptr::null_mut(),
+            buffer_length: 0,
+            strlen_or_ind_ptr: &mut streamed_ind as *mut SqlLen,
+            octet_length_ptr: &mut streamed_ind as *mut SqlLen,
+        }));
+        state.bound_params.push(Some(BoundParam {
+            input_output_type: SQL_PARAM_INPUT,
+            c_type: SQL_C_NUMERIC,
+            sql_type: SQL_DECIMAL,
+            column_size: 5,
+            decimal_digits: 1,
+            app_precision: 38,
+            app_scale: 2,
+            precision_scale_explicit: false,
+            parameter_value_ptr: (&mut numeric as *mut SqlNumericStruct).cast(),
+            buffer_length: 0,
+            strlen_or_ind_ptr: &mut numeric_ind as *mut SqlLen,
+            octet_length_ptr: &mut numeric_ind as *mut SqlLen,
+        }));
+
+        let built = unsafe { build_named_params(&mut state, 2, "test") }.unwrap();
+        assert_eq!(built.dae_params.len(), 1);
+        assert!(!built.fractional_truncated);
+    }
+
+    fn buffered_decimal_param(bound_index: usize) -> DaeParam {
+        use crate::api::odbc_types::SQL_DECIMAL;
+
+        let mut param = DaeParam::unbounded(bound_index, std::ptr::null_mut(), None);
+        param.plan = DaePlan::Buffer;
+        param.binding.c_type = SQL_C_CHAR;
+        param.binding.sql_type = SQL_DECIMAL;
+        param.binding.column_size = 5;
+        param.binding.decimal_digits = 1;
+        param
+    }
+
+    fn deferred_slot() -> RpcParameter {
+        use mssql_tds::message::parameters::rpc_parameters::StatusFlags;
+
+        RpcParameter::data_at_exec(
+            Some("@P1".to_string()),
+            StatusFlags::NONE,
+            StreamedSqlType::VarBinaryMax,
+        )
+    }
+
+    #[test]
+    fn rebuild_deferred_params_reports_fractional_truncation() {
+        use crate::api::odbc_types::{SQL_C_NUMERIC, SQL_DECIMAL, SqlNumericStruct};
+
+        assert!(matches!(
+            dae_plan(SQL_C_NUMERIC, SQL_DECIMAL),
+            Err(ParamBuildError::UnsupportedCType(SQL_C_NUMERIC))
+        ));
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let mut state = stmt.inner.lock().unwrap();
+        let mut param = buffered_decimal_param(0);
+        param.binding.c_type = SQL_C_NUMERIC;
+        param.binding.column_size = 10;
+        param.binding.app_scale = 3;
+        param.binding.precision_scale_explicit = true;
+        let numeric = SqlNumericStruct {
+            precision: 38,
+            scale: 0,
+            sign: 1,
+            val: {
+                let mut value = [0; 16];
+                value[..2].copy_from_slice(&1551u16.to_le_bytes());
+                value
+            },
+        };
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                (&raw const numeric).cast::<u8>(),
+                std::mem::size_of::<SqlNumericStruct>(),
+            )
+        }
+        .to_vec();
+        let dae_params = vec![param];
+        let collected = vec![(0, bytes, false)];
+
+        let (params, fractional_truncated) = rebuild_deferred_params(
+            &mut state,
+            vec![deferred_slot()],
+            &collected,
+            &dae_params,
+            "test",
+        )
+        .unwrap();
+
+        assert_eq!(params.len(), 1);
+        assert!(fractional_truncated);
+        assert!(state.diag_records.is_empty());
+    }
+
+    #[test]
+    fn rebuild_deferred_params_rejects_missing_binding_and_slot() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let mut state = stmt.inner.lock().unwrap();
+
+        let missing_binding = rebuild_deferred_params(
+            &mut state,
+            vec![deferred_slot()],
+            &[(0, Vec::new(), false)],
+            &[],
+            "test",
         );
+        assert_eq!(missing_binding.unwrap_err(), SQL_ERROR);
+        assert_eq!(
+            state.diag_records.last().unwrap().sql_state,
+            ERR_UNBOUND_PARAMETER.state
+        );
+
+        state.diag_records.clear();
+        let missing_slot = rebuild_deferred_params(
+            &mut state,
+            Vec::new(),
+            &[(0, Vec::new(), false)],
+            &[buffered_decimal_param(0)],
+            "test",
+        );
+        assert_eq!(missing_slot.unwrap_err(), SQL_ERROR);
+        assert_eq!(
+            state.diag_records.last().unwrap().sql_state,
+            ERR_UNBOUND_PARAMETER.state
+        );
+    }
+
+    #[test]
+    fn rebuild_deferred_params_posts_conversion_error() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let mut state = stmt.inner.lock().unwrap();
+
+        let result = rebuild_deferred_params(
+            &mut state,
+            vec![deferred_slot()],
+            &[(0, b"not-a-number".to_vec(), false)],
+            &[buffered_decimal_param(0)],
+            "test",
+        );
+
+        assert_eq!(result.unwrap_err(), SQL_ERROR);
+        assert!(!state.diag_records.is_empty());
     }
 
     /// `SQL_LEN_DATA_AT_EXEC(n)` promises `n` bytes, which the closing
@@ -1141,20 +2422,76 @@ mod tests {
             sql_type: SQL_VARCHAR,
             column_size: 0,
             decimal_digits: 0,
+            app_precision: 0,
+            app_scale: 0,
+            precision_scale_explicit: false,
             parameter_value_ptr: std::ptr::null_mut(),
             buffer_length: 0,
             strlen_or_ind_ptr: &mut ind as *mut SqlLen,
+            octet_length_ptr: &mut ind as *mut SqlLen,
         }));
 
         let dae = unsafe { build_named_params(&mut state, 1, "test") }.unwrap();
-        assert_eq!(
-            dae.dae_params,
-            vec![DaeParam {
-                bound_index: 0,
-                value_ptr: std::ptr::null_mut(),
-                expected_len: Some(7)
-            }]
-        );
+        assert_eq!(dae.dae_params.len(), 1);
+        assert_eq!(dae.dae_params[0].bound_index, 0);
+        assert_eq!(dae.dae_params[0].expected_len, Some(7));
+    }
+
+    /// A streamed parameter is only declared at a narrowed length when the
+    /// bound that length implies is one `SQLPutData` can actually enforce.
+    ///
+    /// The two decisions are made independently, so nothing but this guard stops
+    /// them disagreeing. Where they would, the cost is real: a streamed value
+    /// never reaches the close-time conversion that bounds a buffered one, so a
+    /// narrowed declaration with no bound behind it has the client promise the
+    /// server a length and then stream past it.
+    #[test]
+    fn build_named_params_only_narrows_a_declaration_it_can_enforce() {
+        for (c_type, sql_type, expect_narrowed) in [
+            // Same unit on both sides: measurable, so narrowing is honoured.
+            (SQL_C_CHAR, SQL_VARCHAR, true),
+            // A wideness mismatch is measurable too - the unit is the
+            // declaration's and the count is of the source.
+            (crate::api::odbc_types::SQL_C_WCHAR, SQL_VARCHAR, true),
+            (SQL_C_CHAR, crate::api::odbc_types::SQL_WVARCHAR, true),
+            // Cross-family is not: a binary byte is not a character, so the
+            // declaration stays `max` rather than claiming a bound.
+            (SQL_C_CHAR, crate::api::odbc_types::SQL_VARBINARY, false),
+        ] {
+            let h = TestHandles::with_env_dbc_stmt();
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+
+            let mut ind: SqlLen = SQL_DATA_AT_EXEC;
+            let mut state = stmt.inner.lock().unwrap();
+            state.bound_params.push(Some(BoundParam {
+                input_output_type: SQL_PARAM_INPUT,
+                c_type,
+                sql_type,
+                column_size: 10,
+                decimal_digits: 0,
+                app_precision: 0,
+                app_scale: 0,
+                precision_scale_explicit: false,
+                parameter_value_ptr: std::ptr::null_mut(),
+                buffer_length: 0,
+                strlen_or_ind_ptr: &mut ind as *mut SqlLen,
+                octet_length_ptr: &mut ind as *mut SqlLen,
+            }));
+
+            let dae = unsafe { build_named_params(&mut state, 1, "test") }.unwrap();
+            let bounded = dae.dae_params[0].length_limit.is_some();
+            assert_eq!(
+                bounded, expect_narrowed,
+                "{c_type} -> {sql_type}: the bound decides whether narrowing is honest"
+            );
+            // The declaration is only narrowed when the bound backs it, so the
+            // two travel together rather than being decided apart.
+            let narrowed = format!("{:?}", dae.params[0]).contains("streamed_declaration: Some");
+            assert_eq!(
+                narrowed, expect_narrowed,
+                "{c_type} -> {sql_type}: declaration narrowing must follow the bound"
+            );
+        }
     }
 
     /// Without an indicator pointer there is nothing to carry a
@@ -1173,9 +2510,13 @@ mod tests {
             sql_type: SQL_VARCHAR,
             column_size: 0,
             decimal_digits: 0,
+            app_precision: 0,
+            app_scale: 0,
+            precision_scale_explicit: false,
             parameter_value_ptr: buf.as_mut_ptr() as *mut c_void,
             buffer_length: buf.len() as SqlLen,
             strlen_or_ind_ptr: std::ptr::null_mut(),
+            octet_length_ptr: std::ptr::null_mut(),
         }));
 
         let built = unsafe { build_named_params(&mut state, 1, "test") }.unwrap();
@@ -1201,9 +2542,13 @@ mod tests {
             sql_type: SQL_INTEGER,
             column_size: 0,
             decimal_digits: 0,
+            app_precision: 0,
+            app_scale: 0,
+            precision_scale_explicit: false,
             parameter_value_ptr: &mut value as *mut i32 as *mut c_void,
             buffer_length: 4,
             strlen_or_ind_ptr: &mut ind as *mut SqlLen,
+            octet_length_ptr: &mut ind as *mut SqlLen,
         }));
 
         let ret = unsafe { build_named_params(&mut state, 1, "test") };
@@ -1248,9 +2593,13 @@ mod tests {
             sql_type: SQL_INTEGER,
             column_size: 0,
             decimal_digits: 0,
+            app_precision: 0,
+            app_scale: 0,
+            precision_scale_explicit: false,
             parameter_value_ptr: values.as_mut_ptr() as *mut c_void,
             buffer_length: 4,
             strlen_or_ind_ptr: inds.as_mut_ptr(),
+            octet_length_ptr: inds.as_mut_ptr(),
         }));
 
         // `SQL_C_LONG` is not streamable, so reaching the DAE branch is
@@ -1295,9 +2644,13 @@ mod tests {
             sql_type: SQL_VARCHAR,
             column_size: 0,
             decimal_digits: 0,
+            app_precision: 0,
+            app_scale: 0,
+            precision_scale_explicit: false,
             parameter_value_ptr: value.as_mut_ptr().cast(),
             buffer_length: value.len() as SqlLen,
             strlen_or_ind_ptr: indicator_storage.as_mut_ptr(),
+            octet_length_ptr: indicator_storage.as_mut_ptr(),
         }));
 
         let built = unsafe { build_named_params(&mut state, 1, "test") }
@@ -1327,9 +2680,13 @@ mod tests {
             sql_type: SQL_INTEGER,
             column_size: 0,
             decimal_digits: 0,
+            app_precision: 0,
+            app_scale: 0,
+            precision_scale_explicit: false,
             parameter_value_ptr: values.as_mut_ptr() as *mut c_void,
             buffer_length: 4,
             strlen_or_ind_ptr: inds.as_mut_ptr(),
+            octet_length_ptr: inds.as_mut_ptr(),
         }));
 
         let built = unsafe { build_named_params(&mut state, 1, "test") }
@@ -1337,6 +2694,68 @@ mod tests {
         assert!(
             built.dae_params.is_empty(),
             "nothing should be staged for streaming"
+        );
+    }
+
+    /// State consistency for the AB#47510 guard on the data-at-execution
+    /// unwind. `SQLFreeHandle(SQL_HANDLE_STMT)` unwinds a parked DAE sequence
+    /// before freeing, so a host freeing handles from an `onexit` handler
+    /// reaches it after the loader has terminated the runtime's worker.
+    ///
+    /// This pins what the skip arm still owes: the sequence is unwound, the
+    /// client is handed back, and the connection is released — without which
+    /// the DBC records the freed statement as busy forever. It does **not** pin
+    /// the skip itself, unlike the `drain_and_release` and
+    /// `rollback_before_disconnect` pairs: `cancel_streamed_write` returns `()`
+    /// and has no observable effect on a scripted client, so a skipped cancel
+    /// and an attempted one are indistinguishable here. The skip is covered end
+    /// to end instead, by the `mssql-python` swap job.
+    #[test]
+    fn unwind_dae_leaves_the_connection_usable_while_the_process_is_exiting() {
+        use crate::test_support::TestHandles;
+        use mssql_tds::test_client_support::tds_client_from_tokens;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+
+        // Park a client mid-DAE with no tokens queued behind it: a real cancel
+        // would have nothing to read and would fail rather than quietly pass.
+        // Routed through `park_dae_client` rather than building `DaeState` by
+        // hand, so the setup is the same one the execute path produces.
+        {
+            let mut ds = dbc.inner.lock().unwrap();
+            ds.client = None;
+            ds.active_stmt = Some(h.stmt);
+        }
+        assert_eq!(
+            park_dae_client(
+                stmt,
+                tds_client_from_tokens(Vec::new()),
+                None,
+                None,
+                Vec::new(),
+                false,
+                "test",
+            ),
+            crate::api::odbc_types::SQL_NEED_DATA
+        );
+
+        unwind_dae_inner(dbc, stmt, h.stmt, None, true);
+
+        assert!(
+            !stmt.inner.lock().unwrap().needs_data(),
+            "the parked sequence must still be unwound"
+        );
+        let ds = dbc.inner.lock().unwrap();
+        assert!(
+            ds.client.is_some(),
+            "the client must be handed back even when the cancel is skipped"
+        );
+        assert_eq!(
+            ds.active_stmt, None,
+            "the connection must be released, or it stays busy forever"
         );
     }
 }

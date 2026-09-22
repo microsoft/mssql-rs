@@ -5,6 +5,7 @@
 
 use bytes::{BufMut, BytesMut};
 use std::collections::HashMap;
+use std::time::Duration;
 
 /// SQL data types supported by the mock server
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -19,6 +20,8 @@ pub enum SqlDataType {
     BigInt,
     /// NVarChar - UTF16 string
     NVarChar,
+    /// NVarChar(MAX) with caller-chosen PLP chunk boundaries.
+    NVarCharMax,
 }
 
 impl SqlDataType {
@@ -29,7 +32,7 @@ impl SqlDataType {
             SqlDataType::SmallInt => 0x26, // IntN with length 2
             SqlDataType::Int => 0x26,      // IntN with length 4
             SqlDataType::BigInt => 0x26,   // IntN with length 8
-            SqlDataType::NVarChar => 0xE7, // NVarCharType
+            SqlDataType::NVarChar | SqlDataType::NVarCharMax => 0xE7, // NVarCharType
         }
     }
 
@@ -40,7 +43,7 @@ impl SqlDataType {
             SqlDataType::SmallInt => 2,
             SqlDataType::Int => 4,
             SqlDataType::BigInt => 8,
-            SqlDataType::NVarChar => 255, // Handled specially
+            SqlDataType::NVarChar | SqlDataType::NVarCharMax => 255, // Handled specially
         }
     }
 }
@@ -53,6 +56,8 @@ pub enum ColumnValue {
     Int(i32),
     BigInt(i64),
     NVarChar(String),
+    /// Nonempty wire chunks of raw UTF-16 units, including malformed sequences.
+    NVarCharMax(Vec<Vec<u16>>),
     Null,
 }
 
@@ -65,6 +70,7 @@ impl ColumnValue {
             ColumnValue::Int(_) => SqlDataType::Int,
             ColumnValue::BigInt(_) => SqlDataType::BigInt,
             ColumnValue::NVarChar(_) => SqlDataType::NVarChar,
+            ColumnValue::NVarCharMax(_) => SqlDataType::NVarCharMax,
             ColumnValue::Null => SqlDataType::Int, // Default to Int for NULL
         }
     }
@@ -95,6 +101,18 @@ impl ColumnValue {
                     .collect();
                 buf.put_u16_le(utf16_bytes.len() as u16);
                 buf.put_slice(&utf16_bytes);
+            }
+            ColumnValue::NVarCharMax(chunks) => {
+                let total: u64 = chunks.iter().map(|chunk| chunk.len() as u64 * 2).sum();
+                buf.put_u64_le(total);
+                for chunk in chunks {
+                    assert!(!chunk.is_empty(), "an empty PLP chunk ends the value");
+                    buf.put_u32_le((chunk.len() * 2).try_into().expect("PLP chunk length"));
+                    for unit in chunk {
+                        buf.put_u16_le(*unit);
+                    }
+                }
+                buf.put_u32_le(0);
             }
             ColumnValue::Null => {
                 buf.put_u8(0); // Length 0 means NULL for IntN
@@ -184,6 +202,29 @@ impl LeadingError {
     }
 }
 
+/// A server error that ends the batch immediately, with no result set at all.
+///
+/// Models a statement failing outright before producing a row set — for
+/// example SQL Server error 1222 ("Lock request time out period exceeded") on
+/// a `SELECT` blocked behind another session's lock. Unlike [`LeadingError`],
+/// no ColMetadata/Row/DONE follows: the ERROR token's DONE is itself terminal.
+#[derive(Debug, Clone)]
+pub struct TerminalError {
+    pub number: u32,
+    pub severity: u8,
+    pub message: String,
+}
+
+impl TerminalError {
+    pub fn new(number: u32, severity: u8, message: impl Into<String>) -> Self {
+        Self {
+            number,
+            severity,
+            message: message.into(),
+        }
+    }
+}
+
 /// A complete query response definition
 #[derive(Debug, Clone)]
 pub struct QueryResponse {
@@ -193,6 +234,12 @@ pub struct QueryResponse {
     /// An error emitted (with a DONE MORE token) before the result set, so the
     /// server keeps streaming the row set after a statement-scoped error.
     pub leading_error: Option<LeadingError>,
+    /// An error that ends the batch immediately, in place of `columns`/`rows`.
+    /// Takes precedence over `leading_error` when both are set.
+    pub terminal_error: Option<TerminalError>,
+    /// Artificial delay before the server sends this response, simulating a
+    /// slow-to-resolve statement (e.g. blocked on a server-side lock).
+    pub delay: Option<Duration>,
 }
 
 impl QueryResponse {
@@ -203,6 +250,8 @@ impl QueryResponse {
             rows,
             info_tokens: Vec::new(),
             leading_error: None,
+            terminal_error: None,
+            delay: None,
         }
     }
 
@@ -218,6 +267,26 @@ impl QueryResponse {
         self
     }
 
+    /// Replaces any result set with a single error that ends the batch, e.g.
+    /// to model a blocked statement that fails with SQL Server error 1222.
+    pub fn error_only(error: TerminalError) -> Self {
+        Self {
+            columns: Vec::new(),
+            rows: Vec::new(),
+            info_tokens: Vec::new(),
+            leading_error: None,
+            terminal_error: Some(error),
+            delay: None,
+        }
+    }
+
+    /// Delays the server's response by `duration`, simulating a statement
+    /// that blocks (e.g. on a row lock) before the server can answer it.
+    pub fn with_delay(mut self, duration: Duration) -> Self {
+        self.delay = Some(duration);
+        self
+    }
+
     /// Helper to create a response for SELECT 1
     pub fn select_one() -> Self {
         Self {
@@ -225,6 +294,8 @@ impl QueryResponse {
             rows: vec![Row::new(vec![ColumnValue::Int(1)])],
             info_tokens: Vec::new(),
             leading_error: None,
+            terminal_error: None,
+            delay: None,
         }
     }
 
@@ -243,9 +314,33 @@ impl QueryResponse {
             ])],
             info_tokens: Vec::new(),
             leading_error: None,
+            terminal_error: None,
+            delay: None,
         }
     }
 }
+
+/// Reserved [`QueryRegistry`] key that delays the mock server's answer to a
+/// TDS Transaction Manager `Begin` request (the implicit transaction begin an
+/// autocommit-off connection issues before its first statement). Not a SQL
+/// query, so it can never collide with a real registration; only its
+/// [`QueryResponse::delay`] is consulted — its result-set/error fields are
+/// ignored, since `Begin` always acknowledges with an `EnvChange` + `DONE`.
+pub const TM_BEGIN_DELAY_KEY: &str = "__MOCK_TDS_TM_BEGIN_DELAY__";
+
+/// Reserved [`QueryRegistry`] key that delays the mock server's answer to an
+/// RPC request that matched no specific registration.
+///
+/// RPC responses are otherwise matched by finding the registered (upper-cased)
+/// query text inside the request body, which works for `sp_prepexec`-style
+/// calls that carry caller-controlled SQL. It cannot address a call whose
+/// wire text the test does not choose — a catalog procedure, `sp_datatype_info`
+/// or `sp_describe_undeclared_parameters` — because the driver sends those
+/// proc names in lower case. This key delays those instead, so a test can
+/// prove `SQL_ATTR_QUERY_TIMEOUT` bounds the RPC itself rather than only the
+/// steps around it. Like [`TM_BEGIN_DELAY_KEY`], only its
+/// [`QueryResponse::delay`] is consulted.
+pub const RPC_DELAY_KEY: &str = "__MOCK_TDS_RPC_DELAY__";
 
 /// Registry of query responses
 pub struct QueryRegistry {
@@ -278,6 +373,31 @@ impl QueryRegistry {
     /// Get a response for a query
     pub fn get(&self, query: &str) -> Option<&QueryResponse> {
         self.responses.get(&query.to_uppercase())
+    }
+
+    /// Finds a registered response whose query text appears — encoded as
+    /// UTF-16LE, matching the wire encoding of an RPC string parameter —
+    /// anywhere inside `haystack`.
+    ///
+    /// Used to match `sp_prepexec` / `sp_execute` RPC requests (whose `@stmt`
+    /// / declared SQL text carries the query verbatim) without needing a full
+    /// RPC parameter parser: the mock server only needs to recognize a
+    /// specific, test-registered statement, not decode arbitrary parameters.
+    ///
+    /// The comparison is byte-exact against the *uppercased* registered
+    /// query (matching `register`'s case-insensitive key), so callers using
+    /// this path must register and send the same-case (conventionally
+    /// upper-case) SQL text — unlike [`get`](Self::get), which decodes and
+    /// uppercases the incoming text before comparing.
+    pub fn get_by_contained_utf16_text(&self, haystack: &[u8]) -> Option<&QueryResponse> {
+        self.responses.iter().find_map(|(query, response)| {
+            let needle: Vec<u8> = query
+                .encode_utf16()
+                .flat_map(|unit| unit.to_le_bytes())
+                .collect();
+            (!needle.is_empty() && haystack.windows(needle.len()).any(|w| w == needle))
+                .then_some(response)
+        })
     }
 }
 

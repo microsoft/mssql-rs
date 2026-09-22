@@ -272,7 +272,7 @@ full multi-distro ARM test matrices still run on merge.
 |-----------------------------------|----------------|---------------------------------------------|
 | `Build_Linux_ARM` integration pass | PR             | Build stage, vs `Sql_Host_build_arm`        |
 | `Test_arm64`                      | non-PR (merge) | full glibc matrix (7 distros)               |
-| `Test_alpine_arm64`               | non-PR (merge) | full musl matrix (Alpine 3.18–3.21)         |
+| `Test_alpine_arm64`               | non-PR (merge) | musl matrix (Alpine 3.18, 3.21)             |
 
 `Sql_Host_build_arm` is a PR-only instance of `sql-host-template.yml` added to
 the Build stage (`jobCondition: and(not(canceled()), eq(Build.Reason,

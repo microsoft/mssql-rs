@@ -77,9 +77,10 @@ stages:
       displayName: Check duplicate PR head commit
       env:
         SYSTEM_ACCESSTOKEN: $(System.AccessToken)
-
 - stage: Build
   displayName: Build Stage
+  variables:
+    miriToolchain: nightly-2026-09-06
   dependsOn:
     - EvaluateDuplicate
   condition: >-
@@ -125,12 +126,39 @@ stages:
       - template: install-dependencies.yml
         parameters:
           osType: Windows
+      # Packaging and artifact gates must be tested even when PR runs skip them.
+      - pwsh: |
+          python -m pip install --quiet pytest pyyaml
+          python -m pytest scripts/test_inject_odbc.py scripts/test_verify_python_wheels.py scripts/test_release_pipeline.py scripts/test_validation_pipeline.py scripts/test_repair_glibc_wheels.py scripts/test_bump_released_crate_versions.py scripts/test_python_wheel_install.py -q
+        displayName: 'Unit test packaging scripts and pipeline configuration'
       - template: build-template.yml
         parameters:
           osType: Windows
           buildType: ${{ parameters.buildType }}
           testFilter: -E "not (test(connectivity))"
           enableOdbcE2E: true
+      - pwsh: |
+          $ErrorActionPreference = 'Stop'
+          rustup toolchain install $(miriToolchain) --profile minimal --component miri,rust-src
+          if ($LASTEXITCODE -ne 0) { throw "Miri toolchain installation failed (exit $LASTEXITCODE)" }
+          cargo +$(miriToolchain) miri setup --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { throw "Miri sysroot setup failed (exit $LASTEXITCODE)" }
+          cargo +$(miriToolchain) miri nextest run --frozen --package mssqlodbc --lib `
+            --target x86_64-pc-windows-msvc --profile miri-odbc --no-fail-fast --no-tests=fail
+          if ($LASTEXITCODE -ne 0) { throw "ODBC Miri tests failed (exit $LASTEXITCODE)" }
+        displayName: Run ODBC Miri tests (Windows x64)
+        condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
+        env:
+          MIRIFLAGS: -Zmiri-seed=0
+      - task: PublishTestResults@2
+        displayName: Publish ODBC Miri test results (Windows x64)
+        condition: and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'))
+        inputs:
+          testResultsFormat: JUnit
+          testResultsFiles: $(Build.SourcesDirectory)/target/nextest/miri-odbc/junit.xml
+          testRunTitle: ODBC Miri (Windows x64)
+          failTaskOnFailedTests: true
+          failTaskOnMissingResultsFile: true
       # Extended Protection (EPA) channel-binding test.
       # Runs AFTER the main test pass. Runs the same integrated-auth encrypted
       # login test under two server configurations, expecting success in both:
@@ -251,6 +279,10 @@ stages:
       - template: cargo-authenticate-template.yml
         parameters:
           osType: Linux
+      - bash: |
+          set -euo pipefail
+          python3 -m unittest discover -s .pipeline/scripts -p 'test_*.py' -v
+        displayName: Test pipeline helper scripts
       - template: build-template-container.yml
         parameters:
           architecture: x64
@@ -261,6 +293,37 @@ stages:
           additionalPythonTestArgs: '--coverage'
           collectPythonCoverage: true
           collectRustCoverage: true
+      - bash: |
+          set -euo pipefail
+          bash .pipeline/scripts/docker-cargo-run.sh --rm \
+            -v "$PWD:/workspace" \
+            -v "$HOME/.cargo/registry:/root/.cargo/registry" \
+            -v "$HOME/.cargo/git:/root/.cargo/git" \
+            -e MIRIFLAGS=-Zmiri-seed=0 \
+            -w /workspace \
+            ghcr.io/microsoft/mssql-rs/build/ubuntu:22.04 \
+            bash -lc '
+              set -euo pipefail
+              source "$HOME/.cargo/env"
+              rustup toolchain install $(miriToolchain) --profile minimal --component miri,rust-src
+              cargo +$(miriToolchain) miri setup --target x86_64-unknown-linux-gnu
+              cargo +$(miriToolchain) miri nextest run --frozen --package mssqlodbc --lib \
+                --target x86_64-unknown-linux-gnu --profile miri-odbc --no-fail-fast --no-tests=fail
+            '
+        displayName: Run ODBC Miri tests (Linux x64)
+        condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
+        env:
+          CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN)
+          CARGO_REGISTRIES_MSSQL_RS_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_TOKEN)
+      - task: PublishTestResults@2
+        displayName: Publish ODBC Miri test results (Linux x64)
+        condition: and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'))
+        inputs:
+          testResultsFormat: JUnit
+          testResultsFiles: $(Build.SourcesDirectory)/target/nextest/miri-odbc/junit.xml
+          testRunTitle: ODBC Miri (Linux x64)
+          failTaskOnFailedTests: true
+          failTaskOnMissingResultsFile: true
       - template: build-template-alpine.yml
         parameters:
           osType: Linux
@@ -375,6 +438,17 @@ stages:
 
   - job: Test_MacOS
     displayName: Test MacOS
+    # No explicit timeout here used to mean the ADO default of 60m, which this
+    # job can now genuinely exceed: nested virtualization (Colima's Linux VM
+    # under the macOS runner) makes Docker/SQL Server startup 2-3x more
+    # variable than on Linux or Windows, and it's the only test job running
+    # the full mssql-tds + mssqlodbc coverage-instrumented suite on that
+    # runner class. A run that is otherwise healthy (every test still passing,
+    # nothing hung) was seen canceled by the 60m ceiling rather than by a
+    # failure. Budgeted for headroom over the worst observed case, not to mask
+    # a real hang — a genuinely wedged step still fails via its own tighter,
+    # dedicated timeout long before this outer one would matter.
+    timeoutInMinutes: 90
     pool:
       name: Azure Pipelines
       vmImage: macOS-latest
@@ -412,6 +486,36 @@ stages:
           buildType: ${{ parameters.buildType }}
           testFilter: -E 'not (test(connectivity))'
           enableClippy: false
+      - script: |
+          set -euo pipefail
+          if ! command -v cmake >/dev/null 2>&1; then
+            brew install cmake
+          fi
+          brew install unixodbc
+        displayName: 'Install ODBC C++ e2e dependencies (macOS)'
+        condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
+      - script: |
+          set -euo pipefail
+          CMAKE_PREFIX_PATH="$(brew --prefix unixodbc)${CMAKE_PREFIX_PATH:+:$CMAKE_PREFIX_PATH}"
+          export CMAKE_PREFIX_PATH
+          bash mssql-odbc/tests/e2e/run_e2e.sh --retries=3
+        displayName: 'Run ODBC C++ e2e tests (macOS)'
+        condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
+        env:
+          ODBC_TEST_SERVER: '127.0.0.1,1433'
+          ODBC_TEST_UID: 'sa'
+          ODBC_TEST_PWD: $(SQL_PASSWORD)
+          ODBC_TEST_TRUST_CERT: 'Yes'
+          RUST_BACKTRACE: full
+      - task: PublishTestResults@2
+        displayName: 'Publish ODBC e2e test results (macOS)'
+        condition: and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'))
+        inputs:
+          testResultsFormat: JUnit
+          testResultsFiles: $(Build.SourcesDirectory)/mssql-odbc/tests/e2e/build/junit-mssql-odbc.xml
+          testRunTitle: $(System.PhaseName)-OdbcE2E
+          failTaskOnFailedTests: true
+          failTaskOnMissingResultsFile: true
       - script: |
           set +e
           echo "=== Colima status ==="
@@ -462,8 +566,6 @@ stages:
           - ubuntu22
           - ubuntu24
           - alpine318
-          - alpine319
-          - alpine320
           - alpine321
           - debian
           - rhel9
@@ -567,14 +669,8 @@ stages:
           fuzzDurationSeconds: 300
           fuzzTarget: fuzz_bulk_copy
 
-- stage: Build_mssql_python
-  dependsOn:
-    - EvaluateDuplicate
-  condition: and(not(canceled()), eq(variables['Build.Reason'], 'PullRequest'), eq('${{ parameters.RunFuzz }}', 'false'), eq('${{ parameters.RunLongHaul }}', 'false'), ne(dependencies.EvaluateDuplicate.outputs['Evaluate.SetDuplicateState.skipDuplicate'], 'true'))
-  displayName: Build mssql-python
-  jobs:
-  - job: Build_mssql_python_Linux
-    displayName: Build mssql-python (cross-repo)
+  - job: Fuzz_Odbc_Ffi_Linux
+    displayName: Fuzz Test ODBC FFI Execute Linux (30 min)
     pool:
       name: ${{ parameters.poolName }}
       demands:
@@ -582,8 +678,85 @@ stages:
     variables:
       CARGO_TARGET_DIR: $(Build.SourcesDirectory)
     steps:
-      - template: test-mssql-python-template.yml
+      - template: cargo-authenticate-template.yml
+        parameters:
+          osType: Linux
+      - template: install-dependencies.yml
+        parameters:
+          osType: Linux
+          enableJsDeps: false
+      - template: fuzz-template.yml
+        parameters:
+          osType: Linux
+          fuzzDurationSeconds: 1800
+          fuzzTarget: fuzz_ffi_execute
+          fuzzDir: mssql-odbc/fuzz
 
+  - job: Fuzz_Odbc_Additional_Targets_Linux
+    displayName: Fuzz ODBC Additional Targets Linux (Serial - 5 min each)
+    pool:
+      name: ${{ parameters.poolName }}
+      demands:
+        - imageOverride -equals RUST-UBUSLIM
+    variables:
+      CARGO_TARGET_DIR: $(Build.SourcesDirectory)
+    steps:
+      - template: cargo-authenticate-template.yml
+        parameters:
+          osType: Linux
+      - template: install-dependencies.yml
+        parameters:
+          osType: Linux
+          enableJsDeps: false
+      - template: fuzz-template.yml
+        parameters:
+          osType: Linux
+          fuzzDurationSeconds: 300
+          fuzzTarget: fuzz_connection_string
+          fuzzDir: mssql-odbc/fuzz
+      - template: fuzz-template.yml
+        parameters:
+          osType: Linux
+          fuzzDurationSeconds: 300
+          fuzzTarget: fuzz_numeric_parse
+          fuzzDir: mssql-odbc/fuzz
+      - template: fuzz-template.yml
+        parameters:
+          osType: Linux
+          fuzzDurationSeconds: 300
+          fuzzTarget: fuzz_datetime_parse
+          fuzzDir: mssql-odbc/fuzz
+      - template: fuzz-template.yml
+        parameters:
+          osType: Linux
+          fuzzDurationSeconds: 300
+          fuzzTarget: fuzz_read_utf16
+          fuzzDir: mssql-odbc/fuzz
+      - template: fuzz-template.yml
+        parameters:
+          osType: Linux
+          fuzzDurationSeconds: 300
+          fuzzTarget: fuzz_transcode
+          fuzzDir: mssql-odbc/fuzz
+      - template: fuzz-template.yml
+        parameters:
+          osType: Linux
+          fuzzDurationSeconds: 300
+          fuzzTarget: fuzz_fetch_convert
+          fuzzDir: mssql-odbc/fuzz
+      - template: fuzz-template.yml
+        parameters:
+          osType: Linux
+          fuzzDurationSeconds: 300
+          fuzzTarget: fuzz_bound_param
+          fuzzDir: mssql-odbc/fuzz
+
+- stage: Build_mssql_python
+  dependsOn:
+    - EvaluateDuplicate
+  condition: and(not(canceled()), eq(variables['Build.Reason'], 'PullRequest'), eq('${{ parameters.RunFuzz }}', 'false'), eq('${{ parameters.RunLongHaul }}', 'false'), ne(dependencies.EvaluateDuplicate.outputs['Evaluate.SetDuplicateState.skipDuplicate'], 'true'))
+  displayName: Build mssql-python
+  jobs:
   - job: Build_mssql_python_MacOS
     displayName: Build mssql-python macOS (cross-repo)
     pool:
@@ -595,9 +768,9 @@ stages:
       - template: test-mssql-python-macos-template.yml
 
   # Same upstream suite, but with mssql-python's bundled msodbcsql18 binary
-  # replaced by the Rust mssql-odbc driver. Failures and crashes are expected
-  # while the driver is in development, so the job is informational: only a
-  # broken harness fails it, and each test file runs in its own bounded process.
+  # replaced by the Rust mssql-odbc driver. Test failures, crashes, and harness
+  # failures fail the job; each test file runs in its own bounded process so the
+  # remaining results can still be published for diagnosis.
   #
   # Deliberately always-on rather than behind an opt-in parameter like RunFuzz /
   # RunLongHaul: the point is a continuous compatibility signal for a driver
@@ -637,12 +810,6 @@ stages:
           Alpine3_18:
             container: ghcr.io/microsoft/mssql-rs/import/alpine:3.18
             entry: alpine.sh
-          Alpine3_19:
-            container: ghcr.io/microsoft/mssql-rs/import/alpine:3.19
-            entry: alpine.sh
-          Alpine3_20:
-            container: ghcr.io/microsoft/mssql-rs/import/alpine:3.20
-            entry: alpine.sh
           Alpine3_21:
             container: ghcr.io/microsoft/mssql-rs/import/alpine:3.21
             entry: alpine.sh
@@ -657,12 +824,6 @@ stages:
         matrix:
           Alpine3_18:
             container: ghcr.io/microsoft/mssql-rs/import/alpine:3.18
-            entry: odbc-e2e-alpine.sh
-          Alpine3_19:
-            container: ghcr.io/microsoft/mssql-rs/import/alpine:3.19
-            entry: odbc-e2e-alpine.sh
-          Alpine3_20:
-            container: ghcr.io/microsoft/mssql-rs/import/alpine:3.20
             entry: odbc-e2e-alpine.sh
           Alpine3_21:
             container: ghcr.io/microsoft/mssql-rs/import/alpine:3.21
@@ -685,7 +846,7 @@ stages:
           poolName: ${{ parameters.poolName }}
           instanceId: shared_musl
           sqlImageTag: ${{ parameters.sqlImageTag }}
-          expectedSentinels: 'Alpine3_18,Alpine3_19,Alpine3_20,Alpine3_21,odbc_Alpine3_18,odbc_Alpine3_19,odbc_Alpine3_20,odbc_Alpine3_21'
+          expectedSentinels: 'Alpine3_18,Alpine3_21,odbc_Alpine3_18,odbc_Alpine3_21'
       - template: test-matrix-template-alpine_arm64.yml
         parameters:
           manageSqlHost: false
@@ -697,12 +858,6 @@ stages:
           targets:
             - name: Alpine3_18
               container: ghcr.io/microsoft/mssql-rs/import/alpine:3.18
-              entry: alpine.sh
-            - name: Alpine3_19
-              container: ghcr.io/microsoft/mssql-rs/import/alpine:3.19
-              entry: alpine.sh
-            - name: Alpine3_20
-              container: ghcr.io/microsoft/mssql-rs/import/alpine:3.20
               entry: alpine.sh
             - name: Alpine3_21
               container: ghcr.io/microsoft/mssql-rs/import/alpine:3.21
@@ -719,12 +874,6 @@ stages:
           targets:
             - name: Alpine3_18
               container: ghcr.io/microsoft/mssql-rs/import/alpine:3.18
-              entry: odbc-e2e-alpine.sh
-            - name: Alpine3_19
-              container: ghcr.io/microsoft/mssql-rs/import/alpine:3.19
-              entry: odbc-e2e-alpine.sh
-            - name: Alpine3_20
-              container: ghcr.io/microsoft/mssql-rs/import/alpine:3.20
               entry: odbc-e2e-alpine.sh
             - name: Alpine3_21
               container: ghcr.io/microsoft/mssql-rs/import/alpine:3.21
@@ -743,12 +892,6 @@ stages:
             - name: Alpine3_18
               container: ghcr.io/microsoft/mssql-rs/import/alpine:3.18
               entry: alpine.sh
-            - name: Alpine3_19
-              container: ghcr.io/microsoft/mssql-rs/import/alpine:3.19
-              entry: alpine.sh
-            - name: Alpine3_20
-              container: ghcr.io/microsoft/mssql-rs/import/alpine:3.20
-              entry: alpine.sh
             - name: Alpine3_21
               container: ghcr.io/microsoft/mssql-rs/import/alpine:3.21
               entry: alpine.sh
@@ -762,12 +905,6 @@ stages:
           targets:
             - name: Alpine3_18
               container: ghcr.io/microsoft/mssql-rs/import/alpine:3.18
-              entry: odbc-e2e-alpine.sh
-            - name: Alpine3_19
-              container: ghcr.io/microsoft/mssql-rs/import/alpine:3.19
-              entry: odbc-e2e-alpine.sh
-            - name: Alpine3_20
-              container: ghcr.io/microsoft/mssql-rs/import/alpine:3.20
               entry: odbc-e2e-alpine.sh
             - name: Alpine3_21
               container: ghcr.io/microsoft/mssql-rs/import/alpine:3.21

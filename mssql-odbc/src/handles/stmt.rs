@@ -10,17 +10,22 @@ use tracing::error;
 use mssql_tds::connection::tds_client::{PreparedStatement, StatementId, TdsClient};
 use mssql_tds::error::{Error as TdsError, SqlInfoMessage};
 
-use super::desc::{DescHandle, DescKind};
+use super::desc::{DescHandle, DescKind, DescRecord, DescState};
 use super::{DbcHandle, HandleType, HasObjectType, free_handle, handle_to_raw};
 use crate::api::odbc_types::{
     self, SQL_DESC_ALLOC_AUTO, SqlInteger, SqlLen, SqlPointer, SqlSmallInt, SqlULen, SqlUSmallInt,
 };
+use crate::api::set_desc_field::datetime_interval_code_for;
+use crate::conversion::param_convert::{DaeLengthLimit, DaePlan, DaeTranscode};
 use crate::error::{DiagRecord, HasDiagnostics};
 use crate::params::BoundParam;
 use mssql_tds::datatypes::column_values::ColumnValues;
+use mssql_tds::datatypes::sql_string::{ResolvedDecoder, ResolvedEncoding};
 use mssql_tds::datatypes::sqldatatypes::TdsDataType;
-use mssql_tds::encoding_rs::Decoder;
+use mssql_tds::message::parameters::rpc_parameters::RpcParameter;
 use mssql_tds::query::metadata::{ColumnMetadata, PlpEncoding};
+use mssql_tds::query::result::ReturnValue;
+use mssql_tds::token::tokens::SqlCollation;
 
 /// State for a PLP column being streamed across repeated SQLGetData calls.
 pub(crate) struct ActivePlpStream {
@@ -35,16 +40,31 @@ pub(crate) struct ActivePlpStream {
     /// High surrogate whose low half lands in the next chunk. Held back so the
     /// pair is transcoded together instead of each half becoming U+FFFD.
     pub(crate) pending_high_surrogate: Option<u16>,
-    /// Incremental decoder for the narrow-text -> `SQL_C_WCHAR` widening path
-    /// (`varchar(max)`/`json` delivered as UTF-16LE). `None` for every other
-    /// combination.
+    /// Transcoded UTF-8 that did not fit in the caller's `SQL_C_CHAR` buffer,
+    /// held until later calls deliver it. Output can exceed the buffer because a
+    /// UTF-16 surrogate pair becomes a 4-byte UTF-8 character, so a chunk is
+    /// transcoded whole and only the bytes that fit are copied out.
+    pub(crate) pending_utf8: Vec<u8>,
+    /// Narrow wire encoding resolved from the column's collation (or UTF-8 for
+    /// `json`, which carries none), or `None` when the column is not narrow
+    /// text. This is a property of the *column*, so a target type that arrives
+    /// only on a continuation call still finds it — unlike a decoder built from
+    /// the first call's target, which would leave a `SQL_C_BINARY`-first stream
+    /// unable to convert later.
+    pub(crate) narrow_encoding: Option<ResolvedEncoding>,
+    /// Incremental decoder over `narrow_encoding`, built by
+    /// [`Self::ensure_narrow_decoder`] the first time a target actually needs to
+    /// convert. Serves both directions: to UTF-16LE for `SQL_C_WCHAR`
+    /// (`varchar(max)`/`json`) and to UTF-8 for `SQL_C_CHAR` under a non-UTF-8
+    /// collation (AB#47566). One decoder for both, so a target switch mid-stream
+    /// reuses a carry that is still meaningful.
     ///
     /// A decoder rather than a byte carry because the column's codepage can be
     /// multi-byte (`lcid_to_encoding` reaches SHIFT_JIS, GBK, BIG5, EUC-KR and
     /// UTF-8), so a chunk boundary can split one character across two reads.
     /// `encoding_rs::Decoder` already holds that partial sequence internally,
     /// which keeps the boundary rule in one place instead of one per codepage.
-    pub(crate) narrow_to_wide: Option<Decoder>,
+    pub(crate) narrow_decoder: Option<ResolvedDecoder>,
     /// Code units already decoded on a previous call that did not fit the
     /// caller's buffer, delivered before any further wire bytes.
     ///
@@ -54,6 +74,27 @@ pub(crate) struct ActivePlpStream {
     /// having consumed nothing). Holding the surplus here lets a caller ask for
     /// one character at a time without stalling the stream.
     pub(crate) pending_units: Vec<u16>,
+    /// Wire bytes read ahead while the first async read for this value was
+    /// already in flight. Later SQLGetData calls consume these without entering
+    /// the runtime again.
+    prefetched_wire: Vec<u8>,
+    prefetched_offset: usize,
+    prefetched_total_read_before: usize,
+    prefetched_known_total: Option<u64>,
+    prefetched_reached_end: bool,
+    prefetch_error: Option<Box<TdsError>>,
+}
+
+/// Materialized values from a single-row fetch that remain available to
+/// subsequent `SQLGetData` calls.
+#[derive(Debug)]
+pub(crate) struct BufferedGetDataRow {
+    pub(crate) values: Vec<Option<ColumnValues>>,
+    pub(crate) variant_bases: Vec<Option<TdsDataType>>,
+    /// Number of leading value slots already discarded or delivered.
+    pub(crate) consumed: usize,
+    /// The TDS cursor still owns deferred columns after the captured prefix.
+    pub(crate) wire_deferred: bool,
 }
 
 impl ActivePlpStream {
@@ -63,16 +104,113 @@ impl ActivePlpStream {
     pub(crate) fn new(
         column: usize,
         encoding: PlpEncoding,
-        narrow_to_wide: Option<Decoder>,
+        narrow_encoding: Option<ResolvedEncoding>,
     ) -> Self {
         Self {
             column,
             encoding,
             pending_byte: None,
             pending_high_surrogate: None,
-            narrow_to_wide,
+            pending_utf8: Vec::new(),
+            narrow_encoding,
+            narrow_decoder: None,
             pending_units: Vec::new(),
+            prefetched_wire: Vec::new(),
+            prefetched_offset: 0,
+            prefetched_total_read_before: 0,
+            prefetched_known_total: None,
+            prefetched_reached_end: false,
+            prefetch_error: None,
         }
+    }
+
+    /// Builds the narrow decoder if this column has an encoding and no decoder
+    /// yet, so a caller can then take it by field alongside the carry buffers.
+    ///
+    /// Deferred to first use rather than built in `new` because the first
+    /// `SQLGetData` on a column may ask for `SQL_C_BINARY`, which needs no
+    /// decoder; a later call on the same stream may still ask for `SQL_C_CHAR`,
+    /// which does.
+    pub(crate) fn ensure_narrow_decoder(&mut self) {
+        if self.narrow_decoder.is_none()
+            && let Some(encoding) = self.narrow_encoding
+        {
+            self.narrow_decoder = Some(encoding.new_decoder_without_bom_handling());
+        }
+    }
+
+    /// Stores a PLP read-ahead result for delivery by later application calls.
+    ///
+    /// Only the first `read` bytes of `bytes` are retained.
+    pub(crate) fn set_prefetched_wire(
+        &mut self,
+        mut bytes: Vec<u8>,
+        read: usize,
+        total_read_before: usize,
+        known_total: Option<u64>,
+        reached_end: bool,
+    ) {
+        bytes.truncate(read);
+        self.prefetched_wire = bytes;
+        self.prefetched_offset = 0;
+        self.prefetched_total_read_before = total_read_before;
+        self.prefetched_known_total = known_total;
+        self.prefetched_reached_end = reached_end;
+    }
+
+    /// Copies the next prefetched PLP bytes into `out`.
+    ///
+    /// Returns `(bytes_read, reached_end, known_total, total_read)`, where
+    /// `total_read` includes all wire payload consumed through this copy.
+    pub(crate) fn read_prefetched_wire(
+        &mut self,
+        out: &mut [u8],
+    ) -> Option<(usize, bool, Option<u64>, usize)> {
+        let remaining = self
+            .prefetched_wire
+            .len()
+            .saturating_sub(self.prefetched_offset);
+        if remaining == 0 {
+            return None;
+        }
+
+        let read = remaining.min(out.len());
+        let end = self.prefetched_offset.saturating_add(read);
+        let source = self.prefetched_wire.get(self.prefetched_offset..end)?;
+        let target = out.get_mut(..read)?;
+        target.copy_from_slice(source);
+        self.prefetched_offset = end;
+
+        let reached_end =
+            self.prefetched_reached_end && self.prefetched_offset == self.prefetched_wire.len();
+        Some((
+            read,
+            reached_end,
+            self.prefetched_known_total,
+            self.prefetched_total_read_before
+                .saturating_add(self.prefetched_offset),
+        ))
+    }
+
+    /// Clears the prefetch bookkeeping and returns its allocation for reuse.
+    pub(crate) fn take_prefetch_buffer(&mut self) -> Vec<u8> {
+        self.prefetched_offset = 0;
+        self.prefetched_total_read_before = 0;
+        self.prefetched_known_total = None;
+        self.prefetched_reached_end = false;
+        let mut buffer = std::mem::take(&mut self.prefetched_wire);
+        buffer.clear();
+        buffer
+    }
+
+    /// Defers a read-ahead failure until the application's next PLP read.
+    pub(crate) fn set_prefetch_error(&mut self, error: TdsError) {
+        self.prefetch_error = Some(Box::new(error));
+    }
+
+    /// Takes the deferred read-ahead failure for one-time delivery.
+    pub(crate) fn take_prefetch_error(&mut self) -> Option<TdsError> {
+        self.prefetch_error.take().map(|error| *error)
     }
 }
 
@@ -84,8 +222,17 @@ impl std::fmt::Debug for ActivePlpStream {
             .field("encoding", &self.encoding)
             .field("pending_byte", &self.pending_byte)
             .field("pending_high_surrogate", &self.pending_high_surrogate)
-            .field("narrow_to_wide", &self.narrow_to_wide.is_some())
+            .field("pending_utf8", &self.pending_utf8.len())
+            .field("narrow_decoder", &self.narrow_decoder.is_some())
             .field("pending_units", &self.pending_units.len())
+            .field(
+                "prefetched_wire_remaining",
+                &self
+                    .prefetched_wire
+                    .len()
+                    .saturating_sub(self.prefetched_offset),
+            )
+            .field("prefetch_error", &self.prefetch_error.is_some())
             .finish()
     }
 }
@@ -106,9 +253,78 @@ pub(crate) struct ColumnBinding {
     pub(crate) target_value_ptr: SqlPointer,
     /// Capacity of one element of `target_value_ptr`, in bytes.
     pub(crate) buffer_length: SqlLen,
-    /// Receives the length/indicator for each row, or null if the application
-    /// does not want one.
+    /// Receives the NULL indicator for each row, or null if the application
+    /// does not want one. Independent of `octet_length_ptr` per the ODBC
+    /// "Deferred Fields" spec, though `SQLBindCol` writes the same pointer to
+    /// both — see [`Self::write_to_record`].
     pub(crate) strlen_or_ind_ptr: *mut SqlLen,
+    /// Receives the returned data's length for each row, or null if the
+    /// application does not want length information for this column
+    /// (`SQL_DESC_OCTET_LENGTH_PTR`).
+    pub(crate) octet_length_ptr: *mut SqlLen,
+}
+
+impl ColumnBinding {
+    /// Writes this binding's fields into `record`, the ARD shape `SQLBindCol`
+    /// leaves behind (AB#47437: the ARD is the storage `SQLBindCol` and
+    /// `SQLSetDescFieldW` share, not a separate copy). `SQL_DESC_INDICATOR_PTR`
+    /// and `SQL_DESC_OCTET_LENGTH_PTR` both receive the same pointer here —
+    /// `SQLBindCol`'s one `StrLen_or_Ind` argument feeds both descriptor
+    /// fields at once — but they stay two independent fields on the record,
+    /// since `SQLSetDescFieldW`/`SQLSetDescRec` can set them to different
+    /// buffers.
+    ///
+    /// Does not reset `SQL_DESC_LENGTH`/`PRECISION`/`SCALE`; msodbcsql's
+    /// `SetADRec` resets them to `SetTypeDefaults`'s C-type-keyed defaults on
+    /// every `SQLBindCol` call — tracked as a known, narrow
+    /// (metadata-introspection-only) gap in
+    /// [#470](https://github.com/microsoft/mssql-rs/issues/470).
+    pub(crate) fn write_to_record(&self, record: &mut DescRecord) {
+        record.concise_type = self.target_type;
+        record.datetime_interval_code = datetime_interval_code_for(self.target_type);
+        record.data_ptr = self.target_value_ptr;
+        record.octet_length = self.buffer_length;
+        record.indicator_ptr = self.strlen_or_ind_ptr as SqlPointer;
+        record.octet_length_ptr = self.octet_length_ptr as SqlPointer;
+    }
+
+    /// Reconstructs the binding an ARD record represents, or `None` when
+    /// `SQL_DESC_DATA_PTR` is null — this driver's convention (mirroring
+    /// `SQLBindCol`'s own null-pointer-unbinds rule) for "no binding here",
+    /// whether the record was never touched, was explicitly unbound, or was
+    /// grown by a `SQL_DESC_COUNT` write that never supplied a data pointer.
+    pub(crate) fn from_record(column_number: SqlUSmallInt, record: &DescRecord) -> Option<Self> {
+        if record.data_ptr.is_null() {
+            return None;
+        }
+        Some(Self {
+            column_number,
+            target_type: record.concise_type,
+            target_value_ptr: record.data_ptr,
+            buffer_length: record.octet_length,
+            strlen_or_ind_ptr: record.indicator_ptr as *mut SqlLen,
+            octet_length_ptr: record.octet_length_ptr as *mut SqlLen,
+        })
+    }
+
+    /// Every currently-bound column in `ard_state`'s records, in column-number
+    /// order — the fetch loop's input, derived fresh from the ARD each fetch
+    /// rather than cached, so a descriptor-field bind and a `SQLBindCol` bind
+    /// are indistinguishable to it.
+    pub(crate) fn all_from_ard_state(ard_state: &DescState) -> Vec<Self> {
+        let mut bindings = Vec::with_capacity(ard_state.records.len());
+        bindings.extend(
+            ard_state
+                .records
+                .iter()
+                .enumerate()
+                .filter_map(|(i, record)| {
+                    let column_number = SqlUSmallInt::try_from(i + 1).ok()?;
+                    Self::from_record(column_number, record)
+                }),
+        );
+        bindings
+    }
 }
 
 pub(crate) const STMT_STATE_EXEC_STARTED: u32 = 0x0000_0100;
@@ -156,6 +372,11 @@ pub(crate) struct StmtState {
     pub(crate) diag_records: Vec<DiagRecord>,
     /// Column metadata from the most recent execution.
     pub(crate) column_metadata: Vec<ColumnMetadata>,
+    /// UTF-16 column names built once when result metadata changes.
+    pub(crate) column_names_utf16: Vec<Vec<u16>>,
+    /// Reused by bounded PLP read-ahead so each MAX value does not allocate a
+    /// fresh carry buffer.
+    pub(crate) plp_prefetch_scratch: Vec<u8>,
     /// Set once a fetch has confirmed — possibly by peeking one token past
     /// the row it just delivered — that no further rows exist for the
     /// current cursor. Distinct from `STMT_STATE_CURSOR_OPEN`, which stays
@@ -216,12 +437,18 @@ pub(crate) struct StmtState {
     /// Cleared by [`StmtState::clear_exhaustion_state`] alongside
     /// `batch_exhausted`.
     pub(crate) pending_fetch_info: Vec<SqlInfoMessage>,
+    /// Owned before the drained client can be reused by another statement.
+    /// Delivered once by SQLMoreResults using the bindings current at that call.
+    pub(crate) pending_output_params: Option<(Vec<ReturnValue>, Option<i32>)>,
     /// The prepared statement (rewritten SQL + server handle once materialized)
     /// stored by `SQLPrepare`, bundled with its `@P1..@Pn` marker count so the
     /// two can only be set together. The server-side prepare is deferred to
     /// `SQLExecute`. `Some` marks the statement as prepared; the handle is filled
     /// after the first execute.
     pub(crate) prepared: Option<PreparedPlan>,
+    /// Marker count of the accepted direct SQL, independent of a prepared plan.
+    /// Retained across cursor close and parameter reset; replaced by new SQL.
+    pub(crate) direct_marker_count: Option<usize>,
     /// Metadata inferred by `SQLDescribeParam`, indexed by parameter ordinal.
     /// The first describe call fills every marker; `SQLPrepare` invalidates it.
     pub(crate) parameter_metadata: Vec<ParameterDescription>,
@@ -238,10 +465,15 @@ pub(crate) struct StmtState {
     /// this: it is what keeps a live orphan from being discarded on the
     /// `sp_execute` reuse path.
     pub(crate) pending_unprepare: Option<StatementId>,
+    pub(crate) parameter_array: Option<crate::api::execute::BatchClientResults>,
     /// `true` when SQLFetch has positioned the cursor on a row ready for SQLGetData.
     pub(crate) row_positioned: bool,
     /// The column value captured by the most recent resume_row_to_column call, with its 1-based column index.
     pub(crate) last_captured: Option<(usize, ColumnValues)>,
+    /// Complete non-PLP row captured by SQLFetch for subsequent SQLGetData calls.
+    pub(crate) buffered_get_data_row: Option<BufferedGetDataRow>,
+    /// Emptied row storage retained across fetches to avoid per-row allocations.
+    pub(crate) spare_get_data_row: Option<BufferedGetDataRow>,
     /// Base type of `last_captured` when that column is `sql_variant`, with its
     /// 1-based column index. Set per value, since a variant column can hold a
     /// different type in every row.
@@ -256,12 +488,15 @@ pub(crate) struct StmtState {
     /// 1-based column number of the last successful SQLGetData call on this row.
     /// Used to enforce forward-only column access (07009) and SQL_NO_DATA on re-read.
     pub(crate) current_row_last_col: usize,
-    /// Byte/code-unit offset into the current non-PLP column's text, for
+    /// Byte/code-unit offset into the current non-PLP column's value, for
     /// resumable `SQLGetData`. `(1-based column, offset)`; `None` when no
     /// partial read is outstanding. The offset unit matches the target C type
-    /// the column is being read as (bytes for `SQL_C_CHAR`, UTF-16 code units
-    /// for `SQL_C_WCHAR`); a single column's chunk loop uses one target type.
+    /// the column is being read as (bytes for `SQL_C_CHAR` and `SQL_C_BINARY`,
+    /// UTF-16 code units for `SQL_C_WCHAR`); a single column's chunk loop uses
+    /// one target type.
     pub(crate) partial_text_offset: Option<(usize, usize)>,
+    /// Direct string path already validated for `(1-based column, C target type)`.
+    pub(crate) direct_text_target: Option<(usize, SqlSmallInt)>,
     /// Rows affected by the last execution, reported by `SQLRowCount`. `-1`
     /// means "not available" (no statement executed yet, a result-returning
     /// SELECT, DDL, or `SET NOCOUNT ON`) — matching msodbcsql's
@@ -291,14 +526,8 @@ pub(crate) struct StmtState {
     /// when unset. Read at fetch rather than at bind, so the application can
     /// move the whole rowset by updating the pointed-to value.
     pub(crate) row_bind_offset_ptr: *mut SqlULen,
-    /// Columns bound by `SQLBindCol`, in binding order. A column appears at
-    /// most once: rebinding replaces its entry, unbinding removes it. Bindings
-    /// outlive a result set, so they are cleared by `SQLFreeStmt(SQL_UNBIND)`
-    /// rather than by closing the cursor.
-    ///
-    /// Staying empty is a legal state: an unbound `SQLFetchScroll` still
-    /// advances the rowset and reports counts, it just delivers no data.
-    pub(crate) bindings: Vec<ColumnBinding>,
+    /// Number of parameter sets consumed by one SQLExecute.
+    pub(crate) paramset_size: SqlULen,
     /// The active application row descriptor for `SQL_ATTR_APP_ROW_DESC`:
     /// `None` means "use the implicit ARD" (`StmtHandle::ard`); `Some` holds
     /// an explicitly-allocated descriptor associated by
@@ -318,10 +547,15 @@ pub(crate) struct StmtState {
     /// timeout. Seeded at allocation from the parent connection's
     /// [`DbcState::stmt_query_timeout`].
     ///
-    /// Stored and reported only — enforcement against a running query is
-    /// tracked separately (AB#46385), so a non-zero value does not yet cancel
-    /// anything. msodbcsql does enforce it and answers `HYT00` on expiry.
+    /// Enforced against a running query (AB#46385): threaded into
+    /// [`ExecuteOptions`](mssql_tds::connection::tds_client::ExecuteOptions)
+    /// for every `execute*` call, so a non-zero value bounds the wait and
+    /// surfaces `HYT00` on expiry, matching msodbcsql.
     pub(crate) query_timeout: u32,
+    /// True only for a direct procedure RPC whose first binding consumes
+    /// RETURNSTATUS. Text/prepared calls receive their return binding through
+    /// a named RETURNVALUE instead of the wrapper RPC's status.
+    pub(crate) call_returns_status: bool,
     /// `SQL_ATTR_MAX_ROWS`: cap on the number of rows returned from each result
     /// set; `0` (the ODBC default) means no cap.
     ///
@@ -433,6 +667,16 @@ impl InertStmtAttrs {
         Self::index_of(attribute).map(|i| self.0[i])
     }
 
+    /// True when `SQL_ATTR_NOSCAN` is on, i.e. the application has asked the
+    /// driver not to scan its SQL for ODBC escape sequences.
+    ///
+    /// The attribute keeps its measured get/set behaviour — it is stored and
+    /// round-tripped like the rest of the inert set — but the execution path
+    /// now reads it, so it actually suppresses translation.
+    pub(crate) fn noscan(&self) -> bool {
+        self.get(odbc_types::SQL_ATTR_NOSCAN) == Some(odbc_types::SQL_NOSCAN_ON)
+    }
+
     /// Stores `value`, returning whether `attribute` is an inert identifier.
     pub(crate) fn set(&mut self, attribute: SqlInteger, value: SqlULen) -> bool {
         match Self::index_of(attribute) {
@@ -467,29 +711,126 @@ impl InertStmtAttrs {
     }
 }
 
-/// One data-at-execution parameter: which binding it refers to, the token
-/// `SQLParamData` returns, and how many bytes the application promised for it.
+/// One data-at-execution parameter: the token `SQLParamData` returns, how
+/// many bytes the application promised for it, and the plan `dae_plan`
+/// resolved from the binding at execute time.
 ///
 /// Keeping these fields together means the execution-time token and declared
 /// length cannot drift away from the binding they describe.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct DaeParam {
-    /// 0-based index into [`StmtState::bound_params`].
+    /// 0-based index into [`StmtState::bound_params`], and equally the
+    /// parameter's position in the RPC list, which is built in the same order.
     pub(crate) bound_index: usize,
     /// `ParameterValuePtr` with the execution's bind offset already applied.
     pub(crate) value_ptr: SqlPointer,
     /// Total byte count declared by `SQL_LEN_DATA_AT_EXEC(n)`; `None` for
     /// `SQL_DATA_AT_EXEC`, where the application promised no total.
     pub(crate) expected_len: Option<usize>,
+    /// Whether the value streams to the wire or is collected first.
+    pub(crate) plan: DaePlan,
+    /// `ColumnSize` applied to the accumulated chunk total as the chunks
+    /// arrive, so the `22001` lands on the same `SQLPutData` msodbcsql puts it
+    /// on. `None` when the bound is left to the close-time conversion.
+    pub(crate) length_limit: Option<DaeLengthLimit>,
+    /// The binding as of this execution, kept so a buffered value can be
+    /// declared and converted from `ParameterType` when it closes.
+    pub(crate) binding: BoundParam,
+    /// How a streamed chunk is re-encoded on its way to the wire. Filled in
+    /// when the sequence is parked, where the connection's collation is known.
+    pub(crate) transcode: Option<DaeTranscode>,
+}
+
+impl DaeParam {
+    /// Opens a data-at-execution parameter. Named rather than built as a
+    /// literal so a field added later cannot break a construction site written
+    /// in parallel.
+    pub(crate) fn new(
+        bound_index: usize,
+        expected_len: Option<usize>,
+        plan: DaePlan,
+        length_limit: Option<DaeLengthLimit>,
+        binding: BoundParam,
+    ) -> Self {
+        Self {
+            bound_index,
+            value_ptr: binding.parameter_value_ptr,
+            expected_len,
+            plan,
+            length_limit,
+            binding,
+            transcode: None,
+        }
+    }
+
+    /// A streamed parameter with no `ColumnSize` bound, for the tests that only
+    /// exercise the sequencing and declared-length rules.
+    #[cfg(test)]
+    pub(crate) fn unbounded(
+        bound_index: usize,
+        value_ptr: SqlPointer,
+        expected_len: Option<usize>,
+    ) -> Self {
+        use mssql_tds::message::parameters::rpc_parameters::StreamedSqlType;
+        let binding = BoundParam {
+            input_output_type: crate::api::odbc_types::SQL_PARAM_INPUT,
+            c_type: crate::api::odbc_types::SQL_C_BINARY,
+            sql_type: crate::api::odbc_types::SQL_VARBINARY,
+            column_size: 0,
+            decimal_digits: 0,
+            app_precision: 0,
+            app_scale: 0,
+            precision_scale_explicit: false,
+            parameter_value_ptr: value_ptr,
+            buffer_length: 0,
+            strlen_or_ind_ptr: std::ptr::null_mut(),
+            octet_length_ptr: std::ptr::null_mut(),
+        };
+        Self::new(
+            bound_index,
+            expected_len,
+            DaePlan::Stream(StreamedSqlType::VarBinaryMax),
+            None,
+            binding,
+        )
+    }
+
+    /// Same, with the binding's C and SQL types set, for the tests that depend
+    /// on the pairing — `SQL_NTS` sizing reads the C type, and the transcode is
+    /// derived from both.
+    #[cfg(test)]
+    pub(crate) fn with_binding_types(mut self, c_type: SqlSmallInt, sql_type: SqlSmallInt) -> Self {
+        self.binding.c_type = c_type;
+        self.binding.sql_type = sql_type;
+        self
+    }
+
+    /// Same, with a `ColumnSize` bound attached, for the tests that exercise
+    /// trimming against the declared-length promise.
+    #[cfg(test)]
+    pub(crate) fn with_length_limit(mut self, limit: DaeLengthLimit) -> Self {
+        self.length_limit = Some(limit);
+        self
+    }
 }
 
 /// How much of the open data-at-execution parameter the application has
 /// supplied. Reset as a unit whenever the cursor advances.
 #[derive(Debug, Default)]
 pub(crate) struct DaeProgress {
-    /// Bytes supplied by `SQLPutData`, counted before any server-side
-    /// conversion to match msodbcsql's `cbDataAppGiven`.
+    /// Bytes supplied by `SQLPutData`, counted before any trimming or
+    /// conversion to match msodbcsql's `cbDataAppGiven`. This is the total the
+    /// `SQL_LEN_DATA_AT_EXEC(n)` promise is checked against, so it has to count
+    /// what the application handed over rather than what survived.
     pub(crate) bytes_sent: usize,
+    /// Units kept after `ColumnSize` trimming -- msodbcsql's
+    /// `cbDataSentToServer`. Padding trimmed away does not consume the
+    /// declaration's budget, so this trails `bytes_sent` whenever a chunk was
+    /// trimmed, and the two must not be conflated: the declared-length check
+    /// reads the first, the `ColumnSize` bound the second. Counted in the
+    /// bound's own unit, which is UTF-16 code units for a `SQL_C_CHAR` buffer
+    /// and bytes otherwise.
+    pub(crate) retained_units: usize,
     /// Set by the first `SQLPutData` for this parameter, including zero-length
     /// and NULL writes. Closing a parameter without one is a sequence error in
     /// msodbcsql.
@@ -497,6 +838,17 @@ pub(crate) struct DaeProgress {
     /// The parameter was supplied as SQL NULL, so the declared-length check is
     /// skipped, as in msodbcsql.
     pub(crate) is_null: bool,
+    /// Chunks collected for a [`DaePlan::Buffer`] parameter, converted when it
+    /// closes. Empty for a streamed one.
+    pub(crate) buffer: Vec<u8>,
+    /// Bytes of a character split across two `SQLPutData` calls, held until the
+    /// chunk that completes it arrives.
+    pub(crate) carry: Vec<u8>,
+    /// Bytes of a *pad unit* split across two calls -- the first byte of a
+    /// `SQL_C_WCHAR` code unit whose second byte is still to come. Held by the
+    /// length bound rather than the transcoder, because measuring or dropping it
+    /// would shift every later chunk off the application's code-unit grid.
+    pub(crate) unit_carry: Vec<u8>,
 }
 
 /// A data-at-execution sequence in progress: everything the statement holds
@@ -529,6 +881,33 @@ pub(crate) struct DaeState {
     pub(crate) cursor: Option<usize>,
     /// Progress on the parameter named by `cursor`.
     pub(crate) progress: DaeProgress,
+    /// Set when at least one parameter is [`DaePlan::Buffer`]. No RPC is open
+    /// for the sequence: the values are collected as their parameters close and
+    /// the execute runs from the last `SQLParamData`, because a buffered
+    /// parameter's declaration is not known until its bytes are all in.
+    pub(crate) deferred: bool,
+    /// Collected values for buffered parameters as `(bound index, bytes,
+    /// is_null)`, in close order.
+    pub(crate) buffered: Vec<(usize, Vec<u8>, bool)>,
+    /// The RPC parameters as `build_named_params` materialized them at execute
+    /// time, data-at-execution slots included as placeholders. The deferred
+    /// execute replaces only those slots and keeps the rest verbatim.
+    ///
+    /// Held rather than re-read because `bound_params` is itself an
+    /// execute-time snapshot that `SQLFreeStmt(SQL_RESET_PARAMS)` does not
+    /// clear: an application that releases its bindings mid-sequence -- which
+    /// that call invites -- would otherwise have its freed buffers dereferenced
+    /// when the last `SQLParamData` rebuilt the list.
+    pub(crate) prebuilt: Vec<RpcParameter>,
+    /// Rewritten SQL for a deferred `SQLExecDirect`, which runs ad-hoc
+    /// `sp_executesql` and has no prepared plan to execute instead.
+    pub(crate) sql: Option<String>,
+    /// Remaining `SQL_ATTR_QUERY_TIMEOUT` budget captured at execute time, so
+    /// the deferred execute is charged the same allowance as an immediate one.
+    pub(crate) timeout_secs: u32,
+    /// A buffered conversion dropped non-zero fractional digits. Retained when
+    /// a mixed sequence switches to streaming so its final call can report 01S07.
+    pub(crate) fractional_truncated: bool,
 }
 
 impl DaeState {
@@ -546,7 +925,97 @@ impl DaeState {
             params,
             cursor: None,
             progress: DaeProgress::default(),
+            deferred: false,
+            buffered: Vec::new(),
+            prebuilt: Vec::new(),
+            sql: None,
+            timeout_secs: 0,
+            fractional_truncated: false,
         }
+    }
+
+    /// Marks the sequence as one whose execute runs when the last parameter
+    /// closes, rather than one already streaming into an open RPC.
+    pub(crate) fn deferred(
+        mut self,
+        prebuilt: Vec<RpcParameter>,
+        sql: Option<String>,
+        timeout_secs: u32,
+    ) -> Self {
+        self.deferred = true;
+        self.prebuilt = prebuilt;
+        self.sql = sql;
+        self.timeout_secs = timeout_secs;
+        self
+    }
+
+    /// No parameter still to be visited needs collecting, so every value the RPC
+    /// has to declare up front is in hand and it can be opened.
+    ///
+    /// Read from the cursor forward rather than from the plan of the parameter
+    /// just closed: a buffered parameter bound later in the list still has to be
+    /// collected first, because the RPC cannot declare it without its bytes.
+    /// Parameters are offered in bind order -- reordering them so every streamed
+    /// one could stream would change the order `SQLParamData` hands tokens back,
+    /// which an application that counts calls rather than comparing tokens would
+    /// silently mispair. Bind order costs a streamed parameter bound *before* a
+    /// buffered one its streaming, and nothing else.
+    pub(crate) fn buffered_phase_complete(&self) -> bool {
+        match self.cursor {
+            Some(cursor) => self
+                .params
+                .get(cursor..)
+                .is_some_and(|rest| !rest.is_empty() && rest.iter().all(|p| !p.plan.is_buffered())),
+            None => false,
+        }
+    }
+
+    /// Switches the sequence from collecting to streaming once its RPC is open,
+    /// giving each remaining parameter the transcode its chunks need.
+    pub(crate) fn begin_streaming_phase(&mut self, client: TdsClient, collation: SqlCollation) {
+        for param in &mut self.params {
+            if !param.plan.is_buffered() && param.transcode.is_none() {
+                let transcode =
+                    DaeTranscode::new(param.binding.c_type, param.binding.sql_type, collation);
+                if !transcode.is_passthrough() {
+                    param.transcode = Some(transcode);
+                }
+            }
+        }
+        self.deferred = false;
+        self.return_client(client);
+    }
+
+    /// The parameters, for the deferred execute's rebuild.
+    pub(crate) fn params(&self) -> &[DaeParam] {
+        &self.params
+    }
+
+    /// Takes the prepared plan back out when the deferred execute runs.
+    pub(crate) fn take_prepared(&mut self) -> Option<PreparedPlan> {
+        self.prepared.take()
+    }
+
+    /// Takes the orphaned handle so the deferred execute can piggyback its
+    /// release, exactly as an immediate execute does.
+    pub(crate) fn take_orphaned(&mut self) -> Option<StatementId> {
+        self.orphaned.take()
+    }
+
+    /// Puts the plan and orphaned handle back on the sequence, symmetric to
+    /// [`DaeState::take_prepared`] and [`DaeState::take_orphaned`].
+    ///
+    /// A sequence that opened its RPC partway through has to hold them again:
+    /// the closing `take_dae` restores `StmtState` *from* these fields, so
+    /// leaving them empty would overwrite the live plan with `None` and leave a
+    /// successfully executed statement unprepared.
+    pub(crate) fn restore_plan(
+        &mut self,
+        prepared: Option<PreparedPlan>,
+        orphaned: Option<StatementId>,
+    ) {
+        self.prepared = prepared;
+        self.orphaned = orphaned;
     }
 
     /// Checks the client out for a network write, so no lock is held across the
@@ -598,6 +1067,12 @@ impl DaeState {
             params,
             cursor,
             progress: DaeProgress::default(),
+            deferred: false,
+            buffered: Vec::new(),
+            prebuilt: Vec::new(),
+            sql: None,
+            timeout_secs: 0,
+            fractional_truncated: false,
         }
     }
 
@@ -775,6 +1250,14 @@ pub(crate) struct PreparedPlan {
     /// Number of `@P1..@Pn` markers in `stmt`'s SQL, computed once at prepare so
     /// `SQLExecute` builds the parameter list without re-scanning the text.
     pub(crate) marker_count: usize,
+    /// The statement text exactly as the application supplied it, before escape
+    /// translation and marker rewriting.
+    ///
+    /// Kept because the rewritten text is lossy for metadata: `SQLDescribeParam`
+    /// has to translate escapes even when `SQL_ATTR_NOSCAN` is on, and by then
+    /// `{? = call proc(?)}` would already have become `{@P1 = call proc(@P2)}`,
+    /// where the canonical return marker is no longer recognisable.
+    pub(crate) original_sql: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -801,40 +1284,31 @@ impl StmtState {
     /// Clears everything AB#47508's read-ahead peek can leave behind, so a
     /// fresh result set never inherits a previous one's exhaustion state or
     /// deferred diagnostics. Called from every `finish_execute` terminal
-    /// branch and `close_cursor.rs`'s `reset_cursor_state` — folded into one
-    /// method so the invariant lives in a single place rather than four
-    /// call sites that could each independently drift or be missed.
+    /// branch, the all-`SQL_PARAM_IGNORE` batch early return, and
+    /// `close_cursor.rs`'s `reset_cursor_state` — folded into one method so
+    /// the invariant lives in a single place rather than several call sites
+    /// that could each independently drift or be missed.
     pub(crate) fn clear_exhaustion_state(&mut self) {
         self.result_set_exhausted = false;
         self.batch_exhausted = false;
         self.pending_fetch_error = None;
         self.pending_fetch_info.clear();
+        self.pending_output_params = None;
     }
 
-    /// Binds, or rebinds, one column. A column can only be bound once, so an
-    /// existing entry for the same column is replaced in place rather than
-    /// shadowed.
-    pub(crate) fn set_binding(&mut self, binding: ColumnBinding) {
-        // Kept ordered by column number: the fill loop walks a forward-only row
-        // cursor, so it can only visit bound columns in ascending order.
-        match self
-            .bindings
-            .binary_search_by_key(&binding.column_number, |b| b.column_number)
-        {
-            Ok(existing) => self.bindings[existing] = binding,
-            Err(insert_at) => self.bindings.insert(insert_at, binding),
-        }
+    /// The statement's currently *effective* ARD: the explicit descriptor
+    /// associated via `SQLSetStmtAttrW(SQL_ATTR_APP_ROW_DESC, ...)`, or the
+    /// permanent implicit `stmt.ard` when none is associated. This is the
+    /// descriptor `SQLBindCol` writes into and `SQLFetchScroll` reads from
+    /// (AB#47437) — the same resolution `SQLGetStmtAttrW` already reports
+    /// back to the application (`set_stmt_attr.rs`).
+    pub(crate) fn effective_ard(&self, stmt: &StmtHandle) -> *mut c_void {
+        self.active_ard.unwrap_or(stmt.ard)
     }
 
-    /// Removes one column's binding, which is what `SQLBindCol` does when the
-    /// application passes a null `TargetValuePtr`.
-    pub(crate) fn clear_binding(&mut self, column_number: SqlUSmallInt) {
-        self.bindings.retain(|b| b.column_number != column_number);
-    }
-
-    /// Drops every column binding — `SQLFreeStmt(SQL_UNBIND)`.
-    pub(crate) fn clear_bindings(&mut self) {
-        self.bindings.clear();
+    /// The statement's currently *effective* APD. See [`Self::effective_ard`].
+    pub(crate) fn effective_apd(&self, stmt: &StmtHandle) -> *mut c_void {
+        self.active_apd.unwrap_or(stmt.apd)
     }
 
     /// Makes `metadata` the current result set, restarting the
@@ -849,8 +1323,25 @@ impl StmtState {
     /// command ordinal restarts rather than climbing across executions.
     pub(crate) fn begin_result_set(&mut self, metadata: Vec<ColumnMetadata>) {
         self.column_metadata = metadata;
+        self.refresh_metadata_caches();
         self.rows_returned = 0;
         self.current_command += 1;
+    }
+
+    /// Rebuilds result-set data derived from `column_metadata`.
+    pub(crate) fn refresh_metadata_caches(&mut self) {
+        self.column_names_utf16.clear();
+        self.column_names_utf16.extend(
+            self.column_metadata
+                .iter()
+                .map(|column| column.column_name.encode_utf16().collect()),
+        );
+    }
+
+    /// Clears result metadata and every cache derived from it.
+    pub(crate) fn clear_result_metadata(&mut self) {
+        self.column_metadata.clear();
+        self.column_names_utf16.clear();
     }
 
     /// Makes `metadata` the first result set of a new execution.
@@ -877,11 +1368,13 @@ impl StmtState {
     pub(crate) fn reset_row_stream(&mut self) {
         self.row_positioned = false;
         self.last_captured = None;
+        self.buffered_get_data_row = None;
         self.last_variant_base = None;
         self.row_exhausted = false;
         self.active_plp = None;
         self.current_row_last_col = 0;
         self.partial_text_offset = None;
+        self.direct_text_target = None;
     }
 
     /// Positions the row stream on a freshly fetched row: clears all per-row
@@ -954,15 +1447,16 @@ impl StmtState {
             .map_or(std::ptr::null_mut(), |param| param.value_ptr)
     }
 
-    /// The bound C type of the open DAE parameter, which `SQLPutData` needs to
-    /// size an `SQL_NTS` chunk.
+    /// The C type of the open DAE parameter, which `SQLPutData` needs to size
+    /// an `SQL_NTS` chunk. Reads the binding snapshot taken at execute time
+    /// rather than `bound_params`, so it agrees with the type the chunks are
+    /// transcoded with even if `SQLFreeStmt(SQL_RESET_PARAMS)` or a rebind
+    /// changes or clears the live binding while the sequence is open.
     pub(crate) fn dae_current_c_type(&self) -> Option<SqlSmallInt> {
-        self.dae_current_bound_param().map(|param| param.c_type)
-    }
-
-    fn dae_current_bound_param(&self) -> Option<&BoundParam> {
-        let dae_param = self.dae.as_ref()?.current_param()?;
-        self.bound_params.get(dae_param.bound_index)?.as_ref()
+        self.dae
+            .as_ref()?
+            .current_param()
+            .map(|param| param.binding.c_type)
     }
 }
 
@@ -1014,21 +1508,29 @@ impl StmtHandle {
             inner: Mutex::new(StmtState {
                 diag_records: Vec::new(),
                 column_metadata: Vec::new(),
+                column_names_utf16: Vec::new(),
+                plp_prefetch_scratch: Vec::new(),
                 result_set_exhausted: false,
                 batch_exhausted: false,
                 pending_fetch_error: None,
                 pending_fetch_info: Vec::new(),
+                pending_output_params: None,
                 prepared: None,
+                direct_marker_count: None,
                 parameter_metadata: Vec::new(),
                 bound_params: Vec::new(),
                 pending_unprepare: None,
+                parameter_array: None,
                 row_positioned: false,
                 last_captured: None,
+                buffered_get_data_row: None,
+                spare_get_data_row: None,
                 last_variant_base: None,
                 row_exhausted: false,
                 active_plp: None,
                 current_row_last_col: 0,
                 partial_text_offset: None,
+                direct_text_target: None,
                 row_count: -1,
                 pending_row_counts: VecDeque::new(),
                 row_array_size: 1,
@@ -1036,12 +1538,13 @@ impl StmtHandle {
                 row_status_ptr: std::ptr::null_mut(),
                 row_bind_type: crate::api::odbc_types::SQL_BIND_BY_COLUMN,
                 row_bind_offset_ptr: std::ptr::null_mut(),
-                bindings: Vec::new(),
+                paramset_size: 1,
                 active_ard: None,
                 active_apd: None,
                 state_flags: 0,
                 dae: None,
                 query_timeout,
+                call_returns_status: false,
                 max_rows: 0,
                 rows_returned: 0,
                 inert_attrs: InertStmtAttrs::default(),
@@ -1089,95 +1592,262 @@ impl Drop for StmtHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::odbc_types::{SQL_C_CHAR, SQL_C_SLONG};
+    use crate::api::odbc_types::{SQL_C_CHAR, SQL_C_SLONG, SQL_WVARCHAR};
+    use crate::handles::desc::{DescHeader, DescKind};
+    use mssql_tds::test_client_support::int_columns;
 
     fn binding(column_number: SqlUSmallInt, target_type: SqlSmallInt) -> ColumnBinding {
         ColumnBinding {
             column_number,
             target_type,
-            target_value_ptr: std::ptr::null_mut(),
+            // A non-null sentinel: `data_ptr.is_null()` is this driver's
+            // "unbound" signal (`ColumnBinding::from_record`), so a genuine
+            // binding under test must use a non-null value here.
+            target_value_ptr: 0x1 as SqlPointer,
             buffer_length: 0,
             strlen_or_ind_ptr: std::ptr::null_mut(),
+            octet_length_ptr: std::ptr::null_mut(),
         }
     }
 
-    /// Runs `f` against a fresh statement's state. The handle owns descriptor
-    /// allocations it frees on drop, so it has to outlive the borrow.
+    /// Runs `f` against a fresh, empty ARD-shaped `DescState`.
+    fn with_ard_state(f: impl FnOnce(&mut DescState)) {
+        let mut state = DescState {
+            diag_records: Vec::new(),
+            header: DescHeader::default(),
+            records: Vec::new(),
+        };
+        f(&mut state);
+    }
+
     fn with_state(f: impl FnOnce(&mut StmtState)) {
         let handle = StmtHandle::new(std::ptr::null_mut(), 0);
         let mut state = handle.inner.lock().unwrap();
         f(&mut state);
     }
 
-    /// A column can only be bound once, so rebinding replaces the entry rather
-    /// than shadowing it — otherwise the fetch loop would write the column
-    /// twice, once through a stale pointer.
+    #[test]
+    fn buffered_phase_completes_only_when_remaining_params_stream() {
+        let mut buffered = DaeParam::unbounded(0, std::ptr::null_mut(), None);
+        buffered.plan = DaePlan::Buffer;
+        let streamed = DaeParam::unbounded(1, std::ptr::null_mut(), None);
+        let mut dae = DaeState::for_test(vec![buffered, streamed], None);
+
+        assert!(!dae.buffered_phase_complete());
+        dae.cursor = Some(0);
+        assert!(!dae.buffered_phase_complete());
+        dae.cursor = Some(1);
+        assert!(dae.buffered_phase_complete());
+        dae.cursor = Some(2);
+        assert!(!dae.buffered_phase_complete());
+    }
+
+    #[test]
+    fn begin_streaming_phase_transcodes_only_streamed_params_and_parks_client() {
+        use mssql_tds::test_client_support::tds_client_from_tokens;
+
+        let mut buffered = DaeParam::unbounded(0, std::ptr::null_mut(), None);
+        buffered.plan = DaePlan::Buffer;
+        let streamed = DaeParam::unbounded(1, std::ptr::null_mut(), None)
+            .with_binding_types(SQL_C_CHAR, SQL_WVARCHAR);
+        let mut dae = DaeState::for_test(vec![buffered, streamed], Some(1));
+        dae.deferred = true;
+
+        dae.begin_streaming_phase(tds_client_from_tokens(Vec::new()), SqlCollation::default());
+
+        assert!(!dae.deferred);
+        assert!(dae.params[0].transcode.is_none());
+        assert!(dae.params[1].transcode.is_some());
+        assert!(dae.checkout_client().is_some());
+        assert!(dae.call_in_flight);
+    }
+
+    /// Grows `state` to `column_number` records (if needed) and writes
+    /// `binding` into the one at that position — the same two-step shape
+    /// `sql_bind_col_safe` uses.
+    fn bind(state: &mut DescState, binding: ColumnBinding) {
+        let column_number = binding.column_number;
+        let target_count = state.records.len().max(usize::from(column_number));
+        state.set_record_count(target_count, DescKind::AppRow);
+        let record = state
+            .record_mut(SqlSmallInt::try_from(column_number).unwrap())
+            .expect("just grew the record list to include this column_number");
+        binding.write_to_record(record);
+    }
+
+    /// A column can only be bound once, so rebinding overwrites the same
+    /// record in place rather than adding a second one — otherwise the fetch
+    /// loop would write the column twice, once through a stale pointer.
     #[test]
     fn rebinding_a_column_replaces_its_entry() {
-        with_state(|s| {
-            s.set_binding(binding(1, SQL_C_SLONG));
-            s.set_binding(binding(2, SQL_C_SLONG));
-            s.set_binding(binding(1, SQL_C_CHAR));
+        with_ard_state(|s| {
+            bind(s, binding(1, SQL_C_SLONG));
+            bind(s, binding(2, SQL_C_SLONG));
+            bind(s, binding(1, SQL_C_CHAR));
 
-            assert_eq!(s.bindings.len(), 2);
-            let first = s.bindings.iter().find(|b| b.column_number == 1).unwrap();
+            let bindings = ColumnBinding::all_from_ard_state(s);
+            assert_eq!(bindings.len(), 2);
+            let first = bindings.iter().find(|b| b.column_number == 1).unwrap();
             assert_eq!(first.target_type, SQL_C_CHAR);
         });
     }
 
-    /// Unbinding one column leaves the others in place; this is what SQLBindCol
-    /// does with a null TargetValuePtr.
+    /// Unbinding one column (a null `data_ptr`, `SQLBindCol`'s own
+    /// null-pointer-unbinds convention) leaves the others in place.
     #[test]
     fn clearing_one_binding_leaves_the_others() {
-        with_state(|s| {
-            s.set_binding(binding(1, SQL_C_SLONG));
-            s.set_binding(binding(2, SQL_C_SLONG));
-            s.clear_binding(1);
+        with_ard_state(|s| {
+            bind(s, binding(1, SQL_C_SLONG));
+            bind(s, binding(2, SQL_C_SLONG));
+            s.record_mut(1).unwrap().data_ptr = std::ptr::null_mut();
 
-            assert_eq!(s.bindings.len(), 1);
-            assert_eq!(s.bindings[0].column_number, 2);
-            // Unbinding a column that was never bound is a no-op, not a panic.
-            s.clear_binding(99);
-            assert_eq!(s.bindings.len(), 1);
+            let bindings = ColumnBinding::all_from_ard_state(s);
+            assert_eq!(bindings.len(), 1);
+            assert_eq!(bindings[0].column_number, 2);
+            // Unbinding a column that was never bound (no record yet) is a
+            // no-op, not a panic — record_mut(99) is simply None.
+            assert!(s.record_mut(99).is_none());
         });
     }
 
-    /// SQLFreeStmt(SQL_UNBIND) drops the whole table.
+    /// SQLFreeStmt(SQL_UNBIND) drops every binding by nulling every record's
+    /// `data_ptr`.
     #[test]
     fn clearing_all_bindings_empties_the_table() {
-        with_state(|s| {
-            s.set_binding(binding(1, SQL_C_SLONG));
-            s.set_binding(binding(2, SQL_C_SLONG));
-            s.clear_bindings();
-            assert!(s.bindings.is_empty());
+        with_ard_state(|s| {
+            bind(s, binding(1, SQL_C_SLONG));
+            bind(s, binding(2, SQL_C_SLONG));
+            for record in &mut s.records {
+                record.data_ptr = std::ptr::null_mut();
+            }
+            assert!(ColumnBinding::all_from_ard_state(s).is_empty());
         });
     }
 
     /// The fill loop reads a forward-only cursor, so it depends on this order
-    /// rather than re-establishing it; an application may bind in any order.
+    /// rather than re-establishing it; an application may bind in any order —
+    /// guaranteed here by `all_from_ard_state` walking records by position,
+    /// not by insertion order.
     #[test]
     fn bindings_stay_ordered_by_column_however_they_were_bound() {
-        with_state(|s| {
+        with_ard_state(|s| {
             for col in [5, 1, 3, 2, 4] {
-                s.set_binding(binding(col, SQL_C_SLONG));
+                bind(s, binding(col, SQL_C_SLONG));
             }
-            let cols: Vec<_> = s.bindings.iter().map(|b| b.column_number).collect();
+            let cols: Vec<_> = ColumnBinding::all_from_ard_state(s)
+                .iter()
+                .map(|b| b.column_number)
+                .collect();
             assert_eq!(cols, vec![1, 2, 3, 4, 5]);
 
             // A rebind replaces in place and keeps the order.
-            s.set_binding(binding(3, SQL_C_CHAR));
-            let cols: Vec<_> = s.bindings.iter().map(|b| b.column_number).collect();
+            bind(s, binding(3, SQL_C_CHAR));
+            let bindings = ColumnBinding::all_from_ard_state(s);
+            let cols: Vec<_> = bindings.iter().map(|b| b.column_number).collect();
             assert_eq!(cols, vec![1, 2, 3, 4, 5]);
-            assert_eq!(s.bindings[2].target_type, SQL_C_CHAR);
+            assert_eq!(bindings[2].target_type, SQL_C_CHAR);
         });
     }
 
-    /// Bindings start empty, which is what makes an unbound fetch legal.
+    /// A fresh ARD has no records at all, which is what makes an unbound
+    /// fetch legal.
     #[test]
     fn a_fresh_statement_has_no_bindings() {
-        with_state(|s| {
-            assert!(s.bindings.is_empty());
-            assert!(s.row_bind_offset_ptr.is_null());
+        with_ard_state(|s| {
+            assert!(ColumnBinding::all_from_ard_state(s).is_empty());
         });
+        let handle = StmtHandle::new(std::ptr::null_mut(), 0);
+        assert!(handle.inner.lock().unwrap().row_bind_offset_ptr.is_null());
+    }
+
+    #[test]
+    fn beginning_a_row_discards_the_previous_buffered_get_data_row() {
+        with_state(|s| {
+            s.buffered_get_data_row = Some(BufferedGetDataRow {
+                values: vec![Some(ColumnValues::Int(1))],
+                variant_bases: vec![Some(TdsDataType::Int4)],
+                consumed: 0,
+                wire_deferred: false,
+            });
+
+            s.begin_row();
+
+            assert!(s.row_positioned);
+            assert!(s.buffered_get_data_row.is_none());
+        });
+    }
+
+    #[test]
+    fn beginning_result_set_caches_utf16_column_names() {
+        with_state(|s| {
+            let mut metadata = int_columns(2);
+            metadata[0].column_name = "alpha".to_string();
+            metadata[1].column_name = "beta\u{1f642}".to_string();
+
+            s.begin_result_set(metadata);
+
+            assert_eq!(
+                s.column_names_utf16,
+                vec![
+                    "alpha".encode_utf16().collect::<Vec<_>>(),
+                    "beta\u{1f642}".encode_utf16().collect::<Vec<_>>(),
+                ]
+            );
+        });
+    }
+
+    #[test]
+    fn clearing_result_metadata_clears_cached_column_names() {
+        with_state(|s| {
+            let mut metadata = int_columns(1);
+            metadata[0].column_name = "value".to_string();
+            s.begin_result_set(metadata);
+
+            s.clear_result_metadata();
+
+            assert!(s.column_metadata.is_empty());
+            assert!(s.column_names_utf16.is_empty());
+        });
+    }
+
+    #[test]
+    fn prefetched_plp_wire_spans_application_calls() {
+        let mut stream = ActivePlpStream::new(1, PlpEncoding::SingleByteText, None);
+        stream.set_prefetched_wire(vec![1, 2, 3, 4, 5, 6], 6, 8, Some(14), true);
+
+        let mut first = [0; 2];
+        assert_eq!(
+            stream.read_prefetched_wire(&mut first),
+            Some((2, false, Some(14), 10))
+        );
+        assert_eq!(first, [1, 2]);
+
+        let mut second = [0; 8];
+        assert_eq!(
+            stream.read_prefetched_wire(&mut second),
+            Some((4, true, Some(14), 14))
+        );
+        assert_eq!(&second[..4], &[3, 4, 5, 6]);
+        assert_eq!(stream.read_prefetched_wire(&mut second), None);
+    }
+
+    #[test]
+    fn prefetched_plp_wire_preserves_unknown_length_and_incomplete_tail() {
+        let mut stream = ActivePlpStream::new(1, PlpEncoding::SingleByteText, None);
+        stream.set_prefetched_wire(vec![7, 8, 9], 2, 5, None, false);
+
+        let mut probe = [];
+        assert_eq!(
+            stream.read_prefetched_wire(&mut probe),
+            Some((0, false, None, 5))
+        );
+
+        let mut output = [0; 4];
+        assert_eq!(
+            stream.read_prefetched_wire(&mut output),
+            Some((2, false, None, 7))
+        );
+        assert_eq!(&output[..2], &[7, 8]);
+        assert_eq!(stream.read_prefetched_wire(&mut output), None);
     }
 }

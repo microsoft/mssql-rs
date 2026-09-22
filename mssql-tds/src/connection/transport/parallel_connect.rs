@@ -27,8 +27,8 @@
 //! and returns as soon as one succeeds. Failed connections are logged but don't
 //! prevent other connections from succeeding.
 
-use std::net::{SocketAddr, ToSocketAddrs};
-use std::time::Duration;
+use std::net::SocketAddr;
+use std::time::{Duration, Instant};
 
 use tokio::net::{self, TcpStream};
 use tokio::time::timeout;
@@ -125,11 +125,32 @@ pub async fn parallel_connect(
         host, port, config.timeout_ms
     );
 
-    // Resolve DNS to get all IP addresses
-    let addresses: Vec<SocketAddr> = (host, port)
-        .to_socket_addrs()?
-        .take(MAX_PARALLEL_IPS)
-        .collect();
+    // `timeout_ms` is documented as the overall budget for this call, so it
+    // must cover DNS resolution too, not just the connection race below.
+    let deadline = Instant::now() + Duration::from_millis(config.timeout_ms);
+
+    // Resolve DNS to get all IP addresses. `lookup_host` awaits the resolution
+    // instead of blocking the calling thread (unlike `std::net::ToSocketAddrs`),
+    // so a slow or stuck resolver stays subject to `deadline` instead of
+    // silently escaping it.
+    let addresses: Vec<SocketAddr> = match timeout(
+        deadline.saturating_duration_since(Instant::now()),
+        tokio::net::lookup_host((host, port)),
+    )
+    .await
+    {
+        Ok(Ok(resolved)) => resolved.take(MAX_PARALLEL_IPS).collect(),
+        Ok(Err(e)) => return Err(Error::from(e)),
+        Err(_elapsed) => {
+            warn!(
+                "DNS resolution for {}:{} timed out after {}ms",
+                host, port, config.timeout_ms
+            );
+            return Err(Error::TimeoutError(crate::error::TimeoutErrorType::String(
+                format!("Connection timeout: DNS resolution for {host}:{port} timed out"),
+            )));
+        }
+    };
 
     if addresses.is_empty() {
         return Err(Error::ConnectionError(format!(
@@ -177,9 +198,10 @@ pub async fn parallel_connect(
         })
         .collect();
 
-    // Race all connections with an overall timeout
+    // Race all connections with whatever remains of the overall timeout —
+    // DNS resolution above may have already spent part of it.
     let result = timeout(
-        Duration::from_millis(config.timeout_ms),
+        deadline.saturating_duration_since(Instant::now()),
         race_connections(connect_futures),
     )
     .await;
@@ -425,6 +447,59 @@ async fn race_connections(
 mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Regression coverage for AB#47704: `parallel_connect` used to resolve
+    /// DNS via blocking `to_socket_addrs()`, which never yields to the
+    /// executor. Timing can't prove the fix — resolving even a nonexistent
+    /// host completes in ms either way — so this asserts the structural
+    /// property instead: a concurrently spawned heartbeat must get scheduled
+    /// while resolution is in flight. `lookup_host` bridges to
+    /// `spawn_blocking` via a channel, so the awaiting task is guaranteed to
+    /// yield at least once; a blocking call never yields, so the heartbeat
+    /// gets zero chances to run. Uses a host that fails to resolve so the
+    /// call returns from resolution alone, without reaching
+    /// `race_connections` — which spawns tasks and awaits a channel
+    /// regardless of DNS behavior, and would mask the signal. Confirmed by
+    /// mutation testing (reverting to `to_socket_addrs()` makes this fail).
+    ///
+    /// Must stay on the default `current_thread` runtime: a `multi_thread`
+    /// flavor would let the heartbeat run on another worker even if
+    /// resolution blocked, so the assertion would pass without proving
+    /// anything.
+    #[tokio::test(flavor = "current_thread")]
+    async fn parallel_connect_resolution_yields_to_the_executor() {
+        let heartbeats = std::sync::Arc::new(AtomicUsize::new(0));
+        let heartbeats_task = heartbeats.clone();
+        // A short sleep (rather than `yield_now()`) still catches the same
+        // scheduling gap — the first increment can't happen until the main
+        // task yields either way — without busy-spinning a core for however
+        // long this host takes to NXDOMAIN.
+        let heartbeat = tokio::spawn(async move {
+            loop {
+                heartbeats_task.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        });
+
+        let config = ParallelConnectConfig {
+            timeout_ms: 5000,
+            ..Default::default()
+        };
+        let result =
+            parallel_connect("invalid.host.that.does.not.exist.local", 1433, &config).await;
+
+        heartbeat.abort();
+        assert!(
+            result.is_err(),
+            "resolution must fail for a nonexistent host"
+        );
+        assert!(
+            heartbeats.load(Ordering::SeqCst) > 0,
+            "the heartbeat task never ran while resolution was in flight — \
+             resolution is blocking the executor instead of awaiting it"
+        );
+    }
 
     #[test]
     fn test_parallel_connect_config_default() {

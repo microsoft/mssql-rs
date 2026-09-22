@@ -29,28 +29,15 @@ apt-get install -y --no-install-recommends cmake unixodbc-dev
 # The reference driver for comparison mode. The upstream version defaults to a
 # pinned value but can be overridden by the msodbcsqlVersion pipeline variable
 # (passed as ODBC_E2E_MSODBCSQL_VERSION), so a new release can't silently change
-# what the parity table compares against. apt pins the full <upstream>-<revision>
-# package; the Debian revision suffix is appended here.
-MSODBCSQL_VERSION="${ODBC_E2E_MSODBCSQL_VERSION:-18.6.2.1}-1"
+# what the parity table compares against. The shared installer appends and pins
+# the Debian package revision.
+MSODBCSQL_VERSION="${ODBC_E2E_MSODBCSQL_VERSION:-18.6.2.1}"
 
 compare_args=()
 case "$(printf '%s' "${ODBC_E2E_COMPARE:-0}" | tr '[:upper:]' '[:lower:]')" in
     1|true|yes)
-        apt-get install -y --no-install-recommends curl gnupg ca-certificates
-        # Install the signing key into its own keyring and scope it to just the
-        # Microsoft repo via signed-by, rather than trusting it for every apt
-        # source on the box (a global trusted.gpg.d drop-in would do that).
-        install -d -m 0755 /usr/share/keyrings
-        curl -fsSL https://packages.microsoft.com/keys/microsoft.asc \
-            -o /usr/share/keyrings/microsoft.asc
-        curl -fsSL "https://packages.microsoft.com/config/ubuntu/$(. /etc/os-release && echo "$VERSION_ID")/prod.list" \
-            -o /etc/apt/sources.list.d/mssql-release.list
-        sed -i 's#^deb \[#deb [signed-by=/usr/share/keyrings/microsoft.asc #' \
-            /etc/apt/sources.list.d/mssql-release.list
-        grep -q 'signed-by=/usr/share/keyrings/microsoft.asc' /etc/apt/sources.list.d/mssql-release.list \
-            || { echo "Error: failed to scope the Microsoft apt key to its repo" >&2; exit 1; }
-        apt-get update
-        ACCEPT_EULA=Y apt-get install -y --no-install-recommends "msodbcsql18=$MSODBCSQL_VERSION"
+        /workspace/.pipeline/scripts/install-msodbcsql.sh \
+            "$MSODBCSQL_VERSION"
         # msodbcsql18 registers itself as [ODBC Driver 18 for SQL Server] in
         # /etc/odbcinst.ini, which is run_e2e.sh's default --msodbcsql-ini.
         compare_args+=(--compare-with-msodbcsql)

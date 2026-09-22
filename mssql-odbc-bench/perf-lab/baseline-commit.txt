@@ -1,0 +1,9 @@
+# Performance baseline commit for mssql-odbc.
+#
+# This pin records the accepted optimized production state after PR #586.
+# Future baseline moves require a pull request, so every change is
+# reviewed and recorded in git history.
+#
+# Exactly one full 40-character commit SHA on its own line. Lines starting with
+# '#' and blank lines are ignored.
+0e7e1477724d6a5bedba36cb49be75bf373ad08d

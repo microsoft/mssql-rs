@@ -12,17 +12,17 @@
 //! succeeding; `SQL_ATTR_CURSOR_SCROLLABLE` is the same setting seen from the
 //! other side and behaves identically. `SQL_ATTR_QUERY_TIMEOUT` is stored and
 //! clamped to [`MAX_QUERY_TIMEOUT`], matching msodbcsql, which reports `01S02`
-//! rather than rejecting an over-large request; enforcing the stored timeout
-//! against a running statement is tracked separately. `SQL_ATTR_MAX_ROWS` is
-//! stored and genuinely enforced by the fetch path. Other recognized parameter
-//! and cursor controls are stored and round-tripped without effect, because
-//! msodbcsql reports back whatever was written; the handful whose reported value
-//! msodbcsql pins regardless of the
+//! rather than rejecting an over-large request; the stored timeout is enforced
+//! against the running statement by `SQLExecute`/`SQLExecDirectW` (AB#46385).
+//! `SQL_ATTR_MAX_ROWS` is stored and genuinely enforced by the fetch path.
+//! Other recognized parameter and cursor controls are stored and
+//! round-tripped without effect, because msodbcsql reports back whatever was
+//! written; the handful whose reported value msodbcsql pins regardless of the
 //! request (`SQL_ATTR_MAX_LENGTH`, `SQL_ATTR_KEYSET_SIZE`,
 //! `SQL_ATTR_SIMULATE_CURSOR`) substitute and warn with `01S02`.
-//! `SQL_ATTR_PARAMSET_SIZE` accepts the ODBC default of 1 but rejects larger
-//! batches, since parameter arrays are not yet consumed and a silent success
-//! would execute only the first row. `SQL_ATTR_METADATA_ID` accepts its
+//! Parameter-array attributes are stored and consumed by `SQLExecute`; data-at-
+//! execution and output arrays remain explicitly unsupported.
+//! `SQL_ATTR_METADATA_ID` accepts its
 //! pattern-mode default (`SQL_FALSE`) but returns `HYC00` for `SQL_TRUE` until
 //! catalog calls implement identifier matching. Unrecognized attribute
 //! identifiers fail with `HY092`.
@@ -54,25 +54,28 @@ use crate::api::odbc_types::{
     MAX_QUERY_TIMEOUT, MSODBCSQL_MAX_LENGTH, SQL_ATTR_APP_PARAM_DESC, SQL_ATTR_APP_ROW_DESC,
     SQL_ATTR_CONCURRENCY, SQL_ATTR_CURSOR_SCROLLABLE, SQL_ATTR_CURSOR_SENSITIVITY,
     SQL_ATTR_CURSOR_TYPE, SQL_ATTR_IMP_PARAM_DESC, SQL_ATTR_IMP_ROW_DESC, SQL_ATTR_KEYSET_SIZE,
-    SQL_ATTR_MAX_LENGTH, SQL_ATTR_MAX_ROWS, SQL_ATTR_METADATA_ID, SQL_ATTR_PARAMSET_SIZE,
-    SQL_ATTR_QUERY_TIMEOUT, SQL_ATTR_ROW_ARRAY_SIZE, SQL_ATTR_ROW_BIND_OFFSET_PTR,
-    SQL_ATTR_ROW_BIND_TYPE, SQL_ATTR_ROW_NUMBER, SQL_ATTR_ROW_STATUS_PTR,
-    SQL_ATTR_ROWS_FETCHED_PTR, SQL_ATTR_SIMULATE_CURSOR, SQL_CONCUR_READ_ONLY,
-    SQL_CURSOR_FORWARD_ONLY, SQL_ERROR, SQL_FALSE, SQL_INSENSITIVE, SQL_INVALID_HANDLE,
-    SQL_NONSCROLLABLE, SQL_NTS, SQL_SC_UNIQUE, SQL_SOPT_SS_CURRENT_COMMAND,
-    SQL_SOPT_SS_QUERYNOTIFICATION_MSGTEXT, SQL_SOPT_SS_QUERYNOTIFICATION_OPTIONS, SQL_SUCCESS,
-    SQL_SUCCESS_WITH_INFO, SQL_TRUE, SqlHandle, SqlInteger, SqlPointer, SqlReturn, SqlULen,
-    SqlUSmallInt, SqlWChar,
+    SQL_ATTR_MAX_LENGTH, SQL_ATTR_MAX_ROWS, SQL_ATTR_METADATA_ID, SQL_ATTR_PARAM_BIND_OFFSET_PTR,
+    SQL_ATTR_PARAM_BIND_TYPE, SQL_ATTR_PARAM_OPERATION_PTR, SQL_ATTR_PARAM_STATUS_PTR,
+    SQL_ATTR_PARAMS_PROCESSED_PTR, SQL_ATTR_PARAMSET_SIZE, SQL_ATTR_QUERY_TIMEOUT,
+    SQL_ATTR_ROW_ARRAY_SIZE, SQL_ATTR_ROW_BIND_OFFSET_PTR, SQL_ATTR_ROW_BIND_TYPE,
+    SQL_ATTR_ROW_NUMBER, SQL_ATTR_ROW_STATUS_PTR, SQL_ATTR_ROWS_FETCHED_PTR,
+    SQL_ATTR_SIMULATE_CURSOR, SQL_CONCUR_READ_ONLY, SQL_CURSOR_FORWARD_ONLY, SQL_ERROR, SQL_FALSE,
+    SQL_INSENSITIVE, SQL_INVALID_HANDLE, SQL_NONSCROLLABLE, SQL_NTS, SQL_SC_UNIQUE,
+    SQL_SOPT_SS_CURRENT_COMMAND, SQL_SOPT_SS_QUERYNOTIFICATION_MSGTEXT,
+    SQL_SOPT_SS_QUERYNOTIFICATION_OPTIONS, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SQL_TRUE, SqlHandle,
+    SqlInteger, SqlPointer, SqlReturn, SqlULen, SqlUSmallInt, SqlWChar,
 };
 use crate::api::sqlstate::{
     DiagMsg, ERR_FUNCTION_SEQUENCE, ERR_INVALID_ATTRIBUTE_VALUE, ERR_INVALID_CURSOR_STATE,
     ERR_INVALID_USE_OF_AUTO_DESC, ERR_OPTIONAL_FEATURE_NOT_IMPLEMENTED, SQLSTATE_01S02,
-    SQLSTATE_HYC00, WARN_OPTION_VALUE_CHANGED, post_diag,
+    WARN_OPTION_VALUE_CHANGED, post_diag,
 };
 use crate::api::util::{read_utf16_attr, write_if_some, write_wide_attr};
 use crate::error::{free_errors, post_sql_error};
 use crate::handles::desc::DescHandle;
-use crate::handles::stmt::{STMT_STATE_FETCH_IN_PROGRESS, VendorStmtAttrs};
+use crate::handles::stmt::{
+    STMT_STATE_EXEC_STARTED, STMT_STATE_FETCH_IN_PROGRESS, VendorStmtAttrs,
+};
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 
 /// Clamps a requested `SQL_ATTR_QUERY_TIMEOUT` to the largest value the driver
@@ -96,7 +99,7 @@ pub(super) fn clamp_query_timeout(requested: SqlULen) -> (u32, bool) {
 /// # Safety
 /// `statement_handle` must be a valid `StmtHandle` or null. For the pointer
 /// attributes the caller-supplied `value_ptr` must remain valid for the
-/// lifetime it is used by later fetches.
+/// lifetime it is used by later fetches or parameter-array executions.
 pub(crate) unsafe fn sql_set_stmt_attr_w(
     statement_handle: SqlHandle,
     attribute: SqlInteger,
@@ -115,6 +118,12 @@ pub(crate) unsafe fn sql_set_stmt_attr_w(
     })
 }
 
+/// # Safety
+/// `statement_handle` must be null or point to a live `StmtHandle`. For the two
+/// query-notification string attributes, `value_ptr` must be readable for
+/// `string_length` bytes of UTF-16 or through a NUL terminator when the length is
+/// `SQL_NTS`. Pointer-valued attributes must remain valid while associated with
+/// the statement.
 unsafe fn sql_set_stmt_attr_w_impl(
     statement_handle: SqlHandle,
     attribute: SqlInteger,
@@ -154,6 +163,21 @@ unsafe fn sql_set_stmt_attr_w_safe(
     free_errors(&mut state);
 
     match attribute {
+        SQL_ATTR_PARAMSET_SIZE
+        | SQL_ATTR_PARAM_BIND_OFFSET_PTR
+        | SQL_ATTR_PARAM_BIND_TYPE
+        | SQL_ATTR_PARAM_OPERATION_PTR
+        | SQL_ATTR_PARAM_STATUS_PTR
+        | SQL_ATTR_PARAMS_PROCESSED_PTR
+            if state.has_state(STMT_STATE_EXEC_STARTED) =>
+        {
+            error!(
+                attribute,
+                "SQLSetStmtAttrW: parameter execution is in progress on this statement"
+            );
+            post_diag(&mut state, ERR_FUNCTION_SEQUENCE);
+            SQL_ERROR
+        }
         // The rowset controls are read into a fetch's snapshot, so moving them
         // mid-fetch would point it at buffers of the wrong size or shape.
         SQL_ATTR_ROW_ARRAY_SIZE
@@ -198,33 +222,17 @@ unsafe fn sql_set_stmt_attr_w_safe(
             state.row_bind_type = value_ptr as SqlULen;
             SQL_SUCCESS
         }
-        SQL_ATTR_PARAMSET_SIZE => {
-            // Parameter arrays are not yet consumed (executemany batch insert is
-            // tracked separately). Accept the ODBC default of 1; reject a larger
-            // batch (HYC00) instead of silently executing only the first row,
-            // and reject 0 as an invalid value (HY024).
-            match value_ptr as SqlULen {
-                1 => SQL_SUCCESS,
-                0 => {
-                    error!("SQLSetStmtAttrW: SQL_ATTR_PARAMSET_SIZE of 0 is invalid");
-                    post_diag(&mut state, ERR_INVALID_ATTRIBUTE_VALUE);
-                    SQL_ERROR
-                }
-                n => {
-                    error!(
-                        paramset_size = n,
-                        "SQLSetStmtAttrW: SQL_ATTR_PARAMSET_SIZE > 1 not supported"
-                    );
-                    post_sql_error(
-                        &mut state,
-                        SQLSTATE_HYC00,
-                        0,
-                        "Parameter arrays (SQL_ATTR_PARAMSET_SIZE > 1) are not supported",
-                    );
-                    SQL_ERROR
-                }
+        SQL_ATTR_PARAMSET_SIZE => match value_ptr as SqlULen {
+            0 => {
+                error!("SQLSetStmtAttrW: SQL_ATTR_PARAMSET_SIZE of 0 is invalid");
+                post_diag(&mut state, ERR_INVALID_ATTRIBUTE_VALUE);
+                SQL_ERROR
             }
-        }
+            n => {
+                state.paramset_size = n;
+                SQL_SUCCESS
+            }
+        },
         SQL_ATTR_CURSOR_TYPE => {
             // The driver is forward-only. Accept SQL_CURSOR_FORWARD_ONLY as-is;
             // for any other cursor type substitute forward-only and warn with
@@ -567,6 +575,11 @@ pub(crate) unsafe fn sql_get_stmt_attr_w(
     })
 }
 
+/// # Safety
+/// `statement_handle` must be null or point to a live `StmtHandle`. `value_ptr`,
+/// when non-null, must be writable for `buffer_length` bytes for string-valued
+/// attributes or for one pointer-sized value otherwise. `string_length_ptr`,
+/// when non-null, must be writable for one `SqlInteger`.
 unsafe fn sql_get_stmt_attr_w_impl(
     statement_handle: SqlHandle,
     attribute: SqlInteger,
@@ -678,7 +691,17 @@ unsafe fn sql_get_stmt_attr_w_safe(
             write_if_some(value_ptr as *mut SqlULen, SQL_CONCUR_READ_ONLY);
         },
         SQL_ATTR_PARAMSET_SIZE => unsafe {
-            write_if_some(value_ptr as *mut SqlULen, 1);
+            write_if_some(value_ptr as *mut SqlULen, state.paramset_size);
+        },
+        SQL_ATTR_PARAM_BIND_TYPE
+        | SQL_ATTR_PARAM_BIND_OFFSET_PTR
+        | SQL_ATTR_PARAM_OPERATION_PTR
+        | SQL_ATTR_PARAM_STATUS_PTR
+        | SQL_ATTR_PARAMS_PROCESSED_PTR => unsafe {
+            write_if_some(
+                value_ptr as *mut SqlULen,
+                state.inert_attrs.get(attribute).unwrap_or(0),
+            );
         },
         // ARD/APD report the active association (an explicit descriptor if
         // one was set via SQLSetStmtAttrW, else the implicit default), so
@@ -759,7 +782,9 @@ mod tests {
         SQL_SOPT_SS_PARAM_FOCUS, SQL_SOPT_SS_QUERYNOTIFICATION_TIMEOUT, SQL_SOPT_SS_REGIONALIZE,
         SQL_SOPT_SS_TEXTPTR_LOGGING, SqlLen,
     };
-    use crate::api::sqlstate::{SQLSTATE_01004, SQLSTATE_24000, SQLSTATE_HY024, SQLSTATE_HY092};
+    use crate::api::sqlstate::{
+        SQLSTATE_01004, SQLSTATE_24000, SQLSTATE_HY024, SQLSTATE_HY092, SQLSTATE_HYC00,
+    };
     use crate::handles::handle_from_raw;
     use crate::handles::stmt::InertStmtAttrs;
     use crate::test_support::TestHandles;
@@ -1193,11 +1218,12 @@ mod tests {
     }
 
     #[test]
-    fn set_paramset_size_greater_than_one_rejected() {
+    fn set_paramset_size_greater_than_one_is_stored() {
         let h = TestHandles::with_env_dbc_stmt();
         let ret =
             unsafe { sql_set_stmt_attr_w(h.stmt, SQL_ATTR_PARAMSET_SIZE, 100 as SqlPointer, 0) };
-        assert_eq!(ret, SQL_ERROR);
+        assert_eq!(ret, SQL_SUCCESS);
+        assert_eq!(get_attr(h.stmt, SQL_ATTR_PARAMSET_SIZE), 100);
     }
 
     #[test]

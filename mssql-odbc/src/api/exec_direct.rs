@@ -5,19 +5,27 @@
 
 use tracing::{debug, error};
 
-use mssql_tds::connection::tds_client::StreamedParamStatus;
+use std::time::Instant;
 
+use mssql_tds::connection::tds_client::{ExecuteOptions, StreamedParamStatus};
+
+use super::escape::translate_for_execution;
 use super::exec_common::{
-    ParamsWithDae, build_named_params, claim_connection, fail_with_tds, finish_execute,
-    flush_pending_unprepare, park_dae_client,
+    ParamsWithDae, build_named_params, build_positional_params, claim_connection,
+    deduct_query_timeout, fail_with_tds, finish_execute_with_param_warning,
+    flush_pending_unprepare, park_dae_client, park_deferred_dae, publish_scalar_processed,
+    query_timeout_expired_error, snapshot_bound_params,
 };
 use super::sqlstate::*;
 use super::txn::begin_transaction_if_manual;
-use super::util::{read_utf16, rewrite_param_markers};
+use super::util::read_utf16;
 use crate::api::odbc_types::{
-    SQL_ERROR, SQL_INVALID_HANDLE, SqlHandle, SqlReturn, SqlSmallInt, SqlWChar,
+    SQL_BIND_BY_COLUMN, SQL_ERROR, SQL_INVALID_HANDLE, SQL_NO_ROWCOUNT_TOTAL, SqlHandle, SqlReturn,
+    SqlSmallInt, SqlWChar,
 };
+use crate::conversion::param_convert::{data_at_exec_indicator, is_output_direction};
 use crate::error::free_errors;
+use crate::error::post_sql_error;
 use crate::handles::stmt::{
     STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT, STMT_STATE_EXEC_STARTED, STMT_STATE_PREPARED,
 };
@@ -32,6 +40,13 @@ use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 /// - `statement_handle` must be a valid `StmtHandle` allocated by `SQLAllocHandle`.
 /// - `statement_text` must point to a valid UTF-16 buffer readable for `text_length` characters.
 ///   If `text_length` is `SQL_NTS`, the string must be NUL-terminated.
+/// - For each non-data-at-execution parameter, the currently bound value,
+///   indicator, and octet-length buffers must remain readable according to the
+///   bound C type and lengths. When `SQL_ATTR_PARAM_BIND_OFFSET_PTR` is
+///   non-null, these readable extents begin at each bound base plus the
+///   pointed-to signed byte offset, which may be negative, so every allocation
+///   must cover that displaced range. The offset pointer itself must remain
+///   readable for one `SqlLen`.
 pub(crate) unsafe fn sql_exec_direct_w(
     statement_handle: SqlHandle,
     statement_text: *const SqlWChar,
@@ -49,6 +64,17 @@ pub(crate) unsafe fn sql_exec_direct_w(
     })
 }
 
+/// # Safety
+/// `statement_handle` must be null or point to a live `StmtHandle`.
+/// `statement_text` must be readable for `text_length` UTF-16 code units, or
+/// through a NUL terminator when `text_length` is `SQL_NTS`.
+/// For each non-data-at-execution parameter, the currently bound value,
+/// indicator, and octet-length buffers must remain readable according to the
+/// bound C type and lengths. When `SQL_ATTR_PARAM_BIND_OFFSET_PTR` is non-null,
+/// these readable extents begin at each bound base plus the pointed-to signed
+/// byte offset, which may be negative, so every allocation must cover that
+/// displaced range. The offset pointer itself must remain readable for one
+/// `SqlLen`.
 unsafe fn sql_exec_direct_w_impl(
     statement_handle: SqlHandle,
     statement_text: *const SqlWChar,
@@ -85,8 +111,29 @@ fn sql_exec_direct_w_safe(
 
     let dbc = stmt.parent_dbc();
 
+    // Snapshotted before the STMT lock below is taken — this crate never
+    // holds a STMT lock while acquiring a DESC lock (see bind_col.rs's
+    // rationale). Not applied to `stmt_state.bound_params` until the
+    // early-return checks below have passed, so a rejected re-entry during
+    // an active DAE sequence can't clobber that sequence's own snapshot.
+    let Ok(bound_params) = snapshot_bound_params(stmt) else {
+        error!("SQLExecDirectW: failed to snapshot parameter bindings");
+        if let Ok(mut stmt_state) = stmt.inner.lock() {
+            // Cleared first so this diagnostic lands as record 1, not
+            // appended after whatever a previous call left behind.
+            free_errors(&mut stmt_state);
+            post_sql_error(
+                &mut stmt_state,
+                SQLSTATE_HY000,
+                0,
+                "Internal error reading parameter bindings",
+            );
+        }
+        return SQL_ERROR;
+    };
+
     // Check STMT state, gather parameter values, and reset prior context.
-    let (named_params, rewritten_sql, marker_count) = {
+    let (named_params, rewritten_sql, marker_count, call, query_timeout) = {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("SQLExecDirectW: stmt mutex poisoned");
             return SQL_ERROR;
@@ -106,53 +153,198 @@ fn sql_exec_direct_w_safe(
             post_diag(&mut stmt_state, ERR_INVALID_CURSOR_STATE);
             return SQL_ERROR;
         }
-        // Rewrite markers and read the bound parameter buffers before mutating
-        // any state, so a binding error (07002 / HYC00) leaves the statement
-        // unchanged.
-        let (rewritten_sql, marker_count) = rewrite_param_markers(&sql);
-        let named_params =
-            match unsafe { build_named_params(&mut stmt_state, marker_count, "SQLExecDirectW") } {
-                Ok(params) => params,
-                Err(rc) => return rc,
+        stmt_state.bound_params = bound_params;
+        // Translate escapes and rewrite markers, then read the bound parameter
+        // buffers, all before mutating any state — so a malformed escape
+        // (42000 / 22018 / 22001) or a binding error (07002 / HYC00) leaves the
+        // statement unchanged and nothing reaches the wire.
+        let output_flags: Vec<bool> = stmt_state
+            .bound_params
+            .iter()
+            .map(|param| param.is_some_and(|param| is_output_direction(param.input_output_type)))
+            .collect();
+        let (rewritten_sql, marker_count, mut call) =
+            match translate_for_execution(&sql, stmt_state.inert_attrs.noscan(), &output_flags) {
+                Ok(parts) => parts,
+                Err(e) => {
+                    error!(error = %e, "SQLExecDirectW: escape translation failed");
+                    post_sql_error(&mut stmt_state, e.state(), 0, e.message());
+                    return SQL_ERROR;
+                }
             };
+        // msodbcsql batches one sp_executesql per set here (sqlccmd.cpp:3310).
+        // Refused until AB#47939 wires that up: no shipped consumer drives it -
+        // mssql-python's executemany always uses the prepare + execute path
+        // (ddbc_bindings.cpp:3052). Refused with no markers too: msodbcsql sets
+        // iRowEnd = dwArraySize regardless of parameter count
+        // (sqlccmd.cpp:3192-3199), so running once instead of N times would
+        // drop N-1 executions with nothing to show for it.
+        if stmt_state.paramset_size > 1 {
+            error!("SQLExecDirectW: parameter arrays are not supported on this path");
+            post_sql_error(
+                &mut stmt_state,
+                SQLSTATE_HYC00,
+                0,
+                "Parameter arrays are not supported with SQLExecDirect; \
+                 prepare the statement and use SQLExecute",
+            );
+            return SQL_ERROR;
+        }
+        publish_scalar_processed(&stmt_state);
+        let bind_offset = unsafe { stmt_state.inert_attrs.param_bind_offset() };
+        let mut has_dae = false;
+        for index in 0..marker_count {
+            let Some(Some(bound)) = stmt_state.bound_params.get(index) else {
+                post_diag(&mut stmt_state, ERR_UNBOUND_PARAMETER);
+                return SQL_ERROR;
+            };
+            if index == 0
+                && call.as_ref().is_some_and(|c| c.returns_status)
+                && !is_output_direction(bound.input_output_type)
+            {
+                post_diag(&mut stmt_state, ERR_INVALID_PARAMETER_TYPE);
+                return SQL_ERROR;
+            }
+            let Ok(positioned) = bound.for_row(0, bind_offset, SQL_BIND_BY_COLUMN) else {
+                post_diag(&mut stmt_state, ERR_INVALID_STRING_OR_BUFFER_LENGTH);
+                return SQL_ERROR;
+            };
+            has_dae |= unsafe { data_at_exec_indicator(&positioned) }.is_some();
+        }
+        // Both streaming implementations execute text, so they need every named
+        // variable, including a return assignment, rather than RPC arguments.
+        call = call.filter(|c| c.is_rpc_eligible() && !has_dae);
+        // A canonical call binds its parameters by position; everything else
+        // binds them by the `@P1..@Pn` names the rewritten text declares.
+        let rpc_call = call.as_ref();
+        let named_params = match rpc_call {
+            Some(c) => {
+                let skip = usize::from(c.returns_status);
+                match unsafe {
+                    build_positional_params(&mut stmt_state, marker_count, skip, "SQLExecDirectW")
+                } {
+                    Ok(params) => params,
+                    Err(rc) => return rc,
+                }
+            }
+            None => {
+                match unsafe { build_named_params(&mut stmt_state, marker_count, "SQLExecDirectW") }
+                {
+                    Ok(params) => params,
+                    Err(rc) => return rc,
+                }
+            }
+        };
         // A new execute invalidates prior metadata/context immediately, so a
         // later execute failure cannot expose stale SQLNumResultCols/DescribeCol state.
         stmt_state.clear_state(STMT_STATE_EXEC_CONTEXT);
-        stmt_state.column_metadata.clear();
+        stmt_state.clear_result_metadata();
         stmt_state.reset_row_stream();
-        stmt_state.row_count = -1;
+        stmt_state.row_count = SQL_NO_ROWCOUNT_TOTAL;
         stmt_state.pending_row_counts.clear();
         // Superseding a prepared plan orphans its server handle; release it
         // (deferred) once we hold the client below.
         stmt_state.orphan_prepared_handle();
         stmt_state.prepared = None;
+        stmt_state.direct_marker_count = Some(marker_count);
         stmt_state.parameter_metadata.clear();
         stmt_state.clear_state(STMT_STATE_PREPARED);
+        stmt_state.call_returns_status = call.as_ref().is_some_and(|c| c.returns_status);
         stmt_state.set_state(STMT_STATE_EXEC_STARTED);
-        (named_params, rewritten_sql, marker_count)
+        (
+            named_params,
+            rewritten_sql,
+            marker_count,
+            call,
+            stmt_state.query_timeout,
+        )
     };
 
-    let ParamsWithDae { params, dae_params } = named_params;
+    let ParamsWithDae {
+        params,
+        dae_params,
+        fractional_truncated,
+    } = named_params;
 
     let mut client = match claim_connection(dbc, stmt, statement_handle, "SQLExecDirectW") {
         Ok(client) => client,
         Err(rc) => return rc,
     };
+    let budget = query_timeout;
+    let started = Instant::now();
 
     // Release any handle orphaned by the reset above before running the batch.
-    flush_pending_unprepare(dbc, stmt, &mut client, "SQLExecDirectW");
+    // Bounded by the full budget: nothing has run yet to charge against it.
+    flush_pending_unprepare(dbc, stmt, &mut client, "SQLExecDirectW", query_timeout);
 
-    if let Err(e) = begin_transaction_if_manual(dbc, &mut client, "SQLExecDirectW") {
+    // `query_timeout` (SQL_ATTR_QUERY_TIMEOUT) bounds every wire operation this
+    // call makes, not just the final execute — matching msodbcsql's
+    // `DropPrepHandle` / `CheckOptions`, which charge the same deducted budget
+    // to the deferred `sp_unprepare` and the implicit transaction begin. Each
+    // step's remaining allowance is `budget` minus the *cumulative* elapsed
+    // time since this call began (`started` is fixed, never re-seeded), so
+    // every step's cost is charged exactly once against the original budget,
+    // and sub-second remainders accumulate across steps instead of each being
+    // floored away independently — matching msodbcsql's own millisecond-
+    // granularity deduction (`dwQueryTimeoutInMS` in `DropPrepHandle`). An
+    // already-exhausted budget fails immediately with HYT00 rather than
+    // sending the next step unbounded.
+    let query_timeout = match deduct_query_timeout(budget, started.elapsed()) {
+        Ok(remaining) => remaining,
+        Err(()) => {
+            return fail_with_tds(
+                dbc,
+                stmt,
+                statement_handle,
+                client,
+                &query_timeout_expired_error(),
+            );
+        }
+    };
+
+    if let Err(e) = begin_transaction_if_manual(dbc, &mut client, "SQLExecDirectW", query_timeout) {
         return fail_with_tds(dbc, stmt, statement_handle, client, &e);
     }
+
+    let query_timeout = match deduct_query_timeout(budget, started.elapsed()) {
+        Ok(remaining) => remaining,
+        Err(()) => {
+            return fail_with_tds(
+                dbc,
+                stmt,
+                statement_handle,
+                client,
+                &query_timeout_expired_error(),
+            );
+        }
+    };
 
     // Data-at-execution parameters park the half-written RPC on the statement
     // and hand control to SQLParamData / SQLPutData. There is no prepared plan
     // to restore afterwards, so `None` is passed for it.
     if !dae_params.is_empty() {
-        let begin_result =
-            dbc.runtime
-                .block_on(client.begin_sp_executesql(rewritten_sql, params, ()));
+        // A buffered parameter cannot be declared until its bytes are all in,
+        // so no RPC is opened: the sequence collects its values and runs
+        // `sp_executesql` from the last `SQLParamData` (AB#47590).
+        if dae_params.iter().any(|param| param.plan.is_buffered()) {
+            return park_deferred_dae(
+                stmt,
+                client,
+                None,
+                None,
+                dae_params,
+                params,
+                Some(rewritten_sql),
+                query_timeout,
+                fractional_truncated,
+                "SQLExecDirectW",
+            );
+        }
+        let begin_result = dbc.runtime.block_on(client.begin_sp_executesql(
+            rewritten_sql,
+            params,
+            ExecuteOptions::new().timeout_secs(query_timeout),
+        ));
         return match begin_result {
             // Defensive: staging only reports DAE parameters when at least one
             // placeholder is present, so the TDS layer should not complete here.
@@ -161,11 +353,24 @@ fn sql_exec_direct_w_safe(
                     dae_param_count = dae_params.len(),
                     "SQLExecDirectW: begin_sp_executesql completed despite data-at-execution parameters"
                 );
-                finish_execute(dbc, stmt, statement_handle, client, "SQLExecDirectW")
+                finish_execute_with_param_warning(
+                    dbc,
+                    stmt,
+                    statement_handle,
+                    client,
+                    "SQLExecDirectW",
+                    fractional_truncated,
+                )
             }
-            Ok(StreamedParamStatus::NeedData { .. }) => {
-                park_dae_client(stmt, client, None, None, dae_params, "SQLExecDirectW")
-            }
+            Ok(StreamedParamStatus::NeedData { .. }) => park_dae_client(
+                stmt,
+                client,
+                None,
+                None,
+                dae_params,
+                fractional_truncated,
+                "SQLExecDirectW",
+            ),
             Err(e) => {
                 error!(%e, "SQLExecDirectW: begin_sp_executesql failed");
                 fail_with_tds(dbc, stmt, statement_handle, client, &e)
@@ -175,30 +380,63 @@ fn sql_exec_direct_w_safe(
 
     // Parameterized text runs via sp_executesql (direct execution, no cached
     // handle); unparameterized text runs as a plain SQL batch. Neither DBC nor
-    // STMT lock is held during I/O.
-    let exec_result: Result<(), mssql_tds::error::Error> = if marker_count > 0 {
+    // STMT lock is held during I/O. `query_timeout` (already deducted above)
+    // bounds either call; `0` means unlimited, matching the ODBC default.
+    let exec_result: Result<(), mssql_tds::error::Error> = if let Some(call) = call.as_ref() {
+        // A statement that is nothing but `{call proc(?)}` goes out as a TDS
+        // RPC rather than as text, which is what makes output parameters and
+        // the return status available. Anything less strict — a call inside a
+        // batch, or with a literal argument — took the EXEC text form during
+        // translation and runs through sp_executesql below.
         dbc.runtime
-            .block_on(client.execute_sp_executesql(rewritten_sql, params, ()))
+            .block_on(client.execute_stored_procedure(
+                call.proc_name.clone(),
+                Some(params),
+                None,
+                ExecuteOptions::new().timeout_secs(query_timeout),
+            ))
+            .map(|_| ())
+    } else if marker_count > 0 {
+        dbc.runtime
+            .block_on(client.execute_sp_executesql(
+                rewritten_sql,
+                params,
+                ExecuteOptions::new().timeout_secs(query_timeout),
+            ))
             .map(|_| ())
     } else {
         // Statement-wise navigation: position on the batch's first statement
         // (msodbcsql parity) so no-row statements (PRINT / RAISERROR / DML) are
         // individually navigable via SQLMoreResults. finish_execute inspects the
-        // resulting client state.
-        dbc.runtime.block_on(client.execute(sql, ())).map(|_| ())
+        // resulting client state. The *translated* text is sent: a statement
+        // with no parameter markers can still carry escapes.
+        dbc.runtime
+            .block_on(client.execute(
+                rewritten_sql,
+                ExecuteOptions::new().timeout_secs(query_timeout),
+            ))
+            .map(|_| ())
     };
     if let Err(e) = exec_result {
         error!(%e, "SQLExecDirectW: execution failed");
         return fail_with_tds(dbc, stmt, statement_handle, client, &e);
     }
 
-    finish_execute(dbc, stmt, statement_handle, client, "SQLExecDirectW")
+    finish_execute_with_param_warning(
+        dbc,
+        stmt,
+        statement_handle,
+        client,
+        "SQLExecDirectW",
+        fractional_truncated,
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::api::odbc_types::{SQL_NTS, SQL_NULL_HANDLE};
+    use crate::handles::DescHandle;
     use crate::test_support::TestHandles;
 
     #[test]
@@ -302,6 +540,7 @@ mod tests {
                     mssql_tds::connection::tds_client::StatementId::from_raw_for_test(42),
                 ),
                 marker_count: 0,
+                original_sql: String::new(),
             });
             state.set_state(STMT_STATE_PREPARED);
         }
@@ -348,6 +587,109 @@ mod tests {
         assert!(!state.has_state(STMT_STATE_EXEC_STARTED));
     }
 
+    fn assert_return_status_binding_error(bind_return: bool, expected_state: [u8; 5]) {
+        use crate::api::bind_param::sql_bind_parameter;
+        use crate::api::odbc_types::{SQL_C_SLONG, SQL_INTEGER, SQL_PARAM_INPUT, SQL_SUCCESS};
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let mut input = 7_i32;
+        let mut input_ind = 0;
+        let mut status = -1_i32;
+        let mut status_ind = 0;
+        for (ordinal, value, indicator) in [
+            (2, &raw mut input, &raw mut input_ind),
+            (1, &raw mut status, &raw mut status_ind),
+        ] {
+            if ordinal == 1 && !bind_return {
+                continue;
+            }
+            assert_eq!(
+                unsafe {
+                    sql_bind_parameter(
+                        h.stmt,
+                        ordinal,
+                        SQL_PARAM_INPUT,
+                        SQL_C_SLONG,
+                        SQL_INTEGER,
+                        0,
+                        0,
+                        value.cast(),
+                        0,
+                        indicator,
+                    )
+                },
+                SQL_SUCCESS
+            );
+        }
+        let sql: Vec<u16> = "{?=call #return_binding(?)}"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        assert_eq!(
+            unsafe { sql_exec_direct_w(h.stmt, sql.as_ptr(), SQL_NTS) },
+            SQL_ERROR
+        );
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(state.diag_records.len(), 1);
+        assert_eq!(state.diag_records[0].sql_state, expected_state);
+        assert!(!state.has_state(STMT_STATE_EXEC_STARTED));
+        assert_eq!(status, -1);
+        assert_eq!(status_ind, 0);
+    }
+
+    #[test]
+    fn return_status_bound_as_input_returns_hy105() {
+        assert_return_status_binding_error(true, SQLSTATE_HY105);
+    }
+
+    #[test]
+    fn unbound_return_status_returns_07002() {
+        assert_return_status_binding_error(false, SQLSTATE_07002);
+    }
+
+    /// Panics while holding the APD lock, leaving the mutex poisoned —
+    /// mirrors `bind_param.rs`'s own `poison_apd` test helper.
+    fn poison_apd(apd: crate::api::odbc_types::SqlHandle) {
+        let handle = unsafe { handle_from_raw::<DescHandle>(apd) };
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = handle.inner.lock().unwrap();
+            panic!("poison the apd lock");
+        }));
+    }
+
+    /// A `snapshot_bound_params` failure (here, a poisoned APD) must still
+    /// post an HY000 diagnostic, and post it as record 1 — not leave
+    /// `SQLGetDiagRec` reporting `SQL_NO_DATA`, and not append after a stale
+    /// record a previous call left behind (`free_errors` must run first).
+    #[test]
+    fn snapshot_failure_posts_hy000_as_the_first_diagnostic_record() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        stmt.inner
+            .lock()
+            .unwrap()
+            .diag_records
+            .push(crate::error::DiagRecord::new(SQLSTATE_07002, 0, "stale"));
+        poison_apd(h.apd());
+
+        let sql: Vec<u16> = "SELECT 1"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let ret = unsafe { sql_exec_direct_w(h.stmt, sql.as_ptr(), SQL_NTS) };
+        assert_eq!(ret, SQL_ERROR);
+
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(state.diag_records.len(), 1, "stale record must be cleared");
+        assert_eq!(state.diag_records[0].sql_state, SQLSTATE_HY000);
+        assert!(
+            state.diag_records[0]
+                .message
+                .contains("Internal error reading parameter bindings")
+        );
+    }
+
     /// A plain batch whose first statement is a no-row result (DML row count)
     /// followed by more statements leaves the cursor open with zero columns and
     /// the connection busy, so SQLMoreResults can advance past it (msodbcsql
@@ -390,6 +732,124 @@ mod tests {
         let ds = dbc.inner.lock().unwrap();
         assert_eq!(ds.active_stmt, Some(h.stmt));
         assert!(ds.client.is_some());
+    }
+
+    /// `SQL_ATTR_QUERY_TIMEOUT` must actually bound the wait for a response,
+    /// not just reach `ExecuteOptions` — see mssql-rs#439, where the timeout
+    /// was silently dropped on the floor instead of bounding a statement
+    /// blocked server-side (e.g. behind another session's row lock).
+    ///
+    /// Drives the real `SQLExecDirectW` code path (`claim_connection`,
+    /// `begin_transaction_if_manual`, the elapsed-time deduction, and the
+    /// final `execute`) against a real `TdsClient` connected to a mock TDS
+    /// server that holds its response for `RESPONSE_DELAY` — far longer than
+    /// the statement's configured timeout. Reverting the timeout wiring back
+    /// to `ExecuteOptions::default()` would make this test take the full
+    /// `RESPONSE_DELAY` and return `SQL_SUCCESS`/`1222` instead of the prompt
+    /// `HYT00` asserted here, so it fails if the plumbing regresses.
+    #[test]
+    fn exec_direct_query_timeout_bounds_a_longer_server_delay() {
+        use crate::handles::dbc::DbcHandle;
+        use mssql_mock_tds::{QueryResponse, TerminalError};
+        use std::time::{Duration, Instant};
+
+        const RESPONSE_DELAY: Duration = Duration::from_secs(8);
+        const STMT_TIMEOUT_SECS: u32 = 1;
+        // Comfortably above STMT_TIMEOUT_SECS plus connection/RTT overhead,
+        // comfortably below RESPONSE_DELAY — the gap is what proves the
+        // statement timeout, not the server delay, ended the wait.
+        const BOUND: Duration = Duration::from_secs(5);
+        const SELECT_SQL: &str = "SELECT * FROM ##t WHERE id = 1";
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let _mock_server = crate::test_support::connect_mock_server(
+            dbc,
+            SELECT_SQL,
+            QueryResponse::error_only(TerminalError::new(
+                1222,
+                16,
+                "Lock request time out period exceeded.",
+            ))
+            .with_delay(RESPONSE_DELAY),
+        );
+
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        stmt.inner.lock().unwrap().query_timeout = STMT_TIMEOUT_SECS;
+
+        let started = Instant::now();
+        let ret = sql_exec_direct_w_safe(h.stmt, stmt, SELECT_SQL.to_string());
+        let elapsed = started.elapsed();
+
+        assert_eq!(ret, SQL_ERROR);
+        assert!(
+            elapsed < BOUND,
+            "SQLExecDirectW took {elapsed:?} — a {STMT_TIMEOUT_SECS}s SQL_ATTR_QUERY_TIMEOUT \
+             must bound the wait well below the server's {RESPONSE_DELAY:?} delay"
+        );
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(
+            state.diag_records[0].sql_state, *b"HYT00",
+            "a query-timeout expiry must report HYT00, got {:?}",
+            state.diag_records[0].sql_state
+        );
+    }
+
+    /// `SQL_ATTR_QUERY_TIMEOUT` must also bound the implicit transaction begin
+    /// `begin_transaction_if_manual` sends before the statement itself when
+    /// the connection is in manual-commit mode — mirroring msodbcsql's
+    /// `CheckOptions`/`ExecTMRImmediate` (`sqlccmd.cpp:10572-10585`), which
+    /// passes the statement's own query timeout to that TM request. Unlike
+    /// `exec_direct_query_timeout_bounds_a_longer_server_delay` above (which
+    /// delays the query response), this delays only the server's answer to
+    /// the Begin request, via the mock server's reserved
+    /// `TM_BEGIN_DELAY_KEY`, so it fails if the timeout wiring into
+    /// `begin_transaction_if_manual` regresses even though the query step
+    /// itself is untouched.
+    #[test]
+    fn exec_direct_query_timeout_bounds_a_delayed_implicit_transaction_begin() {
+        use crate::handles::dbc::DbcHandle;
+        use mssql_mock_tds::QueryResponse;
+        use std::time::{Duration, Instant};
+
+        const BEGIN_DELAY: Duration = Duration::from_secs(8);
+        const STMT_TIMEOUT_SECS: u32 = 1;
+        // Comfortably above STMT_TIMEOUT_SECS plus connection/RTT overhead,
+        // comfortably below BEGIN_DELAY — the gap is what proves the
+        // statement timeout, not the server delay, ended the wait.
+        const BOUND: Duration = Duration::from_secs(5);
+        const SELECT_SQL: &str = "SELECT * FROM ##t WHERE id = 1";
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let mock_server =
+            crate::test_support::connect_mock_server(dbc, SELECT_SQL, QueryResponse::select_one());
+        mock_server.set_tm_begin_delay(BEGIN_DELAY);
+        // Manual-commit mode with no transaction open yet is what makes
+        // `begin_transaction_if_manual` send a real Begin request instead of
+        // returning immediately.
+        dbc.inner.lock().unwrap().autocommit = false;
+
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        stmt.inner.lock().unwrap().query_timeout = STMT_TIMEOUT_SECS;
+
+        let started = Instant::now();
+        let ret = sql_exec_direct_w_safe(h.stmt, stmt, SELECT_SQL.to_string());
+        let elapsed = started.elapsed();
+
+        assert_eq!(ret, SQL_ERROR);
+        assert!(
+            elapsed < BOUND,
+            "SQLExecDirectW took {elapsed:?} — a {STMT_TIMEOUT_SECS}s SQL_ATTR_QUERY_TIMEOUT \
+             must bound the implicit transaction begin well below the server's \
+             {BEGIN_DELAY:?} delay"
+        );
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(
+            state.diag_records[0].sql_state, *b"HYT00",
+            "a query-timeout expiry must report HYT00, got {:?}",
+            state.diag_records[0].sql_state
+        );
     }
 
     /// SQL Server compiles variable assignment as a SQLSELECT command carrying

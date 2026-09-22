@@ -9,7 +9,7 @@ This project delivers a **production-ready ODBC Driver 18 for SQL Server written
 The driver wraps the `mssql-tds` library (TDS protocol implementation, workspace-local path dependency) with a full ODBC 3.x API layer — ~78 exported functions (including W wide-char variants) covering connectivity, query execution, data types, authentication, encryption, bulk operations, and more.
 
 **Target platforms**: Windows, Linux, macOS (x64 and ARM64) - Same as the platforms currently supported by msodbcsql
-**Binary output**: `msodbcsql18.dll` (Windows), `libmsodbcsql-18.so.1.1` (Linux), `libmsodbcsql.18.dylib` (macOS)
+**Binary output**: `mssqlodbc.dll` (Windows), `mssqlodbc.so` (Linux), `mssqlodbc.dylib` (macOS)
 
 ---
 
@@ -232,17 +232,18 @@ The project is organized into 15 phases grouped by priority. We start with found
 
 ### Phase 15: Asynchronous Execution (Polling Method)
 
-**Scope decision: mirror msodbcsql — statement-level async only.** Verified against
-the reference driver's observable behavior:
-the reference driver advertises `SQL_ASYNC_MODE = SQL_AM_STATEMENT`,
+**Planned scope: mirror msodbcsql — statement-level async only.** The reference
+driver advertises `SQL_ASYNC_MODE = SQL_AM_STATEMENT`,
 `SQL_MAX_ASYNC_CONCURRENT_STATEMENTS = 1`, and `SQL_ASYNC_DBC_FUNCTIONS = 0`.
-We match this exactly so we remain a drop-in replacement.
+This phase is not implemented yet: `SQLGetInfo(SQL_ASYNC_MODE)` truthfully
+returns `SQL_AM_NONE`. See `docs/sql-get-info-plan.md` for the measured
+AB#48149 capability ledger.
 
-**What we support (statement-level):**
+**What this phase will support (statement-level):**
 - `SQLSetStmtAttr(SQL_ATTR_ASYNC_ENABLE, SQL_ASYNC_ENABLE_ON/OFF)` — writable per
   statement, toggleable between operations. Default is `SQL_ASYNC_ENABLE_OFF`
   (set at statement allocation).
-- `SQLGetInfo` advertises: `SQL_ASYNC_MODE = SQL_AM_STATEMENT`,
+- Once implemented, `SQLGetInfo` will advertise: `SQL_ASYNC_MODE = SQL_AM_STATEMENT`,
   `SQL_MAX_ASYNC_CONCURRENT_STATEMENTS = 1`, `SQL_ASYNC_DBC_FUNCTIONS = 0`.
 - Async-capable statement functions return `SQL_STILL_EXECUTING` while the
   operation is in flight; the app polls by re-calling the *same* function with

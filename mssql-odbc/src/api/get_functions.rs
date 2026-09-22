@@ -13,11 +13,12 @@ use crate::api::odbc_types::{
     SQL_API_SQLDRIVERCONNECT, SQL_API_SQLENDTRAN, SQL_API_SQLEXECDIRECT, SQL_API_SQLEXECUTE,
     SQL_API_SQLFETCH, SQL_API_SQLFETCHSCROLL, SQL_API_SQLFOREIGNKEYS, SQL_API_SQLFREEHANDLE,
     SQL_API_SQLFREESTMT, SQL_API_SQLGETCONNECTATTR, SQL_API_SQLGETDATA, SQL_API_SQLGETDESCFIELD,
-    SQL_API_SQLGETDIAGFIELD, SQL_API_SQLGETDIAGREC, SQL_API_SQLGETENVATTR, SQL_API_SQLGETFUNCTIONS,
-    SQL_API_SQLGETINFO, SQL_API_SQLGETSTMTATTR, SQL_API_SQLGETTYPEINFO, SQL_API_SQLMORERESULTS,
-    SQL_API_SQLNUMRESULTCOLS, SQL_API_SQLPARAMDATA, SQL_API_SQLPREPARE, SQL_API_SQLPRIMARYKEYS,
-    SQL_API_SQLPROCEDURES, SQL_API_SQLPUTDATA, SQL_API_SQLROWCOUNT, SQL_API_SQLSETCONNECTATTR,
-    SQL_API_SQLSETDESCFIELD, SQL_API_SQLSETENVATTR, SQL_API_SQLSETSTMTATTR,
+    SQL_API_SQLGETDESCREC, SQL_API_SQLGETDIAGFIELD, SQL_API_SQLGETDIAGREC, SQL_API_SQLGETENVATTR,
+    SQL_API_SQLGETFUNCTIONS, SQL_API_SQLGETINFO, SQL_API_SQLGETSTMTATTR, SQL_API_SQLGETTYPEINFO,
+    SQL_API_SQLMORERESULTS, SQL_API_SQLNATIVESQL, SQL_API_SQLNUMPARAMS, SQL_API_SQLNUMRESULTCOLS,
+    SQL_API_SQLPARAMDATA, SQL_API_SQLPREPARE, SQL_API_SQLPRIMARYKEYS, SQL_API_SQLPROCEDURES,
+    SQL_API_SQLPUTDATA, SQL_API_SQLROWCOUNT, SQL_API_SQLSETCONNECTATTR, SQL_API_SQLSETDESCFIELD,
+    SQL_API_SQLSETDESCREC, SQL_API_SQLSETENVATTR, SQL_API_SQLSETSTMTATTR,
     SQL_API_SQLSPECIALCOLUMNS, SQL_API_SQLSTATISTICS, SQL_API_SQLTABLES, SQL_ERROR, SQL_FALSE,
     SQL_INVALID_HANDLE, SQL_SUCCESS, SQL_TRUE, SqlHandle, SqlReturn, SqlUSmallInt,
 };
@@ -49,6 +50,12 @@ pub(crate) unsafe fn sql_get_functions(
     })
 }
 
+/// # Safety
+/// `connection_handle` must be null or point to a live `DbcHandle`.
+/// `supported_ptr`, when non-null, must be writable for one `SqlUSmallInt`, for
+/// `SQL_API_ALL_FUNCTIONS_SIZE` elements when requesting
+/// `SQL_API_ALL_FUNCTIONS`, or for `SQL_API_ODBC3_ALL_FUNCTIONS_SIZE` elements
+/// when requesting `SQL_API_ODBC3_ALL_FUNCTIONS`.
 unsafe fn sql_get_functions_impl(
     connection_handle: SqlHandle,
     function_id: SqlUSmallInt,
@@ -160,6 +167,8 @@ fn supported_function_ids() -> &'static [SqlUSmallInt] {
         SQL_API_SQLGETINFO,
         SQL_API_SQLGETTYPEINFO,
         SQL_API_SQLMORERESULTS,
+        SQL_API_SQLNATIVESQL,
+        SQL_API_SQLNUMPARAMS,
         SQL_API_SQLALLOCHANDLE,
         SQL_API_SQLCLOSECURSOR,
         SQL_API_SQLFREEHANDLE,
@@ -177,12 +186,15 @@ fn supported_function_ids() -> &'static [SqlUSmallInt] {
         SQL_API_SQLPUTDATA,
         SQL_API_SQLENDTRAN,
         SQL_API_SQLCOLATTRIBUTE,
-        // Descriptor field access (AB#47297/AB#47435). Same Windows DM trap
-        // as SQLGetTypeInfo/SQLColAttribute/the catalog functions below: the
-        // SQLXxxW export exists and is implemented, but the DM answers IM001
-        // without calling the driver unless advertised here.
+        // Descriptor field/record access (AB#47297/AB#47435/AB#47437). Same
+        // Windows DM trap as SQLGetTypeInfo/SQLColAttribute/the catalog
+        // functions below: the SQLXxxW export exists and is implemented, but
+        // the DM answers IM001 without calling the driver unless advertised
+        // here.
         SQL_API_SQLGETDESCFIELD,
         SQL_API_SQLSETDESCFIELD,
+        SQL_API_SQLGETDESCREC,
+        SQL_API_SQLSETDESCREC,
         // Catalog functions (AB#46380). Same trap as SQLGetTypeInfo/SQLColAttribute
         // above: the Windows Driver Manager answers IM001 without ever calling the
         // driver unless each is advertised here, even though the SQLXxxW export
@@ -297,7 +309,12 @@ mod tests {
     #[test]
     fn descriptor_field_functions_report_true() {
         let h = TestHandles::with_env_dbc();
-        for id in [SQL_API_SQLGETDESCFIELD, SQL_API_SQLSETDESCFIELD] {
+        for id in [
+            SQL_API_SQLGETDESCFIELD,
+            SQL_API_SQLSETDESCFIELD,
+            SQL_API_SQLGETDESCREC,
+            SQL_API_SQLSETDESCREC,
+        ] {
             let mut supported: SqlUSmallInt = SQL_FALSE;
             let ret = unsafe { sql_get_functions(h.dbc, id, &mut supported) };
             assert_eq!(ret, SQL_SUCCESS, "id {id}");
@@ -392,6 +409,10 @@ mod tests {
         // bits must be set in the ODBC3 bitmap too.
         assert!(bit_set(SQL_API_SQLGETDESCFIELD));
         assert!(bit_set(SQL_API_SQLSETDESCFIELD));
+        // AB#47437: SQLGetDescRec (1009) / SQLSetDescRec (1018) bits must be
+        // set in the ODBC3 bitmap too.
+        assert!(bit_set(SQL_API_SQLGETDESCREC));
+        assert!(bit_set(SQL_API_SQLSETDESCREC));
         // An in-range unsupported id (2) keeps its bit clear.
         assert!(!bit_set(2));
     }

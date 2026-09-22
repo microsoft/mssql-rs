@@ -35,7 +35,11 @@ use crate::handles::{DescHandle, HandleType, handle_from_raw};
 /// Implementation of [`SQLGetDescFieldW`](super::exports::SQLGetDescFieldW).
 ///
 /// # Safety
-/// See the exported function's doc for caller requirements.
+/// `descriptor_handle` must be null or point to a live `DescHandle`. For a
+/// character field, `value_ptr`, when non-null, must be writable for
+/// `buffer_length` bytes; for any other field it must be writable for one value
+/// of that field's declared type. `string_length_ptr`, when non-null, must be
+/// writable for one `SqlInteger`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn sql_get_desc_field_w(
     descriptor_handle: SqlHandle,
@@ -66,6 +70,12 @@ pub(crate) unsafe fn sql_get_desc_field_w(
     })
 }
 
+/// # Safety
+/// `descriptor_handle` must be null or point to a live `DescHandle`. For a
+/// character field, `value_ptr`, when non-null, must be writable for
+/// `buffer_length` bytes; for any other field it must be writable for one value
+/// of that field's declared type. `string_length_ptr`, when non-null, must be
+/// writable for one `SqlInteger`.
 #[allow(clippy::too_many_arguments)]
 unsafe fn sql_get_desc_field_w_impl(
     descriptor_handle: SqlHandle,

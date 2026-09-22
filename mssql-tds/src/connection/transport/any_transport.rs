@@ -10,12 +10,24 @@ use futures::future::Either;
 use crate::connection::transport::network_transport::NetworkTransport;
 use crate::connection::transport::tds_transport::TdsTransport;
 use crate::core::{CancelHandle, TdsResult};
+use crate::datatypes::column_values::ColumnValues;
 use crate::datatypes::row_writer::RowWriter;
 use crate::io::reader_writer::NetworkWriter;
 use crate::io::token_stream::{
     ColumnPolicy, ParserContext, PlpPauseState, RowHeader, RowPauseState, RowReadResult,
+    TdsTokenStreamReader,
 };
 use crate::token::tokens::Tokens;
+
+/// Result of attempting to fully decode a buffered PLP column in one call.
+///
+/// Outer `None` means not enough bytes were buffered yet to complete the attempt (retry once
+/// more data arrives). `Some(None)` means the column is SQL NULL. `Some(Some((written,
+/// known_total, total_read)))` means the value was decoded: `written` is the payload bytes
+/// copied into the caller's output buffer this call, `known_total` is the value's declared
+/// length from the PLP header when the server sent a known length (`None` for unknown-length
+/// PLP), and `total_read` is the cumulative payload bytes consumed across all chunks so far.
+type CompleteBufferedPlp = Option<Option<(usize, Option<u64>, usize)>>;
 
 /// Concrete transport representation held by [`crate::connection::tds_client::TdsClient`].
 ///
@@ -144,6 +156,141 @@ impl AnyTransport {
         }
     }
 
+    /// Attempts to position a row using only bytes already buffered by the active transport.
+    pub(crate) fn try_receive_row_header(
+        &mut self,
+        context: &ParserContext,
+    ) -> TdsResult<Option<RowPauseState>> {
+        match self {
+            Self::Network(transport) => {
+                TdsTokenStreamReader::try_receive_row_header(transport, context)
+            }
+            #[cfg(any(test, feature = "test-util", fuzzing))]
+            Self::Dynamic(transport) => transport.try_receive_row_header(context),
+        }
+    }
+
+    /// Attempts to decode one buffered column while retaining a `sql_variant` base type.
+    pub(crate) fn try_read_buffered_column_with_base(
+        &mut self,
+        pause_state: &RowPauseState,
+        target: usize,
+    ) -> TdsResult<
+        Option<(
+            ColumnValues,
+            Option<crate::datatypes::sqldatatypes::TdsDataType>,
+        )>,
+    > {
+        match self {
+            Self::Network(transport) => {
+                transport.try_read_buffered_column_with_base(pause_state, target)
+            }
+            #[cfg(any(test, feature = "test-util", fuzzing))]
+            Self::Dynamic(transport) => transport
+                .try_read_buffered_column(pause_state, target)
+                .map(|value| value.map(|value| (value, None))),
+        }
+    }
+
+    /// Attempts to read `target`'s 8-byte PLP header from bytes already buffered by the
+    /// active transport.
+    ///
+    /// Returns `Ok(None)` when `target` has no column metadata or the header isn't fully
+    /// buffered yet (not ready; retry once more bytes arrive). `Ok(Some(None))` means the
+    /// column is SQL NULL. `Ok(Some(Some(stream)))` returns a
+    /// [`crate::datatypes::decoder::PlpColumnStream`] positioned to read chunk payload via
+    /// the buffered path. The dynamic test arm never has buffered data, so it always reports
+    /// not ready.
+    pub(crate) fn try_begin_buffered_plp(
+        &mut self,
+        pause_state: &RowPauseState,
+        target: usize,
+    ) -> TdsResult<Option<Option<crate::datatypes::decoder::PlpColumnStream>>> {
+        match self {
+            Self::Network(transport) => transport.try_begin_buffered_plp(pause_state, target),
+            #[cfg(any(test, feature = "test-util", fuzzing))]
+            Self::Dynamic(_) => Ok(None),
+        }
+    }
+
+    /// Attempts to fully decode `target`'s PLP column from bytes already buffered by the
+    /// active transport, in a single call. See [`CompleteBufferedPlp`] for the exact
+    /// outer/inner/tuple semantics of the result.
+    pub(crate) fn try_read_complete_buffered_plp_column(
+        &mut self,
+        pause_state: &RowPauseState,
+        target: usize,
+        out: &mut [u8],
+    ) -> TdsResult<CompleteBufferedPlp> {
+        match self {
+            Self::Network(transport) => {
+                transport.try_read_complete_buffered_plp_column(pause_state, target, out)
+            }
+            #[cfg(any(test, feature = "test-util", fuzzing))]
+            Self::Dynamic(_) => Ok(None),
+        }
+    }
+
+    /// Continues reading payload for an in-progress buffered PLP stream via the active
+    /// transport.
+    ///
+    /// Returns `Ok(None)` when the stream cannot make further progress right now (no more
+    /// buffered, or synchronously readable, packet data available). Returns
+    /// `Ok(Some(written))` with the number of payload bytes copied into `out` this call.
+    pub(crate) fn try_read_buffered_plp(
+        &mut self,
+        plp_state: &mut PlpPauseState,
+        out: &mut [u8],
+    ) -> TdsResult<Option<usize>> {
+        match self {
+            Self::Network(transport) => transport.try_read_buffered_plp(plp_state, out),
+            #[cfg(any(test, feature = "test-util", fuzzing))]
+            Self::Dynamic(_) => Ok(None),
+        }
+    }
+
+    /// Writes as much of the current buffered row as the active transport can complete.
+    pub(crate) fn try_read_buffered_row_into<W: RowWriter + ?Sized>(
+        &mut self,
+        pause_state: &mut RowPauseState,
+        writer: &mut W,
+    ) -> TdsResult<bool> {
+        self.try_read_buffered_row_prefix_into(pause_state, usize::MAX, writer)
+    }
+
+    /// Decodes consecutive buffered columns before `end_column` into `writer` via the active
+    /// transport, leaving `pause_state` advanced to the last completed column.
+    ///
+    /// Returns `Ok(false)` when the next value needs async continuation (not enough buffered
+    /// data), `Ok(true)` once every column up to `end_column` has been written.
+    pub(crate) fn try_read_buffered_row_prefix_into<W: RowWriter + ?Sized>(
+        &mut self,
+        pause_state: &mut RowPauseState,
+        end_column: usize,
+        writer: &mut W,
+    ) -> TdsResult<bool> {
+        match self {
+            Self::Network(transport) => {
+                transport.try_read_buffered_row_prefix_into(pause_state, end_column, writer)
+            }
+            #[cfg(any(test, feature = "test-util", fuzzing))]
+            Self::Dynamic(transport) => {
+                let Some((row, complete)) = transport.try_read_buffered_test_row(pause_state)?
+                else {
+                    return Ok(false);
+                };
+                for value in row
+                    .into_iter()
+                    .take(end_column.saturating_sub(pause_state.next_column_index))
+                {
+                    writer.write_i32(pause_state.next_column_index, value);
+                    pause_state.next_column_index += 1;
+                }
+                Ok(complete || pause_state.next_column_index >= end_column)
+            }
+        }
+    }
+
     pub(crate) async fn resume_row_into<W>(
         &mut self,
         pause_state: RowPauseState,
@@ -237,16 +384,39 @@ impl AnyTransport {
         }
     }
 
+    /// Dispatches ATTENTION with the parser state needed to drain queued rows.
+    ///
+    /// Row tokens are not self-describing, so the network transport needs the
+    /// interrupted operation's metadata to reach DONE_ATTN safely.
     pub(crate) async fn send_attention_with_timeout(
         &mut self,
+        context: &ParserContext,
         timeout: Duration,
     ) -> TdsResult<bool> {
         match self {
             Self::Network(transport) => {
-                TdsTransport::send_attention_with_timeout(transport, timeout).await
+                TdsTransport::send_attention_with_timeout(transport, context, timeout).await
             }
             #[cfg(any(test, feature = "test-util", fuzzing))]
-            Self::Dynamic(transport) => transport.send_attention_with_timeout(timeout).await,
+            Self::Dynamic(transport) => {
+                transport
+                    .send_attention_with_timeout(context, timeout)
+                    .await
+            }
+        }
+    }
+
+    /// Takes control tokens consumed while the network transport drained ATTENTION.
+    ///
+    /// The client must apply these tokens because transaction and session state
+    /// live above the transport layer.
+    pub(crate) fn take_attention_settlement(
+        &mut self,
+    ) -> Option<crate::connection::transport::network_transport::AttentionSettlement> {
+        match self {
+            Self::Network(transport) => transport.take_attention_settlement(),
+            #[cfg(any(test, feature = "test-util", fuzzing))]
+            Self::Dynamic(_) => None,
         }
     }
 
@@ -352,6 +522,7 @@ mod tests {
 
     use super::*;
     use crate::datatypes::column_values::ColumnValues;
+    use crate::datatypes::decoder::PlpColumnStream;
     use crate::datatypes::row_writer::DefaultRowWriter;
     use crate::datatypes::sqldatatypes::{TdsDataType, TypeInfo};
     use crate::message::messages::PacketType;
@@ -522,5 +693,75 @@ mod tests {
 
         assert!(matches!(result, RowReadResult::RowWritten));
         assert_eq!(writer.take_row(), vec![ColumnValues::Int(42)]);
+    }
+
+    fn plp_metadata_column() -> ColumnMetadata {
+        use crate::datatypes::sqldatatypes::{PartialLengthType, TypeInfoVariant};
+
+        ColumnMetadata {
+            user_type: 0,
+            flags: 0,
+            data_type: TdsDataType::BigVarBinary,
+            type_info: TypeInfo {
+                tds_type: TdsDataType::BigVarBinary,
+                length: 0xFFFF,
+                type_info_variant: TypeInfoVariant::PartialLen(
+                    PartialLengthType::BigVarBinary,
+                    Some(0xFFFF),
+                    None,
+                    None,
+                    None,
+                ),
+            },
+            column_name: "col".to_string(),
+            multi_part_name: None,
+            crypto_metadata: None,
+        }
+    }
+
+    fn int_row_pause_state() -> RowPauseState {
+        let ParserContext::ColumnMetadata(metadata, _) = int_row_context() else {
+            unreachable!()
+        };
+        RowPauseState {
+            next_column_index: 0,
+            metadata,
+            nbc_null_bitmap: None,
+            decryptor: None,
+        }
+    }
+
+    /// The dynamic arm never has buffered-transport access to raw PLP bytes,
+    /// so it always reports "not enough buffered data" rather than guessing.
+    #[tokio::test]
+    async fn dynamic_arm_never_begins_a_buffered_plp_column() {
+        let mut transport = AnyTransport::dynamic(create_network_transport_with_data(&[]));
+        let pause_state = int_row_pause_state();
+
+        assert!(matches!(
+            transport.try_begin_buffered_plp(&pause_state, 0),
+            Ok(None)
+        ));
+    }
+
+    /// Same rationale as above but for continuing an already-active PLP
+    /// stream: the dynamic arm always defers to the async path.
+    #[tokio::test]
+    async fn dynamic_arm_never_continues_a_buffered_plp_stream() {
+        let mut transport = AnyTransport::dynamic(create_network_transport_with_data(&[]));
+        let (stream, _) =
+            PlpColumnStream::try_begin_buffered(&plp_metadata_column(), &4u64.to_le_bytes())
+                .unwrap()
+                .unwrap();
+        let mut plp_state = PlpPauseState {
+            row_pause_state: int_row_pause_state(),
+            plp_stream: stream.unwrap(),
+        };
+        let mut out = [0u8; 4];
+
+        assert!(matches!(
+            transport.try_read_buffered_plp(&mut plp_state, &mut out),
+            Ok(None)
+        ));
     }
 }

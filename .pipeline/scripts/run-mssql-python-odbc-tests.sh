@@ -6,10 +6,11 @@
 # bundled Microsoft ODBC Driver 18 binary has been replaced by the Rust
 # mssql-odbc driver (see swap-mssql-python-odbc-driver.sh).
 #
-# The Rust driver is still under construction, so this suite is expected to fail
-# and to hard-crash the interpreter (segfault / abort) on some files. Each test
-# file therefore gets its own pytest process wrapped in `timeout`, so a crash or
-# a hang costs one file instead of the whole run:
+# A test file can hard-crash the interpreter (segfault / abort) against a
+# driver still under active development, so each test file gets its own pytest
+# process wrapped in `timeout`: a crash or a hang costs one file, not the whole
+# run, and the suite is now a blocking compatibility signal rather than an
+# advisory one.
 #
 #   - A crash kills only that file's process; the loop moves to the next file.
 #   - `timeout` bounds every file, so a wedged driver call can never stall the job.
@@ -36,13 +37,11 @@
 # Exit codes:
 #   0  every file passed.
 #   1  tests ran but the run was not clean - failures, crashes, timeouts, or
-#      files skipped because the time budget ran out. This is the expected
-#      baseline while the Rust driver is under development, so the calling step
-#      reports it as a warning (yellow) rather than failing the job.
+#      files skipped because the time budget ran out.
 #   2  the harness itself could not run the tests (broken venv, missing
-#      interpreter, or a run in which no file executed a single test) - the
-#      calling step turns this into a real pipeline error, since it says
-#      nothing about the driver.
+#      interpreter, or a run in which no file executed a single test).
+# The calling step propagates every nonzero exit code, so either failure mode
+# fails the pipeline job.
 
 # No `set -e`: a failing or crashing test file must not abort the loop.
 set -uo pipefail
@@ -234,12 +233,10 @@ echo "==============================================================="
 echo "files: ${#TEST_FILES[@]} | passed: $passed | failed: $failed | crashed: $crashed | timed out: $timedout | no tests: $empty | skipped: $skipped | harness errors: $harness_error"
 echo "==============================================================="
 
-# The two failure modes need distinct exit codes: a broken environment must be a
-# loud, actionable red, while driver test failures are the expected baseline
-# while mssql-odbc is under development. Collapsing both into exit 1 under the
-# step's error handling makes them indistinguishable.
+# The two failure modes need distinct exit codes so the pipeline can distinguish
+# a broken environment from a driver test failure.
 #   2 -> harness could not run the tests (environment defect)
-#   1 -> tests ran and did not fully pass (driver defect, advisory)
+#   1 -> tests ran and did not fully pass (driver defect)
 #   0 -> everything passed
 # Files skipped because the aggregate budget ran out count as "not clean" too:
 # the result set is incomplete, which must not read as a clean pass.
@@ -258,6 +255,6 @@ if [ "$((passed + failed + crashed + timedout))" -eq 0 ]; then
 fi
 
 if [ "$failed" -gt 0 ] || [ "$crashed" -gt 0 ] || [ "$timedout" -gt 0 ] || [ "$skipped" -gt 0 ]; then
-    echo "##[warning]mssql-python suite did not complete cleanly against the mssql-odbc driver (expected while the driver is in development)"
+    echo "##[error]mssql-python suite did not complete cleanly against the mssql-odbc driver"
     exit 1
 fi

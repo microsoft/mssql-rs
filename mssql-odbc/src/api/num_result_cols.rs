@@ -34,6 +34,9 @@ pub(crate) unsafe fn sql_num_result_cols(
     })
 }
 
+/// # Safety
+/// `statement_handle` must be null or point to a live `StmtHandle`.
+/// `column_count_ptr`, when non-null, must be writable for one `SqlSmallInt`.
 unsafe fn sql_num_result_cols_impl(
     statement_handle: SqlHandle,
     column_count_ptr: *mut SqlSmallInt,

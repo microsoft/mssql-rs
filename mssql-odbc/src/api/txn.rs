@@ -11,7 +11,7 @@
 //! batch (`sqlcmisc.cpp:1760`), so the transaction-manager request carries
 //! `NoChange` and inherits the session setting.
 
-use mssql_tds::connection::tds_client::TdsClient;
+use mssql_tds::connection::tds_client::{ExecuteOptions, TdsClient};
 use mssql_tds::message::transaction_management::TransactionIsolationLevel;
 use tracing::{debug, error};
 
@@ -30,7 +30,7 @@ use super::sqlstate::{
 use crate::error::{HasDiagnostics, free_errors, post_sql_error};
 use crate::handles::DbcHandle;
 use crate::handles::dbc::{ConnectionState, DbcState};
-use crate::handles::{StmtHandle, handle_from_raw};
+use crate::handles::{StmtHandle, handle_from_raw, process_is_shutting_down};
 
 /// Maps an ODBC `SQL_TXN_*` bit to the T-SQL clause msodbcsql emits for it
 /// (`sqlcstr.cpp:56-60`). `None` for any value outside the accepted set, which
@@ -266,10 +266,15 @@ pub(super) fn end_transaction(dbc: &DbcHandle, commit: bool, op: &str) -> SqlRet
 /// as holding user work. Called immediately before every statement execution;
 /// on failure the caller unwinds through `fail_with_tds`.
 ///
-/// Mirrors msodbcsql's `CheckOptions` (`sqlccmd.cpp:10572-10585`). Running it
-/// per statement — rather than only at the autocommit switch — is what recovers
-/// from a transaction the server aborted or the application rolled back with
-/// raw T-SQL.
+/// Mirrors msodbcsql's `CheckOptions` (`sqlccmd.cpp:10572-10585`), including
+/// its use of the statement's query timeout: `CheckOptions` passes
+/// `GetQueryTimeOut(lpstmt)` to `ExecTMRImmediate` so this implicit begin
+/// cannot outlast `SQL_ATTR_QUERY_TIMEOUT` any more than the statement it
+/// precedes. `timeout_secs` is that budget (already deducted for any elapsed
+/// time from earlier steps in the same call); `0` means unlimited. Running it
+/// per statement — rather than only at the autocommit switch — is what
+/// recovers from a transaction the server aborted or the application rolled
+/// back with raw T-SQL.
 ///
 /// The transaction-manager request carries `NoChange` so it inherits the
 /// session isolation level already applied by `SET TRANSACTION ISOLATION LEVEL`.
@@ -282,6 +287,7 @@ pub(super) fn begin_transaction_if_manual(
     dbc: &DbcHandle,
     client: &mut TdsClient,
     op: &str,
+    timeout_secs: u32,
 ) -> Result<(), mssql_tds::error::Error> {
     let (autocommit, already_recorded) = match dbc.inner.lock() {
         Ok(state) => (state.autocommit, state.local_tran_started),
@@ -304,8 +310,11 @@ pub(super) fn begin_transaction_if_manual(
         }
     } else {
         debug!("{op}: manual-commit mode with no active transaction — beginning one");
-        dbc.runtime
-            .block_on(client.begin_transaction(TransactionIsolationLevel::NoChange, None))?;
+        dbc.runtime.block_on(client.begin_transaction_with_options(
+            TransactionIsolationLevel::NoChange,
+            None,
+            ExecuteOptions::new().timeout_secs(timeout_secs),
+        ))?;
     }
 
     // The transaction is open on the server at this point; failing to record it
@@ -757,7 +766,19 @@ pub(super) fn set_txn_isolation(dbc: &DbcHandle, value: u64) -> SqlReturn {
 /// session is not left holding locks when the socket drops. Best-effort: every
 /// failure is logged and swallowed, and no diagnostic is posted, because the
 /// caller is already tearing the connection down.
+///
+/// Skipped entirely once the process is exiting — see the round-trip guard
+/// below. `SQLDisconnect` sits between `SQLFreeHandle(SQL_HANDLE_STMT)` and
+/// `SQLFreeHandle(SQL_HANDLE_ENV)` in a host's teardown sequence, so it is on
+/// the same `DLL_PROCESS_DETACH` path those two already guard.
 pub(super) fn rollback_before_disconnect(dbc: &DbcHandle) {
+    rollback_before_disconnect_inner(dbc, process_is_shutting_down())
+}
+
+/// The body of [`rollback_before_disconnect`], with the loader's shutdown flag
+/// passed in rather than read, so the skip arm below — unreachable in a live
+/// process — is testable.
+fn rollback_before_disconnect_inner(dbc: &DbcHandle, process_is_shutting_down: bool) {
     const OP: &str = "SQLDisconnect(rollback)";
 
     // A cursor that will not close leaves the connection mid-batch, so the
@@ -778,7 +799,16 @@ pub(super) fn rollback_before_disconnect(dbc: &DbcHandle) {
     let Some(mut client) = client else {
         return;
     };
-    if client.has_active_transaction()
+    // The rollback is a server round-trip, so it needs the scheduler's worker to
+    // drive the socket — and that worker is gone if the host is disconnecting
+    // from a static destructor or `onexit` handler during
+    // `DLL_PROCESS_DETACH`, where `block_on` would park this thread forever
+    // (AB#47510). Skipping costs nothing the exit does not already cost: this
+    // transaction carries no user work, and the server rolls it back when the
+    // socket closes — the same fallback the cursor-sweep bail-out above takes.
+    if process_is_shutting_down {
+        debug!("{OP}: process is exiting — the server will roll back on disconnect");
+    } else if client.has_active_transaction()
         && let Err(e) = dbc
             .runtime
             .block_on(client.rollback_transaction(None, None))
@@ -1594,5 +1624,53 @@ mod tests {
             .expect("same client reused across cycle");
         assert!(!client.is_connection_dead());
         assert!(state.diag_records().is_empty());
+    }
+
+    /// The AB#47510 guard on the `SQLDisconnect` rollback. A host that
+    /// disconnects from a static destructor or `onexit` handler reaches this
+    /// after the loader has terminated the runtime's worker, where
+    /// `block_on(rollback_transaction())` can never complete. The flag is
+    /// threaded in because a live test process always reads it as `false`;
+    /// without that seam this arm is dead code under test.
+    ///
+    /// The transaction is left open on the client, which is what proves no
+    /// rollback was sent — the server discards it when the socket closes.
+    #[test]
+    fn rollback_before_disconnect_skips_the_round_trip_while_the_process_is_exiting() {
+        use crate::test_support::TestHandles;
+        use mssql_tds::test_client_support::{
+            done_no_more, env_change_rollback_transaction, tds_client_from_tokens_in_transaction,
+        };
+
+        let h = TestHandles::with_env_dbc();
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        {
+            let mut state = dbc.inner.lock().unwrap();
+            // Queued so a rollback that *is* sent completes and clears the
+            // transaction. That is what makes "still active" below evidence of
+            // a skip rather than of a round-trip that merely failed.
+            state.client = Some(tds_client_from_tokens_in_transaction(
+                vec![env_change_rollback_transaction(), done_no_more()],
+                1,
+            ));
+            state.local_tran_started = true;
+        }
+
+        rollback_before_disconnect_inner(dbc, true);
+
+        let state = dbc.inner.lock().unwrap();
+        let client = state
+            .client
+            .as_ref()
+            .expect("the client must be handed back so teardown stays consistent");
+        assert!(
+            client.has_active_transaction(),
+            "the transaction must be left open — a skipped rollback sends nothing"
+        );
+        assert!(
+            state.diag_records().is_empty(),
+            "this path is best-effort and must post no diagnostic"
+        );
     }
 }

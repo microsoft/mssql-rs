@@ -505,8 +505,9 @@ mod sql_collation_tests {
     }
 }
 
-/// Static lookup table for code pages by SortID
-#[allow(dead_code)]
+/// SQL sort-ID code pages from msodbcsql's `Sql/Common/include/tdssort.h`.
+/// Includes IDs 122 and 210..=217 emitted by SQL Server 2022 but absent from
+/// that header; verified with COLLATIONPROPERTY's TDSCollation and CodePage.
 pub(crate) static CODE_PAGE_FROM_SORT_ID: [Option<u16>; 256] = [
     None,       // 0
     None,       // 1
@@ -588,11 +589,11 @@ pub(crate) static CODE_PAGE_FROM_SORT_ID: [Option<u16>; 256] = [
     None,       // 77
     None,       // 78
     None,       // 79
-    None,       // 80
-    None,       // 81
-    None,       // 82
-    None,       // 83
-    None,       // 84
+    Some(1250), // 80
+    Some(1250), // 81
+    Some(1250), // 82
+    Some(1250), // 83
+    Some(1250), // 84
     Some(1250), // 85
     Some(1250), // 86
     Some(1250), // 87
@@ -606,79 +607,79 @@ pub(crate) static CODE_PAGE_FROM_SORT_ID: [Option<u16>; 256] = [
     Some(1250), // 95
     Some(1250), // 96
     Some(1250), // 97
-    Some(1250), // 98
-    Some(1250), // 99
-    Some(1250), // 100
-    Some(1250), // 101
-    Some(1250), // 102
-    Some(1250), // 103
-    None,       // 104
-    None,       // 105
-    None,       // 106
-    None,       // 107
-    None,       // 108
-    Some(1251), // 109
-    Some(1251), // 110
-    Some(1251), // 111
-    Some(1251), // 112
-    Some(1251), // 113
-    None,       // 114
+    None,       // 98
+    None,       // 99
+    None,       // 100
+    None,       // 101
+    None,       // 102
+    None,       // 103
+    Some(1251), // 104
+    Some(1251), // 105
+    Some(1251), // 106
+    Some(1251), // 107
+    Some(1251), // 108
+    None,       // 109
+    None,       // 110
+    None,       // 111
+    Some(1253), // 112
+    Some(1253), // 113
+    Some(1253), // 114
     None,       // 115
     None,       // 116
-    Some(1253), // 117
-    Some(1253), // 118
-    Some(1253), // 119
-    None,       // 120
-    None,       // 121
-    None,       // 122
+    None,       // 117
+    None,       // 118
+    None,       // 119
+    Some(1253), // 120
+    Some(1253), // 121
+    Some(1253), // 122
     None,       // 123
-    None,       // 124
+    Some(1253), // 124
     None,       // 125
-    Some(1253), // 126
-    Some(1253), // 127
-    Some(1253), // 128
-    None,       // 129
-    Some(1253), // 130
+    None,       // 126
+    None,       // 127
+    Some(1254), // 128
+    Some(1254), // 129
+    Some(1254), // 130
     None,       // 131
     None,       // 132
     None,       // 133
     None,       // 134
-    Some(1254), // 135
-    Some(1254), // 136
-    Some(1254), // 137
-    None,       // 138
+    None,       // 135
+    Some(1255), // 136
+    Some(1255), // 137
+    Some(1255), // 138
     None,       // 139
     None,       // 140
     None,       // 141
     None,       // 142
     None,       // 143
-    Some(1255), // 144
-    Some(1255), // 145
-    Some(1255), // 146
+    Some(1256), // 144
+    Some(1256), // 145
+    Some(1256), // 146
     None,       // 147
     None,       // 148
     None,       // 149
     None,       // 150
     None,       // 151
-    None,       // 152
-    Some(1256), // 153
-    Some(1256), // 154
-    Some(1256), // 155
-    None,       // 156
-    None,       // 157
-    None,       // 158
-    None,       // 159
-    None,       // 160
+    Some(1257), // 152
+    Some(1257), // 153
+    Some(1257), // 154
+    Some(1257), // 155
+    Some(1257), // 156
+    Some(1257), // 157
+    Some(1257), // 158
+    Some(1257), // 159
+    Some(1257), // 160
     None,       // 161
-    Some(1257), // 162
-    Some(1257), // 163
-    Some(1257), // 164
-    Some(1257), // 165
-    Some(1257), // 166
-    Some(1257), // 167
-    Some(1257), // 168
-    Some(1257), // 169
-    Some(1257), // 170
+    None,       // 162
+    None,       // 163
+    None,       // 164
+    None,       // 165
+    None,       // 166
+    None,       // 167
+    None,       // 168
+    None,       // 169
+    None,       // 170
     None,       // 171
     None,       // 172
     None,       // 173
@@ -691,51 +692,51 @@ pub(crate) static CODE_PAGE_FROM_SORT_ID: [Option<u16>; 256] = [
     None,       // 180
     None,       // 181
     None,       // 182
-    None,       // 183
-    None,       // 184
-    None,       // 185
-    None,       // 186
+    Some(1252), // 183
+    Some(1252), // 184
+    Some(1252), // 185
+    Some(1252), // 186
     None,       // 187
     None,       // 188
     None,       // 189
     None,       // 190
     None,       // 191
-    None,       // 192
-    None,       // 193
-    Some(1252), // 194
-    Some(1252), // 195
-    Some(1252), // 196
-    Some(1252), // 197
-    None,       // 198
-    None,       // 199
-    None,       // 200
-    None,       // 201
-    None,       // 202
-    Some(932),  // 203
-    Some(932),  // 204
-    Some(949),  // 205
-    Some(949),  // 206
-    Some(950),  // 207
-    Some(950),  // 208
-    Some(936),  // 209
-    Some(936),  // 210
-    Some(932),  // 211
-    Some(949),  // 212
-    Some(950),  // 213
-    Some(936),  // 214
-    Some(874),  // 215
-    Some(874),  // 216
-    Some(874),  // 217
+    Some(932),  // 192
+    Some(932),  // 193
+    Some(949),  // 194
+    Some(949),  // 195
+    Some(950),  // 196
+    Some(950),  // 197
+    Some(936),  // 198
+    Some(936),  // 199
+    Some(932),  // 200
+    Some(949),  // 201
+    Some(950),  // 202
+    Some(936),  // 203
+    Some(874),  // 204
+    Some(874),  // 205
+    Some(874),  // 206
+    None,       // 207
+    None,       // 208
+    None,       // 209
+    Some(1252), // 210
+    Some(1252), // 211
+    Some(1252), // 212
+    Some(1252), // 213
+    Some(1252), // 214
+    Some(1252), // 215
+    Some(1252), // 216
+    Some(1252), // 217
     None,       // 218
     None,       // 219
     None,       // 220
-    Some(1252), // 221
-    Some(1252), // 222
-    Some(1252), // 223
-    Some(1252), // 224
-    Some(1252), // 225
-    Some(1252), // 226
-    Some(1252), // 227
+    None,       // 221
+    None,       // 222
+    None,       // 223
+    None,       // 224
+    None,       // 225
+    None,       // 226
+    None,       // 227
     None,       // 228
     None,       // 229
     None,       // 230
@@ -1072,6 +1073,9 @@ bitflags::bitflags! {
 
         /// Attention.
         const ATTN = 0x0020;
+
+        /// This DONE terminates one RPC inside a batched RPC request.
+        const RPC_IN_BATCH = 0x0080;
 
         /// Server Error.
         const SERVER_ERROR = 0x0100;
@@ -1465,6 +1469,9 @@ mod coverage_tests {
 
         let status = DoneStatus::from(0x0020);
         assert!(status.contains(DoneStatus::ATTN));
+
+        let status = DoneStatus::from(0x0080);
+        assert!(status.contains(DoneStatus::RPC_IN_BATCH));
 
         let status = DoneStatus::from(0x0100);
         assert!(status.contains(DoneStatus::SERVER_ERROR));

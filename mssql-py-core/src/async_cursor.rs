@@ -23,7 +23,7 @@
 //! preserved.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
 use mssql_tds::connection::tds_client::TdsClient;
 use mssql_tds::error::Error;
@@ -33,11 +33,14 @@ use pyo3::types::PyTuple;
 use tokio::sync::Mutex;
 use tracing::instrument::WithSubscriber;
 
+use crate::async_description::DescriptionState;
+use crate::async_errors::ProgrammingError;
 use crate::async_execute::{ExecuteResources, PreparedState, release_prepared_statements};
-use crate::async_fetch::FetchState;
+use crate::async_fetch::{BufferedResults, FetchState};
 use crate::async_session::{
     AsyncConnectionState, ClaimError, CursorCloseClaim, CursorId, SessionOperationGuard,
 };
+use crate::async_tracing::{in_cursor_operation_span, record_result_set_status};
 
 /// Converts a failed session claim into a Python error with operation-specific busy text.
 fn map_claim_error_with_busy_message(error: ClaimError, busy_message: &'static str) -> PyErr {
@@ -46,13 +49,23 @@ fn map_claim_error_with_busy_message(error: ClaimError, busy_message: &'static s
         ClaimError::Closed => PyRuntimeError::new_err("Connection is closed"),
         ClaimError::Broken => PyRuntimeError::new_err("Connection is broken"),
         ClaimError::Busy => PyRuntimeError::new_err(busy_message),
-        ClaimError::NoResultSet => PyRuntimeError::new_err("No active result set"),
+        ClaimError::NoResultSet => ProgrammingError::new_err("No active result set"),
     }
 }
 
 /// Converts a failed cursor operation claim into a Python error.
 pub(crate) fn map_claim_error(error: ClaimError) -> PyErr {
     map_claim_error_with_busy_message(error, "Connection is busy with another cursor operation")
+}
+
+fn clear_result_state(
+    fetch_state: &FetchState,
+    description_state: &DescriptionState,
+    buffered_results: &BufferedResults,
+) {
+    buffered_results.replace(Default::default());
+    description_state.replace(None);
+    fetch_state.set(crate::async_fetch::FetchStatus::NoResultSet);
 }
 
 /// Python-independent resources required to drain and release a cursor.
@@ -63,9 +76,20 @@ struct CursorCleanup {
     cursor_id: CursorId,
     timeout: u32,
     closed: Arc<AtomicBool>,
+    fetch_state: Arc<FetchState>,
+    description_state: Arc<DescriptionState>,
+    buffered_results: Arc<BufferedResults>,
 }
 
 impl CursorCleanup {
+    fn clear_result_state(&self) {
+        clear_result_state(
+            &self.fetch_state,
+            &self.description_state,
+            &self.buffered_results,
+        );
+    }
+
     async fn run(self, claim: CursorCloseClaim) -> Result<(), Error> {
         let mut cleanup_guard =
             SessionOperationGuard::new(self.session_state.clone(), claim.operation_id);
@@ -86,6 +110,7 @@ impl CursorCleanup {
 
         cleanup_guard.settle(has_open_batch);
         // Cleanup consumes the close attempt even when draining or unprepare fails.
+        self.clear_result_state();
         self.closed.store(true, Ordering::Release);
         result?;
         Ok(())
@@ -108,7 +133,10 @@ impl FinalizerCleanup {
     async fn run(mut self, claim: CursorCloseClaim) {
         let cleanup = self.cleanup.take().expect("finalizer cleanup is available");
         if let Err(error) = cleanup.run(claim).await {
+            record_result_set_status("error");
             tracing::warn!("PyAsyncCursor finalizer cleanup failed: {error}");
+        } else {
+            record_result_set_status("closed");
         }
         self.completion_guard.complete();
     }
@@ -165,12 +193,16 @@ pub struct PyAsyncCursor {
     /// `cursor()` time (`0` = no timeout). Applied by the future `execute`
     /// path unless overridden per-call.
     default_query_timeout: u32,
+    arraysize: isize,
     input_sizes: Option<Vec<crate::types::ParameterHint>>,
     input_sizes_generation: u64,
     cleanup_required: Arc<AtomicBool>,
     cleanup_started: Arc<AtomicBool>,
     closed: Arc<AtomicBool>,
     fetch_state: Arc<FetchState>,
+    description_state: Arc<DescriptionState>,
+    rowcount: Arc<AtomicI64>,
+    buffered_results: Arc<BufferedResults>,
 }
 
 impl PyAsyncCursor {
@@ -193,12 +225,16 @@ impl PyAsyncCursor {
             session_state,
             cursor_id,
             default_query_timeout,
+            arraysize: 1,
             input_sizes: None,
             input_sizes_generation: 0,
             cleanup_required: Arc::new(AtomicBool::new(false)),
             cleanup_started: Arc::new(AtomicBool::new(false)),
             closed: Arc::new(AtomicBool::new(false)),
             fetch_state: Arc::new(FetchState::new()),
+            description_state: Arc::new(DescriptionState::new()),
+            rowcount: Arc::new(AtomicI64::new(-1)),
+            buffered_results: Arc::new(BufferedResults::default()),
         }
     }
 
@@ -210,6 +246,9 @@ impl PyAsyncCursor {
             cursor_id: self.cursor_id,
             timeout: self.default_query_timeout,
             closed: self.closed.clone(),
+            fetch_state: self.fetch_state.clone(),
+            description_state: self.description_state.clone(),
+            buffered_results: self.buffered_results.clone(),
         }
     }
 
@@ -223,6 +262,9 @@ impl PyAsyncCursor {
             self.session_state.clone(),
             self.cursor_id,
             self.fetch_state.clone(),
+            self.description_state.clone(),
+            self.buffered_results.clone(),
+            self.rowcount.clone(),
         ))
     }
 
@@ -241,7 +283,11 @@ impl PyAsyncCursor {
             self.input_sizes.clone(),
             self.input_sizes_generation,
             self.cleanup_required.clone(),
+            self.closed.clone(),
             self.fetch_state.clone(),
+            self.description_state.clone(),
+            self.rowcount.clone(),
+            self.buffered_results.clone(),
         ))
     }
 
@@ -288,30 +334,76 @@ impl Drop for PyAsyncCursor {
             }
             Err(ClaimError::Busy) => {
                 tracing::warn!(
+                    cursor_id = self.cursor_id,
+                    operation = "finalize",
                     "PyAsyncCursor finalizer skipped: session busy; prepared handle deferred to connection close"
                 );
                 return;
             }
             Err(error) => {
-                tracing::warn!("PyAsyncCursor finalizer could not claim cleanup: {error:?}");
+                tracing::warn!(
+                    cursor_id = self.cursor_id,
+                    operation = "finalize",
+                    "PyAsyncCursor finalizer could not claim cleanup: {error:?}"
+                );
                 session_state.abandon_cursor(self.cursor_id);
                 return;
             }
         };
+        let operation_id = claim.operation_id;
         let finalizer = FinalizerCleanup {
             cleanup: Some(cleanup),
             completion_guard: FinalizerCompletionGuard::new(session_state, self.cursor_id),
         };
-        pyo3_async_runtimes::tokio::get_runtime().spawn(finalizer.run(claim));
+        pyo3_async_runtimes::tokio::get_runtime().spawn(in_cursor_operation_span(
+            finalizer.run(claim),
+            self.cursor_id,
+            operation_id,
+            "finalize",
+            "closing",
+        ));
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
     use std::sync::Arc;
 
-    use super::FinalizerCompletionGuard;
+    use pyo3::Python;
+
+    use super::{FinalizerCompletionGuard, clear_result_state, map_claim_error};
+    use crate::async_description::DescriptionState;
+    use crate::async_errors::ProgrammingError;
+    use crate::async_fetch::{BufferedResults, BufferedRowSet, FetchState, FetchStatus};
     use crate::async_session::{AsyncConnectionState, ClaimError, ConnectionLifecycle};
+    use crate::row_writer::PyRowWriter;
+
+    #[test]
+    fn clear_result_state_discards_buffered_results() {
+        let fetch_state = FetchState::new();
+        fetch_state.set(FetchStatus::Ready);
+        let description_state = DescriptionState::new();
+        let buffered_results = BufferedResults::default();
+        buffered_results.replace(VecDeque::from([BufferedRowSet {
+            metadata: Vec::new(),
+            rows: VecDeque::from([PyRowWriter::new(0)]),
+        }]));
+        assert!(buffered_results.has_current());
+
+        clear_result_state(&fetch_state, &description_state, &buffered_results);
+
+        assert!(!buffered_results.has_current());
+        assert!(fetch_state.status() == FetchStatus::NoResultSet);
+    }
+
+    #[test]
+    fn no_result_set_claim_maps_to_programming_error() {
+        let error = map_claim_error(ClaimError::NoResultSet);
+
+        Python::attach(|py| assert!(error.is_instance_of::<ProgrammingError>(py)));
+        assert!(error.to_string().contains("No active result set"));
+    }
 
     #[test]
     fn completed_finalizer_preserves_settled_session() {
@@ -348,6 +440,30 @@ impl PyAsyncCursor {
         self.default_query_timeout
     }
 
+    /// A seven-item DB-API descriptor for each column in the current result set.
+    #[getter]
+    fn description<'py>(&self, py: Python<'py>) -> Option<Bound<'py, pyo3::types::PyTuple>> {
+        self.description_state.get(py)
+    }
+
+    /// Number of rows affected by the most recent operation, or `-1` when unknown.
+    #[getter]
+    fn rowcount(&self) -> i64 {
+        self.rowcount.load(Ordering::Acquire)
+    }
+
+    /// Number of rows requested by `fetchmany()` when no size is supplied.
+    #[getter]
+    fn arraysize(&self) -> isize {
+        self.arraysize
+    }
+
+    /// Set the default number of rows requested by `fetchmany()`.
+    #[setter]
+    fn set_arraysize(&mut self, arraysize: isize) {
+        self.arraysize = arraysize;
+    }
+
     /// Set SQL type, size, and scale hints for the next successful `execute()`.
     ///
     /// Each item is a SQL type integer or `(sql_type, size, decimal_digits)`.
@@ -373,9 +489,55 @@ impl PyAsyncCursor {
         crate::async_execute::execute(slf, py, operation, parameters, use_prepare, reset_cursor)
     }
 
+    /// Execute T-SQL once for each parameter row and return this cursor.
+    ///
+    /// Rows execute sequentially after the complete input iterable is validated.
+    /// Positional rows use `?`; mapping rows use `%(name)s`. A SQL error stops
+    /// execution and reports its zero-based parameter-row index. Earlier rows may
+    /// already be committed when autocommit is enabled; an explicit transaction
+    /// remains open for the caller to commit or roll back.
+    ///
+    /// DML row counts are aggregated. The aggregate is `-1` if any surfaced
+    /// statement result has an unknown row count. Row-producing results also set
+    /// `rowcount` to `-1`, are buffered, and retain their boundaries for
+    /// `fetch*()` and `nextset()`. The query timeout applies separately to each execution.
+    /// Peak memory scales with the complete parameter input plus all buffered
+    /// result rows; the input iterable is not streamed during execution.
+    #[pyo3(signature = (operation, seq_of_parameters, *, use_prepare=true))]
+    fn executemany<'py>(
+        slf: Py<Self>,
+        py: Python<'py>,
+        operation: String,
+        seq_of_parameters: &Bound<'_, PyAny>,
+        use_prepare: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        crate::async_execute::executemany(slf, py, operation, seq_of_parameters, use_prepare)
+    }
+
     /// Fetch the next row and return an awaitable resolving to a tuple or `None`.
     fn fetchone<'py>(slf: Py<Self>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         crate::async_fetch::fetchone(slf, py)
+    }
+
+    /// Fetch at most `size` rows, defaulting to `arraysize`.
+    #[pyo3(signature = (size=None))]
+    fn fetchmany<'py>(
+        slf: Py<Self>,
+        py: Python<'py>,
+        size: Option<isize>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let size = size.unwrap_or_else(|| slf.borrow(py).arraysize);
+        crate::async_fetch::fetchmany(slf, py, size)
+    }
+
+    /// Fetch all remaining rows in the current result set.
+    fn fetchall<'py>(slf: Py<Self>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        crate::async_fetch::fetchall(slf, py)
+    }
+
+    /// Advance to the next statement result, returning `True` or `False` at batch end.
+    fn nextset<'py>(slf: Py<Self>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        crate::async_fetch::nextset(slf, py)
     }
 
     /// Drain pending results, release prepared handles, and close this cursor.
@@ -405,6 +567,7 @@ impl PyAsyncCursor {
         let claim = match session_state.claim_cursor_close(cleanup.cursor_id) {
             Ok(claim) => claim,
             Err(ClaimError::Closing | ClaimError::Closed) => {
+                cleanup.clear_result_state();
                 cleanup.closed.store(true, Ordering::Release);
                 return pyo3_async_runtimes::tokio::future_into_py(py, async move {
                     Python::attach(|py| Ok(py.None()))
@@ -416,13 +579,17 @@ impl PyAsyncCursor {
             }
         };
         let operation_id = claim.operation_id;
+        let cursor_id = cleanup.cursor_id;
         let future = async move {
             cleanup.run(claim).await.map_err(|error| {
+                record_result_set_status("error");
                 tracing::error!("PyAsyncCursor::close: failed: {error}");
                 PyRuntimeError::new_err(format!("Cursor close failed: {error}"))
             })?;
+            record_result_set_status("closed");
             Python::attach(|py| Ok(py.None()))
         };
+        let future = in_cursor_operation_span(future, cursor_id, operation_id, "close", "closing");
         let future = async move {
             match dispatch {
                 Some(dispatch) => future.with_subscriber(dispatch).await,

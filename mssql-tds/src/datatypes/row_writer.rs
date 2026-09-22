@@ -45,9 +45,10 @@ pub trait RowWriter {
     /// value, so an implementation must treat both arms identically.
     ///
     /// [`SqlString::decode`] decodes either arm without copying the borrowed
-    /// one and is the consistent choice. [`EncodingType::encoding`] is
-    /// available for transcoding straight into a caller-owned buffer, but note
-    /// it substitutes U+FFFD where `decode` and [`SqlString::to_utf8_string`]
+    /// one and is the consistent choice. [`EncodingType::resolved_encoding`]
+    /// supports transcoding straight into a caller-owned buffer for all mapped
+    /// collations, including CP437/CP850. Its decoder substitutes U+FFFD where
+    /// `decode` and [`SqlString::to_utf8_string`]
     /// panic on malformed [`EncodingType::Utf8`] input (#310) — picking it for
     /// the borrowed arm alone makes the same logical row behave differently
     /// depending on packet alignment.
