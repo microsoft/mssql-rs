@@ -42,7 +42,7 @@ use crate::api::describe_col::odbc_sql_type;
 use crate::api::exec_common::release_busy_if_row_exhausted;
 use crate::api::get_data::{
     TextError, column_value_to_bytes, column_value_to_text, convert_typed_c,
-    converted_narrow_indicator, hex_buffer_elements, transcode_narrow_into_pending,
+    converted_narrow_indicator, decode_narrow_into_pending, hex_buffer_elements,
     utf16le_chunk_to_utf8, widen_into_pending,
 };
 use crate::api::odbc_types::{
@@ -1868,9 +1868,10 @@ unsafe fn deliver_bound_plp(
         let chunk = runtime.block_on(client.read_active_plp_chunk(scratch))?;
         wire_total = chunk.known_total;
 
-        // Once the buffer is full the rest of the value still has to come off
-        // the wire, but decoding it would be pure waste.
-        if truncated {
+        // Known-length narrow text must finish decoding even after the slot
+        // fills: a chunk can leave source bytes held inside the DBCS decoder.
+        // Other truncated deliveries do not need a converted length.
+        if truncated && (!transcode_narrow_to_utf8 || wire_total.is_none()) {
             if chunk.reached_end {
                 break;
             }
@@ -1912,25 +1913,28 @@ unsafe fn deliver_bound_plp(
                 return Ok(RowOutcome::Error(RowIssue::Unsupported));
             };
             decoded_utf8.clear();
-            transcode_narrow_into_pending(
+            // This bound-only decoder is finalized exactly once, including
+            // when the PLP terminator arrives separately from the final bytes.
+            decode_narrow_into_pending(
                 decoder,
                 &mut decoded_utf8,
                 &scratch[..chunk.read],
                 chunk.reached_end,
-                usize::MAX,
             );
             converted_bytes = converted_bytes.saturating_add(decoded_utf8.len());
             converted_wire_read = chunk.total_read;
             // Whole characters only: a partial UTF-8 sequence left in the
             // caller's buffer would not decode.
-            for ch in String::from_utf8_lossy(&decoded_utf8).chars() {
-                let need = ch.len_utf8();
-                if out_bytes.len() + need <= capacity_elements {
-                    let mut enc = [0u8; 4];
-                    out_bytes.extend_from_slice(ch.encode_utf8(&mut enc).as_bytes());
-                } else {
-                    truncated = true;
-                    break;
+            if !truncated {
+                for ch in String::from_utf8_lossy(&decoded_utf8).chars() {
+                    let need = ch.len_utf8();
+                    if out_bytes.len() + need <= capacity_elements {
+                        let mut enc = [0u8; 4];
+                        out_bytes.extend_from_slice(ch.encode_utf8(&mut enc).as_bytes());
+                    } else {
+                        truncated = true;
+                        break;
+                    }
                 }
             }
         } else if let Some(decoder) = narrow_decoder.as_mut() {
@@ -2558,6 +2562,94 @@ mod tests {
                 ));
             }
             assert!(!dbc.runtime.block_on(client.next_row_cursor()).unwrap());
+        }
+    }
+
+    #[test]
+    fn bound_narrow_plp_counts_dbcs_source_held_at_truncation() {
+        use mssql_mock_tds::{ColumnDefinition, ColumnValue, QueryResponse, Row, SqlDataType};
+        use mssql_tds::token::tokens::SqlCollation;
+
+        for (lcid, lead, trail) in [(0x0411, 0x82, 0xa0), (0x0804, 0xc4, 0xe3)] {
+            // The mock's raw-unit PLP carrier supplies A, a DBCS character, a
+            // held lead byte | its trail byte, Z. Override only the converter's
+            // encoding metadata; PLP framing is identical for narrow text.
+            let first = vec![
+                u16::from_le_bytes([b'A', lead]),
+                u16::from_le_bytes([trail, lead]),
+            ];
+            let tail = vec![u16::from_le_bytes([trail, b'Z'])];
+            let response = QueryResponse::new(
+                vec![
+                    ColumnDefinition::new("", SqlDataType::NVarCharMax),
+                    ColumnDefinition::new("", SqlDataType::Int),
+                ],
+                vec![Row::new(vec![
+                    ColumnValue::NVarCharMax(vec![first, tail]),
+                    ColumnValue::Int(42),
+                ])],
+            );
+            let h = TestHandles::with_env_dbc_stmt();
+            let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+            let _server = crate::test_support::connect_mock_server(dbc, "SELECT dbcs", response);
+            let mut state = dbc.inner.lock().unwrap();
+            let client = state.client.as_mut().unwrap();
+            for capacity in [1, 2, 4] {
+                dbc.runtime
+                    .block_on(client.execute("SELECT dbcs".to_string(), ()))
+                    .unwrap();
+                assert!(dbc.runtime.block_on(client.next_row_cursor()).unwrap());
+                assert!(matches!(
+                    dbc.runtime.block_on(client.read_row_column(0)).unwrap(),
+                    CursorColumn::PlpStreaming { .. }
+                ));
+                let mut output = [0xcc_u8; 5];
+                let mut indicator = -99;
+                let binding = binding(
+                    1,
+                    SQL_C_CHAR,
+                    output.as_mut_ptr().cast(),
+                    capacity,
+                    &mut indicator,
+                );
+                let mut scratch = [0; 4];
+                let outcome = unsafe {
+                    deliver_bound_plp(
+                        client,
+                        &dbc.runtime,
+                        &binding,
+                        0,
+                        0,
+                        Some(PlpColumnInfo {
+                            wire_encoding: PlpEncoding::SingleByteText,
+                            text_encoding: Some(EncodingType::LcidBased(SqlCollation {
+                                info: lcid,
+                                lcid_language_id: lcid as i32,
+                                col_flags: 0,
+                                sort_id: 0,
+                            })),
+                        }),
+                        &mut scratch,
+                    )
+                }
+                .unwrap();
+                assert_eq!(outcome, RowOutcome::Info(RowIssue::StringTruncated));
+                assert_eq!(indicator, 8, "A + two three-byte UTF-8 characters + Z");
+                assert_eq!(output[4], 0xcc);
+                if capacity == 1 {
+                    assert_eq!(output[0], 0);
+                } else {
+                    assert_eq!(&output[..2], b"A\0");
+                }
+                assert!(matches!(
+                    dbc.runtime.block_on(client.read_row_column(1)).unwrap(),
+                    CursorColumn::Value {
+                        value: ColumnValues::Int(42),
+                        ..
+                    }
+                ));
+                assert!(!dbc.runtime.block_on(client.next_row_cursor()).unwrap());
+            }
         }
     }
 

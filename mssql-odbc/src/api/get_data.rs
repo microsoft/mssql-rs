@@ -2633,14 +2633,6 @@ pub(crate) fn transcode_narrow_into_pending(
     reached_end: bool,
     out_bytes: usize,
 ) -> usize {
-    // Decode onto the tail of `pending`, sized by the decoder's own worst-case
-    // bound so the output slice cannot be short: the consumed-byte count is
-    // discarded below, so `OutputFull` would drop wire bytes silently.
-    // `max_utf8_buffer_length` also accounts for a partial sequence the decoder
-    // is already holding, which a fixed ratio could not. `None` means the length
-    // would overflow `usize`, unreachable while the read is bounded by the
-    // caller's buffer.
-    //
     // `reached_end` flushes any half-formed sequence to U+FFFD, and the decoder
     // must not be used afterwards. Once the wire is exhausted there is nothing
     // left to feed it, so later calls only drain what is already decoded.
@@ -2651,24 +2643,33 @@ pub(crate) fn transcode_narrow_into_pending(
     // than replaced. Same shape as `widen_into_pending` above, which has carried
     // this guard since before this path existed; tracked in AB#48073.
     if !(payload.is_empty() && reached_end) {
-        let base = pending.len();
-        let headroom = decoder
-            .max_utf8_buffer_length(payload.len())
-            .unwrap_or_else(|| payload.len().saturating_mul(3).saturating_add(3));
-        pending.resize(base + headroom, 0);
-        let (result, _, written, _) =
-            decoder.decode_to_utf8(payload, &mut pending[base..], reached_end);
-        debug_assert_eq!(
-            result,
-            encoding_rs::CoderResult::InputEmpty,
-            "narrow transcode output slice was too short, so input bytes were dropped"
-        );
-        pending.truncate(base + written);
+        decode_narrow_into_pending(decoder, pending, payload, reached_end);
     }
     // A character may be split across two SQLGetData calls at the byte level,
     // exactly as the UTF-16 transcode does it: the application concatenates the
     // chunks, so a boundary anywhere in the byte stream is lossless.
     out_bytes.min(pending.len())
+}
+
+/// Appends all decoded output, finalizing the decoder when `last` is true.
+/// The caller must not reuse a finalized decoder, even for an empty input.
+pub(crate) fn decode_narrow_into_pending(
+    decoder: &mut ResolvedDecoder,
+    pending: &mut Vec<u8>,
+    payload: &[u8],
+    last: bool,
+) {
+    let base = pending.len();
+    // The decoder's bound includes held source bytes; a fixed expansion ratio
+    // alone can leave too little room when a chunk completes a partial character.
+    let headroom = decoder
+        .max_utf8_buffer_length(payload.len())
+        .unwrap_or_else(|| payload.len().saturating_mul(3).saturating_add(3));
+    pending.resize(base + headroom, 0);
+    let (result, read, written, _) = decoder.decode_to_utf8(payload, &mut pending[base..], last);
+    debug_assert_eq!(result, encoding_rs::CoderResult::InputEmpty);
+    debug_assert_eq!(read, payload.len());
+    pending.truncate(base + written);
 }
 
 /// Picks how many UTF-16LE wire bytes to read for the UTF-8 room still free.
@@ -6708,6 +6709,17 @@ mod tests {
         );
         assert!(dbc.inner.lock().unwrap().client.is_some());
         assert!(!stmt_handle.inner.lock().unwrap().result_set_exhausted);
+    }
+
+    #[test]
+    fn narrow_counting_flushes_source_held_before_an_empty_final_chunk() {
+        let mut decoder =
+            ResolvedEncoding::from(encoding_rs::SHIFT_JIS).new_decoder_without_bom_handling();
+        let mut output = Vec::new();
+        decode_narrow_into_pending(&mut decoder, &mut output, b"A\x82", false);
+        assert_eq!(output, b"A");
+        decode_narrow_into_pending(&mut decoder, &mut output, &[], true);
+        assert_eq!(output, b"A\xef\xbf\xbd");
     }
 
     #[test]
