@@ -11,6 +11,11 @@
 //!   path with handshake cost excluded.
 //! - `iter_rows`               — many small mixed-type rows over a fresh
 //!   connection each iteration.
+//! - `row_iteration_cancellation_modes` — compare driver-managed and
+//!   caller-managed cancellation while draining the same rows. It reuses the
+//!   sorted `iter_rows` query, so server and network time can hide the small
+//!   client-side wall difference. Criterion runs driver-managed first, and each
+//!   mode uses its own connection.
 //! - `connect_fetch_multiple_packets` — connect + multi-result-set fetch.
 //!
 //! Environment knobs:
@@ -28,10 +33,10 @@ use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use mssql_tds::{
     connection::{
         client_context::ClientContext,
-        tds_client::{ResultSet, TdsClient},
+        tds_client::{ExecuteOptions, ResultSet, TdsClient},
     },
     connection_provider::tds_connection_provider::TdsConnectionProvider,
-    core::{EncryptionOptions, EncryptionSetting},
+    core::{CancelHandle, EncryptionOptions, EncryptionSetting},
 };
 
 static QUERY_TO_BENCHMARK: &str = "SELECT * FROM sys.databases; select * from sys.columns";
@@ -51,6 +56,24 @@ FROM sys.columns c1
 CROSS JOIN sys.columns c2
 ORDER BY c1.object_id, c1.column_id"#
     )
+}
+
+async fn execute_and_count_rows(
+    client: &mut TdsClient,
+    query: &str,
+    options: ExecuteOptions<'_>,
+) -> u64 {
+    client.execute(query.to_string(), options).await.unwrap();
+    let mut row_count = 0_u64;
+    loop {
+        while client.next_row().await.unwrap().is_some() {
+            row_count += 1;
+        }
+        if !client.advance_to_rows().await.unwrap() {
+            break;
+        }
+    }
+    row_count
 }
 
 fn fetch_large_encrypted(c: &mut Criterion) {
@@ -175,6 +198,54 @@ fn iter_rows(c: &mut Criterion) {
     group.finish();
 }
 
+fn row_iteration_cancellation_modes(c: &mut Criterion) {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let Some(mut driver_managed_client) = try_connect(&rt) else {
+        eprintln!(
+            "row_iteration_cancellation_modes: skipped because the benchmark database is unavailable"
+        );
+        return;
+    };
+    let Some(mut caller_managed_client) = try_connect(&rt) else {
+        eprintln!(
+            "row_iteration_cancellation_modes: skipped because the second benchmark connection is unavailable"
+        );
+        return;
+    };
+    let cancel_handle = CancelHandle::new();
+    let query = iter_rows_query();
+
+    let mut group = c.benchmark_group("row_iteration_cancellation_modes");
+    group.throughput(Throughput::Elements(ROW_COUNT));
+    group.bench_function("driver_managed", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                let row_count = execute_and_count_rows(
+                    &mut driver_managed_client,
+                    &query,
+                    ExecuteOptions::new().cancel(&cancel_handle),
+                )
+                .await;
+                assert_eq!(row_count, ROW_COUNT);
+            });
+        })
+    });
+    group.bench_function("caller_managed", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                let row_count = execute_and_count_rows(
+                    &mut caller_managed_client,
+                    &query,
+                    ExecuteOptions::new().caller_managed_cancellation(),
+                )
+                .await;
+                assert_eq!(row_count, ROW_COUNT);
+            });
+        })
+    });
+    group.finish();
+}
+
 fn connect_fetch_multiple_packets(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
     c.bench_function("connect_fetch_multiple_packets", |b| {
@@ -282,6 +353,6 @@ criterion_group! {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(10),
         );
-    targets = fetch_large_encrypted, connect_only, iter_rows, connect_fetch_multiple_packets
+    targets = fetch_large_encrypted, connect_only, iter_rows, row_iteration_cancellation_modes, connect_fetch_multiple_packets
 }
 criterion_main!(benches);
