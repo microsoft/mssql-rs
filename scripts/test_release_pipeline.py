@@ -107,6 +107,14 @@ def expand(value, parameters):
     return value
 
 
+def _stage_flags(**overrides):
+    """Seed from stages.yml's declared defaults so a new parameter cannot break callers."""
+    source = yaml.safe_load(_BUILD_STAGES.read_text(encoding="utf-8"))
+    flags = {parameter["name"]: parameter["default"] for parameter in source["parameters"]}
+    flags.update(overrides)
+    return flags
+
+
 def test_release_defaults_are_safe():
     pipeline = yaml.safe_load(_PIPELINE.read_text(encoding="utf-8"))
     assert {p["name"]: p["default"] for p in pipeline["parameters"]} == dict.fromkeys(
@@ -543,15 +551,15 @@ def test_python_wheel_install_gate_precedes_artifact_publication(
         for parameter in install_template["parameters"]
         if parameter["name"] == "pythonVersions"
     )
-    flags = {
-        "buildAllTargets": True,
-        "buildPythonWheels": True,
-        "buildOdbcNative": True,
-        "buildRustCrates": False,
-        "testPythonWheelInstalls": True,
-        "isOfficial": True,
-        "publishToFeed": False,
-    }
+    flags = _stage_flags(
+        buildAllTargets=True,
+        buildPythonWheels=True,
+        buildOdbcNative=True,
+        buildRustCrates=False,
+        testPythonWheelInstalls=True,
+        isOfficial=True,
+        publishToFeed=False,
+    )
     pipeline = expand(source, flags)
     build = next(stage for stage in pipeline["stages"] if stage["stage"] == "Build")
     job = next(job for job in build["jobs"] if job.get("job") == job_name)
@@ -622,15 +630,15 @@ def test_windows_and_macos_install_matrix_tracks_release_python_tags() -> None:
     assert min(default_versions, key=lambda v: tuple(map(int, v.split(".")))) == floor
 
     source = yaml.safe_load(_BUILD_STAGES.read_text(encoding="utf-8"))
-    flags = {
-        "buildAllTargets": True,
-        "buildPythonWheels": True,
-        "buildOdbcNative": True,
-        "buildRustCrates": False,
-        "testPythonWheelInstalls": True,
-        "isOfficial": True,
-        "publishToFeed": False,
-    }
+    flags = _stage_flags(
+        buildAllTargets=True,
+        buildPythonWheels=True,
+        buildOdbcNative=True,
+        buildRustCrates=False,
+        testPythonWheelInstalls=True,
+        isOfficial=True,
+        publishToFeed=False,
+    )
     pipeline = expand(source, flags)
     build = next(stage for stage in pipeline["stages"] if stage["stage"] == "Build")
     arm64_job = next(job for job in build["jobs"] if job.get("job") == "Windows_ARM64")
@@ -669,15 +677,15 @@ def test_macos_wheel_install_gate_verifies_both_architectures() -> None:
 @pytest.mark.parametrize("architecture", ("x64", "ARM64"))
 @pytest.mark.parametrize("build_odbc", (False, True))
 def test_manylinux_repair_does_not_depend_on_odbc(architecture: str, build_odbc: bool) -> None:
-    flags = {
-        "buildAllTargets": True,
-        "buildPythonWheels": True,
-        "buildOdbcNative": build_odbc,
-        "buildRustCrates": False,
-        "testPythonWheelInstalls": False,
-        "isOfficial": False,
-        "publishToFeed": True,
-    }
+    flags = _stage_flags(
+        buildAllTargets=True,
+        buildPythonWheels=True,
+        buildOdbcNative=build_odbc,
+        buildRustCrates=False,
+        testPythonWheelInstalls=False,
+        isOfficial=False,
+        publishToFeed=True,
+    )
     pipeline = expand(yaml.safe_load(_BUILD_STAGES.read_text(encoding="utf-8")), flags)
     build = next(stage for stage in pipeline["stages"] if stage["stage"] == "Build")
     job = next(job for job in build["jobs"] if job["job"] == f"Linux_{architecture}")
@@ -726,15 +734,15 @@ def test_nonofficial_nuget_versions_follow_python_distribution(
     )
     staging = tmp_path / "staging"
     staging.mkdir()
-    flags = {
-        "buildAllTargets": True,
-        "buildPythonWheels": True,
-        "buildOdbcNative": True,
-        "buildRustCrates": False,
-        "testPythonWheelInstalls": False,
-        "isOfficial": is_official,
-        "publishToFeed": True,
-    }
+    flags = _stage_flags(
+        buildAllTargets=True,
+        buildPythonWheels=True,
+        buildOdbcNative=True,
+        buildRustCrates=False,
+        testPythonWheelInstalls=False,
+        isOfficial=is_official,
+        publishToFeed=True,
+    )
     pipeline = expand(yaml.safe_load(_BUILD_STAGES.read_text(encoding="utf-8")), flags)
     publish = next(stage for stage in pipeline["stages"] if stage["stage"] == "Publish")
     step = next(
@@ -787,15 +795,15 @@ def test_manylinux_228_builds_use_isolated_cargo_targets(
     job_name: str,
     image: str,
 ) -> None:
-    flags = {
-        "buildAllTargets": True,
-        "buildPythonWheels": True,
-        "buildOdbcNative": True,
-        "buildRustCrates": False,
-        "testPythonWheelInstalls": False,
-        "isOfficial": False,
-        "publishToFeed": False,
-    }
+    flags = _stage_flags(
+        buildAllTargets=True,
+        buildPythonWheels=True,
+        buildOdbcNative=True,
+        buildRustCrates=False,
+        testPythonWheelInstalls=False,
+        isOfficial=False,
+        publishToFeed=False,
+    )
     pipeline = expand(
         yaml.safe_load(_BUILD_STAGES.read_text(encoding="utf-8")), flags
     )
@@ -820,15 +828,15 @@ def test_manylinux_228_builds_use_isolated_cargo_targets(
 
 @pytest.mark.parametrize("job_name", ["Linux_x64", "Linux_ARM64"])
 def test_manylinux_228_odbc_builds_enforce_glibc_ceiling(job_name: str) -> None:
-    flags = {
-        "buildAllTargets": True,
-        "buildPythonWheels": True,
-        "buildOdbcNative": True,
-        "buildRustCrates": False,
-        "testPythonWheelInstalls": False,
-        "isOfficial": False,
-        "publishToFeed": False,
-    }
+    flags = _stage_flags(
+        buildAllTargets=True,
+        buildPythonWheels=True,
+        buildOdbcNative=True,
+        buildRustCrates=False,
+        testPythonWheelInstalls=False,
+        isOfficial=False,
+        publishToFeed=False,
+    )
     pipeline = expand(
         yaml.safe_load(_BUILD_STAGES.read_text(encoding="utf-8")), flags
     )

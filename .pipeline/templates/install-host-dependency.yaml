@@ -10,6 +10,22 @@ parameters:
 
 
 steps:
+# The Azure Linux image is minimal and does not ship these; sql-host/start.sh
+# needs hostname(1) or ip(8) to advertise the agent's private IPv4. Jobs that
+# reach this template do not all run install-deps.sh.
+- script: |
+    missing=""
+    command -v hostname >/dev/null 2>&1 || missing="$missing hostname"
+    command -v ip >/dev/null 2>&1 || missing="$missing iproute"
+    if [ -n "$missing" ]; then
+      echo "Installing missing core utilities:$missing"
+      sudo tdnf install -y $missing
+    else
+      echo "hostname and ip are already present"
+    fi
+  displayName: Ensure core network utilities
+  condition: succeeded()
+
 - ${{ if eq(parameters.installAzCli, true) }}:
   - script: |
       if ! command -v az &> /dev/null

@@ -39,7 +39,9 @@ DEPS="jq \
     python3-pip \
     python3-devel \
     wget \
-    ca-certificates"
+    ca-certificates \
+    hostname \
+    iproute"
 
 # Docker is baked into the x64 images; only ARM has ever installed it here.
 if [ "$ARCH" = "aarch64" ]; then

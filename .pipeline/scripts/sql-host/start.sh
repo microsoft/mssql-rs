@@ -67,12 +67,16 @@ docker network rm "${NETWORK_NAME}" >/dev/null 2>&1 || true
 # 2. Resolve the agent's primary private IPv4 first — we need it both for
 #    the endpoint sentinel and as an extra SAN on the SQL Server's cert
 #    so that ARM test clients can verify the chain when connecting by IP.
-SQL_HOST_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+# `|| true` is required, not defensive: under `set -euo pipefail` a missing or
+# failing hostname kills the script before the ip(8) fallback below can run.
+SQL_HOST_IP="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
 if [ -z "${SQL_HOST_IP}" ]; then
-    SQL_HOST_IP="$(ip -4 -o addr show scope global | awk 'NR==1 {split($4,a,"/"); print a[1]}')"
+    SQL_HOST_IP="$(ip -4 -o addr show scope global 2>/dev/null | awk 'NR==1 {split($4,a,"/"); print a[1]}' || true)"
 fi
 if [ -z "${SQL_HOST_IP}" ]; then
     echo "ERROR: could not resolve a private IPv4 for this agent." >&2
+    echo "       hostname: $(command -v hostname || echo MISSING)" >&2
+    echo "       ip:       $(command -v ip || echo MISSING)" >&2
     exit 1
 fi
 echo "Advertising SQL host endpoint ${SQL_HOST_IP}:${SQL_HOST_PORT}"
