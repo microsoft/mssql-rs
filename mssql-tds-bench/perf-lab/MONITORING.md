@@ -119,8 +119,10 @@ Bump only when **all** of the following hold:
    to accept that drift in the reference commit, so it is investigated rather
    than absorbed.
 
-Criteria 3 and 4 are usually satisfiable from the same pair of runs, since
-criterion 3 already calls for a second one — read both from the confirming run.
+On the platform re-queued for criterion 3, use the confirming run to evaluate
+criterion 4 as well. For the other platform, retain its original run at the same
+candidate commit when checking criterion 4; a confirming run on one platform
+does not establish the absence of drift on the other.
 
 When (1)–(3) hold but (4) does not, report the win and the drift together; the
 drift is the finding, and the bump waits for it to be explained or fixed. Note
