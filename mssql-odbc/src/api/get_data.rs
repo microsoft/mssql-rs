@@ -7964,6 +7964,115 @@ mod tests {
     }
 
     #[test]
+    fn plp_utf8_target_switch_indicator_counts_wide_carry() {
+        for tail in ["", "AB"] {
+            let (h, _server) = open_mock_utf8_plp(vec![format!("\u{1f600}{tail}").into_bytes()]);
+            let mut wide = [0xcc; 4];
+            assert_eq!(
+                read_plp_test_chunk(&h, SQL_C_WCHAR, &mut wide),
+                (SQL_SUCCESS_WITH_INFO, SQL_NO_TOTAL)
+            );
+            assert_eq!(wide, [0x3d, 0xd8, 0, 0]);
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            assert_eq!(
+                stmt.inner
+                    .lock()
+                    .unwrap()
+                    .active_plp
+                    .as_ref()
+                    .unwrap()
+                    .pending_units,
+                [0xde00]
+            );
+
+            let mut first = [0xcc; 2];
+            assert_eq!(
+                read_plp_test_chunk(&h, SQL_C_CHAR, &mut first),
+                (SQL_SUCCESS_WITH_INFO, (2 + tail.len()) as SqlLen)
+            );
+            assert_eq!(first, [0, 0]);
+            let mut rest = [0xcc; 8];
+            assert_eq!(
+                read_plp_test_chunk(&h, SQL_C_CHAR, &mut rest),
+                (SQL_SUCCESS, (1 + tail.len()) as SqlLen)
+            );
+            let mut expected = vec![0xde];
+            expected.extend_from_slice(tail.as_bytes());
+            expected.push(0);
+            assert_eq!(&rest[..expected.len()], expected);
+            assert_eq!(
+                read_plp_test_chunk(&h, SQL_C_CHAR, &mut rest),
+                (SQL_NO_DATA, -999)
+            );
+        }
+    }
+
+    #[test]
+    fn plp_gbk_target_switch_probe_indicator_counts_wide_carry() {
+        for null_target in [false, true] {
+            // GB18030 encodes U+1F600 in four bytes; GBK's decoder accepts it.
+            let (h, _server) = open_mock_gbk_plp(vec![vec![0x94, 0x39, 0xfc, 0x36, b'A', b'B']]);
+            let mut wide = [0xcc; 4];
+            assert_eq!(
+                read_plp_test_chunk(&h, SQL_C_WCHAR, &mut wide),
+                (SQL_SUCCESS_WITH_INFO, SQL_NO_TOTAL)
+            );
+            assert_eq!(wide, [0x3d, 0xd8, 0, 0]);
+            for capacity in [0, 1] {
+                let mut probe = [0xcc; 2];
+                let mut indicator = -999;
+                assert_eq!(
+                    unsafe {
+                        sql_get_data(
+                            h.stmt,
+                            1,
+                            SQL_C_CHAR,
+                            if null_target {
+                                std::ptr::null_mut()
+                            } else {
+                                probe.as_mut_ptr().cast()
+                            },
+                            capacity,
+                            &mut indicator,
+                        )
+                    },
+                    SQL_SUCCESS_WITH_INFO
+                );
+                assert_eq!(indicator, 4);
+                assert_eq!(
+                    probe,
+                    if null_target || capacity == 0 {
+                        [0xcc; 2]
+                    } else {
+                        [0, 0xcc]
+                    }
+                );
+                let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+                assert_eq!(
+                    stmt.inner
+                        .lock()
+                        .unwrap()
+                        .active_plp
+                        .as_ref()
+                        .unwrap()
+                        .pending_units,
+                    [0xde00]
+                );
+            }
+            let mut rest = [0xcc; 8];
+            assert_eq!(
+                read_plp_test_chunk(&h, SQL_C_CHAR, &mut rest),
+                (SQL_SUCCESS, 4)
+            );
+            assert_eq!(&rest[..5], &[0, 0xde, b'A', b'B', 0]);
+            assert_eq!(
+                read_plp_test_chunk(&h, SQL_C_CHAR, &mut rest),
+                (SQL_NO_DATA, -999)
+            );
+        }
+    }
+
+    #[test]
     fn plp_target_switch_drains_wide_carry_as_bytes_across_odd_sized_reads() {
         let (h, _server) = open_mock_plp(vec![vec![0x20ac]]);
         assert_eq!(
