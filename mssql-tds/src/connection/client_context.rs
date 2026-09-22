@@ -1681,8 +1681,8 @@ mod tests {
     #[test]
     fn test_driver_version_from_cargo() {
         let v = DriverVersion::from_cargo_version();
-        // Should parse the crate version "0.1.0"
-        assert_eq!(v, DriverVersion::new(0, 1, 0));
+        // Should parse the crate version "0.2.0"
+        assert_eq!(v, DriverVersion::new(0, 2, 0));
         assert_eq!(v.to_string(), env!("CARGO_PKG_VERSION"));
     }
 
