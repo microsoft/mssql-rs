@@ -4,10 +4,9 @@ trigger:
 - development
 
 parameters:
-# TEMPORARY ON THIS BRANCH: linuxImage defaults to RUST-AZL3 so the whole suite
-# runs on Azure Linux 3. Revert to RUST-UBUSLIM before merging. ARM stays on
-# Ubuntu because RUST-AZL3-ARM64 is only in the throwaway v6 test pool, not the
-# production ARM pools.
+# The host scripts are Azure Linux 3 only, so these must name an AZL3 image. The
+# parameter exists so a pool can be pointed at a different image without editing
+# every job, which is how the Ubuntu retirement was staged.
 - name: linuxImage
   displayName: Agent image for x64 Linux jobs
   type: string
@@ -16,7 +15,7 @@ parameters:
 - name: linuxArmImage
   displayName: Agent image for ARM64 Linux jobs
   type: string
-  default: RUST-UBUNTU-ARM64
+  default: RUST-AZL3-ARM64
 
 - name: buildType
   displayName: Type of the build to produce

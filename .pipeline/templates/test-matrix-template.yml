@@ -2,7 +2,7 @@
 parameters:
   matrix: {}
   poolName: 'RUST-X64-WUS3'
-  poolImageOverride: 'imageOverride -equals RUST-UBUSLIM'
+  poolImageOverride: 'imageOverride -equals RUST-AZL3'
 
 jobs:
   - job: Test_Matrix
@@ -20,7 +20,7 @@ jobs:
       - task: DockerInstaller@0
         inputs:
           dockerVersion: '29.0.0'
-      - template: install-ubuntu-dependency.yaml
+      - template: install-host-dependency.yaml
         parameters:
           installAzCli: false
       - task: DownloadPipelineArtifact@2

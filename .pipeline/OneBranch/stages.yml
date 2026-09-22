@@ -24,12 +24,12 @@
 parameters:
 - name: linuxImage
   type: string
-  default: RUST-UBUSLIM
+  default: RUST-AZL3
   displayName: 'Agent image for x64 Linux jobs'
 
 - name: linuxArmImage
   type: string
-  default: RUST-UBUNTU-ARM64
+  default: RUST-AZL3-ARM64
   displayName: 'Agent image for ARM64 Linux jobs'
 
 - name: buildAllTargets
@@ -312,7 +312,7 @@ stages:
       inputs:
         dockerVersion: '29.0.0'
       displayName: 'Install Docker'
-    - template: /.pipeline/templates/install-ubuntu-dependency.yaml
+    - template: /.pipeline/templates/install-host-dependency.yaml
       parameters:
         installDocker: true
     - ${{ if eq(parameters.buildPythonWheels, true) }}:
@@ -369,7 +369,7 @@ stages:
         condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
       - script: |
           set -e
-          command -v python3 >/dev/null 2>&1 || { sudo apt-get update && sudo apt-get install -y python3; }
+          command -v python3 >/dev/null 2>&1 || { sudo tdnf -y makecache && sudo tdnf install -y python3; }
           sudo chown -R $(whoami):$(whoami) "$(ob_outputDirectory)/wheels"
           python3 "$(Build.SourcesDirectory)/scripts/inject-odbc-into-wheels.py" \
             --wheels-dir "$(ob_outputDirectory)/wheels" \
@@ -461,7 +461,7 @@ stages:
         inputs:
           dockerVersion: '29.0.0'
         displayName: 'Install Docker'
-      - template: /.pipeline/templates/install-ubuntu-dependency.yaml
+      - template: /.pipeline/templates/install-host-dependency.yaml
         parameters:
           installDocker: true
       - ${{ if eq(parameters.buildPythonWheels, true) }}:
@@ -518,7 +518,7 @@ stages:
           condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
         - script: |
             set -e
-            command -v python3 >/dev/null 2>&1 || { sudo apt-get update && sudo apt-get install -y python3; }
+            command -v python3 >/dev/null 2>&1 || { sudo tdnf -y makecache && sudo tdnf install -y python3; }
             sudo chown -R $(whoami):$(whoami) "$(ob_outputDirectory)/wheels"
             python3 "$(Build.SourcesDirectory)/scripts/inject-odbc-into-wheels.py" \
               --wheels-dir "$(ob_outputDirectory)/wheels" \

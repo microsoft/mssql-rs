@@ -19,7 +19,7 @@ parameters:
   - name: linuxImage
     displayName: 'Agent image for x64 Linux jobs'
     type: string
-    default: RUST-UBUSLIM
+    default: RUST-AZL3
 
 stages:
   - stage: Benchmark

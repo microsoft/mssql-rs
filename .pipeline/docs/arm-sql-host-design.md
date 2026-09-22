@@ -354,7 +354,7 @@ unchanged.
   probe. The current default tag (`2025-latest`) does.
 - The ubuntu image used by the x64 SQL host (`RUST-UBUSLIM`) provides
   `curl` and `docker`. The latter is enforced by `DockerInstaller@0` and
-  `install-ubuntu-dependency.yaml`; the former is standard in the image.
+  `install-host-dependency.yaml`; the former is standard in the image.
 - Both ARM and x64 1ES pool agents have `python3` available (used by
   `poll-for-endpoint.sh` for JSON parsing). Standard in the Ubuntu images.
 - **Rerun granularity.** Attempt namespacing makes **Rerun stage** fully clean

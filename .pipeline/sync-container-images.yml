@@ -16,11 +16,11 @@ parameters:
 - name: linuxImage
   displayName: 'Agent image for x64 Linux jobs'
   type: string
-  default: RUST-UBUSLIM
+  default: RUST-AZL3
 - name: linuxArmImage
   displayName: 'Agent image for ARM64 Linux jobs'
   type: string
-  default: RUST-UBUNTU-ARM64
+  default: RUST-AZL3-ARM64
 
 # STAGE 1 (Import) is gated on the queue-time Docker Hub credential variables
 # (DOCKERHUB_USERNAME + DOCKERHUB_PAT): the import stage runs ONLY when
@@ -962,7 +962,7 @@ stages:
       inputs:
         dockerVersion: '29.0.0'
 
-    - template: templates/install-ubuntu-dependency.yaml
+    - template: templates/install-host-dependency.yaml
       parameters:
         installAzCli: false
         installDocker: true

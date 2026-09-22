@@ -11,7 +11,7 @@ parameters:
   artifactName: 'Odbc_Linux_x64'
   nameSuffix: ''
   poolName: 'RUST-X64-WUS3'
-  poolImageOverride: 'imageOverride -equals RUST-UBUSLIM'
+  poolImageOverride: 'imageOverride -equals RUST-AZL3'
 
 jobs:
   - job: Test_Odbc_Matrix${{ parameters.nameSuffix }}
@@ -29,7 +29,7 @@ jobs:
       - task: DockerInstaller@0
         inputs:
           dockerVersion: '29.0.0'
-      - template: install-ubuntu-dependency.yaml
+      - template: install-host-dependency.yaml
         parameters:
           installAzCli: false
       - task: DownloadPipelineArtifact@2

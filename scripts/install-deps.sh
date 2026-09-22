@@ -1,7 +1,5 @@
 #!/bin/bash
 
-export DEBIAN_FRONTEND=noninteractive
-
 print_info() {
     arch
     echo "Current dir is $(pwd)"
@@ -18,87 +16,44 @@ if [ "$ARCH" != "x86_64" ] && [ "$ARCH" != "aarch64" ]; then
     exit 1
 fi
 
-# Azure Linux 3 agents are replacing the Ubuntu ones, whose git-lfs,
-# gss-ntlmssp and python3-pip CVEs are fixed on jammy only under Ubuntu Pro. So
-# resolve the package manager rather than assuming apt.
+# Azure Linux 3 only. The Ubuntu agents were retired because their git-lfs,
+# gss-ntlmssp and python3-pip CVEs are fixed on jammy only under Ubuntu Pro.
 if [ -r /etc/os-release ]; then
     . /etc/os-release
 fi
 
-if command -v apt-get >/dev/null 2>&1; then
-    PKG_MGR="apt"
-elif command -v tdnf >/dev/null 2>&1; then
-    PKG_MGR="tdnf"
-elif command -v dnf >/dev/null 2>&1; then
-    PKG_MGR="dnf"
-else
-    echo "ERROR: no supported package manager found (looked for apt-get, tdnf, dnf)"
+if ! command -v tdnf >/dev/null 2>&1; then
+    echo "ERROR: tdnf not found. This script targets Azure Linux 3 agents."
     echo "       ID=${ID:-unknown} VERSION_ID=${VERSION_ID:-unknown}"
     exit 1
 fi
-echo "INFO: package manager is $PKG_MGR (ID=${ID:-unknown} VERSION_ID=${VERSION_ID:-unknown})"
+echo "INFO: ID=${ID:-unknown} VERSION_ID=${VERSION_ID:-unknown}"
 
-if [ "$PKG_MGR" = "apt" ]; then
-    DEPS="jq \
-        unzip \
-        build-essential \
-        pkg-config \
-        libssl-dev \
-        libkrb5-dev \
-        python-is-python3 \
-        python3.10-venv \
-        pip \
-        python3-pip \
-        wget \
-        apt-transport-https \
-        software-properties-common"
-    DOCKER_PKG="docker.io"
-else
-    # apt-transport-https and software-properties-common are apt plumbing with no
-    # rpm equivalent; python-is-python3 is replaced by the symlink below.
-    DEPS="jq \
-        unzip \
-        build-essential \
-        pkg-config \
-        openssl-devel \
-        krb5-devel \
-        python3 \
-        python3-pip \
-        python3-devel \
-        wget \
-        ca-certificates"
-    DOCKER_PKG="moby-engine"
-fi
+DEPS="jq \
+    unzip \
+    build-essential \
+    pkg-config \
+    openssl-devel \
+    krb5-devel \
+    python3 \
+    python3-pip \
+    python3-devel \
+    wget \
+    ca-certificates"
 
 # Docker is baked into the x64 images; only ARM has ever installed it here.
 if [ "$ARCH" = "aarch64" ]; then
-    DEPS="$DEPS $DOCKER_PKG"
+    DEPS="$DEPS moby-engine"
 fi
-
-pkg_update() {
-    case "$PKG_MGR" in
-        apt)  sudo apt update ;;
-        tdnf) sudo tdnf -y makecache ;;
-        dnf)  sudo dnf -y makecache ;;
-    esac
-}
-
-pkg_install() {
-    case "$PKG_MGR" in
-        apt)  sudo apt install "$@" -y ;;
-        tdnf) sudo tdnf install "$@" -y ;;
-        dnf)  sudo dnf install "$@" -y ;;
-    esac
-}
 
 update_ok=false
 for i in {1..5}; do
-    pkg_update && { update_ok=true; break; }
-    echo "$PKG_MGR update failed, retrying in 5 seconds... (attempt $i/5)"
+    sudo tdnf -y makecache && { update_ok=true; break; }
+    echo "tdnf makecache failed, retrying... (attempt $i/5)"
     sleep $((30 * i))
 done
 if [ "$update_ok" != true ]; then
-    echo "ERROR: $PKG_MGR update failed after 5 attempts"
+    echo "ERROR: tdnf makecache failed after 5 attempts"
     exit 1
 fi
 
@@ -106,17 +61,17 @@ fi
 # Try installing dependencies up to 5 times if it fails
 install_ok=false
 for i in {1..5}; do
-    pkg_install $DEPS && { install_ok=true; break; }
-    echo "$PKG_MGR install failed, retrying in 5 seconds... (attempt $i/5)"
+    sudo tdnf install $DEPS -y && { install_ok=true; break; }
+    echo "tdnf install failed, retrying... (attempt $i/5)"
     sleep $((30 * i))
 done
 if [ "$install_ok" != true ]; then
-    echo "ERROR: $PKG_MGR install failed after 5 attempts"
+    echo "ERROR: tdnf install failed after 5 attempts"
     exit 1
 fi
 
-# apt ships a `pip` shim and a `python` alias via python-is-python3; rpm distros
-# ship neither, and parts of the build call the unsuffixed names.
+# Azure Linux ships only the suffixed names; parts of the build call `python`
+# and `pip` unsuffixed.
 if ! command -v pip >/dev/null 2>&1 && command -v pip3 >/dev/null 2>&1; then
     sudo ln -sf "$(command -v pip3)" /usr/local/bin/pip
 fi
@@ -130,7 +85,7 @@ pip --version && pip install pipenv
 if ! command -v openssl &> /dev/null
 then
     echo "OpenSSL not found, installing..."
-    pkg_install openssl
+    sudo tdnf install openssl -y
 fi
 
 if [ "$ARCH" = "aarch64" ]; then

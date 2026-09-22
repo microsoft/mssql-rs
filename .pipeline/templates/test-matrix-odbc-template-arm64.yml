@@ -56,7 +56,7 @@ parameters:
     default: ''
   - name: poolImageOverride
     type: string
-    default: 'imageOverride -equals RUST-UBUNTU-ARM64'
+    default: 'imageOverride -equals RUST-AZL3-ARM64'
 
 jobs:
   # ------------------------------------------------------------------
@@ -101,7 +101,7 @@ jobs:
         - task: DockerInstaller@0
           inputs:
             dockerVersion: '29.0.0'
-        - template: install-ubuntu-dependency.yaml
+        - template: install-host-dependency.yaml
           parameters:
             installAzCli: false
             installDocker: true
@@ -213,7 +213,7 @@ jobs:
           - task: DockerInstaller@0
             inputs:
               dockerVersion: '29.0.0'
-          - template: install-ubuntu-dependency.yaml
+          - template: install-host-dependency.yaml
             parameters:
               installAzCli: false
               installDocker: true

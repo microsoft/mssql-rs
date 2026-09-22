@@ -34,12 +34,12 @@ parameters:
 - name: linuxImage
   displayName: 'Agent image for x64 Linux jobs'
   type: string
-  default: RUST-UBUSLIM
+  default: RUST-AZL3
 
 - name: linuxArmImage
   displayName: 'Agent image for ARM64 Linux jobs'
   type: string
-  default: RUST-UBUNTU-ARM64
+  default: RUST-AZL3-ARM64
 
 # Publishing is opt-in for safety. When false (the default) the corresponding
 # stage still BUILDS everything but logs a clear DRY RUN message instead of
@@ -172,7 +172,7 @@ extends:
           inputs:
             dockerVersion: '29.0.0'
           displayName: 'Install Docker'
-        - template: /.pipeline/templates/install-ubuntu-dependency.yaml@self
+        - template: /.pipeline/templates/install-host-dependency.yaml@self
           parameters:
             installDocker: true
         - script: bash .pipeline/scripts/stamp-mock-wheel-version.sh
@@ -223,7 +223,7 @@ extends:
           inputs:
             dockerVersion: '29.0.0'
           displayName: 'Install Docker'
-        - template: /.pipeline/templates/install-ubuntu-dependency.yaml@self
+        - template: /.pipeline/templates/install-host-dependency.yaml@self
           parameters:
             installDocker: true
         - script: bash .pipeline/scripts/stamp-mock-wheel-version.sh
@@ -276,7 +276,7 @@ extends:
           inputs:
             dockerVersion: '29.0.0'
           displayName: 'Install Docker'
-        - template: /.pipeline/templates/install-ubuntu-dependency.yaml@self
+        - template: /.pipeline/templates/install-host-dependency.yaml@self
           parameters:
             installDocker: true
         - script: bash .pipeline/scripts/stamp-mock-wheel-version.sh
@@ -329,7 +329,7 @@ extends:
           inputs:
             dockerVersion: '29.0.0'
           displayName: 'Install Docker'
-        - template: /.pipeline/templates/install-ubuntu-dependency.yaml@self
+        - template: /.pipeline/templates/install-host-dependency.yaml@self
           parameters:
             installDocker: true
         - script: bash .pipeline/scripts/stamp-mock-wheel-version.sh

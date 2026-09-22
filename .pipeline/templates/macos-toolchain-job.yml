@@ -15,7 +15,7 @@ parameters:
   type: string
 - name: poolImageOverride
   type: string
-  default: 'imageOverride -equals RUST-UBUSLIM'
+  default: 'imageOverride -equals RUST-AZL3'
 
 jobs:
 - job: Build_${{ parameters.arch }}

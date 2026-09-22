@@ -41,18 +41,6 @@ steps:
       displayName: "Print Linux Agent info"
 
     - script: |
-        # This causes unexpected failures in APT package installation.
-        # Debian-only; the unit does not exist on rpm-based agents.
-        if systemctl list-unit-files unattended-upgrades.service >/dev/null 2>&1 \
-           && systemctl list-unit-files unattended-upgrades.service | grep -q unattended-upgrades; then
-          sudo systemctl disable unattended-upgrades || true
-        else
-          echo "unattended-upgrades not present, nothing to disable"
-        fi
-      displayName: "Disable unattended upgrades"
-      continueOnError: true
-
-    - script: |
         scripts/install-deps.sh ${{ parameters.installdepsparams }}
       displayName: "Install linux dependencies"
 

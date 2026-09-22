@@ -54,7 +54,7 @@ parameters:
 - name: linuxImage
   displayName: 'Agent image for the Linux jobs'
   type: string
-  default: RUST-UBUSLIM
+  default: RUST-AZL3
 
 # The architectures a version covers, deliberately a set rather than a toggle
 # each: they publish together or not at all.
