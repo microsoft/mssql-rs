@@ -868,6 +868,8 @@ stages:
           expectedSentinels: 'Alpine3_18,Alpine3_21,odbc_Alpine3_18,odbc_Alpine3_21'
       - template: test-matrix-template-alpine_arm64.yml
         parameters:
+          sqlHostPoolName: ${{ parameters.poolName }}
+          sqlHostImageOverride: imageOverride -equals ${{ parameters.linuxImage }}
           manageSqlHost: false
           artifactName: 'Build_Linux_ARM'
           poolName: ${{ parameters.armPoolName }}
@@ -883,6 +885,8 @@ stages:
               entry: alpine.sh
       - template: test-matrix-odbc-template-arm64.yml
         parameters:
+          sqlHostPoolName: ${{ parameters.poolName }}
+          sqlHostImageOverride: imageOverride -equals ${{ parameters.linuxImage }}
           poolName: ${{ parameters.armPoolName }}
           poolImageOverride: imageOverride -equals ${{ parameters.linuxArmImage }}
           manageSqlHost: false
@@ -903,6 +907,8 @@ stages:
     - ${{ if eq(parameters.sqlInstanceMode, 'per-job') }}:
       - template: test-matrix-template-alpine_arm64.yml
         parameters:
+          sqlHostPoolName: ${{ parameters.poolName }}
+          sqlHostImageOverride: imageOverride -equals ${{ parameters.linuxImage }}
           artifactName: 'Build_Linux_ARM'
           poolName: ${{ parameters.armPoolName }}
           poolImageOverride: imageOverride -equals ${{ parameters.linuxArmImage }}
@@ -917,6 +923,8 @@ stages:
               entry: alpine.sh
       - template: test-matrix-odbc-template-arm64.yml
         parameters:
+          sqlHostPoolName: ${{ parameters.poolName }}
+          sqlHostImageOverride: imageOverride -equals ${{ parameters.linuxImage }}
           poolName: ${{ parameters.armPoolName }}
           poolImageOverride: imageOverride -equals ${{ parameters.linuxArmImage }}
           sqlInstanceMode: per-job
@@ -1023,6 +1031,8 @@ stages:
           expectedSentinels: 'DebianBookworm,AzLinux3,RHEL9,OracleLinux9,SLES15,Ubuntu22,Ubuntu24,odbc_DebianBookworm,odbc_Ubuntu22,odbc_Ubuntu24,odbc_AzLinux3,odbc_RHEL8'
       - template: test-matrix-template-arm64.yml
         parameters:
+          sqlHostPoolName: ${{ parameters.poolName }}
+          sqlHostImageOverride: imageOverride -equals ${{ parameters.linuxImage }}
           poolName: ${{ parameters.armPoolName }}
           poolImageOverride: imageOverride -equals ${{ parameters.linuxArmImage }}
           manageSqlHost: false
@@ -1052,6 +1062,8 @@ stages:
               entry: deb-bookworm.sh
       - template: test-matrix-odbc-template-arm64.yml
         parameters:
+          sqlHostPoolName: ${{ parameters.poolName }}
+          sqlHostImageOverride: imageOverride -equals ${{ parameters.linuxImage }}
           poolName: ${{ parameters.armPoolName }}
           poolImageOverride: imageOverride -equals ${{ parameters.linuxArmImage }}
           manageSqlHost: false
@@ -1079,6 +1091,8 @@ stages:
       # in the shared host's expectedSentinels above.
       - template: test-matrix-odbc-template-arm64.yml
         parameters:
+          sqlHostPoolName: ${{ parameters.poolName }}
+          sqlHostImageOverride: imageOverride -equals ${{ parameters.linuxImage }}
           poolName: ${{ parameters.armPoolName }}
           poolImageOverride: imageOverride -equals ${{ parameters.linuxArmImage }}
           manageSqlHost: false
@@ -1097,6 +1111,8 @@ stages:
     - ${{ if eq(parameters.sqlInstanceMode, 'per-job') }}:
       - template: test-matrix-template-arm64.yml
         parameters:
+          sqlHostPoolName: ${{ parameters.poolName }}
+          sqlHostImageOverride: imageOverride -equals ${{ parameters.linuxImage }}
           poolName: ${{ parameters.armPoolName }}
           poolImageOverride: imageOverride -equals ${{ parameters.linuxArmImage }}
           sqlInstanceMode: per-job
@@ -1125,6 +1141,8 @@ stages:
               entry: deb-bookworm.sh
       - template: test-matrix-odbc-template-arm64.yml
         parameters:
+          sqlHostPoolName: ${{ parameters.poolName }}
+          sqlHostImageOverride: imageOverride -equals ${{ parameters.linuxImage }}
           poolName: ${{ parameters.armPoolName }}
           poolImageOverride: imageOverride -equals ${{ parameters.linuxArmImage }}
           sqlInstanceMode: per-job
@@ -1148,6 +1166,8 @@ stages:
       # manylinux_2_28 aarch64 so it loads on RHEL 8 / UBI 8 arm64.
       - template: test-matrix-odbc-template-arm64.yml
         parameters:
+          sqlHostPoolName: ${{ parameters.poolName }}
+          sqlHostImageOverride: imageOverride -equals ${{ parameters.linuxImage }}
           poolName: ${{ parameters.armPoolName }}
           poolImageOverride: imageOverride -equals ${{ parameters.linuxArmImage }}
           sqlInstanceMode: per-job

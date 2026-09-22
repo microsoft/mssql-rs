@@ -44,8 +44,9 @@ DEPS="jq \
     iproute"
 
 # Docker is baked into the x64 images; only ARM has ever installed it here.
+# moby-engine is dockerd only, so the client has to come from moby-cli.
 if [ "$ARCH" = "aarch64" ]; then
-    DEPS="$DEPS moby-engine"
+    DEPS="$DEPS moby-engine moby-cli"
 fi
 
 update_ok=false
@@ -91,6 +92,9 @@ then
 fi
 
 if [ "$ARCH" = "aarch64" ]; then
+    # Installing the package does not start dockerd, and install-dependencies.yml
+    # runs `docker ps` straight after this.
+    sudo systemctl enable --now docker
     echo "Changing permissions for docker.sock"
     sudo chmod 666 /var/run/docker.sock
 fi

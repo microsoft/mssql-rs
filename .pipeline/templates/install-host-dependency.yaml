@@ -41,9 +41,12 @@ steps:
 - ${{ if eq(parameters.installDocker, true) }}:
   - script: |
       # Only ARM has ever needed this; the x64 images ship a docker daemon.
+      # Gate on the DAEMON, not the CLI: callers run DockerInstaller@0 first, so
+      # `command -v docker` is already true on a host with no daemon installed.
       ARCH=$(arch)
-      if [ "$ARCH" = "aarch64" ] && ! command -v docker >/dev/null 2>&1; then
-          echo "Docker not found, installing..."
+      if [ "$ARCH" = "aarch64" ] && ! sudo docker info >/dev/null 2>&1; then
+          echo "Docker daemon not reachable, installing..."
+          # moby-engine is dockerd only; the client comes from moby-cli.
           sudo tdnf install moby-engine moby-cli -y
           sudo systemctl enable --now docker
           sudo groupadd -f docker
