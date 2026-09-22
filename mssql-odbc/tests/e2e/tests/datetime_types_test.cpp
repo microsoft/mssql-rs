@@ -18,6 +18,7 @@
 
 #include "odbc_test_fixture.h"
 
+#include <array>
 #include <string>
 
 // SQL Server extension C types. Declared here rather than pulled from
@@ -65,13 +66,65 @@ protected:
             FAIL() << "No connection configured – set ODBC_TEST_SERVER or ODBC_TEST_CONNSTR";
         }
         Connect();
+        SQLCHAR version[64]{};
+        ASSERT_SQL_OK(SQLGetInfoA(dbc_, SQL_DRIVER_VER, version, sizeof(version), nullptr),
+                      SQL_HANDLE_DBC, dbc_);
+        RecordProperty("SQL_DRIVER_VER", reinterpret_cast<const char*>(version));
     }
 
     SQLRETURN ExecDirect(const std::string& sql) {
         SqlTString s = ODBCTestUtils::ToSqlTStr(sql);
         return SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(s.c_str()), SQL_NTS);
     }
+
+    void CheckInvalidCharacterTemporalValues(bool bound) {
+        // ConvertToDateTime rewrites ParseDateTime/field-validation failures to
+        // CVT_CAST_ERROR (sqlccnvt.cpp:4727-4867): ODBC 3 reports 22018, not 22008.
+        constexpr std::array<SQLSMALLINT, 5> targets{
+            SQL_C_TYPE_DATE, SQL_C_TYPE_TIME, SQL_C_TYPE_TIMESTAMP,
+            SQL_C_SS_TIME2, SQL_C_SS_TIMESTAMPOFFSET};
+        for (SQLSMALLINT target : targets) {
+            for (const char* sql_type : {"varchar(100)", "nvarchar(100)"}) {
+                for (const char* literal : {"not-a-date", "0000-01-01 00:00:00",
+                                            "10000-01-01 00:00:00", "2024-13-01 00:00:00",
+                                            "2023-02-29 00:00:00", "2024-01-01 24:00:00",
+                                            "2024-01-01 00:60:00", "2024-01-01 00:00:60",
+                                            "2024-01-01 00:00:00 +14:01",
+                                            "2024-01-01 00:00:00.1234567890"}) {
+                    SCOPED_TRACE(::testing::Message()
+                                 << "target=" << target << ", source=" << sql_type
+                                 << ", literal=" << literal << ", bound=" << bound);
+                    ASSERT_SQL_OK(ExecDirect(std::string("SELECT CAST('") + literal + "' AS "
+                                            + sql_type + ")"),
+                                  SQL_HANDLE_STMT, stmt_);
+                    alignas(SQL_SS_TIMESTAMPOFFSET_STRUCT) std::array<unsigned char, 32> out{};
+                    SQLLEN indicator = -42;
+                    if (bound) {
+                        ASSERT_SQL_OK(SQLBindCol(stmt_, 1, target, out.data(), out.size(),
+                                                &indicator),
+                                      SQL_HANDLE_STMT, stmt_);
+                        EXPECT_EQ(SQL_ERROR, SQLFetchScroll(stmt_, SQL_FETCH_NEXT, 0));
+                    } else {
+                        ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+                        EXPECT_EQ(SQL_ERROR, SQLGetData(stmt_, 1, target, out.data(),
+                                                       out.size(), &indicator));
+                    }
+                    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "22018");
+                    ASSERT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+                    ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_UNBIND), SQL_HANDLE_STMT, stmt_);
+                }
+            }
+        }
+    }
 };
+
+TEST_F(DateTimeTypesLiveTest, InvalidCharacterTemporalValuesViaGetData) {
+    CheckInvalidCharacterTemporalValues(false);
+}
+
+TEST_F(DateTimeTypesLiveTest, InvalidCharacterTemporalValuesViaBoundFetch) {
+    CheckInvalidCharacterTemporalValues(true);
+}
 
 // ---------------------------------------------------------------------------
 // SQL_C_TYPE_DATE

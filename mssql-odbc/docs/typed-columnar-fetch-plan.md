@@ -93,6 +93,30 @@ A source with no interpretation for the requested target (binary, guid) is `0700
 
 Max-length character sources (`varchar(max)` / `nvarchar(max)`) into the numeric and date/time targets are **excluded** from P1a and tracked as Task [47238](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47238). They arrive as PLP, so parsing needs the ODBC layer to accumulate chunks, which inverts the "never buffer the full PLP payload" invariant that `stream_active_plp_chunk` documents. That work is sequenced after #204 and #215, which are both rewriting the same read path, and needs a bounded-prefix policy agreed first so a 2 GB column cannot be drained to produce a `SQL_C_SLONG`.
 
+#### Temporal fetch errors (#529)
+
+Temporal C targets distinguish invalid decoded fields (`22007`), conversion
+arithmetic overflow (`22008`), and illegal source/target pairings (`07006`).
+Character literals with invalid syntax or fields remain `22018`; successful
+conversions that drop a nonzero component retain `01S07`. The buffered
+`SQLGetData` and bound-fetch fast paths use the same classification.
+
+The ODBC 3 distinction comes from msodbcsql's `ConvertToDateTime` native
+validation and character-parser branches (`sqlccnvt.cpp:3661-3935,4727-4867`),
+called by `OdbcDataFromSqlData` with `TODRIVER`. `sqlcprot.h:945-959` and
+`clntcomn.cpp:1015-1018,1204-1208,1388-1395` map invalid temporal fields to
+`22007`, not the ODBC 2 `22008` mapping. Character-input cases across all five
+temporal C targets and both fetch paths were measured on Linux with
+msodbcsql 18.6.2.1-1 (`SQL_DRIVER_VER=18.06.0002`) by
+`DateTimeTypesLiveTest.InvalidCharacterTemporalValuesViaGetData` and
+`InvalidCharacterTemporalValuesViaBoundFetch`.
+
+Malformed decoded native values are covered by Rust regressions, not a retail
+wire-level comparison: a normal SQL Server cannot produce them. In particular,
+checked-arithmetic rejection of extreme ticks is driver hardening, not a claim
+that msodbcsql handles identical corrupt bytes the same way. Closing that
+evidence gap requires replaying malformed temporal TDS rows to both drivers.
+
 #### Known divergences from msodbcsql
 
 These were found by reading `Sql/Ntdbms/sqlncli/odbc/sqlccnvt.cpp` while reviewing P1a. They are recorded here because `GetDataLiveTest` skips the msodbcsql comparison leg for these cases, so the parity run will not surface them.
