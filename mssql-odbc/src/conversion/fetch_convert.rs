@@ -373,9 +373,9 @@ pub(crate) fn datetimeoffset_parts(
     {
         return Err(ConvError::InvalidDatetimeFormat);
     }
-    // Keep conversion arithmetic overflow distinct from invalid decoded fields:
-    // msodbcsql's CVT_DT_OVERFLOW is 22008, while CVT_DT/TM_ERROR map to 22007
-    // for ODBC 3 (sqlcprot.h; clntcomn.cpp's SQLSTATE table).
+    // The guards above make these overflow errors unreachable. Keep checked
+    // arithmetic as a defensive backstop, mapped to CVT_DT_OVERFLOW / 22008
+    // rather than invalid decoded fields / 22007 (sqlcprot.h; clntcomn.cpp).
     let utc_ticks = i64::try_from(datetime.datetime2.time.time_nanoseconds)
         .map_err(|_| ConvError::DatetimeFieldOverflow)?
         .checked_add(i64::from(datetime.offset) * 60 * 10_000_000)
@@ -491,11 +491,13 @@ pub(crate) unsafe fn convert_datetime_c(
 ) -> Result<ConvOk, ConvError> {
     if matches!(
         (value, target_type),
-        (ColumnValues::Time(_), SQL_C_TYPE_DATE | SQL_C_DATE)
-            | (
-                ColumnValues::Date(_),
-                SQL_C_TYPE_TIME | SQL_C_TIME | SQL_C_SS_TIME2
-            )
+        (
+            ColumnValues::Time(_),
+            SQL_C_TYPE_DATE | SQL_C_DATE | SQL_C_SS_TIMESTAMPOFFSET
+        ) | (
+            ColumnValues::Date(_),
+            SQL_C_TYPE_TIME | SQL_C_TIME | SQL_C_SS_TIME2
+        )
     ) {
         return Err(ConvError::Restricted);
     }
@@ -2623,6 +2625,10 @@ mod tests {
                 time_nanoseconds: u64::MAX,
                 scale: 7,
             }),
+            ColumnValues::Time(SqlTime {
+                time_nanoseconds: 0,
+                scale: 8,
+            }),
             ColumnValues::DateTime2(SqlDateTime2 {
                 days: 0,
                 time: SqlTime {
@@ -2712,7 +2718,10 @@ mod tests {
                     result,
                     Err(
                         if matches!(value, ColumnValues::Time(_))
-                            && matches!(target, SQL_C_TYPE_DATE | SQL_C_DATE)
+                            && matches!(
+                                target,
+                                SQL_C_TYPE_DATE | SQL_C_DATE | SQL_C_SS_TIMESTAMPOFFSET
+                            )
                         {
                             ConvError::Restricted
                         } else {

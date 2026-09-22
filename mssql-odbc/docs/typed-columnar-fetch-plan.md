@@ -95,11 +95,20 @@ Max-length character sources (`varchar(max)` / `nvarchar(max)`) into the numeric
 
 #### Temporal fetch errors (#529)
 
-Temporal C targets distinguish invalid decoded fields (`22007`), conversion
-arithmetic overflow (`22008`), and illegal source/target pairings (`07006`).
+Temporal C targets distinguish invalid decoded fields (`22007`) from illegal
+source/target pairings (`07006`). The conversion arithmetic overflow (`22008`)
+variant and its diagnostic mappings are defensive backstops: decoded-field
+guards make every producer unreachable today. The overflow mapping tests inject
+the error directly; they do not demonstrate a reachable input.
 Character literals with invalid syntax or fields remain `22018`; successful
 conversions that drop a nonzero component retain `01S07`. The buffered
 `SQLGetData` and bound-fetch fast paths use the same classification.
+
+Character output targets (`SQL_C_CHAR` and `SQL_C_WCHAR`) deliberately retain
+the existing `TextError::Unsupported` / `HYC00` mapping for temporal extraction
+failures in both fetch paths, including newly rejected scales, legacy dates,
+and out-of-day ticks. This change does not extend the struct-target diagnostics
+to text output or claim retail parity for malformed native values.
 
 The ODBC 3 distinction comes from msodbcsql's `ConvertToDateTime` native
 validation and character-parser branches (`sqlccnvt.cpp:3661-3935,4727-4867`),
