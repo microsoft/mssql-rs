@@ -8,7 +8,7 @@ We build Python wheels inside **manylinux** and **musllinux** containers to:
 - ✅ Avoid GitHub API rate limits (no need to download Python from GitHub)
 - ✅ Ensure binary compatibility across Linux distributions
 - ✅ Use official PyPA (Python Packaging Authority) build environments
-- ✅ Build for multiple Python versions (3.10-3.14) in one step
+- ✅ Build one `cp310-abi3` wheel for CPython 3.10 and later
 - ✅ Support both x64 and ARM64 architectures
 
 ## Container Images
@@ -139,7 +139,7 @@ The Azure DevOps pipeline automatically builds wheels in containers:
 2. Pulls the appropriate container image
 3. Mounts source code into the container
 4. Runs `build-python-wheels-in-container.sh`
-5. Builds wheels for Python 3.10, 3.11, 3.12, 3.13, 3.14
+5. Builds one `cp310-abi3` wheel for the target platform
 6. Publishes wheels as build artifacts
 
 ## About manylinux and musllinux
@@ -206,21 +206,11 @@ Vanilla Images (no suffix):
       └── No customization
 ```
 
-### Modify Python Versions
+### Modify the Stable ABI Floor
 
-Edit `.pipeline/templates/build-python-wheels-template.yml`:
-
-```yaml
-parameters:
-- name: pythonVersions
-  type: object
-  default:
-  - '3.10'
-  - '3.11'
-  - '3.12'
-  - '3.13'
-  - '3.14'  # Add/remove versions here
-```
+The wheel uses the CPython 3.10 stable ABI. To change that floor, update the
+PyO3 `abi3-py310` feature and all `cp310-abi3` wheel selection and validation
+logic together.
 
 ## Troubleshooting
 
