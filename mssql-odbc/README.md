@@ -195,6 +195,8 @@ buffers unchanged; no truncated numeric prefix is returned. See
 [deviation 7](docs/parity-deviations.md) for the measured native-driver difference.
 Fallible materialization allocation failures drain the value and report `HY001`
 instead of the size-limit diagnostic.
+Typed reads and rejected-value drains reuse an 8 KiB scratch buffer within one
+`SQLGetData` call; internal chunks do not require additional application calls.
 Empty character values retrieved as numeric or GUID C targets succeed with
 indicator 0 and leave the value buffer unchanged, matching msodbcsql18. Empty
 date/time literals remain `22018`. SQL NULL still uses `SQL_NULL_DATA` and

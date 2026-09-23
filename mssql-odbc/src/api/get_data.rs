@@ -52,6 +52,8 @@ use mssql_tds::query::metadata::PlpEncoding;
 /// to an arbitrarily large MAX value.
 const MAX_PLP_PREFETCH_BYTES: usize = 64 * 1024;
 
+const TYPED_PLP_CHUNK_BYTES: usize = 8 * 1024;
+
 /// Implements SQLGetData for current-row retrieval.
 ///
 /// Current scope:
@@ -1622,6 +1624,7 @@ struct PlpReadProgress {
     completing_surrogate: bool,
     completing_narrow: bool,
     typed_bytes: Vec<u8>,
+    typed_scratch: Vec<u8>,
     typed_error: Option<DiagMsg>,
 }
 
@@ -1926,7 +1929,7 @@ fn stream_active_plp_chunk_once<'a>(
             .cast()
     };
     let payload_capacity = if typed_target {
-        256
+        TYPED_PLP_CHUNK_BYTES
     } else {
         (buffer_length as usize).saturating_sub(terminator_bytes)
     };
@@ -2124,8 +2127,33 @@ fn stream_active_plp_chunk_once<'a>(
     let direct_wire_output =
         max_read > 0 && !target_value_ptr.is_null() && !staged_binary_read && wire_shaped_output;
     let mut inline_payload = [0_u8; 256];
-    let mut heap_payload = Vec::new();
-    let payload = if direct_wire_output {
+    let mut heap_payload = if typed_target {
+        std::mem::take(&mut progress.typed_scratch)
+    } else {
+        Vec::new()
+    };
+    let payload = if typed_target {
+        if heap_payload.is_empty()
+            && progress
+                .typed_error
+                .is_none_or(|diag| diag.state != SQLSTATE_HY001)
+        {
+            if heap_payload
+                .try_reserve_exact(TYPED_PLP_CHUNK_BYTES)
+                .is_ok()
+            {
+                heap_payload.resize(TYPED_PLP_CHUNK_BYTES, 0);
+            } else {
+                progress.typed_error.get_or_insert(ERR_MEMORY_ALLOCATION);
+            }
+        }
+        if heap_payload.is_empty() {
+            // Allocation failure must still drain without allocating again.
+            inline_payload.as_mut_slice()
+        } else {
+            heap_payload.as_mut_slice()
+        }
+    } else if direct_wire_output {
         // The application owns this writable buffer for the duration of the ODBC
         // call. Initialize it before forming a byte slice because ODBC output
         // buffers may contain uninitialized storage; `max_read` reserves the
@@ -2361,8 +2389,9 @@ fn stream_active_plp_chunk_once<'a>(
                 progress.typed_error = Some(ERR_PLP_TYPED_LIMIT);
             }
         }
+        progress.typed_scratch = heap_payload;
         if !reached_end {
-            progress.retry_bytes = 256;
+            progress.retry_bytes = TYPED_PLP_CHUNK_BYTES;
             return SQL_SUCCESS_WITH_INFO;
         }
         state.active_plp = None;
@@ -7874,6 +7903,71 @@ mod tests {
     }
 
     #[test]
+    fn typed_plp_materialization_and_rejection_reuse_large_read_chunks() {
+        for length in [
+            TYPED_PLP_CHUNK_BYTES - 1,
+            TYPED_PLP_CHUNK_BYTES,
+            TYPED_PLP_CHUNK_BYTES + 1,
+            1024 * 1024 + 1,
+        ] {
+            for known in [false, true] {
+                let handles = TestHandles::with_env_dbc_stmt();
+                prefetched_text_stream(
+                    &handles,
+                    PlpEncoding::SingleByteText,
+                    Some(encoding_rs::WINDOWS_1252.into()),
+                    vec![b'0'; length],
+                    known.then_some(u64::try_from(length).unwrap()),
+                );
+                let stmt = unsafe { handle_from_raw::<StmtHandle>(handles.stmt) };
+                let mut progress = PlpReadProgress::default();
+                let mut scratch_ptr = None;
+                let mut value = -99_i32;
+                let mut indicator = -99;
+                let reads = length.div_ceil(TYPED_PLP_CHUNK_BYTES);
+                for chunk in 1..=reads {
+                    let rc = stream_active_plp_chunk_once(
+                        stmt,
+                        handles.stmt,
+                        1,
+                        SQL_C_SLONG,
+                        (&mut value as *mut i32).cast(),
+                        0,
+                        &mut indicator,
+                        false,
+                        None,
+                        None,
+                        &mut progress,
+                    );
+                    assert_eq!(progress.typed_scratch.len(), TYPED_PLP_CHUNK_BYTES);
+                    assert_eq!(
+                        *scratch_ptr.get_or_insert(progress.typed_scratch.as_ptr()),
+                        progress.typed_scratch.as_ptr()
+                    );
+                    if chunk < reads {
+                        assert_eq!(rc, SQL_SUCCESS_WITH_INFO);
+                        assert_eq!(progress.retry_bytes, TYPED_PLP_CHUNK_BYTES);
+                        assert_eq!((value, indicator), (-99, -99));
+                    } else {
+                        assert_eq!(progress.retry_bytes, 0);
+                        if length > 1024 * 1024 {
+                            assert_eq!(rc, SQL_ERROR);
+                            assert_eq!((value, indicator), (-99, -99));
+                            assert_last_diag(
+                                &stmt.inner.lock().unwrap().diag_records,
+                                ERR_PLP_TYPED_LIMIT,
+                            );
+                        } else {
+                            assert_eq!(rc, SQL_SUCCESS);
+                            assert_eq!((value, indicator), (0, 4));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn typed_plp_known_and_unknown_lengths_respect_the_limit() {
         for length in [256, 1024 * 1024, 1024 * 1024 + 1] {
             for known in [false, true] {
@@ -8204,8 +8298,8 @@ mod tests {
                 &handles,
                 PlpEncoding::SingleByteText,
                 Some(encoding_rs::WINDOWS_1252.into()),
-                vec![b'0'; 513],
-                Some(513),
+                vec![b'0'; 2 * TYPED_PLP_CHUNK_BYTES + 1],
+                Some(u64::try_from(2 * TYPED_PLP_CHUNK_BYTES + 1).unwrap()),
             );
             let mut value = -99_i32;
             let mut indicator = -99;
