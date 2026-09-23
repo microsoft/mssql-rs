@@ -344,6 +344,13 @@ guarantees first; preserve existing guards meanwhile.
   precision/scale. A `SQL_NUMERIC_STRUCT` header is not the prepared declaration.
 - No descriptor identity, lifetime counter, or persistent metadata snapshot is
   needed for this sequential cache-invalidation policy.
+- Do not extend that sequential claim to IPD mutation overlapping synchronous
+  execute. The existing snapshot/stage/restore sequence can lose invalidation;
+  a pending flag only while the plan is absent does not close every window.
+  Treat this as a separate concurrency gap, not application misuse or an
+  assumed Driver Manager serialization guarantee. ODBC's
+  [multithreading contract](https://learn.microsoft.com/sql/odbc/reference/develop-app/multithreading)
+  is distinct from the Need Data rule below.
 - A DAE binding snapshot is not permission to change the live definition while
   the statement is in Need Data. `SQLBindParameter` and associated descriptor
   setters are DM-enforced `HY010` errors in that state (see their

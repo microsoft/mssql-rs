@@ -302,6 +302,17 @@ the SQL definition changes; there is no per-execute metadata key or comparison.
 The existing plan and deferred-unprepare state still travel through arrays and
 data-at-execution.
 
+This policy covers sequential mutations between completed calls. Concurrent
+IPD mutation during synchronous `SQLExecute` remains a known limitation: an
+edit after the binding snapshot can miss the staged plan, which execution
+later restores with its old declaration. Serialize parameter edits with
+execution to avoid this gap. Closing it requires coordinating the descriptor
+snapshot, plan staging, and restoration; a flag set only while the plan is
+absent would not cover the earlier snapshot-to-staging window. This is separate
+from the Need Data restriction below, not a claim that synchronous
+cross-thread calls are inherently invalid or that every Driver Manager
+serializes them.
+
 Definition changes must occur outside a data-at-execution Need Data sequence.
 `SQLBindParameter` and associated `SQLSetDescField`/`SQLSetDescRec` calls in that
 state are DM-enforced `HY010` errors. Keeping execution snapshots does not grant
