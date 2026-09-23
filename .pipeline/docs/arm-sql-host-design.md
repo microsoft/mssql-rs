@@ -355,9 +355,9 @@ unchanged.
 - The Azure Linux image used by the x64 SQL host (`RUST-AZL3`) provides
   `curl` and `docker`. The latter is enforced by `DockerInstaller@0` and
   `install-host-dependency.yaml`; the former is standard in the image.
-  `hostname` and `iproute` are *not* in the base image, so
-  `install-host-dependency.yaml` installs them: `start.sh` needs one of the two
-  to advertise the agent's private IPv4.
+  The image also ships `net-tools` and `iproute`, but `net-tools`' `hostname`
+  has no `-I` flag and exits 3 on it, so `start.sh` relies on the `ip(8)`
+  fallback to advertise the agent's private IPv4.
 - Both ARM and x64 1ES pool agents have `python3` available (used by
   `poll-for-endpoint.sh` for JSON parsing). Standard in the Azure Linux images.
 - **Rerun granularity.** Attempt namespacing makes **Rerun stage** fully clean

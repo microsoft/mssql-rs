@@ -67,8 +67,10 @@ docker network rm "${NETWORK_NAME}" >/dev/null 2>&1 || true
 # 2. Resolve the agent's primary private IPv4 first — we need it both for
 #    the endpoint sentinel and as an extra SAN on the SQL Server's cert
 #    so that ARM test clients can verify the chain when connecting by IP.
-# `|| true` is required, not defensive: under `set -euo pipefail` a missing or
-# failing hostname kills the script before the ip(8) fallback below can run.
+# `|| true` is required, not defensive. The Azure Linux image ships net-tools,
+# whose hostname(1) has no -I flag (that is the Debian hostname package) and
+# exits 3 on it. Under `set -euo pipefail` that killed the script here, before
+# the ip(8) fallback below could run.
 SQL_HOST_IP="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
 if [ -z "${SQL_HOST_IP}" ]; then
     SQL_HOST_IP="$(ip -4 -o addr show scope global 2>/dev/null | awk 'NR==1 {split($4,a,"/"); print a[1]}' || true)"

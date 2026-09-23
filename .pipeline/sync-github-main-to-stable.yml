@@ -38,6 +38,12 @@ resources:
     name: mssql-rs/mssql-rs
     ref: refs/heads/stable
 
+variables:
+# This pipeline only moves git refs and opens a PR; nothing is compiled, so the
+# org decorator's injection only adds job time.
+- name: Codeql.SkipTaskAutoInjection
+  value: true
+
 pool:
   name: RUST-X64-WUS3
   demands:

@@ -39,9 +39,7 @@ DEPS="jq \
     python3-pip \
     python3-devel \
     wget \
-    ca-certificates \
-    hostname \
-    iproute"
+    ca-certificates"
 
 # Docker is baked into the x64 images; only ARM has ever installed it here.
 # moby-engine is dockerd only, so the client has to come from moby-cli.

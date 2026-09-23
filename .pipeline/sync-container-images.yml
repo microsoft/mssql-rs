@@ -132,6 +132,10 @@ schedules:
   always: true
 
 variables:
+  # Container images are pulled, built from Dockerfiles and pushed; none of our
+  # own source is compiled here, so the org decorator's injection only adds job
+  # time.
+  Codeql.SkipTaskAutoInjection: true
   ACR_NAME: 'tdslibrs'
   ACR_REGISTRY: 'tdslibrs.azurecr.io'
   GHCR_REGISTRY: 'ghcr.io'
