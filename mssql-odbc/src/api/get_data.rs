@@ -880,14 +880,8 @@ fn try_deliver_complete_buffered_unicode_plp(
         unsafe { write_if_some(strlen_or_ind_ptr, chunk.read as SqlLen) };
         SQL_SUCCESS
     } else {
-        // SAFETY: as above for the indicator; the caller also guarantees room
-        // for at least one `SqlWChar`, so the empty-string terminator fits.
-        unsafe {
-            write_if_some(strlen_or_ind_ptr, SQL_NULL_DATA);
-            if !target_value_ptr.is_null() {
-                target_value_ptr.cast::<SqlWChar>().write_unaligned(0);
-            }
-        }
+        // SAFETY: as above for the indicator. NULL leaves the data buffer untouched.
+        unsafe { write_if_some(strlen_or_ind_ptr, SQL_NULL_DATA) };
         SQL_SUCCESS
     };
     stmt_state.current_row_last_col = col_index;
@@ -1106,18 +1100,9 @@ fn write_captured_column(
             post_diag(stmt_state, ERR_INDICATOR_REQUIRED);
             return SQL_ERROR;
         }
+        // msodbcsql's InternalGetColData (sqlcdata.h) skips character termination
+        // on fIsNullData by jumping to Return2, not Return3.
         unsafe { write_if_some(strlen_or_ind_ptr, SQL_NULL_DATA) };
-        // Only character targets get a terminator; a fixed-width target's
-        // buffer is left untouched on NULL.
-        if target_type == SQL_C_WCHAR {
-            unsafe {
-                copy_with_nul(target_value_ptr as *mut SqlWChar, buf_elements, &[]);
-            }
-        } else if target_type == SQL_C_CHAR {
-            unsafe {
-                copy_with_nul(target_value_ptr as *mut u8, buf_elements, &[]);
-            }
-        }
         stmt_state.last_captured = None;
         stmt_state.partial_text_offset = None;
         stmt_state.current_row_last_col = col_index;
@@ -6139,6 +6124,84 @@ mod tests {
         assert_eq!(ind, SQL_NULL_DATA);
     }
 
+    #[test]
+    fn get_data_null_preserves_character_buffers_and_retry_state() {
+        for target in [SQL_C_CHAR, SQL_C_WCHAR] {
+            for capacity in [0, 1, 2, 3, 32] {
+                for buffered in [false, true] {
+                    let h = TestHandles::with_env_dbc_stmt();
+                    if buffered {
+                        stmt_with_buffered_values(
+                            &h,
+                            vec![ColumnValues::Null, ColumnValues::Int(42)],
+                        );
+                    } else {
+                        stmt_with_captured(&h, ColumnValues::Null);
+                    }
+                    let mut buffer = [0x7Eu8; 34];
+                    let ptr = unsafe { buffer.as_mut_ptr().add(1) }.cast();
+                    assert_eq!(
+                        unsafe {
+                            crate::api::exports::SQLGetData(
+                                h.stmt,
+                                1,
+                                target,
+                                ptr,
+                                capacity,
+                                std::ptr::null_mut(),
+                            )
+                        },
+                        SQL_ERROR
+                    );
+                    assert_eq!(buffer, [0x7E; 34]);
+                    let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+                    {
+                        let state = stmt.inner.lock().unwrap();
+                        assert_last_diag(&state.diag_records, ERR_INDICATOR_REQUIRED);
+                        assert_eq!(state.current_row_last_col, 0);
+                    }
+                    let mut indicator = -99;
+                    assert_eq!(
+                        unsafe {
+                            crate::api::exports::SQLGetData(
+                                h.stmt,
+                                1,
+                                target,
+                                ptr,
+                                capacity,
+                                &mut indicator,
+                            )
+                        },
+                        SQL_SUCCESS
+                    );
+                    assert_eq!(indicator, SQL_NULL_DATA);
+                    assert_eq!(buffer, [0x7E; 34]);
+                    {
+                        let state = stmt.inner.lock().unwrap();
+                        assert!(state.diag_records.is_empty());
+                        assert!(state.last_captured.is_none());
+                        assert!(state.partial_text_offset.is_none());
+                        assert_eq!(state.current_row_last_col, 1);
+                    }
+                    assert_eq!(
+                        unsafe {
+                            crate::api::exports::SQLGetData(
+                                h.stmt,
+                                1,
+                                target,
+                                ptr,
+                                capacity,
+                                &mut indicator,
+                            )
+                        },
+                        SQL_NO_DATA
+                    );
+                    assert_eq!(buffer, [0x7E; 34]);
+                }
+            }
+        }
+    }
+
     /// SQLGetData on a NULL reports SQL_NULL_DATA for any valid C target and
     /// leaves a fixed-width buffer untouched. The buffer is nonzero-length, so
     /// this is a data fetch rather than the SQL_C_BINARY length probe above.
@@ -6701,7 +6764,7 @@ mod tests {
     }
 
     /// The same rule applies to character targets: a NULL with no indicator is
-    /// still 22002, even though a terminator could otherwise be written.
+    /// still 22002.
     #[test]
     fn get_data_char_null_without_indicator_reports_22002() {
         let h = TestHandles::with_env_dbc_stmt();
