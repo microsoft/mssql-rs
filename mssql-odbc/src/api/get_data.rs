@@ -7633,6 +7633,105 @@ mod tests {
         );
     }
 
+    #[test]
+    fn buffered_unicode_plp_null_preserves_buffer_at_all_capacities() {
+        use mssql_mock_tds::{ColumnDefinition, ColumnValue, QueryResponse, Row, SqlDataType};
+
+        for capacity in [0, 1, 2, 3, 32] {
+            let h = TestHandles::with_env_dbc_stmt();
+            let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+            let response = QueryResponse::new(
+                vec![
+                    ColumnDefinition::new("prefix", SqlDataType::Int),
+                    ColumnDefinition::new("value", SqlDataType::NVarCharMax),
+                    ColumnDefinition::new("following", SqlDataType::Int),
+                ],
+                vec![Row::new(vec![
+                    ColumnValue::Int(1),
+                    ColumnValue::NVarCharMaxNull,
+                    ColumnValue::Int(42),
+                ])],
+            );
+            let _server =
+                crate::test_support::connect_mock_server(dbc, "SELECT null_plp", response);
+            let sql: Vec<u16> = "SELECT null_plp\0".encode_utf16().collect();
+            assert_eq!(
+                unsafe {
+                    crate::api::exec_direct::sql_exec_direct_w(h.stmt, sql.as_ptr(), SQL_NTS)
+                },
+                SQL_SUCCESS
+            );
+            assert_eq!(unsafe { crate::api::fetch::sql_fetch(h.stmt) }, SQL_SUCCESS);
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            {
+                let state = stmt.inner.lock().unwrap();
+                let row = state.buffered_get_data_row.as_ref().unwrap();
+                assert!(matches!(row.values[0], Some(ColumnValues::Int(1))));
+                assert!(row.values[1].is_none(), "NULL PLP must remain deferred");
+                assert_eq!(
+                    state.column_metadata[1].plp_encoding(),
+                    Some(PlpEncoding::Utf16Text)
+                );
+            }
+
+            let mut buffer = [0x7Eu8; 34];
+            let mut indicator = -99;
+            let ptr = buffer[1..].as_mut_ptr().cast();
+            assert_eq!(
+                unsafe {
+                    crate::api::exports::SQLGetData(
+                        h.stmt,
+                        2,
+                        SQL_C_WCHAR,
+                        ptr,
+                        capacity,
+                        &mut indicator,
+                    )
+                },
+                SQL_SUCCESS,
+                "capacity {capacity}"
+            );
+            assert_eq!(indicator, SQL_NULL_DATA);
+            assert_eq!(buffer, [0x7E; 34], "capacity {capacity}");
+            {
+                let state = stmt.inner.lock().unwrap();
+                assert!(state.diag_records.is_empty());
+                assert!(state.last_captured.is_none());
+                assert!(state.active_plp.is_none());
+                assert_eq!(state.current_row_last_col, 2);
+            }
+            assert_eq!(
+                unsafe {
+                    crate::api::exports::SQLGetData(
+                        h.stmt,
+                        2,
+                        SQL_C_WCHAR,
+                        ptr,
+                        capacity,
+                        &mut indicator,
+                    )
+                },
+                SQL_NO_DATA
+            );
+            assert_eq!(buffer, [0x7E; 34]);
+            let mut next = 0i32;
+            assert_eq!(
+                unsafe {
+                    crate::api::exports::SQLGetData(
+                        h.stmt,
+                        3,
+                        SQL_C_SLONG,
+                        (&raw mut next).cast(),
+                        4,
+                        &mut indicator,
+                    )
+                },
+                SQL_SUCCESS
+            );
+            assert_eq!(next, 42);
+        }
+    }
+
     fn open_mock_plp(chunks: Vec<Vec<u16>>) -> (TestHandles, crate::test_support::MockServer) {
         use mssql_mock_tds::{ColumnDefinition, ColumnValue, SqlDataType};
 

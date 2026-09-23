@@ -121,6 +121,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ### Fixed
 
+- `mssql-odbc`: NULL values returned through `SQLGetData`, bound columns, and
+  output parameters now leave character output buffers untouched instead of
+  writing a terminator. Applications should use the `SQL_NULL_DATA` indicator
+  to distinguish NULL from an empty string (#555).
+
 - `mssql-odbc`: `SQL_ATTR_QUERY_TIMEOUT` is now enforced for the implemented
   catalog functions (`SQLTables`, `SQLColumns`, `SQLPrimaryKeys`,
   `SQLForeignKeys`, `SQLSpecialColumns`, `SQLStatistics`, `SQLProcedures`),
@@ -211,4 +216,3 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   idle-connection reconnect (`TdsClient::reconnect`) now wraps each attempt's
   full connect (DNS through login) in the attempt's remaining budget instead
   of only capping the post-resolution TCP connect step.
-
