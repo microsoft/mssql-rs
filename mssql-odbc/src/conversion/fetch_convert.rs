@@ -314,21 +314,41 @@ pub(crate) unsafe fn convert_guid_c(
 }
 
 /// Converts a TDS `date` into normalized calendar fields.
-pub(crate) fn date_parts(date: &SqlDate) -> DateTimeParts {
-    let date = civil_from_days_since_0001(i64::from(date.get_days()));
-    DateTimeParts {
+pub(crate) fn date_parts(date: &SqlDate) -> Result<DateTimeParts, ConvError> {
+    checked_date_parts(i64::from(date.get_days()))
+}
+
+fn validate_date_days(days: i64) -> Result<(), ConvError> {
+    if !(0..=MAX_DAYS_SINCE_0001).contains(&days) {
+        return Err(ConvError::InvalidDatetimeFormat);
+    }
+    Ok(())
+}
+
+fn checked_date_parts(days: i64) -> Result<DateTimeParts, ConvError> {
+    validate_date_days(days)?;
+    let date = civil_from_days_since_0001(days);
+    Ok(DateTimeParts {
         year: date.year,
         month: date.month,
         day: date.day,
         has_date: true,
         ..Default::default()
+    })
+}
+
+fn validate_time_fields(time: &SqlTime) -> Result<(), ConvError> {
+    if time.scale > 7 || time.time_nanoseconds >= TICKS_PER_DAY.unsigned_abs() {
+        return Err(ConvError::InvalidDatetimeFormat);
     }
+    Ok(())
 }
 
 /// Converts a TDS `time` into normalized clock fields.
-pub(crate) fn time_parts(time: &SqlTime) -> DateTimeParts {
+pub(crate) fn time_parts(time: &SqlTime) -> Result<DateTimeParts, ConvError> {
+    validate_time_fields(time)?;
     let t = hms_from_ticks_100ns(time.time_nanoseconds);
-    DateTimeParts {
+    Ok(DateTimeParts {
         hour: t.hour,
         minute: t.minute,
         second: t.second,
@@ -336,38 +356,45 @@ pub(crate) fn time_parts(time: &SqlTime) -> DateTimeParts {
         scale: time.scale,
         has_time: true,
         ..Default::default()
-    }
+    })
 }
 
 /// Converts a TDS `datetime2` into normalized calendar and clock fields.
-pub(crate) fn datetime2_parts(datetime: &SqlDateTime2) -> DateTimeParts {
-    let date = civil_from_days_since_0001(i64::from(datetime.days));
-    let mut parts = time_parts(&datetime.time);
+pub(crate) fn datetime2_parts(datetime: &SqlDateTime2) -> Result<DateTimeParts, ConvError> {
+    let date = checked_date_parts(i64::from(datetime.days))?;
+    let mut parts = time_parts(&datetime.time)?;
     parts.year = date.year;
     parts.month = date.month;
     parts.day = date.day;
     parts.has_date = true;
-    parts
+    Ok(parts)
 }
 
 /// Converts a UTC TDS `datetimeoffset` value to its represented local time.
 ///
-/// Returns `None` when applying the offset falls outside the TDS date range.
-pub(crate) fn datetimeoffset_parts(datetime: &SqlDateTimeOffset) -> Option<DateTimeParts> {
-    // A time that cannot fit in i64 already exceeds 10 million days; even
-    // the most negative i16 minute offset cannot bring it into the TDS range.
-    // Checked arithmetic retains that rejection without per-value i128 division.
-    let utc_ticks = i64::try_from(datetime.datetime2.time.time_nanoseconds)
-        .ok()?
-        .checked_add(i64::from(datetime.offset) * 60 * 10_000_000)?;
-    let days = i64::from(datetime.datetime2.days) + utc_ticks.div_euclid(TICKS_PER_DAY);
-    if !(0..=MAX_DAYS_SINCE_0001).contains(&days) {
-        return None;
+/// Rejects offset arithmetic that leaves the representable date range.
+pub(crate) fn datetimeoffset_parts(
+    datetime: &SqlDateTimeOffset,
+) -> Result<DateTimeParts, ConvError> {
+    validate_date_days(i64::from(datetime.datetime2.days))?;
+    validate_time_fields(&datetime.datetime2.time)?;
+    if !(-840..=840).contains(&datetime.offset) {
+        return Err(ConvError::InvalidDatetimeFormat);
     }
-
-    let date = civil_from_days_since_0001(days);
-    let t = hms_from_ticks_100ns(u64::try_from(utc_ticks.rem_euclid(TICKS_PER_DAY)).ok()?);
-    Some(DateTimeParts {
+    // The validation above makes these overflow errors unreachable. Keep checked
+    // arithmetic as a defensive backstop, mapped to CVT_DT_OVERFLOW / 22008
+    // rather than invalid decoded fields / 22007 (sqlcprot.h; clntcomn.cpp).
+    let utc_ticks = i64::try_from(datetime.datetime2.time.time_nanoseconds)
+        .map_err(|_| ConvError::DatetimeFieldOverflow)?
+        .checked_add(i64::from(datetime.offset) * 60 * 10_000_000)
+        .ok_or(ConvError::DatetimeFieldOverflow)?;
+    let days = i64::from(datetime.datetime2.days) + utc_ticks.div_euclid(TICKS_PER_DAY);
+    let date = checked_date_parts(days)?;
+    let t = hms_from_ticks_100ns(
+        u64::try_from(utc_ticks.rem_euclid(TICKS_PER_DAY))
+            .map_err(|_| ConvError::DatetimeFieldOverflow)?,
+    );
+    Ok(DateTimeParts {
         year: date.year,
         month: date.month,
         day: date.day,
@@ -384,17 +411,19 @@ pub(crate) fn datetimeoffset_parts(datetime: &SqlDateTimeOffset) -> Option<DateT
     })
 }
 
-/// Extracts a [`DateTimeParts`] from any date/time column value, or `None` for
-/// non-temporal sources.
-pub(crate) fn extract_datetime_parts(value: &ColumnValues) -> Option<DateTimeParts> {
+/// Distinguishes an unrepresentable temporal value from a non-temporal source.
+pub(crate) fn extract_datetime_parts(value: &ColumnValues) -> Result<DateTimeParts, ConvError> {
     let mut p = DateTimeParts::default();
     match value {
-        ColumnValues::Date(date) => return Some(date_parts(date)),
-        ColumnValues::Time(time) => return Some(time_parts(time)),
-        ColumnValues::DateTime2(datetime) => return Some(datetime2_parts(datetime)),
+        ColumnValues::Date(date) => return date_parts(date),
+        ColumnValues::Time(time) => return time_parts(time),
+        ColumnValues::DateTime2(datetime) => return datetime2_parts(datetime),
         ColumnValues::DateTimeOffset(datetime) => return datetimeoffset_parts(datetime),
         ColumnValues::DateTime(dt) => {
-            let date = civil_from_days_since_0001(i64::from(dt.days) + DAYS_0001_TO_1900);
+            let date = checked_date_parts(i64::from(dt.days) + DAYS_0001_TO_1900)?;
+            if date.year < 1753 || dt.time >= 24 * 60 * 60 * 300 {
+                return Err(ConvError::InvalidDatetimeFormat);
+            }
             // `datetime` time is counted in 1/300-second ticks since midnight.
             let ticks = u64::from(dt.time);
             let secs = ticks / 300;
@@ -413,7 +442,10 @@ pub(crate) fn extract_datetime_parts(value: &ColumnValues) -> Option<DateTimePar
             p.has_time = true;
         }
         ColumnValues::SmallDateTime(dt) => {
-            let date = civil_from_days_since_0001(i64::from(dt.days) + DAYS_0001_TO_1900);
+            let date = checked_date_parts(i64::from(dt.days) + DAYS_0001_TO_1900)?;
+            if dt.time >= 24 * 60 {
+                return Err(ConvError::InvalidDatetimeFormat);
+            }
             p.year = date.year;
             p.month = date.month;
             p.day = date.day;
@@ -422,9 +454,9 @@ pub(crate) fn extract_datetime_parts(value: &ColumnValues) -> Option<DateTimePar
             p.has_date = true;
             p.has_time = true;
         }
-        _ => return None,
+        _ => return Err(ConvError::Restricted),
     }
-    Some(p)
+    Ok(p)
 }
 
 /// Returns `true` if `target_type` is one of the date/time C struct targets
@@ -465,6 +497,16 @@ pub(crate) unsafe fn convert_datetime_c(
     target_value_ptr: SqlPointer,
     strlen_or_ind_ptr: *mut SqlLen,
 ) -> Result<ConvOk, ConvError> {
+    if matches!(
+        (value, target_type),
+        (ColumnValues::Time(_), SQL_C_TYPE_DATE | SQL_C_DATE)
+            | (
+                ColumnValues::Date(_),
+                SQL_C_TYPE_TIME | SQL_C_TIME | SQL_C_SS_TIME2
+            )
+    ) {
+        return Err(ConvError::Restricted);
+    }
     let from_character = matches!(value, ColumnValues::String(_));
     let p = match value {
         // A character column must hold a valid literal for the target.
@@ -473,14 +515,23 @@ pub(crate) unsafe fn convert_datetime_c(
             parse_datetime_literal(&text).ok_or(ConvError::InvalidCharacterValue)?
         }
         // A date/time C target for a non-temporal column is illegal.
-        _ => extract_datetime_parts(value).ok_or(ConvError::Restricted)?,
+        _ => extract_datetime_parts(value)?,
     };
 
     // Appendix D: a time value converted to a timestamp takes the current date.
     // Filling it in here lets the timestamp arms keep their `has_date` guard, so
     // the date-only targets below still refuse a time value.
+    // Native time also widens to timestampoffset with a zero offset
+    // (ConvertToDateTime's SQL_TIME2_MAPPED branch); character input is separate.
     let mut p = p;
-    if p.has_time && !p.has_date && matches!(target_type, SQL_C_TYPE_TIMESTAMP | SQL_C_TIMESTAMP) {
+    if p.has_time
+        && !p.has_date
+        && (matches!(target_type, SQL_C_TYPE_TIMESTAMP | SQL_C_TIMESTAMP)
+            || matches!(
+                (value, target_type),
+                (ColumnValues::Time(_), SQL_C_SS_TIMESTAMPOFFSET)
+            ))
+    {
         let (year, month, day) = current_local_date().ok_or(ConvError::Internal)?;
         p.year = year;
         p.month = month;
@@ -2178,6 +2229,37 @@ mod tests {
     }
 
     #[test]
+    fn native_time_to_timestampoffset_uses_today_and_zero_offset() {
+        let value = ColumnValues::Time(SqlTime {
+            time_nanoseconds: 452_961_234_567,
+            scale: 7,
+        });
+        let mut out = SqlSsTimestampoffsetStruct::default();
+        let mut indicator = -42;
+        let before = current_local_date().unwrap();
+        assert_eq!(
+            unsafe {
+                convert_datetime_c(
+                    &value,
+                    SQL_C_SS_TIMESTAMPOFFSET,
+                    (&mut out as *mut SqlSsTimestampoffsetStruct).cast(),
+                    &mut indicator,
+                )
+            },
+            Ok(ConvOk::Exact)
+        );
+        let after = current_local_date().unwrap();
+        assert!([before, after].contains(&(out.year, out.month, out.day)));
+        assert_eq!((out.hour, out.minute, out.second), (12, 34, 56));
+        assert_eq!(out.fraction, 123_456_700);
+        assert_eq!((out.timezone_hour, out.timezone_minute), (0, 0));
+        assert_eq!(
+            indicator,
+            SqlLen::try_from(std::mem::size_of::<SqlSsTimestampoffsetStruct>()).unwrap()
+        );
+    }
+
+    #[test]
     fn datetime2_to_timestamp_struct() {
         use mssql_tds::datatypes::column_values::{SqlDateTime2, SqlTime};
         // 01:02:03.5 in 100 ns ticks since midnight.
@@ -2459,7 +2541,7 @@ mod tests {
             )
         }
         .unwrap_err();
-        assert_eq!(err, ConvError::Restricted);
+        assert_eq!(err, ConvError::InvalidDatetimeFormat);
     }
 
     #[test]
@@ -2490,7 +2572,7 @@ mod tests {
             )
         }
         .unwrap_err();
-        assert_eq!(err, ConvError::Restricted);
+        assert_eq!(err, ConvError::InvalidDatetimeFormat);
     }
 
     #[test]
@@ -2522,7 +2604,11 @@ mod tests {
                     let wide_days =
                         i128::from(days) + wide_ticks.div_euclid(i128::from(TICKS_PER_DAY));
                     let actual = datetimeoffset_parts(&value);
-                    if (0..=i128::from(MAX_DAYS_SINCE_0001)).contains(&wide_days) {
+                    if i64::from(days) <= MAX_DAYS_SINCE_0001
+                        && ticks < day_ticks
+                        && (-840..=840).contains(&offset)
+                        && (0..=i128::from(MAX_DAYS_SINCE_0001)).contains(&wide_days)
+                    {
                         let actual = actual.unwrap();
                         let date = civil_from_days_since_0001(i64::try_from(wide_days).unwrap());
                         let time = hms_from_ticks_100ns(
@@ -2547,14 +2633,233 @@ mod tests {
                             (offset / 60, offset % 60)
                         );
                     } else {
-                        assert!(
-                            actual.is_none(),
+                        assert_eq!(
+                            actual,
+                            Err(ConvError::InvalidDatetimeFormat),
                             "days={days}, ticks={ticks}, offset={offset}"
                         );
                     }
                 }
             }
         }
+    }
+
+    #[test]
+    fn invalid_temporal_fields_leave_every_target_and_indicator_untouched() {
+        use mssql_tds::datatypes::column_values::{SqlDateTime, SqlSmallDateTime};
+
+        let invalid_values = [
+            ColumnValues::DateTime2(SqlDateTime2 {
+                days: 3_652_059,
+                time: SqlTime {
+                    time_nanoseconds: 0,
+                    scale: 7,
+                },
+            }),
+            ColumnValues::DateTime2(SqlDateTime2 {
+                days: u32::MAX,
+                time: SqlTime {
+                    time_nanoseconds: 0,
+                    scale: 7,
+                },
+            }),
+            ColumnValues::Time(SqlTime {
+                time_nanoseconds: u64::try_from(TICKS_PER_DAY).unwrap(),
+                scale: 7,
+            }),
+            ColumnValues::Time(SqlTime {
+                time_nanoseconds: u64::MAX,
+                scale: 7,
+            }),
+            ColumnValues::Time(SqlTime {
+                time_nanoseconds: 0,
+                scale: 8,
+            }),
+            ColumnValues::DateTime2(SqlDateTime2 {
+                days: 0,
+                time: SqlTime {
+                    time_nanoseconds: u64::MAX,
+                    scale: 7,
+                },
+            }),
+            ColumnValues::DateTimeOffset(SqlDateTimeOffset {
+                datetime2: SqlDateTime2 {
+                    days: 3_652_058,
+                    time: SqlTime {
+                        time_nanoseconds: u64::try_from(TICKS_PER_DAY).unwrap() - 1,
+                        scale: 7,
+                    },
+                },
+                offset: 1,
+            }),
+            ColumnValues::DateTimeOffset(SqlDateTimeOffset {
+                datetime2: SqlDateTime2 {
+                    days: 0,
+                    time: SqlTime {
+                        time_nanoseconds: 0,
+                        scale: 7,
+                    },
+                },
+                offset: -1,
+            }),
+            ColumnValues::DateTimeOffset(SqlDateTimeOffset {
+                datetime2: SqlDateTime2 {
+                    days: 1,
+                    time: SqlTime {
+                        time_nanoseconds: u64::try_from(TICKS_PER_DAY).unwrap(),
+                        scale: 7,
+                    },
+                },
+                offset: 0,
+            }),
+            ColumnValues::DateTimeOffset(SqlDateTimeOffset {
+                datetime2: SqlDateTime2 {
+                    days: 1,
+                    time: SqlTime {
+                        time_nanoseconds: 0,
+                        scale: 7,
+                    },
+                },
+                offset: 841,
+            }),
+            ColumnValues::DateTime(SqlDateTime {
+                days: i32::MIN,
+                time: 0,
+            }),
+            ColumnValues::DateTime(SqlDateTime {
+                days: -53_691,
+                time: 0,
+            }),
+            ColumnValues::DateTime(SqlDateTime {
+                days: i32::MAX,
+                time: 0,
+            }),
+            ColumnValues::DateTime(SqlDateTime {
+                days: 0,
+                time: 24 * 60 * 60 * 300,
+            }),
+            ColumnValues::SmallDateTime(SqlSmallDateTime {
+                days: 0,
+                time: 24 * 60,
+            }),
+        ];
+
+        for value in invalid_values {
+            for target in [
+                SQL_C_TYPE_DATE,
+                SQL_C_DATE,
+                SQL_C_TYPE_TIME,
+                SQL_C_TIME,
+                SQL_C_SS_TIME2,
+                SQL_C_TYPE_TIMESTAMP,
+                SQL_C_TIMESTAMP,
+                SQL_C_SS_TIMESTAMPOFFSET,
+            ] {
+                let mut output = [0xA5_u8; 32];
+                let mut indicator = -42;
+                let result = unsafe {
+                    convert_datetime_c(&value, target, output.as_mut_ptr().cast(), &mut indicator)
+                };
+                assert_eq!(
+                    result,
+                    Err(
+                        if matches!(value, ColumnValues::Time(_))
+                            && matches!(target, SQL_C_TYPE_DATE | SQL_C_DATE)
+                        {
+                            ConvError::Restricted
+                        } else {
+                            ConvError::InvalidDatetimeFormat
+                        }
+                    ),
+                    "{value:?}, target={target}"
+                );
+                assert_eq!(output, [0xA5; 32]);
+                assert_eq!(indicator, -42);
+            }
+        }
+    }
+
+    #[test]
+    fn decoded_temporal_scales_are_limited_to_seven() {
+        for scale in 0..=u8::MAX {
+            let time = SqlTime {
+                time_nanoseconds: 0,
+                scale,
+            };
+            let datetime2 = SqlDateTime2 {
+                days: 0,
+                time: time.clone(),
+            };
+            let offset = SqlDateTimeOffset {
+                datetime2: datetime2.clone(),
+                offset: 0,
+            };
+            for result in [
+                time_parts(&time),
+                datetime2_parts(&datetime2),
+                datetimeoffset_parts(&offset),
+            ] {
+                if scale <= 7 {
+                    assert_eq!(result.unwrap().scale, scale);
+                } else {
+                    assert_eq!(result, Err(ConvError::InvalidDatetimeFormat));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn temporal_extraction_checks_boundaries_before_narrowing() {
+        assert_eq!(
+            checked_date_parts(-1),
+            Err(ConvError::InvalidDatetimeFormat)
+        );
+        assert_eq!(
+            checked_date_parts(MAX_DAYS_SINCE_0001 + 1),
+            Err(ConvError::InvalidDatetimeFormat)
+        );
+        for (days, expected) in [(0, (1, 1, 1)), (3_652_058, (9999, 12, 31))] {
+            let date = SqlDate::create(days).unwrap();
+            let parts = date_parts(&date).unwrap();
+            assert_eq!((parts.year, parts.month, parts.day), expected);
+            let parts = datetime2_parts(&SqlDateTime2 {
+                days,
+                time: SqlTime {
+                    time_nanoseconds: u64::try_from(TICKS_PER_DAY).unwrap() - 1,
+                    scale: 7,
+                },
+            })
+            .unwrap();
+            assert_eq!((parts.year, parts.month, parts.day), expected);
+            assert_eq!(
+                (parts.hour, parts.minute, parts.second, parts.fraction_ns),
+                (23, 59, 59, 999_999_900)
+            );
+        }
+        assert_eq!(
+            extract_datetime_parts(&ColumnValues::Int(1)),
+            Err(ConvError::Restricted)
+        );
+    }
+
+    #[test]
+    fn legacy_datetime_lower_bound_does_not_restrict_datetime2() {
+        use mssql_tds::datatypes::column_values::SqlDateTime;
+        let parts = extract_datetime_parts(&ColumnValues::DateTime(SqlDateTime {
+            days: -53_690,
+            time: 0,
+        }))
+        .unwrap();
+        assert_eq!((parts.year, parts.month, parts.day), (1753, 1, 1));
+        let parts = datetime2_parts(&SqlDateTime2 {
+            days: 0,
+            time: SqlTime {
+                time_nanoseconds: 0,
+                scale: 7,
+            },
+        })
+        .unwrap();
+        assert_eq!((parts.year, parts.month, parts.day), (1, 1, 1));
     }
 
     #[test]

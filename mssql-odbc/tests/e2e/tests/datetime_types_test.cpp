@@ -18,6 +18,8 @@
 
 #include "odbc_test_fixture.h"
 
+#include <array>
+#include <ctime>
 #include <string>
 
 // SQL Server extension C types. Declared here rather than pulled from
@@ -65,13 +67,122 @@ protected:
             FAIL() << "No connection configured – set ODBC_TEST_SERVER or ODBC_TEST_CONNSTR";
         }
         Connect();
+        SQLCHAR version[64]{};
+        ASSERT_SQL_OK(SQLGetInfoA(dbc_, SQL_DRIVER_VER, version, sizeof(version), nullptr),
+                      SQL_HANDLE_DBC, dbc_);
+        RecordProperty("SQL_DRIVER_VER", reinterpret_cast<const char*>(version));
     }
 
     SQLRETURN ExecDirect(const std::string& sql) {
         SqlTString s = ODBCTestUtils::ToSqlTStr(sql);
         return SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(s.c_str()), SQL_NTS);
     }
+
+    void CheckTimeToTimestampoffset(bool bound) {
+        auto local_date = [] {
+            const std::time_t now = std::time(nullptr);
+            std::tm local{};
+#ifdef _WIN32
+            localtime_s(&local, &now);
+#else
+            localtime_r(&now, &local);
+#endif
+            return std::array<int, 3>{local.tm_year + 1900, local.tm_mon + 1, local.tm_mday};
+        };
+        for (int scale : {0, 7}) {
+            SCOPED_TRACE(::testing::Message() << "scale=" << scale << ", bound=" << bound);
+            ASSERT_SQL_OK(ExecDirect(
+                              std::string("SELECT CAST('12:34:56.1234567' AS TIME(")
+                              + std::to_string(scale) + "))"),
+                          SQL_HANDLE_STMT, stmt_);
+            SQL_SS_TIMESTAMPOFFSET_STRUCT out{};
+            out.timezone_hour = 12;
+            out.timezone_minute = 34;
+            SQLLEN indicator = -1;
+            const auto before = local_date();
+            if (bound) {
+                ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_SS_TIMESTAMPOFFSET, &out,
+                                        sizeof(out), &indicator),
+                              SQL_HANDLE_STMT, stmt_);
+                ASSERT_EQ(SQL_SUCCESS, SQLFetchScroll(stmt_, SQL_FETCH_NEXT, 0));
+            } else {
+                ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+                ASSERT_EQ(SQL_SUCCESS, SQLGetData(stmt_, 1, SQL_C_SS_TIMESTAMPOFFSET,
+                                                 &out, sizeof(out), &indicator));
+            }
+            const auto after = local_date();
+            const std::array<int, 3> date{out.year, out.month, out.day};
+            EXPECT_TRUE(date == before || date == after);
+            EXPECT_EQ(12, out.hour);
+            EXPECT_EQ(34, out.minute);
+            EXPECT_EQ(56, out.second);
+            EXPECT_EQ(scale == 0 ? 0u : 123456700u, out.fraction);
+            EXPECT_EQ(0, out.timezone_hour);
+            EXPECT_EQ(0, out.timezone_minute);
+            EXPECT_EQ(static_cast<SQLLEN>(sizeof(out)), indicator);
+            ASSERT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+            ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_UNBIND), SQL_HANDLE_STMT, stmt_);
+        }
+    }
+
+    void CheckInvalidCharacterTemporalValues(bool bound) {
+        // ConvertToDateTime rewrites ParseDateTime/field-validation failures to
+        // CVT_CAST_ERROR (sqlccnvt.cpp:4727-4867): ODBC 3 reports 22018, not 22008.
+        constexpr std::array<SQLSMALLINT, 5> targets{
+            SQL_C_TYPE_DATE, SQL_C_TYPE_TIME, SQL_C_TYPE_TIMESTAMP,
+            SQL_C_SS_TIME2, SQL_C_SS_TIMESTAMPOFFSET};
+        for (SQLSMALLINT target : targets) {
+            for (const char* sql_type : {"varchar(100)", "nvarchar(100)"}) {
+                for (const char* literal : {"not-a-date", "0000-01-01 00:00:00",
+                                            "10000-01-01 00:00:00", "2024-13-01 00:00:00",
+                                            "2023-02-29 00:00:00", "2024-01-01 24:00:00",
+                                            "2024-01-01 00:60:00", "2024-01-01 00:00:60",
+                                            "2024-01-01 00:00:00 +14:01",
+                                            "2024-01-01 00:00:00.1234567890"}) {
+                    SCOPED_TRACE(::testing::Message()
+                                 << "target=" << target << ", source=" << sql_type
+                                 << ", literal=" << literal << ", bound=" << bound);
+                    ASSERT_SQL_OK(ExecDirect(std::string("SELECT CAST('") + literal + "' AS "
+                                            + sql_type + ")"),
+                                  SQL_HANDLE_STMT, stmt_);
+                    alignas(SQL_SS_TIMESTAMPOFFSET_STRUCT) std::array<unsigned char, 32> out{};
+                    SQLLEN indicator = 0;
+                    if (bound) {
+                        ASSERT_SQL_OK(SQLBindCol(stmt_, 1, target, out.data(), out.size(),
+                                                &indicator),
+                                      SQL_HANDLE_STMT, stmt_);
+                        EXPECT_EQ(SQL_ERROR, SQLFetchScroll(stmt_, SQL_FETCH_NEXT, 0));
+                    } else {
+                        ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+                        EXPECT_EQ(SQL_ERROR, SQLGetData(stmt_, 1, target, out.data(),
+                                                       out.size(), &indicator));
+                    }
+                    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "22018");
+                    // ODBC leaves out/indicator undefined on SQL_ERROR; preservation
+                    // is a Rust regression assertion, not a retail parity contract.
+                    ASSERT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+                    ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_UNBIND), SQL_HANDLE_STMT, stmt_);
+                }
+            }
+        }
+    }
 };
+
+TEST_F(DateTimeTypesLiveTest, InvalidCharacterTemporalValuesViaGetData) {
+    CheckInvalidCharacterTemporalValues(false);
+}
+
+TEST_F(DateTimeTypesLiveTest, InvalidCharacterTemporalValuesViaBoundFetch) {
+    CheckInvalidCharacterTemporalValues(true);
+}
+
+TEST_F(DateTimeTypesLiveTest, TimeToTimestampoffsetViaGetData) {
+    CheckTimeToTimestampoffset(false);
+}
+
+TEST_F(DateTimeTypesLiveTest, TimeToTimestampoffsetViaBoundFetch) {
+    CheckTimeToTimestampoffset(true);
+}
 
 // ---------------------------------------------------------------------------
 // SQL_C_TYPE_DATE

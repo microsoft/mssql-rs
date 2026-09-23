@@ -47,7 +47,6 @@ use crate::api::type_rules::{
     SqlTypeSupport, canonical_c_type, classify_parameter_sql_type, is_valid_c_type,
 };
 use crate::api::util::read_utf16;
-use crate::error::free_errors;
 use crate::handles::desc::{DescKind, DescRecord, DescState, FieldScope, classify_field};
 use crate::handles::{DescHandle, HandleType, handle_from_raw};
 
@@ -124,62 +123,76 @@ fn sql_set_desc_field_w_safe(
     value_ptr: SqlPointer,
     buffer_length: SqlInteger,
 ) -> SqlReturn {
-    let Ok(mut state) = desc.inner.lock() else {
-        error!("SQLSetDescFieldW: desc mutex poisoned");
-        return SQL_ERROR;
-    };
-    free_errors(&mut state);
+    desc.update_definition(record_number, "SQLSetDescFieldW", |state| {
+        set_desc_field(
+            state,
+            desc.kind,
+            record_number,
+            field_identifier,
+            value_ptr,
+            buffer_length,
+        )
+    })
+}
 
+fn set_desc_field(
+    state: &mut DescState,
+    kind: DescKind,
+    record_number: SqlSmallInt,
+    field_identifier: SqlSmallInt,
+    value_ptr: SqlPointer,
+    buffer_length: SqlInteger,
+) -> SqlReturn {
     let Ok(field) = SqlUSmallInt::try_from(field_identifier) else {
         error!(
             field_identifier,
             "SQLSetDescFieldW: negative field identifier"
         );
-        post_diag(&mut state, ERR_INVALID_DESCRIPTOR_FIELD);
+        post_diag(state, ERR_INVALID_DESCRIPTOR_FIELD);
         return SQL_ERROR;
     };
 
     // Blanket IRD gate, checked before general field validity — mirrors
     // msodbcsql's literal order (`sqlcdesc.cpp:1399-1405`): every IRD field
     // write is rejected except these two header pointer fields.
-    if desc.kind == DescKind::ImpRow
+    if kind == DescKind::ImpRow
         && field != SQL_DESC_ROWS_PROCESSED_PTR
         && field != SQL_DESC_ARRAY_STATUS_PTR
     {
         error!("SQLSetDescFieldW: cannot modify an implementation row descriptor");
-        post_diag(&mut state, ERR_CANNOT_MODIFY_IRD);
+        post_diag(state, ERR_CANNOT_MODIFY_IRD);
         return SQL_ERROR;
     }
 
-    let Some(access) = classify_field(desc.kind, field) else {
+    let Some(access) = classify_field(kind, field) else {
         error!(
             field,
-            kind = ?desc.kind,
+            ?kind,
             "SQLSetDescFieldW: field not valid for this descriptor kind"
         );
-        post_diag(&mut state, ERR_INVALID_DESCRIPTOR_FIELD);
+        post_diag(state, ERR_INVALID_DESCRIPTOR_FIELD);
         return SQL_ERROR;
     };
 
     if !access.writable {
         error!(field, "SQLSetDescFieldW: field is not writable");
-        post_diag(&mut state, ERR_INVALID_DESCRIPTOR_FIELD);
+        post_diag(state, ERR_INVALID_DESCRIPTOR_FIELD);
         return SQL_ERROR;
     }
 
     match access.scope {
         FieldScope::Header if field == SQL_DESC_COUNT => {
-            set_record_count_field(&mut state, desc.kind, value_ptr)
+            set_record_count_field(state, kind, value_ptr)
         }
-        FieldScope::Header => set_header_field(&mut state, field, value_ptr),
+        FieldScope::Header => set_header_field(state, field, value_ptr),
         FieldScope::Record => {
             if record_number < 1 {
                 error!(record_number, "SQLSetDescFieldW: invalid record number");
-                post_diag(&mut state, ERR_INVALID_DESCRIPTOR_INDEX);
+                post_diag(state, ERR_INVALID_DESCRIPTOR_INDEX);
                 return SQL_ERROR;
             }
             let Ok(count) = usize::try_from(record_number) else {
-                post_diag(&mut state, ERR_INVALID_DESCRIPTOR_INDEX);
+                post_diag(state, ERR_INVALID_DESCRIPTOR_INDEX);
                 return SQL_ERROR;
             };
             // Growing on demand: msodbcsql calls AllocPlex before the
@@ -188,16 +201,9 @@ fn sql_set_desc_field_w_safe(
             // (sqlcdesc.cpp:1587-1614). Mirrored here rather than validating
             // first, so behavior matches on the failure path too.
             if count > state.records.len() {
-                state.set_record_count(count, desc.kind);
+                state.set_record_count(count, kind);
             }
-            set_record_field(
-                &mut state,
-                desc.kind,
-                record_number,
-                field,
-                value_ptr,
-                buffer_length,
-            )
+            set_record_field(state, kind, record_number, field, value_ptr, buffer_length)
         }
     }
 }

@@ -137,6 +137,9 @@ impl ParamBuildError {
             Self::UnsupportedSqlType(_) => ERR_PARAM_SQL_TYPE_NOT_IMPLEMENTED,
             Self::ConversionNotImplemented => ERR_PARAM_CONVERSION_NOT_IMPLEMENTED,
             Self::Value(ConvError::OutOfRange) => ERR_NUMERIC_OUT_OF_RANGE,
+            // Exhaustiveness backstop; parameters use Self::DateTimeFieldOverflow.
+            Self::Value(ConvError::DatetimeFieldOverflow) => ERR_DATETIME_FIELD_OVERFLOW,
+            Self::Value(ConvError::InvalidDatetimeFormat) => ERR_INVALID_DATETIME_FORMAT,
             Self::Value(ConvError::InvalidCharacterValue) => ERR_INVALID_CHARACTER_VALUE,
             Self::Value(ConvError::Internal) => ERR_INTERNAL_CONVERSION,
             // Backstop only: parameter legality is settled by the bind-time
@@ -209,10 +212,29 @@ pub(crate) unsafe fn bound_param_to_rpc(
         StatusFlags::NONE
     };
     let parameter = RpcParameter::new(name.into(), status, value);
-    let parameter = match type_metadata {
+    let mut parameter = match type_metadata {
         Some(metadata) => parameter.with_type_metadata(metadata),
         None => parameter,
     };
+    if matches!(param.sql_type, SQL_NUMERIC | SQL_DECIMAL) {
+        // The IPD defines @params; the numeric fast path can retain a different
+        // precision/scale in the incoming SQL_NUMERIC_STRUCT wire value.
+        let declaration = decimal_metadata(param.column_size, param.decimal_digits)?;
+        if type_metadata != Some(declaration) {
+            let precision = declaration
+                .precision
+                .ok_or(ParamBuildError::InvalidParameterSize(param.column_size))?;
+            let scale = declaration
+                .scale
+                .ok_or(ParamBuildError::InvalidDecimalDigits(param.decimal_digits))?;
+            parameter = parameter
+                .with_numeric_declaration(precision, scale)
+                .map_err(|error| {
+                    tracing::error!(%error, "Inconsistent numeric RPC declaration");
+                    ParamBuildError::Value(ConvError::Internal)
+                })?;
+        }
+    }
     Ok((parameter, outcome))
 }
 
@@ -2013,6 +2035,50 @@ mod tests {
             scale,
             sign,
             val: magnitude.to_le_bytes(),
+        }
+    }
+
+    #[test]
+    fn numeric_rpc_declaration_uses_ipd_independently_of_apd_and_value_header() {
+        use mssql_tds::test_client_support::rpc_parameter_declaration;
+
+        for sql_type in [SQL_NUMERIC, SQL_DECIMAL] {
+            let type_name = if sql_type == SQL_NUMERIC {
+                "numeric"
+            } else {
+                "decimal"
+            };
+            let mut source = numeric_struct(12345, 1, 2);
+            source.precision = 8;
+            let mut indicator = 0;
+            let mut binding = param(SQL_C_NUMERIC, (&raw mut source).cast(), &mut indicator);
+            binding.sql_type = sql_type;
+            binding.column_size = 12;
+            binding.decimal_digits = 2;
+            binding.app_scale = 2;
+            binding.precision_scale_explicit = true;
+
+            for (app_precision, source_precision) in [(8, 8), (12, 8), (12, 10)] {
+                binding.app_precision = app_precision;
+                source.precision = source_precision;
+                let ((_, wire_metadata), _) =
+                    unsafe { bound_param_to_value_with_outcome(&binding) }.unwrap();
+                assert_eq!(
+                    wire_metadata.unwrap().precision,
+                    Some(if app_precision == 12 {
+                        source_precision
+                    } else {
+                        12
+                    })
+                );
+                let (parameter, outcome) =
+                    unsafe { bound_param_to_rpc(Some("@P1".into()), &binding) }.unwrap();
+                assert_eq!(outcome, ConvOk::Exact);
+                assert_eq!(
+                    rpc_parameter_declaration(&parameter).unwrap(),
+                    format!("{type_name}(12,2)")
+                );
+            }
         }
     }
 

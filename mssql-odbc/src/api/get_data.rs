@@ -757,7 +757,9 @@ unsafe fn try_write_exact_buffered_scalar(
         (ColumnValues::Real(value), SQL_C_FLOAT) => write_exact!(*value),
         (ColumnValues::Float(value), SQL_C_DOUBLE) => write_exact!(*value),
         (ColumnValues::Date(value), SQL_C_TYPE_DATE) => {
-            let parts = date_parts(value);
+            let Ok(parts) = date_parts(value) else {
+                return false;
+            };
             write_exact!(SqlDateStruct {
                 year: parts.year,
                 month: parts.month,
@@ -765,7 +767,9 @@ unsafe fn try_write_exact_buffered_scalar(
             })
         }
         (ColumnValues::Time(value), SQL_C_SS_TIME2) => {
-            let parts = time_parts(value);
+            let Ok(parts) = time_parts(value) else {
+                return false;
+            };
             write_exact!(SqlSsTime2Struct {
                 hour: parts.hour,
                 minute: parts.minute,
@@ -774,7 +778,9 @@ unsafe fn try_write_exact_buffered_scalar(
             })
         }
         (ColumnValues::DateTime2(value), SQL_C_TYPE_TIMESTAMP) => {
-            let parts = datetime2_parts(value);
+            let Ok(parts) = datetime2_parts(value) else {
+                return false;
+            };
             write_exact!(SqlTimestampStruct {
                 year: parts.year,
                 month: parts.month,
@@ -786,7 +792,7 @@ unsafe fn try_write_exact_buffered_scalar(
             })
         }
         (ColumnValues::DateTimeOffset(value), SQL_C_SS_TIMESTAMPOFFSET) => {
-            let Some(parts) = datetimeoffset_parts(value) else {
+            let Ok(parts) = datetimeoffset_parts(value) else {
                 return false;
             };
             write_exact!(SqlSsTimestampoffsetStruct {
@@ -3379,6 +3385,14 @@ fn finish_typed_conv(
             post_diag(stmt_state, ERR_NUMERIC_OUT_OF_RANGE);
             SQL_ERROR
         }
+        Err(ConvError::InvalidDatetimeFormat) => {
+            post_diag(stmt_state, ERR_INVALID_DATETIME_FORMAT);
+            SQL_ERROR
+        }
+        Err(ConvError::DatetimeFieldOverflow) => {
+            post_diag(stmt_state, ERR_DATETIME_FIELD_OVERFLOW);
+            SQL_ERROR
+        }
         Err(ConvError::Restricted) => {
             post_diag(stmt_state, ERR_RESTRICTED_DATA_TYPE);
             SQL_ERROR
@@ -3553,7 +3567,7 @@ pub(crate) fn column_value_to_text(v: &ColumnValues) -> Result<String, TextError
         | ColumnValues::DateTimeOffset(_)
         | ColumnValues::SmallDateTime(_) => extract_datetime_parts(v)
             .map(|p| format_datetime_parts(&p))
-            .ok_or(TextError::Unsupported),
+            .map_err(|_| TextError::Unsupported),
         ColumnValues::Null => Ok(String::new()),
     }
 }
@@ -3583,6 +3597,18 @@ mod tests {
             d.message,
             expected.text
         );
+    }
+
+    #[test]
+    fn temporal_overflow_backstop_maps_to_22008() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let mut state = stmt.inner.lock().unwrap();
+        assert_eq!(
+            finish_typed_conv(&mut state, Err(ConvError::DatetimeFieldOverflow)),
+            SQL_ERROR
+        );
+        assert_last_diag(&state.diag_records, ERR_DATETIME_FIELD_OVERFLOW);
     }
 
     #[test]
@@ -6966,6 +6992,311 @@ mod tests {
         };
         assert_eq!(ret, SQL_SUCCESS);
         assert_eq!(out, 2);
+    }
+
+    #[test]
+    fn exported_get_data_temporal_errors_preserve_outputs() {
+        use crate::api::odbc_types::SQL_C_TYPE_TIME;
+        use mssql_tds::datatypes::column_values::{
+            SqlDateTime, SqlDateTime2, SqlDateTimeOffset, SqlSmallDateTime, SqlTime,
+        };
+
+        let midnight = SqlTime {
+            time_nanoseconds: 0,
+            scale: 7,
+        };
+        let invalid_time = SqlTime {
+            time_nanoseconds: 864_000_000_000,
+            scale: 7,
+        };
+        let invalid_scale = SqlTime {
+            time_nanoseconds: 0,
+            scale: 8,
+        };
+        let values = [
+            ColumnValues::Time(invalid_scale.clone()),
+            ColumnValues::DateTime2(SqlDateTime2 {
+                days: 0,
+                time: invalid_scale.clone(),
+            }),
+            ColumnValues::DateTimeOffset(SqlDateTimeOffset {
+                datetime2: SqlDateTime2 {
+                    days: 0,
+                    time: invalid_scale,
+                },
+                offset: 0,
+            }),
+            ColumnValues::Time(invalid_time.clone()),
+            ColumnValues::DateTime2(SqlDateTime2 {
+                days: 3_652_059,
+                time: midnight.clone(),
+            }),
+            ColumnValues::DateTime2(SqlDateTime2 {
+                days: 0,
+                time: invalid_time,
+            }),
+            ColumnValues::DateTimeOffset(SqlDateTimeOffset {
+                datetime2: SqlDateTime2 {
+                    days: 0,
+                    time: midnight.clone(),
+                },
+                offset: -1,
+            }),
+            ColumnValues::DateTimeOffset(SqlDateTimeOffset {
+                datetime2: SqlDateTime2 {
+                    days: 3_652_058,
+                    time: SqlTime {
+                        time_nanoseconds: 863_999_999_999,
+                        scale: 7,
+                    },
+                },
+                offset: 1,
+            }),
+            ColumnValues::DateTime(SqlDateTime {
+                days: i32::MAX,
+                time: 0,
+            }),
+            ColumnValues::DateTime(SqlDateTime {
+                days: -53_691,
+                time: 0,
+            }),
+            ColumnValues::DateTime(SqlDateTime {
+                days: 0,
+                time: 25_920_000,
+            }),
+            ColumnValues::SmallDateTime(SqlSmallDateTime {
+                days: 0,
+                time: 1_440,
+            }),
+        ];
+        let values: Vec<_> = values
+            .into_iter()
+            .map(|value| (value, ERR_INVALID_DATETIME_FORMAT))
+            .chain([u64::try_from(i64::MAX).unwrap(), u64::MAX].map(|ticks| {
+                (
+                    ColumnValues::DateTimeOffset(SqlDateTimeOffset {
+                        datetime2: SqlDateTime2 {
+                            days: 0,
+                            time: SqlTime {
+                                time_nanoseconds: ticks,
+                                scale: 7,
+                            },
+                        },
+                        offset: 1,
+                    }),
+                    ERR_INVALID_DATETIME_FORMAT,
+                )
+            }))
+            .chain([(
+                ColumnValues::String(SqlString::from_utf8_string("not a datetime".into())),
+                ERR_INVALID_CHARACTER_VALUE,
+            )])
+            .collect();
+
+        for buffered in [false, true] {
+            for target in [
+                SQL_C_TYPE_DATE,
+                SQL_C_TYPE_TIME,
+                SQL_C_TYPE_TIMESTAMP,
+                SQL_C_SS_TIME2,
+                SQL_C_SS_TIMESTAMPOFFSET,
+            ] {
+                for (value, diagnostic) in &values {
+                    let diagnostic =
+                        if matches!(value, ColumnValues::Time(_)) && target == SQL_C_TYPE_DATE {
+                            ERR_RESTRICTED_DATA_TYPE
+                        } else {
+                            *diagnostic
+                        };
+                    let h = TestHandles::with_env_dbc_stmt();
+                    if buffered {
+                        stmt_with_buffered_values(&h, vec![value.clone()]);
+                    } else {
+                        stmt_with_captured(&h, value.clone());
+                    }
+                    let mut output = [0xA5_u8; 32];
+                    let mut indicator: SqlLen = -99;
+                    assert_eq!(
+                        unsafe {
+                            crate::api::exports::SQLGetData(
+                                h.stmt,
+                                1,
+                                target,
+                                output.as_mut_ptr().cast(),
+                                SqlLen::try_from(output.len()).unwrap(),
+                                &mut indicator,
+                            )
+                        },
+                        SQL_ERROR,
+                        "{value:?}, target={target}, buffered={buffered}"
+                    );
+                    assert_eq!(output, [0xA5; 32]);
+                    assert_eq!(indicator, -99);
+                    let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+                    let state = stmt.inner.lock().unwrap();
+                    assert_eq!(state.diag_records.len(), 1);
+                    assert_last_diag(&state.diag_records, diagnostic);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn exported_get_data_unrepresentable_offset_text_remains_unsupported() {
+        use mssql_tds::datatypes::column_values::{SqlDateTime2, SqlDateTimeOffset, SqlTime};
+
+        for buffered in [false, true] {
+            for target in [SQL_C_CHAR, SQL_C_WCHAR] {
+                let h = TestHandles::with_env_dbc_stmt();
+                let value = ColumnValues::DateTimeOffset(SqlDateTimeOffset {
+                    datetime2: SqlDateTime2 {
+                        days: 0,
+                        time: SqlTime {
+                            time_nanoseconds: 0,
+                            scale: 7,
+                        },
+                    },
+                    offset: -1,
+                });
+                if buffered {
+                    stmt_with_buffered_values(&h, vec![value]);
+                } else {
+                    stmt_with_captured(&h, value);
+                }
+                let mut output = [0xA5_u8; 64];
+                let mut indicator: SqlLen = -99;
+                assert_eq!(
+                    unsafe {
+                        crate::api::exports::SQLGetData(
+                            h.stmt,
+                            1,
+                            target,
+                            output.as_mut_ptr().cast(),
+                            SqlLen::try_from(output.len()).unwrap(),
+                            &mut indicator,
+                        )
+                    },
+                    SQL_ERROR
+                );
+                assert_eq!(output, [0xA5; 64]);
+                assert_eq!(indicator, -99);
+                let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+                let state = stmt.inner.lock().unwrap();
+                assert_eq!(state.diag_records.last().unwrap().sql_state, *b"HYC00");
+            }
+        }
+    }
+
+    #[test]
+    fn exported_get_data_temporal_targets_preserve_success_and_restricted_errors() {
+        use crate::api::odbc_types::SQL_C_TYPE_TIME;
+        use mssql_tds::datatypes::column_values::{SqlDateTime2, SqlTime};
+
+        for buffered in [false, true] {
+            for target in [
+                SQL_C_TYPE_DATE,
+                SQL_C_TYPE_TIME,
+                SQL_C_TYPE_TIMESTAMP,
+                SQL_C_SS_TIME2,
+                SQL_C_SS_TIMESTAMPOFFSET,
+            ] {
+                for supported in [true, false] {
+                    let h = TestHandles::with_env_dbc_stmt();
+                    let value = if supported {
+                        ColumnValues::DateTime2(SqlDateTime2 {
+                            days: 3_652_058,
+                            time: SqlTime {
+                                time_nanoseconds: 0,
+                                scale: 7,
+                            },
+                        })
+                    } else {
+                        ColumnValues::Int(42)
+                    };
+                    if buffered {
+                        stmt_with_buffered_values(&h, vec![value]);
+                    } else {
+                        stmt_with_captured(&h, value);
+                    }
+                    let mut output = [0xA5_u8; 32];
+                    let mut indicator: SqlLen = -99;
+                    let rc = unsafe {
+                        crate::api::exports::SQLGetData(
+                            h.stmt,
+                            1,
+                            target,
+                            output.as_mut_ptr().cast(),
+                            SqlLen::try_from(output.len()).unwrap(),
+                            &mut indicator,
+                        )
+                    };
+                    let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+                    let state = stmt.inner.lock().unwrap();
+                    if supported {
+                        assert_eq!(rc, SQL_SUCCESS);
+                        assert_eq!(
+                            indicator,
+                            SqlLen::try_from(element_stride(target, 0)).unwrap()
+                        );
+                        assert!(state.diag_records.is_empty());
+                    } else {
+                        assert_eq!(rc, SQL_ERROR);
+                        assert_last_diag(&state.diag_records, ERR_RESTRICTED_DATA_TYPE);
+                        assert_eq!(output, [0xA5; 32]);
+                        assert_eq!(indicator, -99);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn exported_get_data_native_time_to_timestampoffset() {
+        use crate::conversion::datetime::current_local_date;
+        use mssql_tds::datatypes::column_values::SqlTime;
+
+        for buffered in [false, true] {
+            let h = TestHandles::with_env_dbc_stmt();
+            let value = ColumnValues::Time(SqlTime {
+                time_nanoseconds: 452_961_234_567,
+                scale: 7,
+            });
+            if buffered {
+                stmt_with_buffered_values(&h, vec![value]);
+            } else {
+                stmt_with_captured(&h, value);
+            }
+            let mut output = SqlSsTimestampoffsetStruct {
+                timezone_hour: 12,
+                timezone_minute: 34,
+                ..Default::default()
+            };
+            let mut indicator = SQL_NULL_DATA;
+            let length = SqlLen::try_from(std::mem::size_of_val(&output)).unwrap();
+            let before = current_local_date().unwrap();
+            assert_eq!(
+                unsafe {
+                    crate::api::exports::SQLGetData(
+                        h.stmt,
+                        1,
+                        SQL_C_SS_TIMESTAMPOFFSET,
+                        (&mut output as *mut SqlSsTimestampoffsetStruct).cast(),
+                        length,
+                        &mut indicator,
+                    )
+                },
+                SQL_SUCCESS,
+                "buffered={buffered}"
+            );
+            let after = current_local_date().unwrap();
+            assert!([before, after].contains(&(output.year, output.month, output.day)));
+            assert_eq!((output.hour, output.minute, output.second), (12, 34, 56));
+            assert_eq!(output.fraction, 123_456_700);
+            assert_eq!((output.timezone_hour, output.timezone_minute), (0, 0));
+            assert_eq!(indicator, length);
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            assert!(stmt.inner.lock().unwrap().diag_records.is_empty());
+        }
     }
 
     #[test]

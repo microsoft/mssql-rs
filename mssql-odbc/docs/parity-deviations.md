@@ -439,3 +439,39 @@ msodbcsql build is measured.
    agent capture for msodbcsql. A parity measurement that connects msodbcsql
    18.6.2.1 (the build pinned in CI) to a server or proxy that records the TDS 8
    user-agent feature would close this evidence gap.
+16. **Direct IPD field edits invalidate a cached plan when its SQL definition
+    changes.** msodbcsql's `ParamInfoSnapshot::FHasChanged` in
+    `Sql/Ntdbms/sqlncli/odbc/sqlcprot.h` is used by `SetIPDRec` in `sqlcdesc.cpp`,
+    not by the direct `SQLSetDescFieldW` route. On retail 18.06.0001 through the
+    Windows Driver Manager, an IPD INTEGER-to-SMALLINT field edit retained
+    `sp_execute` and an INTEGER result; `SQLSetDescRec` reparsed as SMALLINT.
+    This driver handles both routes consistently so the next execute reflects
+    the changed SQL definition. Approved by David Engel on 2026-09-17 in the
+    scope of [PR #564](https://github.com/microsoft/mssql-rs/pull/564).
+    Retail 18.6.2.1 was not measured for this distinction; do not infer it from
+    the driver's compatibility version string or add a parity-test skip.
+17. **Special SQL types retain a conservative plan-invalidation comparison.**
+    `DescRecord::parameter_definition` compares length, precision, and scale
+    for types outside its named character/binary, numeric, and fixed/temporal
+    arms, in addition to direction and SQL type. This differs from the
+    reference-source comparison, independently of the setter-route difference
+    in entry 16: at msodbcsql source `aa19092c`,
+    `Sql/Ntdbms/sqlncli/odbc/sqlcdesc.cpp` maps the public SQL identifiers before
+    `SetIPDRec` invokes `ParamInfoSnapshot::FHasChanged` in `sqlcprot.h`.
+    `IsSQLBinary` includes mapped UDT and `IsSQLWCHAR` includes mapped XML, so
+    that comparison considers only their length; mapped vector is outside all
+    shape-comparison groups, so it considers only direction and SQL type.
+    This driver deliberately retains the broader fallback because special
+    types can encode SQL shape in these fields, such as vector dimensions and
+    element type. It may re-prepare for an irrelevant field change rather
+    than risk retaining an obsolete declaration. This policy is part of the
+    selective design in [PR #564](https://github.com/microsoft/mssql-rs/pull/564),
+    not a change to which parameter types or conversions are supported.
+    `special_parameter_definitions_keep_size_precision_and_scale` pins the
+    vector and UDT projections; UDT parameter binding remains unsupported.
+    **Evidence limit:** this is a source comparison and a Rust unit test,
+    not a measured retail reuse/re-prepare claim. The earlier 18.06.0001 RPC
+    measurements did not cover these special-type edits. A supported
+    Driver Manager bind/record-edit sequence with RPC capture and a recorded
+    `SQL_DRIVER_VER` is still needed to establish shipping-build behavior;
+    do not infer retail parity or add a comparison-test skip from this entry.
