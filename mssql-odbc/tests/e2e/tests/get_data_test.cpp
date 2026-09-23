@@ -275,6 +275,217 @@ protected:
     }
 };
 
+TEST_F(GetDataLiveTest, PlpTypedConversions) {
+    SQLCHAR version[32] = {};
+    ASSERT_SQL_OK(SQLGetInfoA(dbc_, SQL_DRIVER_VER, version, sizeof(version), nullptr),
+                  SQL_HANDLE_DBC, dbc_);
+    RecordProperty("driver_version", reinterpret_cast<const char*>(version));
+    for (const char* type : {"varchar(max)", "nvarchar(max)"}) {
+        SCOPED_TRACE(type);
+        ASSERT_SQL_OK(ExecDirect(
+            "SELECT CAST('42' AS " + std::string(type) + "), CAST('12.5' AS " + type +
+            "), CAST('2026-09-22' AS " + type +
+            "), CAST('2026-09-22 13:14:15.123' AS " + type + "), 99"),
+            SQL_HANDLE_STMT, stmt_);
+        ASSERT_EQ(SQL_SUCCESS, SQLFetch(stmt_));
+        SQLLEN indicator = -99;
+        SQLINTEGER integer = 0;
+        ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_SLONG, &integer, 0, &indicator),
+                      SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ(42, integer);
+        EXPECT_EQ(sizeof(integer), indicator);
+        EXPECT_EQ(SQL_NO_DATA, SQLGetData(stmt_, 1, SQL_C_SLONG, &integer, 0, &indicator));
+        SQLDOUBLE floating = 0;
+        ASSERT_SQL_OK(SQLGetData(stmt_, 2, SQL_C_DOUBLE, &floating, 0, &indicator),
+                      SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ(12.5, floating);
+        EXPECT_EQ(sizeof(floating), indicator);
+        SQL_DATE_STRUCT date = {};
+        ASSERT_SQL_OK(SQLGetData(stmt_, 3, SQL_C_TYPE_DATE, &date, 0, &indicator),
+                      SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ(2026, date.year);
+        EXPECT_EQ(9, date.month);
+        EXPECT_EQ(22, date.day);
+        EXPECT_EQ(sizeof(date), indicator);
+        SQL_TIMESTAMP_STRUCT timestamp = {};
+        ASSERT_SQL_OK(SQLGetData(stmt_, 4, SQL_C_TYPE_TIMESTAMP, &timestamp, 0, &indicator),
+                      SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ(2026, timestamp.year);
+        EXPECT_EQ(9, timestamp.month);
+        EXPECT_EQ(22, timestamp.day);
+        EXPECT_EQ(13, timestamp.hour);
+        EXPECT_EQ(14, timestamp.minute);
+        EXPECT_EQ(15, timestamp.second);
+        EXPECT_EQ(123000000u, timestamp.fraction);
+        EXPECT_EQ(sizeof(timestamp), indicator);
+        ASSERT_EQ(SQL_SUCCESS, SQLGetData(stmt_, 5, SQL_C_SLONG, &integer, 0, &indicator));
+        EXPECT_EQ(99, integer);
+        EXPECT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
+        ASSERT_EQ(SQL_SUCCESS, SQLCloseCursor(stmt_));
+    }
+}
+
+TEST_F(GetDataLiveTest, PlpTypedDiagnosticsAndFollowingRows) {
+    struct Case {
+        const char* literal;
+        SQLRETURN result;
+        const char* state;
+        SQLINTEGER value;
+    };
+    const Case cases[] = {
+        {"42.5", SQL_SUCCESS_WITH_INFO, "01S07", 42},
+        {"42.000", SQL_SUCCESS, "", 42},
+        {"not-a-number", SQL_ERROR, "22018", -99},
+        {"2147483648", SQL_ERROR, "22003", -99},
+    };
+    for (const char* type : {"varchar(max)", "nvarchar(max)"}) {
+        for (const auto& test : cases) {
+            SCOPED_TRACE(type);
+            SCOPED_TRACE(test.literal);
+            ASSERT_SQL_OK(ExecDirect(
+                "SELECT CAST('" + std::string(test.literal) + "' AS " + type +
+                "), 99 UNION ALL SELECT CAST('7' AS " + type + "), 100"),
+                SQL_HANDLE_STMT, stmt_);
+            ASSERT_EQ(SQL_SUCCESS, SQLFetch(stmt_));
+            SQLINTEGER value = -99;
+            SQLLEN indicator = -99;
+            EXPECT_EQ(test.result, SQLGetData(stmt_, 1, SQL_C_SLONG, &value, 0, &indicator));
+            EXPECT_EQ(test.state, StmtDiagState());
+            if (test.result != SQL_ERROR) {
+                EXPECT_EQ(test.value, value);
+                EXPECT_EQ(sizeof(value), indicator);
+            }
+            ASSERT_EQ(SQL_SUCCESS, SQLGetData(stmt_, 2, SQL_C_SLONG, &value, 0, &indicator));
+            EXPECT_EQ(99, value);
+            ASSERT_EQ(SQL_SUCCESS, SQLFetch(stmt_));
+            ASSERT_EQ(SQL_SUCCESS, SQLGetData(stmt_, 1, SQL_C_SLONG, &value, 0, &indicator));
+            EXPECT_EQ(7, value);
+            ASSERT_EQ(SQL_SUCCESS, SQLGetData(stmt_, 2, SQL_C_SLONG, &value, 0, &indicator));
+            EXPECT_EQ(100, value);
+            EXPECT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
+            ASSERT_EQ(SQL_SUCCESS, SQLCloseCursor(stmt_));
+        }
+    }
+}
+
+TEST_F(GetDataLiveTest, EmptyTextTypedConversionsLeaveOutputUntouched) {
+    for (const char* type : {"varchar(max)", "nvarchar(max)", "varchar(32)", "nvarchar(32)"}) {
+        for (SQLSMALLINT target : {SQL_C_SLONG, SQL_C_SBIGINT, SQL_C_UBIGINT, SQL_C_SSHORT,
+                                  SQL_C_USHORT, SQL_C_STINYINT, SQL_C_UTINYINT, SQL_C_BIT,
+                                  SQL_C_FLOAT, SQL_C_DOUBLE, SQL_C_GUID, SQL_C_TYPE_DATE,
+                                  SQL_C_TYPE_TIME, SQL_C_TYPE_TIMESTAMP}) {
+            for (bool bound : {false, true}) {
+                SCOPED_TRACE(type);
+                SCOPED_TRACE(target);
+                SCOPED_TRACE(bound);
+                ASSERT_SQL_OK(ExecDirect("SELECT CAST('' AS " + std::string(type) + "), 99"),
+                              SQL_HANDLE_STMT, stmt_);
+                std::vector<SQLCHAR> bytes(32, 0xCC);
+                const auto expected = bytes;
+                SQLLEN indicator = -99;
+                if (bound) {
+                    ASSERT_EQ(SQL_SUCCESS, SQLBindCol(stmt_, 1, target, bytes.data(), 0, &indicator));
+                }
+                const bool temporal = target == SQL_C_TYPE_DATE || target == SQL_C_TYPE_TIME ||
+                                      target == SQL_C_TYPE_TIMESTAMP;
+                SQLRETURN result = SQLFetch(stmt_);
+                if (!bound) {
+                    ASSERT_EQ(SQL_SUCCESS, result);
+                    result = SQLGetData(stmt_, 1, target, bytes.data(), 0, &indicator);
+                }
+                EXPECT_EQ(temporal ? SQL_ERROR : SQL_SUCCESS, result);
+                EXPECT_EQ(temporal ? "22018" : "", StmtDiagState());
+                EXPECT_EQ(expected, bytes);
+                if (!temporal) {
+                    EXPECT_EQ(0, indicator);
+                }
+                ASSERT_EQ(SQL_SUCCESS, SQLCloseCursor(stmt_));
+                ASSERT_EQ(SQL_SUCCESS, SQLFreeStmt(stmt_, SQL_UNBIND));
+            }
+        }
+    }
+}
+
+TEST_F(GetDataLiveTest, PlpTypedNullsAndChunkBoundaries) {
+    for (const char* type : {"varchar(max)", "nvarchar(max)"}) {
+        SCOPED_TRACE(type);
+        ASSERT_SQL_OK(ExecDirect("SELECT CAST(NULL AS " + std::string(type) + "), 99"),
+                      SQL_HANDLE_STMT, stmt_);
+        ASSERT_EQ(SQL_SUCCESS, SQLFetch(stmt_));
+        SQLINTEGER value = -99;
+        SQLLEN indicator = -99;
+        EXPECT_EQ(SQL_SUCCESS, SQLGetData(stmt_, 1, SQL_C_SLONG, &value, 0, &indicator));
+        EXPECT_EQ(SQL_NULL_DATA, indicator);
+        EXPECT_EQ(-99, value);
+        ASSERT_EQ(SQL_SUCCESS, SQLCloseCursor(stmt_));
+
+        for (int length : {255, 256, 257, 511}) {
+            SCOPED_TRACE(length);
+            ASSERT_SQL_OK(ExecDirect(
+                "SELECT REPLICATE(CAST('0' AS " + std::string(type) + "), " +
+                std::to_string(length - 1) + ") + '1', 99"), SQL_HANDLE_STMT, stmt_);
+            ASSERT_EQ(SQL_SUCCESS, SQLFetch(stmt_));
+            EXPECT_EQ(SQL_SUCCESS, SQLGetData(stmt_, 1, SQL_C_SLONG, &value, 0, &indicator));
+            EXPECT_EQ("", StmtDiagState());
+            EXPECT_EQ(1, value);
+            EXPECT_EQ(sizeof(value), indicator);
+            EXPECT_EQ(SQL_SUCCESS, SQLGetData(stmt_, 2, SQL_C_SLONG, &value, 0, &indicator));
+            EXPECT_EQ(99, value);
+            ASSERT_EQ(SQL_SUCCESS, SQLCloseCursor(stmt_));
+        }
+    }
+}
+
+TEST_F(GetDataLiveTest, PlpTypedAfterCharacterProbeOrRead) {
+    for (const char* type : {"varchar(max)", "nvarchar(max)"}) {
+        for (SQLSMALLINT target : {SQL_C_CHAR, SQL_C_WCHAR}) {
+            for (bool probe : {false, true}) {
+                SCOPED_TRACE(type);
+                SCOPED_TRACE(target);
+                SCOPED_TRACE(probe);
+                ASSERT_SQL_OK(ExecDirect("SELECT CAST('142' AS " + std::string(type) + "), 99"),
+                              SQL_HANDLE_STMT, stmt_);
+                ASSERT_EQ(SQL_SUCCESS, SQLFetch(stmt_));
+                SQLCHAR buffer[4] = {};
+                SQLLEN indicator = -99;
+                const SQLLEN size = target == SQL_C_CHAR ? 1 : sizeof(SQLWCHAR);
+                EXPECT_EQ(SQL_SUCCESS_WITH_INFO, SQLGetData(
+                    stmt_, 1, target, buffer, probe ? size : 2 * size, &indicator));
+                SQLINTEGER value = -99;
+                EXPECT_EQ(SQL_SUCCESS, SQLGetData(stmt_, 1, SQL_C_SLONG, &value, 0, &indicator));
+                EXPECT_EQ(probe ? 142 : 42, value);
+                EXPECT_EQ(sizeof(value), indicator);
+                EXPECT_EQ(SQL_SUCCESS, SQLGetData(stmt_, 2, SQL_C_SLONG, &value, 0, &indicator));
+                EXPECT_EQ(99, value);
+                ASSERT_EQ(SQL_SUCCESS, SQLCloseCursor(stmt_));
+            }
+        }
+    }
+}
+
+TEST_F(GetDataLiveTest, PlpTypedOversizedValueIsRefusedAndDrained) {
+    const char* target = std::getenv("ODBC_TEST_TARGET");
+    const bool reference = target && std::string(target) == "msodbcsql";
+    for (const char* type : {"varchar(max)", "nvarchar(max)"}) {
+        SCOPED_TRACE(type);
+        ASSERT_SQL_OK(ExecDirect(
+            "SELECT REPLICATE(CAST('0' AS " + std::string(type) + "), 1048576) + '1', 99"),
+            SQL_HANDLE_STMT, stmt_);
+        ASSERT_EQ(SQL_SUCCESS, SQLFetch(stmt_));
+        SQLINTEGER value = -99;
+        SQLLEN indicator = -99;
+        EXPECT_EQ(reference ? SQL_SUCCESS_WITH_INFO : SQL_ERROR,
+                  SQLGetData(stmt_, 1, SQL_C_SLONG, &value, 0, &indicator));
+        EXPECT_EQ(reference ? "01004" : "HYC00", StmtDiagState());
+        EXPECT_EQ(reference ? 0 : -99, value);
+        EXPECT_EQ(reference ? static_cast<SQLLEN>(sizeof(value)) : -99, indicator);
+        EXPECT_EQ(SQL_SUCCESS, SQLGetData(stmt_, 2, SQL_C_SLONG, &value, 0, &indicator));
+        EXPECT_EQ(99, value);
+        EXPECT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
+        ASSERT_EQ(SQL_SUCCESS, SQLCloseCursor(stmt_));
+    }
+}
+
 class GetDataUtf16Test : public GetDataLiveTest {
 protected:
     void SetUp() override {
@@ -1652,12 +1863,7 @@ TEST_F(GetDataLiveTest, PartialPlpReadThenJumpToLaterColumnClearsStaleStream) {
     SQLCloseCursor(stmt_);
 }
 
-// A PLP (streamed max-type) column requested with a non-character C type is
-// rejected with HYC00 before any stream state is created. The reference
-// msodbcsql driver implements numeric conversions from character data, so the
-// HYC00 assertion is mssql-odbc-specific — skip it on the msodbcsql leg.
-TEST_F(GetDataLiveTest, PlpColumnUnsupportedCTypeReturnsHyc00) {
-    SKIP_IF_COMPARING_MSODBCSQL();
+TEST_F(GetDataLiveTest, PlpColumnToShortTarget) {
     ASSERT_SQL_OK(ExecDirect("SELECT CAST('123' AS VARCHAR(MAX)) AS c1"),
                   SQL_HANDLE_STMT, stmt_);
 
@@ -1666,8 +1872,10 @@ TEST_F(GetDataLiveTest, PlpColumnUnsupportedCTypeReturnsHyc00) {
     SQLSMALLINT sbuf = 0;
     SQLLEN ind = 0;
     SQLRETURN rc = SQLGetData(stmt_, 1, SQL_C_SSHORT, &sbuf, 0, &ind);
-    EXPECT_EQ(SQL_ERROR, rc);
-    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HYC00");
+    EXPECT_EQ(SQL_SUCCESS, rc);
+    EXPECT_EQ(123, sbuf);
+    EXPECT_EQ(sizeof(sbuf), ind);
+    EXPECT_EQ("", StmtDiagState());
 
     SQLCloseCursor(stmt_);
 }

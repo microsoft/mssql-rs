@@ -138,6 +138,10 @@ pub(crate) const ERR_MEMORY_ALLOCATION: DiagMsg = DiagMsg {
     state: SQLSTATE_HY001,
     text: "Memory allocation error",
 };
+pub(crate) const ERR_PLP_TYPED_LIMIT: DiagMsg = DiagMsg {
+    state: SQLSTATE_HYC00,
+    text: "PLP typed conversion exceeds the materialization limit",
+};
 pub(crate) const ERR_FETCH_TYPE_OUT_OF_RANGE: DiagMsg = DiagMsg {
     state: SQLSTATE_HY106,
     text: "Fetch type out of range",

@@ -1621,7 +1621,7 @@ const PLP_BOUND_CHUNK: usize = 8 * 1024;
 /// rather than letting an arbitrary MAX value exhaust the application process.
 const PLP_TYPED_MATERIALIZE_LIMIT: usize = 1024 * 1024;
 
-fn typed_plp_chunk_fits(current: usize, chunk: usize, known_total: Option<u64>) -> bool {
+pub(crate) fn typed_plp_chunk_fits(current: usize, chunk: usize, known_total: Option<u64>) -> bool {
     known_total.is_none_or(|total| total <= PLP_TYPED_MATERIALIZE_LIMIT as u64)
         && current
             .checked_add(chunk)

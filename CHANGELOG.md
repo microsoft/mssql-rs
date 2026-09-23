@@ -8,6 +8,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ### Added
 
+- `mssql-odbc`: `SQLGetData` conversions from `varchar(max)` and `nvarchar(max)`
+  into supported numeric, GUID, and date/time C targets, with the existing
+  bound-fetch 1 MiB source-data cap (AB#47238).
+
 - `mssql-odbc`: input parameter binding (`SQLBindParameter` with
   `SQL_PARAM_INPUT`) for the character and integer type families. Any other
   `ValueType` → `ParameterType` pairing is rejected at bind time with `HYC00`,
@@ -54,6 +58,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 - Initial public release of the mssql-rs workspace.
 
 ### Changed
+
+- `mssql-odbc`: empty character values retrieved as numeric or GUID C targets
+  now return success with indicator 0 and leave the value buffer unchanged,
+  matching msodbcsql18 for bound and unbound retrieval. Empty date/time
+  literals still return `22018`.
 
 - `mssql-odbc`: `SQLBindCol` now accepts `SQL_C_DEFAULT` and resolves it at
   fetch time from the current result column's SQL type, using the same mapping

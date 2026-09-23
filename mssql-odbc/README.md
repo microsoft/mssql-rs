@@ -177,6 +177,23 @@ See the [end-to-end test guide](tests/e2e/README.md) for prerequisites,
 connection configuration, targeted runs, coverage, and comparison testing
 against `msodbcsql18`.
 
+## Typed character retrieval
+
+`SQLGetData` converts `varchar(max)` and `nvarchar(max)` into the same supported
+integer, floating-point, GUID, and date/time C targets as non-max text. It
+preserves the column's encoding and any unread characters from an earlier
+character read. Fixed-size targets ignore `BufferLength` and report their C
+type's size after successful conversion.
+
+Typed PLP conversion accepts at most 1 MiB of source wire data, matching bound
+fetches. Larger values are drained and rejected with `HYC00`, leaving output
+buffers unchanged; no truncated numeric prefix is returned. See
+[deviation 7](docs/parity-deviations.md) for the measured native-driver difference.
+Empty character values retrieved as numeric or GUID C targets succeed with
+indicator 0 and leave the value buffer unchanged, matching msodbcsql18. Empty
+date/time literals remain `22018`. SQL NULL still uses `SQL_NULL_DATA` and
+requires an indicator pointer.
+
 ## Connection busy gate
 
 `SQLFetch`/`SQLFetchScroll`/`SQLGetData` release the connection's busy claim
