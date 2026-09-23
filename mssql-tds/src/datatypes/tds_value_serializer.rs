@@ -1371,7 +1371,7 @@ impl TdsValueSerializer {
     /// - 0xEF: NCHAR(n) - UTF-16LE encoding with padding
     /// - 0xA7: VARCHAR(n) / VARCHAR(MAX) - single-byte encoding
     /// - 0xAF: CHAR(n) - single-byte encoding with padding
-    async fn serialize_string<'a, 'b>(
+    pub(crate) async fn serialize_string<'a, 'b>(
         writer: &'a mut PacketWriter<'b>,
         value: &crate::datatypes::sql_string::SqlString,
         ctx: &TdsTypeContext,
