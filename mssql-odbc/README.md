@@ -177,6 +177,14 @@ See the [end-to-end test guide](tests/e2e/README.md) for prerequisites,
 connection configuration, targeted runs, coverage, and comparison testing
 against `msodbcsql18`.
 
+## Result error timing
+
+When positioning a row-returning result, `SQLExecDirect`, `SQLExecute`, and
+`SQLMoreResults` wait for its first row, end-of-result, or server error rather
+than returning after column metadata alone. Errors before the first row are
+reported by that positioning call, including server lock timeouts. A first row
+found during this check remains available to `SQLFetch`.
+
 ## Connection busy gate
 
 `SQLFetch`/`SQLFetchScroll`/`SQLGetData` release the connection's busy claim
