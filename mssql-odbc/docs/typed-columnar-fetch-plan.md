@@ -131,9 +131,16 @@ for `time(0)` and `time(7)`. A one-off manual Linux comparison also passed with
 process timezone; they do not set `TZ` or provide an automated timezone matrix.
 Character time-only literals to timestampoffset remain outside this change.
 
-Malformed decoded native values are covered by Rust regressions, not a retail
-wire-level comparison: a normal SQL Server cannot produce them. Decoded fields
-are validated before arithmetic, so even extreme ticks report `22007`.
+Malformed decoded native values other than `Date` are covered by Rust
+regressions, not a retail wire-level comparison: a normal SQL Server cannot
+produce them. Malformed `ColumnValues::Date` is absent from the converter,
+captured/buffered `SQLGetData`, and bound-fetch error matrices: `SqlDate::create`
+rejects invalid dates, while `unchecked_create` is private to `mssql-tds`.
+The `Date`-specific error routing remains an untested gap despite sharing the
+date-range validator with other temporal sources. Closing it requires
+decoder-backed test fixtures; this PR does not widen the unchecked constructor.
+
+Decoded fields are validated before arithmetic, so even extreme ticks report `22007`.
 Decoded temporal scales outside 0..7 also report `22007`; this does not limit
 character literals, whose fractional fields can carry nine digits.
 An offset-adjusted date outside years 1..9999 remains `22007`: the reference
