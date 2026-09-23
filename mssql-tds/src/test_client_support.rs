@@ -26,6 +26,13 @@ pub use crate::sql_identifier::escape_identifier;
 
 pub use crate::message::parameters::rpc_parameters::rpc_parameter_status;
 
+/// Uses the declaration generator used by prepared RPCs, without a server.
+pub fn rpc_parameter_declaration(
+    parameter: &crate::message::parameters::rpc_parameters::RpcParameter,
+) -> TdsResult<String> {
+    parameter.sql_declaration()
+}
+
 use crate::connection::client_context::ClientContext;
 use crate::connection::execution_context::ExecutionContext;
 use crate::connection::tds_client::TdsClient;

@@ -76,9 +76,9 @@ pub(crate) struct RpcEncryptionMetadata {
 ///
 /// A `None`-valued `Decimal`/`Numeric` or `Time`/`DateTime2`/`DateTimeOffset`
 /// has no value to read precision and scale from, so a typed NULL would
-/// otherwise fall back to the TDS defaults. Supplying this metadata drives both
-/// the SQL declaration text and the wire `TYPE_INFO`, so the two cannot
-/// disagree.
+/// otherwise fall back to the TDS defaults. By default this metadata drives both
+/// the SQL declaration and wire `TYPE_INFO`. A separate bound SQL numeric target
+/// can be specified with [`RpcParameter::with_numeric_declaration`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RpcTypeMetadata {
     /// Decimal/numeric precision.
@@ -147,6 +147,12 @@ enum RpcValue {
     Streamed(StreamedSqlType),
 }
 
+#[derive(Debug, Clone, Copy)]
+struct NumericDeclaration {
+    precision: u8,
+    scale: u8,
+}
+
 /// A single parameter in a TDS RPC request.
 ///
 /// Construct with [`RpcParameter::new`], supplying an optional name, status
@@ -168,8 +174,11 @@ pub struct RpcParameter {
     value: RpcValue,
 
     /// Precision/scale for a value template that cannot carry them itself.
-    /// Applied to both the SQL declaration and the wire `TYPE_INFO`.
+    /// Applied to wire `TYPE_INFO` and, absent an override, the SQL declaration.
     type_metadata: Option<RpcTypeMetadata>,
+
+    /// A bound SQL numeric definition may differ from its incoming wire value.
+    numeric_declaration: Option<NumericDeclaration>,
 
     /// Declaration for a streamed parameter whose `@params` type is narrower
     /// than its PLP body. See [`RpcParameter::with_streamed_declaration`].
@@ -198,6 +207,7 @@ impl RpcParameter {
             options,
             value: RpcValue::Materialized(value),
             type_metadata: None,
+            numeric_declaration: None,
             streamed_declaration: None,
             encrypted: None,
             force_column_encryption: false,
@@ -215,6 +225,7 @@ impl RpcParameter {
             options,
             value: RpcValue::Streamed(sql_type),
             type_metadata: None,
+            numeric_declaration: None,
             streamed_declaration: None,
             encrypted: None,
             force_column_encryption: false,
@@ -266,16 +277,46 @@ impl RpcParameter {
     /// Supplies precision/scale for a value template that cannot carry them —
     /// a typed NULL `Decimal`/`Numeric` or `Time`/`DateTime2`/`DateTimeOffset`.
     ///
-    /// The same metadata drives the SQL declaration and the wire `TYPE_INFO`,
-    /// so a caller cannot declare `decimal(12,3)` while sending `NUMERIC(1,0)`.
+    /// By default this drives both the SQL declaration and wire `TYPE_INFO`.
+    /// [`Self::with_numeric_declaration`] can specify a separate SQL target.
     pub fn with_type_metadata(mut self, metadata: RpcTypeMetadata) -> Self {
         self.type_metadata = Some(metadata);
         self
     }
 
+    /// Sets the SQL numeric target without changing the value or wire precision
+    /// and scale. ODBC's IPD defines this target independently of its C buffer.
+    pub fn with_numeric_declaration(mut self, precision: u8, scale: u8) -> TdsResult<Self> {
+        if !matches!(
+            self.value,
+            RpcValue::Materialized(SqlType::Decimal(_) | SqlType::Numeric(_))
+        ) {
+            return Err(Error::UsageError(
+                "A numeric declaration requires a decimal or numeric parameter".into(),
+            ));
+        }
+        if !crate::datatypes::decoder::decimal_metadata_is_valid(precision, scale) {
+            return Err(Error::UsageError(
+                "Invalid numeric declaration precision or scale".into(),
+            ));
+        }
+        self.numeric_declaration = Some(NumericDeclaration { precision, scale });
+        Ok(self)
+    }
+
     pub(crate) fn sql_declaration(&self) -> TdsResult<String> {
         match &self.value {
-            RpcValue::Materialized(value) => Self::get_sql_name(value, self.type_metadata),
+            RpcValue::Materialized(value) => {
+                let metadata = self
+                    .numeric_declaration
+                    .map_or(self.type_metadata, |declaration| {
+                        Some(RpcTypeMetadata {
+                            precision: Some(declaration.precision),
+                            scale: Some(declaration.scale),
+                        })
+                    });
+                Self::get_sql_name(value, metadata)
+            }
             RpcValue::Streamed(streamed) => match &self.streamed_declaration {
                 Some(declaration) => Self::get_sql_name(declaration, self.type_metadata),
                 None => streamed.sql_name(),
@@ -820,6 +861,7 @@ mod tests {
             std::mem::size_of_val(&parameter.encrypted),
             size_of::<usize>()
         );
+        assert!(std::mem::size_of_val(&parameter.numeric_declaration) <= 4);
         assert!(
             size_of::<RpcParameter>()
                 <= size_of::<SqlType>() + size_of::<Option<String>>() + 6 * size_of::<usize>()
@@ -1052,9 +1094,8 @@ mod tests {
         }
     }
 
-    /// The declaration text and the wire `TYPE_INFO` must come from the same
-    /// [`RpcTypeMetadata`]: declaring `decimal(12,3)` while serializing
-    /// `NUMERIC(1,0)` would truncate the first non-NULL value sent.
+    /// Without a separate SQL target, supplied metadata drives both declaration
+    /// and wire type, including when the value is NULL.
     #[test]
     fn type_metadata_drives_declaration_and_wire_metadata() {
         let param = RpcParameter::new(
@@ -1083,6 +1124,67 @@ mod tests {
             (type_info[2], type_info[3]),
             (12, 3),
             "wire precision/scale must match the declaration"
+        );
+    }
+
+    #[test]
+    fn numeric_declaration_does_not_change_wire_value_metadata() {
+        use crate::datatypes::decoder::DecimalParts;
+
+        for value in [
+            SqlType::Numeric(Some(DecimalParts::new(true, 8, 2, 12345))),
+            SqlType::Decimal(Some(DecimalParts::new(true, 8, 2, 12345))),
+            SqlType::Numeric(None),
+            SqlType::Decimal(None),
+        ] {
+            let type_name = if matches!(value, SqlType::Numeric(_)) {
+                "numeric"
+            } else {
+                "decimal"
+            };
+            let parameter = RpcParameter::new(Some("@P1".into()), StatusFlags::NONE, value)
+                .with_type_metadata(RpcTypeMetadata {
+                    precision: Some(8),
+                    scale: Some(2),
+                });
+            let wire = serialize_param(&parameter);
+            assert_eq!(
+                parameter.sql_declaration().unwrap(),
+                format!("{type_name}(8,2)")
+            );
+            let parameter = parameter.with_numeric_declaration(12, 4).unwrap();
+            let mut declaration = String::new();
+            build_parameter_list_string(&vec![parameter.clone()], &mut declaration).unwrap();
+            assert_eq!(declaration, format!("@P1 {type_name}(12,4) "));
+            assert_eq!(serialize_param(&parameter), wire);
+        }
+    }
+
+    #[test]
+    fn numeric_declaration_validates_type_precision_and_scale() {
+        for (precision, scale) in [(0, 0), (39, 0), (8, 9)] {
+            assert!(
+                RpcParameter::new(None, StatusFlags::NONE, SqlType::Numeric(None))
+                    .with_numeric_declaration(precision, scale)
+                    .is_err()
+            );
+        }
+        for (precision, scale) in [(1, 0), (1, 1), (38, 0), (38, 38)] {
+            assert!(
+                RpcParameter::new(None, StatusFlags::NONE, SqlType::Numeric(None))
+                    .with_numeric_declaration(precision, scale)
+                    .is_ok()
+            );
+        }
+        assert!(
+            RpcParameter::new(None, StatusFlags::NONE, SqlType::Int(Some(42)))
+                .with_numeric_declaration(12, 2)
+                .is_err()
+        );
+        assert!(
+            RpcParameter::data_at_exec(None, StatusFlags::NONE, StreamedSqlType::VarcharMax)
+                .with_numeric_declaration(12, 2)
+                .is_err()
         );
     }
 

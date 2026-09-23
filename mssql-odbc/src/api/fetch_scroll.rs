@@ -320,6 +320,10 @@ pub(crate) enum RowIssue {
     FractionalTruncated,
     /// 22003 — numeric value out of the target's range.
     OutOfRange,
+    /// 22007 — a decoded datetime field or value is out of range.
+    InvalidDatetimeFormat,
+    /// 22008 — datetime arithmetic overflowed.
+    DatetimeFieldOverflow,
     /// 07006 — the source type cannot convert to the requested target.
     Restricted,
     /// 22018 — the payload is not a valid literal for the target.
@@ -338,6 +342,8 @@ impl RowIssue {
             RowIssue::StringTruncated => post_diag(stmt_state, WARN_STRING_TRUNCATION),
             RowIssue::FractionalTruncated => post_diag(stmt_state, WARN_FRACTIONAL_TRUNCATION),
             RowIssue::OutOfRange => post_diag(stmt_state, ERR_NUMERIC_OUT_OF_RANGE),
+            RowIssue::InvalidDatetimeFormat => post_diag(stmt_state, ERR_INVALID_DATETIME_FORMAT),
+            RowIssue::DatetimeFieldOverflow => post_diag(stmt_state, ERR_DATETIME_FIELD_OVERFLOW),
             RowIssue::Restricted => post_diag(stmt_state, ERR_RESTRICTED_DATA_TYPE),
             RowIssue::InvalidCharacter => post_diag(stmt_state, ERR_INVALID_CHARACTER_VALUE),
             RowIssue::IndicatorRequired => post_diag(stmt_state, ERR_INDICATOR_REQUIRED),
@@ -478,7 +484,7 @@ impl<'a> BoundRowWriter<'a> {
     }
 
     /// Converts temporal parts directly into the matching ODBC struct, retaining
-    /// the normal conversion path for other C targets and range failures.
+    /// the normal conversion path for other C targets.
     fn write_temporal<T, P, C, V>(
         &mut self,
         col: usize,
@@ -488,7 +494,7 @@ impl<'a> BoundRowWriter<'a> {
         value: V,
     ) where
         T: Copy,
-        P: FnOnce() -> Option<DateTimeParts>,
+        P: FnOnce() -> Result<DateTimeParts, ConvError>,
         C: FnOnce(DateTimeParts) -> T,
         V: FnOnce() -> ColumnValues,
     {
@@ -497,10 +503,10 @@ impl<'a> BoundRowWriter<'a> {
         };
         let delivered = if binding.target_type == target_type {
             match parts() {
-                Some(parts) => unsafe {
+                Ok(parts) => unsafe {
                     deliver_fixed_bound(binding, self.row_index, self.bind_offset, convert(parts))
                 },
-                None => RowOutcome::Error(RowIssue::Restricted),
+                Err(error) => typed_conv_outcome(Err(error)),
             }
         } else {
             unsafe { deliver_bound(binding, self.row_index, self.bind_offset, &value()) }
@@ -581,7 +587,7 @@ impl RowWriter for BoundRowWriter<'_> {
         self.write_temporal(
             col,
             SQL_C_TYPE_DATE,
-            || Some(date_parts(&val)),
+            || date_parts(&val),
             |parts| SqlDateStruct {
                 year: parts.year,
                 month: parts.month,
@@ -596,7 +602,7 @@ impl RowWriter for BoundRowWriter<'_> {
         self.write_temporal(
             col,
             SQL_C_SS_TIME2,
-            || Some(time_parts(&val)),
+            || time_parts(&val),
             |parts| SqlSsTime2Struct {
                 hour: parts.hour,
                 minute: parts.minute,
@@ -622,7 +628,7 @@ impl RowWriter for BoundRowWriter<'_> {
         self.write_temporal(
             col,
             SQL_C_TYPE_TIMESTAMP,
-            || Some(datetime2_parts(&val)),
+            || datetime2_parts(&val),
             |parts| SqlTimestampStruct {
                 year: parts.year,
                 month: parts.month,
@@ -2297,21 +2303,22 @@ unsafe fn deliver_bound(
         }
         return RowOutcome::Success;
     }
-    unsafe { clear_stale_null_indicator(indicator, octet_length) };
-
     if is_typed_c_target(binding.target_type) {
         let converted = unsafe {
             convert_typed_c(value, binding.target_type, slot as SqlPointer, octet_length)
         };
+        if converted.is_ok() {
+            unsafe { clear_stale_null_indicator(indicator, octet_length) };
+        }
         return typed_conv_outcome(converted);
     }
-
     if binding.target_type == SQL_C_BINARY {
         // Binary is not a string: no terminator, and the untruncated byte count
         // goes to `octet_length` exactly as the character targets do.
         let Some(bytes) = column_value_to_bytes(value) else {
             return RowOutcome::Error(RowIssue::Unsupported);
         };
+        unsafe { clear_stale_null_indicator(indicator, octet_length) };
         unsafe { write_if_some(octet_length, bytes.len() as SqlLen) };
         let take = bytes.len().min(stride);
         if take > 0 {
@@ -2336,6 +2343,7 @@ unsafe fn deliver_bound(
             || (matches!(value.encoding_type(), EncodingType::Utf16)
                 && value.bytes.len().is_multiple_of(2)))
     {
+        unsafe { clear_stale_null_indicator(indicator, octet_length) };
         let byte_len = if cp1252 {
             value.bytes.len().saturating_mul(2)
         } else {
@@ -2367,6 +2375,7 @@ unsafe fn deliver_bound(
         Err(TextError::Malformed) => return RowOutcome::Error(RowIssue::InvalidCharacter),
         Err(TextError::Unsupported) => return RowOutcome::Error(RowIssue::Unsupported),
     };
+    unsafe { clear_stale_null_indicator(indicator, octet_length) };
 
     let buf_elements = char_buf_elements(binding.target_type, stride);
     let buf_elements = if matches!(value, ColumnValues::Bytes(_)) {
@@ -2397,6 +2406,8 @@ fn typed_conv_outcome(converted: Result<ConvOk, ConvError>) -> RowOutcome {
         Ok(ConvOk::Exact) => RowOutcome::Success,
         Ok(ConvOk::Truncated) => RowOutcome::Info(RowIssue::FractionalTruncated),
         Err(ConvError::OutOfRange) => RowOutcome::Error(RowIssue::OutOfRange),
+        Err(ConvError::InvalidDatetimeFormat) => RowOutcome::Error(RowIssue::InvalidDatetimeFormat),
+        Err(ConvError::DatetimeFieldOverflow) => RowOutcome::Error(RowIssue::DatetimeFieldOverflow),
         Err(ConvError::Restricted) => RowOutcome::Error(RowIssue::Restricted),
         Err(ConvError::InvalidCharacterValue) => RowOutcome::Error(RowIssue::InvalidCharacter),
         Err(ConvError::Internal) => RowOutcome::Error(RowIssue::Internal),
@@ -4371,6 +4382,287 @@ mod tests {
     }
 
     #[test]
+    fn typed_bound_success_clears_split_indicator_after_conversion() {
+        for (ticks, expected) in [
+            (0, RowOutcome::Success),
+            (1, RowOutcome::Info(RowIssue::FractionalTruncated)),
+        ] {
+            let mut output = SqlDateStruct::default();
+            let mut indicator = SQL_NULL_DATA;
+            let mut length = -99;
+            let column = ColumnBinding {
+                column_number: 1,
+                target_type: SQL_C_TYPE_DATE,
+                target_value_ptr: (&mut output as *mut SqlDateStruct).cast(),
+                buffer_length: 0,
+                strlen_or_ind_ptr: &mut indicator,
+                octet_length_ptr: &mut length,
+            };
+            let value = ColumnValues::DateTime2(SqlDateTime2 {
+                days: 0,
+                time: SqlTime {
+                    time_nanoseconds: ticks,
+                    scale: 7,
+                },
+            });
+            assert_eq!(unsafe { deliver_bound(&column, 0, 0, &value) }, expected);
+            assert_eq!(indicator, 0);
+            assert_eq!(
+                length,
+                SqlLen::try_from(size_of::<SqlDateStruct>()).unwrap()
+            );
+            assert_eq!((output.year, output.month, output.day), (1, 1, 1));
+        }
+    }
+
+    #[test]
+    fn temporal_text_success_clears_split_indicator() {
+        let value = ColumnValues::DateTime2(SqlDateTime2 {
+            days: 0,
+            time: SqlTime {
+                time_nanoseconds: 0,
+                scale: 0,
+            },
+        });
+        for target in [SQL_C_CHAR, SQL_C_WCHAR] {
+            for capacity in [2, 64] {
+                let mut output = [0xA5_u8; 64];
+                let mut indicator = SQL_NULL_DATA;
+                let mut length = -99;
+                let column = ColumnBinding {
+                    column_number: 1,
+                    target_type: target,
+                    target_value_ptr: output.as_mut_ptr().cast(),
+                    buffer_length: capacity,
+                    strlen_or_ind_ptr: &mut indicator,
+                    octet_length_ptr: &mut length,
+                };
+                let expected = if capacity == 2 {
+                    RowOutcome::Info(RowIssue::StringTruncated)
+                } else {
+                    RowOutcome::Success
+                };
+                assert_eq!(unsafe { deliver_bound(&column, 0, 0, &value) }, expected);
+                assert_eq!(indicator, 0);
+                assert_eq!(length, if target == SQL_C_WCHAR { 38 } else { 19 });
+            }
+        }
+    }
+
+    #[test]
+    fn temporal_overflow_backstop_maps_to_row_error() {
+        assert_eq!(
+            typed_conv_outcome(Err(ConvError::DatetimeFieldOverflow)),
+            RowOutcome::Error(RowIssue::DatetimeFieldOverflow)
+        );
+    }
+
+    #[test]
+    fn bound_temporal_errors_preserve_row_buffers_and_indicators() {
+        let midnight = SqlTime {
+            time_nanoseconds: 0,
+            scale: 7,
+        };
+        let invalid_scale = SqlTime {
+            time_nanoseconds: 0,
+            scale: 8,
+        };
+        let values = [
+            ColumnValues::Time(invalid_scale.clone()),
+            ColumnValues::DateTime2(SqlDateTime2 {
+                days: 0,
+                time: invalid_scale.clone(),
+            }),
+            ColumnValues::DateTimeOffset(SqlDateTimeOffset {
+                datetime2: SqlDateTime2 {
+                    days: 0,
+                    time: invalid_scale,
+                },
+                offset: 0,
+            }),
+            ColumnValues::Time(SqlTime {
+                time_nanoseconds: 864_000_000_000,
+                scale: 7,
+            }),
+            ColumnValues::DateTime2(SqlDateTime2 {
+                days: 3_652_059,
+                time: midnight.clone(),
+            }),
+            ColumnValues::DateTime2(SqlDateTime2 {
+                days: 0,
+                time: SqlTime {
+                    time_nanoseconds: u64::MAX,
+                    scale: 7,
+                },
+            }),
+            ColumnValues::DateTimeOffset(SqlDateTimeOffset {
+                datetime2: SqlDateTime2 {
+                    days: 0,
+                    time: midnight,
+                },
+                offset: -1,
+            }),
+            ColumnValues::DateTime(SqlDateTime {
+                days: i32::MAX,
+                time: 0,
+            }),
+            ColumnValues::DateTime(SqlDateTime {
+                days: -53_691,
+                time: 0,
+            }),
+            ColumnValues::SmallDateTime(SqlSmallDateTime {
+                days: 0,
+                time: 1_440,
+            }),
+        ];
+        let values: Vec<_> = values
+            .into_iter()
+            .map(|value| {
+                (
+                    value,
+                    RowIssue::InvalidDatetimeFormat,
+                    ERR_INVALID_DATETIME_FORMAT,
+                )
+            })
+            .chain([u64::try_from(i64::MAX).unwrap(), u64::MAX].map(|ticks| {
+                (
+                    ColumnValues::DateTimeOffset(SqlDateTimeOffset {
+                        datetime2: SqlDateTime2 {
+                            days: 0,
+                            time: SqlTime {
+                                time_nanoseconds: ticks,
+                                scale: 7,
+                            },
+                        },
+                        offset: 1,
+                    }),
+                    RowIssue::InvalidDatetimeFormat,
+                    ERR_INVALID_DATETIME_FORMAT,
+                )
+            }))
+            .collect();
+
+        for target in [
+            SQL_C_TYPE_DATE,
+            SQL_C_TYPE_TIME,
+            SQL_C_TYPE_TIMESTAMP,
+            SQL_C_SS_TIME2,
+            SQL_C_SS_TIMESTAMPOFFSET,
+            SQL_C_CHAR,
+            SQL_C_WCHAR,
+        ] {
+            for (value, issue, expected_diagnostic) in &values {
+                let (issue, expected_diagnostic) =
+                    if matches!(value, ColumnValues::Time(_)) && target == SQL_C_TYPE_DATE {
+                        (RowIssue::Restricted, ERR_RESTRICTED_DATA_TYPE)
+                    } else if matches!(target, SQL_C_CHAR | SQL_C_WCHAR) {
+                        (
+                            RowIssue::Unsupported,
+                            DiagMsg {
+                                state: SQLSTATE_HYC00,
+                                text: "Column type conversion not yet implemented",
+                            },
+                        )
+                    } else {
+                        (*issue, *expected_diagnostic)
+                    };
+                let mut output = [0xA5_u8; 80];
+                let mut indicators = [0xA5_u8; 40];
+                let mut octet_lengths = [0xB6_u8; 40];
+                let column = ColumnBinding {
+                    column_number: 2,
+                    target_type: target,
+                    target_value_ptr: output.as_mut_ptr().cast(),
+                    buffer_length: 32,
+                    strlen_or_ind_ptr: indicators.as_mut_ptr().cast(),
+                    octet_length_ptr: octet_lengths.as_mut_ptr().cast(),
+                };
+                let bindings = [column];
+                let mut writer = BoundRowWriter::new(&bindings, 1, 1);
+                match value {
+                    ColumnValues::Time(value) => writer.write_time(1, value.clone()),
+                    ColumnValues::DateTime2(value) => writer.write_datetime2(1, value.clone()),
+                    ColumnValues::DateTimeOffset(value) => {
+                        writer.write_datetimeoffset(1, value.clone())
+                    }
+                    ColumnValues::DateTime(value) => writer.write_datetime(1, value.clone()),
+                    ColumnValues::SmallDateTime(value) => {
+                        writer.write_smalldatetime(1, value.clone())
+                    }
+                    _ => unreachable!(),
+                }
+                assert_eq!(
+                    writer.outcome,
+                    RowOutcome::Error(issue),
+                    "{value:?}, target={target}"
+                );
+                assert_eq!(writer.outcome.status(), SQL_ROW_ERROR);
+                assert_eq!(writer.last_column_read, 2);
+                assert_eq!(
+                    unsafe { deliver_bound(&bindings[0], 1, 1, value) },
+                    writer.outcome
+                );
+                assert_eq!(output, [0xA5; 80]);
+                assert_eq!(indicators, [0xA5; 40]);
+                assert_eq!(octet_lengths, [0xB6; 40]);
+
+                let h = TestHandles::with_env_dbc_stmt();
+                let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+                let mut state = stmt.inner.lock().unwrap();
+                writer.outcome.issue().unwrap().post(&mut state);
+                let diagnostic = state.diag_records.last().unwrap();
+                assert_eq!(diagnostic.sql_state, expected_diagnostic.state);
+                assert!(diagnostic.message.contains(expected_diagnostic.text));
+            }
+        }
+    }
+
+    #[test]
+    fn bound_native_time_to_timestampoffset() {
+        use crate::conversion::datetime::current_local_date;
+
+        for use_writer in [false, true] {
+            let value = SqlTime {
+                time_nanoseconds: 452_961_234_567,
+                scale: 7,
+            };
+            let mut output = SqlSsTimestampoffsetStruct {
+                timezone_hour: 12,
+                timezone_minute: 34,
+                ..Default::default()
+            };
+            let mut indicator = SQL_NULL_DATA;
+            let mut octet_length = -99;
+            let length = SqlLen::try_from(std::mem::size_of_val(&output)).unwrap();
+            let bindings = [ColumnBinding {
+                column_number: 1,
+                target_type: SQL_C_SS_TIMESTAMPOFFSET,
+                target_value_ptr: (&mut output as *mut SqlSsTimestampoffsetStruct).cast(),
+                buffer_length: length,
+                strlen_or_ind_ptr: &mut indicator,
+                octet_length_ptr: &mut octet_length,
+            }];
+            let before = current_local_date().unwrap();
+            let outcome = if use_writer {
+                let mut writer = BoundRowWriter::new(&bindings, 0, 0);
+                writer.write_time(0, value);
+                assert_eq!(writer.last_column_read, 1);
+                writer.outcome
+            } else {
+                unsafe { deliver_bound(&bindings[0], 0, 0, &ColumnValues::Time(value)) }
+            };
+            let after = current_local_date().unwrap();
+            assert_eq!(outcome, RowOutcome::Success, "use_writer={use_writer}");
+            assert!([before, after].contains(&(output.year, output.month, output.day)));
+            assert_eq!((output.hour, output.minute, output.second), (12, 34, 56));
+            assert_eq!(output.fraction, 123_456_700);
+            assert_eq!((output.timezone_hour, output.timezone_minute), (0, 0));
+            assert_eq!(indicator, 0);
+            assert_eq!(octet_length, length);
+        }
+    }
+
+    #[test]
     fn bound_row_writer_matches_established_conversion_path() {
         macro_rules! check {
             ($target:expr, $target_rust_type:ty, $column_value:expr, $write:expr) => {{
@@ -4477,7 +4769,7 @@ mod tests {
             |w: &mut BoundRowWriter<'_>| w.write_date(0, date.clone())
         );
         let time = SqlTime {
-            time_nanoseconds: 45_296_123_456_700,
+            time_nanoseconds: 452_961_234_567,
             scale: 7,
         };
         check!(
@@ -5304,6 +5596,8 @@ mod tests {
             (RowIssue::StringTruncated, *b"01004"),
             (RowIssue::FractionalTruncated, *b"01S07"),
             (RowIssue::OutOfRange, *b"22003"),
+            (RowIssue::InvalidDatetimeFormat, *b"22007"),
+            (RowIssue::DatetimeFieldOverflow, *b"22008"),
             (RowIssue::Restricted, *b"07006"),
             (RowIssue::InvalidCharacter, *b"22018"),
             (RowIssue::IndicatorRequired, *b"22002"),

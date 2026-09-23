@@ -1145,7 +1145,7 @@ mod tests {
         SQL_ATTR_PARAMS_PROCESSED_PTR, SQL_BIND_BY_COLUMN, SQL_C_CHAR, SQL_C_SLONG,
         SQL_DATA_AT_EXEC, SQL_INTEGER, SQL_NULL_HANDLE, SQL_PARAM_ERROR, SQL_PARAM_IGNORE,
         SQL_PARAM_INPUT, SQL_PARAM_OUTPUT, SQL_PARAM_PROCEED, SQL_PARAM_UNUSED, SQL_SUCCESS,
-        SQL_VARCHAR, SqlLen, SqlULen,
+        SQL_VARCHAR, SqlLen, SqlPointer, SqlULen,
     };
     use crate::api::util::rewrite_param_markers;
     use crate::handles::DescHandle;
@@ -1161,6 +1161,1022 @@ mod tests {
             marker_count,
             original_sql: String::new(),
         });
+    }
+
+    fn bind_cached_test_value(raw: SqlHandle, value: &mut i32) {
+        assert_eq!(
+            unsafe {
+                sql_bind_parameter(
+                    raw,
+                    1,
+                    SQL_PARAM_INPUT,
+                    SQL_C_SLONG,
+                    SQL_INTEGER,
+                    10,
+                    0,
+                    std::ptr::from_mut(value).cast(),
+                    4,
+                    std::ptr::null_mut(),
+                )
+            },
+            SQL_SUCCESS
+        );
+    }
+
+    fn stage_and_restore_plan(raw: SqlHandle) -> (Option<StatementId>, Option<StatementId>) {
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(raw) };
+        let staging = stage_execution(stmt).unwrap_or_else(|rc| {
+            panic!(
+                "staging returned {rc}: {:?}",
+                stmt.inner.lock().unwrap().diag_records
+            )
+        });
+        let (prepared, orphaned) = match staging {
+            ExecutionStaging::Ready(execution) => (execution.prepared, execution.orphaned),
+            ExecutionStaging::NeedData(execution) => (execution.prepared, execution.orphaned),
+            ExecutionStaging::Batch(execution) => (execution.prepared, execution.orphaned),
+        };
+        let id = prepared.stmt.id();
+        let mut state = stmt.inner.lock().unwrap();
+        state.prepared = Some(prepared);
+        state.pending_unprepare = orphaned;
+        state.clear_state(STMT_STATE_EXEC_STARTED);
+        (id, orphaned)
+    }
+
+    fn materialize_test_plan(raw: SqlHandle, id: StatementId) {
+        let sql: Vec<u16> = "SELECT ?".encode_utf16().collect();
+        assert_eq!(
+            unsafe { crate::api::SQLPrepareW(raw, sql.as_ptr(), sql.len().try_into().unwrap()) },
+            SQL_SUCCESS
+        );
+        assert_eq!(stage_and_restore_plan(raw), (None, None));
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(raw) };
+        let mut state = stmt.inner.lock().unwrap();
+        let plan = state.prepared.as_mut().unwrap();
+        plan.stmt = PreparedStatement::materialized_for_test(plan.stmt.sql(), id);
+    }
+
+    fn set_cached_desc_field(raw: SqlHandle, field: SqlUSmallInt, value: isize) {
+        assert_eq!(
+            unsafe {
+                crate::api::SQLSetDescFieldW(
+                    raw,
+                    1,
+                    field.try_into().unwrap(),
+                    value as SqlPointer,
+                    0,
+                )
+            },
+            SQL_SUCCESS
+        );
+    }
+
+    #[test]
+    fn changed_ipd_invalidates_materialized_plan() {
+        use crate::api::odbc_types::{SQL_DESC_CONCISE_TYPE, SQL_SMALLINT};
+
+        let h = TestHandles::with_env_dbc_stmt();
+        h.mark_dbc_connected();
+        let mut value = 7;
+        bind_cached_test_value(h.stmt, &mut value);
+        let id = StatementId::from_raw_for_test(42);
+        materialize_test_plan(h.stmt, id);
+
+        set_cached_desc_field(h.ipd(), SQL_DESC_CONCISE_TYPE, isize::from(SQL_SMALLINT));
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        assert_eq!(
+            stmt.inner
+                .lock()
+                .unwrap()
+                .prepared
+                .as_ref()
+                .unwrap()
+                .stmt
+                .id(),
+            None,
+            "IPD mutation must invalidate before SQLExecute"
+        );
+        assert_eq!(stage_and_restore_plan(h.stmt), (None, Some(id)));
+    }
+
+    #[test]
+    fn pointer_only_rebind_reuses_materialized_plan() {
+        let h = TestHandles::with_env_dbc_stmt();
+        h.mark_dbc_connected();
+        let mut value = 7;
+        bind_cached_test_value(h.stmt, &mut value);
+        let id = StatementId::from_raw_for_test(42);
+        materialize_test_plan(h.stmt, id);
+        let mut replacement = 9;
+        bind_cached_test_value(h.stmt, &mut replacement);
+        assert_eq!(stage_and_restore_plan(h.stmt), (Some(id), None));
+    }
+
+    #[test]
+    fn apd_length_edit_reuses_materialized_plan() {
+        use crate::api::odbc_types::SQL_DESC_OCTET_LENGTH;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        h.mark_dbc_connected();
+        let mut value = 7;
+        bind_cached_test_value(h.stmt, &mut value);
+        let id = StatementId::from_raw_for_test(42);
+        materialize_test_plan(h.stmt, id);
+        set_cached_desc_field(h.apd(), SQL_DESC_OCTET_LENGTH, 8);
+        assert_eq!(stage_and_restore_plan(h.stmt), (Some(id), None));
+    }
+
+    fn bind_null_cached_value(
+        raw: SqlHandle,
+        sql_type: crate::api::odbc_types::SqlSmallInt,
+        size: SqlULen,
+        scale: crate::api::odbc_types::SqlSmallInt,
+        direction: crate::api::odbc_types::SqlSmallInt,
+        indicator: &mut SqlLen,
+    ) {
+        assert_eq!(
+            unsafe {
+                sql_bind_parameter(
+                    raw,
+                    1,
+                    direction,
+                    crate::api::odbc_types::SQL_C_DEFAULT,
+                    sql_type,
+                    size,
+                    scale,
+                    std::ptr::null_mut(),
+                    0,
+                    indicator,
+                )
+            },
+            SQL_SUCCESS
+        );
+    }
+
+    #[test]
+    fn rebind_invalidates_only_changed_sql_definitions() {
+        use crate::api::odbc_types::{
+            SQL_BINARY, SQL_CHAR, SQL_DECIMAL, SQL_GUID, SQL_NULL_DATA, SQL_NUMERIC,
+            SQL_PARAM_INPUT_OUTPUT, SQL_SMALLINT, SQL_SS_TIME2, SQL_SS_TIMESTAMPOFFSET,
+            SQL_TYPE_TIME, SQL_TYPE_TIMESTAMP, SQL_VARBINARY, SQL_WCHAR, SQL_WVARCHAR,
+        };
+
+        let cases = [
+            (
+                SQL_INTEGER,
+                SQL_SMALLINT,
+                10,
+                5,
+                0,
+                0,
+                SQL_PARAM_INPUT,
+                true,
+            ),
+            (
+                SQL_INTEGER,
+                SQL_INTEGER,
+                10,
+                8,
+                0,
+                1,
+                SQL_PARAM_INPUT,
+                false,
+            ),
+            (
+                SQL_INTEGER,
+                SQL_INTEGER,
+                10,
+                10,
+                0,
+                0,
+                SQL_PARAM_INPUT_OUTPUT,
+                true,
+            ),
+            (SQL_CHAR, SQL_CHAR, 8, 16, 0, 0, SQL_PARAM_INPUT, true),
+            (SQL_VARCHAR, SQL_VARCHAR, 8, 16, 0, 0, SQL_PARAM_INPUT, true),
+            (SQL_WCHAR, SQL_WCHAR, 8, 16, 0, 0, SQL_PARAM_INPUT, true),
+            (
+                SQL_WVARCHAR,
+                SQL_WVARCHAR,
+                8,
+                16,
+                0,
+                0,
+                SQL_PARAM_INPUT,
+                true,
+            ),
+            (SQL_BINARY, SQL_BINARY, 8, 16, 0, 0, SQL_PARAM_INPUT, true),
+            (
+                SQL_VARBINARY,
+                SQL_VARBINARY,
+                8,
+                16,
+                0,
+                0,
+                SQL_PARAM_INPUT,
+                true,
+            ),
+            (
+                SQL_DECIMAL,
+                SQL_DECIMAL,
+                12,
+                13,
+                2,
+                2,
+                SQL_PARAM_INPUT,
+                true,
+            ),
+            (
+                SQL_NUMERIC,
+                SQL_NUMERIC,
+                12,
+                12,
+                2,
+                3,
+                SQL_PARAM_INPUT,
+                true,
+            ),
+            (
+                SQL_DECIMAL,
+                SQL_DECIMAL,
+                12,
+                12,
+                2,
+                2,
+                SQL_PARAM_INPUT,
+                false,
+            ),
+            (SQL_GUID, SQL_GUID, 0, 20, 0, 3, SQL_PARAM_INPUT, false),
+            (
+                SQL_TYPE_TIME,
+                SQL_TYPE_TIME,
+                16,
+                16,
+                2,
+                3,
+                SQL_PARAM_INPUT,
+                false,
+            ),
+            (
+                SQL_SS_TIME2,
+                SQL_SS_TIME2,
+                16,
+                16,
+                2,
+                3,
+                SQL_PARAM_INPUT,
+                false,
+            ),
+            (
+                SQL_TYPE_TIMESTAMP,
+                SQL_TYPE_TIMESTAMP,
+                27,
+                27,
+                2,
+                3,
+                SQL_PARAM_INPUT,
+                false,
+            ),
+            (
+                SQL_SS_TIMESTAMPOFFSET,
+                SQL_SS_TIMESTAMPOFFSET,
+                34,
+                34,
+                2,
+                3,
+                SQL_PARAM_INPUT,
+                false,
+            ),
+        ];
+        for (old_type, new_type, old_size, new_size, old_scale, new_scale, direction, changed) in
+            cases
+        {
+            let h = TestHandles::with_env_dbc_stmt();
+            h.mark_dbc_connected();
+            let mut indicator = SQL_NULL_DATA;
+            bind_null_cached_value(
+                h.stmt,
+                old_type,
+                old_size,
+                old_scale,
+                SQL_PARAM_INPUT,
+                &mut indicator,
+            );
+            let id = StatementId::from_raw_for_test(42);
+            materialize_test_plan(h.stmt, id);
+            bind_null_cached_value(
+                h.stmt,
+                new_type,
+                new_size,
+                new_scale,
+                direction,
+                &mut indicator,
+            );
+            assert_eq!(
+                stage_and_restore_plan(h.stmt),
+                ((!changed).then_some(id), changed.then_some(id)),
+                "SQL type {old_type} -> {new_type}, size {old_size} -> {new_size}, scale {old_scale} -> {new_scale}, direction {direction}"
+            );
+        }
+    }
+
+    #[test]
+    fn direct_ipd_fields_compare_sql_shape_and_ignore_noop_writes() {
+        use crate::api::odbc_types::{
+            SQL_DESC_LENGTH, SQL_DESC_OCTET_LENGTH, SQL_DESC_PARAMETER_TYPE, SQL_DESC_PRECISION,
+            SQL_DESC_SCALE, SQL_NULL_DATA, SQL_NUMERIC, SQL_PARAM_INPUT_OUTPUT, SQL_TYPE_TIMESTAMP,
+            SQL_VARBINARY, SQL_WVARCHAR,
+        };
+
+        for (sql_type, field, value, changed) in [
+            (SQL_VARCHAR, SQL_DESC_LENGTH, 16, true),
+            (SQL_WVARCHAR, SQL_DESC_LENGTH, 16, true),
+            (SQL_VARBINARY, SQL_DESC_LENGTH, 16, true),
+            (SQL_NUMERIC, SQL_DESC_PRECISION, 16, true),
+            (SQL_NUMERIC, SQL_DESC_SCALE, 3, true),
+            (SQL_NUMERIC, SQL_DESC_PRECISION, 12, false),
+            (SQL_NUMERIC, SQL_DESC_LENGTH, 16, false),
+            (SQL_VARCHAR, SQL_DESC_LENGTH, 12, false),
+            (SQL_VARCHAR, SQL_DESC_PRECISION, 16, false),
+            (SQL_VARCHAR, SQL_DESC_SCALE, 3, false),
+            (SQL_INTEGER, SQL_DESC_PRECISION, 16, false),
+            (SQL_INTEGER, SQL_DESC_OCTET_LENGTH, 8, false),
+            (
+                SQL_INTEGER,
+                SQL_DESC_PARAMETER_TYPE,
+                isize::from(SQL_PARAM_INPUT),
+                false,
+            ),
+            (
+                SQL_INTEGER,
+                SQL_DESC_PARAMETER_TYPE,
+                isize::from(SQL_PARAM_INPUT_OUTPUT),
+                true,
+            ),
+            (SQL_TYPE_TIMESTAMP, SQL_DESC_SCALE, 3, false),
+            (SQL_TYPE_TIMESTAMP, SQL_DESC_PRECISION, 3, false),
+        ] {
+            let h = TestHandles::with_env_dbc_stmt();
+            h.mark_dbc_connected();
+            let mut indicator = SQL_NULL_DATA;
+            bind_null_cached_value(h.stmt, sql_type, 12, 2, SQL_PARAM_INPUT, &mut indicator);
+            let id = StatementId::from_raw_for_test(42);
+            materialize_test_plan(h.stmt, id);
+            set_cached_desc_field(h.ipd(), field, value);
+            assert_eq!(
+                stage_and_restore_plan(h.stmt),
+                ((!changed).then_some(id), changed.then_some(id)),
+                "SQL type {sql_type}, field {field}, value {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn edits_beyond_used_markers_reuse_but_ipd_truncation_invalidates() {
+        use crate::api::odbc_types::{SQL_DESC_CONCISE_TYPE, SQL_DESC_COUNT, SQL_SMALLINT};
+
+        let h = TestHandles::with_env_dbc_stmt();
+        h.mark_dbc_connected();
+        let mut value = 7;
+        bind_cached_test_value(h.stmt, &mut value);
+        let id = StatementId::from_raw_for_test(42);
+        materialize_test_plan(h.stmt, id);
+        assert_eq!(
+            unsafe {
+                sql_bind_parameter(
+                    h.stmt,
+                    2,
+                    SQL_PARAM_INPUT,
+                    SQL_C_SLONG,
+                    SQL_INTEGER,
+                    10,
+                    0,
+                    (&raw mut value).cast(),
+                    4,
+                    std::ptr::null_mut(),
+                )
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!(stage_and_restore_plan(h.stmt), (Some(id), None));
+        assert_eq!(
+            unsafe {
+                crate::api::SQLSetDescFieldW(
+                    h.ipd(),
+                    2,
+                    SQL_DESC_CONCISE_TYPE.try_into().unwrap(),
+                    isize::from(SQL_SMALLINT) as SqlPointer,
+                    0,
+                )
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!(stage_and_restore_plan(h.stmt), (Some(id), None));
+        assert_eq!(
+            unsafe {
+                crate::api::SQLSetDescRec(
+                    h.ipd(),
+                    2,
+                    SQL_INTEGER,
+                    0,
+                    4,
+                    10,
+                    0,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!(stage_and_restore_plan(h.stmt), (Some(id), None));
+        set_cached_desc_field(h.ipd(), SQL_DESC_COUNT, 1);
+        assert_eq!(stage_and_restore_plan(h.stmt), (Some(id), None));
+        set_cached_desc_field(h.ipd(), SQL_DESC_COUNT, 0);
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(state.prepared.as_ref().unwrap().stmt.id(), None);
+        assert_eq!(state.pending_unprepare, Some(id));
+    }
+
+    #[test]
+    fn unchanged_ipd_record_reuses_and_repeated_changes_keep_original_orphan() {
+        use crate::api::odbc_types::{SQL_DESC_CONCISE_TYPE, SQL_SMALLINT};
+
+        let h = TestHandles::with_env_dbc_stmt();
+        h.mark_dbc_connected();
+        let mut value = 7;
+        bind_cached_test_value(h.stmt, &mut value);
+        let id = StatementId::from_raw_for_test(42);
+        materialize_test_plan(h.stmt, id);
+        assert_eq!(
+            unsafe {
+                crate::api::SQLSetDescRec(
+                    h.ipd(),
+                    1,
+                    SQL_INTEGER,
+                    0,
+                    8,
+                    12,
+                    1,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!(stage_and_restore_plan(h.stmt), (Some(id), None));
+        set_cached_desc_field(h.ipd(), SQL_DESC_CONCISE_TYPE, isize::from(SQL_SMALLINT));
+        set_cached_desc_field(h.ipd(), SQL_DESC_CONCISE_TYPE, isize::from(SQL_INTEGER));
+        assert_eq!(stage_and_restore_plan(h.stmt), (None, Some(id)));
+    }
+
+    #[test]
+    fn direct_ipd_edit_invalidates_only_its_owning_statement() {
+        use crate::api::odbc_types::{SQL_DESC_CONCISE_TYPE, SQL_SMALLINT};
+
+        let mut h = TestHandles::with_env_dbc_stmt();
+        h.mark_dbc_connected();
+        let other = h.alloc_extra_stmt();
+        let mut value = 7;
+        let id = StatementId::from_raw_for_test(42);
+        let other_id = StatementId::from_raw_for_test(43);
+        for (raw, id) in [(h.stmt, id), (other, other_id)] {
+            bind_cached_test_value(raw, &mut value);
+            materialize_test_plan(raw, id);
+        }
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(other) };
+        set_cached_desc_field(stmt.ipd, SQL_DESC_CONCISE_TYPE, isize::from(SQL_SMALLINT));
+        assert_eq!(stage_and_restore_plan(h.stmt), (Some(id), None));
+        assert_eq!(stage_and_restore_plan(other), (None, Some(other_id)));
+    }
+
+    #[test]
+    fn sql_definition_edits_before_materialization_need_no_orphan() {
+        use crate::api::odbc_types::{SQL_DESC_CONCISE_TYPE, SQL_SMALLINT};
+
+        let h = TestHandles::with_env_dbc_stmt();
+        h.mark_dbc_connected();
+        set_prepared(h.stmt, "SELECT ?");
+        let mut value = 7;
+        bind_cached_test_value(h.stmt, &mut value);
+        set_cached_desc_field(h.ipd(), SQL_DESC_CONCISE_TYPE, isize::from(SQL_SMALLINT));
+        assert_eq!(stage_and_restore_plan(h.stmt), (None, None));
+    }
+
+    #[test]
+    fn shared_apd_edit_reuses_each_materialized_plan() {
+        use crate::api::odbc_types::{SQL_ATTR_APP_PARAM_DESC, SQL_DESC_OCTET_LENGTH};
+
+        let mut h = TestHandles::with_env_dbc_stmt();
+        let other = h.alloc_extra_stmt();
+        let shared = h.alloc_explicit_desc();
+        let mut value = 7;
+        for raw in [h.stmt, other] {
+            assert_eq!(
+                unsafe { crate::api::SQLSetStmtAttrW(raw, SQL_ATTR_APP_PARAM_DESC, shared, 0) },
+                SQL_SUCCESS
+            );
+            bind_cached_test_value(raw, &mut value);
+        }
+        let ids = [
+            StatementId::from_raw_for_test(42),
+            StatementId::from_raw_for_test(43),
+        ];
+        for (raw, id) in [h.stmt, other].into_iter().zip(ids) {
+            materialize_test_plan(raw, id);
+        }
+
+        set_cached_desc_field(shared, SQL_DESC_OCTET_LENGTH, 8);
+        for (raw, id) in [h.stmt, other].into_iter().zip(ids) {
+            assert_eq!(stage_and_restore_plan(raw), (Some(id), None));
+        }
+    }
+
+    #[test]
+    fn unchanged_metadata_and_new_values_reuse_materialized_plan() {
+        use crate::api::odbc_types::{SQL_ATTR_IMP_PARAM_DESC, SQL_DESC_DATA_PTR};
+        use crate::handles::stmt::ParameterDescription;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        h.mark_dbc_connected();
+        let mut value = 7;
+        bind_cached_test_value(h.stmt, &mut value);
+        let id = StatementId::from_raw_for_test(42);
+        materialize_test_plan(h.stmt, id);
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.parameter_metadata = vec![ParameterDescription {
+                data_type: SQL_INTEGER,
+                parameter_size: 10,
+                decimal_digits: 0,
+                nullable: crate::api::odbc_types::SQL_NULLABLE,
+            }];
+        }
+        assert_eq!(
+            unsafe { crate::api::SQLSetStmtAttrW(h.stmt, SQL_ATTR_IMP_PARAM_DESC, h.ipd(), 0) },
+            SQL_ERROR,
+            "the IPD association is read-only"
+        );
+        assert_eq!(
+            unsafe {
+                crate::api::SQLDescribeParam(
+                    h.stmt,
+                    1,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!(stage_and_restore_plan(h.stmt), (Some(id), None));
+        value = 9;
+        assert_eq!(stage_and_restore_plan(h.stmt), (Some(id), None));
+        assert_eq!(value, 9);
+
+        let mut replacement = 11;
+        assert_eq!(
+            unsafe {
+                crate::api::SQLSetDescFieldW(
+                    h.apd(),
+                    1,
+                    SQL_DESC_DATA_PTR.try_into().unwrap(),
+                    (&raw mut replacement).cast(),
+                    0,
+                )
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!(stage_and_restore_plan(h.stmt), (Some(id), None));
+    }
+
+    #[test]
+    fn only_sql_definition_fields_invalidate_materialized_plans() {
+        use crate::api::odbc_types::{
+            SQL_C_SSHORT, SQL_DESC_CONCISE_TYPE, SQL_DESC_DATA_PTR, SQL_DESC_LENGTH,
+            SQL_DESC_PARAMETER_TYPE, SQL_DESC_PRECISION, SQL_DESC_SCALE, SQL_PARAM_INPUT_OUTPUT,
+        };
+
+        for edit in 0..7 {
+            let h = TestHandles::with_env_dbc_stmt();
+            h.mark_dbc_connected();
+            let mut value = 7;
+            bind_cached_test_value(h.stmt, &mut value);
+            let id = StatementId::from_raw_for_test(42);
+            materialize_test_plan(h.stmt, id);
+            let (desc, field, scalar) = match edit {
+                0 => (h.apd(), SQL_DESC_CONCISE_TYPE, isize::from(SQL_C_SSHORT)),
+                1 => (h.apd(), SQL_DESC_PRECISION, 9),
+                2 => (h.apd(), SQL_DESC_SCALE, 1),
+                // Same numeric precision, but now explicitly chosen.
+                3 => (h.apd(), SQL_DESC_PRECISION, 0),
+                4 => (h.ipd(), SQL_DESC_LENGTH, 8),
+                5 => (h.ipd(), SQL_DESC_SCALE, 1),
+                _ => (
+                    h.ipd(),
+                    SQL_DESC_PARAMETER_TYPE,
+                    isize::from(SQL_PARAM_INPUT_OUTPUT),
+                ),
+            };
+            set_cached_desc_field(desc, field, scalar);
+            if edit == 0 {
+                // Retyping an APD unbinds its data pointer.
+                assert_eq!(
+                    unsafe {
+                        crate::api::SQLSetDescFieldW(
+                            h.apd(),
+                            1,
+                            SQL_DESC_DATA_PTR.try_into().unwrap(),
+                            (&raw mut value).cast(),
+                            0,
+                        )
+                    },
+                    SQL_SUCCESS
+                );
+            }
+            assert_eq!(
+                stage_and_restore_plan(h.stmt),
+                if edit == 6 {
+                    (None, Some(id))
+                } else {
+                    (Some(id), None)
+                },
+                "edit {edit}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_ipd_records_invalidate_materialized_plans_even_after_partial_failure() {
+        use crate::api::odbc_types::{SQL_DECIMAL, SQL_DESC_PRECISION};
+
+        for edit in 0..4 {
+            let h = TestHandles::with_env_dbc_stmt();
+            h.mark_dbc_connected();
+            let mut value = *b"7\0";
+            let mut length = 1;
+            assert_eq!(
+                unsafe {
+                    sql_bind_parameter(
+                        h.stmt,
+                        1,
+                        SQL_PARAM_INPUT,
+                        SQL_C_CHAR,
+                        if edit == 3 { SQL_DECIMAL } else { SQL_VARCHAR },
+                        8,
+                        0,
+                        value.as_mut_ptr().cast(),
+                        2,
+                        &mut length,
+                    )
+                },
+                SQL_SUCCESS
+            );
+            let id = StatementId::from_raw_for_test(42);
+            materialize_test_plan(h.stmt, id);
+            if edit == 3 {
+                set_cached_desc_field(h.ipd(), SQL_DESC_PRECISION, 9);
+            } else {
+                let rc = unsafe {
+                    crate::api::SQLSetDescRec(
+                        if edit == 0 { h.apd() } else { h.ipd() },
+                        1,
+                        if edit == 0 { SQL_C_CHAR } else { SQL_DECIMAL },
+                        0,
+                        2,
+                        2,
+                        if edit == 2 { 3 } else { 0 },
+                        value.as_mut_ptr().cast(),
+                        &mut length,
+                        &mut length,
+                    )
+                };
+                assert_eq!(rc, if edit == 2 { SQL_ERROR } else { SQL_SUCCESS });
+                if edit == 2 {
+                    let ipd = unsafe { handle_from_raw::<DescHandle>(h.ipd()) };
+                    let state = ipd.inner.lock().unwrap();
+                    let record = state.record(1).unwrap();
+                    assert_eq!(record.concise_type, SQL_DECIMAL);
+                    assert_eq!(record.precision, 2);
+                    assert_eq!(record.scale, 0, "failed scale write retains earlier edits");
+                }
+            }
+            assert_eq!(
+                stage_and_restore_plan(h.stmt),
+                if edit == 0 {
+                    (Some(id), None)
+                } else {
+                    (None, Some(id))
+                },
+                "edit {edit}"
+            );
+        }
+    }
+
+    #[test]
+    fn shared_apd_rebind_reuses_other_materialized_plan() {
+        use crate::api::odbc_types::{SQL_ATTR_APP_PARAM_DESC, SQL_C_SSHORT};
+
+        let mut h = TestHandles::with_env_dbc_stmt();
+        let other = h.alloc_extra_stmt();
+        let shared = h.alloc_explicit_desc();
+        let mut value = 7;
+        for raw in [h.stmt, other] {
+            assert_eq!(
+                unsafe { crate::api::SQLSetStmtAttrW(raw, SQL_ATTR_APP_PARAM_DESC, shared, 0) },
+                SQL_SUCCESS
+            );
+            bind_cached_test_value(raw, &mut value);
+        }
+        let id = StatementId::from_raw_for_test(42);
+        materialize_test_plan(h.stmt, id);
+        let mut replacement: i16 = 9;
+        assert_eq!(
+            unsafe {
+                sql_bind_parameter(
+                    other,
+                    1,
+                    SQL_PARAM_INPUT,
+                    SQL_C_SSHORT,
+                    SQL_INTEGER,
+                    10,
+                    0,
+                    (&raw mut replacement).cast(),
+                    2,
+                    std::ptr::null_mut(),
+                )
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!(stage_and_restore_plan(h.stmt), (Some(id), None));
+    }
+
+    #[test]
+    fn apd_reassociation_and_free_reuse_sql_definition() {
+        use crate::api::odbc_types::{SQL_ATTR_APP_PARAM_DESC, SQL_DESC_OCTET_LENGTH};
+
+        for changed in [false, true] {
+            for change in 0..3 {
+                let mut h = TestHandles::with_env_dbc_stmt();
+                h.mark_dbc_connected();
+                let mut value = 7;
+                bind_cached_test_value(h.stmt, &mut value);
+                let original = h.alloc_explicit_desc();
+                let replacement = h.alloc_explicit_desc();
+                for desc in [replacement, original] {
+                    assert_eq!(
+                        unsafe {
+                            crate::api::SQLSetStmtAttrW(h.stmt, SQL_ATTR_APP_PARAM_DESC, desc, 0)
+                        },
+                        SQL_SUCCESS
+                    );
+                    bind_cached_test_value(h.stmt, &mut value);
+                }
+                if changed {
+                    set_cached_desc_field(original, SQL_DESC_OCTET_LENGTH, 8);
+                }
+                let id = StatementId::from_raw_for_test(42);
+                materialize_test_plan(h.stmt, id);
+                let rc = match change {
+                    0 => unsafe {
+                        crate::api::SQLSetStmtAttrW(h.stmt, SQL_ATTR_APP_PARAM_DESC, replacement, 0)
+                    },
+                    1 => unsafe {
+                        crate::api::SQLSetStmtAttrW(
+                            h.stmt,
+                            SQL_ATTR_APP_PARAM_DESC,
+                            SQL_NULL_HANDLE,
+                            0,
+                        )
+                    },
+                    _ => h.free_explicit_desc(original),
+                };
+                assert_eq!(rc, SQL_SUCCESS);
+                assert_eq!(
+                    stage_and_restore_plan(h.stmt),
+                    (Some(id), None),
+                    "changed={changed}, change={change}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn reset_params_invalidates_materialized_plan_before_rebinding() {
+        use crate::api::odbc_types::SQL_RESET_PARAMS;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        h.mark_dbc_connected();
+        let mut value = 7;
+        bind_cached_test_value(h.stmt, &mut value);
+        let id = StatementId::from_raw_for_test(42);
+        materialize_test_plan(h.stmt, id);
+        assert_eq!(
+            unsafe { crate::api::SQLFreeStmt(h.stmt, SQL_RESET_PARAMS) },
+            SQL_SUCCESS
+        );
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        assert!(matches!(stage_execution(stmt), Err(SQL_ERROR)));
+        {
+            let state = stmt.inner.lock().unwrap();
+            assert_eq!(state.prepared.as_ref().unwrap().stmt.id(), None);
+            assert_eq!(state.pending_unprepare, Some(id));
+            assert_eq!(state.diag_records[0].sql_state, SQLSTATE_07002);
+        }
+        bind_cached_test_value(h.stmt, &mut value);
+        assert_eq!(stage_and_restore_plan(h.stmt), (None, Some(id)));
+    }
+
+    #[test]
+    fn describe_refinement_invalidates_only_changed_effective_metadata() {
+        use crate::handles::stmt::ParameterDescription;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        h.mark_dbc_connected();
+        let mut value = *b"7\0";
+        let mut length = 1;
+        assert_eq!(
+            unsafe {
+                crate::api::SQLSetDescRec(
+                    h.apd(),
+                    1,
+                    SQL_C_CHAR,
+                    0,
+                    2,
+                    0,
+                    0,
+                    value.as_mut_ptr().cast(),
+                    &mut length,
+                    &mut length,
+                )
+            },
+            SQL_SUCCESS
+        );
+        set_prepared(h.stmt, "SELECT ?");
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let describe = |size| {
+            stmt.inner.lock().unwrap().parameter_metadata = vec![ParameterDescription {
+                data_type: SQL_VARCHAR,
+                parameter_size: size,
+                decimal_digits: 0,
+                nullable: crate::api::odbc_types::SQL_NULLABLE,
+            }];
+            assert_eq!(
+                unsafe {
+                    crate::api::SQLDescribeParam(
+                        h.stmt,
+                        1,
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                    )
+                },
+                SQL_SUCCESS
+            );
+        };
+        describe(8);
+        let id = StatementId::from_raw_for_test(42);
+        materialize_test_plan(h.stmt, id);
+        describe(8);
+        assert_eq!(stage_and_restore_plan(h.stmt), (Some(id), None));
+        describe(16);
+        assert_eq!(stage_and_restore_plan(h.stmt), (None, Some(id)));
+    }
+
+    #[test]
+    fn array_staging_preserves_selective_plan_invalidation() {
+        use crate::api::odbc_types::{
+            SQL_ATTR_PARAMSET_SIZE, SQL_DESC_CONCISE_TYPE, SQL_DESC_LENGTH, SQL_SMALLINT,
+        };
+
+        let h = TestHandles::with_env_dbc_stmt();
+        h.mark_dbc_connected();
+        let mut values = [7_i32, 9];
+        bind_cached_test_value(h.stmt, &mut values[0]);
+        let id = StatementId::from_raw_for_test(42);
+        materialize_test_plan(h.stmt, id);
+        assert_eq!(
+            unsafe {
+                crate::api::SQLSetStmtAttrW(
+                    h.stmt,
+                    SQL_ATTR_PARAMSET_SIZE,
+                    2_usize as SqlPointer,
+                    0,
+                )
+            },
+            SQL_SUCCESS
+        );
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        assert_eq!(stage_and_restore_plan(h.stmt), (Some(id), None));
+        assert!(stmt.inner.lock().unwrap().bound_params.is_empty());
+        assert_eq!(stage_and_restore_plan(h.stmt), (Some(id), None));
+        set_cached_desc_field(h.ipd(), SQL_DESC_LENGTH, 8);
+        assert_eq!(stage_and_restore_plan(h.stmt), (Some(id), None));
+        set_cached_desc_field(h.ipd(), SQL_DESC_CONCISE_TYPE, isize::from(SQL_SMALLINT));
+        assert_eq!(stage_and_restore_plan(h.stmt), (None, Some(id)));
+    }
+
+    #[test]
+    fn dae_parking_preserves_selective_plan_invalidation() {
+        use crate::api::odbc_types::{
+            SQL_DECIMAL, SQL_DESC_LENGTH, SQL_DESC_PRECISION, SQL_NEED_DATA,
+        };
+        use mssql_tds::test_client_support::tds_client_from_tokens;
+
+        for (deferred, changed) in [(false, false), (true, false), (false, true), (true, true)] {
+            let h = TestHandles::with_env_dbc_stmt();
+            h.mark_dbc_connected();
+            let mut token = 7_i32;
+            let mut indicator = SQL_DATA_AT_EXEC;
+            assert_eq!(
+                unsafe {
+                    sql_bind_parameter(
+                        h.stmt,
+                        1,
+                        SQL_PARAM_INPUT,
+                        SQL_C_CHAR,
+                        if deferred { SQL_DECIMAL } else { SQL_VARCHAR },
+                        8,
+                        0,
+                        (&raw mut token).cast(),
+                        4,
+                        &mut indicator,
+                    )
+                },
+                SQL_SUCCESS
+            );
+            let id = StatementId::from_raw_for_test(42);
+            materialize_test_plan(h.stmt, id);
+            let field = if deferred {
+                SQL_DESC_PRECISION
+            } else {
+                SQL_DESC_LENGTH
+            };
+            if changed {
+                set_cached_desc_field(h.ipd(), field, 16);
+            }
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let ExecutionStaging::NeedData(execution) = stage_execution(stmt).unwrap() else {
+                panic!("expected DAE staging");
+            };
+            let expected = ((!changed).then_some(id), changed.then_some(id));
+            assert_eq!((execution.prepared.stmt.id(), execution.orphaned), expected);
+            assert_eq!(
+                execution
+                    .dae_params
+                    .iter()
+                    .any(|param| param.plan.is_buffered()),
+                deferred
+            );
+            let client = tds_client_from_tokens(Vec::new());
+            let rc = if deferred {
+                park_deferred_dae(
+                    stmt,
+                    client,
+                    Some(execution.prepared),
+                    execution.orphaned,
+                    execution.dae_params,
+                    execution.params,
+                    None,
+                    0,
+                    false,
+                    "test",
+                )
+            } else {
+                park_dae_client(
+                    stmt,
+                    client,
+                    Some(execution.prepared),
+                    execution.orphaned,
+                    execution.dae_params,
+                    false,
+                    "test",
+                )
+            };
+            assert_eq!(rc, SQL_NEED_DATA);
+            {
+                let mut state = stmt.inner.lock().unwrap();
+                assert!(state.prepared.is_none());
+                if deferred {
+                    let dae = state.dae.as_mut().unwrap();
+                    let plan = dae.take_prepared();
+                    let orphan = dae.take_orphaned();
+                    dae.restore_plan(plan, orphan);
+                }
+                // The same restoration used on DAE completion/cancellation.
+                drop(state.take_dae());
+                state.clear_state(STMT_STATE_EXEC_STARTED);
+            }
+            assert_eq!(stage_and_restore_plan(h.stmt), expected);
+            set_cached_desc_field(h.ipd(), field, 24);
+            assert_eq!(stage_and_restore_plan(h.stmt), (None, Some(id)));
+        }
     }
 
     /// Panics while holding the APD lock, leaving the mutex poisoned —

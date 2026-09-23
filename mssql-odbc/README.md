@@ -233,6 +233,32 @@ remaining byte length. This applies to buffered/captured reads, bound row
 arrays and output parameters. Other encodings, `SQL_C_CHAR`, and streaming MAX
 conversion retain their existing paths.
 
+## SQLGetData target switches
+
+An active PLP value can change between `SQL_C_CHAR`, `SQL_C_WCHAR`, and
+`SQL_C_BINARY`. Both text targets first copy any pending converted bytes
+**without re-encoding them**; binary bypasses those bytes and completes when
+the unread wire payload ends. This matches msodbcsql's `InternalGetColData`
+(`odbc/sqlcdata.h`) and completion gate (`odbc/sqlcdata.cpp`), measured on Linux
+with retail 18.6.2.1 (`SQL_DRIVER_VER` `18.06.0002`). See AB#48046.
+
+Text conversions finish a trailing partial source character before returning,
+even if earlier characters already produced output. Internal completion reads
+append to that output and preserve the call's length accounting.
+If malformed input starts a new character during completion, its bytes are
+returned to the raw stream for the next read. Completion does not keep consuming
+a chain of malformed characters after the output buffer fills.
+
+One reference-driver quirk remains: after a narrow read exhausts an
+`nvarchar(max)` value's wire bytes, a WCHAR probe with no payload room reports
+`01004` with indicator **0**, even when converted carry remains. The indicator
+counts only unread wire bytes on this path; callers must provide payload room
+to drain the carry, rather than keep issuing zero-capacity probes.
+
+A zero-length binary probe before text conversion consumes nothing. A consuming
+binary read followed by text conversion resumes at the next unread byte, even
+if that position splits a multibyte character, as in the reference driver.
+
 ## Parameter array results
 
 Prepared parameter arrays can return rows from `SELECT`, `INSERT ... OUTPUT`,
@@ -258,6 +284,53 @@ retaining elapsed-time accounting for finite and exhausted budgets.
 Inlining hints target parameter positioning, conversion, RPC encoding, and
 response/value dispatch. The large conversion and serialization functions use
 `#[inline]`, leaving the final inlining decision to the compiler.
+
+## Prepared parameter bindings
+
+Parameter mutations compare the old and new IPD SQL definition: direction and
+SQL type, character/binary SQL length, and numeric/decimal precision and scale.
+Relevant changes invalidate only the owning statement's materialized plan;
+unchanged definitions and records beyond its parameter markers do not.
+Temporal application scales affect conversion checks, not the fixed-scale SQL
+declaration; special types conservatively include their size/precision/scale.
+
+`SQLBindParameter`, IPD `SQLSetDescField`/`SQLSetDescRec`, parameter reset, and
+actual IPD refinement use this policy, including retained edits from a partially
+failed setter. Descriptor locks are released before statement invalidation.
+Direct IPD setters locate the owner through the DBC's statement list only when
+the SQL definition changes; there is no per-execute metadata key or comparison.
+The existing plan and deferred-unprepare state still travel through arrays and
+data-at-execution.
+
+This policy covers sequential mutations between completed calls. Concurrent
+IPD mutation during synchronous `SQLExecute` remains a known limitation: an
+edit after the binding snapshot can miss the staged plan, which execution
+later restores with its old declaration. Serialize parameter edits with
+execution to avoid this gap. Closing it requires coordinating the descriptor
+snapshot, plan staging, and restoration; a flag set only while the plan is
+absent would not cover the earlier snapshot-to-staging window. This is separate
+from the Need Data restriction below, not a claim that synchronous
+cross-thread calls are inherently invalid or that every Driver Manager
+serializes them.
+
+Definition changes must occur outside a data-at-execution Need Data sequence.
+`SQLBindParameter` and associated `SQLSetDescField`/`SQLSetDescRec` calls in that
+state are DM-enforced `HY010` errors. Keeping execution snapshots does not grant
+permission to rebind or reset parameters while the sequence is parked.
+
+Pointer-only rebinding and APD-only C type, buffer length, precision/scale, or
+descriptor reassociation changes reuse the plan when the IPD SQL definition is
+unchanged. Application buffers retain their existing validity requirements.
+Numeric prepared declarations always use IPD precision/scale, independently of
+the numeric value's wire precision/scale; the existing conversion fast path and
+wire representation are preserved.
+
+The selective policy follows msodbcsql's `ParamInfoSnapshot`/`SetIPDRec` path.
+Direct IPD-field invalidation is an intentional extension: retail 18.06.0001
+accepted an INTEGER-to-SMALLINT `SQLSetDescField` change but reused the old
+INTEGER declaration, whereas this driver applies the new definition at the
+next execute. This observation is not a measurement of retail 18.6.2.1.
+The decision is recorded in the [parity registry](docs/parity-deviations.md).
 
 ## Tracing
 

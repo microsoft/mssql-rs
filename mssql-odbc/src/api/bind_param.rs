@@ -308,7 +308,7 @@ fn sql_bind_parameter_safe(
         // SQLSetDescFieldW/SQLSetDescRec.
         octet_length_ptr: strlen_or_ind_ptr,
     };
-    let Ok(()) = bind_param_records(apd, stmt.ipd, parameter_number, bound) else {
+    let Ok(definition_changed) = bind_param_records(apd, stmt.ipd, parameter_number, bound) else {
         error!("SQLBindParameter: failed writing to apd/ipd (poisoned mutex or missing record)");
         if let Ok(mut stmt_state) = stmt.inner.lock() {
             post_sql_error(
@@ -321,19 +321,14 @@ fn sql_bind_parameter_safe(
         return SQL_ERROR;
     };
 
-    // A rebind invalidates any cached server-side prepared plan: the next
-    // SQLExecute must re-prepare so the plan matches the new bindings. This
-    // mirrors msodbcsql clearing DESC_CONSISTENT → FIsReprepareRequired. The
-    // prepared SQL text is kept; the server handle is orphaned for release
-    // (via sp_unprepare) at the next execute, forcing the sp_prepexec path.
-    // Runs only now that the write above actually succeeded — orphaning
-    // during the earlier STMT-locked validation would discard a still-valid
-    // plan for a binding that turned out to fail (e.g. a poisoned/concurrently
-    // freed APD) and never actually changed.
-    if let Ok(mut stmt_state) = stmt.inner.lock() {
-        stmt_state.orphan_prepared_handle();
-    } else {
-        error!("SQLBindParameter: stmt mutex poisoned; prepared plan not invalidated");
+    // Classic SetIPDRec uses ParamInfoSnapshot::FHasChanged to mark RE_PREPARE
+    // and DropPrepHandle(FALSE); DESC_CONSISTENT only controls validation.
+    if definition_changed
+        && stmt
+            .invalidate_parameter_definition(usize::from(parameter_number))
+            .is_err()
+    {
+        return SQL_ERROR;
     }
 
     debug!(parameter_number, "SQLBindParameter: parameter bound");
@@ -342,7 +337,8 @@ fn sql_bind_parameter_safe(
 
 /// Writes `bound` into `apd`'s and `ipd`'s records at `parameter_number`,
 /// growing either record list first if that ordinal doesn't exist yet on it.
-/// `Err(())` on a poisoned mutex (either descriptor) or a missing record
+/// Returns whether the SQL definition changed. `Err(())` on a poisoned mutex
+/// (either descriptor) or a missing record
 /// after growth — the caller decides how to report that against the
 /// statement, since bind errors are always posted to the STMT handle, never
 /// a descriptor. `parameter_number` must already fit `SqlSmallInt`
@@ -361,7 +357,7 @@ fn bind_param_records(
     ipd: SqlHandle,
     parameter_number: SqlUSmallInt,
     bound: BoundParam,
-) -> Result<(), ()> {
+) -> Result<bool, ()> {
     // `apd` can be an explicit descriptor `effective_apd` resolved under the
     // STMT lock, already dropped by the time this runs — re-check liveness
     // right before dereferencing to narrow (not fully close) the race against
@@ -381,6 +377,9 @@ fn bind_param_records(
     };
 
     let record_number = SqlSmallInt::try_from(parameter_number).map_err(|_| ())?;
+    let previous = ipd_state
+        .record(record_number)
+        .map(crate::handles::desc::DescRecord::parameter_definition);
 
     let target_count = apd_state.records.len().max(usize::from(parameter_number));
     apd_state.set_record_count(target_count, apd_desc.kind);
@@ -390,12 +389,12 @@ fn bind_param_records(
     let apd_record = apd_state.record_mut(record_number).ok_or(())?;
     let ipd_record = ipd_state.record_mut(record_number).ok_or(())?;
     bound.write_to_records(apd_record, ipd_record);
-    Ok(())
+    Ok(previous != Some(ipd_record.parameter_definition()))
 }
 
 /// Implements the `SQL_RESET_PARAMS` option of `SQLFreeStmt` — releases all
-/// parameter bindings on the statement. The prepared handle and cursor state
-/// are left untouched.
+/// parameter bindings on the statement and invalidates its parameter declaration.
+/// The cursor state is left untouched.
 ///
 /// # Safety
 /// `statement_handle` must be a valid `StmtHandle` or null.
@@ -484,6 +483,9 @@ fn sql_free_stmt_reset_params_safe(stmt: &StmtHandle) -> SqlReturn {
     match ipd.inner.lock() {
         Ok(mut ipd_state) => ipd_state.set_record_count(0, ipd.kind),
         Err(_) => error!("SQLFreeStmt(SQL_RESET_PARAMS): ipd mutex poisoned; IPD left stale"),
+    }
+    if stmt.invalidate_parameter_definition(1).is_err() {
+        return SQL_ERROR;
     }
 
     debug!("SQLFreeStmt(SQL_RESET_PARAMS): parameter bindings released");
@@ -1069,7 +1071,7 @@ mod tests {
                     "SELECT @P1",
                     mssql_tds::connection::tds_client::StatementId::from_raw_for_test(42),
                 ),
-                marker_count: 0,
+                marker_count: 1,
                 original_sql: String::new(),
             });
         }

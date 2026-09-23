@@ -403,3 +403,60 @@ msodbcsql build is measured.
    application, so this is visible only to a caller that loads the driver
    directly. Tracked in AB#48256.
    Signed off by Theekshna Kotian on 2026-09-18.
+15. The TDS 8 user-agent `Driver Name` field is `MS-ODBCRS`; msodbcsql sends
+   `MS-ODBC` (`tds/TdsSend.cpp`, around line 299). The classic Login7
+   `ClientInterfaceName` field is not part of this deviation: this driver sends
+   `ODBC` there to match msodbcsql's `pwszClientInterface` assignment in
+   `odbc/sqlcconn.cpp` and the corresponding `L"ODBC"` assertion in
+   `tds/TdsSend.cpp`, preserving `sys.dm_exec_sessions.client_interface_name`
+   parity.
+
+   The user-agent name intentionally distinguishes this Rust ODBC driver from
+   the classic C++ driver in server-side telemetry while staying within the same
+   Microsoft ODBC driver family. This mirrors the sibling binding precedent where
+   Python sets a distinct user-agent driver name (`MS-PYTHON`) instead of using
+   the generic TDS default. Tracked in #634.
+
+   Evidence level: source reading only. No observed `SQL_DRIVER_VER` or tested
+   msodbcsql build is recorded here because the claim is about a Login7 feature
+   extension field that this driver's current parity suite can capture through
+   `mssql-mock-tds`, but the comparison leg has no equivalent server-side user
+   agent capture for msodbcsql. A parity measurement that connects msodbcsql
+   18.6.2.1 (the build pinned in CI) to a server or proxy that records the TDS 8
+   user-agent feature would close this evidence gap.
+16. **Direct IPD field edits invalidate a cached plan when its SQL definition
+    changes.** msodbcsql's `ParamInfoSnapshot::FHasChanged` in
+    `Sql/Ntdbms/sqlncli/odbc/sqlcprot.h` is used by `SetIPDRec` in `sqlcdesc.cpp`,
+    not by the direct `SQLSetDescFieldW` route. On retail 18.06.0001 through the
+    Windows Driver Manager, an IPD INTEGER-to-SMALLINT field edit retained
+    `sp_execute` and an INTEGER result; `SQLSetDescRec` reparsed as SMALLINT.
+    This driver handles both routes consistently so the next execute reflects
+    the changed SQL definition. Approved by David Engel on 2026-09-17 in the
+    scope of [PR #564](https://github.com/microsoft/mssql-rs/pull/564).
+    Retail 18.6.2.1 was not measured for this distinction; do not infer it from
+    the driver's compatibility version string or add a parity-test skip.
+17. **Special SQL types retain a conservative plan-invalidation comparison.**
+    `DescRecord::parameter_definition` compares length, precision, and scale
+    for types outside its named character/binary, numeric, and fixed/temporal
+    arms, in addition to direction and SQL type. This differs from the
+    reference-source comparison, independently of the setter-route difference
+    in entry 16: at msodbcsql source `aa19092c`,
+    `Sql/Ntdbms/sqlncli/odbc/sqlcdesc.cpp` maps the public SQL identifiers before
+    `SetIPDRec` invokes `ParamInfoSnapshot::FHasChanged` in `sqlcprot.h`.
+    `IsSQLBinary` includes mapped UDT and `IsSQLWCHAR` includes mapped XML, so
+    that comparison considers only their length; mapped vector is outside all
+    shape-comparison groups, so it considers only direction and SQL type.
+    This driver deliberately retains the broader fallback because special
+    types can encode SQL shape in these fields, such as vector dimensions and
+    element type. It may re-prepare for an irrelevant field change rather
+    than risk retaining an obsolete declaration. This policy is part of the
+    selective design in [PR #564](https://github.com/microsoft/mssql-rs/pull/564),
+    not a change to which parameter types or conversions are supported.
+    `special_parameter_definitions_keep_size_precision_and_scale` pins the
+    vector and UDT projections; UDT parameter binding remains unsupported.
+    **Evidence limit:** this is a source comparison and a Rust unit test,
+    not a measured retail reuse/re-prepare claim. The earlier 18.06.0001 RPC
+    measurements did not cover these special-type edits. A supported
+    Driver Manager bind/record-edit sequence with RPC capture and a recorded
+    `SQL_DRIVER_VER` is still needed to establish shipping-build behavior;
+    do not infer retail parity or add a comparison-test skip from this entry.

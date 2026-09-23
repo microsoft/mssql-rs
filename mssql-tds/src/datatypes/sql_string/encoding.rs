@@ -114,6 +114,18 @@ enum DecoderKind {
 }
 
 impl ResolvedDecoder {
+    /// Whether an ASCII-compatible narrow decoder holds an incomplete character.
+    /// Query before finalization; OEM encodings never buffer source bytes.
+    pub fn has_pending_narrow_character(&self) -> bool {
+        match &self.inner {
+            DecoderKind::EncodingRs(decoder) => {
+                debug_assert!(decoder.encoding().is_ascii_compatible());
+                decoder.latin1_byte_compatible_up_to(&[]).is_none()
+            }
+            DecoderKind::Oem(_) => false,
+        }
+    }
+
     /// Upper bound on UTF-8 output, including any buffered partial input.
     /// Returns `None` if the bound overflows `usize`.
     pub fn max_utf8_buffer_length(&self, byte_length: usize) -> Option<usize> {
@@ -345,6 +357,8 @@ mod tests {
             let expected: Vec<char> = (0..128).map(char::from).chain(high_half.chars()).collect();
             let mut utf8_decoder = encoding.new_decoder_without_bom_handling();
             let mut utf16_decoder = encoding.new_decoder_without_bom_handling();
+            assert!(!utf8_decoder.has_pending_narrow_character());
+            assert!(!utf16_decoder.has_pending_narrow_character());
             for (byte, character) in (0..=255).zip(expected) {
                 for capacity in 0..character.len_utf8() {
                     let mut output = [0; 3];
@@ -372,6 +386,8 @@ mod tests {
                     (CoderResult::InputEmpty, 1, 1, false),
                 );
                 assert_eq!(output[0], character as u16);
+                assert!(!utf8_decoder.has_pending_narrow_character());
+                assert!(!utf16_decoder.has_pending_narrow_character());
             }
             assert_eq!(
                 utf8_decoder.decode_to_utf8(&[], &mut [], true),

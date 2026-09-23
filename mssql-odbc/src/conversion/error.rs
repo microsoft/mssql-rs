@@ -25,6 +25,11 @@ pub(crate) enum ConvOk {
 pub(crate) enum ConvError {
     /// The value does not fit the requested C type (SQLSTATE `22003`).
     OutOfRange,
+    /// Temporal conversion arithmetic overflowed (SQLSTATE `22008`).
+    /// Defensive backstop: decoded-field guards make this unreachable today.
+    DatetimeFieldOverflow,
+    /// Decoded temporal fields are outside their valid ranges (SQLSTATE `22007`).
+    InvalidDatetimeFormat,
     /// This source/target pairing is not handled by this converter; the caller
     /// should try another path. Never surfaced to the application directly.
     NotHandledHere,
