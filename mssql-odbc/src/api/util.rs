@@ -7,6 +7,54 @@ use crate::api::odbc_types::{
 };
 use crate::api::sqlstate::{WARN_STRING_TRUNCATION, post_diag};
 use crate::error::HasDiagnostics;
+use mssql_tds::datatypes::sql_string::EncodingType;
+use mssql_tds::encoding_rs::{CoderResult, WINDOWS_1252};
+
+const CP1252_SCRATCH_UNITS: usize = 256;
+
+/// Resolve only when delivery can proceed: unknown LCIDs use the shared
+/// resolver's CP1252 fallback and warning, without a second generic decode.
+pub(crate) fn is_cp1252(encoding: &EncodingType) -> bool {
+    encoding.encoding() == Some(WINDOWS_1252)
+}
+
+/// CP1252 has exactly one UTF-16 unit per byte, so only the delivered prefix
+/// needs decoding. Scratch space is bounded independently of the value size.
+///
+/// # Safety
+/// Same destination and non-overlap contract as [`copy_with_nul`], in UTF-16 units.
+pub(crate) unsafe fn copy_cp1252_with_nul(
+    dst: *mut SqlWChar,
+    buf_len: usize,
+    bytes: &[u8],
+) -> bool {
+    if dst.is_null() {
+        return false;
+    }
+    if buf_len == 0 {
+        return !bytes.is_empty();
+    }
+    let copied = bytes.len().min(buf_len - 1);
+    let mut scratch = [0_u16; CP1252_SCRATCH_UNITS];
+    let mut decoder = WINDOWS_1252.new_decoder_without_bom_handling();
+    for (index, chunk) in bytes[..copied].chunks(scratch.len()).enumerate() {
+        let (result, read, written, errors) = decoder.decode_to_utf16(chunk, &mut scratch, false);
+        debug_assert_eq!(result, CoderResult::InputEmpty);
+        debug_assert_eq!((read, written, errors), (chunk.len(), chunk.len(), false));
+        // SAFETY: CP1252 writes one unit per byte. Byte copying permits an
+        // unaligned application pointer; the prefix leaves room for the NUL.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                scratch.as_ptr().cast::<u8>(),
+                dst.add(index * scratch.len()).cast::<u8>(),
+                written * size_of::<SqlWChar>(),
+            );
+        }
+    }
+    unsafe { dst.add(copied).write_unaligned(0) };
+    copied < bytes.len()
+}
+
 /// Bit 0 of the COLMETADATA flags word marks a column nullable (`fNullable`).
 /// Shared by any RPC-backed result set (`SQLGetTypeInfo`, catalog functions)
 /// that clears it on the ODBC-mandated NOT NULL columns after execution.
@@ -320,11 +368,38 @@ pub(crate) fn rewrite_param_markers(sql: &str) -> (String, usize) {
 #[cfg(test)]
 mod tests {
     use super::{
-        copy_utf16_with_nul, copy_utf16le_with_nul, copy_with_nul, is_high_surrogate,
-        is_low_surrogate, is_surrogate_pair, read_utf16, read_utf16_attr, read_utf16_long,
-        rewrite_param_markers, write_if_some,
+        copy_cp1252_with_nul, copy_utf16_with_nul, copy_utf16le_with_nul, copy_with_nul, is_cp1252,
+        is_high_surrogate, is_low_surrogate, is_surrogate_pair, read_utf16, read_utf16_attr,
+        read_utf16_long, rewrite_param_markers, write_if_some,
     };
     use crate::api::odbc_types::{SQL_NTS, SqlInteger, SqlSmallInt, SqlWChar};
+
+    #[test]
+    fn cp1252_eligibility_uses_the_resolved_encoding() {
+        use mssql_tds::datatypes::sql_string::EncodingType;
+        use mssql_tds::token::tokens::SqlCollation;
+        for (lcid, expected) in [
+            (0x0409, true),
+            (0x0407, true),
+            (0x0419, false),
+            (0x0411, false),
+        ] {
+            let encoding = EncodingType::LcidBased(SqlCollation {
+                info: lcid,
+                lcid_language_id: lcid as i32,
+                col_flags: 0,
+                sort_id: 0,
+            });
+            assert_eq!(is_cp1252(&encoding), expected);
+        }
+        for encoding in [
+            EncodingType::Utf8,
+            EncodingType::Utf16,
+            EncodingType::DelayedSet,
+        ] {
+            assert!(!is_cp1252(&encoding));
+        }
+    }
 
     #[test]
     fn surrogate_checks_match_utf16_decoding() {
@@ -340,6 +415,35 @@ mod tests {
             assert_eq!(is_low_surrogate(unit), low, "unit={unit:#06x}");
             assert_eq!(is_surrogate_pair(0xD800, unit), low, "unit={unit:#06x}");
         }
+    }
+
+    #[test]
+    fn cp1252_copy_all_bytes_across_scratch_boundaries() {
+        let bytes: Vec<u8> = (0..=255).cycle().take(1025).collect();
+        assert!(bytes.len() > super::CP1252_SCRATCH_UNITS * 2);
+        let expected: Vec<u16> = mssql_tds::encoding_rs::WINDOWS_1252
+            .decode_without_bom_handling(&bytes)
+            .0
+            .encode_utf16()
+            .collect();
+        assert_eq!(expected.len(), bytes.len());
+        assert_eq!(expected[0x80], 0x20AC);
+        assert_eq!(&expected[0x91..=0x94], &[0x2018, 0x2019, 0x201C, 0x201D]);
+        for unit in [0x81_u16, 0x8D, 0x8F, 0x90, 0x9D] {
+            assert_eq!(expected[usize::from(unit)], unit);
+        }
+        for capacity in [0, 1, 2, 255, 256, 257, 258, 1025, 1026, 1027] {
+            let mut actual = vec![0xAAAA; capacity + 1];
+            let truncated = unsafe { copy_cp1252_with_nul(actual.as_mut_ptr(), capacity, &bytes) };
+            let copied = bytes.len().min(capacity.saturating_sub(1));
+            assert_eq!(truncated, copied < bytes.len());
+            assert_eq!(&actual[..copied], &expected[..copied]);
+            if capacity > 0 {
+                assert_eq!(actual[copied], 0);
+            }
+            assert_eq!(actual[capacity], 0xAAAA);
+        }
+        assert!(!unsafe { copy_cp1252_with_nul(std::ptr::null_mut(), 0, &bytes) });
     }
 
     #[test]
@@ -378,6 +482,47 @@ mod tests {
         use crate::api::odbc_types::SqlLen;
         use crate::test_support::AlignedBuffer;
         use std::mem::MaybeUninit;
+
+        #[test]
+        fn cp1252_copy_preserves_prefixes_and_unaligned_capacity() {
+            for bytes in [
+                &b""[..],
+                b"A",
+                b"\x80\x81\x91\x9D\0",
+                b"\xEF\xBB\xBFA",
+                b"\xFF\xFEA\0",
+                b"\xFE\xFFA\0",
+            ] {
+                let units: Vec<u16> = mssql_tds::encoding_rs::WINDOWS_1252
+                    .decode_without_bom_handling(bytes)
+                    .0
+                    .encode_utf16()
+                    .collect();
+                assert_eq!(units.len(), bytes.len());
+                for capacity in 0..=units.len() + 2 {
+                    for _ in 0..2 {
+                        let mut storage = AlignedBuffer([0xA5_u8; 19]);
+                        let dst = storage.0.as_mut_ptr().wrapping_add(1).cast::<u16>();
+                        assert!(!dst.is_aligned());
+                        let truncated = unsafe { copy_cp1252_with_nul(dst, capacity, bytes) };
+                        assert_eq!(truncated, units.len() > capacity.saturating_sub(1));
+                        let mut expected = [0xA5; 19];
+                        if capacity > 0 {
+                            for (i, unit) in units
+                                .iter()
+                                .copied()
+                                .take(capacity - 1)
+                                .chain(std::iter::once(0))
+                                .enumerate()
+                            {
+                                expected[1 + i * 2..3 + i * 2].copy_from_slice(&unit.to_ne_bytes());
+                            }
+                        }
+                        assert_eq!(storage.0, expected);
+                    }
+                }
+            }
+        }
 
         #[test]
         fn wide_copies_respect_capacity_at_a_byte_offset() {

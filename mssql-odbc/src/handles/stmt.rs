@@ -20,9 +20,8 @@ use crate::conversion::param_convert::{DaeLengthLimit, DaePlan, DaeTranscode};
 use crate::error::{DiagRecord, HasDiagnostics};
 use crate::params::BoundParam;
 use mssql_tds::datatypes::column_values::ColumnValues;
+use mssql_tds::datatypes::sql_string::{ResolvedDecoder, ResolvedEncoding};
 use mssql_tds::datatypes::sqldatatypes::TdsDataType;
-use mssql_tds::encoding_rs;
-use mssql_tds::encoding_rs::Decoder;
 use mssql_tds::message::parameters::rpc_parameters::RpcParameter;
 use mssql_tds::query::metadata::{ColumnMetadata, PlpEncoding};
 use mssql_tds::query::result::ReturnValue;
@@ -41,31 +40,30 @@ pub(crate) struct ActivePlpStream {
     /// High surrogate whose low half lands in the next chunk. Held back so the
     /// pair is transcoded together instead of each half becoming U+FFFD.
     pub(crate) pending_high_surrogate: Option<u16>,
-    /// Transcoded UTF-8 that did not fit in the caller's `SQL_C_CHAR` buffer,
-    /// held until later calls deliver it. Output can exceed the buffer because a
-    /// UTF-16 surrogate pair becomes a 4-byte UTF-8 character, so a chunk is
-    /// transcoded whole and only the bytes that fit are copied out.
-    pub(crate) pending_utf8: Vec<u8>,
+    /// Converted output that did not fit. Usually UTF-8, but a continuation
+    /// also moves pending UTF-16 units here so either text target can drain
+    /// their bytes verbatim, including a byte split after a target switch.
+    pub(crate) pending_bytes: Vec<u8>,
     /// Narrow wire encoding resolved from the column's collation (or UTF-8 for
     /// `json`, which carries none), or `None` when the column is not narrow
     /// text. This is a property of the *column*, so a target type that arrives
     /// only on a continuation call still finds it — unlike a decoder built from
     /// the first call's target, which would leave a `SQL_C_BINARY`-first stream
     /// unable to convert later.
-    pub(crate) narrow_encoding: Option<&'static encoding_rs::Encoding>,
+    pub(crate) narrow_encoding: Option<ResolvedEncoding>,
     /// Incremental decoder over `narrow_encoding`, built by
     /// [`Self::ensure_narrow_decoder`] the first time a target actually needs to
     /// convert. Serves both directions: to UTF-16LE for `SQL_C_WCHAR`
     /// (`varchar(max)`/`json`) and to UTF-8 for `SQL_C_CHAR` under a non-UTF-8
-    /// collation (AB#47566). One decoder for both, so a target switch mid-stream
-    /// reuses a carry that is still meaningful.
+    /// collation (AB#47566). SQLGetData completes any partial source character
+    /// before returning, so a later target switch cannot strand decoder input.
     ///
     /// A decoder rather than a byte carry because the column's codepage can be
     /// multi-byte (`lcid_to_encoding` reaches SHIFT_JIS, GBK, BIG5, EUC-KR and
     /// UTF-8), so a chunk boundary can split one character across two reads.
     /// `encoding_rs::Decoder` already holds that partial sequence internally,
     /// which keeps the boundary rule in one place instead of one per codepage.
-    pub(crate) narrow_decoder: Option<Decoder>,
+    pub(crate) narrow_decoder: Option<ResolvedDecoder>,
     /// Code units already decoded on a previous call that did not fit the
     /// caller's buffer, delivered before any further wire bytes.
     ///
@@ -75,9 +73,8 @@ pub(crate) struct ActivePlpStream {
     /// having consumed nothing). Holding the surplus here lets a caller ask for
     /// one character at a time without stalling the stream.
     pub(crate) pending_units: Vec<u16>,
-    /// Wire bytes read ahead while the first async read for this value was
-    /// already in flight. Later SQLGetData calls consume these without entering
-    /// the runtime again.
+    /// Raw bytes awaiting delivery: async read-ahead or replayed character
+    /// lookahead. Later reads consume these without entering the runtime again.
     prefetched_wire: Vec<u8>,
     prefetched_offset: usize,
     prefetched_total_read_before: usize,
@@ -105,14 +102,14 @@ impl ActivePlpStream {
     pub(crate) fn new(
         column: usize,
         encoding: PlpEncoding,
-        narrow_encoding: Option<&'static encoding_rs::Encoding>,
+        narrow_encoding: Option<ResolvedEncoding>,
     ) -> Self {
         Self {
             column,
             encoding,
             pending_byte: None,
             pending_high_surrogate: None,
-            pending_utf8: Vec::new(),
+            pending_bytes: Vec::new(),
             narrow_encoding,
             narrow_decoder: None,
             pending_units: Vec::new(),
@@ -157,6 +154,24 @@ impl ActivePlpStream {
         self.prefetched_total_read_before = total_read_before;
         self.prefetched_known_total = known_total;
         self.prefetched_reached_end = reached_end;
+    }
+
+    /// Returns lookahead for a new source character to the raw stream.
+    pub(crate) fn restore_source_prefix(
+        &mut self,
+        bytes: &[u8],
+        total_read: usize,
+        known_total: Option<u64>,
+        reached_end: bool,
+    ) {
+        self.prefetched_wire.drain(..self.prefetched_offset);
+        if self.prefetched_wire.is_empty() {
+            self.prefetched_reached_end = reached_end;
+        }
+        self.prefetched_wire.splice(..0, bytes.iter().copied());
+        self.prefetched_offset = 0;
+        self.prefetched_total_read_before = total_read.saturating_sub(bytes.len());
+        self.prefetched_known_total = known_total;
     }
 
     /// Copies the next prefetched PLP bytes into `out`.
@@ -223,7 +238,7 @@ impl std::fmt::Debug for ActivePlpStream {
             .field("encoding", &self.encoding)
             .field("pending_byte", &self.pending_byte)
             .field("pending_high_surrogate", &self.pending_high_surrogate)
-            .field("pending_utf8", &self.pending_utf8.len())
+            .field("pending_bytes", &self.pending_bytes.len())
             .field("narrow_decoder", &self.narrow_decoder.is_some())
             .field("pending_units", &self.pending_units.len())
             .field(
@@ -1848,6 +1863,46 @@ mod tests {
         );
         assert_eq!(&second[..4], &[3, 4, 5, 6]);
         assert_eq!(stream.read_prefetched_wire(&mut second), None);
+    }
+
+    #[test]
+    fn restored_source_prefix_preserves_prefetched_tail_and_accounting() {
+        let mut stream = ActivePlpStream::new(1, PlpEncoding::Utf16Text, None);
+        stream.set_prefetched_wire(
+            vec![0x00, 0xd8, 0x3d, 0xd8, 0x00, 0xde],
+            6,
+            8,
+            Some(14),
+            true,
+        );
+        assert_eq!(
+            stream.read_prefetched_wire(&mut [0; 4]),
+            Some((4, false, Some(14), 12))
+        );
+        stream.restore_source_prefix(&[0x3d, 0xd8], 12, Some(14), false);
+        let mut output = [0; 4];
+        assert_eq!(
+            stream.read_prefetched_wire(&mut output),
+            Some((4, true, Some(14), 14))
+        );
+        assert_eq!(output, [0x3d, 0xd8, 0x00, 0xde]);
+    }
+
+    #[test]
+    fn restored_source_prefix_preserves_unknown_length_without_a_prefetched_tail() {
+        let mut stream = ActivePlpStream::new(
+            1,
+            PlpEncoding::Utf8Text,
+            Some(mssql_tds::encoding_rs::UTF_8.into()),
+        );
+        stream.restore_source_prefix(&[0xf0], 2, None, false);
+        let mut output = [0; 4];
+        assert_eq!(
+            stream.read_prefetched_wire(&mut output),
+            Some((1, false, None, 2))
+        );
+        assert_eq!(output[0], 0xf0);
+        assert_eq!(stream.read_prefetched_wire(&mut output), None);
     }
 
     #[test]

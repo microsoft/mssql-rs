@@ -22,6 +22,8 @@ pub enum SqlDataType {
     NVarChar,
     /// NVarChar(MAX) with caller-chosen PLP chunk boundaries.
     NVarCharMax,
+    /// VarChar(MAX) with caller-chosen PLP chunk boundaries and column collation.
+    VarCharMax,
 }
 
 impl SqlDataType {
@@ -33,6 +35,7 @@ impl SqlDataType {
             SqlDataType::Int => 0x26,      // IntN with length 4
             SqlDataType::BigInt => 0x26,   // IntN with length 8
             SqlDataType::NVarChar | SqlDataType::NVarCharMax => 0xE7, // NVarCharType
+            SqlDataType::VarCharMax => 0xA7,
         }
     }
 
@@ -44,6 +47,7 @@ impl SqlDataType {
             SqlDataType::Int => 4,
             SqlDataType::BigInt => 8,
             SqlDataType::NVarChar | SqlDataType::NVarCharMax => 255, // Handled specially
+            SqlDataType::VarCharMax => 255,
         }
     }
 }
@@ -58,6 +62,8 @@ pub enum ColumnValue {
     NVarChar(String),
     /// Nonempty wire chunks of raw UTF-16 units, including malformed sequences.
     NVarCharMax(Vec<Vec<u16>>),
+    /// Nonempty chunks of bytes encoded in the column's collation.
+    VarCharMax(Vec<Vec<u8>>),
     Null,
 }
 
@@ -71,6 +77,7 @@ impl ColumnValue {
             ColumnValue::BigInt(_) => SqlDataType::BigInt,
             ColumnValue::NVarChar(_) => SqlDataType::NVarChar,
             ColumnValue::NVarCharMax(_) => SqlDataType::NVarCharMax,
+            ColumnValue::VarCharMax(_) => SqlDataType::VarCharMax,
             ColumnValue::Null => SqlDataType::Int, // Default to Int for NULL
         }
     }
@@ -114,6 +121,16 @@ impl ColumnValue {
                 }
                 buf.put_u32_le(0);
             }
+            ColumnValue::VarCharMax(chunks) => {
+                let total: u64 = chunks.iter().map(|chunk| chunk.len() as u64).sum();
+                buf.put_u64_le(total);
+                for chunk in chunks {
+                    assert!(!chunk.is_empty(), "an empty PLP chunk ends the value");
+                    buf.put_u32_le(chunk.len().try_into().expect("PLP chunk length"));
+                    buf.put_slice(chunk);
+                }
+                buf.put_u32_le(0);
+            }
             ColumnValue::Null => {
                 buf.put_u8(0); // Length 0 means NULL for IntN
             }
@@ -126,6 +143,8 @@ impl ColumnValue {
 pub struct ColumnDefinition {
     pub name: String,
     pub data_type: SqlDataType,
+    /// TDS collation bytes for string columns; ignored for other types.
+    pub collation: [u8; 5],
 }
 
 impl ColumnDefinition {
@@ -134,6 +153,7 @@ impl ColumnDefinition {
         Self {
             name: name.into(),
             data_type,
+            collation: [0x09, 0x04, 0xD0, 0x00, 0x34], // SQL_Latin1_General_CP1_CI_AS
         }
     }
 }
