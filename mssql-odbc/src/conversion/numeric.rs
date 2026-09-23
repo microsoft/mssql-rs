@@ -204,6 +204,15 @@ pub(crate) fn narrow_f64_to_f32(v: f64) -> Result<f32, ConvError> {
 /// and flags any non-zero one past the scale (`sqlccnvt.cpp:7823`) however long
 /// the literal is.
 pub(crate) fn parse_numeric_text(text: &str) -> Result<NumericSource, ConvError> {
+    parse_numeric_text_with_underflow_check(text, !cfg!(windows))
+}
+
+/// Decimal parameters reject underflow even on Windows, where CharToDouble
+/// accepts zero: ConvertToNumeric uses stringtonumeric (sqlccnvt.cpp:7101).
+pub(crate) fn parse_numeric_text_with_underflow_check(
+    text: &str,
+    reject_underflow: bool,
+) -> Result<NumericSource, ConvError> {
     // An embedded NUL ends the number. `CharToBigint` loops
     // `while (len < srclen && charstr[len] != '\0')` (`sqlccnvt.cpp:7800`), so an
     // application that passes `strlen + 1` as the length still parses.
@@ -241,10 +250,12 @@ pub(crate) fn parse_numeric_text(text: &str) -> Result<NumericSource, ConvError>
     // the double holds).
     match trimmed.parse::<f64>() {
         // Rust silently rounds underflow to zero. CharToDouble maps the Linux
-        // VarR8FromStr range error to CVT_PREC (sqlccnvt.cpp:7949-7954).
+        // VarR8FromStr range error to CVT_PREC (sqlccnvt.cpp:7949-7954),
+        // whereas Windows OLE Automation succeeds with signed zero.
         // Inspect only the significand: the exponent in "0e-999" is not a value.
         Ok(f)
-            if f == 0.0
+            if reject_underflow
+                && f == 0.0
                 && trimmed
                     .bytes()
                     .take_while(|b| !matches!(b, b'e' | b'E'))
@@ -455,7 +466,7 @@ mod tests {
     }
 
     #[test]
-    fn an_underflowing_exponent_is_out_of_range() {
+    fn exponent_underflow_follows_the_platform_and_target() {
         for text in [
             "1e-999",
             "-1e-999",
@@ -466,11 +477,22 @@ mod tests {
             " 1e-999 ",
             "1e-999\0ignored",
         ] {
+            let expected = if cfg!(windows) {
+                Ok(NumericSource::Float(0.0))
+            } else {
+                Err(ConvError::OutOfRange)
+            };
+            assert_eq!(parse_numeric_text(text), expected, "{text:?}");
             assert_eq!(
-                parse_numeric_text(text),
+                parse_numeric_text_with_underflow_check(text, true),
                 Err(ConvError::OutOfRange),
                 "{text:?}"
             );
+            let rounded = parse_numeric_text_with_underflow_check(text, false)
+                .unwrap()
+                .as_f64();
+            assert_eq!(rounded, 0.0);
+            assert_eq!(rounded.is_sign_negative(), text.starts_with('-'));
         }
     }
 

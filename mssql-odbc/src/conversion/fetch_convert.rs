@@ -1691,18 +1691,33 @@ mod tests {
     }
 
     #[test]
-    fn out_of_range_numeric_text_leaves_outputs_unchanged() {
+    fn numeric_text_range_errors_leave_outputs_unchanged() {
         for text in ["1e400", "1e-999", "-1e-999"] {
             for target in [SQL_C_DOUBLE, SQL_C_FLOAT] {
                 let mut out = [0xa5u8; 8];
                 let mut ind: SqlLen = -999;
-                let err = unsafe {
+                let result = unsafe {
                     convert_float_c(&utf8_col(text), target, out.as_mut_ptr().cast(), &mut ind)
+                };
+                if cfg!(windows) && text != "1e400" {
+                    assert_eq!(result, Ok(ConvOk::Exact));
+                    let (value, width) = if target == SQL_C_DOUBLE {
+                        (f64::from_ne_bytes(out), 8)
+                    } else {
+                        assert_eq!(&out[4..], &[0xa5; 4]);
+                        (
+                            f64::from(f32::from_ne_bytes(out[..4].try_into().unwrap())),
+                            4,
+                        )
+                    };
+                    assert_eq!(value, 0.0);
+                    assert_eq!(value.is_sign_negative(), text.starts_with('-'));
+                    assert_eq!(ind, width);
+                } else {
+                    assert_eq!(result, Err(ConvError::OutOfRange), "{text}: {target}");
+                    assert_eq!(out, [0xa5; 8]);
+                    assert_eq!(ind, -999);
                 }
-                .unwrap_err();
-                assert_eq!(err, ConvError::OutOfRange, "{text}: {target}");
-                assert_eq!(out, [0xa5; 8]);
-                assert_eq!(ind, -999);
             }
         }
     }

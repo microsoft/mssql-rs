@@ -62,6 +62,7 @@ use crate::conversion::datetime::{
 use crate::conversion::error::{ConvError, ConvOk};
 use crate::conversion::numeric::{
     NumericSource, narrow_f64_to_f32, narrow_i128, parse_numeric_text,
+    parse_numeric_text_with_underflow_check,
 };
 use crate::conversion::param_buffer::{AppValue, Indicator, read_indicator, read_param_value};
 use crate::params::BoundParam;
@@ -1362,7 +1363,8 @@ fn variant_column_size(column_size: usize, sql_type: SqlSmallInt) -> usize {
 fn decimal_from_text(param: &BoundParam, text: AppText) -> Result<TypedValue, ParamBuildError> {
     let metadata = decimal_metadata(param.column_size, param.decimal_digits)?;
     let (precision, scale) = (metadata.precision.unwrap_or(0), metadata.scale.unwrap_or(0));
-    let parsed = parse_numeric_text(&text.into_string()).map_err(ParamBuildError::Value)?;
+    let parsed = parse_numeric_text_with_underflow_check(&text.into_string(), true)
+        .map_err(ParamBuildError::Value)?;
     let (mantissa, source_scale) = match parsed {
         NumericSource::Int(v) => (v, 0u32),
         NumericSource::Scaled { mantissa, scale } => (mantissa, scale),
@@ -5411,11 +5413,17 @@ mod tests {
             SqlType::Int(Some(-150))
         );
         for c_type in [SQL_C_CHAR, SQL_C_WCHAR] {
-            for text in ["1e400", "1e-999", "-1e-999"] {
-                assert_eq!(
-                    convert_char(c_type, SQL_BIGINT, 0, text),
+            assert_eq!(
+                convert_char(c_type, SQL_BIGINT, 0, "1e400"),
+                Err(ParamBuildError::Value(ConvError::OutOfRange))
+            );
+            for text in ["1e-999", "-1e-999"] {
+                let expected = if cfg!(windows) {
+                    Ok(SqlType::BigInt(Some(0)))
+                } else {
                     Err(ParamBuildError::Value(ConvError::OutOfRange))
-                );
+                };
+                assert_eq!(convert_char(c_type, SQL_BIGINT, 0, text), expected);
             }
             assert_eq!(
                 convert_char(c_type, SQL_BIGINT, 0, "0e-999").unwrap(),
