@@ -1627,7 +1627,7 @@ struct PlpReadProgress {
     completing_surrogate: bool,
     completing_narrow: bool,
     typed_bytes: Vec<u8>,
-    typed_rejected: bool,
+    typed_error: Option<DiagMsg>,
 }
 
 /// Reads and returns one SQLGetData chunk directly from the active PLP stream.
@@ -2335,19 +2335,28 @@ fn stream_active_plp_chunk_once<'a>(
                 state
             }
         };
-        if !progress.typed_rejected {
-            progress.typed_rejected = !typed_plp_chunk_fits(progress.wire_read, read, known_total);
-            if !progress.typed_rejected {
+        if progress.typed_error.is_none() {
+            // The PLP header includes bytes consumed by earlier character reads.
+            let consumed_before = total_read
+                .saturating_sub(read)
+                .saturating_sub(progress.wire_read);
+            let remaining_total = known_total
+                .and_then(|total| total.checked_sub(u64::try_from(consumed_before).ok()?));
+            if typed_plp_chunk_fits(progress.wire_read, read, remaining_total) {
                 progress.wire_read += read;
                 let Some(stream) = state.active_plp.as_mut() else {
+                    post_diag(&mut state, ERR_INTERNAL_CONVERSION);
                     return SQL_ERROR;
                 };
-                progress.typed_rejected = !append_typed_plp_text(
+                progress.typed_error = append_typed_plp_text(
                     stream,
                     &payload[..read],
                     reached_end,
                     &mut progress.typed_bytes,
-                );
+                )
+                .err();
+            } else {
+                progress.typed_error = Some(ERR_PLP_TYPED_LIMIT);
             }
         }
         if !reached_end {
@@ -2355,8 +2364,8 @@ fn stream_active_plp_chunk_once<'a>(
             return SQL_SUCCESS_WITH_INFO;
         }
         state.active_plp = None;
-        if progress.typed_rejected {
-            post_diag(&mut state, ERR_PLP_TYPED_LIMIT);
+        if let Some(diag) = progress.typed_error {
+            post_diag(&mut state, diag);
             return finish_get_data(stmt, statement_handle, state, col_index, SQL_ERROR);
         }
         state.last_captured = Some((
@@ -2868,17 +2877,21 @@ pub(crate) fn converted_narrow_indicator(
     })
 }
 
+fn reserve_typed_plp_bytes(bytes: &mut Vec<u8>, additional: usize) -> Result<(), DiagMsg> {
+    bytes
+        .try_reserve(additional)
+        .map_err(|_| ERR_MEMORY_ALLOCATION)
+}
+
 fn append_typed_plp_text(
     stream: &mut ActivePlpStream,
     payload: &[u8],
     reached_end: bool,
     bytes: &mut Vec<u8>,
-) -> bool {
+) -> Result<(), DiagMsg> {
     if !stream.pending_units.is_empty() {
         let text = String::from_utf16_lossy(&stream.pending_units);
-        if bytes.try_reserve(text.len()).is_err() {
-            return false;
-        }
+        reserve_typed_plp_bytes(bytes, text.len())?;
         bytes.extend_from_slice(text.as_bytes());
         stream.pending_units.clear();
     }
@@ -2895,9 +2908,10 @@ fn append_typed_plp_text(
         }
         PlpEncoding::SingleByteText | PlpEncoding::Utf8Text => {
             stream.ensure_narrow_decoder();
-            let Some(decoder) = stream.narrow_decoder.as_mut() else {
-                return false;
-            };
+            let decoder = stream
+                .narrow_decoder
+                .as_mut()
+                .ok_or(ERR_INTERNAL_CONVERSION)?;
             transcode_narrow_into_pending(
                 decoder,
                 &mut stream.pending_bytes,
@@ -2906,14 +2920,12 @@ fn append_typed_plp_text(
                 usize::MAX,
             );
         }
-        PlpEncoding::Binary => return false,
+        PlpEncoding::Binary => return Err(ERR_INTERNAL_CONVERSION),
     }
-    if bytes.try_reserve(stream.pending_bytes.len()).is_err() {
-        return false;
-    }
+    reserve_typed_plp_bytes(bytes, stream.pending_bytes.len())?;
     bytes.extend_from_slice(&stream.pending_bytes);
     stream.pending_bytes.clear();
-    true
+    Ok(())
 }
 
 /// Decodes one chunk of narrow PLP wire bytes to UTF-16 for `SQL_C_WCHAR`
@@ -7877,6 +7889,237 @@ mod tests {
     }
 
     #[test]
+    fn typed_plp_limit_applies_to_the_unread_suffix_after_character_reads() {
+        for unicode in [false, true] {
+            let unit_size = if unicode { 2 } else { 1 };
+            let prefix_units = 1024 * 1024 / unit_size + 1;
+            for suffix_bytes in [2 * unit_size, 1024 * 1024, 1024 * 1024 + unit_size] {
+                for known in [false, true] {
+                    let handles = TestHandles::with_env_dbc_stmt();
+                    let text = format!(
+                        "{}{}42",
+                        "x".repeat(prefix_units),
+                        "0".repeat(suffix_bytes / unit_size - 2)
+                    );
+                    let wire = if unicode {
+                        utf16le(&text)
+                    } else {
+                        text.into_bytes()
+                    };
+                    let known_total = known.then_some(u64::try_from(wire.len()).unwrap());
+                    prefetched_text_stream(
+                        &handles,
+                        if unicode {
+                            PlpEncoding::Utf16Text
+                        } else {
+                            PlpEncoding::SingleByteText
+                        },
+                        (!unicode).then_some(encoding_rs::WINDOWS_1252.into()),
+                        wire,
+                        known_total,
+                    );
+                    let mut prefix = vec![0xcc_u8; (prefix_units + 1) * unit_size];
+                    let mut indicator = -99;
+                    assert_eq!(
+                        unsafe {
+                            sql_get_data(
+                                handles.stmt,
+                                1,
+                                if unicode { SQL_C_WCHAR } else { SQL_C_CHAR },
+                                prefix.as_mut_ptr().cast(),
+                                SqlLen::try_from(prefix.len()).unwrap(),
+                                &mut indicator,
+                            )
+                        },
+                        SQL_SUCCESS_WITH_INFO
+                    );
+                    let mut value = -99_i32;
+                    indicator = -99;
+                    let rc = unsafe {
+                        sql_get_data(
+                            handles.stmt,
+                            1,
+                            SQL_C_SLONG,
+                            (&mut value as *mut i32).cast(),
+                            0,
+                            &mut indicator,
+                        )
+                    };
+                    if suffix_bytes <= 1024 * 1024 {
+                        assert_eq!(rc, SQL_SUCCESS);
+                        assert_eq!(value, 42);
+                        assert_eq!(indicator, 4);
+                    } else {
+                        assert_eq!(rc, SQL_ERROR);
+                        assert_eq!(value, -99);
+                        assert_eq!(indicator, -99);
+                        let stmt = unsafe { handle_from_raw::<StmtHandle>(handles.stmt) };
+                        assert_last_diag(
+                            &stmt.inner.lock().unwrap().diag_records,
+                            ERR_PLP_TYPED_LIMIT,
+                        );
+                    }
+                    assert_eq!(
+                        unsafe {
+                            sql_get_data(
+                                handles.stmt,
+                                1,
+                                SQL_C_SLONG,
+                                (&mut value as *mut i32).cast(),
+                                0,
+                                &mut indicator,
+                            )
+                        },
+                        SQL_NO_DATA
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn typed_plp_target_switch_preserves_pending_utf8_bytes() {
+        for (encoding, narrow, wire) in [
+            (PlpEncoding::Utf16Text, None, utf16le("2")),
+            (
+                PlpEncoding::SingleByteText,
+                Some(encoding_rs::WINDOWS_1252.into()),
+                b"2".to_vec(),
+            ),
+        ] {
+            let handles = TestHandles::with_env_dbc_stmt();
+            prefetched_text_stream(&handles, encoding, narrow, wire, None);
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(handles.stmt) };
+            stmt.inner
+                .lock()
+                .unwrap()
+                .active_plp
+                .as_mut()
+                .unwrap()
+                .pending_bytes
+                .extend_from_slice(b"4");
+            let mut value = -99_i32;
+            let mut indicator = -99;
+            assert_eq!(
+                unsafe {
+                    sql_get_data(
+                        handles.stmt,
+                        1,
+                        SQL_C_SLONG,
+                        (&mut value as *mut i32).cast(),
+                        0,
+                        &mut indicator,
+                    )
+                },
+                SQL_SUCCESS
+            );
+            assert_eq!(value, 42);
+            assert_eq!(indicator, 4);
+        }
+    }
+
+    #[test]
+    fn typed_plp_allocation_failure_preserves_hy001_while_draining() {
+        let mut bytes = Vec::new();
+        let allocation_error = reserve_typed_plp_bytes(&mut bytes, usize::MAX).unwrap_err();
+        assert_eq!(allocation_error.state, SQLSTATE_HY001);
+        let handles = TestHandles::with_env_dbc_stmt();
+        prefetched_text_stream(
+            &handles,
+            PlpEncoding::SingleByteText,
+            Some(encoding_rs::WINDOWS_1252.into()),
+            vec![b'0'; 513],
+            Some(513),
+        );
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(handles.stmt) };
+        let mut progress = PlpReadProgress {
+            typed_error: Some(allocation_error),
+            ..Default::default()
+        };
+        let mut value = -99_i32;
+        let mut indicator = -99;
+        for expected in [SQL_SUCCESS_WITH_INFO, SQL_SUCCESS_WITH_INFO, SQL_ERROR] {
+            assert_eq!(
+                stream_active_plp_chunk_once(
+                    stmt,
+                    handles.stmt,
+                    1,
+                    SQL_C_SLONG,
+                    (&mut value as *mut i32).cast(),
+                    0,
+                    &mut indicator,
+                    false,
+                    None,
+                    None,
+                    &mut progress,
+                ),
+                expected
+            );
+            assert_eq!(value, -99);
+            assert_eq!(indicator, -99);
+            assert!(progress.typed_bytes.is_empty());
+        }
+        let state = stmt.inner.lock().unwrap();
+        assert_last_diag(&state.diag_records, ERR_MEMORY_ALLOCATION);
+        assert!(state.active_plp.is_none());
+        drop(state);
+        assert_eq!(
+            unsafe {
+                sql_get_data(
+                    handles.stmt,
+                    1,
+                    SQL_C_SLONG,
+                    (&mut value as *mut i32).cast(),
+                    0,
+                    &mut indicator,
+                )
+            },
+            SQL_NO_DATA
+        );
+    }
+
+    #[test]
+    fn typed_plp_nonempty_guid_matches_the_existing_text_conversion_gap() {
+        for plp in [false, true] {
+            let handles = TestHandles::with_env_dbc_stmt();
+            let wire = utf16le("00112233-4455-6677-8899-aabbccddeeff");
+            if plp {
+                prefetched_text_stream(&handles, PlpEncoding::Utf16Text, None, wire, None);
+            } else {
+                stmt_with_buffered_string(&handles, SqlString::new(wire, EncodingType::Utf16));
+            }
+            let mut output = [0xcc_u8; 16];
+            let mut indicator = -99;
+            assert_eq!(
+                unsafe {
+                    sql_get_data(
+                        handles.stmt,
+                        1,
+                        SQL_C_GUID,
+                        output.as_mut_ptr().cast(),
+                        0,
+                        &mut indicator,
+                    )
+                },
+                SQL_ERROR
+            );
+            assert_eq!(output, [0xcc; 16]);
+            assert_eq!(indicator, -99);
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(handles.stmt) };
+            assert_eq!(
+                stmt.inner
+                    .lock()
+                    .unwrap()
+                    .diag_records
+                    .last()
+                    .unwrap()
+                    .sql_state,
+                SQLSTATE_07006
+            );
+        }
+    }
+
+    #[test]
     fn typed_plp_conversion_error_keeps_text_available_for_retry() {
         let handles = TestHandles::with_env_dbc_stmt();
         prefetched_text_stream(
@@ -7972,12 +8215,8 @@ mod tests {
             stream.pending_units.push(u16::from(b'1'));
             let mut bytes = Vec::new();
             for (index, byte) in wire.iter().enumerate() {
-                assert!(append_typed_plp_text(
-                    &mut stream,
-                    &[*byte],
-                    index + 1 == wire.len(),
-                    &mut bytes
-                ));
+                append_typed_plp_text(&mut stream, &[*byte], index + 1 == wire.len(), &mut bytes)
+                    .unwrap();
             }
             assert_eq!(String::from_utf8(bytes).unwrap(), format!("1{expected}"));
             assert!(stream.pending_units.is_empty());

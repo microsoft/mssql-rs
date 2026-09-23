@@ -141,7 +141,9 @@ msodbcsql build is measured.
    `PLP_TYPED_MATERIALIZE_LIMIT` (`api/fetch_scroll.rs`) at 1 MiB; past it the
    value is drained to keep the row synchronized and answered `HYC00`.
    This applies to bound fetches and `SQLGetData`; the shared limit counts
-   source wire bytes, including both bytes of each UTF-16 code unit. Decoding
+   unread source wire bytes, including both bytes of each UTF-16 code unit.
+   Earlier character reads do not count against a subsequent typed
+   `SQLGetData` call's cap. Decoding
    can expand that bounded input into UTF-8, but allocation never scales with
    an unbounded server value. Below the cap, this driver converts the complete
    remaining literal, not a truncated prefix.

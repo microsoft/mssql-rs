@@ -463,6 +463,40 @@ TEST_F(GetDataLiveTest, PlpTypedAfterCharacterProbeOrRead) {
     }
 }
 
+TEST_F(GetDataLiveTest, PlpTypedAfterConsumingOversizedCharacterPrefix) {
+    SQLCHAR version[32] = {};
+    ASSERT_SQL_OK(SQLGetInfoA(dbc_, SQL_DRIVER_VER, version, sizeof(version), nullptr),
+                  SQL_HANDLE_DBC, dbc_);
+    RecordProperty("driver_version", reinterpret_cast<const char*>(version));
+    for (bool unicode : {false, true}) {
+        const std::string type = unicode ? "nvarchar(max)" : "varchar(max)";
+        SCOPED_TRACE(type);
+        constexpr size_t prefixLength = 1048577;
+        ASSERT_SQL_OK(ExecDirect(
+            "SELECT REPLICATE(CAST('x' AS " + type + "), " +
+            std::to_string(prefixLength) + ") + '42', 99"),
+            SQL_HANDLE_STMT, stmt_);
+        ASSERT_EQ(SQL_SUCCESS, SQLFetch(stmt_));
+        const size_t unitSize = unicode ? sizeof(SQLWCHAR) : sizeof(SQLCHAR);
+        std::vector<SQLCHAR> prefix((prefixLength + 1) * unitSize, 0xCC);
+        SQLLEN indicator = -99;
+        ASSERT_EQ(SQL_SUCCESS_WITH_INFO,
+                  SQLGetData(stmt_, 1, unicode ? SQL_C_WCHAR : SQL_C_CHAR,
+                             prefix.data(), static_cast<SQLLEN>(prefix.size()), &indicator));
+        EXPECT_EQ("01004", StmtDiagState());
+        SQLINTEGER value = -99;
+        ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_SLONG, &value, 0, &indicator),
+                      SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ(42, value);
+        EXPECT_EQ(sizeof(value), indicator);
+        EXPECT_EQ(SQL_NO_DATA, SQLGetData(stmt_, 1, SQL_C_SLONG, &value, 0, &indicator));
+        ASSERT_EQ(SQL_SUCCESS, SQLGetData(stmt_, 2, SQL_C_SLONG, &value, 0, &indicator));
+        EXPECT_EQ(99, value);
+        EXPECT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
+        ASSERT_EQ(SQL_SUCCESS, SQLCloseCursor(stmt_));
+    }
+}
+
 TEST_F(GetDataLiveTest, PlpTypedOversizedValueIsRefusedAndDrained) {
     const char* target = std::getenv("ODBC_TEST_TARGET");
     const bool reference = target && std::string(target) == "msodbcsql";
