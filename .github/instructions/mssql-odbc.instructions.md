@@ -35,42 +35,18 @@ Crate-specific requirements for changes under `mssql-odbc/`.
 
 ### 1.1. Performance and FFI data movement
 
-The ODBC fetch, conversion, parameter, and packet paths are performance-critical.
-Avoid copies and allocations unless ownership, concurrency, safety, or measurement
-requires them.
+Follow the repository-wide
+[Performance and Data Movement guidance](../copilot-instructions.md#performance-and-data-movement).
+For ODBC hot paths:
 
-- Borrow binding metadata and descriptor snapshots through hot loops instead of
-  copying records per row or column. Use explicit lifetimes when they tie returned
-  references to the snapshot that owns them.
-- Keep wire payloads borrowed while they can be delivered directly. Materialize
-  `ColumnValues` only when conversion requires it.
-- Prefer slices and reusable buffers over copied sub-`Vec`s. Treat `clone()`,
-  `to_owned()`, `to_vec()`, `collect::<Vec<_>>()`, and temporary wrappers inside
-  row, column, token, or packet loops as review points.
-- Preserve borrowed data through helper boundaries rather than changing a helper
-  to require ownership for convenience.
-- Use direct fixed-width or encoded delivery when source and destination
-  representations match, while retaining the existing raw-pointer safety contract.
-- Do not use `unsafe` merely to remove a copy. Document the ownership and
-  synchronization invariant for every unsafe optimization, especially `Send` impls
-  involving application buffers.
-
-When changing a fetch, token, packet, or parameter hot path:
-
-- Begin with a measured workload or profile. Test call counts, allocations, and
-  packet behavior when those are the claimed source of improvement.
-- Keep exact fast-path guards and established fallback conversion/error behavior.
-  Do not trade ODBC semantics, truncation reporting, cancellation, or timeout
-  accounting for an optimization without an explicit decision and test coverage.
-- Treat row-continuation state, packet synchronization, lock ordering, and
-  `Send`/raw-pointer invariants as correctness constraints when changing async
-  boundaries or moving work into buffered synchronous paths.
-- Make metadata snapshots and lock acquisition conditional on the path that needs
-  them; do not pay for PLP, SQL-type, or timeout work on paths that can avoid it.
-- Use `#[inline]` selectively for small profiled dispatch/conversion boundaries;
-  prefer leaving larger inlining decisions to the compiler.
-- Document architecture-level buffering or decoding trade-offs in `mssql-odbc`
-  README.md so later optimizations do not lose the rationale.
+- Direct fixed-width or encoded delivery must preserve the
+  [raw-pointer and alignment requirements](#5-unsafe-code).
+- Document ownership and synchronization invariants for unsafe optimizations,
+  especially `Send` impls involving application buffers.
+- Preserve ODBC conversion and truncation reporting when bypassing
+  `ColumnValues` materialization.
+- Document architecture-level buffering or decoding trade-offs in
+  [mssql-odbc/README.md](../../mssql-odbc/README.md).
 
 ## 2. Parity reference: the classic C++ msodbcsql driver
 
