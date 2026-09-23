@@ -13,6 +13,7 @@
 #include "cp1252_test_data.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <string>
@@ -3618,7 +3619,7 @@ TEST_P(NumericExponentLiveTest, UnderflowFollowsPlatformAndNextRowRecovers) {
                           Case{"1e400", "22003", 0},
                           Case{"1e-", "22018", 0},
                           Case{"0e-999", "", 0},
-                          Case{"-0E-999", "", 0},
+                          Case{"-0E-999", "", -0.0},
                           Case{"0e2", "", 0},
                           Case{"2.2250738585072014e-308", "", 2.2250738585072014e-308}}) {
         SCOPED_TRACE(c.literal);
@@ -3646,6 +3647,9 @@ TEST_P(NumericExponentLiveTest, UnderflowFollowsPlatformAndNextRowRecovers) {
                 EXPECT_EQ(SQL_SUCCESS, rc);
                 EXPECT_EQ("", ODBCTestUtils::GetDiagState(SQL_HANDLE_STMT, stmt_));
                 EXPECT_DOUBLE_EQ(row == 0 ? c.value : 1, value);
+                if (row == 0 && c.value == 0.0) {
+                    EXPECT_EQ(std::signbit(c.value), std::signbit(value));
+                }
                 EXPECT_EQ(static_cast<SQLLEN>(sizeof(value)), indicator);
             }
         }

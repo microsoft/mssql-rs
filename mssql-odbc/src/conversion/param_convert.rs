@@ -61,8 +61,8 @@ use crate::conversion::datetime::{
 };
 use crate::conversion::error::{ConvError, ConvOk};
 use crate::conversion::numeric::{
-    NumericSource, narrow_f64_to_f32, narrow_i128, parse_numeric_text,
-    parse_numeric_text_with_underflow_check,
+    NumericSource, UnderflowPolicy, narrow_f64_to_f32, narrow_i128, parse_numeric_text,
+    parse_numeric_text_with_policy,
 };
 use crate::conversion::param_buffer::{AppValue, Indicator, read_indicator, read_param_value};
 use crate::params::BoundParam;
@@ -1363,7 +1363,7 @@ fn variant_column_size(column_size: usize, sql_type: SqlSmallInt) -> usize {
 fn decimal_from_text(param: &BoundParam, text: AppText) -> Result<TypedValue, ParamBuildError> {
     let metadata = decimal_metadata(param.column_size, param.decimal_digits)?;
     let (precision, scale) = (metadata.precision.unwrap_or(0), metadata.scale.unwrap_or(0));
-    let parsed = parse_numeric_text_with_underflow_check(&text.into_string(), true)
+    let parsed = parse_numeric_text_with_policy(&text.into_string(), UnderflowPolicy::Reject)
         .map_err(ParamBuildError::Value)?;
     let (mantissa, source_scale) = match parsed {
         NumericSource::Int(v) => (v, 0u32),

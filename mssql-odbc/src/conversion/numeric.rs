@@ -184,7 +184,15 @@ pub(crate) fn narrow_f64_to_f32(v: f64) -> Result<f32, ConvError> {
     Ok(v as f32)
 }
 
+pub(crate) enum UnderflowPolicy {
+    Reject,
+    AcceptZero,
+}
+
 /// Interprets text as a number, for either direction (fetch & params).
+///
+/// Exponent underflow becomes signed zero on Windows and a range error elsewhere,
+/// matching the platform's CharToDouble implementation.
 ///
 /// Both directions must agree on what counts as a number, because msodbcsql
 /// answers the question once: `Convert` dispatches a character source to
@@ -204,14 +212,19 @@ pub(crate) fn narrow_f64_to_f32(v: f64) -> Result<f32, ConvError> {
 /// and flags any non-zero one past the scale (`sqlccnvt.cpp:7823`) however long
 /// the literal is.
 pub(crate) fn parse_numeric_text(text: &str) -> Result<NumericSource, ConvError> {
-    parse_numeric_text_with_underflow_check(text, !cfg!(windows))
+    let policy = if cfg!(windows) {
+        UnderflowPolicy::AcceptZero
+    } else {
+        UnderflowPolicy::Reject
+    };
+    parse_numeric_text_with_policy(text, policy)
 }
 
 /// Decimal parameters reject underflow even on Windows, where CharToDouble
 /// accepts zero: ConvertToNumeric uses stringtonumeric (sqlccnvt.cpp:7101).
-pub(crate) fn parse_numeric_text_with_underflow_check(
+pub(crate) fn parse_numeric_text_with_policy(
     text: &str,
-    reject_underflow: bool,
+    policy: UnderflowPolicy,
 ) -> Result<NumericSource, ConvError> {
     // An embedded NUL ends the number. `CharToBigint` loops
     // `while (len < srclen && charstr[len] != '\0')` (`sqlccnvt.cpp:7800`), so an
@@ -231,6 +244,8 @@ pub(crate) fn parse_numeric_text_with_underflow_check(
     // here. `a_non_numeric_literal_is_22018` is what holds that.
     let trimmed = text.trim_matches(' ');
 
+    // Plain decimals keep their existing exact path; underflow when later
+    // converting them with as_f64 is outside this exponent-parsing policy.
     if let Some(source) = parse_decimal_literal(trimmed) {
         return Ok(source);
     }
@@ -254,7 +269,7 @@ pub(crate) fn parse_numeric_text_with_underflow_check(
         // whereas Windows OLE Automation succeeds with signed zero.
         // Inspect only the significand: the exponent in "0e-999" is not a value.
         Ok(f)
-            if reject_underflow
+            if matches!(policy, UnderflowPolicy::Reject)
                 && f == 0.0
                 && trimmed
                     .bytes()
@@ -484,11 +499,11 @@ mod tests {
             };
             assert_eq!(parse_numeric_text(text), expected, "{text:?}");
             assert_eq!(
-                parse_numeric_text_with_underflow_check(text, true),
+                parse_numeric_text_with_policy(text, UnderflowPolicy::Reject),
                 Err(ConvError::OutOfRange),
                 "{text:?}"
             );
-            let rounded = parse_numeric_text_with_underflow_check(text, false)
+            let rounded = parse_numeric_text_with_policy(text, UnderflowPolicy::AcceptZero)
                 .unwrap()
                 .as_f64();
             assert_eq!(rounded, 0.0);
@@ -518,8 +533,14 @@ mod tests {
     #[test]
     fn representable_exponents_and_plain_fractions_are_unchanged() {
         let plain = format!("0.{}1", "0".repeat(400));
+        let source = parse_numeric_text_with_policy(&plain, UnderflowPolicy::Reject).unwrap();
         assert_eq!(
-            parse_numeric_text(&plain).unwrap().to_i128_truncating(),
+            source.as_f64(),
+            0.0,
+            "plain-decimal float underflow is unchanged"
+        );
+        assert_eq!(
+            source.to_i128_truncating(),
             Some((0, true)),
             "a plain literal keeps the digit walk"
         );
