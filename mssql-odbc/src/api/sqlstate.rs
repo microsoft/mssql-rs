@@ -263,13 +263,14 @@ pub(crate) const ERR_INVALID_CHARACTER_VALUE: DiagMsg = DiagMsg {
     state: SQLSTATE_22018,
     text: "Invalid character value for cast specification",
 };
-/// A date/time C struct that names no real instant - month 13, 31 February, a
+/// Date/time fields that name no real instant - month 13, 31 February, a
 /// year outside `0001`..`9999`, or an out-of-range time or UTC offset.
 pub(crate) const ERR_INVALID_DATETIME_FORMAT: DiagMsg = DiagMsg {
     state: SQLSTATE_22007,
     text: "Invalid datetime format",
 };
-/// A fraction dropped by a temporal target's declared scale. Retail 18.6.2.1
+/// Temporal arithmetic overflow or a fraction dropped by the target's declared scale.
+/// Retail 18.6.2.1
 /// answers this state for `time`, `datetime2` and `datetimeoffset` alike.
 ///
 /// `ParamToSQLType` (`sqlcfunc.cpp:3350`) reads as a split - this state for the

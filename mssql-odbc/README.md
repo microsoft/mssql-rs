@@ -292,6 +292,53 @@ Inlining hints target parameter positioning, conversion, RPC encoding, and
 response/value dispatch. The large conversion and serialization functions use
 `#[inline]`, leaving the final inlining decision to the compiler.
 
+## Prepared parameter bindings
+
+Parameter mutations compare the old and new IPD SQL definition: direction and
+SQL type, character/binary SQL length, and numeric/decimal precision and scale.
+Relevant changes invalidate only the owning statement's materialized plan;
+unchanged definitions and records beyond its parameter markers do not.
+Temporal application scales affect conversion checks, not the fixed-scale SQL
+declaration; special types conservatively include their size/precision/scale.
+
+`SQLBindParameter`, IPD `SQLSetDescField`/`SQLSetDescRec`, parameter reset, and
+actual IPD refinement use this policy, including retained edits from a partially
+failed setter. Descriptor locks are released before statement invalidation.
+Direct IPD setters locate the owner through the DBC's statement list only when
+the SQL definition changes; there is no per-execute metadata key or comparison.
+The existing plan and deferred-unprepare state still travel through arrays and
+data-at-execution.
+
+This policy covers sequential mutations between completed calls. Concurrent
+IPD mutation during synchronous `SQLExecute` remains a known limitation: an
+edit after the binding snapshot can miss the staged plan, which execution
+later restores with its old declaration. Serialize parameter edits with
+execution to avoid this gap. Closing it requires coordinating the descriptor
+snapshot, plan staging, and restoration; a flag set only while the plan is
+absent would not cover the earlier snapshot-to-staging window. This is separate
+from the Need Data restriction below, not a claim that synchronous
+cross-thread calls are inherently invalid or that every Driver Manager
+serializes them.
+
+Definition changes must occur outside a data-at-execution Need Data sequence.
+`SQLBindParameter` and associated `SQLSetDescField`/`SQLSetDescRec` calls in that
+state are DM-enforced `HY010` errors. Keeping execution snapshots does not grant
+permission to rebind or reset parameters while the sequence is parked.
+
+Pointer-only rebinding and APD-only C type, buffer length, precision/scale, or
+descriptor reassociation changes reuse the plan when the IPD SQL definition is
+unchanged. Application buffers retain their existing validity requirements.
+Numeric prepared declarations always use IPD precision/scale, independently of
+the numeric value's wire precision/scale; the existing conversion fast path and
+wire representation are preserved.
+
+The selective policy follows msodbcsql's `ParamInfoSnapshot`/`SetIPDRec` path.
+Direct IPD-field invalidation is an intentional extension: retail 18.06.0001
+accepted an INTEGER-to-SMALLINT `SQLSetDescField` change but reused the old
+INTEGER declaration, whereas this driver applies the new definition at the
+next execute. This observation is not a measurement of retail 18.6.2.1.
+The decision is recorded in the [parity registry](docs/parity-deviations.md).
+
 ## Tracing
 
 Tracing is disabled by default and is intended for diagnostics.

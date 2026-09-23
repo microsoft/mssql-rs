@@ -16,11 +16,13 @@ Crate-specific requirements for changes under `mssql-odbc/`.
 - [4. Diagnostics and error handling](#4-diagnostics-and-error-handling)
 - [5. Unsafe code](#5-unsafe-code)
 - [6. Ownership and memory](#6-ownership-and-memory)
+- [6.1. Application lifetime contracts and bug scope](#61-application-lifetime-contracts-and-bug-scope)
 - [7. Concurrency](#7-concurrency)
 - [7.1. Handle hierarchy and locking](#71-handle-hierarchy-and-locking)
 - [7.1.1. DM guarantees we rely on](#711-dm-guarantees-we-rely-on)
 - [7.1.2. Locking rules](#712-locking-rules-mirroring-msodbcsql)
 - [7.2. Known descriptor concurrency gap](#72-known-descriptor-concurrency-gap)
+- [7.3. Prepared parameter definitions](#73-prepared-parameter-definitions)
 - [8. FFI boundary conventions](#8-ffi-boundary-conventions)
 - [9. Types and casts](#9-types-and-casts)
 - [10. Testing](#10-testing)
@@ -232,6 +234,26 @@ on the `master` branch.
 - Prefer `Box` for single-owner heap objects; use `Arc` only when shared
   ownership is genuinely required.
 
+### 6.1. Application lifetime contracts and bug scope
+
+- Applications must not use a handle after it is freed. `SQLDisconnect` also
+  releases associated statements and explicitly allocated descriptors. A
+  surviving Driver Manager wrapper does not establish that its old driver
+  handle is still usable. See [SQLFreeHandle](https://learn.microsoft.com/sql/odbc/reference/syntax/sqlfreehandle-function).
+- Applications own buffer allocation and must preserve buffers while the
+  driver still requires them. Do not infer that a concurrent descriptor setter
+  returning success makes an earlier outstanding fetch's buffers safe to free.
+  See [Allocating and Freeing Buffers](https://learn.microsoft.com/sql/odbc/reference/develop-app/allocating-and-freeing-buffers).
+- Crash prevention for freed application handles or prematurely freed buffers
+  is not a driver requirement. Do not add global identity, ownership, or
+  per-call admission machinery solely to harden those invalid uses.
+- Concurrent calls are not automatically misuse: ODBC requires thread safety.
+  Before redesigning synchronization for a reported race, establish a supported
+  call sequence, what the Driver Manager already enforces, and a reproducer
+  with valid submitted handles and buffers retained through call completion.
+  A source-level race or the absence of a classic-driver lock alone does not
+  establish the application contract. Keep proven internal fixes narrowly scoped.
+
 ## 7. Concurrency
 
 - The ODBC spec allows Driver Manager to call functions on the same handle
@@ -284,8 +306,10 @@ on; these guarantees were verified against msodbcsql's behavior.
   resolve the target descriptor handle (`effective_ard`/`effective_apd`),
   drop the STMT lock, *then* lock the descriptor. A descriptor pointer
   resolved this way can be freed by a concurrent `SQLFreeHandle` before it
-  is dereferenced; re-check `handles::live_type` immediately before the
-  dereference to fail cleanly instead of touching freed memory.
+  is dereferenced. Existing `handles::live_type` rechecks narrow that window,
+  but are not a complete lifetime guarantee. Establish the supported concurrent
+  call sequence before treating [#441](https://github.com/microsoft/mssql-rs/issues/441)
+  as a requirement for a broader ownership redesign.
 - **APD before IPD**: `SQLBindParameter`'s `bind_param_records` is the only
   place in this crate that holds two DESC locks at once (writing a
   parameter's APD and IPD records together). It locks APD before IPD, and
@@ -300,13 +324,39 @@ on; these guarantees were verified against msodbcsql's behavior.
 
 ### 7.2. Known descriptor concurrency gap
 
-`SQLSetDescRec` and `SQLSetDescFieldW` do not check
-`STMT_STATE_FETCH_IN_PROGRESS`. `SQLBindCol`, `SQLFreeStmt(SQL_UNBIND)`, and
-`SQLSetStmtAttr` refuse to touch the ARD while a fetch is writing through its
-snapshot, but the descriptor-field API writes the same records without that
-guard. Fixing it requires a DBC → STMT walk to find every statement associated
-with an explicit, possibly reassociated descriptor. This is tracked in
-[#472](https://github.com/microsoft/mssql-rs/issues/472).
+The different admission checks in `SQLBindCol`/`SQLFreeStmt`/`SQLSetStmtAttr`
+and the direct descriptor setters are tracked in
+[#472](https://github.com/microsoft/mssql-rs/issues/472). Do not justify a new
+buffer-use protocol by an application freeing storage that an outstanding
+fetch still needs. Establish the supported concurrency and completion
+guarantees first; preserve existing guards meanwhile.
+
+### 7.3. Prepared parameter definitions
+
+- Compare SQL definitions during IPD mutation, not APD addresses or conversion
+  metadata on every execute. Preserve plans for equivalent `SQLBindParameter`
+  calls and APD-only changes. `DESC_CONSISTENT` in msodbcsql controls validation,
+  not plan invalidation; its `ParamInfoSnapshot`/`RE_PREPARE` path is the reference.
+- Use the shared definition projection for binding, direct IPD fields/records,
+  and refinement. Account for partial failed writes and parameter-count changes.
+  Release descriptor locks before invalidating the owning statement.
+- Keep numeric SQL declarations IPD-based without overwriting the value's wire
+  precision/scale. A `SQL_NUMERIC_STRUCT` header is not the prepared declaration.
+- No descriptor identity, lifetime counter, or persistent metadata snapshot is
+  needed for this sequential cache-invalidation policy.
+- Do not extend that sequential claim to IPD mutation overlapping synchronous
+  execute. The existing snapshot/stage/restore sequence can lose invalidation;
+  a pending flag only while the plan is absent does not close every window.
+  Treat this as a separate concurrency gap, not application misuse or an
+  assumed Driver Manager serialization guarantee. ODBC's
+  [multithreading contract](https://learn.microsoft.com/sql/odbc/reference/develop-app/multithreading)
+  is distinct from the Need Data rule below.
+- A DAE binding snapshot is not permission to change the live definition while
+  the statement is in Need Data. `SQLBindParameter` and associated descriptor
+  setters are DM-enforced `HY010` errors in that state (see their
+  [diagnostic contract](https://learn.microsoft.com/sql/odbc/reference/syntax/sqlbindparameter-function#diagnostics)).
+  Cover valid mutations before DAE starts or after it ends, not a new deferred
+  invalidation protocol for out-of-contract rebinding.
 
 ## 8. FFI boundary conventions
 
