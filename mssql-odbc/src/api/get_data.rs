@@ -817,7 +817,7 @@ unsafe fn try_write_exact_buffered_scalar(
 /// Returns `None` when the value is not fully buffered or the connection cannot
 /// be used synchronously, leaving the caller to resume normal PLP streaming.
 /// `Some` means the column was consumed, including SQL NULL (reported through
-/// `strlen_or_ind_ptr` and terminated as an empty wide string).
+/// `strlen_or_ind_ptr` without modifying the destination buffer).
 ///
 /// The caller guarantees room for at least one `SqlWChar` terminator and a
 /// non-null indicator pointer before selecting this path.
