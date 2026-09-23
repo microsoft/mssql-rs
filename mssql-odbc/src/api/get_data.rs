@@ -925,15 +925,10 @@ fn try_deliver_complete_buffered_unicode_plp(
 /// not have reached the wire's end yet; the peek only runs once it completes
 /// naturally on a later `SQLGetData` call.
 ///
-/// `ready` alone decides whether to peek — there is no separate `rc ==
-/// SQL_ERROR` bail. Every `write_captured_column` path that returns
-/// `SQL_ERROR` deliberately leaves `current_row_last_col` unadvanced (a
-/// truncated read, an unconvertible type, a malformed payload — all keep the
-/// column resident and re-readable), so `ready` already reads false for
-/// every current error outcome. That also makes this correct for a future
-/// error outcome that legitimately does finish delivering the column (e.g. a
-/// NULL surfaced through an error indicator): `ready` still reflects the true
-/// delivery state instead of a blanket rc check overriding it.
+/// `ready` alone decides whether to peek, not `rc`. Captured-conversion errors
+/// keep the column resident and re-readable. A rejected typed PLP value,
+/// however, is drained: stream initialization already advanced the column,
+/// so clearing `active_plp` makes a terminal error eligible to release busy.
 fn finish_get_data(
     stmt: &StmtHandle,
     statement_handle: SqlHandle,
@@ -7724,14 +7719,8 @@ mod tests {
         assert!(!stmt_handle.inner.lock().unwrap().result_set_exhausted);
     }
 
-    /// `finish_get_data` must decide whether to peek from delivery state
-    /// (`current_row_last_col`/`column_metadata`/`active_plp`) alone, never
-    /// from `rc`. Every *current* `write_captured_column` error path leaves
-    /// `current_row_last_col` unadvanced, so this combination cannot happen
-    /// today — but a future caller can legitimately finish delivering the
-    /// column while still reporting `SQL_ERROR` (e.g. a NULL surfaced through
-    /// an error-style indicator), and the busy-release optimization must not
-    /// silently skip that case.
+    /// A terminal error after draining the last column can release busy;
+    /// delivery state, not the return code, controls the peek.
     #[test]
     fn finish_get_data_releases_busy_purely_on_delivery_state_even_when_rc_is_sql_error() {
         let h = TestHandles::with_env_dbc_stmt();
@@ -8279,6 +8268,132 @@ mod tests {
                     .unwrap()
                     .sql_state,
                 SQLSTATE_07006
+            );
+        }
+    }
+
+    #[test]
+    fn typed_plp_drained_errors_release_the_connection() {
+        use mssql_mock_tds::{ColumnDefinition, ColumnValue, QueryResponse, Row, SqlDataType};
+
+        for (unicode, diag) in [
+            (false, ERR_PLP_TYPED_LIMIT),
+            (true, ERR_PLP_TYPED_LIMIT),
+            (false, ERR_MEMORY_ALLOCATION),
+            (true, ERR_MEMORY_ALLOCATION),
+        ] {
+            let mut handles = TestHandles::with_env_dbc_stmt();
+            let dbc = unsafe { handle_from_raw::<DbcHandle>(handles.dbc) };
+            let (sql_type, value) = if unicode {
+                (
+                    SqlDataType::NVarCharMax,
+                    ColumnValue::NVarCharMax(vec![vec![u16::from(b'0'); 513]]),
+                )
+            } else {
+                (
+                    SqlDataType::VarCharMax,
+                    ColumnValue::VarCharMax(vec![vec![b'0'; 513]]),
+                )
+            };
+            let response = QueryResponse::new(
+                vec![ColumnDefinition::new("value", sql_type)],
+                vec![Row::new(vec![value])],
+            );
+            let _server =
+                crate::test_support::connect_mock_server(dbc, "SELECT oversized", response);
+            let query: Vec<u16> = "SELECT oversized\0".encode_utf16().collect();
+            assert_eq!(
+                unsafe {
+                    crate::api::exec_direct::sql_exec_direct_w(
+                        handles.stmt,
+                        query.as_ptr(),
+                        SQL_NTS,
+                    )
+                },
+                SQL_SUCCESS
+            );
+            assert_eq!(
+                unsafe { crate::api::fetch::sql_fetch(handles.stmt) },
+                SQL_SUCCESS
+            );
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(handles.stmt) };
+            assert_eq!(stmt.inner.lock().unwrap().current_row_last_col, 0);
+            let mut value = -99_i32;
+            let mut indicator = -99;
+            assert_eq!(
+                unsafe {
+                    crate::api::exports::SQLGetData(
+                        handles.stmt,
+                        1,
+                        SQL_C_CHAR,
+                        (&mut value as *mut i32).cast(),
+                        0,
+                        &mut indicator,
+                    )
+                },
+                SQL_SUCCESS_WITH_INFO
+            );
+            assert_eq!(stmt.inner.lock().unwrap().current_row_last_col, 1);
+            // Fault-inject after production stream setup, not into hand-built
+            // statement state. Both terminal errors take the same drain path.
+            let mut progress = PlpReadProgress {
+                typed_error: Some(diag),
+                ..Default::default()
+            };
+            indicator = -99;
+            loop {
+                let rc = stream_active_plp_chunk_once(
+                    stmt,
+                    handles.stmt,
+                    1,
+                    SQL_C_SLONG,
+                    (&mut value as *mut i32).cast(),
+                    0,
+                    &mut indicator,
+                    false,
+                    None,
+                    None,
+                    &mut progress,
+                );
+                if progress.retry_bytes == 0 {
+                    assert_eq!(rc, SQL_ERROR);
+                    break;
+                }
+                assert_eq!(rc, SQL_SUCCESS_WITH_INFO);
+            }
+            assert_eq!(value, -99);
+            assert_eq!(indicator, -99);
+            {
+                let state = stmt.inner.lock().unwrap();
+                assert_last_diag(&state.diag_records, diag);
+                assert_eq!(state.current_row_last_col, 1);
+                assert!(state.active_plp.is_none());
+                assert!(state.result_set_exhausted);
+            }
+            assert!(dbc.inner.lock().unwrap().active_stmt.is_none());
+            assert_eq!(
+                unsafe {
+                    crate::api::exports::SQLGetData(
+                        handles.stmt,
+                        1,
+                        SQL_C_SLONG,
+                        (&mut value as *mut i32).cast(),
+                        0,
+                        &mut indicator,
+                    )
+                },
+                SQL_NO_DATA
+            );
+            let next_stmt = handles.alloc_extra_stmt();
+            assert_eq!(
+                unsafe {
+                    crate::api::exec_direct::sql_exec_direct_w(next_stmt, query.as_ptr(), SQL_NTS)
+                },
+                SQL_SUCCESS
+            );
+            assert_eq!(
+                unsafe { crate::api::fetch::sql_fetch(handles.stmt) },
+                SQL_NO_DATA
             );
         }
     }

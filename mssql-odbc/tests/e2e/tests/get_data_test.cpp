@@ -520,6 +520,45 @@ TEST_F(GetDataLiveTest, PlpTypedOversizedValueIsRefusedAndDrained) {
     }
 }
 
+// Benefits-from-mock-tds: typed_plp_drained_errors_release_the_connection also
+// checks the internal busy claim, which a Driver Manager test cannot inspect.
+TEST_F(GetDataLiveTest, PlpTypedOversizedOnlyColumnReleasesConnection) {
+    const char* target = std::getenv("ODBC_TEST_TARGET");
+    const bool reference = target && std::string(target) == "msodbcsql";
+    SQLCHAR version[32] = {};
+    ASSERT_SQL_OK(SQLGetInfoA(dbc_, SQL_DRIVER_VER, version, sizeof(version), nullptr),
+                  SQL_HANDLE_DBC, dbc_);
+    RecordProperty("driver_version", reinterpret_cast<const char*>(version));
+    for (const char* type : {"varchar(max)", "nvarchar(max)"}) {
+        SCOPED_TRACE(type);
+        ASSERT_SQL_OK(ExecDirect(
+            "SELECT REPLICATE(CAST('0' AS " + std::string(type) + "), 1048576) + '1'"),
+            SQL_HANDLE_STMT, stmt_);
+        ASSERT_EQ(SQL_SUCCESS, SQLFetch(stmt_));
+        SQLINTEGER value = -99;
+        SQLLEN indicator = -99;
+        EXPECT_EQ(reference ? SQL_SUCCESS_WITH_INFO : SQL_ERROR,
+                  SQLGetData(stmt_, 1, SQL_C_SLONG, &value, 0, &indicator));
+        EXPECT_EQ(reference ? "01004" : "HYC00", StmtDiagState());
+        EXPECT_EQ(reference ? 0 : -99, value);
+        EXPECT_EQ(reference ? static_cast<SQLLEN>(sizeof(value)) : -99, indicator);
+        EXPECT_EQ(SQL_NO_DATA, SQLGetData(stmt_, 1, SQL_C_SLONG, &value, 0, &indicator));
+
+        SQLHSTMT next = AllocStmt();
+        ASSERT_NE(nullptr, next);
+        auto query = ODBCTestUtils::ToSqlTStr("SELECT 7");
+        ASSERT_SQL_OK(SQLExecDirect(next, const_cast<SQLTCHAR*>(query.c_str()), SQL_NTS),
+                      SQL_HANDLE_STMT, next);
+        ASSERT_EQ(SQL_SUCCESS, SQLFetch(next));
+        ASSERT_EQ(SQL_SUCCESS, SQLGetData(next, 1, SQL_C_SLONG, &value, 0, &indicator));
+        EXPECT_EQ(7, value);
+        EXPECT_EQ(SQL_NO_DATA, SQLFetch(next));
+        FreeStmt(next);
+        EXPECT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
+        ASSERT_EQ(SQL_SUCCESS, SQLCloseCursor(stmt_));
+    }
+}
+
 class GetDataUtf16Test : public GetDataLiveTest {
 protected:
     void SetUp() override {
