@@ -26,12 +26,6 @@ pub(crate) enum NumericSource {
     /// and whether anything non-zero was dropped, which survives any length.
     /// `negative` is kept separately because `int_part` cannot hold the sign of
     /// `-0.something` and `approx` can underflow to `-0.0`.
-    ///
-    /// [`NumericSource::Float`] has no such rescue, and deliberately so: it
-    /// holds exponent forms, which msodbcsql also routes through a double
-    /// (`sqlccnvt.cpp:5118`). `"-1e-400"` is `-0.0` there too, so
-    /// [`NumericSource::is_negative`] answering `false` matches rather than
-    /// diverges. See `parse_numeric_text` for the routing.
     WideDecimal {
         approx: f64,
         negative: bool,
@@ -245,14 +239,19 @@ pub(crate) fn parse_numeric_text(text: &str) -> Result<NumericSource, ConvError>
     // `CharToBigint` (`:5109`, which walks digits and flags a dropped fraction)
     // but an exponent literal to `CharToDouble` (`:5118`, which keeps only what
     // the double holds).
-    //
-    // That makes the answer depend on the spelling, in both drivers: `"1e-400"`
-    // underflows to `0.0` and reports no dropped fraction, where the same value
-    // written out as `"0." + 400 zeros + "1"` reports one. Deliberately left
-    // alone - recovering the fraction from the text would be more self-
-    // consistent but would diverge from msodbcsql on both directions at once.
-    // The same routing is why `"-1e-400"` is `-0.0` and so not negative.
     match trimmed.parse::<f64>() {
+        // Rust silently rounds underflow to zero. CharToDouble maps the Linux
+        // VarR8FromStr range error to CVT_PREC (sqlccnvt.cpp:7949-7954).
+        // Inspect only the significand: the exponent in "0e-999" is not a value.
+        Ok(f)
+            if f == 0.0
+                && trimmed
+                    .bytes()
+                    .take_while(|b| !matches!(b, b'e' | b'E'))
+                    .any(|b| matches!(b, b'1'..=b'9')) =>
+        {
+            Err(ConvError::OutOfRange)
+        }
         Ok(f) if f.is_finite() => Ok(NumericSource::Float(f)),
         // Rust folds overflow into `Ok(inf)`, but msodbcsql's `VarR8FromStr`
         // reports `DISP_E_OVERFLOW` -> 22003 and keeps the cast error for text
@@ -455,34 +454,69 @@ mod tests {
         assert!(!parse_numeric_text(&zero).unwrap().is_negative());
     }
 
-    /// The answer depends on the spelling, and that is msodbcsql's behaviour,
-    /// not an oversight: `Convert` sends a plain literal to `CharToBigint`,
-    /// which walks digits and flags a dropped fraction, and an exponent literal
-    /// to `CharToDouble`, which keeps only what the double holds
-    /// (`sqlccnvt.cpp:5092`, `:5109`, `:5118`). An underflowing exponent is
-    /// therefore exactly zero, with no fraction to report and no sign.
     #[test]
-    fn an_underflowing_exponent_loses_its_fraction_as_msodbcsql_does() {
+    fn an_underflowing_exponent_is_out_of_range() {
+        for text in [
+            "1e-999",
+            "-1e-999",
+            "1e-400",
+            "-1e-400",
+            "2e-324",
+            "+0.001E-999",
+            " 1e-999 ",
+            "1e-999\0ignored",
+        ] {
+            assert_eq!(
+                parse_numeric_text(text),
+                Err(ConvError::OutOfRange),
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn zero_significands_are_not_underflow() {
+        for text in ["0e-999", "-0e-999", "+0.000E-999", "0e999", "0E+999"] {
+            assert_eq!(parse_numeric_text(text).unwrap().as_f64(), 0.0, "{text}");
+        }
+        assert!(
+            parse_numeric_text("-0e-999")
+                .unwrap()
+                .as_f64()
+                .is_sign_negative()
+        );
+        for text in ["0e-", "0e-999x", "1e-999x"] {
+            assert_eq!(
+                parse_numeric_text(text),
+                Err(ConvError::InvalidCharacterValue)
+            );
+        }
+    }
+
+    #[test]
+    fn representable_exponents_and_plain_fractions_are_unchanged() {
         let plain = format!("0.{}1", "0".repeat(400));
         assert_eq!(
             parse_numeric_text(&plain).unwrap().to_i128_truncating(),
             Some((0, true)),
             "a plain literal keeps the digit walk"
         );
-        assert_eq!(
-            parse_numeric_text("1e-400").unwrap().to_i128_truncating(),
-            Some((0, false)),
-            "an exponent literal is whatever the double holds"
-        );
-
-        // Subnormal but non-zero: the double still carries a fraction.
+        // Nonzero subnormal parsing is outside the underflow-to-zero fix.
         assert_eq!(
             parse_numeric_text("1e-320").unwrap().to_i128_truncating(),
             Some((0, true))
         );
 
-        // -0.0 is not negative, for the same reason.
-        assert!(!parse_numeric_text("-1e-400").unwrap().is_negative());
+        assert_eq!(
+            parse_numeric_text("5e-324").unwrap().as_f64(),
+            f64::from_bits(1)
+        );
+        assert_eq!(
+            parse_numeric_text("2.2250738585072014e-308")
+                .unwrap()
+                .as_f64(),
+            f64::MIN_POSITIVE
+        );
     }
 
     /// A literal past an exact mantissa still has to reach a float target at

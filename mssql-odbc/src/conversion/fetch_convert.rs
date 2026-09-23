@@ -1690,22 +1690,21 @@ mod tests {
         assert_eq!(err, ConvError::InvalidCharacterValue);
     }
 
-    /// Digits that overflow `f64` are out of range, not unparseable text.
-    /// `f64::from_str` folds both into `Ok(inf)`, so they have to be split.
     #[test]
-    fn overflowing_numeric_text_is_out_of_range() {
-        let mut out: f64 = 0.0;
-        let mut ind: SqlLen = 0;
-        let err = unsafe {
-            convert_float_c(
-                &utf8_col("1e400"),
-                SQL_C_DOUBLE,
-                (&mut out as *mut f64).cast(),
-                &mut ind,
-            )
+    fn out_of_range_numeric_text_leaves_outputs_unchanged() {
+        for text in ["1e400", "1e-999", "-1e-999"] {
+            for target in [SQL_C_DOUBLE, SQL_C_FLOAT] {
+                let mut out = [0xa5u8; 8];
+                let mut ind: SqlLen = -999;
+                let err = unsafe {
+                    convert_float_c(&utf8_col(text), target, out.as_mut_ptr().cast(), &mut ind)
+                }
+                .unwrap_err();
+                assert_eq!(err, ConvError::OutOfRange, "{text}: {target}");
+                assert_eq!(out, [0xa5; 8]);
+                assert_eq!(ind, -999);
+            }
         }
-        .unwrap_err();
-        assert_eq!(err, ConvError::OutOfRange);
     }
 
     /// Character text that parses as a different temporal shape is bad text for

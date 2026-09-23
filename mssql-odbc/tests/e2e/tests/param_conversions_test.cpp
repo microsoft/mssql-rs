@@ -391,6 +391,24 @@ TEST_F(CrossConversionLiveTest, CharParamOutOfRangeIs22003) {
     }
 }
 
+TEST_F(CrossConversionLiveTest, ExponentUnderflowIs22003ForNumericParameters) {
+    for (SQLSMALLINT c_type : {SQL_C_CHAR, SQL_C_WCHAR}) {
+        for (SQLSMALLINT sql_type : {SQL_INTEGER, SQL_DECIMAL}) {
+            ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
+            for (const char* text : {"1e-999", "-1e-999"}) {
+                SCOPED_TRACE(::testing::Message() << c_type << " -> " << sql_type << ": " << text);
+                ASSERT_SQL_OK(BindText(c_type, text, sql_type, 10), SQL_HANDLE_STMT, stmt_);
+                EXPECT_EQ(SQL_ERROR, SQLExecute(stmt_));
+                EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "22003");
+                ResetParams();
+            }
+            ASSERT_SQL_OK(BindText(c_type, "1", sql_type, 10), SQL_HANDLE_STMT, stmt_);
+            EXPECT_EQ("1", ExecuteAndReadBack());
+            ResetParams();
+        }
+    }
+}
+
 // Overflow outranks a dropped fraction: the narrowing runs before msodbcsql's
 // fraction rewrite can fire, so a value that does both reports 22003.
 TEST_F(CrossConversionLiveTest, CharParamOverflowOutranksFraction) {

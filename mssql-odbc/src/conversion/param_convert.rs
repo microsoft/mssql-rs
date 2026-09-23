@@ -2625,6 +2625,13 @@ mod tests {
             convert_decimal(SQL_DECIMAL, 3, 2, "10").unwrap_err(),
             ParamBuildError::Value(ConvError::OutOfRange)
         );
+        for text in ["1e-999", "-1e-999"] {
+            assert_eq!(
+                convert_decimal(SQL_DECIMAL, 10, 2, text).unwrap_err(),
+                ParamBuildError::Value(ConvError::OutOfRange)
+            );
+        }
+        assert!(convert_decimal(SQL_DECIMAL, 10, 2, "0e-999").is_ok());
     }
 
     /// An unparseable literal is `22018`, the same state and the same parser the
@@ -5403,12 +5410,18 @@ mod tests {
             convert_char(SQL_C_CHAR, SQL_INTEGER, 0, "-1.5E2").unwrap(),
             SqlType::Int(Some(-150))
         );
-        // An exponent past the `f64` range parses as infinity, which is an
-        // overflow rather than a syntax error.
-        assert_eq!(
-            convert_char(SQL_C_CHAR, SQL_BIGINT, 0, "1e400"),
-            Err(ParamBuildError::Value(ConvError::OutOfRange))
-        );
+        for c_type in [SQL_C_CHAR, SQL_C_WCHAR] {
+            for text in ["1e400", "1e-999", "-1e-999"] {
+                assert_eq!(
+                    convert_char(c_type, SQL_BIGINT, 0, text),
+                    Err(ParamBuildError::Value(ConvError::OutOfRange))
+                );
+            }
+            assert_eq!(
+                convert_char(c_type, SQL_BIGINT, 0, "0e-999").unwrap(),
+                SqlType::BigInt(Some(0))
+            );
+        }
     }
 
     /// The wide arm decodes UTF-16 rather than narrowing through the ANSI code

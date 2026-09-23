@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <cstring>
 #include <string>
+#include <tuple>
 #include <vector>
 
 namespace {
@@ -3579,3 +3580,76 @@ TEST_F(GetDataLiveTest, FloatTargetRejectsUnderflowAsWellAsOverflow) {
 
     SQLCloseCursor(stmt_);
 }
+
+class NumericExponentLiveTest
+    : public ODBCTest,
+      public ::testing::WithParamInterface<std::tuple<SQLULEN, bool, bool>> {
+protected:
+    void SetUp() override {
+        ODBCTest::SetUp();
+        if (!ODBCTestConfig::Instance().HasConnection()) {
+            GTEST_SKIP() << "No connection configured";
+        }
+        ASSERT_SQL_OK(SQLSetEnvAttr(env_, SQL_ATTR_ODBC_VERSION,
+                                    reinterpret_cast<SQLPOINTER>(std::get<0>(GetParam())), 0),
+                      SQL_HANDLE_ENV, env_);
+        Connect();
+    }
+};
+
+TEST_P(NumericExponentLiveTest, UnderflowReportsRangeErrorAndNextRowRecovers) {
+    const auto [version, wide, bound] = GetParam();
+    SCOPED_TRACE(::testing::Message() << "ODBC " << version << " wide=" << wide
+                                     << " bound=" << bound);
+    struct Case {
+        const char* literal;
+        const char* state;
+        double value;
+    };
+    for (const Case& c : {Case{"1e-999", "22003", 0},
+                          Case{"-1e-999", "22003", 0},
+                          Case{"1e-400", "22003", 0},
+                          Case{"1e400", "22003", 0},
+                          Case{"1e-", "22018", 0},
+                          Case{"0e-999", "", 0},
+                          Case{"-0E-999", "", 0},
+                          Case{"0e999", "", 0},
+                          Case{"2.2250738585072014e-308", "", 2.2250738585072014e-308}}) {
+        SCOPED_TRACE(c.literal);
+        const std::string sql = std::string("SELECT CAST(v AS ") +
+            (wide ? "nvarchar" : "varchar") + "(128)) FROM (VALUES (1, '" +
+            c.literal + "'), (2, '1')) AS src(ord, v) ORDER BY ord";
+        ASSERT_NO_FATAL_FAILURE(ExecDirect(sql));
+        double value = 9;
+        SQLLEN indicator = -999;
+        if (bound) {
+            ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_DOUBLE, &value, sizeof(value), &indicator),
+                          SQL_HANDLE_STMT, stmt_);
+        }
+        for (int row = 0; row < 2; ++row) {
+            SQLRETURN rc = SQLFetch(stmt_);
+            if (!bound) {
+                ASSERT_EQ(SQL_SUCCESS, rc);
+                rc = SQLGetData(stmt_, 1, SQL_C_DOUBLE, &value, sizeof(value), &indicator);
+            }
+            if (row == 0 && c.state[0]) {
+                EXPECT_EQ(SQL_ERROR, rc);
+                EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, c.state);
+                EXPECT_EQ(9, value);
+            } else {
+                EXPECT_EQ(SQL_SUCCESS, rc);
+                EXPECT_EQ("", ODBCTestUtils::GetDiagState(SQL_HANDLE_STMT, stmt_));
+                EXPECT_DOUBLE_EQ(row == 0 ? c.value : 1, value);
+                EXPECT_EQ(static_cast<SQLLEN>(sizeof(value)), indicator);
+            }
+        }
+        EXPECT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
+        ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_UNBIND), SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+    }
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    AllPaths, NumericExponentLiveTest,
+    ::testing::Combine(::testing::Values(SQLULEN{SQL_OV_ODBC3}, SQLULEN{SQL_OV_ODBC3_80}),
+                       ::testing::Bool(), ::testing::Bool()));
