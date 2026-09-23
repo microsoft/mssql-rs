@@ -194,6 +194,9 @@ and its metadata stay available: `SQLFetch` returns `SQL_NO_DATA` without
 touching a second statement's results. Protocol-only RPC completion tokens
 are consumed before release, with output values retained until
 `SQLMoreResults`; a later application-visible result keeps the connection busy.
+For an empty RPC result, the completion check may wait for the next response
+token under the request's remaining timeout; an expiry is reported by
+`SQLExecDirect`/`SQLExecute`, before the application calls `SQLMoreResults`.
 
 ## Bound fetch performance
 
