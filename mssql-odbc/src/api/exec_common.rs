@@ -1204,7 +1204,11 @@ pub(super) fn finish_execute(
     let info_messages = client.take_info_messages();
     let Ok(mut stmt_state) = stmt.inner.lock() else {
         error!("{op}: stmt mutex poisoned");
-        return_client_busy(dbc, client);
+        if batch_exhausted {
+            return_client_idle(dbc, statement_handle, client);
+        } else {
+            return_client_busy(dbc, client);
+        }
         return SQL_ERROR;
     };
     stmt_state.begin_batch(metadata);
@@ -1425,17 +1429,52 @@ mod tests {
 
     #[test]
     fn finish_execute_completes_empty_rpc_result_and_retains_outputs() {
+        use crate::api::bind_param::sql_bind_parameter;
         use crate::api::more_results::sql_more_results;
-        use mssql_tds::test_client_support::info;
+        use crate::api::odbc_types::{SQL_C_SLONG, SQL_PARAM_OUTPUT};
+        use mssql_tds::datatypes::column_values::ColumnValues;
+        use mssql_tds::query::result::ReturnValue;
+        use mssql_tds::test_client_support::{info, return_status, return_value};
+        use mssql_tds::token::tokenitems::ReturnValueStatus;
 
         let handles = TestHandles::with_env_dbc_stmt();
         handles.mark_dbc_connected();
         let dbc = unsafe { handle_from_raw::<DbcHandle>(handles.dbc) };
         let stmt = unsafe { handle_from_raw::<StmtHandle>(handles.stmt) };
+        let mut buffers = [-1i32; 2];
+        let mut lengths = [-1; 2];
+        for (index, (buffer, length)) in buffers.iter_mut().zip(&mut lengths).enumerate() {
+            assert_eq!(
+                unsafe {
+                    sql_bind_parameter(
+                        handles.stmt,
+                        u16::try_from(index + 1).unwrap(),
+                        SQL_PARAM_OUTPUT,
+                        SQL_C_SLONG,
+                        SQL_INTEGER,
+                        0,
+                        0,
+                        std::ptr::from_mut(buffer).cast(),
+                        4,
+                        length,
+                    )
+                },
+                SQL_SUCCESS
+            );
+        }
+        stmt.inner.lock().unwrap().call_returns_status = true;
         let mut client = tds_client_from_tokens(vec![
             col_metadata(int_columns(1)),
             info(50000, 10, "completion warning"),
             done_in_proc_more(),
+            return_status(17),
+            return_value(ReturnValue {
+                param_ordinal: 0,
+                param_name: "@P2".to_owned(),
+                value: ColumnValues::Int(73),
+                column_metadata: Box::new(int_columns(1).remove(0)),
+                status: ReturnValueStatus::OutputParam,
+            }),
             done_proc_no_more(),
         ]);
         dbc.runtime
@@ -1462,8 +1501,62 @@ mod tests {
             );
             assert!(stmt_state.pending_fetch_info.is_empty());
         }
+        assert_eq!(buffers, [-1, -1]);
+        assert_eq!(lengths, [-1, -1]);
         assert_eq!(unsafe { sql_more_results(handles.stmt) }, SQL_NO_DATA);
+        assert_eq!(buffers, [17, 73]);
+        assert_eq!(lengths, [4, 4]);
         assert!(stmt.inner.lock().unwrap().pending_output_params.is_none());
+        buffers.fill(-2);
+        lengths.fill(-2);
+        assert_eq!(unsafe { sql_more_results(handles.stmt) }, SQL_NO_DATA);
+        assert_eq!(buffers, [-2, -2]);
+        assert_eq!(lengths, [-2, -2]);
+    }
+
+    #[test]
+    fn finish_execute_poisoned_stmt_releases_only_completed_empty_result() {
+        for batch_done in [true, false] {
+            let handles = TestHandles::with_env_dbc_stmt();
+            handles.mark_dbc_connected();
+            let dbc = unsafe { handle_from_raw::<DbcHandle>(handles.dbc) };
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(handles.stmt) };
+            let mut tokens = vec![col_metadata(int_columns(1))];
+            if batch_done {
+                tokens.push(done_no_more());
+            } else {
+                tokens.extend([done_more(), col_metadata(int_columns(1)), done_no_more()]);
+            }
+            let mut client = tds_client_from_tokens(tokens);
+            dbc.runtime
+                .block_on(client.execute("SELECT 1 WHERE 1 = 0".to_owned(), ()))
+                .unwrap();
+            dbc.inner.lock().unwrap().active_stmt = Some(handles.stmt);
+            std::thread::scope(|scope| {
+                assert!(
+                    scope
+                        .spawn(|| {
+                            let _guard = stmt.inner.lock().unwrap();
+                            panic!("poison the stmt lock");
+                        })
+                        .join()
+                        .is_err()
+                );
+            });
+
+            assert_eq!(
+                finish_execute(dbc, stmt, handles.stmt, client, "SQLExecute"),
+                SQL_ERROR
+            );
+            assert_eq!(
+                dbc.inner.lock().unwrap().active_stmt,
+                if batch_done { None } else { Some(handles.stmt) }
+            );
+            stmt.inner.clear_poison();
+            let mut client = dbc.inner.lock().unwrap().client.take().unwrap();
+            dbc.runtime.block_on(client.close_query()).unwrap();
+            return_client_idle(dbc, handles.stmt, client);
+        }
     }
 
     #[test]
