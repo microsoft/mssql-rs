@@ -2880,6 +2880,8 @@ pub(crate) fn converted_narrow_indicator(
 }
 
 fn reserve_typed_plp_bytes(bytes: &mut Vec<u8>, additional: usize) -> Result<(), DiagMsg> {
+    #[cfg(test)]
+    let additional = tests::typed_plp_reserve_size(additional);
     bytes
         .try_reserve(additional)
         .map_err(|_| ERR_MEMORY_ALLOCATION)
@@ -3619,6 +3621,29 @@ mod tests {
     use mssql_tds::datatypes::sql_string::SqlString;
     use mssql_tds::datatypes::sqldatatypes::TdsDataType;
     use mssql_tds::test_client_support::{int_columns, tds_client_from_int_rows};
+
+    thread_local! {
+        static FAIL_TYPED_PLP_RESERVE_AFTER: std::cell::Cell<Option<usize>> =
+            const { std::cell::Cell::new(None) };
+    }
+
+    pub(super) fn typed_plp_reserve_size(additional: usize) -> usize {
+        if additional == 0 {
+            return additional;
+        }
+        FAIL_TYPED_PLP_RESERVE_AFTER.with(|remaining| match remaining.get() {
+            Some(0) => {
+                remaining.set(None);
+                // Trigger a real TryReserveError without exhausting process memory.
+                usize::MAX
+            }
+            Some(count) => {
+                remaining.set(Some(count - 1));
+                additional
+            }
+            None => additional,
+        })
+    }
 
     /// Assert the most recent diagnostic matches the expected canonical
     /// SQLSTATE and message text (the message is prefixed by the driver, so we
@@ -8173,52 +8198,20 @@ mod tests {
 
     #[test]
     fn typed_plp_allocation_failure_preserves_hy001_while_draining() {
-        let mut bytes = Vec::new();
-        let allocation_error = reserve_typed_plp_bytes(&mut bytes, usize::MAX).unwrap_err();
-        assert_eq!(allocation_error.state, SQLSTATE_HY001);
-        let handles = TestHandles::with_env_dbc_stmt();
-        prefetched_text_stream(
-            &handles,
-            PlpEncoding::SingleByteText,
-            Some(encoding_rs::WINDOWS_1252.into()),
-            vec![b'0'; 513],
-            Some(513),
-        );
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(handles.stmt) };
-        let mut progress = PlpReadProgress {
-            typed_error: Some(allocation_error),
-            ..Default::default()
-        };
-        let mut value = -99_i32;
-        let mut indicator = -99;
-        for expected in [SQL_SUCCESS_WITH_INFO, SQL_SUCCESS_WITH_INFO, SQL_ERROR] {
-            assert_eq!(
-                stream_active_plp_chunk_once(
-                    stmt,
-                    handles.stmt,
-                    1,
-                    SQL_C_SLONG,
-                    (&mut value as *mut i32).cast(),
-                    0,
-                    &mut indicator,
-                    false,
-                    None,
-                    None,
-                    &mut progress,
-                ),
-                expected
+        for fail_after in [0, 1, 2] {
+            let handles = TestHandles::with_env_dbc_stmt();
+            prefetched_text_stream(
+                &handles,
+                PlpEncoding::SingleByteText,
+                Some(encoding_rs::WINDOWS_1252.into()),
+                vec![b'0'; 513],
+                Some(513),
             );
-            assert_eq!(value, -99);
-            assert_eq!(indicator, -99);
-            assert!(progress.typed_bytes.is_empty());
-        }
-        let state = stmt.inner.lock().unwrap();
-        assert_last_diag(&state.diag_records, ERR_MEMORY_ALLOCATION);
-        assert!(state.active_plp.is_none());
-        drop(state);
-        assert_eq!(
-            unsafe {
-                sql_get_data(
+            let mut value = -99_i32;
+            let mut indicator = -99;
+            FAIL_TYPED_PLP_RESERVE_AFTER.set(Some(fail_after));
+            let rc = unsafe {
+                crate::api::exports::SQLGetData(
                     handles.stmt,
                     1,
                     SQL_C_SLONG,
@@ -8226,9 +8219,30 @@ mod tests {
                     0,
                     &mut indicator,
                 )
-            },
-            SQL_NO_DATA
-        );
+            };
+            assert_eq!(FAIL_TYPED_PLP_RESERVE_AFTER.replace(None), None);
+            assert_eq!(rc, SQL_ERROR);
+            assert_eq!(value, -99);
+            assert_eq!(indicator, -99);
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(handles.stmt) };
+            let state = stmt.inner.lock().unwrap();
+            assert_last_diag(&state.diag_records, ERR_MEMORY_ALLOCATION);
+            assert!(state.active_plp.is_none());
+            drop(state);
+            assert_eq!(
+                unsafe {
+                    sql_get_data(
+                        handles.stmt,
+                        1,
+                        SQL_C_SLONG,
+                        (&mut value as *mut i32).cast(),
+                        0,
+                        &mut indicator,
+                    )
+                },
+                SQL_NO_DATA
+            );
+        }
     }
 
     #[test]
