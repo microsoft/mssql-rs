@@ -14,6 +14,8 @@ body:
 
         **Important:** Before posting, redact sensitive information from all report fields and evidence, including commands, output, and diff excerpts. Do not include connection strings, passwords, access tokens, customer data, or non-public source.
 
+        **Security vulnerabilities:** Do not report suspected or confirmed security vulnerabilities in public issues or comments, including as skill drift. Follow the private Microsoft Security Response Center reporting process at [https://aka.ms/SECURITY.md](https://aka.ms/SECURITY.md) instead. Redacting secrets does not make vulnerability details safe to publish.
+
   - type: dropdown
     id: class
     attributes:

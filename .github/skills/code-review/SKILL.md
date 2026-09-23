@@ -384,6 +384,13 @@ Report when:
 - A step cost time without changing the outcome, or you raised a class of finding that
   a lint, test, or CI check could have caught before review.
 
+**Security vulnerabilities are excluded from public drift reporting.** For suspected
+or confirmed vulnerabilities, follow the private Microsoft Security Response Center
+reporting process linked from [SECURITY.md](../../../SECURITY.md):
+<https://aka.ms/SECURITY.md>. Do not create public issues or comments containing
+vulnerability details, even with secrets redacted. This applies to interactive and
+unattended runs; authorization to file drift does not authorize public disclosure.
+
 Search before filing, including closed issues, using distinctive terms for the underlying
 drift mechanism. The same mistake can recur in different functions, tests, or files;
 use the local symbol only as an optional additional query. Recurrence belongs on the
@@ -417,6 +424,7 @@ the full option list. An issue missing the required fields is a note, not someth
 later pass can promote:
 
 ```markdown
+<!-- Do not report suspected or confirmed security vulnerabilities in public issues or comments, including as skill drift. Follow the private Microsoft Security Response Center reporting process at https://aka.ms/SECURITY.md instead. Redacting secrets does not make vulnerability details safe to publish. -->
 <!-- Before posting an issue or comment, redact sensitive information from all report fields and evidence, including commands, output, and diff excerpts. Do not include connection strings, passwords, access tokens, customer data, or non-public source. -->
 ### Drift class
 <one exact option from the form's Drift class dropdown>
