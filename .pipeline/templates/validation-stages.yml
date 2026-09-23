@@ -3,8 +3,7 @@
 
 parameters:
 # Defaulted so any caller that does not pass them keeps the current images. These
-# exist so the Linux fleet can be moved between agent images, and moved back,
-# without editing every job.
+# let callers change agent images without editing every job.
 - name: linuxImage
   displayName: Agent image for x64 Linux jobs
   type: string

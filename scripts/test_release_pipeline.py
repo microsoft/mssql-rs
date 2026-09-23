@@ -66,11 +66,16 @@ def evaluate(expression, parameters, succeeded=True):
     return visit(ast.parse(expression.strip(), mode="eval").body)
 
 
+def _literal(value):
+    """ADO renders booleans lowercase; everything else keeps its casing."""
+    return str(value).lower() if isinstance(value, bool) else str(value)
+
+
 def expand(value, parameters):
     if isinstance(value, str):
         return re.sub(
             r"\$\{\{(.+?)\}\}",
-            lambda match: str(evaluate(match[1], parameters)).lower(),
+            lambda match: _literal(evaluate(match[1], parameters)),
             value,
         )
     if isinstance(value, list):
