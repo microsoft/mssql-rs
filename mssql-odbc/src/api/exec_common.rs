@@ -1029,7 +1029,7 @@ fn no_row_execute_return(row_count: i64, has_server_info: bool) -> SqlReturn {
 /// statement/connection state.
 ///
 /// - **Result set** (non-empty `COLMETADATA`): the cursor is left open for
-///   `SQLFetch`; the connection stays busy.
+///   `SQLFetch`; an empty result releases the connection if the batch is done.
 /// - **DDL/DML** (no `COLMETADATA`): the wire is drained via `close_query` and
 ///   the connection returns to idle. Collected DML counts remain navigable;
 ///   output parameters wait until `SQLMoreResults` consumes the final count.
@@ -1178,10 +1178,25 @@ pub(super) fn finish_execute(
     // first row. Wait for that row, end-of-set, or an ERROR token so execution
     // errors surface from SQLExecDirect/SQLExecute instead of a later SQLFetch.
     // A row is only positioned and parked; SQLFetch still receives it normally.
-    if let Err(e) = dbc.runtime.block_on(client.peek_past_current_row()) {
-        error!(%e, "{op}: failed before the first result row");
-        return fail_with_tds(dbc, stmt, statement_handle, client, &e);
-    }
+    let has_row = match dbc.runtime.block_on(client.peek_past_current_row()) {
+        Ok(has_row) => has_row,
+        Err(error) => {
+            error!(%error, "{op}: failed before the first result row");
+            return fail_with_tds(dbc, stmt, statement_handle, client, &error);
+        }
+    };
+    let row_count = client.last_rows_affected();
+    let batch_exhausted = if has_row {
+        false
+    } else {
+        match dbc.runtime.block_on(client.complete_current_result()) {
+            Ok(batch_done) => batch_done,
+            Err(error) => {
+                error!(%error, "{op}: failed to complete the empty result");
+                return fail_with_tds(dbc, stmt, statement_handle, client, &error);
+            }
+        }
+    };
 
     // Result-bearing query: leave the cursor open for SQLFetch. This must stay
     // below the peek: the peek drains any INFO token in the post-metadata
@@ -1193,14 +1208,24 @@ pub(super) fn finish_execute(
         return SQL_ERROR;
     };
     stmt_state.begin_batch(metadata);
-    stmt_state.row_count = client.last_rows_affected();
+    stmt_state.row_count = row_count;
     stmt_state.pending_row_counts.clear();
     stmt_state.clear_exhaustion_state();
+    stmt_state.result_set_exhausted = !has_row;
+    stmt_state.batch_exhausted = batch_exhausted;
+    if batch_exhausted {
+        stmt_state.pending_output_params =
+            Some((client.get_return_values(), client.get_return_status()));
+    }
     stmt_state.set_state(STMT_STATE_EXEC_CONTEXT | STMT_STATE_CURSOR_OPEN);
     stmt_state.clear_state(STMT_STATE_EXEC_STARTED);
     let has_server_info = post_tds_info_messages(&mut stmt_state, &info_messages);
     drop(stmt_state);
-    return_client_busy(dbc, client);
+    if batch_exhausted {
+        return_client_idle(dbc, statement_handle, client);
+    } else {
+        return_client_busy(dbc, client);
+    }
     if !ird_ok {
         if let Ok(mut stmt_state) = stmt.inner.lock() {
             post_sql_error(
@@ -1372,6 +1397,166 @@ mod tests {
         assert!(try_claim_idle_client(dbc, h.dbc).is_none());
         // The existing claim must be left untouched.
         assert_eq!(dbc.inner.lock().unwrap().active_stmt, Some(other));
+    }
+
+    #[test]
+    fn finish_execute_releases_empty_completed_result() {
+        let handles = TestHandles::with_env_dbc_stmt();
+        handles.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(handles.dbc) };
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(handles.stmt) };
+        let mut client = tds_client_from_tokens(vec![col_metadata(int_columns(1)), done_no_more()]);
+        dbc.runtime
+            .block_on(client.execute("SELECT 1 WHERE 1 = 0".to_string(), ()))
+            .unwrap();
+        dbc.inner.lock().unwrap().active_stmt = Some(handles.stmt);
+
+        assert_eq!(
+            finish_execute(dbc, stmt, handles.stmt, client, "SQLExecDirectW"),
+            SQL_SUCCESS
+        );
+
+        assert!(dbc.inner.lock().unwrap().active_stmt.is_none());
+        let stmt_state = stmt.inner.lock().unwrap();
+        assert!(stmt_state.result_set_exhausted);
+        assert!(stmt_state.batch_exhausted);
+        assert!(stmt_state.has_state(STMT_STATE_CURSOR_OPEN));
+    }
+
+    #[test]
+    fn finish_execute_completes_empty_rpc_result_and_retains_outputs() {
+        use crate::api::more_results::sql_more_results;
+        use mssql_tds::test_client_support::info;
+
+        let handles = TestHandles::with_env_dbc_stmt();
+        handles.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(handles.dbc) };
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(handles.stmt) };
+        let mut client = tds_client_from_tokens(vec![
+            col_metadata(int_columns(1)),
+            info(50000, 10, "completion warning"),
+            done_in_proc_more(),
+            done_proc_no_more(),
+        ]);
+        dbc.runtime
+            .block_on(client.execute("SELECT 1 WHERE 1 = 0".to_string(), ()))
+            .unwrap();
+        dbc.inner.lock().unwrap().active_stmt = Some(handles.stmt);
+
+        assert_eq!(
+            finish_execute(dbc, stmt, handles.stmt, client, "SQLExecute"),
+            SQL_SUCCESS_WITH_INFO
+        );
+
+        assert!(dbc.inner.lock().unwrap().active_stmt.is_none());
+        {
+            let stmt_state = stmt.inner.lock().unwrap();
+            assert!(stmt_state.result_set_exhausted);
+            assert!(stmt_state.batch_exhausted);
+            assert!(stmt_state.pending_output_params.is_some());
+            assert!(
+                stmt_state
+                    .diag_records
+                    .iter()
+                    .any(|record| record.native_error == 50000)
+            );
+            assert!(stmt_state.pending_fetch_info.is_empty());
+        }
+        assert_eq!(unsafe { sql_more_results(handles.stmt) }, SQL_NO_DATA);
+        assert!(stmt.inner.lock().unwrap().pending_output_params.is_none());
+    }
+
+    #[test]
+    fn finish_execute_keeps_busy_for_empty_result_with_later_results() {
+        use crate::api::more_results::sql_more_results;
+
+        for terminator in [done_more(), done_in_proc_more()] {
+            let handles = TestHandles::with_env_dbc_stmt();
+            handles.mark_dbc_connected();
+            let dbc = unsafe { handle_from_raw::<DbcHandle>(handles.dbc) };
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(handles.stmt) };
+            let mut client = tds_client_from_tokens(vec![
+                col_metadata(int_columns(1)),
+                terminator,
+                col_metadata(int_columns(2)),
+                done_no_more(),
+            ]);
+            dbc.runtime
+                .block_on(client.execute("SELECT 1 WHERE 1 = 0; SELECT 2, 3".to_string(), ()))
+                .unwrap();
+            dbc.inner.lock().unwrap().active_stmt = Some(handles.stmt);
+
+            assert_eq!(
+                finish_execute(dbc, stmt, handles.stmt, client, "SQLExecute"),
+                SQL_SUCCESS
+            );
+
+            assert_eq!(dbc.inner.lock().unwrap().active_stmt, Some(handles.stmt));
+            {
+                let stmt_state = stmt.inner.lock().unwrap();
+                assert!(stmt_state.result_set_exhausted);
+                assert!(!stmt_state.batch_exhausted);
+                assert!(stmt_state.pending_output_params.is_none());
+            }
+            assert_eq!(unsafe { sql_more_results(handles.stmt) }, SQL_SUCCESS);
+            assert!(!stmt.inner.lock().unwrap().result_set_exhausted);
+            assert_eq!(unsafe { sql_more_results(handles.stmt) }, SQL_NO_DATA);
+        }
+    }
+
+    #[test]
+    fn finish_execute_keeps_first_row_parked_and_connection_busy() {
+        use mssql_tds::test_client_support::tds_client_from_int_rows;
+
+        let handles = TestHandles::with_env_dbc_stmt();
+        handles.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(handles.dbc) };
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(handles.stmt) };
+        let mut client = tds_client_from_int_rows(vec![vec![42]]);
+        dbc.runtime
+            .block_on(client.execute("SELECT 42".to_string(), ()))
+            .unwrap();
+        dbc.inner.lock().unwrap().active_stmt = Some(handles.stmt);
+
+        assert_eq!(
+            finish_execute(dbc, stmt, handles.stmt, client, "SQLExecute"),
+            SQL_SUCCESS
+        );
+
+        assert_eq!(dbc.inner.lock().unwrap().active_stmt, Some(handles.stmt));
+        {
+            let stmt_state = stmt.inner.lock().unwrap();
+            assert!(!stmt_state.result_set_exhausted);
+            assert!(!stmt_state.batch_exhausted);
+        }
+        let mut client = dbc.inner.lock().unwrap().client.take().unwrap();
+        assert!(dbc.runtime.block_on(client.next_row_cursor()).unwrap());
+        dbc.runtime.block_on(client.close_query()).unwrap();
+        return_client_idle(dbc, handles.stmt, client);
+    }
+
+    #[test]
+    fn finish_execute_reports_truncated_empty_rpc_tail() {
+        let handles = TestHandles::with_env_dbc_stmt();
+        handles.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(handles.dbc) };
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(handles.stmt) };
+        let mut client =
+            tds_client_from_tokens(vec![col_metadata(int_columns(1)), done_in_proc_more()]);
+        dbc.runtime
+            .block_on(client.execute("SELECT 1 WHERE 1 = 0".to_string(), ()))
+            .unwrap();
+        dbc.inner.lock().unwrap().active_stmt = Some(handles.stmt);
+
+        assert_eq!(
+            finish_execute(dbc, stmt, handles.stmt, client, "SQLExecute"),
+            SQL_ERROR
+        );
+        assert!(dbc.inner.lock().unwrap().active_stmt.is_none());
+        let stmt_state = stmt.inner.lock().unwrap();
+        assert!(!stmt_state.diag_records.is_empty());
+        assert!(stmt_state.pending_fetch_error.is_none());
+        assert!(!stmt_state.has_state(STMT_STATE_EXEC_STARTED));
     }
 
     #[test]

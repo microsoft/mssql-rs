@@ -147,17 +147,96 @@ TEST_F(ConnectionBusyLiveTest, PreparedParameterMultiRowReleasesAfterLastRow) {
     EXPECT_SQL_OK(Run(b, "SELECT 2"), SQL_HANDLE_STMT, b);
 }
 
-TEST_F(ConnectionBusyLiveTest, PreparedParameterZeroRowReleasesConnection) {
+TEST_F(ConnectionBusyLiveTest, PreparedParameterZeroRowReleasesConnectionBeforeFetch) {
     SQLHSTMT b = AllocStmt();
 
     ASSERT_SQL_OK(Prepare(stmt_, "SELECT ? WHERE 1 = 0"), SQL_HANDLE_STMT, stmt_);
     SQLINTEGER parameter = 42;
     SQLLEN parameter_ind = 0;
     ASSERT_SQL_OK(BindInt(stmt_, 1, &parameter, &parameter_ind), SQL_HANDLE_STMT, stmt_);
-    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
-    ASSERT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
+    for (int execution = 0; execution < 2; ++execution) {
+        ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(Run(b, "SELECT 2"), SQL_HANDLE_STMT, b);
 
-    EXPECT_SQL_OK(Run(b, "SELECT 2"), SQL_HANDLE_STMT, b);
+        SQLSMALLINT columns = 0;
+        ASSERT_SQL_OK(SQLNumResultCols(stmt_, &columns), SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ(1, columns);
+        EXPECT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
+        EXPECT_EQ(SQL_NO_DATA, SQLMoreResults(stmt_));
+
+        ASSERT_SQL_OK(SQLFetch(b), SQL_HANDLE_STMT, b);
+        SQLINTEGER value = 0;
+        ASSERT_SQL_OK(SQLGetData(b, 1, SQL_C_SLONG, &value, sizeof(value), nullptr),
+                      SQL_HANDLE_STMT, b);
+        EXPECT_EQ(2, value);
+        ASSERT_SQL_OK(SQLCloseCursor(b), SQL_HANDLE_STMT, b);
+    }
+}
+
+TEST_F(ConnectionBusyLiveTest, ExecDirectZeroRowReleasesConnectionBeforeFetch) {
+    SQLHSTMT other_stmt = AllocStmt();
+    SQLINTEGER parameter = 42;
+    SQLLEN parameter_ind = 0;
+
+    for (bool parameterized : {false, true}) {
+        SCOPED_TRACE(parameterized);
+        if (parameterized) {
+            ASSERT_SQL_OK(BindInt(stmt_, 1, &parameter, &parameter_ind), SQL_HANDLE_STMT, stmt_);
+        }
+        ASSERT_SQL_OK(Run(stmt_, parameterized ? "SELECT ? WHERE 1 = 0" : "SELECT 1 WHERE 1 = 0"),
+                      SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(Run(other_stmt, "SELECT 2"), SQL_HANDLE_STMT, other_stmt);
+
+        SQLSMALLINT columns = 0;
+        ASSERT_SQL_OK(SQLNumResultCols(stmt_, &columns), SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ(1, columns);
+        EXPECT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
+        EXPECT_EQ(SQL_NO_DATA, SQLMoreResults(stmt_));
+
+        ASSERT_SQL_OK(SQLFetch(other_stmt), SQL_HANDLE_STMT, other_stmt);
+        SQLINTEGER value = 0;
+        ASSERT_SQL_OK(SQLGetData(other_stmt, 1, SQL_C_SLONG, &value, sizeof(value), nullptr),
+                      SQL_HANDLE_STMT, other_stmt);
+        EXPECT_EQ(2, value);
+        ASSERT_SQL_OK(SQLCloseCursor(other_stmt), SQL_HANDLE_STMT, other_stmt);
+    }
+}
+
+TEST_F(ConnectionBusyLiveTest, EmptyFirstResultKeepsConnectionBusyForLaterResults) {
+    SQLHSTMT other_stmt = AllocStmt();
+    SQLINTEGER parameter = 42;
+    SQLLEN parameter_ind = 0;
+
+    for (int mode = 0; mode < 3; ++mode) {
+        SCOPED_TRACE(mode);
+        if (mode != 0) {
+            ASSERT_SQL_OK(BindInt(stmt_, 1, &parameter, &parameter_ind), SQL_HANDLE_STMT, stmt_);
+        }
+        if (mode == 2) {
+            ASSERT_SQL_OK(Prepare(stmt_, "SELECT ? WHERE 1 = 0; SELECT 42"), SQL_HANDLE_STMT, stmt_);
+            ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+        } else {
+            ASSERT_SQL_OK(Run(stmt_, mode == 0 ? "SELECT 1 WHERE 1 = 0; SELECT 42"
+                                              : "SELECT ? WHERE 1 = 0; SELECT 42"),
+                          SQL_HANDLE_STMT, stmt_);
+        }
+
+        EXPECT_EQ(SQL_ERROR, Run(other_stmt, "SELECT 2"));
+        EXPECT_SQLSTATE(SQL_HANDLE_STMT, other_stmt, "HY000");
+        ASSERT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
+        EXPECT_EQ(SQL_ERROR, Run(other_stmt, "SELECT 2"));
+        EXPECT_SQLSTATE(SQL_HANDLE_STMT, other_stmt, "HY000");
+
+        ASSERT_SQL_OK(SQLMoreResults(stmt_), SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+        SQLINTEGER value = 0;
+        ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_SLONG, &value, sizeof(value), nullptr),
+                      SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ(42, value);
+        EXPECT_EQ(SQL_NO_DATA, SQLMoreResults(stmt_));
+        ASSERT_SQL_OK(Run(other_stmt, "SELECT 2"), SQL_HANDLE_STMT, other_stmt);
+        ASSERT_SQL_OK(SQLCloseCursor(other_stmt), SQL_HANDLE_STMT, other_stmt);
+    }
 }
 
 // SQLExecDirect with bound parameters uses sp_executesql rather than the
