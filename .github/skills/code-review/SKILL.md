@@ -365,7 +365,9 @@ than `gh pr review`, diff-hunk anchoring, `--paginate` when verifying — are in
    context and can be tracked to resolution.
 4. **Skill drift** — one line per observation, or `none`. Report it every time; a
    section left off is indistinguishable from one nobody checked. This is a note to
-   the human, not part of the posted review.
+   the human, not part of the posted review. Exception: for suspected or confirmed
+   security vulnerabilities, emit only `Private MSRC reporting required` without
+   details, as described below.
 
 ## Reporting Skill Drift
 
@@ -390,6 +392,11 @@ reporting process linked from [SECURITY.md](../../../SECURITY.md):
 <https://aka.ms/SECURITY.md>. Do not create public issues or comments containing
 vulnerability details, even with secrets redacted. This applies to interactive and
 unattended runs; authorization to file drift does not authorize public disclosure.
+For such observations, the required drift output and any chat fallback must contain
+only `Private MSRC reporting required`, not the prepared report. Do not include
+vulnerability details or evidence in review/chat output or unattended logs; reserve
+them for the private reporting process. The marker indicates a required next step,
+not that a report has been submitted.
 
 Search before filing, including closed issues, using distinctive terms for the underlying
 drift mechanism. The same mistake can recur in different functions, tests, or files;
@@ -453,7 +460,8 @@ mistake — a one-off you could not have anticipated is not drift. The confirmat
 authorization rules in step 6 apply to both issue creation and comments. Unattended
 runs capture these too, with the same body, but write only when the run explicitly
 authorizes that action; permission to post a PR review alone does not authorize issue
-writes. Otherwise, include the prepared report in the chat output without posting it.
+writes. Otherwise, include the prepared report in the chat output without posting it,
+except for security-related observations, which use only the private-MSRC marker above.
 
 ## Principles
 
