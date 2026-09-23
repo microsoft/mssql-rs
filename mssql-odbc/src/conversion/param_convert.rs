@@ -137,6 +137,9 @@ impl ParamBuildError {
             Self::UnsupportedSqlType(_) => ERR_PARAM_SQL_TYPE_NOT_IMPLEMENTED,
             Self::ConversionNotImplemented => ERR_PARAM_CONVERSION_NOT_IMPLEMENTED,
             Self::Value(ConvError::OutOfRange) => ERR_NUMERIC_OUT_OF_RANGE,
+            // Exhaustiveness backstop; parameters use Self::DateTimeFieldOverflow.
+            Self::Value(ConvError::DatetimeFieldOverflow) => ERR_DATETIME_FIELD_OVERFLOW,
+            Self::Value(ConvError::InvalidDatetimeFormat) => ERR_INVALID_DATETIME_FORMAT,
             Self::Value(ConvError::InvalidCharacterValue) => ERR_INVALID_CHARACTER_VALUE,
             Self::Value(ConvError::Internal) => ERR_INTERNAL_CONVERSION,
             // Backstop only: parameter legality is settled by the bind-time
