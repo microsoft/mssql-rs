@@ -62,6 +62,10 @@ failures by the ODBC runner follow the same policy. Checkout, build, and
 test-harness failures remain blocking in both modes. JUnit results are still
 published, including failed tests.
 
+The ODBC runner treats per-file pytest exit 2 as a test failure because a driver
+import error can prevent collection. Pytest internal/usage errors (3/4) and
+command-launch failures remain harness errors.
+
 To advance the pin, review the upstream commit comparison, replace the full SHA,
 and validate both cross-repo jobs in the pin-update PR. CI following main never
 updates the pin automatically.

@@ -183,7 +183,8 @@ for idx in "${!TEST_FILES[@]}"; do
     case "$rc" in
         0)   status="PASSED";              kind="ok";      passed=$((passed + 1)) ;;
         1)   status="FAILED";              kind="error";   failed=$((failed + 1)) ;;
-        2)   status="INTERRUPTED";         kind="error";   harness_error=$((harness_error + 1)) ;;
+        # Driver import failures during collection also produce pytest exit 2.
+        2)   status="COLLECTION ERROR / INTERRUPTED"; kind="error"; failed=$((failed + 1)) ;;
         3)   status="INTERNAL ERROR";      kind="error";   harness_error=$((harness_error + 1)) ;;
         4)   status="USAGE ERROR";         kind="error";   harness_error=$((harness_error + 1)) ;;
         # Every test in the file was deselected by pytest.ini's `-m "not stress"`.

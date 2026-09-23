@@ -218,7 +218,7 @@ def test_mssql_python_odbc_failures_are_advisory_only_in_ci():
 @pytest.mark.skipif(shutil.which("bash") is None, reason="Bash is required")
 @pytest.mark.parametrize(
     ("pytest_exit", "runner_exit"),
-    [(0, 0), (1, 1), (2, 2), (3, 2), (4, 2), (5, 0),
+    [(0, 0), (1, 1), (2, 1), (3, 2), (4, 2), (5, 0),
      (124, 1), (125, 2), (126, 2), (127, 2), (137, 1), (139, 1)],
 )
 def test_odbc_runner_distinguishes_harness_errors(tmp_path, pytest_exit, runner_exit):
@@ -230,17 +230,27 @@ def test_odbc_runner_distinguishes_harness_errors(tmp_path, pytest_exit, runner_
     script = f"""
     python() {{ return 0; }}
     timeout() {{
-        if [ "$6" = "tests/test_pass.py" ]; then return 0; fi
-        return {pytest_exit}
+        for arg in "$@"; do
+            case "$arg" in
+                tests/test_pass.py) return 0 ;;
+                tests/test_result.py) return {pytest_exit} ;;
+            esac
+        done
+        echo "Unexpected timeout arguments: $*" >&2
+        return 125
     }}
     MSSQL_PYTHON_DIR="$2" TEST_RESULTS_DIR="$2/test-results" \
         PYTEST_FILE_TIMEOUT=10s PYTEST_TOTAL_BUDGET=120s source "$1"
     """
+    script_path = tmp_path / "run-test.sh"
+    script_path.write_text(script, encoding="utf-8", newline="\n")
     result = subprocess.run(
-        ["bash", "-c", script, "bash", str(runner), str(tmp_path)],
+        ["bash", script_path.as_posix(), runner.as_posix(), tmp_path.as_posix()],
         capture_output=True, text=True,
     )
     assert result.returncode == runner_exit, result.stdout + result.stderr
+    assert "Unexpected timeout arguments" not in result.stderr
+    assert f"passed: {2 if pytest_exit == 0 else 1} |" in result.stdout
     assert f"harness errors: {int(runner_exit == 2)}" in result.stdout
     assert len(list((tmp_path / "test-results").glob("*.xml"))) == 2
 
@@ -259,15 +269,20 @@ def test_odbc_runner_distinguishes_harness_errors(tmp_path, pytest_exit, runner_
 )
 @pytest.mark.parametrize("exit_code", [0, 1, 2, 3, 4, 5, 125, 126, 127, 137])
 @pytest.mark.parametrize("reason", ["PullRequest", "IndividualCI", "BatchedCI", "Manual", "Schedule", ""])
-def test_python_pipeline_test_exit_codes(template, display_name, command, exit_code, reason):
+def test_python_pipeline_test_exit_codes(tmp_path, template, display_name, command, exit_code, reason):
     step = next(
         step for step in load_template(template)["steps"]
         if step.get("displayName") == display_name
     )
     script = step["script"].replace("$(Build.SourcesDirectory)", "/workspace")
     script = re.sub(r"\$\{\{.*?\}\}", "10m", script)
+    script_path = tmp_path / "run-step.sh"
+    script_path.write_text(
+        f"BUILD_REASON='{reason}'\n{command}() {{ return {exit_code}; }}\n{script}",
+        encoding="utf-8", newline="\n",
+    )
     result = subprocess.run(
-        ["bash", "-c", f"BUILD_REASON='{reason}'\n{command}() {{ return {exit_code}; }}\n{script}"],
+        ["bash", script_path.as_posix()],
         capture_output=True, text=True,
     )
     advisory = exit_code == 1 and reason not in ("PullRequest", "")
