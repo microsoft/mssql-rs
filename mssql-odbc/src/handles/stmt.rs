@@ -44,6 +44,11 @@ pub(crate) struct ActivePlpStream {
     /// also moves pending UTF-16 units here so either text target can drain
     /// their bytes verbatim, including a byte split after a target switch.
     pub(crate) pending_bytes: Vec<u8>,
+    /// The carry is raw UTF-16LE rather than UTF-8. An odd length means its
+    /// first byte is the remainder of a partially delivered code unit.
+    /// Character reads drain old carry before decoding new wire input, so
+    /// this tag covers the entire byte buffer.
+    pub(crate) pending_bytes_utf16: bool,
     /// Narrow wire encoding resolved from the column's collation (or UTF-8 for
     /// `json`, which carries none), or `None` when the column is not narrow
     /// text. This is a property of the *column*, so a target type that arrives
@@ -110,6 +115,7 @@ impl ActivePlpStream {
             pending_byte: None,
             pending_high_surrogate: None,
             pending_bytes: Vec::new(),
+            pending_bytes_utf16: false,
             narrow_encoding,
             narrow_decoder: None,
             pending_units: Vec::new(),

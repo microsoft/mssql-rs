@@ -182,7 +182,10 @@ against `msodbcsql18`.
 `SQLGetData` converts `varchar(max)` and `nvarchar(max)` into the same supported
 integer, floating-point, and date/time C targets as non-max text. It
 preserves the column's encoding and any unread characters from an earlier
-character read. Fixed-size targets ignore `BufferLength` and report their C
+character read. Typed conversion decodes carried UTF-16 output even after a
+character-target switch has moved it into byte storage; a partially delivered
+code unit remains malformed rather than becoming a numeric prefix.
+Fixed-size targets ignore `BufferLength` and report their C
 type's size after successful conversion.
 
 Typed PLP conversion accepts at most 1 MiB of unread source wire data, matching

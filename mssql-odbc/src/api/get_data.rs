@@ -2050,6 +2050,10 @@ fn stream_active_plp_chunk_once<'a>(
             carried_bytes.min(capacity)
         };
         if emit > 0 {
+            if !stream.pending_units.is_empty() {
+                debug_assert!(stream.pending_bytes.is_empty() || stream.pending_bytes_utf16);
+                stream.pending_bytes_utf16 = true;
+            }
             stream
                 .pending_bytes
                 .extend(stream.pending_units.drain(..).flat_map(u16::to_le_bytes));
@@ -2064,6 +2068,9 @@ fn stream_active_plp_chunk_once<'a>(
                 );
             }
             stream.pending_bytes.drain(..emit);
+            if stream.pending_bytes.is_empty() {
+                stream.pending_bytes_utf16 = false;
+            }
         }
         retained_stmt_state = Some(state);
         emit
@@ -2889,6 +2896,27 @@ fn append_typed_plp_text(
     reached_end: bool,
     bytes: &mut Vec<u8>,
 ) -> Result<(), DiagMsg> {
+    if stream.pending_bytes_utf16 {
+        // An odd carry starts with the high byte of a unit whose low byte
+        // was already delivered. Do not pair it with the next code unit.
+        let partial_unit = stream.pending_bytes.len() % 2;
+        let mut text = utf16le_chunk_to_utf8(
+            &stream.pending_bytes[partial_unit..],
+            true,
+            &mut None,
+            &mut None,
+        );
+        if partial_unit != 0 {
+            text.insert(0, char::REPLACEMENT_CHARACTER);
+        }
+        reserve_typed_plp_bytes(bytes, text.len())?;
+        bytes.extend_from_slice(text.as_bytes());
+    } else {
+        reserve_typed_plp_bytes(bytes, stream.pending_bytes.len())?;
+        bytes.extend_from_slice(&stream.pending_bytes);
+    }
+    stream.pending_bytes.clear();
+    stream.pending_bytes_utf16 = false;
     if !stream.pending_units.is_empty() {
         let text = String::from_utf16_lossy(&stream.pending_units);
         reserve_typed_plp_bytes(bytes, text.len())?;
@@ -8015,6 +8043,142 @@ mod tests {
             );
             assert_eq!(value, 42);
             assert_eq!(indicator, 4);
+        }
+    }
+
+    #[test]
+    fn typed_plp_target_switch_decodes_remaining_wide_carry() {
+        for char_bytes in [1, 2, 4, 6] {
+            let handles = TestHandles::with_env_dbc_stmt();
+            prefetched_text_stream(
+                &handles,
+                PlpEncoding::SingleByteText,
+                Some(encoding_rs::WINDOWS_1252.into()),
+                b"2".to_vec(),
+                Some(1),
+            );
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(handles.stmt) };
+            stmt.inner
+                .lock()
+                .unwrap()
+                .active_plp
+                .as_mut()
+                .unwrap()
+                .pending_units = "014".encode_utf16().collect();
+            let mut prefix = vec![0xcc; char_bytes + 1];
+            assert_eq!(
+                read_plp_test_chunk(&handles, SQL_C_CHAR, &mut prefix).0,
+                SQL_SUCCESS_WITH_INFO
+            );
+            assert_eq!(&prefix[..char_bytes], &utf16le("014")[..char_bytes]);
+            let mut value = -99_i32;
+            let mut indicator = -99;
+            let rc = unsafe {
+                sql_get_data(
+                    handles.stmt,
+                    1,
+                    SQL_C_SLONG,
+                    (&mut value as *mut i32).cast(),
+                    0,
+                    &mut indicator,
+                )
+            };
+            if char_bytes % 2 == 0 {
+                assert_eq!(rc, SQL_SUCCESS);
+                assert_eq!(
+                    value,
+                    match char_bytes {
+                        2 => 142,
+                        4 => 42,
+                        _ => 2,
+                    }
+                );
+                assert_eq!(indicator, 4);
+            } else {
+                assert_eq!(rc, SQL_ERROR);
+                assert_eq!(value, -99);
+                assert_eq!(indicator, -99);
+                assert_eq!(
+                    stmt.inner
+                        .lock()
+                        .unwrap()
+                        .diag_records
+                        .last()
+                        .unwrap()
+                        .sql_state,
+                    SQLSTATE_22018
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn typed_plp_after_wide_and_narrow_reads_rejects_a_partial_carried_unit() {
+        for chunks in [
+            vec![vec![0xc2, b'0', b'4', b'2']],
+            vec![vec![0xc2], vec![b'0'], vec![b'4', b'2']],
+        ] {
+            let (handles, _server) = open_mock_utf8_plp(chunks);
+            let mut wide = [0xcc; 4];
+            assert_eq!(
+                read_plp_test_chunk(&handles, SQL_C_WCHAR, &mut wide).0,
+                SQL_SUCCESS_WITH_INFO
+            );
+            assert_eq!(wide, [0xfd, 0xff, 0, 0]);
+            let mut narrow = [0xcc; 2];
+            assert_eq!(
+                read_plp_test_chunk(&handles, SQL_C_CHAR, &mut narrow).0,
+                SQL_SUCCESS_WITH_INFO
+            );
+            assert_eq!(narrow, [b'0', 0]);
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(handles.stmt) };
+            {
+                let state = stmt.inner.lock().unwrap();
+                let stream = state.active_plp.as_ref().unwrap();
+                assert!(stream.pending_bytes_utf16);
+                assert_eq!(stream.pending_bytes, [0]);
+            }
+            let mut value = -99_i32;
+            let mut indicator = -99;
+            assert_eq!(
+                unsafe {
+                    sql_get_data(
+                        handles.stmt,
+                        1,
+                        SQL_C_SLONG,
+                        (&mut value as *mut i32).cast(),
+                        0,
+                        &mut indicator,
+                    )
+                },
+                SQL_ERROR
+            );
+            assert_eq!(value, -99);
+            assert_eq!(indicator, -99);
+            assert_eq!(
+                stmt.inner
+                    .lock()
+                    .unwrap()
+                    .diag_records
+                    .last()
+                    .unwrap()
+                    .sql_state,
+                SQLSTATE_22018
+            );
+            assert_eq!(
+                unsafe {
+                    sql_get_data(
+                        handles.stmt,
+                        2,
+                        SQL_C_SLONG,
+                        (&mut value as *mut i32).cast(),
+                        0,
+                        &mut indicator,
+                    )
+                },
+                SQL_SUCCESS
+            );
+            assert_eq!(value, 42);
         }
     }
 
