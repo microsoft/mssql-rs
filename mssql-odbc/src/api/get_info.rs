@@ -165,10 +165,12 @@ const SQL_INFO_SCHEMA_VIEWS_MASK: u32 = 0x0000_0004 // CHECK_CONSTRAINTS
     | 0x0010_0000 // VIEW_COLUMN_USAGE
     | 0x0020_0000 // VIEW_TABLE_USAGE
     | 0x0040_0000; // VIEWS
-// SQL Server identifier and index limits (msodbcsql `sqlcinfo.cpp` Sphinx
-// constants). Confirmed against retail msodbcsql18 by the compare-leg E2E.
+// SQL Server identifier and index limits from msodbcsql's `sqlsrv.h`/`tds.h`:
+// `MAXCURSORNAMESPHINX` = `SYSNAMELEN` (128), `MAXPROCNAMESPHINX` =
+// `MAX_PROCNAME + 6` = 128 + 6 (the `;nnnnn` numbered-procedure suffix), and
+// `MAXINDEXSIZESPHINX` = 900. The compare-leg E2E pins these against retail.
 const SQL_SERVER_MAX_CURSOR_NAME_LEN: u16 = 128;
-const SQL_SERVER_MAX_PROCEDURE_NAME_LEN: u16 = 128;
+const SQL_SERVER_MAX_PROCEDURE_NAME_LEN: u16 = 134;
 const SQL_SERVER_MAX_INDEX_SIZE: u32 = 900;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
