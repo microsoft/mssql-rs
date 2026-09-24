@@ -68,7 +68,10 @@ fn sql_disconnect_safe(dbc: &DbcHandle) -> SqlReturn {
         // Defensive guard only: SQLDriverConnectW holds this mutex from setting
         // Connecting until it publishes Connected or Disconnected, so a
         // concurrent disconnect blocks and always observes a final state.
-        if state.connection_state != ConnectionState::Connected {
+        let can_disconnect = state.connection_state == ConnectionState::Connected;
+        #[cfg(unix)]
+        let can_disconnect = can_disconnect || state.connection_state == ConnectionState::Forked;
+        if !can_disconnect {
             error!("SQLDisconnect: connect still in progress");
             post_diag(&mut state, ERR_CONNECTION_DOES_NOT_EXIST);
             return SQL_ERROR;

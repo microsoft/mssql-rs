@@ -29,6 +29,11 @@ pub(crate) use tracing_init::init_tracing;
 macro_rules! ffi_entry {
     ($name:literal, $body:expr $(,)?) => {{
         let ret = match ::std::panic::catch_unwind(|| {
+            #[cfg(unix)]
+            if let Err(error) = $crate::handles::ensure_current_process() {
+                ::tracing::error!(%error, concat!($name, ": fork recovery failed"));
+                return $crate::api::odbc_types::SQL_ERROR;
+            }
             $crate::init_tracing();
             $body
         }) {

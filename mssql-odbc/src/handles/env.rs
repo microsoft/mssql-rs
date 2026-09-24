@@ -87,8 +87,8 @@ pub(crate) fn process_is_shutting_down() -> bool {
     unsafe { RtlDllShutdownInProgress() != 0 }
 }
 
-/// Non-Windows platforms do not terminate the process's other threads before
-/// running library teardown, so the runtime can always be used normally.
+/// Non-Windows platforms do not use Windows loader-driven process teardown.
+/// Inherited post-fork runtimes are handled separately by `SharedRuntime`.
 #[cfg(not(windows))]
 pub(crate) fn process_is_shutting_down() -> bool {
     false
@@ -164,11 +164,22 @@ fn release(runtime: Runtime, policy: ReleasePolicy) {
 ///
 /// [`#459`]: https://github.com/microsoft/mssql-rs/pull/459
 #[derive(Debug)]
-pub(crate) struct SharedRuntime(ManuallyDrop<Runtime>);
+pub(crate) struct SharedRuntime {
+    runtime: ManuallyDrop<Runtime>,
+    process_id: u32,
+}
 
 impl SharedRuntime {
     fn new(runtime: Runtime) -> Self {
-        Self(ManuallyDrop::new(runtime))
+        Self {
+            runtime: ManuallyDrop::new(runtime),
+            process_id: std::process::id(),
+        }
+    }
+
+    #[cfg(unix)]
+    pub(super) fn create() -> io::Result<Arc<Self>> {
+        new_runtime().map(|runtime| Arc::new(Self::new(runtime)))
     }
 }
 
@@ -176,17 +187,22 @@ impl std::ops::Deref for SharedRuntime {
     type Target = Runtime;
 
     fn deref(&self) -> &Runtime {
-        &self.0
+        &self.runtime
     }
 }
 
 impl Drop for SharedRuntime {
     fn drop(&mut self) {
-        // SAFETY: `drop` runs at most once and nothing reads `self.0` after
+        // An inherited runtime cannot be joined, signalled, or dropped: its
+        // worker threads disappeared at fork, possibly while holding its locks.
+        if self.process_id != std::process::id() {
+            return;
+        }
+        // SAFETY: `drop` runs at most once and nothing reads `self.runtime` after
         // this, so taking ownership out of the `ManuallyDrop` is sound. Taking
         // it by value is what lets `release` choose between dropping the
         // `Runtime` and forgetting it; the default drop glue would always join.
-        let runtime = unsafe { ManuallyDrop::take(&mut self.0) };
+        let runtime = unsafe { ManuallyDrop::take(&mut self.runtime) };
         release(runtime, release_policy(process_is_shutting_down()));
     }
 }
