@@ -1,0 +1,14 @@
+{
+  "name": "mssql-js-tedious-comparison",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "compare": "node compare-tedious.js"
+  },
+  "dependencies": {
+    "tedious": "20.0.0"
+  }
+}
