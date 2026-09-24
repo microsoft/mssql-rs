@@ -345,8 +345,14 @@ def test_provider_verification_in_fresh_interpreter(tmp_path, provider, diagnost
     ("body", "contract_error"),
     [
         ("", True),
+        ("get_native_provider_info = None", True),
         ("raise ImportError('upstream import changed')", True),
         ("def get_native_provider_info(required): pass", True),
+        ("def get_native_provider_info(): raise AttributeError('unexpected failure')", False),
+        ("def get_native_provider_info(): raise KeyError('unexpected failure')", False),
+        ("def get_native_provider_info(): raise TypeError('unexpected failure')", False),
+        ("def get_native_provider_info(): raise ValueError('unexpected failure')", False),
+        ("def get_native_provider_info(): raise ImportError('unexpected failure')", False),
         ("def get_native_provider_info(): raise RuntimeError('unexpected failure')", False),
         ("import os\nos._exit(139)", False),
     ],
@@ -443,21 +449,31 @@ def test_unverifiable_url_dependency_fails_setup(runtime_metadata):
 
 
 @pytest.mark.parametrize("extra_installed", [False, True])
-def test_required_extras_and_transitive_dependencies_are_checked(runtime_metadata, monkeypatch, extra_installed):
+@pytest.mark.parametrize("base_installed", [False, True])
+def test_required_extras_and_transitive_dependencies_are_checked(
+    runtime_metadata, monkeypatch, extra_installed, base_installed,
+):
     requirements, versions = runtime_metadata
     requirements.append("new-runtime[feature]>=1")
     versions["new-runtime"] = "1.0"
     if extra_installed:
         versions["extra-runtime"] = "2.0"
+    if base_installed:
+        versions["base-runtime"] = "1.0"
     nested = {
-        "new-runtime": ["extra-runtime>=2; extra == 'feature'", "unused; extra == 'unused'"],
+        "new-runtime": [
+            "extra-runtime>=2; extra == 'feature'",
+            "base-runtime>=1; extra != 'feature'",
+            "unused; extra == 'unused'",
+        ],
         "extra-runtime": ["new-runtime[feature]>=1"],
     }
     monkeypatch.setattr(prepare_python.metadata, "requires", lambda name: nested.get(name, []))
-    if extra_installed:
+    if extra_installed and base_installed:
         prepare_python.check_runtime_dependencies()
     else:
-        with pytest.raises(RuntimeError, match="extra-runtime>=2.*not installed"):
+        missing = "extra-runtime>=2" if not extra_installed else "base-runtime>=1"
+        with pytest.raises(RuntimeError, match=f"{missing}.*not installed"):
             prepare_python.check_runtime_dependencies()
 
 

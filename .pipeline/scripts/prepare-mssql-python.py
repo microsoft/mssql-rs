@@ -6,6 +6,7 @@
 
 import argparse
 from importlib import metadata
+import inspect
 import os
 from pathlib import Path
 import subprocess
@@ -39,7 +40,7 @@ def active_requirements(entries, extras=()):
     return [
         requirement for requirement in requirements
         if requirement.marker is None or any(
-            requirement.marker.evaluate({"extra": extra}) for extra in extras or ("",)
+            requirement.marker.evaluate({"extra": extra}) for extra in ("", *extras)
         )
     ]
 
@@ -90,13 +91,17 @@ def check_runtime_dependencies():
 def verify_provider():
     try:
         import mssql_python
-
-        get_info = getattr(mssql_python, "get_native_provider_info", None)
-        if not callable(get_info):
-            raise UpstreamContractError("mssql_python.get_native_provider_info is missing or not callable")
-        provider = get_info()
-    except (ImportError, AttributeError, KeyError, TypeError, ValueError) as error:
-        raise UpstreamContractError(f"Cannot read the upstream native provider: {error}") from error
+    except ImportError as error:
+        raise UpstreamContractError(f"Cannot import the upstream native provider: {error}") from error
+    get_info = getattr(mssql_python, "get_native_provider_info", None)
+    if not callable(get_info):
+        raise UpstreamContractError("mssql_python.get_native_provider_info is missing or not callable")
+    signature = inspect.signature(get_info)
+    try:
+        signature.bind()
+    except TypeError as error:
+        raise UpstreamContractError(f"Provider query now requires arguments: {signature}") from error
+    provider = get_info()
     if not isinstance(provider, dict) or provider.get("id") != "msodbcsql18":
         raise UpstreamContractError(f"Expected provider id msodbcsql18, got {provider!r}")
     driver = provider.get("driver_path")
