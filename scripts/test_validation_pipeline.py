@@ -128,6 +128,24 @@ def test_mssql_python_macos_failures_are_advisory_only_in_ci():
     assert publish["inputs"]["failTaskOnMissingResultsFile"] is True
 
 
+def test_mssql_python_macos_owns_development_dependencies():
+    steps = load_template("test-mssql-python-macos-template.yml")["steps"]
+    build = next(
+        step
+        for step in steps
+        if step.get("displayName") == "Build ddbc_bindings and mssql-py-core"
+    )
+    script = build["script"]
+    odbc_build = "python setup_odbc.py bdist_wheel --dist-dir odbc-dist"
+    editable_install = 'python -m pip install --no-deps -e "$MSSQL_PYTHON_DIR"'
+    assert odbc_build in script
+    assert "shopt -s nullglob" in script
+    assert 'if [ "${#ODBC_WHEELS[@]}" -ne 1 ]; then' in script
+    assert 'python -m pip install --no-deps "$ODBC_WHEEL"' in script
+    assert editable_install in script
+    assert script.index(odbc_build) < script.index(editable_install)
+
+
 def test_pin_validation_is_not_path_filtered_or_optional():
     pipeline = yaml.safe_load(
         (_ROOT / ".pipeline" / "validation-pipeline.yml").read_text(encoding="utf-8")
