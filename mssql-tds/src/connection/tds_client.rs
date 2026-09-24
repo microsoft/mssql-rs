@@ -1304,9 +1304,9 @@ impl TdsClient {
     /// `timeout_sec` is the overall budget for recovery **and** the subsequent
     /// execution, matching ODBC's `CheckOrRecoverConnection` (which deducts
     /// recovery time from the remaining command timeout). Charge the returned
-    /// duration back with [`deduct_timeout`](Self::deduct_timeout) so a
-    /// 30-second command timeout still means at most 30 seconds total whether
-    /// or not a reconnect occurred. When `timeout_sec` is `None` or `Some(0)`,
+    /// duration back with [`deduct_timeout`](Self::deduct_timeout) so recovery
+    /// and execution share the budget at whole-second precision.
+    /// When `timeout_sec` is `None` or `Some(0)`,
     /// recovery is instead bounded by the login `connect_timeout`, so it can
     /// never block indefinitely.
     ///
@@ -1425,7 +1425,7 @@ impl TdsClient {
         self.check_and_reconnect(timeout_sec, cancel_handle).await
     }
 
-    /// Charges elapsed recovery time against a command-timeout budget.
+    /// Charges whole elapsed seconds against a command-timeout budget.
     ///
     /// # Parameters
     /// - `timeout_sec`: remaining command budget in seconds; `None` means "no
@@ -1434,8 +1434,11 @@ impl TdsClient {
     ///
     /// `None` and caller-supplied `Some(0)` both represent an infinite budget.
     /// A positive timeout becomes [`CommandTimeoutBudget::Exhausted`] when
-    /// recovery consumes it, which must be rejected by `into_timeout` before a
+    /// elapsed time consumes it, which must be rejected by `into_timeout` before a
     /// request is serialized.
+    /// Truncate elapsed time so sub-second cleanup cannot exhaust a one-second
+    /// budget. Multi-step callers must pass the original budget and cumulative
+    /// elapsed time, limiting rounding slack to less than one second.
     pub(in crate::connection) fn deduct_timeout(
         timeout_sec: Option<u32>,
         elapsed: Duration,
@@ -1443,12 +1446,7 @@ impl TdsClient {
         let Some(timeout_sec) = timeout_sec.and_then(NonZeroU32::new) else {
             return CommandTimeoutBudget::None;
         };
-        let elapsed_secs = u32::try_from(
-            elapsed
-                .as_secs()
-                .saturating_add(u64::from(elapsed.subsec_nanos() > 0)),
-        )
-        .unwrap_or(u32::MAX);
+        let elapsed_secs = u32::try_from(elapsed.as_secs()).unwrap_or(u32::MAX);
 
         match NonZeroU32::new(timeout_sec.get().saturating_sub(elapsed_secs)) {
             Some(remaining) => CommandTimeoutBudget::Remaining(remaining),
@@ -3619,7 +3617,7 @@ impl TdsClient {
             self.prepared_handles.remove(&statement_id);
             self.prepared_param_encryption.remove(&statement_id);
             if serialize_result.is_err() && message.nothing_sent() {
-                // A cancelled write may have left a partial packet on the wire.
+                // An interrupted write may have left a partial packet on the wire.
                 self.retire_without_writing();
             }
         }
@@ -12191,13 +12189,34 @@ mod tests {
     }
 
     #[test]
-    fn deduct_timeout_rounds_up_sub_second() {
-        // 1.9 seconds elapsed should round up to 2 seconds deducted
-        let result = TdsClient::deduct_timeout(Some(30), Duration::from_millis(1900));
-        assert_eq!(
-            result,
-            CommandTimeoutBudget::Remaining(NonZeroU32::new(28).unwrap())
-        );
+    fn deduct_timeout_preserves_partial_seconds() {
+        for (timeout, elapsed, remaining) in [
+            (1, Duration::from_nanos(1), 1),
+            (1, Duration::from_millis(999), 1),
+            (30, Duration::from_millis(1900), 29),
+        ] {
+            let result = TdsClient::deduct_timeout(Some(timeout), elapsed);
+            assert_eq!(
+                result,
+                CommandTimeoutBudget::Remaining(NonZeroU32::new(remaining).unwrap())
+            );
+        }
+    }
+
+    #[test]
+    fn deduct_timeout_charges_cumulative_elapsed_time() {
+        for (elapsed, remaining) in [(600, Some(1)), (1200, None)] {
+            let result = TdsClient::deduct_timeout(Some(1), Duration::from_millis(elapsed));
+            match remaining {
+                Some(remaining) => {
+                    assert_eq!(result.into_timeout().unwrap().seconds(), Some(remaining));
+                }
+                None => assert!(matches!(
+                    result.into_timeout(),
+                    Err(crate::error::Error::TimeoutError(_))
+                )),
+            }
+        }
     }
 
     /// A reconnect that consumes the whole command budget must fail the call
@@ -15978,7 +15997,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn begin_execute_prepared_releases_each_orphan_before_a_cancellable_stream() {
+    async fn begin_execute_prepared_releases_each_orphan_with_one_second_timeout() {
         let tokens = (78..82)
             .flat_map(|handle| {
                 [
@@ -16007,13 +16026,17 @@ mod tests {
                     &mut statement,
                     vec![streamed_varbinary("@v")],
                     &mut orphaned,
-                    (),
+                    ExecuteOptions::new().timeout_secs(1),
                 )
                 .await
                 .unwrap();
             assert!(matches!(status, StreamedParamStatus::NeedData { .. }));
             assert!(orphaned.is_none());
             assert!(client.prepared_handles.is_empty());
+            match &client.streamed_write_state {
+                StreamedWriteState::Idle => panic!("expected a parked stream"),
+                StreamedWriteState::Active(state) => assert_eq!(state.timeout_sec, Some(1)),
+            }
 
             let release = sent.lock().unwrap()[offset..].to_vec();
             assert_eq!(
@@ -16356,7 +16379,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepared_batch_unsent_release_keeps_orphan_for_retry() {
+    async fn prepared_batch_unsent_release_keeps_orphan_for_retry_with_one_second_timeout() {
         for stream_results in [false, true] {
             let (mut client, sent) = create_capturing_client(vec![
                 done_no_more(),
@@ -16400,7 +16423,7 @@ mod tests {
                     &mut statement,
                     vec![Ok((0, Vec::new()))],
                     &mut orphaned,
-                    (),
+                    ExecuteOptions::new().timeout_secs(1),
                     stream_results,
                 )
                 .await

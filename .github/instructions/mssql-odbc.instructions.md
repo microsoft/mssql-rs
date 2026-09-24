@@ -377,6 +377,23 @@ does not grow every time a new msodbcsql build is measured.
     `01S07`. Build 173710 confirms both outcomes against retail msodbcsql
     18.6.2.1. Truncation after the first DAE parameter remains silent. Signed
     off by Theekshna Kotian on 2026-09-09. Tracked in AB#47946.
+15. **A superseded prepared handle is released before opening a data-at-execution
+    stream, and a release error fails that execute.** The source reference is
+    msodbcsql's `DropPrepHandle` (`Sql/Ntdbms/sqlncli/odbc/sqlcfunc.cpp`), which
+    defers the drop in `hPrepDropDeferred`; `BuildSPPrepExec` (`odbc/sqlccmd.cpp`)
+    passes that handle by reference on the next prepare, saving a round trip.
+    `ProcessDAEParam` clears the deferred slot only after `SendRPCFromStmt`
+    succeeds. This driver instead sends and drains a separate `sp_unprepare`
+    in `TdsClient::begin_execute_prepared` before parking the stream.
+    `execute.rs` propagates a release failure and restores any retained orphan.
+    Do not swallow that error and continue: `StmtState::pending_unprepare`
+    holds only one orphan, so preparing another handle while retaining the old
+    one can overflow that slot at the next rebind, recreating #598.
+    This is a source-verified policy difference, not a measured claim about a
+    retail driver's diagnostics or wire sequence; a build-specific reference
+    comparison remains outstanding. No parity test is skipped for it.
+    Recorded following automated review feedback on #599 (2026-09-22);
+    human parity sign-off has not been recorded. Tracked in #598.
 
 ## No panics
 
