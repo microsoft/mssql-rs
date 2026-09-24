@@ -2,6 +2,7 @@
 parameters:
   matrix: {}
   poolName: 'RUST-X64-WUS3'
+  poolImageOverride: 'imageOverride -equals RUST-AZL3'
 
 jobs:
   - job: Test_Matrix
@@ -11,7 +12,7 @@ jobs:
     pool:
       name: ${{ parameters.poolName }}
       demands:
-        - imageOverride -equals RUST-UBUSLIM
+        - ${{ parameters.poolImageOverride }}
     steps:
       - template: generate-sql-password-template.yml
         parameters:
@@ -19,7 +20,7 @@ jobs:
       - task: DockerInstaller@0
         inputs:
           dockerVersion: '29.0.0'
-      - template: install-ubuntu-dependency.yaml
+      - template: install-host-dependency.yaml
         parameters:
           installAzCli: false
       - task: DownloadPipelineArtifact@2

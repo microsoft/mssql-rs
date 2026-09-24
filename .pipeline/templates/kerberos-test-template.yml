@@ -36,7 +36,7 @@ parameters:
     default: 'RUST-X64-WUS3'
   - name: poolImageOverride
     type: string
-    default: 'imageOverride -equals RUST-UBUSLIM'
+    default: 'imageOverride -equals RUST-AZL3'
   - name: testTimeout
     type: number
     default: 60
@@ -80,7 +80,7 @@ jobs:
           docker compose version
         displayName: 'Install docker-compose plugin'
       
-      - template: install-ubuntu-dependency.yaml
+      - template: install-host-dependency.yaml
         parameters:
           installAzCli: false
           installDocker: true

@@ -48,7 +48,7 @@ steps:
     dockerVersion: '29.0.0'
   displayName: Install Docker
 
-- template: install-ubuntu-dependency.yaml
+- template: install-host-dependency.yaml
   parameters:
     installAzCli: false
     installDocker: true
