@@ -2439,8 +2439,13 @@ impl TdsClient {
                 // A partial value chunk is now on the wire, so this message can no
                 // longer be continued safely. Drop it and abort the streamed
                 // write rather than re-parking it as resumable.
+                let send_incomplete = message.send_incomplete();
                 drop(message);
-                self.abort_streamed_write().await;
+                if send_incomplete {
+                    self.retire_without_writing();
+                } else {
+                    self.abort_streamed_write().await;
+                }
                 Err(e)
             }
         }
@@ -2540,11 +2545,18 @@ impl TdsClient {
     /// discarded locally, part is withdrawn with `EOM | IGNORE`, and all of it is
     /// cancelled with an attention. Without this the server holds a truncated
     /// message and answers 4002 on the *next* command.
+    /// An interrupted packet write retires the transport without another write,
+    /// even if earlier packets completed: neither IGNORE nor TLS shutdown is safe.
     async fn retract_partial_request(&mut self, message: SuspendedMessage) {
         // Before anything that drains: a RETURNVALUE read with the capture still
         // armed would record a handle for a request that never ran.
         // `cancel_streamed_write` disarms up front for the same reason.
         self.abort_pending_prepare_capture();
+
+        if message.send_incomplete() {
+            self.retire_without_writing();
+            return;
+        }
 
         if message.nothing_sent() {
             // Not a plain drop: re-arm the RESETCONNECTION bit this message took.
@@ -2628,9 +2640,12 @@ impl TdsClient {
         // transport is retired without being written to again.
         let ignored =
             tokio::time::timeout(CANCEL_TIMEOUT, packet_writer.cancel_current_message()).await;
-        drop(packet_writer);
+        let message = packet_writer.suspend();
+        let send_incomplete = message.send_incomplete();
+        drop(message);
         match ignored {
             Ok(Ok(())) => {}
+            Ok(Err(error)) if send_incomplete => return Withdrawal::WriteAbandoned(error),
             Ok(Err(error)) => return Withdrawal::Failed(error),
             Err(_) => {
                 return Withdrawal::WriteAbandoned(crate::error::Error::TimeoutError(
@@ -3684,10 +3699,6 @@ impl TdsClient {
         if message.send_attempted() {
             self.prepared_handles.remove(&statement_id);
             self.prepared_param_encryption.remove(&statement_id);
-            if serialize_result.is_err() && message.nothing_sent() {
-                // An interrupted write may have left a partial packet on the wire.
-                self.retire_without_writing();
-            }
         }
         self.finish_send(serialize_result, message).await?;
 
@@ -8526,6 +8537,7 @@ mod tests {
     #[derive(Debug)]
     struct TestTransport {
         closed: bool,
+        close_calls: Arc<std::sync::atomic::AtomicUsize>,
         pending_tokens: VecDeque<Tokens>,
         reset_mode: ResetConnectionMode,
         /// Mirrors the production writer's dispatch record so client tests can
@@ -8551,6 +8563,7 @@ mod tests {
         cancel_after_send: Option<tokio_util::sync::CancellationToken>,
         cancel_on_writer_creation: Option<tokio_util::sync::CancellationToken>,
         cancel_during_send: Option<tokio_util::sync::CancellationToken>,
+        sends_before_cancel: usize,
         send_delay: Option<Duration>,
         /// Attentions requested, so a test can tell the cancel-a-sent-request
         /// path from the withdraw-a-partial-one path.
@@ -8572,6 +8585,7 @@ mod tests {
         fn new() -> Self {
             Self {
                 closed: false,
+                close_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 pending_tokens: VecDeque::new(),
                 reset_mode: ResetConnectionMode::None,
                 reset_dispatched: false,
@@ -8584,6 +8598,7 @@ mod tests {
                 cancel_after_send: None,
                 cancel_on_writer_creation: None,
                 cancel_during_send: None,
+                sends_before_cancel: 0,
                 send_delay: None,
                 attentions: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 known_dead: false,
@@ -8784,11 +8799,14 @@ mod tests {
             {
                 std::future::pending::<()>().await;
             }
-            if let Some(cancel) = self.cancel_during_send.take() {
+            if self.sends_before_cancel == 0
+                && let Some(cancel) = self.cancel_during_send.take()
+            {
                 self.sent.lock().unwrap().extend_from_slice(&data[..8]);
                 cancel.cancel();
                 std::future::pending::<()>().await;
             }
+            self.sends_before_cancel = self.sends_before_cancel.saturating_sub(1);
             self.sent.lock().unwrap().extend_from_slice(data);
             if let Some(cancel) = self.cancel_after_send.take() {
                 cancel.cancel();
@@ -8840,6 +8858,8 @@ mod tests {
             4096
         }
         async fn close_transport(&mut self) -> TdsResult<()> {
+            self.close_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.closed = true;
             Ok(())
         }
@@ -16282,6 +16302,150 @@ mod tests {
             &metadata
         ));
         assert!(!client.is_connection_dead());
+    }
+
+    #[tokio::test]
+    async fn prepared_stream_interrupted_send_retires_without_writing_again() {
+        use crate::security::describe_parameter_encryption::DescribeParameterEncryptionResult;
+
+        for (prior_packet, final_packet) in
+            [(false, true), (true, true), (false, false), (true, false)]
+        {
+            let cancel = CancelHandle::new();
+            let mut transport = TestTransport::with_tokens(vec![done_no_more()]);
+            transport.cancel_during_send = Some(cancel.cancel_token.clone());
+            transport.sends_before_cancel = usize::from(prior_packet);
+            let sent = Arc::clone(&transport.sent);
+            let attentions = Arc::clone(&transport.attentions);
+            let close_calls = Arc::clone(&transport.close_calls);
+            let mut client = create_test_client_with_transport(transport);
+            let id = client.issue_statement_id();
+            client.prepared_handles.insert(id, 77);
+            let metadata = Arc::new(DescribeParameterEncryptionResult::new());
+            client
+                .prepared_param_encryption
+                .insert(id, Arc::clone(&metadata));
+            let mut statement = PreparedStatement::new("SELECT @v");
+            let mut orphaned = Some(id);
+            client
+                .begin_execute_prepared(
+                    &mut statement,
+                    vec![streamed_varbinary("@v")],
+                    &mut orphaned,
+                    ExecuteOptions::new().cancel(&cancel),
+                )
+                .await
+                .unwrap();
+            if prior_packet {
+                client
+                    .write_streamed_chunk(&vec![0xAB; 4096])
+                    .await
+                    .unwrap();
+            }
+            let offset = sent.lock().unwrap().len();
+            assert_eq!(offset, if prior_packet { 4096 } else { 0 });
+            let error = tokio::time::timeout(Duration::from_secs(1), async {
+                if final_packet {
+                    client
+                        .end_execute_prepared_param(&mut statement, &mut orphaned)
+                        .await
+                        .map(|_| ())
+                } else {
+                    client.write_streamed_chunk(&vec![0xAB; 4096]).await
+                }
+            })
+            .await
+            .unwrap()
+            .unwrap_err();
+            assert!(matches!(
+                error,
+                crate::error::Error::OperationCancelledError(_)
+            ));
+            assert!(
+                client.is_connection_dead(),
+                "an interrupted packet cannot be retracted"
+            );
+            assert_eq!(
+                sent.lock().unwrap().len(),
+                offset + 8,
+                "no IGNORE after a partial packet"
+            );
+            assert_eq!(attentions.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert_eq!(
+                close_calls.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "TLS shutdown must not write after interruption"
+            );
+            assert!(statement.id().is_none());
+            assert_eq!(orphaned, Some(id));
+            assert_eq!(client.prepared_handles.get(&id), Some(&77));
+            assert!(Arc::ptr_eq(
+                client.prepared_param_encryption.get(&id).unwrap(),
+                &metadata
+            ));
+            assert!(client.pending_capture.is_none());
+            for _ in 0..2 {
+                client.cancel_streamed_write().await;
+                assert!(matches!(
+                    client.write_streamed_chunk(&[0xAB]).await,
+                    Err(UsageError(_))
+                ));
+                assert_eq!(sent.lock().unwrap().len(), offset + 8);
+                assert_eq!(close_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn prepared_stream_cancellation_between_packets_keeps_connection_reusable() {
+        use crate::message::messages::PacketStatusFlags;
+
+        let cancel = CancelHandle::new();
+        let mut transport = TestTransport::with_tokens(vec![done_no_more()]);
+        transport.cancel_after_send = Some(cancel.cancel_token.clone());
+        let sent = Arc::clone(&transport.sent);
+        let close_calls = Arc::clone(&transport.close_calls);
+        let mut client = create_test_client_with_transport(transport);
+        let id = client.issue_statement_id();
+        client.prepared_handles.insert(id, 77);
+        let mut statement = PreparedStatement::new("SELECT @v");
+        let mut orphaned = Some(id);
+        client
+            .begin_execute_prepared(
+                &mut statement,
+                vec![streamed_varbinary("@v")],
+                &mut orphaned,
+                ExecuteOptions::new().cancel(&cancel),
+            )
+            .await
+            .unwrap();
+        client
+            .write_streamed_chunk(&vec![0xAB; 4096])
+            .await
+            .unwrap();
+        assert_eq!(
+            sent.lock().unwrap().len(),
+            4096,
+            "exactly one packet completed"
+        );
+        assert!(cancel.cancel_token.is_cancelled());
+        assert!(matches!(
+            client
+                .end_execute_prepared_param(&mut statement, &mut orphaned)
+                .await,
+            Err(crate::error::Error::OperationCancelledError(_))
+        ));
+        assert!(!client.is_connection_dead());
+        assert_eq!(close_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(statement.id().is_none());
+        assert_eq!(orphaned, Some(id));
+        assert_eq!(client.prepared_handles.get(&id), Some(&77));
+        let wire = sent.lock().unwrap();
+        assert_eq!(wire.len(), 4096 + PacketWriter::PACKET_HEADER_SIZE);
+        assert_eq!(
+            wire[4097],
+            PacketStatusFlags::Eom as u8 | PacketStatusFlags::Ignore as u8
+        );
     }
 
     #[tokio::test]
