@@ -768,6 +768,39 @@ TEST_F(FetchScrollLiveTest, BoundNullIsReportedThroughTheIndicator) {
     SQLCloseCursor(stmt_);
 }
 
+TEST_F(FetchScrollUtf16Test, BoundNullPreservesSeparateOctetLength) {
+    for (const char* type : {"VARBINARY(8)", "VARBINARY(MAX)",
+                             "VARCHAR(8)", "NVARCHAR(MAX)"}) {
+        SCOPED_TRACE(type);
+        for (SQLSMALLINT target : {SQL_C_CHAR, SQL_C_WCHAR}) {
+            SCOPED_TRACE(target);
+            for (SQLLEN capacity : {0, 1, 2, 3, 32}) {
+                SCOPED_TRACE(capacity);
+                std::vector<unsigned char> buffer(32, 0x7E);
+                SQLLEN indicator = -99;
+                SQLLEN octet_length = -98;
+                ASSERT_EQ(SQL_SUCCESS, SQLBindCol(stmt_, 1, target, buffer.data(),
+                                                 capacity, &indicator));
+                SQLHDESC ard = SQL_NULL_HDESC;
+                ASSERT_EQ(SQL_SUCCESS, SQLGetStmtAttr(stmt_, SQL_ATTR_APP_ROW_DESC,
+                                                     &ard, 0, nullptr));
+                ASSERT_EQ(SQL_SUCCESS, SQLSetDescField(
+                    ard, 1, SQL_DESC_INDICATOR_PTR, &indicator, 0));
+                ASSERT_EQ(SQL_SUCCESS, SQLSetDescField(
+                    ard, 1, SQL_DESC_OCTET_LENGTH_PTR, &octet_length, 0));
+                ExecDirect("SELECT CAST(NULL AS " + std::string(type) + ")");
+                ASSERT_EQ(SQL_SUCCESS, SQLFetchScroll(stmt_, SQL_FETCH_NEXT, 0));
+                EXPECT_EQ(SQL_NULL_DATA, indicator);
+                EXPECT_EQ(-98, octet_length);
+                EXPECT_EQ(std::vector<unsigned char>(buffer.size(), 0x7E), buffer);
+                EXPECT_EQ("", StmtDiagState());
+                ASSERT_EQ(SQL_SUCCESS, SQLCloseCursor(stmt_));
+                ASSERT_EQ(SQL_SUCCESS, SQLFreeStmt(stmt_, SQL_UNBIND));
+            }
+        }
+    }
+}
+
 // A bound column gets one shot at a fixed buffer, so an over-long value is
 // truncated with 01004 and the indicator reports the untruncated length.
 TEST_F(FetchScrollLiveTest, BoundCharacterDataTruncatesWithInfo) {

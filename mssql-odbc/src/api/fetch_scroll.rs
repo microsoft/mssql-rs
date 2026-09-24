@@ -4959,6 +4959,8 @@ mod tests {
 
     #[test]
     fn null_preserves_character_slots_and_separate_octet_lengths() {
+        // Retail 18.6.2.1 / 18.06.0002: BoundNullPreservesSeparateOctetLength
+        // verifies the untouched length with split ARD pointers on Linux/unixODBC.
         for target in [SQL_C_CHAR, SQL_C_WCHAR] {
             for capacity in [0, 1, 2, 3, 32] {
                 let mut buffer = [0x7Eu8; 66];
