@@ -26,7 +26,7 @@ use crate::api::util::{
     write_if_some,
 };
 use crate::error::{free_errors, post_sql_error};
-use crate::handles::stmt::{ActivePlpStream, STMT_STATE_CURSOR_OPEN, StmtState};
+use crate::handles::stmt::{ActivePlpStream, CapturedPlpWire, STMT_STATE_CURSOR_OPEN, StmtState};
 use crate::handles::{HandleType, OdbcVersion, StmtHandle, handle_from_raw};
 use mssql_tds::connection::tds_client::{CursorColumn, CursorPoll, PlpChunk};
 use mssql_tds::core::TdsResult;
@@ -1183,11 +1183,7 @@ fn write_captured_column(
         // `SQLGetData(SQL_C_BINARY, NULL, 0)` with `SQL_SUCCESS_WITH_INFO` /
         // `01004` / indicator 9, while an empty `varbinary` answers
         // `SQL_SUCCESS` and reports `SQL_NO_DATA` on a repeat.
-        let offset = stmt_state
-            .partial_text_offset
-            .filter(|(column, _)| *column == col_index)
-            .map(|(_, offset)| offset)
-            .unwrap_or(0);
+        let offset = captured_binary_offset(stmt_state, col_index);
         let available = captured_column_bytes(stmt_state, col_index).map_or_else(
             || remaining_binary_length(value, offset),
             |bytes| SqlLen::try_from(bytes.len().saturating_sub(offset)).unwrap_or(SqlLen::MAX),
@@ -2423,7 +2419,11 @@ fn stream_active_plp_chunk_once<'a>(
                 EncodingType::Utf8,
             )),
         ));
-        state.captured_plp_wire = Some((col_index, std::mem::take(&mut progress.typed_wire)));
+        state.captured_plp_wire = Some(CapturedPlpWire {
+            column: col_index,
+            bytes: std::mem::take(&mut progress.typed_wire),
+            offset: 0,
+        });
         state.current_row_last_col = col_index - 1;
         state.partial_text_offset = None;
         let rc = write_captured_column(
@@ -3278,18 +3278,32 @@ pub(crate) fn column_value_to_bytes(value: &ColumnValues) -> Option<&[u8]> {
 }
 
 fn captured_column_bytes(stmt_state: &StmtState, col_index: usize) -> Option<&[u8]> {
-    if let Some((_, bytes)) = stmt_state
+    if let Some(wire) = stmt_state
         .captured_plp_wire
         .as_ref()
-        .filter(|(column, _)| *column == col_index)
+        .filter(|wire| wire.column == col_index)
     {
-        return Some(bytes);
+        return Some(&wire.bytes);
     }
     stmt_state
         .last_captured
         .as_ref()
         .filter(|(column, _)| *column == col_index)
         .and_then(|(_, value)| column_value_to_bytes(value))
+}
+
+fn captured_binary_offset(stmt_state: &StmtState, col_index: usize) -> usize {
+    if let Some(wire) = stmt_state
+        .captured_plp_wire
+        .as_ref()
+        .filter(|wire| wire.column == col_index)
+    {
+        return wire.offset;
+    }
+    stmt_state
+        .partial_text_offset
+        .filter(|(column, _)| *column == col_index)
+        .map_or(0, |(_, offset)| offset)
 }
 
 /// Byte count a value would occupy in its `SQL_C_BINARY` form, for the length
@@ -3358,12 +3372,7 @@ unsafe fn deliver_captured_binary(
         return SQL_ERROR;
     };
 
-    let offset = stmt_state
-        .partial_text_offset
-        .filter(|(c, _)| *c == col_index)
-        .map(|(_, o)| o)
-        .unwrap_or(0)
-        .min(bytes.len());
+    let offset = captured_binary_offset(stmt_state, col_index).min(bytes.len());
     let remaining = bytes.len() - offset;
     let capacity = usize::try_from(buffer_length).unwrap_or(0);
     let take = remaining.min(capacity);
@@ -3385,7 +3394,15 @@ unsafe fn deliver_captured_binary(
     };
 
     if take < remaining {
-        stmt_state.partial_text_offset = Some((col_index, offset + take));
+        if let Some(wire) = stmt_state
+            .captured_plp_wire
+            .as_mut()
+            .filter(|wire| wire.column == col_index)
+        {
+            wire.offset = offset + take;
+        } else {
+            stmt_state.partial_text_offset = Some((col_index, offset + take));
+        }
         stmt_state.direct_text_target = None;
         post_diag(stmt_state, WARN_STRING_TRUNCATION);
         return SQL_SUCCESS_WITH_INFO;
@@ -8538,6 +8555,136 @@ mod tests {
                 unsafe { crate::api::fetch::sql_fetch(handles.stmt) },
                 SQL_NO_DATA
             );
+        }
+    }
+
+    #[test]
+    fn typed_plp_retry_target_switches_keep_independent_offsets() {
+        let literal = "\u{e9}invalid";
+        for (encoding, narrow, wire) in [
+            (PlpEncoding::Utf16Text, None, utf16le(literal)),
+            (
+                PlpEncoding::SingleByteText,
+                Some(encoding_rs::WINDOWS_1252.into()),
+                b"\xe9invalid".to_vec(),
+            ),
+            (
+                PlpEncoding::Utf8Text,
+                Some(encoding_rs::UTF_8.into()),
+                literal.as_bytes().to_vec(),
+            ),
+        ] {
+            for text_target in [SQL_C_CHAR, SQL_C_WCHAR] {
+                let text = if text_target == SQL_C_WCHAR {
+                    utf16le(literal)
+                } else {
+                    literal.as_bytes().to_vec()
+                };
+                let unit = if text_target == SQL_C_WCHAR { 2 } else { 1 };
+                for binary_first in [false, true] {
+                    for finish_binary in [false, true] {
+                        let handles = TestHandles::with_env_dbc_stmt();
+                        prefetched_text_stream(&handles, encoding, narrow, wire.clone(), None);
+                        let mut value = -99_i32;
+                        let mut indicator = -99;
+                        assert_eq!(
+                            unsafe {
+                                crate::api::exports::SQLGetData(
+                                    handles.stmt,
+                                    1,
+                                    SQL_C_SLONG,
+                                    (&mut value as *mut i32).cast(),
+                                    0,
+                                    &mut indicator,
+                                )
+                            },
+                            SQL_ERROR
+                        );
+                        let mut binary_offset = 0;
+                        let mut text_offset = 0;
+                        for _ in 0..2 {
+                            for binary in [binary_first, !binary_first] {
+                                assert_eq!(
+                                    unsafe {
+                                        crate::api::exports::SQLGetData(
+                                            handles.stmt,
+                                            1,
+                                            SQL_C_BINARY,
+                                            std::ptr::null_mut(),
+                                            0,
+                                            &mut indicator,
+                                        )
+                                    },
+                                    SQL_SUCCESS_WITH_INFO
+                                );
+                                assert_eq!(indicator, (wire.len() - binary_offset) as SqlLen);
+                                let mut output = [0xcc; 8];
+                                let (target, capacity, take, offset, expected) = if binary {
+                                    (SQL_C_BINARY, 1, 1, &mut binary_offset, &wire)
+                                } else {
+                                    (text_target, 2 * unit, unit, &mut text_offset, &text)
+                                };
+                                assert_eq!(
+                                    unsafe {
+                                        crate::api::exports::SQLGetData(
+                                            handles.stmt,
+                                            1,
+                                            target,
+                                            output.as_mut_ptr().cast(),
+                                            capacity as SqlLen,
+                                            &mut indicator,
+                                        )
+                                    },
+                                    SQL_SUCCESS_WITH_INFO
+                                );
+                                assert_eq!(indicator, (expected.len() - *offset) as SqlLen);
+                                assert_eq!(&output[..take], &expected[*offset..*offset + take]);
+                                if !binary {
+                                    assert!(output[take..capacity].iter().all(|b| *b == 0));
+                                }
+                                assert!(output[capacity..].iter().all(|b| *b == 0xcc));
+                                *offset += take;
+                            }
+                        }
+                        let (target, expected) = if finish_binary {
+                            (SQL_C_BINARY, &wire[binary_offset..])
+                        } else {
+                            (text_target, &text[text_offset..])
+                        };
+                        let mut output = [0xcc; 64];
+                        assert_eq!(
+                            unsafe {
+                                crate::api::exports::SQLGetData(
+                                    handles.stmt,
+                                    1,
+                                    target,
+                                    output.as_mut_ptr().cast(),
+                                    64,
+                                    &mut indicator,
+                                )
+                            },
+                            SQL_SUCCESS
+                        );
+                        assert_eq!(indicator, expected.len() as SqlLen);
+                        assert_eq!(&output[..expected.len()], expected);
+                        assert_eq!(
+                            unsafe {
+                                crate::api::exports::SQLGetData(
+                                    handles.stmt,
+                                    1,
+                                    SQL_C_BINARY,
+                                    std::ptr::null_mut(),
+                                    0,
+                                    &mut indicator,
+                                )
+                            },
+                            SQL_NO_DATA
+                        );
+                        let stmt = unsafe { handle_from_raw::<StmtHandle>(handles.stmt) };
+                        assert!(stmt.inner.lock().unwrap().captured_plp_wire.is_none());
+                    }
+                }
+            }
         }
     }
 

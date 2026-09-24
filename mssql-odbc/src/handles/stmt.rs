@@ -100,6 +100,14 @@ pub(crate) struct BufferedGetDataRow {
     pub(crate) wire_deferred: bool,
 }
 
+#[derive(Debug)]
+pub(crate) struct CapturedPlpWire {
+    pub(crate) column: usize,
+    pub(crate) bytes: Vec<u8>,
+    /// Wire-byte position, independent of the decoded text's offset.
+    pub(crate) offset: usize,
+}
+
 impl ActivePlpStream {
     /// Opens a stream for `column`. Every carry field starts empty, so a call
     /// site names only what identifies the stream — and a carry field added
@@ -494,7 +502,7 @@ pub(crate) struct StmtState {
     pub(crate) last_captured: Option<(usize, ColumnValues)>,
     /// Original unread wire bytes for binary retries of a typed PLP conversion.
     /// `last_captured` separately retains decoded text, including character carry.
-    pub(crate) captured_plp_wire: Option<(usize, Vec<u8>)>,
+    pub(crate) captured_plp_wire: Option<CapturedPlpWire>,
     /// Complete non-PLP row captured by SQLFetch for subsequent SQLGetData calls.
     pub(crate) buffered_get_data_row: Option<BufferedGetDataRow>,
     /// Emptied row storage retained across fetches to avoid per-row allocations.
