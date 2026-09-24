@@ -769,8 +769,8 @@ TEST_F(FetchScrollLiveTest, BoundNullIsReportedThroughTheIndicator) {
 }
 
 TEST_F(FetchScrollUtf16Test, BoundNullPreservesSeparateOctetLength) {
-    for (const char* type : {"VARBINARY(8)", "VARBINARY(MAX)",
-                             "VARCHAR(8)", "NVARCHAR(MAX)"}) {
+    for (const char* type : {"BINARY(3)", "CHAR(8)", "VARBINARY(8)",
+                             "VARBINARY(MAX)", "VARCHAR(8)", "NVARCHAR(MAX)"}) {
         SCOPED_TRACE(type);
         for (SQLSMALLINT target : {SQL_C_CHAR, SQL_C_WCHAR}) {
             SCOPED_TRACE(target);
