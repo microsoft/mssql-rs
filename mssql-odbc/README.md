@@ -229,6 +229,16 @@ but returning row N can now wait on row N+1's header arriving. See
 `release_busy_if_row_exhausted` in `src/api/exec_common.rs` for the full
 trade-off and why it was accepted as-is.
 
+`SQLExecDirect`/`SQLExecute` also release the claim when their first-row peek
+finds an empty result and the batch is complete (AB#47814). The empty cursor
+and its metadata stay available: `SQLFetch` returns `SQL_NO_DATA` without
+touching a second statement's results. Protocol-only RPC completion tokens
+are consumed before release, with output values retained until
+`SQLMoreResults`; a later application-visible result keeps the connection busy.
+For an empty RPC result, the completion check may wait for the next response
+token under the request's remaining timeout; an expiry is reported by
+`SQLExecDirect`/`SQLExecute`, before the application calls `SQLMoreResults`.
+
 ## Bound fetch performance
 
 Bound fetches borrow their per-fetch descriptor snapshot rather than copying a
