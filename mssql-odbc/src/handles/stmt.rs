@@ -492,6 +492,9 @@ pub(crate) struct StmtState {
     pub(crate) row_positioned: bool,
     /// The column value captured by the most recent resume_row_to_column call, with its 1-based column index.
     pub(crate) last_captured: Option<(usize, ColumnValues)>,
+    /// Original unread wire bytes for binary retries of a typed PLP conversion.
+    /// `last_captured` separately retains decoded text, including character carry.
+    pub(crate) captured_plp_wire: Option<(usize, Vec<u8>)>,
     /// Complete non-PLP row captured by SQLFetch for subsequent SQLGetData calls.
     pub(crate) buffered_get_data_row: Option<BufferedGetDataRow>,
     /// Emptied row storage retained across fetches to avoid per-row allocations.
@@ -1388,6 +1391,7 @@ impl StmtState {
     pub(crate) fn reset_row_stream(&mut self) {
         self.row_positioned = false;
         self.last_captured = None;
+        self.captured_plp_wire = None;
         self.buffered_get_data_row = None;
         self.last_variant_base = None;
         self.row_exhausted = false;
@@ -1563,6 +1567,7 @@ impl StmtHandle {
                 parameter_array: None,
                 row_positioned: false,
                 last_captured: None,
+                captured_plp_wire: None,
                 buffered_get_data_row: None,
                 spare_get_data_row: None,
                 last_variant_base: None,
