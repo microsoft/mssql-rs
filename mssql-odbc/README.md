@@ -205,6 +205,9 @@ Switching decoded-text targets or retrying a typed conversion uses only the
 unread suffix, with offsets interpreted in the preceding character target's
 encoding. Partially delivered characters remain malformed for typed conversions,
 but their remaining bytes/code units can still be read in the same encoding.
+Character recovery caches the target encoding once on entry or a target switch;
+successive small WCHAR/CHAR reads reuse that rendering rather than reconverting
+the whole retained value.
 The raw retry buffer is bounded by the same source-data cap.
 Empty character values retrieved as numeric or GUID C targets succeed with
 indicator 0 and leave the value buffer unchanged, matching msodbcsql18. Empty
