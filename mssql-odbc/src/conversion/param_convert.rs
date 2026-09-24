@@ -1354,11 +1354,12 @@ fn variant_column_size(column_size: usize, sql_type: SqlSmallInt) -> usize {
 /// Builds `decimal`/`numeric` from a character buffer using the shared literal
 /// parser, but rejects exponent underflow on every platform.
 ///
-/// Plain literals drop excess zero digits and report `22001` for nonzero ones;
-/// unlike `DecimalParts::from_string`, an excess input scale alone is not an
-/// error. The reference uses `ConvertToNumeric`/`stringtonumeric`
-/// (`sqlccnvt.cpp:7101`); the integer target's `CharToBigint` digit walk does not
-/// establish this path's truncation behavior.
+/// Unlike `DecimalParts::from_string`, an excess input scale alone is not an
+/// error. `ConvertToNumeric` calls `stringtonumeric` (`sqlccnvt.cpp:7101`), which
+/// strips insignificant fractional zeros via `FindSigNumber` (:8389, :7995-8008)
+/// before reporting `CVT_FRACT_TRUNC` for excess scale (:8433-8437).
+/// `ParamToSQLType` maps that warning to `22001` for ODBC 3.x character input
+/// (`sqlcfunc.cpp:3350-3370`).
 fn decimal_from_text(param: &BoundParam, text: AppText) -> Result<TypedValue, ParamBuildError> {
     let metadata = decimal_metadata(param.column_size, param.decimal_digits)?;
     let (precision, scale) = (metadata.precision.unwrap_or(0), metadata.scale.unwrap_or(0));
@@ -1391,8 +1392,10 @@ fn decimal_from_text(param: &BoundParam, text: AppText) -> Result<TypedValue, Pa
         }
     };
 
-    // Preserve the character path's truncation-before-overflow precedence.
-    // decimal_from_numeric does not use this early return.
+    // Keep the existing Rust truncation-before-overflow ordering, not a parity claim.
+    // ParamToSQLType rewrites fractional truncation to 22001 for ODBC 3.x
+    // character input, but not SQL_C_NUMERIC (sqlcfunc.cpp:3350-3370), hence
+    // decimal_from_numeric does not use this character-only early return.
     let (scaled, outcome) = rescale_mantissa(mantissa, i64::from(source_scale), scale)?;
     if outcome == ConvOk::Truncated {
         return Err(ParamBuildError::StringTruncation);
@@ -2454,12 +2457,8 @@ mod tests {
         assert!(convert_decimal(SQL_DECIMAL, 38, 1, &trailing_zeros).is_ok());
     }
 
-    /// A dropped fractional digit is `22001` even when the truncated result
-    /// would also overflow `precision`: `sqlccnvt.cpp:7823` sets
-    /// `CVT_FRACT_TRUNC` and returns immediately, never reaching the
-    /// whole-number overflow check below it. `"1234.55"` into `decimal(3,1)`
-    /// drops the trailing `5` (non-zero) before the rescaled `1234.5` ever
-    /// gets compared against `10^3`.
+    /// Pins the existing Rust error precedence, not reference parity:
+    /// a dropped fraction wins over whole-number overflow.
     #[test]
     fn a_dropped_fraction_is_22001_even_when_the_result_also_overflows() {
         let err = convert_decimal(SQL_DECIMAL, 3, 1, "1234.55").unwrap_err();
@@ -2579,8 +2578,8 @@ mod tests {
         );
     }
 
-    /// Unlike `DecimalParts::from_string`, plain literals can discard excess
-    /// zero digits without rejecting the input scale.
+    /// Pins the zero-stripping and scale-check behavior cited in
+    /// [`decimal_from_text`], unlike `DecimalParts::from_string`'s scale rejection.
     #[test]
     fn a_decimal_fraction_past_the_scale_is_dropped_only_when_zero() {
         let (value, _) = convert_decimal(SQL_DECIMAL, 5, 1, "1.50").unwrap();

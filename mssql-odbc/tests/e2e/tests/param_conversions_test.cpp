@@ -952,9 +952,10 @@ TEST_F(ScalarConversionLiveTest, DecimalParamUsesTheDeclaredPrecisionAndScale) {
     EXPECT_EQ("-12.34", ExecuteAndReadBack());
 }
 
-// Digits past the declared scale are dropped when zero and are 22001 when not -
-// `if (c != '0') Error = CVT_FRACT_TRUNC` (sqlccnvt.cpp:7823), rewritten to
-// IDS_22_001 inbound (sqlcfunc.cpp:3348).
+// stringtonumeric strips fractional zeros through FindSigNumber
+// (sqlccnvt.cpp:8389, :7995-8008), then flags excess scale (:8433-8437).
+// ParamToSQLType maps that warning to 22001 for ODBC 3.x character input
+// (sqlcfunc.cpp:3350-3370). Measured on Linux Driver 18.6.2.1 (18.06.0002).
 TEST_F(ScalarConversionLiveTest, DecimalFractionPastTheScaleIsDroppedOnlyWhenZero) {
     ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(64), ?)"), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(BindNarrow(SQL_DECIMAL, "1.50", 5, 1), SQL_HANDLE_STMT, stmt_);
