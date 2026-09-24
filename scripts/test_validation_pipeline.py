@@ -4,6 +4,8 @@
 """Regression tests for validation pipeline builds, tests, and artifacts."""
 
 import re
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -115,13 +117,14 @@ def test_cross_repo_jobs_share_the_pinned_checkout(template):
     assert "mssql-python-branch" not in text
 
 
-def test_mssql_python_macos_failures_fail_the_job():
+def test_mssql_python_macos_failures_are_advisory_only_in_ci():
     steps = load_template("test-mssql-python-macos-template.yml")["steps"]
     run = next(step for step in steps if step.get("displayName") == "Run mssql-python tests")
     assert "continueOnError" not in run
+    assert "task.complete result=SucceededWithIssues" in run["script"]
     publish = next(step for step in steps if step.get("task") == "PublishTestResults@2")
     assert publish["condition"] == "succeededOrFailed()"
-    assert publish["inputs"]["failTaskOnFailedTests"] is True
+    assert publish["inputs"]["failTaskOnFailedTests"] is False
     assert publish["inputs"]["failTaskOnMissingResultsFile"] is True
 
 
@@ -135,10 +138,11 @@ def test_pin_validation_is_not_path_filtered_or_optional():
     stage = next(stage for stage in stages if stage["stage"] == "Build_mssql_python")
     assert stage["dependsOn"] == ["EvaluateDuplicate"]
     assert stage["condition"] == (
-        "and(not(canceled()), eq(variables['Build.Reason'], 'PullRequest'), "
+        "and(not(canceled()), "
         "eq('${{ parameters.RunFuzz }}', 'false'), "
         "eq('${{ parameters.RunLongHaul }}', 'false'), "
-        "ne(dependencies.EvaluateDuplicate.outputs['Evaluate.SetDuplicateState.skipDuplicate'], 'true'))"
+        "or(ne(variables['Build.Reason'], 'PullRequest'), "
+        "ne(dependencies.EvaluateDuplicate.outputs['Evaluate.SetDuplicateState.skipDuplicate'], 'true')))"
     )
     for job in stage["jobs"]:
         assert "condition" not in job
@@ -166,7 +170,7 @@ def test_alpine_gssapi_compilation_still_runs_on_prs():
     assert "--features gssapi" in script
 
 
-def test_mssql_python_odbc_failures_fail_the_job():
+def test_mssql_python_odbc_failures_are_advisory_only_in_ci():
     template_path = _TEMPLATES / "test-mssql-python-odbc-template.yml"
     template = template_path.read_text(encoding="utf-8")
     steps = yaml.safe_load(template)["steps"]
@@ -177,8 +181,9 @@ def test_mssql_python_odbc_failures_fail_the_job():
     )
     assert "continueOnError" not in test_step
     assert 'exit "$rc"' in test_step["script"]
-    assert "task.complete result=SucceededWithIssues" not in test_step["script"]
-    assert "SucceededWithIssues" not in template
+    assert "task.complete result=SucceededWithIssues" in test_step["script"]
+    publish = next(step for step in steps if step.get("task") == "PublishTestResults@2")
+    assert publish["inputs"]["failTaskOnFailedTests"] is False
 
     # A docker-exec launch failure (125/126/127), or the runner's own exit 2
     # for a broken harness, both mean the tests said nothing about the driver,
@@ -188,8 +193,7 @@ def test_mssql_python_odbc_failures_fail_the_job():
     assert re.search(r"125\|126\|127\)", test_step["script"])
     assert "exit \"$rc\"" in test_step["script"].rsplit("esac", 1)[-1]
 
-    # The step alone isn't the whole gate: a job-level continueOnError would
-    # silently restore the old non-blocking behavior regardless of exit code.
+    # Harness failures must not be masked by a job-level continueOnError.
     stages = yaml.safe_load(
         (_TEMPLATES / "validation-stages.yml").read_text(encoding="utf-8")
     )["stages"]
@@ -209,6 +213,82 @@ def test_mssql_python_odbc_failures_fail_the_job():
     dirty_run_parts = runner.split('if [ "$failed" -gt 0 ]', 1)
     assert len(dirty_run_parts) == 2, "dirty-run guard line not found in runner script"
     assert re.search(r"\bexit 1\b", dirty_run_parts[1])
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="Bash is required")
+@pytest.mark.parametrize(
+    ("pytest_exit", "runner_exit"),
+    [(0, 0), (1, 1), (2, 1), (3, 2), (4, 2), (5, 0),
+     (124, 1), (125, 2), (126, 2), (127, 2), (137, 1), (139, 1)],
+)
+def test_odbc_runner_distinguishes_harness_errors(tmp_path, pytest_exit, runner_exit):
+    tests = tmp_path / "tests"
+    tests.mkdir()
+    (tests / "test_pass.py").touch()
+    (tests / "test_result.py").touch()
+    runner = _ROOT / ".pipeline" / "scripts" / "run-mssql-python-odbc-tests.sh"
+    script = f"""
+    python() {{ return 0; }}
+    timeout() {{
+        for arg in "$@"; do
+            case "$arg" in
+                tests/test_pass.py) return 0 ;;
+                tests/test_result.py) return {pytest_exit} ;;
+            esac
+        done
+        echo "Unexpected timeout arguments: $*" >&2
+        return 125
+    }}
+    MSSQL_PYTHON_DIR="$2" TEST_RESULTS_DIR="$2/test-results" \
+        PYTEST_FILE_TIMEOUT=10s PYTEST_TOTAL_BUDGET=120s source "$1"
+    """
+    script_path = tmp_path / "run-test.sh"
+    script_path.write_text(script, encoding="utf-8", newline="\n")
+    result = subprocess.run(
+        ["bash", script_path.as_posix(), runner.as_posix(), tmp_path.as_posix()],
+        capture_output=True, text=True,
+    )
+    assert result.returncode == runner_exit, result.stdout + result.stderr
+    assert "Unexpected timeout arguments" not in result.stderr
+    assert f"passed: {2 if pytest_exit == 0 else 1} |" in result.stdout
+    assert f"harness errors: {int(runner_exit == 2)}" in result.stdout
+    assert len(list((tmp_path / "test-results").glob("*.xml"))) == 2
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="Bash is required")
+@pytest.mark.parametrize(
+    ("template", "display_name", "command"),
+    [
+        ("test-mssql-python-macos-template.yml", "Run mssql-python tests", "pytest"),
+        (
+            "test-mssql-python-odbc-template.yml",
+            "Run mssql-python tests against mssql-odbc",
+            "docker",
+        ),
+    ],
+)
+@pytest.mark.parametrize("exit_code", [0, 1, 2, 3, 4, 5, 125, 126, 127, 137])
+@pytest.mark.parametrize("reason", ["PullRequest", "IndividualCI", "BatchedCI", "Manual", "Schedule", ""])
+def test_python_pipeline_test_exit_codes(tmp_path, template, display_name, command, exit_code, reason):
+    step = next(
+        step for step in load_template(template)["steps"]
+        if step.get("displayName") == display_name
+    )
+    script = step["script"].replace("$(Build.SourcesDirectory)", "/workspace")
+    script = re.sub(r"\$\{\{.*?\}\}", "10m", script)
+    script_path = tmp_path / "run-step.sh"
+    script_path.write_text(
+        f"BUILD_REASON='{reason}'\n{command}() {{ return {exit_code}; }}\n{script}",
+        encoding="utf-8", newline="\n",
+    )
+    result = subprocess.run(
+        ["bash", script_path.as_posix()],
+        capture_output=True, text=True,
+    )
+    advisory = exit_code == 1 and reason not in ("PullRequest", "")
+    assert result.returncode == (0 if advisory else exit_code), result.stderr
+    assert ("task.logissue type=warning" in result.stdout) == advisory
+    assert ("task.complete result=SucceededWithIssues;" in result.stdout) == advisory
 
 
 @pytest.mark.parametrize("architecture", ["x64", "ARM64"])

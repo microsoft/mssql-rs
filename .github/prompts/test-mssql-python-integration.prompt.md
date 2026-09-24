@@ -24,8 +24,8 @@ If missing:
 bash .pipeline/scripts/clone-mssql-python.sh
 ```
 
-Run from the mssql-rs repository root. This reproduces CI's approved commit
-from `.pipeline/mssql-python-revision.txt`, not floating upstream main.
+Run from the mssql-rs repository root. Local and PR runs use the full commit SHA
+in `.pipeline/mssql-python-revision.txt`. Non-PR CI follows upstream `main`.
 An existing sibling checkout is an explicit local developer choice.
 
 ### 2. SQL Server Running
@@ -215,9 +215,11 @@ tests and the mssql-odbc driver-swap compatibility job remain enabled.
 ### 3. Merge order
 
 1. **First:** Merge mssql-python PR (so `main` has the changes)
-2. **Then:** Update `.pipeline/mssql-python-revision.txt` in the mssql-rs PR to
-   the required full upstream commit SHA and pass both cross-repo jobs before
-   merging. PR-description branch overrides are not supported.
+2. **Then:** Update `.pipeline/mssql-python-revision.txt` to the required full
+   upstream commit SHA and pass both cross-repo jobs in the mssql-rs PR.
+   Non-PR CI follows `main` with advisory test failures; PR test failures block.
+   Checkout, build, and harness failures block in both modes.
+   PR-description branch overrides are not supported.
 
 ---
 

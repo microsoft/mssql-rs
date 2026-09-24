@@ -164,6 +164,36 @@ TEST_F(OutputParamsTest, IndicatorOnlyOutputBinding) {
     EXPECT_EQ(SQL_NULL_DATA, length);
 }
 
+TEST_F(OutputParamsTest, NullOutputsPreserveCharacterBuffers) {
+    struct Source {
+        const char* name;
+        SQLSMALLINT type;
+    };
+    for (const auto& source : {Source{"VARCHAR(8)", SQL_VARCHAR},
+                               Source{"NVARCHAR(8)", SQL_WVARCHAR}}) {
+        SCOPED_TRACE(source.name);
+        ExecDirect("CREATE PROCEDURE #null_outputs @v " + std::string(source.name) +
+                   " OUTPUT AS SET NOCOUNT ON; SET @v=NULL");
+        for (SQLSMALLINT target : {SQL_C_CHAR, SQL_C_WCHAR}) {
+            SCOPED_TRACE(target);
+            std::array<unsigned char, 32> buffer;
+            buffer.fill(0x7E);
+            const auto untouched = buffer;
+            SQLLEN indicator = -99;
+            ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_OUTPUT, target,
+                                          source.type, 8, 0, buffer.data(),
+                                          buffer.size(), &indicator),
+                          SQL_HANDLE_STMT, stmt_);
+            EXPECT_EQ(SQL_NO_DATA, Exhaust(Direct("{call #null_outputs(?)}")));
+            EXPECT_EQ(SQL_NULL_DATA, indicator);
+            EXPECT_EQ(untouched, buffer);
+            ASSERT_EQ(SQL_SUCCESS, SQLFreeStmt(stmt_, SQL_RESET_PARAMS));
+            ASSERT_EQ(SQL_SUCCESS, SQLFreeStmt(stmt_, SQL_CLOSE));
+        }
+        ExecDirect("DROP PROCEDURE #null_outputs");
+    }
+}
+
 TEST_F(OutputParamsTest, IndicatorOnlyCharacterOutputIgnoresBufferLength) {
     ExecDirect("CREATE PROCEDURE #indicator @v varchar(8) OUTPUT AS SET NOCOUNT ON; SET @v='hello'");
     SQLLEN length = -2;
