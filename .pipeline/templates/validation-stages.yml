@@ -754,7 +754,7 @@ stages:
 - stage: Build_mssql_python
   dependsOn:
     - EvaluateDuplicate
-  condition: and(not(canceled()), eq(variables['Build.Reason'], 'PullRequest'), eq('${{ parameters.RunFuzz }}', 'false'), eq('${{ parameters.RunLongHaul }}', 'false'), ne(dependencies.EvaluateDuplicate.outputs['Evaluate.SetDuplicateState.skipDuplicate'], 'true'))
+  condition: and(not(canceled()), eq('${{ parameters.RunFuzz }}', 'false'), eq('${{ parameters.RunLongHaul }}', 'false'), or(ne(variables['Build.Reason'], 'PullRequest'), ne(dependencies.EvaluateDuplicate.outputs['Evaluate.SetDuplicateState.skipDuplicate'], 'true')))
   displayName: Build mssql-python
   jobs:
   - job: Build_mssql_python_MacOS
@@ -768,8 +768,9 @@ stages:
       - template: test-mssql-python-macos-template.yml
 
   # Same upstream suite, but with mssql-python's bundled msodbcsql18 binary
-  # replaced by the Rust mssql-odbc driver. Test failures, crashes, and harness
-  # failures fail the job; each test file runs in its own bounded process so the
+  # replaced by the Rust mssql-odbc driver. PRs use a pinned SHA and block on test
+  # failures; non-PR CI follows main and warns. Harness failures block in both modes.
+  # Each test file runs in its own bounded process so the
   # remaining results can still be published for diagnosis.
   #
   # Deliberately always-on rather than behind an opt-in parameter like RunFuzz /
