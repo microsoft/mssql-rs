@@ -62,7 +62,14 @@ steps:
     cd "$MSSQL_PYTHON_DIR"
     rm -rf odbc-dist/
     python setup_odbc.py bdist_wheel --dist-dir odbc-dist
+  displayName: 'Build ddbc_bindings and mssql-py-core'
+  env:
+    CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN)
+    CARGO_REGISTRIES_MSSQL_RS_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_TOKEN)
 
+- script: |
+    set -euo pipefail
+    MSSQL_PYTHON_DIR="$(Build.SourcesDirectory)/../mssql-python"
     shopt -s nullglob
     ODBC_WHEELS=("$MSSQL_PYTHON_DIR"/odbc-dist/mssql_python_odbc-*.whl)
     if [ "${#ODBC_WHEELS[@]}" -ne 1 ]; then
@@ -74,10 +81,7 @@ steps:
     # PR/local runs use the pinned SHA; non-PR runs follow upstream main.
     # Preserve both job-owned native wheels instead of resolving release pins.
     python -m pip install --no-deps -e "$MSSQL_PYTHON_DIR"
-  displayName: 'Build ddbc_bindings and mssql-py-core'
-  env:
-    CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN)
-    CARGO_REGISTRIES_MSSQL_RS_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_TOKEN)
+  displayName: 'Install mssql-python packages'
 
 - script: |
     set -euo pipefail

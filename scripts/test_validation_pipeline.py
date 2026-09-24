@@ -126,6 +126,34 @@ def test_cross_repo_jobs_share_the_pinned_checkout(template):
     assert "mssql-python-branch" not in text
 
 
+@pytest.mark.skipif(_BASH is None, reason="Bash is required")
+@pytest.mark.parametrize("count", [0, 1, 2])
+def test_odbc_wheel_installation(tmp_path, count):
+    steps = load_template("test-mssql-python-macos-template.yml")["steps"]
+    script = next(step["script"] for step in steps if step.get("displayName") == "Install mssql-python packages")
+    source = tmp_path / "rust"
+    source.mkdir()
+    wheels = tmp_path / "mssql-python" / "odbc-dist"
+    wheels.mkdir(parents=True)
+    for index in range(count):
+        (wheels / f"mssql_python_odbc-{index}.whl").touch()
+    result = subprocess.run(
+        [_BASH, "-s"], cwd=source, capture_output=True, text=True,
+        input='python() { printf "%s\\t" "$@"; printf "\\n"; }\n'
+        + script.replace("$(Build.SourcesDirectory)", "$PWD"),
+    )
+    assert result.returncode == (0 if count == 1 else 1), result.stdout + result.stderr
+    if count == 1:
+        installs = [line.split("\t")[:-1] for line in result.stdout.splitlines()]
+        assert len(installs) == 2
+        assert installs[0][:4] == ["-m", "pip", "install", "--no-deps"]
+        assert installs[0][4].endswith("mssql_python_odbc-0.whl")
+        assert installs[1][:5] == ["-m", "pip", "install", "--no-deps", "-e"]
+    else:
+        assert f"Expected exactly one mssql-python-odbc wheel, found {count}" in result.stdout
+        assert "\t" not in result.stdout
+
+
 @pytest.fixture
 def installed_runtime(tmp_path, monkeypatch):
     driver = tmp_path / "driver.dylib"
