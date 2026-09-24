@@ -1351,15 +1351,14 @@ fn variant_column_size(column_size: usize, sql_type: SqlSmallInt) -> usize {
     }
 }
 
-/// Builds `decimal`/`numeric` from a character buffer, reusing the fetch
-/// direction's literal parser so both directions accept exactly the same forms.
+/// Builds `decimal`/`numeric` from a character buffer using the shared literal
+/// parser, but rejects exponent underflow on every platform.
 ///
-/// Rescaling follows msodbcsql rather than `DecimalParts::from_string`, which
-/// rejects *any* input scale past the target. msodbcsql drops the excess digits
-/// and only errors when one of them is non-zero - `if (c != '0') Error =
-/// CVT_FRACT_TRUNC` (`sqlccnvt.cpp:7823`) - and `ParamToSQLType` rewrites that
-/// warning to `22001` for a non-2.x application (`sqlcfunc.cpp:3348`). So
-/// `"1.50"` into `decimal(5,1)` is `1.5`, and `"1.55"` is `22001`.
+/// Plain literals drop excess zero digits and report `22001` for nonzero ones;
+/// unlike `DecimalParts::from_string`, an excess input scale alone is not an
+/// error. The reference uses `ConvertToNumeric`/`stringtonumeric`
+/// (`sqlccnvt.cpp:7101`); the integer target's `CharToBigint` digit walk does not
+/// establish this path's truncation behavior.
 fn decimal_from_text(param: &BoundParam, text: AppText) -> Result<TypedValue, ParamBuildError> {
     let metadata = decimal_metadata(param.column_size, param.decimal_digits)?;
     let (precision, scale) = (metadata.precision.unwrap_or(0), metadata.scale.unwrap_or(0));
@@ -1382,8 +1381,9 @@ fn decimal_from_text(param: &BoundParam, text: AppText) -> Result<TypedValue, Pa
         }
         // Our parser represents exponent literals as f64. The reference uses
         // ConvertToNumeric/stringtonumeric (sqlccnvt.cpp:7101), not the integer
-        // target's CharToDouble path (:5118). Keep this existing approximation;
-        // matching underflow errors does not establish general rounding parity.
+        // target's CharToDouble path (:5118). This existing approximation rounds
+        // excess fractional digits instead of reporting 22001 as plain literals
+        // do. That spelling-dependent behavior is outside this underflow fix.
         NumericSource::Float(approx) => {
             let value = DecimalParts::from_f64(approx, precision, scale)
                 .map_err(|_| ParamBuildError::Value(ConvError::OutOfRange))?;
@@ -1391,14 +1391,8 @@ fn decimal_from_text(param: &BoundParam, text: AppText) -> Result<TypedValue, Pa
         }
     };
 
-    // Truncation is checked before the precision/magnitude bound below, not
-    // after: `sqlccnvt.cpp:7823` sets `CVT_FRACT_TRUNC` and returns without
-    // ever reaching the whole-number overflow check, so a dropped fractional
-    // digit is always `22001` here, even when the truncated result would also
-    // overflow `precision`. `decimal_from_numeric` does not get this early
-    // return - its source is `SQL_C_NUMERIC`, not `SQL_C_CHAR`/`SQL_C_WCHAR`,
-    // so `CVT_FRACT_TRUNC` is never rewritten to `22001` for it
-    // (`sqlcfunc.cpp:3348`) and the overflow check applies unconditionally.
+    // Preserve the character path's truncation-before-overflow precedence.
+    // decimal_from_numeric does not use this early return.
     let (scaled, outcome) = rescale_mantissa(mantissa, i64::from(source_scale), scale)?;
     if outcome == ConvOk::Truncated {
         return Err(ParamBuildError::StringTruncation);
@@ -2585,11 +2579,8 @@ mod tests {
         );
     }
 
-    /// The excess-fraction rule is msodbcsql's, not `DecimalParts::from_string`'s:
-    /// digits past the declared scale are dropped when they are zero and are
-    /// `22001` when they are not - `if (c != '0') Error = CVT_FRACT_TRUNC`
-    /// (`sqlccnvt.cpp:7823`), rewritten to `IDS_22_001` inbound
-    /// (`sqlcfunc.cpp:3348`). `from_string` would reject both.
+    /// Unlike `DecimalParts::from_string`, plain literals can discard excess
+    /// zero digits without rejecting the input scale.
     #[test]
     fn a_decimal_fraction_past_the_scale_is_dropped_only_when_zero() {
         let (value, _) = convert_decimal(SQL_DECIMAL, 5, 1, "1.50").unwrap();
@@ -2612,6 +2603,22 @@ mod tests {
             convert_decimal(SQL_DECIMAL, 5, 0, "12.3").unwrap_err(),
             ParamBuildError::StringTruncation
         );
+    }
+
+    #[test]
+    fn decimal_exponent_rounding_is_unchanged_by_the_underflow_fix() {
+        assert_eq!(
+            convert_decimal(SQL_DECIMAL, 10, 2, "1.235").unwrap_err(),
+            ParamBuildError::StringTruncation
+        );
+        for text in ["1.235e0", "12.35e-1"] {
+            let (value, _) = convert_decimal(SQL_DECIMAL, 10, 2, text).unwrap();
+            assert_eq!(
+                value,
+                SqlType::Decimal(Some(DecimalParts::new(true, 10, 2, 124))),
+                "{text}"
+            );
+        }
     }
 
     /// More integer digits than the declaration holds is a range error, not a
