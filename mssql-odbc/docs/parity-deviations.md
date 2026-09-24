@@ -460,20 +460,26 @@ msodbcsql build is measured.
     Driver Manager bind/record-edit sequence with RPC capture and a recorded
     `SQL_DRIVER_VER` is still needed to establish shipping-build behavior;
     do not infer retail parity or add a comparison-test skip from this entry.
-18. **A superseded prepared handle is released before opening a data-at-execution
-    stream, and a release error fails that execute.** The source reference is
-    msodbcsql's `DropPrepHandle` (`Sql/Ntdbms/sqlncli/odbc/sqlcfunc.cpp`), which
+18. **A cross-identity orphan is released before streaming an already-live
+    prepared statement, and a release error fails that execute.** The source
+    reference is msodbcsql's `DropPrepHandle` (`Sql/Ntdbms/sqlncli/odbc/sqlcfunc.cpp`), which
     defers the drop in `hPrepDropDeferred`; `BuildSPPrepExec` (`odbc/sqlccmd.cpp`)
     passes that handle by reference on the next prepare, saving a round trip.
     `ProcessDAEParam` clears the deferred slot only after `SendRPCFromStmt`
-    succeeds. This driver instead sends and drains a separate `sp_unprepare`
-    in `TdsClient::begin_execute_prepared` before parking the stream.
+    succeeds. This driver's streamed `sp_prepexec` likewise piggybacks the
+    orphan and defers eviction until the complete message is sent; cancellation
+    retains the orphan without assigning a new statement identity.
+    The separate-release policy applies only when `begin_execute_prepared`
+    reuses a live handle through `sp_execute`, whose handle parameter has no
+    drop slot for another identity. It sends and drains `sp_unprepare` before
+    parking that stream, analogous to the reference's forced-drop route.
     `execute.rs` propagates a release failure and restores any retained orphan.
     Do not swallow that error and continue: `StmtState::pending_unprepare`
-    holds only one orphan, so preparing another handle while retaining the old
-    one can overflow that slot at the next rebind, recreating #598.
+    holds only one orphan, so returning a live prepared statement while retaining
+    a separate orphan can overflow that slot at the next rebind, recreating #598.
     This is a source-verified policy difference, not a measured claim about a
     retail driver's diagnostics or wire sequence; a build-specific reference
     comparison remains outstanding. No parity test is skipped for it.
     Recorded following automated review feedback on #599 (2026-09-22);
-    human parity sign-off has not been recorded. Tracked in #598.
+    narrowed to the cross-identity case following review on 2026-09-24.
+    Human parity sign-off has not been recorded. Tracked in #598.

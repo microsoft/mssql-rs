@@ -302,7 +302,44 @@ fn sql_param_data_safe(
         return fail_with_tds(dbc, stmt, statement_handle, client, &e);
     }
 
-    let end_result = dbc.runtime.block_on(client.end_streamed_param());
+    let (mut prepared, mut orphaned) = {
+        let Ok(mut stmt_state) = stmt.inner.lock() else {
+            error!("SQLParamData: stmt mutex poisoned taking the streamed plan");
+            return_client_idle(dbc, statement_handle, client);
+            return SQL_ERROR;
+        };
+        let Some(dae) = stmt_state.dae.as_mut() else {
+            error!("SQLParamData: DAE sequence vanished before closing the parameter");
+            drop(stmt_state);
+            return_client_idle(dbc, statement_handle, client);
+            return SQL_ERROR;
+        };
+        (dae.take_prepared(), dae.take_orphaned())
+    };
+    let end_result = match prepared.as_mut() {
+        Some(plan) => dbc
+            .runtime
+            .block_on(client.end_execute_prepared_param(&mut plan.stmt, &mut orphaned)),
+        None => dbc.runtime.block_on(client.end_streamed_param()),
+    };
+    // The send may have completed even when its response failed. Restore the
+    // updated ownership before either completion or error tears down DAE.
+    {
+        let Ok(mut stmt_state) = stmt.inner.lock() else {
+            error!("SQLParamData: stmt mutex poisoned restoring the streamed plan");
+            return_client_idle(dbc, statement_handle, client);
+            return SQL_ERROR;
+        };
+        let Some(dae) = stmt_state.dae.as_mut() else {
+            error!("SQLParamData: DAE sequence vanished after closing the parameter");
+            stmt_state.prepared = prepared;
+            stmt_state.pending_unprepare = orphaned;
+            drop(stmt_state);
+            return_client_idle(dbc, statement_handle, client);
+            return SQL_ERROR;
+        };
+        dae.restore_plan(prepared, orphaned);
+    }
 
     match end_result {
         Ok(StreamedParamStatus::NeedData { param_name: _ }) => {
