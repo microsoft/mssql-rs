@@ -45,6 +45,24 @@ steps:
     chmod +x build.sh
     ./build.sh
 
+    # Package the ODBC dylibs prepared by build.sh from the same upstream
+    # checkout. Development versions on main may not be published yet.
+    echo "=== Building mssql-python-odbc wheel from source ==="
+    cd "$MSSQL_PYTHON_DIR"
+    rm -rf odbc-dist/
+    python setup_odbc.py bdist_wheel --dist-dir odbc-dist
+
+    shopt -s nullglob
+    ODBC_WHEELS=("$MSSQL_PYTHON_DIR"/odbc-dist/mssql_python_odbc-*.whl)
+    shopt -u nullglob
+    if [ "${#ODBC_WHEELS[@]}" -ne 1 ]; then
+      echo "##[error]Expected exactly one mssql-python-odbc wheel, found ${#ODBC_WHEELS[@]}"
+      exit 1
+    fi
+    ODBC_WHEEL="${ODBC_WHEELS[0]}"
+    echo "Installing mssql-python-odbc wheel: $ODBC_WHEEL"
+    python -m pip install --no-deps "$ODBC_WHEEL"
+
     # Build mssql-py-core wheel and extract .so into mssql-python
     echo "=== Building mssql-py-core ==="
     cd $(Build.SourcesDirectory)/mssql-py-core
@@ -58,8 +76,23 @@ steps:
     echo "=== Verifying mssql_py_core is importable ==="
     python -c "import mssql_py_core; print('mssql_py_core OK')"
 
-    # Install mssql-python in editable mode
-    python -m pip install -e "$MSSQL_PYTHON_DIR"
+    # This job intentionally combines upstream Python main with the Rust wheel
+    # built above, which can be newer than Python's release dependency pin.
+    python -m pip install --no-deps -e "$MSSQL_PYTHON_DIR"
+
+    python - <<'PY'
+    from importlib.metadata import version
+    from pathlib import Path
+
+    import mssql_python
+
+    provider = mssql_python.get_native_provider_info()
+    assert provider["id"] == "msodbcsql18", provider
+    assert provider["driver_path"] and Path(provider["driver_path"]).is_file(), provider
+    print("mssql-python-rs:", version("mssql-python-rs"))
+    print("mssql-python-odbc:", version("mssql-python-odbc"))
+    print("ODBC provider:", provider)
+    PY
   displayName: 'Build ddbc_bindings and mssql-py-core'
   env:
     CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN)
