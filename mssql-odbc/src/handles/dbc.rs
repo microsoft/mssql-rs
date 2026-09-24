@@ -217,6 +217,10 @@ pub(crate) struct ConnectionIdentity {
     /// instead reports `USER_NAME()`, which it fetches lazily on first use;
     /// this driver has no way to issue an internal query mid-session.
     pub(crate) user_name: String,
+    /// `SQL_COLLATION_SEQ`. The character-set name the server reported in the
+    /// login `CHARACTER_SET` `ENVCHANGE`; empty when the server sent a
+    /// `SQL_COLLATION` change instead, as modern servers do.
+    pub(crate) collation_seq: String,
 }
 
 // Manual `Debug` so the bearer access token is never rendered in logs or panic

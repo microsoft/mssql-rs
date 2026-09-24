@@ -12,17 +12,31 @@ the behavior is tested. The owning user story is
 |---|---|---|
 | [AB#47086](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47086) | Closed | First-release support for the 21 information types then blocking mssql-python. |
 | [AB#48149](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/48149) | Active | 61 mssql-python payload names representing 59 distinct information IDs. `SQL_OWNER_USAGE` aliases `SQL_SCHEMA_USAGE`; `SQL_QUALIFIER_USAGE` aliases `SQL_CATALOG_USAGE`. |
-| [AB#47996](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47996) | New | Complete the remaining 68 ODBC 3.x public information types and residual parity work. |
+| [AB#47996](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47996) | Active | The remaining ODBC 3.x public information types: 22 conversion masks, 23 supported-SQL/driver masks, the SQL limits, `SQL_COLLATION_SEQ`, and the deprecated `SQL_LOCK_TYPES` / `SQL_POS_OPERATIONS`. |
 
 [AB#46406](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/46406),
 `SQLGetTypeInfoW`, is another closed child of AB#46381. It is deliberately
 outside this document because it returns a result set rather than an
 `SQLGetInfoW` scalar value.
 
-The current implementation therefore covers the original loader and
-transaction information, AB#47086, and AB#48149. It is not yet the complete
-ODBC 3.x public surface; unsupported residual identifiers remain owned by
-AB#47996.
+The current implementation covers the original loader and transaction
+information, AB#47086, AB#48149, and the AB#47996 residual surface. Three
+listed-but-unimplementable identifiers are deliberately excluded, each with a
+verified reason:
+
+- `SQL_ALTER_SCHEMA` is not a defined ODBC information type — it appears in no
+  ODBC header, so there is nothing to return. It reaches the driver only as an
+  out-of-range value and answers `HY096`.
+- `SQL_DRIVER_AWARE_POOLING_SUPPORTED` and the five `SQL_DRIVER_H*` handle types
+  are `ERROR_FLAG` in msodbcsql's `SQLGetInfoTable`; the handle types are also
+  answered by the Driver Manager before the call reaches the driver. The driver
+  core returns `HY096` to match, and applications never observe it for the
+  handle types because the DM intercepts them.
+- The driver-specific reserved band (`SQL_INFO_SS_RESERVED_FIRST`..`LAST`)
+  returns `HYC00` rather than `HY096` in msodbcsql. That refinement is deferred:
+  the exact band constants are internal to the msodbcsql build and not in any
+  published header, and no in-scope information type falls in the band, so the
+  `HY096` fallthrough is correct for everything AB#47996 covers.
 
 ## Compatibility evidence
 
@@ -143,5 +157,7 @@ regression suite at
   (covered by E2E).
 
 Variation 3 also checks `SQL_DRIVER_HDESC`, `SQL_DRIVER_HLIB`,
-`SQL_DRIVER_HENV`, `SQL_DRIVER_HDBC`, and `SQL_DRIVER_HSTMT`. Those handle
-information types remain in AB#47996 rather than being silently claimed here.
+`SQL_DRIVER_HENV`, `SQL_DRIVER_HDBC`, and `SQL_DRIVER_HSTMT`. The Driver Manager
+answers those handle information types itself before the call reaches the
+driver; the driver core returns `HY096` as a backstop
+(`handle_and_pooling_info_types_return_hy096`).
