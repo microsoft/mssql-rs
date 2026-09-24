@@ -346,7 +346,9 @@ def test_provider_verification_in_fresh_interpreter(tmp_path, provider, diagnost
     [
         ("", True),
         ("get_native_provider_info = None", True),
-        ("raise ImportError('upstream import changed')", True),
+        ("raise ModuleNotFoundError('package renamed', name='mssql_python')", True),
+        ("raise ModuleNotFoundError('dependency missing', name='dependency')", False),
+        ("raise ImportError('ddbc_bindings ABI/link failure')", False),
         ("def get_native_provider_info(required): pass", True),
         ("def get_native_provider_info(): raise AttributeError('unexpected failure')", False),
         ("def get_native_provider_info(): raise KeyError('unexpected failure')", False),

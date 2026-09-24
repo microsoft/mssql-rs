@@ -99,7 +99,9 @@ def check_runtime_dependencies():
 def verify_provider():
     try:
         import mssql_python
-    except ImportError as error:
+    except ModuleNotFoundError as error:
+        if error.name != "mssql_python":
+            raise
         raise UpstreamContractError(f"Cannot import the upstream native provider: {error}") from error
     get_info = getattr(mssql_python, "get_native_provider_info", None)
     if not callable(get_info):
