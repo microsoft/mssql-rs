@@ -2293,14 +2293,6 @@ unsafe fn deliver_bound(
 
     if is_null {
         unsafe { write_if_some(indicator, SQL_NULL_DATA) };
-        // A character target still gets a terminator so the slot does not read
-        // back as whatever the previous row left there.
-        let buf_elements = char_buf_elements(binding.target_type, stride);
-        if binding.target_type == SQL_C_WCHAR {
-            unsafe { copy_with_nul(slot as *mut SqlWChar, buf_elements, &[]) };
-        } else if binding.target_type == SQL_C_CHAR {
-            unsafe { copy_with_nul(slot, buf_elements, &[]) };
-        }
         return RowOutcome::Success;
     }
     if is_typed_c_target(binding.target_type) {
@@ -5255,6 +5247,36 @@ mod tests {
         assert!(matches!(outcome, RowOutcome::Success));
         assert_eq!(ind[1], SQL_NULL_DATA);
         assert_eq!(buf[1], 7, "a NULL must not disturb the data slot");
+    }
+
+    #[test]
+    fn null_preserves_character_slots_and_separate_octet_lengths() {
+        // Retail 18.6.2.1 / 18.06.0002: BoundNullPreservesSeparateOctetLength
+        // verifies the untouched length with split ARD pointers on Linux/unixODBC.
+        for target in [SQL_C_CHAR, SQL_C_WCHAR] {
+            for capacity in [0, 1, 2, 3, 32] {
+                let mut buffer = [0x7Eu8; 66];
+                let mut indicators = [-99; 2];
+                let mut lengths = [-98; 2];
+                let b = ColumnBinding {
+                    octet_length_ptr: lengths.as_mut_ptr(),
+                    ..binding(
+                        1,
+                        target,
+                        unsafe { buffer.as_mut_ptr().add(1) }.cast(),
+                        capacity,
+                        indicators.as_mut_ptr(),
+                    )
+                };
+                assert_eq!(
+                    unsafe { deliver_bound(&b, 1, 0, &ColumnValues::Null) },
+                    RowOutcome::Success
+                );
+                assert_eq!(buffer, [0x7E; 66]);
+                assert_eq!(indicators, [-99, SQL_NULL_DATA]);
+                assert_eq!(lengths, [-98; 2]);
+            }
+        }
     }
 
     /// `SQLBindCol` points both descriptor fields at one location, so a test
