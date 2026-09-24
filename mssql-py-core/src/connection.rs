@@ -55,11 +55,9 @@ impl PyCoreConnection {
 
         // Log encryption/TLS details for diagnosing handshake failures
         tracing::info!(
-            "Encryption options: mode={:?}, trust_server_certificate={}, host_name_in_cert={:?}, server_certificate={:?}",
+            "Encryption options: mode={:?}, server_trust={:?}",
             client_context.encryption_options.mode,
-            client_context.encryption_options.trust_server_certificate,
-            client_context.encryption_options.host_name_in_cert,
-            client_context.encryption_options.server_certificate,
+            client_context.encryption_options.server_trust,
         );
 
         // Connect using TdsConnectionProvider
@@ -259,13 +257,13 @@ impl PyCoreConnection {
             .get_item("server_certificate")?
             .and_then(|v| v.extract::<PathBuf>().ok());
 
-        let encryption_options = EncryptionOptions {
-            mode: encryption_mode,
+        let encryption_options = EncryptionOptions::from_connection_keywords(
+            encryption_mode,
             trust_server_certificate,
             host_name_in_cert,
             server_certificate,
-            server_ca: None,
-        };
+        )
+        .map_err(|e| PyRuntimeError::new_err(format!("Failed to connect to SQL Server: {e}")))?;
 
         // Parse application intent (case-insensitive)
         let application_intent_str = dict

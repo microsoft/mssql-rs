@@ -19,7 +19,7 @@ mod connectivity {
     };
     use dotenv::dotenv;
     use mssql_tds::connection::tds_client::ResultSet;
-    use mssql_tds::core::EncryptionOptions;
+    use mssql_tds::core::{EncryptionOptions, ServerTrust};
     use mssql_tds::datatypes::column_values::ColumnValues;
     use mssql_tds::{
         connection::client_context::{ClientContext, EntraIdTokenFactory, TdsAuthenticationMethod},
@@ -95,13 +95,13 @@ mod connectivity {
 
         let mut context = ClientContext::default();
         context.database = "master".to_string();
-        context.encryption_options = EncryptionOptions {
-            mode: EncryptionSetting::On,
-            trust_server_certificate: false,
-            host_name_in_cert: env::var("CERT_HOST_NAME").ok(),
-            server_certificate: None,
-            server_ca: None,
-        };
+        context.encryption_options = EncryptionOptions::from_connection_keywords(
+            EncryptionSetting::On,
+            false,
+            env::var("CERT_HOST_NAME").ok(),
+            None,
+        )
+        .unwrap();
         context.tds_authentication_method = TdsAuthenticationMethod::AccessToken;
         context.access_token = Some(access_token);
         context
@@ -127,13 +127,13 @@ mod connectivity {
 
         let mut context = ClientContext::default();
         context.database = "master".to_string();
-        context.encryption_options = EncryptionOptions {
-            mode: EncryptionSetting::On,
-            trust_server_certificate: false,
-            host_name_in_cert: env::var("CERT_HOST_NAME").ok(),
-            server_certificate: None,
-            server_ca: None,
-        };
+        context.encryption_options = EncryptionOptions::from_connection_keywords(
+            EncryptionSetting::On,
+            false,
+            env::var("CERT_HOST_NAME").ok(),
+            None,
+        )
+        .unwrap();
         context.tds_authentication_method = auth_method;
         context.auth_method_map = auth_method_map;
         context.connect_timeout = 3600;
@@ -214,7 +214,7 @@ mod connectivity {
     pub async fn trust_server_cert() {
         let access_token = generate_access_token().await;
         let mut context = create_context_with_accesstoken(access_token);
-        context.encryption_options.trust_server_certificate = true;
+        context.encryption_options.server_trust = ServerTrust::DangerAcceptAny;
         let datasource = build_tcp_datasource();
         let provider = TdsConnectionProvider {};
         let connection_result = provider.create_client(context, &datasource, None).await;

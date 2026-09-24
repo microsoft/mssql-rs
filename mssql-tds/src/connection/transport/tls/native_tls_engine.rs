@@ -29,13 +29,13 @@ static CONNECTOR_CACHE: std::sync::LazyLock<
     RwLock<HashMap<super::TlsValidationConfig, NativeTlsConnector>>,
 > = std::sync::LazyLock::new(|| RwLock::new(HashMap::new()));
 
-/// Connections with a custom CA are not cached: the trust material is re-read
-/// from disk for every handshake so a rotated, removed, or corrupted CA file
+/// Connections with custom roots are not cached: file-backed trust material is
+/// re-read for every handshake so a rotated, removed, or corrupted CA file
 /// takes effect immediately instead of being masked by a cached connector.
 fn get_or_build_connector(
     validation: &super::TlsValidationConfig,
 ) -> TdsResult<NativeTlsConnector> {
-    let cacheable = validation.server_ca_path.is_none();
+    let cacheable = validation.custom_roots.is_none();
 
     if cacheable
         && let Some(connector) = CONNECTOR_CACHE
@@ -60,10 +60,11 @@ fn get_or_build_connector(
     if validation.use_alpn {
         builder.request_alpns(&[TDS_8_ALPN_PROTOCOL]);
     }
-    if let Some(ca_path) = validation.server_ca_path.as_deref() {
-        for certificate in certificate_validator::load_ca_certificates_from_file(ca_path)? {
+    if let Some(roots) = &validation.custom_roots {
+        for certificate in certificate_validator::load_ca_certificates(&roots.source)? {
             builder.add_root_certificate(certificate);
         }
+        builder.disable_built_in_roots(!roots.include_platform_roots);
     }
     let connector = builder.build()?;
 
@@ -124,8 +125,8 @@ impl TlsEngine for NativeTlsEngine {
                     }
                 }
 
-                if let Some(cert_path) = params.server_certificate_path {
-                    info!("Validating server certificate using: {cert_path:?}",);
+                if let Some(pinned) = params.pinned_certificate {
+                    info!("Validating server certificate against pinned certificate");
 
                     let peer_cert = stream
                         .get_ref()
@@ -136,10 +137,7 @@ impl TlsEngine for NativeTlsEngine {
                     let server_cert_der =
                         peer_cert.to_der().map_err(crate::error::Error::TlsError)?;
 
-                    certificate_validator::validate_server_certificate(
-                        cert_path,
-                        &server_cert_der,
-                    )?;
+                    certificate_validator::validate_server_certificate(pinned, &server_cert_der)?;
 
                     info!("Server certificate validation successful");
                 }
@@ -190,14 +188,22 @@ impl Stream for TlsStream<Box<dyn Stream>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::connection::transport::tls::TlsValidationConfig;
+    use crate::connection::transport::tls::{CustomRoots, TlsValidationConfig};
+    use crate::core::CertificateSource;
+
+    fn custom_file(path: &str, include_platform_roots: bool) -> CustomRoots {
+        CustomRoots {
+            source: CertificateSource::File(path.into()),
+            include_platform_roots,
+        }
+    }
 
     fn cfg(certs: bool, hosts: bool, alpn: bool) -> TlsValidationConfig {
         TlsValidationConfig {
             accept_invalid_certs: certs,
             accept_invalid_hostnames: hosts,
             use_alpn: alpn,
-            server_ca_path: None,
+            custom_roots: None,
         }
     }
 
@@ -214,7 +220,7 @@ mod tests {
     #[test]
     fn missing_ca_file_is_reported_on_every_call() {
         let mut config = cfg(false, false, false);
-        config.server_ca_path = Some("/nonexistent/path/ca.pem".into());
+        config.custom_roots = Some(custom_file("/nonexistent/path/ca.pem", true));
         for _ in 0..2 {
             assert!(matches!(
                 get_or_build_connector(&config),
@@ -226,7 +232,7 @@ mod tests {
     #[test]
     fn custom_ca_connector_reloads_the_file() {
         let mut config = cfg(false, false, false);
-        config.server_ca_path = Some("tests/test_certificates/valid_cert.pem".into());
+        config.custom_roots = Some(custom_file("tests/test_certificates/valid_cert.pem", true));
         assert!(get_or_build_connector(&config).is_ok());
         assert!(
             !CONNECTOR_CACHE.read().unwrap().contains_key(&config),
@@ -261,7 +267,7 @@ mod tests {
             validation: &validation,
             host_name: "127.0.0.1",
             server_host_name: "127.0.0.1",
-            server_certificate_path: None,
+            pinned_certificate: None,
         };
         let result = NATIVE_TLS_ENGINE.connect(Box::new(client), params).await;
         assert!(result.is_err(), "expected handshake failure on peer drop");

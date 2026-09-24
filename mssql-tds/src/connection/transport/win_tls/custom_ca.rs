@@ -51,7 +51,12 @@ impl Drop for Chain {
     }
 }
 
-pub(super) fn validate(ctx: &SecCtx, roots: &[Vec<u8>], host: &str) -> io::Result<()> {
+pub(super) fn validate(
+    ctx: &SecCtx,
+    roots: &[Vec<u8>],
+    include_platform_roots: bool,
+    host: &str,
+) -> io::Result<()> {
     let mut cert: *mut crypto::CERT_CONTEXT = ptr::null_mut();
     // SAFETY: ctx is a completed handshake; the query initializes a certificate
     // reference which is released by Cert.
@@ -69,10 +74,15 @@ pub(super) fn validate(ctx: &SecCtx, roots: &[Vec<u8>], host: &str) -> io::Resul
         return Err(io::Error::other("Schannel returned no remote certificate"));
     }
     let cert = Cert(cert);
-    validate_certificate(&cert, roots, host)
+    validate_certificate(&cert, roots, include_platform_roots, host)
 }
 
-fn validate_certificate(cert: &Cert, roots: &[Vec<u8>], host: &str) -> io::Result<()> {
+fn validate_certificate(
+    cert: &Cert,
+    roots: &[Vec<u8>],
+    include_platform_roots: bool,
+    host: &str,
+) -> io::Result<()> {
     if host.encode_utf16().any(|c| c == 0) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -130,15 +140,18 @@ fn validate_certificate(cert: &Cert, roots: &[Vec<u8>], host: &str) -> io::Resul
         }
     }
 
-    // First keep platform trust semantics, including system disallowed roots.
-    // Only an untrusted-root error permits retrying with the explicit CA roots;
-    // expired certificates, wrong names and invalid signatures never bypass it.
-    let system_error = match verify_chain(0, cert, additional.0, host) {
-        Ok(()) => return Ok(()),
-        Err(error) => error,
-    };
-    if system_error.raw_os_error() != Some(Foundation::CERT_E_UNTRUSTEDROOT) {
-        return Err(system_error);
+    // With platform roots, keep platform trust semantics first, including
+    // system disallowed roots. Only an untrusted-root error permits retrying
+    // with the explicit CA roots; expired certificates, wrong names and invalid
+    // signatures never bypass it.
+    if include_platform_roots {
+        let system_error = match verify_chain(0, cert, additional.0, host) {
+            Ok(()) => return Ok(()),
+            Err(error) => error,
+        };
+        if system_error.raw_os_error() != Some(Foundation::CERT_E_UNTRUSTEDROOT) {
+            return Err(system_error);
+        }
     }
 
     // SAFETY: the config is initialized with documented defaults; the root
@@ -250,15 +263,20 @@ mod tests {
         };
         assert!(!cert.is_null());
         let cert = Cert(cert);
-        assert!(validate_certificate(&cert, std::slice::from_ref(&root), "localhost").is_ok());
-        assert!(validate_certificate(&cert, std::slice::from_ref(&root), "wrong.example").is_err());
-        assert!(validate_certificate(&cert, &[unrelated], "localhost").is_err());
-        assert!(validate_certificate(&cert, &[], "localhost").is_err());
-        assert!(validate_certificate(&cert, &[root], "localhost\0wrong.example").is_err());
+        for include_platform_roots in [true, false] {
+            let check = |roots: &[Vec<u8>], host| {
+                validate_certificate(&cert, roots, include_platform_roots, host)
+            };
+            assert!(check(std::slice::from_ref(&root), "localhost").is_ok());
+            assert!(check(std::slice::from_ref(&root), "wrong.example").is_err());
+            assert!(check(std::slice::from_ref(&unrelated), "localhost").is_err());
+            assert!(check(&[], "localhost").is_err());
+            assert!(check(std::slice::from_ref(&root), "localhost\0wrong.example").is_err());
+        }
     }
 
     #[test]
     fn invalid_context_cannot_skip_custom_ca_validation() {
-        assert!(validate(&SecCtx::for_test_only(), &[], "localhost").is_err());
+        assert!(validate(&SecCtx::for_test_only(), &[], true, "localhost").is_err());
     }
 }

@@ -39,7 +39,7 @@ pub(crate) static SCHANNEL_ENGINE: SchannelEngine = SchannelEngine;
 /// post-handshake DER compare for the pinned cert runs in
 /// [`super::validate::validate_after_handshake`].
 fn pick_cred_kind(validation: &TlsValidationConfig, has_pinned_cert: bool) -> CredKind {
-    if has_pinned_cert || validation.server_ca_path.is_some() {
+    if has_pinned_cert || validation.custom_roots.is_some() {
         // File pins and custom CA chains are validated after the handshake.
         CredKind::ManualValidate
     } else if validation.accept_invalid_certs {
@@ -61,14 +61,19 @@ impl TlsEngine for SchannelEngine {
     ) -> TdsResult<Box<dyn Stream>> {
         base_stream.tls_handshake_starting();
 
-        let kind = pick_cred_kind(params.validation, params.server_certificate_path.is_some());
-        let custom_roots: Option<Vec<Vec<u8>>> = params
+        let kind = pick_cred_kind(params.validation, params.pinned_certificate.is_some());
+        let custom_roots = params
             .validation
-            .server_ca_path
-            .as_deref()
-            .map(super::super::certificate_validator::load_ca_certificates_from_file)
-            .transpose()?
-            .map(|certs| certs.iter().map(native_tls::Certificate::to_der).collect())
+            .custom_roots
+            .as_ref()
+            .map(|roots| -> TdsResult<_> {
+                let certificates =
+                    super::super::certificate_validator::load_ca_certificates(&roots.source)?
+                        .iter()
+                        .map(native_tls::Certificate::to_der)
+                        .collect::<Result<Vec<_>, _>>()?;
+                Ok((certificates, roots.include_platform_roots))
+            })
             .transpose()?;
         // Custom trust roots are reloaded and get a fresh TLS session cache
         // partition, so neither certificate rotation nor policy changes can
@@ -111,17 +116,21 @@ impl TlsEngine for SchannelEngine {
             }
         };
 
-        if let Some(roots) = custom_roots {
-            super::custom_ca::validate(stream.ctx(), &roots, params.host_name).map_err(|e| {
+        if let Some((roots, include_platform_roots)) = custom_roots {
+            super::custom_ca::validate(
+                stream.ctx(),
+                &roots,
+                include_platform_roots,
+                params.host_name,
+            )
+            .map_err(|e| {
                 crate::error::Error::ImplementationError(format!(
                     "Schannel custom CA validation failed: {e}"
                 ))
             })?;
-        } else if let Err(e) = validate::validate_after_handshake(
-            stream.ctx(),
-            kind,
-            params.server_certificate_path.map(|p| p.as_path()),
-        ) {
+        } else if let Err(e) =
+            validate::validate_after_handshake(stream.ctx(), kind, params.pinned_certificate)
+        {
             error!(
                 "Schannel post-handshake validation FAILED: host={}, error={}",
                 params.host_name, e
@@ -159,6 +168,8 @@ impl Stream for SchannelTlsStream<Box<dyn Stream>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connection::transport::tls::CustomRoots;
+    use crate::core::CertificateSource;
 
     #[test]
     fn cred_kind_for_custom_ca_is_manual() {
@@ -166,7 +177,10 @@ mod tests {
             accept_invalid_certs: false,
             accept_invalid_hostnames: false,
             use_alpn: false,
-            server_ca_path: Some("ca.pem".into()),
+            custom_roots: Some(CustomRoots {
+                source: CertificateSource::File("ca.pem".into()),
+                include_platform_roots: true,
+            }),
         };
         assert_eq!(pick_cred_kind(&validation, false), CredKind::ManualValidate);
     }
@@ -198,7 +212,10 @@ mod tests {
             accept_invalid_certs: false,
             accept_invalid_hostnames: false,
             use_alpn: false,
-            server_ca_path: Some("tests/test_certificates/ca_cert.pem".into()),
+            custom_roots: Some(CustomRoots {
+                source: CertificateSource::File("tests/test_certificates/ca_cert.pem".into()),
+                include_platform_roots: true,
+            }),
         };
         let client = async {
             let socket = tokio::net::TcpStream::connect(addr).await.unwrap();
@@ -209,7 +226,7 @@ mod tests {
                         validation: &validation,
                         host_name: "localhost",
                         server_host_name: "localhost",
-                        server_certificate_path: None,
+                        pinned_certificate: None,
                     },
                 )
                 .await
@@ -234,7 +251,7 @@ mod tests {
             accept_invalid_certs: true,
             accept_invalid_hostnames: false,
             use_alpn: false,
-            server_ca_path: None,
+            custom_roots: None,
         };
         assert_eq!(pick_cred_kind(&validation, false), CredKind::NoValidate);
     }
@@ -249,7 +266,7 @@ mod tests {
             accept_invalid_certs: true,
             accept_invalid_hostnames: true,
             use_alpn: false,
-            server_ca_path: None,
+            custom_roots: None,
         };
         assert_eq!(pick_cred_kind(&validation, true), CredKind::ManualValidate);
     }
@@ -260,7 +277,7 @@ mod tests {
             accept_invalid_certs: false,
             accept_invalid_hostnames: false,
             use_alpn: false,
-            server_ca_path: None,
+            custom_roots: None,
         };
         assert_eq!(pick_cred_kind(&validation, true), CredKind::ManualValidate);
     }
@@ -271,7 +288,7 @@ mod tests {
             accept_invalid_certs: false,
             accept_invalid_hostnames: false,
             use_alpn: false,
-            server_ca_path: None,
+            custom_roots: None,
         };
         assert_eq!(pick_cred_kind(&validation, false), CredKind::AutoValidate);
     }
@@ -296,13 +313,13 @@ mod tests {
             accept_invalid_certs: true,
             accept_invalid_hostnames: false,
             use_alpn: true,
-            server_ca_path: None,
+            custom_roots: None,
         };
         let params = TlsConnectParams {
             validation: &validation,
             host_name: "127.0.0.1",
             server_host_name: "127.0.0.1",
-            server_certificate_path: None,
+            pinned_certificate: None,
         };
         let result = SCHANNEL_ENGINE.connect(Box::new(client), params).await;
         assert!(result.is_err(), "expected handshake failure on peer drop");

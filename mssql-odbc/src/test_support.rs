@@ -389,7 +389,7 @@ pub(crate) fn connect_mock_server(
     use mssql_mock_tds::MockTdsServer;
     use mssql_tds::connection::client_context::ClientContext;
     use mssql_tds::connection_provider::tds_connection_provider::TdsConnectionProvider;
-    use mssql_tds::core::{EncryptionOptions, EncryptionSetting};
+    use mssql_tds::core::{EncryptionOptions, EncryptionSetting, ServerTrust};
     use std::time::Duration;
 
     let server_runtime =
@@ -415,13 +415,9 @@ pub(crate) fn connect_mock_server(
     context.user_name = "sa".to_string();
     context.password = "unused-by-the-mock-server".to_string();
     context.database = "master".to_string();
-    context.encryption_options = EncryptionOptions {
-        mode: EncryptionSetting::PreferOff,
-        trust_server_certificate: true,
-        host_name_in_cert: None,
-        server_certificate: None,
-        server_ca: None,
-    };
+    context.encryption_options = EncryptionOptions::new()
+        .with_mode(EncryptionSetting::PreferOff)
+        .with_server_trust(ServerTrust::DangerAcceptAny);
 
     let provider = TdsConnectionProvider {};
     let client = dbc

@@ -7,77 +7,17 @@
 //! between a user-provided certificate file and the server's certificate during
 //! the SSL/TLS handshake.
 
-use crate::core::TdsResult;
+use crate::core::{CertificateSource, TdsResult};
 use crate::error::Error;
 use native_tls::Certificate;
 use std::fs;
 use std::path::Path;
 use tracing::{debug, info};
 
-/// Load a certificate from a file path and convert to DER format.
-/// Supports both DER and PEM encoded X.509 certificates.
-/// Uses native-tls Certificate API for automatic format detection and conversion.
-///
-/// # Arguments
-/// * `path` - Path to the certificate file
-///
-/// # Returns
-/// * `Ok(Vec<u8>)` - DER-encoded certificate data
-/// * `Err(Error)` - File not found, IO error, or invalid format
-pub fn load_certificate_from_file(path: &Path) -> TdsResult<Vec<u8>> {
-    debug!("Loading certificate from file: {path:?}");
-
-    // Check if file exists
-    if !path.exists() {
-        return Err(Error::CertificateNotFound {
-            path: path.to_path_buf(),
-        });
-    }
-
-    // Read certificate file
-    let cert_data = fs::read(path).map_err(|e| Error::CertificateFileIoError {
-        path: path.to_path_buf(),
-        error: e.to_string(),
-    })?;
-
-    // Try to parse as PEM first, fall back to DER
-    // native-tls handles the format detection and parsing
-    let certificate = Certificate::from_pem(&cert_data)
-        .or_else(|_| {
-            debug!("Not PEM format, trying DER");
-            Certificate::from_der(&cert_data)
-        })
-        .map_err(|_| Error::InvalidCertificateFormat {
-            path: path.to_path_buf(),
-        })?;
-
-    // Convert to DER format for binary comparison
-    let der_data = certificate
-        .to_der()
-        .map_err(|_| Error::InvalidCertificateFormat {
-            path: path.to_path_buf(),
-        })?;
-
-    info!(
-        "Successfully loaded certificate from: {path:?} ({} bytes)",
-        der_data.len()
-    );
-    Ok(der_data)
-}
-
-/// Load one or more CA certificates from a file for use as custom trust roots.
-/// Accepts a PEM file (single certificate or bundle) or a single DER certificate.
-///
-/// # Arguments
-/// * `path` - Path to the CA certificate file
-///
-/// # Returns
-/// * `Ok(Vec<Certificate>)` - Parsed CA certificates, in file order
-/// * `Err(Error)` - File not found, IO error, or invalid format
-pub fn load_ca_certificates_from_file(path: &Path) -> TdsResult<Vec<Certificate>> {
-    debug!("Loading CA certificate(s) from file: {path:?}");
-
-    let cert_data = fs::read(path).map_err(|e| match e.kind() {
+/// Reads a certificate file, distinguishing a missing path from other I/O
+/// failures.
+fn read_certificate_file(path: &Path) -> TdsResult<Vec<u8>> {
+    fs::read(path).map_err(|e| match e.kind() {
         std::io::ErrorKind::NotFound => Error::CertificateNotFound {
             path: path.to_path_buf(),
         },
@@ -85,29 +25,70 @@ pub fn load_ca_certificates_from_file(path: &Path) -> TdsResult<Vec<Certificate>
             path: path.to_path_buf(),
             error: e.to_string(),
         },
-    })?;
+    })
+}
 
-    let invalid_format = || Error::InvalidCertificateFormat {
-        path: path.to_path_buf(),
+/// Load a single certificate as DER. Files may be PEM or DER; only the first
+/// certificate of a PEM file is used.
+pub fn load_certificate(source: &CertificateSource) -> TdsResult<Vec<u8>> {
+    let certificate = match source {
+        CertificateSource::File(path) => {
+            debug!("Loading certificate from file: {path:?}");
+            let invalid_format = || Error::InvalidCertificateFormat { path: path.clone() };
+            let data = read_certificate_file(path)?;
+            let certificate = Certificate::from_pem(&data)
+                .or_else(|_| Certificate::from_der(&data))
+                .map_err(|_| invalid_format())?;
+            let der = certificate.to_der().map_err(|_| invalid_format())?;
+            info!("Loaded certificate from: {path:?} ({} bytes)", der.len());
+            return Ok(der);
+        }
+        CertificateSource::Pem(data) => Certificate::from_pem(data)
+            .map_err(|_| Error::InvalidCertificateData { expected: "PEM" })?,
+        CertificateSource::Der(data) => Certificate::from_der(data)
+            .map_err(|_| Error::InvalidCertificateData { expected: "DER" })?,
+    };
+    certificate
+        .to_der()
+        .map_err(|_| Error::InvalidCertificateData { expected: "DER" })
+}
+
+/// Load one or more CA certificates for use as trust roots. Files may be a
+/// PEM bundle or a single DER certificate; every PEM block is loaded.
+pub fn load_ca_certificates(source: &CertificateSource) -> TdsResult<Vec<Certificate>> {
+    let (data, path) = match source {
+        CertificateSource::File(path) => {
+            debug!("Loading CA certificate(s) from file: {path:?}");
+            (
+                std::borrow::Cow::Owned(read_certificate_file(path)?),
+                Some(path),
+            )
+        }
+        CertificateSource::Pem(data) | CertificateSource::Der(data) => {
+            (std::borrow::Cow::Borrowed(data.as_slice()), None)
+        }
+    };
+    let invalid = |expected| match path {
+        Some(path) => Error::InvalidCertificateFormat { path: path.clone() },
+        None => Error::InvalidCertificateData { expected },
     };
 
-    let certificates = if let Some(pem_blocks) = split_pem_certificates(&cert_data) {
-        pem_blocks
+    let certificates = match (source, split_pem_certificates(&data)) {
+        (CertificateSource::Der(_), _) => {
+            vec![Certificate::from_der(&data).map_err(|_| invalid("DER"))?]
+        }
+        (_, Some(blocks)) => blocks
             .iter()
-            .map(|block| Certificate::from_pem(block).map_err(|_| invalid_format()))
-            .collect::<TdsResult<Vec<_>>>()?
-    } else {
-        vec![Certificate::from_der(&cert_data).map_err(|_| invalid_format())?]
+            .map(|block| Certificate::from_pem(block).map_err(|_| invalid("PEM")))
+            .collect::<TdsResult<Vec<_>>>()?,
+        (CertificateSource::Pem(_), None) => return Err(invalid("PEM")),
+        (_, None) => vec![Certificate::from_der(&data).map_err(|_| invalid("PEM or DER"))?],
     };
 
     if certificates.is_empty() {
-        return Err(invalid_format());
+        return Err(invalid("PEM or DER"));
     }
-
-    info!(
-        "Successfully loaded {} CA certificate(s) from: {path:?}",
-        certificates.len()
-    );
+    info!("Loaded {} CA certificate(s)", certificates.len());
     Ok(certificates)
 }
 
@@ -196,17 +177,20 @@ pub fn constant_time_compare(a: &[u8], b: &[u8]) -> bool {
 /// Performs expiry check and exact binary match.
 ///
 /// # Arguments
-/// * `user_cert_path` - Path to user-provided certificate file
+/// * `pinned` - Certificate the server must present
 /// * `server_cert_der` - DER-encoded server certificate from TLS handshake
 ///
 /// # Returns
 /// * `Ok(())` - Certificates match and server cert is valid
 /// * `Err(Error)` - Validation failed
-pub fn validate_server_certificate(user_cert_path: &Path, server_cert_der: &[u8]) -> TdsResult<()> {
-    info!("Validating server certificate against: {user_cert_path:?}");
+pub fn validate_server_certificate(
+    pinned: &CertificateSource,
+    server_cert_der: &[u8],
+) -> TdsResult<()> {
+    info!("Validating server certificate against pinned certificate");
 
     // Step 1: Load user-provided certificate
-    let user_cert_der = load_certificate_from_file(user_cert_path)?;
+    let user_cert_der = load_certificate(pinned)?;
 
     // Step 2: Check server certificate expiry
     if is_certificate_expired(server_cert_der)? {
@@ -230,6 +214,14 @@ pub fn validate_server_certificate(user_cert_path: &Path, server_cert_der: &[u8]
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn load_certificate_file(path: impl AsRef<Path>) -> TdsResult<Vec<u8>> {
+        load_certificate(&CertificateSource::File(path.as_ref().to_path_buf()))
+    }
+
+    fn load_ca_file(path: impl AsRef<Path>) -> TdsResult<Vec<Certificate>> {
+        load_ca_certificates(&CertificateSource::File(path.as_ref().to_path_buf()))
+    }
 
     #[test]
     fn test_constant_time_compare_equal() {
@@ -255,7 +247,7 @@ mod tests {
     #[test]
     fn test_load_certificate_file_not_found() {
         let p = Path::new("/nonexistent/path/cert.cer");
-        let result = load_certificate_from_file(p);
+        let result = load_certificate_file(p);
         assert!(result.is_err());
         match result {
             Err(Error::CertificateNotFound { path }) => {
@@ -269,7 +261,7 @@ mod tests {
     fn test_load_certificate_from_pem() {
         // Path relative to the crate root
         let cert_path = Path::new("tests/test_certificates/valid_cert.pem");
-        let result = load_certificate_from_file(cert_path);
+        let result = load_certificate_file(cert_path);
 
         match result {
             Ok(der_bytes) => {
@@ -289,7 +281,7 @@ mod tests {
     fn test_load_certificate_from_der() {
         // Path relative to the crate root
         let cert_path = Path::new("tests/test_certificates/valid_cert.der");
-        let result = load_certificate_from_file(cert_path);
+        let result = load_certificate_file(cert_path);
 
         match result {
             Ok(der_bytes) => {
@@ -309,7 +301,7 @@ mod tests {
     fn test_load_certificate_invalid_format() {
         // Path relative to the crate root
         let cert_path = Path::new("tests/test_certificates/invalid_format.txt");
-        let result = load_certificate_from_file(cert_path);
+        let result = load_certificate_file(cert_path);
 
         assert!(result.is_err(), "Should fail to load invalid certificate");
         match result {
@@ -327,8 +319,8 @@ mod tests {
         let pem_path = Path::new("tests/test_certificates/valid_cert.pem");
         let der_path = Path::new("tests/test_certificates/valid_cert.der");
 
-        let pem_result = load_certificate_from_file(pem_path);
-        let der_result = load_certificate_from_file(der_path);
+        let pem_result = load_certificate_file(pem_path);
+        let der_result = load_certificate_file(der_path);
 
         assert!(
             pem_result.is_ok(),
@@ -353,8 +345,7 @@ mod tests {
     fn test_is_certificate_expired_valid() {
         // Our test certificate is valid for 10 years (3650 days)
         let cert_path = Path::new("tests/test_certificates/valid_cert.pem");
-        let der_bytes =
-            load_certificate_from_file(cert_path).expect("Failed to load test certificate");
+        let der_bytes = load_certificate_file(cert_path).expect("Failed to load test certificate");
 
         let result = is_certificate_expired(&der_bytes);
         assert!(result.is_ok(), "Certificate expiry check should succeed");
@@ -412,17 +403,15 @@ mod tests {
 
     #[test]
     fn test_load_ca_certificates_from_pem() {
-        let certs =
-            load_ca_certificates_from_file(Path::new("tests/test_certificates/valid_cert.pem"))
-                .expect("PEM CA certificate should load");
+        let certs = load_ca_file(Path::new("tests/test_certificates/valid_cert.pem"))
+            .expect("PEM CA certificate should load");
         assert_eq!(certs.len(), 1);
     }
 
     #[test]
     fn test_load_ca_certificates_from_der() {
-        let certs =
-            load_ca_certificates_from_file(Path::new("tests/test_certificates/valid_cert.der"))
-                .expect("DER CA certificate should load");
+        let certs = load_ca_file(Path::new("tests/test_certificates/valid_cert.der"))
+            .expect("DER CA certificate should load");
         assert_eq!(certs.len(), 1);
     }
 
@@ -435,8 +424,7 @@ mod tests {
         bundle.extend_from_slice(&single);
         fs::write(&bundle_path, &bundle).expect("bundle should be writable");
 
-        let certs =
-            load_ca_certificates_from_file(&bundle_path).expect("PEM bundle should load fully");
+        let certs = load_ca_file(&bundle_path).expect("PEM bundle should load fully");
         assert_eq!(certs.len(), 2);
 
         let _ = fs::remove_file(&bundle_path);
@@ -446,7 +434,7 @@ mod tests {
     fn test_load_ca_certificates_not_found() {
         let path = Path::new("/nonexistent/path/ca.pem");
         assert!(matches!(
-            load_ca_certificates_from_file(path),
+            load_ca_file(path),
             Err(Error::CertificateNotFound { .. })
         ));
     }
@@ -455,7 +443,7 @@ mod tests {
     fn test_load_ca_certificates_io_error() {
         let directory = tempfile::tempdir().unwrap();
         assert!(matches!(
-            load_ca_certificates_from_file(directory.path()),
+            load_ca_file(directory.path()),
             Err(Error::CertificateFileIoError { .. })
         ));
     }
@@ -467,7 +455,7 @@ mod tests {
         let path = directory.path().join("loop.pem");
         std::os::unix::fs::symlink("loop.pem", &path).unwrap();
         assert!(matches!(
-            load_ca_certificates_from_file(&path),
+            load_ca_file(&path),
             Err(Error::CertificateFileIoError { .. })
         ));
     }
@@ -476,7 +464,7 @@ mod tests {
     fn test_load_ca_certificates_invalid_format() {
         let path = Path::new("tests/test_certificates/invalid_format.txt");
         assert!(matches!(
-            load_ca_certificates_from_file(path),
+            load_ca_file(path),
             Err(Error::InvalidCertificateFormat { .. })
         ));
     }
@@ -491,10 +479,53 @@ mod tests {
         .expect("file should be writable");
 
         assert!(matches!(
-            load_ca_certificates_from_file(&truncated_path),
+            load_ca_file(&truncated_path),
             Err(Error::InvalidCertificateFormat { .. })
         ));
 
         let _ = fs::remove_file(&truncated_path);
+    }
+
+    #[test]
+    fn test_in_memory_sources_load() {
+        let pem = fs::read("tests/test_certificates/valid_cert.pem").unwrap();
+        let der = fs::read("tests/test_certificates/valid_cert.der").unwrap();
+        let mut bundle = pem.clone();
+        bundle.extend_from_slice(&pem);
+
+        assert_eq!(
+            load_certificate(&CertificateSource::Pem(pem.clone())).unwrap(),
+            load_certificate(&CertificateSource::Der(der.clone())).unwrap()
+        );
+        assert_eq!(
+            load_ca_certificates(&CertificateSource::Pem(bundle))
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            load_ca_certificates(&CertificateSource::Der(der))
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_in_memory_sources_reject_wrong_encoding() {
+        let der = fs::read("tests/test_certificates/valid_cert.der").unwrap();
+        for source in [
+            CertificateSource::Pem(der.clone()),
+            CertificateSource::Der(b"not a certificate".to_vec()),
+        ] {
+            assert!(matches!(
+                load_ca_certificates(&source),
+                Err(Error::InvalidCertificateData { .. })
+            ));
+            assert!(matches!(
+                load_certificate(&source),
+                Err(Error::InvalidCertificateData { .. })
+            ));
+        }
     }
 }

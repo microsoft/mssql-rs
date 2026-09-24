@@ -7,6 +7,7 @@ use clap::Parser;
 
 use mssql_tds::core::EncryptionOptions;
 use mssql_tds::core::EncryptionSetting;
+use mssql_tds::core::ServerTrust;
 use rustyline::Helper;
 use rustyline::Result as RustylineResult;
 use rustyline::completion::{Completer, Pair};
@@ -162,13 +163,9 @@ pub async fn main_cli() -> Result<(), Box<dyn std::error::Error>> {
     context.user_name = "sa".to_string();
     context.password = std::fs::read_to_string("/tmp/password")?.trim().to_string();
     context.database = "master".to_string();
-    context.encryption_options = EncryptionOptions {
-        mode: EncryptionSetting::On,
-        trust_server_certificate: true,
-        host_name_in_cert: None,
-        server_certificate: None,
-        server_ca: None,
-    };
+    context.encryption_options = EncryptionOptions::new()
+        .with_mode(EncryptionSetting::On)
+        .with_server_trust(ServerTrust::DangerAcceptAny);
     let provider = TdsConnectionProvider {};
     let datasource = "tcp:localhost,1433";
     let connection_result = provider.create_client(context, datasource, None).await;

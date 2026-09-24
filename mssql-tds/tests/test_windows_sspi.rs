@@ -19,7 +19,7 @@ mod common;
 use mssql_tds::connection::client_context::{ClientContext, TdsAuthenticationMethod};
 use mssql_tds::connection::tds_client::ResultSet;
 use mssql_tds::connection_provider::tds_connection_provider::TdsConnectionProvider;
-use mssql_tds::core::{EncryptionOptions, EncryptionSetting, TdsResult};
+use mssql_tds::core::{EncryptionOptions, EncryptionSetting, ServerTrust, TdsResult};
 use mssql_tds::datatypes::column_values::ColumnValues;
 
 /// Test Windows SSPI token generation
@@ -86,13 +86,9 @@ async fn test_windows_integrated_auth_connection() -> TdsResult<()> {
     let mut context = ClientContext::default();
     context.database = "master".to_string();
     context.tds_authentication_method = TdsAuthenticationMethod::SSPI;
-    context.encryption_options = EncryptionOptions {
-        mode: EncryptionSetting::On,
-        trust_server_certificate: true,
-        host_name_in_cert: None,
-        server_certificate: None,
-        server_ca: None,
-    };
+    context.encryption_options = EncryptionOptions::new()
+        .with_mode(EncryptionSetting::On)
+        .with_server_trust(ServerTrust::DangerAcceptAny);
 
     let provider = TdsConnectionProvider {};
     let datasource = "tcp:localhost,1433";
@@ -148,13 +144,7 @@ async fn test_localdb_integrated_auth_connection() -> TdsResult<()> {
     let mut context = ClientContext::default();
     context.database = "master".to_string();
     context.tds_authentication_method = TdsAuthenticationMethod::SSPI;
-    context.encryption_options = EncryptionOptions {
-        mode: EncryptionSetting::Strict,
-        trust_server_certificate: true,
-        host_name_in_cert: None,
-        server_certificate: None,
-        server_ca: None,
-    };
+    context.encryption_options = EncryptionOptions::new().with_mode(EncryptionSetting::Strict);
 
     let provider = TdsConnectionProvider {};
 
@@ -222,13 +212,9 @@ async fn test_ssrp_named_pipe_integrated_auth() -> TdsResult<()> {
     let mut context = ClientContext::default();
     context.database = "master".to_string();
     context.tds_authentication_method = TdsAuthenticationMethod::SSPI;
-    context.encryption_options = EncryptionOptions {
-        mode: EncryptionSetting::On,
-        trust_server_certificate: true,
-        host_name_in_cert: None,
-        server_certificate: None,
-        server_ca: None,
-    };
+    context.encryption_options = EncryptionOptions::new()
+        .with_mode(EncryptionSetting::On)
+        .with_server_trust(ServerTrust::DangerAcceptAny);
 
     let provider = TdsConnectionProvider {};
     let mut client = provider.create_client(context, &datasource, None).await?;
@@ -264,13 +250,9 @@ async fn connect_and_get_transport(datasource: &str) -> TdsResult<String> {
     let mut context = ClientContext::default();
     context.database = "master".to_string();
     context.tds_authentication_method = TdsAuthenticationMethod::SSPI;
-    context.encryption_options = EncryptionOptions {
-        mode: EncryptionSetting::On,
-        trust_server_certificate: true,
-        host_name_in_cert: None,
-        server_certificate: None,
-        server_ca: None,
-    };
+    context.encryption_options = EncryptionOptions::new()
+        .with_mode(EncryptionSetting::On)
+        .with_server_trust(ServerTrust::DangerAcceptAny);
 
     let provider = TdsConnectionProvider {};
     let mut client = provider.create_client(context, datasource, None).await?;
@@ -353,13 +335,9 @@ async fn test_sspi_localhost_select_one() -> TdsResult<()> {
     let mut context = ClientContext::default();
     context.database = "master".to_string();
     context.tds_authentication_method = TdsAuthenticationMethod::SSPI;
-    context.encryption_options = EncryptionOptions {
-        mode: EncryptionSetting::PreferOff,
-        trust_server_certificate: true,
-        host_name_in_cert: None,
-        server_certificate: None,
-        server_ca: None,
-    };
+    context.encryption_options = EncryptionOptions::new()
+        .with_mode(EncryptionSetting::PreferOff)
+        .with_server_trust(ServerTrust::DangerAcceptAny);
 
     let provider = TdsConnectionProvider {};
     let mut client = provider
@@ -406,13 +384,9 @@ async fn test_sspi_named_instance_select_one() -> TdsResult<()> {
     let mut context = ClientContext::default();
     context.database = "master".to_string();
     context.tds_authentication_method = TdsAuthenticationMethod::SSPI;
-    context.encryption_options = EncryptionOptions {
-        mode: EncryptionSetting::PreferOff,
-        trust_server_certificate: true,
-        host_name_in_cert: None,
-        server_certificate: None,
-        server_ca: None,
-    };
+    context.encryption_options = EncryptionOptions::new()
+        .with_mode(EncryptionSetting::PreferOff)
+        .with_server_trust(ServerTrust::DangerAcceptAny);
 
     let provider = TdsConnectionProvider {};
     let mut client = provider.create_client(context, &datasource, None).await?;

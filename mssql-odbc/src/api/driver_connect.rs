@@ -24,7 +24,7 @@ use crate::handles::{HandleType, handle_from_raw};
 
 use mssql_tds::connection::client_context::{ClientContext, IPAddressPreference};
 use mssql_tds::connection_provider::tds_connection_provider::TdsConnectionProvider;
-use mssql_tds::core::{EncryptionOptions, EncryptionSetting};
+use mssql_tds::core::{EncryptionOptions, EncryptionSetting, TdsResult};
 use mssql_tds::message::login_options::ApplicationIntent;
 use std::path::PathBuf;
 
@@ -392,12 +392,13 @@ fn do_connect(
         return SQL_ERROR;
     }
 
-    context.encryption_options = EncryptionOptions {
-        trust_server_certificate: params.trust_server_certificate,
-        mode: encryption_setting(params.encrypt.as_deref()),
-        host_name_in_cert: None,
-        server_certificate: None,
-        server_ca: None,
+    context.encryption_options = match encryption_options(&params) {
+        Ok(options) => options,
+        Err(e) => {
+            error!(%e, "SQLDriverConnectW: invalid TLS options");
+            post_tds_error(state, &e, SQLSTATE_08001);
+            return SQL_ERROR;
+        }
     };
 
     seed_and_apply_connection_params(&mut context, state.packet_size, &params);
@@ -498,6 +499,17 @@ fn do_connect(
 pub(super) const MIN_PACKET_SIZE: u32 = 512;
 pub(super) const MAX_PACKET_SIZE: u32 = 32768;
 
+/// Maps the `Encrypt`, `TrustServerCertificate`, `HostNameInCertificate` and
+/// `ServerCertificate` keywords onto the TLS configuration.
+fn encryption_options(params: &ConnectionParams) -> TdsResult<EncryptionOptions> {
+    EncryptionOptions::from_connection_keywords(
+        encryption_setting(params.encrypt.as_deref()),
+        params.trust_server_certificate,
+        params.host_name_in_certificate.clone(),
+        params.server_certificate.as_deref().map(PathBuf::from),
+    )
+}
+
 /// Maps parsed [`ConnectionParams`] onto a [`ClientContext`]. `ConnectRetryCount`
 /// and `ConnectRetryInterval` are already range-validated during parsing;
 /// `PacketSize` is clamped here to the range `mssql-tds` accepts. Enum strings are
@@ -506,10 +518,6 @@ pub(super) const MAX_PACKET_SIZE: u32 = 32768;
 /// (matching msodbcsql). Kept separate from `do_connect` so the mapping is
 /// unit-testable without a live server.
 fn apply_connection_params(context: &mut ClientContext, params: &ConnectionParams) {
-    context.encryption_options.host_name_in_cert = params.host_name_in_certificate.clone();
-    context.encryption_options.server_certificate =
-        params.server_certificate.as_deref().map(PathBuf::from);
-
     if let Some(server_spn) = &params.server_spn {
         context.server_spn = Some(server_spn.clone());
     }
@@ -597,6 +605,7 @@ mod tests {
         SQL_DRIVER_COMPLETE, SQL_HANDLE_DBC, SQL_INVALID_HANDLE, SQL_NTS, SQL_NULL_HANDLE,
     };
     use crate::test_support::{TestHandles, cs};
+    use mssql_tds::core::{CertificateSource, ServerTrust, TrustRoots};
 
     #[test]
     fn initial_database_uses_keyword_then_attribute_then_login_default() {
@@ -980,22 +989,62 @@ mod tests {
     }
 
     #[test]
-    fn apply_params_maps_tls_identity_fields() {
-        let mut ctx = ClientContext::default();
+    fn encryption_options_maps_host_name_in_certificate() {
+        let params = ConnectionParams {
+            host_name_in_certificate: Some("cn.contoso.com".to_string()),
+            ..Default::default()
+        };
+        let options = encryption_options(&params).unwrap();
+        assert_eq!(
+            options.server_trust,
+            ServerTrust::Verify {
+                roots: TrustRoots::Platform,
+                host_name: Some("cn.contoso.com".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn encryption_options_maps_server_certificate_to_pin() {
+        let params = ConnectionParams {
+            server_certificate: Some("/etc/ssl/server.pem".to_string()),
+            trust_server_certificate: true,
+            ..Default::default()
+        };
+        let options = encryption_options(&params).unwrap();
+        assert_eq!(
+            options.server_trust,
+            ServerTrust::Pinned(CertificateSource::File("/etc/ssl/server.pem".into()))
+        );
+    }
+
+    #[test]
+    fn encryption_options_ignores_trust_under_strict() {
+        let trusting = |encrypt: &str| ConnectionParams {
+            encrypt: Some(encrypt.to_string()),
+            trust_server_certificate: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            encryption_options(&trusting("yes")).unwrap().server_trust,
+            ServerTrust::DangerAcceptAny
+        );
+        assert_eq!(
+            encryption_options(&trusting("strict"))
+                .unwrap()
+                .server_trust,
+            ServerTrust::default()
+        );
+    }
+
+    #[test]
+    fn encryption_options_rejects_pin_with_host_name() {
         let params = ConnectionParams {
             host_name_in_certificate: Some("cn.contoso.com".to_string()),
             server_certificate: Some("/etc/ssl/server.pem".to_string()),
             ..Default::default()
         };
-        apply_connection_params(&mut ctx, &params);
-        assert_eq!(
-            ctx.encryption_options.host_name_in_cert.as_deref(),
-            Some("cn.contoso.com")
-        );
-        assert_eq!(
-            ctx.encryption_options.server_certificate,
-            Some(PathBuf::from("/etc/ssl/server.pem"))
-        );
+        assert!(encryption_options(&params).is_err());
     }
 
     #[test]
@@ -1143,8 +1192,6 @@ mod tests {
         assert_eq!(ctx.packet_size, before_packet);
         assert_eq!(ctx.connect_retry_count, before_retry);
         assert_eq!(ctx.application_name, before_app_name);
-        assert_eq!(ctx.encryption_options.host_name_in_cert, None);
-        assert_eq!(ctx.encryption_options.server_certificate, None);
     }
 
     /// Drives `do_connect`'s actual `seed_and_apply_connection_params` helper

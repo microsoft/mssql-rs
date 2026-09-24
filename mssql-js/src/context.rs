@@ -3,7 +3,7 @@
 
 use mssql_tds::{
     connection::client_context::ClientContext,
-    core::{EncryptionOptions, EncryptionSetting},
+    core::{EncryptionOptions, EncryptionSetting, ServerTrust},
 };
 use tracing::info;
 
@@ -20,13 +20,14 @@ pub struct JsClientContext {
 
 impl From<JsClientContext> for ClientContext {
     fn from(js_ctx: JsClientContext) -> Self {
-        let encryption_options = EncryptionOptions {
-            mode: EncryptionSetting::Required,
-            trust_server_certificate: js_ctx.trust_server_certificate,
-            host_name_in_cert: None,
-            server_certificate: None,
-            server_ca: None,
+        let server_trust = if js_ctx.trust_server_certificate {
+            ServerTrust::DangerAcceptAny
+        } else {
+            ServerTrust::default()
         };
+        let encryption_options = EncryptionOptions::new()
+            .with_mode(EncryptionSetting::Required)
+            .with_server_trust(server_trust);
 
         info!(
             "Creating ClientContext with server_name: {}, port: {}, user_name: {}, database: {}",

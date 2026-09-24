@@ -191,8 +191,6 @@ pub struct DefaultClientContextValidator;
 
 impl ClientContextValidator for DefaultClientContextValidator {
     fn validate(&self, context: &ClientContext) -> TdsResult<()> {
-        context.encryption_options.validate()?;
-
         // Validate packet_size is within acceptable range (512 - 32768)
         const MIN_PACKET_SIZE: u16 = 512;
         const MAX_PACKET_SIZE: u16 = 32768;

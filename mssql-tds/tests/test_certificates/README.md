@@ -12,7 +12,7 @@ These files are NOT tracked in git (they contain secrets). Generate them locally
 The same certificate in DER (binary) format for testing DER file loading.
 
 ### ca_cert.pem / ca_key.pem
-A private test CA used by the ServerCA (custom trust root) tests.
+A private test CA used by the custom trust root tests.
 
 ### ca_signed_cert.pem / ca_signed_key.pem
 A leaf certificate for `localhost` / `127.0.0.1` issued by the test CA above.
@@ -28,7 +28,7 @@ An invalid file that doesn't contain a valid certificate, used to test error han
 ## Generating Test Certificates
 
 Before running TLS tests, generate the test certificates locally.
-The ServerCA tests require these fixtures on every platform; missing, unreadable,
+The custom trust root tests require these fixtures on every platform; missing, unreadable,
 or malformed files fail the tests rather than silently skipping TLS coverage.
 
 ### From repository root (recommended for CI/CD):

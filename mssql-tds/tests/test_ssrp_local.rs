@@ -26,7 +26,7 @@ mod ssrp_local {
     use mssql_tds::connection::client_context::{ClientContext, TdsAuthenticationMethod};
     use mssql_tds::connection::tds_client::{ResultSet, TdsClient};
     use mssql_tds::connection_provider::tds_connection_provider::TdsConnectionProvider;
-    use mssql_tds::core::{EncryptionOptions, EncryptionSetting, TdsResult};
+    use mssql_tds::core::{EncryptionOptions, EncryptionSetting, ServerTrust, TdsResult};
     use mssql_tds::datatypes::column_values::ColumnValues;
 
     use crate::common::init_tracing;
@@ -39,13 +39,9 @@ mod ssrp_local {
         let mut ctx = ClientContext::default();
         ctx.tds_authentication_method = TdsAuthenticationMethod::SSPI;
         ctx.database = "master".to_string();
-        ctx.encryption_options = EncryptionOptions {
-            mode: EncryptionSetting::On,
-            trust_server_certificate: true,
-            host_name_in_cert: None,
-            server_certificate: None,
-            server_ca: None,
-        };
+        ctx.encryption_options = EncryptionOptions::new()
+            .with_mode(EncryptionSetting::On)
+            .with_server_trust(ServerTrust::DangerAcceptAny);
 
         let provider = TdsConnectionProvider {};
         provider.create_client(ctx, datasource, None).await

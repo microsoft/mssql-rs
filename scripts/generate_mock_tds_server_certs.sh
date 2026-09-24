@@ -25,7 +25,7 @@ openssl req -x509 -newkey rsa:2048 \
 openssl x509 -in "$CERT_DIR/valid_cert.pem" -outform DER -out "$CERT_DIR/valid_cert.der" 2>/dev/null
 
 # Generate a private CA plus a leaf certificate signed by it. These back the
-# ServerCA (custom trust root) tests: the client trusts the CA, not the leaf.
+# custom trust root tests: the client trusts the CA, not the leaf.
 openssl req -x509 -newkey rsa:2048 \
     -keyout "$CERT_DIR/ca_key.pem" \
     -out "$CERT_DIR/ca_cert.pem" \

@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! Tests for the ServerCA option (custom trust roots).
+//! Tests for custom trust roots (`TrustRoots::Custom` / `PlatformAndCustom`).
 //!
 //! The mock server presents a leaf certificate issued by a private test CA.
 //! The client trusts the CA itself, so chain building, host name verification
@@ -18,7 +18,7 @@ use mssql_mock_tds::MockTdsServer;
 use mssql_mock_tds::create_test_identity;
 use mssql_tds::connection::client_context::ClientContext;
 use mssql_tds::connection_provider::tds_connection_provider::TdsConnectionProvider;
-use mssql_tds::core::{EncryptionOptions, EncryptionSetting};
+use mssql_tds::core::{CertificateSource, EncryptionOptions, ServerTrust, TrustRoots};
 #[cfg(not(windows))]
 use std::fs;
 use tokio::sync::oneshot;
@@ -67,17 +67,12 @@ fn load_identity(
     }
 }
 
-fn encryption_options(
-    server_ca: Option<&str>,
-    host_name_in_cert: Option<&str>,
-) -> EncryptionOptions {
-    EncryptionOptions {
-        mode: EncryptionSetting::Strict,
-        trust_server_certificate: false,
-        host_name_in_cert: host_name_in_cert.map(str::to_string),
-        server_certificate: None,
-        server_ca: server_ca.map(Into::into),
-    }
+fn trusting(roots: TrustRoots) -> EncryptionOptions {
+    EncryptionOptions::new().with_server_trust(ServerTrust::verify(roots))
+}
+
+fn ca_file(path: &str) -> CertificateSource {
+    CertificateSource::File(path.into())
 }
 
 /// Starts a strict-TLS mock server with `identity` and tries to connect with
@@ -114,25 +109,33 @@ async fn connect_to_mock_server(
 #[tokio::test]
 async fn ca_signed_certificate_is_accepted_when_ca_is_trusted()
 -> Result<(), Box<dyn std::error::Error>> {
-    let identity = load_identity(&CA_SIGNED_IDENTITY)?;
-
-    assert!(
-        connect_to_mock_server(identity, encryption_options(Some(CA_CERT), None)).await?,
-        "connection should succeed when the issuing CA is supplied through ServerCA"
-    );
+    for roots in [
+        TrustRoots::PlatformAndCustom(ca_file(CA_CERT)),
+        TrustRoots::Custom(ca_file(CA_CERT)),
+        TrustRoots::Custom(CertificateSource::Pem(std::fs::read(CA_CERT)?)),
+    ] {
+        let identity = load_identity(&CA_SIGNED_IDENTITY)?;
+        assert!(
+            connect_to_mock_server(identity, trusting(roots.clone())).await?,
+            "connection should succeed when the issuing CA is trusted via {roots:?}"
+        );
+    }
     Ok(())
 }
 
 #[tokio::test]
 async fn ca_signed_certificate_is_rejected_for_unrelated_ca()
 -> Result<(), Box<dyn std::error::Error>> {
-    let identity = load_identity(&CA_SIGNED_IDENTITY)?;
-
-    assert!(
-        !connect_to_mock_server(identity, encryption_options(Some(UNRELATED_CA_CERT), None))
-            .await?,
-        "connection should fail when the supplied CA did not issue the server certificate"
-    );
+    for roots in [
+        TrustRoots::PlatformAndCustom(ca_file(UNRELATED_CA_CERT)),
+        TrustRoots::Custom(ca_file(UNRELATED_CA_CERT)),
+    ] {
+        let identity = load_identity(&CA_SIGNED_IDENTITY)?;
+        assert!(
+            !connect_to_mock_server(identity, trusting(roots.clone())).await?,
+            "connection should fail when {roots:?} did not issue the server certificate"
+        );
+    }
     Ok(())
 }
 
@@ -140,13 +143,13 @@ async fn ca_signed_certificate_is_rejected_for_unrelated_ca()
 async fn trusted_ca_still_enforces_host_name_validation() -> Result<(), Box<dyn std::error::Error>>
 {
     let identity = load_identity(&CA_SIGNED_IDENTITY)?;
+    let options = EncryptionOptions::new().with_server_trust(ServerTrust::Verify {
+        roots: TrustRoots::Custom(ca_file(CA_CERT)),
+        host_name: Some("wrong.hostname.example.com".to_string()),
+    });
 
     assert!(
-        !connect_to_mock_server(
-            identity,
-            encryption_options(Some(CA_CERT), Some("wrong.hostname.example.com"))
-        )
-        .await?,
+        !connect_to_mock_server(identity, options).await?,
         "connection should fail when the certificate does not match the expected host name"
     );
     Ok(())
@@ -158,8 +161,12 @@ async fn trusted_ca_does_not_trust_unrelated_self_signed_certificate()
     let identity = load_identity(&SELF_SIGNED_IDENTITY)?;
 
     assert!(
-        !connect_to_mock_server(identity, encryption_options(Some(CA_CERT), None)).await?,
-        "ServerCA must not make unrelated certificates acceptable"
+        !connect_to_mock_server(
+            identity,
+            trusting(TrustRoots::PlatformAndCustom(ca_file(CA_CERT)))
+        )
+        .await?,
+        "a custom CA must not make unrelated certificates acceptable"
     );
     Ok(())
 }
@@ -169,47 +176,18 @@ async fn custom_trust_root_does_not_leak_to_other_connections()
 -> Result<(), Box<dyn std::error::Error>> {
     let identity = load_identity(&CA_SIGNED_IDENTITY)?;
     assert!(
-        connect_to_mock_server(identity, encryption_options(Some(CA_CERT), None)).await?,
-        "connection with ServerCA should succeed first"
+        connect_to_mock_server(
+            identity,
+            trusting(TrustRoots::PlatformAndCustom(ca_file(CA_CERT)))
+        )
+        .await?,
+        "connection with a custom CA should succeed first"
     );
 
     let identity = load_identity(&CA_SIGNED_IDENTITY)?;
     assert!(
-        !connect_to_mock_server(identity, encryption_options(None, None)).await?,
-        "a connection without ServerCA must not inherit the custom trust root"
+        !connect_to_mock_server(identity, EncryptionOptions::new()).await?,
+        "a connection with platform roots must not inherit the custom trust root"
     );
     Ok(())
-}
-
-#[tokio::test]
-async fn conflicting_server_ca_options_are_rejected_before_connecting() {
-    for mode in [
-        EncryptionSetting::PreferOff,
-        EncryptionSetting::On,
-        EncryptionSetting::Required,
-        EncryptionSetting::Strict,
-    ] {
-        for conflicting_option in ["TrustServerCertificate", "ServerCertificate"] {
-            let mut context = ClientContext::default();
-            context.encryption_options = encryption_options(Some(CA_CERT), None);
-            context.encryption_options.mode = mode;
-            if conflicting_option == "TrustServerCertificate" {
-                context.encryption_options.trust_server_certificate = true;
-            } else {
-                context.encryption_options.server_certificate = Some("leaf.pem".into());
-            }
-
-            let result = TdsConnectionProvider::new()
-                .create_client(context, "tcp:127.0.0.1,0", None)
-                .await;
-            assert!(
-                matches!(
-                    result,
-                    Err(mssql_tds::error::Error::UsageError(ref message))
-                        if message.contains("ServerCA") && message.contains(conflicting_option)
-                ),
-                "conflicting {conflicting_option} must fail before transport use in {mode:?} mode"
-            );
-        }
-    }
 }

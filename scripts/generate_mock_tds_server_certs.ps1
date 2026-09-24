@@ -100,7 +100,7 @@ catch {
     exit 1
 }
 
-# Generate the ServerCA fixtures: a private CA, a leaf issued by it, and an
+# Generate the custom trust root fixtures: a private CA, a leaf issued by it, and an
 # unrelated CA.
 try {
     $CaCertPath = Join-Path $CertDir "ca_cert.pem"
@@ -207,7 +207,7 @@ try {
     $leafWithKey.Dispose()
 }
 catch {
-    Write-Error "Failed to generate ServerCA test certificates: $_"
+    Write-Error "Failed to generate custom trust root test certificates: $_"
     exit 1
 }
 

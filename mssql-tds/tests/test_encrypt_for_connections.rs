@@ -35,13 +35,13 @@ mod encryption_tests {
                 "SQL_PASSWORD environment variable not set and /tmp/password could not be read",
             );
         context.database = "master".to_string();
-        context.encryption_options = EncryptionOptions {
-            mode: encryption_setting,
-            trust_server_certificate: trust_server_certificate(),
-            host_name_in_cert: env::var("CERT_HOST_NAME").ok(),
-            server_certificate: None,
-            server_ca: None,
-        };
+        context.encryption_options = EncryptionOptions::from_connection_keywords(
+            encryption_setting,
+            trust_server_certificate(),
+            env::var("CERT_HOST_NAME").ok(),
+            None,
+        )
+        .unwrap();
         context
     }
 

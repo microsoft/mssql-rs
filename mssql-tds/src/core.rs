@@ -225,57 +225,160 @@ mod tests {
 
         assert!(matches!(result, Err(OperationCancelledError(_))));
     }
+
+    fn keywords(
+        mode: EncryptionSetting,
+        trust: bool,
+        host_name: Option<&str>,
+        certificate: Option<&str>,
+    ) -> TdsResult<ServerTrust> {
+        EncryptionOptions::from_connection_keywords(
+            mode,
+            trust,
+            host_name.map(str::to_string),
+            certificate.map(PathBuf::from),
+        )
+        .map(|options| options.server_trust)
+    }
+
+    #[test]
+    fn connection_keywords_default_to_platform_verification() {
+        assert_eq!(
+            keywords(EncryptionSetting::On, false, None, None).unwrap(),
+            ServerTrust::default()
+        );
+        assert_eq!(
+            keywords(EncryptionSetting::On, false, Some(""), None).unwrap(),
+            ServerTrust::default()
+        );
+        assert_eq!(
+            keywords(EncryptionSetting::On, false, Some("cn.example"), None).unwrap(),
+            ServerTrust::Verify {
+                roots: TrustRoots::Platform,
+                host_name: Some("cn.example".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn connection_keywords_trust_server_certificate_is_ignored_under_strict() {
+        assert_eq!(
+            keywords(EncryptionSetting::Required, true, None, None).unwrap(),
+            ServerTrust::DangerAcceptAny
+        );
+        assert_eq!(
+            keywords(EncryptionSetting::Strict, true, None, None).unwrap(),
+            ServerTrust::default()
+        );
+    }
+
+    #[test]
+    fn connection_keywords_server_certificate_takes_precedence() {
+        for mode in [EncryptionSetting::On, EncryptionSetting::Strict] {
+            assert_eq!(
+                keywords(mode, true, None, Some("server.cer")).unwrap(),
+                ServerTrust::Pinned(CertificateSource::File("server.cer".into()))
+            );
+        }
+    }
+
+    #[test]
+    fn connection_keywords_reject_pin_with_host_name() {
+        assert!(matches!(
+            keywords(
+                EncryptionSetting::On,
+                false,
+                Some("cn.example"),
+                Some("server.cer")
+            ),
+            Err(Error::UsageError(_))
+        ));
+    }
 }
 
 /// TLS and encryption settings for a TDS connection.
+///
+/// ```
+/// use mssql_tds::core::{
+///     CertificateSource, EncryptionOptions, EncryptionSetting, ServerTrust, TrustRoots,
+/// };
+///
+/// let options = EncryptionOptions::new()
+///     .with_mode(EncryptionSetting::Strict)
+///     .with_server_trust(ServerTrust::verify(TrustRoots::PlatformAndCustom(
+///         CertificateSource::File("/etc/ssl/private-ca.pem".into()),
+///     )));
+/// # let _ = options;
+/// ```
 #[derive(Clone, PartialEq, Debug)]
+#[non_exhaustive]
 pub struct EncryptionOptions {
     /// Encryption mode negotiated with the server.
     pub mode: EncryptionSetting,
-    /// Skip server certificate chain validation.
-    pub trust_server_certificate: bool,
-    /// Expected CN or SAN in the server certificate.
-    pub host_name_in_cert: Option<String>,
-    /// Path to a DER or PEM encoded X.509 certificate file for certificate pinning.
-    /// When specified, the driver performs an exact binary match between the provided
-    /// certificate and the server's certificate, bypassing standard CA chain validation.
-    pub server_certificate: Option<PathBuf>,
-    /// Path to a DER or PEM encoded X.509 CA certificate (or PEM bundle) trusted
-    /// to issue the server's certificate. The certificates are added to the trust
-    /// roots of this connection only, supplementing the platform roots. Standard
-    /// chain, validity and host name validation stay enabled. Mutually exclusive
-    /// with `trust_server_certificate` and `server_certificate`.
-    pub server_ca: Option<PathBuf>,
+    /// How the server's certificate is authenticated.
+    pub server_trust: ServerTrust,
 }
 
 impl EncryptionOptions {
-    pub(crate) fn validate(&self) -> TdsResult<()> {
-        if self.server_ca.is_some() {
-            if self.trust_server_certificate {
-                return Err(crate::error::Error::UsageError(
-                    "ServerCA and TrustServerCertificate are mutually exclusive. TrustServerCertificate would disable the requested CA validation."
-                        .to_string(),
-                ));
-            }
-            if self.server_certificate.is_some() {
-                return Err(crate::error::Error::UsageError(
-                    "ServerCA and ServerCertificate are mutually exclusive. Use ServerCA to trust an issuing CA or ServerCertificate to pin a certificate."
-                        .to_string(),
-                ));
-            }
-        }
-        Ok(())
-    }
-
-    /// Creates encryption options defaulting to `Strict` mode.
+    /// Creates encryption options defaulting to `Strict` mode with platform
+    /// certificate validation.
     pub fn new() -> Self {
         EncryptionOptions {
             mode: EncryptionSetting::Strict,
-            trust_server_certificate: false,
-            host_name_in_cert: None,
-            server_certificate: None,
-            server_ca: None,
+            server_trust: ServerTrust::default(),
         }
+    }
+
+    /// Sets the encryption mode.
+    pub fn with_mode(mut self, mode: EncryptionSetting) -> Self {
+        self.mode = mode;
+        self
+    }
+
+    /// Sets how the server certificate is authenticated.
+    pub fn with_server_trust(mut self, server_trust: ServerTrust) -> Self {
+        self.server_trust = server_trust;
+        self
+    }
+
+    /// Maps the ODBC-style connection keywords shared by the driver bindings
+    /// onto encryption options, including msodbcsql's rules for how they
+    /// interact: `ServerCertificate` wins over `TrustServerCertificate`, and
+    /// `TrustServerCertificate` is ignored under `Strict` encryption.
+    pub fn from_connection_keywords(
+        mode: EncryptionSetting,
+        trust_server_certificate: bool,
+        host_name_in_certificate: Option<String>,
+        server_certificate: Option<PathBuf>,
+    ) -> TdsResult<Self> {
+        let host_name = host_name_in_certificate.filter(|name| !name.is_empty());
+        let server_trust = if let Some(path) = server_certificate {
+            if host_name.is_some() {
+                return Err(Error::UsageError(
+                    "ServerCertificate and HostnameInCertificate are mutually exclusive. Use only one."
+                        .to_string(),
+                ));
+            }
+            if trust_server_certificate {
+                tracing::warn!(
+                    "Both ServerCertificate and TrustServerCertificate are specified. ServerCertificate takes precedence."
+                );
+            }
+            ServerTrust::Pinned(CertificateSource::File(path))
+        } else if trust_server_certificate && mode != EncryptionSetting::Strict {
+            ServerTrust::DangerAcceptAny
+        } else {
+            if trust_server_certificate {
+                tracing::warn!(
+                    "TrustServerCertificate is ignored for Strict encryption mode. Certificate validation will be enforced."
+                );
+            }
+            ServerTrust::Verify {
+                roots: TrustRoots::Platform,
+                host_name,
+            }
+        };
+        Ok(EncryptionOptions { mode, server_trust })
     }
 }
 
@@ -283,6 +386,74 @@ impl Default for EncryptionOptions {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// How the server's TLS certificate is authenticated.
+///
+/// Each variant is a complete trust model, so contradictory combinations
+/// (e.g. pinning a certificate while also skipping validation) cannot be
+/// expressed.
+#[derive(Clone, PartialEq, Eq, Debug)]
+#[non_exhaustive]
+pub enum ServerTrust {
+    /// Validate the certificate chain, validity period and host name.
+    Verify {
+        /// Trust anchors the chain must terminate in.
+        roots: TrustRoots,
+        /// Host name expected in the certificate instead of the server name
+        /// being connected to (`HostNameInCertificate`).
+        host_name: Option<String>,
+    },
+    /// Accept only a certificate byte-identical to this one
+    /// (`ServerCertificate`). Chain and host name are not checked; expiry is.
+    Pinned(CertificateSource),
+    /// Accept any certificate without validation (`TrustServerCertificate`).
+    /// The connection is encrypted but not authenticated.
+    DangerAcceptAny,
+}
+
+impl ServerTrust {
+    /// Validation against `roots`, checking the server name being connected to.
+    pub fn verify(roots: TrustRoots) -> Self {
+        ServerTrust::Verify {
+            roots,
+            host_name: None,
+        }
+    }
+}
+
+impl Default for ServerTrust {
+    fn default() -> Self {
+        ServerTrust::verify(TrustRoots::Platform)
+    }
+}
+
+/// Trust anchors used by [`ServerTrust::Verify`].
+///
+/// Custom certificates must be CA certificates that terminate the server's
+/// chain; they are scoped to the connection and never installed system wide.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+#[non_exhaustive]
+pub enum TrustRoots {
+    /// The operating system's trusted roots.
+    Platform,
+    /// Only these certificates; the platform roots are not trusted.
+    Custom(CertificateSource),
+    /// The platform roots plus these certificates.
+    PlatformAndCustom(CertificateSource),
+}
+
+/// Where certificate material comes from.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+#[non_exhaustive]
+pub enum CertificateSource {
+    /// A PEM (single certificate or bundle) or DER file, re-read on every
+    /// connection so rotated files take effect without restarting.
+    File(PathBuf),
+    /// PEM-encoded certificate or bundle.
+    Pem(Vec<u8>),
+    /// A single DER-encoded certificate.
+    Der(Vec<u8>),
 }
 
 /// Encryption level requested by the client during the TDS pre-login.

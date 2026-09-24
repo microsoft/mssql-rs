@@ -186,11 +186,9 @@ impl PyAsyncConnection {
         let datasource = context.data_source.clone();
 
         tracing::info!(
-            "PyAsyncConnection::connect: encryption mode={:?}, trust_server_certificate={}, host_name_in_cert={:?}, server_certificate={:?}",
+            "PyAsyncConnection::connect: encryption mode={:?}, server_trust={:?}",
             context.encryption_options.mode,
-            context.encryption_options.trust_server_certificate,
-            context.encryption_options.host_name_in_cert,
-            context.encryption_options.server_certificate,
+            context.encryption_options.server_trust,
         );
 
         tracing::info!(

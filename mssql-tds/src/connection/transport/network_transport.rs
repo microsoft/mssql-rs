@@ -3175,7 +3175,7 @@ pub(crate) mod tests {
     use crate::connection::client_context::ClientContext;
     use crate::connection::transport::network_transport::Stream;
     use crate::connection::transport::ssl_handler::SslHandler;
-    use crate::core::EncryptionOptions;
+    use crate::core::{EncryptionOptions, ServerTrust};
     use crate::datatypes::row_writer::DefaultRowWriter;
     use crate::datatypes::sqldatatypes::{TdsDataType, TypeInfo};
     use crate::message::messages::PacketType;
@@ -3454,11 +3454,9 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn test_network_transport_send() {
         let context = ClientContext {
-            encryption_options: EncryptionOptions {
-                mode: EncryptionSetting::On,
-                trust_server_certificate: true,
-                ..EncryptionOptions::default()
-            },
+            encryption_options: EncryptionOptions::new()
+                .with_mode(EncryptionSetting::On)
+                .with_server_trust(ServerTrust::DangerAcceptAny),
             ..Default::default()
         };
         let (mut transport, server_side) = create_readable_network_transport(&context);
@@ -3504,11 +3502,9 @@ pub(crate) mod tests {
 
         let context = ClientContext {
             packet_size: initial_packet_size as u16,
-            encryption_options: EncryptionOptions {
-                mode: EncryptionSetting::On,
-                trust_server_certificate: true,
-                ..EncryptionOptions::default()
-            },
+            encryption_options: EncryptionOptions::new()
+                .with_mode(EncryptionSetting::On)
+                .with_server_trust(ServerTrust::DangerAcceptAny),
             ..Default::default()
         };
 
@@ -3554,11 +3550,9 @@ pub(crate) mod tests {
 
         let context = ClientContext {
             packet_size: packet_size as u16,
-            encryption_options: EncryptionOptions {
-                mode: EncryptionSetting::On,
-                trust_server_certificate: true,
-                ..EncryptionOptions::default()
-            },
+            encryption_options: EncryptionOptions::new()
+                .with_mode(EncryptionSetting::On)
+                .with_server_trust(ServerTrust::DangerAcceptAny),
             ..Default::default()
         };
 
@@ -3598,11 +3592,9 @@ pub(crate) mod tests {
 
         let context = ClientContext {
             packet_size: packet_size as u16,
-            encryption_options: EncryptionOptions {
-                mode: EncryptionSetting::On,
-                trust_server_certificate: true,
-                ..EncryptionOptions::default()
-            },
+            encryption_options: EncryptionOptions::new()
+                .with_mode(EncryptionSetting::On)
+                .with_server_trust(ServerTrust::DangerAcceptAny),
             ..Default::default()
         };
 
@@ -3720,11 +3712,9 @@ pub(crate) mod tests {
 
         let context = ClientContext {
             packet_size: packet_size as u16,
-            encryption_options: EncryptionOptions {
-                mode: EncryptionSetting::On,
-                trust_server_certificate: true,
-                ..EncryptionOptions::default()
-            },
+            encryption_options: EncryptionOptions::new()
+                .with_mode(EncryptionSetting::On)
+                .with_server_trust(ServerTrust::DangerAcceptAny),
             ..Default::default()
         };
 
@@ -3976,11 +3966,9 @@ pub(crate) mod tests {
 
         let context = ClientContext {
             packet_size: packet_size as u16,
-            encryption_options: EncryptionOptions {
-                mode: EncryptionSetting::On,
-                trust_server_certificate: true,
-                ..EncryptionOptions::default()
-            },
+            encryption_options: EncryptionOptions::new()
+                .with_mode(EncryptionSetting::On)
+                .with_server_trust(ServerTrust::DangerAcceptAny),
             ..Default::default()
         };
 
@@ -4108,11 +4096,9 @@ pub(crate) mod tests {
 
         let context = ClientContext {
             packet_size: packet_size as u16,
-            encryption_options: EncryptionOptions {
-                mode: EncryptionSetting::On,
-                trust_server_certificate: true,
-                ..EncryptionOptions::default()
-            },
+            encryption_options: EncryptionOptions::new()
+                .with_mode(EncryptionSetting::On)
+                .with_server_trust(ServerTrust::DangerAcceptAny),
             ..Default::default()
         };
 
@@ -4176,11 +4162,9 @@ pub(crate) mod tests {
 
         let context = ClientContext {
             packet_size: packet_size as u16,
-            encryption_options: EncryptionOptions {
-                mode: EncryptionSetting::On,
-                trust_server_certificate: true,
-                ..EncryptionOptions::default()
-            },
+            encryption_options: EncryptionOptions::new()
+                .with_mode(EncryptionSetting::On)
+                .with_server_trust(ServerTrust::DangerAcceptAny),
             ..Default::default()
         };
 

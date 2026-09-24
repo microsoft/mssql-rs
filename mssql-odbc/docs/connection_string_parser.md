@@ -154,9 +154,9 @@ pass both keys directly; mssql-python collapses the group to a single canonical
 | `Authentication` | auth resolution | recognized-keyword set |
 | `Trusted_Connection` | integrated auth | `Yes` / `No` |
 | `Encrypt` | `EncryptionOptions::mode` | `Yes` / `Mandatory` / `No` / `Optional` / `Strict` |
-| `TrustServerCertificate` | `EncryptionOptions::trust_server_certificate` | `Yes` / `No` |
-| `HostnameInCertificate` | `EncryptionOptions::host_name_in_cert` | verbatim |
-| `ServerCertificate` | `EncryptionOptions::server_certificate` (path) | verbatim path |
+| `TrustServerCertificate` | `ServerTrust::DangerAcceptAny` via `EncryptionOptions::from_connection_keywords` | `Yes` / `No`; ignored under `Strict` |
+| `HostnameInCertificate` | `ServerTrust::Verify { host_name }` | verbatim |
+| `ServerCertificate` | `ServerTrust::Pinned(CertificateSource::File)` | verbatim path; wins over `TrustServerCertificate` |
 | `ServerSPN` | `ClientContext::server_spn` | verbatim |
 | `APP` | `ClientContext::application_name` | verbatim |
 | `ApplicationIntent` | `ClientContext::application_intent` | `ReadOnly` / `ReadWrite` |

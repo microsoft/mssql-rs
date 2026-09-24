@@ -25,7 +25,6 @@
 //! that calls the right branch.
 
 use std::io;
-use std::path::Path;
 use std::ptr;
 
 use tracing::debug;
@@ -36,6 +35,7 @@ use windows_sys::Win32::Security::Cryptography;
 use super::cred::CredKind;
 use super::errors::sec_status_to_io_error;
 use super::handshake::SecCtx;
+use crate::core::CertificateSource;
 
 /// Extract the server's leaf certificate in DER form from a completed
 /// security context.
@@ -91,9 +91,9 @@ pub(crate) fn query_remote_cert_der(ctx: &SecCtx) -> io::Result<Vec<u8>> {
 pub(crate) fn validate_after_handshake(
     ctx: &SecCtx,
     kind: CredKind,
-    server_certificate_path: Option<&Path>,
+    pinned_certificate: Option<&CertificateSource>,
 ) -> Result<(), ValidationError> {
-    match (kind, server_certificate_path) {
+    match (kind, pinned_certificate) {
         (CredKind::AutoValidate, _) => {
             // Already validated inline by SChannel. Nothing to do.
             debug!("win_tls: validate skipped (AutoValidate; SChannel did chain build inline)");
@@ -105,12 +105,12 @@ pub(crate) fn validate_after_handshake(
             debug!("win_tls: validate skipped (NoValidate; TrustServerCertificate=Yes)");
             Ok(())
         }
-        (CredKind::ManualValidate, Some(path)) => {
+        (CredKind::ManualValidate, Some(pinned)) => {
             let der = query_remote_cert_der(ctx).map_err(ValidationError::QueryCert)?;
-            validate_pinned_cert(path, &der)
+            validate_pinned_cert(pinned, &der)
         }
         (CredKind::ManualValidate, None) => Err(ValidationError::ConfigMismatch(
-            "CredKind::ManualValidate requires a server_certificate_path".to_string(),
+            "CredKind::ManualValidate requires a pinned certificate".to_string(),
         )),
     }
 }
@@ -121,8 +121,8 @@ pub(crate) fn validate_after_handshake(
 /// Split out from [`validate_after_handshake`] so the pin decision and its
 /// logging are exercisable without a live Schannel context (the FFI in
 /// [`query_remote_cert_der`] cannot be driven from a unit test).
-fn validate_pinned_cert(path: &Path, der: &[u8]) -> Result<(), ValidationError> {
-    let result = super::super::certificate_validator::validate_server_certificate(path, der)
+fn validate_pinned_cert(pinned: &CertificateSource, der: &[u8]) -> Result<(), ValidationError> {
+    let result = super::super::certificate_validator::validate_server_certificate(pinned, der)
         .map_err(ValidationError::Pin);
     match &result {
         Ok(()) => debug!(
@@ -199,8 +199,8 @@ mod tests {
         // returns SEC_E_INVALID_HANDLE. Exercises the query_remote_cert_der
         // error branch and the ManualValidate+Some(path) arm.
         let dummy = SecCtx::for_test_only();
-        let path = std::path::PathBuf::from("nonexistent-cert.cer");
-        let r = validate_after_handshake(&dummy, CredKind::ManualValidate, Some(&path));
+        let pinned = CertificateSource::File("nonexistent-cert.cer".into());
+        let r = validate_after_handshake(&dummy, CredKind::ManualValidate, Some(&pinned));
         assert!(matches!(r, Err(ValidationError::QueryCert(_))));
     }
 
@@ -212,11 +212,20 @@ mod tests {
         assert!(query_remote_cert_der(&dummy).is_err());
     }
 
-    fn fixture(name: &str) -> std::path::PathBuf {
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests")
-            .join("test_certificates")
-            .join(name)
+    fn fixture(name: &str) -> CertificateSource {
+        CertificateSource::File(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests")
+                .join("test_certificates")
+                .join(name),
+        )
+    }
+
+    fn fixture_bytes(name: &str) -> Vec<u8> {
+        match fixture(name) {
+            CertificateSource::File(path) => std::fs::read(path).expect("read der fixture"),
+            _ => unreachable!(),
+        }
     }
 
     #[test]
@@ -224,9 +233,8 @@ mod tests {
         // Pin file and queried DER are the same (non-expired) certificate, so
         // the pin check succeeds. Covers the ManualValidate happy path that the
         // dummy-context tests cannot reach.
-        let der_path = fixture("valid_cert.der");
-        let der = std::fs::read(&der_path).expect("read der fixture");
-        let r = validate_pinned_cert(&der_path, &der);
+        let der = fixture_bytes("valid_cert.der");
+        let r = validate_pinned_cert(&fixture("valid_cert.der"), &der);
         assert!(r.is_ok(), "expected pin match, got {r:?}");
     }
 
@@ -234,8 +242,11 @@ mod tests {
     fn validate_pinned_cert_missing_pin_file_is_pin_error() {
         // Pin path does not exist => the validator fails to load the user cert
         // and the error is surfaced as ValidationError::Pin.
-        let der = std::fs::read(fixture("valid_cert.der")).expect("read der fixture");
-        let r = validate_pinned_cert(std::path::Path::new("definitely-missing-pin.cer"), &der);
+        let der = fixture_bytes("valid_cert.der");
+        let r = validate_pinned_cert(
+            &CertificateSource::File("definitely-missing-pin.cer".into()),
+            &der,
+        );
         assert!(matches!(r, Err(ValidationError::Pin(_))));
     }
 
@@ -244,11 +255,10 @@ mod tests {
         // A DER that differs from the pinned certificate is rejected as a Pin
         // error (whether it trips the expiry-parse step or the constant-time
         // comparison, both map to ValidationError::Pin).
-        let pin_path = fixture("valid_cert.der");
-        let mut der = std::fs::read(&pin_path).expect("read der fixture");
+        let mut der = fixture_bytes("valid_cert.der");
         let mid = der.len() / 2;
         der[mid] ^= 0xFF;
-        let r = validate_pinned_cert(&pin_path, &der);
+        let r = validate_pinned_cert(&fixture("valid_cert.der"), &der);
         assert!(matches!(r, Err(ValidationError::Pin(_))));
     }
 

@@ -61,13 +61,13 @@ mod timeout_and_cancel_tests {
         // Create a client context with a two-second timeout that points to localhost:1433.
         let mut client_context = ClientContext::default();
         client_context.database = "master".to_string();
-        client_context.encryption_options = EncryptionOptions {
-            mode: EncryptionSetting::PreferOff,
-            trust_server_certificate: trust_server_certificate(),
-            host_name_in_cert: None,
-            server_certificate: None,
-            server_ca: None,
-        };
+        client_context.encryption_options = EncryptionOptions::from_connection_keywords(
+            EncryptionSetting::PreferOff,
+            trust_server_certificate(),
+            None,
+            None,
+        )
+        .unwrap();
 
         let provider = TdsConnectionProvider {};
         let join_handle = tokio::spawn(async move {
@@ -163,13 +163,8 @@ mod timeout_and_cancel_tests {
         // Create a client context with a two-second timeout that points to localhost:1433.
         let mut client_context = ClientContext::default();
         client_context.database = "master".to_string();
-        client_context.encryption_options = EncryptionOptions {
-            mode: EncryptionSetting::PreferOff,
-            trust_server_certificate: false,
-            host_name_in_cert: None,
-            server_certificate: None,
-            server_ca: None,
-        };
+        client_context.encryption_options =
+            EncryptionOptions::new().with_mode(EncryptionSetting::PreferOff);
         client_context.connect_timeout = 2;
         client_context.connect_retry_count = retry_count as u32;
 

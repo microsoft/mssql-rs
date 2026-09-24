@@ -12,7 +12,7 @@
 pub(crate) mod native_tls_engine;
 
 use crate::connection::transport::network_transport::Stream;
-use crate::core::TdsResult;
+use crate::core::{CertificateSource, TdsResult};
 
 /// Per-connection TLS validation configuration resolved from the user's
 /// encryption options and the negotiated encryption setting.
@@ -21,10 +21,14 @@ pub(crate) struct TlsValidationConfig {
     pub accept_invalid_certs: bool,
     pub accept_invalid_hostnames: bool,
     pub use_alpn: bool,
-    /// Optional path to a CA certificate (or PEM bundle) added to this
-    /// connection's trust roots on top of the platform roots. Chain and
-    /// host name validation remain enabled.
-    pub server_ca_path: Option<std::path::PathBuf>,
+    /// Connection-scoped trust anchors; `None` uses only the platform roots.
+    pub custom_roots: Option<CustomRoots>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct CustomRoots {
+    pub source: CertificateSource,
+    pub include_platform_roots: bool,
 }
 
 /// Inputs passed to [`TlsEngine::connect`] for a single handshake.
@@ -36,10 +40,9 @@ pub(crate) struct TlsConnectParams<'a> {
     /// Host actually being connected to. Used for log messages and the
     /// error returned on handshake failure.
     pub server_host_name: &'a str,
-    /// Optional path to a server certificate file for pinning mode. When
-    /// `Some`, the engine MUST validate the peer certificate's DER against
-    /// the file and return `Err` on mismatch.
-    pub server_certificate_path: Option<&'a std::path::PathBuf>,
+    /// Pinned server certificate. When `Some`, the engine MUST validate the
+    /// peer certificate's DER against it and return `Err` on mismatch.
+    pub pinned_certificate: Option<&'a CertificateSource>,
 }
 
 /// Abstraction over a TLS handshake implementation.
