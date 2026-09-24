@@ -205,7 +205,13 @@ fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
         client
     };
 
-    let result = dbc.runtime.block_on(client.advance());
+    let result = dbc.runtime.block_on(async {
+        let result = client.advance().await?;
+        if matches!(result, StatementResult::Rows) {
+            client.peek_past_current_row().await?;
+        }
+        Ok(result)
+    });
     let array_rc = super::execute::update_parameter_array(stmt, &mut client);
     match result {
         Ok(StatementResult::Rows) => {
@@ -445,6 +451,7 @@ mod tests {
                 col_metadata_empty(), // stmt1 row set
                 done_more(),          // terminates stmt1, more to come
                 col_metadata_empty(), // stmt2 row set
+                done_no_more(),
             ],
         );
         assert_eq!(first, StatementResult::Rows);
@@ -454,6 +461,108 @@ mod tests {
 
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         assert_eq!(dbc.inner.lock().unwrap().active_stmt, Some(h.stmt));
+    }
+
+    #[test]
+    fn more_results_surfaces_an_error_before_the_first_row() {
+        use mssql_tds::test_client_support::{col_metadata, int_columns, sql_error};
+
+        let handles = TestHandles::with_env_dbc_stmt();
+        let first = position_first_and_inject(
+            &handles,
+            vec![
+                col_metadata(int_columns(1)),
+                done_more(),
+                col_metadata(int_columns(1)),
+                info(50000, 10, "before error"),
+                sql_error(1222, 16, "Lock request time out period exceeded."),
+                done_no_more(),
+            ],
+        );
+        assert_eq!(first, StatementResult::Rows);
+
+        assert_eq!(unsafe { sql_more_results(handles.stmt) }, SQL_ERROR);
+
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(handles.stmt) };
+        {
+            let state = stmt.inner.lock().unwrap();
+            assert!(
+                state
+                    .diag_records
+                    .iter()
+                    .any(|record| record.native_error == 1222)
+            );
+            assert!(
+                state
+                    .diag_records
+                    .iter()
+                    .any(|record| record.message.contains("before error"))
+            );
+            assert!(!state.has_state(STMT_STATE_CURSOR_OPEN));
+            assert!(state.pending_fetch_error.is_none());
+        }
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(handles.dbc) };
+        let state = dbc.inner.lock().unwrap();
+        assert!(state.client.is_some());
+        assert!(state.active_stmt.is_none());
+        drop(state);
+        assert_eq!(unsafe { sql_more_results(handles.stmt) }, SQL_NO_DATA);
+        assert!(stmt.inner.lock().unwrap().diag_records.is_empty());
+    }
+
+    #[test]
+    fn more_results_reports_info_before_the_first_row() {
+        use mssql_tds::test_client_support::{col_metadata, int_columns};
+
+        let handles = TestHandles::with_env_dbc_stmt();
+        position_first_and_inject(
+            &handles,
+            vec![
+                col_metadata(int_columns(1)),
+                done_more(),
+                col_metadata(int_columns(1)),
+                info(8153, 10, "Null value is eliminated by an aggregate."),
+                done_no_more(),
+            ],
+        );
+
+        assert_eq!(
+            unsafe { sql_more_results(handles.stmt) },
+            SQL_SUCCESS_WITH_INFO
+        );
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(handles.stmt) };
+        assert!(
+            stmt.inner
+                .lock()
+                .unwrap()
+                .diag_records
+                .iter()
+                .any(|record| record.native_error == 8153)
+        );
+        assert_eq!(unsafe { sql_more_results(handles.stmt) }, SQL_NO_DATA);
+        assert!(stmt.inner.lock().unwrap().diag_records.is_empty());
+    }
+
+    #[test]
+    fn more_results_does_not_peek_beyond_an_empty_result() {
+        use mssql_tds::test_client_support::{col_metadata, int_columns, sql_error};
+
+        let handles = TestHandles::with_env_dbc_stmt();
+        position_first_and_inject(
+            &handles,
+            vec![
+                col_metadata(int_columns(1)),
+                done_more(),
+                col_metadata(int_columns(1)),
+                done_more(),
+                col_metadata(int_columns(1)),
+                sql_error(1222, 16, "Lock request time out period exceeded."),
+                done_no_more(),
+            ],
+        );
+
+        assert_eq!(unsafe { sql_more_results(handles.stmt) }, SQL_SUCCESS);
+        assert_eq!(unsafe { sql_more_results(handles.stmt) }, SQL_ERROR);
     }
 
     /// The first result set was fetched to exhaustion, which releases
@@ -473,6 +582,7 @@ mod tests {
                 col_metadata_empty(), // stmt1 row set
                 done_more(),          // terminates stmt1, more to come
                 col_metadata_empty(), // stmt2 row set
+                done_no_more(),
             ],
         );
         assert_eq!(first, StatementResult::Rows);
@@ -505,6 +615,7 @@ mod tests {
                 col_metadata_empty(), // stmt1 row set
                 done_more(),          // terminates stmt1, more to come
                 col_metadata_empty(), // stmt2 row set
+                done_no_more(),
             ],
         );
         assert_eq!(first, StatementResult::Rows);
