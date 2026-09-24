@@ -66,29 +66,20 @@ The ODBC runner treats per-file pytest exit 2 as a test failure because a driver
 import error can prevent collection. Pytest internal/usage errors (3/4) and
 command-launch failures remain harness errors.
 
-The macOS job runs `prepare-mssql-python.py` after building the C++ bindings and
-installing the local Rust wheel. It builds exactly one source-matched ODBC wheel,
-installs it, and installs the upstream checkout editable with `--no-deps`.
-The job owns `mssql-python-rs` and `mssql-python-odbc`; upstream release pins must
-not replace either wheel. `requirements.txt` supplies third-party runtime
-dependencies. The setup helper checks the installed checkout's active
-`Requires-Dist` dependency tree (including version constraints, environment
-markers, and required extras)
-before importing the provider. New missing or incompatible dependencies fail
-setup with an actionable diagnostic. Update the setup dependencies rather than
-running an unrestricted dependency resolution or `pip check`, which would reject
-the intentionally different local native versions.
+The macOS job owns the locally built Rust and source-matched ODBC wheels and
+installs upstream editable with `--no-deps`. Its `requirements.txt` supplies
+third-party dependencies. Before SQL startup, `verify-mssql-python.py` runs as a
+pytest smoke check of the installed runtime: direct dependency versions/markers
+and the provider ID/driver path. Only the two native version pins are exempt.
+New missing/incompatible requirements fail setup; extras or URL requirements
+require explicit setup support rather than a custom dependency resolver.
 
-Missing `setup_odbc.py`, changed distribution names/wheel output, and recognized
-provider API/id/driver-path drift fail pinned PR/local runs. Non-PR runs report
-these as warnings, mark setup `SucceededWithIssues`, publish a skipped setup
-test with the reason, and skip driver tests that cannot run meaningfully.
-Successful setup publishes a passing setup test; strict failures publish a
-failure. Missing checkouts, build/install command failures, dependency failures,
-unexpected exceptions, and provider process crashes remain blocking in both
-modes. A failed packaging command is not assumed to be upstream drift: its
-cause may be infrastructure or a build regression. SQL/Docker infrastructure
-and the pytest exit-code policy remain independently blocking as before.
+Provider API/id/path drift fails PR/local runs but produces a warning and a
+skipped smoke test on non-PR runs. Pytest publishes the setup result in either
+case; driver tests run only after a successful smoke check. Native builds,
+packaging/install commands, dependency failures, import/loader errors, and
+unexpected exceptions remain blocking. Pipeline wiring is validated by the
+actual PR jobs, not a mocked build/install harness.
 
 To advance the pin, review the upstream commit comparison, replace the full SHA,
 and validate both cross-repo jobs in the pin-update PR. CI following main never

@@ -57,6 +57,23 @@ steps:
 
     echo "=== Verifying mssql_py_core is importable ==="
     python -c "import mssql_py_core; print('mssql_py_core OK')"
+
+    # Package the ODBC dylibs prepared by build.sh from the same checkout.
+    cd "$MSSQL_PYTHON_DIR"
+    rm -rf odbc-dist/
+    python setup_odbc.py bdist_wheel --dist-dir odbc-dist
+
+    shopt -s nullglob
+    ODBC_WHEELS=("$MSSQL_PYTHON_DIR"/odbc-dist/mssql_python_odbc-*.whl)
+    if [ "${#ODBC_WHEELS[@]}" -ne 1 ]; then
+      echo "##[error]Expected exactly one mssql-python-odbc wheel, found ${#ODBC_WHEELS[@]}"
+      exit 1
+    fi
+    python -m pip install --no-deps "${ODBC_WHEELS[0]}"
+
+    # PR/local runs use the pinned SHA; non-PR runs follow upstream main.
+    # Preserve both job-owned native wheels instead of resolving release pins.
+    python -m pip install --no-deps -e "$MSSQL_PYTHON_DIR"
   displayName: 'Build ddbc_bindings and mssql-py-core'
   env:
     CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN)
@@ -64,12 +81,10 @@ steps:
 
 - script: |
     set -euo pipefail
-    # PR/local runs use the pinned upstream SHA; non-PR runs follow main.
-    # Keep both native wheels local even when upstream release pins differ.
-    python .pipeline/scripts/prepare-mssql-python.py \
-      --upstream "$(Build.SourcesDirectory)/../mssql-python" \
-      --results "$(Build.SourcesDirectory)/mssql-python-macos-setup-results.xml"
-  displayName: 'Prepare and verify mssql-python runtime'
+    echo "##vso[task.setvariable variable=mssqlPythonReady]false"
+    python -m pytest .pipeline/scripts/verify-mssql-python.py -v -s \
+      --junitxml="$(Build.SourcesDirectory)/mssql-python-macos-setup-results.xml"
+  displayName: 'Verify installed mssql-python runtime'
 
 - task: PublishTestResults@2
   condition: succeededOrFailed()

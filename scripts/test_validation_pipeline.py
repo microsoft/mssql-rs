@@ -4,14 +4,12 @@
 """Regression tests for validation pipeline builds, tests, and artifacts."""
 
 import importlib.util
-import os
 import re
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
-import xml.etree.ElementTree as ET
 
 import pytest
 import yaml
@@ -21,11 +19,11 @@ _TEMPLATES = _ROOT / ".pipeline" / "templates"
 _NON_PR = "and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))"
 _PR = "and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))"
 _BASH = shutil.which("bash")
-_PREPARE = _ROOT / ".pipeline" / "scripts" / "prepare-mssql-python.py"
-_SPEC = importlib.util.spec_from_file_location("prepare_mssql_python", _PREPARE)
+_VERIFY = _ROOT / ".pipeline" / "scripts" / "verify-mssql-python.py"
+_SPEC = importlib.util.spec_from_file_location("verify_mssql_python", _VERIFY)
 assert _SPEC and _SPEC.loader
-prepare_python = importlib.util.module_from_spec(_SPEC)
-_SPEC.loader.exec_module(prepare_python)
+verify_python = importlib.util.module_from_spec(_SPEC)
+_SPEC.loader.exec_module(verify_python)
 
 
 def load_template(name):
@@ -128,447 +126,87 @@ def test_cross_repo_jobs_share_the_pinned_checkout(template):
     assert "mssql-python-branch" not in text
 
 
-def test_mssql_python_macos_failures_are_advisory_only_in_ci():
-    steps = load_template("test-mssql-python-macos-template.yml")["steps"]
-    run = next(step for step in steps if step.get("displayName") == "Run mssql-python tests")
-    assert "continueOnError" not in run
-    assert "task.complete result=SucceededWithIssues" in run["script"]
-    assert run["condition"] == "and(succeeded(), eq(variables['mssqlPythonReady'], 'true'))"
-    publish = next(
-        step for step in steps
-        if step.get("displayName") == "Publish mssql-python macOS test results"
-    )
-    assert publish["condition"] == (
-        "and(succeededOrFailed(), eq(variables['mssqlPythonReady'], 'true'))"
-    )
-    assert publish["inputs"]["failTaskOnFailedTests"] is False
-    assert publish["inputs"]["failTaskOnMissingResultsFile"] is True
-
-
-def test_mssql_python_macos_setup_results_survive_verification_failure():
-    steps = load_template("test-mssql-python-macos-template.yml")["steps"]
-    build = next(
-        step for step in steps
-        if step.get("displayName") == "Build ddbc_bindings and mssql-py-core"
-    )
-    setup = next(
-        step for step in steps
-        if step.get("displayName") == "Prepare and verify mssql-python runtime"
-    )
-    publish = next(
-        step for step in steps
-        if step.get("displayName") == "Publish mssql-python macOS setup results"
-    )
-    run = next(step for step in steps if step.get("displayName") == "Run mssql-python tests")
-    assert steps.index(build) < steps.index(setup) < steps.index(publish) < steps.index(run)
-    for step in (build, setup):
-        assert not step.get("continueOnError", False)
-        assert step.get("condition", "succeeded()") == "succeeded()"
-    assert publish["condition"] == "succeededOrFailed()"
-    assert publish["inputs"]["testResultsFiles"] == "**/mssql-python-macos-setup-results.xml"
-    assert publish["inputs"]["failTaskOnFailedTests"] is False
-    assert publish["inputs"]["failTaskOnMissingResultsFile"] is True
-
-
-@pytest.mark.skipif(_BASH is None, reason="Bash is required")
-@pytest.mark.parametrize("rust_exit", [0, 1, 127])
-def test_macos_build_installs_local_rust_before_upstream_setup(tmp_path, rust_exit):
-    steps = load_template("test-mssql-python-macos-template.yml")["steps"]
-    names = {"Build ddbc_bindings and mssql-py-core", "Prepare and verify mssql-python runtime"}
-    scripts = [step["script"] for step in steps if step.get("displayName") in names]
-    source = tmp_path / "rust"
-    (source / "mssql-py-core").mkdir(parents=True)
-    bindings = tmp_path / "mssql-python" / "mssql_python" / "pybind"
-    bindings.mkdir(parents=True)
-    (bindings / "build.sh").write_text('echo bindings >> "$LOG"\n', newline="\n")
-    script = f"""
-    ROOT="$PWD"
-    export LOG="$ROOT/commands"
-    python() {{
-        printf '%s\\t' python "$@" >> "$LOG"
-        printf '\\n' >> "$LOG"
-    }}
-    maturin() {{
-        echo maturin >> "$LOG"
-        mkdir dist
-        touch dist/local-rust.whl
-        return {rust_exit}
-    }}
-    """
-    # Each Azure script starts in the sources directory, in a fresh shell.
-    script += "\nset -e\n" + "\n".join(
-        '(cd "$ROOT/rust";\n'
-        + text.replace("$(Build.SourcesDirectory)", "$ROOT/rust")
-        + "\n)"
-        for text in scripts
-    )
-    result = subprocess.run(
-        [_BASH, "-s"], input=script, cwd=tmp_path, capture_output=True, text=True,
-    )
-    assert result.returncode == rust_exit, result.stdout + result.stderr
-    commands = (tmp_path / "commands").read_text().splitlines()
-    if rust_exit:
-        assert commands[-1] == "maturin"
-        return
-    install = next(i for i, command in enumerate(commands) if "dist/local-rust.whl" in command)
-    setup = commands[-1].split("\t")[:-1]
-    assert commands.index("bindings") < commands.index("maturin") < install < len(commands) - 1
-    assert setup[:3] == ["python", ".pipeline/scripts/prepare-mssql-python.py", "--upstream"]
-    assert Path(setup[3]).name == "mssql-python"
-    assert setup[4] == "--results"
-    assert Path(setup[5]).name == "mssql-python-macos-setup-results.xml"
-
-
-@pytest.mark.parametrize("count", [0, 1, 2])
-def test_odbc_wheel_selection_executes_all_cardinalities(tmp_path, count):
-    (tmp_path / "unrelated-1.0.whl").touch()
-    for index in range(count):
-        (tmp_path / f"mssql_python_odbc-{index}.whl").touch()
-    if count == 1:
-        assert prepare_python.select_odbc_wheel(tmp_path).name == "mssql_python_odbc-0.whl"
-    else:
-        with pytest.raises(prepare_python.UpstreamContractError, match=f"found {count}"):
-            prepare_python.select_odbc_wheel(tmp_path)
-
-
-def test_upstream_setup_builds_installs_and_verifies_in_order(tmp_path, monkeypatch):
-    tmp_path = tmp_path / "upstream with spaces; literal"
-    tmp_path.mkdir()
-    (tmp_path / "setup_odbc.py").touch()
-    calls = []
-
-    def run(arguments, **kwargs):
-        assert not kwargs.get("shell", False)
-        calls.append(arguments[1:])
-        if arguments[1] == "setup_odbc.py":
-            assert kwargs == {"cwd": tmp_path, "check": True}
-            (Path(arguments[-1]) / "mssql_python_odbc-1.0.whl").touch()
-        return subprocess.CompletedProcess(arguments, 0)
-
-    monkeypatch.setattr(prepare_python.subprocess, "run", run)
-    monkeypatch.setattr(prepare_python, "check_runtime_dependencies", lambda: calls.append(["metadata"]))
-    prepare_python.prepare(tmp_path)
-    assert calls[0][:3] == ["setup_odbc.py", "bdist_wheel", "--dist-dir"]
-    assert calls[1][:4] == ["-m", "pip", "install", "--no-deps"]
-    assert Path(calls[1][4]).name == "mssql_python_odbc-1.0.whl"
-    assert calls[2] == ["-m", "pip", "install", "--no-deps", "-e", str(tmp_path)]
-    assert calls[3] == ["metadata"]
-    assert calls[4] == [str(_PREPARE.resolve()), "--verify-provider"]
-    assert len(calls) == 5
-
-
-@pytest.mark.parametrize("reason", ["PullRequest", "IndividualCI"])
-@pytest.mark.parametrize("failed_command", [0, 1, 2, 3])
-def test_setup_subprocess_failures_are_not_advisory(tmp_path, monkeypatch, reason, failed_command):
-    (tmp_path / "setup_odbc.py").touch()
-    monkeypatch.setenv("BUILD_REASON", reason)
-    calls = []
-
-    def run(arguments, **kwargs):
-        index = len(calls)
-        calls.append(arguments)
-        if index == failed_command:
-            if kwargs["check"]:
-                raise subprocess.CalledProcessError(1, arguments)
-            return subprocess.CompletedProcess(arguments, 139)
-        if index == 0:
-            (Path(arguments[-1]) / "mssql_python_odbc-1.0.whl").touch()
-        return subprocess.CompletedProcess(arguments, 0)
-
-    monkeypatch.setattr(prepare_python.subprocess, "run", run)
-    monkeypatch.setattr(prepare_python, "check_runtime_dependencies", lambda: None)
-    report = tmp_path / "setup.xml"
-    with pytest.raises(subprocess.CalledProcessError):
-        prepare_python.main(["--upstream", str(tmp_path), "--results", str(report)])
-    assert len(calls) == failed_command + 1
-    assert ET.parse(report).getroot().get("failures") == "1"
-
-
-@pytest.mark.parametrize("reason", [None, "IndividualCI"])
-def test_provider_subprocess_drift_reaches_setup_policy(tmp_path, monkeypatch, reason, capsys):
-    (tmp_path / "setup_odbc.py").touch()
-    if reason is None:
-        monkeypatch.delenv("BUILD_REASON", raising=False)
-    else:
-        monkeypatch.setenv("BUILD_REASON", reason)
-
-    def run(arguments, **kwargs):
-        if arguments[1] == "setup_odbc.py":
-            (Path(arguments[-1]) / "mssql_python_odbc-1.0.whl").touch()
-        code = prepare_python.CONTRACT_EXIT if "--verify-provider" in arguments else 0
-        return subprocess.CompletedProcess(arguments, code)
-
-    monkeypatch.setattr(prepare_python.subprocess, "run", run)
-    monkeypatch.setattr(prepare_python, "check_runtime_dependencies", lambda: None)
-    report = tmp_path / "setup.xml"
-    result = prepare_python.main(["--upstream", str(tmp_path), "--results", str(report)])
-    advisory = reason is not None
-    assert result == int(not advisory)
-    assert "variable=mssqlPythonReady]true" not in capsys.readouterr().out
-    suite = ET.parse(report).getroot()
-    assert suite.get("skipped") == str(int(advisory))
-    assert suite.get("failures") == str(int(not advisory))
-
-
-@pytest.mark.parametrize(
-    ("provider", "diagnostic"),
-    [
-        ("{'id': 'msodbcsql18', 'driver_path': DRIVER}", None),
-        ("{'id': 'other', 'driver_path': DRIVER}", "Expected provider id"),
-        ("{'driver_path': DRIVER}", "Expected provider id"),
-        ("{'id': 'msodbcsql18'}", "driver_path"),
-        ("{'id': 'msodbcsql18', 'driver_path': ''}", "driver_path"),
-        ("{'id': 'msodbcsql18', 'driver_path': DRIVER + '.missing'}", "driver_path"),
-        ("{'id': 'msodbcsql18', 'driver_path': str(Path(DRIVER).parent)}", "driver_path"),
-        ("{'id': 'msodbcsql18', 'driver_path': 1}", "driver_path"),
-        ("None", "Expected provider id"),
-    ],
-)
-def test_provider_verification_in_fresh_interpreter(tmp_path, provider, diagnostic):
-    driver = tmp_path / "test driver.dylib"
-    driver.touch()
-    (tmp_path / "mssql_python.py").write_text(
-        f"from pathlib import Path\nDRIVER = {str(driver)!r}\n"
-        f"def get_native_provider_info():\n    return {provider}\n",
-        encoding="utf-8",
-    )
-    result = subprocess.run(
-        [sys.executable, str(_PREPARE), "--verify-provider"],
-        env={**os.environ, "PYTHONPATH": str(tmp_path)},
-        capture_output=True, text=True,
-    )
-    assert result.returncode == (prepare_python.CONTRACT_EXIT if diagnostic else 0), result.stderr
-    assert (diagnostic or "ODBC provider:") in result.stdout + result.stderr
-
-
-@pytest.mark.parametrize(
-    ("body", "contract_error"),
-    [
-        ("", True),
-        ("get_native_provider_info = None", True),
-        ("raise ModuleNotFoundError('package renamed', name='mssql_python')", True),
-        ("raise ModuleNotFoundError('dependency missing', name='dependency')", False),
-        ("raise ImportError('ddbc_bindings ABI/link failure')", False),
-        ("def get_native_provider_info(required): pass", True),
-        ("def get_native_provider_info(): raise AttributeError('unexpected failure')", False),
-        ("def get_native_provider_info(): raise KeyError('unexpected failure')", False),
-        ("def get_native_provider_info(): raise TypeError('unexpected failure')", False),
-        ("def get_native_provider_info(): raise ValueError('unexpected failure')", False),
-        ("def get_native_provider_info(): raise ImportError('unexpected failure')", False),
-        ("def get_native_provider_info(): raise RuntimeError('unexpected failure')", False),
-        ("import os\nos._exit(139)", False),
-    ],
-)
-def test_provider_interface_drift_does_not_hide_unexpected_errors(tmp_path, body, contract_error):
-    (tmp_path / "mssql_python.py").write_text(body, encoding="utf-8")
-    result = subprocess.run(
-        [sys.executable, str(_PREPARE), "--verify-provider"],
-        env={**os.environ, "PYTHONPATH": str(tmp_path)}, capture_output=True, text=True,
-    )
-    assert result.returncode != 0
-    assert (result.returncode == prepare_python.CONTRACT_EXIT) == contract_error
-
-
 @pytest.fixture
-def runtime_metadata(monkeypatch):
-    requirements = ["mssql_python_rs==9.9", "MSSQL.Python.ODBC==9.9", "Azure_Identity>=1.12"]
-    versions = {"mssql-python-rs": "0.1.dev1", "mssql-python-odbc": "0.1.dev1", "azure-identity": "1.12"}
-    monkeypatch.setattr(
-        prepare_python.metadata, "distribution", lambda _: SimpleNamespace(requires=requirements),
-    )
-
-    def version(name):
-        if name not in versions:
-            raise prepare_python.metadata.PackageNotFoundError(name)
-        return versions[name]
-
-    monkeypatch.setattr(prepare_python.metadata, "version", version)
-    monkeypatch.setattr(prepare_python.metadata, "requires", lambda _: [])
-    monkeypatch.setattr(
-        prepare_python.metadata, "metadata",
-        lambda _: SimpleNamespace(get_all=lambda key, default: ["feature"]),
-    )
-    return requirements, versions
-
-
-def test_runtime_metadata_respects_markers_and_local_native_ownership(runtime_metadata, capsys):
-    requirements, _ = runtime_metadata
-    requirements.extend(['not-installed; python_version < "2"', 'optional; extra == "pyarrow"'])
-    prepare_python.check_runtime_dependencies()
-    assert capsys.readouterr().out.count("locally built; ignoring upstream") == 2
-
-
-def test_installed_prerelease_can_satisfy_runtime_requirement(runtime_metadata):
-    _, versions = runtime_metadata
-    versions["azure-identity"] = "1.13.dev1"
-    prepare_python.check_runtime_dependencies()
+def installed_runtime(tmp_path, monkeypatch):
+    driver = tmp_path / "driver.dylib"
+    driver.touch()
+    provider = {"id": "msodbcsql18", "driver_path": str(driver)}
+    module = SimpleNamespace(get_native_provider_info=lambda: provider)
+    monkeypatch.setitem(sys.modules, "mssql_python", module)
+    monkeypatch.setattr(verify_python.metadata, "requires", lambda _: [])
+    return module, provider
 
 
 @pytest.mark.parametrize(
-    "dependency",
-    ["new-runtime>=1", "azure-identity>=2", "new-runtime[feature]>=1", "new-runtime; python_version >= '3'"],
+    ("requirement", "installed", "error"),
+    [
+        ("MSSQL_PYTHON_RS==9.9", "0.2", None),
+        ("mssql-python-odbc==9.9", "0.2", None),
+        ("new-dependency>=2", "3", None),
+        ("new-dependency>=2", None, "Missing runtime dependency"),
+        ("new-dependency>=2", "1", "update setup requirements"),
+        ("inactive; python_version < '2'", None, None),
+        ("optional; extra == 'feature'", None, None),
+        ("new-dependency[feature]", "1", "explicit setup support"),
+        ("new-dependency @ https://example.invalid/package.whl", "1", "explicit setup support"),
+    ],
 )
-def test_new_or_incompatible_runtime_dependency_fails_setup(runtime_metadata, dependency):
-    requirements, _ = runtime_metadata
-    requirements.append(dependency)
-    with pytest.raises(RuntimeError, match="Unsatisfied.*Update the setup dependencies"):
-        prepare_python.check_runtime_dependencies()
+def test_runtime_requirements(installed_runtime, monkeypatch, requirement, installed, error):
+    monkeypatch.setattr(verify_python.metadata, "requires", lambda _: [requirement])
 
+    def version(_):
+        if installed is None:
+            raise verify_python.metadata.PackageNotFoundError(requirement)
+        return installed
 
-def test_native_distribution_rename_is_contract_drift(runtime_metadata):
-    requirements, _ = runtime_metadata
-    requirements[0] = "new-rust-distribution==9.9"
-    with pytest.raises(prepare_python.UpstreamContractError, match="no longer declares.*mssql-python-rs"):
-        prepare_python.check_runtime_dependencies()
-
-
-def test_missing_native_install_is_not_contract_drift(runtime_metadata):
-    _, versions = runtime_metadata
-    del versions["mssql-python-rs"]
-    with pytest.raises(RuntimeError, match="mssql_python_rs==9.9: not installed") as error:
-        prepare_python.check_runtime_dependencies()
-    assert not isinstance(error.value, prepare_python.UpstreamContractError)
-
-
-def test_missing_upstream_distribution_is_contract_drift(monkeypatch):
-    def distribution(_):
-        raise prepare_python.metadata.PackageNotFoundError("mssql-python")
-
-    monkeypatch.setattr(prepare_python.metadata, "distribution", distribution)
-    with pytest.raises(prepare_python.UpstreamContractError, match="did not provide.*mssql-python"):
-        prepare_python.check_runtime_dependencies()
-
-
-def test_malformed_metadata_remains_blocking(runtime_metadata):
-    requirements, _ = runtime_metadata
-    requirements.append("--not-a-requirement")
-    with pytest.raises(ValueError):
-        prepare_python.check_runtime_dependencies()
-
-
-def test_unverifiable_url_dependency_fails_setup(runtime_metadata):
-    requirements, versions = runtime_metadata
-    requirements.append("new-runtime @ https://example.invalid/new-runtime.whl")
-    versions["new-runtime"] = "1.0"
-    with pytest.raises(RuntimeError, match="cannot verify a direct-URL runtime dependency"):
-        prepare_python.check_runtime_dependencies()
-
-
-@pytest.mark.parametrize("extra", ["missing", "feature", "FEATURE", "feature_name"])
-def test_runtime_extras_must_be_declared(runtime_metadata, monkeypatch, extra):
-    requirements, versions = runtime_metadata
-    requirements.append(f"new-runtime[{extra}]>=1")
-    versions["new-runtime"] = "1.0"
-    monkeypatch.setattr(
-        prepare_python.metadata, "metadata",
-        lambda _: SimpleNamespace(get_all=lambda key, default: ["feature", "feature-name"]),
-    )
-    if extra == "missing":
-        with pytest.raises(RuntimeError, match="does not declare extras.*missing"):
-            prepare_python.check_runtime_dependencies()
+    monkeypatch.setattr(verify_python.metadata, "version", version)
+    if error:
+        with pytest.raises((AssertionError, pytest.fail.Exception), match=error):
+            verify_python.test_installed_runtime()
     else:
-        prepare_python.check_runtime_dependencies()
+        verify_python.test_installed_runtime()
 
 
-@pytest.mark.parametrize("extra_installed", [False, True])
-@pytest.mark.parametrize("base_installed", [False, True])
-def test_required_extras_and_transitive_dependencies_are_checked(
-    runtime_metadata, monkeypatch, extra_installed, base_installed,
-):
-    requirements, versions = runtime_metadata
-    requirements.append("new-runtime[feature]>=1")
-    versions["new-runtime"] = "1.0"
-    if extra_installed:
-        versions["extra-runtime"] = "2.0"
-    if base_installed:
-        versions["base-runtime"] = "1.0"
-    nested = {
-        "new-runtime": [
-            "extra-runtime>=2; extra == 'feature'",
-            "base-runtime>=1; extra != 'feature'",
-            "unused; extra == 'unused'",
-        ],
-        "extra-runtime": ["new-runtime[feature]>=1"],
-    }
-    monkeypatch.setattr(prepare_python.metadata, "requires", lambda name: nested.get(name, []))
-    if extra_installed and base_installed:
-        prepare_python.check_runtime_dependencies()
-    else:
-        missing = "extra-runtime>=2" if not extra_installed else "base-runtime>=1"
-        with pytest.raises(RuntimeError, match=f"{missing}.*not installed"):
-            prepare_python.check_runtime_dependencies()
-
-
-@pytest.mark.parametrize("reason", [None, "", "PullRequest", "IndividualCI", "BatchedCI", "Manual", "Schedule"])
-@pytest.mark.parametrize("drift", [False, True])
-def test_setup_policy_and_junit_results(tmp_path, monkeypatch, capsys, reason, drift):
+@pytest.mark.parametrize("reason", [None, "PullRequest", "IndividualCI"])
+@pytest.mark.parametrize(
+    "case", ["ok", "bad-id", "missing-path", "nonexistent-path", "missing-api",
+             "required-argument", "query-error", "import-error"],
+)
+def test_provider_failure_policy(installed_runtime, monkeypatch, capsys, reason, case):
+    module, provider = installed_runtime
     if reason is None:
         monkeypatch.delenv("BUILD_REASON", raising=False)
     else:
         monkeypatch.setenv("BUILD_REASON", reason)
-
-    def prepare(_):
-        if drift:
-            raise prepare_python.UpstreamContractError("provider <contract> changed")
-
-    monkeypatch.setattr(prepare_python, "prepare", prepare)
-    report = tmp_path / "setup.xml"
-    result = prepare_python.main(["--upstream", str(tmp_path), "--results", str(report)])
-    output = capsys.readouterr()
-    advisory = drift and reason not in (None, "", "PullRequest")
-    assert result == int(drift and not advisory)
-    assert ("task.logissue type=warning" in output.out) == advisory
-    assert ("task.complete result=SucceededWithIssues" in output.out) == advisory
-    assert ("variable=mssqlPythonReady]true" in output.out) == (not drift)
-    suite = ET.parse(report).getroot()
-    assert suite.get("failures") == str(int(drift and not advisory))
-    assert suite.get("skipped") == str(int(advisory))
-    if drift:
-        assert "provider <contract> changed" in suite.find("testcase")[0].get("message")
-
-
-@pytest.mark.parametrize("reason", ["PullRequest", "IndividualCI"])
-@pytest.mark.parametrize(
-    "error",
-    [FileNotFoundError("missing checkout"), subprocess.CalledProcessError(1, ["build"]),
-     RuntimeError("dependency failure"), OSError("disk full")],
-)
-def test_setup_errors_remain_blocking_and_publish_failure(tmp_path, monkeypatch, capsys, reason, error):
-    monkeypatch.setenv("BUILD_REASON", reason)
-
-    def prepare(_):
-        raise error
-
-    monkeypatch.setattr(prepare_python, "prepare", prepare)
-    report = tmp_path / "setup.xml"
-    with pytest.raises(type(error)):
-        prepare_python.main(["--upstream", str(tmp_path), "--results", str(report)])
-    assert "task.complete" not in capsys.readouterr().out
-    assert ET.parse(report).getroot().get("failures") == "1"
-
-
-@pytest.mark.parametrize("drift", [False, True])
-def test_missing_setup_result_cannot_report_success(tmp_path, monkeypatch, capsys, drift):
-    monkeypatch.setenv("BUILD_REASON", "IndividualCI")
-
-    def prepare(_):
-        if drift:
-            raise prepare_python.UpstreamContractError("provider changed")
-
-    monkeypatch.setattr(prepare_python, "prepare", prepare)
-    report = tmp_path / "missing-directory" / "setup.xml"
-    with pytest.raises(FileNotFoundError):
-        prepare_python.main(["--upstream", str(tmp_path), "--results", str(report)])
+    if case == "bad-id":
+        provider["id"] = "other"
+    elif case == "missing-path":
+        provider.pop("driver_path")
+    elif case == "nonexistent-path":
+        provider["driver_path"] += ".missing"
+    elif case == "missing-api":
+        del module.get_native_provider_info
+    elif case == "required-argument":
+        module.get_native_provider_info = lambda required: provider
+    elif case == "query-error":
+        def broken_query():
+            raise TypeError("unexpected provider failure")
+        module.get_native_provider_info = broken_query
+    elif case == "import-error":
+        monkeypatch.setitem(sys.modules, "mssql_python", None)
+    if case == "ok":
+        verify_python.test_installed_runtime()
+    else:
+        expected = {"query-error": TypeError, "import-error": ModuleNotFoundError}.get(
+            case, pytest.skip.Exception if reason == "IndividualCI" else pytest.fail.Exception,
+        )
+        with pytest.raises(expected):
+            verify_python.test_installed_runtime()
     output = capsys.readouterr().out
-    assert "variable=mssqlPythonReady]true" not in output
-    assert "task.complete" not in output
-
-
-def test_missing_packaging_entrypoint_is_recognized_drift(tmp_path):
-    with pytest.raises(prepare_python.UpstreamContractError, match="setup_odbc.py"):
-        prepare_python.prepare(tmp_path)
-    with pytest.raises(FileNotFoundError, match="checkout"):
-        prepare_python.prepare(tmp_path / "missing")
+    assert ("mssqlPythonReady]true" in output) == (case == "ok")
+    assert ("type=warning" in output) == (
+        reason == "IndividualCI" and case not in ("ok", "query-error", "import-error")
+    )
 
 
 def test_pin_validation_is_not_path_filtered_or_optional():
