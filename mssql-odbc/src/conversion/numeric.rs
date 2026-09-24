@@ -270,9 +270,11 @@ pub(crate) fn parse_numeric_text_with_policy(
     // but an exponent literal to `CharToDouble` (`:5118`, which keeps only what
     // the double holds).
     match trimmed.parse::<f64>() {
-        // Rust silently rounds underflow to zero. CharToDouble maps the Linux
-        // VarR8FromStr range error to CVT_PREC (sqlccnvt.cpp:7949-7954),
-        // whereas Windows OLE Automation succeeds with signed zero.
+        // Rust silently rounds underflow to zero. The non-OLE VarR8FromStr
+        // rejects strtod zero with ERANGE (xplat/src/StringFunctions.cpp:1437-1442);
+        // its :1360 guard includes Linux and macOS. CharToDouble maps that error
+        // to CVT_PREC (sqlccnvt.cpp:7949-7954), whereas Windows OLE Automation
+        // succeeds with signed zero.
         // Inspect only the significand: the exponent in "0e-999" is not a value.
         Ok(f)
             if matches!(policy, UnderflowPolicy::Reject)
