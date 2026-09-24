@@ -560,6 +560,26 @@ pub fn done_proc_no_more() -> ScriptedToken {
     }))
 }
 
+/// An RPC output parameter returned before the terminal `DONEPROC`.
+pub fn return_value(value: crate::query::result::ReturnValue) -> ScriptedToken {
+    ScriptedToken(Tokens::ReturnValue(
+        crate::token::tokens::ReturnValueToken {
+            param_ordinal: value.param_ordinal,
+            param_name: value.param_name,
+            value: value.value,
+            column_metadata: value.column_metadata,
+            status: value.status,
+        },
+    ))
+}
+
+/// A stored procedure's integer return status.
+pub fn return_status(value: i32) -> ScriptedToken {
+    ScriptedToken(Tokens::ReturnStatus(
+        crate::token::tokens::ReturnStatusToken { value },
+    ))
+}
+
 /// A terminal DONE token (no more results — end of batch).
 pub fn done_no_more() -> ScriptedToken {
     ScriptedToken(Tokens::Done(DoneToken {

@@ -100,6 +100,33 @@ impl ResolvedEncoding {
             },
         }
     }
+
+    /// Creates an incremental decoder, returning `None` if its storage cannot
+    /// be allocated. OEM decoders do not require heap storage.
+    pub fn try_new_decoder_without_bom_handling(self) -> Option<ResolvedDecoder> {
+        let inner = match self {
+            Self::EncodingRs(encoding) => {
+                const { assert!(std::mem::size_of::<Decoder>() > 0) };
+                let layout = std::alloc::Layout::new::<Decoder>();
+                // SAFETY: Decoder's nonzero size is checked above at compile time.
+                // A successful allocation is aligned for Decoder, initialized
+                // once, and transferred to Box using the same global allocator
+                // and layout.
+                let decoder = unsafe {
+                    let ptr = std::alloc::alloc(layout).cast::<Decoder>();
+                    if ptr.is_null() {
+                        return None;
+                    }
+                    ptr.write(encoding.new_decoder_without_bom_handling());
+                    Box::from_raw(ptr)
+                };
+                DecoderKind::EncodingRs(decoder)
+            }
+            Self::Oem437 => DecoderKind::Oem(&CP437),
+            Self::Oem850 => DecoderKind::Oem(&CP850),
+        };
+        Some(ResolvedDecoder { inner })
+    }
 }
 
 /// Incremental decoding with `encoding_rs` buffer and result conventions.
@@ -259,6 +286,23 @@ const CP850: [char; 128] = [
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fallible_decoder_creation_supports_narrow_and_oem_encodings() {
+        for encoding in [
+            super::ResolvedEncoding::from(encoding_rs::UTF_8),
+            super::ResolvedEncoding::Oem437,
+            super::ResolvedEncoding::Oem850,
+        ] {
+            let mut decoder = encoding.try_new_decoder_without_bom_handling().unwrap();
+            let mut output = [0; 16];
+            let (result, consumed, written, errors) =
+                decoder.decode_to_utf8(b"42", &mut output, true);
+            assert_eq!(result, encoding_rs::CoderResult::InputEmpty);
+            assert_eq!((consumed, written, errors), (2, 2, false));
+            assert_eq!(&output[..written], b"42");
+        }
+    }
+
     use super::*;
 
     #[test]

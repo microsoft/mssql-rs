@@ -134,12 +134,19 @@ msodbcsql build is measured.
    `SKIP_IF_COMPARING_MSODBCSQL()`. Tracked in AB#47369, which is where the
    outstanding 18.6.2.1 measurements land - keep the running record there
    rather than growing this file per build.
-7. **A bound `max`/LOB text column converted to a typed C target is refused
+7. **A `max`/LOB text column converted to a typed C target is refused
    above 1 MiB; msodbcsql converts a truncated prefix and warns.** Both drivers
    cap what a typed conversion may materialize - a `varchar(max)` carries up to
    2 GB and the converter needs one contiguous literal. This driver's cap is
    `PLP_TYPED_MATERIALIZE_LIMIT` (`api/fetch_scroll.rs`) at 1 MiB; past it the
    value is drained to keep the row synchronized and answered `HYC00`.
+   This applies to bound fetches and `SQLGetData`; the shared limit counts
+   unread source wire bytes, including both bytes of each UTF-16 code unit.
+   Earlier character reads do not count against a subsequent typed
+   `SQLGetData` call's cap. Decoding
+   can expand that bounded input into UTF-8, but allocation never scales with
+   an unbounded server value. Below the cap, this driver converts the complete
+   remaining literal, not a truncated prefix.
    msodbcsql clamps to `2*CONVBUF_SIZE` (~1244 bytes, sized for the longest
    legal `double` literal) in `EstimateBytesToRead` (`odbc/sqlcdata.cpp`), then
    converts that prefix and reports `01004` rather than failing.
@@ -162,7 +169,17 @@ msodbcsql build is measured.
    `varchar(max)` bound to a typed target reaches it - schema drift, not a
    contrived input. CI compares against 18.6.2.1; this measurement is
    18.06.0001, so re-measure there before relying on the exact prefix length.
-   Tracked in AB#47767.
+   `SQLGetData` was re-measured on Linux with **18.06.0001** for AB#47238:
+   `'0'` repeated 1048576 times followed by `'1'`, as either `varchar(max)` or
+   `nvarchar(max)`, returns `SQL_SUCCESS_WITH_INFO`, `01004`, integer `0`, and
+   indicator `4`. This driver returns `SQL_ERROR` / `HYC00` without changing
+   either output, and both can retrieve the following column. The dedicated
+   `PlpTypedOversizedValueIsRefusedAndDrained` test asserts each driver's
+   result. The native caller clamps fixed conversions in `GetColData`'s
+   delivery implementation (`odbc/sqlcdata.h`, `IsFixedOrBinaryWithFixedServerType`
+   branch) before `FetchDataWithCopy`, consistent with `EstimateBytesToRead`.
+   Reusing the bound-fetch policy for `SQLGetData` was approved by David Engel
+   on 2026-09-22. Tracked in AB#47767 and AB#47238.
 8. **Widening a bound narrow `max` column to `SQL_C_WCHAR` truncates on a whole
    character.** A buffer with no room for the final surrogate pair ends before
    it; msodbcsql leaves the lone high surrogate in the last payload slot on this
