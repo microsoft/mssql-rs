@@ -24,6 +24,8 @@ pub enum SqlDataType {
     NVarCharMax,
     /// VarChar(MAX) with caller-chosen PLP chunk boundaries and column collation.
     VarCharMax,
+    /// VarBinary(MAX) with caller-chosen PLP chunk boundaries.
+    VarBinaryMax,
 }
 
 impl SqlDataType {
@@ -36,6 +38,7 @@ impl SqlDataType {
             SqlDataType::BigInt => 0x26,   // IntN with length 8
             SqlDataType::NVarChar | SqlDataType::NVarCharMax => 0xE7, // NVarCharType
             SqlDataType::VarCharMax => 0xA7,
+            SqlDataType::VarBinaryMax => 0xA5,
         }
     }
 
@@ -47,7 +50,7 @@ impl SqlDataType {
             SqlDataType::Int => 4,
             SqlDataType::BigInt => 8,
             SqlDataType::NVarChar | SqlDataType::NVarCharMax => 255, // Handled specially
-            SqlDataType::VarCharMax => 255,
+            SqlDataType::VarCharMax | SqlDataType::VarBinaryMax => 255,
         }
     }
 }
@@ -66,6 +69,8 @@ pub enum ColumnValue {
     NVarCharMaxNull,
     /// Nonempty chunks of bytes encoded in the column's collation.
     VarCharMax(Vec<Vec<u8>>),
+    /// Nonempty chunks of opaque bytes.
+    VarBinaryMax(Vec<Vec<u8>>),
     Null,
 }
 
@@ -80,6 +85,7 @@ impl ColumnValue {
             ColumnValue::NVarChar(_) => SqlDataType::NVarChar,
             ColumnValue::NVarCharMax(_) | ColumnValue::NVarCharMaxNull => SqlDataType::NVarCharMax,
             ColumnValue::VarCharMax(_) => SqlDataType::VarCharMax,
+            ColumnValue::VarBinaryMax(_) => SqlDataType::VarBinaryMax,
             ColumnValue::Null => SqlDataType::Int, // Default to Int for NULL
         }
     }
@@ -124,7 +130,7 @@ impl ColumnValue {
                 buf.put_u32_le(0);
             }
             ColumnValue::NVarCharMaxNull => buf.put_u64_le(u64::MAX),
-            ColumnValue::VarCharMax(chunks) => {
+            ColumnValue::VarCharMax(chunks) | ColumnValue::VarBinaryMax(chunks) => {
                 let total: u64 = chunks.iter().map(|chunk| chunk.len() as u64).sum();
                 buf.put_u64_le(total);
                 for chunk in chunks {
