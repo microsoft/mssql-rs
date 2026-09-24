@@ -519,6 +519,9 @@ mod tests {
 
     #[test]
     fn zero_significands_are_not_underflow() {
+        // The positive-exponent cases pin Rust behavior, not Windows parity:
+        // Driver 18.6.2.1 returns 22003 for 0e999/0E+999 via SQL_C_DOUBLE.
+        // That existing exponent-range gap is outside this underflow fix.
         for text in ["0e-999", "-0e-999", "+0.000E-999", "0e999", "0E+999"] {
             assert_eq!(parse_numeric_text(text).unwrap().as_f64(), 0.0, "{text}");
             for policy in [UnderflowPolicy::Reject, UnderflowPolicy::AcceptZero] {
@@ -557,7 +560,9 @@ mod tests {
             Some((0, true)),
             "a plain literal keeps the digit walk"
         );
-        // Nonzero subnormal parsing is outside the underflow-to-zero fix.
+        // These subnormal assertions pin Rust behavior, not Linux parity:
+        // Driver 18.6.2.1 returns 22018 for 1e-320/5e-324 via SQL_C_DOUBLE.
+        // Nonzero subnormal parsing remains outside the underflow-to-zero fix.
         assert_eq!(
             parse_numeric_text("1e-320").unwrap().to_i128_truncating(),
             Some((0, true))
