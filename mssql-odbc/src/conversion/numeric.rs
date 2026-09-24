@@ -33,6 +33,8 @@ pub(crate) enum NumericSource {
         fraction_dropped: bool,
         fractional_precision: u32,
     },
+    /// Negative zero is not negative for bit conversion (`f < 0.0`), including
+    /// Windows exponent underflow; this matches msodbcsql's `dTemp < 0` check.
     Float(f64),
 }
 
@@ -184,8 +186,12 @@ pub(crate) fn narrow_f64_to_f32(v: f64) -> Result<f32, ConvError> {
     Ok(v as f32)
 }
 
+/// Selects the outcome when a nonzero exponent literal rounds to zero.
+#[derive(Debug, Clone, Copy)]
 pub(crate) enum UnderflowPolicy {
+    /// Non-Windows CharToDouble and decimal parameters on every platform.
     Reject,
+    /// Windows OLE Automation preserves signed zero.
     AcceptZero,
 }
 
@@ -515,6 +521,13 @@ mod tests {
     fn zero_significands_are_not_underflow() {
         for text in ["0e-999", "-0e-999", "+0.000E-999", "0e999", "0E+999"] {
             assert_eq!(parse_numeric_text(text).unwrap().as_f64(), 0.0, "{text}");
+            for policy in [UnderflowPolicy::Reject, UnderflowPolicy::AcceptZero] {
+                assert_eq!(
+                    parse_numeric_text_with_policy(text, policy).map(|source| source.as_f64()),
+                    Ok(0.0),
+                    "{text}: {policy:?}"
+                );
+            }
         }
         assert!(
             parse_numeric_text("-0e-999")

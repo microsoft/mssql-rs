@@ -1380,8 +1380,10 @@ fn decimal_from_text(param: &BoundParam, text: AppText) -> Result<TypedValue, Pa
                 .map_err(|_| ParamBuildError::Value(ConvError::OutOfRange))?;
             return Ok((decimal_of(param.sql_type, value), Some(metadata)));
         }
-        // Exponent literals have no exact form to rescale and reach the wire
-        // through the f64 approximation (`sqlccnvt.cpp:5118`).
+        // Our parser represents exponent literals as f64. The reference uses
+        // ConvertToNumeric/stringtonumeric (sqlccnvt.cpp:7101), not the integer
+        // target's CharToDouble path (:5118). Keep this existing approximation;
+        // matching underflow errors does not establish general rounding parity.
         NumericSource::Float(approx) => {
             let value = DecimalParts::from_f64(approx, precision, scale)
                 .map_err(|_| ParamBuildError::Value(ConvError::OutOfRange))?;

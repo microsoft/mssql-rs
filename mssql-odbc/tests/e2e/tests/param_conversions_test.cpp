@@ -1143,14 +1143,20 @@ TEST_F(ScalarConversionLiveTest, AWideLiteralReachesTheDecimalTarget) {
     EXPECT_EQ("-1.5", ExecuteAndReadBack());
 }
 
-// An exponent literal has no exact scaled form, so decimal_from_text routes it
-// through the f64 approximation rather than the integer rescale. Untested until
-// now, and the one decimal arm whose msodbcsql equivalent is unconfirmed - the
-// CharToDouble citation was verified for an integer target, not a decimal one.
+// Rust uses an f64 approximation here; msodbcsql uses stringtonumeric
+// (sqlccnvt.cpp:7101). These samples compare outcomes, not the parsing mechanism.
 TEST_F(ScalarConversionLiveTest, AnExponentLiteralReachesTheDecimalTarget) {
-    ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(64), ?)"), SQL_HANDLE_STMT, stmt_);
-    ASSERT_SQL_OK(BindNarrow(SQL_DECIMAL, "1.5e2", 10, 2), SQL_HANDLE_STMT, stmt_);
-    EXPECT_EQ("150.00", ExecuteAndReadBack());
+    struct Case {
+        const char* text;
+        const char* expected;
+    };
+    for (const auto& c : {Case{"1.5e2", "150.00"}, Case{"1.005e2", "100.50"}}) {
+        SCOPED_TRACE(c.text);
+        ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(64), ?)"), SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(BindNarrow(SQL_DECIMAL, c.text, 10, 2), SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ(c.expected, ExecuteAndReadBack());
+        ResetParams();
+    }
 }
 
 TEST_F(ScalarConversionLiveTest, DateParamRoundTrips) {
