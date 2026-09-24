@@ -2570,6 +2570,7 @@ fn stream_active_plp_chunk_once<'a>(
             stream.ensure_narrow_decoder();
             let ActivePlpStream {
                 narrow_decoder,
+                narrow_decoder_finished,
                 pending_units,
                 ..
             } = stream;
@@ -2585,6 +2586,7 @@ fn stream_active_plp_chunk_once<'a>(
                 reached_end,
                 widen_out_units,
             );
+            *narrow_decoder_finished |= reached_end && read != 0;
             decoded_output = pending_units.len() > pending_before;
             unsafe {
                 copy_with_nul(
@@ -2754,6 +2756,7 @@ fn stream_active_plp_chunk_once<'a>(
             stream.ensure_narrow_decoder();
             let ActivePlpStream {
                 narrow_decoder,
+                narrow_decoder_finished,
                 pending_bytes: pending_utf8,
                 ..
             } = stream;
@@ -2769,6 +2772,7 @@ fn stream_active_plp_chunk_once<'a>(
                 reached_end,
                 payload_capacity,
             );
+            *narrow_decoder_finished |= reached_end && read != 0;
             decoded_output = pending_utf8.len() > pending_before;
             unsafe {
                 copy_with_nul(
@@ -3056,17 +3060,21 @@ fn append_typed_plp_text(
         // An odd carry starts with the high byte of a unit whose low byte
         // was already delivered. Do not pair it with the next code unit.
         let partial_unit = stream.pending_bytes.len() % 2;
-        let mut text = utf16le_chunk_to_utf8(
+        if partial_unit != 0 {
+            reserve_typed_plp_bytes(bytes, char::REPLACEMENT_CHARACTER.len_utf8())?;
+            bytes.extend_from_slice(
+                char::REPLACEMENT_CHARACTER
+                    .encode_utf8(&mut [0; 4])
+                    .as_bytes(),
+            );
+        }
+        append_typed_utf16(
             &stream.pending_bytes[partial_unit..],
             true,
             &mut None,
             &mut None,
-        );
-        if partial_unit != 0 {
-            text.insert(0, char::REPLACEMENT_CHARACTER);
-        }
-        reserve_typed_plp_bytes(bytes, text.len())?;
-        bytes.extend_from_slice(text.as_bytes());
+            bytes,
+        )?;
     } else {
         reserve_typed_plp_bytes(bytes, stream.pending_bytes.len())?;
         bytes.extend_from_slice(&stream.pending_bytes);
@@ -3074,41 +3082,121 @@ fn append_typed_plp_text(
     stream.pending_bytes.clear();
     stream.pending_bytes_utf16 = false;
     if !stream.pending_units.is_empty() {
-        let text = String::from_utf16_lossy(&stream.pending_units);
-        reserve_typed_plp_bytes(bytes, text.len())?;
-        bytes.extend_from_slice(text.as_bytes());
+        let bound = stream
+            .pending_units
+            .len()
+            .checked_mul(3)
+            .ok_or(ERR_MEMORY_ALLOCATION)?;
+        reserve_typed_plp_bytes(bytes, bound)?;
+        for ch in char::decode_utf16(stream.pending_units.iter().copied()) {
+            bytes.extend_from_slice(
+                ch.unwrap_or(char::REPLACEMENT_CHARACTER)
+                    .encode_utf8(&mut [0; 4])
+                    .as_bytes(),
+            );
+        }
         stream.pending_units.clear();
     }
     match stream.encoding {
         PlpEncoding::Utf16Text => {
-            transcode_utf16le_into_pending(
+            append_typed_utf16(
                 payload,
                 reached_end,
                 &mut stream.pending_byte,
                 &mut stream.pending_high_surrogate,
-                &mut stream.pending_bytes,
-                usize::MAX,
-            );
+                bytes,
+            )?;
         }
         PlpEncoding::SingleByteText | PlpEncoding::Utf8Text => {
-            stream.ensure_narrow_decoder();
+            if stream.narrow_decoder.is_none() {
+                #[cfg(test)]
+                if tests::typed_plp_decoder_allocation_fails() {
+                    return Err(ERR_MEMORY_ALLOCATION);
+                }
+                stream.narrow_decoder = Some(
+                    stream
+                        .narrow_encoding
+                        .ok_or(ERR_INTERNAL_CONVERSION)?
+                        .try_new_decoder_without_bom_handling()
+                        .ok_or(ERR_MEMORY_ALLOCATION)?,
+                );
+                stream.narrow_decoder_finished = false;
+            }
+            if stream.narrow_decoder_finished {
+                return if payload.is_empty() && reached_end {
+                    Ok(())
+                } else {
+                    Err(ERR_INTERNAL_CONVERSION)
+                };
+            }
             let decoder = stream
                 .narrow_decoder
                 .as_mut()
                 .ok_or(ERR_INTERNAL_CONVERSION)?;
-            transcode_narrow_into_pending(
-                decoder,
-                &mut stream.pending_bytes,
-                payload,
-                reached_end,
-                usize::MAX,
-            );
+            let bound = decoder
+                .max_utf8_buffer_length(payload.len())
+                .ok_or(ERR_MEMORY_ALLOCATION)?;
+            reserve_typed_plp_bytes(bytes, bound)?;
+            let base = bytes.len();
+            bytes.resize(base + bound, 0);
+            let (result, consumed, written, _) =
+                decoder.decode_to_utf8(payload, &mut bytes[base..], reached_end);
+            bytes.truncate(base + written);
+            if result != encoding_rs::CoderResult::InputEmpty || consumed != payload.len() {
+                return Err(ERR_INTERNAL_CONVERSION);
+            }
+            stream.narrow_decoder_finished = reached_end;
         }
         PlpEncoding::Binary => return Err(ERR_INTERNAL_CONVERSION),
     }
-    reserve_typed_plp_bytes(bytes, stream.pending_bytes.len())?;
-    bytes.extend_from_slice(&stream.pending_bytes);
-    stream.pending_bytes.clear();
+    Ok(())
+}
+
+fn append_typed_utf16(
+    payload: &[u8],
+    reached_end: bool,
+    pending_byte: &mut Option<u8>,
+    pending_high: &mut Option<u16>,
+    output: &mut Vec<u8>,
+) -> Result<(), DiagMsg> {
+    let bound = payload
+        .len()
+        .checked_add(2)
+        .and_then(|len| len.checked_mul(3))
+        .ok_or(ERR_MEMORY_ALLOCATION)?;
+    reserve_typed_plp_bytes(output, bound)?;
+    let mut emit = |ch: char| {
+        output.extend_from_slice(ch.encode_utf8(&mut [0; 4]).as_bytes());
+    };
+    for &byte in payload {
+        let Some(low) = pending_byte.take() else {
+            *pending_byte = Some(byte);
+            continue;
+        };
+        let unit = u16::from_le_bytes([low, byte]);
+        if let Some(high) = pending_high.take() {
+            if (0xdc00..=0xdfff).contains(&unit) {
+                let scalar =
+                    0x10000 + ((u32::from(high) - 0xd800) << 10) + u32::from(unit) - 0xdc00;
+                emit(char::from_u32(scalar).unwrap_or(char::REPLACEMENT_CHARACTER));
+                continue;
+            }
+            emit(char::REPLACEMENT_CHARACTER);
+        }
+        if is_high_surrogate(unit) {
+            *pending_high = Some(unit);
+        } else {
+            emit(char::from_u32(u32::from(unit)).unwrap_or(char::REPLACEMENT_CHARACTER));
+        }
+    }
+    if reached_end {
+        if pending_high.take().is_some() {
+            emit(char::REPLACEMENT_CHARACTER);
+        }
+        if pending_byte.take().is_some() {
+            emit(char::REPLACEMENT_CHARACTER);
+        }
+    }
     Ok(())
 }
 
@@ -3816,6 +3904,12 @@ mod tests {
     thread_local! {
         static FAIL_TYPED_PLP_RESERVE_AFTER: std::cell::Cell<Option<usize>> =
             const { std::cell::Cell::new(None) };
+        static FAIL_TYPED_PLP_DECODER_ALLOCATION: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+    }
+
+    pub(super) fn typed_plp_decoder_allocation_fails() -> bool {
+        FAIL_TYPED_PLP_DECODER_ALLOCATION.replace(false)
     }
 
     pub(super) fn typed_plp_reserve_size(additional: usize) -> usize {
@@ -8449,6 +8543,227 @@ mod tests {
                 SQL_SUCCESS
             );
             assert_eq!(value, 42);
+        }
+    }
+
+    #[test]
+    fn typed_plp_decoder_allocations_report_hy001_and_drain() {
+        for case in 0..7 {
+            let handles = TestHandles::with_env_dbc_stmt();
+            let narrow = case == 5;
+            prefetched_text_stream(
+                &handles,
+                if narrow {
+                    PlpEncoding::SingleByteText
+                } else {
+                    PlpEncoding::Utf16Text
+                },
+                narrow.then_some(encoding_rs::WINDOWS_1252.into()),
+                if narrow {
+                    vec![b'0'; 9000]
+                } else {
+                    utf16le(&"0".repeat(9000))
+                },
+                None,
+            );
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(handles.stmt) };
+            {
+                let mut state = stmt.inner.lock().unwrap();
+                let stream = state.active_plp.as_mut().unwrap();
+                match case {
+                    0 | 6 => {
+                        stream.pending_bytes = vec![0, b'0', 0];
+                        stream.pending_bytes_utf16 = true;
+                    }
+                    1 => {
+                        stream.pending_bytes = utf16le("0");
+                        stream.pending_bytes_utf16 = true;
+                    }
+                    2 => stream.pending_units = vec![u16::from(b'0')],
+                    _ => {}
+                }
+            }
+            if case == 5 {
+                FAIL_TYPED_PLP_DECODER_ALLOCATION.set(true);
+            } else {
+                // The first reservation retains raw wire, the second decodes carry/payload.
+                // Case 4 rejects a later wire chunk instead.
+                FAIL_TYPED_PLP_RESERVE_AFTER.set(Some(match case {
+                    4 => 3,
+                    6 => 2,
+                    _ => 1,
+                }));
+            }
+            let mut value = -99_i32;
+            let mut indicator = -99;
+            assert_eq!(
+                unsafe {
+                    crate::api::exports::SQLGetData(
+                        handles.stmt,
+                        1,
+                        SQL_C_SLONG,
+                        (&mut value as *mut i32).cast(),
+                        0,
+                        &mut indicator,
+                    )
+                },
+                SQL_ERROR
+            );
+            assert_eq!((value, indicator), (-99, -99));
+            assert_eq!(FAIL_TYPED_PLP_RESERVE_AFTER.replace(None), None);
+            assert!(!FAIL_TYPED_PLP_DECODER_ALLOCATION.replace(false));
+            let state = stmt.inner.lock().unwrap();
+            assert_last_diag(&state.diag_records, ERR_MEMORY_ALLOCATION);
+            assert!(state.active_plp.is_none());
+            assert!(state.captured_plp_wire.is_none());
+            drop(state);
+            assert_eq!(
+                unsafe {
+                    crate::api::exports::SQLGetData(
+                        handles.stmt,
+                        1,
+                        SQL_C_SLONG,
+                        (&mut value as *mut i32).cast(),
+                        0,
+                        &mut indicator,
+                    )
+                },
+                SQL_NO_DATA
+            );
+        }
+    }
+
+    #[test]
+    fn typed_plp_after_final_character_chunk_does_not_finalize_decoder_twice() {
+        use mssql_mock_tds::{ColumnDefinition, ColumnValue, QueryResponse, Row, SqlDataType};
+        let handles = TestHandles::with_env_dbc_stmt();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(handles.dbc) };
+        let response = QueryResponse::new(
+            vec![ColumnDefinition::new("value", SqlDataType::VarCharMax)],
+            vec![Row::new(vec![ColumnValue::VarCharMax(vec![vec![0x80]])])],
+        );
+        let _server = crate::test_support::connect_mock_server(dbc, "SELECT carry", response);
+        let query: Vec<u16> = "SELECT carry\0".encode_utf16().collect();
+        assert_eq!(
+            unsafe {
+                crate::api::exec_direct::sql_exec_direct_w(handles.stmt, query.as_ptr(), SQL_NTS)
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!(
+            unsafe { crate::api::fetch::sql_fetch(handles.stmt) },
+            SQL_SUCCESS
+        );
+        let mut output = [0xcc_u8; 2];
+        let mut indicator = -99;
+        assert_eq!(
+            unsafe {
+                crate::api::exports::SQLGetData(
+                    handles.stmt,
+                    1,
+                    SQL_C_CHAR,
+                    output.as_mut_ptr().cast(),
+                    2,
+                    &mut indicator,
+                )
+            },
+            SQL_SUCCESS_WITH_INFO
+        );
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(handles.stmt) };
+        assert!(
+            stmt.inner
+                .lock()
+                .unwrap()
+                .active_plp
+                .as_ref()
+                .unwrap()
+                .narrow_decoder_finished
+        );
+        let mut value = -99_i32;
+        indicator = -99;
+        assert_eq!(
+            unsafe {
+                crate::api::exports::SQLGetData(
+                    handles.stmt,
+                    1,
+                    SQL_C_SLONG,
+                    (&mut value as *mut i32).cast(),
+                    0,
+                    &mut indicator,
+                )
+            },
+            SQL_ERROR
+        );
+        assert_eq!((value, indicator), (-99, -99));
+        assert_last_diag(
+            &stmt.inner.lock().unwrap().diag_records,
+            ERR_INVALID_CHARACTER_VALUE,
+        );
+    }
+
+    #[test]
+    fn typed_plp_utf16_decoder_matches_lossy_text_at_every_split() {
+        for wire in [
+            utf16le("42\u{20ac}\u{1f600}"),
+            vec![0, 0xd8, b'4', 0, 0, 0xdc, b'2', 0, 0xff],
+            vec![0, 0xd8, 0],
+            vec![],
+        ] {
+            let expected = utf16le_chunk_to_utf8(&wire, true, &mut None, &mut None);
+            for split in 0..=wire.len() {
+                let mut output = Vec::new();
+                let mut pending_byte = None;
+                let mut pending_high = None;
+                append_typed_utf16(
+                    &wire[..split],
+                    false,
+                    &mut pending_byte,
+                    &mut pending_high,
+                    &mut output,
+                )
+                .unwrap();
+                append_typed_utf16(
+                    &wire[split..],
+                    true,
+                    &mut pending_byte,
+                    &mut pending_high,
+                    &mut output,
+                )
+                .unwrap();
+                assert_eq!(output, expected.as_bytes(), "split {split}, wire {wire:?}");
+                assert_eq!(pending_byte, None);
+                assert_eq!(pending_high, None);
+            }
+        }
+    }
+
+    #[test]
+    fn typed_plp_decoders_flush_empty_final_chunks_without_allocating_temporaries() {
+        for (encoding, narrow, input) in [
+            (PlpEncoding::Utf16Text, None, vec![0x3d, 0xd8, 0]),
+            (
+                PlpEncoding::Utf8Text,
+                Some(encoding_rs::UTF_8.into()),
+                vec![0xe2, 0x82],
+            ),
+            (
+                PlpEncoding::SingleByteText,
+                Some(encoding_rs::SHIFT_JIS.into()),
+                vec![0x82],
+            ),
+        ] {
+            let mut stream = ActivePlpStream::new(1, encoding, narrow);
+            let mut output = Vec::new();
+            for byte in input {
+                append_typed_plp_text(&mut stream, &[byte], false, &mut output).unwrap();
+            }
+            append_typed_plp_text(&mut stream, &[], true, &mut output).unwrap();
+            let expected = if encoding == PlpEncoding::Utf16Text {
+                "\u{fffd}\u{fffd}"
+            } else {
+                "\u{fffd}"
+            };
+            assert_eq!(output, expected.as_bytes());
         }
     }
 

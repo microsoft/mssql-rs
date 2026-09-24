@@ -195,6 +195,8 @@ buffers unchanged; no truncated numeric prefix is returned. See
 [deviation 7](docs/parity-deviations.md) for the measured native-driver difference.
 Fallible materialization allocation failures drain the value and report `HY001`
 instead of the size-limit diagnostic.
+Typed decoding reserves output before consuming carry or decoder input, without
+temporary UTF-16 vectors or strings; narrow decoder creation is fallible too.
 Typed reads and rejected-value drains reuse an 8 KiB scratch buffer within one
 `SQLGetData` call; internal chunks do not require additional application calls.
 Conversion errors retain decoded text for character/typed retries and the

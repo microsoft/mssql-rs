@@ -69,6 +69,7 @@ pub(crate) struct ActivePlpStream {
     /// `encoding_rs::Decoder` already holds that partial sequence internally,
     /// which keeps the boundary rule in one place instead of one per codepage.
     pub(crate) narrow_decoder: Option<ResolvedDecoder>,
+    pub(crate) narrow_decoder_finished: bool,
     /// Code units already decoded on a previous call that did not fit the
     /// caller's buffer, delivered before any further wire bytes.
     ///
@@ -128,6 +129,7 @@ impl ActivePlpStream {
             pending_bytes_utf16: false,
             narrow_encoding,
             narrow_decoder: None,
+            narrow_decoder_finished: false,
             pending_units: Vec::new(),
             prefetched_wire: Vec::new(),
             prefetched_offset: 0,
@@ -150,6 +152,7 @@ impl ActivePlpStream {
             && let Some(encoding) = self.narrow_encoding
         {
             self.narrow_decoder = Some(encoding.new_decoder_without_bom_handling());
+            self.narrow_decoder_finished = false;
         }
     }
 
