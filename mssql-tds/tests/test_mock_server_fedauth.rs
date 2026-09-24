@@ -10,7 +10,7 @@ mod mock_server_fedauth_tests {
         ClientContext, EntraIdTokenFactory, TdsAuthenticationMethod,
     };
     use mssql_tds::connection_provider::tds_connection_provider::TdsConnectionProvider;
-    use mssql_tds::core::{EncryptionOptions, EncryptionSetting, TdsResult};
+    use mssql_tds::core::{EncryptionOptions, EncryptionSetting, ServerTrust, TdsResult};
     use std::sync::{Arc, Mutex};
     use tokio::sync::oneshot;
     use tracing_subscriber::FmtSubscriber;
@@ -88,12 +88,9 @@ mod mock_server_fedauth_tests {
         context.access_token = Some(access_token.clone());
         context.tds_authentication_method = TdsAuthenticationMethod::AccessToken;
         context.database = "master".to_string();
-        context.encryption_options = EncryptionOptions {
-            mode: EncryptionSetting::PreferOff,
-            trust_server_certificate: true,
-            host_name_in_cert: None,
-            server_certificate: None,
-        };
+        context.encryption_options = EncryptionOptions::new()
+            .with_mode(EncryptionSetting::PreferOff)
+            .with_server_trust(ServerTrust::DangerAcceptAny);
 
         // Connect to mock server
         let provider = TdsConnectionProvider {};
@@ -172,12 +169,9 @@ mod mock_server_fedauth_tests {
         context.access_token = Some(access_token.clone());
         context.tds_authentication_method = TdsAuthenticationMethod::AccessToken;
         context.database = "master".to_string();
-        context.encryption_options = EncryptionOptions {
-            mode: EncryptionSetting::PreferOff,
-            trust_server_certificate: true,
-            host_name_in_cert: None,
-            server_certificate: None,
-        };
+        context.encryption_options = EncryptionOptions::new()
+            .with_mode(EncryptionSetting::PreferOff)
+            .with_server_trust(ServerTrust::DangerAcceptAny);
 
         // Connect and execute query
         let provider = TdsConnectionProvider {};
@@ -255,12 +249,9 @@ mod mock_server_fedauth_tests {
         context.access_token = Some(access_token.clone());
         context.tds_authentication_method = TdsAuthenticationMethod::AccessToken;
         context.database = "master".to_string();
-        context.encryption_options = EncryptionOptions {
-            mode: EncryptionSetting::PreferOff,
-            trust_server_certificate: true,
-            host_name_in_cert: None,
-            server_certificate: None,
-        };
+        context.encryption_options = EncryptionOptions::new()
+            .with_mode(EncryptionSetting::PreferOff)
+            .with_server_trust(ServerTrust::DangerAcceptAny);
 
         // This should succeed if FedAuth negotiation works
         let provider = TdsConnectionProvider {};
@@ -339,12 +330,9 @@ mod mock_server_fedauth_tests {
         context.access_token = Some(unique_token.clone());
         context.tds_authentication_method = TdsAuthenticationMethod::AccessToken;
         context.database = "master".to_string();
-        context.encryption_options = EncryptionOptions {
-            mode: EncryptionSetting::PreferOff,
-            trust_server_certificate: true,
-            host_name_in_cert: None,
-            server_certificate: None,
-        };
+        context.encryption_options = EncryptionOptions::new()
+            .with_mode(EncryptionSetting::PreferOff)
+            .with_server_trust(ServerTrust::DangerAcceptAny);
 
         let provider = TdsConnectionProvider {};
         let client = provider.create_client(context, &datasource, None).await?;
@@ -408,12 +396,9 @@ mod mock_server_fedauth_tests {
         context.tds_authentication_method =
             TdsAuthenticationMethod::ActiveDirectoryServicePrincipal;
         context.database = "master".to_string();
-        context.encryption_options = EncryptionOptions {
-            mode: EncryptionSetting::PreferOff,
-            trust_server_certificate: true,
-            host_name_in_cert: None,
-            server_certificate: None,
-        };
+        context.encryption_options = EncryptionOptions::new()
+            .with_mode(EncryptionSetting::PreferOff)
+            .with_server_trust(ServerTrust::DangerAcceptAny);
         context.auth_method_map.insert(
             TdsAuthenticationMethod::ActiveDirectoryServicePrincipal,
             Box::new(MockEntraFactory {
@@ -497,12 +482,9 @@ mod mock_server_fedauth_tests {
         context.access_token = Some(access_token.clone());
         context.tds_authentication_method = TdsAuthenticationMethod::AccessToken;
         context.database = "master".to_string();
-        context.encryption_options = EncryptionOptions {
-            mode: EncryptionSetting::PreferOff,
-            trust_server_certificate: true,
-            host_name_in_cert: None,
-            server_certificate: None,
-        };
+        context.encryption_options = EncryptionOptions::new()
+            .with_mode(EncryptionSetting::PreferOff)
+            .with_server_trust(ServerTrust::DangerAcceptAny);
 
         let provider = TdsConnectionProvider {};
         let client = provider.create_client(context, &datasource, None).await?;

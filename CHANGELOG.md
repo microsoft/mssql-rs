@@ -8,6 +8,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ### Added
 
+- `mssql-tds`: custom trust roots for server certificate validation via
+  `ServerTrust::Verify { roots: TrustRoots::Custom(..) | TrustRoots::PlatformAndCustom(..), .. }`.
+  Certificates come from a `CertificateSource` (PEM/DER file, or in-memory PEM
+  or DER) and apply to that connection only. Chain, validity and host name
+  validation stay enabled, so a private CA can be trusted without installing it
+  system wide. Custom certificates must be root CAs. On Windows the default
+  Schannel-direct engine retains TLS channel bindings with custom roots.
+
 - `mssql-odbc`: input parameter binding (`SQLBindParameter` with
   `SQL_PARAM_INPUT`) for the character and integer type families. Any other
   `ValueType` → `ParameterType` pairing is rejected at bind time with `HYC00`,
@@ -54,6 +62,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 - Initial public release of the mssql-rs workspace.
 
 ### Changed
+
+- `mssql-tds` (breaking): `EncryptionOptions` is now `#[non_exhaustive]` with
+  `mode` and `server_trust: ServerTrust` fields, replacing
+  `trust_server_certificate`, `host_name_in_cert` and `server_certificate`.
+  `ServerTrust` is `Verify { roots, host_name }`, `Pinned(CertificateSource)`
+  or `DangerAcceptAny`, so contradictory combinations cannot be expressed.
+  Build options with `EncryptionOptions::new().with_mode(..).with_server_trust(..)`.
+  Bindings that accept ODBC-style keywords use
+  `EncryptionOptions::from_connection_keywords`, which keeps msodbcsql's rules
+  (`ServerCertificate` wins over `TrustServerCertificate`,
+  `TrustServerCertificate` is ignored under `Strict`, `ServerCertificate` and
+  `HostNameInCertificate` are mutually exclusive). `ServerTrust::DangerAcceptAny`
+  set directly is honored in every mode, including `Strict`.
 
 - `mssql-odbc`: `SQLBindCol` now accepts `SQL_C_DEFAULT` and resolves it at
   fetch time from the current result column's SQL type, using the same mapping

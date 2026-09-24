@@ -10,7 +10,7 @@
 mod redirection_tests {
     use mssql_tds::connection::client_context::ClientContext;
     use mssql_tds::connection_provider::tds_connection_provider::TdsConnectionProvider;
-    use mssql_tds::core::{EncryptionOptions, EncryptionSetting};
+    use mssql_tds::core::{EncryptionOptions, EncryptionSetting, ServerTrust};
 
     /// Create a client context for testing without encryption
     fn create_test_context() -> ClientContext {
@@ -18,12 +18,9 @@ mod redirection_tests {
         context.user_name = "sa".to_string();
         context.password = "TestPassword123!".to_string();
         context.database = "master".to_string();
-        context.encryption_options = EncryptionOptions {
-            mode: EncryptionSetting::PreferOff,
-            trust_server_certificate: true,
-            host_name_in_cert: None,
-            server_certificate: None,
-        };
+        context.encryption_options = EncryptionOptions::new()
+            .with_mode(EncryptionSetting::PreferOff)
+            .with_server_trust(ServerTrust::DangerAcceptAny);
         context.connect_timeout = 30;
         context
     }

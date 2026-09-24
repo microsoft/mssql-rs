@@ -248,7 +248,7 @@ pub enum Error {
 
     /// Certificate file does not exist on disk.
     #[error(
-        "Certificate file not found: {path}. Verify the ServerCertificate path is correct and the file exists."
+        "Certificate file not found: {path}. Verify the certificate path is correct and the file exists."
     )]
     CertificateNotFound {
         /// File path that was looked up.
@@ -262,6 +262,15 @@ pub enum Error {
     InvalidCertificateFormat {
         /// File path with the invalid certificate.
         path: PathBuf,
+    },
+
+    /// In-memory certificate data cannot be parsed.
+    #[error(
+        "Invalid certificate data. Ensure it contains a valid {expected} encoded X.509 certificate."
+    )]
+    InvalidCertificateData {
+        /// Encoding the data was expected to use.
+        expected: &'static str,
     },
 
     /// Server certificate has passed its validity period.

@@ -11,12 +11,25 @@ These files are NOT tracked in git (they contain secrets). Generate them locally
 ### valid_cert.der  
 The same certificate in DER (binary) format for testing DER file loading.
 
+### ca_cert.pem / ca_key.pem
+A private test CA used by the custom trust root tests.
+
+### ca_signed_cert.pem / ca_signed_key.pem
+A leaf certificate for `localhost` / `127.0.0.1` issued by the test CA above.
+The PowerShell generator additionally writes `ca_signed_identity.pfx` for
+Windows, where identities are loaded from PKCS#12 files.
+
+### unrelated_ca_cert.pem / unrelated_ca_key.pem
+A second, unrelated CA used to verify that trusting one CA does not trust another.
+
 ### invalid_format.txt
 An invalid file that doesn't contain a valid certificate, used to test error handling.
 
 ## Generating Test Certificates
 
 Before running TLS tests, generate the test certificates locally.
+The custom trust root tests require these fixtures on every platform; missing, unreadable,
+or malformed files fail the tests rather than silently skipping TLS coverage.
 
 ### From repository root (recommended for CI/CD):
 

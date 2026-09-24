@@ -9,7 +9,8 @@ mod mock_server_tests {
     use mssql_tds::connection::client_context::ClientContext;
     use mssql_tds::connection::tds_client::ResultSet;
     use mssql_tds::connection_provider::tds_connection_provider::TdsConnectionProvider;
-    use mssql_tds::core::{EncryptionOptions, EncryptionSetting};
+    use mssql_tds::core::{CertificateSource, EncryptionOptions, EncryptionSetting, ServerTrust};
+    use mssql_tds::error::Error;
     use tokio::sync::oneshot;
     use tracing_subscriber::FmtSubscriber;
 
@@ -108,12 +109,9 @@ mod mock_server_tests {
         context.user_name = "sa".to_string();
         context.password = generate_test_password();
         context.database = "master".to_string();
-        context.encryption_options = EncryptionOptions {
-            mode: EncryptionSetting::PreferOff,
-            trust_server_certificate: true,
-            host_name_in_cert: None,
-            server_certificate: None,
-        };
+        context.encryption_options = EncryptionOptions::new()
+            .with_mode(EncryptionSetting::PreferOff)
+            .with_server_trust(ServerTrust::DangerAcceptAny);
 
         // Connect to mock server
         let provider = TdsConnectionProvider {};
@@ -150,12 +148,9 @@ mod mock_server_tests {
         context.user_name = "sa".to_string();
         context.password = generate_test_password();
         context.database = "master".to_string();
-        context.encryption_options = EncryptionOptions {
-            mode: EncryptionSetting::PreferOff,
-            trust_server_certificate: true,
-            host_name_in_cert: None,
-            server_certificate: None,
-        };
+        context.encryption_options = EncryptionOptions::new()
+            .with_mode(EncryptionSetting::PreferOff)
+            .with_server_trust(ServerTrust::DangerAcceptAny);
 
         let provider = TdsConnectionProvider {};
         let mut client = provider.create_client(context, &datasource, None).await?;
@@ -211,12 +206,9 @@ mod mock_server_tests {
         context.user_name = "sa".to_string();
         context.password = generate_test_password();
         context.database = "master".to_string();
-        context.encryption_options = EncryptionOptions {
-            mode: EncryptionSetting::PreferOff,
-            trust_server_certificate: true,
-            host_name_in_cert: None,
-            server_certificate: None,
-        };
+        context.encryption_options = EncryptionOptions::new()
+            .with_mode(EncryptionSetting::PreferOff)
+            .with_server_trust(ServerTrust::DangerAcceptAny);
 
         let provider = TdsConnectionProvider {};
         let mut client = provider.create_client(context, &datasource, None).await?;
@@ -282,12 +274,9 @@ mod mock_server_tests {
         context.user_name = "sa".to_string();
         context.password = generate_test_password();
         context.database = "master".to_string();
-        context.encryption_options = EncryptionOptions {
-            mode: EncryptionSetting::PreferOff,
-            trust_server_certificate: true,
-            host_name_in_cert: None,
-            server_certificate: None,
-        };
+        context.encryption_options = EncryptionOptions::new()
+            .with_mode(EncryptionSetting::PreferOff)
+            .with_server_trust(ServerTrust::DangerAcceptAny);
 
         let provider = TdsConnectionProvider {};
         let mut client = provider.create_client(context, &datasource, None).await?;
@@ -355,12 +344,9 @@ mod mock_server_tests {
         context.user_name = "sa".to_string();
         context.password = generate_test_password();
         context.database = "master".to_string();
-        context.encryption_options = EncryptionOptions {
-            mode: EncryptionSetting::PreferOff,
-            trust_server_certificate: true,
-            host_name_in_cert: None,
-            server_certificate: None,
-        };
+        context.encryption_options = EncryptionOptions::new()
+            .with_mode(EncryptionSetting::PreferOff)
+            .with_server_trust(ServerTrust::DangerAcceptAny);
 
         let provider = TdsConnectionProvider {};
 
@@ -429,12 +415,9 @@ mod mock_server_tests {
         context.user_name = "sa".to_string();
         context.password = generate_test_password();
         context.database = "master".to_string();
-        context.encryption_options = EncryptionOptions {
-            mode: EncryptionSetting::PreferOff,
-            trust_server_certificate: true,
-            host_name_in_cert: None,
-            server_certificate: None,
-        };
+        context.encryption_options = EncryptionOptions::new()
+            .with_mode(EncryptionSetting::PreferOff)
+            .with_server_trust(ServerTrust::DangerAcceptAny);
 
         let provider = TdsConnectionProvider {};
         let mut client = provider.create_client(context, &datasource, None).await?;
@@ -517,12 +500,9 @@ mod mock_server_tests {
         context.user_name = "sa".to_string();
         context.password = generate_test_password();
         context.database = "master".to_string();
-        context.encryption_options = EncryptionOptions {
-            mode: EncryptionSetting::PreferOff,
-            trust_server_certificate: true,
-            host_name_in_cert: None,
-            server_certificate: None,
-        };
+        context.encryption_options = EncryptionOptions::new()
+            .with_mode(EncryptionSetting::PreferOff)
+            .with_server_trust(ServerTrust::DangerAcceptAny);
 
         let provider = TdsConnectionProvider {};
         let mut client = provider.create_client(context, &datasource, None).await?;
@@ -573,12 +553,13 @@ mod mock_server_tests {
         context.user_name = "sa".to_string();
         context.password = generate_test_password();
         context.database = "master".to_string();
-        context.encryption_options = EncryptionOptions {
-            mode: EncryptionSetting::PreferOff, // Use PreferOff since mock server doesn't support TLS
-            trust_server_certificate: true,
-            host_name_in_cert: None,
-            server_certificate: Some("/nonexistent/path/certificate.cer".into()),
-        };
+        context.encryption_options = EncryptionOptions::from_connection_keywords(
+            EncryptionSetting::PreferOff,
+            true,
+            None,
+            Some("/nonexistent/path/certificate.cer".into()),
+        )
+        .unwrap();
 
         // Attempt to connect - should succeed since encryption is off
         // But ServerCertificate should still be validated when reading from file
@@ -638,12 +619,13 @@ mod mock_server_tests {
         context.user_name = "sa".to_string();
         context.password = generate_test_password();
         context.database = "master".to_string();
-        context.encryption_options = EncryptionOptions {
-            mode: EncryptionSetting::Required,
-            trust_server_certificate: true, // This should be ignored
-            host_name_in_cert: None,
-            server_certificate: Some(cert_path.clone()),
-        };
+        context.encryption_options = EncryptionOptions::from_connection_keywords(
+            EncryptionSetting::Required,
+            true,
+            None,
+            Some(cert_path.clone()),
+        )
+        .unwrap();
 
         // Attempt to connect - ServerCertificate should take precedence
         // This may fail due to certificate mismatch or SSL issues with mock server,
@@ -677,67 +659,16 @@ mod mock_server_tests {
         let _ = tokio::time::timeout(tokio::time::Duration::from_secs(2), server_handle).await;
     }
 
-    /// Test ServerCertificate and HostnameInCertificate mutual exclusion
-    #[tokio::test]
-    async fn test_server_certificate_with_hostname_in_cert_fails() {
-        init_tracing();
-
-        // Start mock server
-        let server = MockTdsServer::new("127.0.0.1:0").await.unwrap();
-        let server_addr = server.local_addr();
-
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        let server_handle =
-            tokio::spawn(async move { server.run_with_shutdown(shutdown_rx).await });
-
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
-        // Create a temporary test certificate file
-        use std::fs;
-        use std::io::Write;
-        let temp_dir = std::env::temp_dir();
-        let cert_path = temp_dir.join("test_cert_hnic.cer");
-
-        let mut file = fs::File::create(&cert_path).unwrap();
-        file.write_all(&[0x30, 0x82, 0x01, 0x00]).unwrap();
-        file.write_all(&vec![0; 256]).unwrap();
-
-        // Create client context with both ServerCertificate and HostnameInCertificate
-        // This should return an error as they are mutually exclusive
-        let datasource = format!("tcp:{},{}", server_addr.ip(), server_addr.port());
-        let mut context = ClientContext::default();
-        context.user_name = "sa".to_string();
-        context.password = generate_test_password();
-        context.database = "master".to_string();
-        context.encryption_options = EncryptionOptions {
-            mode: EncryptionSetting::PreferOff, // Use PreferOff since mock server doesn't support TLS
-            trust_server_certificate: true,
-            host_name_in_cert: Some("custom.hostname.com".to_string()),
-            server_certificate: Some(cert_path.clone()),
-        };
-
-        // Attempt to connect - with PreferOff, may succeed but both options set is unusual
-        // The test primarily validates that the configuration is accepted at creation time
-        let provider = TdsConnectionProvider {};
-        let result = provider.create_client(context, &datasource, None).await;
-
-        // When encryption is off, the mutual exclusivity check might not trigger
-        // This test validates the configuration doesn't cause a crash
-        match result {
-            Ok(_) => {
-                // Connection succeeded (no encryption, so certificate options ignored)
-            }
-            Err(e) => {
-                let error_msg = e.to_string();
-                // If it fails, could be due to the mutual exclusivity or connection issues
-                println!("Error occurred (expected behavior): {}", error_msg);
-            }
-        }
-
-        // Cleanup
-        let _ = fs::remove_file(cert_path);
-        let _ = shutdown_tx.send(());
-        let _ = tokio::time::timeout(tokio::time::Duration::from_secs(2), server_handle).await;
+    /// ServerCertificate and HostnameInCertificate are mutually exclusive
+    #[test]
+    fn test_server_certificate_with_hostname_in_cert_fails() {
+        let result = EncryptionOptions::from_connection_keywords(
+            EncryptionSetting::PreferOff,
+            true,
+            Some("custom.hostname.com".to_string()),
+            Some("server.cer".into()),
+        );
+        assert!(matches!(result, Err(Error::UsageError(_))));
     }
 
     /// Test ServerCertificate with TLS-enabled mock server
@@ -769,12 +700,11 @@ mod mock_server_tests {
             context.user_name = "sa".to_string();
             context.password = generate_test_password();
             context.database = "master".to_string();
-            context.encryption_options = EncryptionOptions {
-                mode: EncryptionSetting::Required,
-                trust_server_certificate: false,
-                host_name_in_cert: None,
-                server_certificate: Some("tests/test_certificates/valid_cert.pem".into()),
-            };
+            context.encryption_options = EncryptionOptions::new()
+                .with_mode(EncryptionSetting::Required)
+                .with_server_trust(ServerTrust::Pinned(CertificateSource::File(
+                    "tests/test_certificates/valid_cert.pem".into(),
+                )));
 
             let provider = TdsConnectionProvider {};
             let client = provider.create_client(context, &datasource, None).await?;
@@ -788,12 +718,9 @@ mod mock_server_tests {
             context.user_name = "sa".to_string();
             context.password = generate_test_password();
             context.database = "master".to_string();
-            context.encryption_options = EncryptionOptions {
-                mode: EncryptionSetting::Required,
-                trust_server_certificate: true,
-                host_name_in_cert: None,
-                server_certificate: None,
-            };
+            context.encryption_options = EncryptionOptions::new()
+                .with_mode(EncryptionSetting::Required)
+                .with_server_trust(ServerTrust::DangerAcceptAny);
 
             let provider = TdsConnectionProvider {};
             let client = provider.create_client(context, &datasource, None).await?;
@@ -807,12 +734,11 @@ mod mock_server_tests {
             context.user_name = "sa".to_string();
             context.password = generate_test_password();
             context.database = "master".to_string();
-            context.encryption_options = EncryptionOptions {
-                mode: EncryptionSetting::Required,
-                trust_server_certificate: false,
-                host_name_in_cert: None,
-                server_certificate: Some("tests/test_certificates/valid_cert.pem".into()),
-            };
+            context.encryption_options = EncryptionOptions::new()
+                .with_mode(EncryptionSetting::Required)
+                .with_server_trust(ServerTrust::Pinned(CertificateSource::File(
+                    "tests/test_certificates/valid_cert.pem".into(),
+                )));
 
             let provider = TdsConnectionProvider {};
             let mut client = provider.create_client(context, &datasource, None).await?;
@@ -872,12 +798,10 @@ mod mock_server_tests {
             context.user_name = "sa".to_string();
             context.password = generate_test_password();
             context.database = "master".to_string();
-            context.encryption_options = EncryptionOptions {
-                mode: EncryptionSetting::Strict, // TDS 8.0 - direct TLS
-                trust_server_certificate: false,
-                host_name_in_cert: None,
-                server_certificate: Some("tests/test_certificates/valid_cert.pem".into()),
-            };
+            context.encryption_options =
+                EncryptionOptions::new().with_server_trust(ServerTrust::Pinned(
+                    CertificateSource::File("tests/test_certificates/valid_cert.pem".into()),
+                ));
 
             let provider = TdsConnectionProvider {};
             let client = provider.create_client(context, &datasource, None).await?;
@@ -892,12 +816,13 @@ mod mock_server_tests {
             context.user_name = "sa".to_string();
             context.password = generate_test_password();
             context.database = "master".to_string();
-            context.encryption_options = EncryptionOptions {
-                mode: EncryptionSetting::Strict,
-                trust_server_certificate: true, // This is ignored in Strict mode
-                host_name_in_cert: None,
-                server_certificate: None,
-            };
+            context.encryption_options = EncryptionOptions::from_connection_keywords(
+                EncryptionSetting::Strict,
+                true,
+                None,
+                None,
+            )
+            .unwrap();
 
             let provider = TdsConnectionProvider {};
             let result = provider.create_client(context, &datasource, None).await;
@@ -916,12 +841,10 @@ mod mock_server_tests {
             context.user_name = "sa".to_string();
             context.password = generate_test_password();
             context.database = "master".to_string();
-            context.encryption_options = EncryptionOptions {
-                mode: EncryptionSetting::Strict,
-                trust_server_certificate: false,
-                host_name_in_cert: None,
-                server_certificate: Some("tests/test_certificates/valid_cert.pem".into()),
-            };
+            context.encryption_options =
+                EncryptionOptions::new().with_server_trust(ServerTrust::Pinned(
+                    CertificateSource::File("tests/test_certificates/valid_cert.pem".into()),
+                ));
 
             let provider = TdsConnectionProvider {};
             let mut client = provider.create_client(context, &datasource, None).await?;
@@ -972,12 +895,9 @@ mod mock_server_tests {
         context.user_name = "sa".to_string();
         context.password = generate_test_password();
         context.database = "master".to_string();
-        context.encryption_options = EncryptionOptions {
-            mode: EncryptionSetting::PreferOff,
-            trust_server_certificate: true,
-            host_name_in_cert: None,
-            server_certificate: None,
-        };
+        context.encryption_options = EncryptionOptions::new()
+            .with_mode(EncryptionSetting::PreferOff)
+            .with_server_trust(ServerTrust::DangerAcceptAny);
 
         let provider = TdsConnectionProvider {};
         let mut client = provider.create_client(context, &datasource, None).await?;
@@ -1061,12 +981,9 @@ mod mock_server_tests {
         context.user_name = "sa".to_string();
         context.password = generate_test_password();
         context.database = "master".to_string();
-        context.encryption_options = EncryptionOptions {
-            mode: EncryptionSetting::PreferOff,
-            trust_server_certificate: true,
-            host_name_in_cert: None,
-            server_certificate: None,
-        };
+        context.encryption_options = EncryptionOptions::new()
+            .with_mode(EncryptionSetting::PreferOff)
+            .with_server_trust(ServerTrust::DangerAcceptAny);
 
         let provider = TdsConnectionProvider {};
         let mut client = provider.create_client(context, &datasource, None).await?;
@@ -1152,12 +1069,9 @@ mod mock_server_tests {
         context.user_name = "sa".to_string();
         context.password = generate_test_password();
         context.database = "master".to_string();
-        context.encryption_options = EncryptionOptions {
-            mode: EncryptionSetting::PreferOff,
-            trust_server_certificate: true,
-            host_name_in_cert: None,
-            server_certificate: None,
-        };
+        context.encryption_options = EncryptionOptions::new()
+            .with_mode(EncryptionSetting::PreferOff)
+            .with_server_trust(ServerTrust::DangerAcceptAny);
 
         let provider = TdsConnectionProvider {};
         let mut client = provider.create_client(context, &datasource, None).await?;
@@ -1251,12 +1165,9 @@ mod mock_server_tests {
         context.user_name = "sa".to_string();
         context.password = generate_test_password();
         context.database = "master".to_string();
-        context.encryption_options = EncryptionOptions {
-            mode: EncryptionSetting::PreferOff,
-            trust_server_certificate: true,
-            host_name_in_cert: None,
-            server_certificate: None,
-        };
+        context.encryption_options = EncryptionOptions::new()
+            .with_mode(EncryptionSetting::PreferOff)
+            .with_server_trust(ServerTrust::DangerAcceptAny);
 
         let provider = TdsConnectionProvider {};
         let mut client = provider.create_client(context, &datasource, None).await?;

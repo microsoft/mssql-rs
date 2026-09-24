@@ -33,6 +33,8 @@ pub(crate) mod alpn;
 pub(crate) mod bindings;
 pub(crate) mod cred;
 #[cfg(feature = "tls-schannel-direct")]
+mod custom_ca;
+#[cfg(feature = "tls-schannel-direct")]
 pub(crate) mod engine;
 pub(crate) mod errors;
 pub(crate) mod handshake;

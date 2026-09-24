@@ -64,12 +64,13 @@ mod transport_protocols {
         client_context.user_name = username;
         client_context.password = password;
         client_context.database = "master".to_string();
-        client_context.encryption_options = EncryptionOptions {
-            mode: encryption_mode,
-            trust_server_certificate: trust_server_certificate(),
-            host_name_in_cert: get_cert_hostname(),
-            server_certificate: None,
-        };
+        client_context.encryption_options = EncryptionOptions::from_connection_keywords(
+            encryption_mode,
+            trust_server_certificate(),
+            get_cert_hostname(),
+            None,
+        )
+        .unwrap();
 
         let provider = TdsConnectionProvider {};
         provider
@@ -86,12 +87,13 @@ mod transport_protocols {
         let mut client_context = ClientContext::default();
         client_context.database = "master".to_string();
         client_context.tds_authentication_method = TdsAuthenticationMethod::SSPI;
-        client_context.encryption_options = EncryptionOptions {
-            mode: encryption_mode,
-            trust_server_certificate: trust_server_certificate(),
-            host_name_in_cert: get_cert_hostname(),
-            server_certificate: None,
-        };
+        client_context.encryption_options = EncryptionOptions::from_connection_keywords(
+            encryption_mode,
+            trust_server_certificate(),
+            get_cert_hostname(),
+            None,
+        )
+        .unwrap();
 
         let provider = TdsConnectionProvider {};
         provider

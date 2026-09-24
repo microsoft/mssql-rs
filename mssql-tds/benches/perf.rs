@@ -248,22 +248,25 @@ pub fn create_context() -> ClientContext {
                 .map_err(|_| std::env::VarError::NotPresent)
         })
         .expect("SQL_PASSWORD environment variable not set and /tmp/password could not be read");
-    context.encryption_options = EncryptionOptions {
-        mode: env::var("BENCH_ENCRYPT")
-            .ok()
-            .and_then(|v| match v.to_ascii_lowercase().as_str() {
-                "strict" => Some(EncryptionSetting::Strict),
-                "on" => Some(EncryptionSetting::On),
-                "off" => Some(EncryptionSetting::PreferOff),
-                _ => None,
-            })
-            .unwrap_or(EncryptionSetting::On),
-        trust_server_certificate: env::var("TRUST_SERVER_CERTIFICATE")
-            .map(|v| v.parse().unwrap_or(false))
-            .unwrap_or(false),
-        host_name_in_cert: env::var("CERT_HOST_NAME").ok(),
-        server_certificate: None,
-    };
+    let mode = env::var("BENCH_ENCRYPT")
+        .ok()
+        .and_then(|v| match v.to_ascii_lowercase().as_str() {
+            "strict" => Some(EncryptionSetting::Strict),
+            "on" => Some(EncryptionSetting::On),
+            "off" => Some(EncryptionSetting::PreferOff),
+            _ => None,
+        })
+        .unwrap_or(EncryptionSetting::On);
+    let trust_server_certificate = env::var("TRUST_SERVER_CERTIFICATE")
+        .map(|v| v.parse().unwrap_or(false))
+        .unwrap_or(false);
+    context.encryption_options = EncryptionOptions::from_connection_keywords(
+        mode,
+        trust_server_certificate,
+        env::var("CERT_HOST_NAME").ok(),
+        None,
+    )
+    .expect("invalid TLS environment settings");
     context
 }
 

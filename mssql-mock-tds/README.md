@@ -179,7 +179,7 @@ You can also use `ColumnValue::Null` to represent NULL values in result sets.
 use mssql_mock_tds::MockTdsServer;
 use mssql_tds::connection::client_context::{ClientContext, TransportContext};
 use mssql_tds::connection_provider::tds_connection_provider::TdsConnectionProvider;
-use mssql_tds::core::{EncryptionOptions, EncryptionSetting};
+use mssql_tds::core::{EncryptionOptions, EncryptionSetting, ServerTrust};
 
 #[tokio::test]
 async fn test_connectivity() -> Result<(), Box<dyn std::error::Error>> {
@@ -201,11 +201,9 @@ async fn test_connectivity() -> Result<(), Box<dyn std::error::Error>> {
         user_name: "sa".to_string(),
         password: "password".to_string(),
         database: "master".to_string(),
-        encryption_options: EncryptionOptions {
-            mode: EncryptionSetting::PreferOff,
-            trust_server_certificate: true,
-            host_name_in_cert: None,
-        },
+        encryption_options: EncryptionOptions::new()
+            .with_mode(EncryptionSetting::PreferOff)
+            .with_server_trust(ServerTrust::DangerAcceptAny),
         ..Default::default()
     };
     

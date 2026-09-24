@@ -30,7 +30,7 @@ mod common;
 use mssql_tds::connection::client_context::{ClientContext, TdsAuthenticationMethod};
 use mssql_tds::connection::tds_client::ResultSet;
 use mssql_tds::connection_provider::tds_connection_provider::TdsConnectionProvider;
-use mssql_tds::core::{EncryptionOptions, EncryptionSetting, TdsResult};
+use mssql_tds::core::{EncryptionOptions, EncryptionSetting, ServerTrust, TdsResult};
 use mssql_tds::datatypes::column_values::ColumnValues;
 
 fn epa_enabled() -> bool {
@@ -43,12 +43,9 @@ fn integrated_encrypted_context() -> ClientContext {
     let mut context = ClientContext::default();
     context.database = "master".to_string();
     context.tds_authentication_method = TdsAuthenticationMethod::SSPI;
-    context.encryption_options = EncryptionOptions {
-        mode: EncryptionSetting::On,
-        trust_server_certificate: true,
-        host_name_in_cert: None,
-        server_certificate: None,
-    };
+    context.encryption_options = EncryptionOptions::new()
+        .with_mode(EncryptionSetting::On)
+        .with_server_trust(ServerTrust::DangerAcceptAny);
     context
 }
 

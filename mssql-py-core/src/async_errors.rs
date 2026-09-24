@@ -64,6 +64,7 @@ pub(crate) fn map_tds_error(
         | TdsError::ConnectionClosed(_)
         | TdsError::CertificateNotFound { .. }
         | TdsError::InvalidCertificateFormat { .. }
+        | TdsError::InvalidCertificateData { .. }
         | TdsError::CertificateExpired
         | TdsError::CertificateMismatch
         | TdsError::CertificateFileIoError { .. }

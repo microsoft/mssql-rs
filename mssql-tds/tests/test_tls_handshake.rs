@@ -33,12 +33,8 @@ fn sql_auth_context(trust_cert: bool, encryption: EncryptionSetting) -> ClientCo
         })
         .expect("SQL_PASSWORD not set");
     ctx.database = "master".into();
-    ctx.encryption_options = EncryptionOptions {
-        mode: encryption,
-        trust_server_certificate: trust_cert,
-        host_name_in_cert: None,
-        server_certificate: None,
-    };
+    ctx.encryption_options =
+        EncryptionOptions::from_connection_keywords(encryption, trust_cert, None, None).unwrap();
     ctx
 }
 

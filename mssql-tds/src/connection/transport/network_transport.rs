@@ -470,7 +470,7 @@ async fn create_transport_for_version(
 ) -> TdsResult<NetworkTransport> {
     let ssl_handler = SslHandler {
         server_host_name: transport_context.get_server_name().to_string(),
-        encryption_options,
+        encryption_options: Box::new(encryption_options),
     };
 
     match tds_version {
@@ -3175,7 +3175,7 @@ pub(crate) mod tests {
     use crate::connection::client_context::ClientContext;
     use crate::connection::transport::network_transport::Stream;
     use crate::connection::transport::ssl_handler::SslHandler;
-    use crate::core::EncryptionOptions;
+    use crate::core::{EncryptionOptions, ServerTrust};
     use crate::datatypes::row_writer::DefaultRowWriter;
     use crate::datatypes::sqldatatypes::{TdsDataType, TypeInfo};
     use crate::message::messages::PacketType;
@@ -3260,7 +3260,7 @@ pub(crate) mod tests {
 
         let ssl_handler = SslHandler {
             server_host_name: context.transport_context.get_server_name().clone(),
-            encryption_options: context.encryption_options.clone(),
+            encryption_options: Box::new(context.encryption_options.clone()),
         };
 
         (
@@ -3409,7 +3409,7 @@ pub(crate) mod tests {
         let context = ClientContext::default();
         let ssl_handler = SslHandler {
             server_host_name: context.transport_context.get_server_name().clone(),
-            encryption_options: context.encryption_options.clone(),
+            encryption_options: Box::new(context.encryption_options.clone()),
         };
         let mut transport = NetworkTransport::new(
             Box::new(ErroringStream),
@@ -3434,7 +3434,7 @@ pub(crate) mod tests {
         let context = ClientContext::default();
         let ssl_handler = SslHandler {
             server_host_name: context.transport_context.get_server_name().clone(),
-            encryption_options: context.encryption_options.clone(),
+            encryption_options: Box::new(context.encryption_options.clone()),
         };
         let mut transport = NetworkTransport::new(
             Box::new(ErroringStream),
@@ -3454,11 +3454,9 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn test_network_transport_send() {
         let context = ClientContext {
-            encryption_options: EncryptionOptions {
-                mode: EncryptionSetting::On,
-                trust_server_certificate: true,
-                ..EncryptionOptions::default()
-            },
+            encryption_options: EncryptionOptions::new()
+                .with_mode(EncryptionSetting::On)
+                .with_server_trust(ServerTrust::DangerAcceptAny),
             ..Default::default()
         };
         let (mut transport, server_side) = create_readable_network_transport(&context);
@@ -3504,11 +3502,9 @@ pub(crate) mod tests {
 
         let context = ClientContext {
             packet_size: initial_packet_size as u16,
-            encryption_options: EncryptionOptions {
-                mode: EncryptionSetting::On,
-                trust_server_certificate: true,
-                ..EncryptionOptions::default()
-            },
+            encryption_options: EncryptionOptions::new()
+                .with_mode(EncryptionSetting::On)
+                .with_server_trust(ServerTrust::DangerAcceptAny),
             ..Default::default()
         };
 
@@ -3554,11 +3550,9 @@ pub(crate) mod tests {
 
         let context = ClientContext {
             packet_size: packet_size as u16,
-            encryption_options: EncryptionOptions {
-                mode: EncryptionSetting::On,
-                trust_server_certificate: true,
-                ..EncryptionOptions::default()
-            },
+            encryption_options: EncryptionOptions::new()
+                .with_mode(EncryptionSetting::On)
+                .with_server_trust(ServerTrust::DangerAcceptAny),
             ..Default::default()
         };
 
@@ -3598,11 +3592,9 @@ pub(crate) mod tests {
 
         let context = ClientContext {
             packet_size: packet_size as u16,
-            encryption_options: EncryptionOptions {
-                mode: EncryptionSetting::On,
-                trust_server_certificate: true,
-                ..EncryptionOptions::default()
-            },
+            encryption_options: EncryptionOptions::new()
+                .with_mode(EncryptionSetting::On)
+                .with_server_trust(ServerTrust::DangerAcceptAny),
             ..Default::default()
         };
 
@@ -3720,11 +3712,9 @@ pub(crate) mod tests {
 
         let context = ClientContext {
             packet_size: packet_size as u16,
-            encryption_options: EncryptionOptions {
-                mode: EncryptionSetting::On,
-                trust_server_certificate: true,
-                ..EncryptionOptions::default()
-            },
+            encryption_options: EncryptionOptions::new()
+                .with_mode(EncryptionSetting::On)
+                .with_server_trust(ServerTrust::DangerAcceptAny),
             ..Default::default()
         };
 
@@ -3976,11 +3966,9 @@ pub(crate) mod tests {
 
         let context = ClientContext {
             packet_size: packet_size as u16,
-            encryption_options: EncryptionOptions {
-                mode: EncryptionSetting::On,
-                trust_server_certificate: true,
-                ..EncryptionOptions::default()
-            },
+            encryption_options: EncryptionOptions::new()
+                .with_mode(EncryptionSetting::On)
+                .with_server_trust(ServerTrust::DangerAcceptAny),
             ..Default::default()
         };
 
@@ -4108,11 +4096,9 @@ pub(crate) mod tests {
 
         let context = ClientContext {
             packet_size: packet_size as u16,
-            encryption_options: EncryptionOptions {
-                mode: EncryptionSetting::On,
-                trust_server_certificate: true,
-                ..EncryptionOptions::default()
-            },
+            encryption_options: EncryptionOptions::new()
+                .with_mode(EncryptionSetting::On)
+                .with_server_trust(ServerTrust::DangerAcceptAny),
             ..Default::default()
         };
 
@@ -4176,11 +4162,9 @@ pub(crate) mod tests {
 
         let context = ClientContext {
             packet_size: packet_size as u16,
-            encryption_options: EncryptionOptions {
-                mode: EncryptionSetting::On,
-                trust_server_certificate: true,
-                ..EncryptionOptions::default()
-            },
+            encryption_options: EncryptionOptions::new()
+                .with_mode(EncryptionSetting::On)
+                .with_server_trust(ServerTrust::DangerAcceptAny),
             ..Default::default()
         };
 
@@ -4304,7 +4288,7 @@ pub(crate) mod tests {
         async fn network_transport_no_stream_returns_true() {
             let ssl_handler = SslHandler {
                 server_host_name: "test".to_string(),
-                encryption_options: EncryptionOptions::new(),
+                encryption_options: Box::new(EncryptionOptions::new()),
             };
 
             let mut transport = NetworkTransport::new(
@@ -4330,7 +4314,7 @@ pub(crate) mod tests {
 
             let ssl_handler = SslHandler {
                 server_host_name: "test".to_string(),
-                encryption_options: EncryptionOptions::new(),
+                encryption_options: Box::new(EncryptionOptions::new()),
             };
 
             let transport = NetworkTransport::new(
@@ -4353,7 +4337,7 @@ pub(crate) mod tests {
 
             let ssl_handler = SslHandler {
                 server_host_name: "test".to_string(),
-                encryption_options: EncryptionOptions::new(),
+                encryption_options: Box::new(EncryptionOptions::new()),
             };
 
             let transport = NetworkTransport::new(
@@ -4412,7 +4396,7 @@ pub(crate) mod tests {
 
             let ssl_handler = SslHandler {
                 server_host_name: "test".to_string(),
-                encryption_options: EncryptionOptions::new(),
+                encryption_options: Box::new(EncryptionOptions::new()),
             };
 
             let mut transport = NetworkTransport::new(

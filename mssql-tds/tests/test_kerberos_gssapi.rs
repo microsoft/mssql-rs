@@ -182,7 +182,7 @@ mod e2e {
     use mssql_tds::connection::client_context::{ClientContext, TdsAuthenticationMethod};
     use mssql_tds::connection::tds_client::{ResultSet, TdsClient};
     use mssql_tds::connection_provider::tds_connection_provider::TdsConnectionProvider;
-    use mssql_tds::core::{EncryptionOptions, EncryptionSetting};
+    use mssql_tds::core::{EncryptionOptions, EncryptionSetting, ServerTrust};
 
     /// Creates a ClientContext configured for Kerberos/SSPI authentication.
     fn create_kerberos_context() -> ClientContext {
@@ -202,12 +202,9 @@ mod e2e {
         context.connect_timeout = 60;
 
         // Encryption settings - trust the test server certificate
-        context.encryption_options = EncryptionOptions {
-            mode: EncryptionSetting::On,
-            trust_server_certificate: true,
-            host_name_in_cert: None,
-            server_certificate: None,
-        };
+        context.encryption_options = EncryptionOptions::new()
+            .with_mode(EncryptionSetting::On)
+            .with_server_trust(ServerTrust::DangerAcceptAny);
 
         context
     }

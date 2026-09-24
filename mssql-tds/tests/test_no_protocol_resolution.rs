@@ -65,12 +65,13 @@ mod no_protocol_resolution {
         client_context.user_name = username;
         client_context.password = password;
         client_context.database = "master".to_string();
-        client_context.encryption_options = EncryptionOptions {
-            mode: encryption_mode,
-            trust_server_certificate: trust_server_certificate(),
-            host_name_in_cert: get_cert_hostname(),
-            server_certificate: None,
-        };
+        client_context.encryption_options = EncryptionOptions::from_connection_keywords(
+            encryption_mode,
+            trust_server_certificate(),
+            get_cert_hostname(),
+            None,
+        )
+        .unwrap();
 
         let provider = TdsConnectionProvider {};
         provider
@@ -91,12 +92,13 @@ mod no_protocol_resolution {
         client_context.user_name = username;
         client_context.password = password;
         client_context.database = "master".to_string();
-        client_context.encryption_options = EncryptionOptions {
-            mode: encryption_mode,
-            trust_server_certificate: trust_cert,
-            host_name_in_cert: get_cert_hostname(),
-            server_certificate: None,
-        };
+        client_context.encryption_options = EncryptionOptions::from_connection_keywords(
+            encryption_mode,
+            trust_cert,
+            get_cert_hostname(),
+            None,
+        )
+        .unwrap();
 
         let provider = TdsConnectionProvider {};
         provider
