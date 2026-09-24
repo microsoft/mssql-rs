@@ -282,11 +282,11 @@ async fn execute_on_client(
     if drain_previous {
         client.close_query().await?;
     }
-    let options = ExecuteOptions {
-        timeout: if timeout == 0 { None } else { Some(timeout) },
-        cancel: Some(&claim.cancel_handle),
-        ..Default::default()
-    };
+    let options = match timeout {
+        0 => ExecuteOptions::new(),
+        timeout => ExecuteOptions::new().timeout_secs(timeout),
+    }
+    .cancel(&claim.cancel_handle);
     if !autocommit && !client.has_active_transaction() {
         client
             .begin_transaction_with_options(

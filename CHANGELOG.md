@@ -8,6 +8,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ### Added
 
+- `mssql-tds`: caller-managed request cancellation for hosts that detect an
+  interrupt outside the TDS future. `RequestCancellationMode::CallerManaged`
+  removes the row-path `CancelHandle`; after dropping the in-flight operation,
+  the caller consumes the client through `TdsClient::cancel_request`. A complete
+  request sends ATTENTION and waits for bounded `DONE_ATTN` acknowledgement.
+  Ambiguous writes, partial writes, and positioned pull-cursor rows retire
+  without ATTENTION.
+
 - `mssql-odbc`: input parameter binding (`SQLBindParameter` with
   `SQL_PARAM_INPUT`) for the character and integer type families. Any other
   `ValueType` → `ParameterType` pairing is rejected at bind time with `HYC00`,
@@ -54,6 +62,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 - Initial public release of the mssql-rs workspace.
 
 ### Changed
+
+- `mssql-tds`: `ExecuteOptions::cancel` is replaced by the typed
+  `ExecuteOptions::cancellation` field. Calls through `.cancel(&handle)` do not
+  change. Struct-literal users must set
+  `RequestCancellationMode::DriverManaged(&handle)` or use the builder.
 
 - `mssql-odbc`: `SQLBindCol` now accepts `SQL_C_DEFAULT` and resolves it at
   fetch time from the current result column's SQL type, using the same mapping

@@ -16,7 +16,7 @@
 //! You can implement the [`MetadataRetriever`] trait to provide custom metadata
 //! retrieval strategies, such as caching or alternative sources.
 
-use crate::connection::tds_client::{ExecuteOptions, TdsClient};
+use crate::connection::tds_client::{ExecuteOptions, RequestCancellationMode, TdsClient};
 use crate::core::{CancelHandle, TdsResult};
 use crate::datatypes::bulk_copy_metadata::BulkCopyColumnMetadata;
 use crate::error::Error;
@@ -341,7 +341,10 @@ pub(crate) async fn fetch_table_metadata(
             query,
             ExecuteOptions {
                 timeout: timeout_sec,
-                cancel: cancel_handle,
+                cancellation: cancel_handle.map_or(
+                    RequestCancellationMode::None,
+                    RequestCancellationMode::DriverManaged,
+                ),
                 ..Default::default()
             },
         )

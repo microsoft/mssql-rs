@@ -785,23 +785,47 @@ pub(crate) async fn receive_row_into_internal<
     writer: &mut W,
     nbc_bitmap_scratch: &mut Option<Arc<[u8]>>,
 ) -> TdsResult<RowReadResult> {
+    receive_row_into_with_control_context_internal(
+        reader,
+        registry,
+        context,
+        context,
+        plan,
+        writer,
+        nbc_bitmap_scratch,
+    )
+    .await
+}
+
+pub(crate) async fn receive_row_into_with_control_context_internal<
+    R: TdsPacketReader + Send + Sync,
+    W: RowWriter + Send + ?Sized,
+>(
+    reader: &mut R,
+    registry: &impl TokenParserRegistry,
+    row_context: &ParserContext,
+    control_context: &ParserContext,
+    plan: ColumnPolicy,
+    writer: &mut W,
+    nbc_bitmap_scratch: &mut Option<Arc<[u8]>>,
+) -> TdsResult<RowReadResult> {
     let token_type_byte = reader.read_byte().await?;
     let token_type: TokenType = token_type_byte.try_into()?;
     debug!("Parsing token type: {:?}", &token_type);
 
     match token_type {
         TokenType::Row => {
-            let (metadata, decryptor) = extract_row_context(context)?;
+            let (metadata, decryptor) = extract_row_context(row_context)?;
             drive_row_columns(reader, metadata, decryptor, None, 0, plan, writer).await
         }
         TokenType::NbcRow => {
-            let (metadata, decryptor) = extract_row_context(context)?;
+            let (metadata, decryptor) = extract_row_context(row_context)?;
             let bitmap_len = metadata.columns.len().div_ceil(8);
             let bitmap = read_nbc_bitmap(reader, bitmap_len, nbc_bitmap_scratch).await?;
             drive_row_columns(reader, metadata, decryptor, Some(&bitmap), 0, plan, writer).await
         }
         _ => {
-            let token = dispatch_token(reader, registry, token_type, context).await?;
+            let token = dispatch_token(reader, registry, token_type, control_context).await?;
             Ok(RowReadResult::Token(token))
         }
     }

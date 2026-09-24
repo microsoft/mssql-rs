@@ -101,11 +101,7 @@ mod timeout_and_cancel_tests {
             let result = connection
                 .execute(
                     "WAITFOR DELAY '00:00:05'".to_string(),
-                    mssql_tds::connection::tds_client::ExecuteOptions {
-                        timeout: None,
-                        cancel: Some(&child_handle),
-                        ..Default::default()
-                    },
+                    mssql_tds::connection::tds_client::ExecuteOptions::new().cancel(&child_handle),
                 )
                 .await;
             verify_duration(result, start_time, 1000, 2500);

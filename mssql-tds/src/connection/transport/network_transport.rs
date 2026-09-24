@@ -20,11 +20,14 @@ use crate::error::TimeoutErrorType;
 use crate::handler::handler_factory::SessionSettings;
 use crate::io::packet_reader::{LENGTH_NULL, TdsPacketReader};
 use crate::io::packet_writer::PacketWriter;
-use crate::io::reader_writer::{NetworkReader, NetworkReaderWriter, NetworkWriter};
+use crate::io::reader_writer::{
+    ExternalRequestState, NetworkReader, NetworkReaderWriter, NetworkWriter,
+};
 use crate::io::token_stream::{
     ColumnPolicy, ParserContext, PlpPauseState, RowHeader, RowPauseState, RowReadResult,
     TdsTokenStreamReader, log_received_token, read_active_plp_bytes_internal,
-    receive_row_header_internal, receive_row_into_internal, receive_token_internal,
+    receive_row_header_internal, receive_row_into_internal,
+    receive_row_into_with_control_context_internal, receive_token_internal,
     resume_row_into_internal,
 };
 use crate::message::attention::AttentionRequest;
@@ -862,6 +865,7 @@ pub(crate) struct NetworkTransport {
     /// `ResetConnection` ENVCHANGE, which is what makes the acknowledgement
     /// verifiable.
     reset_dispatched: bool,
+    external_request: ExternalRequestState,
     /// Cached liveness status. Set to `true` once the connection is explicitly
     /// closed or an I/O operation observes it broken. Surfaced by
     /// `connection_known_dead()` as a cheap, socket-free liveness check.
@@ -956,6 +960,10 @@ impl NetworkWriter for NetworkTransport {
         std::mem::replace(&mut self.reset_dispatched, false)
     }
 
+    fn external_request_state(&mut self) -> Option<&mut ExternalRequestState> {
+        Some(&mut self.external_request)
+    }
+
     fn channel_binding_token(&self) -> Option<Vec<u8>> {
         // After a successful TLS handshake `self.stream` holds the encrypted
         // stream; the call forwards through `Box<dyn Stream>` to the TLS
@@ -984,6 +992,7 @@ impl NetworkTransport {
             extractable_stream_handle: None,
             pending_reset: ResetConnectionMode::None,
             reset_dispatched: false,
+            external_request: ExternalRequestState::default(),
             known_dead: false,
             nbc_bitmap_scratch: None,
             column_encryption_supported: false,
@@ -1606,6 +1615,9 @@ impl NetworkTransport {
         attention_timeout: Duration,
     ) -> TdsResult<bool> {
         self.attention_settlement = None;
+        if self.known_dead {
+            return Ok(false);
+        }
         let deadline = Instant::now() + attention_timeout;
         match timeout_at(deadline, self.cancel_read_stream()).await {
             Ok(Ok(())) => {}
@@ -1907,13 +1919,16 @@ impl NetworkTransport {
 
         loop {
             if let Some(metadata) = context.metadata.as_ref().cloned() {
-                let parser_context = ParserContext::ColumnMetadata(metadata, None);
+                let row_context = ParserContext::ColumnMetadata(metadata, None);
+                let control_context =
+                    ParserContext::ColumnEncryption(context.column_encryption_supported);
                 let mut writer = crate::datatypes::row_writer::DiscardRowWriter;
                 let mut nbc_bitmap_scratch = self.nbc_bitmap_scratch.take();
-                let result = receive_row_into_internal(
+                let result = receive_row_into_with_control_context_internal(
                     self,
                     &*PARSER_REGISTRY,
-                    &parser_context,
+                    &row_context,
+                    &control_context,
                     ColumnPolicy::SkipAll,
                     &mut writer,
                     &mut nbc_bitmap_scratch,
@@ -2706,6 +2721,7 @@ impl NetworkTransport {
         }
         let attention_stream = self.stream.as_ref().cloned();
         let already_dead = self.known_dead;
+        let tracked_parser = self.external_request.note_parser_started();
         let outcome = {
             let mut read = std::pin::pin!(receive_token_internal(self, &*PARSER_REGISTRY, context));
             read_to_attention_boundary(
@@ -2717,6 +2733,9 @@ impl NetworkTransport {
             )
             .await
         };
+        if matches!(&outcome, InterruptibleRead::Completed(Ok(_))) {
+            self.external_request.note_parser_finished(tracked_parser);
+        }
         let (error, boundary) = match outcome {
             InterruptibleRead::Completed(result) => return result,
             InterruptibleRead::Interrupted { error, boundary } => (error, boundary),
@@ -2772,6 +2791,7 @@ impl NetworkTransport {
         let attention_stream = self.stream.as_ref().cloned();
         let already_dead = self.known_dead;
         let mut nbc_bitmap_scratch = self.nbc_bitmap_scratch.take();
+        let tracked_parser = self.external_request.note_parser_started();
         let outcome = {
             let mut read = std::pin::pin!(receive_row_into_internal(
                 self,
@@ -2790,6 +2810,9 @@ impl NetworkTransport {
             )
             .await
         };
+        if matches!(&outcome, InterruptibleRead::Completed(Ok(_))) {
+            self.external_request.note_parser_finished(tracked_parser);
+        }
         self.nbc_bitmap_scratch = nbc_bitmap_scratch;
         let (error, boundary) = match outcome {
             InterruptibleRead::Completed(result) => return result,
@@ -2832,6 +2855,7 @@ impl NetworkTransport {
         let attention_stream = self.stream.as_ref().cloned();
         let already_dead = self.known_dead;
         let mut nbc_bitmap_scratch = self.nbc_bitmap_scratch.take();
+        let tracked_parser = self.external_request.note_parser_started();
         let outcome = {
             let mut read = std::pin::pin!(receive_row_header_internal(
                 self,
@@ -2848,6 +2872,9 @@ impl NetworkTransport {
             )
             .await
         };
+        if matches!(&outcome, InterruptibleRead::Completed(Ok(_))) {
+            self.external_request.note_parser_finished(tracked_parser);
+        }
         self.nbc_bitmap_scratch = nbc_bitmap_scratch;
         let (error, boundary) = match outcome {
             InterruptibleRead::Completed(result) => return result,
@@ -2899,6 +2926,7 @@ impl NetworkTransport {
         let attention_stream = self.stream.as_ref().cloned();
         let already_dead = self.known_dead;
         let drain_context = ParserContext::ColumnMetadata(Arc::clone(&pause_state.metadata), None);
+        let tracked_parser = self.external_request.note_parser_started();
         let outcome = {
             let mut read =
                 std::pin::pin!(resume_row_into_internal(self, pause_state, plan, writer));
@@ -2911,6 +2939,9 @@ impl NetworkTransport {
             )
             .await
         };
+        if matches!(&outcome, InterruptibleRead::Completed(Ok(_))) {
+            self.external_request.note_parser_finished(tracked_parser);
+        }
         let (error, boundary) = match outcome {
             InterruptibleRead::Completed(result) => return result,
             InterruptibleRead::Interrupted { error, boundary } => (error, boundary),
@@ -2958,6 +2989,7 @@ impl NetworkTransport {
         let already_dead = self.known_dead;
         let drain_context =
             ParserContext::ColumnMetadata(Arc::clone(&plp_state.row_pause_state.metadata), None);
+        let tracked_parser = self.external_request.note_parser_started();
         let outcome = {
             let mut read = std::pin::pin!(read_active_plp_bytes_internal(self, plp_state, out));
             read_to_attention_boundary(
@@ -2969,6 +3001,9 @@ impl NetworkTransport {
             )
             .await
         };
+        if matches!(&outcome, InterruptibleRead::Completed(Ok(_))) {
+            self.external_request.note_parser_finished(tracked_parser);
+        }
         let (error, boundary) = match outcome {
             InterruptibleRead::Completed(result) => return result,
             InterruptibleRead::Interrupted { error, boundary } => (error, boundary),
@@ -3175,6 +3210,7 @@ pub(crate) mod tests {
     use crate::connection::client_context::ClientContext;
     use crate::connection::transport::network_transport::Stream;
     use crate::connection::transport::ssl_handler::SslHandler;
+    use crate::connection::transport::tds_transport::TdsTransport;
     use crate::core::EncryptionOptions;
     use crate::datatypes::row_writer::DefaultRowWriter;
     use crate::datatypes::sqldatatypes::{TdsDataType, TypeInfo};
@@ -3273,6 +3309,54 @@ pub(crate) mod tests {
             ),
             server_side,
         )
+    }
+
+    #[test]
+    fn external_request_progress_follows_request_lifecycle() {
+        let (mut transport, _server_side) =
+            create_readable_network_transport(&ClientContext::default());
+
+        NetworkWriter::external_request_state(&mut transport)
+            .unwrap()
+            .begin();
+        assert_eq!(
+            NetworkWriter::external_request_state(&mut transport)
+                .unwrap()
+                .take(),
+            Some(crate::io::reader_writer::ExternalRequestProgress::Preparing)
+        );
+
+        let request = NetworkWriter::external_request_state(&mut transport).unwrap();
+        request.begin();
+        request.note_write_started(PacketType::SqlBatch);
+        request.note_packet_sent(PacketType::SqlBatch, false);
+        request.note_write_started(PacketType::SqlBatch);
+        request.note_packet_sent(PacketType::SqlBatch, true);
+        request.note_response_active();
+        assert_eq!(
+            request.take(),
+            Some(crate::io::reader_writer::ExternalRequestProgress::ResponseActive)
+        );
+
+        request.begin();
+        request.finish();
+        assert_eq!(request.take(), None);
+    }
+
+    #[test]
+    fn attention_packets_do_not_advance_external_request() {
+        let (mut transport, _server_side) =
+            create_readable_network_transport(&ClientContext::default());
+
+        let request = NetworkWriter::external_request_state(&mut transport).unwrap();
+        request.begin();
+        request.note_write_started(PacketType::Attention);
+        request.note_packet_sent(PacketType::Attention, true);
+
+        assert_eq!(
+            request.take(),
+            Some(crate::io::reader_writer::ExternalRequestProgress::Preparing)
+        );
     }
 
     /// A stream whose reads always fail, used to exercise the I/O-error arm of
@@ -5899,6 +5983,20 @@ pub(crate) mod tests {
         bytes
     }
 
+    /// Encodes the same metadata with the empty CEK table required after
+    /// Always Encrypted is negotiated.
+    fn int4_colmetadata_bytes_with_empty_cek(name: &str) -> Vec<u8> {
+        let mut bytes = vec![TokenType::ColMetadata as u8];
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&0_u16.to_le_bytes());
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        bytes.extend_from_slice(&0_u16.to_le_bytes());
+        bytes.push(TdsDataType::Int4 as u8);
+        bytes.push(u8::try_from(name.chars().count()).unwrap());
+        bytes.extend_from_slice(&encode_utf16_le(name));
+        bytes
+    }
+
     /// Frames a one-column ROW or NBCROW message used to test metadata-aware drains.
     fn int4_row_message(token_type: u8, is_nbc: bool, value: i32) -> Vec<u8> {
         let mut packet = TestPacketBuilder::new(PacketType::TabularResult);
@@ -6424,6 +6522,27 @@ pub(crate) mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn attention_drain_parses_new_colmetadata_with_column_encryption() {
+        let mut response = TestPacketBuilder::new(PacketType::TabularResult)
+            .append_bytes(&int4_colmetadata_bytes_with_empty_cek("value"))
+            .append_byte(TokenType::Row as u8)
+            .append_i32(42)
+            .build();
+        response.extend_from_slice(&done_token_message(DoneStatus::ATTN.bits()));
+        let (mut transport, _written) =
+            create_network_transport_with_live_peer_capturing_writes(&response);
+        transport.column_encryption_supported = true;
+
+        let acknowledged = transport
+            .send_attention_with_timeout(&int4_row_context(1), Duration::from_secs(5))
+            .await
+            .unwrap();
+
+        assert!(acknowledged);
+        assert!(!is_known_dead(&transport));
+    }
+
     /// Verifies that cancellation retains a parser paused inside ROW bytes long
     /// enough to finish the row and reach DONE_ATTN.
     #[tokio::test]
@@ -6450,6 +6569,93 @@ pub(crate) mod tests {
             !is_known_dead(&transport),
             "finishing the in-flight row reached DONE_ATTN and preserved the connection"
         );
+    }
+
+    /// Caller-managed cancellation drops the parser future. If that happens
+    /// mid-value, cleanup must fail closed rather than parse the value tail as a
+    /// control token and report a false DONE_ATTN acknowledgement.
+    #[tokio::test]
+    async fn dropped_mid_row_parser_cannot_report_attention_acknowledged() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let first_packet = TestPacketBuilder::new(PacketType::TabularResult)
+            .continuation()
+            .append_byte(TokenType::Row as u8)
+            .append_bytes(&42_i32.to_le_bytes()[..2])
+            .build();
+        let mut completion = TestPacketBuilder::new(PacketType::TabularResult)
+            .append_bytes(&42_i32.to_le_bytes()[2..])
+            .build();
+        completion.extend_from_slice(&done_token_message(DoneStatus::ATTN.bits()));
+        let (client_side, mut peer) = duplex(MAX_BUFFER_SIZE);
+        peer.write_all(&first_packet).await.unwrap();
+        let mut transport = build_duplex_transport(client_side);
+        let attention_seen = Arc::new(AtomicBool::new(false));
+        let peer_attention_seen = Arc::clone(&attention_seen);
+        let peer_task = tokio::spawn(async move {
+            let mut attention = [0_u8; PacketWriter::PACKET_HEADER_SIZE];
+            peer.read_exact(&mut attention).await.unwrap();
+            assert_eq!(attention[0], PacketType::Attention as u8);
+            peer_attention_seen.store(true, Ordering::Release);
+            peer.write_all(&completion).await.unwrap();
+        });
+
+        let context = int4_row_context(1);
+        let mut writer = DefaultRowWriter::new(1);
+        {
+            let mut read = std::pin::pin!(transport.receive_row_into(
+                &context,
+                None,
+                None,
+                ColumnPolicy::DecodeAll,
+                &mut writer,
+            ));
+            let first_poll = poll_fn(|cx| Poll::Ready(read.as_mut().poll(cx))).await;
+            assert!(first_poll.is_pending());
+        }
+
+        let result = timeout(
+            Duration::from_secs(5),
+            transport.send_attention_with_timeout(&context, Duration::from_secs(1)),
+        )
+        .await
+        .expect("caller-managed cleanup must stay bounded");
+
+        timeout(Duration::from_secs(5), peer_task)
+            .await
+            .expect("the peer did not observe ATTENTION")
+            .unwrap();
+        assert!(
+            attention_seen.load(Ordering::Acquire),
+            "the peer must observe ATTENTION before returning the completion"
+        );
+        assert!(
+            !matches!(result, Ok(true)),
+            "a dropped mid-row parser cannot prove DONE_ATTN alignment"
+        );
+        assert!(
+            is_known_dead(&transport),
+            "unproven parser alignment must retire the transport"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn known_dead_transport_skips_attention_without_spending_the_bound() {
+        let (mut transport, mut written) =
+            create_network_transport_with_live_peer_capturing_writes(&[]);
+        transport.mark_known_dead();
+
+        let result = timeout(
+            Duration::ZERO,
+            transport
+                .send_attention_with_timeout(&ParserContext::None(()), Duration::from_secs(10)),
+        )
+        .await
+        .expect("known-dead cleanup must not wait")
+        .unwrap();
+
+        assert!(!result);
+        assert!(written.try_recv().is_err(), "no ATTENTION may be written");
     }
 
     #[tokio::test(start_paused = true)]

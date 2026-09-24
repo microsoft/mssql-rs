@@ -16,6 +16,7 @@ use crate::datatypes::tds_value_serializer::{PLP_NULL, PLP_TERMINATOR, PLP_UNKNO
 use crate::error::Error::UsageError;
 use crate::error::{SqlErrorInfo, SqlInfoMessage};
 use crate::io::packet_writer::{PacketWriter, SuspendedMessage, TdsPacketWriter};
+use crate::io::reader_writer::ExternalRequestProgress;
 use crate::message::bulk_load::{StreamingBulkLoadWriter, build_insert_bulk_command};
 use crate::message::messages::{PacketType, ResetConnectionMode};
 use crate::message::parameters::rpc_parameters::{
@@ -451,6 +452,61 @@ struct StreamedWriteContext {
     null_signaled: bool,
     /// Configured timeout reused for each resumed streaming operation.
     timeout_sec: Option<u32>,
+}
+
+/// Result of retiring a caller-managed request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RequestCancellationOutcome {
+    /// The request completed before cancellation cleanup began.
+    NothingActive,
+    /// The connection was retired before a complete request reached the wire.
+    RetiredBeforeRequestCompletion,
+    /// SQL Server acknowledged ATTENTION before the cleanup deadline.
+    AttentionAcknowledged,
+    /// The cleanup deadline expired before SQL Server acknowledged ATTENTION.
+    AttentionTimedOut,
+    /// The transport was already retired or could not start a safe ATTENTION
+    /// drain, so no acknowledgement was attempted.
+    ConnectionAlreadyRetired,
+}
+
+/// Selects who detects cancellation and owns protocol cleanup for one request.
+#[derive(Clone, Copy, Debug, Default)]
+#[non_exhaustive]
+pub enum RequestCancellationMode<'a> {
+    /// The request has no cancellation signal.
+    #[default]
+    None,
+    /// The caller signals the handle; the driver observes it and restores the
+    /// TDS stream before returning an operation-cancelled error.
+    DriverManaged(&'a CancelHandle),
+    /// The caller detects cancellation, drops the in-flight operation, then
+    /// consumes the client through [`TdsClient::cancel_request`].
+    CallerManaged,
+}
+
+impl<'a> RequestCancellationMode<'a> {
+    fn cancel_handle(self) -> Option<&'a CancelHandle> {
+        match self {
+            Self::DriverManaged(handle) => Some(handle),
+            Self::None | Self::CallerManaged => None,
+        }
+    }
+
+    fn caller_managed(self) -> bool {
+        matches!(self, Self::CallerManaged)
+    }
+
+    fn driver_managed_handle(self) -> TdsResult<Option<&'a CancelHandle>> {
+        match self {
+            Self::CallerManaged => Err(UsageError(
+                "Caller-managed cancellation is supported only by execute and execute_sp_executesql"
+                    .to_string(),
+            )),
+            Self::None | Self::DriverManaged(_) => Ok(self.cancel_handle()),
+        }
+    }
 }
 
 /// Cached row-buffering eligibility paired with the exact metadata allocation it describes.
@@ -966,6 +1022,8 @@ impl TdsClient {
     /// server diagnostic reaches the caller instead of being masked by this
     /// one; a reset still unacknowledged after it is caught on the next token.
     fn observe_response_token(&mut self, token: &Tokens) -> TdsResult<()> {
+        self.observe_external_request_token(token);
+
         if matches!(self.reset_state, ResetAckState::Armed(_))
             && self.transport.as_writer().take_reset_dispatched()
         {
@@ -986,6 +1044,35 @@ impl TdsClient {
         self.reset_state = ResetAckState::Idle;
         self.transport.mark_known_dead();
         Err(crate::error::Error::ConnectionResetNotAcknowledged)
+    }
+
+    fn observe_external_request_token(&mut self, token: &Tokens) {
+        let completes_request = matches!(
+            token,
+            Tokens::Done(done) | Tokens::DoneInProc(done) | Tokens::DoneProc(done)
+                if !done.has_more()
+        );
+        let writer = self.transport.as_writer();
+        if let Some(request) = writer.external_request_state() {
+            request.note_response_active();
+            if completes_request {
+                request.finish();
+            }
+        }
+    }
+
+    fn begin_external_request(&mut self) -> TdsResult<()> {
+        let request = self
+            .transport
+            .as_writer()
+            .external_request_state()
+            .ok_or_else(|| {
+                UsageError(
+                    "Caller-managed cancellation is not supported by this transport".to_string(),
+                )
+            })?;
+        request.begin();
+        Ok(())
     }
 
     /// The token's variant name, for diagnostics. Deliberately *not* `?token`:
@@ -1562,9 +1649,10 @@ impl TdsClient {
     ) -> TdsResult<()> {
         let ExecuteOptions {
             timeout,
-            cancel,
+            cancellation,
             column_encryption,
         } = options;
+        let cancel = cancellation.cancel_handle();
         self.current_command_ce_setting = column_encryption;
 
         if self.command_is_busy() {
@@ -1585,6 +1673,9 @@ impl TdsClient {
         self.cancel_handle = cancel.map(|handle| handle.child_handle());
 
         self.transport.reset_reader();
+        if cancellation.caller_managed() {
+            self.begin_external_request()?;
+        }
         let batch = SqlBatch::new(sql_command, &self.execution_context);
         let mut packet_writer =
             batch.create_packet_writer(self.transport.as_writer(), timeout, cancel);
@@ -1616,14 +1707,25 @@ impl TdsClient {
     pub async fn execute_sp_executesql<'a>(
         &mut self,
         sql: String,
-        mut named_params: Vec<RpcParameter>,
+        named_params: Vec<RpcParameter>,
         options: impl Into<ExecuteOptions<'a>>,
+    ) -> TdsResult<StatementResult> {
+        self.execute_sp_executesql_inner(sql, named_params, options.into())
+            .await
+    }
+
+    async fn execute_sp_executesql_inner(
+        &mut self,
+        sql: String,
+        mut named_params: Vec<RpcParameter>,
+        options: ExecuteOptions<'_>,
     ) -> TdsResult<StatementResult> {
         let ExecuteOptions {
             timeout: timeout_sec,
-            cancel: cancel_handle,
+            cancellation,
             column_encryption,
-        } = options.into();
+        } = options;
+        let cancel_handle = cancellation.cancel_handle();
         self.current_command_ce_setting = column_encryption;
 
         if self.command_is_busy() {
@@ -1643,14 +1745,25 @@ impl TdsClient {
             self.prepare_rpc_command(timeout_sec, cancel_handle).await?;
 
         if self.should_encrypt_parameters() && !named_params.is_empty() {
-            self.encrypt_parameters(
-                &sql,
-                &params_list_as_string,
-                &mut named_params,
-                timeout_sec,
-                cancel_handle,
-            )
-            .await?;
+            if cancellation.caller_managed() {
+                self.begin_external_request()?;
+            }
+            let encryption_result = self
+                .encrypt_parameters(
+                    &sql,
+                    &params_list_as_string,
+                    &mut named_params,
+                    timeout_sec,
+                    cancel_handle,
+                )
+                .await;
+            if encryption_result.is_err()
+                && cancellation.caller_managed()
+                && let Some(request) = self.transport.as_writer().external_request_state()
+            {
+                request.finish();
+            }
+            encryption_result?;
             // The describe round-trip closes its own batch, which clears the
             // per-operation timeout/cancel state; restore it for the real RPC.
             self.remaining_request_timeout = request_timeout;
@@ -1664,6 +1777,9 @@ impl TdsClient {
             &database_collation,
         );
 
+        if cancellation.caller_managed() {
+            self.begin_external_request()?;
+        }
         let mut packet_writer =
             rpc.create_packet_writer(self.transport.as_writer(), timeout_sec, cancel_handle);
         let serialize_result = rpc.serialize(&mut packet_writer).await;
@@ -1693,9 +1809,10 @@ impl TdsClient {
 
         let ExecuteOptions {
             timeout: timeout_sec,
-            cancel: cancel_handle,
+            cancellation,
             column_encryption,
         } = options.into();
+        let cancel_handle = cancellation.driver_managed_handle()?;
         self.current_command_ce_setting = column_encryption;
         self.remaining_request_timeout = timeout_sec
             .filter(|seconds| *seconds > 0)
@@ -2096,9 +2213,10 @@ impl TdsClient {
     ) -> TdsResult<StreamedParamStatus> {
         let ExecuteOptions {
             timeout: timeout_sec,
-            cancel: cancel_handle,
+            cancellation,
             column_encryption,
         } = options.into();
+        let cancel_handle = cancellation.driver_managed_handle()?;
 
         if self.command_is_busy() {
             return Err(UsageError(ALREADY_EXECUTING_ERROR.to_string()));
@@ -2117,7 +2235,7 @@ impl TdsClient {
                     materialized_params,
                     ExecuteOptions {
                         timeout: timeout_sec,
-                        cancel: cancel_handle,
+                        cancellation,
                         column_encryption,
                     },
                 )
@@ -2678,6 +2796,9 @@ impl TdsClient {
     ) -> TdsResult<()> {
         if let Err(e) = serialize_result {
             self.retract_partial_request(message).await;
+            if let Some(request) = self.transport.as_writer().external_request_state() {
+                request.finish();
+            }
             return Err(e);
         }
         Ok(())
@@ -3235,9 +3356,10 @@ impl TdsClient {
     ) -> TdsResult<StatementResult> {
         let ExecuteOptions {
             timeout: timeout_sec,
-            cancel: cancel_handle,
+            cancellation,
             column_encryption,
         } = options.into();
+        let cancel_handle = cancellation.driver_managed_handle()?;
         self.current_command_ce_setting = column_encryption;
 
         let mut positional_parameters = positional_parameters;
@@ -3383,9 +3505,10 @@ impl TdsClient {
     ) -> TdsResult<StatementId> {
         let ExecuteOptions {
             timeout: timeout_sec,
-            cancel: cancel_handle,
+            cancellation,
             column_encryption,
         } = options.into();
+        let cancel_handle = cancellation.driver_managed_handle()?;
         self.current_command_ce_setting = column_encryption;
 
         let reconnect_elapsed = if command_started {
@@ -3577,9 +3700,10 @@ impl TdsClient {
 
         let ExecuteOptions {
             timeout: timeout_sec,
-            cancel: cancel_handle,
+            cancellation,
             ..
         } = options.into();
+        let cancel_handle = cancellation.driver_managed_handle()?;
 
         // Store timeout and cancel handle for this operation
         let budget = Self::deduct_timeout(timeout_sec, Duration::ZERO);
@@ -3679,7 +3803,10 @@ impl TdsClient {
         self.begin_command();
 
         let mut opts = options.into();
-        let reconnect_elapsed = self.check_and_reconnect(opts.timeout, opts.cancel).await?;
+        let cancel_handle = opts.cancellation.driver_managed_handle()?;
+        let reconnect_elapsed = self
+            .check_and_reconnect(opts.timeout, cancel_handle)
+            .await?;
         let budget = Self::deduct_timeout(opts.timeout, reconnect_elapsed);
         opts.timeout = budget.into_timeout()?.seconds();
 
@@ -3800,7 +3927,10 @@ impl TdsClient {
 
         self.begin_command();
         let started = Instant::now();
-        let reconnect_elapsed = self.check_and_reconnect(opts.timeout, opts.cancel).await?;
+        let cancel_handle = opts.cancellation.driver_managed_handle()?;
+        let reconnect_elapsed = self
+            .check_and_reconnect(opts.timeout, cancel_handle)
+            .await?;
         let original_timeout = opts.timeout;
         let mut budget = Self::deduct_timeout(original_timeout, reconnect_elapsed);
         opts.timeout = budget.into_timeout()?.seconds();
@@ -3914,8 +4044,10 @@ impl TdsClient {
             ));
         }
 
-        let (timeout_sec, _request_timeout, database_collation) =
-            self.prepare_rpc_command(opts.timeout, opts.cancel).await?;
+        let cancel_handle = opts.cancellation.driver_managed_handle()?;
+        let (timeout_sec, _request_timeout, database_collation) = self
+            .prepare_rpc_command(opts.timeout, cancel_handle)
+            .await?;
 
         // Reuse the statement's handle when the client still holds one; a
         // reconnect clears the map, so an id from a dead session re-prepares.
@@ -3991,7 +4123,7 @@ impl TdsClient {
                 rpc,
                 streamed_params,
                 timeout_sec,
-                opts.cancel,
+                cancel_handle,
                 database_collation,
             )
             .await?;
@@ -4038,7 +4170,10 @@ impl TdsClient {
         self.begin_command();
 
         let mut opts = options.into();
-        let reconnect_elapsed = self.check_and_reconnect(opts.timeout, opts.cancel).await?;
+        let cancel_handle = opts.cancellation.driver_managed_handle()?;
+        let reconnect_elapsed = self
+            .check_and_reconnect(opts.timeout, cancel_handle)
+            .await?;
         let budget = Self::deduct_timeout(opts.timeout, reconnect_elapsed);
         // Absent handle (never materialized, or a reconnect cleared the map):
         // already gone server-side, skip with no RPC — including the timeout
@@ -4124,9 +4259,10 @@ impl TdsClient {
 
         let ExecuteOptions {
             timeout: timeout_sec,
-            cancel: cancel_handle,
+            cancellation,
             column_encryption,
         } = options.into();
+        let cancel_handle = cancellation.driver_managed_handle()?;
         self.current_command_ce_setting = column_encryption;
 
         // Store timeout and cancel handle for this operation
@@ -4309,9 +4445,10 @@ impl TdsClient {
 
         let ExecuteOptions {
             timeout: timeout_sec,
-            cancel: cancel_handle,
+            cancellation,
             column_encryption,
         } = options.into();
+        let cancel_handle = cancellation.driver_managed_handle()?;
         self.current_command_ce_setting = column_encryption;
 
         // Store timeout and cancel handle for this operation
@@ -4740,21 +4877,24 @@ impl TdsClient {
                         "Row read paused while draining a result set; the drain writer never requests a pause".to_string(),
                     ));
                 }
-                RowReadResult::Token(token) => match token {
-                    Tokens::Done(done) | Tokens::DoneProc(done) | Tokens::DoneInProc(done) => {
-                        info!(
-                            ?done,
-                            discarded_rows, "Draining DONE token ending result set"
-                        );
-                        return Ok(!done.has_more());
+                RowReadResult::Token(token) => {
+                    self.observe_external_request_token(&token);
+                    match token {
+                        Tokens::Done(done) | Tokens::DoneProc(done) | Tokens::DoneInProc(done) => {
+                            info!(
+                                ?done,
+                                discarded_rows, "Draining DONE token ending result set"
+                            );
+                            return Ok(!done.has_more());
+                        }
+                        Tokens::ColMetadata(_) => {
+                            return Err(crate::error::Error::ProtocolError(
+                                "Unexpected COLMETADATA token before the previous result set's DONE while draining".to_string(),
+                            ));
+                        }
+                        other => self.apply_drain_side_effect(other, collected_errors)?,
                     }
-                    Tokens::ColMetadata(_) => {
-                        return Err(crate::error::Error::ProtocolError(
-                            "Unexpected COLMETADATA token before the previous result set's DONE while draining".to_string(),
-                        ));
-                    }
-                    other => self.apply_drain_side_effect(other, collected_errors)?,
-                },
+                }
             }
         }
     }
@@ -4828,6 +4968,9 @@ impl TdsClient {
         self.current_result_ended_with_done_in_proc = false;
         self.current_command_ce_setting = ExecutionColumnEncryptionSetting::UseConnectionSetting;
         self.execution_context.set_has_open_batch(false);
+        if let Some(request) = self.transport.as_writer().external_request_state() {
+            request.finish();
+        }
     }
 
     /// Applies connection-level control tokens consumed by an ATTENTION drain.
@@ -7488,6 +7631,7 @@ impl TdsClient {
     }
 
     async fn handle_row_read_token(&mut self, token: Tokens) -> TdsResult<Option<bool>> {
+        self.observe_external_request_token(&token);
         self.observe_prepared_batch_done(&token)?;
         match token {
             Tokens::DoneInProc(done) => self.handle_row_done(done, true),
@@ -7789,6 +7933,51 @@ impl TdsClient {
         Ok(())
     }
 
+    /// Cancels a caller-managed request and retires this client.
+    ///
+    /// Consuming the client is required because the caller may have dropped a
+    /// parser or packet-write future at an arbitrary suspension point. Before a
+    /// complete request reaches the wire, dropping the connection is the only
+    /// protocol-safe action. After EOM, this method sends ATTENTION and drains
+    /// through DONE_ATTN using the normal client settlement path.
+    pub async fn cancel_request(
+        mut self,
+        timeout: Duration,
+    ) -> TdsResult<RequestCancellationOutcome> {
+        let (progress, parser_in_progress) = self
+            .transport
+            .as_writer()
+            .external_request_state()
+            .map(|state| (state.take(), state.parser_in_progress()))
+            .unwrap_or((None, false));
+        match progress {
+            None => Ok(RequestCancellationOutcome::NothingActive),
+            Some(
+                ExternalRequestProgress::Preparing
+                | ExternalRequestProgress::WriteInProgressOrUnknown
+                | ExternalRequestProgress::PartialMessageSent,
+            ) => Ok(RequestCancellationOutcome::RetiredBeforeRequestCompletion),
+            Some(
+                ExternalRequestProgress::FinalEomSent | ExternalRequestProgress::ResponseActive,
+            ) => {
+                if self.transport.connection_known_dead() {
+                    return Ok(RequestCancellationOutcome::ConnectionAlreadyRetired);
+                }
+                if parser_in_progress
+                    || !matches!(self.active_row_read_state, ActiveRowReadState::Idle)
+                {
+                    self.transport.mark_known_dead();
+                    self.normalize_after_attention();
+                    return Ok(RequestCancellationOutcome::ConnectionAlreadyRetired);
+                }
+                match self.send_attention_with_timeout(timeout).await? {
+                    true => Ok(RequestCancellationOutcome::AttentionAcknowledged),
+                    false => Ok(RequestCancellationOutcome::AttentionTimedOut),
+                }
+            }
+        }
+    }
+
     /// Sends ATTENTION and attempts to drain the active response through DONE_ATTN.
     ///
     /// This method:
@@ -7814,8 +8003,10 @@ impl TdsClient {
     pub async fn send_attention_with_timeout(&mut self, timeout: Duration) -> TdsResult<bool> {
         self.interrupted_read_settled = false;
         let parser_context = match self.current_metadata.as_ref() {
-            Some(metadata) => ParserContext::ColumnMetadata(Arc::clone(metadata), None),
-            None => ParserContext::ColumnEncryption(
+            Some(metadata) if !self.current_result_set_has_been_read_till_end => {
+                ParserContext::ColumnMetadata(Arc::clone(metadata), None)
+            }
+            _ => ParserContext::ColumnEncryption(
                 self.negotiated_settings.is_column_encryption_supported(),
             ),
         };
@@ -7900,8 +8091,11 @@ impl TdsClient {
             ));
         }
         let ExecuteOptions {
-            timeout, cancel, ..
+            timeout,
+            cancellation,
+            ..
         } = options.into();
+        let cancel = cancellation.driver_managed_handle()?;
 
         self.begin_command();
         let reconnect_elapsed = self.check_and_reconnect(timeout, cancel).await?;
@@ -8244,10 +8438,8 @@ pub struct ExecuteOptions<'a> {
     /// client-side timeout (unlimited); a positive value bounds the command,
     /// with connection-recovery time charged against it.
     pub timeout: Option<u32>,
-    /// Optional [`CancelHandle`] for cooperative cancellation. A child token is
-    /// derived so cancelling aborts the request without tearing down the
-    /// connection.
-    pub cancel: Option<&'a CancelHandle>,
+    /// Selects who detects cancellation and performs protocol cleanup.
+    pub cancellation: RequestCancellationMode<'a>,
     /// Per-command Always Encrypted override. Defaults to
     /// [`ExecutionColumnEncryptionSetting::UseConnectionSetting`] (inherit the
     /// connection). Only has effect when the server acknowledged the Column
@@ -8271,9 +8463,16 @@ impl<'a> ExecuteOptions<'a> {
         self
     }
 
-    /// Attaches a cancellation handle.
+    /// Uses driver-managed cancellation triggered by `handle`.
     pub fn cancel(mut self, handle: &'a CancelHandle) -> Self {
-        self.cancel = Some(handle);
+        self.cancellation = RequestCancellationMode::DriverManaged(handle);
+        self
+    }
+
+    /// Uses caller-managed cancellation. After dropping an in-flight operation,
+    /// consume the client through [`TdsClient::cancel_request`].
+    pub fn caller_managed_cancellation(mut self) -> Self {
+        self.cancellation = RequestCancellationMode::CallerManaged;
         self
     }
 
@@ -8396,7 +8595,7 @@ mod tests {
     use crate::core::{CancelHandle, TdsResult};
     use crate::datatypes::row_writer::RowWriter;
     use crate::io::packet_reader::TdsPacketReader;
-    use crate::io::reader_writer::{NetworkReader, NetworkWriter};
+    use crate::io::reader_writer::{ExternalRequestState, NetworkReader, NetworkWriter};
     use crate::io::token_stream::{
         ColumnPolicy, ParserContext, RowHeader, RowPauseState, RowReadResult, TdsTokenStreamReader,
     };
@@ -8404,7 +8603,7 @@ mod tests {
     use crate::test_client_support::byte_stream::tds_client_over_raw_bytes as client_over_bytes;
     use crate::test_client_support::byte_stream::tds_client_over_raw_bytes_with_column_encryption as client_over_bytes_with_ae;
     use crate::test_packet_support::{
-        TestPacketBuilder, create_network_transport_with_data,
+        TestPacketBuilder, build_duplex_transport, create_network_transport_with_data,
         create_network_transport_with_live_peer,
         create_network_transport_with_live_peer_capturing_writes,
     };
@@ -8414,6 +8613,7 @@ mod tests {
     };
     use async_trait::async_trait;
     use std::collections::VecDeque;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
 
     // ── Minimal mock transport for reconnect() unit tests ──
 
@@ -8425,6 +8625,8 @@ mod tests {
         /// Mirrors the production writer's dispatch record so client tests can
         /// drive acknowledgement verification without a real socket.
         reset_dispatched: bool,
+        external_request: ExternalRequestState,
+        supports_external_cancellation: bool,
         /// Every byte handed to `send` (request framing + payload), so tests can
         /// assert what was actually written to the wire.
         sent: Arc<std::sync::Mutex<Vec<u8>>>,
@@ -8440,12 +8642,17 @@ mod tests {
         /// When set, `send` never returns, so a test can drive a write deadline
         /// without a real stalled peer.
         send_should_hang: Arc<std::sync::atomic::AtomicBool>,
+        block_on_send: Option<usize>,
+        send_calls: Arc<std::sync::atomic::AtomicUsize>,
         /// Fires after the first successful send, allowing a multi-packet
         /// request to be cancelled while the server holds its first packet.
         cancel_after_send: Option<tokio_util::sync::CancellationToken>,
         /// Attentions requested, so a test can tell the cancel-a-sent-request
         /// path from the withdraw-a-partial-one path.
         attentions: Arc<std::sync::atomic::AtomicUsize>,
+        attention_acknowledged: bool,
+        attention_should_fail: bool,
+        row_read_had_cancel: Arc<std::sync::atomic::AtomicBool>,
         /// Cached liveness flag toggled by `mark_known_dead`, surfaced through
         /// `connection_known_dead` so tests can assert the fatal-error path.
         known_dead: bool,
@@ -8466,14 +8673,21 @@ mod tests {
                 pending_tokens: VecDeque::new(),
                 reset_mode: ResetConnectionMode::None,
                 reset_dispatched: false,
+                external_request: ExternalRequestState::default(),
+                supports_external_cancellation: true,
                 sent: Arc::new(std::sync::Mutex::new(Vec::new())),
                 packet_data: Vec::new(),
                 packet_pos: 0,
                 resume_results: VecDeque::new(),
                 send_should_fail: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 send_should_hang: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                block_on_send: None,
+                send_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 cancel_after_send: None,
                 attentions: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                attention_acknowledged: true,
+                attention_should_fail: false,
+                row_read_had_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 known_dead: false,
                 receive_error: None,
                 sync_header_available: false,
@@ -8579,10 +8793,12 @@ mod tests {
             &mut self,
             _context: &ParserContext,
             _remaining_request_timeout: Option<Duration>,
-            _cancel_handle: Option<&CancelHandle>,
+            cancel_handle: Option<&CancelHandle>,
             _plan: ColumnPolicy,
             _writer: &mut (dyn RowWriter + Send),
         ) -> TdsResult<RowReadResult> {
+            self.row_read_had_cancel
+                .store(cancel_handle.is_some(), std::sync::atomic::Ordering::SeqCst);
             // The mock has no row bytes to materialize, so it replays the queued
             // tokens as control tokens (e.g. a terminal DONE). This lets drain
             // paths — which read rows until the result set's DONE — be exercised
@@ -8669,6 +8885,13 @@ mod tests {
             {
                 std::future::pending::<()>().await;
             }
+            let call = self
+                .send_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            if self.block_on_send == Some(call) {
+                std::future::pending::<()>().await;
+            }
             self.sent.lock().unwrap().extend_from_slice(data);
             if let Some(cancel) = self.cancel_after_send.take() {
                 cancel.cancel();
@@ -8693,6 +8916,10 @@ mod tests {
         }
         fn take_reset_dispatched(&mut self) -> bool {
             std::mem::replace(&mut self.reset_dispatched, false)
+        }
+        fn external_request_state(&mut self) -> Option<&mut ExternalRequestState> {
+            self.supports_external_cancellation
+                .then_some(&mut self.external_request)
         }
     }
 
@@ -8727,11 +8954,15 @@ mod tests {
         ) -> TdsResult<bool> {
             self.attentions
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            // Acknowledged. `Ok(false)` would mean the ACK never came, and
-            // `send_attention_and_wait` retires the transport on every such
-            // outcome - a mock that returned it without doing so would let a test
-            // read a dead connection as a surviving one.
-            Ok(true)
+            if self.attention_should_fail {
+                return Err(crate::error::Error::ConnectionClosed(
+                    "injected attention failure".to_string(),
+                ));
+            }
+            if !self.attention_acknowledged {
+                self.known_dead = true;
+            }
+            Ok(self.attention_acknowledged)
         }
         fn is_connection_dead(&self) -> bool {
             self.closed
@@ -8838,6 +9069,653 @@ mod tests {
             client_context,
             Vec::new(),
         )
+    }
+
+    fn create_external_cancel_client(
+        progress: Option<ExternalRequestProgress>,
+        attention_acknowledged: bool,
+        attention_should_fail: bool,
+    ) -> (TdsClient, Arc<std::sync::atomic::AtomicUsize>) {
+        let mut transport = TestTransport::new();
+        transport.external_request = ExternalRequestState::from_progress(progress);
+        transport.attention_acknowledged = attention_acknowledged;
+        transport.attention_should_fail = attention_should_fail;
+        let attentions = Arc::clone(&transport.attentions);
+        (create_test_client_with_transport(transport), attentions)
+    }
+
+    #[tokio::test]
+    async fn ordinary_execute_does_not_arm_external_cancellation() {
+        let mut client = create_test_client_with_tokens(vec![done_no_more()]);
+
+        client.execute("SELECT 1".to_string(), ()).await.unwrap();
+
+        assert_eq!(
+            client
+                .transport
+                .as_writer()
+                .external_request_state()
+                .unwrap()
+                .take(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn external_execute_clears_progress_on_terminal_done() {
+        let mut client = create_test_client_with_tokens(vec![done_no_more()]);
+
+        assert_eq!(
+            client
+                .execute(
+                    "SELECT 1".to_string(),
+                    ExecuteOptions::new().caller_managed_cancellation(),
+                )
+                .await
+                .unwrap(),
+            StatementResult::End
+        );
+        assert_eq!(
+            client
+                .transport
+                .as_writer()
+                .external_request_state()
+                .unwrap()
+                .take(),
+            None
+        );
+    }
+
+    #[test]
+    fn cancellation_builder_selects_one_owner() {
+        let cancel = CancelHandle::new();
+
+        let caller_managed = ExecuteOptions::new()
+            .cancel(&cancel)
+            .caller_managed_cancellation();
+        assert!(matches!(
+            caller_managed.cancellation,
+            RequestCancellationMode::CallerManaged
+        ));
+
+        let driver_managed = ExecuteOptions::new()
+            .caller_managed_cancellation()
+            .cancel(&cancel);
+        assert!(matches!(
+            driver_managed.cancellation,
+            RequestCancellationMode::DriverManaged(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn external_row_reads_do_not_receive_a_cancel_handle() {
+        let transport = TestTransport::with_tokens(vec![empty_col_metadata(), done_no_more()]);
+        let row_read_had_cancel = Arc::clone(&transport.row_read_had_cancel);
+        let mut client = create_test_client_with_transport(transport);
+
+        assert_eq!(
+            client
+                .execute(
+                    "SELECT 1".to_string(),
+                    ExecuteOptions::new().caller_managed_cancellation(),
+                )
+                .await
+                .unwrap(),
+            StatementResult::Rows
+        );
+        let mut writer = DefaultRowWriter::new(0);
+        assert!(!client.next_row_into(&mut writer).await.unwrap());
+        assert!(!row_read_had_cancel.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn external_row_drain_clears_progress_on_terminal_done() {
+        let transport = TestTransport::with_tokens(vec![empty_col_metadata(), done_no_more()]);
+        let attentions = Arc::clone(&transport.attentions);
+        let mut client = create_test_client_with_transport(transport);
+
+        assert_eq!(
+            client
+                .execute(
+                    "SELECT 1".to_string(),
+                    ExecuteOptions::new().caller_managed_cancellation(),
+                )
+                .await
+                .unwrap(),
+            StatementResult::Rows
+        );
+        let mut writer = DefaultRowWriter::new(0);
+        assert!(!client.next_row_into(&mut writer).await.unwrap());
+
+        assert_eq!(
+            client.cancel_request(Duration::from_secs(1)).await.unwrap(),
+            RequestCancellationOutcome::NothingActive
+        );
+        assert_eq!(attentions.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn external_close_query_clears_progress_on_terminal_done() {
+        let transport = TestTransport::with_tokens(vec![empty_col_metadata(), done_no_more()]);
+        let attentions = Arc::clone(&transport.attentions);
+        let mut client = create_test_client_with_transport(transport);
+
+        assert_eq!(
+            client
+                .execute(
+                    "SELECT 1".to_string(),
+                    ExecuteOptions::new().caller_managed_cancellation(),
+                )
+                .await
+                .unwrap(),
+            StatementResult::Rows
+        );
+        client.close_query().await.unwrap();
+
+        assert_eq!(
+            client.cancel_request(Duration::from_secs(1)).await.unwrap(),
+            RequestCancellationOutcome::NothingActive
+        );
+        assert_eq!(attentions.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn external_execute_with_rows_enables_attention_cleanup() {
+        let transport = TestTransport::with_tokens(vec![empty_col_metadata()]);
+        let attentions = Arc::clone(&transport.attentions);
+        let mut client = create_test_client_with_transport(transport);
+
+        assert_eq!(
+            client
+                .execute(
+                    "SELECT 1".to_string(),
+                    ExecuteOptions::new().caller_managed_cancellation(),
+                )
+                .await
+                .unwrap(),
+            StatementResult::Rows
+        );
+        assert_eq!(
+            client.cancel_request(Duration::from_secs(1)).await.unwrap(),
+            RequestCancellationOutcome::AttentionAcknowledged
+        );
+        assert_eq!(attentions.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn external_sp_executesql_with_rows_enables_attention_cleanup() {
+        let transport = TestTransport::with_tokens(vec![empty_col_metadata()]);
+        let attentions = Arc::clone(&transport.attentions);
+        let mut client = create_test_client_with_transport(transport);
+
+        assert_eq!(
+            client
+                .execute_sp_executesql(
+                    "SELECT 1".to_string(),
+                    Vec::new(),
+                    ExecuteOptions::new().caller_managed_cancellation(),
+                )
+                .await
+                .unwrap(),
+            StatementResult::Rows
+        );
+        assert_eq!(
+            client.cancel_request(Duration::from_secs(1)).await.unwrap(),
+            RequestCancellationOutcome::AttentionAcknowledged
+        );
+        assert_eq!(attentions.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn external_sp_executesql_tracks_always_encrypted_describe() {
+        use crate::connection::client_context::ExecutionColumnEncryptionSetting;
+        use crate::message::features::always_encrypted::AlwaysEncryptedFeature;
+        use crate::message::login::Feature;
+
+        let transport = TestTransport::new();
+        transport
+            .send_should_hang
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let attentions = Arc::clone(&transport.attentions);
+        let mut negotiated_settings =
+            crate::handler::handler_factory::create_test_negotiated_settings_internal();
+        let mut feature = AlwaysEncryptedFeature::default();
+        feature.set_acknowledged(true);
+        negotiated_settings
+            .session_settings
+            .supported_features
+            .push(Box::new(feature));
+        let mut client = TdsClient::new(
+            AnyTransport::dynamic(transport),
+            negotiated_settings,
+            crate::connection::execution_context::ExecutionContext::new(),
+            ClientContext::with_data_source("tcp:localhost,1433"),
+            Vec::new(),
+        );
+        let parameter = RpcParameter::new(
+            Some("@value".to_string()),
+            StatusFlags::NONE,
+            SqlType::Int(Some(1)),
+        );
+
+        {
+            let mut execute = std::pin::pin!(
+                client.execute_sp_executesql(
+                    "SELECT @value".to_string(),
+                    vec![parameter],
+                    ExecuteOptions::new()
+                        .column_encryption(ExecutionColumnEncryptionSetting::Enabled)
+                        .caller_managed_cancellation(),
+                )
+            );
+            std::future::poll_fn(|context| match execute.as_mut().poll(context) {
+                std::task::Poll::Pending => std::task::Poll::Ready(()),
+                std::task::Poll::Ready(result) => {
+                    panic!("blocked describe request completed unexpectedly: {result:?}")
+                }
+            })
+            .await;
+        }
+
+        assert_eq!(
+            client.cancel_request(Duration::from_secs(1)).await.unwrap(),
+            RequestCancellationOutcome::RetiredBeforeRequestCompletion
+        );
+        assert_eq!(attentions.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn external_execute_does_not_arm_before_failed_reconnect() {
+        let mut transport = TestTransport::new();
+        transport.known_dead = true;
+        let mut client = create_test_client_with_transport(transport);
+
+        assert!(
+            client
+                .execute(
+                    "SELECT 1".to_string(),
+                    ExecuteOptions::new().caller_managed_cancellation(),
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            client.cancel_request(Duration::from_secs(1)).await.unwrap(),
+            RequestCancellationOutcome::NothingActive
+        );
+    }
+
+    #[tokio::test]
+    async fn caller_managed_cancellation_rejects_an_unsupported_transport_before_send() {
+        let mut transport = TestTransport::new();
+        transport.supports_external_cancellation = false;
+        let sent = Arc::clone(&transport.sent);
+        let mut client = create_test_client_with_transport(transport);
+
+        let result = client
+            .execute(
+                "SELECT 1".to_string(),
+                ExecuteOptions::new().caller_managed_cancellation(),
+            )
+            .await;
+
+        assert!(matches!(result, Err(crate::error::Error::UsageError(_))));
+        assert!(sent.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn begin_sp_executesql_rejects_caller_managed_cancellation_before_send() {
+        let transport = TestTransport::new();
+        let sent = Arc::clone(&transport.sent);
+        let mut client = create_test_client_with_transport(transport);
+
+        let result = client
+            .begin_sp_executesql(
+                "SELECT 1".to_string(),
+                Vec::new(),
+                ExecuteOptions::new().caller_managed_cancellation(),
+            )
+            .await;
+
+        assert!(matches!(result, Err(crate::error::Error::UsageError(_))));
+        assert!(sent.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn external_cancel_retires_an_indeterminate_write_without_attention() {
+        let transport = TestTransport::new();
+        transport
+            .send_should_hang
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let attentions = Arc::clone(&transport.attentions);
+        let mut client = create_test_client_with_transport(transport);
+
+        {
+            let mut execute = std::pin::pin!(client.execute(
+                "SELECT 1".to_string(),
+                ExecuteOptions::new().caller_managed_cancellation(),
+            ));
+            std::future::poll_fn(|context| match execute.as_mut().poll(context) {
+                std::task::Poll::Pending => std::task::Poll::Ready(()),
+                std::task::Poll::Ready(result) => {
+                    panic!("blocked send completed unexpectedly: {result:?}")
+                }
+            })
+            .await;
+        }
+
+        assert_eq!(
+            client.cancel_request(Duration::from_secs(1)).await.unwrap(),
+            RequestCancellationOutcome::RetiredBeforeRequestCompletion
+        );
+        assert_eq!(attentions.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn external_cancel_retires_a_partial_message_without_attention() {
+        let mut transport = TestTransport::new();
+        transport.block_on_send = Some(2);
+        let send_calls = Arc::clone(&transport.send_calls);
+        let attentions = Arc::clone(&transport.attentions);
+        let mut client = create_test_client_with_transport(transport);
+
+        {
+            let mut execute = std::pin::pin!(client.execute(
+                "X".repeat(4096),
+                ExecuteOptions::new().caller_managed_cancellation(),
+            ));
+            std::future::poll_fn(|context| match execute.as_mut().poll(context) {
+                std::task::Poll::Pending => std::task::Poll::Ready(()),
+                std::task::Poll::Ready(result) => {
+                    panic!("second packet completed unexpectedly: {result:?}")
+                }
+            })
+            .await;
+        }
+
+        assert_eq!(send_calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(
+            client.cancel_request(Duration::from_secs(1)).await.unwrap(),
+            RequestCancellationOutcome::RetiredBeforeRequestCompletion
+        );
+        assert_eq!(attentions.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn external_cancel_sends_attention_only_after_final_eom() {
+        for progress in [
+            ExternalRequestProgress::FinalEomSent,
+            ExternalRequestProgress::ResponseActive,
+        ] {
+            let (client, attentions) = create_external_cancel_client(Some(progress), true, false);
+
+            assert_eq!(
+                client.cancel_request(Duration::from_secs(1)).await.unwrap(),
+                RequestCancellationOutcome::AttentionAcknowledged
+            );
+            assert_eq!(attentions.load(std::sync::atomic::Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn external_cancel_reports_attention_timeout_and_retires() {
+        let (client, attentions) = create_external_cancel_client(
+            Some(ExternalRequestProgress::ResponseActive),
+            false,
+            false,
+        );
+
+        assert_eq!(
+            client.cancel_request(Duration::from_secs(1)).await.unwrap(),
+            RequestCancellationOutcome::AttentionTimedOut
+        );
+        assert_eq!(attentions.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn external_cancel_propagates_attention_failure_and_retires() {
+        let (client, attentions) = create_external_cancel_client(
+            Some(ExternalRequestProgress::ResponseActive),
+            false,
+            true,
+        );
+
+        assert!(matches!(
+            client.cancel_request(Duration::from_secs(1)).await,
+            Err(crate::error::Error::ConnectionClosed(_))
+        ));
+        assert_eq!(attentions.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn external_cancel_reports_an_already_retired_connection() {
+        let (mut client, attentions) = create_external_cancel_client(
+            Some(ExternalRequestProgress::ResponseActive),
+            true,
+            false,
+        );
+        client.transport.mark_known_dead();
+
+        assert_eq!(
+            client.cancel_request(Duration::from_secs(1)).await.unwrap(),
+            RequestCancellationOutcome::ConnectionAlreadyRetired
+        );
+        assert_eq!(attentions.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn external_cancel_retires_a_positioned_row_without_attention() {
+        let (mut client, attentions) = create_external_cancel_client(
+            Some(ExternalRequestProgress::ResponseActive),
+            true,
+            false,
+        );
+        client.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(RowPauseState {
+            next_column_index: 0,
+            metadata: int_column_metadata(1),
+            nbc_null_bitmap: None,
+            decryptor: None,
+        }));
+
+        assert_eq!(
+            client.cancel_request(Duration::from_secs(1)).await.unwrap(),
+            RequestCancellationOutcome::ConnectionAlreadyRetired
+        );
+        assert_eq!(attentions.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn external_cancel_retires_a_dropped_push_row_parser_without_attention() {
+        let first_packet = TestPacketBuilder::new(PacketType::TabularResult)
+            .continuation()
+            .append_byte(TokenType::Row as u8)
+            .append_bytes(&42_i32.to_le_bytes()[..2])
+            .build();
+        let (client_side, mut peer) = duplex(4096);
+        peer.write_all(&first_packet).await.unwrap();
+        let mut transport = build_duplex_transport(client_side);
+        let request = transport.external_request_state().unwrap();
+        request.begin();
+        request.note_packet_sent(PacketType::SqlBatch, true);
+        request.note_response_active();
+        let mut client = create_test_client_with_any_transport(AnyTransport::network(transport));
+        client.current_metadata = Some(int_column_metadata(1));
+        client.current_result_set_has_been_read_till_end = false;
+        let mut writer = DefaultRowWriter::new(1);
+
+        {
+            let mut read = std::pin::pin!(client.next_row_into(&mut writer));
+            let first_poll =
+                std::future::poll_fn(|context| std::task::Poll::Ready(read.as_mut().poll(context)))
+                    .await;
+            assert!(first_poll.is_pending());
+        }
+        assert!(matches!(
+            client.active_row_read_state,
+            ActiveRowReadState::Idle
+        ));
+
+        assert_eq!(
+            client.cancel_request(Duration::from_secs(1)).await.unwrap(),
+            RequestCancellationOutcome::ConnectionAlreadyRetired
+        );
+        let mut sent = [0_u8; PacketWriter::PACKET_HEADER_SIZE];
+        assert_eq!(peer.read(&mut sent).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn external_cancel_retires_a_dropped_row_header_parser_without_attention() {
+        let first_packet = TestPacketBuilder::new(PacketType::TabularResult)
+            .continuation()
+            .append_byte(TokenType::NbcRow as u8)
+            .append_byte(0)
+            .build();
+        let (client_side, mut peer) = duplex(4096);
+        peer.write_all(&first_packet).await.unwrap();
+        let mut transport = build_duplex_transport(client_side);
+        let request = transport.external_request_state().unwrap();
+        request.begin();
+        request.note_packet_sent(PacketType::SqlBatch, true);
+        request.note_response_active();
+        let mut client = create_test_client_with_any_transport(AnyTransport::network(transport));
+        client.current_metadata = Some(int_column_metadata(9));
+        client.current_result_set_has_been_read_till_end = false;
+
+        {
+            let mut read = std::pin::pin!(client.next_row_cursor());
+            let first_poll =
+                std::future::poll_fn(|context| std::task::Poll::Ready(read.as_mut().poll(context)))
+                    .await;
+            assert!(first_poll.is_pending());
+        }
+        assert!(matches!(
+            client.active_row_read_state,
+            ActiveRowReadState::Idle
+        ));
+
+        assert_eq!(
+            client.cancel_request(Duration::from_secs(1)).await.unwrap(),
+            RequestCancellationOutcome::ConnectionAlreadyRetired
+        );
+        let mut sent = [0_u8; PacketWriter::PACKET_HEADER_SIZE];
+        assert_eq!(peer.read(&mut sent).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn external_cancel_retires_a_dropped_control_parser_without_attention() {
+        let first_packet = TestPacketBuilder::new(PacketType::TabularResult)
+            .continuation()
+            .append_byte(TokenType::Done as u8)
+            .append_bytes(&DoneStatus::ATTN.bits().to_le_bytes())
+            .build();
+        let (client_side, mut peer) = duplex(4096);
+        peer.write_all(&first_packet).await.unwrap();
+        let mut transport = build_duplex_transport(client_side);
+        let request = transport.external_request_state().unwrap();
+        request.begin();
+        request.note_packet_sent(PacketType::SqlBatch, true);
+        request.note_response_active();
+
+        {
+            let mut read = std::pin::pin!(transport.receive_token(
+                &ParserContext::ColumnEncryption(false),
+                None,
+                None,
+            ));
+            let first_poll =
+                std::future::poll_fn(|context| std::task::Poll::Ready(read.as_mut().poll(context)))
+                    .await;
+            assert!(first_poll.is_pending());
+        }
+        let client = create_test_client_with_any_transport(AnyTransport::network(transport));
+
+        assert_eq!(
+            client.cancel_request(Duration::from_secs(1)).await.unwrap(),
+            RequestCancellationOutcome::ConnectionAlreadyRetired
+        );
+        let mut sent = [0_u8; PacketWriter::PACKET_HEADER_SIZE];
+        assert_eq!(peer.read(&mut sent).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn external_cancel_sends_attention_after_a_complete_push_row() {
+        let row_packet = TestPacketBuilder::new(PacketType::TabularResult)
+            .append_byte(TokenType::Row as u8)
+            .append_i32(42)
+            .build();
+        let attention_ack = TestPacketBuilder::new(PacketType::TabularResult)
+            .append_byte(TokenType::Done as u8)
+            .append_u16(DoneStatus::ATTN.bits())
+            .append_u16(0)
+            .append_u64(0)
+            .build();
+        let (client_side, mut peer) = duplex(4096);
+        peer.write_all(&row_packet).await.unwrap();
+        let mut transport = build_duplex_transport(client_side);
+        let request = transport.external_request_state().unwrap();
+        request.begin();
+        request.note_packet_sent(PacketType::SqlBatch, true);
+        request.note_response_active();
+        let mut client = create_test_client_with_any_transport(AnyTransport::network(transport));
+        client.current_metadata = Some(int_column_metadata(1));
+        client.current_result_set_has_been_read_till_end = false;
+        let mut writer = DefaultRowWriter::new(1);
+
+        assert!(client.next_row_into(&mut writer).await.unwrap());
+        let peer_task = tokio::spawn(async move {
+            let mut attention = [0_u8; PacketWriter::PACKET_HEADER_SIZE];
+            peer.read_exact(&mut attention).await.unwrap();
+            assert_eq!(attention[0], PacketType::Attention as u8);
+            peer.write_all(&attention_ack).await.unwrap();
+        });
+
+        assert_eq!(
+            client.cancel_request(Duration::from_secs(1)).await.unwrap(),
+            RequestCancellationOutcome::AttentionAcknowledged
+        );
+        peer_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn external_cancel_sends_attention_after_a_complete_control_token() {
+        let token_packet = TestPacketBuilder::new(PacketType::TabularResult)
+            .append_byte(TokenType::ReturnStatus as u8)
+            .append_i32(42)
+            .build();
+        let attention_ack = TestPacketBuilder::new(PacketType::TabularResult)
+            .append_byte(TokenType::Done as u8)
+            .append_u16(DoneStatus::ATTN.bits())
+            .append_u16(0)
+            .append_u64(0)
+            .build();
+        let (client_side, mut peer) = duplex(4096);
+        peer.write_all(&token_packet).await.unwrap();
+        let mut transport = build_duplex_transport(client_side);
+        let request = transport.external_request_state().unwrap();
+        request.begin();
+        request.note_packet_sent(PacketType::SqlBatch, true);
+        request.note_response_active();
+
+        assert!(matches!(
+            transport
+                .receive_token(&ParserContext::ColumnEncryption(false), None, None)
+                .await
+                .unwrap(),
+            Tokens::ReturnStatus(_)
+        ));
+        let client = create_test_client_with_any_transport(AnyTransport::network(transport));
+        let peer_task = tokio::spawn(async move {
+            let mut attention = [0_u8; PacketWriter::PACKET_HEADER_SIZE];
+            peer.read_exact(&mut attention).await.unwrap();
+            assert_eq!(attention[0], PacketType::Attention as u8);
+            peer.write_all(&attention_ack).await.unwrap();
+        });
+
+        assert_eq!(
+            client.cancel_request(Duration::from_secs(1)).await.unwrap(),
+            RequestCancellationOutcome::AttentionAcknowledged
+        );
+        peer_task.await.unwrap();
     }
 
     #[test]
@@ -13235,6 +14113,16 @@ mod tests {
         let (transport, _written) =
             create_network_transport_with_live_peer_capturing_writes(&response);
         let mut client = create_test_client_with_any_transport(AnyTransport::network(transport));
+        {
+            let request = client
+                .transport
+                .as_writer()
+                .external_request_state()
+                .unwrap();
+            request.begin();
+            request.note_packet_sent(PacketType::SqlBatch, true);
+            request.note_response_active();
+        }
         client.current_metadata = Some(int_column_metadata(1));
         client.current_result_set_has_been_read_till_end = false;
         client.current_result_ended_with_done_in_proc = true;
@@ -13258,6 +14146,10 @@ mod tests {
         assert!(client.cancel_handle.is_none());
         assert!(!client.command_is_busy());
         assert!(!client.is_connection_dead());
+        assert_eq!(
+            client.cancel_request(Duration::from_secs(1)).await.unwrap(),
+            RequestCancellationOutcome::NothingActive
+        );
     }
 
     /// A malicious or corrupt server cannot keep the trailer scanner alive

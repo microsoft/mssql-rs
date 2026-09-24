@@ -434,12 +434,21 @@ impl<'a> PacketWriter<'a> {
         // next write to panic (issue #513). The timeout is checked *after*
         // the write finishes so that the stream always remains in a clean
         // state and attention packets can be sent safely on timeout.
+        // A pending write may already have reached the socket. Record the
+        // ambiguous phase before awaiting it, so cancellation retires the
+        // connection instead of sending ATTENTION for an incomplete request.
+        if let Some(request) = self.network_writer.external_request_state() {
+            request.note_write_started(self.packet_type);
+        }
         let send_data_fut = CancelHandle::run_until_cancelled(
             self.cancel_handle.as_ref(),
             self.network_writer.send(data_slice),
         );
 
         send_data_fut.await?;
+        if let Some(request) = self.network_writer.external_request_state() {
+            request.note_packet_sent(self.packet_type, is_last_packet && !is_ignore_packet);
+        }
 
         // Set before anything that can fail below: once these bytes are on the
         // wire the server is mid-message, whatever this call returns.
@@ -748,6 +757,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::connection::transport::network_transport::TransportSslHandler;
     use crate::core::NegotiatedEncryptionSetting;
+    use crate::io::reader_writer::{ExternalRequestProgress, ExternalRequestState};
     use async_trait::async_trait;
     use futures::executor::block_on;
 
@@ -763,6 +773,7 @@ pub(crate) mod tests {
         pub(crate) data: Vec<u8>,
         pub(crate) reset_mode: ResetConnectionMode,
         pub(crate) reset_dispatched: bool,
+        pub(crate) external_request: ExternalRequestState,
     }
 
     impl MockNetworkWriter {
@@ -772,6 +783,7 @@ pub(crate) mod tests {
                 data: vec![],
                 reset_mode: ResetConnectionMode::None,
                 reset_dispatched: false,
+                external_request: ExternalRequestState::default(),
             }
         }
     }
@@ -808,6 +820,10 @@ pub(crate) mod tests {
 
         fn take_reset_dispatched(&mut self) -> bool {
             std::mem::replace(&mut self.reset_dispatched, false)
+        }
+
+        fn external_request_state(&mut self) -> Option<&mut ExternalRequestState> {
+            Some(&mut self.external_request)
         }
     }
 
@@ -1047,6 +1063,22 @@ pub(crate) mod tests {
         );
         // The buffered payload byte must not be part of the ignored packet.
         assert!(!mock.data.contains(&0xAB));
+    }
+
+    #[test]
+    fn ignored_message_does_not_complete_external_request() {
+        let mut mock = MockNetworkWriter::new(16);
+        mock.external_request.begin();
+        let mut writer = PacketWriter::new(PacketType::SqlBatch, &mut mock, None, None);
+
+        block_on(writer.write_byte_async(0xAB)).unwrap();
+        block_on(writer.cancel_current_message()).unwrap();
+        drop(writer);
+
+        assert_eq!(
+            mock.external_request.take(),
+            Some(ExternalRequestProgress::PartialMessageSent)
+        );
     }
 
     #[test]
