@@ -1911,6 +1911,9 @@ fn stream_active_plp_chunk_once<'a>(
                         }),
                     _ => None,
                 };
+                // The TDS cursor is already paused inside this value. Preserve
+                // that position even if conversion is rejected, so a retry does
+                // not resume the row cursor and drain the unread value.
                 stmt_state.active_plp =
                     Some(ActivePlpStream::new(col_index, encoding, narrow_encoding));
                 stmt_state.current_row_last_col = col_index;
@@ -8855,6 +8858,191 @@ mod tests {
                     .unwrap()
                     .sql_state,
                 SQLSTATE_07006
+            );
+        }
+    }
+
+    #[test]
+    fn typed_binary_plp_rejection_preserves_retry_and_following_columns() {
+        use mssql_mock_tds::{ColumnDefinition, ColumnValue, QueryResponse, Row, SqlDataType};
+        for (retry, prefix) in [
+            None,
+            Some(SQL_C_BINARY),
+            Some(SQL_C_CHAR),
+            Some(SQL_C_WCHAR),
+        ]
+        .into_iter()
+        .flat_map(|retry| [(retry, false), (retry, true)])
+        {
+            let mut handles = TestHandles::with_env_dbc_stmt();
+            let dbc = unsafe { handle_from_raw::<DbcHandle>(handles.dbc) };
+            let response = QueryResponse::new(
+                vec![
+                    ColumnDefinition::new("binary", SqlDataType::VarBinaryMax),
+                    ColumnDefinition::new("following", SqlDataType::Int),
+                ],
+                vec![
+                    Row::new(vec![
+                        ColumnValue::VarBinaryMax(vec![vec![0, 1], vec![0xff, 0x42]]),
+                        ColumnValue::Int(99),
+                    ]),
+                    Row::new(vec![
+                        ColumnValue::VarBinaryMax(vec![vec![0x12]]),
+                        ColumnValue::Int(123),
+                    ]),
+                ],
+            );
+            let _server = crate::test_support::connect_mock_server(dbc, "SELECT binary", response);
+            let query: Vec<u16> = "SELECT binary\0".encode_utf16().collect();
+            assert_eq!(
+                unsafe {
+                    crate::api::exec_direct::sql_exec_direct_w(
+                        handles.stmt,
+                        query.as_ptr(),
+                        SQL_NTS,
+                    )
+                },
+                SQL_SUCCESS
+            );
+            assert_eq!(
+                unsafe { crate::api::fetch::sql_fetch(handles.stmt) },
+                SQL_SUCCESS
+            );
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(handles.stmt) };
+            let mut value = -99_i32;
+            let mut indicator = -99;
+            if prefix {
+                let mut byte = 0xcc_u8;
+                assert_eq!(
+                    unsafe {
+                        crate::api::exports::SQLGetData(
+                            handles.stmt,
+                            1,
+                            SQL_C_BINARY,
+                            (&mut byte as *mut u8).cast(),
+                            1,
+                            &mut indicator,
+                        )
+                    },
+                    SQL_SUCCESS_WITH_INFO
+                );
+                assert_eq!(byte, 0);
+                indicator = -99;
+            }
+            for _ in 0..2 {
+                assert_eq!(
+                    unsafe {
+                        crate::api::exports::SQLGetData(
+                            handles.stmt,
+                            1,
+                            SQL_C_SLONG,
+                            (&mut value as *mut i32).cast(),
+                            0,
+                            &mut indicator,
+                        )
+                    },
+                    SQL_ERROR
+                );
+                assert_eq!((value, indicator), (-99, -99));
+                let state = stmt.inner.lock().unwrap();
+                assert_eq!(state.diag_records.last().unwrap().sql_state, SQLSTATE_HYC00);
+                let stream = state.active_plp.as_ref().unwrap();
+                assert_eq!(stream.column, 1);
+                assert_eq!(stream.encoding, PlpEncoding::Binary);
+                assert_eq!(state.current_row_last_col, 1);
+            }
+            if let Some(target) = retry {
+                let mut bytes = [0xcc_u8; 32];
+                assert_eq!(
+                    unsafe {
+                        crate::api::exports::SQLGetData(
+                            handles.stmt,
+                            1,
+                            target,
+                            bytes.as_mut_ptr().cast(),
+                            32,
+                            &mut indicator,
+                        )
+                    },
+                    SQL_SUCCESS
+                );
+                let hex = if prefix { "01FF42" } else { "0001FF42" };
+                let expected = match target {
+                    SQL_C_BINARY if prefix => vec![1, 0xff, 0x42],
+                    SQL_C_BINARY => vec![0, 1, 0xff, 0x42],
+                    SQL_C_WCHAR => utf16le(hex),
+                    _ => hex.as_bytes().to_vec(),
+                };
+                assert_eq!(&bytes[..expected.len()], &expected);
+                assert_eq!(indicator, expected.len() as SqlLen);
+            }
+            assert_eq!(
+                unsafe {
+                    crate::api::exports::SQLGetData(
+                        handles.stmt,
+                        2,
+                        SQL_C_SLONG,
+                        (&mut value as *mut i32).cast(),
+                        0,
+                        &mut indicator,
+                    )
+                },
+                SQL_SUCCESS
+            );
+            assert_eq!((value, indicator), (99, 4));
+            assert_eq!(
+                unsafe { crate::api::fetch::sql_fetch(handles.stmt) },
+                SQL_SUCCESS
+            );
+            assert_eq!(
+                unsafe {
+                    crate::api::exports::SQLGetData(
+                        handles.stmt,
+                        2,
+                        SQL_C_SLONG,
+                        (&mut value as *mut i32).cast(),
+                        0,
+                        &mut indicator,
+                    )
+                },
+                SQL_SUCCESS
+            );
+            assert_eq!((value, indicator), (123, 4));
+            assert_eq!(
+                unsafe { crate::api::fetch::sql_fetch(handles.stmt) },
+                SQL_NO_DATA
+            );
+            assert!(dbc.inner.lock().unwrap().active_stmt.is_none());
+            let next_stmt = handles.alloc_extra_stmt();
+            assert_eq!(
+                unsafe {
+                    crate::api::exec_direct::sql_exec_direct_w(next_stmt, query.as_ptr(), SQL_NTS)
+                },
+                SQL_SUCCESS
+            );
+            for expected in [99, 123] {
+                assert_eq!(
+                    unsafe { crate::api::fetch::sql_fetch(next_stmt) },
+                    SQL_SUCCESS
+                );
+                assert_eq!(
+                    unsafe {
+                        crate::api::exports::SQLGetData(
+                            next_stmt,
+                            2,
+                            SQL_C_SLONG,
+                            (&mut value as *mut i32).cast(),
+                            0,
+                            &mut indicator,
+                        )
+                    },
+                    SQL_SUCCESS
+                );
+                assert_eq!((value, indicator), (expected, 4));
+            }
+            assert_eq!(
+                unsafe { crate::api::fetch::sql_fetch(next_stmt) },
+                SQL_NO_DATA
             );
         }
     }
