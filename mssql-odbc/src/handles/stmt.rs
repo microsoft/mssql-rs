@@ -44,6 +44,11 @@ pub(crate) struct ActivePlpStream {
     /// also moves pending UTF-16 units here so either text target can drain
     /// their bytes verbatim, including a byte split after a target switch.
     pub(crate) pending_bytes: Vec<u8>,
+    /// The carry is raw UTF-16LE rather than UTF-8. An odd length means its
+    /// first byte is the remainder of a partially delivered code unit.
+    /// Character reads drain old carry before decoding new wire input, so
+    /// this tag covers the entire byte buffer.
+    pub(crate) pending_bytes_utf16: bool,
     /// Narrow wire encoding resolved from the column's collation (or UTF-8 for
     /// `json`, which carries none), or `None` when the column is not narrow
     /// text. This is a property of the *column*, so a target type that arrives
@@ -64,6 +69,7 @@ pub(crate) struct ActivePlpStream {
     /// `encoding_rs::Decoder` already holds that partial sequence internally,
     /// which keeps the boundary rule in one place instead of one per codepage.
     pub(crate) narrow_decoder: Option<ResolvedDecoder>,
+    pub(crate) narrow_decoder_finished: bool,
     /// Code units already decoded on a previous call that did not fit the
     /// caller's buffer, delivered before any further wire bytes.
     ///
@@ -95,6 +101,16 @@ pub(crate) struct BufferedGetDataRow {
     pub(crate) wire_deferred: bool,
 }
 
+#[derive(Debug)]
+pub(crate) struct CapturedPlpWire {
+    pub(crate) column: usize,
+    pub(crate) bytes: Vec<u8>,
+    /// Wire-byte position, independent of the decoded text's offset.
+    pub(crate) offset: usize,
+    /// Unit of `partial_text_offset` for the decoded retry value.
+    pub(crate) text_target: Option<SqlSmallInt>,
+}
+
 impl ActivePlpStream {
     /// Opens a stream for `column`. Every carry field starts empty, so a call
     /// site names only what identifies the stream — and a carry field added
@@ -110,8 +126,10 @@ impl ActivePlpStream {
             pending_byte: None,
             pending_high_surrogate: None,
             pending_bytes: Vec::new(),
+            pending_bytes_utf16: false,
             narrow_encoding,
             narrow_decoder: None,
+            narrow_decoder_finished: false,
             pending_units: Vec::new(),
             prefetched_wire: Vec::new(),
             prefetched_offset: 0,
@@ -134,6 +152,7 @@ impl ActivePlpStream {
             && let Some(encoding) = self.narrow_encoding
         {
             self.narrow_decoder = Some(encoding.new_decoder_without_bom_handling());
+            self.narrow_decoder_finished = false;
         }
     }
 
@@ -486,6 +505,9 @@ pub(crate) struct StmtState {
     pub(crate) row_positioned: bool,
     /// The column value captured by the most recent resume_row_to_column call, with its 1-based column index.
     pub(crate) last_captured: Option<(usize, ColumnValues)>,
+    /// Original unread wire bytes for binary retries of a typed PLP conversion.
+    /// `last_captured` separately retains decoded text, including character carry.
+    pub(crate) captured_plp_wire: Option<CapturedPlpWire>,
     /// Complete non-PLP row captured by SQLFetch for subsequent SQLGetData calls.
     pub(crate) buffered_get_data_row: Option<BufferedGetDataRow>,
     /// Emptied row storage retained across fetches to avoid per-row allocations.
@@ -909,11 +931,9 @@ pub(crate) struct DaeState {
     /// time, data-at-execution slots included as placeholders. The deferred
     /// execute replaces only those slots and keeps the rest verbatim.
     ///
-    /// Held rather than re-read because `bound_params` is itself an
-    /// execute-time snapshot that `SQLFreeStmt(SQL_RESET_PARAMS)` does not
-    /// clear: an application that releases its bindings mid-sequence -- which
-    /// that call invites -- would otherwise have its freed buffers dereferenced
-    /// when the last `SQLParamData` rebuilt the list.
+    /// Retains already-converted non-DAE values while deferred parameters
+    /// arrive. This snapshot does not permit rebinding or parameter reset
+    /// during Need Data; the Driver Manager rejects those calls with HY010.
     pub(crate) prebuilt: Vec<RpcParameter>,
     /// Rewritten SQL for a deferred `SQLExecDirect`, which runs ad-hoc
     /// `sp_executesql` and has no prepared plan to execute instead.
@@ -1384,6 +1404,7 @@ impl StmtState {
     pub(crate) fn reset_row_stream(&mut self) {
         self.row_positioned = false;
         self.last_captured = None;
+        self.captured_plp_wire = None;
         self.buffered_get_data_row = None;
         self.last_variant_base = None;
         self.row_exhausted = false;
@@ -1429,6 +1450,7 @@ impl StmtState {
             );
         }
     }
+
     /// Resets all data-at-execution streaming state and hands back the parked
     /// client, if the sequence still held one. Call after a DAE sequence
     /// completes, is cancelled, or fails.
@@ -1466,8 +1488,8 @@ impl StmtState {
     /// The C type of the open DAE parameter, which `SQLPutData` needs to size
     /// an `SQL_NTS` chunk. Reads the binding snapshot taken at execute time
     /// rather than `bound_params`, so it agrees with the type the chunks are
-    /// transcoded with even if `SQLFreeStmt(SQL_RESET_PARAMS)` or a rebind
-    /// changes or clears the live binding while the sequence is open.
+    /// transcoded with. Rebinding/reset during Need Data is a DM-enforced
+    /// HY010 sequence error, not a supported way to change this snapshot.
     pub(crate) fn dae_current_c_type(&self) -> Option<SqlSmallInt> {
         self.dae
             .as_ref()?
@@ -1493,6 +1515,25 @@ unsafe impl Send for StmtHandle {}
 unsafe impl Sync for StmtHandle {}
 
 impl StmtHandle {
+    /// Called after releasing descriptor locks. Records beyond this SQL's
+    /// markers cannot change its prepared declaration.
+    /// A plan parked in DAE is not a mutation target: SQLBindParameter and
+    /// associated descriptor setters are disallowed during Need Data (HY010).
+    pub(crate) fn invalidate_parameter_definition(&self, first_changed: usize) -> Result<(), ()> {
+        let Ok(mut state) = self.inner.lock() else {
+            error!("invalidating parameter definition: stmt mutex poisoned");
+            return Err(());
+        };
+        if state
+            .prepared
+            .as_ref()
+            .is_some_and(|plan| first_changed <= plan.marker_count)
+        {
+            state.orphan_prepared_handle();
+        }
+        Ok(())
+    }
+
     /// `query_timeout` is the parent connection's current
     /// [`DbcState::stmt_query_timeout`](crate::handles::dbc::DbcState); a
     /// statement starts at the connection-level default rather than always at
@@ -1539,6 +1580,7 @@ impl StmtHandle {
                 parameter_array: None,
                 row_positioned: false,
                 last_captured: None,
+                captured_plp_wire: None,
                 buffered_get_data_row: None,
                 spare_get_data_row: None,
                 last_variant_base: None,

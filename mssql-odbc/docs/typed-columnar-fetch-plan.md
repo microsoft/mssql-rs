@@ -93,6 +93,64 @@ A source with no interpretation for the requested target (binary, guid) is `0700
 
 Max-length character sources (`varchar(max)` / `nvarchar(max)`) into the numeric and date/time targets are **excluded** from P1a and tracked as Task [47238](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47238). They arrive as PLP, so parsing needs the ODBC layer to accumulate chunks, which inverts the "never buffer the full PLP payload" invariant that `stream_active_plp_chunk` documents. That work is sequenced after #204 and #215, which are both rewriting the same read path, and needs a bounded-prefix policy agreed first so a 2 GB column cannot be drained to produce a `SQL_C_SLONG`.
 
+#### Temporal fetch errors (#529)
+
+Temporal C targets distinguish invalid decoded fields (`22007`) from illegal
+source/target pairings (`07006`). The conversion arithmetic overflow (`22008`)
+variant and its diagnostic mappings are defensive backstops: decoded-field
+guards make every producer unreachable today. The overflow mapping tests inject
+the error directly; they do not demonstrate a reachable input.
+Character literals with invalid syntax or fields remain `22018`; successful
+conversions that drop a nonzero component retain `01S07`. The buffered
+`SQLGetData` and bound-fetch fast paths use the same classification.
+
+Character output targets (`SQL_C_CHAR` and `SQL_C_WCHAR`) deliberately retain
+the existing `TextError::Unsupported` / `HYC00` mapping for temporal extraction
+failures in both fetch paths, including newly rejected scales, legacy dates,
+and out-of-day ticks. This change does not extend the struct-target diagnostics
+to text output or claim retail parity for malformed native values.
+
+The ODBC 3 distinction comes from msodbcsql's `ConvertToDateTime` native
+validation and character-parser branches (`sqlccnvt.cpp:3661-3935,4727-4867`),
+called by `OdbcDataFromSqlData` with `TODRIVER`. `sqlcprot.h:945-959` and
+`clntcomn.cpp:1015-1018,1204-1208,1388-1395` map invalid temporal fields to
+`22007`, not the ODBC 2 `22008` mapping. Character-input cases across all five
+temporal C targets and both fetch paths were measured on Linux with
+msodbcsql 18.6.2.1-1 (`SQL_DRIVER_VER=18.06.0002`) by
+`DateTimeTypesLiveTest.InvalidCharacterTemporalValuesViaGetData` and
+`InvalidCharacterTemporalValuesViaBoundFetch`.
+
+Native `time` to `SQL_C_SS_TIMESTAMPOFFSET` is a supported pairing: valid
+values receive the current process-local date and zero timezone fields;
+malformed fields report `22007`. This follows `IsValidColumnConversion`'s
+`SQLTIMEN` arm (`sqlcresl.cpp:460-473`) and `ConvertToDateTime`'s
+`SQL_TIME2_MAPPED` branch (`sqlccnvt.cpp:3869-3902`). Measured on the same retail
+build by `TimeToTimestampoffsetViaGetData` and `TimeToTimestampoffsetViaBoundFetch`
+for `time(0)` and `time(7)`. A one-off manual Linux comparison also passed with
+`TZ=UTC-12` exported before invoking the e2e runner. The tests use the ambient
+process timezone; they do not set `TZ` or provide an automated timezone matrix.
+Character time-only literals to timestampoffset remain outside this change.
+
+Malformed decoded native values other than `Date` are covered by Rust
+regressions, not a retail wire-level comparison: a normal SQL Server cannot
+produce them. Malformed `ColumnValues::Date` is absent from the converter,
+captured/buffered `SQLGetData`, and bound-fetch error matrices: `SqlDate::create`
+rejects invalid dates, while `unchecked_create` is private to `mssql-tds`.
+The `Date`-specific error routing remains an untested gap despite sharing the
+date-range validator with other temporal sources. Closing it requires
+decoder-backed test fixtures; this PR does not widen the unchecked constructor.
+
+Decoded fields are validated before arithmetic, so even extreme ticks report `22007`.
+Decoded temporal scales outside 0..7 also report `22007`; this does not limit
+character literals, whose fractional fields can carry nine digits.
+An offset-adjusted date outside years 1..9999 remains `22007`: the reference
+timestampoffset target reaches `ValidateDateTimeOffsetStruct` after decoding
+(`sqlccnvt.cpp:3904-3933,8765-8766`), which returns `CVT_DT_ERROR`.
+Rejecting invalid wire fields, including legacy `datetime` before 1753-01-01,
+is driver hardening, not a claim that msodbcsql handles identical corrupt
+bytes the same way. Closing that
+evidence gap requires replaying malformed temporal TDS rows to both drivers.
+
 #### Known divergences from msodbcsql
 
 These were found by reading `Sql/Ntdbms/sqlncli/odbc/sqlccnvt.cpp` while reviewing P1a. They are recorded here because `GetDataLiveTest` skips the msodbcsql comparison leg for these cases, so the parity run will not surface them.
@@ -102,7 +160,7 @@ These were found by reading `Sql/Ntdbms/sqlncli/odbc/sqlccnvt.cpp` while reviewi
 | A `datetimeoffset` value, for any target other than `SQL_C_SS_TIMESTAMPOFFSET` | shifts the value into the client's local zone (`ConvertOffsetToLocal`) | validates the offset, then delivers the wall-clock fields as written | **Deliberate.** Matching would make the returned value depend on the client machine's time zone. Locked in by `offset_is_ignored_for_non_offset_targets` for parsed character data and `DatetimeoffsetIntoSsTime2Succeeds` for a native `datetimeoffset` column; the latter skips the comparison leg. |
 | `YYYY/MM/DD` and the ODBC escape literals `{d '...'}` / `{t '...'}` / `{ts '...'}` | accepted (`rgbECODE_DATE_SLASH` retry, and the `FindECode` branch) | `22018` | Gap — Task [47246](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47246). |
 | `T` separator, `HH:MM` without seconds, unpadded fields such as `2023-6-5` | rejected (fixed-length token grammar) | accepted | Permissive. Low risk, same task. |
-| A time-only value into `SQL_C_TYPE_TIMESTAMP` | fills in the process-local current date and succeeds, per Appendix D | fills in the process-local current date and succeeds | Parity — Task [47247](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47247). Both drivers honor the process `TZ` setting. `SQL_C_SS_TIMESTAMPOFFSET` remains deliberately deferred because its timezone semantics require separate measurement. |
+| A time-only value into `SQL_C_TYPE_TIMESTAMP` | fills in the process-local current date and succeeds, per Appendix D | fills in the process-local current date and succeeds | Parity — Task [47247](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47247). Both drivers honor the process `TZ` setting. Native `time` to `SQL_C_SS_TIMESTAMPOFFSET` is now measured and supported as described above; character time-only literals to that target remain deferred. |
 | Any source into `SQL_C_NUMERIC` | converts, per Appendix D | `HYC00` | Gap — Task [47816](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47816). Previously recorded as permanent on the belief that mssql-python asks for decimals as character data; it does, but only *after* keying on a `SQL_C_NUMERIC` answer from the row below, so the target still has to become real for any caller that trusts the reported type. **Since AB#47702 this is a report/service mismatch, not just a missing target:** the row below now reports `SQL_C_NUMERIC` for a variant, so a caller that follows the ODBC data-type-mapping workflow and binds the returned type gets `HYC00` where msodbcsql succeeds. That raises the priority of this task; it does not change what it is. Anchored by `UnsupportedCTypeReturnsHyc00ThenValueReadable`. |
 | `SQL_CA_SS_VARIANT_TYPE` for a variant holding `decimal` / `numeric` / `money` / `smallmoney` | `SQL_C_NUMERIC` | `SQL_C_NUMERIC` | Parity, since AB#47702. Measured against retail msodbcsql18 `18.06.0001`: `decimal`, `numeric`, `money` and `smallmoney` all answer `SQL_C_NUMERIC` (`2`). mssql-python maps the answer to `SQL_NUMERIC` and then re-fetches with `SQL_C_CHAR`, so the character delivery path is what actually serves it. **This answer is not yet serviceable**: binding the returned type yields `HYC00` until AB#47816 lands (row above), a mismatch that did not exist while the answer was `SQL_C_CHAR`. Shipped in this order deliberately — the previous answer was wrong *and* silent, handing `str` back for a decimal with nothing to signal it, and a defined "optional feature not implemented" is a better failure than data of the wrong shape. |
 | `SQL_CA_SS_VARIANT_TYPE` on a column that is not `sql_variant` | `SQL_SUCCESS` | `HY113` | **Deliberate.** msodbcsql prepares `IDS_S1_113` and then `break`s without returning it, where the adjacent `SQL_CA_SS_VARIANT_SERVER_TYPE` case does `SETRC_SERR_GOTO` with the same error — so its success looks like an oversight rather than a contract. Telling the caller it asked the wrong question is more useful than answering it. |

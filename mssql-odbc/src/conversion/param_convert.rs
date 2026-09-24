@@ -61,7 +61,8 @@ use crate::conversion::datetime::{
 };
 use crate::conversion::error::{ConvError, ConvOk};
 use crate::conversion::numeric::{
-    NumericSource, narrow_f64_to_f32, narrow_i128, parse_numeric_text,
+    NumericSource, UnderflowPolicy, narrow_f64_to_f32, narrow_i128, parse_numeric_text,
+    parse_numeric_text_with_policy,
 };
 use crate::conversion::param_buffer::{AppValue, Indicator, read_indicator, read_param_value};
 use crate::params::BoundParam;
@@ -137,6 +138,9 @@ impl ParamBuildError {
             Self::UnsupportedSqlType(_) => ERR_PARAM_SQL_TYPE_NOT_IMPLEMENTED,
             Self::ConversionNotImplemented => ERR_PARAM_CONVERSION_NOT_IMPLEMENTED,
             Self::Value(ConvError::OutOfRange) => ERR_NUMERIC_OUT_OF_RANGE,
+            // Exhaustiveness backstop; parameters use Self::DateTimeFieldOverflow.
+            Self::Value(ConvError::DatetimeFieldOverflow) => ERR_DATETIME_FIELD_OVERFLOW,
+            Self::Value(ConvError::InvalidDatetimeFormat) => ERR_INVALID_DATETIME_FORMAT,
             Self::Value(ConvError::InvalidCharacterValue) => ERR_INVALID_CHARACTER_VALUE,
             Self::Value(ConvError::Internal) => ERR_INTERNAL_CONVERSION,
             // Backstop only: parameter legality is settled by the bind-time
@@ -209,10 +213,29 @@ pub(crate) unsafe fn bound_param_to_rpc(
         StatusFlags::NONE
     };
     let parameter = RpcParameter::new(name.into(), status, value);
-    let parameter = match type_metadata {
+    let mut parameter = match type_metadata {
         Some(metadata) => parameter.with_type_metadata(metadata),
         None => parameter,
     };
+    if matches!(param.sql_type, SQL_NUMERIC | SQL_DECIMAL) {
+        // The IPD defines @params; the numeric fast path can retain a different
+        // precision/scale in the incoming SQL_NUMERIC_STRUCT wire value.
+        let declaration = decimal_metadata(param.column_size, param.decimal_digits)?;
+        if type_metadata != Some(declaration) {
+            let precision = declaration
+                .precision
+                .ok_or(ParamBuildError::InvalidParameterSize(param.column_size))?;
+            let scale = declaration
+                .scale
+                .ok_or(ParamBuildError::InvalidDecimalDigits(param.decimal_digits))?;
+            parameter = parameter
+                .with_numeric_declaration(precision, scale)
+                .map_err(|error| {
+                    tracing::error!(%error, "Inconsistent numeric RPC declaration");
+                    ParamBuildError::Value(ConvError::Internal)
+                })?;
+        }
+    }
     Ok((parameter, outcome))
 }
 
@@ -1331,19 +1354,20 @@ fn variant_column_size(column_size: usize, sql_type: SqlSmallInt) -> usize {
     }
 }
 
-/// Builds `decimal`/`numeric` from a character buffer, reusing the fetch
-/// direction's literal parser so both directions accept exactly the same forms.
+/// Builds `decimal`/`numeric` from a character buffer using the shared literal
+/// parser, but rejects exponent underflow on every platform.
 ///
-/// Rescaling follows msodbcsql rather than `DecimalParts::from_string`, which
-/// rejects *any* input scale past the target. msodbcsql drops the excess digits
-/// and only errors when one of them is non-zero - `if (c != '0') Error =
-/// CVT_FRACT_TRUNC` (`sqlccnvt.cpp:7823`) - and `ParamToSQLType` rewrites that
-/// warning to `22001` for a non-2.x application (`sqlcfunc.cpp:3348`). So
-/// `"1.50"` into `decimal(5,1)` is `1.5`, and `"1.55"` is `22001`.
+/// Unlike `DecimalParts::from_string`, an excess input scale alone is not an
+/// error. `ConvertToNumeric` calls `stringtonumeric` (`sqlccnvt.cpp:7101`), which
+/// strips insignificant fractional zeros via `FindSigNumber` (:8389, :7995-8008)
+/// before reporting `CVT_FRACT_TRUNC` for excess scale (:8433-8437).
+/// `ParamToSQLType` maps that warning to `22001` for ODBC 3.x character input
+/// (`sqlcfunc.cpp:3350-3370`).
 fn decimal_from_text(param: &BoundParam, text: AppText) -> Result<TypedValue, ParamBuildError> {
     let metadata = decimal_metadata(param.column_size, param.decimal_digits)?;
     let (precision, scale) = (metadata.precision.unwrap_or(0), metadata.scale.unwrap_or(0));
-    let parsed = parse_numeric_text(&text.into_string()).map_err(ParamBuildError::Value)?;
+    let parsed = parse_numeric_text_with_policy(&text.into_string(), UnderflowPolicy::Reject)
+        .map_err(ParamBuildError::Value)?;
     let (mantissa, source_scale) = match parsed {
         NumericSource::Int(v) => (v, 0u32),
         NumericSource::Scaled { mantissa, scale } => (mantissa, scale),
@@ -1359,8 +1383,11 @@ fn decimal_from_text(param: &BoundParam, text: AppText) -> Result<TypedValue, Pa
                 .map_err(|_| ParamBuildError::Value(ConvError::OutOfRange))?;
             return Ok((decimal_of(param.sql_type, value), Some(metadata)));
         }
-        // Exponent literals have no exact form to rescale and reach the wire
-        // through the f64 approximation (`sqlccnvt.cpp:5118`).
+        // Our parser represents exponent literals as f64. The reference uses
+        // ConvertToNumeric/stringtonumeric (sqlccnvt.cpp:7101), not the integer
+        // target's CharToDouble path (:5118). This existing approximation rounds
+        // excess fractional digits instead of reporting 22001 as plain literals
+        // do. That spelling-dependent behavior is outside this underflow fix.
         NumericSource::Float(approx) => {
             let value = DecimalParts::from_f64(approx, precision, scale)
                 .map_err(|_| ParamBuildError::Value(ConvError::OutOfRange))?;
@@ -1368,14 +1395,10 @@ fn decimal_from_text(param: &BoundParam, text: AppText) -> Result<TypedValue, Pa
         }
     };
 
-    // Truncation is checked before the precision/magnitude bound below, not
-    // after: `sqlccnvt.cpp:7823` sets `CVT_FRACT_TRUNC` and returns without
-    // ever reaching the whole-number overflow check, so a dropped fractional
-    // digit is always `22001` here, even when the truncated result would also
-    // overflow `precision`. `decimal_from_numeric` does not get this early
-    // return - its source is `SQL_C_NUMERIC`, not `SQL_C_CHAR`/`SQL_C_WCHAR`,
-    // so `CVT_FRACT_TRUNC` is never rewritten to `22001` for it
-    // (`sqlcfunc.cpp:3348`) and the overflow check applies unconditionally.
+    // Keep the existing Rust truncation-before-overflow ordering, not a parity claim.
+    // ParamToSQLType rewrites fractional truncation to 22001 for ODBC 3.x
+    // character input, but not SQL_C_NUMERIC (sqlcfunc.cpp:3350-3370), hence
+    // decimal_from_numeric does not use this character-only early return.
     let (scaled, outcome) = rescale_mantissa(mantissa, i64::from(source_scale), scale)?;
     if outcome == ConvOk::Truncated {
         return Err(ParamBuildError::StringTruncation);
@@ -2016,6 +2039,50 @@ mod tests {
         }
     }
 
+    #[test]
+    fn numeric_rpc_declaration_uses_ipd_independently_of_apd_and_value_header() {
+        use mssql_tds::test_client_support::rpc_parameter_declaration;
+
+        for sql_type in [SQL_NUMERIC, SQL_DECIMAL] {
+            let type_name = if sql_type == SQL_NUMERIC {
+                "numeric"
+            } else {
+                "decimal"
+            };
+            let mut source = numeric_struct(12345, 1, 2);
+            source.precision = 8;
+            let mut indicator = 0;
+            let mut binding = param(SQL_C_NUMERIC, (&raw mut source).cast(), &mut indicator);
+            binding.sql_type = sql_type;
+            binding.column_size = 12;
+            binding.decimal_digits = 2;
+            binding.app_scale = 2;
+            binding.precision_scale_explicit = true;
+
+            for (app_precision, source_precision) in [(8, 8), (12, 8), (12, 10)] {
+                binding.app_precision = app_precision;
+                source.precision = source_precision;
+                let ((_, wire_metadata), _) =
+                    unsafe { bound_param_to_value_with_outcome(&binding) }.unwrap();
+                assert_eq!(
+                    wire_metadata.unwrap().precision,
+                    Some(if app_precision == 12 {
+                        source_precision
+                    } else {
+                        12
+                    })
+                );
+                let (parameter, outcome) =
+                    unsafe { bound_param_to_rpc(Some("@P1".into()), &binding) }.unwrap();
+                assert_eq!(outcome, ConvOk::Exact);
+                assert_eq!(
+                    rpc_parameter_declaration(&parameter).unwrap(),
+                    format!("{type_name}(12,2)")
+                );
+            }
+        }
+    }
+
     /// Simulates an application that explicitly wrote the APD's
     /// `SQL_DESC_SCALE` (`app_scale`) via `SQLSetDescFieldW`/`SQLSetDescRec`,
     /// distinct from a bare `SQLBindParameter` bind, where the driver's own
@@ -2393,12 +2460,8 @@ mod tests {
         assert!(convert_decimal(SQL_DECIMAL, 38, 1, &trailing_zeros).is_ok());
     }
 
-    /// A dropped fractional digit is `22001` even when the truncated result
-    /// would also overflow `precision`: `sqlccnvt.cpp:7823` sets
-    /// `CVT_FRACT_TRUNC` and returns immediately, never reaching the
-    /// whole-number overflow check below it. `"1234.55"` into `decimal(3,1)`
-    /// drops the trailing `5` (non-zero) before the rescaled `1234.5` ever
-    /// gets compared against `10^3`.
+    /// Pins the existing Rust error precedence, not reference parity:
+    /// a dropped fraction wins over whole-number overflow.
     #[test]
     fn a_dropped_fraction_is_22001_even_when_the_result_also_overflows() {
         let err = convert_decimal(SQL_DECIMAL, 3, 1, "1234.55").unwrap_err();
@@ -2518,11 +2581,8 @@ mod tests {
         );
     }
 
-    /// The excess-fraction rule is msodbcsql's, not `DecimalParts::from_string`'s:
-    /// digits past the declared scale are dropped when they are zero and are
-    /// `22001` when they are not - `if (c != '0') Error = CVT_FRACT_TRUNC`
-    /// (`sqlccnvt.cpp:7823`), rewritten to `IDS_22_001` inbound
-    /// (`sqlcfunc.cpp:3348`). `from_string` would reject both.
+    /// Pins the zero-stripping and scale-check behavior cited in
+    /// [`decimal_from_text`], unlike `DecimalParts::from_string`'s scale rejection.
     #[test]
     fn a_decimal_fraction_past_the_scale_is_dropped_only_when_zero() {
         let (value, _) = convert_decimal(SQL_DECIMAL, 5, 1, "1.50").unwrap();
@@ -2547,6 +2607,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn decimal_exponent_rounding_is_unchanged_by_the_underflow_fix() {
+        assert_eq!(
+            convert_decimal(SQL_DECIMAL, 10, 2, "1.235").unwrap_err(),
+            ParamBuildError::StringTruncation
+        );
+        for text in ["1.235e0", "12.35e-1"] {
+            let (value, _) = convert_decimal(SQL_DECIMAL, 10, 2, text).unwrap();
+            assert_eq!(
+                value,
+                SqlType::Decimal(Some(DecimalParts::new(true, 10, 2, 124))),
+                "{text}"
+            );
+        }
+    }
+
     /// More integer digits than the declaration holds is a range error, not a
     /// truncation: `decimal(3,0)` cannot carry 1000 however small the mantissa.
     #[test]
@@ -2562,6 +2638,13 @@ mod tests {
             convert_decimal(SQL_DECIMAL, 3, 2, "10").unwrap_err(),
             ParamBuildError::Value(ConvError::OutOfRange)
         );
+        for text in ["1e-999", "-1e-999"] {
+            assert_eq!(
+                convert_decimal(SQL_DECIMAL, 10, 2, text).unwrap_err(),
+                ParamBuildError::Value(ConvError::OutOfRange)
+            );
+        }
+        assert!(convert_decimal(SQL_DECIMAL, 10, 2, "0e-999").is_ok());
     }
 
     /// An unparseable literal is `22018`, the same state and the same parser the
@@ -5340,12 +5423,24 @@ mod tests {
             convert_char(SQL_C_CHAR, SQL_INTEGER, 0, "-1.5E2").unwrap(),
             SqlType::Int(Some(-150))
         );
-        // An exponent past the `f64` range parses as infinity, which is an
-        // overflow rather than a syntax error.
-        assert_eq!(
-            convert_char(SQL_C_CHAR, SQL_BIGINT, 0, "1e400"),
-            Err(ParamBuildError::Value(ConvError::OutOfRange))
-        );
+        for c_type in [SQL_C_CHAR, SQL_C_WCHAR] {
+            assert_eq!(
+                convert_char(c_type, SQL_BIGINT, 0, "1e400"),
+                Err(ParamBuildError::Value(ConvError::OutOfRange))
+            );
+            for text in ["1e-999", "-1e-999"] {
+                let expected = if cfg!(windows) {
+                    Ok(SqlType::BigInt(Some(0)))
+                } else {
+                    Err(ParamBuildError::Value(ConvError::OutOfRange))
+                };
+                assert_eq!(convert_char(c_type, SQL_BIGINT, 0, text), expected);
+            }
+            assert_eq!(
+                convert_char(c_type, SQL_BIGINT, 0, "0e-999").unwrap(),
+                SqlType::BigInt(Some(0))
+            );
+        }
     }
 
     /// The wide arm decodes UTF-16 rather than narrowing through the ANSI code

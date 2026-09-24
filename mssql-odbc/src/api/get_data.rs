@@ -18,7 +18,7 @@ use super::odbc_types::{
 use super::sqlstate::*;
 use crate::api::describe_col::odbc_sql_type;
 use crate::api::exec_common::release_busy_if_row_exhausted;
-use crate::api::fetch_scroll::element_stride;
+use crate::api::fetch_scroll::{element_stride, typed_plp_chunk_fits};
 use crate::api::odbc_types::SqlWChar;
 use crate::api::type_rules::{canonical_c_type, is_valid_c_type, resolve_default_c_type};
 use crate::api::util::{
@@ -26,7 +26,7 @@ use crate::api::util::{
     write_if_some,
 };
 use crate::error::{free_errors, post_sql_error};
-use crate::handles::stmt::{ActivePlpStream, STMT_STATE_CURSOR_OPEN, StmtState};
+use crate::handles::stmt::{ActivePlpStream, CapturedPlpWire, STMT_STATE_CURSOR_OPEN, StmtState};
 use crate::handles::{HandleType, OdbcVersion, StmtHandle, handle_from_raw};
 use mssql_tds::connection::tds_client::{CursorColumn, CursorPoll, PlpChunk};
 use mssql_tds::core::TdsResult;
@@ -41,7 +41,9 @@ use crate::conversion::fetch_convert::{
 };
 use mssql_tds::datatypes::column_values::ColumnValues;
 use mssql_tds::datatypes::decoder::DECIMAL_STR_LEN;
-use mssql_tds::datatypes::sql_string::{EncodingType, ResolvedDecoder, ResolvedEncoding};
+use mssql_tds::datatypes::sql_string::{
+    EncodingType, ResolvedDecoder, ResolvedEncoding, SqlString,
+};
 use mssql_tds::query::metadata::PlpEncoding;
 
 /// Maximum speculative PLP read-ahead retained by one `SQLGetData` stream.
@@ -49,6 +51,8 @@ use mssql_tds::query::metadata::PlpEncoding;
 /// Larger tails remain on the wire so one call cannot allocate in proportion
 /// to an arbitrarily large MAX value.
 const MAX_PLP_PREFETCH_BYTES: usize = 64 * 1024;
+
+const TYPED_PLP_CHUNK_BYTES: usize = 8 * 1024;
 
 /// Implements SQLGetData for current-row retrieval.
 ///
@@ -285,6 +289,7 @@ fn sql_get_data_safe(
         );
         return finish_get_data(stmt, statement_handle, stmt_state, col_index, rc);
     }
+    stmt_state.captured_plp_wire = None;
 
     let mut try_complete_buffered_plp = false;
     if let Some(row) = stmt_state.buffered_get_data_row.as_mut() {
@@ -755,7 +760,9 @@ unsafe fn try_write_exact_buffered_scalar(
         (ColumnValues::Real(value), SQL_C_FLOAT) => write_exact!(*value),
         (ColumnValues::Float(value), SQL_C_DOUBLE) => write_exact!(*value),
         (ColumnValues::Date(value), SQL_C_TYPE_DATE) => {
-            let parts = date_parts(value);
+            let Ok(parts) = date_parts(value) else {
+                return false;
+            };
             write_exact!(SqlDateStruct {
                 year: parts.year,
                 month: parts.month,
@@ -763,7 +770,9 @@ unsafe fn try_write_exact_buffered_scalar(
             })
         }
         (ColumnValues::Time(value), SQL_C_SS_TIME2) => {
-            let parts = time_parts(value);
+            let Ok(parts) = time_parts(value) else {
+                return false;
+            };
             write_exact!(SqlSsTime2Struct {
                 hour: parts.hour,
                 minute: parts.minute,
@@ -772,7 +781,9 @@ unsafe fn try_write_exact_buffered_scalar(
             })
         }
         (ColumnValues::DateTime2(value), SQL_C_TYPE_TIMESTAMP) => {
-            let parts = datetime2_parts(value);
+            let Ok(parts) = datetime2_parts(value) else {
+                return false;
+            };
             write_exact!(SqlTimestampStruct {
                 year: parts.year,
                 month: parts.month,
@@ -784,7 +795,7 @@ unsafe fn try_write_exact_buffered_scalar(
             })
         }
         (ColumnValues::DateTimeOffset(value), SQL_C_SS_TIMESTAMPOFFSET) => {
-            let Some(parts) = datetimeoffset_parts(value) else {
+            let Ok(parts) = datetimeoffset_parts(value) else {
                 return false;
             };
             write_exact!(SqlSsTimestampoffsetStruct {
@@ -817,7 +828,7 @@ unsafe fn try_write_exact_buffered_scalar(
 /// Returns `None` when the value is not fully buffered or the connection cannot
 /// be used synchronously, leaving the caller to resume normal PLP streaming.
 /// `Some` means the column was consumed, including SQL NULL (reported through
-/// `strlen_or_ind_ptr` and terminated as an empty wide string).
+/// `strlen_or_ind_ptr` without modifying the destination buffer).
 ///
 /// The caller guarantees room for at least one `SqlWChar` terminator and a
 /// non-null indicator pointer before selecting this path.
@@ -880,14 +891,8 @@ fn try_deliver_complete_buffered_unicode_plp(
         unsafe { write_if_some(strlen_or_ind_ptr, chunk.read as SqlLen) };
         SQL_SUCCESS
     } else {
-        // SAFETY: as above for the indicator; the caller also guarantees room
-        // for at least one `SqlWChar`, so the empty-string terminator fits.
-        unsafe {
-            write_if_some(strlen_or_ind_ptr, SQL_NULL_DATA);
-            if !target_value_ptr.is_null() {
-                target_value_ptr.cast::<SqlWChar>().write_unaligned(0);
-            }
-        }
+        // SAFETY: as above for the indicator. NULL leaves the data buffer untouched.
+        unsafe { write_if_some(strlen_or_ind_ptr, SQL_NULL_DATA) };
         SQL_SUCCESS
     };
     stmt_state.current_row_last_col = col_index;
@@ -917,15 +922,10 @@ fn try_deliver_complete_buffered_unicode_plp(
 /// not have reached the wire's end yet; the peek only runs once it completes
 /// naturally on a later `SQLGetData` call.
 ///
-/// `ready` alone decides whether to peek — there is no separate `rc ==
-/// SQL_ERROR` bail. Every `write_captured_column` path that returns
-/// `SQL_ERROR` deliberately leaves `current_row_last_col` unadvanced (a
-/// truncated read, an unconvertible type, a malformed payload — all keep the
-/// column resident and re-readable), so `ready` already reads false for
-/// every current error outcome. That also makes this correct for a future
-/// error outcome that legitimately does finish delivering the column (e.g. a
-/// NULL surfaced through an error indicator): `ready` still reflects the true
-/// delivery state instead of a blanket rc check overriding it.
+/// `ready` alone decides whether to peek, not `rc`. Captured-conversion errors
+/// keep the column resident and re-readable. A rejected typed PLP value,
+/// however, is drained: stream initialization already advanced the column,
+/// so clearing `active_plp` makes a terminal error eligible to release busy.
 fn finish_get_data(
     stmt: &StmtHandle,
     statement_handle: SqlHandle,
@@ -933,6 +933,14 @@ fn finish_get_data(
     col_index: usize,
     rc: SqlReturn,
 ) -> SqlReturn {
+    if stmt_state.current_row_last_col >= col_index
+        || stmt_state
+            .last_captured
+            .as_ref()
+            .is_none_or(|(column, _)| *column != col_index)
+    {
+        stmt_state.captured_plp_wire = None;
+    }
     let ready = stmt_state.current_row_last_col == col_index
         && col_index == stmt_state.column_metadata.len()
         && stmt_state.active_plp.is_none();
@@ -1050,6 +1058,102 @@ fn resolve_default_target(
     target_type
 }
 
+fn prepare_captured_plp_text(
+    state: &mut StmtState,
+    col_index: usize,
+    target_type: SqlSmallInt,
+) -> Result<(), DiagMsg> {
+    normalize_captured_plp_suffix(state, col_index, target_type)?;
+    if state
+        .captured_plp_wire
+        .as_ref()
+        .is_none_or(|wire| wire.column != col_index)
+    {
+        return Ok(());
+    }
+    let encoding = match target_type {
+        SQL_C_WCHAR => EncodingType::Utf16,
+        SQL_C_CHAR => EncodingType::Utf8,
+        _ => return Ok(()),
+    };
+    let Some((_, ColumnValues::String(value))) = state.last_captured.as_mut() else {
+        return Err(ERR_INTERNAL_CONVERSION);
+    };
+    if value.encoding_type() == &encoding {
+        return Ok(());
+    }
+    let mut bytes = Vec::new();
+    if target_type == SQL_C_WCHAR {
+        let text = std::str::from_utf8(&value.bytes).map_err(|_| ERR_INVALID_CHARACTER_VALUE)?;
+        reserve_typed_plp_bytes(&mut bytes, text.encode_utf16().count() * 2)?;
+        bytes.extend(text.encode_utf16().flat_map(u16::to_le_bytes));
+    } else {
+        let units = value
+            .bytes
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]));
+        let chars = char::decode_utf16(units).map(|ch| ch.unwrap_or(char::REPLACEMENT_CHARACTER));
+        reserve_typed_plp_bytes(&mut bytes, chars.clone().map(char::len_utf8).sum())?;
+        for ch in chars {
+            bytes.extend_from_slice(ch.encode_utf8(&mut [0; 4]).as_bytes());
+        }
+    }
+    *value = SqlString::new(bytes, encoding);
+    state.direct_text_target = Some((col_index, target_type));
+    Ok(())
+}
+
+fn normalize_captured_plp_suffix(
+    state: &mut StmtState,
+    col_index: usize,
+    target_type: SqlSmallInt,
+) -> Result<(), DiagMsg> {
+    let Some(previous_target) = state
+        .captured_plp_wire
+        .as_ref()
+        .filter(|wire| wire.column == col_index)
+        .and_then(|wire| wire.text_target)
+    else {
+        return Ok(());
+    };
+    if target_type == SQL_C_BINARY || target_type == previous_target {
+        return Ok(());
+    }
+    let offset = state
+        .partial_text_offset
+        .filter(|(column, _)| *column == col_index)
+        .map_or(0, |(_, offset)| offset);
+    let Some((_, ColumnValues::String(value))) = state.last_captured.as_mut() else {
+        return Err(ERR_INTERNAL_CONVERSION);
+    };
+    // Normalize only on a target switch; same-target chunking keeps its offset
+    // and avoids repeatedly moving the remainder of a large value.
+    if offset != 0 {
+        let encoding = if previous_target == SQL_C_WCHAR {
+            EncodingType::Utf16
+        } else {
+            EncodingType::Utf8
+        };
+        if value.encoding_type() != &encoding {
+            return Err(ERR_INTERNAL_CONVERSION);
+        }
+        let byte_offset = if previous_target == SQL_C_WCHAR {
+            offset.saturating_mul(2)
+        } else {
+            offset
+        };
+        value.bytes.drain(..byte_offset.min(value.bytes.len()));
+        // A byte/surrogate fragment is still readable in its original target.
+        // A different encoding or typed conversion must validate that fragment.
+        state.direct_text_target = Some((col_index, previous_target));
+    }
+    state.partial_text_offset = None;
+    if let Some(wire) = state.captured_plp_wire.as_mut() {
+        wire.text_target = None;
+    }
+    Ok(())
+}
+
 fn write_captured_column(
     stmt_state: &mut crate::handles::stmt::StmtState,
     col_index: usize,
@@ -1081,6 +1185,11 @@ fn write_captured_column(
         return SQL_ERROR;
     }
 
+    if let Err(diag) = prepare_captured_plp_text(stmt_state, col_index, target_type) {
+        post_diag(stmt_state, diag);
+        return SQL_ERROR;
+    }
+
     // Output buffer capacity in element units (u8 for SQL_C_CHAR, SqlWChar for
     // SQL_C_WCHAR). buffer_length is always in bytes per the ODBC spec.
     let buf_elements = if target_type == SQL_C_WCHAR {
@@ -1106,18 +1215,9 @@ fn write_captured_column(
             post_diag(stmt_state, ERR_INDICATOR_REQUIRED);
             return SQL_ERROR;
         }
+        // msodbcsql's InternalGetColData (sqlcdata.h) skips character termination
+        // on fIsNullData by jumping to Return2, not Return3.
         unsafe { write_if_some(strlen_or_ind_ptr, SQL_NULL_DATA) };
-        // Only character targets get a terminator; a fixed-width target's
-        // buffer is left untouched on NULL.
-        if target_type == SQL_C_WCHAR {
-            unsafe {
-                copy_with_nul(target_value_ptr as *mut SqlWChar, buf_elements, &[]);
-            }
-        } else if target_type == SQL_C_CHAR {
-            unsafe {
-                copy_with_nul(target_value_ptr as *mut u8, buf_elements, &[]);
-            }
-        }
         stmt_state.last_captured = None;
         stmt_state.partial_text_offset = None;
         stmt_state.current_row_last_col = col_index;
@@ -1169,12 +1269,11 @@ fn write_captured_column(
         // `SQLGetData(SQL_C_BINARY, NULL, 0)` with `SQL_SUCCESS_WITH_INFO` /
         // `01004` / indicator 9, while an empty `varbinary` answers
         // `SQL_SUCCESS` and reports `SQL_NO_DATA` on a repeat.
-        let offset = stmt_state
-            .partial_text_offset
-            .filter(|(column, _)| *column == col_index)
-            .map(|(_, offset)| offset)
-            .unwrap_or(0);
-        let available = remaining_binary_length(value, offset);
+        let offset = captured_binary_offset(stmt_state, col_index);
+        let available = captured_column_bytes(stmt_state, col_index).map_or_else(
+            || remaining_binary_length(value, offset),
+            |bytes| SqlLen::try_from(bytes.len().saturating_sub(offset)).unwrap_or(SqlLen::MAX),
+        );
         // SAFETY: `strlen_or_ind_ptr` is null or valid for one `SqlLen` write
         // per the SQLGetData contract.
         let rc = unsafe { answer_binary_probe(stmt_state, available, strlen_or_ind_ptr) };
@@ -1223,7 +1322,11 @@ fn write_captured_column(
         .filter(|(c, _)| *c == col_index)
         .map(|(_, o)| o)
         .unwrap_or(0);
-    let direct_validated = stmt_state.direct_text_target == Some((col_index, target_type));
+    let direct_validated = stmt_state.direct_text_target == Some((col_index, target_type))
+        || stmt_state
+            .captured_plp_wire
+            .as_ref()
+            .is_some_and(|wire| wire.column == col_index);
     // SAFETY: `buf_elements` is `buffer_length` converted to the element unit of
     // `target_type`, so `target_value_ptr` is null or writable for that many
     // elements; `strlen_or_ind_ptr` is null or writable for one `SqlLen`.
@@ -1248,6 +1351,9 @@ fn write_captured_column(
         if truncated && consumed < remaining {
             stmt_state.partial_text_offset = Some((col_index, offset + consumed));
             stmt_state.direct_text_target = Some((col_index, target_type));
+            if let Some(wire) = stmt_state.captured_plp_wire.as_mut() {
+                wire.text_target = Some(target_type);
+            }
         } else {
             stmt_state.current_row_last_col = col_index;
             retain_completed_buffered_value(stmt_state, col_index);
@@ -1321,6 +1427,9 @@ fn write_captured_column(
         // Truncated: remember where to resume and keep the column addressable —
         // do NOT mark it consumed, so the next SQLGetData continues it.
         stmt_state.partial_text_offset = Some((col_index, offset + consumed));
+        if let Some(wire) = stmt_state.captured_plp_wire.as_mut() {
+            wire.text_target = Some(target_type);
+        }
     } else if rc != SQL_ERROR {
         // Fully delivered: the column is done.
         stmt_state.current_row_last_col = col_index;
@@ -1618,6 +1727,10 @@ struct PlpReadProgress {
     retry_bytes: usize,
     completing_surrogate: bool,
     completing_narrow: bool,
+    typed_bytes: Vec<u8>,
+    typed_wire: Vec<u8>,
+    typed_scratch: Vec<u8>,
+    typed_error: Option<DiagMsg>,
 }
 
 /// Reads and returns one SQLGetData chunk directly from the active PLP stream.
@@ -1677,7 +1790,12 @@ fn stream_active_plp_chunk_once<'a>(
     let retry_bytes = std::mem::take(&mut progress.retry_bytes);
     let completing_surrogate = std::mem::take(&mut progress.completing_surrogate);
     let completing_narrow = std::mem::take(&mut progress.completing_narrow);
-    if target_type != SQL_C_CHAR && target_type != SQL_C_WCHAR && target_type != SQL_C_BINARY {
+    let typed_target = is_typed_c_target(target_type);
+    if !typed_target
+        && target_type != SQL_C_CHAR
+        && target_type != SQL_C_WCHAR
+        && target_type != SQL_C_BINARY
+    {
         if let Some(mut state) = retained_stmt_state.take() {
             post_sql_error(
                 &mut state,
@@ -1701,6 +1819,8 @@ fn stream_active_plp_chunk_once<'a>(
         {
             let decoder_ready = narrow_encoding.is_some();
             let compatible = match (target_type, encoding) {
+                (_, PlpEncoding::Utf16Text | PlpEncoding::Utf8Text) if typed_target => true,
+                (_, PlpEncoding::SingleByteText) if typed_target => decoder_ready,
                 (SQL_C_WCHAR, PlpEncoding::Utf16Text) => true,
                 (SQL_C_WCHAR, PlpEncoding::SingleByteText | PlpEncoding::Utf8Text) => decoder_ready,
                 (
@@ -1776,6 +1896,9 @@ fn stream_active_plp_chunk_once<'a>(
                         }),
                     _ => None,
                 };
+                // The TDS cursor is already paused inside this value. Preserve
+                // that position even if conversion is rejected, so a retry does
+                // not resume the row cursor and drain the unread value.
                 stmt_state.active_plp =
                     Some(ActivePlpStream::new(col_index, encoding, narrow_encoding));
                 stmt_state.current_row_last_col = col_index;
@@ -1817,6 +1940,8 @@ fn stream_active_plp_chunk_once<'a>(
             let narrow_encoding = stream.and_then(|s| s.narrow_encoding);
             let decoder_ready = narrow_encoding.is_some();
             let compatible = match (target_type, encoding) {
+                (_, Some(PlpEncoding::Utf16Text | PlpEncoding::Utf8Text)) if typed_target => true,
+                (_, Some(PlpEncoding::SingleByteText)) if typed_target => decoder_ready,
                 (SQL_C_WCHAR, Some(PlpEncoding::Utf16Text)) => true,
                 (SQL_C_WCHAR, Some(PlpEncoding::SingleByteText | PlpEncoding::Utf8Text)) => {
                     decoder_ready
@@ -1911,7 +2036,11 @@ fn stream_active_plp_chunk_once<'a>(
             .wrapping_add(progress.written)
             .cast()
     };
-    let payload_capacity = (buffer_length as usize).saturating_sub(terminator_bytes);
+    let payload_capacity = if typed_target {
+        TYPED_PLP_CHUNK_BYTES
+    } else {
+        (buffer_length as usize).saturating_sub(terminator_bytes)
+    };
     let widen_out_units = if widen_narrow_to_utf16 {
         payload_capacity / std::mem::size_of::<SqlWChar>()
     } else {
@@ -2001,7 +2130,7 @@ fn stream_active_plp_chunk_once<'a>(
     if retry_bytes == 0 {
         progress.carry_before = carried_bytes;
     }
-    let prefix_bytes = if target_type != SQL_C_BINARY && carried_bytes > 0 {
+    let prefix_bytes = if !typed_target && target_type != SQL_C_BINARY && carried_bytes > 0 {
         let mut state = match retained_stmt_state.take() {
             Some(state) => state,
             None => {
@@ -2027,6 +2156,10 @@ fn stream_active_plp_chunk_once<'a>(
             carried_bytes.min(capacity)
         };
         if emit > 0 {
+            if !stream.pending_units.is_empty() {
+                debug_assert!(stream.pending_bytes.is_empty() || stream.pending_bytes_utf16);
+                stream.pending_bytes_utf16 = true;
+            }
             stream
                 .pending_bytes
                 .extend(stream.pending_units.drain(..).flat_map(u16::to_le_bytes));
@@ -2041,6 +2174,9 @@ fn stream_active_plp_chunk_once<'a>(
                 );
             }
             stream.pending_bytes.drain(..emit);
+            if stream.pending_bytes.is_empty() {
+                stream.pending_bytes_utf16 = false;
+            }
         }
         retained_stmt_state = Some(state);
         emit
@@ -2099,8 +2235,33 @@ fn stream_active_plp_chunk_once<'a>(
     let direct_wire_output =
         max_read > 0 && !target_value_ptr.is_null() && !staged_binary_read && wire_shaped_output;
     let mut inline_payload = [0_u8; 256];
-    let mut heap_payload = Vec::new();
-    let payload = if direct_wire_output {
+    let mut heap_payload = if typed_target {
+        std::mem::take(&mut progress.typed_scratch)
+    } else {
+        Vec::new()
+    };
+    let payload = if typed_target {
+        if heap_payload.is_empty()
+            && progress
+                .typed_error
+                .is_none_or(|diag| diag.state != SQLSTATE_HY001)
+        {
+            if heap_payload
+                .try_reserve_exact(TYPED_PLP_CHUNK_BYTES)
+                .is_ok()
+            {
+                heap_payload.resize(TYPED_PLP_CHUNK_BYTES, 0);
+            } else {
+                progress.typed_error.get_or_insert(ERR_MEMORY_ALLOCATION);
+            }
+        }
+        if heap_payload.is_empty() {
+            // Allocation failure must still drain without allocating again.
+            inline_payload.as_mut_slice()
+        } else {
+            heap_payload.as_mut_slice()
+        }
+    } else if direct_wire_output {
         // The application owns this writable buffer for the duration of the ODBC
         // call. Initialize it before forming a byte slice because ODBC output
         // buffers may contain uninitialized storage; `max_read` reserves the
@@ -2302,6 +2463,80 @@ fn stream_active_plp_chunk_once<'a>(
         }
     };
 
+    if typed_target {
+        let mut state = match retained_stmt_state.take() {
+            Some(state) => state,
+            None => {
+                let Ok(state) = stmt.inner.lock() else {
+                    return SQL_ERROR;
+                };
+                state
+            }
+        };
+        if progress.typed_error.is_none() {
+            // The PLP header includes bytes consumed by earlier character reads.
+            let consumed_before = total_read
+                .saturating_sub(read)
+                .saturating_sub(progress.wire_read);
+            let remaining_total = known_total
+                .and_then(|total| total.checked_sub(u64::try_from(consumed_before).ok()?));
+            if typed_plp_chunk_fits(progress.wire_read, read, remaining_total) {
+                progress.wire_read += read;
+                let Some(stream) = state.active_plp.as_mut() else {
+                    post_diag(&mut state, ERR_INTERNAL_CONVERSION);
+                    return SQL_ERROR;
+                };
+                progress.typed_error = reserve_typed_plp_bytes(&mut progress.typed_wire, read)
+                    .and_then(|()| {
+                        progress.typed_wire.extend_from_slice(&payload[..read]);
+                        append_typed_plp_text(
+                            stream,
+                            &payload[..read],
+                            reached_end,
+                            &mut progress.typed_bytes,
+                        )
+                    })
+                    .err();
+            } else {
+                progress.typed_error = Some(ERR_PLP_TYPED_LIMIT);
+            }
+        }
+        progress.typed_scratch = heap_payload;
+        if !reached_end {
+            progress.retry_bytes = TYPED_PLP_CHUNK_BYTES;
+            return SQL_SUCCESS_WITH_INFO;
+        }
+        state.active_plp = None;
+        if let Some(diag) = progress.typed_error {
+            post_diag(&mut state, diag);
+            return finish_get_data(stmt, statement_handle, state, col_index, SQL_ERROR);
+        }
+        state.last_captured = Some((
+            col_index,
+            ColumnValues::String(SqlString::new(
+                std::mem::take(&mut progress.typed_bytes),
+                EncodingType::Utf8,
+            )),
+        ));
+        state.captured_plp_wire = Some(CapturedPlpWire {
+            column: col_index,
+            bytes: std::mem::take(&mut progress.typed_wire),
+            offset: 0,
+            text_target: None,
+        });
+        state.current_row_last_col = col_index - 1;
+        state.partial_text_offset = None;
+        let rc = write_captured_column(
+            &mut state,
+            col_index,
+            target_type,
+            target_value_ptr,
+            buffer_length,
+            application_indicator,
+        );
+        return finish_get_data(stmt, statement_handle, state, col_index, rc);
+    }
+
     if widen_narrow_to_utf16 || transcode_utf16_to_utf8 || transcode_narrow_to_utf8 {
         drop(retained_stmt_state.take());
     }
@@ -2323,6 +2558,7 @@ fn stream_active_plp_chunk_once<'a>(
             stream.ensure_narrow_decoder();
             let ActivePlpStream {
                 narrow_decoder,
+                narrow_decoder_finished,
                 pending_units,
                 ..
             } = stream;
@@ -2338,6 +2574,9 @@ fn stream_active_plp_chunk_once<'a>(
                 reached_end,
                 widen_out_units,
             );
+            // The helper skips empty final input; `read` counts wire bytes,
+            // not decoded output. Only an actual final decode sets this flag.
+            *narrow_decoder_finished |= reached_end && read != 0;
             decoded_output = pending_units.len() > pending_before;
             unsafe {
                 copy_with_nul(
@@ -2507,6 +2746,7 @@ fn stream_active_plp_chunk_once<'a>(
             stream.ensure_narrow_decoder();
             let ActivePlpStream {
                 narrow_decoder,
+                narrow_decoder_finished,
                 pending_bytes: pending_utf8,
                 ..
             } = stream;
@@ -2522,6 +2762,9 @@ fn stream_active_plp_chunk_once<'a>(
                 reached_end,
                 payload_capacity,
             );
+            // Like widening, this helper skips empty final input. Preserve any
+            // earlier finalization while draining already-decoded carry.
+            *narrow_decoder_finished |= reached_end && read != 0;
             decoded_output = pending_utf8.len() > pending_before;
             unsafe {
                 copy_with_nul(
@@ -2789,6 +3032,166 @@ pub(crate) fn converted_narrow_indicator(
         let converted = u64::try_from(converted_bytes).unwrap_or(u64::MAX);
         SqlLen::try_from(remaining.saturating_add(converted)).unwrap_or(SqlLen::MAX)
     })
+}
+
+fn reserve_typed_plp_bytes(bytes: &mut Vec<u8>, additional: usize) -> Result<(), DiagMsg> {
+    #[cfg(test)]
+    let additional = tests::typed_plp_reserve_size(additional);
+    bytes
+        .try_reserve(additional)
+        .map_err(|_| ERR_MEMORY_ALLOCATION)
+}
+
+fn append_typed_plp_text(
+    stream: &mut ActivePlpStream,
+    payload: &[u8],
+    reached_end: bool,
+    bytes: &mut Vec<u8>,
+) -> Result<(), DiagMsg> {
+    if stream.pending_bytes_utf16 {
+        // An odd carry starts with the high byte of a unit whose low byte
+        // was already delivered. Do not pair it with the next code unit.
+        let partial_unit = stream.pending_bytes.len() % 2;
+        if partial_unit != 0 {
+            reserve_typed_plp_bytes(bytes, char::REPLACEMENT_CHARACTER.len_utf8())?;
+            bytes.extend_from_slice(
+                char::REPLACEMENT_CHARACTER
+                    .encode_utf8(&mut [0; 4])
+                    .as_bytes(),
+            );
+        }
+        append_typed_utf16(
+            &stream.pending_bytes[partial_unit..],
+            true,
+            &mut None,
+            &mut None,
+            bytes,
+        )?;
+    } else {
+        reserve_typed_plp_bytes(bytes, stream.pending_bytes.len())?;
+        bytes.extend_from_slice(&stream.pending_bytes);
+    }
+    stream.pending_bytes.clear();
+    stream.pending_bytes_utf16 = false;
+    if !stream.pending_units.is_empty() {
+        let bound = stream
+            .pending_units
+            .len()
+            .checked_mul(3)
+            .ok_or(ERR_MEMORY_ALLOCATION)?;
+        reserve_typed_plp_bytes(bytes, bound)?;
+        for ch in char::decode_utf16(stream.pending_units.iter().copied()) {
+            bytes.extend_from_slice(
+                ch.unwrap_or(char::REPLACEMENT_CHARACTER)
+                    .encode_utf8(&mut [0; 4])
+                    .as_bytes(),
+            );
+        }
+        stream.pending_units.clear();
+    }
+    match stream.encoding {
+        PlpEncoding::Utf16Text => {
+            append_typed_utf16(
+                payload,
+                reached_end,
+                &mut stream.pending_byte,
+                &mut stream.pending_high_surrogate,
+                bytes,
+            )?;
+        }
+        PlpEncoding::SingleByteText | PlpEncoding::Utf8Text => {
+            if stream.narrow_decoder.is_none() {
+                #[cfg(test)]
+                if tests::typed_plp_decoder_allocation_fails() {
+                    return Err(ERR_MEMORY_ALLOCATION);
+                }
+                stream.narrow_decoder = Some(
+                    stream
+                        .narrow_encoding
+                        .ok_or(ERR_INTERNAL_CONVERSION)?
+                        .try_new_decoder_without_bom_handling()
+                        .ok_or(ERR_MEMORY_ALLOCATION)?,
+                );
+                stream.narrow_decoder_finished = false;
+            }
+            if stream.narrow_decoder_finished {
+                return if payload.is_empty() && reached_end {
+                    Ok(())
+                } else {
+                    Err(ERR_INTERNAL_CONVERSION)
+                };
+            }
+            let decoder = stream
+                .narrow_decoder
+                .as_mut()
+                .ok_or(ERR_INTERNAL_CONVERSION)?;
+            let bound = decoder
+                .max_utf8_buffer_length(payload.len())
+                .ok_or(ERR_MEMORY_ALLOCATION)?;
+            reserve_typed_plp_bytes(bytes, bound)?;
+            let base = bytes.len();
+            bytes.resize(base + bound, 0);
+            let (result, consumed, written, _) =
+                decoder.decode_to_utf8(payload, &mut bytes[base..], reached_end);
+            bytes.truncate(base + written);
+            if result != encoding_rs::CoderResult::InputEmpty || consumed != payload.len() {
+                return Err(ERR_INTERNAL_CONVERSION);
+            }
+            // Unlike the character helpers, typed decoding flushes empty final
+            // input too; the guard above prevents finalizing that decoder twice.
+            stream.narrow_decoder_finished = reached_end;
+        }
+        PlpEncoding::Binary => return Err(ERR_INTERNAL_CONVERSION),
+    }
+    Ok(())
+}
+
+fn append_typed_utf16(
+    payload: &[u8],
+    reached_end: bool,
+    pending_byte: &mut Option<u8>,
+    pending_high: &mut Option<u16>,
+    output: &mut Vec<u8>,
+) -> Result<(), DiagMsg> {
+    let bound = payload
+        .len()
+        .checked_add(2)
+        .and_then(|len| len.checked_mul(3))
+        .ok_or(ERR_MEMORY_ALLOCATION)?;
+    reserve_typed_plp_bytes(output, bound)?;
+    let mut emit = |ch: char| {
+        output.extend_from_slice(ch.encode_utf8(&mut [0; 4]).as_bytes());
+    };
+    for &byte in payload {
+        let Some(low) = pending_byte.take() else {
+            *pending_byte = Some(byte);
+            continue;
+        };
+        let unit = u16::from_le_bytes([low, byte]);
+        if let Some(high) = pending_high.take() {
+            if (0xdc00..=0xdfff).contains(&unit) {
+                let scalar =
+                    0x10000 + ((u32::from(high) - 0xd800) << 10) + u32::from(unit) - 0xdc00;
+                emit(char::from_u32(scalar).unwrap_or(char::REPLACEMENT_CHARACTER));
+                continue;
+            }
+            emit(char::REPLACEMENT_CHARACTER);
+        }
+        if is_high_surrogate(unit) {
+            *pending_high = Some(unit);
+        } else {
+            emit(char::from_u32(u32::from(unit)).unwrap_or(char::REPLACEMENT_CHARACTER));
+        }
+    }
+    if reached_end {
+        if pending_high.take().is_some() {
+            emit(char::REPLACEMENT_CHARACTER);
+        }
+        if pending_byte.take().is_some() {
+            emit(char::REPLACEMENT_CHARACTER);
+        }
+    }
+    Ok(())
 }
 
 /// Decodes one chunk of narrow PLP wire bytes to UTF-16 for `SQL_C_WCHAR`
@@ -3068,6 +3471,35 @@ pub(crate) fn column_value_to_bytes(value: &ColumnValues) -> Option<&[u8]> {
     }
 }
 
+fn captured_column_bytes(stmt_state: &StmtState, col_index: usize) -> Option<&[u8]> {
+    if let Some(wire) = stmt_state
+        .captured_plp_wire
+        .as_ref()
+        .filter(|wire| wire.column == col_index)
+    {
+        return Some(&wire.bytes);
+    }
+    stmt_state
+        .last_captured
+        .as_ref()
+        .filter(|(column, _)| *column == col_index)
+        .and_then(|(_, value)| column_value_to_bytes(value))
+}
+
+fn captured_binary_offset(stmt_state: &StmtState, col_index: usize) -> usize {
+    if let Some(wire) = stmt_state
+        .captured_plp_wire
+        .as_ref()
+        .filter(|wire| wire.column == col_index)
+    {
+        return wire.offset;
+    }
+    stmt_state
+        .partial_text_offset
+        .filter(|(column, _)| *column == col_index)
+        .map_or(0, |(_, offset)| offset)
+}
+
 /// Byte count a value would occupy in its `SQL_C_BINARY` form, for the length
 /// probe. `SQL_NO_TOTAL` where the binary encoding is not fixed by the value
 /// alone, so there is no length to promise for those; `column_value_to_bytes`
@@ -3114,7 +3546,7 @@ unsafe fn deliver_captured_binary(
     buffer_length: SqlLen,
     strlen_or_ind_ptr: *mut SqlLen,
 ) -> SqlReturn {
-    let Some((_, value)) = stmt_state.last_captured.as_ref() else {
+    if stmt_state.last_captured.is_none() {
         post_sql_error(
             stmt_state,
             SQLSTATE_24000,
@@ -3122,8 +3554,8 @@ unsafe fn deliver_captured_binary(
             "Requested column is not available in the current row",
         );
         return SQL_ERROR;
-    };
-    let Some(bytes) = column_value_to_bytes(value) else {
+    }
+    let Some(bytes) = captured_column_bytes(stmt_state, col_index) else {
         // Left resident so a retry with a target this driver delivers can work.
         post_sql_error(
             stmt_state,
@@ -3134,12 +3566,7 @@ unsafe fn deliver_captured_binary(
         return SQL_ERROR;
     };
 
-    let offset = stmt_state
-        .partial_text_offset
-        .filter(|(c, _)| *c == col_index)
-        .map(|(_, o)| o)
-        .unwrap_or(0)
-        .min(bytes.len());
+    let offset = captured_binary_offset(stmt_state, col_index).min(bytes.len());
     let remaining = bytes.len() - offset;
     let capacity = usize::try_from(buffer_length).unwrap_or(0);
     let take = remaining.min(capacity);
@@ -3161,7 +3588,15 @@ unsafe fn deliver_captured_binary(
     };
 
     if take < remaining {
-        stmt_state.partial_text_offset = Some((col_index, offset + take));
+        if let Some(wire) = stmt_state
+            .captured_plp_wire
+            .as_mut()
+            .filter(|wire| wire.column == col_index)
+        {
+            wire.offset = offset + take;
+        } else {
+            stmt_state.partial_text_offset = Some((col_index, offset + take));
+        }
         stmt_state.direct_text_target = None;
         post_diag(stmt_state, WARN_STRING_TRUNCATION);
         return SQL_SUCCESS_WITH_INFO;
@@ -3223,6 +3658,14 @@ pub(crate) unsafe fn convert_typed_c(
     target_value_ptr: SqlPointer,
     strlen_or_ind_ptr: *mut SqlLen,
 ) -> Result<ConvOk, ConvError> {
+    if matches!(value, ColumnValues::String(text) if text.bytes.is_empty())
+        && (is_integer_c_target(target_type)
+            || is_float_c_target(target_type)
+            || target_type == SQL_C_GUID)
+    {
+        unsafe { write_if_some(strlen_or_ind_ptr, 0) };
+        return Ok(ConvOk::Exact);
+    }
     unsafe {
         if is_integer_c_target(target_type) {
             convert_integer_c(value, target_type, target_value_ptr, strlen_or_ind_ptr)
@@ -3250,6 +3693,14 @@ fn finish_typed_conv(
         }
         Err(ConvError::OutOfRange) => {
             post_diag(stmt_state, ERR_NUMERIC_OUT_OF_RANGE);
+            SQL_ERROR
+        }
+        Err(ConvError::InvalidDatetimeFormat) => {
+            post_diag(stmt_state, ERR_INVALID_DATETIME_FORMAT);
+            SQL_ERROR
+        }
+        Err(ConvError::DatetimeFieldOverflow) => {
+            post_diag(stmt_state, ERR_DATETIME_FIELD_OVERFLOW);
             SQL_ERROR
         }
         Err(ConvError::Restricted) => {
@@ -3426,7 +3877,7 @@ pub(crate) fn column_value_to_text(v: &ColumnValues) -> Result<String, TextError
         | ColumnValues::DateTimeOffset(_)
         | ColumnValues::SmallDateTime(_) => extract_datetime_parts(v)
             .map(|p| format_datetime_parts(&p))
-            .ok_or(TextError::Unsupported),
+            .map_err(|_| TextError::Unsupported),
         ColumnValues::Null => Ok(String::new()),
     }
 }
@@ -3444,6 +3895,35 @@ mod tests {
     use mssql_tds::datatypes::sqldatatypes::TdsDataType;
     use mssql_tds::test_client_support::{int_columns, tds_client_from_int_rows};
 
+    thread_local! {
+        static FAIL_TYPED_PLP_RESERVE_AFTER: std::cell::Cell<Option<usize>> =
+            const { std::cell::Cell::new(None) };
+        static FAIL_TYPED_PLP_DECODER_ALLOCATION: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+    }
+
+    pub(super) fn typed_plp_decoder_allocation_fails() -> bool {
+        FAIL_TYPED_PLP_DECODER_ALLOCATION.replace(false)
+    }
+
+    pub(super) fn typed_plp_reserve_size(additional: usize) -> usize {
+        if additional == 0 {
+            return additional;
+        }
+        FAIL_TYPED_PLP_RESERVE_AFTER.with(|remaining| match remaining.get() {
+            Some(0) => {
+                remaining.set(None);
+                // Trigger a real TryReserveError without exhausting process memory.
+                usize::MAX
+            }
+            Some(count) => {
+                remaining.set(Some(count - 1));
+                additional
+            }
+            None => additional,
+        })
+    }
+
     /// Assert the most recent diagnostic matches the expected canonical
     /// SQLSTATE and message text (the message is prefixed by the driver, so we
     /// match on a substring).
@@ -3459,6 +3939,18 @@ mod tests {
     }
 
     #[test]
+    fn temporal_overflow_backstop_maps_to_22008() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let mut state = stmt.inner.lock().unwrap();
+        assert_eq!(
+            finish_typed_conv(&mut state, Err(ConvError::DatetimeFieldOverflow)),
+            SQL_ERROR
+        );
+        assert_last_diag(&state.diag_records, ERR_DATETIME_FIELD_OVERFLOW);
+    }
+
+    #[test]
     fn internal_typed_conversion_failure_posts_driver_error() {
         let h = TestHandles::with_env_dbc_stmt();
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
@@ -3469,6 +3961,40 @@ mod tests {
             SQL_ERROR
         );
         assert_last_diag(&state.diag_records, ERR_INTERNAL_CONVERSION);
+    }
+
+    #[test]
+    fn empty_text_typed_outputs_match_the_target_family() {
+        for encoding in [EncodingType::Utf8, EncodingType::Utf16] {
+            for target in [SQL_C_SLONG, SQL_C_DOUBLE, SQL_C_GUID, SQL_C_TYPE_TIMESTAMP] {
+                let handles = TestHandles::with_env_dbc_stmt();
+                stmt_with_buffered_string(&handles, SqlString::new(Vec::new(), encoding));
+                let mut output = [0xcc_u8; 32];
+                let mut indicator = -99;
+                let result = unsafe {
+                    sql_get_data(
+                        handles.stmt,
+                        1,
+                        target,
+                        output.as_mut_ptr().cast(),
+                        0,
+                        &mut indicator,
+                    )
+                };
+                assert_eq!(output, [0xcc; 32]);
+                if target == SQL_C_TYPE_TIMESTAMP {
+                    assert_eq!(result, SQL_ERROR);
+                    let stmt = unsafe { handle_from_raw::<StmtHandle>(handles.stmt) };
+                    assert_last_diag(
+                        &stmt.inner.lock().unwrap().diag_records,
+                        ERR_INVALID_CHARACTER_VALUE,
+                    );
+                } else {
+                    assert_eq!(result, SQL_SUCCESS);
+                    assert_eq!(indicator, 0);
+                }
+            }
+        }
     }
 
     #[test]
@@ -6139,6 +6665,84 @@ mod tests {
         assert_eq!(ind, SQL_NULL_DATA);
     }
 
+    #[test]
+    fn get_data_null_preserves_character_buffers_and_retry_state() {
+        for target in [SQL_C_CHAR, SQL_C_WCHAR] {
+            for capacity in [0, 1, 2, 3, 32] {
+                for buffered in [false, true] {
+                    let h = TestHandles::with_env_dbc_stmt();
+                    if buffered {
+                        stmt_with_buffered_values(
+                            &h,
+                            vec![ColumnValues::Null, ColumnValues::Int(42)],
+                        );
+                    } else {
+                        stmt_with_captured(&h, ColumnValues::Null);
+                    }
+                    let mut buffer = [0x7Eu8; 34];
+                    let ptr = unsafe { buffer.as_mut_ptr().add(1) }.cast();
+                    assert_eq!(
+                        unsafe {
+                            crate::api::exports::SQLGetData(
+                                h.stmt,
+                                1,
+                                target,
+                                ptr,
+                                capacity,
+                                std::ptr::null_mut(),
+                            )
+                        },
+                        SQL_ERROR
+                    );
+                    assert_eq!(buffer, [0x7E; 34]);
+                    let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+                    {
+                        let state = stmt.inner.lock().unwrap();
+                        assert_last_diag(&state.diag_records, ERR_INDICATOR_REQUIRED);
+                        assert_eq!(state.current_row_last_col, 0);
+                    }
+                    let mut indicator = -99;
+                    assert_eq!(
+                        unsafe {
+                            crate::api::exports::SQLGetData(
+                                h.stmt,
+                                1,
+                                target,
+                                ptr,
+                                capacity,
+                                &mut indicator,
+                            )
+                        },
+                        SQL_SUCCESS
+                    );
+                    assert_eq!(indicator, SQL_NULL_DATA);
+                    assert_eq!(buffer, [0x7E; 34]);
+                    {
+                        let state = stmt.inner.lock().unwrap();
+                        assert!(state.diag_records.is_empty());
+                        assert!(state.last_captured.is_none());
+                        assert!(state.partial_text_offset.is_none());
+                        assert_eq!(state.current_row_last_col, 1);
+                    }
+                    assert_eq!(
+                        unsafe {
+                            crate::api::exports::SQLGetData(
+                                h.stmt,
+                                1,
+                                target,
+                                ptr,
+                                capacity,
+                                &mut indicator,
+                            )
+                        },
+                        SQL_NO_DATA
+                    );
+                    assert_eq!(buffer, [0x7E; 34]);
+                }
+            }
+        }
+    }
+
     /// SQLGetData on a NULL reports SQL_NULL_DATA for any valid C target and
     /// leaves a fixed-width buffer untouched. The buffer is nonzero-length, so
     /// this is a data fetch rather than the SQL_C_BINARY length probe above.
@@ -6701,7 +7305,7 @@ mod tests {
     }
 
     /// The same rule applies to character targets: a NULL with no indicator is
-    /// still 22002, even though a terminator could otherwise be written.
+    /// still 22002.
     #[test]
     fn get_data_char_null_without_indicator_reports_22002() {
         let h = TestHandles::with_env_dbc_stmt();
@@ -6805,6 +7409,311 @@ mod tests {
         };
         assert_eq!(ret, SQL_SUCCESS);
         assert_eq!(out, 2);
+    }
+
+    #[test]
+    fn exported_get_data_temporal_errors_preserve_outputs() {
+        use crate::api::odbc_types::SQL_C_TYPE_TIME;
+        use mssql_tds::datatypes::column_values::{
+            SqlDateTime, SqlDateTime2, SqlDateTimeOffset, SqlSmallDateTime, SqlTime,
+        };
+
+        let midnight = SqlTime {
+            time_nanoseconds: 0,
+            scale: 7,
+        };
+        let invalid_time = SqlTime {
+            time_nanoseconds: 864_000_000_000,
+            scale: 7,
+        };
+        let invalid_scale = SqlTime {
+            time_nanoseconds: 0,
+            scale: 8,
+        };
+        let values = [
+            ColumnValues::Time(invalid_scale.clone()),
+            ColumnValues::DateTime2(SqlDateTime2 {
+                days: 0,
+                time: invalid_scale.clone(),
+            }),
+            ColumnValues::DateTimeOffset(SqlDateTimeOffset {
+                datetime2: SqlDateTime2 {
+                    days: 0,
+                    time: invalid_scale,
+                },
+                offset: 0,
+            }),
+            ColumnValues::Time(invalid_time.clone()),
+            ColumnValues::DateTime2(SqlDateTime2 {
+                days: 3_652_059,
+                time: midnight.clone(),
+            }),
+            ColumnValues::DateTime2(SqlDateTime2 {
+                days: 0,
+                time: invalid_time,
+            }),
+            ColumnValues::DateTimeOffset(SqlDateTimeOffset {
+                datetime2: SqlDateTime2 {
+                    days: 0,
+                    time: midnight.clone(),
+                },
+                offset: -1,
+            }),
+            ColumnValues::DateTimeOffset(SqlDateTimeOffset {
+                datetime2: SqlDateTime2 {
+                    days: 3_652_058,
+                    time: SqlTime {
+                        time_nanoseconds: 863_999_999_999,
+                        scale: 7,
+                    },
+                },
+                offset: 1,
+            }),
+            ColumnValues::DateTime(SqlDateTime {
+                days: i32::MAX,
+                time: 0,
+            }),
+            ColumnValues::DateTime(SqlDateTime {
+                days: -53_691,
+                time: 0,
+            }),
+            ColumnValues::DateTime(SqlDateTime {
+                days: 0,
+                time: 25_920_000,
+            }),
+            ColumnValues::SmallDateTime(SqlSmallDateTime {
+                days: 0,
+                time: 1_440,
+            }),
+        ];
+        let values: Vec<_> = values
+            .into_iter()
+            .map(|value| (value, ERR_INVALID_DATETIME_FORMAT))
+            .chain([u64::try_from(i64::MAX).unwrap(), u64::MAX].map(|ticks| {
+                (
+                    ColumnValues::DateTimeOffset(SqlDateTimeOffset {
+                        datetime2: SqlDateTime2 {
+                            days: 0,
+                            time: SqlTime {
+                                time_nanoseconds: ticks,
+                                scale: 7,
+                            },
+                        },
+                        offset: 1,
+                    }),
+                    ERR_INVALID_DATETIME_FORMAT,
+                )
+            }))
+            .chain([(
+                ColumnValues::String(SqlString::from_utf8_string("not a datetime".into())),
+                ERR_INVALID_CHARACTER_VALUE,
+            )])
+            .collect();
+
+        for buffered in [false, true] {
+            for target in [
+                SQL_C_TYPE_DATE,
+                SQL_C_TYPE_TIME,
+                SQL_C_TYPE_TIMESTAMP,
+                SQL_C_SS_TIME2,
+                SQL_C_SS_TIMESTAMPOFFSET,
+            ] {
+                for (value, diagnostic) in &values {
+                    let diagnostic =
+                        if matches!(value, ColumnValues::Time(_)) && target == SQL_C_TYPE_DATE {
+                            ERR_RESTRICTED_DATA_TYPE
+                        } else {
+                            *diagnostic
+                        };
+                    let h = TestHandles::with_env_dbc_stmt();
+                    if buffered {
+                        stmt_with_buffered_values(&h, vec![value.clone()]);
+                    } else {
+                        stmt_with_captured(&h, value.clone());
+                    }
+                    let mut output = [0xA5_u8; 32];
+                    let mut indicator: SqlLen = -99;
+                    assert_eq!(
+                        unsafe {
+                            crate::api::exports::SQLGetData(
+                                h.stmt,
+                                1,
+                                target,
+                                output.as_mut_ptr().cast(),
+                                SqlLen::try_from(output.len()).unwrap(),
+                                &mut indicator,
+                            )
+                        },
+                        SQL_ERROR,
+                        "{value:?}, target={target}, buffered={buffered}"
+                    );
+                    assert_eq!(output, [0xA5; 32]);
+                    assert_eq!(indicator, -99);
+                    let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+                    let state = stmt.inner.lock().unwrap();
+                    assert_eq!(state.diag_records.len(), 1);
+                    assert_last_diag(&state.diag_records, diagnostic);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn exported_get_data_unrepresentable_offset_text_remains_unsupported() {
+        use mssql_tds::datatypes::column_values::{SqlDateTime2, SqlDateTimeOffset, SqlTime};
+
+        for buffered in [false, true] {
+            for target in [SQL_C_CHAR, SQL_C_WCHAR] {
+                let h = TestHandles::with_env_dbc_stmt();
+                let value = ColumnValues::DateTimeOffset(SqlDateTimeOffset {
+                    datetime2: SqlDateTime2 {
+                        days: 0,
+                        time: SqlTime {
+                            time_nanoseconds: 0,
+                            scale: 7,
+                        },
+                    },
+                    offset: -1,
+                });
+                if buffered {
+                    stmt_with_buffered_values(&h, vec![value]);
+                } else {
+                    stmt_with_captured(&h, value);
+                }
+                let mut output = [0xA5_u8; 64];
+                let mut indicator: SqlLen = -99;
+                assert_eq!(
+                    unsafe {
+                        crate::api::exports::SQLGetData(
+                            h.stmt,
+                            1,
+                            target,
+                            output.as_mut_ptr().cast(),
+                            SqlLen::try_from(output.len()).unwrap(),
+                            &mut indicator,
+                        )
+                    },
+                    SQL_ERROR
+                );
+                assert_eq!(output, [0xA5; 64]);
+                assert_eq!(indicator, -99);
+                let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+                let state = stmt.inner.lock().unwrap();
+                assert_eq!(state.diag_records.last().unwrap().sql_state, *b"HYC00");
+            }
+        }
+    }
+
+    #[test]
+    fn exported_get_data_temporal_targets_preserve_success_and_restricted_errors() {
+        use crate::api::odbc_types::SQL_C_TYPE_TIME;
+        use mssql_tds::datatypes::column_values::{SqlDateTime2, SqlTime};
+
+        for buffered in [false, true] {
+            for target in [
+                SQL_C_TYPE_DATE,
+                SQL_C_TYPE_TIME,
+                SQL_C_TYPE_TIMESTAMP,
+                SQL_C_SS_TIME2,
+                SQL_C_SS_TIMESTAMPOFFSET,
+            ] {
+                for supported in [true, false] {
+                    let h = TestHandles::with_env_dbc_stmt();
+                    let value = if supported {
+                        ColumnValues::DateTime2(SqlDateTime2 {
+                            days: 3_652_058,
+                            time: SqlTime {
+                                time_nanoseconds: 0,
+                                scale: 7,
+                            },
+                        })
+                    } else {
+                        ColumnValues::Int(42)
+                    };
+                    if buffered {
+                        stmt_with_buffered_values(&h, vec![value]);
+                    } else {
+                        stmt_with_captured(&h, value);
+                    }
+                    let mut output = [0xA5_u8; 32];
+                    let mut indicator: SqlLen = -99;
+                    let rc = unsafe {
+                        crate::api::exports::SQLGetData(
+                            h.stmt,
+                            1,
+                            target,
+                            output.as_mut_ptr().cast(),
+                            SqlLen::try_from(output.len()).unwrap(),
+                            &mut indicator,
+                        )
+                    };
+                    let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+                    let state = stmt.inner.lock().unwrap();
+                    if supported {
+                        assert_eq!(rc, SQL_SUCCESS);
+                        assert_eq!(
+                            indicator,
+                            SqlLen::try_from(element_stride(target, 0)).unwrap()
+                        );
+                        assert!(state.diag_records.is_empty());
+                    } else {
+                        assert_eq!(rc, SQL_ERROR);
+                        assert_last_diag(&state.diag_records, ERR_RESTRICTED_DATA_TYPE);
+                        assert_eq!(output, [0xA5; 32]);
+                        assert_eq!(indicator, -99);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn exported_get_data_native_time_to_timestampoffset() {
+        use crate::conversion::datetime::current_local_date;
+        use mssql_tds::datatypes::column_values::SqlTime;
+
+        for buffered in [false, true] {
+            let h = TestHandles::with_env_dbc_stmt();
+            let value = ColumnValues::Time(SqlTime {
+                time_nanoseconds: 452_961_234_567,
+                scale: 7,
+            });
+            if buffered {
+                stmt_with_buffered_values(&h, vec![value]);
+            } else {
+                stmt_with_captured(&h, value);
+            }
+            let mut output = SqlSsTimestampoffsetStruct {
+                timezone_hour: 12,
+                timezone_minute: 34,
+                ..Default::default()
+            };
+            let mut indicator = SQL_NULL_DATA;
+            let length = SqlLen::try_from(std::mem::size_of_val(&output)).unwrap();
+            let before = current_local_date().unwrap();
+            assert_eq!(
+                unsafe {
+                    crate::api::exports::SQLGetData(
+                        h.stmt,
+                        1,
+                        SQL_C_SS_TIMESTAMPOFFSET,
+                        (&mut output as *mut SqlSsTimestampoffsetStruct).cast(),
+                        length,
+                        &mut indicator,
+                    )
+                },
+                SQL_SUCCESS,
+                "buffered={buffered}"
+            );
+            let after = current_local_date().unwrap();
+            assert!([before, after].contains(&(output.year, output.month, output.day)));
+            assert_eq!((output.hour, output.minute, output.second), (12, 34, 56));
+            assert_eq!(output.fraction, 123_456_700);
+            assert_eq!((output.timezone_hour, output.timezone_minute), (0, 0));
+            assert_eq!(indicator, length);
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            assert!(stmt.inner.lock().unwrap().diag_records.is_empty());
+        }
     }
 
     #[test]
@@ -7192,14 +8101,8 @@ mod tests {
         assert!(!stmt_handle.inner.lock().unwrap().result_set_exhausted);
     }
 
-    /// `finish_get_data` must decide whether to peek from delivery state
-    /// (`current_row_last_col`/`column_metadata`/`active_plp`) alone, never
-    /// from `rc`. Every *current* `write_captured_column` error path leaves
-    /// `current_row_last_col` unadvanced, so this combination cannot happen
-    /// today — but a future caller can legitimately finish delivering the
-    /// column while still reporting `SQL_ERROR` (e.g. a NULL surfaced through
-    /// an error-style indicator), and the busy-release optimization must not
-    /// silently skip that case.
+    /// A terminal error after draining the last column can release busy;
+    /// delivery state, not the return code, controls the peek.
     #[test]
     fn finish_get_data_releases_busy_purely_on_delivery_state_even_when_rc_is_sql_error() {
         let h = TestHandles::with_env_dbc_stmt();
@@ -7325,6 +8228,1953 @@ mod tests {
         state.current_row_last_col = 1;
         state.row_positioned = true;
         state.active_plp = Some(stream);
+    }
+
+    #[test]
+    fn typed_plp_materialization_and_rejection_reuse_large_read_chunks() {
+        for length in [
+            TYPED_PLP_CHUNK_BYTES - 1,
+            TYPED_PLP_CHUNK_BYTES,
+            TYPED_PLP_CHUNK_BYTES + 1,
+            1024 * 1024 + 1,
+        ] {
+            for known in [false, true] {
+                let handles = TestHandles::with_env_dbc_stmt();
+                prefetched_text_stream(
+                    &handles,
+                    PlpEncoding::SingleByteText,
+                    Some(encoding_rs::WINDOWS_1252.into()),
+                    vec![b'0'; length],
+                    known.then_some(u64::try_from(length).unwrap()),
+                );
+                let stmt = unsafe { handle_from_raw::<StmtHandle>(handles.stmt) };
+                let mut progress = PlpReadProgress::default();
+                let mut scratch_ptr = None;
+                let mut value = -99_i32;
+                let mut indicator = -99;
+                let reads = length.div_ceil(TYPED_PLP_CHUNK_BYTES);
+                for chunk in 1..=reads {
+                    let rc = stream_active_plp_chunk_once(
+                        stmt,
+                        handles.stmt,
+                        1,
+                        SQL_C_SLONG,
+                        (&mut value as *mut i32).cast(),
+                        0,
+                        &mut indicator,
+                        false,
+                        None,
+                        None,
+                        &mut progress,
+                    );
+                    assert_eq!(progress.typed_scratch.len(), TYPED_PLP_CHUNK_BYTES);
+                    assert_eq!(
+                        *scratch_ptr.get_or_insert(progress.typed_scratch.as_ptr()),
+                        progress.typed_scratch.as_ptr()
+                    );
+                    if chunk < reads {
+                        assert_eq!(rc, SQL_SUCCESS_WITH_INFO);
+                        assert_eq!(progress.retry_bytes, TYPED_PLP_CHUNK_BYTES);
+                        assert_eq!((value, indicator), (-99, -99));
+                    } else {
+                        assert_eq!(progress.retry_bytes, 0);
+                        if length > 1024 * 1024 {
+                            assert_eq!(rc, SQL_ERROR);
+                            assert_eq!((value, indicator), (-99, -99));
+                            assert_last_diag(
+                                &stmt.inner.lock().unwrap().diag_records,
+                                ERR_PLP_TYPED_LIMIT,
+                            );
+                        } else {
+                            assert_eq!(rc, SQL_SUCCESS);
+                            assert_eq!((value, indicator), (0, 4));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn typed_plp_known_and_unknown_lengths_respect_the_limit() {
+        for length in [256, 1024 * 1024, 1024 * 1024 + 1] {
+            for known in [false, true] {
+                let handles = TestHandles::with_env_dbc_stmt();
+                let mut wire = vec![b'0'; length];
+                *wire.last_mut().unwrap() = b'7';
+                prefetched_text_stream(
+                    &handles,
+                    PlpEncoding::SingleByteText,
+                    Some(encoding_rs::WINDOWS_1252.into()),
+                    wire,
+                    known.then_some(length as u64),
+                );
+                let mut value = -99_i32;
+                let mut indicator = -99;
+                let result = unsafe {
+                    sql_get_data(
+                        handles.stmt,
+                        1,
+                        SQL_C_SLONG,
+                        (&mut value as *mut i32).cast(),
+                        0,
+                        &mut indicator,
+                    )
+                };
+                if length <= 1024 * 1024 {
+                    assert_eq!(result, SQL_SUCCESS);
+                    assert_eq!(value, 7);
+                    assert_eq!(indicator, 4);
+                } else {
+                    assert_eq!(result, SQL_ERROR);
+                    assert_eq!(value, -99);
+                    assert_eq!(indicator, -99);
+                    let stmt = unsafe { handle_from_raw::<StmtHandle>(handles.stmt) };
+                    assert_last_diag(
+                        &stmt.inner.lock().unwrap().diag_records,
+                        ERR_PLP_TYPED_LIMIT,
+                    );
+                }
+                assert_eq!(
+                    unsafe {
+                        sql_get_data(
+                            handles.stmt,
+                            1,
+                            SQL_C_SLONG,
+                            (&mut value as *mut i32).cast(),
+                            0,
+                            &mut indicator,
+                        )
+                    },
+                    SQL_NO_DATA
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn typed_plp_limit_applies_to_the_unread_suffix_after_character_reads() {
+        for unicode in [false, true] {
+            let unit_size = if unicode { 2 } else { 1 };
+            let prefix_units = 1024 * 1024 / unit_size + 1;
+            for suffix_bytes in [2 * unit_size, 1024 * 1024, 1024 * 1024 + unit_size] {
+                for known in [false, true] {
+                    let handles = TestHandles::with_env_dbc_stmt();
+                    let text = format!(
+                        "{}{}42",
+                        "x".repeat(prefix_units),
+                        "0".repeat(suffix_bytes / unit_size - 2)
+                    );
+                    let wire = if unicode {
+                        utf16le(&text)
+                    } else {
+                        text.into_bytes()
+                    };
+                    let known_total = known.then_some(u64::try_from(wire.len()).unwrap());
+                    prefetched_text_stream(
+                        &handles,
+                        if unicode {
+                            PlpEncoding::Utf16Text
+                        } else {
+                            PlpEncoding::SingleByteText
+                        },
+                        (!unicode).then_some(encoding_rs::WINDOWS_1252.into()),
+                        wire,
+                        known_total,
+                    );
+                    let mut prefix = vec![0xcc_u8; (prefix_units + 1) * unit_size];
+                    let mut indicator = -99;
+                    assert_eq!(
+                        unsafe {
+                            sql_get_data(
+                                handles.stmt,
+                                1,
+                                if unicode { SQL_C_WCHAR } else { SQL_C_CHAR },
+                                prefix.as_mut_ptr().cast(),
+                                SqlLen::try_from(prefix.len()).unwrap(),
+                                &mut indicator,
+                            )
+                        },
+                        SQL_SUCCESS_WITH_INFO
+                    );
+                    let mut value = -99_i32;
+                    indicator = -99;
+                    let rc = unsafe {
+                        sql_get_data(
+                            handles.stmt,
+                            1,
+                            SQL_C_SLONG,
+                            (&mut value as *mut i32).cast(),
+                            0,
+                            &mut indicator,
+                        )
+                    };
+                    if suffix_bytes <= 1024 * 1024 {
+                        assert_eq!(rc, SQL_SUCCESS);
+                        assert_eq!(value, 42);
+                        assert_eq!(indicator, 4);
+                    } else {
+                        assert_eq!(rc, SQL_ERROR);
+                        assert_eq!(value, -99);
+                        assert_eq!(indicator, -99);
+                        let stmt = unsafe { handle_from_raw::<StmtHandle>(handles.stmt) };
+                        assert_last_diag(
+                            &stmt.inner.lock().unwrap().diag_records,
+                            ERR_PLP_TYPED_LIMIT,
+                        );
+                    }
+                    assert_eq!(
+                        unsafe {
+                            sql_get_data(
+                                handles.stmt,
+                                1,
+                                SQL_C_SLONG,
+                                (&mut value as *mut i32).cast(),
+                                0,
+                                &mut indicator,
+                            )
+                        },
+                        SQL_NO_DATA
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn typed_plp_target_switch_preserves_pending_utf8_bytes() {
+        for (encoding, narrow, wire) in [
+            (PlpEncoding::Utf16Text, None, utf16le("2")),
+            (
+                PlpEncoding::SingleByteText,
+                Some(encoding_rs::WINDOWS_1252.into()),
+                b"2".to_vec(),
+            ),
+        ] {
+            let handles = TestHandles::with_env_dbc_stmt();
+            prefetched_text_stream(&handles, encoding, narrow, wire, None);
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(handles.stmt) };
+            stmt.inner
+                .lock()
+                .unwrap()
+                .active_plp
+                .as_mut()
+                .unwrap()
+                .pending_bytes
+                .extend_from_slice(b"4");
+            let mut value = -99_i32;
+            let mut indicator = -99;
+            assert_eq!(
+                unsafe {
+                    sql_get_data(
+                        handles.stmt,
+                        1,
+                        SQL_C_SLONG,
+                        (&mut value as *mut i32).cast(),
+                        0,
+                        &mut indicator,
+                    )
+                },
+                SQL_SUCCESS
+            );
+            assert_eq!(value, 42);
+            assert_eq!(indicator, 4);
+        }
+    }
+
+    #[test]
+    fn typed_plp_target_switch_decodes_remaining_wide_carry() {
+        for char_bytes in [1, 2, 4, 6] {
+            let handles = TestHandles::with_env_dbc_stmt();
+            prefetched_text_stream(
+                &handles,
+                PlpEncoding::SingleByteText,
+                Some(encoding_rs::WINDOWS_1252.into()),
+                b"2".to_vec(),
+                Some(1),
+            );
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(handles.stmt) };
+            stmt.inner
+                .lock()
+                .unwrap()
+                .active_plp
+                .as_mut()
+                .unwrap()
+                .pending_units = "014".encode_utf16().collect();
+            let mut prefix = vec![0xcc; char_bytes + 1];
+            assert_eq!(
+                read_plp_test_chunk(&handles, SQL_C_CHAR, &mut prefix).0,
+                SQL_SUCCESS_WITH_INFO
+            );
+            assert_eq!(&prefix[..char_bytes], &utf16le("014")[..char_bytes]);
+            let mut value = -99_i32;
+            let mut indicator = -99;
+            let rc = unsafe {
+                sql_get_data(
+                    handles.stmt,
+                    1,
+                    SQL_C_SLONG,
+                    (&mut value as *mut i32).cast(),
+                    0,
+                    &mut indicator,
+                )
+            };
+            if char_bytes % 2 == 0 {
+                assert_eq!(rc, SQL_SUCCESS);
+                assert_eq!(
+                    value,
+                    match char_bytes {
+                        2 => 142,
+                        4 => 42,
+                        _ => 2,
+                    }
+                );
+                assert_eq!(indicator, 4);
+            } else {
+                assert_eq!(rc, SQL_ERROR);
+                assert_eq!(value, -99);
+                assert_eq!(indicator, -99);
+                assert_eq!(
+                    stmt.inner
+                        .lock()
+                        .unwrap()
+                        .diag_records
+                        .last()
+                        .unwrap()
+                        .sql_state,
+                    SQLSTATE_22018
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn typed_plp_after_wide_and_narrow_reads_rejects_a_partial_carried_unit() {
+        for chunks in [
+            vec![vec![0xc2, b'0', b'4', b'2']],
+            vec![vec![0xc2], vec![b'0'], vec![b'4', b'2']],
+        ] {
+            let (handles, _server) = open_mock_utf8_plp(chunks);
+            let mut wide = [0xcc; 4];
+            assert_eq!(
+                read_plp_test_chunk(&handles, SQL_C_WCHAR, &mut wide).0,
+                SQL_SUCCESS_WITH_INFO
+            );
+            assert_eq!(wide, [0xfd, 0xff, 0, 0]);
+            let mut narrow = [0xcc; 2];
+            assert_eq!(
+                read_plp_test_chunk(&handles, SQL_C_CHAR, &mut narrow).0,
+                SQL_SUCCESS_WITH_INFO
+            );
+            assert_eq!(narrow, [b'0', 0]);
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(handles.stmt) };
+            {
+                let state = stmt.inner.lock().unwrap();
+                let stream = state.active_plp.as_ref().unwrap();
+                assert!(stream.pending_bytes_utf16);
+                assert_eq!(stream.pending_bytes, [0]);
+            }
+            let mut value = -99_i32;
+            let mut indicator = -99;
+            assert_eq!(
+                unsafe {
+                    sql_get_data(
+                        handles.stmt,
+                        1,
+                        SQL_C_SLONG,
+                        (&mut value as *mut i32).cast(),
+                        0,
+                        &mut indicator,
+                    )
+                },
+                SQL_ERROR
+            );
+            assert_eq!(value, -99);
+            assert_eq!(indicator, -99);
+            assert_eq!(
+                stmt.inner
+                    .lock()
+                    .unwrap()
+                    .diag_records
+                    .last()
+                    .unwrap()
+                    .sql_state,
+                SQLSTATE_22018
+            );
+            assert_eq!(
+                unsafe {
+                    sql_get_data(
+                        handles.stmt,
+                        2,
+                        SQL_C_SLONG,
+                        (&mut value as *mut i32).cast(),
+                        0,
+                        &mut indicator,
+                    )
+                },
+                SQL_SUCCESS
+            );
+            assert_eq!(value, 42);
+        }
+    }
+
+    #[test]
+    fn typed_plp_decoder_allocations_report_hy001_and_drain() {
+        for case in 0..7 {
+            let handles = TestHandles::with_env_dbc_stmt();
+            let narrow = case == 5;
+            prefetched_text_stream(
+                &handles,
+                if narrow {
+                    PlpEncoding::SingleByteText
+                } else {
+                    PlpEncoding::Utf16Text
+                },
+                narrow.then_some(encoding_rs::WINDOWS_1252.into()),
+                if narrow {
+                    vec![b'0'; 9000]
+                } else {
+                    utf16le(&"0".repeat(9000))
+                },
+                None,
+            );
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(handles.stmt) };
+            {
+                let mut state = stmt.inner.lock().unwrap();
+                let stream = state.active_plp.as_mut().unwrap();
+                match case {
+                    0 | 6 => {
+                        stream.pending_bytes = vec![0, b'0', 0];
+                        stream.pending_bytes_utf16 = true;
+                    }
+                    1 => {
+                        stream.pending_bytes = utf16le("0");
+                        stream.pending_bytes_utf16 = true;
+                    }
+                    2 => stream.pending_units = vec![u16::from(b'0')],
+                    _ => {}
+                }
+            }
+            if case == 5 {
+                FAIL_TYPED_PLP_DECODER_ALLOCATION.set(true);
+            } else {
+                // The first reservation retains raw wire, the second decodes carry/payload.
+                // Case 4 rejects a later wire chunk instead.
+                FAIL_TYPED_PLP_RESERVE_AFTER.set(Some(match case {
+                    4 => 3,
+                    6 => 2,
+                    _ => 1,
+                }));
+            }
+            let mut value = -99_i32;
+            let mut indicator = -99;
+            assert_eq!(
+                unsafe {
+                    crate::api::exports::SQLGetData(
+                        handles.stmt,
+                        1,
+                        SQL_C_SLONG,
+                        (&mut value as *mut i32).cast(),
+                        0,
+                        &mut indicator,
+                    )
+                },
+                SQL_ERROR
+            );
+            assert_eq!((value, indicator), (-99, -99));
+            assert_eq!(FAIL_TYPED_PLP_RESERVE_AFTER.replace(None), None);
+            assert!(!FAIL_TYPED_PLP_DECODER_ALLOCATION.replace(false));
+            let state = stmt.inner.lock().unwrap();
+            assert_last_diag(&state.diag_records, ERR_MEMORY_ALLOCATION);
+            assert!(state.active_plp.is_none());
+            assert!(state.captured_plp_wire.is_none());
+            drop(state);
+            assert_eq!(
+                unsafe {
+                    crate::api::exports::SQLGetData(
+                        handles.stmt,
+                        1,
+                        SQL_C_SLONG,
+                        (&mut value as *mut i32).cast(),
+                        0,
+                        &mut indicator,
+                    )
+                },
+                SQL_NO_DATA
+            );
+        }
+    }
+
+    #[test]
+    fn typed_plp_after_final_character_chunk_does_not_finalize_decoder_twice() {
+        use mssql_mock_tds::{ColumnDefinition, ColumnValue, QueryResponse, Row, SqlDataType};
+        let handles = TestHandles::with_env_dbc_stmt();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(handles.dbc) };
+        let response = QueryResponse::new(
+            vec![ColumnDefinition::new("value", SqlDataType::VarCharMax)],
+            vec![Row::new(vec![ColumnValue::VarCharMax(vec![vec![0x80]])])],
+        );
+        let _server = crate::test_support::connect_mock_server(dbc, "SELECT carry", response);
+        let query: Vec<u16> = "SELECT carry\0".encode_utf16().collect();
+        assert_eq!(
+            unsafe {
+                crate::api::exec_direct::sql_exec_direct_w(handles.stmt, query.as_ptr(), SQL_NTS)
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!(
+            unsafe { crate::api::fetch::sql_fetch(handles.stmt) },
+            SQL_SUCCESS
+        );
+        let mut output = [0xcc_u8; 2];
+        let mut indicator = -99;
+        assert_eq!(
+            unsafe {
+                crate::api::exports::SQLGetData(
+                    handles.stmt,
+                    1,
+                    SQL_C_CHAR,
+                    output.as_mut_ptr().cast(),
+                    2,
+                    &mut indicator,
+                )
+            },
+            SQL_SUCCESS_WITH_INFO
+        );
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(handles.stmt) };
+        assert!(
+            stmt.inner
+                .lock()
+                .unwrap()
+                .active_plp
+                .as_ref()
+                .unwrap()
+                .narrow_decoder_finished
+        );
+        let mut value = -99_i32;
+        indicator = -99;
+        assert_eq!(
+            unsafe {
+                crate::api::exports::SQLGetData(
+                    handles.stmt,
+                    1,
+                    SQL_C_SLONG,
+                    (&mut value as *mut i32).cast(),
+                    0,
+                    &mut indicator,
+                )
+            },
+            SQL_ERROR
+        );
+        assert_eq!((value, indicator), (-99, -99));
+        assert_last_diag(
+            &stmt.inner.lock().unwrap().diag_records,
+            ERR_INVALID_CHARACTER_VALUE,
+        );
+    }
+
+    #[test]
+    fn typed_plp_utf16_decoder_matches_lossy_text_at_every_split() {
+        for wire in [
+            utf16le("42\u{20ac}\u{1f600}"),
+            vec![0, 0xd8, b'4', 0, 0, 0xdc, b'2', 0, 0xff],
+            vec![0, 0xd8, 0],
+            vec![],
+        ] {
+            let expected = utf16le_chunk_to_utf8(&wire, true, &mut None, &mut None);
+            for split in 0..=wire.len() {
+                let mut output = Vec::new();
+                let mut pending_byte = None;
+                let mut pending_high = None;
+                append_typed_utf16(
+                    &wire[..split],
+                    false,
+                    &mut pending_byte,
+                    &mut pending_high,
+                    &mut output,
+                )
+                .unwrap();
+                append_typed_utf16(
+                    &wire[split..],
+                    true,
+                    &mut pending_byte,
+                    &mut pending_high,
+                    &mut output,
+                )
+                .unwrap();
+                assert_eq!(output, expected.as_bytes(), "split {split}, wire {wire:?}");
+                assert_eq!(pending_byte, None);
+                assert_eq!(pending_high, None);
+            }
+        }
+    }
+
+    #[test]
+    fn typed_plp_decoders_flush_empty_final_chunks_without_allocating_temporaries() {
+        for (encoding, narrow, input) in [
+            (PlpEncoding::Utf16Text, None, vec![0x3d, 0xd8, 0]),
+            (
+                PlpEncoding::Utf8Text,
+                Some(encoding_rs::UTF_8.into()),
+                vec![0xe2, 0x82],
+            ),
+            (
+                PlpEncoding::SingleByteText,
+                Some(encoding_rs::SHIFT_JIS.into()),
+                vec![0x82],
+            ),
+        ] {
+            let mut stream = ActivePlpStream::new(1, encoding, narrow);
+            let mut output = Vec::new();
+            for byte in input {
+                append_typed_plp_text(&mut stream, &[byte], false, &mut output).unwrap();
+            }
+            append_typed_plp_text(&mut stream, &[], true, &mut output).unwrap();
+            let expected = if encoding == PlpEncoding::Utf16Text {
+                "\u{fffd}\u{fffd}"
+            } else {
+                "\u{fffd}"
+            };
+            assert_eq!(output, expected.as_bytes());
+            if narrow.is_some() {
+                assert!(stream.narrow_decoder_finished);
+                append_typed_plp_text(&mut stream, &[], true, &mut output).unwrap();
+                assert_eq!(output, expected.as_bytes());
+            }
+        }
+    }
+
+    #[test]
+    fn typed_plp_allocation_failure_preserves_hy001_while_draining() {
+        // Both the raw retry buffer and decoded text reserve on each chunk.
+        for fail_after in 0..6 {
+            let handles = TestHandles::with_env_dbc_stmt();
+            prefetched_text_stream(
+                &handles,
+                PlpEncoding::SingleByteText,
+                Some(encoding_rs::WINDOWS_1252.into()),
+                vec![b'0'; 2 * TYPED_PLP_CHUNK_BYTES + 1],
+                Some(u64::try_from(2 * TYPED_PLP_CHUNK_BYTES + 1).unwrap()),
+            );
+            let mut value = -99_i32;
+            let mut indicator = -99;
+            FAIL_TYPED_PLP_RESERVE_AFTER.set(Some(fail_after));
+            let rc = unsafe {
+                crate::api::exports::SQLGetData(
+                    handles.stmt,
+                    1,
+                    SQL_C_SLONG,
+                    (&mut value as *mut i32).cast(),
+                    0,
+                    &mut indicator,
+                )
+            };
+            assert_eq!(FAIL_TYPED_PLP_RESERVE_AFTER.replace(None), None);
+            assert_eq!(rc, SQL_ERROR);
+            assert_eq!(value, -99);
+            assert_eq!(indicator, -99);
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(handles.stmt) };
+            let state = stmt.inner.lock().unwrap();
+            assert_last_diag(&state.diag_records, ERR_MEMORY_ALLOCATION);
+            assert!(state.active_plp.is_none());
+            assert!(state.captured_plp_wire.is_none());
+            drop(state);
+            assert_eq!(
+                unsafe {
+                    sql_get_data(
+                        handles.stmt,
+                        1,
+                        SQL_C_SLONG,
+                        (&mut value as *mut i32).cast(),
+                        0,
+                        &mut indicator,
+                    )
+                },
+                SQL_NO_DATA
+            );
+        }
+    }
+
+    #[test]
+    fn typed_plp_nonempty_guid_matches_the_existing_text_conversion_gap() {
+        for plp in [false, true] {
+            let handles = TestHandles::with_env_dbc_stmt();
+            let wire = utf16le("00112233-4455-6677-8899-aabbccddeeff");
+            if plp {
+                prefetched_text_stream(&handles, PlpEncoding::Utf16Text, None, wire, None);
+            } else {
+                stmt_with_buffered_string(&handles, SqlString::new(wire, EncodingType::Utf16));
+            }
+            let mut output = [0xcc_u8; 16];
+            let mut indicator = -99;
+            assert_eq!(
+                unsafe {
+                    sql_get_data(
+                        handles.stmt,
+                        1,
+                        SQL_C_GUID,
+                        output.as_mut_ptr().cast(),
+                        0,
+                        &mut indicator,
+                    )
+                },
+                SQL_ERROR
+            );
+            assert_eq!(output, [0xcc; 16]);
+            assert_eq!(indicator, -99);
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(handles.stmt) };
+            assert_eq!(
+                stmt.inner
+                    .lock()
+                    .unwrap()
+                    .diag_records
+                    .last()
+                    .unwrap()
+                    .sql_state,
+                SQLSTATE_07006
+            );
+        }
+    }
+
+    #[test]
+    fn typed_binary_plp_rejection_preserves_retry_and_following_columns() {
+        use mssql_mock_tds::{ColumnDefinition, ColumnValue, QueryResponse, Row, SqlDataType};
+        for (retry, prefix) in [
+            None,
+            Some(SQL_C_BINARY),
+            Some(SQL_C_CHAR),
+            Some(SQL_C_WCHAR),
+        ]
+        .into_iter()
+        .flat_map(|retry| [(retry, false), (retry, true)])
+        {
+            let mut handles = TestHandles::with_env_dbc_stmt();
+            let dbc = unsafe { handle_from_raw::<DbcHandle>(handles.dbc) };
+            let response = QueryResponse::new(
+                vec![
+                    ColumnDefinition::new("binary", SqlDataType::VarBinaryMax),
+                    ColumnDefinition::new("following", SqlDataType::Int),
+                ],
+                vec![
+                    Row::new(vec![
+                        ColumnValue::VarBinaryMax(vec![vec![0, 1], vec![0xff, 0x42]]),
+                        ColumnValue::Int(99),
+                    ]),
+                    Row::new(vec![
+                        ColumnValue::VarBinaryMax(vec![vec![0x12]]),
+                        ColumnValue::Int(123),
+                    ]),
+                ],
+            );
+            let _server = crate::test_support::connect_mock_server(dbc, "SELECT binary", response);
+            let query: Vec<u16> = "SELECT binary\0".encode_utf16().collect();
+            assert_eq!(
+                unsafe {
+                    crate::api::exec_direct::sql_exec_direct_w(
+                        handles.stmt,
+                        query.as_ptr(),
+                        SQL_NTS,
+                    )
+                },
+                SQL_SUCCESS
+            );
+            assert_eq!(
+                unsafe { crate::api::fetch::sql_fetch(handles.stmt) },
+                SQL_SUCCESS
+            );
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(handles.stmt) };
+            let mut value = -99_i32;
+            let mut indicator = -99;
+            if prefix {
+                let mut byte = 0xcc_u8;
+                assert_eq!(
+                    unsafe {
+                        crate::api::exports::SQLGetData(
+                            handles.stmt,
+                            1,
+                            SQL_C_BINARY,
+                            (&mut byte as *mut u8).cast(),
+                            1,
+                            &mut indicator,
+                        )
+                    },
+                    SQL_SUCCESS_WITH_INFO
+                );
+                assert_eq!(byte, 0);
+                indicator = -99;
+            }
+            for _ in 0..2 {
+                assert_eq!(
+                    unsafe {
+                        crate::api::exports::SQLGetData(
+                            handles.stmt,
+                            1,
+                            SQL_C_SLONG,
+                            (&mut value as *mut i32).cast(),
+                            0,
+                            &mut indicator,
+                        )
+                    },
+                    SQL_ERROR
+                );
+                assert_eq!((value, indicator), (-99, -99));
+                let state = stmt.inner.lock().unwrap();
+                assert_eq!(state.diag_records.last().unwrap().sql_state, SQLSTATE_HYC00);
+                let stream = state.active_plp.as_ref().unwrap();
+                assert_eq!(stream.column, 1);
+                assert_eq!(stream.encoding, PlpEncoding::Binary);
+                assert_eq!(state.current_row_last_col, 1);
+            }
+            if let Some(target) = retry {
+                let mut bytes = [0xcc_u8; 32];
+                assert_eq!(
+                    unsafe {
+                        crate::api::exports::SQLGetData(
+                            handles.stmt,
+                            1,
+                            target,
+                            bytes.as_mut_ptr().cast(),
+                            32,
+                            &mut indicator,
+                        )
+                    },
+                    SQL_SUCCESS
+                );
+                let hex = if prefix { "01FF42" } else { "0001FF42" };
+                let expected = match target {
+                    SQL_C_BINARY if prefix => vec![1, 0xff, 0x42],
+                    SQL_C_BINARY => vec![0, 1, 0xff, 0x42],
+                    SQL_C_WCHAR => utf16le(hex),
+                    _ => hex.as_bytes().to_vec(),
+                };
+                assert_eq!(&bytes[..expected.len()], &expected);
+                assert_eq!(indicator, expected.len() as SqlLen);
+            }
+            assert_eq!(
+                unsafe {
+                    crate::api::exports::SQLGetData(
+                        handles.stmt,
+                        2,
+                        SQL_C_SLONG,
+                        (&mut value as *mut i32).cast(),
+                        0,
+                        &mut indicator,
+                    )
+                },
+                SQL_SUCCESS
+            );
+            assert_eq!((value, indicator), (99, 4));
+            assert_eq!(
+                unsafe { crate::api::fetch::sql_fetch(handles.stmt) },
+                SQL_SUCCESS
+            );
+            assert_eq!(
+                unsafe {
+                    crate::api::exports::SQLGetData(
+                        handles.stmt,
+                        2,
+                        SQL_C_SLONG,
+                        (&mut value as *mut i32).cast(),
+                        0,
+                        &mut indicator,
+                    )
+                },
+                SQL_SUCCESS
+            );
+            assert_eq!((value, indicator), (123, 4));
+            assert_eq!(
+                unsafe { crate::api::fetch::sql_fetch(handles.stmt) },
+                SQL_NO_DATA
+            );
+            assert!(dbc.inner.lock().unwrap().active_stmt.is_none());
+            let next_stmt = handles.alloc_extra_stmt();
+            assert_eq!(
+                unsafe {
+                    crate::api::exec_direct::sql_exec_direct_w(next_stmt, query.as_ptr(), SQL_NTS)
+                },
+                SQL_SUCCESS
+            );
+            for expected in [99, 123] {
+                assert_eq!(
+                    unsafe { crate::api::fetch::sql_fetch(next_stmt) },
+                    SQL_SUCCESS
+                );
+                assert_eq!(
+                    unsafe {
+                        crate::api::exports::SQLGetData(
+                            next_stmt,
+                            2,
+                            SQL_C_SLONG,
+                            (&mut value as *mut i32).cast(),
+                            0,
+                            &mut indicator,
+                        )
+                    },
+                    SQL_SUCCESS
+                );
+                assert_eq!((value, indicator), (expected, 4));
+            }
+            assert_eq!(
+                unsafe { crate::api::fetch::sql_fetch(next_stmt) },
+                SQL_NO_DATA
+            );
+        }
+    }
+
+    #[test]
+    fn typed_plp_drained_errors_release_the_connection() {
+        use mssql_mock_tds::{ColumnDefinition, ColumnValue, QueryResponse, Row, SqlDataType};
+
+        for (unicode, diag) in [
+            (false, ERR_PLP_TYPED_LIMIT),
+            (true, ERR_PLP_TYPED_LIMIT),
+            (false, ERR_MEMORY_ALLOCATION),
+            (true, ERR_MEMORY_ALLOCATION),
+        ] {
+            let mut handles = TestHandles::with_env_dbc_stmt();
+            let dbc = unsafe { handle_from_raw::<DbcHandle>(handles.dbc) };
+            let (sql_type, value) = if unicode {
+                (
+                    SqlDataType::NVarCharMax,
+                    ColumnValue::NVarCharMax(vec![vec![u16::from(b'0'); 513]]),
+                )
+            } else {
+                (
+                    SqlDataType::VarCharMax,
+                    ColumnValue::VarCharMax(vec![vec![b'0'; 513]]),
+                )
+            };
+            let response = QueryResponse::new(
+                vec![ColumnDefinition::new("value", sql_type)],
+                vec![Row::new(vec![value])],
+            );
+            let _server =
+                crate::test_support::connect_mock_server(dbc, "SELECT oversized", response);
+            let query: Vec<u16> = "SELECT oversized\0".encode_utf16().collect();
+            assert_eq!(
+                unsafe {
+                    crate::api::exec_direct::sql_exec_direct_w(
+                        handles.stmt,
+                        query.as_ptr(),
+                        SQL_NTS,
+                    )
+                },
+                SQL_SUCCESS
+            );
+            assert_eq!(
+                unsafe { crate::api::fetch::sql_fetch(handles.stmt) },
+                SQL_SUCCESS
+            );
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(handles.stmt) };
+            assert_eq!(stmt.inner.lock().unwrap().current_row_last_col, 0);
+            let mut value = -99_i32;
+            let mut indicator = -99;
+            assert_eq!(
+                unsafe {
+                    crate::api::exports::SQLGetData(
+                        handles.stmt,
+                        1,
+                        SQL_C_CHAR,
+                        (&mut value as *mut i32).cast(),
+                        0,
+                        &mut indicator,
+                    )
+                },
+                SQL_SUCCESS_WITH_INFO
+            );
+            assert_eq!(stmt.inner.lock().unwrap().current_row_last_col, 1);
+            // Fault-inject after production stream setup, not into hand-built
+            // statement state. Both terminal errors take the same drain path.
+            let mut progress = PlpReadProgress {
+                typed_error: Some(diag),
+                ..Default::default()
+            };
+            indicator = -99;
+            loop {
+                let rc = stream_active_plp_chunk_once(
+                    stmt,
+                    handles.stmt,
+                    1,
+                    SQL_C_SLONG,
+                    (&mut value as *mut i32).cast(),
+                    0,
+                    &mut indicator,
+                    false,
+                    None,
+                    None,
+                    &mut progress,
+                );
+                if progress.retry_bytes == 0 {
+                    assert_eq!(rc, SQL_ERROR);
+                    break;
+                }
+                assert_eq!(rc, SQL_SUCCESS_WITH_INFO);
+            }
+            assert_eq!(value, -99);
+            assert_eq!(indicator, -99);
+            {
+                let state = stmt.inner.lock().unwrap();
+                assert_last_diag(&state.diag_records, diag);
+                assert_eq!(state.current_row_last_col, 1);
+                assert!(state.active_plp.is_none());
+                assert!(state.result_set_exhausted);
+            }
+            assert!(dbc.inner.lock().unwrap().active_stmt.is_none());
+            assert_eq!(
+                unsafe {
+                    crate::api::exports::SQLGetData(
+                        handles.stmt,
+                        1,
+                        SQL_C_SLONG,
+                        (&mut value as *mut i32).cast(),
+                        0,
+                        &mut indicator,
+                    )
+                },
+                SQL_NO_DATA
+            );
+            let next_stmt = handles.alloc_extra_stmt();
+            assert_eq!(
+                unsafe {
+                    crate::api::exec_direct::sql_exec_direct_w(next_stmt, query.as_ptr(), SQL_NTS)
+                },
+                SQL_SUCCESS
+            );
+            assert_eq!(
+                unsafe { crate::api::fetch::sql_fetch(next_stmt) },
+                SQL_SUCCESS
+            );
+            assert_eq!(
+                unsafe {
+                    crate::api::exports::SQLGetData(
+                        next_stmt,
+                        1,
+                        SQL_C_SLONG,
+                        (&mut value as *mut i32).cast(),
+                        0,
+                        &mut indicator,
+                    )
+                },
+                SQL_SUCCESS
+            );
+            assert_eq!((value, indicator), (0, 4));
+            assert_eq!(
+                unsafe { crate::api::fetch::sql_fetch(next_stmt) },
+                SQL_NO_DATA
+            );
+            assert_eq!(
+                unsafe { crate::api::fetch::sql_fetch(handles.stmt) },
+                SQL_NO_DATA
+            );
+        }
+    }
+
+    #[test]
+    fn typed_plp_wchar_recovery_reuses_one_rendering() {
+        let text = "\u{e9}\u{1f600}x".repeat(4096);
+        let expected: Vec<u16> = text.encode_utf16().collect();
+        let handles = TestHandles::with_env_dbc_stmt();
+        prefetched_text_stream(
+            &handles,
+            PlpEncoding::Utf8Text,
+            Some(encoding_rs::UTF_8.into()),
+            text.into_bytes(),
+            None,
+        );
+        let mut value = -99_i32;
+        let mut indicator = -99;
+        assert_eq!(
+            unsafe {
+                crate::api::exports::SQLGetData(
+                    handles.stmt,
+                    1,
+                    SQL_C_SLONG,
+                    (&mut value as *mut i32).cast(),
+                    0,
+                    &mut indicator,
+                )
+            },
+            SQL_ERROR
+        );
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(handles.stmt) };
+        let mut rendering = None;
+        for (index, chunk) in expected.chunks(2).enumerate() {
+            let offset = index * 2;
+            let remaining = expected.len() - offset;
+            let mut output = [0xcccc_u16; 4];
+            assert_eq!(
+                unsafe {
+                    crate::api::exports::SQLGetData(
+                        handles.stmt,
+                        1,
+                        SQL_C_WCHAR,
+                        output.as_mut_ptr().cast(),
+                        6,
+                        &mut indicator,
+                    )
+                },
+                if remaining > 2 {
+                    SQL_SUCCESS_WITH_INFO
+                } else {
+                    SQL_SUCCESS
+                }
+            );
+            assert_eq!(indicator, (remaining * 2) as SqlLen);
+            assert_eq!(&output[..chunk.len()], chunk);
+            assert_eq!(output[chunk.len()], 0);
+            assert_eq!(output[3], 0xcccc);
+            let state = stmt.inner.lock().unwrap();
+            if remaining > 2 {
+                let (_, ColumnValues::String(value)) = state.last_captured.as_ref().unwrap() else {
+                    panic!("expected retained text");
+                };
+                assert_eq!(value.encoding_type(), &EncodingType::Utf16);
+                let storage = (
+                    value.bytes.as_ptr(),
+                    value.bytes.len(),
+                    value.bytes.capacity(),
+                );
+                assert_eq!(*rendering.get_or_insert(storage), storage);
+                assert_eq!(state.partial_text_offset, Some((1, offset + chunk.len())));
+                assert_eq!(state.captured_plp_wire.as_ref().unwrap().offset, 0);
+                if index == 0 {
+                    FAIL_TYPED_PLP_RESERVE_AFTER.set(Some(0));
+                }
+            } else {
+                assert!(state.last_captured.is_none());
+                assert!(state.captured_plp_wire.is_none());
+            }
+        }
+        assert_eq!(FAIL_TYPED_PLP_RESERVE_AFTER.replace(None), Some(0));
+    }
+
+    #[test]
+    fn typed_plp_recovery_rendering_failure_preserves_a_switched_suffix() {
+        for first_target in [SQL_C_CHAR, SQL_C_WCHAR] {
+            let handles = TestHandles::with_env_dbc_stmt();
+            prefetched_text_stream(
+                &handles,
+                PlpEncoding::Utf16Text,
+                None,
+                utf16le("x\u{e9}42"),
+                None,
+            );
+            let mut value = -99_i32;
+            let mut indicator = -99;
+            assert_eq!(
+                unsafe {
+                    crate::api::exports::SQLGetData(
+                        handles.stmt,
+                        1,
+                        SQL_C_SLONG,
+                        (&mut value as *mut i32).cast(),
+                        0,
+                        &mut indicator,
+                    )
+                },
+                SQL_ERROR
+            );
+            let mut output = [0xcc_u8; 16];
+            assert_eq!(
+                unsafe {
+                    crate::api::exports::SQLGetData(
+                        handles.stmt,
+                        1,
+                        first_target,
+                        output.as_mut_ptr().cast(),
+                        if first_target == SQL_C_CHAR { 2 } else { 4 },
+                        &mut indicator,
+                    )
+                },
+                SQL_SUCCESS_WITH_INFO
+            );
+            let second_target = if first_target == SQL_C_CHAR {
+                SQL_C_WCHAR
+            } else {
+                SQL_C_CHAR
+            };
+            output.fill(0xcc);
+            indicator = -99;
+            FAIL_TYPED_PLP_RESERVE_AFTER.set(Some(0));
+            assert_eq!(
+                unsafe {
+                    crate::api::exports::SQLGetData(
+                        handles.stmt,
+                        1,
+                        second_target,
+                        output.as_mut_ptr().cast(),
+                        16,
+                        &mut indicator,
+                    )
+                },
+                SQL_ERROR
+            );
+            assert_eq!(FAIL_TYPED_PLP_RESERVE_AFTER.replace(None), None);
+            assert_eq!(output, [0xcc; 16]);
+            assert_eq!(indicator, -99);
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(handles.stmt) };
+            assert_last_diag(
+                &stmt.inner.lock().unwrap().diag_records,
+                ERR_MEMORY_ALLOCATION,
+            );
+            assert_eq!(
+                unsafe {
+                    crate::api::exports::SQLGetData(
+                        handles.stmt,
+                        1,
+                        second_target,
+                        output.as_mut_ptr().cast(),
+                        16,
+                        &mut indicator,
+                    )
+                },
+                SQL_SUCCESS
+            );
+            let expected = if second_target == SQL_C_WCHAR {
+                utf16le("\u{e9}42")
+            } else {
+                "\u{e9}42".as_bytes().to_vec()
+            };
+            assert_eq!(indicator, expected.len() as SqlLen);
+            assert_eq!(&output[..expected.len()], &expected);
+        }
+    }
+
+    #[test]
+    fn typed_plp_decoded_retry_preserves_partially_delivered_characters() {
+        for target in [SQL_C_CHAR, SQL_C_WCHAR] {
+            let handles = TestHandles::with_env_dbc_stmt();
+            prefetched_text_stream(
+                &handles,
+                PlpEncoding::Utf16Text,
+                None,
+                utf16le("\u{1f600}42"),
+                None,
+            );
+            let mut value = -99_i32;
+            let mut indicator = -99;
+            let typed = |value: &mut i32, indicator: &mut SqlLen| unsafe {
+                crate::api::exports::SQLGetData(
+                    handles.stmt,
+                    1,
+                    SQL_C_SLONG,
+                    (value as *mut i32).cast(),
+                    0,
+                    indicator,
+                )
+            };
+            assert_eq!(typed(&mut value, &mut indicator), SQL_ERROR);
+            let mut output = [0xcc_u8; 8];
+            assert_eq!(
+                unsafe {
+                    crate::api::exports::SQLGetData(
+                        handles.stmt,
+                        1,
+                        target,
+                        output.as_mut_ptr().cast(),
+                        if target == SQL_C_CHAR { 2 } else { 4 },
+                        &mut indicator,
+                    )
+                },
+                SQL_SUCCESS_WITH_INFO
+            );
+            indicator = -99;
+            assert_eq!(typed(&mut value, &mut indicator), SQL_ERROR);
+            assert_eq!((value, indicator), (-99, -99));
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(handles.stmt) };
+            assert_last_diag(
+                &stmt.inner.lock().unwrap().diag_records,
+                ERR_INVALID_CHARACTER_VALUE,
+            );
+            assert_eq!(
+                unsafe {
+                    crate::api::exports::SQLGetData(
+                        handles.stmt,
+                        1,
+                        SQL_C_BINARY,
+                        output.as_mut_ptr().cast(),
+                        1,
+                        &mut indicator,
+                    )
+                },
+                SQL_SUCCESS_WITH_INFO
+            );
+            assert_eq!(
+                unsafe {
+                    crate::api::exports::SQLGetData(
+                        handles.stmt,
+                        1,
+                        target,
+                        output.as_mut_ptr().cast(),
+                        4,
+                        &mut indicator,
+                    )
+                },
+                SQL_SUCCESS_WITH_INFO
+            );
+            if target == SQL_C_CHAR {
+                assert_eq!(&output[..4], &[0x9f, 0x98, 0x80, 0]);
+            } else {
+                assert_eq!(&output[..4], &[0, 0xde, 0, 0]);
+            }
+            assert_eq!(typed(&mut value, &mut indicator), SQL_SUCCESS);
+            assert_eq!((value, indicator), (42, 4));
+        }
+    }
+
+    #[test]
+    fn typed_plp_rendering_allocation_failure_keeps_the_retry_position() {
+        let handles = TestHandles::with_env_dbc_stmt();
+        prefetched_text_stream(
+            &handles,
+            PlpEncoding::Utf16Text,
+            None,
+            utf16le("\u{e9}42"),
+            None,
+        );
+        let mut value = -99_i32;
+        let mut indicator = -99;
+        let typed = |value: &mut i32, indicator: &mut SqlLen| unsafe {
+            crate::api::exports::SQLGetData(
+                handles.stmt,
+                1,
+                SQL_C_SLONG,
+                (value as *mut i32).cast(),
+                0,
+                indicator,
+            )
+        };
+        assert_eq!(typed(&mut value, &mut indicator), SQL_ERROR);
+        let mut output = [0xcc_u8; 4];
+        FAIL_TYPED_PLP_RESERVE_AFTER.set(Some(0));
+        indicator = -99;
+        assert_eq!(
+            unsafe {
+                crate::api::exports::SQLGetData(
+                    handles.stmt,
+                    1,
+                    SQL_C_WCHAR,
+                    output.as_mut_ptr().cast(),
+                    4,
+                    &mut indicator,
+                )
+            },
+            SQL_ERROR
+        );
+        assert_eq!(FAIL_TYPED_PLP_RESERVE_AFTER.replace(None), None);
+        assert_eq!((value, indicator), (-99, -99));
+        assert_eq!(output, [0xcc; 4]);
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(handles.stmt) };
+        assert_last_diag(
+            &stmt.inner.lock().unwrap().diag_records,
+            ERR_MEMORY_ALLOCATION,
+        );
+        assert_eq!(
+            unsafe {
+                crate::api::exports::SQLGetData(
+                    handles.stmt,
+                    1,
+                    SQL_C_WCHAR,
+                    output.as_mut_ptr().cast(),
+                    4,
+                    &mut indicator,
+                )
+            },
+            SQL_SUCCESS_WITH_INFO
+        );
+        assert_eq!(typed(&mut value, &mut indicator), SQL_SUCCESS);
+        assert_eq!((value, indicator), (42, 4));
+    }
+
+    #[test]
+    fn typed_plp_decoded_retries_convert_only_the_unread_suffix() {
+        for first_target in [SQL_C_CHAR, SQL_C_WCHAR] {
+            for switch_character_target in [false, true] {
+                let handles = TestHandles::with_env_dbc_stmt();
+                prefetched_text_stream(
+                    &handles,
+                    PlpEncoding::Utf16Text,
+                    None,
+                    utf16le(if switch_character_target {
+                        "\u{e9}x42"
+                    } else {
+                        "\u{e9}42"
+                    }),
+                    None,
+                );
+                let mut value = -99_i32;
+                let mut indicator = -99;
+                assert_eq!(
+                    unsafe {
+                        crate::api::exports::SQLGetData(
+                            handles.stmt,
+                            1,
+                            SQL_C_SLONG,
+                            (&mut value as *mut i32).cast(),
+                            0,
+                            &mut indicator,
+                        )
+                    },
+                    SQL_ERROR
+                );
+                let mut prefix = [0xcc; 8];
+                assert_eq!(
+                    unsafe {
+                        crate::api::exports::SQLGetData(
+                            handles.stmt,
+                            1,
+                            first_target,
+                            prefix.as_mut_ptr().cast(),
+                            if first_target == SQL_C_CHAR { 3 } else { 4 },
+                            &mut indicator,
+                        )
+                    },
+                    SQL_SUCCESS_WITH_INFO
+                );
+                assert_eq!(
+                    &prefix[..2],
+                    if first_target == SQL_C_CHAR {
+                        &[0xc3, 0xa9]
+                    } else {
+                        &[0xe9, 0]
+                    }
+                );
+                if switch_character_target {
+                    let second_target = if first_target == SQL_C_CHAR {
+                        SQL_C_WCHAR
+                    } else {
+                        SQL_C_CHAR
+                    };
+                    assert_eq!(
+                        unsafe {
+                            crate::api::exports::SQLGetData(
+                                handles.stmt,
+                                1,
+                                second_target,
+                                prefix.as_mut_ptr().cast(),
+                                if second_target == SQL_C_CHAR { 2 } else { 4 },
+                                &mut indicator,
+                            )
+                        },
+                        SQL_SUCCESS_WITH_INFO
+                    );
+                    assert_eq!(prefix[0], b'x');
+                    assert_eq!(prefix[1], 0);
+                    assert_eq!(indicator, if second_target == SQL_C_CHAR { 3 } else { 6 });
+                }
+                assert_eq!(
+                    unsafe {
+                        crate::api::exports::SQLGetData(
+                            handles.stmt,
+                            1,
+                            SQL_C_SLONG,
+                            (&mut value as *mut i32).cast(),
+                            0,
+                            &mut indicator,
+                        )
+                    },
+                    SQL_SUCCESS
+                );
+                assert_eq!((value, indicator), (42, 4));
+            }
+        }
+    }
+
+    #[test]
+    fn typed_plp_retry_target_switches_keep_independent_offsets() {
+        let literal = "\u{e9}invalid";
+        for (encoding, narrow, wire) in [
+            (PlpEncoding::Utf16Text, None, utf16le(literal)),
+            (
+                PlpEncoding::SingleByteText,
+                Some(encoding_rs::WINDOWS_1252.into()),
+                b"\xe9invalid".to_vec(),
+            ),
+            (
+                PlpEncoding::Utf8Text,
+                Some(encoding_rs::UTF_8.into()),
+                literal.as_bytes().to_vec(),
+            ),
+        ] {
+            for text_target in [SQL_C_CHAR, SQL_C_WCHAR] {
+                let text = if text_target == SQL_C_WCHAR {
+                    utf16le(literal)
+                } else {
+                    literal.as_bytes().to_vec()
+                };
+                let unit = if text_target == SQL_C_WCHAR { 2 } else { 1 };
+                for binary_first in [false, true] {
+                    for finish_binary in [false, true] {
+                        let handles = TestHandles::with_env_dbc_stmt();
+                        prefetched_text_stream(&handles, encoding, narrow, wire.clone(), None);
+                        let mut value = -99_i32;
+                        let mut indicator = -99;
+                        assert_eq!(
+                            unsafe {
+                                crate::api::exports::SQLGetData(
+                                    handles.stmt,
+                                    1,
+                                    SQL_C_SLONG,
+                                    (&mut value as *mut i32).cast(),
+                                    0,
+                                    &mut indicator,
+                                )
+                            },
+                            SQL_ERROR
+                        );
+                        let mut binary_offset = 0;
+                        let mut text_offset = 0;
+                        for _ in 0..2 {
+                            for binary in [binary_first, !binary_first] {
+                                assert_eq!(
+                                    unsafe {
+                                        crate::api::exports::SQLGetData(
+                                            handles.stmt,
+                                            1,
+                                            SQL_C_BINARY,
+                                            std::ptr::null_mut(),
+                                            0,
+                                            &mut indicator,
+                                        )
+                                    },
+                                    SQL_SUCCESS_WITH_INFO
+                                );
+                                assert_eq!(indicator, (wire.len() - binary_offset) as SqlLen);
+                                let mut output = [0xcc; 8];
+                                let (target, capacity, take, offset, expected) = if binary {
+                                    (SQL_C_BINARY, 1, 1, &mut binary_offset, &wire)
+                                } else {
+                                    (text_target, 2 * unit, unit, &mut text_offset, &text)
+                                };
+                                assert_eq!(
+                                    unsafe {
+                                        crate::api::exports::SQLGetData(
+                                            handles.stmt,
+                                            1,
+                                            target,
+                                            output.as_mut_ptr().cast(),
+                                            capacity as SqlLen,
+                                            &mut indicator,
+                                        )
+                                    },
+                                    SQL_SUCCESS_WITH_INFO
+                                );
+                                assert_eq!(indicator, (expected.len() - *offset) as SqlLen);
+                                assert_eq!(&output[..take], &expected[*offset..*offset + take]);
+                                if !binary {
+                                    assert!(output[take..capacity].iter().all(|b| *b == 0));
+                                }
+                                assert!(output[capacity..].iter().all(|b| *b == 0xcc));
+                                *offset += take;
+                            }
+                        }
+                        let (target, expected) = if finish_binary {
+                            (SQL_C_BINARY, &wire[binary_offset..])
+                        } else {
+                            (text_target, &text[text_offset..])
+                        };
+                        let mut output = [0xcc; 64];
+                        assert_eq!(
+                            unsafe {
+                                crate::api::exports::SQLGetData(
+                                    handles.stmt,
+                                    1,
+                                    target,
+                                    output.as_mut_ptr().cast(),
+                                    64,
+                                    &mut indicator,
+                                )
+                            },
+                            SQL_SUCCESS
+                        );
+                        assert_eq!(indicator, expected.len() as SqlLen);
+                        assert_eq!(&output[..expected.len()], expected);
+                        assert_eq!(
+                            unsafe {
+                                crate::api::exports::SQLGetData(
+                                    handles.stmt,
+                                    1,
+                                    SQL_C_BINARY,
+                                    std::ptr::null_mut(),
+                                    0,
+                                    &mut indicator,
+                                )
+                            },
+                            SQL_NO_DATA
+                        );
+                        let stmt = unsafe { handle_from_raw::<StmtHandle>(handles.stmt) };
+                        assert!(stmt.inner.lock().unwrap().captured_plp_wire.is_none());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn typed_plp_conversion_error_preserves_binary_retry_bytes() {
+        let mut long_wide = utf16le(&"x".repeat(TYPED_PLP_CHUNK_BYTES / 2 - 1));
+        long_wide.extend(utf16le("\u{1f600}"));
+        for (encoding, narrow, wire) in [
+            (
+                PlpEncoding::Utf16Text,
+                None,
+                utf16le("invalid \u{20ac}\u{1f600}"),
+            ),
+            (PlpEncoding::Utf16Text, None, vec![0, 0xd8, 0xff]),
+            (PlpEncoding::Utf16Text, None, long_wide),
+            (
+                PlpEncoding::SingleByteText,
+                Some(encoding_rs::WINDOWS_1252.into()),
+                vec![0x80, b'x'],
+            ),
+            (
+                PlpEncoding::Utf8Text,
+                Some(encoding_rs::UTF_8.into()),
+                vec![0xff, b'x'],
+            ),
+        ] {
+            for known in [false, true] {
+                for prefix_read in [false, true] {
+                    let handles = TestHandles::with_env_dbc_stmt();
+                    let mut source = if prefix_read {
+                        vec![b'!'; 2]
+                    } else {
+                        Vec::new()
+                    };
+                    source.extend_from_slice(&wire);
+                    let total = known.then_some(u64::try_from(source.len()).unwrap());
+                    prefetched_text_stream(&handles, encoding, narrow, source, total);
+                    let mut indicator = -99;
+                    if prefix_read {
+                        let mut prefix = [0xcc; 2];
+                        assert_eq!(
+                            unsafe {
+                                crate::api::exports::SQLGetData(
+                                    handles.stmt,
+                                    1,
+                                    SQL_C_BINARY,
+                                    prefix.as_mut_ptr().cast(),
+                                    2,
+                                    &mut indicator,
+                                )
+                            },
+                            SQL_SUCCESS_WITH_INFO
+                        );
+                        assert_eq!(prefix, [b'!'; 2]);
+                    }
+                    for _ in 0..2 {
+                        let mut value = -99_i32;
+                        indicator = -99;
+                        assert_eq!(
+                            unsafe {
+                                crate::api::exports::SQLGetData(
+                                    handles.stmt,
+                                    1,
+                                    SQL_C_SLONG,
+                                    (&mut value as *mut i32).cast(),
+                                    0,
+                                    &mut indicator,
+                                )
+                            },
+                            SQL_ERROR
+                        );
+                        assert_eq!((value, indicator), (-99, -99));
+                        let stmt = unsafe { handle_from_raw::<StmtHandle>(handles.stmt) };
+                        assert_last_diag(
+                            &stmt.inner.lock().unwrap().diag_records,
+                            ERR_INVALID_CHARACTER_VALUE,
+                        );
+                    }
+                    assert_eq!(
+                        unsafe {
+                            crate::api::exports::SQLGetData(
+                                handles.stmt,
+                                1,
+                                SQL_C_BINARY,
+                                std::ptr::null_mut(),
+                                0,
+                                &mut indicator,
+                            )
+                        },
+                        SQL_SUCCESS_WITH_INFO
+                    );
+                    assert_eq!(indicator, SqlLen::try_from(wire.len()).unwrap());
+                    let mut offset = 0;
+                    while offset < wire.len() {
+                        let mut output = [0xcc; 4097];
+                        let remaining = wire.len() - offset;
+                        let take = remaining.min(output.len());
+                        assert_eq!(
+                            unsafe {
+                                crate::api::exports::SQLGetData(
+                                    handles.stmt,
+                                    1,
+                                    SQL_C_BINARY,
+                                    output.as_mut_ptr().cast(),
+                                    SqlLen::try_from(output.len()).unwrap(),
+                                    &mut indicator,
+                                )
+                            },
+                            if take < remaining {
+                                SQL_SUCCESS_WITH_INFO
+                            } else {
+                                SQL_SUCCESS
+                            }
+                        );
+                        assert_eq!(indicator, SqlLen::try_from(remaining).unwrap());
+                        assert_eq!(&output[..take], &wire[offset..offset + take]);
+                        assert!(output[take..].iter().all(|byte| *byte == 0xcc));
+                        offset += take;
+                    }
+                    assert_eq!(
+                        unsafe {
+                            crate::api::exports::SQLGetData(
+                                handles.stmt,
+                                1,
+                                SQL_C_BINARY,
+                                std::ptr::null_mut(),
+                                0,
+                                &mut indicator,
+                            )
+                        },
+                        SQL_NO_DATA
+                    );
+                    let stmt = unsafe { handle_from_raw::<StmtHandle>(handles.stmt) };
+                    assert!(stmt.inner.lock().unwrap().captured_plp_wire.is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn typed_plp_retry_keeps_character_carry_separate_from_wire_bytes() {
+        for binary in [false, true] {
+            let handles = TestHandles::with_env_dbc_stmt();
+            let wire = utf16le("42");
+            prefetched_text_stream(
+                &handles,
+                PlpEncoding::Utf16Text,
+                None,
+                wire.clone(),
+                Some(4),
+            );
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(handles.stmt) };
+            stmt.inner
+                .lock()
+                .unwrap()
+                .active_plp
+                .as_mut()
+                .unwrap()
+                .pending_units
+                .push(u16::from(b'x'));
+            let mut value = -99_i32;
+            let mut indicator = -99;
+            assert_eq!(
+                unsafe {
+                    crate::api::exports::SQLGetData(
+                        handles.stmt,
+                        1,
+                        SQL_C_SLONG,
+                        (&mut value as *mut i32).cast(),
+                        0,
+                        &mut indicator,
+                    )
+                },
+                SQL_ERROR
+            );
+            let mut output = [0xcc; 8];
+            assert_eq!(
+                unsafe {
+                    crate::api::exports::SQLGetData(
+                        handles.stmt,
+                        1,
+                        if binary { SQL_C_BINARY } else { SQL_C_CHAR },
+                        output.as_mut_ptr().cast(),
+                        8,
+                        &mut indicator,
+                    )
+                },
+                SQL_SUCCESS
+            );
+            if binary {
+                assert_eq!(indicator, 4);
+                assert_eq!(&output[..4], wire);
+            } else {
+                assert_eq!(indicator, 3);
+                assert_eq!(&output[..4], b"x42\0");
+            }
+            assert!(stmt.inner.lock().unwrap().captured_plp_wire.is_none());
+        }
+    }
+
+    #[test]
+    fn typed_plp_retry_wire_is_discarded_with_the_row_or_column() {
+        for next_row in [false, true] {
+            let handles = TestHandles::with_env_dbc_stmt();
+            prefetched_text_stream(
+                &handles,
+                PlpEncoding::Utf16Text,
+                None,
+                utf16le("invalid"),
+                Some(14),
+            );
+            let mut value = -99_i32;
+            let mut indicator = -99;
+            assert_eq!(
+                unsafe {
+                    crate::api::exports::SQLGetData(
+                        handles.stmt,
+                        1,
+                        SQL_C_SLONG,
+                        (&mut value as *mut i32).cast(),
+                        0,
+                        &mut indicator,
+                    )
+                },
+                SQL_ERROR
+            );
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(handles.stmt) };
+            {
+                let mut state = stmt.inner.lock().unwrap();
+                assert!(state.captured_plp_wire.is_some());
+                if next_row {
+                    state.begin_row();
+                    assert!(state.captured_plp_wire.is_none());
+                }
+                state.column_metadata = int_columns(2);
+                state.buffered_get_data_row = Some(BufferedGetDataRow {
+                    values: vec![
+                        Some(ColumnValues::Bytes(vec![7])),
+                        Some(ColumnValues::Bytes(vec![9])),
+                    ],
+                    variant_bases: vec![None; 2],
+                    consumed: 0,
+                    wire_deferred: false,
+                });
+            }
+            let mut output = [0xcc; 8];
+            assert_eq!(
+                unsafe {
+                    crate::api::exports::SQLGetData(
+                        handles.stmt,
+                        if next_row { 1 } else { 2 },
+                        SQL_C_BINARY,
+                        output.as_mut_ptr().cast(),
+                        8,
+                        &mut indicator,
+                    )
+                },
+                SQL_SUCCESS
+            );
+            assert_eq!(indicator, 1);
+            assert_eq!(output[0], if next_row { 7 } else { 9 });
+            assert!(stmt.inner.lock().unwrap().captured_plp_wire.is_none());
+        }
+    }
+
+    #[test]
+    fn typed_plp_conversion_error_keeps_text_available_for_retry() {
+        let handles = TestHandles::with_env_dbc_stmt();
+        prefetched_text_stream(
+            &handles,
+            PlpEncoding::Utf16Text,
+            None,
+            utf16le("invalid"),
+            None,
+        );
+        let mut value = -99_i32;
+        let mut indicator = -99;
+        assert_eq!(
+            unsafe {
+                sql_get_data(
+                    handles.stmt,
+                    1,
+                    SQL_C_SLONG,
+                    (&mut value as *mut i32).cast(),
+                    0,
+                    &mut indicator,
+                )
+            },
+            SQL_ERROR
+        );
+        assert_eq!(value, -99);
+        assert_eq!(indicator, -99);
+        let mut text = [0xcc; 8];
+        assert_eq!(
+            unsafe {
+                sql_get_data(
+                    handles.stmt,
+                    1,
+                    SQL_C_CHAR,
+                    text.as_mut_ptr().cast(),
+                    8,
+                    &mut indicator,
+                )
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!(&text, b"invalid\0");
+        assert_eq!(indicator, 7);
+    }
+
+    #[test]
+    fn typed_plp_writes_unaligned_fixed_outputs_without_using_buffer_length() {
+        let handles = TestHandles::with_env_dbc_stmt();
+        prefetched_text_stream(
+            &handles,
+            PlpEncoding::Utf16Text,
+            None,
+            utf16le("42"),
+            Some(4),
+        );
+        let mut values = [0xcccccccc_u32; 2];
+        let mut indicators = [-99_isize; 2];
+        let output = unsafe { values.as_mut_ptr().cast::<u8>().add(1).cast::<i32>() };
+        let indicator = unsafe { indicators.as_mut_ptr().cast::<u8>().add(1).cast::<SqlLen>() };
+        assert_eq!(
+            unsafe { sql_get_data(handles.stmt, 1, SQL_C_SLONG, output.cast(), 0, indicator) },
+            SQL_SUCCESS
+        );
+        assert_eq!(unsafe { output.read_unaligned() }, 42);
+        assert_eq!(unsafe { indicator.read_unaligned() }, 4);
+        let bytes = unsafe { std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), 8) };
+        assert_eq!(bytes[0], 0xcc);
+        assert_eq!(&bytes[5..], &[0xcc; 3]);
+    }
+
+    #[test]
+    fn typed_plp_decoder_preserves_split_wire_characters_and_pending_output() {
+        for (encoding, narrow, wire, expected) in [
+            (
+                PlpEncoding::Utf16Text,
+                None,
+                utf16le("\u{1f600}42"),
+                "\u{1f600}42",
+            ),
+            (
+                PlpEncoding::SingleByteText,
+                Some(encoding_rs::UTF_8.into()),
+                "\u{20ac}42".as_bytes().to_vec(),
+                "\u{20ac}42",
+            ),
+            (
+                PlpEncoding::SingleByteText,
+                Some(encoding_rs::WINDOWS_1252.into()),
+                vec![0x80, b'4', b'2'],
+                "\u{20ac}42",
+            ),
+        ] {
+            let mut stream = ActivePlpStream::new(1, encoding, narrow);
+            stream.pending_units.push(u16::from(b'1'));
+            let mut bytes = Vec::new();
+            for (index, byte) in wire.iter().enumerate() {
+                append_typed_plp_text(&mut stream, &[*byte], index + 1 == wire.len(), &mut bytes)
+                    .unwrap();
+            }
+            assert_eq!(String::from_utf8(bytes).unwrap(), format!("1{expected}"));
+            assert!(stream.pending_units.is_empty());
+            assert!(stream.pending_bytes.is_empty());
+        }
     }
 
     #[test]
@@ -7568,6 +10418,105 @@ mod tests {
             diagnostic.message.contains("deferred PLP prefetch failure"),
             "{diagnostic:?}"
         );
+    }
+
+    #[test]
+    fn buffered_unicode_plp_null_preserves_buffer_at_all_capacities() {
+        use mssql_mock_tds::{ColumnDefinition, ColumnValue, QueryResponse, Row, SqlDataType};
+
+        for capacity in [0, 1, 2, 3, 32] {
+            let h = TestHandles::with_env_dbc_stmt();
+            let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+            let response = QueryResponse::new(
+                vec![
+                    ColumnDefinition::new("prefix", SqlDataType::Int),
+                    ColumnDefinition::new("value", SqlDataType::NVarCharMax),
+                    ColumnDefinition::new("following", SqlDataType::Int),
+                ],
+                vec![Row::new(vec![
+                    ColumnValue::Int(1),
+                    ColumnValue::NVarCharMaxNull,
+                    ColumnValue::Int(42),
+                ])],
+            );
+            let _server =
+                crate::test_support::connect_mock_server(dbc, "SELECT null_plp", response);
+            let sql: Vec<u16> = "SELECT null_plp\0".encode_utf16().collect();
+            assert_eq!(
+                unsafe {
+                    crate::api::exec_direct::sql_exec_direct_w(h.stmt, sql.as_ptr(), SQL_NTS)
+                },
+                SQL_SUCCESS
+            );
+            assert_eq!(unsafe { crate::api::fetch::sql_fetch(h.stmt) }, SQL_SUCCESS);
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            {
+                let state = stmt.inner.lock().unwrap();
+                let row = state.buffered_get_data_row.as_ref().unwrap();
+                assert!(matches!(row.values[0], Some(ColumnValues::Int(1))));
+                assert!(row.values[1].is_none(), "NULL PLP must remain deferred");
+                assert_eq!(
+                    state.column_metadata[1].plp_encoding(),
+                    Some(PlpEncoding::Utf16Text)
+                );
+            }
+
+            let mut buffer = [0x7Eu8; 34];
+            let mut indicator = -99;
+            let ptr = buffer[1..].as_mut_ptr().cast();
+            assert_eq!(
+                unsafe {
+                    crate::api::exports::SQLGetData(
+                        h.stmt,
+                        2,
+                        SQL_C_WCHAR,
+                        ptr,
+                        capacity,
+                        &mut indicator,
+                    )
+                },
+                SQL_SUCCESS,
+                "capacity {capacity}"
+            );
+            assert_eq!(indicator, SQL_NULL_DATA);
+            assert_eq!(buffer, [0x7E; 34], "capacity {capacity}");
+            {
+                let state = stmt.inner.lock().unwrap();
+                assert!(state.diag_records.is_empty());
+                assert!(state.last_captured.is_none());
+                assert!(state.active_plp.is_none());
+                assert_eq!(state.current_row_last_col, 2);
+            }
+            assert_eq!(
+                unsafe {
+                    crate::api::exports::SQLGetData(
+                        h.stmt,
+                        2,
+                        SQL_C_WCHAR,
+                        ptr,
+                        capacity,
+                        &mut indicator,
+                    )
+                },
+                SQL_NO_DATA
+            );
+            assert_eq!(buffer, [0x7E; 34]);
+            let mut next = 0i32;
+            assert_eq!(
+                unsafe {
+                    crate::api::exports::SQLGetData(
+                        h.stmt,
+                        3,
+                        SQL_C_SLONG,
+                        (&raw mut next).cast(),
+                        4,
+                        &mut indicator,
+                    )
+                },
+                SQL_SUCCESS
+            );
+            assert_eq!(next, 42);
+        }
     }
 
     fn open_mock_plp(chunks: Vec<Vec<u16>>) -> (TestHandles, crate::test_support::MockServer) {

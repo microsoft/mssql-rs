@@ -1,17 +1,7 @@
-# Dev environment setup for SSH linux
+# CI dependency setup
 
-Run the `./install-deps.sh` This install the prereqs on Ubuntu
+`install-deps.sh` installs build dependencies on the Azure Linux 3 CI agent images using `tdnf`. It supports x86_64 and aarch64, requires sudo access, and expects Azure CLI to be preinstalled. Docker must already be installed on x86_64; the script installs and starts it on aarch64.
 
-After this download the `msrustup` using the `install-msrustup.sh` script.
+This is not an Ubuntu developer setup script. It does not install or configure an SSH server or create SSH users.
 
-This will place the `msrustup` binary in the same folder as the scripts. 
-
-Now run `./msrustup`. For Authentication, you need to use DeviceCode authentication, since the browser won't work in SSH. 
-
-Restart the terminal. 
-
-
-Now Cargo should be available in the PATH. 
-
-From the root of the repo, run `cargo build`. This should succeed. 
-
+For local development prerequisites and build instructions, see [Getting Started](../README.md#getting-started) in the root README.

@@ -9,8 +9,7 @@
 # A test file can hard-crash the interpreter (segfault / abort) against a
 # driver still under active development, so each test file gets its own pytest
 # process wrapped in `timeout`: a crash or a hang costs one file, not the whole
-# run, and the suite is now a blocking compatibility signal rather than an
-# advisory one.
+# run.
 #
 #   - A crash kills only that file's process; the loop moves to the next file.
 #   - `timeout` bounds every file, so a wedged driver call can never stall the job.
@@ -40,8 +39,8 @@
 #      files skipped because the time budget ran out.
 #   2  the harness itself could not run the tests (broken venv, missing
 #      interpreter, or a run in which no file executed a single test).
-# The calling step propagates every nonzero exit code, so either failure mode
-# fails the pipeline job.
+# Non-PR CI treats exit 1 as advisory (SucceededWithIssues); PRs and exit 2 still
+# fail the job. Local callers receive the original nonzero exit code.
 
 # No `set -e`: a failing or crashing test file must not abort the loop.
 set -uo pipefail
@@ -184,9 +183,10 @@ for idx in "${!TEST_FILES[@]}"; do
     case "$rc" in
         0)   status="PASSED";              kind="ok";      passed=$((passed + 1)) ;;
         1)   status="FAILED";              kind="error";   failed=$((failed + 1)) ;;
-        2)   status="INTERRUPTED";         kind="error";   failed=$((failed + 1)) ;;
-        3)   status="INTERNAL ERROR";      kind="error";   failed=$((failed + 1)) ;;
-        4)   status="USAGE ERROR";         kind="error";   failed=$((failed + 1)) ;;
+        # Driver import failures during collection also produce pytest exit 2.
+        2)   status="COLLECTION ERROR / INTERRUPTED"; kind="error"; failed=$((failed + 1)) ;;
+        3)   status="INTERNAL ERROR";      kind="error";   harness_error=$((harness_error + 1)) ;;
+        4)   status="USAGE ERROR";         kind="error";   harness_error=$((harness_error + 1)) ;;
         # Every test in the file was deselected by pytest.ini's `-m "not stress"`.
         5)   status="NO TESTS COLLECTED";  kind="skipped"; empty=$((empty + 1)) ;;
         # `timeout` could not run the command at all - a broken venv or missing

@@ -134,12 +134,19 @@ msodbcsql build is measured.
    `SKIP_IF_COMPARING_MSODBCSQL()`. Tracked in AB#47369, which is where the
    outstanding 18.6.2.1 measurements land - keep the running record there
    rather than growing this file per build.
-7. **A bound `max`/LOB text column converted to a typed C target is refused
+7. **A `max`/LOB text column converted to a typed C target is refused
    above 1 MiB; msodbcsql converts a truncated prefix and warns.** Both drivers
    cap what a typed conversion may materialize - a `varchar(max)` carries up to
    2 GB and the converter needs one contiguous literal. This driver's cap is
    `PLP_TYPED_MATERIALIZE_LIMIT` (`api/fetch_scroll.rs`) at 1 MiB; past it the
    value is drained to keep the row synchronized and answered `HYC00`.
+   This applies to bound fetches and `SQLGetData`; the shared limit counts
+   unread source wire bytes, including both bytes of each UTF-16 code unit.
+   Earlier character reads do not count against a subsequent typed
+   `SQLGetData` call's cap. Decoding
+   can expand that bounded input into UTF-8, but allocation never scales with
+   an unbounded server value. Below the cap, this driver converts the complete
+   remaining literal, not a truncated prefix.
    msodbcsql clamps to `2*CONVBUF_SIZE` (~1244 bytes, sized for the longest
    legal `double` literal) in `EstimateBytesToRead` (`odbc/sqlcdata.cpp`), then
    converts that prefix and reports `01004` rather than failing.
@@ -162,7 +169,17 @@ msodbcsql build is measured.
    `varchar(max)` bound to a typed target reaches it - schema drift, not a
    contrived input. CI compares against 18.6.2.1; this measurement is
    18.06.0001, so re-measure there before relying on the exact prefix length.
-   Tracked in AB#47767.
+   `SQLGetData` was re-measured on Linux with **18.06.0001** for AB#47238:
+   `'0'` repeated 1048576 times followed by `'1'`, as either `varchar(max)` or
+   `nvarchar(max)`, returns `SQL_SUCCESS_WITH_INFO`, `01004`, integer `0`, and
+   indicator `4`. This driver returns `SQL_ERROR` / `HYC00` without changing
+   either output, and both can retrieve the following column. The dedicated
+   `PlpTypedOversizedValueIsRefusedAndDrained` test asserts each driver's
+   result. The native caller clamps fixed conversions in `GetColData`'s
+   delivery implementation (`odbc/sqlcdata.h`, `IsFixedOrBinaryWithFixedServerType`
+   branch) before `FetchDataWithCopy`, consistent with `EstimateBytesToRead`.
+   Reusing the bound-fetch policy for `SQLGetData` was approved by David Engel
+   on 2026-09-22. Tracked in AB#47767 and AB#47238.
 8. **Widening a bound narrow `max` column to `SQL_C_WCHAR` truncates on a whole
    character.** A buffer with no room for the final surrogate pair ends before
    it; msodbcsql leaves the lone high surrogate in the last payload slot on this
@@ -424,3 +441,39 @@ msodbcsql build is measured.
    agent capture for msodbcsql. A parity measurement that connects msodbcsql
    18.6.2.1 (the build pinned in CI) to a server or proxy that records the TDS 8
    user-agent feature would close this evidence gap.
+16. **Direct IPD field edits invalidate a cached plan when its SQL definition
+    changes.** msodbcsql's `ParamInfoSnapshot::FHasChanged` in
+    `Sql/Ntdbms/sqlncli/odbc/sqlcprot.h` is used by `SetIPDRec` in `sqlcdesc.cpp`,
+    not by the direct `SQLSetDescFieldW` route. On retail 18.06.0001 through the
+    Windows Driver Manager, an IPD INTEGER-to-SMALLINT field edit retained
+    `sp_execute` and an INTEGER result; `SQLSetDescRec` reparsed as SMALLINT.
+    This driver handles both routes consistently so the next execute reflects
+    the changed SQL definition. Approved by David Engel on 2026-09-17 in the
+    scope of [PR #564](https://github.com/microsoft/mssql-rs/pull/564).
+    Retail 18.6.2.1 was not measured for this distinction; do not infer it from
+    the driver's compatibility version string or add a parity-test skip.
+17. **Special SQL types retain a conservative plan-invalidation comparison.**
+    `DescRecord::parameter_definition` compares length, precision, and scale
+    for types outside its named character/binary, numeric, and fixed/temporal
+    arms, in addition to direction and SQL type. This differs from the
+    reference-source comparison, independently of the setter-route difference
+    in entry 16: at msodbcsql source `aa19092c`,
+    `Sql/Ntdbms/sqlncli/odbc/sqlcdesc.cpp` maps the public SQL identifiers before
+    `SetIPDRec` invokes `ParamInfoSnapshot::FHasChanged` in `sqlcprot.h`.
+    `IsSQLBinary` includes mapped UDT and `IsSQLWCHAR` includes mapped XML, so
+    that comparison considers only their length; mapped vector is outside all
+    shape-comparison groups, so it considers only direction and SQL type.
+    This driver deliberately retains the broader fallback because special
+    types can encode SQL shape in these fields, such as vector dimensions and
+    element type. It may re-prepare for an irrelevant field change rather
+    than risk retaining an obsolete declaration. This policy is part of the
+    selective design in [PR #564](https://github.com/microsoft/mssql-rs/pull/564),
+    not a change to which parameter types or conversions are supported.
+    `special_parameter_definitions_keep_size_precision_and_scale` pins the
+    vector and UDT projections; UDT parameter binding remains unsupported.
+    **Evidence limit:** this is a source comparison and a Rust unit test,
+    not a measured retail reuse/re-prepare claim. The earlier 18.06.0001 RPC
+    measurements did not cover these special-type edits. A supported
+    Driver Manager bind/record-edit sequence with RPC capture and a recorded
+    `SQL_DRIVER_VER` is still needed to establish shipping-build behavior;
+    do not infer retail parity or add a comparison-test skip from this entry.

@@ -26,6 +26,13 @@ pub use crate::sql_identifier::escape_identifier;
 
 pub use crate::message::parameters::rpc_parameters::rpc_parameter_status;
 
+/// Uses the declaration generator used by prepared RPCs, without a server.
+pub fn rpc_parameter_declaration(
+    parameter: &crate::message::parameters::rpc_parameters::RpcParameter,
+) -> TdsResult<String> {
+    parameter.sql_declaration()
+}
+
 use crate::connection::client_context::ClientContext;
 use crate::connection::execution_context::ExecutionContext;
 use crate::connection::tds_client::TdsClient;
@@ -551,6 +558,26 @@ pub fn done_proc_no_more() -> ScriptedToken {
         cur_cmd: CurrentCommand::Select,
         row_count: 0,
     }))
+}
+
+/// An RPC output parameter returned before the terminal `DONEPROC`.
+pub fn return_value(value: crate::query::result::ReturnValue) -> ScriptedToken {
+    ScriptedToken(Tokens::ReturnValue(
+        crate::token::tokens::ReturnValueToken {
+            param_ordinal: value.param_ordinal,
+            param_name: value.param_name,
+            value: value.value,
+            column_metadata: value.column_metadata,
+            status: value.status,
+        },
+    ))
+}
+
+/// A stored procedure's integer return status.
+pub fn return_status(value: i32) -> ScriptedToken {
+    ScriptedToken(Tokens::ReturnStatus(
+        crate::token::tokens::ReturnStatusToken { value },
+    ))
 }
 
 /// A terminal DONE token (no more results — end of batch).

@@ -352,11 +352,14 @@ unchanged.
 - `mcr.microsoft.com/mssql/server:<sqlImageTag>` ships
   `/opt/mssql-tools18/bin/sqlcmd`, which `start.sh` uses for the readiness
   probe. The current default tag (`2025-latest`) does.
-- The ubuntu image used by the x64 SQL host (`RUST-UBUSLIM`) provides
+- The Azure Linux image used by the x64 SQL host (`RUST-AZL3`) provides
   `curl` and `docker`. The latter is enforced by `DockerInstaller@0` and
-  `install-ubuntu-dependency.yaml`; the former is standard in the image.
+  `install-host-dependency.yaml`; the former is standard in the image.
+  The image also ships `net-tools` and `iproute`, but `net-tools`' `hostname`
+  has no `-I` flag and exits 3 on it, so `start.sh` relies on the `ip(8)`
+  fallback to advertise the agent's private IPv4.
 - Both ARM and x64 1ES pool agents have `python3` available (used by
-  `poll-for-endpoint.sh` for JSON parsing). Standard in the Ubuntu images.
+  `poll-for-endpoint.sh` for JSON parsing). Standard in the Azure Linux images.
 - **Rerun granularity.** Attempt namespacing makes **Rerun stage** fully clean
   (all jobs re-run under a new `System.StageAttempt`, forming a fresh
   handshake). **Rerun failed jobs** is *not* fully supported yet: on a test

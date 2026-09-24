@@ -660,7 +660,8 @@ diagonal would reject every defaulted decimal binding.
 
 Shared with fetch rather than reimplemented - `days_since_0001_from_civil` sits
 beside its existing inverse, decimal text goes through
-`numeric::parse_numeric_text`, and `SqlGuid` is taken apart with
+`numeric::parse_numeric_text_with_policy` with `UnderflowPolicy::Reject` on every
+platform (rather than the fetch parser's platform default), and `SqlGuid` is taken apart with
 `Uuid::from_fields`, the mirror of `convert_guid_c`.
 
 Rules read from msodbcsql source, not derived:
@@ -673,7 +674,7 @@ Rules read from msodbcsql source, not derived:
 | The `real` range check is symmetric | `sqlccnvt.cpp:5519` | A non-zero magnitude *below* `FLT_MIN` is `22003`, not just one above `FLT_MAX`. An infinity is too: `Temp` is a `DOUBLE` (`:5327`), so `+INF > FLT_MAX` holds before the narrowing cast |
 | That check applies to a 64-bit source only | measured, retail 18.6.2.1 | `SQL_C_DOUBLE` -> `SQL_REAL` at `1e-40` is `22003`, but `SQL_C_FLOAT` -> `SQL_REAL` at the same magnitude binds, executes and arrives as `9.99995e-41`. Nothing narrows when the source is already `real`, so the rule keys off the source width, not the value |
 | `SQL_C_BIT` is read as one `SCHAR` and widened like a tinyint | `sqlccnvt.cpp:5057` | Any non-zero byte reaches `bit` as 1; no value is rejected |
-| A fraction past the declared scale follows the character rule - dropped when zero, `22001` when not | `sqlccnvt.cpp:7823`, rewritten inbound at `sqlcfunc.cpp:3348` | `"1.50"` into `decimal(5,1)` converts; `"1.55"` does not |
+| A fraction past the declared scale follows the character rule - dropped when zero, `22001` when not | `ConvertToNumeric` calls `stringtonumeric` (`sqlccnvt.cpp:7101`); `FindSigNumber` strips fractional zeros (:8389, :7995-8008), then the scale check reports truncation (:8433-8437), rewritten inbound by `ParamToSQLType` (`sqlcfunc.cpp:3350-3370`); measured on Linux Driver 18.6.2.1 | `"1.50"` into `decimal(5,1)` converts; `"1.55"` does not |
 | A dropped *datetime* fraction is `22008`, not the `22001` the character rule uses | measured, retail 18.6.2.1; `sqlcfunc.cpp:3128` | `time`, `datetime2` and `datetimeoffset` alike. `:3128` is unconditional and its `switch (fSqlType)` case list covers every temporal type; the guard at `:3131` then jumps to `ErrorRet`, so the C-type-gated rewrite at `:3350` is not reached this way. Whether any route reaches `:3350` with a temporal `fSqlType` is not established |
 | A temporal parameter is declared at the **maximum** fractional-seconds scale | measured, retail 18.6.2.1 | `SQL_DESC_SCALE` is 7 under every `ColumnSize` and `DecimalDigits`, including an explicit 0. `DecimalDigits` still bounds the value, so a fraction it cannot carry is `22008` even though the declaration would hold it |
 

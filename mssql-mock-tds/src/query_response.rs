@@ -24,6 +24,8 @@ pub enum SqlDataType {
     NVarCharMax,
     /// VarChar(MAX) with caller-chosen PLP chunk boundaries and column collation.
     VarCharMax,
+    /// VarBinary(MAX) with caller-chosen PLP chunk boundaries.
+    VarBinaryMax,
 }
 
 impl SqlDataType {
@@ -36,6 +38,7 @@ impl SqlDataType {
             SqlDataType::BigInt => 0x26,   // IntN with length 8
             SqlDataType::NVarChar | SqlDataType::NVarCharMax => 0xE7, // NVarCharType
             SqlDataType::VarCharMax => 0xA7,
+            SqlDataType::VarBinaryMax => 0xA5,
         }
     }
 
@@ -47,7 +50,7 @@ impl SqlDataType {
             SqlDataType::Int => 4,
             SqlDataType::BigInt => 8,
             SqlDataType::NVarChar | SqlDataType::NVarCharMax => 255, // Handled specially
-            SqlDataType::VarCharMax => 255,
+            SqlDataType::VarCharMax | SqlDataType::VarBinaryMax => 255,
         }
     }
 }
@@ -62,8 +65,12 @@ pub enum ColumnValue {
     NVarChar(String),
     /// Nonempty wire chunks of raw UTF-16 units, including malformed sequences.
     NVarCharMax(Vec<Vec<u16>>),
+    /// SQL_PLP_NULL for an nvarchar(max) column, without a chunk terminator.
+    NVarCharMaxNull,
     /// Nonempty chunks of bytes encoded in the column's collation.
     VarCharMax(Vec<Vec<u8>>),
+    /// Nonempty chunks of opaque bytes.
+    VarBinaryMax(Vec<Vec<u8>>),
     Null,
 }
 
@@ -76,8 +83,9 @@ impl ColumnValue {
             ColumnValue::Int(_) => SqlDataType::Int,
             ColumnValue::BigInt(_) => SqlDataType::BigInt,
             ColumnValue::NVarChar(_) => SqlDataType::NVarChar,
-            ColumnValue::NVarCharMax(_) => SqlDataType::NVarCharMax,
+            ColumnValue::NVarCharMax(_) | ColumnValue::NVarCharMaxNull => SqlDataType::NVarCharMax,
             ColumnValue::VarCharMax(_) => SqlDataType::VarCharMax,
+            ColumnValue::VarBinaryMax(_) => SqlDataType::VarBinaryMax,
             ColumnValue::Null => SqlDataType::Int, // Default to Int for NULL
         }
     }
@@ -121,7 +129,8 @@ impl ColumnValue {
                 }
                 buf.put_u32_le(0);
             }
-            ColumnValue::VarCharMax(chunks) => {
+            ColumnValue::NVarCharMaxNull => buf.put_u64_le(u64::MAX),
+            ColumnValue::VarCharMax(chunks) | ColumnValue::VarBinaryMax(chunks) => {
                 let total: u64 = chunks.iter().map(|chunk| chunk.len() as u64).sum();
                 buf.put_u64_le(total);
                 for chunk in chunks {
@@ -454,6 +463,12 @@ mod tests {
         assert_eq!(null_val.data_type(), SqlDataType::Int);
         null_val.write_to_buffer(&mut buf);
         assert_eq!(&buf[..], &[0]);
+        buf.clear();
+
+        let null_plp = ColumnValue::NVarCharMaxNull;
+        assert_eq!(null_plp.data_type(), SqlDataType::NVarCharMax);
+        null_plp.write_to_buffer(&mut buf);
+        assert_eq!(&buf[..], &[0xFF; 8]);
         buf.clear();
 
         let nvarchar_val = ColumnValue::NVarChar("test".to_string());
