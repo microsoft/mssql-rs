@@ -382,6 +382,10 @@ def runtime_metadata(monkeypatch):
 
     monkeypatch.setattr(prepare_python.metadata, "version", version)
     monkeypatch.setattr(prepare_python.metadata, "requires", lambda _: [])
+    monkeypatch.setattr(
+        prepare_python.metadata, "metadata",
+        lambda _: SimpleNamespace(get_all=lambda key, default: ["feature"]),
+    )
     return requirements, versions
 
 
@@ -445,6 +449,22 @@ def test_unverifiable_url_dependency_fails_setup(runtime_metadata):
     requirements.append("new-runtime @ https://example.invalid/new-runtime.whl")
     versions["new-runtime"] = "1.0"
     with pytest.raises(RuntimeError, match="cannot verify a direct-URL runtime dependency"):
+        prepare_python.check_runtime_dependencies()
+
+
+@pytest.mark.parametrize("extra", ["missing", "feature", "FEATURE", "feature_name"])
+def test_runtime_extras_must_be_declared(runtime_metadata, monkeypatch, extra):
+    requirements, versions = runtime_metadata
+    requirements.append(f"new-runtime[{extra}]>=1")
+    versions["new-runtime"] = "1.0"
+    monkeypatch.setattr(
+        prepare_python.metadata, "metadata",
+        lambda _: SimpleNamespace(get_all=lambda key, default: ["feature", "feature-name"]),
+    )
+    if extra == "missing":
+        with pytest.raises(RuntimeError, match="does not declare extras.*missing"):
+            prepare_python.check_runtime_dependencies()
+    else:
         prepare_python.check_runtime_dependencies()
 
 

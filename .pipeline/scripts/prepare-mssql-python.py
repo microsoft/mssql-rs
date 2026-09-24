@@ -76,6 +76,14 @@ def check_runtime_dependencies():
             problems.append(f"{requirement}: cannot verify a direct-URL runtime dependency")
         elif not requirement.specifier.contains(installed, prereleases=True):
             problems.append(f"{requirement}: installed {installed}")
+        if requirement.extras:
+            declared = {
+                canonicalize_name(extra)
+                for extra in metadata.metadata(name).get_all("Provides-Extra", [])
+            }
+            missing = {canonicalize_name(extra) for extra in requirement.extras} - declared
+            if missing:
+                problems.append(f"{requirement}: installed {installed} does not declare extras {sorted(missing)}")
         key = (name, frozenset(requirement.extras))
         if key not in visited:
             visited.add(key)
