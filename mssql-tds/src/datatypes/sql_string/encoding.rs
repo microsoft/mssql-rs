@@ -106,10 +106,12 @@ impl ResolvedEncoding {
     pub fn try_new_decoder_without_bom_handling(self) -> Option<ResolvedDecoder> {
         let inner = match self {
             Self::EncodingRs(encoding) => {
+                const { assert!(std::mem::size_of::<Decoder>() > 0) };
                 let layout = std::alloc::Layout::new::<Decoder>();
-                // SAFETY: Decoder has nonzero size. A successful allocation is
-                // aligned for Decoder, initialized once, and transferred to Box
-                // using the same global allocator and layout.
+                // SAFETY: Decoder's nonzero size is checked above at compile time.
+                // A successful allocation is aligned for Decoder, initialized
+                // once, and transferred to Box using the same global allocator
+                // and layout.
                 let decoder = unsafe {
                     let ptr = std::alloc::alloc(layout).cast::<Decoder>();
                     if ptr.is_null() {

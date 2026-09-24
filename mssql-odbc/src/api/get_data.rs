@@ -2589,6 +2589,8 @@ fn stream_active_plp_chunk_once<'a>(
                 reached_end,
                 widen_out_units,
             );
+            // The helper skips empty final input; `read` counts wire bytes,
+            // not decoded output. Only an actual final decode sets this flag.
             *narrow_decoder_finished |= reached_end && read != 0;
             decoded_output = pending_units.len() > pending_before;
             unsafe {
@@ -2775,6 +2777,8 @@ fn stream_active_plp_chunk_once<'a>(
                 reached_end,
                 payload_capacity,
             );
+            // Like widening, this helper skips empty final input. Preserve any
+            // earlier finalization while draining already-decoded carry.
             *narrow_decoder_finished |= reached_end && read != 0;
             decoded_output = pending_utf8.len() > pending_before;
             unsafe {
@@ -3148,6 +3152,8 @@ fn append_typed_plp_text(
             if result != encoding_rs::CoderResult::InputEmpty || consumed != payload.len() {
                 return Err(ERR_INTERNAL_CONVERSION);
             }
+            // Unlike the character helpers, typed decoding flushes empty final
+            // input too; the guard above prevents finalizing that decoder twice.
             stream.narrow_decoder_finished = reached_end;
         }
         PlpEncoding::Binary => return Err(ERR_INTERNAL_CONVERSION),
@@ -8767,6 +8773,11 @@ mod tests {
                 "\u{fffd}"
             };
             assert_eq!(output, expected.as_bytes());
+            if narrow.is_some() {
+                assert!(stream.narrow_decoder_finished);
+                append_typed_plp_text(&mut stream, &[], true, &mut output).unwrap();
+                assert_eq!(output, expected.as_bytes());
+            }
         }
     }
 
