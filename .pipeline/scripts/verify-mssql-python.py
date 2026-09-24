@@ -31,14 +31,14 @@ def test_installed_runtime():
             installed = metadata.version(requirement.name)
         except metadata.PackageNotFoundError:
             pytest.fail(f"Missing runtime dependency {requirement}; update setup requirements")
-        if canonicalize_name(requirement.name) in {"mssql-python-rs", "mssql-python-odbc"}:
-            print(f"{requirement.name}: {installed} (job-owned; ignoring upstream pin)")
-            continue
         # requirements.txt supplies third-party dependencies. Do not implement
         # another resolver for extras, URLs, or their transitive requirements.
         assert not (requirement.extras or requirement.url), (
             f"Runtime requirement {requirement} needs explicit setup support"
         )
+        if canonicalize_name(requirement.name) in {"mssql-python-rs", "mssql-python-odbc"}:
+            print(f"{requirement.name}: {installed} (job-owned; ignoring upstream pin)")
+            continue
         assert requirement.specifier.contains(installed, prereleases=True), (
             f"Runtime dependency {requirement}: installed {installed}; update setup requirements"
         )

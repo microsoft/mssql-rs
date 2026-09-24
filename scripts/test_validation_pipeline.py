@@ -177,6 +177,8 @@ def installed_runtime(tmp_path, monkeypatch):
         ("optional; extra == 'feature'", None, None),
         ("new-dependency[feature]", "1", "explicit setup support"),
         ("new-dependency @ https://example.invalid/package.whl", "1", "explicit setup support"),
+        ("mssql-python-rs[feature]", "0.2", "explicit setup support"),
+        ("mssql-python-odbc @ https://example.invalid/package.whl", "18", "explicit setup support"),
     ],
 )
 def test_runtime_requirements(installed_runtime, monkeypatch, requirement, installed, error):
