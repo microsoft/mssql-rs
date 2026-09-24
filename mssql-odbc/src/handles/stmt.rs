@@ -106,6 +106,8 @@ pub(crate) struct CapturedPlpWire {
     pub(crate) bytes: Vec<u8>,
     /// Wire-byte position, independent of the decoded text's offset.
     pub(crate) offset: usize,
+    /// Unit of `partial_text_offset` for the decoded retry value.
+    pub(crate) text_target: Option<SqlSmallInt>,
 }
 
 impl ActivePlpStream {

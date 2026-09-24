@@ -1064,6 +1064,69 @@ fn resolve_default_target(
     target_type
 }
 
+fn prepare_captured_plp_text(
+    state: &mut StmtState,
+    col_index: usize,
+    target_type: SqlSmallInt,
+) -> Result<(), DiagMsg> {
+    let Some(previous_target) = state
+        .captured_plp_wire
+        .as_ref()
+        .filter(|wire| wire.column == col_index)
+        .and_then(|wire| wire.text_target)
+    else {
+        return Ok(());
+    };
+    if target_type == SQL_C_BINARY || target_type == previous_target {
+        return Ok(());
+    }
+    let offset = state
+        .partial_text_offset
+        .filter(|(column, _)| *column == col_index)
+        .map_or(0, |(_, offset)| offset);
+    let Some((_, ColumnValues::String(value))) = state.last_captured.as_mut() else {
+        return Err(ERR_INTERNAL_CONVERSION);
+    };
+    // Normalize only on a target switch; same-target chunking keeps its offset
+    // and avoids repeatedly moving the remainder of a large value.
+    if offset != 0 {
+        let encoding = if previous_target == SQL_C_WCHAR {
+            EncodingType::Utf16
+        } else {
+            EncodingType::Utf8
+        };
+        if value.encoding_type() == &encoding {
+            let byte_offset = if previous_target == SQL_C_WCHAR {
+                offset.saturating_mul(2)
+            } else {
+                offset
+            };
+            value.bytes.drain(..byte_offset.min(value.bytes.len()));
+        } else {
+            let text = sql_string_to_text(value).ok_or(ERR_INVALID_CHARACTER_VALUE)?;
+            let mut bytes = Vec::new();
+            if previous_target == SQL_C_WCHAR {
+                let remaining = text.encode_utf16().skip(offset);
+                reserve_typed_plp_bytes(&mut bytes, remaining.clone().count() * 2)?;
+                bytes.extend(remaining.flat_map(u16::to_le_bytes));
+            } else {
+                let remaining = &text.as_bytes()[offset.min(text.len())..];
+                reserve_typed_plp_bytes(&mut bytes, remaining.len())?;
+                bytes.extend_from_slice(remaining);
+            }
+            *value = SqlString::new(bytes, encoding);
+        }
+        // A byte/surrogate fragment is still readable in its original target.
+        // A different encoding or typed conversion must validate that fragment.
+        state.direct_text_target = Some((col_index, previous_target));
+    }
+    state.partial_text_offset = None;
+    if let Some(wire) = state.captured_plp_wire.as_mut() {
+        wire.text_target = None;
+    }
+    Ok(())
+}
+
 fn write_captured_column(
     stmt_state: &mut crate::handles::stmt::StmtState,
     col_index: usize,
@@ -1092,6 +1155,11 @@ fn write_captured_column(
             0,
             "Requested column is not available in the current row",
         );
+        return SQL_ERROR;
+    }
+
+    if let Err(diag) = prepare_captured_plp_text(stmt_state, col_index, target_type) {
+        post_diag(stmt_state, diag);
         return SQL_ERROR;
     }
 
@@ -1236,7 +1304,11 @@ fn write_captured_column(
         .filter(|(c, _)| *c == col_index)
         .map(|(_, o)| o)
         .unwrap_or(0);
-    let direct_validated = stmt_state.direct_text_target == Some((col_index, target_type));
+    let direct_validated = stmt_state.direct_text_target == Some((col_index, target_type))
+        || stmt_state
+            .captured_plp_wire
+            .as_ref()
+            .is_some_and(|wire| wire.column == col_index);
     // SAFETY: `buf_elements` is `buffer_length` converted to the element unit of
     // `target_type`, so `target_value_ptr` is null or writable for that many
     // elements; `strlen_or_ind_ptr` is null or writable for one `SqlLen`.
@@ -1261,6 +1333,9 @@ fn write_captured_column(
         if truncated && consumed < remaining {
             stmt_state.partial_text_offset = Some((col_index, offset + consumed));
             stmt_state.direct_text_target = Some((col_index, target_type));
+            if let Some(wire) = stmt_state.captured_plp_wire.as_mut() {
+                wire.text_target = Some(target_type);
+            }
         } else {
             stmt_state.current_row_last_col = col_index;
             retain_completed_buffered_value(stmt_state, col_index);
@@ -1334,6 +1409,9 @@ fn write_captured_column(
         // Truncated: remember where to resume and keep the column addressable —
         // do NOT mark it consumed, so the next SQLGetData continues it.
         stmt_state.partial_text_offset = Some((col_index, offset + consumed));
+        if let Some(wire) = stmt_state.captured_plp_wire.as_mut() {
+            wire.text_target = Some(target_type);
+        }
     } else if rc != SQL_ERROR {
         // Fully delivered: the column is done.
         stmt_state.current_row_last_col = col_index;
@@ -2423,6 +2501,7 @@ fn stream_active_plp_chunk_once<'a>(
             column: col_index,
             bytes: std::mem::take(&mut progress.typed_wire),
             offset: 0,
+            text_target: None,
         });
         state.current_row_last_col = col_index - 1;
         state.partial_text_offset = None;
@@ -8552,9 +8631,258 @@ mod tests {
                 SQL_SUCCESS
             );
             assert_eq!(
+                unsafe { crate::api::fetch::sql_fetch(next_stmt) },
+                SQL_SUCCESS
+            );
+            assert_eq!(
+                unsafe {
+                    crate::api::exports::SQLGetData(
+                        next_stmt,
+                        1,
+                        SQL_C_SLONG,
+                        (&mut value as *mut i32).cast(),
+                        0,
+                        &mut indicator,
+                    )
+                },
+                SQL_SUCCESS
+            );
+            assert_eq!((value, indicator), (0, 4));
+            assert_eq!(
+                unsafe { crate::api::fetch::sql_fetch(next_stmt) },
+                SQL_NO_DATA
+            );
+            assert_eq!(
                 unsafe { crate::api::fetch::sql_fetch(handles.stmt) },
                 SQL_NO_DATA
             );
+        }
+    }
+
+    #[test]
+    fn typed_plp_decoded_retry_preserves_partially_delivered_characters() {
+        for target in [SQL_C_CHAR, SQL_C_WCHAR] {
+            let handles = TestHandles::with_env_dbc_stmt();
+            prefetched_text_stream(
+                &handles,
+                PlpEncoding::Utf16Text,
+                None,
+                utf16le("\u{1f600}42"),
+                None,
+            );
+            let mut value = -99_i32;
+            let mut indicator = -99;
+            let typed = |value: &mut i32, indicator: &mut SqlLen| unsafe {
+                crate::api::exports::SQLGetData(
+                    handles.stmt,
+                    1,
+                    SQL_C_SLONG,
+                    (value as *mut i32).cast(),
+                    0,
+                    indicator,
+                )
+            };
+            assert_eq!(typed(&mut value, &mut indicator), SQL_ERROR);
+            let mut output = [0xcc_u8; 8];
+            assert_eq!(
+                unsafe {
+                    crate::api::exports::SQLGetData(
+                        handles.stmt,
+                        1,
+                        target,
+                        output.as_mut_ptr().cast(),
+                        if target == SQL_C_CHAR { 2 } else { 4 },
+                        &mut indicator,
+                    )
+                },
+                SQL_SUCCESS_WITH_INFO
+            );
+            indicator = -99;
+            assert_eq!(typed(&mut value, &mut indicator), SQL_ERROR);
+            assert_eq!((value, indicator), (-99, -99));
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(handles.stmt) };
+            assert_last_diag(
+                &stmt.inner.lock().unwrap().diag_records,
+                ERR_INVALID_CHARACTER_VALUE,
+            );
+            assert_eq!(
+                unsafe {
+                    crate::api::exports::SQLGetData(
+                        handles.stmt,
+                        1,
+                        SQL_C_BINARY,
+                        output.as_mut_ptr().cast(),
+                        1,
+                        &mut indicator,
+                    )
+                },
+                SQL_SUCCESS_WITH_INFO
+            );
+            assert_eq!(
+                unsafe {
+                    crate::api::exports::SQLGetData(
+                        handles.stmt,
+                        1,
+                        target,
+                        output.as_mut_ptr().cast(),
+                        4,
+                        &mut indicator,
+                    )
+                },
+                SQL_SUCCESS_WITH_INFO
+            );
+            if target == SQL_C_CHAR {
+                assert_eq!(&output[..4], &[0x9f, 0x98, 0x80, 0]);
+            } else {
+                assert_eq!(&output[..4], &[0, 0xde, 0, 0]);
+            }
+            assert_eq!(typed(&mut value, &mut indicator), SQL_SUCCESS);
+            assert_eq!((value, indicator), (42, 4));
+        }
+    }
+
+    #[test]
+    fn typed_plp_decoded_suffix_allocation_failure_keeps_the_retry_position() {
+        let handles = TestHandles::with_env_dbc_stmt();
+        prefetched_text_stream(
+            &handles,
+            PlpEncoding::Utf16Text,
+            None,
+            utf16le("\u{e9}42"),
+            None,
+        );
+        let mut value = -99_i32;
+        let mut indicator = -99;
+        let typed = |value: &mut i32, indicator: &mut SqlLen| unsafe {
+            crate::api::exports::SQLGetData(
+                handles.stmt,
+                1,
+                SQL_C_SLONG,
+                (value as *mut i32).cast(),
+                0,
+                indicator,
+            )
+        };
+        assert_eq!(typed(&mut value, &mut indicator), SQL_ERROR);
+        let mut output = [0xcc_u8; 4];
+        assert_eq!(
+            unsafe {
+                crate::api::exports::SQLGetData(
+                    handles.stmt,
+                    1,
+                    SQL_C_WCHAR,
+                    output.as_mut_ptr().cast(),
+                    4,
+                    &mut indicator,
+                )
+            },
+            SQL_SUCCESS_WITH_INFO
+        );
+        FAIL_TYPED_PLP_RESERVE_AFTER.set(Some(0));
+        indicator = -99;
+        assert_eq!(typed(&mut value, &mut indicator), SQL_ERROR);
+        assert_eq!(FAIL_TYPED_PLP_RESERVE_AFTER.replace(None), None);
+        assert_eq!((value, indicator), (-99, -99));
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(handles.stmt) };
+        assert_last_diag(
+            &stmt.inner.lock().unwrap().diag_records,
+            ERR_MEMORY_ALLOCATION,
+        );
+        assert_eq!(typed(&mut value, &mut indicator), SQL_SUCCESS);
+        assert_eq!((value, indicator), (42, 4));
+    }
+
+    #[test]
+    fn typed_plp_decoded_retries_convert_only_the_unread_suffix() {
+        for first_target in [SQL_C_CHAR, SQL_C_WCHAR] {
+            for switch_character_target in [false, true] {
+                let handles = TestHandles::with_env_dbc_stmt();
+                prefetched_text_stream(
+                    &handles,
+                    PlpEncoding::Utf16Text,
+                    None,
+                    utf16le(if switch_character_target {
+                        "\u{e9}x42"
+                    } else {
+                        "\u{e9}42"
+                    }),
+                    None,
+                );
+                let mut value = -99_i32;
+                let mut indicator = -99;
+                assert_eq!(
+                    unsafe {
+                        crate::api::exports::SQLGetData(
+                            handles.stmt,
+                            1,
+                            SQL_C_SLONG,
+                            (&mut value as *mut i32).cast(),
+                            0,
+                            &mut indicator,
+                        )
+                    },
+                    SQL_ERROR
+                );
+                let mut prefix = [0xcc; 8];
+                assert_eq!(
+                    unsafe {
+                        crate::api::exports::SQLGetData(
+                            handles.stmt,
+                            1,
+                            first_target,
+                            prefix.as_mut_ptr().cast(),
+                            if first_target == SQL_C_CHAR { 3 } else { 4 },
+                            &mut indicator,
+                        )
+                    },
+                    SQL_SUCCESS_WITH_INFO
+                );
+                assert_eq!(
+                    &prefix[..2],
+                    if first_target == SQL_C_CHAR {
+                        &[0xc3, 0xa9]
+                    } else {
+                        &[0xe9, 0]
+                    }
+                );
+                if switch_character_target {
+                    let second_target = if first_target == SQL_C_CHAR {
+                        SQL_C_WCHAR
+                    } else {
+                        SQL_C_CHAR
+                    };
+                    assert_eq!(
+                        unsafe {
+                            crate::api::exports::SQLGetData(
+                                handles.stmt,
+                                1,
+                                second_target,
+                                prefix.as_mut_ptr().cast(),
+                                if second_target == SQL_C_CHAR { 2 } else { 4 },
+                                &mut indicator,
+                            )
+                        },
+                        SQL_SUCCESS_WITH_INFO
+                    );
+                    assert_eq!(prefix[0], b'x');
+                    assert_eq!(prefix[1], 0);
+                    assert_eq!(indicator, if second_target == SQL_C_CHAR { 3 } else { 6 });
+                }
+                assert_eq!(
+                    unsafe {
+                        crate::api::exports::SQLGetData(
+                            handles.stmt,
+                            1,
+                            SQL_C_SLONG,
+                            (&mut value as *mut i32).cast(),
+                            0,
+                            &mut indicator,
+                        )
+                    },
+                    SQL_SUCCESS
+                );
+                assert_eq!((value, indicator), (42, 4));
+            }
         }
     }
 

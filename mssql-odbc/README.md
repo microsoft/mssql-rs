@@ -201,6 +201,10 @@ Conversion errors retain decoded text for character/typed retries and the
 original unread wire bytes for binary retries, including binary length probes.
 Binary and decoded-text retries advance independent positions, so switching
 between those views does not interpret a wire-byte offset as a text offset.
+Switching decoded-text targets or retrying a typed conversion uses only the
+unread suffix, with offsets interpreted in the preceding character target's
+encoding. Partially delivered characters remain malformed for typed conversions,
+but their remaining bytes/code units can still be read in the same encoding.
 The raw retry buffer is bounded by the same source-data cap.
 Empty character values retrieved as numeric or GUID C targets succeed with
 indicator 0 and leave the value buffer unchanged, matching msodbcsql18. Empty
