@@ -943,17 +943,22 @@ pub fn build_query_result(response: &crate::query_response::QueryResponse) -> By
             col.data_type,
             crate::query_response::SqlDataType::NVarChar
                 | crate::query_response::SqlDataType::NVarCharMax
+                | crate::query_response::SqlDataType::VarCharMax
         ) {
             // Required to support string responses (e.g., @@USERAGENT).
             // TDS ColMetadata mandates a 5-byte collation suffix for variable-length types.
             result.put_u16_le(
-                if col.data_type == crate::query_response::SqlDataType::NVarCharMax {
+                if matches!(
+                    col.data_type,
+                    crate::query_response::SqlDataType::NVarCharMax
+                        | crate::query_response::SqlDataType::VarCharMax
+                ) {
                     PLP_TYPE_LENGTH_MARKER
                 } else {
                     MAX_BOUNDED_STRING_BYTES
                 },
             );
-            result.put_slice(&[0x09, 0x04, 0xD0, 0x00, 0x34]); // SQL_Latin1_General_CP1_CI_AS
+            result.put_slice(&col.collation);
         } else {
             result.put_u8(col.data_type.max_length());
         }

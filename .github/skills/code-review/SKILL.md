@@ -11,8 +11,8 @@ affected code — do not critique pre-existing code outside the PR's scope.
 Every concrete number, constant, and known-failure list below is a dated observation,
 not a standing truth. Prefer the command that re-derives a fact over the value written
 here. If what you observe contradicts this file, trust the observation and report the
-drift separately — an issue or PR against this skill, not the summary of whatever PR
-you happen to be reviewing. Skill maintenance is not that author's problem.
+drift separately — see "Reporting Skill Drift", not the summary of whatever PR you
+happen to be reviewing. Skill maintenance is not that author's problem.
 
 ## Process
 
@@ -363,6 +363,105 @@ than `gh pr review`, diff-hunk anchoring, `--paginate` when verifying — are in
 3. Each finding for a specific `file:line` gives a concrete fix or a focused code
    snippet — not just "this is wrong." Leave the comment at that line so it carries
    context and can be tracked to resolution.
+4. **Skill drift** — one line per observation, or `none`. Report it every time; a
+   section left off is indistinguishable from one nobody checked. This is a note to
+   the human, not part of the posted review. Exception: for suspected or confirmed
+   security vulnerabilities, emit only `Private MSRC reporting required` without
+   details, as described below.
+
+## Reporting Skill Drift
+
+You are the only reader who sees both this file and what the code actually did, and
+that pairing is gone the moment the review ends. Reconstructing it later from the
+thread is far more expensive than a line written now.
+
+Report when:
+
+- You retracted or downgraded a finding after checking it — most of all one this file
+  told you to check anyway.
+- A defect got past the checks in this file, whether CI, a human, or a later PR caught
+  it.
+- A fact here no longer matches the repo: a constant, a path, a workflow behavior, a
+  known-failure list.
+- A step cost time without changing the outcome, or you raised a class of finding that
+  a lint, test, or CI check could have caught before review.
+
+**Security vulnerabilities are excluded from public drift reporting.** For suspected
+or confirmed vulnerabilities, follow the private Microsoft Security Response Center
+reporting process linked from [SECURITY.md](../../../SECURITY.md):
+<https://aka.ms/SECURITY.md>. Do not create public issues or comments containing
+vulnerability details, even with secrets redacted. This applies to interactive and
+unattended runs; authorization to file drift does not authorize public disclosure.
+For such observations, the required drift output and any chat fallback must contain
+only `Private MSRC reporting required`, not the prepared report. Do not include
+vulnerability details or evidence in review/chat output or unattended logs; reserve
+them for the private reporting process. The marker indicates a required next step,
+not that a report has been submitted.
+
+Search before filing, including closed issues, using distinctive terms for the underlying
+drift mechanism. The same mistake can recur in different functions, tests, or files;
+use the local symbol only as an optional additional query. Recurrence belongs on the
+existing issue, where it is the evidence that promotes it:
+
+```bash
+gh issue list --repo microsoft/mssql-rs --label skill:code-review --state all --limit 1000 --search "in:title,body,comments <drift mechanism terms>"
+```
+
+Search includes comments because recurrence evidence is appended there. If the result
+count reaches the limit, split the query into non-overlapping `created:` date ranges
+and inspect every range; a truncated or failed search cannot establish that no match exists.
+
+Read potential matches to confirm they describe the same drift, not just the same symbol.
+If a match exists, append the structured report below as a comment and do not create a
+new issue:
+
+```bash
+gh issue comment <number> --repo microsoft/mssql-rs --body-file <path>
+```
+
+Only if no match exists, file a separate issue for the observation, with the evidence
+rather than a conclusion. Interactively, use the form so it prompts you for the fields:
+
+<https://github.com/microsoft/mssql-rs/issues/new?template=code_review_skill_drift.yml>
+
+`gh issue create` does not apply the form, so write the body yourself with the same
+required headings. For each dropdown, select one exact option from
+[the form](../../ISSUE_TEMPLATE/code_review_skill_drift.yml), rather than an alias or
+the full option list. An issue missing the required fields is a note, not something a
+later pass can promote:
+
+```markdown
+<!-- Do not report suspected or confirmed security vulnerabilities in public issues or comments, including as skill drift. Follow the private Microsoft Security Response Center reporting process at https://aka.ms/SECURITY.md instead. Redacting secrets does not make vulnerability details safe to publish. -->
+<!-- Before posting an issue or comment, redact sensitive information from all report fields and evidence, including commands, output, and diff excerpts. Do not include connection strings, passwords, access tokens, customer data, or non-public source. -->
+### Drift class
+<one exact option from the form's Drift class dropdown>
+### Where it happened
+<PR, review thread, or comment URL; for a local review, repository and base/HEAD commit IDs>
+### What the skill says today
+<quote the bullet, or state that nothing covers this>
+### What actually turned out to be true
+<the observation, in the terms a future reviewer would need>
+### Evidence
+<redacted file:line, command and output, or thread where it was settled; include only a redacted relevant diff excerpt for uncommitted changes>
+### What it cost
+<one exact option from the form's What it cost dropdown>
+```
+
+For a new issue only:
+
+```bash
+gh issue create --repo microsoft/mssql-rs --label skill:code-review \
+  --title "[review-skill] <one-line drift>" --body-file <path>
+```
+
+These issues are the queue a periodic maintenance pass reads, so one that isn't acted on
+immediately is still doing its job. The bar is whether a future review would repeat the
+mistake — a one-off you could not have anticipated is not drift. The confirmation and
+authorization rules in step 6 apply to both issue creation and comments. Unattended
+runs capture these too, with the same body, but write only when the run explicitly
+authorizes that action; permission to post a PR review alone does not authorize issue
+writes. Otherwise, include the prepared report in the chat output without posting it,
+except for security-related observations, which use only the private-MSRC marker above.
 
 ## Principles
 

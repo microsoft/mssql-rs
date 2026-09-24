@@ -106,6 +106,28 @@ pub(crate) const ERR_FUNCTION_SEQUENCE: DiagMsg = DiagMsg {
     state: SQLSTATE_HY010,
     text: "Function sequence error",
 };
+/// No supported `SQL_ATTR_ODBC_VERSION` was recorded before the application
+/// allocated a connection. Reached either by a caller that skipped the
+/// attribute entirely, or by a 2.x application whose `SQL_OV_ODBC2` this
+/// driver rejected (`HY024`) — the Driver Manager forwards that declaration
+/// rather than mapping it, then allocates the connection regardless. ODBC
+/// specifies `HY010` for allocating a connection before the version is set.
+///
+/// Note the text below reaches only a caller that loads this driver directly.
+/// It is posted on *this driver's* environment handle, which a Driver Manager
+/// application never holds — the application's `henv` is the DM's own. On the
+/// path this exists for, the DM substitutes its own diagnostic: unixODBC posts
+/// `IM005` ("Driver's SQLAllocHandle on SQL_HANDLE_DBC failed",
+/// `DriverManager/SQLConnect.c:1613-1616`), while the Windows DM propagates
+/// the `HY024` from the rejected `SQLSetEnvAttr` instead. `post_diag` only
+/// appends to `diag_records` and does not trace, so the refusal site in
+/// `alloc_handle.rs` logs this `text` verbatim — that log is the only place
+/// the reason survives for a Driver Manager user on either platform.
+pub(crate) const ERR_ODBC_VERSION_NOT_SET: DiagMsg = DiagMsg {
+    state: SQLSTATE_HY010,
+    text: "SQL_ATTR_ODBC_VERSION must be set to SQL_OV_ODBC3 or SQL_OV_ODBC3_80 \
+           before allocating a connection; this driver does not support ODBC 2.x",
+};
 /// A fallible allocation failed. Used where the byte count comes from the
 /// application rather than a bounded internal computation -- e.g. buffering
 /// a data-at-execution value with no declared total (`SQL_DATA_AT_EXEC`) --
@@ -241,13 +263,14 @@ pub(crate) const ERR_INVALID_CHARACTER_VALUE: DiagMsg = DiagMsg {
     state: SQLSTATE_22018,
     text: "Invalid character value for cast specification",
 };
-/// A date/time C struct that names no real instant - month 13, 31 February, a
+/// Date/time fields that name no real instant - month 13, 31 February, a
 /// year outside `0001`..`9999`, or an out-of-range time or UTC offset.
 pub(crate) const ERR_INVALID_DATETIME_FORMAT: DiagMsg = DiagMsg {
     state: SQLSTATE_22007,
     text: "Invalid datetime format",
 };
-/// A fraction dropped by a temporal target's declared scale. Retail 18.6.2.1
+/// Temporal arithmetic overflow or a fraction dropped by the target's declared scale.
+/// Retail 18.6.2.1
 /// answers this state for `time`, `datetime2` and `datetimeoffset` alike.
 ///
 /// `ParamToSQLType` (`sqlcfunc.cpp:3350`) reads as a split - this state for the

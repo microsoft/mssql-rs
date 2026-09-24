@@ -226,9 +226,13 @@ TEST_F(PrepareExecuteLiveTest, NumericTruncationBeforeDataAtExecutionIsReported)
 #ifdef _WIN32
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01S07");
 #else
-    // unixODBC's function_return_ex does not extract driver diagnostics for
+    // unixODBC's function_return_ex (DriverManager/__info.c) extracts driver
+    // diagnostics for SQL_SUCCESS_WITH_INFO, SQL_ERROR and SQL_NO_DATA but not
     // SQL_NEED_DATA, so neither driver's 01S07 is application-visible here
-    // (Linux and macOS both link unixODBC for this suite).
+    // (Linux and macOS both link unixODBC for this suite). This matches
+    // msodbcsql rather than diverging from it, so it carries no
+    // parity-registry entry; the decision history, sign-off and the build
+    // 173710 measurement against retail msodbcsql 18.6.2.1 are in AB#47946.
     EXPECT_EQ("", ODBCTestUtils::GetDiagState(SQL_HANDLE_STMT, stmt_));
 #endif
     SQLPOINTER value_ptr = nullptr;
@@ -1047,9 +1051,8 @@ TEST_F(PrepareExecuteLiveTest, ExecDirectNumericTruncationBeforeDataAtExecutionI
 #ifdef _WIN32
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01S07");
 #else
-    // unixODBC's function_return_ex does not extract driver diagnostics for
-    // SQL_NEED_DATA, so neither driver's 01S07 is application-visible here
-    // (Linux and macOS both link unixODBC for this suite).
+    // Same unixODBC function_return_ex gap as the SQLExecute case above; see
+    // AB#47946 for the decision history and the build 173710 measurement.
     EXPECT_EQ("", ODBCTestUtils::GetDiagState(SQL_HANDLE_STMT, stmt_));
 #endif
     SQLPOINTER value_ptr = nullptr;
