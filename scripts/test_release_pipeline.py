@@ -120,6 +120,27 @@ def _stage_flags(**overrides):
     return flags
 
 
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("RUST-AZL3", "RUST-AZL3"),
+        ("MixedCase", "MixedCase"),
+        ("True", "True"),
+        (True, "true"),
+        (False, "false"),
+    ],
+)
+def test_expand_parameter_literals(value, expected):
+    source = {
+        "value": "${{ parameters.value }}",
+        "embedded": ["prefix-${{ parameters.value }}-suffix"],
+    }
+    assert expand(source, {"value": value}) == {
+        "value": expected,
+        "embedded": [f"prefix-{expected}-suffix"],
+    }
+
+
 def test_release_defaults_are_safe():
     pipeline = yaml.safe_load(_PIPELINE.read_text(encoding="utf-8"))
     assert {p["name"]: p["default"] for p in pipeline["parameters"]} == dict.fromkeys(
