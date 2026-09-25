@@ -3119,7 +3119,19 @@ impl TdsClient {
         }
 
         // STEP 4: End streaming (write DONE token and finalize)
+        //
+        // A bulk row goes through the same `TdsValueSerializer` as an RPC
+        // parameter, so a narrow value can be substituted here too. This path
+        // builds its own `PacketWriter` and never reaches `finish_send`, so the
+        // flag is carried across by hand; without it
+        // `take_code_page_conversion_loss` would answer `false` immediately
+        // after a bulk substitution, which its doc comment promises otherwise.
+        // Read before `end`, which consumes the writer, and assigned rather
+        // than OR-ed: this is a complete message of its own, so the assignment
+        // opens its reporting window exactly as `finish_send` does a request's.
+        let had_loss = writer.code_page_conversion_loss();
         let rows_written = writer.end().await?;
+        self.code_page_conversion_loss = had_loss;
 
         // STEP 5: Drain the server response for error handling and INFO capture.
         // Its returned count is informational only; callers receive the client-side

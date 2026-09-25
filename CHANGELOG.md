@@ -155,6 +155,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   alongside 18 for the best-fit mapping msodbcsql performs and this driver does
   not.
 
+  Bulk copy shares the same encoder and substitutes on the same terms. Its
+  messages also carry the flag, so `TdsClient::take_code_page_conversion_loss`
+  reports a bulk substitution rather than silently answering `false`.
+
   New `mssql_tds::datatypes::sql_string::NarrowEncoded` (returned by the now
   loss-reporting `encode_narrow`) and `TdsClient::take_code_page_conversion_loss`
   / `note_code_page_conversion_loss`.

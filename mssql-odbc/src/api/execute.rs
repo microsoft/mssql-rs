@@ -624,6 +624,15 @@ fn finish_parameter_array(
     let metadata = client.get_metadata().clone();
     let ird_ok = super::ird::populate_ird(stmt, &metadata).is_ok();
     let info_messages = client.take_info_messages();
+    // Parameter arrays are serialized through the same `PacketWriter` as a
+    // scalar execute (`execute_sp_execute_batch`), so an unmappable value in
+    // any parameter set marks the message exactly as one in a single set does.
+    // This path does not go through `finish_execute`, so it has to drain and
+    // post the flag itself -- otherwise the warning the attribute advertises
+    // would never fire for an array, and the undrained flag would leak into the
+    // next statement's verdict. Drained before the STMT lock for the DBC-then-
+    // STMT ordering reason `take_code_page_conversion_loss` documents.
+    let warn_cp_loss = super::exec_common::take_code_page_conversion_loss(dbc, &mut client);
     let Ok(mut stmt_state) = stmt.inner.lock() else {
         super::exec_common::return_client_busy(dbc, client);
         return SQL_ERROR;
@@ -636,7 +645,9 @@ fn finish_parameter_array(
         client.current_parameter_set(),
         has_more,
     );
-    if post_tds_info_messages(&mut stmt_state, &info_messages) && rc == SQL_SUCCESS {
+    let posted_info = post_tds_info_messages(&mut stmt_state, &info_messages)
+        | super::exec_common::post_code_page_conversion_loss(&mut stmt_state, warn_cp_loss);
+    if posted_info && rc == SQL_SUCCESS {
         rc = SQL_SUCCESS_WITH_INFO;
     }
     stmt_state.clear_exhaustion_state();
@@ -1151,6 +1162,55 @@ mod tests {
     use crate::handles::DescHandle;
     use crate::test_support::TestHandles;
     use mssql_tds::connection::tds_client::{PreparedStatement, StatementId};
+
+    /// A parameter array is serialized through the same `PacketWriter` as a
+    /// scalar execute, but completes through `finish_parameter_array` rather
+    /// than `finish_execute`, so it needs its own drain/post of the code-page
+    /// loss flag. Without it the warning the attribute advertises never fires
+    /// for an array, and the undrained flag leaks into the next statement's
+    /// verdict (AB#47598).
+    ///
+    /// Asserted against the helpers `finish_parameter_array` calls, since the
+    /// function itself needs a live batch result a unit test cannot build.
+    #[test]
+    fn parameter_array_completion_drains_and_posts_the_code_page_loss_flag() {
+        use crate::api::exec_common::{
+            post_code_page_conversion_loss, take_code_page_conversion_loss,
+        };
+        use crate::api::sqlstate::WARN_CODE_PAGE_CONVERSION_LOSS;
+        use crate::handles::DbcHandle;
+        use mssql_tds::test_client_support::{done_no_more, tds_client_from_tokens};
+
+        for attribute_on in [false, true] {
+            let h = TestHandles::with_env_dbc_stmt();
+            let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+            dbc.inner.lock().unwrap().warn_on_cp_error = attribute_on;
+
+            let mut client = tds_client_from_tokens(vec![done_no_more()]);
+            client.note_code_page_conversion_loss();
+
+            let warn = take_code_page_conversion_loss(dbc, &mut client);
+            assert_eq!(warn, attribute_on);
+            assert!(
+                !client.take_code_page_conversion_loss(),
+                "the flag must be drained whatever the attribute says, or it \
+                 leaks into the next statement"
+            );
+
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let mut stmt_state = stmt.inner.lock().unwrap();
+            assert_eq!(
+                post_code_page_conversion_loss(&mut stmt_state, warn),
+                attribute_on
+            );
+            if attribute_on {
+                assert_eq!(
+                    stmt_state.diag_records[0].sql_state,
+                    WARN_CODE_PAGE_CONVERSION_LOSS.state
+                );
+            }
+        }
+    }
 
     fn set_prepared(stmt_raw: SqlHandle, sql: &str) {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(stmt_raw) };
