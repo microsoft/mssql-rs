@@ -3786,6 +3786,24 @@ mod tests {
         let err = unsafe { bound_param_to_value(&p) }.unwrap_err();
         assert_eq!(err, ParamBuildError::StringTruncation);
         assert_eq!(err.diag().state, *b"22001");
+
+        // The accept side of the same boundary: a payload exactly at the
+        // ceiling converts intact. Pins the ceiling itself - shortening it by
+        // one byte fails here - which the reject case above cannot show.
+        let mut at_limit = vec![0xFFu8; SQL_PREC_BIGCHARBINARY];
+        let mut ind: SqlLen = SqlLen::try_from(at_limit.len()).unwrap();
+        let mut p = param(SQL_C_BINARY, at_limit.as_mut_ptr() as *mut c_void, &mut ind);
+        p.sql_type = SQL_SS_VARIANT;
+        p.column_size = 0;
+
+        let (value, _) = unsafe { bound_param_to_value(&p) }.unwrap();
+        let SqlType::Variant(inner) = value else {
+            panic!("expected Variant, got {value:?}");
+        };
+        assert!(
+            matches!(*inner, SqlType::VarBinary(Some(ref b), _) if b.len() == SQL_PREC_BIGCHARBINARY),
+            "a payload exactly at the ceiling must convert intact, got {inner:?}"
+        );
     }
 
     /// Every newly bound row must produce a typed NULL from `ParameterType`

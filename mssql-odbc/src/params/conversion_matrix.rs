@@ -310,6 +310,16 @@ mod tests {
 
     /// Unrelated scalar C types do not reach these payloads. `SQL_C_BINARY` is
     /// asserted apart because it reaches `sql_variant` but none of the rest.
+    ///
+    /// The `sql_variant` half is narrower than msodbcsql, not settled intent:
+    /// `IsValidSQLConversion`'s `case SQL_VARIANT_MAPPED:` (`sqlcprot.h`)
+    /// rejects only `SQL_C_DATE`/`SQL_C_TIME` pre-Katmai and then falls through
+    /// to `fValidConversion`, whose `CHARCONVERSION` sets the variant bit
+    /// (`sqlcmisc.cpp:497-507`) and which every `NUMERICCONVERSION`-based mask
+    /// inherits - so the reference admits `SQL_C_BIT`, `SQL_C_GUID`, the
+    /// integers, the floats, `NUMERIC` and the temporals too. Widening the row
+    /// needs matching conversion arms and e2e parity coverage, tracked in
+    /// AB#48453. `SQL_DECIMAL`/`SQL_NUMERIC`/`SQL_SS_XML` are unaffected.
     #[test]
     fn unrelated_c_types_do_not_reach_decimal_xml_or_variant() {
         for c_type in [
