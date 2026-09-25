@@ -13594,6 +13594,13 @@ mod tests {
         let (mut client, fail) = create_failing_capturing_client(vec![done_no_more()]);
         let orphan_id = client.issue_statement_id();
         client.prepared_handles.insert(orphan_id, 7);
+        let encryption = std::sync::Arc::new(
+            crate::security::describe_parameter_encryption::DescribeParameterEncryptionResult::new(
+            ),
+        );
+        client
+            .prepared_param_encryption
+            .insert(orphan_id, encryption.clone());
         let mut orphan = Some(orphan_id);
 
         fail.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -13608,6 +13615,13 @@ mod tests {
             client.prepared_handles.get(&orphan_id),
             Some(&7),
             "a first write that never reaches the network must leave the orphan releasable"
+        );
+        assert!(
+            std::sync::Arc::ptr_eq(
+                client.prepared_param_encryption.get(&orphan_id).unwrap(),
+                &encryption
+            ),
+            "the same encryption metadata must be reinstated, not just the handle"
         );
     }
 
