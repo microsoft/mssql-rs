@@ -283,6 +283,9 @@ pub(crate) fn is_valid_timezone_offset(tz_hour: i16, tz_minute: i16) -> bool {
 /// parameter binding accepts too.
 pub(crate) fn parse_datetime_literal(text: &str) -> Option<DateTimeParts> {
     let mut s = text.trim();
+    if s.starts_with('{') || s.contains('/') {
+        return parse_odbc_temporal_literal(s);
+    }
     let mut p = DateTimeParts::default();
 
     // A trailing "+HH:MM" / "-HH:MM" is a UTC offset. Match it only in that
@@ -343,6 +346,84 @@ pub(crate) fn parse_datetime_literal(text: &str) -> Option<DateTimeParts> {
         return None;
     }
     Some(p)
+}
+
+fn parse_odbc_temporal_literal(mut text: &str) -> Option<DateTimeParts> {
+    fn number(text: &mut &str, width: usize) -> Option<u16> {
+        *text = text.trim_ascii_start();
+        let digits = text.get(..width)?;
+        if !digits.bytes().all(|byte| byte.is_ascii_digit())
+            || text.as_bytes().get(width).is_some_and(u8::is_ascii_digit)
+        {
+            return None;
+        }
+        let value = digits.parse().ok()?;
+        *text = text.get(width..)?;
+        Some(value)
+    }
+
+    fn separator(text: &mut &str, delimiter: char) -> Option<()> {
+        *text = text.trim_ascii_start().strip_prefix(delimiter)?;
+        Some(())
+    }
+
+    let mut parts = DateTimeParts::default();
+    let (has_date, has_time, date_separator) = if text.starts_with('{') {
+        text = text.strip_prefix('{')?.strip_suffix('}')?.trim_ascii();
+        let (kind, value) = text.split_once('\'')?;
+        text = value.trim_ascii_end().strip_suffix('\'')?;
+        let kind = kind.trim_ascii();
+        if kind.eq_ignore_ascii_case("d") {
+            (true, false, '-')
+        } else if kind.eq_ignore_ascii_case("t") {
+            (false, true, '-')
+        } else if kind.eq_ignore_ascii_case("ts") {
+            (true, true, '-')
+        } else {
+            return None;
+        }
+    } else {
+        if text.len() != 10 {
+            return None;
+        }
+        (true, false, '/')
+    };
+
+    if has_date {
+        parts.year = i16::try_from(number(&mut text, 4)?).ok()?;
+        separator(&mut text, date_separator)?;
+        parts.month = number(&mut text, 2)?;
+        separator(&mut text, date_separator)?;
+        parts.day = number(&mut text, 2)?;
+        days_since_0001_from_civil(parts.year, parts.month, parts.day)?;
+        parts.has_date = true;
+    }
+    if has_time {
+        parts.hour = number(&mut text, 2)?;
+        separator(&mut text, ':')?;
+        parts.minute = number(&mut text, 2)?;
+        separator(&mut text, ':')?;
+        parts.second = number(&mut text, 2)?;
+        if parts.hour > 23 || parts.minute > 59 || parts.second > 59 {
+            return None;
+        }
+        parts.has_time = true;
+        text = text.trim_ascii_start();
+        if has_date && let Some(fraction) = text.strip_prefix('.') {
+            text = fraction.trim_ascii_start();
+            let width = text.bytes().take_while(u8::is_ascii_digit).count();
+            if width > 9 {
+                return None;
+            }
+            parts.scale = u8::try_from(width).ok()?;
+            if width > 0 {
+                parts.fraction_ns =
+                    text.get(..width)?.parse::<u32>().ok()? * 10u32.pow(9 - u32::from(parts.scale));
+            }
+            text = text.get(width..)?;
+        }
+    }
+    text.trim_ascii().is_empty().then_some(parts)
 }
 
 /// The local calendar date, as `(year, month, day)`, or `None` if the platform
@@ -505,6 +586,98 @@ mod tests {
             parse_datetime_literal("  2024-05-20  "),
             parse_datetime_literal("2024-05-20")
         );
+    }
+
+    #[test]
+    fn slash_dates_and_odbc_escape_literals_parse() {
+        for (literal, plain) in [
+            ("2024/05/20", "2024-05-20"),
+            (" 2000/02/29 ", "2000-02-29"),
+            ("0001/01/01", "0001-01-01"),
+            ("9999/12/31", "9999-12-31"),
+            ("{d '2024-05-20'}", "2024-05-20"),
+            ("{D'2024-05-20'}", "2024-05-20"),
+            ("{ d ' 2024 - 05 - 20 ' }", "2024-05-20"),
+            ("{t '12:34:56'}", "12:34:56"),
+            ("{T'12:34:56'}", "12:34:56"),
+            ("{ t ' 12 : 34 : 56 ' }", "12:34:56"),
+            ("{ts '2024-05-20 12:34:56'}", "2024-05-20 12:34:56"),
+            ("{Ts '2024-05-20\t12:34:56.1'}", "2024-05-20 12:34:56.1"),
+            ("{ts '2024-05-20 12:34:56.'}", "2024-05-20 12:34:56"),
+            (
+                "{ts '2024-05-20 12:34:56 . 001 '}",
+                "2024-05-20 12:34:56.001",
+            ),
+            (
+                "{ts '2024-05-20 12:34:56.123456789'}",
+                "2024-05-20 12:34:56.123456789",
+            ),
+        ] {
+            let expected = parse_datetime_literal(plain).unwrap();
+            assert_eq!(
+                parse_datetime_literal(literal),
+                Some(expected),
+                "{literal:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_odbc_temporal_literals_are_rejected() {
+        for literal in [
+            "2024/05-20",
+            "2024-05/20",
+            "2024/5/20",
+            "2024/05/2",
+            "2024/05/20 12:34:56",
+            "0000/01/01",
+            "2023/02/29",
+            "1900/02/29",
+            "2024/13/01",
+            "2024/00/01",
+            "2024/01/00",
+            "2024/04/31",
+            "{}",
+            "{d}",
+            "{d ''}",
+            "{d 2024-05-20}",
+            "{d '2024-05-20'",
+            "{d '2024-05-20}",
+            "{d '2024-05-20'} junk",
+            "{d '2024-05-20'}{t '12:34:56'}",
+            "{d '2024-05-20' junk}",
+            "{d '2024-05-20''}",
+            "{d '2024/05/20'}",
+            "{d '2024-05-20 12:34:56'}",
+            "{t '2024-05-20'}",
+            "{ts '2024-05-20'}",
+            "{d '2024-5-20'}",
+            "{t '12:34'}",
+            "{t '1:34:56'}",
+            "{t '12:34:56.1'}",
+            "{t '24:00:00'}",
+            "{t '12:60:00'}",
+            "{t '12:34:60'}",
+            "{d '2023-02-29'}",
+            "{ts '2024-05-20T12:34:56'}",
+            "{ts '2024-05-20 12:34:56+05:30'}",
+            "{ts '2024-05-20 12:34:56.1234567890'}",
+            "{ts '2024-05-2012:34:56'}",
+            "{guid '2024-05-20'}",
+            "{d '{d '2024-05-20'}'}",
+            "{d '+024-05-20'}",
+        ] {
+            assert_eq!(parse_datetime_literal(literal), None, "{literal:?}");
+        }
+        for character in ['\u{e9}', '\u{65e5}', '\u{1f600}'] {
+            for literal in [
+                format!("{{d '{character}-05-20'}}"),
+                format!("{{t '12:34:{character}'}}"),
+                format!("{{ts '2024-05-20 12:34:56.{character}'}}"),
+            ] {
+                assert_eq!(parse_datetime_literal(&literal), None, "{literal:?}");
+            }
+        }
     }
 
     #[test]

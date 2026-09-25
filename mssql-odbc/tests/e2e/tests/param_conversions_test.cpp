@@ -1239,7 +1239,7 @@ TEST_F(ScalarConversionLiveTest, CharTimestampLiteralRoundTrips) {
 //
 // Pre-existing and deliberate: the parser is shared with fetch, and the same
 // permissiveness covers `HH:MM` without seconds and unpadded fields like
-// `2023-6-5`. Narrowing it is AB#47246, not this PR.
+// `2023-6-5`. AB#47246 preserves these existing accepted forms.
 TEST_F(ScalarConversionLiveTest, CharTimestampAcceptsTheIsoSeparator) {
     SKIP_IF_COMPARING_MSODBCSQL();
 
@@ -1282,6 +1282,82 @@ TEST_F(ScalarConversionLiveTest, CharDateOnlyLiteralFillsATimestampAtMidnight) {
     ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(32), ?, 121)"), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(BindNarrow(SQL_TYPE_TIMESTAMP, "2024-05-20"), SQL_HANDLE_STMT, stmt_);
     EXPECT_EQ("2024-05-20 00:00:00.0000000", ExecuteAndReadBack());
+}
+
+TEST_F(ScalarConversionLiveTest, OdbcTemporalLiteralsRoundTrip) {
+    SQLCHAR version[32] = {};
+    ASSERT_SQL_OK(SQLGetInfoA(dbc_, SQL_DRIVER_VER, version, sizeof(version), nullptr),
+                  SQL_HANDLE_DBC, dbc_);
+    RecordProperty("driver_version", reinterpret_cast<const char*>(version));
+    struct Case {
+        SQLSMALLINT sql_type;
+        const char* literal;
+        const char* expected;
+    };
+    for (const Case& value : {
+             Case{SQL_TYPE_DATE, "2024/05/20", "2024-05-20"},
+             Case{SQL_TYPE_DATE, "2000/02/29", "2000-02-29"},
+             Case{SQL_TYPE_DATE, "{d '2024-05-20'}", "2024-05-20"},
+             Case{SQL_TYPE_DATE, "{D'2024-05-20'}", "2024-05-20"},
+             Case{SQL_TYPE_DATE, "{ d ' 2024 - 05 - 20 ' }", "2024-05-20"},
+             Case{SQL_TYPE_TIME, "{t '12:34:56'}", "12:34:56.0000000"},
+             Case{SQL_SS_TIME2, "{T'12:34:56'}", "12:34:56.0000000"},
+             Case{SQL_TYPE_TIME, "{ t ' 12 : 34 : 56 ' }", "12:34:56.0000000"},
+             Case{SQL_TYPE_TIMESTAMP, "{ts '2024-05-20 12:34:56.1234567'}",
+                  "2024-05-20 12:34:56.1234567"},
+             Case{SQL_TYPE_TIMESTAMP, "{Ts '2024-05-20\t12:34:56'}",
+                  "2024-05-20 12:34:56.0000000"},
+               Case{SQL_TYPE_TIMESTAMP, "{ts '2024-05-20 12:34:56.'}",
+                   "2024-05-20 12:34:56.0000000"},
+               Case{SQL_TYPE_TIMESTAMP, "{ts '2024-05-20 12:34:56 . 001 '}",
+                   "2024-05-20 12:34:56.0010000"},
+               Case{SQL_SS_TIMESTAMPOFFSET, "{ts '2024-05-20 12:34:56.1234567'}",
+                   "2024-05-20 12:34:56.1234567"},
+             Case{SQL_TYPE_TIMESTAMP, "{d '2024-05-20'}", "2024-05-20 00:00:00.0000000"},
+             Case{SQL_TYPE_TIMESTAMP, "2024/05/20", "2024-05-20 00:00:00.0000000"},
+         }) {
+        for (bool wide : {false, true}) {
+            SCOPED_TRACE(value.literal);
+            SCOPED_TRACE(wide);
+            ASSERT_SQL_OK(Prepare(value.sql_type == SQL_SS_TIMESTAMPOFFSET
+                                      ? "SELECT CONVERT(VARCHAR(64), CAST(? AS DATETIME2), 121)"
+                                      : "SELECT CONVERT(VARCHAR(64), ?, 121)"),
+                          SQL_HANDLE_STMT, stmt_);
+            ASSERT_SQL_OK(wide ? BindWide(value.sql_type, value.literal, 0, 7)
+                               : BindNarrow(value.sql_type, value.literal, 0, 7),
+                          SQL_HANDLE_STMT, stmt_);
+            EXPECT_EQ(value.expected, ExecuteAndReadBack());
+            ResetParams();
+        }
+    }
+}
+
+TEST_F(ScalarConversionLiveTest, MalformedOdbcTemporalLiteralsAre22018) {
+    SQLCHAR version[32] = {};
+    ASSERT_SQL_OK(SQLGetInfoA(dbc_, SQL_DRIVER_VER, version, sizeof(version), nullptr),
+                  SQL_HANDLE_DBC, dbc_);
+    RecordProperty("driver_version", reinterpret_cast<const char*>(version));
+    for (const char* literal : {
+             "2024/05-20", "2024/5/20", "2024/05/20 12:34:56", "2023/02/29",
+             "{d '2024/05/20'}", "{d '2024-05-20 12:34:56'}", "{t '2024-05-20'}",
+             "{ts '2024-05-20'}", "{d '2024-5-20'}", "{t '12:34'}", "{t '12:34:56.1'}",
+             "{ts '2024-05-20T12:34:56'}", "{ts '2024-05-20 12:34:56+05:30'}",
+             "{ts '2024-05-20 12:34:56.1234567890'}", "{d '2024-05-20'} junk",
+             "{ts '2024-05-2012:34:56'}",
+             "{d '2024-05-20'", "{d '2023-02-29'}", "{t '24:00:00'}",
+         }) {
+        for (bool wide : {false, true}) {
+            SCOPED_TRACE(literal);
+            SCOPED_TRACE(wide);
+            ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
+            ASSERT_SQL_OK(wide ? BindWide(SQL_TYPE_TIMESTAMP, literal, 0, 7)
+                               : BindNarrow(SQL_TYPE_TIMESTAMP, literal, 0, 7),
+                          SQL_HANDLE_STMT, stmt_);
+            EXPECT_EQ(SQL_ERROR, SQLExecute(stmt_));
+            EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "22018");
+            ResetParams();
+        }
+    }
 }
 
 TEST_F(ScalarConversionLiveTest, UnparseableTemporalLiteralIs22018) {
