@@ -30,7 +30,7 @@ use crate::conversion::param_convert::{
     DaePlan, DaeTranscode, ParamBuildError, bound_param_to_rpc, buffered_dae_to_rpc,
     dae_length_limit, dae_plan, dae_streamed_declaration,
 };
-use crate::error::post_sql_error;
+use crate::error::{HasDiagnostics, post_sql_error};
 use crate::handles::dbc::ConnectionState;
 use crate::handles::stmt::{
     DaeParam, DaeState, PreparedPlan, STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT,
@@ -294,6 +294,40 @@ pub(super) fn return_client_idle(dbc: &DbcHandle, statement_handle: SqlHandle, c
             dbc_state.active_stmt = None;
         }
     }
+}
+
+/// Drains the connection's "a value reached the wire with a substituted
+/// character" flag and decides whether it is worth a diagnostic.
+///
+/// Always drains, so a substitution can never leak into the next statement's
+/// verdict, then reports it only if the application opted in with
+/// `SQL_COPT_SS_WARN_ON_CP_ERROR` (AB#47598).
+///
+/// Takes the DBC lock, so it must be called **before** the STMT lock the caller
+/// posts under: `SQLFreeHandle(SQL_HANDLE_DESC)` locks DBC then STMT, and
+/// reversing that here would risk an ABBA deadlock against it. Hence the split
+/// with [`post_code_page_conversion_loss`], which does the posting.
+pub(super) fn take_code_page_conversion_loss(dbc: &DbcHandle, client: &mut TdsClient) -> bool {
+    let had_loss = client.take_code_page_conversion_loss();
+    had_loss
+        && dbc
+            .inner
+            .lock()
+            .is_ok_and(|dbc_state| dbc_state.warn_on_cp_error)
+}
+
+/// Posts the `01000` substitution warning when
+/// [`take_code_page_conversion_loss`] said to. Returns whether a record was
+/// posted, so the caller can fold it into its `SQL_SUCCESS_WITH_INFO` decision
+/// exactly as it folds server INFO.
+pub(super) fn post_code_page_conversion_loss(
+    state: &mut impl HasDiagnostics,
+    should_warn: bool,
+) -> bool {
+    if should_warn {
+        post_diag(state, WARN_CODE_PAGE_CONVERSION_LOSS);
+    }
+    should_warn
 }
 
 /// Claims the TDS client only if the connection is live and **idle** (no
@@ -1066,6 +1100,7 @@ pub(super) fn finish_execute(
         // 24000). Do NOT drain the wire — that would collapse the rest of the
         // batch. Matches msodbcsql.
         let info_messages = client.take_info_messages();
+        let warn_cp_loss = take_code_page_conversion_loss(dbc, &mut client);
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("{op}: stmt mutex poisoned on no-row result");
             return_client_busy(dbc, client);
@@ -1080,7 +1115,8 @@ pub(super) fn finish_execute(
         stmt_state.clear_exhaustion_state();
         stmt_state.set_state(STMT_STATE_EXEC_CONTEXT | STMT_STATE_CURSOR_OPEN);
         stmt_state.clear_state(STMT_STATE_EXEC_STARTED);
-        let has_server_info = post_tds_info_messages(&mut stmt_state, &info_messages);
+        let has_server_info = post_tds_info_messages(&mut stmt_state, &info_messages)
+            | post_code_page_conversion_loss(&mut stmt_state, warn_cp_loss);
         drop(stmt_state);
         return_client_busy(dbc, client);
         if !ird_ok {
@@ -1106,6 +1142,7 @@ pub(super) fn finish_execute(
             return fail_with_tds(dbc, stmt, statement_handle, client, &e);
         }
         let info_messages = client.take_info_messages();
+        let warn_cp_loss = take_code_page_conversion_loss(dbc, &mut client);
         // A pure-DML batch (UPDATE; DELETE; INSERT) yields one count per
         // statement. Report the first here; queue the rest for SQLMoreResults to
         // step through, matching msodbcsql's one result set per DML statement.
@@ -1153,7 +1190,8 @@ pub(super) fn finish_execute(
         stmt_state.pending_row_counts = dml_counts;
         stmt_state.set_state(STMT_STATE_EXEC_CONTEXT);
         stmt_state.clear_state(STMT_STATE_CURSOR_OPEN | STMT_STATE_EXEC_STARTED);
-        let has_server_info = post_tds_info_messages(&mut stmt_state, &info_messages);
+        let has_server_info = post_tds_info_messages(&mut stmt_state, &info_messages)
+            | post_code_page_conversion_loss(&mut stmt_state, warn_cp_loss);
         drop(stmt_state);
         return_client_idle(dbc, statement_handle, client);
         if !ird_ok {
@@ -1202,6 +1240,7 @@ pub(super) fn finish_execute(
     // below the peek: the peek drains any INFO token in the post-metadata
     // window, and taking the messages first would leave them for a later fetch.
     let info_messages = client.take_info_messages();
+    let warn_cp_loss = take_code_page_conversion_loss(dbc, &mut client);
     let Ok(mut stmt_state) = stmt.inner.lock() else {
         error!("{op}: stmt mutex poisoned");
         if batch_exhausted {
@@ -1223,7 +1262,8 @@ pub(super) fn finish_execute(
     }
     stmt_state.set_state(STMT_STATE_EXEC_CONTEXT | STMT_STATE_CURSOR_OPEN);
     stmt_state.clear_state(STMT_STATE_EXEC_STARTED);
-    let has_server_info = post_tds_info_messages(&mut stmt_state, &info_messages);
+    let has_server_info = post_tds_info_messages(&mut stmt_state, &info_messages)
+        | post_code_page_conversion_loss(&mut stmt_state, warn_cp_loss);
     drop(stmt_state);
     if batch_exhausted {
         return_client_idle(dbc, statement_handle, client);
@@ -1379,6 +1419,55 @@ mod tests {
             Err(()),
             "cumulative composition against the fixed budget must see the combined cost"
         );
+    }
+
+    /// The substitution is reported only on request: `SQL_COPT_SS_WARN_ON_CP_ERROR`
+    /// defaults off, so an ordinary statement must not change its return code
+    /// just because a legacy code page could not hold one character (AB#47598).
+    /// The flag is drained either way, so a substitution can never be carried
+    /// into the next statement's verdict.
+    #[test]
+    fn code_page_conversion_loss_is_reported_only_when_the_attribute_is_on() {
+        for (attribute_on, loss, expect_warning) in [
+            (false, false, false),
+            (false, true, false),
+            (true, false, false),
+            (true, true, true),
+        ] {
+            let h = TestHandles::with_env_dbc_stmt();
+            let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+            dbc.inner.lock().unwrap().warn_on_cp_error = attribute_on;
+
+            let mut client = tds_client_from_tokens(vec![done_no_more()]);
+            if loss {
+                client.note_code_page_conversion_loss();
+            }
+
+            let should_warn = take_code_page_conversion_loss(dbc, &mut client);
+            assert_eq!(
+                should_warn, expect_warning,
+                "attribute {attribute_on}, loss {loss}"
+            );
+            assert!(
+                !client.take_code_page_conversion_loss(),
+                "the flag must be drained whatever the attribute says"
+            );
+
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let mut stmt_state = stmt.inner.lock().unwrap();
+            assert_eq!(
+                post_code_page_conversion_loss(&mut stmt_state, should_warn),
+                expect_warning
+            );
+            if expect_warning {
+                assert_eq!(
+                    stmt_state.diag_records[0].sql_state,
+                    WARN_CODE_PAGE_CONVERSION_LOSS.state
+                );
+            } else {
+                assert!(stmt_state.diag_records.is_empty());
+            }
+        }
     }
 
     #[test]

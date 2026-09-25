@@ -21,8 +21,9 @@ use crate::api::odbc_types::{
     SQL_ATTR_CONNECTION_TIMEOUT, SQL_ATTR_CURRENT_CATALOG, SQL_ATTR_LOGIN_TIMEOUT,
     SQL_ATTR_PACKET_SIZE, SQL_ATTR_TXN_ISOLATION, SQL_AUTOCOMMIT_OFF, SQL_AUTOCOMMIT_ON,
     SQL_CD_FALSE, SQL_CD_TRUE, SQL_COPT_SS_ENCRYPT, SQL_COPT_SS_INTEGRATED_SECURITY,
-    SQL_COPT_SS_TRUST_SERVER_CERTIFICATE, SQL_COPT_SS_TXN_ISOLATION, SQL_EN_ON, SQL_ERROR,
-    SQL_INVALID_HANDLE, SQL_SUCCESS, SqlHandle, SqlInteger, SqlPointer, SqlReturn,
+    SQL_COPT_SS_TRUST_SERVER_CERTIFICATE, SQL_COPT_SS_TXN_ISOLATION, SQL_COPT_SS_WARN_ON_CP_ERROR,
+    SQL_EN_ON, SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS, SQL_WARN_NO, SQL_WARN_YES, SqlHandle,
+    SqlInteger, SqlPointer, SqlReturn,
 };
 use crate::api::util::write_if_some;
 use crate::error::free_errors;
@@ -142,7 +143,8 @@ fn sql_get_connect_attr_w_safe(
         | SQL_ATTR_PACKET_SIZE
         | SQL_ATTR_AUTOCOMMIT
         | SQL_ATTR_TXN_ISOLATION
-        | SQL_COPT_SS_TXN_ISOLATION => {
+        | SQL_COPT_SS_TXN_ISOLATION
+        | SQL_COPT_SS_WARN_ON_CP_ERROR => {
             if value_ptr.is_null() {
                 error!(attribute, "SQLGetConnectAttrW: value pointer is null");
                 post_diag(&mut state, ERR_INVALID_NULL_POINTER);
@@ -151,6 +153,13 @@ fn sql_get_connect_attr_w_safe(
             let value = match attribute {
                 SQL_ATTR_ACCESS_MODE => state.access_mode,
                 SQL_ATTR_CONNECTION_TIMEOUT => state.connection_timeout,
+                SQL_COPT_SS_WARN_ON_CP_ERROR => {
+                    if state.warn_on_cp_error {
+                        SQL_WARN_YES as u32
+                    } else {
+                        SQL_WARN_NO as u32
+                    }
+                }
                 // Read from the cached value rather than the server: msodbcsql
                 // does the same for both (`sqlcmisc.cpp:3426`), so a get never
                 // costs a round trip.
@@ -617,6 +626,26 @@ mod tests {
                 "reading {attribute} back"
             );
         }
+    }
+
+    /// Defaults to `SQL_WARN_NO` as msodbcsql's does (`sqlcconn.cpp:596`), and
+    /// round-trips whatever the set side normalized it to (AB#47598).
+    #[test]
+    fn warn_on_cp_error_defaults_to_no_and_round_trips() {
+        let h = TestHandles::with_env_dbc();
+        assert_eq!(
+            get_u32(h.dbc, SQL_COPT_SS_WARN_ON_CP_ERROR),
+            SQL_WARN_NO as u32
+        );
+
+        let set = unsafe {
+            sql_set_connect_attr_w(h.dbc, SQL_COPT_SS_WARN_ON_CP_ERROR, 1usize as SqlPointer, 0)
+        };
+        assert_eq!(set, SQL_SUCCESS);
+        assert_eq!(
+            get_u32(h.dbc, SQL_COPT_SS_WARN_ON_CP_ERROR),
+            SQL_WARN_YES as u32
+        );
     }
 
     #[test]

@@ -119,6 +119,13 @@ pub struct PacketWriter<'a> {
     /// payload ended exactly on a packet boundary, leaving the buffer empty
     /// (issue #73).
     eom_pending: bool,
+    /// Whether any value written into this message lost a character to the
+    /// target collation's code page. Set by the narrow string serializers and
+    /// read by the send site once the message is built, so `mssql-odbc` can
+    /// report SQLSTATE `01000` under `SQL_COPT_SS_WARN_ON_CP_ERROR`. Carried
+    /// across [`PacketWriter::suspend`] so a data-at-execution message that
+    /// spans several calls does not forget a loss from an earlier one.
+    code_page_conversion_loss: bool,
 }
 
 /// Owned, detached state of an in-progress outgoing message, produced by
@@ -143,6 +150,7 @@ pub(crate) struct SuspendedMessage {
     cancel_handle: Option<CancelHandle>,
     reset_mode: ResetConnectionMode,
     eom_pending: bool,
+    code_page_conversion_loss: bool,
 }
 
 impl SuspendedMessage {
@@ -188,6 +196,13 @@ impl SuspendedMessage {
     /// The RESETCONNECTION mode this message took from the connection.
     pub(crate) fn reset_mode(&self) -> ResetConnectionMode {
         self.reset_mode
+    }
+
+    /// Whether any value written into this message was written with a
+    /// substituted character. See
+    /// [`PacketWriter::note_code_page_conversion_loss`].
+    pub(crate) fn code_page_conversion_loss(&self) -> bool {
+        self.code_page_conversion_loss
     }
 
     /// Discards an unsent message, returning any RESETCONNECTION request it was
@@ -252,7 +267,24 @@ impl<'a> PacketWriter<'a> {
             cancel_handle: cancel_handle.map(|handle| handle.child_handle()),
             reset_mode,
             eom_pending: false,
+            code_page_conversion_loss: false,
         }
+    }
+
+    /// Records that a value written into this message lost at least one
+    /// character to the target collation's code page.
+    ///
+    /// Sticky for the life of the message: one substituted character is enough
+    /// to warrant the diagnostic, and the send site reads the flag once, after
+    /// the whole message is built.
+    pub(crate) fn note_code_page_conversion_loss(&mut self) {
+        self.code_page_conversion_loss = true;
+    }
+
+    /// Whether any value in this message was written with a substituted
+    /// character. See [`Self::note_code_page_conversion_loss`].
+    pub(crate) fn code_page_conversion_loss(&self) -> bool {
+        self.code_page_conversion_loss
     }
 
     /// Detaches this writer's in-progress message state from the borrowed
@@ -286,6 +318,7 @@ impl<'a> PacketWriter<'a> {
             cancel_handle: self.cancel_handle,
             reset_mode: self.reset_mode,
             eom_pending: self.eom_pending,
+            code_page_conversion_loss: self.code_page_conversion_loss,
         }
     }
 
@@ -316,6 +349,7 @@ impl<'a> PacketWriter<'a> {
             cancel_handle: state.cancel_handle,
             reset_mode: state.reset_mode,
             eom_pending: state.eom_pending,
+            code_page_conversion_loss: state.code_page_conversion_loss,
         }
     }
 

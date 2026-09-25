@@ -130,6 +130,44 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ### Fixed
 
+- `mssql-tds` / `mssql-odbc`: a character with no representation in the target
+  column's collation is now replaced with `?` instead of being rewritten as
+  markup. `encoding_rs` implements WHATWG form-submission semantics, so
+  `Encoding::encode` substitutes a decimal numeric character reference — `U+65E5`
+  became the eight ASCII bytes `&#26085;` — and both narrow encoders only logged
+  a warning, so the server stored markup instead of text, one character counted
+  as eight against the column's declared length, and the application saw success.
+  The two Latin-1 fallbacks in the parameter serializer (no known collation, and
+  an LCID this crate does not map) already substituted `?` and keep doing so.
+
+  The single `?` matches msodbcsql, which converts with `WideCharToMultiByte` /
+  `iconv` and takes the code page's default character, and matches SQL Server's
+  own `CAST(N'…' AS varchar(n))`. One substitute byte per UTF-16 code unit, so
+  an astral character yields two, as both of those do. As in msodbcsql, the
+  substitution is not an error and is silent by default.
+
+  An application that needs to know can set the `SQL_COPT_SS_WARN_ON_CP_ERROR`
+  (1243) connection attribute to `SQL_WARN_YES`, which reports SQLSTATE `01000`
+  *"Warning: Code page translation caused loss of data"*. The call that carries
+  the diagnostic is the one that completes the parameter: `SQLExecute` /
+  `SQLExecDirect` return `SQL_SUCCESS_WITH_INFO` for a materialized value, while
+  a value streamed with `SQLPutData` leaves those returning `SQL_NEED_DATA` and
+  the warning arrives on the final `SQLParamData` — a diagnostic posted on the
+  `SQLPutData` that produced the loss would be cleared by the next call on the
+  handle. Values outside `SQL_WARN_NO` / `SQL_WARN_YES` are rejected with
+  `HY024`, as msodbcsql rejects them.
+
+  msodbcsql owns the attribute but consults it only on the retrieval direction
+  (output parameters and columns); this driver applies it to parameters, which
+  is where its own loss occurs — `SQL_C_CHAR` is UTF-8 here, so a fetch can
+  always represent whatever the server sent. Recorded as parity deviation 19,
+  alongside 18 for the best-fit mapping msodbcsql performs and this driver does
+  not.
+
+  New `mssql_tds::datatypes::sql_string::NarrowEncoded` (returned by the now
+  loss-reporting `encode_narrow`) and `TdsClient::take_code_page_conversion_loss`
+  / `note_code_page_conversion_loss`.
+
 - `mssql-odbc`: NULL values returned through `SQLGetData`, bound columns, and
   output parameters now leave character output buffers untouched instead of
   writing a terminator. Applications should use the `SQL_NULL_DATA` indicator

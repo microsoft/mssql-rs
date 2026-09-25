@@ -340,6 +340,18 @@ pub(crate) const WARN_TRANSACTION_COMMITTED: DiagMsg = DiagMsg {
     state: SQLSTATE_01000,
     text: "The open transaction was committed because autocommit mode was enabled",
 };
+/// A character with no representation in the target column's collation was
+/// substituted with `?` on the way to the wire.
+///
+/// msodbcsql's `IDS_01_000_16` verbatim (`local.rc:29`, SQLSTATE `01000` via
+/// `clntcomn.cpp:1183`). Posted only when the application opted in with
+/// `SQL_COPT_SS_WARN_ON_CP_ERROR`; see
+/// [`DbcState::warn_on_cp_error`](crate::handles::dbc::DbcState::warn_on_cp_error)
+/// for why the substitution itself is not an error (AB#47598).
+pub(crate) const WARN_CODE_PAGE_CONVERSION_LOSS: DiagMsg = DiagMsg {
+    state: SQLSTATE_01000,
+    text: "Warning: Code page translation caused loss of data",
+};
 /// `SQL_ATTR_TXN_ISOLATION` changed while a manual-commit transaction is open
 /// (msodbcsql `sqlcmisc.cpp:360`).
 pub(crate) const ERR_ATTRIBUTE_CANNOT_BE_SET_NOW: DiagMsg = DiagMsg {
