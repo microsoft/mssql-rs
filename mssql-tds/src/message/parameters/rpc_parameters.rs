@@ -494,6 +494,13 @@ impl RpcParameter {
     /// default schema. msodbcsql builds the same one-, two-, or three-part
     /// quoted name here (`sqlccmd.cpp:7485-7505`); unlike a TVP there is no
     /// `READONLY` suffix and the catalog part is legal.
+    ///
+    /// A catalog with no schema keeps the slot empty (`[db]..[Point]`) rather
+    /// than naming a schema: T-SQL reads the empty slot as the caller's default
+    /// schema, which is what an omitted part means. Substituting `dbo` would
+    /// silently pick a different type for a caller whose default is not `dbo`.
+    /// msodbcsql lands on the same text - it quotes the absent schema to the
+    /// empty string and prints all three parts (`clntcomn.h:281`).
     fn format_udt_sql_name(type_name: &UdtTypeName) -> String {
         let quoted = |part: &str| format!("[{}]", part.replace(']', "]]"));
         match (
@@ -503,7 +510,7 @@ impl RpcParameter {
             (Some(db), schema) => format!(
                 "{}.{}.{}",
                 quoted(db),
-                quoted(schema.unwrap_or("dbo")),
+                schema.map(quoted).unwrap_or_default(),
                 quoted(&type_name.type_name)
             ),
             (None, Some(schema)) => {
@@ -899,11 +906,11 @@ mod tests {
             (None, None, "hierarchyid", "[hierarchyid]"),
             (None, Some("dbo"), "Point", "[dbo].[Point]"),
             (Some("mydb"), Some("dbo"), "Point", "[mydb].[dbo].[Point]"),
-            // A catalog without a schema still needs a schema slot. msodbcsql
-            // would emit an empty `[]` here (its `%s.%s.%s` branch quotes
-            // whatever is in the pool); this defaults to `dbo` instead, the
-            // same default `format_tvp_sql_name` already applies.
-            (Some("mydb"), None, "Point", "[mydb].[dbo].[Point]"),
+            // A catalog without a schema leaves the slot empty, which T-SQL
+            // reads as the caller's default schema - the meaning of an omitted
+            // part. msodbcsql produces the same text: its `%s.%s.%s` branch
+            // quotes the absent schema to the empty string (`clntcomn.h:281`).
+            (Some("mydb"), None, "Point", "[mydb]..[Point]"),
         ];
         for (db, schema, type_name, expected) in cases {
             let value = SqlType::Udt(

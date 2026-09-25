@@ -1964,10 +1964,12 @@ fn datetime_metadata(
 /// Builds the wire name for a UDT parameter from the IPD's `SQL_CA_SS_UDT_*`
 /// fields.
 ///
-/// The type name is mandatory and has no fallback: `SQLDescribeParam` cannot
-/// report it, and the server cannot resolve the parameter without it.
-/// msodbcsql refuses the same binding before execute, with "At least 3-parts
-/// name of a UDT type should be present" (`sqlccmd.cpp`).
+/// Those fields have two sources: the application, via `SQLSetDescField`, and
+/// the server, via the `suggested_user_type_*` columns that `SQLDescribeParam`
+/// copies into the IPD (see `refine_ipd`). An application-supplied identity
+/// wins. The type name itself is mandatory - with neither source the server
+/// cannot resolve the parameter. msodbcsql refuses the same binding, with "At
+/// least 3-parts name of a UDT type should be present" (`sqlccmd.cpp`).
 fn udt_type_name(names: Option<&UdtNames>) -> Result<UdtTypeName, ParamBuildError> {
     let names = names.filter(|n| !n.type_name.is_empty());
     let Some(names) = names else {
@@ -3768,10 +3770,11 @@ mod tests {
         }
     }
 
-    /// A binary payload past the variant's 8000-byte limit is refused at bind,
-    /// matching the character variants. A zero-only overflow still trims, since
-    /// the clamp hands `convert_binary_sql` the same `CheckTrailingZeros` rule
-    /// a bounded `varbinary` target gets.
+    /// A binary payload past the variant's 8000-byte limit is refused during
+    /// parameter conversion - `SQLExecute`, not `SQLBindParameter`, which only
+    /// records the binding - matching the character variants. A zero-only
+    /// overflow still trims, since the clamp hands `convert_binary_sql` the
+    /// same `CheckTrailingZeros` rule a bounded `varbinary` target gets.
     #[test]
     fn a_binary_variant_payload_past_the_byte_ceiling_is_truncation() {
         let mut bytes = vec![0xFFu8; SQL_PREC_BIGCHARBINARY + 1];

@@ -137,6 +137,7 @@ fn sql_prepare_w_safe(stmt: &StmtHandle, sql: String) -> SqlReturn {
         original_sql: sql,
     });
     stmt_state.parameter_metadata.clear();
+    stmt_state.parameter_udt_names.clear();
     stmt_state.clear_result_metadata();
     stmt_state.reset_row_stream();
     stmt_state.clear_state(STMT_STATE_EXEC_CONTEXT);

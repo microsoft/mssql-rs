@@ -70,6 +70,7 @@ fn ird_record_from_metadata(meta: &ColumnMetadata) -> DescRecord {
     DescRecord {
         concise_type,
         udt_names: None,
+        udt_names_auto_filled: false,
         datetime_interval_code: datetime_interval_code_for(concise_type),
         length: SqlULen::try_from(desc_length(meta)).unwrap_or(0),
         octet_length: octet_length(meta),

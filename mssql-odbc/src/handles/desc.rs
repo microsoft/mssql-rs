@@ -268,6 +268,14 @@ pub(crate) struct DescRecord {
     /// parameter, so it is boxed rather than costing three strings on every
     /// record of every descriptor.
     pub(crate) udt_names: Option<Box<UdtNames>>,
+    /// IPD only: set when `refine_ipd` supplied `udt_names` from the server's
+    /// `suggested_user_type_*` columns rather than the application supplying
+    /// them through `SQLSetDescField`. Plays the same role for the UDT
+    /// identity that `explicitly_bound` plays for the type/size - without it,
+    /// `udt_names.is_some()` cannot tell an application's choice apart from a
+    /// stale name this driver auto-filled for a different statement, and a
+    /// re-`SQLPrepare` (which keeps IPD records) would send the old identity.
+    pub(crate) udt_names_auto_filled: bool,
 }
 
 /// The server-side identity an application supplies for a UDT parameter.
@@ -287,13 +295,18 @@ pub(crate) struct UdtNames {
 }
 
 /// SQL-side inputs to the prepared declaration, compared only during IPD writes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ParameterDefinition {
     direction: SqlSmallInt,
     sql_type: SqlSmallInt,
     length: SqlULen,
     precision: SqlSmallInt,
     scale: SqlSmallInt,
+    /// Catalog/schema/type of a UDT, which `sp_executesql` spells out in the
+    /// declaration and so must invalidate a materialized handle when it
+    /// changes. The assembly-qualified name is excluded: it never reaches the
+    /// wire, so rewriting it cannot change the prepared text.
+    udt: Option<Box<(String, String, String)>>,
 }
 
 impl DescRecord {
@@ -325,6 +338,13 @@ impl DescRecord {
             length,
             precision,
             scale,
+            udt: self.udt_names.as_ref().map(|names| {
+                Box::new((
+                    names.catalog.clone(),
+                    names.schema.clone(),
+                    names.type_name.clone(),
+                ))
+            }),
         }
     }
 
@@ -359,6 +379,7 @@ impl DescRecord {
             precision_scale_explicit: false,
             explicitly_bound: false,
             udt_names: None,
+            udt_names_auto_filled: false,
         }
     }
 
@@ -655,13 +676,13 @@ pub(crate) fn classify_field(kind: DescKind, field: SqlUSmallInt) -> Option<Fiel
         // matching SQL_DESC_NAME's own IRD/IPD split above.
         SQL_DESC_UNNAMED if is_ird || is_ipd => (Record, is_ipd),
         SQL_DESC_PARAMETER_TYPE if is_ipd => (Record, true),
-        // The UDT identity an application supplies for a `SQL_SS_UDT`
-        // parameter. IPD-only and writable: this is the driver's only source
-        // for the type name today, since `refine_ipd` does not yet read the
-        // server's `suggested_user_type_*` columns (AB#48248). The
-        // assembly-qualified name is accepted and echoed but never sent - the
-        // parameter header has no field for it, and msodbcsql stores it
-        // without writing it either.
+        // The UDT identity for a `SQL_SS_UDT` parameter. IPD-only and
+        // writable. An application writing here is one of two sources; the
+        // other is `refine_ipd`, which copies the server's
+        // `suggested_user_type_*` columns into any record the application has
+        // not claimed. The assembly-qualified name is accepted and echoed but
+        // never sent - the parameter header has no field for it, and msodbcsql
+        // stores it without writing it either.
         SQL_CA_SS_UDT_CATALOG_NAME
         | SQL_CA_SS_UDT_SCHEMA_NAME
         | SQL_CA_SS_UDT_TYPE_NAME
@@ -879,6 +900,39 @@ mod tests {
         for kind in ALL_KINDS {
             assert!(classify_field(kind, 0xFFFF).is_none());
         }
+    }
+
+    /// The UDT's catalog/schema/type are spelled out in the `sp_executesql`
+    /// declaration, so changing one has to orphan a materialized prepared
+    /// handle exactly as changing the SQL type would. `update_definition`
+    /// decides that by comparing `parameter_definition()`, so the names must
+    /// be part of the projection. The assembly-qualified name is excluded: it
+    /// never reaches the wire, so rewriting it must not force a re-prepare.
+    #[test]
+    fn the_udt_name_is_part_of_the_prepared_parameter_definition() {
+        let mut record = DescRecord::default_for(DescKind::ImpParam);
+        record.concise_type = crate::api::odbc_types::SQL_SS_UDT;
+        let without_names = record.parameter_definition();
+
+        record.udt_names = Some(Box::new(UdtNames {
+            catalog: String::new(),
+            schema: "dbo".to_string(),
+            type_name: "Point".to_string(),
+            assembly_type_name: String::new(),
+        }));
+        let point = record.parameter_definition();
+        assert_ne!(without_names, point);
+
+        record.udt_names.as_mut().unwrap().type_name = "Shape".to_string();
+        assert_ne!(point, record.parameter_definition());
+
+        record.udt_names.as_mut().unwrap().type_name = "Point".to_string();
+        record.udt_names.as_mut().unwrap().assembly_type_name = "Asm.Point".to_string();
+        assert_eq!(
+            point,
+            record.parameter_definition(),
+            "the assembly name never reaches the wire, so it cannot invalidate"
+        );
     }
 
     #[test]

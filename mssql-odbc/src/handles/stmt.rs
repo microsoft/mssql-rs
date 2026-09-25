@@ -488,6 +488,11 @@ pub(crate) struct StmtState {
     /// Metadata inferred by `SQLDescribeParam`, indexed by parameter ordinal.
     /// The first describe call fills every marker; `SQLPrepare` invalidates it.
     pub(crate) parameter_metadata: Vec<ParameterDescription>,
+    /// The `suggested_user_type_*` identities that came back with
+    /// `parameter_metadata`, as `(ordinal - 1, names)` for UDT markers only.
+    /// Kept beside the scalar descriptions rather than inside them so
+    /// `ParameterDescription` stays `Copy`, and invalidated with them.
+    pub(crate) parameter_udt_names: Vec<(usize, Box<UdtNames>)>,
     /// Parameters bound via `SQLBindParameter`, indexed by `(ParameterNumber
     /// - 1)`. `None` slots are gaps left by binding a higher ordinal first.
     pub(crate) bound_params: Vec<Option<ParamSnapshot>>,
@@ -1582,6 +1587,7 @@ impl StmtHandle {
                 prepared: None,
                 direct_marker_count: None,
                 parameter_metadata: Vec::new(),
+                parameter_udt_names: Vec::new(),
                 bound_params: Vec::new(),
                 pending_unprepare: None,
                 parameter_array: None,

@@ -526,7 +526,7 @@ pub fn fuzz_bound_param(data: &[u8]) {
         strlen_or_ind_ptr: ind_ptr,
         octet_length_ptr: ind_ptr,
     };
-    let _ = unsafe { bound_param_to_rpc("@P1".to_string(), &param) };
+    let _ = unsafe { bound_param_to_rpc("@P1".to_string(), &param, None) };
 }
 
 /// Drive the real ODBC result path end to end — `SQLExecDirectW` → `SQLFetch` →

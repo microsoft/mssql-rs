@@ -178,10 +178,14 @@ fn sql_describe_param_safe(
             // call is idempotent for an already-bound marker and still picks
             // up one that was unbound (or never bound) since the last call.
             let cached = stmt_state.parameter_metadata.clone();
+            // Replayed, not dropped: `SQLFreeStmt(SQL_RESET_PARAMS)` truncates
+            // the IPD while leaving this cache intact, so a second
+            // reset-then-describe cycle has to rebuild the UDT identity from
+            // here or the execute fails with no type name. mssql-python runs
+            // exactly that cycle on every execution (microsoft/mssql-python#818).
+            let cached_udt_names = stmt_state.parameter_udt_names.clone();
             drop(stmt_state);
-            // No names here: they are not cached, and the IPD already holds
-            // whatever the RPC path filled in on the first call.
-            refine_ipd(stmt, &cached, &[]);
+            refine_ipd(stmt, &cached, &cached_udt_names);
             write_description(
                 description,
                 data_type_ptr,
@@ -346,6 +350,7 @@ fn sql_describe_param_safe(
         return SQL_ERROR;
     };
     stmt_state.parameter_metadata = descriptions.clone();
+    stmt_state.parameter_udt_names = udt_names.clone();
     stmt_state.clear_state(STMT_STATE_EXEC_STARTED);
     let has_info = post_tds_info_messages(&mut stmt_state, &info_messages);
 
@@ -450,12 +455,14 @@ fn refine_ipd(
         }
         // The server is the only source for a UDT's name when the application
         // has not supplied one, matching msodbcsql's `AutoFillIPD`. An
-        // identity the application already set wins, the same way an explicit
-        // bind does above.
-        if record.udt_names.is_none()
-            && let Some((_, names)) = udt_names.iter().find(|(index, _)| *index == i)
-        {
-            record.udt_names = Some(names.clone());
+        // identity the application set wins, the same way an explicit bind
+        // does above; one this function auto-filled earlier is replaced, since
+        // a re-`SQLPrepare` keeps IPD records and the previous name may belong
+        // to a different statement's marker.
+        if record.udt_names.is_none() || record.udt_names_auto_filled {
+            let described = udt_names.iter().find(|(index, _)| *index == i);
+            record.udt_names = described.map(|(_, names)| names.clone());
+            record.udt_names_auto_filled = record.udt_names.is_some();
         }
         if previous != record.parameter_definition() {
             first_changed.get_or_insert(i + 1);
@@ -1665,5 +1672,101 @@ mod tests {
             "a record refine_ipd filled in itself must stay refreshable"
         );
         assert_eq!(record.length, 80);
+    }
+
+    fn udt_identity(type_name: &str) -> Box<UdtNames> {
+        Box::new(UdtNames {
+            catalog: String::new(),
+            schema: String::new(),
+            type_name: type_name.to_string(),
+            assembly_type_name: String::new(),
+        })
+    }
+
+    /// The same ambiguity `explicitly_bound` resolves for the type, applied to
+    /// the UDT identity: `udt_names.is_some()` cannot tell an application's
+    /// `SQLSetDescField` apart from a name this function auto-filled for an
+    /// earlier statement. A re-`SQLPrepare` keeps IPD records, so a stale
+    /// auto-filled name must be replaced - while an explicit one is kept.
+    #[test]
+    fn refine_ipd_replaces_a_udt_name_it_auto_filled_but_keeps_an_explicit_one() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let described = [param_description(SQL_SS_UDT, 8000, 0, SQL_NULLABLE)];
+
+        refine_ipd(stmt, &described, &[(0, udt_identity("hierarchyid"))]);
+        assert_eq!(
+            ipd_records(&h)[0].udt_names.as_ref().unwrap().type_name,
+            "hierarchyid"
+        );
+
+        // A second prepare describing a different UDT at the same ordinal.
+        refine_ipd(stmt, &described, &[(0, udt_identity("geography"))]);
+        assert_eq!(
+            ipd_records(&h)[0].udt_names.as_ref().unwrap().type_name,
+            "geography",
+            "a stale auto-filled identity must not outlive its statement"
+        );
+
+        // Now the application claims the identity; the server must not win.
+        {
+            let desc = unsafe { handle_from_raw::<DescHandle>(h.ipd()) };
+            let mut state = desc.inner.lock().unwrap();
+            let record = state.record_mut(1).unwrap();
+            record.udt_names = Some(udt_identity("Point"));
+            record.udt_names_auto_filled = false;
+        }
+        refine_ipd(stmt, &described, &[(0, udt_identity("geography"))]);
+        assert_eq!(
+            ipd_records(&h)[0].udt_names.as_ref().unwrap().type_name,
+            "Point",
+            "an application-supplied identity outranks the server's suggestion"
+        );
+    }
+
+    /// `SQLFreeStmt(SQL_RESET_PARAMS)` truncates the IPD but leaves the
+    /// parameter-metadata cache intact, so the next `SQLDescribeParam` is
+    /// served from the cache and has to rebuild the UDT identity from there.
+    /// Dropping it left the record with no type name and failed the execute.
+    /// mssql-python runs this reset-then-describe cycle on every execution
+    /// (microsoft/mssql-python#818), so the second cycle is the common path.
+    #[test]
+    fn a_cached_describe_still_supplies_the_udt_identity_after_a_parameter_reset() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.prepared = Some(crate::handles::stmt::PreparedPlan {
+                stmt: PreparedStatement::new("SELECT @P1".to_string()),
+                marker_count: 1,
+                original_sql: String::new(),
+            });
+            state
+                .parameter_metadata
+                .push(param_description(SQL_SS_UDT, 8000, 0, SQL_NULLABLE));
+            state.parameter_udt_names = vec![(0, udt_identity("hierarchyid"))];
+        }
+        // What SQL_RESET_PARAMS leaves behind: no IPD records, cache intact.
+        {
+            let desc = unsafe { handle_from_raw::<DescHandle>(h.ipd()) };
+            desc.inner.lock().unwrap().records.clear();
+        }
+
+        let rc = unsafe {
+            sql_describe_param(
+                h.stmt,
+                1,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(rc, SQL_SUCCESS);
+        assert_eq!(
+            ipd_records(&h)[0].udt_names.as_ref().unwrap().type_name,
+            "hierarchyid",
+            "the cache-served describe must restore the identity it first found"
+        );
     }
 }

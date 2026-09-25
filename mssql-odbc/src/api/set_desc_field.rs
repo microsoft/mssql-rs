@@ -710,6 +710,9 @@ fn set_udt_name(
         return SQL_ERROR;
     };
     write_record_field(state, record_number, |r| {
+        // The application is claiming this identity, so a later describe must
+        // not overwrite it (see `DescRecord::udt_names_auto_filled`).
+        r.udt_names_auto_filled = false;
         let names = r.udt_names.get_or_insert_with(Default::default);
         match field {
             SQL_CA_SS_UDT_CATALOG_NAME => names.catalog = value,

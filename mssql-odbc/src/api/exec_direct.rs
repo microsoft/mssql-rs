@@ -252,6 +252,7 @@ fn sql_exec_direct_w_safe(
         stmt_state.prepared = None;
         stmt_state.direct_marker_count = Some(marker_count);
         stmt_state.parameter_metadata.clear();
+        stmt_state.parameter_udt_names.clear();
         stmt_state.clear_state(STMT_STATE_PREPARED);
         stmt_state.call_returns_status = call.as_ref().is_some_and(|c| c.returns_status);
         stmt_state.set_state(STMT_STATE_EXEC_STARTED);

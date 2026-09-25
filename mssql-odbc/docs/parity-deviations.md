@@ -470,7 +470,15 @@ msodbcsql build is measured.
     selective design in [PR #564](https://github.com/microsoft/mssql-rs/pull/564),
     not a change to which parameter types or conversions are supported.
     `special_parameter_definitions_keep_size_precision_and_scale` pins the
-    vector and UDT projections; UDT parameter binding remains unsupported.
+    vector and UDT projections.
+    The UDT projection also carries the type's catalog, schema, and name, which
+    `sp_executesql` spells out in the declaration; msodbcsql's `IsSQLBinary`
+    grouping compares only length, so an application that rewrites
+    `SQL_CA_SS_UDT_TYPE_NAME` between executes keeps the old declaration there.
+    This driver re-prepares instead, for the same reason as the rest of this
+    entry. The assembly-qualified name is excluded because it never reaches the
+    wire. `the_udt_name_is_part_of_the_prepared_parameter_definition` pins both
+    halves.
     **Evidence limit:** this is a source comparison and a Rust unit test,
     not a measured retail reuse/re-prepare claim. The earlier 18.06.0001 RPC
     measurements did not cover these special-type edits. A supported
@@ -529,3 +537,21 @@ msodbcsql build is measured.
     Recorded following automated review feedback on #599 (2026-09-22);
     narrowed to the cross-identity case following review on 2026-09-24.
     Human parity sign-off has not been recorded. Tracked in #598.
+20. **An oversized `sql_variant` payload is refused by the driver, not the
+    server.** `sql_variant` cannot hold a `max` type (server error 529), so a
+    payload past the 8000-byte ceiling has to be refused somewhere. msodbcsql
+    sends it and surfaces the server's refusal as `42000`; this driver declares
+    the inner type at its non-max ceiling (`variant_column_size`) and refuses
+    during parameter conversion with `22001`, saving the round trip.
+    The rule is not new to binary payloads - `variant_column_size` already
+    governed the character variants - but binary `sql_variant` parameters make
+    it reachable for a second family of C types, so it is recorded here rather
+    than left in a code comment.
+    Measured against msodbcsql 18.6.2.1 (`SQL_DRIVER_VER` `18.06.0002`) on SQL
+    Server 2022, Windows Driver Manager, 2026-09-25.
+    `BinaryVariantPayloadPastTheCeilingIsRefused` asserts both legs, so the
+    reference side stays measured rather than skipped. Tracked in AB#48248.
+    **Evidence limit:** only the binary leg is measured. The character leg is
+    covered by unit tests and shares `variant_column_size`, but no comparison
+    run records msodbcsql's SQLSTATE for an oversized character `sql_variant`;
+    do not infer that half from this entry.

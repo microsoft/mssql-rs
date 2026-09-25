@@ -2136,12 +2136,14 @@ TEST_F(ExtendedTypeLiveTest, BinaryParamRoundTripsThroughSqlVariant) {
 // sql_variant cannot hold a max type (server error 529), so the payload has to
 // be refused somewhere. Both drivers refuse it; they differ in where.
 //
-// Measured against ODBC Driver 18 for SQL Server on SQL Server 2022, localhost,
-// 2026-09-25: msodbcsql sends the oversized value and surfaces the server's
-// refusal as `42000`. This driver declares the inner varbinary at its non-max
-// ceiling (`variant_column_size`, which predates binary variants and already
-// governed the character ones) and refuses at execute with `22001`, saving the
-// round trip. Both legs are asserted so the reference stays measured.
+// Measured against msodbcsql 18.6.2.1 (`SQL_DRIVER_VER` `18.06.0002`) on SQL
+// Server 2022, localhost, 2026-09-25: msodbcsql sends the oversized value and
+// surfaces the server's refusal as `42000`. This driver declares the inner
+// varbinary at its non-max ceiling (`variant_column_size`, which predates
+// binary variants and already governed the character ones) and refuses at
+// execute with `22001`, saving the round trip. Both legs are asserted so the
+// reference stays measured. Registered as deviation 19 in
+// `mssql-odbc/docs/parity-deviations.md`.
 TEST_F(ExtendedTypeLiveTest, BinaryVariantPayloadPastTheCeilingIsRefused) {
     ASSERT_SQL_OK(Prepare("SELECT CAST(? AS VARBINARY(8000))"), SQL_HANDLE_STMT, stmt_);
     std::vector<SQLCHAR> payload(8001, 0xAB);
@@ -2190,8 +2192,9 @@ protected:
         return SQLPrepare(stmt_, const_cast<SQLTCHAR*>(s.c_str()), SQL_NTS);
     }
 
-    // Sets the UDT identity on the IPD, which is the only place the type name
-    // can come from: SQLDescribeParam does not report it.
+    // Sets the UDT identity on the IPD. That is one of two sources for the
+    // type name; the other is SQLDescribeParam's `suggested_user_type_*`
+    // columns, which the tests below exercise separately.
     SQLRETURN SetUdtName(const std::string& type_name, const std::string& schema = "") {
         SQLHDESC ipd = nullptr;
         SQLRETURN rc = SQLGetStmtAttr(stmt_, SQL_ATTR_IMP_PARAM_DESC, &ipd, 0, nullptr);
@@ -2360,6 +2363,36 @@ TEST_F(UdtParamLiveTest, ResetThenDescribeRecoversTheUdtNameOnStatementReuse) {
                                    payload.data(), indicator_, &indicator_),
                   SQL_HANDLE_STMT, stmt_);
     EXPECT_EQ("/7/", ExecuteAndReadBack());
+}
+
+// The second and later cycles of the sequence above, which is where
+// mssql-python actually spends its time: once one describe has succeeded the
+// parameter metadata is cached, and `SQLFreeStmt(SQL_RESET_PARAMS)` truncates
+// the IPD without clearing that cache. The cache-served describe therefore has
+// to replay the UDT identity too - dropping it left the record with no type
+// name and failed the execute on every run after the first.
+TEST_F(UdtParamLiveTest, ASecondResetDescribeCycleKeepsTheUdtNameFromTheCache) {
+    std::vector<SQLCHAR> payload = SerializedHierarchyId("/9/");
+    ASSERT_FALSE(payload.empty());
+
+    ASSERT_SQL_OK(Prepare("SELECT CAST(? AS hierarchyid).ToString()"), SQL_HANDLE_STMT, stmt_);
+
+    SQLSMALLINT described_type = 0, decimal_digits = 0, nullable = 0;
+    SQLULEN column_size = 0;
+    for (int cycle = 0; cycle < 2; ++cycle) {
+        SCOPED_TRACE("cycle " + std::to_string(cycle));
+        ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_RESET_PARAMS), SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(
+            SQLDescribeParam(stmt_, 1, &described_type, &column_size, &decimal_digits, &nullable),
+            SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ(SQL_SS_UDT, described_type);
+
+        indicator_ = static_cast<SQLLEN>(payload.size());
+        ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_BINARY, SQL_SS_UDT, 0, 0,
+                                       payload.data(), indicator_, &indicator_),
+                      SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ("/9/", ExecuteAndReadBack());
+    }
 }
 
 // A schema-qualified name resolves the same system type, exercising the
