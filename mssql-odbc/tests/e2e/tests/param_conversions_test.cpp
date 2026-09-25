@@ -2273,8 +2273,10 @@ protected:
 // Benefits-from-mock-tds: the round trip proves the value survived, but not
 // that the TYPE_INFO carried the three B_VARCHAR name parts in the order
 // `CRPCPolicy::WriteUDTHeader` emits them, nor that the body was PLP-framed.
-// Those byte-level facts are pinned by the mssql-tds unit tests in
-// `datatypes::sql_udt::tests` meanwhile.
+// Those byte-level facts are pinned by the mssql-tds unit tests: the name
+// block by `datatypes::sql_udt::tests`, and the type byte, name block and PLP
+// framing together by `sqltypes::variant_tests::
+// a_udt_parameter_is_framed_as_plp_after_its_name_block`.
 TEST_F(UdtParamLiveTest, BinaryPayloadRoundTripsThroughAUdtParameter) {
     std::vector<SQLCHAR> payload = SerializedHierarchyId("/1/");
     ASSERT_FALSE(payload.empty());

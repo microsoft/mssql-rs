@@ -1352,6 +1352,7 @@ mod variant_tests {
     use crate::{
         datatypes::{
             sql_string::{EncodingType, SqlString},
+            sql_udt::UdtTypeName,
             sqldatatypes::TdsDataType,
             sqltypes::{SQL_VARIANT_MAX_LENGTH, SqlType},
         },
@@ -1394,6 +1395,71 @@ mod variant_tests {
         // TYPE_INFO: 0x62 + u32 max data length (8009)
         assert_eq!(cursor.get_u8(), TdsDataType::SsVariant as u8);
         assert_eq!(cursor.get_u32_le(), SQL_VARIANT_MAX_LENGTH);
+    }
+
+    /// The whole UDT parameter on the wire, not just its name block: type
+    /// byte, the three B_VARCHARs `CRPCPolicy::WriteUDTHeader` emits, then the
+    /// PLP body - an 8-byte total length, one chunk with its own u32 length,
+    /// and the PLP terminator. `datatypes::sql_udt::tests` covers only the
+    /// name block, so nothing else pins this framing.
+    #[tokio::test]
+    async fn a_udt_parameter_is_framed_as_plp_after_its_name_block() {
+        let payload = vec![0xDEu8, 0xAD, 0xBE, 0xEF];
+        let value = SqlType::Udt(
+            UdtTypeName::new(None, Some("dbo".to_string()), "Point".to_string()),
+            Some(payload.clone()),
+        );
+        let mut cursor = Cursor::new(serialize_to_bytes(&value).await);
+
+        assert_eq!(cursor.get_u8(), TdsDataType::Udt as u8);
+        assert_eq!(cursor.get_u8(), 0, "absent catalog is a zero-length part");
+        assert_eq!(cursor.get_u8(), 3, "schema \"dbo\" is 3 UTF-16 units");
+        cursor.advance(3 * 2);
+        assert_eq!(cursor.get_u8(), 5, "type \"Point\" is 5 UTF-16 units");
+        cursor.advance(5 * 2);
+
+        // Unknown-length PLP: chunks run until the terminator. msodbcsql
+        // instead writes the actual byte count when it knows it
+        // (`WriteUDTHeader`: `ullActualLen = cbData` unless the value is
+        // unlimited). Both are valid PLP and the server accepts either; this
+        // driver buffers the payload but still declares it unknown, which is
+        // what lets the data-at-execution path share the same writer.
+        assert_eq!(
+            cursor.get_u64_le(),
+            0xFFFF_FFFF_FFFF_FFFE,
+            "PLP unknown-length marker precedes the chunks"
+        );
+        assert_eq!(cursor.get_u32_le(), payload.len() as u32, "chunk length");
+        let mut chunk = vec![0u8; payload.len()];
+        cursor.copy_to_slice(&mut chunk);
+        assert_eq!(chunk, payload, "payload passes through untouched");
+        assert_eq!(cursor.get_u32_le(), 0, "PLP terminator");
+        assert!(!cursor.has_remaining(), "nothing follows the terminator");
+    }
+
+    /// A NULL UDT still names its type - the server cannot resolve the
+    /// parameter otherwise - and then declares the PLP null length rather than
+    /// a zero-length body.
+    #[tokio::test]
+    async fn a_null_udt_parameter_still_carries_its_name() {
+        let value = SqlType::Udt(
+            UdtTypeName::new(None, None, "hierarchyid".to_string()),
+            None,
+        );
+        let mut cursor = Cursor::new(serialize_to_bytes(&value).await);
+
+        assert_eq!(cursor.get_u8(), TdsDataType::Udt as u8);
+        assert_eq!(cursor.get_u8(), 0, "absent catalog");
+        assert_eq!(cursor.get_u8(), 0, "absent schema");
+        assert_eq!(cursor.get_u8(), 11, "type \"hierarchyid\" is 11 units");
+        cursor.advance(11 * 2);
+        assert_eq!(
+            cursor.get_u64_le(),
+            0xFFFF_FFFF_FFFF_FFFF,
+            "a NULL PLP body is the null length (GenericDecoder::SQL_PLP_NULL), \
+             not an empty chunk list"
+        );
+        assert!(!cursor.has_remaining());
     }
 
     #[tokio::test]
