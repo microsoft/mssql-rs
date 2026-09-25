@@ -503,6 +503,9 @@ fn do_connect(
             .unwrap_or(params.server.as_str())
             .to_string(),
         user_name: params.uid.clone(),
+        // The login character-set name, surfaced as `SQL_COLLATION_SEQ`. Empty
+        // for a server that reports a `SQL_COLLATION` change instead.
+        collation_seq: client.char_set().unwrap_or_default().to_string(),
     };
     // Published here (not right after resolving it above) for the same
     // failed-connect reason as the other fields in this block: kept separate

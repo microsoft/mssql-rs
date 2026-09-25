@@ -1210,6 +1210,14 @@ impl TdsClient {
         self.negotiated_settings.server_reported_name.as_deref()
     }
 
+    /// Returns the character-set name the server sent in the login
+    /// `CHARACTER_SET` `ENVCHANGE`, if any. Modern servers report a
+    /// `SQL_COLLATION` change instead and send no character-set name, so this is
+    /// commonly `None`.
+    pub fn char_set(&self) -> Option<&str> {
+        self.negotiated_settings.char_set.as_deref()
+    }
+
     /// Returns `true` if the connection is known to be dead.
     ///
     /// This surfaces the connection's last-known liveness status, updated
