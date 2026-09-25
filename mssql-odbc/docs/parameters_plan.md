@@ -500,11 +500,12 @@ improvement.** `SQL_C_CHAR` `"[three U+2615]"` into `varchar(3)` was a correct
 happens next depends on whether the target collation can represent the
 character:
 
-- **Representable** (a `_UTF8` or DBCS collation): each character encodes to
-  three bytes, the value is over-long, and it fails downstream as an opaque
-  `HY000` from `serialize_char_varchar_direct` - or, on a `max` or
+- **Representable** (a `_UTF8` collation, where each U+2615 is three bytes, or a
+  DBCS one, where it is two): the value is over-long, and it fails downstream as
+  an opaque `HY000` from `serialize_char_varchar_direct` - or, on a `max` or
   `text`/`ntext` target, is sent over-long with no check at all.
-- **Unmappable** (a single-byte collation): each character becomes a single `?`
+- **Unmappable** (a single-byte collation, and also the DBCS ones - U+2615 has
+  no CP932 or GBK representation either): each character becomes a single `?`
   (AB#47598), so three bytes reach a `varchar(3)`, the value fits, and the
   statement **succeeds** with the data altered.
 

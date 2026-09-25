@@ -3126,9 +3126,14 @@ impl TdsClient {
         // flag is carried across by hand; without it
         // `take_code_page_conversion_loss` would answer `false` immediately
         // after a bulk substitution, which its doc comment promises otherwise.
-        // Read before `end`, which consumes the writer, and assigned rather
-        // than OR-ed: this is a complete message of its own, so the assignment
+        // Read before `end`, which consumes the writer.
+        //
+        // Assigned, not OR-ed: this is one complete message, and the assignment
         // opens its reporting window exactly as `finish_send` does a request's.
+        // A *multi-batch* bulk copy is several such messages, so
+        // `BulkCopy::write_to_server` drains this after every batch and restores
+        // the accumulated verdict at the end — assigning alone would let the
+        // last batch overwrite an earlier batch's substitution (AB#47598).
         let had_loss = writer.code_page_conversion_loss();
         let rows_written = writer.end().await?;
         self.code_page_conversion_loss = had_loss;
@@ -7689,6 +7694,17 @@ impl TdsClient {
     /// that produced it would be cleared by the next ODBC call on the handle.
     pub fn note_code_page_conversion_loss(&mut self) {
         self.code_page_conversion_loss = true;
+    }
+
+    /// Replaces the substitution verdict outright.
+    ///
+    /// For a caller that spans several messages and has to report one answer for
+    /// all of them — `BulkCopy::write_to_server`, which drains the flag after
+    /// each batch so one batch's verdict cannot overwrite another's, then
+    /// restores the accumulated result here. Mirrors how it restores
+    /// [`extend_info_messages`](Self::extend_info_messages) over the same span.
+    pub fn set_code_page_conversion_loss(&mut self, had_loss: bool) {
+        self.code_page_conversion_loss = had_loss;
     }
 
     /// Drains the "a character was substituted on the way to the wire" flag for

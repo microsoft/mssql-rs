@@ -1003,15 +1003,22 @@ TEST_F(CharConversionLiveTest, UnmappableCharacterIsSubstitutedForANarrowCType) 
     EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }
 
-// An astral character is two UTF-16 code units and substitutes as two bytes.
-// WideCharToMultiByte counts that way (measured: U+1F600 under CP1252 gives
-// 3F 3F) and so does the engine - DATALENGTH(CAST(N'<emoji>' AS varchar(4)))
-// is 2. Substituting once per Unicode scalar instead would make the value a
-// byte shorter here than through msodbcsql, so a varchar(n) would accept a
-// string the reference driver rejects.
+// An astral character is two UTF-16 code units. This driver substitutes one
+// byte per unit, so it becomes two bytes - matching WideCharToMultiByte
+// (measured: U+1F600 under CP1252 gives 3F 3F) and the engine, where
+// DATALENGTH(CAST(N'<emoji>' AS varchar(4))) is 2. Substituting once per
+// Unicode scalar instead would make the value a byte shorter and let a
+// varchar(n) accept a string those two reject.
 //
-// Runs on both legs: this is parity, not a deviation.
+// Skipped under comparison: parity-deviations entry 18. msodbcsql is not
+// self-consistent here across its own platforms - its iconv legs convert the
+// whole character at once, so glibc answers a single 3F (measured on
+// Ubuntu 22.04 / glibc 2.35, iconv -f UTF-16LE -t CP1252//TRANSLIT) where
+// Windows answers 3F 3F. This driver is platform-independent and follows the
+// Windows/engine answer.
 TEST_F(CharConversionLiveTest, AstralUnmappableCharacterSubstitutesPerUtf16Unit) {
+    SKIP_IF_COMPARING_MSODBCSQL();
+
     if (!DatabaseIsLatin1()) {
         GTEST_SKIP() << "needs a Latin1 database collation";
     }
