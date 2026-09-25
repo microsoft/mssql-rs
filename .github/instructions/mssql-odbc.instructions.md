@@ -9,6 +9,7 @@ Crate-specific requirements for changes under `mssql-odbc/`.
 ## Index
 
 - [1. Before making changes](#1-before-making-changes)
+- [1.1. Performance and FFI data movement](#11-performance-and-ffi-data-movement)
 - [2. Parity reference: the classic C++ msodbcsql driver](#2-parity-reference-the-classic-c-msodbcsql-driver)
 - [2.1. Verifying parity claims and recording deviations](#21-verifying-parity-claims-and-recording-deviations)
 - [2.2. ODBC version handling](#22-odbc-version-handling)
@@ -33,6 +34,21 @@ Crate-specific requirements for changes under `mssql-odbc/`.
   architecture, and build/test instructions.
 - Follow the repository-wide conventions in
   [copilot-instructions.md](../copilot-instructions.md).
+
+### 1.1. Performance and FFI data movement
+
+Follow the repository-wide
+[Performance and Data Movement guidance](../copilot-instructions.md#performance-and-data-movement).
+For ODBC hot paths:
+
+- Direct fixed-width or encoded delivery must preserve the
+  [raw-pointer and alignment requirements](#5-unsafe-code).
+- Document ownership and synchronization invariants for unsafe optimizations,
+  especially `Send` impls involving application buffers.
+- Preserve ODBC conversion and truncation reporting when bypassing
+  `ColumnValues` materialization.
+- Document architecture-level buffering or decoding trade-offs in
+  [mssql-odbc/README.md](../../mssql-odbc/README.md).
 
 ## 2. Parity reference: the classic C++ msodbcsql driver
 

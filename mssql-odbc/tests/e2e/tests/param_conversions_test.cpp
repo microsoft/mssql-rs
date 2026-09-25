@@ -391,6 +391,32 @@ TEST_F(CrossConversionLiveTest, CharParamOutOfRangeIs22003) {
     }
 }
 
+TEST_F(CrossConversionLiveTest, ExponentUnderflowFollowsPlatformAndNumericTarget) {
+    for (SQLSMALLINT c_type : {SQL_C_CHAR, SQL_C_WCHAR}) {
+        for (SQLSMALLINT sql_type : {SQL_INTEGER, SQL_DECIMAL}) {
+            ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
+            for (const char* text : {"1e-999", "-1e-999"}) {
+                SCOPED_TRACE(::testing::Message() << c_type << " -> " << sql_type << ": " << text);
+                ASSERT_SQL_OK(BindText(c_type, text, sql_type, 10), SQL_HANDLE_STMT, stmt_);
+#ifdef _WIN32
+                // Integer conversion uses CharToDouble; decimal uses stringtonumeric.
+                if (sql_type == SQL_INTEGER) {
+                    EXPECT_EQ("0", ExecuteAndReadBack());
+                } else
+#endif
+                {
+                    EXPECT_EQ(SQL_ERROR, SQLExecute(stmt_));
+                    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "22003");
+                }
+                ResetParams();
+            }
+            ASSERT_SQL_OK(BindText(c_type, "1", sql_type, 10), SQL_HANDLE_STMT, stmt_);
+            EXPECT_EQ("1", ExecuteAndReadBack());
+            ResetParams();
+        }
+    }
+}
+
 // Overflow outranks a dropped fraction: the narrowing runs before msodbcsql's
 // fraction rewrite can fire, so a value that does both reports 22003.
 TEST_F(CrossConversionLiveTest, CharParamOverflowOutranksFraction) {
@@ -926,9 +952,10 @@ TEST_F(ScalarConversionLiveTest, DecimalParamUsesTheDeclaredPrecisionAndScale) {
     EXPECT_EQ("-12.34", ExecuteAndReadBack());
 }
 
-// Digits past the declared scale are dropped when zero and are 22001 when not -
-// `if (c != '0') Error = CVT_FRACT_TRUNC` (sqlccnvt.cpp:7823), rewritten to
-// IDS_22_001 inbound (sqlcfunc.cpp:3348).
+// stringtonumeric strips fractional zeros through FindSigNumber
+// (sqlccnvt.cpp:8389, :7995-8008), then flags excess scale (:8433-8437).
+// ParamToSQLType maps that warning to 22001 for ODBC 3.x character input
+// (sqlcfunc.cpp:3350-3370). Measured on Linux Driver 18.6.2.1 (18.06.0002).
 TEST_F(ScalarConversionLiveTest, DecimalFractionPastTheScaleIsDroppedOnlyWhenZero) {
     ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(64), ?)"), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(BindNarrow(SQL_DECIMAL, "1.50", 5, 1), SQL_HANDLE_STMT, stmt_);
@@ -1117,14 +1144,20 @@ TEST_F(ScalarConversionLiveTest, AWideLiteralReachesTheDecimalTarget) {
     EXPECT_EQ("-1.5", ExecuteAndReadBack());
 }
 
-// An exponent literal has no exact scaled form, so decimal_from_text routes it
-// through the f64 approximation rather than the integer rescale. Untested until
-// now, and the one decimal arm whose msodbcsql equivalent is unconfirmed - the
-// CharToDouble citation was verified for an integer target, not a decimal one.
+// Rust uses an f64 approximation here; msodbcsql uses stringtonumeric
+// (sqlccnvt.cpp:7101). These samples compare outcomes, not the parsing mechanism.
 TEST_F(ScalarConversionLiveTest, AnExponentLiteralReachesTheDecimalTarget) {
-    ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(64), ?)"), SQL_HANDLE_STMT, stmt_);
-    ASSERT_SQL_OK(BindNarrow(SQL_DECIMAL, "1.5e2", 10, 2), SQL_HANDLE_STMT, stmt_);
-    EXPECT_EQ("150.00", ExecuteAndReadBack());
+    struct Case {
+        const char* text;
+        const char* expected;
+    };
+    for (const auto& c : {Case{"1.5e2", "150.00"}, Case{"1.005e2", "100.50"}}) {
+        SCOPED_TRACE(c.text);
+        ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(64), ?)"), SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(BindNarrow(SQL_DECIMAL, c.text, 10, 2), SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ(c.expected, ExecuteAndReadBack());
+        ResetParams();
+    }
 }
 
 TEST_F(ScalarConversionLiveTest, DateParamRoundTrips) {

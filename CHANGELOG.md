@@ -8,6 +8,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ### Added
 
+- `mssql-odbc`: `SQLGetData` conversions from `varchar(max)` and `nvarchar(max)`
+  into supported numeric and date/time C targets, with the existing
+  bound-fetch 1 MiB source-data cap (AB#47238).
+
 - `mssql-odbc`: input parameter binding (`SQLBindParameter` with
   `SQL_PARAM_INPUT`) for the character and integer type families. Any other
   `ValueType` → `ParameterType` pairing is rejected at bind time with `HYC00`,
@@ -54,6 +58,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 - Initial public release of the mssql-rs workspace.
 
 ### Changed
+
+- `mssql-odbc`: empty character values retrieved as numeric or GUID C targets
+  now return success with indicator 0 and leave the value buffer unchanged,
+  matching msodbcsql18 for bound and unbound retrieval. Empty date/time
+  literals still return `22018`.
 
 - `mssql-odbc`: `SQLBindCol` now accepts `SQL_C_DEFAULT` and resolves it at
   fetch time from the current result column's SQL type, using the same mapping
@@ -120,6 +129,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   federated-auth flows.
 
 ### Fixed
+
+- `mssql-odbc`: NULL values returned through `SQLGetData`, bound columns, and
+  output parameters now leave character output buffers untouched instead of
+  writing a terminator. Applications should use the `SQL_NULL_DATA` indicator
+  to distinguish NULL from an empty string (#555).
 
 - `mssql-odbc`: `SQL_ATTR_QUERY_TIMEOUT` is now enforced for the implemented
   catalog functions (`SQLTables`, `SQLColumns`, `SQLPrimaryKeys`,
@@ -211,4 +225,3 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   idle-connection reconnect (`TdsClient::reconnect`) now wraps each attempt's
   full connect (DNS through login) in the attempt's remaining budget instead
   of only capping the post-resolution TCP connect step.
-

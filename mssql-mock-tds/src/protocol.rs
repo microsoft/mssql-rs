@@ -959,6 +959,8 @@ pub fn build_query_result(response: &crate::query_response::QueryResponse) -> By
                 },
             );
             result.put_slice(&col.collation);
+        } else if col.data_type == crate::query_response::SqlDataType::VarBinaryMax {
+            result.put_u16_le(PLP_TYPE_LENGTH_MARKER);
         } else {
             result.put_u8(col.data_type.max_length());
         }

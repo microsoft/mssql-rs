@@ -177,6 +177,55 @@ See the [end-to-end test guide](tests/e2e/README.md) for prerequisites,
 connection configuration, targeted runs, coverage, and comparison testing
 against `msodbcsql18`.
 
+## Result error timing
+
+When positioning a row-returning result, `SQLExecDirect`, `SQLExecute`, and
+`SQLMoreResults` wait for its first row, end-of-result, or server error rather
+than returning after column metadata alone. Errors before the first row are
+reported by that positioning call, including server lock timeouts. A first row
+found during this check remains available to `SQLFetch`.
+
+## Typed character retrieval
+
+`SQLGetData` converts `varchar(max)` and `nvarchar(max)` into the same supported
+integer, floating-point, and date/time C targets as non-max text. It
+preserves the column's encoding and any unread characters from an earlier
+character read. Typed conversion decodes carried UTF-16 output even after a
+character-target switch has moved it into byte storage; a partially delivered
+code unit remains malformed rather than becoming a numeric prefix.
+Fixed-size targets ignore `BufferLength` and report their C
+type's size after successful conversion.
+
+Typed PLP conversion accepts at most 1 MiB of unread source wire data, matching
+the bound-fetch cap. Bytes consumed by earlier character reads do not count
+against the limit. Larger values are drained and rejected with `HYC00`, leaving output
+buffers unchanged; no truncated numeric prefix is returned. See
+[deviation 7](docs/parity-deviations.md) for the measured native-driver difference.
+Fallible materialization allocation failures drain the value and report `HY001`
+instead of the size-limit diagnostic.
+Typed decoding reserves output before consuming carry or decoder input, without
+temporary UTF-16 vectors or strings; narrow decoder creation is fallible too.
+Typed reads and rejected-value drains reuse an 8 KiB scratch buffer within one
+`SQLGetData` call; internal chunks do not require additional application calls.
+Conversion errors retain decoded text for character/typed retries and the
+original unread wire bytes for binary retries, including binary length probes.
+Binary and decoded-text retries advance independent positions, so switching
+between those views does not interpret a wire-byte offset as a text offset.
+Switching decoded-text targets or retrying a typed conversion uses only the
+unread suffix, with offsets interpreted in the preceding character target's
+encoding. Partially delivered characters remain malformed for typed conversions,
+but their remaining bytes/code units can still be read in the same encoding.
+Character recovery caches the target encoding once on entry or a target switch;
+successive small WCHAR/CHAR reads reuse that rendering rather than reconverting
+the whole retained value.
+The raw retry buffer is bounded by the same source-data cap.
+Empty character values retrieved as numeric or GUID C targets succeed with
+indicator 0 and leave the value buffer unchanged, matching msodbcsql18. Empty
+date/time literals remain `22018`. SQL NULL still uses `SQL_NULL_DATA` and
+requires an indicator pointer.
+Nonempty text-to-`SQL_C_GUID` conversion remains unimplemented for both max and
+non-max text (`07006`); this PLP path reuses the existing typed converters.
+
 ## Connection busy gate
 
 `SQLFetch`/`SQLFetchScroll`/`SQLGetData` release the connection's busy claim
@@ -187,6 +236,16 @@ This costs a one-token read-ahead on ordinary fetches: no extra round trip,
 but returning row N can now wait on row N+1's header arriving. See
 `release_busy_if_row_exhausted` in `src/api/exec_common.rs` for the full
 trade-off and why it was accepted as-is.
+
+`SQLExecDirect`/`SQLExecute` also release the claim when their first-row peek
+finds an empty result and the batch is complete (AB#47814). The empty cursor
+and its metadata stay available: `SQLFetch` returns `SQL_NO_DATA` without
+touching a second statement's results. Protocol-only RPC completion tokens
+are consumed before release, with output values retained until
+`SQLMoreResults`; a later application-visible result keeps the connection busy.
+For an empty RPC result, the completion check may wait for the next response
+token under the request's remaining timeout; an expiry is reported by
+`SQLExecDirect`/`SQLExecute`, before the application calls `SQLMoreResults`.
 
 ## Bound fetch performance
 
