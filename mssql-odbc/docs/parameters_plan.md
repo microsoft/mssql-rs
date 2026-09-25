@@ -1,7 +1,7 @@
 # Parameterized execution - `SQLBindParameter` / `SQLExecute` / `SQLExecDirect`
 
 Status, behavior, and known gaps for parameterized prepared-statement execution
-in the ODBC Driver 18 (Rust). Updated 2026-09-01.
+in the ODBC Driver 18 (Rust). Updated 2026-09-24.
 
 ---
 
@@ -69,7 +69,8 @@ transparent reconnects.
   per C type). The semantics differ: `fValidConversion` is a legality table,
   this one is an implementation-progress list, so a pairing it does not carry
   returns `HYC00` (unbuilt), not `07006` (illegal) or `HY003` (unknown type).
-  Tracked by AB#47500; the state becomes `07006` once the table is complete.
+  Tracked by the P9 series under AB#46373; the state becomes `07006` once the
+  table is complete (P9f, AB#48249).
 - **`SQL_C_DEFAULT` resolution** - resolved at bind time to the C type implied
   by `ParameterType` and stored resolved in `BoundParam`, so the execute path
   never sees the placeholder. Version-aware, like msodbcsql's `Sql2CDefault`,
@@ -96,7 +97,10 @@ transparent reconnects.
 - **Data-at-execution streaming** - `SQLParamData` / `SQLPutData` stream
   `SQL_C_CHAR`, `SQL_C_WCHAR`, and `SQL_C_BINARY` as PLP
   `(n)varchar(max)` / `varbinary(max)`, matching msodbcsql sequencing.
-  Same-family pairings always stream. A C-type/SQL-type wideness mismatch
+  Streaming is chosen by the SQL type identifier: the variable-length
+  character and binary identifiers are PLP-framed, while fixed-length
+  `CHAR`, `WCHAR` and `BINARY` accumulate and convert at close.
+  A C-type/SQL-type wideness mismatch
   within the character family (e.g. `SQL_C_WCHAR` against a narrow SQL type)
   is buffered and transcoded once at `SQLParamData` close via the
   connection's collation rather than rejected - msodbcsql accepts the same
@@ -132,35 +136,23 @@ transparent reconnects.
   abort the process one call later. Not fixed: `AppText`/`decode_utf16le` are
   shared with the materialized path, so bounding them is a broader change
   than this file's DAE-specific scope (AB#47590).
-  Cross-*family* pairings (character/binary against an integer SQL type) are
-  still **not** streamable: there is no transcode from arbitrary bytes to an
-  integer wire value. Since P5 made those pairings bindable, the refusal
-  moved from `SQLBindParameter` to execute - the DAE indicator is only read
-  while building the parameter list - so an application gets `HYC00` from
-  `SQLExecute` after setting up its `SQLParamData` loop rather than at bind.
-
-  **Superseded.** The pairing is no longer refused at all: the chunks are
-  collected and the complete value goes through the same conversion the
-  materialized path uses, so text supplied in pieces parses to an integer
-  exactly as it does when bound in one buffer. Measured against the
-  reference driver, which accepts the `SQLPutData` and returns the same
-  value, so `CrossFamilyDataAtExecutionConvertsToInteger` runs on the
-  comparison leg rather than opting out.
-
-  An earlier note here claimed the reference driver rejects this pairing
-  once the value is supplied in pieces. It does not: the claim came from
-  reading its source rather than running it, and probing both drivers
-  disproved it.
-  Pinned by `CrossFamilyDataAtExecutionConvertsToInteger` and, for the
-  wideness-mismatch fix, `NarrowCTypeAgainstWideSqlTypeDataAtExecutionTranscodes`
-  / `WideCTypeAgainstNarrowSqlTypeDataAtExecutionTranscodes` in
-  `execute_test.cpp`.
-  AB#47851 puts the temporal SQL targets in exactly this set: a character C
-  type streamed against `date`/`time`/`datetime2`/`datetimeoffset` was
-  refused at bind before, and is refused at execute now, with the same
-  `HYC00`. Nothing about the streamed path changed -- a temporal wire value
-  is fixed-length, so it could never have been chunked -- only the call that
-  reports it. Pinned by `cross_family_dae_is_rejected` in `param_convert.rs`.
+  Cross-*family* pairings (a character or binary buffer against an integer or
+  temporal SQL type) are buffered rather than streamed. PLP framing is chosen
+  by the SQL type identifier alone - `ColumnSize` does not enter into it,
+  because a bounded declaration rides in the `@params` string while the value
+  body stays a `max`. The variable-length character and binary identifiers are
+  therefore PLP-framed even when bounded (a `varchar(50)` data-at-execution
+  parameter still streams); fixed-length char/binary and every other supported
+  SQL type accumulate and are converted at `SQLParamData` close exactly as the
+  materialized path converts them. Text supplied in pieces therefore parses to
+  the same value as the same text bound in one buffer. Measured against the
+  reference driver, which accepts the `SQLPutData` and returns the same value,
+  so `CrossFamilyDataAtExecutionConvertsToInteger` runs on the comparison leg
+  rather than opting out. Pinned by that case in `execute_test.cpp` and
+  `param_conversions_test.cpp`, by `dae_plan_buffers_what_cannot_be_plp_framed`
+  in `param_convert.rs`, and - for the wideness-mismatch fix - by
+  `NarrowCTypeAgainstWideSqlTypeDataAtExecutionTranscodes` /
+  `WideCTypeAgainstNarrowSqlTypeDataAtExecutionTranscodes`.
 
 ## `mssql-tds` prepared API
 
@@ -190,6 +182,18 @@ transparent reconnects.
   [ADO 46631](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/46631).
   Enable `StaleHandleAfterReconnectIsInvalidatedAndReprepared` afterward under
   [ADO 47099](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47099).
+- **Concurrent IPD mutation during synchronous `SQLExecute`.** The plan
+  comparison in `DescRecord::parameter_definition` covers sequential mutations
+  between completed calls. An IPD edit made after execution takes its binding
+  snapshot can miss the staged plan, which execution later restores with its
+  old declaration, so applications must serialize parameter edits with
+  execution. Closing this requires coordinating the descriptor snapshot, plan
+  staging, and restoration together; a flag set only while the plan is absent
+  would leave the earlier snapshot-to-staging window uncovered. This is
+  distinct from the data-at-execution Need Data restriction (section 7.3 of
+  the [ODBC engineering instructions](../../.github/instructions/mssql-odbc.instructions.md#73-prepared-parameter-definitions)),
+  and is not a
+  claim that synchronous cross-thread calls are inherently invalid.
 
 ## Conversion milestone: integers and strings
 
@@ -225,8 +229,8 @@ temporal types, `xml` and `sql_variant`. Money needs no row of its own: ODBC
 names no money type - there is no `SQL_MONEY` identifier and no entry for one in
 `rgbTRANSTYPE380` - so `money` and `smallmoney` parameters are bound as
 `SQL_DECIMAL`, which is what `SQLDescribeParam` reports for them, and P8's
-decimal row carries them. What remains is P9 (AB#47790): `vector`, UDT, TVP,
-`SQL_C_NUMERIC`, and the off-diagonal cross-product.
+decimal row carries them. What remains is the P9 series: `vector`, UDT,
+and the off-diagonal cross-product.
 
 ### Design rules
 
@@ -276,10 +280,13 @@ one task per phase.
 | P3 | [47367](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47367) | Code complete | Quadrant A: integer C -> integer SQL |
 | P4 | [47368](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47368) | Code complete | Quadrant B: character C -> character SQL |
 | P5 | [47369](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47369) | Code complete | Quadrants C and D: cross conversions |
-| P6 | [47370](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47370) | Not started | Parity and e2e hardening |
-| P7 | [47371](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47371) | Not started | Cleanup and follow-up hooks |
+| P6 | [47370](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47370) | Partly done | Parity and e2e hardening |
+| P7 | [47371](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47371) | Partly done | Cleanup and follow-up hooks |
 | P8 | [47500](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47500) | Code complete | Scalar rows: bit, float, decimal, GUID, temporal, XML, variant |
-| P9 | [47790](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47790) | Not started | Complete the matrix: vector, UDT, TVP, `SQL_C_NUMERIC`, the `07006` flip |
+| P9 | series under [46373](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/46373) | In progress | Complete the matrix. P9a `SQL_C_NUMERIC` ([47946](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47946), closed), P9b UDT / `sql_variant` ([48248](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/48248)), P9c temporal ([48246](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/48246)), P9d interval sources ([48247](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/48247)), P9e scalar values ([47790](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47790)), P9f the `07006` flip ([48249](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/48249)), P9g vector ([48326](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/48326)) |
+
+P6 and P7 are each partly delivered in code while their work items are still
+open; the bullets under their sections mark which parts have landed.
 
 P1 is independent of P0; P3 onward depend on both. P8 landed ahead of P6 and P7;
 P9 follows P8.
@@ -287,50 +294,28 @@ P9 follows P8.
 #### P0 - Extract shared conversion core (code complete)
 
 Pure refactor, no behavior change. `src/conversion/` now holds the value-level
-conversion for both directions:
+conversion for both directions: the outcome vocabulary (`error.rs`), the exact
+numeric model and narrowing (`numeric.rs`), and the two direction converters
+(`fetch_convert.rs`, `param_convert.rs`). `params/` keeps what is genuinely
+about bindings - the `BoundParam` record and the bind-time `conversion_matrix`.
 
-- `error.rs` - the outcome vocabulary (`ConvOk`, `ConvError`) lifted out of
-  `fetch_convert.rs`. `NotHandledHere` stays a dispatch signal and must never
-  reach an application.
-- `numeric.rs` - `NumericSource` (exact `Int` / `Scaled` / `Float` model),
-  `parse_decimal_literal`, `to_i128_truncating`, and `narrow_i128`, extracted
-  from the `narrow!` macro that was local to `convert_integer_c`. This carries
-  the 128-bit shift-overflow guard and the `22003` unrepresentable-value fix
-  into the parameter path.
-- `fetch_convert.rs` - `api/fetch_convert.rs` moved wholesale. It has no handle
-  or diagnostic coupling, so it never belonged beside the `SQLxxx` entry points
-  in `api/`.
-- `param_convert.rs` - `params/convert.rs` moved, so both direction converters
-  sit together on the shared core. `params/` keeps what is genuinely about
-  bindings: the `BoundParam` record and the bind-time `conversion_matrix`.
+One rule worth keeping: `ConvError::NotHandledHere` is a dispatch signal and
+must never reach an application.
 
-Deferred to the phase that first constructs them, because `sqlstate.rs` carries
-no `allow(dead_code)` and `cargo bclippy` runs `-D warnings` - an unused
-SQLSTATE constant or a never-constructed enum variant fails the lint gate:
-
-- `SQLSTATE_22001` and its `DiagMsg` - landed with P4. `WARN_STRING_TRUNCATION`
-  (`01004`) already existed for the outbound path.
-- `ConvDirection`, and a split of `Truncated` into `FractionalTruncation` /
-  `StringTruncation`, were the anticipated shape for inbound severity. Neither
-  was needed: the parameter path carries its own
-  `ParamBuildError::StringTruncation`, and fetch keeps `ConvOk::Truncated`, so
-  direction is expressed by which converter you are in rather than by a flag.
+Two anticipated abstractions were not needed. `ConvDirection`, and a split of
+`Truncated` into fractional and string variants, were dropped: the parameter
+path carries its own `ParamBuildError::StringTruncation` and fetch keeps
+`ConvOk::Truncated`, so direction is expressed by which converter you are in
+rather than by a flag.
 
 #### P1 - Parameter type model and conversion matrix (code complete)
 
-- [`api/type_rules.rs`](../src/api/type_rules.rs) - C-type canonicalization, the
-  `HY003` / `HY004` identifier gates, and version-aware `SQL_C_DEFAULT`
-  resolution. Direction-neutral, so it sits in `api` rather than `params`.
-- [`params/conversion_matrix.rs`](../src/params/conversion_matrix.rs) - one row
-  per C type listing the SQL types it converts to. Rows as P1 landed them:
-  `SQL_C_CHAR` -> `CHAR` / `VARCHAR` / `LONGVARCHAR`, `SQL_C_WCHAR` -> `WCHAR` /
-  `WVARCHAR` / `WLONGVARCHAR`, and `SQL_C_BINARY` -> `BINARY` / `VARBINARY` /
-  `LONGVARBINARY`. P3-P5 added the integer rows and the cross-family targets.
-- [`api/bind_param.rs`](../src/api/bind_param.rs) - runs both checks and stores
-  the resolved C type on the binding.
-
-No value conversion changed here: `SQL_C_SLONG` + `SQL_INTEGER` still fails at
-bind until P3 adds its row.
+Type-identifier gates and `SQL_C_DEFAULT` resolution live in
+[`api/type_rules.rs`](../src/api/type_rules.rs) (direction-neutral); the
+one-row-per-C-type table lives in
+[`params/conversion_matrix.rs`](../src/params/conversion_matrix.rs);
+[`api/bind_param.rs`](../src/api/bind_param.rs) runs both and stores the
+resolved C type on the binding.
 
 Deviations from msodbcsql, verified against source:
 
@@ -363,13 +348,8 @@ Deviations from msodbcsql, verified against source:
 
 #### P2 - Buffer reader (code complete)
 
-Landed with P3, the phase that gives its integer path a producer and a consumer.
-
 [`conversion/param_buffer.rs`](../src/conversion/param_buffer.rs) is the single
-audited read of application buffers, private to `conversion`. It reads in two
-steps: `read_indicator` settles NULL and the special indicators before any value
-buffer is touched, then `read_param_value` returns an owned `AppValue`
-(`Integer`, `NarrowText`, `WideText`).
+audited read of application buffers, private to `conversion`.
 
 Rules it fixes:
 
@@ -388,51 +368,31 @@ Rules it fixes:
 
 #### P3 - Integer C to integer SQL (code complete)
 
-- `conversion_matrix.rs` gains a row per integer C type reaching all four integer
-  SQL types. Width is not legality: a value that does not fit is a runtime
-  `22003`, not a rejected binding.
-- `param_convert::integer_value` picks the `SqlType` from `ParameterType`, not
-  the C type, typed NULL included - the first phase where `@P1` is declared `int`
-  rather than `nvarchar(max)`.
-- Narrowing goes through `numeric::narrow_i128`, so parameters and fetch share
-  one range check. Overflow is `22003`, including `SQL_C_UBIGINT` above
-  `i64::MAX`, which no SQL Server type can hold.
-- `SQL_C_TINYINT` is sign-unknown: `sqlext.h` gives it neither
-  `SQL_SIGNED_OFFSET` nor `SQL_UNSIGNED_OFFSET`, unlike `SQL_C_STINYINT` and
-  `SQL_C_UTINYINT`. The rule is per pairing, not per type - a `tinyint`-to-
-  `tinyint` transfer moves the byte unchanged, every other pairing reads it
-  signed. `ConvertToFixed` range-checks against `SCHAR_MAX`/`SCHAR_MIN` and
-  stores through `(SCHAR *)`, but skips the check when the source is any tinyint
-  flavour (`sqlccnvt.cpp`). So `SQL_C_TINYINT` is not a synonym for
-  `SQL_C_STINYINT`: only the same-width case differs, and `SQL_C_STINYINT` never
-  gets it.
-- msodbcsql spells that one rule two ways, and so does this driver, because the
-  two directions have different representations available:
-  - Fetch copies the byte outright, so no sign is ever chosen. msodbcsql usually
-    does not even reach the converter - `sqlcdata.cpp` maps a `SQLINT1` column to
-    `SQL_C_UTINYINT` and clears `fConvNeeded` - and where it does convert,
-    `ConvertToFixed` forces a bit copy ("input or output is sign unknown and
-    opposite parameter is same size").
-  - Parameters cannot. `read_param_value` widens every integer C type to `i128`,
-    and widening forces an interpretation; signed would turn an application byte
-    of `0xC8` into `-56`, which a `tinyint` column cannot hold. Unsigned is the
-    reading that keeps the widening lossless, so `effective_param_c_type`
-    rewrites the C type instead - exactly as `ParamToSQLType` does ("If both are
-    tinyint, change C type to unsigned", `sqlcfunc.cpp`), and for the same
-    reason: that path also loads a widened `Temp` before converting.
+Every integer C type reaches all four integer SQL types. Width is not legality:
+a value that does not fit is a runtime `22003`, not a rejected binding. The
+wire type follows `ParameterType`, not the C type - the first phase where `@P1`
+is declared `int` rather than `nvarchar(max)`. Narrowing is shared with fetch
+through `numeric::narrow_i128`.
 
-  Net: a `tinyint` above 127 round-trips in both directions instead of failing
-  `22003`, while `SQL_C_STINYINT` and every wider target keep the signed range
-  check.
-- Value failures travel as `ParamBuildError::Value(ConvError)`, so both
-  directions map `OutOfRange` to the same `22003`.
+The non-obvious rule is `SQL_C_TINYINT`'s sign. `sqlext.h` gives it neither
+`SQL_SIGNED_OFFSET` nor `SQL_UNSIGNED_OFFSET`, and the rule is per pairing, not
+per type: a `tinyint`-to-`tinyint` transfer moves the byte unchanged, every
+other pairing reads it signed (`ConvertToFixed` skips its `SCHAR` range check
+only when the source is a tinyint flavour, `sqlccnvt.cpp`). So `SQL_C_TINYINT`
+is not a synonym for `SQL_C_STINYINT`.
 
-Deviation: no identity fast path. msodbcsql has `IsParamConversionNeeded` to skip
-a buffer-to-buffer copy when the types already agree; this driver always decodes
+Fetch can copy the byte outright and never choose a sign. Parameters cannot:
+`read_param_value` widens to `i128`, and widening forces an interpretation -
+signed would turn an application byte of `0xC8` into `-56`, which a `tinyint`
+column cannot hold. So `effective_param_c_type` rewrites the C type to unsigned
+instead, exactly as `ParamToSQLType` does ("If both are tinyint, change C type
+to unsigned", `sqlcfunc.cpp`). Net: a `tinyint` above 127 round-trips in both
+directions instead of failing `22003`, while `SQL_C_STINYINT` and every wider
+target keep the signed range check.
+
+No identity fast path: msodbcsql has `IsParamConversionNeeded` to skip a
+buffer-to-buffer copy when the types already agree; this driver always decodes
 to a canonical `i128`, so there is no copy to skip.
-
-Signedness, the `22003` state and its message text, and the unaligned reads are
-all verified against msodbcsql source.
 
 #### P4 - Character C to character SQL (code complete)
 
@@ -546,12 +506,25 @@ Verified against msodbcsql source:
 - Malformed UTF-8 stays lossy - there is no msodbcsql behaviour to copy, since
   its conversion goes through `SystemLocale::FromUtf16` (`sqlccmd.cpp:10952`),
   which is not in this source tree. `22018` is tracked with AB#47565.
-- Still `HYC00`: `SQL_SS_VECTOR`, `SQL_SS_UDT` and `SQL_SS_TABLE`, all owned by
-  AB#47790 (P9). `DescribesMaxLengthParameters` and
+- Still `HYC00`: `SQL_SS_VECTOR` (P9g, AB#48326), `SQL_SS_UDT` (P9b, AB#48248)
+  and `SQL_SS_TABLE` (TVPs, AB#48148). `DescribesMaxLengthParameters` and
   `DescribedDecimalRoundTripsPrecisionAndScale` are both re-enabled - the first
   with the binary types (AB#47688), the second with decimal (AB#47500).
 
 Deferred:
+
+**mssql-python reachability for this section.** `param_detect.hpp` binds text
+with `PARAM_C_TYPE_TEXT`, which is `SQL_C_WCHAR` on every platform, and routes
+any non-ASCII string to `SQL_WVARCHAR`. The narrow-target hazards above -
+approximate truncation units (AB#47584), numeric-character-reference
+substitution for unmappable characters (AB#47598), and the `SQL_C_CHAR` code
+page (AB#47565) - are therefore **not on its default path**. They become
+reachable when an application forces a narrow C or SQL type through
+`setinputsizes`. The byte-encoding path additionally requires an explicit real
+narrow C type, for example
+`setencoding(encoding="cp1252", ctype=mssql_python.SQL_CHAR)`; the native
+binding honors the configured encoding only when `ctype == SQL_CHAR`.
+Treat these paths as opt-in rather than unreachable.
 
 - **The 2GB ceiling on `max` types is enforced nowhere, here or in msodbcsql.**
   Conversion skips length checks for varmax (`:2862`), bind bounds the declared
@@ -727,17 +700,19 @@ round-trip cases under `testsrc/.../NewODBCCTypes`, bit, float, decimal and GUID
 parameters none at all - so the e2e cases in `param_conversions_test.cpp` run on
 the compare leg, where a wrong reading fails rather than sits.
 
-#### P6 - Parity and e2e hardening (not started)
+#### P6 - Parity and e2e hardening (partly done)
 
 - Parameter-numbered diagnostics.
 - A serialization failure after a packet has already flushed leaves the request
   half-sent, and the server answers 4002 on the *next* command. Declaring real
   lengths is what made it reachable, so P4 exposed it rather than caused it.
   The retraction and its two e2e cases are tracked by AB#47687.
-- Run the e2e suite under `--compare-with-msodbcsql`; mark driver-specific
-  assertions with `SKIP_IF_COMPARING_MSODBCSQL()`.
-- Add `Benefits-from-mock-tds:` notes where only the round-tripped value is
-  observable and the declared RPC type is not.
+- **Done.** Run the e2e suite under `--compare-with-msodbcsql`; mark
+  driver-specific assertions with `SKIP_IF_COMPARING_MSODBCSQL()`. The macro is
+  defined in the e2e fixture, wired into `run_e2e.sh` / `run_e2e.ps1`, and used
+  throughout the suite.
+- **Done.** Add `Benefits-from-mock-tds:` notes where only the round-tripped
+  value is observable and the declared RPC type is not.
 - **`DecimalDigits` is validated at execute, not at bind.** `CheckSqlPrecScale`
   lives up to its name: `SQLBindParameter` runs it (`sqlcdesc.cpp:3038`) and it
   rejects a bad scale there, not later. `SQL_NUMERIC` / `SQL_DECIMAL` reject
@@ -763,10 +738,11 @@ the compare leg, where a wrong reading fails rather than sits.
   check nor repair, so a mismatched pair reaches the wire with a different
   declaration than msodbcsql would send.
 
-#### P7 - Cleanup and hooks (not started)
+#### P7 - Cleanup and hooks (partly done)
 
-- Remove remaining "Phase 1" language from `conversion/param_convert.rs` and
-  `params/bound_param.rs`.
+- **Done.** Remove remaining "Phase 1" language from
+  `conversion/param_convert.rs` and `params/bound_param.rs`; neither file
+  carries it now.
 - Record the deferred blockers: `SqlType` metadata/value separation for decimal
   and temporal typed NULLs, and the hard-coded decimal precision/scale in
   `mssql-tds/src/datatypes/sqltypes.rs`.
@@ -906,22 +882,32 @@ accept/store contract itself belongs to AB#46377 and is documented in
 What each driver does, the measurements behind it, and the reasoning live on the
 work items. Not restated here.
 
-| # | case | this driver | work item |
-|---|---|---|---|
-| 1 | a set that fails **client-side** conversion | sets already serialized still commit and the call is partial success; msodbcsql materializes first, sends nothing, and reports total failure | AB#47945 |
-| 2 | `SQLExecDirect` with `PARAMSET_SIZE > 1` | `HYC00`, with or without markers | AB#47939 |
-| 4 | data-at-execution combined with an array | `HYC00` at execute | AB#47958 |
-| 5 | output / `InputOutput` parameters in arrays only (`SQL_ATTR_PARAMSET_SIZE > 1`) | binding accepted; array execution returns `HYC00` | AB#48148 |
-| 6 | array stride for `SQL_C_SS_VECTOR` | binding refused | AB#47790 |
-| 7 | array size set through `SQLSetDescField(apd, SQL_DESC_ARRAY_SIZE, n)` | accepted, then one set executes | AB#47945 |
-| 8 | server reports fewer sets than `PARAMSET_SIZE` with no error | `SQL_SUCCESS_WITH_INFO` and `01000` naming the reported count; msodbcsql returns `SQL_SUCCESS` | AB#47945 |
-| 9 | `SQL_DIAG_ROW_NUMBER` on a diagnostic raised during array execution | always `SQL_NO_ROW_NUMBER` - no per-set attribution is plumbed through `post_tds_error` yet, so a batch with several failing sets reports several records with no mapping back to the row that produced each one | microsoft/mssql-rs#541 |
+The **mssql-python** column records whether the divergence is observable
+through the primary consumer, read from `param_detect.hpp` /
+`ddbc_bindings.cpp`: its
+`executemany` binds column-wise arrays but **falls back to a row-by-row
+`SQLExecute` loop whenever any parameter is DAE**, always prepares rather than
+using `SQLExecDirect`, sets the array size through `SQLSetStmtAttr` only, and
+`DetectParamTypes` hard-codes `inputOutputType = SQL_PARAM_INPUT` for every
+parameter. "No" therefore means not observable today, not unimportant -
+whether because the case cannot be reached at all, or because it is reached
+but the differing field is never read. "n/a" marks a case no consumer can
+reach for reasons unrelated to mssql-python.
 
-Divergence 9's absence was unobservable before this PR: nothing produced
-per-row diagnostics until array execution existed. `SQL_DIAG_ROW_NUMBER`
-itself is now implemented and correctly reports `SQL_NO_ROW_NUMBER` for every
-non-array diagnostic (there is no row to report); only the array-execution
-row-attribution is deferred.
+| # | case | this driver | mssql-python | work item |
+|---|---|---|---|---|
+| 1 | a set that fails **client-side** conversion | sets already serialized still commit and the call is partial success; msodbcsql materializes first, sends nothing, and reports total failure | **Yes** - `executemany` uses arrays | AB#47945 |
+| 2 | `SQLExecDirect` with `PARAMSET_SIZE > 1` | `HYC00`, with or without markers | No - always prepares | AB#47939 |
+| 4 | data-at-execution combined with an array | `HYC00` at execute | No - drops to a row-by-row loop when any parameter is DAE | AB#47958 |
+| 5 | output / `InputOutput` parameters in arrays only (`SQL_ATTR_PARAMSET_SIZE > 1`) | binding accepted; array execution returns `HYC00` | No - binds `SQL_PARAM_INPUT` only | AB#48148 |
+| 6 | array stride for `SQL_C_SS_VECTOR` | binding refused | No - never binds the vector C type | AB#48326 |
+| 7 | array size set through `SQLSetDescField(apd, SQL_DESC_ARRAY_SIZE, n)` | accepted, then one set executes | No - uses `SQLSetStmtAttr`; `SQLSetDescField` only for `SQL_C_NUMERIC` | AB#47945 |
+| 8 | server reports fewer sets than `PARAMSET_SIZE` with no error | `SQL_SUCCESS_WITH_INFO` and `01000` naming the reported count; msodbcsql returns `SQL_SUCCESS`; no known server behaviour produces it | n/a - not consumer-gated | AB#47945 |
+| 9 | `SQL_DIAG_ROW_NUMBER` on a diagnostic raised during array execution | always `SQL_NO_ROW_NUMBER` - no per-set attribution is plumbed through `post_tds_error` yet, so a batch with several failing sets reports several records with no mapping back to the row that produced each one | No - the array errors surface, but `AppendDiagRecords` reads records with `SQLGetDiagRecW` and its only `SQLGetDiagFieldW` call asks for `SQL_DIAG_SQLSTATE`, so the missing attribution is never observed | microsoft/mssql-rs#541 |
+
+`SQL_DIAG_ROW_NUMBER` is implemented and correctly reports
+`SQL_NO_ROW_NUMBER` for every non-array diagnostic (there is no row to
+report); only the array-execution row-attribution is deferred.
 
 `SQL_PARAM_ARRAY_ROW_COUNTS` and `SQL_PARAM_ARRAY_SELECTS` (`SQLGetInfo`) are
 both implemented: `SQL_PARC_NO_BATCH` (one rolled-up `SQLRowCount`, matching
@@ -960,19 +946,27 @@ code* is deliberately not copied - msodbcsql's `SQL_ERROR` is a total-failure
 code, correct there because nothing ran, and reporting it over committed
 rows would invite a retry that double-inserts. The rest are gaps.
 
-1-4 are pinned by `param_array_test.cpp` cases gated with
-`SKIP_IF_COMPARING_MSODBCSQL()`; 5 by
+Divergences 1, 2 and 4 are pinned by `param_array_test.cpp` cases gated with
+`SKIP_IF_COMPARING_MSODBCSQL()` (there is no divergence 3; the numbers are
+stable identifiers and are not reused); 5 by
 the input-only array validation in `stage_execution`.
 
 Single-row output/input-output parameters and call return values are supported (AB#46384 / AB#48049). Direct RPC and `EXEC ... OUTPUT` text routes match returned parameters by name or ordinal. Delivery uses current bindings and bind offsets, survives fetch exhaustion and connection reuse, and respects rebind/`SQL_RESET_PARAMS`. Writeback reports string/fractional truncation (`01004`/`01S07`) and conversion/indicator errors (`22018`/`22002`).
 
 ## Remaining work
 
+Items whose mssql-python reachability was assessed carry a **[reachable]** or
+**[not reachable]** tag, on the evidence described above the divergences table.
+A "not reachable" item is still real ODBC surface - it just cannot be hit
+through mssql-python today, so it does not gate the msodbcsql replacement.
+Untagged items are internal optimizations, already-closed gaps, or work whose
+consumer reachability has not been assessed.
+
 - **Stream marker rewriting without an intermediate SQL string.** `SQLPrepare`
   already scans and rewrites once. A future allocation optimization could store
   the original SQL plus `Vec<usize>` marker offsets, then stream SQL chunks and
-  `@P{n}` names directly to the TDS writer. Execute-time binding state would
-  already supplies `OUTPUT` and `?=` handling. This is no longer a repeated-parsing
+  `@P{n}` names directly to the TDS writer. Execute-time binding state already
+  supplies `OUTPUT` and `?=` handling. This is no longer a repeated-parsing
   correctness issue.
 - **Type matrix and TDS type selection:** tracked by the conversion milestone
   above. P3-P5 drive the wire type from `ParameterType` for the integer and
@@ -981,11 +975,23 @@ Single-row output/input-output parameters and call return values are supported (
   need nothing further: ODBC has no money type identifier, so they arrive as
   `SQL_DECIMAL` and are declared `decimal(19,4)` / `decimal(10,4)` for the
   server to convert on assignment. msodbcsql declares the same, for the same
-  reason. The remaining matrix work - `vector`, UDT, TVP, `SQL_C_NUMERIC` and
-  the off-diagonal cross-product, together with the `HYC00` -> `07006` flip that
-  depends on it - is P9 (AB#47790). `ColumnSize` still does not bound a
-  data-at-execution value in either family (AB#47590).
-- **Deferred features (AB#48148):** output/input-output parameters in parameter arrays and TVPs. Single-row output parameters are supported; input parameter arrays (`SQL_ATTR_PARAMSET_SIZE`) are implemented with the limitations above.
+  reason. The remaining matrix work is now the P9 series under AB#46373
+  (`mssql-odbc | Parameter completeness`): UDT (P9b, AB#48248)
+  **[not reachable** - `ParamInfo` carries no type name, so mssql-python cannot
+  supply one**]**,
+  temporal completion (P9c, AB#48246) **[reachable]**, interval C sources (P9d,
+  AB#48247) **[not reachable** - no interval C type is bound**]**, scalar value
+  conversions (P9e, AB#47790) **[reachable]**, the `HYC00` -> `07006` flip
+  (P9f, AB#48249) **[reachable** - diagnostic correctness**]**, and `vector`
+  (P9g, AB#48326) **[not reachable]**. TVPs are tracked separately by AB#48148
+  **[not reachable** - no `SQL_SS_TABLE` binding**]**. `ColumnSize` bounds a
+  data-at-execution value within the character and binary families, enforced
+  against the accumulated total on the `SQLPutData` that breaches it (`22001`);
+  it is left to the close-time conversion only across families and for the
+  `max` declarations, which have no declared length. What remains under
+  AB#47590 is the unbounded close-time transform described above
+  **[reachable** - DAE triggers above 4000 UTF-16 units / 8000 bytes**]**.
+- **Deferred features (AB#48148) [not reachable]:** output/input-output parameters in parameter arrays and TVPs. `DetectParamTypes` binds every parameter `SQL_PARAM_INPUT`, so mssql-python never reaches the output-array case; TVPs are unreachable for the separate reason above - they are input parameters, but `ParamInfo` carries no `SQL_SS_TABLE` type name to supply. Single-row output parameters are supported; input parameter arrays (`SQL_ATTR_PARAMSET_SIZE`) are implemented with the limitations above.
 - **`mssql-tds` gap found by P8, closed by AB#47800:** a `sql_variant` could not
   carry a `varchar` payload - `get_variant_base_type` and
   `create_variant_inner_context` assumed every `ColumnValues::String` was
