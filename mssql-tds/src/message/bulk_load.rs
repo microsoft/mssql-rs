@@ -474,6 +474,18 @@ impl<'a> StreamingBulkLoadWriter<'a> {
         Ok(())
     }
 
+    /// Whether any value written into this bulk-load message lost a character
+    /// to the target collation's code page.
+    ///
+    /// A bulk row goes through the same `TdsValueSerializer` as an RPC
+    /// parameter, so a narrow value can be substituted here too. Read this
+    /// *before* [`Self::end`], which consumes the writer along with its borrow
+    /// of the `PacketWriter` the flag lives on; `end` writes only the DONE
+    /// token, so no value can be substituted after this point.
+    pub fn code_page_conversion_loss(&self) -> bool {
+        self.packet_writer.code_page_conversion_loss()
+    }
+
     /// End streaming - write DONE token and finalize packet.
     ///
     /// This consumes the writer and returns the number of rows written.
