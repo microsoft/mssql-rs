@@ -880,13 +880,17 @@ accept/store contract itself belongs to AB#46377 and is documented in
 What each driver does, the measurements behind it, and the reasoning live on the
 work items. Not restated here.
 
-The **mssql-python** column records whether the primary consumer can reach the
-case at all, read from `param_detect.hpp` / `ddbc_bindings.cpp`: its
+The **mssql-python** column records whether the divergence is observable
+through the primary consumer, read from `param_detect.hpp` /
+`ddbc_bindings.cpp`: its
 `executemany` binds column-wise arrays but **falls back to a row-by-row
 `SQLExecute` loop whenever any parameter is DAE**, always prepares rather than
 using `SQLExecDirect`, sets the array size through `SQLSetStmtAttr` only, and
 `DetectParamTypes` hard-codes `inputOutputType = SQL_PARAM_INPUT` for every
-parameter. "No" therefore means unreachable today, not unimportant.
+parameter. "No" therefore means not observable today, not unimportant -
+whether because the case cannot be reached at all, or because it is reached
+but the differing field is never read. "n/a" marks a case no consumer can
+reach for reasons unrelated to mssql-python.
 
 | # | case | this driver | mssql-python | work item |
 |---|---|---|---|---|

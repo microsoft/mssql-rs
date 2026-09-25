@@ -459,9 +459,9 @@ free the statement handle before the execution path reacquires it.
 
 This is a source-level race, not an established application-contract defect.
 The ODBC spec gates `SQLDisconnect` with `HY010` while a statement is still
-executing asynchronously or is parked in a `SQL_NEED_DATA` sequence, and the
-expected synchronous ordering is that an application drains its results and
-closes its cursors before disconnecting. Establishing whether this is
+executing asynchronously or is parked in a `SQL_NEED_DATA` sequence; outside
+those cases it permits disconnecting with statements still allocated and
+requires the driver to free them. Establishing whether this is
 reachable through a supported call sequence needs the Driver Manager's own
 enforcement and a reproducer holding valid handles through call completion,
 per section 6.1 of the engineering instructions. Until that exists, serializing
