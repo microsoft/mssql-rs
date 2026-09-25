@@ -126,6 +126,54 @@ def test_cross_repo_jobs_share_the_pinned_checkout(template):
     assert "mssql-python-branch" not in text
 
 
+def test_macos_docker_condition_preserves_other_callers():
+    template = load_template("macos-docker-steps.yml")
+    condition = next(p for p in template["parameters"] if p["name"] == "condition")
+    assert condition == {"name": "condition", "type": "string", "default": "succeeded()"}
+    for step in template["steps"]:
+        assert step["condition"] == "${{ parameters.condition }}"
+        assert not step.get("continueOnError", False)
+
+    sql_steps = load_template("sql-setup-template.yml")["steps"]
+    macos = next(
+        step["${{ if eq(parameters.buildTarget, 'MacOS') }}"]
+        for step in sql_steps if "${{ if eq(parameters.buildTarget, 'MacOS') }}" in step
+    )
+    docker = next(step for step in macos if step.get("template") == "macos-docker-steps.yml")
+    assert "condition" not in docker.get("parameters", {})
+    sql = next(step for step in macos if "start-sql-server-macos.sh" in step.get("script", ""))
+    assert sql.get("condition", "succeeded()") == "succeeded()"
+
+
+def test_mssql_python_macos_readiness_gates_provisioning():
+    steps = load_template("test-mssql-python-macos-template.yml")["steps"]
+    named = {step["displayName"]: step for step in steps if "displayName" in step}
+    ready = "and(succeeded(), eq(variables['mssqlPythonReady'], 'true'))"
+    docker = next(step for step in steps if step.get("template") == "macos-docker-steps.yml")
+    assert docker["parameters"]["condition"] == ready
+    sql = named["Start SQL Server (Docker, no TLS certs)"]
+    tests = named["Run mssql-python tests"]
+    assert sql["condition"] == tests["condition"] == ready
+    smoke = named["Verify installed mssql-python runtime"]
+    assert steps.index(smoke) < steps.index(docker) < steps.index(sql) < steps.index(tests)
+    assert smoke.get("condition", "succeeded()") == "succeeded()"
+    for step in steps:
+        assert not step.get("continueOnError", False)
+
+    setup_results = named["Publish mssql-python macOS setup results"]
+    test_results = named["Publish mssql-python macOS test results"]
+    assert setup_results["condition"] == "succeededOrFailed()"
+    assert test_results["condition"] == (
+        "and(succeededOrFailed(), eq(variables['mssqlPythonReady'], 'true'))"
+    )
+    for publish in (setup_results, test_results):
+        assert publish["inputs"]["failTaskOnMissingResultsFile"] is True
+    assert named["Cleanup SQL Server"]["condition"] == (
+        "and(always(), eq(variables['mssqlPythonReady'], 'true'))"
+    )
+    assert named["Cleanup"]["condition"] == "always()"
+
+
 @pytest.mark.skipif(_BASH is None, reason="Bash is required")
 @pytest.mark.parametrize("count", [0, 1, 2])
 def test_odbc_wheel_installation(tmp_path, count):

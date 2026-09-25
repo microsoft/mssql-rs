@@ -76,10 +76,13 @@ require explicit setup support rather than a custom dependency resolver.
 
 Provider API/id/path drift fails PR/local runs but produces a warning and a
 skipped smoke test on non-PR runs. Pytest publishes the setup result in either
-case; driver tests run only after a successful smoke check. Native builds,
+case; Docker/Colima provisioning, SQL startup, and driver tests run only after
+a successful smoke check. An advisory skip also skips Docker cleanup, but the
+upstream checkout is always cleaned up. The shared Docker template defaults to
+`succeeded()` for other callers. Native builds,
 packaging/install commands, dependency failures, import/loader errors, and
-unexpected exceptions remain blocking. Pipeline wiring is validated by the
-actual PR jobs, not a mocked build/install harness.
+unexpected exceptions remain blocking. Focused YAML assertions cover readiness
+gates and the shared default; actual PR jobs validate the build/install wiring.
 
 To advance the pin, review the upstream commit comparison, replace the full SHA,
 and validate both cross-repo jobs in the pin-update PR. CI following main never

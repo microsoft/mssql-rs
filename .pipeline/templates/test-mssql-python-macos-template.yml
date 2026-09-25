@@ -101,10 +101,13 @@ steps:
 
 # ── 4. Start Docker via Colima ───────────────────────────────────────────────
 - template: macos-docker-steps.yml
+  parameters:
+    condition: and(succeeded(), eq(variables['mssqlPythonReady'], 'true'))
 
 # ── 5. Start SQL Server (no TLS certs) ──────────────────────────────────────
 - script: bash .pipeline/scripts/start-sql-server-macos.sh
   displayName: 'Start SQL Server (Docker, no TLS certs)'
+  condition: and(succeeded(), eq(variables['mssqlPythonReady'], 'true'))
   timeoutInMinutes: 22
   env:
     SQL_PASSWORD: $(SQL_PASSWORD)
@@ -143,6 +146,9 @@ steps:
 - script: |
     docker stop sqlserver || true
     docker rm sqlserver || true
-    rm -rf $(Build.SourcesDirectory)/../mssql-python || true
+  displayName: Cleanup SQL Server
+  condition: and(always(), eq(variables['mssqlPythonReady'], 'true'))
+
+- script: rm -rf $(Build.SourcesDirectory)/../mssql-python || true
   displayName: Cleanup
   condition: always()
