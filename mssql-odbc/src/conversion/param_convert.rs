@@ -385,30 +385,27 @@ unsafe fn bound_param_to_value_with_outcome(
         )?),
         // A UDT's payload is its `IBinarySerialize` form, which the driver
         // passes through untouched - there is nothing to convert, only to name.
-        (AppValue::Binary(bytes), SqlFamily::Udt) => {
-            SqlType::Udt(udt_type_name(udt_names)?, Some(bytes))
-        }
-        // Character buffers are legal sources - `fValidConversion` admits all
-        // three buffer C types for `SQL_UDT_MAPPED` - but this arm diverges
-        // from msodbcsql, which hex-decodes them instead of passing them
-        // through. `rgbTRANSTYPE*` maps `SQL_UDT_MAPPED` to a `SQL_C_BINARY`
-        // transfer type (`sqlcmisc.cpp:67`, `:178`, `:217`), so `wCTypeOut` is
-        // binary while `wCType` stays char (asserted at `sqlcmisc.cpp:7224`).
-        // `ConvertLongData` then takes its conversion path rather than its
-        // pass-through one, whose guard admits only binary input or a matching
-        // char/wchar pair (`sqlccnvt.cpp:874-877`), reaching the branch
-        // commented "CHAR/WCHAR ->binary (2 chars are converted to only one
-        // single binary byte)" (`sqlccnvt.cpp:1014-1016`). The length checks
-        // corroborate the 2:1 ratio: `cbMax*2` for `SQL_C_CHAR` and
-        // `cbMax*2*sizeof(WCHAR)` for `SQL_C_WCHAR` (`sqlcfunc.cpp:3048-3063`).
         //
-        // Source reading only - unmeasured on retail, so this is not yet a
-        // registry entry. Closing it needs a both-legs run binding `SQL_C_CHAR`
-        // against a `hierarchyid` with `SQL_DRIVER_VER` recorded, which then
-        // decides whether to hex-decode here or register the divergence. Note
-        // `SQL_NTS` is unusable for this: a serialized `hierarchyid` contains
-        // embedded nulls, so the length must be explicit. AB#48248.
-        (AppValue::NarrowText(bytes) | AppValue::WideText(bytes), SqlFamily::Udt) => {
+        // Binary only. `fValidConversion` also admits `SQL_C_CHAR` and
+        // `SQL_C_WCHAR`, but msodbcsql hex-decodes those rather than passing
+        // them through - `rgbTRANSTYPE*` gives `SQL_UDT_MAPPED` a
+        // `SQL_C_BINARY` transfer type (`sqlcmisc.cpp:67`, `:178`, `:217`), so
+        // `ConvertLongData` misses its pass-through guard
+        // (`sqlccnvt.cpp:874-877`) and reaches the branch commented "CHAR/WCHAR
+        // ->binary (2 chars are converted to only one single binary byte)"
+        // (`sqlccnvt.cpp:1014-1016`), with the `cbMax*2` checks at
+        // `sqlcfunc.cpp:3048-3063` corroborating the ratio. Sending the buffer
+        // verbatim instead would put different bytes on the wire for the same
+        // binding, so those rows stay out of the conversion matrix and are
+        // refused at bind rather than shipped divergent.
+        //
+        // Source reading only, unmeasured on retail. Closing it needs a
+        // both-legs run binding `SQL_C_CHAR` against a `hierarchyid` with
+        // `SQL_DRIVER_VER` recorded, which decides whether to implement the
+        // decode here or register the difference. Note `SQL_NTS` is unusable
+        // for that binding: a serialized `hierarchyid` contains embedded nulls,
+        // so the length must be explicit. AB#48248.
+        (AppValue::Binary(bytes), SqlFamily::Udt) => {
             SqlType::Udt(udt_type_name(udt_names)?, Some(bytes))
         }
         _ => return Err(ParamBuildError::ConversionNotImplemented),
@@ -6038,47 +6035,45 @@ mod tests {
     /// serialized form, so there is nothing to convert, only to name.
     #[test]
     fn a_udt_passes_its_payload_through_unchanged() {
-        for c_type in [SQL_C_BINARY, SQL_C_CHAR] {
-            let mut bytes = vec![0x01u8, 0x02, 0xFE];
-            let mut ind: SqlLen = 3;
-            let mut p = param(c_type, bytes.as_mut_ptr() as *mut c_void, &mut ind);
-            p.sql_type = SQL_SS_UDT;
-            let names = udt_binding("hierarchyid", "", "");
-
-            let (value, _) = unsafe { bound_param_to_value_named(&p, names.as_deref()) }.unwrap();
-            match value {
-                SqlType::Udt(name, Some(payload)) => {
-                    assert_eq!(payload, vec![0x01, 0x02, 0xFE], "{c_type}");
-                    assert_eq!(name.type_name, "hierarchyid");
-                    assert_eq!(name.db_name, None);
-                    assert_eq!(name.schema_name, None);
-                }
-                other => panic!("{c_type}: expected a UDT, got {other:?}"),
-            }
-        }
-    }
-
-    /// A wide buffer is a legal UDT source too (`conversion_matrix` admits all
-    /// three buffer C types), and its bytes are the payload verbatim.
-    ///
-    /// This pins current behavior, not parity: msodbcsql hex-decodes a
-    /// character buffer bound to a UDT rather than passing it through - see
-    /// the divergence note on the `SqlFamily::Udt` character arm in
-    /// `bound_param_to_value`. Unmeasured on retail, so the answer here may
-    /// change once it is (AB#48248).
-    #[test]
-    fn a_wide_buffer_reaches_a_udt_as_its_raw_bytes() {
-        // UTF-16LE 'A' - even length so the wide read is well-formed.
-        let mut bytes = vec![0x41u8, 0x00];
-        let mut ind: SqlLen = 2;
-        let mut p = param(SQL_C_WCHAR, bytes.as_mut_ptr() as *mut c_void, &mut ind);
+        let mut bytes = vec![0x01u8, 0x02, 0xFE];
+        let mut ind: SqlLen = 3;
+        let mut p = param(SQL_C_BINARY, bytes.as_mut_ptr() as *mut c_void, &mut ind);
         p.sql_type = SQL_SS_UDT;
         let names = udt_binding("hierarchyid", "", "");
 
         let (value, _) = unsafe { bound_param_to_value_named(&p, names.as_deref()) }.unwrap();
         match value {
-            SqlType::Udt(_, Some(payload)) => assert_eq!(payload, vec![0x41, 0x00]),
+            SqlType::Udt(name, Some(payload)) => {
+                assert_eq!(payload, vec![0x01, 0x02, 0xFE]);
+                assert_eq!(name.type_name, "hierarchyid");
+                assert_eq!(name.db_name, None);
+                assert_eq!(name.schema_name, None);
+            }
             other => panic!("expected a UDT, got {other:?}"),
+        }
+    }
+
+    /// A character buffer does not reach a UDT: msodbcsql hex-decodes one,
+    /// two characters to the byte, rather than passing it through, so
+    /// admitting the row while sending the buffer verbatim would put different
+    /// bytes on the wire for the same binding. Refused past the bind gate the
+    /// same way, via the `_ =>` unsupported-conversion arm.
+    ///
+    /// Source reading only - see the citation chain on the `SqlFamily::Udt`
+    /// arm in `bound_param_to_value`. A measured retail run may turn this into
+    /// an implemented decode (AB#48248).
+    #[test]
+    fn a_character_buffer_does_not_reach_a_udt() {
+        for c_type in [SQL_C_WCHAR, SQL_C_CHAR] {
+            // UTF-16LE 'A' - even length so a wide read would be well-formed.
+            let mut bytes = vec![0x41u8, 0x00];
+            let mut ind: SqlLen = 2;
+            let mut p = param(c_type, bytes.as_mut_ptr() as *mut c_void, &mut ind);
+            p.sql_type = SQL_SS_UDT;
+            let names = udt_binding("hierarchyid", "", "");
+
+            let err = unsafe { bound_param_to_value_named(&p, names.as_deref()) }.unwrap_err();
+            assert_eq!(err, ParamBuildError::ConversionNotImplemented, "{c_type}");
         }
     }
 

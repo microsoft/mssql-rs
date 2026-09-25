@@ -58,8 +58,22 @@ const TEMPORAL_SQL_TARGETS: &[SqlSmallInt] = &[
 /// listed apart from `CHARACTER_SQL_TARGETS`.
 const CHARACTER_PAYLOAD_SQL_TARGETS: &[SqlSmallInt] = &[SQL_SS_XML];
 
-/// A CLR UDT takes its payload untouched from any of the three buffer-shaped C
-/// types, and its identity from the IPD's `SQL_CA_SS_UDT_*` fields.
+/// A CLR UDT takes its payload untouched from a `SQL_C_BINARY` buffer, and its
+/// identity from the IPD's `SQL_CA_SS_UDT_*` fields.
+///
+/// `fValidConversion` also admits `SQL_C_CHAR` and `SQL_C_WCHAR`, but those
+/// rows are not built yet rather than deliberately refused: msodbcsql does not
+/// pass a character buffer through, it hex-decodes it two characters to the
+/// byte. `rgbTRANSTYPE*` gives `SQL_UDT_MAPPED` a `SQL_C_BINARY` transfer type
+/// (`sqlcmisc.cpp:67`, `:178`, `:217`), so `ConvertLongData` misses its
+/// pass-through guard (`sqlccnvt.cpp:874-877`) and lands on the branch
+/// commented "CHAR/WCHAR ->binary (2 chars are converted to only one single
+/// binary byte)" (`sqlccnvt.cpp:1014-1016`); the `cbMax*2` length checks at
+/// `sqlcfunc.cpp:3048-3063` corroborate the ratio. Admitting them while
+/// sending the buffer verbatim would put different bytes on the wire than the
+/// reference for the same binding. Source reading only - the measurement that
+/// decides whether to implement the decode is named in `bound_param_to_value`'s
+/// UDT arm. AB#48248.
 const UDT_SQL_TARGETS: &[SqlSmallInt] = &[SQL_SS_UDT];
 
 /// Whether the driver can convert a `c_type` application buffer into `sql_type`
@@ -82,7 +96,6 @@ pub(crate) fn is_supported_conversion(c_type: SqlSmallInt, sql_type: SqlSmallInt
             TEMPORAL_SQL_TARGETS,
             CHARACTER_PAYLOAD_SQL_TARGETS,
             &[SQL_SS_VARIANT],
-            UDT_SQL_TARGETS,
         ],
         SQL_C_WCHAR => &[
             CHARACTER_SQL_TARGETS,
@@ -91,7 +104,6 @@ pub(crate) fn is_supported_conversion(c_type: SqlSmallInt, sql_type: SqlSmallInt
             TEMPORAL_SQL_TARGETS,
             CHARACTER_PAYLOAD_SQL_TARGETS,
             &[SQL_SS_VARIANT],
-            UDT_SQL_TARGETS,
         ],
         SQL_C_BINARY => &[BINARY_SQL_TARGETS, &[SQL_SS_VARIANT], UDT_SQL_TARGETS],
         SQL_C_BIT => &[&[SQL_BIT]],
@@ -344,15 +356,18 @@ mod tests {
         }
     }
 
-    /// A UDT takes its payload untouched from any of the three buffer-shaped C
-    /// types. Nothing else reaches it: a scalar C type has no serialized form
-    /// the server could interpret as the UDT's own.
+    /// A UDT takes its payload untouched from a `SQL_C_BINARY` buffer, and
+    /// nothing else reaches it today. A scalar C type has no serialized form
+    /// the server could interpret as the UDT's own; the character rows are a
+    /// different case - `fValidConversion` admits them, but msodbcsql
+    /// hex-decodes rather than passing through, so they stay unbuilt until
+    /// that is measured (see `UDT_SQL_TARGETS`, AB#48248).
     #[test]
-    fn only_the_buffer_c_types_reach_udt() {
-        for c_type in [SQL_C_CHAR, SQL_C_WCHAR, SQL_C_BINARY] {
-            assert!(is_supported_conversion(c_type, SQL_SS_UDT), "{c_type}");
-        }
+    fn only_a_binary_buffer_reaches_udt_today() {
+        assert!(is_supported_conversion(SQL_C_BINARY, SQL_SS_UDT));
         for c_type in [
+            SQL_C_CHAR,
+            SQL_C_WCHAR,
             SQL_C_BIT,
             SQL_C_DOUBLE,
             SQL_C_GUID,
