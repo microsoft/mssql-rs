@@ -15,9 +15,9 @@ platform's ODBC Driver Manager.
 ## Distribution
 
 The driver is included in
-[`mssql-python-rs`](https://pypi.org/project/mssql-python-rs/0.1.0/), the native
-runtime used by `mssql-python`. Version `0.1.0` is the latest release on PyPI,
-with prebuilt wheels for supported Windows, macOS, and Linux targets.
+[`mssql-python-rs`](https://pypi.org/project/mssql-python-rs/), the native
+runtime used by `mssql-python`. See the PyPI release page for the current
+version and available Windows, macOS, and Linux wheels.
 
 This crate is not published independently to crates.io. Build it from this
 workspace when developing or testing the ODBC library directly.
@@ -37,17 +37,6 @@ flowchart TD
     odbcDriver -->|Rust API| tdsClient
     tdsClient -->|TDS protocol| sqlServer
 ```
-
-ODBC entry points cross a panic boundary, validate raw pointers in a small
-unsafe layer, and delegate to safe Rust implementations. The driver targets
-the behavior of Microsoft ODBC Driver 18 where practical while documenting and
-testing deliberate differences.
-
-Design notes for individual subsystems live beside the code: the parameter
-binding and array-execution model in [`docs/parameters_plan.md`](docs/parameters_plan.md),
-the fetch path in [`docs/typed-columnar-fetch-plan.md`](docs/typed-columnar-fetch-plan.md),
-and the deliberate departures from msodbcsql in
-[`docs/parity-deviations.md`](docs/parity-deviations.md).
 
 ## Platform artifacts
 
@@ -91,73 +80,6 @@ Run the Rust test suite from the repository root:
 cargo nextest run -p mssqlodbc --lib
 ```
 
-### Buffer safety with Miri
-
-The `miri-odbc` nextest profile selects the opt-in `memory_safety` unit-test
-modules and the parameter reader's existing misalignment tests. They cover
-unaligned values and indicators, initialized read extents, string terminators
-and capacities, fixed-width writes, untouched error outputs, and reuse of caller
-buffers. They also run as ordinary unit tests; no production code is replaced
-under Miri. The UTF-16 reader cases check both aligned and byte-offset input,
-preserving lossy decoding, explicit lengths, and NUL termination. Parameter
-cases vary value, indicator, and length alignment independently, including
-temporal inputs, ignored storage, and length sentinels. Column-wise arrays and
-packed row-wise parameter bindings exercise production address calculations
-with nonzero offsets and distinct first/last values.
-
-The SQL NULL case with an uninitialized octet-length slot tests only
-`read_indicator`'s early return, not full execution. Execution's earlier
-data-at-execution probes still require readable, initialized non-null
-octet-length slots for input and input/output parameters.
-
-PR validation runs this profile under Miri on **Windows x64 and Linux x64**
-only, using `nightly-2026-09-06` and seed 0. The Linux job uses the existing
-Ubuntu build container. Test failures and empty selections fail the job, and
-each platform publishes a separate ODBC Miri JUnit report. The ordinary native
-test run still includes these tests; ARM64, macOS, and Alpine do not run Miri.
-The `--package mssqlodbc` option scopes the run to the driver. The shared filter
-uses only test names so it also parses in the smaller Kerberos workspace,
-which omits ODBC.
-
-The Build stage's `miriToolchain` variable in
-`.pipeline/templates/validation-stages.yml` holds the CI pin; keep the local
-commands below on the same version when updating it.
-
-From the repository root, with `cargo-nextest` installed:
-
-```powershell
-cargo fetch
-rustup toolchain install nightly-2026-09-06 --profile minimal --component miri,rust-src
-cargo +nightly-2026-09-06 miri nextest run --frozen -p mssqlodbc --lib --profile miri-odbc
-```
-
-`cargo fetch` creates the local, gitignored lockfile and restores dependencies
-before the frozen run. On Windows, a long checkout path can make Cargo use a
-compiler response file, which this Miri version does not support. In that case,
-set a short, dedicated build directory before running Miri:
-
-```powershell
-$env:CARGO_TARGET_DIR = Join-Path $env:TEMP "odbc-miri"
-```
-
-Run the same selection natively with:
-
-```powershell
-cargo nextest run --frozen -p mssqlodbc --lib --profile miri-odbc
-```
-
-The tests keep unread input tails uninitialized so Miri can detect over-reads
-that stay inside an allocation. Output sentinels additionally catch writes
-outside the declared slot even when those writes remain inside the backing
-allocation. Deliberate misalignment is asserted before the call, and C struct
-padding is not assumed to be initialized.
-
-This profile intentionally excludes handle fixtures (which start an I/O-enabled
-Tokio runtime), socket-based mock servers, native authentication/TLS, and the
-C++ Driver Manager tests. It does not test Windows DLL unloading or replace
-native end-to-end tests or fuzzing. Keep Miri's alignment and aliasing checks
-enabled; a passing run covers only the inputs and executions exercised.
-
 ### C++ end-to-end tests
 
 The C++ end-to-end suite loads the built library through the real ODBC Driver
@@ -177,172 +99,41 @@ See the [end-to-end test guide](tests/e2e/README.md) for prerequisites,
 connection configuration, targeted runs, coverage, and comparison testing
 against `msodbcsql18`.
 
-## Result error timing
+### Buffer safety with Miri
 
-When positioning a row-returning result, `SQLExecDirect`, `SQLExecute`, and
-`SQLMoreResults` wait for its first row, end-of-result, or server error rather
-than returning after column metadata alone. Errors before the first row are
-reported by that positioning call, including server lock timeouts. A first row
-found during this check remains available to `SQLFetch`.
+The `miri-odbc` nextest profile selects the opt-in `memory_safety` unit-test
+modules and misalignment tests. It exercises ODBC caller-buffer handling,
+including unaligned values and indicators, string bounds, fixed-width writes,
+and column-wise and row-wise array address calculations. PR validation runs
+this profile on Windows x64 and Linux x64.
 
-## Typed character retrieval
+From the repository root, with `cargo-nextest` installed:
 
-`SQLGetData` converts `varchar(max)` and `nvarchar(max)` into the same supported
-integer, floating-point, and date/time C targets as non-max text. It
-preserves the column's encoding and any unread characters from an earlier
-character read. Typed conversion decodes carried UTF-16 output even after a
-character-target switch has moved it into byte storage; a partially delivered
-code unit remains malformed rather than becoming a numeric prefix.
-Fixed-size targets ignore `BufferLength` and report their C
-type's size after successful conversion.
+```powershell
+cargo fetch
+rustup toolchain install nightly-2026-09-06 --profile minimal --component miri,rust-src
+cargo +nightly-2026-09-06 miri nextest run --frozen -p mssqlodbc --lib --profile miri-odbc
+```
 
-Typed PLP conversion accepts at most 1 MiB of unread source wire data, matching
-the bound-fetch cap. Bytes consumed by earlier character reads do not count
-against the limit. Larger values are drained and rejected with `HYC00`, leaving output
-buffers unchanged; no truncated numeric prefix is returned. See
-[deviation 7](docs/parity-deviations.md) for the measured native-driver difference.
-Fallible materialization allocation failures drain the value and report `HY001`
-instead of the size-limit diagnostic.
-Typed decoding reserves output before consuming carry or decoder input, without
-temporary UTF-16 vectors or strings; narrow decoder creation is fallible too.
-Typed reads and rejected-value drains reuse an 8 KiB scratch buffer within one
-`SQLGetData` call; internal chunks do not require additional application calls.
-Conversion errors retain decoded text for character/typed retries and the
-original unread wire bytes for binary retries, including binary length probes.
-Binary and decoded-text retries advance independent positions, so switching
-between those views does not interpret a wire-byte offset as a text offset.
-Switching decoded-text targets or retrying a typed conversion uses only the
-unread suffix, with offsets interpreted in the preceding character target's
-encoding. Partially delivered characters remain malformed for typed conversions,
-but their remaining bytes/code units can still be read in the same encoding.
-Character recovery caches the target encoding once on entry or a target switch;
-successive small WCHAR/CHAR reads reuse that rendering rather than reconverting
-the whole retained value.
-The raw retry buffer is bounded by the same source-data cap.
-Empty character values retrieved as numeric or GUID C targets succeed with
-indicator 0 and leave the value buffer unchanged, matching msodbcsql18. Empty
-date/time literals remain `22018`. SQL NULL still uses `SQL_NULL_DATA` and
-requires an indicator pointer.
-Nonempty text-to-`SQL_C_GUID` conversion remains unimplemented for both max and
-non-max text (`07006`); this PLP path reuses the existing typed converters.
+The CI toolchain pin is `miriToolchain` in
+`.pipeline/templates/validation-stages.yml`; use that value if it changes.
+On Windows, set a short target directory if Miri reports that compiler response
+files are unsupported:
 
-## Connection busy gate
+```powershell
+$env:CARGO_TARGET_DIR = Join-Path $env:TEMP "odbc-miri"
+```
 
-`SQLFetch`/`SQLFetchScroll`/`SQLGetData` release the connection's busy claim
-(`DbcState::active_stmt`) as soon as the wire is drained for the current
-statement, instead of holding it for the statement's whole cursor lifetime —
-matching msodbcsql's wire-state `FIsBusyReadingData` gate (see AB#47508).
-This costs a one-token read-ahead on ordinary fetches: no extra round trip,
-but returning row N can now wait on row N+1's header arriving. See
-`release_busy_if_row_exhausted` in `src/api/exec_common.rs` for the full
-trade-off and why it was accepted as-is.
+Run the same selection natively with:
 
-`SQLExecDirect`/`SQLExecute` also release the claim when their first-row peek
-finds an empty result and the batch is complete (AB#47814). The empty cursor
-and its metadata stay available: `SQLFetch` returns `SQL_NO_DATA` without
-touching a second statement's results. Protocol-only RPC completion tokens
-are consumed before release, with output values retained until
-`SQLMoreResults`; a later application-visible result keeps the connection busy.
-For an empty RPC result, the completion check may wait for the next response
-token under the request's remaining timeout; an expiry is reported by
-`SQLExecDirect`/`SQLExecute`, before the application calls `SQLMoreResults`.
+```powershell
+cargo nextest run --frozen -p mssqlodbc --lib --profile miri-odbc
+```
 
-## Bound fetch performance
-
-Bound fetches borrow their per-fetch descriptor snapshot rather than copying a
-binding for every cell. SQL type resolution is deferred until a binding requests
-`SQL_C_DEFAULT`, and complete inline rows need no PLP metadata snapshot.
-After a packet-boundary continuation, resident columns return to synchronous
-decoding; network waits retain the existing cancellation and timeout handling.
-Datetimeoffset conversion uses checked 64-bit arithmetic while preserving the
-out-of-range rejection of the wider calculation.
-Same-encoding wide delivery in bound fetches and `SQLGetData` copies complete
-UTF-16 code units without decoding them. This preserves unpaired surrogates,
-BOM-like units, and embedded NULs for the application's decoding policy.
-Actual encoding conversions use the explicit encoding without BOM sniffing:
-leading BOM-shaped bytes remain data, including in non-Unicode `varchar` values.
-The materialized-value fast paths require an even byte length before
-using the raw-unit copy helper. Odd-length PLP streams retain their existing
-behavior and are not covered by this parity claim.
-Bound buffers trim a real surrogate pair if truncation would split it, but keep
-already-unpaired units. `SQLGetData` can split a pair across calls because the
-caller retrieves the remaining units on its next call.
-
-The native `GetDataUtf16Test` and `FetchScrollUtf16Test` cases reproduce these
-fetch behaviors against SQL Server through the Driver Manager, comparing raw
-units rather than decoded strings. `BoundTruncationPreservesOnlyCompletePairs`
-checks real-server truncation; the Rust
-`bound_wide_plp_preserves_units_across_wire_chunks` test additionally uses a mock
-server to force a surrogate pair across a PLP chunk boundary that a SQL query
-cannot control.
-
-Bound narrow-codepage `SQL_C_CHAR` truncation converts only a buffer-sized
-prefix, then drains the remaining wire bytes without conversion. For a known
-length, the indicator estimates unread source bytes at 1:1 plus converted
-output (including withheld characters), matching classic msodbcsql's
-`sqlcdata.h` accounting before `FlushData`. Source held by a DBCS decoder stays
-in the unconverted count; unknown lengths remain `SQL_NO_TOTAL`. A fitting
-value reports its exact UTF-8 length. `SQLGetData` keeps its resumable behavior.
-
-Materialized CP1252 `varchar` values delivered as `SQL_C_WCHAR` decode directly
-to bounded UTF-16 scratch space, without allocating a UTF-8 string or copying
-borrowed source bytes. Each CP1252 byte produces one UTF-16 unit, so repeated
-`SQLGetData` calls decode only the next requested chunk and report the exact
-remaining byte length. This applies to buffered/captured reads, bound row
-arrays and output parameters. Other encodings, `SQL_C_CHAR`, and streaming MAX
-conversion retain their existing paths.
-
-## SQLGetData target switches
-
-An active PLP value can change between `SQL_C_CHAR`, `SQL_C_WCHAR`, and
-`SQL_C_BINARY`. Both text targets first copy any pending converted bytes
-**without re-encoding them**; binary bypasses those bytes and completes when
-the unread wire payload ends. This matches msodbcsql's `InternalGetColData`
-(`odbc/sqlcdata.h`) and completion gate (`odbc/sqlcdata.cpp`), measured on Linux
-with retail 18.6.2.1 (`SQL_DRIVER_VER` `18.06.0002`). See AB#48046.
-
-Text conversions finish a trailing partial source character before returning,
-even if earlier characters already produced output. Internal completion reads
-append to that output and preserve the call's length accounting.
-If malformed input starts a new character during completion, its bytes are
-returned to the raw stream for the next read. Completion does not keep consuming
-a chain of malformed characters after the output buffer fills.
-
-One reference-driver quirk remains: after a narrow read exhausts an
-`nvarchar(max)` value's wire bytes, a WCHAR probe with no payload room reports
-`01004` with indicator **0**, even when converted carry remains. The indicator
-counts only unread wire bytes on this path; callers must provide payload room
-to drain the carry, rather than keep issuing zero-capacity probes.
-
-A zero-length binary probe before text conversion consumes nothing. A consuming
-binary read followed by text conversion resumes at the next unread byte, even
-if that position splits a multibyte character, as in the reference driver.
-
-## Parameter array results
-
-Prepared parameter arrays can return rows from `SELECT`, `INSERT ... OUTPUT`,
-and procedures. Fetch the current result normally and use `SQLMoreResults` to
-advance through the results in parameter-set order. Completion counts and
-statuses are deferred until the corresponding sets finish; inspect the final
-bookkeeping after navigation reaches `SQL_NO_DATA`. Closing the cursor drains
-unread results without executing any parameter set again.
-
-`SQLGetInfo(SQL_PARAM_ARRAY_SELECTS)` reports `SQL_PAS_BATCH`. Non-row-returning
-arrays still complete during `SQLExecute` and report their aggregate row count.
-
-RPC value encoding avoids per-parameter boxed futures. Complete buffered
-DONE-family and RETURNSTATUS tokens are decoded without constructing the
-asynchronous parser; cancellation still uses the normal ATTENTION settlement
-path, and incomplete tokens retain the existing network-read behavior.
-Optional streaming declarations and encryption metadata are stored out of line
-so ordinary parameter arrays do not copy their unused storage for every value.
-Small RPC headers and type metadata are written together when buffered space
-allows; packet-boundary writes retain normal overflow and cancellation handling.
-Response-token reads skip clock sampling for unlimited query timeouts while
-retaining elapsed-time accounting for finite and exhausted budgets.
-Inlining hints target parameter positioning, conversion, RPC encoding, and
-response/value dispatch. The large conversion and serialization functions use
-`#[inline]`, leaving the final inlining decision to the compiler.
+This profile intentionally excludes handle fixtures (which start an I/O-enabled
+Tokio runtime), socket-based mock servers, native authentication/TLS, and the
+C++ Driver Manager tests. It complements rather than replaces native
+end-to-end tests and fuzzing.
 
 ## Prepared parameter bindings
 

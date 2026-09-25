@@ -4,9 +4,16 @@
 
 ## Overview
 
-This project delivers a **production-ready ODBC Driver 18 for SQL Server written in Rust**, designed as a drop-in replacement for Microsoft's `msodbcsql18` driver. Applications using `Driver={ODBC Driver 18 for SQL Server}` work without code changes.
+This project is developing an ODBC 3.x driver for SQL Server in Rust, with
+Microsoft ODBC Driver 18 compatibility as the target. The driver is alpha
+software and is not yet a general-purpose, drop-in replacement for
+`msodbcsql18`.
 
-The driver wraps the `mssql-tds` library (TDS protocol implementation, workspace-local path dependency) with a full ODBC 3.x API layer — ~78 exported functions (including W wide-char variants) covering connectivity, query execution, data types, authentication, encryption, bulk operations, and more.
+The driver wraps the workspace-local `mssql-tds` protocol library. The current
+export manifest defines 50 ODBC entry points covering handles, connectivity,
+statement execution, parameters, result retrieval, catalogs, descriptors, and
+diagnostics. `SQLSetConnectAttr` is exported only on non-Windows targets; the
+other character APIs currently expose their wide variants.
 
 **Target platforms**: Windows, Linux, macOS (x64 and ARM64) - Same as the platforms currently supported by msodbcsql
 **Binary output**: `mssqlodbc.dll` (Windows), `mssqlodbc.so` (Linux), `mssqlodbc.dylib` (macOS)
@@ -38,56 +45,26 @@ The driver follows a three-layer architecture with strict separation of concerns
 
 ### Crate Structure
 
-A single crate (`mssql-odbc/`) producing the cdylib. Internal separation is via modules:
+`mssql-odbc` is a single crate producing the native driver library. Its current
+top-level structure is:
 
 ```
 mssql-odbc/
 ├── src/
-│   ├── lib.rs              # cdylib root — declares modules, hosts ffi_entry! macro and init_tracing()
-│   ├── test_support.rs     # TestHandles helper for unit tests
-│   ├── api/                # ODBC API layer — one file per SQLXxx (or family)
-│   │   ├── mod.rs
-│   │   ├── exports.rs        # All #[unsafe(no_mangle)] pub extern "C" symbols
-│   │   ├── odbc_types.rs     # ODBC C type aliases (SqlHandle, SqlReturn, ...) and constants
-│   │   ├── sqlstate.rs       # SQLSTATE constants
-│   │   ├── util.rs           # Shared helpers (write_if_some, read_utf16, copy_with_nul, ...)
-│   │   ├── alloc_handle.rs   # SQLAllocHandle
-│   │   ├── free_handle.rs    # SQLFreeHandle
-│   │   ├── set_env_attr.rs   # SQLSetEnvAttr
-│   │   ├── driver_connect.rs # SQLDriverConnect[W]
-│   │   ├── disconnect.rs     # SQLDisconnect
-│   │   ├── exec_direct.rs    # SQLExecDirect[W]
-│   │   ├── prepare.rs        # SQLPrepare[W] (deferred prepare)
-│   │   ├── execute.rs        # SQLExecute (sp_prepexec / sp_execute)
-│   │   ├── exec_common.rs    # Shared claim/execute/finish helpers for exec paths
-│   │   ├── bind_param.rs     # SQLBindParameter / SQLFreeStmt(SQL_RESET_PARAMS)
-│   │   ├── fetch.rs          # SQLFetch
-│   │   ├── get_data.rs       # SQLGetData
-│   │   ├── num_result_cols.rs# SQLNumResultCols
-│   │   ├── describe_col.rs   # SQLDescribeCol[W]
-│   │   ├── more_results.rs   # SQLMoreResults
-│   │   ├── close_cursor.rs   # SQLCloseCursor / SQLFreeStmt(SQL_CLOSE)
-│   │   └── get_diag.rs       # SQLGetDiagRec[W] / SQLGetDiagField[W]
-│   ├── handles/            # Env, DBC, STMT handle structs and state
-│   │   ├── mod.rs            # HandleType, handle_to_raw / handle_from_raw conversions
-│   │   ├── env.rs            # EnvHandle, EnvState, OdbcVersion
-│   │   ├── dbc.rs            # DbcHandle, DbcState, ConnectionState
-│   │   └── stmt.rs           # StmtHandle, StmtState
-│   ├── params/            # Bound parameter storage and C→TDS value conversion
-│   │   ├── mod.rs            # BoundParam
-│   │   ├── bound_param.rs    # BoundParam struct
-│   │   └── convert.rs        # C-type → SqlType conversion, type/conversion validity
-│   ├── connection/         # Connection-string parsing and connect orchestration
-│   │   └── mod.rs
-│   └── error/              # Diagnostic record posting (post_sql_error, post_tds_error)
-│       ├── mod.rs            # free_errors, error posters, SQLSTATE mapping table
-│       └── diag.rs           # DiagRec storage, SQLGetDiagRec / SQLGetDiagField backing
-├── tests/
-│   └── e2e/                # CMake-built Google Test C++ suite that loads the driver
-│                           # via the ODBC Driver Manager (run_e2e.sh / .ps1)
-├── build.rs                # Platform-specific linker config (soname, install_name, .def)
+│   ├── lib.rs             # Crate root and FFI panic boundary
+│   ├── tracing_init.rs    # Process-wide tracing initialization
+│   ├── api/               # ODBC exports and implementations by API/family
+│   ├── auth/              # SQL, integrated, access-token, and Entra adapters
+│   ├── connection/        # Connection-string parsing and orchestration
+│   ├── conversion/        # Parameter and result value conversion
+│   ├── handles/           # ENV, DBC, STMT, and DESC state
+│   ├── params/            # Bound parameters and conversion legality matrix
+│   └── error/             # Diagnostic records and SQLSTATE mapping
+├── tests/e2e/             # Driver Manager C++ end-to-end suite
+├── docs/                  # Subsystem plans and parity records
+├── build.rs               # Platform linker and artifact configuration
 ├── README.md
-├── plan.md                 # This document
+├── plan.md
 └── Cargo.toml
 ```
 
@@ -108,7 +85,7 @@ FFI from logic), that restructuring is a follow-up task.
 | **TDS dependency** | `mssql-tds` via local path (`../mssql-tds`) | TDS 7.4 + 8.0 support, co-developed in same workspace |
 | **Driver version** | Driver 18 only | TDS 7.4 + TDS 8.0 strict encryption, SQL Server 2016+ alignment |
 | **TLS** | Delegated to mssql-tds (`native-tls`) | SChannel (Win), Security.framework (macOS), OpenSSL (Linux) — no separate TLS crates needed |
-| **Authentication** | Delegated to mssql-tds | Full SSPI, Kerberos, and all 9 Azure AD modes built-in |
+| **Authentication** | ODBC adapters over mssql-tds | SQL password, SSPI, access token, service principal, managed identity, and Windows interactive are wired; other recognized Entra modes currently return `HYC00` |
 | **Localization** | English (en_US) only | Simplifies initial release; resource bundles extensible later |
 | **Test targets** | SQL Server 2022 + Azure SQL Database | Latest features + primary cloud target; older versions work via TDS backward compat |
 
@@ -116,13 +93,15 @@ FFI from logic), that restructuring is a follow-up task.
 
 ## Roadmap
 
-The project is organized into 15 phases grouped by priority. We start with foundational infrastructure and the MVP, then layer on data types, authentication, encryption, and advanced features.
+This roadmap records both implemented milestones and target capabilities. Phase
+status describes the current crate, not merely whether supporting code exists in
+`mssql-tds`.
 
-### Phase 1: Setup
+### Phase 1: Setup — Implemented
 - Cargo workspace initialization, CI/CD pipelines, build infrastructure
 - Export definition file, platform-specific build.rs, GitHub Actions matrix
 
-### Phase 2: Foundation
+### Phase 2: Foundation — Implemented
 - ODBC type system (SQLRETURN, SQLHANDLE, SQL_C_* types)
 - SQLAllocHandle / SQLFreeHandle for all handle types (Env, Connection, Statement, Descriptor)
 - Diagnostics (SQLGetDiagRec, SQLGetDiagField) and SQLSTATE mapping from mssql-tds errors
@@ -130,82 +109,104 @@ The project is organized into 15 phases grouped by priority. We start with found
 - State machine transitions with HY010 enforcement
 - SQLGetInfo, SQLGetFunctions, SQLGetTypeInfo for Driver Manager integration
 
-### Phase 3: Connectivity — MVP
+### Phase 3: Connectivity — MVP — Implemented
 - Connection string parsing (Server, Database, UID, PWD, Encrypt, Trusted_Connection, Authentication, etc.)
 - SQLConnect, SQLDriverConnect with SQL authentication
 - Map auth keywords to mssql-tds: `Trusted_Connection=Yes` → integrated, `Authentication=ActiveDirectory*` → corresponding mode (mostly keyword passthrough)
 - SQLExecDirect, SQLFetch, SQLGetData
 - **Milestone**: Connect to SQL Server, execute `SELECT 1`, fetch result
 
-### Phase 4: Result Handling & Prepared Statements
+### Phase 4: Result Handling & Prepared Statements — Implemented with limitations
 - SQLBindCol
 - SQLNumResultCols, SQLDescribeCol, SQLRowCount
 - SQLMoreResults for multi-statement batches
-- SQLCancel / SQLCancelHandle for query cancellation and timeout handling
+- SQLCancel for query cancellation and timeout handling
 - SQLPrepare / SQLExecute via **deferred prepare**: the first `SQLExecute`
   prepares and runs in one round trip with `sp_prepexec`, caches the returned
   handle, and subsequent executes reuse it via `sp_execute` (a rebind or
   re-prepare invalidates the handle). Matches msodbcsql's deferred-prepare path.
-- SQLBindParameter — input parameters. Phase-1 subset: `SQL_C_CHAR` →
-  `char`/`varchar`/`longvarchar` and `SQL_C_WCHAR` →
-  `wchar`/`wvarchar`/`wlongvarchar`; bind-time type/conversion validation
-  (HY003 / HY004 / 07006). Output params, data-at-exec, parameter arrays, and
-  the wider C↔SQL type matrix are deferred — see
-  [parameters_plan.md](parameters_plan.md).
+- SQLBindParameter with input, output, input/output, and return-value
+  parameters; broad C↔SQL conversion validation; data-at-execution input; and
+  prepared parameter arrays. Streamed output parameters, data-at-execution
+  inside arrays, and parameter arrays through `SQLExecDirect` remain unsupported.
+  See [parameters_plan.md](docs/parameters_plan.md).
 - Statement reuse with different parameter values
 - Batch execution with multiple result sets
 
-### Phase 5: All SQL Server Data Types
-- All 45+ SQL Server types with correct C type conversions
-- Numeric, character, binary, date/time, special types (BIT, GUID, XML)
+### Phase 5: SQL Server Data Types — In progress
+- Complete the C↔SQL conversion matrix and overflow/truncation behavior
+- Numeric, character, binary, date/time, and special types (BIT, GUID, XML)
 - LOB streaming via chunked SQLGetData
-- Data-at-execution parameters (SQLPutData/SQLParamData)
 - Table-Valued Parameters (TVP)
 - Cross-type automatic conversions per ODBC specification
 
-### Phase 6: Authentication E2E Validation
+### Phase 6: Authentication E2E Validation — In progress
 - E2E tests for each auth mode against SQL Server 2022 + Azure SQL
-- Keyword mapping already implemented in Phase 3; this phase is test coverage and edge-case hardening
-- Validate: SQL auth, Windows Integrated (SSPI/Kerberos), all 9 Azure AD modes (Password, Interactive, DeviceCodeFlow, ServicePrincipal, ManagedIdentity, Default, MSI, WorkloadIdentity, Integrated)
+- Complete the one remaining driver-reachable adapter,
+  `ActiveDirectoryIntegrated` (AB#46068). `ActiveDirectoryPassword` is an
+  accepted out-of-scope deviation (AB#45486) and stays `HYC00`.
+- Validate what the driver itself performs: SQL auth, Windows Integrated
+  (SSPI/Kerberos), Windows Interactive, ServicePrincipal, ManagedIdentity/MSI,
+  and pre-acquired access tokens
+- `ActiveDirectoryDefault` and `ActiveDirectoryDeviceCode` are not msodbcsql
+  `Authentication=` keywords; mssql-python maps both and hands the driver
+  `SQL_COPT_SS_ACCESS_TOKEN`, so validating them means covering the
+  access-token path rather than a driver-side mode.
+- Any `Authentication=` value mssql-python does not map survives into the
+  connection string and reaches this driver. That includes
+  `ActiveDirectoryWorkloadIdentity` and the `ActiveDirectoryDeviceCodeFlow`
+  spelling, both of which this driver recognizes and validates before
+  `configure_auth` returns `HYC00`. They are reachable unsupported
+  pass-through modes, not unreachable ones. Neither is an msodbcsql keyword,
+  so implementing them would exceed parity - decide that explicitly rather
+  than by default.
 - Linux/macOS Kerberos via GSS-API (delegated to mssql-tds)
 - Token refresh, expiry, and retry behavior under real Azure AD
 
-### Phase 7: TLS Encryption
-- Map Encrypt=Yes/No/Strict, TrustServerCertificate, HostNameInCertificate to mssql-tds
-- TLS 1.2/1.3 via `native-tls` (delegated to mssql-tds)
-- TDS 8.0 strict encryption mode for SQL Server 2022
+### Phase 7: TLS Encryption — In progress
+- Map Encrypt, TrustServerCertificate, and HostNameInCertificate to mssql-tds
+- Validate TLS behavior and certificate diagnostics on each target platform
+- Complete and verify TDS 8.0 strict encryption against SQL Server 2022
 
-### Phase 8: Cross-Platform Installation
+### Phase 8: Distribution and Installation — In progress
+- **Shipped**: the driver is distributed inside the `mssql-python-rs` Python
+  wheels on PyPI, for Windows (x64, ARM64), macOS (universal2), and Linux
+  (`manylinux_2_28`, `manylinux_2_34`, `musllinux_1_2`; x86_64 and aarch64),
+  built and verified by the containerized pipeline under `.pipeline/` and
+  `scripts/`. This replaced OS-native packaging as the initial release vehicle.
 - Windows MSI (WiX), Linux DEB/RPM, macOS PKG installers
-- Driver registration as "ODBC Driver 18 for SQL Server"
-- DSN configuration (ConfigDSN, SQLConfigDataSource)
-- CI/CD release pipeline
+- Driver Manager registration as "ODBC Driver 18 for SQL Server" outside the
+  test harnesses. The e2e and benchmark scripts register a distinct
+  "ODBC Driver 18 for SQL Server (Rust)" name so both drivers can coexist, and
+  mssql-python loads the library directly rather than through a registration.
+- DSN configuration: `ConfigDSN` and `SQLConfigDataSource` are not exported
 
-### Phase 9: Always Encrypted
+### Phase 9: Always Encrypted — Planned
 - SQLSetConnectAttr(SQL_COPT_SS_COLUMN_ENCRYPTION) to enable AE
 - Transparent encrypt on SQLBindParameter, decrypt on SQLFetch/SQLGetData for encrypted columns
 - Column Encryption Key (CEK) caching and Column Master Key (CMK) resolution
 - Keystore providers: Windows Certificate Store, Azure Key Vault
 - Secure enclave attestation (SQL Server 2019+) for LIKE, range, and pattern queries on encrypted columns
 
-### Phase 10: Scrollable Cursors
+### Phase 10: Scrollable Cursors — Planned
 - Static, keyset-driven, and dynamic cursor types
 - SQLFetchScroll (ABSOLUTE, RELATIVE, PRIOR, FIRST, LAST)
 - Positioned updates/deletes via SQLSetPos, SQLBulkOperations
 
-### Phase 11: Catalog Functions
+### Phase 11: Catalog Functions — In progress
 - Each catalog function dispatches to the matching SQL Server system stored
   procedure via RPC, renames its ODBC 2.x column names to ODBC 3.x, and clears
   the ODBC-mandated NOT NULL flags — matching msodbcsql (`sqlcdd.cpp` `DoDD()`)
 - **Implemented**: SQLTables, SQLColumns, SQLPrimaryKeys, SQLForeignKeys,
   SQLStatistics, SQLSpecialColumns, SQLProcedures (AB#46380)
-- **Not yet implemented**: SQLProcedureColumns
+- **Not yet implemented**: SQLProcedureColumns, SQLTablePrivileges,
+  SQLColumnPrivileges
 - Results match msodbcsql column names, types, and ordering exactly
 - Filter arguments (catalog, schema, table name patterns) flow through
   unmodified to the stored procedures, which already implement ODBC's
   pattern/exact-match argument semantics server-side
 
-### Phase 12: Polish & Cross-Cutting Concerns
+### Phase 12: Polish & Cross-Cutting Concerns — Ongoing
 - Transaction management: SQLEndTran (COMMIT/ROLLBACK), SQLSetConnectAttr for isolation levels (READ COMMITTED, SNAPSHOT, etc.), autocommit on/off
 - Unicode (W) FFI entry points: string-accepting exports duplicated as wide-char variants (SQLConnectW, SQLExecDirectW, etc.) for Driver Manager integration
 - Data type conversion compliance: validate all SQL_C_* ↔ SQL_* conversion pairs, overflow/truncation behavior, SQL_C_DEFAULT resolution
@@ -219,18 +220,18 @@ The project is organized into 15 phases grouped by priority. We start with found
 - Multi-subnet failover: MultiSubnetFailover=Yes connection string keyword, parallel connection attempts
 - 24-hour stress test, memory leak validation (Valgrind/ASAN)
 
-### Phase 13: Bulk Copy Program (BCP)
+### Phase 13: Bulk Copy Program (BCP) — Deferred
 - All 25+ BCP API functions: `bcp_init`, `bcp_bind`, `bcp_sendrow`, `bcp_batch`, `bcp_exec`
 - High-performance bulk import/export targeting >50K rows/sec
 - FFI wiring for all BCP entry points
 
-### Phase 14: MARS
+### Phase 14: MARS — Deferred
 - SQLSetConnectAttr(SQL_COPT_SS_MARS_ENABLED) to enable/disable MARS
 - Multiple active SQLExecDirect / SQLFetch calls on separate statements sharing one connection
 - TDS session multiplexing — delegated to mssql-tds; ODBC layer routes results to correct statement handle
 - When MARS is off, return HY000 if a second statement executes while results are pending
 
-### Phase 15: Asynchronous Execution (Polling Method)
+### Phase 15: Asynchronous Execution (Polling Method) — Planned
 
 **Planned scope: mirror msodbcsql — statement-level async only.** The reference
 driver advertises `SQL_ASYNC_MODE = SQL_AM_STATEMENT`,
@@ -251,7 +252,7 @@ AB#48149 capability ledger.
   msodbcsql): `SQLExecDirect[W]`, `SQLExecute`, `SQLFetch`, `SQLFetchScroll`,
   `SQLMoreResults`, `SQLGetData`, `SQLNumResultCols`, `SQLDescribeCol[W]`,
   `SQLColAttribute[W]`, `SQLPrepare[W]`, and the catalog functions.
-- Cancellation of an in-flight async op via `SQLCancel` / `SQLCancelHandle`
+- Cancellation of an in-flight async op via `SQLCancel`
   (wires into the existing Phase 4 cancel path / mssql-tds `CancelHandle`).
 
 **What we explicitly do NOT support (matching msodbcsql):**
@@ -271,7 +272,7 @@ AB#48149 capability ledger.
   may have an async op in flight (non-MARS). A second async op on the connection
   returns HY010.
 - While an op is `SQL_STILL_EXECUTING`, only the original function plus
-  `SQLCancel`/`SQLCancelHandle`, `SQLGetDiagRec`/`SQLGetDiagField`, and the
+  `SQLCancel`, `SQLGetDiagRec`/`SQLGetDiagField`, and the
   read-only info functions may be called on that handle; anything else → HY010.
 - Each repeated (polling) call clears the previous diagnostic records, per spec.
 
@@ -297,48 +298,13 @@ interrupts an in-flight query.
 
 ---
 
-## Phase Dependencies
-
-```
-  Phase 1: Setup
-      │
-      ▼
-  Phase 2: Foundation  ◄── BLOCKS all user stories
-      │
-      ├───► Phase 3: Connectivity (MVP)
-      │         │
-      │         ├───► Phase 4: Result Handling & Prepared Statements
-      │         │         │
-      │         │         ├───► Phase 5: Data Types
-      │         │         │         │
-      │         │         │         └───► Phase 9: Always Encrypted
-      │         │         │
-      │         │         ├───► Phase 14: MARS
-      │         │         └───► Phase 15: Async Execution
-      │         │
-      │         ├───► Phase 6: Auth E2E Validation
-      │         ├───► Phase 7: TLS Encryption
-      │         ├───► Phase 8: Installation
-      │         ├───► Phase 10: Cursors
-      │         ├───► Phase 11: Catalog Functions
-      │         └───► Phase 13: BCP
-      │
-      └───► Phase 12: Cross-Cutting (alongside any phase)
-```
-
-Phases **6, 7, 8, 10, 11, and 13** can proceed in parallel once Phase 3 is complete. Phase 9 (Always Encrypted) requires Phases 4 and 5. Phase 11 (Catalog) can ship incrementally — each function is independent. Phase 12 cross-cutting items can be picked up alongside any phase. Phases 13 (BCP) and 14 (MARS) are deferred — not required for initial releases. Phase 15 (Async Execution) requires Phase 4 (cancellation path) and a `multi_thread` Tokio runtime; it is deferred — not required for initial releases.
-
----
-
 ## Risks & Mitigations
 
 | Risk | Likelihood | Mitigation |
 |------|-----------|------------|
 | **mssql-tds API gaps** — pre-release library may lack features | High | Return HYC00 for unsupported features; document gaps; contribute upstream PRs |
-| **ODBC conformance failures** — spec edge cases | Medium | Run conformance tests early; use ec-mini-odbc MCP server to verify msodbcsql behavior |
+| **ODBC conformance failures** — spec edge cases | Medium | Run the e2e suite against both drivers through the same Driver Manager (`run_e2e.sh --compare-with-msodbcsql`) and treat any parity-table difference as a defect |
 | **BCP performance below 50K rows/sec** | Low | Profile with criterion; optimize type conversions and buffer copies |
-| **Azure AD complexity** — 9 auth modes with platform differences | Medium | Delegate to mssql-tds (supports all modes); test incrementally |
-| **Cross-platform build matrix** — 3 OS × 2+ architectures | Medium | GitHub Actions matrix builds; Docker for Linux reproducibility |
 
 ---
 
@@ -366,7 +332,11 @@ Phases **6, 7, 8, 10, 11, and 13** can proceed in parallel once Phase 3 is compl
 
 ## Appendix: ODBC APIs Used by mssql-python
 
-Audit of [microsoft/mssql-python](https://github.com/microsoft/mssql-python) — 38 ODBC functions dynamically loaded via `GetFunctionPointer` in `ddbc_bindings.cpp`. This is the minimum API surface required for mssql-python compatibility.
+Audit of [microsoft/mssql-python](https://github.com/microsoft/mssql-python) at
+commit `29fa5546eb7f24df0d5d42276549aa789937880d`: 40 ODBC functions are
+dynamically resolved via `GetFunctionPointer` in `ddbc_bindings.cpp`. The
+loader's mandatory composite check covers 38; `SQLCancel` and
+`SQLGetDiagFieldW` are optional but used when available.
 
 | Category | Functions |
 |----------|-----------|
@@ -383,42 +353,98 @@ Audit of [microsoft/mssql-python](https://github.com/microsoft/mssql-python) —
 | **Info** (2) | `SQLGetInfoW`, `SQLGetTypeInfoW` |
 | **Descriptor** (1) | `SQLSetDescFieldW` |
 | **Transaction** (1) | `SQLEndTran` |
-| **Diagnostics** (1) | `SQLGetDiagRecW` |
+| **Cancellation** (1) | `SQLCancel` |
+| **Diagnostics** (2) | `SQLGetDiagRecW`, `SQLGetDiagFieldW` |
 | **Cleanup** (1) | `SQLFreeStmt` |
 
-**Not used by mssql-python**: `SQLConnect`, `SQLBrowseConnect`, `SQLGetFunctions`, `SQLSetPos`, `SQLBulkOperations`, `SQLCloseCursor`, `SQLCancel`, `SQLProcedureColumns`, `SQLGetDiagField`, `SQLGetDescField`, all `bcp_*` functions.
+**Not used by mssql-python**: `SQLConnect`, `SQLBrowseConnect`, `SQLGetFunctions`, `SQLSetPos`, `SQLBulkOperations`, `SQLCloseCursor`, `SQLProcedureColumns`, `SQLGetDescField`, all `bcp_*` functions.
 
 ---
 
 ## Appendix: ODBC APIs used by pyodbc but not mssql-python
 
-Audit of [mkleehammer/pyodbc](https://github.com/mkleehammer/pyodbc) (source call sites) and diffed against the mssql-python API list above.
+Audit of [mkleehammer/pyodbc](https://github.com/mkleehammer/pyodbc) source call
+sites, diffed against the mssql-python list above.
 
-| ODBC APIs used by pyodbc but not mssql-python |
-|----------|
-| `SQLCancel` |
-| `SQLColAttribute` |
-| `SQLDataSources` |
-| `SQLDataSourcesW` |
-| `SQLDescribeCol` |
-| `SQLDrivers` |
-| `SQLExecDirect` |
-| `SQLForeignKeys` |
-| `SQLGetDiagField` |
-| `SQLGetInfo` |
-| `SQLGetStmtAttr` |
-| `SQLGetTypeInfo` |
-| `SQLNumParams` |
-| `SQLPrepare` |
-| `SQLPrimaryKeys` |
-| `SQLProcedureColumns` |
-| `SQLProcedures` |
-| `SQLSetConnectAttr` |
-| `SQLSetDescField` |
-| `SQLSetStmtAttr` |
-| `SQLSpecialColumns` |
-| `SQLStatistics` |
-| `SQLTables` |
+pyodbc chooses the ANSI or the wide entry point at runtime from the connection
+encoding (the `isWide` branches in `cursor.cpp`), so it calls both spellings of
+most families. Treating each A/W pair as one family, three families are absent
+from the mssql-python list:
+
+| Additional API | pyodbc use | Current mssql-odbc status |
+|---|---|---|
+| `SQLNumParams` | Parameter-marker count in `params.cpp` | Exported |
+| `SQLProcedureColumns` | `Cursor.procedureColumns` | Not implemented |
+| `SQLTablePrivileges` | `Cursor.tablePrivileges` | Not implemented |
+
+The other unsuffixed names pyodbc calls — `SQLColAttribute`, `SQLDescribeCol`,
+`SQLExecDirect`, `SQLForeignKeys`, `SQLGetInfo`, `SQLGetStmtAttr`,
+`SQLGetTypeInfo`, `SQLPrepare`, `SQLPrimaryKeys`, `SQLProcedures`,
+`SQLSetConnectAttr`, `SQLSetDescField`, `SQLSetStmtAttr`, `SQLSpecialColumns`,
+`SQLStatistics`, and `SQLTables` — are ANSI spellings of families mssql-python
+already uses in `W` form. They are not additional APIs, and they raise the same
+ANSI routing question as the PHP appendix below.
+
+`SQLDataSources` and `SQLDrivers` back `pyodbc.dataSources()` and
+`pyodbc.drivers()`. Both are Driver Manager enumeration APIs called on the
+environment handle, so they are not driver exports.
+
+### Required feature work beyond API availability
+
+| Area | pyodbc path | Required work |
+|------|-------------|---------------|
+| **Table-valued parameters** | `SQL_SS_TABLE` parameters bind their constituent columns under `SQL_SOPT_SS_PARAM_FOCUS`, each column sent as DAE | Implement TVP binding. The crate rejects `SQL_SOPT_SS_PARAM_FOCUS`, so this fails at the first call. |
+| **DAE inside parameter arrays** | `fast_executemany` drives a `SQLParamData`/`SQLPutData` loop within a single paramset | Support data-at-execution within parameter arrays. The crate rejects the combination, so `fast_executemany` fails once any value is DAE-sized. |
+| **Row-wise parameter arrays** | Binds at a synthetic base address with `SQL_ATTR_PARAM_BIND_TYPE` set to the row length and `SQL_ATTR_PARAM_BIND_OFFSET_PTR` rebasing each batch | Implemented; validate against pyodbc's offset technique. |
+| **APD descriptor writes** | `SQL_C_NUMERIC` parameters set `SQL_DESC_TYPE`, `SQL_DESC_PRECISION`, `SQL_DESC_SCALE`, and `SQL_DESC_DATA_PTR` on the application parameter descriptor | Validate `SQLSetDescField`, including `SQL_DESC_DATA_PTR` writes. |
+| **Retrieval and sizing metadata** | No `SQLBindCol`; every value is read through `SQLGetData`, and DAE thresholds come from `SQL_NEED_LONG_DATA_LEN` and `SQLGetTypeInfo` column sizes | Validate chunked `SQLGetData` and the reported type metadata, which decide when pyodbc switches to DAE. |
+| **ANSI routing** | `setencoding`/`setdecoding` can select `SQL_C_CHAR`, after which pyodbc calls the unsuffixed entry points | Same ANSI routing question as the API table above. |
+
+pyodbc does not need scrollable cursors, output parameters, or `SQLBindCol`:
+`Cursor.skip` deliberately calls `SQLFetchScroll` with `SQL_FETCH_NEXT` to avoid
+scrollable cursors, and both parameter paths bind `SQL_PARAM_INPUT` only.
+
+The API gaps are `SQLProcedureColumns` and `SQLTablePrivileges`; the feature
+gaps are TVPs and data-at-execution inside parameter arrays.
+
+---
+
+## Appendix: Additional ODBC support required by the PHP drivers
+
+Audit of [microsoft/msphpsql](https://github.com/microsoft/msphpsql) `dev` at
+commit `a218e2382c5d2698f84ed762044e7ab0bfe3b9fc`. Both `sqlsrv` and
+`pdo_sqlsrv` use the shared ODBC layer under `source/shared/`.
+
+Treating ANSI and wide variants as one API family, msphpsql calls one family
+that is absent from the mssql-python list above. It already exists in
+`mssql-odbc`:
+
+| Additional API | PHP use | Current mssql-odbc status |
+|----------|---------|---------------------------|
+| `SQLNumParams` | Parameter-marker count | Exported |
+
+Msphpsql also uses unsuffixed calls for `SQLColAttribute`, `SQLColumns`,
+`SQLDescribeCol`, `SQLGetConnectAttr`, `SQLGetInfo`, `SQLGetStmtAttr`,
+`SQLPrepare`, `SQLSetConnectAttr`, `SQLSetStmtAttr`, and `SQLTables`, while
+`mssql-odbc` mainly exports the corresponding `W` symbols. Because msphpsql
+calls through an ODBC Driver Manager, test these paths through the Windows
+Driver Manager and unixODBC before adding ANSI exports.
+
+`SQLGetInstalledDrivers` is not a driver requirement. It is a Driver Manager
+installer API; installation only needs to register the expected driver name.
+
+### Required feature work beyond mssql-python compatibility
+
+| Area | PHP path | Required work |
+|------|----------|---------------|
+| **Server cursors** | Static, dynamic, and keyset cursor options; PRIOR, FIRST, LAST, ABSOLUTE, and RELATIVE fetches | Implement non-forward cursor types and orientations. The PHP-layer client-buffered cursor does not require a new ODBC feature. |
+| **Table-valued parameters** | `SQL_SS_TABLE`, descriptor fields, and `SQL_SOPT_SS_PARAM_FOCUS` for constituent columns | Implement TVP binding and RPC serialization. The crate currently rejects `SQL_SOPT_SS_PARAM_FOCUS`. |
+| **Always Encrypted and data classification** | Column-encryption options and `SQL_COPT_SS_DATACLASSIFICATION_VERSION` negotiation | Implement the existing Phase 9 work plus classification metadata. |
+| **Connection options** | PHP exposes MARS, failover partner, attach-file, language, workstation ID, quoted-ID, and transparent-network-resolution options | These keywords are currently recognized but ignored; implement each option required for the intended PHP compatibility level. |
+| **Consumer validation** | ANSI Driver Manager routing, output parameters, DAE input streams, metadata/catalog calls, transactions, timeouts, and the PHP C/SQL type matrix | Run both PHP extension suites through each target Driver Manager. Treat failures as concrete behavior gaps; these paths do not currently imply new API families. |
+
+The largest feature gaps are server cursors and TVPs. Full PHP feature
+parity additionally requires the optional SQL Server features above.
 
 ---
 
@@ -426,60 +452,54 @@ Audit of [mkleehammer/pyodbc](https://github.com/mkleehammer/pyodbc) (source cal
 
 ### Disconnect Lifetime Race Condition
 
-**Issue**: A use-after-free (UAF) can occur if a thread calls `SQLDisconnect` while another thread is mid-execute (during `SQLExecDirectW` network I/O), even though the ODBC spec and Driver Manager should prevent this scenario in correct usage.
+Concurrent `SQLDisconnect` and statement I/O can cause a use-after-free. The
+execution path releases the DBC lock during network I/O, while disconnect can
+free the statement handle before the execution path reacquires it.
 
-**Root Cause**:
-- In `SQLExecDirectW` ([exec_direct.rs line ~150](src/api/exec_direct.rs#L148-L150)), the DBC lock is released before I/O begins to avoid holding the lock during network operations.
-- Thread A (executing) takes the TdsClient, releases the DBC lock, and begins `block_on(client.execute(...))`.
-- Thread B (disconnecting) locks the DBC, sees the connection is connected, then frees all STMT handles in a loop by taking the STMT lock and immediately deallocating the `Box<StmtHandle>`.
-- Thread A's I/O completes and attempts to lock the STMT handle again to post error diagnostics, but the memory has already been freed by Thread B → UAF.
-
-**Why It Doesn't Fire in Practice**:
-The ODBC spec explicitly gates `SQLDisconnect` via the Driver Manager with `HY010` (function sequence error) if:
-- any statement is still executing **asynchronously** (returns `SQL_STILL_EXECUTING`), or
-- any statement/connection is in a `SQL_NEED_DATA` flow (data-at-execution parameters).
-
-([SQLDisconnect diagnostics](https://learn.microsoft.com/en-us/sql/odbc/reference/syntax/sqldisconnect-function?view=sql-server-ver17#diagnostics))
-([Statement Transitions](https://learn.microsoft.com/en-us/sql/odbc/reference/appendixes/statement-transitions?view=sql-server-ver17#sqldisconnect))
-
-For **synchronous** in-flight operations, the spec does not explicitly gate `SQLDisconnect` at the DM level, but the intended usage pattern is: app drains all results via `SQLFetch`/`SQLGetData`, calls `SQLCloseCursor` or `SQLFreeStmt(SQL_CLOSE)`, *then* `SQLDisconnect`. In correct ODBC usage, this ordering ensures no concurrent synchronous I/O exists when `SQLDisconnect` is called.
-
-**How msodbcsql Handles It:**
-msodbcsql uses **batch-context refcounting** — a separate batch execution context independent of the STMT handle lifetime:
-1. When a statement starts executing, it attaches a batch context with a reference count.
-2. Thread A (executing) holds a strong reference to the batch context, incrementing its refcount.
-3. When `SQLDisconnect` frees a STMT handle, it does **not** free the batch context; only the STMT handle box is deallocated.
-4. Thread A's in-flight I/O still holds a reference to the batch context; when the operation completes, the refcount drops and cleanup happens cleanly.
-5. Thread B (disconnecting) can safely free STMT handles because the underlying batch state remains alive while referenced.
-
-**Fix (Phase 3+)** (Not fixed now — does not affect correct ODBC usage):
-Introduce an `Arc<BatchContext>` wrapper so each TdsClient operation holds a strong reference across I/O. The `StmtHandle` can be deallocated immediately by `SQLDisconnect`, but the arc keeps the underlying state alive until all in-flight operations complete. This mirrors msodbcsql's batch-context pattern but using Rust's Arc for automatic refcounting.
-
-See [disconnect.rs line 63](src/api/disconnect.rs#L63) for the TODO comment noting this exact issue.
+The handle lifetime must be refcounted so in-flight operations retain valid
+state independently of ODBC handle ownership. Until that is implemented,
+callers must serialize disconnect against all operations on the connection.
+See the lifetime TODO in [disconnect.rs](src/api/disconnect.rs).
 
 ---
 
 ## Appendix: Authentication Method Support Comparison
 
-| Authentication Method | mssql-tds | mssql-python | mssql-odbc (target) | Notes |
-|---|---|---|---|---|
-| **SQL Server Auth** |
-| Password | ✅ | ✅ | ✅ | Username + password |
-| **Integrated / Domain** |
-| SSPI / Integrated | ✅ | ✅ | ✅ | Windows SSPI or Unix GSSAPI/Kerberos |
-| **Entra ID / Azure AD** |
-| ActiveDirectoryPassword | ✅ | ✅ | ✅ | Username + password. Deprecated by the drivers — uses the Azure AD ROPC flow, which Microsoft discourages; prefer Interactive / Default / ServicePrincipal |
-| ActiveDirectoryInteractive | ✅ | ✅ | ✅ | Browser-based interactive sign-in |
-| ActiveDirectoryDeviceCode | ✅ | ✅ | ✅ | Device code flow (headless/CLI environments) |
-| ActiveDirectoryServicePrincipal | ✅ | ✅ | ✅ | Client ID + secret or certificate |
-| ActiveDirectoryManagedIdentity / MSI | ✅ | ✅ | ✅ | System-assigned or user-assigned identity |
-| ActiveDirectoryDefault | ✅ | ✅ | ✅ | Auto-detect auth method from environment |
-| ActiveDirectoryIntegrated | ✅ | ❌ | ✅ | Entra with current user's Kerberos ticket |
-| **Advanced** |
-| ActiveDirectoryWorkloadIdentity | ✅ | ❌ | ✅ | Kubernetes workload identity |
-| AccessToken (JWT) | ✅ | ❌ | ✅ | Pre-acquired bearer access token |
+`mssql-python` acquires tokens itself through Azure Identity for Default,
+DeviceCode, MSI, and non-Windows Interactive, then passes the result to the
+driver as `SQL_COPT_SS_ACCESS_TOKEN`; for those modes the driver only needs
+access-token support. It leaves Windows Interactive and ServicePrincipal to the
+driver, and any keyword it does not map stays in the connection string for the
+driver to resolve.
 
-**Summary**:
-- **mssql-tds** supports all 12 methods (foundation layer)
-- **mssql-python** supports 9 core methods (Password, Integrated, and 7 Entra flows)
-- **mssql-odbc** targets full parity with mssql-tds (all 12 methods delegated via tds layer)
+| Authentication method | mssql-tds | Driver support mssql-python needs | mssql-odbc | Notes |
+|---|---|---|---|---|
+| Password (SQL auth) | ✅ | Native | Implemented | Username + password |
+| SSPI / Integrated | ✅ | Native | Implemented | Windows SSPI or Unix GSSAPI/Kerberos |
+| AccessToken (JWT) | ✅ | Native | Implemented | Pre-acquired bearer token via `SQL_COPT_SS_ACCESS_TOKEN` |
+| ActiveDirectoryServicePrincipal | ✅ | Native | Implemented | Client ID + secret |
+| ActiveDirectoryManagedIdentity | ✅ | Access token | Implemented | System- or user-assigned identity |
+| ActiveDirectoryInteractive | ✅ | Native on Windows, access token elsewhere | Windows only | Browser sign-in; non-Windows resolves to Integrated and returns `HYC00` |
+| ActiveDirectoryPassword | ✅ | Native | Out of scope (`HYC00`) | ROPC sends plaintext credentials to Entra, supports neither MFA nor conditional access, and is deprecated by the Microsoft identity platform. Excluded by signed-off design deviation (AB#45486) |
+| ActiveDirectoryDeviceCodeFlow | ✅ | Access token | `HYC00` | Not an msodbcsql18 keyword. mssql-python maps the `ActiveDirectoryDeviceCode` spelling and acquires the token itself; the `...Flow` spelling it does not map passes through and reaches this refusal |
+| ActiveDirectoryDefault | ✅ | Access token | `HYC00` | Not an msodbcsql18 keyword. mssql-python maps it and acquires the token itself, so it never sends the keyword; this driver recognizes it, so another ODBC consumer can still reach this refusal |
+| ActiveDirectoryIntegrated | ✅ | Native | `HYC00` | Entra with the current user's Kerberos ticket |
+| ActiveDirectoryWorkloadIdentity | ✅ | Pass-through | `HYC00` | Not an msodbcsql18 keyword and not mapped by mssql-python, so the keyword survives into the connection string and reaches this driver, which recognizes and validates it before refusing. Reachable but unsupported; implementing it would exceed parity |
+
+`ActiveDirectoryMSI` is accepted as a connection-string alias and resolves to
+`ActiveDirectoryManagedIdentity`; mssql-tds has no separate MSI workflow.
+
+msodbcsql18 accepts exactly six `Authentication=` values (`dlgattr.h`):
+`SqlPassword`, `ActiveDirectoryIntegrated`, `ActiveDirectoryPassword`,
+`ActiveDirectoryInteractive`, `ActiveDirectoryMSI`, and
+`ActiveDirectoryServicePrincipal`. `ActiveDirectoryDefault`,
+`ActiveDirectoryDeviceCode`, and `ActiveDirectoryWorkloadIdentity` are not
+driver keywords at all — mssql-python implements the first two in Python.
+
+**Summary**: `mssql-odbc` currently wires six methods — SQL password, SSPI,
+access token, service principal, managed identity, and Windows interactive.
+AB#45484 closed against exactly that scope (T0–T3). Measured against msodbcsql18
+there are only two real gaps: `ActiveDirectoryPassword`, an accepted
+out-of-scope deviation (AB#45486) and a known regression for the pass-through
+case; and `ActiveDirectoryIntegrated`, tracked by AB#46068 and still open.
+Non-Windows interactive was cut (AB#46683).

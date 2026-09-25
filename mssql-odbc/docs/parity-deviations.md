@@ -477,3 +477,29 @@ msodbcsql build is measured.
     Driver Manager bind/record-edit sequence with RPC capture and a recorded
     `SQL_DRIVER_VER` is still needed to establish shipping-build behavior;
     do not infer retail parity or add a comparison-test skip from this entry.
+18. **`Authentication=ActiveDirectoryPassword` is refused.** msodbcsql accepts
+    it: `OPTIONADPASSWORD L"ActiveDirectoryPassword"`
+    (`Sql/Ntdbms/sqlncli/msdart/inc/dlgattr.h`), carried through as
+    `IntegratedSecurity::ActiveDirectoryPassword` (`tds/TdsParser.h:411`) and
+    dispatched by the `authMode` ternary at `tds/Parse.cpp:3661`, which selects
+    `AKVCFG_AUTHMODE_PASSWORD` and feeds `AzureADAuth::GetAccessTokenW`. This driver parses and validates the
+    keyword - including the rule that it requires both `UID` and `PWD` - and
+    then returns `HYC00` from `SQLDriverConnectW`, because `configure_auth`
+    (`src/auth/entra.rs`) has no arm for it and falls through to
+    `UnsupportedAuth::plain`. The refusal happens before any network activity.
+    Excluded by design rather than deferred: the ratified authentication design
+    scopes the driver to "full msodbcsql parity except AD Password" (mssql-rs
+    wiki, `Design/mssql-odbc-Authentication`, commit `072f280f`). The flow sends
+    plaintext credentials to Entra, supports neither MFA nor conditional access,
+    is deprecated by the Microsoft identity platform, is blocked in many
+    tenants, and was deprecated in SqlClient 7.0.
+    **Application-visible regression:** an application that reaches this driver
+    through mssql-python can use the keyword today, because mssql-python does
+    not map it and passes it through to msodbcsql. Signed off by Vahid
+    Beiranvand on 2026-07-16 on AB#45486, which records the reconciliation with
+    the auth parity review and was closed as Removed rather than implemented.
+   **Evidence limit:** this is a source comparison, not a measured retail
+   acceptance claim. A comparison run that records `SQL_DRIVER_VER` and the
+   tested msodbcsql build while calling `SQLDriverConnectW` with
+   `Authentication=ActiveDirectoryPassword` is still required to establish
+   shipping-build behavior.

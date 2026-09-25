@@ -1,3 +1,10 @@
+<!--
+Published verbatim as the mssql-python-rs PyPI project description (see
+`readme` in pyproject.toml). Edit only as part of a PyPI release. Keep the
+content user-facing and every link absolute: repo-relative links do not
+resolve on PyPI.
+-->
+
 # mssql-python-rs
 
 The Rust-based native runtime for connecting to Microsoft SQL Server and Azure
@@ -15,13 +22,6 @@ components:
 
 `mssql-python-rs` is the native runtime that
 [`mssql-python`](https://github.com/microsoft/mssql-python) depends on.
-
-## SQL string decoding
-
-The `mssql_py_core` cursor uses the shared
-[TDS string decoding rules](../mssql-tds/README.md#sql-string-decoding).
-Leading BOM-shaped bytes in SQL values remain data in the column's encoding;
-they are not removed or used to select another encoding.
 
 ## Platforms
 
