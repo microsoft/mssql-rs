@@ -2325,6 +2325,43 @@ TEST_F(UdtParamLiveTest, DescribeParamSuppliesAUdtNameTheApplicationOmitted) {
     EXPECT_EQ("/5/", ExecuteAndReadBack());
 }
 
+// The sequence mssql-python's `PreResolveUdtTypes` runs
+// (microsoft/mssql-python#818): reset the bindings, describe every SQL_SS_UDT
+// marker so the IPD picks up the identity, then bind and execute.
+//
+// The reset is what makes this work on statement reuse. An IPD record left over
+// from an earlier bind reads as explicitly bound, and `refine_ipd` leaves those
+// alone - matching msodbcsql's AutoFillIPD, which requires no parameters bound
+// yet. SQLFreeStmt(SQL_RESET_PARAMS) truncates the IPD so the describe below
+// lands on a fresh record.
+TEST_F(UdtParamLiveTest, ResetThenDescribeRecoversTheUdtNameOnStatementReuse) {
+    std::vector<SQLCHAR> payload = SerializedHierarchyId("/7/");
+    ASSERT_FALSE(payload.empty());
+
+    ASSERT_SQL_OK(Prepare("SELECT CAST(? AS hierarchyid).ToString()"), SQL_HANDLE_STMT, stmt_);
+
+    // An earlier bind, as a reused statement would already carry.
+    indicator_ = static_cast<SQLLEN>(payload.size());
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_BINARY, SQL_SS_UDT, 0, 0,
+                                   payload.data(), indicator_, &indicator_),
+                  SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_RESET_PARAMS), SQL_HANDLE_STMT, stmt_);
+
+    SQLSMALLINT described_type = 0, decimal_digits = 0, nullable = 0;
+    SQLULEN column_size = 0;
+    ASSERT_SQL_OK(
+        SQLDescribeParam(stmt_, 1, &described_type, &column_size, &decimal_digits, &nullable),
+        SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(SQL_SS_UDT, described_type);
+
+    indicator_ = static_cast<SQLLEN>(payload.size());
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_BINARY, SQL_SS_UDT, 0, 0,
+                                   payload.data(), indicator_, &indicator_),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("/7/", ExecuteAndReadBack());
+}
+
 // A schema-qualified name resolves the same system type, exercising the
 // optional part of the header.
 TEST_F(UdtParamLiveTest, ASchemaQualifiedUdtNameResolves) {
