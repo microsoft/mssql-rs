@@ -152,6 +152,17 @@ fn sql_prepare_w_safe(stmt: &StmtHandle, sql: String) -> SqlReturn {
     let rc = unsafe { handle_from_raw::<DescHandle>(stmt.ipd) }.clear_auto_filled_udt_names();
     if rc != SQL_SUCCESS {
         error!("SQLPrepareW: could not clear auto-filled UDT names");
+        // Re-lock to post: the STMT lock was dropped above, so without this
+        // the application gets SQL_ERROR and SQL_NO_DATA from SQLGetDiagRec.
+        // Same shape as `sql_free_stmt_reset_params_safe`'s poisoned-APD path.
+        if let Ok(mut stmt_state) = stmt.inner.lock() {
+            post_sql_error(
+                &mut stmt_state,
+                SQLSTATE_HY000,
+                0,
+                "Internal error clearing UDT parameter names",
+            );
+        }
         return rc;
     }
 

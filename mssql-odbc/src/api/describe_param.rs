@@ -459,7 +459,19 @@ fn refine_ipd(
         // does above; one this function auto-filled earlier is replaced, since
         // a re-`SQLPrepare` keeps IPD records and the previous name may belong
         // to a different statement's marker.
-        if record.udt_names.is_none() || record.udt_names_auto_filled {
+        //
+        // "Claimed" is a property of the record, not of how it was reached: a
+        // record whose `type_name` is empty carries no wire identity, however
+        // it got that way - `SQLSetDescField` writing only the echo-only
+        // assembly name, or `clear_auto_filled_udt_names` keeping a record for
+        // exactly that. Gating on the state rather than the provenance bit
+        // alone keeps those histories indistinguishable, as the descriptor
+        // contract says they should be.
+        let claimed = record
+            .udt_names
+            .as_ref()
+            .is_some_and(|names| !names.type_name.is_empty());
+        if !claimed || record.udt_names_auto_filled {
             let described = udt_names.iter().find(|(index, _)| *index == i);
             // The server never supplies an assembly name, so an application's
             // survives the refresh of the parts around it.
@@ -1826,6 +1838,82 @@ mod tests {
         assert!(
             names.type_name.is_empty(),
             "no describe supplied a wire identity, so it stays empty"
+        );
+    }
+
+    /// The set-then-describe route into the same stranded state, reached
+    /// without any clear: writing only the echo-only assembly name on a
+    /// never-described record leaves `Some(..)` with an empty `type_name`.
+    /// Gating on the provenance bit alone skipped it, so route (b) -
+    /// describe-before-execute supplying the identity - silently failed with
+    /// `ERR_MISSING_UDT_TYPE_NAME` for an application that knew its assembly
+    /// but relied on the server for the type name.
+    #[test]
+    fn an_assembly_name_alone_does_not_block_the_server_from_naming_the_type() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let ipd = unsafe { handle_from_raw::<DescHandle>(h.ipd()) };
+
+        // Exactly what `set_udt_name` does for the assembly field on a fresh
+        // record: no wire identity claimed, provenance bit untouched.
+        {
+            let mut state = ipd.inner.lock().unwrap();
+            state.set_record_count(1, ipd.kind);
+            let record = state.record_mut(1).unwrap();
+            record.udt_names = Some(Box::new(UdtNames {
+                assembly_type_name: "MyAsm".to_string(),
+                ..Default::default()
+            }));
+            record.udt_names_auto_filled = false;
+        }
+
+        refine_ipd(
+            stmt,
+            &[param_description(SQL_SS_UDT, 8000, 0, SQL_NULLABLE)],
+            &[(0, udt_identity("hierarchyid"))],
+        );
+
+        let names = ipd_records(&h)[0]
+            .udt_names
+            .as_ref()
+            .expect("record must survive")
+            .clone();
+        assert_eq!(
+            names.type_name, "hierarchyid",
+            "an assembly name alone claims no wire identity, so the server still names the type"
+        );
+        assert_eq!(
+            names.assembly_type_name, "MyAsm",
+            "the application's assembly name survives the refresh around it"
+        );
+    }
+
+    /// The other side of the same gate: a `type_name` the application actually
+    /// wrote is a claim, and no describe may replace it.
+    #[test]
+    fn an_application_type_name_still_outranks_the_server() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let ipd = unsafe { handle_from_raw::<DescHandle>(h.ipd()) };
+
+        {
+            let mut state = ipd.inner.lock().unwrap();
+            state.set_record_count(1, ipd.kind);
+            let record = state.record_mut(1).unwrap();
+            record.udt_names = Some(udt_identity("Point"));
+            record.udt_names_auto_filled = false;
+        }
+
+        refine_ipd(
+            stmt,
+            &[param_description(SQL_SS_UDT, 8000, 0, SQL_NULLABLE)],
+            &[(0, udt_identity("hierarchyid"))],
+        );
+
+        assert_eq!(
+            ipd_records(&h)[0].udt_names.as_ref().unwrap().type_name,
+            "Point",
+            "an application-supplied type name is a claim the server cannot override"
         );
     }
 
