@@ -154,6 +154,20 @@ Tokio runtime), socket-based mock servers, native authentication/TLS, and the
 C++ Driver Manager tests. It complements rather than replaces native
 end-to-end tests and fuzzing.
 
+## Temporal character literals
+
+Character parameters and character-column fetches accept `YYYY/MM/DD` dates
+and ODBC temporal literals: `{d 'YYYY-MM-DD'}`, `{t 'HH:MM:SS'}`, and
+`{ts 'YYYY-MM-DD HH:MM:SS[.fraction]'}`. Escape keywords are case-insensitive;
+numeric fields are fixed-width, and timestamps retain up to nine fractional
+digits before target-specific conversion. Slash dates are date-only and do
+not apply inside escapes. Malformed values report `22018`.
+
+Existing plain-text forms remain supported, including ISO `T` separators,
+unpadded month/day/time fields, and times without seconds. See
+[the parameter conversion notes](docs/parameters_plan.md#character-c-type-to-a-temporal-parametertype-ab47851)
+for grammar and reference-driver measurements.
+
 ## Tracing
 
 Tracing is disabled by default and is intended for diagnostics.

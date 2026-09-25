@@ -277,6 +277,69 @@ protected:
     }
 };
 
+TEST_F(GetDataLiveTest, OdbcTemporalLiteralsFromCharacterColumns) {
+    SQLCHAR version[32] = {};
+    ASSERT_SQL_OK(SQLGetInfoA(dbc_, SQL_DRIVER_VER, version, sizeof(version), nullptr),
+                  SQL_HANDLE_DBC, dbc_);
+    RecordProperty("driver_version", reinterpret_cast<const char*>(version));
+    for (const std::string type : {"varchar(64)", "nvarchar(64)", "varchar(max)", "nvarchar(max)"}) {
+        for (bool bound : {false, true}) {
+            SCOPED_TRACE(type);
+            SCOPED_TRACE(bound);
+            ASSERT_SQL_OK(ExecDirect(
+                "SELECT CAST('2024/05/20' AS " + type + "), "
+                "CAST('{d ''2024-05-20''}' AS " + type + "), "
+                "CAST('{t ''12:34:56''}' AS " + type + "), "
+                "CAST('{ts ''2024-05-20 12:34:56.123456789''}' AS " + type + ")"),
+                SQL_HANDLE_STMT, stmt_);
+            SQL_DATE_STRUCT slash_date = {}, escape_date = {};
+            SQL_TIME_STRUCT time = {};
+            SQL_TIMESTAMP_STRUCT timestamp = {};
+            SQLLEN lengths[4] = {};
+            const SQLSMALLINT targets[] = {
+                SQL_C_TYPE_DATE, SQL_C_TYPE_DATE, SQL_C_TYPE_TIME, SQL_C_TYPE_TIMESTAMP};
+            SQLPOINTER buffers[] = {&slash_date, &escape_date, &time, &timestamp};
+            const SQLLEN sizes[] = {
+                sizeof(slash_date), sizeof(escape_date), sizeof(time), sizeof(timestamp)};
+            if (bound) {
+                for (SQLUSMALLINT column = 1; column <= 4; ++column) {
+                    ASSERT_SQL_OK(SQLBindCol(stmt_, column, targets[column - 1], buffers[column - 1],
+                                            sizes[column - 1], &lengths[column - 1]),
+                                  SQL_HANDLE_STMT, stmt_);
+                }
+            }
+            ASSERT_EQ(SQL_SUCCESS, SQLFetch(stmt_));
+            if (!bound) {
+                for (SQLUSMALLINT column = 1; column <= 4; ++column) {
+                    ASSERT_EQ(SQL_SUCCESS, SQLGetData(stmt_, column, targets[column - 1],
+                                                     buffers[column - 1], sizes[column - 1],
+                                                     &lengths[column - 1]));
+                }
+            }
+            for (const auto& date : {slash_date, escape_date}) {
+                EXPECT_EQ(2024, date.year);
+                EXPECT_EQ(5, date.month);
+                EXPECT_EQ(20, date.day);
+            }
+            EXPECT_EQ(12, time.hour);
+            EXPECT_EQ(34, time.minute);
+            EXPECT_EQ(56, time.second);
+            EXPECT_EQ(2024, timestamp.year);
+            EXPECT_EQ(5, timestamp.month);
+            EXPECT_EQ(20, timestamp.day);
+            EXPECT_EQ(12, timestamp.hour);
+            EXPECT_EQ(34, timestamp.minute);
+            EXPECT_EQ(56, timestamp.second);
+            EXPECT_EQ(123456789u, timestamp.fraction);
+            for (size_t column = 0; column < 4; ++column) {
+                EXPECT_EQ(sizes[column], lengths[column]);
+            }
+            ASSERT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+            ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_UNBIND), SQL_HANDLE_STMT, stmt_);
+        }
+    }
+}
+
 TEST_F(GetDataLiveTest, PlpTypedConversions) {
     SQLCHAR version[32] = {};
     ASSERT_SQL_OK(SQLGetInfoA(dbc_, SQL_DRIVER_VER, version, sizeof(version), nullptr),
