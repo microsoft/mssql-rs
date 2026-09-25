@@ -385,11 +385,29 @@ unsafe fn bound_param_to_value_with_outcome(
         )?),
         // A UDT's payload is its `IBinarySerialize` form, which the driver
         // passes through untouched - there is nothing to convert, only to name.
-        // Character buffers are legal sources too, and reach the wire as their
-        // own bytes.
         (AppValue::Binary(bytes), SqlFamily::Udt) => {
             SqlType::Udt(udt_type_name(udt_names)?, Some(bytes))
         }
+        // Character buffers are legal sources - `fValidConversion` admits all
+        // three buffer C types for `SQL_UDT_MAPPED` - but this arm diverges
+        // from msodbcsql, which hex-decodes them instead of passing them
+        // through. `rgbTRANSTYPE*` maps `SQL_UDT_MAPPED` to a `SQL_C_BINARY`
+        // transfer type (`sqlcmisc.cpp:67`, `:178`, `:217`), so `wCTypeOut` is
+        // binary while `wCType` stays char (asserted at `sqlcmisc.cpp:7224`).
+        // `ConvertLongData` then takes its conversion path rather than its
+        // pass-through one, whose guard admits only binary input or a matching
+        // char/wchar pair (`sqlccnvt.cpp:874-877`), reaching the branch
+        // commented "CHAR/WCHAR ->binary (2 chars are converted to only one
+        // single binary byte)" (`sqlccnvt.cpp:1014-1016`). The length checks
+        // corroborate the 2:1 ratio: `cbMax*2` for `SQL_C_CHAR` and
+        // `cbMax*2*sizeof(WCHAR)` for `SQL_C_WCHAR` (`sqlcfunc.cpp:3048-3063`).
+        //
+        // Source reading only - unmeasured on retail, so this is not yet a
+        // registry entry. Closing it needs a both-legs run binding `SQL_C_CHAR`
+        // against a `hierarchyid` with `SQL_DRIVER_VER` recorded, which then
+        // decides whether to hex-decode here or register the divergence. Note
+        // `SQL_NTS` is unusable for this: a serialized `hierarchyid` contains
+        // embedded nulls, so the length must be explicit. AB#48248.
         (AppValue::NarrowText(bytes) | AppValue::WideText(bytes), SqlFamily::Udt) => {
             SqlType::Udt(udt_type_name(udt_names)?, Some(bytes))
         }
@@ -6041,8 +6059,13 @@ mod tests {
     }
 
     /// A wide buffer is a legal UDT source too (`conversion_matrix` admits all
-    /// three buffer C types), and its bytes are the payload verbatim: a UDT's
-    /// serialized form is opaque, so there is no transcoding step to apply.
+    /// three buffer C types), and its bytes are the payload verbatim.
+    ///
+    /// This pins current behavior, not parity: msodbcsql hex-decodes a
+    /// character buffer bound to a UDT rather than passing it through - see
+    /// the divergence note on the `SqlFamily::Udt` character arm in
+    /// `bound_param_to_value`. Unmeasured on retail, so the answer here may
+    /// change once it is (AB#48248).
     #[test]
     fn a_wide_buffer_reaches_a_udt_as_its_raw_bytes() {
         // UTF-16LE 'A' - even length so the wide read is well-formed.
