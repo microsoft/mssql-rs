@@ -1526,18 +1526,19 @@ mod variant_tests {
     /// the same pre-existing gap `trim_blank_overflow` already documents for
     /// plain `varchar` (AB#47584), now also reachable through `sql_variant`.
     /// The wire-level 8000-byte cap this function enforces is still the
-    /// backstop that refuses an over-large narrow variant -- just later, and
-    /// with a different error shape (`UsageError` here vs. ODBC's `22001` at
-    /// bind for the wide leg, where `SQL_PREC_NCHAR * 2` is an exact byte
-    /// bound and the bind-time clamp alone suffices).
+    /// backstop that refuses an over-large narrow variant.
     ///
-    /// 2000 repetitions of U+65E5 (3 UTF-8 bytes each = 6000 source bytes,
-    /// under the 8000-byte declared ceiling) each expand to an 8-byte NCR
-    /// escape (`&#26085;`) under a non-UTF-8 collation that cannot represent
-    /// it, totalling 16000 bytes -- twice the cap. Pinned so this drifts only
-    /// on a deliberate change, per the PR discussion.
+    /// The expansion that used to reach that cap no longer happens: 2000
+    /// repetitions of U+65E5 (3 UTF-8 bytes each = 6000 source bytes, under the
+    /// 8000-byte declared ceiling) each expanded to an 8-byte NCR escape
+    /// (`&#26085;`) under a non-UTF-8 collation that cannot represent them,
+    /// totalling 16000 bytes -- twice the cap. Each is now a single `?`
+    /// (AB#47598), so the value shrinks to 2000 bytes and lands well inside the
+    /// cap. Pinned so this drifts only on a deliberate change: an encoder that
+    /// went back to escaping would trip the cap again and turn a warning into a
+    /// hard failure.
     #[tokio::test]
-    async fn variant_varchar_expansion_past_the_byte_cap_is_a_usage_error() {
+    async fn variant_varchar_substitutes_unmappable_characters_within_the_byte_cap() {
         let val = SqlString::new("日".repeat(2000).into_bytes(), EncodingType::Utf8);
         let mut mock_reader_writer = MockNetworkWriter::new(4096);
         let mut packet_writer = PacketWriter::new(
@@ -1546,16 +1547,14 @@ mod variant_tests {
             None,
             None,
         );
-        let result = SqlType::Variant(Box::new(SqlType::Varchar(Some(val), 8000)))
+        SqlType::Variant(Box::new(SqlType::Varchar(Some(val), 8000)))
             .serialize(&mut packet_writer, &default_collation(), None)
-            .await;
-        match result {
-            Err(Error::UsageError(msg)) => assert!(
-                msg.contains("16000"),
-                "expected the message to cite the expanded 16000-byte size, got: {msg}"
-            ),
-            other => panic!("expected UsageError, got {other:?}"),
-        }
+            .await
+            .expect("2000 substituted bytes fit the cap");
+        assert!(
+            packet_writer.code_page_conversion_loss(),
+            "the message must carry the loss for the caller"
+        );
     }
 
     /// The robust fix for AB#47800: a narrow value whose source (UTF-8) and

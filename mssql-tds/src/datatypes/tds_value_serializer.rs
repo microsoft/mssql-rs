@@ -13,7 +13,10 @@ use crate::core::TdsResult;
 use crate::datatypes::column_values::ColumnValues;
 use crate::datatypes::lcid_encoding::lcid_to_encoding;
 use crate::datatypes::sql_json::SqlJson;
-use crate::datatypes::sql_string::{EncodingType, SqlString, encode_narrow};
+use crate::datatypes::sql_string::{
+    EncodingType, NARROW_SUBSTITUTE_BYTE, NarrowEncoded, SqlString, encode_narrow,
+    substitute_unmappable,
+};
 use crate::datatypes::sql_vector::{SqlVector, VectorData};
 use crate::datatypes::sqldatatypes::TdsDataType;
 use crate::datatypes::sqltypes::get_time_length_from_scale;
@@ -1423,8 +1426,11 @@ impl TdsValueSerializer {
 
                 // Otherwise (UTF-8 or UTF-16 source), decode and re-encode to target code page
                 let decoded_str = value.to_utf8_string();
-                let single_byte_data = Self::encode_narrow_for_wire(&decoded_str, ctx.collation);
-                return Self::serialize_char_varchar_direct(writer, &single_byte_data, ctx).await;
+                let encoded = Self::encode_narrow_for_wire(&decoded_str, ctx.collation);
+                if encoded.had_loss {
+                    writer.note_code_page_conversion_loss();
+                }
+                return Self::serialize_char_varchar_direct(writer, &encoded.bytes, ctx).await;
             }
             _ => {
                 return Err(Error::UsageError(format!(
@@ -1576,7 +1582,7 @@ impl TdsValueSerializer {
 
     /// Encodes `text` into the legacy wire representation used for
     /// VARCHAR/CHAR/TEXT: `collation`'s LCID codepage, or a Latin-1-like mapping
-    /// (anything above U+00FF becomes `?`) when no collation is known.
+    /// when no collation is known.
     ///
     /// Extracted from [`Self::serialize_string`]'s `VARCHAR | CHAR | TEXT` arm
     /// so it stays available to a caller needing that exact behaviour.
@@ -1588,12 +1594,15 @@ impl TdsValueSerializer {
     /// only: [`Self::resolve_narrow_wire_bytes`] always resolves a concrete
     /// collation (see [`DEFAULT_VARIANT_COLLATION`]) and calls [`encode_narrow`]
     /// directly, so it never reaches this function's own no-collation case.
-    fn encode_narrow_for_wire(text: &str, collation: Option<SqlCollation>) -> Vec<u8> {
+    ///
+    /// A character none of the three encodings can represent becomes
+    /// [`NARROW_SUBSTITUTE_BYTE`] and sets [`NarrowEncoded::had_loss`], matching
+    /// msodbcsql. The codepage arm must not be left to `encoding_rs`, which
+    /// emits a numeric character reference (`U+65E5` as the eight ASCII bytes
+    /// `&#26085;`) rather than substituting a single byte (AB#47598).
+    fn encode_narrow_for_wire(text: &str, collation: Option<SqlCollation>) -> NarrowEncoded {
         let Some(collation) = collation else {
-            return text
-                .chars()
-                .map(|c| if (c as u32) <= 0xFF { c as u8 } else { b'?' })
-                .collect();
+            return Self::encode_latin1_for_wire(text);
         };
 
         // Extract LCID from the lower 20 bits of collation.info
@@ -1602,14 +1611,15 @@ impl TdsValueSerializer {
             Ok(encoding) => {
                 let (encoded, _encoding_used, had_errors) = encoding.encode(text);
                 if had_errors {
-                    tracing::warn!(
-                        "Encountered encoding errors while converting string to LCID 0x{:04X} ({}) encoding. \
-                         Some characters may have been replaced.",
-                        lcid,
-                        lcid
-                    );
+                    return NarrowEncoded {
+                        bytes: substitute_unmappable(text, encoding.into()),
+                        had_loss: true,
+                    };
                 }
-                encoded.into_owned()
+                NarrowEncoded {
+                    bytes: encoded.into_owned(),
+                    had_loss: false,
+                }
             }
             Err(e) => {
                 tracing::warn!(
@@ -1618,11 +1628,28 @@ impl TdsValueSerializer {
                     lcid,
                     e
                 );
-                text.chars()
-                    .map(|c| if (c as u32) <= 0xFF { c as u8 } else { b'?' })
-                    .collect()
+                Self::encode_latin1_for_wire(text)
             }
         }
+    }
+
+    /// The Latin-1-like mapping [`Self::encode_narrow_for_wire`] falls back to:
+    /// a scalar value at or below U+00FF is its own byte, and anything above it
+    /// becomes [`NARROW_SUBSTITUTE_BYTE`] -- one per UTF-16 code unit, for the
+    /// reason [`substitute_unmappable`] documents.
+    fn encode_latin1_for_wire(text: &str) -> NarrowEncoded {
+        let mut had_loss = false;
+        let mut bytes = Vec::with_capacity(text.len());
+        for c in text.chars() {
+            match u8::try_from(u32::from(c)) {
+                Ok(byte) => bytes.push(byte),
+                Err(_) => {
+                    had_loss = true;
+                    bytes.extend(std::iter::repeat_n(NARROW_SUBSTITUTE_BYTE, c.len_utf16()));
+                }
+            }
+        }
+        NarrowEncoded { bytes, had_loss }
     }
 
     /// Resolves the final wire bytes for a narrow (non-UTF-16) string about to
@@ -1649,16 +1676,23 @@ impl TdsValueSerializer {
     /// inside a `sql_variant` already carries `Some(collation)`, see
     /// `sqltypes.rs`'s `to_column_value_and_context` arms), but not by
     /// anything this layer enforces on its own.
+    ///
+    /// # Loss
+    ///
+    /// Reports [`NarrowEncoded::had_loss`] from [`encode_narrow`] alongside the
+    /// bytes. Raw wire bytes are passed through, so they never report loss:
+    /// whatever encoding produced them already happened elsewhere.
     fn resolve_narrow_wire_bytes(
         value: &SqlString,
         collation: Option<SqlCollation>,
-    ) -> Cow<'_, [u8]> {
+    ) -> (Cow<'_, [u8]>, bool) {
         if let Some(raw) = value.as_raw_wire_bytes() {
-            return Cow::Borrowed(raw);
+            return (Cow::Borrowed(raw), false);
         }
         let text = value.to_utf8_string();
         let collation = collation.unwrap_or(DEFAULT_VARIANT_COLLATION);
-        Cow::Owned(encode_narrow(&text, collation))
+        let encoded = encode_narrow(&text, collation);
+        (Cow::Owned(encoded.bytes), encoded.had_loss)
     }
 
     /// Helper to serialize a UTF-8 string as UTF-16LE for NVARCHAR/NCHAR types.
@@ -1904,7 +1938,11 @@ impl TdsValueSerializer {
                     EncodingType::Utf8 | EncodingType::LcidBased(_)
                 ) =>
             {
-                Some(Self::resolve_narrow_wire_bytes(s, ctx.collation))
+                let (bytes, had_loss) = Self::resolve_narrow_wire_bytes(s, ctx.collation);
+                if had_loss {
+                    writer.note_code_page_conversion_loss();
+                }
+                Some(bytes)
             }
             _ => None,
         };
@@ -3923,14 +3961,14 @@ mod serializer_tests {
     /// see `sqltypes.rs`), but not guaranteed to agree by anything in this
     /// file alone.
     ///
-    /// '€' (U+20AC), not 'é': CP1252 and the old Latin-1-pass-through
-    /// fallback (`encode_narrow_for_wire`'s `None` arm: any char `<= 0xFF`
-    /// passes through, else `?`) agree on every codepoint `<= 0xFF`,
-    /// including 'é' (U+00E9) -- so a test built on 'é' passes identically
-    /// whether or not the two defaults actually share one constant, proving
-    /// nothing. '€' is `> 0xFF` -- the fallback maps it to `b'?'`
-    /// (`0x3F`) -- but CP1252 still represents it, at byte `0x80`, so only
-    /// this codepoint actually discriminates the fix from the bug it pins.
+    /// '€' (U+20AC), not 'é': CP1252 and the Latin-1-pass-through fallback
+    /// (`encode_narrow_for_wire`'s `None` arm: any scalar value `<= 0xFF`
+    /// passes through) agree on every codepoint `<= 0xFF`, including 'é'
+    /// (U+00E9) -- so a test built on 'é' passes identically whether or not
+    /// the two defaults actually share one constant, proving nothing. '€' is
+    /// `> 0xFF`, which that fallback cannot represent at all, but CP1252 still
+    /// represents it, at byte `0x80`, so only this codepoint actually
+    /// discriminates the fix from the bug it pins.
     #[test]
     fn variant_varchar_no_collation_uses_the_same_default_for_declaration_and_encoding() {
         let mut mock = MockNetworkWriter::new(128);
@@ -3950,7 +3988,7 @@ mod serializer_tests {
         assert_eq!(u32::from_le_bytes([p[6], p[7], p[8], p[9]]), 0x00000409); // collation.info
         assert_eq!(p[10], 52); // collation.sort_id
         assert_eq!(u16::from_le_bytes([p[11], p[12]]), 1); // max_length = 1 encoded byte
-        assert_eq!(p[13], 0x80); // CP1252 '€', not a Latin-1-fallback '?' (0x3F)
+        assert_eq!(p[13], 0x80); // CP1252 '€', not a Latin-1-fallback rejection
     }
 
     /// A TDS type the variant writers do not handle must be an error, never a
@@ -4007,7 +4045,14 @@ mod serializer_tests {
 
 #[cfg(test)]
 mod tests {
+    use super::{TdsTypeContext, TdsValueSerializer, VARCHAR};
+    use crate::datatypes::column_values::ColumnValues;
     use crate::datatypes::lcid_encoding::lcid_to_encoding;
+    use crate::io::packet_writer::PacketWriter;
+    use crate::io::packet_writer::tests::MockNetworkWriter;
+    use crate::message::messages::PacketType;
+    use crate::token::tokens::SqlCollation;
+    use futures::executor::block_on;
 
     /// Test that different collations use different encodings for non-ASCII characters
     #[test]
@@ -4238,18 +4283,108 @@ mod tests {
         assert_eq!(first_encoding, b"Hello123", "ASCII should be encoded as-is");
     }
 
-    /// A character the target code page cannot represent is not dropped and not
-    /// replaced with `?`: `encoding_rs` substitutes a decimal numeric character
-    /// reference, so one character becomes eight ASCII bytes and what the server
-    /// stores is markup rather than text. `serialize_string` only logs a warning
-    /// for `had_errors`, so nothing upstream sees this.
+    /// A character the target code page cannot represent is neither dropped nor
+    /// left to `encoding_rs`, whose `encode` substitutes a decimal numeric
+    /// character reference -- one character became eight ASCII bytes, so the
+    /// server stored markup rather than text, behind nothing but a
+    /// `tracing::warn!` (AB#47598). `serialize_string` now writes a single `?`,
+    /// matching msodbcsql and SQL Server's own `CAST`, and marks the message so
+    /// `mssql-odbc` can report SQLSTATE `01000` under
+    /// `SQL_COPT_SS_WARN_ON_CP_ERROR`.
+    ///
+    /// The numeric character reference is still asserted, because it is the
+    /// reason the substitution has to be written by hand rather than taken from
+    /// the encoder.
     #[test]
-    fn unmappable_character_becomes_a_numeric_character_reference() {
+    fn unmappable_character_is_substituted_rather_than_escaped() {
         let encoding = lcid_to_encoding(0x0409).unwrap();
         let (encoded, _enc, had_errors) = encoding.encode("\u{65E5}");
-
         assert!(had_errors);
-        assert_eq!(&encoded[..], b"&#26085;");
+        assert_eq!(
+            &encoded[..],
+            b"&#26085;",
+            "the escape this substitution exists to prevent"
+        );
+
+        let (payload, had_loss) = serialize_varchar("\u{65E5}", Some(windows_1252_collation()));
+        // 2-byte length prefix, then the value.
+        assert_eq!(payload, b"\x01\x00?");
+        assert!(had_loss, "the message must carry the loss for the caller");
+    }
+
+    /// Both of `encode_narrow_for_wire`'s Latin-1 arms -- the no-collation
+    /// default and the fallback for an LCID this crate cannot map -- used to
+    /// substitute a `?` silently. They keep the byte and now report the loss
+    /// with it.
+    #[test]
+    fn unmappable_character_is_reported_by_both_latin1_fallbacks() {
+        for collation in [
+            None,
+            Some(SqlCollation {
+                info: 0x000F_FFFF, // no mapped encoding
+                lcid_language_id: 0,
+                col_flags: 0,
+                sort_id: 0,
+            }),
+        ] {
+            let (payload, had_loss) = serialize_varchar("\u{65E5}", collation);
+            assert_eq!(payload, b"\x01\x00?", "collation {collation:?}");
+            assert!(had_loss, "collation {collation:?}");
+        }
+    }
+
+    /// The loss flag is confined to characters the encoding genuinely cannot
+    /// hold: the Latin-1 fallbacks still pass every scalar value at or below
+    /// U+00FF straight through, and report nothing.
+    #[test]
+    fn latin1_fallback_encodes_a_representable_character_without_loss() {
+        let encoded = TdsValueSerializer::encode_narrow_for_wire("Caf\u{e9}", None);
+        assert_eq!(encoded.bytes, b"Caf\xe9");
+        assert!(!encoded.had_loss);
+    }
+
+    /// A value that encodes cleanly must not mark the message, or every
+    /// statement would warn once the attribute is on.
+    #[test]
+    fn a_mappable_value_leaves_the_message_unmarked() {
+        let (payload, had_loss) = serialize_varchar("Caf\u{e9}", Some(windows_1252_collation()));
+        assert_eq!(payload, b"\x04\x00Caf\xe9");
+        assert!(!had_loss);
+    }
+
+    fn windows_1252_collation() -> SqlCollation {
+        SqlCollation {
+            info: 0x0409, // US English LCID -> Windows-1252
+            lcid_language_id: 0,
+            col_flags: 0,
+            sort_id: 0,
+        }
+    }
+
+    /// Serializes `text` as a `varchar` parameter, returning the wire payload
+    /// and whether the message was marked as having substituted a character, so
+    /// the assertions above run through `serialize_string` rather than against
+    /// the helper in isolation.
+    fn serialize_varchar(text: &str, collation: Option<SqlCollation>) -> (Vec<u8>, bool) {
+        let mut mock = MockNetworkWriter::new(64);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        let ctx = TdsTypeContext {
+            tds_type: VARCHAR,
+            max_size: 8000,
+            is_plp: false,
+            is_fixed_length: false,
+            precision: None,
+            scale: None,
+            collation,
+            is_nullable: true,
+        };
+        let value = ColumnValues::String(crate::datatypes::sql_string::SqlString::new(
+            text.as_bytes().to_vec(),
+            crate::datatypes::sql_string::EncodingType::Utf8,
+        ));
+        block_on(TdsValueSerializer::serialize_value(&mut w, &value, &ctx)).expect("serializes");
+        let payload = w.get_payload().clone().into_inner()[8..].to_vec();
+        (payload, w.code_page_conversion_loss())
     }
 
     #[test]

@@ -805,9 +805,14 @@ impl DaeTranscode {
 
     /// Converts everything in `chunk` that completes a character, moving a
     /// trailing partial one into `carry` for the next call.
-    pub(crate) fn push(&self, carry: &mut Vec<u8>, chunk: &[u8]) -> Vec<u8> {
+    ///
+    /// [`DaeChunk::had_loss`] reports a character the narrow target's collation
+    /// could not represent. The caller must surface that itself: a streamed
+    /// chunk goes straight to the wire, so there is no later message-level flag
+    /// to carry it the way the materialized path has (AB#47598).
+    pub(crate) fn push(&self, carry: &mut Vec<u8>, chunk: &[u8]) -> DaeChunk {
         if self.is_passthrough() {
-            return chunk.to_vec();
+            return DaeChunk::exact(chunk.to_vec());
         }
         let mut buf = std::mem::take(carry);
         buf.extend_from_slice(chunk);
@@ -818,9 +823,11 @@ impl DaeTranscode {
 
     /// Converts what a value ended part-way through. The bytes cannot be
     /// completed, so they decode lossily, as the materialized path would.
-    pub(crate) fn finish(&self, carry: &mut Vec<u8>) -> Vec<u8> {
+    ///
+    /// Reports loss as [`Self::push`] does.
+    pub(crate) fn finish(&self, carry: &mut Vec<u8>) -> DaeChunk {
         if carry.is_empty() {
-            return Vec::new();
+            return DaeChunk::exact(Vec::new());
         }
         let tail = std::mem::take(carry);
         self.encode(&self.decode(&tail))
@@ -842,13 +849,42 @@ impl DaeTranscode {
         }
     }
 
-    fn encode(&self, text: &str) -> Vec<u8> {
+    fn encode(&self, text: &str) -> DaeChunk {
         match self.target {
-            DaeTarget::Utf16 => text.encode_utf16().flat_map(u16::to_le_bytes).collect(),
+            DaeTarget::Utf16 => {
+                DaeChunk::exact(text.encode_utf16().flat_map(u16::to_le_bytes).collect())
+            }
             // The same helper the materialized narrow path uses, so an LCID
-            // this crate cannot map falls back identically on both.
-            DaeTarget::Narrow(collation) => encode_narrow(text, collation),
-            DaeTarget::Raw => text.as_bytes().to_vec(),
+            // this crate cannot map falls back identically on both, and an
+            // unmappable character is substituted identically on both.
+            DaeTarget::Narrow(collation) => {
+                let encoded = encode_narrow(text, collation);
+                DaeChunk {
+                    bytes: encoded.bytes,
+                    had_loss: encoded.had_loss,
+                }
+            }
+            DaeTarget::Raw => DaeChunk::exact(text.as_bytes().to_vec()),
+        }
+    }
+}
+
+/// One converted data-at-execution chunk, ready for the wire.
+pub(crate) struct DaeChunk {
+    /// Converted bytes.
+    pub(crate) bytes: Vec<u8>,
+    /// `true` when a character had no representation in the narrow target's
+    /// code page and was substituted. Surfaced as SQLSTATE `01000` under
+    /// `SQL_COPT_SS_WARN_ON_CP_ERROR`.
+    pub(crate) had_loss: bool,
+}
+
+impl DaeChunk {
+    /// Bytes that needed no substitution.
+    fn exact(bytes: Vec<u8>) -> Self {
+        Self {
+            bytes,
+            had_loss: false,
         }
     }
 }
@@ -3996,15 +4032,32 @@ mod tests {
         let transcode = DaeTranscode::new(SQL_C_CHAR, SQL_WVARCHAR, SqlCollation::default());
         let mut carry = Vec::new();
         // "caf" + the first byte of U+00E9.
-        let first = transcode.push(&mut carry, &[b'c', b'a', b'f', 0xC3]);
+        let first = transcode.push(&mut carry, &[b'c', b'a', b'f', 0xC3]).bytes;
         assert_eq!(
             first,
             b"c\0a\0f\0".to_vec(),
             "the partial byte is held back"
         );
-        let second = transcode.push(&mut carry, &[0xA9]);
+        let second = transcode.push(&mut carry, &[0xA9]).bytes;
         assert_eq!(second, vec![0xE9, 0x00], "the completed sequence follows");
-        assert!(transcode.finish(&mut carry).is_empty());
+        assert!(transcode.finish(&mut carry).bytes.is_empty());
+    }
+
+    /// Drives a whole streamed value through `transcode`, chunk by chunk, and
+    /// returns its wire bytes plus whether any chunk substituted a character.
+    fn run_transcode(transcode: &DaeTranscode, chunks: &[&[u8]]) -> (Vec<u8>, bool) {
+        let mut carry = Vec::new();
+        let mut out = Vec::new();
+        let mut had_loss = false;
+        for chunk in chunks {
+            let pushed = transcode.push(&mut carry, chunk);
+            had_loss |= pushed.had_loss;
+            out.extend(pushed.bytes);
+        }
+        let tail = transcode.finish(&mut carry);
+        had_loss |= tail.had_loss;
+        out.extend(tail.bytes);
+        (out, had_loss)
     }
 
     /// Every UTF-8 sequence width can straddle a boundary, including a 4-byte
@@ -4013,12 +4066,9 @@ mod tests {
     fn transcode_carries_every_utf8_sequence_width() {
         let transcode = DaeTranscode::new(SQL_C_CHAR, SQL_WVARCHAR, SqlCollation::default());
         for split in 1..4 {
-            let mut carry = Vec::new();
             // U+1F600, four bytes, one surrogate pair.
             let full = "\u{1F600}".as_bytes();
-            let mut out = transcode.push(&mut carry, &full[..split]);
-            out.extend(transcode.push(&mut carry, &full[split..]));
-            out.extend(transcode.finish(&mut carry));
+            let (out, _) = run_transcode(&transcode, &[&full[..split], &full[split..]]);
             assert_eq!(
                 out,
                 vec![0x3D, 0xD8, 0x00, 0xDE],
@@ -4039,20 +4089,21 @@ mod tests {
         let transcode = DaeTranscode::new(SQL_C_WCHAR, SQL_VARCHAR, SqlCollation::default());
         let mut carry = Vec::new();
         // U+00E9 as UTF-16LE, split between its two bytes.
-        assert!(transcode.push(&mut carry, &[0xE9]).is_empty());
-        assert_eq!(transcode.push(&mut carry, &[0x00]), vec![0xE9]);
-        assert!(transcode.finish(&mut carry).is_empty());
+        assert!(transcode.push(&mut carry, &[0xE9]).bytes.is_empty());
+        assert_eq!(transcode.push(&mut carry, &[0x00]).bytes, vec![0xE9]);
+        assert!(transcode.finish(&mut carry).bytes.is_empty());
 
-        // A surrogate pair, whole and then split at every offset.
+        // A surrogate pair, whole and then split at every offset. U+1F600 has
+        // no representation in this collation's code page, so every split must
+        // produce the same substitution *and* the same loss verdict
+        // (AB#47598) rather than one of them slipping through unreported.
+        // Two bytes, not one: the substitute is per UTF-16 code unit, matching
+        // `WideCharToMultiByte` and the engine.
         let pair = [0x3D, 0xD8, 0x00, 0xDE];
-        let mut whole_carry = Vec::new();
-        let whole = transcode.push(&mut whole_carry, &pair);
-        assert!(transcode.finish(&mut whole_carry).is_empty());
+        let whole = run_transcode(&transcode, &[&pair]);
+        assert_eq!(whole, (b"??".to_vec(), true));
         for split in 1..pair.len() {
-            let mut carry = Vec::new();
-            let mut out = transcode.push(&mut carry, &pair[..split]);
-            out.extend(transcode.push(&mut carry, &pair[split..]));
-            out.extend(transcode.finish(&mut carry));
+            let out = run_transcode(&transcode, &[&pair[..split], &pair[split..]]);
             assert_eq!(out, whole, "split after {split} byte(s) changed the value");
         }
     }
@@ -4063,8 +4114,36 @@ mod tests {
     fn transcode_flushes_a_truncated_tail_as_a_replacement() {
         let transcode = DaeTranscode::new(SQL_C_CHAR, SQL_WVARCHAR, SqlCollation::default());
         let mut carry = Vec::new();
-        assert!(transcode.push(&mut carry, &[0xC3]).is_empty());
-        assert_eq!(transcode.finish(&mut carry), vec![0xFD, 0xFF], "U+FFFD");
+        assert!(transcode.push(&mut carry, &[0xC3]).bytes.is_empty());
+        assert_eq!(
+            transcode.finish(&mut carry).bytes,
+            vec![0xFD, 0xFF],
+            "U+FFFD"
+        );
+    }
+
+    /// A streamed chunk carrying a character the target collation cannot
+    /// represent is substituted with `?` -- not the numeric character reference
+    /// `encoding_rs` would emit -- and reports the loss, which the caller hands
+    /// to the connection for the statement to report (AB#47598).
+    #[test]
+    fn transcode_substitutes_a_chunk_the_narrow_target_cannot_represent() {
+        let transcode = DaeTranscode::new(SQL_C_CHAR, SQL_VARCHAR, windows_1252_collation());
+        assert_eq!(
+            run_transcode(&transcode, &["caf\u{65e5}".as_bytes()]),
+            (b"caf?".to_vec(), true)
+        );
+    }
+
+    /// A chunk that encodes cleanly reports no loss, or every streamed
+    /// statement would warn once the attribute is on.
+    #[test]
+    fn transcode_reports_no_loss_for_a_representable_chunk() {
+        let transcode = DaeTranscode::new(SQL_C_CHAR, SQL_VARCHAR, windows_1252_collation());
+        assert_eq!(
+            run_transcode(&transcode, &["caf\u{e9}".as_bytes()]),
+            (b"caf\xe9".to_vec(), false)
+        );
     }
 
     /// A pairing whose buffer bytes are already the wire's bytes copies rather
@@ -4538,15 +4617,11 @@ mod tests {
             .flat_map(u16::to_le_bytes)
             .collect();
         let transcode = DaeTranscode::new(SQL_C_WCHAR, SQL_VARCHAR, utf8_collation());
-        let mut carry = Vec::new();
-        let mut narrow = transcode.push(&mut carry, &wide_bytes);
-        narrow.extend(transcode.finish(&mut carry));
+        let narrow = run_transcode(&transcode, &[&wide_bytes]).0;
         assert_eq!(String::from_utf8(narrow).unwrap(), "caf\u{e9}");
 
         let transcode = DaeTranscode::new(SQL_C_CHAR, SQL_WVARCHAR, utf8_collation());
-        let mut carry = Vec::new();
-        let mut wide = transcode.push(&mut carry, "caf\u{e9}".as_bytes());
-        wide.extend(transcode.finish(&mut carry));
+        let wide = run_transcode(&transcode, &["caf\u{e9}".as_bytes()]).0;
         let wide_units: Vec<u16> = wide
             .chunks_exact(2)
             .map(|p| u16::from_le_bytes([p[0], p[1]]))
@@ -4567,17 +4642,13 @@ mod tests {
             .flat_map(u16::to_le_bytes)
             .collect();
         let transcode = DaeTranscode::new(SQL_C_WCHAR, SQL_VARCHAR, windows_1252_collation());
-        let mut carry = Vec::new();
-        let mut narrow = transcode.push(&mut carry, &wide_bytes);
-        narrow.extend(transcode.finish(&mut carry));
+        let narrow = run_transcode(&transcode, &[&wide_bytes]).0;
         assert_eq!(narrow, b"caf\xe9");
 
         // Same for a narrow C buffer: `SQL_C_CHAR` is UTF-8 by this driver's
         // convention, which is not a wire encoding.
         let transcode = DaeTranscode::new(SQL_C_CHAR, SQL_VARCHAR, windows_1252_collation());
-        let mut carry = Vec::new();
-        let mut narrow = transcode.push(&mut carry, "caf\u{e9}".as_bytes());
-        narrow.extend(transcode.finish(&mut carry));
+        let narrow = run_transcode(&transcode, &["caf\u{e9}".as_bytes()]).0;
         assert_eq!(narrow, b"caf\xe9");
     }
 

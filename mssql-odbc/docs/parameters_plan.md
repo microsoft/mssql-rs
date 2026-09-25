@@ -498,9 +498,10 @@ guesswork - so it belongs with AB#47584 rather than as a local patch.
 improvement.** `SQL_C_CHAR` `"[three U+2615]"` into `varchar(3)` was a correct
 `22001` under the byte count; it is now accepted as three units and fails
 downstream as an opaque `HY000` - or, under a single-byte collation, each
-character is unmappable and becomes a seven-byte numeric character reference
-(`&#9749;`, AB#47598), so 21 bytes are offered to a `varchar(3)`. CJK and astral
-input bound with an exact character count is the shape that regresses. The trade
+character is unmappable and becomes a single `?` (AB#47598), so three bytes
+reach a `varchar(3)` and the value is silently transliterated instead of
+rejected. CJK and astral input bound with an exact character count is the shape
+that regresses. The trade
 was taken because over-rejection has no application workaround - the byte count
 is encoding-dependent and the application cannot know it - while under-rejection
 still errors, and because byte-counting *both* C types would have broken the

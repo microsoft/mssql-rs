@@ -304,6 +304,12 @@ unsafe fn sql_put_data_safe(
     // The client is checked out in the same lock as the counter update, and
     // before it, so a call that cannot write leaves the parameter's byte total
     // where it was. A zero-length chunk writes nothing and needs no client.
+    //
+    // `chunk_had_loss` records a character the narrow target's code page could
+    // not hold. The materialized path carries that on the message and reports it
+    // at execute; a streamed chunk goes straight to the wire, so it is reported
+    // from here instead (AB#47598).
+    let mut chunk_had_loss = false;
     let checked_out = {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("SQLPutData: stmt mutex poisoned updating DAE byte count");
@@ -514,7 +520,8 @@ unsafe fn sql_put_data_safe(
                     carry_restore = Some(carry.clone());
                     let out = transcode.push(&mut carry, &fitted);
                     dae.progress.carry = carry;
-                    Cow::Owned(out)
+                    chunk_had_loss = out.had_loss;
+                    Cow::Owned(out.bytes)
                 }
                 None => {
                     error!("SQLPutData: DAE sequence ended between locks");
@@ -560,9 +567,18 @@ unsafe fn sql_put_data_safe(
     let Some((mut client, outgoing)) = checked_out else {
         // Zero-length chunk with a non-null pointer supplies an empty value, as
         // does one held entirely in the transcoder pending its continuation.
-        // NULL/0 is handled above as SQL NULL to match msodbcsql.
+        // NULL/0 is handled above as SQL NULL to match msodbcsql. Such a chunk
+        // wrote nothing, so it also substituted nothing.
+        debug_assert!(!chunk_had_loss, "an empty chunk cannot have substituted");
         return SQL_SUCCESS;
     };
+
+    // Reported once the statement completes rather than from this call: a
+    // diagnostic posted here would be cleared by the next `SQLPutData` /
+    // `SQLParamData` on the handle, so the application would never see it.
+    if chunk_had_loss {
+        client.note_code_page_conversion_loss();
+    }
 
     let write_result = dbc.runtime.block_on(client.write_streamed_chunk(&outgoing));
 

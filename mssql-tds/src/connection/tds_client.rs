@@ -502,6 +502,11 @@ pub struct TdsClient {
 
     pub(in crate::connection) return_values: Vec<ReturnValue>,
     info_messages: Vec<SqlInfoMessage>,
+    /// Whether the most recently sent message substituted a character that the
+    /// target collation's code page could not represent. Captured from the
+    /// message once it is built, and drained by
+    /// [`take_code_page_conversion_loss`](Self::take_code_page_conversion_loss).
+    code_page_conversion_loss: bool,
     /// Per-statement Always Encrypted parameter metadata, keyed by the same
     /// client-issued [`StatementId`] as `prepared_handles`. Captured by
     /// `execute_sp_prepare` / `sp_prepexec` from
@@ -666,6 +671,7 @@ impl TdsClient {
             prepared_batch: None,
             return_values: Vec::new(),
             info_messages: Vec::new(),
+            code_page_conversion_loss: false,
             prepared_param_encryption: HashMap::new(),
             query_metadata_cache: crate::security::query_metadata_cache::QueryMetadataCache::new(),
             describe_round_trips: 0,
@@ -2266,6 +2272,11 @@ impl TdsClient {
 
         let mut packet_writer =
             rpc.create_packet_writer(self.transport.as_writer(), timeout_sec, cancel_handle);
+        // A streamed sequence spans several calls and never reaches
+        // `finish_send`, whose assignment is what resets this for an ordinary
+        // request. Clear it here so the sequence starts from a clean verdict and
+        // every later site can OR into it.
+        self.code_page_conversion_loss = false;
         // Write the RPC prefix (headers, proc, positional + materialized named
         // params) then the first streamed parameter's header. The data-at-exec
         // branch of `serialize` writes name + status + TYPE_INFO and stops before
@@ -2676,6 +2687,7 @@ impl TdsClient {
         serialize_result: TdsResult<()>,
         message: SuspendedMessage,
     ) -> TdsResult<()> {
+        self.code_page_conversion_loss = message.code_page_conversion_loss();
         if let Err(e) = serialize_result {
             self.retract_partial_request(message).await;
             return Err(e);
@@ -2871,6 +2883,13 @@ impl TdsClient {
             // reading the response also aborts (the request is already on the
             // wire, so the connection must be reset before reuse).
             Ok(None) => {
+                // The materialized parameters in this message's prefix were
+                // serialized calls ago; the flag rode along on the suspended
+                // message, and this is the only point at which the whole
+                // message is known to be complete. OR rather than assign: the
+                // streamed chunks in between reported their own substitutions
+                // through `note_code_page_conversion_loss`.
+                self.code_page_conversion_loss |= packet_writer.code_page_conversion_loss();
                 drop(packet_writer);
                 match self.position_on_first_result().await {
                     Ok(result) => Ok(StreamedParamStatus::Complete(result)),
@@ -7639,6 +7658,36 @@ impl TdsClient {
 
     pub(crate) fn extend_info_messages(&mut self, messages: Vec<SqlInfoMessage>) {
         self.info_messages.extend(messages);
+    }
+
+    /// Records that a streamed chunk was written with a substituted character.
+    ///
+    /// The materialized path detects this during serialization and carries it on
+    /// the message; a data-at-execution chunk is converted by the caller and
+    /// written straight to the wire, so the caller reports it here instead. Both
+    /// land on the same flag, drained once by
+    /// [`take_code_page_conversion_loss`](Self::take_code_page_conversion_loss)
+    /// when the statement completes — a diagnostic posted on the `SQLPutData`
+    /// that produced it would be cleared by the next ODBC call on the handle.
+    pub fn note_code_page_conversion_loss(&mut self) {
+        self.code_page_conversion_loss = true;
+    }
+
+    /// Drains the "a character was substituted on the way to the wire" flag for
+    /// the most recently sent message.
+    ///
+    /// Set when a narrow (VARCHAR/CHAR/TEXT) value carried a character the
+    /// target collation's code page could not represent: the serializers write
+    /// `?` for it, matching msodbcsql and SQL Server's own `CAST`, rather than
+    /// the numeric character reference `encoding_rs` would emit (AB#47598).
+    /// The substitution is not an error — `mssql-odbc` reports it as SQLSTATE
+    /// `01000` only when the application asked for it via
+    /// `SQL_COPT_SS_WARN_ON_CP_ERROR`.
+    ///
+    /// Reflects one message and is replaced by the next send, so read it before
+    /// issuing another command.
+    pub fn take_code_page_conversion_loss(&mut self) -> bool {
+        std::mem::take(&mut self.code_page_conversion_loss)
     }
 
     fn capture_info_message(&mut self, token: &crate::token::tokens::InfoToken) {
