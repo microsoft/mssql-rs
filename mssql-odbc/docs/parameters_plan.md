@@ -894,7 +894,7 @@ parameter. "No" therefore means unreachable today, not unimportant.
 | 6 | array stride for `SQL_C_SS_VECTOR` | binding refused | No - never binds the vector C type | AB#48326 |
 | 7 | array size set through `SQLSetDescField(apd, SQL_DESC_ARRAY_SIZE, n)` | accepted, then one set executes | No - uses `SQLSetStmtAttr`; `SQLSetDescField` only for `SQL_C_NUMERIC` | AB#47945 |
 | 8 | server reports fewer sets than `PARAMSET_SIZE` with no error | `SQL_SUCCESS_WITH_INFO` and `01000` naming the reported count; msodbcsql returns `SQL_SUCCESS`; no known server behaviour produces it | n/a - not consumer-gated | AB#47945 |
-| 9 | `SQL_DIAG_ROW_NUMBER` on a diagnostic raised during array execution | always `SQL_NO_ROW_NUMBER` - no per-set attribution is plumbed through `post_tds_error` yet, so a batch with several failing sets reports several records with no mapping back to the row that produced each one | **Yes** - any array diagnostic | microsoft/mssql-rs#541 |
+| 9 | `SQL_DIAG_ROW_NUMBER` on a diagnostic raised during array execution | always `SQL_NO_ROW_NUMBER` - no per-set attribution is plumbed through `post_tds_error` yet, so a batch with several failing sets reports several records with no mapping back to the row that produced each one | No - the array errors surface, but `AppendDiagRecords` reads records with `SQLGetDiagRecW` and its only `SQLGetDiagFieldW` call asks for `SQL_DIAG_SQLSTATE`, so the missing attribution is never observed | microsoft/mssql-rs#541 |
 
 `SQL_DIAG_ROW_NUMBER` is implemented and correctly reports
 `SQL_NO_ROW_NUMBER` for every non-array diagnostic (there is no row to
@@ -975,8 +975,12 @@ consumer reachability has not been assessed.
   conversions (P9e, AB#47790) **[reachable]**, the `HYC00` -> `07006` flip
   (P9f, AB#48249) **[reachable** - diagnostic correctness**]**, and `vector`
   (P9g, AB#48326) **[not reachable]**. TVPs are tracked separately by AB#48148
-  **[not reachable** - no `SQL_SS_TABLE` binding**]**. `ColumnSize` still does
-  not bound a data-at-execution value in either family (AB#47590)
+  **[not reachable** - no `SQL_SS_TABLE` binding**]**. `ColumnSize` bounds a
+  data-at-execution value within the character and binary families, enforced
+  against the accumulated total on the `SQLPutData` that breaches it (`22001`);
+  it is left to the close-time conversion only across families and for the
+  `max` declarations, which have no declared length. What remains under
+  AB#47590 is the unbounded close-time transform described above
   **[reachable** - DAE triggers above 4000 UTF-16 units / 8000 bytes**]**.
 - **Deferred features (AB#48148) [not reachable]:** output/input-output parameters in parameter arrays and TVPs. `DetectParamTypes` binds every parameter `SQL_PARAM_INPUT`, so mssql-python never reaches the output-array case; TVPs are unreachable for the separate reason above - they are input parameters, but `ParamInfo` carries no `SQL_SS_TABLE` type name to supply. Single-row output parameters are supported; input parameter arrays (`SQL_ATTR_PARAMSET_SIZE`) are implemented with the limitations above.
 - **`mssql-tds` gap found by P8, closed by AB#47800:** a `sql_variant` could not
