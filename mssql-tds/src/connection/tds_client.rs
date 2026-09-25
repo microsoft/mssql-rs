@@ -4190,14 +4190,16 @@ impl TdsClient {
         // The by-reference `@handle`: NULL input prepares fresh; a `Some(h)`
         // input tells the server to drop prepared statement `h` before
         // preparing. The new handle comes back as the `@handle` RETURNVALUE captured during drain.
-        // From this point onward, serialization or response failures are
-        // ambiguous: the server may have consumed the piggybacked drop, so the
-        // orphan is released and its entries evicted either way.
-        let drop_handle = orphan.take().and_then(|orphan_id| {
-            self.prepared_param_encryption.remove(&orphan_id);
-            self.prepared_handles.remove(&orphan_id)
-        });
-        let handle_value = SqlType::Int(drop_handle);
+        // Removed rather than merely read: once a send is attempted, the
+        // server may have consumed the piggybacked drop even if the attempt
+        // then fails, so the entries cannot be trusted to still describe a
+        // live statement. If nothing reaches the network before the failure,
+        // they are reinstated below.
+        let orphan_id = orphan.take();
+        let removed_handle = orphan_id.and_then(|id| self.prepared_handles.remove(&id));
+        let removed_encryption =
+            orphan_id.and_then(|id| self.prepared_param_encryption.remove(&id));
+        let handle_value = SqlType::Int(removed_handle);
 
         let handle_parameter = RpcParameter::new(None, StatusFlags::BY_REF_VALUE, handle_value);
 
@@ -4225,7 +4227,22 @@ impl TdsClient {
         let serialize_result = rpc.serialize(&mut packet_writer).await;
         let message = packet_writer.suspend();
         drop(rpc);
+        let send_never_reached_network = serialize_result.is_err() && message.nothing_sent();
         if let Err(e) = self.finish_send(serialize_result, message).await {
+            if send_never_reached_network {
+                // The server never saw this request, so the piggybacked drop
+                // was never sent either: reinstate the orphan exactly as it
+                // was so the caller can retry releasing it.
+                if let Some(id) = orphan_id {
+                    *orphan = Some(id);
+                    if let Some(handle) = removed_handle {
+                        self.prepared_handles.insert(id, handle);
+                    }
+                    if let Some(encryption) = removed_encryption {
+                        self.prepared_param_encryption.insert(id, encryption);
+                    }
+                }
+            }
             self.report_issued_id(issued_id, statement_id);
             return Err(e);
         }
@@ -13569,6 +13586,42 @@ mod tests {
         assert!(
             !client.prepared_handles.contains_key(&orphan_id),
             "once the drop crosses the send boundary the orphan's entry is dead"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_sp_prepexec_preserves_orphan_when_the_first_send_fails() {
+        let (mut client, fail) = create_failing_capturing_client(vec![done_no_more()]);
+        let orphan_id = client.issue_statement_id();
+        client.prepared_handles.insert(orphan_id, 7);
+        let encryption = std::sync::Arc::new(
+            crate::security::describe_parameter_encryption::DescribeParameterEncryptionResult::new(
+            ),
+        );
+        client
+            .prepared_param_encryption
+            .insert(orphan_id, encryption.clone());
+        let mut orphan = Some(orphan_id);
+
+        fail.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let result = client
+            .execute_sp_prepexec_for_test("SELECT 1".to_string(), Vec::new(), &mut orphan, ())
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(orphan, Some(orphan_id));
+        assert_eq!(
+            client.prepared_handles.get(&orphan_id),
+            Some(&7),
+            "a first write that never reaches the network must leave the orphan releasable"
+        );
+        assert!(
+            std::sync::Arc::ptr_eq(
+                client.prepared_param_encryption.get(&orphan_id).unwrap(),
+                &encryption
+            ),
+            "the same encryption metadata must be reinstated, not just the handle"
         );
     }
 
