@@ -169,12 +169,14 @@ pub fn encode_narrow(text: &str, collation: SqlCollation) -> NarrowEncoded {
 /// alone as it does in context.
 ///
 /// One substitute byte per **UTF-16 code unit**, not per character, so an
-/// astral character yields two. `WideCharToMultiByte` counts that way (measured:
-/// `U+1F600` under CP1252 gives `3F 3F`), as does SQL Server
-/// (`DATALENGTH(CAST(N'😀' AS varchar(4)))` is 2). Counting scalars instead
-/// would make a substituted value one byte shorter than the same value through
-/// msodbcsql, and a `varchar(n)` would accept a string the reference driver
-/// rejects.
+/// astral character yields two. `WideCharToMultiByte` counts that way
+/// (measured: `U+1F600` gives `3F 3F` under CP1252 and CP932), as does SQL
+/// Server (`DATALENGTH(CAST(N'😀' AS varchar(4)))` is 2), and so do
+/// msodbcsql's iconv legs -- `EncodingConverter::Convert`'s `EILSEQ` arm
+/// advances one `WCHAR` via `SkipSingleCh()` and writes one `DefaultChar`
+/// (`Globalization.h`). Counting scalars instead would make a substituted value
+/// one byte shorter than the same value through msodbcsql on every platform,
+/// and a `varchar(n)` would accept a string the reference driver rejects.
 pub(crate) fn substitute_unmappable(text: &str, encoding: ResolvedEncoding) -> Vec<u8> {
     let mut out = Vec::with_capacity(text.len());
     let mut buf = [0u8; 4];
@@ -764,6 +766,10 @@ mod tests {
     /// A multi-byte mappable character keeps all of its bytes while an
     /// unmappable neighbour collapses to one, so the substitution cannot be a
     /// per-character byte-for-byte assumption.
+    ///
+    /// Measured with `WideCharToMultiByte(932, 0, ...)`: `U+3042` is `82 A0`
+    /// with no loss flag, `U+0141` is `3F` with it set, and the pair is
+    /// `82 A0 3F`.
     #[test]
     fn encode_narrow_substitutes_within_a_dbcs_code_page() {
         let collation = SqlCollation {
@@ -780,6 +786,11 @@ mod tests {
     /// The OEM code pages take the table-backed codec rather than `encoding_rs`
     /// and emit the same numeric character reference, so they must substitute on
     /// the same terms.
+    ///
+    /// Measured with `WideCharToMultiByte(437, 0, ...)`: `U+65E5` is `3F` with
+    /// the loss flag set. `U+0141` is deliberately not used here - CP437
+    /// best-fits it to `4C` (`L`), which is parity-deviations entry 18 rather
+    /// than a substitution.
     #[test]
     fn encode_narrow_substitutes_under_an_oem_code_page() {
         let collation = SqlCollation {
@@ -794,10 +805,13 @@ mod tests {
     }
 
     /// An astral character is two UTF-16 code units and substitutes as two
-    /// bytes, matching `WideCharToMultiByte` (measured: `U+1F600` under CP1252
-    /// gives `3F 3F`) and SQL Server (`DATALENGTH(CAST(N'😀' AS varchar(4)))`
-    /// is 2). Counting scalars would make the value a byte shorter here than
-    /// through msodbcsql.
+    /// bytes, matching `WideCharToMultiByte` (measured: `U+1F600` gives `3F 3F`
+    /// under CP1252 *and* CP932) and SQL Server
+    /// (`DATALENGTH(CAST(N'😀' AS varchar(4)))` is 2). msodbcsql's non-Windows
+    /// legs agree by a different route: `EncodingConverter::Convert`'s `EILSEQ`
+    /// arm calls `SkipSingleCh()`, which advances one `WCHAR`, then writes one
+    /// `DefaultChar` (`Globalization.h`). Counting scalars would make the value
+    /// a byte shorter here than through msodbcsql on every platform.
     #[test]
     fn encode_narrow_substitutes_one_byte_per_utf16_unit() {
         let collation = SqlCollation {

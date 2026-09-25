@@ -2687,11 +2687,17 @@ impl TdsClient {
         serialize_result: TdsResult<()>,
         message: SuspendedMessage,
     ) -> TdsResult<()> {
-        self.code_page_conversion_loss = message.code_page_conversion_loss();
         if let Err(e) = serialize_result {
             self.retract_partial_request(message).await;
             return Err(e);
         }
+        // Below the error return so a retracted request cannot leave the flag
+        // set. Harmless either way today -- `finish_execute` is the only drain
+        // point and is unreachable once a send site has failed, so a stale
+        // `true` is always overwritten by the next send's assignment before
+        // anything reads it -- but the contract the accessor documents is "the
+        // most recently *sent* message", and only this order matches it.
+        self.code_page_conversion_loss = message.code_page_conversion_loss();
         Ok(())
     }
 

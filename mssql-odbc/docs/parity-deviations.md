@@ -496,9 +496,9 @@ msodbcsql build is measured.
     emit is the musl leg's answer and the ODBC specification's substitution
     wording.
 
-    Second-order consequence: under `SQL_COPT_SS_WARN_ON_CP_ERROR` we warn for
-    a best-fit character where msodbcsql would not, since it does not count a
-    best-fit result as loss.
+    Second-order consequence: under `SQL_COPT_SS_WARN_ON_CP_ERROR` (entry 19)
+    we warn for a best-fit character where msodbcsql would not, since it does
+    not count a best-fit result as loss.
 
     Distinct from the AB#47598 defect this entry is the residue of, where
     `encoding_rs`'s WHATWG *form-submission* semantics emitted a numeric
@@ -508,3 +508,39 @@ msodbcsql build is measured.
     carries `SKIP_IF_COMPARING_MSODBCSQL()` and pins the disagreement;
     `UnmappableCharacterIsSubstituted` and its siblings run unskipped on the
     rows both drivers agree on. Tracked in AB#47598.
+
+19. **`SQL_COPT_SS_WARN_ON_CP_ERROR` reports code-page loss on input
+    parameters; msodbcsql reports it only on retrieval.** msodbcsql posts
+    `IDS_01_000_16` ("Warning: Code page translation caused loss of data",
+    SQLSTATE `01000` via `cli_common/src/clntcomn.cpp:1183`) from exactly two
+    sites, both in `odbc/sqlcdata.h`: the output-parameter arm (`:1297`) and the
+    column arm (`:1310`). The input-parameter paths discard the loss flag
+    outright — `Xlat(..., TOSERVER, NULL, ...)` at `odbc/sqlcmisc.cpp:7364` and
+    `odbc/sqlccnvt.cpp:995`, and `FromUtf16(..., NULL)` at
+    `odbc/sqlccmd.cpp:10975`. With the attribute on and an unmappable bound
+    parameter, msodbcsql returns `SQL_SUCCESS` and posts nothing; this driver
+    returns `SQL_SUCCESS_WITH_INFO` and posts `01000`.
+
+    Taken because the retrieval direction msodbcsql instruments cannot lose
+    anything here: this driver's `SQL_C_CHAR` is UTF-8 (entry 3), so any
+    character the server sends has a representation in the target buffer and
+    there is nothing to substitute. Applying the attribute to the direction
+    where loss actually occurs keeps it meaningful rather than inert. The
+    substitution itself is silent by default on both drivers, so an application
+    that never sets the attribute cannot tell them apart.
+
+    `UnmappableCharacterWarnsWhenAsked` and
+    `DataAtExecutionUnmappableCharacterWarnsWhenAsked` carry
+    `SKIP_IF_COMPARING_MSODBCSQL()`; the substitution they sit alongside is
+    asserted unskipped by `UnmappableCharacterIsSubstituted` and
+    `DataAtExecutionUnmappableCharacterIsSubstituted`. Tracked in AB#47598.
+
+    **Value validation matches, with one measured exception.** msodbcsql
+    rejects anything but `SQL_WARN_NO`/`SQL_WARN_YES` with `HY024`
+    (`odbc/sqlcmisc.cpp:2473`), and so does this driver. Measured on retail
+    18.6.2.1: `SQLSetConnectAttr(dbc, 1243, (SQLPOINTER)7, 0)` answers `HY024`
+    after connect but is **accepted silently before** connect — the
+    `pAttributeValue > SQL_IS_ON` check at `odbc/dbcinfotoken.cpp:171` guards a
+    path `SQLSetConnectAttr` does not reach pre-connect. This driver validates
+    in both states; silently storing an out-of-range value is not behaviour
+    worth reproducing.

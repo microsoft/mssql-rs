@@ -499,7 +499,7 @@ improvement.** `SQL_C_CHAR` `"[three U+2615]"` into `varchar(3)` was a correct
 `22001` under the byte count; it is now accepted as three units and fails
 downstream as an opaque `HY000` - or, under a single-byte collation, each
 character is unmappable and becomes a single `?` (AB#47598), so three bytes
-reach a `varchar(3)` and the value is silently transliterated instead of
+reach a `varchar(3)` and the value is silently substituted rather than
 rejected. CJK and astral input bound with an exact character count is the shape
 that regresses. The trade
 was taken because over-rejection has no application workaround - the byte count

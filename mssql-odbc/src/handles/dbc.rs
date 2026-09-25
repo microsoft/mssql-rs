@@ -128,10 +128,13 @@ pub(crate) struct DbcState {
     /// unconditionally would change the return code of every statement that
     /// carries text a legacy code page cannot hold.
     ///
-    /// msodbcsql only consults its copy on the fetch direction. This driver
-    /// applies it to parameters instead, which is where our loss actually
-    /// occurs: `SQL_C_CHAR` is UTF-8 here, so a fetch can always represent
-    /// whatever the server sent and has nothing to substitute (AB#47598).
+    /// msodbcsql only consults its copy on the retrieval direction — output
+    /// parameters (`sqlcdata.h:1297`) and columns (`:1310`); every
+    /// input-parameter path discards the loss flag. This driver applies it to
+    /// parameters instead, which is where our loss actually occurs:
+    /// `SQL_C_CHAR` is UTF-8 here, so a fetch can always represent whatever the
+    /// server sent and has nothing to substitute. Recorded as
+    /// parity-deviations entry 19 (AB#47598).
     pub(crate) warn_on_cp_error: bool,
     /// `SQL_ATTR_CONNECTION_TIMEOUT` in seconds. Stored, not yet honored.
     /// `0` is the ODBC default and means "no timeout".
