@@ -66,6 +66,16 @@ pub const SQL_COPT_SS_INTEGRATED_SECURITY: SqlInteger = 1203;
 pub const SQL_COPT_SS_ENCRYPT: SqlInteger = 1223;
 pub const SQL_COPT_SS_TRUST_SERVER_CERTIFICATE: SqlInteger = 1228;
 
+/// `SQL_COPT_SS_WARN_ON_CP_ERROR` (`SQL_COPT_SS_BASE_EX + 3`). Takes
+/// [`SQL_WARN_NO`] / [`SQL_WARN_YES`]; see
+/// [`DbcState::warn_on_cp_error`](crate::handles::dbc::DbcState::warn_on_cp_error).
+pub const SQL_COPT_SS_WARN_ON_CP_ERROR: SqlInteger = 1243;
+
+/// `SQL_COPT_SS_WARN_ON_CP_ERROR` values, as msodbcsql spells them.
+pub const SQL_WARN_NO: u64 = 0;
+/// See [`SQL_WARN_NO`].
+pub const SQL_WARN_YES: u64 = 1;
+
 // SQL_COPT_SS_ENCRYPT values. 0/1 are the historical off/on pair; 2 selects the
 // TDS 8.0 "strict" mode Driver 18 added. Measured: any other value is treated
 // as "on" rather than rejected.

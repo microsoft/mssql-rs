@@ -91,6 +91,42 @@ fn resolve_collation(collation: SqlCollation) -> ResolvedEncoding {
     lcid_encoding_or_fallback(collation).into()
 }
 
+/// Byte substituted for a character the target narrow encoding cannot
+/// represent.
+///
+/// Matches msodbcsql, which converts with `WideCharToMultiByte`/`iconv` and
+/// takes the code page's default character — hardcoded `0x3f` in its own
+/// cross-platform converter (`Globalization.h`, `iconv_buffer::DefaultChar`).
+///
+/// SQL Server itself substitutes the same byte for a `CAST(N'…' AS varchar(n))`
+/// it cannot best-fit map: measured on `SQL_Latin1_General_CP1_CI_AS`,
+/// `ASCII(CAST(N'日' AS varchar(4)))` is 63. Characters it *can* best-fit
+/// (`Ł`→`L`, `Ć`→`C`, `‐`→`-`) are transliterated rather than substituted, and
+/// this driver does not reproduce that — see `docs/parity-deviations.md`.
+pub const NARROW_SUBSTITUTE_BYTE: u8 = b'?';
+
+/// Wire bytes from a narrow encode, plus whether producing them lost anything.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NarrowEncoded {
+    /// Encoded bytes, ready for the wire.
+    pub bytes: Vec<u8>,
+    /// `true` when at least one character had no representation in the target
+    /// encoding and was replaced with [`NARROW_SUBSTITUTE_BYTE`]. The caller
+    /// decides whether that is worth reporting; `mssql-odbc` surfaces it as
+    /// SQLSTATE `01000` under `SQL_COPT_SS_WARN_ON_CP_ERROR`.
+    pub had_loss: bool,
+}
+
+impl NarrowEncoded {
+    /// Bytes that encoded exactly.
+    fn exact(bytes: Vec<u8>) -> Self {
+        Self {
+            bytes,
+            had_loss: false,
+        }
+    }
+}
+
 /// Encodes `text` for the wire under `collation`'s narrow encoding: UTF-8 when
 /// the collation is UTF-8-aware, then its SQL sort ID code page, then its LCID
 /// (falling back to Windows-1252 for an LCID this crate does not map).
@@ -105,18 +141,55 @@ fn resolve_collation(collation: SqlCollation) -> ResolvedEncoding {
 /// Inline string parameters can therefore encode differently from this helper
 /// and from fetched values under UTF-8 or SQL sort-ID collations. Unifying that
 /// serializer path is deferred alongside the UTF-8 discrepancy in AB#47590.
-pub fn encode_narrow(text: &str, collation: SqlCollation) -> Vec<u8> {
+///
+/// A character the encoding cannot represent becomes
+/// [`NARROW_SUBSTITUTE_BYTE`] and sets [`NarrowEncoded::had_loss`]. It must not
+/// be left to `encoding_rs`, whose `encode` implements WHATWG form-submission
+/// semantics and emits a decimal numeric character reference instead --
+/// `U+65E5` as the eight ASCII bytes `&#26085;` -- so the server would store
+/// markup in place of the value, and one character would count as eight against
+/// the column's length (AB#47598).
+pub fn encode_narrow(text: &str, collation: SqlCollation) -> NarrowEncoded {
     let (encoded, encoding_used, had_errors) = resolve_collation(collation).encode(text);
-    if had_errors {
-        warn!(
-            "Encountered encoding errors while converting string to {} (LCID 0x{:04X}, SQL sort ID {}). \
-             Some characters may have been replaced.",
-            encoding_used.name(),
-            collation.info & 0x000F_FFFF,
-            collation.sort_id
-        );
+    if !had_errors {
+        return NarrowEncoded::exact(encoded.into_owned());
     }
-    encoded.into_owned()
+    NarrowEncoded {
+        bytes: substitute_unmappable(text, encoding_used),
+        had_loss: true,
+    }
+}
+
+/// Re-encodes `text` one character at a time, replacing each character
+/// `encoding` cannot represent with [`NARROW_SUBSTITUTE_BYTE`].
+///
+/// Only reached once a whole-string encode has already reported a substitution,
+/// so the per-character cost never lands on a value that encodes cleanly. Every
+/// encoding this resolves to is stateless, so a character encodes the same
+/// alone as it does in context.
+///
+/// One substitute byte per **UTF-16 code unit**, not per character, so an
+/// astral character yields two. `WideCharToMultiByte` counts that way (measured:
+/// `U+1F600` under CP1252 gives `3F 3F`), as does SQL Server
+/// (`DATALENGTH(CAST(N'😀' AS varchar(4)))` is 2). Counting scalars instead
+/// would make a substituted value one byte shorter than the same value through
+/// msodbcsql, and a `varchar(n)` would accept a string the reference driver
+/// rejects.
+pub(crate) fn substitute_unmappable(text: &str, encoding: ResolvedEncoding) -> Vec<u8> {
+    let mut out = Vec::with_capacity(text.len());
+    let mut buf = [0u8; 4];
+    for character in text.chars() {
+        let (bytes, _, failed) = encoding.encode(character.encode_utf8(&mut buf));
+        if failed {
+            out.extend(std::iter::repeat_n(
+                NARROW_SUBSTITUTE_BYTE,
+                character.len_utf16(),
+            ));
+        } else {
+            out.extend_from_slice(&bytes);
+        }
+    }
+    out
 }
 
 impl EncodingType {
@@ -623,7 +696,9 @@ mod tests {
             col_flags: 0,
             sort_id: 0,
         };
-        assert_eq!(encode_narrow("Caf\u{e9}", collation), b"Caf\xe9");
+        let encoded = encode_narrow("Caf\u{e9}", collation);
+        assert_eq!(encoded.bytes, b"Caf\xe9");
+        assert!(!encoded.had_loss);
     }
 
     #[test]
@@ -635,7 +710,7 @@ mod tests {
             sort_id: 0,
         };
         assert_eq!(
-            encode_narrow("Caf\u{e9}", collation),
+            encode_narrow("Caf\u{e9}", collation).bytes,
             "Caf\u{e9}".as_bytes()
         );
     }
@@ -648,21 +723,95 @@ mod tests {
             col_flags: 0,
             sort_id: 0,
         };
-        assert_eq!(encode_narrow("Caf\u{e9}", collation), b"Caf\xe9");
+        assert_eq!(encode_narrow("Caf\u{e9}", collation).bytes, b"Caf\xe9");
     }
 
-    /// U+65E5 has no Windows-1252 representation. `encoding_rs` substitutes
-    /// an HTML numeric character reference, not `?`, and `encode_narrow`
-    /// warns on this rather than substituting silently.
+    /// U+65E5 has no Windows-1252 representation. Left to `encoding_rs` it
+    /// would become the eight ASCII bytes `&#26085;` -- WHATWG
+    /// form-submission semantics -- so the server would store markup and one
+    /// character would count as eight against the column. It is substituted
+    /// with a single `?` instead, matching msodbcsql and SQL Server's own
+    /// `CAST`, and the loss is reported for the caller to surface (AB#47598).
     #[test]
-    fn encode_narrow_substitutes_ncr_for_a_character_the_codepage_cannot_represent() {
+    fn encode_narrow_substitutes_a_character_the_codepage_cannot_represent() {
         let collation = SqlCollation {
             info: 0x0409, // US English LCID -> Windows-1252
             lcid_language_id: 0,
             col_flags: 0,
             sort_id: 0,
         };
-        assert_eq!(encode_narrow("\u{65e5}", collation), b"&#26085;");
+        let encoded = encode_narrow("Caf\u{65e5}", collation);
+        assert_eq!(encoded.bytes, b"Caf?");
+        assert!(encoded.had_loss);
+    }
+
+    /// Only the unmappable characters are substituted: `é` encodes fine in
+    /// Windows-1252 and must survive a value that also carries one that does
+    /// not.
+    #[test]
+    fn encode_narrow_substitutes_only_the_unmappable_characters() {
+        let collation = SqlCollation {
+            info: 0x0409,
+            lcid_language_id: 0,
+            col_flags: 0,
+            sort_id: 0,
+        };
+        let encoded = encode_narrow("\u{e9}\u{65e5}\u{e9}", collation);
+        assert_eq!(encoded.bytes, b"\xe9?\xe9");
+        assert!(encoded.had_loss);
+    }
+
+    /// A multi-byte mappable character keeps all of its bytes while an
+    /// unmappable neighbour collapses to one, so the substitution cannot be a
+    /// per-character byte-for-byte assumption.
+    #[test]
+    fn encode_narrow_substitutes_within_a_dbcs_code_page() {
+        let collation = SqlCollation {
+            info: 0x0411, // Japanese -> Shift_JIS
+            lcid_language_id: 0,
+            col_flags: 0,
+            sort_id: 0,
+        };
+        let encoded = encode_narrow("\u{3042}\u{0141}", collation);
+        assert_eq!(encoded.bytes, b"\x82\xa0?");
+        assert!(encoded.had_loss);
+    }
+
+    /// The OEM code pages take the table-backed codec rather than `encoding_rs`
+    /// and emit the same numeric character reference, so they must substitute on
+    /// the same terms.
+    #[test]
+    fn encode_narrow_substitutes_under_an_oem_code_page() {
+        let collation = SqlCollation {
+            info: 0x0409,
+            lcid_language_id: 0,
+            col_flags: 0,
+            sort_id: 30, // CP437
+        };
+        let encoded = encode_narrow("\u{65e5}", collation);
+        assert_eq!(encoded.bytes, b"?");
+        assert!(encoded.had_loss);
+    }
+
+    /// An astral character is two UTF-16 code units and substitutes as two
+    /// bytes, matching `WideCharToMultiByte` (measured: `U+1F600` under CP1252
+    /// gives `3F 3F`) and SQL Server (`DATALENGTH(CAST(N'😀' AS varchar(4)))`
+    /// is 2). Counting scalars would make the value a byte shorter here than
+    /// through msodbcsql.
+    #[test]
+    fn encode_narrow_substitutes_one_byte_per_utf16_unit() {
+        let collation = SqlCollation {
+            info: 0x0409, // Windows-1252
+            lcid_language_id: 0,
+            col_flags: 0,
+            sort_id: 0,
+        };
+        let encoded = encode_narrow("\u{1F600}", collation);
+        assert_eq!(encoded.bytes, b"??", "one substitute per UTF-16 unit");
+        assert!(encoded.had_loss);
+
+        // Mixed with a BMP unmappable, which stays one byte.
+        assert_eq!(encode_narrow("\u{65e5}\u{1F600}", collation).bytes, b"???");
     }
 
     #[test]
@@ -696,7 +845,7 @@ mod tests {
             };
             let encoding = EncodingType::LcidBased(collation);
             assert_eq!(SqlString::decode(bytes, encoding), text);
-            assert_eq!(encode_narrow(text, collation), bytes);
+            assert_eq!(encode_narrow(text, collation).bytes, bytes);
             if matches!(sort_id, 30 | 40) {
                 assert_eq!(encoding.encoding(), None);
             }
@@ -773,7 +922,7 @@ mod tests {
             let encoding = EncodingType::LcidBased(collation);
             assert_eq!(encoding.encoding(), Some(encoding_rs::UTF_8));
             assert_eq!(SqlString::decode("é😀".as_bytes(), encoding), "é😀");
-            assert_eq!(encode_narrow("é😀", collation), "é😀".as_bytes());
+            assert_eq!(encode_narrow("é😀", collation).bytes, "é😀".as_bytes());
         }
     }
 
@@ -794,7 +943,7 @@ mod tests {
                 let encoding = EncodingType::LcidBased(collation);
                 assert_eq!(encoding.encoding(), Some(expected));
                 assert_eq!(SqlString::decode(b"\xc6", encoding), text);
-                assert_eq!(encode_narrow(text, collation), b"\xc6");
+                assert_eq!(encode_narrow(text, collation).bytes, b"\xc6");
             }
         }
         assert_eq!(EncodingType::DelayedSet.resolved_encoding(), None);

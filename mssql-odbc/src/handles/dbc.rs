@@ -118,6 +118,21 @@ pub(crate) struct DbcState {
     /// `SQL_ATTR_ACCESS_MODE`. Stored so a set/get round-trip agrees; the driver
     /// does not yet vary its behaviour on it.
     pub(crate) access_mode: u32,
+    /// `SQL_COPT_SS_WARN_ON_CP_ERROR`. When `true`, a value whose characters
+    /// the target collation's code page could not represent — substituted with
+    /// `?` on the way to the wire, matching msodbcsql — is reported as SQLSTATE
+    /// `01000` and turns the call's return into `SQL_SUCCESS_WITH_INFO`.
+    ///
+    /// Defaults to `false` (`SQL_WARN_NO`), as msodbcsql's does
+    /// (`sqlcconn.cpp:596`): the substitution is not an error, and warning
+    /// unconditionally would change the return code of every statement that
+    /// carries text a legacy code page cannot hold.
+    ///
+    /// msodbcsql only consults its copy on the fetch direction. This driver
+    /// applies it to parameters instead, which is where our loss actually
+    /// occurs: `SQL_C_CHAR` is UTF-8 here, so a fetch can always represent
+    /// whatever the server sent and has nothing to substitute (AB#47598).
+    pub(crate) warn_on_cp_error: bool,
     /// `SQL_ATTR_CONNECTION_TIMEOUT` in seconds. Stored, not yet honored.
     /// `0` is the ODBC default and means "no timeout".
     pub(crate) connection_timeout: u32,
@@ -272,6 +287,7 @@ impl DbcHandle {
                 effective_vendor_settings: None,
                 login_timeout: None,
                 access_mode: SQL_MODE_READ_WRITE,
+                warn_on_cp_error: false,
                 connection_timeout: 0,
                 packet_size: DEFAULT_PACKET_SIZE,
                 effective_packet_size: None,

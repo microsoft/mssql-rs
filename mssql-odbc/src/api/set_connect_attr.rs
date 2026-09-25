@@ -23,9 +23,9 @@ use crate::api::odbc_types::{
     SQL_ATTR_CURRENT_CATALOG, SQL_ATTR_LOGIN_TIMEOUT, SQL_ATTR_PACKET_SIZE, SQL_ATTR_QUERY_TIMEOUT,
     SQL_ATTR_RESET_CONNECTION, SQL_ATTR_TXN_ISOLATION, SQL_COPT_SS_ACCESS_TOKEN,
     SQL_COPT_SS_ENCRYPT, SQL_COPT_SS_INTEGRATED_SECURITY, SQL_COPT_SS_RESET_CONNECTION,
-    SQL_COPT_SS_TRUST_SERVER_CERTIFICATE, SQL_COPT_SS_TXN_ISOLATION, SQL_EN_OFF, SQL_EN_ON,
-    SQL_EN_STRICT, SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle,
-    SqlInteger, SqlPointer, SqlReturn,
+    SQL_COPT_SS_TRUST_SERVER_CERTIFICATE, SQL_COPT_SS_TXN_ISOLATION, SQL_COPT_SS_WARN_ON_CP_ERROR,
+    SQL_EN_OFF, SQL_EN_ON, SQL_EN_STRICT, SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS,
+    SQL_SUCCESS_WITH_INFO, SQL_WARN_YES, SqlHandle, SqlInteger, SqlPointer, SqlReturn,
 };
 #[cfg(not(windows))]
 use crate::api::odbc_types::{SQL_NTS, SYSNAMELEN, SqlWChar};
@@ -288,6 +288,19 @@ unsafe fn sql_set_connect_attr_w_impl(
             debug!(
                 attribute,
                 value, "SQLSetConnectAttrW: vendor override stored"
+            );
+            SQL_SUCCESS
+        }
+        // Settable at any time, before or after connect: it changes only how the
+        // driver reports a substitution, never how the connection is made.
+        // msodbcsql stores it the same way, with no connected-state guard
+        // (`sqlcmisc.cpp:2473`).
+        SQL_COPT_SS_WARN_ON_CP_ERROR => {
+            let value = value_ptr as usize as u64;
+            state.warn_on_cp_error = value == SQL_WARN_YES;
+            debug!(
+                value,
+                "SQLSetConnectAttrW: warn-on-code-page-error preference stored"
             );
             SQL_SUCCESS
         }
@@ -1279,6 +1292,41 @@ mod tests {
             };
             assert_eq!(stored, Some(expected), "attribute {attribute} value {raw}");
         }
+    }
+
+    /// `SQL_COPT_SS_WARN_ON_CP_ERROR` is a reporting preference, not a
+    /// connection property, so it is settable in either state and only
+    /// `SQL_WARN_YES` turns it on (AB#47598).
+    #[test]
+    fn warn_on_cp_error_stores_only_sql_warn_yes() {
+        for (raw, expected) in [(0usize, false), (1, true), (2, false), (7, false)] {
+            let h = TestHandles::with_env_dbc();
+            let ret = unsafe {
+                sql_set_connect_attr_w(h.dbc, SQL_COPT_SS_WARN_ON_CP_ERROR, raw as SqlPointer, 0)
+            };
+            assert_eq!(ret, SQL_SUCCESS, "value {raw}");
+            let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+            assert_eq!(
+                dbc.inner.lock().unwrap().warn_on_cp_error,
+                expected,
+                "value {raw}"
+            );
+        }
+    }
+
+    /// Unlike the vendor attributes above, this one is accepted after connect:
+    /// it changes nothing about the session, only what the driver reports.
+    #[test]
+    fn warn_on_cp_error_is_settable_after_connect() {
+        let h = TestHandles::with_env_dbc();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        dbc.inner.lock().unwrap().connection_state = ConnectionState::Connected;
+
+        let ret = unsafe {
+            sql_set_connect_attr_w(h.dbc, SQL_COPT_SS_WARN_ON_CP_ERROR, 1usize as SqlPointer, 0)
+        };
+        assert_eq!(ret, SQL_SUCCESS);
+        assert!(dbc.inner.lock().unwrap().warn_on_cp_error);
     }
 
     #[test]
