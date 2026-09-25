@@ -4343,6 +4343,34 @@ mod tests {
         assert!(!encoded.had_loss);
     }
 
+    /// The Latin-1 fallback is a second, independent `len_utf16()` site, so it
+    /// needs its own astral case: substituting once per scalar here would make
+    /// a no-collation value a byte shorter than the same value under a real
+    /// code page, and shorter than msodbcsql and the engine both produce.
+    /// Verified by mutation - replacing the `repeat_n` with a single `push`
+    /// leaves every other test green.
+    #[test]
+    fn latin1_fallback_substitutes_one_byte_per_utf16_unit() {
+        // No collation, and an LCID this crate cannot map: both reach the same
+        // fallback and must agree.
+        let unmapped = SqlCollation {
+            info: 0x000F_FFFF,
+            lcid_language_id: 0,
+            col_flags: 0,
+            sort_id: 0,
+        };
+        for collation in [None, Some(unmapped)] {
+            let encoded = TdsValueSerializer::encode_narrow_for_wire("\u{1F600}", collation);
+            assert_eq!(encoded.bytes, b"??", "collation {collation:?}");
+            assert!(encoded.had_loss, "collation {collation:?}");
+
+            // A representable neighbour keeps its own single byte, so the width
+            // is per-character rather than a blanket doubling.
+            let mixed = TdsValueSerializer::encode_narrow_for_wire("\u{e9}\u{1F600}", collation);
+            assert_eq!(mixed.bytes, b"\xe9??", "collation {collation:?}");
+        }
+    }
+
     /// A value that encodes cleanly must not mark the message, or every
     /// statement would warn once the attribute is on.
     #[test]

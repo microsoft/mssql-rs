@@ -68,6 +68,19 @@
 
 #include "odbc_test_fixture.h"
 
+// From msodbcsql.h, which this suite does not include: `SQL_COPT_SS_BASE_EX + 3`,
+// taking SQL_WARN_NO / SQL_WARN_YES. Opts in to the `01000` warning for a
+// character the target collation's code page could not represent (AB#47598).
+#ifndef SQL_COPT_SS_WARN_ON_CP_ERROR
+#define SQL_COPT_SS_WARN_ON_CP_ERROR 1243
+#endif
+#ifndef SQL_WARN_NO
+#define SQL_WARN_NO 0L
+#endif
+#ifndef SQL_WARN_YES
+#define SQL_WARN_YES 1L
+#endif
+
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -354,6 +367,91 @@ TEST_F(ParamArrayTest, ArrayHandlesVariableWidthBuffers) {
     EXPECT_EQ("DEAD,BEEFCA,01020304",
               ScalarString("SELECT STRING_AGG(CONVERT(varchar(20), b, 2), ',') "
                            "WITHIN GROUP (ORDER BY id) FROM #pa_v"));
+}
+
+// -------------------------------------------------------------------
+// A parameter array is serialized through the same PacketWriter as a scalar
+// execute, so an unmappable character in any parameter set substitutes the
+// same way - but array execution completes through finish_parameter_array
+// rather than finish_execute, so it needs its own drain/post of the
+// code-page loss flag. Without it the 01000 the attribute advertises never
+// fires for an array, and the undrained flag leaks into the next statement's
+// verdict (AB#47598).
+//
+// Both halves are asserted: the warning on the array execute, and the *next*
+// statement coming back clean. The second is what catches a missing drain,
+// which a single-statement test cannot see.
+//
+// Skipped under comparison: parity-deviations entry 19 - msodbcsql consults
+// this attribute only on the retrieval direction, so it returns plain
+// SQL_SUCCESS for a parameter however the attribute is set.
+// -------------------------------------------------------------------
+TEST_F(ParamArrayTest, ArrayUnmappableCharacterWarnsWhenAsked) {
+    SKIP_IF_COMPARING_MSODBCSQL();
+
+    const std::string collation =
+        ScalarString("SELECT CAST(DATABASEPROPERTYEX(DB_NAME(), 'Collation') AS VARCHAR(128))");
+    if (collation.find("Latin1_General") == std::string::npos ||
+        collation.find("_UTF8") != std::string::npos) {
+        GTEST_SKIP() << "needs a single-byte Latin1 collation, server has " << collation;
+    }
+
+    ASSERT_SQL_OK(SQLSetConnectAttr(dbc_, SQL_COPT_SS_WARN_ON_CP_ERROR,
+                                    reinterpret_cast<SQLPOINTER>(SQL_WARN_YES), 0),
+                  SQL_HANDLE_DBC, dbc_);
+
+    ExecDirect("CREATE TABLE #pa_cp (id int, s varchar(8))");
+    Prepare("INSERT INTO #pa_cp (id, s) VALUES (?, ?)");
+
+    // Three sets; only the middle one carries U+65E5, so the warning has to
+    // survive a clean set following the substituted one.
+    constexpr SQLLEN kStride = 4;  // two UTF-16 units plus room
+    SQLINTEGER ids[3] = {1, 2, 3};
+    SQLWCHAR text[3 * (kStride / sizeof(SQLWCHAR))] = {};
+    text[0] = 'a';
+    text[kStride / sizeof(SQLWCHAR)] = 0x65E5;
+    text[2 * (kStride / sizeof(SQLWCHAR))] = 'c';
+    SQLLEN id_ind[3] = {0, 0, 0};
+    SQLLEN text_ind[3] = {sizeof(SQLWCHAR), sizeof(SQLWCHAR), sizeof(SQLWCHAR)};
+
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_SLONG,
+                                   SQL_INTEGER, 10, 0, ids, 0, id_ind),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 2, SQL_PARAM_INPUT, SQL_C_WCHAR,
+                                   SQL_VARCHAR, 8, 0, text, kStride, text_ind),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_EQ(SQL_SUCCESS, SetStmtULen(SQL_ATTR_PARAMSET_SIZE, 3));
+
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, SQLExecute(stmt_));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01000");
+
+    // The substituted set stored '?' (63); its neighbours are untouched.
+    EXPECT_EQ("97,63,99",
+              ScalarString("SELECT STRING_AGG(CAST(ASCII(s) AS varchar(8)), ',') "
+                           "WITHIN GROUP (ORDER BY id) FROM #pa_cp"));
+
+    // The flag must have been drained, not merely read: a following statement
+    // with nothing unmappable must come back clean.
+    ASSERT_EQ(SQL_SUCCESS, SetStmtULen(SQL_ATTR_PARAMSET_SIZE, 1));
+    ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_RESET_PARAMS), SQL_HANDLE_STMT, stmt_);
+    Prepare("INSERT INTO #pa_cp (id, s) VALUES (?, ?)");
+    SQLINTEGER clean_id = 4;
+    SQLWCHAR clean_text[] = {'z'};
+    SQLLEN clean_id_ind = 0;
+    SQLLEN clean_text_ind = sizeof(SQLWCHAR);
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_SLONG,
+                                   SQL_INTEGER, 10, 0, &clean_id, 0, &clean_id_ind),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 2, SQL_PARAM_INPUT, SQL_C_WCHAR,
+                                   SQL_VARCHAR, 8, 0, clean_text, sizeof(clean_text),
+                                   &clean_text_ind),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(SQL_SUCCESS, SQLExecute(stmt_))
+        << "an undrained flag would warn again on an unrelated statement";
+
+    ASSERT_SQL_OK(SQLSetConnectAttr(dbc_, SQL_COPT_SS_WARN_ON_CP_ERROR,
+                                    reinterpret_cast<SQLPOINTER>(SQL_WARN_NO), 0),
+                  SQL_HANDLE_DBC, dbc_);
 }
 
 // -------------------------------------------------------------------

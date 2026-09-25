@@ -1051,6 +1051,14 @@ impl<'a> BulkCopy<'a> {
         // once the loop completes.
         let mut accumulated_info: Vec<SqlInfoMessage> = Vec::new();
 
+        // Accumulated for the same reason, and by the same means: each batch is a
+        // complete message of its own, so `execute_bulk_load_streaming_zerocopy`
+        // *assigns* the flag per batch rather than OR-ing it, exactly as
+        // `finish_send` does for a request. Without draining it per batch the
+        // second batch's verdict would overwrite the first's, and a bulk copy
+        // whose only substitution happened early would report none (AB#47598).
+        let mut accumulated_cp_loss = false;
+
         loop {
             if rows.peek().is_none() {
                 break;
@@ -1130,6 +1138,7 @@ impl<'a> BulkCopy<'a> {
                     // Drain this batch's INFO messages before the internal commit (which
                     // resets the client's buffer) can clear them.
                     accumulated_info.extend(self.client.take_info_messages());
+                    accumulated_cp_loss |= self.client.take_code_page_conversion_loss();
 
                     // ═══════════════════════════════════════════════════════════
                     // COMMIT TRANSACTION: Commit on successful batch completion
@@ -1146,6 +1155,8 @@ impl<'a> BulkCopy<'a> {
                         let _ = self.client.take_info_messages();
                         self.client
                             .extend_info_messages(std::mem::take(&mut accumulated_info));
+                        self.client
+                            .set_code_page_conversion_loss(accumulated_cp_loss);
                         return Err(e);
                     }
 
@@ -1156,6 +1167,7 @@ impl<'a> BulkCopy<'a> {
                     // the client's buffer via begin_command) can clear it, so it is
                     // retained alongside the already-accumulated prior batches' INFO.
                     accumulated_info.extend(self.client.take_info_messages());
+                    accumulated_cp_loss |= self.client.take_code_page_conversion_loss();
 
                     // ═══════════════════════════════════════════════════════════
                     // ROLLBACK TRANSACTION: Rollback on batch failure
@@ -1178,6 +1190,8 @@ impl<'a> BulkCopy<'a> {
                     let _ = self.client.take_info_messages();
                     self.client
                         .extend_info_messages(std::mem::take(&mut accumulated_info));
+                    self.client
+                        .set_code_page_conversion_loss(accumulated_cp_loss);
 
                     return Err(e);
                 }
@@ -1209,6 +1223,11 @@ impl<'a> BulkCopy<'a> {
         // buffer left by the final internal commit first, so only bulk-load INFO remains.
         let _ = self.client.take_info_messages();
         self.client.extend_info_messages(accumulated_info);
+        // Same restore for the substitution verdict: the caller reads it once for
+        // the whole `write_to_server`, so it must be true if *any* batch
+        // substituted, not just the last.
+        self.client
+            .set_code_page_conversion_loss(accumulated_cp_loss);
 
         Ok(())
     }
@@ -1343,6 +1362,47 @@ mod tests {
         assert!(!opts.table_lock);
         assert!(!opts.use_internal_transaction); // Matches .NET default
         assert_eq!(opts.notification_interval, 0);
+    }
+
+    /// `write_to_server` runs one `execute_bulk_load_streaming_zerocopy` per
+    /// batch, and that call *assigns* the substitution verdict for its own
+    /// message. Draining it per batch and restoring the accumulated result is
+    /// what stops a later clean batch from erasing an earlier batch's
+    /// substitution — the exact shape `accumulated_info` already solves for INFO
+    /// (AB#47598).
+    ///
+    /// Pins that sequence rather than the loop itself, which needs a live
+    /// server: the ordering here is the whole of the fix, and asserting it
+    /// catches a regression to plain assignment.
+    #[tokio::test]
+    async fn multi_batch_bulk_copy_accumulates_the_code_page_loss_verdict() {
+        use crate::test_client_support::{done_no_more, tds_client_from_tokens};
+
+        let mut client = tds_client_from_tokens(vec![done_no_more()]);
+        let mut accumulated_cp_loss = false;
+
+        // Batch 1 substitutes.
+        client.note_code_page_conversion_loss();
+        accumulated_cp_loss |= client.take_code_page_conversion_loss();
+        assert!(accumulated_cp_loss);
+
+        // Batch 2 is clean. Its own assignment leaves the client false, which is
+        // precisely what would have lost the first batch's verdict.
+        accumulated_cp_loss |= client.take_code_page_conversion_loss();
+        assert!(
+            !client.take_code_page_conversion_loss(),
+            "the per-batch flag is drained, so nothing carries over implicitly"
+        );
+
+        client.set_code_page_conversion_loss(accumulated_cp_loss);
+        assert!(
+            client.take_code_page_conversion_loss(),
+            "a substitution in any batch must be visible for the whole operation"
+        );
+        assert!(
+            !client.take_code_page_conversion_loss(),
+            "the restored verdict is still drained by a single take"
+        );
     }
 
     #[test]

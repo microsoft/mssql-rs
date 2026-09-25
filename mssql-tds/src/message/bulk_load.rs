@@ -1557,4 +1557,52 @@ mod ae_colmetadata_tests {
             "expected an out-of-bounds error, got: {err}"
         );
     }
+
+    /// A bulk row goes through the same `TdsValueSerializer` as an RPC
+    /// parameter, so a narrow value carrying a character the target collation's
+    /// code page cannot hold is substituted with `?` here too, and the message
+    /// must record it — `TdsClient::take_code_page_conversion_loss` promises a
+    /// bulk substitution is reported, and this accessor is how the client
+    /// learns of it (AB#47598).
+    ///
+    /// Read before `end()`, which consumes the writer; `end()` writes only the
+    /// DONE token, so nothing can be substituted after that point.
+    #[tokio::test]
+    async fn bulk_row_reports_a_code_page_substitution() {
+        // Windows-1252 via LCID 0x0409: U+65E5 has no representation.
+        let latin1 = SqlCollation {
+            info: 0x0409,
+            lcid_language_id: 0,
+            col_flags: 0,
+            sort_id: 0,
+        };
+        let column =
+            BulkCopyColumnMetadata::new("v", SqlDbType::VarChar, TdsDataType::BigVarChar as u8)
+                .with_length(8, TypeLength::Variable(8))
+                .with_collation(latin1);
+
+        for (text, expected_loss) in [("caf\u{e9}", false), ("caf\u{65e5}", true)] {
+            let mut net = CapturingWriter { buffer: Vec::new() };
+            let mut packet_writer = PacketWriter::new(PacketType::BulkLoad, &mut net, None, None);
+            let mut writer = StreamingBulkLoadWriter::new(
+                &mut packet_writer,
+                "T".to_string(),
+                vec![column.clone()],
+                latin1,
+            );
+            writer.begin().await.unwrap();
+
+            let value = ColumnValues::String(crate::datatypes::sql_string::SqlString::new(
+                text.as_bytes().to_vec(),
+                crate::datatypes::sql_string::EncodingType::Utf8,
+            ));
+            writer.write_column_value(0, &value).await.unwrap();
+
+            assert_eq!(
+                writer.code_page_conversion_loss(),
+                expected_loss,
+                "text {text:?}"
+            );
+        }
+    }
 }
