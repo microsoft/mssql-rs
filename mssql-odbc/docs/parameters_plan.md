@@ -97,7 +97,10 @@ transparent reconnects.
 - **Data-at-execution streaming** - `SQLParamData` / `SQLPutData` stream
   `SQL_C_CHAR`, `SQL_C_WCHAR`, and `SQL_C_BINARY` as PLP
   `(n)varchar(max)` / `varbinary(max)`, matching msodbcsql sequencing.
-  Same-family pairings always stream. A C-type/SQL-type wideness mismatch
+  Streaming is chosen by the SQL type identifier: the variable-length
+  character and binary identifiers are PLP-framed, while fixed-length
+  `CHAR`, `WCHAR` and `BINARY` accumulate and convert at close.
+  A C-type/SQL-type wideness mismatch
   within the character family (e.g. `SQL_C_WCHAR` against a narrow SQL type)
   is buffered and transcoded once at `SQLParamData` close via the
   connection's collation rather than rejected - msodbcsql accepts the same
