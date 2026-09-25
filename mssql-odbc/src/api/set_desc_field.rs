@@ -25,16 +25,17 @@ use std::mem::size_of;
 use tracing::{debug, error};
 
 use crate::api::odbc_types::{
-    SQL_C_NUMERIC, SQL_CODE_DATE, SQL_CODE_TIME, SQL_CODE_TIMESTAMP, SQL_DATETIME, SQL_DECIMAL,
-    SQL_DESC_ARRAY_SIZE, SQL_DESC_ARRAY_STATUS_PTR, SQL_DESC_BIND_OFFSET_PTR, SQL_DESC_BIND_TYPE,
-    SQL_DESC_CONCISE_TYPE, SQL_DESC_COUNT, SQL_DESC_DATA_PTR, SQL_DESC_DATETIME_INTERVAL_CODE,
-    SQL_DESC_INDICATOR_PTR, SQL_DESC_LENGTH, SQL_DESC_NAME, SQL_DESC_OCTET_LENGTH,
-    SQL_DESC_OCTET_LENGTH_PTR, SQL_DESC_PARAMETER_TYPE, SQL_DESC_PRECISION,
-    SQL_DESC_ROWS_PROCESSED_PTR, SQL_DESC_SCALE, SQL_DESC_TYPE, SQL_DESC_UNNAMED, SQL_ERROR,
-    SQL_INVALID_HANDLE, SQL_NTS, SQL_PARAM_INPUT, SQL_PARAM_INPUT_OUTPUT, SQL_PARAM_OUTPUT,
-    SQL_PREC_NUMERIC, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SQL_TYPE_DATE, SQL_TYPE_TIME,
-    SQL_TYPE_TIMESTAMP, SQL_UNNAMED, SqlHandle, SqlInteger, SqlLen, SqlPointer, SqlReturn,
-    SqlSmallInt, SqlULen, SqlUSmallInt, SqlWChar,
+    SQL_C_NUMERIC, SQL_CA_SS_UDT_ASSEMBLY_TYPE_NAME, SQL_CA_SS_UDT_CATALOG_NAME,
+    SQL_CA_SS_UDT_SCHEMA_NAME, SQL_CA_SS_UDT_TYPE_NAME, SQL_CODE_DATE, SQL_CODE_TIME,
+    SQL_CODE_TIMESTAMP, SQL_DATETIME, SQL_DECIMAL, SQL_DESC_ARRAY_SIZE, SQL_DESC_ARRAY_STATUS_PTR,
+    SQL_DESC_BIND_OFFSET_PTR, SQL_DESC_BIND_TYPE, SQL_DESC_CONCISE_TYPE, SQL_DESC_COUNT,
+    SQL_DESC_DATA_PTR, SQL_DESC_DATETIME_INTERVAL_CODE, SQL_DESC_INDICATOR_PTR, SQL_DESC_LENGTH,
+    SQL_DESC_NAME, SQL_DESC_OCTET_LENGTH, SQL_DESC_OCTET_LENGTH_PTR, SQL_DESC_PARAMETER_TYPE,
+    SQL_DESC_PRECISION, SQL_DESC_ROWS_PROCESSED_PTR, SQL_DESC_SCALE, SQL_DESC_TYPE,
+    SQL_DESC_UNNAMED, SQL_ERROR, SQL_INVALID_HANDLE, SQL_NTS, SQL_PARAM_INPUT,
+    SQL_PARAM_INPUT_OUTPUT, SQL_PARAM_OUTPUT, SQL_PREC_NUMERIC, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO,
+    SQL_TYPE_DATE, SQL_TYPE_TIME, SQL_TYPE_TIMESTAMP, SQL_UNNAMED, SqlHandle, SqlInteger, SqlLen,
+    SqlPointer, SqlReturn, SqlSmallInt, SqlULen, SqlUSmallInt, SqlWChar,
 };
 use crate::api::sqlstate::{
     ERR_CANNOT_MODIFY_IRD, ERR_INCONSISTENT_DESCRIPTOR_INFO, ERR_INVALID_ATTRIBUTE_VALUE,
@@ -333,6 +334,12 @@ fn set_record_field(
         SQL_DESC_PRECISION => set_precision(state, record_number, value_ptr),
         SQL_DESC_SCALE => set_scale(state, kind, record_number, value_ptr),
         SQL_DESC_NAME => set_name(state, record_number, value_ptr, buffer_length),
+        SQL_CA_SS_UDT_CATALOG_NAME
+        | SQL_CA_SS_UDT_SCHEMA_NAME
+        | SQL_CA_SS_UDT_TYPE_NAME
+        | SQL_CA_SS_UDT_ASSEMBLY_TYPE_NAME => {
+            set_udt_name(state, field, record_number, value_ptr, buffer_length)
+        }
         SQL_DESC_UNNAMED => set_unnamed(state, record_number, value_ptr),
         SQL_DESC_PARAMETER_TYPE => set_parameter_type(state, record_number, value_ptr),
         SQL_DESC_DATA_PTR => set_data_ptr(state, record_number, value_ptr),
@@ -644,35 +651,75 @@ fn set_name(
     value_ptr: SqlPointer,
     buffer_length: SqlInteger,
 ) -> SqlReturn {
-    // Unlike a connection string or catalog wildcard, a null buffer has no
-    // valid meaning for SQL_DESC_NAME — reject it before it ever reaches
-    // `read_utf16` (an `unsafe fn` that dereferences the pointer
-    // unconditionally). A null `Value` here is genuine application input,
-    // not something the Driver Manager filters out: verified against this
-    // exact call sequence, an unchecked null crashes the process with a
-    // non-unwinding access-violation abort that `ffi_entry!`'s
-    // `catch_unwind` cannot intercept.
-    if value_ptr.is_null() {
-        error!("SQLSetDescFieldW: SQL_DESC_NAME value_ptr is null");
-        post_diag(state, ERR_INVALID_NULL_POINTER);
+    let Some(name) = read_descriptor_string(state, value_ptr, buffer_length) else {
         return SQL_ERROR;
+    };
+    write_record_field(state, record_number, |r| r.name = name)
+}
+
+/// Reads a character descriptor field's value. `buffer_length` is in bytes, or
+/// `SQL_NTS` for NUL-terminated input, matching ODBC's general character-input
+/// rule. `None` means a diagnostic has already been posted.
+fn read_descriptor_string(
+    state: &mut DescState,
+    value_ptr: SqlPointer,
+    buffer_length: SqlInteger,
+) -> Option<String> {
+    // Unlike a connection string or catalog wildcard, a null buffer has no
+    // valid meaning here — reject it before it ever reaches `read_utf16` (an
+    // `unsafe fn` that dereferences the pointer unconditionally). A null
+    // `Value` is genuine application input, not something the Driver Manager
+    // filters out: verified against this exact call sequence, an unchecked
+    // null crashes the process with a non-unwinding access-violation abort
+    // that `ffi_entry!`'s `catch_unwind` cannot intercept.
+    if value_ptr.is_null() {
+        error!("SQLSetDescFieldW: character descriptor field value_ptr is null");
+        post_diag(state, ERR_INVALID_NULL_POINTER);
+        return None;
     }
 
     let ptr = value_ptr as *const SqlWChar;
-    let name = if buffer_length == SqlInteger::from(SQL_NTS) {
-        unsafe { read_utf16(ptr, SQL_NTS) }
-    } else {
-        let Ok(byte_len) = usize::try_from(buffer_length) else {
-            post_diag(state, ERR_INVALID_STRING_OR_BUFFER_LENGTH);
-            return SQL_ERROR;
-        };
-        let Ok(char_len) = SqlSmallInt::try_from(byte_len / size_of::<SqlWChar>()) else {
-            post_diag(state, ERR_INVALID_STRING_OR_BUFFER_LENGTH);
-            return SQL_ERROR;
-        };
-        unsafe { read_utf16(ptr, char_len) }
+    if buffer_length == SqlInteger::from(SQL_NTS) {
+        return Some(unsafe { read_utf16(ptr, SQL_NTS) });
+    }
+    let Ok(byte_len) = usize::try_from(buffer_length) else {
+        post_diag(state, ERR_INVALID_STRING_OR_BUFFER_LENGTH);
+        return None;
     };
-    write_record_field(state, record_number, |r| r.name = name)
+    let Ok(char_len) = SqlSmallInt::try_from(byte_len / size_of::<SqlWChar>()) else {
+        post_diag(state, ERR_INVALID_STRING_OR_BUFFER_LENGTH);
+        return None;
+    };
+    Some(unsafe { read_utf16(ptr, char_len) })
+}
+
+/// A `SQL_CA_SS_UDT_*` name write (IPD only). Reads the string under the same
+/// rules as [`set_name`], then stores it in the record's boxed UDT identity.
+///
+/// Only the type name is required on the wire; an application that leaves the
+/// catalog and schema unset lets the server resolve the type against the
+/// current database and default schema.
+fn set_udt_name(
+    state: &mut DescState,
+    field: SqlUSmallInt,
+    record_number: SqlSmallInt,
+    value_ptr: SqlPointer,
+    buffer_length: SqlInteger,
+) -> SqlReturn {
+    let Some(value) = read_descriptor_string(state, value_ptr, buffer_length) else {
+        return SQL_ERROR;
+    };
+    write_record_field(state, record_number, |r| {
+        let names = r.udt_names.get_or_insert_with(Default::default);
+        match field {
+            SQL_CA_SS_UDT_CATALOG_NAME => names.catalog = value,
+            SQL_CA_SS_UDT_SCHEMA_NAME => names.schema = value,
+            SQL_CA_SS_UDT_TYPE_NAME => names.type_name = value,
+            SQL_CA_SS_UDT_ASSEMBLY_TYPE_NAME => names.assembly_type_name = value,
+            // `set_record_field` routes only the four fields above here.
+            _ => debug_assert!(false, "unexpected UDT name field {field}"),
+        }
+    })
 }
 
 /// `SQL_DESC_UNNAMED` write (IPD only — `classify_field` marks it read-only
@@ -812,6 +859,52 @@ mod tests {
         let ret =
             unsafe { sql_set_desc_field_w(SQL_NULL_HANDLE, 1, SQL_DESC_TYPE, ptr::null_mut(), 0) };
         assert_eq!(ret, SQL_INVALID_HANDLE);
+    }
+
+    /// A descriptor field this driver accepts on `SQLSetDescField` must also
+    /// read back through `SQLGetDescField`: `classify_field` gates both, so a
+    /// field added to one side only leaves `record_field_value` out of sync
+    /// and trips its `debug_assert`. msodbcsql returns all of these from its
+    /// own getter (`sqlcdesc.cpp:7337-7361`).
+    #[test]
+    fn udt_name_fields_round_trip_through_get_desc_field() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let ipd = h.ipd();
+        for (field, expected) in [
+            (SQL_CA_SS_UDT_CATALOG_NAME, "mydb"),
+            (SQL_CA_SS_UDT_SCHEMA_NAME, "dbo"),
+            (SQL_CA_SS_UDT_TYPE_NAME, "Point"),
+            (SQL_CA_SS_UDT_ASSEMBLY_TYPE_NAME, "MyAsm, Version=1.0.0.0"),
+        ] {
+            let field = field as SqlSmallInt;
+            let mut value: Vec<u16> = expected.encode_utf16().chain(std::iter::once(0)).collect();
+            let ret = unsafe {
+                sql_set_desc_field_w(
+                    ipd,
+                    1,
+                    field,
+                    value.as_mut_ptr() as SqlPointer,
+                    SqlInteger::from(SQL_NTS),
+                )
+            };
+            assert_eq!(ret, SQL_SUCCESS, "SET failed for field {field}");
+
+            let mut buf = [0u16; 64];
+            let mut text_len: SqlInteger = 0;
+            let ret = unsafe {
+                sql_get_desc_field_w(
+                    ipd,
+                    1,
+                    field,
+                    buf.as_mut_ptr() as SqlPointer,
+                    (buf.len() * size_of::<u16>()) as SqlInteger,
+                    &mut text_len,
+                )
+            };
+            assert_eq!(ret, SQL_SUCCESS, "GET failed for field {field}");
+            let chars = text_len as usize / size_of::<u16>();
+            assert_eq!(String::from_utf16_lossy(&buf[..chars]), expected);
+        }
     }
 
     /// The exact sequence `mssql-python`'s `ddbc_bindings.cpp` runs for a

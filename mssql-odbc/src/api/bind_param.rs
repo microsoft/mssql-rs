@@ -504,7 +504,7 @@ mod tests {
 
     /// Every parameter position on `h`'s implicit APD/IPD, in ordinal order —
     /// the same view `snapshot_bound_params` derives fresh before an execute.
-    fn bound_params(h: &TestHandles) -> Vec<Option<BoundParam>> {
+    fn bound_params(h: &TestHandles) -> Vec<Option<crate::params::ParamSnapshot>> {
         let apd = unsafe { handle_from_raw::<DescHandle>(h.apd()) };
         let ipd = unsafe { handle_from_raw::<DescHandle>(h.ipd()) };
         let apd_state = apd.inner.lock().unwrap();
@@ -876,17 +876,78 @@ mod tests {
             )
         };
         assert_eq!(ret, SQL_SUCCESS);
-        let bound = bound_params(&h)[0].expect("parameter 1 should be bound");
-        assert_eq!(bound.c_type, SQL_C_CHAR);
+        let binding = bound_params(&h);
+        let bound = binding[0].as_ref().expect("parameter 1 should be bound");
+        assert_eq!(bound.param.c_type, SQL_C_CHAR);
     }
 
     #[test]
     fn default_c_type_resolved_but_unconvertible_returns_hyc00() {
-        // `SQL_SS_UDT` needs the fully qualified server type name, which
-        // `SQLDescribeParam` does not report and the driver cannot otherwise
-        // obtain, so a defaulted bind of it is still rejected up front.
+        // `SQL_SS_TABLE` resolves to `SQL_C_BINARY` like a UDT does, but TVP
+        // binding is a separate feature with no row in the matrix, so a
+        // defaulted bind of it is still rejected up front.
         let h = TestHandles::with_env_dbc_stmt();
         let mut ind: SqlLen = 0;
+        let ret = unsafe {
+            sql_bind_parameter(
+                h.stmt,
+                1,
+                SQL_PARAM_INPUT,
+                SQL_C_DEFAULT,
+                crate::api::odbc_types::SQL_SS_TABLE,
+                0,
+                0,
+                std::ptr::null_mut(),
+                0,
+                &mut ind,
+            )
+        };
+        assert_eq!(ret, SQL_ERROR);
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(state.diag_records[0].sql_state, SQLSTATE_HYC00);
+    }
+
+    /// Binding a UDT with a scalar C type is illegal, not merely unbuilt:
+    /// msodbcsql's `fValidConversion` gives `SQL_UDT_MAPPED` only the three
+    /// buffer C types, and its own regression (`TCLargeUDT.cpp`,
+    /// `negative_variation_1`) asserts `07006`.
+    ///
+    /// This driver answers `HYC00` because the conversion matrix is still an
+    /// implementation-progress list rather than a legality table; flipping the
+    /// two apart is P9f (AB#48249). Pinned here so the divergence is visible
+    /// and disappears deliberately rather than by accident.
+    #[test]
+    fn a_scalar_c_type_against_udt_is_rejected_at_bind() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let mut value: i32 = 7;
+        let mut ind: SqlLen = 4;
+        let ret = unsafe {
+            sql_bind_parameter(
+                h.stmt,
+                1,
+                SQL_PARAM_INPUT,
+                crate::api::odbc_types::SQL_C_SLONG,
+                SQL_SS_UDT,
+                0,
+                0,
+                (&raw mut value).cast(),
+                0,
+                &mut ind,
+            )
+        };
+        assert_eq!(ret, SQL_ERROR);
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(state.diag_records[0].sql_state, SQLSTATE_HYC00);
+    }
+
+    /// A defaulted UDT bind resolves to `SQL_C_BINARY` and is accepted: the
+    /// type name it still needs is supplied through the IPD, not here.
+    #[test]
+    fn default_c_type_udt_is_accepted_at_bind() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let mut ind: SqlLen = SQL_NULL_DATA;
         let ret = unsafe {
             sql_bind_parameter(
                 h.stmt,
@@ -901,10 +962,10 @@ mod tests {
                 &mut ind,
             )
         };
-        assert_eq!(ret, SQL_ERROR);
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
-        let state = stmt.inner.lock().unwrap();
-        assert_eq!(state.diag_records[0].sql_state, SQLSTATE_HYC00);
+        assert_eq!(ret, SQL_SUCCESS);
+        let binding = bound_params(&h);
+        let bound = binding[0].as_ref().expect("parameter 1 should be bound");
+        assert_eq!(bound.param.c_type, crate::api::odbc_types::SQL_C_BINARY);
     }
 
     #[test]
@@ -926,9 +987,11 @@ mod tests {
             )
         };
         assert_eq!(ret, SQL_SUCCESS);
-        let bound = bound_params(&h)[0].expect("parameter 1 should be bound");
-        assert_eq!(bound.c_type, crate::api::odbc_types::SQL_C_GUID);
-        assert_eq!(bound.sql_type, SQL_GUID);
+        let bound = bound_params(&h)[0]
+            .clone()
+            .expect("parameter 1 should be bound");
+        assert_eq!(bound.param.c_type, crate::api::odbc_types::SQL_C_GUID);
+        assert_eq!(bound.param.sql_type, SQL_GUID);
     }
 
     /// ODBC gives some non-character SQL types a character default C type. The
@@ -989,8 +1052,10 @@ mod tests {
             };
             if is_supported_conversion(default_c, sql_type) {
                 assert_eq!(ret, SQL_SUCCESS, "sql_type {sql_type}");
-                let bound = bound_params(&h)[0].expect("parameter 1 should be bound");
-                assert_eq!(bound.c_type, default_c, "sql_type {sql_type}");
+                let bound = bound_params(&h)[0]
+                    .clone()
+                    .expect("parameter 1 should be bound");
+                assert_eq!(bound.param.c_type, default_c, "sql_type {sql_type}");
             } else {
                 assert_eq!(ret, SQL_ERROR, "sql_type {sql_type}");
                 let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
@@ -1048,9 +1113,11 @@ mod tests {
             )
         };
         assert_eq!(ret, SQL_SUCCESS);
-        let bound = bound_params(&h)[0].expect("parameter 1 should be bound");
+        let bound = bound_params(&h)[0]
+            .clone()
+            .expect("parameter 1 should be bound");
         assert_eq!(
-            bound.c_type,
+            bound.param.c_type,
             crate::api::odbc_types::SQL_C_TYPE_TIMESTAMP,
             "the deprecated spelling must be stored canonically"
         );

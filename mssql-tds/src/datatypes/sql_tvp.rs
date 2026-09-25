@@ -422,7 +422,9 @@ pub(crate) async fn write_tvp_type_name(
 /// Writes a TDS B_VARCHAR: a `u8` UTF-16 character count followed by the
 /// UTF-16LE-encoded characters. `None` or an empty string writes a single
 /// `0x00` length byte.
-async fn write_b_varchar(
+///
+/// Shared with the UDT parameter header, which names its type in the same form.
+pub(crate) async fn write_b_varchar(
     packet_writer: &mut PacketWriter<'_>,
     value: Option<&str>,
 ) -> TdsResult<()> {
@@ -431,7 +433,7 @@ async fn write_b_varchar(
             let char_count = s.encode_utf16().count();
             if char_count > u8::MAX as usize {
                 return Err(Error::UsageError(format!(
-                    "TVP name part is too long: {char_count} UTF-16 code units (max 255)"
+                    "type name part is too long: {char_count} UTF-16 code units (max 255)"
                 )));
             }
             packet_writer.write_byte_async(char_count as u8).await?;

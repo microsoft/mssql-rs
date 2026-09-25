@@ -65,14 +65,15 @@ use std::sync::Mutex;
 
 use super::{DbcHandle, HandleType, HasObjectType, StmtHandle, handle_from_raw};
 use crate::api::odbc_types::{
-    SQL_C_DEFAULT, SQL_DESC_ALLOC_AUTO, SQL_DESC_ALLOC_TYPE, SQL_DESC_ALLOC_USER,
-    SQL_DESC_ARRAY_SIZE, SQL_DESC_ARRAY_STATUS_PTR, SQL_DESC_BIND_OFFSET_PTR, SQL_DESC_BIND_TYPE,
-    SQL_DESC_CONCISE_TYPE, SQL_DESC_COUNT, SQL_DESC_DATA_PTR, SQL_DESC_DATETIME_INTERVAL_CODE,
-    SQL_DESC_INDICATOR_PTR, SQL_DESC_LENGTH, SQL_DESC_NAME, SQL_DESC_NULLABLE,
-    SQL_DESC_OCTET_LENGTH, SQL_DESC_OCTET_LENGTH_PTR, SQL_DESC_PARAMETER_TYPE, SQL_DESC_PRECISION,
-    SQL_DESC_ROWS_PROCESSED_PTR, SQL_DESC_SCALE, SQL_DESC_TYPE, SQL_DESC_UNNAMED, SQL_ERROR,
-    SQL_NULLABLE, SQL_PARAM_INPUT, SQL_ROWSET_SIZE_DEFAULT, SqlInteger, SqlLen, SqlPointer,
-    SqlReturn, SqlSmallInt, SqlULen, SqlUSmallInt,
+    SQL_C_DEFAULT, SQL_CA_SS_UDT_ASSEMBLY_TYPE_NAME, SQL_CA_SS_UDT_CATALOG_NAME,
+    SQL_CA_SS_UDT_SCHEMA_NAME, SQL_CA_SS_UDT_TYPE_NAME, SQL_DESC_ALLOC_AUTO, SQL_DESC_ALLOC_TYPE,
+    SQL_DESC_ALLOC_USER, SQL_DESC_ARRAY_SIZE, SQL_DESC_ARRAY_STATUS_PTR, SQL_DESC_BIND_OFFSET_PTR,
+    SQL_DESC_BIND_TYPE, SQL_DESC_CONCISE_TYPE, SQL_DESC_COUNT, SQL_DESC_DATA_PTR,
+    SQL_DESC_DATETIME_INTERVAL_CODE, SQL_DESC_INDICATOR_PTR, SQL_DESC_LENGTH, SQL_DESC_NAME,
+    SQL_DESC_NULLABLE, SQL_DESC_OCTET_LENGTH, SQL_DESC_OCTET_LENGTH_PTR, SQL_DESC_PARAMETER_TYPE,
+    SQL_DESC_PRECISION, SQL_DESC_ROWS_PROCESSED_PTR, SQL_DESC_SCALE, SQL_DESC_TYPE,
+    SQL_DESC_UNNAMED, SQL_ERROR, SQL_NULLABLE, SQL_PARAM_INPUT, SQL_ROWSET_SIZE_DEFAULT,
+    SqlInteger, SqlLen, SqlPointer, SqlReturn, SqlSmallInt, SqlULen, SqlUSmallInt,
 };
 use crate::api::sqlstate::SQLSTATE_HY000;
 use crate::error::{DiagRecord, HasDiagnostics, free_errors, post_sql_error};
@@ -262,6 +263,27 @@ pub(crate) struct DescRecord {
     /// bind — `concise_type != 0` alone can't tell the two apart, since
     /// `refine_ipd`'s own write leaves it non-zero too.
     pub(crate) explicitly_bound: bool,
+    /// `SQL_CA_SS_UDT_CATALOG_NAME` / `SQL_CA_SS_UDT_SCHEMA_NAME` /
+    /// `SQL_CA_SS_UDT_TYPE_NAME`. IPD only, and only for a `SQL_SS_UDT`
+    /// parameter, so it is boxed rather than costing three strings on every
+    /// record of every descriptor.
+    pub(crate) udt_names: Option<Box<UdtNames>>,
+}
+
+/// The server-side identity an application supplies for a UDT parameter.
+///
+/// Only the type name is required; SQL Server resolves an unqualified name
+/// against the current database and default schema. `assembly_type_name` is
+/// stored and echoed back but never sent: the parameter `TYPE_INFO` has no
+/// field for it (`CRPCPolicy::WriteUDTHeader` writes three name parts), unlike
+/// the `UDT_INFO` in `COLMETADATA`. msodbcsql keeps it the same way
+/// (`sqlcdesc.cpp:4954` stores it; no RPC writer reads it).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct UdtNames {
+    pub(crate) catalog: String,
+    pub(crate) schema: String,
+    pub(crate) type_name: String,
+    pub(crate) assembly_type_name: String,
 }
 
 /// SQL-side inputs to the prepared declaration, compared only during IPD writes.
@@ -336,6 +358,7 @@ impl DescRecord {
             data_bound: false,
             precision_scale_explicit: false,
             explicitly_bound: false,
+            udt_names: None,
         }
     }
 
@@ -632,6 +655,21 @@ pub(crate) fn classify_field(kind: DescKind, field: SqlUSmallInt) -> Option<Fiel
         // matching SQL_DESC_NAME's own IRD/IPD split above.
         SQL_DESC_UNNAMED if is_ird || is_ipd => (Record, is_ipd),
         SQL_DESC_PARAMETER_TYPE if is_ipd => (Record, true),
+        // The UDT identity an application supplies for a `SQL_SS_UDT`
+        // parameter. IPD-only and writable: this is the driver's only source
+        // for the type name today, since `refine_ipd` does not yet read the
+        // server's `suggested_user_type_*` columns (AB#48248). The
+        // assembly-qualified name is accepted and echoed but never sent - the
+        // parameter header has no field for it, and msodbcsql stores it
+        // without writing it either.
+        SQL_CA_SS_UDT_CATALOG_NAME
+        | SQL_CA_SS_UDT_SCHEMA_NAME
+        | SQL_CA_SS_UDT_TYPE_NAME
+        | SQL_CA_SS_UDT_ASSEMBLY_TYPE_NAME
+            if is_ipd =>
+        {
+            (Record, true)
+        }
 
         _ => return None,
     };
@@ -813,6 +851,27 @@ mod tests {
                 .unwrap()
                 .writable
         );
+    }
+
+    /// The UDT identity is supplied by the application on the IPD; every other
+    /// descriptor kind has no use for it. All four parts are writable, matching
+    /// msodbcsql (`sqlcdesc.cpp:4891-4957`), even though only the first three
+    /// reach the wire.
+    #[test]
+    fn udt_name_fields_are_writable_on_ipd_only() {
+        for field in [
+            SQL_CA_SS_UDT_CATALOG_NAME,
+            SQL_CA_SS_UDT_SCHEMA_NAME,
+            SQL_CA_SS_UDT_TYPE_NAME,
+            SQL_CA_SS_UDT_ASSEMBLY_TYPE_NAME,
+        ] {
+            for kind in [DescKind::AppRow, DescKind::AppParam, DescKind::ImpRow] {
+                assert!(classify_field(kind, field).is_none(), "{kind:?} {field}");
+            }
+            let access = classify_field(DescKind::ImpParam, field).unwrap();
+            assert_eq!(access.scope, FieldScope::Record, "{field}");
+            assert!(access.writable, "{field}");
+        }
     }
 
     #[test]

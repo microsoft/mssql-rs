@@ -22,9 +22,9 @@ use crate::api::odbc_types::{
     SQL_C_DOUBLE, SQL_C_FLOAT, SQL_C_GUID, SQL_C_NUMERIC, SQL_C_SS_TIME2, SQL_C_SS_TIMESTAMPOFFSET,
     SQL_C_TYPE_DATE, SQL_C_TYPE_TIME, SQL_C_TYPE_TIMESTAMP, SQL_C_WCHAR, SQL_CHAR, SQL_DECIMAL,
     SQL_DOUBLE, SQL_FLOAT, SQL_GUID, SQL_INTEGER, SQL_LONGVARBINARY, SQL_LONGVARCHAR, SQL_NUMERIC,
-    SQL_REAL, SQL_SMALLINT, SQL_SS_TIME2, SQL_SS_TIMESTAMPOFFSET, SQL_SS_VARIANT, SQL_SS_XML,
-    SQL_TINYINT, SQL_TYPE_DATE, SQL_TYPE_TIME, SQL_TYPE_TIMESTAMP, SQL_VARBINARY, SQL_VARCHAR,
-    SQL_WCHAR, SQL_WLONGVARCHAR, SQL_WVARCHAR, SqlSmallInt,
+    SQL_REAL, SQL_SMALLINT, SQL_SS_TIME2, SQL_SS_TIMESTAMPOFFSET, SQL_SS_UDT, SQL_SS_VARIANT,
+    SQL_SS_XML, SQL_TINYINT, SQL_TYPE_DATE, SQL_TYPE_TIME, SQL_TYPE_TIMESTAMP, SQL_VARBINARY,
+    SQL_VARCHAR, SQL_WCHAR, SQL_WLONGVARCHAR, SQL_WVARCHAR, SqlSmallInt,
 };
 use crate::api::type_rules::is_integer_c_type;
 
@@ -58,6 +58,10 @@ const TEMPORAL_SQL_TARGETS: &[SqlSmallInt] = &[
 /// listed apart from `CHARACTER_SQL_TARGETS`.
 const CHARACTER_PAYLOAD_SQL_TARGETS: &[SqlSmallInt] = &[SQL_SS_XML];
 
+/// A CLR UDT takes its payload untouched from any of the three buffer-shaped C
+/// types, and its identity from the IPD's `SQL_CA_SS_UDT_*` fields.
+const UDT_SQL_TARGETS: &[SqlSmallInt] = &[SQL_SS_UDT];
+
 /// Whether the driver can convert a `c_type` application buffer into `sql_type`
 /// for an input parameter.
 ///
@@ -78,6 +82,7 @@ pub(crate) fn is_supported_conversion(c_type: SqlSmallInt, sql_type: SqlSmallInt
             TEMPORAL_SQL_TARGETS,
             CHARACTER_PAYLOAD_SQL_TARGETS,
             &[SQL_SS_VARIANT],
+            UDT_SQL_TARGETS,
         ],
         SQL_C_WCHAR => &[
             CHARACTER_SQL_TARGETS,
@@ -86,8 +91,9 @@ pub(crate) fn is_supported_conversion(c_type: SqlSmallInt, sql_type: SqlSmallInt
             TEMPORAL_SQL_TARGETS,
             CHARACTER_PAYLOAD_SQL_TARGETS,
             &[SQL_SS_VARIANT],
+            UDT_SQL_TARGETS,
         ],
-        SQL_C_BINARY => &[BINARY_SQL_TARGETS],
+        SQL_C_BINARY => &[BINARY_SQL_TARGETS, &[SQL_SS_VARIANT], UDT_SQL_TARGETS],
         SQL_C_BIT => &[&[SQL_BIT]],
         SQL_C_FLOAT | SQL_C_DOUBLE => &[&[SQL_REAL, SQL_FLOAT, SQL_DOUBLE]],
         SQL_C_GUID => &[&[SQL_GUID]],
@@ -135,9 +141,12 @@ mod tests {
         }
     }
 
+    /// `sql_variant` joins the binary targets because msodbcsql derives a
+    /// variant's inner type from the C type (`CTypeToSqlType`, `sqlcprot.h`),
+    /// which answers `varbinary` for `SQL_C_BINARY`.
     #[test]
-    fn binary_c_type_reaches_only_the_binary_sql_types() {
-        for sql_type in [SQL_BINARY, SQL_VARBINARY, SQL_LONGVARBINARY] {
+    fn binary_c_type_reaches_the_binary_sql_types_and_variant() {
+        for sql_type in [SQL_BINARY, SQL_VARBINARY, SQL_LONGVARBINARY, SQL_SS_VARIANT] {
             assert!(is_supported_conversion(SQL_C_BINARY, sql_type));
         }
         assert!(!is_supported_conversion(SQL_C_BINARY, SQL_VARCHAR));
@@ -299,7 +308,8 @@ mod tests {
         }
     }
 
-    /// Unrelated scalar and binary C types do not reach these payloads.
+    /// Unrelated scalar C types do not reach these payloads. `SQL_C_BINARY` is
+    /// asserted apart because it reaches `sql_variant` but none of the rest.
     #[test]
     fn unrelated_c_types_do_not_reach_decimal_xml_or_variant() {
         for c_type in [
@@ -308,7 +318,6 @@ mod tests {
             SQL_C_GUID,
             SQL_C_TYPE_TIMESTAMP,
             SQL_C_SLONG,
-            SQL_C_BINARY,
         ] {
             for sql_type in [SQL_DECIMAL, SQL_NUMERIC, SQL_SS_XML, SQL_SS_VARIANT] {
                 assert!(
@@ -317,10 +326,37 @@ mod tests {
                 );
             }
         }
+        for sql_type in [SQL_DECIMAL, SQL_NUMERIC, SQL_SS_XML] {
+            assert!(
+                !is_supported_conversion(SQL_C_BINARY, sql_type),
+                "SQL_C_BINARY -> {sql_type} should not be supported"
+            );
+        }
     }
 
-    /// Rows AB#47790 still owns. Pinned so adding one is a deliberate edit here
-    /// rather than a side effect of widening something else.
+    /// A UDT takes its payload untouched from any of the three buffer-shaped C
+    /// types. Nothing else reaches it: a scalar C type has no serialized form
+    /// the server could interpret as the UDT's own.
+    #[test]
+    fn only_the_buffer_c_types_reach_udt() {
+        for c_type in [SQL_C_CHAR, SQL_C_WCHAR, SQL_C_BINARY] {
+            assert!(is_supported_conversion(c_type, SQL_SS_UDT), "{c_type}");
+        }
+        for c_type in [
+            SQL_C_BIT,
+            SQL_C_DOUBLE,
+            SQL_C_GUID,
+            SQL_C_SLONG,
+            SQL_C_NUMERIC,
+            SQL_C_TYPE_TIMESTAMP,
+        ] {
+            assert!(!is_supported_conversion(c_type, SQL_SS_UDT), "{c_type}");
+        }
+    }
+
+    /// The rows still deferred: `vector` is P9g (AB#48326) and TVP is a feature
+    /// of its own. Pinned so adding one is a deliberate edit here rather than a
+    /// side effect of widening something else.
     #[test]
     fn the_deferred_sql_types_are_reached_by_nothing() {
         let c_types = [
@@ -334,7 +370,7 @@ mod tests {
             SQL_C_TYPE_TIMESTAMP,
         ];
         for c_type in c_types {
-            for sql_type in [SQL_SS_VECTOR, SQL_SS_UDT, SQL_SS_TABLE] {
+            for sql_type in [SQL_SS_VECTOR, SQL_SS_TABLE] {
                 assert!(
                     !is_supported_conversion(c_type, sql_type),
                     "{c_type} -> {sql_type} should not be supported"

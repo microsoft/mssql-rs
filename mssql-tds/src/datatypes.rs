@@ -23,6 +23,8 @@ pub mod sql_json;
 pub mod sql_string;
 /// Table-valued parameter (TVP) types for RPC calls.
 pub mod sql_tvp;
+/// CLR user-defined type (UDT) parameter support.
+pub mod sql_udt;
 /// SQL Server `vector` column type.
 pub mod sql_vector;
 /// Wire-level TDS data type identifiers.

@@ -39,7 +39,7 @@ use crate::handles::stmt::{
 use crate::handles::{
     DbcHandle, DescHandle, StmtHandle, handle_from_raw, process_is_shutting_down,
 };
-use crate::params::{BoundParam, ParamArrayLayoutError};
+use crate::params::{BoundParam, ParamArrayLayoutError, ParamSnapshot};
 
 /// Clears the in-flight `EXEC_STARTED` flag on an execution failure so the
 /// statement is reusable.
@@ -660,7 +660,7 @@ fn dae_expected_length(indicator: SqlLen) -> Option<usize> {
 /// failure, and reported a misleading `07002` for one with markers.
 pub(super) fn snapshot_bound_params(
     stmt: &StmtHandle,
-) -> Result<Vec<Option<BoundParam>>, SqlReturn> {
+) -> Result<Vec<Option<ParamSnapshot>>, SqlReturn> {
     // Read before the STMT lock below, matching bind_param.rs's own
     // parent-before-child lock ordering for the same lookup.
     let odbc_version = {
@@ -727,8 +727,8 @@ pub(super) unsafe fn build_positional_params(
     op: &str,
 ) -> Result<ParamsWithDae, SqlReturn> {
     let bind_offset = unsafe { stmt_state.inert_attrs.param_bind_offset() };
-    let bound: Vec<Option<BoundParam>> =
-        stmt_state.bound_params.iter().skip(skip).copied().collect();
+    let bound: Vec<Option<ParamSnapshot>> =
+        stmt_state.bound_params.iter().skip(skip).cloned().collect();
     match unsafe {
         build_named_params_for_row(
             &bound,
@@ -807,7 +807,7 @@ pub(super) unsafe fn build_named_params(
 /// Every pointer in `bound_params`, after applying `bind_offset` and the
 /// row-specific stride, must satisfy the original `SQLBindParameter` contract.
 pub(super) unsafe fn build_named_params_for_row(
-    bound_params: &[Option<BoundParam>],
+    bound_params: &[Option<ParamSnapshot>],
     marker_count: usize,
     bind_offset: isize,
     param_bind_type: crate::api::odbc_types::SqlULen,
@@ -820,10 +820,12 @@ pub(super) unsafe fn build_named_params_for_row(
     let mut dae_params = Vec::new();
     let mut fractional_truncated = false;
     for i in 0..marker_count {
-        let Some(Some(bound_param)) = bound_params.get(i) else {
+        let Some(Some(snapshot)) = bound_params.get(i) else {
             return Err(ParamRowBuildError::Unbound { parameter: i + 1 });
         };
-        let bound_param = bound_param
+        let udt_names = snapshot.udt_names.as_deref();
+        let bound_param = snapshot
+            .param
             .for_row(row, bind_offset, param_bind_type)
             .map_err(|ParamArrayLayoutError::InvalidValueStride { .. }| {
                 ParamRowBuildError::Layout { parameter: i + 1 }
@@ -854,6 +856,7 @@ pub(super) unsafe fn build_named_params_for_row(
                 plan,
                 length_limit,
                 bound_param,
+                snapshot.udt_names.clone(),
             ));
             // Nothing to declare for a buffered parameter yet: its bytes are
             // not in, so its type and length are not known. The slot is filled
@@ -903,12 +906,10 @@ pub(super) unsafe fn build_named_params_for_row(
             };
             params.push(rpc);
         } else {
-            let (param, outcome) =
-                unsafe { bound_param_to_rpc(name, &bound_param) }.map_err(|source| {
-                    ParamRowBuildError::Conversion {
-                        parameter: i + 1,
-                        source,
-                    }
+            let (param, outcome) = unsafe { bound_param_to_rpc(name, &bound_param, udt_names) }
+                .map_err(|source| ParamRowBuildError::Conversion {
+                    parameter: i + 1,
+                    source,
                 })?;
             if outcome == ConvOk::Truncated && dae_params.is_empty() {
                 fractional_truncated = true;
@@ -992,7 +993,13 @@ pub(super) fn rebuild_deferred_params(
             return Err(SQL_ERROR);
         };
         let name = parameter_name(*index);
-        match buffered_dae_to_rpc(name, &dae.binding, bytes, *is_null) {
+        match buffered_dae_to_rpc(
+            name,
+            &dae.binding,
+            dae.udt_names.as_deref(),
+            bytes,
+            *is_null,
+        ) {
             Ok((param, outcome)) => {
                 *slot = param;
                 fractional_truncated |= outcome == ConvOk::Truncated;
@@ -2257,6 +2264,12 @@ mod tests {
     }
 
     /// Builds a `BoundParam` over the given char buffer and NTS indicator.
+    /// `bound_params` holds the per-ordinal snapshot; these tests only ever
+    /// describe the binding half of it.
+    fn snap(param: BoundParam) -> Option<ParamSnapshot> {
+        Some(param.into())
+    }
+
     fn char_param(buf: &mut [u8], ind: &mut SqlLen) -> BoundParam {
         BoundParam {
             input_output_type: SQL_PARAM_INPUT,
@@ -2340,7 +2353,7 @@ mod tests {
             let mut param = char_param(&mut buffer, &mut indicator);
             param.input_output_type = direction;
             param.column_size = 8;
-            state.bound_params = vec![Some(param)];
+            state.bound_params = vec![snap(param)];
             let built = unsafe { build_named_params(&mut state, 1, "test") }.unwrap();
             assert!(built.dae_params.is_empty());
             assert_eq!(built.params.len(), 1);
@@ -2373,7 +2386,7 @@ mod tests {
                 let mut param = char_param(&mut buffer, &mut indicator);
                 param.input_output_type = direction;
                 param.sql_type = sql_type;
-                state.bound_params = vec![Some(param)];
+                state.bound_params = vec![snap(param)];
                 let built = unsafe { build_named_params(&mut state, 1, "test") }.unwrap();
                 assert_eq!(built.dae_params.len(), 1);
                 assert_eq!(built.dae_params[0].plan, plan);
@@ -2414,10 +2427,10 @@ mod tests {
         let mut state = stmt.inner.lock().unwrap();
         state
             .bound_params
-            .push(Some(char_param(&mut buf1, &mut ind1)));
+            .push(snap(char_param(&mut buf1, &mut ind1)));
         state
             .bound_params
-            .push(Some(char_param(&mut buf2, &mut ind2)));
+            .push(snap(char_param(&mut buf2, &mut ind2)));
 
         let built = unsafe { build_named_params(&mut state, 2, "test") }.unwrap();
         assert_eq!(built.params.len(), 2);
@@ -2449,7 +2462,7 @@ mod tests {
         let mut state = stmt.inner.lock().unwrap();
         state
             .bound_params
-            .push(Some(char_param(&mut buf, &mut ind)));
+            .push(snap(char_param(&mut buf, &mut ind)));
 
         let ret = unsafe { build_named_params(&mut state, 1, "test") };
         assert!(ret.is_err());
@@ -2475,8 +2488,8 @@ mod tests {
         let mut state = stmt.inner.lock().unwrap();
         state
             .bound_params
-            .push(Some(char_param(&mut first, &mut first_ind)));
-        state.bound_params.push(Some(BoundParam {
+            .push(snap(char_param(&mut first, &mut first_ind)));
+        state.bound_params.push(snap(BoundParam {
             input_output_type: SQL_PARAM_INPUT,
             c_type: SQL_C_CHAR,
             sql_type: SQL_VARCHAR,
@@ -2492,7 +2505,7 @@ mod tests {
         }));
         state
             .bound_params
-            .push(Some(char_param(&mut last, &mut last_ind)));
+            .push(snap(char_param(&mut last, &mut last_ind)));
 
         let dae = unsafe { build_named_params(&mut state, 3, "test") }.unwrap();
         assert_eq!(dae.params.len(), 3);
@@ -2524,7 +2537,7 @@ mod tests {
         let mut numeric_ind: SqlLen = std::mem::size_of::<SqlNumericStruct>() as SqlLen;
 
         let mut state = stmt.inner.lock().unwrap();
-        state.bound_params.push(Some(BoundParam {
+        state.bound_params.push(snap(BoundParam {
             input_output_type: SQL_PARAM_INPUT,
             c_type: SQL_C_CHAR,
             sql_type: SQL_VARCHAR,
@@ -2538,7 +2551,7 @@ mod tests {
             strlen_or_ind_ptr: &mut streamed_ind as *mut SqlLen,
             octet_length_ptr: &mut streamed_ind as *mut SqlLen,
         }));
-        state.bound_params.push(Some(BoundParam {
+        state.bound_params.push(snap(BoundParam {
             input_output_type: SQL_PARAM_INPUT,
             c_type: SQL_C_NUMERIC,
             sql_type: SQL_DECIMAL,
@@ -2693,7 +2706,7 @@ mod tests {
         let mut ind: SqlLen = sql_len_data_at_exec(7);
 
         let mut state = stmt.inner.lock().unwrap();
-        state.bound_params.push(Some(BoundParam {
+        state.bound_params.push(snap(BoundParam {
             input_output_type: SQL_PARAM_INPUT,
             c_type: SQL_C_CHAR,
             sql_type: SQL_VARCHAR,
@@ -2740,7 +2753,7 @@ mod tests {
 
             let mut ind: SqlLen = SQL_DATA_AT_EXEC;
             let mut state = stmt.inner.lock().unwrap();
-            state.bound_params.push(Some(BoundParam {
+            state.bound_params.push(snap(BoundParam {
                 input_output_type: SQL_PARAM_INPUT,
                 c_type,
                 sql_type,
@@ -2781,7 +2794,7 @@ mod tests {
 
         let mut buf: Vec<u8> = b"abc".to_vec();
         let mut state = stmt.inner.lock().unwrap();
-        state.bound_params.push(Some(BoundParam {
+        state.bound_params.push(snap(BoundParam {
             input_output_type: SQL_PARAM_INPUT,
             c_type: SQL_C_CHAR,
             sql_type: SQL_VARCHAR,
@@ -2813,7 +2826,7 @@ mod tests {
         let mut ind: SqlLen = SQL_DATA_AT_EXEC;
 
         let mut state = stmt.inner.lock().unwrap();
-        state.bound_params.push(Some(BoundParam {
+        state.bound_params.push(snap(BoundParam {
             input_output_type: SQL_PARAM_INPUT,
             c_type: SQL_C_LONG,
             sql_type: SQL_INTEGER,
@@ -2864,7 +2877,7 @@ mod tests {
         state
             .inert_attrs
             .set(SQL_ATTR_PARAM_BIND_OFFSET_PTR, &raw mut offset as SqlULen);
-        state.bound_params.push(Some(BoundParam {
+        state.bound_params.push(snap(BoundParam {
             input_output_type: SQL_PARAM_INPUT,
             c_type: SQL_C_LONG,
             sql_type: SQL_INTEGER,
@@ -2915,7 +2928,7 @@ mod tests {
         state
             .inert_attrs
             .set(SQL_ATTR_PARAM_BIND_OFFSET_PTR, &raw mut offset as SqlULen);
-        state.bound_params.push(Some(BoundParam {
+        state.bound_params.push(snap(BoundParam {
             input_output_type: SQL_PARAM_INPUT,
             c_type: SQL_C_CHAR,
             sql_type: SQL_VARCHAR,
@@ -2951,7 +2964,7 @@ mod tests {
         let mut inds: [SqlLen; 2] = [4, SQL_DATA_AT_EXEC];
 
         let mut state = stmt.inner.lock().unwrap();
-        state.bound_params.push(Some(BoundParam {
+        state.bound_params.push(snap(BoundParam {
             input_output_type: SQL_PARAM_INPUT,
             c_type: SQL_C_LONG,
             sql_type: SQL_INTEGER,

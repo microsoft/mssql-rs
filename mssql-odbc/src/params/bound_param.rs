@@ -11,7 +11,7 @@ use crate::api::set_desc_field::datetime_interval_code_for;
 use crate::api::type_rules::{parameter_size_is_precision, resolve_default_c_type};
 use crate::conversion::parameter_value_stride;
 use crate::handles::OdbcVersion;
-use crate::handles::desc::{DescRecord, DescState};
+use crate::handles::desc::{DescRecord, DescState, UdtNames};
 
 /// A bound parameter — the lightweight equivalent of msodbcsql's implicit
 /// APD + IPD records (`cmdp.APD`), populated by `SQLBindParameter`.
@@ -65,6 +65,30 @@ pub(crate) struct BoundParam {
     /// can set them independently. Null means "assume NUL-terminated" for a
     /// character parameter.
     pub(crate) octet_length_ptr: *mut SqlLen,
+}
+
+/// One parameter ordinal's execute-time snapshot: the POD binding plus the
+/// UDT identity from the IPD's `SQL_CA_SS_UDT_*` fields.
+///
+/// The name is kept out of [`BoundParam`] deliberately. It varies per ordinal
+/// but not per row, whereas [`BoundParam::for_row`] runs once per parameter
+/// per row; holding an owned name inside it would both cost `BoundParam` its
+/// `Copy` and re-allocate the same three strings for every row of a parameter
+/// array.
+#[derive(Debug, Clone)]
+pub(crate) struct ParamSnapshot {
+    pub(crate) param: BoundParam,
+    /// `None` for every parameter that is not a `SQL_SS_UDT`.
+    pub(crate) udt_names: Option<Box<UdtNames>>,
+}
+
+impl From<BoundParam> for ParamSnapshot {
+    fn from(param: BoundParam) -> Self {
+        Self {
+            param,
+            udt_names: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -319,13 +343,18 @@ impl BoundParam {
         apd_state: &DescState,
         ipd_state: &DescState,
         odbc_version: OdbcVersion,
-    ) -> Vec<Option<Self>> {
+    ) -> Vec<Option<ParamSnapshot>> {
         apd_state
             .records
             .iter()
             .enumerate()
             .map(|(i, apd_record)| {
-                Self::from_records(apd_record, ipd_state.records.get(i), odbc_version)
+                let ipd_record = ipd_state.records.get(i);
+                let param = Self::from_records(apd_record, ipd_record, odbc_version)?;
+                Some(ParamSnapshot {
+                    param,
+                    udt_names: ipd_record.and_then(|ipd| ipd.udt_names.clone()),
+                })
             })
             .collect()
     }

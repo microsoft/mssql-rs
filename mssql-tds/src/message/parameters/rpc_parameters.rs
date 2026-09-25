@@ -6,6 +6,7 @@ use bitflags::bitflags;
 use crate::datatypes::column_values::DEFAULT_VARTIME_SCALE;
 use crate::datatypes::encoder::SqlValueEncoder;
 use crate::datatypes::sql_tvp::TvpTypeName;
+use crate::datatypes::sql_udt::UdtTypeName;
 use crate::datatypes::sqldatatypes::VectorBaseType;
 use crate::datatypes::sqltypes::SqlType;
 use crate::{
@@ -109,8 +110,10 @@ pub(crate) struct EncryptedRpcValue {
 /// independently - see [`RpcParameter::with_streamed_declaration`] - so a
 /// `varchar(10)` parameter still streams its body as `varchar(max)`.
 ///
-/// TODO: extend to the remaining PLP types (`xml`, `json`, `udt`, `text`, `ntext`,
-/// `image`) for parity with the incremental read path.
+/// TODO: `xml` and `udt` have no variant here and are buffered by the ODBC
+/// layer instead of streamed - correct on the wire, but it holds the whole
+/// value in memory (AB#48349). `text` / `ntext` / `image` need no variant:
+/// they are already mapped onto the `max` types above.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamedSqlType {
     /// Unicode MAX text.
@@ -372,6 +375,13 @@ impl RpcParameter {
             return Ok(Self::format_tvp_sql_name(type_name));
         }
 
+        // A UDT is declared by its own server-side type name, for the same
+        // reason: `udt` is a TDS wire type, not something `sp_executesql` can
+        // resolve.
+        if let SqlType::Udt(type_name, _) = value {
+            return Ok(Self::format_udt_sql_name(type_name));
+        }
+
         // For nullable types, we need to check the actual datatype to derive the name.
         let tds_type = TdsDataType::from(value);
         let type_name = tds_type.get_meta_type_name()?;
@@ -474,6 +484,33 @@ impl RpcParameter {
     fn format_tvp_sql_name(type_name: &TvpTypeName) -> String {
         let schema = type_name.schema_name.as_deref().unwrap_or("dbo");
         format!("[{schema}].[{}] READONLY", type_name.type_name)
+    }
+
+    /// Formats a UDT's declaration name for `sp_executesql`, e.g.
+    /// `[dbo].[Point]`.
+    ///
+    /// Only the parts the application supplied are emitted, so an unqualified
+    /// name stays unqualified and resolves against the current database and
+    /// default schema. msodbcsql builds the same one-, two-, or three-part
+    /// quoted name here (`sqlccmd.cpp:7485-7505`); unlike a TVP there is no
+    /// `READONLY` suffix and the catalog part is legal.
+    fn format_udt_sql_name(type_name: &UdtTypeName) -> String {
+        let quoted = |part: &str| format!("[{}]", part.replace(']', "]]"));
+        match (
+            type_name.db_name.as_deref(),
+            type_name.schema_name.as_deref(),
+        ) {
+            (Some(db), schema) => format!(
+                "{}.{}.{}",
+                quoted(db),
+                quoted(schema.unwrap_or("dbo")),
+                quoted(&type_name.type_name)
+            ),
+            (None, Some(schema)) => {
+                format!("{}.{}", quoted(schema), quoted(&type_name.type_name))
+            }
+            (None, None) => quoted(&type_name.type_name),
+        }
     }
 
     /// Serializes the RPC parameter into the provided `PacketWriter`.
@@ -824,6 +861,7 @@ impl From<&SqlType> for TdsDataType {
             SqlType::VarcharMax(_) => TdsDataType::VarChar,
             SqlType::VarBinaryMax(_) => TdsDataType::VarBinary,
             SqlType::Xml(_) => TdsDataType::Xml,
+            SqlType::Udt(_, _) => TdsDataType::Udt,
             SqlType::Uuid(_) => TdsDataType::Guid,
             SqlType::DateTime(_) => TdsDataType::DateTime,
             SqlType::Date(_) => TdsDataType::DateN,
@@ -844,11 +882,56 @@ mod tests {
     };
 
     use crate::datatypes::encoder::GenericEncoder;
+    use crate::datatypes::sql_udt::UdtTypeName;
     use crate::io::packet_writer::PacketWriter;
     use crate::io::packet_writer::tests::MockNetworkWriter;
     use crate::message::messages::PacketType;
     use crate::token::tokens::SqlCollation;
     use futures::executor::block_on;
+
+    /// A UDT is declared by its own server-side name, not the TDS type name
+    /// `udt`, which `sp_executesql` cannot resolve ("Cannot find data type
+    /// udt", server error 2715). Only the parts the application supplied are
+    /// emitted, matching msodbcsql's three branches at `sqlccmd.cpp:7485`.
+    #[test]
+    fn a_udt_is_declared_by_its_qualified_type_name() {
+        let cases = [
+            (None, None, "hierarchyid", "[hierarchyid]"),
+            (None, Some("dbo"), "Point", "[dbo].[Point]"),
+            (Some("mydb"), Some("dbo"), "Point", "[mydb].[dbo].[Point]"),
+            // A catalog without a schema still needs a schema slot. msodbcsql
+            // would emit an empty `[]` here (its `%s.%s.%s` branch quotes
+            // whatever is in the pool); this defaults to `dbo` instead, the
+            // same default `format_tvp_sql_name` already applies.
+            (Some("mydb"), None, "Point", "[mydb].[dbo].[Point]"),
+        ];
+        for (db, schema, type_name, expected) in cases {
+            let value = SqlType::Udt(
+                UdtTypeName::new(
+                    db.map(str::to_string),
+                    schema.map(str::to_string),
+                    type_name.to_string(),
+                ),
+                Some(vec![0x01]),
+            );
+            assert_eq!(
+                RpcParameter::get_sql_name(&value, None).unwrap(),
+                expected,
+                "{db:?}.{schema:?}.{type_name}"
+            );
+        }
+    }
+
+    /// A `]` inside an identifier must be doubled or the quoting breaks out of
+    /// the bracketed name.
+    #[test]
+    fn a_udt_declaration_escapes_a_closing_bracket() {
+        let value = SqlType::Udt(
+            UdtTypeName::new(None, None, "od]d".to_string()),
+            Some(vec![0x01]),
+        );
+        assert_eq!(RpcParameter::get_sql_name(&value, None).unwrap(), "[od]]d]");
+    }
 
     #[test]
     fn ordinary_parameters_do_not_inline_streaming_and_encryption_metadata() {

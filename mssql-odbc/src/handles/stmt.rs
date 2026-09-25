@@ -18,7 +18,8 @@ use crate::api::odbc_types::{
 use crate::api::set_desc_field::datetime_interval_code_for;
 use crate::conversion::param_convert::{DaeLengthLimit, DaePlan, DaeTranscode};
 use crate::error::{DiagRecord, HasDiagnostics};
-use crate::params::BoundParam;
+use crate::handles::desc::UdtNames;
+use crate::params::{BoundParam, ParamSnapshot};
 use mssql_tds::datatypes::column_values::ColumnValues;
 use mssql_tds::datatypes::sql_string::{ResolvedDecoder, ResolvedEncoding};
 use mssql_tds::datatypes::sqldatatypes::TdsDataType;
@@ -489,7 +490,7 @@ pub(crate) struct StmtState {
     pub(crate) parameter_metadata: Vec<ParameterDescription>,
     /// Parameters bound via `SQLBindParameter`, indexed by `(ParameterNumber
     /// - 1)`. `None` slots are gaps left by binding a higher ordinal first.
-    pub(crate) bound_params: Vec<Option<BoundParam>>,
+    pub(crate) bound_params: Vec<Option<ParamSnapshot>>,
     /// The identity of a prepared statement superseded by a re-prepare / rebind
     /// / `SQLExecDirect`, whose server handle awaits release with `sp_unprepare`.
     /// The drop is deferred to the next point that already holds the TDS client
@@ -755,7 +756,7 @@ impl InertStmtAttrs {
 ///
 /// Keeping these fields together means the execution-time token and declared
 /// length cannot drift away from the binding they describe.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct DaeParam {
     /// 0-based index into [`StmtState::bound_params`], and equally the
     /// parameter's position in the RPC list, which is built in the same order.
@@ -774,6 +775,9 @@ pub(crate) struct DaeParam {
     /// The binding as of this execution, kept so a buffered value can be
     /// declared and converted from `ParameterType` when it closes.
     pub(crate) binding: BoundParam,
+    /// The binding's UDT identity, owned here because the descriptor snapshot
+    /// it came from does not outlive the execute that parks this sequence.
+    pub(crate) udt_names: Option<Box<UdtNames>>,
     /// How a streamed chunk is re-encoded on its way to the wire. Filled in
     /// when the sequence is parked, where the connection's collation is known.
     pub(crate) transcode: Option<DaeTranscode>,
@@ -789,6 +793,7 @@ impl DaeParam {
         plan: DaePlan,
         length_limit: Option<DaeLengthLimit>,
         binding: BoundParam,
+        udt_names: Option<Box<UdtNames>>,
     ) -> Self {
         Self {
             bound_index,
@@ -797,6 +802,7 @@ impl DaeParam {
             plan,
             length_limit,
             binding,
+            udt_names,
             transcode: None,
         }
     }
@@ -830,6 +836,7 @@ impl DaeParam {
             DaePlan::Stream(StreamedSqlType::VarBinaryMax),
             None,
             binding,
+            None,
         )
     }
 

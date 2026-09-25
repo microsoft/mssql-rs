@@ -12,6 +12,7 @@ use crate::datatypes::sql_tvp::{
     TVP_END_TOKEN, TVP_NOMETADATA_TOKEN, TvpTableData, TvpTypeName, write_tvp_column_metadata,
     write_tvp_order_unique, write_tvp_rows, write_tvp_type_name,
 };
+use crate::datatypes::sql_udt::{UdtTypeName, write_udt_type_name};
 use crate::datatypes::sql_vector::SqlVector;
 use crate::datatypes::tds_value_serializer::{TdsTypeContext, TdsValueSerializer};
 use crate::{
@@ -128,6 +129,13 @@ pub enum SqlType {
     /// even for NULL TVPs. `None` table data encodes a NULL TVP; `Some` with
     /// an empty row set encodes an empty TVP.
     Table(TvpTypeName, Option<TvpTableData>),
+
+    /// CLR user-defined type (input-only, TDS type `0xF0`).
+    ///
+    /// The payload is the type's serialized (`IBinarySerialize`) form, which
+    /// the driver passes through untouched; `None` is a NULL UDT. The name is
+    /// always sent because the server resolves the type from it.
+    Udt(UdtTypeName, Option<Vec<u8>>),
 }
 
 type NullableTdsType = TdsDataType;
@@ -187,6 +195,7 @@ impl SqlType {
             SqlType::Vector(_, _, _) => TdsDataType::Vector,
             SqlType::Variant(_) => TdsDataType::SsVariant,
             SqlType::Table(_, _) => TdsDataType::SqlTable,
+            SqlType::Udt(_, _) => TdsDataType::Udt,
         }
     }
 
@@ -666,6 +675,20 @@ impl SqlType {
             // handled by the `serialize_table` short-circuit in `serialize`, so this
             // arm is a safe fallback that never feeds real wire data.
             SqlType::Table(_, _) => (ColumnValues::Null, base_ctx),
+
+            // UDT: the payload is opaque bytes framed as PLP, like varbinary(max).
+            SqlType::Udt(_, opt) => {
+                let cv = match opt {
+                    Some(bytes) => ColumnValues::Bytes(bytes.clone()),
+                    None => ColumnValues::Null,
+                };
+                let ctx = TdsTypeContext {
+                    max_size: usize::MAX,
+                    is_plp: true,
+                    ..base_ctx
+                };
+                (cv, ctx)
+            }
         }
     }
 
@@ -1038,6 +1061,14 @@ impl SqlType {
                     .await?;
             }
 
+            // UDT: type byte + catalog/schema/type name, and nothing else. The
+            // PLP body length that follows is written by the value serializer,
+            // exactly as msodbcsql's `WriteUDTHeader` emits it.
+            SqlType::Udt(type_name, _) => {
+                packet_writer.write_byte_async(nullable_type as u8).await?;
+                write_udt_type_name(packet_writer, type_name).await?;
+            }
+
             // Table (TVP): metadata and rows are written by the dedicated
             // `serialize_table` path, which short-circuits in `serialize` before
             // this method is reached. A TVP is never a column type within another
@@ -1074,6 +1105,7 @@ impl SqlType {
             SqlType::Xml(_) => Some("xml"),
             SqlType::Json(_) => Some("json"),
             SqlType::Vector(_, _, _) => Some("vector"),
+            SqlType::Udt(_, _) => Some("udt"),
             SqlType::Variant(_) => Some("sql_variant (nested)"),
             SqlType::Table(_, _) => Some("table-valued parameter (TVP)"),
             // Sized string/binary types whose declared length exceeds the non-MAX limit
