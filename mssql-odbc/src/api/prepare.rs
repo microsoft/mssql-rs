@@ -20,7 +20,7 @@ use crate::handles::stmt::{
     PreparedPlan, STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT, STMT_STATE_EXEC_STARTED,
     STMT_STATE_PREPARED,
 };
-use crate::handles::{HandleType, StmtHandle, handle_from_raw};
+use crate::handles::{DescHandle, HandleType, StmtHandle, handle_from_raw};
 
 /// Implementation of `SQLPrepareW`.
 ///
@@ -143,6 +143,13 @@ fn sql_prepare_w_safe(stmt: &StmtHandle, sql: String) -> SqlReturn {
     stmt_state.clear_state(STMT_STATE_EXEC_CONTEXT);
     stmt_state.call_returns_status = false;
     stmt_state.set_state(STMT_STATE_PREPARED);
+    drop(stmt_state);
+    drop(dbc_state);
+
+    // These names describe the text this prepare just replaced, and a later
+    // SQLBindParameter would mark the record explicitly bound - freezing the
+    // stale identity in place. Application-set names survive.
+    unsafe { handle_from_raw::<DescHandle>(stmt.ipd) }.clear_auto_filled_udt_names();
 
     debug!("SQLPrepareW: statement prepared (deferred)");
     SQL_SUCCESS

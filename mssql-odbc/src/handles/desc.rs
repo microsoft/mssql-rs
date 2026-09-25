@@ -458,6 +458,27 @@ impl DescState {
 }
 
 impl DescHandle {
+    /// Drops the UDT identities `SQLDescribeParam` auto-filled, keeping any the
+    /// application set through `SQLSetDescField`. Call when new SQL supersedes
+    /// the text a name was described from - the identity belongs to that text,
+    /// not to the binding, and a record the application later binds would
+    /// otherwise carry it onto an unrelated statement.
+    ///
+    /// Never call with a STMT lock held (see the crate's locking rules). A
+    /// poisoned mutex is logged and ignored: the next describe refills these.
+    pub(crate) fn clear_auto_filled_udt_names(&self) {
+        let Ok(mut state) = self.inner.lock() else {
+            error!("clearing auto-filled UDT names: desc mutex poisoned");
+            return;
+        };
+        for record in &mut state.records {
+            if record.udt_names_auto_filled {
+                record.udt_names = None;
+                record.udt_names_auto_filled = false;
+            }
+        }
+    }
+
     /// Captures partial failed writes too. Never acquires DBC/STMT while DESC
     /// is locked, and APD/ARD writes never inspect statement ownership.
     pub(crate) fn update_definition(
@@ -900,6 +921,45 @@ mod tests {
         for kind in ALL_KINDS {
             assert!(classify_field(kind, 0xFFFF).is_none());
         }
+    }
+
+    /// New SQL supersedes the text a describe filled these names from, so the
+    /// auto-filled ones go and the application's stay. Without this, a later
+    /// `SQLBindParameter` marks the record explicitly bound and freezes a stale
+    /// identity that `refine_ipd` then refuses to touch.
+    #[test]
+    fn clearing_auto_filled_udt_names_spares_application_supplied_ones() {
+        let handle = DescHandle::new(
+            DescKind::ImpParam,
+            SQL_DESC_ALLOC_AUTO,
+            std::ptr::null_mut(),
+        );
+        {
+            let mut state = handle.inner.lock().unwrap();
+            state.set_record_count(2, DescKind::ImpParam);
+            let described = state.record_mut(1).unwrap();
+            described.udt_names = Some(Box::new(UdtNames {
+                type_name: "hierarchyid".to_string(),
+                ..Default::default()
+            }));
+            described.udt_names_auto_filled = true;
+            let chosen = state.record_mut(2).unwrap();
+            chosen.udt_names = Some(Box::new(UdtNames {
+                type_name: "Point".to_string(),
+                ..Default::default()
+            }));
+            chosen.udt_names_auto_filled = false;
+        }
+
+        handle.clear_auto_filled_udt_names();
+
+        let state = handle.inner.lock().unwrap();
+        assert!(state.records[0].udt_names.is_none());
+        assert!(!state.records[0].udt_names_auto_filled);
+        assert_eq!(
+            state.records[1].udt_names.as_ref().unwrap().type_name,
+            "Point"
+        );
     }
 
     /// The UDT's catalog/schema/type are spelled out in the `sp_executesql`

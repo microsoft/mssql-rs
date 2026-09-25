@@ -2216,6 +2216,11 @@ protected:
 
     std::string ExecuteAndReadBack() {
         EXPECT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+        return ReadBack();
+    }
+
+    // The read half, for a case that ran the statement some other way.
+    std::string ReadBack() {
         EXPECT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
         SQLCHAR buf[512] = {0};
         SQLLEN ind = 0;
@@ -2236,6 +2241,22 @@ protected:
                       SQL_HANDLE_STMT, stmt_);
         EXPECT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
         SQLCHAR buf[892] = {0};
+        SQLLEN ind = 0;
+        EXPECT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_BINARY, buf, sizeof(buf), &ind), SQL_HANDLE_STMT,
+                      stmt_);
+        EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+        return std::vector<SQLCHAR>(buf, buf + (ind > 0 ? ind : 0));
+    }
+
+    // A second system CLR type, so a multi-parameter test can prove each
+    // ordinal carried its own name rather than reusing the first.
+    std::vector<SQLCHAR> SerializedGeometry(const std::string& wkt) {
+        SqlTString sql = ODBCTestUtils::ToSqlTStr(
+            "SELECT CAST(geometry::STGeomFromText('" + wkt + "', 0) AS VARBINARY(8000))");
+        EXPECT_SQL_OK(SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS),
+                      SQL_HANDLE_STMT, stmt_);
+        EXPECT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+        SQLCHAR buf[8000] = {0};
         SQLLEN ind = 0;
         EXPECT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_BINARY, buf, sizeof(buf), &ind), SQL_HANDLE_STMT,
                       stmt_);
@@ -2296,6 +2317,85 @@ TEST_F(UdtParamLiveTest, AUdtParameterWithoutATypeNameFails) {
                                    payload.data(), indicator_, &indicator_),
                   SQL_HANDLE_STMT, stmt_);
     EXPECT_EQ(SQL_ERROR, SQLExecute(stmt_));
+}
+
+// A name the driver auto-filled belongs to the SQL it was described from, not
+// to the binding. Re-preparing different text and binding without describing
+// again must therefore fail exactly as if no describe had ever run - silently
+// reusing the previous statement's identity would send the wrong type. The
+// bind is what makes this reachable: it marks the record explicitly bound,
+// which stops the self-healing describe path from ever correcting it.
+TEST_F(UdtParamLiveTest, AnAutoFilledNameDoesNotSurviveARePrepare) {
+    std::vector<SQLCHAR> payload = SerializedHierarchyId("/1/");
+    ASSERT_FALSE(payload.empty());
+
+    ASSERT_SQL_OK(Prepare("SELECT CAST(? AS hierarchyid).ToString()"), SQL_HANDLE_STMT, stmt_);
+    SQLSMALLINT described_type = 0, decimal_digits = 0, nullable = 0;
+    SQLULEN column_size = 0;
+    ASSERT_SQL_OK(
+        SQLDescribeParam(stmt_, 1, &described_type, &column_size, &decimal_digits, &nullable),
+        SQL_HANDLE_STMT, stmt_);
+
+    // Different text, same ordinal, no second describe.
+    ASSERT_SQL_OK(Prepare("SELECT CAST(? AS hierarchyid).ToString() + 'x'"), SQL_HANDLE_STMT,
+                  stmt_);
+    indicator_ = static_cast<SQLLEN>(payload.size());
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_BINARY, SQL_SS_UDT, 0, 0,
+                                   payload.data(), indicator_, &indicator_),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(SQL_ERROR, SQLExecute(stmt_));
+}
+
+// The other half of the same rule: a name the *application* set is a property
+// of the binding, so it must survive a re-prepare untouched.
+TEST_F(UdtParamLiveTest, AnApplicationSuppliedNameSurvivesARePrepare) {
+    std::vector<SQLCHAR> payload = SerializedHierarchyId("/1/");
+    ASSERT_FALSE(payload.empty());
+
+    ASSERT_SQL_OK(Prepare("SELECT CAST(? AS hierarchyid).ToString()"), SQL_HANDLE_STMT, stmt_);
+    indicator_ = static_cast<SQLLEN>(payload.size());
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_BINARY, SQL_SS_UDT, 0, 0,
+                                   payload.data(), indicator_, &indicator_),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SetUdtName("hierarchyid"), SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_SQL_OK(Prepare("SELECT CAST(? AS hierarchyid).ToString() + 'x'"), SQL_HANDLE_STMT,
+                  stmt_);
+    indicator_ = static_cast<SQLLEN>(payload.size());
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_BINARY, SQL_SS_UDT, 0, 0,
+                                   payload.data(), indicator_, &indicator_),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("/1/x", ExecuteAndReadBack());
+}
+
+// `SQLExecDirect` also supersedes the SQL, but unlike a re-prepare it keeps an
+// auto-filled identity: measured against msodbcsql 18.6.2.1 (`SQL_DRIVER_VER`
+// `18.06.0002`) on SQL Server 2022, 2026-09-25, the execute below succeeds
+// there, so this driver matches rather than diverging. The identity is only
+// right while the new text's parameter is the same type - when it is not, the
+// payload fails to deserialize server-side rather than being silently
+// misread. Asserted on both legs so the reference stays measured.
+TEST_F(UdtParamLiveTest, SQLExecDirectReusesAnAutoFilledName) {
+    std::vector<SQLCHAR> payload = SerializedHierarchyId("/1/");
+    ASSERT_FALSE(payload.empty());
+
+    ASSERT_SQL_OK(Prepare("SELECT CAST(? AS hierarchyid).ToString()"), SQL_HANDLE_STMT, stmt_);
+    SQLSMALLINT described_type = 0, decimal_digits = 0, nullable = 0;
+    SQLULEN column_size = 0;
+    ASSERT_SQL_OK(
+        SQLDescribeParam(stmt_, 1, &described_type, &column_size, &decimal_digits, &nullable),
+        SQL_HANDLE_STMT, stmt_);
+
+    indicator_ = static_cast<SQLLEN>(payload.size());
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_BINARY, SQL_SS_UDT, 0, 0,
+                                   payload.data(), indicator_, &indicator_),
+                  SQL_HANDLE_STMT, stmt_);
+
+    SqlTString sql =
+        ODBCTestUtils::ToSqlTStr(std::string("SELECT CAST(? AS hierarchyid).ToString() + 'x'"));
+    ASSERT_SQL_OK(SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("/1/x", ReadBack());
 }
 
 // The companion to the test above: describing the parameter first supplies the
@@ -2414,17 +2514,18 @@ TEST_F(UdtParamLiveTest, ASchemaQualifiedUdtNameResolves) {
 // sets SQL_CA_SS_UDT_TYPE_NAME per IPD record (TCLargeUDT.cpp variation_10), so
 // the names must not be shared between ordinals.
 //
-// Benefits-from-mock-tds: distinct results imply distinct headers, but only a
-// byte-level view proves each ordinal carried its own name block rather than
-// the server tolerating a repeated one.
+// The two ordinals use *different* types on purpose: with `hierarchyid` on
+// both, a driver that reused parameter 1's name for parameter 2 would still
+// pass. `geometry` has a different serialized form, so sending it under the
+// wrong type name fails at the server.
 TEST_F(UdtParamLiveTest, EachUdtParameterCarriesItsOwnName) {
     std::vector<SQLCHAR> first = SerializedHierarchyId("/1/");
-    std::vector<SQLCHAR> second = SerializedHierarchyId("/2/");
+    std::vector<SQLCHAR> second = SerializedGeometry("POINT (3 4)");
     ASSERT_FALSE(first.empty());
     ASSERT_FALSE(second.empty());
 
     ASSERT_SQL_OK(Prepare("SELECT CAST(? AS hierarchyid).ToString()"
-                          " + '|' + CAST(? AS hierarchyid).ToString()"),
+                          " + '|' + CAST(? AS geometry).STAsText()"),
                   SQL_HANDLE_STMT, stmt_);
     SQLLEN firstLen = static_cast<SQLLEN>(first.size());
     SQLLEN secondLen = static_cast<SQLLEN>(second.size());
@@ -2438,14 +2539,15 @@ TEST_F(UdtParamLiveTest, EachUdtParameterCarriesItsOwnName) {
     SQLHDESC ipd = nullptr;
     ASSERT_SQL_OK(SQLGetStmtAttr(stmt_, SQL_ATTR_IMP_PARAM_DESC, &ipd, 0, nullptr),
                   SQL_HANDLE_STMT, stmt_);
-    SqlTString name = ODBCTestUtils::ToSqlTStr(std::string("hierarchyid"));
+    SqlTString firstName = ODBCTestUtils::ToSqlTStr(std::string("hierarchyid"));
+    SqlTString secondName = ODBCTestUtils::ToSqlTStr(std::string("geometry"));
     ASSERT_SQL_OK(SQLSetDescField(ipd, 1, SQL_CA_SS_UDT_TYPE_NAME,
-                                  const_cast<SQLTCHAR*>(name.c_str()), SQL_NTS),
+                                  const_cast<SQLTCHAR*>(firstName.c_str()), SQL_NTS),
                   SQL_HANDLE_DESC, ipd);
     ASSERT_SQL_OK(SQLSetDescField(ipd, 2, SQL_CA_SS_UDT_TYPE_NAME,
-                                  const_cast<SQLTCHAR*>(name.c_str()), SQL_NTS),
+                                  const_cast<SQLTCHAR*>(secondName.c_str()), SQL_NTS),
                   SQL_HANDLE_DESC, ipd);
-    EXPECT_EQ("/1/|/2/", ExecuteAndReadBack());
+    EXPECT_EQ("/1/|POINT (3 4)", ExecuteAndReadBack());
 }
 
 // A UDT parameter used as a predicate rather than an inserted value, which is
