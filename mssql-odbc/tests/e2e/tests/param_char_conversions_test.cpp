@@ -110,8 +110,18 @@ protected:
     // serialize_string picks the code page from the collation's LCID alone, so
     // only the LCID has to be Latin1 for U+65E5 to be unmappable. The parameter
     // carries the *database* collation, which need not match the instance's.
+    //
+    // A `_UTF8` collation is excluded even though its name matches: the two
+    // parameter routes disagree there. A materialized value reaches
+    // serialize_string's LCID-only arm, which ignores the fUTF8 flag and still
+    // substitutes under CP1252, but a streamed one goes through `encode_narrow`
+    // (the only mssql-odbc caller is `DaeTranscode::encode`), which honours
+    // `col_flags & 0x40` and passes UTF-8 through intact. The DAE cases would
+    // therefore fail rather than skip. Unifying the two is AB#47590.
     bool DatabaseIsLatin1() {
-        return DatabaseCollation().find("Latin1_General") != std::string::npos;
+        const std::string collation = DatabaseCollation();
+        return collation.find("Latin1_General") != std::string::npos &&
+               collation.find("_UTF8") == std::string::npos;
     }
 
     // The database collation name, or an empty string if it could not be read.
@@ -1213,13 +1223,15 @@ TEST_F(CharConversionLiveTest, UnmappableCharacterIsSubstitutedInsideASqlVariant
 }
 
 // SQL_COPT_SS_WARN_ON_CP_ERROR (1243) turns the substitution into a reportable
-// event: SQLSTATE 01000 and SQL_SUCCESS_WITH_INFO. msodbcsql owns the attribute
-// but only consults it on the fetch direction; this driver applies it to
-// parameters, which is where its own loss occurs - SQL_C_CHAR is UTF-8 here, so
-// a fetch can always represent whatever the server sent (AB#47598).
+// event: SQLSTATE 01000 and SQL_SUCCESS_WITH_INFO.
 //
-// Skipped under comparison for exactly that reason: msodbcsql returns plain
-// SQL_SUCCESS for a parameter however the attribute is set.
+// Skipped under comparison: parity-deviations entry 19. msodbcsql posts
+// IDS_01_000_16 only from its output-parameter and column arms
+// (sqlcdata.h:1297, :1310) and discards the loss flag on every input-parameter
+// path, so it returns plain SQL_SUCCESS here however the attribute is set.
+// This driver applies it to parameters, which is where its own loss occurs -
+// SQL_C_CHAR is UTF-8 here, so a fetch can always represent what the server
+// sent and the direction msodbcsql instruments is inert for us (AB#47598).
 TEST_F(CharConversionLiveTest, UnmappableCharacterWarnsWhenAsked) {
     SKIP_IF_COMPARING_MSODBCSQL();
 
@@ -1310,9 +1322,9 @@ TEST_F(CharConversionLiveTest, DataAtExecutionUnmappableCharacterIsSubstituted) 
 // on the handle, so the application would never read it. SQLPutData therefore
 // succeeds plainly and SQLParamData carries the warning (AB#47598).
 //
-// Skipped under comparison for the same reason as
-// UnmappableCharacterWarnsWhenAsked: msodbcsql does not consult the attribute
-// on the parameter path at all.
+// Skipped under comparison: parity-deviations entry 19, same as
+// UnmappableCharacterWarnsWhenAsked - msodbcsql does not consult the attribute
+// on any input-parameter path.
 TEST_F(CharConversionLiveTest, DataAtExecutionUnmappableCharacterWarnsWhenAsked) {
     SKIP_IF_COMPARING_MSODBCSQL();
 

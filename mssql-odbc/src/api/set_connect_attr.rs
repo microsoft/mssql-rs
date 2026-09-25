@@ -25,7 +25,7 @@ use crate::api::odbc_types::{
     SQL_COPT_SS_ENCRYPT, SQL_COPT_SS_INTEGRATED_SECURITY, SQL_COPT_SS_RESET_CONNECTION,
     SQL_COPT_SS_TRUST_SERVER_CERTIFICATE, SQL_COPT_SS_TXN_ISOLATION, SQL_COPT_SS_WARN_ON_CP_ERROR,
     SQL_EN_OFF, SQL_EN_ON, SQL_EN_STRICT, SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS,
-    SQL_SUCCESS_WITH_INFO, SQL_WARN_YES, SqlHandle, SqlInteger, SqlPointer, SqlReturn,
+    SQL_SUCCESS_WITH_INFO, SQL_WARN_NO, SQL_WARN_YES, SqlHandle, SqlInteger, SqlPointer, SqlReturn,
 };
 #[cfg(not(windows))]
 use crate::api::odbc_types::{SQL_NTS, SYSNAMELEN, SqlWChar};
@@ -293,10 +293,24 @@ unsafe fn sql_set_connect_attr_w_impl(
         }
         // Settable at any time, before or after connect: it changes only how the
         // driver reports a substitution, never how the connection is made.
-        // msodbcsql stores it the same way, with no connected-state guard
-        // (`sqlcmisc.cpp:2473`).
+        //
+        // Only SQL_WARN_NO / SQL_WARN_YES are legal, and anything else is
+        // HY024 (msodbcsql `sqlcmisc.cpp:2473`). Measured on retail 18.6.2.1:
+        // value 7 answers HY024 after connect, but is accepted silently
+        // *before* connect -- `dbcinfotoken.cpp:171` guards a path
+        // SQLSetConnectAttr does not reach. This driver validates in both
+        // states: storing an out-of-range value as "off" would make a typo read
+        // back as a deliberate setting. See parity-deviations entry 19.
         SQL_COPT_SS_WARN_ON_CP_ERROR => {
             let value = value_ptr as usize as u64;
+            if value != SQL_WARN_NO && value != SQL_WARN_YES {
+                error!(
+                    value,
+                    "SQLSetConnectAttrW: invalid SQL_COPT_SS_WARN_ON_CP_ERROR value"
+                );
+                post_diag(&mut state, ERR_INVALID_ATTRIBUTE_VALUE);
+                return SQL_ERROR;
+            }
             state.warn_on_cp_error = value == SQL_WARN_YES;
             debug!(
                 value,
@@ -1295,22 +1309,37 @@ mod tests {
     }
 
     /// `SQL_COPT_SS_WARN_ON_CP_ERROR` is a reporting preference, not a
-    /// connection property, so it is settable in either state and only
-    /// `SQL_WARN_YES` turns it on (AB#47598).
+    /// connection property, so it is settable in either state; only
+    /// `SQL_WARN_YES` turns it on and anything outside the pair is `HY024`,
+    /// matching msodbcsql (measured on retail 18.6.2.1 post-connect). See
+    /// parity-deviations entry 19 (AB#47598).
     #[test]
-    fn warn_on_cp_error_stores_only_sql_warn_yes() {
-        for (raw, expected) in [(0usize, false), (1, true), (2, false), (7, false)] {
+    fn warn_on_cp_error_accepts_only_the_two_legal_values() {
+        for (raw, expected) in [(0usize, Some(false)), (1, Some(true)), (2, None), (7, None)] {
             let h = TestHandles::with_env_dbc();
             let ret = unsafe {
                 sql_set_connect_attr_w(h.dbc, SQL_COPT_SS_WARN_ON_CP_ERROR, raw as SqlPointer, 0)
             };
-            assert_eq!(ret, SQL_SUCCESS, "value {raw}");
             let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
-            assert_eq!(
-                dbc.inner.lock().unwrap().warn_on_cp_error,
-                expected,
-                "value {raw}"
-            );
+            let state = dbc.inner.lock().unwrap();
+            match expected {
+                Some(stored) => {
+                    assert_eq!(ret, SQL_SUCCESS, "value {raw}");
+                    assert_eq!(state.warn_on_cp_error, stored, "value {raw}");
+                }
+                None => {
+                    assert_eq!(ret, SQL_ERROR, "value {raw}");
+                    assert_eq!(
+                        state.diag_records()[0].sql_state,
+                        ERR_INVALID_ATTRIBUTE_VALUE.state,
+                        "value {raw}"
+                    );
+                    assert!(
+                        !state.warn_on_cp_error,
+                        "a rejected value must not change the setting"
+                    );
+                }
+            }
         }
     }
 
