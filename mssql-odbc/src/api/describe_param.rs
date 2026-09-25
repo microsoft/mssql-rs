@@ -461,7 +461,18 @@ fn refine_ipd(
         // to a different statement's marker.
         if record.udt_names.is_none() || record.udt_names_auto_filled {
             let described = udt_names.iter().find(|(index, _)| *index == i);
-            record.udt_names = described.map(|(_, names)| names.clone());
+            // The server never supplies an assembly name, so an application's
+            // survives the refresh of the parts around it.
+            let assembly = record
+                .udt_names
+                .as_ref()
+                .map(|names| names.assembly_type_name.clone())
+                .unwrap_or_default();
+            record.udt_names = described.map(|(_, names)| {
+                let mut names = names.clone();
+                names.assembly_type_name = assembly;
+                names
+            });
             record.udt_names_auto_filled = record.udt_names.is_some();
         }
         if previous != record.parameter_definition() {

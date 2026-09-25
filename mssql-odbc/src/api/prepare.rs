@@ -149,7 +149,11 @@ fn sql_prepare_w_safe(stmt: &StmtHandle, sql: String) -> SqlReturn {
     // These names describe the text this prepare just replaced, and a later
     // SQLBindParameter would mark the record explicitly bound - freezing the
     // stale identity in place. Application-set names survive.
-    unsafe { handle_from_raw::<DescHandle>(stmt.ipd) }.clear_auto_filled_udt_names();
+    let rc = unsafe { handle_from_raw::<DescHandle>(stmt.ipd) }.clear_auto_filled_udt_names();
+    if rc != SQL_SUCCESS {
+        error!("SQLPrepareW: could not clear auto-filled UDT names");
+        return rc;
+    }
 
     debug!("SQLPrepareW: statement prepared (deferred)");
     SQL_SUCCESS

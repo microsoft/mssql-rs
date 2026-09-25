@@ -710,9 +710,12 @@ fn set_udt_name(
         return SQL_ERROR;
     };
     write_record_field(state, record_number, |r| {
-        // The application is claiming this identity, so a later describe must
-        // not overwrite it (see `DescRecord::udt_names_auto_filled`).
-        r.udt_names_auto_filled = false;
+        // Only the three parts that reach the wire claim the identity. The
+        // assembly name is stored and echoed but never sent, so writing it
+        // must not freeze a server-supplied name against a later describe.
+        if field != SQL_CA_SS_UDT_ASSEMBLY_TYPE_NAME {
+            r.udt_names_auto_filled = false;
+        }
         let names = r.udt_names.get_or_insert_with(Default::default);
         match field {
             SQL_CA_SS_UDT_CATALOG_NAME => names.catalog = value,
@@ -908,6 +911,58 @@ mod tests {
             let chars = text_len as usize / size_of::<u16>();
             assert_eq!(String::from_utf16_lossy(&buf[..chars]), expected);
         }
+    }
+
+    /// The assembly-qualified name never reaches the wire, so writing it is not
+    /// the application claiming the type's identity. Treating it as a claim
+    /// froze a server-auto-filled name in place: `SQLPrepare` would not clear
+    /// it and `refine_ipd` would not replace it, so a later statement could be
+    /// executed against the previous statement's type.
+    #[test]
+    fn writing_the_assembly_name_does_not_claim_a_server_supplied_identity() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let ipd = h.ipd();
+        let desc = unsafe { handle_from_raw::<DescHandle>(ipd) };
+        {
+            let mut state = desc.inner.lock().unwrap();
+            state.set_record_count(1, crate::handles::desc::DescKind::ImpParam);
+            let record = state.record_mut(1).unwrap();
+            record.udt_names = Some(Box::new(crate::handles::desc::UdtNames {
+                type_name: "hierarchyid".to_string(),
+                ..Default::default()
+            }));
+            record.udt_names_auto_filled = true;
+        }
+
+        let mut value: Vec<u16> = "MyAsm".encode_utf16().chain(std::iter::once(0)).collect();
+        let ret = unsafe {
+            sql_set_desc_field_w(
+                ipd,
+                1,
+                SQL_CA_SS_UDT_ASSEMBLY_TYPE_NAME as SqlSmallInt,
+                value.as_mut_ptr() as SqlPointer,
+                SqlInteger::from(SQL_NTS),
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS);
+        assert!(
+            desc.inner.lock().unwrap().records[0].udt_names_auto_filled,
+            "the identity is still the server's, so it must stay replaceable"
+        );
+
+        // A wire-relevant part is a claim, and does stop the refresh.
+        let mut value: Vec<u16> = "Point".encode_utf16().chain(std::iter::once(0)).collect();
+        let ret = unsafe {
+            sql_set_desc_field_w(
+                ipd,
+                1,
+                SQL_CA_SS_UDT_TYPE_NAME as SqlSmallInt,
+                value.as_mut_ptr() as SqlPointer,
+                SqlInteger::from(SQL_NTS),
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS);
+        assert!(!desc.inner.lock().unwrap().records[0].udt_names_auto_filled);
     }
 
     /// The exact sequence `mssql-python`'s `ddbc_bindings.cpp` runs for a

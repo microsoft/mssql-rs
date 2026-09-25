@@ -2317,6 +2317,9 @@ TEST_F(UdtParamLiveTest, AUdtParameterWithoutATypeNameFails) {
                                    payload.data(), indicator_, &indicator_),
                   SQL_HANDLE_STMT, stmt_);
     EXPECT_EQ(SQL_ERROR, SQLExecute(stmt_));
+    // Asserted as the application sees it: without this the diagnostic could
+    // regress to any other SQLSTATE and the test would still pass.
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HY000");
 }
 
 // A name the driver auto-filled belongs to the SQL it was described from, not

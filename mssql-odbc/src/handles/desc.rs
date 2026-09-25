@@ -73,7 +73,7 @@ use crate::api::odbc_types::{
     SQL_DESC_NULLABLE, SQL_DESC_OCTET_LENGTH, SQL_DESC_OCTET_LENGTH_PTR, SQL_DESC_PARAMETER_TYPE,
     SQL_DESC_PRECISION, SQL_DESC_ROWS_PROCESSED_PTR, SQL_DESC_SCALE, SQL_DESC_TYPE,
     SQL_DESC_UNNAMED, SQL_ERROR, SQL_NULLABLE, SQL_PARAM_INPUT, SQL_ROWSET_SIZE_DEFAULT,
-    SqlInteger, SqlLen, SqlPointer, SqlReturn, SqlSmallInt, SqlULen, SqlUSmallInt,
+    SQL_SUCCESS, SqlInteger, SqlLen, SqlPointer, SqlReturn, SqlSmallInt, SqlULen, SqlUSmallInt,
 };
 use crate::api::sqlstate::SQLSTATE_HY000;
 use crate::error::{DiagRecord, HasDiagnostics, free_errors, post_sql_error};
@@ -464,19 +464,35 @@ impl DescHandle {
     /// not to the binding, and a record the application later binds would
     /// otherwise carry it onto an unrelated statement.
     ///
-    /// Never call with a STMT lock held (see the crate's locking rules). A
-    /// poisoned mutex is logged and ignored: the next describe refills these.
-    pub(crate) fn clear_auto_filled_udt_names(&self) {
+    /// Only the three wire-relevant parts are dropped; an assembly-qualified
+    /// name the application set is echo-only state that no describe supplies,
+    /// so it outlives the identity it was written beside.
+    ///
+    /// Never call with a STMT lock held (see the crate's locking rules).
+    /// Returns `SQL_ERROR` on a poisoned mutex rather than reporting success
+    /// with a stale identity still in place.
+    pub(crate) fn clear_auto_filled_udt_names(&self) -> SqlReturn {
         let Ok(mut state) = self.inner.lock() else {
             error!("clearing auto-filled UDT names: desc mutex poisoned");
-            return;
+            return SQL_ERROR;
         };
         for record in &mut state.records {
-            if record.udt_names_auto_filled {
+            if !record.udt_names_auto_filled {
+                continue;
+            }
+            record.udt_names_auto_filled = false;
+            let Some(names) = record.udt_names.as_mut() else {
+                continue;
+            };
+            if names.assembly_type_name.is_empty() {
                 record.udt_names = None;
-                record.udt_names_auto_filled = false;
+            } else {
+                names.catalog.clear();
+                names.schema.clear();
+                names.type_name.clear();
             }
         }
+        SQL_SUCCESS
     }
 
     /// Captures partial failed writes too. Never acquires DBC/STMT while DESC
@@ -959,6 +975,43 @@ mod tests {
         assert_eq!(
             state.records[1].udt_names.as_ref().unwrap().type_name,
             "Point"
+        );
+    }
+
+    /// The assembly-qualified name is echo-only and no describe supplies it, so
+    /// writing it must not claim the wire identity - doing so froze a stale
+    /// auto-filled name against both the prepare-time clear and a later
+    /// describe. The name itself still survives that clear.
+    #[test]
+    fn the_assembly_name_neither_claims_nor_loses_the_wire_identity() {
+        let handle = DescHandle::new(
+            DescKind::ImpParam,
+            SQL_DESC_ALLOC_AUTO,
+            std::ptr::null_mut(),
+        );
+        {
+            let mut state = handle.inner.lock().unwrap();
+            state.set_record_count(1, DescKind::ImpParam);
+            let record = state.record_mut(1).unwrap();
+            record.udt_names = Some(Box::new(UdtNames {
+                type_name: "hierarchyid".to_string(),
+                assembly_type_name: "Asm.Point".to_string(),
+                ..Default::default()
+            }));
+            record.udt_names_auto_filled = true;
+        }
+
+        assert_eq!(handle.clear_auto_filled_udt_names(), SQL_SUCCESS);
+
+        let state = handle.inner.lock().unwrap();
+        let names = state.records[0].udt_names.as_ref().unwrap();
+        assert_eq!(
+            names.type_name, "",
+            "the auto-filled wire identity must not survive"
+        );
+        assert_eq!(
+            names.assembly_type_name, "Asm.Point",
+            "the application's assembly name is not the server's to drop"
         );
     }
 

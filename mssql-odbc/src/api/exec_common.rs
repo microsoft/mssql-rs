@@ -727,18 +727,20 @@ pub(super) unsafe fn build_positional_params(
     op: &str,
 ) -> Result<ParamsWithDae, SqlReturn> {
     let bind_offset = unsafe { stmt_state.inert_attrs.param_bind_offset() };
-    let bound: Vec<Option<ParamSnapshot>> =
-        stmt_state.bound_params.iter().skip(skip).cloned().collect();
-    match unsafe {
+    // Borrowed, not cloned: the builder only reads this tail, and cloning it
+    // would reallocate every UDT identity on each stored-procedure call.
+    let bound = stmt_state.bound_params.get(skip..).unwrap_or_default();
+    let built = unsafe {
         build_named_params_for_row(
-            &bound,
+            bound,
             marker_count.saturating_sub(skip),
             bind_offset,
             crate::api::odbc_types::SQL_BIND_BY_COLUMN,
             0,
             false,
         )
-    } {
+    };
+    match built {
         Ok(params) => Ok(params),
         Err(error) => {
             error!(

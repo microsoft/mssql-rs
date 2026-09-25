@@ -1023,16 +1023,18 @@ fn stage_execution(stmt: &StmtHandle) -> Result<ExecutionStaging, SqlReturn> {
             }
 
             for parameter in 0..marker_count {
+                // Only the `Copy` half is needed per row; cloning the snapshot
+                // would reallocate the UDT identity for every row.
                 let bound = stmt_state
                     .bound_params
                     .get(parameter)
                     .and_then(Option::as_ref)
-                    .cloned()
+                    .map(|snapshot| snapshot.param)
                     .ok_or_else(|| {
                         post_diag(&mut stmt_state, ERR_UNBOUND_PARAMETER);
                         SQL_ERROR
                     })?;
-                let positioned = match bound.param.for_row(row, bind_offset, param_bind_type) {
+                let positioned = match bound.for_row(row, bind_offset, param_bind_type) {
                     Ok(positioned) => positioned,
                     Err(_) => {
                         unsafe {
