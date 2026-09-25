@@ -503,9 +503,13 @@ impl RpcParameter {
     /// empty string and prints all three parts (`clntcomn.h:281`).
     fn format_udt_sql_name(type_name: &UdtTypeName) -> String {
         let quoted = |part: &str| format!("[{}]", part.replace(']', "]]"));
+        // `write_b_varchar` gives an empty part and an absent one the same
+        // zero-length encoding, so the declaration has to read them the same
+        // way too - otherwise `Some(String::new())` declares `[]` against a
+        // header that named nothing, and the execute fails.
         match (
-            type_name.db_name.as_deref(),
-            type_name.schema_name.as_deref(),
+            type_name.db_name.as_deref().filter(|s| !s.is_empty()),
+            type_name.schema_name.as_deref().filter(|s| !s.is_empty()),
         ) {
             (Some(db), schema) => format!(
                 "{}.{}.{}",
@@ -938,6 +942,33 @@ mod tests {
             Some(vec![0x01]),
         );
         assert_eq!(RpcParameter::get_sql_name(&value, None).unwrap(), "[od]]d]");
+    }
+
+    /// `write_b_varchar` encodes an empty part and an absent one identically,
+    /// so the declaration must too - `Some(String::new())` declaring `[]`
+    /// against a header that named nothing fails at the server.
+    #[test]
+    fn an_empty_udt_name_part_is_declared_as_absent() {
+        let cases = [
+            (Some(""), Some(""), "[Point]"),
+            (Some(""), Some("dbo"), "[dbo].[Point]"),
+            (Some("mydb"), Some(""), "[mydb]..[Point]"),
+        ];
+        for (db, schema, expected) in cases {
+            let value = SqlType::Udt(
+                UdtTypeName::new(
+                    db.map(str::to_string),
+                    schema.map(str::to_string),
+                    "Point".to_string(),
+                ),
+                Some(vec![0x01]),
+            );
+            assert_eq!(
+                RpcParameter::get_sql_name(&value, None).unwrap(),
+                expected,
+                "{db:?}.{schema:?}"
+            );
+        }
     }
 
     #[test]

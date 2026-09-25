@@ -178,6 +178,15 @@ impl TvpColumnDef {
     }
 
     fn validate(&self) -> TdsResult<()> {
+        // A UDT column's COLMETADATA carries MAX_BYTE_SIZE and the
+        // assembly-qualified name; `write_type_info` only emits the RPC
+        // parameter form, so accepting one here would write malformed TDS.
+        if matches!(self.column_type, SqlType::Udt(_, _)) {
+            return Err(Error::UsageError(
+                "UDT columns are not supported in table-valued parameters".to_string(),
+            ));
+        }
+
         if let Some((precision, scale)) = self.decimal_metadata() {
             validate_decimal_metadata(precision, scale)?;
         }
@@ -821,6 +830,21 @@ mod tests {
             vec![vec![SqlType::Int(Some(1))], vec![SqlType::Int(None)]],
         );
         assert!(data.validate().is_ok());
+    }
+
+    /// `write_type_info` emits only the RPC parameter form of a UDT, which
+    /// omits the MAX_BYTE_SIZE and assembly-qualified name a COLMETADATA UDT
+    /// column carries. Accepting one here would write malformed TDS.
+    #[test]
+    fn test_validate_rejects_a_udt_column() {
+        let data = TvpTableData::new(
+            vec![TvpColumnDef::new(SqlType::Udt(
+                crate::datatypes::sql_udt::UdtTypeName::new(None, None, "Point".to_string()),
+                None,
+            ))],
+            Vec::new(),
+        );
+        assert!(matches!(data.validate(), Err(Error::UsageError(_))));
     }
 
     #[test]
