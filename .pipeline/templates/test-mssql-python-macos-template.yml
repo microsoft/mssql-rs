@@ -33,10 +33,10 @@ steps:
 - script: |
     set -euo pipefail
 
-    MSSQL_PYTHON_DIR=$(Build.SourcesDirectory)/../mssql-python
+    MSSQL_PYTHON_DIR="$(Build.SourcesDirectory)/../mssql-python"
 
     python -m pip install --upgrade pip
-    python -m pip install maturin pytest pytest-asyncio python-dotenv pybind11 wheel setuptools patchelf
+    python -m pip install maturin pytest pytest-asyncio python-dotenv pybind11 wheel setuptools packaging patchelf
     python -m pip install -r "$MSSQL_PYTHON_DIR/requirements.txt"
 
     # Build ddbc_bindings (C++ pybind11 .so)
@@ -45,27 +45,9 @@ steps:
     chmod +x build.sh
     ./build.sh
 
-    # Package the ODBC dylibs prepared by build.sh from the same upstream
-    # checkout. Development versions on main may not be published yet.
-    echo "=== Building mssql-python-odbc wheel from source ==="
-    cd "$MSSQL_PYTHON_DIR"
-    rm -rf odbc-dist/
-    python setup_odbc.py bdist_wheel --dist-dir odbc-dist
-
-    shopt -s nullglob
-    ODBC_WHEELS=("$MSSQL_PYTHON_DIR"/odbc-dist/mssql_python_odbc-*.whl)
-    shopt -u nullglob
-    if [ "${#ODBC_WHEELS[@]}" -ne 1 ]; then
-      echo "##[error]Expected exactly one mssql-python-odbc wheel, found ${#ODBC_WHEELS[@]}"
-      exit 1
-    fi
-    ODBC_WHEEL="${ODBC_WHEELS[0]}"
-    echo "Installing mssql-python-odbc wheel: $ODBC_WHEEL"
-    python -m pip install --no-deps "$ODBC_WHEEL"
-
-    # Build mssql-py-core wheel and extract .so into mssql-python
+    # Build and install the local Rust wheel before upstream package setup.
     echo "=== Building mssql-py-core ==="
-    cd $(Build.SourcesDirectory)/mssql-py-core
+    cd "$(Build.SourcesDirectory)/mssql-py-core"
     rm -rf dist/
     maturin build --release -o dist/
 
@@ -76,34 +58,56 @@ steps:
     echo "=== Verifying mssql_py_core is importable ==="
     python -c "import mssql_py_core; print('mssql_py_core OK')"
 
-    # This job intentionally combines upstream Python main with the Rust wheel
-    # built above, which can be newer than Python's release dependency pin.
-    python -m pip install --no-deps -e "$MSSQL_PYTHON_DIR"
-
-    python - <<'PY'
-    from importlib.metadata import version
-    from pathlib import Path
-
-    import mssql_python
-
-    provider = mssql_python.get_native_provider_info()
-    assert provider["id"] == "msodbcsql18", provider
-    assert provider["driver_path"] and Path(provider["driver_path"]).is_file(), provider
-    print("mssql-python-rs:", version("mssql-python-rs"))
-    print("mssql-python-odbc:", version("mssql-python-odbc"))
-    print("ODBC provider:", provider)
-    PY
+    # Package the ODBC dylibs prepared by build.sh from the same checkout.
+    cd "$MSSQL_PYTHON_DIR"
+    rm -rf odbc-dist/
+    python setup_odbc.py bdist_wheel --dist-dir odbc-dist
   displayName: 'Build ddbc_bindings and mssql-py-core'
   env:
     CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN)
     CARGO_REGISTRIES_MSSQL_RS_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_TOKEN)
 
+- script: |
+    set -euo pipefail
+    MSSQL_PYTHON_DIR="$(Build.SourcesDirectory)/../mssql-python"
+    shopt -s nullglob
+    ODBC_WHEELS=("$MSSQL_PYTHON_DIR"/odbc-dist/mssql_python_odbc-*.whl)
+    if [ "${#ODBC_WHEELS[@]}" -ne 1 ]; then
+      echo "##[error]Expected exactly one mssql-python-odbc wheel, found ${#ODBC_WHEELS[@]}"
+      exit 1
+    fi
+    python -m pip install --no-deps "${ODBC_WHEELS[0]}"
+
+    # PR/local runs use the pinned SHA; non-PR runs follow upstream main.
+    # Preserve both job-owned native wheels instead of resolving release pins.
+    python -m pip install --no-deps -e "$MSSQL_PYTHON_DIR"
+  displayName: 'Install mssql-python packages'
+
+- script: |
+    set -euo pipefail
+    echo "##vso[task.setvariable variable=mssqlPythonReady]false"
+    python -m pytest .pipeline/scripts/verify-mssql-python.py -v -s \
+      --junitxml="$(Build.SourcesDirectory)/mssql-python-macos-setup-results.xml"
+  displayName: 'Verify installed mssql-python runtime'
+
+- task: PublishTestResults@2
+  condition: succeededOrFailed()
+  displayName: Publish mssql-python macOS setup results
+  inputs:
+    testResultsFiles: '**/mssql-python-macos-setup-results.xml'
+    testRunTitle: 'mssql-python macOS setup'
+    failTaskOnFailedTests: false
+    failTaskOnMissingResultsFile: true
+
 # ── 4. Start Docker via Colima ───────────────────────────────────────────────
 - template: macos-docker-steps.yml
+  parameters:
+    condition: and(succeeded(), eq(variables['mssqlPythonReady'], 'true'))
 
 # ── 5. Start SQL Server (no TLS certs) ──────────────────────────────────────
 - script: bash .pipeline/scripts/start-sql-server-macos.sh
   displayName: 'Start SQL Server (Docker, no TLS certs)'
+  condition: and(succeeded(), eq(variables['mssqlPythonReady'], 'true'))
   timeoutInMinutes: 22
   env:
     SQL_PASSWORD: $(SQL_PASSWORD)
@@ -120,6 +124,7 @@ steps:
     fi
     exit "$rc"
   displayName: 'Run mssql-python tests'
+  condition: and(succeeded(), eq(variables['mssqlPythonReady'], 'true'))
   env:
     SQL_PASSWORD: $(SQL_PASSWORD)
     DB_CONNECTION_STRING: 'Server=tcp:127.0.0.1,1433;Database=master;Uid=sa;Pwd=$(SQL_PASSWORD);TrustServerCertificate=yes'
@@ -130,7 +135,7 @@ steps:
     TRUST_SERVER_CERTIFICATE: 'true'
 
 - task: PublishTestResults@2
-  condition: succeededOrFailed()
+  condition: and(succeededOrFailed(), eq(variables['mssqlPythonReady'], 'true'))
   displayName: Publish mssql-python macOS test results
   inputs:
     testResultsFiles: '**/pytest-mssql-python-macos-results.xml'
@@ -141,6 +146,9 @@ steps:
 - script: |
     docker stop sqlserver || true
     docker rm sqlserver || true
-    rm -rf $(Build.SourcesDirectory)/../mssql-python || true
+  displayName: Cleanup SQL Server
+  condition: and(always(), eq(variables['mssqlPythonReady'], 'true'))
+
+- script: rm -rf $(Build.SourcesDirectory)/../mssql-python || true
   displayName: Cleanup
   condition: always()
