@@ -54,7 +54,8 @@ User-visible performance behavior is recorded as data-path contracts in the
 [ODBC driver engineering guidelines](../.github/instructions/mssql-odbc.instructions.md#11-performance-and-ffi-data-movement).
 The measurements and trade-offs behind each contract live beside the code that
 implements it, and deliberate departures from msodbcsql are recorded in the
-[parity registry](docs/parity-deviations.md).
+[parity registry](docs/parity-deviations.md). Subsystem design notes live in
+[`docs/`](docs/).
 
 ## Platform artifacts
 

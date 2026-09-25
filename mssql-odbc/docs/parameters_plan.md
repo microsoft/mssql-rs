@@ -190,7 +190,9 @@ transparent reconnects.
   execution. Closing this requires coordinating the descriptor snapshot, plan
   staging, and restoration together; a flag set only while the plan is absent
   would leave the earlier snapshot-to-staging window uncovered. This is
-  distinct from the data-at-execution Need Data restriction, and is not a
+  distinct from the data-at-execution Need Data restriction (section 7.3 of
+  the [ODBC engineering instructions](../../.github/instructions/mssql-odbc.instructions.md#73-prepared-parameter-definitions)),
+  and is not a
   claim that synchronous cross-thread calls are inherently invalid.
 
 ## Conversion milestone: integers and strings
