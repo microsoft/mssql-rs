@@ -1,6 +1,6 @@
 <!--
 Published verbatim as the mssql-python-rs PyPI project description (see
-`readme` in pyproject.toml). Edit only as part of a PyPI release. Keep the
+`readme` in pyproject.toml); it is republished on the next release. Keep the
 content user-facing and every link absolute: repo-relative links do not
 resolve on PyPI.
 -->

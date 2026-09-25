@@ -12,7 +12,7 @@ software and is not yet a general-purpose, drop-in replacement for
 The driver wraps the workspace-local `mssql-tds` protocol library. The current
 export manifest defines 50 ODBC entry points covering handles, connectivity,
 statement execution, parameters, result retrieval, catalogs, descriptors, and
-diagnostics. `SQLSetConnectAttr` is exported only on non-Windows targets; the
+diagnostics; 49 ship on Windows, where `SQLSetConnectAttr` is not compiled. The
 other character APIs currently expose their wide variants.
 
 **Target platforms**: Windows, Linux, macOS (x64 and ARM64) - Same as the platforms currently supported by msodbcsql
@@ -128,7 +128,8 @@ status describes the current crate, not merely whether supporting code exists in
 - SQLBindParameter with input, output, input/output, and return-value
   parameters; broad C↔SQL conversion validation; data-at-execution input; and
   prepared parameter arrays. Streamed output parameters, data-at-execution
-  inside arrays, and parameter arrays through `SQLExecDirect` remain unsupported.
+  inside arrays, output/input-output parameters inside arrays (AB#48148), and
+  parameter arrays through `SQLExecDirect` remain unsupported.
   See [parameters_plan.md](docs/parameters_plan.md).
 - Statement reuse with different parameter values
 - Batch execution with multiple result sets
@@ -303,7 +304,7 @@ interrupts an in-flight query.
 | Risk | Likelihood | Mitigation |
 |------|-----------|------------|
 | **mssql-tds API gaps** — pre-release library may lack features | High | Return HYC00 for unsupported features; document gaps; contribute upstream PRs |
-| **ODBC conformance failures** — spec edge cases | Medium | Run the e2e suite against both drivers through the same Driver Manager (`run_e2e.sh --compare-with-msodbcsql`) and treat any parity-table difference as a defect |
+| **ODBC conformance failures** — spec edge cases | Medium | Run the e2e suite against both drivers through the same Driver Manager (`run_e2e.sh --compare-with-msodbcsql`) and treat any parity-table difference that is not a registered deviation as a defect |
 | **BCP performance below 50K rows/sec** | Low | Profile with criterion; optimize type conversions and buffer copies |
 
 ---
@@ -313,8 +314,8 @@ interrupts an in-flight query.
 | ID | Metric | Target |
 |----|--------|--------|
 | SC-001 | ODBC Core Level 1 conformance | 100% pass |
-| SC-002 | Drop-in replacement | Zero app code changes from msodbcsql18 |
-| SC-003 | Authentication | All auth methods connect to SQL Server 2022 + Azure SQL |
+| SC-002 | Drop-in replacement | Zero app code changes from msodbcsql18, outside the registered deviations |
+| SC-003 | Authentication | Every supported auth method connects to SQL Server 2022 + Azure SQL |
 | SC-004 | Query overhead | <5ms vs. msodbcsql |
 | SC-005 | BCP throughput | >50K rows/sec (10 INT columns, gigabit network) |
 | SC-006 | Stability | 24-hour stress test (100 queries/sec), zero memory leaks |
@@ -456,10 +457,19 @@ Concurrent `SQLDisconnect` and statement I/O can cause a use-after-free. The
 execution path releases the DBC lock during network I/O, while disconnect can
 free the statement handle before the execution path reacquires it.
 
-The handle lifetime must be refcounted so in-flight operations retain valid
-state independently of ODBC handle ownership. Until that is implemented,
-callers must serialize disconnect against all operations on the connection.
-See the lifetime TODO in [disconnect.rs](src/api/disconnect.rs).
+This is a source-level race, not an established application-contract defect.
+The ODBC spec gates `SQLDisconnect` with `HY010` while a statement is still
+executing asynchronously or is parked in a `SQL_NEED_DATA` sequence, and the
+expected synchronous ordering is that an application drains its results and
+closes its cursors before disconnecting. Establishing whether this is
+reachable through a supported call sequence needs the Driver Manager's own
+enforcement and a reproducer holding valid handles through call completion,
+per section 6.1 of the engineering instructions. Until that exists, serializing
+disconnect against other operations on the connection avoids it.
+
+Refcounted handle lifetimes are the candidate fix, so in-flight operations
+would retain valid state independently of ODBC handle ownership. See the
+lifetime TODO in [disconnect.rs](src/api/disconnect.rs).
 
 ---
 
@@ -489,17 +499,19 @@ driver to resolve.
 `ActiveDirectoryMSI` is accepted as a connection-string alias and resolves to
 `ActiveDirectoryManagedIdentity`; mssql-tds has no separate MSI workflow.
 
-msodbcsql18 accepts exactly six `Authentication=` values (`dlgattr.h`):
-`SqlPassword`, `ActiveDirectoryIntegrated`, `ActiveDirectoryPassword`,
-`ActiveDirectoryInteractive`, `ActiveDirectoryMSI`, and
-`ActiveDirectoryServicePrincipal`. `ActiveDirectoryDefault`,
+Source inspection of msodbcsql18 identifies exactly six `Authentication=`
+values (`dlgattr.h`): `SqlPassword`, `ActiveDirectoryIntegrated`,
+`ActiveDirectoryPassword`, `ActiveDirectoryInteractive`, `ActiveDirectoryMSI`,
+and `ActiveDirectoryServicePrincipal`. `ActiveDirectoryDefault`,
 `ActiveDirectoryDeviceCode`, and `ActiveDirectoryWorkloadIdentity` are not
-driver keywords at all — mssql-python implements the first two in Python.
+driver keywords at all — mssql-python implements the first two in Python. A
+retail comparison recording `SQL_DRIVER_VER` is still outstanding.
 
 **Summary**: `mssql-odbc` currently wires six methods — SQL password, SSPI,
 access token, service principal, managed identity, and Windows interactive.
-AB#45484 closed against exactly that scope (T0–T3). Measured against msodbcsql18
-there are only two real gaps: `ActiveDirectoryPassword`, an accepted
-out-of-scope deviation (AB#45486) and a known regression for the pass-through
-case; and `ActiveDirectoryIntegrated`, tracked by AB#46068 and still open.
+AB#45484 closed against exactly that scope (T0–T3). Compared with the
+msodbcsql18 source, two differences remain: `ActiveDirectoryPassword` is an
+accepted deliberate deviation (AB#45486), while `ActiveDirectoryIntegrated`
+is an implementation gap tracked by AB#46068. Retail behavior has not yet been
+measured for the former.
 Non-Windows interactive was cut (AB#46683).

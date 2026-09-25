@@ -141,10 +141,10 @@ transparent reconnects.
   therefore PLP-framed even when bounded (a `varchar(50)` data-at-execution
   parameter still streams); fixed-length char/binary and every other supported
   SQL type accumulate and are converted at `SQLParamData` close exactly as the
-  materialized path converts them. Text supplied in pieces therefore parses to the same value as
-  the same text bound in one buffer. Measured against the reference driver,
-  which accepts the `SQLPutData` and returns the same value, so
-  `CrossFamilyDataAtExecutionConvertsToInteger` runs on the comparison leg
+  materialized path converts them. Text supplied in pieces therefore parses to
+  the same value as the same text bound in one buffer. Measured against the
+  reference driver, which accepts the `SQLPutData` and returns the same value,
+  so `CrossFamilyDataAtExecutionConvertsToInteger` runs on the comparison leg
   rather than opting out. Pinned by that case in `execute_test.cpp` and
   `param_conversions_test.cpp`, by `dae_plan_buffers_what_cannot_be_plp_framed`
   in `param_convert.rs`, and - for the wideness-mismatch fix - by
@@ -179,6 +179,16 @@ transparent reconnects.
   [ADO 46631](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/46631).
   Enable `StaleHandleAfterReconnectIsInvalidatedAndReprepared` afterward under
   [ADO 47099](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47099).
+- **Concurrent IPD mutation during synchronous `SQLExecute`.** The plan
+  comparison in `DescRecord::parameter_definition` covers sequential mutations
+  between completed calls. An IPD edit made after execution takes its binding
+  snapshot can miss the staged plan, which execution later restores with its
+  old declaration, so applications must serialize parameter edits with
+  execution. Closing this requires coordinating the descriptor snapshot, plan
+  staging, and restoration together; a flag set only while the plan is absent
+  would leave the earlier snapshot-to-staging window uncovered. This is
+  distinct from the data-at-execution Need Data restriction, and is not a
+  claim that synchronous cross-thread calls are inherently invalid.
 
 ## Conversion milestone: integers and strings
 
@@ -491,8 +501,8 @@ Verified against msodbcsql source:
 - Malformed UTF-8 stays lossy - there is no msodbcsql behaviour to copy, since
   its conversion goes through `SystemLocale::FromUtf16` (`sqlccmd.cpp:10952`),
   which is not in this source tree. `22018` is tracked with AB#47565.
-- Still `HYC00`: `SQL_SS_VECTOR`, `SQL_SS_UDT` and `SQL_SS_TABLE`, all owned by
-  AB#47790 (P9). `DescribesMaxLengthParameters` and
+- Still `HYC00`: `SQL_SS_VECTOR` (P9g, AB#48326), `SQL_SS_UDT` (P9b, AB#48248)
+  and `SQL_SS_TABLE` (TVPs, AB#48148). `DescribesMaxLengthParameters` and
   `DescribedDecimalRoundTripsPrecisionAndScale` are both re-enabled - the first
   with the binary types (AB#47688), the second with decimal (AB#47500).
 
@@ -505,8 +515,11 @@ approximate truncation units (AB#47584), numeric-character-reference
 substitution for unmappable characters (AB#47598), and the `SQL_C_CHAR` code
 page (AB#47565) - are therefore **not on its default path**. They become
 reachable when an application forces a narrow C or SQL type through
-`setinputsizes`, or sets a non-UTF-8 `encoding` via the connection's encoding
-settings. Treat them as opt-in rather than unreachable.
+`setinputsizes`. The byte-encoding path additionally requires an explicit real
+narrow C type, for example
+`setencoding(encoding="cp1252", ctype=mssql_python.SQL_CHAR)`; the native
+binding honors the configured encoding only when `ctype == SQL_CHAR`.
+Treat these paths as opt-in rather than unreachable.
 
 - **The 2GB ceiling on `max` types is enforced nowhere, here or in msodbcsql.**
   Conversion skips length checks for varmax (`:2862`), bind bounds the declared
@@ -880,7 +893,7 @@ parameter. "No" therefore means unreachable today, not unimportant.
 | 5 | output / `InputOutput` parameters in arrays only (`SQL_ATTR_PARAMSET_SIZE > 1`) | binding accepted; array execution returns `HYC00` | No - binds `SQL_PARAM_INPUT` only | AB#48148 |
 | 6 | array stride for `SQL_C_SS_VECTOR` | binding refused | No - never binds the vector C type | AB#48326 |
 | 7 | array size set through `SQLSetDescField(apd, SQL_DESC_ARRAY_SIZE, n)` | accepted, then one set executes | No - uses `SQLSetStmtAttr`; `SQLSetDescField` only for `SQL_C_NUMERIC` | AB#47945 |
-| 8 | server reports fewer sets than `PARAMSET_SIZE` with no error | `SQL_SUCCESS_WITH_INFO` and `01000` naming the reported count; msodbcsql returns `SQL_SUCCESS` | No - no known server behaviour produces it | AB#47945 |
+| 8 | server reports fewer sets than `PARAMSET_SIZE` with no error | `SQL_SUCCESS_WITH_INFO` and `01000` naming the reported count; msodbcsql returns `SQL_SUCCESS`; no known server behaviour produces it | n/a - not consumer-gated | AB#47945 |
 | 9 | `SQL_DIAG_ROW_NUMBER` on a diagnostic raised during array execution | always `SQL_NO_ROW_NUMBER` - no per-set attribution is plumbed through `post_tds_error` yet, so a batch with several failing sets reports several records with no mapping back to the row that produced each one | **Yes** - any array diagnostic | microsoft/mssql-rs#541 |
 
 `SQL_DIAG_ROW_NUMBER` is implemented and correctly reports
@@ -933,10 +946,12 @@ Single-row output/input-output parameters and call return values are supported (
 
 ## Remaining work
 
-Items are tagged **[reachable]** or **[not reachable]** for mssql-python, the
-primary consumer, on the evidence described above the divergences table. A
-"not reachable" item is still real ODBC surface - it just cannot be hit through
-mssql-python today, so it does not gate the msodbcsql replacement.
+Items whose mssql-python reachability was assessed carry a **[reachable]** or
+**[not reachable]** tag, on the evidence described above the divergences table.
+A "not reachable" item is still real ODBC surface - it just cannot be hit
+through mssql-python today, so it does not gate the msodbcsql replacement.
+Untagged items are internal optimizations, already-closed gaps, or work whose
+consumer reachability has not been assessed.
 
 - **Stream marker rewriting without an intermediate SQL string.** `SQLPrepare`
   already scans and rewrites once. A future allocation optimization could store
@@ -963,7 +978,7 @@ mssql-python today, so it does not gate the msodbcsql replacement.
   **[not reachable** - no `SQL_SS_TABLE` binding**]**. `ColumnSize` still does
   not bound a data-at-execution value in either family (AB#47590)
   **[reachable** - DAE triggers above 4000 UTF-16 units / 8000 bytes**]**.
-- **Deferred features (AB#48148) [not reachable]:** output/input-output parameters in parameter arrays and TVPs. `DetectParamTypes` binds every parameter `SQL_PARAM_INPUT`, so mssql-python reaches neither. Single-row output parameters are supported; input parameter arrays (`SQL_ATTR_PARAMSET_SIZE`) are implemented with the limitations above.
+- **Deferred features (AB#48148) [not reachable]:** output/input-output parameters in parameter arrays and TVPs. `DetectParamTypes` binds every parameter `SQL_PARAM_INPUT`, so mssql-python never reaches the output-array case; TVPs are unreachable for the separate reason above - they are input parameters, but `ParamInfo` carries no `SQL_SS_TABLE` type name to supply. Single-row output parameters are supported; input parameter arrays (`SQL_ATTR_PARAMSET_SIZE`) are implemented with the limitations above.
 - **`mssql-tds` gap found by P8, closed by AB#47800:** a `sql_variant` could not
   carry a `varchar` payload - `get_variant_base_type` and
   `create_variant_inner_context` assumed every `ColumnValues::String` was
