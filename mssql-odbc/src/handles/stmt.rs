@@ -44,6 +44,11 @@ pub(crate) struct ActivePlpStream {
     /// also moves pending UTF-16 units here so either text target can drain
     /// their bytes verbatim, including a byte split after a target switch.
     pub(crate) pending_bytes: Vec<u8>,
+    /// The carry is raw UTF-16LE rather than UTF-8. An odd length means its
+    /// first byte is the remainder of a partially delivered code unit.
+    /// Character reads drain old carry before decoding new wire input, so
+    /// this tag covers the entire byte buffer.
+    pub(crate) pending_bytes_utf16: bool,
     /// Narrow wire encoding resolved from the column's collation (or UTF-8 for
     /// `json`, which carries none), or `None` when the column is not narrow
     /// text. This is a property of the *column*, so a target type that arrives
@@ -64,6 +69,7 @@ pub(crate) struct ActivePlpStream {
     /// `encoding_rs::Decoder` already holds that partial sequence internally,
     /// which keeps the boundary rule in one place instead of one per codepage.
     pub(crate) narrow_decoder: Option<ResolvedDecoder>,
+    pub(crate) narrow_decoder_finished: bool,
     /// Code units already decoded on a previous call that did not fit the
     /// caller's buffer, delivered before any further wire bytes.
     ///
@@ -95,6 +101,16 @@ pub(crate) struct BufferedGetDataRow {
     pub(crate) wire_deferred: bool,
 }
 
+#[derive(Debug)]
+pub(crate) struct CapturedPlpWire {
+    pub(crate) column: usize,
+    pub(crate) bytes: Vec<u8>,
+    /// Wire-byte position, independent of the decoded text's offset.
+    pub(crate) offset: usize,
+    /// Unit of `partial_text_offset` for the decoded retry value.
+    pub(crate) text_target: Option<SqlSmallInt>,
+}
+
 impl ActivePlpStream {
     /// Opens a stream for `column`. Every carry field starts empty, so a call
     /// site names only what identifies the stream — and a carry field added
@@ -110,8 +126,10 @@ impl ActivePlpStream {
             pending_byte: None,
             pending_high_surrogate: None,
             pending_bytes: Vec::new(),
+            pending_bytes_utf16: false,
             narrow_encoding,
             narrow_decoder: None,
+            narrow_decoder_finished: false,
             pending_units: Vec::new(),
             prefetched_wire: Vec::new(),
             prefetched_offset: 0,
@@ -134,6 +152,7 @@ impl ActivePlpStream {
             && let Some(encoding) = self.narrow_encoding
         {
             self.narrow_decoder = Some(encoding.new_decoder_without_bom_handling());
+            self.narrow_decoder_finished = false;
         }
     }
 
@@ -486,6 +505,9 @@ pub(crate) struct StmtState {
     pub(crate) row_positioned: bool,
     /// The column value captured by the most recent resume_row_to_column call, with its 1-based column index.
     pub(crate) last_captured: Option<(usize, ColumnValues)>,
+    /// Original unread wire bytes for binary retries of a typed PLP conversion.
+    /// `last_captured` separately retains decoded text, including character carry.
+    pub(crate) captured_plp_wire: Option<CapturedPlpWire>,
     /// Complete non-PLP row captured by SQLFetch for subsequent SQLGetData calls.
     pub(crate) buffered_get_data_row: Option<BufferedGetDataRow>,
     /// Emptied row storage retained across fetches to avoid per-row allocations.
@@ -1382,6 +1404,7 @@ impl StmtState {
     pub(crate) fn reset_row_stream(&mut self) {
         self.row_positioned = false;
         self.last_captured = None;
+        self.captured_plp_wire = None;
         self.buffered_get_data_row = None;
         self.last_variant_base = None;
         self.row_exhausted = false;
@@ -1557,6 +1580,7 @@ impl StmtHandle {
                 parameter_array: None,
                 row_positioned: false,
                 last_captured: None,
+                captured_plp_wire: None,
                 buffered_get_data_row: None,
                 spare_get_data_row: None,
                 last_variant_base: None,

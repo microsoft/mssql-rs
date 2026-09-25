@@ -507,6 +507,27 @@ mod tests {
         assert_eq!(ind, SQL_NULL_DATA as crate::api::odbc_types::SqlLen);
     }
 
+    #[test]
+    fn null_outputs_preserve_character_buffers() {
+        for target in [SQL_C_CHAR, crate::api::odbc_types::SQL_C_WCHAR] {
+            let mut buffer = [0x7Eu8; 32];
+            let mut indicator = -99;
+            let param = output_param(
+                target,
+                SQL_VARCHAR,
+                buffer.as_mut_ptr().cast(),
+                32,
+                &raw mut indicator,
+            );
+            assert_eq!(
+                unsafe { write_value(&param, &ColumnValues::Null) },
+                RowOutcome::Success
+            );
+            assert_eq!(indicator, SQL_NULL_DATA);
+            assert_eq!(buffer, [0x7E; 32]);
+        }
+    }
+
     /// A NULL with nowhere to report it is an error, not a silent stale value.
     #[test]
     fn a_null_output_without_an_indicator_is_an_error() {

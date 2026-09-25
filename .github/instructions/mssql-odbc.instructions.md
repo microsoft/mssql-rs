@@ -26,6 +26,7 @@ Crate-specific requirements for changes under `mssql-odbc/`.
 - [8. FFI boundary conventions](#8-ffi-boundary-conventions)
 - [9. Types and casts](#9-types-and-casts)
 - [10. Testing](#10-testing)
+- [11. Performance and FFI data movement](#11-performance-and-ffi-data-movement)
 
 ## 1. Before making changes
 
@@ -463,3 +464,36 @@ guarantees first; preserve existing guards meanwhile.
   conversion will materialize (see deviation 7 in the
   [parity decision registry](../../mssql-odbc/docs/parity-deviations.md)).
 - Use `cargo nextest` (via `cargo btest`), not `cargo test`.
+
+## 11. Performance and FFI data movement
+
+Follow the repository-wide
+[Performance and Data Movement guidance](../copilot-instructions.md#performance-and-data-movement).
+For ODBC hot paths:
+
+- Direct fixed-width or encoded delivery must preserve the
+  [raw-pointer and alignment requirements](#5-unsafe-code).
+- Document ownership and synchronization invariants for unsafe optimizations,
+  especially `Send` impls involving application buffers.
+- Preserve ODBC conversion and truncation reporting when bypassing
+  `ColumnValues` materialization.
+- Treat these as data-path contracts. Preserve them when changing the owning
+  path, or update this section and its tests or parity entry in the same change:
+  - `SQLExecDirect`, `SQLExecute`, and `SQLMoreResults` wait for the first row,
+    end of result, or server error; a row read ahead remains fetchable.
+  - Typed PLP retrieval retains unread input across calls, caps materialization
+    at 1 MiB, and reports fixed-width C target sizes independently of
+    `BufferLength`.
+  - Character delivery preserves complete encoded units, embedded NULs, and
+    BOM-shaped data. Do not use BOM sniffing to select or alter an encoding.
+  - An active PLP value may switch among `SQL_C_CHAR`, `SQL_C_WCHAR`, and
+    `SQL_C_BINARY` without re-encoding already converted text or confusing text
+    offsets with wire-byte offsets.
+  - Release the connection's active-statement claim only after its wire data is
+    drained; completed empty results may release it during execute.
+  - Bound fetch reuses descriptor snapshots and conversion storage across rows;
+    do not add avoidable per-row allocation or metadata cloning.
+  - Parameter-array rowsets remain visible in parameter-set order through
+    fetch and `SQLMoreResults`; defer final processed/status reporting until
+    each set completes, and drain unread results on cursor close without
+    re-executing the batch.

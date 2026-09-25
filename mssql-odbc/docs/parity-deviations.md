@@ -134,12 +134,19 @@ msodbcsql build is measured.
    `SKIP_IF_COMPARING_MSODBCSQL()`. Tracked in AB#47369, which is where the
    outstanding 18.6.2.1 measurements land - keep the running record there
    rather than growing this file per build.
-7. **A bound `max`/LOB text column converted to a typed C target is refused
+7. **A `max`/LOB text column converted to a typed C target is refused
    above 1 MiB; msodbcsql converts a truncated prefix and warns.** Both drivers
    cap what a typed conversion may materialize - a `varchar(max)` carries up to
    2 GB and the converter needs one contiguous literal. This driver's cap is
    `PLP_TYPED_MATERIALIZE_LIMIT` (`api/fetch_scroll.rs`) at 1 MiB; past it the
    value is drained to keep the row synchronized and answered `HYC00`.
+   This applies to bound fetches and `SQLGetData`; the shared limit counts
+   unread source wire bytes, including both bytes of each UTF-16 code unit.
+   Earlier character reads do not count against a subsequent typed
+   `SQLGetData` call's cap. Decoding
+   can expand that bounded input into UTF-8, but allocation never scales with
+   an unbounded server value. Below the cap, this driver converts the complete
+   remaining literal, not a truncated prefix.
    msodbcsql clamps to `2*CONVBUF_SIZE` (~1244 bytes, sized for the longest
    legal `double` literal) in `EstimateBytesToRead` (`odbc/sqlcdata.cpp`), then
    converts that prefix and reports `01004` rather than failing.
@@ -162,7 +169,17 @@ msodbcsql build is measured.
    `varchar(max)` bound to a typed target reaches it - schema drift, not a
    contrived input. CI compares against 18.6.2.1; this measurement is
    18.06.0001, so re-measure there before relying on the exact prefix length.
-   Tracked in AB#47767.
+   `SQLGetData` was re-measured on Linux with **18.06.0001** for AB#47238:
+   `'0'` repeated 1048576 times followed by `'1'`, as either `varchar(max)` or
+   `nvarchar(max)`, returns `SQL_SUCCESS_WITH_INFO`, `01004`, integer `0`, and
+   indicator `4`. This driver returns `SQL_ERROR` / `HYC00` without changing
+   either output, and both can retrieve the following column. The dedicated
+   `PlpTypedOversizedValueIsRefusedAndDrained` test asserts each driver's
+   result. The native caller clamps fixed conversions in `GetColData`'s
+   delivery implementation (`odbc/sqlcdata.h`, `IsFixedOrBinaryWithFixedServerType`
+   branch) before `FetchDataWithCopy`, consistent with `EstimateBytesToRead`.
+   Reusing the bound-fetch policy for `SQLGetData` was approved by David Engel
+   on 2026-09-22. Tracked in AB#47767 and AB#47238.
 8. **Widening a bound narrow `max` column to `SQL_C_WCHAR` truncates on a whole
    character.** A buffer with no room for the final surrogate pair ends before
    it; msodbcsql leaves the lone high surrogate in the last payload slot on this
@@ -460,7 +477,36 @@ msodbcsql build is measured.
     Driver Manager bind/record-edit sequence with RPC capture and a recorded
     `SQL_DRIVER_VER` is still needed to establish shipping-build behavior;
     do not infer retail parity or add a comparison-test skip from this entry.
-18. **A cross-identity orphan is released before streaming an already-live
+18. **`Authentication=ActiveDirectoryPassword` is refused.** msodbcsql accepts
+    it: `OPTIONADPASSWORD L"ActiveDirectoryPassword"`
+    (`Sql/Ntdbms/sqlncli/msdart/inc/dlgattr.h`), carried through as
+    `IntegratedSecurity::ActiveDirectoryPassword` (`tds/TdsParser.h:411`) and
+    dispatched by the `authMode` ternary at `tds/Parse.cpp:3661`, which selects
+    `AKVCFG_AUTHMODE_PASSWORD` and feeds `AzureADAuth::GetAccessTokenW`.
+    This driver parses and validates the keyword - including the rule that it
+    requires both `UID` and `PWD` - and then returns `HYC00` from
+    `SQLDriverConnectW`, because `configure_auth` (`src/auth/entra.rs`) has no
+    arm for it and falls through to `UnsupportedAuth::plain`. The refusal
+    happens before any network activity.
+    Excluded by design rather than deferred: the ratified authentication design
+    scopes the driver to "full msodbcsql parity except AD Password" (mssql-rs
+    wiki, `Design/mssql-odbc-Authentication`, commit `072f280f`). The flow sends
+    plaintext credentials to Entra, supports neither MFA nor conditional access,
+    is deprecated by the Microsoft identity platform, is blocked in many
+    tenants, and was deprecated in SqlClient 7.0.
+    **Application-visible regression:** mssql-python does not map this keyword,
+    so it stays in the connection string and reaches whichever driver is
+    loaded. An application using `Authentication=ActiveDirectoryPassword`
+    connects today against msodbcsql; pointing that same application at this
+    driver turns a working connection into `HYC00`. Signed off by Vahid
+    Beiranvand on 2026-07-16 on AB#45486, which records the reconciliation with
+    the auth parity review and was closed as Removed rather than implemented.
+    **Evidence limit:** this is a source comparison, not a measured retail
+    acceptance claim. A comparison run that records `SQL_DRIVER_VER` and the
+    tested msodbcsql build while calling `SQLDriverConnectW` with
+    `Authentication=ActiveDirectoryPassword` is still required to establish
+    shipping-build behavior.
+19. **A cross-identity orphan is released before streaming an already-live
     prepared statement, and a release error fails that execute.** The source
     reference is msodbcsql's `DropPrepHandle` (`Sql/Ntdbms/sqlncli/odbc/sqlcfunc.cpp`), which
     defers the drop in `hPrepDropDeferred`; `BuildSPPrepExec` (`odbc/sqlccmd.cpp`)

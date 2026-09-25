@@ -619,6 +619,7 @@ class BlockedSelectTest : public TransactionLiveTest {
         const std::string table = GlobalTempTable(suffix);
         Exec("CREATE TABLE " + table + "(id int PRIMARY KEY, value int)");
         Exec("INSERT INTO " + table + " VALUES (1, 0)");
+        EXPECT_EQ(0, Scalar("SELECT value FROM " + table + " WHERE id = 1"));
 
         ASSERT_SQL_OK(SetAutocommit(dbc_, SQL_AUTOCOMMIT_OFF), SQL_HANDLE_DBC, dbc_);
         Exec("UPDATE " + table + " SET value = 1 WHERE id = 1");
@@ -690,6 +691,44 @@ TEST_F(BlockedSelectTest, PreparedExecuteReturnsServerLockTimeout) {
         EXPECT_SQL_OK(prepare_rc, SQL_HANDLE_STMT, hstmt);
         return SQLExecute(hstmt);
     });
+}
+
+TEST_F(BlockedSelectTest, MoreResultsReturnsServerLockTimeout) {
+    SQLTCHAR driver_version[32] = {};
+    ASSERT_SQL_OK(SQLGetInfo(dbc_, SQL_DRIVER_VER, driver_version, sizeof(driver_version),
+                             nullptr), SQL_HANDLE_DBC, dbc_);
+    RecordProperty("driver_version", ODBCTestUtils::ToNarrow(SqlTString(driver_version)));
+
+    for (const bool prepared : {false, true}) {
+        for (const bool fetch_first : {false, true}) {
+            const std::string suffix = std::string("lock_timeout_more_") +
+                (prepared ? "prepared_" : "direct_") + (fetch_first ? "fetched" : "unread");
+            SCOPED_TRACE(suffix);
+            RunBlockedSelect(suffix, [prepared, fetch_first](SQLHSTMT hstmt,
+                                                            const std::string& table) {
+                SqlTString sql = ODBCTestUtils::ToSqlTStr(
+                    "SELECT 1; SELECT value FROM " + table + " WHERE id = 1");
+                SQLRETURN rc;
+                if (prepared) {
+                    rc = SQLPrepare(hstmt, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS);
+                    EXPECT_SQL_OK(rc, SQL_HANDLE_STMT, hstmt);
+                    if (!SQL_SUCCEEDED(rc)) return rc;
+                    rc = SQLExecute(hstmt);
+                } else {
+                    rc = SQLExecDirect(hstmt, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS);
+                }
+                EXPECT_SQL_OK(rc, SQL_HANDLE_STMT, hstmt);
+                if (!SQL_SUCCEEDED(rc)) return rc;
+                if (fetch_first) {
+                    rc = SQLFetch(hstmt);
+                    EXPECT_SQL_OK(rc, SQL_HANDLE_STMT, hstmt);
+                    if (!SQL_SUCCEEDED(rc)) return rc;
+                    EXPECT_EQ(SQL_NO_DATA, SQLFetch(hstmt));
+                }
+                return SQLMoreResults(hstmt);
+            });
+        }
+    }
 }
 
 // The isolation level survives commit and rollback — it is a session setting.

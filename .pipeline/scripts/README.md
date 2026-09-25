@@ -28,10 +28,13 @@ See `.pipeline/docs/arm-sql-host-design.md` for the full design.
 
 Both the macOS cross-repo tests and the full upstream suite against the Rust
 ODBC replacement use the full commit SHA in
-[`../mssql-python-revision.txt`](../mssql-python-revision.txt). The script fetches
-that commit directly, checks it out detached, and logs and verifies HEAD.
-Missing, malformed, or unavailable pins fail the job; there is no branch fallback
-or PR-description override.
+[`../mssql-python-revision.txt`](../mssql-python-revision.txt) for PR validation.
+Non-PR pipeline runs fetch the latest upstream `main` instead. The shared script
+uses Azure Pipelines' `BUILD_REASON`: `PullRequest` (or unset for local use) selects
+the pin; other reasons, including manual and scheduled CI, select `main`.
+Both modes check out detached and log HEAD. Invalid or unavailable PR pins fail
+without falling back to main; an unavailable CI main fails without using the pin.
+PR-description overrides are not supported.
 
 From the repository root, with Bash and Git installed, reproduce the checkout:
 
@@ -47,28 +50,33 @@ MSSQL_PYTHON_CLONE_DIR=/tmp/mssql-python-pinned bash .pipeline/scripts/clone-mss
 ```
 
 Existing local workflows such as `dev/test-python.sh --mssql-python` still use
-the developer's sibling checkout; only use the pinned checkout when reproducing
-CI. A source pin does not freeze container tags or package indexes.
+the developer's sibling checkout. Set `BUILD_REASON=IndividualCI` when invoking
+the clone script to follow main locally. Use the logged HEAD as the pin to
+reproduce a specific CI run.
+A source pin does not freeze container tags or package indexes.
 
-To update manually, inspect
-`https://github.com/microsoft/mssql-python/compare/<old-sha>...<new-sha>`,
-replace the pin with the reviewed full lowercase SHA, and open a draft PR.
-Run the script tests (`python -m unittest discover -s .pipeline/scripts -p
-'test_*.py'`) and repository checks, then require both cross-repo jobs to pass on
-that exact proposed pin before merging. Revert a broken pin-update commit in a
-new PR rather than falling back to upstream main. Scheduled update PRs are a
-separate follow-up in #605.
+Python test failures in both cross-repo jobs block PR validation against the pin.
+In non-PR CI they report warnings and mark the test step `SucceededWithIssues`,
+without blocking the pipeline. Per-file crashes and timeouts reported as test
+failures by the ODBC runner follow the same policy. Checkout, build, and
+test-harness failures remain blocking in both modes. JUnit results are still
+published, including failed tests.
+
+The ODBC runner treats per-file pytest exit 2 as a test failure because a driver
+import error can prevent collection. Pytest internal/usage errors (3/4) and
+command-launch failures remain harness errors.
+
+To advance the pin, review the upstream commit comparison, replace the full SHA,
+and validate both cross-repo jobs in the pin-update PR. CI following main never
+updates the pin automatically.
 
 Keep the pin under `.pipeline/`: the public PR pipeline's configured path
 exclusions cover documentation and `.github/`, not `.pipeline/`. Both cross-repo
-jobs run in `Build_mssql_python` on PRs. Duplicate validation is reusable only
+jobs run in `Build_mssql_python` on PRs and in non-PR CI, except dedicated fuzz
+and long-haul runs. Duplicate PR validation is reusable only
 for a successful run of the same PR head SHA; a pin edit changes that SHA and
 must receive fresh validation. Do not exclude the pin from the pipeline's
 server-side PR trigger filters.
-
-The initial candidate came from historical green build 176345. That is not
-evidence that it passes on a newer mssql-rs revision; the pin PR's current
-cross-repo results are the acceptance check.
 
 ### Generate-SqlCertificates.ps1
 Generates and installs self-signed certificates for SQL Server TLS encryption.
