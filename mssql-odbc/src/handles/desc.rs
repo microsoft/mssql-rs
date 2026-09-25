@@ -480,13 +480,19 @@ impl DescHandle {
             if !record.udt_names_auto_filled {
                 continue;
             }
-            record.udt_names_auto_filled = false;
             let Some(names) = record.udt_names.as_mut() else {
+                record.udt_names_auto_filled = false;
                 continue;
             };
             if names.assembly_type_name.is_empty() {
                 record.udt_names = None;
+                record.udt_names_auto_filled = false;
             } else {
+                // Only the wire parts go. The record survives solely to carry
+                // the application's echo-only assembly name, so the identity
+                // is still the server's to supply - keep it auto-filled or
+                // `refine_ipd`'s gate would never refresh it again, stranding
+                // the parameter with an empty `type_name`.
                 names.catalog.clear();
                 names.schema.clear();
                 names.type_name.clear();

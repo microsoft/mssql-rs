@@ -468,12 +468,24 @@ fn refine_ipd(
                 .as_ref()
                 .map(|names| names.assembly_type_name.clone())
                 .unwrap_or_default();
-            record.udt_names = described.map(|(_, names)| {
+            // A describe that reports no UDT at this ordinal must not discard
+            // the record outright: it may exist only to carry that echo-only
+            // assembly name, which no describe can restore.
+            if let Some((_, names)) = described {
                 let mut names = names.clone();
                 names.assembly_type_name = assembly;
-                names
-            });
-            record.udt_names_auto_filled = record.udt_names.is_some();
+                record.udt_names = Some(names);
+                record.udt_names_auto_filled = true;
+            } else if !assembly.is_empty() {
+                record.udt_names = Some(Box::new(UdtNames {
+                    assembly_type_name: assembly,
+                    ..Default::default()
+                }));
+                record.udt_names_auto_filled = true;
+            } else {
+                record.udt_names = None;
+                record.udt_names_auto_filled = false;
+            }
         }
         if previous != record.parameter_definition() {
             first_changed.get_or_insert(i + 1);
@@ -1732,6 +1744,88 @@ mod tests {
             ipd_records(&h)[0].udt_names.as_ref().unwrap().type_name,
             "Point",
             "an application-supplied identity outranks the server's suggestion"
+        );
+    }
+
+    /// Steps 1-4 of the sequence `clear_auto_filled_udt_names` sits in the
+    /// middle of: describe, write an assembly name, re-prepare, describe again.
+    /// The assembly name is echo-only and never a claim on the wire identity,
+    /// so the record it leaves behind must stay refreshable - clearing the
+    /// provenance flag while keeping the record stranded the parameter with an
+    /// empty `type_name` that no later describe could refill, failing the
+    /// execute with `ERR_MISSING_UDT_TYPE_NAME`.
+    #[test]
+    fn an_assembly_name_does_not_strand_a_record_the_server_must_still_name() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let described = [param_description(SQL_SS_UDT, 8000, 0, SQL_NULLABLE)];
+        let ipd = unsafe { handle_from_raw::<DescHandle>(h.ipd()) };
+
+        refine_ipd(stmt, &described, &[(0, udt_identity("hierarchyid"))]);
+
+        // SQLSetDescField(SQL_CA_SS_UDT_ASSEMBLY_TYPE_NAME): echo-only state,
+        // deliberately not a claim on the wire identity.
+        {
+            let mut state = ipd.inner.lock().unwrap();
+            let record = state.record_mut(1).unwrap();
+            record.udt_names.as_mut().unwrap().assembly_type_name = "MyAsm".to_string();
+        }
+
+        // SQLPrepare with new SQL supersedes the described identity.
+        assert_eq!(ipd.clear_auto_filled_udt_names(), SQL_SUCCESS);
+
+        // The describe for the new SQL must still be able to name the type.
+        refine_ipd(stmt, &described, &[(0, udt_identity("geography"))]);
+
+        let record = &ipd_records(&h)[0];
+        let names = record.udt_names.as_ref().expect("record must survive");
+        assert_eq!(
+            names.type_name, "geography",
+            "a record kept only for its assembly name must stay refreshable"
+        );
+        assert_eq!(
+            names.assembly_type_name, "MyAsm",
+            "the application's assembly name survives the refresh around it"
+        );
+    }
+
+    /// The other half of the same rule: when a later describe reports no UDT
+    /// at this ordinal, the record may still exist only to carry the
+    /// application's echo-only assembly name. Dropping it outright would
+    /// discard state no describe can ever restore.
+    #[test]
+    fn a_describe_without_a_udt_keeps_an_application_assembly_name() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let ipd = unsafe { handle_from_raw::<DescHandle>(h.ipd()) };
+
+        refine_ipd(
+            stmt,
+            &[param_description(SQL_SS_UDT, 8000, 0, SQL_NULLABLE)],
+            &[(0, udt_identity("hierarchyid"))],
+        );
+        {
+            let mut state = ipd.inner.lock().unwrap();
+            let record = state.record_mut(1).unwrap();
+            record.udt_names.as_mut().unwrap().assembly_type_name = "MyAsm".to_string();
+        }
+
+        // The new SQL's marker 1 is an ordinary scalar: no UDT is described.
+        refine_ipd(
+            stmt,
+            &[param_description(SQL_INTEGER, 10, 0, SQL_NULLABLE)],
+            &[],
+        );
+
+        let record = &ipd_records(&h)[0];
+        let names = record
+            .udt_names
+            .as_ref()
+            .expect("a record carrying an assembly name must survive");
+        assert_eq!(names.assembly_type_name, "MyAsm");
+        assert!(
+            names.type_name.is_empty(),
+            "no describe supplied a wire identity, so it stays empty"
         );
     }
 
