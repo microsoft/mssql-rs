@@ -544,11 +544,18 @@ msodbcsql build is measured.
     `42000`; this driver declares the inner type at its non-max ceiling
     (`variant_column_size`) and refuses during parameter conversion with
     `22001`, saving the round trip.
-    Scope: only a *non-zero* overflow diverges. A payload whose bytes past the
-    ceiling are all zero is trimmed and sent by both drivers -
-    `trim_zero_overflow` is this driver's `CheckTrailingZeros`
-    (`sqlccnvt.cpp:8690`), so that case is parity, not deviation, and
-    `a_binary_variant_payload_past_the_byte_ceiling_is_truncation` pins it.
+    Scope: only a *non-zero* overflow is measured here. A payload whose bytes
+    past the ceiling are all zero takes `trim_zero_overflow`, which trims and
+    sends rather than refusing, and
+    `a_binary_variant_payload_past_the_byte_ceiling_is_truncation` pins that
+    half of this driver's behavior.
+    **Evidence limit:** whether msodbcsql also trims that case is a source
+    reading only - `trim_zero_overflow` mirrors `CheckTrailingZeros`
+    (`sqlccnvt.cpp:8690`) - and is *not* measured. Do not infer parity for the
+    zero-overflow boundary from this entry. Closing it needs a both-leg case
+    binding an oversized zero-filled binary `sql_variant` with `SQL_DRIVER_VER`
+    recorded; if the reference refuses it, the deviation here is wider than
+    stated.
     The rule is not new to binary payloads - `variant_column_size` already
     governed the character variants - but binary `sql_variant` parameters make
     it reachable for a second family of C types, so it is recorded here rather

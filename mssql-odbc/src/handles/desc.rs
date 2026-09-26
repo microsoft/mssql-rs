@@ -338,13 +338,27 @@ impl DescRecord {
             length,
             precision,
             scale,
-            udt: self.udt_names.as_ref().map(|names| {
-                Box::new((
-                    names.catalog.clone(),
-                    names.schema.clone(),
-                    names.type_name.clone(),
-                ))
-            }),
+            // Only the three wire parts, and only when at least one is set: a
+            // record carrying nothing but the echo-only assembly name declares
+            // no type, so it must project the same as a record with no
+            // identity at all. Projecting `Some(("", "", ""))` there orphaned a
+            // materialized prepared handle for a field the declaration never
+            // mentions.
+            udt: self
+                .udt_names
+                .as_ref()
+                .filter(|names| {
+                    !names.catalog.is_empty()
+                        || !names.schema.is_empty()
+                        || !names.type_name.is_empty()
+                })
+                .map(|names| {
+                    Box::new((
+                        names.catalog.clone(),
+                        names.schema.clone(),
+                        names.type_name.clone(),
+                    ))
+                }),
         }
     }
 
@@ -1051,6 +1065,24 @@ mod tests {
             point,
             record.parameter_definition(),
             "the assembly name never reaches the wire, so it cannot invalidate"
+        );
+
+        // The same rule from the other direction: a record that carries *only*
+        // an assembly name has no wire identity at all, so its projection must
+        // stay indistinguishable from a record with no identity. Projecting
+        // `Some(("", "", ""))` here orphaned a materialized prepared handle on
+        // an `SQL_CA_SS_UDT_ASSEMBLY_TYPE_NAME` write, forcing a re-prepare for
+        // a field that never reaches the declaration.
+        let mut assembly_only = DescRecord::default_for(DescKind::ImpParam);
+        assembly_only.concise_type = crate::api::odbc_types::SQL_SS_UDT;
+        assembly_only.udt_names = Some(Box::new(UdtNames {
+            assembly_type_name: "Asm.Point".to_string(),
+            ..Default::default()
+        }));
+        assert_eq!(
+            without_names,
+            assembly_only.parameter_definition(),
+            "an assembly-only record declares nothing, so it must not re-prepare"
         );
     }
 
