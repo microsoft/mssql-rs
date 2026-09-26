@@ -793,7 +793,7 @@ pub(crate) struct DaeParam {
     pub(crate) binding: BoundParam,
     /// The binding's UDT identity, owned here because the descriptor snapshot
     /// it came from does not outlive the execute that parks this sequence.
-    pub(crate) udt_names: Option<Box<UdtNames>>,
+    pub(crate) udt_names: Option<Arc<UdtNames>>,
     /// How a streamed chunk is re-encoded on its way to the wire. Filled in
     /// when the sequence is parked, where the connection's collation is known.
     pub(crate) transcode: Option<DaeTranscode>,
@@ -809,7 +809,7 @@ impl DaeParam {
         plan: DaePlan,
         length_limit: Option<DaeLengthLimit>,
         binding: BoundParam,
-        udt_names: Option<Box<UdtNames>>,
+        udt_names: Option<Arc<UdtNames>>,
     ) -> Self {
         Self {
             bound_index,

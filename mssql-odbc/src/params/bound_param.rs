@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 use std::ffi::c_void;
+use std::sync::Arc;
 
 use crate::api::odbc_types::{
     SQL_BIND_BY_COLUMN, SQL_C_DEFAULT, SQL_C_NUMERIC, SQL_PARAM_INPUT, SQL_PREC_NUMERIC, SqlLen,
@@ -79,7 +80,7 @@ pub(crate) struct BoundParam {
 pub(crate) struct ParamSnapshot {
     pub(crate) param: BoundParam,
     /// `None` for every parameter that is not a `SQL_SS_UDT`.
-    pub(crate) udt_names: Option<Box<UdtNames>>,
+    pub(crate) udt_names: Option<Arc<UdtNames>>,
 }
 
 impl From<BoundParam> for ParamSnapshot {

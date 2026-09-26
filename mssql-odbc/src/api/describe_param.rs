@@ -529,7 +529,7 @@ fn refine_ipd(
                         .unwrap_or_default();
                     let mut fresh = UdtNames::clone(names);
                     fresh.assembly_type_name = assembly;
-                    record.udt_names = Some(Box::new(fresh));
+                    record.udt_names = Some(Arc::new(fresh));
                     record.udt_names_auto_filled = true;
                 }
             } else {
@@ -539,7 +539,7 @@ fn refine_ipd(
                     .map(|names| names.assembly_type_name.clone())
                     .unwrap_or_default();
                 if !assembly.is_empty() {
-                    record.udt_names = Some(Box::new(UdtNames {
+                    record.udt_names = Some(Arc::new(UdtNames {
                         assembly_type_name: assembly,
                         ..Default::default()
                     }));
@@ -1827,7 +1827,7 @@ mod tests {
             let desc = unsafe { handle_from_raw::<DescHandle>(h.ipd()) };
             let mut state = desc.inner.lock().unwrap();
             let record = state.record_mut(1).unwrap();
-            record.udt_names = Some(Box::new(UdtNames::clone(&udt_identity("Point"))));
+            record.udt_names = Some(Arc::new(UdtNames::clone(&udt_identity("Point"))));
             record.udt_names_auto_filled = false;
         }
         refine_ipd(stmt, &described, &[(0, udt_identity("geography"))]);
@@ -1859,7 +1859,12 @@ mod tests {
         {
             let mut state = ipd.inner.lock().unwrap();
             let record = state.record_mut(1).unwrap();
-            record.udt_names.as_mut().unwrap().assembly_type_name = "MyAsm".to_string();
+            record
+                .udt_names
+                .as_mut()
+                .map(Arc::make_mut)
+                .unwrap()
+                .assembly_type_name = "MyAsm".to_string();
         }
 
         // SQLPrepare with new SQL supersedes the described identity.
@@ -1898,7 +1903,12 @@ mod tests {
         {
             let mut state = ipd.inner.lock().unwrap();
             let record = state.record_mut(1).unwrap();
-            record.udt_names.as_mut().unwrap().assembly_type_name = "MyAsm".to_string();
+            record
+                .udt_names
+                .as_mut()
+                .map(Arc::make_mut)
+                .unwrap()
+                .assembly_type_name = "MyAsm".to_string();
         }
 
         // The new SQL's marker 1 is an ordinary scalar: no UDT is described.
@@ -1939,7 +1949,7 @@ mod tests {
             let mut state = ipd.inner.lock().unwrap();
             state.set_record_count(1, ipd.kind);
             let record = state.record_mut(1).unwrap();
-            record.udt_names = Some(Box::new(UdtNames {
+            record.udt_names = Some(Arc::new(UdtNames {
                 assembly_type_name: "MyAsm".to_string(),
                 ..Default::default()
             }));
@@ -1979,7 +1989,7 @@ mod tests {
             let mut state = ipd.inner.lock().unwrap();
             state.set_record_count(1, ipd.kind);
             let record = state.record_mut(1).unwrap();
-            record.udt_names = Some(Box::new(UdtNames::clone(&udt_identity("Point"))));
+            record.udt_names = Some(Arc::new(UdtNames::clone(&udt_identity("Point"))));
             record.udt_names_auto_filled = false;
         }
 

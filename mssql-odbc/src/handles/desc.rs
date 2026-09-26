@@ -61,6 +61,7 @@
 //! data), unlike `SQLGetDescRecW`'s `Name` output.
 
 use std::ffi::c_void;
+use std::sync::Arc;
 use std::sync::Mutex;
 
 use super::{DbcHandle, HandleType, HasObjectType, StmtHandle, handle_from_raw};
@@ -267,7 +268,16 @@ pub(crate) struct DescRecord {
     /// `SQL_CA_SS_UDT_TYPE_NAME`. IPD only, and only for a `SQL_SS_UDT`
     /// parameter, so it is boxed rather than costing three strings on every
     /// record of every descriptor.
-    pub(crate) udt_names: Option<Box<UdtNames>>,
+    ///
+    /// `Arc`, not `Box`: `parameter_definition` snapshots this for the
+    /// before/after comparison that decides whether a prepared handle is
+    /// stale, and `refine_ipd` takes that snapshot twice per record on every
+    /// cache-served describe. Deep-copying the three names there cost O(N^2)
+    /// string allocations across a describe-all pass; sharing makes each
+    /// snapshot a refcount bump. Writers use `Arc::make_mut`, so a record
+    /// whose identity is also held by a live snapshot is copied once, on
+    /// write, rather than on every read.
+    pub(crate) udt_names: Option<Arc<UdtNames>>,
     /// IPD only: set when `refine_ipd` supplied `udt_names` from the server's
     /// `suggested_user_type_*` columns rather than the application supplying
     /// them through `SQLSetDescField`. Plays the same role for the UDT
@@ -295,7 +305,7 @@ pub(crate) struct UdtNames {
 }
 
 /// SQL-side inputs to the prepared declaration, compared only during IPD writes.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub(crate) struct ParameterDefinition {
     direction: SqlSmallInt,
     sql_type: SqlSmallInt,
@@ -306,8 +316,48 @@ pub(crate) struct ParameterDefinition {
     /// declaration and so must invalidate a materialized handle when it
     /// changes. The assembly-qualified name is excluded: it never reaches the
     /// wire, so rewriting it cannot change the prepared text.
-    udt: Option<Box<(String, String, String)>>,
+    ///
+    /// Shares the record's `Arc` rather than copying the names: this snapshot
+    /// is taken twice per record on every cache-served describe, so cloning
+    /// made the comparison itself the allocation cost it was meant to avoid.
+    /// `PartialEq` still compares the names by value, so a record whose
+    /// identity was replaced compares unequal even if the new `Arc` happens
+    /// to hold the same strings.
+    udt: Option<Arc<UdtNames>>,
 }
+
+impl PartialEq for ParameterDefinition {
+    /// Compares the three *wire* name parts, never `assembly_type_name`: it
+    /// does not reach the declaration, so rewriting it must not orphan a
+    /// prepared handle. A derived impl would compare it, since it lives on the
+    /// shared `UdtNames`.
+    ///
+    /// Pointer equality is checked first only as a fast path for the common
+    /// case where both snapshots share one `Arc`; the value comparison behind
+    /// it is what decides.
+    fn eq(&self, other: &Self) -> bool {
+        if self.direction != other.direction
+            || self.sql_type != other.sql_type
+            || self.length != other.length
+            || self.precision != other.precision
+            || self.scale != other.scale
+        {
+            return false;
+        }
+        match (&self.udt, &other.udt) {
+            (None, None) => true,
+            (Some(a), Some(b)) => {
+                Arc::ptr_eq(a, b)
+                    || (a.catalog == b.catalog
+                        && a.schema == b.schema
+                        && a.type_name == b.type_name)
+            }
+            _ => false,
+        }
+    }
+}
+
+impl Eq for ParameterDefinition {}
 
 impl DescRecord {
     pub(crate) fn parameter_definition(&self) -> ParameterDefinition {
@@ -361,13 +411,7 @@ impl DescRecord {
                     self.concise_type == crate::api::odbc_types::SQL_SS_UDT
                         && !names.type_name.is_empty()
                 })
-                .map(|names| {
-                    Box::new((
-                        names.catalog.clone(),
-                        names.schema.clone(),
-                        names.type_name.clone(),
-                    ))
-                }),
+                .map(Arc::clone),
         }
     }
 
@@ -504,7 +548,7 @@ impl DescHandle {
             if !record.udt_names_auto_filled {
                 continue;
             }
-            let Some(names) = record.udt_names.as_mut() else {
+            let Some(names) = record.udt_names.as_mut().map(Arc::make_mut) else {
                 record.udt_names_auto_filled = false;
                 continue;
             };
@@ -983,13 +1027,13 @@ mod tests {
             let mut state = handle.inner.lock().unwrap();
             state.set_record_count(2, DescKind::ImpParam);
             let described = state.record_mut(1).unwrap();
-            described.udt_names = Some(Box::new(UdtNames {
+            described.udt_names = Some(Arc::new(UdtNames {
                 type_name: "hierarchyid".to_string(),
                 ..Default::default()
             }));
             described.udt_names_auto_filled = true;
             let chosen = state.record_mut(2).unwrap();
-            chosen.udt_names = Some(Box::new(UdtNames {
+            chosen.udt_names = Some(Arc::new(UdtNames {
                 type_name: "Point".to_string(),
                 ..Default::default()
             }));
@@ -1019,7 +1063,7 @@ mod tests {
             let mut state = handle.inner.lock().unwrap();
             state.set_record_count(1, DescKind::ImpParam);
             let record = state.record_mut(1).unwrap();
-            record.udt_names = Some(Box::new(UdtNames {
+            record.udt_names = Some(Arc::new(UdtNames {
                 type_name: "hierarchyid".to_string(),
                 assembly_type_name: "Asm.Point".to_string(),
                 ..Default::default()
@@ -1053,7 +1097,7 @@ mod tests {
         record.concise_type = crate::api::odbc_types::SQL_SS_UDT;
         let without_names = record.parameter_definition();
 
-        record.udt_names = Some(Box::new(UdtNames {
+        record.udt_names = Some(Arc::new(UdtNames {
             catalog: String::new(),
             schema: "dbo".to_string(),
             type_name: "Point".to_string(),
@@ -1062,11 +1106,26 @@ mod tests {
         let point = record.parameter_definition();
         assert_ne!(without_names, point);
 
-        record.udt_names.as_mut().unwrap().type_name = "Shape".to_string();
+        record
+            .udt_names
+            .as_mut()
+            .map(Arc::make_mut)
+            .unwrap()
+            .type_name = "Shape".to_string();
         assert_ne!(point, record.parameter_definition());
 
-        record.udt_names.as_mut().unwrap().type_name = "Point".to_string();
-        record.udt_names.as_mut().unwrap().assembly_type_name = "Asm.Point".to_string();
+        record
+            .udt_names
+            .as_mut()
+            .map(Arc::make_mut)
+            .unwrap()
+            .type_name = "Point".to_string();
+        record
+            .udt_names
+            .as_mut()
+            .map(Arc::make_mut)
+            .unwrap()
+            .assembly_type_name = "Asm.Point".to_string();
         assert_eq!(
             point,
             record.parameter_definition(),
@@ -1081,7 +1140,7 @@ mod tests {
         // a field that never reaches the declaration.
         let mut assembly_only = DescRecord::default_for(DescKind::ImpParam);
         assembly_only.concise_type = crate::api::odbc_types::SQL_SS_UDT;
-        assembly_only.udt_names = Some(Box::new(UdtNames {
+        assembly_only.udt_names = Some(Arc::new(UdtNames {
             assembly_type_name: "Asm.Point".to_string(),
             ..Default::default()
         }));
@@ -1107,7 +1166,7 @@ mod tests {
         ] {
             let mut record = DescRecord::default_for(DescKind::ImpParam);
             record.concise_type = crate::api::odbc_types::SQL_SS_UDT;
-            record.udt_names = Some(Box::new(partial));
+            record.udt_names = Some(Arc::new(partial));
             assert_eq!(
                 without_names,
                 record.parameter_definition(),
@@ -1123,7 +1182,7 @@ mod tests {
         let mut scalar = DescRecord::default_for(DescKind::ImpParam);
         scalar.concise_type = crate::api::odbc_types::SQL_INTEGER;
         let scalar_plain = scalar.parameter_definition();
-        scalar.udt_names = Some(Box::new(UdtNames {
+        scalar.udt_names = Some(Arc::new(UdtNames {
             type_name: "Point".to_string(),
             ..Default::default()
         }));

@@ -21,6 +21,7 @@
 //! gap tracked in [#472](https://github.com/microsoft/mssql-rs/issues/472).
 
 use std::mem::size_of;
+use std::sync::Arc;
 
 use tracing::{debug, error};
 
@@ -716,7 +717,7 @@ fn set_udt_name(
         if field != SQL_CA_SS_UDT_ASSEMBLY_TYPE_NAME {
             r.udt_names_auto_filled = false;
         }
-        let names = r.udt_names.get_or_insert_with(Default::default);
+        let names = Arc::make_mut(r.udt_names.get_or_insert_with(Default::default));
         match field {
             SQL_CA_SS_UDT_CATALOG_NAME => names.catalog = value,
             SQL_CA_SS_UDT_SCHEMA_NAME => names.schema = value,
@@ -927,7 +928,7 @@ mod tests {
             let mut state = desc.inner.lock().unwrap();
             state.set_record_count(1, crate::handles::desc::DescKind::ImpParam);
             let record = state.record_mut(1).unwrap();
-            record.udt_names = Some(Box::new(crate::handles::desc::UdtNames {
+            record.udt_names = Some(Arc::new(crate::handles::desc::UdtNames {
                 type_name: "hierarchyid".to_string(),
                 ..Default::default()
             }));
