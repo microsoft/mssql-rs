@@ -186,7 +186,9 @@ fn sql_describe_param_safe(
             // exactly that cycle on every execution (microsoft/mssql-python#818).
             let cached_udt_names = stmt_state.parameter_udt_names.clone();
             drop(stmt_state);
-            refine_ipd(stmt, &cached, &cached_udt_names);
+            if refine_ipd(stmt, &cached, &cached_udt_names) != SQL_SUCCESS {
+                return post_refine_failure(stmt);
+            }
             write_description(
                 description,
                 data_type_ptr,
@@ -373,7 +375,9 @@ fn sql_describe_param_safe(
     // Dropped before refine_ipd locks the IPD: this crate never holds a
     // STMT lock while acquiring a DESC lock (see bind_col.rs's rationale).
     drop(stmt_state);
-    refine_ipd(stmt, &descriptions, &udt_names);
+    if refine_ipd(stmt, &descriptions, &udt_names) != SQL_SUCCESS {
+        return post_refine_failure(stmt);
+    }
     write_description(
         description,
         data_type_ptr,
@@ -424,11 +428,18 @@ fn sql_describe_param_safe(
 /// scan made a describe-all pass over N markers cost O(N^3) comparisons.
 /// `sql_describe_param_safe` sorts once before caching; the `debug_assert`
 /// below catches any future caller that forgets.
+/// Call only after the STMT lock has been dropped (see `bind_col.rs`'s
+/// locking-order rationale). Failure is reported, not swallowed: the UDT
+/// identity this writes is the only source of `SQL_CA_SS_UDT_TYPE_NAME` on the
+/// describe-before-bind route, so answering `SQL_SUCCESS` after it failed would
+/// surface later as a misleading missing-name error at execute, or reuse a
+/// stale prepared declaration. Matches `clear_auto_filled_udt_names`, which
+/// propagates its own poisoned-mutex failure for the same reason.
 fn refine_ipd(
     stmt: &StmtHandle,
     descriptions: &[ParameterDescription],
     udt_names: &[(usize, Arc<UdtNames>)],
-) {
+) -> SqlReturn {
     debug_assert!(
         udt_names.windows(2).all(|w| w[0].0 <= w[1].0),
         "refine_ipd requires udt_names sorted by ordinal for binary search"
@@ -436,7 +447,7 @@ fn refine_ipd(
     let desc = unsafe { handle_from_raw::<DescHandle>(stmt.ipd) };
     let Ok(mut desc_state) = desc.inner.lock() else {
         error!("SQLDescribeParam: ipd mutex poisoned; parameter metadata left unrefined");
-        return;
+        return SQL_ERROR;
     };
     let target_count = desc_state.records.len().max(descriptions.len());
     desc_state.set_record_count(target_count, desc.kind);
@@ -549,7 +560,26 @@ fn refine_ipd(
         && stmt.invalidate_parameter_definition(first_changed).is_err()
     {
         error!("SQLDescribeParam: failed invalidating refined parameter definition");
+        return SQL_ERROR;
     }
+    SQL_SUCCESS
+}
+
+/// Posts the diagnostic for a failed `refine_ipd` and returns `SQL_ERROR`.
+///
+/// The STMT lock is taken here rather than passed in: `refine_ipd` runs with it
+/// released, since this crate never holds a STMT lock while acquiring a DESC
+/// lock. Same shape as `SQLPrepareW`'s poisoned-IPD exit.
+fn post_refine_failure(stmt: &StmtHandle) -> SqlReturn {
+    if let Ok(mut stmt_state) = stmt.inner.lock() {
+        post_sql_error(
+            &mut stmt_state,
+            SQLSTATE_HY000,
+            0,
+            "Internal error refining parameter metadata",
+        );
+    }
+    SQL_ERROR
 }
 
 fn fail_metadata_response(
