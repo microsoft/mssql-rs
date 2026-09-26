@@ -339,22 +339,27 @@ impl DescRecord {
             precision,
             scale,
             // Only the three wire parts, and only on a record that actually
-            // declares a UDT. The `SQL_CA_SS_UDT_*` fields are writable on any
-            // IPD record (`classify_field` gates on kind, not type), but a
-            // non-UDT declaration never references them - and a record
-            // carrying nothing but the echo-only assembly name declares no
-            // type either. Projecting in those cases orphaned a materialized
-            // prepared handle for text the declaration does not contain. A
-            // later switch to `SQL_SS_UDT` still invalidates through
-            // `sql_type`, and brings the name with it.
+            // declares a UDT: the concise type says so, and a type name is
+            // present. The `SQL_CA_SS_UDT_*` fields are writable on any IPD
+            // record (`classify_field` gates on kind, not type), so without
+            // the first test a UDT name on an `int` marker would orphan a
+            // materialized prepared handle for text the declaration never
+            // contains. Without the second, a record holding only a catalog,
+            // schema or the echo-only assembly name would do the same - none
+            // of those declare a type, and `udt_type_name` refuses to execute
+            // such a record at all (`ERR_MISSING_UDT_TYPE_NAME`).
+            //
+            // "Has a wire identity" is deliberately the same test `refine_ipd`
+            // applies as `claimed`: a non-empty type name. Once one is present
+            // the catalog and schema travel with it, so changing either still
+            // invalidates, and a later switch to `SQL_SS_UDT` invalidates
+            // through `sql_type`.
             udt: self
                 .udt_names
                 .as_ref()
-                .filter(|_| self.concise_type == crate::api::odbc_types::SQL_SS_UDT)
                 .filter(|names| {
-                    !names.catalog.is_empty()
-                        || !names.schema.is_empty()
-                        || !names.type_name.is_empty()
+                    self.concise_type == crate::api::odbc_types::SQL_SS_UDT
+                        && !names.type_name.is_empty()
                 })
                 .map(|names| {
                     Box::new((
@@ -1088,6 +1093,30 @@ mod tests {
             assembly_only.parameter_definition(),
             "an assembly-only record declares nothing, so it must not re-prepare"
         );
+
+        // The same for a record holding only a catalog or only a schema: no
+        // type name means no declaration, and `udt_type_name` refuses to
+        // execute it. This is the test `refine_ipd` applies as `claimed`, so
+        // the two definitions of "has a wire identity" stay identical.
+        for partial in [
+            UdtNames {
+                catalog: "mydb".to_string(),
+                ..Default::default()
+            },
+            UdtNames {
+                schema: "dbo".to_string(),
+                ..Default::default()
+            },
+        ] {
+            let mut record = DescRecord::default_for(DescKind::ImpParam);
+            record.concise_type = crate::api::odbc_types::SQL_SS_UDT;
+            record.udt_names = Some(Box::new(partial));
+            assert_eq!(
+                without_names,
+                record.parameter_definition(),
+                "a qualification without a type name declares nothing"
+            );
+        }
 
         // A UDT name on a record that does not declare a UDT. The
         // `SQL_CA_SS_UDT_*` fields are writable on any IPD record, but an
