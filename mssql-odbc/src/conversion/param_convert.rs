@@ -26,6 +26,7 @@ use mssql_tds::datatypes::column_values::{
 };
 use mssql_tds::datatypes::decoder::DecimalParts;
 use mssql_tds::datatypes::sql_string::{EncodingType, SqlString, encode_narrow};
+use mssql_tds::datatypes::sql_udt::UdtTypeName;
 use mssql_tds::datatypes::sqldatatypes::VectorBaseType;
 use mssql_tds::datatypes::sqltypes::SqlType;
 use mssql_tds::message::parameters::rpc_parameters::{
@@ -38,18 +39,19 @@ use crate::api::odbc_types::{
     SQL_BIGINT, SQL_BINARY, SQL_BIT, SQL_C_BINARY, SQL_C_CHAR, SQL_C_WCHAR, SQL_CHAR,
     SQL_DATA_AT_EXEC, SQL_DECIMAL, SQL_DOUBLE, SQL_FLOAT, SQL_GUID, SQL_INTEGER,
     SQL_LEN_DATA_AT_EXEC_OFFSET, SQL_LONGVARBINARY, SQL_LONGVARCHAR, SQL_NULL_DATA, SQL_NUMERIC,
-    SQL_REAL, SQL_SMALLINT, SQL_SS_TIME2, SQL_SS_TIMESTAMPOFFSET, SQL_SS_VARIANT, SQL_SS_VECTOR,
-    SQL_SS_VECTOR_ELEMENT_SIZE, SQL_SS_XML, SQL_TINYINT, SQL_TYPE_DATE, SQL_TYPE_TIME,
-    SQL_TYPE_TIMESTAMP, SQL_VARBINARY, SQL_VARCHAR, SQL_WCHAR, SQL_WLONGVARCHAR, SQL_WVARCHAR,
-    SqlGuid, SqlLen, SqlNumericStruct, SqlSmallInt, SqlSsVectorLayout,
+    SQL_REAL, SQL_SMALLINT, SQL_SS_TIME2, SQL_SS_TIMESTAMPOFFSET, SQL_SS_UDT, SQL_SS_VARIANT,
+    SQL_SS_VECTOR, SQL_SS_VECTOR_ELEMENT_SIZE, SQL_SS_XML, SQL_TINYINT, SQL_TYPE_DATE,
+    SQL_TYPE_TIME, SQL_TYPE_TIMESTAMP, SQL_VARBINARY, SQL_VARCHAR, SQL_WCHAR, SQL_WLONGVARCHAR,
+    SQL_WVARCHAR, SqlGuid, SqlLen, SqlNumericStruct, SqlSmallInt, SqlSsVectorLayout,
 };
 use crate::api::sqlstate::{
     DiagMsg, ERR_DATA_AT_EXEC_NOT_STAGED, ERR_DATETIME_FIELD_OVERFLOW, ERR_INTERNAL_CONVERSION,
     ERR_INVALID_CHARACTER_VALUE, ERR_INVALID_DATETIME_FORMAT, ERR_INVALID_NULL_POINTER,
     ERR_INVALID_PARAM_PRECISION_OR_SCALE, ERR_INVALID_STRING_OR_BUFFER_LENGTH,
-    ERR_INVALID_USE_OF_DEFAULT_PARAM, ERR_MEMORY_ALLOCATION, ERR_NUMERIC_OUT_OF_RANGE,
-    ERR_PARAM_C_TYPE_NOT_IMPLEMENTED, ERR_PARAM_CONVERSION_NOT_IMPLEMENTED,
-    ERR_PARAM_SQL_TYPE_NOT_IMPLEMENTED, ERR_PARAM_STRING_TRUNCATION, ERR_RESTRICTED_DATA_TYPE,
+    ERR_INVALID_USE_OF_DEFAULT_PARAM, ERR_MEMORY_ALLOCATION, ERR_MISSING_UDT_TYPE_NAME,
+    ERR_NUMERIC_OUT_OF_RANGE, ERR_PARAM_C_TYPE_NOT_IMPLEMENTED,
+    ERR_PARAM_CONVERSION_NOT_IMPLEMENTED, ERR_PARAM_SQL_TYPE_NOT_IMPLEMENTED,
+    ERR_PARAM_STRING_TRUNCATION, ERR_RESTRICTED_DATA_TYPE,
 };
 use crate::api::type_rules::{
     SQL_PREC_BIGCHARBINARY, SQL_PREC_NCHAR, SQL_PREC_NTEXT, SQL_PREC_NUMERIC, SQL_PREC_TEXTIMAGE,
@@ -65,6 +67,7 @@ use crate::conversion::numeric::{
     parse_numeric_text_with_policy,
 };
 use crate::conversion::param_buffer::{AppValue, Indicator, read_indicator, read_param_value};
+use crate::handles::desc::UdtNames;
 use crate::params::BoundParam;
 
 /// Why a bound parameter could not be turned into an RPC parameter.
@@ -115,6 +118,9 @@ pub(crate) enum ParamBuildError {
     /// Backstop only: the C and SQL families are both known but the pairing
     /// between them is not built yet, so the matrix and this module disagree.
     ConversionNotImplemented,
+    /// A `SQL_SS_UDT` parameter with no `SQL_CA_SS_UDT_TYPE_NAME` on its IPD
+    /// record. The server cannot resolve the type without it.
+    MissingUdtTypeName,
     /// The value could not be represented in the target SQL type.
     Value(ConvError),
 }
@@ -137,6 +143,7 @@ impl ParamBuildError {
             }
             Self::UnsupportedSqlType(_) => ERR_PARAM_SQL_TYPE_NOT_IMPLEMENTED,
             Self::ConversionNotImplemented => ERR_PARAM_CONVERSION_NOT_IMPLEMENTED,
+            Self::MissingUdtTypeName => ERR_MISSING_UDT_TYPE_NAME,
             Self::Value(ConvError::OutOfRange) => ERR_NUMERIC_OUT_OF_RANGE,
             // Exhaustiveness backstop; parameters use Self::DateTimeFieldOverflow.
             Self::Value(ConvError::DatetimeFieldOverflow) => ERR_DATETIME_FIELD_OVERFLOW,
@@ -202,8 +209,10 @@ pub(crate) unsafe fn data_at_exec_indicator(param: &BoundParam) -> Option<SqlLen
 pub(crate) unsafe fn bound_param_to_rpc(
     name: impl Into<Option<String>>,
     param: &BoundParam,
+    udt_names: Option<&UdtNames>,
 ) -> Result<(RpcParameter, ConvOk), ParamBuildError> {
-    let ((value, type_metadata), outcome) = unsafe { bound_param_to_value_with_outcome(param) }?;
+    let ((value, type_metadata), outcome) =
+        unsafe { bound_param_to_value_with_outcome(param, udt_names) }?;
     // BY_REF_VALUE is what makes the server send a RETURNVALUE token back for
     // this parameter; without it an OUTPUT binding would be sent as a plain
     // input and silently produce nothing.
@@ -248,7 +257,19 @@ pub(crate) unsafe fn bound_param_to_rpc(
 pub(crate) unsafe fn bound_param_to_value(
     param: &BoundParam,
 ) -> Result<TypedValue, ParamBuildError> {
-    unsafe { bound_param_to_value_with_outcome(param) }.map(|(value, _)| value)
+    unsafe { bound_param_to_value_with_outcome(param, None) }.map(|(value, _)| value)
+}
+
+/// Same, for the UDT cases that need an identity the binding no longer carries.
+///
+/// # Safety
+/// See [`bound_param_to_value_with_outcome`].
+#[cfg(test)]
+pub(crate) unsafe fn bound_param_to_value_named(
+    param: &BoundParam,
+    udt_names: Option<&UdtNames>,
+) -> Result<TypedValue, ParamBuildError> {
+    unsafe { bound_param_to_value_with_outcome(param, udt_names) }.map(|(value, _)| value)
 }
 
 /// # Safety
@@ -258,17 +279,28 @@ pub(crate) unsafe fn bound_param_to_value(
 #[inline]
 unsafe fn bound_param_to_value_with_outcome(
     param: &BoundParam,
+    udt_names: Option<&UdtNames>,
 ) -> Result<(TypedValue, ConvOk), ParamBuildError> {
     if is_output_only(param.input_output_type) {
-        return typed_null(param.sql_type, param.column_size, param.decimal_digits)
-            .map(|value| (value, ConvOk::Exact));
+        return typed_null(
+            param.sql_type,
+            param.column_size,
+            param.decimal_digits,
+            udt_names,
+        )
+        .map(|value| (value, ConvOk::Exact));
     }
     // NULL is settled from the indicator alone, so a typed NULL never reads the
     // value buffer.
     let len_spec = match unsafe { read_indicator(param) }? {
         Indicator::Null => {
-            return typed_null(param.sql_type, param.column_size, param.decimal_digits)
-                .map(|value| (value, ConvOk::Exact));
+            return typed_null(
+                param.sql_type,
+                param.column_size,
+                param.decimal_digits,
+                udt_names,
+            )
+            .map(|value| (value, ConvOk::Exact));
         }
         Indicator::Length(len) => len,
     };
@@ -343,6 +375,39 @@ unsafe fn bound_param_to_value_with_outcome(
             variant_column_size(param.column_size, SQL_WVARCHAR),
             AppText::Utf16(bytes),
         )?),
+        // msodbcsql picks a variant's inner type from the C type alone:
+        // `CTypeToSqlType` (`sqlcprot.h`) answers `SQL_VARBINARY` for a binary
+        // buffer.
+        (AppValue::Binary(bytes), SqlFamily::Variant) => variant_of(convert_binary_sql(
+            SQL_VARBINARY,
+            variant_column_size(param.column_size, SQL_VARBINARY),
+            bytes,
+        )?),
+        // A UDT's payload is its `IBinarySerialize` form, which the driver
+        // passes through untouched - there is nothing to convert, only to name.
+        //
+        // Binary only. `fValidConversion` also admits `SQL_C_CHAR` and
+        // `SQL_C_WCHAR`, but msodbcsql hex-decodes those rather than passing
+        // them through - `rgbTRANSTYPE*` gives `SQL_UDT_MAPPED` a
+        // `SQL_C_BINARY` transfer type (`sqlcmisc.cpp:67`, `:178`, `:217`), so
+        // `ConvertLongData` misses its pass-through guard
+        // (`sqlccnvt.cpp:874-877`) and reaches the branch commented "CHAR/WCHAR
+        // ->binary (2 chars are converted to only one single binary byte)"
+        // (`sqlccnvt.cpp:1014-1016`), with the `cbMax*2` checks at
+        // `sqlcfunc.cpp:3048-3063` corroborating the ratio. Sending the buffer
+        // verbatim instead would put different bytes on the wire for the same
+        // binding, so those rows stay out of the conversion matrix and are
+        // refused at bind rather than shipped divergent.
+        //
+        // Source reading only, unmeasured on retail. Closing it needs a
+        // both-legs run binding `SQL_C_CHAR` against a `hierarchyid` with
+        // `SQL_DRIVER_VER` recorded, which decides whether to implement the
+        // decode here or register the difference. Note `SQL_NTS` is unusable
+        // for that binding: a serialized `hierarchyid` contains embedded nulls,
+        // so the length must be explicit. AB#48248.
+        (AppValue::Binary(bytes), SqlFamily::Udt) => {
+            SqlType::Udt(udt_type_name(udt_names)?, Some(bytes))
+        }
         _ => return Err(ParamBuildError::ConversionNotImplemented),
     };
 
@@ -634,6 +699,7 @@ pub(crate) fn dae_length_limit(
 pub(crate) fn buffered_dae_to_rpc(
     name: String,
     binding: &BoundParam,
+    udt_names: Option<&UdtNames>,
     buffer: &[u8],
     is_null: bool,
 ) -> Result<(RpcParameter, ConvOk), ParamBuildError> {
@@ -643,7 +709,7 @@ pub(crate) fn buffered_dae_to_rpc(
         SqlLen::try_from(buffer.len()).map_err(|_| ParamBuildError::StringTruncation)?
     };
     let synthetic = buffered_dae_binding(binding, buffer, &mut indicator);
-    unsafe { bound_param_to_rpc(name, &synthetic) }
+    unsafe { bound_param_to_rpc(name, &synthetic, udt_names) }
 }
 
 fn buffered_dae_binding(binding: &BoundParam, buffer: &[u8], indicator: &mut SqlLen) -> BoundParam {
@@ -916,6 +982,9 @@ enum SqlFamily {
     /// `sql_variant` wraps whatever the application supplied; the declaration is
     /// the inner type's, not a `sql_variant` of its own.
     Variant,
+    /// A CLR UDT takes opaque bytes; its identity comes from the descriptor
+    /// rather than from the value.
+    Udt,
 }
 
 /// `None` for a SQL type no builder covers yet, which the bind-time matrix has
@@ -938,6 +1007,7 @@ fn sql_family(sql_type: SqlSmallInt) -> Option<SqlFamily> {
         | SQL_SS_TIMESTAMPOFFSET => Some(SqlFamily::DateTime),
         SQL_SS_XML => Some(SqlFamily::Xml),
         SQL_SS_VARIANT => Some(SqlFamily::Variant),
+        SQL_SS_UDT => Some(SqlFamily::Udt),
         _ => None,
     }
 }
@@ -1341,7 +1411,8 @@ fn character_max_length(sql_type: SqlSmallInt) -> usize {
 ///
 /// The ceiling comes from [`character_max_length`], the one
 /// [`convert_character_sql`] applies, so the two cannot drift apart and put
-/// `max` back inside a variant.
+/// `max` back inside a variant. A `SQL_VARBINARY` target takes the narrow
+/// branch of that helper, which is also `varbinary`'s own non-`max` bound.
 ///
 /// Measured on retail 18.6.2.1 at representative sizes through 100000: a wide
 /// variant binding executes without landing on a `max` inner type.
@@ -1749,6 +1820,7 @@ fn typed_null(
     sql_type: SqlSmallInt,
     column_size: usize,
     decimal_digits: SqlSmallInt,
+    udt_names: Option<&UdtNames>,
 ) -> Result<TypedValue, ParamBuildError> {
     let value = match sql_type {
         SQL_BIT => SqlType::Bit(None),
@@ -1808,9 +1880,12 @@ fn typed_null(
             let (dimensions, base_type) = vector_metadata(column_size, decimal_digits)?;
             SqlType::Vector(None, dimensions, base_type)
         }
-        // `SQL_SS_UDT` and `SQL_SS_TABLE` need the fully qualified server type
-        // name, which `SQLDescribeParam` does not report and this driver has no
-        // other way to obtain, so they are rejected up front at bind time.
+        // A NULL UDT still names its type: the server resolves the parameter
+        // from the header, which carries the name whether or not there is a
+        // payload.
+        SQL_SS_UDT => SqlType::Udt(udt_type_name(udt_names)?, None),
+        // `SQL_SS_TABLE` is a separate feature (AB#48148) and has no binding
+        // here, so it is rejected up front.
         other => return Err(ParamBuildError::UnsupportedSqlType(other)),
     };
     Ok((value, None))
@@ -1898,6 +1973,27 @@ fn datetime_metadata(
             scale: Some(MAX_DATETIME_SCALE),
         },
         app_scale,
+    ))
+}
+
+/// Builds the wire name for a UDT parameter from the IPD's `SQL_CA_SS_UDT_*`
+/// fields.
+///
+/// Those fields have two sources: the application, via `SQLSetDescField`, and
+/// the server, via the `suggested_user_type_*` columns that `SQLDescribeParam`
+/// copies into the IPD (see `refine_ipd`). An application-supplied identity
+/// wins. The type name itself is mandatory - with neither source the server
+/// cannot resolve the parameter. msodbcsql refuses the same binding, with "At
+/// least 3-parts name of a UDT type should be present" (`sqlccmd.cpp`).
+fn udt_type_name(names: Option<&UdtNames>) -> Result<UdtTypeName, ParamBuildError> {
+    let names = names.filter(|n| !n.type_name.is_empty());
+    let Some(names) = names else {
+        return Err(ParamBuildError::MissingUdtTypeName);
+    };
+    Ok(UdtTypeName::new(
+        Some(names.catalog.clone()).filter(|s| !s.is_empty()),
+        Some(names.schema.clone()).filter(|s| !s.is_empty()),
+        names.type_name.clone(),
     ))
 }
 
@@ -2063,7 +2159,7 @@ mod tests {
                 binding.app_precision = app_precision;
                 source.precision = source_precision;
                 let ((_, wire_metadata), _) =
-                    unsafe { bound_param_to_value_with_outcome(&binding) }.unwrap();
+                    unsafe { bound_param_to_value_with_outcome(&binding, None) }.unwrap();
                 assert_eq!(
                     wire_metadata.unwrap().precision,
                     Some(if app_precision == 12 {
@@ -2073,7 +2169,7 @@ mod tests {
                     })
                 );
                 let (parameter, outcome) =
-                    unsafe { bound_param_to_rpc(Some("@P1".into()), &binding) }.unwrap();
+                    unsafe { bound_param_to_rpc(Some("@P1".into()), &binding, None) }.unwrap();
                 assert_eq!(outcome, ConvOk::Exact);
                 assert_eq!(
                     rpc_parameter_declaration(&parameter).unwrap(),
@@ -3657,6 +3753,100 @@ mod tests {
         }
     }
 
+    /// `SQL_C_BINARY` -> `SQL_SS_VARIANT` wraps `varbinary`, the inner type
+    /// msodbcsql's `CTypeToSqlType` (`sqlcprot.h`) names for a binary buffer.
+    /// Same clamp as the character cases, counted in bytes rather than
+    /// characters.
+    #[test]
+    fn a_binary_variant_wraps_a_bounded_varbinary_declaration() {
+        let cases: &[(usize, u16)] = &[
+            (8, 8),
+            // Unstated: the byte ceiling, not `max`.
+            (0, SQL_PREC_BIGCHARBINARY as u16),
+            // Past the ceiling: clamped, not `max`.
+            (SQL_PREC_BIGCHARBINARY + 1, SQL_PREC_BIGCHARBINARY as u16),
+            (usize::MAX, SQL_PREC_BIGCHARBINARY as u16),
+        ];
+
+        for &(column_size, expected) in cases {
+            let mut bytes = vec![0xDEu8, 0xAD];
+            let mut ind: SqlLen = 2;
+            let mut p = param(SQL_C_BINARY, bytes.as_mut_ptr() as *mut c_void, &mut ind);
+            p.sql_type = SQL_SS_VARIANT;
+            p.column_size = column_size;
+            let (value, _) = unsafe { bound_param_to_value(&p) }.unwrap();
+            match value {
+                SqlType::Variant(inner) => assert!(
+                    matches!(*inner, SqlType::VarBinary(Some(_), n) if n == expected),
+                    "column_size {column_size}: got {inner:?}"
+                ),
+                other => panic!("column_size {column_size}: expected Variant, got {other:?}"),
+            }
+        }
+    }
+
+    /// A binary payload past the variant's 8000-byte limit is refused during
+    /// parameter conversion - `SQLExecute`, not `SQLBindParameter`, which only
+    /// records the binding - matching the character variants. A zero-only
+    /// overflow still trims, since the clamp hands `convert_binary_sql` the
+    /// same `CheckTrailingZeros` rule a bounded `varbinary` target gets.
+    #[test]
+    fn a_binary_variant_payload_past_the_byte_ceiling_is_truncation() {
+        let mut bytes = vec![0xFFu8; SQL_PREC_BIGCHARBINARY + 1];
+        let mut ind: SqlLen = SqlLen::try_from(bytes.len()).unwrap();
+        let mut p = param(SQL_C_BINARY, bytes.as_mut_ptr() as *mut c_void, &mut ind);
+        p.sql_type = SQL_SS_VARIANT;
+        p.column_size = 0;
+
+        let err = unsafe { bound_param_to_value(&p) }.unwrap_err();
+        assert_eq!(err, ParamBuildError::StringTruncation);
+        assert_eq!(err.diag().state, *b"22001");
+
+        // The accept side of the same boundary: a payload exactly at the
+        // ceiling converts intact. Pins the ceiling itself - shortening it by
+        // one byte fails here - which the reject case above cannot show.
+        let mut at_limit = vec![0xFFu8; SQL_PREC_BIGCHARBINARY];
+        let mut ind: SqlLen = SqlLen::try_from(at_limit.len()).unwrap();
+        let mut p = param(SQL_C_BINARY, at_limit.as_mut_ptr() as *mut c_void, &mut ind);
+        p.sql_type = SQL_SS_VARIANT;
+        p.column_size = 0;
+
+        let (value, _) = unsafe { bound_param_to_value(&p) }.unwrap();
+        let SqlType::Variant(inner) = value else {
+            panic!("expected Variant, got {value:?}");
+        };
+        assert!(
+            matches!(*inner, SqlType::VarBinary(Some(ref b), _) if b.len() == SQL_PREC_BIGCHARBINARY),
+            "a payload exactly at the ceiling must convert intact, got {inner:?}"
+        );
+
+        // Zero-only overflow: padding rather than data, so it is trimmed and
+        // sent instead of refused. This is the leg parity deviation 20 cites -
+        // the reject case above uses `0xFF` and cannot show it, and
+        // `an_all_zero_binary_overflow_is_trimmed_silently` covers the plain
+        // `varbinary`/`binary`/`image` targets rather than a variant.
+        let mut zero_padded = vec![0xFFu8; SQL_PREC_BIGCHARBINARY];
+        zero_padded.push(0x00);
+        let mut ind: SqlLen = SqlLen::try_from(zero_padded.len()).unwrap();
+        let mut p = param(
+            SQL_C_BINARY,
+            zero_padded.as_mut_ptr() as *mut c_void,
+            &mut ind,
+        );
+        p.sql_type = SQL_SS_VARIANT;
+        p.column_size = 0;
+
+        let (value, _) = unsafe { bound_param_to_value(&p) }
+            .expect("an all-zero overflow is padding, so it trims rather than failing");
+        let SqlType::Variant(inner) = value else {
+            panic!("expected Variant, got {value:?}");
+        };
+        assert!(
+            matches!(*inner, SqlType::VarBinary(Some(ref b), _) if b.len() == SQL_PREC_BIGCHARBINARY),
+            "the zero padding is dropped, leaving the payload at the ceiling, got {inner:?}"
+        );
+    }
+
     /// Every newly bound row must produce a typed NULL from `ParameterType`
     /// alone, since a defaulted binding of these types is the common case and a
     /// NULL has no buffer to read.
@@ -3782,7 +3972,7 @@ mod tests {
             checked += 1;
             assert!(
                 !matches!(
-                    typed_null(sql_type, 10, 0),
+                    typed_null(sql_type, 10, 0, None),
                     Err(ParamBuildError::UnsupportedSqlType(_))
                 ),
                 "no typed NULL for supported SQL type {sql_type}"
@@ -5717,7 +5907,8 @@ mod tests {
             p.column_size = 8;
             p.buffer_length = 8;
             assert!(unsafe { data_at_exec_indicator(&p) }.is_none());
-            let (rpc, outcome) = unsafe { bound_param_to_rpc(Some("@P1".into()), &p) }.unwrap();
+            let (rpc, outcome) =
+                unsafe { bound_param_to_rpc(Some("@P1".into()), &p, None) }.unwrap();
             assert!(
                 mssql_tds::test_client_support::rpc_parameter_status(&rpc)
                     .contains(StatusFlags::BY_REF_VALUE)
@@ -5749,7 +5940,7 @@ mod tests {
                 let mut p = param(SQL_C_CHAR, value.as_mut_ptr().cast(), &mut length);
                 p.input_output_type = direction;
                 p.sql_type = SQL_INTEGER;
-                let (rpc, _) = unsafe { bound_param_to_rpc(name, &p) }.unwrap();
+                let (rpc, _) = unsafe { bound_param_to_rpc(name, &p, None) }.unwrap();
                 assert_eq!(
                     rpc_parameter_status(&rpc).bits(),
                     expected.bits(),
@@ -5771,7 +5962,7 @@ mod tests {
             p.decimal_digits = 3;
             assert!(unsafe { data_at_exec_indicator(&p) }.is_none());
             let ((value, metadata), outcome) =
-                unsafe { bound_param_to_value_with_outcome(&p) }.unwrap();
+                unsafe { bound_param_to_value_with_outcome(&p, None) }.unwrap();
             assert!(matches!(value, SqlType::Decimal(None)));
             assert_eq!(metadata.unwrap().precision, Some(12));
             assert_eq!(metadata.unwrap().scale, Some(3));
@@ -5845,13 +6036,237 @@ mod tests {
         assert!(matches!(value, SqlType::NVarcharMax(None)));
     }
 
+    /// A UDT binding with no `SQL_CA_SS_UDT_TYPE_NAME` cannot be declared: the
+    /// server resolves the type from the name, so there is nothing to send.
+    /// msodbcsql refuses the same binding before execute.
     #[test]
-    fn null_indicator_unsupported_sql_type_is_rejected() {
+    fn a_udt_without_a_type_name_is_rejected() {
         let mut ind: SqlLen = SQL_NULL_DATA;
         let mut p = param(SQL_C_CHAR, std::ptr::null_mut(), &mut ind);
         p.sql_type = SQL_SS_UDT;
         let err = unsafe { bound_param_to_value(&p) }.unwrap_err();
-        assert_eq!(err, ParamBuildError::UnsupportedSqlType(SQL_SS_UDT));
+        assert_eq!(err, ParamBuildError::MissingUdtTypeName);
+    }
+
+    fn udt_binding(type_name: &str, catalog: &str, schema: &str) -> Option<Box<UdtNames>> {
+        Some(Box::new(UdtNames {
+            catalog: catalog.to_string(),
+            schema: schema.to_string(),
+            type_name: type_name.to_string(),
+            assembly_type_name: String::new(),
+        }))
+    }
+
+    /// The payload reaches the wire untouched: a UDT's bytes are its own
+    /// serialized form, so there is nothing to convert, only to name.
+    #[test]
+    fn a_udt_passes_its_payload_through_unchanged() {
+        let mut bytes = vec![0x01u8, 0x02, 0xFE];
+        let mut ind: SqlLen = 3;
+        let mut p = param(SQL_C_BINARY, bytes.as_mut_ptr() as *mut c_void, &mut ind);
+        p.sql_type = SQL_SS_UDT;
+        let names = udt_binding("hierarchyid", "", "");
+
+        let (value, _) = unsafe { bound_param_to_value_named(&p, names.as_deref()) }.unwrap();
+        match value {
+            SqlType::Udt(name, Some(payload)) => {
+                assert_eq!(payload, vec![0x01, 0x02, 0xFE]);
+                assert_eq!(name.type_name, "hierarchyid");
+                assert_eq!(name.db_name, None);
+                assert_eq!(name.schema_name, None);
+            }
+            other => panic!("expected a UDT, got {other:?}"),
+        }
+    }
+
+    /// A character buffer does not reach a UDT: msodbcsql hex-decodes one,
+    /// two characters to the byte, rather than passing it through, so
+    /// admitting the row while sending the buffer verbatim would put different
+    /// bytes on the wire for the same binding. Refused past the bind gate the
+    /// same way, via the `_ =>` unsupported-conversion arm.
+    ///
+    /// Source reading only - see the citation chain on the `SqlFamily::Udt`
+    /// arm in `bound_param_to_value`. A measured retail run may turn this into
+    /// an implemented decode (AB#48248).
+    #[test]
+    fn a_character_buffer_does_not_reach_a_udt() {
+        for c_type in [SQL_C_WCHAR, SQL_C_CHAR] {
+            // UTF-16LE 'A' - even length so a wide read would be well-formed.
+            let mut bytes = vec![0x41u8, 0x00];
+            let mut ind: SqlLen = 2;
+            let mut p = param(c_type, bytes.as_mut_ptr() as *mut c_void, &mut ind);
+            p.sql_type = SQL_SS_UDT;
+            let names = udt_binding("hierarchyid", "", "");
+
+            let err = unsafe { bound_param_to_value_named(&p, names.as_deref()) }.unwrap_err();
+            assert_eq!(err, ParamBuildError::ConversionNotImplemented, "{c_type}");
+        }
+    }
+
+    /// Catalog and schema are optional and only sent when the application set
+    /// them; an empty part is absent rather than an empty name.
+    #[test]
+    fn a_udt_carries_the_qualification_the_application_supplied() {
+        let mut bytes = vec![0u8];
+        let mut ind: SqlLen = 1;
+        let mut p = param(SQL_C_BINARY, bytes.as_mut_ptr() as *mut c_void, &mut ind);
+        p.sql_type = SQL_SS_UDT;
+        let names = udt_binding("Point", "mydb", "dbo");
+
+        let (value, _) = unsafe { bound_param_to_value_named(&p, names.as_deref()) }.unwrap();
+        match value {
+            SqlType::Udt(name, _) => {
+                assert_eq!(name.db_name.as_deref(), Some("mydb"));
+                assert_eq!(name.schema_name.as_deref(), Some("dbo"));
+                assert_eq!(name.type_name, "Point");
+            }
+            other => panic!("expected a UDT, got {other:?}"),
+        }
+    }
+
+    /// A NULL UDT still declares its type: the header carries the name whether
+    /// or not there is a payload.
+    #[test]
+    fn a_null_udt_still_names_its_type() {
+        let mut ind: SqlLen = SQL_NULL_DATA;
+        let mut p = param(SQL_C_BINARY, std::ptr::null_mut(), &mut ind);
+        p.sql_type = SQL_SS_UDT;
+        let names = udt_binding("hierarchyid", "", "");
+
+        let (value, _) = unsafe { bound_param_to_value_named(&p, names.as_deref()) }.unwrap();
+        match value {
+            SqlType::Udt(name, None) => assert_eq!(name.type_name, "hierarchyid"),
+            other => panic!("expected a NULL UDT, got {other:?}"),
+        }
+    }
+
+    /// A UDT streams through data-at-execution in msodbcsql's own regression
+    /// suite (`TCLargeUDT.cpp`, `variation_10`, which supplies a 100017-byte
+    /// value that way). It is collected rather than streamed here - the same
+    /// way every PLP target except character and binary behaves, tracked by
+    /// AB#48349 - but the collected bytes must still reach the wire as the
+    /// UDT's payload, with the name carried across from the original binding.
+    #[test]
+    fn a_udt_supplied_at_execution_keeps_its_name_and_payload() {
+        let mut stale_indicator = SQL_DATA_AT_EXEC;
+        let mut binding = param(SQL_C_BINARY, std::ptr::null_mut(), &mut stale_indicator);
+        binding.sql_type = SQL_SS_UDT;
+        let names = udt_binding("hierarchyid", "", "dbo");
+
+        assert_eq!(dae_plan(SQL_C_BINARY, SQL_SS_UDT), Ok(DaePlan::Buffer));
+
+        let mut buffered_length = 3;
+        let synthetic = buffered_dae_binding(&binding, &[0x5A, 0x00, 0x01], &mut buffered_length);
+        match unsafe { bound_param_to_value_named(&synthetic, names.as_deref()) }
+            .unwrap()
+            .0
+        {
+            SqlType::Udt(name, Some(payload)) => {
+                assert_eq!(payload, vec![0x5A, 0x00, 0x01]);
+                assert_eq!(name.type_name, "hierarchyid");
+                assert_eq!(name.schema_name.as_deref(), Some("dbo"));
+            }
+            other => panic!("expected a UDT, got {other:?}"),
+        }
+    }
+
+    /// Each parameter carries its own identity: msodbcsql sets
+    /// `SQL_CA_SS_UDT_TYPE_NAME` per IPD record, so two UDT parameters in one
+    /// statement must not share a name.
+    #[test]
+    fn each_udt_parameter_carries_its_own_type_name() {
+        let mut first_bytes = vec![1u8];
+        let mut second_bytes = vec![2u8];
+        let mut first_ind: SqlLen = 1;
+        let mut second_ind: SqlLen = 1;
+
+        let mut first = param(
+            SQL_C_BINARY,
+            first_bytes.as_mut_ptr() as *mut c_void,
+            &mut first_ind,
+        );
+        first.sql_type = SQL_SS_UDT;
+        let first_names = udt_binding("hierarchyid", "", "");
+
+        let mut second = param(
+            SQL_C_BINARY,
+            second_bytes.as_mut_ptr() as *mut c_void,
+            &mut second_ind,
+        );
+        second.sql_type = SQL_SS_UDT;
+        let second_names = udt_binding("Point", "mydb", "dbo");
+
+        let (first_value, _) =
+            unsafe { bound_param_to_value_named(&first, first_names.as_deref()) }.unwrap();
+        let (second_value, _) =
+            unsafe { bound_param_to_value_named(&second, second_names.as_deref()) }.unwrap();
+        match (first_value, second_value) {
+            (SqlType::Udt(a, _), SqlType::Udt(b, _)) => {
+                assert_eq!(a.type_name, "hierarchyid");
+                assert_eq!(a.db_name, None);
+                assert_eq!(b.type_name, "Point");
+                assert_eq!(b.db_name.as_deref(), Some("mydb"));
+            }
+            other => panic!("expected two UDTs, got {other:?}"),
+        }
+    }
+
+    /// A zero-length payload is a legal UDT value and distinct from NULL: the
+    /// header declares a present value of length zero.
+    #[test]
+    fn an_empty_udt_payload_is_not_null() {
+        let mut bytes = vec![0u8];
+        let mut ind: SqlLen = 0;
+        let mut p = param(SQL_C_BINARY, bytes.as_mut_ptr() as *mut c_void, &mut ind);
+        p.sql_type = SQL_SS_UDT;
+        let names = udt_binding("hierarchyid", "", "");
+
+        let (value, _) = unsafe { bound_param_to_value_named(&p, names.as_deref()) }.unwrap();
+        match value {
+            SqlType::Udt(_, Some(payload)) => assert!(payload.is_empty()),
+            other => panic!("expected an empty UDT payload, got {other:?}"),
+        }
+    }
+
+    /// msodbcsql binds a binary variant with an explicit `ColumnSize` - 16 for
+    /// a `SQL_SS_TIME2_STRUCT` in its own datetime suite - so the declared
+    /// inner length follows `ColumnSize` when the application states one,
+    /// rather than always landing on the ceiling.
+    #[test]
+    fn a_binary_variant_honours_an_explicit_column_size() {
+        let mut bytes = vec![0xABu8; 12];
+        let mut ind: SqlLen = 12;
+        let mut p = param(SQL_C_BINARY, bytes.as_mut_ptr() as *mut c_void, &mut ind);
+        p.sql_type = SQL_SS_VARIANT;
+        p.column_size = 16;
+
+        let (value, _) = unsafe { bound_param_to_value(&p) }.unwrap();
+        match value {
+            SqlType::Variant(inner) => assert!(
+                matches!(*inner, SqlType::VarBinary(Some(ref b), 16) if b.len() == 12),
+                "got {inner:?}"
+            ),
+            other => panic!("expected a Variant, got {other:?}"),
+        }
+    }
+
+    /// A zero-length binary variant is a present value, not NULL, and still
+    /// declares a usable inner length.
+    #[test]
+    fn an_empty_binary_variant_is_not_null() {
+        let mut bytes = vec![0u8];
+        let mut ind: SqlLen = 0;
+        let mut p = param(SQL_C_BINARY, bytes.as_mut_ptr() as *mut c_void, &mut ind);
+        p.sql_type = SQL_SS_VARIANT;
+
+        let (value, _) = unsafe { bound_param_to_value(&p) }.unwrap();
+        match value {
+            SqlType::Variant(inner) => assert!(
+                matches!(*inner, SqlType::VarBinary(Some(ref b), _) if b.is_empty()),
+                "got {inner:?}"
+            ),
+            other => panic!("expected a Variant, got {other:?}"),
+        }
     }
 
     /// A NULL is still declared with its SQL type, so a fixed-length one needs a
@@ -5922,7 +6337,7 @@ mod tests {
                     continue;
                 }
                 assert!(
-                    typed_null(sql_type, column_size, 0).is_ok(),
+                    typed_null(sql_type, column_size, 0, None).is_ok(),
                     "sql_type {sql_type}: bind accepts ColumnSize {column_size} \
                      but the declaration cannot be built"
                 );
@@ -6072,12 +6487,7 @@ mod tests {
                 -1,
                 ParamBuildError::InvalidDecimalDigits(-1),
             ),
-            (
-                SQL_SS_UDT,
-                0,
-                0,
-                ParamBuildError::UnsupportedSqlType(SQL_SS_UDT),
-            ),
+            (SQL_SS_UDT, 0, 0, ParamBuildError::MissingUdtTypeName),
         ];
         for &(sql_type, column_size, decimal_digits, expected) in cases {
             let mut ind: SqlLen = SQL_NULL_DATA;

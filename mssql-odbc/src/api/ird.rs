@@ -69,6 +69,8 @@ fn ird_record_from_metadata(meta: &ColumnMetadata) -> DescRecord {
     let concise_type = odbc_sql_type(meta);
     DescRecord {
         concise_type,
+        udt_names: None,
+        udt_name_claimed: Default::default(),
         datetime_interval_code: datetime_interval_code_for(concise_type),
         length: SqlULen::try_from(desc_length(meta)).unwrap_or(0),
         octet_length: octet_length(meta),

@@ -289,6 +289,12 @@ pub(crate) const ERR_DAE_LENGTH_MISMATCH: DiagMsg = DiagMsg {
     state: SQLSTATE_22026,
     text: "String data, length mismatch",
 };
+/// A `SQL_SS_UDT` parameter bound without `SQL_CA_SS_UDT_TYPE_NAME`. msodbcsql
+/// rejects the same binding before execute (`IDS_S1_000_95`).
+pub(crate) const ERR_MISSING_UDT_TYPE_NAME: DiagMsg = DiagMsg {
+    state: SQLSTATE_HY000,
+    text: "At least 3-parts name of a UDT type should be present",
+};
 // A streamed parameter is either NULL or a sequence of value chunks; mixing the
 // two in one `SQL_NEED_DATA` window has no representation on the wire
 // (msodbcsql `sqlccmd.cpp` -> IDS_HY_020).

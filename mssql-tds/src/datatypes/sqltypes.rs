@@ -12,6 +12,7 @@ use crate::datatypes::sql_tvp::{
     TVP_END_TOKEN, TVP_NOMETADATA_TOKEN, TvpTableData, TvpTypeName, write_tvp_column_metadata,
     write_tvp_order_unique, write_tvp_rows, write_tvp_type_name,
 };
+use crate::datatypes::sql_udt::{UdtTypeName, write_udt_type_name};
 use crate::datatypes::sql_vector::SqlVector;
 use crate::datatypes::tds_value_serializer::{TdsTypeContext, TdsValueSerializer};
 use crate::{
@@ -128,6 +129,13 @@ pub enum SqlType {
     /// even for NULL TVPs. `None` table data encodes a NULL TVP; `Some` with
     /// an empty row set encodes an empty TVP.
     Table(TvpTypeName, Option<TvpTableData>),
+
+    /// CLR user-defined type (input-only, TDS type `0xF0`).
+    ///
+    /// The payload is the type's serialized (`IBinarySerialize`) form, which
+    /// the driver passes through untouched; `None` is a NULL UDT. The name is
+    /// always sent because the server resolves the type from it.
+    Udt(UdtTypeName, Option<Vec<u8>>),
 }
 
 type NullableTdsType = TdsDataType;
@@ -187,6 +195,7 @@ impl SqlType {
             SqlType::Vector(_, _, _) => TdsDataType::Vector,
             SqlType::Variant(_) => TdsDataType::SsVariant,
             SqlType::Table(_, _) => TdsDataType::SqlTable,
+            SqlType::Udt(_, _) => TdsDataType::Udt,
         }
     }
 
@@ -666,6 +675,20 @@ impl SqlType {
             // handled by the `serialize_table` short-circuit in `serialize`, so this
             // arm is a safe fallback that never feeds real wire data.
             SqlType::Table(_, _) => (ColumnValues::Null, base_ctx),
+
+            // UDT: the payload is opaque bytes framed as PLP, like varbinary(max).
+            SqlType::Udt(_, opt) => {
+                let cv = match opt {
+                    Some(bytes) => ColumnValues::Bytes(bytes.clone()),
+                    None => ColumnValues::Null,
+                };
+                let ctx = TdsTypeContext {
+                    max_size: usize::MAX,
+                    is_plp: true,
+                    ..base_ctx
+                };
+                (cv, ctx)
+            }
         }
     }
 
@@ -996,30 +1019,7 @@ impl SqlType {
             SqlType::Vector(sql_vector, dimensions, base_type) => {
                 packet_writer.write_byte_async(nullable_type as u8).await?;
 
-                let max_dim = base_type.max_dimensions();
-                if *dimensions > max_dim {
-                    return Err(Error::UsageError(format!(
-                        "Vector dimensions {} exceeds maximum supported dimensions {} for base type {:?}",
-                        dimensions, max_dim, base_type
-                    )));
-                }
-
-                if let Some(vector) = sql_vector {
-                    let actual_base_type = vector.base_type();
-                    if actual_base_type != *base_type {
-                        return Err(Error::TypeConversionError(format!(
-                            "Vector base type mismatch: declared {:?}, but vector has {:?}",
-                            base_type, actual_base_type
-                        )));
-                    }
-                    let actual_dimensions = vector.dimension_count();
-                    if actual_dimensions != *dimensions {
-                        return Err(Error::TypeConversionError(format!(
-                            "Vector dimension mismatch: declared {}, but vector has {}",
-                            dimensions, actual_dimensions
-                        )));
-                    }
-                }
+                Self::validate_vector(sql_vector.as_ref(), *dimensions, *base_type)?;
 
                 let element_size = base_type.element_size_bytes() as u16;
                 let exact_size = (VECTOR_HEADER_SIZE as u16) + (*dimensions * element_size);
@@ -1038,6 +1038,14 @@ impl SqlType {
                     .await?;
             }
 
+            // UDT: type byte + catalog/schema/type name, and nothing else. The
+            // PLP body length that follows is written by the value serializer,
+            // exactly as msodbcsql's `WriteUDTHeader` emits it.
+            SqlType::Udt(type_name, _) => {
+                packet_writer.write_byte_async(nullable_type as u8).await?;
+                write_udt_type_name(packet_writer, type_name).await?;
+            }
+
             // Table (TVP): metadata and rows are written by the dedicated
             // `serialize_table` path, which short-circuits in `serialize` before
             // this method is reached. A TVP is never a column type within another
@@ -1051,6 +1059,75 @@ impl SqlType {
             }
         }
 
+        Ok(())
+    }
+
+    /// Validates what must be correct before *any* byte of this value reaches
+    /// the wire.
+    ///
+    /// The per-type checks below also run during `write_type_info`, but that
+    /// is too late to keep a failure local: by then `RpcParameter::serialize`
+    /// has written this parameter's name and status flags, and in a
+    /// multi-parameter RPC an earlier parameter may have flushed whole packets
+    /// (`PacketWriter` sends on overflow). `SqlRpc::validate_parameters` calls
+    /// this for every parameter before the message writes anything, so
+    /// locally-invalid input fails locally instead of becoming a half-sent
+    /// request that has to be cancelled and drained.
+    ///
+    /// Every fallible *scalar* metadata check in `write_type_info` belongs
+    /// here: today the UDT name, the `sql_variant` inner type, and the vector
+    /// dimension/base-type bounds. The duplicates in `write_type_info` stay,
+    /// since that function must remain correct for callers that reach it by
+    /// another route.
+    ///
+    /// `SqlType::Table` is the known exception. A TVP's validation lives in
+    /// `serialize_table` / `write_tvp_type_name` / `write_tvp_column_metadata`
+    /// and covers the type name, the column metadata and every row, so hoisting
+    /// it is a larger change than this one - it is tracked in AB#48248 rather
+    /// than half-done here. A TVP with invalid table data can therefore still
+    /// fail mid-write; do not read this method as covering it.
+    pub(crate) fn validate_for_send(&self) -> TdsResult<()> {
+        match self {
+            SqlType::Udt(type_name, _) => type_name.validate(),
+            SqlType::Variant(inner) => Self::validate_variant_inner(inner),
+            SqlType::Vector(vector, dimensions, base_type) => {
+                Self::validate_vector(vector.as_ref(), *dimensions, *base_type)
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Checks a vector's declared dimensions against its base type's maximum,
+    /// and - when a value is present - that the declaration matches the value.
+    ///
+    /// Shared with `write_type_info` so the wire path and the preflight cannot
+    /// disagree about what is sendable.
+    fn validate_vector(
+        vector: Option<&SqlVector>,
+        dimensions: u16,
+        base_type: VectorBaseType,
+    ) -> TdsResult<()> {
+        let max_dim = base_type.max_dimensions();
+        if dimensions > max_dim {
+            return Err(Error::UsageError(format!(
+                "Vector dimensions {dimensions} exceeds maximum supported dimensions {max_dim} for base type {base_type:?}"
+            )));
+        }
+
+        if let Some(vector) = vector {
+            let actual_base_type = vector.base_type();
+            if actual_base_type != base_type {
+                return Err(Error::TypeConversionError(format!(
+                    "Vector base type mismatch: declared {base_type:?}, but vector has {actual_base_type:?}"
+                )));
+            }
+            let actual_dimensions = vector.dimension_count();
+            if actual_dimensions != dimensions {
+                return Err(Error::TypeConversionError(format!(
+                    "Vector dimension mismatch: declared {dimensions}, but vector has {actual_dimensions}"
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -1074,6 +1151,7 @@ impl SqlType {
             SqlType::Xml(_) => Some("xml"),
             SqlType::Json(_) => Some("json"),
             SqlType::Vector(_, _, _) => Some("vector"),
+            SqlType::Udt(_, _) => Some("udt"),
             SqlType::Variant(_) => Some("sql_variant (nested)"),
             SqlType::Table(_, _) => Some("table-valued parameter (TVP)"),
             // Sized string/binary types whose declared length exceeds the non-MAX limit
@@ -1320,6 +1398,7 @@ mod variant_tests {
     use crate::{
         datatypes::{
             sql_string::{EncodingType, SqlString},
+            sql_udt::UdtTypeName,
             sqldatatypes::TdsDataType,
             sqltypes::{SQL_VARIANT_MAX_LENGTH, SqlType},
         },
@@ -1362,6 +1441,71 @@ mod variant_tests {
         // TYPE_INFO: 0x62 + u32 max data length (8009)
         assert_eq!(cursor.get_u8(), TdsDataType::SsVariant as u8);
         assert_eq!(cursor.get_u32_le(), SQL_VARIANT_MAX_LENGTH);
+    }
+
+    /// The whole UDT parameter on the wire, not just its name block: type
+    /// byte, the three B_VARCHARs `CRPCPolicy::WriteUDTHeader` emits, then the
+    /// PLP body - an 8-byte total length, one chunk with its own u32 length,
+    /// and the PLP terminator. `datatypes::sql_udt::tests` covers only the
+    /// name block, so nothing else pins this framing.
+    #[tokio::test]
+    async fn a_udt_parameter_is_framed_as_plp_after_its_name_block() {
+        let payload = vec![0xDEu8, 0xAD, 0xBE, 0xEF];
+        let value = SqlType::Udt(
+            UdtTypeName::new(None, Some("dbo".to_string()), "Point".to_string()),
+            Some(payload.clone()),
+        );
+        let mut cursor = Cursor::new(serialize_to_bytes(&value).await);
+
+        assert_eq!(cursor.get_u8(), TdsDataType::Udt as u8);
+        assert_eq!(cursor.get_u8(), 0, "absent catalog is a zero-length part");
+        assert_eq!(cursor.get_u8(), 3, "schema \"dbo\" is 3 UTF-16 units");
+        cursor.advance(3 * 2);
+        assert_eq!(cursor.get_u8(), 5, "type \"Point\" is 5 UTF-16 units");
+        cursor.advance(5 * 2);
+
+        // Unknown-length PLP: chunks run until the terminator. msodbcsql
+        // instead writes the actual byte count when it knows it
+        // (`WriteUDTHeader`: `ullActualLen = cbData` unless the value is
+        // unlimited). Both are valid PLP and the server accepts either; this
+        // driver buffers the payload but still declares it unknown, which is
+        // what lets the data-at-execution path share the same writer.
+        assert_eq!(
+            cursor.get_u64_le(),
+            0xFFFF_FFFF_FFFF_FFFE,
+            "PLP unknown-length marker precedes the chunks"
+        );
+        assert_eq!(cursor.get_u32_le(), payload.len() as u32, "chunk length");
+        let mut chunk = vec![0u8; payload.len()];
+        cursor.copy_to_slice(&mut chunk);
+        assert_eq!(chunk, payload, "payload passes through untouched");
+        assert_eq!(cursor.get_u32_le(), 0, "PLP terminator");
+        assert!(!cursor.has_remaining(), "nothing follows the terminator");
+    }
+
+    /// A NULL UDT still names its type - the server cannot resolve the
+    /// parameter otherwise - and then declares the PLP null length rather than
+    /// a zero-length body.
+    #[tokio::test]
+    async fn a_null_udt_parameter_still_carries_its_name() {
+        let value = SqlType::Udt(
+            UdtTypeName::new(None, None, "hierarchyid".to_string()),
+            None,
+        );
+        let mut cursor = Cursor::new(serialize_to_bytes(&value).await);
+
+        assert_eq!(cursor.get_u8(), TdsDataType::Udt as u8);
+        assert_eq!(cursor.get_u8(), 0, "absent catalog");
+        assert_eq!(cursor.get_u8(), 0, "absent schema");
+        assert_eq!(cursor.get_u8(), 11, "type \"hierarchyid\" is 11 units");
+        cursor.advance(11 * 2);
+        assert_eq!(
+            cursor.get_u64_le(),
+            0xFFFF_FFFF_FFFF_FFFF,
+            "a NULL PLP body is the null length (GenericDecoder::SQL_PLP_NULL), \
+             not an empty chunk list"
+        );
+        assert!(!cursor.has_remaining());
     }
 
     #[tokio::test]

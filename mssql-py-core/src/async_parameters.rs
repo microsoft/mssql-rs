@@ -56,6 +56,15 @@ pub(crate) enum ParameterMetadata {
         /// Unqualified table type name.
         name: String,
     },
+    /// A CLR user-defined type declaration identified by server type name.
+    Udt {
+        /// Database qualifying the type; `None` when the name is unqualified.
+        catalog: Option<String>,
+        /// Schema qualifying the type; `None` when the name is unqualified.
+        schema: Option<String>,
+        /// Unqualified UDT name.
+        name: String,
+    },
 }
 
 /// Extracts the declaration identity used for prepared-statement reuse.
@@ -137,6 +146,14 @@ fn sql_type_metadata(value: &SqlType) -> ParameterMetadata {
                 .schema_name
                 .clone()
                 .unwrap_or_else(|| "dbo".to_string()),
+            name: type_name.type_name.clone(),
+        },
+        // Absent parts stay absent, unlike the TVP arm above: the UDT
+        // declaration omits them too, so `Point` and `dbo.Point` are different
+        // declarations and must not share a prepared statement.
+        SqlType::Udt(type_name, _) => ParameterMetadata::Udt {
+            catalog: type_name.db_name.clone(),
+            schema: type_name.schema_name.clone(),
             name: type_name.type_name.clone(),
         },
     }
