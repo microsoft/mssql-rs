@@ -29,6 +29,7 @@ use crate::error::{free_errors, post_sql_error};
 use crate::handles::desc::UdtNames;
 use crate::handles::stmt::{ParameterDescription, STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_STARTED};
 use crate::handles::{DescHandle, HandleType, StmtHandle, handle_from_raw};
+use std::sync::Arc;
 
 use super::set_desc_field::datetime_interval_code_for;
 
@@ -295,7 +296,7 @@ fn sql_describe_param_safe(
     let mut collector = DescriptionCollector::new(described_count);
     // Sparse, because only a `udt` marker has a name: `(index, identity)` keyed
     // by the same ordinal the collector uses.
-    let mut udt_names: Vec<(usize, Box<UdtNames>)> = Vec::new();
+    let mut udt_names: Vec<(usize, Arc<UdtNames>)> = Vec::new();
     // INVARIANT: a row that cannot be mapped must not leave this loop early.
     // The result set has to be drained and `close_query()` called below, or the
     // connection is left mid-result and every later operation on it fails. That
@@ -426,7 +427,7 @@ fn sql_describe_param_safe(
 fn refine_ipd(
     stmt: &StmtHandle,
     descriptions: &[ParameterDescription],
-    udt_names: &[(usize, Box<UdtNames>)],
+    udt_names: &[(usize, Arc<UdtNames>)],
 ) {
     debug_assert!(
         udt_names.windows(2).all(|w| w[0].0 <= w[1].0),
@@ -493,30 +494,50 @@ fn refine_ipd(
                 .binary_search_by_key(&i, |(index, _)| *index)
                 .ok()
                 .map(|position| &udt_names[position].1);
-            // The server never supplies an assembly name, so an application's
-            // survives the refresh of the parts around it.
-            let assembly = record
-                .udt_names
-                .as_ref()
-                .map(|names| names.assembly_type_name.clone())
-                .unwrap_or_default();
             // A describe that reports no UDT at this ordinal must not discard
-            // the record outright: it may exist only to carry that echo-only
+            // the record outright: it may exist only to carry the echo-only
             // assembly name, which no describe can restore.
             if let Some(names) = described {
-                let mut names = names.clone();
-                names.assembly_type_name = assembly;
-                record.udt_names = Some(names);
-                record.udt_names_auto_filled = true;
-            } else if !assembly.is_empty() {
-                record.udt_names = Some(Box::new(UdtNames {
-                    assembly_type_name: assembly,
-                    ..Default::default()
-                }));
-                record.udt_names_auto_filled = true;
+                // Steady state: a replay after the first call finds the record
+                // already holding exactly this identity, so there is nothing
+                // to write. Comparing the three wire parts costs no allocation,
+                // where rebuilding them cost one owned copy per marker per
+                // cache-served answer - O(N^2) across a describe-all pass.
+                let unchanged = record.udt_names_auto_filled
+                    && record.udt_names.as_ref().is_some_and(|current| {
+                        current.catalog == names.catalog
+                            && current.schema == names.schema
+                            && current.type_name == names.type_name
+                    });
+                if !unchanged {
+                    // The server never supplies an assembly name, so an
+                    // application's survives the refresh of the parts around it.
+                    let assembly = record
+                        .udt_names
+                        .as_ref()
+                        .map(|names| names.assembly_type_name.clone())
+                        .unwrap_or_default();
+                    let mut fresh = UdtNames::clone(names);
+                    fresh.assembly_type_name = assembly;
+                    record.udt_names = Some(Box::new(fresh));
+                    record.udt_names_auto_filled = true;
+                }
             } else {
-                record.udt_names = None;
-                record.udt_names_auto_filled = false;
+                let assembly = record
+                    .udt_names
+                    .as_ref()
+                    .map(|names| names.assembly_type_name.clone())
+                    .unwrap_or_default();
+                if !assembly.is_empty() {
+                    record.udt_names = Some(Box::new(UdtNames {
+                        assembly_type_name: assembly,
+                        ..Default::default()
+                    }));
+                    record.udt_names_auto_filled = true;
+                } else {
+                    record.udt_names = None;
+                    record.udt_names_auto_filled = false;
+                }
             }
         }
         if previous != record.parameter_definition() {
@@ -576,7 +597,7 @@ fn write_description(
 fn parse_parameter_row(
     row: &[ColumnValues],
     marker_count: usize,
-) -> Result<(usize, ParameterDescription, Option<Box<UdtNames>>), String> {
+) -> Result<(usize, ParameterDescription, Option<Arc<UdtNames>>), String> {
     let ordinal = read_i32(row, PARAMETER_ORDINAL, "parameter_ordinal")?;
     let index = usize::try_from(ordinal)
         .ok()
@@ -861,12 +882,12 @@ fn read_optional_string(row: &[ColumnValues], index: usize) -> Option<String> {
 
 /// The CLR type identity for a described `udt` parameter, or `None` for every
 /// other type. msodbcsql fills the same three IPD fields from these columns.
-fn read_udt_names(row: &[ColumnValues], data_type: SqlSmallInt) -> Option<Box<UdtNames>> {
+fn read_udt_names(row: &[ColumnValues], data_type: SqlSmallInt) -> Option<Arc<UdtNames>> {
     if data_type != SQL_SS_UDT {
         return None;
     }
     let type_name = read_optional_string(row, SUGGESTED_USER_TYPE_NAME)?;
-    Some(Box::new(UdtNames {
+    Some(Arc::new(UdtNames {
         catalog: read_optional_string(row, SUGGESTED_USER_TYPE_DATABASE).unwrap_or_default(),
         schema: read_optional_string(row, SUGGESTED_USER_TYPE_SCHEMA).unwrap_or_default(),
         type_name,
@@ -1729,8 +1750,8 @@ mod tests {
         assert_eq!(record.length, 80);
     }
 
-    fn udt_identity(type_name: &str) -> Box<UdtNames> {
-        Box::new(UdtNames {
+    fn udt_identity(type_name: &str) -> Arc<UdtNames> {
+        Arc::new(UdtNames {
             catalog: String::new(),
             schema: String::new(),
             type_name: type_name.to_string(),
@@ -1768,7 +1789,7 @@ mod tests {
             let desc = unsafe { handle_from_raw::<DescHandle>(h.ipd()) };
             let mut state = desc.inner.lock().unwrap();
             let record = state.record_mut(1).unwrap();
-            record.udt_names = Some(udt_identity("Point"));
+            record.udt_names = Some(Box::new(UdtNames::clone(&udt_identity("Point"))));
             record.udt_names_auto_filled = false;
         }
         refine_ipd(stmt, &described, &[(0, udt_identity("geography"))]);
@@ -1920,7 +1941,7 @@ mod tests {
             let mut state = ipd.inner.lock().unwrap();
             state.set_record_count(1, ipd.kind);
             let record = state.record_mut(1).unwrap();
-            record.udt_names = Some(udt_identity("Point"));
+            record.udt_names = Some(Box::new(UdtNames::clone(&udt_identity("Point"))));
             record.udt_names_auto_filled = false;
         }
 

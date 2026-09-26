@@ -537,18 +537,25 @@ msodbcsql build is measured.
     Recorded following automated review feedback on #599 (2026-09-22);
     narrowed to the cross-identity case following review on 2026-09-24.
     Human parity sign-off has not been recorded. Tracked in #598.
-20. **An oversized `sql_variant` payload is refused by the driver, not the
-    server.** `sql_variant` cannot hold a `max` type (server error 529), so a
-    payload past the 8000-byte ceiling has to be refused somewhere. msodbcsql
-    sends it and surfaces the server's refusal as `42000`; this driver declares
-    the inner type at its non-max ceiling (`variant_column_size`) and refuses
-    during parameter conversion with `22001`, saving the round trip.
+20. **An oversized `sql_variant` payload with a non-zero overflow is refused by
+    the driver, not the server.** `sql_variant` cannot hold a `max` type
+    (server error 529), so a payload past the 8000-byte ceiling has to be
+    refused somewhere. msodbcsql sends it and surfaces the server's refusal as
+    `42000`; this driver declares the inner type at its non-max ceiling
+    (`variant_column_size`) and refuses during parameter conversion with
+    `22001`, saving the round trip.
+    Scope: only a *non-zero* overflow diverges. A payload whose bytes past the
+    ceiling are all zero is trimmed and sent by both drivers -
+    `trim_zero_overflow` is this driver's `CheckTrailingZeros`
+    (`sqlccnvt.cpp:8690`), so that case is parity, not deviation, and
+    `a_binary_variant_payload_past_the_byte_ceiling_is_truncation` pins it.
     The rule is not new to binary payloads - `variant_column_size` already
     governed the character variants - but binary `sql_variant` parameters make
     it reachable for a second family of C types, so it is recorded here rather
     than left in a code comment.
     Measured against msodbcsql 18.6.2.1 (`SQL_DRIVER_VER` `18.06.0002`) on SQL
-    Server 2022, Windows Driver Manager, 2026-09-25.
+    Server 2022, Windows Driver Manager, 2026-09-25, with a `0xAB`-filled
+    payload - i.e. the non-zero overflow this entry describes.
     `BinaryVariantPayloadPastTheCeilingIsRefused` asserts both legs, so the
     reference side stays measured rather than skipped. Tracked in AB#48248.
     **Evidence limit:** only the binary leg is measured. The character leg is

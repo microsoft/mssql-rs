@@ -3,6 +3,7 @@
 
 use std::collections::VecDeque;
 use std::ffi::c_void;
+use std::sync::Arc;
 use std::sync::Mutex;
 
 use tracing::error;
@@ -496,7 +497,13 @@ pub(crate) struct StmtState {
     /// Sorted by ordinal: `refine_ipd` binary-searches it on every cached
     /// describe, which a linear scan turned into O(N^3) work across a
     /// describe-all pass.
-    pub(crate) parameter_udt_names: Vec<(usize, Box<UdtNames>)>,
+    ///
+    /// `Arc`, not `Box`: the list has to be cloned out from under the STMT
+    /// lock before `refine_ipd` can take the DESC lock, and that happens on
+    /// every cache-served answer. Deep-copying each identity's strings there
+    /// cost O(N^2) allocations across the same pass; sharing them makes it a
+    /// refcount bump. The descriptor still keeps its own owned copy.
+    pub(crate) parameter_udt_names: Vec<(usize, Arc<UdtNames>)>,
     /// Parameters bound via `SQLBindParameter`, indexed by `(ParameterNumber
     /// - 1)`. `None` slots are gaps left by binding a higher ordinal first.
     pub(crate) bound_params: Vec<Option<ParamSnapshot>>,
