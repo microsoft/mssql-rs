@@ -529,8 +529,9 @@ mod tests {
     /// whole packets - the error would then arrive as a half-sent RPC needing
     /// cancel-and-drain rather than a local failure.
     ///
-    /// Covers both fallible metadata checks: a UDT name too long for its
-    /// B_VARCHAR count, and a `sql_variant` whose inner type it cannot hold.
+    /// Covers all three fallible metadata checks: a UDT name too long for its
+    /// B_VARCHAR count, a `sql_variant` whose inner type it cannot hold, and a
+    /// vector whose declaration disagrees with its value.
     #[test]
     fn an_invalid_later_parameter_sends_nothing() {
         use crate::datatypes::sql_udt::UdtTypeName;
