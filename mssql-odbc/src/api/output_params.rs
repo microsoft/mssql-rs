@@ -493,6 +493,29 @@ mod tests {
         assert_eq!(ind, size_of::<i32>() as crate::api::odbc_types::SqlLen);
     }
 
+    /// A returned UDT decodes to `ColumnValues::Bytes` (`decoder.rs`, the
+    /// `TdsDataType::Udt` arm), so the write-back leg is the binary one. This
+    /// PR made `SQL_PARAM_OUTPUT` + `SQL_SS_UDT` reachable for the first time -
+    /// before it, the bind failed `HYC00` for want of a conversion-matrix row -
+    /// so pin the leg rather than inferring it from the scalar cases.
+    #[test]
+    fn a_returned_udt_lands_in_the_bound_binary_buffer() {
+        let mut buf = [0u8; 8];
+        let mut ind: crate::api::odbc_types::SqlLen = -999;
+        let param = output_param(
+            crate::api::odbc_types::SQL_C_BINARY,
+            crate::api::odbc_types::SQL_SS_UDT,
+            buf.as_mut_ptr().cast(),
+            buf.len() as crate::api::odbc_types::SqlLen,
+            &raw mut ind,
+        );
+        let payload = vec![0x58u8, 0x59, 0x5A];
+        let outcome = unsafe { write_value(&param, &ColumnValues::Bytes(payload.clone())) };
+        assert_eq!(outcome, RowOutcome::Success);
+        assert_eq!(&buf[..payload.len()], payload.as_slice());
+        assert_eq!(ind, payload.len() as crate::api::odbc_types::SqlLen);
+    }
+
     /// A NULL output must be reported through the indicator, not left as
     /// whatever the buffer happened to hold.
     #[test]

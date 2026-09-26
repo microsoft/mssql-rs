@@ -2689,6 +2689,44 @@ TEST_F(UdtParamLiveTest, AUdtParameterReachesAStoredProcedure) {
     EXPECT_EQ("/6/", ExecuteAndReadBack());
 }
 
+// The output direction of the same binding. This PR made it reachable for the
+// first time - before it, SQLBindParameter rejected SQL_SS_UDT with HYC00 for
+// want of a conversion-matrix row, so no direction was bindable. msodbcsql
+// applies no direction gate to SQL_UDT_MAPPED (CheckParamBindInfo checks only
+// that a type name is present, sqlccmd.cpp:9977), so accepting it is parity;
+// what needed pinning is the write-back leg, which had never run against a
+// returned UDT.
+TEST_F(UdtParamLiveTest, AUdtOutputParameterIsWrittenBack) {
+    SqlTString drop = ODBCTestUtils::ToSqlTStr(std::string(
+        "IF OBJECT_ID('tempdb..#udt_out') IS NOT NULL DROP PROCEDURE #udt_out"));
+    ASSERT_SQL_OK(SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(drop.c_str()), SQL_NTS),
+                  SQL_HANDLE_STMT, stmt_);
+    SqlTString create = ODBCTestUtils::ToSqlTStr(
+        std::string("CREATE PROCEDURE #udt_out @h hierarchyid OUTPUT AS "
+                    "SET @h = hierarchyid::Parse('/7/')"));
+    ASSERT_SQL_OK(SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(create.c_str()), SQL_NTS),
+                  SQL_HANDLE_STMT, stmt_);
+
+    // The same value the server will return, obtained independently.
+    std::vector<SQLCHAR> expected = SerializedHierarchyId("/7/");
+    ASSERT_FALSE(expected.empty());
+
+    SQLCHAR buffer[892] = {0};
+    ASSERT_SQL_OK(Prepare("{call #udt_out(?)}"), SQL_HANDLE_STMT, stmt_);
+    indicator_ = 0;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_OUTPUT, SQL_C_BINARY, SQL_SS_UDT, 0, 0,
+                                   buffer, sizeof(buffer), &indicator_),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SetUdtName("hierarchyid"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+    // Output parameters are only delivered once the result stream is drained.
+    while (SQLMoreResults(stmt_) == SQL_SUCCESS) {
+    }
+
+    ASSERT_EQ(indicator_, static_cast<SQLLEN>(expected.size()));
+    EXPECT_EQ(std::vector<SQLCHAR>(buffer, buffer + indicator_), expected);
+}
+
 // msodbcsql derives a variant's inner type from the C type alone
 // (CTypeToSqlType, sqlcprot.h). Its own suites bind several C types against
 // SQL_SS_VARIANT and check what the server received; these are the pairings

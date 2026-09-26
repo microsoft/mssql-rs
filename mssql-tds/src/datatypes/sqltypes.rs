@@ -130,11 +130,13 @@ pub enum SqlType {
     /// an empty row set encodes an empty TVP.
     Table(TvpTypeName, Option<TvpTableData>),
 
-    /// CLR user-defined type (input-only, TDS type `0xF0`).
+    /// CLR user-defined type (TDS type `0xF0`).
     ///
     /// The payload is the type's serialized (`IBinarySerialize`) form, which
     /// the driver passes through untouched; `None` is a NULL UDT. The name is
-    /// always sent because the server resolves the type from it.
+    /// always sent because the server resolves the type from it. A returned
+    /// UDT arrives as plain bytes rather than through this type, so the output
+    /// direction of a UDT parameter needs no variant here.
     Udt(UdtTypeName, Option<Vec<u8>>),
 }
 
