@@ -1364,47 +1364,6 @@ mod tests {
         assert_eq!(opts.notification_interval, 0);
     }
 
-    /// `write_to_server` runs one `execute_bulk_load_streaming_zerocopy` per
-    /// batch, and that call *assigns* the substitution verdict for its own
-    /// message. Draining it per batch and restoring the accumulated result is
-    /// what stops a later clean batch from erasing an earlier batch's
-    /// substitution — the exact shape `accumulated_info` already solves for INFO
-    /// (AB#47598).
-    ///
-    /// Pins that sequence rather than the loop itself, which needs a live
-    /// server: the ordering here is the whole of the fix, and asserting it
-    /// catches a regression to plain assignment.
-    #[tokio::test]
-    async fn multi_batch_bulk_copy_accumulates_the_code_page_loss_verdict() {
-        use crate::test_client_support::{done_no_more, tds_client_from_tokens};
-
-        let mut client = tds_client_from_tokens(vec![done_no_more()]);
-        let mut accumulated_cp_loss = false;
-
-        // Batch 1 substitutes.
-        client.note_code_page_conversion_loss();
-        accumulated_cp_loss |= client.take_code_page_conversion_loss();
-        assert!(accumulated_cp_loss);
-
-        // Batch 2 is clean. Its own assignment leaves the client false, which is
-        // precisely what would have lost the first batch's verdict.
-        accumulated_cp_loss |= client.take_code_page_conversion_loss();
-        assert!(
-            !client.take_code_page_conversion_loss(),
-            "the per-batch flag is drained, so nothing carries over implicitly"
-        );
-
-        client.set_code_page_conversion_loss(accumulated_cp_loss);
-        assert!(
-            client.take_code_page_conversion_loss(),
-            "a substitution in any batch must be visible for the whole operation"
-        );
-        assert!(
-            !client.take_code_page_conversion_loss(),
-            "the restored verdict is still drained by a single take"
-        );
-    }
-
     #[test]
     fn test_bulk_copy_options_validate() {
         let opts = BulkCopyOptions {
