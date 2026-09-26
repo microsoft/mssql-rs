@@ -26,7 +26,7 @@ use super::txn::begin_transaction_if_manual;
 use super::util::write_if_some;
 use crate::api::type_rules::parameter_size_is_precision;
 use crate::error::{free_errors, post_sql_error};
-use crate::handles::desc::UdtNames;
+use crate::handles::desc::{DescRecord, UdtNameClaims, UdtNames};
 use crate::handles::stmt::{ParameterDescription, STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_STARTED};
 use crate::handles::{DescHandle, HandleType, StmtHandle, handle_from_raw};
 use std::sync::Arc;
@@ -490,66 +490,23 @@ fn refine_ipd(
             .binary_search_by_key(&i, |(index, _)| *index)
             .ok()
             .map(|position| &udt_names[position].1);
-        // A describe that reports no UDT at this ordinal clears the unclaimed
-        // parts rather than discarding the record: it may still carry claimed
-        // parts, or the echo-only assembly name, which no describe restores.
-        let empty = UdtNames::default();
-        let fresh = described.map_or(&empty, |names| &**names);
-        let claims = record.udt_name_claimed;
-        // Steady state: a replay after the first call finds the record already
-        // holding exactly this identity, so there is nothing to write.
-        // Comparing the three wire parts costs no allocation, where rebuilding
-        // them cost one owned copy per marker per cache-served answer - O(N^2)
-        // across a describe-all pass.
-        let merged = |part: fn(&UdtNames) -> &String, claimed: bool| -> &str {
-            if claimed {
-                record.udt_names.as_deref().map_or("", |n| part(n))
-            } else {
-                part(fresh)
-            }
-        };
-        let unchanged = record.udt_names.as_ref().is_some_and(|current| {
-            current.catalog == merged(|n| &n.catalog, claims.catalog)
-                && current.schema == merged(|n| &n.schema, claims.schema)
-                && current.type_name == merged(|n| &n.type_name, claims.type_name)
-        });
-        if !unchanged {
-            // Nothing of the application's to preserve: share the describe's
-            // identity rather than copying its three strings per marker.
-            if let Some(described) = described
-                && claims.none()
-                && record
-                    .udt_names
-                    .as_ref()
-                    .is_none_or(|n| n.assembly_type_name.is_empty())
-            {
-                record.udt_names = Some(Arc::clone(described));
-            } else {
-                let names = Arc::make_mut(record.udt_names.get_or_insert_with(Default::default));
-                // This driver does not read the assembly-qualified column (see
-                // `read_udt_names`), so an application's survives the refresh
-                // of the parts around it.
-                if !claims.catalog {
-                    names.catalog.clone_from(&fresh.catalog);
-                }
-                if !claims.schema {
-                    names.schema.clone_from(&fresh.schema);
-                }
-                if !claims.type_name {
-                    names.type_name.clone_from(&fresh.type_name);
-                }
-            }
-        }
-        // Nothing left worth carrying: no claimed part, nothing described, no
-        // assembly name to echo.
-        if record.udt_names.as_ref().is_some_and(|n| {
-            claims.none()
-                && n.assembly_type_name.is_empty()
-                && n.catalog.is_empty()
-                && n.schema.is_empty()
-                && n.type_name.is_empty()
-        }) {
-            record.udt_names = None;
+        // Nothing described and nothing stored: the overwhelmingly common
+        // case, every marker on a statement with no UDT in it. Skipping is
+        // behaviour-preserving - the merge below would copy empty into empty
+        // and the cleanup would undo it - but the merge allocates an
+        // `Arc<UdtNames>` to do it, and `refine_ipd` is replayed for every
+        // cache-served describe answer (`:189`), so not skipping costs ~N^2
+        // allocations across a describe-all pass over N non-UDT markers.
+        //
+        // A claim always accompanies a stored identity (`set_udt_name` creates
+        // the record before claiming; both clears drop the record only when
+        // nothing is claimed), so this cannot skip a record with live claims.
+        debug_assert!(
+            record.udt_names.is_some() || record.udt_name_claimed == UdtNameClaims::default(),
+            "a claimed UDT name part must have a record to live on"
+        );
+        if described.is_some() || record.udt_names.is_some() {
+            merge_udt_identity(record, described);
         }
         if previous != record.parameter_definition() {
             first_changed.get_or_insert(i + 1);
@@ -563,6 +520,76 @@ fn refine_ipd(
         return SQL_ERROR;
     }
     SQL_SUCCESS
+}
+
+/// Merges a describe's UDT identity into one IPD record, per wire part.
+///
+/// A part the application claimed through `SQLSetDescField` wins; an unclaimed
+/// one takes the describe's value, or is emptied when the describe reports no
+/// UDT at this ordinal. Only the caller's guard decides whether there is
+/// anything to merge at all - see the allocation note there.
+fn merge_udt_identity(record: &mut DescRecord, described: Option<&Arc<UdtNames>>) {
+    let empty = UdtNames::default();
+    // A describe reporting no UDT here clears the unclaimed parts rather than
+    // discarding the record: it may still carry claimed parts, or the
+    // echo-only assembly name, which no describe restores.
+    let fresh = described.map_or(&empty, |names| &**names);
+    let claims = record.udt_name_claimed;
+    // Steady state: a replay after the first call finds the record already
+    // holding exactly this identity, so there is nothing to write. Comparing
+    // the three wire parts costs no allocation, where rebuilding them cost one
+    // owned copy per marker per cache-served answer - O(N^2) across a
+    // describe-all pass.
+    let merged = |part: fn(&UdtNames) -> &String, claimed: bool| -> &str {
+        if claimed {
+            record.udt_names.as_deref().map_or("", |n| part(n))
+        } else {
+            part(fresh)
+        }
+    };
+    let unchanged = record.udt_names.as_ref().is_some_and(|current| {
+        current.catalog == merged(|n| &n.catalog, claims.catalog)
+            && current.schema == merged(|n| &n.schema, claims.schema)
+            && current.type_name == merged(|n| &n.type_name, claims.type_name)
+    });
+    if !unchanged {
+        // Nothing of the application's to preserve: share the describe's
+        // identity rather than copying its three strings per marker.
+        if let Some(described) = described
+            && claims.none()
+            && record
+                .udt_names
+                .as_ref()
+                .is_none_or(|n| n.assembly_type_name.is_empty())
+        {
+            record.udt_names = Some(Arc::clone(described));
+        } else {
+            let names = Arc::make_mut(record.udt_names.get_or_insert_with(Default::default));
+            // This driver does not read the assembly-qualified column (see
+            // `read_udt_names`), so an application's survives the refresh of
+            // the parts around it.
+            if !claims.catalog {
+                names.catalog.clone_from(&fresh.catalog);
+            }
+            if !claims.schema {
+                names.schema.clone_from(&fresh.schema);
+            }
+            if !claims.type_name {
+                names.type_name.clone_from(&fresh.type_name);
+            }
+        }
+    }
+    // Nothing left worth carrying: no claimed part, nothing described, no
+    // assembly name to echo.
+    if record.udt_names.as_ref().is_some_and(|n| {
+        claims.none()
+            && n.assembly_type_name.is_empty()
+            && n.catalog.is_empty()
+            && n.schema.is_empty()
+            && n.type_name.is_empty()
+    }) {
+        record.udt_names = None;
+    }
 }
 
 /// Posts the diagnostic for a failed `refine_ipd` and returns `SQL_ERROR`.

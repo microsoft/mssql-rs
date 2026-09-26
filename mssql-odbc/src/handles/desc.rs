@@ -427,11 +427,12 @@ impl DescRecord {
             // of those declare a type, and `udt_type_name` refuses to execute
             // such a record at all (`ERR_MISSING_UDT_TYPE_NAME`).
             //
-            // "Has a wire identity" is deliberately the same test `refine_ipd`
-            // applies as `claimed`: a non-empty type name. Once one is present
-            // the catalog and schema travel with it, so changing either still
-            // invalidates, and a later switch to `SQL_SS_UDT` invalidates
-            // through `sql_type`.
+            // "Has a wire identity" is a non-empty type name, the same test
+            // `udt_type_name` applies before an execute: a record holding only
+            // a catalog or schema declares nothing. Once a type name is
+            // present the catalog and schema travel with it, so changing
+            // either still invalidates, and a later switch away from
+            // `SQL_SS_UDT` invalidates through `sql_type`.
             udt: self
                 .udt_names
                 .as_ref()

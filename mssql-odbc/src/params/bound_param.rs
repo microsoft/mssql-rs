@@ -354,7 +354,14 @@ impl BoundParam {
                 let param = Self::from_records(apd_record, ipd_record, odbc_version)?;
                 Some(ParamSnapshot {
                     param,
-                    udt_names: ipd_record.and_then(|ipd| ipd.udt_names.clone()),
+                    // Filtered to match the doc on the field, and for the same
+                    // reason `parameter_definition` filters: `classify_field`
+                    // gates the `SQL_CA_SS_UDT_*` fields on `DescKind::ImpParam`
+                    // alone, so an application can leave an identity on a
+                    // record it later rebinds to a scalar type.
+                    udt_names: ipd_record
+                        .filter(|ipd| ipd.concise_type == crate::api::odbc_types::SQL_SS_UDT)
+                        .and_then(|ipd| ipd.udt_names.clone()),
                 })
             })
             .collect()
@@ -817,5 +824,31 @@ mod tests {
         assert_eq!(params.len(), 2);
         assert!(params[0].is_some());
         assert!(params[1].is_none());
+    }
+
+    /// `SQL_CA_SS_UDT_*` is writable on any IPD record (`classify_field` gates
+    /// on kind, not type), so an identity can outlive a rebind to a scalar
+    /// type. The snapshot must not carry it: the field's contract is `None`
+    /// for every non-`SQL_SS_UDT` parameter, and nothing else enforces that.
+    #[test]
+    fn a_udt_identity_left_on_a_scalar_record_does_not_reach_the_snapshot() {
+        let mut apd_state = empty_state();
+        let mut ipd_state = empty_state();
+        let mut apd = DescRecord::default_for(DescKind::AppParam);
+        let mut ipd = DescRecord::default_for(DescKind::ImpParam);
+        param(std::ptr::null_mut(), std::ptr::null_mut()).write_to_records(&mut apd, &mut ipd);
+        // The bind above leaves `concise_type` at SQL_VARCHAR.
+        ipd.udt_names = Some(Arc::new(UdtNames {
+            type_name: "Point".to_string(),
+            ..Default::default()
+        }));
+        apd_state.records.push(apd);
+        ipd_state.records.push(ipd);
+
+        let params = BoundParam::all_from_descriptor_states(&apd_state, &ipd_state, ODBC_VERSION);
+        assert!(
+            params[0].as_ref().unwrap().udt_names.is_none(),
+            "a scalar parameter must carry no UDT identity"
+        );
     }
 }
