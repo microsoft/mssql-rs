@@ -524,6 +524,23 @@ impl RpcParameter {
         }
     }
 
+    /// The B_VARCHAR count for a parameter name is a single byte, so the name
+    /// is bounded. Shared by [`Self::validate_named_before_send`] and the
+    /// write path in `serialize`, so the two cannot drift.
+    ///
+    /// NOTE: the bound is measured in `len()` (UTF-8 bytes) while the payload
+    /// is written as UTF-16 by `write_string_unicode_async`. The two agree for
+    /// the ASCII names this driver generates (`@P1`, ...), but not in general.
+    /// Pre-existing behaviour, preserved here rather than changed silently.
+    fn validate_name_length(name: &str) -> TdsResult<()> {
+        if name.len() > 0xFF {
+            return Err(Error::UsageError(
+                "Parameter name is too long. Maximum length is 255 characters.".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Validates whatever must be correct before *any* byte of this parameter
     /// reaches the wire.
     ///
@@ -534,11 +551,28 @@ impl RpcParameter {
     /// earlier parameter may have flushed whole packets. Checking here, before
     /// the RPC writes anything, is what keeps invalid local input a local
     /// failure rather than a half-sent request needing cancel-and-drain.
+    ///
+    /// The name is checked separately by [`Self::validate_named_before_send`],
+    /// since only the named path writes it.
     pub(crate) fn validate_before_send(&self) -> TdsResult<()> {
         match &self.value {
             RpcValue::Materialized(value) => value.validate_for_send(),
             RpcValue::Streamed(_) => Ok(()),
         }
+    }
+
+    /// [`Self::validate_before_send`] plus the parameter-name bound, for a
+    /// parameter the RPC will serialize through its *named* path.
+    ///
+    /// Kept apart because `serialize` only writes - and only length-checks -
+    /// the name when it is not positional, so validating it unconditionally
+    /// would reject a positional parameter whose unused name happens to be
+    /// overlong.
+    pub(crate) fn validate_named_before_send(&self) -> TdsResult<()> {
+        if let Some(name) = &self.name {
+            Self::validate_name_length(name)?;
+        }
+        self.validate_before_send()
     }
 
     /// Serializes the RPC parameter into the provided `PacketWriter`.
@@ -570,12 +604,7 @@ impl RpcParameter {
         } else {
             match self.name {
                 Some(ref name) => {
-                    if name.len() > 0xFF {
-                        return Err(Error::UsageError(
-                            "Parameter name is too long. Maximum length is 255 characters."
-                                .to_string(),
-                        ));
-                    }
+                    Self::validate_name_length(name)?;
                     let name_length = name.len() as u8;
                     // We can only send byte length.
                     packet_writer.write_byte_async(name_length).await?;

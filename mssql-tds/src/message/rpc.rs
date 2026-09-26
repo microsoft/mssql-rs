@@ -99,13 +99,11 @@ impl<'a> SqlRpc<'a> {
     /// already left. Running the checks first keeps locally-invalid input a
     /// local failure instead of a half-sent RPC needing cancel-and-drain.
     fn validate_parameters(&self) -> TdsResult<()> {
-        for parameter in self
-            .positional_parameters
-            .iter()
-            .chain(self.named_parameters.iter())
-            .flatten()
-        {
+        for parameter in self.positional_parameters.iter().flatten() {
             parameter.validate_before_send()?;
+        }
+        for parameter in self.named_parameters.iter().flatten() {
+            parameter.validate_named_before_send()?;
         }
         Ok(())
     }
@@ -572,5 +570,44 @@ mod tests {
                 "no packet may reach the network before every parameter is validated"
             );
         }
+    }
+
+    /// The named counterpart: an overlong name on a *later* named parameter
+    /// must also fail before anything is written. `serialize` length-checks
+    /// the name only on the named path, which is why the preflight splits the
+    /// two rather than validating names it will never write.
+    #[test]
+    fn an_overlong_name_on_a_later_named_parameter_sends_nothing() {
+        let filler = SqlString::from_utf8_string("x".repeat(600));
+        let parameters = vec![
+            RpcParameter::new(
+                Some("@ok".to_string()),
+                StatusFlags::NONE,
+                SqlType::NVarchar(Some(filler), 4000),
+            ),
+            RpcParameter::new(
+                Some(format!("@{}", "n".repeat(0xFF))),
+                StatusFlags::NONE,
+                SqlType::Int(Some(1)),
+            ),
+        ];
+
+        let mut mock = MockNetworkWriter::new(512);
+        let mut writer = PacketWriter::new(PacketType::RpcRequest, &mut mock, None, None);
+        let collation = SqlCollation::default();
+        let rpc = SqlRpc::new(
+            RpcType::ProcId(RpcProcs::ExecuteSql),
+            None,
+            Some(parameters),
+            &collation,
+            &ExecutionContext::new(),
+        );
+
+        let result = block_on(rpc.serialize_prefix(&mut writer));
+        assert!(matches!(result, Err(crate::error::Error::UsageError(_))));
+        assert!(
+            mock.data.is_empty(),
+            "no packet may reach the network before every parameter is validated"
+        );
     }
 }
