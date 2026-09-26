@@ -92,6 +92,24 @@ impl<'a> SqlRpc<'a> {
         }
     }
 
+    /// Validates every parameter before the message writes anything.
+    ///
+    /// `PacketWriter` sends on overflow, so once serialization starts a later
+    /// parameter's invalid value can only be reported after earlier bytes have
+    /// already left. Running the checks first keeps locally-invalid input a
+    /// local failure instead of a half-sent RPC needing cancel-and-drain.
+    fn validate_parameters(&self) -> TdsResult<()> {
+        for parameter in self
+            .positional_parameters
+            .iter()
+            .chain(self.named_parameters.iter())
+            .flatten()
+        {
+            parameter.validate_before_send()?;
+        }
+        Ok(())
+    }
+
     async fn write_positional_parameters(
         &self,
         packet_writer: &mut PacketWriter<'_>,
@@ -140,6 +158,7 @@ impl<'a> SqlRpc<'a> {
     where
         'b: 's,
     {
+        self.validate_parameters()?;
         write_headers(&self.headers, packet_writer).await?;
         self.write_proc(packet_writer).await?;
         self.write_positional_parameters(packet_writer).await?;
@@ -158,6 +177,7 @@ impl<'a> SqlRpc<'a> {
         packet_writer: &mut PacketWriter<'_>,
         first: bool,
     ) -> TdsResult<()> {
+        self.validate_parameters()?;
         if first {
             write_headers(&self.headers, packet_writer).await?;
         } else {
@@ -490,6 +510,56 @@ mod tests {
         assert_eq!(
             &writer.get_payload().into_inner()[8..],
             &[0xff, 0xff, 10, 0, 0, 0]
+        );
+    }
+
+    /// An invalid UDT identity on a *later* parameter must fail before the
+    /// message writes anything. `PacketWriter` sends on overflow, so once
+    /// serialization starts an earlier parameter can already have flushed
+    /// whole packets - the error would then arrive as a half-sent RPC needing
+    /// cancel-and-drain rather than a local failure.
+    #[test]
+    fn an_invalid_udt_name_on_a_later_parameter_sends_nothing() {
+        use crate::datatypes::sql_udt::UdtTypeName;
+
+        // First parameter is large enough to overflow the 512-byte packet on
+        // its own, so a missing preflight would be observable as sent bytes.
+        let filler = SqlString::from_utf8_string("x".repeat(600));
+        let parameters = vec![
+            RpcParameter::new(
+                None,
+                StatusFlags::NONE,
+                SqlType::NVarchar(Some(filler), 4000),
+            ),
+            RpcParameter::new(
+                None,
+                StatusFlags::NONE,
+                SqlType::Udt(
+                    UdtTypeName::new(None, None, "c".repeat(256)),
+                    Some(vec![0x01]),
+                ),
+            ),
+        ];
+
+        // Packet size comes from the mock writer, not from `PacketWriter::new`
+        // (whose third argument is a timeout). 512 bytes is small enough that
+        // the 1200-byte first parameter must overflow and flush.
+        let mut mock = MockNetworkWriter::new(512);
+        let mut writer = PacketWriter::new(PacketType::RpcRequest, &mut mock, None, None);
+        let collation = SqlCollation::default();
+        let rpc = SqlRpc::new(
+            RpcType::ProcId(RpcProcs::ExecuteSql),
+            Some(parameters),
+            None,
+            &collation,
+            &ExecutionContext::new(),
+        );
+
+        let result = block_on(rpc.serialize_prefix(&mut writer));
+        assert!(matches!(result, Err(crate::error::Error::UsageError(_))));
+        assert!(
+            mock.data.is_empty(),
+            "no packet may reach the network before every parameter is validated"
         );
     }
 }

@@ -198,9 +198,11 @@ mod tests {
         ] {
             assert!(matches!(name.validate(), Err(Error::UsageError(_))));
 
-            // A packet small enough that the catalog alone would overflow it.
-            let mut mock = MockNetworkWriter::new(4096);
-            let mut writer = PacketWriter::new(PacketType::RpcRequest, &mut mock, Some(512), None);
+            // Packet size comes from the mock, not from `PacketWriter::new`
+            // (whose third argument is a timeout). 512 bytes is small enough
+            // that a 255-unit catalog part must overflow and flush.
+            let mut mock = MockNetworkWriter::new(512);
+            let mut writer = PacketWriter::new(PacketType::RpcRequest, &mut mock, None, None);
             let result = write_udt_type_name(&mut writer, &name).await;
 
             assert!(matches!(result, Err(Error::UsageError(_))));
