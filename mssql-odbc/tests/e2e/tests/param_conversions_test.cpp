@@ -2142,7 +2142,7 @@ TEST_F(ExtendedTypeLiveTest, BinaryParamRoundTripsThroughSqlVariant) {
 // varbinary at its non-max ceiling (`variant_column_size`, which predates
 // binary variants and already governed the character ones) and refuses at
 // execute with `22001`, saving the round trip. Both legs are asserted so the
-// reference stays measured. Registered as deviation 19 in
+// reference stays measured. Registered as deviation 20 in
 // `mssql-odbc/docs/parity-deviations.md`.
 TEST_F(ExtendedTypeLiveTest, BinaryVariantPayloadPastTheCeilingIsRefused) {
     ASSERT_SQL_OK(Prepare("SELECT CAST(? AS VARBINARY(8000))"), SQL_HANDLE_STMT, stmt_);
