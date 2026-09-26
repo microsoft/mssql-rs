@@ -338,15 +338,19 @@ impl DescRecord {
             length,
             precision,
             scale,
-            // Only the three wire parts, and only when at least one is set: a
-            // record carrying nothing but the echo-only assembly name declares
-            // no type, so it must project the same as a record with no
-            // identity at all. Projecting `Some(("", "", ""))` there orphaned a
-            // materialized prepared handle for a field the declaration never
-            // mentions.
+            // Only the three wire parts, and only on a record that actually
+            // declares a UDT. The `SQL_CA_SS_UDT_*` fields are writable on any
+            // IPD record (`classify_field` gates on kind, not type), but a
+            // non-UDT declaration never references them - and a record
+            // carrying nothing but the echo-only assembly name declares no
+            // type either. Projecting in those cases orphaned a materialized
+            // prepared handle for text the declaration does not contain. A
+            // later switch to `SQL_SS_UDT` still invalidates through
+            // `sql_type`, and brings the name with it.
             udt: self
                 .udt_names
                 .as_ref()
+                .filter(|_| self.concise_type == crate::api::odbc_types::SQL_SS_UDT)
                 .filter(|names| {
                     !names.catalog.is_empty()
                         || !names.schema.is_empty()
@@ -1084,6 +1088,28 @@ mod tests {
             assembly_only.parameter_definition(),
             "an assembly-only record declares nothing, so it must not re-prepare"
         );
+
+        // A UDT name on a record that does not declare a UDT. The
+        // `SQL_CA_SS_UDT_*` fields are writable on any IPD record, but an
+        // `int` declaration never mentions them, so the projection must ignore
+        // them until the type actually becomes `SQL_SS_UDT` - at which point
+        // `sql_type` invalidates and carries the name along.
+        let mut scalar = DescRecord::default_for(DescKind::ImpParam);
+        scalar.concise_type = crate::api::odbc_types::SQL_INTEGER;
+        let scalar_plain = scalar.parameter_definition();
+        scalar.udt_names = Some(Box::new(UdtNames {
+            type_name: "Point".to_string(),
+            ..Default::default()
+        }));
+        assert_eq!(
+            scalar_plain,
+            scalar.parameter_definition(),
+            "a UDT name on a non-UDT record changes no declaration"
+        );
+
+        // ... and switching that record to a UDT does invalidate, name included.
+        scalar.concise_type = crate::api::odbc_types::SQL_SS_UDT;
+        assert_ne!(scalar_plain, scalar.parameter_definition());
     }
 
     #[test]
