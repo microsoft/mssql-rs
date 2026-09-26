@@ -342,6 +342,13 @@ fn sql_describe_param_safe(
         }
     }
 
+    // Sorted once here so `refine_ipd` can binary-search instead of scanning:
+    // it replays this list for every cached answer, so a describe-all pass
+    // over N markers would otherwise cost O(N^3) ordinal comparisons - 62.6M
+    // at 500 UDT placeholders. `sp_describe_undeclared_parameters` rows are
+    // not promised in ordinal order, so this cannot assume the push order.
+    udt_names.sort_unstable_by_key(|(index, _)| *index);
+
     let info_messages = client.take_info_messages();
     return_client_idle(dbc, statement_handle, client);
 
@@ -410,11 +417,21 @@ fn sql_describe_param_safe(
 /// locking-order rationale). A poisoned IPD mutex is logged and otherwise
 /// ignored: `SQLDescribeParam`'s own answer, already written from the
 /// in-memory `descriptions`, does not depend on this refinement succeeding.
+///
+/// INVARIANT: `udt_names` is sorted by ordinal. This function is replayed for
+/// every cached answer, so it binary-searches rather than scanning - a linear
+/// scan made a describe-all pass over N markers cost O(N^3) comparisons.
+/// `sql_describe_param_safe` sorts once before caching; the `debug_assert`
+/// below catches any future caller that forgets.
 fn refine_ipd(
     stmt: &StmtHandle,
     descriptions: &[ParameterDescription],
     udt_names: &[(usize, Box<UdtNames>)],
 ) {
+    debug_assert!(
+        udt_names.windows(2).all(|w| w[0].0 <= w[1].0),
+        "refine_ipd requires udt_names sorted by ordinal for binary search"
+    );
     let desc = unsafe { handle_from_raw::<DescHandle>(stmt.ipd) };
     let Ok(mut desc_state) = desc.inner.lock() else {
         error!("SQLDescribeParam: ipd mutex poisoned; parameter metadata left unrefined");
@@ -472,7 +489,10 @@ fn refine_ipd(
             .as_ref()
             .is_some_and(|names| !names.type_name.is_empty());
         if !claimed || record.udt_names_auto_filled {
-            let described = udt_names.iter().find(|(index, _)| *index == i);
+            let described = udt_names
+                .binary_search_by_key(&i, |(index, _)| *index)
+                .ok()
+                .map(|position| &udt_names[position].1);
             // The server never supplies an assembly name, so an application's
             // survives the refresh of the parts around it.
             let assembly = record
@@ -483,7 +503,7 @@ fn refine_ipd(
             // A describe that reports no UDT at this ordinal must not discard
             // the record outright: it may exist only to carry that echo-only
             // assembly name, which no describe can restore.
-            if let Some((_, names)) = described {
+            if let Some(names) = described {
                 let mut names = names.clone();
                 names.assembly_type_name = assembly;
                 record.udt_names = Some(names);
@@ -1914,6 +1934,48 @@ mod tests {
             ipd_records(&h)[0].udt_names.as_ref().unwrap().type_name,
             "Point",
             "an application-supplied type name is a claim the server cannot override"
+        );
+    }
+
+    /// `refine_ipd` binary-searches `udt_names`, so every marker must still
+    /// resolve to its own identity rather than a neighbour's. Pins the
+    /// ordering contract the search depends on: `sp_describe_undeclared_
+    /// parameters` does not promise ordinal order, so the sort in
+    /// `sql_describe_param_safe` is what makes this hold.
+    #[test]
+    fn each_marker_resolves_its_own_identity_across_a_sorted_list() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+
+        // Three UDT markers with a non-UDT gap at ordinal 2, sorted as the
+        // caching path leaves them.
+        let described = [
+            param_description(SQL_SS_UDT, 8000, 0, SQL_NULLABLE),
+            param_description(SQL_SS_UDT, 8000, 0, SQL_NULLABLE),
+            param_description(SQL_INTEGER, 10, 0, SQL_NULLABLE),
+            param_description(SQL_SS_UDT, 8000, 0, SQL_NULLABLE),
+        ];
+        let names = [
+            (0, udt_identity("hierarchyid")),
+            (1, udt_identity("geometry")),
+            (3, udt_identity("geography")),
+        ];
+
+        refine_ipd(stmt, &described, &names);
+
+        let records = ipd_records(&h);
+        assert_eq!(
+            records[0].udt_names.as_ref().unwrap().type_name,
+            "hierarchyid"
+        );
+        assert_eq!(records[1].udt_names.as_ref().unwrap().type_name, "geometry");
+        assert!(
+            records[2].udt_names.is_none(),
+            "the gap ordinal has no identity to take"
+        );
+        assert_eq!(
+            records[3].udt_names.as_ref().unwrap().type_name,
+            "geography"
         );
     }
 

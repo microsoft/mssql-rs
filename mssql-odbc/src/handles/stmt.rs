@@ -492,6 +492,10 @@ pub(crate) struct StmtState {
     /// `parameter_metadata`, as `(ordinal - 1, names)` for UDT markers only.
     /// Kept beside the scalar descriptions rather than inside them so
     /// `ParameterDescription` stays `Copy`, and invalidated with them.
+    ///
+    /// Sorted by ordinal: `refine_ipd` binary-searches it on every cached
+    /// describe, which a linear scan turned into O(N^3) work across a
+    /// describe-all pass.
     pub(crate) parameter_udt_names: Vec<(usize, Box<UdtNames>)>,
     /// Parameters bound via `SQLBindParameter`, indexed by `(ParameterNumber
     /// - 1)`. `None` slots are gaps left by binding a higher ordinal first.
