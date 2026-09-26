@@ -527,20 +527,18 @@ impl RpcParameter {
     /// Validates whatever must be correct before *any* byte of this parameter
     /// reaches the wire.
     ///
-    /// Only a UDT has such a rule today: its three-part name is bounded by the
-    /// B_VARCHAR `u8` count, and `write_udt_type_name` cannot enforce that
-    /// early enough on its own. By the time it runs, `serialize` has already
-    /// written this parameter's name and status flags and `write_type_info`
-    /// has written the UDT type byte - and `PacketWriter` sends on overflow,
-    /// so in a multi-parameter RPC an earlier parameter may have flushed
-    /// whole packets already. Checking here, before the RPC writes anything,
-    /// is what keeps an invalid local identity a local failure rather than a
-    /// half-sent request that has to be cancelled and drained.
+    /// Delegates to [`SqlType::validate_for_send`], which owns the per-type
+    /// rules. Those checks also run inside `write_type_info`, but by then
+    /// `serialize` has already written this parameter's name and status flags,
+    /// and `PacketWriter` sends on overflow - so in a multi-parameter RPC an
+    /// earlier parameter may have flushed whole packets. Checking here, before
+    /// the RPC writes anything, is what keeps invalid local input a local
+    /// failure rather than a half-sent request needing cancel-and-drain.
     pub(crate) fn validate_before_send(&self) -> TdsResult<()> {
-        if let RpcValue::Materialized(SqlType::Udt(type_name, _)) = &self.value {
-            type_name.validate()?;
+        match &self.value {
+            RpcValue::Materialized(value) => value.validate_for_send(),
+            RpcValue::Streamed(_) => Ok(()),
         }
-        Ok(())
     }
 
     /// Serializes the RPC parameter into the provided `PacketWriter`.

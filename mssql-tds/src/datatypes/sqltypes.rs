@@ -1092,6 +1092,30 @@ impl SqlType {
     /// string/binary types whose declared length exceeds the non-MAX limit, since those
     /// are promoted to MAX/PLP by the type-info paths. Returns [`Error::UsageError`] for
     /// any of these.
+    /// Validates what must be correct before *any* byte of this value reaches
+    /// the wire.
+    ///
+    /// The per-type checks below also run during `write_type_info`, but that
+    /// is too late to keep a failure local: by then `RpcParameter::serialize`
+    /// has written this parameter's name and status flags, and in a
+    /// multi-parameter RPC an earlier parameter may have flushed whole packets
+    /// (`PacketWriter` sends on overflow). `SqlRpc::validate_parameters` calls
+    /// this for every parameter before the message writes anything, so
+    /// locally-invalid input fails locally instead of becoming a half-sent
+    /// request that has to be cancelled and drained.
+    ///
+    /// Every fallible metadata check in `write_type_info` belongs here. Today
+    /// that is the UDT name and the `sql_variant` inner type; the duplicate in
+    /// `write_type_info` stays, since that function must remain correct for
+    /// callers that reach it by another route.
+    pub(crate) fn validate_for_send(&self) -> TdsResult<()> {
+        match self {
+            SqlType::Udt(type_name, _) => type_name.validate(),
+            SqlType::Variant(inner) => Self::validate_variant_inner(inner),
+            _ => Ok(()),
+        }
+    }
+
     fn validate_variant_inner(inner: &SqlType) -> TdsResult<()> {
         // nvarchar tops out at 4000 characters before promotion to nvarchar(max).
         const NVARCHAR_MAX_CHARS: u16 = 4000;

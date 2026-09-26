@@ -513,53 +513,64 @@ mod tests {
         );
     }
 
-    /// An invalid UDT identity on a *later* parameter must fail before the
-    /// message writes anything. `PacketWriter` sends on overflow, so once
+    /// An invalid value on a *later* parameter must fail before the message
+    /// writes anything. `PacketWriter` sends on overflow, so once
     /// serialization starts an earlier parameter can already have flushed
     /// whole packets - the error would then arrive as a half-sent RPC needing
     /// cancel-and-drain rather than a local failure.
+    ///
+    /// Covers both fallible metadata checks: a UDT name too long for its
+    /// B_VARCHAR count, and a `sql_variant` whose inner type it cannot hold.
     #[test]
-    fn an_invalid_udt_name_on_a_later_parameter_sends_nothing() {
+    fn an_invalid_later_parameter_sends_nothing() {
         use crate::datatypes::sql_udt::UdtTypeName;
 
-        // First parameter is large enough to overflow the 512-byte packet on
-        // its own, so a missing preflight would be observable as sent bytes.
-        let filler = SqlString::from_utf8_string("x".repeat(600));
-        let parameters = vec![
-            RpcParameter::new(
-                None,
-                StatusFlags::NONE,
-                SqlType::NVarchar(Some(filler), 4000),
+        let invalid_values = [
+            SqlType::Udt(
+                UdtTypeName::new(None, None, "c".repeat(256)),
+                Some(vec![0x01]),
             ),
-            RpcParameter::new(
-                None,
-                StatusFlags::NONE,
-                SqlType::Udt(
-                    UdtTypeName::new(None, None, "c".repeat(256)),
-                    Some(vec![0x01]),
-                ),
-            ),
+            // `sql_variant` cannot carry a UDT; rejected by
+            // `validate_variant_inner`, which `write_type_info` only reaches
+            // after this parameter's name and flags are already written.
+            SqlType::Variant(Box::new(SqlType::Udt(
+                UdtTypeName::new(None, None, "Point".to_string()),
+                Some(vec![0x01]),
+            ))),
         ];
 
-        // Packet size comes from the mock writer, not from `PacketWriter::new`
-        // (whose third argument is a timeout). 512 bytes is small enough that
-        // the 1200-byte first parameter must overflow and flush.
-        let mut mock = MockNetworkWriter::new(512);
-        let mut writer = PacketWriter::new(PacketType::RpcRequest, &mut mock, None, None);
-        let collation = SqlCollation::default();
-        let rpc = SqlRpc::new(
-            RpcType::ProcId(RpcProcs::ExecuteSql),
-            Some(parameters),
-            None,
-            &collation,
-            &ExecutionContext::new(),
-        );
+        for invalid in invalid_values {
+            // First parameter is large enough to overflow the 512-byte packet
+            // on its own, so a missing preflight is observable as sent bytes.
+            let filler = SqlString::from_utf8_string("x".repeat(600));
+            let parameters = vec![
+                RpcParameter::new(
+                    None,
+                    StatusFlags::NONE,
+                    SqlType::NVarchar(Some(filler), 4000),
+                ),
+                RpcParameter::new(None, StatusFlags::NONE, invalid),
+            ];
 
-        let result = block_on(rpc.serialize_prefix(&mut writer));
-        assert!(matches!(result, Err(crate::error::Error::UsageError(_))));
-        assert!(
-            mock.data.is_empty(),
-            "no packet may reach the network before every parameter is validated"
-        );
+            // Packet size comes from the mock writer, not from
+            // `PacketWriter::new` (whose third argument is a timeout).
+            let mut mock = MockNetworkWriter::new(512);
+            let mut writer = PacketWriter::new(PacketType::RpcRequest, &mut mock, None, None);
+            let collation = SqlCollation::default();
+            let rpc = SqlRpc::new(
+                RpcType::ProcId(RpcProcs::ExecuteSql),
+                Some(parameters),
+                None,
+                &collation,
+                &ExecutionContext::new(),
+            );
+
+            let result = block_on(rpc.serialize_prefix(&mut writer));
+            assert!(matches!(result, Err(crate::error::Error::UsageError(_))));
+            assert!(
+                mock.data.is_empty(),
+                "no packet may reach the network before every parameter is validated"
+            );
+        }
     }
 }
