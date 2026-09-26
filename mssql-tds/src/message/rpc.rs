@@ -98,6 +98,18 @@ impl<'a> SqlRpc<'a> {
     /// parameter's invalid value can only be reported after earlier bytes have
     /// already left. Running the checks first keeps locally-invalid input a
     /// local failure instead of a half-sent RPC needing cancel-and-drain.
+    ///
+    /// SCOPE: this covers one RPC message. In a *batched* prepared execution
+    /// each row is its own command, appended to a shared writer by
+    /// `serialize_batch_command`, so this runs per command and a later row's
+    /// invalid parameter is still reported after earlier rows have flushed -
+    /// `finish_send` retracts the request in that case. Closing that would
+    /// mean validating every row before the first is written, which the
+    /// streaming row iterator does not allow without materializing the whole
+    /// batch. The batch path already aborts mid-batch the same way for
+    /// `reject_data_at_exec` and the ForceColumnEncryption check
+    /// (`tds_client.rs`), so this shares an existing property rather than
+    /// adding one; tracked in AB#48248.
     fn validate_parameters(&self) -> TdsResult<()> {
         for parameter in self.positional_parameters.iter().flatten() {
             parameter.validate_before_send()?;
@@ -535,6 +547,17 @@ mod tests {
                 UdtTypeName::new(None, None, "Point".to_string()),
                 Some(vec![0x01]),
             ))),
+            // A vector whose declared dimensions disagree with its value.
+            // Reachable from outside this crate - `mssql-py-core` builds these
+            // from application input.
+            SqlType::Vector(
+                Some(
+                    crate::datatypes::sql_vector::SqlVector::try_from_f32(vec![1.0, 2.0, 3.0])
+                        .expect("three f32 elements is a valid vector"),
+                ),
+                7,
+                crate::datatypes::sqldatatypes::VectorBaseType::Float32,
+            ),
         ];
 
         for invalid in invalid_values {
@@ -564,7 +587,9 @@ mod tests {
             );
 
             let result = block_on(rpc.serialize_prefix(&mut writer));
-            assert!(matches!(result, Err(crate::error::Error::UsageError(_))));
+            // `UsageError` for the name/variant rules, `TypeConversionError`
+            // for a vector whose declaration disagrees with its value.
+            assert!(result.is_err(), "expected the invalid value to be rejected");
             assert!(
                 mock.data.is_empty(),
                 "no packet may reach the network before every parameter is validated"

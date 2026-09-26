@@ -1019,30 +1019,7 @@ impl SqlType {
             SqlType::Vector(sql_vector, dimensions, base_type) => {
                 packet_writer.write_byte_async(nullable_type as u8).await?;
 
-                let max_dim = base_type.max_dimensions();
-                if *dimensions > max_dim {
-                    return Err(Error::UsageError(format!(
-                        "Vector dimensions {} exceeds maximum supported dimensions {} for base type {:?}",
-                        dimensions, max_dim, base_type
-                    )));
-                }
-
-                if let Some(vector) = sql_vector {
-                    let actual_base_type = vector.base_type();
-                    if actual_base_type != *base_type {
-                        return Err(Error::TypeConversionError(format!(
-                            "Vector base type mismatch: declared {:?}, but vector has {:?}",
-                            base_type, actual_base_type
-                        )));
-                    }
-                    let actual_dimensions = vector.dimension_count();
-                    if actual_dimensions != *dimensions {
-                        return Err(Error::TypeConversionError(format!(
-                            "Vector dimension mismatch: declared {}, but vector has {}",
-                            dimensions, actual_dimensions
-                        )));
-                    }
-                }
+                Self::validate_vector(sql_vector.as_ref(), *dimensions, *base_type)?;
 
                 let element_size = base_type.element_size_bytes() as u16;
                 let exact_size = (VECTOR_HEADER_SIZE as u16) + (*dimensions * element_size);
@@ -1085,13 +1062,6 @@ impl SqlType {
         Ok(())
     }
 
-    /// Validate that the inner type of a `sql_variant` is one the server can store.
-    ///
-    /// `sql_variant` cannot hold MAX types, `xml`, `json`, `text`/`ntext`, vectors,
-    /// table-valued parameters, or a nested `sql_variant`. It also cannot hold sized
-    /// string/binary types whose declared length exceeds the non-MAX limit, since those
-    /// are promoted to MAX/PLP by the type-info paths. Returns [`Error::UsageError`] for
-    /// any of these.
     /// Validates what must be correct before *any* byte of this value reaches
     /// the wire.
     ///
@@ -1104,18 +1074,70 @@ impl SqlType {
     /// locally-invalid input fails locally instead of becoming a half-sent
     /// request that has to be cancelled and drained.
     ///
-    /// Every fallible metadata check in `write_type_info` belongs here. Today
-    /// that is the UDT name and the `sql_variant` inner type; the duplicate in
-    /// `write_type_info` stays, since that function must remain correct for
-    /// callers that reach it by another route.
+    /// Every fallible *scalar* metadata check in `write_type_info` belongs
+    /// here: today the UDT name, the `sql_variant` inner type, and the vector
+    /// dimension/base-type bounds. The duplicates in `write_type_info` stay,
+    /// since that function must remain correct for callers that reach it by
+    /// another route.
+    ///
+    /// `SqlType::Table` is the known exception. A TVP's validation lives in
+    /// `serialize_table` / `write_tvp_type_name` / `write_tvp_column_metadata`
+    /// and covers the type name, the column metadata and every row, so hoisting
+    /// it is a larger change than this one - it is tracked in AB#48248 rather
+    /// than half-done here. A TVP with invalid table data can therefore still
+    /// fail mid-write; do not read this method as covering it.
     pub(crate) fn validate_for_send(&self) -> TdsResult<()> {
         match self {
             SqlType::Udt(type_name, _) => type_name.validate(),
             SqlType::Variant(inner) => Self::validate_variant_inner(inner),
+            SqlType::Vector(vector, dimensions, base_type) => {
+                Self::validate_vector(vector.as_ref(), *dimensions, *base_type)
+            }
             _ => Ok(()),
         }
     }
 
+    /// Checks a vector's declared dimensions against its base type's maximum,
+    /// and - when a value is present - that the declaration matches the value.
+    ///
+    /// Shared with `write_type_info` so the wire path and the preflight cannot
+    /// disagree about what is sendable.
+    fn validate_vector(
+        vector: Option<&SqlVector>,
+        dimensions: u16,
+        base_type: VectorBaseType,
+    ) -> TdsResult<()> {
+        let max_dim = base_type.max_dimensions();
+        if dimensions > max_dim {
+            return Err(Error::UsageError(format!(
+                "Vector dimensions {dimensions} exceeds maximum supported dimensions {max_dim} for base type {base_type:?}"
+            )));
+        }
+
+        if let Some(vector) = vector {
+            let actual_base_type = vector.base_type();
+            if actual_base_type != base_type {
+                return Err(Error::TypeConversionError(format!(
+                    "Vector base type mismatch: declared {base_type:?}, but vector has {actual_base_type:?}"
+                )));
+            }
+            let actual_dimensions = vector.dimension_count();
+            if actual_dimensions != dimensions {
+                return Err(Error::TypeConversionError(format!(
+                    "Vector dimension mismatch: declared {dimensions}, but vector has {actual_dimensions}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate that the inner type of a `sql_variant` is one the server can store.
+    ///
+    /// `sql_variant` cannot hold MAX types, `xml`, `json`, `text`/`ntext`, vectors,
+    /// table-valued parameters, or a nested `sql_variant`. It also cannot hold sized
+    /// string/binary types whose declared length exceeds the non-MAX limit, since those
+    /// are promoted to MAX/PLP by the type-info paths. Returns [`Error::UsageError`] for
+    /// any of these.
     fn validate_variant_inner(inner: &SqlType) -> TdsResult<()> {
         // nvarchar tops out at 4000 characters before promotion to nvarchar(max).
         const NVARCHAR_MAX_CHARS: u16 = 4000;
