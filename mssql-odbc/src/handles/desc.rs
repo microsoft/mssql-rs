@@ -278,14 +278,42 @@ pub(crate) struct DescRecord {
     /// whose identity is also held by a live snapshot is copied once, on
     /// write, rather than on every read.
     pub(crate) udt_names: Option<Arc<UdtNames>>,
-    /// IPD only: set when `refine_ipd` supplied `udt_names` from the server's
-    /// `suggested_user_type_*` columns rather than the application supplying
-    /// them through `SQLSetDescField`. Plays the same role for the UDT
-    /// identity that `explicitly_bound` plays for the type/size - without it,
-    /// `udt_names.is_some()` cannot tell an application's choice apart from a
-    /// stale name this driver auto-filled for a different statement, and a
-    /// re-`SQLPrepare` (which keeps IPD records) would send the old identity.
-    pub(crate) udt_names_auto_filled: bool,
+    /// IPD only: which of the three *wire* name parts the application set
+    /// through `SQLSetDescField`, as opposed to `refine_ipd` auto-filling them
+    /// from the server's `suggested_user_type_*` columns. Plays the same role
+    /// for the UDT identity that `explicitly_bound` plays for the type/size.
+    ///
+    /// Per field, not one flag for the record: the three parts are
+    /// independently writable, so a single bit cannot express "the
+    /// application chose the schema, the server still owns the type name".
+    /// Collapsing them let a re-`SQLPrepare` preserve a stale server-filled
+    /// type name because the application had written only the schema, and let
+    /// a describe overwrite a catalog the application had set.
+    ///
+    /// `assembly_type_name` has no entry: it never reaches the wire, no
+    /// describe supplies it, and writing it must not claim the identity.
+    pub(crate) udt_name_claimed: UdtNameClaims,
+}
+
+/// Which wire parts of a UDT identity the application claimed.
+///
+/// One bool per part rather than one for the record: `SQLSetDescField` writes
+/// them independently, so provenance is per field. An unclaimed part stays the
+/// server's to supply and to refresh; a claimed one survives both a describe
+/// and the prepare-time clear.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct UdtNameClaims {
+    pub(crate) catalog: bool,
+    pub(crate) schema: bool,
+    pub(crate) type_name: bool,
+}
+
+impl UdtNameClaims {
+    /// True when the application has claimed no wire part, so the whole
+    /// identity is still the server's to supply.
+    pub(crate) fn none(&self) -> bool {
+        !self.catalog && !self.schema && !self.type_name
+    }
 }
 
 /// The server-side identity an application supplies for a UDT parameter.
@@ -446,7 +474,7 @@ impl DescRecord {
             precision_scale_explicit: false,
             explicitly_bound: false,
             udt_names: None,
-            udt_names_auto_filled: false,
+            udt_name_claimed: UdtNameClaims::default(),
         }
     }
 
@@ -545,25 +573,29 @@ impl DescHandle {
             return SQL_ERROR;
         };
         for record in &mut state.records {
-            if !record.udt_names_auto_filled {
+            if record.udt_name_claimed == UdtNameClaims::default() && record.udt_names.is_none() {
                 continue;
             }
             let Some(names) = record.udt_names.as_mut().map(Arc::make_mut) else {
-                record.udt_names_auto_filled = false;
                 continue;
             };
-            if names.assembly_type_name.is_empty() {
-                record.udt_names = None;
-                record.udt_names_auto_filled = false;
-            } else {
-                // Only the wire parts go. The record survives solely to carry
-                // the application's echo-only assembly name, so the identity
-                // is still the server's to supply - keep it auto-filled or
-                // `refine_ipd`'s gate would never refresh it again, stranding
-                // the parameter with an empty `type_name`.
+            // Per part: an application's write survives, an auto-filled one
+            // goes. Clearing a part rather than the record keeps the rest -
+            // including the echo-only assembly name, which no describe can
+            // restore - and leaves the cleared parts refreshable, since
+            // `refine_ipd` treats an unclaimed part as the server's to supply.
+            if !record.udt_name_claimed.catalog {
                 names.catalog.clear();
+            }
+            if !record.udt_name_claimed.schema {
                 names.schema.clear();
+            }
+            if !record.udt_name_claimed.type_name {
                 names.type_name.clear();
+            }
+            // Nothing left worth keeping: no claimed part, no assembly name.
+            if record.udt_name_claimed.none() && names.assembly_type_name.is_empty() {
+                record.udt_names = None;
             }
         }
         SQL_SUCCESS
@@ -1031,20 +1063,24 @@ mod tests {
                 type_name: "hierarchyid".to_string(),
                 ..Default::default()
             }));
-            described.udt_names_auto_filled = true;
+            described.udt_name_claimed = UdtNameClaims::default();
             let chosen = state.record_mut(2).unwrap();
             chosen.udt_names = Some(Arc::new(UdtNames {
                 type_name: "Point".to_string(),
                 ..Default::default()
             }));
-            chosen.udt_names_auto_filled = false;
+            chosen.udt_name_claimed = UdtNameClaims {
+                catalog: true,
+                schema: true,
+                type_name: true,
+            };
         }
 
         handle.clear_auto_filled_udt_names();
 
         let state = handle.inner.lock().unwrap();
         assert!(state.records[0].udt_names.is_none());
-        assert!(!state.records[0].udt_names_auto_filled);
+        assert_eq!(state.records[0].udt_name_claimed, UdtNameClaims::default());
         assert_eq!(
             state.records[1].udt_names.as_ref().unwrap().type_name,
             "Point"
@@ -1068,7 +1104,7 @@ mod tests {
                 assembly_type_name: "Asm.Point".to_string(),
                 ..Default::default()
             }));
-            record.udt_names_auto_filled = true;
+            record.udt_name_claimed = UdtNameClaims::default();
         }
 
         assert_eq!(handle.clear_auto_filled_udt_names(), SQL_SUCCESS);

@@ -481,74 +481,75 @@ fn refine_ipd(
             record.precision = 0;
         }
         // The server is the only source for a UDT's name when the application
-        // has not supplied one, matching msodbcsql's `AutoFillIPD`. An
-        // identity the application set wins, the same way an explicit bind
-        // does above; one this function auto-filled earlier is replaced, since
-        // a re-`SQLPrepare` keeps IPD records and the previous name may belong
-        // to a different statement's marker.
-        //
-        // "Claimed" is a property of the record, not of how it was reached: a
-        // record whose `type_name` is empty carries no wire identity, however
-        // it got that way - `SQLSetDescField` writing only the echo-only
-        // assembly name, or `clear_auto_filled_udt_names` keeping a record for
-        // exactly that. Gating on the state rather than the provenance bit
-        // alone keeps those histories indistinguishable, as the descriptor
-        // contract says they should be.
-        let claimed = record
-            .udt_names
-            .as_ref()
-            .is_some_and(|names| !names.type_name.is_empty());
-        if !claimed || record.udt_names_auto_filled {
-            let described = udt_names
-                .binary_search_by_key(&i, |(index, _)| *index)
-                .ok()
-                .map(|position| &udt_names[position].1);
-            // A describe that reports no UDT at this ordinal must not discard
-            // the record outright: it may exist only to carry the echo-only
-            // assembly name, which no describe can restore.
-            if let Some(names) = described {
-                // Steady state: a replay after the first call finds the record
-                // already holding exactly this identity, so there is nothing
-                // to write. Comparing the three wire parts costs no allocation,
-                // where rebuilding them cost one owned copy per marker per
-                // cache-served answer - O(N^2) across a describe-all pass.
-                let unchanged = record.udt_names_auto_filled
-                    && record.udt_names.as_ref().is_some_and(|current| {
-                        current.catalog == names.catalog
-                            && current.schema == names.schema
-                            && current.type_name == names.type_name
-                    });
-                if !unchanged {
-                    // This driver does not read the assembly-qualified column
-                    // (see `read_udt_names`), so an application's survives the
-                    // refresh of the parts around it.
-                    let assembly = record
-                        .udt_names
-                        .as_ref()
-                        .map(|names| names.assembly_type_name.clone())
-                        .unwrap_or_default();
-                    let mut fresh = UdtNames::clone(names);
-                    fresh.assembly_type_name = assembly;
-                    record.udt_names = Some(Arc::new(fresh));
-                    record.udt_names_auto_filled = true;
-                }
+        // has not supplied one, matching msodbcsql's `AutoFillIPD`. The merge
+        // is per part, because provenance is: a part the application set wins,
+        // the same way an explicit bind does above; an unclaimed one is
+        // replaced, since a re-`SQLPrepare` keeps IPD records and the previous
+        // name may belong to a different statement's marker.
+        let described = udt_names
+            .binary_search_by_key(&i, |(index, _)| *index)
+            .ok()
+            .map(|position| &udt_names[position].1);
+        // A describe that reports no UDT at this ordinal clears the unclaimed
+        // parts rather than discarding the record: it may still carry claimed
+        // parts, or the echo-only assembly name, which no describe restores.
+        let empty = UdtNames::default();
+        let fresh = described.map_or(&empty, |names| &**names);
+        let claims = record.udt_name_claimed;
+        // Steady state: a replay after the first call finds the record already
+        // holding exactly this identity, so there is nothing to write.
+        // Comparing the three wire parts costs no allocation, where rebuilding
+        // them cost one owned copy per marker per cache-served answer - O(N^2)
+        // across a describe-all pass.
+        let merged = |part: fn(&UdtNames) -> &String, claimed: bool| -> &str {
+            if claimed {
+                record.udt_names.as_deref().map_or("", |n| part(n))
             } else {
-                let assembly = record
+                part(fresh)
+            }
+        };
+        let unchanged = record.udt_names.as_ref().is_some_and(|current| {
+            current.catalog == merged(|n| &n.catalog, claims.catalog)
+                && current.schema == merged(|n| &n.schema, claims.schema)
+                && current.type_name == merged(|n| &n.type_name, claims.type_name)
+        });
+        if !unchanged {
+            // Nothing of the application's to preserve: share the describe's
+            // identity rather than copying its three strings per marker.
+            if let Some(described) = described
+                && claims.none()
+                && record
                     .udt_names
                     .as_ref()
-                    .map(|names| names.assembly_type_name.clone())
-                    .unwrap_or_default();
-                if !assembly.is_empty() {
-                    record.udt_names = Some(Arc::new(UdtNames {
-                        assembly_type_name: assembly,
-                        ..Default::default()
-                    }));
-                    record.udt_names_auto_filled = true;
-                } else {
-                    record.udt_names = None;
-                    record.udt_names_auto_filled = false;
+                    .is_none_or(|n| n.assembly_type_name.is_empty())
+            {
+                record.udt_names = Some(Arc::clone(described));
+            } else {
+                let names = Arc::make_mut(record.udt_names.get_or_insert_with(Default::default));
+                // This driver does not read the assembly-qualified column (see
+                // `read_udt_names`), so an application's survives the refresh
+                // of the parts around it.
+                if !claims.catalog {
+                    names.catalog.clone_from(&fresh.catalog);
+                }
+                if !claims.schema {
+                    names.schema.clone_from(&fresh.schema);
+                }
+                if !claims.type_name {
+                    names.type_name.clone_from(&fresh.type_name);
                 }
             }
+        }
+        // Nothing left worth carrying: no claimed part, nothing described, no
+        // assembly name to echo.
+        if record.udt_names.as_ref().is_some_and(|n| {
+            claims.none()
+                && n.assembly_type_name.is_empty()
+                && n.catalog.is_empty()
+                && n.schema.is_empty()
+                && n.type_name.is_empty()
+        }) {
+            record.udt_names = None;
         }
         if previous != record.parameter_definition() {
             first_changed.get_or_insert(i + 1);
@@ -977,6 +978,23 @@ impl DescriptionCollector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::handles::desc::UdtNameClaims;
+
+    /// `SQLSetDescField` for one `SQL_CA_SS_UDT_*` name on record 1, so tests
+    /// exercise `set_udt_name`'s provenance claim rather than reaching past it.
+    fn set_udt_name_field(ipd: SqlHandle, field: SqlUSmallInt, value: &str) {
+        let mut wide: Vec<u16> = value.encode_utf16().chain(std::iter::once(0)).collect();
+        let ret = unsafe {
+            crate::api::set_desc_field::sql_set_desc_field_w(
+                ipd,
+                1,
+                field as SqlSmallInt,
+                wide.as_mut_ptr() as SqlPointer,
+                SqlInteger::from(SQL_NTS),
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS);
+    }
     use crate::test_support::TestHandles;
     use mssql_tds::connection::tds_client::PreparedStatement;
 
@@ -1828,7 +1846,11 @@ mod tests {
             let mut state = desc.inner.lock().unwrap();
             let record = state.record_mut(1).unwrap();
             record.udt_names = Some(Arc::new(UdtNames::clone(&udt_identity("Point"))));
-            record.udt_names_auto_filled = false;
+            record.udt_name_claimed = UdtNameClaims {
+                catalog: true,
+                schema: true,
+                type_name: true,
+            };
         }
         refine_ipd(stmt, &described, &[(0, udt_identity("geography"))]);
         assert_eq!(
@@ -1885,6 +1907,67 @@ mod tests {
         );
     }
 
+    /// The three wire parts are independently writable, so provenance is
+    /// per field. Both writes go through `SQLSetDescField` so the test guards
+    /// `set_udt_name`'s claim as well as the merge. Two orders prove one flag
+    /// cannot express it:
+    ///
+    /// 1. Server fills the identity, then the application overrides only the
+    ///    schema. A single flag marks the whole identity application-owned,
+    ///    so `clear_auto_filled_udt_names` preserves the *server's* stale type
+    ///    name across a re-`SQLPrepare` instead of letting the next describe
+    ///    refresh it.
+    /// 2. The application writes only the catalog, then describes. A gate
+    ///    keyed off `type_name` alone lets the describe overwrite a part the
+    ///    application did set.
+    #[test]
+    fn per_field_udt_provenance_survives_both_orders() {
+        let described = [param_description(SQL_SS_UDT, 8000, 0, SQL_NULLABLE)];
+
+        // Order 1: server-filled, then an application schema override.
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let ipd_ptr = h.ipd();
+        let ipd = unsafe { handle_from_raw::<DescHandle>(ipd_ptr) };
+
+        refine_ipd(stmt, &described, &[(0, udt_identity("hierarchyid"))]);
+        set_udt_name_field(ipd_ptr, SQL_CA_SS_UDT_SCHEMA_NAME, "dbo");
+        assert_eq!(ipd.clear_auto_filled_udt_names(), SQL_SUCCESS);
+        refine_ipd(stmt, &described, &[(0, udt_identity("geography"))]);
+
+        let names = ipd_records(&h)[0].udt_names.as_ref().unwrap().clone();
+        assert_eq!(
+            names.schema, "dbo",
+            "the application's schema write must survive"
+        );
+        assert_eq!(
+            names.type_name, "geography",
+            "the server's stale type name must not outlive its statement"
+        );
+
+        // Order 2: application writes the catalog only, then describes.
+        let h2 = TestHandles::with_env_dbc_stmt();
+        let stmt2 = unsafe { handle_from_raw::<StmtHandle>(h2.stmt) };
+        let ipd2_ptr = h2.ipd();
+        {
+            let ipd2 = unsafe { handle_from_raw::<DescHandle>(ipd2_ptr) };
+            let mut state = ipd2.inner.lock().unwrap();
+            state.set_record_count(1, ipd2.kind);
+        }
+        set_udt_name_field(ipd2_ptr, SQL_CA_SS_UDT_CATALOG_NAME, "mydb");
+        refine_ipd(stmt2, &described, &[(0, udt_identity("hierarchyid"))]);
+
+        let names2 = ipd_records(&h2)[0].udt_names.as_ref().unwrap().clone();
+        assert_eq!(
+            names2.catalog, "mydb",
+            "an application catalog write must not be overwritten by a describe"
+        );
+        assert_eq!(
+            names2.type_name, "hierarchyid",
+            "the unclaimed type name is still the server's to supply"
+        );
+    }
+
     /// The other half of the same rule: when a later describe reports no UDT
     /// at this ordinal, the record may still exist only to carry the
     /// application's echo-only assembly name. Dropping it outright would
@@ -1894,7 +1977,6 @@ mod tests {
         let h = TestHandles::with_env_dbc_stmt();
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let ipd = unsafe { handle_from_raw::<DescHandle>(h.ipd()) };
-
         refine_ipd(
             stmt,
             &[param_description(SQL_SS_UDT, 8000, 0, SQL_NULLABLE)],
@@ -1944,7 +2026,7 @@ mod tests {
         let ipd = unsafe { handle_from_raw::<DescHandle>(h.ipd()) };
 
         // Exactly what `set_udt_name` does for the assembly field on a fresh
-        // record: no wire identity claimed, provenance bit untouched.
+        // record: it claims no wire part.
         {
             let mut state = ipd.inner.lock().unwrap();
             state.set_record_count(1, ipd.kind);
@@ -1953,7 +2035,6 @@ mod tests {
                 assembly_type_name: "MyAsm".to_string(),
                 ..Default::default()
             }));
-            record.udt_names_auto_filled = false;
         }
 
         refine_ipd(
@@ -1990,7 +2071,11 @@ mod tests {
             state.set_record_count(1, ipd.kind);
             let record = state.record_mut(1).unwrap();
             record.udt_names = Some(Arc::new(UdtNames::clone(&udt_identity("Point"))));
-            record.udt_names_auto_filled = false;
+            record.udt_name_claimed = UdtNameClaims {
+                catalog: true,
+                schema: true,
+                type_name: true,
+            };
         }
 
         refine_ipd(

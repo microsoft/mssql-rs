@@ -711,17 +711,23 @@ fn set_udt_name(
         return SQL_ERROR;
     };
     write_record_field(state, record_number, |r| {
-        // Only the three parts that reach the wire claim the identity. The
-        // assembly name is stored and echoed but never sent, so writing it
-        // must not freeze a server-supplied name against a later describe.
-        if field != SQL_CA_SS_UDT_ASSEMBLY_TYPE_NAME {
-            r.udt_names_auto_filled = false;
-        }
         let names = Arc::make_mut(r.udt_names.get_or_insert_with(Default::default));
+        // Claim only the part written. The assembly name never reaches the
+        // wire, so writing it claims nothing and leaves the rest the server's
+        // to supply.
         match field {
-            SQL_CA_SS_UDT_CATALOG_NAME => names.catalog = value,
-            SQL_CA_SS_UDT_SCHEMA_NAME => names.schema = value,
-            SQL_CA_SS_UDT_TYPE_NAME => names.type_name = value,
+            SQL_CA_SS_UDT_CATALOG_NAME => {
+                names.catalog = value;
+                r.udt_name_claimed.catalog = true;
+            }
+            SQL_CA_SS_UDT_SCHEMA_NAME => {
+                names.schema = value;
+                r.udt_name_claimed.schema = true;
+            }
+            SQL_CA_SS_UDT_TYPE_NAME => {
+                names.type_name = value;
+                r.udt_name_claimed.type_name = true;
+            }
             SQL_CA_SS_UDT_ASSEMBLY_TYPE_NAME => names.assembly_type_name = value,
             // `set_record_field` routes only the four fields above here.
             _ => debug_assert!(false, "unexpected UDT name field {field}"),
@@ -932,7 +938,7 @@ mod tests {
                 type_name: "hierarchyid".to_string(),
                 ..Default::default()
             }));
-            record.udt_names_auto_filled = true;
+            record.udt_name_claimed = Default::default();
         }
 
         let mut value: Vec<u16> = "MyAsm".encode_utf16().chain(std::iter::once(0)).collect();
@@ -947,7 +953,9 @@ mod tests {
         };
         assert_eq!(ret, SQL_SUCCESS);
         assert!(
-            desc.inner.lock().unwrap().records[0].udt_names_auto_filled,
+            !desc.inner.lock().unwrap().records[0]
+                .udt_name_claimed
+                .type_name,
             "the identity is still the server's, so it must stay replaceable"
         );
 
@@ -963,7 +971,11 @@ mod tests {
             )
         };
         assert_eq!(ret, SQL_SUCCESS);
-        assert!(!desc.inner.lock().unwrap().records[0].udt_names_auto_filled);
+        assert!(
+            desc.inner.lock().unwrap().records[0]
+                .udt_name_claimed
+                .type_name
+        );
     }
 
     /// The exact sequence `mssql-python`'s `ddbc_bindings.cpp` runs for a

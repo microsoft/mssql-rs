@@ -312,7 +312,7 @@ mod tests {
                 precision_scale_explicit: false,
                 explicitly_bound: false,
                 udt_names: None,
-                udt_names_auto_filled: false,
+                udt_name_claimed: Default::default(),
             },
         );
 
@@ -352,7 +352,7 @@ mod tests {
                 precision_scale_explicit: false,
                 explicitly_bound: false,
                 udt_names: None,
-                udt_names_auto_filled: false,
+                udt_name_claimed: Default::default(),
             },
         );
 
@@ -391,7 +391,7 @@ mod tests {
                 precision_scale_explicit: false,
                 explicitly_bound: false,
                 udt_names: None,
-                udt_names_auto_filled: false,
+                udt_name_claimed: Default::default(),
             },
         );
 
