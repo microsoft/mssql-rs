@@ -690,6 +690,155 @@ mod bulk_copy_integration_tests {
         assert_eq!(result.rows_affected, 0);
     }
 
+    /// One `varchar` row per batch, so the substitution verdict has to survive
+    /// a clean batch following a lossy one.
+    #[derive(Debug, Clone)]
+    struct TextRow {
+        id: i32,
+        text: &'static str,
+    }
+
+    #[async_trait]
+    impl BulkLoadRow for TextRow {
+        async fn write_to_packet(
+            &self,
+            writer: &mut mssql_tds::message::bulk_load::StreamingBulkLoadWriter<'_>,
+            column_index: &mut usize,
+        ) -> TdsResult<()> {
+            writer
+                .write_column_value(*column_index, &ColumnValues::Int(self.id))
+                .await?;
+            *column_index += 1;
+            writer
+                .write_column_value(
+                    *column_index,
+                    &ColumnValues::String(SqlString::from_utf8_string(self.text.to_string())),
+                )
+                .await?;
+            *column_index += 1;
+            Ok(())
+        }
+    }
+
+    /// A character the target collation's code page cannot represent is
+    /// substituted with `?` on the bulk-copy path exactly as it is for an RPC
+    /// parameter, and the whole operation reports it — even when the
+    /// substitution happened in an earlier batch than the last (AB#47598).
+    ///
+    /// `batch_size(1)` with two rows forces two
+    /// `execute_bulk_load_streaming_zerocopy` calls. Each assigns the verdict
+    /// for its own message, so without `write_to_server`'s per-batch drain and
+    /// final restore the clean second batch would erase the first batch's
+    /// substitution and this would report `false`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_bulk_copy_reports_code_page_loss_from_an_earlier_batch() {
+        let mut client = begin_connection(&build_tcp_datasource()).await;
+
+        // The column collation decides the code page, so this holds whatever
+        // the database default is. U+65E5 has no Windows-1252 representation.
+        client
+            .execute(
+                "CREATE TABLE #BulkCopyCpLoss (
+                    id INT NOT NULL,
+                    v VARCHAR(16) COLLATE SQL_Latin1_General_CP1_CI_AS NOT NULL
+                )"
+                .to_string(),
+                (),
+            )
+            .await
+            .expect("Failed to create test table");
+        client.close_query().await.expect("Failed to close query");
+
+        let rows = vec![
+            TextRow {
+                id: 1,
+                text: "caf\u{65e5}",
+            },
+            TextRow { id: 2, text: "abc" },
+        ];
+
+        let result = BulkCopy::new(&mut client, "#BulkCopyCpLoss")
+            .batch_size(1)
+            .write_to_server_zerocopy(rows)
+            .await
+            .expect("Bulk copy failed");
+        assert_eq!(result.rows_affected, 2);
+
+        assert!(
+            client.take_code_page_conversion_loss(),
+            "a substitution in the first of two batches must still be reported \
+             for the whole operation"
+        );
+        assert!(
+            !client.take_code_page_conversion_loss(),
+            "the verdict is drained by a single take"
+        );
+
+        // The substitution is the single byte msodbcsql and the engine both
+        // produce, not the eight-byte numeric character reference `encoding_rs`
+        // emits unaided.
+        client
+            .execute(
+                "SELECT CAST(ASCII(SUBSTRING(v, 4, 1)) AS VARCHAR(8)) + '/' \
+                 + CAST(DATALENGTH(v) AS VARCHAR(8)) \
+                 FROM #BulkCopyCpLoss WHERE id = 1"
+                    .to_string(),
+                (),
+            )
+            .await
+            .expect("probe the stored value");
+        let first = get_scalar_value(&mut client)
+            .await
+            .expect("read probe")
+            .expect("probe returned a row");
+        match first {
+            ColumnValues::String(s) => assert_eq!(
+                s.to_utf8_string(),
+                "63/4",
+                "\"caf?\" - one substitute byte, not markup"
+            ),
+            other => panic!("expected a string, got {other:?}"),
+        }
+        client.close_query().await.expect("Failed to close query");
+    }
+
+    /// The counterpart: a bulk copy whose values all encode cleanly must not
+    /// report loss, or every bulk copy would warn once the attribute is on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_bulk_copy_reports_no_code_page_loss_for_mappable_values() {
+        let mut client = begin_connection(&build_tcp_datasource()).await;
+
+        client
+            .execute(
+                "CREATE TABLE #BulkCopyCpClean (
+                    id INT NOT NULL,
+                    v VARCHAR(16) COLLATE SQL_Latin1_General_CP1_CI_AS NOT NULL
+                )"
+                .to_string(),
+                (),
+            )
+            .await
+            .expect("Failed to create test table");
+        client.close_query().await.expect("Failed to close query");
+
+        // 'é' is representable in Windows-1252, so nothing is substituted.
+        let rows = vec![
+            TextRow {
+                id: 1,
+                text: "caf\u{e9}",
+            },
+            TextRow { id: 2, text: "abc" },
+        ];
+
+        BulkCopy::new(&mut client, "#BulkCopyCpClean")
+            .batch_size(1)
+            .write_to_server_zerocopy(rows)
+            .await
+            .expect("Bulk copy failed");
+
+        assert!(!client.take_code_page_conversion_loss());
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_bulk_copy_null_to_non_nullable_column() {
         let mut client = begin_connection(&build_tcp_datasource()).await;
@@ -2657,7 +2806,7 @@ mod bulk_copy_integration_tests {
 
         {
             let mut bulk_copy = BulkCopy::new(&mut client, "#BulkDiverse");
-            bulk_copy.write_to_server_zerocopy(&rows).await.unwrap();
+            bulk_copy.write_to_server_zerocopy(rows).await.unwrap();
         }
 
         client
@@ -2745,7 +2894,7 @@ mod bulk_copy_integration_tests {
 
         {
             let mut bulk_copy = BulkCopy::new(&mut client, "#BulkNullable");
-            bulk_copy.write_to_server_zerocopy(&rows).await.unwrap();
+            bulk_copy.write_to_server_zerocopy(rows).await.unwrap();
         }
 
         client
@@ -2852,7 +3001,7 @@ mod bulk_copy_integration_tests {
 
         {
             let mut bulk_copy = BulkCopy::new(&mut client, "#BulkTime");
-            bulk_copy.write_to_server_zerocopy(&rows).await.unwrap();
+            bulk_copy.write_to_server_zerocopy(rows).await.unwrap();
         }
 
         client
@@ -2944,7 +3093,7 @@ mod bulk_copy_integration_tests {
 
         {
             let mut bulk_copy = BulkCopy::new(&mut client, "#BulkMoney");
-            bulk_copy.write_to_server_zerocopy(&rows).await.unwrap();
+            bulk_copy.write_to_server_zerocopy(rows).await.unwrap();
         }
 
         client

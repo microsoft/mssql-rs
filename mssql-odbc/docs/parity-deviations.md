@@ -499,13 +499,25 @@ msodbcsql build is measured.
     **The same platform split decides the substitution *width* for an astral
     character.** Windows converts per UTF-16 code unit, so `U+1F600` becomes two
     `0x3F` bytes; so does the engine
-    (`DATALENGTH(CAST(N'😀' AS varchar(4)))` is 2). msodbcsql's iconv legs
-    convert the character as a unit and emit one — measured on Ubuntu 22.04 /
-    glibc 2.35, `iconv -f UTF-16LE -t CP1252//TRANSLIT` gives a single `3f`.
+    (`DATALENGTH(CAST(N'😀' AS varchar(4)))` is 2). **Measured on glibc 2.35
+    (Ubuntu 22.04, the CI container's base): one byte.**
+    `iconv -f UTF-16LE -t CP1252//TRANSLIT` emits a single `3f`, because
+    `//TRANSLIT` makes iconv itself resolve the character and msodbcsql's own
+    per-`WCHAR` `EILSEQ` loop (`Globalization.h`, `SkipSingleCh` + `AddDefault`)
+    never runs.
+
+    **musl is not measured.** `TRANSLIT` is empty there (`:51`), so iconv should
+    instead return `EILSEQ` and hand the character back to that per-`WCHAR`
+    loop — a different mechanism, and therefore possibly a different width. The
+    claim here is deliberately limited to the leg that was measured; do not
+    infer musl's byte count from this entry, and measure it before relying on
+    one either way.
+
     This driver follows the Windows and engine answer, which is also the one
     that cannot let a `varchar(n)` accept a string those two reject, and it does
-    so identically on every platform. `AstralUnmappableCharacterSubstitutesPerUtf16Unit`
-    carries `SKIP_IF_COMPARING_MSODBCSQL()` for the glibc leg.
+    so identically on every platform.
+    `AstralUnmappableCharacterSubstitutesPerUtf16Unit` carries
+    `SKIP_IF_COMPARING_MSODBCSQL()` for the glibc leg.
 
     Second-order consequence: under `SQL_COPT_SS_WARN_ON_CP_ERROR` (entry 19)
     we warn for a best-fit character where msodbcsql would not, since it does

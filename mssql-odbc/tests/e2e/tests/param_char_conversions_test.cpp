@@ -1011,11 +1011,12 @@ TEST_F(CharConversionLiveTest, UnmappableCharacterIsSubstitutedForANarrowCType) 
 // varchar(n) accept a string those two reject.
 //
 // Skipped under comparison: parity-deviations entry 18. msodbcsql is not
-// self-consistent here across its own platforms - its iconv legs convert the
-// whole character at once, so glibc answers a single 3F (measured on
-// Ubuntu 22.04 / glibc 2.35, iconv -f UTF-16LE -t CP1252//TRANSLIT) where
-// Windows answers 3F 3F. This driver is platform-independent and follows the
-// Windows/engine answer.
+// self-consistent here across its own platforms - measured on glibc 2.35,
+// iconv -f UTF-16LE -t CP1252//TRANSLIT answers a single 3F where
+// WideCharToMultiByte answers 3F 3F, because //TRANSLIT lets iconv resolve the
+// character itself instead of handing it to msodbcsql's per-WCHAR EILSEQ loop.
+// musl compiles //TRANSLIT out and is not measured. This driver is
+// platform-independent and follows the Windows/engine answer.
 TEST_F(CharConversionLiveTest, AstralUnmappableCharacterSubstitutesPerUtf16Unit) {
     SKIP_IF_COMPARING_MSODBCSQL();
 
