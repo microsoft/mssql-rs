@@ -974,11 +974,10 @@ mod tests {
     /// identity that `refine_ipd` then refuses to touch.
     #[test]
     fn clearing_auto_filled_udt_names_spares_application_supplied_ones() {
-        let handle = DescHandle::new(
-            DescKind::ImpParam,
-            SQL_DESC_ALLOC_AUTO,
-            std::ptr::null_mut(),
-        );
+        // The statement's real IPD, per the fixture rule: in production this
+        // method is only ever called on `stmt.ipd`.
+        let h = crate::test_support::TestHandles::with_env_dbc_stmt();
+        let handle = unsafe { crate::handles::handle_from_raw::<DescHandle>(h.ipd()) };
         {
             let mut state = handle.inner.lock().unwrap();
             state.set_record_count(2, DescKind::ImpParam);
@@ -1013,11 +1012,8 @@ mod tests {
     /// describe. The name itself still survives that clear.
     #[test]
     fn the_assembly_name_neither_claims_nor_loses_the_wire_identity() {
-        let handle = DescHandle::new(
-            DescKind::ImpParam,
-            SQL_DESC_ALLOC_AUTO,
-            std::ptr::null_mut(),
-        );
+        let h = crate::test_support::TestHandles::with_env_dbc_stmt();
+        let handle = unsafe { crate::handles::handle_from_raw::<DescHandle>(h.ipd()) };
         {
             let mut state = handle.inner.lock().unwrap();
             state.set_record_count(1, DescKind::ImpParam);
