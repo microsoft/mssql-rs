@@ -3819,6 +3819,32 @@ mod tests {
             matches!(*inner, SqlType::VarBinary(Some(ref b), _) if b.len() == SQL_PREC_BIGCHARBINARY),
             "a payload exactly at the ceiling must convert intact, got {inner:?}"
         );
+
+        // Zero-only overflow: padding rather than data, so it is trimmed and
+        // sent instead of refused. This is the leg parity deviation 20 cites -
+        // the reject case above uses `0xFF` and cannot show it, and
+        // `an_all_zero_binary_overflow_is_trimmed_silently` covers the plain
+        // `varbinary`/`binary`/`image` targets rather than a variant.
+        let mut zero_padded = vec![0xFFu8; SQL_PREC_BIGCHARBINARY];
+        zero_padded.push(0x00);
+        let mut ind: SqlLen = SqlLen::try_from(zero_padded.len()).unwrap();
+        let mut p = param(
+            SQL_C_BINARY,
+            zero_padded.as_mut_ptr() as *mut c_void,
+            &mut ind,
+        );
+        p.sql_type = SQL_SS_VARIANT;
+        p.column_size = 0;
+
+        let (value, _) = unsafe { bound_param_to_value(&p) }
+            .expect("an all-zero overflow is padding, so it trims rather than failing");
+        let SqlType::Variant(inner) = value else {
+            panic!("expected Variant, got {value:?}");
+        };
+        assert!(
+            matches!(*inner, SqlType::VarBinary(Some(ref b), _) if b.len() == SQL_PREC_BIGCHARBINARY),
+            "the zero padding is dropped, leaving the payload at the ceiling, got {inner:?}"
+        );
     }
 
     /// Every newly bound row must produce a typed NULL from `ParameterType`
