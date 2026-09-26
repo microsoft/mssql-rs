@@ -180,17 +180,23 @@ whether the statement is prepared and treats DAE as orthogonal, parking a
 half-written `sp_prepexec` / `sp_execute` RPC the same way this driver does.
 `SQLExecDirect` has no plan to preserve, so it stays on ad-hoc `sp_executesql`.
 
-Because `sp_prepexec` returns its `@handle` as a RETURNVALUE that trails the
-result set, the statement id is claimed when the message is parked rather than
-when it completes. A sequence that is cancelled or fails never produces the
-handle, so `cancel_streamed_write` and `abort_streamed_write` disarm the pending
-capture; leaving it armed would divert an unrelated RPC's first return value
-into the handle map.
+`sp_prepexec` returns its `@handle` as a RETURNVALUE that trails the result set.
+The client reserves an id while building the request but assigns it to the
+statement only when the complete message is sent, before reading the response.
+The same boundary consumes the orphan carried in the by-reference `@handle`
+and removes its cached encryption metadata. Cancelling the parked request
+retains the orphan without leaving an inert statement id that could overwrite
+it on the next rebind. `cancel_streamed_write` and `abort_streamed_write` disarm
+the pending capture; leaving it armed would divert an unrelated RPC's first
+return value into the handle map.
 
 `SQLPutData` calls `TdsClient::write_streamed_chunk` (or
-`write_streamed_null`). `SQLParamData` calls `TdsClient::end_streamed_param`
-which writes the PLP terminator and either opens the next parameter's header
-or finalises and sends the packet.
+`write_streamed_null`). `SQLParamData` calls
+`TdsClient::end_execute_prepared_param` with the sequence's plan and orphan, or
+`end_streamed_param` for an ad-hoc request. Both write the PLP terminator and
+either open the next parameter's header or finalise and send the packet.
+Prepared ownership is restored to the sequence even on error: a final packet
+may reach the server before a timeout or response error is reported.
 
 ### Parameter Order
 
@@ -225,12 +231,15 @@ statements.
 
 ### Error Recovery
 
-If `write_streamed_chunk`, `write_streamed_null`, or `end_streamed_param`
-fails, `TdsClient::abort_streamed_write` is called internally (which closes
-the transport). The ODBC layer:
+Write failures end the streamed request. A failure while closing a parameter
+retracts an incomplete message where possible; an unrecoverable write or
+response failure closes the transport. Usage errors leave the stream available
+for correction or cancellation. For errors propagated to the application, the
+ODBC layer:
 
 1. Clears all DAE state (`take_dae`).
-2. Writes the prepared plan back so `SQLExecute` can be retried.
+2. Restores the prepared plan and any unconsumed orphan so `SQLExecute` can be
+   retried, including when `end_execute_prepared_param` failed after sending.
 3. Returns the client to idle and posts the TDS error.
 
 The application receives `SQL_ERROR` with an appropriate diagnostic.

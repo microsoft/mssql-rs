@@ -352,7 +352,8 @@ enum ResetAckState {
 pub enum StreamedParamStatus {
     /// The server still expects a streamed parameter value. Stream its chunks
     /// next via [`TdsClient::write_streamed_chunk`], then call
-    /// [`TdsClient::end_streamed_param`].
+    /// [`TdsClient::end_streamed_param`] (or
+    /// [`TdsClient::end_execute_prepared_param`] for a prepared stream).
     NeedData {
         /// Name of the streamed parameter now awaiting its value chunks.
         param_name: String,
@@ -451,6 +452,13 @@ struct StreamedWriteContext {
     null_signaled: bool,
     /// Configured timeout reused for each resumed streaming operation.
     timeout_sec: Option<u32>,
+    prepared: Option<StreamedPreparedContext>,
+}
+
+#[derive(Debug)]
+struct StreamedPreparedContext {
+    issued_id: Option<StatementId>,
+    orphaned: Option<StatementId>,
 }
 
 /// Cached row-buffering eligibility paired with the exact metadata allocation it describes.
@@ -1304,9 +1312,9 @@ impl TdsClient {
     /// `timeout_sec` is the overall budget for recovery **and** the subsequent
     /// execution, matching ODBC's `CheckOrRecoverConnection` (which deducts
     /// recovery time from the remaining command timeout). Charge the returned
-    /// duration back with [`deduct_timeout`](Self::deduct_timeout) so a
-    /// 30-second command timeout still means at most 30 seconds total whether
-    /// or not a reconnect occurred. When `timeout_sec` is `None` or `Some(0)`,
+    /// duration back with [`deduct_timeout`](Self::deduct_timeout) so recovery
+    /// and execution share the budget at whole-second precision.
+    /// When `timeout_sec` is `None` or `Some(0)`,
     /// recovery is instead bounded by the login `connect_timeout`, so it can
     /// never block indefinitely.
     ///
@@ -1425,7 +1433,7 @@ impl TdsClient {
         self.check_and_reconnect(timeout_sec, cancel_handle).await
     }
 
-    /// Charges elapsed recovery time against a command-timeout budget.
+    /// Charges whole elapsed seconds against a command-timeout budget.
     ///
     /// # Parameters
     /// - `timeout_sec`: remaining command budget in seconds; `None` means "no
@@ -1434,8 +1442,11 @@ impl TdsClient {
     ///
     /// `None` and caller-supplied `Some(0)` both represent an infinite budget.
     /// A positive timeout becomes [`CommandTimeoutBudget::Exhausted`] when
-    /// recovery consumes it, which must be rejected by `into_timeout` before a
+    /// elapsed time consumes it, which must be rejected by `into_timeout` before a
     /// request is serialized.
+    /// Truncate elapsed time so sub-second cleanup cannot exhaust a one-second
+    /// budget. Multi-step callers must pass the original budget and cumulative
+    /// elapsed time, limiting rounding slack to less than one second.
     pub(in crate::connection) fn deduct_timeout(
         timeout_sec: Option<u32>,
         elapsed: Duration,
@@ -1443,12 +1454,7 @@ impl TdsClient {
         let Some(timeout_sec) = timeout_sec.and_then(NonZeroU32::new) else {
             return CommandTimeoutBudget::None;
         };
-        let elapsed_secs = u32::try_from(
-            elapsed
-                .as_secs()
-                .saturating_add(u64::from(elapsed.subsec_nanos() > 0)),
-        )
-        .unwrap_or(u32::MAX);
+        let elapsed_secs = u32::try_from(elapsed.as_secs()).unwrap_or(u32::MAX);
 
         match NonZeroU32::new(timeout_sec.get().saturating_sub(elapsed_secs)) {
             Some(remaining) => CommandTimeoutBudget::Remaining(remaining),
@@ -2300,6 +2306,7 @@ impl TdsClient {
             value_opened: false,
             null_signaled: false,
             timeout_sec,
+            prepared: None,
         }));
 
         Ok(StreamedParamStatus::NeedData {
@@ -2313,6 +2320,8 @@ impl TdsClient {
     /// [`begin_sp_executesql`](Self::begin_sp_executesql) (or
     /// [`end_streamed_param`](Self::end_streamed_param)) and the matching
     /// [`end_streamed_param`](Self::end_streamed_param).
+    /// Prepared streams use
+    /// [`end_execute_prepared_param`](Self::end_execute_prepared_param) instead.
     ///
     /// Empty chunks are ignored: a zero-length PLP chunk header is the value
     /// terminator, so it must never be emitted mid-value.
@@ -2352,6 +2361,7 @@ impl TdsClient {
             value_opened,
             null_signaled,
             timeout_sec,
+            prepared,
         } = *ctx;
         self.remaining_request_timeout = timeout_sec.map(|s| Duration::from_secs(u64::from(s)));
 
@@ -2369,6 +2379,7 @@ impl TdsClient {
                     value_opened,
                     null_signaled,
                     timeout_sec,
+                    prepared,
                 }));
             return Err(UsageError(
                 "write_streamed_chunk called after the parameter was marked NULL.".to_string(),
@@ -2388,6 +2399,7 @@ impl TdsClient {
                     value_opened,
                     null_signaled,
                     timeout_sec,
+                    prepared,
                 }));
             return Ok(());
         }
@@ -2419,6 +2431,7 @@ impl TdsClient {
                         value_opened: true,
                         null_signaled: false,
                         timeout_sec,
+                        prepared,
                     }));
                 Ok(())
             }
@@ -2426,8 +2439,13 @@ impl TdsClient {
                 // A partial value chunk is now on the wire, so this message can no
                 // longer be continued safely. Drop it and abort the streamed
                 // write rather than re-parking it as resumable.
+                let send_incomplete = message.send_incomplete();
                 drop(message);
-                self.abort_streamed_write().await;
+                if send_incomplete {
+                    self.retire_without_writing();
+                } else {
+                    self.abort_streamed_write().await;
+                }
                 Err(e)
             }
         }
@@ -2527,11 +2545,18 @@ impl TdsClient {
     /// discarded locally, part is withdrawn with `EOM | IGNORE`, and all of it is
     /// cancelled with an attention. Without this the server holds a truncated
     /// message and answers 4002 on the *next* command.
+    /// An interrupted packet write retires the transport without another write,
+    /// even if earlier packets completed: neither IGNORE nor TLS shutdown is safe.
     async fn retract_partial_request(&mut self, message: SuspendedMessage) {
         // Before anything that drains: a RETURNVALUE read with the capture still
         // armed would record a handle for a request that never ran.
         // `cancel_streamed_write` disarms up front for the same reason.
         self.abort_pending_prepare_capture();
+
+        if message.send_incomplete() {
+            self.retire_without_writing();
+            return;
+        }
 
         if message.nothing_sent() {
             // Not a plain drop: re-arm the RESETCONNECTION bit this message took.
@@ -2615,9 +2640,12 @@ impl TdsClient {
         // transport is retired without being written to again.
         let ignored =
             tokio::time::timeout(CANCEL_TIMEOUT, packet_writer.cancel_current_message()).await;
-        drop(packet_writer);
+        let message = packet_writer.suspend();
+        let send_incomplete = message.send_incomplete();
+        drop(message);
         match ignored {
             Ok(Ok(())) => {}
+            Ok(Err(error)) if send_incomplete => return Withdrawal::WriteAbandoned(error),
             Ok(Err(error)) => return Withdrawal::Failed(error),
             Err(_) => {
                 return Withdrawal::WriteAbandoned(crate::error::Error::TimeoutError(
@@ -2713,6 +2741,7 @@ impl TdsClient {
     /// when a data-at-execution parameter resolves to NULL (the ODBC
     /// `SQLPutData(SQL_NULL_DATA)` case). No bytes are written now; when the
     /// parameter is closed with [`end_streamed_param`](Self::end_streamed_param)
+    /// or [`end_execute_prepared_param`](Self::end_execute_prepared_param)
     /// the driver emits `PLP_NULL` instead of an unknown-length opener +
     /// terminator. Mirrors msodbcsql, which writes `VARMAX_LENGTH_NULL` with no
     /// chunks for a DAE parameter that resolves to NULL.
@@ -2738,6 +2767,7 @@ impl TdsClient {
             value_opened,
             null_signaled: _,
             timeout_sec,
+            prepared,
         } = *ctx;
 
         if value_opened {
@@ -2751,6 +2781,7 @@ impl TdsClient {
                     value_opened,
                     null_signaled: false,
                     timeout_sec,
+                    prepared,
                 }));
             return Err(UsageError(
                 "write_streamed_null called after value chunks were already written.".to_string(),
@@ -2764,6 +2795,7 @@ impl TdsClient {
             value_opened: false,
             null_signaled: true,
             timeout_sec,
+            prepared,
         }));
         Ok(())
     }
@@ -2782,11 +2814,43 @@ impl TdsClient {
     /// When the last streamed parameter closes, the RPC message is finalized and
     /// sent, then the real server result is returned in
     /// [`StreamedParamStatus::Complete`].
+    /// For a prepared stream, use
+    /// [`end_execute_prepared_param`](Self::end_execute_prepared_param) instead.
     ///
     /// # Errors
     /// Returns a usage error if no streamed parameter is currently open, or an
     /// I/O error if sending fails.
     pub async fn end_streamed_param(&mut self) -> TdsResult<StreamedParamStatus> {
+        self.end_streamed_param_inner(None).await
+    }
+
+    /// Closes a parameter opened by [`begin_execute_prepared`](Self::begin_execute_prepared).
+    ///
+    /// Pass the same statement and orphan slot supplied at begin. Once the
+    /// complete request is sent, the statement receives its new identity and
+    /// the piggybacked orphan is consumed, even if reading the response fails.
+    /// Cancellation or failure before that boundary leaves both unchanged.
+    pub async fn end_execute_prepared_param(
+        &mut self,
+        statement: &mut PreparedStatement,
+        orphaned: &mut Option<StatementId>,
+    ) -> TdsResult<StreamedParamStatus> {
+        self.end_streamed_param_inner(Some((statement, orphaned)))
+            .await
+    }
+
+    async fn end_streamed_param_inner(
+        &mut self,
+        prepared_target: Option<(&mut PreparedStatement, &mut Option<StatementId>)>,
+    ) -> TdsResult<StreamedParamStatus> {
+        if let StreamedWriteState::Active(ctx) = &self.streamed_write_state
+            && ctx.prepared.is_some() != prepared_target.is_some()
+        {
+            return Err(UsageError(
+                "Prepared streams must be closed with end_execute_prepared_param; other streams with end_streamed_param."
+                    .to_string(),
+            ));
+        }
         let ctx = match std::mem::replace(&mut self.streamed_write_state, StreamedWriteState::Idle)
         {
             StreamedWriteState::Active(ctx) => ctx,
@@ -2803,6 +2867,7 @@ impl TdsClient {
             value_opened,
             null_signaled,
             timeout_sec,
+            prepared,
         } = *ctx;
         self.remaining_request_timeout = timeout_sec.map(|s| Duration::from_secs(u64::from(s)));
 
@@ -2847,10 +2912,26 @@ impl TdsClient {
         }
         .await;
 
+        let message = packet_writer.suspend();
+        // A completed final packet can still return a timeout or callback
+        // error. Settle ownership from the wire state, not the Result.
+        if message.message_complete()
+            && let (Some(prepared), Some((statement, orphaned))) =
+                (prepared.as_ref(), prepared_target)
+        {
+            if let Some(id) = prepared.orphaned {
+                self.prepared_handles.remove(&id);
+                self.prepared_param_encryption.remove(&id);
+                *orphaned = None;
+            }
+            if let Some(id) = prepared.issued_id {
+                statement.id = Some(id);
+            }
+        }
+
         match write_outcome {
             // Another streamed parameter is now open for data.
             Ok(Some(next_name)) => {
-                let message = packet_writer.suspend();
                 self.streamed_write_state =
                     StreamedWriteState::Active(Box::new(StreamedWriteContext {
                         message,
@@ -2861,6 +2942,7 @@ impl TdsClient {
                         value_opened: false,
                         null_signaled: false,
                         timeout_sec,
+                        prepared,
                     }));
                 Ok(StreamedParamStatus::NeedData {
                     param_name: next_name,
@@ -2871,7 +2953,7 @@ impl TdsClient {
             // reading the response also aborts (the request is already on the
             // wire, so the connection must be reset before reuse).
             Ok(None) => {
-                drop(packet_writer);
+                drop(message);
                 match self.position_on_first_result().await {
                     Ok(result) => Ok(StreamedParamStatus::Complete(result)),
                     Err(e) => {
@@ -2884,7 +2966,6 @@ impl TdsClient {
             // withdraw it rather than leaving it resumable or discarding the
             // connection for a failure that cost only the request.
             Err(e) => {
-                let message = packet_writer.suspend();
                 self.retract_partial_request(message).await;
                 Err(e)
             }
@@ -3541,19 +3622,17 @@ impl TdsClient {
     /// server handle, so once the connection has reconnected that handle is
     /// already gone — reusing it hits SQL Server error 8179. Staleness needs no
     /// caller check: a reconnect clears `prepared_handles`, so an id with no
-    /// entry is skipped below without an RPC; on a dead connection the send just
-    /// fails and is ignored (best-effort). Forcing recovery, if ever wanted, is
+    /// entry is skipped below without an RPC; on a dead connection the send
+    /// fails and its error is propagated. Forcing recovery, if ever wanted, is
     /// the caller's job (see
     /// [`check_and_reconnect`](Self::check_and_reconnect)).
     /// A low-level wire call with caller-owned recovery — prefer the
     /// managed [`execute_prepared`](Self::execute_prepared) / [`unprepare`](Self::unprepare) API.
     ///
     /// Drops `statement_id`'s handle and cached Always Encrypted metadata from
-    /// the client's maps before sending, whether or not the RPC succeeds: a
-    /// failure is ambiguous (the send may have landed and the response been
-    /// lost), and a map entry naming a plan the server already dropped would
-    /// make the next execute fail with error 8179 instead of re-preparing.
-    /// Absent is the recoverable state; stale-but-present is not.
+    /// the client's maps once a send is attempted, whether or not it succeeds:
+    /// the server may have dropped the plan even if the response is lost.
+    /// Before any send starts, cancellation retains both entries for retry.
     ///
     /// `command_started`: `true` when the caller already opened the command
     /// boundary via `begin_command` (as `unprepare` does before recovery, so the
@@ -3591,13 +3670,9 @@ impl TdsClient {
 
         self.transport.reset_reader();
 
-        // Evicted before the send: a failed RPC is ambiguous, and keeping an
-        // entry the server may already have dropped is the worse of the two
-        // wrong answers (see this method's docs).
-        let Some(handle) = self.prepared_handles.remove(&statement_id) else {
+        let Some(&handle) = self.prepared_handles.get(&statement_id) else {
             return Ok(());
         };
-        self.prepared_param_encryption.remove(&statement_id);
 
         let database_collation = self.negotiated_settings.database_collation;
 
@@ -3621,6 +3696,10 @@ impl TdsClient {
         let serialize_result = rpc.serialize(&mut packet_writer).await;
         let message = packet_writer.suspend();
         drop(rpc);
+        if message.send_attempted() {
+            self.prepared_handles.remove(&statement_id);
+            self.prepared_param_encryption.remove(&statement_id);
+        }
         self.finish_send(serialize_result, message).await?;
 
         // Drain the result set. A successful unprepare returns no results,
@@ -3631,6 +3710,21 @@ impl TdsClient {
             return Err(crate::error::Error::from_sql_errors(server_errors));
         }
         Ok(())
+    }
+
+    async fn unprepare_orphan(
+        &mut self,
+        orphaned: &mut Option<StatementId>,
+        options: ExecuteOptions<'_>,
+    ) -> TdsResult<()> {
+        let Some(id) = *orphaned else {
+            return Ok(());
+        };
+        let result = self.execute_sp_unprepare(id, true, options).await;
+        if !self.prepared_handles.contains_key(&id) {
+            *orphaned = None;
+        }
+        result
     }
 
     /// Executes `statement`, transparently recovering the connection and
@@ -3811,9 +3905,8 @@ impl TdsClient {
         let statement_id = match live_id {
             Some(id) => id,
             None => {
-                if let Some(orphan_id) = orphaned.take() {
-                    self.execute_sp_unprepare(orphan_id, true, opts.clone())
-                        .await?;
+                if orphaned.is_some() {
+                    self.unprepare_orphan(orphaned, opts.clone()).await?;
                     budget = Self::deduct_timeout(original_timeout, started.elapsed());
                     opts.timeout = budget.into_timeout()?.seconds();
                 }
@@ -3863,25 +3956,24 @@ impl TdsClient {
     /// [`execute_prepared`](Self::execute_prepared) and reports
     /// [`StreamedParamStatus::Complete`].
     ///
-    /// On the `sp_prepexec` route `statement` receives its issued
-    /// [`StatementId`] as soon as the request is parked, because the server's
-    /// `@handle` trails the result set and is only captured during the drain —
-    /// long after this returns. The id resolves through the client's handle map,
-    /// so a sequence that never reaches the server (a
-    /// [`cancel_streamed_write`](Self::cancel_streamed_write), a mid-stream
-    /// failure) leaves it inert and the next execute re-prepares.
+    /// Close each parameter with
+    /// [`end_execute_prepared_param`](Self::end_execute_prepared_param), passing
+    /// the same statement and orphan slot. `sp_prepexec` carries the orphan in
+    /// its by-reference `@handle`; the orphan remains owned by the caller until
+    /// the complete message is sent. Only then does the statement receive its
+    /// new identity, whose server handle is captured during the response drain.
+    /// Cancelling a parked request retains the orphan without issuing an inert
+    /// statement identity.
     ///
-    /// Unlike [`execute_prepared`](Self::execute_prepared), `orphaned` is never
-    /// consumed here: its drop is not piggybacked onto the `@handle` argument.
-    /// The request stays open for the whole application-driven chunk sequence
-    /// and may be discarded server-side, which would evict the orphan from the
-    /// client's map while the server still held the plan. The caller keeps it
-    /// and releases it with [`unprepare`](Self::unprepare).
+    /// Reusing a live statement uses `sp_execute`, which has no piggyback slot.
+    /// That route releases a separate orphan with `sp_unprepare` first, charging
+    /// both operations to the command timeout.
     ///
     /// # Errors
     /// Returns a usage error for invalid streamed parameters, for an already
     /// executing command, or when Always Encrypted is active for this command,
-    /// plus transport/serialization errors from the parked request.
+    /// plus orphan-release or transport/serialization errors. A failed release
+    /// does not open a new streamed request.
     pub async fn begin_execute_prepared<'a>(
         &mut self,
         statement: &mut PreparedStatement,
@@ -3914,15 +4006,34 @@ impl TdsClient {
             ));
         }
 
-        let (timeout_sec, _request_timeout, database_collation) =
+        let started = Instant::now();
+        let (mut timeout_sec, _request_timeout, database_collation) =
             self.prepare_rpc_command(opts.timeout, opts.cancel).await?;
 
-        // Reuse the statement's handle when the client still holds one; a
-        // reconnect clears the map, so an id from a dead session re-prepares.
+        if orphaned.is_some_and(|id| !self.prepared_handles.contains_key(&id)) {
+            *orphaned = None;
+        }
+        // A live plan uses sp_execute, whose handle is not a drop slot.
         let live_handle = statement
             .id
             .and_then(|id| self.prepared_handles.get(&id).copied());
+        if live_handle.is_some() && orphaned.is_some() {
+            self.unprepare_orphan(
+                orphaned,
+                ExecuteOptions {
+                    timeout: timeout_sec,
+                    ..opts.clone()
+                },
+            )
+            .await?;
+            let remaining = Self::deduct_timeout(opts.timeout, started.elapsed()).into_timeout()?;
+            timeout_sec = remaining.seconds();
+            self.remaining_request_timeout = remaining.duration();
+        }
 
+        let live_handle = statement
+            .id
+            .and_then(|id| self.prepared_handles.get(&id).copied());
         let (rpc, issued_id) = match live_handle {
             Some(handle) => {
                 // `sp_execute` carries the handle plus the parameter values; the
@@ -3957,10 +4068,11 @@ impl TdsClient {
                     StatusFlags::NONE,
                     SqlType::NVarcharMax(Some(SqlString::from_utf8_string(params_list_as_string))),
                 );
-                // NULL by-reference `@handle`: prepare fresh, with no piggybacked
-                // drop — see this method's docs on `orphaned`.
-                let handle_parameter =
-                    RpcParameter::new(None, StatusFlags::BY_REF_VALUE, SqlType::Int(None));
+                let handle_parameter = RpcParameter::new(
+                    None,
+                    StatusFlags::BY_REF_VALUE,
+                    SqlType::Int(orphaned.and_then(|id| self.prepared_handles.get(&id).copied())),
+                );
 
                 let rpc = SqlRpc::new(
                     RpcType::ProcId(RpcProcs::PrepExec),
@@ -3996,8 +4108,11 @@ impl TdsClient {
             )
             .await?;
 
-        if let Some(issued_id) = issued_id {
-            statement.id = Some(issued_id);
+        if let StreamedWriteState::Active(ctx) = &mut self.streamed_write_state {
+            ctx.prepared = Some(StreamedPreparedContext {
+                issued_id,
+                orphaned: *orphaned,
+            });
         }
         Ok(status)
     }
@@ -4023,6 +4138,8 @@ impl TdsClient {
     /// and sends `sp_unprepare` only when the statement's connection id still
     /// matches the recovered connection. Take the id with
     /// [`PreparedStatement::take_id`] once the statement is done.
+    /// Keep that id if this call fails before sending; retrying it is safe,
+    /// since a previously attempted release has already removed its map entry.
     pub async fn unprepare<'a>(
         &mut self,
         statement_id: StatementId,
@@ -8420,6 +8537,7 @@ mod tests {
     #[derive(Debug)]
     struct TestTransport {
         closed: bool,
+        close_calls: Arc<std::sync::atomic::AtomicUsize>,
         pending_tokens: VecDeque<Tokens>,
         reset_mode: ResetConnectionMode,
         /// Mirrors the production writer's dispatch record so client tests can
@@ -8443,6 +8561,10 @@ mod tests {
         /// Fires after the first successful send, allowing a multi-packet
         /// request to be cancelled while the server holds its first packet.
         cancel_after_send: Option<tokio_util::sync::CancellationToken>,
+        cancel_on_writer_creation: Option<tokio_util::sync::CancellationToken>,
+        cancel_during_send: Option<tokio_util::sync::CancellationToken>,
+        sends_before_cancel: usize,
+        send_delay: Option<Duration>,
         /// Attentions requested, so a test can tell the cancel-a-sent-request
         /// path from the withdraw-a-partial-one path.
         attentions: Arc<std::sync::atomic::AtomicUsize>,
@@ -8463,6 +8585,7 @@ mod tests {
         fn new() -> Self {
             Self {
                 closed: false,
+                close_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 pending_tokens: VecDeque::new(),
                 reset_mode: ResetConnectionMode::None,
                 reset_dispatched: false,
@@ -8473,6 +8596,10 @@ mod tests {
                 send_should_fail: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 send_should_hang: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 cancel_after_send: None,
+                cancel_on_writer_creation: None,
+                cancel_during_send: None,
+                sends_before_cancel: 0,
+                send_delay: None,
                 attentions: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 known_dead: false,
                 receive_error: None,
@@ -8646,6 +8773,9 @@ mod tests {
     #[async_trait]
     impl NetworkWriter for TestTransport {
         async fn send(&mut self, data: &[u8]) -> TdsResult<()> {
+            if let Some(delay) = self.send_delay.take() {
+                tokio::time::sleep(delay).await;
+            }
             if self.closed {
                 return Err(crate::error::Error::ConnectionClosed(
                     "test transport is closed".to_string(),
@@ -8669,6 +8799,14 @@ mod tests {
             {
                 std::future::pending::<()>().await;
             }
+            if self.sends_before_cancel == 0
+                && let Some(cancel) = self.cancel_during_send.take()
+            {
+                self.sent.lock().unwrap().extend_from_slice(&data[..8]);
+                cancel.cancel();
+                std::future::pending::<()>().await;
+            }
+            self.sends_before_cancel = self.sends_before_cancel.saturating_sub(1);
             self.sent.lock().unwrap().extend_from_slice(data);
             if let Some(cancel) = self.cancel_after_send.take() {
                 cancel.cancel();
@@ -8686,6 +8824,9 @@ mod tests {
             self.reset_dispatched = false;
         }
         fn take_reset_mode(&mut self) -> ResetConnectionMode {
+            if let Some(cancel) = self.cancel_on_writer_creation.take() {
+                cancel.cancel();
+            }
             std::mem::replace(&mut self.reset_mode, ResetConnectionMode::None)
         }
         fn note_reset_dispatched(&mut self) {
@@ -8717,6 +8858,8 @@ mod tests {
             4096
         }
         async fn close_transport(&mut self) -> TdsResult<()> {
+            self.close_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.closed = true;
             Ok(())
         }
@@ -12142,13 +12285,34 @@ mod tests {
     }
 
     #[test]
-    fn deduct_timeout_rounds_up_sub_second() {
-        // 1.9 seconds elapsed should round up to 2 seconds deducted
-        let result = TdsClient::deduct_timeout(Some(30), Duration::from_millis(1900));
-        assert_eq!(
-            result,
-            CommandTimeoutBudget::Remaining(NonZeroU32::new(28).unwrap())
-        );
+    fn deduct_timeout_preserves_partial_seconds() {
+        for (timeout, elapsed, remaining) in [
+            (1, Duration::from_nanos(1), 1),
+            (1, Duration::from_millis(999), 1),
+            (30, Duration::from_millis(1900), 29),
+        ] {
+            let result = TdsClient::deduct_timeout(Some(timeout), elapsed);
+            assert_eq!(
+                result,
+                CommandTimeoutBudget::Remaining(NonZeroU32::new(remaining).unwrap())
+            );
+        }
+    }
+
+    #[test]
+    fn deduct_timeout_charges_cumulative_elapsed_time() {
+        for (elapsed, remaining) in [(600, Some(1)), (1200, None)] {
+            let result = TdsClient::deduct_timeout(Some(1), Duration::from_millis(elapsed));
+            match remaining {
+                Some(remaining) => {
+                    assert_eq!(result.into_timeout().unwrap().seconds(), Some(remaining));
+                }
+                None => assert!(matches!(
+                    result.into_timeout(),
+                    Err(crate::error::Error::TimeoutError(_))
+                )),
+            }
+        }
     }
 
     /// A reconnect that consumes the whole command budget must fail the call
@@ -15826,16 +15990,17 @@ mod tests {
             .expect("begin must park for the streamed value");
         assert!(matches!(status, StreamedParamStatus::NeedData { .. }));
 
-        let statement_id = statement
-            .id()
-            .expect("the parked prepexec must claim an identity for its @handle");
+        assert!(statement.id().is_none(), "a parked request has no identity");
 
         client.write_streamed_chunk(&[0xAA, 0xBB]).await.unwrap();
         let status = client
-            .end_streamed_param()
+            .end_execute_prepared_param(&mut statement, &mut orphaned)
             .await
             .expect("closing the only streamed parameter completes the RPC");
         assert!(matches!(status, StreamedParamStatus::Complete(_)));
+        let statement_id = statement
+            .id()
+            .expect("the completed send issues an identity");
 
         // Asserted after finalize: the parked prefix stays buffered until the
         // last parameter closes, so nothing is on the wire before that.
@@ -15883,7 +16048,10 @@ mod tests {
         );
 
         client.write_streamed_chunk(&[0xAA]).await.unwrap();
-        let status = client.end_streamed_param().await.unwrap();
+        let status = client
+            .end_execute_prepared_param(&mut statement, &mut orphaned)
+            .await
+            .unwrap();
         assert!(matches!(status, StreamedParamStatus::Complete(_)));
 
         let bytes = sent.lock().unwrap().clone();
@@ -15928,16 +16096,607 @@ mod tests {
         );
     }
 
-    /// The orphan's drop is not piggybacked onto a streamed prepexec: the
-    /// request stays open for the whole chunk sequence and may never reach the
-    /// server, so releasing it here could lose a live server-side plan.
     #[tokio::test]
-    async fn begin_execute_prepared_keeps_the_orphan_for_the_caller() {
-        let (mut client, _sent) = create_capturing_client(vec![]);
-        let orphan_id = sid(1);
+    async fn begin_execute_prepared_piggybacks_each_orphan_with_one_second_timeout() {
+        let tokens = (78..82)
+            .flat_map(|handle| {
+                [
+                    Tokens::ReturnValue(ae_return_value_token(
+                        "@handle",
+                        ColumnValues::Int(handle),
+                        None,
+                    )),
+                    done_no_more(),
+                ]
+            })
+            .collect();
+        let (mut client, sent) = create_capturing_client(tokens);
+        let first_id = client.issue_statement_id();
+        client.prepared_handles.insert(first_id, 77);
+        let mut statement =
+            PreparedStatement::materialized_for_test("INSERT INTO t(v) VALUES (@v)", first_id);
+
+        for handle in 77i32..81 {
+            let mut orphaned = statement.take_id();
+            let old_id = orphaned.unwrap();
+            let offset = sent.lock().unwrap().len();
+            let status = client
+                .begin_execute_prepared(
+                    &mut statement,
+                    vec![streamed_varbinary("@v")],
+                    &mut orphaned,
+                    ExecuteOptions::new().timeout_secs(1),
+                )
+                .await
+                .unwrap();
+            assert!(matches!(status, StreamedParamStatus::NeedData { .. }));
+            assert_eq!(orphaned, Some(old_id));
+            assert_eq!(client.prepared_handles.get(&old_id), Some(&handle));
+            assert!(statement.id().is_none());
+            match &client.streamed_write_state {
+                StreamedWriteState::Idle => panic!("expected a parked stream"),
+                StreamedWriteState::Active(state) => assert_eq!(state.timeout_sec, Some(1)),
+            }
+
+            assert_eq!(sent.lock().unwrap().len(), offset);
+
+            client.cancel_streamed_write().await;
+            assert_eq!(client.prepared_handles.get(&old_id), Some(&handle));
+            assert_eq!(orphaned, Some(old_id));
+            assert!(
+                statement.take_id().is_none(),
+                "cancel/rebind must not add an orphan"
+            );
+            assert!(client.pending_capture.is_none());
+            assert_eq!(sent.lock().unwrap().len(), offset);
+
+            client
+                .begin_execute_prepared(
+                    &mut statement,
+                    vec![streamed_varbinary("@v")],
+                    &mut orphaned,
+                    ExecuteOptions::new().timeout_secs(1),
+                )
+                .await
+                .unwrap();
+            client.write_streamed_chunk(&[0xAA]).await.unwrap();
+            assert!(matches!(
+                client
+                    .end_execute_prepared_param(&mut statement, &mut orphaned)
+                    .await
+                    .unwrap(),
+                StreamedParamStatus::Complete(_)
+            ));
+            assert!(orphaned.is_none());
+            let wire = sent.lock().unwrap()[offset..].to_vec();
+            assert_eq!(
+                wire.windows(4)
+                    .filter(|w| *w == [0xFF, 0xFF, 0x0D, 0x00])
+                    .count(),
+                1,
+            );
+            assert!(!wire.windows(4).any(|w| w == [0xFF, 0xFF, 0x0F, 0x00]));
+            let mut parameter = vec![0, 1, 0x26, 4, 4];
+            parameter.extend_from_slice(&handle.to_le_bytes());
+            assert!(wire.windows(parameter.len()).any(|w| w == parameter));
+            assert_eq!(client.prepared_handles.len(), 1);
+            assert_eq!(
+                client.prepared_handles.get(&statement.id().unwrap()),
+                Some(&(handle + 1))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn prepared_stream_multiple_params_assigns_id_only_after_last() {
+        let (mut client, _) = create_capturing_client(vec![
+            Tokens::ReturnValue(ae_return_value_token(
+                "@handle",
+                ColumnValues::Int(78),
+                None,
+            )),
+            done_no_more(),
+        ]);
+        let id = client.issue_statement_id();
+        client.prepared_handles.insert(id, 77);
+        let mut statement = PreparedStatement::new("SELECT @v, @w");
+        let mut orphaned = Some(id);
+        client
+            .begin_execute_prepared(
+                &mut statement,
+                vec![streamed_varbinary("@v"), streamed_varbinary("@w")],
+                &mut orphaned,
+                (),
+            )
+            .await
+            .unwrap();
+        client.write_streamed_null().unwrap();
+        assert!(matches!(
+            client
+                .end_execute_prepared_param(&mut statement, &mut orphaned)
+                .await
+                .unwrap(),
+            StreamedParamStatus::NeedData { .. }
+        ));
+        assert!(statement.id().is_none());
+        assert_eq!(orphaned, Some(id));
+        assert_eq!(client.prepared_handles.get(&id), Some(&77));
+        client.write_streamed_chunk(&[]).await.unwrap();
+        assert!(matches!(
+            client
+                .end_execute_prepared_param(&mut statement, &mut orphaned)
+                .await
+                .unwrap(),
+            StreamedParamStatus::Complete(_)
+        ));
+        assert!(orphaned.is_none());
+        assert_eq!(
+            client.prepared_handles.get(&statement.id().unwrap()),
+            Some(&78)
+        );
+        assert!(!client.prepared_handles.contains_key(&id));
+    }
+
+    #[tokio::test]
+    async fn prepared_stream_partial_cancel_retains_orphan_and_metadata() {
+        use crate::message::messages::PacketStatusFlags;
+        use crate::security::describe_parameter_encryption::DescribeParameterEncryptionResult;
+
+        let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
+        let id = client.issue_statement_id();
+        client.prepared_handles.insert(id, 77);
+        let metadata = Arc::new(DescribeParameterEncryptionResult::new());
+        client
+            .prepared_param_encryption
+            .insert(id, Arc::clone(&metadata));
+        let mut statement = PreparedStatement::new("SELECT @v, @w");
+        let mut orphaned = Some(id);
+        client
+            .begin_execute_prepared(
+                &mut statement,
+                vec![streamed_varbinary("@v"), streamed_varbinary("@w")],
+                &mut orphaned,
+                (),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            client.end_streamed_param().await,
+            Err(UsageError(_))
+        ));
+        client.write_streamed_chunk(&[]).await.unwrap();
+        client.write_streamed_null().unwrap();
+        assert!(matches!(
+            client.write_streamed_chunk(&[]).await,
+            Err(UsageError(_))
+        ));
+        assert!(matches!(
+            client
+                .end_execute_prepared_param(&mut statement, &mut orphaned)
+                .await
+                .unwrap(),
+            StreamedParamStatus::NeedData { .. }
+        ));
+        assert!(statement.id().is_none());
+        assert_eq!(orphaned, Some(id));
+        client
+            .write_streamed_chunk(&vec![0xAB; 10_000])
+            .await
+            .unwrap();
+        assert!(matches!(client.write_streamed_null(), Err(UsageError(_))));
+        assert!(
+            !sent.lock().unwrap().is_empty(),
+            "the test must flush a partial packet"
+        );
+        client.cancel_streamed_write().await;
+        let wire = sent.lock().unwrap();
+        assert_eq!(
+            wire[wire.len() - PacketWriter::PACKET_HEADER_SIZE + 1],
+            PacketStatusFlags::Eom as u8 | PacketStatusFlags::Ignore as u8
+        );
+        assert!(statement.id().is_none());
+        assert_eq!(orphaned, Some(id));
+        assert_eq!(client.prepared_handles.get(&id), Some(&77));
+        assert!(Arc::ptr_eq(
+            client.prepared_param_encryption.get(&id).unwrap(),
+            &metadata
+        ));
+        assert!(!client.is_connection_dead());
+    }
+
+    #[tokio::test]
+    async fn prepared_stream_interrupted_send_retires_without_writing_again() {
+        use crate::security::describe_parameter_encryption::DescribeParameterEncryptionResult;
+
+        for (prior_packet, final_packet) in
+            [(false, true), (true, true), (false, false), (true, false)]
+        {
+            let cancel = CancelHandle::new();
+            let mut transport = TestTransport::with_tokens(vec![done_no_more()]);
+            transport.cancel_during_send = Some(cancel.cancel_token.clone());
+            transport.sends_before_cancel = usize::from(prior_packet);
+            let sent = Arc::clone(&transport.sent);
+            let attentions = Arc::clone(&transport.attentions);
+            let close_calls = Arc::clone(&transport.close_calls);
+            let mut client = create_test_client_with_transport(transport);
+            let id = client.issue_statement_id();
+            client.prepared_handles.insert(id, 77);
+            let metadata = Arc::new(DescribeParameterEncryptionResult::new());
+            client
+                .prepared_param_encryption
+                .insert(id, Arc::clone(&metadata));
+            let mut statement = PreparedStatement::new("SELECT @v");
+            let mut orphaned = Some(id);
+            client
+                .begin_execute_prepared(
+                    &mut statement,
+                    vec![streamed_varbinary("@v")],
+                    &mut orphaned,
+                    ExecuteOptions::new().cancel(&cancel),
+                )
+                .await
+                .unwrap();
+            if prior_packet {
+                client
+                    .write_streamed_chunk(&vec![0xAB; 4096])
+                    .await
+                    .unwrap();
+            }
+            let offset = sent.lock().unwrap().len();
+            assert_eq!(offset, if prior_packet { 4096 } else { 0 });
+            let error = tokio::time::timeout(Duration::from_secs(1), async {
+                if final_packet {
+                    client
+                        .end_execute_prepared_param(&mut statement, &mut orphaned)
+                        .await
+                        .map(|_| ())
+                } else {
+                    client.write_streamed_chunk(&vec![0xAB; 4096]).await
+                }
+            })
+            .await
+            .unwrap()
+            .unwrap_err();
+            assert!(matches!(
+                error,
+                crate::error::Error::OperationCancelledError(_)
+            ));
+            assert!(
+                client.is_connection_dead(),
+                "an interrupted packet cannot be retracted"
+            );
+            assert_eq!(
+                sent.lock().unwrap().len(),
+                offset + 8,
+                "no IGNORE after a partial packet"
+            );
+            assert_eq!(attentions.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert_eq!(
+                close_calls.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "TLS shutdown must not write after interruption"
+            );
+            assert!(statement.id().is_none());
+            assert_eq!(orphaned, Some(id));
+            assert_eq!(client.prepared_handles.get(&id), Some(&77));
+            assert!(Arc::ptr_eq(
+                client.prepared_param_encryption.get(&id).unwrap(),
+                &metadata
+            ));
+            assert!(client.pending_capture.is_none());
+            for _ in 0..2 {
+                client.cancel_streamed_write().await;
+                assert!(matches!(
+                    client.write_streamed_chunk(&[0xAB]).await,
+                    Err(UsageError(_))
+                ));
+                assert_eq!(sent.lock().unwrap().len(), offset + 8);
+                assert_eq!(close_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn prepared_stream_cancellation_between_packets_keeps_connection_reusable() {
+        use crate::message::messages::PacketStatusFlags;
+
+        let cancel = CancelHandle::new();
+        let mut transport = TestTransport::with_tokens(vec![done_no_more()]);
+        transport.cancel_after_send = Some(cancel.cancel_token.clone());
+        let sent = Arc::clone(&transport.sent);
+        let close_calls = Arc::clone(&transport.close_calls);
+        let mut client = create_test_client_with_transport(transport);
+        let id = client.issue_statement_id();
+        client.prepared_handles.insert(id, 77);
+        let mut statement = PreparedStatement::new("SELECT @v");
+        let mut orphaned = Some(id);
+        client
+            .begin_execute_prepared(
+                &mut statement,
+                vec![streamed_varbinary("@v")],
+                &mut orphaned,
+                ExecuteOptions::new().cancel(&cancel),
+            )
+            .await
+            .unwrap();
+        client
+            .write_streamed_chunk(&vec![0xAB; 4096])
+            .await
+            .unwrap();
+        assert_eq!(
+            sent.lock().unwrap().len(),
+            4096,
+            "exactly one packet completed"
+        );
+        assert!(cancel.cancel_token.is_cancelled());
+        assert!(matches!(
+            client
+                .end_execute_prepared_param(&mut statement, &mut orphaned)
+                .await,
+            Err(crate::error::Error::OperationCancelledError(_))
+        ));
+        assert!(!client.is_connection_dead());
+        assert_eq!(close_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(statement.id().is_none());
+        assert_eq!(orphaned, Some(id));
+        assert_eq!(client.prepared_handles.get(&id), Some(&77));
+        let wire = sent.lock().unwrap();
+        assert_eq!(wire.len(), 4096 + PacketWriter::PACKET_HEADER_SIZE);
+        assert_eq!(
+            wire[4097],
+            PacketStatusFlags::Eom as u8 | PacketStatusFlags::Ignore as u8
+        );
+    }
+
+    #[tokio::test]
+    async fn prepared_stream_failed_final_send_retains_ownership() {
+        let (mut client, fail) = create_failing_capturing_client(vec![]);
+        let id = client.issue_statement_id();
+        client.prepared_handles.insert(id, 77);
+        let mut statement = PreparedStatement::new("SELECT @v");
+        let mut orphaned = Some(id);
+        client
+            .begin_execute_prepared(
+                &mut statement,
+                vec![streamed_varbinary("@v")],
+                &mut orphaned,
+                (),
+            )
+            .await
+            .unwrap();
+        fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            client
+                .end_execute_prepared_param(&mut statement, &mut orphaned)
+                .await
+                .is_err()
+        );
+        assert!(statement.id().is_none());
+        assert_eq!(orphaned, Some(id));
+        assert_eq!(client.prepared_handles.get(&id), Some(&77));
+        assert!(client.pending_capture.is_none());
+    }
+
+    #[tokio::test]
+    async fn prepared_stream_completed_send_consumes_orphan_on_error() {
+        use crate::security::describe_parameter_encryption::DescribeParameterEncryptionResult;
+
+        // The first case fails while reading the response; the second fails
+        // the writer's timeout check after the final packet reached the peer.
+        for delayed_send in [false, true] {
+            let mut transport = TestTransport::new();
+            if delayed_send {
+                transport.send_delay = Some(Duration::from_millis(2100));
+            }
+            let sent = Arc::clone(&transport.sent);
+            let attentions = Arc::clone(&transport.attentions);
+            let mut client = create_test_client_with_transport(transport);
+            let id = client.issue_statement_id();
+            client.prepared_handles.insert(id, 77);
+            client
+                .prepared_param_encryption
+                .insert(id, Arc::new(DescribeParameterEncryptionResult::new()));
+            let mut statement = PreparedStatement::new("SELECT @v");
+            let mut orphaned = Some(id);
+            client
+                .begin_execute_prepared(
+                    &mut statement,
+                    vec![streamed_varbinary("@v")],
+                    &mut orphaned,
+                    ExecuteOptions::new().timeout_secs(1),
+                )
+                .await
+                .unwrap();
+            let error = client
+                .end_execute_prepared_param(&mut statement, &mut orphaned)
+                .await
+                .unwrap_err();
+            if delayed_send {
+                assert!(matches!(error, crate::error::Error::TimeoutError(_)));
+                assert_eq!(attentions.load(std::sync::atomic::Ordering::SeqCst), 1);
+            }
+            assert!(statement.id().is_some());
+            assert!(orphaned.is_none());
+            assert!(!client.prepared_handles.contains_key(&id));
+            assert!(!client.prepared_param_encryption.contains_key(&id));
+            let wire = sent.lock().unwrap();
+            assert_eq!(wire[1] & 1, 1, "the final EOM packet must have been sent");
+        }
+    }
+
+    #[tokio::test]
+    async fn prepared_stream_cross_identity_orphan_uses_standalone_release() {
+        let (mut client, sent) = create_capturing_client(vec![
+            done_no_more(),
+            done_no_more(),
+            done_no_more(),
+            done_no_more(),
+        ]);
+        let live_id = client.issue_statement_id();
+        client.prepared_handles.insert(live_id, 99);
+        let mut statement = PreparedStatement::materialized_for_test("SELECT @v", live_id);
+        for _ in 0..2 {
+            let old_id = client.issue_statement_id();
+            client.prepared_handles.insert(old_id, 77);
+            let mut orphaned = Some(old_id);
+            let offset = sent.lock().unwrap().len();
+            client
+                .begin_execute_prepared(
+                    &mut statement,
+                    vec![streamed_varbinary("@v")],
+                    &mut orphaned,
+                    ExecuteOptions::new().timeout_secs(1),
+                )
+                .await
+                .unwrap();
+            assert!(orphaned.is_none());
+            assert!(!client.prepared_handles.contains_key(&old_id));
+            assert_eq!(statement.id(), Some(live_id));
+            assert!(matches!(
+                client
+                    .end_execute_prepared_param(&mut statement, &mut orphaned)
+                    .await
+                    .unwrap(),
+                StreamedParamStatus::Complete(_)
+            ));
+            let wire = sent.lock().unwrap()[offset..].to_vec();
+            assert_eq!(
+                wire.windows(4)
+                    .filter(|w| *w == [0xFF, 0xFF, 0x0F, 0x00])
+                    .count(),
+                1
+            );
+            assert_eq!(
+                wire.windows(4)
+                    .filter(|w| *w == [0xFF, 0xFF, 0x0C, 0x00])
+                    .count(),
+                1
+            );
+            assert!(!wire.windows(4).any(|w| w == [0xFF, 0xFF, 0x0D, 0x00]));
+            assert_eq!(client.prepared_handles.get(&live_id), Some(&99));
+        }
+    }
+
+    #[tokio::test]
+    async fn begin_execute_prepared_skips_absent_orphans_without_unprepare() {
+        for orphaned in [None, Some(sid(77))] {
+            let (mut client, sent) = create_capturing_client(vec![]);
+            let mut orphaned = orphaned;
+            let mut statement = PreparedStatement::new("INSERT INTO t(v) VALUES (@v)");
+            client
+                .begin_execute_prepared(
+                    &mut statement,
+                    vec![streamed_varbinary("@v")],
+                    &mut orphaned,
+                    ExecuteOptions::new().timeout_secs(1),
+                )
+                .await
+                .unwrap();
+            assert!(orphaned.is_none());
+            assert!(
+                sent.lock().unwrap().is_empty(),
+                "no cleanup RPC for an absent handle"
+            );
+            client.cancel_streamed_write().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn begin_execute_prepared_release_failure_does_not_open_a_stream() {
+        let (mut client, sent) = create_capturing_client(vec![]);
+        let orphan_id = client.issue_statement_id();
+        client.prepared_handles.insert(orphan_id, 77);
+        let live_id = client.issue_statement_id();
+        client.prepared_handles.insert(live_id, 99);
+        let mut statement =
+            PreparedStatement::materialized_for_test("INSERT INTO t(v) VALUES (@v)", live_id);
+        let mut orphaned = Some(orphan_id);
+
+        assert!(
+            client
+                .begin_execute_prepared(
+                    &mut statement,
+                    vec![streamed_varbinary("@v")],
+                    &mut orphaned,
+                    (),
+                )
+                .await
+                .is_err()
+        );
+        assert!(orphaned.is_none(), "the release crossed its send boundary");
+        assert_eq!(client.prepared_handles.get(&live_id), Some(&99));
+        assert!(!client.prepared_handles.contains_key(&orphan_id));
+        assert!(client.pending_capture.is_none());
+        assert_eq!(statement.id(), Some(live_id));
+        assert!(matches!(
+            client.streamed_write_state,
+            StreamedWriteState::Idle
+        ));
+        let bytes = sent.lock().unwrap();
+        assert!(bytes.windows(4).any(|w| w == [0xFF, 0xFF, 0x0F, 0x00]));
+        assert!(!bytes.windows(4).any(|w| w == [0xFF, 0xFF, 0x0D, 0x00]));
+    }
+
+    #[tokio::test]
+    async fn begin_execute_prepared_invalid_parameter_keeps_orphan_without_io() {
+        let (mut client, sent) = create_capturing_client(vec![]);
+        let orphan_id = client.issue_statement_id();
         client.prepared_handles.insert(orphan_id, 77);
         let mut statement = PreparedStatement::new("INSERT INTO t(v) VALUES (@v)");
         let mut orphaned = Some(orphan_id);
+        let mut param = streamed_varbinary("@v");
+        param.name = None;
+        assert!(matches!(
+            client
+                .begin_execute_prepared(&mut statement, vec![param], &mut orphaned, ())
+                .await,
+            Err(UsageError(_))
+        ));
+        assert_eq!(orphaned, Some(orphan_id));
+        assert_eq!(client.prepared_handles.get(&orphan_id), Some(&77));
+        assert!(sent.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn begin_execute_prepared_release_server_error_preserves_connection_reuse() {
+        let (mut client, sent) = create_capturing_client(vec![
+            Tokens::Error(crate::token::tokens::ErrorToken {
+                number: 8179,
+                state: 1,
+                severity: 16,
+                message: "Could not find prepared statement with handle 77.".to_string(),
+                server_name: "test".to_string(),
+                proc_name: String::new(),
+                line_number: 1,
+            }),
+            done_no_more(),
+            done_no_more(),
+        ]);
+        let orphan_id = client.issue_statement_id();
+        client.prepared_handles.insert(orphan_id, 77);
+        let mut orphaned = Some(orphan_id);
+        let live_id = client.issue_statement_id();
+        client.prepared_handles.insert(live_id, 99);
+        let mut statement =
+            PreparedStatement::materialized_for_test("INSERT INTO t(v) VALUES (@v)", live_id);
+
+        let error = client
+            .begin_execute_prepared(
+                &mut statement,
+                vec![streamed_varbinary("@v")],
+                &mut orphaned,
+                (),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(expect_sql_error(error).errors[0].number, 8179);
+        assert!(orphaned.is_none());
+        assert_eq!(statement.id(), Some(live_id));
+        assert!(matches!(
+            client.streamed_write_state,
+            StreamedWriteState::Idle
+        ));
+        assert!(!client.is_connection_dead());
 
         client
             .begin_execute_prepared(
@@ -15947,18 +16706,251 @@ mod tests {
                 (),
             )
             .await
-            .expect("begin must park for the streamed value");
+            .unwrap();
+        client.write_streamed_chunk(&[0xAA]).await.unwrap();
+        assert!(matches!(
+            client
+                .end_execute_prepared_param(&mut statement, &mut orphaned)
+                .await
+                .unwrap(),
+            StreamedParamStatus::Complete(_)
+        ));
+        assert_eq!(client.prepared_handles.len(), 1);
+        assert_eq!(
+            sent.lock()
+                .unwrap()
+                .windows(4)
+                .filter(|w| *w == [0xFF, 0xFF, 0x0F, 0x00])
+                .count(),
+            1,
+            "retry must not release the old handle twice"
+        );
+    }
 
-        assert_eq!(
-            orphaned,
-            Some(orphan_id),
-            "the caller keeps ownership of the orphan's release"
-        );
-        assert_eq!(
-            client.prepared_handles.get(&orphan_id).copied(),
-            Some(77),
-            "the orphan's handle must stay live and releasable via unprepare"
-        );
+    #[tokio::test]
+    async fn begin_execute_prepared_cancelled_final_send_keeps_orphan_for_retry() {
+        use crate::security::describe_parameter_encryption::DescribeParameterEncryptionResult;
+
+        let tokens = (78..80)
+            .flat_map(|handle| {
+                [
+                    Tokens::ReturnValue(ae_return_value_token(
+                        "@handle",
+                        ColumnValues::Int(handle),
+                        None,
+                    )),
+                    done_no_more(),
+                ]
+            })
+            .collect();
+        let (mut client, sent) = create_capturing_client(tokens);
+        let first_id = client.issue_statement_id();
+        client.prepared_handles.insert(first_id, 77);
+        let mut orphaned = Some(first_id);
+        let mut statement = PreparedStatement::new("INSERT INTO t(v) VALUES (@v)");
+        let cancellation = CancelHandle::new();
+        let cancelled = cancellation.child_handle();
+        cancellation.cancel();
+
+        for handle in 77..79 {
+            let id = orphaned.unwrap();
+            let metadata = Arc::new(DescribeParameterEncryptionResult::new());
+            client
+                .prepared_param_encryption
+                .insert(id, Arc::clone(&metadata));
+            let offset = sent.lock().unwrap().len();
+            for _ in 0..2 {
+                client
+                    .begin_execute_prepared(
+                        &mut statement,
+                        vec![streamed_varbinary("@v")],
+                        &mut orphaned,
+                        ExecuteOptions::new().cancel(&cancelled),
+                    )
+                    .await
+                    .unwrap();
+                let error = client
+                    .end_execute_prepared_param(&mut statement, &mut orphaned)
+                    .await
+                    .unwrap_err();
+                assert!(matches!(
+                    error,
+                    crate::error::Error::OperationCancelledError(_)
+                ));
+                assert_eq!(
+                    sent.lock().unwrap().len(),
+                    offset,
+                    "nothing reached the server"
+                );
+                assert_eq!(orphaned, Some(id));
+                assert!(statement.id().is_none());
+                assert_eq!(client.prepared_handles.get(&id), Some(&handle));
+                assert!(Arc::ptr_eq(
+                    client.prepared_param_encryption.get(&id).unwrap(),
+                    &metadata
+                ));
+                assert!(!client.is_connection_dead());
+            }
+            client
+                .begin_execute_prepared(
+                    &mut statement,
+                    vec![streamed_varbinary("@v")],
+                    &mut orphaned,
+                    (),
+                )
+                .await
+                .unwrap();
+            assert_eq!(orphaned, Some(id));
+            assert!(client.prepared_param_encryption.contains_key(&id));
+            client.write_streamed_chunk(&[0xAA]).await.unwrap();
+            assert!(matches!(
+                client
+                    .end_execute_prepared_param(&mut statement, &mut orphaned)
+                    .await
+                    .unwrap(),
+                StreamedParamStatus::Complete(_)
+            ));
+            assert_eq!(client.prepared_handles.len(), 1);
+            assert!(orphaned.is_none());
+            assert!(!client.prepared_param_encryption.contains_key(&id));
+            orphaned = statement.take_id();
+            assert_eq!(
+                client.prepared_handles.get(&orphaned.unwrap()),
+                Some(&(handle + 1))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn begin_execute_prepared_release_cancellation_tracks_send_attempt() {
+        use crate::security::describe_parameter_encryption::DescribeParameterEncryptionResult;
+
+        for send_started in [false, true] {
+            let cancel = CancelHandle::new();
+            let mut transport = TestTransport::with_tokens(vec![done_no_more()]);
+            if send_started {
+                transport.cancel_during_send = Some(cancel.cancel_token.clone());
+            } else {
+                transport.cancel_on_writer_creation = Some(cancel.cancel_token.clone());
+            }
+            let sent = Arc::clone(&transport.sent);
+            let mut client =
+                create_test_client_with_any_transport(AnyTransport::dynamic(transport));
+            let id = client.issue_statement_id();
+            client.prepared_handles.insert(id, 77);
+            client
+                .prepared_param_encryption
+                .insert(id, Arc::new(DescribeParameterEncryptionResult::new()));
+            let mut orphaned = Some(id);
+            let live_id = client.issue_statement_id();
+            client.prepared_handles.insert(live_id, 99);
+            let mut statement =
+                PreparedStatement::materialized_for_test("INSERT INTO t(v) VALUES (@v)", live_id);
+
+            assert!(!cancel.cancel_token.is_cancelled());
+            let error = tokio::time::timeout(
+                Duration::from_secs(1),
+                client.begin_execute_prepared(
+                    &mut statement,
+                    vec![streamed_varbinary("@v")],
+                    &mut orphaned,
+                    ExecuteOptions::new().cancel(&cancel),
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap_err();
+            assert!(matches!(
+                error,
+                crate::error::Error::OperationCancelledError(_)
+            ));
+            assert_eq!(sent.lock().unwrap().len(), if send_started { 8 } else { 0 });
+            assert_eq!(client.is_connection_dead(), send_started);
+            assert_eq!(orphaned, if send_started { None } else { Some(id) });
+            assert_eq!(client.prepared_handles.contains_key(&id), !send_started);
+            assert_eq!(
+                client.prepared_param_encryption.contains_key(&id),
+                !send_started
+            );
+            assert!(matches!(
+                client.streamed_write_state,
+                StreamedWriteState::Idle
+            ));
+            if !send_started {
+                client.unprepare(id, ()).await.unwrap();
+                assert_eq!(client.prepared_handles.get(&live_id), Some(&99));
+                assert!(!client.prepared_handles.contains_key(&id));
+                assert!(client.prepared_param_encryption.is_empty());
+                assert!(!client.is_connection_dead());
+                let bytes = sent.lock().unwrap();
+                assert_eq!(
+                    bytes
+                        .windows(4)
+                        .filter(|w| *w == [0xFF, 0xFF, 0x0F, 0x00])
+                        .count(),
+                    1
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn prepared_batch_unsent_release_keeps_orphan_for_retry_with_one_second_timeout() {
+        for stream_results in [false, true] {
+            let (mut client, sent) = create_capturing_client(vec![
+                done_no_more(),
+                Tokens::ReturnValue(ae_return_value_token(
+                    "@handle",
+                    ColumnValues::Int(78),
+                    None,
+                )),
+                done_no_more(),
+                batch_done_proc(false, false),
+            ]);
+            let id = client.issue_statement_id();
+            client.prepared_handles.insert(id, 77);
+            let mut orphaned = Some(id);
+            let mut statement = PreparedStatement::new("SELECT 1");
+            let cancellation = CancelHandle::new();
+            let cancelled = cancellation.child_handle();
+            cancellation.cancel();
+            for _ in 0..2 {
+                let error = client
+                    .execute_prepared_batch_inner(
+                        &mut statement,
+                        vec![Ok((0, Vec::new()))],
+                        &mut orphaned,
+                        ExecuteOptions::new().cancel(&cancelled),
+                        stream_results,
+                    )
+                    .await
+                    .unwrap_err();
+                assert!(matches!(
+                    error,
+                    crate::error::Error::OperationCancelledError(_)
+                ));
+                assert!(sent.lock().unwrap().is_empty());
+                assert_eq!(orphaned, Some(id));
+                assert_eq!(client.prepared_handles.get(&id), Some(&77));
+                assert!(!client.is_connection_dead());
+            }
+            client
+                .execute_prepared_batch_inner(
+                    &mut statement,
+                    vec![Ok((0, Vec::new()))],
+                    &mut orphaned,
+                    ExecuteOptions::new().timeout_secs(1),
+                    stream_results,
+                )
+                .await
+                .unwrap();
+            assert!(orphaned.is_none());
+            assert_eq!(client.prepared_handles.len(), 1);
+            assert_eq!(
+                client.prepared_handles.get(&statement.id().unwrap()),
+                Some(&78)
+            );
+        }
     }
 
     /// Cancelling a parked `sp_prepexec` disarms the `@handle` capture. Leaving
@@ -15984,11 +16976,8 @@ mod tests {
         client.cancel_streamed_write().await;
 
         assert!(client.pending_capture.is_none());
-        let statement_id = statement.id().expect("the parked prepexec claimed an id");
-        assert!(
-            !client.prepared_handles.contains_key(&statement_id),
-            "a cancelled prepare leaves the identity inert so the next execute re-prepares"
-        );
+        assert!(statement.id().is_none());
+        assert!(client.prepared_handles.is_empty());
     }
 
     /// Opening a streamed RPC consumes the connection's pending RESETCONNECTION
