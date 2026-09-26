@@ -419,22 +419,20 @@ fn sql_describe_param_safe(
 /// `SQLBindParameter` (or the record's un-bound default) set them.
 ///
 /// Call only after the STMT lock has been dropped (see `bind_col.rs`'s
-/// locking-order rationale). A poisoned IPD mutex is logged and otherwise
-/// ignored: `SQLDescribeParam`'s own answer, already written from the
-/// in-memory `descriptions`, does not depend on this refinement succeeding.
+/// locking-order rationale). Failure is reported, not swallowed: the UDT
+/// identity this writes is the only source of `SQL_CA_SS_UDT_TYPE_NAME` on the
+/// describe-before-bind route, so answering `SQL_SUCCESS` after it failed would
+/// surface later as a misleading missing-name error at execute, or reuse a
+/// stale prepared declaration. Both call sites route a failure through
+/// `post_refine_failure` and skip `write_description`. Matches
+/// `clear_auto_filled_udt_names`, which propagates its own poisoned-mutex
+/// failure for the same reason.
 ///
 /// INVARIANT: `udt_names` is sorted by ordinal. This function is replayed for
 /// every cached answer, so it binary-searches rather than scanning - a linear
 /// scan made a describe-all pass over N markers cost O(N^3) comparisons.
 /// `sql_describe_param_safe` sorts once before caching; the `debug_assert`
 /// below catches any future caller that forgets.
-/// Call only after the STMT lock has been dropped (see `bind_col.rs`'s
-/// locking-order rationale). Failure is reported, not swallowed: the UDT
-/// identity this writes is the only source of `SQL_CA_SS_UDT_TYPE_NAME` on the
-/// describe-before-bind route, so answering `SQL_SUCCESS` after it failed would
-/// surface later as a misleading missing-name error at execute, or reuse a
-/// stale prepared declaration. Matches `clear_auto_filled_udt_names`, which
-/// propagates its own poisoned-mutex failure for the same reason.
 fn refine_ipd(
     stmt: &StmtHandle,
     descriptions: &[ParameterDescription],
@@ -521,8 +519,9 @@ fn refine_ipd(
                             && current.type_name == names.type_name
                     });
                 if !unchanged {
-                    // The server never supplies an assembly name, so an
-                    // application's survives the refresh of the parts around it.
+                    // This driver does not read the assembly-qualified column
+                    // (see `read_udt_names`), so an application's survives the
+                    // refresh of the parts around it.
                     let assembly = record
                         .udt_names
                         .as_ref()
@@ -921,6 +920,15 @@ fn read_udt_names(row: &[ColumnValues], data_type: SqlSmallInt) -> Option<Arc<Ud
         catalog: read_optional_string(row, SUGGESTED_USER_TYPE_DATABASE).unwrap_or_default(),
         schema: read_optional_string(row, SUGGESTED_USER_TYPE_SCHEMA).unwrap_or_default(),
         type_name,
+        // Left empty by choice, not because the server is silent:
+        // `sp_describe_undeclared_parameters` does return
+        // `suggested_assembly_qualified_type_name` (0-based column 11), and
+        // msodbcsql even reads it (`sqlcdesc.cpp:9155-9162`). But it reads it
+        // into a scratch `FRS_Format` field and never adds it to the IPD name
+        // pool the way it does the catalog/schema/type parts, so the field
+        // reads back empty there too. Since the parameter `TYPE_INFO` has no
+        // slot for an assembly name either, reading the column would buy
+        // nothing and would overwrite whatever the application set.
         assembly_type_name: String::new(),
     }))
 }

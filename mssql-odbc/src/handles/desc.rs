@@ -488,8 +488,9 @@ impl DescHandle {
     /// otherwise carry it onto an unrelated statement.
     ///
     /// Only the three wire-relevant parts are dropped; an assembly-qualified
-    /// name the application set is echo-only state that no describe supplies,
-    /// so it outlives the identity it was written beside.
+    /// name the application set is echo-only state that no describe *in this
+    /// driver* supplies (`read_udt_names` deliberately skips the column), so
+    /// it outlives the identity it was written beside.
     ///
     /// Never call with a STMT lock held (see the crate's locking rules).
     /// Returns `SQL_ERROR` on a poisoned mutex rather than reporting success
@@ -1006,8 +1007,8 @@ mod tests {
         );
     }
 
-    /// The assembly-qualified name is echo-only and no describe supplies it, so
-    /// writing it must not claim the wire identity - doing so froze a stale
+    /// The assembly-qualified name is echo-only and no describe in this driver
+    /// supplies it (`read_udt_names` skips the column), so writing it must not claim the wire identity - doing so froze a stale
     /// auto-filled name against both the prepare-time clear and a later
     /// describe. The name itself still survives that clear.
     #[test]
