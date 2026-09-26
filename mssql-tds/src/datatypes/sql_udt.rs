@@ -34,13 +34,38 @@ impl UdtTypeName {
         }
     }
 
+    /// Validates the whole name before any of it reaches the wire.
+    ///
     /// The type name is mandatory: the server cannot resolve the UDT without
     /// it, and msodbcsql refuses such a binding before it reaches the wire.
+    ///
+    /// Each part is also bounded to what a B_VARCHAR's `u8` count can express.
+    /// That limit is re-checked in `write_b_varchar`, but checking it here too
+    /// is what keeps a rejection local: the parts are written in sequence, and
+    /// a long earlier part can fill a packet and flush it (`PacketWriter`
+    /// sends on overflow) before a later part is even inspected. Without this
+    /// preflight, invalid local input becomes a half-sent RPC that has to be
+    /// cancelled and drained instead of failing before any network I/O.
     pub(crate) fn validate(&self) -> TdsResult<()> {
         if self.type_name.is_empty() {
             return Err(Error::UsageError(
                 "UDT type name must not be empty".to_string(),
             ));
+        }
+        for part in [
+            self.db_name.as_deref(),
+            self.schema_name.as_deref(),
+            Some(self.type_name.as_str()),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let units = part.encode_utf16().count();
+            if units > u8::MAX as usize {
+                return Err(Error::UsageError(format!(
+                    "type name part is too long: {units} UTF-16 code units (max 255)"
+                )));
+            }
         }
         Ok(())
     }
@@ -147,5 +172,42 @@ mod tests {
         let name = UdtTypeName::new(None, None, "a".repeat(256));
         let result = type_name_bytes(&name).await;
         assert!(matches!(result, Err(Error::UsageError(_))));
+    }
+
+    /// An oversized part is rejected before *any* byte is written, including
+    /// when an earlier part is valid. The parts are written in sequence and
+    /// `PacketWriter` sends on overflow, so a 255-unit catalog can fill and
+    /// flush a small packet; without the preflight in `validate`, invalid
+    /// local input would become a half-sent RPC needing cancel-and-drain
+    /// rather than a clean local failure.
+    #[tokio::test]
+    async fn test_a_late_oversized_part_writes_nothing() {
+        for name in [
+            // Oversized schema behind a maximal catalog.
+            UdtTypeName::new(
+                Some("a".repeat(255)),
+                Some("b".repeat(256)),
+                "Point".to_string(),
+            ),
+            // Oversized type name behind two valid parts.
+            UdtTypeName::new(
+                Some("a".repeat(255)),
+                Some("dbo".to_string()),
+                "c".repeat(256),
+            ),
+        ] {
+            assert!(matches!(name.validate(), Err(Error::UsageError(_))));
+
+            // A packet small enough that the catalog alone would overflow it.
+            let mut mock = MockNetworkWriter::new(4096);
+            let mut writer = PacketWriter::new(PacketType::RpcRequest, &mut mock, Some(512), None);
+            let result = write_udt_type_name(&mut writer, &name).await;
+
+            assert!(matches!(result, Err(Error::UsageError(_))));
+            assert!(
+                mock.data.is_empty(),
+                "no packet may reach the network before the name is validated"
+            );
+        }
     }
 }
