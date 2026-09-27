@@ -7655,17 +7655,20 @@ impl TdsClient {
             }
             Tokens::Error(error_token) => {
                 info!(?error_token);
+                // Ahead of the deferral check: a prepared batch reports errors on
+                // the row, which is also all `read_prepared_batch_result` does, so
+                // deferring here as well would both double-report and make the
+                // channel depend on whether the statement returned a result set.
+                if self.prepared_batch.is_some() {
+                    self.record_error_token(&error_token);
+                    return Ok(None);
+                }
                 if self.defer_batch_errors {
-                    // Through the helper: it also retires the connection on a
-                    // fatal error and attaches the error to the prepared row,
-                    // which observe_prepared_batch_done expects to find.
+                    // Through the helper: deferring must not skip retiring the
+                    // connection on a fatal error.
                     let error = self.record_error_token(&error_token);
                     self.pending_errors.push(error);
                     self.unreported_error = true;
-                    return Ok(None);
-                }
-                if self.prepared_batch.is_some() {
-                    self.record_error_token(&error_token);
                     return Ok(None);
                 }
                 let mut all_errors = vec![self.record_error_token(&error_token)];
@@ -7766,13 +7769,18 @@ impl TdsClient {
     /// server-side batch — `sqlcmd` and friends — need this to interleave rows
     /// and messages the way the server sent them.
     ///
-    /// While deferral is on, **every** server error is collected rather than
-    /// returned, including the one that ends the batch: iteration reports the
-    /// end of the results, not an `Err`. Splitting the two would make the same
-    /// logical condition arrive down two different paths depending on where in
-    /// the batch it happened, which is the ambiguity this mode exists to
-    /// remove. A caller that enables deferral must therefore call
+    /// While deferral is on, **every** server error from a batch is collected
+    /// rather than returned, including the one that ends it: iteration reports
+    /// the end of the results, not an `Err`. Splitting the two would make the
+    /// same logical condition arrive down two different paths depending on
+    /// where in the batch it happened, which is the ambiguity this mode exists
+    /// to remove. A caller that enables deferral must therefore call
     /// `take_pending_errors` — an empty result is the only "no error" signal.
+    ///
+    /// Prepared RPC batches are outside this: they report per-row errors
+    /// through [`PreparedBatchResult`](crate::connection::PreparedBatchResult)
+    /// and are left on that channel, so a deferred batch never double-reports
+    /// them.
     ///
     /// A fatal error still retires the connection, so a deferred one cannot be
     /// handed back to a pool for reuse.
@@ -9415,6 +9423,49 @@ mod tests {
         let collected = client.take_pending_errors();
         assert_eq!(collected.len(), 1, "the error is still reported, not lost");
         assert_eq!(collected[0].number, 50000);
+    }
+
+    /// A prepared batch reports errors on the row, and does so whether or not
+    /// the statement produced a result set — `read_prepared_batch_result`
+    /// handles the no-row case and this the mid-row one. Deferral must not
+    /// divert either onto `pending_errors`, or the channel an error arrives on
+    /// would depend on the shape of the result.
+    #[tokio::test]
+    async fn a_prepared_batch_keeps_its_errors_off_the_deferred_queue() {
+        use crate::token::tokens::ErrorToken;
+
+        let mut client = create_test_client();
+        client.set_defer_batch_errors(true);
+        client.prepared_batch = Some(Box::new(PreparedBatchReadState {
+            current: Some(PreparedBatchReadState::next_row(0)),
+            remaining: Vec::new().into_iter(),
+            completed: Vec::new(),
+        }));
+
+        let outcome = client
+            .handle_row_read_token(Tokens::Error(ErrorToken {
+                number: 50000,
+                state: 1,
+                severity: 16,
+                message: "boom".to_string(),
+                server_name: String::new(),
+                proc_name: String::new(),
+                line_number: 1,
+            }))
+            .await
+            .unwrap();
+
+        assert!(outcome.is_none(), "the error does not end the result set");
+        assert!(
+            client.take_pending_errors().is_empty(),
+            "a prepared batch reports on the row, not the deferred queue"
+        );
+        let row = client.prepared_batch.as_ref().unwrap().current.as_ref();
+        assert_eq!(
+            row.map(|r| r.errors.len()),
+            Some(1),
+            "the error belongs on the prepared row"
+        );
     }
 
     /// A DONE token carrying the `DONE_COUNT` flag (a DML row count). `more`
