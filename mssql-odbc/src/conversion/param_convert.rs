@@ -391,10 +391,11 @@ unsafe fn bound_param_to_value_with_outcome(
         // them through - `rgbTRANSTYPE*` gives `SQL_UDT_MAPPED` a
         // `SQL_C_BINARY` transfer type (`sqlcmisc.cpp:67`, `:178`, `:217`), so
         // `ConvertLongData` misses its pass-through guard
-        // (`sqlccnvt.cpp:874-877`) and reaches the branch commented "CHAR/WCHAR
-        // ->binary (2 chars are converted to only one single binary byte)"
-        // (`sqlccnvt.cpp:1014-1016`), with the `cbMax*2` checks at
-        // `sqlcfunc.cpp:3048-3063` corroborating the ratio. Sending the buffer
+        // (`sqlccnvt.cpp:874-877`) and reaches the character-to-binary
+        // conversion at `sqlccnvt.cpp:1014-1016`, which treats the buffer as
+        // hex text and folds each two characters into one byte - the `cbMax*2`
+        // checks at `sqlcfunc.cpp:3048-3063` corroborate that ratio. Sending
+        // the buffer
         // verbatim instead would put different bytes on the wire for the same
         // binding, so those rows stay out of the conversion matrix and are
         // refused at bind rather than shipped divergent.
@@ -1983,8 +1984,8 @@ fn datetime_metadata(
 /// the server, via the `suggested_user_type_*` columns that `SQLDescribeParam`
 /// copies into the IPD (see `refine_ipd`). An application-supplied identity
 /// wins. The type name itself is mandatory - with neither source the server
-/// cannot resolve the parameter. msodbcsql refuses the same binding, with "At
-/// least 3-parts name of a UDT type should be present" (`sqlccmd.cpp`).
+/// cannot resolve the parameter. msodbcsql refuses the same binding
+/// (`sqlccmd.cpp:9977`).
 fn udt_type_name(names: Option<&UdtNames>) -> Result<UdtTypeName, ParamBuildError> {
     let names = names.filter(|n| !n.type_name.is_empty());
     let Some(names) = names else {

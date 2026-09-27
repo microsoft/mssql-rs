@@ -2305,10 +2305,10 @@ TEST_F(UdtParamLiveTest, ANullUdtParameterIsAccepted) {
 
 // With no name on the IPD the parameter cannot be declared, so it must fail
 // rather than reach the server malformed. msodbcsql refuses the same binding
-// at execute (`sqlccmd.cpp` -> IDS_S1_000_95, "At least 3-parts name of a UDT
-// type should be present"), so this asserts on both legs rather than skipping.
-// Neither driver consults the server here: msodbcsql fills the name only from
-// SQLDescribeParam/auto-IPD (`AutoFillIPD`), never at execute.
+// at execute (`sqlccmd.cpp:9977` -> IDS_S1_000_95), so this asserts on both
+// legs rather than skipping. Neither driver consults the server here:
+// msodbcsql fills the name only from SQLDescribeParam/auto-IPD
+// (`AutoFillIPD`), never at execute.
 TEST_F(UdtParamLiveTest, AUdtParameterWithoutATypeNameFails) {
     std::vector<SQLCHAR> payload = SerializedHierarchyId("/1/");
     ASSERT_FALSE(payload.empty());
