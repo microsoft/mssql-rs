@@ -7794,12 +7794,20 @@ impl TdsClient {
         std::mem::take(&mut self.pending_errors)
     }
 
-    /// Row counts reported by each statement of the current or most recent
-    /// command, in arrival order, leaving the log empty.
+    /// Row counts reported by each statement as a query's results are iterated,
+    /// in arrival order, leaving the log empty.
     ///
     /// `None` marks a statement that completed without reporting a count, which
     /// is what `SET NOCOUNT ON` produces; that is deliberately distinct from
     /// `Some(0)`, which means the statement ran and affected no rows.
+    ///
+    /// Scoped to result-set iteration — the DONE tokens seen by
+    /// [`advance_to_rows`](Self::advance_to_rows) and
+    /// [`next_row`](Self::next_row). Commands that report through their own API
+    /// are not logged here and would otherwise double-count: bulk copy returns
+    /// its total directly, prepared RPC batches carry per-row counts in
+    /// [`PreparedBatchResult`](crate::connection::PreparedBatchResult), and
+    /// transaction control has no statement counts to report.
     pub fn take_done_row_counts(&mut self) -> Vec<Option<u64>> {
         std::mem::take(&mut self.done_row_counts)
     }

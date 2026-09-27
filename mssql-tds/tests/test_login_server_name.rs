@@ -54,19 +54,29 @@ async fn login_server_name_on_the_wire(override_name: Option<&str>) -> String {
     let client = Box::pin(TdsConnectionProvider {}.create_client(context, &datasource, None)).await;
     assert!(client.is_ok(), "connect failed: {:?}", client.err());
 
-    // Dropping the client lets the server's handler finish and record the
-    // connection.
+    // Dropping the client lets the server's handler finish, but nothing awaits
+    // it: the store is written only when that handler exits, so poll for the
+    // record rather than assume a fixed delay outlasts it.
     drop(client);
-    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
 
-    let seen = {
-        let store = store.lock().await;
-        let connections: Vec<_> = store.all().values().collect();
-        assert_eq!(connections.len(), 1, "expected exactly one connection");
-        connections[0]
-            .received_server_name
-            .clone()
-            .expect("server should have parsed a ServerName from LOGIN7")
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(10);
+    let seen = loop {
+        let recorded = {
+            let store = store.lock().await;
+            let connections: Vec<_> = store.all().values().collect();
+            assert!(connections.len() <= 1, "expected at most one connection");
+            connections
+                .first()
+                .and_then(|c| c.received_server_name.clone())
+        };
+        if let Some(name) = recorded {
+            break name;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "server never recorded a ServerName from LOGIN7"
+        );
+        tokio::time::sleep(tokio::time::Duration::from_millis(25)).await;
     };
 
     let _ = shutdown_tx.send(());
