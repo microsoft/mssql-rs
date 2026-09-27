@@ -1637,7 +1637,7 @@ mod tests {
         assert_eq!(payload.read_u32::<LittleEndian>().unwrap(), 70_000);
     }
 
-    // ── FeaturesRequest::features() ──
+    // ── Serializer::calculate_login_record_length ──
 
     /// The record Length and feature-extension offset must describe the bytes
     /// actually serialized. A ServerName override of a different length than
@@ -1682,11 +1682,15 @@ mod tests {
         }
     }
 
+    // ── FeaturesRequest::features() ──
+
     #[test]
     fn features_request_features_returns_all() {
         let req = make_features_request();
         assert_eq!(req.features().len(), 2);
-    } // ── FeaturesRequest::is_acknowledged ──
+    }
+
+    // ── FeaturesRequest::is_acknowledged ──
 
     #[test]
     fn features_request_is_acknowledged_returns_none_for_unacknowledged() {
