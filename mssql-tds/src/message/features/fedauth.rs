@@ -262,8 +262,11 @@ mod unittests {
         }
     }
 
-    /// MSI is managed identity; the two spellings had been separate arms
-    /// returning different constants.
+    /// `ActiveDirectoryMSI` had no arm of its own and fell through to the
+    /// unsupported-method error; it only worked because the ODBC binding
+    /// rewrites the keyword to `ActiveDirectoryManagedIdentity` first. The
+    /// variant is public, so a caller setting it directly hit that error for a
+    /// method the driver does support.
     #[test]
     fn msi_and_managed_identity_agree() {
         let msi = FedAuthFeature::new(TdsAuthenticationMethod::ActiveDirectoryMSI, None, false);
