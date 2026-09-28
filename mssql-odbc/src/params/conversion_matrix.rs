@@ -73,7 +73,7 @@ const CHARACTER_PAYLOAD_SQL_TARGETS: &[SqlSmallInt] = &[SQL_SS_XML];
 /// sending the buffer verbatim would put different bytes on the wire than the
 /// reference for the same binding. Source reading only - the measurement that
 /// decides whether to implement the decode is named in `bound_param_to_value`'s
-/// UDT arm. AB#48248.
+/// UDT arm. AB#48815.
 const UDT_SQL_TARGETS: &[SqlSmallInt] = &[SQL_SS_UDT];
 
 /// Whether the driver can convert a `c_type` application buffer into `sql_type`
@@ -361,7 +361,7 @@ mod tests {
     /// the server could interpret as the UDT's own; the character rows are a
     /// different case - `fValidConversion` admits them, but msodbcsql
     /// hex-decodes rather than passing through, so they stay unbuilt until
-    /// that is measured (see `UDT_SQL_TARGETS`, AB#48248).
+    /// that is measured (see `UDT_SQL_TARGETS`, AB#48815).
     #[test]
     fn only_a_binary_buffer_reaches_udt_today() {
         assert!(is_supported_conversion(SQL_C_BINARY, SQL_SS_UDT));

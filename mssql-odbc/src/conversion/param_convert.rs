@@ -405,7 +405,7 @@ unsafe fn bound_param_to_value_with_outcome(
         // `SQL_DRIVER_VER` recorded, which decides whether to implement the
         // decode here or register the difference. Note `SQL_NTS` is unusable
         // for that binding: a serialized `hierarchyid` contains embedded nulls,
-        // so the length must be explicit. AB#48248.
+        // so the length must be explicit. AB#48815.
         (AppValue::Binary(bytes), SqlFamily::Udt) => {
             SqlType::Udt(udt_type_name(udt_names)?, Some(bytes))
         }
@@ -6088,7 +6088,7 @@ mod tests {
     ///
     /// Source reading only - see the citation chain on the `SqlFamily::Udt`
     /// arm in `bound_param_to_value`. A measured retail run may turn this into
-    /// an implemented decode (AB#48248).
+    /// an implemented decode (AB#48815).
     #[test]
     fn a_character_buffer_does_not_reach_a_udt() {
         for c_type in [SQL_C_WCHAR, SQL_C_CHAR] {
