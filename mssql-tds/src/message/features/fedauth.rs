@@ -116,10 +116,14 @@ impl FedAuthFeature {
             | TdsAuthenticationMethod::ActiveDirectoryClientAssertion => {
                 Ok(active_directory_token_credential)
             }
-            _ => Err(crate::error::Error::ProtocolError(format!(
-                "Unsupported authentication method {:?} used with FedAuth feature",
-                self.tds_authentication_method
-            ))),
+            TdsAuthenticationMethod::Password
+            | TdsAuthenticationMethod::SSPI
+            | TdsAuthenticationMethod::AccessToken => {
+                Err(crate::error::Error::ProtocolError(format!(
+                    "Unsupported authentication method {:?} used with FedAuth feature",
+                    self.tds_authentication_method
+                )))
+            }
         }
     }
 

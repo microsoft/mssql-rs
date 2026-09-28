@@ -322,6 +322,10 @@ pub struct ClientContext {
     /// name the real server so server-side routing and any name-based policy
     /// see the intended target.
     ///
+    /// The override is a login identity, not a one-hop dial target, so it is
+    /// reused for a LOGIN7 retry after a server routing redirect. With no
+    /// override, each login uses the address of its current transport.
+    ///
     /// `None` writes the dialled address, which is the previous behaviour.
     pub login_server_name: Option<String>,
     pub(crate) transport_context: TransportContext,

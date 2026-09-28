@@ -1342,14 +1342,6 @@ fn utf16_code_units(value: &str) -> TdsResult<u16> {
     })
 }
 
-impl SizedLoginItem for TransportContext {
-    fn len_bytes(&self) -> usize {
-        // Must match what get_login_server_name() returns for consistency
-        // with write_server_name() which serializes get_login_server_name()
-        self.get_login_server_name().len_bytes()
-    }
-}
-
 impl SizedLoginItem for String {
     fn len_bytes(&self) -> usize {
         self.encode_utf16().count() * 2

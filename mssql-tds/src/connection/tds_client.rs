@@ -43,7 +43,7 @@ use crate::{
 use std::collections::HashMap;
 use std::future::Future;
 use std::num::NonZeroU32;
-use tracing::{debug, error, info, instrument, warn};
+use tracing::{info, instrument, warn};
 
 use crate::{
     core::{CancelHandle, NegotiatedEncryptionSetting, TdsResult},
@@ -507,11 +507,17 @@ pub struct TdsClient {
     /// [`take_dml_result_counts`](Self::take_dml_result_counts).
     dml_result_counts: Vec<i64>,
     prepared_batch: Option<Box<PreparedBatchReadState>>,
-    /// Row counts from each DONE token of the current request, in arrival order.
+    /// Whether language batches should collect one row-count entry per DONE.
+    collect_done_row_counts: bool,
+    /// Whether the current language batch is collecting DONE row counts.
+    collect_done_row_counts_for_current_command: bool,
+    /// Row counts collected from each DONE token, in arrival order.
     done_row_counts: Vec<Option<u64>>,
-    /// When set, errors in a batch are collected while later results are read.
+    /// Whether language batches should collect errors while later results are read.
     defer_batch_errors: bool,
-    /// Errors collected under [`Self::defer_batch_errors`], in arrival order.
+    /// Whether error deferral is active for the current language batch.
+    defer_batch_errors_for_current_command: bool,
+    /// Errors collected under batch-error deferral, in arrival order.
     pending_errors: Vec<SqlErrorInfo>,
     /// An ERROR token has been collected whose closing DONE has not arrived.
     unreported_error: bool,
@@ -680,8 +686,11 @@ impl TdsClient {
             last_rows_affected: -1,
             dml_result_counts: Vec::new(),
             prepared_batch: None,
+            collect_done_row_counts: false,
+            collect_done_row_counts_for_current_command: false,
             done_row_counts: Vec::new(),
             defer_batch_errors: false,
+            defer_batch_errors_for_current_command: false,
             pending_errors: Vec::new(),
             unreported_error: false,
             return_values: Vec::new(),
@@ -1537,6 +1546,10 @@ impl TdsClient {
         self.recovery_context.session_state_table.reset();
         self.clear_session_bound_caches();
         self.negotiated_settings.restore_login_defaults();
+        self.defer_batch_errors = false;
+        self.collect_done_row_counts = false;
+        self.defer_batch_errors_for_current_command = false;
+        self.collect_done_row_counts_for_current_command = false;
     }
 
     /// Executes a SQL batch and positions on its **first navigable result**,
@@ -1592,6 +1605,8 @@ impl TdsClient {
         };
 
         self.begin_command();
+        self.defer_batch_errors_for_current_command = self.defer_batch_errors;
+        self.collect_done_row_counts_for_current_command = self.collect_done_row_counts;
         let reconnect_elapsed = self.check_and_reconnect(timeout, cancel).await?;
         let budget = Self::deduct_timeout(timeout, reconnect_elapsed);
         let resolved = budget.into_timeout()?;
@@ -5082,7 +5097,6 @@ impl TdsClient {
         let parser_context = ParserContext::ColumnEncryption(
             self.negotiated_settings.is_column_encryption_supported(),
         );
-        let mut loop_count = 0u32;
         // Whether the statement whose DONE we are about to reach produced any
         // informational message. In statement-wise navigation, msodbcsql exposes
         // a statement as its own result when it returns rows, carries a row count
@@ -5090,18 +5104,9 @@ impl TdsClient {
         // with none of these are collapsed. Tracks messages since the last
         // boundary so a PRINT / low-severity RAISERROR is surfaced individually.
         let mut saw_message = false;
+        let mut stalled_tokens = 0u32;
 
         loop {
-            loop_count += 1;
-
-            // Warn when approaching iteration limit to help diagnose issues
-            if loop_count.is_multiple_of(1000) {
-                debug!(
-                    loop_count,
-                    "High iteration count in advance_to_result_boundary"
-                );
-            }
-
             let token = self.next_response_token(&parser_context).await?;
             // `Tokens` moves into the match below; capture the one distinction
             // the shared DONE arm erases — only an RPC emits DONEINPROC, and
@@ -5127,21 +5132,12 @@ impl TdsClient {
                         done.has_more()
                     );
 
-                    // Read before the flag check: `&&` would short-circuit
-                    // past it on a DONE without the error flag, leaving the
-                    // excuse armed to absolve a genuinely unpaired one later.
-                    let excused = self.consumed_pending_error();
-                    if done.has_error() && !excused {
-                        return Err(crate::error::Error::ProtocolError(
-                            "Server reported error in DONE token without preceding ERROR token"
-                                .to_string(),
-                        ));
-                    }
+                    self.validate_done_error(&done, is_done_in_proc)?;
 
                     let count = self.count_map.entry(done.cur_cmd).or_insert(0);
                     // Use saturating_add to prevent integer overflow from malicious/corrupted TDS responses
                     *count = count.saturating_add(done.row_count);
-                    self.record_done_row_count(&done, false);
+                    self.record_done_row_count(&done, false)?;
                     self.current_result_set_has_been_read_till_end = true;
                     self.current_result_ended_with_done_in_proc = is_done_in_proc;
 
@@ -5229,17 +5225,7 @@ impl TdsClient {
                         "More result sets available (has_more=true), continuing to look for ColMetadata"
                     );
 
-                    // Prevent infinite loops from malicious inputs sending endless Done tokens with has_more=true
-                    if loop_count > 10000 {
-                        error!(
-                            loop_count,
-                            "Excessive iterations in advance_to_result_boundary - possible malicious input or protocol violation"
-                        );
-                        return Err(crate::error::Error::UsageError(
-                            "Too many Done tokens with has_more=true without ColMetadata"
-                                .to_string(),
-                        ));
-                    }
+                    self.note_stalled_boundary_token(&mut stalled_tokens)?;
                     continue;
                 }
                 Tokens::EnvChange(env_change) => {
@@ -5249,28 +5235,33 @@ impl TdsClient {
                     }
                     self.execution_context
                         .capture_change_property(&env_change, &mut self.negotiated_settings)?;
+                    self.note_stalled_boundary_token(&mut stalled_tokens)?;
                 }
                 Tokens::SessionState(session_state) => {
                     self.recovery_context
                         .process_session_state(&session_state)?;
+                    self.note_stalled_boundary_token(&mut stalled_tokens)?;
                 }
                 Tokens::ReturnValue(return_value_token) => {
                     let return_value = self.finalize_return_value(return_value_token)?;
                     self.push_return_value(return_value);
+                    self.note_stalled_boundary_token(&mut stalled_tokens)?;
                 }
                 Tokens::ReturnStatus(return_status) => {
                     self.last_return_status = ReturnStatus::Received(return_status.value);
                     info!("Received return_status token: {:?}", return_status);
+                    self.note_stalled_boundary_token(&mut stalled_tokens)?;
                     continue;
                 }
                 Tokens::Error(error_token) => {
                     info!(?error_token);
-                    if self.defer_batch_errors {
+                    if self.defer_batch_errors_for_current_command {
                         // Through the helper: deferring must not skip retiring
                         // the connection on a fatal error.
                         let error = self.record_error_token(&error_token);
-                        self.pending_errors.push(error);
-                        self.unreported_error = true;
+                        self.defer_batch_error(error)?;
+                        saw_message = true;
+                        stalled_tokens = 0;
                         continue;
                     }
                     let mut all_errors = vec![self.record_error_token(&error_token)];
@@ -5302,9 +5293,11 @@ impl TdsClient {
                     // Marks the current statement as message-bearing so
                     // statement-wise navigation surfaces it as its own result.
                     saw_message = true;
+                    stalled_tokens = 0;
                     continue;
                 }
                 Tokens::TabName | Tokens::ColInfo => {
+                    self.note_stalled_boundary_token(&mut stalled_tokens)?;
                     continue;
                 }
                 _ => {
@@ -7667,12 +7660,11 @@ impl TdsClient {
                     self.record_error_token(&error_token);
                     return Ok(None);
                 }
-                if self.defer_batch_errors {
+                if self.defer_batch_errors_for_current_command {
                     // Through the helper: deferring must not skip retiring the
                     // connection on a fatal error.
                     let error = self.record_error_token(&error_token);
-                    self.pending_errors.push(error);
-                    self.unreported_error = true;
+                    self.defer_batch_error(error)?;
                     return Ok(None);
                 }
                 let mut all_errors = vec![self.record_error_token(&error_token)];
@@ -7721,15 +7713,8 @@ impl TdsClient {
     ) -> TdsResult<Option<bool>> {
         info!("done while get_next_row: {:?}", done);
 
-        // A deferred error was already collected and will be reported by the
-        // caller, so it does not make this DONE a protocol violation. Read
-        // first: `&&` would short-circuit past the one-shot flag and leave it
-        // armed to excuse a genuinely unpaired error-flagged DONE later.
-        let excused = self.consumed_pending_error();
-        if done.has_error() && self.prepared_batch.is_none() && !excused {
-            return Err(crate::error::Error::ProtocolError(
-                "Server reported error in DONE token without preceding ERROR token".to_string(),
-            ));
+        if self.prepared_batch.is_none() {
+            self.validate_done_error(&done, ended_with_done_in_proc)?;
         }
 
         let count = self.count_map.entry(done.cur_cmd).or_insert(0);
@@ -7740,7 +7725,7 @@ impl TdsClient {
         if self.prepared_batch.is_none() {
             // Reached while reading rows, so this DONE closes a row-returning
             // statement and its count is the row count.
-            self.record_done_row_count(&done, true);
+            self.record_done_row_count(&done, true)?;
         }
         self.current_result_set_has_been_read_till_end = true;
         self.current_result_ended_with_done_in_proc = ended_with_done_in_proc;
@@ -7762,15 +7747,49 @@ impl TdsClient {
         self.return_values.clone()
     }
 
-    /// Whether the DONE token now being handled is the one closing a statement
-    /// whose ERROR token was already collected.
+    /// Validates a DONE error flag against the preceding deferred ERROR token.
     ///
-    /// A DONE carrying the error flag is normally a protocol violation, because
-    /// the ERROR token that explains it should have ended the batch. Under
-    /// [`set_defer_batch_errors`](Self::set_defer_batch_errors) that token was
-    /// collected instead, so the flag is expected exactly once per error.
-    fn consumed_pending_error(&mut self) -> bool {
-        std::mem::take(&mut self.unreported_error)
+    /// A procedure error can be reflected by both DONEINPROC and the enclosing
+    /// DONEPROC. Keep the allowance through DONEINPROC; every other DONE closes
+    /// the completion chain so it cannot excuse an unrelated token later.
+    fn validate_done_error(&mut self, done: &DoneToken, is_done_in_proc: bool) -> TdsResult<()> {
+        let has_deferred_error = self.unreported_error;
+        if !is_done_in_proc {
+            self.unreported_error = false;
+        }
+        if done.has_error() && !has_deferred_error {
+            return Err(crate::error::Error::ProtocolError(
+                "Server reported error in DONE token without preceding ERROR token".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn defer_batch_error(&mut self, error: SqlErrorInfo) -> TdsResult<()> {
+        if self.pending_errors.len() >= 10_000 {
+            self.execution_context.set_has_open_batch(false);
+            self.current_metadata = None;
+            self.transport.mark_known_dead();
+            return Err(crate::error::Error::UsageError(
+                "Too many deferred errors in one response".to_string(),
+            ));
+        }
+        self.pending_errors.push(error);
+        self.unreported_error = true;
+        Ok(())
+    }
+
+    fn note_stalled_boundary_token(&mut self, stalled_tokens: &mut u32) -> TdsResult<()> {
+        *stalled_tokens += 1;
+        if *stalled_tokens <= 10_000 {
+            return Ok(());
+        }
+        self.execution_context.set_has_open_batch(false);
+        self.current_metadata = None;
+        self.transport.mark_known_dead();
+        Err(crate::error::Error::UsageError(
+            "Too many response tokens without result progress".to_string(),
+        ))
     }
 
     /// Collects mid-batch errors instead of ending the batch at the first one.
@@ -7802,6 +7821,12 @@ impl TdsClient {
         self.defer_batch_errors = defer;
     }
 
+    /// Enables per-statement DONE row-count collection for subsequent language
+    /// batches. RPCs and existing callers that do not opt in retain no DONE log.
+    pub fn set_collect_done_row_counts(&mut self, collect: bool) {
+        self.collect_done_row_counts = collect;
+    }
+
     /// Takes the errors collected under
     /// [`set_defer_batch_errors`](Self::set_defer_batch_errors), in arrival order.
     ///
@@ -7815,6 +7840,8 @@ impl TdsClient {
 
     /// Row counts reported by each statement as a query's results are iterated,
     /// in arrival order, leaving the log empty.
+    /// Collection is disabled until
+    /// [`set_collect_done_row_counts`](Self::set_collect_done_row_counts) is enabled.
     ///
     /// `None` marks a statement with no reportable count — `SET NOCOUNT ON`,
     /// DDL, or a variable assignment whose `SQLSELECT`-tagged count both
@@ -7841,10 +7868,22 @@ impl TdsClient {
     /// `SELECT @x = col FROM t`), which SQL Server still gives a `DONE_COUNT`.
     /// msodbcsql (`sqlctokn.cpp:2149`) and .NET SqlClient both discard those,
     /// the latter calling them "the bogus DONE counts sent by the server".
-    fn record_done_row_count(&mut self, done: &DoneToken, row_set: bool) {
+    fn record_done_row_count(&mut self, done: &DoneToken, row_set: bool) -> TdsResult<()> {
+        if !self.collect_done_row_counts_for_current_command {
+            return Ok(());
+        }
+        if self.done_row_counts.len() >= 10_000 {
+            self.execution_context.set_has_open_batch(false);
+            self.current_metadata = None;
+            self.transport.mark_known_dead();
+            return Err(crate::error::Error::UsageError(
+                "Too many DONE row counts in one response".to_string(),
+            ));
+        }
         let reportable = done.has_count() && (row_set || done.cur_cmd != CurrentCommand::Select);
         self.done_row_counts
             .push(reportable.then_some(done.row_count));
+        Ok(())
     }
 
     /// Returns the procedure's `RETURN` value from the most recent RPC, or
@@ -7932,6 +7971,8 @@ impl TdsClient {
         self.done_row_counts.clear();
         self.pending_errors.clear();
         self.unreported_error = false;
+        self.defer_batch_errors_for_current_command = false;
+        self.collect_done_row_counts_for_current_command = false;
     }
 
     /// The live server handle the client holds for `statement_id`, if any.
@@ -9248,6 +9289,7 @@ mod tests {
     #[test]
     fn prepare_reset_connection_routes_mode_to_transport() {
         let mut client = create_test_client();
+        client.set_defer_batch_errors(true);
 
         // Default: no reset pending.
         assert_eq!(
@@ -9257,6 +9299,7 @@ mod tests {
 
         // Plain reset.
         client.prepare_reset_connection(false);
+        assert!(!client.defer_batch_errors);
         assert_eq!(
             client.transport.as_writer().take_reset_mode(),
             ResetConnectionMode::Reset
@@ -9425,6 +9468,7 @@ mod tests {
     #[test]
     fn a_done_without_a_count_is_logged_as_none() {
         let mut client = create_test_client();
+        client.collect_done_row_counts_for_current_command = true;
         let no_count = DoneToken {
             status: DoneStatus::FINAL,
             cur_cmd: CurrentCommand::Select,
@@ -9436,8 +9480,8 @@ mod tests {
             row_count: 0,
         };
 
-        client.record_done_row_count(&no_count, false);
-        client.record_done_row_count(&zero_rows, false);
+        client.record_done_row_count(&no_count, false).unwrap();
+        client.record_done_row_count(&zero_rows, false).unwrap();
 
         assert_eq!(client.take_done_row_counts(), vec![None, Some(0)]);
     }
@@ -9447,15 +9491,18 @@ mod tests {
     #[test]
     fn done_row_counts_are_per_statement_and_taken_once() {
         let mut client = create_test_client();
+        client.collect_done_row_counts_for_current_command = true;
         for rows in [2_u64, 5, 1] {
-            client.record_done_row_count(
-                &DoneToken {
-                    status: DoneStatus::COUNT,
-                    cur_cmd: CurrentCommand::Update,
-                    row_count: rows,
-                },
-                false,
-            );
+            client
+                .record_done_row_count(
+                    &DoneToken {
+                        status: DoneStatus::COUNT,
+                        cur_cmd: CurrentCommand::Update,
+                        row_count: rows,
+                    },
+                    false,
+                )
+                .unwrap();
         }
 
         assert_eq!(
@@ -9465,16 +9512,72 @@ mod tests {
         assert!(client.take_done_row_counts().is_empty());
     }
 
-    /// The flag excuses exactly one error-flagged DONE. A second one with no
-    /// intervening ERROR is still the protocol violation the check exists for.
-    #[test]
-    fn a_collected_error_excuses_exactly_one_done() {
-        let mut client = create_test_client();
-        assert!(!client.consumed_pending_error());
+    #[tokio::test]
+    async fn a_deferred_error_allows_error_on_done_in_proc_and_done_proc() {
+        let mut client = create_test_client_with_tokens(vec![
+            Tokens::Error(error_token_with_severity(16)),
+            Tokens::DoneInProc(DoneToken {
+                status: DoneStatus::ERROR | DoneStatus::MORE,
+                cur_cmd: CurrentCommand::Select,
+                row_count: 0,
+            }),
+            Tokens::DoneProc(DoneToken {
+                status: DoneStatus::ERROR,
+                cur_cmd: CurrentCommand::Select,
+                row_count: 0,
+            }),
+        ]);
+        client.set_defer_batch_errors(true);
+        client.defer_batch_errors_for_current_command = true;
 
-        client.unreported_error = true;
-        assert!(client.consumed_pending_error());
-        assert!(!client.consumed_pending_error());
+        assert!(matches!(
+            client.advance_to_result_boundary().await.unwrap(),
+            ResultBoundaryKind::NoRows {
+                rows_affected: None
+            }
+        ));
+        assert!(client.unreported_error);
+        assert!(matches!(
+            client.advance_to_result_boundary().await.unwrap(),
+            ResultBoundaryKind::End
+        ));
+
+        assert_eq!(client.take_pending_errors().len(), 1);
+        assert!(!client.unreported_error);
+    }
+
+    #[tokio::test]
+    async fn a_deferred_error_allows_error_only_on_done_proc() {
+        let mut client = create_test_client_with_tokens(vec![
+            Tokens::Error(error_token_with_severity(16)),
+            Tokens::DoneInProc(DoneToken {
+                status: DoneStatus::MORE,
+                cur_cmd: CurrentCommand::Select,
+                row_count: 0,
+            }),
+            Tokens::DoneProc(DoneToken {
+                status: DoneStatus::ERROR,
+                cur_cmd: CurrentCommand::Select,
+                row_count: 0,
+            }),
+        ]);
+        client.set_defer_batch_errors(true);
+        client.defer_batch_errors_for_current_command = true;
+
+        assert!(matches!(
+            client.advance_to_result_boundary().await.unwrap(),
+            ResultBoundaryKind::NoRows {
+                rows_affected: None
+            }
+        ));
+        assert!(client.unreported_error);
+        assert!(matches!(
+            client.advance_to_result_boundary().await.unwrap(),
+            ResultBoundaryKind::End
+        ));
+
+        assert_eq!(client.take_pending_errors().len(), 1);
+        assert!(!client.unreported_error);
     }
 
     /// Deferral is off unless asked for, so existing callers keep the
@@ -9510,6 +9613,7 @@ mod tests {
             done_no_more(),
         ]);
         client.set_defer_batch_errors(true);
+        client.defer_batch_errors_for_current_command = true;
 
         let _ = client.advance_to_result_boundary().await;
 
@@ -9572,6 +9676,7 @@ mod tests {
     #[test]
     fn a_sqlselect_count_is_reported_only_for_a_row_set() {
         let mut client = create_test_client();
+        client.collect_done_row_counts_for_current_command = true;
         let assignment = DoneToken {
             status: DoneStatus::COUNT,
             cur_cmd: CurrentCommand::Select,
@@ -9583,9 +9688,9 @@ mod tests {
             row_count: 2,
         };
 
-        client.record_done_row_count(&assignment, false);
-        client.record_done_row_count(&insert, false);
-        client.record_done_row_count(&assignment, true);
+        client.record_done_row_count(&assignment, false).unwrap();
+        client.record_done_row_count(&insert, false).unwrap();
+        client.record_done_row_count(&assignment, true).unwrap();
 
         assert_eq!(
             client.take_done_row_counts(),
@@ -9994,6 +10099,151 @@ mod tests {
                 .unwrap_or(0),
             1
         );
+    }
+
+    /// A deferred error remains a navigable statement boundary so callers can
+    /// associate the collected error with the statement that produced it.
+    #[tokio::test]
+    async fn execute_surfaces_a_deferred_error_statement() {
+        let mut client = create_test_client_with_tokens(vec![
+            Tokens::Error(crate::token::tokens::ErrorToken {
+                number: 50000,
+                state: 1,
+                severity: 16,
+                message: "boom".to_string(),
+                server_name: String::new(),
+                proc_name: String::new(),
+                line_number: 1,
+            }),
+            done_more(),
+            int_col_metadata(1),
+        ]);
+        client.set_defer_batch_errors(true);
+        client.defer_batch_errors_for_current_command = true;
+
+        let first = client
+            .execute("RAISERROR('boom', 16, 1); SELECT 1;".to_string(), ())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            first,
+            StatementResult::NoRows {
+                rows_affected: None
+            }
+        );
+        assert_eq!(client.take_pending_errors().len(), 1);
+        assert_eq!(client.advance().await.unwrap(), StatementResult::Rows);
+    }
+
+    #[tokio::test]
+    async fn reset_ack_does_not_disable_deferral_for_its_response() {
+        let mut client = create_test_client_with_tokens(vec![
+            Tokens::EnvChange(crate::token::tokens::EnvChangeToken {
+                sub_type: EnvChangeTokenSubType::ResetConnection,
+                change_type: crate::token::tokens::EnvChangeContainer::from((0u32, 0u32)),
+            }),
+            Tokens::Error(error_token_with_severity(16)),
+            done_more(),
+            int_col_metadata(1),
+        ]);
+        client.set_defer_batch_errors(true);
+        client.defer_batch_errors_for_current_command = true;
+
+        assert!(matches!(
+            client.advance_to_result_boundary().await.unwrap(),
+            ResultBoundaryKind::NoRows {
+                rows_affected: None
+            }
+        ));
+        assert!(client.defer_batch_errors);
+        assert_eq!(client.take_pending_errors().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn message_heavy_statement_is_not_rejected_by_a_token_cap() {
+        let mut tokens = Vec::with_capacity(10_002);
+        for number in 0..10_001 {
+            tokens.push(info_token(number, 0, "message"));
+        }
+        tokens.push(done_no_more());
+        let mut client = create_test_client_with_tokens(tokens);
+
+        assert!(matches!(
+            client.advance_to_result_boundary().await.unwrap(),
+            ResultBoundaryKind::NoRows {
+                rows_affected: None
+            }
+        ));
+        assert!(!client.is_connection_dead());
+    }
+
+    #[tokio::test]
+    async fn endless_done_more_chain_is_bounded_and_retires_connection() {
+        let mut client = create_test_client_with_tokens(
+            std::iter::repeat_with(done_more).take(10_001).collect(),
+        );
+
+        let error = client.advance_to_result_boundary().await.unwrap_err();
+
+        assert!(matches!(error, crate::error::Error::UsageError(_)));
+        assert!(client.is_connection_dead());
+        assert!(!client.has_open_batch());
+    }
+
+    #[tokio::test]
+    async fn counted_select_done_more_chain_is_bounded_and_retires_connection() {
+        let mut client = create_test_client_with_tokens(
+            std::iter::repeat_with(|| done_count(CurrentCommand::Select, 1, true))
+                .take(10_001)
+                .collect(),
+        );
+
+        let error = client.advance_to_result_boundary().await.unwrap_err();
+
+        assert!(matches!(error, crate::error::Error::UsageError(_)));
+        assert!(client.is_connection_dead());
+        assert!(!client.has_open_batch());
+    }
+
+    #[test]
+    fn done_row_count_collection_is_bounded_and_retires_connection() {
+        let mut client = create_test_client();
+        client.collect_done_row_counts_for_current_command = true;
+        client.done_row_counts.resize(10_000, None);
+
+        let error = client
+            .record_done_row_count(
+                &DoneToken {
+                    status: DoneStatus::COUNT,
+                    cur_cmd: CurrentCommand::Update,
+                    row_count: 1,
+                },
+                false,
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, crate::error::Error::UsageError(_)));
+        assert!(client.is_connection_dead());
+        assert!(!client.has_open_batch());
+    }
+
+    #[test]
+    fn done_row_count_collection_is_disabled_by_default() {
+        let mut client = create_test_client();
+
+        client
+            .record_done_row_count(
+                &DoneToken {
+                    status: DoneStatus::COUNT,
+                    cur_cmd: CurrentCommand::Update,
+                    row_count: 1,
+                },
+                false,
+            )
+            .unwrap();
+
+        assert!(client.take_done_row_counts().is_empty());
     }
 
     /// Divergence pin: msodbcsql excludes `SQLFETCHCURSOR` (0x21) and `SQLDBCC`
@@ -14084,6 +14334,28 @@ mod tests {
             Some(&7),
             "a pre-send failure must leave the orphan releasable"
         );
+    }
+
+    #[tokio::test]
+    async fn execute_sp_prepexec_error_is_not_deferred_by_batch_preference() {
+        let mut client = create_test_client_with_tokens(vec![
+            Tokens::Error(error_token_with_severity(16)),
+            done_no_more(),
+        ]);
+        client.set_defer_batch_errors(true);
+        let mut orphan = None;
+
+        let result = client
+            .execute_sp_prepexec_for_test("SELECT 1".to_string(), Vec::new(), &mut orphan, ())
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(crate::error::Error::SqlServerError { .. })
+        ));
+        assert!(client.pending_capture.is_none());
+        assert!(client.take_pending_errors().is_empty());
+        assert!(!client.defer_batch_errors_for_current_command);
     }
 
     #[tokio::test]

@@ -667,6 +667,7 @@ mod query_result_reads {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn variable_assignment_counts_are_not_reported() {
         let mut connection = begin_connection(&build_tcp_datasource()).await;
+        connection.set_collect_done_row_counts(true);
 
         connection
             .execute(
@@ -782,6 +783,7 @@ mod query_result_reads {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn done_row_counts_arrive_one_per_statement() {
         let mut connection = begin_connection(&build_tcp_datasource()).await;
+        connection.set_collect_done_row_counts(true);
 
         connection
             .execute(
@@ -813,6 +815,7 @@ mod query_result_reads {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn nocount_reports_none_not_zero() {
         let mut connection = begin_connection(&build_tcp_datasource()).await;
+        connection.set_collect_done_row_counts(true);
 
         connection
             .execute(
@@ -826,6 +829,10 @@ mod query_result_reads {
         connection.close_query().await.unwrap();
 
         let counts = connection.take_done_row_counts();
+        assert!(
+            !counts.is_empty(),
+            "the batch should still log a DONE per statement"
+        );
         assert!(
             counts.iter().all(Option::is_none),
             "no statement should report a count under SET NOCOUNT ON, got {counts:?}"
