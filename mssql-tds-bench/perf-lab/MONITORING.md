@@ -2,6 +2,13 @@
 
 How the weekly perf-lab runs are triaged, and when the baseline is advanced.
 
+This file is the policy: it decides what a verdict means and when the baseline moves,
+for humans and automation alike. The step-by-step mechanics of a run — reaching the
+Azure DevOps API, pulling a verdict out of a step log, and the shape of the bump PR —
+live in the [`perf-lab-triage`](../../.github/skills/perf-lab-triage/SKILL.md) skill,
+which defers to this file. Keep the criteria below in one place: if that skill (or an
+invoking prompt) restates or contradicts them, this file wins and the copy is the bug.
+
 ## The pipelines
 
 | Platform | Definition | Schedule (UTC) | Typical duration |
