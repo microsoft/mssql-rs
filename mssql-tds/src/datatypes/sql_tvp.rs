@@ -180,9 +180,10 @@ impl TvpColumnDef {
     fn validate(&self) -> TdsResult<()> {
         // A UDT column's COLMETADATA carries MAX_BYTE_SIZE and the
         // assembly-qualified name; `write_type_info` only emits the RPC
-        // parameter form, so a UDT column writes malformed TDS. This states
-        // that rather than preventing it: `TvpTableData::validate` is not on
-        // the send path (see its doc), so the bytes still go out today.
+        // parameter form, so accepting one here would write malformed TDS.
+        // `serialize_table` runs this before any column metadata, so the
+        // malformed bytes are never written - only the TVP type byte and name
+        // precede the check.
         if matches!(self.column_type, SqlType::Udt(_, _)) {
             return Err(Error::UsageError(
                 "UDT columns are not supported in table-valued parameters".to_string(),
@@ -351,14 +352,12 @@ impl TvpTableData {
     /// template. Variant matching uses [`std::mem::discriminant`], so the
     /// inner value (including `None` vs `Some`) is not compared.
     ///
-    /// NOT ON THE SEND PATH. Nothing outside this module's tests calls this
-    /// today: `serialize_table` validates the *type name* and then writes the
-    /// rows, so none of the checks below can refuse a malformed table before
-    /// it reaches the wire. That predates the UDT work - it was already true
-    /// at this branch's merge base - so the arms here describe what a TVP
-    /// *should* reject rather than what it does. Wiring it in means a second
-    /// pass over every row ahead of the writing pass, which is why it is a
-    /// tracked gap rather than a change made in passing. NEEDS A WORK ITEM.
+    /// `serialize_table` runs this before any column metadata or row bytes are
+    /// written, so a rejection here keeps all of those off the wire. It is not
+    /// a full preflight: the TVP type byte and three-part name precede it, so
+    /// a failure leaves those in the writer and, if they overflowed a packet,
+    /// already sent - the same partial-request shape `validate_parameters`
+    /// exists to avoid for scalar parameters.
     pub(crate) fn validate(&self) -> TdsResult<()> {
         if self.columns.is_empty() {
             return Err(Error::UsageError(

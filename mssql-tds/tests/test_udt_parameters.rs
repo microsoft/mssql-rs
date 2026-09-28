@@ -6,12 +6,17 @@ mod common;
 
 /// Integration coverage for the UDT parameter path added to `mssql-tds`.
 ///
-/// These exercise `SqlType::Udt` through `TdsClient` directly, which is how the
-/// JS and Python bindings reach it. The ODBC e2e suite covers the same wire
-/// path from above, but only through bindings ODBC happens to expose - it
-/// cannot reach a caller that builds an `RpcParameter` itself, and it cannot
-/// reach the send preflight's rejection arms at all, because `SQLBindParameter`
-/// refuses those inputs before `mssql-tds` sees them.
+/// These exercise `SqlType::Udt` through `TdsClient` directly. `mssql-tds` is
+/// a crate in its own right and `SqlType`, `UdtTypeName` and `RpcParameter`
+/// are its public surface, so this is a supported way in even though ODBC is
+/// the only consumer building a UDT parameter today - `mssql-py-core` still
+/// refuses one (`types.rs:441`) and `mssql-js` has no UDT path at all.
+///
+/// The ODBC e2e suite covers the successful wire path from above, on both
+/// driver legs. What it cannot reach is the send preflight's rejection arms:
+/// `SQLBindParameter` refuses an empty or overlong UDT type name before
+/// `mssql-tds` is ever called, so those arms have no coverage from that
+/// direction in either driver.
 mod udt_parameters {
     use crate::common::{begin_connection, build_tcp_datasource, get_first_row, init_tracing};
     use mssql_tds::connection::tds_client::TdsClient;
