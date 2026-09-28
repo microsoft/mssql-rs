@@ -195,6 +195,23 @@ pub fn encode_narrow(text: &str, collation: SqlCollation) -> NarrowEncoded {
 /// encoding this resolves to is stateless, so a character encodes the same
 /// alone as it does in context.
 ///
+/// # Cost
+///
+/// One [`ResolvedEncoding::encode`] call per scalar. ASCII borrows, but every
+/// non-ASCII scalar returns an owned `Cow` — in the `encoding_rs` branch and the
+/// OEM table branch alike — so a value that is largely non-ASCII allocates once
+/// per character after the first unmappable one. Measured: ~9.5 ms/MB under
+/// CP1252 against ~76 ms/MB under CP932, and that 8x gap is this effect, CP932
+/// text being non-ASCII throughout.
+///
+/// Accepted rather than fixed: it is confined to a value already being altered,
+/// and removing it means driving `Encoder::encode_from_utf8_without_replacement`
+/// incrementally (copy representable spans, append `?` on `Unmappable`) with a
+/// second allocation-free implementation for the OEM tables, which
+/// `ResolvedEncoding` does not expose today. Do that as its own change with the
+/// CP1252/CP932/CP437, astral and mixed cases re-run — those are exactly where a
+/// one-pass rewrite regresses silently.
+///
 /// One substitute byte per **UTF-16 code unit**, not per character, so an
 /// astral character yields two. `WideCharToMultiByte` counts that way
 /// (measured: `U+1F600` gives `3F 3F` under CP1252 and CP932), as does SQL
