@@ -4378,10 +4378,11 @@ mod tests {
     /// `finish` runs, and the sibling test above targets `SQL_WVARCHAR`, where
     /// U+FFFD is representable and `finish` reports no loss.
     ///
-    /// So this is what pins `finish`'s loss verdict, and with it the
-    /// `note_code_page_conversion_loss` call on the tail in `SQLParamData`
-    /// (`param_data.rs`) — CI's coverage report flagged that line as the only
-    /// uncovered new line in the diff (AB#47598).
+    /// Pins `finish`'s verdict only. It does *not* pin `SQLParamData`'s
+    /// `note_code_page_conversion_loss` call on the tail — deleting that line
+    /// leaves this green, since this drives the helper directly. The
+    /// entry-point half is `DataAtExecutionTruncatedTailWarnsWhenAsked` in the
+    /// e2e suite (AB#47598).
     #[test]
     fn transcode_reports_loss_when_flushing_a_truncated_tail_to_a_narrow_target() {
         let transcode = DaeTranscode::new(SQL_C_CHAR, SQL_VARCHAR, windows_1252_collation());

@@ -1370,6 +1370,61 @@ TEST_F(CharConversionLiveTest, DataAtExecutionUnmappableCharacterWarnsWhenAsked)
                   SQL_HANDLE_DBC, dbc_);
 }
 
+// The transcoder's *tail* flush is a separate substitution site from the
+// per-chunk one above: a value that ends part-way through a character has no
+// continuation coming, so `DaeTranscode::finish` decodes the held bytes
+// lossily to U+FFFD, which a single-byte code page cannot represent either. The
+// `?` and the loss verdict therefore come from `finish` rather than `push`, and
+// `SQLParamData` records them from its own call site.
+//
+// Only an entry-point test reaches that: the unit test beside it drives
+// `finish` directly, so deleting the `note_code_page_conversion_loss` call in
+// `SQLParamData` leaves it green. Here the partial sequence is the whole value,
+// so nothing else can have set the verdict (AB#47598).
+//
+// Skipped under comparison: parity-deviations entry 22, same as
+// DataAtExecutionUnmappableCharacterWarnsWhenAsked.
+TEST_F(CharConversionLiveTest, DataAtExecutionTruncatedTailWarnsWhenAsked) {
+    SKIP_IF_COMPARING_MSODBCSQL();
+
+    if (!DatabaseIsLatin1()) {
+        GTEST_SKIP() << "needs a Latin1 database collation";
+    }
+
+    ASSERT_SQL_OK(SQLSetConnectAttr(dbc_, SQL_COPT_SS_WARN_ON_CP_ERROR,
+                                    reinterpret_cast<SQLPOINTER>(SQL_WARN_YES), 0),
+                  SQL_HANDLE_DBC, dbc_);
+
+    ASSERT_SQL_OK(Prepare("SELECT CAST(ASCII(?) AS VARCHAR(16))"), SQL_HANDLE_STMT, stmt_);
+    SQLLEN streamed_ind = SQL_DATA_AT_EXEC;
+    SQLCHAR token = 0;
+    // SQL_C_CHAR is UTF-8 in this driver, so a lone 0xC3 is a lead byte whose
+    // continuation never arrives.
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_CHAR,
+                                   SQL_VARCHAR, 0, 0, &token, 0, &streamed_ind),
+                  SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_EQ(SQL_NEED_DATA, SQLExecute(stmt_));
+    SQLPOINTER value_ptr = nullptr;
+    ASSERT_EQ(SQL_NEED_DATA, SQLParamData(stmt_, &value_ptr));
+
+    SQLCHAR lead_byte = 0xC3;
+    // Held back as an incomplete character, so this chunk writes nothing and
+    // cannot itself report loss.
+    EXPECT_EQ(SQL_SUCCESS, SQLPutData(stmt_, &lead_byte, 1));
+    // The tail flush is what substitutes, and the warning arrives with it.
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, SQLParamData(stmt_, &value_ptr));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01000");
+
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("63", GetColumnChar(1)) << "U+FFFD has no CP1252 representation";
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_SQL_OK(SQLSetConnectAttr(dbc_, SQL_COPT_SS_WARN_ON_CP_ERROR,
+                                    reinterpret_cast<SQLPOINTER>(SQL_WARN_NO), 0),
+                  SQL_HANDLE_DBC, dbc_);
+}
+
 // ---------------------------------------------------------------------------
 // A value rejected after a packet has flushed leaves the server holding an
 // incomplete message. Unless it is withdrawn (EOM | IGNORE, then its DONE
