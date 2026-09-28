@@ -91,6 +91,48 @@ fn resolve_collation(collation: SqlCollation) -> ResolvedEncoding {
     lcid_encoding_or_fallback(collation).into()
 }
 
+/// The Windows code page the server's `collation` selects, mirroring the value
+/// msodbcsql derives with `CodePageFromTDSCollation`: a SQL collation's sort-ID
+/// code page, else the LCID's ANSI code page (`65001` for a UTF-8 collation).
+/// `None` when neither the sort ID nor the LCID maps to a known code page.
+pub(crate) fn collation_code_page(collation: SqlCollation) -> Option<u16> {
+    if collation.utf8() {
+        return Some(65001);
+    }
+    if let Some(code_page) = CODE_PAGE_FROM_SORT_ID[usize::from(collation.sort_id)] {
+        return Some(code_page);
+    }
+    let lcid = collation.info & 0x000F_FFFF;
+    lcid_to_encoding(lcid).ok().and_then(encoding_to_code_page)
+}
+
+/// Maps the `encoding_rs` encodings [`lcid_to_encoding`] can return back to
+/// their Windows code page number.
+fn encoding_to_code_page(encoding: &'static encoding_rs::Encoding) -> Option<u16> {
+    use encoding_rs as e;
+    for (candidate, code_page) in [
+        (e::WINDOWS_1250, 1250u16),
+        (e::WINDOWS_1251, 1251),
+        (e::WINDOWS_1252, 1252),
+        (e::WINDOWS_1253, 1253),
+        (e::WINDOWS_1254, 1254),
+        (e::WINDOWS_1255, 1255),
+        (e::WINDOWS_1256, 1256),
+        (e::WINDOWS_1257, 1257),
+        (e::WINDOWS_1258, 1258),
+        (e::WINDOWS_874, 874),
+        (e::SHIFT_JIS, 932),
+        (e::GBK, 936),
+        (e::EUC_KR, 949),
+        (e::BIG5, 950),
+    ] {
+        if std::ptr::eq(encoding, candidate) {
+            return Some(code_page);
+        }
+    }
+    None
+}
+
 /// Encodes `text` for the wire under `collation`'s narrow encoding: UTF-8 when
 /// the collation is UTF-8-aware, then its SQL sort ID code page, then its LCID
 /// (falling back to Windows-1252 for an LCID this crate does not map).
@@ -533,6 +575,36 @@ mod tests {
         };
         let sql_str = SqlString::new(text.to_vec(), EncodingType::LcidBased(collation));
         assert_eq!(sql_str.to_utf8_string(), "Hello, World!");
+    }
+
+    #[test]
+    fn collation_code_page_resolves_sort_id_then_lcid() {
+        let sql_collation = |sort_id| SqlCollation {
+            info: 0,
+            lcid_language_id: 0,
+            col_flags: 0,
+            sort_id,
+        };
+        // SQL collations resolve through the sort-ID table.
+        assert_eq!(collation_code_page(sql_collation(50)), Some(1252));
+        assert_eq!(collation_code_page(sql_collation(40)), Some(850));
+        assert_eq!(collation_code_page(sql_collation(30)), Some(437));
+        // A Windows collation (sort_id 0) resolves through the LCID's ANSI page.
+        let windows = SqlCollation {
+            info: 0x0409,
+            lcid_language_id: 0,
+            col_flags: 0,
+            sort_id: 0,
+        };
+        assert_eq!(collation_code_page(windows), Some(1252));
+        // An unmapped LCID has no code page.
+        let unknown = SqlCollation {
+            info: 0x000F_FFFF,
+            lcid_language_id: 0,
+            col_flags: 0,
+            sort_id: 0,
+        };
+        assert_eq!(collation_code_page(unknown), None);
     }
 
     #[test]

@@ -1939,7 +1939,7 @@ mod tests {
     #[test]
     fn collation_seq_reports_login_charset() {
         let h = TestHandles::with_env_dbc();
-        // Empty before any login character-set name is captured.
+        // Empty before a connection resolves the collation.
         let (rc, value, len) = get_wide_str(h.dbc, odbc::SQL_COLLATION_SEQ);
         assert_eq!(rc, SQL_SUCCESS);
         assert_eq!(value, "");
@@ -1947,12 +1947,12 @@ mod tests {
 
         {
             let dbc_ref = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
-            dbc_ref.inner.lock().unwrap().identity.collation_seq = "iso_1".to_string();
+            dbc_ref.inner.lock().unwrap().identity.collation_seq = "ISO 8859-1".to_string();
         }
         let (rc, value, len) = get_wide_str(h.dbc, odbc::SQL_COLLATION_SEQ);
         assert_eq!(rc, SQL_SUCCESS);
-        assert_eq!(value, "iso_1");
-        assert_eq!(len, 10);
+        assert_eq!(value, "ISO 8859-1");
+        assert_eq!(len, 20);
     }
 
     #[test]

@@ -278,6 +278,18 @@ fn initial_database(database_keyword: &str, current_catalog: Option<&str>) -> St
     }
 }
 
+/// The `SQL_COLLATION_SEQ` name for a server code page. msodbcsql names only
+/// these three (`sqlctokn.cpp` `OnEnvChange` `ENV_DATABASECOLLATION`) and leaves
+/// every other code page empty.
+fn collation_seq_name(code_page: Option<u16>) -> Option<&'static str> {
+    match code_page {
+        Some(1252) => Some("ISO 8859-1"),
+        Some(850) => Some("Code page 850"),
+        Some(437) => Some("Code page 437"),
+        _ => None,
+    }
+}
+
 const ODBC_LIBRARY_NAME: &str = "ODBC";
 const ODBC_USER_AGENT_LIBRARY_NAME: &str = "MS-ODBCRS";
 const ODBC_DRIVER_VERSION_STRING: &str = env!("CARGO_PKG_VERSION");
@@ -503,9 +515,14 @@ fn do_connect(
             .unwrap_or(params.server.as_str())
             .to_string(),
         user_name: params.uid.clone(),
-        // The login character-set name, surfaced as `SQL_COLLATION_SEQ`. Empty
-        // for a server that reports a `SQL_COLLATION` change instead.
-        collation_seq: client.char_set().unwrap_or_default().to_string(),
+        // `SQL_COLLATION_SEQ`: msodbcsql names three server code pages derived
+        // from the collation and leaves the rest empty; a legacy
+        // `CHARACTER_SET` `ENVCHANGE` name is the fallback when the collation
+        // maps to none of them.
+        collation_seq: collation_seq_name(client.collation_code_page())
+            .map(str::to_string)
+            .or_else(|| client.char_set().map(str::to_string))
+            .unwrap_or_default(),
     };
     // Published here (not right after resolving it above) for the same
     // failed-connect reason as the other fields in this block: kept separate
@@ -656,6 +673,16 @@ mod tests {
         assert_eq!(initial_database("", Some("attribute_db")), "attribute_db");
         assert_eq!(initial_database("", Some("")), "");
         assert_eq!(initial_database("", None), "");
+    }
+
+    #[test]
+    fn collation_seq_name_maps_only_the_three_named_code_pages() {
+        assert_eq!(collation_seq_name(Some(1252)), Some("ISO 8859-1"));
+        assert_eq!(collation_seq_name(Some(850)), Some("Code page 850"));
+        assert_eq!(collation_seq_name(Some(437)), Some("Code page 437"));
+        assert_eq!(collation_seq_name(Some(1251)), None);
+        assert_eq!(collation_seq_name(Some(65001)), None);
+        assert_eq!(collation_seq_name(None), None);
     }
 
     #[test]

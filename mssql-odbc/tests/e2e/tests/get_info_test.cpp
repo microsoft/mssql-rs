@@ -652,15 +652,38 @@ TEST_F(GetInfoLiveTest, WorkItem47996StringValuesMatchMsodbcsql) {
     }
 }
 
-// AB#47996: `SQL_COLLATION_SEQ` is the login character-set name. Modern servers
-// send a `SQL_COLLATION` change and no character-set name, so the value is
-// commonly empty; only the success contract is pinned here.
-TEST_F(GetInfoLiveTest, WorkItem47996CollationSeqSucceeds) {
+// AB#47996: `SQL_COLLATION_SEQ` names three server code pages (1252, 850, 437)
+// derived from the database collation and is empty for every other. Expected is
+// computed from the connected database's code page so the assertion holds on
+// any server collation, and the compare leg pins it against retail.
+TEST_F(GetInfoLiveTest, WorkItem47996CollationSeqMatchesServerCodePage) {
+    SQLHSTMT stmt = SQL_NULL_HANDLE;
+    ASSERT_EQ(SQL_SUCCESS, SQLAllocHandle(SQL_HANDLE_STMT, dbc_, &stmt));
+    const SqlTString query = ODBCTestUtils::ToSqlTStr(
+        "SELECT COLLATIONPROPERTY(CAST(DATABASEPROPERTYEX(DB_NAME(),'Collation')"
+        " AS nvarchar(128)),'CodePage')");
+    ASSERT_EQ(SQL_SUCCESS,
+              SQLExecDirect(stmt, const_cast<SQLTCHAR*>(query.c_str()), SQL_NTS));
+    ASSERT_EQ(SQL_SUCCESS, SQLFetch(stmt));
+    SQLINTEGER codePage = 0;
+    SQLLEN ind = 0;
+    ASSERT_TRUE(SQL_SUCCEEDED(SQLGetData(stmt, 1, SQL_C_SLONG, &codePage,
+                                         sizeof(codePage), &ind)));
+    SQLFreeHandle(SQL_HANDLE_STMT, stmt);
+
+    const char* expected = "";
+    if (codePage == 1252) {
+        expected = "ISO 8859-1";
+    } else if (codePage == 850) {
+        expected = "Code page 850";
+    } else if (codePage == 437) {
+        expected = "Code page 437";
+    }
+
     SQLRETURN rc = SQL_ERROR;
     SQLSMALLINT len = -1;
-    GetInfoString(dbc_, SQL_COLLATION_SEQ, &rc, &len);
+    EXPECT_EQ(expected, GetInfoString(dbc_, SQL_COLLATION_SEQ, &rc, &len));
     EXPECT_EQ(SQL_SUCCESS, rc);
-    EXPECT_GE(len, 0);
 }
 
 TEST_F(GetInfoLiveTest, DatabaseNameMatchesCurrentCatalog) {

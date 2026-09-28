@@ -39,12 +39,6 @@ verified reason:
   the exact band constants are internal to the msodbcsql build and not in any
   published header, and no in-scope information type falls in the band, so the
   `HY096` fallthrough is correct for everything AB#47996 covers.
-- `SQL_COLLATION_SEQ` reports the login `CHARACTER_SET` `ENVCHANGE` name and is
-  empty when the server sends a `SQL_COLLATION` change instead (the modern
-  default). msodbcsql additionally derives a code-page display name from the
-  negotiated collation (`CodePageFromTDSCollation`, `sqlctokn.cpp`) in that
-  case; matching that exact string is deferred pending a retail measurement so a
-  wrong name is not shipped. Tracked under AB#47996.
 
 ## Compatibility evidence
 
