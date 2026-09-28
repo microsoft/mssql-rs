@@ -3199,8 +3199,9 @@ impl TdsClient {
         // every exit below then carries it. Rows streamed before a mid-batch
         // failure can already have been applied — a bulk copy with no internal
         // transaction commits as it streams — so a substitution among them is
-        // real, and `BulkCopy::write_to_server` drains this in its `Err` arm to
-        // fold into the operation's verdict. Reading it now also ends the
+        // real, and `BulkCopy::write_to_server_zerocopy` drains this in its
+        // `Err` arm to fold into the operation's verdict. Reading it now also
+        // ends the
         // writer's borrow of the transport before either exit needs `&mut self`,
         // and `end` writes only the DONE token, so nothing can be substituted
         // between here and the return.
@@ -7823,12 +7824,16 @@ impl TdsClient {
 
     /// Replaces the substitution verdict outright.
     ///
-    /// For a caller that spans several messages and has to report one answer for
-    /// all of them — `BulkCopy::write_to_server`, which drains the flag after
-    /// each batch so one batch's verdict cannot overwrite another's, then
-    /// restores the accumulated result here. Mirrors how it restores
-    /// [`extend_info_messages`](Self::extend_info_messages) over the same span.
-    pub fn set_code_page_conversion_loss(&mut self, had_loss: bool) {
+    /// In-crate only, and deliberately so: it lets the caller assert a verdict
+    /// for a message it did not serialize, which is safe exactly once — inside
+    /// [`BulkCopy::write_to_server_zerocopy`](crate::connection::bulk_copy::BulkCopy::write_to_server_zerocopy),
+    /// which drains the flag after each batch so one batch's verdict cannot
+    /// overwrite another's, then restores the accumulated result here. Mirrors
+    /// how it restores [`extend_info_messages`](Self::extend_info_messages) over
+    /// the same span. External callers get
+    /// [`note_code_page_conversion_loss`](Self::note_code_page_conversion_loss),
+    /// which can only ever set the flag.
+    pub(crate) fn set_code_page_conversion_loss(&mut self, had_loss: bool) {
         self.code_page_conversion_loss = had_loss;
     }
 

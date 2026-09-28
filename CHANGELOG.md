@@ -171,7 +171,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
   New `mssql_tds::datatypes::sql_string::NarrowEncoded` (returned by the now
   loss-reporting `encode_narrow`), `TdsClient::take_code_page_conversion_loss` /
-  `note_code_page_conversion_loss` / `set_code_page_conversion_loss`, and
+  `note_code_page_conversion_loss`, and
   `StreamingBulkLoadWriter::code_page_conversion_loss`.
 
 - `mssql-odbc`: NULL values returned through `SQLGetData`, bound columns, and

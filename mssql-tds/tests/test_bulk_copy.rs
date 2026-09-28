@@ -727,7 +727,8 @@ mod bulk_copy_integration_tests {
     ///
     /// `batch_size(1)` with two rows forces two
     /// `execute_bulk_load_streaming_zerocopy` calls. Each assigns the verdict
-    /// for its own message, so without `write_to_server`'s per-batch drain and
+    /// for its own message, so without `write_to_server_zerocopy`'s per-batch
+    /// drain and
     /// final restore the clean second batch would erase the first batch's
     /// substitution and this would report `false`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
