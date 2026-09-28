@@ -2324,14 +2324,26 @@ TEST_F(UdtParamLiveTest, AUdtParameterWithoutATypeNameFails) {
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HY000");
 }
 
-// A bounded ColumnSize bounds the payload, measured on both legs. msodbcsql
-// raises 22001 when `cbData > min(cbColDef, SQL_PREC_UDT)`
-// (`sqlcfunc.cpp:2681-2696`); the check is skipped entirely when ColumnSize is
-// SQL_SS_LENGTH_UNLIMITED, so the same payload binds there.
+// A bounded ColumnSize bounds the payload. msodbcsql raises 22001 when
+// `cbData > min(cbColDef, SQL_PREC_UDT)` (`sqlcfunc.cpp:2681-2696`); the check
+// is skipped entirely when ColumnSize is SQL_SS_LENGTH_UNLIMITED, so the same
+// payload binds there.
 //
 // Unlike the varbinary arm above it in the reference, the UDT arm does not
 // call CheckTrailingZeros, so a zero-padded overflow is refused rather than
 // trimmed - asserted here because that is the half most likely to drift.
+//
+// EVIDENCE: source reading only. The reference leg's `22001` is not recorded
+// against a `SQL_DRIVER_VER` and tested build anywhere, and the PR's
+// Validation table predates this case. Asserting it unconditionally is
+// deliberate rather than an oversight: PR validation runs this suite under
+// `--compare-with-msodbcsql`, so a wrong expectation fails the reference leg
+// instead of shipping. What would close it is a `--compare-with-msodbcsql` run
+// on this head with the driver version, server and date recorded here, the way
+// `BinaryVariantPayloadPastTheCeilingIsRefused` does. If that run shows
+// msodbcsql answering something other than `22001`, this is a measured
+// divergence needing the `ODBC_TEST_TARGET` split and a registry entry, not a
+// changed expectation.
 TEST_F(UdtParamLiveTest, AUdtPayloadPastABoundedColumnSizeIsRefused) {
     // A multi-level path: a single-level hierarchyid serializes to one byte,
     // and `ColumnSize = 0` is SQL_SS_LENGTH_UNLIMITED, so there would be no
@@ -2365,15 +2377,21 @@ TEST_F(UdtParamLiveTest, AUdtPayloadPastABoundedColumnSizeIsRefused) {
     EXPECT_EQ(kPath, ExecuteAndReadBack());
 }
 
-// The ColumnSize ceiling, measured on both legs rather than read from source.
-// msodbcsql's CheckSqlPrecScale rejects `> SQL_PREC_UDT` (8000) with HY104
-// (`sqlcdesc.cpp:11790`); this driver's `parameter_column_size_is_valid` has
-// the matching arm. 0 is `SQL_SS_LENGTH_UNLIMITED`, the documented way to bind
-// a UDT larger than the ceiling, so it must stay accepted.
+// The ColumnSize ceiling. msodbcsql's CheckSqlPrecScale rejects
+// `> SQL_PREC_UDT` (8000) with HY104 (`sqlcdesc.cpp:11790`), reached from
+// SQLBindParameter via `CheckSqlPrecScale<TRUE>` (`sqlcdesc.cpp:3038`); this
+// driver's `parameter_column_size_is_valid` has the matching arm. 0 is
+// `SQL_SS_LENGTH_UNLIMITED`, the documented way to bind a UDT larger than the
+// ceiling, so it must stay accepted.
 //
 // The 8000 edge is load-bearing: mssql-python's documented
 // `setinputsizes([(SQL_SS_UDT, 8000, 0)])` sits exactly on it. Literals rather
 // than a driver constant, so the assertion cannot move with the code.
+//
+// EVIDENCE: source reading only, on the same terms as the bounded-payload case
+// above - the `HY104` expected of the reference leg is not recorded against a
+// `SQL_DRIVER_VER` and tested build, and the same `--compare-with-msodbcsql`
+// run would close both.
 TEST_F(UdtParamLiveTest, AUdtColumnSizePastTheCeilingIsRefusedAtBind) {
     std::vector<SQLCHAR> payload = SerializedHierarchyId("/2/");
     ASSERT_FALSE(payload.empty());
