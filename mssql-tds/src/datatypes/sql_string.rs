@@ -155,11 +155,12 @@ pub fn encode_narrow(text: &str, collation: SqlCollation) -> NarrowEncoded {
         return NarrowEncoded::exact(encoded.into_owned());
     }
     // Deliberate double pass: `encoded` holds the numeric-character-reference
-    // expansion (6-9 bytes per unmappable character against 2-4 source, so up
-    // to ~3x the source) and is dropped unread so the value can be re-encoded
-    // one character at a time. Only reached once a substitution is already
-    // happening, on a value already fully resident, so it never taxes the
-    // clean path.
+    // expansion (6-10 bytes per unmappable character -- three punctuation plus
+    // three to seven decimal digits -- against 2-4 UTF-8 source bytes, so up to
+    // 3.5x the source at U+0400-U+07FF, where a four-digit scalar is only two
+    // bytes) and is dropped unread so the value can be re-encoded one character
+    // at a time. Only reached once a substitution is already happening, on a
+    // value already fully resident, so it never taxes the clean path.
     //
     // A true single pass needs `Encoder::encode_from_utf8_without_replacement`
     // — copy representable spans, append `?` on `Unmappable`. `ResolvedEncoding`
