@@ -968,6 +968,54 @@ mod tests {
         assert_eq!(bound.param.c_type, crate::api::odbc_types::SQL_C_BINARY);
     }
 
+    /// The `ColumnSize` bound reaches the application through
+    /// `SQLBindParameter`, not just through the predicate: 8000 binds, 8001 is
+    /// `HY104`, and 0 binds because it is `SQL_SS_LENGTH_UNLIMITED` - the only
+    /// way to send a UDT larger than the ceiling.
+    ///
+    /// Written with literals, not `SQL_PREC_UDT`. The 8000 edge is
+    /// load-bearing rather than incidental: mssql-python's documented
+    /// `setinputsizes([(SQL_SS_UDT, 8000, 0)])` sits exactly on it. Expressing
+    /// the bound in terms of the constant would move the assertion with the
+    /// constant, so shrinking it would silently break that path with the test
+    /// still green - verified by mutation, which is how this test was first
+    /// written and why it is not.
+    #[test]
+    fn udt_column_size_is_bounded_at_bind() {
+        for (column_size, expected) in [
+            (0usize, SQL_SUCCESS),
+            (8000, SQL_SUCCESS),
+            (8001, SQL_ERROR),
+        ] {
+            let h = TestHandles::with_env_dbc_stmt();
+            let mut ind: SqlLen = SQL_NULL_DATA;
+            let ret = unsafe {
+                sql_bind_parameter(
+                    h.stmt,
+                    1,
+                    SQL_PARAM_INPUT,
+                    crate::api::odbc_types::SQL_C_BINARY,
+                    SQL_SS_UDT,
+                    column_size as crate::api::odbc_types::SqlULen,
+                    0,
+                    std::ptr::null_mut(),
+                    0,
+                    &mut ind,
+                )
+            };
+            assert_eq!(ret, expected, "ColumnSize {column_size}");
+            if expected == SQL_ERROR {
+                let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+                let state = stmt.inner.lock().unwrap();
+                assert_eq!(
+                    state.diag_records[0].sql_state,
+                    crate::api::sqlstate::SQLSTATE_HY104,
+                    "ColumnSize {column_size}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn default_c_type_guid_is_accepted_and_stored() {
         let h = TestHandles::with_env_dbc_stmt();

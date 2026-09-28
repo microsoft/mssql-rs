@@ -139,14 +139,15 @@ pub(crate) fn parameter_column_size_is_valid(sql_type: SqlSmallInt, column_size:
         SQL_LONGVARCHAR | SQL_LONGVARBINARY => 1..=SQL_PREC_TEXTIMAGE,
         SQL_WLONGVARCHAR => 1..=SQL_PREC_NTEXT,
         SQL_DECIMAL | SQL_NUMERIC => 1..=SQL_PREC_NUMERIC,
-        // A UDT bounds the size but not the zero: `SQL_PREC_UNLIMITED` is the
-        // `max` spelling here, and every binding this driver accepts today
-        // passes 0. msodbcsql's `case SQL_UDT_MAPPED` rejects only
-        // `> SQL_PREC_UDT` with `IDS_S1_104`, leaving the lower end alone
-        // (`sqlcdesc.cpp:11790`), reached from `SQLBindParameter` via
-        // `CheckSqlPrecScale<TRUE>` (`sqlcdesc.cpp:3038`);
-        // `FixupColumnSizeDecimalDigits` has no UDT arm, so the application's
-        // value arrives unchanged.
+        // A UDT bounds the size but not the zero. Zero is not merely permitted
+        // here the way `varchar(max)` permits it: it is the public
+        // `SQL_SS_LENGTH_UNLIMITED` (`msodbcsql.h:564`), and binding it is the
+        // only way to send a UDT larger than `SQL_PREC_UDT`. msodbcsql's
+        // `case SQL_UDT_MAPPED` rejects only `> SQL_PREC_UDT` with
+        // `IDS_S1_104`, leaving the lower end alone (`sqlcdesc.cpp:11790`),
+        // reached from `SQLBindParameter` via `CheckSqlPrecScale<TRUE>`
+        // (`sqlcdesc.cpp:3038`); `FixupColumnSizeDecimalDigits` has no UDT arm,
+        // so the application's value arrives unchanged.
         SQL_SS_UDT => SQL_PREC_UNLIMITED..=SQL_PREC_UDT,
         _ => return true,
     };
@@ -576,15 +577,14 @@ mod tests {
         assert!(!parameter_column_size_is_valid(SQL_VARCHAR, 8001));
         assert!(parameter_column_size_is_valid(SQL_SS_XML, 4000));
         assert!(!parameter_column_size_is_valid(SQL_SS_XML, 4001));
-        // A UDT bounds the top but keeps 0 as its `max` spelling, matching
-        // msodbcsql's `case SQL_UDT_MAPPED` (`sqlcdesc.cpp:11790`), which tests
-        // only `> SQL_PREC_UDT`.
+        // A UDT bounds the top but keeps 0, which is the public
+        // `SQL_SS_LENGTH_UNLIMITED` and the only way to bind one larger than
+        // `SQL_PREC_UDT`. Matches msodbcsql's `case SQL_UDT_MAPPED`
+        // (`sqlcdesc.cpp:11790`), which tests only `> SQL_PREC_UDT`. Literals,
+        // so the assertion does not move if the constant does.
         assert!(parameter_column_size_is_valid(SQL_SS_UDT, 0));
-        assert!(parameter_column_size_is_valid(SQL_SS_UDT, SQL_PREC_UDT));
-        assert!(!parameter_column_size_is_valid(
-            SQL_SS_UDT,
-            SQL_PREC_UDT + 1
-        ));
+        assert!(parameter_column_size_is_valid(SQL_SS_UDT, 8000));
+        assert!(!parameter_column_size_is_valid(SQL_SS_UDT, 8001));
         assert!(parameter_column_size_is_valid(SQL_DECIMAL, 38));
         assert!(!parameter_column_size_is_valid(SQL_DECIMAL, 39));
         // The `long` variants bound at the `text`/`ntext` sizes, and `ntext` is

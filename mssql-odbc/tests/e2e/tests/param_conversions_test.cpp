@@ -2324,6 +2324,39 @@ TEST_F(UdtParamLiveTest, AUdtParameterWithoutATypeNameFails) {
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HY000");
 }
 
+// The ColumnSize ceiling, measured on both legs rather than read from source.
+// msodbcsql's CheckSqlPrecScale rejects `> SQL_PREC_UDT` (8000) with HY104
+// (`sqlcdesc.cpp:11790`); this driver's `parameter_column_size_is_valid` has
+// the matching arm. 0 is `SQL_SS_LENGTH_UNLIMITED`, the documented way to bind
+// a UDT larger than the ceiling, so it must stay accepted.
+//
+// The 8000 edge is load-bearing: mssql-python's documented
+// `setinputsizes([(SQL_SS_UDT, 8000, 0)])` sits exactly on it. Literals rather
+// than a driver constant, so the assertion cannot move with the code.
+TEST_F(UdtParamLiveTest, AUdtColumnSizePastTheCeilingIsRefusedAtBind) {
+    std::vector<SQLCHAR> payload = SerializedHierarchyId("/2/");
+    ASSERT_FALSE(payload.empty());
+    indicator_ = static_cast<SQLLEN>(payload.size());
+
+    struct Case {
+        SQLULEN column_size;
+        bool accepted;
+    };
+    for (const Case& c : {Case{0, true}, Case{8000, true}, Case{8001, false}}) {
+        ASSERT_SQL_OK(Prepare("SELECT CAST(? AS hierarchyid).ToString()"), SQL_HANDLE_STMT, stmt_);
+        SQLRETURN rc =
+            SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_BINARY, SQL_SS_UDT, c.column_size, 0,
+                             payload.data(), indicator_, &indicator_);
+        if (c.accepted) {
+            EXPECT_TRUE(SQL_SUCCEEDED(rc)) << "ColumnSize " << c.column_size << " should bind";
+        } else {
+            EXPECT_EQ(SQL_ERROR, rc) << "ColumnSize " << c.column_size << " should be refused";
+            EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HY104");
+        }
+        EXPECT_SQL_OK(SQLFreeStmt(stmt_, SQL_RESET_PARAMS), SQL_HANDLE_STMT, stmt_);
+    }
+}
+
 // A name the driver auto-filled belongs to the SQL it was described from, not
 // to the binding. Re-preparing different text and binding without describing
 // again must therefore fail exactly as if no describe had ever run - silently
