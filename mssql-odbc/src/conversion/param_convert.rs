@@ -416,6 +416,12 @@ unsafe fn bound_param_to_value_with_outcome(
         // zero-only overflow (`sqlcfunc.cpp:2606-2616`), the behaviour this
         // driver mirrors in `trim_zero_overflow`. The UDT arm has no such call,
         // so trimming here would accept a payload msodbcsql refuses.
+        //
+        // The data-at-execution path does the opposite and that is correct:
+        // `ValidatePutDataLength` routes a UDT through `IsSQLBinary`
+        // (`sqlcprot.h:1294`) and does trim there (`sqlccmd.cpp:11192-11215`).
+        // msodbcsql is asymmetric between its two paths, so `dae_length_limit`
+        // is too rather than being made to agree with this arm.
         (AppValue::Binary(bytes), SqlFamily::Udt) => {
             if param.column_size != SQL_PREC_UNLIMITED
                 && bytes.len() > param.column_size.min(SQL_PREC_UDT)
@@ -492,15 +498,16 @@ pub(crate) struct DaeLengthLimit {
     bound: DaeBound,
     /// One unit of padding whose overflow is dropped rather than reported:
     /// `0x00` for binary, a blank for character, in the buffer's own encoding.
-    pad_unit: &'static [u8],
-    /// Whether an all-padding overflow is trimmed away instead of reported.
     ///
-    /// True for every character and binary declaration, mirroring
-    /// `CheckTrailingZeros` and its character sibling. False for a UDT: the
-    /// reference's `SQL_UDT_MAPPED` arm has no such call
-    /// (`sqlcfunc.cpp:2681-2696` against the `varbinary` arm at `:2606-2616`),
-    /// so a zero-padded overflow is `22001` there rather than trimmed.
-    trims_padding: bool,
+    /// A UDT trims here even though the materialized path refuses: msodbcsql
+    /// is itself asymmetric between the two. `ValidatePutDataLength`'s
+    /// `SQL_C_BINARY` arm tests `IsSQLBinary`, which includes `SQL_UDT_MAPPED`
+    /// (`sqlcprot.h:1294`), and trims a zero-only overflow via
+    /// `CheckTrailingZeros` (`sqlccmd.cpp:11192-11215`) - where
+    /// `ParamToSQLType`'s `SQL_UDT_MAPPED` arm has no such call
+    /// (`sqlcfunc.cpp:2681-2696`). Source reading only; a retail measurement
+    /// recording `SQL_DRIVER_VER` would close it.
+    pad_unit: &'static [u8],
 }
 
 impl DaeLengthLimit {
@@ -618,11 +625,8 @@ impl DaeLengthLimit {
         };
 
         // The overflow is now a whole number of units, so padding is recognised
-        // by comparison alone - where padding is forgiven at all.
+        // by comparison alone.
         let overflow = &chunk[split..];
-        if !self.trims_padding && !overflow.is_empty() {
-            return Err(ParamBuildError::StringTruncation);
-        }
         if !overflow.chunks(unit).all(|unit| unit == self.pad_unit) {
             return Err(ParamBuildError::StringTruncation);
         }
@@ -721,7 +725,6 @@ pub(crate) fn dae_length_limit(
             _ => DaeBound::Bytes(units.saturating_mul(unit_bytes)),
         },
         pad_unit,
-        trims_padding: sql_type != SQL_SS_UDT,
     }))
 }
 
@@ -4544,7 +4547,6 @@ mod tests {
                 Some(DaeLengthLimit {
                     bound: DaeBound::Utf16Units(10),
                     pad_unit: b" ",
-                    trims_padding: true,
                 }),
                 "SQL_C_CHAR -> {sql_type} bounds 10 UTF-16 units of UTF-8"
             );
@@ -4558,7 +4560,6 @@ mod tests {
                 Some(DaeLengthLimit {
                     bound: DaeBound::Bytes(20),
                     pad_unit: &[b' ', 0],
-                    trims_padding: true,
                 }),
                 "SQL_C_WCHAR -> {sql_type} bounds 10 units as 20 buffer bytes"
             );
@@ -4589,12 +4590,13 @@ mod tests {
     /// unmeasured: a bounded UDT could accumulate without limit across
     /// `SQLPutData` calls and only learn of the overflow at `SQLParamData`.
     ///
-    /// The overflow is a hard reject even when it is all zeros, unlike the
-    /// `varbinary` sibling directly below: msodbcsql's `SQL_UDT_MAPPED` arm has
-    /// no `CheckTrailingZeros` call (`sqlcfunc.cpp:2681-2696` against
-    /// `:2606-2616`), so trimming here would accept a payload it refuses.
+    /// A zero-only overflow is *trimmed* here, unlike the materialized path,
+    /// because msodbcsql is asymmetric between the two: `ValidatePutDataLength`
+    /// routes a UDT through its `IsSQLBinary` arm and calls
+    /// `CheckTrailingZeros` (`sqlccmd.cpp:11192-11215`), where `ParamToSQLType`
+    /// has no such call for `SQL_UDT_MAPPED` (`sqlcfunc.cpp:2681-2696`).
     #[test]
-    fn dae_limit_measures_a_bounded_udt_and_rejects_its_padding() {
+    fn dae_limit_measures_a_bounded_udt() {
         let limit = dae_length_limit(SQL_C_BINARY, SQL_SS_UDT, 3)
             .unwrap()
             .expect("a bounded UDT must be measurable per chunk");
@@ -4607,11 +4609,8 @@ mod tests {
             limit.fit(&[1, 2, 3, 4], 0).unwrap_err(),
             ParamBuildError::StringTruncation
         );
-        // Zero padding past it is refused too - the UDT-specific half.
-        assert_eq!(
-            limit.fit(&[1, 2, 3, 0], 0).unwrap_err(),
-            ParamBuildError::StringTruncation
-        );
+        // Zero padding past it is trimmed, matching the reference's DAE arm.
+        assert_eq!(limit.fit(&[1, 2, 3, 0], 0).unwrap().0, &[1, 2, 3]);
         // The bound is against the accumulated total, not the chunk alone.
         assert_eq!(
             limit.fit(&[4], 3).unwrap_err(),
