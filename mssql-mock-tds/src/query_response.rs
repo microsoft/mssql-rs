@@ -399,9 +399,14 @@ impl QueryRegistry {
     }
 
     /// Register a query response
+    ///
+    /// Replaces any previous registration for `query`, including trailing info
+    /// tokens set by [`register_with_trailing_info`](Self::register_with_trailing_info):
+    /// leaving those behind would pair a new response with the old warnings.
     pub fn register(&mut self, query: impl Into<String>, response: QueryResponse) {
         let query = query.into().to_uppercase();
-        self.responses.insert(query, response);
+        self.responses.insert(query.clone(), response);
+        self.trailing_info.remove(&query);
     }
 
     /// Register a query response whose info tokens are emitted *after* the
@@ -413,6 +418,9 @@ impl QueryRegistry {
     ///
     /// Held here rather than on [`QueryResponse`] so that adding it cannot
     /// invalidate an existing `QueryResponse` struct literal.
+    ///
+    /// Like [`register`](Self::register), this replaces any previous
+    /// registration for `query`.
     pub fn register_with_trailing_info(
         &mut self,
         query: impl Into<String>,
@@ -420,8 +428,10 @@ impl QueryRegistry {
         trailing_info: Vec<InfoMessage>,
     ) {
         let query = query.into().to_uppercase();
-        self.responses.insert(query.clone(), response);
-        self.trailing_info.insert(query, trailing_info);
+        self.register(query.clone(), response);
+        if !trailing_info.is_empty() {
+            self.trailing_info.insert(query, trailing_info);
+        }
     }
 
     /// Get a response for a query
@@ -545,5 +555,48 @@ mod tests {
             .expect("registered query response should be available");
         assert_eq!(resp.columns.len(), 1);
         assert_eq!(resp.rows.len(), 1);
+    }
+
+    /// `register` replaces a previous registration, so it has to drop that
+    /// key's trailing info too. Otherwise a plain re-registration silently
+    /// inherits the earlier warnings and the mock emits them after a response
+    /// that never asked for them.
+    #[test]
+    fn plain_register_clears_trailing_info_from_a_previous_registration() {
+        let mut registry = QueryRegistry::new();
+        registry.register_with_trailing_info(
+            "SELECT trailing",
+            QueryResponse::select_one(),
+            vec![InfoMessage::new(8153, 10, "aggregate warning")],
+        );
+        assert_eq!(registry.trailing_info("SELECT trailing").len(), 1);
+
+        registry.register("SELECT trailing", QueryResponse::select_one());
+
+        assert!(
+            registry.trailing_info("SELECT trailing").is_empty(),
+            "the replacing response must not inherit the old warnings"
+        );
+    }
+
+    /// The same key re-registered with new trailing info must carry only the
+    /// new messages, not both sets.
+    #[test]
+    fn re_registering_trailing_info_replaces_rather_than_accumulates() {
+        let mut registry = QueryRegistry::new();
+        registry.register_with_trailing_info(
+            "SELECT trailing",
+            QueryResponse::select_one(),
+            vec![InfoMessage::new(8153, 10, "first")],
+        );
+        registry.register_with_trailing_info(
+            "SELECT trailing",
+            QueryResponse::select_one(),
+            vec![InfoMessage::new(8154, 10, "second")],
+        );
+
+        let trailing = registry.trailing_info("SELECT trailing");
+        assert_eq!(trailing.len(), 1);
+        assert_eq!(trailing[0].number, 8154);
     }
 }
