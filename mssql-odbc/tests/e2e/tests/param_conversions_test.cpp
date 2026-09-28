@@ -1284,6 +1284,8 @@ TEST_F(ScalarConversionLiveTest, CharDateOnlyLiteralFillsATimestampAtMidnight) {
     EXPECT_EQ("2024-05-20 00:00:00.0000000", ExecuteAndReadBack());
 }
 
+// Benefits-from-mock-tds: capture temporal TYPE_INFO and encoded payloads
+// for narrow/wide parameters rather than only server-rendered values.
 TEST_F(ScalarConversionLiveTest, OdbcTemporalLiteralsRoundTrip) {
     SQLCHAR version[32] = {};
     ASSERT_SQL_OK(SQLGetInfoA(dbc_, SQL_DRIVER_VER, version, sizeof(version), nullptr),
@@ -1332,6 +1334,8 @@ TEST_F(ScalarConversionLiveTest, OdbcTemporalLiteralsRoundTrip) {
     }
 }
 
+// Benefits-from-mock-tds: verify malformed literals are rejected before
+// any temporal parameter payload is sent, not just the returned SQLSTATE.
 TEST_F(ScalarConversionLiveTest, MalformedOdbcTemporalLiteralsAre22018) {
     SQLCHAR version[32] = {};
     ASSERT_SQL_OK(SQLGetInfoA(dbc_, SQL_DRIVER_VER, version, sizeof(version), nullptr),

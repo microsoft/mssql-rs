@@ -277,6 +277,8 @@ protected:
     }
 };
 
+// Benefits-from-mock-tds: supply exact regular/PLP varchar and nvarchar
+// metadata and payloads without relying on SQL Server casts.
 TEST_F(GetDataLiveTest, OdbcTemporalLiteralsFromCharacterColumns) {
     SQLCHAR version[32] = {};
     ASSERT_SQL_OK(SQLGetInfoA(dbc_, SQL_DRIVER_VER, version, sizeof(version), nullptr),
