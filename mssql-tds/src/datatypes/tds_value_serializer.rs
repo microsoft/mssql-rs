@@ -1620,7 +1620,10 @@ impl TdsValueSerializer {
                 let (encoded, _encoding_used, had_errors) = encoding.encode(text);
                 if had_errors {
                     // Same deliberate double pass as `encode_narrow`, and for
-                    // the same reason — see the comment there.
+                    // the same reason — see the comment there, including why
+                    // the expansion is dropped before the second pass allocates
+                    // rather than at end of scope.
+                    drop(encoded);
                     return NarrowEncoded {
                         bytes: substitute_unmappable(text, encoding.into()),
                         had_loss: true,

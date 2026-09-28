@@ -159,9 +159,10 @@ pub fn encode_narrow(text: &str, collation: SqlCollation) -> NarrowEncoded {
     // expansion (6-10 bytes per unmappable character -- three punctuation plus
     // three to seven decimal digits -- against 2-4 UTF-8 source bytes, so up to
     // 3.5x the source at U+0400-U+07FF, where a four-digit scalar is only two
-    // bytes) and is dropped unread so the value can be re-encoded one character
-    // at a time. Only reached once a substitution is already happening, on a
-    // value already fully resident, so it never taxes the clean path.
+    // bytes) and is discarded unread so the value can be re-encoded one
+    // character at a time. Only reached once a substitution is already
+    // happening, on a value already fully resident, so it never taxes the clean
+    // path.
     //
     // A true single pass needs `Encoder::encode_from_utf8_without_replacement`
     // — copy representable spans, append `?` on `Unmappable`. `ResolvedEncoding`
@@ -170,6 +171,12 @@ pub fn encode_narrow(text: &str, collation: SqlCollation) -> NarrowEncoded {
     // table-backed codec with no `encoding_rs` `Encoder` at all. So it means
     // adding an incremental encoder to `ResolvedEncoding` and implementing it
     // twice, not a local rewrite.
+    //
+    // Dropped explicitly rather than at end of scope: NLL governs borrows, not
+    // drop timing, so without this the expansion would still be live while
+    // `substitute_unmappable` allocates the replacement, holding both buffers
+    // at once on the one path that already amplifies its input.
+    drop(encoded);
     NarrowEncoded {
         bytes: substitute_unmappable(text, encoding_used),
         had_loss: true,
