@@ -89,9 +89,7 @@ fn auth_method_to_str(auth_method: &TdsAuthenticationMethod) -> &'static str {
         }
         TdsAuthenticationMethod::ActiveDirectoryAzurePipelines => "activedirectoryazurepipelines",
         TdsAuthenticationMethod::ActiveDirectoryEnvironment => "activedirectoryenvironment",
-        TdsAuthenticationMethod::ActiveDirectoryClientAssertion => {
-            "activedirectoryclientassertion"
-        }
+        TdsAuthenticationMethod::ActiveDirectoryClientAssertion => "activedirectoryclientassertion",
         TdsAuthenticationMethod::Password => "password",
         TdsAuthenticationMethod::SSPI => "sspi",
         TdsAuthenticationMethod::AccessToken => "accesstoken",
