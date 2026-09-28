@@ -193,9 +193,12 @@ read `diagnostics.errors` (and, new, `diagnostics.info_messages`).
 - These entry points drain `client.take_info_messages()` and post them, and
   return `SQL_SUCCESS_WITH_INFO` when informational records were posted on an
   otherwise successful call:
-  `SQLDriverConnectW`, `SQLExecDirectW`, `SQLFetch` / `SQLFetchScroll`,
-  `SQLGetData` (on the terminal column, see below), `SQLMoreResults`,
-  `SQLCloseCursor` / `SQLFreeStmt(SQL_CLOSE)`.
+  `SQLDriverConnectW`, `SQLExecDirectW`, `SQLExecute`,
+  `SQLFetch` / `SQLFetchScroll`, `SQLGetData` (on the terminal column, see
+  below), `SQLMoreResults`, `SQLCloseCursor` / `SQLFreeStmt(SQL_CLOSE)`,
+  `SQLDescribeParam`, and `SQLSetConnectAttr(SQL_ATTR_CURRENT_CATALOG)`.
+  `grep -rn take_info_messages mssql-odbc/src` is the authority if this list
+  falls behind the code.
 - **Terminal INFO is posted by the call that consumed it** (revised by
   [AB#48821](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/48821);
   this section previously specified deferring it to the next boundary call).
