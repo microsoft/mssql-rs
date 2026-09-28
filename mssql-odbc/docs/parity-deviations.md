@@ -569,27 +569,3 @@ msodbcsql build is measured.
     covered by unit tests and shares `variant_column_size`, but no comparison
     run records msodbcsql's SQLSTATE for an oversized character `sql_variant`;
     do not infer that half from this entry.
-
-21. **`SQLGetDescField` on the IRD refuses the `SQL_CA_SS_UDT_*` fields.**
-    msodbcsql serves all four for a result column through that route:
-    `SQLGetDescFieldW`'s default arm dispatches `SQL_HANDLE_IRD` to
-    `GetIRDField` with `fSQLGETDESCFIELD` (`sqlcdesc.cpp:2390`), and
-    `GetIRDField` answers the UDT name parts from the column's name pool
-    (`sqlcdesc.cpp:6844-6880`) with no gate distinguishing that caller from
-    `SQLColAttribute`. This driver's `classify_field` returns `None` for
-    `DescKind::ImpRow`, so the same call answers `HY091`.
-    This is a gap rather than a choice: the data is already present and this
-    driver exposes it through `SQLColAttribute`
-    (`col_attribute.rs:286-309`), which reads the same four parts out of
-    `COLMETADATA`'s `UDT_INFO`. Only the descriptor-field route to it is
-    missing, so the two ODBC views of one record field disagree.
-    It predates the UDT parameter work: before it these fields were absent
-    from `classify_field` for every kind, so the IRD read was already refused.
-    Wiring it up is result-column work rather than parameter work, and
-    `udt_name_fields_are_writable_on_ipd_only` pins the current behavior so
-    opening the route is a deliberate edit rather than a silent one.
-    **Evidence limit:** source reading only. No comparison run records what
-    msodbcsql returns from `SQLGetDescField(IRD, SQL_CA_SS_UDT_TYPE_NAME)`,
-    and the reference's write side was read separately
-    (`sqlcdesc.cpp:4891-4957`) and is not evidence for the read side. Closing
-    this needs a both-leg case over a result column of UDT type.

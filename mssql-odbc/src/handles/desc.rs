@@ -1027,12 +1027,21 @@ mod tests {
     /// way to a result column's UDT identity, answering all four parts out of
     /// `COLMETADATA`'s `UDT_INFO` (`col_attribute.rs:286-309`).
     ///
-    /// Whether refusing the IRD read matches msodbcsql is now answered, and it
-    /// does not: the reference serves all four through that route
-    /// (`sqlcdesc.cpp:2390` dispatches to `GetIRDField`, which answers them at
-    /// `:6844-6880`). Recorded as parity deviation 21. The `sqlcdesc.cpp`
-    /// citation below covers the IPD write side only. Opening the route later
-    /// fails this assertion by design.
+    /// GAP, not a deliberate deviation - msodbcsql *does* serve that route.
+    /// `SQLGetDescFieldW`'s default arm dispatches `SQL_HANDLE_IRD` to
+    /// `GetIRDField` with `fSQLGETDESCFIELD` (`sqlcdesc.cpp:2390`), which
+    /// answers the UDT name parts from the column's name pool
+    /// (`sqlcdesc.cpp:6844-6880`); no gate there separates that caller from
+    /// `SQLColAttribute`. Source reading only - no comparison run measures it,
+    /// and the `sqlcdesc.cpp:4891-4957` citation below covers the IPD *write*
+    /// side, which is not evidence for the read side.
+    ///
+    /// The gap predates the UDT parameter work: these fields were absent from
+    /// `classify_field` for every kind before it, so the IRD read was already
+    /// refused. Wiring it up is result-column work. This assertion pins the
+    /// current behavior, so opening the route is a deliberate edit rather than
+    /// a silent one. NEEDS A WORK ITEM - see the reply on this PR's
+    /// `parity-deviations.md` thread.
     ///
     /// All four parts are writable, matching msodbcsql
     /// (`sqlcdesc.cpp:4891-4957`), even though only the first three reach the
