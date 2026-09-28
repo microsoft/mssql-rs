@@ -1337,21 +1337,37 @@ TEST_F(ScalarConversionLiveTest, MalformedOdbcTemporalLiteralsAre22018) {
     ASSERT_SQL_OK(SQLGetInfoA(dbc_, SQL_DRIVER_VER, version, sizeof(version), nullptr),
                   SQL_HANDLE_DBC, dbc_);
     RecordProperty("driver_version", reinterpret_cast<const char*>(version));
-    for (const char* literal : {
-             "2024/05-20", "2024/5/20", "2024/05/20 12:34:56", "2023/02/29",
-             "{d '2024/05/20'}", "{d '2024-05-20 12:34:56'}", "{t '2024-05-20'}",
-             "{ts '2024-05-20'}", "{d '2024-5-20'}", "{t '12:34'}", "{t '12:34:56.1'}",
-             "{ts '2024-05-20T12:34:56'}", "{ts '2024-05-20 12:34:56+05:30'}",
-             "{ts '2024-05-20 12:34:56.1234567890'}", "{d '2024-05-20'} junk",
-             "{ts '2024-05-2012:34:56'}",
-             "{d '2024-05-20'", "{d '2023-02-29'}", "{t '24:00:00'}",
+    struct Case {
+        SQLSMALLINT sql_type;
+        const char* literal;
+    };
+    for (const Case& value : {
+             Case{SQL_TYPE_DATE, "2024/05-20"},
+             Case{SQL_TYPE_DATE, "2024/5/20"},
+             Case{SQL_TYPE_DATE, "2024/05/20 12:34:56"},
+             Case{SQL_TYPE_DATE, "2023/02/29"},
+             Case{SQL_TYPE_DATE, "{d '2024/05/20'}"},
+             Case{SQL_TYPE_DATE, "{d '2024-05-20 12:34:56'}"},
+             Case{SQL_TYPE_TIME, "{t '2024-05-20'}"},
+             Case{SQL_TYPE_TIMESTAMP, "{ts '2024-05-20'}"},
+             Case{SQL_TYPE_DATE, "{d '2024-5-20'}"},
+             Case{SQL_TYPE_TIME, "{t '12:34'}"},
+             Case{SQL_TYPE_TIME, "{t '12:34:56.1'}"},
+             Case{SQL_TYPE_TIMESTAMP, "{ts '2024-05-20T12:34:56'}"},
+             Case{SQL_TYPE_TIMESTAMP, "{ts '2024-05-20 12:34:56+05:30'}"},
+             Case{SQL_TYPE_TIMESTAMP, "{ts '2024-05-20 12:34:56.1234567890'}"},
+             Case{SQL_TYPE_DATE, "{d '2024-05-20'} junk"},
+             Case{SQL_TYPE_TIMESTAMP, "{ts '2024-05-2012:34:56'}"},
+             Case{SQL_TYPE_DATE, "{d '2024-05-20'"},
+             Case{SQL_TYPE_DATE, "{d '2023-02-29'}"},
+             Case{SQL_TYPE_TIME, "{t '24:00:00'}"},
          }) {
         for (bool wide : {false, true}) {
-            SCOPED_TRACE(literal);
+            SCOPED_TRACE(value.literal);
             SCOPED_TRACE(wide);
             ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
-            ASSERT_SQL_OK(wide ? BindWide(SQL_TYPE_TIMESTAMP, literal, 0, 7)
-                               : BindNarrow(SQL_TYPE_TIMESTAMP, literal, 0, 7),
+            ASSERT_SQL_OK(wide ? BindWide(value.sql_type, value.literal, 0, 7)
+                               : BindNarrow(value.sql_type, value.literal, 0, 7),
                           SQL_HANDLE_STMT, stmt_);
             EXPECT_EQ(SQL_ERROR, SQLExecute(stmt_));
             EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "22018");
