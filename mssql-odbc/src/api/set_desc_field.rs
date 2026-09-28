@@ -14,11 +14,8 @@
 //! `SQLSetStmtAttrW` (`set_stmt_attr.rs`) and confirmed against msodbcsql's
 //! `SetADHeaderField` (`(SIZE_T)Value`, `sqlcdesc.cpp:4129-4149`).
 //!
-//! Unlike `SQLBindCol`/`SQLFreeStmt(SQL_UNBIND)`/`SQLSetStmtAttr`, this
-//! entry point does not check `STMT_STATE_FETCH_IN_PROGRESS` before writing
-//! `SQL_DESC_DATA_PTR`/`SQL_DESC_OCTET_LENGTH`/`SQL_DESC_CONCISE_TYPE` on an
-//! ARD/APD record a fetch may still be reading through — a known, deferred
-//! gap tracked in [#472](https://github.com/microsoft/mssql-rs/issues/472).
+//! Like `SQLBindCol`, a write to an ARD that a fetch is reading through fails
+//! with HY010; see [`DescHandle::update_definition`].
 
 use std::mem::size_of;
 use std::sync::Arc;
@@ -470,11 +467,7 @@ pub(super) fn set_type(
         if is_application_desc {
             r.data_ptr = std::ptr::null_mut();
             r.data_bound = false;
-            r.precision_scale_explicit = false;
-            if resolved == SQL_C_NUMERIC {
-                r.precision = SQL_PREC_NUMERIC;
-                r.scale = 0;
-            }
+            r.apply_app_type_defaults(resolved);
         }
         r.explicitly_bound = true;
     })
@@ -543,7 +536,6 @@ pub(super) fn set_precision(
 
     write_record_field(state, record_number, |r| {
         r.precision = precision;
-        r.precision_scale_explicit = true;
         r.explicitly_bound = true;
     })
 }
@@ -590,7 +582,6 @@ pub(super) fn set_scale(
 
     write_record_field(state, record_number, |r| {
         r.scale = scale;
-        r.precision_scale_explicit = true;
         r.explicitly_bound = true;
     })
 }
@@ -802,7 +793,9 @@ mod tests {
         SQL_TYPE_DATE, SqlNumericStruct,
     };
     use crate::api::set_stmt_attr::{sql_get_stmt_attr_w, sql_set_stmt_attr_w};
+    use crate::api::sqlstate::ERR_FUNCTION_SEQUENCE;
     use crate::error::diag::DiagRecord;
+    use crate::handles::stmt::STMT_STATE_FETCH_IN_PROGRESS;
     use crate::handles::{DescHandle, handle_from_raw};
     use crate::test_support::TestHandles;
 
@@ -1218,6 +1211,86 @@ mod tests {
         let record = state.record(1).unwrap();
         assert!(record.data_ptr.is_null());
         assert!(!record.data_bound);
+    }
+
+    fn set_fetch_in_progress(h: &TestHandles, on: bool) {
+        let stmt = unsafe { handle_from_raw::<crate::handles::StmtHandle>(h.stmt) };
+        let mut s = stmt.inner.lock().unwrap();
+        if on {
+            s.set_state(STMT_STATE_FETCH_IN_PROGRESS);
+        } else {
+            s.clear_state(STMT_STATE_FETCH_IN_PROGRESS);
+        }
+    }
+
+    fn set_long_type(handle: SqlHandle) -> SqlReturn {
+        unsafe {
+            sql_set_desc_field_w(
+                handle,
+                1,
+                SQL_DESC_TYPE,
+                SQL_C_LONG as isize as SqlPointer,
+                0,
+            )
+        }
+    }
+
+    #[test]
+    fn writes_to_the_implicit_ard_are_refused_while_a_fetch_is_in_progress() {
+        let h = TestHandles::with_env_dbc_stmt();
+        set_fetch_in_progress(&h, true);
+        assert_eq!(set_long_type(h.ard()), SQL_ERROR);
+        assert_last_diag(&desc_diags(h.ard()), ERR_FUNCTION_SEQUENCE);
+        assert_eq!(
+            unsafe {
+                crate::api::set_desc_rec::sql_set_desc_rec(
+                    h.ard(),
+                    1,
+                    SQL_C_LONG,
+                    0,
+                    4,
+                    0,
+                    0,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                )
+            },
+            SQL_ERROR
+        );
+        assert_last_diag(&desc_diags(h.ard()), ERR_FUNCTION_SEQUENCE);
+        assert_eq!(set_long_type(h.apd()), SQL_SUCCESS);
+
+        set_fetch_in_progress(&h, false);
+        assert_eq!(set_long_type(h.ard()), SQL_SUCCESS);
+        assert!(desc_diags(h.ard()).is_empty());
+    }
+
+    #[test]
+    fn writes_to_an_explicit_ard_are_refused_while_a_fetch_is_in_progress() {
+        let mut h = TestHandles::with_env_dbc_stmt();
+        let desc = h.alloc_explicit_desc();
+        assert_eq!(
+            unsafe { sql_set_stmt_attr_w(h.stmt, SQL_ATTR_APP_ROW_DESC, desc as SqlPointer, 0) },
+            SQL_SUCCESS
+        );
+        set_fetch_in_progress(&h, true);
+        assert_eq!(set_long_type(desc), SQL_ERROR);
+        assert_last_diag(&desc_diags(desc), ERR_FUNCTION_SEQUENCE);
+        // The implicit ARD is no longer the one the fetch reads through.
+        assert_eq!(set_long_type(h.ard()), SQL_SUCCESS);
+    }
+
+    #[test]
+    fn an_explicit_descriptor_used_only_as_apd_stays_writable_during_a_fetch() {
+        let mut h = TestHandles::with_env_dbc_stmt();
+        let desc = h.alloc_explicit_desc();
+        assert_eq!(
+            unsafe { sql_set_stmt_attr_w(h.stmt, SQL_ATTR_APP_PARAM_DESC, desc as SqlPointer, 0) },
+            SQL_SUCCESS
+        );
+        set_fetch_in_progress(&h, true);
+        assert_eq!(set_long_type(desc), SQL_SUCCESS);
     }
 
     #[test]

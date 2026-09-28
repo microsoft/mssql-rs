@@ -623,6 +623,9 @@ pub const SQL_C_SS_VECTOR: SqlSmallInt = SQL_C_TYPES_EXTENDED + 2; // 0x4002
 // The 13 ODBC 3.x interval C types occupy a contiguous range, 101..=113, and the
 // matching `SQL_INTERVAL_*` SQL types share those values.
 pub const SQL_C_INTERVAL_YEAR: SqlSmallInt = 101;
+pub const SQL_C_INTERVAL_SECOND: SqlSmallInt = 106;
+pub const SQL_C_INTERVAL_DAY_TO_SECOND: SqlSmallInt = 110;
+pub const SQL_C_INTERVAL_HOUR_TO_SECOND: SqlSmallInt = 112;
 pub const SQL_C_INTERVAL_MINUTE_TO_SECOND: SqlSmallInt = 113;
 // The interval SQL types share the C type values above.
 pub const SQL_INTERVAL_YEAR: SqlSmallInt = 101;

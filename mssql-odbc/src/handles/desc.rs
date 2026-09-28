@@ -64,6 +64,7 @@ use std::ffi::c_void;
 use std::sync::Arc;
 use std::sync::Mutex;
 
+use super::stmt::STMT_STATE_FETCH_IN_PROGRESS;
 use super::{DbcHandle, HandleType, HasObjectType, StmtHandle, handle_from_raw};
 use crate::api::odbc_types::{
     SQL_C_DEFAULT, SQL_CA_SS_UDT_ASSEMBLY_TYPE_NAME, SQL_CA_SS_UDT_CATALOG_NAME,
@@ -76,7 +77,7 @@ use crate::api::odbc_types::{
     SQL_DESC_UNNAMED, SQL_ERROR, SQL_NULLABLE, SQL_PARAM_INPUT, SQL_ROWSET_SIZE_DEFAULT,
     SQL_SUCCESS, SqlInteger, SqlLen, SqlPointer, SqlReturn, SqlSmallInt, SqlULen, SqlUSmallInt,
 };
-use crate::api::sqlstate::SQLSTATE_HY000;
+use crate::api::sqlstate::{ERR_FUNCTION_SEQUENCE, SQLSTATE_HY000, post_diag};
 use crate::error::{DiagRecord, HasDiagnostics, free_errors, post_sql_error};
 use tracing::error;
 
@@ -224,34 +225,6 @@ pub(crate) struct DescRecord {
     /// Whether an application value binding has been established for this
     /// record. Unlike `data_ptr`, this remains true for a null DAE token.
     pub(crate) data_bound: bool,
-    /// APD only: whether the application itself wrote `SQL_DESC_PRECISION`
-    /// and/or `SQL_DESC_SCALE` via `SQLSetDescField`/`SQLSetDescRec`, as
-    /// opposed to this driver's own default-fill (`SQLBindParameter`'s
-    /// `SQL_C_NUMERIC` reset, or a `SQL_DESC_TYPE` write's matching reset —
-    /// see `set_type`). `decimal_from_numeric`'s fast path
-    /// (`sqlcfunc.cpp:3163-3172`) only forwards a `SQL_C_NUMERIC` struct's own
-    /// embedded precision/scale when the APD's precision/scale numerically
-    /// match the IPD's *and* the application chose them explicitly; an APD
-    /// that merely landed on the same values through this driver's own
-    /// `SetTypeDefaults`-equivalent default-fill must not trigger it, or a
-    /// bare `SQLBindParameter` into a same-shaped column would wrongly skip
-    /// the rescale every other source takes. It also gates which *source*
-    /// scale the non-fast-path rescale trusts (`decimal_from_numeric`'s
-    /// slow path): explicit means the APD's own `scale` is authoritative,
-    /// non-explicit falls back to the struct's own embedded scale, since
-    /// that is the only self-description available for a value the app
-    /// never described through the descriptor.
-    ///
-    /// Set to `true` only by `set_precision`/`set_scale` themselves. Reset
-    /// to `false` by a `SQL_DESC_TYPE` write that changes the concise type
-    /// (`set_type`) and by `SQLBindParameter`'s own APD write
-    /// (`write_to_records`) *only when its `ValueType` is changing* —
-    /// mirroring the ODBC spec's `SQLBindParameter` rebind rule that
-    /// rebinding the same `ValueType` retains other APD fields set by a
-    /// prior bind or `SQLSetDescField` call. A same-`SQL_C_NUMERIC` rebind
-    /// therefore keeps this flag from a prior explicit call even though the
-    /// precision/scale *values* still reset to `(SQL_PREC_NUMERIC, 0)`.
-    pub(crate) precision_scale_explicit: bool,
     /// IPD only: set when the application has itself written this record's
     /// type/size (`SQL_DESC_CONCISE_TYPE`/`TYPE`, `DATETIME_INTERVAL_CODE`,
     /// `LENGTH`, `OCTET_LENGTH`, `PRECISION` or `SCALE`) via
@@ -472,11 +445,66 @@ impl DescRecord {
             indicator_ptr: std::ptr::null_mut(),
             octet_length_ptr: std::ptr::null_mut(),
             data_bound: false,
-            precision_scale_explicit: false,
             explicitly_bound: false,
             udt_names: None,
             udt_name_claimed: UdtNameClaims::default(),
         }
+    }
+
+    /// msodbcsql's `SetTypeDefaults` (`sqlcdesc.cpp:12344`) for an
+    /// application descriptor record, applied by `SQLBindCol`,
+    /// `SQLBindParameter` and a `SQL_DESC_TYPE`/`CONCISE_TYPE` write.
+    ///
+    /// Types outside the table keep their current values, as in msodbcsql;
+    /// the bind paths zero the record first (`SetADRec`/`SetADRecBP`), see
+    /// [`Self::reset_app_type_defaults`].
+    ///
+    /// msodbcsql stores `SQL_DESC_LENGTH` and `SQL_DESC_PRECISION` in one
+    /// union (`cbPrecision`/`cbColDef`) and reports the scale as the
+    /// precision for its datetime and interval types (`GetDescField`,
+    /// `sqlcdesc.cpp:2298`). This record keeps the three separately, so the
+    /// table writes the values those getters return. Measured on Driver
+    /// 18.6.2.1 (`SQL_DRIVER_VER` 18.06.0002) on Windows.
+    pub(crate) fn apply_app_type_defaults(&mut self, c_type: SqlSmallInt) {
+        use crate::api::odbc_types::{
+            SQL_C_BINARY, SQL_C_CHAR, SQL_C_FLOAT, SQL_C_GUID, SQL_C_INTERVAL_DAY_TO_SECOND,
+            SQL_C_INTERVAL_HOUR_TO_SECOND, SQL_C_INTERVAL_MINUTE_TO_SECOND, SQL_C_INTERVAL_SECOND,
+            SQL_C_INTERVAL_YEAR, SQL_C_NUMERIC, SQL_C_SS_TIME2, SQL_C_SS_TIMESTAMPOFFSET,
+            SQL_C_TYPE_TIME, SQL_C_TYPE_TIMESTAMP, SQL_DECIMAL, SQL_FLOAT, SQL_LONGVARBINARY,
+            SQL_LONGVARCHAR, SQL_PREC_NUMERIC, SQL_VARBINARY, SQL_VARCHAR,
+        };
+
+        let (length, precision, scale): (SqlULen, SqlSmallInt, SqlSmallInt) = match c_type {
+            SQL_C_CHAR | SQL_VARCHAR | SQL_LONGVARCHAR | SQL_C_BINARY | SQL_VARBINARY
+            | SQL_LONGVARBINARY => (1, 1, self.scale),
+            SQL_C_GUID => (16, 16, self.scale),
+            SQL_C_NUMERIC | SQL_DECIMAL => (38, SQL_PREC_NUMERIC, 0),
+            SQL_FLOAT => (53, 53, self.scale),
+            SQL_C_FLOAT => (24, 24, self.scale),
+            SQL_C_TYPE_TIME | SQL_C_TYPE_TIMESTAMP | SQL_C_SS_TIME2 | SQL_C_SS_TIMESTAMPOFFSET => {
+                (self.length, 7, 7)
+            }
+            SQL_C_INTERVAL_SECOND
+            | SQL_C_INTERVAL_DAY_TO_SECOND
+            | SQL_C_INTERVAL_HOUR_TO_SECOND
+            | SQL_C_INTERVAL_MINUTE_TO_SECOND => (2, 6, 6),
+            SQL_C_INTERVAL_YEAR..=SQL_C_INTERVAL_MINUTE_TO_SECOND => (2, 0, 0),
+            _ => return,
+        };
+        self.length = length;
+        self.precision = precision;
+        self.scale = scale;
+    }
+
+    /// The bind-time form of [`Self::apply_app_type_defaults`]: msodbcsql's
+    /// `SetADRec`/`SetADRecBP` zero the record before applying the defaults
+    /// (`sqlcdesc.cpp:2615`, `:2883`), so no earlier binding's length,
+    /// precision or scale survives a rebind.
+    pub(crate) fn reset_app_type_defaults(&mut self, c_type: SqlSmallInt) {
+        self.length = 0;
+        self.precision = 0;
+        self.scale = 0;
+        self.apply_app_type_defaults(c_type);
     }
 
     /// `SQL_DESC_TYPE`, the verbose form of `concise_type`: `SQL_TYPE_TIME`/
@@ -603,18 +631,39 @@ impl DescHandle {
     }
 
     /// Captures partial failed writes too. Never acquires DBC/STMT while DESC
-    /// is locked, and APD/ARD writes never inspect statement ownership.
+    /// is locked: the ARD fetch check runs before the DESC lock is taken.
     pub(crate) fn update_definition(
         &self,
         record_number: SqlSmallInt,
         op: &str,
         update: impl FnOnce(&mut DescState) -> SqlReturn,
     ) -> SqlReturn {
+        let fetching = match self.kind {
+            DescKind::AppRow | DescKind::Ad => self.fetch_reads_through(),
+            _ => Ok(false),
+        };
         let Ok(mut state) = self.inner.lock() else {
             error!("{op}: desc mutex poisoned");
             return SQL_ERROR;
         };
         free_errors(&mut state);
+        match fetching {
+            Ok(false) => {}
+            Ok(true) => {
+                error!("{op}: a fetch is in progress through this descriptor");
+                post_diag(&mut state, ERR_FUNCTION_SEQUENCE);
+                return SQL_ERROR;
+            }
+            Err(()) => {
+                post_sql_error(
+                    &mut state,
+                    SQLSTATE_HY000,
+                    0,
+                    "Internal error checking descriptor statement state",
+                );
+                return SQL_ERROR;
+            }
+        }
         let is_ipd = self.kind == DescKind::ImpParam;
         let previous_count = state.records.len();
         let previous = is_ipd
@@ -654,6 +703,32 @@ impl DescHandle {
             return SQL_ERROR;
         }
         rc
+    }
+
+    /// Whether any statement is fetching through this descriptor as its
+    /// effective ARD. `SQLBindCol` refuses in the same window, because the
+    /// fetch writes through pointers it snapshotted from these records. An
+    /// explicit descriptor may be the ARD of several statements, so every
+    /// statement on the connection is checked, in DBC -> STMT order.
+    fn fetch_reads_through(&self) -> Result<bool, ()> {
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(self.parent_dbc) };
+        let Ok(dbc_state) = dbc.inner.lock() else {
+            error!("checking ARD fetch state: dbc mutex poisoned");
+            return Err(());
+        };
+        for &raw in &dbc_state.statements {
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(raw) };
+            let Ok(state) = stmt.inner.lock() else {
+                error!("checking ARD fetch state: stmt mutex poisoned");
+                return Err(());
+            };
+            if state.has_state(STMT_STATE_FETCH_IN_PROGRESS)
+                && std::ptr::eq(state.effective_ard(stmt).cast::<DescHandle>(), self)
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn invalidate_prepared_owner(&self, first_changed: usize) -> Result<(), ()> {

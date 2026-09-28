@@ -310,15 +310,10 @@ impl ColumnBinding {
     /// fields at once — but they stay two independent fields on the record,
     /// since `SQLSetDescFieldW`/`SQLSetDescRec` can set them to different
     /// buffers.
-    ///
-    /// Does not reset `SQL_DESC_LENGTH`/`PRECISION`/`SCALE`; msodbcsql's
-    /// `SetADRec` resets them to `SetTypeDefaults`'s C-type-keyed defaults on
-    /// every `SQLBindCol` call — tracked as a known, narrow
-    /// (metadata-introspection-only) gap in
-    /// [#470](https://github.com/microsoft/mssql-rs/issues/470).
     pub(crate) fn write_to_record(&self, record: &mut DescRecord) {
         record.concise_type = self.target_type;
         record.datetime_interval_code = datetime_interval_code_for(self.target_type);
+        record.reset_app_type_defaults(self.target_type);
         record.data_ptr = self.target_value_ptr;
         record.octet_length = self.buffer_length;
         record.indicator_ptr = self.strlen_or_ind_ptr as SqlPointer;
@@ -840,7 +835,6 @@ impl DaeParam {
             decimal_digits: 0,
             app_precision: 0,
             app_scale: 0,
-            precision_scale_explicit: false,
             parameter_value_ptr: value_ptr,
             buffer_length: 0,
             strlen_or_ind_ptr: std::ptr::null_mut(),

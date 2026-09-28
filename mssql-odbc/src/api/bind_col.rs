@@ -705,6 +705,32 @@ mod tests {
         }
     }
 
+    /// #470: a rebind must not keep the previous C type's precision/scale.
+    /// Measured on Driver 18.6.2.1: `SQL_C_TYPE_TIMESTAMP` then `SQL_C_CHAR`
+    /// reads back length 1, precision 1, scale 0.
+    #[test]
+    fn rebinding_a_column_resets_ard_length_precision_and_scale() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let mut buf = [0u8; 32];
+        for c_type in [SQL_C_TYPE_TIMESTAMP, SQL_C_CHAR] {
+            let rc = unsafe {
+                sql_bind_col(
+                    h.stmt,
+                    1,
+                    c_type,
+                    buf.as_mut_ptr() as SqlPointer,
+                    buf.len() as SqlLen,
+                    ptr::null_mut(),
+                )
+            };
+            assert_eq!(rc, SQL_SUCCESS);
+        }
+        let ard = unsafe { handle_from_raw::<DescHandle>(h.ard()) };
+        let state = ard.inner.lock().unwrap();
+        let record = state.record(1).unwrap();
+        assert_eq!((record.length, record.precision, record.scale), (1, 1, 0));
+    }
+
     #[test]
     fn binding_is_refused_while_a_fetch_is_in_progress() {
         let h = TestHandles::with_env_dbc_stmt();

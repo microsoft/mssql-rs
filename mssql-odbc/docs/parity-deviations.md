@@ -569,3 +569,16 @@ msodbcsql build is measured.
     covered by unit tests and shares `variant_column_size`, but no comparison
     run records msodbcsql's SQLSTATE for an oversized character `sql_variant`;
     do not infer that half from this entry.
+21. **A `SQL_C_NUMERIC` parameter never writes to the application's struct.**
+    When the APD precision/scale differ from the IPD's, msodbcsql copies the
+    APD values into the bound `SQL_NUMERIC_STRUCT`'s `precision` and `scale`
+    before converting (`sqlcfunc.cpp:3165-3176`), so an application reading its
+    own buffer after `SQLExecute` sees `(38, 0)` after a bare
+    `SQLBindParameter`. This driver reads the same APD values but leaves the
+    input buffer untouched. The value sent is the same either way: both read
+    `val[]` at the APD scale off the fast path and forward the struct whole on
+    it. An input parameter buffer belongs to the application.
+    Measured against msodbcsql 18.6.2.1 (`SQL_DRIVER_VER` `18.06.0002`) on SQL
+    Server 2025, Windows Driver Manager, with struct `(5, 3, 12345)` bound as
+    `SQL_DECIMAL(10, 2)`: both drivers return `12345.00`, and only msodbcsql
+    leaves `(38, 0)` in the struct. Tracked in AB#46374.

@@ -1021,6 +1021,42 @@ TEST_F(ScalarConversionLiveTest, NumericStructWithoutDescriptorFieldWritesUsesDe
     EXPECT_EQ("12", ExecuteAndReadBack());
 }
 
+// The fast path forwards the struct's own scale, so SQL Server rounds rather
+// than the driver truncating. Measured on Windows Driver 18.6.2.1: 13.
+TEST_F(ScalarConversionLiveTest, NumericStructOnTheDefaultFastPathIsRoundedByTheServer) {
+    SQL_NUMERIC_STRUCT value = {};
+    value.precision = 3;
+    value.scale = 1;
+    value.sign = 1;
+    std::uint64_t magnitude = 125;
+    std::memcpy(value.val, &magnitude, sizeof(magnitude));
+    std::memcpy(storage_, &value, sizeof(value));
+
+    ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(64), ?)"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_NUMERIC, SQL_DECIMAL, 38, 0,
+                                   storage_, 0, nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("13", ExecuteAndReadBack());
+}
+
+// Off the fast path the default APD scale 0 describes val[], not the struct's
+// own scale 3. Measured on Windows Driver 18.6.2.1: 12345.00.
+TEST_F(ScalarConversionLiveTest, NumericStructOffTheFastPathIgnoresTheEmbeddedScale) {
+    SQL_NUMERIC_STRUCT value = {};
+    value.precision = 5;
+    value.scale = 3;
+    value.sign = 1;
+    std::uint64_t magnitude = 12345;
+    std::memcpy(value.val, &magnitude, sizeof(magnitude));
+    std::memcpy(storage_, &value, sizeof(value));
+
+    ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(64), ?)"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_NUMERIC, SQL_DECIMAL, 10, 2,
+                                   storage_, 0, nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("12345.00", ExecuteAndReadBack());
+}
+
 // A rebind (same ordinal, same statement, no intervening SQL_RESET_PARAMS)
 // must not let a bare SQLBindParameter inherit APD precision/scale left by a
 // prior, differently-shaped binding: msodbcsql's SetADRecBP resets the whole

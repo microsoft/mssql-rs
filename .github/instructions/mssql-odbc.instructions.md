@@ -323,14 +323,16 @@ on; these guarantees were verified against msodbcsql's behavior.
   fire in debug builds only — in release builds the driver trusts the DM and
   frees unconditionally, matching msodbcsql.
 
-### 7.2. Known descriptor concurrency gap
+### 7.2. Descriptor writes during a fetch
 
-The different admission checks in `SQLBindCol`/`SQLFreeStmt`/`SQLSetStmtAttr`
-and the direct descriptor setters are tracked in
-[#472](https://github.com/microsoft/mssql-rs/issues/472). Do not justify a new
-buffer-use protocol by an application freeing storage that an outstanding
-fetch still needs. Establish the supported concurrency and completion
-guarantees first; preserve existing guards meanwhile.
+`SQLSetDescFieldW` and `SQLSetDescRec` refuse with HY010 while any statement
+on the connection is fetching through the target descriptor as its effective
+ARD, matching `SQLBindCol`/`SQLFreeStmt(SQL_UNBIND)`/`SQLSetStmtAttr`.
+`DescHandle::update_definition` walks DBC → STMT and releases both locks
+before taking the DESC lock. `STMT_STATE_FETCH_IN_PROGRESS` is specific to this
+driver, which does not hold the STMT lock across network I/O. Do not justify a
+new buffer-use protocol by an application freeing storage that an outstanding
+fetch still needs.
 
 ### 7.3. Prepared parameter definitions
 
