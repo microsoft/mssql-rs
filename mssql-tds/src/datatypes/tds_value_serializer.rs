@@ -1611,6 +1611,8 @@ impl TdsValueSerializer {
             Ok(encoding) => {
                 let (encoded, _encoding_used, had_errors) = encoding.encode(text);
                 if had_errors {
+                    // Same deliberate double pass as `encode_narrow`, and for
+                    // the same reason — see the comment there.
                     return NarrowEncoded {
                         bytes: substitute_unmappable(text, encoding.into()),
                         had_loss: true,

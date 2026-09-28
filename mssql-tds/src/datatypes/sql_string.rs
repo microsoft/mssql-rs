@@ -154,6 +154,20 @@ pub fn encode_narrow(text: &str, collation: SqlCollation) -> NarrowEncoded {
     if !had_errors {
         return NarrowEncoded::exact(encoded.into_owned());
     }
+    // Deliberate double pass: `encoded` holds the numeric-character-reference
+    // expansion (6-9 bytes per unmappable character against 2-4 source, so up
+    // to ~3x the source) and is dropped unread so the value can be re-encoded
+    // one character at a time. Only reached once a substitution is already
+    // happening, on a value already fully resident, so it never taxes the
+    // clean path.
+    //
+    // A true single pass needs `Encoder::encode_from_utf8_without_replacement`
+    // — copy representable spans, append `?` on `Unmappable`. `ResolvedEncoding`
+    // exposes only whole-string `encode`: there is no encoder counterpart to
+    // `new_decoder_without_bom_handling`, and `Oem437`/`Oem850` are the
+    // table-backed codec with no `encoding_rs` `Encoder` at all. So it means
+    // adding an incremental encoder to `ResolvedEncoding` and implementing it
+    // twice, not a local rewrite.
     NarrowEncoded {
         bytes: substitute_unmappable(text, encoding_used),
         had_loss: true,
