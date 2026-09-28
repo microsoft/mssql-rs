@@ -175,8 +175,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   reports a bulk substitution rather than silently answering `false`.
 
   New `mssql_tds::datatypes::sql_string::NarrowEncoded` (returned by the now
-  loss-reporting `encode_narrow`) and `NARROW_SUBSTITUTE_BYTE` (the `?` an
-  application can compare against to detect a substituted byte),
+  loss-reporting `encode_narrow`) and `NARROW_SUBSTITUTE_BYTE` (the byte written
+  in place of an unrepresentable character; whether a substitution happened is
+  reported by `NarrowEncoded::had_loss` and the connection's loss flag, not by
+  inspecting the bytes, since a literal `?` is the same byte),
   `TdsClient::take_code_page_conversion_loss` /
   `note_code_page_conversion_loss`, and
   `StreamingBulkLoadWriter::code_page_conversion_loss`.

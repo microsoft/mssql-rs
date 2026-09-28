@@ -104,6 +104,10 @@ fn resolve_collation(collation: SqlCollation) -> ResolvedEncoding {
 /// (`Ł`→`L`, `Ć`→`C`, `‐`→`-`) are transliterated rather than substituted, and
 /// this driver does not reproduce that — see
 /// `mssql-odbc/docs/parity-deviations.md`.
+///
+/// Not a detection mechanism: a literal `?` in the source encodes to this same
+/// byte, so whether a substitution occurred is reported by
+/// [`NarrowEncoded::had_loss`] rather than by inspecting the wire bytes.
 pub const NARROW_SUBSTITUTE_BYTE: u8 = b'?';
 
 /// Wire bytes from a narrow encode, plus whether producing them lost anything.
