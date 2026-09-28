@@ -343,14 +343,26 @@ pub fn tds_client_from_tokens(tokens: Vec<ScriptedToken>) -> TdsClient {
 /// Builds a client that first returns integer-column metadata and then replays
 /// the supplied rows through the buffered cursor APIs.
 pub fn tds_client_from_int_rows(rows: Vec<Vec<i32>>) -> TdsClient {
+    tds_client_from_int_rows_with_trailing_tokens(rows, vec![done_no_more()])
+}
+
+/// Builds a client that replays integer rows followed by caller-supplied
+/// tokens such as terminal INFO and DONE records.
+pub fn tds_client_from_int_rows_with_trailing_tokens(
+    rows: Vec<Vec<i32>>,
+    trailing_tokens: Vec<ScriptedToken>,
+) -> TdsClient {
     let width = rows.first().map_or(0, Vec::len);
     let metadata = Tokens::ColMetadata(ColMetadataToken {
         column_count: u16::try_from(width).unwrap_or(u16::MAX),
         columns: int_columns(width),
         cek_table: Vec::new(),
     });
-    let transport =
-        AnyTransport::dynamic(TokenReplayTransport::with_int_rows(metadata, rows, None));
+    let mut tokens = vec![metadata];
+    tokens.extend(trailing_tokens.into_iter().map(|token| token.0));
+    let mut transport = TokenReplayTransport::new(tokens);
+    transport.pending_rows = rows.into_iter().map(VecDeque::from).collect();
+    let transport = AnyTransport::dynamic(transport);
     let negotiated_settings = create_test_negotiated_settings_internal();
     let execution_context = ExecutionContext::new();
     let client_context = ClientContext::with_data_source("tcp:localhost,1433");

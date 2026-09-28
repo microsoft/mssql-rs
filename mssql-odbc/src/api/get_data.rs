@@ -966,8 +966,12 @@ fn finish_get_data(
     // A row's column was genuinely captured to reach this point (`ready`
     // requires it), so a row was always delivered here — unlike
     // `fetch_scroll.rs`'s zero-row fetch case.
-    release_busy_if_row_exhausted(dbc, stmt, statement_handle, client, true);
-    rc
+    let has_server_info = release_busy_if_row_exhausted(dbc, stmt, statement_handle, client);
+    if rc == SQL_SUCCESS && has_server_info {
+        SQL_SUCCESS_WITH_INFO
+    } else {
+        rc
+    }
 }
 
 /// The C type a `SQL_C_DEFAULT` retrieval of `col_index` names, taken from the
@@ -3893,7 +3897,10 @@ mod tests {
     use crate::test_support::TestHandles;
     use mssql_tds::datatypes::sql_string::SqlString;
     use mssql_tds::datatypes::sqldatatypes::TdsDataType;
-    use mssql_tds::test_client_support::{int_columns, tds_client_from_int_rows};
+    use mssql_tds::test_client_support::{
+        done_no_more, info, int_columns, tds_client_from_int_rows,
+        tds_client_from_int_rows_with_trailing_tokens,
+    };
 
     thread_local! {
         static FAIL_TYPED_PLP_RESERVE_AFTER: std::cell::Cell<Option<usize>> =
@@ -5064,6 +5071,97 @@ mod tests {
         let mut state = dbc.inner.lock().unwrap();
         state.client = Some(client);
         state.active_stmt = Some(h.stmt);
+    }
+
+    #[test]
+    fn terminal_info_promotes_clean_get_data_success() {
+        let h = TestHandles::with_env_dbc_stmt();
+        {
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let mut state = stmt.inner.lock().unwrap();
+            state.set_state(STMT_STATE_CURSOR_OPEN);
+            state.column_metadata = int_columns(1);
+            state.row_positioned = true;
+        }
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let mut client = tds_client_from_int_rows_with_trailing_tokens(
+            vec![vec![7]],
+            vec![
+                info(8153, 10, "Null value is eliminated by an aggregate."),
+                done_no_more(),
+            ],
+        );
+        dbc.runtime
+            .block_on(client.execute("SELECT 7;".to_string(), ()))
+            .unwrap();
+        assert!(dbc.runtime.block_on(client.next_row_cursor()).unwrap());
+        {
+            let mut state = dbc.inner.lock().unwrap();
+            state.client = Some(client);
+            state.active_stmt = Some(h.stmt);
+        }
+
+        let mut value = 0_i32;
+        let mut indicator = 0;
+        let rc = unsafe {
+            sql_get_data(
+                h.stmt,
+                1,
+                SQL_C_SLONG,
+                (&mut value as *mut i32).cast(),
+                0,
+                &mut indicator,
+            )
+        };
+        assert_eq!(rc, SQL_SUCCESS_WITH_INFO, "SQLGetData diagnostics: {:?}", {
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            stmt.inner.lock().unwrap().diag_records.clone()
+        });
+        assert_eq!((value, indicator), (7, 4));
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(state.diag_records.len(), 1);
+        assert_eq!(state.diag_records[0].sql_state, *b"01003");
+        assert_eq!(state.diag_records[0].native_error, 8153);
+    }
+
+    #[test]
+    fn terminal_info_preserves_existing_get_data_return_codes() {
+        for expected in [SQL_SUCCESS_WITH_INFO, SQL_ERROR] {
+            let h = TestHandles::with_env_dbc_stmt();
+            {
+                let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+                let mut state = stmt.inner.lock().unwrap();
+                state.column_metadata = int_columns(1);
+                state.current_row_last_col = 1;
+            }
+            h.mark_dbc_connected();
+            let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+            let mut client = tds_client_from_int_rows_with_trailing_tokens(
+                vec![vec![7]],
+                vec![info(8153, 10, "terminal warning"), done_no_more()],
+            );
+            dbc.runtime
+                .block_on(client.execute("SELECT 7;".to_string(), ()))
+                .unwrap();
+            assert!(dbc.runtime.block_on(client.next_row_cursor()).unwrap());
+            {
+                let mut state = dbc.inner.lock().unwrap();
+                state.client = Some(client);
+                state.active_stmt = Some(h.stmt);
+            }
+
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let state = stmt.inner.lock().unwrap();
+            let rc = finish_get_data(stmt, h.stmt, state, 1, expected);
+
+            assert_eq!(rc, expected);
+            let state = stmt.inner.lock().unwrap();
+            assert_eq!(state.diag_records.len(), 1);
+            assert_eq!(state.diag_records[0].sql_state, *b"01003");
+            assert_eq!(state.diag_records[0].native_error, 8153);
+        }
     }
 
     #[test]
