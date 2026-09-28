@@ -4372,6 +4372,26 @@ mod tests {
         );
     }
 
+    /// The same truncated tail against a *narrow* target is the one
+    /// substitution site nothing else reaches: every other narrow test feeds
+    /// whole characters through `push`, leaving the carry empty by the time
+    /// `finish` runs, and the sibling test above targets `SQL_WVARCHAR`, where
+    /// U+FFFD is representable and `finish` reports no loss.
+    ///
+    /// So this is what pins `finish`'s loss verdict, and with it the
+    /// `note_code_page_conversion_loss` call on the tail in `SQLParamData`
+    /// (`param_data.rs`) — CI's coverage report flagged that line as the only
+    /// uncovered new line in the diff (AB#47598).
+    #[test]
+    fn transcode_reports_loss_when_flushing_a_truncated_tail_to_a_narrow_target() {
+        let transcode = DaeTranscode::new(SQL_C_CHAR, SQL_VARCHAR, windows_1252_collation());
+        let mut carry = Vec::new();
+        assert!(transcode.push(&mut carry, &[0xC3]).bytes.is_empty());
+        let tail = transcode.finish(&mut carry);
+        assert_eq!(tail.bytes, b"?", "U+FFFD has no CP1252 representation");
+        assert!(tail.had_loss);
+    }
+
     /// A streamed chunk carrying a character the target collation cannot
     /// represent is substituted with `?` -- not the numeric character reference
     /// `encoding_rs` would emit -- and reports the loss, which the caller hands
