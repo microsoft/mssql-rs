@@ -660,6 +660,42 @@ mod query_result_reads {
         run_query_and_check_results(&mut connection, "SELECT 1".to_string(), &expected).await;
     }
 
+    /// Variable assignment is tagged `SQLSELECT` and still carries a count, so
+    /// logging it verbatim makes a tool print a row count for `SET @x = 1`.
+    /// The expected sequence is what ODBC `sqlcmd` prints for this batch: one
+    /// count for the INSERT and one for the real SELECT, nothing else.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn variable_assignment_counts_are_not_reported() {
+        let mut connection = begin_connection(&build_tcp_datasource()).await;
+
+        connection
+            .execute(
+                "DECLARE @x int; SET @x = 1; CREATE TABLE #va (i int); \
+                 INSERT INTO #va VALUES (1),(2); SELECT @x = i FROM #va; \
+                 SELECT * FROM #va;"
+                    .to_string(),
+                (),
+            )
+            .await
+            .unwrap();
+        loop {
+            if connection.on_rows() {
+                while connection.next_row().await.unwrap().is_some() {}
+            }
+            if !connection.advance_to_rows().await.unwrap() {
+                break;
+            }
+        }
+        connection.close_query().await.unwrap();
+
+        let counts = connection.take_done_row_counts();
+        assert_eq!(
+            counts.iter().flatten().copied().collect::<Vec<_>>(),
+            vec![2, 2],
+            "expected only the INSERT and the SELECT to report, got {counts:?}"
+        );
+    }
+
     /// With deferral on, a statement that fails mid-batch no longer hides the
     /// result sets after it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

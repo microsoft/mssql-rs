@@ -5137,7 +5137,7 @@ impl TdsClient {
                     let count = self.count_map.entry(done.cur_cmd).or_insert(0);
                     // Use saturating_add to prevent integer overflow from malicious/corrupted TDS responses
                     *count = count.saturating_add(done.row_count);
-                    self.record_done_row_count(&done);
+                    self.record_done_row_count(&done, false);
                     self.current_result_set_has_been_read_till_end = true;
                     self.current_result_ended_with_done_in_proc = is_done_in_proc;
 
@@ -7727,7 +7727,9 @@ impl TdsClient {
 
         let count = self.count_map.entry(done.cur_cmd).or_insert(0);
         *count = count.saturating_add(done.row_count);
-        self.record_done_row_count(&done);
+        // Reached while reading rows, so this DONE closes a row-returning
+        // statement and its count is the row count.
+        self.record_done_row_count(&done, true);
         self.current_result_set_has_been_read_till_end = true;
         self.current_result_ended_with_done_in_proc = ended_with_done_in_proc;
         let has_more = done.has_more() || self.prepared_batch.is_some();
@@ -7797,9 +7799,10 @@ impl TdsClient {
     /// Row counts reported by each statement as a query's results are iterated,
     /// in arrival order, leaving the log empty.
     ///
-    /// `None` marks a statement that completed without reporting a count, which
-    /// is what `SET NOCOUNT ON` produces; that is deliberately distinct from
-    /// `Some(0)`, which means the statement ran and affected no rows.
+    /// `None` marks a statement with no reportable count — `SET NOCOUNT ON`,
+    /// DDL, or a variable assignment whose `SQLSELECT`-tagged count both
+    /// reference drivers discard. That is deliberately distinct from `Some(0)`,
+    /// which means the statement ran and affected no rows.
     ///
     /// Scoped to result-set iteration — the DONE tokens seen by
     /// [`advance_to_rows`](Self::advance_to_rows) and
@@ -7812,9 +7815,17 @@ impl TdsClient {
         std::mem::take(&mut self.done_row_counts)
     }
 
-    fn record_done_row_count(&mut self, done: &DoneToken) {
+    /// `row_set` marks the DONE that closes a statement whose rows were just
+    /// read, which is the one case where a `SQLSELECT` count is meaningful.
+    ///
+    /// Everywhere else `SQLSELECT` tags variable assignment (`SET @x = 1`,
+    /// `SELECT @x = col FROM t`), which SQL Server still gives a `DONE_COUNT`.
+    /// msodbcsql (`sqlctokn.cpp:2149`) and .NET SqlClient both discard those,
+    /// the latter calling them "the bogus DONE counts sent by the server".
+    fn record_done_row_count(&mut self, done: &DoneToken, row_set: bool) {
+        let reportable = done.has_count() && (row_set || done.cur_cmd != CurrentCommand::Select);
         self.done_row_counts
-            .push(done.has_count().then_some(done.row_count));
+            .push(reportable.then_some(done.row_count));
     }
 
     /// Returns the procedure's `RETURN` value from the most recent RPC, or
@@ -9350,8 +9361,8 @@ mod tests {
             row_count: 0,
         };
 
-        client.record_done_row_count(&no_count);
-        client.record_done_row_count(&zero_rows);
+        client.record_done_row_count(&no_count, false);
+        client.record_done_row_count(&zero_rows, false);
 
         assert_eq!(client.take_done_row_counts(), vec![None, Some(0)]);
     }
@@ -9362,11 +9373,14 @@ mod tests {
     fn done_row_counts_are_per_statement_and_taken_once() {
         let mut client = create_test_client();
         for rows in [2_u64, 5, 1] {
-            client.record_done_row_count(&DoneToken {
-                status: DoneStatus::COUNT,
-                cur_cmd: CurrentCommand::Update,
-                row_count: rows,
-            });
+            client.record_done_row_count(
+                &DoneToken {
+                    status: DoneStatus::COUNT,
+                    cur_cmd: CurrentCommand::Update,
+                    row_count: rows,
+                },
+                false,
+            );
         }
 
         assert_eq!(
@@ -9473,6 +9487,35 @@ mod tests {
             row.map(|r| r.errors.len()),
             Some(1),
             "the error belongs on the prepared row"
+        );
+    }
+
+    /// SQL Server tags variable assignment as `SQLSELECT` and still sets
+    /// `DONE_COUNT`; reporting those would print a row count for `SET @x = 1`.
+    /// The same tag on a row set's own DONE carries the real row count, so the
+    /// rule keys off which statement shape produced it, not the tag alone.
+    #[test]
+    fn a_sqlselect_count_is_reported_only_for_a_row_set() {
+        let mut client = create_test_client();
+        let assignment = DoneToken {
+            status: DoneStatus::COUNT,
+            cur_cmd: CurrentCommand::Select,
+            row_count: 2,
+        };
+        let insert = DoneToken {
+            status: DoneStatus::COUNT,
+            cur_cmd: CurrentCommand::Insert,
+            row_count: 2,
+        };
+
+        client.record_done_row_count(&assignment, false);
+        client.record_done_row_count(&insert, false);
+        client.record_done_row_count(&assignment, true);
+
+        assert_eq!(
+            client.take_done_row_counts(),
+            vec![None, Some(2), Some(2)],
+            "only the update count and the row set's own count are reportable"
         );
     }
 
