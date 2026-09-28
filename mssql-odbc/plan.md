@@ -85,7 +85,7 @@ FFI from logic), that restructuring is a follow-up task.
 | **TDS dependency** | `mssql-tds` via local path (`../mssql-tds`) | TDS 7.4 + 8.0 support, co-developed in same workspace |
 | **Driver version** | Driver 18 only | TDS 7.4 + TDS 8.0 strict encryption, SQL Server 2016+ alignment |
 | **TLS** | Delegated to mssql-tds (`native-tls`) | SChannel (Win), Security.framework (macOS), OpenSSL (Linux) — no separate TLS crates needed |
-| **Authentication** | ODBC adapters over mssql-tds | SQL password, SSPI, access token, service principal, managed identity, and Windows interactive are wired; other recognized Entra modes currently return `HYC00` |
+| **Authentication** | ODBC adapters over mssql-tds | SQL password, SSPI, access token, service principal, managed identity, Windows interactive, and AD integrated are wired; other recognized Entra modes currently return `HYC00` |
 | **Localization** | English (en_US) only | Simplifies initial release; resource bundles extensible later |
 | **Test targets** | SQL Server 2022 + Azure SQL Database | Latest features + primary cloud target; older versions work via TDS backward compat |
 
@@ -143,8 +143,9 @@ status describes the current crate, not merely whether supporting code exists in
 
 ### Phase 6: Authentication E2E Validation — In progress
 - E2E tests for each auth mode against SQL Server 2022 + Azure SQL
-- Complete the one remaining driver-reachable adapter,
-  `ActiveDirectoryIntegrated` (AB#46068). `ActiveDirectoryPassword` is an
+- `ActiveDirectoryIntegrated` (AB#46068) is implemented and covered by unit
+  and mock-server tests; live validation needs a federated (ADFS) tenant.
+  `ActiveDirectoryPassword` is an
   accepted out-of-scope deviation (AB#45486) and stays `HYC00`.
 - Validate what the driver itself performs: SQL auth, Windows Integrated
   (SSPI/Kerberos), Windows Interactive, ServicePrincipal, ManagedIdentity/MSI,
@@ -489,11 +490,11 @@ driver to resolve.
 | AccessToken (JWT) | ✅ | Native | Implemented | Pre-acquired bearer token via `SQL_COPT_SS_ACCESS_TOKEN` |
 | ActiveDirectoryServicePrincipal | ✅ | Native | Implemented | Client ID + secret |
 | ActiveDirectoryManagedIdentity | ✅ | Access token | Implemented | System- or user-assigned identity |
-| ActiveDirectoryInteractive | ✅ | Native on Windows, access token elsewhere | Windows only | Browser sign-in; non-Windows resolves to Integrated and returns `HYC00` |
+| ActiveDirectoryInteractive | ✅ | Native on Windows, access token elsewhere | Windows only | Browser sign-in; non-Windows resolves to Integrated, as msodbcsql does |
 | ActiveDirectoryPassword | ✅ | Native | Out of scope (`HYC00`) | ROPC sends plaintext credentials to Entra, supports neither MFA nor conditional access, and is deprecated by the Microsoft identity platform. Excluded by signed-off design deviation (AB#45486) |
 | ActiveDirectoryDeviceCodeFlow | ✅ | Access token | `HYC00` | Not an msodbcsql18 keyword. mssql-python maps the `ActiveDirectoryDeviceCode` spelling and acquires the token itself; the `...Flow` spelling it does not map passes through and reaches this refusal |
 | ActiveDirectoryDefault | ✅ | Access token | `HYC00` | Not an msodbcsql18 keyword. mssql-python maps it and acquires the token itself, so it never sends the keyword; this driver recognizes it, so another ODBC consumer can still reach this refusal |
-| ActiveDirectoryIntegrated | ✅ | Native | `HYC00` | Entra with the current user's Kerberos ticket |
+| ActiveDirectoryIntegrated | ✅ | Native | Implemented | Entra token for the OS identity: `mssql-auth.dll` on Windows; Kerberos ticket → ADFS WS-Trust → SAML bearer on Linux/macOS. Live federated-tenant E2E pending |
 | ActiveDirectoryWorkloadIdentity | ✅ | Pass-through | `HYC00` | Not an msodbcsql18 keyword and not mapped by mssql-python, so the keyword survives into the connection string and reaches this driver, which recognizes and validates it before refusing. Reachable but unsupported; implementing it would exceed parity |
 
 `ActiveDirectoryMSI` is accepted as a connection-string alias and resolves to
@@ -507,11 +508,10 @@ and `ActiveDirectoryServicePrincipal`. `ActiveDirectoryDefault`,
 driver keywords at all — mssql-python implements the first two in Python. A
 retail comparison recording `SQL_DRIVER_VER` is still outstanding.
 
-**Summary**: `mssql-odbc` currently wires six methods — SQL password, SSPI,
-access token, service principal, managed identity, and Windows interactive.
-AB#45484 closed against exactly that scope (T0–T3). Compared with the
-msodbcsql18 source, two differences remain: `ActiveDirectoryPassword` is an
-accepted deliberate deviation (AB#45486), while `ActiveDirectoryIntegrated`
-is an implementation gap tracked by AB#46068. Retail behavior has not yet been
-measured for the former.
+**Summary**: `mssql-odbc` wires seven methods — SQL password, SSPI, access
+token, service principal, managed identity, Windows interactive, and
+`ActiveDirectoryIntegrated` (AB#46068). AB#45484 closed against the first six
+(T0–T3). Compared with the msodbcsql18 source, one difference remains:
+`ActiveDirectoryPassword` is an accepted deliberate deviation (AB#45486).
+Retail behavior has not yet been measured for it.
 Non-Windows interactive was cut (AB#46683).

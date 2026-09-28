@@ -246,6 +246,37 @@ type GssReleaseCredFn = unsafe extern "C" fn(
     cred_handle: *mut GssCredIdT,
 ) -> GssOmUint32;
 
+type GssInquireCredFn = unsafe extern "C" fn(
+    minor_status: *mut GssOmUint32,
+    cred_handle: GssCredIdT,
+    name: *mut GssNameT,
+    lifetime: *mut GssOmUint32,
+    cred_usage: *mut i32,
+    mechanisms: *mut *mut c_void,
+) -> GssOmUint32;
+
+type GssDisplayNameFn = unsafe extern "C" fn(
+    minor_status: *mut GssOmUint32,
+    input_name: GssNameT,
+    output_name_buffer: GssBufferT,
+    output_name_type: *mut GssOid,
+) -> GssOmUint32;
+
+/// SPNEGO mechanism OID 1.3.6.1.5.5.2 (RFC 4178), the mechanism HTTP
+/// `Negotiate` (RFC 4559) requires.
+static GSS_SPNEGO_MECHANISM_BYTES: [u8; 6] = [0x2b, 0x06, 0x01, 0x05, 0x05, 0x02];
+
+static GSS_SPNEGO_MECHANISM_DESC: SyncOidDesc = SyncOidDesc(GssOidDesc {
+    length: 6,
+    elements: GSS_SPNEGO_MECHANISM_BYTES.as_ptr() as *mut c_void,
+});
+
+/// Returns the SPNEGO mechanism OID. The descriptor is static and never
+/// written through, so handing out a `*mut` for the C ABI is sound.
+pub(super) fn spnego_mechanism() -> GssOid {
+    &GSS_SPNEGO_MECHANISM_DESC.0 as *const GssOidDesc as *mut GssOidDesc
+}
+
 // =============================================================================
 // Static OID Definition (fallback)
 // =============================================================================
@@ -300,6 +331,10 @@ struct GssapiLibrary {
     gss_display_status: GssDisplayStatusFn,
     gss_acquire_cred: GssAcquireCredFn,
     gss_release_cred: GssReleaseCredFn,
+    /// Optional: only needed to read the default principal name, so a library
+    /// without it still serves TDS integrated authentication.
+    gss_inquire_cred: Option<GssInquireCredFn>,
+    gss_display_name: Option<GssDisplayNameFn>,
     /// GSS_C_NT_HOSTBASED_SERVICE OID pointer (from library or fallback)
     gss_c_nt_hostbased_service: GssOid,
 }
@@ -374,6 +409,8 @@ impl GssapiLibrary {
         let gss_display_status = load_sym("gss_display_status");
         let gss_acquire_cred = load_sym("gss_acquire_cred");
         let gss_release_cred = load_sym("gss_release_cred");
+        let gss_inquire_cred = load_sym("gss_inquire_cred");
+        let gss_display_name = load_sym("gss_display_name");
 
         // Check all required symbols were loaded
         if gss_init_sec_context.is_null()
@@ -433,6 +470,10 @@ impl GssapiLibrary {
             gss_display_status: unsafe { std::mem::transmute(gss_display_status) },
             gss_acquire_cred: unsafe { std::mem::transmute(gss_acquire_cred) },
             gss_release_cred: unsafe { std::mem::transmute(gss_release_cred) },
+            gss_inquire_cred: (!gss_inquire_cred.is_null())
+                .then(|| unsafe { std::mem::transmute(gss_inquire_cred) }),
+            gss_display_name: (!gss_display_name.is_null())
+                .then(|| unsafe { std::mem::transmute(gss_display_name) }),
             gss_c_nt_hostbased_service,
         })
     }
@@ -775,6 +816,86 @@ pub fn has_valid_credentials() -> bool {
     }
 
     major == GSS_S_COMPLETE
+}
+
+/// Returns the display name of the default initiator credential's principal
+/// (e.g. `user@REALM`), i.e. whoever `kinit` last authenticated.
+///
+/// Mirrors msodbcsql's `gss_acquire_cred` → `gss_inquire_cred` →
+/// `gss_display_name` sequence (`AzureADAuth.cpp` `CheckFederated`), which
+/// derives the Entra user realm lookup from the Kerberos identity.
+pub fn default_principal_name() -> Result<String, crate::security::SecurityError> {
+    use crate::security::SecurityError;
+
+    let lib = get_gssapi_lib().ok_or_else(|| {
+        SecurityError::LoadLibraryFailed("libgssapi_krb5: GSSAPI library not available".to_string())
+    })?;
+    let (Some(inquire_cred), Some(display_name)) = (lib.gss_inquire_cred, lib.gss_display_name)
+    else {
+        return Err(SecurityError::LoadLibraryFailed(
+            "libgssapi_krb5 does not export gss_inquire_cred/gss_display_name".to_string(),
+        ));
+    };
+
+    let failure = |what: &str, major: GssOmUint32, minor: GssOmUint32| SecurityError::GssapiError {
+        major,
+        minor,
+        message: format!("{what}: {}", get_gssapi_error(major, minor)),
+    };
+
+    let mut minor: GssOmUint32 = 0;
+    let mut release_minor: GssOmUint32 = 0;
+    let mut cred: GssCredIdT = ptr::null_mut();
+    let major = unsafe {
+        (lib.gss_acquire_cred)(
+            &mut minor,
+            ptr::null_mut(),
+            0,
+            ptr::null_mut(),
+            1, // GSS_C_INITIATE
+            &mut cred,
+            ptr::null_mut(),
+            ptr::null_mut(),
+        )
+    };
+    if major != GSS_S_COMPLETE {
+        return Err(failure(
+            "Error acquiring Kerberos credentials",
+            major,
+            minor,
+        ));
+    }
+
+    let mut name: GssNameT = ptr::null_mut();
+    let major = unsafe {
+        inquire_cred(
+            &mut minor,
+            cred,
+            &mut name,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+        )
+    };
+    unsafe { (lib.gss_release_cred)(&mut release_minor, &mut cred) };
+    if major != GSS_S_COMPLETE {
+        return Err(failure(
+            "Error retrieving current credential name",
+            major,
+            minor,
+        ));
+    }
+
+    let mut buffer = GssBufferDesc::default();
+    let major = unsafe { display_name(&mut minor, name, &mut buffer, ptr::null_mut()) };
+    unsafe { (lib.gss_release_name)(&mut release_minor, &mut name) };
+    if major != GSS_S_COMPLETE {
+        return Err(failure("Error retrieving principal name", major, minor));
+    }
+
+    let principal = String::from_utf8_lossy(&unsafe { buffer.to_vec() }).into_owned();
+    unsafe { (lib.gss_release_buffer)(&mut release_minor, &mut buffer) };
+    Ok(principal)
 }
 
 // =============================================================================

@@ -43,6 +43,7 @@ use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
 use url::{Position, Url};
 
+use super::integrated::IntegratedTokenFactory;
 #[cfg(windows)]
 use super::interactive::{InteractiveTokenFactory, LOGIN_TIMEOUT_SECS};
 use crate::connection::odbc_authentication_transformer::TransformedAuth;
@@ -359,8 +360,9 @@ impl UnsupportedAuth {
 /// Applies the resolved authentication to `context`: sets credentials for
 /// SQL/SSPI, the pre-acquired token for `AccessToken`, or builds and registers
 /// an Entra token factory for service principal / managed identity /
-/// interactive. For the factory methods the credentials are captured by the
-/// factory and left out of `context`, so they are never serialized in LOGIN7.
+/// interactive / integrated. For the factory methods the credentials are
+/// captured by the factory and left out of `context`, so they are never
+/// serialized in LOGIN7.
 ///
 /// `server` labels the interactive sign-in window, so it is only read on
 /// Windows, the sole platform with an interactive path.
@@ -428,21 +430,29 @@ pub(crate) fn configure_auth(
         // (`Parse.cpp:3597`). The request lands in the generic `AzureADAuth`
         // block, whose `authMode` ternary (`:3657-3660`) has no Interactive arm
         // and so resolves to `AKVCFG_AUTHMODE_INTEGRATED` — a Kerberos attempt
-        // against the STS. Resolve it the same way; once Integrated is
-        // implemented this becomes msodbcsql's behaviour exactly. The caller
-        // still names the requested method, because parity justifies the
-        // resolution, not a diagnostic about a keyword nobody typed.
+        // against the STS. Resolve it the same way: register the integrated
+        // factory and send the integrated FedAuth workflow.
         #[cfg(not(windows))]
         TdsAuthenticationMethod::ActiveDirectoryInteractive => {
-            return Err(UnsupportedAuth {
-                requested: TdsAuthenticationMethod::ActiveDirectoryInteractive,
-                resolved: TdsAuthenticationMethod::ActiveDirectoryIntegrated,
-            });
+            register_integrated(context);
+            context.tds_authentication_method = TdsAuthenticationMethod::ActiveDirectoryIntegrated;
+            return Ok(());
         }
+        TdsAuthenticationMethod::ActiveDirectoryIntegrated => register_integrated(context),
         other => return Err(UnsupportedAuth::plain(other)),
     }
     context.tds_authentication_method = method;
     Ok(())
+}
+
+/// Registers the OS-identity token factory. The transformer has already
+/// discarded any `UID`/`PWD`, so nothing identifying is stored in `context`.
+fn register_integrated(context: &mut ClientContext) {
+    let factory = IntegratedTokenFactory::new(context.login_timeout);
+    context.auth_method_map.insert(
+        TdsAuthenticationMethod::ActiveDirectoryIntegrated,
+        Box::new(factory),
+    );
 }
 
 #[cfg(test)]
@@ -667,34 +677,48 @@ mod tests {
 
     #[cfg(not(windows))]
     #[test]
-    fn configure_auth_interactive_reports_integrated_off_windows() {
+    fn configure_auth_interactive_resolves_to_integrated_off_windows() {
         // msodbcsql does not compile an interactive path off Windows; the
         // request falls through its `authMode` ternary (`Parse.cpp:3657-3660`)
-        // to AKVCFG_AUTHMODE_INTEGRATED. Reporting Integrated keeps that
-        // behaviour, and becomes a real Kerberos attempt once that method
-        // lands.
+        // to AKVCFG_AUTHMODE_INTEGRATED, a Kerberos attempt against the STS.
         let mut ctx = ClientContext::default();
         let r = transformed(
             TdsAuthenticationMethod::ActiveDirectoryInteractive,
             "user@contoso.com",
             "",
         );
+        assert!(configure(&mut ctx, r).is_ok());
         assert_eq!(
-            configure(&mut ctx, r),
-            Err(UnsupportedAuth {
-                requested: TdsAuthenticationMethod::ActiveDirectoryInteractive,
-                resolved: TdsAuthenticationMethod::ActiveDirectoryIntegrated,
-            }),
-            "the error must still name the keyword the user wrote"
-        );
-        // Nothing is written to the context, and no factory is registered, so
-        // the connection cannot proceed.
-        assert!(ctx.auth_method_map.is_empty());
-        assert!(ctx.login_timeout.is_none());
-        assert_ne!(
             ctx.tds_authentication_method,
-            TdsAuthenticationMethod::ActiveDirectoryInteractive
+            TdsAuthenticationMethod::ActiveDirectoryIntegrated,
+            "LOGIN7 must carry the integrated FedAuth workflow"
         );
+        assert!(
+            ctx.auth_method_map
+                .contains_key(&TdsAuthenticationMethod::ActiveDirectoryIntegrated)
+        );
+        assert!(ctx.user_name.is_empty());
+        // Interactive's longer login deadline is for a human; none is involved.
+        assert!(ctx.login_timeout.is_none());
+    }
+
+    #[test]
+    fn configure_auth_integrated_registers_factory() {
+        let mut ctx = ClientContext::default();
+        let r = transformed(TdsAuthenticationMethod::ActiveDirectoryIntegrated, "", "");
+        assert!(configure(&mut ctx, r).is_ok());
+        assert_eq!(
+            ctx.tds_authentication_method,
+            TdsAuthenticationMethod::ActiveDirectoryIntegrated
+        );
+        assert!(
+            ctx.auth_method_map
+                .contains_key(&TdsAuthenticationMethod::ActiveDirectoryIntegrated)
+        );
+        assert!(ctx.user_name.is_empty());
+        assert!(ctx.password.is_empty());
+        assert!(ctx.access_token.is_none());
+        assert!(ctx.login_timeout.is_none());
     }
 
     #[test]

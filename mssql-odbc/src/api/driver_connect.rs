@@ -394,11 +394,10 @@ fn do_connect(
     // Build ClientContext. T1 wired SQL password, integrated (SSPI/GSSAPI), and
     // pre-acquired access tokens; T2 added Entra service principal (secret) and
     // managed identity; T3 adds interactive sign-in (Windows only, matching
-    // msodbcsql) — all via a token factory. Methods that still need token
-    // acquisition (AD password, device code, workload identity, default
-    // credential, AD integrated) are rejected with HYC00 until a later tier.
-    // Off Windows an interactive request is reported as AD integrated, the same
-    // method msodbcsql falls through to there.
+    // msodbcsql); T4 adds AD integrated — all via a token factory. Methods that
+    // still need token acquisition (AD password, device code, workload
+    // identity, default credential) are rejected with HYC00. Off Windows an
+    // interactive request resolves to AD integrated, as it does in msodbcsql.
     let mut context = ClientContext::default();
     configure_driver_identity(&mut context);
     // The connection string wins over a pre-connect

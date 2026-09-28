@@ -40,7 +40,12 @@ url = "2"
 # secret.
 sha2 = "0.11.0"
 # `RowWriter` exposes UUID values without first boxing them as `ColumnValues`.
-uuid = "1"
+# `v4` supplies the random WS-Trust message id for Entra integrated auth.
+uuid = { version = "1", features = ["v4"] }
+# Entra integrated auth off Windows (ADFS WS-Trust): the SPNEGO header and the
+# SAML-bearer assertion are base64, and the realm/token responses are JSON.
+base64 = "0.22"
+serde_json = "1"
 # msodbcsql widens a time-only value with the process-local current date
 # (`localtime_s` in sqlccnvt.cpp), which std cannot supply on every platform.
 libc = "0.2"

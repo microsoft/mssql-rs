@@ -84,6 +84,8 @@ pub struct ConnectionProcessor {
     pub user_agent: Option<String>,
     /// ServerName received in the Login7 packet
     received_server_name: Option<String>,
+    /// MSAL FedAuth workflow byte received in the Login7 packet (if any)
+    fedauth_workflow: Option<u8>,
     /// Whether the server is waiting for a follow-up FedAuthToken packet
     awaiting_fedauth_token: bool,
     /// Reference to the shared query registry
@@ -116,6 +118,7 @@ impl ConnectionProcessor {
             received_token: None,
             user_agent: None,
             received_server_name: None,
+            fedauth_workflow: None,
             awaiting_fedauth_token: false,
             query_registry,
             buffer: BytesMut::with_capacity(4096),
@@ -140,6 +143,7 @@ impl ConnectionProcessor {
             received_token: None,
             user_agent: None,
             received_server_name: None,
+            fedauth_workflow: None,
             awaiting_fedauth_token: false,
             query_registry,
             buffer: BytesMut::with_capacity(4096),
@@ -172,6 +176,11 @@ impl ConnectionProcessor {
     /// Get the ServerName received in the Login7 packet
     pub fn received_server_name(&self) -> Option<&str> {
         self.received_server_name.as_deref()
+    }
+
+    /// Get the MSAL FedAuth workflow byte received in the Login7 packet
+    pub fn fedauth_workflow(&self) -> Option<u8> {
+        self.fedauth_workflow
     }
 
     /// Get the received access token as a UTF-16LE decoded string
@@ -329,6 +338,7 @@ impl ConnectionProcessor {
 
                 // Store the server name for test verification
                 self.received_server_name = auth_info.server_name.clone();
+                self.fedauth_workflow = auth_info.fedauth_workflow;
 
                 // Check if redirection is configured
                 if let Some(ref redir) = self.redirection {
@@ -681,6 +691,8 @@ pub struct ConnectionInfo {
     pub user_agent: Option<String>,
     /// ServerName received in the Login7 packet
     pub received_server_name: Option<String>,
+    /// MSAL FedAuth workflow byte received in the Login7 packet (if any)
+    pub fedauth_workflow: Option<u8>,
     /// The ALL_HEADERS TransactionDescriptor header — `(TransactionDescriptor,
     /// OutstandingRequestCount)` — recorded from every `SqlBatch`/`RpcRequest`
     /// this connection has sent, in order. Lets a test assert a client
@@ -728,6 +740,7 @@ impl ConnectionStore {
             authenticated: processor.is_authenticated(),
             user_agent: processor.user_agent.clone(),
             received_server_name: processor.received_server_name().map(|s| s.to_string()),
+            fedauth_workflow: processor.fedauth_workflow(),
             transaction_descriptor_headers: processor.transaction_descriptor_headers().to_vec(),
         };
         self.connections.insert(processor.conn_id(), info);

@@ -5,10 +5,10 @@
 //! library that fronts OneAuth.
 //!
 //! This is the same library, loaded the same way, that msodbcsql uses for
-//! `Authentication=ActiveDirectoryInteractive`, so the sign-in experience and
-//! the token cache behaviour match the C++ driver. Only the entry points the
-//! interactive flow needs are bound; the password and integrated-auth entry
-//! points are deliberately left out.
+//! `Authentication=ActiveDirectoryInteractive` and, on Windows,
+//! `Authentication=ActiveDirectoryIntegrated`, so the sign-in experience and
+//! the token cache behaviour match the C++ driver. The username/password entry
+//! point is deliberately left out.
 //!
 //! # Why a dedicated thread
 //!
@@ -134,16 +134,20 @@ type PfnUiCreateHostWindow = unsafe extern "system" fn(
     menu_or_id: *mut c_void,
 ) -> i32;
 type PfnDeleteRequest = unsafe extern "system" fn(request: HMsqaRequest);
+type PfnCreateAuthenticationContextNoUi =
+    unsafe extern "system" fn(sts: PCSTR, client_id: PCSTR, redirect_uri: PCSTR) -> HMsqaContext;
+type PfnUseWindowsAuthentication = unsafe extern "system" fn(request: HMsqaRequest) -> i32;
+type PfnReleaseAuthenticationContext = unsafe extern "system" fn(ctx: HMsqaContext);
 
 /// The untyped code pointer `GetProcAddress` returns.
 type Farproc = unsafe extern "system" fn() -> isize;
 
 /// The resolved `mssql-auth.dll` entry points.
 ///
-/// `MSQAReleaseAuthenticationContext` is intentionally absent: interactive
-/// contexts are cached for the life of the process so OneAuth can reuse its
-/// token cache, exactly as msodbcsql does (`SNI_FedAuth.cpp:777-782`), so there
-/// is never a caller for it.
+/// Interactive contexts are cached for the life of the process so OneAuth can
+/// reuse its token cache and are never released; integrated contexts are
+/// created per acquisition and released afterwards, exactly as msodbcsql does
+/// (`SNI_FedAuth.cpp:777-782`).
 struct MsqaApi {
     create_context: PfnCreateAuthenticationContext,
     set_option: PfnSetOption,
@@ -153,6 +157,9 @@ struct MsqaApi {
     get_error_description: PfnGetErrorDescription,
     ui_create_host_window: PfnUiCreateHostWindow,
     delete_request: PfnDeleteRequest,
+    create_context_no_ui: PfnCreateAuthenticationContextNoUi,
+    use_windows_authentication: PfnUseWindowsAuthentication,
+    release_context: PfnReleaseAuthenticationContext,
 }
 
 // The entry points are plain code pointers into a module that is never
@@ -248,16 +255,17 @@ fn load_api() -> Result<MsqaApi, String> {
         Err(e) => {
             return Err(format!(
                 "{MSQA_LIBRARY} could not be loaded from the system directory ({e}). \
-                 Entra interactive authentication requires the Microsoft SQL Server \
-                 authentication library to be installed."
+                 Entra interactive and integrated authentication require the Microsoft \
+                 SQL Server authentication library to be installed."
             ));
         }
     };
     resolve(module)
 }
 
-/// Resolves every entry point the interactive flow needs, failing if any is
-/// missing rather than discovering the gap mid-sign-in.
+/// Resolves every entry point the interactive and integrated flows need,
+/// failing if any is missing rather than discovering the gap mid-sign-in.
+/// msodbcsql binds the same exports unconditionally (`SNI_FedAuth.cpp:257-268`).
 fn resolve(module: HMODULE) -> Result<MsqaApi, String> {
     /// Looks up one export and transmutes it to its typed signature.
     ///
@@ -285,6 +293,18 @@ fn resolve(module: HMODULE) -> Result<MsqaApi, String> {
         get_error_description: entry!("MSQAGetErrorDescription", PfnGetErrorDescription),
         ui_create_host_window: entry!("MSQAUICreateHostWindow", PfnUiCreateHostWindow),
         delete_request: entry!("MSQADeleteRequest", PfnDeleteRequest),
+        create_context_no_ui: entry!(
+            "MSQACreateAuthenticationContextNoUI",
+            PfnCreateAuthenticationContextNoUi
+        ),
+        use_windows_authentication: entry!(
+            "MSQAUseWindowsAuthentication",
+            PfnUseWindowsAuthentication
+        ),
+        release_context: entry!(
+            "MSQAReleaseAuthenticationContext",
+            PfnReleaseAuthenticationContext
+        ),
     })
 }
 
@@ -414,7 +434,7 @@ pub(super) fn acquire_token(
     };
 
     if status != MSQA_SUCCESS {
-        return Err(describe_failure(api, request, status));
+        return Err(describe_failure(api, request, status, INTERACTIVE_LABEL));
     }
 
     // The account is now signed in; let later connections reuse the cached
@@ -611,7 +631,12 @@ fn read_access_token(api: &'static MsqaApi, request: HMsqaRequest) -> TdsResult<
 /// Turns a failed request into an error, preserving OneAuth's own description
 /// and preserving the transient/permanent distinction the connection retry
 /// logic depends on.
-fn describe_failure(api: &'static MsqaApi, request: HMsqaRequest, status: i32) -> Error {
+fn describe_failure(
+    api: &'static MsqaApi,
+    request: HMsqaRequest,
+    status: i32,
+    label: &str,
+) -> Error {
     let mut length: u32 = 0;
     let mut packed: i64 = 0;
     unsafe { (api.get_error_description)(request, std::ptr::null_mut(), &mut length, &mut packed) };
@@ -638,15 +663,139 @@ fn describe_failure(api: &'static MsqaApi, request: HMsqaRequest, status: i32) -
     if is_transient(one_auth_status) {
         warn!(
             status = one_auth_status,
-            "interactive: transient failure acquiring a token"
+            label, "transient failure acquiring a token from mssql-auth"
         );
         // Transient faults stay `ConnectionError` so the provider may retry.
-        return Error::ConnectionError(format!("Entra interactive sign-in failed: {description}"));
+        return Error::ConnectionError(format!("{label} failed: {description}"));
     }
 
     Error::Security(SecurityError::AuthenticationDenied(format!(
-        "Entra interactive sign-in failed: {description}"
+        "{label} failed: {description}"
     )))
+}
+
+const INTERACTIVE_LABEL: &str = "Entra interactive sign-in";
+const INTEGRATED_LABEL: &str = "Entra integrated authentication";
+
+/// Releases a per-acquisition `HMSQACONTEXT` on every exit path.
+struct ContextGuard {
+    api: &'static MsqaApi,
+    context: HMsqaContext,
+}
+
+impl Drop for ContextGuard {
+    fn drop(&mut self) {
+        unsafe { (self.api.release_context)(self.context) };
+    }
+}
+
+/// Acquires an access token for the signed-in Windows account without any UI
+/// (`Authentication=ActiveDirectoryIntegrated`). Blocking: run it on a thread
+/// that may block.
+///
+/// Mirrors the non-interactive branch of `SNISecMSQAGetAccessToken`
+/// (`SNI_FedAuth.cpp:625-694`): a fresh no-UI context per call, WAM off,
+/// `MSQAUseWindowsAuthentication` on an STA thread when OneAuth reports that
+/// credentials are needed, and the context released afterwards.
+pub(super) fn acquire_integrated_token(
+    sts_url: &str,
+    resource: &str,
+    client_id: &str,
+    redirect_uri: &str,
+) -> TdsResult<String> {
+    let api = api()?;
+    let sts = to_c_string(sts_url, "STS URL")?;
+    let client = to_c_string(client_id, "client id")?;
+    let redirect = to_c_string(redirect_uri, "redirect URI")?;
+    let resource_c = to_c_string(resource, "resource")?;
+
+    let context = unsafe {
+        (api.create_context_no_ui)(
+            PCSTR(sts.as_ptr().cast()),
+            PCSTR(client.as_ptr().cast()),
+            PCSTR(redirect.as_ptr().cast()),
+        )
+    };
+    if context.is_null() {
+        let code = unsafe { GetLastError() }.0;
+        return Err(Error::Security(SecurityError::InternalError(format!(
+            "MSQACreateAuthenticationContextNoUI failed (Windows error {code})"
+        ))));
+    }
+    let _context = ContextGuard { api, context };
+
+    unsafe { (api.set_option)(context, MSQA_OPTION_USE_WAM, USE_WAM) };
+
+    let correlation_id = GUID::new().unwrap_or(GUID::zeroed());
+    let request =
+        unsafe { (api.acquire_token)(context, PCSTR(resource_c.as_ptr().cast()), &correlation_id) };
+    if request.is_null() {
+        let code = unsafe { GetLastError() }.0;
+        return Err(Error::Security(SecurityError::InternalError(format!(
+            "MSQAAcquireToken failed (Windows error {code})"
+        ))));
+    }
+    // Declared after `_context`, so the request is deleted before the context
+    // is released, matching msodbcsql's `Exit:` order.
+    let _request = RequestGuard { api, request };
+
+    let status = match unsafe { (api.get_request_status)(request) } {
+        MSQA_INTERACTION_REQUIRED => {
+            debug!("integrated: authenticating with the signed-in Windows account");
+            run_windows_authentication(api, request)?
+        }
+        // No credentials have been supplied yet, so a completed request carries
+        // no token; msodbcsql maps this to `ERROR_ADAL_UNEXPECTED` (:670-676).
+        MSQA_SUCCESS => {
+            return Err(Error::Security(SecurityError::InternalError(
+                "MSQAAcquireToken completed before Windows credentials were supplied".to_string(),
+            )));
+        }
+        other => other,
+    };
+
+    if status != MSQA_SUCCESS {
+        return Err(describe_failure(api, request, status, INTEGRATED_LABEL));
+    }
+    read_access_token(api, request)
+}
+
+/// Runs `MSQAUseWindowsAuthentication` on a dedicated STA thread and returns
+/// the resulting request status. Mirrors the Windows-integrated branch of
+/// `MSQAThread` (`SNI_FedAuth.cpp:417-511`), which needs COM but no message
+/// pump.
+fn run_windows_authentication(api: &'static MsqaApi, request: HMsqaRequest) -> TdsResult<i32> {
+    let moved = RequestHandle(request);
+    let worker = std::thread::Builder::new()
+        .name("mssql-odbc-integrated-auth".to_string())
+        .spawn(move || {
+            let moved = moved;
+            let com = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+            if com.is_err() {
+                return Err(Error::Security(SecurityError::InternalError(format!(
+                    "the integrated authentication thread could not initialize COM \
+                     (HRESULT {:#010x})",
+                    com.0
+                ))));
+            }
+            // The BOOL result is ignored, as in msodbcsql: the request status
+            // read next carries the outcome.
+            unsafe { (api.use_windows_authentication)(moved.0) };
+            let status = unsafe { (api.get_request_status)(moved.0) };
+            unsafe { CoUninitialize() };
+            Ok(status)
+        })
+        .map_err(|e| {
+            Error::Security(SecurityError::InternalError(format!(
+                "could not start the integrated authentication thread: {e}"
+            )))
+        })?;
+
+    worker.join().map_err(|_| {
+        Error::Security(SecurityError::InternalError(
+            "the integrated authentication thread panicked".to_string(),
+        ))
+    })?
 }
 
 /// Mirrors `IsTransientError` (`SNI_FedAuth.cpp:301-306`).
