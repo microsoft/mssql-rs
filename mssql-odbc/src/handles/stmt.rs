@@ -9,7 +9,7 @@ use std::sync::Mutex;
 use tracing::error;
 
 use mssql_tds::connection::tds_client::{PreparedStatement, StatementId, TdsClient};
-use mssql_tds::error::{Error as TdsError, SqlInfoMessage};
+use mssql_tds::error::Error as TdsError;
 
 use super::desc::{DescHandle, DescKind, DescRecord, DescState};
 use super::{DbcHandle, HandleType, HasObjectType, free_handle, handle_to_raw};
@@ -463,17 +463,6 @@ pub(crate) struct StmtState {
     /// since both it and `result_set_exhausted` describe facts about the
     /// same now-superseded result set.
     pub(crate) pending_fetch_error: Option<TdsError>,
-    /// Server INFO messages a read-ahead peek drained from the client when
-    /// `release_busy_if_row_exhausted` released the busy claim on a zero-row
-    /// fetch (`row_delivered == false`). `fill_rowset`'s own `SQL_NO_DATA`
-    /// can't carry `SQL_SUCCESS_WITH_INFO`, so these are stashed here instead
-    /// of posted immediately — for `SQLMoreResults`'s `batch_exhausted` fast
-    /// path or a cursor close to surface, exactly as the deferred-error
-    /// twin above. Both fast paths release the connection without the
-    /// caller re-touching the wire, so nothing else would ever drain them.
-    /// Cleared by [`StmtState::clear_exhaustion_state`] alongside
-    /// `batch_exhausted`.
-    pub(crate) pending_fetch_info: Vec<SqlInfoMessage>,
     /// Owned before the drained client can be reused by another statement.
     /// Delivered once by SQLMoreResults using the bindings current at that call.
     pub(crate) pending_output_params: Option<(Vec<ReturnValue>, Option<i32>)>,
@@ -1351,7 +1340,6 @@ impl StmtState {
         self.result_set_exhausted = false;
         self.batch_exhausted = false;
         self.pending_fetch_error = None;
-        self.pending_fetch_info.clear();
         self.pending_output_params = None;
     }
 
@@ -1593,7 +1581,6 @@ impl StmtHandle {
                 result_set_exhausted: false,
                 batch_exhausted: false,
                 pending_fetch_error: None,
-                pending_fetch_info: Vec::new(),
                 pending_output_params: None,
                 prepared: None,
                 direct_marker_count: None,
