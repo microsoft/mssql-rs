@@ -555,7 +555,7 @@ msodbcsql build is measured.
     not a measured retail claim. A comparison that records `SQL_DRIVER_VER`
     and the tested msodbcsql build would close that evidence gap. Decision
     recorded in #547.
-20. **An oversized `sql_variant` payload with a non-zero overflow is refused by
+21. **An oversized `sql_variant` payload with a non-zero overflow is refused by
     the driver, not the server.** `sql_variant` cannot hold a `max` type
     (server error 529), so a payload past the 8000-byte ceiling has to be
     refused somewhere. msodbcsql sends it and surfaces the server's refusal as
