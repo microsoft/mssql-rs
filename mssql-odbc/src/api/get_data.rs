@@ -966,7 +966,7 @@ fn finish_get_data(
     // A row's column was genuinely captured to reach this point (`ready`
     // requires it), so a row was always delivered here — unlike
     // `fetch_scroll.rs`'s zero-row fetch case.
-    let has_server_info =
+    let (has_server_info, _) =
         release_busy_if_row_exhausted(dbc, stmt, statement_handle, client, |_| false);
     if rc == SQL_SUCCESS && has_server_info {
         SQL_SUCCESS_WITH_INFO

@@ -376,6 +376,10 @@ pub(super) fn return_client_busy(dbc: &DbcHandle, client: TdsClient) {
 /// so it has to be recorded first; its return value reports whether it posted
 /// a server message. Callers with nothing pending pass `|_| false`.
 ///
+/// Returns `(has_server_info, preceding_ran)`. `preceding_ran` is `false` when
+/// the statement lock was poisoned and the closure therefore never ran, so a
+/// caller that relies on it having posted can fall back rather than assume.
+///
 /// # Caller obligation
 /// Only call this once every column of the row positioned when `client` was
 /// claimed has been read — like `next_row_cursor`, the peek discards
@@ -386,7 +390,7 @@ pub(super) fn release_busy_if_row_exhausted(
     statement_handle: SqlHandle,
     mut client: TdsClient,
     post_preceding: impl FnOnce(&mut StmtState) -> bool,
-) -> bool {
+) -> (bool, bool) {
     let peek_result = match client.try_peek_past_current_row() {
         Ok(CursorPoll::Ready(has_row)) => Ok(has_row),
         Ok(CursorPoll::Pending) => dbc.runtime.block_on(client.peek_past_current_row()),
@@ -438,11 +442,13 @@ pub(super) fn release_busy_if_row_exhausted(
     let drained_info = client.take_info_messages();
 
     let mut has_server_info = false;
+    let mut preceding_ran = false;
     if let Ok(mut stmt_state) = stmt.inner.lock() {
         if release {
             stmt_state.pending_output_params =
                 Some((client.get_return_values(), client.get_return_status()));
         }
+        preceding_ran = true;
         has_server_info = post_preceding(&mut stmt_state);
         has_server_info |= post_tds_info_messages(&mut stmt_state, &drained_info);
         if let Some(e) = read_error {
@@ -468,7 +474,7 @@ pub(super) fn release_busy_if_row_exhausted(
             Some(statement_handle)
         };
     }
-    has_server_info
+    (has_server_info, preceding_ran)
 }
 
 /// Restores the client to idle, posts a TDS error to `stmt`, clears
@@ -1901,13 +1907,7 @@ mod tests {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let client = dbc.inner.lock().unwrap().client.take().unwrap();
 
-        assert!(!release_busy_if_row_exhausted(
-            dbc,
-            stmt,
-            h.stmt,
-            client,
-            |_| false
-        ));
+        assert!(!release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false).0);
 
         assert!(dbc.inner.lock().unwrap().active_stmt.is_none());
         assert!(dbc.inner.lock().unwrap().client.is_some());
@@ -1940,13 +1940,7 @@ mod tests {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let client = dbc.inner.lock().unwrap().client.take().unwrap();
 
-        assert!(!release_busy_if_row_exhausted(
-            dbc,
-            stmt,
-            h.stmt,
-            client,
-            |_| false
-        ));
+        assert!(!release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false).0);
 
         assert!(dbc.inner.lock().unwrap().active_stmt.is_none());
         let ss = stmt.inner.lock().unwrap();
@@ -2045,7 +2039,7 @@ mod tests {
         let client = dbc.inner.lock().unwrap().client.take().unwrap();
 
         assert!(
-            release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false),
+            release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false).0,
             "the fetch caller must be told to return SQL_SUCCESS_WITH_INFO"
         );
 
@@ -2187,7 +2181,7 @@ mod tests {
         let client = dbc.inner.lock().unwrap().client.take().unwrap();
 
         assert!(
-            release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false),
+            release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false).0,
             "the caller must be told a server message was posted"
         );
 
@@ -2240,13 +2234,7 @@ mod tests {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let client = dbc.inner.lock().unwrap().client.take().unwrap();
 
-        assert!(release_busy_if_row_exhausted(
-            dbc,
-            stmt,
-            h.stmt,
-            client,
-            |_| false
-        ));
+        assert!(release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false).0);
 
         assert!(
             dbc.inner.lock().unwrap().active_stmt.is_none(),
@@ -2271,6 +2259,45 @@ mod tests {
             "must not stay resident on the client, where a different statement \
              claiming the connection next could have it misattributed to its \
              own diagnostics"
+        );
+    }
+
+    /// The closure runs under the statement lock, so a poisoned lock skips it
+    /// entirely. Reporting `preceding_ran == false` is what lets the caller
+    /// tell "nothing to post" apart from "never got the chance", instead of
+    /// assuming the closure ran and suppressing its own fallback.
+    #[test]
+    fn release_busy_if_row_exhausted_reports_a_skipped_preceding_closure() {
+        let h = TestHandles::with_env_dbc_stmt();
+        position_and_inject(&h, vec![col_metadata_empty(), done_no_more()]);
+
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let client = dbc.inner.lock().unwrap().client.take().unwrap();
+
+        // Poison the statement lock the helper needs.
+        assert!(
+            std::thread::scope(|scope| {
+                scope
+                    .spawn(|| {
+                        let _guard = stmt.inner.lock().unwrap();
+                        panic!("poison the stmt lock");
+                    })
+                    .join()
+            })
+            .is_err()
+        );
+
+        let ran = std::cell::Cell::new(false);
+        let (_, preceding_ran) = release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| {
+            ran.set(true);
+            true
+        });
+
+        assert!(!ran.get(), "the poisoned lock must skip the closure");
+        assert!(
+            !preceding_ran,
+            "a skipped closure must be reported, not assumed to have posted"
         );
     }
 
@@ -2306,13 +2333,12 @@ mod tests {
             line_number: None,
         }];
 
-        assert!(release_busy_if_row_exhausted(
-            dbc,
-            stmt,
-            h.stmt,
-            client,
-            |s| post_tds_info_messages(s, &earlier)
-        ));
+        assert!(
+            release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |s| {
+                post_tds_info_messages(s, &earlier)
+            })
+            .0
+        );
 
         let ss = stmt.inner.lock().unwrap();
         let order: Vec<&str> = ss

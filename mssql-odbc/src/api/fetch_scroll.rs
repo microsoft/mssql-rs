@@ -1440,10 +1440,11 @@ fn fill_rowset(
     let peek_is_safe =
         !client.maybe_has_unread_rows() || row_array_size != 1 || last_column_read == column_count;
 
-    // Each branch reports whether it posted a server message and whether it
-    // ran `post_row_diagnostics`, rather than having a later line re-derive
-    // which branch was taken: desyncing the two would either double-post the
-    // row diagnostics or drop them, and nothing would catch it.
+    // Each branch reports whether it posted a server message and whether the
+    // row diagnostics were actually written, rather than having a later line
+    // re-derive which branch was taken or assume the helper's closure ran:
+    // desyncing the two would either double-post the row diagnostics or drop
+    // them, and nothing would catch it.
     let (release_has_server_info, row_diags_posted) = if fetch_error.is_some() {
         let Ok(mut dbc_state) = dbc.inner.lock() else {
             error!("SQLFetchScroll: dbc mutex poisoned returning client");
@@ -1459,10 +1460,11 @@ fn fill_rowset(
         // being posted below: it all left the wire before anything the release
         // peek finds, and posting it afterward would invert the order
         // SQLGetDiagRec reports it in.
-        let posted = release_busy_if_row_exhausted(dbc, stmt, statement_handle, client, |s| {
-            post_row_diagnostics(s, &info_messages, worst)
-        });
-        (posted, true)
+        let (posted, preceding_ran) =
+            release_busy_if_row_exhausted(dbc, stmt, statement_handle, client, |s| {
+                post_row_diagnostics(s, &info_messages, worst)
+            });
+        (posted, preceding_ran)
     } else {
         let Ok(mut dbc_state) = dbc.inner.lock() else {
             error!("SQLFetchScroll: dbc mutex poisoned returning client");
