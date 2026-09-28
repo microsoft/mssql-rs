@@ -5188,13 +5188,17 @@ mod tests {
             vec![Row::new(vec![ColumnValue::NVarCharMax(vec![vec![
                 0x41, 0x42, 0x43,
             ]])])],
-        )
-        .with_trailing_info_tokens(vec![InfoMessage::new(
-            8153,
-            10,
-            "Null value is eliminated by an aggregate.",
-        )]);
-        let _server = crate::test_support::connect_mock_server(dbc, "SELECT plp_info", response);
+        );
+        let _server = crate::test_support::connect_mock_server_with_trailing_info(
+            dbc,
+            "SELECT plp_info",
+            response,
+            vec![InfoMessage::new(
+                8153,
+                10,
+                "Null value is eliminated by an aggregate.",
+            )],
+        );
         let sql: Vec<u16> = "SELECT plp_info\0".encode_utf16().collect();
         assert_eq!(
             unsafe { crate::api::exec_direct::sql_exec_direct_w(h.stmt, sql.as_ptr(), SQL_NTS) },

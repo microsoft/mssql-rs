@@ -915,6 +915,15 @@ pub fn build_terminal_error_tokens(error: &crate::query_response::TerminalError)
 
 /// Build a query result from a QueryResponse
 pub fn build_query_result(response: &crate::query_response::QueryResponse) -> BytesMut {
+    build_query_result_with_trailing_info(response, &[])
+}
+
+/// Build a query result whose `trailing_info` tokens follow the last row,
+/// before the terminal DONE — where SQL Server reports an aggregate warning.
+pub fn build_query_result_with_trailing_info(
+    response: &crate::query_response::QueryResponse,
+    trailing_info: &[crate::query_response::InfoMessage],
+) -> BytesMut {
     let mut result = BytesMut::new();
 
     // A terminal error replaces the result set entirely: no ColMetadata, no
@@ -988,7 +997,7 @@ pub fn build_query_result(response: &crate::query_response::QueryResponse) -> By
 
     // Trailing Info tokens: after the last row, before DONE — where SQL Server
     // reports an aggregate warning such as 8153.
-    for info in &response.trailing_info_tokens {
+    for info in trailing_info {
         result.extend_from_slice(&build_info_token(info));
     }
 

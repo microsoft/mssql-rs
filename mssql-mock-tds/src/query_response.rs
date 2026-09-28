@@ -260,12 +260,6 @@ pub struct QueryResponse {
     pub columns: Vec<ColumnDefinition>,
     pub rows: Vec<Row>,
     pub info_tokens: Vec<InfoMessage>,
-    /// Info tokens emitted *after* the last row, before the terminal DONE —
-    /// where SQL Server puts an aggregate warning such as 8153. Unlike
-    /// `info_tokens` (sent between ColMetadata and the rows), these are only
-    /// reachable once a reader has consumed every row, so they exercise the
-    /// driver's terminal read-ahead rather than its execute path.
-    pub trailing_info_tokens: Vec<InfoMessage>,
     /// An error emitted (with a DONE MORE token) before the result set, so the
     /// server keeps streaming the row set after a statement-scoped error.
     pub leading_error: Option<LeadingError>,
@@ -284,7 +278,6 @@ impl QueryResponse {
             columns,
             rows,
             info_tokens: Vec::new(),
-            trailing_info_tokens: Vec::new(),
             leading_error: None,
             terminal_error: None,
             delay: None,
@@ -293,13 +286,6 @@ impl QueryResponse {
 
     pub fn with_info_tokens(mut self, info_tokens: Vec<InfoMessage>) -> Self {
         self.info_tokens = info_tokens;
-        self
-    }
-
-    /// Emit `info_tokens` after the last row instead of before the first, as
-    /// SQL Server does for an aggregate warning like 8153.
-    pub fn with_trailing_info_tokens(mut self, info_tokens: Vec<InfoMessage>) -> Self {
-        self.trailing_info_tokens = info_tokens;
         self
     }
 
@@ -317,7 +303,6 @@ impl QueryResponse {
             columns: Vec::new(),
             rows: Vec::new(),
             info_tokens: Vec::new(),
-            trailing_info_tokens: Vec::new(),
             leading_error: None,
             terminal_error: Some(error),
             delay: None,
@@ -337,7 +322,6 @@ impl QueryResponse {
             columns: vec![ColumnDefinition::new("", SqlDataType::Int)],
             rows: vec![Row::new(vec![ColumnValue::Int(1)])],
             info_tokens: Vec::new(),
-            trailing_info_tokens: Vec::new(),
             leading_error: None,
             terminal_error: None,
             delay: None,
@@ -358,7 +342,6 @@ impl QueryResponse {
                 ColumnValue::Int(3),
             ])],
             info_tokens: Vec::new(),
-            trailing_info_tokens: Vec::new(),
             leading_error: None,
             terminal_error: None,
             delay: None,
@@ -391,6 +374,10 @@ pub const RPC_DELAY_KEY: &str = "__MOCK_TDS_RPC_DELAY__";
 /// Registry of query responses
 pub struct QueryRegistry {
     responses: HashMap<String, QueryResponse>,
+    /// Info tokens emitted after a registered response's last row. Kept beside
+    /// the response rather than inside it so `QueryResponse` stays
+    /// literal-constructible by existing callers.
+    trailing_info: HashMap<String, Vec<InfoMessage>>,
 }
 
 impl QueryRegistry {
@@ -398,6 +385,7 @@ impl QueryRegistry {
     pub fn new() -> Self {
         let mut registry = Self {
             responses: HashMap::new(),
+            trailing_info: HashMap::new(),
         };
 
         // Add default responses
@@ -416,9 +404,36 @@ impl QueryRegistry {
         self.responses.insert(query, response);
     }
 
+    /// Register a query response whose info tokens are emitted *after* the
+    /// last row, before the terminal DONE — where SQL Server puts an aggregate
+    /// warning such as 8153. Unlike [`QueryResponse::with_info_tokens`], which
+    /// sends them between ColMetadata and the rows, these are only reachable
+    /// once a reader has consumed every row, so they exercise a driver's
+    /// terminal read-ahead rather than its execute path.
+    ///
+    /// Held here rather than on [`QueryResponse`] so that adding it cannot
+    /// invalidate an existing `QueryResponse` struct literal.
+    pub fn register_with_trailing_info(
+        &mut self,
+        query: impl Into<String>,
+        response: QueryResponse,
+        trailing_info: Vec<InfoMessage>,
+    ) {
+        let query = query.into().to_uppercase();
+        self.responses.insert(query.clone(), response);
+        self.trailing_info.insert(query, trailing_info);
+    }
+
     /// Get a response for a query
     pub fn get(&self, query: &str) -> Option<&QueryResponse> {
         self.responses.get(&query.to_uppercase())
+    }
+
+    /// The info tokens registered to follow this query's last row, if any.
+    pub fn trailing_info(&self, query: &str) -> &[InfoMessage] {
+        self.trailing_info
+            .get(&query.to_uppercase())
+            .map_or(&[], Vec::as_slice)
     }
 
     /// Finds a registered response whose query text appears — encoded as
@@ -436,13 +451,27 @@ impl QueryRegistry {
     /// upper-case) SQL text — unlike [`get`](Self::get), which decodes and
     /// uppercases the incoming text before comparing.
     pub fn get_by_contained_utf16_text(&self, haystack: &[u8]) -> Option<&QueryResponse> {
+        self.get_by_contained_utf16_text_with_trailing_info(haystack)
+            .map(|(response, _)| response)
+    }
+
+    /// [`get_by_contained_utf16_text`](Self::get_by_contained_utf16_text),
+    /// also returning any info tokens registered to follow the last row.
+    pub fn get_by_contained_utf16_text_with_trailing_info(
+        &self,
+        haystack: &[u8],
+    ) -> Option<(&QueryResponse, &[InfoMessage])> {
         self.responses.iter().find_map(|(query, response)| {
             let needle: Vec<u8> = query
                 .encode_utf16()
                 .flat_map(|unit| unit.to_le_bytes())
                 .collect();
-            (!needle.is_empty() && haystack.windows(needle.len()).any(|w| w == needle))
-                .then_some(response)
+            (!needle.is_empty() && haystack.windows(needle.len()).any(|w| w == needle)).then(|| {
+                (
+                    response,
+                    self.trailing_info.get(query).map_or(&[][..], Vec::as_slice),
+                )
+            })
         })
     }
 }
