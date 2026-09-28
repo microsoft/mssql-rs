@@ -3062,6 +3062,12 @@ impl TdsClient {
 
         self.transport.reset_reader();
 
+        // This message's substitution accounting starts clean. Every exit below
+        // publishes a verdict for *this* batch, so a failure before any row is
+        // written must report no substitution rather than leave the previous
+        // message's verdict standing (AB#47598).
+        self.code_page_conversion_loss = false;
+
         // STEP 1: Filter column metadata to only include mapped columns
         // If we have column mappings, only include the destination columns that are mapped.
         // This allows SQL Server to handle NULL/defaults for unmapped columns.
@@ -3184,6 +3190,22 @@ impl TdsClient {
             }
         }
 
+        // A bulk row goes through the same `TdsValueSerializer` as an RPC
+        // parameter, so a narrow value can be substituted here too. This path
+        // builds its own `PacketWriter` and never reaches `finish_send`, so the
+        // verdict is published by hand.
+        //
+        // Published *here*, before the error branch, rather than after `end`:
+        // every exit below then carries it. Rows streamed before a mid-batch
+        // failure can already have been applied — a bulk copy with no internal
+        // transaction commits as it streams — so a substitution among them is
+        // real, and `BulkCopy::write_to_server` drains this in its `Err` arm to
+        // fold into the operation's verdict. Reading it now also ends the
+        // writer's borrow of the transport before either exit needs `&mut self`,
+        // and `end` writes only the DONE token, so nothing can be substituted
+        // between here and the return.
+        self.code_page_conversion_loss = writer.code_page_conversion_loss();
+
         // Handle error during row streaming
         if let Some(original_error) = row_write_error {
             // Send attention packet to cancel the bulk load operation gracefully.
@@ -3201,23 +3223,9 @@ impl TdsClient {
 
         // STEP 4: End streaming (write DONE token and finalize)
         //
-        // A bulk row goes through the same `TdsValueSerializer` as an RPC
-        // parameter, so a narrow value can be substituted here too. This path
-        // builds its own `PacketWriter` and never reaches `finish_send`, so the
-        // flag is carried across by hand; without it
-        // `take_code_page_conversion_loss` would answer `false` immediately
-        // after a bulk substitution, which its doc comment promises otherwise.
-        // Read before `end`, which consumes the writer.
-        //
-        // Assigned, not OR-ed: this is one complete message, and the assignment
-        // opens its reporting window exactly as `finish_send` does a request's.
-        // A *multi-batch* bulk copy is several such messages, so
-        // `BulkCopy::write_to_server` drains this after every batch and restores
-        // the accumulated verdict at the end — assigning alone would let the
-        // last batch overwrite an earlier batch's substitution (AB#47598).
-        let had_loss = writer.code_page_conversion_loss();
+        // The substitution verdict was published above so that the error exits
+        // carry it too; `end` cannot change it.
         let rows_written = writer.end().await?;
-        self.code_page_conversion_loss = had_loss;
 
         // STEP 5: Drain the server response for error handling and INFO capture.
         // Its returned count is informational only; callers receive the client-side
