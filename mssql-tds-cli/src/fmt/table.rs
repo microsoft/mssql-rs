@@ -146,6 +146,28 @@ impl Table {
             .collect()
     }
 
+    /// The heading that would have introduced the next row, emitted once the
+    /// rows run out on an exact group boundary. Both references print it, so a
+    /// result whose row count is a multiple of `-h n` ends on a heading.
+    pub fn trailing_header(&mut self) -> Vec<String> {
+        let due = match self.style.headers {
+            n if n <= 0 => false,
+            n => self.header_written && self.rows_since_header % n == 0,
+        };
+        if !due {
+            return Vec::new();
+        }
+        let mut out: Vec<String> = self
+            .header_lines()
+            .into_iter()
+            .flat_map(|line| self.wrap(line))
+            .collect();
+        if self.style.gap_before_repeat {
+            out.push(String::new());
+        }
+        out
+    }
+
     /// `-w` wraps rather than truncates: the line is cut into screen-width chunks.
     fn wrap(&self, line: String) -> Vec<String> {
         let width = self.style.screen_width;

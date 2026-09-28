@@ -76,6 +76,9 @@ pub struct Outcome {
     counted: bool,
     /// Whether the current result set drew any rows.
     drew_rows: bool,
+    /// Whether a result set was rendered at all, rows or bare heading. go-sqlcmd
+    /// gaps a following count on that, not on the row count.
+    rendered_set: bool,
 }
 
 impl Outcome {
@@ -150,7 +153,11 @@ fn report_counts(client: &mut TdsClient, outcome: &mut Outcome, style: &RunStyle
     }
     for count in counts.into_iter().flatten() {
         let text = report::rows_affected(count, style.compat);
-        let text = if outcome.suppress_count_gap {
+        // go-sqlcmd gaps a count only when it directly follows a result set's
+        // rows; consecutive counts, and counts for statements that drew none,
+        // run flush against what came before.
+        let earns_gap = !style.compat.is_go() || (outcome.rendered_set && !outcome.counted);
+        let text = if outcome.suppress_count_gap || !earns_gap {
             text.trim_start_matches(EOL).to_string()
         } else {
             text
@@ -249,6 +256,11 @@ async fn render_result_set(
                     buffer.push_str(&line);
                     buffer.push_str(EOL);
                 }
+            } else {
+                for line in table.trailing_header() {
+                    buffer.push_str(&line);
+                    buffer.push_str(EOL);
+                }
             }
         }
         Format::Vertical => {
@@ -279,6 +291,7 @@ async fn render_result_set(
 
     outcome.output.push(Output::Result(buffer));
     outcome.drew_rows = rows > 0;
+    outcome.rendered_set = true;
     outcome.counted = false;
     Ok(())
 }
