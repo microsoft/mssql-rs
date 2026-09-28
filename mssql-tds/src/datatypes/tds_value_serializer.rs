@@ -1427,10 +1427,18 @@ impl TdsValueSerializer {
                 // Otherwise (UTF-8 or UTF-16 source), decode and re-encode to target code page
                 let decoded_str = value.to_utf8_string();
                 let encoded = Self::encode_narrow_for_wire(&decoded_str, ctx.collation);
-                if encoded.had_loss {
+                // Marked only once the value has actually serialized.
+                // `serialize_char_varchar_direct` rejects an over-length value
+                // before writing a byte, and a substitution shortens nothing
+                // into range -- an astral `??` still overflows `varchar(1)`.
+                // Marking first would report loss for bytes that never reached
+                // the wire, which the bulk-load error path then publishes
+                // (AB#47598).
+                let result = Self::serialize_char_varchar_direct(writer, &encoded.bytes, ctx).await;
+                if result.is_ok() && encoded.had_loss {
                     writer.note_code_page_conversion_loss();
                 }
-                return Self::serialize_char_varchar_direct(writer, &encoded.bytes, ctx).await;
+                return result;
             }
             _ => {
                 return Err(Error::UsageError(format!(
@@ -1933,6 +1941,13 @@ impl TdsValueSerializer {
         // transcoding it, corrupting the value on the wire without changing a
         // single data byte, which is strictly worse. get_variant_base_type
         // below must stay in lockstep with this.
+        //
+        // The substitution verdict is held here and applied only after the
+        // variant has fully serialized: the base-type, property-length and
+        // 8000/8016-byte checks below all reject before a wrapper byte is
+        // written, so marking at resolve time would report loss for a value
+        // that never reached the wire (AB#47598).
+        let mut narrow_had_loss = false;
         let resolved_narrow: Option<Cow<'_, [u8]>> = match value {
             ColumnValues::String(s)
                 if matches!(
@@ -1941,9 +1956,7 @@ impl TdsValueSerializer {
                 ) =>
             {
                 let (bytes, had_loss) = Self::resolve_narrow_wire_bytes(s, ctx.collation);
-                if had_loss {
-                    writer.note_code_page_conversion_loss();
-                }
+                narrow_had_loss = had_loss;
                 Some(bytes)
             }
             _ => None,
@@ -2012,6 +2025,10 @@ impl TdsValueSerializer {
         match &resolved_narrow {
             Some(bytes) => Self::serialize_char_varchar_direct(writer, bytes, &temp_ctx).await?,
             None => Self::serialize_value_inner(writer, value, &temp_ctx).await?,
+        }
+
+        if narrow_had_loss {
+            writer.note_code_page_conversion_loss();
         }
 
         Ok(())

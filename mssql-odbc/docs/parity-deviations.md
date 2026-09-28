@@ -648,6 +648,14 @@ msodbcsql build is measured.
     `UnmappableCharacterIsSubstituted` and its siblings run unskipped on the
     rows both drivers agree on. Tracked in AB#47598.
 
+    **Human parity sign-off has not been recorded.** This entry describes an
+    application-visible regression against msodbcsql — Polish, Czech, Croatian,
+    Turkish and Baltic text bound to a CP1252 `varchar` transliterates there and
+    is substituted here — so the registry's "who signed off and when" applies.
+    The decision is evidenced (measured three ways, with the musl leg explicitly
+    unmeasured) but not approved; record the approver and date in AB#47598
+    before relying on this entry as settled.
+
 22. **`SQL_COPT_SS_WARN_ON_CP_ERROR` reports code-page loss on input
     parameters; msodbcsql reports it only on retrieval.** msodbcsql posts
     `IDS_01_000_16` ("Warning: Code page translation caused loss of data",
