@@ -5127,7 +5127,11 @@ impl TdsClient {
                         done.has_more()
                     );
 
-                    if done.has_error() && !self.consumed_pending_error() {
+                    // Read before the flag check: `&&` would short-circuit
+                    // past it on a DONE without the error flag, leaving the
+                    // excuse armed to absolve a genuinely unpaired one later.
+                    let excused = self.consumed_pending_error();
+                    if done.has_error() && !excused {
                         return Err(crate::error::Error::ProtocolError(
                             "Server reported error in DONE token without preceding ERROR token"
                                 .to_string(),
@@ -7718,8 +7722,11 @@ impl TdsClient {
         info!("done while get_next_row: {:?}", done);
 
         // A deferred error was already collected and will be reported by the
-        // caller, so it does not make this DONE a protocol violation.
-        if done.has_error() && self.prepared_batch.is_none() && !self.consumed_pending_error() {
+        // caller, so it does not make this DONE a protocol violation. Read
+        // first: `&&` would short-circuit past the one-shot flag and leave it
+        // armed to excuse a genuinely unpaired error-flagged DONE later.
+        let excused = self.consumed_pending_error();
+        if done.has_error() && self.prepared_batch.is_none() && !excused {
             return Err(crate::error::Error::ProtocolError(
                 "Server reported error in DONE token without preceding ERROR token".to_string(),
             ));
@@ -7797,6 +7804,11 @@ impl TdsClient {
 
     /// Takes the errors collected under
     /// [`set_defer_batch_errors`](Self::set_defer_batch_errors), in arrival order.
+    ///
+    /// Take them before issuing the next command: the next `execute*` clears
+    /// the queue. That matters most when deferral still returns `Err` — a
+    /// transport failure part-way through a batch — where a caller that treats
+    /// `Err` as terminal and reissues loses the SQL error explaining it.
     pub fn take_pending_errors(&mut self) -> Vec<SqlErrorInfo> {
         std::mem::take(&mut self.pending_errors)
     }
@@ -7816,6 +7828,8 @@ impl TdsClient {
     /// its total directly, prepared RPC batches carry per-row counts in
     /// [`PreparedBatchResult`](crate::connection::PreparedBatchResult), and
     /// transaction control has no statement counts to report.
+    ///
+    /// Take them before issuing the next command, which clears the log.
     pub fn take_done_row_counts(&mut self) -> Vec<Option<u64>> {
         std::mem::take(&mut self.done_row_counts)
     }
@@ -9303,6 +9317,32 @@ mod tests {
         assert!(
             client.take_done_row_counts().is_empty(),
             "a prepared batch reports through PreparedBatchResult, not the log"
+        );
+    }
+
+    /// A DONE that arrives without the error flag still spends the excuse.
+    /// Otherwise a collected error whose closing DONE is unflagged would leave
+    /// it armed, absolving a genuinely unpaired error-flagged DONE later in the
+    /// same request.
+    #[test]
+    fn an_unflagged_done_still_spends_the_excuse() {
+        let mut client = create_test_client();
+        client.unreported_error = true;
+
+        client
+            .handle_row_done(
+                DoneToken {
+                    status: DoneStatus::COUNT,
+                    cur_cmd: CurrentCommand::Select,
+                    row_count: 1,
+                },
+                false,
+            )
+            .unwrap();
+
+        assert!(
+            !client.unreported_error,
+            "the excuse must not survive a DONE that did not need it"
         );
     }
 
