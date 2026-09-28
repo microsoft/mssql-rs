@@ -13,7 +13,7 @@ mod encoding;
 pub use encoding::{ResolvedDecoder, ResolvedEncoding};
 
 use super::{
-    lcid_encoding::lcid_to_encoding,
+    lcid_encoding::{lcid_to_code_page, lcid_to_encoding},
     sqldatatypes::{TypeInfoVariant, is_unicode_type},
 };
 
@@ -102,35 +102,7 @@ pub(crate) fn collation_code_page(collation: SqlCollation) -> Option<u16> {
     if let Some(code_page) = CODE_PAGE_FROM_SORT_ID[usize::from(collation.sort_id)] {
         return Some(code_page);
     }
-    let lcid = collation.info & 0x000F_FFFF;
-    lcid_to_encoding(lcid).ok().and_then(encoding_to_code_page)
-}
-
-/// Maps the `encoding_rs` encodings [`lcid_to_encoding`] can return back to
-/// their Windows code page number.
-fn encoding_to_code_page(encoding: &'static encoding_rs::Encoding) -> Option<u16> {
-    use encoding_rs as e;
-    for (candidate, code_page) in [
-        (e::WINDOWS_1250, 1250u16),
-        (e::WINDOWS_1251, 1251),
-        (e::WINDOWS_1252, 1252),
-        (e::WINDOWS_1253, 1253),
-        (e::WINDOWS_1254, 1254),
-        (e::WINDOWS_1255, 1255),
-        (e::WINDOWS_1256, 1256),
-        (e::WINDOWS_1257, 1257),
-        (e::WINDOWS_1258, 1258),
-        (e::WINDOWS_874, 874),
-        (e::SHIFT_JIS, 932),
-        (e::GBK, 936),
-        (e::EUC_KR, 949),
-        (e::BIG5, 950),
-    ] {
-        if std::ptr::eq(encoding, candidate) {
-            return Some(code_page);
-        }
-    }
-    None
+    lcid_to_code_page(collation.info & 0x000F_FFFF)
 }
 
 /// Encodes `text` for the wire under `collation`'s narrow encoding: UTF-8 when
@@ -605,6 +577,15 @@ mod tests {
             sort_id: 0,
         };
         assert_eq!(collation_code_page(cyrillic), Some(1251));
+        // A niche CP1252 Windows collation whose LCID the encoding table does
+        // not carry (Welsh, 0x0452) still resolves through the full locale map.
+        let welsh = SqlCollation {
+            info: 0x0452,
+            lcid_language_id: 0,
+            col_flags: 0,
+            sort_id: 0,
+        };
+        assert_eq!(collation_code_page(welsh), Some(1252));
         // An unmapped LCID has no code page.
         let unknown = SqlCollation {
             info: 0x000F_FFFF,

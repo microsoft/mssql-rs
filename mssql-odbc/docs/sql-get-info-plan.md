@@ -109,6 +109,8 @@ claim them as such.
 | `SQL_SCROLL_OPTIONS` | `SQL_SO_FORWARD_ONLY` | Only forward-only cursors are implemented. Planned Phase 10. |
 | `SQL_FETCH_DIRECTION` | `SQL_FD_FETCH_NEXT` | Deprecated identifier truthfully mirrors forward-only fetch support. Phase 10 owns additional directions. |
 | `SQL_POSITIONED_STATEMENTS` | `0` | Positioned update/delete is not implemented. Planned Phase 10. |
+| `SQL_POS_OPERATIONS` | `0` | `SQLSetPos` is not implemented, so no positioned operations are advertised. Planned Phase 10. |
+| `SQL_LOCK_TYPES` | `0` | Deprecated `SQLSetPos` lock types; `SQLSetPos` is not implemented. Planned Phase 10. |
 | `SQL_SCROLL_CONCURRENCY` | `SQL_SCCO_READ_ONLY` | Deprecated identifier truthfully mirrors read-only cursor support. Phase 10 owns additional modes. |
 | `SQL_STATIC_SENSITIVITY` | `0` | Deprecated identifier; static cursor changes are not implemented. Planned Phase 10. |
 

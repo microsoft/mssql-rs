@@ -551,11 +551,6 @@ TEST_F(GetInfoLiveTest, WorkItem47996U32ValuesMatchMsodbcsql) {
              SQL_ISV_TABLE_CONSTRAINTS | SQL_ISV_TABLE_PRIVILEGES | SQL_ISV_TABLES |
              SQL_ISV_VIEW_COLUMN_USAGE | SQL_ISV_VIEW_TABLE_USAGE | SQL_ISV_VIEWS,
          "SQL_INFO_SCHEMA_VIEWS"},
-        {SQL_LOCK_TYPES, SQL_LCK_NO_CHANGE, "SQL_LOCK_TYPES"},
-        {SQL_POS_OPERATIONS,
-         SQL_POS_POSITION | SQL_POS_REFRESH | SQL_POS_UPDATE | SQL_POS_DELETE |
-             SQL_POS_ADD,
-         "SQL_POS_OPERATIONS"},
         {SQL_STANDARD_CLI_CONFORMANCE, SQL_SCC_ISO92_CLI,
          "SQL_STANDARD_CLI_CONFORMANCE"},
         {SQL_MAX_INDEX_SIZE, 900u, "SQL_MAX_INDEX_SIZE"},
@@ -624,6 +619,10 @@ TEST_F(GetInfoLiveTest, WorkItem47996CapabilitiesDescribeThisDriver) {
          "SQL_MAX_ASYNC_CONCURRENT_STATEMENTS"},
         {SQL_ODBC_INTERFACE_CONFORMANCE, SQL_OIC_CORE,
          "SQL_ODBC_INTERFACE_CONFORMANCE"},
+        // SQLSetPos is unimplemented (planned Phase 10), so this driver
+        // advertises no positioned operations or lock types, unlike retail.
+        {SQL_POS_OPERATIONS, 0u, "SQL_POS_OPERATIONS"},
+        {SQL_LOCK_TYPES, 0u, "SQL_LOCK_TYPES"},
     };
 
     for (const Case& c : cases) {

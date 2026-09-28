@@ -138,9 +138,6 @@ const SQL_IK_ALL: u32 = 0x0000_0001 | 0x0000_0002;
 const SQL_IS_INSERT_LITERALS: u32 = 0x0000_0001;
 const SQL_IS_INSERT_SEARCHED: u32 = 0x0000_0002;
 const SQL_IS_SELECT_INTO: u32 = 0x0000_0004;
-const SQL_POS_OPERATIONS_SPT: u32 =
-    0x0000_0001 | 0x0000_0002 | 0x0000_0004 | 0x0000_0008 | 0x0000_0010;
-const SQL_LCK_NO_CHANGE: u32 = 0x0000_0001;
 const SQL_OIC_CORE: u32 = 1;
 const SQL_SCC_ISO92_CLI: u32 = 0x0000_0002;
 const SQL_QL_START: u16 = 0x0001;
@@ -542,13 +539,15 @@ const STATIC_INFO: &[InfoEntry] = &[
         info_type: odbc::SQL_INFO_SCHEMA_VIEWS,
         value: InfoValue::Bitmask(SQL_INFO_SCHEMA_VIEWS_MASK),
     },
+    // SQLSetPos is not implemented (planned in Phase 10), so this driver
+    // advertises no positioned operations or lock types.
     InfoEntry {
         info_type: odbc::SQL_LOCK_TYPES,
-        value: InfoValue::Bitmask(SQL_LCK_NO_CHANGE),
+        value: InfoValue::Bitmask(NO_CAPABILITIES),
     },
     InfoEntry {
         info_type: odbc::SQL_POS_OPERATIONS,
-        value: InfoValue::Bitmask(SQL_POS_OPERATIONS_SPT),
+        value: InfoValue::Bitmask(NO_CAPABILITIES),
     },
     InfoEntry {
         info_type: odbc::SQL_CREATE_SCHEMA,
@@ -1294,8 +1293,9 @@ fn collation_seq_name(code_page: Option<u16>) -> Option<&'static str> {
 fn char_set_display_name(char_set: &str) -> String {
     if char_set.eq_ignore_ascii_case("iso_1") {
         "ISO 8859-1".to_string()
-    } else if char_set.len() > 2 {
-        format!("Code page {}", &char_set[2..])
+    } else if char_set.chars().count() > 2 {
+        let suffix: String = char_set.chars().skip(2).collect();
+        format!("Code page {suffix}")
     } else {
         char_set.to_string()
     }
@@ -1851,8 +1851,9 @@ mod tests {
                 SQL_IS_INSERT_LITERALS | SQL_IS_INSERT_SEARCHED | SQL_IS_SELECT_INTO,
             ),
             (odbc::SQL_INFO_SCHEMA_VIEWS, SQL_INFO_SCHEMA_VIEWS_MASK),
-            (odbc::SQL_LOCK_TYPES, SQL_LCK_NO_CHANGE),
-            (odbc::SQL_POS_OPERATIONS, SQL_POS_OPERATIONS_SPT),
+            // SQLSetPos unimplemented: no positioned operations or lock types.
+            (odbc::SQL_LOCK_TYPES, 0),
+            (odbc::SQL_POS_OPERATIONS, 0),
             (
                 odbc::SQL_CREATE_SCHEMA,
                 SQL_CS_CREATE_SCHEMA | SQL_CS_AUTHORIZATION,
@@ -2002,6 +2003,9 @@ mod tests {
         assert_eq!(char_set_display_name("iso_1"), "ISO 8859-1");
         assert_eq!(char_set_display_name("cp850"), "Code page 850");
         assert_eq!(char_set_display_name("cp1252"), "Code page 1252");
+        // A non-ASCII name must drop two characters without slicing a UTF-8
+        // byte boundary, so this must not panic.
+        assert_eq!(char_set_display_name("café"), "Code page fé");
     }
 
     #[test]
