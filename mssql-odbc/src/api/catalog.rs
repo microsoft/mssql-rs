@@ -612,12 +612,12 @@ fn run_catalog(
         //
         // DIVERGES from msodbcsql, deliberately: its retry is a recursive
         // `DoDD` (`sqlcdd.cpp:1894`) whose re-entered `SQLExecDirectW` re-reads
-        // the *undeducted* `GetQueryTimeOut(lpstmt)`, so there the retry starts
-        // from a genuinely fresh budget and a two-attempt call can take a full
-        // 2x the configured timeout. Sharing the budget keeps the attribute's
-        // documented meaning — the caller's deadline for the call they made —
-        // rather than letting a driver-internal fallback double it. Tracked by
-        // mssql-rs#547.
+        // the *undeducted* `GetQueryTimeOut(lpstmt)`. Source predicts a fresh
+        // budget and up to 2x the configured timeout across both attempts;
+        // retail behavior has not been measured. Sharing the budget keeps the
+        // attribute's documented meaning — the caller's deadline for the
+        // call they made — rather than letting an internal fallback double it.
+        // Decision recorded in mssql-rs#547.
         //
         // The gate above, by contrast, MATCHES msodbcsql: only a server error
         // retries, never a timeout or transport failure, mirroring its

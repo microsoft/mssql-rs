@@ -17,7 +17,7 @@ use crate::handles::{
     DbcHandle, DescHandle, EnvHandle, HandleType, StmtHandle, free_handle, handle_from_raw,
     live_type, process_is_shutting_down,
 };
-use mssql_tds::connection::tds_client::StatementId;
+use mssql_tds::connection::tds_client::{ExecuteOptions, StatementId};
 
 /// Implementation of [`SQLFreeHandle`](super::exports::SQLFreeHandle).
 ///
@@ -459,10 +459,11 @@ fn best_effort_unprepare_on_free_inner(
         super::exec_common::unwind_dae(dbc, stmt, handle, None);
     }
 
-    let (prepared, pending) = match stmt.inner.lock() {
+    let (prepared, pending, query_timeout) = match stmt.inner.lock() {
         Ok(mut stmt_state) => (
             stmt_state.prepared.take().map(|p| p.stmt),
             stmt_state.pending_unprepare.take(),
+            stmt_state.query_timeout,
         ),
         Err(_) => return,
     };
@@ -497,13 +498,13 @@ fn best_effort_unprepare_on_free_inner(
     // `unprepare` skips a handle from a superseded session (already gone
     // server-side) and releases a live one.
     //
-    // `()` leaves this unbounded by `SQL_ATTR_QUERY_TIMEOUT`, unlike every
-    // other statement-scoped wire operation. msodbcsql bounds its equivalent
-    // (`DropPrepHandle`, `sqlcfunc.cpp:790-830`); doing the same here needs the
-    // statement's timeout captured before its state is torn down, so it is
-    // tracked by mssql-rs#546 rather than papered over here.
+    // msodbcsql's `DropPrepHandle` also bounds this cleanup by the statement
+    // timeout (`sqlcfunc.cpp:790-830`). A zero timeout stays unlimited.
     for statement_id in handles {
-        if let Err(e) = dbc.runtime.block_on(client.unprepare(statement_id, ())) {
+        if let Err(e) = dbc.runtime.block_on(client.unprepare(
+            statement_id,
+            ExecuteOptions::new().timeout_secs(query_timeout),
+        )) {
             error!(%e, "SQLFreeHandle(STMT): sp_unprepare failed — handle leaked until disconnect");
         }
     }
@@ -521,6 +522,60 @@ mod tests {
         SQL_ATTR_ODBC_VERSION, SQL_HANDLE_ENV, SQL_NULL_HANDLE, SQL_OV_ODBC3_80,
     };
     use crate::api::set_env_attr::sql_set_env_attr;
+
+    #[test]
+    fn free_stmt_query_timeout_bounds_unprepare_without_failing_cleanup() {
+        use crate::test_support::TestHandles;
+        use mssql_mock_tds::QueryResponse;
+        use std::time::{Duration, Instant};
+
+        let mut h = TestHandles::with_env_dbc();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let mock_server =
+            crate::test_support::connect_mock_server(dbc, "SELECT 1", QueryResponse::select_one());
+        mock_server.set_rpc_delay(Duration::from_secs(8));
+
+        let stmt_handle = h.alloc_extra_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(stmt_handle) };
+        crate::test_support::arm_pending_unprepare(dbc, stmt);
+        stmt.inner.lock().unwrap().query_timeout = 1;
+
+        let started = Instant::now();
+        assert_eq!(h.free_extra_stmt(stmt_handle), SQL_SUCCESS);
+        let elapsed = started.elapsed();
+        assert!(
+            (Duration::from_millis(750)..Duration::from_secs(5)).contains(&elapsed),
+            "unprepare took {elapsed:?}: it must reach the wire and time out near one second, \
+             not skip the RPC or wait for the eight-second server delay"
+        );
+        let state = dbc.inner.lock().unwrap();
+        assert_eq!(state.active_stmt, None);
+        assert!(state.client.is_some());
+    }
+
+    #[test]
+    fn free_stmt_zero_query_timeout_does_not_bound_unprepare() {
+        use crate::test_support::TestHandles;
+        use mssql_mock_tds::QueryResponse;
+        use std::time::{Duration, Instant};
+
+        let mut h = TestHandles::with_env_dbc();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let mock_server =
+            crate::test_support::connect_mock_server(dbc, "SELECT 1", QueryResponse::select_one());
+        mock_server.set_rpc_delay(Duration::from_millis(1_300));
+
+        let stmt_handle = h.alloc_extra_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(stmt_handle) };
+        crate::test_support::arm_pending_unprepare(dbc, stmt);
+
+        let started = Instant::now();
+        assert_eq!(h.free_extra_stmt(stmt_handle), SQL_SUCCESS);
+        assert!(
+            started.elapsed() >= Duration::from_millis(1_200),
+            "the default zero timeout must wait for the server's unprepare reply"
+        );
+    }
 
     /// Allocate an ENV handle with ODBC 3.80 version set.
     fn alloc_env() -> SqlHandle {
