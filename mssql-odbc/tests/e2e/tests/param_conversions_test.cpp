@@ -2333,9 +2333,13 @@ TEST_F(UdtParamLiveTest, AUdtParameterWithoutATypeNameFails) {
 // call CheckTrailingZeros, so a zero-padded overflow is refused rather than
 // trimmed - asserted here because that is the half most likely to drift.
 TEST_F(UdtParamLiveTest, AUdtPayloadPastABoundedColumnSizeIsRefused) {
-    std::vector<SQLCHAR> payload = SerializedHierarchyId("/3/");
+    // A multi-level path: a single-level hierarchyid serializes to one byte,
+    // and `ColumnSize = 0` is SQL_SS_LENGTH_UNLIMITED, so there would be no
+    // bounded value below it to test with.
+    const char* kPath = "/1/2/3/4/5/6/7/8/9/10/";
+    std::vector<SQLCHAR> payload = SerializedHierarchyId(kPath);
     ASSERT_FALSE(payload.empty());
-    ASSERT_GT(payload.size(), 1u);
+    ASSERT_GT(payload.size(), 1u) << "need a payload with a bounded size below it";
 
     // One byte short of the payload: bounded, so the payload no longer fits.
     const SQLULEN too_small = static_cast<SQLULEN>(payload.size() - 1);
@@ -2358,7 +2362,7 @@ TEST_F(UdtParamLiveTest, AUdtPayloadPastABoundedColumnSizeIsRefused) {
                                    payload.data(), indicator_, &indicator_),
                   SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(SetUdtName("hierarchyid"), SQL_HANDLE_STMT, stmt_);
-    EXPECT_EQ("/3/", ExecuteAndReadBack());
+    EXPECT_EQ(kPath, ExecuteAndReadBack());
 }
 
 // The ColumnSize ceiling, measured on both legs rather than read from source.
