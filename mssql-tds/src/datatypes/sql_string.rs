@@ -770,6 +770,12 @@ mod tests {
     /// Measured with `WideCharToMultiByte(932, 0, ...)`: `U+3042` is `82 A0`
     /// with no loss flag, `U+0141` is `3F` with it set, and the pair is
     /// `82 A0 3F`.
+    ///
+    /// Windows only. glibc `iconv -t CP932//TRANSLIT` best-fits `U+0141` to
+    /// `4C`, giving `82 A0 4C` — the same divergence parity-deviations entry 20
+    /// records for CP1252, so best-fit is not a CP1252-specific behaviour. This
+    /// is a unit test of *this* driver's encoder, not a cross-platform parity
+    /// assertion, so it pins `82 A0 3F` regardless.
     #[test]
     fn encode_narrow_substitutes_within_a_dbcs_code_page() {
         let collation = SqlCollation {

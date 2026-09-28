@@ -592,6 +592,13 @@ msodbcsql build is measured.
     Polish, Czech, Croatian, Turkish and Baltic text bound to a CP1252
     `varchar` transliterates on msodbcsql and becomes `?` here.
 
+    **Not CP1252-specific.** Measured on the DBCS and OEM code pages too:
+    `WideCharToMultiByte(932, ...)` substitutes `U+0141` (`3F`, loss flag set)
+    while glibc `iconv -t CP932//TRANSLIT` best-fits it to `4C`, and CP437
+    best-fits it to `4C` on Windows. The table above is CP1252 because that is
+    where the application impact is widest, not because the behaviour is
+    confined to it.
+
     **Not replicated because msodbcsql has no single behaviour to replicate.**
     Its non-Windows legs take transliteration from `iconv`: `cp_iconv::g_cp_iconv`
     appends `//TRANSLIT` (`LocalizationImpl.hpp:59`), which glibc honours with

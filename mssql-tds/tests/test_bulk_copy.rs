@@ -2806,7 +2806,7 @@ mod bulk_copy_integration_tests {
 
         {
             let mut bulk_copy = BulkCopy::new(&mut client, "#BulkDiverse");
-            bulk_copy.write_to_server_zerocopy(rows).await.unwrap();
+            bulk_copy.write_to_server_zerocopy(&rows).await.unwrap();
         }
 
         client
@@ -2894,7 +2894,7 @@ mod bulk_copy_integration_tests {
 
         {
             let mut bulk_copy = BulkCopy::new(&mut client, "#BulkNullable");
-            bulk_copy.write_to_server_zerocopy(rows).await.unwrap();
+            bulk_copy.write_to_server_zerocopy(&rows).await.unwrap();
         }
 
         client
@@ -3001,7 +3001,7 @@ mod bulk_copy_integration_tests {
 
         {
             let mut bulk_copy = BulkCopy::new(&mut client, "#BulkTime");
-            bulk_copy.write_to_server_zerocopy(rows).await.unwrap();
+            bulk_copy.write_to_server_zerocopy(&rows).await.unwrap();
         }
 
         client
@@ -3093,7 +3093,7 @@ mod bulk_copy_integration_tests {
 
         {
             let mut bulk_copy = BulkCopy::new(&mut client, "#BulkMoney");
-            bulk_copy.write_to_server_zerocopy(rows).await.unwrap();
+            bulk_copy.write_to_server_zerocopy(&rows).await.unwrap();
         }
 
         client
