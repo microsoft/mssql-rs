@@ -143,8 +143,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   The single `?` matches msodbcsql, which converts with `WideCharToMultiByte` /
   `iconv` and takes the code page's default character, and matches SQL Server's
   own `CAST(N'…' AS varchar(n))`. One substitute byte per UTF-16 code unit, so
-  an astral character yields two, as both of those do. As in msodbcsql, the
-  substitution is not an error and is silent by default.
+  an astral character yields two, matching `WideCharToMultiByte` and SQL Server;
+  msodbcsql's glibc leg emits one byte instead, recorded as parity deviation 20.
+  As in msodbcsql, the substitution is not an error and is silent by default.
 
   An application that needs to know can set the `SQL_COPT_SS_WARN_ON_CP_ERROR`
   (1243) connection attribute to `SQL_WARN_YES`, which reports SQLSTATE `01000`

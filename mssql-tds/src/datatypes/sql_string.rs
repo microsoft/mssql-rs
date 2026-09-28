@@ -171,12 +171,16 @@ pub fn encode_narrow(text: &str, collation: SqlCollation) -> NarrowEncoded {
 /// One substitute byte per **UTF-16 code unit**, not per character, so an
 /// astral character yields two. `WideCharToMultiByte` counts that way
 /// (measured: `U+1F600` gives `3F 3F` under CP1252 and CP932), as does SQL
-/// Server (`DATALENGTH(CAST(N'😀' AS varchar(4)))` is 2), and so do
-/// msodbcsql's iconv legs -- `EncodingConverter::Convert`'s `EILSEQ` arm
-/// advances one `WCHAR` via `SkipSingleCh()` and writes one `DefaultChar`
-/// (`Globalization.h`). Counting scalars instead would make a substituted value
-/// one byte shorter than the same value through msodbcsql on every platform,
-/// and a `varchar(n)` would accept a string the reference driver rejects.
+/// Server (`DATALENGTH(CAST(N'😀' AS varchar(4)))` is 2). Counting scalars
+/// instead would make a substituted value one byte shorter than the same value
+/// through msodbcsql on Windows, and a `varchar(n)` would accept a string
+/// Windows msodbcsql and the engine both reject.
+///
+/// msodbcsql does *not* agree on every platform: on glibc, `//TRANSLIT` lets
+/// `iconv` resolve the astral scalar itself, so its per-`WCHAR` `EILSEQ` loop
+/// never runs and it emits a single byte (measured, glibc 2.35). musl compiles
+/// `//TRANSLIT` out and is unmeasured. This driver takes the Windows/engine
+/// answer on every platform; see `docs/parity-deviations.md` entry 20.
 pub(crate) fn substitute_unmappable(text: &str, encoding: ResolvedEncoding) -> Vec<u8> {
     let mut out = Vec::with_capacity(text.len());
     let mut buf = [0u8; 4];
@@ -813,11 +817,15 @@ mod tests {
     /// An astral character is two UTF-16 code units and substitutes as two
     /// bytes, matching `WideCharToMultiByte` (measured: `U+1F600` gives `3F 3F`
     /// under CP1252 *and* CP932) and SQL Server
-    /// (`DATALENGTH(CAST(N'😀' AS varchar(4)))` is 2). msodbcsql's non-Windows
-    /// legs agree by a different route: `EncodingConverter::Convert`'s `EILSEQ`
-    /// arm calls `SkipSingleCh()`, which advances one `WCHAR`, then writes one
-    /// `DefaultChar` (`Globalization.h`). Counting scalars would make the value
-    /// a byte shorter here than through msodbcsql on every platform.
+    /// (`DATALENGTH(CAST(N'😀' AS varchar(4)))` is 2). Counting scalars would
+    /// make the value a byte shorter here than through msodbcsql on Windows.
+    ///
+    /// msodbcsql's glibc leg disagrees — `//TRANSLIT` resolves the scalar in
+    /// `iconv`, yielding one byte (measured, glibc 2.35); musl is unmeasured.
+    /// That is parity-deviations entry 20, and it is why the e2e counterpart
+    /// `AstralUnmappableCharacterSubstitutesPerUtf16Unit` is skipped under
+    /// comparison. This unit test pins *this* driver's encoder, which takes the
+    /// Windows/engine answer on every platform.
     #[test]
     fn encode_narrow_substitutes_one_byte_per_utf16_unit() {
         let collation = SqlCollation {

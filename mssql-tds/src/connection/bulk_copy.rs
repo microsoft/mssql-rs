@@ -1057,6 +1057,17 @@ impl<'a> BulkCopy<'a> {
         // `finish_send` does for a request. Without draining it per batch the
         // second batch's verdict would overwrite the first's, and a bulk copy
         // whose only substitution happened early would report none (AB#47598).
+        //
+        // Unlike `accumulated_info`, this is mirrored back onto the client as
+        // soon as it is updated, so the invariant "the client holds the verdict
+        // for every batch attempted so far" holds at *every* point after a
+        // drain. The loop has exits that do not pass through an epilogue — the
+        // two timeout returns and the `begin_transaction` `?` below — and a
+        // restore placed only at the end would drop an earlier batch's
+        // substitution on each of them. Nothing between batches clears the flag
+        // (the transaction calls build their own `PacketWriter`s and never
+        // reach `finish_send`), so the mirrored value survives until the next
+        // batch assigns a fresh one.
         let mut accumulated_cp_loss = false;
 
         loop {
@@ -1139,6 +1150,8 @@ impl<'a> BulkCopy<'a> {
                     // resets the client's buffer) can clear them.
                     accumulated_info.extend(self.client.take_info_messages());
                     accumulated_cp_loss |= self.client.take_code_page_conversion_loss();
+                    self.client
+                        .set_code_page_conversion_loss(accumulated_cp_loss);
 
                     // ═══════════════════════════════════════════════════════════
                     // COMMIT TRANSACTION: Commit on successful batch completion
@@ -1151,12 +1164,12 @@ impl<'a> BulkCopy<'a> {
                         // and including this batch before propagating the error, so it
                         // stays retrievable via `client.info_messages()` — consistent
                         // with the Err(e) arm below. Drop any residual INFO left by the
-                        // failed commit first.
+                        // failed commit first. The substitution verdict needs no restore
+                        // here: it was mirrored onto the client above and the commit
+                        // cannot have disturbed it.
                         let _ = self.client.take_info_messages();
                         self.client
                             .extend_info_messages(std::mem::take(&mut accumulated_info));
-                        self.client
-                            .set_code_page_conversion_loss(accumulated_cp_loss);
                         return Err(e);
                     }
 
@@ -1168,6 +1181,8 @@ impl<'a> BulkCopy<'a> {
                     // retained alongside the already-accumulated prior batches' INFO.
                     accumulated_info.extend(self.client.take_info_messages());
                     accumulated_cp_loss |= self.client.take_code_page_conversion_loss();
+                    self.client
+                        .set_code_page_conversion_loss(accumulated_cp_loss);
 
                     // ═══════════════════════════════════════════════════════════
                     // ROLLBACK TRANSACTION: Rollback on batch failure
@@ -1186,12 +1201,11 @@ impl<'a> BulkCopy<'a> {
                     // itself; INFO is a separate, complementary channel (INFO tokens vs
                     // ERROR tokens) and this mirrors .NET's InfoMessage events having
                     // already fired for the batches that completed. Drop any residual
-                    // INFO left by the rollback first.
+                    // INFO left by the rollback first. The substitution verdict was
+                    // mirrored onto the client above; the rollback cannot disturb it.
                     let _ = self.client.take_info_messages();
                     self.client
                         .extend_info_messages(std::mem::take(&mut accumulated_info));
-                    self.client
-                        .set_code_page_conversion_loss(accumulated_cp_loss);
 
                     return Err(e);
                 }
@@ -1223,9 +1237,11 @@ impl<'a> BulkCopy<'a> {
         // buffer left by the final internal commit first, so only bulk-load INFO remains.
         let _ = self.client.take_info_messages();
         self.client.extend_info_messages(accumulated_info);
-        // Same restore for the substitution verdict: the caller reads it once for
-        // the whole `write_to_server`, so it must be true if *any* batch
-        // substituted, not just the last.
+        // The verdict was already mirrored onto the client after each batch. This
+        // final assignment is what covers the zero-batch case: with no rows there
+        // is nothing to drain, and an unrelated earlier statement's verdict must
+        // not be reported as this bulk copy's — the same reason the residual INFO
+        // buffer is dropped above.
         self.client
             .set_code_page_conversion_loss(accumulated_cp_loss);
 
