@@ -34,7 +34,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 - `mssql-odbc`: server informational/warning messages are surfaced as
   diagnostic records (`SQLGetDiagRec` / `SQLGetDiagField`), and successful calls
   that observed them return `SQL_SUCCESS_WITH_INFO`
-  (`SQLDriverConnect`, `SQLExecDirect`, `SQLFetch`, `SQLMoreResults`,
+  (`SQLDriverConnect`, `SQLExecDirect`, `SQLFetch` / `SQLFetchScroll`,
+  `SQLGetData`, `SQLMoreResults`,
   `SQLCloseCursor` / `SQLFreeStmt(SQL_CLOSE)`). A message consumed by a fetch's
   terminal read-ahead is posted by the call that read it: a fetch or
   terminal-column `SQLGetData` that delivered data returns
