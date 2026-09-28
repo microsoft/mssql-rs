@@ -1703,6 +1703,37 @@ mod variant_tests {
         );
     }
 
+    /// The variant path marks the message only after the value has serialized,
+    /// for the same reason as the plain `varchar` arm: the 8000-byte cap
+    /// rejects before a wrapper byte is written, so a lossy value refused here
+    /// never reached the wire and must not be reported as lost (AB#47598).
+    ///
+    /// 8001 unmappable characters substitute to 8001 bytes -- one past the cap
+    /// -- which is the smallest value that is both lossy and refused. The
+    /// sibling test above pins the accepted side at 2000.
+    ///
+    /// Mutation-sensitive: marking at resolve time rather than after the inner
+    /// serialize makes this fail while the accepted-side tests still pass.
+    #[tokio::test]
+    async fn variant_varchar_rejected_past_the_byte_cap_does_not_mark_the_message() {
+        let val = SqlString::new("日".repeat(8001).into_bytes(), EncodingType::Utf8);
+        let mut mock_reader_writer = MockNetworkWriter::new(4096);
+        let mut packet_writer = PacketWriter::new(
+            PacketType::TabularResult,
+            &mut mock_reader_writer,
+            None,
+            None,
+        );
+        SqlType::Variant(Box::new(SqlType::Varchar(Some(val), 8000)))
+            .serialize(&mut packet_writer, &default_collation(), None)
+            .await
+            .expect_err("8001 substituted bytes exceed the variant cap");
+        assert!(
+            !packet_writer.code_page_conversion_loss(),
+            "a variant refused before its wrapper was written must not report loss"
+        );
+    }
+
     /// The robust fix for AB#47800: a narrow value whose source (UTF-8) and
     /// wire (collation codepage) byte lengths differ must declare -- and
     /// send -- the *wire* length, resolved once and reused everywhere,

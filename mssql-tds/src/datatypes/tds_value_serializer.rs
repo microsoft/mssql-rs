@@ -4435,6 +4435,99 @@ mod tests {
         (payload, w.code_page_conversion_loss())
     }
 
+    /// A value that substitutes and is then *rejected* must not mark the
+    /// message: the bytes never reached the wire, and the bulk-load error path
+    /// publishes this verdict, so a false positive there is observable.
+    ///
+    /// `U+1F600` is two substitute bytes against `varchar(1)`, so substitution
+    /// does not shrink it into range and
+    /// `serialize_char_varchar_direct` rejects it — before writing a byte,
+    /// which is why suppressing the mark cannot leave a partial write
+    /// unaccounted for (AB#47598).
+    ///
+    /// Mutation-sensitive: moving the `note_code_page_conversion_loss()` call
+    /// back above the serialize call makes this fail, where the pre-existing
+    /// substitution tests all still pass.
+    #[test]
+    fn a_rejected_lossy_varchar_does_not_mark_the_message() {
+        let mut mock = MockNetworkWriter::new(64);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        let ctx = TdsTypeContext {
+            tds_type: VARCHAR,
+            max_size: 1,
+            is_plp: false,
+            is_fixed_length: false,
+            precision: None,
+            scale: None,
+            collation: Some(windows_1252_collation()),
+            is_nullable: true,
+        };
+        let value = ColumnValues::String(crate::datatypes::sql_string::SqlString::new(
+            "\u{1F600}".as_bytes().to_vec(),
+            crate::datatypes::sql_string::EncodingType::Utf8,
+        ));
+        block_on(TdsValueSerializer::serialize_value(&mut w, &value, &ctx))
+            .expect_err("two substitute bytes overflow varchar(1)");
+        assert!(
+            !w.code_page_conversion_loss(),
+            "a value that never reached the wire must not be reported as lost"
+        );
+    }
+
+    /// The flag is sticky across values, so the suppression above must be
+    /// confined to the rejected value: an earlier value that substituted *and*
+    /// serialized keeps its verdict even when a later one is refused.
+    ///
+    /// Without this, "do not mark on rejection" could be implemented as a
+    /// clear-on-rejection and still pass the test above.
+    #[test]
+    fn a_rejected_lossy_varchar_leaves_an_earlier_verdict_standing() {
+        let mut mock = MockNetworkWriter::new(128);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        let collation = Some(windows_1252_collation());
+
+        let accepted_ctx = TdsTypeContext {
+            tds_type: VARCHAR,
+            max_size: 8000,
+            is_plp: false,
+            is_fixed_length: false,
+            precision: None,
+            scale: None,
+            collation,
+            is_nullable: true,
+        };
+        let accepted = ColumnValues::String(crate::datatypes::sql_string::SqlString::new(
+            "caf\u{65e5}".as_bytes().to_vec(),
+            crate::datatypes::sql_string::EncodingType::Utf8,
+        ));
+        block_on(TdsValueSerializer::serialize_value(
+            &mut w,
+            &accepted,
+            &accepted_ctx,
+        ))
+        .expect("serializes");
+        assert!(w.code_page_conversion_loss());
+
+        let rejected_ctx = TdsTypeContext {
+            max_size: 1,
+            ..accepted_ctx
+        };
+        let rejected = ColumnValues::String(crate::datatypes::sql_string::SqlString::new(
+            "\u{1F600}".as_bytes().to_vec(),
+            crate::datatypes::sql_string::EncodingType::Utf8,
+        ));
+        block_on(TdsValueSerializer::serialize_value(
+            &mut w,
+            &rejected,
+            &rejected_ctx,
+        ))
+        .expect_err("two substitute bytes overflow varchar(1)");
+        assert!(
+            w.code_page_conversion_loss(),
+            "the earlier value did reach the wire; its verdict must survive"
+        );
+    }
+
     #[test]
     fn test_latin1_fallback_for_unsupported_lcid() {
         // Test that unsupported LCID returns error (fallback handled in serialize_string)
