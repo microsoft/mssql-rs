@@ -151,9 +151,14 @@ fn sql_type_metadata(value: &SqlType) -> ParameterMetadata {
         // Absent parts stay absent, unlike the TVP arm above: the UDT
         // declaration omits them too, so `Point` and `dbo.Point` are different
         // declarations and must not share a prepared statement.
+        //
+        // Empty folds to absent because `format_udt_sql_name` filters empties
+        // before choosing its branch, so `Some("")` and `None` render the same
+        // declaration; keying them apart would miss the cache and re-prepare
+        // identical SQL.
         SqlType::Udt(type_name, _) => ParameterMetadata::Udt {
-            catalog: type_name.db_name.clone(),
-            schema: type_name.schema_name.clone(),
+            catalog: type_name.db_name.clone().filter(|s| !s.is_empty()),
+            schema: type_name.schema_name.clone().filter(|s| !s.is_empty()),
             name: type_name.type_name.clone(),
         },
     }

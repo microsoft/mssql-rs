@@ -40,6 +40,7 @@ use crate::conversion::fetch_convert::{
 use crate::conversion::numeric::{narrow_i128, parse_numeric_text};
 use crate::conversion::param_convert::{DaeTranscode, bound_param_to_rpc};
 use crate::handles::dbc::ConnectionState;
+use crate::handles::desc::UdtNames;
 use crate::handles::{DbcHandle, handle_from_raw};
 use crate::params::BoundParam;
 use crate::params::conversion_matrix::is_supported_conversion;
@@ -475,6 +476,10 @@ static PARAM_SQL_TYPES: LazyLock<Vec<SqlSmallInt>> = LazyLock::new(|| {
 /// are refused before the value buffer is read, while a plain negative length
 /// is refused only for the character/binary C types and otherwise falls through
 /// to a fixed-width struct read that the padding keeps in-bounds.
+///
+/// The UDT identity is drawn from the same cursor rather than passed as `None`:
+/// the conversion consults it first, so a `None` would short-circuit every
+/// `SQL_SS_UDT` draw before the value buffer is read.
 pub fn fuzz_bound_param(data: &[u8]) {
     let mut cur = ByteCursor::new(data);
     let c_type = PARAM_C_TYPES[(cur.u8() as usize) % PARAM_C_TYPES.len()];
@@ -482,6 +487,14 @@ pub fn fuzz_bound_param(data: &[u8]) {
     let ind_mode = cur.u8();
     let column_size = cur.u8() as SqlULen;
     let decimal_digits = SqlSmallInt::from(cur.u8() % 39);
+    // Ahead of `rest()`, which consumes the remainder. Lengths are drawn past
+    // the 255-unit bound so the overlong-name rejection is reachable, and a
+    // zero length is left possible so the absent-part branches are too.
+    let (cat_len, sch_len) = ((cur.u8() % 24) as usize, (cur.u8() % 24) as usize);
+    let udt_catalog = cur.take(cat_len);
+    let udt_schema = cur.take(sch_len);
+    let type_len = (cur.u8() % 2) as usize * 200 + (cur.u8() % 80) as usize;
+    let udt_type = cur.take(type_len);
 
     let mut value_buf = cur.rest();
     let fuzz_len = value_buf.len() as SqlLen;
@@ -512,6 +525,21 @@ pub fn fuzz_bound_param(data: &[u8]) {
     let ind_ptr = &mut ind as *mut SqlLen;
     let value_ptr = value_buf.as_mut_ptr() as *mut c_void;
 
+    // `bound_param_to_value_with_outcome` consults the identity before it reads
+    // the value buffer, so passing `None` would make every `SQL_SS_UDT` draw
+    // return `MissingUdtTypeName` and leave the whole UDT arm - the one place a
+    // caller-controlled type name meets an arbitrary payload - unfuzzed.
+    // Drawn from the cursor rather than a literal so the bytes reach the two
+    // pieces that actually parse hostile text: `UdtTypeName::validate`'s
+    // 255-UTF-16-unit bound per part, and `format_udt_sql_name`'s `]` doubling.
+    // Lossy rather than a UTF-8 check, so no draw is wasted on invalid input.
+    let udt = UdtNames {
+        catalog: String::from_utf8_lossy(&udt_catalog).into_owned(),
+        schema: String::from_utf8_lossy(&udt_schema).into_owned(),
+        type_name: String::from_utf8_lossy(&udt_type).into_owned(),
+        assembly_type_name: String::new(),
+    };
+
     let param = BoundParam {
         input_output_type: SQL_PARAM_INPUT,
         c_type,
@@ -526,7 +554,7 @@ pub fn fuzz_bound_param(data: &[u8]) {
         strlen_or_ind_ptr: ind_ptr,
         octet_length_ptr: ind_ptr,
     };
-    let _ = unsafe { bound_param_to_rpc("@P1".to_string(), &param, None) };
+    let _ = unsafe { bound_param_to_rpc("@P1".to_string(), &param, Some(&udt)) };
 }
 
 /// Drive the real ODBC result path end to end — `SQLExecDirectW` → `SQLFetch` →
