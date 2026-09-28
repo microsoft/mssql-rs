@@ -1448,7 +1448,11 @@ fn fill_rowset(
         }
         false
     } else if peek_is_safe {
-        release_busy_if_row_exhausted(dbc, stmt, statement_handle, client)
+        // The row loop's own messages go in here rather than being posted
+        // below: they left the wire before anything the release peek finds,
+        // and posting them afterward would invert the order SQLGetDiagRec
+        // reports them in.
+        release_busy_if_row_exhausted(dbc, stmt, statement_handle, client, &info_messages)
     } else {
         let Ok(mut dbc_state) = dbc.inner.lock() else {
             error!("SQLFetchScroll: dbc mutex poisoned returning client");
@@ -1458,6 +1462,10 @@ fn fill_rowset(
         dbc_state.active_stmt = Some(statement_handle);
         false
     };
+
+    // True exactly when the branch above handed `info_messages` to the release
+    // helper, which posted them in wire order under its own lock.
+    let info_posted_by_release = fetch_error.is_none() && peek_is_safe;
 
     let Ok(mut stmt_state) = stmt.inner.lock() else {
         error!("SQLFetchScroll: stmt mutex poisoned recording rowset");
@@ -1484,9 +1492,11 @@ fn fill_rowset(
         return SQL_ERROR;
     }
 
-    // Post even when the release helper already found INFO; diagnostics from
-    // the row loop and from terminal read-ahead are independent sources.
-    let row_has_server_info = post_tds_info_messages(&mut stmt_state, &info_messages);
+    let row_has_server_info = if info_posted_by_release {
+        false
+    } else {
+        post_tds_info_messages(&mut stmt_state, &info_messages)
+    };
     let has_server_info = release_has_server_info || row_has_server_info;
 
     if rows_filled == 0 {

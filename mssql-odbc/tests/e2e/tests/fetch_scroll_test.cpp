@@ -136,13 +136,27 @@ TEST_F(FetchScrollUtf16Test, RawUnitsInBoundRowArrays) {
     ASSERT_EQ(SQL_SUCCESS, SQLCloseCursor(stmt_));
 }
 
+// Benefits-from-mock-tds: this test can only observe that exactly one
+// 01003/8153 record surfaces and that the fetch returns SQL_SUCCESS_WITH_INFO.
+// It cannot see which TDS read consumed the INFO token, so it cannot tell a
+// terminal read-ahead promotion apart from the row loop having already drained
+// the message. A byte-level mock TDS server would let it assert that the token
+// was still unread when the rowset budget was reached and that the release
+// peek is what consumed it. `row_fetch_with_terminal_info_returns_success_with_info`
+// pins that split in Rust meanwhile.
 TEST_F(FetchScrollLiveTest, TerminalAggregateWarningIsReportedExactlyOnce) {
     SQLCHAR version[32] = {};
     ASSERT_SQL_OK(SQLGetInfoA(dbc_, SQL_DRIVER_VER, version, sizeof(version), nullptr),
                   SQL_HANDLE_DBC, dbc_);
     RecordProperty("driver_version", reinterpret_cast<const char*>(version));
 
-    constexpr SQLULEN row_count = 4;
+    // Exactly as many slots as the query returns rows: the fill loop stops on
+    // its own budget without probing a further row, so the terminal INFO is
+    // still unread on the wire and only the release peek can consume it. A
+    // wider rowset would make the loop read past the last row and drain the
+    // message through the ordinary row-loop path instead, leaving the
+    // terminal read-ahead promotion untested.
+    constexpr SQLULEN row_count = 2;
     SQLINTEGER values[row_count] = {};
     SQLLEN indicators[row_count] = {};
     SQLULEN fetched = 0;
