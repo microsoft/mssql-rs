@@ -1019,11 +1019,20 @@ mod tests {
     }
 
     /// The UDT identity is supplied by the application on the IPD; no other
-    /// descriptor kind takes a *write*. The IRD's read side is a separate
-    /// question this test does not settle: `SQLColAttribute` already answers
-    /// all four for a result column out of `COLMETADATA`'s `UDT_INFO`
-    /// (`col_attribute.rs:286-309`), so the `SQLGetDescField` route to the same
-    /// data is deliberately left open rather than decided here.
+    /// descriptor kind takes a *write*. The IRD read route is closed too, and
+    /// the `ImpRow` arm below is what holds it closed: `classify_field` is the
+    /// sole gate on the read path, so `SQLGetDescField(IRD, SQL_CA_SS_UDT_*)`
+    /// answers `HY091` (`get_desc_field.rs:140`) and the `SQL_CA_SS_UDT_*`
+    /// arms below it are unreachable for that kind. `SQLColAttribute` is the
+    /// way to a result column's UDT identity, answering all four parts out of
+    /// `COLMETADATA`'s `UDT_INFO` (`col_attribute.rs:286-309`).
+    ///
+    /// Whether refusing the IRD read matches msodbcsql is now answered, and it
+    /// does not: the reference serves all four through that route
+    /// (`sqlcdesc.cpp:2390` dispatches to `GetIRDField`, which answers them at
+    /// `:6844-6880`). Recorded as parity deviation 21. The `sqlcdesc.cpp`
+    /// citation below covers the IPD write side only. Opening the route later
+    /// fails this assertion by design.
     ///
     /// All four parts are writable, matching msodbcsql
     /// (`sqlcdesc.cpp:4891-4957`), even though only the first three reach the
