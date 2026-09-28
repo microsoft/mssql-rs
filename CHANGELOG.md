@@ -35,10 +35,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   diagnostic records (`SQLGetDiagRec` / `SQLGetDiagField`), and successful calls
   that observed them return `SQL_SUCCESS_WITH_INFO`
   (`SQLDriverConnect`, `SQLExecDirect`, `SQLFetch`, `SQLMoreResults`,
-  `SQLCloseCursor` / `SQLFreeStmt(SQL_CLOSE)`). INFO captured at end-of-rowset is
-  deferred to the next result-set boundary (`SQLMoreResults` advance or cursor
-  close) so it surfaces with a `SQL_SUCCESS_WITH_INFO` hint instead of being
-  posted under `SQL_NO_DATA`, which many applications never inspect.
+  `SQLCloseCursor` / `SQLFreeStmt(SQL_CLOSE)`). A message consumed by a fetch's
+  terminal read-ahead is posted by the call that read it: a fetch or
+  terminal-column `SQLGetData` that delivered data returns
+  `SQL_SUCCESS_WITH_INFO`, and a zero-row fetch keeps `SQL_NO_DATA` while
+  leaving the record retrievable (AB#48821).
 
 - `mssql-odbc`: catalog functions — `SQLTables`, `SQLColumns`, `SQLPrimaryKeys`,
   `SQLForeignKeys`, `SQLSpecialColumns`, `SQLStatistics`, `SQLProcedures`

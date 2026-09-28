@@ -195,20 +195,37 @@ read `diagnostics.errors` (and, new, `diagnostics.info_messages`).
   otherwise successful call:
   `SQLDriverConnectW`, `SQLExecDirectW`, `SQLFetch`, `SQLMoreResults`,
   `SQLCloseCursor` / `SQLFreeStmt(SQL_CLOSE)`.
-- **End-of-rowset INFO is deferred, not posted under `SQL_NO_DATA`.** `SQLFetch`
-  returning `SQL_NO_DATA` (and `SQLMoreResults` returning `SQL_NO_DATA` for an
-  exhausted batch) cannot be upgraded to `SQL_SUCCESS_WITH_INFO` per the ODBC
-  cursor contract, so those return codes carry no "read diagnostics" hint that
-  many applications rely on. Rather than post end-of-rowset INFO under
-  `SQL_NO_DATA` (where it may never be read) and consume it so nothing else can
-  re-surface it, `SQLFetch`'s end-of-rowset path leaves the captured INFO on the
-  client buffer. It is then surfaced *with* a hint by the next boundary call:
-  `SQLMoreResults` advancing to a further result set (`SQL_SUCCESS_WITH_INFO`),
-  or `SQLCloseCursor` / `SQLFreeStmt(SQL_CLOSE)` (`SQL_SUCCESS_WITH_INFO` via
-  `DrainOutcome::InfoPosted`). If the batch is exhausted and the application
-  calls `SQLMoreResults` rather than closing the cursor, that call still posts
-  the records (under `SQL_NO_DATA`) so they are never dropped — matching
-  msodbcsql's between-result surfacing.
+- **Terminal INFO is posted by the call that consumed it** (revised by
+  [AB#48821](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/48821);
+  this section previously specified deferring it to the next boundary call).
+  A fetch reads past its last row to discover end-of-set, so the read-ahead can
+  consume an INFO token — SQL Server reports an aggregate warning such as 8153
+  there — that belongs to the result set just read. That message is drained and
+  posted under the call whose peek consumed it, and `SQLGetDiagRec` reports it
+  in wire order relative to anything the rows themselves produced.
+  Where that leaves the *return code* depends on what the call delivered: a
+  fetch that filled at least one row, and a terminal-column `SQLGetData`, are
+  promoted from `SQL_SUCCESS` to `SQL_SUCCESS_WITH_INFO`; a zero-row fetch keeps
+  `SQL_NO_DATA`, which the ODBC cursor contract will not let carry
+  `SQL_SUCCESS_WITH_INFO`, but the record is posted and remains retrievable.
+  This holds whether or not the batch has a further result set pending — the
+  peek stops at the current result set's DONE, so everything it consumed
+  belongs to this call.
+
+  This matches msodbcsql, which posts a server message from `OnMessage` as the
+  token is parsed (`sqlctokn.cpp:3217`), with no gate on batch state, and clears
+  `LOG_SRVINFO` at the end of each fetch (`sqlccurs.cpp:2163`) so it cannot
+  carry to a later call. The earlier design left such a message on the client
+  for `SQLMoreResults` or the cursor close to surface with a
+  `SQL_SUCCESS_WITH_INFO` hint. That lost the attribution — `SQLMoreResults`
+  posts only *after* advancing, so the first result set's warning landed on the
+  second — and dropped the message entirely for an application that stops at
+  `SQL_NO_DATA` without calling `SQLMoreResults`.
+
+  `SQLCloseCursor` / `SQLFreeStmt(SQL_CLOSE)` still post INFO their *own* drain
+  of the trailing token stream finds (`DrainOutcome::InfoPosted` →
+  `SQL_SUCCESS_WITH_INFO`); what changed is that they are no longer relied on to
+  surface a message an earlier fetch already consumed.
 - `SQLDriverConnect` failure now fans out the full login diagnostics (all
   errors + info) via `post_tds_error`, matching `msodbcsql`.
 
@@ -247,6 +264,16 @@ read `diagnostics.errors` (and, new, `diagnostics.info_messages`).
 - **ODBC e2e (`mssql-odbc/tests/e2e/tests/more_results_test.cpp`)**: an INFO
   message between two result sets surfaces on the `SQLMoreResults` advance with a
   `SQL_SUCCESS_WITH_INFO` hint and a retrievable diagnostic record.
+- **Unit (`mssql-odbc`, AB#48821 terminal INFO)**: a row-delivering fetch and a
+  terminal-column `SQLGetData` are each promoted to `SQL_SUCCESS_WITH_INFO`
+  (including the streamed-PLP completion arm, and with a second result set still
+  pending); a zero-row fetch posts the record once under `SQL_NO_DATA` and a
+  repeated EOF fetch does not replay it; a row-conversion diagnostic is reported
+  ahead of the terminal INFO; and `SQLGetData`'s existing `SQL_ERROR` /
+  truncation returns are preserved rather than promoted.
+- **ODBC e2e (`mssql-odbc/tests/e2e/tests/fetch_scroll_test.cpp`)**: a terminal
+  aggregate warning (`01003` / 8153) is reported exactly once across the fetch
+  and the EOF fetches that follow, on both this driver and msodbcsql.
 
 ## Open items / future work
 
