@@ -97,13 +97,12 @@ pub struct PacketWriter<'a> {
     payload_cursor: Cursor<Vec<u8>>,
     packet_size: usize,
     is_first_packet: bool, // Note: Cannot just use packet_id because its value can rollover.
-    /// Set the instant a packet reaches the network. Distinct from
-    /// `is_first_packet`, which is cleared only after the write budget check and
-    /// the first-packet callback, so it still reads `true` on error paths where
-    /// the bytes are already gone.
-    any_packet_flushed: bool,
-    /// Whether the final packet of this message reached the network. Like
-    /// `any_packet_flushed`, set with the flush rather than after the checks that
+    /// A send was polled but has not completed successfully. Further writes
+    /// would append to a potentially partial packet or TLS record.
+    send_incomplete: bool,
+    send_attempted: bool,
+    /// Whether the final packet of this message reached the network. Set with
+    /// the flush rather than after the checks that
     /// follow it, so a budget expiry on the last packet cannot make a message the
     /// server holds in full look incomplete.
     message_complete: bool,
@@ -137,7 +136,8 @@ pub(crate) struct SuspendedMessage {
     payload_cursor: Cursor<Vec<u8>>,
     packet_size: usize,
     is_first_packet: bool,
-    any_packet_flushed: bool,
+    send_incomplete: bool,
+    send_attempted: bool,
     message_complete: bool,
     max_timeout_sec: Option<u32>,
     cancel_handle: Option<CancelHandle>,
@@ -146,15 +146,21 @@ pub(crate) struct SuspendedMessage {
 }
 
 impl SuspendedMessage {
-    /// `true` while no packet of this message has reached the network yet, so
-    /// the request can be abandoned locally without the server ever learning it
-    /// existed.
-    ///
-    /// Deliberately not `is_first_packet`: that is cleared only after the write
-    /// budget check and the first-packet callback, so a packet that landed and
-    /// then tripped either would still read as unsent.
+    /// A polled send may have written bytes even if cancellation prevented it
+    /// from completing. False proves the server never saw this message.
+    pub(crate) fn send_attempted(&self) -> bool {
+        self.send_attempted
+    }
+
+    /// An interrupted send may have written only part of a packet, even when
+    /// earlier packets completed. Neither IGNORE nor attention can repair it.
+    pub(crate) fn send_incomplete(&self) -> bool {
+        self.send_incomplete
+    }
+
+    /// No send was polled, so abandoning locally cannot strand server bytes.
     pub(crate) fn nothing_sent(&self) -> bool {
-        !self.any_packet_flushed
+        !self.send_attempted
     }
 
     /// `true` when the final packet reached the network, so the server holds the
@@ -245,7 +251,8 @@ impl<'a> PacketWriter<'a> {
             payload_cursor: buffer_cursor,
             packet_size,
             is_first_packet: true,
-            any_packet_flushed: false,
+            send_incomplete: false,
+            send_attempted: false,
             message_complete: false,
             start_time: Instant::now(),
             max_timeout_sec: effective_timeout,
@@ -280,7 +287,8 @@ impl<'a> PacketWriter<'a> {
             payload_cursor: self.payload_cursor,
             packet_size: self.packet_size,
             is_first_packet: self.is_first_packet,
-            any_packet_flushed: self.any_packet_flushed,
+            send_incomplete: self.send_incomplete,
+            send_attempted: self.send_attempted,
             message_complete: self.message_complete,
             max_timeout_sec: self.max_timeout_sec,
             cancel_handle: self.cancel_handle,
@@ -309,7 +317,8 @@ impl<'a> PacketWriter<'a> {
             payload_cursor: state.payload_cursor,
             packet_size: state.packet_size,
             is_first_packet: state.is_first_packet,
-            any_packet_flushed: state.any_packet_flushed,
+            send_incomplete: state.send_incomplete,
+            send_attempted: state.send_attempted,
             message_complete: state.message_complete,
             start_time: Instant::now(),
             max_timeout_sec: state.max_timeout_sec,
@@ -434,16 +443,17 @@ impl<'a> PacketWriter<'a> {
         // next write to panic (issue #513). The timeout is checked *after*
         // the write finishes so that the stream always remains in a clean
         // state and attention packets can be sent safely on timeout.
-        let send_data_fut = CancelHandle::run_until_cancelled(
-            self.cancel_handle.as_ref(),
-            self.network_writer.send(data_slice),
-        );
+        let send_data_fut = CancelHandle::run_until_cancelled(self.cancel_handle.as_ref(), async {
+            self.send_attempted = true;
+            self.send_incomplete = true;
+            self.network_writer.send(data_slice).await
+        });
 
         send_data_fut.await?;
+        self.send_incomplete = false;
 
         // Set before anything that can fail below: once these bytes are on the
         // wire the server is mid-message, whatever this call returns.
-        self.any_packet_flushed = true;
         self.message_complete = is_last_packet && !is_ignore_packet;
 
         // The header just written reached the wire, so any reset bit it carried
@@ -820,6 +830,30 @@ pub(crate) mod tests {
         async fn disable_ssl(&mut self) -> TdsResult<()> {
             unimplemented!()
         }
+    }
+
+    #[test]
+    fn send_attempt_survives_suspend_and_resume() {
+        let mut mock = MockNetworkWriter::new(512);
+        let mut writer = PacketWriter::new(PacketType::RpcRequest, &mut mock, None, None);
+        block_on(writer.write_byte_async(0xAB)).unwrap();
+        let mut message = writer.suspend();
+        for _ in 0..2 {
+            assert!(!message.send_attempted());
+            assert!(!message.send_incomplete());
+            assert!(message.nothing_sent());
+            message = PacketWriter::resume(message, &mut mock).suspend();
+        }
+        let mut writer = PacketWriter::resume(message, &mut mock);
+        block_on(writer.finalize()).unwrap();
+        let mut message = writer.suspend();
+        for _ in 0..2 {
+            assert!(message.send_attempted());
+            assert!(!message.send_incomplete());
+            assert!(!message.nothing_sent());
+            message = PacketWriter::resume(message, &mut mock).suspend();
+        }
+        assert_eq!(mock.data.len(), 9);
     }
 
     #[test]

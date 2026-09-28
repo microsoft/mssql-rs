@@ -311,6 +311,8 @@ mod tests {
                 data_bound: false,
                 precision_scale_explicit: false,
                 explicitly_bound: false,
+                udt_names: None,
+                udt_name_claimed: Default::default(),
             },
         );
 
@@ -349,6 +351,8 @@ mod tests {
                 data_bound: false,
                 precision_scale_explicit: false,
                 explicitly_bound: false,
+                udt_names: None,
+                udt_name_claimed: Default::default(),
             },
         );
 
@@ -386,6 +390,8 @@ mod tests {
                 data_bound: false,
                 precision_scale_explicit: false,
                 explicitly_bound: false,
+                udt_names: None,
+                udt_name_claimed: Default::default(),
             },
         );
 

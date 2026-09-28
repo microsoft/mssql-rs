@@ -30,12 +30,12 @@ transparent reconnects.
   as that call's in/out `@handle`, so the server drops the old plan and prepares
   the new one in one round trip. `SQLExecDirect` supersede and
   `SQLFreeHandle(STMT)` use standalone `sp_unprepare` because they have no
-  `sp_prepexec` on which to piggyback. A data-at-execution execute also declines
-  to piggyback even though it does run `sp_prepexec`: the request stays open for
-  the whole `SQLPutData` sequence and may be cancelled before it reaches the
-  server, so evicting the superseded handle at build time could leak the plan
-  until disconnect. It rides along with the parked state instead.
-- **`sp_prepexec` failure ownership** - the pending handle remains in ODBC
+  `sp_prepexec` on which to piggyback. A data-at-execution `sp_prepexec` also
+  piggybacks: its orphan stays owned by the parked sequence until the complete
+  message is sent. Cancellation restores the orphan without assigning a new
+  statement identity. Streaming through an already-live `sp_execute` releases
+  a separate orphan first, since that RPC has no drop slot.
+- **Materialized `sp_prepexec` failure ownership** - the pending handle remains in ODBC
   through reconnect, validation, parameter construction, and Always Encrypted
   setup. `mssql-tds` consumes it only when the prepexec RPC is ready to
   serialize, so definite pre-send failures restore it for a later cleanup.

@@ -22,7 +22,7 @@ use crate::api::odbc_types::{
 };
 use crate::api::sqlstate::{ERR_INVALID_STRING_OR_BUFFER_LENGTH, post_diag};
 use crate::handles::stmt::{ColumnBinding, StmtState};
-use crate::params::BoundParam;
+use crate::params::{BoundParam, ParamSnapshot};
 
 /// Copies every output value the server returned into the buffers the
 /// application currently bound, preserving conversion diagnostics and the
@@ -40,7 +40,7 @@ use crate::params::BoundParam;
 /// the execution-time input snapshot.
 pub(crate) unsafe fn write_back_output_params(
     stmt_state: &mut StmtState,
-    bound_params: &[Option<BoundParam>],
+    bound_params: &[Option<ParamSnapshot>],
     return_values: &[ReturnValue],
     return_status: Option<i32>,
 ) -> SqlReturn {
@@ -48,7 +48,7 @@ pub(crate) unsafe fn write_back_output_params(
     let bound = bound_params
         .iter()
         .enumerate()
-        .filter_map(|(i, p)| p.map(|p| (i, p)))
+        .filter_map(|(i, p)| p.as_ref().map(|p| (i, &p.param)))
         .filter(|(_, p)| {
             matches!(
                 p.input_output_type,
@@ -183,6 +183,12 @@ mod tests {
             strlen_or_ind_ptr: indicator,
             octet_length_ptr: indicator,
         }
+    }
+
+    /// `write_back_output_params` takes the per-ordinal snapshot; these tests
+    /// only ever describe the binding half of it.
+    fn snap(param: BoundParam) -> Option<ParamSnapshot> {
+        Some(param.into())
     }
 
     fn returned(name: &str, ordinal: u16, value: ColumnValues) -> ReturnValue {
@@ -374,7 +380,7 @@ mod tests {
         for direct_rpc in [false, true] {
             state.call_returns_status = direct_rpc;
             assert_eq!(
-                unsafe { write_back_output_params(&mut state, &[Some(param)], &values, Some(19)) },
+                unsafe { write_back_output_params(&mut state, &[snap(param)], &values, Some(19)) },
                 SQL_SUCCESS
             );
             assert_eq!(value, if direct_rpc { 19 } else { 37 });
@@ -398,7 +404,7 @@ mod tests {
             unsafe {
                 write_back_output_params(
                     &mut state,
-                    &[None, Some(param)],
+                    &[None, snap(param)],
                     &[returned("@P1", 0, ColumnValues::Int(7))],
                     None,
                 )
@@ -410,7 +416,7 @@ mod tests {
             unsafe {
                 write_back_output_params(
                     &mut state,
-                    &[None, Some(param)],
+                    &[None, snap(param)],
                     &[returned("", 1, ColumnValues::Int(9))],
                     None,
                 )
@@ -428,21 +434,21 @@ mod tests {
         let mut truncated = [0u8; 4];
         let mut fractional = -1i32;
         let bindings = [
-            Some(output_param(
+            snap(output_param(
                 SQL_C_SLONG,
                 SQL_INTEGER,
                 (&raw mut invalid).cast(),
                 0,
                 std::ptr::null_mut(),
             )),
-            Some(output_param(
+            snap(output_param(
                 SQL_C_CHAR,
                 SQL_VARCHAR,
                 truncated.as_mut_ptr().cast(),
                 4,
                 std::ptr::null_mut(),
             )),
-            Some(output_param(
+            snap(output_param(
                 SQL_C_SLONG,
                 SQL_INTEGER,
                 (&raw mut fractional).cast(),
@@ -485,6 +491,29 @@ mod tests {
         assert_eq!(outcome, RowOutcome::Success);
         assert_eq!(buf, 4711);
         assert_eq!(ind, size_of::<i32>() as crate::api::odbc_types::SqlLen);
+    }
+
+    /// A returned UDT decodes to `ColumnValues::Bytes` (`decoder.rs`, the
+    /// `TdsDataType::Udt` arm), so the write-back leg is the binary one. This
+    /// PR made `SQL_PARAM_OUTPUT` + `SQL_SS_UDT` reachable for the first time -
+    /// before it, the bind failed `HYC00` for want of a conversion-matrix row -
+    /// so pin the leg rather than inferring it from the scalar cases.
+    #[test]
+    fn a_returned_udt_lands_in_the_bound_binary_buffer() {
+        let mut buf = [0u8; 8];
+        let mut ind: crate::api::odbc_types::SqlLen = -999;
+        let param = output_param(
+            crate::api::odbc_types::SQL_C_BINARY,
+            crate::api::odbc_types::SQL_SS_UDT,
+            buf.as_mut_ptr().cast(),
+            buf.len() as crate::api::odbc_types::SqlLen,
+            &raw mut ind,
+        );
+        let payload = vec![0x58u8, 0x59, 0x5A];
+        let outcome = unsafe { write_value(&param, &ColumnValues::Bytes(payload.clone())) };
+        assert_eq!(outcome, RowOutcome::Success);
+        assert_eq!(&buf[..payload.len()], payload.as_slice());
+        assert_eq!(ind, payload.len() as crate::api::odbc_types::SqlLen);
     }
 
     /// A NULL output must be reported through the indicator, not left as

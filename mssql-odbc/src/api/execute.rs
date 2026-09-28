@@ -112,7 +112,7 @@ struct DaeExecution {
 }
 
 struct BatchExecution {
-    bound_params: Vec<Option<crate::params::BoundParam>>,
+    bound_params: Vec<Option<crate::params::ParamSnapshot>>,
     active_rows: Vec<usize>,
     marker_count: usize,
     bind_offset: isize,
@@ -146,7 +146,7 @@ enum ExecutionStaging {
 }
 
 struct PreparedRows<'a> {
-    bound_params: &'a [Option<crate::params::BoundParam>],
+    bound_params: &'a [Option<crate::params::ParamSnapshot>],
     active_rows: std::slice::Iter<'a, usize>,
     marker_count: usize,
     bind_offset: isize,
@@ -388,10 +388,8 @@ fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn
             // streams the values into the same `sp_execute` / `sp_prepexec` RPC a
             // materialized execute would have used, so the statement stays
             // prepared and reuses its handle across executes (msodbcsql parity).
-            // The orphan is not piggybacked here — the request stays open for the
-            // whole SQLPutData sequence and may never reach the server — so it
-            // rides along with the parked state and is released by the next
-            // execute or by SQLFreeHandle.
+            // The orphan stays owned by DAE until SQLParamData completes the
+            // send; cancellation restores it without creating another id.
             let begin_result = dbc.runtime.block_on(client.begin_execute_prepared(
                 &mut prepared.stmt,
                 params,
@@ -906,7 +904,11 @@ fn stage_execution(stmt: &StmtHandle) -> Result<ExecutionStaging, SqlReturn> {
     let output_flags: Vec<bool> = stmt_state
         .bound_params
         .iter()
-        .map(|param| param.is_some_and(|param| is_output_direction(param.input_output_type)))
+        .map(|param| {
+            param
+                .as_ref()
+                .is_some_and(|param| is_output_direction(param.param.input_output_type))
+        })
         .collect();
     let Some(plan) = stmt_state.prepared.as_ref() else {
         post_diag(&mut stmt_state, ERR_FUNCTION_SEQUENCE);
@@ -930,7 +932,7 @@ fn stage_execution(stmt: &StmtHandle) -> Result<ExecutionStaging, SqlReturn> {
                     post_diag(&mut stmt_state, ERR_UNBOUND_PARAMETER);
                     return Err(SQL_ERROR);
                 }
-                Some(param) if !is_output_direction(param.input_output_type) => {
+                Some(param) if !is_output_direction(param.param.input_output_type) => {
                     post_diag(&mut stmt_state, ERR_INVALID_PARAMETER_TYPE);
                     return Err(SQL_ERROR);
                 }
@@ -976,7 +978,7 @@ fn stage_execution(stmt: &StmtHandle) -> Result<ExecutionStaging, SqlReturn> {
                 post_diag(&mut stmt_state, ERR_UNBOUND_PARAMETER);
                 return Err(SQL_ERROR);
             };
-            if bound.input_output_type != SQL_PARAM_INPUT {
+            if bound.param.input_output_type != SQL_PARAM_INPUT {
                 post_sql_error(
                     &mut stmt_state,
                     SQLSTATE_HYC00,
@@ -1021,11 +1023,13 @@ fn stage_execution(stmt: &StmtHandle) -> Result<ExecutionStaging, SqlReturn> {
             }
 
             for parameter in 0..marker_count {
+                // Only the `Copy` half is needed per row; cloning the snapshot
+                // would reallocate the UDT identity for every row.
                 let bound = stmt_state
                     .bound_params
                     .get(parameter)
                     .and_then(Option::as_ref)
-                    .copied()
+                    .map(|snapshot| snapshot.param)
                     .ok_or_else(|| {
                         post_diag(&mut stmt_state, ERR_UNBOUND_PARAMETER);
                         SQL_ERROR
@@ -2177,6 +2181,87 @@ mod tests {
             set_cached_desc_field(h.ipd(), field, 24);
             assert_eq!(stage_and_restore_plan(h.stmt), (None, Some(id)));
         }
+    }
+
+    #[test]
+    fn streamed_cancel_rebind_and_failed_response_preserve_ownership() {
+        use crate::api::odbc_types::{SQL_DESC_LENGTH, SQL_NEED_DATA, SQL_NULL_DATA};
+        use crate::api::param_data::sql_param_data;
+        use crate::api::put_data::sql_put_data;
+        use mssql_tds::test_client_support::tds_client_from_tokens;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        h.mark_dbc_connected();
+        let mut token = 7_i32;
+        let mut indicator = SQL_DATA_AT_EXEC;
+        assert_eq!(
+            unsafe {
+                sql_bind_parameter(
+                    h.stmt,
+                    1,
+                    SQL_PARAM_INPUT,
+                    SQL_C_CHAR,
+                    SQL_VARCHAR,
+                    8,
+                    0,
+                    (&raw mut token).cast(),
+                    4,
+                    &mut indicator,
+                )
+            },
+            SQL_SUCCESS
+        );
+        let mut client = tds_client_from_tokens(Vec::new());
+        let id = client.register_prepared_handle_for_test(77);
+        materialize_test_plan(h.stmt, id);
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let dbc = stmt.parent_dbc();
+        dbc.inner.lock().unwrap().client = Some(client);
+
+        for length in [16, 24, 32] {
+            set_cached_desc_field(h.ipd(), SQL_DESC_LENGTH, length);
+            assert_eq!(unsafe { sql_execute(h.stmt) }, SQL_NEED_DATA);
+            assert_eq!(
+                unsafe { crate::api::cancel::sql_cancel(h.stmt) },
+                SQL_SUCCESS
+            );
+            let state = stmt.inner.lock().unwrap();
+            assert!(!state.needs_data());
+            assert!(state.prepared.as_ref().unwrap().stmt.id().is_none());
+            assert_eq!(state.pending_unprepare, Some(id));
+            drop(state);
+            assert_eq!(
+                dbc.inner
+                    .lock()
+                    .unwrap()
+                    .client
+                    .as_ref()
+                    .unwrap()
+                    .prepared_handle_for_test(id),
+                Some(77)
+            );
+        }
+
+        assert_eq!(unsafe { sql_execute(h.stmt) }, SQL_NEED_DATA);
+        let mut value_ptr = std::ptr::null_mut();
+        assert_eq!(
+            unsafe { sql_param_data(h.stmt, &mut value_ptr) },
+            SQL_NEED_DATA
+        );
+        assert_eq!(
+            unsafe { sql_put_data(h.stmt, std::ptr::null_mut(), SQL_NULL_DATA) },
+            SQL_SUCCESS
+        );
+        // The token double returns EOF after the complete request is sent.
+        assert_eq!(unsafe { sql_param_data(h.stmt, &mut value_ptr) }, SQL_ERROR);
+        let state = stmt.inner.lock().unwrap();
+        assert!(!state.needs_data());
+        assert!(state.pending_unprepare.is_none());
+        let new_id = state.prepared.as_ref().unwrap().stmt.id().unwrap();
+        assert_ne!(new_id, id);
+        drop(state);
+        set_cached_desc_field(h.ipd(), SQL_DESC_LENGTH, 40);
+        assert_eq!(stage_and_restore_plan(h.stmt), (None, Some(new_id)));
     }
 
     /// Panics while holding the APD lock, leaving the mutex poisoned —

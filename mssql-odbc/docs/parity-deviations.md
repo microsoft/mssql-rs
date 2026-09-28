@@ -470,7 +470,15 @@ msodbcsql build is measured.
     selective design in [PR #564](https://github.com/microsoft/mssql-rs/pull/564),
     not a change to which parameter types or conversions are supported.
     `special_parameter_definitions_keep_size_precision_and_scale` pins the
-    vector and UDT projections; UDT parameter binding remains unsupported.
+    vector and UDT projections.
+    The UDT projection also carries the type's catalog, schema, and name, which
+    `sp_executesql` spells out in the declaration; msodbcsql's `IsSQLBinary`
+    grouping compares only length, so an application that rewrites
+    `SQL_CA_SS_UDT_TYPE_NAME` between executes keeps the old declaration there.
+    This driver re-prepares instead, for the same reason as the rest of this
+    entry. The assembly-qualified name is excluded because it never reaches the
+    wire. `the_udt_name_is_part_of_the_prepared_parameter_definition` pins both
+    halves.
     **Evidence limit:** this is a source comparison and a Rust unit test,
     not a measured retail reuse/re-prepare claim. The earlier 18.06.0001 RPC
     measurements did not cover these special-type edits. A supported
@@ -506,3 +514,58 @@ msodbcsql build is measured.
     tested msodbcsql build while calling `SQLDriverConnectW` with
     `Authentication=ActiveDirectoryPassword` is still required to establish
     shipping-build behavior.
+19. **A cross-identity orphan is released before streaming an already-live
+    prepared statement, and a release error fails that execute.** The source
+    reference is msodbcsql's `DropPrepHandle` (`Sql/Ntdbms/sqlncli/odbc/sqlcfunc.cpp`), which
+    defers the drop in `hPrepDropDeferred`; `BuildSPPrepExec` (`odbc/sqlccmd.cpp`)
+    passes that handle by reference on the next prepare, saving a round trip.
+    `ProcessDAEParam` clears the deferred slot only after `SendRPCFromStmt`
+    succeeds. This driver's streamed `sp_prepexec` likewise piggybacks the
+    orphan and defers eviction until the complete message is sent; cancellation
+    retains the orphan without assigning a new statement identity.
+    The separate-release policy applies only when `begin_execute_prepared`
+    reuses a live handle through `sp_execute`, whose handle parameter has no
+    drop slot for another identity. It sends and drains `sp_unprepare` before
+    parking that stream, analogous to the reference's forced-drop route.
+    `execute.rs` propagates a release failure and restores any retained orphan.
+    Do not swallow that error and continue: `StmtState::pending_unprepare`
+    holds only one orphan, so returning a live prepared statement while retaining
+    a separate orphan can overflow that slot at the next rebind, recreating #598.
+    This is a source-verified policy difference, not a measured claim about a
+    retail driver's diagnostics or wire sequence; a build-specific reference
+    comparison remains outstanding. No parity test is skipped for it.
+    Recorded following automated review feedback on #599 (2026-09-22);
+    narrowed to the cross-identity case following review on 2026-09-24.
+    Human parity sign-off has not been recorded. Tracked in #598.
+20. **An oversized `sql_variant` payload with a non-zero overflow is refused by
+    the driver, not the server.** `sql_variant` cannot hold a `max` type
+    (server error 529), so a payload past the 8000-byte ceiling has to be
+    refused somewhere. msodbcsql sends it and surfaces the server's refusal as
+    `42000`; this driver declares the inner type at its non-max ceiling
+    (`variant_column_size`) and refuses during parameter conversion with
+    `22001`, saving the round trip.
+    Scope: only a *non-zero* overflow is measured here. A payload whose bytes
+    past the ceiling are all zero takes `trim_zero_overflow`, which trims and
+    sends rather than refusing, and
+    `a_binary_variant_payload_past_the_byte_ceiling_is_truncation` pins that
+    half of this driver's behavior.
+    **Evidence limit:** whether msodbcsql also trims that case is a source
+    reading only - `trim_zero_overflow` mirrors `CheckTrailingZeros`
+    (`sqlccnvt.cpp:8690`) - and is *not* measured. Do not infer parity for the
+    zero-overflow boundary from this entry. Closing it needs a both-leg case
+    binding an oversized zero-filled binary `sql_variant` with `SQL_DRIVER_VER`
+    recorded; if the reference refuses it, the deviation here is wider than
+    stated.
+    The rule is not new to binary payloads - `variant_column_size` already
+    governed the character variants - but binary `sql_variant` parameters make
+    it reachable for a second family of C types, so it is recorded here rather
+    than left in a code comment.
+    Measured against msodbcsql 18.6.2.1 (`SQL_DRIVER_VER` `18.06.0002`) on SQL
+    Server 2022, Windows Driver Manager, 2026-09-25, with a `0xAB`-filled
+    payload - i.e. the non-zero overflow this entry describes.
+    `BinaryVariantPayloadPastTheCeilingIsRefused` asserts both legs, so the
+    reference side stays measured rather than skipped. Tracked in AB#48248.
+    **Evidence limit:** only the binary leg is measured. The character leg is
+    covered by unit tests and shares `variant_column_size`, but no comparison
+    run records msodbcsql's SQLSTATE for an oversized character `sql_variant`;
+    do not infer that half from this entry.
