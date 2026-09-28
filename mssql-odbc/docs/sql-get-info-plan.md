@@ -12,7 +12,7 @@ the behavior is tested. The owning user story is
 |---|---|---|
 | [AB#47086](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47086) | Closed | First-release support for the 21 information types then blocking mssql-python. |
 | [AB#48149](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/48149) | Active | 61 mssql-python payload names representing 59 distinct information IDs. `SQL_OWNER_USAGE` aliases `SQL_SCHEMA_USAGE`; `SQL_QUALIFIER_USAGE` aliases `SQL_CATALOG_USAGE`. |
-| [AB#47996](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47996) | Active | The remaining ODBC 3.x public information types: 22 conversion masks, 23 supported-SQL/driver masks, the SQL limits, `SQL_COLLATION_SEQ`, and the deprecated `SQL_LOCK_TYPES` / `SQL_POS_OPERATIONS`. |
+| [AB#47996](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47996) | Active | The remaining ODBC 3.x public information types: 25 conversion masks, the supported-SQL / SQL-92 / driver capability masks, the SQL limits, `SQL_COLLATION_SEQ`, and the deprecated `SQL_LOCK_TYPES` / `SQL_POS_OPERATIONS`. |
 
 [AB#46406](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/46406),
 `SQLGetTypeInfoW`, is another closed child of AB#46381. It is deliberately
@@ -97,6 +97,8 @@ claim them as such.
 | Information type | mssql-odbc answer | Difference and owner |
 |---|---:|---|
 | `SQL_ASYNC_MODE` | `SQL_AM_NONE` | msodbcsql advertises statement async. Planned Phase 15 in `plan.md`. |
+| `SQL_MAX_ASYNC_CONCURRENT_STATEMENTS` | `0` | msodbcsql reports `1`; this driver has no async yet (`SQL_ASYNC_MODE = SQL_AM_NONE`), so it advertises no async statements. Becomes `1` with Phase 15. |
+| `SQL_ODBC_INTERFACE_CONFORMANCE` | `SQL_OIC_CORE` | msodbcsql reports Level 2; `SQLSetPos` / `SQLBulkOperations` and some catalog functions are unimplemented, so only Core is claimed (`docs/odbc-escape-sequences-plan.md`). |
 | `SQL_DYNAMIC_CURSOR_ATTRIBUTES1/2` | `0` | Dynamic cursors are not implemented. Planned Phase 10 in `plan.md`. |
 | `SQL_FORWARD_ONLY_CURSOR_ATTRIBUTES1` | `SQL_CA1_NEXT` | Only next-oriented forward fetch is implemented. Additional cursor operations belong to Phase 10. |
 | `SQL_FORWARD_ONLY_CURSOR_ATTRIBUTES2` | `SQL_CA2_READ_ONLY_CONCURRENCY \| SQL_CA2_MAX_ROWS_SELECT` | Reports only implemented concurrency and `SQL_ATTR_MAX_ROWS`; the broader msodbcsql mask belongs to Phase 10. |

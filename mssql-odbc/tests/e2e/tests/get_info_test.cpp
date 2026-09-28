@@ -556,12 +556,8 @@ TEST_F(GetInfoLiveTest, WorkItem47996U32ValuesMatchMsodbcsql) {
          SQL_POS_POSITION | SQL_POS_REFRESH | SQL_POS_UPDATE | SQL_POS_DELETE |
              SQL_POS_ADD,
          "SQL_POS_OPERATIONS"},
-        {SQL_ODBC_INTERFACE_CONFORMANCE, SQL_OIC_LEVEL2,
-         "SQL_ODBC_INTERFACE_CONFORMANCE"},
         {SQL_STANDARD_CLI_CONFORMANCE, SQL_SCC_ISO92_CLI,
          "SQL_STANDARD_CLI_CONFORMANCE"},
-        {SQL_MAX_ASYNC_CONCURRENT_STATEMENTS, 1u,
-         "SQL_MAX_ASYNC_CONCURRENT_STATEMENTS"},
         {SQL_MAX_INDEX_SIZE, 900u, "SQL_MAX_INDEX_SIZE"},
         {SQL_ALTER_DOMAIN, 0u, "SQL_ALTER_DOMAIN"},
         {SQL_CREATE_DOMAIN, 0u, "SQL_CREATE_DOMAIN"},
@@ -602,6 +598,32 @@ TEST_F(GetInfoLiveTest, WorkItem47996U32ValuesMatchMsodbcsql) {
         {SQL_SQL92_FOREIGN_KEY_DELETE_RULE, 0u, "SQL_SQL92_FOREIGN_KEY_DELETE_RULE"},
         {SQL_SQL92_FOREIGN_KEY_UPDATE_RULE, 0u, "SQL_SQL92_FOREIGN_KEY_UPDATE_RULE"},
         {SQL_SQL92_NUMERIC_VALUE_FUNCTIONS, 0u, "SQL_SQL92_NUMERIC_VALUE_FUNCTIONS"},
+    };
+
+    for (const Case& c : cases) {
+        SQLRETURN rc = SQL_ERROR;
+        SQLSMALLINT len = -1;
+        EXPECT_EQ(c.expected, GetInfoU32(dbc_, c.infoType, &rc, &len)) << c.name;
+        EXPECT_EQ(SQL_SUCCESS, rc) << c.name;
+        EXPECT_EQ(static_cast<SQLSMALLINT>(sizeof(SQLUINTEGER)), len) << c.name;
+    }
+}
+
+// AB#47996: capability-ledger values that describe this driver rather than
+// msodbcsql. Async is unimplemented (`SQL_ASYNC_MODE = SQL_AM_NONE`), so no
+// async statements are advertised; the interface conformance is Core, not the
+// Level 2 msodbcsql claims, because `SQLSetPos`/`SQLBulkOperations` and some
+// catalog functions are not implemented. Both intentionally diverge from
+// retail, so the comparison leg is skipped.
+TEST_F(GetInfoLiveTest, WorkItem47996CapabilitiesDescribeThisDriver) {
+    SKIP_IF_COMPARING_MSODBCSQL();
+
+    struct Case { SQLUSMALLINT infoType; SQLUINTEGER expected; const char* name; };
+    const Case cases[] = {
+        {SQL_MAX_ASYNC_CONCURRENT_STATEMENTS, 0u,
+         "SQL_MAX_ASYNC_CONCURRENT_STATEMENTS"},
+        {SQL_ODBC_INTERFACE_CONFORMANCE, SQL_OIC_CORE,
+         "SQL_ODBC_INTERFACE_CONFORMANCE"},
     };
 
     for (const Case& c : cases) {

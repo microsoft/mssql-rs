@@ -597,6 +597,14 @@ mod tests {
             sort_id: 0,
         };
         assert_eq!(collation_code_page(windows), Some(1252));
+        // A second LCID branch, to catch a transposition in the match arms.
+        let cyrillic = SqlCollation {
+            info: 0x0419,
+            lcid_language_id: 0,
+            col_flags: 0,
+            sort_id: 0,
+        };
+        assert_eq!(collation_code_page(cyrillic), Some(1251));
         // An unmapped LCID has no code page.
         let unknown = SqlCollation {
             info: 0x000F_FFFF,

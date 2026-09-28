@@ -141,7 +141,7 @@ const SQL_IS_SELECT_INTO: u32 = 0x0000_0004;
 const SQL_POS_OPERATIONS_SPT: u32 =
     0x0000_0001 | 0x0000_0002 | 0x0000_0004 | 0x0000_0008 | 0x0000_0010;
 const SQL_LCK_NO_CHANGE: u32 = 0x0000_0001;
-const SQL_OIC_LEVEL2: u32 = 3;
+const SQL_OIC_CORE: u32 = 1;
 const SQL_SCC_ISO92_CLI: u32 = 0x0000_0002;
 const SQL_QL_START: u16 = 0x0001;
 const SQL_NNC_NON_NULL: u16 = 0x0001;
@@ -508,11 +508,17 @@ const STATIC_INFO: &[InfoEntry] = &[
     },
     InfoEntry {
         info_type: odbc::SQL_MAX_ASYNC_CONCURRENT_STATEMENTS,
-        value: InfoValue::U32(1),
+        // Async is not implemented (`SQL_ASYNC_MODE` is `SQL_AM_NONE`), so this
+        // reports no async statements rather than msodbcsql's 1 (see plan.md
+        // Phase 15). Capability ledger, not parity.
+        value: InfoValue::U32(0),
     },
     InfoEntry {
         info_type: odbc::SQL_ODBC_INTERFACE_CONFORMANCE,
-        value: InfoValue::U32(SQL_OIC_LEVEL2),
+        // Core, not msodbcsql's Level 2: `SQLSetPos` / `SQLBulkOperations` and
+        // some catalog functions are unimplemented, so the Level 2 surface is
+        // not present (`docs/odbc-escape-sequences-plan.md`). Capability ledger.
+        value: InfoValue::U32(SQL_OIC_CORE),
     },
     InfoEntry {
         info_type: odbc::SQL_STANDARD_CLI_CONFORMANCE,
@@ -896,7 +902,18 @@ fn sql_get_info_w_safe(
             )
         }
         odbc::SQL_COLLATION_SEQ => {
-            let collation = state.identity.collation_seq.clone();
+            // Resolved from the live client, not snapshotted: the database
+            // collation (hence code page) changes on `USE` / catalog switch.
+            let collation = state
+                .client
+                .as_ref()
+                .map(|client| {
+                    collation_seq_name(client.collation_code_page())
+                        .map(str::to_string)
+                        .or_else(|| client.char_set().map(char_set_display_name))
+                        .unwrap_or_default()
+                })
+                .unwrap_or_default();
             write_wide_str(
                 &mut state,
                 info_value_ptr,
@@ -1257,6 +1274,31 @@ fn write_wide_str(
 
 fn driver_name() -> &'static str {
     env!("MSSQL_ODBC_ARTIFACT")
+}
+
+/// `SQL_COLLATION_SEQ` name for a server code page. msodbcsql names only these
+/// three (`sqlctokn.cpp` `ENV_DATABASECOLLATION`) and leaves the rest empty.
+fn collation_seq_name(code_page: Option<u16>) -> Option<&'static str> {
+    match code_page {
+        Some(1252) => Some("ISO 8859-1"),
+        Some(850) => Some("Code page 850"),
+        Some(437) => Some("Code page 437"),
+        _ => None,
+    }
+}
+
+/// Maps a legacy `CHARACTER_SET` `ENVCHANGE` name to its `SQL_COLLATION_SEQ`
+/// display form the way msodbcsql's `ENV_CHARSET` handler does
+/// (`sqlctokn.cpp`): `iso_1` becomes `ISO 8859-1`, everything else becomes
+/// `Code page <suffix>` after dropping the two-character prefix.
+fn char_set_display_name(char_set: &str) -> String {
+    if char_set.eq_ignore_ascii_case("iso_1") {
+        "ISO 8859-1".to_string()
+    } else if char_set.len() > 2 {
+        format!("Code page {}", &char_set[2..])
+    } else {
+        char_set.to_string()
+    }
 }
 
 #[cfg(test)]
@@ -1861,8 +1903,8 @@ mod tests {
             (odbc::SQL_SQL92_FOREIGN_KEY_UPDATE_RULE, 0),
             (odbc::SQL_SQL92_NUMERIC_VALUE_FUNCTIONS, 0),
             (odbc::SQL_MAX_INDEX_SIZE, SQL_SERVER_MAX_INDEX_SIZE),
-            (odbc::SQL_MAX_ASYNC_CONCURRENT_STATEMENTS, 1),
-            (odbc::SQL_ODBC_INTERFACE_CONFORMANCE, SQL_OIC_LEVEL2),
+            (odbc::SQL_MAX_ASYNC_CONCURRENT_STATEMENTS, 0),
+            (odbc::SQL_ODBC_INTERFACE_CONFORMANCE, SQL_OIC_CORE),
             (odbc::SQL_STANDARD_CLI_CONFORMANCE, SQL_SCC_ISO92_CLI),
         ] {
             let (rc, val, len) = get_u32(h.dbc, info_type);
@@ -1937,22 +1979,29 @@ mod tests {
     }
 
     #[test]
-    fn collation_seq_reports_login_charset() {
+    fn collation_seq_is_empty_without_a_connection() {
         let h = TestHandles::with_env_dbc();
-        // Empty before a connection resolves the collation.
         let (rc, value, len) = get_wide_str(h.dbc, odbc::SQL_COLLATION_SEQ);
         assert_eq!(rc, SQL_SUCCESS);
         assert_eq!(value, "");
         assert_eq!(len, 0);
+    }
 
-        {
-            let dbc_ref = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
-            dbc_ref.inner.lock().unwrap().identity.collation_seq = "ISO 8859-1".to_string();
-        }
-        let (rc, value, len) = get_wide_str(h.dbc, odbc::SQL_COLLATION_SEQ);
-        assert_eq!(rc, SQL_SUCCESS);
-        assert_eq!(value, "ISO 8859-1");
-        assert_eq!(len, 20);
+    #[test]
+    fn collation_seq_name_maps_only_the_three_named_code_pages() {
+        assert_eq!(collation_seq_name(Some(1252)), Some("ISO 8859-1"));
+        assert_eq!(collation_seq_name(Some(850)), Some("Code page 850"));
+        assert_eq!(collation_seq_name(Some(437)), Some("Code page 437"));
+        assert_eq!(collation_seq_name(Some(1251)), None);
+        assert_eq!(collation_seq_name(Some(65001)), None);
+        assert_eq!(collation_seq_name(None), None);
+    }
+
+    #[test]
+    fn char_set_display_name_matches_env_charset_mapping() {
+        assert_eq!(char_set_display_name("iso_1"), "ISO 8859-1");
+        assert_eq!(char_set_display_name("cp850"), "Code page 850");
+        assert_eq!(char_set_display_name("cp1252"), "Code page 1252");
     }
 
     #[test]
@@ -2063,7 +2112,6 @@ mod tests {
                 data_source_name: "ReportingDsn".to_string(),
                 server_name: "SQLPROD01\\INST".to_string(),
                 user_name: "reporting_app".to_string(),
-                collation_seq: "SQL_Latin1_General_CP1_CI_AS".to_string(),
             };
         }
 
