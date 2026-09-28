@@ -789,7 +789,7 @@ mod tests {
     ///
     /// Measured with `WideCharToMultiByte(437, 0, ...)`: `U+65E5` is `3F` with
     /// the loss flag set. `U+0141` is deliberately not used here - CP437
-    /// best-fits it to `4C` (`L`), which is parity-deviations entry 18 rather
+    /// best-fits it to `4C` (`L`), which is parity-deviations entry 20 rather
     /// than a substitution.
     #[test]
     fn encode_narrow_substitutes_under_an_oem_code_page() {

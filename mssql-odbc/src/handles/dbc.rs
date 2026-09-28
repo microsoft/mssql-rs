@@ -134,7 +134,7 @@ pub(crate) struct DbcState {
     /// parameters instead, which is where our loss actually occurs:
     /// `SQL_C_CHAR` is UTF-8 here, so a fetch can always represent whatever the
     /// server sent and has nothing to substitute. Recorded as
-    /// parity-deviations entry 19 (AB#47598).
+    /// parity-deviations entry 21 (AB#47598).
     pub(crate) warn_on_cp_error: bool,
     /// `SQL_ATTR_CONNECTION_TIMEOUT` in seconds. Stored, not yet honored.
     /// `0` is the ODBC default and means "no timeout".

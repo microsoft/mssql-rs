@@ -382,7 +382,7 @@ TEST_F(ParamArrayTest, ArrayHandlesVariableWidthBuffers) {
 // statement coming back clean. The second is what catches a missing drain,
 // which a single-statement test cannot see.
 //
-// Skipped under comparison: parity-deviations entry 19 - msodbcsql consults
+// Skipped under comparison: parity-deviations entry 21 - msodbcsql consults
 // this attribute only on the retrieval direction, so it returns plain
 // SQL_SUCCESS for a parameter however the attribute is set.
 // -------------------------------------------------------------------
