@@ -250,6 +250,12 @@ pub(super) fn claim_connection(
     // Claim the connection before releasing the lock so concurrent threads see
     // active_stmt and get HY000 rather than "no active TDS client".
     dbc_state.active_stmt = Some(statement_handle);
+    // Snapshot the collation before the client leaves the DBC: a
+    // data-at-execution sequence parks it on the statement, so `SQLGetInfo`
+    // needs this to answer `SQL_COLLATION_SEQ` until the client returns.
+    if let Some(client) = dbc_state.client.as_ref() {
+        dbc_state.last_collation_seq = Some(super::get_info::resolve_collation_seq(client));
+    }
     let Some(client) = dbc_state.client.take() else {
         error!("{op}: no active TDS client");
         dbc_state.active_stmt = None;

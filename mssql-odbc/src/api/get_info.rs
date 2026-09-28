@@ -37,6 +37,7 @@ use crate::api::sqlstate::{
 use crate::api::util::{copy_with_nul, write_if_some};
 use crate::error::free_errors;
 use crate::handles::{DbcHandle, HandleType, handle_from_raw};
+use mssql_tds::connection::tds_client::TdsClient;
 
 /// `sysname`, the type of every identifier column in the catalog views, which
 /// bounds `SQL_MAX_COLUMN_NAME_LEN`, `SQL_MAX_SCHEMA_NAME_LEN`, and
@@ -903,16 +904,12 @@ fn sql_get_info_w_safe(
         odbc::SQL_COLLATION_SEQ => {
             // Resolved from the live client, not snapshotted: the database
             // collation (hence code page) changes on `USE` / catalog switch.
-            let collation = state
-                .client
-                .as_ref()
-                .map(|client| {
-                    collation_seq_name(client.collation_code_page())
-                        .map(str::to_string)
-                        .or_else(|| client.char_set().map(char_set_display_name))
-                        .unwrap_or_default()
-                })
-                .unwrap_or_default();
+            // While a data-at-execution sequence owns the client, fall back to
+            // the value cached when that execution claimed it.
+            let collation = match state.client.as_ref() {
+                Some(client) => resolve_collation_seq(client),
+                None => state.last_collation_seq.clone().unwrap_or_default(),
+            };
             write_wide_str(
                 &mut state,
                 info_value_ptr,
@@ -1284,6 +1281,18 @@ fn collation_seq_name(code_page: Option<u16>) -> Option<&'static str> {
         Some(437) => Some("Code page 437"),
         _ => None,
     }
+}
+
+/// The `SQL_COLLATION_SEQ` string for a live client: the database code page's
+/// name, else the legacy `CHARACTER_SET` display name, else empty. Cached into
+/// [`DbcState::last_collation_seq`](crate::handles::dbc::DbcState) when an
+/// execution claims the client, so `SQLGetInfo` still answers it while a
+/// data-at-execution sequence owns the client.
+pub(super) fn resolve_collation_seq(client: &TdsClient) -> String {
+    collation_seq_name(client.collation_code_page())
+        .map(str::to_string)
+        .or_else(|| client.char_set().map(char_set_display_name))
+        .unwrap_or_default()
 }
 
 /// Maps a legacy `CHARACTER_SET` `ENVCHANGE` name to its `SQL_COLLATION_SEQ`
@@ -1989,6 +1998,23 @@ mod tests {
     }
 
     #[test]
+    fn collation_seq_uses_the_cache_while_the_client_is_parked() {
+        let h = TestHandles::with_env_dbc();
+        let dbc_ref = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        {
+            // A data-at-execution sequence has moved the client onto a
+            // statement; the DBC stays connected with the collation cached.
+            let mut state = dbc_ref.inner.lock().unwrap();
+            assert!(state.client.is_none());
+            state.last_collation_seq = Some("ISO 8859-1".to_string());
+        }
+        let (rc, value, len) = get_wide_str(h.dbc, odbc::SQL_COLLATION_SEQ);
+        assert_eq!(rc, SQL_SUCCESS);
+        assert_eq!(value, "ISO 8859-1");
+        assert_eq!(len, 20);
+    }
+
+    #[test]
     fn collation_seq_name_maps_only_the_three_named_code_pages() {
         assert_eq!(collation_seq_name(Some(1252)), Some("ISO 8859-1"));
         assert_eq!(collation_seq_name(Some(850)), Some("Code page 850"));
@@ -2003,9 +2029,11 @@ mod tests {
         assert_eq!(char_set_display_name("iso_1"), "ISO 8859-1");
         assert_eq!(char_set_display_name("cp850"), "Code page 850");
         assert_eq!(char_set_display_name("cp1252"), "Code page 1252");
-        // A non-ASCII name must drop two characters without slicing a UTF-8
-        // byte boundary, so this must not panic.
-        assert_eq!(char_set_display_name("café"), "Code page fé");
+        // Names whose multi-byte characters straddle byte offset 2 (where the
+        // old byte slice `&char_set[2..]` cut) must drop two whole characters
+        // without panicking on a UTF-8 boundary.
+        assert_eq!(char_set_display_name("日本語"), "Code page 語");
+        assert_eq!(char_set_display_name("aあx"), "Code page x");
     }
 
     #[test]
