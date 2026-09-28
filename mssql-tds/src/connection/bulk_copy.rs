@@ -912,6 +912,13 @@ impl<'a> BulkCopy<'a> {
         let start_time = Instant::now();
         let mut total_rows = 0u64;
 
+        // The whole operation's substitution accounting starts clean, and it has
+        // to be cleared *here* rather than in `write_rows_to_server_zerocopy`:
+        // that helper is only reached when there is at least one row, so an empty
+        // bulk copy would otherwise leave a previous operation's verdict standing
+        // on a reused client and report it as this one's (AB#47598).
+        self.client.set_code_page_conversion_loss(false);
+
         // Initialize timeout state for this operation
         // A timeout of 0 means infinite (no timeout)
         self.timeout_state = Some(BulkCopyTimeoutState::from_seconds(self.options.timeout_sec));
@@ -1237,11 +1244,12 @@ impl<'a> BulkCopy<'a> {
         // buffer left by the final internal commit first, so only bulk-load INFO remains.
         let _ = self.client.take_info_messages();
         self.client.extend_info_messages(accumulated_info);
-        // The verdict was already mirrored onto the client after each batch. This
-        // final assignment is what covers the zero-batch case: with no rows there
-        // is nothing to drain, and an unrelated earlier statement's verdict must
-        // not be reported as this bulk copy's — the same reason the residual INFO
-        // buffer is dropped above.
+        // Belt and braces: the verdict was already mirrored onto the client after
+        // each batch, and this helper only runs with at least one row, so the
+        // loop has always executed by now. Kept so the accumulator and the
+        // client cannot drift if a future exit is added between the last mirror
+        // and here. The empty-copy case is handled by the reset in
+        // `write_to_server_zerocopy`, which is the only caller.
         self.client
             .set_code_page_conversion_loss(accumulated_cp_loss);
 

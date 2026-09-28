@@ -839,6 +839,57 @@ mod bulk_copy_integration_tests {
         assert!(!client.take_code_page_conversion_loss());
     }
 
+    /// An *empty* bulk copy must report its own verdict, not the previous
+    /// operation's. The reset lives in `write_to_server_zerocopy` rather than in
+    /// `write_rows_to_server_zerocopy` precisely because the latter is only
+    /// reached when there is at least one row: with the reset in the helper, a
+    /// reused client that had substituted earlier would still answer `true`
+    /// here (AB#47598).
+    ///
+    /// The first copy deliberately leaves the verdict set — it is never drained
+    /// — so the assertion fails unless the empty copy clears it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_empty_bulk_copy_clears_a_previous_operations_code_page_loss() {
+        let mut client = begin_connection(&build_tcp_datasource()).await;
+
+        client
+            .execute(
+                "CREATE TABLE #BulkCopyCpStale (
+                    id INT NOT NULL,
+                    v VARCHAR(16) COLLATE SQL_Latin1_General_CP1_CI_AS NOT NULL
+                )"
+                .to_string(),
+                (),
+            )
+            .await
+            .expect("Failed to create test table");
+        client.close_query().await.expect("Failed to close query");
+
+        // U+65E5 has no Windows-1252 representation, so this copy substitutes
+        // and leaves the verdict set on the client.
+        BulkCopy::new(&mut client, "#BulkCopyCpStale")
+            .write_to_server_zerocopy(vec![TextRow {
+                id: 1,
+                text: "caf\u{65e5}",
+            }])
+            .await
+            .expect("Bulk copy failed");
+
+        // Deliberately not drained: the next operation owns the verdict it
+        // reports, and an empty one substituted nothing.
+        let empty: Vec<TextRow> = vec![];
+        let result = BulkCopy::new(&mut client, "#BulkCopyCpStale")
+            .write_to_server_zerocopy(empty)
+            .await
+            .expect("Bulk copy should handle empty dataset");
+        assert_eq!(result.rows_affected, 0);
+
+        assert!(
+            !client.take_code_page_conversion_loss(),
+            "an empty bulk copy must not report the previous operation's substitution"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_bulk_copy_null_to_non_nullable_column() {
         let mut client = begin_connection(&build_tcp_datasource()).await;
