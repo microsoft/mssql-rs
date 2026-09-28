@@ -161,7 +161,11 @@ fn sql_exec_direct_w_safe(
         let output_flags: Vec<bool> = stmt_state
             .bound_params
             .iter()
-            .map(|param| param.is_some_and(|param| is_output_direction(param.input_output_type)))
+            .map(|param| {
+                param
+                    .as_ref()
+                    .is_some_and(|param| is_output_direction(param.param.input_output_type))
+            })
             .collect();
         let (rewritten_sql, marker_count, mut call) =
             match translate_for_execution(&sql, stmt_state.inert_attrs.noscan(), &output_flags) {
@@ -200,12 +204,12 @@ fn sql_exec_direct_w_safe(
             };
             if index == 0
                 && call.as_ref().is_some_and(|c| c.returns_status)
-                && !is_output_direction(bound.input_output_type)
+                && !is_output_direction(bound.param.input_output_type)
             {
                 post_diag(&mut stmt_state, ERR_INVALID_PARAMETER_TYPE);
                 return SQL_ERROR;
             }
-            let Ok(positioned) = bound.for_row(0, bind_offset, SQL_BIND_BY_COLUMN) else {
+            let Ok(positioned) = bound.param.for_row(0, bind_offset, SQL_BIND_BY_COLUMN) else {
                 post_diag(&mut stmt_state, ERR_INVALID_STRING_OR_BUFFER_LENGTH);
                 return SQL_ERROR;
             };
@@ -248,6 +252,7 @@ fn sql_exec_direct_w_safe(
         stmt_state.prepared = None;
         stmt_state.direct_marker_count = Some(marker_count);
         stmt_state.parameter_metadata.clear();
+        stmt_state.parameter_udt_names.clear();
         stmt_state.clear_state(STMT_STATE_PREPARED);
         stmt_state.call_returns_status = call.as_ref().is_some_and(|c| c.returns_status);
         stmt_state.set_state(STMT_STATE_EXEC_STARTED);

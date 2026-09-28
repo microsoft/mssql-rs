@@ -20,7 +20,7 @@ use crate::handles::stmt::{
     PreparedPlan, STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT, STMT_STATE_EXEC_STARTED,
     STMT_STATE_PREPARED,
 };
-use crate::handles::{HandleType, StmtHandle, handle_from_raw};
+use crate::handles::{DescHandle, HandleType, StmtHandle, handle_from_raw};
 
 /// Implementation of `SQLPrepareW`.
 ///
@@ -90,9 +90,11 @@ fn sql_prepare_w_safe(stmt: &StmtHandle, sql: String) -> SqlReturn {
     let dbc = stmt.parent_dbc();
 
     // Lock parent (DBC) before child (STMT) per the crate's lock-ordering rule,
-    // and hold both for the whole body: the state check and the store happen
+    // and hold both through the store: the state check and the store happen
     // under one continuous STMT lock, so there is no TOCTOU window between them,
-    // and the connection-liveness read stays valid through the store.
+    // and the connection-liveness read stays valid through the store. Both are
+    // then released before the IPD work below, because the same rule forbids
+    // holding a STMT lock while taking a DESC lock.
     let Ok(dbc_state) = dbc.inner.lock() else {
         error!("SQLPrepareW: dbc mutex poisoned");
         return SQL_ERROR;
@@ -137,11 +139,34 @@ fn sql_prepare_w_safe(stmt: &StmtHandle, sql: String) -> SqlReturn {
         original_sql: sql,
     });
     stmt_state.parameter_metadata.clear();
+    stmt_state.parameter_udt_names.clear();
     stmt_state.clear_result_metadata();
     stmt_state.reset_row_stream();
     stmt_state.clear_state(STMT_STATE_EXEC_CONTEXT);
     stmt_state.call_returns_status = false;
     stmt_state.set_state(STMT_STATE_PREPARED);
+    drop(stmt_state);
+    drop(dbc_state);
+
+    // These names describe the text this prepare just replaced, and a later
+    // SQLBindParameter would mark the record explicitly bound - freezing the
+    // stale identity in place. Application-set names survive.
+    let rc = unsafe { handle_from_raw::<DescHandle>(stmt.ipd) }.clear_auto_filled_udt_names();
+    if rc != SQL_SUCCESS {
+        error!("SQLPrepareW: could not clear auto-filled UDT names");
+        // Re-lock to post: the STMT lock was dropped above, so without this
+        // the application gets SQL_ERROR and SQL_NO_DATA from SQLGetDiagRec.
+        // Same shape as `sql_free_stmt_reset_params_safe`'s poisoned-APD path.
+        if let Ok(mut stmt_state) = stmt.inner.lock() {
+            post_sql_error(
+                &mut stmt_state,
+                SQLSTATE_HY000,
+                0,
+                "Internal error clearing UDT parameter names",
+            );
+        }
+        return rc;
+    }
 
     debug!("SQLPrepareW: statement prepared (deferred)");
     SQL_SUCCESS

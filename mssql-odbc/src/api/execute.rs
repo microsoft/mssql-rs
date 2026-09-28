@@ -112,7 +112,7 @@ struct DaeExecution {
 }
 
 struct BatchExecution {
-    bound_params: Vec<Option<crate::params::BoundParam>>,
+    bound_params: Vec<Option<crate::params::ParamSnapshot>>,
     active_rows: Vec<usize>,
     marker_count: usize,
     bind_offset: isize,
@@ -146,7 +146,7 @@ enum ExecutionStaging {
 }
 
 struct PreparedRows<'a> {
-    bound_params: &'a [Option<crate::params::BoundParam>],
+    bound_params: &'a [Option<crate::params::ParamSnapshot>],
     active_rows: std::slice::Iter<'a, usize>,
     marker_count: usize,
     bind_offset: isize,
@@ -904,7 +904,11 @@ fn stage_execution(stmt: &StmtHandle) -> Result<ExecutionStaging, SqlReturn> {
     let output_flags: Vec<bool> = stmt_state
         .bound_params
         .iter()
-        .map(|param| param.is_some_and(|param| is_output_direction(param.input_output_type)))
+        .map(|param| {
+            param
+                .as_ref()
+                .is_some_and(|param| is_output_direction(param.param.input_output_type))
+        })
         .collect();
     let Some(plan) = stmt_state.prepared.as_ref() else {
         post_diag(&mut stmt_state, ERR_FUNCTION_SEQUENCE);
@@ -928,7 +932,7 @@ fn stage_execution(stmt: &StmtHandle) -> Result<ExecutionStaging, SqlReturn> {
                     post_diag(&mut stmt_state, ERR_UNBOUND_PARAMETER);
                     return Err(SQL_ERROR);
                 }
-                Some(param) if !is_output_direction(param.input_output_type) => {
+                Some(param) if !is_output_direction(param.param.input_output_type) => {
                     post_diag(&mut stmt_state, ERR_INVALID_PARAMETER_TYPE);
                     return Err(SQL_ERROR);
                 }
@@ -974,7 +978,7 @@ fn stage_execution(stmt: &StmtHandle) -> Result<ExecutionStaging, SqlReturn> {
                 post_diag(&mut stmt_state, ERR_UNBOUND_PARAMETER);
                 return Err(SQL_ERROR);
             };
-            if bound.input_output_type != SQL_PARAM_INPUT {
+            if bound.param.input_output_type != SQL_PARAM_INPUT {
                 post_sql_error(
                     &mut stmt_state,
                     SQLSTATE_HYC00,
@@ -1019,11 +1023,13 @@ fn stage_execution(stmt: &StmtHandle) -> Result<ExecutionStaging, SqlReturn> {
             }
 
             for parameter in 0..marker_count {
+                // Only the `Copy` half is needed per row; cloning the snapshot
+                // would reallocate the UDT identity for every row.
                 let bound = stmt_state
                     .bound_params
                     .get(parameter)
                     .and_then(Option::as_ref)
-                    .copied()
+                    .map(|snapshot| snapshot.param)
                     .ok_or_else(|| {
                         post_diag(&mut stmt_state, ERR_UNBOUND_PARAMETER);
                         SQL_ERROR
