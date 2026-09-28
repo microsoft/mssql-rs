@@ -252,5 +252,6 @@ pub async fn connect(
     // A batch that fails part-way still has result sets to render, and the
     // reference prints them. Without this the driver stops at the first error.
     client.set_defer_batch_errors(true);
+    client.set_collect_done_row_counts(true);
     Ok(client)
 }
