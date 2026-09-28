@@ -1410,10 +1410,13 @@ fn fill_rowset(
         fetch_error.is_none()
     });
 
-    // Leave zero-row messages on the client until the exhaustion check decides
-    // whether this fetch can release the connection. If another result remains,
-    // SQLMoreResults will consume them; if the batch is done, the release helper
-    // posts them before publishing the idle client.
+    // Zero-row messages stay on the client so the release helper drains them
+    // together with anything its own peek consumes, posting the whole set in
+    // wire order under one lock. With rows delivered they are taken here and
+    // handed to that helper as `preceding` instead, since they came off the
+    // wire before it looks. Either way this fetch posts them — the helper now
+    // drains regardless of whether the batch can release, so SQLMoreResults
+    // never sees them.
     let info_messages = if rows_filled > 0 || fetch_error.is_some() {
         client.take_info_messages()
     } else {
