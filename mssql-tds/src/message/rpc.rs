@@ -92,6 +92,34 @@ impl<'a> SqlRpc<'a> {
         }
     }
 
+    /// Validates every parameter before the message writes anything.
+    ///
+    /// `PacketWriter` sends on overflow, so once serialization starts a later
+    /// parameter's invalid value can only be reported after earlier bytes have
+    /// already left. Running the checks first keeps locally-invalid input a
+    /// local failure instead of a half-sent RPC needing cancel-and-drain.
+    ///
+    /// SCOPE: this covers one RPC message. In a *batched* prepared execution
+    /// each row is its own command, appended to a shared writer by
+    /// `serialize_batch_command`, so this runs per command and a later row's
+    /// invalid parameter is still reported after earlier rows have flushed -
+    /// `finish_send` retracts the request in that case. Closing that would
+    /// mean validating every row before the first is written, which the
+    /// streaming row iterator does not allow without materializing the whole
+    /// batch. The batch path already aborts mid-batch the same way for
+    /// `reject_data_at_exec` and the ForceColumnEncryption check
+    /// (`tds_client.rs`), so this shares an existing property rather than
+    /// adding one; tracked in AB#48248.
+    fn validate_parameters(&self) -> TdsResult<()> {
+        for parameter in self.positional_parameters.iter().flatten() {
+            parameter.validate_before_send()?;
+        }
+        for parameter in self.named_parameters.iter().flatten() {
+            parameter.validate_named_before_send()?;
+        }
+        Ok(())
+    }
+
     async fn write_positional_parameters(
         &self,
         packet_writer: &mut PacketWriter<'_>,
@@ -140,6 +168,7 @@ impl<'a> SqlRpc<'a> {
     where
         'b: 's,
     {
+        self.validate_parameters()?;
         write_headers(&self.headers, packet_writer).await?;
         self.write_proc(packet_writer).await?;
         self.write_positional_parameters(packet_writer).await?;
@@ -158,6 +187,7 @@ impl<'a> SqlRpc<'a> {
         packet_writer: &mut PacketWriter<'_>,
         first: bool,
     ) -> TdsResult<()> {
+        self.validate_parameters()?;
         if first {
             write_headers(&self.headers, packet_writer).await?;
         } else {
@@ -490,6 +520,120 @@ mod tests {
         assert_eq!(
             &writer.get_payload().into_inner()[8..],
             &[0xff, 0xff, 10, 0, 0, 0]
+        );
+    }
+
+    /// An invalid value on a *later* parameter must fail before the message
+    /// writes anything. `PacketWriter` sends on overflow, so once
+    /// serialization starts an earlier parameter can already have flushed
+    /// whole packets - the error would then arrive as a half-sent RPC needing
+    /// cancel-and-drain rather than a local failure.
+    ///
+    /// Covers all three fallible metadata checks: a UDT name too long for its
+    /// B_VARCHAR count, a `sql_variant` whose inner type it cannot hold, and a
+    /// vector whose declaration disagrees with its value.
+    #[test]
+    fn an_invalid_later_parameter_sends_nothing() {
+        use crate::datatypes::sql_udt::UdtTypeName;
+
+        let invalid_values = [
+            SqlType::Udt(
+                UdtTypeName::new(None, None, "c".repeat(256)),
+                Some(vec![0x01]),
+            ),
+            // `sql_variant` cannot carry a UDT; rejected by
+            // `validate_variant_inner`, which `write_type_info` only reaches
+            // after this parameter's name and flags are already written.
+            SqlType::Variant(Box::new(SqlType::Udt(
+                UdtTypeName::new(None, None, "Point".to_string()),
+                Some(vec![0x01]),
+            ))),
+            // A vector whose declared dimensions disagree with its value.
+            // Reachable from outside this crate - `mssql-py-core` builds these
+            // from application input.
+            SqlType::Vector(
+                Some(
+                    crate::datatypes::sql_vector::SqlVector::try_from_f32(vec![1.0, 2.0, 3.0])
+                        .expect("three f32 elements is a valid vector"),
+                ),
+                7,
+                crate::datatypes::sqldatatypes::VectorBaseType::Float32,
+            ),
+        ];
+
+        for invalid in invalid_values {
+            // First parameter is large enough to overflow the 512-byte packet
+            // on its own, so a missing preflight is observable as sent bytes.
+            let filler = SqlString::from_utf8_string("x".repeat(600));
+            let parameters = vec![
+                RpcParameter::new(
+                    None,
+                    StatusFlags::NONE,
+                    SqlType::NVarchar(Some(filler), 4000),
+                ),
+                RpcParameter::new(None, StatusFlags::NONE, invalid),
+            ];
+
+            // Packet size comes from the mock writer, not from
+            // `PacketWriter::new` (whose third argument is a timeout).
+            let mut mock = MockNetworkWriter::new(512);
+            let mut writer = PacketWriter::new(PacketType::RpcRequest, &mut mock, None, None);
+            let collation = SqlCollation::default();
+            let rpc = SqlRpc::new(
+                RpcType::ProcId(RpcProcs::ExecuteSql),
+                Some(parameters),
+                None,
+                &collation,
+                &ExecutionContext::new(),
+            );
+
+            let result = block_on(rpc.serialize_prefix(&mut writer));
+            // `UsageError` for the name/variant rules, `TypeConversionError`
+            // for a vector whose declaration disagrees with its value.
+            assert!(result.is_err(), "expected the invalid value to be rejected");
+            assert!(
+                mock.data.is_empty(),
+                "no packet may reach the network before every parameter is validated"
+            );
+        }
+    }
+
+    /// The named counterpart: an overlong name on a *later* named parameter
+    /// must also fail before anything is written. `serialize` length-checks
+    /// the name only on the named path, which is why the preflight splits the
+    /// two rather than validating names it will never write.
+    #[test]
+    fn an_overlong_name_on_a_later_named_parameter_sends_nothing() {
+        let filler = SqlString::from_utf8_string("x".repeat(600));
+        let parameters = vec![
+            RpcParameter::new(
+                Some("@ok".to_string()),
+                StatusFlags::NONE,
+                SqlType::NVarchar(Some(filler), 4000),
+            ),
+            RpcParameter::new(
+                Some(format!("@{}", "n".repeat(0xFF))),
+                StatusFlags::NONE,
+                SqlType::Int(Some(1)),
+            ),
+        ];
+
+        let mut mock = MockNetworkWriter::new(512);
+        let mut writer = PacketWriter::new(PacketType::RpcRequest, &mut mock, None, None);
+        let collation = SqlCollation::default();
+        let rpc = SqlRpc::new(
+            RpcType::ProcId(RpcProcs::ExecuteSql),
+            None,
+            Some(parameters),
+            &collation,
+            &ExecutionContext::new(),
+        );
+
+        let result = block_on(rpc.serialize_prefix(&mut writer));
+        assert!(matches!(result, Err(crate::error::Error::UsageError(_))));
+        assert!(
+            mock.data.is_empty(),
+            "no packet may reach the network before every parameter is validated"
         );
     }
 }

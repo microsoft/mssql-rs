@@ -151,6 +151,7 @@ fn sql_get_type_info_w_safe(
         stmt_state.orphan_prepared_handle();
         stmt_state.prepared = None;
         stmt_state.parameter_metadata.clear();
+        stmt_state.parameter_udt_names.clear();
         stmt_state.clear_state(STMT_STATE_PREPARED);
         stmt_state.set_state(STMT_STATE_EXEC_STARTED);
         stmt_state.query_timeout

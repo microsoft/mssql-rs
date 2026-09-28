@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 use std::ffi::c_void;
+use std::sync::Arc;
 
 use crate::api::odbc_types::{
     SQL_BIND_BY_COLUMN, SQL_C_DEFAULT, SQL_C_NUMERIC, SQL_PARAM_INPUT, SQL_PREC_NUMERIC, SqlLen,
@@ -11,7 +12,7 @@ use crate::api::set_desc_field::datetime_interval_code_for;
 use crate::api::type_rules::{parameter_size_is_precision, resolve_default_c_type};
 use crate::conversion::parameter_value_stride;
 use crate::handles::OdbcVersion;
-use crate::handles::desc::{DescRecord, DescState};
+use crate::handles::desc::{DescRecord, DescState, UdtNames};
 
 /// A bound parameter — the lightweight equivalent of msodbcsql's implicit
 /// APD + IPD records (`cmdp.APD`), populated by `SQLBindParameter`.
@@ -65,6 +66,30 @@ pub(crate) struct BoundParam {
     /// can set them independently. Null means "assume NUL-terminated" for a
     /// character parameter.
     pub(crate) octet_length_ptr: *mut SqlLen,
+}
+
+/// One parameter ordinal's execute-time snapshot: the POD binding plus the
+/// UDT identity from the IPD's `SQL_CA_SS_UDT_*` fields.
+///
+/// The name is kept out of [`BoundParam`] deliberately. It varies per ordinal
+/// but not per row, whereas [`BoundParam::for_row`] runs once per parameter
+/// per row; holding an owned name inside it would both cost `BoundParam` its
+/// `Copy` and re-allocate the same three strings for every row of a parameter
+/// array.
+#[derive(Debug, Clone)]
+pub(crate) struct ParamSnapshot {
+    pub(crate) param: BoundParam,
+    /// `None` for every parameter that is not a `SQL_SS_UDT`.
+    pub(crate) udt_names: Option<Arc<UdtNames>>,
+}
+
+impl From<BoundParam> for ParamSnapshot {
+    fn from(param: BoundParam) -> Self {
+        Self {
+            param,
+            udt_names: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -319,13 +344,25 @@ impl BoundParam {
         apd_state: &DescState,
         ipd_state: &DescState,
         odbc_version: OdbcVersion,
-    ) -> Vec<Option<Self>> {
+    ) -> Vec<Option<ParamSnapshot>> {
         apd_state
             .records
             .iter()
             .enumerate()
             .map(|(i, apd_record)| {
-                Self::from_records(apd_record, ipd_state.records.get(i), odbc_version)
+                let ipd_record = ipd_state.records.get(i);
+                let param = Self::from_records(apd_record, ipd_record, odbc_version)?;
+                Some(ParamSnapshot {
+                    param,
+                    // Filtered to match the doc on the field, and for the same
+                    // reason `parameter_definition` filters: `classify_field`
+                    // gates the `SQL_CA_SS_UDT_*` fields on `DescKind::ImpParam`
+                    // alone, so an application can leave an identity on a
+                    // record it later rebinds to a scalar type.
+                    udt_names: ipd_record
+                        .filter(|ipd| ipd.concise_type == crate::api::odbc_types::SQL_SS_UDT)
+                        .and_then(|ipd| ipd.udt_names.clone()),
+                })
             })
             .collect()
     }
@@ -787,5 +824,31 @@ mod tests {
         assert_eq!(params.len(), 2);
         assert!(params[0].is_some());
         assert!(params[1].is_none());
+    }
+
+    /// `SQL_CA_SS_UDT_*` is writable on any IPD record (`classify_field` gates
+    /// on kind, not type), so an identity can outlive a rebind to a scalar
+    /// type. The snapshot must not carry it: the field's contract is `None`
+    /// for every non-`SQL_SS_UDT` parameter, and nothing else enforces that.
+    #[test]
+    fn a_udt_identity_left_on_a_scalar_record_does_not_reach_the_snapshot() {
+        let mut apd_state = empty_state();
+        let mut ipd_state = empty_state();
+        let mut apd = DescRecord::default_for(DescKind::AppParam);
+        let mut ipd = DescRecord::default_for(DescKind::ImpParam);
+        param(std::ptr::null_mut(), std::ptr::null_mut()).write_to_records(&mut apd, &mut ipd);
+        // The bind above leaves `concise_type` at SQL_VARCHAR.
+        ipd.udt_names = Some(Arc::new(UdtNames {
+            type_name: "Point".to_string(),
+            ..Default::default()
+        }));
+        apd_state.records.push(apd);
+        ipd_state.records.push(ipd);
+
+        let params = BoundParam::all_from_descriptor_states(&apd_state, &ipd_state, ODBC_VERSION);
+        assert!(
+            params[0].as_ref().unwrap().udt_names.is_none(),
+            "a scalar parameter must carry no UDT identity"
+        );
     }
 }
