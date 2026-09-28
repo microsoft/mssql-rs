@@ -543,10 +543,9 @@ pub(super) fn flush_pending_unprepare(
 /// deducted timeout to each step (`sqlcfunc.cpp:787-828`, `sqlccmd.cpp:10572-10586`).
 ///
 /// `0` means unlimited and passes through unchanged. A positive budget is
-/// reduced by `elapsed`, truncated *down* to whole seconds — unlike
-/// `mssql-tds`'s own internal `deduct_timeout`, which rounds a *measured*
-/// recovery duration up to charge it conservatively, `elapsed` here is
-/// measured across steps that may have done no I/O at all (e.g. an
+/// reduced by `elapsed`, truncated *down* to whole seconds, like
+/// `mssql-tds`'s internal `deduct_timeout`. Elapsed time is measured across
+/// steps that may have done no I/O at all (e.g. an
 /// autocommit-on connection skips the transaction begin entirely), so its
 /// value is often a few microseconds of local bookkeeping (mutex locks,
 /// staging). Rounding that up would charge a full second against the budget

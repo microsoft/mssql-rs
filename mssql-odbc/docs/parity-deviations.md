@@ -477,3 +477,55 @@ msodbcsql build is measured.
     Driver Manager bind/record-edit sequence with RPC capture and a recorded
     `SQL_DRIVER_VER` is still needed to establish shipping-build behavior;
     do not infer retail parity or add a comparison-test skip from this entry.
+18. **`Authentication=ActiveDirectoryPassword` is refused.** msodbcsql accepts
+    it: `OPTIONADPASSWORD L"ActiveDirectoryPassword"`
+    (`Sql/Ntdbms/sqlncli/msdart/inc/dlgattr.h`), carried through as
+    `IntegratedSecurity::ActiveDirectoryPassword` (`tds/TdsParser.h:411`) and
+    dispatched by the `authMode` ternary at `tds/Parse.cpp:3661`, which selects
+    `AKVCFG_AUTHMODE_PASSWORD` and feeds `AzureADAuth::GetAccessTokenW`.
+    This driver parses and validates the keyword - including the rule that it
+    requires both `UID` and `PWD` - and then returns `HYC00` from
+    `SQLDriverConnectW`, because `configure_auth` (`src/auth/entra.rs`) has no
+    arm for it and falls through to `UnsupportedAuth::plain`. The refusal
+    happens before any network activity.
+    Excluded by design rather than deferred: the ratified authentication design
+    scopes the driver to "full msodbcsql parity except AD Password" (mssql-rs
+    wiki, `Design/mssql-odbc-Authentication`, commit `072f280f`). The flow sends
+    plaintext credentials to Entra, supports neither MFA nor conditional access,
+    is deprecated by the Microsoft identity platform, is blocked in many
+    tenants, and was deprecated in SqlClient 7.0.
+    **Application-visible regression:** mssql-python does not map this keyword,
+    so it stays in the connection string and reaches whichever driver is
+    loaded. An application using `Authentication=ActiveDirectoryPassword`
+    connects today against msodbcsql; pointing that same application at this
+    driver turns a working connection into `HYC00`. Signed off by Vahid
+    Beiranvand on 2026-07-16 on AB#45486, which records the reconciliation with
+    the auth parity review and was closed as Removed rather than implemented.
+    **Evidence limit:** this is a source comparison, not a measured retail
+    acceptance claim. A comparison run that records `SQL_DRIVER_VER` and the
+    tested msodbcsql build while calling `SQLDriverConnectW` with
+    `Authentication=ActiveDirectoryPassword` is still required to establish
+    shipping-build behavior.
+19. **A cross-identity orphan is released before streaming an already-live
+    prepared statement, and a release error fails that execute.** The source
+    reference is msodbcsql's `DropPrepHandle` (`Sql/Ntdbms/sqlncli/odbc/sqlcfunc.cpp`), which
+    defers the drop in `hPrepDropDeferred`; `BuildSPPrepExec` (`odbc/sqlccmd.cpp`)
+    passes that handle by reference on the next prepare, saving a round trip.
+    `ProcessDAEParam` clears the deferred slot only after `SendRPCFromStmt`
+    succeeds. This driver's streamed `sp_prepexec` likewise piggybacks the
+    orphan and defers eviction until the complete message is sent; cancellation
+    retains the orphan without assigning a new statement identity.
+    The separate-release policy applies only when `begin_execute_prepared`
+    reuses a live handle through `sp_execute`, whose handle parameter has no
+    drop slot for another identity. It sends and drains `sp_unprepare` before
+    parking that stream, analogous to the reference's forced-drop route.
+    `execute.rs` propagates a release failure and restores any retained orphan.
+    Do not swallow that error and continue: `StmtState::pending_unprepare`
+    holds only one orphan, so returning a live prepared statement while retaining
+    a separate orphan can overflow that slot at the next rebind, recreating #598.
+    This is a source-verified policy difference, not a measured claim about a
+    retail driver's diagnostics or wire sequence; a build-specific reference
+    comparison remains outstanding. No parity test is skipped for it.
+    Recorded following automated review feedback on #599 (2026-09-22);
+    narrowed to the cross-identity case following review on 2026-09-24.
+    Human parity sign-off has not been recorded. Tracked in #598.
