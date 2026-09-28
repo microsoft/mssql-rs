@@ -22,8 +22,8 @@ use crate::api::odbc_types::{
     SQL_C_UBIGINT, SQL_C_ULONG, SQL_C_USHORT, SQL_C_UTINYINT, SQL_C_WCHAR, SQL_DATA_AT_EXEC,
     SQL_DEFAULT_PARAM, SQL_HANDLE_DBC, SQL_HANDLE_ENV, SQL_HANDLE_STMT,
     SQL_LEN_DATA_AT_EXEC_OFFSET, SQL_NTS, SQL_NULL_DATA, SQL_NULL_HANDLE, SQL_OV_ODBC3_80,
-    SQL_PARAM_INPUT, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SQL_VARCHAR, SQL_WVARCHAR, SqlHandle,
-    SqlInteger, SqlLen, SqlPointer, SqlSmallInt, SqlULen, SqlUSmallInt, SqlWChar,
+    SQL_PARAM_INPUT, SQL_SS_UDT, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SQL_VARCHAR, SQL_WVARCHAR,
+    SqlHandle, SqlInteger, SqlLen, SqlPointer, SqlSmallInt, SqlULen, SqlUSmallInt, SqlWChar,
 };
 use crate::api::util::rewrite_param_markers;
 use crate::api::util::{read_utf16, read_utf16_attr, read_utf16_long};
@@ -51,6 +51,7 @@ use mssql_tds::datatypes::column_values::{
 use mssql_tds::datatypes::decoder::DecimalParts;
 use mssql_tds::datatypes::sql_string::{EncodingType, SqlString};
 use mssql_tds::fuzz_support::{FuzzPacketReader, create_fuzz_tds_client};
+use mssql_tds::message::parameters::rpc_parameters::RpcParameter;
 use mssql_tds::token::tokens::SqlCollation;
 use std::ffi::c_void;
 use std::sync::LazyLock;
@@ -479,7 +480,13 @@ static PARAM_SQL_TYPES: LazyLock<Vec<SqlSmallInt>> = LazyLock::new(|| {
 ///
 /// The UDT identity is drawn from the same cursor rather than passed as `None`:
 /// the conversion consults it first, so a `None` would short-circuit every
-/// `SQL_SS_UDT` draw before the value buffer is read.
+/// `SQL_SS_UDT` draw before the value buffer is read. The draw is made only for
+/// a `SQL_SS_UDT` `sql_type`, since those bytes otherwise come out of the value
+/// buffer for every other type without being used.
+///
+/// The declaration is then rendered from the converted value, because
+/// conversion alone never inspects the name - that is what carries fuzzer bytes
+/// into `format_udt_sql_name`'s `]` doubling.
 pub fn fuzz_bound_param(data: &[u8]) {
     let mut cur = ByteCursor::new(data);
     let c_type = PARAM_C_TYPES[(cur.u8() as usize) % PARAM_C_TYPES.len()];
@@ -487,14 +494,25 @@ pub fn fuzz_bound_param(data: &[u8]) {
     let ind_mode = cur.u8();
     let column_size = cur.u8() as SqlULen;
     let decimal_digits = SqlSmallInt::from(cur.u8() % 39);
-    // Ahead of `rest()`, which consumes the remainder. Lengths are drawn past
-    // the 255-unit bound so the overlong-name rejection is reachable, and a
-    // zero length is left possible so the absent-part branches are too.
-    let (cat_len, sch_len) = ((cur.u8() % 24) as usize, (cur.u8() % 24) as usize);
-    let udt_catalog = cur.take(cat_len);
-    let udt_schema = cur.take(sch_len);
-    let type_len = (cur.u8() % 2) as usize * 200 + (cur.u8() % 80) as usize;
-    let udt_type = cur.take(type_len);
+    // Only for a UDT draw: these bytes come out of the value buffer, and every
+    // other `sql_type` - the large majority of `PARAM_SQL_TYPES` - would pay
+    // for entropy it cannot use.
+    let udt = (sql_type == SQL_SS_UDT).then(|| {
+        let (cat_len, sch_len) = ((cur.u8() % 24) as usize, (cur.u8() % 24) as usize);
+        let catalog = cur.take(cat_len);
+        let schema = cur.take(sch_len);
+        let type_len = 1 + (cur.u8() % 24) as usize;
+        let type_name = cur.take(type_len);
+        // Lossy rather than a UTF-8 check, so no draw is wasted on invalid
+        // input. A zero-length catalog or schema is deliberately possible: the
+        // absent-part branches of the declaration are reached that way.
+        UdtNames {
+            catalog: String::from_utf8_lossy(&catalog).into_owned(),
+            schema: String::from_utf8_lossy(&schema).into_owned(),
+            type_name: String::from_utf8_lossy(&type_name).into_owned(),
+            assembly_type_name: String::new(),
+        }
+    });
 
     let mut value_buf = cur.rest();
     let fuzz_len = value_buf.len() as SqlLen;
@@ -525,21 +543,6 @@ pub fn fuzz_bound_param(data: &[u8]) {
     let ind_ptr = &mut ind as *mut SqlLen;
     let value_ptr = value_buf.as_mut_ptr() as *mut c_void;
 
-    // `bound_param_to_value_with_outcome` consults the identity before it reads
-    // the value buffer, so passing `None` would make every `SQL_SS_UDT` draw
-    // return `MissingUdtTypeName` and leave the whole UDT arm - the one place a
-    // caller-controlled type name meets an arbitrary payload - unfuzzed.
-    // Drawn from the cursor rather than a literal so the bytes reach the two
-    // pieces that actually parse hostile text: `UdtTypeName::validate`'s
-    // 255-UTF-16-unit bound per part, and `format_udt_sql_name`'s `]` doubling.
-    // Lossy rather than a UTF-8 check, so no draw is wasted on invalid input.
-    let udt = UdtNames {
-        catalog: String::from_utf8_lossy(&udt_catalog).into_owned(),
-        schema: String::from_utf8_lossy(&udt_schema).into_owned(),
-        type_name: String::from_utf8_lossy(&udt_type).into_owned(),
-        assembly_type_name: String::new(),
-    };
-
     let param = BoundParam {
         input_output_type: SQL_PARAM_INPUT,
         c_type,
@@ -554,7 +557,26 @@ pub fn fuzz_bound_param(data: &[u8]) {
         strlen_or_ind_ptr: ind_ptr,
         octet_length_ptr: ind_ptr,
     };
-    let _ = unsafe { bound_param_to_rpc("@P1".to_string(), &param, Some(&udt)) };
+    // `bound_param_to_value_with_outcome` consults the identity before it reads
+    // the value buffer, so passing `None` would make every `SQL_SS_UDT` draw
+    // return `MissingUdtTypeName` and leave the UDT arm - the `SqlType::Udt`
+    // construction and the binary payload pass-through behind it - unfuzzed.
+    let Ok((rpc, _)) = (unsafe { bound_param_to_rpc("@P1".to_string(), &param, udt.as_ref()) })
+    else {
+        return;
+    };
+    // Conversion alone never inspects the name: `udt_type_name` only checks
+    // that the type name is non-empty, and both `UdtTypeName::validate` and
+    // the declaration formatter live past this point. Rendering the
+    // declaration is what puts fuzzer bytes through `format_udt_sql_name`'s
+    // `]` doubling - the injection-relevant escaping, which nothing else
+    // fuzzes. (`UdtTypeName::validate`'s 255-UTF-16-unit bound stays out of
+    // reach from this crate: it runs at serialization time inside mssql-tds,
+    // so fuzzing it belongs in that crate's targets, not here.)
+    let Ok(value) = rpc.get_value() else {
+        return;
+    };
+    let _ = RpcParameter::get_sql_name(value, None);
 }
 
 /// Drive the real ODBC result path end to end — `SQLExecDirectW` → `SQLFetch` →
