@@ -510,9 +510,15 @@ pub struct TdsClient {
 
     pub(in crate::connection) return_values: Vec<ReturnValue>,
     info_messages: Vec<SqlInfoMessage>,
-    /// Whether the most recently sent message substituted a character that the
-    /// target collation's code page could not represent. Captured from the
-    /// message once it is built, and drained by
+    /// Whether the work most recently completed on this connection substituted
+    /// a character the narrow encoding it was sent in could not represent.
+    ///
+    /// Usually one message: captured from it once it is built, or noted
+    /// directly by a caller that converts a data-at-execution chunk itself.
+    /// A bulk copy is the exception — `BulkCopy::write_to_server_zerocopy`
+    /// spans several messages and restores the aggregate across every batch
+    /// here, so this is not always "the last message" and must not be
+    /// documented as such. Drained by
     /// [`take_code_page_conversion_loss`](Self::take_code_page_conversion_loss).
     code_page_conversion_loss: bool,
     /// Per-statement Always Encrypted parameter metadata, keyed by the same
@@ -7838,18 +7844,22 @@ impl TdsClient {
     }
 
     /// Drains the "a character was substituted on the way to the wire" flag for
-    /// the most recently sent message.
+    /// the work most recently completed on this connection.
     ///
     /// Set when a narrow (VARCHAR/CHAR/TEXT) value carried a character the
-    /// target collation's code page could not represent: the serializers write
-    /// `?` for it, matching msodbcsql and SQL Server's own `CAST`, rather than
-    /// the numeric character reference `encoding_rs` would emit (AB#47598).
+    /// encoding it was sent in could not represent: the serializers write `?`
+    /// for it, matching msodbcsql and SQL Server's own `CAST`, rather than the
+    /// numeric character reference `encoding_rs` would emit (AB#47598). That
+    /// encoding comes from the collation the value carries, so this reports the
+    /// conversion *this driver* performed, not any later one the server does.
     /// The substitution is not an error — `mssql-odbc` reports it as SQLSTATE
     /// `01000` only when the application asked for it via
     /// `SQL_COPT_SS_WARN_ON_CP_ERROR`.
     ///
-    /// Reflects one message and is replaced by the next send, so read it before
-    /// issuing another command.
+    /// Normally reflects one message and is replaced by the next send, so read
+    /// it before issuing another command. A bulk copy is the exception: it
+    /// spans several messages and reports the aggregate across every batch, so
+    /// one read after `write_to_server_zerocopy` covers the whole operation.
     pub fn take_code_page_conversion_loss(&mut self) -> bool {
         std::mem::take(&mut self.code_page_conversion_loss)
     }
