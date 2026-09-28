@@ -7727,9 +7727,14 @@ impl TdsClient {
 
         let count = self.count_map.entry(done.cur_cmd).or_insert(0);
         *count = count.saturating_add(done.row_count);
-        // Reached while reading rows, so this DONE closes a row-returning
-        // statement and its count is the row count.
-        self.record_done_row_count(&done, true);
+        // Prepared batches carry their counts in `PreparedBatchResult`; logging
+        // them here as well would double-report, and only row-producing ones
+        // reach this handler, so the channel would depend on the result shape.
+        if self.prepared_batch.is_none() {
+            // Reached while reading rows, so this DONE closes a row-returning
+            // statement and its count is the row count.
+            self.record_done_row_count(&done, true);
+        }
         self.current_result_set_has_been_read_till_end = true;
         self.current_result_ended_with_done_in_proc = ended_with_done_in_proc;
         let has_more = done.has_more() || self.prepared_batch.is_some();
@@ -9269,6 +9274,36 @@ mod tests {
             client_context,
             Vec::new(),
         )
+    }
+
+    /// A prepared batch carries its counts in `PreparedBatchResult`. Only
+    /// row-producing rows reach `handle_row_done`, so logging there as well
+    /// would both double-report and make the log depend on whether the row
+    /// returned a result set.
+    #[test]
+    fn a_prepared_batch_keeps_its_counts_off_the_done_log() {
+        let mut client = create_test_client();
+        client.prepared_batch = Some(Box::new(PreparedBatchReadState {
+            current: Some(PreparedBatchReadState::next_row(0)),
+            remaining: Vec::new().into_iter(),
+            completed: Vec::new(),
+        }));
+
+        client
+            .handle_row_done(
+                DoneToken {
+                    status: DoneStatus::COUNT,
+                    cur_cmd: CurrentCommand::Select,
+                    row_count: 2,
+                },
+                false,
+            )
+            .unwrap();
+
+        assert!(
+            client.take_done_row_counts().is_empty(),
+            "a prepared batch reports through PreparedBatchResult, not the log"
+        );
     }
 
     /// Builds a client whose transport replays `tokens` and captures every byte
