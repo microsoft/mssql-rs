@@ -2324,6 +2324,43 @@ TEST_F(UdtParamLiveTest, AUdtParameterWithoutATypeNameFails) {
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HY000");
 }
 
+// A bounded ColumnSize bounds the payload, measured on both legs. msodbcsql
+// raises 22001 when `cbData > min(cbColDef, SQL_PREC_UDT)`
+// (`sqlcfunc.cpp:2681-2696`); the check is skipped entirely when ColumnSize is
+// SQL_SS_LENGTH_UNLIMITED, so the same payload binds there.
+//
+// Unlike the varbinary arm above it in the reference, the UDT arm does not
+// call CheckTrailingZeros, so a zero-padded overflow is refused rather than
+// trimmed - asserted here because that is the half most likely to drift.
+TEST_F(UdtParamLiveTest, AUdtPayloadPastABoundedColumnSizeIsRefused) {
+    std::vector<SQLCHAR> payload = SerializedHierarchyId("/3/");
+    ASSERT_FALSE(payload.empty());
+    ASSERT_GT(payload.size(), 1u);
+
+    // One byte short of the payload: bounded, so the payload no longer fits.
+    const SQLULEN too_small = static_cast<SQLULEN>(payload.size() - 1);
+
+    ASSERT_SQL_OK(Prepare("SELECT CAST(? AS hierarchyid).ToString()"), SQL_HANDLE_STMT, stmt_);
+    indicator_ = static_cast<SQLLEN>(payload.size());
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_BINARY, SQL_SS_UDT, too_small,
+                                   0, payload.data(), indicator_, &indicator_),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SetUdtName("hierarchyid"), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(SQL_ERROR, SQLExecute(stmt_));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "22001");
+
+    // The same payload with SQL_SS_LENGTH_UNLIMITED is accepted and round
+    // trips, so the rejection above is the ceiling and not the binding.
+    EXPECT_SQL_OK(SQLFreeStmt(stmt_, SQL_RESET_PARAMS), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(Prepare("SELECT CAST(? AS hierarchyid).ToString()"), SQL_HANDLE_STMT, stmt_);
+    indicator_ = static_cast<SQLLEN>(payload.size());
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_BINARY, SQL_SS_UDT, 0, 0,
+                                   payload.data(), indicator_, &indicator_),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SetUdtName("hierarchyid"), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("/3/", ExecuteAndReadBack());
+}
+
 // The ColumnSize ceiling, measured on both legs rather than read from source.
 // msodbcsql's CheckSqlPrecScale rejects `> SQL_PREC_UDT` (8000) with HY104
 // (`sqlcdesc.cpp:11790`); this driver's `parameter_column_size_is_valid` has

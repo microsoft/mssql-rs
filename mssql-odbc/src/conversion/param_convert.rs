@@ -55,7 +55,7 @@ use crate::api::sqlstate::{
 };
 use crate::api::type_rules::{
     SQL_PREC_BIGCHARBINARY, SQL_PREC_NCHAR, SQL_PREC_NTEXT, SQL_PREC_NUMERIC, SQL_PREC_TEXTIMAGE,
-    is_wide_character_sql_type,
+    SQL_PREC_UDT, SQL_PREC_UNLIMITED, is_wide_character_sql_type,
 };
 use crate::conversion::datetime::{
     DateTimeParts, MAX_DAYS_SINCE_0001, TICKS_PER_DAY, civil_from_days_since_0001,
@@ -395,10 +395,9 @@ unsafe fn bound_param_to_value_with_outcome(
         // conversion at `sqlccnvt.cpp:1014-1016`, which treats the buffer as
         // hex text and folds each two characters into one byte - the `cbMax*2`
         // checks at `sqlcfunc.cpp:3048-3063` corroborate that ratio. Sending
-        // the buffer
-        // verbatim instead would put different bytes on the wire for the same
-        // binding, so those rows stay out of the conversion matrix and are
-        // refused at bind rather than shipped divergent.
+        // the buffer verbatim instead would put different bytes on the wire
+        // for the same binding, so those rows stay out of the conversion
+        // matrix and are refused at bind rather than shipped divergent.
         //
         // Source reading only, unmeasured on retail. Closing it needs a
         // both-legs run binding `SQL_C_CHAR` against a `hierarchyid` with
@@ -406,7 +405,23 @@ unsafe fn bound_param_to_value_with_outcome(
         // decode here or register the difference. Note `SQL_NTS` is unusable
         // for that binding: a serialized `hierarchyid` contains embedded nulls,
         // so the length must be explicit. AB#48815.
+        // A bounded declaration bounds the payload. msodbcsql checks
+        // `cbData > min(cbColDef, SQL_PREC_UDT)` and raises `22001`
+        // (`sqlcfunc.cpp:2681-2696`), skipping the check entirely when
+        // `ColumnSize` is `SQL_SS_LENGTH_UNLIMITED` - which is what `fIsVarMax`
+        // means for a UDT (`sqlcfunc.cpp:2577-2584`).
+        //
+        // Hard reject, deliberately unlike the `varbinary` arm right above it
+        // in the reference: that one calls `CheckTrailingZeros` and trims a
+        // zero-only overflow (`sqlcfunc.cpp:2606-2616`), the behaviour this
+        // driver mirrors in `trim_zero_overflow`. The UDT arm has no such call,
+        // so trimming here would accept a payload msodbcsql refuses.
         (AppValue::Binary(bytes), SqlFamily::Udt) => {
+            if param.column_size != SQL_PREC_UNLIMITED
+                && bytes.len() > param.column_size.min(SQL_PREC_UDT)
+            {
+                return Err(ParamBuildError::StringTruncation);
+            }
             SqlType::Udt(udt_type_name(udt_names)?, Some(bytes))
         }
         _ => return Err(ParamBuildError::ConversionNotImplemented),
@@ -6168,6 +6183,51 @@ mod tests {
                 assert_eq!(name.schema_name.as_deref(), Some("dbo"));
             }
             other => panic!("expected a UDT, got {other:?}"),
+        }
+    }
+
+    /// A bounded `ColumnSize` bounds the payload: msodbcsql raises `22001`
+    /// when `cbData > min(cbColDef, SQL_PREC_UDT)` (`sqlcfunc.cpp:2681-2696`).
+    ///
+    /// The zero-overflow case is asserted too, and it is the one that is easy
+    /// to get wrong: the `varbinary` arm immediately above in the reference
+    /// trims a zero-only overflow via `CheckTrailingZeros`
+    /// (`sqlcfunc.cpp:2606-2616`), which is what `trim_zero_overflow` mirrors
+    /// here - but the UDT arm has no such call, so a zero-padded payload past
+    /// the declaration is refused rather than trimmed.
+    #[test]
+    fn a_udt_payload_past_a_bounded_column_size_is_refused() {
+        let names = udt_binding("hierarchyid", "", "");
+        for (payload, column_size, expected) in [
+            // Exactly at the declaration, and under it: both fit.
+            (vec![1u8, 2, 3], 3usize, true),
+            (vec![1u8, 2], 3, true),
+            // One byte past a bounded declaration.
+            (vec![1u8, 2, 3, 4], 3, false),
+            // Past it, but the overflow is zeros - trimmed for `varbinary`,
+            // refused for a UDT.
+            (vec![1u8, 2, 3, 0], 3, false),
+            // `SQL_SS_LENGTH_UNLIMITED`: no ceiling is applied at all.
+            (vec![1u8, 2, 3, 4], 0, true),
+        ] {
+            let mut bytes = payload.clone();
+            let mut ind: SqlLen = bytes.len() as SqlLen;
+            let mut p = param(SQL_C_BINARY, bytes.as_mut_ptr().cast(), &mut ind);
+            p.sql_type = SQL_SS_UDT;
+            p.column_size = column_size;
+            let result = unsafe { bound_param_to_value_named(&p, names.as_deref()) };
+            if expected {
+                assert!(
+                    result.is_ok(),
+                    "payload {payload:?} with ColumnSize {column_size} should bind"
+                );
+            } else {
+                assert_eq!(
+                    result.unwrap_err(),
+                    ParamBuildError::StringTruncation,
+                    "payload {payload:?} with ColumnSize {column_size}"
+                );
+            }
         }
     }
 
