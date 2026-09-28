@@ -676,11 +676,21 @@ msodbcsql build is measured.
     substitution itself is silent by default on both drivers, so an application
     that never sets the attribute cannot tell them apart.
 
-    `UnmappableCharacterWarnsWhenAsked` and
-    `DataAtExecutionUnmappableCharacterWarnsWhenAsked` carry
-    `SKIP_IF_COMPARING_MSODBCSQL()`; the substitution they sit alongside is
-    asserted unskipped by `UnmappableCharacterIsSubstituted` and
-    `DataAtExecutionUnmappableCharacterIsSubstituted`. Tracked in AB#47598.
+    Four tests carry `SKIP_IF_COMPARING_MSODBCSQL()` for this entry:
+    `UnmappableCharacterWarnsWhenAsked`,
+    `DataAtExecutionUnmappableCharacterWarnsWhenAsked` and
+    `DataAtExecutionTruncatedTailWarnsWhenAsked` in
+    `param_char_conversions_test.cpp`, and `ArrayUnmappableCharacterWarnsWhenAsked`
+    in `param_array_test.cpp`. The substitution they sit alongside is asserted
+    unskipped by `UnmappableCharacterIsSubstituted` and
+    `DataAtExecutionUnmappableCharacterIsSubstituted`.
+
+    `ArrayUnmappableCharacterWarnsWhenAsked` carries a second obligation worth
+    recording here: its follow-up statement, asserting plain `SQL_SUCCESS` on a
+    value with nothing unmappable, is the only assertion in the suite that
+    catches a missing `take_code_page_conversion_loss` in
+    `finish_parameter_array` — an undrained verdict would warn again on an
+    unrelated statement. Tracked in AB#47598.
 
     **Value validation matches, with one measured exception.** msodbcsql
     rejects anything but `SQL_WARN_NO`/`SQL_WARN_YES` with `HY024`
