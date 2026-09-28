@@ -54,6 +54,9 @@ pub(crate) const SQL_PREC_NCHAR: usize = 4000;
 pub(crate) const SQL_PREC_TEXTIMAGE: usize = 2_147_483_647;
 pub(crate) const SQL_PREC_NTEXT: usize = 1_073_741_823;
 pub(crate) const SQL_PREC_NUMERIC: usize = 38;
+/// A CLR UDT's declarable maximum; past it msodbcsql reports `HY104`. A larger
+/// UDT is declared with `SQL_PREC_UNLIMITED` instead, the `max` spelling.
+pub(crate) const SQL_PREC_UDT: usize = 8000;
 /// `ColumnSize` 0, which only the `max`-capable types accept.
 pub(crate) const SQL_PREC_UNLIMITED: usize = 0;
 
@@ -136,6 +139,15 @@ pub(crate) fn parameter_column_size_is_valid(sql_type: SqlSmallInt, column_size:
         SQL_LONGVARCHAR | SQL_LONGVARBINARY => 1..=SQL_PREC_TEXTIMAGE,
         SQL_WLONGVARCHAR => 1..=SQL_PREC_NTEXT,
         SQL_DECIMAL | SQL_NUMERIC => 1..=SQL_PREC_NUMERIC,
+        // A UDT bounds the size but not the zero: `SQL_PREC_UNLIMITED` is the
+        // `max` spelling here, and every binding this driver accepts today
+        // passes 0. msodbcsql's `case SQL_UDT_MAPPED` rejects only
+        // `> SQL_PREC_UDT` with `IDS_S1_104`, leaving the lower end alone
+        // (`sqlcdesc.cpp:11790`), reached from `SQLBindParameter` via
+        // `CheckSqlPrecScale<TRUE>` (`sqlcdesc.cpp:3038`);
+        // `FixupColumnSizeDecimalDigits` has no UDT arm, so the application's
+        // value arrives unchanged.
+        SQL_SS_UDT => SQL_PREC_UNLIMITED..=SQL_PREC_UDT,
         _ => return true,
     };
     valid.contains(&column_size)
@@ -564,6 +576,15 @@ mod tests {
         assert!(!parameter_column_size_is_valid(SQL_VARCHAR, 8001));
         assert!(parameter_column_size_is_valid(SQL_SS_XML, 4000));
         assert!(!parameter_column_size_is_valid(SQL_SS_XML, 4001));
+        // A UDT bounds the top but keeps 0 as its `max` spelling, matching
+        // msodbcsql's `case SQL_UDT_MAPPED` (`sqlcdesc.cpp:11790`), which tests
+        // only `> SQL_PREC_UDT`.
+        assert!(parameter_column_size_is_valid(SQL_SS_UDT, 0));
+        assert!(parameter_column_size_is_valid(SQL_SS_UDT, SQL_PREC_UDT));
+        assert!(!parameter_column_size_is_valid(
+            SQL_SS_UDT,
+            SQL_PREC_UDT + 1
+        ));
         assert!(parameter_column_size_is_valid(SQL_DECIMAL, 38));
         assert!(!parameter_column_size_is_valid(SQL_DECIMAL, 39));
         // The `long` variants bound at the `text`/`ntext` sizes, and `ntext` is

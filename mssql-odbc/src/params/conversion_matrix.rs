@@ -66,10 +66,11 @@ const CHARACTER_PAYLOAD_SQL_TARGETS: &[SqlSmallInt] = &[SQL_SS_XML];
 /// pass a character buffer through, it hex-decodes it two characters to the
 /// byte. `rgbTRANSTYPE*` gives `SQL_UDT_MAPPED` a `SQL_C_BINARY` transfer type
 /// (`sqlcmisc.cpp:67`, `:178`, `:217`), so `ConvertLongData` misses its
-/// pass-through guard (`sqlccnvt.cpp:874-877`) and lands on the branch
-/// commented "CHAR/WCHAR ->binary (2 chars are converted to only one single
-/// binary byte)" (`sqlccnvt.cpp:1014-1016`); the `cbMax*2` length checks at
-/// `sqlcfunc.cpp:3048-3063` corroborate the ratio. Admitting them while
+/// pass-through guard (`sqlccnvt.cpp:874-877`) and lands on the
+/// character-to-binary conversion at `sqlccnvt.cpp:1014-1016`, which reads the
+/// buffer as hex text and folds each two characters into one byte; the
+/// `cbMax*2` length checks at `sqlcfunc.cpp:3048-3063` corroborate the ratio.
+/// Admitting them while
 /// sending the buffer verbatim would put different bytes on the wire than the
 /// reference for the same binding. Source reading only - the measurement that
 /// decides whether to implement the decode is named in `bound_param_to_value`'s
