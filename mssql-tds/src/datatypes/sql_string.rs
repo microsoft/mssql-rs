@@ -102,7 +102,8 @@ fn resolve_collation(collation: SqlCollation) -> ResolvedEncoding {
 /// it cannot best-fit map: measured on `SQL_Latin1_General_CP1_CI_AS`,
 /// `ASCII(CAST(N'日' AS varchar(4)))` is 63. Characters it *can* best-fit
 /// (`Ł`→`L`, `Ć`→`C`, `‐`→`-`) are transliterated rather than substituted, and
-/// this driver does not reproduce that — see `docs/parity-deviations.md`.
+/// this driver does not reproduce that — see
+/// `mssql-odbc/docs/parity-deviations.md`.
 pub const NARROW_SUBSTITUTE_BYTE: u8 = b'?';
 
 /// Wire bytes from a narrow encode, plus whether producing them lost anything.
@@ -195,7 +196,8 @@ pub fn encode_narrow(text: &str, collation: SqlCollation) -> NarrowEncoded {
 /// `iconv` resolve the astral scalar itself, so its per-`WCHAR` `EILSEQ` loop
 /// never runs and it emits a single byte (measured, glibc 2.35). musl compiles
 /// `//TRANSLIT` out and is unmeasured. This driver takes the Windows/engine
-/// answer on every platform; see `docs/parity-deviations.md` entry 21.
+/// answer on every platform; see `mssql-odbc/docs/parity-deviations.md`
+/// entry 21.
 pub(crate) fn substitute_unmappable(text: &str, encoding: ResolvedEncoding) -> Vec<u8> {
     let mut out = Vec::with_capacity(text.len());
     let mut buf = [0u8; 4];
