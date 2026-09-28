@@ -1010,7 +1010,7 @@ TEST_F(CharConversionLiveTest, UnmappableCharacterIsSubstitutedForANarrowCType) 
 // Unicode scalar instead would make the value a byte shorter and let a
 // varchar(n) accept a string those two reject.
 //
-// Skipped under comparison: parity-deviations entry 20. msodbcsql is not
+// Skipped under comparison: parity-deviations entry 21. msodbcsql is not
 // self-consistent here across its own platforms - measured on glibc 2.35,
 // iconv -f UTF-16LE -t CP1252//TRANSLIT answers a single 3F where
 // WideCharToMultiByte answers 3F 3F, because //TRANSLIT lets iconv resolve the
@@ -1038,7 +1038,7 @@ TEST_F(CharConversionLiveTest, AstralUnmappableCharacterSubstitutesPerUtf16Unit)
     EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }
 
-// Pins parity-deviations.md entry 20. msodbcsql converts with
+// Pins parity-deviations.md entry 21. msodbcsql converts with
 // WideCharToMultiByte(cp, 0, ...), where dwFlags=0 leaves *best-fit* mapping
 // on, so a character with no code-page representation but a plausible
 // transliteration is rewritten rather than substituted: U+0141 LATIN CAPITAL
@@ -1233,7 +1233,7 @@ TEST_F(CharConversionLiveTest, UnmappableCharacterIsSubstitutedInsideASqlVariant
 // SQL_COPT_SS_WARN_ON_CP_ERROR (1243) turns the substitution into a reportable
 // event: SQLSTATE 01000 and SQL_SUCCESS_WITH_INFO.
 //
-// Skipped under comparison: parity-deviations entry 21. msodbcsql posts
+// Skipped under comparison: parity-deviations entry 22. msodbcsql posts
 // IDS_01_000_16 only from its output-parameter and column arms
 // (sqlcdata.h:1297, :1310) and discards the loss flag on every input-parameter
 // path, so it returns plain SQL_SUCCESS here however the attribute is set.
@@ -1330,7 +1330,7 @@ TEST_F(CharConversionLiveTest, DataAtExecutionUnmappableCharacterIsSubstituted) 
 // on the handle, so the application would never read it. SQLPutData therefore
 // succeeds plainly and SQLParamData carries the warning (AB#47598).
 //
-// Skipped under comparison: parity-deviations entry 21, same as
+// Skipped under comparison: parity-deviations entry 22, same as
 // UnmappableCharacterWarnsWhenAsked - msodbcsql does not consult the attribute
 // on any input-parameter path.
 TEST_F(CharConversionLiveTest, DataAtExecutionUnmappableCharacterWarnsWhenAsked) {

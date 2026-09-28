@@ -635,7 +635,7 @@ msodbcsql build is measured.
     `AstralUnmappableCharacterSubstitutesPerUtf16Unit` carries
     `SKIP_IF_COMPARING_MSODBCSQL()` for the glibc leg.
 
-    Second-order consequence: under `SQL_COPT_SS_WARN_ON_CP_ERROR` (entry 21)
+    Second-order consequence: under `SQL_COPT_SS_WARN_ON_CP_ERROR` (entry 22)
     we warn for a best-fit character where msodbcsql would not, since it does
     not count a best-fit result as loss.
 
@@ -648,7 +648,7 @@ msodbcsql build is measured.
     `UnmappableCharacterIsSubstituted` and its siblings run unskipped on the
     rows both drivers agree on. Tracked in AB#47598.
 
-21. **`SQL_COPT_SS_WARN_ON_CP_ERROR` reports code-page loss on input
+22. **`SQL_COPT_SS_WARN_ON_CP_ERROR` reports code-page loss on input
     parameters; msodbcsql reports it only on retrieval.** msodbcsql posts
     `IDS_01_000_16` ("Warning: Code page translation caused loss of data",
     SQLSTATE `01000` via `cli_common/src/clntcomn.cpp:1183`) from exactly two

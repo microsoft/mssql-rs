@@ -145,7 +145,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   `iconv` and takes the code page's default character, and matches SQL Server's
   own `CAST(N'…' AS varchar(n))`. One substitute byte per UTF-16 code unit, so
   an astral character yields two, matching `WideCharToMultiByte` and SQL Server;
-  msodbcsql's glibc leg emits one byte instead, recorded as parity deviation 20.
+  msodbcsql's glibc leg emits one byte instead, recorded as parity deviation 21.
   As in msodbcsql, the substitution is not an error and is silent by default.
 
   An application that needs to know can set the `SQL_COPT_SS_WARN_ON_CP_ERROR`
@@ -166,7 +166,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   msodbcsql owns the attribute but consults it only on the retrieval direction
   (output parameters and columns); this driver applies it to parameters, which
   is where its own loss occurs — `SQL_C_CHAR` is UTF-8 here, so a fetch can
-  always represent whatever the server sent. Recorded as parity deviation 21,
+  always represent whatever the server sent. Recorded as parity deviation 22,
   alongside 20 for the best-fit mapping msodbcsql performs and this driver does
   not.
 

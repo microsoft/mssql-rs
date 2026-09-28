@@ -4347,7 +4347,7 @@ mod tests {
     /// needs its own astral case: substituting once per scalar here would make
     /// a no-collation value a byte shorter than the same value under a real
     /// code page, and shorter than Windows msodbcsql and the engine produce
-    /// (the glibc leg emits one byte — parity-deviations entry 20).
+    /// (the glibc leg emits one byte — parity-deviations entry 21).
     /// Verified by mutation - replacing the `repeat_n` with a single `push`
     /// leaves every other test green.
     #[test]

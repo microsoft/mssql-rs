@@ -300,7 +300,7 @@ unsafe fn sql_set_connect_attr_w_impl(
         // *before* connect -- `dbcinfotoken.cpp:171` guards a path
         // SQLSetConnectAttr does not reach. This driver validates in both
         // states: storing an out-of-range value as "off" would make a typo read
-        // back as a deliberate setting. See parity-deviations entry 21.
+        // back as a deliberate setting. See parity-deviations entry 22.
         SQL_COPT_SS_WARN_ON_CP_ERROR => {
             let value = value_ptr as usize as u64;
             if value != SQL_WARN_NO && value != SQL_WARN_YES {
@@ -1312,7 +1312,7 @@ mod tests {
     /// connection property, so it is settable in either state; only
     /// `SQL_WARN_YES` turns it on and anything outside the pair is `HY024`,
     /// matching msodbcsql (measured on retail 18.6.2.1 post-connect). See
-    /// parity-deviations entry 21 (AB#47598).
+    /// parity-deviations entry 22 (AB#47598).
     #[test]
     fn warn_on_cp_error_accepts_only_the_two_legal_values() {
         for (raw, expected) in [(0usize, Some(false)), (1, Some(true)), (2, None), (7, None)] {

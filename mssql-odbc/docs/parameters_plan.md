@@ -485,7 +485,7 @@ msodbcsql gets right. No option preserved both parity and self-consistency.
 The unmappable case is the one where under-rejection no longer errors, and it
 is not a new data-altering path: substitution is what msodbcsql and the engine
 both do, and `SQL_COPT_SS_WARN_ON_CP_ERROR` is how an application detects it
-(parity-deviations entries 20 and 21). What AB#47584 inherits is the length
+(parity-deviations entries 21 and 22). What AB#47584 inherits is the length
 unit, not the substitution.
 
 Verified against msodbcsql source:

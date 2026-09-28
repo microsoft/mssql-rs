@@ -180,7 +180,7 @@ pub fn encode_narrow(text: &str, collation: SqlCollation) -> NarrowEncoded {
 /// `iconv` resolve the astral scalar itself, so its per-`WCHAR` `EILSEQ` loop
 /// never runs and it emits a single byte (measured, glibc 2.35). musl compiles
 /// `//TRANSLIT` out and is unmeasured. This driver takes the Windows/engine
-/// answer on every platform; see `docs/parity-deviations.md` entry 20.
+/// answer on every platform; see `docs/parity-deviations.md` entry 21.
 pub(crate) fn substitute_unmappable(text: &str, encoding: ResolvedEncoding) -> Vec<u8> {
     let mut out = Vec::with_capacity(text.len());
     let mut buf = [0u8; 4];
@@ -776,7 +776,7 @@ mod tests {
     /// `82 A0 3F`.
     ///
     /// Windows only. glibc `iconv -t CP932//TRANSLIT` best-fits `U+0141` to
-    /// `4C`, giving `82 A0 4C` — the same divergence parity-deviations entry 20
+    /// `4C`, giving `82 A0 4C` — the same divergence parity-deviations entry 21
     /// records for CP1252, so best-fit is not a CP1252-specific behaviour. This
     /// is a unit test of *this* driver's encoder, not a cross-platform parity
     /// assertion, so it pins `82 A0 3F` regardless.
@@ -799,7 +799,7 @@ mod tests {
     ///
     /// Measured with `WideCharToMultiByte(437, 0, ...)`: `U+65E5` is `3F` with
     /// the loss flag set. `U+0141` is deliberately not used here - CP437
-    /// best-fits it to `4C` (`L`), which is parity-deviations entry 20 rather
+    /// best-fits it to `4C` (`L`), which is parity-deviations entry 21 rather
     /// than a substitution.
     #[test]
     fn encode_narrow_substitutes_under_an_oem_code_page() {
@@ -822,7 +822,7 @@ mod tests {
     ///
     /// msodbcsql's glibc leg disagrees — `//TRANSLIT` resolves the scalar in
     /// `iconv`, yielding one byte (measured, glibc 2.35); musl is unmeasured.
-    /// That is parity-deviations entry 20, and it is why the e2e counterpart
+    /// That is parity-deviations entry 21, and it is why the e2e counterpart
     /// `AstralUnmappableCharacterSubstitutesPerUtf16Unit` is skipped under
     /// comparison. This unit test pins *this* driver's encoder, which takes the
     /// Windows/engine answer on every platform.
