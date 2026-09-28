@@ -90,9 +90,11 @@ fn sql_prepare_w_safe(stmt: &StmtHandle, sql: String) -> SqlReturn {
     let dbc = stmt.parent_dbc();
 
     // Lock parent (DBC) before child (STMT) per the crate's lock-ordering rule,
-    // and hold both for the whole body: the state check and the store happen
+    // and hold both through the store: the state check and the store happen
     // under one continuous STMT lock, so there is no TOCTOU window between them,
-    // and the connection-liveness read stays valid through the store.
+    // and the connection-liveness read stays valid through the store. Both are
+    // then released before the IPD work below, because the same rule forbids
+    // holding a STMT lock while taking a DESC lock.
     let Ok(dbc_state) = dbc.inner.lock() else {
         error!("SQLPrepareW: dbc mutex poisoned");
         return SQL_ERROR;

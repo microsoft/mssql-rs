@@ -1018,10 +1018,16 @@ mod tests {
         );
     }
 
-    /// The UDT identity is supplied by the application on the IPD; every other
-    /// descriptor kind has no use for it. All four parts are writable, matching
-    /// msodbcsql (`sqlcdesc.cpp:4891-4957`), even though only the first three
-    /// reach the wire.
+    /// The UDT identity is supplied by the application on the IPD; no other
+    /// descriptor kind takes a *write*. The IRD's read side is a separate
+    /// question this test does not settle: `SQLColAttribute` already answers
+    /// all four for a result column out of `COLMETADATA`'s `UDT_INFO`
+    /// (`col_attribute.rs:286-309`), so the `SQLGetDescField` route to the same
+    /// data is deliberately left open rather than decided here.
+    ///
+    /// All four parts are writable, matching msodbcsql
+    /// (`sqlcdesc.cpp:4891-4957`), even though only the first three reach the
+    /// wire.
     #[test]
     fn udt_name_fields_are_writable_on_ipd_only() {
         for field in [
