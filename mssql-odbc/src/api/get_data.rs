@@ -5253,6 +5253,66 @@ mod tests {
         );
     }
 
+    /// The terminal-column `SQLGetData` promotion must also hold with a second
+    /// result set pending: the peek consumes the INFO before this result set's
+    /// DONE, so this call owns it even though the claim is kept.
+    #[test]
+    fn terminal_info_before_a_second_result_promotes_get_data_success() {
+        use mssql_tds::test_client_support::{col_metadata_empty, done_more};
+
+        let h = TestHandles::with_env_dbc_stmt();
+        {
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let mut state = stmt.inner.lock().unwrap();
+            state.set_state(STMT_STATE_CURSOR_OPEN);
+            state.column_metadata = int_columns(1);
+            state.row_positioned = true;
+        }
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let mut client = tds_client_from_int_rows_with_trailing_tokens(
+            vec![vec![7]],
+            vec![
+                info(8153, 10, "Null value is eliminated by an aggregate."),
+                done_more(),
+                col_metadata_empty(),
+                done_select_no_more(),
+            ],
+        );
+        dbc.runtime
+            .block_on(client.execute("SELECT 7; SELECT 1;".to_string(), ()))
+            .unwrap();
+        assert!(dbc.runtime.block_on(client.next_row_cursor()).unwrap());
+        {
+            let mut state = dbc.inner.lock().unwrap();
+            state.client = Some(client);
+            state.active_stmt = Some(h.stmt);
+        }
+
+        let mut value = 0_i32;
+        let mut indicator = 0;
+        let rc = unsafe {
+            sql_get_data(
+                h.stmt,
+                1,
+                SQL_C_SLONG,
+                (&mut value as *mut i32).cast(),
+                0,
+                &mut indicator,
+            )
+        };
+        assert_eq!(
+            rc, SQL_SUCCESS_WITH_INFO,
+            "the warning belongs to this SQLGetData, not to a later SQLMoreResults"
+        );
+        assert_eq!(value, 7);
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(state.diag_records.len(), 1);
+        assert_eq!(state.diag_records[0].sql_state, *b"01003");
+        assert_eq!(state.diag_records[0].native_error, 8153);
+    }
+
     #[test]
     fn get_data_reads_complete_buffered_row_without_a_client() {
         let h = TestHandles::with_env_dbc_stmt();

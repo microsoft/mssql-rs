@@ -4325,6 +4325,69 @@ mod tests {
         );
     }
 
+    /// The same promotion must hold when the batch has a further result set
+    /// pending: the INFO arrived before this result set's DONE, so the fetch
+    /// that consumed it owns it, even though the connection stays claimed and
+    /// `SQLMoreResults` has not run yet.
+    #[test]
+    fn row_fetch_with_terminal_info_before_a_second_result_returns_success_with_info() {
+        use mssql_tds::test_client_support::{done_more, info};
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let mut value = [0_i32];
+        let mut indicator = [0 as SqlLen];
+        {
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let mut s = stmt.inner.lock().unwrap();
+            s.set_state(STMT_STATE_CURSOR_OPEN);
+            s.column_metadata = int_columns(1);
+        }
+        assert_eq!(
+            unsafe {
+                sql_bind_col(
+                    h.stmt,
+                    1,
+                    SQL_C_SLONG,
+                    value.as_mut_ptr().cast(),
+                    0,
+                    indicator.as_mut_ptr(),
+                )
+            },
+            SQL_SUCCESS
+        );
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let mut client = tds_client_from_int_rows_with_trailing_tokens(
+            vec![vec![7]],
+            vec![
+                info(8153, 10, "Null value is eliminated by an aggregate."),
+                done_more(),
+                col_metadata_empty(),
+                done_select_no_more(),
+            ],
+        );
+        dbc.runtime
+            .block_on(client.execute("SELECT 7; SELECT 1;".to_string(), ()))
+            .unwrap();
+        {
+            let mut ds = dbc.inner.lock().unwrap();
+            ds.client = Some(client);
+            ds.active_stmt = Some(h.stmt);
+        }
+
+        assert_eq!(
+            unsafe { sql_fetch_scroll(h.stmt, SQL_FETCH_NEXT, 0) },
+            SQL_SUCCESS_WITH_INFO,
+            "the warning belongs to this fetch, not to a later SQLMoreResults"
+        );
+        assert_eq!(value[0], 7);
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let s = stmt.inner.lock().unwrap();
+        assert_eq!(s.diag_records.len(), 1);
+        assert_eq!(s.diag_records[0].sql_state, *b"01003");
+        assert_eq!(s.diag_records[0].native_error, 8153);
+    }
+
     /// Row-wise binding is not implemented, and reporting HYC00 is better than
     /// filling the application's struct array as if it were column-wise.
     #[test]

@@ -360,13 +360,15 @@ pub(super) fn return_client_busy(dbc: &DbcHandle, client: TdsClient) {
 /// is left rather than stranding it — so it takes the deferred-error route
 /// above, never the unposted one.
 ///
-/// Info messages are drained and posted once the claim is released, before the
-/// idle client is published. Leaving them on `client` past that point would let
-/// the next statement that claims the connection misattribute them; while the
-/// claim is kept they stay on `client`, which no other statement can reach.
-/// The return value tells row-delivering callers
-/// to promote an otherwise-clean success to `SQL_SUCCESS_WITH_INFO`; a zero-row
-/// fetch keeps `SQL_NO_DATA` while leaving the diagnostic available.
+/// Info messages the peek consumed are drained and posted here, whether or not
+/// the claim is released: they arrived before this result set's DONE, so they
+/// belong to the call that read them. Leaving them on `client` would hand this
+/// result set's warning to whichever call reads next — `SQLMoreResults` posts
+/// only after advancing to the following result set — or drop it entirely if
+/// the application never calls `SQLMoreResults`. The return value tells
+/// row-delivering callers to promote an otherwise-clean success to
+/// `SQL_SUCCESS_WITH_INFO`; a zero-row fetch keeps `SQL_NO_DATA` while leaving
+/// the diagnostic available.
 ///
 /// `post_preceding` runs under this call's statement lock, before any message
 /// the peek drains is posted. Everything the caller's own rows produced left
@@ -424,11 +426,16 @@ pub(super) fn release_busy_if_row_exhausted(
         read_error = Some(error);
     }
 
-    let drained_info = if release {
-        client.take_info_messages()
-    } else {
-        Vec::new()
-    };
+    // Drained whether or not the claim is released. Everything the peek
+    // consumed came before this result set's DONE, so it belongs to the call
+    // that read it — msodbcsql posts a server message from `OnMessage` as the
+    // token is parsed (`sqlctokn.cpp:3217`) and clears the flag at the end of
+    // each fetch (`sqlccurs.cpp:2163`), so it never carries to a later call.
+    // Holding it on `client` for whoever reads next would hand this result
+    // set's warning to `SQLMoreResults`, which posts only after advancing to
+    // the following result set, and would drop it outright if the application
+    // never calls `SQLMoreResults` at all.
+    let drained_info = client.take_info_messages();
 
     let mut has_server_info = false;
     if let Ok(mut stmt_state) = stmt.inner.lock() {
@@ -2150,13 +2157,17 @@ mod tests {
         assert!(ss.pending_fetch_error.is_none());
     }
 
-    /// A zero-row fetch discovering the current result set is done, with a
-    /// further result set still pending in the batch, must leave any info
-    /// message already on the client alone — that message belongs to
-    /// whichever call (`SQLMoreResults`) actually reads the client next, not
-    /// to this one, since the claim was not released.
+    /// A fetch that exhausts the current result set with a further result set
+    /// still pending must still surface an info message the peek consumed on
+    /// the way: it arrived before this result set's DONE, so it belongs to
+    /// this call. msodbcsql posts a server message from `OnMessage` as the
+    /// token is parsed (`sqlctokn.cpp:3217`), independently of whether the
+    /// batch can release the connection. Deferring it to `SQLMoreResults`
+    /// would attach this result set's warning to the *next* one (that call
+    /// posts only after advancing), and lose it entirely for an application
+    /// that never calls `SQLMoreResults`.
     #[test]
-    fn release_busy_if_row_exhausted_leaves_info_messages_when_the_claim_is_not_released() {
+    fn release_busy_if_row_exhausted_posts_info_messages_when_the_claim_is_not_released() {
         use mssql_tds::test_client_support::info;
 
         let h = TestHandles::with_env_dbc_stmt();
@@ -2164,7 +2175,7 @@ mod tests {
             &h,
             vec![
                 col_metadata_empty(),
-                info(50000, 10, "leave me for SQLMoreResults"),
+                info(50000, 10, "belongs to the first result set"),
                 done_more(),
                 col_metadata_empty(),
                 done_no_more(),
@@ -2175,7 +2186,10 @@ mod tests {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let client = dbc.inner.lock().unwrap().client.take().unwrap();
 
-        release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false);
+        assert!(
+            release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false),
+            "the caller must be told a server message was posted"
+        );
 
         assert_eq!(
             dbc.inner.lock().unwrap().active_stmt,
@@ -2183,15 +2197,13 @@ mod tests {
             "a pending second result set means the claim is not released"
         );
         assert!(
-            !stmt
-                .inner
+            stmt.inner
                 .lock()
                 .unwrap()
                 .diag_records
                 .iter()
-                .any(|d| d.message.contains("leave me for SQLMoreResults")),
-            "the message must not be posted under this call, which returns a \
-             code the caller may never inspect diagnostics for"
+                .any(|d| d.message.contains("belongs to the first result set")),
+            "the message must be posted under the call whose peek consumed it"
         );
         let dbc_state = dbc.inner.lock().unwrap();
         assert!(
@@ -2200,10 +2212,9 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .info_messages()
-                .iter()
-                .any(|m| m.message.contains("leave me for SQLMoreResults")),
-            "the message must still be resident on the client for \
-             SQLMoreResults to find and surface"
+                .is_empty(),
+            "must not also stay on the client, where SQLMoreResults would \
+             re-post it against the result set it advances to"
         );
     }
 
