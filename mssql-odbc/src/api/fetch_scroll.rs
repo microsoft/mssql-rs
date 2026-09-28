@@ -33,7 +33,7 @@ use mssql_tds::datatypes::sql_string::{EncodingType, SqlString, get_encoding_typ
 use mssql_tds::datatypes::sql_vector::SqlVector;
 use mssql_tds::datatypes::sqldatatypes::TdsDataType;
 use mssql_tds::encoding_rs;
-use mssql_tds::error::Error as TdsError;
+use mssql_tds::error::{Error as TdsError, SqlInfoMessage};
 use mssql_tds::query::metadata::PlpEncoding;
 use uuid::Uuid;
 
@@ -1448,11 +1448,13 @@ fn fill_rowset(
         }
         false
     } else if peek_is_safe {
-        // The row loop's own messages go in here rather than being posted
-        // below: they left the wire before anything the release peek finds,
-        // and posting them afterward would invert the order SQLGetDiagRec
-        // reports them in.
-        release_busy_if_row_exhausted(dbc, stmt, statement_handle, client, &info_messages)
+        // Everything the rows produced goes in through the closure rather than
+        // being posted below: it all left the wire before anything the release
+        // peek finds, and posting it afterward would invert the order
+        // SQLGetDiagRec reports it in.
+        release_busy_if_row_exhausted(dbc, stmt, statement_handle, client, |s| {
+            post_row_diagnostics(s, &info_messages, worst)
+        })
     } else {
         let Ok(mut dbc_state) = dbc.inner.lock() else {
             error!("SQLFetchScroll: dbc mutex poisoned returning client");
@@ -1463,9 +1465,9 @@ fn fill_rowset(
         false
     };
 
-    // True exactly when the branch above handed `info_messages` to the release
-    // helper, which posted them in wire order under its own lock.
-    let info_posted_by_release = fetch_error.is_none() && peek_is_safe;
+    // True exactly when the branch above ran `post_row_diagnostics` through the
+    // release helper, which posted them in wire order under its own lock.
+    let row_diags_posted = fetch_error.is_none() && peek_is_safe;
 
     let Ok(mut stmt_state) = stmt.inner.lock() else {
         error!("SQLFetchScroll: stmt mutex poisoned recording rowset");
@@ -1492,10 +1494,10 @@ fn fill_rowset(
         return SQL_ERROR;
     }
 
-    let row_has_server_info = if info_posted_by_release {
+    let row_has_server_info = if row_diags_posted {
         false
     } else {
-        post_tds_info_messages(&mut stmt_state, &info_messages)
+        post_row_diagnostics(&mut stmt_state, &info_messages, worst)
     };
     let has_server_info = release_has_server_info || row_has_server_info;
 
@@ -1525,13 +1527,14 @@ fn fill_rowset(
 
     // Report why the rowset was imperfect with the SQLSTATE that value would
     // have produced through SQLGetData, rather than a blanket truncation
-    // warning. Per-row detail lives in the row status array.
+    // warning. Per-row detail lives in the row status array. The record itself
+    // was already posted by `post_row_diagnostics`, in wire order with the
+    // server's own messages; only the return code is decided here.
     // msodbcsql keys the return code on the rowset size, not on how many rows
     // failed: a block fetch demotes a row error to SQL_SUCCESS_WITH_INFO and
     // leaves the detail in the row status array, while a single-row fetch lets
     // the error stand (`sqlccurs.cpp`, gated on dwRowSize > 1).
-    if let Some(issue) = worst.issue() {
-        issue.post(&mut stmt_state);
+    if worst.issue().is_some() {
         if row_array_size == 1 && matches!(worst, RowOutcome::Error(_)) {
             return SQL_ERROR;
         }
@@ -1541,6 +1544,24 @@ fn fill_rowset(
         return SQL_SUCCESS_WITH_INFO;
     }
     SQL_SUCCESS
+}
+
+/// Posts every diagnostic the fill loop itself produced: server INFO messages
+/// drained off the client, then the worst per-row conversion issue. Both
+/// describe rows that left the wire before any terminal read-ahead, and
+/// `SQLGetDiagRec` is ordinal, so they must be recorded before whatever the
+/// release peek finds. Returns whether a *server* message was posted — a
+/// driver-generated row issue drives the return code separately.
+fn post_row_diagnostics(
+    stmt_state: &mut StmtState,
+    info_messages: &[SqlInfoMessage],
+    worst: RowOutcome,
+) -> bool {
+    let posted = post_tds_info_messages(stmt_state, info_messages);
+    if let Some(issue) = worst.issue() {
+        issue.post(stmt_state);
+    }
+    posted
 }
 
 /// How many rows this fetch may deliver.
@@ -4236,6 +4257,71 @@ mod tests {
         assert_eq!(s.diag_records.len(), 1);
         assert_eq!(s.diag_records[0].sql_state, *b"01003");
         assert_eq!(s.diag_records[0].native_error, 8153);
+    }
+
+    /// A row-conversion diagnostic describes a row that left the wire before
+    /// the terminal read-ahead ran, so it must be reported ahead of the
+    /// terminal INFO rather than appended after it — `SQLGetDiagRec` is
+    /// ordinal, and msodbcsql inserts each record as its token is parsed.
+    #[test]
+    fn row_conversion_diagnostic_precedes_terminal_info() {
+        use mssql_tds::test_client_support::info;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let mut text = [0_u8; 4];
+        let mut indicator = [0 as SqlLen];
+        {
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let mut s = stmt.inner.lock().unwrap();
+            s.set_state(STMT_STATE_CURSOR_OPEN);
+            s.column_metadata = int_columns(1);
+        }
+        assert_eq!(
+            unsafe {
+                sql_bind_col(
+                    h.stmt,
+                    1,
+                    SQL_C_CHAR,
+                    text.as_mut_ptr().cast(),
+                    text.len() as SqlLen,
+                    indicator.as_mut_ptr(),
+                )
+            },
+            SQL_SUCCESS
+        );
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        // 1234567 cannot fit a 4-byte character target, so the row reports
+        // 01004 while a terminal INFO still waits unread on the wire.
+        let mut client = tds_client_from_int_rows_with_trailing_tokens(
+            vec![vec![1234567]],
+            vec![
+                info(8153, 10, "Null value is eliminated by an aggregate."),
+                done_no_more(),
+            ],
+        );
+        dbc.runtime
+            .block_on(client.execute("SELECT 1234567;".to_string(), ()))
+            .unwrap();
+        {
+            let mut ds = dbc.inner.lock().unwrap();
+            ds.client = Some(client);
+            ds.active_stmt = Some(h.stmt);
+        }
+
+        assert_eq!(
+            unsafe { sql_fetch_scroll(h.stmt, SQL_FETCH_NEXT, 0) },
+            SQL_SUCCESS_WITH_INFO
+        );
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let s = stmt.inner.lock().unwrap();
+        let states: Vec<[u8; 5]> = s.diag_records.iter().map(|d| d.sql_state).collect();
+        assert_eq!(
+            states,
+            [*b"01004", *b"01003"],
+            "the truncated row was read before the terminal INFO token, so it \
+             must be reported first"
+        );
     }
 
     /// Row-wise binding is not implemented, and reporting HYC00 is better than

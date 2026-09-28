@@ -15,7 +15,7 @@ use std::time::Duration;
 use mssql_tds::connection::tds_client::{
     CursorPoll, ExecuteOptions, ResultSet, StatementId, TdsClient,
 };
-use mssql_tds::error::{Error as TdsError, SqlInfoMessage, TimeoutErrorType};
+use mssql_tds::error::{Error as TdsError, TimeoutErrorType};
 use mssql_tds::message::parameters::rpc_parameters::{RpcParameter, StreamedSqlType};
 
 use super::ird::populate_ird;
@@ -366,10 +366,11 @@ pub(super) fn return_client_busy(dbc: &DbcHandle, client: TdsClient) {
 /// to promote an otherwise-clean success to `SQL_SUCCESS_WITH_INFO`; a zero-row
 /// fetch keeps `SQL_NO_DATA` while leaving the diagnostic available.
 ///
-/// `preceding_info` carries messages the caller already drained off `client`
-/// before handing it over — those left the wire ahead of anything this peek
-/// finds, and `SQLGetDiagRec` is ordinal, so they are posted first under the
-/// same lock rather than after the peek's own.
+/// `post_preceding` runs under this call's statement lock, before any message
+/// the peek drains is posted. Everything the caller's own rows produced left
+/// the wire ahead of whatever the peek finds, and `SQLGetDiagRec` is ordinal,
+/// so it has to be recorded first; its return value reports whether it posted
+/// a server message. Callers with nothing pending pass `|_| false`.
 ///
 /// # Caller obligation
 /// Only call this once every column of the row positioned when `client` was
@@ -380,7 +381,7 @@ pub(super) fn release_busy_if_row_exhausted(
     stmt: &StmtHandle,
     statement_handle: SqlHandle,
     mut client: TdsClient,
-    preceding_info: &[SqlInfoMessage],
+    post_preceding: impl FnOnce(&mut StmtState) -> bool,
 ) -> bool {
     let peek_result = match client.try_peek_past_current_row() {
         Ok(CursorPoll::Ready(has_row)) => Ok(has_row),
@@ -433,7 +434,7 @@ pub(super) fn release_busy_if_row_exhausted(
             stmt_state.pending_output_params =
                 Some((client.get_return_values(), client.get_return_status()));
         }
-        has_server_info = post_tds_info_messages(&mut stmt_state, preceding_info);
+        has_server_info = post_preceding(&mut stmt_state);
         has_server_info |= post_tds_info_messages(&mut stmt_state, &drained_info);
         if let Some(e) = read_error {
             error!(%e, "release_busy_if_row_exhausted: finishing current result failed");
@@ -1896,7 +1897,7 @@ mod tests {
             stmt,
             h.stmt,
             client,
-            &[]
+            |_| false
         ));
 
         assert!(dbc.inner.lock().unwrap().active_stmt.is_none());
@@ -1935,7 +1936,7 @@ mod tests {
             stmt,
             h.stmt,
             client,
-            &[]
+            |_| false
         ));
 
         assert!(dbc.inner.lock().unwrap().active_stmt.is_none());
@@ -1953,7 +1954,7 @@ mod tests {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let client = dbc.inner.lock().unwrap().client.take().unwrap();
 
-        release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, &[]);
+        release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false);
 
         assert!(dbc.inner.lock().unwrap().active_stmt.is_none());
         let ss = stmt.inner.lock().unwrap();
@@ -1992,7 +1993,7 @@ mod tests {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let client = dbc.inner.lock().unwrap().client.take().unwrap();
 
-        release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, &[]);
+        release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false);
 
         assert_eq!(
             dbc.inner.lock().unwrap().active_stmt,
@@ -2035,7 +2036,7 @@ mod tests {
         let client = dbc.inner.lock().unwrap().client.take().unwrap();
 
         assert!(
-            release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, &[]),
+            release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false),
             "the fetch caller must be told to return SQL_SUCCESS_WITH_INFO"
         );
 
@@ -2076,7 +2077,7 @@ mod tests {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let client = dbc.inner.lock().unwrap().client.take().unwrap();
 
-        release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, &[]);
+        release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false);
 
         assert!(
             dbc.inner.lock().unwrap().active_stmt.is_none(),
@@ -2130,7 +2131,7 @@ mod tests {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let client = dbc.inner.lock().unwrap().client.take().unwrap();
 
-        release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, &[]);
+        release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false);
 
         assert_eq!(dbc.inner.lock().unwrap().active_stmt, Some(h.stmt));
         assert!(dbc.inner.lock().unwrap().client.is_some());
@@ -2172,7 +2173,7 @@ mod tests {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let client = dbc.inner.lock().unwrap().client.take().unwrap();
 
-        release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, &[]);
+        release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false);
 
         assert_eq!(
             dbc.inner.lock().unwrap().active_stmt,
@@ -2231,7 +2232,7 @@ mod tests {
             stmt,
             h.stmt,
             client,
-            &[]
+            |_| false
         ));
 
         assert!(
@@ -2261,11 +2262,12 @@ mod tests {
     }
 
     /// `SQLGetDiagRec` is ordinal, so records must come back in the order the
-    /// server sent them. Messages the caller already drained left the wire
-    /// before this peek's do, so they have to be posted ahead of them rather
-    /// than appended after.
+    /// server sent them. Anything the caller's own rows produced left the wire
+    /// before this peek's messages do, so it has to be posted ahead of them
+    /// rather than appended after.
     #[test]
     fn release_busy_if_row_exhausted_posts_preceding_info_before_its_own() {
+        use mssql_tds::error::SqlInfoMessage;
         use mssql_tds::test_client_support::info;
 
         let h = TestHandles::with_env_dbc_stmt();
@@ -2281,7 +2283,7 @@ mod tests {
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let client = dbc.inner.lock().unwrap().client.take().unwrap();
-        let earlier = vec![SqlInfoMessage {
+        let earlier = [SqlInfoMessage {
             message: "row loop message".to_string(),
             state: 1,
             class: 10,
@@ -2292,7 +2294,11 @@ mod tests {
         }];
 
         assert!(release_busy_if_row_exhausted(
-            dbc, stmt, h.stmt, client, &earlier
+            dbc,
+            stmt,
+            h.stmt,
+            client,
+            |s| post_tds_info_messages(s, &earlier)
         ));
 
         let ss = stmt.inner.lock().unwrap();
