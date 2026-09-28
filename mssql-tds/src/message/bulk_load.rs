@@ -482,6 +482,17 @@ impl<'a> StreamingBulkLoadWriter<'a> {
     /// *before* [`Self::end`], which consumes the writer along with its borrow
     /// of the `PacketWriter` the flag lives on; `end` writes only the DONE
     /// token, so no value can be substituted after this point.
+    ///
+    /// **Not reported for an Always Encrypted column.**
+    /// [`Self::write_column_value`] encrypts the cell before the plaintext
+    /// serializer runs, and `normalize_column_value` hands
+    /// `ColumnValues::String` to the cipher as its existing bytes, so the
+    /// narrow encoder never sees the value: nothing is substituted and this
+    /// stays `false`. That path also assumes the caller already encoded to the
+    /// column's code page — `SqlString::from_utf8_string` produces UTF-16LE, so
+    /// an encrypted `varchar` can be sealed over the wrong plaintext. Both are
+    /// pre-existing in the cell-encryption path rather than consequences of the
+    /// substitution work; tracked separately from AB#47598.
     pub fn code_page_conversion_loss(&self) -> bool {
         self.packet_writer.code_page_conversion_loss()
     }

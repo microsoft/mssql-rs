@@ -7860,6 +7860,11 @@ impl TdsClient {
     /// it before issuing another command. A bulk copy is the exception: it
     /// spans several messages and reports the aggregate across every batch, so
     /// one read after `write_to_server_zerocopy` covers the whole operation.
+    ///
+    /// Silent for an Always Encrypted column in either direction: cell
+    /// encryption consumes the value before the narrow serializer runs, so no
+    /// substitution happens and none is reported. See
+    /// [`StreamingBulkLoadWriter::code_page_conversion_loss`](crate::message::bulk_load::StreamingBulkLoadWriter::code_page_conversion_loss).
     pub fn take_code_page_conversion_loss(&mut self) -> bool {
         std::mem::take(&mut self.code_page_conversion_loss)
     }
