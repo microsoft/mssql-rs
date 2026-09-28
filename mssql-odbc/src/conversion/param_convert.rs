@@ -4620,6 +4620,17 @@ mod tests {
         // `SQL_SS_LENGTH_UNLIMITED` leaves it unbounded, as on the
         // materialized path.
         assert_eq!(dae_length_limit(SQL_C_BINARY, SQL_SS_UDT, 0).unwrap(), None);
+
+        // The declaration is still capped at `SQL_PREC_UDT`, which matters
+        // because `SQL_DESC_LENGTH` can be written straight onto the IPD
+        // without passing `parameter_column_size_is_valid`.
+        assert_eq!(
+            dae_length_limit(SQL_C_BINARY, SQL_SS_UDT, 20_000)
+                .unwrap()
+                .expect("still bounded")
+                .bound,
+            DaeBound::Bytes(8000)
+        );
     }
 
     /// Once the budget is spent every later chunk must be padding, and the
@@ -6273,6 +6284,13 @@ mod tests {
             (vec![1u8, 2, 3, 0], 3, false),
             // `SQL_SS_LENGTH_UNLIMITED`: no ceiling is applied at all.
             (vec![1u8, 2, 3, 4], 0, true),
+            // Past `SQL_PREC_UDT` even though the declaration says otherwise.
+            // `SQLBindParameter` caps `ColumnSize` at 8000, but that is not the
+            // only way into `ipd.length`: `SQL_DESC_LENGTH` is writable on an
+            // IPD (`classify_field`) and `set_desc_field` stores it without
+            // consulting `parameter_column_size_is_valid`. The `min` is what
+            // keeps that route matching `min(cbColDef, SQL_PREC_UDT)`.
+            (vec![7u8; 9000], 20_000, false),
         ] {
             let mut bytes = payload.clone();
             let mut ind: SqlLen = bytes.len() as SqlLen;

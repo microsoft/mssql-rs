@@ -2331,7 +2331,9 @@ TEST_F(UdtParamLiveTest, AUdtParameterWithoutATypeNameFails) {
 //
 // Unlike the varbinary arm above it in the reference, the UDT arm does not
 // call CheckTrailingZeros, so a zero-padded overflow is refused rather than
-// trimmed - asserted here because that is the half most likely to drift.
+// trimmed. The third phase below asserts that on both legs, because it is the
+// half most likely to drift and the one this PR reads against the reference's
+// neighbouring arm rather than the arm itself.
 //
 // EVIDENCE: source reading only. The reference leg's `22001` is not recorded
 // against a `SQL_DRIVER_VER` and tested build anywhere, and the PR's
@@ -2375,6 +2377,24 @@ TEST_F(UdtParamLiveTest, AUdtPayloadPastABoundedColumnSizeIsRefused) {
                   SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(SetUdtName("hierarchyid"), SQL_HANDLE_STMT, stmt_);
     EXPECT_EQ(kPath, ExecuteAndReadBack());
+
+    // A zero-only overflow is refused too. This is the case that diverges from
+    // the reference's neighbouring varbinary arm, which calls
+    // CheckTrailingZeros and trims - so it is the least certain reading here
+    // and the one most worth checking on the reference leg rather than only in
+    // a unit test.
+    EXPECT_SQL_OK(SQLFreeStmt(stmt_, SQL_RESET_PARAMS), SQL_HANDLE_STMT, stmt_);
+    std::vector<SQLCHAR> zero_padded = payload;
+    zero_padded.push_back(0x00);
+    ASSERT_SQL_OK(Prepare("SELECT CAST(? AS hierarchyid).ToString()"), SQL_HANDLE_STMT, stmt_);
+    indicator_ = static_cast<SQLLEN>(zero_padded.size());
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_BINARY, SQL_SS_UDT,
+                                   static_cast<SQLULEN>(payload.size()), 0, zero_padded.data(),
+                                   indicator_, &indicator_),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SetUdtName("hierarchyid"), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(SQL_ERROR, SQLExecute(stmt_));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "22001");
 }
 
 // The ColumnSize ceiling. msodbcsql's CheckSqlPrecScale rejects
