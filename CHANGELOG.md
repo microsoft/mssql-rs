@@ -130,10 +130,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ### Fixed
 
-- `mssql-tds` / `mssql-odbc`: a character with no representation in the target
-  column's collation is now replaced with `?` instead of being rewritten as
-  markup. `encoding_rs` implements WHATWG form-submission semantics, so
-  `Encoding::encode` substitutes a decimal numeric character reference — `U+65E5`
+- `mssql-tds` / `mssql-odbc`: a character with no representation in the narrow
+  encoding a value is sent in is now replaced with `?` instead of being
+  rewritten as markup. `encoding_rs` implements WHATWG form-submission
+  semantics, so `Encoding::encode` substitutes a decimal numeric character
+  reference — `U+65E5`
   became the eight ASCII bytes `&#26085;` — and both narrow encoders only logged
   a warning, so the server stored markup instead of text, one character counted
   as eight against the column's declared length, and the application saw success.
@@ -156,7 +157,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   the warning arrives on the final `SQLParamData` — a diagnostic posted on the
   `SQLPutData` that produced the loss would be cleared by the next call on the
   handle. Values outside `SQL_WARN_NO` / `SQL_WARN_YES` are rejected with
-  `HY024`, as msodbcsql rejects them.
+  `HY024`, as msodbcsql rejects them. It reports the conversion *this driver*
+  performs, using the collation the parameter carries (the connection's
+  negotiated database collation); the destination column is not known at that
+  point, so a column collated differently from the database can still lose
+  characters in the server's own conversion without this firing.
 
   msodbcsql owns the attribute but consults it only on the retrieval direction
   (output parameters and columns); this driver applies it to parameters, which

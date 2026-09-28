@@ -348,8 +348,14 @@ pub(crate) const WARN_TRANSACTION_COMMITTED: DiagMsg = DiagMsg {
     state: SQLSTATE_01000,
     text: "The open transaction was committed because autocommit mode was enabled",
 };
-/// A character with no representation in the target column's collation was
-/// substituted with `?` on the way to the wire.
+/// A character with no representation in the narrow encoding the outgoing value
+/// was sent in was substituted with `?` on the way to the wire.
+///
+/// That encoding comes from the collation the *parameter* carries — the
+/// connection's negotiated database collation — not from the destination
+/// column's. The driver does not know the destination column here, so a column
+/// whose collation differs from the database can still lose characters during
+/// the server-side conversion without this ever being posted.
 ///
 /// msodbcsql's `IDS_01_000_16` verbatim (`local.rc:29`, SQLSTATE `01000` via
 /// `clntcomn.cpp:1183`). Posted only when the application opted in with

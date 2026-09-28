@@ -118,10 +118,16 @@ pub(crate) struct DbcState {
     /// `SQL_ATTR_ACCESS_MODE`. Stored so a set/get round-trip agrees; the driver
     /// does not yet vary its behaviour on it.
     pub(crate) access_mode: u32,
-    /// `SQL_COPT_SS_WARN_ON_CP_ERROR`. When `true`, a value whose characters
-    /// the target collation's code page could not represent — substituted with
+    /// `SQL_COPT_SS_WARN_ON_CP_ERROR`. When `true`, a value carrying a character
+    /// the narrow encoding it is sent in could not represent — substituted with
     /// `?` on the way to the wire, matching msodbcsql — is reported as SQLSTATE
     /// `01000` and turns the call's return into `SQL_SUCCESS_WITH_INFO`.
+    ///
+    /// That encoding is the one the parameter carries, which is the
+    /// connection's negotiated database collation; the driver does not know the
+    /// destination column here. So this observes the conversion *this driver*
+    /// performs, not the server's: a column collated differently from the
+    /// database can still lose characters server-side without this firing.
     ///
     /// Defaults to `false` (`SQL_WARN_NO`), as msodbcsql's does
     /// (`sqlcconn.cpp:596`): the substitution is not an error, and warning

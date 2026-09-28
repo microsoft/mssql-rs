@@ -890,6 +890,47 @@ pub(crate) mod tests {
         assert_eq!(mock.data.len(), 9);
     }
 
+    /// The substitution verdict has to survive the suspend/resume cycle, and it
+    /// is the one message field with no observable effect on the bytes: a
+    /// data-at-execution message is suspended and resumed once per
+    /// `SQLPutData`, so dropping it from either half of the round trip would
+    /// silently forget a substitution made by an earlier chunk and the payload
+    /// would still look correct (AB#47598).
+    ///
+    /// Asserted across two cycles in both states, like
+    /// `send_attempt_survives_suspend_and_resume` above: once set it is sticky,
+    /// and a clean message must not acquire it.
+    #[test]
+    fn code_page_conversion_loss_survives_suspend_and_resume() {
+        let mut mock = MockNetworkWriter::new(512);
+
+        // A message that never substituted stays clean across the round trip.
+        let mut writer = PacketWriter::new(PacketType::RpcRequest, &mut mock, None, None);
+        block_on(writer.write_byte_async(0xAB)).unwrap();
+        let mut message = writer.suspend();
+        for _ in 0..2 {
+            assert!(!message.code_page_conversion_loss());
+            message = PacketWriter::resume(message, &mut mock).suspend();
+        }
+
+        // Once noted, it rides every later suspend and resume.
+        let mut writer = PacketWriter::resume(message, &mut mock);
+        writer.note_code_page_conversion_loss();
+        assert!(writer.code_page_conversion_loss());
+        let mut message = writer.suspend();
+        for _ in 0..2 {
+            assert!(
+                message.code_page_conversion_loss(),
+                "a substitution from an earlier chunk must not be forgotten"
+            );
+            message = PacketWriter::resume(message, &mut mock).suspend();
+        }
+        assert!(
+            PacketWriter::resume(message, &mut mock).code_page_conversion_loss(),
+            "the resumed writer sees it too, not just the suspended state"
+        );
+    }
+
     #[test]
     fn fixed_bytes_preserve_packet_boundaries_and_reset_flags() {
         fn serialize<const N: usize>(
