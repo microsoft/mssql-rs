@@ -260,6 +260,12 @@ pub struct QueryResponse {
     pub columns: Vec<ColumnDefinition>,
     pub rows: Vec<Row>,
     pub info_tokens: Vec<InfoMessage>,
+    /// Info tokens emitted *after* the last row, before the terminal DONE —
+    /// where SQL Server puts an aggregate warning such as 8153. Unlike
+    /// `info_tokens` (sent between ColMetadata and the rows), these are only
+    /// reachable once a reader has consumed every row, so they exercise the
+    /// driver's terminal read-ahead rather than its execute path.
+    pub trailing_info_tokens: Vec<InfoMessage>,
     /// An error emitted (with a DONE MORE token) before the result set, so the
     /// server keeps streaming the row set after a statement-scoped error.
     pub leading_error: Option<LeadingError>,
@@ -278,6 +284,7 @@ impl QueryResponse {
             columns,
             rows,
             info_tokens: Vec::new(),
+            trailing_info_tokens: Vec::new(),
             leading_error: None,
             terminal_error: None,
             delay: None,
@@ -286,6 +293,13 @@ impl QueryResponse {
 
     pub fn with_info_tokens(mut self, info_tokens: Vec<InfoMessage>) -> Self {
         self.info_tokens = info_tokens;
+        self
+    }
+
+    /// Emit `info_tokens` after the last row instead of before the first, as
+    /// SQL Server does for an aggregate warning like 8153.
+    pub fn with_trailing_info_tokens(mut self, info_tokens: Vec<InfoMessage>) -> Self {
+        self.trailing_info_tokens = info_tokens;
         self
     }
 
@@ -303,6 +317,7 @@ impl QueryResponse {
             columns: Vec::new(),
             rows: Vec::new(),
             info_tokens: Vec::new(),
+            trailing_info_tokens: Vec::new(),
             leading_error: None,
             terminal_error: Some(error),
             delay: None,
@@ -322,6 +337,7 @@ impl QueryResponse {
             columns: vec![ColumnDefinition::new("", SqlDataType::Int)],
             rows: vec![Row::new(vec![ColumnValue::Int(1)])],
             info_tokens: Vec::new(),
+            trailing_info_tokens: Vec::new(),
             leading_error: None,
             terminal_error: None,
             delay: None,
@@ -342,6 +358,7 @@ impl QueryResponse {
                 ColumnValue::Int(3),
             ])],
             info_tokens: Vec::new(),
+            trailing_info_tokens: Vec::new(),
             leading_error: None,
             terminal_error: None,
             delay: None,

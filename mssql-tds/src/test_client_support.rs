@@ -343,7 +343,7 @@ pub fn tds_client_from_tokens(tokens: Vec<ScriptedToken>) -> TdsClient {
 /// Builds a client that first returns integer-column metadata and then replays
 /// the supplied rows through the buffered cursor APIs.
 pub fn tds_client_from_int_rows(rows: Vec<Vec<i32>>) -> TdsClient {
-    tds_client_from_int_rows_with_trailing_tokens(rows, vec![done_no_more()])
+    tds_client_from_int_rows_with_trailing_tokens(rows, vec![done_select_no_more()])
 }
 
 /// Builds a client that replays integer rows followed by caller-supplied
@@ -597,6 +597,22 @@ pub fn done_no_more() -> ScriptedToken {
     ScriptedToken(Tokens::Done(DoneToken {
         status: DoneStatus::FINAL,
         cur_cmd: CurrentCommand::Insert,
+        row_count: 0,
+    }))
+}
+
+/// A terminal DONE token tagged as a SELECT.
+///
+/// `done.cur_cmd != CurrentCommand::Select` is the gate `SQLRowCount` and
+/// statement-wise navigation parity turn on (`tds_client.rs`), so a row-returning
+/// replay must end on a SELECT-tagged DONE rather than the INSERT-tagged
+/// [`done_no_more`]. Both set only `DoneStatus::FINAL`, so the distinction is
+/// inert until a test sets `COUNT` — at which point starting from a mislabelled
+/// stream would let it pass for the wrong reason.
+pub fn done_select_no_more() -> ScriptedToken {
+    ScriptedToken(Tokens::Done(DoneToken {
+        status: DoneStatus::FINAL,
+        cur_cmd: CurrentCommand::Select,
         row_count: 0,
     }))
 }

@@ -2501,9 +2501,10 @@ mod tests {
     use crate::test_support::TestHandles;
     use mssql_tds::datatypes::sql_string::{EncodingType, SqlString};
     use mssql_tds::test_client_support::{
-        col_metadata_empty, done_no_more, int_columns, mixed_lob_columns, tds_client_from_int_rows,
-        tds_client_from_int_rows_with_trailing_tokens, tds_client_from_mixed_lob_prefix_rows,
-        tds_client_from_partial_int_rows, tds_client_from_tokens,
+        col_metadata_empty, done_no_more, done_select_no_more, int_columns, mixed_lob_columns,
+        tds_client_from_int_rows, tds_client_from_int_rows_with_trailing_tokens,
+        tds_client_from_mixed_lob_prefix_rows, tds_client_from_partial_int_rows,
+        tds_client_from_tokens,
     };
 
     fn binding(
@@ -4234,7 +4235,7 @@ mod tests {
             vec![vec![7]],
             vec![
                 info(8153, 10, "Null value is eliminated by an aggregate."),
-                done_no_more(),
+                done_select_no_more(),
             ],
         );
         dbc.runtime
@@ -4297,7 +4298,7 @@ mod tests {
             vec![vec![1234567]],
             vec![
                 info(8153, 10, "Null value is eliminated by an aggregate."),
-                done_no_more(),
+                done_select_no_more(),
             ],
         );
         dbc.runtime

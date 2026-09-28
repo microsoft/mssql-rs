@@ -3899,7 +3899,7 @@ mod tests {
     use mssql_tds::datatypes::sql_string::SqlString;
     use mssql_tds::datatypes::sqldatatypes::TdsDataType;
     use mssql_tds::test_client_support::{
-        done_no_more, info, int_columns, tds_client_from_int_rows,
+        done_select_no_more, info, int_columns, tds_client_from_int_rows,
         tds_client_from_int_rows_with_trailing_tokens,
     };
 
@@ -5090,7 +5090,7 @@ mod tests {
             vec![vec![7]],
             vec![
                 info(8153, 10, "Null value is eliminated by an aggregate."),
-                done_no_more(),
+                done_select_no_more(),
             ],
         );
         dbc.runtime
@@ -5141,7 +5141,7 @@ mod tests {
             let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
             let mut client = tds_client_from_int_rows_with_trailing_tokens(
                 vec![vec![7]],
-                vec![info(8153, 10, "terminal warning"), done_no_more()],
+                vec![info(8153, 10, "terminal warning"), done_select_no_more()],
             );
             dbc.runtime
                 .block_on(client.execute("SELECT 7;".to_string(), ()))
@@ -5163,6 +5163,94 @@ mod tests {
             assert_eq!(state.diag_records[0].sql_state, *b"01003");
             assert_eq!(state.diag_records[0].native_error, 8153);
         }
+    }
+
+    /// `finish_get_data` is reached with a literal `SQL_SUCCESS` from the PLP
+    /// completion arm too — the final chunk of a streamed long-data read, not
+    /// just the fixed-scalar arms the other terminal-INFO tests cover. That
+    /// return is what a classic chunking loop
+    /// (`while (rc == SQL_SUCCESS_WITH_INFO) SQLGetData(...)`) reads as
+    /// "truncated, call again", so promoting it has to stay safe: the state is
+    /// `01003`, not the `01004` that means truncation, and a loop driven by the
+    /// return code alone makes one further call that ends on `SQL_NO_DATA`.
+    #[test]
+    fn terminal_info_promotes_a_completed_plp_read() {
+        use mssql_mock_tds::{
+            ColumnDefinition, ColumnValue, InfoMessage, QueryResponse, Row, SqlDataType,
+        };
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        // One column only: the release peek needs every column of the row read,
+        // so a trailing scalar would keep the claim and never reach the INFO.
+        let response = QueryResponse::new(
+            vec![ColumnDefinition::new("value", SqlDataType::NVarCharMax)],
+            vec![Row::new(vec![ColumnValue::NVarCharMax(vec![vec![
+                0x41, 0x42, 0x43,
+            ]])])],
+        )
+        .with_trailing_info_tokens(vec![InfoMessage::new(
+            8153,
+            10,
+            "Null value is eliminated by an aggregate.",
+        )]);
+        let _server = crate::test_support::connect_mock_server(dbc, "SELECT plp_info", response);
+        let sql: Vec<u16> = "SELECT plp_info\0".encode_utf16().collect();
+        assert_eq!(
+            unsafe { crate::api::exec_direct::sql_exec_direct_w(h.stmt, sql.as_ptr(), SQL_NTS) },
+            SQL_SUCCESS
+        );
+        assert_eq!(unsafe { crate::api::fetch::sql_fetch(h.stmt) }, SQL_SUCCESS);
+
+        // Buffer sized to hold the whole value plus its terminator, so this
+        // call completes the stream rather than truncating it.
+        let mut buffer = [0_u8; 16];
+        let mut indicator = -99;
+        let rc = unsafe {
+            sql_get_data(
+                h.stmt,
+                1,
+                SQL_C_CHAR,
+                buffer.as_mut_ptr().cast(),
+                buffer.len() as SqlLen,
+                &mut indicator,
+            )
+        };
+        assert_eq!(
+            rc, SQL_SUCCESS_WITH_INFO,
+            "the completed PLP read must carry the terminal INFO"
+        );
+        assert_eq!(&buffer[..3], b"ABC");
+
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let state = stmt.inner.lock().unwrap();
+            assert_eq!(state.diag_records.len(), 1);
+            assert_eq!(
+                state.diag_records[0].sql_state, *b"01003",
+                "01003, not the 01004 a chunking loop would read as truncation"
+            );
+            assert_eq!(state.diag_records[0].native_error, 8153);
+        }
+
+        // What a `while (rc == SQL_SUCCESS_WITH_INFO)` loop does next: one more
+        // call, which must terminate the loop rather than re-reading the value.
+        let mut tail = [0_u8; 16];
+        let mut tail_indicator = -99;
+        assert_eq!(
+            unsafe {
+                sql_get_data(
+                    h.stmt,
+                    1,
+                    SQL_C_CHAR,
+                    tail.as_mut_ptr().cast(),
+                    tail.len() as SqlLen,
+                    &mut tail_indicator,
+                )
+            },
+            SQL_NO_DATA,
+            "the chunking loop must terminate on the next call"
+        );
     }
 
     #[test]

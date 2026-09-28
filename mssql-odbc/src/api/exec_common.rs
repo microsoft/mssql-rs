@@ -360,9 +360,11 @@ pub(super) fn return_client_busy(dbc: &DbcHandle, client: TdsClient) {
 /// is left rather than stranding it — so it takes the deferred-error route
 /// above, never the unposted one.
 ///
-/// Info messages are drained and posted before the idle client is published.
-/// Leaving them on `client` would let the next statement that claims the
-/// connection misattribute them. The return value tells row-delivering callers
+/// Info messages are drained and posted once the claim is released, before the
+/// idle client is published. Leaving them on `client` past that point would let
+/// the next statement that claims the connection misattribute them; while the
+/// claim is kept they stay on `client`, which no other statement can reach.
+/// The return value tells row-delivering callers
 /// to promote an otherwise-clean success to `SQL_SUCCESS_WITH_INFO`; a zero-row
 /// fetch keeps `SQL_NO_DATA` while leaving the diagnostic available.
 ///

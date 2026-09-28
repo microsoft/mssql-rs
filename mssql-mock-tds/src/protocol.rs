@@ -986,9 +986,14 @@ pub fn build_query_result(response: &crate::query_response::QueryResponse) -> By
         }
     }
 
+    // Trailing Info tokens: after the last row, before DONE — where SQL Server
+    // reports an aggregate warning such as 8153.
+    for info in &response.trailing_info_tokens {
+        result.extend_from_slice(&build_info_token(info));
+    }
+
     // DONE token
     result.extend_from_slice(&build_done_token(response.rows.len() as u64));
-
     wrap_in_packet(PacketType::TabularResult, result)
 }
 
