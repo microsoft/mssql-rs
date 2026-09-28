@@ -167,7 +167,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   (output parameters and columns); this driver applies it to parameters, which
   is where its own loss occurs — `SQL_C_CHAR` is UTF-8 here, so a fetch can
   always represent whatever the server sent. Recorded as parity deviation 22,
-  alongside 20 for the best-fit mapping msodbcsql performs and this driver does
+  alongside 21 for the best-fit mapping msodbcsql performs and this driver does
   not.
 
   Bulk copy shares the same encoder and substitutes on the same terms. Its
