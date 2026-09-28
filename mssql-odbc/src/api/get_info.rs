@@ -173,6 +173,57 @@ const SQL_SERVER_MAX_CURSOR_NAME_LEN: u16 = 128;
 const SQL_SERVER_MAX_PROCEDURE_NAME_LEN: u16 = 134;
 const SQL_SERVER_MAX_INDEX_SIZE: u32 = 900;
 
+// `SQL_CREATE_VIEW` and the SQL-92 capability masks (sqlext.h bit names),
+// assembled to match msodbcsql's `SQLGetInfoTable`.
+const SQL_CV_CREATE_VIEW: u32 = 0x0000_0001;
+const SQL_CV_CHECK_OPTION: u32 = 0x0000_0002;
+const SQL_CREATE_VIEW_MASK: u32 = SQL_CV_CREATE_VIEW | SQL_CV_CHECK_OPTION;
+const SQL_SG_WITH_GRANT_OPTION: u32 = 0x0000_0010;
+const SQL_SR_GRANT_OPTION_FOR: u32 = 0x0000_0010;
+const SQL_SP_EXISTS: u32 = 0x0000_0001;
+const SQL_SP_ISNOTNULL: u32 = 0x0000_0002;
+const SQL_SP_ISNULL: u32 = 0x0000_0004;
+const SQL_SP_LIKE: u32 = 0x0000_0200;
+const SQL_SP_IN: u32 = 0x0000_0400;
+const SQL_SP_BETWEEN: u32 = 0x0000_0800;
+const SQL_SP_COMPARISON: u32 = 0x0000_1000;
+const SQL_SP_QUANTIFIED_COMPARISON: u32 = 0x0000_2000;
+const SQL_SQL92_PREDICATES_SPT: u32 = SQL_SP_BETWEEN
+    | SQL_SP_COMPARISON
+    | SQL_SP_EXISTS
+    | SQL_SP_IN
+    | SQL_SP_ISNOTNULL
+    | SQL_SP_ISNULL
+    | SQL_SP_LIKE
+    | SQL_SP_QUANTIFIED_COMPARISON;
+const SQL_SRJO_CROSS_JOIN: u32 = 0x0000_0002;
+const SQL_SRJO_FULL_OUTER_JOIN: u32 = 0x0000_0008;
+const SQL_SRJO_INNER_JOIN: u32 = 0x0000_0010;
+const SQL_SRJO_LEFT_OUTER_JOIN: u32 = 0x0000_0040;
+const SQL_SRJO_RIGHT_OUTER_JOIN: u32 = 0x0000_0100;
+const SQL_SRJO_UNION_JOIN: u32 = 0x0000_0200;
+const SQL_SQL92_RELATIONAL_JOIN_OPERATORS_SPT: u32 = SQL_SRJO_CROSS_JOIN
+    | SQL_SRJO_FULL_OUTER_JOIN
+    | SQL_SRJO_INNER_JOIN
+    | SQL_SRJO_LEFT_OUTER_JOIN
+    | SQL_SRJO_RIGHT_OUTER_JOIN
+    | SQL_SRJO_UNION_JOIN;
+const SQL_SRVC_VALUE_EXPRESSION: u32 = 0x0000_0001;
+const SQL_SRVC_NULL: u32 = 0x0000_0002;
+const SQL_SRVC_DEFAULT: u32 = 0x0000_0004;
+const SQL_SRVC_ROW_SUBQUERY: u32 = 0x0000_0008;
+const SQL_SQL92_ROW_VALUE_CONSTRUCTOR_SPT: u32 =
+    SQL_SRVC_VALUE_EXPRESSION | SQL_SRVC_NULL | SQL_SRVC_DEFAULT | SQL_SRVC_ROW_SUBQUERY;
+const SQL_SSF_LOWER: u32 = 0x0000_0002;
+const SQL_SSF_UPPER: u32 = 0x0000_0004;
+const SQL_SQL92_STRING_FUNCTIONS_SPT: u32 = SQL_SSF_LOWER | SQL_SSF_UPPER;
+const SQL_SVE_CASE: u32 = 0x0000_0001;
+const SQL_SVE_CAST: u32 = 0x0000_0002;
+const SQL_SVE_COALESCE: u32 = 0x0000_0004;
+const SQL_SVE_NULLIF: u32 = 0x0000_0008;
+const SQL_SQL92_VALUE_EXPRESSIONS_SPT: u32 =
+    SQL_SVE_CASE | SQL_SVE_CAST | SQL_SVE_COALESCE | SQL_SVE_NULLIF;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum InfoValue {
     String(&'static str),
@@ -516,7 +567,7 @@ const STATIC_INFO: &[InfoEntry] = &[
         value: InfoValue::Bitmask(NO_CAPABILITIES),
     },
     InfoEntry {
-        info_type: odbc::SQL_ANSI_SQL_DATETIME_LITERALS,
+        info_type: odbc::SQL_DATETIME_LITERALS,
         value: InfoValue::Bitmask(NO_CAPABILITIES),
     },
     InfoEntry {
@@ -628,7 +679,20 @@ const STATIC_INFO: &[InfoEntry] = &[
         info_type: odbc::SQL_CONVERT_VARCHAR,
         value: InfoValue::Bitmask(CVT_VARCHAR_SPT),
     },
-    // SQL Server has no server-side conversion to these targets: zero mask.
+    InfoEntry {
+        info_type: odbc::SQL_CONVERT_WCHAR,
+        value: InfoValue::Bitmask(CVT_CHAR_SPT),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_CONVERT_WVARCHAR,
+        value: InfoValue::Bitmask(CVT_VARCHAR_SPT),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_CONVERT_WLONGVARCHAR,
+        value: InfoValue::Bitmask(CVT_LONGVARCHAR_SPT),
+    },
+    // msodbcsql reports a zero conversion mask for these targets; kept for
+    // parity, not a statement about SQL Server's own CAST/CONVERT support.
     InfoEntry {
         info_type: odbc::SQL_CONVERT_DATE,
         value: InfoValue::Bitmask(NO_CAPABILITIES),
@@ -647,6 +711,55 @@ const STATIC_INFO: &[InfoEntry] = &[
     },
     InfoEntry {
         info_type: odbc::SQL_CONVERT_INTERVAL_YEAR_MONTH,
+        value: InfoValue::Bitmask(NO_CAPABILITIES),
+    },
+    // `SQL_CREATE_VIEW` and the SQL-92 capability masks (msodbcsql `SQLGetInfoTable`).
+    InfoEntry {
+        info_type: odbc::SQL_CREATE_VIEW,
+        value: InfoValue::Bitmask(SQL_CREATE_VIEW_MASK),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_SQL92_GRANT,
+        value: InfoValue::Bitmask(SQL_SG_WITH_GRANT_OPTION),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_SQL92_REVOKE,
+        value: InfoValue::Bitmask(SQL_SR_GRANT_OPTION_FOR),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_SQL92_PREDICATES,
+        value: InfoValue::Bitmask(SQL_SQL92_PREDICATES_SPT),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_SQL92_RELATIONAL_JOIN_OPERATORS,
+        value: InfoValue::Bitmask(SQL_SQL92_RELATIONAL_JOIN_OPERATORS_SPT),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_SQL92_ROW_VALUE_CONSTRUCTOR,
+        value: InfoValue::Bitmask(SQL_SQL92_ROW_VALUE_CONSTRUCTOR_SPT),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_SQL92_STRING_FUNCTIONS,
+        value: InfoValue::Bitmask(SQL_SQL92_STRING_FUNCTIONS_SPT),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_SQL92_VALUE_EXPRESSIONS,
+        value: InfoValue::Bitmask(SQL_SQL92_VALUE_EXPRESSIONS_SPT),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_SQL92_DATETIME_FUNCTIONS,
+        value: InfoValue::Bitmask(NO_CAPABILITIES),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_SQL92_FOREIGN_KEY_DELETE_RULE,
+        value: InfoValue::Bitmask(NO_CAPABILITIES),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_SQL92_FOREIGN_KEY_UPDATE_RULE,
+        value: InfoValue::Bitmask(NO_CAPABILITIES),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_SQL92_NUMERIC_VALUE_FUNCTIONS,
         value: InfoValue::Bitmask(NO_CAPABILITIES),
     },
 ];
@@ -1257,7 +1370,7 @@ mod tests {
         let h = TestHandles::with_env_dbc();
         let mut seen = HashSet::new();
 
-        assert_eq!(STATIC_INFO.len(), 107);
+        assert_eq!(STATIC_INFO.len(), 122);
         for entry in STATIC_INFO {
             assert!(
                 seen.insert(entry.info_type),
@@ -1705,10 +1818,48 @@ mod tests {
             (odbc::SQL_CREATE_TABLE, SQL_CT_CREATE_TABLE),
             (odbc::SQL_DROP_TABLE, SQL_DT_DROP_TABLE),
             (odbc::SQL_DROP_VIEW, SQL_DV_DROP_VIEW),
+            (odbc::SQL_CREATE_VIEW, SQL_CREATE_VIEW_MASK),
             (odbc::SQL_ALTER_DOMAIN, 0),
-            (odbc::SQL_ANSI_SQL_DATETIME_LITERALS, 0),
+            (odbc::SQL_DATETIME_LITERALS, 0),
             (odbc::SQL_CREATE_DOMAIN, 0),
             (odbc::SQL_DROP_SCHEMA, 0),
+            // Zero-mask capability types msodbcsql still answers (not HY096).
+            (odbc::SQL_CREATE_CHARACTER_SET, 0),
+            (odbc::SQL_CREATE_COLLATION, 0),
+            (odbc::SQL_CREATE_TRANSLATION, 0),
+            (odbc::SQL_DROP_ASSERTION, 0),
+            (odbc::SQL_DROP_CHARACTER_SET, 0),
+            (odbc::SQL_DROP_COLLATION, 0),
+            (odbc::SQL_DROP_DOMAIN, 0),
+            (odbc::SQL_DROP_TRANSLATION, 0),
+            // Wide conversion targets.
+            (odbc::SQL_CONVERT_WCHAR, CVT_CHAR_SPT),
+            (odbc::SQL_CONVERT_WVARCHAR, CVT_VARCHAR_SPT),
+            (odbc::SQL_CONVERT_WLONGVARCHAR, CVT_LONGVARCHAR_SPT),
+            // SQL-92 capability masks.
+            (odbc::SQL_SQL92_GRANT, SQL_SG_WITH_GRANT_OPTION),
+            (odbc::SQL_SQL92_REVOKE, SQL_SR_GRANT_OPTION_FOR),
+            (odbc::SQL_SQL92_PREDICATES, SQL_SQL92_PREDICATES_SPT),
+            (
+                odbc::SQL_SQL92_RELATIONAL_JOIN_OPERATORS,
+                SQL_SQL92_RELATIONAL_JOIN_OPERATORS_SPT,
+            ),
+            (
+                odbc::SQL_SQL92_ROW_VALUE_CONSTRUCTOR,
+                SQL_SQL92_ROW_VALUE_CONSTRUCTOR_SPT,
+            ),
+            (
+                odbc::SQL_SQL92_STRING_FUNCTIONS,
+                SQL_SQL92_STRING_FUNCTIONS_SPT,
+            ),
+            (
+                odbc::SQL_SQL92_VALUE_EXPRESSIONS,
+                SQL_SQL92_VALUE_EXPRESSIONS_SPT,
+            ),
+            (odbc::SQL_SQL92_DATETIME_FUNCTIONS, 0),
+            (odbc::SQL_SQL92_FOREIGN_KEY_DELETE_RULE, 0),
+            (odbc::SQL_SQL92_FOREIGN_KEY_UPDATE_RULE, 0),
+            (odbc::SQL_SQL92_NUMERIC_VALUE_FUNCTIONS, 0),
             (odbc::SQL_MAX_INDEX_SIZE, SQL_SERVER_MAX_INDEX_SIZE),
             (odbc::SQL_MAX_ASYNC_CONCURRENT_STATEMENTS, 1),
             (odbc::SQL_ODBC_INTERFACE_CONFORMANCE, SQL_OIC_LEVEL2),

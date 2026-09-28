@@ -374,7 +374,7 @@ pub const SQL_MAX_ROW_SIZE_INCLUDES_LONG: SqlUSmallInt = 103;
 pub const SQL_CATALOG_LOCATION: SqlUSmallInt = 114;
 pub const SQL_ACTIVE_ENVIRONMENTS: SqlUSmallInt = 116;
 pub const SQL_ALTER_DOMAIN: SqlUSmallInt = 117;
-pub const SQL_ANSI_SQL_DATETIME_LITERALS: SqlUSmallInt = 119;
+pub const SQL_DATETIME_LITERALS: SqlUSmallInt = 119;
 pub const SQL_CONVERT_INTERVAL_DAY_TIME: SqlUSmallInt = 123;
 pub const SQL_CONVERT_INTERVAL_YEAR_MONTH: SqlUSmallInt = 124;
 pub const SQL_CREATE_CHARACTER_SET: SqlUSmallInt = 128;
@@ -400,6 +400,24 @@ pub const SQL_INSERT_STATEMENT: SqlUSmallInt = 172;
 pub const SQL_CONVERT_GUID: SqlUSmallInt = 173;
 pub const SQL_COLLATION_SEQ: SqlUSmallInt = 10004;
 pub const SQL_MAX_ASYNC_CONCURRENT_STATEMENTS: SqlUSmallInt = 10022;
+// Wide conversion targets, `SQL_CREATE_VIEW`, and the SQL-92 capability masks
+// complete the ODBC 3.x conversion/supported-SQL surface (msodbcsql answers all
+// of these in `SQLGetInfoTable`).
+pub const SQL_CONVERT_WCHAR: SqlUSmallInt = 122;
+pub const SQL_CONVERT_WLONGVARCHAR: SqlUSmallInt = 125;
+pub const SQL_CONVERT_WVARCHAR: SqlUSmallInt = 126;
+pub const SQL_CREATE_VIEW: SqlUSmallInt = 134;
+pub const SQL_SQL92_DATETIME_FUNCTIONS: SqlUSmallInt = 155;
+pub const SQL_SQL92_FOREIGN_KEY_DELETE_RULE: SqlUSmallInt = 156;
+pub const SQL_SQL92_FOREIGN_KEY_UPDATE_RULE: SqlUSmallInt = 157;
+pub const SQL_SQL92_GRANT: SqlUSmallInt = 158;
+pub const SQL_SQL92_NUMERIC_VALUE_FUNCTIONS: SqlUSmallInt = 159;
+pub const SQL_SQL92_PREDICATES: SqlUSmallInt = 160;
+pub const SQL_SQL92_RELATIONAL_JOIN_OPERATORS: SqlUSmallInt = 161;
+pub const SQL_SQL92_REVOKE: SqlUSmallInt = 162;
+pub const SQL_SQL92_ROW_VALUE_CONSTRUCTOR: SqlUSmallInt = 163;
+pub const SQL_SQL92_STRING_FUNCTIONS: SqlUSmallInt = 164;
+pub const SQL_SQL92_VALUE_EXPRESSIONS: SqlUSmallInt = 165;
 // Driver-Manager-owned information types: the DM answers these before the call
 // reaches the driver, so the driver core returns HY096 as a backstop.
 pub const SQL_DRIVER_HDBC: SqlUSmallInt = 3;

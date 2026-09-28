@@ -30,13 +30,21 @@ verified reason:
 - `SQL_DRIVER_AWARE_POOLING_SUPPORTED` and the five `SQL_DRIVER_H*` handle types
   are `ERROR_FLAG` in msodbcsql's `SQLGetInfoTable`; the handle types are also
   answered by the Driver Manager before the call reaches the driver. The driver
-  core returns `HY096` to match, and applications never observe it for the
-  handle types because the DM intercepts them.
+  core returns `HY096` to match. An application reaching the driver through the
+  Driver Manager never sees that for the handle types because the DM answers
+  them first; a consumer that loads the driver and resolves `SQLGetInfoW`
+  directly (mssql-python) bypasses the DM and does observe the `HY096`.
 - The driver-specific reserved band (`SQL_INFO_SS_RESERVED_FIRST`..`LAST`)
   returns `HYC00` rather than `HY096` in msodbcsql. That refinement is deferred:
   the exact band constants are internal to the msodbcsql build and not in any
   published header, and no in-scope information type falls in the band, so the
   `HY096` fallthrough is correct for everything AB#47996 covers.
+- `SQL_COLLATION_SEQ` reports the login `CHARACTER_SET` `ENVCHANGE` name and is
+  empty when the server sends a `SQL_COLLATION` change instead (the modern
+  default). msodbcsql additionally derives a code-page display name from the
+  negotiated collation (`CodePageFromTDSCollation`, `sqlctokn.cpp`) in that
+  case; matching that exact string is deferred pending a retail measurement so a
+  wrong name is not shipped. Tracked under AB#47996.
 
 ## Compatibility evidence
 
@@ -132,7 +140,7 @@ Driver Manager interaction difference is recorded in
 
 ## Test inventory
 
-Rust unit tests validate all 50 `STATIC_INFO` table entries' uniqueness and
+Rust unit tests validate all `STATIC_INFO` table entries' uniqueness and
 dispatch (each is fetched through the real `SQLGetInfoW` path and compared
 against its table value), an independent ODBC-spec width list that catches an
 entry using the wrong `InfoValue` variant, the two aliases, dynamic
