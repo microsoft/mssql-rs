@@ -2940,6 +2940,13 @@ mod tests {
         }
     }
 
+    fn cp1252_loss_bytes(text: &str) -> Vec<u8> {
+        // Win32/glibc and musl have different native substitution characters.
+        let encoded = client_output(1252, true).encoding.encode(text).unwrap();
+        assert!(encoded.had_loss);
+        encoded.bytes.into_owned()
+    }
+
     #[test]
     fn bound_client_text_uses_target_bytes_and_whole_characters() {
         for (code_page, text, expected) in [
@@ -2992,6 +2999,7 @@ mod tests {
 
     #[test]
     fn bound_client_text_reports_only_delivered_loss_and_keeps_both_warnings() {
+        let expected = cp1252_loss_bytes("AあZ");
         for warn_on_loss in [false, true] {
             for capacity in [2, 3, 4] {
                 let mut output = [0xcc_u8; 8];
@@ -3008,7 +3016,7 @@ mod tests {
                     deliver_bound_value(&binding, &value, client_output(1252, warn_on_loss))
                 };
                 let take = capacity as usize - 1;
-                assert_eq!(&output[..take], &b"A?Z"[..take]);
+                assert_eq!(&output[..take], &expected[..take]);
                 assert_eq!(output[take], 0);
                 assert_eq!(length, 3);
                 assert_eq!(
@@ -3041,10 +3049,11 @@ mod tests {
     fn bound_client_text_decodes_collations_and_variant_writer_uses_snapshot() {
         use mssql_tds::token::tokens::SqlCollation;
 
+        let substituted = cp1252_loss_bytes("あ");
         for (lcid, source, code_page, expected, loss) in [
             (0x0409, &b"\xe9\x80"[..], 1252, &b"\xe9\x80"[..], false),
             (0x0411, &b"\x82\xa0"[..], 932, &b"\x82\xa0"[..], false),
-            (0x0411, &b"\x82\xa0"[..], 1252, &b"?"[..], true),
+            (0x0411, &b"\x82\xa0"[..], 1252, substituted.as_slice(), true),
         ] {
             let source_encoding = EncodingType::LcidBased(SqlCollation {
                 info: lcid,
@@ -3240,14 +3249,25 @@ mod tests {
             col_flags: 0,
             sort_id: 0,
         });
+        let supplementary_loss = cp1252_loss_bytes("A😀Z");
+        let dbcs_loss = cp1252_loss_bytes("あい");
         let cases = [
             (
                 EncodingType::Utf16,
                 PlpEncoding::Utf16Text,
                 vec![0x41, 0x00, 0x3d, 0xd8, 0x00, 0xde, 0x5a, 0x00],
                 1252,
-                &b"A??Z"[..],
+                supplementary_loss.as_slice(),
                 true,
+            ),
+            #[cfg(unix)]
+            (
+                EncodingType::Utf16,
+                PlpEncoding::Utf16Text,
+                vec![0x3d, 0xd8, 0x00, 0xde],
+                54936,
+                &b"\x94\x39\xfc\x36"[..],
+                false,
             ),
             (
                 EncodingType::Utf16,
@@ -3270,7 +3290,7 @@ mod tests {
                 PlpEncoding::SingleByteText,
                 vec![0x82, 0xa0, 0x82, 0xa2],
                 1252,
-                &b"??"[..],
+                dbcs_loss.as_slice(),
                 true,
             ),
             (
@@ -3354,7 +3374,8 @@ mod tests {
                         )
                     }
                     .unwrap();
-                    let loss_in_prefix = had_loss && expected[..take].contains(&b'?');
+                    let loss_offset = usize::from(expected.first() == Some(&b'A'));
+                    let loss_in_prefix = had_loss && take > loss_offset;
                     assert_eq!(
                         outcome,
                         client_text_outcome(take < expected.len(), warn_on_loss && loss_in_prefix)
@@ -3389,12 +3410,13 @@ mod tests {
     fn fetch_snapshots_client_encoding_for_bound_row_arrays() {
         use mssql_mock_tds::{ColumnDefinition, ColumnValue, QueryResponse, Row, SqlDataType};
 
+        let substituted = cp1252_loss_bytes("あ");
         for plp in [false, true] {
             for (code_page, text, expected, warn_on_loss) in [
                 (1252, "é€", &b"\xe9\x80"[..], true),
                 (932, "あい", &b"\x82\xa0\x82\xa2"[..], true),
-                (1252, "あ", &b"?"[..], true),
-                (1252, "あ", &b"?"[..], false),
+                (1252, "あ", substituted.as_slice(), true),
+                (1252, "あ", substituted.as_slice(), false),
             ] {
                 let rows = (0..2)
                     .map(|_| {
