@@ -909,8 +909,13 @@ fn sql_get_info_w_safe(
             // While a data-at-execution sequence owns the client, fall back to
             // the value cached when that execution claimed it.
             let collation = match state.client.as_ref() {
-                Some(client) => resolve_collation_seq(client),
-                None => state.last_collation_seq.clone().unwrap_or_default(),
+                Some(client) => {
+                    collation_seq_string(client.collation_code_page(), client.char_set())
+                }
+                None => collation_seq_string(
+                    state.last_collation_code_page,
+                    state.last_char_set.as_deref(),
+                ),
             };
             write_wide_str(
                 &mut state,
@@ -1285,16 +1290,31 @@ fn collation_seq_name(code_page: Option<u16>) -> Option<&'static str> {
     }
 }
 
-/// The `SQL_COLLATION_SEQ` string for a live client: the database code page's
-/// name, else the legacy `CHARACTER_SET` display name, else empty. Cached into
-/// [`DbcState::last_collation_seq`](crate::handles::dbc::DbcState) when an
-/// execution claims the client, so `SQLGetInfo` still answers it while a
-/// data-at-execution sequence owns the client.
-pub(super) fn resolve_collation_seq(client: &TdsClient) -> String {
-    collation_seq_name(client.collation_code_page())
+/// The `SQL_COLLATION_SEQ` string for a database code page and optional legacy
+/// `CHARACTER_SET` name: the code page's msodbcsql name, else the legacy
+/// display name, else empty.
+fn collation_seq_string(code_page: Option<u16>, char_set: Option<&str>) -> String {
+    collation_seq_name(code_page)
         .map(str::to_string)
-        .or_else(|| client.char_set().map(char_set_display_name))
+        .or_else(|| char_set.map(char_set_display_name))
         .unwrap_or_default()
+}
+
+/// The connection-level `SQL_COLLATION_SEQ` cache inputs for a live client: the
+/// database code page, plus the legacy `CHARACTER_SET` name only when it is
+/// needed to name a code page [`collation_seq_name`] does not cover. Keeping
+/// the code page as a plain `u16` lets [`claim_connection`] refresh the cache
+/// without allocating on the common named-code-page path.
+///
+/// [`claim_connection`]: crate::api::exec_common::claim_connection
+pub(super) fn collation_cache_inputs(client: &TdsClient) -> (Option<u16>, Option<String>) {
+    let code_page = client.collation_code_page();
+    let char_set = if collation_seq_name(code_page).is_none() {
+        client.char_set().map(str::to_string)
+    } else {
+        None
+    };
+    (code_page, char_set)
 }
 
 /// Maps a legacy `CHARACTER_SET` `ENVCHANGE` name to its `SQL_COLLATION_SEQ`
@@ -2008,7 +2028,7 @@ mod tests {
             // statement; the DBC stays connected with the collation cached.
             let mut state = dbc_ref.inner.lock().unwrap();
             assert!(state.client.is_none());
-            state.last_collation_seq = Some("ISO 8859-1".to_string());
+            state.last_collation_code_page = Some(1252);
         }
         let (rc, value, len) = get_wide_str(h.dbc, odbc::SQL_COLLATION_SEQ);
         assert_eq!(rc, SQL_SUCCESS);

@@ -196,12 +196,18 @@ pub(crate) struct DbcState {
     /// `SQL_DATA_SOURCE_NAME`, `SQL_SERVER_NAME`, and `SQL_USER_NAME` without a
     /// round trip. Populated on a successful connect, cleared on disconnect.
     pub(crate) identity: ConnectionIdentity,
-    /// Last-known `SQL_COLLATION_SEQ` for the live connection, refreshed each
+    /// Last-known database code page for `SQL_COLLATION_SEQ`, refreshed each
     /// time an execution claims the client. Answers `SQLGetInfo` while a
     /// data-at-execution sequence has moved the client onto a statement
     /// (`SQL_NEED_DATA`), when [`client`](Self::client) is `None` but the DBC is
-    /// still connected. Cleared on disconnect.
-    pub(crate) last_collation_seq: Option<String>,
+    /// still connected. A plain code page, so the common path caches without
+    /// allocating. Cleared on disconnect.
+    pub(crate) last_collation_code_page: Option<u16>,
+    /// Legacy `CHARACTER_SET` name paired with
+    /// [`last_collation_code_page`](Self::last_collation_code_page), populated
+    /// only when the code page needs it to name `SQL_COLLATION_SEQ` (so modern
+    /// collation connections never allocate here). Cleared on disconnect.
+    pub(crate) last_char_set: Option<String>,
 }
 
 /// The parts of a connection's identity that `SQLGetInfo` reports back to the
@@ -289,7 +295,8 @@ impl DbcHandle {
                 current_catalog: None,
                 stmt_query_timeout: 0,
                 identity: ConnectionIdentity::default(),
-                last_collation_seq: None,
+                last_collation_code_page: None,
+                last_char_set: None,
             }),
         }
     }
