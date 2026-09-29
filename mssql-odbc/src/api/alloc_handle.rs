@@ -401,6 +401,10 @@ mod tests {
         let dbc = unsafe { &*(dbc_handle as *const DbcHandle) };
         let state = dbc.inner.lock().unwrap();
         assert_eq!(state.connection_state, ConnectionState::Disconnected);
+        assert_eq!(
+            state.client_encoding,
+            crate::conversion::client_encoding::ClientEncoding::system_default()
+        );
         drop(state);
 
         unsafe { sql_free_handle(SQL_HANDLE_DBC, dbc_handle) };

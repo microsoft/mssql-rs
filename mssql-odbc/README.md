@@ -154,6 +154,31 @@ Tokio runtime), socket-based mock servers, native authentication/TLS, and the
 C++ Driver Manager tests. It complements rather than replaces native
 end-to-end tests and fuzzing.
 
+## Character encoding
+
+Narrow character results (`SQL_C_CHAR`) use the platform client encoding:
+the Windows ANSI code page (`GetACP()`), or the supported process-locale
+encoding on Linux/macOS, with UTF-8 as the fallback for the C/POSIX or an
+unrecognized locale. Locale selection is captured on first use; set the locale
+before loading/using the driver. Changing a database collation does not select
+the client's encoding.
+
+This applies to `SQLGetData`, bound-column fetches, and procedure output
+parameters, including streamed character values. Characters that cannot be
+represented use the platform's best-fit/substitution behavior. Set
+`SQL_COPT_SS_WARN_ON_CP_ERROR` to `SQL_WARN_YES` to receive `01000` and
+`SQL_SUCCESS_WITH_INFO` when conversion reports data loss.
+
+Use `SQL_C_WCHAR` for lossless Unicode retrieval; it remains UTF-16LE.
+`SQL_C_BINARY` continues to return unconverted wire bytes. mssql-python's
+default wide-character fetching is unchanged; an explicitly selected narrow
+decoder must match the platform client encoding.
+
+**Migration note:** narrow results were previously always UTF-8. Applications
+that assumed UTF-8 on a non-UTF-8 system should use wide retrieval or decode
+with the client encoding. Input `SQL_C_CHAR` parameters still use UTF-8 pending
+AB#47565; this change affects retrieval only.
+
 ## Temporal character literals
 
 Character parameters and character-column fetches accept `YYYY/MM/DD` dates
