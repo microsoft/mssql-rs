@@ -1790,10 +1790,12 @@ fn trim_partial_utf8(bytes: &mut Vec<u8>) {
 
 fn client_text_outcome(truncated: bool, loss: bool) -> RowOutcome {
     match (truncated, loss) {
-        (true, true) => RowOutcome::Info(RowIssue::StringTruncatedWithCodePageLoss),
+        (true, true) => RowOutcome::Info(RowIssue::StringTruncated)
+            .merge(RowOutcome::Info(RowIssue::CodePageLoss)),
         (true, false) => RowOutcome::Info(RowIssue::StringTruncated),
-        (false, true) => RowOutcome::Info(RowIssue::CodePageLoss),
-        (false, false) => RowOutcome::Success,
+        // msodbcsql's sqlcdata.h success exit bypasses the warning poster,
+        // even when WARN_ON_CP_ERROR is enabled and conversion was lossy.
+        (false, _) => RowOutcome::Success,
     }
 }
 
@@ -3483,36 +3485,22 @@ mod tests {
                     },
                     SQL_SUCCESS
                 );
-                let loss = warn_on_loss && text == "あ";
                 assert_eq!(
                     unsafe { sql_fetch_scroll(h.stmt, SQL_FETCH_NEXT, 0) },
-                    if loss {
-                        SQL_SUCCESS_WITH_INFO
-                    } else {
-                        SQL_SUCCESS
-                    }
+                    SQL_SUCCESS
                 );
                 assert_eq!(fetched, 2);
                 for row in 0..2 {
                     assert_eq!(&output[row][..expected.len()], expected);
                     assert_eq!(output[row][expected.len()], 0);
                     assert_eq!(lengths[row], expected.len() as SqlLen);
-                    assert_eq!(
-                        statuses[row],
-                        if loss {
-                            SQL_ROW_SUCCESS_WITH_INFO
-                        } else {
-                            SQL_ROW_SUCCESS
-                        }
-                    );
+                    assert_eq!(statuses[row], SQL_ROW_SUCCESS);
                 }
                 assert_eq!(
                     stmt.inner.lock().unwrap().text_output.encoding,
                     text_output.encoding
                 );
-                if loss {
-                    assert_eq!(last_state(&h), SQLSTATE_01000);
-                }
+                assert!(stmt.inner.lock().unwrap().diag_records.is_empty());
             }
         }
     }

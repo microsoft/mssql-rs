@@ -113,19 +113,48 @@ TEST_F(FetchScrollLiveTest, BoundClientCodePageLossHonorsWarningAttribute) {
     for (SQLULEN warn : {0UL, 1UL}) {
         ASSERT_SQL_OK(SQLSetConnectAttr(dbc_, SQL_COPT_SS_WARN_ON_CP_ERROR,
                                        reinterpret_cast<SQLPOINTER>(warn), 0), SQL_HANDLE_DBC, dbc_);
+        SQLUINTEGER actual_warn = 99;
+        ASSERT_SQL_OK(SQLGetConnectAttr(dbc_, SQL_COPT_SS_WARN_ON_CP_ERROR,
+                                       &actual_warn, sizeof(actual_warn), nullptr), SQL_HANDLE_DBC, dbc_);
+        ASSERT_EQ(warn, actual_warn);
         for (const char* type : {"nvarchar(16)", "nvarchar(max)"}) {
             SCOPED_TRACE(type);
             SCOPED_TRACE(warn);
-            ExecDirect(std::string("SELECT CAST(NCHAR(0xD83D) + NCHAR(0xDE00) AS ") + type + ")");
-            unsigned char output[16] = {};
-            SQLLEN length = -99;
-            ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_CHAR, output, sizeof(output), &length), SQL_HANDLE_STMT, stmt_);
-            EXPECT_EQ(warn && had_loss ? SQL_SUCCESS_WITH_INFO : SQL_SUCCESS, SQLFetch(stmt_));
-            if (warn && had_loss) EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01000");
-            EXPECT_EQ(expected, reinterpret_cast<const char*>(output));
-            EXPECT_EQ(static_cast<SQLLEN>(expected.size()), length);
-            ASSERT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
-            ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_UNBIND), SQL_HANDLE_STMT, stmt_);
+            for (SQLLEN capacity : {16, 2}) {
+                SCOPED_TRACE(capacity);
+                ExecDirect(std::string("SELECT CAST(NCHAR(0xD83D) + NCHAR(0xDE00) AS ") + type + ")");
+                unsigned char output[16] = {};
+                SQLLEN length = -99;
+                ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_CHAR, output, capacity, &length), SQL_HANDLE_STMT, stmt_);
+                const bool truncated = expected.size() >= static_cast<size_t>(capacity);
+                EXPECT_EQ(truncated ? SQL_SUCCESS_WITH_INFO : SQL_SUCCESS, SQLFetch(stmt_));
+                bool saw_truncation = false;
+                bool saw_loss = false;
+                for (SQLSMALLINT record = 1;; ++record) {
+                    SQLCHAR state[6] = {};
+                    SQLCHAR message[256] = {};
+                    SQLINTEGER native = 0;
+                    SQLSMALLINT size = 0;
+                    const auto rc = SQLGetDiagRecA(SQL_HANDLE_STMT, stmt_, record, state,
+                                                   &native, message, sizeof(message), &size);
+                    if (rc == SQL_NO_DATA) break;
+                    ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+                    const std::string sqlstate(reinterpret_cast<const char*>(state));
+                    saw_truncation |= sqlstate == "01004";
+                    saw_loss |= sqlstate == "01000";
+                    EXPECT_TRUE(sqlstate == "01004" || sqlstate == "01000");
+                }
+                EXPECT_EQ(truncated, saw_truncation);
+                EXPECT_EQ(truncated && warn && had_loss, saw_loss);
+                if (!truncated) {
+                    EXPECT_EQ(expected, reinterpret_cast<const char*>(output));
+                    EXPECT_EQ(static_cast<SQLLEN>(expected.size()), length);
+                } else if (had_loss && expected.size() == 2) {
+                    EXPECT_EQ(expected.substr(0, 1), reinterpret_cast<const char*>(output));
+                }
+                ASSERT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+                ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_UNBIND), SQL_HANDLE_STMT, stmt_);
+            }
         }
     }
     ASSERT_SQL_OK(SQLSetConnectAttr(dbc_, SQL_COPT_SS_WARN_ON_CP_ERROR, nullptr, 0), SQL_HANDLE_DBC, dbc_);
