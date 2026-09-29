@@ -2264,6 +2264,79 @@ mod tests {
         assert_eq!(stage_and_restore_plan(h.stmt), (None, Some(new_id)));
     }
 
+    #[test]
+    fn data_at_execution_parking_keeps_collation_seq_answerable() {
+        use crate::api::get_info::sql_get_info_w;
+        use crate::api::odbc_types::{SQL_COLLATION_SEQ, SQL_NEED_DATA, SqlSmallInt};
+        use mssql_tds::test_client_support::tds_client_from_tokens;
+        use mssql_tds::token::tokens::SqlCollation;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        h.mark_dbc_connected();
+        let mut token = 7_i32;
+        let mut indicator = SQL_DATA_AT_EXEC;
+        assert_eq!(
+            unsafe {
+                sql_bind_parameter(
+                    h.stmt,
+                    1,
+                    SQL_PARAM_INPUT,
+                    SQL_C_CHAR,
+                    SQL_VARCHAR,
+                    8,
+                    0,
+                    (&raw mut token).cast(),
+                    4,
+                    &mut indicator,
+                )
+            },
+            SQL_SUCCESS
+        );
+        let mut client = tds_client_from_tokens(Vec::new());
+        // Windows Latin1 (LCID 0x0409) resolves to code page 1252 -> "ISO 8859-1".
+        client.set_database_collation_for_test(SqlCollation {
+            info: 0x0409,
+            lcid_language_id: 0,
+            col_flags: 0,
+            sort_id: 0,
+        });
+        let id = client.register_prepared_handle_for_test(77);
+        materialize_test_plan(h.stmt, id);
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let dbc = stmt.parent_dbc();
+        dbc.inner.lock().unwrap().client = Some(client);
+
+        // The application path: `sql_execute` parks the client on the statement,
+        // which is the only moment `claim_connection` snapshots the collation.
+        assert_eq!(unsafe { sql_execute(h.stmt) }, SQL_NEED_DATA);
+        {
+            let state = dbc.inner.lock().unwrap();
+            assert!(state.client.is_none(), "client is parked for DAE");
+            assert_eq!(state.last_collation_code_page, Some(1252));
+        }
+
+        let mut buf = [0u16; 64];
+        let mut len: SqlSmallInt = -1;
+        let rc = unsafe {
+            sql_get_info_w(
+                h.dbc,
+                SQL_COLLATION_SEQ,
+                buf.as_mut_ptr().cast(),
+                (buf.len() * std::mem::size_of::<u16>()) as SqlSmallInt,
+                &mut len,
+            )
+        };
+        assert_eq!(rc, SQL_SUCCESS);
+        let n = (len as usize) / 2;
+        assert_eq!(String::from_utf16_lossy(&buf[..n]), "ISO 8859-1");
+
+        // Unwind the parked sequence so the handles drop cleanly.
+        assert_eq!(
+            unsafe { crate::api::cancel::sql_cancel(h.stmt) },
+            SQL_SUCCESS
+        );
+    }
+
     /// Panics while holding the APD lock, leaving the mutex poisoned —
     /// mirrors `bind_param.rs`'s own `poison_apd` test helper.
     fn poison_apd(apd: SqlHandle) {

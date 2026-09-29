@@ -4561,6 +4561,12 @@ impl TdsClient {
 
     #[cfg(any(test, feature = "test-util"))]
     #[doc(hidden)]
+    pub fn set_database_collation_for_test(&mut self, collation: SqlCollation) {
+        self.negotiated_settings.database_collation = collation;
+    }
+
+    #[cfg(any(test, feature = "test-util"))]
+    #[doc(hidden)]
     pub async fn execute_sp_unprepare_for_test<'a>(
         &mut self,
         statement_id: StatementId,
