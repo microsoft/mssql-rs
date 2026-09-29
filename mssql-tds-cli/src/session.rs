@@ -893,12 +893,11 @@ impl Session {
                 continue;
             }
             if let Some(document) = &mut self.json {
-                if let Output::Message(message) = &item {
-                    if message.state == exitcode::TERMINATING_STATE
-                        && self.terminating_message.is_none()
-                    {
-                        self.terminating_message = Some(message.number);
-                    }
+                if let Output::Message(message) = &item
+                    && message.state == exitcode::TERMINATING_STATE
+                    && self.terminating_message.is_none()
+                {
+                    self.terminating_message = Some(message.number);
                 }
                 document.push(item);
                 continue;
