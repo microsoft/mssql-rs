@@ -22,10 +22,6 @@ parameters:
   displayName: Intermediate ADO branch carrying GitHub main
   type: string
   default: sync/github-main-to-stable
-- name: linuxImage
-  displayName: Agent image for x64 Linux jobs
-  type: string
-  default: RUST-AZL3
 
 resources:
   repositories:
@@ -47,7 +43,7 @@ variables:
 pool:
   name: RUST-X64-WUS3
   demands:
-    - imageOverride -equals ${{ parameters.linuxImage }}
+    - imageOverride -equals RUST-AZL3
 
 steps:
 # GitHub main (self): the source we are syncing from.
