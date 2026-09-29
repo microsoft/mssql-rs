@@ -352,12 +352,22 @@ fn read_eof_outcome(enc_in_empty: bool) -> Poll<io::Result<()>> {
 const MAX_TLS_RECORD: usize = 5 + 16384 + 2048;
 
 /// Bytes still needed before `enc_in` holds its first TLS record whole.
-fn missing_record_bytes(enc_in: &[u8]) -> usize {
+///
+/// A header declaring more than `MAX_TLS_RECORD` is a `record_overflow`
+/// (RFC 5246 §6.2.3) and fails at once instead of waiting for the body.
+fn missing_record_bytes(enc_in: &[u8]) -> io::Result<usize> {
     match enc_in {
         [_, _, _, hi, lo, ..] => {
-            (5 + u16::from_be_bytes([*hi, *lo]) as usize).saturating_sub(enc_in.len())
+            let record_len = 5 + usize::from(u16::from_be_bytes([*hi, *lo]));
+            if record_len > MAX_TLS_RECORD {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("TLS record length {record_len} exceeds {MAX_TLS_RECORD}"),
+                ));
+            }
+            Ok(record_len.saturating_sub(enc_in.len()))
         }
-        _ => 5 - enc_in.len(),
+        _ => Ok(5 - enc_in.len()),
     }
 }
 
@@ -389,7 +399,10 @@ where
 
             // 2. Try to decrypt one record out of enc_in. A partial record
             // cannot decrypt, so skip the SChannel call until it is whole.
-            let missing = missing_record_bytes(enc_in);
+            let missing = match missing_record_bytes(enc_in) {
+                Ok(missing) => missing,
+                Err(e) => return Poll::Ready(Err(e)),
+            };
             if missing == 0 {
                 match record.decrypt(enc_in, plain_out) {
                     Ok(Decrypted::Ok) => continue, // back to step 1 to drain
@@ -401,7 +414,7 @@ where
 
             // 3. Read more from the socket, straight into enc_in, with room
             // for at least one full record so it arrives in one read.
-            enc_in.reserve(missing.max(MAX_TLS_RECORD));
+            enc_in.reserve(MAX_TLS_RECORD);
             match tokio_util::io::poll_read_buf(Pin::new(&mut this.socket), cx, enc_in) {
                 Poll::Ready(Ok(0)) => return read_eof_outcome(enc_in.is_empty()),
                 Poll::Ready(Ok(_)) => {}
@@ -799,20 +812,48 @@ mod tests {
 
     #[test]
     fn missing_record_bytes_tracks_header_and_body() {
-        assert_eq!(missing_record_bytes(&[]), 5);
-        assert_eq!(missing_record_bytes(&[0x17, 3, 3]), 2);
+        let missing = |b: &[u8]| missing_record_bytes(b).unwrap();
+        assert_eq!(missing(&[]), 5);
+        assert_eq!(missing(&[0x17, 3, 3]), 2);
         let mut rec = vec![0x17, 3, 3, 0x01, 0x00];
-        assert_eq!(missing_record_bytes(&rec), 256);
+        assert_eq!(missing(&rec), 256);
         rec.resize(5 + 255, 0);
-        assert_eq!(missing_record_bytes(&rec), 1);
+        assert_eq!(missing(&rec), 1);
         rec.push(0);
-        assert_eq!(missing_record_bytes(&rec), 0);
+        assert_eq!(missing(&rec), 0);
         rec.extend_from_slice(&[0x17, 3]);
+        assert_eq!(missing(&rec), 0, "trailing bytes of the next record");
+    }
+
+    #[test]
+    fn missing_record_bytes_rejects_oversized_length() {
+        let max_body = u16::try_from(MAX_TLS_RECORD - 5).unwrap();
         assert_eq!(
-            missing_record_bytes(&rec),
-            0,
-            "trailing bytes of the next record"
+            missing_record_bytes(&record_prefix(max_body, 5)).unwrap(),
+            MAX_TLS_RECORD - 5
         );
+        for body in [max_body + 1, u16::MAX] {
+            let err = missing_record_bytes(&record_prefix(body, 5)).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        }
+    }
+
+    #[test]
+    fn poll_read_fails_on_oversized_header_without_waiting() {
+        let waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        let socket = FeedSocket {
+            data: record_prefix(u16::MAX, 5),
+            pos: 0,
+            data_reads: 0,
+        };
+        let mut s = streaming_stream(socket, Vec::new(), 0);
+        let mut backing = [0u8; 16];
+        let mut rb = ReadBuf::new(&mut backing);
+        match Pin::new(&mut s).poll_read(&mut cx, &mut rb) {
+            Poll::Ready(Err(e)) => assert_eq!(e.kind(), io::ErrorKind::InvalidData),
+            other => panic!("oversized header must fail, got {other:?}"),
+        }
     }
 
     /// Socket that serves `data` as fast as the caller's buffer allows, then
