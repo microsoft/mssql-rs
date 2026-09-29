@@ -26,6 +26,7 @@ mod tests {
     fn utf8_and_ascii_borrow_the_input() {
         for code_page in [65001, 1252, 932] {
             let encoding = ClientEncoding::for_code_page(code_page).unwrap();
+            assert!(encoding.is_ascii_compatible());
             for text in ["", "ascii\0with nul"] {
                 let encoded = encoding.encode(text).unwrap();
                 assert!(matches!(encoded.bytes, Cow::Borrowed(_)));
@@ -147,6 +148,12 @@ mod tests {
     #[test]
     fn system_default_can_convert_ascii() {
         let encoding = ClientEncoding::system_default();
+        assert_eq!(
+            std::thread::spawn(ClientEncoding::system_default)
+                .join()
+                .unwrap(),
+            encoding,
+        );
         let encoded = encoding.encode("default\0encoding").unwrap();
         assert_eq!(
             encoding.decode(&encoded.bytes).unwrap(),
@@ -169,19 +176,21 @@ impl ClientEncoding {
 
     /// Match `InitDbcCodePages` / `SystemLocale::AnsiCP`, not a server code page.
     pub(crate) fn system_default() -> Self {
-        platform::system_default()
+        // Native SystemLocale::Singleton captures the locale on its first use.
+        static DEFAULT: std::sync::OnceLock<ClientEncoding> = std::sync::OnceLock::new();
+        *DEFAULT.get_or_init(platform::system_default)
     }
 
     pub(crate) fn is_utf8(self) -> bool {
         self == Self::UTF8
     }
 
-    fn ascii_compatible(self) -> bool {
+    pub(crate) fn is_ascii_compatible(self) -> bool {
         self.0 != 12000
     }
 
     pub(crate) fn encode(self, text: &str) -> Result<ClientEncoded<'_>, DiagMsg> {
-        if self.is_utf8() || (self.ascii_compatible() && text.is_ascii()) {
+        if self.is_utf8() || (self.is_ascii_compatible() && text.is_ascii()) {
             return Ok(ClientEncoded {
                 bytes: Cow::Borrowed(text.as_bytes()),
                 had_loss: false,
@@ -195,7 +204,7 @@ impl ClientEncoding {
     }
 
     pub(crate) fn decode(self, bytes: &[u8]) -> Result<Cow<'_, str>, DiagMsg> {
-        if self.is_utf8() || (self.ascii_compatible() && bytes.is_ascii()) {
+        if self.is_utf8() || (self.is_ascii_compatible() && bytes.is_ascii()) {
             return std::str::from_utf8(bytes)
                 .map(Cow::Borrowed)
                 .map_err(|error| {
@@ -218,7 +227,7 @@ impl ClientEncoding {
             }
             return Ok(end);
         }
-        if self.ascii_compatible() && bytes.is_ascii() {
+        if self.is_ascii_compatible() && bytes.is_ascii() {
             return Ok(capacity);
         }
         platform::prefix_len(self, bytes, capacity)
@@ -631,6 +640,7 @@ mod platform {
         #[test]
         fn utf32le_does_not_borrow_ascii_or_split_units() {
             let encoding = for_code_page(12000).unwrap();
+            assert!(!encoding.is_ascii_compatible());
             let encoded = encoding.encode("A\0😀").unwrap();
             assert!(matches!(encoded.bytes, Cow::Owned(_)));
             assert_eq!(encoded.bytes.len(), 12);
