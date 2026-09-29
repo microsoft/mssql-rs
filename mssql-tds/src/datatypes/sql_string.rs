@@ -13,7 +13,7 @@ mod encoding;
 pub use encoding::{ResolvedDecoder, ResolvedEncoding};
 
 use super::{
-    lcid_encoding::lcid_to_encoding,
+    lcid_encoding::{lcid_to_code_page, lcid_to_encoding},
     sqldatatypes::{TypeInfoVariant, is_unicode_type},
 };
 
@@ -89,6 +89,20 @@ fn resolve_collation(collation: SqlCollation) -> ResolvedEncoding {
         return encoding.into();
     }
     lcid_encoding_or_fallback(collation).into()
+}
+
+/// The Windows code page the server's `collation` selects, mirroring the value
+/// msodbcsql derives with `CodePageFromTDSCollation`: a SQL collation's sort-ID
+/// code page, else the LCID's ANSI code page (`65001` for a UTF-8 collation).
+/// `None` when neither the sort ID nor the LCID maps to a known code page.
+pub(crate) fn collation_code_page(collation: SqlCollation) -> Option<u16> {
+    if collation.utf8() {
+        return Some(65001);
+    }
+    if let Some(code_page) = CODE_PAGE_FROM_SORT_ID[usize::from(collation.sort_id)] {
+        return Some(code_page);
+    }
+    lcid_to_code_page(collation.info & 0x000F_FFFF)
 }
 
 /// Byte substituted for a character the target narrow encoding cannot
@@ -657,6 +671,53 @@ mod tests {
         };
         let sql_str = SqlString::new(text.to_vec(), EncodingType::LcidBased(collation));
         assert_eq!(sql_str.to_utf8_string(), "Hello, World!");
+    }
+
+    #[test]
+    fn collation_code_page_resolves_sort_id_then_lcid() {
+        let sql_collation = |sort_id| SqlCollation {
+            info: 0,
+            lcid_language_id: 0,
+            col_flags: 0,
+            sort_id,
+        };
+        // SQL collations resolve through the sort-ID table.
+        assert_eq!(collation_code_page(sql_collation(50)), Some(1252));
+        assert_eq!(collation_code_page(sql_collation(40)), Some(850));
+        assert_eq!(collation_code_page(sql_collation(30)), Some(437));
+        // A Windows collation (sort_id 0) resolves through the LCID's ANSI page.
+        let windows = SqlCollation {
+            info: 0x0409,
+            lcid_language_id: 0,
+            col_flags: 0,
+            sort_id: 0,
+        };
+        assert_eq!(collation_code_page(windows), Some(1252));
+        // A second LCID branch, to catch a transposition in the match arms.
+        let cyrillic = SqlCollation {
+            info: 0x0419,
+            lcid_language_id: 0,
+            col_flags: 0,
+            sort_id: 0,
+        };
+        assert_eq!(collation_code_page(cyrillic), Some(1251));
+        // A niche CP1252 Windows collation whose LCID the encoding table does
+        // not carry (Welsh, 0x0452) still resolves through the full locale map.
+        let welsh = SqlCollation {
+            info: 0x0452,
+            lcid_language_id: 0,
+            col_flags: 0,
+            sort_id: 0,
+        };
+        assert_eq!(collation_code_page(welsh), Some(1252));
+        // An unmapped LCID has no code page.
+        let unknown = SqlCollation {
+            info: 0x000F_FFFF,
+            lcid_language_id: 0,
+            col_flags: 0,
+            sort_id: 0,
+        };
+        assert_eq!(collation_code_page(unknown), None);
     }
 
     #[test]

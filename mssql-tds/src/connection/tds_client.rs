@@ -1230,6 +1230,20 @@ impl TdsClient {
         self.negotiated_settings.server_reported_name.as_deref()
     }
 
+    /// Returns the character-set name the server sent in the login
+    /// `CHARACTER_SET` `ENVCHANGE`, if any. Modern servers report a
+    /// `SQL_COLLATION` change instead and send no character-set name, so this is
+    /// commonly `None`.
+    pub fn char_set(&self) -> Option<&str> {
+        self.negotiated_settings.char_set.as_deref()
+    }
+
+    /// The Windows code page the current database collation selects, as
+    /// msodbcsql derives it for `SQL_COLLATION_SEQ` (`CodePageFromTDSCollation`).
+    pub fn collation_code_page(&self) -> Option<u16> {
+        crate::datatypes::sql_string::collation_code_page(self.get_collation())
+    }
+
     /// Returns `true` if the connection is known to be dead.
     ///
     /// This surfaces the connection's last-known liveness status, updated
@@ -4600,6 +4614,12 @@ impl TdsClient {
         let statement_id = self.issue_statement_id();
         self.prepared_handles.insert(statement_id, handle);
         statement_id
+    }
+
+    #[cfg(any(test, feature = "test-util"))]
+    #[doc(hidden)]
+    pub fn set_database_collation_for_test(&mut self, collation: SqlCollation) {
+        self.negotiated_settings.database_collation = collation;
     }
 
     #[cfg(any(test, feature = "test-util"))]

@@ -12,17 +12,33 @@ the behavior is tested. The owning user story is
 |---|---|---|
 | [AB#47086](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47086) | Closed | First-release support for the 21 information types then blocking mssql-python. |
 | [AB#48149](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/48149) | Active | 61 mssql-python payload names representing 59 distinct information IDs. `SQL_OWNER_USAGE` aliases `SQL_SCHEMA_USAGE`; `SQL_QUALIFIER_USAGE` aliases `SQL_CATALOG_USAGE`. |
-| [AB#47996](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47996) | New | Complete the remaining 68 ODBC 3.x public information types and residual parity work. |
+| [AB#47996](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47996) | Active | The remaining ODBC 3.x public information types: 25 conversion masks, the supported-SQL / SQL-92 / driver capability masks, the SQL limits, `SQL_COLLATION_SEQ`, and the deprecated `SQL_LOCK_TYPES` / `SQL_POS_OPERATIONS`. |
 
 [AB#46406](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/46406),
 `SQLGetTypeInfoW`, is another closed child of AB#46381. It is deliberately
 outside this document because it returns a result set rather than an
 `SQLGetInfoW` scalar value.
 
-The current implementation therefore covers the original loader and
-transaction information, AB#47086, and AB#48149. It is not yet the complete
-ODBC 3.x public surface; unsupported residual identifiers remain owned by
-AB#47996.
+The current implementation covers the original loader and transaction
+information, AB#47086, AB#48149, and the AB#47996 residual surface. Three
+listed-but-unimplementable identifiers are deliberately excluded, each with a
+verified reason:
+
+- `SQL_ALTER_SCHEMA` is not a defined ODBC information type — it appears in no
+  ODBC header, so there is nothing to return. It reaches the driver only as an
+  out-of-range value and answers `HY096`.
+- `SQL_DRIVER_AWARE_POOLING_SUPPORTED` and the five `SQL_DRIVER_H*` handle types
+  are `ERROR_FLAG` in msodbcsql's `SQLGetInfoTable`; the handle types are also
+  answered by the Driver Manager before the call reaches the driver. The driver
+  core returns `HY096` to match. An application reaching the driver through the
+  Driver Manager never sees that for the handle types because the DM answers
+  them first; a consumer that loads the driver and resolves `SQLGetInfoW`
+  directly (mssql-python) bypasses the DM and does observe the `HY096`.
+- The driver-specific reserved band (`SQL_INFO_SS_RESERVED_FIRST`..`LAST`)
+  returns `HYC00` rather than `HY096` in msodbcsql. That refinement is deferred:
+  the exact band constants are internal to the msodbcsql build and not in any
+  published header, and no in-scope information type falls in the band, so the
+  `HY096` fallthrough is correct for everything AB#47996 covers.
 
 ## Compatibility evidence
 
@@ -81,6 +97,8 @@ claim them as such.
 | Information type | mssql-odbc answer | Difference and owner |
 |---|---:|---|
 | `SQL_ASYNC_MODE` | `SQL_AM_NONE` | msodbcsql advertises statement async. Planned Phase 15 in `plan.md`. |
+| `SQL_MAX_ASYNC_CONCURRENT_STATEMENTS` | `0` | msodbcsql reports `1`; this driver has no async yet (`SQL_ASYNC_MODE = SQL_AM_NONE`), so it advertises no async statements. Becomes `1` with Phase 15. |
+| `SQL_ODBC_INTERFACE_CONFORMANCE` | `0` | msodbcsql reports Level 2. The Core interface set requires `SQLGetCursorName` / `SQLSetCursorName`, which are unimplemented (and absent from `SQLGetFunctions`), so no named level is fully met; `0` rather than an overstated `SQL_OIC_CORE`. Unlike the bitmask rows above (where `0` means "no bits set" and is always well-formed), this is an enum whose `sqlext.h` values are only `1`/`2`/`3`, so `0` is outside the defined range: a consumer doing `== SQL_OIC_CORE` sees "below Core" rather than "Core minus cursor-name". Rises to Core with Phase 10 cursor-name support. |
 | `SQL_DYNAMIC_CURSOR_ATTRIBUTES1/2` | `0` | Dynamic cursors are not implemented. Planned Phase 10 in `plan.md`. |
 | `SQL_FORWARD_ONLY_CURSOR_ATTRIBUTES1` | `SQL_CA1_NEXT` | Only next-oriented forward fetch is implemented. Additional cursor operations belong to Phase 10. |
 | `SQL_FORWARD_ONLY_CURSOR_ATTRIBUTES2` | `SQL_CA2_READ_ONLY_CONCURRENCY \| SQL_CA2_MAX_ROWS_SELECT` | Reports only implemented concurrency and `SQL_ATTR_MAX_ROWS`; the broader msodbcsql mask belongs to Phase 10. |
@@ -91,6 +109,8 @@ claim them as such.
 | `SQL_SCROLL_OPTIONS` | `SQL_SO_FORWARD_ONLY` | Only forward-only cursors are implemented. Planned Phase 10. |
 | `SQL_FETCH_DIRECTION` | `SQL_FD_FETCH_NEXT` | Deprecated identifier truthfully mirrors forward-only fetch support. Phase 10 owns additional directions. |
 | `SQL_POSITIONED_STATEMENTS` | `0` | Positioned update/delete is not implemented. Planned Phase 10. |
+| `SQL_POS_OPERATIONS` | `0` | `SQLSetPos` is not implemented, so no positioned operations are advertised. Planned Phase 10. |
+| `SQL_LOCK_TYPES` | `0` | Deprecated `SQLSetPos` lock types; `SQLSetPos` is not implemented. Planned Phase 10. |
 | `SQL_SCROLL_CONCURRENCY` | `SQL_SCCO_READ_ONLY` | Deprecated identifier truthfully mirrors read-only cursor support. Phase 10 owns additional modes. |
 | `SQL_STATIC_SENSITIVITY` | `0` | Deprecated identifier; static cursor changes are not implemented. Planned Phase 10. |
 
@@ -118,7 +138,7 @@ Driver Manager interaction difference is recorded in
 
 ## Test inventory
 
-Rust unit tests validate all 50 `STATIC_INFO` table entries' uniqueness and
+Rust unit tests validate all `STATIC_INFO` table entries' uniqueness and
 dispatch (each is fetched through the real `SQLGetInfoW` path and compared
 against its table value), an independent ODBC-spec width list that catches an
 entry using the wrong `InfoValue` variant, the two aliases, dynamic
@@ -143,5 +163,7 @@ regression suite at
   (covered by E2E).
 
 Variation 3 also checks `SQL_DRIVER_HDESC`, `SQL_DRIVER_HLIB`,
-`SQL_DRIVER_HENV`, `SQL_DRIVER_HDBC`, and `SQL_DRIVER_HSTMT`. Those handle
-information types remain in AB#47996 rather than being silently claimed here.
+`SQL_DRIVER_HENV`, `SQL_DRIVER_HDBC`, and `SQL_DRIVER_HSTMT`. The Driver Manager
+answers those handle information types itself before the call reaches the
+driver; the driver core returns `HY096` as a backstop
+(`handle_and_pooling_info_types_return_hy096`).
