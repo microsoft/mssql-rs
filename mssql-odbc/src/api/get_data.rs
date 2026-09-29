@@ -1454,18 +1454,15 @@ fn write_captured_column(
         let all = encoded.bytes.as_ref();
         let bytes = &all[offset.min(all.len())..];
         let consumed = buf_elements.saturating_sub(1).min(bytes.len());
-        let mut rc = write_string_result(
+        let rc = write_string_result(
             stmt_state,
             bytes,
             target_value_ptr as *mut u8,
             buf_elements,
             strlen_or_ind_ptr,
         );
-        if encoded.had_loss && stmt_state.text_output.warn_on_loss {
+        if encoded.had_loss && stmt_state.text_output.warn_on_loss && rc == SQL_SUCCESS_WITH_INFO {
             post_diag(stmt_state, WARN_CODE_PAGE_CONVERSION_LOSS);
-            if rc == SQL_SUCCESS {
-                rc = SQL_SUCCESS_WITH_INFO;
-            }
         }
         (rc, consumed, bytes.len())
     };
@@ -2053,14 +2050,11 @@ fn stream_active_plp_chunk_once<'a>(
             stream_state
         };
     let is_unicode_plp = matches!(plp_encoding, Some(PlpEncoding::Utf16Text));
-    // SQL_C_CHAR delivery of a UTF-16 PLP column must transcode on the fly.
+    // Character delivery decodes the wire incrementally to Unicode, then
+    // encodes complete text into the client code page.
     let transcode_utf16_to_utf8 = target_type == SQL_C_CHAR && is_unicode_plp;
-    // SQL_C_CHAR delivery of a codepage-text PLP column must decode through the
-    // column's collation on the fly (AB#47566). A column already UTF-8 on the
-    // wire (json, or a UTF-8 collation) is excluded: it is already in the target
-    // encoding, so the verbatim copy below is both correct and cheaper, and
-    // running it through a decoder would only risk turning an invalid sequence
-    // into U+FFFD.
+    // UTF-8 wire text (including json) is verbatim only for a UTF-8 client.
+    // Other narrow sources still decode through their own collation (AB#47566).
     let transcode_narrow_to_utf8 = target_type == SQL_C_CHAR
         && matches!(
             plp_encoding,
@@ -2709,13 +2703,9 @@ fn stream_active_plp_chunk_once<'a>(
         // writable for one `SqlLen`.
         unsafe { write_if_some(strlen_or_ind_ptr, usable as SqlLen) };
     } else if transcode_utf16_to_utf8 {
-        // The wire carries nvarchar as UTF-16; the caller asked for UTF-8
-        // (SQL_C_CHAR). A code unit or a surrogate pair split across a chunk
-        // boundary is carried on the input side (pending_byte /
-        // pending_high_surrogate). Output can overrun too: a surrogate pair
-        // becomes a 4-byte character, so a chunk may transcode to more UTF-8
-        // than the buffer holds. Transcode the whole chunk, copy only what
-        // fits, and keep the rest in pending_utf8 for the next call.
+        // Preserve split UTF-16 units/surrogates on input. The complete
+        // Unicode chunk is then encoded to client bytes; overflow stays in
+        // pending_bytes and is not encoded again on a continuation.
         {
             let Ok(mut ss) = stmt.inner.lock() else {
                 return SQL_ERROR;
@@ -2832,17 +2822,9 @@ fn stream_active_plp_chunk_once<'a>(
             write_if_some(strlen_or_ind_ptr, read as SqlLen);
         }
     } else if transcode_narrow_to_utf8 {
-        // varchar(max)/char/text under a non-UTF-8 collation. The wire carries
-        // codepage text and SQL_C_CHAR output is UTF-8, so the bytes must be
-        // decoded through the column's own collation — the same conversion
-        // `SqlString::to_utf8_string` performs on the non-PLP path, so a value
-        // delivered inline and the same value streamed agree byte for byte
-        // (AB#47566).
-        //
-        // The decoder carries a multi-byte sequence split across a chunk
-        // boundary (a DBCS collation puts two wire bytes on some characters),
-        // and pending_utf8 carries output the caller's buffer had no room for,
-        // since decoding expands: CP1252 0x80 is three UTF-8 bytes.
+        // The source decoder carries split wire characters. Only its newly
+        // produced Unicode suffix is encoded, leaving existing client-byte
+        // carry unchanged even when a caller buffer splits a DBCS character.
         {
             let Ok(mut ss) = stmt.inner.lock() else {
                 return SQL_ERROR;
@@ -3065,13 +3047,7 @@ fn stream_active_plp_chunk_once<'a>(
                 stmt_state.plp_prefetch_scratch = buffer;
             }
         }
-        let rc = if progress.code_page_loss && text_output.warn_on_loss {
-            post_diag(&mut stmt_state, WARN_CODE_PAGE_CONVERSION_LOSS);
-            SQL_SUCCESS_WITH_INFO
-        } else {
-            SQL_SUCCESS
-        };
-        return finish_get_data(stmt, statement_handle, stmt_state, col_index, rc);
+        return finish_get_data(stmt, statement_handle, stmt_state, col_index, SQL_SUCCESS);
     }
 
     // active_plp already holds this column's stream state; leave it in place so
@@ -5237,7 +5213,7 @@ mod tests {
     }
 
     #[test]
-    fn client_code_page_loss_warns_only_when_requested_and_does_not_leak() {
+    fn client_code_page_loss_is_silent_when_the_result_fits() {
         for warn in [false, true] {
             let h = TestHandles::with_env_dbc_stmt();
             client_code_page(&h, 1252, warn);
@@ -5258,27 +5234,20 @@ mod tests {
                         &mut indicator,
                     )
                 },
-                if warn {
-                    SQL_SUCCESS_WITH_INFO
-                } else {
-                    SQL_SUCCESS
-                }
+                SQL_SUCCESS
             );
             assert_eq!(indicator, 1);
             assert_eq!(&output[..2], b"?\0");
             let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
             {
                 let state = stmt.inner.lock().unwrap();
-                if warn {
-                    assert_last_diag(&state.diag_records, WARN_CODE_PAGE_CONVERSION_LOSS);
-                } else {
-                    assert!(state.diag_records.is_empty());
-                }
+                assert!(state.diag_records.is_empty());
             }
             stmt_with_captured(
                 &h,
                 ColumnValues::String(SqlString::new(b"OK".to_vec(), EncodingType::Utf8)),
             );
+            stmt.inner.lock().unwrap().current_row_last_col = 0;
             assert_eq!(
                 unsafe {
                     sql_get_data(
@@ -8866,7 +8835,12 @@ mod tests {
                             };
                             assert!(
                                 rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO,
-                                "page {code_page}, source {source:?}, capacity {capacity}, rc {rc}"
+                                "page {code_page}, source {source:?}, capacity {capacity}, rc {rc}, received {received:?}, diagnostics {:?}",
+                                unsafe { handle_from_raw::<StmtHandle>(h.stmt) }
+                                    .inner
+                                    .lock()
+                                    .unwrap()
+                                    .diag_records
                             );
                             let length = output[..capacity as usize]
                                 .iter()

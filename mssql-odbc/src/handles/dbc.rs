@@ -136,8 +136,10 @@ pub(crate) struct DbcState {
     /// unconditionally would change the return code of every statement that
     /// carries text a legacy code page cannot hold.
     ///
-    /// Also reports retrieval loss when the client code page cannot represent
-    /// a column or output parameter. msodbcsql consults this flag only on
+    /// Also reports retrieval loss on the native warning path. A converted
+    /// result that fits bypasses that path, even when this flag is set
+    /// (`sqlcdata.h:1210-1217`, measured on Windows msodbcsql 18.6.1.1).
+    /// msodbcsql consults this flag only on
     /// retrieval (`sqlcdata.h:1297,1310`); retaining our input-parameter warning
     /// is the remaining deviation in parity-deviations entry 22 (AB#47598).
     pub(crate) warn_on_cp_error: bool,

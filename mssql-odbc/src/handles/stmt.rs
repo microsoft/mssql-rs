@@ -212,7 +212,15 @@ impl ActivePlpStream {
             .len()
             .saturating_sub(self.prefetched_offset);
         if remaining == 0 {
-            return None;
+            // Conversion overflow can outlive the final wire chunk. Preserve
+            // EOF while that output is drained instead of resuming the client.
+            return self.prefetched_reached_end.then_some((
+                0,
+                true,
+                self.prefetched_known_total,
+                self.prefetched_total_read_before
+                    .saturating_add(self.prefetched_offset),
+            ));
         }
 
         let read = remaining.min(out.len());
@@ -1903,6 +1911,11 @@ mod tests {
             Some((4, true, Some(14), 14))
         );
         assert_eq!(&second[..4], &[3, 4, 5, 6]);
+        assert_eq!(
+            stream.read_prefetched_wire(&mut second),
+            Some((0, true, Some(14), 14))
+        );
+        stream.take_prefetch_buffer();
         assert_eq!(stream.read_prefetched_wire(&mut second), None);
     }
 

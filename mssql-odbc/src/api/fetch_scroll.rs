@@ -2416,9 +2416,20 @@ unsafe fn deliver_bound_client_plp(
     let mut loss = false;
     let mut conversion_error = None;
     let mut wire_total: Option<u64>;
+    let narrow_source = matches!(
+        column_info.wire_encoding,
+        PlpEncoding::SingleByteText | PlpEncoding::Utf8Text
+    );
+    let mut converted_bytes = 0_usize;
+    let mut converted_wire_read = 0_usize;
 
     loop {
-        let chunk = runtime.block_on(client.read_active_plp_chunk(scratch))?;
+        let read_limit = if narrow_source && !truncated {
+            capacity.saturating_sub(produced).max(1).min(scratch.len())
+        } else {
+            scratch.len()
+        };
+        let chunk = runtime.block_on(client.read_active_plp_chunk(&mut scratch[..read_limit]))?;
         wire_total = chunk.known_total;
         if !truncated && conversion_error.is_none() {
             decoded.clear();
@@ -2438,6 +2449,8 @@ unsafe fn deliver_bound_client_plp(
                 let text =
                     std::str::from_utf8(&decoded).map_err(|_| ERR_INVALID_CHARACTER_VALUE)?;
                 let encoded = text_output.encoding.encode(text)?;
+                converted_bytes = converted_bytes.saturating_add(encoded.bytes.len());
+                converted_wire_read = chunk.total_read;
                 let take = text_output
                     .encoding
                     .prefix_len(&encoded.bytes, capacity.saturating_sub(produced))?;
@@ -2464,6 +2477,30 @@ unsafe fn deliver_bound_client_plp(
             if let Err(diag) = converted {
                 conversion_error = Some(RowOutcome::Error(diag.into()));
             }
+            if narrow_source
+                && truncated
+                && !chunk.reached_end
+                && let Some(decoder) = decoder.as_mut()
+            {
+                decoded.resize(decoder.max_utf8_buffer_length(0).unwrap_or(16), 0);
+                let (result, _, written) =
+                    decoder.decode_to_utf8_without_replacement(&[], &mut decoded, true);
+                if let encoding_rs::DecoderResult::Malformed(length, after) = result {
+                    converted_wire_read = converted_wire_read
+                        .saturating_sub(usize::from(length) + usize::from(after));
+                }
+                if written != 0 {
+                    let converted = std::str::from_utf8(&decoded[..written])
+                        .map_err(|_| ERR_INVALID_CHARACTER_VALUE)
+                        .and_then(|text| text_output.encoding.encode(text));
+                    match converted {
+                        Ok(encoded) => {
+                            converted_bytes = converted_bytes.saturating_add(encoded.bytes.len());
+                        }
+                        Err(diag) => conversion_error = Some(RowOutcome::Error(diag.into())),
+                    }
+                }
+            }
         }
         if chunk.reached_end {
             break;
@@ -2483,6 +2520,8 @@ unsafe fn deliver_bound_client_plp(
                     false,
                     wire_total.and_then(|total| total.checked_mul(width as u64)),
                 )
+            } else if truncated && narrow_source {
+                converted_narrow_indicator(wire_total, converted_wire_read, converted_bytes)
             } else if truncated {
                 SQL_NO_TOTAL
             } else {
@@ -3384,8 +3423,15 @@ mod tests {
                     );
                     assert_eq!(
                         length,
-                        if take < expected.len() {
+                        if take < expected.len() && wire_encoding == PlpEncoding::Utf16Text {
                             SQL_NO_TOTAL
+                        } else if take == 0
+                            && had_loss
+                            && wire_encoding == PlpEncoding::SingleByteText
+                        {
+                            // One two-byte source character was converted to
+                            // one substitute; the unread pair is still wire bytes.
+                            (source.len() - 1) as SqlLen
                         } else {
                             expected.len() as SqlLen
                         }

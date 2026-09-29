@@ -166,8 +166,10 @@ the client's encoding.
 This applies to `SQLGetData`, bound-column fetches, and procedure output
 parameters, including streamed character values. Characters that cannot be
 represented use the platform's best-fit/substitution behavior. Set
-`SQL_COPT_SS_WARN_ON_CP_ERROR` to `SQL_WARN_YES` to receive `01000` and
-`SQL_SUCCESS_WITH_INFO` when conversion reports data loss.
+`SQL_COPT_SS_WARN_ON_CP_ERROR` to `SQL_WARN_YES` to include `01000` when
+retrieval truncates and conversion reports loss. Like msodbcsql, a converted
+result that fits returns success without a loss warning, even with this
+option enabled; do not use the option as a guarantee of lossless retrieval.
 
 Use `SQL_C_WCHAR` for lossless Unicode retrieval; it remains UTF-16LE.
 `SQL_C_BINARY` continues to return unconverted wire bytes. mssql-python's
