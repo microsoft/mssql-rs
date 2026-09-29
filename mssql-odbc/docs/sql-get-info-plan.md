@@ -98,7 +98,7 @@ claim them as such.
 |---|---:|---|
 | `SQL_ASYNC_MODE` | `SQL_AM_NONE` | msodbcsql advertises statement async. Planned Phase 15 in `plan.md`. |
 | `SQL_MAX_ASYNC_CONCURRENT_STATEMENTS` | `0` | msodbcsql reports `1`; this driver has no async yet (`SQL_ASYNC_MODE = SQL_AM_NONE`), so it advertises no async statements. Becomes `1` with Phase 15. |
-| `SQL_ODBC_INTERFACE_CONFORMANCE` | `SQL_OIC_CORE` | msodbcsql reports Level 2; `SQLSetPos` / `SQLBulkOperations` and some catalog functions are unimplemented, so only Core is claimed (`docs/odbc-escape-sequences-plan.md`). |
+| `SQL_ODBC_INTERFACE_CONFORMANCE` | `0` | msodbcsql reports Level 2. The Core interface set requires `SQLGetCursorName` / `SQLSetCursorName`, which are unimplemented (and absent from `SQLGetFunctions`), so no named level is fully met; `0` rather than an overstated `SQL_OIC_CORE`. Rises to Core with Phase 10 cursor-name support. |
 | `SQL_DYNAMIC_CURSOR_ATTRIBUTES1/2` | `0` | Dynamic cursors are not implemented. Planned Phase 10 in `plan.md`. |
 | `SQL_FORWARD_ONLY_CURSOR_ATTRIBUTES1` | `SQL_CA1_NEXT` | Only next-oriented forward fetch is implemented. Additional cursor operations belong to Phase 10. |
 | `SQL_FORWARD_ONLY_CURSOR_ATTRIBUTES2` | `SQL_CA2_READ_ONLY_CONCURRENCY \| SQL_CA2_MAX_ROWS_SELECT` | Reports only implemented concurrency and `SQL_ATTR_MAX_ROWS`; the broader msodbcsql mask belongs to Phase 10. |

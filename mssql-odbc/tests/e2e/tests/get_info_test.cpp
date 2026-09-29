@@ -606,9 +606,10 @@ TEST_F(GetInfoLiveTest, WorkItem47996U32ValuesMatchMsodbcsql) {
 
 // AB#47996: capability-ledger values that describe this driver rather than
 // msodbcsql. Async is unimplemented (`SQL_ASYNC_MODE = SQL_AM_NONE`), so no
-// async statements are advertised; the interface conformance is Core, not the
-// Level 2 msodbcsql claims, because `SQLSetPos`/`SQLBulkOperations` and some
-// catalog functions are not implemented. Both intentionally diverge from
+// async statements are advertised; the interface conformance is 0, not the
+// Level 2 msodbcsql claims, because the Core set itself is not fully met
+// (`SQLGetCursorName`/`SQLSetCursorName` are unimplemented) let alone the Level
+// 2 `SQLSetPos`/`SQLBulkOperations` surface. Both intentionally diverge from
 // retail, so the comparison leg is skipped.
 TEST_F(GetInfoLiveTest, WorkItem47996CapabilitiesDescribeThisDriver) {
     SKIP_IF_COMPARING_MSODBCSQL();
@@ -617,7 +618,7 @@ TEST_F(GetInfoLiveTest, WorkItem47996CapabilitiesDescribeThisDriver) {
     const Case cases[] = {
         {SQL_MAX_ASYNC_CONCURRENT_STATEMENTS, 0u,
          "SQL_MAX_ASYNC_CONCURRENT_STATEMENTS"},
-        {SQL_ODBC_INTERFACE_CONFORMANCE, SQL_OIC_CORE,
+        {SQL_ODBC_INTERFACE_CONFORMANCE, 0u,
          "SQL_ODBC_INTERFACE_CONFORMANCE"},
         // SQLSetPos is unimplemented (planned Phase 10), so this driver
         // advertises no positioned operations or lock types, unlike retail.

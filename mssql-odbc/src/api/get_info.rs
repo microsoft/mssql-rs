@@ -139,7 +139,6 @@ const SQL_IK_ALL: u32 = 0x0000_0001 | 0x0000_0002;
 const SQL_IS_INSERT_LITERALS: u32 = 0x0000_0001;
 const SQL_IS_INSERT_SEARCHED: u32 = 0x0000_0002;
 const SQL_IS_SELECT_INTO: u32 = 0x0000_0004;
-const SQL_OIC_CORE: u32 = 1;
 const SQL_SCC_ISO92_CLI: u32 = 0x0000_0002;
 const SQL_QL_START: u16 = 0x0001;
 const SQL_NNC_NON_NULL: u16 = 0x0001;
@@ -513,10 +512,13 @@ const STATIC_INFO: &[InfoEntry] = &[
     },
     InfoEntry {
         info_type: odbc::SQL_ODBC_INTERFACE_CONFORMANCE,
-        // Core, not msodbcsql's Level 2: `SQLSetPos` / `SQLBulkOperations` and
-        // some catalog functions are unimplemented, so the Level 2 surface is
-        // not present (`docs/odbc-escape-sequences-plan.md`). Capability ledger.
-        value: InfoValue::U32(SQL_OIC_CORE),
+        // 0, not msodbcsql's Level 2 nor even Core: the Core interface set
+        // requires `SQLGetCursorName` / `SQLSetCursorName`, which are
+        // unimplemented (and correctly absent from `SQLGetFunctions`), so no
+        // named conformance level is fully met. Rises to Core when cursor-name
+        // support lands with Phase 10 (`docs/odbc-escape-sequences-plan.md`).
+        // Capability ledger, not parity.
+        value: InfoValue::U32(0),
     },
     InfoEntry {
         info_type: odbc::SQL_STANDARD_CLI_CONFORMANCE,
@@ -1914,7 +1916,7 @@ mod tests {
             (odbc::SQL_SQL92_NUMERIC_VALUE_FUNCTIONS, 0),
             (odbc::SQL_MAX_INDEX_SIZE, SQL_SERVER_MAX_INDEX_SIZE),
             (odbc::SQL_MAX_ASYNC_CONCURRENT_STATEMENTS, 0),
-            (odbc::SQL_ODBC_INTERFACE_CONFORMANCE, SQL_OIC_CORE),
+            (odbc::SQL_ODBC_INTERFACE_CONFORMANCE, 0),
             (odbc::SQL_STANDARD_CLI_CONFORMANCE, SQL_SCC_ISO92_CLI),
         ] {
             let (rc, val, len) = get_u32(h.dbc, info_type);
