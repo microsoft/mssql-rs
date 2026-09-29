@@ -1797,6 +1797,19 @@ fn client_text_outcome(truncated: bool, loss: bool) -> RowOutcome {
     }
 }
 
+fn client_hex_pair_width(text_output: TextOutput) -> Result<usize, DiagMsg> {
+    let width = text_output.encoding.encode("00")?.bytes.len();
+    if width == 0 {
+        Err(ERR_INTERNAL_CONVERSION)
+    } else {
+        Ok(width)
+    }
+}
+
+fn whole_pair_capacity(capacity: usize, pair_width: usize) -> usize {
+    capacity / pair_width * pair_width
+}
+
 /// A truncated tail was not delivered; only substitutions in the delivered
 /// prefix should generate the optional loss warning.
 fn client_prefix_loss(
@@ -2383,14 +2396,28 @@ unsafe fn deliver_bound_client_plp(
     } else {
         stride.saturating_sub(1)
     };
+    let hex_pair_width = if decoder.is_none() {
+        match client_hex_pair_width(text_output) {
+            Ok(width) => Some(width),
+            Err(diag) => {
+                drain_plp_to_end(client, runtime, scratch)?;
+                return Ok(RowOutcome::Error(diag.into()));
+            }
+        }
+    } else {
+        None
+    };
+    let capacity = hex_pair_width.map_or(capacity, |width| whole_pair_capacity(capacity, width));
     let mut decoded = Vec::new();
     let mut produced = 0_usize;
     let mut truncated = false;
     let mut loss = false;
     let mut conversion_error = None;
+    let mut wire_total: Option<u64>;
 
     loop {
         let chunk = runtime.block_on(client.read_active_plp_chunk(scratch))?;
+        wire_total = chunk.known_total;
         if !truncated && conversion_error.is_none() {
             decoded.clear();
             if let Some(decoder) = decoder.as_mut() {
@@ -2447,7 +2474,14 @@ unsafe fn deliver_bound_client_plp(
         clear_stale_null_indicator(indicator, length);
         write_if_some(
             length,
-            if truncated {
+            if let Some(width) = hex_pair_width {
+                plp_indicator(
+                    produced,
+                    truncated,
+                    false,
+                    wire_total.and_then(|total| total.checked_mul(width as u64)),
+                )
+            } else if truncated {
                 SQL_NO_TOTAL
             } else {
                 SqlLen::try_from(produced).unwrap_or(SqlLen::MAX)
@@ -2744,7 +2778,19 @@ unsafe fn deliver_bound(
 
     let buf_elements = char_buf_elements(binding.target_type, stride);
     let buf_elements = if matches!(value, ColumnValues::Bytes(_)) {
-        hex_buffer_elements(buf_elements)
+        if binding.target_type == SQL_C_CHAR && !text_output.encoding.is_ascii_compatible() {
+            let width = match client_hex_pair_width(text_output) {
+                Ok(width) => width,
+                Err(diag) => return RowOutcome::Error(diag.into()),
+            };
+            if buf_elements == 0 {
+                0
+            } else {
+                whole_pair_capacity(buf_elements - 1, width) + 1
+            }
+        } else {
+            hex_buffer_elements(buf_elements)
+        }
     } else {
         buf_elements
     };
@@ -3024,6 +3070,123 @@ mod tests {
             assert_eq!(output[1][expected.len()], 0);
             assert_eq!(lengths, [-99, expected.len() as SqlLen]);
         }
+    }
+
+    #[test]
+    fn bound_hex_capacity_keeps_whole_encoded_pairs() {
+        for width in [2, 4, 8] {
+            for capacity in 0..=24 {
+                let take = whole_pair_capacity(capacity, width);
+                assert!(take <= capacity);
+                assert_eq!(take % width, 0);
+                assert!(capacity - take < width);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bound_non_ascii_compatible_client_keeps_hex_pairs_and_lengths() {
+        use mssql_mock_tds::{ColumnDefinition, ColumnValue, QueryResponse, Row, SqlDataType};
+
+        let text_output = client_output(12000, false);
+        let expected: Vec<u8> = "ABCD"
+            .chars()
+            .flat_map(|ch| u32::from(ch).to_le_bytes())
+            .collect();
+        let value = ColumnValues::Bytes(vec![0xab, 0xcd]);
+        let response = QueryResponse::new(
+            vec![
+                ColumnDefinition::new("", SqlDataType::NVarCharMax),
+                ColumnDefinition::new("", SqlDataType::Int),
+            ],
+            vec![Row::new(vec![
+                ColumnValue::NVarCharMax(vec![vec![0xcdab]]),
+                ColumnValue::Int(42),
+            ])],
+        );
+        let h = TestHandles::with_env_dbc_stmt();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let _server = crate::test_support::connect_mock_server(dbc, "SELECT native_hex", response);
+        let mut state = dbc.inner.lock().unwrap();
+        let client = state.client.as_mut().unwrap();
+        for capacity in 0..=expected.len() + 1 {
+            let take = whole_pair_capacity(capacity.saturating_sub(1), 8);
+            for plp in [false, true] {
+                let mut output = [0xcc_u8; 24];
+                let mut length = -99;
+                let binding = binding(
+                    1,
+                    SQL_C_CHAR,
+                    output.as_mut_ptr().cast(),
+                    capacity as SqlLen,
+                    &mut length,
+                );
+                let outcome = if plp {
+                    dbc.runtime
+                        .block_on(client.execute("SELECT native_hex".into(), ()))
+                        .unwrap();
+                    assert!(dbc.runtime.block_on(client.next_row_cursor()).unwrap());
+                    assert!(matches!(
+                        dbc.runtime.block_on(client.read_row_column(0)).unwrap(),
+                        CursorColumn::PlpStreaming { .. }
+                    ));
+                    let mut scratch = [0; 1];
+                    let outcome = unsafe {
+                        deliver_bound_plp(
+                            client,
+                            &dbc.runtime,
+                            &binding,
+                            0,
+                            0,
+                            Some(PlpColumnInfo {
+                                wire_encoding: PlpEncoding::Binary,
+                                text_encoding: None,
+                            }),
+                            &mut scratch,
+                            text_output,
+                        )
+                    }
+                    .unwrap();
+                    assert!(matches!(
+                        dbc.runtime.block_on(client.read_row_column(1)).unwrap(),
+                        CursorColumn::Value {
+                            value: ColumnValues::Int(42),
+                            ..
+                        }
+                    ));
+                    assert!(!dbc.runtime.block_on(client.next_row_cursor()).unwrap());
+                    outcome
+                } else {
+                    unsafe { deliver_bound_value(&binding, &value, text_output) }
+                };
+                assert_eq!(outcome, client_text_outcome(take < expected.len(), false));
+                assert_eq!(length, 16);
+                assert_eq!(&output[..take], &expected[..take]);
+                if capacity > 0 {
+                    assert_eq!(output[take], 0);
+                }
+                assert!(output[capacity..].iter().all(|byte| *byte == 0xcc));
+            }
+        }
+        let mut output = [0xcc_u8; 16];
+        let mut length = -99;
+        let binding = binding(1, SQL_C_CHAR, output.as_mut_ptr().cast(), 16, &mut length);
+        assert_eq!(
+            unsafe {
+                deliver_encoded_string(
+                    &binding,
+                    0,
+                    0,
+                    Cow::Borrowed(b"AB"),
+                    EncodingType::Utf8,
+                    text_output,
+                )
+            },
+            RowOutcome::Success
+        );
+        assert_eq!(length, 8);
+        assert_eq!(&output[..9], b"A\0\0\0B\0\0\0\0");
     }
 
     #[test]

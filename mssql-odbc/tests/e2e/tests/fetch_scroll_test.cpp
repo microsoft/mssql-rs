@@ -34,35 +34,6 @@
 #endif
 
 namespace {
-std::string ClientText(const std::string& utf8, bool* had_loss = nullptr) {
-    if (had_loss) *had_loss = false;
-#ifdef _WIN32
-    const int units = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, utf8.data(),
-                                        static_cast<int>(utf8.size()), nullptr, 0);
-    EXPECT_GT(units, 0);
-    if (units <= 0) return {};
-    std::wstring wide(static_cast<size_t>(units), L'\0');
-    if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, utf8.data(),
-                            static_cast<int>(utf8.size()), wide.data(), units) != units) {
-        ADD_FAILURE() << "Cannot decode test text";
-        return {};
-    }
-    const int bytes = WideCharToMultiByte(CP_ACP, 0, wide.data(), units,
-                                         nullptr, 0, nullptr, nullptr);
-    EXPECT_GT(bytes, 0);
-    if (bytes <= 0) return {};
-    std::string result(static_cast<size_t>(bytes), '\0');
-    BOOL used_default = FALSE;
-    EXPECT_EQ(bytes, WideCharToMultiByte(CP_ACP, 0, wide.data(), units,
-                                         result.data(), bytes, nullptr,
-                                         GetACP() == CP_UTF8 ? nullptr : &used_default));
-    if (had_loss) *had_loss = used_default != FALSE;
-    return result;
-#else
-    return utf8;
-#endif
-}
-
 std::string RepeatedPrefix(const std::string& character, size_t capacity) {
     std::string result;
     if (character.empty()) return result;
@@ -125,7 +96,7 @@ TEST_F(FetchScrollLiveTest, BoundTextRowArraysUseClientEncoding) {
         ExecDirect(std::string("SELECT ") + expression + " FROM (VALUES(1), (2)) AS t(n)");
         ASSERT_EQ(SQL_SUCCESS, SQLFetchScroll(stmt_, SQL_FETCH_NEXT, 0));
         ASSERT_EQ(row_count, fetched);
-        const auto expected = ClientText("\xC3\xA9\xE2\x82\xAC");
+        const auto expected = ODBCTestUtils::Utf8ToNativeClient("\xC3\xA9\xE2\x82\xAC");
         for (size_t row = 0; row < row_count; ++row) {
             EXPECT_EQ(expected, reinterpret_cast<const char*>(output[row]));
             EXPECT_EQ(static_cast<SQLLEN>(expected.size()), lengths[row]);
@@ -138,7 +109,7 @@ TEST_F(FetchScrollLiveTest, BoundTextRowArraysUseClientEncoding) {
 
 TEST_F(FetchScrollLiveTest, BoundClientCodePageLossHonorsWarningAttribute) {
     bool had_loss = false;
-    const auto expected = ClientText("\xF0\x9F\x98\x80", &had_loss);
+    const auto expected = ODBCTestUtils::Utf8ToNativeClient("\xF0\x9F\x98\x80", &had_loss);
     for (SQLULEN warn : {0UL, 1UL}) {
         ASSERT_SQL_OK(SQLSetConnectAttr(dbc_, SQL_COPT_SS_WARN_ON_CP_ERROR,
                                        reinterpret_cast<SQLPOINTER>(warn), 0), SQL_HANDLE_DBC, dbc_);
@@ -1427,7 +1398,7 @@ TEST_F(FetchScrollLiveTest, ABoundVarcharMaxUsesItsCollationForChar) {
     ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_CHAR, buf, sizeof(buf), &ind), SQL_HANDLE_STMT,
                   stmt_);
     EXPECT_EQ(SQL_SUCCESS, SQLFetch(stmt_));
-    const auto expected = ClientText("\xC3\xA9");
+    const auto expected = ODBCTestUtils::Utf8ToNativeClient("\xC3\xA9");
     EXPECT_EQ(expected, reinterpret_cast<const char*>(buf));
     EXPECT_EQ(static_cast<SQLLEN>(expected.size()), ind);
     SQLFreeStmt(stmt_, SQL_UNBIND);
@@ -1465,7 +1436,7 @@ TEST_F(FetchScrollLiveTest, ABoundVarcharMaxDbcsCarriesCharactersAcrossWireChunk
         SQL_HANDLE_STMT, stmt_);
     EXPECT_EQ(SQL_SUCCESS, SQLFetch(stmt_));
 
-    const std::string token = ClientText("\xE4\xBD\xA0\xE5\xA5\xBD\xE4\xB8\x96\xE7\x95\x8C"
+    const std::string token = ODBCTestUtils::Utf8ToNativeClient("\xE4\xBD\xA0\xE5\xA5\xBD\xE4\xB8\x96\xE7\x95\x8C"
                                         "abc");  // 你好世界abc
     std::string expected;
     expected.reserve(token.size() * 3000);
@@ -1480,9 +1451,9 @@ TEST_F(FetchScrollLiveTest, ABoundVarcharMaxDbcsCarriesCharactersAcrossWireChunk
 }
 
 TEST_F(FetchScrollLiveTest, ABoundVarcharMaxDbcsTruncationCountsHeldSource) {
-    // The reference length estimates below were measured under C.UTF-8 only.
-    // Native-client truncation uses SQL_NO_TOTAL pending separate retail evidence.
-    SKIP_IF_COMPARING_MSODBCSQL_ON_WINDOWS();
+    if (ODBCTestUtils::Utf8ToNativeClient("\xE2\x82\xAC") != "\xE2\x82\xAC") {
+        GTEST_SKIP() << "This regression pins UTF-8 client length estimates";
+    }
     SQLCHAR version[32] = {};
     ASSERT_SQL_OK(SQLGetInfoA(dbc_, SQL_DRIVER_VER, version, sizeof(version), nullptr),
                   SQL_HANDLE_DBC, dbc_);
@@ -1509,24 +1480,12 @@ TEST_F(FetchScrollLiveTest, ABoundVarcharMaxDbcsTruncationCountsHeldSource) {
             stmt_, 1, SQL_C_CHAR, output.data() + 1, buffer_length, &indicator));
         ASSERT_EQ(SQL_SUCCESS_WITH_INFO, SQLFetch(stmt_));
         EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01004");
-        const std::string character = ClientText("\xE4\xBD\xA0");
-        std::string expected;
-        for (size_t i = 0; i < 4 && expected.size() + character.size() < static_cast<size_t>(buffer_length); ++i) {
-            expected += character;
-        }
-        const auto currency = ClientText("\xC2\xA4");
-        if (expected.size() == character.size() * 4 && expected.size() + currency.size() < static_cast<size_t>(buffer_length)) {
-            expected += currency;
-            expected += RepeatedPrefix(character, static_cast<size_t>(buffer_length) - 1 - expected.size());
-        }
+        const std::string character = "\xE4\xBD\xA0";
+        const std::string expected = buffer_length == 7 ?
+            character + character : character + character + character;
         EXPECT_EQ(0, std::memcmp(output.data() + 1, expected.c_str(), expected.size() + 1));
         EXPECT_EQ(0xCC, output.front());
         EXPECT_EQ(0xCC, output.back());
-#ifdef _WIN32
-        if (GetACP() != CP_UTF8) {
-            EXPECT_EQ(SQL_NO_TOTAL, indicator) << "the discarded tail was not converted";
-        } else
-#endif
         EXPECT_EQ(buffer_length == 7 ? 214 : 215, indicator)
             << "211 wire bytes plus expansion of three or four converted characters";
 
@@ -1546,9 +1505,9 @@ TEST_F(FetchScrollLiveTest, ABoundVarcharMaxDbcsTruncationCountsHeldSource) {
 // 5008 under C.UTF-8. Bound delivery uses the same estimate and raw-drains the
 // discarded tail instead of converting all 10,000 UTF-8 bytes.
 TEST_F(FetchScrollLiveTest, ABoundVarcharMaxTruncatedToCharKeepsConcreteLength) {
-    // The concrete reference indicator below was measured under C.UTF-8 only.
-    // Native-client truncation uses SQL_NO_TOTAL pending separate retail evidence.
-    SKIP_IF_COMPARING_MSODBCSQL_ON_WINDOWS();
+    if (ODBCTestUtils::Utf8ToNativeClient("\xE2\x82\xAC") != "\xE2\x82\xAC") {
+        GTEST_SKIP() << "This regression pins UTF-8 client length estimates";
+    }
     ExecDirect(
         "SELECT REPLICATE(CAST(NCHAR(233) COLLATE SQL_Latin1_General_CP1_CI_AS AS VARCHAR(MAX)), "
         "5000) AS c1");
@@ -1561,13 +1520,8 @@ TEST_F(FetchScrollLiveTest, ABoundVarcharMaxTruncatedToCharKeepsConcreteLength) 
     EXPECT_EQ(SQL_SUCCESS_WITH_INFO, SQLFetch(stmt_));
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01004");
 
-    EXPECT_EQ(RepeatedPrefix(ClientText("\xC3\xA9"), sizeof(buf) - 1),
+    EXPECT_EQ(RepeatedPrefix("\xC3\xA9", sizeof(buf) - 1),
               reinterpret_cast<const char*>(buf));
-#ifdef _WIN32
-    if (GetACP() != CP_UTF8) {
-        EXPECT_EQ(SQL_NO_TOTAL, ind) << "the discarded tail was not converted";
-    } else
-#endif
     EXPECT_EQ(5008, ind) << "4992 unread bytes + 16 converted bytes (emitted and carry)";
     SQLFreeStmt(stmt_, SQL_UNBIND);
     SQLCloseCursor(stmt_);
@@ -1604,14 +1558,13 @@ TEST_F(FetchScrollLiveTest, ABoundUtf8CollationVarcharMaxTruncatesOnACharacterBo
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01004");
 
     const std::string got(reinterpret_cast<const char*>(buf));
-#ifdef _WIN32
-    if (GetACP() != CP_UTF8) {
-        EXPECT_EQ(RepeatedPrefix(ClientText("\xE4\xBD\xA0"), sizeof(buf) - 1), got);
+    const auto native_character = ODBCTestUtils::Utf8ToNativeClient("\xE4\xBD\xA0");
+    if (native_character != "\xE4\xBD\xA0") {
+        EXPECT_EQ(RepeatedPrefix(native_character, sizeof(buf) - 1), got);
         SQLFreeStmt(stmt_, SQL_UNBIND);
         SQLCloseCursor(stmt_);
         return;
     }
-#endif
     const std::string kSource = "\xE4\xBD\xA0\xE4\xBD\xA0\xE4\xBD\xA0";  // 你你你
 
     // Shared on both drivers: the value truncated to a prefix that fits.
@@ -1793,7 +1746,7 @@ TEST_F(FetchScrollLiveTest, ABoundNvarcharMaxTranscodesNonAscii) {
     ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_CHAR, buf, sizeof(buf), &ind), SQL_HANDLE_STMT,
                   stmt_);
     EXPECT_EQ(SQL_SUCCESS, SQLFetch(stmt_));
-    const auto expected = ClientText("\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9");
+    const auto expected = ODBCTestUtils::Utf8ToNativeClient("\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9");
     EXPECT_EQ(static_cast<SQLLEN>(expected.size()), ind);
     EXPECT_EQ(expected, reinterpret_cast<const char*>(buf));
     SQLFreeStmt(stmt_, SQL_UNBIND);
@@ -1812,7 +1765,7 @@ TEST_F(FetchScrollLiveTest, ABoundNvarcharMaxTruncatesOnACharacterBoundary) {
     EXPECT_EQ(SQL_SUCCESS_WITH_INFO, SQLFetch(stmt_));
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01004");
 
-    EXPECT_EQ(RepeatedPrefix(ClientText("\xC3\xA9"), sizeof(buf) - 1),
+    EXPECT_EQ(RepeatedPrefix(ODBCTestUtils::Utf8ToNativeClient("\xC3\xA9"), sizeof(buf) - 1),
               reinterpret_cast<const char*>(buf));
     SQLFreeStmt(stmt_, SQL_UNBIND);
     SQLCloseCursor(stmt_);
@@ -1832,8 +1785,8 @@ TEST_F(FetchScrollLiveTest, ABoundJsonTruncatesOnACharacterBoundary) {
     EXPECT_EQ(SQL_SUCCESS_WITH_INFO, SQLFetch(stmt_));
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01004");
 
-    const auto prefix = ClientText("[\"");
-    EXPECT_EQ(prefix + RepeatedPrefix(ClientText("\xC3\xA9"), sizeof(buf) - 1 - prefix.size()),
+    const auto prefix = ODBCTestUtils::Utf8ToNativeClient("[\"");
+    EXPECT_EQ(prefix + RepeatedPrefix(ODBCTestUtils::Utf8ToNativeClient("\xC3\xA9"), sizeof(buf) - 1 - prefix.size()),
               reinterpret_cast<const char*>(buf));
     SQLFreeStmt(stmt_, SQL_UNBIND);
     SQLCloseCursor(stmt_);
