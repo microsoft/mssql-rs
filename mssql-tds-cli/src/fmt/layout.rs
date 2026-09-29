@@ -22,6 +22,8 @@ pub enum Format {
     Vertical,
     /// A `+---+` bordered table.
     Ascii,
+    /// One JSON document containing metadata and ordered command output.
+    Json,
 }
 
 impl Format {
@@ -31,6 +33,7 @@ impl Format {
         match value.trim().to_ascii_lowercase().as_str() {
             "vert" | "vertical" => Format::Vertical,
             "ascii" => Format::Ascii,
+            "json" => Format::Json,
             _ => Format::Horizontal,
         }
     }

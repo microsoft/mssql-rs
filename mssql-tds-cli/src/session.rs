@@ -15,6 +15,7 @@ use crate::exec::connect;
 use crate::exec::runner::{self, Output, RunStyle};
 use crate::exitcode;
 use crate::fmt::color::{self, Colorizer, TextType};
+use crate::fmt::json;
 use crate::fmt::layout::Format;
 use crate::fmt::report;
 use crate::fmt::table::TableStyle;
@@ -57,6 +58,7 @@ pub struct Session {
     /// `SQLCMDCOLORSCHEME`. Inactive unless a known scheme is named and the
     /// results are going to a terminal.
     colors: Colorizer,
+    json: Option<json::Document>,
 }
 
 impl Session {
@@ -101,6 +103,7 @@ impl Session {
             vars.get("SQLCMDCOLORSCHEME").unwrap_or_default(),
             options.output_file.is_none() && color::stdout_is_terminal(),
         );
+        let json = (format == Format::Json).then(|| json::Document::new(&options));
 
         Ok(Self {
             on_error: if options.exit_on_error {
@@ -124,16 +127,26 @@ impl Session {
             xml_mode: false,
             format,
             colors,
+            json,
         })
     }
 
     /// Connects, runs whatever the options ask for, and returns the exit code.
     pub async fn run(mut self) -> i32 {
+        let exit_code = self.run_inner().await;
+        if let Some(document) = self.json.take() {
+            self.results.write(&document.render(exit_code));
+            self.results.flush();
+        }
+        exit_code
+    }
+
+    async fn run_inner(&mut self) -> i32 {
         // `-L` never connects; it asks the network who is out there.
         if self.options.list_servers {
             let listing = servers::list(self.options.list_servers_clean).await;
-            self.results.write(&listing);
-            self.results.flush();
+            self.write_text_result(&listing);
+            self.flush_text_results();
             return exitcode::SUCCESS;
         }
 
@@ -148,6 +161,9 @@ impl Session {
         }
 
         if let Err(text) = Box::pin(self.open_connection()).await {
+            if let Some(document) = &mut self.json {
+                document.push_client_error(&text);
+            }
             self.errors.write(&text);
             self.errors.flush();
             return exitcode::FAILURE;
@@ -155,7 +171,7 @@ impl Session {
 
         // `-Z` changes the password and stops; `-z` changes it and carries on.
         if self.options.exit_after_password_change {
-            self.results.flush();
+            self.flush_text_results();
             if let Some(client) = &mut self.client {
                 let _ = client.close_connection().await;
             }
@@ -233,7 +249,7 @@ impl Session {
             self.execute_cache(1).await;
         }
 
-        self.results.flush();
+        self.flush_text_results();
         self.errors.flush();
 
         if let Some(client) = &mut self.client {
@@ -344,8 +360,8 @@ impl Session {
 
     fn prompt(&mut self) {
         let number = self.batch.line_count() + 1;
-        self.results.write(&format!("{number}> "));
-        self.results.flush();
+        self.write_text_result(&format!("{number}> "));
+        self.flush_text_results();
     }
 
     /// The terminator to record for an input line.
@@ -380,7 +396,7 @@ impl Session {
                 // `-e` echoes the statement text only; terminators and colon
                 // commands are not part of what gets sent.
                 if self.options.echo_input {
-                    self.results.write(&format!("{text}{EOL}"));
+                    self.write_text_result(&format!("{text}{EOL}"));
                 }
                 None
             }
@@ -393,7 +409,7 @@ impl Session {
                 // blank line; go-sqlcmd runs them together.
                 if self.options.echo_input && !self.batch.is_empty() && !self.options.compat.is_go()
                 {
-                    self.results.write(EOL);
+                    self.write_text_result(EOL);
                 }
                 self.execute_cache(count).await;
                 self.stop_if_failed()
@@ -431,7 +447,7 @@ impl Session {
             Err(ParseError::NotACommand) => {
                 self.batch.push_text(raw, eol);
                 if self.options.echo_input {
-                    self.results.write(&format!("{raw}{EOL}"));
+                    self.write_text_result(&format!("{raw}{EOL}"));
                 }
                 return None;
             }
@@ -443,13 +459,13 @@ impl Session {
 
         match command {
             Command::Help => {
-                self.results.write(&crlf(commands::HELP));
+                self.write_text_result(&crlf(commands::HELP));
                 None
             }
             Command::Quit => Some(Stop::Requested(self.final_exit_code())),
             Command::Exit(form) => self.exit(form).await,
             Command::List => {
-                self.results.write(&crlf(self.batch.text()));
+                self.write_text_result(&crlf(self.batch.text()));
                 None
             }
             Command::ListColor => {
@@ -461,7 +477,7 @@ impl Session {
                     .iter()
                     .map(|name| format!("{name}: {SAMPLE}{EOL}"))
                     .collect();
-                self.results.write(&listing);
+                self.write_text_result(&listing);
                 None
             }
             Command::ListVar => {
@@ -471,7 +487,7 @@ impl Session {
                     .iter()
                     .map(|(name, value)| format!("{name} = \"{value}\"{EOL}"))
                     .collect();
-                self.results.write(&listing.concat());
+                self.write_text_result(&listing.concat());
                 None
             }
             Command::Reset => {
@@ -487,11 +503,25 @@ impl Session {
                 None
             }
             Command::Out(target) => {
-                self.redirect_results(&target);
+                if self.json.is_some() {
+                    self.errors.write(&messages::basic_errorinfo(
+                        "Sqlcmd",
+                        ":out is not supported with JSON output",
+                    ));
+                } else {
+                    self.redirect_results(&target);
+                }
                 None
             }
             Command::Error(target) => {
-                self.redirect_errors(&target);
+                if self.json.is_some() {
+                    self.errors.write(&messages::basic_errorinfo(
+                        "Sqlcmd",
+                        ":error is not supported with JSON output",
+                    ));
+                } else {
+                    self.redirect_errors(&target);
+                }
                 None
             }
             Command::OnError(action) => {
@@ -503,11 +533,25 @@ impl Session {
                 None
             }
             Command::Shell(line) => {
-                self.shell(&line);
+                if self.json.is_some() {
+                    self.errors.write(&messages::basic_errorinfo(
+                        "Sqlcmd",
+                        ":!! is not supported with JSON output",
+                    ));
+                } else {
+                    self.shell(&line);
+                }
                 None
             }
             Command::Editor => {
-                self.edit();
+                if self.json.is_some() {
+                    self.errors.write(&messages::basic_errorinfo(
+                        "Sqlcmd",
+                        ":ed is not supported with JSON output",
+                    ));
+                } else {
+                    self.edit();
+                }
                 None
             }
             Command::Xml(on) => {
@@ -615,7 +659,7 @@ impl Session {
                 self.batch.push_line(line, eol, &terminator);
             }
             // The reference shows the edited text back to you.
-            self.results.write(&crlf(self.batch.text()));
+            self.write_text_result(&crlf(self.batch.text()));
         }
         let _ = std::fs::remove_file(&path);
     }
@@ -843,11 +887,27 @@ impl Session {
             // Once a state-127 message has been seen the session is over, so
             // whatever the batch produced after it is discarded. Both
             // references drop the trailing result sets this way.
-            if self.terminating_message.is_some() && matches!(item, Output::Result(_)) {
+            if self.terminating_message.is_some()
+                && matches!(item, Output::Result(_) | Output::ResultSet { .. })
+            {
+                continue;
+            }
+            if let Some(document) = &mut self.json {
+                if let Output::Message(message) = &item {
+                    if message.state == exitcode::TERMINATING_STATE
+                        && self.terminating_message.is_none()
+                    {
+                        self.terminating_message = Some(message.number);
+                    }
+                }
+                document.push(item);
                 continue;
             }
             match item {
                 Output::Result(text) => self.results.write(&text),
+                Output::ResultSet { .. } | Output::RowsAffected(_) => {
+                    unreachable!("structured output is consumed by the JSON document")
+                }
                 Output::Message(message) => {
                     // State 127 ends the session once this outcome has been
                     // written out; the message itself is still reported, and
@@ -904,7 +964,7 @@ impl Session {
             }
         }
 
-        if self.options.print_statistics {
+        if self.options.print_statistics && self.json.is_none() {
             let stats = if self.options.statistics_colon_format {
                 report::perf_stats_colon(outcome.packet_size, 1, outcome.elapsed_ms)
             } else {
@@ -913,8 +973,20 @@ impl Session {
             self.results.write(&stats);
         }
 
-        self.results.flush();
+        self.flush_text_results();
         self.errors.flush();
+    }
+
+    fn write_text_result(&mut self, text: &str) {
+        if self.json.is_none() {
+            self.results.write(text);
+        }
+    }
+
+    fn flush_text_results(&mut self) {
+        if self.json.is_none() {
+            self.results.flush();
+        }
     }
 
     fn run_style(&self) -> RunStyle {

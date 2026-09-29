@@ -22,6 +22,14 @@ use crate::messages::EOL;
 pub enum Output {
     /// Rows, headings and row counts.
     Result(String),
+    /// A result set whose cell values retain the existing sqlcmd text
+    /// representation. `None` preserves SQL NULL separately from "NULL".
+    ResultSet {
+        columns: Vec<String>,
+        rows: Vec<Vec<Option<String>>>,
+    },
+    /// A DONE count emitted in command order.
+    RowsAffected(u64),
     /// Server messages, which `-r` may route elsewhere.
     Message(Message),
 }
@@ -152,6 +160,11 @@ fn report_counts(client: &mut TdsClient, outcome: &mut Outcome, style: &RunStyle
         return;
     }
     for count in counts.into_iter().flatten() {
+        if style.format == Format::Json {
+            outcome.output.push(Output::RowsAffected(count));
+            outcome.counted = true;
+            continue;
+        }
         let text = report::rows_affected(count, style.compat);
         // go-sqlcmd gaps a count only when it directly follows a result set's
         // rows; consecutive counts, and counts for statements that drew none,
@@ -191,6 +204,41 @@ async fn render_result_set(
     outcome: &mut Outcome,
 ) -> Result<(), TdsError> {
     let columns = client.get_metadata().clone();
+
+    if style.format == Format::Json {
+        let mut rows = Vec::new();
+        while let Some(row) = client.next_row().await? {
+            if outcome.first_cell.is_none() {
+                outcome.first_cell = row.first().cloned();
+            }
+            debug_assert_eq!(row.len(), columns.len());
+            rows.push(
+                row.iter()
+                    .zip(&columns)
+                    .map(|(cell, column)| {
+                        if matches!(
+                            cell,
+                            mssql_tds::datatypes::column_values::ColumnValues::Null
+                        ) {
+                            None
+                        } else {
+                            Some(value::render(cell, column, style.values()))
+                        }
+                    })
+                    .collect(),
+            );
+        }
+        outcome.output.push(Output::ResultSet {
+            columns: columns
+                .iter()
+                .map(|column| column.column_name.clone())
+                .collect(),
+            rows,
+        });
+        outcome.rendered_set = true;
+        outcome.counted = false;
+        return Ok(());
+    }
 
     if style.xml {
         let mut buffer = String::new();
@@ -287,6 +335,7 @@ async fn render_result_set(
             outcome.suppress_count_gap = true;
             return Ok(());
         }
+        Format::Json => unreachable!("JSON result sets are handled before table layout"),
     }
 
     outcome.output.push(Output::Result(buffer));

@@ -277,7 +277,12 @@ fn check_conflicts(lexed: &Lexed) -> Result<(), CliError> {
             "--authentication-method",
         )));
     }
-    if lexed.contains('L') && lexed.options.len() > 1 {
+    if lexed.contains('L')
+        && lexed
+            .options
+            .iter()
+            .any(|option| option.short != 'L' && option.short != spec::FORMAT)
+    {
         return Err(CliError::Stderr(messages::opt_single_usage('L')));
     }
     if lexed.contains('E')

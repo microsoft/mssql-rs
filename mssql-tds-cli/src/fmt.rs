@@ -4,6 +4,7 @@
 //! Turning result sets and server messages into text.
 
 pub mod color;
+pub mod json;
 pub mod layout;
 pub mod regional;
 pub mod report;

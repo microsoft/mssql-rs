@@ -41,3 +41,13 @@ cargo build -p mssql-tds-cli --features compat-go
 The crate also builds as a library with a small C ABI (`sqlcmd_modern_claims`,
 `sqlcmd_modern_main`), so the same implementation can be linked into the native
 ODBC `sqlcmd` and handle the modern command lines there.
+
+The native build enables this delegation when `SQLCMD_RUST_LIBRARY` names the
+`mssql_tds_cli` static library. `SQLCMD_RUST_NATIVE_LIBS` supplies the native
+libraries reported by the command below, and `SQLCMD_RUST_LIBRARY_DIRS` names
+their search directories when they are not on the platform linker's default
+path:
+
+```bash
+cargo rustc -p mssql-tds-cli --release --lib -- --print native-static-libs
+```

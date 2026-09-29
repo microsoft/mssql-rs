@@ -147,3 +147,28 @@ pub unsafe extern "C" fn sqlcmd_modern_main_w(argc: c_int, argv: *const *const u
         None => crate::exitcode::FAILURE,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::claims;
+
+    #[test]
+    fn format_is_owned_by_rust() {
+        assert!(claims(&[
+            "--format".to_string(),
+            "json".to_string(),
+            "-Q".to_string(),
+            "SELECT 1".to_string(),
+        ]));
+    }
+
+    #[test]
+    fn legacy_query_stays_on_the_native_path() {
+        assert!(!claims(&[
+            "-S".to_string(),
+            "localhost".to_string(),
+            "-Q".to_string(),
+            "SELECT 1".to_string(),
+        ]));
+    }
+}
