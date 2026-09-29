@@ -2074,7 +2074,13 @@ fn stream_active_plp_chunk_once<'a>(
         } else if transcode_utf16_to_utf8 {
             utf16le_max_read(payload_capacity, utf8_carry_len)
         } else if transcode_narrow_to_utf8 {
-            narrow_max_read(payload_capacity, utf8_carry_len)
+            // Without carry, read the whole room: delivery decodes only what fits
+            // and returns the rest to the stream unconverted.
+            if utf8_carry_len == 0 {
+                payload_capacity
+            } else {
+                narrow_max_read(payload_capacity, utf8_carry_len)
+            }
         } else {
             payload_capacity
         }
@@ -2313,7 +2319,9 @@ fn stream_active_plp_chunk_once<'a>(
 
     let read_result = if let Some(error) = prefetch_error {
         Err(error)
-    } else if let Some((read, reached_end, known_total, total_read)) = prefetched_read {
+    } else if let Some((read, reached_end, known_total, total_read)) = prefetched_read
+        && (reached_end || read == payload.len())
+    {
         Ok(PlpChunk {
             read,
             reached_end,
@@ -2322,136 +2330,27 @@ fn stream_active_plp_chunk_once<'a>(
         })
     } else {
         drop(retained_stmt_state.take());
-        let dbc = stmt.parent_dbc();
-        let mut dbc_state = match dbc.inner.lock() {
-            Ok(state) => state,
-            Err(_) => {
-                error!("SQLGetData: dbc mutex poisoned while reading PLP stream");
-                return SQL_ERROR;
-            }
-        };
-        if let Some(busy_stmt) = dbc_state.active_stmt
-            && busy_stmt != statement_handle
-        {
-            drop(dbc_state);
-            if let Ok(mut s) = stmt.inner.lock() {
-                post_diag(&mut s, ERR_CONNECTION_BUSY);
-            }
-            return SQL_ERROR;
-        }
-        let buffered_read = {
-            let Some(client) = dbc_state.client.as_mut() else {
-                drop(dbc_state);
-                if let Ok(mut s) = stmt.inner.lock() {
-                    post_diag(&mut s, ERR_NO_ACTIVE_TDS_CLIENT);
-                }
-                return SQL_ERROR;
-            };
-            client.try_read_active_plp_chunk(payload)
-        };
-        dbc_state.active_stmt = Some(statement_handle);
-        match buffered_read {
-            Ok(CursorPoll::Ready(chunk)) => {
-                drop(dbc_state);
-                Ok(chunk)
-            }
-            Err(error) => {
-                drop(dbc_state);
-                Err(error)
-            }
-            Ok(CursorPoll::Pending) => {
-                let Some(mut client) = dbc_state.client.take() else {
-                    drop(dbc_state);
-                    if let Ok(mut s) = stmt.inner.lock() {
-                        post_diag(&mut s, ERR_NO_ACTIVE_TDS_CLIENT);
-                    }
-                    return SQL_ERROR;
-                };
-                drop(dbc_state);
-                let mut prefetch_scratch = {
-                    let Ok(mut stmt_state) = stmt.inner.lock() else {
-                        error!("SQLGetData: stmt mutex poisoned while taking PLP prefetch buffer");
-                        return SQL_ERROR;
-                    };
-                    std::mem::take(&mut stmt_state.plp_prefetch_scratch)
-                };
-                let result = dbc.runtime.block_on(async {
-                    let chunk = client.read_active_plp_chunk(payload).await?;
-                    let remaining = chunk
-                        .known_total
-                        .and_then(|total| total.checked_sub(chunk.total_read as u64))
-                        .and_then(|bytes| usize::try_from(bytes).ok());
-                    let prefetch_len = remaining.filter(|remaining| {
-                        direct_wire_output
-                            && *remaining > 0
-                            && *remaining <= MAX_PLP_PREFETCH_BYTES
-                            && !chunk.reached_end
-                    });
-                    let Some(prefetch_len) = prefetch_len else {
-                        return Ok((chunk, None, Some(prefetch_scratch), None));
-                    };
-
-                    prefetch_scratch.resize(prefetch_len, 0);
-                    match client.read_active_plp_chunk(&mut prefetch_scratch).await {
-                        Ok(tail) => {
-                            let carry = (prefetch_scratch, tail, chunk.total_read);
-                            Ok((chunk, Some(carry), None, None))
-                        }
-                        Err(error) => Ok((chunk, None, Some(prefetch_scratch), Some(error))),
-                    }
-                });
-                let Ok(mut dbc_state) = dbc.inner.lock() else {
-                    error!("SQLGetData: dbc mutex poisoned after PLP read");
-                    return SQL_ERROR;
-                };
-                dbc_state.client = Some(client);
-                dbc_state.active_stmt = Some(statement_handle);
-                drop(dbc_state);
-                match result {
-                    Ok((chunk, carry, unused_scratch, prefetch_error)) => {
-                        let Ok(mut stmt_state) = stmt.inner.lock() else {
-                            error!(
-                                "SQLGetData: stmt mutex poisoned while saving PLP prefetch buffer"
-                            );
-                            return SQL_ERROR;
-                        };
-                        if let Some((bytes, tail, total_read_before)) = carry {
-                            let Some(stream) = stmt_state.active_plp.as_mut() else {
-                                error!(
-                                    "SQLGetData: PLP stream vanished while saving prefetched bytes"
-                                );
-                                return SQL_ERROR;
-                            };
-                            stream.set_prefetched_wire(
-                                bytes,
-                                tail.read,
-                                total_read_before,
-                                tail.known_total,
-                                tail.reached_end,
-                            );
-                        } else if let Some(buffer) = unused_scratch {
-                            stmt_state.plp_prefetch_scratch = buffer;
-                        }
-                        if let Some(error) = prefetch_error {
-                            let Some(stream) = stmt_state.active_plp.as_mut() else {
-                                error!(
-                                    "SQLGetData: PLP stream vanished while saving prefetch error"
-                                );
-                                return SQL_ERROR;
-                            };
-                            stream.set_prefetch_error(error);
-                        }
-                        Ok(chunk)
-                    }
-                    Err(error) => Err(error),
-                }
-            }
+        // Read-ahead that ran dry short of the budget is topped up from the wire,
+        // as an unbuffered read would have been.
+        let buffered = prefetched_read.map_or(0, |(read, ..)| read);
+        match read_plp_wire(
+            stmt,
+            statement_handle,
+            &mut payload[buffered..],
+            direct_wire_output,
+        ) {
+            Ok(Ok(chunk)) => Ok(PlpChunk {
+                read: buffered + chunk.read,
+                ..chunk
+            }),
+            Ok(Err(error)) => Err(error),
+            Err(rc) => return rc,
         }
     };
 
     let PlpChunk {
-        read,
-        reached_end,
+        mut read,
+        mut reached_end,
         known_total,
         mut total_read,
     } = match read_result {
@@ -2749,6 +2648,34 @@ fn stream_active_plp_chunk_once<'a>(
                 return SQL_ERROR;
             };
             stream.ensure_narrow_decoder();
+            let finished = stream.narrow_decoder_finished;
+            let Some(held_partial) = stream
+                .narrow_decoder
+                .as_ref()
+                .map(|decoder| !finished && narrow_decoder_has_partial_character(decoder))
+            else {
+                error!("SQLGetData: narrow PLP stream has no encoding to convert through");
+                return SQL_ERROR;
+            };
+            let pending_before = stream.pending_bytes.len();
+            let fit = narrow_source_fit(
+                &payload[..read],
+                payload_capacity.saturating_sub(pending_before),
+                held_partial,
+            );
+            if fit < read {
+                // Unconverted source stays on the stream so a target switch
+                // still finds it raw.
+                stream.restore_source_prefix(
+                    &payload[fit..read],
+                    total_read,
+                    known_total,
+                    reached_end,
+                );
+                total_read = total_read.saturating_sub(read - fit);
+                read = fit;
+                reached_end = false;
+            }
             let ActivePlpStream {
                 narrow_decoder,
                 narrow_decoder_finished,
@@ -2756,10 +2683,8 @@ fn stream_active_plp_chunk_once<'a>(
                 ..
             } = stream;
             let Some(decoder) = narrow_decoder.as_mut() else {
-                error!("SQLGetData: narrow PLP stream has no encoding to convert through");
                 return SQL_ERROR;
             };
-            let pending_before = pending_utf8.len();
             let emit = transcode_narrow_into_pending(
                 decoder,
                 pending_utf8,
@@ -3020,6 +2945,140 @@ fn stream_active_plp_chunk_once<'a>(
     SQL_SUCCESS_WITH_INFO
 }
 
+/// Reads the next PLP bytes for `statement_handle` from the connection into
+/// `payload`, filling the stream's read-ahead when the output is wire-shaped.
+///
+/// The outer `Err` is the return code after a diagnostic was posted; the inner
+/// result is the TDS read outcome.
+fn read_plp_wire(
+    stmt: &StmtHandle,
+    statement_handle: SqlHandle,
+    payload: &mut [u8],
+    direct_wire_output: bool,
+) -> Result<TdsResult<PlpChunk>, SqlReturn> {
+    #[cfg(test)]
+    tests::PLP_WIRE_READS.with(|reads| reads.set(reads.get() + 1));
+    let dbc = stmt.parent_dbc();
+    let mut dbc_state = match dbc.inner.lock() {
+        Ok(state) => state,
+        Err(_) => {
+            error!("SQLGetData: dbc mutex poisoned while reading PLP stream");
+            return Err(SQL_ERROR);
+        }
+    };
+    if let Some(busy_stmt) = dbc_state.active_stmt
+        && busy_stmt != statement_handle
+    {
+        drop(dbc_state);
+        if let Ok(mut s) = stmt.inner.lock() {
+            post_diag(&mut s, ERR_CONNECTION_BUSY);
+        }
+        return Err(SQL_ERROR);
+    }
+    let buffered_read = {
+        let Some(client) = dbc_state.client.as_mut() else {
+            drop(dbc_state);
+            if let Ok(mut s) = stmt.inner.lock() {
+                post_diag(&mut s, ERR_NO_ACTIVE_TDS_CLIENT);
+            }
+            return Err(SQL_ERROR);
+        };
+        client.try_read_active_plp_chunk(payload)
+    };
+    dbc_state.active_stmt = Some(statement_handle);
+    Ok(match buffered_read {
+        Ok(CursorPoll::Ready(chunk)) => {
+            drop(dbc_state);
+            Ok(chunk)
+        }
+        Err(error) => {
+            drop(dbc_state);
+            Err(error)
+        }
+        Ok(CursorPoll::Pending) => {
+            let Some(mut client) = dbc_state.client.take() else {
+                drop(dbc_state);
+                if let Ok(mut s) = stmt.inner.lock() {
+                    post_diag(&mut s, ERR_NO_ACTIVE_TDS_CLIENT);
+                }
+                return Err(SQL_ERROR);
+            };
+            drop(dbc_state);
+            let mut prefetch_scratch = {
+                let Ok(mut stmt_state) = stmt.inner.lock() else {
+                    error!("SQLGetData: stmt mutex poisoned while taking PLP prefetch buffer");
+                    return Err(SQL_ERROR);
+                };
+                std::mem::take(&mut stmt_state.plp_prefetch_scratch)
+            };
+            let result = dbc.runtime.block_on(async {
+                let chunk = client.read_active_plp_chunk(payload).await?;
+                let remaining = chunk
+                    .known_total
+                    .and_then(|total| total.checked_sub(chunk.total_read as u64))
+                    .and_then(|bytes| usize::try_from(bytes).ok());
+                let prefetch_len = remaining.filter(|remaining| {
+                    direct_wire_output
+                        && *remaining > 0
+                        && *remaining <= MAX_PLP_PREFETCH_BYTES
+                        && !chunk.reached_end
+                });
+                let Some(prefetch_len) = prefetch_len else {
+                    return Ok((chunk, None, Some(prefetch_scratch), None));
+                };
+
+                prefetch_scratch.resize(prefetch_len, 0);
+                match client.read_active_plp_chunk(&mut prefetch_scratch).await {
+                    Ok(tail) => {
+                        let carry = (prefetch_scratch, tail, chunk.total_read);
+                        Ok((chunk, Some(carry), None, None))
+                    }
+                    Err(error) => Ok((chunk, None, Some(prefetch_scratch), Some(error))),
+                }
+            });
+            let Ok(mut dbc_state) = dbc.inner.lock() else {
+                error!("SQLGetData: dbc mutex poisoned after PLP read");
+                return Err(SQL_ERROR);
+            };
+            dbc_state.client = Some(client);
+            dbc_state.active_stmt = Some(statement_handle);
+            drop(dbc_state);
+            match result {
+                Ok((chunk, carry, unused_scratch, prefetch_error)) => {
+                    let Ok(mut stmt_state) = stmt.inner.lock() else {
+                        error!("SQLGetData: stmt mutex poisoned while saving PLP prefetch buffer");
+                        return Err(SQL_ERROR);
+                    };
+                    if let Some((bytes, tail, total_read_before)) = carry {
+                        let Some(stream) = stmt_state.active_plp.as_mut() else {
+                            error!("SQLGetData: PLP stream vanished while saving prefetched bytes");
+                            return Err(SQL_ERROR);
+                        };
+                        stream.set_prefetched_wire(
+                            bytes,
+                            tail.read,
+                            total_read_before,
+                            tail.known_total,
+                            tail.reached_end,
+                        );
+                    } else if let Some(buffer) = unused_scratch {
+                        stmt_state.plp_prefetch_scratch = buffer;
+                    }
+                    if let Some(error) = prefetch_error {
+                        let Some(stream) = stmt_state.active_plp.as_mut() else {
+                            error!("SQLGetData: PLP stream vanished while saving prefetch error");
+                            return Err(SQL_ERROR);
+                        };
+                        stream.set_prefetch_error(error);
+                    }
+                    Ok(chunk)
+                }
+                Err(error) => Err(error),
+            }
+        }
+    })
+}
+
 fn narrow_decoder_has_partial_character(decoder: &ResolvedDecoder) -> bool {
     decoder.has_pending_narrow_character()
 }
@@ -3274,6 +3333,23 @@ fn narrow_max_read(payload_capacity: usize, pending_utf8_len: usize) -> usize {
     } else {
         (remaining / 3).max(1)
     }
+}
+
+/// How many of `source`'s narrow bytes to decode into `room` UTF-8 bytes.
+///
+/// A leading ASCII run decodes one byte to one byte, so it is taken whole; the
+/// rest gets the worst-case budget of [`narrow_max_read`]. A decoder already
+/// holding part of a character may expand its first byte, so it gets only the
+/// worst-case budget. Never below one byte of non-empty input, so a call always
+/// makes progress.
+fn narrow_source_fit(source: &[u8], room: usize, held_partial: bool) -> usize {
+    let ascii = if held_partial {
+        0
+    } else {
+        encoding_rs::Encoding::ascii_valid_up_to(source).min(room)
+    };
+    let fit = ascii + narrow_max_read(room - ascii, 0);
+    fit.max(1).min(source.len())
 }
 
 /// Decodes one chunk of narrow PLP wire bytes to UTF-8 for `SQL_C_CHAR`
@@ -10836,6 +10912,94 @@ mod tests {
         (rc, indicator)
     }
 
+    thread_local! {
+        pub(super) static PLP_WIRE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    fn open_mock_cp1252_plp(
+        chunks: Vec<Vec<u8>>,
+    ) -> (TestHandles, crate::test_support::MockServer) {
+        use mssql_mock_tds::{ColumnDefinition, ColumnValue, SqlDataType};
+
+        let mut column = ColumnDefinition::new("value", SqlDataType::VarCharMax);
+        column.collation = [0x09, 0x04, 0, 0, 0]; // en-US, codepage 1252
+        open_mock_plp_column(column, ColumnValue::VarCharMax(chunks))
+    }
+
+    #[test]
+    fn plp_cp1252_ascii_fills_char_buffer_in_one_wire_read() {
+        let (h, _server) = open_mock_cp1252_plp(vec![vec![b'a'; 3000]]);
+        let mut output = vec![0xcc; 2048];
+        PLP_WIRE_READS.with(|reads| reads.set(0));
+        assert_eq!(
+            read_plp_test_chunk(&h, SQL_C_CHAR, &mut output),
+            (SQL_SUCCESS_WITH_INFO, 3000)
+        );
+        assert_eq!(PLP_WIRE_READS.with(|reads| reads.get()), 1);
+        assert!(output[..2047].iter().all(|&byte| byte == b'a'));
+        assert_eq!(output[2047], 0);
+    }
+
+    #[test]
+    fn plp_cp1252_mixed_text_streams_and_keeps_raw_bytes_for_binary() {
+        let source: Vec<u8> = (0..700u32)
+            .flat_map(|i| [b'a' + (i % 26) as u8, b'b', 0x80, 0xe9])
+            .collect();
+        let expected: Vec<u8> = source
+            .iter()
+            .flat_map(|&byte| match byte {
+                0x80 => "\u{20ac}".as_bytes().to_vec(),
+                0xe9 => "\u{e9}".as_bytes().to_vec(),
+                ascii => vec![ascii],
+            })
+            .collect();
+        for size in [2, 3, 4, 5, 7, 64, 101, 1024] {
+            let (h, _server) = open_mock_cp1252_plp(vec![source.clone()]);
+            let mut delivered = Vec::new();
+            let mut finished = false;
+            for _ in 0..expected.len() + 1 {
+                let mut output = vec![0xcc; size];
+                let (rc, _) = read_plp_test_chunk(&h, SQL_C_CHAR, &mut output);
+                assert!(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+                let len = output.iter().position(|&byte| byte == 0).unwrap();
+                delivered.extend_from_slice(&output[..len]);
+                if rc == SQL_SUCCESS {
+                    finished = true;
+                    break;
+                }
+            }
+            assert!(finished, "buffer size {size}");
+            assert_eq!(delivered, expected, "buffer size {size}");
+        }
+
+        let (h, _server) = open_mock_cp1252_plp(vec![source.clone()]);
+        let mut text = [0xcc; 101];
+        assert_eq!(
+            read_plp_test_chunk(&h, SQL_C_CHAR, &mut text).0,
+            SQL_SUCCESS_WITH_INFO
+        );
+        let text_len = text.iter().position(|&byte| byte == 0).unwrap();
+        let consumed = source
+            .iter()
+            .scan(0, |out, &byte| {
+                *out += if byte < 0x80 {
+                    1
+                } else {
+                    2 + usize::from(byte == 0x80)
+                };
+                Some(*out)
+            })
+            .position(|out| out >= text_len)
+            .unwrap()
+            + 1;
+        let mut binary = vec![0xcc; source.len()];
+        assert_eq!(
+            read_plp_test_chunk(&h, SQL_C_BINARY, &mut binary),
+            (SQL_SUCCESS, (source.len() - consumed) as SqlLen)
+        );
+        assert_eq!(&binary[..source.len() - consumed], &source[consumed..]);
+    }
+
     #[test]
     fn plp_null_target_survives_utf16_completion_after_output() {
         let (h, _server) = open_mock_plp(vec![vec![0x41, 0x42, 0xd83d, 0xde00, 0x43]]);
@@ -10936,7 +11100,7 @@ mod tests {
             read_plp_test_chunk(&h, SQL_C_BINARY, &mut binary),
             (SQL_SUCCESS_WITH_INFO, 1022)
         );
-        assert_eq!(binary, [0x01, 0xd8, 0xcc, 0xcc]);
+        assert_eq!(binary, [0x01, 0xd8, 0x01, 0xd8]);
     }
 
     #[test]
