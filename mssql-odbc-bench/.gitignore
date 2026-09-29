@@ -1,0 +1,16 @@
+# CMake build output
+build/
+build_*/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+_deps/
+
+# Compiled objects and libraries
+*.o
+*.obj
+*.a
+*.lib
+*.exe
+*.pdb
+*.ilk

@@ -54,7 +54,7 @@ parameters:
     default: 'RUST-X64-WUS3'
   - name: poolImageOverride
     type: string
-    default: 'imageOverride -equals RUST-UBUSLIM'
+    default: 'imageOverride -equals RUST-AZL3'
   - name: jobCondition
     # Job-level condition. Defaults to succeeded(); custom conditions must evaluate
     # to false when the pipeline is canceled so the SQL host does not remain running.
@@ -91,7 +91,7 @@ jobs:
         inputs:
           dockerVersion: '29.0.0'
 
-      - template: install-ubuntu-dependency.yaml
+      - template: install-host-dependency.yaml
         parameters:
           installAzCli: false
           installDocker: true

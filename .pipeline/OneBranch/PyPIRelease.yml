@@ -1,0 +1,219 @@
+#################################################################################
+#                OneBranch Pipeline - mssql-python-rs PyPI Release               #
+#                                                                               #
+# The single ESRP -> PyPI publish pipeline for the `mssql-python-rs` package.    #
+#                                                                               #
+# Publishes the exact signed wheels from an operator-selected Official Python   #
+# Wheels Build run. This pipeline does not rebuild or modify wheel contents.     #
+#                                                                               #
+# Manual trigger only. `publishToPyPI` defaults to false: a default run is a    #
+# dry run that verifies and stages the selected wheels with NO publish. Flip it  #
+# to true only for a deliberate publish from `stable`.                           #
+#                                                                               #
+# Reuses the shared 'ESRP Federated Creds (AME)' variable group (same AKV cert  #
+# / ESRP creds mssql-python publishes with).                                    #
+#################################################################################
+
+name: $(Year:YY)$(DayOfYear)$(Rev:.r)-PyPI-Release
+
+trigger: none
+pr: none
+
+parameters:
+  - name: publishToPyPI
+    displayName: 'Publish selected official wheels to PyPI via ESRP. Leave false for a dry run.'
+    type: boolean
+    default: false
+
+variables:
+  - name: CDP_DEFINITION_BUILD_COUNT
+    value: $[counter('', 0)]
+  - name: LinuxContainerImage
+    value: 'mcr.microsoft.com/onebranch/azurelinux/build:3.0'
+  - name: WindowsContainerImage
+    value: 'onebranch.azurecr.io/windows/ltsc2022/vse2022:latest'
+  - name: DEBIAN_FRONTEND
+    value: noninteractive
+  - group: 'ESRP Federated Creds (AME)'
+
+resources:
+  repositories:
+    - repository: templates
+      type: git
+      name: OneBranch.Pipelines/GovernedTemplates
+      ref: refs/heads/main
+
+  # The operator selects the exact Official Build run when queuing this
+  # pipeline. ADO supplies that run's immutable artifacts and source metadata.
+  pipelines:
+    - pipeline: officialBuild
+      source: 'Official Python Wheels Build'  # ADO pipeline definition name (ID 2234)
+      trigger: none
+
+# Official template: required for a real production publish to public PyPI. The
+# pipeline must be classified Production in the product catalog for this to run.
+extends:
+  template: v2/OneBranch.Official.CrossPlat.yml@templates
+  parameters:
+    featureFlags:
+      EnableCDPxPAT: false
+      WindowsHostVersion: 1ESWindows2022
+    globalSdl:
+      binskim:
+        enabled: true
+        scanOutputDirectoryOnly: true
+      credscan:
+        enabled: true
+      policheck:
+        enabled: true
+
+    stages:
+    #########################################################################
+    # Download and verify the selected Official Build without rebuilding it.
+    # Dry runs use the same artifact path without invoking ESRP.
+    #########################################################################
+    - stage: ReleaseWheels
+      displayName: 'Release mssql-python-rs wheels'
+      jobs:
+      - job: PyPIRelease
+        displayName: 'Verify and publish official wheels'
+        templateContext:
+          type: releaseJob
+          isProduction: true
+        pool:
+          type: windows
+        variables:
+          ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
+          WindowsContainerImage: 'onebranch.azurecr.io/windows/ltsc2022/vse2022:latest'
+        steps:
+        - checkout: self
+          path: s/mssql-rs
+          persistCredentials: true
+          fetchDepth: 0
+
+        - pwsh: |
+            $ErrorActionPreference = 'Stop'
+
+            $runId = 0
+            if (-not [int]::TryParse($env:OFFICIAL_BUILD_RUN_ID, [ref]$runId)) {
+              throw "Invalid Official Build run ID: $env:OFFICIAL_BUILD_RUN_ID"
+            }
+            $uri = "$env:SYSTEM_COLLECTIONURI$env:SYSTEM_TEAMPROJECTID/_apis/build/builds/${runId}?api-version=7.1"
+            $headers = @{ Authorization = "Bearer $env:SYSTEM_ACCESSTOKEN" }
+            $build = Invoke-RestMethod -Method Get -Uri $uri -Headers $headers
+            if ($build.status -cne 'completed' -or $build.result -cne 'succeeded') {
+              throw "Official Build $runId is not eligible for release: status='$($build.status)', result='$($build.result)'."
+            }
+            Write-Host "Selected Official Build $runId is completed and succeeded."
+          displayName: 'Require successful Official Build'
+          env:
+            OFFICIAL_BUILD_RUN_ID: $(resources.pipeline.officialBuild.runID)
+            SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+            SYSTEM_COLLECTIONURI: $(System.CollectionUri)
+            SYSTEM_TEAMPROJECTID: $(System.TeamProjectId)
+
+        - download: officialBuild
+          displayName: 'Download all artifacts from Official Build'
+
+        - ${{ if eq(parameters.publishToPyPI, true) }}:
+          - pwsh: |
+              if ($env:RELEASE_SOURCE_BRANCH -cne 'refs/heads/stable') {
+                throw 'PyPI publishing is allowed only from refs/heads/stable.'
+              }
+              if ($env:OFFICIAL_BUILD_SOURCE_BRANCH -cne 'refs/heads/stable') {
+                throw 'PyPI publishing requires an Official Build produced from refs/heads/stable.'
+              }
+            displayName: 'Require stable branch for publish'
+            env:
+              RELEASE_SOURCE_BRANCH: $(Build.SourceBranch)
+              OFFICIAL_BUILD_SOURCE_BRANCH: $(resources.pipeline.officialBuild.sourceBranch)
+
+        - pwsh: |
+            $ErrorActionPreference = 'Stop'
+
+            $repoRoot = "$(Pipeline.Workspace)/s/mssql-rs"
+            $artifactRoot = "$(Pipeline.Workspace)/officialBuild"
+            $stage = "$(Agent.TempDirectory)/pypi-publish"
+            Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue
+            New-Item -ItemType Directory -Force -Path $stage | Out-Null
+
+            if (-not (Test-Path $artifactRoot)) {
+              throw "Official Build artifacts not found: $artifactRoot"
+            }
+
+            $metadata = & "$repoRoot/.pipeline/scripts/get-python-release-metadata.ps1" `
+              -RepositoryDirectory $repoRoot `
+              -CommitSha $env:OFFICIAL_BUILD_SOURCE_COMMIT `
+              -SourceBranch $env:OFFICIAL_BUILD_SOURCE_BRANCH `
+              -IncludeWheelMetadata
+            $commitSha = $metadata.SourceCommit
+            $distributionName = $metadata.DistributionName
+            $distributionVersion = $metadata.PythonVersion
+            if ($distributionName -ne 'mssql-python-rs') {
+              throw "Selected build contains '$distributionName', expected 'mssql-python-rs'."
+            }
+
+            $wheels = @(
+              Get-ChildItem $artifactRoot -Filter '*.whl' -File -Recurse |
+                Where-Object { $_.FullName -match '[\\/]+wheels[\\/][^\\/]+\.whl$' }
+            )
+            if ($wheels.Count -eq 0) {
+              throw 'No wheels found in the selected Official Build artifacts.'
+            }
+            $duplicateNames = @(
+              $wheels | Group-Object Name | Where-Object Count -gt 1 | ForEach-Object Name
+            )
+            if ($duplicateNames.Count -gt 0) {
+              throw "Duplicate wheel filenames in Official Build artifacts: $($duplicateNames -join ', ')"
+            }
+
+            foreach ($wheel in $wheels) {
+              $destination = Join-Path $stage $wheel.Name
+              Copy-Item $wheel.FullName $destination
+              $sourceHash = (Get-FileHash $wheel.FullName -Algorithm SHA256).Hash
+              $destinationHash = (Get-FileHash $destination -Algorithm SHA256).Hash
+              if ($sourceHash -ne $destinationHash) {
+                throw "Staged wheel copy does not match the downloaded artifact: $($wheel.Name)"
+              }
+              Write-Host "$($wheel.Name)  SHA256=$sourceHash"
+            }
+
+            & "$repoRoot/.pipeline/scripts/verify-python-wheels.ps1" `
+              -WheelsDir $stage `
+              -ExpectedName $distributionName `
+              -ExpectedVersion $distributionVersion `
+              -RequireOdbc
+
+            Write-Host "Selected Official Build: $env:OFFICIAL_BUILD_RUN_ID"
+            Write-Host "Selected source commit: $commitSha"
+            Write-Host "Staged $($wheels.Count) $distributionName $distributionVersion wheels unchanged."
+          displayName: 'Verify and stage official wheels'
+          env:
+            OFFICIAL_BUILD_SOURCE_COMMIT: $(resources.pipeline.officialBuild.sourceCommit)
+            OFFICIAL_BUILD_SOURCE_BRANCH: $(resources.pipeline.officialBuild.sourceBranch)
+            OFFICIAL_BUILD_RUN_ID: $(resources.pipeline.officialBuild.runID)
+
+        - ${{ if eq(parameters.publishToPyPI, true) }}:
+          - task: EsrpRelease@9
+            displayName: 'ESRP Release mssql-python-rs wheels to PyPI'
+            inputs:
+              connectedservicename: '$(ESRPConnectedServiceName)'
+              usemanagedidentity: true
+              keyvaultname: '$(AuthAKVName)'
+              signcertname: '$(AuthSignCertName)'
+              clientid: '$(EsrpClientId)'
+              Intent: 'PackageDistribution'
+              ContentType: 'PyPI'
+              ContentSource: 'Folder'
+              FolderLocation: '$(Agent.TempDirectory)/pypi-publish'
+              WaitForReleaseCompletion: true
+              Owners: '$(owner)'
+              Approvers: '$(approver)'
+              ServiceEndpointUrl: 'https://api.esrp.microsoft.com'
+              MainPublisher: 'ESRPRELPACMAN'
+              DomainTenantId: '$(DomainTenantId)'
+
+          - pwsh: |
+              Write-Host 'mssql-python-rs official wheels submitted to PyPI via ESRP.'
+              Write-Host 'Yank the 0.0.0 reservation version after this release is verified on PyPI.'
+            displayName: 'Release summary'

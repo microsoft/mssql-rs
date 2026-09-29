@@ -1,13 +1,19 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-use crate::{query::metadata::ColumnMetadata, token::tokens::SqlCollation};
+use crate::{
+    query::metadata::ColumnMetadata,
+    token::tokens::{CODE_PAGE_FROM_SORT_ID, SqlCollation},
+};
 use core::fmt;
 use std::{fmt::Debug, fmt::Display};
 use tracing::warn;
 
+mod encoding;
+pub use encoding::{ResolvedDecoder, ResolvedEncoding};
+
 use super::{
-    lcid_encoding::lcid_to_encoding,
+    lcid_encoding::{lcid_to_code_page, lcid_to_encoding},
     sqldatatypes::{TypeInfoVariant, is_unicode_type},
 };
 
@@ -18,7 +24,7 @@ pub enum EncodingType {
     Utf8,
     /// UTF-16LE encoding.
     Utf16,
-    /// Encoding derived from SQL collation LCID.
+    /// Encoding derived from SQL collation UTF-8 flag, sort ID, or LCID.
     LcidBased(SqlCollation),
     /// Placeholder set before the connection collation is known.
     // This is to be used when we want to have an empty encoding, which
@@ -51,24 +57,232 @@ fn lcid_encoding_or_fallback(collation: SqlCollation) -> &'static encoding_rs::E
     }
 }
 
+fn resolve_collation(collation: SqlCollation) -> ResolvedEncoding {
+    if collation.utf8() {
+        return encoding_rs::UTF_8.into();
+    }
+    if let Some(code_page) = CODE_PAGE_FROM_SORT_ID[usize::from(collation.sort_id)] {
+        let encoding = match code_page {
+            437 => return ResolvedEncoding::Oem437,
+            850 => return ResolvedEncoding::Oem850,
+            874 => encoding_rs::WINDOWS_874,
+            932 => encoding_rs::SHIFT_JIS,
+            936 => encoding_rs::GBK,
+            949 => encoding_rs::EUC_KR,
+            950 => encoding_rs::BIG5,
+            1250 => encoding_rs::WINDOWS_1250,
+            1251 => encoding_rs::WINDOWS_1251,
+            1252 => encoding_rs::WINDOWS_1252,
+            1253 => encoding_rs::WINDOWS_1253,
+            1254 => encoding_rs::WINDOWS_1254,
+            1255 => encoding_rs::WINDOWS_1255,
+            1256 => encoding_rs::WINDOWS_1256,
+            1257 => encoding_rs::WINDOWS_1257,
+            _ => {
+                warn!(
+                    "Unsupported code page {} for SQL sort ID {}, falling back to LCID",
+                    code_page, collation.sort_id
+                );
+                return lcid_encoding_or_fallback(collation).into();
+            }
+        };
+        return encoding.into();
+    }
+    lcid_encoding_or_fallback(collation).into()
+}
+
+/// The Windows code page the server's `collation` selects, mirroring the value
+/// msodbcsql derives with `CodePageFromTDSCollation`: a SQL collation's sort-ID
+/// code page, else the LCID's ANSI code page (`65001` for a UTF-8 collation).
+/// `None` when neither the sort ID nor the LCID maps to a known code page.
+pub(crate) fn collation_code_page(collation: SqlCollation) -> Option<u16> {
+    if collation.utf8() {
+        return Some(65001);
+    }
+    if let Some(code_page) = CODE_PAGE_FROM_SORT_ID[usize::from(collation.sort_id)] {
+        return Some(code_page);
+    }
+    lcid_to_code_page(collation.info & 0x000F_FFFF)
+}
+
+/// Byte substituted for a character the target narrow encoding cannot
+/// represent.
+///
+/// Matches msodbcsql, which converts with `WideCharToMultiByte`/`iconv` and
+/// takes the code page's default character — hardcoded `0x3f` in its own
+/// cross-platform converter (`Globalization.h`, `iconv_buffer::DefaultChar`).
+///
+/// SQL Server itself substitutes the same byte for a `CAST(N'…' AS varchar(n))`
+/// it cannot best-fit map: measured on `SQL_Latin1_General_CP1_CI_AS`,
+/// `ASCII(CAST(N'日' AS varchar(4)))` is 63. Characters it *can* best-fit
+/// (`Ł`→`L`, `Ć`→`C`, `‐`→`-`) are transliterated rather than substituted, and
+/// this driver does not reproduce that — see
+/// `mssql-odbc/docs/parity-deviations.md`.
+///
+/// Not a detection mechanism: a literal `?` in the source encodes to this same
+/// byte, so whether a substitution occurred is reported by
+/// [`NarrowEncoded::had_loss`] rather than by inspecting the wire bytes.
+pub const NARROW_SUBSTITUTE_BYTE: u8 = b'?';
+
+/// Wire bytes from a narrow encode, plus whether producing them lost anything.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NarrowEncoded {
+    /// Encoded bytes, ready for the wire.
+    pub bytes: Vec<u8>,
+    /// `true` when at least one character had no representation in the target
+    /// encoding and was replaced with [`NARROW_SUBSTITUTE_BYTE`]. The caller
+    /// decides whether that is worth reporting; `mssql-odbc` surfaces it as
+    /// SQLSTATE `01000` under `SQL_COPT_SS_WARN_ON_CP_ERROR`.
+    pub had_loss: bool,
+}
+
+impl NarrowEncoded {
+    /// Bytes that encoded exactly.
+    fn exact(bytes: Vec<u8>) -> Self {
+        Self {
+            bytes,
+            had_loss: false,
+        }
+    }
+}
+
+/// Encodes `text` for the wire under `collation`'s narrow encoding: UTF-8 when
+/// the collation is UTF-8-aware, then its SQL sort ID code page, then its LCID
+/// (falling back to Windows-1252 for an LCID this crate does not map).
+///
+/// Mirrors the encoding step [`get_encoding_type`] performs for a materialized
+/// value, for a caller that must produce collation-correct wire bytes
+/// directly instead of routing through the parameter serializer -- e.g. a
+/// data-at-execution write, which streams bytes to the wire before the normal
+/// parameter-serialization path runs. Does *not* mirror that serializer's own
+/// `VARCHAR | CHAR | TEXT` arm (`tds_value_serializer.rs`): that arm still
+/// resolves only the LCID, ignoring both the UTF-8 flag and SQL sort ID.
+/// Inline string parameters can therefore encode differently from this helper
+/// and from fetched values under UTF-8 or SQL sort-ID collations. Unifying that
+/// serializer path is deferred alongside the UTF-8 discrepancy in AB#47590.
+///
+/// A character the encoding cannot represent becomes
+/// [`NARROW_SUBSTITUTE_BYTE`] and sets [`NarrowEncoded::had_loss`]. It must not
+/// be left to `encoding_rs`, whose `encode` implements WHATWG form-submission
+/// semantics and emits a decimal numeric character reference instead --
+/// `U+65E5` as the eight ASCII bytes `&#26085;` -- so the server would store
+/// markup in place of the value, and one character would count as eight against
+/// the column's length (AB#47598).
+pub fn encode_narrow(text: &str, collation: SqlCollation) -> NarrowEncoded {
+    let (encoded, encoding_used, had_errors) = resolve_collation(collation).encode(text);
+    if !had_errors {
+        return NarrowEncoded::exact(encoded.into_owned());
+    }
+    // Deliberate double pass: `encoded` holds the numeric-character-reference
+    // expansion (6-10 bytes per unmappable character -- three punctuation plus
+    // three to seven decimal digits -- against 2-4 UTF-8 source bytes, so up to
+    // 3.5x the source at U+0400-U+07FF, where a four-digit scalar is only two
+    // bytes) and is discarded unread so the value can be re-encoded one
+    // character at a time. Only reached once a substitution is already
+    // happening, on a value already fully resident, so it never taxes the clean
+    // path.
+    //
+    // A true single pass needs `Encoder::encode_from_utf8_without_replacement`
+    // — copy representable spans, append `?` on `Unmappable`. `ResolvedEncoding`
+    // exposes only whole-string `encode`: there is no encoder counterpart to
+    // `new_decoder_without_bom_handling`, and `Oem437`/`Oem850` are the
+    // table-backed codec with no `encoding_rs` `Encoder` at all. So it means
+    // adding an incremental encoder to `ResolvedEncoding` and implementing it
+    // twice, not a local rewrite.
+    //
+    // Dropped explicitly rather than at end of scope: NLL governs borrows, not
+    // drop timing, so without this the expansion would still be live while
+    // `substitute_unmappable` allocates the replacement, holding both buffers
+    // at once on the one path that already amplifies its input.
+    drop(encoded);
+    NarrowEncoded {
+        bytes: substitute_unmappable(text, encoding_used),
+        had_loss: true,
+    }
+}
+
+/// Re-encodes `text` one character at a time, replacing each character
+/// `encoding` cannot represent with [`NARROW_SUBSTITUTE_BYTE`].
+///
+/// Only reached once a whole-string encode has already reported a substitution,
+/// so the per-character cost never lands on a value that encodes cleanly. Every
+/// encoding this resolves to is stateless, so a character encodes the same
+/// alone as it does in context.
+///
+/// # Cost
+///
+/// One [`ResolvedEncoding::encode`] call per scalar. ASCII borrows, but every
+/// non-ASCII scalar returns an owned `Cow` — in the `encoding_rs` branch and the
+/// OEM table branch alike — so a value that is largely non-ASCII allocates once
+/// per character after the first unmappable one. Measured: ~9.5 ms/MB under
+/// CP1252 against ~76 ms/MB under CP932, and that 8x gap is this effect, CP932
+/// text being non-ASCII throughout.
+///
+/// Accepted rather than fixed: it is confined to a value already being altered,
+/// and removing it means driving `Encoder::encode_from_utf8_without_replacement`
+/// incrementally (copy representable spans, append `?` on `Unmappable`) with a
+/// second allocation-free implementation for the OEM tables, which
+/// `ResolvedEncoding` does not expose today. Do that as its own change with the
+/// CP1252/CP932/CP437, astral and mixed cases re-run — those are exactly where a
+/// one-pass rewrite regresses silently.
+///
+/// One substitute byte per **UTF-16 code unit**, not per character, so an
+/// astral character yields two. `WideCharToMultiByte` counts that way
+/// (measured: `U+1F600` gives `3F 3F` under CP1252 and CP932), as does SQL
+/// Server (`DATALENGTH(CAST(N'😀' AS varchar(4)))` is 2). Counting scalars
+/// instead would make a substituted value one byte shorter than the same value
+/// through msodbcsql on Windows, and a `varchar(n)` would accept a string
+/// Windows msodbcsql and the engine both reject.
+///
+/// msodbcsql does *not* agree on every platform: on glibc, `//TRANSLIT` lets
+/// `iconv` resolve the astral scalar itself, so its per-`WCHAR` `EILSEQ` loop
+/// never runs and it emits a single byte (measured, glibc 2.35). musl compiles
+/// `//TRANSLIT` out and is unmeasured. This driver takes the Windows/engine
+/// answer on every platform; see `mssql-odbc/docs/parity-deviations.md`
+/// entry 21.
+pub(crate) fn substitute_unmappable(text: &str, encoding: ResolvedEncoding) -> Vec<u8> {
+    let mut out = Vec::with_capacity(text.len());
+    let mut buf = [0u8; 4];
+    for character in text.chars() {
+        let (bytes, _, failed) = encoding.encode(character.encode_utf8(&mut buf));
+        if failed {
+            out.extend(std::iter::repeat_n(
+                NARROW_SUBSTITUTE_BYTE,
+                character.len_utf16(),
+            ));
+        } else {
+            out.extend_from_slice(&bytes);
+        }
+    }
+    out
+}
+
 impl EncodingType {
     /// The encoding these bytes are in, or `None` when the collation is not yet
-    /// known ([`EncodingType::DelayedSet`]).
+    /// known ([`EncodingType::DelayedSet`]) or requires an OEM codec (CP437/850)
+    /// unavailable in `encoding_rs`. Use [`Self::resolved_encoding`] for all
+    /// supported SQL collations.
     ///
-    /// Exists so a writer handed borrowed wire bytes by
-    /// [`RowWriter::write_string`](crate::datatypes::row_writer::RowWriter::write_string)
-    /// can transcode straight into its own buffer instead of building an owned
-    /// [`SqlString`] first.
+    /// Retained for compatibility with callers using `encoding_rs` directly.
+    /// New conversion code should use [`Self::resolved_encoding`] to include
+    /// the OEM codecs.
     ///
     /// Decoding through this substitutes U+FFFD on malformed input, whereas
     /// [`SqlString::to_utf8_string`] panics on invalid UTF-8 under
     /// [`EncodingType::Utf8`]. Use this when replacement is the wanted
     /// behaviour, not as a drop-in for `to_utf8_string`.
     pub fn encoding(&self) -> Option<&'static encoding_rs::Encoding> {
+        self.resolved_encoding()
+            .and_then(ResolvedEncoding::as_encoding_rs)
+    }
+
+    /// Resolves UTF-8 first, then a recognized nonzero SQL sort ID, then LCID.
+    /// Unknown LCIDs retain the warning and Windows-1252 fallback.
+    pub fn resolved_encoding(&self) -> Option<ResolvedEncoding> {
         match self {
-            EncodingType::Utf8 => Some(encoding_rs::UTF_8),
-            EncodingType::Utf16 => Some(encoding_rs::UTF_16LE),
-            EncodingType::LcidBased(collation) => Some(lcid_encoding_or_fallback(*collation)),
+            EncodingType::Utf8 => Some(encoding_rs::UTF_8.into()),
+            EncodingType::Utf16 => Some(encoding_rs::UTF_16LE.into()),
+            EncodingType::LcidBased(collation) => Some(resolve_collation(*collation)),
             EncodingType::DelayedSet => None,
         }
     }
@@ -103,6 +317,7 @@ impl SqlString {
     }
 
     /// Decodes wire bytes in `encoding_type` into a Rust `String`.
+    /// The explicit encoding is authoritative; BOM-shaped prefixes are payload.
     ///
     /// Lets a writer handed borrowed bytes by
     /// [`RowWriter::write_string`](crate::datatypes::row_writer::RowWriter::write_string)
@@ -114,22 +329,24 @@ impl SqlString {
             EncodingType::Utf8 => String::from_utf8(bytes.to_vec()).unwrap(),
             EncodingType::Utf16 => {
                 // Use encoding_rs for efficient UTF-16LE decoding without intermediate Vec<u16> allocation
-                let (decoded, _, _) = encoding_rs::UTF_16LE.decode(bytes);
+                let (decoded, _) = encoding_rs::UTF_16LE.decode_without_bom_handling(bytes);
                 decoded.into_owned()
             }
             EncodingType::LcidBased(collation) => {
                 // Extract LCID from the lower 20 bits of collation.info
                 let lcid = collation.info & 0x000F_FFFF;
-                let encoding = lcid_encoding_or_fallback(collation);
+                let encoding = resolve_collation(collation);
 
                 // Decode bytes using the determined encoding
-                let (decoded, _used_encoding, had_errors) = encoding.decode(bytes);
+                let (decoded, had_errors) = encoding.decode_without_bom_handling(bytes);
 
                 if had_errors {
                     warn!(
-                        "Encountered decoding errors while converting LCID 0x{:04X} ({}) encoded data. \
+                        "Encountered decoding errors while converting {} encoded data (LCID 0x{:04X}, SQL sort ID {}). \
                          Some characters may have been replaced with U+FFFD.",
-                        lcid, lcid
+                        encoding.name(),
+                        lcid,
+                        collation.sort_id
                     );
                 }
 
@@ -336,6 +553,41 @@ mod tests {
     }
 
     #[test]
+    fn decode_preserves_bom_shaped_sql_payloads() {
+        let cp1252 = EncodingType::LcidBased(collation(0x0409));
+        assert_eq!(cp1252.encoding(), Some(encoding_rs::WINDOWS_1252));
+        let cases: &[(&[u8], EncodingType, &str)] = &[
+            (b"\xEF\xBB\xBFA", cp1252, "\u{EF}\u{BB}\u{BF}A"),
+            (b"\xFF\xFEA\0", cp1252, "\u{FF}\u{FE}A\0"),
+            (b"\xFE\xFFA\0", cp1252, "\u{FE}\u{FF}A\0"),
+            (b"\xFF\xFEA\0", EncodingType::Utf16, "\u{FEFF}A"),
+            (b"\xFE\xFFA\0", EncodingType::Utf16, "\u{FFFE}A"),
+            (b"\xEF\xBB\xBFA", EncodingType::Utf8, "\u{FEFF}A"),
+            (b"A\xEF\xBB\xBF", cp1252, "A\u{EF}\u{BB}\u{BF}"),
+            (b"caf\xE9", cp1252, "caf\u{E9}"),
+            (b"A\0", EncodingType::Utf16, "A"),
+            (b"\x3D\xD8\0\xDE\0\0", EncodingType::Utf16, "\u{1F600}\0"),
+            (b"\0\xD8", EncodingType::Utf16, "\u{FFFD}"),
+            (b"\0\xDC", EncodingType::Utf16, "\u{FFFD}"),
+            (b"A\0B", EncodingType::Utf16, "A\u{FFFD}"),
+            (b"", cp1252, ""),
+            (b"", EncodingType::Utf16, ""),
+        ];
+        for &(bytes, encoding, expected) in cases {
+            assert_eq!(
+                SqlString::decode(bytes, encoding),
+                expected,
+                "{encoding:?}: {bytes:02X?}"
+            );
+            assert_eq!(
+                SqlString::new(bytes.to_vec(), encoding).to_utf8_string(),
+                expected,
+                "{encoding:?}: {bytes:02X?}"
+            );
+        }
+    }
+
+    #[test]
     fn test_sql_string_debug_utf16() {
         let sql_str = SqlString::from_utf8_string("Debug".to_string());
         let debug_str = format!("{sql_str:?}");
@@ -422,6 +674,53 @@ mod tests {
     }
 
     #[test]
+    fn collation_code_page_resolves_sort_id_then_lcid() {
+        let sql_collation = |sort_id| SqlCollation {
+            info: 0,
+            lcid_language_id: 0,
+            col_flags: 0,
+            sort_id,
+        };
+        // SQL collations resolve through the sort-ID table.
+        assert_eq!(collation_code_page(sql_collation(50)), Some(1252));
+        assert_eq!(collation_code_page(sql_collation(40)), Some(850));
+        assert_eq!(collation_code_page(sql_collation(30)), Some(437));
+        // A Windows collation (sort_id 0) resolves through the LCID's ANSI page.
+        let windows = SqlCollation {
+            info: 0x0409,
+            lcid_language_id: 0,
+            col_flags: 0,
+            sort_id: 0,
+        };
+        assert_eq!(collation_code_page(windows), Some(1252));
+        // A second LCID branch, to catch a transposition in the match arms.
+        let cyrillic = SqlCollation {
+            info: 0x0419,
+            lcid_language_id: 0,
+            col_flags: 0,
+            sort_id: 0,
+        };
+        assert_eq!(collation_code_page(cyrillic), Some(1251));
+        // A niche CP1252 Windows collation whose LCID the encoding table does
+        // not carry (Welsh, 0x0452) still resolves through the full locale map.
+        let welsh = SqlCollation {
+            info: 0x0452,
+            lcid_language_id: 0,
+            col_flags: 0,
+            sort_id: 0,
+        };
+        assert_eq!(collation_code_page(welsh), Some(1252));
+        // An unmapped LCID has no code page.
+        let unknown = SqlCollation {
+            info: 0x000F_FFFF,
+            lcid_language_id: 0,
+            col_flags: 0,
+            sort_id: 0,
+        };
+        assert_eq!(collation_code_page(unknown), None);
+    }
+
+    #[test]
     fn test_lcid_based_encoding_special_chars_windows1252() {
         // Test special characters in Windows-1252
         // "Café résumé naïve" with special chars
@@ -499,5 +798,288 @@ mod tests {
 
         let utf8_str = SqlString::new(b"test".to_vec(), EncodingType::Utf8);
         assert!(utf8_str.as_utf16_bytes().is_none());
+    }
+
+    #[test]
+    fn encode_narrow_uses_the_lcid_codepage_for_a_non_utf8_collation() {
+        let collation = SqlCollation {
+            info: 0x0409, // US English LCID -> Windows-1252
+            lcid_language_id: 0,
+            col_flags: 0,
+            sort_id: 0,
+        };
+        let encoded = encode_narrow("Caf\u{e9}", collation);
+        assert_eq!(encoded.bytes, b"Caf\xe9");
+        assert!(!encoded.had_loss);
+    }
+
+    #[test]
+    fn encode_narrow_passes_through_utf8_for_a_utf8_collation() {
+        let collation = SqlCollation {
+            info: 0x0409,
+            lcid_language_id: 0,
+            col_flags: 0x40, // fUTF8
+            sort_id: 0,
+        };
+        assert_eq!(
+            encode_narrow("Caf\u{e9}", collation).bytes,
+            "Caf\u{e9}".as_bytes()
+        );
+    }
+
+    #[test]
+    fn encode_narrow_falls_back_to_windows_1252_for_an_unmapped_lcid() {
+        let collation = SqlCollation {
+            info: 0x000F_FFFF,
+            lcid_language_id: 0,
+            col_flags: 0,
+            sort_id: 0,
+        };
+        assert_eq!(encode_narrow("Caf\u{e9}", collation).bytes, b"Caf\xe9");
+    }
+
+    /// U+65E5 has no Windows-1252 representation. Left to `encoding_rs` it
+    /// would become the eight ASCII bytes `&#26085;` -- WHATWG
+    /// form-submission semantics -- so the server would store markup and one
+    /// character would count as eight against the column. It is substituted
+    /// with a single `?` instead, matching msodbcsql and SQL Server's own
+    /// `CAST`, and the loss is reported for the caller to surface (AB#47598).
+    #[test]
+    fn encode_narrow_substitutes_a_character_the_codepage_cannot_represent() {
+        let collation = SqlCollation {
+            info: 0x0409, // US English LCID -> Windows-1252
+            lcid_language_id: 0,
+            col_flags: 0,
+            sort_id: 0,
+        };
+        let encoded = encode_narrow("Caf\u{65e5}", collation);
+        assert_eq!(encoded.bytes, b"Caf?");
+        assert!(encoded.had_loss);
+    }
+
+    /// Only the unmappable characters are substituted: `é` encodes fine in
+    /// Windows-1252 and must survive a value that also carries one that does
+    /// not.
+    #[test]
+    fn encode_narrow_substitutes_only_the_unmappable_characters() {
+        let collation = SqlCollation {
+            info: 0x0409,
+            lcid_language_id: 0,
+            col_flags: 0,
+            sort_id: 0,
+        };
+        let encoded = encode_narrow("\u{e9}\u{65e5}\u{e9}", collation);
+        assert_eq!(encoded.bytes, b"\xe9?\xe9");
+        assert!(encoded.had_loss);
+    }
+
+    /// A multi-byte mappable character keeps all of its bytes while an
+    /// unmappable neighbour collapses to one, so the substitution cannot be a
+    /// per-character byte-for-byte assumption.
+    ///
+    /// Measured with `WideCharToMultiByte(932, 0, ...)`: `U+3042` is `82 A0`
+    /// with no loss flag, `U+0141` is `3F` with it set, and the pair is
+    /// `82 A0 3F`.
+    ///
+    /// Windows only. glibc `iconv -t CP932//TRANSLIT` best-fits `U+0141` to
+    /// `4C`, giving `82 A0 4C` — the same divergence parity-deviations entry 21
+    /// records for CP1252, so best-fit is not a CP1252-specific behaviour. This
+    /// is a unit test of *this* driver's encoder, not a cross-platform parity
+    /// assertion, so it pins `82 A0 3F` regardless.
+    #[test]
+    fn encode_narrow_substitutes_within_a_dbcs_code_page() {
+        let collation = SqlCollation {
+            info: 0x0411, // Japanese -> Shift_JIS
+            lcid_language_id: 0,
+            col_flags: 0,
+            sort_id: 0,
+        };
+        let encoded = encode_narrow("\u{3042}\u{0141}", collation);
+        assert_eq!(encoded.bytes, b"\x82\xa0?");
+        assert!(encoded.had_loss);
+    }
+
+    /// The OEM code pages take the table-backed codec rather than `encoding_rs`
+    /// and emit the same numeric character reference, so they must substitute on
+    /// the same terms.
+    ///
+    /// Measured with `WideCharToMultiByte(437, 0, ...)`: `U+65E5` is `3F` with
+    /// the loss flag set. `U+0141` is deliberately not used here - CP437
+    /// best-fits it to `4C` (`L`), which is parity-deviations entry 21 rather
+    /// than a substitution.
+    #[test]
+    fn encode_narrow_substitutes_under_an_oem_code_page() {
+        let collation = SqlCollation {
+            info: 0x0409,
+            lcid_language_id: 0,
+            col_flags: 0,
+            sort_id: 30, // CP437
+        };
+        let encoded = encode_narrow("\u{65e5}", collation);
+        assert_eq!(encoded.bytes, b"?");
+        assert!(encoded.had_loss);
+    }
+
+    /// An astral character is two UTF-16 code units and substitutes as two
+    /// bytes, matching `WideCharToMultiByte` (measured: `U+1F600` gives `3F 3F`
+    /// under CP1252 *and* CP932) and SQL Server
+    /// (`DATALENGTH(CAST(N'😀' AS varchar(4)))` is 2). Counting scalars would
+    /// make the value a byte shorter here than through msodbcsql on Windows.
+    ///
+    /// msodbcsql's glibc leg disagrees — `//TRANSLIT` resolves the scalar in
+    /// `iconv`, yielding one byte (measured, glibc 2.35); musl is unmeasured.
+    /// That is parity-deviations entry 21, and it is why the e2e counterpart
+    /// `AstralUnmappableCharacterSubstitutesPerUtf16Unit` is skipped under
+    /// comparison. This unit test pins *this* driver's encoder, which takes the
+    /// Windows/engine answer on every platform.
+    #[test]
+    fn encode_narrow_substitutes_one_byte_per_utf16_unit() {
+        let collation = SqlCollation {
+            info: 0x0409, // Windows-1252
+            lcid_language_id: 0,
+            col_flags: 0,
+            sort_id: 0,
+        };
+        let encoded = encode_narrow("\u{1F600}", collation);
+        assert_eq!(encoded.bytes, b"??", "one substitute per UTF-16 unit");
+        assert!(encoded.had_loss);
+
+        // Mixed with a BMP unmappable, which stays one byte.
+        assert_eq!(encode_narrow("\u{65e5}\u{1F600}", collation).bytes, b"???");
+    }
+
+    #[test]
+    fn sort_id_overrides_lcid_for_decode_and_encode() {
+        for (sort_id, bytes, text) in [
+            (30, b"\x82\xb3\xe0".as_slice(), "é│α"),
+            (40, b"\x82\xb3\xd0".as_slice(), "é│ð"),
+            (50, b"\xe9".as_slice(), "é"),
+            (85, b"\xa3".as_slice(), "Ł"),
+            (105, b"\xc6".as_slice(), "Ж"),
+            (112, b"\xc1".as_slice(), "Α"),
+            (122, b"\xc1".as_slice(), "Α"),
+            (130, b"\xd0".as_slice(), "Ğ"),
+            (137, b"\xe0".as_slice(), "א"),
+            (145, b"\xc7".as_slice(), "ا"),
+            (153, b"\xc0".as_slice(), "Ą"),
+            (183, b"\xe9".as_slice(), "é"),
+            (192, b"\x82\xa0".as_slice(), "あ"),
+            (194, b"\xb0\xa1".as_slice(), "가"),
+            (196, b"\xa4\xa4".as_slice(), "中"),
+            (203, b"\xd6\xd0".as_slice(), "中"),
+            (204, b"\xa1".as_slice(), "ก"),
+            (210, b"\xe9".as_slice(), "é"),
+            (217, b"\xe9".as_slice(), "é"),
+        ] {
+            let collation = SqlCollation {
+                info: 0x0409,
+                lcid_language_id: 0,
+                col_flags: 0,
+                sort_id,
+            };
+            let encoding = EncodingType::LcidBased(collation);
+            assert_eq!(SqlString::decode(bytes, encoding), text);
+            assert_eq!(encode_narrow(text, collation).bytes, bytes);
+            if matches!(sort_id, 30 | 40) {
+                assert_eq!(encoding.encoding(), None);
+            }
+        }
+    }
+
+    #[test]
+    fn sort_id_table_matches_reference_assignments() {
+        // msodbcsql Sql/Common/include/tdssort.h, x_rguiCodepageFromSortid.
+        // SQL Server 2022 also emits 122 and 210..=217, absent from that header.
+        for (sort_id, actual) in CODE_PAGE_FROM_SORT_ID.iter().enumerate() {
+            let expected = match sort_id {
+                30..=34 => Some(437),
+                40..=44 | 49 | 55..=61 => Some(850),
+                50..=54 | 71..=75 | 183..=186 | 210..=217 => Some(1252),
+                80..=97 => Some(1250),
+                104..=108 => Some(1251),
+                112..=114 | 120..=122 | 124 => Some(1253),
+                128..=130 => Some(1254),
+                136..=138 => Some(1255),
+                144..=146 => Some(1256),
+                152..=160 => Some(1257),
+                192 | 193 | 200 => Some(932),
+                194 | 195 | 201 => Some(949),
+                196 | 197 | 202 => Some(950),
+                198 | 199 | 203 => Some(936),
+                204..=206 => Some(874),
+                _ => None,
+            };
+            assert_eq!(*actual, expected, "sort ID {sort_id}");
+        }
+    }
+
+    #[test]
+    fn every_sort_table_entry_resolves_before_unknown_lcid() {
+        for (sort_id, code_page) in CODE_PAGE_FROM_SORT_ID.iter().enumerate() {
+            let Some(code_page) = code_page else {
+                continue;
+            };
+            let collation = SqlCollation {
+                info: 0x000f_ffff,
+                lcid_language_id: 0,
+                col_flags: 0,
+                sort_id: sort_id as u8,
+            };
+            let expected = match code_page {
+                437 => "IBM437",
+                850 => "IBM850",
+                874 => "windows-874",
+                932 => "Shift_JIS",
+                936 => "GBK",
+                949 => "EUC-KR",
+                950 => "Big5",
+                _ => "",
+            };
+            let expected = if expected.is_empty() {
+                format!("windows-{code_page}")
+            } else {
+                expected.to_string()
+            };
+            assert_eq!(resolve_collation(collation).name(), expected);
+        }
+    }
+
+    #[test]
+    fn utf8_overrides_every_sort_id_and_lcid() {
+        for sort_id in 0..=255 {
+            let collation = SqlCollation {
+                info: 0x0400_0409,
+                lcid_language_id: 0,
+                col_flags: 0x40,
+                sort_id,
+            };
+            let encoding = EncodingType::LcidBased(collation);
+            assert_eq!(encoding.encoding(), Some(encoding_rs::UTF_8));
+            assert_eq!(SqlString::decode("é😀".as_bytes(), encoding), "é😀");
+            assert_eq!(encode_narrow("é😀", collation).bytes, "é😀".as_bytes());
+        }
+    }
+
+    #[test]
+    fn absent_or_unknown_sort_id_preserves_lcid_and_unknown_lcid_fallback() {
+        for sort_id in [0, 1, 255] {
+            for (lcid, expected, text) in [
+                (0x0409, encoding_rs::WINDOWS_1252, "Æ"),
+                (0x0419, encoding_rs::WINDOWS_1251, "Ж"),
+                (0x000f_ffff, encoding_rs::WINDOWS_1252, "Æ"),
+            ] {
+                let collation = SqlCollation {
+                    info: lcid | 0x2000_0000,
+                    lcid_language_id: 0,
+                    col_flags: 0,
+                    sort_id,
+                };
+                let encoding = EncodingType::LcidBased(collation);
+                assert_eq!(encoding.encoding(), Some(expected));
+                assert_eq!(SqlString::decode(b"\xc6", encoding), text);
+                assert_eq!(encode_narrow(text, collation).bytes, b"\xc6");
+            }
+        }
+        assert_eq!(EncodingType::DelayedSet.resolved_encoding(), None);
     }
 }

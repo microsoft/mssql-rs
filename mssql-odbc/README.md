@@ -1,119 +1,211 @@
+<!--
+User-facing introduction to the mssql-odbc crate: what the driver is, how to
+obtain it, and how to build, test and configure it. Keep it oriented to new
+readers and users of the driver.
+
+Do not add implementation details, design rationale, or engineering
+instructions here. Behavioral contracts belong in
+`.github/instructions/mssql-odbc.instructions.md`, deliberate departures from
+msodbcsql in `docs/parity-deviations.md`, and subsystem design in the
+corresponding `docs/*.md` plan.
+-->
+
 # mssql-odbc
 
-Rust implementation of the Microsoft ODBC Driver 18 for SQL Server (`msodbcsql18`),
-built on top of [mssql-tds](../mssql-tds).
+`mssql-odbc` is a cross-platform ODBC 3.x driver for Microsoft SQL Server and
+Azure SQL, written in Rust and built on [mssql-tds](../mssql-tds). It exposes
+the native ODBC C API as a shared library that applications load through the
+platform's ODBC Driver Manager.
 
-## What it does
+> [!IMPORTANT]
+> The driver is alpha software under active development. It is being validated
+> as an opt-in backend for
+> [mssql-python](https://github.com/microsoft/mssql-python), but it is not yet a
+> complete, general-purpose replacement for Microsoft ODBC Driver 18 for SQL
+> Server.
 
-Produces a shared library (`libmsodbcsql18.so` / `libmsodbcsql.18.dylib` / `msodbcsql18.dll`) that implements
-the ODBC C API. The ODBC Driver Manager (`unixODBC` on Linux/macOS, `odbc32` on Windows)
-loads it via `dlopen` — applications use standard ODBC calls without knowing the driver
-is written in Rust.
+## Distribution
 
-## Build
+The driver is included in
+[`mssql-python-rs`](https://pypi.org/project/mssql-python-rs/), the native
+runtime used by `mssql-python`. See the PyPI release page for the current
+version and available Windows, macOS, and Linux wheels.
 
-```bash
-cargo build              # debug build
-cargo build --release    # release build
+This crate is not published independently to crates.io. Build it from this
+workspace when developing or testing the ODBC library directly.
+
+## How it works
+
+```mermaid
+flowchart TD
+    application[Application]
+    driverManager[ODBC Driver Manager<br/>Windows or unixODBC]
+    odbcDriver[mssql-odbc<br/>Native shared library]
+    tdsClient[mssql-tds<br/>TDS protocol client]
+    sqlServer[SQL Server or Azure SQL]
+
+    application -->|ODBC C API| driverManager
+    driverManager -->|Loads driver| odbcDriver
+    odbcDriver -->|Rust API| tdsClient
+    tdsClient -->|TDS protocol| sqlServer
 ```
 
-Output location: `target/{debug,release}/` with a platform-specific filename:
+User-visible performance behavior is recorded as data-path contracts in the
+[ODBC driver engineering guidelines](../.github/instructions/mssql-odbc.instructions.md#11-performance-and-ffi-data-movement).
+The measurements and trade-offs behind each contract live beside the code that
+implements it, and deliberate departures from msodbcsql are recorded in the
+[parity registry](docs/parity-deviations.md). Subsystem design notes live in
+[`docs/`](docs/).
 
-| Platform | Output file |
-|---|---|
-| Linux | `libmsodbcsql18.so` |
-| macOS | `libmsodbcsql18.dylib` |
-| Windows | `msodbcsql18.dll` |
+## Platform artifacts
 
-The `build.rs` script embeds platform-specific metadata:
-- **Linux:** `soname` → `libmsodbcsql-18.4.so.1.1`
-- **macOS:** `install_name` → `libmsodbcsql.18.dylib`
-- **Windows:** no extra linker args needed
+| Platform | Driver Manager | Library |
+|---|---|---|
+| Windows | Windows ODBC Driver Manager | `mssqlodbc.dll` |
+| macOS | unixODBC | `mssqlodbc.dylib` |
+| Linux | unixODBC | `mssqlodbc.so` |
 
-## Testing
+## Build from source
 
-### Rust unit tests
+Install the repository's pinned Rust toolchain. Linux and macOS builds also
+need unixODBC development headers; the C++ end-to-end tests additionally need
+CMake and a C++17 compiler.
 
-```bash
-cargo btest -p mssql-odbc
-```
-
-### C++ e2e tests (Google Test)
-
-End-to-end tests that exercise the driver through the ODBC Driver Manager,
-matching the msodbcsql gtest infrastructure. See [tests/e2e/README.md](tests/e2e/README.md).
+From the repository root:
 
 ```bash
-cd tests/e2e
-./run_e2e.sh               # builds driver + registers + cmake + ctest
+cargo build -p mssqlodbc
+bash mssql-odbc/scripts/finalize-artifact.sh debug
 ```
 
-Or run test binaries directly (self-registers the driver automatically):
+For an optimized build, add `--release` to `cargo build` and pass `release` to
+the finalization script.
+
+On Windows, use PowerShell after building:
+
+```powershell
+cargo build -p mssqlodbc
+./mssql-odbc/scripts/finalize-artifact.ps1 -BuildProfile debug
+```
+
+The finalization script prints the artifact path under the workspace Cargo
+target directory.
+
+## Test
+
+Run the Rust test suite from the repository root:
 
 ```bash
-./build/smoke_test
-./build/alloc_env_test
+cargo nextest run -p mssqlodbc --lib
 ```
+
+### C++ end-to-end tests
+
+The C++ end-to-end suite loads the built library through the real ODBC Driver
+Manager and exercises the exported API:
+
+```bash
+bash mssql-odbc/tests/e2e/run_e2e.sh
+```
+
+On Windows, run:
+
+```powershell
+./mssql-odbc/tests/e2e/run_e2e.ps1
+```
+
+See the [end-to-end test guide](tests/e2e/README.md) for prerequisites,
+connection configuration, targeted runs, coverage, and comparison testing
+against `msodbcsql18`.
+
+### Buffer safety with Miri
+
+The `miri-odbc` nextest profile selects the opt-in `memory_safety` unit-test
+modules and misalignment tests. It exercises ODBC caller-buffer handling,
+including unaligned values and indicators, string bounds, fixed-width writes,
+and column-wise and row-wise array address calculations. PR validation runs
+this profile on Windows x64 and Linux x64.
+
+From the repository root, with `cargo-nextest` installed:
+
+```powershell
+cargo fetch
+rustup toolchain install nightly-2026-09-06 --profile minimal --component miri,rust-src
+cargo +nightly-2026-09-06 miri nextest run --frozen -p mssqlodbc --lib --profile miri-odbc
+```
+
+The CI toolchain pin is `miriToolchain` in
+`.pipeline/templates/validation-stages.yml`; use that value if it changes.
+On Windows, set a short target directory if Miri reports that compiler response
+files are unsupported:
+
+```powershell
+$env:CARGO_TARGET_DIR = Join-Path $env:TEMP "odbc-miri"
+```
+
+Run the same selection natively with:
+
+```powershell
+cargo nextest run --frozen -p mssqlodbc --lib --profile miri-odbc
+```
+
+This profile intentionally excludes handle fixtures (which start an I/O-enabled
+Tokio runtime), socket-based mock servers, native authentication/TLS, and the
+C++ Driver Manager tests. It complements rather than replaces native
+end-to-end tests and fuzzing.
+
+## Temporal character literals
+
+Character parameters and character-column fetches accept `YYYY/MM/DD` dates
+and ODBC temporal literals: `{d 'YYYY-MM-DD'}`, `{t 'HH:MM:SS'}`, and
+`{ts 'YYYY-MM-DD HH:MM:SS[.fraction]'}`. Escape keywords are case-insensitive;
+numeric fields are fixed-width, and timestamps retain up to nine fractional
+digits before target-specific conversion. Slash dates are date-only and do
+not apply inside escapes. Malformed values report `22018`.
+
+Existing plain-text forms remain supported, including ISO `T` separators,
+unpadded month/day/time fields, and times without seconds. See
+[the parameter conversion notes](docs/parameters_plan.md#character-c-type-to-a-temporal-parametertype-ab47851)
+for grammar and reference-driver measurements.
 
 ## Tracing
 
-Tracing is disabled by default. Enable it with environment variables:
+Tracing is disabled by default and is intended for diagnostics.
 
-| Variable | Default | Description |
+| Variable | Default | Purpose |
 |---|---|---|
-| `MSSQL_TDS_TRACE` | `false` | Set to `true` to enable tracing output |
-| `MSSQL_TDS_TRACE_LEVEL` | `warn` | Tracing filter expression (`tracing_subscriber::EnvFilter`) |
+| `MSSQL_TDS_TRACE` | `false` | Set to `true` to enable tracing |
+| `MSSQL_TDS_TRACE_LEVEL` | `warn` | Set a `tracing_subscriber::EnvFilter` expression |
+| `MSSQL_TDS_TRACE_DIR` | unset | Write per-process trace files to this directory instead of stderr |
 
-Examples:
+For example:
 
 ```bash
-# Enable default warn-level logging
-MSSQL_TDS_TRACE=true cargo btest -p mssql-odbc
-
-# ODBC-driver-focused debug logs only
-MSSQL_TDS_TRACE=true MSSQL_TDS_TRACE_LEVEL="warn,msodbcsql18=debug" cargo btest -p mssql-odbc
-
-# Full filter syntax is supported
-MSSQL_TDS_TRACE=true MSSQL_TDS_TRACE_LEVEL="warn,msodbcsql18=debug,mssql_tds=off" cargo btest -p mssql-odbc
+MSSQL_TDS_TRACE=true \
+MSSQL_TDS_TRACE_LEVEL="warn,mssqlodbc=debug" \
+MSSQL_TDS_TRACE_DIR="./traces" \
+cargo nextest run -p mssqlodbc --lib
 ```
 
-## Architecture
+Trace events can contain SQL text and parameter values. On Unix the driver
+creates trace files with mode `0600`, and warns on stderr when
+`MSSQL_TDS_TRACE_DIR` is writable by group or other users, or points inside the
+system temporary directory. Configuration is captured on the first ODBC call: a
+relative directory is resolved to an absolute path at that point, and the
+settings cannot be changed while the driver stays loaded. Trace files are not
+rotated or deleted automatically.
 
-```
-Application
-    ↓ ODBC C API (SQLAllocHandle, SQLDriverConnect, ...)
-Driver Manager (unixODBC / odbc32)
-    ↓ dlopen / LoadLibrary
-libmsodbcsql18.so (this crate)
-    ↓
-mssql-tds (TDS protocol)
-    ↓
-SQL Server
-```
+## Contributing
 
-Each ODBC entry point is a thin `pub unsafe extern "C"` wrapper in `exports.rs`
-that the Driver Manager resolves by symbol name. The wrapper delegates to a
-layered impl: panic boundary (`ffi_entry!` macro) → unsafe shim (raw-pointer
-validation) → safe core (business logic). See the conventions file below for
-details.
+Start with the repository [contribution guide](../CONTRIBUTING.md). Changes to
+this crate must also follow the
+[ODBC driver engineering guidelines](../.github/instructions/mssql-odbc.instructions.md),
+which define the FFI safety, error handling, concurrency, parity, and testing
+requirements.
 
-## Connection busy gate
+Report security vulnerabilities according to the repository
+[security policy](../SECURITY.md).
 
-`SQLFetch`/`SQLFetchScroll`/`SQLGetData` release the connection's busy claim
-(`DbcState::active_stmt`) as soon as the wire is drained for the current
-statement, instead of holding it for the statement's whole cursor lifetime —
-matching msodbcsql's wire-state `FIsBusyReadingData` gate (see AB#47508).
-This costs a one-token read-ahead on ordinary fetches: no extra round trip,
-but returning row N can now wait on row N+1's header arriving. See
-`release_busy_if_row_exhausted` in `src/api/exec_common.rs` for the full
-trade-off and why it was accepted as-is.
+## License
 
-## Conventions
-
-Before writing or modifying code in this crate, read
-[`.github/instructions/mssql-odbc.instructions.md`](../.github/instructions/mssql-odbc.instructions.md).
-It covers panic safety, FFI boundary conventions (the mandatory `ffi_entry!`
-macro and safe-core/unsafe-shell split), unsafe-code rules, memory ownership
-rules, concurrency and handle-hierarchy locking, diagnostic posting
-(`post_sql_error` vs. `post_tds_error`), and testing requirements (the
-`TestHandles` helper).
+Licensed under the [MIT License](../LICENSE).

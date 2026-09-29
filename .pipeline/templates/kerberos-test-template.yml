@@ -23,7 +23,7 @@
 #   # For merge/CI builds (full matrix)  
 #   - template: templates/kerberos-test-template.yml
 #     parameters:
-#       profiles: ['ubuntu22', 'ubuntu24', 'alpine318', 'alpine319', 'alpine320', 'alpine321', 'debian', 'rhel9', 'oracle9']
+#       profiles: ['ubuntu22', 'ubuntu24', 'alpine318', 'alpine321', 'debian', 'rhel9', 'oracle9']
 
 parameters:
   - name: profiles
@@ -36,7 +36,7 @@ parameters:
     default: 'RUST-X64-WUS3'
   - name: poolImageOverride
     type: string
-    default: 'imageOverride -equals RUST-UBUSLIM'
+    default: 'imageOverride -equals RUST-AZL3'
   - name: testTimeout
     type: number
     default: 60
@@ -80,7 +80,7 @@ jobs:
           docker compose version
         displayName: 'Install docker-compose plugin'
       
-      - template: install-ubuntu-dependency.yaml
+      - template: install-host-dependency.yaml
         parameters:
           installAzCli: false
           installDocker: true

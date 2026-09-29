@@ -1,0 +1,102 @@
+name: Code Review Skill Drift
+description: Record something a review learned that the code-review skill got wrong, missed, or no longer matches
+title: "[review-skill] "
+labels: ["skill:code-review"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For observations about `.github/skills/code-review/SKILL.md` itself — not about the code under review.
+        File one issue per observation so each can be judged on its own evidence.
+
+        These issues are the queue a periodic maintenance pass reads when proposing skill edits, so
+        favor a precise observation with evidence over a polished suggestion.
+
+        **Important:** Before posting, redact sensitive information from all report fields and evidence, including commands, output, and diff excerpts. Do not include connection strings, passwords, access tokens, customer data, or non-public source.
+
+        **Security vulnerabilities:** Do not report suspected or confirmed security vulnerabilities in public issues or comments, including as skill drift. Follow the private Microsoft Security Response Center reporting process at [https://aka.ms/SECURITY.md](https://aka.ms/SECURITY.md) instead. Redacting secrets does not make vulnerability details safe to publish.
+
+  - type: dropdown
+    id: class
+    attributes:
+      label: Drift class
+      options:
+        - Wrong finding — raised, then retracted or downgraded after checking
+        - Missed defect — the skill's checklist should have caught it and didn't
+        - Stale fact — a constant, path, or behavior in the skill no longer matches the repo
+        - Wasted step — cost review time without changing the outcome
+        - Mechanizable — this finding class recurs and a lint, test, or CI check could catch it
+    validations:
+      required: true
+
+  - type: input
+    id: source
+    attributes:
+      label: Where it happened
+      description: >-
+        PR, review thread, or comment URL. For a local review without a PR, identify the
+        repository and base/HEAD commit IDs, and include the relevant diff excerpt in
+        Evidence for uncommitted changes.
+    validations:
+      required: true
+
+  - type: textarea
+    id: says
+    attributes:
+      label: What the skill says today
+      description: >-
+        Quote the bullet or section, or state that nothing covers this. If the skill is silent,
+        say what a reviewer would reasonably have assumed instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: observed
+    attributes:
+      label: What actually turned out to be true
+      description: The observation that contradicts it, in the terms a future reviewer would need.
+    validations:
+      required: true
+
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence
+      description: >-
+        Redacted evidence: `file:line`, the command you ran and its output, public reference-driver source, or the
+        thread where it was settled. An assertion without one of these can't be promoted.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: cost
+    attributes:
+      label: What it cost
+      description: Sets the bar for acting on a single occurrence rather than waiting for a repeat.
+      options:
+        - A retracted blocking finding
+        - A retracted or downgraded non-blocking finding
+        - A defect reached main
+        - Review time only
+        - Nothing yet — noticed before it mattered
+    validations:
+      required: true
+
+  - type: textarea
+    id: recurrence
+    attributes:
+      label: Prior occurrences
+      description: Links to earlier instances, if you know of any. Recurrence is what promotes an entry.
+    validations:
+      required: false
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+      description: >-
+        Optional. If prose, name the section it belongs in and what it would replace — the skill is
+        read on every review and has a size budget, so additions are traded against removals. If a
+        check would catch it instead, say which one and skip the prose.
+    validations:
+      required: false

@@ -25,7 +25,8 @@ Manager; the harness never links to the Rust driver.
 | `ODBC_BENCH_ENCRYPT` | `Mandatory` | `Encrypt` value |
 | `ODBC_BENCH_PACKET_SIZE` | `16192` | Cross-platform encrypted-lab value honored exactly by Microsoft ODBC 18.6.2.1 and both Rust builds; set through both ODBC attribute and connection keyword, then read back |
 | `ODBC_BENCH_PACKET_SIZE_KEYWORD` | `PacketSize` | `PacketSize` or Microsoft driver spelling `Packet Size` |
-| `ODBC_BENCH_SCENARIO` | all | Run only `narrow`, `wide`, `rowset`, `varwidth`, or `getdata` |
+| `ODBC_BENCH_SCENARIO` | all | Run only `narrow`, `wide`, `rowset`, `varwidth`, `getdata`, or `write` |
+| `ODBC_BENCH_WRITE_MODE` | `parameter_array` | Use one parameter-array execute, or `sequential` for a driver without array support |
 
 Missing required values, connection errors, absent/invalid tables, ODBC
 warnings during retrieval, and correctness failures make the process fail.
@@ -87,6 +88,7 @@ leg reads the same tables:
 - `dbo.mssql_odbc_bench_lobmax_1k_c3`
 - `dbo.mssql_odbc_bench_mixedlob_20k_c16`
 - `dbo.mssql_odbc_bench_variant_20k_c4`
+- `dbo.mssql_odbc_bench_param_array`
 
 `mssql_odbc_bench_admin print-sql` prints the exact DDL, generator, and
 projection SQL for the whole catalog without connecting, which is the offline way
@@ -104,7 +106,7 @@ After both legs:
 
 ## Workloads
 
-Thirteen measurements over eight tables, all of them C++ calls into the driver.
+Fourteen measurements over nine tables, all of them C++ calls into the driver.
 Every id encodes the data shape, the row and column counts, and the access shape,
 and is identical on all three driver legs. The shapes are drawn from what
 `mssql-python` asks a driver to do; nothing here runs Python.
@@ -175,9 +177,13 @@ four measure that path.
   separates the call shape from the cadence.
 - `getdata/rowwise_1k_c3_lob_max/chunked_8192` — `NVARCHAR(MAX)` of 9,000-9,999
   characters and `VARCHAR(MAX)` of 20,000-20,999 bytes. Both are past one
-  8192-byte chunk, so each non-NULL value needs three calls total (the initial
-  call plus two continuations); preflight fails the run if a value arrives in
-  fewer, because then the loop under test never ran.
+  8192-byte chunk, so each non-NULL value needs at least three calls total (the
+  initial call plus two continuations); conversion may produce shorter chunks and
+  require more calls. Preflight fails the run if a value arrives in fewer, because
+  then the loop under test never ran.
+  Payload is read up to the first NUL character in each chunk, not inferred from
+  the remaining-length indicator or unused buffer contents. The generated text
+  contains no embedded NULs.
 - `getdata/rowwise_20k_c16_mixed_lob/whole_result_rowwise` — the 15-column fixed
   pattern plus one *small* `NVARCHAR(MAX)`. The payload is tiny on purpose: what
   this measures is one PLP column moving all sixteen onto the row-at-a-time path.
@@ -192,10 +198,30 @@ four measure that path.
   Manager, which rejects a `NULL` target with `HY009` before the driver sees the
   call. Both drivers treat the two forms identically.
 
-  Only base types whose reported C type is unambiguous are used. `mssql-odbc`
-  deliberately reports `SQL_C_CHAR` where msodbcsql reports `SQL_C_NUMERIC` for
-  decimal/money variants, and a benchmark that depended on that difference would
-  not be the same work on both drivers.
+  The exact numerics are not among the base types measured, but no longer for a
+  parity reason: since AB#47702 both drivers answer `SQL_C_NUMERIC` for
+  decimal/money variants, which the harness folds onto `SQL_C_CHAR` on either
+  driver. The column set is unchanged so existing baselines stay comparable.
+
+### `write` — 2,000-row parameter-array insert
+
+- `write/insert_2000_c3/executemany`
+
+The workload prepares one three-parameter `INSERT` and writes 2,000 rows of
+`INT`, `NVARCHAR(15)`, and `BIGINT` values. `parameter_array` mode binds the
+three buffers column-wise and performs one `SQLExecute`; `sequential` mode
+executes the same prepared statement once per row. The timed region contains
+only the execute calls. Autocommit is disabled to match `mssql-python`'s default;
+the single commit, setup, prepare, binding, validation, and truncation are
+outside the timed region.
+
+Preflight and every sample verify `SQLRowCount`, all parameter status entries,
+`SQL_ATTR_PARAMS_PROCESSED_PTR`, row count, numeric sums, and total text length.
+The dedicated perf runners use parameter arrays for the candidate and pinned
+msodbcsql legs. The checked-in Rust baseline predates parameter-array execution
+and rejects `SQL_ATTR_PARAMSET_SIZE > 1`, so it runs the explicitly reported
+sequential mode instead; the result is a sequential-baseline comparison, not a
+claim that the pinned baseline executed a parameter array.
 
 ## Measurement boundaries
 
@@ -210,6 +236,7 @@ access shape:
 | `bound_rowset_*` | `SQLExecDirect`, `SQLNumResultCols`, every `SQLDescribeCol`, every `SQLBindCol`, all `SQLFetchScroll` calls |
 | `bind_cycle_*` | the same, but describe + bind + row-array set + fetch + row-array reset + `SQLFreeStmt(SQL_UNBIND)` repeated once per rowset |
 | `getdata/*` | `SQLExecDirect`, the initial describe, then per row: `SQLFetch`, and per column a `SQLDescribeCol` plus its `SQLGetData` calls (including LOB continuations and the variant probe/`SQLColAttribute` pair) |
+| `write/*` | one parameter-array `SQLExecute`, or 2,000 sequential `SQLExecute` calls on the pinned Rust baseline |
 
 The per-cell `SQLDescribeCol` in the row-at-a-time shape is not an accident: it
 mirrors `SQLGetData_wrap`, which re-describes every column on every row, so it is

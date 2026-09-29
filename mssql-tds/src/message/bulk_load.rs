@@ -15,6 +15,9 @@ use crate::datatypes::sqldatatypes::TdsDataType;
 use crate::datatypes::tds_value_serializer::{TdsTypeContext, TdsValueSerializer};
 use crate::error::Error;
 use crate::io::packet_writer::{PacketWriter, TdsPacketWriter};
+use crate::sql_identifier::{
+    TABLE_INDEX, build_multipart_name, escape_identifier, parse_multipart_identifier,
+};
 use crate::token::tokens::SqlCollation;
 use tracing::{debug, trace};
 
@@ -469,6 +472,29 @@ impl<'a> StreamingBulkLoadWriter<'a> {
         );
 
         Ok(())
+    }
+
+    /// Whether any value written into this bulk-load message lost a character
+    /// to the target collation's code page.
+    ///
+    /// A bulk row goes through the same `TdsValueSerializer` as an RPC
+    /// parameter, so a narrow value can be substituted here too. Read this
+    /// *before* [`Self::end`], which consumes the writer along with its borrow
+    /// of the `PacketWriter` the flag lives on; `end` writes only the DONE
+    /// token, so no value can be substituted after this point.
+    ///
+    /// **Not reported for an Always Encrypted column.**
+    /// [`Self::write_column_value`] encrypts the cell before the plaintext
+    /// serializer runs, and `normalize_column_value` hands
+    /// `ColumnValues::String` to the cipher as its existing bytes, so the
+    /// narrow encoder never sees the value: nothing is substituted and this
+    /// stays `false`. That path also assumes the caller already encoded to the
+    /// column's code page — `SqlString::from_utf8_string` produces UTF-16LE, so
+    /// an encrypted `varchar` can be sealed over the wrong plaintext. Both are
+    /// pre-existing in the cell-encryption path rather than consequences of the
+    /// substitution work; tracked separately from AB#47598.
+    pub fn code_page_conversion_loss(&self) -> bool {
+        self.packet_writer.code_page_conversion_loss()
     }
 
     /// End streaming - write DONE token and finalize packet.
@@ -1041,6 +1067,16 @@ pub(crate) fn build_insert_bulk_command(
     column_metadata: &[BulkCopyColumnMetadata],
     options: &BulkCopyOptions,
 ) -> crate::core::TdsResult<String> {
+    let parts = parse_multipart_identifier(table_name, true)?;
+    if parts[TABLE_INDEX]
+        .as_ref()
+        .is_none_or(|part| part.is_empty())
+    {
+        return Err(Error::UsageError(format!(
+            "Invalid table name: {table_name}"
+        )));
+    }
+    let table_name = build_multipart_name(&parts);
     let mut command = format!("INSERT BULK {table_name} (");
 
     for (i, col_meta) in column_metadata.iter().enumerate() {
@@ -1049,7 +1085,8 @@ pub(crate) fn build_insert_bulk_command(
         }
 
         // Column name
-        command.push_str(&format!("[{}] ", col_meta.column_name));
+        command.push_str(&escape_identifier(&col_meta.column_name));
+        command.push(' ');
 
         // Type definition
         let type_def = col_meta.get_sql_type_definition()?;
@@ -1058,6 +1095,19 @@ pub(crate) fn build_insert_bulk_command(
         // Add COLLATE clause if the column needs collation and has a collation name
         if let (true, Some(collation_name)) = (col_meta.needs_collation(), &col_meta.collation_name)
         {
+            if collation_name.len() > 128
+                || !collation_name
+                    .as_bytes()
+                    .first()
+                    .is_some_and(u8::is_ascii_alphabetic)
+                || !collation_name
+                    .bytes()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == b'_')
+            {
+                return Err(Error::UsageError(format!(
+                    "Invalid collation name: {collation_name}"
+                )));
+            }
             command.push_str(&format!(" COLLATE {}", collation_name));
         }
     }
@@ -1517,5 +1567,53 @@ mod ae_colmetadata_tests {
             format!("{err}").to_lowercase().contains("out of bounds"),
             "expected an out-of-bounds error, got: {err}"
         );
+    }
+
+    /// A bulk row goes through the same `TdsValueSerializer` as an RPC
+    /// parameter, so a narrow value carrying a character the target collation's
+    /// code page cannot hold is substituted with `?` here too, and the message
+    /// must record it — `TdsClient::take_code_page_conversion_loss` promises a
+    /// bulk substitution is reported, and this accessor is how the client
+    /// learns of it (AB#47598).
+    ///
+    /// Read before `end()`, which consumes the writer; `end()` writes only the
+    /// DONE token, so nothing can be substituted after that point.
+    #[tokio::test]
+    async fn bulk_row_reports_a_code_page_substitution() {
+        // Windows-1252 via LCID 0x0409: U+65E5 has no representation.
+        let latin1 = SqlCollation {
+            info: 0x0409,
+            lcid_language_id: 0,
+            col_flags: 0,
+            sort_id: 0,
+        };
+        let column =
+            BulkCopyColumnMetadata::new("v", SqlDbType::VarChar, TdsDataType::BigVarChar as u8)
+                .with_length(8, TypeLength::Variable(8))
+                .with_collation(latin1);
+
+        for (text, expected_loss) in [("caf\u{e9}", false), ("caf\u{65e5}", true)] {
+            let mut net = CapturingWriter { buffer: Vec::new() };
+            let mut packet_writer = PacketWriter::new(PacketType::BulkLoad, &mut net, None, None);
+            let mut writer = StreamingBulkLoadWriter::new(
+                &mut packet_writer,
+                "T".to_string(),
+                vec![column.clone()],
+                latin1,
+            );
+            writer.begin().await.unwrap();
+
+            let value = ColumnValues::String(crate::datatypes::sql_string::SqlString::new(
+                text.as_bytes().to_vec(),
+                crate::datatypes::sql_string::EncodingType::Utf8,
+            ));
+            writer.write_column_value(0, &value).await.unwrap();
+
+            assert_eq!(
+                writer.code_page_conversion_loss(),
+                expected_loss,
+                "text {text:?}"
+            );
+        }
     }
 }

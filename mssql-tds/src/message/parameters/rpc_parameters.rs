@@ -6,6 +6,7 @@ use bitflags::bitflags;
 use crate::datatypes::column_values::DEFAULT_VARTIME_SCALE;
 use crate::datatypes::encoder::SqlValueEncoder;
 use crate::datatypes::sql_tvp::TvpTypeName;
+use crate::datatypes::sql_udt::UdtTypeName;
 use crate::datatypes::sqldatatypes::VectorBaseType;
 use crate::datatypes::sqltypes::SqlType;
 use crate::{
@@ -76,9 +77,9 @@ pub(crate) struct RpcEncryptionMetadata {
 ///
 /// A `None`-valued `Decimal`/`Numeric` or `Time`/`DateTime2`/`DateTimeOffset`
 /// has no value to read precision and scale from, so a typed NULL would
-/// otherwise fall back to the TDS defaults. Supplying this metadata drives both
-/// the SQL declaration text and the wire `TYPE_INFO`, so the two cannot
-/// disagree.
+/// otherwise fall back to the TDS defaults. By default this metadata drives both
+/// the SQL declaration and wire `TYPE_INFO`. A separate bound SQL numeric target
+/// can be specified with [`RpcParameter::with_numeric_declaration`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RpcTypeMetadata {
     /// Decimal/numeric precision.
@@ -105,8 +106,14 @@ pub(crate) struct EncryptedRpcValue {
 /// written before the total value length is known. Callers buffer any other type
 /// and send it materialized.
 ///
-/// TODO: extend to the remaining PLP types (`xml`, `json`, `udt`, `text`, `ntext`,
-/// `image`) for parity with the incremental read path.
+/// This selects the *wire* type only. The `@params` declaration can be narrowed
+/// independently - see [`RpcParameter::with_streamed_declaration`] - so a
+/// `varchar(10)` parameter still streams its body as `varchar(max)`.
+///
+/// TODO: `xml` and `udt` have no variant here and are buffered by the ODBC
+/// layer instead of streamed - correct on the wire, but it holds the whole
+/// value in memory (AB#48349). `text` / `ntext` / `image` need no variant:
+/// they are already mapped onto the `max` types above.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamedSqlType {
     /// Unicode MAX text.
@@ -118,7 +125,9 @@ pub enum StreamedSqlType {
 }
 
 impl StreamedSqlType {
-    /// Declaration name for the `sp_executesql` `@params` string. Delegates to
+    /// Default declaration name for the `sp_executesql` `@params` string, used
+    /// when the caller supplied no narrower one via
+    /// [`RpcParameter::with_streamed_declaration`]. Delegates to
     /// [`RpcParameter::get_sql_name_impl`] on the equivalent materialized
     /// [`SqlType`] rather than duplicating the `nvarchar(MAX)` / `varchar(MAX)`
     /// / `varbinary(MAX)` strings, so the two can't drift apart.
@@ -139,6 +148,12 @@ impl StreamedSqlType {
 enum RpcValue {
     Materialized(SqlType),
     Streamed(StreamedSqlType),
+}
+
+#[derive(Debug, Clone, Copy)]
+struct NumericDeclaration {
+    precision: u8,
+    scale: u8,
 }
 
 /// A single parameter in a TDS RPC request.
@@ -162,13 +177,21 @@ pub struct RpcParameter {
     value: RpcValue,
 
     /// Precision/scale for a value template that cannot carry them itself.
-    /// Applied to both the SQL declaration and the wire `TYPE_INFO`.
+    /// Applied to wire `TYPE_INFO` and, absent an override, the SQL declaration.
     type_metadata: Option<RpcTypeMetadata>,
+
+    /// A bound SQL numeric definition may differ from its incoming wire value.
+    numeric_declaration: Option<NumericDeclaration>,
+
+    /// Declaration for a streamed parameter whose `@params` type is narrower
+    /// than its PLP body. See [`RpcParameter::with_streamed_declaration`].
+    /// Cold metadata stays boxed to keep ordinary parameter arrays compact.
+    streamed_declaration: Option<Box<SqlType>>,
 
     /// When present, the parameter is sent encrypted (Always Encrypted): the
     /// ciphertext is serialized as a BIGVARBINARY with the ENCRYPTED status flag
     /// and a trailing CryptoMetaData block, bypassing the plaintext `value`.
-    encrypted: Option<EncryptedRpcValue>,
+    encrypted: Option<Box<EncryptedRpcValue>>,
 
     /// When `true`, the caller requires this parameter to be encrypted: if
     /// `sp_describe_parameter_encryption` reports the target column as not
@@ -187,6 +210,8 @@ impl RpcParameter {
             options,
             value: RpcValue::Materialized(value),
             type_metadata: None,
+            numeric_declaration: None,
+            streamed_declaration: None,
             encrypted: None,
             force_column_encryption: false,
         }
@@ -203,9 +228,28 @@ impl RpcParameter {
             options,
             value: RpcValue::Streamed(sql_type),
             type_metadata: None,
+            numeric_declaration: None,
+            streamed_declaration: None,
             encrypted: None,
             force_column_encryption: false,
         }
+    }
+
+    /// Declares a streamed parameter as `declaration` in the `@params` string
+    /// while its value body stays PLP-framed.
+    ///
+    /// The two are independent: PLP framing needs an unknown-length opener, so
+    /// the wire `TYPE_INFO` is always a `max`, but the variable the value is
+    /// assigned to can still be a bounded `varchar(n)`. That is how a streamed
+    /// parameter honours `ColumnSize` without giving up chunking, and it is
+    /// what msodbcsql sends (`odbc/sqlccmd.cpp:4676` passes `cbColDef`
+    /// alongside `VARMAX_INDICATOR`).
+    ///
+    /// Ignored for a materialized parameter, whose declaration comes from its
+    /// own value.
+    pub fn with_streamed_declaration(mut self, declaration: SqlType) -> Self {
+        self.streamed_declaration = Some(Box::new(declaration));
+        self
     }
 
     /// Returns `true` if this parameter's value is supplied via the
@@ -236,17 +280,50 @@ impl RpcParameter {
     /// Supplies precision/scale for a value template that cannot carry them —
     /// a typed NULL `Decimal`/`Numeric` or `Time`/`DateTime2`/`DateTimeOffset`.
     ///
-    /// The same metadata drives the SQL declaration and the wire `TYPE_INFO`,
-    /// so a caller cannot declare `decimal(12,3)` while sending `NUMERIC(1,0)`.
+    /// By default this drives both the SQL declaration and wire `TYPE_INFO`.
+    /// [`Self::with_numeric_declaration`] can specify a separate SQL target.
     pub fn with_type_metadata(mut self, metadata: RpcTypeMetadata) -> Self {
         self.type_metadata = Some(metadata);
         self
     }
 
+    /// Sets the SQL numeric target without changing the value or wire precision
+    /// and scale. ODBC's IPD defines this target independently of its C buffer.
+    pub fn with_numeric_declaration(mut self, precision: u8, scale: u8) -> TdsResult<Self> {
+        if !matches!(
+            self.value,
+            RpcValue::Materialized(SqlType::Decimal(_) | SqlType::Numeric(_))
+        ) {
+            return Err(Error::UsageError(
+                "A numeric declaration requires a decimal or numeric parameter".into(),
+            ));
+        }
+        if !crate::datatypes::decoder::decimal_metadata_is_valid(precision, scale) {
+            return Err(Error::UsageError(
+                "Invalid numeric declaration precision or scale".into(),
+            ));
+        }
+        self.numeric_declaration = Some(NumericDeclaration { precision, scale });
+        Ok(self)
+    }
+
     pub(crate) fn sql_declaration(&self) -> TdsResult<String> {
         match &self.value {
-            RpcValue::Materialized(value) => Self::get_sql_name(value, self.type_metadata),
-            RpcValue::Streamed(streamed) => streamed.sql_name(),
+            RpcValue::Materialized(value) => {
+                let metadata = self
+                    .numeric_declaration
+                    .map_or(self.type_metadata, |declaration| {
+                        Some(RpcTypeMetadata {
+                            precision: Some(declaration.precision),
+                            scale: Some(declaration.scale),
+                        })
+                    });
+                Self::get_sql_name(value, metadata)
+            }
+            RpcValue::Streamed(streamed) => match &self.streamed_declaration {
+                Some(declaration) => Self::get_sql_name(declaration, self.type_metadata),
+                None => streamed.sql_name(),
+            },
         }
     }
 
@@ -296,6 +373,13 @@ impl RpcParameter {
         // type name (which `get_meta_type_name` would reject for `SqlTable`).
         if let SqlType::Table(type_name, _) = value {
             return Ok(Self::format_tvp_sql_name(type_name));
+        }
+
+        // A UDT is declared by its own server-side type name, for the same
+        // reason: `udt` is a TDS wire type, not something `sp_executesql` can
+        // resolve.
+        if let SqlType::Udt(type_name, _) = value {
+            return Ok(Self::format_udt_sql_name(type_name));
         }
 
         // For nullable types, we need to check the actual datatype to derive the name.
@@ -402,10 +486,100 @@ impl RpcParameter {
         format!("[{schema}].[{}] READONLY", type_name.type_name)
     }
 
+    /// Formats a UDT's declaration name for `sp_executesql`, e.g.
+    /// `[dbo].[Point]`.
+    ///
+    /// Only the parts the application supplied are emitted, so an unqualified
+    /// name stays unqualified and resolves against the current database and
+    /// default schema. msodbcsql builds the same one-, two-, or three-part
+    /// quoted name here (`sqlccmd.cpp:7485-7505`); unlike a TVP there is no
+    /// `READONLY` suffix and the catalog part is legal.
+    ///
+    /// A catalog with no schema keeps the slot empty (`[db]..[Point]`) rather
+    /// than naming a schema: T-SQL reads the empty slot as the caller's default
+    /// schema, which is what an omitted part means. Substituting `dbo` would
+    /// silently pick a different type for a caller whose default is not `dbo`.
+    /// msodbcsql lands on the same text - it quotes the absent schema to the
+    /// empty string and prints all three parts (`clntcomn.h:281`).
+    fn format_udt_sql_name(type_name: &UdtTypeName) -> String {
+        let quoted = |part: &str| format!("[{}]", part.replace(']', "]]"));
+        // `write_b_varchar` gives an empty part and an absent one the same
+        // zero-length encoding, so the declaration has to read them the same
+        // way too - otherwise `Some(String::new())` declares `[]` against a
+        // header that named nothing, and the execute fails.
+        match (
+            type_name.db_name.as_deref().filter(|s| !s.is_empty()),
+            type_name.schema_name.as_deref().filter(|s| !s.is_empty()),
+        ) {
+            (Some(db), schema) => format!(
+                "{}.{}.{}",
+                quoted(db),
+                schema.map(quoted).unwrap_or_default(),
+                quoted(&type_name.type_name)
+            ),
+            (None, Some(schema)) => {
+                format!("{}.{}", quoted(schema), quoted(&type_name.type_name))
+            }
+            (None, None) => quoted(&type_name.type_name),
+        }
+    }
+
+    /// The B_VARCHAR count for a parameter name is a single byte, so the name
+    /// is bounded. Shared by [`Self::validate_named_before_send`] and the
+    /// write path in `serialize`, so the two cannot drift.
+    ///
+    /// NOTE: the bound is measured in `len()` (UTF-8 bytes) while the payload
+    /// is written as UTF-16 by `write_string_unicode_async`. The two agree for
+    /// the ASCII names this driver generates (`@P1`, ...), but not in general.
+    /// Pre-existing behaviour, preserved here rather than changed silently.
+    fn validate_name_length(name: &str) -> TdsResult<()> {
+        if name.len() > 0xFF {
+            return Err(Error::UsageError(
+                "Parameter name is too long. Maximum length is 255 characters.".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Validates whatever must be correct before *any* byte of this parameter
+    /// reaches the wire.
+    ///
+    /// Delegates to [`SqlType::validate_for_send`], which owns the per-type
+    /// rules. Those checks also run inside `write_type_info`, but by then
+    /// `serialize` has already written this parameter's name and status flags,
+    /// and `PacketWriter` sends on overflow - so in a multi-parameter RPC an
+    /// earlier parameter may have flushed whole packets. Checking here, before
+    /// the RPC writes anything, is what keeps invalid local input a local
+    /// failure rather than a half-sent request needing cancel-and-drain.
+    ///
+    /// The name is checked separately by [`Self::validate_named_before_send`],
+    /// since only the named path writes it.
+    pub(crate) fn validate_before_send(&self) -> TdsResult<()> {
+        match &self.value {
+            RpcValue::Materialized(value) => value.validate_for_send(),
+            RpcValue::Streamed(_) => Ok(()),
+        }
+    }
+
+    /// [`Self::validate_before_send`] plus the parameter-name bound, for a
+    /// parameter the RPC will serialize through its *named* path.
+    ///
+    /// Kept apart because `serialize` only writes - and only length-checks -
+    /// the name when it is not positional, so validating it unconditionally
+    /// would reject a positional parameter whose unused name happens to be
+    /// overlong.
+    pub(crate) fn validate_named_before_send(&self) -> TdsResult<()> {
+        if let Some(name) = &self.name {
+            Self::validate_name_length(name)?;
+        }
+        self.validate_before_send()
+    }
+
     /// Serializes the RPC parameter into the provided `PacketWriter`.
     /// The `encoder` is used to encode the parameter value based on its data type.
     /// The `db_collation` is used for string types to determine the collation.
     /// The `is_positional` flag indicates whether the parameter is positional or named.
+    #[inline]
     pub(crate) async fn serialize<T: SqlValueEncoder>(
         &self,
         packet_writer: &mut PacketWriter<'_>,
@@ -413,20 +587,24 @@ impl RpcParameter {
         is_positional: bool,
         encoder: &T,
     ) -> TdsResult<()> {
+        let options_written = is_positional
+            && self.encrypted.is_none()
+            && matches!(self.value, RpcValue::Materialized(_));
         // If the parameter is positional, then we dont need to write the name.
         if is_positional {
             // Indicates that the parameter name is 0 length, since this is
             // a positional parameter.
-            packet_writer.write_byte_async(0).await?;
+            if options_written {
+                packet_writer
+                    .write_fixed_bytes(&[0, self.options.bits()])
+                    .await?;
+            } else {
+                packet_writer.write_byte_async(0).await?;
+            }
         } else {
             match self.name {
                 Some(ref name) => {
-                    if name.len() > 0xFF {
-                        return Err(Error::UsageError(
-                            "Parameter name is too long. Maximum length is 255 characters."
-                                .to_string(),
-                        ));
-                    }
+                    Self::validate_name_length(name)?;
                     let name_length = name.len() as u8;
                     // We can only send byte length.
                     packet_writer.write_byte_async(name_length).await?;
@@ -476,7 +654,9 @@ impl RpcParameter {
         }
 
         // Write the options byte.
-        packet_writer.write_byte_async(self.options.bits()).await?;
+        if !options_written {
+            packet_writer.write_byte_async(self.options.bits()).await?;
+        }
 
         let value = match &self.value {
             RpcValue::Materialized(value) => value,
@@ -497,10 +677,10 @@ impl RpcParameter {
         ciphertext: Option<Vec<u8>>,
         metadata: RpcEncryptionMetadata,
     ) {
-        self.encrypted = Some(EncryptedRpcValue {
+        self.encrypted = Some(Box::new(EncryptedRpcValue {
             ciphertext,
             metadata,
-        });
+        }));
     }
 
     /// Returns the parameter's plaintext value. Used by the parameter-encryption
@@ -657,6 +837,12 @@ impl RpcParameter {
     }
 }
 
+/// Inspect parameter direction flags without exposing them in the production API.
+#[cfg(feature = "test-util")]
+pub fn rpc_parameter_status(parameter: &RpcParameter) -> StatusFlags {
+    parameter.options
+}
+
 /// Builds a comma-separated list of parameter names and types for the RPC call.
 /// This is used to construct the parameter declaration string for sp_executesql.
 #[cfg(fuzzing)]
@@ -690,7 +876,12 @@ fn build_parameter_list_string_impl(
             } else {
                 params_list.push_str(", ");
             }
-            params_list.push_str(&format!("{param_name} {param_type_name} "));
+            // OUTPUT has to appear in the declaration as well as at the call
+            // site; sp_executesql silently drops the value if either is
+            // missing, which is why an output parameter over the text path
+            // used to come back unset.
+            let output = if param.is_output() { "OUTPUT " } else { "" };
+            params_list.push_str(&format!("{param_name} {param_type_name} {output}"));
         }
     }
     Ok(())
@@ -727,6 +918,7 @@ impl From<&SqlType> for TdsDataType {
             SqlType::VarcharMax(_) => TdsDataType::VarChar,
             SqlType::VarBinaryMax(_) => TdsDataType::VarBinary,
             SqlType::Xml(_) => TdsDataType::Xml,
+            SqlType::Udt(_, _) => TdsDataType::Udt,
             SqlType::Uuid(_) => TdsDataType::Guid,
             SqlType::DateTime(_) => TdsDataType::DateTime,
             SqlType::Date(_) => TdsDataType::DateN,
@@ -747,11 +939,101 @@ mod tests {
     };
 
     use crate::datatypes::encoder::GenericEncoder;
+    use crate::datatypes::sql_udt::UdtTypeName;
     use crate::io::packet_writer::PacketWriter;
     use crate::io::packet_writer::tests::MockNetworkWriter;
     use crate::message::messages::PacketType;
     use crate::token::tokens::SqlCollation;
     use futures::executor::block_on;
+
+    /// A UDT is declared by its own server-side name, not the TDS type name
+    /// `udt`, which `sp_executesql` cannot resolve ("Cannot find data type
+    /// udt", server error 2715). Only the parts the application supplied are
+    /// emitted, matching msodbcsql's three branches at `sqlccmd.cpp:7485`.
+    #[test]
+    fn a_udt_is_declared_by_its_qualified_type_name() {
+        let cases = [
+            (None, None, "hierarchyid", "[hierarchyid]"),
+            (None, Some("dbo"), "Point", "[dbo].[Point]"),
+            (Some("mydb"), Some("dbo"), "Point", "[mydb].[dbo].[Point]"),
+            // A catalog without a schema leaves the slot empty, which T-SQL
+            // reads as the caller's default schema - the meaning of an omitted
+            // part. msodbcsql produces the same text: its `%s.%s.%s` branch
+            // quotes the absent schema to the empty string (`clntcomn.h:281`).
+            (Some("mydb"), None, "Point", "[mydb]..[Point]"),
+        ];
+        for (db, schema, type_name, expected) in cases {
+            let value = SqlType::Udt(
+                UdtTypeName::new(
+                    db.map(str::to_string),
+                    schema.map(str::to_string),
+                    type_name.to_string(),
+                ),
+                Some(vec![0x01]),
+            );
+            assert_eq!(
+                RpcParameter::get_sql_name(&value, None).unwrap(),
+                expected,
+                "{db:?}.{schema:?}.{type_name}"
+            );
+        }
+    }
+
+    /// A `]` inside an identifier must be doubled or the quoting breaks out of
+    /// the bracketed name.
+    #[test]
+    fn a_udt_declaration_escapes_a_closing_bracket() {
+        let value = SqlType::Udt(
+            UdtTypeName::new(None, None, "od]d".to_string()),
+            Some(vec![0x01]),
+        );
+        assert_eq!(RpcParameter::get_sql_name(&value, None).unwrap(), "[od]]d]");
+    }
+
+    /// `write_b_varchar` encodes an empty part and an absent one identically,
+    /// so the declaration must too - `Some(String::new())` declaring `[]`
+    /// against a header that named nothing fails at the server.
+    #[test]
+    fn an_empty_udt_name_part_is_declared_as_absent() {
+        let cases = [
+            (Some(""), Some(""), "[Point]"),
+            (Some(""), Some("dbo"), "[dbo].[Point]"),
+            (Some("mydb"), Some(""), "[mydb]..[Point]"),
+        ];
+        for (db, schema, expected) in cases {
+            let value = SqlType::Udt(
+                UdtTypeName::new(
+                    db.map(str::to_string),
+                    schema.map(str::to_string),
+                    "Point".to_string(),
+                ),
+                Some(vec![0x01]),
+            );
+            assert_eq!(
+                RpcParameter::get_sql_name(&value, None).unwrap(),
+                expected,
+                "{db:?}.{schema:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_parameters_do_not_inline_streaming_and_encryption_metadata() {
+        let parameter = RpcParameter::new(None, StatusFlags::NONE, SqlType::Int(Some(42)));
+        assert_eq!(
+            std::mem::size_of_val(&parameter.streamed_declaration),
+            size_of::<usize>()
+        );
+        assert_eq!(
+            std::mem::size_of_val(&parameter.encrypted),
+            size_of::<usize>()
+        );
+        assert!(std::mem::size_of_val(&parameter.numeric_declaration) <= 4);
+        assert!(
+            size_of::<RpcParameter>()
+                <= size_of::<SqlType>() + size_of::<Option<String>>() + 6 * size_of::<usize>()
+        );
+    }
 
     /// Returns the RPC payload bytes written to the packet writer, stripping the
     /// 8-byte packet header.
@@ -979,9 +1261,8 @@ mod tests {
         }
     }
 
-    /// The declaration text and the wire `TYPE_INFO` must come from the same
-    /// [`RpcTypeMetadata`]: declaring `decimal(12,3)` while serializing
-    /// `NUMERIC(1,0)` would truncate the first non-NULL value sent.
+    /// Without a separate SQL target, supplied metadata drives both declaration
+    /// and wire type, including when the value is NULL.
     #[test]
     fn type_metadata_drives_declaration_and_wire_metadata() {
         let param = RpcParameter::new(
@@ -1010,6 +1291,67 @@ mod tests {
             (type_info[2], type_info[3]),
             (12, 3),
             "wire precision/scale must match the declaration"
+        );
+    }
+
+    #[test]
+    fn numeric_declaration_does_not_change_wire_value_metadata() {
+        use crate::datatypes::decoder::DecimalParts;
+
+        for value in [
+            SqlType::Numeric(Some(DecimalParts::new(true, 8, 2, 12345))),
+            SqlType::Decimal(Some(DecimalParts::new(true, 8, 2, 12345))),
+            SqlType::Numeric(None),
+            SqlType::Decimal(None),
+        ] {
+            let type_name = if matches!(value, SqlType::Numeric(_)) {
+                "numeric"
+            } else {
+                "decimal"
+            };
+            let parameter = RpcParameter::new(Some("@P1".into()), StatusFlags::NONE, value)
+                .with_type_metadata(RpcTypeMetadata {
+                    precision: Some(8),
+                    scale: Some(2),
+                });
+            let wire = serialize_param(&parameter);
+            assert_eq!(
+                parameter.sql_declaration().unwrap(),
+                format!("{type_name}(8,2)")
+            );
+            let parameter = parameter.with_numeric_declaration(12, 4).unwrap();
+            let mut declaration = String::new();
+            build_parameter_list_string(&vec![parameter.clone()], &mut declaration).unwrap();
+            assert_eq!(declaration, format!("@P1 {type_name}(12,4) "));
+            assert_eq!(serialize_param(&parameter), wire);
+        }
+    }
+
+    #[test]
+    fn numeric_declaration_validates_type_precision_and_scale() {
+        for (precision, scale) in [(0, 0), (39, 0), (8, 9)] {
+            assert!(
+                RpcParameter::new(None, StatusFlags::NONE, SqlType::Numeric(None))
+                    .with_numeric_declaration(precision, scale)
+                    .is_err()
+            );
+        }
+        for (precision, scale) in [(1, 0), (1, 1), (38, 0), (38, 38)] {
+            assert!(
+                RpcParameter::new(None, StatusFlags::NONE, SqlType::Numeric(None))
+                    .with_numeric_declaration(precision, scale)
+                    .is_ok()
+            );
+        }
+        assert!(
+            RpcParameter::new(None, StatusFlags::NONE, SqlType::Int(Some(42)))
+                .with_numeric_declaration(12, 2)
+                .is_err()
+        );
+        assert!(
+            RpcParameter::data_at_exec(None, StatusFlags::NONE, StreamedSqlType::VarcharMax)
+                .with_numeric_declaration(12, 2)
+                .is_err()
         );
     }
 

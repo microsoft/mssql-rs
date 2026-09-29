@@ -26,48 +26,17 @@ steps:
   displayName: 'Install CMake'
 
 # ── 2. Clone mssql-python ────────────────────────────────────────────────────
-- script: |
-    set -euo pipefail
-
-    MSSQL_PYTHON_BRANCH="main"
-
-    if [ -n "${SYSTEM_PULLREQUEST_PULLREQUESTID:-}" ]; then
-      echo "PR build detected (PR #${SYSTEM_PULLREQUEST_PULLREQUESTID})"
-
-      az extension add --name azure-devops --yes --allow-preview true 2>/dev/null || echo "Extension may already be installed"
-      az devops configure --defaults organization="${SYSTEM_COLLECTIONURI}" project="${SYSTEM_TEAMPROJECT}"
-
-      PR_DESC=$(az repos pr show --id "${SYSTEM_PULLREQUEST_PULLREQUESTID}" --query description -o tsv 2>&1) || {
-        echo "##[warning]Failed to get PR description: $PR_DESC"
-        PR_DESC=""
-      }
-
-      if [ -n "$PR_DESC" ]; then
-        BRANCH_OVERRIDE=$(echo "$PR_DESC" | grep -oP 'mssql-python-branch:\s*\K[a-zA-Z0-9_/.-]+' | head -1 | tr -d '[:space:]' || true)
-        if [ -n "$BRANCH_OVERRIDE" ]; then
-          MSSQL_PYTHON_BRANCH="$BRANCH_OVERRIDE"
-          echo "##[section]Using mssql-python branch override: $MSSQL_PYTHON_BRANCH"
-        fi
-      fi
-    fi
-
-    echo "Cloning microsoft/mssql-python (branch: $MSSQL_PYTHON_BRANCH)..."
-    if ! git clone --depth 1 -b "$MSSQL_PYTHON_BRANCH" https://github.com/microsoft/mssql-python.git ../mssql-python 2>/dev/null; then
-      echo "##[warning]Branch '$MSSQL_PYTHON_BRANCH' not found, falling back to main"
-      git clone --depth 1 -b main https://github.com/microsoft/mssql-python.git ../mssql-python
-    fi
+- script: bash .pipeline/scripts/clone-mssql-python.sh
   displayName: Clone mssql-python
-  env:
-    AZURE_DEVOPS_EXT_PAT: $(System.AccessToken)
 
 # ── 3. Build bindings (no Docker needed) ─────────────────────────────────────
 - script: |
     set -euo pipefail
 
-    MSSQL_PYTHON_DIR=$(Build.SourcesDirectory)/../mssql-python
+    MSSQL_PYTHON_DIR="$(Build.SourcesDirectory)/../mssql-python"
 
     python -m pip install --upgrade pip
-    python -m pip install maturin pytest pytest-asyncio python-dotenv pybind11 wheel setuptools patchelf
+    python -m pip install maturin pytest pytest-asyncio python-dotenv pybind11 wheel setuptools packaging patchelf
     python -m pip install -r "$MSSQL_PYTHON_DIR/requirements.txt"
 
     # Build ddbc_bindings (C++ pybind11 .so)
@@ -76,9 +45,9 @@ steps:
     chmod +x build.sh
     ./build.sh
 
-    # Build mssql-py-core wheel and extract .so into mssql-python
+    # Build and install the local Rust wheel before upstream package setup.
     echo "=== Building mssql-py-core ==="
-    cd $(Build.SourcesDirectory)/mssql-py-core
+    cd "$(Build.SourcesDirectory)/mssql-py-core"
     rm -rf dist/
     maturin build --release -o dist/
 
@@ -89,23 +58,56 @@ steps:
     echo "=== Verifying mssql_py_core is importable ==="
     python -c "import mssql_py_core; print('mssql_py_core OK')"
 
-    # Install mssql-python in editable mode
-    python -m pip install -e "$MSSQL_PYTHON_DIR"
+    # Package the ODBC dylibs prepared by build.sh from the same checkout.
+    cd "$MSSQL_PYTHON_DIR"
+    rm -rf odbc-dist/
+    python setup_odbc.py bdist_wheel --dist-dir odbc-dist
   displayName: 'Build ddbc_bindings and mssql-py-core'
   env:
     CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN)
     CARGO_REGISTRIES_MSSQL_RS_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_TOKEN)
 
+- script: |
+    set -euo pipefail
+    MSSQL_PYTHON_DIR="$(Build.SourcesDirectory)/../mssql-python"
+    shopt -s nullglob
+    ODBC_WHEELS=("$MSSQL_PYTHON_DIR"/odbc-dist/mssql_python_odbc-*.whl)
+    if [ "${#ODBC_WHEELS[@]}" -ne 1 ]; then
+      echo "##[error]Expected exactly one mssql-python-odbc wheel, found ${#ODBC_WHEELS[@]}"
+      exit 1
+    fi
+    python -m pip install --no-deps "${ODBC_WHEELS[0]}"
+
+    # PR/local runs use the pinned SHA; non-PR runs follow upstream main.
+    # Preserve both job-owned native wheels instead of resolving release pins.
+    python -m pip install --no-deps -e "$MSSQL_PYTHON_DIR"
+  displayName: 'Install mssql-python packages'
+
+- script: |
+    set -euo pipefail
+    echo "##vso[task.setvariable variable=mssqlPythonReady]false"
+    python -m pytest .pipeline/scripts/verify-mssql-python.py -v -s \
+      --junitxml="$(Build.SourcesDirectory)/mssql-python-macos-setup-results.xml"
+  displayName: 'Verify installed mssql-python runtime'
+
+- task: PublishTestResults@2
+  condition: succeededOrFailed()
+  displayName: Publish mssql-python macOS setup results
+  inputs:
+    testResultsFiles: '**/mssql-python-macos-setup-results.xml'
+    testRunTitle: 'mssql-python macOS setup'
+    failTaskOnFailedTests: false
+    failTaskOnMissingResultsFile: true
+
 # ── 4. Start Docker via Colima ───────────────────────────────────────────────
-# timeoutInMinutes backstops the scripts' own wall-clock budgets: the macOS job
-# caps at 60 minutes and SQL setup must not be what exhausts it.
-- script: bash .pipeline/scripts/start-colima-macos.sh
-  displayName: 'Install and start Colima-based Docker'
-  timeoutInMinutes: 13
+- template: macos-docker-steps.yml
+  parameters:
+    condition: and(succeeded(), eq(variables['mssqlPythonReady'], 'true'))
 
 # ── 5. Start SQL Server (no TLS certs) ──────────────────────────────────────
 - script: bash .pipeline/scripts/start-sql-server-macos.sh
   displayName: 'Start SQL Server (Docker, no TLS certs)'
+  condition: and(succeeded(), eq(variables['mssqlPythonReady'], 'true'))
   timeoutInMinutes: 22
   env:
     SQL_PASSWORD: $(SQL_PASSWORD)
@@ -113,8 +115,16 @@ steps:
 # ── 6. Run tests ─────────────────────────────────────────────────────────────
 - script: |
     set -euo pipefail
-    pytest $(Build.SourcesDirectory)/mssql-py-core/tests/mssql_python/ -v --tb=short --junitxml=$(Build.SourcesDirectory)/pytest-mssql-python-macos-results.xml
+    rc=0
+    pytest $(Build.SourcesDirectory)/mssql-py-core/tests/mssql_python/ -v --tb=short --junitxml=$(Build.SourcesDirectory)/pytest-mssql-python-macos-results.xml || rc=$?
+    if [ "$rc" -eq 1 ] && [ "${BUILD_REASON:-PullRequest}" != "PullRequest" ]; then
+      echo "##vso[task.logissue type=warning]mssql-python macOS tests did not fully pass"
+      echo "##vso[task.complete result=SucceededWithIssues;]"
+      exit 0
+    fi
+    exit "$rc"
   displayName: 'Run mssql-python tests'
+  condition: and(succeeded(), eq(variables['mssqlPythonReady'], 'true'))
   env:
     SQL_PASSWORD: $(SQL_PASSWORD)
     DB_CONNECTION_STRING: 'Server=tcp:127.0.0.1,1433;Database=master;Uid=sa;Pwd=$(SQL_PASSWORD);TrustServerCertificate=yes'
@@ -123,18 +133,22 @@ steps:
     SQL_SERVER: '127.0.0.1'
     SQL_DATABASE: 'master'
     TRUST_SERVER_CERTIFICATE: 'true'
-  continueOnError: true
 
 - task: PublishTestResults@2
-  condition: succeededOrFailed()
+  condition: and(succeededOrFailed(), eq(variables['mssqlPythonReady'], 'true'))
   displayName: Publish mssql-python macOS test results
   inputs:
     testResultsFiles: '**/pytest-mssql-python-macos-results.xml'
     testRunTitle: 'mssql-python macOS tests'
+    failTaskOnFailedTests: false
+    failTaskOnMissingResultsFile: true
 
 - script: |
     docker stop sqlserver || true
     docker rm sqlserver || true
-    rm -rf $(Build.SourcesDirectory)/../mssql-python || true
+  displayName: Cleanup SQL Server
+  condition: and(always(), eq(variables['mssqlPythonReady'], 'true'))
+
+- script: rm -rf $(Build.SourcesDirectory)/../mssql-python || true
   displayName: Cleanup
   condition: always()

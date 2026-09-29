@@ -22,6 +22,10 @@ parameters:
   displayName: Intermediate ADO branch carrying GitHub main
   type: string
   default: sync/github-main-to-stable
+- name: linuxImage
+  displayName: Agent image for x64 Linux jobs
+  type: string
+  default: RUST-AZL3
 
 resources:
   repositories:
@@ -34,10 +38,16 @@ resources:
     name: mssql-rs/mssql-rs
     ref: refs/heads/stable
 
+variables:
+# This pipeline only moves git refs and opens a PR; nothing is compiled, so the
+# org decorator's injection only adds job time.
+- name: Codeql.SkipTaskAutoInjection
+  value: true
+
 pool:
   name: RUST-X64-WUS3
   demands:
-    - imageOverride -equals RUST-UBUSLIM
+    - imageOverride -equals ${{ parameters.linuxImage }}
 
 steps:
 # GitHub main (self): the source we are syncing from.

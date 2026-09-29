@@ -224,6 +224,67 @@ impl TryFrom<TableMetadataResult> for Vec<BulkCopyColumnMetadata> {
     }
 }
 
+fn build_table_metadata_query(table_name: &str) -> TdsResult<String> {
+    let mut parts = parse_multipart_identifier(table_name, true)?;
+    let table_part = parts[TABLE_INDEX]
+        .as_ref()
+        .filter(|part| !part.is_empty())
+        .ok_or_else(|| Error::UsageError(format!("Invalid table name: {table_name}")))?;
+
+    if table_part.starts_with('#')
+        && parts[CATALOG_INDEX]
+            .as_ref()
+            .is_none_or(|part| part.is_empty())
+    {
+        parts[CATALOG_INDEX] = Some("tempdb".to_string());
+    }
+
+    let catalog = parts[CATALOG_INDEX]
+        .as_ref()
+        .filter(|part| !part.is_empty())
+        .map(|part| escape_identifier(part));
+    let escaped_full_name = escape_string_literal(&build_multipart_name(&parts));
+
+    // The sys-view prefix is inside a nested SQL literal; the procedure prefix
+    // is executable SQL and needs only identifier escaping.
+    let catalog_prefix = catalog
+        .as_ref()
+        .map(|catalog| format!("{}.", escape_string_literal(catalog)))
+        .unwrap_or_default();
+    let catalog_for_sproc = catalog
+        .as_ref()
+        .map(|catalog| format!("{catalog}.."))
+        .unwrap_or_default();
+    let sproc_parts = [
+        None,
+        None,
+        parts[SCHEMA_INDEX].clone().filter(|part| !part.is_empty()),
+        parts[TABLE_INDEX].clone(),
+    ];
+    let sproc_table_name = escape_string_literal(&build_multipart_name(&sproc_parts));
+
+    Ok(format!(
+        r#"SELECT @@TRANCOUNT;
+
+DECLARE @Column_Names NVARCHAR(MAX) = NULL;
+DECLARE @object_id INT = OBJECT_ID(N'{escaped_full_name}');
+DECLARE @sql NVARCHAR(MAX);
+SET @sql = N'SELECT @CN = COALESCE(@CN + N'', '', N'''') + QUOTENAME([name]) FROM {catalog_prefix}sys.all_columns WHERE [object_id] = @ObjId';
+IF EXISTS (SELECT TOP 1 * FROM sys.all_columns WHERE [object_id] = OBJECT_ID('sys.all_columns') AND [name] = 'graph_type')
+    SET @sql = @sql + N' AND COALESCE([graph_type], 0) NOT IN (1, 3, 4, 6, 7)';
+SET @sql = @sql + N' ORDER BY [column_id] ASC';
+EXEC sp_executesql @sql, N'@CN NVARCHAR(MAX) OUTPUT, @ObjId INT', @CN = @Column_Names OUTPUT, @ObjId = @object_id;
+
+SELECT @Column_Names = COALESCE(@Column_Names, '*');
+
+SET FMTONLY ON;
+EXEC(N'SELECT ' + @Column_Names + N' FROM {escaped_full_name}');
+SET FMTONLY OFF;
+
+EXEC {catalog_for_sproc}sp_tablecollations_100 N'{sproc_table_name}';"#
+    ))
+}
+
 /// Fetch table metadata using SET FMTONLY ON query.
 ///
 /// This function retrieves column metadata for a table by executing a
@@ -270,82 +331,7 @@ pub(crate) async fn fetch_table_metadata(
     timeout_sec: Option<u32>,
     cancel_handle: Option<&CancelHandle>,
 ) -> TdsResult<TableMetadataResult> {
-    // Parse the multipart identifier
-    let parts = parse_multipart_identifier(table_name, false)?;
-
-    // Validate table name exists
-    let table_part = parts[TABLE_INDEX]
-        .as_ref()
-        .ok_or_else(|| Error::UsageError(format!("Invalid table name: {}", table_name)))?;
-
-    // Check if temp table
-    let is_temp_table = table_part.starts_with('#');
-
-    // Determine catalog
-    let catalog = if is_temp_table && parts[CATALOG_INDEX].is_none() {
-        "tempdb".to_string()
-    } else if let Some(cat) = &parts[CATALOG_INDEX] {
-        escape_identifier(cat)
-    } else {
-        // No catalog specified, don't prefix
-        String::new()
-    };
-
-    // Build full object name for OBJECT_ID
-    let full_name = build_multipart_name(&parts);
-    let escaped_full_name = escape_string_literal(&full_name);
-
-    // Build query with catalog prefix for sys views (single dot)
-    // and catalog spec for stored procedures (double dot)
-    let catalog_prefix = if !catalog.is_empty() {
-        format!("{}.", catalog)
-    } else {
-        String::new()
-    };
-
-    let catalog_for_sproc = if !catalog.is_empty() {
-        format!("{}..", catalog)
-    } else {
-        String::new()
-    };
-
-    // Prepare schema and table names for sp_tablecollations_100
-    // Match C# behavior: escape for use in TSQL literal block
-    let schema_name = parts[SCHEMA_INDEX]
-        .as_ref()
-        .map(|s| escape_identifier(&escape_string_literal(s)))
-        .unwrap_or_else(|| "dbo".to_string());
-
-    let table_name_escaped = escape_identifier(&escape_string_literal(table_part));
-
-    // Use SET FMTONLY ON to get metadata without query execution overhead.
-    // This matches .NET SqlBulkCopy behavior and is more efficient than SELECT TOP 0.
-    // The query structure matches C# SqlBulkCopy.CreateInitialQuery():
-    // 1. SELECT @@TRANCOUNT - produces a result set we need to skip
-    // 2. Dynamic column building with graph_type check
-    // 3. SET FMTONLY ON to get column metadata without data
-    // 4. sp_tablecollations_100 to get collation information
-    // Note: Use double-dot notation (catalog..sproc) for system stored procedures.
-    let query = format!(
-        r#"SELECT @@TRANCOUNT;
-
-DECLARE @Column_Names NVARCHAR(MAX) = NULL;
-DECLARE @object_id INT = OBJECT_ID('{escaped_full_name}');
-DECLARE @sql NVARCHAR(MAX);
-SET @sql = N'SELECT @CN = COALESCE(@CN + N'', '', N'''') + QUOTENAME([name]) FROM {catalog_prefix}sys.all_columns WHERE [object_id] = @ObjId';
-IF EXISTS (SELECT TOP 1 * FROM sys.all_columns WHERE [object_id] = OBJECT_ID('sys.all_columns') AND [name] = 'graph_type')
-    SET @sql = @sql + N' AND COALESCE([graph_type], 0) NOT IN (1, 3, 4, 6, 7)';
-SET @sql = @sql + N' ORDER BY [column_id] ASC';
-EXEC sp_executesql @sql, N'@CN NVARCHAR(MAX) OUTPUT, @ObjId INT', @CN = @Column_Names OUTPUT, @ObjId = @object_id;
-
-SELECT @Column_Names = COALESCE(@Column_Names, '*');
-
-SET FMTONLY ON;
-EXEC(N'SELECT ' + @Column_Names + N' FROM {escaped_full_name}');
-SET FMTONLY OFF;
-
-EXEC {catalog_for_sproc}sp_tablecollations_100 N'{schema_name}.{table_name_escaped}';"#
-    );
+    let query = build_table_metadata_query(table_name)?;
 
     debug!("Fetching table metadata with FMTONLY and collations");
 
@@ -475,6 +461,133 @@ mod tests {
     };
     use crate::query::metadata::ColumnMetadata;
     use crate::token::tokens::SqlCollation;
+
+    #[test]
+    fn test_metadata_query_escapes_nested_catalog_literal() {
+        for (name, nested_catalog, direct_catalog, full_name, sproc_name) in [
+            (
+                "[x'; SELECT 4242 AS audit_probe; RETURN;--].dbo.t",
+                "[x''; SELECT 4242 AS audit_probe; RETURN;--]",
+                "[x'; SELECT 4242 AS audit_probe; RETURN;--]",
+                "[x''; SELECT 4242 AS audit_probe; RETURN;--].[dbo].[t]",
+                "[dbo].[t]",
+            ),
+            (
+                "[O'Brien]]db].[s'ch]]ema].[t'ab]]le]",
+                "[O''Brien]]db]",
+                "[O'Brien]]db]",
+                "[O''Brien]]db].[s''ch]]ema].[t''ab]]le]",
+                "[s''ch]]ema].[t''ab]]le]",
+            ),
+        ] {
+            let query = build_table_metadata_query(name).unwrap();
+            assert!(query.contains(&format!(
+                "SET @sql = N'SELECT @CN = COALESCE(@CN + N'', '', N'''') + QUOTENAME([name]) FROM {nested_catalog}.sys.all_columns WHERE [object_id] = @ObjId';"
+            )), "{query}");
+            assert!(
+                query.contains(&format!("OBJECT_ID(N'{full_name}')")),
+                "{query}"
+            );
+            assert!(
+                query.contains(&format!(
+                    "EXEC(N'SELECT ' + @Column_Names + N' FROM {full_name}');"
+                )),
+                "{query}"
+            );
+            assert!(
+                query.ends_with(&format!(
+                    "EXEC {direct_catalog}..sp_tablecollations_100 N'{sproc_name}';"
+                )),
+                "{query}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_metadata_query_preserves_qualifiers_and_temp_tables() {
+        for (name, full_name, catalog_prefix, sproc_call) in [
+            ("table", "[table]", "", "sp_tablecollations_100 N'[table]';"),
+            (
+                "dbo.table",
+                "[dbo].[table]",
+                "",
+                "sp_tablecollations_100 N'[dbo].[table]';",
+            ),
+            (
+                "db..table",
+                "[db]..[table]",
+                "[db].",
+                "[db]..sp_tablecollations_100 N'[table]';",
+            ),
+            (
+                "#table",
+                "[tempdb]..[#table]",
+                "[tempdb].",
+                "[tempdb]..sp_tablecollations_100 N'[#table]';",
+            ),
+            (
+                "..#table",
+                "[tempdb]..[#table]",
+                "[tempdb].",
+                "[tempdb]..sp_tablecollations_100 N'[#table]';",
+            ),
+            (
+                "tempdb..#table",
+                "[tempdb]..[#table]",
+                "[tempdb].",
+                "[tempdb]..sp_tablecollations_100 N'[#table]';",
+            ),
+            (
+                "[tempdb].[dbo].[#table]",
+                "[tempdb].[dbo].[#table]",
+                "[tempdb].",
+                "[tempdb]..sp_tablecollations_100 N'[dbo].[#table]';",
+            ),
+            (
+                "[table ]",
+                "[table ]",
+                "",
+                "sp_tablecollations_100 N'[table ]';",
+            ),
+        ] {
+            let query = build_table_metadata_query(name).unwrap();
+            assert!(
+                query.contains(&format!("OBJECT_ID(N'{full_name}')")),
+                "{name}: {query}"
+            );
+            assert!(
+                query.contains(&format!("FROM {catalog_prefix}sys.all_columns")),
+                "{name}: {query}"
+            );
+            assert!(
+                query.ends_with(&format!("EXEC {sproc_call}")),
+                "{name}: {query}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_metadata_query_rejects_missing_or_invalid_table() {
+        for name in [
+            "",
+            " ",
+            ".",
+            "db..",
+            "dbo.",
+            "dbo.  ",
+            "[]",
+            "db.dbo.[]",
+            "\"\"",
+            "[t",
+            "[t]extra",
+            "a.b.c.d.e",
+        ] {
+            assert!(
+                matches!(build_table_metadata_query(name), Err(Error::UsageError(_))),
+                "{name}"
+            );
+        }
+    }
 
     fn make_column(name: &str, flags: u16, type_info_variant: TypeInfoVariant) -> ColumnMetadata {
         let tds_type = match &type_info_variant {

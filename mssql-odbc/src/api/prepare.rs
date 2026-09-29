@@ -7,19 +7,20 @@ use tracing::{debug, error};
 
 use mssql_tds::connection::tds_client::PreparedStatement;
 
+use super::escape::translate_and_rewrite;
 use super::sqlstate::*;
-use super::util::{read_utf16, rewrite_param_markers};
+use super::util::read_utf16;
 use crate::api::odbc_types::{
     SQL_ERROR, SQL_INVALID_HANDLE, SQL_NTS, SQL_SUCCESS, SqlHandle, SqlReturn, SqlSmallInt,
     SqlWChar,
 };
-use crate::error::free_errors;
+use crate::error::{free_errors, post_sql_error};
 use crate::handles::dbc::ConnectionState;
 use crate::handles::stmt::{
     PreparedPlan, STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT, STMT_STATE_EXEC_STARTED,
     STMT_STATE_PREPARED,
 };
-use crate::handles::{HandleType, StmtHandle, handle_from_raw};
+use crate::handles::{DescHandle, HandleType, StmtHandle, handle_from_raw};
 
 /// Implementation of `SQLPrepareW`.
 ///
@@ -48,6 +49,10 @@ pub(crate) unsafe fn sql_prepare_w(
     })
 }
 
+/// # Safety
+/// `statement_handle` must be null or point to a live `StmtHandle`.
+/// `statement_text` must be readable for `text_length` UTF-16 code units, or
+/// through a NUL terminator when `text_length` is `SQL_NTS`.
 unsafe fn sql_prepare_w_impl(
     statement_handle: SqlHandle,
     statement_text: *const SqlWChar,
@@ -85,9 +90,11 @@ fn sql_prepare_w_safe(stmt: &StmtHandle, sql: String) -> SqlReturn {
     let dbc = stmt.parent_dbc();
 
     // Lock parent (DBC) before child (STMT) per the crate's lock-ordering rule,
-    // and hold both for the whole body: the state check and the store happen
+    // and hold both through the store: the state check and the store happen
     // under one continuous STMT lock, so there is no TOCTOU window between them,
-    // and the connection-liveness read stays valid through the store.
+    // and the connection-liveness read stays valid through the store. Both are
+    // then released before the IPD work below, because the same rule forbids
+    // holding a STMT lock while taking a DESC lock.
     let Ok(dbc_state) = dbc.inner.lock() else {
         error!("SQLPrepareW: dbc mutex poisoned");
         return SQL_ERROR;
@@ -114,19 +121,52 @@ fn sql_prepare_w_safe(stmt: &StmtHandle, sql: String) -> SqlReturn {
     // Store the SQL text and defer the server-side prepare to SQLExecute.
     // Re-preparing discards any prior prepared text and stale result metadata.
     // A prior prepared handle is orphaned for release at the next execute.
-    // Markers are rewritten to `@P1..@Pn` once here so `SQLExecute` re-prepares
-    // (after a reconnect) without re-scanning the SQL.
-    let (rewritten_sql, marker_count) = rewrite_param_markers(&sql);
+    // Execution adds binding-dependent OUTPUT annotations to the retained SQL.
+    let (rewritten_sql, marker_count, _) =
+        match translate_and_rewrite(&sql, stmt_state.inert_attrs.noscan()) {
+            Ok(parts) => parts,
+            Err(e) => {
+                error!(error = %e, "SQLPrepareW: escape translation failed");
+                post_sql_error(&mut stmt_state, e.state(), 0, e.message());
+                return SQL_ERROR;
+            }
+        };
     stmt_state.orphan_prepared_handle();
+    stmt_state.direct_marker_count = None;
     stmt_state.prepared = Some(PreparedPlan {
         stmt: PreparedStatement::new(rewritten_sql),
         marker_count,
+        original_sql: sql,
     });
     stmt_state.parameter_metadata.clear();
-    stmt_state.column_metadata.clear();
+    stmt_state.parameter_udt_names.clear();
+    stmt_state.clear_result_metadata();
     stmt_state.reset_row_stream();
     stmt_state.clear_state(STMT_STATE_EXEC_CONTEXT);
+    stmt_state.call_returns_status = false;
     stmt_state.set_state(STMT_STATE_PREPARED);
+    drop(stmt_state);
+    drop(dbc_state);
+
+    // These names describe the text this prepare just replaced, and a later
+    // SQLBindParameter would mark the record explicitly bound - freezing the
+    // stale identity in place. Application-set names survive.
+    let rc = unsafe { handle_from_raw::<DescHandle>(stmt.ipd) }.clear_auto_filled_udt_names();
+    if rc != SQL_SUCCESS {
+        error!("SQLPrepareW: could not clear auto-filled UDT names");
+        // Re-lock to post: the STMT lock was dropped above, so without this
+        // the application gets SQL_ERROR and SQL_NO_DATA from SQLGetDiagRec.
+        // Same shape as `sql_free_stmt_reset_params_safe`'s poisoned-APD path.
+        if let Ok(mut stmt_state) = stmt.inner.lock() {
+            post_sql_error(
+                &mut stmt_state,
+                SQLSTATE_HY000,
+                0,
+                "Internal error clearing UDT parameter names",
+            );
+        }
+        return rc;
+    }
 
     debug!("SQLPrepareW: statement prepared (deferred)");
     SQL_SUCCESS
@@ -185,6 +225,7 @@ mod tests {
                     mssql_tds::connection::tds_client::StatementId::from_raw_for_test(42),
                 ),
                 marker_count: 0,
+                original_sql: String::new(),
             });
             state.set_state(STMT_STATE_PREPARED);
             state.parameter_metadata.push(ParameterDescription {

@@ -12,6 +12,7 @@ use crate::datatypes::sql_tvp::{
     TVP_END_TOKEN, TVP_NOMETADATA_TOKEN, TvpTableData, TvpTypeName, write_tvp_column_metadata,
     write_tvp_order_unique, write_tvp_rows, write_tvp_type_name,
 };
+use crate::datatypes::sql_udt::{UdtTypeName, write_udt_type_name};
 use crate::datatypes::sql_vector::SqlVector;
 use crate::datatypes::tds_value_serializer::{TdsTypeContext, TdsValueSerializer};
 use crate::{
@@ -128,6 +129,15 @@ pub enum SqlType {
     /// even for NULL TVPs. `None` table data encodes a NULL TVP; `Some` with
     /// an empty row set encodes an empty TVP.
     Table(TvpTypeName, Option<TvpTableData>),
+
+    /// CLR user-defined type (TDS type `0xF0`).
+    ///
+    /// The payload is the type's serialized (`IBinarySerialize`) form, which
+    /// the driver passes through untouched; `None` is a NULL UDT. The name is
+    /// always sent because the server resolves the type from it. A returned
+    /// UDT arrives as plain bytes rather than through this type, so the output
+    /// direction of a UDT parameter needs no variant here.
+    Udt(UdtTypeName, Option<Vec<u8>>),
 }
 
 type NullableTdsType = TdsDataType;
@@ -187,6 +197,7 @@ impl SqlType {
             SqlType::Vector(_, _, _) => TdsDataType::Vector,
             SqlType::Variant(_) => TdsDataType::SsVariant,
             SqlType::Table(_, _) => TdsDataType::SqlTable,
+            SqlType::Udt(_, _) => TdsDataType::Udt,
         }
     }
 
@@ -666,6 +677,20 @@ impl SqlType {
             // handled by the `serialize_table` short-circuit in `serialize`, so this
             // arm is a safe fallback that never feeds real wire data.
             SqlType::Table(_, _) => (ColumnValues::Null, base_ctx),
+
+            // UDT: the payload is opaque bytes framed as PLP, like varbinary(max).
+            SqlType::Udt(_, opt) => {
+                let cv = match opt {
+                    Some(bytes) => ColumnValues::Bytes(bytes.clone()),
+                    None => ColumnValues::Null,
+                };
+                let ctx = TdsTypeContext {
+                    max_size: usize::MAX,
+                    is_plp: true,
+                    ..base_ctx
+                };
+                (cv, ctx)
+            }
         }
     }
 
@@ -725,6 +750,28 @@ impl SqlType {
         .await
     }
 
+    async fn write_collated_type_info(
+        packet_writer: &mut PacketWriter<'_>,
+        tds_type: u8,
+        length: u16,
+        collation: &SqlCollation,
+    ) -> TdsResult<()> {
+        let length = length.to_le_bytes();
+        let info = collation.info.to_le_bytes();
+        packet_writer
+            .write_fixed_bytes(&[
+                tds_type,
+                length[0],
+                length[1],
+                info[0],
+                info[1],
+                info[2],
+                info[3],
+                collation.sort_id,
+            ])
+            .await
+    }
+
     /// Write the TDS `TYPE_INFO` for this type: the type byte followed by its
     /// length/precision/scale/collation metadata.
     ///
@@ -754,8 +801,9 @@ impl SqlType {
             | SqlType::Real(_)
             | SqlType::Float(_) => {
                 let type_size = self.get_fixed_length_size();
-                packet_writer.write_byte_async(nullable_type as u8).await?;
-                packet_writer.write_byte_async(type_size as u8).await?;
+                packet_writer
+                    .write_fixed_bytes(&[nullable_type as u8, type_size as u8])
+                    .await?;
             }
 
             // Decimal/Numeric: type byte + 17 + precision + scale
@@ -843,16 +891,22 @@ impl SqlType {
                 } else {
                     *param_len * 2
                 };
-                packet_writer.write_byte_async(nullable_type as u8).await?;
-                packet_writer.write_u16_async(param_len).await?;
-                packet_writer.write_u32_async(db_collation.info).await?;
-                packet_writer.write_byte_async(db_collation.sort_id).await?;
+                Self::write_collated_type_info(
+                    packet_writer,
+                    nullable_type as u8,
+                    param_len,
+                    db_collation,
+                )
+                .await?;
             }
             SqlType::NVarcharMax(_) => {
-                packet_writer.write_byte_async(nullable_type as u8).await?;
-                packet_writer.write_u16_async(MAX_U16_LENGTH).await?;
-                packet_writer.write_u32_async(db_collation.info).await?;
-                packet_writer.write_byte_async(db_collation.sort_id).await?;
+                Self::write_collated_type_info(
+                    packet_writer,
+                    nullable_type as u8,
+                    MAX_U16_LENGTH,
+                    db_collation,
+                )
+                .await?;
             }
 
             // Varchar: type byte + param_len(u16) + collation(5 bytes)
@@ -862,16 +916,22 @@ impl SqlType {
                 } else {
                     *param_len
                 };
-                packet_writer.write_byte_async(nullable_type as u8).await?;
-                packet_writer.write_u16_async(param_len).await?;
-                packet_writer.write_u32_async(db_collation.info).await?;
-                packet_writer.write_byte_async(db_collation.sort_id).await?;
+                Self::write_collated_type_info(
+                    packet_writer,
+                    nullable_type as u8,
+                    param_len,
+                    db_collation,
+                )
+                .await?;
             }
             SqlType::VarcharMax(_) => {
-                packet_writer.write_byte_async(nullable_type as u8).await?;
-                packet_writer.write_u16_async(MAX_U16_LENGTH).await?;
-                packet_writer.write_u32_async(db_collation.info).await?;
-                packet_writer.write_byte_async(db_collation.sort_id).await?;
+                Self::write_collated_type_info(
+                    packet_writer,
+                    nullable_type as u8,
+                    MAX_U16_LENGTH,
+                    db_collation,
+                )
+                .await?;
             }
 
             // Char: type byte + param_len(u16) + collation(5 bytes)
@@ -881,10 +941,13 @@ impl SqlType {
                 } else {
                     *param_len
                 };
-                packet_writer.write_byte_async(nullable_type as u8).await?;
-                packet_writer.write_u16_async(param_len).await?;
-                packet_writer.write_u32_async(db_collation.info).await?;
-                packet_writer.write_byte_async(db_collation.sort_id).await?;
+                Self::write_collated_type_info(
+                    packet_writer,
+                    nullable_type as u8,
+                    param_len,
+                    db_collation,
+                )
+                .await?;
             }
             SqlType::NChar(_, param_len) => {
                 let param_len = if *param_len > 4000 {
@@ -892,10 +955,13 @@ impl SqlType {
                 } else {
                     *param_len * 2
                 };
-                packet_writer.write_byte_async(nullable_type as u8).await?;
-                packet_writer.write_u16_async(param_len).await?;
-                packet_writer.write_u32_async(db_collation.info).await?;
-                packet_writer.write_byte_async(db_collation.sort_id).await?;
+                Self::write_collated_type_info(
+                    packet_writer,
+                    nullable_type as u8,
+                    param_len,
+                    db_collation,
+                )
+                .await?;
             }
 
             // Text/NText: type byte + u32 max_size + collation(5 bytes) + table name parts
@@ -955,30 +1021,7 @@ impl SqlType {
             SqlType::Vector(sql_vector, dimensions, base_type) => {
                 packet_writer.write_byte_async(nullable_type as u8).await?;
 
-                let max_dim = base_type.max_dimensions();
-                if *dimensions > max_dim {
-                    return Err(Error::UsageError(format!(
-                        "Vector dimensions {} exceeds maximum supported dimensions {} for base type {:?}",
-                        dimensions, max_dim, base_type
-                    )));
-                }
-
-                if let Some(vector) = sql_vector {
-                    let actual_base_type = vector.base_type();
-                    if actual_base_type != *base_type {
-                        return Err(Error::TypeConversionError(format!(
-                            "Vector base type mismatch: declared {:?}, but vector has {:?}",
-                            base_type, actual_base_type
-                        )));
-                    }
-                    let actual_dimensions = vector.dimension_count();
-                    if actual_dimensions != *dimensions {
-                        return Err(Error::TypeConversionError(format!(
-                            "Vector dimension mismatch: declared {}, but vector has {}",
-                            dimensions, actual_dimensions
-                        )));
-                    }
-                }
+                Self::validate_vector(sql_vector.as_ref(), *dimensions, *base_type)?;
 
                 let element_size = base_type.element_size_bytes() as u16;
                 let exact_size = (VECTOR_HEADER_SIZE as u16) + (*dimensions * element_size);
@@ -997,6 +1040,14 @@ impl SqlType {
                     .await?;
             }
 
+            // UDT: type byte + catalog/schema/type name, and nothing else. The
+            // PLP body length that follows is written by the value serializer,
+            // exactly as msodbcsql's `WriteUDTHeader` emits it.
+            SqlType::Udt(type_name, _) => {
+                packet_writer.write_byte_async(nullable_type as u8).await?;
+                write_udt_type_name(packet_writer, type_name).await?;
+            }
+
             // Table (TVP): metadata and rows are written by the dedicated
             // `serialize_table` path, which short-circuits in `serialize` before
             // this method is reached. A TVP is never a column type within another
@@ -1010,6 +1061,75 @@ impl SqlType {
             }
         }
 
+        Ok(())
+    }
+
+    /// Validates what must be correct before *any* byte of this value reaches
+    /// the wire.
+    ///
+    /// The per-type checks below also run during `write_type_info`, but that
+    /// is too late to keep a failure local: by then `RpcParameter::serialize`
+    /// has written this parameter's name and status flags, and in a
+    /// multi-parameter RPC an earlier parameter may have flushed whole packets
+    /// (`PacketWriter` sends on overflow). `SqlRpc::validate_parameters` calls
+    /// this for every parameter before the message writes anything, so
+    /// locally-invalid input fails locally instead of becoming a half-sent
+    /// request that has to be cancelled and drained.
+    ///
+    /// Every fallible *scalar* metadata check in `write_type_info` belongs
+    /// here: today the UDT name, the `sql_variant` inner type, and the vector
+    /// dimension/base-type bounds. The duplicates in `write_type_info` stay,
+    /// since that function must remain correct for callers that reach it by
+    /// another route.
+    ///
+    /// `SqlType::Table` is the known exception. A TVP's validation lives in
+    /// `serialize_table` / `write_tvp_type_name` / `write_tvp_column_metadata`
+    /// and covers the type name, the column metadata and every row, so hoisting
+    /// it is a larger change than this one - it is tracked in AB#48248 rather
+    /// than half-done here. A TVP with invalid table data can therefore still
+    /// fail mid-write; do not read this method as covering it.
+    pub(crate) fn validate_for_send(&self) -> TdsResult<()> {
+        match self {
+            SqlType::Udt(type_name, _) => type_name.validate(),
+            SqlType::Variant(inner) => Self::validate_variant_inner(inner),
+            SqlType::Vector(vector, dimensions, base_type) => {
+                Self::validate_vector(vector.as_ref(), *dimensions, *base_type)
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Checks a vector's declared dimensions against its base type's maximum,
+    /// and - when a value is present - that the declaration matches the value.
+    ///
+    /// Shared with `write_type_info` so the wire path and the preflight cannot
+    /// disagree about what is sendable.
+    fn validate_vector(
+        vector: Option<&SqlVector>,
+        dimensions: u16,
+        base_type: VectorBaseType,
+    ) -> TdsResult<()> {
+        let max_dim = base_type.max_dimensions();
+        if dimensions > max_dim {
+            return Err(Error::UsageError(format!(
+                "Vector dimensions {dimensions} exceeds maximum supported dimensions {max_dim} for base type {base_type:?}"
+            )));
+        }
+
+        if let Some(vector) = vector {
+            let actual_base_type = vector.base_type();
+            if actual_base_type != base_type {
+                return Err(Error::TypeConversionError(format!(
+                    "Vector base type mismatch: declared {base_type:?}, but vector has {actual_base_type:?}"
+                )));
+            }
+            let actual_dimensions = vector.dimension_count();
+            if actual_dimensions != dimensions {
+                return Err(Error::TypeConversionError(format!(
+                    "Vector dimension mismatch: declared {dimensions}, but vector has {actual_dimensions}"
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -1033,6 +1153,7 @@ impl SqlType {
             SqlType::Xml(_) => Some("xml"),
             SqlType::Json(_) => Some("json"),
             SqlType::Vector(_, _, _) => Some("vector"),
+            SqlType::Udt(_, _) => Some("udt"),
             SqlType::Variant(_) => Some("sql_variant (nested)"),
             SqlType::Table(_, _) => Some("table-valued parameter (TVP)"),
             // Sized string/binary types whose declared length exceeds the non-MAX limit
@@ -1278,7 +1399,8 @@ mod variant_tests {
 
     use crate::{
         datatypes::{
-            sql_string::SqlString,
+            sql_string::{EncodingType, SqlString},
+            sql_udt::UdtTypeName,
             sqldatatypes::TdsDataType,
             sqltypes::{SQL_VARIANT_MAX_LENGTH, SqlType},
         },
@@ -1323,6 +1445,71 @@ mod variant_tests {
         assert_eq!(cursor.get_u32_le(), SQL_VARIANT_MAX_LENGTH);
     }
 
+    /// The whole UDT parameter on the wire, not just its name block: type
+    /// byte, the three B_VARCHARs `CRPCPolicy::WriteUDTHeader` emits, then the
+    /// PLP body - an 8-byte total length, one chunk with its own u32 length,
+    /// and the PLP terminator. `datatypes::sql_udt::tests` covers only the
+    /// name block, so nothing else pins this framing.
+    #[tokio::test]
+    async fn a_udt_parameter_is_framed_as_plp_after_its_name_block() {
+        let payload = vec![0xDEu8, 0xAD, 0xBE, 0xEF];
+        let value = SqlType::Udt(
+            UdtTypeName::new(None, Some("dbo".to_string()), "Point".to_string()),
+            Some(payload.clone()),
+        );
+        let mut cursor = Cursor::new(serialize_to_bytes(&value).await);
+
+        assert_eq!(cursor.get_u8(), TdsDataType::Udt as u8);
+        assert_eq!(cursor.get_u8(), 0, "absent catalog is a zero-length part");
+        assert_eq!(cursor.get_u8(), 3, "schema \"dbo\" is 3 UTF-16 units");
+        cursor.advance(3 * 2);
+        assert_eq!(cursor.get_u8(), 5, "type \"Point\" is 5 UTF-16 units");
+        cursor.advance(5 * 2);
+
+        // Unknown-length PLP: chunks run until the terminator. msodbcsql
+        // instead writes the actual byte count when it knows it
+        // (`WriteUDTHeader`: `ullActualLen = cbData` unless the value is
+        // unlimited). Both are valid PLP and the server accepts either; this
+        // driver buffers the payload but still declares it unknown, which is
+        // what lets the data-at-execution path share the same writer.
+        assert_eq!(
+            cursor.get_u64_le(),
+            0xFFFF_FFFF_FFFF_FFFE,
+            "PLP unknown-length marker precedes the chunks"
+        );
+        assert_eq!(cursor.get_u32_le(), payload.len() as u32, "chunk length");
+        let mut chunk = vec![0u8; payload.len()];
+        cursor.copy_to_slice(&mut chunk);
+        assert_eq!(chunk, payload, "payload passes through untouched");
+        assert_eq!(cursor.get_u32_le(), 0, "PLP terminator");
+        assert!(!cursor.has_remaining(), "nothing follows the terminator");
+    }
+
+    /// A NULL UDT still names its type - the server cannot resolve the
+    /// parameter otherwise - and then declares the PLP null length rather than
+    /// a zero-length body.
+    #[tokio::test]
+    async fn a_null_udt_parameter_still_carries_its_name() {
+        let value = SqlType::Udt(
+            UdtTypeName::new(None, None, "hierarchyid".to_string()),
+            None,
+        );
+        let mut cursor = Cursor::new(serialize_to_bytes(&value).await);
+
+        assert_eq!(cursor.get_u8(), TdsDataType::Udt as u8);
+        assert_eq!(cursor.get_u8(), 0, "absent catalog");
+        assert_eq!(cursor.get_u8(), 0, "absent schema");
+        assert_eq!(cursor.get_u8(), 11, "type \"hierarchyid\" is 11 units");
+        cursor.advance(11 * 2);
+        assert_eq!(
+            cursor.get_u64_le(),
+            0xFFFF_FFFF_FFFF_FFFF,
+            "a NULL PLP body is the null length (GenericDecoder::SQL_PLP_NULL), \
+             not an empty chunk list"
+        );
+        assert!(!cursor.has_remaining());
+    }
+
     #[tokio::test]
     async fn variant_int_round_trip_bytes() {
         let bytes = serialize_to_bytes(&SqlType::Variant(Box::new(SqlType::Int(Some(42))))).await;
@@ -1363,6 +1550,244 @@ mod variant_tests {
         assert_eq!(cursor.get_u32_le(), 13);
         assert_eq!(cursor.get_u8(), TdsDataType::NVarChar as u8); // base type
         assert_eq!(cursor.get_u8(), 7); // prop_len = 7 (collation[5] + max_len[2])
+    }
+
+    /// `DelayedSet` means "encoding not yet known", not "narrow": `mssql-js`
+    /// uses it for both widths (`ffidatatypes.rs:435-443` for `NVarchar`,
+    /// `:449` for `Varchar`), so no encoding-tag heuristic can be right for it
+    /// in general. Landing it in the wide arm here is the defensible default
+    /// regardless: `mssql-js` rejects `SsVariant` outright today, so neither
+    /// pairing is reachable through this function, and `serialize_string`'s
+    /// NVARCHAR arm already honours a pre-encoded wide payload unchanged via
+    /// `as_raw_wire_bytes`, so treating it as wide risks nothing a real
+    /// caller could hit. Classifying it as narrow by negating `Utf16` rather
+    /// than matching the encodings that are actually narrow would instead
+    /// misclassify it as narrow every time, retagging a wide payload
+    /// `BigVarChar` without transcoding it -- corrupting the value on the
+    /// wire while changing not one data byte, which a length-based check
+    /// would not catch. Regression test for that classification bug.
+    #[tokio::test]
+    async fn variant_delayedset_string_is_treated_as_wide() {
+        let wide_hi: Vec<u8> = "Hi".encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let val = SqlString::new(wide_hi.clone(), EncodingType::DelayedSet);
+        let bytes = serialize_to_bytes(&SqlType::Variant(Box::new(SqlType::NVarchar(
+            Some(val),
+            10,
+        ))))
+        .await;
+        let mut cursor = Cursor::new(bytes);
+        assert_eq!(cursor.get_u8(), TdsDataType::SsVariant as u8);
+        assert_eq!(cursor.get_u32_le(), SQL_VARIANT_MAX_LENGTH);
+        // Same shape as the plain-UTF-16 "Hi" case above: total_length = 2 + 7(prop) + 4(data) = 13
+        assert_eq!(cursor.get_u32_le(), 13);
+        assert_eq!(cursor.get_u8(), TdsDataType::NVarChar as u8); // base type stays wide, not BigVarChar
+        assert_eq!(cursor.get_u8(), 7); // prop_len = 7 (collation[5] + max_len[2])
+        assert_eq!(cursor.get_u32_le(), 0x0000_0409); // collation.info
+        assert_eq!(cursor.get_u8(), 52); // collation.sort_id
+        assert_eq!(cursor.get_u16_le(), 4); // max_length: the 4 raw UTF-16LE bytes
+        assert_eq!(cursor.chunk(), &wide_hi[..]); // payload is untouched, not re-transcoded
+    }
+
+    /// `LcidBased` bytes are already encoded to the collation's codepage --
+    /// typically by the fetch/decode path reading a non-UTF8-collation narrow
+    /// variant column back (`decode_seven_propbyte_variant`) -- so
+    /// `resolve_narrow_wire_bytes` must pass them through unchanged via its
+    /// `as_raw_wire_bytes` fast path rather than re-encoding. Covers that
+    /// fast path directly: `DelayedSet` no longer reaches it after the fix
+    /// above, so `LcidBased` is the only remaining narrow encoding that does.
+    #[tokio::test]
+    async fn variant_lcidbased_string_bytes_pass_through_unchanged() {
+        let collation = SqlCollation {
+            info: 0x00000409,
+            lcid_language_id: 0x0409,
+            col_flags: 0,
+            sort_id: 52,
+        };
+        // Pre-encoded Windows-1252 bytes for "café": the trailing 'é' is
+        // already the single byte 0xE9, not the two-byte UTF-8 sequence.
+        let val = SqlString::new(
+            vec![b'c', b'a', b'f', 0xE9],
+            EncodingType::LcidBased(collation),
+        );
+        let bytes =
+            serialize_to_bytes(&SqlType::Variant(Box::new(SqlType::Varchar(Some(val), 10)))).await;
+        let mut cursor = Cursor::new(bytes);
+        assert_eq!(cursor.get_u8(), TdsDataType::SsVariant as u8);
+        assert_eq!(cursor.get_u32_le(), SQL_VARIANT_MAX_LENGTH);
+        assert_eq!(cursor.get_u32_le(), 13); // total_length = 2 + 7(prop) + 4(data)
+        assert_eq!(cursor.get_u8(), TdsDataType::BigVarChar as u8); // narrow base type
+        assert_eq!(cursor.get_u8(), 7);
+        assert_eq!(cursor.get_u32_le(), 0x0000_0409); // collation.info
+        assert_eq!(cursor.get_u8(), 52); // collation.sort_id
+        assert_eq!(cursor.get_u16_le(), 4); // max_length: the 4 raw bytes, unchanged
+        assert_eq!(cursor.chunk(), &[b'c', b'a', b'f', 0xE9]); // pass-through, not re-transcoded
+    }
+
+    #[tokio::test]
+    async fn variant_varchar_writes_narrow_base_type_and_length() {
+        let val = SqlString::new(b"Hi".to_vec(), EncodingType::Utf8);
+        let bytes =
+            serialize_to_bytes(&SqlType::Variant(Box::new(SqlType::Varchar(Some(val), 10)))).await;
+        let mut cursor = Cursor::new(bytes);
+        assert_eq!(cursor.get_u8(), TdsDataType::SsVariant as u8);
+        assert_eq!(cursor.get_u32_le(), SQL_VARIANT_MAX_LENGTH);
+        // "Hi" narrow = 2 bytes (vs. 4 bytes for the nvarchar/UTF-16 case above).
+        // total_length = 2 + 7(prop) + 2(data) = 11
+        assert_eq!(cursor.get_u32_le(), 11);
+        assert_eq!(cursor.get_u8(), TdsDataType::BigVarChar as u8); // base type: AB#47800
+        assert_eq!(cursor.get_u8(), 7); // prop_len = 7 (collation[5] + max_len[2])
+        assert_eq!(cursor.get_u32_le(), 0x0000_0409); // collation.info
+        assert_eq!(cursor.get_u8(), 52); // collation.sort_id
+        assert_eq!(cursor.get_u16_le(), 2); // max_length: 2 narrow bytes, not halved as if wide
+        assert_eq!(cursor.chunk(), b"Hi");
+    }
+
+    /// The one narrow shape the tests above don't reach: an empty payload.
+    /// `MaxLength = 0` on a `BIGVARCHARTYPE` follows directly from the same
+    /// `wMaxLen = cbSrc` rule msodbcsql uses (`odbc/sqlcmisc.cpp:7594`), and
+    /// `main` already declared 0 the same way for an empty *wide* payload, but
+    /// no existing test -- unit or the two un-skipped E2E cases -- exercises
+    /// it on the narrow leg.
+    #[tokio::test]
+    async fn variant_varchar_empty_payload_declares_zero_length() {
+        let val = SqlString::new(Vec::new(), EncodingType::Utf8);
+        let bytes =
+            serialize_to_bytes(&SqlType::Variant(Box::new(SqlType::Varchar(Some(val), 10)))).await;
+        let mut cursor = Cursor::new(bytes);
+        assert_eq!(cursor.get_u8(), TdsDataType::SsVariant as u8);
+        assert_eq!(cursor.get_u32_le(), SQL_VARIANT_MAX_LENGTH);
+        assert_eq!(cursor.get_u32_le(), 9); // total_length = 2 + 7(prop) + 0(data)
+        assert_eq!(cursor.get_u8(), TdsDataType::BigVarChar as u8);
+        assert_eq!(cursor.get_u8(), 7);
+        assert_eq!(cursor.get_u32_le(), 0x0000_0409);
+        assert_eq!(cursor.get_u8(), 52);
+        assert_eq!(cursor.get_u16_le(), 0); // max_length = 0, not "unstated"/max
+        assert!(cursor.chunk().is_empty());
+    }
+
+    /// A narrow value's transcoded byte length can exceed its declared `n` in
+    /// ways the ODBC-side bind-time clamp (`variant_column_size` /
+    /// `trim_blank_overflow` in `mssql-odbc`) does not catch, because that
+    /// clamp measures source units, not the collation-transcoded result --
+    /// the same pre-existing gap `trim_blank_overflow` already documents for
+    /// plain `varchar` (AB#47584), now also reachable through `sql_variant`.
+    /// The wire-level 8000-byte cap this function enforces is still the
+    /// backstop that refuses an over-large narrow variant.
+    ///
+    /// The expansion that used to reach that cap no longer happens: 2000
+    /// repetitions of U+65E5 (3 UTF-8 bytes each = 6000 source bytes, under the
+    /// 8000-byte declared ceiling) each expanded to an 8-byte NCR escape
+    /// (`&#26085;`) under a non-UTF-8 collation that cannot represent them,
+    /// totalling 16000 bytes -- twice the cap. Each is now a single `?`
+    /// (AB#47598), so the value shrinks to 2000 bytes and lands well inside the
+    /// cap. Pinned so this drifts only on a deliberate change: an encoder that
+    /// went back to escaping would trip the cap again and turn a warning into a
+    /// hard failure.
+    #[tokio::test]
+    async fn variant_varchar_substitutes_unmappable_characters_within_the_byte_cap() {
+        let val = SqlString::new("日".repeat(2000).into_bytes(), EncodingType::Utf8);
+        let mut mock_reader_writer = MockNetworkWriter::new(4096);
+        let mut packet_writer = PacketWriter::new(
+            PacketType::TabularResult,
+            &mut mock_reader_writer,
+            None,
+            None,
+        );
+        SqlType::Variant(Box::new(SqlType::Varchar(Some(val), 8000)))
+            .serialize(&mut packet_writer, &default_collation(), None)
+            .await
+            .expect("2000 substituted bytes fit the cap");
+        assert!(
+            packet_writer.code_page_conversion_loss(),
+            "the message must carry the loss for the caller"
+        );
+    }
+
+    /// The variant path marks the message only after the value has serialized,
+    /// for the same reason as the plain `varchar` arm: the 8000-byte cap
+    /// rejects before a wrapper byte is written, so a lossy value refused here
+    /// never reached the wire and must not be reported as lost (AB#47598).
+    ///
+    /// 8001 unmappable characters substitute to 8001 bytes -- one past the cap
+    /// -- which is the smallest value that is both lossy and refused. The
+    /// sibling test above pins the accepted side at 2000.
+    ///
+    /// Mutation-sensitive: marking at resolve time rather than after the inner
+    /// serialize makes this fail while the accepted-side tests still pass.
+    #[tokio::test]
+    async fn variant_varchar_rejected_past_the_byte_cap_does_not_mark_the_message() {
+        let val = SqlString::new("日".repeat(8001).into_bytes(), EncodingType::Utf8);
+        let mut mock_reader_writer = MockNetworkWriter::new(4096);
+        let mut packet_writer = PacketWriter::new(
+            PacketType::TabularResult,
+            &mut mock_reader_writer,
+            None,
+            None,
+        );
+        SqlType::Variant(Box::new(SqlType::Varchar(Some(val), 8000)))
+            .serialize(&mut packet_writer, &default_collation(), None)
+            .await
+            .expect_err("8001 substituted bytes exceed the variant cap");
+        assert!(
+            !packet_writer.code_page_conversion_loss(),
+            "a variant refused before its wrapper was written must not report loss"
+        );
+    }
+
+    /// The robust fix for AB#47800: a narrow value whose source (UTF-8) and
+    /// wire (collation codepage) byte lengths differ must declare -- and
+    /// send -- the *wire* length, resolved once and reused everywhere,
+    /// rather than a source length recomputed independently in each place
+    /// that needs a length (which is how the original bug manifested: a
+    /// declared length that disagreed with the bytes actually written).
+    ///
+    /// "café" is 5 UTF-8 bytes (the trailing 'é' is 0xC3 0xA9) but 4 bytes
+    /// under Windows-1252 (LCID 0x0409, this test's collation), where 'é' is
+    /// the single byte 0xE9.
+    #[tokio::test]
+    async fn variant_varchar_declares_the_transcoded_length_not_the_source_length() {
+        let val = SqlString::new("café".as_bytes().to_vec(), EncodingType::Utf8);
+        let bytes =
+            serialize_to_bytes(&SqlType::Variant(Box::new(SqlType::Varchar(Some(val), 10)))).await;
+        let mut cursor = Cursor::new(bytes);
+        assert_eq!(cursor.get_u8(), TdsDataType::SsVariant as u8);
+        assert_eq!(cursor.get_u32_le(), SQL_VARIANT_MAX_LENGTH);
+        // total_length = 2 + 7(prop) + 4(data): 4 transcoded bytes, not the 5-byte UTF-8 source.
+        assert_eq!(cursor.get_u32_le(), 13);
+        assert_eq!(cursor.get_u8(), TdsDataType::BigVarChar as u8);
+        assert_eq!(cursor.get_u8(), 7);
+        assert_eq!(cursor.get_u32_le(), 0x0000_0409);
+        assert_eq!(cursor.get_u8(), 52);
+        assert_eq!(cursor.get_u16_le(), 4); // declared length matches the transcoded bytes
+        assert_eq!(cursor.chunk(), &[b'c', b'a', b'f', 0xE9]); // Windows-1252, not UTF-8
+    }
+
+    /// End-to-end proof for the AB#47800 fix: what the serializer now writes
+    /// for a transcoded narrow value is read back correctly by the existing,
+    /// separately-tested sql_variant decoder -- not just shaped the way a
+    /// hand-written byte assertion expects.
+    #[tokio::test]
+    async fn variant_varchar_round_trips_through_the_decoder() {
+        use crate::datatypes::decoder::GenericDecoder;
+
+        let val = SqlString::new("café".as_bytes().to_vec(), EncodingType::Utf8);
+        let bytes =
+            serialize_to_bytes(&SqlType::Variant(Box::new(SqlType::Varchar(Some(val), 10)))).await;
+        // Skip the RPC TYPE_INFO preamble (1-byte type + 4-byte max length)
+        // this crate writes ahead of every SSVARIANT_INSTANCE.
+        let variant_bytes = &bytes[5..];
+
+        let decoder = GenericDecoder::default();
+        let (base, value, used) = decoder
+            .try_decode_buffered_variant(variant_bytes)
+            .unwrap()
+            .unwrap();
+        assert_eq!(base, Some(TdsDataType::BigVarChar));
+        assert_eq!(used, variant_bytes.len());
+        let crate::datatypes::column_values::ColumnValues::String(decoded) = value else {
+            panic!("expected string variant");
+        };
+        assert_eq!(decoded.to_utf8_string(), "café");
     }
 
     #[tokio::test]

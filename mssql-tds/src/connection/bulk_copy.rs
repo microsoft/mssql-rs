@@ -296,6 +296,13 @@ impl BulkCopyResult {
 /// `BulkCopy` provides a convenient builder-style API for configuring and executing
 /// bulk copy operations. It handles batching, progress reporting, and error handling.
 ///
+/// Destination names are parsed as multipart identifiers and bracket-quoted, not
+/// treated as SQL fragments. Omitted qualifiers (`database..table`), temporary
+/// tables (`#table`, `tempdb..#table`), and bracket- or double-quoted parts are
+/// supported. A missing table part, including a trailing dot, is rejected.
+/// Column names from custom metadata retrievers are also quoted; collation names
+/// must follow the token format documented on [`BulkCopyColumnMetadata::collation_name`].
+///
 /// # Example
 ///
 /// ```rust,ignore
@@ -843,8 +850,13 @@ impl<'a> BulkCopy<'a> {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
-    /// use mssql_tds::connection::bulk_copy::{BulkLoadRow, BulkRowWriter};
+    /// ```rust,no_run
+    /// use async_trait::async_trait;
+    /// use mssql_tds::connection::bulk_copy::{BulkCopy, BulkLoadRow};
+    /// use mssql_tds::core::TdsResult;
+    /// use mssql_tds::datatypes::column_values::ColumnValues;
+    /// use mssql_tds::datatypes::sql_string::SqlString;
+    /// use mssql_tds::message::bulk_load::StreamingBulkLoadWriter;
     ///
     /// struct User {
     ///     id: i32,
@@ -854,20 +866,34 @@ impl<'a> BulkCopy<'a> {
     ///
     /// #[async_trait]
     /// impl BulkLoadRow for User {
-    ///     async fn write_to_packet(&self, writer: &mut BulkRowWriter<'_>) -> TdsResult<()> {
-    ///         writer.write_int(0, self.id).await?;
-    ///         writer.write_string(1, &self.name).await?;
-    ///         writer.write_bit(2, self.active).await?;
+    ///     async fn write_to_packet(
+    ///         &self,
+    ///         writer: &mut StreamingBulkLoadWriter<'_>,
+    ///         column_index: &mut usize,
+    ///     ) -> TdsResult<()> {
+    ///         writer.write_column_value(*column_index, &ColumnValues::Int(self.id)).await?;
+    ///         *column_index += 1;
+    ///         writer
+    ///             .write_column_value(
+    ///                 *column_index,
+    ///                 &ColumnValues::String(SqlString::from_utf8_string(self.name.clone())),
+    ///             )
+    ///             .await?;
+    ///         *column_index += 1;
+    ///         writer.write_column_value(*column_index, &ColumnValues::Bit(self.active)).await?;
+    ///         *column_index += 1;
     ///         Ok(())
     ///     }
     /// }
     ///
-    /// let users = vec![
-    ///     User { id: 1, name: "Alice".to_string(), active: true },
-    ///     User { id: 2, name: "Bob".to_string(), active: false },
-    /// ];
-    ///
-    /// bulk_copy.write_to_server_zerocopy(users.into_iter()).await?;
+    /// async fn write_users(bulk_copy: &mut BulkCopy<'_>) -> TdsResult<()> {
+    ///     let users = vec![
+    ///         User { id: 1, name: "Alice".to_string(), active: true },
+    ///         User { id: 2, name: "Bob".to_string(), active: false },
+    ///     ];
+    ///     bulk_copy.write_to_server_zerocopy(users.into_iter()).await?;
+    ///     Ok(())
+    /// }
     /// ```
     ///
     /// # Errors
@@ -885,6 +911,13 @@ impl<'a> BulkCopy<'a> {
     {
         let start_time = Instant::now();
         let mut total_rows = 0u64;
+
+        // The whole operation's substitution accounting starts clean, and it has
+        // to be cleared *here* rather than in `write_rows_to_server_zerocopy`:
+        // that helper is only reached when there is at least one row, so an empty
+        // bulk copy would otherwise leave a previous operation's verdict standing
+        // on a reused client and report it as this one's (AB#47598).
+        self.client.set_code_page_conversion_loss(false);
 
         // Initialize timeout state for this operation
         // A timeout of 0 means infinite (no timeout)
@@ -1025,6 +1058,25 @@ impl<'a> BulkCopy<'a> {
         // once the loop completes.
         let mut accumulated_info: Vec<SqlInfoMessage> = Vec::new();
 
+        // Accumulated for the same reason, and by the same means: each batch is a
+        // complete message of its own, so `execute_bulk_load_streaming_zerocopy`
+        // *assigns* the flag per batch rather than OR-ing it, exactly as
+        // `finish_send` does for a request. Without draining it per batch the
+        // second batch's verdict would overwrite the first's, and a bulk copy
+        // whose only substitution happened early would report none (AB#47598).
+        //
+        // Unlike `accumulated_info`, this is mirrored back onto the client as
+        // soon as it is updated, so the invariant "the client holds the verdict
+        // for every batch attempted so far" holds at *every* point after a
+        // drain. The loop has exits that do not pass through an epilogue — the
+        // two timeout returns and the `begin_transaction` `?` below — and a
+        // restore placed only at the end would drop an earlier batch's
+        // substitution on each of them. Nothing between batches clears the flag
+        // (the transaction calls build their own `PacketWriter`s and never
+        // reach `finish_send`), so the mirrored value survives until the next
+        // batch assigns a fresh one.
+        let mut accumulated_cp_loss = false;
+
         loop {
             if rows.peek().is_none() {
                 break;
@@ -1104,6 +1156,9 @@ impl<'a> BulkCopy<'a> {
                     // Drain this batch's INFO messages before the internal commit (which
                     // resets the client's buffer) can clear them.
                     accumulated_info.extend(self.client.take_info_messages());
+                    accumulated_cp_loss |= self.client.take_code_page_conversion_loss();
+                    self.client
+                        .set_code_page_conversion_loss(accumulated_cp_loss);
 
                     // ═══════════════════════════════════════════════════════════
                     // COMMIT TRANSACTION: Commit on successful batch completion
@@ -1116,7 +1171,9 @@ impl<'a> BulkCopy<'a> {
                         // and including this batch before propagating the error, so it
                         // stays retrievable via `client.info_messages()` — consistent
                         // with the Err(e) arm below. Drop any residual INFO left by the
-                        // failed commit first.
+                        // failed commit first. The substitution verdict needs no restore
+                        // here: it was mirrored onto the client above and the commit
+                        // cannot have disturbed it.
                         let _ = self.client.take_info_messages();
                         self.client
                             .extend_info_messages(std::mem::take(&mut accumulated_info));
@@ -1130,6 +1187,9 @@ impl<'a> BulkCopy<'a> {
                     // the client's buffer via begin_command) can clear it, so it is
                     // retained alongside the already-accumulated prior batches' INFO.
                     accumulated_info.extend(self.client.take_info_messages());
+                    accumulated_cp_loss |= self.client.take_code_page_conversion_loss();
+                    self.client
+                        .set_code_page_conversion_loss(accumulated_cp_loss);
 
                     // ═══════════════════════════════════════════════════════════
                     // ROLLBACK TRANSACTION: Rollback on batch failure
@@ -1148,7 +1208,8 @@ impl<'a> BulkCopy<'a> {
                     // itself; INFO is a separate, complementary channel (INFO tokens vs
                     // ERROR tokens) and this mirrors .NET's InfoMessage events having
                     // already fired for the batches that completed. Drop any residual
-                    // INFO left by the rollback first.
+                    // INFO left by the rollback first. The substitution verdict was
+                    // mirrored onto the client above; the rollback cannot disturb it.
                     let _ = self.client.take_info_messages();
                     self.client
                         .extend_info_messages(std::mem::take(&mut accumulated_info));
@@ -1183,6 +1244,14 @@ impl<'a> BulkCopy<'a> {
         // buffer left by the final internal commit first, so only bulk-load INFO remains.
         let _ = self.client.take_info_messages();
         self.client.extend_info_messages(accumulated_info);
+        // Belt and braces: the verdict was already mirrored onto the client after
+        // each batch, and this helper only runs with at least one row, so the
+        // loop has always executed by now. Kept so the accumulator and the
+        // client cannot drift if a future exit is added between the last mirror
+        // and here. The empty-copy case is handled by the reset in
+        // `write_to_server_zerocopy`, which is the only caller.
+        self.client
+            .set_code_page_conversion_loss(accumulated_cp_loss);
 
         Ok(())
     }
@@ -1229,9 +1298,13 @@ impl<'a> BulkCopy<'a> {
 ///
 /// # Example
 ///
-/// ```rust,ignore
-/// use mssql_tds::connection::bulk_copy::{BulkLoadRow, BulkRowWriter};
+/// ```rust,no_run
+/// use async_trait::async_trait;
+/// use mssql_tds::connection::bulk_copy::{BulkCopy, BulkLoadRow};
 /// use mssql_tds::core::TdsResult;
+/// use mssql_tds::datatypes::column_values::ColumnValues;
+/// use mssql_tds::datatypes::sql_string::SqlString;
+/// use mssql_tds::message::bulk_load::StreamingBulkLoadWriter;
 ///
 /// struct Product {
 ///     id: i32,
@@ -1239,19 +1312,35 @@ impl<'a> BulkCopy<'a> {
 ///     price: f64,
 /// }
 ///
+/// #[async_trait]
 /// impl BulkLoadRow for Product {
-///     async fn write_to_packet(&self, writer: &mut BulkRowWriter<'_>) -> TdsResult<()> {
-///         writer.write_int(self.id).await?;
-///         writer.write_string(&self.name).await?;
-///         writer.write_float(self.price).await?;
+///     async fn write_to_packet(
+///         &self,
+///         writer: &mut StreamingBulkLoadWriter<'_>,
+///         column_index: &mut usize,
+///     ) -> TdsResult<()> {
+///         writer.write_column_value(*column_index, &ColumnValues::Int(self.id)).await?;
+///         *column_index += 1;
+///         writer
+///             .write_column_value(
+///                 *column_index,
+///                 &ColumnValues::String(SqlString::from_utf8_string(self.name.clone())),
+///             )
+///             .await?;
+///         *column_index += 1;
+///         writer.write_column_value(*column_index, &ColumnValues::Float(self.price)).await?;
+///         *column_index += 1;
 ///         Ok(())
 ///     }
 /// }
 ///
-/// // Use it:
-/// let products = vec![Product { id: 1, name: "Widget".to_string(), price: 9.99 }];
-/// let bulk_copy = BulkCopy::new(&mut client, "Products");
-/// bulk_copy.write_to_server_zerocopy(products.into_iter()).await?;
+/// async fn write_products(bulk_copy: &mut BulkCopy<'_>) -> TdsResult<()> {
+///     let products = vec![
+///         Product { id: 1, name: "Widget".to_string(), price: 9.99 },
+///     ];
+///     bulk_copy.write_to_server_zerocopy(products.into_iter()).await?;
+///     Ok(())
+/// }
 /// ```
 #[async_trait]
 pub trait BulkLoadRow {

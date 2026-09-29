@@ -17,7 +17,7 @@
 #
 # --skip-build reuses a driver and CMake `build/` produced earlier by
 # build_e2e.sh (no cargo/cmake needed — only the unixODBC runtime). Combine
-# with --driver=PATH to point at the prebuilt libmsodbcsql18.so. This is how
+# with --driver=PATH to point at the prebuilt mssqlodbc.so. This is how
 # CI runs prebuilt binaries across distro containers.
 #
 # --retries=N reruns each failing test up to N extra times (ctest
@@ -49,7 +49,7 @@
 # Rust driver logs are controlled by MSSQL_TDS_TRACE and
 # MSSQL_TDS_TRACE_LEVEL.
 # In --verbose mode, this script defaults to:
-#   MSSQL_TDS_TRACE=true MSSQL_TDS_TRACE_LEVEL=warn,msodbcsql18=debug
+#   MSSQL_TDS_TRACE=true MSSQL_TDS_TRACE_LEVEL=warn,mssqlodbc=debug
 # unless they are already set in the environment.
 #
 # Examples:
@@ -182,7 +182,7 @@ trap cleanup EXIT
 # `cargo llvm-cov show-env` exports RUSTFLAGS (-C instrument-coverage), the
 # llvm-cov target dir and an LLVM_PROFILE_FILE pattern (with %p/%m so distinct
 # gtest processes and ctest retries never clobber each other's .profraw). The
-# subsequent `cargo build` then produces an instrumented libmsodbcsql18.so, and
+# subsequent `cargo build` then produces an instrumented mssqlodbc.so, and
 # every ctest child process inherits LLVM_PROFILE_FILE from this environment.
 setup_coverage_env() {
     echo "=== Enabling coverage instrumentation for the Rust driver ==="
@@ -201,7 +201,7 @@ setup_coverage_env() {
 setup_tracing() {
     if [ "$VERBOSE" -eq 1 ]; then
         export MSSQL_TDS_TRACE="${MSSQL_TDS_TRACE:-true}"
-        export MSSQL_TDS_TRACE_LEVEL="${MSSQL_TDS_TRACE_LEVEL:-warn,msodbcsql18=debug}"
+        export MSSQL_TDS_TRACE_LEVEL="${MSSQL_TDS_TRACE_LEVEL:-warn,mssqlodbc=debug}"
         echo "Verbose: MSSQL_TDS_TRACE=$MSSQL_TDS_TRACE MSSQL_TDS_TRACE_LEVEL=$MSSQL_TDS_TRACE_LEVEL"
     fi
 }
@@ -210,12 +210,12 @@ setup_tracing() {
 # Step 2: Build the Rust driver and resolve its shared library path
 # ----------------------------------------------------------------------------
 build_rust_driver() {
-    # Resolve the driver's shared-library filename for this platform.
+    # Resolve the shipped shared-library filename for this platform.
     local libname
     if [[ "$(uname -s)" == "Darwin" ]]; then
-        libname="libmsodbcsql18.dylib"
+        libname="mssqlodbc.dylib"
     else
-        libname="libmsodbcsql18.so"
+        libname="mssqlodbc.so"
     fi
 
     # Prebuilt mode: an explicit --driver=PATH wins; otherwise --skip-build
@@ -240,28 +240,25 @@ build_rust_driver() {
                 cargo build
             fi
         )
+        RUST_DRIVER_PATH="$(bash "$ODBC_CRATE_DIR/scripts/finalize-artifact.sh" "$BUILD_TYPE")"
     else
         echo "=== Skipping driver build (--skip-build) ==="
         # build_e2e.sh stages the driver inside the build tree, so prefer that
-        # copy when it exists before falling back to the cargo target dir.
+        # copy when it exists before re-running the finalizer.
         if [ -f "$BUILD_DIR/$libname" ]; then
             RUST_DRIVER_PATH="$BUILD_DIR/$libname"
             echo "Using staged driver: $RUST_DRIVER_PATH"
             return
         fi
+        # No staged copy: re-run the finalizer so the shipped artifact reflects
+        # Cargo's current output. Resolving the finalized copy directly could run
+        # a stale driver, since `cargo build` never refreshes that copy.
+        if ! RUST_DRIVER_PATH="$(bash "$ODBC_CRATE_DIR/scripts/finalize-artifact.sh" "$BUILD_TYPE")"; then
+            echo "Error: could not finalize the driver for --skip-build" >&2
+            echo "Hint: run 'cargo build' (add --release for release), or pass --driver=PATH" >&2
+            exit 1
+        fi
     fi
-
-    # Cargo builds into the workspace root's target/ directory, which may
-    # differ from the crate-local directory. Use `cargo metadata` to resolve it.
-    # Under coverage, `cargo llvm-cov show-env` may redirect the build via
-    # CARGO_TARGET_DIR; `cargo metadata` honors that env var, so target_directory
-    # always points at wherever the instrumented .so actually lands.
-    local target_dir
-    target_dir="$(cd "$ODBC_CRATE_DIR" && cargo metadata --format-version 1 --no-deps 2>/dev/null \
-        | python3 -c 'import sys,json; print(json.load(sys.stdin)["target_directory"])' 2>/dev/null \
-        || echo "$ODBC_CRATE_DIR/target")"
-
-    RUST_DRIVER_PATH="$target_dir/$BUILD_TYPE/$libname"
 
     if [ ! -f "$RUST_DRIVER_PATH" ]; then
         echo "Error: Rust driver not found at $RUST_DRIVER_PATH" >&2
@@ -463,7 +460,7 @@ generate_coverage_report() {
         echo "WARNING: failed to create ODBC e2e coverage output directory" >&2
         return 0
     fi
-    if cargo llvm-cov report --package mssql-tds --package mssql-odbc \
+    if cargo llvm-cov report --package mssql-tds --package mssqlodbc \
         --cobertura --output-path "$COVERAGE_OUTPUT"; then
         echo "Coverage report written to $COVERAGE_OUTPUT"
     else

@@ -1,97 +1,146 @@
-# stamp-crate-versions.ps1
-# Patches Cargo.toml version fields for publishable crates before cargo publish.
-# Uses the same versioning scheme as the NuGet wheel packaging.
-#
-# Usage (in pipeline):
-#   pwsh .pipeline/scripts/stamp-crate-versions.ps1 -BuildReason "$(Build.Reason)" -BuildId "$(Build.BuildId)" -IsOfficial $false
-#
-# Usage (local testing):
-#   pwsh .pipeline/scripts/stamp-crate-versions.ps1 -BuildReason "IndividualCI" -BuildId "99999" -IsOfficial $false -WhatIf
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
+<#
+.SYNOPSIS
+  Stamps publishable crate manifests with the version for the current build.
+
+.DESCRIPTION
+  Official builds retain the source version. Non-official scheduled builds use a
+  nightly version, while other non-official builds use a unique dev version.
+  mssql-mock-tds is kept aligned with mssql-tds, including its dependency version.
+#>
+[CmdletBinding()]
 param(
-    [Parameter(Mandatory=$true)]
+    [Parameter(Mandatory = $true)]
     [string]$BuildReason,
 
-    [Parameter(Mandatory=$true)]
+    [Parameter(Mandatory = $true)]
     [string]$BuildId,
 
-    [Parameter(Mandatory=$false)]
-    [bool]$IsOfficial = $false,
+    [string]$IsOfficial = 'False',
 
-    [Parameter(Mandatory=$false)]
-    [string[]]$Crates = @("mssql-tds", "mssql-mock-tds"),
+    [string[]]$Crates = @('mssql-tds', 'mssql-mock-tds'),
 
-    [Parameter(Mandatory=$false)]
-    [switch]$WhatIf
+    [switch]$WhatIf,
+
+    [string]$RepositoryRoot = (Resolve-Path (Join-Path $PSScriptRoot '../..'))
 )
 
 $ErrorActionPreference = 'Stop'
 
-# Read base version from the first crate
-$cargoTomlPath = Join-Path $PSScriptRoot "../../$($Crates[0])/Cargo.toml"
-$cargoToml = Get-Content $cargoTomlPath -Raw
-# Match the first `version = "..."` at the start of a line (multiline mode).
-# This targets the [package] version, which appears before any dependency versions.
-if ($cargoToml -match '(?m)^version\s*=\s*"([^"]+)"') {
-    $baseVersion = $Matches[1]
-} else {
-    Write-Error "Could not extract version from $cargoTomlPath"
-    exit 1
+function Get-PackageVersion {
+    param([Parameter(Mandatory = $true)][string]$Content, [Parameter(Mandatory = $true)][string]$Path)
+
+    $packageSection = [regex]::Match($Content, '(?ms)^\[package\].*?(?=^\[|\z)')
+    if (-not $packageSection.Success) {
+        throw "No [package] section found in $Path"
+    }
+
+    $version = [regex]::Match($packageSection.Value, '(?m)^version\s*=\s*"([^"]+)"')
+    if (-not $version.Success) {
+        throw "No package version found in $Path"
+    }
+
+    return $version.Groups[1].Value
 }
 
-$dateStamp = Get-Date -Format "yyyyMMdd"
+function Set-PackageVersion {
+    param(
+        [Parameter(Mandatory = $true)][string]$Content,
+        [Parameter(Mandatory = $true)][string]$Version,
+        [Parameter(Mandatory = $true)][string]$Path
+    )
 
-# Build.Reason is set by Azure Pipelines to indicate how the run was triggered:
-#   Schedule      - cron-scheduled run          -> nightly prerelease
-#   Manual        - user clicked "Run pipeline" -> release (official) or dev (non-official)
-#   IndividualCI  - push to a monitored branch  -> dev prerelease
-#   BatchedCI     - batched push trigger         -> dev prerelease
-#   PullRequest   - PR validation (publish is skipped at the stage level)
-switch ($BuildReason) {
-    'Schedule' {
-        $crateVersion = "$baseVersion-nightly.$dateStamp"
-        Write-Host "Nightly build detected"
+    $packageSection = [regex]::Match($Content, '(?ms)^\[package\].*?(?=^\[|\z)')
+    if (-not $packageSection.Success) {
+        throw "No [package] section found in $Path"
     }
-    'Manual' {
-        if ($IsOfficial) {
-            $crateVersion = $baseVersion
-            Write-Host "Official release build detected"
-        } else {
-            $crateVersion = "$baseVersion-dev.$dateStamp.$BuildId"
-            Write-Host "Non-official manual build detected"
-        }
+
+    $versionMatches = [regex]::Matches($packageSection.Value, '(?m)^(version\s*=\s*)"[^"]+"')
+    if ($versionMatches.Count -ne 1) {
+        throw "Expected one package version in ${Path}, found $($versionMatches.Count)"
     }
-    default {
-        $crateVersion = "$baseVersion-dev.$dateStamp.$BuildId"
-        Write-Host "CI build detected (reason: $BuildReason)"
-    }
+
+    $versionMatch = $versionMatches[0]
+    $replacement = $versionMatch.Groups[1].Value + "`"$Version`""
+    $updatedSection = $packageSection.Value.Substring(0, $versionMatch.Index) +
+        $replacement +
+        $packageSection.Value.Substring($versionMatch.Index + $versionMatch.Length)
+
+    return $Content.Substring(0, $packageSection.Index) +
+        $updatedSection +
+        $Content.Substring($packageSection.Index + $packageSection.Length)
 }
 
-Write-Host "Base version: $baseVersion"
+function Set-MssqlTdsDependencyVersion {
+    param(
+        [Parameter(Mandatory = $true)][string]$Content,
+        [Parameter(Mandatory = $true)][string]$Version,
+        [Parameter(Mandatory = $true)][string]$Path
+    )
+
+    $pattern = [regex]'(?m)^(?<prefix>\s*mssql-tds\s*=\s*\{[^\r\n}]*?\bversion\s*=\s*)"[^"]+"(?<suffix>[^\r\n}]*\}\s*)$'
+    $depMatches = $pattern.Matches($Content)
+    if ($depMatches.Count -ne 1) {
+        throw "Expected one versioned mssql-tds dependency in ${Path}, found $($depMatches.Count)"
+    }
+
+    $match = $depMatches[0]
+    $replacement = $match.Groups['prefix'].Value + "`"$Version`"" + $match.Groups['suffix'].Value
+    return $Content.Substring(0, $match.Index) +
+        $replacement +
+        $Content.Substring($match.Index + $match.Length)
+}
+
+$isOfficialBuild = $false
+if (-not [bool]::TryParse($IsOfficial, [ref]$isOfficialBuild)) {
+    throw "IsOfficial must be True or False, got '$IsOfficial'"
+}
+
+$cargoTomlPath = Join-Path $RepositoryRoot "$($Crates[0])/Cargo.toml"
+$baseVersion = Get-PackageVersion -Content (Get-Content $cargoTomlPath -Raw) -Path $cargoTomlPath
+if ($baseVersion -match '-(?:dev|nightly)\.\d{8}(?:\.|$)') {
+    throw "Source manifest is already stamped with build version $baseVersion"
+}
+$dateStamp = Get-Date -Format 'yyyyMMdd'
+
+if ($isOfficialBuild) {
+    $crateVersion = $baseVersion
+    Write-Host 'Official build detected'
+}
+elseif ($BuildReason -eq 'Schedule') {
+    $crateVersion = "$baseVersion-nightly.$dateStamp"
+    Write-Host 'Non-official nightly build detected'
+}
+else {
+    $crateVersion = "$baseVersion-dev.$dateStamp.$BuildId"
+    Write-Host "Non-official build detected (reason: $BuildReason)"
+}
+
+Write-Host "Base version:  $baseVersion"
 Write-Host "Crate version: $crateVersion"
 
 foreach ($crate in $Crates) {
-    $path = Join-Path $PSScriptRoot "../../$crate/Cargo.toml"
-    $path = Resolve-Path $path
+    $path = Join-Path $RepositoryRoot "$crate/Cargo.toml"
     $content = Get-Content $path -Raw
-
-    # Replace only the first version = "..." line (the [package] version)
-    $updated = $content -replace '(?m)^(version\s*=\s*)"[^"]+"', "`$1`"$crateVersion`""
-
-    if ($content -eq $updated) {
-        Write-Warning "No version field found or already at target in $path"
-        continue
+    $updated = Set-PackageVersion -Content $content -Version $crateVersion -Path $path
+    if ($crate -eq 'mssql-mock-tds') {
+        $updated = Set-MssqlTdsDependencyVersion -Content $updated -Version $crateVersion -Path $path
     }
 
     if ($WhatIf) {
         Write-Host "[WhatIf] Would patch $path -> version = `"$crateVersion`""
-    } else {
+    }
+    elseif ($content -ne $updated) {
         Set-Content $path $updated -NoNewline
         Write-Host "Patched $path -> version = `"$crateVersion`""
     }
+    else {
+        Write-Host "$path already uses version `"$crateVersion`""
+    }
 }
 
-# Set pipeline variable for downstream steps
 if (-not $WhatIf) {
     Write-Host "##vso[task.setvariable variable=crateVersion]$crateVersion"
     Write-Host "##vso[task.setvariable variable=crateVersion;isOutput=true]$crateVersion"

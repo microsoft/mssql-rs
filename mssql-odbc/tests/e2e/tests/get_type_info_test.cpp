@@ -12,6 +12,15 @@
 #ifndef SQL_SS_UDT
 #define SQL_SS_UDT (-151)
 #endif
+#ifndef SQL_SS_XML
+#define SQL_SS_XML (-152)
+#endif
+#ifndef SQL_SS_TABLE
+#define SQL_SS_TABLE (-153)
+#endif
+#ifndef SQL_SS_VECTOR
+#define SQL_SS_VECTOR (-156)
+#endif
 
 namespace {
 
@@ -48,14 +57,79 @@ TEST(GetTypeInfoTest, NullHandle) {
 
 class GetTypeInfoLiveTest : public ODBCTest {
 protected:
+    virtual SQLUINTEGER OdbcVersion() const { return SQL_OV_ODBC3_80; }
+
     void SetUp() override {
         ODBCTest::SetUp();
         if (!ODBCTestConfig::Instance().HasConnection()) {
             GTEST_SKIP() << "No connection configured – set ODBC_TEST_SERVER or ODBC_TEST_CONNSTR";
         }
+        ASSERT_SQL_OK(SQLSetEnvAttr(env_, SQL_ATTR_ODBC_VERSION,
+                                    reinterpret_cast<SQLPOINTER>(OdbcVersion()), 0),
+                      SQL_HANDLE_ENV, env_);
         Connect();
     }
 };
+
+class GetTypeInfoOdbcVersionLiveTest
+    : public GetTypeInfoLiveTest,
+      public ::testing::WithParamInterface<SQLUINTEGER> {
+protected:
+    SQLUINTEGER OdbcVersion() const override { return GetParam(); }
+};
+
+// Benefits-from-mock-tds: request capture could assert the positional
+// SQL_TYPE_TIMESTAMP and named @ODBCVer=4 parameters directly for both app
+// versions; the live server exposes only their result-set effects.
+TEST_P(GetTypeInfoOdbcVersionLiveTest, TimestampFilterAndColumnContractMatch) {
+    ASSERT_SQL_OK(SQLGetTypeInfo(stmt_, SQL_TYPE_TIMESTAMP), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("TYPE_NAME", DescribeColName(stmt_, 1));
+    EXPECT_EQ("DATA_TYPE", DescribeColName(stmt_, 2));
+    EXPECT_EQ("COLUMN_SIZE", DescribeColName(stmt_, 3));
+    EXPECT_EQ("FIXED_PREC_SCALE", DescribeColName(stmt_, 11));
+    EXPECT_EQ("AUTO_UNIQUE_VALUE", DescribeColName(stmt_, 12));
+    int rows = 0;
+    SQLRETURN rc;
+    while ((rc = SQLFetch(stmt_)) == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO) {
+        char dataType[16] = {};
+        SQLLEN indicator = 0;
+        ASSERT_SQL_OK(SQLGetData(stmt_, 2, SQL_C_CHAR, dataType, sizeof(dataType), &indicator),
+                      SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ(std::to_string(SQL_TYPE_TIMESTAMP), std::string(dataType));
+        ++rows;
+    }
+    EXPECT_EQ(SQL_NO_DATA, rc);
+    EXPECT_GT(rows, 0);
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+}
+
+// msodbcsql sends pseudo-version 4 here rather than the catalog functions'
+// value 3 (`sqlcdd.cpp:2206`, `fODBCVer = ISYUKON(lpdbc) ? 4 : 3`), and the
+// comment beside it attributes that to making sp_datatype_info report NULL
+// precision for XML. That effect does not reproduce on a modern server: in
+// build 176155 both this driver and msodbcsql 18.6.2.1 returned a non-NULL,
+// one-character COLUMN_SIZE for the XML row on all 16 runs, against both
+// SQL_OV_ODBC3 and SQL_OV_ODBC3_80. The RPC parameter itself is pinned by the
+// `type_info_rpc_sends_the_yukon_pseudo_version_and_the_unmodified_type` unit
+// test; what stays worth checking
+// live is that the XML row is returned and reports a column size at all.
+TEST_P(GetTypeInfoOdbcVersionLiveTest, XmlColumnSizeIsReported) {
+    ASSERT_SQL_OK(SQLGetTypeInfo(stmt_, SQL_SS_XML), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    char columnSize[32] = {};
+    SQLLEN indicator = 0;
+    ASSERT_SQL_OK(SQLGetData(stmt_, 3, SQL_C_CHAR, columnSize, sizeof(columnSize), &indicator),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_NE(SQL_NULL_DATA, indicator)
+        << "sp_datatype_info_100 reported no COLUMN_SIZE for the XML row";
+    EXPECT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+}
+
+INSTANTIATE_TEST_SUITE_P(Odbc3And38, GetTypeInfoOdbcVersionLiveTest,
+                         ::testing::Values(static_cast<SQLUINTEGER>(SQL_OV_ODBC3),
+                                           static_cast<SQLUINTEGER>(SQL_OV_ODBC3_80)));
 
 // SQL_ALL_TYPES opens a fetchable result set with the full ODBC type-info
 // column contract (at least 19 columns) and at least one row.
@@ -163,6 +237,53 @@ TEST_F(GetTypeInfoLiveTest, RecoversAfterInvalidType) {
 // msodbcsql.
 TEST_F(GetTypeInfoLiveTest, UdtReturnsHYC00) {
     SQLRETURN rc = SQLGetTypeInfo(stmt_, SQL_SS_UDT);
+    EXPECT_EQ(SQL_ERROR, rc);
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HYC00");
+}
+
+// SQL_SS_UDT is not special: msodbcsql answers HYC00 for every unmapped id at
+// or below SQL_TYPE_DRIVER_START (-80), not just the UDT id.
+TEST_F(GetTypeInfoLiveTest, DriverRangeTypeReturnsHYC00) {
+    SQLRETURN rc = SQLGetTypeInfo(stmt_, -200);
+    EXPECT_EQ(SQL_ERROR, rc);
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HYC00");
+}
+
+// A table type sits far below SQL_TYPE_DRIVER_START but is still HY004, because
+// msodbcsql's FInternalSqlType check runs before the driver-range bound.
+TEST_F(GetTypeInfoLiveTest, TableTypeReturnsHY004) {
+    SQLRETURN rc = SQLGetTypeInfo(stmt_, SQL_SS_TABLE);
+    EXPECT_EQ(SQL_ERROR, rc);
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HY004");
+}
+
+// SQL Server supports no interval types, but the request is not an error:
+// msodbcsql discards IsValidSqlType's HYC00 verdict for these ids and sends the
+// RPC anyway, so the call succeeds with an empty result set.
+TEST_F(GetTypeInfoLiveTest, IntervalTypeReturnsEmptyResultSet) {
+    SQLRETURN rc = SQLGetTypeInfo(stmt_, SQL_INTERVAL_YEAR);
+    ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+
+    rc = SQLFetch(stmt_);
+    EXPECT_EQ(SQL_NO_DATA, rc);
+
+    rc = SQLCloseCursor(stmt_);
+    EXPECT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+}
+
+// msodbcsql accepts a vector type id, but only because it also switches to
+// sp_datatype_info_170 when the connection negotiated vector support. This
+// driver always calls _100, which has no vector row, so it answers HYC00 ("not
+// implemented") rather than reporting success with no vector metadata. Update
+// this expectation when the _170 selection lands.
+//
+// The skip is the gap-driven form permitted by §2.1 of the ODBC engineering
+// instructions: asserting msodbcsql's answer here would need a vector-capable
+// server this suite cannot assume. The gap is tracked by AB#48326 (P9g: Vector
+// parameter binding and the SQL_SS_VECTOR client struct).
+TEST_F(GetTypeInfoLiveTest, VectorTypeIsNotImplementedYet) {
+    SKIP_IF_COMPARING_MSODBCSQL();
+    SQLRETURN rc = SQLGetTypeInfo(stmt_, SQL_SS_VECTOR);
     EXPECT_EQ(SQL_ERROR, rc);
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HYC00");
 }

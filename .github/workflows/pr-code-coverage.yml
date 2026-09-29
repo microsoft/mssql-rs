@@ -45,8 +45,33 @@ on:
 # Each job opts into only the scopes it needs.
 permissions: {}
 
+# Concurrency is resolved at run creation, before the job `if:` is evaluated, so
+# a run that will skip (an ordinary PR comment) would otherwise cancel the real
+# in-flight run and leave a red, misleading check behind. Two things keep runs
+# apart:
+#
+#   1. Runs that the `coverage-report` job will skip get a unique
+#      `-noop-<run_id>` suffix, so they share a group with nothing and cancel
+#      nothing. The predicate mirrors the job `if:` below — keep them in sync.
+#   2. The event name is part of the group, so the automatic `pull_request` path
+#      and the manual `/coverage` path never cancel each other. Both are "real"
+#      runs, but only the `pull_request` run's check is attached to the PR head
+#      SHA; letting a `/coverage` run cancel it would re-create the same red
+#      check this guard exists to prevent — precisely when someone is manually
+#      recovering a report.
+#
+# Within each path `cancel-in-progress` still applies, so a new push supersedes
+# a stale wait and a second `/coverage` supersedes the first.
 concurrency:
-  group: pr-coverage-${{ github.event.pull_request.number || github.event.issue.number }}
+  group: >-
+    pr-coverage-${{ github.event.pull_request.number || github.event.issue.number }}-${{ github.event_name }}${{
+    !((github.event_name == 'pull_request' &&
+    github.event.pull_request.head.repo.full_name == github.repository) ||
+    (github.event_name == 'issue_comment' &&
+    github.event.issue.pull_request != null &&
+    startsWith(github.event.comment.body, '/coverage') &&
+    contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)))
+    && format('-noop-{0}', github.run_id) || '' }}
   cancel-in-progress: true
 
 env:

@@ -54,6 +54,17 @@ parameters:
     # the same stage (e.g. glibc-modern and glibc-2.28) get distinct job names.
     type: string
     default: ''
+  - name: poolImageOverride
+    type: string
+    default: 'imageOverride -equals RUST-AZL3-ARM64'
+  # The SQL host these ARM jobs talk to runs on x64, so it needs its own pool and
+  # image rather than inheriting the ARM ones above.
+  - name: sqlHostPoolName
+    type: string
+    default: 'RUST-X64-WUS3'
+  - name: sqlHostImageOverride
+    type: string
+    default: 'imageOverride -equals RUST-AZL3'
 
 jobs:
   # ------------------------------------------------------------------
@@ -63,6 +74,8 @@ jobs:
     - ${{ if parameters.manageSqlHost }}:
       - template: sql-host-template.yml
         parameters:
+          poolName: ${{ parameters.sqlHostPoolName }}
+          poolImageOverride: ${{ parameters.sqlHostImageOverride }}
           instanceId: ${{ parameters.sqlReadyInstanceId }}
           sqlImageTag: ${{ parameters.sqlImageTag }}
           maxLifetimeMinutes: ${{ parameters.maxLifetimeMinutes }}
@@ -84,7 +97,7 @@ jobs:
       pool:
         name: ${{ parameters.poolName }}
         demands:
-          - imageOverride -equals RUST-UBUNTU-ARM64
+          - ${{ parameters.poolImageOverride }}
       steps:
         - bash: |
             set -euo pipefail
@@ -98,7 +111,7 @@ jobs:
         - task: DockerInstaller@0
           inputs:
             dockerVersion: '29.0.0'
-        - template: install-ubuntu-dependency.yaml
+        - template: install-host-dependency.yaml
           parameters:
             installAzCli: false
             installDocker: true
@@ -185,6 +198,8 @@ jobs:
     - ${{ each target in parameters.targets }}:
       - template: sql-host-template.yml
         parameters:
+          poolName: ${{ parameters.sqlHostPoolName }}
+          poolImageOverride: ${{ parameters.sqlHostImageOverride }}
           instanceId: ${{ parameters.sentinelPrefix }}${{ target.name }}
           sqlImageTag: ${{ parameters.sqlImageTag }}
           maxLifetimeMinutes: ${{ parameters.maxLifetimeMinutes }}
@@ -196,7 +211,7 @@ jobs:
         pool:
           name: ${{ parameters.poolName }}
           demands:
-            - imageOverride -equals RUST-UBUNTU-ARM64
+            - ${{ parameters.poolImageOverride }}
         steps:
           - bash: |
               set -euo pipefail
@@ -210,7 +225,7 @@ jobs:
           - task: DockerInstaller@0
             inputs:
               dockerVersion: '29.0.0'
-          - template: install-ubuntu-dependency.yaml
+          - template: install-host-dependency.yaml
             parameters:
               installAzCli: false
               installDocker: true

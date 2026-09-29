@@ -15,12 +15,13 @@ use std::mem::size_of;
 use tracing::{debug, error};
 
 use crate::api::odbc_types::{
-    SQL_DESC_ALLOC_TYPE, SQL_DESC_ARRAY_SIZE, SQL_DESC_ARRAY_STATUS_PTR, SQL_DESC_BIND_OFFSET_PTR,
-    SQL_DESC_BIND_TYPE, SQL_DESC_CONCISE_TYPE, SQL_DESC_COUNT, SQL_DESC_DATA_PTR,
-    SQL_DESC_DATETIME_INTERVAL_CODE, SQL_DESC_INDICATOR_PTR, SQL_DESC_LENGTH, SQL_DESC_NAME,
-    SQL_DESC_NULLABLE, SQL_DESC_OCTET_LENGTH, SQL_DESC_OCTET_LENGTH_PTR, SQL_DESC_PARAMETER_TYPE,
-    SQL_DESC_PRECISION, SQL_DESC_ROWS_PROCESSED_PTR, SQL_DESC_SCALE, SQL_DESC_TYPE,
-    SQL_DESC_UNNAMED, SQL_ERROR, SQL_INVALID_HANDLE, SQL_NO_DATA, SQL_SUCCESS,
+    SQL_CA_SS_UDT_ASSEMBLY_TYPE_NAME, SQL_CA_SS_UDT_CATALOG_NAME, SQL_CA_SS_UDT_SCHEMA_NAME,
+    SQL_CA_SS_UDT_TYPE_NAME, SQL_DESC_ALLOC_TYPE, SQL_DESC_ARRAY_SIZE, SQL_DESC_ARRAY_STATUS_PTR,
+    SQL_DESC_BIND_OFFSET_PTR, SQL_DESC_BIND_TYPE, SQL_DESC_CONCISE_TYPE, SQL_DESC_COUNT,
+    SQL_DESC_DATA_PTR, SQL_DESC_DATETIME_INTERVAL_CODE, SQL_DESC_INDICATOR_PTR, SQL_DESC_LENGTH,
+    SQL_DESC_NAME, SQL_DESC_NULLABLE, SQL_DESC_OCTET_LENGTH, SQL_DESC_OCTET_LENGTH_PTR,
+    SQL_DESC_PARAMETER_TYPE, SQL_DESC_PRECISION, SQL_DESC_ROWS_PROCESSED_PTR, SQL_DESC_SCALE,
+    SQL_DESC_TYPE, SQL_DESC_UNNAMED, SQL_ERROR, SQL_INVALID_HANDLE, SQL_NO_DATA, SQL_SUCCESS,
     SQL_SUCCESS_WITH_INFO, SqlHandle, SqlInteger, SqlLen, SqlPointer, SqlReturn, SqlSmallInt,
     SqlULen, SqlUSmallInt, SqlWChar,
 };
@@ -35,7 +36,11 @@ use crate::handles::{DescHandle, HandleType, handle_from_raw};
 /// Implementation of [`SQLGetDescFieldW`](super::exports::SQLGetDescFieldW).
 ///
 /// # Safety
-/// See the exported function's doc for caller requirements.
+/// `descriptor_handle` must be null or point to a live `DescHandle`. For a
+/// character field, `value_ptr`, when non-null, must be writable for
+/// `buffer_length` bytes; for any other field it must be writable for one value
+/// of that field's declared type. `string_length_ptr`, when non-null, must be
+/// writable for one `SqlInteger`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn sql_get_desc_field_w(
     descriptor_handle: SqlHandle,
@@ -66,6 +71,12 @@ pub(crate) unsafe fn sql_get_desc_field_w(
     })
 }
 
+/// # Safety
+/// `descriptor_handle` must be null or point to a live `DescHandle`. For a
+/// character field, `value_ptr`, when non-null, must be writable for
+/// `buffer_length` bytes; for any other field it must be writable for one value
+/// of that field's declared type. `string_length_ptr`, when non-null, must be
+/// writable for one `SqlInteger`.
 #[allow(clippy::too_many_arguments)]
 unsafe fn sql_get_desc_field_w_impl(
     descriptor_handle: SqlHandle,
@@ -217,6 +228,20 @@ fn record_field_value(record: &DescRecord, field: SqlUSmallInt) -> Option<FieldV
         SQL_DESC_DATA_PTR => FieldValue::Pointer(record.data_ptr),
         SQL_DESC_INDICATOR_PTR => FieldValue::Pointer(record.indicator_ptr),
         SQL_DESC_OCTET_LENGTH_PTR => FieldValue::Pointer(record.octet_length_ptr),
+        // A UDT name part that was never set reads back empty, the same answer
+        // a record with no UDT identity at all gives.
+        SQL_CA_SS_UDT_CATALOG_NAME
+        | SQL_CA_SS_UDT_SCHEMA_NAME
+        | SQL_CA_SS_UDT_TYPE_NAME
+        | SQL_CA_SS_UDT_ASSEMBLY_TYPE_NAME => {
+            let part = record.udt_names.as_deref().map(|n| match field {
+                SQL_CA_SS_UDT_CATALOG_NAME => &n.catalog,
+                SQL_CA_SS_UDT_SCHEMA_NAME => &n.schema,
+                SQL_CA_SS_UDT_TYPE_NAME => &n.type_name,
+                _ => &n.assembly_type_name,
+            });
+            FieldValue::Text(part.cloned().unwrap_or_default())
+        }
         _ => return None,
     };
     Some(value)

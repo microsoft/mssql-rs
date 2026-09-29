@@ -56,6 +56,15 @@ pub(crate) enum ParameterMetadata {
         /// Unqualified table type name.
         name: String,
     },
+    /// A CLR user-defined type declaration identified by server type name.
+    Udt {
+        /// Database qualifying the type; `None` when the name is unqualified.
+        catalog: Option<String>,
+        /// Schema qualifying the type; `None` when the name is unqualified.
+        schema: Option<String>,
+        /// Unqualified UDT name.
+        name: String,
+    },
 }
 
 /// Extracts the declaration identity used for prepared-statement reuse.
@@ -137,6 +146,19 @@ fn sql_type_metadata(value: &SqlType) -> ParameterMetadata {
                 .schema_name
                 .clone()
                 .unwrap_or_else(|| "dbo".to_string()),
+            name: type_name.type_name.clone(),
+        },
+        // Absent parts stay absent, unlike the TVP arm above: the UDT
+        // declaration omits them too, so `Point` and `dbo.Point` are different
+        // declarations and must not share a prepared statement.
+        //
+        // Empty folds to absent because `format_udt_sql_name` filters empties
+        // before choosing its branch, so `Some("")` and `None` render the same
+        // declaration; keying them apart would miss the cache and re-prepare
+        // identical SQL.
+        SqlType::Udt(type_name, _) => ParameterMetadata::Udt {
+            catalog: type_name.db_name.clone().filter(|s| !s.is_empty()),
+            schema: type_name.schema_name.clone().filter(|s| !s.is_empty()),
             name: type_name.type_name.clone(),
         },
     }
@@ -374,6 +396,89 @@ pub(crate) fn bind_parameters(
     }
 
     bind_positional(operation, parameters.iter(), hints)
+}
+
+/// Rewritten SQL and placeholder metadata reused for every ExecuteMany row.
+pub(crate) struct ParameterBindingPlan {
+    operation: String,
+    placeholders: Vec<Placeholder>,
+    named: bool,
+}
+
+impl ParameterBindingPlan {
+    pub(crate) fn new(operation: &str, named: bool) -> PyResult<Self> {
+        let (operation, placeholders) = rewrite_placeholders(operation, named)?;
+        Ok(Self {
+            operation,
+            placeholders,
+            named,
+        })
+    }
+
+    pub(crate) fn operation(&self) -> &str {
+        &self.operation
+    }
+
+    pub(crate) fn bind_row(
+        &self,
+        row: &Bound<'_, PyAny>,
+        hints: Option<&[ParameterHint]>,
+    ) -> PyResult<(Vec<RpcParameter>, Vec<ParameterMetadata>)> {
+        validate_hint_count(hints, self.placeholders.len())?;
+        if self.named {
+            let values = row.cast::<PyDict>()?;
+            if self.placeholders.is_empty() && !values.is_empty() {
+                return Err(PyTypeError::new_err(format!(
+                    "The SQL contains no parameter markers, but {} parameters were supplied. \
+                     Named parameters use the %(name)s style.",
+                    values.len()
+                )));
+            }
+            let bound = self
+                .placeholders
+                .iter()
+                .enumerate()
+                .map(|(index, placeholder)| {
+                    let source_name = placeholder
+                        .source_name
+                        .as_ref()
+                        .expect("named placeholders include source names");
+                    let value = values
+                        .get_item(source_name)?
+                        .ok_or_else(|| PyKeyError::new_err(source_name.clone()))?;
+                    rpc_parameter(
+                        placeholder.rpc_name.clone(),
+                        &value,
+                        hints.and_then(|hints| hints.get(index)),
+                    )
+                })
+                .collect::<PyResult<Vec<_>>>()?;
+            return Ok(bound.into_iter().unzip());
+        }
+
+        let values = row.try_iter()?.collect::<PyResult<Vec<_>>>()?;
+        if self.placeholders.len() != values.len() {
+            return Err(PyTypeError::new_err(format!(
+                "The SQL contains {} parameter markers, but {} parameters were supplied",
+                self.placeholders.len(),
+                values.len()
+            )));
+        }
+        let bound = self
+            .placeholders
+            .iter()
+            .zip(values)
+            .enumerate()
+            .map(|(index, (placeholder, value))| {
+                rpc_parameter(
+                    placeholder.rpc_name.clone(),
+                    &value,
+                    hints.and_then(|hints| hints.get(index)),
+                )
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        Ok(bound.into_iter().unzip())
+    }
 }
 
 /// Parses `setinputsizes()` entries into validated conversion hints.

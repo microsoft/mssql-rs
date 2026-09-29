@@ -236,7 +236,7 @@ mod tests {
         );
 
         // Verify basic structure is correct
-        assert!(command.starts_with("INSERT BULK dbo.TestTable ("));
+        assert!(command.starts_with("INSERT BULK [dbo].[TestTable] ("));
         assert!(command.contains("[Id] int"));
         assert!(command.contains("[Name] nvarchar(100)"));
         assert!(command.contains("[Description] varchar(255)"));
@@ -318,5 +318,177 @@ mod tests {
             "Expected WITH clause with options, got: {}",
             command
         );
+    }
+
+    #[test]
+    fn test_insert_bulk_quotes_destination_parts() {
+        use crate::connection::bulk_copy::BulkCopyOptions;
+        use crate::message::bulk_load::build_insert_bulk_command;
+
+        let metadata = [create_int_column("id")];
+        for (name, expected) in [
+            ("Target", "[Target]"),
+            (" dbo . Target ", "[dbo].[Target]"),
+            ("db.dbo.Target", "[db].[dbo].[Target]"),
+            ("server.db.dbo.Target", "[server].[db].[dbo].[Target]"),
+            ("db..Target", "[db]..[Target]"),
+            (".Target", ".[Target]"),
+            ("..Target", "..[Target]"),
+            ("server...Target", "[server]...[Target]"),
+            ("#Target", "[#Target]"),
+            ("##Target", "[##Target]"),
+            ("tempdb..#Target", "[tempdb]..[#Target]"),
+            (
+                "[db.with.dot].[schema].[a]]b]",
+                "[db.with.dot].[schema].[a]]b]",
+            ),
+            ("\"db\".\"a\"\"b\".\" Target \"", "[db].[a\"b].[ Target ]"),
+            ("[O'Brien].[t'ab]]le]", "[O'Brien].[t'ab]]le]"),
+            (
+                "dbo.Target ([id] int); SELECT 4242 AS audit_probe;--",
+                "[dbo].[Target ([id]] int); SELECT 4242 AS audit_probe;--]",
+            ),
+            ("[a]]; SELECT 4242;--]", "[a]]; SELECT 4242;--]"),
+        ] {
+            let command =
+                build_insert_bulk_command(name, &metadata, &BulkCopyOptions::default()).unwrap();
+            assert_eq!(
+                command,
+                format!("INSERT BULK {expected} ([id] int)"),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_insert_bulk_quotes_column_identifiers() {
+        use crate::connection::bulk_copy::BulkCopyOptions;
+        use crate::message::bulk_load::build_insert_bulk_command;
+
+        for (name, expected) in [
+            ("id", "[id]"),
+            ("a]b", "[a]]b]"),
+            ("a]]b", "[a]]]]b]"),
+            ("O'Brien", "[O'Brien]"),
+            ("a.b", "[a.b]"),
+            (" column ", "[ column ]"),
+            ("a\"b", "[a\"b]"),
+            (
+                "id] int); SELECT 4242 AS audit_probe;--",
+                "[id]] int); SELECT 4242 AS audit_probe;--]",
+            ),
+        ] {
+            let command = build_insert_bulk_command(
+                "dbo.Target",
+                &[create_int_column(name)],
+                &BulkCopyOptions::default(),
+            )
+            .unwrap();
+            assert_eq!(
+                command,
+                format!("INSERT BULK [dbo].[Target] ({expected} int)")
+            );
+        }
+    }
+
+    #[test]
+    fn test_insert_bulk_rejects_missing_or_invalid_target() {
+        use crate::connection::bulk_copy::BulkCopyOptions;
+        use crate::error::Error;
+        use crate::message::bulk_load::build_insert_bulk_command;
+
+        for name in [
+            "",
+            " ",
+            ".",
+            "dbo.",
+            "db..",
+            "db.dbo. ",
+            "[]",
+            "db.dbo.[]",
+            "\"\"",
+            "[t",
+            "[t]extra",
+            "a.b.c.d.e",
+            "a.b.c.d.",
+        ] {
+            assert!(
+                matches!(
+                    build_insert_bulk_command(
+                        name,
+                        &[create_int_column("id")],
+                        &BulkCopyOptions::default()
+                    ),
+                    Err(Error::UsageError(_))
+                ),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_insert_bulk_rejects_invalid_collation_tokens() {
+        use crate::connection::bulk_copy::BulkCopyOptions;
+        use crate::error::Error;
+        use crate::message::bulk_load::build_insert_bulk_command;
+
+        let too_long = "A".repeat(129);
+        for name in [
+            "",
+            " Latin1_General_CI_AS",
+            "Latin1_General_CI_AS ",
+            "1Latin1",
+            "_Latin1",
+            "Latin1-General",
+            "Latin1.General",
+            "[Latin1_General_CI_AS]",
+            "'Latin1_General_CI_AS'",
+            "Latin1_General_CI_AS); SELECT 4242 AS audit_probe;--",
+            "Latin1_General_CI_AS--",
+            "Latin1_General_CI_AS/**/",
+            "Latin1\nGeneral",
+            "Latin1\0General",
+            "Lat\u{ed}n1_General",
+            &too_long,
+        ] {
+            let metadata = [create_nvarchar_column("Name", 10).with_collation_name(name)];
+            assert!(
+                matches!(
+                    build_insert_bulk_command("Target", &metadata, &BulkCopyOptions::default()),
+                    Err(Error::UsageError(message)) if message.starts_with("Invalid collation name:")
+                ),
+                "{name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_insert_bulk_accepts_collation_tokens() {
+        use crate::connection::bulk_copy::BulkCopyOptions;
+        use crate::message::bulk_load::build_insert_bulk_command;
+
+        let max_length = "A".repeat(128);
+        for name in [
+            "SQL_Latin1_General_CP1_CI_AS",
+            "Latin1_General_100_CI_AS_SC_UTF8",
+            "Japanese_XJIS_140_CI_AS_KS_WS_VSS",
+            "SQL_EBCDIC277_2_CP1_CS_AS",
+            "Latin1_General_BIN2",
+            "a",
+            &max_length,
+        ] {
+            for column in [
+                create_nvarchar_column("Name", 10),
+                create_varchar_column("Name", 10),
+            ] {
+                let command = build_insert_bulk_command(
+                    "Target",
+                    &[column.with_collation_name(name)],
+                    &BulkCopyOptions::default(),
+                )
+                .unwrap();
+                assert!(command.ends_with(&format!(" COLLATE {name})")), "{command}");
+            }
+        }
     }
 }

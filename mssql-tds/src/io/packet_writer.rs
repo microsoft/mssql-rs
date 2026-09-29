@@ -6,7 +6,6 @@ use crate::core::{CancelHandle, TdsResult};
 use crate::error::Error::TimeoutError;
 use crate::error::TimeoutErrorType;
 use crate::message::messages::{PacketStatusFlags, PacketType, ResetConnectionMode};
-use async_trait::async_trait;
 use byteorder::{BigEndian, WriteBytesExt};
 use std::io::Cursor;
 use std::time::Instant;
@@ -44,7 +43,8 @@ pub(crate) trait TdsPacketWriterUnchecked {
     async fn check_overflow(&mut self) -> TdsResult<()>;
 }
 
-#[async_trait]
+// This trait is statically dispatched: native async methods avoid allocating a
+// boxed future for every primitive written to a packet.
 pub(crate) trait TdsPacketWriter {
     /// Writes a byte to the buffer.
     async fn write_byte_async(&mut self, value: u8) -> TdsResult<()>;
@@ -97,13 +97,12 @@ pub struct PacketWriter<'a> {
     payload_cursor: Cursor<Vec<u8>>,
     packet_size: usize,
     is_first_packet: bool, // Note: Cannot just use packet_id because its value can rollover.
-    /// Set the instant a packet reaches the network. Distinct from
-    /// `is_first_packet`, which is cleared only after the write budget check and
-    /// the first-packet callback, so it still reads `true` on error paths where
-    /// the bytes are already gone.
-    any_packet_flushed: bool,
-    /// Whether the final packet of this message reached the network. Like
-    /// `any_packet_flushed`, set with the flush rather than after the checks that
+    /// A send was polled but has not completed successfully. Further writes
+    /// would append to a potentially partial packet or TLS record.
+    send_incomplete: bool,
+    send_attempted: bool,
+    /// Whether the final packet of this message reached the network. Set with
+    /// the flush rather than after the checks that
     /// follow it, so a budget expiry on the last packet cannot make a message the
     /// server holds in full look incomplete.
     message_complete: bool,
@@ -119,6 +118,13 @@ pub struct PacketWriter<'a> {
     /// payload ended exactly on a packet boundary, leaving the buffer empty
     /// (issue #73).
     eom_pending: bool,
+    /// Whether any value written into this message lost a character to the
+    /// target collation's code page. Set by the narrow string serializers and
+    /// read by the send site once the message is built, so `mssql-odbc` can
+    /// report SQLSTATE `01000` under `SQL_COPT_SS_WARN_ON_CP_ERROR`. Carried
+    /// across [`PacketWriter::suspend`] so a data-at-execution message that
+    /// spans several calls does not forget a loss from an earlier one.
+    code_page_conversion_loss: bool,
 }
 
 /// Owned, detached state of an in-progress outgoing message, produced by
@@ -137,24 +143,32 @@ pub(crate) struct SuspendedMessage {
     payload_cursor: Cursor<Vec<u8>>,
     packet_size: usize,
     is_first_packet: bool,
-    any_packet_flushed: bool,
+    send_incomplete: bool,
+    send_attempted: bool,
     message_complete: bool,
     max_timeout_sec: Option<u32>,
     cancel_handle: Option<CancelHandle>,
     reset_mode: ResetConnectionMode,
     eom_pending: bool,
+    code_page_conversion_loss: bool,
 }
 
 impl SuspendedMessage {
-    /// `true` while no packet of this message has reached the network yet, so
-    /// the request can be abandoned locally without the server ever learning it
-    /// existed.
-    ///
-    /// Deliberately not `is_first_packet`: that is cleared only after the write
-    /// budget check and the first-packet callback, so a packet that landed and
-    /// then tripped either would still read as unsent.
+    /// A polled send may have written bytes even if cancellation prevented it
+    /// from completing. False proves the server never saw this message.
+    pub(crate) fn send_attempted(&self) -> bool {
+        self.send_attempted
+    }
+
+    /// An interrupted send may have written only part of a packet, even when
+    /// earlier packets completed. Neither IGNORE nor attention can repair it.
+    pub(crate) fn send_incomplete(&self) -> bool {
+        self.send_incomplete
+    }
+
+    /// No send was polled, so abandoning locally cannot strand server bytes.
     pub(crate) fn nothing_sent(&self) -> bool {
-        !self.any_packet_flushed
+        !self.send_attempted
     }
 
     /// `true` when the final packet reached the network, so the server holds the
@@ -188,6 +202,13 @@ impl SuspendedMessage {
     /// The RESETCONNECTION mode this message took from the connection.
     pub(crate) fn reset_mode(&self) -> ResetConnectionMode {
         self.reset_mode
+    }
+
+    /// Whether any value written into this message was written with a
+    /// substituted character. See
+    /// [`PacketWriter::note_code_page_conversion_loss`].
+    pub(crate) fn code_page_conversion_loss(&self) -> bool {
+        self.code_page_conversion_loss
     }
 
     /// Discards an unsent message, returning any RESETCONNECTION request it was
@@ -245,14 +266,32 @@ impl<'a> PacketWriter<'a> {
             payload_cursor: buffer_cursor,
             packet_size,
             is_first_packet: true,
-            any_packet_flushed: false,
+            send_incomplete: false,
+            send_attempted: false,
             message_complete: false,
             start_time: Instant::now(),
             max_timeout_sec: effective_timeout,
             cancel_handle: cancel_handle.map(|handle| handle.child_handle()),
             reset_mode,
             eom_pending: false,
+            code_page_conversion_loss: false,
         }
+    }
+
+    /// Records that a value written into this message lost at least one
+    /// character to the target collation's code page.
+    ///
+    /// Sticky for the life of the message: one substituted character is enough
+    /// to warrant the diagnostic, and the send site reads the flag once, after
+    /// the whole message is built.
+    pub(crate) fn note_code_page_conversion_loss(&mut self) {
+        self.code_page_conversion_loss = true;
+    }
+
+    /// Whether any value in this message was written with a substituted
+    /// character. See [`Self::note_code_page_conversion_loss`].
+    pub(crate) fn code_page_conversion_loss(&self) -> bool {
+        self.code_page_conversion_loss
     }
 
     /// Detaches this writer's in-progress message state from the borrowed
@@ -280,12 +319,14 @@ impl<'a> PacketWriter<'a> {
             payload_cursor: self.payload_cursor,
             packet_size: self.packet_size,
             is_first_packet: self.is_first_packet,
-            any_packet_flushed: self.any_packet_flushed,
+            send_incomplete: self.send_incomplete,
+            send_attempted: self.send_attempted,
             message_complete: self.message_complete,
             max_timeout_sec: self.max_timeout_sec,
             cancel_handle: self.cancel_handle,
             reset_mode: self.reset_mode,
             eom_pending: self.eom_pending,
+            code_page_conversion_loss: self.code_page_conversion_loss,
         }
     }
 
@@ -309,13 +350,15 @@ impl<'a> PacketWriter<'a> {
             payload_cursor: state.payload_cursor,
             packet_size: state.packet_size,
             is_first_packet: state.is_first_packet,
-            any_packet_flushed: state.any_packet_flushed,
+            send_incomplete: state.send_incomplete,
+            send_attempted: state.send_attempted,
             message_complete: state.message_complete,
             start_time: Instant::now(),
             max_timeout_sec: state.max_timeout_sec,
             cancel_handle: state.cancel_handle,
             reset_mode: state.reset_mode,
             eom_pending: state.eom_pending,
+            code_page_conversion_loss: state.code_page_conversion_loss,
         }
     }
 
@@ -337,6 +380,21 @@ impl<'a> PacketWriter<'a> {
 
     pub(crate) fn position(&self) -> i32 {
         (self.payload_cursor.position() - Self::PACKET_HEADER_SIZE as u64) as i32
+    }
+
+    pub(crate) async fn write_fixed_bytes<const N: usize>(
+        &mut self,
+        bytes: &[u8; N],
+    ) -> TdsResult<()> {
+        // Keep exact-boundary sends on the ordinary overflow/cancellation path.
+        if self.has_space(N + 1) {
+            std::io::Write::write_all(&mut self.payload_cursor, bytes)?;
+        } else {
+            for &byte in bytes {
+                self.write_byte_async(byte).await?;
+            }
+        }
+        Ok(())
     }
 
     async fn handle_overflow_if_needed(&mut self) -> TdsResult<()> {
@@ -419,16 +477,17 @@ impl<'a> PacketWriter<'a> {
         // next write to panic (issue #513). The timeout is checked *after*
         // the write finishes so that the stream always remains in a clean
         // state and attention packets can be sent safely on timeout.
-        let send_data_fut = CancelHandle::run_until_cancelled(
-            self.cancel_handle.as_ref(),
-            self.network_writer.send(data_slice),
-        );
+        let send_data_fut = CancelHandle::run_until_cancelled(self.cancel_handle.as_ref(), async {
+            self.send_attempted = true;
+            self.send_incomplete = true;
+            self.network_writer.send(data_slice).await
+        });
 
         send_data_fut.await?;
+        self.send_incomplete = false;
 
         // Set before anything that can fail below: once these bytes are on the
         // wire the server is mid-message, whatever this call returns.
-        self.any_packet_flushed = true;
         self.message_complete = is_last_packet && !is_ignore_packet;
 
         // The header just written reached the wire, so any reset bit it carried
@@ -527,7 +586,6 @@ impl<'a> PacketWriter<'a> {
     }
 }
 
-#[async_trait]
 impl TdsPacketWriter for PacketWriter<'_> {
     async fn finalize(&mut self) -> TdsResult<()> {
         // Send a final EOM packet when there is buffered payload, or when the
@@ -806,6 +864,142 @@ pub(crate) mod tests {
         async fn disable_ssl(&mut self) -> TdsResult<()> {
             unimplemented!()
         }
+    }
+
+    #[test]
+    fn send_attempt_survives_suspend_and_resume() {
+        let mut mock = MockNetworkWriter::new(512);
+        let mut writer = PacketWriter::new(PacketType::RpcRequest, &mut mock, None, None);
+        block_on(writer.write_byte_async(0xAB)).unwrap();
+        let mut message = writer.suspend();
+        for _ in 0..2 {
+            assert!(!message.send_attempted());
+            assert!(!message.send_incomplete());
+            assert!(message.nothing_sent());
+            message = PacketWriter::resume(message, &mut mock).suspend();
+        }
+        let mut writer = PacketWriter::resume(message, &mut mock);
+        block_on(writer.finalize()).unwrap();
+        let mut message = writer.suspend();
+        for _ in 0..2 {
+            assert!(message.send_attempted());
+            assert!(!message.send_incomplete());
+            assert!(!message.nothing_sent());
+            message = PacketWriter::resume(message, &mut mock).suspend();
+        }
+        assert_eq!(mock.data.len(), 9);
+    }
+
+    /// The substitution verdict has to survive the suspend/resume cycle, and it
+    /// is the one message field with no observable effect on the bytes: a
+    /// data-at-execution message is suspended and resumed once per
+    /// `SQLPutData`, so dropping it from either half of the round trip would
+    /// silently forget a substitution made by an earlier chunk and the payload
+    /// would still look correct (AB#47598).
+    ///
+    /// Asserted across two cycles in both states, like
+    /// `send_attempt_survives_suspend_and_resume` above: once set it is sticky,
+    /// and a clean message must not acquire it.
+    #[test]
+    fn code_page_conversion_loss_survives_suspend_and_resume() {
+        let mut mock = MockNetworkWriter::new(512);
+
+        // A message that never substituted stays clean across the round trip.
+        let mut writer = PacketWriter::new(PacketType::RpcRequest, &mut mock, None, None);
+        block_on(writer.write_byte_async(0xAB)).unwrap();
+        let mut message = writer.suspend();
+        for _ in 0..2 {
+            assert!(!message.code_page_conversion_loss());
+            message = PacketWriter::resume(message, &mut mock).suspend();
+        }
+
+        // Once noted, it rides every later suspend and resume.
+        let mut writer = PacketWriter::resume(message, &mut mock);
+        writer.note_code_page_conversion_loss();
+        assert!(writer.code_page_conversion_loss());
+        let mut message = writer.suspend();
+        for _ in 0..2 {
+            assert!(
+                message.code_page_conversion_loss(),
+                "a substitution from an earlier chunk must not be forgotten"
+            );
+            message = PacketWriter::resume(message, &mut mock).suspend();
+        }
+        assert!(
+            PacketWriter::resume(message, &mut mock).code_page_conversion_loss(),
+            "the resumed writer sees it too, not just the suspended state"
+        );
+    }
+
+    #[test]
+    fn fixed_bytes_preserve_packet_boundaries_and_reset_flags() {
+        fn serialize<const N: usize>(
+            packet_size: u32,
+            padding: usize,
+            reset_mode: ResetConnectionMode,
+            metadata: &[u8; N],
+            batched: bool,
+            trailing_byte: bool,
+        ) -> Vec<u8> {
+            let mut mock = MockNetworkWriter::new(packet_size);
+            mock.set_reset_mode(reset_mode);
+            let mut writer = PacketWriter::new(PacketType::RpcRequest, &mut mock, None, None);
+            block_on(async {
+                writer.write_async(&vec![0x55; padding]).await.unwrap();
+                if batched {
+                    writer.write_fixed_bytes(metadata).await.unwrap();
+                } else {
+                    for &byte in metadata {
+                        writer.write_byte_async(byte).await.unwrap();
+                    }
+                }
+                if trailing_byte {
+                    writer.write_byte_async(0x5a).await.unwrap();
+                }
+                writer.finalize().await.unwrap();
+            });
+            drop(writer);
+            mock.data
+        }
+
+        fn check<const N: usize>(metadata: &[u8; N]) {
+            for packet_size in [512, 4096, 8000, 16192] {
+                let boundary = packet_size as usize - PacketWriter::PACKET_HEADER_SIZE;
+                for padding in (boundary - N - 1)..=(boundary + 1) {
+                    for reset_mode in [
+                        ResetConnectionMode::None,
+                        ResetConnectionMode::Reset,
+                        ResetConnectionMode::ResetSkipTran,
+                    ] {
+                        for trailing_byte in [false, true] {
+                            assert_eq!(
+                                serialize(
+                                    packet_size,
+                                    padding,
+                                    reset_mode,
+                                    metadata,
+                                    true,
+                                    trailing_byte
+                                ),
+                                serialize(
+                                    packet_size,
+                                    padding,
+                                    reset_mode,
+                                    metadata,
+                                    false,
+                                    trailing_byte
+                                ),
+                                "packet_size={packet_size}, padding={padding}, trailing={trailing_byte}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        check(&[0, 0]);
+        check(&[0xff, 0xff, 12, 0, 0, 0]);
+        check(&[0xe7, 30, 0, 9, 4, 0xd0, 0, 0x34]);
     }
 
     #[test]

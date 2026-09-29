@@ -1,0 +1,310 @@
+"""Tests for final mssql-python-rs wheel validation."""
+
+from __future__ import annotations
+
+import re
+import subprocess
+import zipfile
+from pathlib import Path
+
+import pytest
+
+_VALIDATOR = Path(__file__).parents[1] / ".pipeline" / "scripts" / "verify-python-wheels.ps1"
+
+_LIBS = "mssql_py_core/libs"
+_PLATFORM_DRIVERS = {
+    "win_amd64": (f"{_LIBS}/windows/x64/mssqlodbc.dll",),
+    "win_arm64": (f"{_LIBS}/windows/arm64/mssqlodbc.dll",),
+    "manylinux_2_34_x86_64": (f"{_LIBS}/linux/glibc/x86_64/lib/mssqlodbc.so",),
+    "manylinux_2_34_aarch64": (f"{_LIBS}/linux/glibc/arm64/lib/mssqlodbc.so",),
+    "manylinux_2_28_x86_64": (f"{_LIBS}/linux/glibc/x86_64/lib/mssqlodbc.so",),
+    "manylinux_2_28_aarch64": (f"{_LIBS}/linux/glibc/arm64/lib/mssqlodbc.so",),
+    "musllinux_1_2_x86_64": (f"{_LIBS}/linux/musl/x86_64/lib/mssqlodbc.so",),
+    "musllinux_1_2_aarch64": (f"{_LIBS}/linux/musl/arm64/lib/mssqlodbc.so",),
+    "macosx_15_0_universal2": (
+        f"{_LIBS}/macos/x86_64/lib/mssqlodbc.dylib",
+        f"{_LIBS}/macos/arm64/lib/mssqlodbc.dylib",
+    ),
+}
+
+
+def write_wheel(
+    directory: Path,
+    platform: str,
+    *,
+    python_tag: str = "cp310",
+    abi_tag: str = "abi3",
+    distribution: str = "mssql_python_rs",
+    include_odbc: bool = True,
+    include_extension: bool = True,
+    uppercase_odbc: bool = False,
+    requires_python: str = ">=3.10",
+    metadata_name: str = "mssql-python-rs",
+    metadata_version: str = "0.1.0",
+    wheel_tag: str | None = None,
+    extra_wheel_tags: tuple[str, ...] = (),
+) -> Path:
+    wheel_path = directory / f"{distribution}-0.1.0-{python_tag}-{abi_tag}-{platform}.whl"
+    tags = (wheel_tag or f"{python_tag}-{abi_tag}-{platform}", *extra_wheel_tags)
+    with zipfile.ZipFile(wheel_path, "w") as wheel:
+        wheel.writestr(
+            "mssql_python_rs-0.1.0.dist-info/METADATA",
+            "Metadata-Version: 2.4\n"
+            f"Name: {metadata_name}\n"
+            f"Version: {metadata_version}\n"
+            f"Requires-Python: {requires_python}\n",
+        )
+        wheel.writestr(
+            "mssql_python_rs-0.1.0.dist-info/WHEEL",
+            "Wheel-Version: 1.0\n" + "".join(f"Tag: {tag}\n" for tag in tags),
+        )
+        wheel.writestr("mssql_py_core/__init__.py", "")
+        if include_extension:
+            extension = (
+                "mssql_py_core/mssql_py_core.pyd"
+                if platform.startswith("win_")
+                else "mssql_py_core/mssql_py_core.abi3.so"
+            )
+            wheel.writestr(extension, b"extension")
+        if include_odbc:
+            for driver in _PLATFORM_DRIVERS[platform]:
+                if uppercase_odbc:
+                    driver = driver.upper()
+                wheel.writestr(driver, b"driver")
+    return wheel_path
+
+
+def write_wheel_matrix(directory: Path) -> list[Path]:
+    return [write_wheel(directory, platform) for platform in _PLATFORM_DRIVERS]
+
+
+def run_validator(
+    wheels_dir: Path,
+    *,
+    require_odbc: bool = True,
+) -> subprocess.CompletedProcess[str]:
+    command = [
+        "pwsh",
+        "-NoProfile",
+        "-File",
+        str(_VALIDATOR),
+        "-WheelsDir",
+        str(wheels_dir),
+        "-ExpectedName",
+        "mssql-python-rs",
+        "-ExpectedVersion",
+        "0.1.0",
+    ]
+    if require_odbc:
+        command.append("-RequireOdbc")
+    return subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def normalized_stderr(result: subprocess.CompletedProcess[str]) -> str:
+    stderr = re.sub(r"\x1b\[[0-9;]*m", "", result.stderr)
+    return "".join(stderr.split()).replace("|", "")
+
+
+def test_validator_accepts_expected_wheel_matrix(tmp_path: Path) -> None:
+    write_wheel_matrix(tmp_path)
+
+    result = run_validator(tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    assert "Validated 9 mssql-python-rs wheels" in result.stdout
+
+
+def test_validator_rejects_missing_odbc_driver(tmp_path: Path) -> None:
+    wheels = write_wheel_matrix(tmp_path)
+    wheels[0].unlink()
+    write_wheel(tmp_path, "win_amd64", include_odbc=False)
+
+    result = run_validator(tmp_path)
+
+    assert result.returncode != 0
+    assert "missing ODBC driver" in result.stderr
+
+
+def test_validator_rejects_wrong_case_odbc_driver(tmp_path: Path) -> None:
+    wheels = write_wheel_matrix(tmp_path)
+    linux_wheel = next(
+        wheel for wheel in wheels if "cp310-abi3-manylinux_2_34_x86_64" in wheel.name
+    )
+    linux_wheel.unlink()
+    write_wheel(tmp_path, "manylinux_2_34_x86_64", uppercase_odbc=True)
+
+    result = run_validator(tmp_path)
+
+    assert result.returncode != 0
+    assert "missing ODBC driver" in result.stderr
+    assert "mssqlodbc.so" in result.stderr
+
+
+def test_validator_allows_matrix_without_odbc_when_not_required(tmp_path: Path) -> None:
+    wheels = write_wheel_matrix(tmp_path)
+    for wheel_path in wheels:
+        platform = wheel_path.stem.rsplit("-", 1)[1]
+        wheel_path.unlink()
+        write_wheel(tmp_path, platform, include_odbc=False)
+
+    result = run_validator(tmp_path, require_odbc=False)
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_validator_rejects_legacy_filename(tmp_path: Path) -> None:
+    wheels = write_wheel_matrix(tmp_path)
+    wheels[0].unlink()
+    write_wheel(tmp_path, "win_amd64", distribution="mssql_py_core")
+
+    result = run_validator(tmp_path)
+
+    assert result.returncode != 0
+    assert "Wheel matrix mismatch" in result.stderr
+    assert "mssql_py_core-0.1.0-cp310-abi3-win_amd64.whl" in result.stderr
+
+
+def test_validator_rejects_incomplete_matrix(tmp_path: Path) -> None:
+    write_wheel(tmp_path, "win_amd64")
+
+    result = run_validator(tmp_path)
+
+    assert result.returncode != 0
+    assert "Expected 9 wheels, found 1" in result.stderr
+
+
+def test_validator_rejects_no_wheels(tmp_path: Path) -> None:
+    result = run_validator(tmp_path)
+
+    assert result.returncode != 0
+    assert "Expected 9 wheels, found 0" in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("metadata", "message"),
+    [
+        (
+            {"metadata_name": "wrong-distribution"},
+            "'wrong-distribution', expected 'mssql-python-rs'",
+        ),
+        ({"metadata_version": "9.9.9"}, "'9.9.9', expected '0.1.0'"),
+    ],
+)
+def test_validator_rejects_wrong_metadata(tmp_path: Path, metadata: dict, message: str) -> None:
+    wheels = write_wheel_matrix(tmp_path)
+    wheels[0].unlink()
+    write_wheel(tmp_path, "win_amd64", **metadata)
+
+    result = run_validator(tmp_path)
+
+    assert result.returncode != 0
+    assert "".join(message.split()) in normalized_stderr(result)
+
+
+def test_validator_rejects_wrong_filename_version(tmp_path: Path) -> None:
+    wheels = write_wheel_matrix(tmp_path)
+    wheels[0].rename(wheels[0].with_name(wheels[0].name.replace("-0.1.0-", "-9.9.9-")))
+
+    result = run_validator(tmp_path)
+
+    assert result.returncode != 0
+    assert "Wheel matrix mismatch" in result.stderr
+
+
+def test_validator_rejects_same_count_with_unexpected_wheel(tmp_path: Path) -> None:
+    wheels = write_wheel_matrix(tmp_path)
+    wheels[0].unlink()
+    write_wheel(tmp_path, "win_amd64", python_tag="cp400")
+
+    result = run_validator(tmp_path)
+
+    assert result.returncode != 0
+    assert "Wheel matrix mismatch" in result.stderr
+    assert "cp310-abi3-win_amd64" in result.stderr
+    assert "cp400-abi3-win_amd64" in result.stderr
+
+
+def test_validator_rejects_wrong_case_wheel_filename(tmp_path: Path) -> None:
+    wheels = write_wheel_matrix(tmp_path)
+    linux_wheel = next(
+        wheel for wheel in wheels if "cp310-abi3-manylinux_2_34_x86_64" in wheel.name
+    )
+    uppercase_name = linux_wheel.name.replace("cp310", "CP310")
+    linux_wheel.rename(linux_wheel.with_name(uppercase_name))
+
+    result = run_validator(tmp_path)
+
+    assert result.returncode != 0
+    assert "Wheel matrix mismatch" in result.stderr
+
+
+def test_validator_rejects_unsupported_python_floor(tmp_path: Path) -> None:
+    wheels = write_wheel_matrix(tmp_path)
+    wheels[0].unlink()
+    write_wheel(tmp_path, "win_amd64", requires_python=">=3.8")
+
+    result = run_validator(tmp_path)
+
+    assert result.returncode != 0
+    assert "is'>=3.8',expected'>=3.10'" in normalized_stderr(result)
+
+
+def test_validator_rejects_non_abi3_tag(tmp_path: Path) -> None:
+    wheels = write_wheel_matrix(tmp_path)
+    wheels[0].unlink()
+    write_wheel(tmp_path, "win_amd64", wheel_tag="cp310-cp310-win_amd64")
+
+    result = run_validator(tmp_path)
+
+    normalized = normalized_stderr(result)
+    assert result.returncode != 0
+    assert "expectedonlyTag:cp310-abi3-win_amd64" in normalized
+
+
+def test_validator_rejects_extra_wheel_tag(tmp_path: Path) -> None:
+    wheels = write_wheel_matrix(tmp_path)
+    wheels[0].unlink()
+    write_wheel(
+        tmp_path,
+        "win_amd64",
+        extra_wheel_tags=("cp310-cp310-win_amd64",),
+    )
+
+    result = run_validator(tmp_path)
+
+    normalized = normalized_stderr(result)
+    assert result.returncode != 0
+    assert "cp310-abi3-win_amd64,cp310-cp310-win_amd64" in normalized
+    assert "expectedonlyTag:cp310-abi3-win_amd64" in normalized
+
+
+def test_validator_rejects_missing_stable_abi_extension(tmp_path: Path) -> None:
+    wheels = write_wheel_matrix(tmp_path)
+    wheels[0].unlink()
+    write_wheel(tmp_path, "win_amd64", include_extension=False)
+
+    result = run_validator(tmp_path)
+
+    assert result.returncode != 0
+    assert "missing stable-ABI extension" in result.stderr
+
+
+def test_validator_rejects_non_pypi_linux_tag(tmp_path: Path) -> None:
+    wheels = write_wheel_matrix(tmp_path)
+    manylinux_wheel = next(
+        wheel for wheel in wheels if "cp310-abi3-manylinux_2_34_x86_64" in wheel.name
+    )
+    manylinux_wheel.unlink()
+    write_wheel(tmp_path, "linux_x86_64", include_odbc=False)
+
+    result = run_validator(tmp_path)
+
+    normalized = "".join(result.stderr.split())
+    assert result.returncode != 0
+    assert "linux_x86_64" in normalized
+    assert "PyPIrejects" in normalized

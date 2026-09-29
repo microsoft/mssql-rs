@@ -15,7 +15,7 @@ use crate::api::odbc_types::{
 };
 use crate::error::free_errors;
 use crate::handles::stmt::{STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT};
-use crate::handles::{HandleType, StmtHandle, handle_from_raw};
+use crate::handles::{HandleType, StmtHandle, handle_from_raw, process_is_shutting_down};
 
 /// Closes the cursor on `statement_handle` and discards any pending rows.
 ///
@@ -47,6 +47,8 @@ pub(crate) unsafe fn sql_free_stmt_close(statement_handle: SqlHandle) -> SqlRetu
     })
 }
 
+/// # Safety
+/// `statement_handle` must be null or point to a live `StmtHandle`.
 unsafe fn sql_close_cursor_impl(statement_handle: SqlHandle) -> SqlReturn {
     if statement_handle.is_null() {
         error!("SQLCloseCursor: statement_handle is null");
@@ -75,15 +77,9 @@ fn sql_close_cursor_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
     // than losing it under that fetch's own SQL_SUCCESS return. The peek
     // already closed the batch on the wire, so the drain below can no
     // longer discover it there — take it now and surface it below instead
-    // of silently closing as if the batch had never errored. The same peek
-    // can also have stashed trailing server INFO messages it drained but
-    // had no success return to post them under (`StmtState::pending_fetch_info`)
-    // — post those here too, since `drain_and_release`'s own drain can no
-    // longer find them on the wire either.
+    // of silently closing as if the batch had never errored.
     let pending_fetch_error = stmt_state.pending_fetch_error.take();
-    let pending_fetch_info = std::mem::take(&mut stmt_state.pending_fetch_info);
     reset_cursor_state(&mut stmt_state);
-    let had_pending_info = post_tds_info_messages(&mut stmt_state, &pending_fetch_info);
     drop(stmt_state);
 
     let outcome = drain_and_release(stmt, statement_handle);
@@ -105,15 +101,13 @@ fn sql_close_cursor_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
         }
         DrainOutcome::Clean => {
             debug!("SQLCloseCursor: cursor closed");
-            if had_pending_info {
-                SQL_SUCCESS_WITH_INFO
-            } else {
-                SQL_SUCCESS
-            }
+            SQL_SUCCESS
         }
     }
 }
 
+/// # Safety
+/// `statement_handle` must be null or point to a live `StmtHandle`.
 unsafe fn sql_free_stmt_close_impl(statement_handle: SqlHandle) -> SqlReturn {
     if statement_handle.is_null() {
         error!("SQLFreeStmt(SQL_CLOSE): statement_handle is null");
@@ -137,9 +131,7 @@ fn sql_free_stmt_close_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> S
 
     // See the identical comment in sql_close_cursor_safe.
     let pending_fetch_error = stmt_state.pending_fetch_error.take();
-    let pending_fetch_info = std::mem::take(&mut stmt_state.pending_fetch_info);
     reset_cursor_state(&mut stmt_state);
-    let had_pending_info = post_tds_info_messages(&mut stmt_state, &pending_fetch_info);
     drop(stmt_state);
 
     let outcome = drain_and_release(stmt, statement_handle);
@@ -161,11 +153,7 @@ fn sql_free_stmt_close_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> S
         }
         DrainOutcome::Clean => {
             debug!("SQLFreeStmt(SQL_CLOSE): cursor closed");
-            if had_pending_info {
-                SQL_SUCCESS_WITH_INFO
-            } else {
-                SQL_SUCCESS
-            }
+            SQL_SUCCESS
         }
     }
 }
@@ -191,9 +179,7 @@ fn sql_free_stmt_close_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> S
 /// this function's own return: `SQL_ERROR` here specifically tells the
 /// caller the stream failed to drain, so sending a transaction-manager
 /// request next is unsafe, which an already-closed batch's stale diagnostic
-/// does not make true. Pending INFO messages (`StmtState::pending_fetch_info`)
-/// are posted the same way, unconditionally — this sweep's `SQL_SUCCESS`
-/// already covers `InfoPosted` too, so there is no separate signal to gate on.
+/// does not make true.
 pub(super) fn close_cursor_for_connection_op(stmt: &StmtHandle, handle: SqlHandle) -> SqlReturn {
     let pending_fetch_error = {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
@@ -205,9 +191,7 @@ pub(super) fn close_cursor_for_connection_op(stmt: &StmtHandle, handle: SqlHandl
             return SQL_SUCCESS;
         }
         let pending_fetch_error = stmt_state.pending_fetch_error.take();
-        let pending_fetch_info = std::mem::take(&mut stmt_state.pending_fetch_info);
         reset_cursor_state(&mut stmt_state);
-        post_tds_info_messages(&mut stmt_state, &pending_fetch_info);
         pending_fetch_error
     };
 
@@ -231,7 +215,7 @@ pub(super) fn close_cursor_for_connection_op(stmt: &StmtHandle, handle: SqlHandl
 pub(super) fn reset_cursor_state(stmt_state: &mut crate::handles::stmt::StmtState) {
     stmt_state.clear_state(STMT_STATE_CURSOR_OPEN | STMT_STATE_EXEC_CONTEXT);
     stmt_state.reset_row_stream();
-    stmt_state.column_metadata.clear();
+    stmt_state.clear_result_metadata();
     stmt_state.pending_row_counts.clear();
     stmt_state.clear_exhaustion_state();
 }
@@ -256,6 +240,18 @@ pub(super) enum DrainOutcome {
 /// that surfaced server INFO messages, and — importantly — from a drain failure,
 /// which must not be reported to the app as success.
 pub(super) fn drain_and_release(stmt: &StmtHandle, statement_handle: SqlHandle) -> DrainOutcome {
+    drain_and_release_inner(stmt, statement_handle, process_is_shutting_down())
+}
+
+/// The body of [`drain_and_release`], with the loader's shutdown flag passed in
+/// rather than read. The skip arm below is unreachable in a live process, so
+/// threading the flag is the only way a test can exercise it — without that,
+/// deleting the arm leaves the suite green and restores the AB#47510 hang.
+fn drain_and_release_inner(
+    stmt: &StmtHandle,
+    statement_handle: SqlHandle,
+    process_is_shutting_down: bool,
+) -> DrainOutcome {
     let dbc = stmt.parent_dbc();
 
     // Take the client; intentionally leave active_stmt set while draining.
@@ -288,6 +284,25 @@ pub(super) fn drain_and_release(stmt: &StmtHandle, statement_handle: SqlHandle) 
         return DrainOutcome::Failed;
     };
 
+    // The drain is a server round-trip, so it needs the scheduler's worker to
+    // drive the socket. During `DLL_PROCESS_DETACH` the OS has already
+    // terminated that worker and `block_on` would park this thread forever
+    // (AB#47510). Reached whenever a host frees a statement with an open cursor
+    // from an `onexit` handler. Skipping costs nothing the exit does not
+    // already cost: the undrained rows die with the connection, and the client
+    // is still returned below so the DBC is left consistent for whatever
+    // teardown runs after this.
+    if process_is_shutting_down {
+        debug!("drain_and_release: process is exiting — skipping the drain round-trip");
+        if let Ok(mut ds) = dbc.inner.lock() {
+            ds.client = Some(client);
+            if ds.active_stmt == Some(statement_handle) {
+                ds.active_stmt = None;
+            }
+        }
+        return DrainOutcome::Clean;
+    }
+
     if let Err(e) = dbc.runtime.block_on(client.close_query()) {
         error!(%e, "drain_and_release: failed to drain TDS stream — connection may be broken");
         // Surface the failure as a diagnostic so the app is not told the close
@@ -304,6 +319,7 @@ pub(super) fn drain_and_release(stmt: &StmtHandle, statement_handle: SqlHandle) 
         return DrainOutcome::Failed;
     }
 
+    let array_rc = super::execute::update_parameter_array(stmt, &mut client);
     let has_server_info = match stmt.inner.lock() {
         Ok(mut stmt_state) => {
             // Drain INFO only after the lock is held so a poisoned mutex cannot
@@ -331,7 +347,9 @@ pub(super) fn drain_and_release(stmt: &StmtHandle, statement_handle: SqlHandle) 
         }
     }
 
-    if has_server_info {
+    if array_rc == SQL_ERROR {
+        DrainOutcome::Failed
+    } else if has_server_info || array_rc == SQL_SUCCESS_WITH_INFO {
         DrainOutcome::InfoPosted
     } else {
         DrainOutcome::Clean
@@ -405,65 +423,6 @@ mod tests {
             "the deferred error must be posted, not silently dropped by the close"
         );
         assert!(ss.pending_fetch_error.is_none());
-    }
-
-    /// A zero-row fetch that also exhausts the whole batch can drain a
-    /// trailing server INFO message its own `SQL_NO_DATA` return has no way
-    /// to carry, stashing it as `StmtState::pending_fetch_info` instead (see
-    /// AB#47508's `release_busy_if_row_exhausted`). If the application calls
-    /// `SQLCloseCursor` directly — without an intervening `SQLMoreResults` —
-    /// the cursor is still open (only `SQLMoreResults`'s `batch_exhausted`
-    /// fast path implicitly closes it), so this must reach the drain path
-    /// and surface the stashed message rather than silently dropping it.
-    #[test]
-    fn close_cursor_surfaces_a_pending_fetch_info() {
-        use crate::handles::dbc::DbcHandle;
-        use mssql_tds::error::SqlInfoMessage;
-        use mssql_tds::test_client_support::tds_client_from_tokens;
-
-        let h = TestHandles::with_env_dbc_stmt();
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
-        {
-            let mut ss = stmt.inner.lock().unwrap();
-            ss.set_state(STMT_STATE_CURSOR_OPEN);
-            ss.batch_exhausted = true;
-            ss.pending_fetch_info = vec![SqlInfoMessage {
-                message: "simulated trailing PRINT message".to_string(),
-                state: 1,
-                class: 0,
-                number: 0,
-                server_name: None,
-                proc_name: None,
-                line_number: None,
-            }];
-        }
-        h.mark_dbc_connected();
-        // A fresh, never-executed client: has_open_batch() is false, so
-        // drain_and_release's own close_query()/take_info_messages() finds
-        // nothing new — isolating the assertion to "does the stashed
-        // pending_fetch_info alone get surfaced", independent of a fresh drain.
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
-        dbc.inner.lock().unwrap().client = Some(tds_client_from_tokens(vec![]));
-        // active_stmt left None: mirrors release_busy_if_row_exhausted having
-        // already released the claim on the zero-row fetch that stashed this.
-
-        let ret = unsafe { sql_close_cursor(h.stmt) };
-
-        assert_eq!(
-            ret, SQL_SUCCESS_WITH_INFO,
-            "the stashed message must be surfaced, not silently dropped"
-        );
-        let ss = stmt.inner.lock().unwrap();
-        assert!(
-            ss.diag_records
-                .iter()
-                .any(|d| d.message.contains("simulated trailing PRINT message")),
-            "the stashed message must land on this statement's own diagnostics"
-        );
-        assert!(
-            ss.pending_fetch_info.is_empty(),
-            "must be taken so it cannot leak into a later call"
-        );
     }
 
     /// Same requirement as `close_cursor_surfaces_a_pending_fetch_error`, for
@@ -586,6 +545,93 @@ mod tests {
         assert!(
             ds.client.as_ref().is_some_and(|c| c.has_open_batch()),
             "B's result set must still be open — not drained by A's close"
+        );
+    }
+
+    /// The AB#47510 guard on the cursor drain. Once the loader has terminated
+    /// the runtime's worker, `block_on(close_query())` can never complete, so
+    /// the drain must be skipped entirely. The flag is threaded in because a
+    /// live test process always reads it as `false`; without that seam this arm
+    /// is dead code under test and deleting it leaves the suite green.
+    ///
+    /// The client is left holding an open batch, which is what proves no drain
+    /// was attempted — a real `close_query()` would have consumed it.
+    #[test]
+    fn drain_and_release_skips_the_round_trip_while_the_process_is_exiting() {
+        use crate::handles::dbc::DbcHandle;
+        use mssql_tds::test_client_support::{col_metadata_empty, tds_client_from_tokens};
+
+        let h = TestHandles::with_env_dbc_stmt();
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+
+        // Positioned on an open result set with an empty token queue behind it,
+        // so an actual drain would error rather than silently succeed.
+        let mut client = tds_client_from_tokens(vec![col_metadata_empty()]);
+        dbc.runtime
+            .block_on(client.execute("SELECT 1;".to_string(), ()))
+            .unwrap();
+        {
+            let mut ds = dbc.inner.lock().unwrap();
+            ds.client = Some(client);
+            ds.active_stmt = Some(h.stmt);
+        }
+
+        let outcome = drain_and_release_inner(
+            unsafe { handle_from_raw::<StmtHandle>(h.stmt) },
+            h.stmt,
+            true,
+        );
+
+        assert!(
+            matches!(outcome, DrainOutcome::Clean),
+            "skipping during shutdown must report a clean close, not a failure"
+        );
+        let ds = dbc.inner.lock().unwrap();
+        assert!(
+            ds.client.as_ref().is_some_and(|c| c.has_open_batch()),
+            "the batch must be left undrained — a skipped drain performs no I/O"
+        );
+        assert_eq!(
+            ds.active_stmt, None,
+            "the connection must still be released, or it stays busy forever"
+        );
+    }
+
+    /// The same call with the flag false takes the ordinary path and does drain
+    /// the batch. Without this pair, a guard that fired unconditionally would
+    /// also pass the test above.
+    #[test]
+    fn drain_and_release_still_drains_while_the_process_is_alive() {
+        use crate::handles::dbc::DbcHandle;
+        use mssql_tds::test_client_support::{
+            col_metadata_empty, done_no_more, tds_client_from_tokens,
+        };
+
+        let h = TestHandles::with_env_dbc_stmt();
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+
+        let mut client = tds_client_from_tokens(vec![col_metadata_empty(), done_no_more()]);
+        dbc.runtime
+            .block_on(client.execute("SELECT 1;".to_string(), ()))
+            .unwrap();
+        {
+            let mut ds = dbc.inner.lock().unwrap();
+            ds.client = Some(client);
+            ds.active_stmt = Some(h.stmt);
+        }
+
+        let _ = drain_and_release_inner(
+            unsafe { handle_from_raw::<StmtHandle>(h.stmt) },
+            h.stmt,
+            false,
+        );
+
+        let ds = dbc.inner.lock().unwrap();
+        assert!(
+            ds.client.as_ref().is_some_and(|c| !c.has_open_batch()),
+            "the live-process path must actually drain the batch"
         );
     }
 }

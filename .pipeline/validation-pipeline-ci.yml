@@ -7,6 +7,16 @@ trigger:
 pr: none
 
 parameters:
+- name: linuxImage
+  displayName: Agent image for x64 Linux jobs
+  type: string
+  default: RUST-AZL3
+
+- name: linuxArmImage
+  displayName: Agent image for ARM64 Linux jobs
+  type: string
+  default: RUST-AZL3-ARM64
+
 - name: buildType
   displayName: Type of the build to produce
   type: string
@@ -49,6 +59,8 @@ variables:
 stages:
 - template: templates/validation-stages.yml
   parameters:
+    linuxImage: ${{ parameters.linuxImage }}
+    linuxArmImage: ${{ parameters.linuxArmImage }}
     buildType: ${{ parameters.buildType }}
     RunFuzz: ${{ parameters.RunFuzz }}
     RunLongHaul: ${{ parameters.RunLongHaul }}

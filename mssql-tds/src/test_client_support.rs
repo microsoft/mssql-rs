@@ -3,7 +3,7 @@
 
 //! Test-only helpers for driving a [`TdsClient`] against a scripted sequence of
 //! TDS tokens, without a live server. Gated behind the `test-util` feature so
-//! downstream crates (e.g. `mssql-odbc`) can unit-test the code paths that
+//! downstream crates (e.g. `mssqlodbc`) can unit-test the code paths that
 //! require a positioned client — statement-wise navigation, no-row results,
 //! end-of-batch — which otherwise are only reachable through end-to-end tests.
 //!
@@ -19,6 +19,20 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 
+/// Metadata strategy for testing bulk copy with custom or cached metadata.
+pub use crate::connection::metadata_retriever::MetadataRetriever;
+/// Quote identifiers used in test setup SQL.
+pub use crate::sql_identifier::escape_identifier;
+
+pub use crate::message::parameters::rpc_parameters::rpc_parameter_status;
+
+/// Uses the declaration generator used by prepared RPCs, without a server.
+pub fn rpc_parameter_declaration(
+    parameter: &crate::message::parameters::rpc_parameters::RpcParameter,
+) -> TdsResult<String> {
+    parameter.sql_declaration()
+}
+
 use crate::connection::client_context::ClientContext;
 use crate::connection::execution_context::ExecutionContext;
 use crate::connection::tds_client::TdsClient;
@@ -27,7 +41,9 @@ use crate::connection::transport::network_transport::TransportSslHandler;
 use crate::connection::transport::tds_transport::TdsTransport;
 use crate::core::{CancelHandle, NegotiatedEncryptionSetting, TdsResult};
 use crate::datatypes::row_writer::RowWriter;
-use crate::datatypes::sqldatatypes::{TdsDataType, TypeInfo};
+use crate::datatypes::sqldatatypes::{
+    PartialLengthType, TdsDataType, TypeInfo, TypeInfoVariant, UdtInfo, UdtInfoInColMetadata,
+};
 use crate::handler::handler_factory::create_test_negotiated_settings_internal;
 use crate::io::reader_writer::{NetworkReader, NetworkWriter};
 use crate::io::token_stream::{
@@ -285,7 +301,11 @@ impl TdsTransport for TokenReplayTransport {
     async fn close_transport(&mut self) -> TdsResult<()> {
         Ok(())
     }
-    async fn send_attention_with_timeout(&mut self, _timeout: Duration) -> TdsResult<bool> {
+    async fn send_attention_with_timeout(
+        &mut self,
+        _context: &ParserContext,
+        _timeout: Duration,
+    ) -> TdsResult<bool> {
         Ok(false)
     }
     fn is_connection_dead(&self) -> bool {
@@ -323,14 +343,26 @@ pub fn tds_client_from_tokens(tokens: Vec<ScriptedToken>) -> TdsClient {
 /// Builds a client that first returns integer-column metadata and then replays
 /// the supplied rows through the buffered cursor APIs.
 pub fn tds_client_from_int_rows(rows: Vec<Vec<i32>>) -> TdsClient {
+    tds_client_from_int_rows_with_trailing_tokens(rows, vec![done_select_no_more()])
+}
+
+/// Builds a client that replays integer rows followed by caller-supplied
+/// tokens such as terminal INFO and DONE records.
+pub fn tds_client_from_int_rows_with_trailing_tokens(
+    rows: Vec<Vec<i32>>,
+    trailing_tokens: Vec<ScriptedToken>,
+) -> TdsClient {
     let width = rows.first().map_or(0, Vec::len);
     let metadata = Tokens::ColMetadata(ColMetadataToken {
         column_count: u16::try_from(width).unwrap_or(u16::MAX),
         columns: int_columns(width),
         cek_table: Vec::new(),
     });
-    let transport =
-        AnyTransport::dynamic(TokenReplayTransport::with_int_rows(metadata, rows, None));
+    let mut tokens = vec![metadata];
+    tokens.extend(trailing_tokens.into_iter().map(|token| token.0));
+    let mut transport = TokenReplayTransport::new(tokens);
+    transport.pending_rows = rows.into_iter().map(VecDeque::from).collect();
+    let transport = AnyTransport::dynamic(transport);
     let negotiated_settings = create_test_negotiated_settings_internal();
     let execution_context = ExecutionContext::new();
     let client_context = ClientContext::with_data_source("tcp:localhost,1433");
@@ -432,6 +464,87 @@ pub fn int_columns(n: usize) -> Vec<ColumnMetadata> {
         .collect()
 }
 
+/// A nullable CLR UDT column with the wire-declared maximum byte size.
+pub fn udt_column(max_byte_size: u16) -> ColumnMetadata {
+    ColumnMetadata {
+        user_type: 0,
+        flags: 0x01,
+        type_info: TypeInfo::partial_len(TdsDataType::Udt, usize::from(max_byte_size), None)
+            .expect("UDT is a PLP type"),
+        data_type: TdsDataType::Udt,
+        column_name: "udt".to_string(),
+        multi_part_name: None,
+        crypto_metadata: None,
+    }
+}
+
+/// A nullable CLR UDT column with identity metadata from `COLMETADATA`.
+pub fn udt_column_with_metadata(
+    max_byte_size: u16,
+    db_name: &str,
+    schema_name: &str,
+    type_name: &str,
+    assembly_qualified_name: &str,
+) -> ColumnMetadata {
+    let mut column = udt_column(max_byte_size);
+    column.type_info.type_info_variant = TypeInfoVariant::PartialLen(
+        PartialLengthType::Udt,
+        Some(usize::from(max_byte_size)),
+        None,
+        None,
+        Some(UdtInfo::InColMetadata(UdtInfoInColMetadata::new(
+            max_byte_size,
+            db_name.to_string(),
+            schema_name.to_string(),
+            type_name.to_string(),
+            assembly_qualified_name.to_string(),
+        ))),
+    );
+    column
+}
+
+/// Inline integer columns followed by one deferred `nvarchar(max)` column.
+pub fn mixed_lob_columns(prefix_columns: usize) -> Vec<ColumnMetadata> {
+    let mut columns = int_columns(prefix_columns);
+    columns.push(ColumnMetadata {
+        user_type: 0,
+        flags: 0x01,
+        type_info: TypeInfo::partial_len(TdsDataType::NVarChar, usize::from(u16::MAX), None)
+            .expect("nvarchar(max) is a PLP type"),
+        data_type: TdsDataType::NVarChar,
+        column_name: "lob".to_string(),
+        multi_part_name: None,
+        crypto_metadata: None,
+    });
+    columns
+}
+
+/// Builds mixed-LOB rows whose scripted payload contains only the inline prefix.
+///
+/// Consumer tests use this to verify fetch-time prefix capture and bypass
+/// selection; PLP streaming itself is exercised by the real byte transport.
+pub fn tds_client_from_mixed_lob_prefix_rows(rows: Vec<Vec<i32>>) -> TdsClient {
+    let prefix_columns = rows.first().map_or(0, Vec::len);
+    let columns = mixed_lob_columns(prefix_columns);
+    let metadata = Tokens::ColMetadata(ColMetadataToken {
+        column_count: u16::try_from(columns.len()).unwrap_or(u16::MAX),
+        columns,
+        cek_table: Vec::new(),
+    });
+    let transport =
+        AnyTransport::dynamic(TokenReplayTransport::with_int_rows(metadata, rows, None));
+    let negotiated_settings = create_test_negotiated_settings_internal();
+    let execution_context = ExecutionContext::new();
+    let client_context = ClientContext::with_data_source("tcp:localhost,1433");
+    TdsClient::new(
+        transport,
+        negotiated_settings,
+        execution_context,
+        client_context,
+        Vec::new(),
+    )
+}
+
 /// A DONE token with the MORE flag set (more results follow in the batch).
 pub fn done_more() -> ScriptedToken {
     ScriptedToken(Tokens::Done(DoneToken {
@@ -441,11 +554,65 @@ pub fn done_more() -> ScriptedToken {
     }))
 }
 
+/// A `DONEINPROC` token with MORE set, ending a row set inside an RPC.
+pub fn done_in_proc_more() -> ScriptedToken {
+    ScriptedToken(Tokens::DoneInProc(DoneToken {
+        status: DoneStatus::MORE,
+        cur_cmd: CurrentCommand::Select,
+        row_count: 0,
+    }))
+}
+
+/// A terminal `DONEPROC` token ending an RPC response.
+pub fn done_proc_no_more() -> ScriptedToken {
+    ScriptedToken(Tokens::DoneProc(DoneToken {
+        status: DoneStatus::FINAL,
+        cur_cmd: CurrentCommand::Select,
+        row_count: 0,
+    }))
+}
+
+/// An RPC output parameter returned before the terminal `DONEPROC`.
+pub fn return_value(value: crate::query::result::ReturnValue) -> ScriptedToken {
+    ScriptedToken(Tokens::ReturnValue(
+        crate::token::tokens::ReturnValueToken {
+            param_ordinal: value.param_ordinal,
+            param_name: value.param_name,
+            value: value.value,
+            column_metadata: value.column_metadata,
+            status: value.status,
+        },
+    ))
+}
+
+/// A stored procedure's integer return status.
+pub fn return_status(value: i32) -> ScriptedToken {
+    ScriptedToken(Tokens::ReturnStatus(
+        crate::token::tokens::ReturnStatusToken { value },
+    ))
+}
+
 /// A terminal DONE token (no more results — end of batch).
 pub fn done_no_more() -> ScriptedToken {
     ScriptedToken(Tokens::Done(DoneToken {
         status: DoneStatus::FINAL,
         cur_cmd: CurrentCommand::Insert,
+        row_count: 0,
+    }))
+}
+
+/// A terminal DONE token tagged as a SELECT.
+///
+/// `done.cur_cmd != CurrentCommand::Select` is the gate `SQLRowCount` and
+/// statement-wise navigation parity turn on (`tds_client.rs`), so a row-returning
+/// replay must end on a SELECT-tagged DONE rather than the INSERT-tagged
+/// [`done_no_more`]. Both set only `DoneStatus::FINAL`, so the distinction is
+/// inert until a test sets `COUNT` — at which point starting from a mislabelled
+/// stream would let it pass for the wrong reason.
+pub fn done_select_no_more() -> ScriptedToken {
+    ScriptedToken(Tokens::Done(DoneToken {
+        status: DoneStatus::FINAL,
+        cur_cmd: CurrentCommand::Select,
         row_count: 0,
     }))
 }
@@ -703,7 +870,11 @@ pub(crate) mod byte_stream {
         async fn close_transport(&mut self) -> TdsResult<()> {
             Ok(())
         }
-        async fn send_attention_with_timeout(&mut self, _timeout: Duration) -> TdsResult<bool> {
+        async fn send_attention_with_timeout(
+            &mut self,
+            _context: &ParserContext,
+            _timeout: Duration,
+        ) -> TdsResult<bool> {
             Ok(false)
         }
         fn is_connection_dead(&self) -> bool {

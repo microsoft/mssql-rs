@@ -11,9 +11,6 @@ use crate::{
     io::packet_writer::{PacketWriter, TdsPacketWriter},
 };
 
-// Static counter for non-transaction request count
-static NON_TRANSACTION_REQUEST_COUNT: AtomicU32 = AtomicU32::new(0);
-
 pub(crate) enum TdsHeaders {
     TransactionDescriptor(TransactionDescriptorHeader),
     #[allow(dead_code)]
@@ -53,8 +50,9 @@ impl TransactionDescriptorHeader {
     }
 
     pub fn create_non_transaction_header() -> Self {
-        let count = NON_TRANSACTION_REQUEST_COUNT.fetch_add(1, Ordering::SeqCst);
-        Self::new(0, count + 1)
+        // MS-TDS requires the outstanding request count to be 1 when the
+        // connection is operating in autocommit mode (section 2.2.5.3.2).
+        Self::new(0, 1)
     }
 }
 
@@ -217,12 +215,13 @@ mod tests {
     }
 
     #[test]
-    fn test_transaction_descriptor_header_create_non_transaction() {
+    fn test_non_transaction_headers_use_autocommit_values() {
         let header1 = TransactionDescriptorHeader::create_non_transaction_header();
         let header2 = TransactionDescriptorHeader::create_non_transaction_header();
         assert_eq!(header1.transaction_descriptor, 0);
         assert_eq!(header2.transaction_descriptor, 0);
-        assert!(header2.outstanding_request_count > header1.outstanding_request_count);
+        assert_eq!(header1.outstanding_request_count, 1);
+        assert_eq!(header2.outstanding_request_count, 1);
     }
 
     #[test]

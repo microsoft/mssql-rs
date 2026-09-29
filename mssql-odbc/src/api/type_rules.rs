@@ -54,6 +54,9 @@ pub(crate) const SQL_PREC_NCHAR: usize = 4000;
 pub(crate) const SQL_PREC_TEXTIMAGE: usize = 2_147_483_647;
 pub(crate) const SQL_PREC_NTEXT: usize = 1_073_741_823;
 pub(crate) const SQL_PREC_NUMERIC: usize = 38;
+/// A CLR UDT's declarable maximum; past it msodbcsql reports `HY104`. A larger
+/// UDT is declared with `SQL_PREC_UNLIMITED` instead, the `max` spelling.
+pub(crate) const SQL_PREC_UDT: usize = 8000;
 /// `ColumnSize` 0, which only the `max`-capable types accept.
 pub(crate) const SQL_PREC_UNLIMITED: usize = 0;
 
@@ -136,9 +139,35 @@ pub(crate) fn parameter_column_size_is_valid(sql_type: SqlSmallInt, column_size:
         SQL_LONGVARCHAR | SQL_LONGVARBINARY => 1..=SQL_PREC_TEXTIMAGE,
         SQL_WLONGVARCHAR => 1..=SQL_PREC_NTEXT,
         SQL_DECIMAL | SQL_NUMERIC => 1..=SQL_PREC_NUMERIC,
+        // A UDT bounds the size but not the zero. Zero is not merely permitted
+        // here the way `varchar(max)` permits it: it is the public
+        // `SQL_SS_LENGTH_UNLIMITED` (`msodbcsql.h:564`), and binding it is the
+        // only way to send a UDT larger than `SQL_PREC_UDT`. msodbcsql's
+        // `case SQL_UDT_MAPPED` rejects only `> SQL_PREC_UDT` with
+        // `IDS_S1_104`, leaving the lower end alone (`sqlcdesc.cpp:11790`),
+        // reached from `SQLBindParameter` via `CheckSqlPrecScale<TRUE>`
+        // (`sqlcdesc.cpp:3038`); `FixupColumnSizeDecimalDigits` has no UDT arm,
+        // so the application's value arrives unchanged.
+        SQL_SS_UDT => SQL_PREC_UNLIMITED..=SQL_PREC_UDT,
         _ => return true,
     };
     valid.contains(&column_size)
+}
+
+/// Whether an IPD record's bound `ColumnSize` belongs in `SQL_DESC_PRECISION`
+/// rather than `SQL_DESC_LENGTH`.
+///
+/// This driver stores the two as independent `DescRecord` fields
+/// (`get_desc_field.rs` reads each one back directly, with no type-based
+/// redirection), unlike msodbcsql's single overloaded `cbColDef`, so
+/// `SQLBindParameter`'s IPD auto-population has to pick one. Only the
+/// exact-numeric types read `ColumnSize` as a digit count — the same split
+/// [`parameter_column_size_is_valid`] already validates against
+/// (`1..=SQL_PREC_NUMERIC`); every other type, including the fixed-length
+/// numerics where ODBC does not constrain `ColumnSize` at all, is stored as
+/// a length.
+pub(crate) fn parameter_size_is_precision(sql_type: SqlSmallInt) -> bool {
+    matches!(sql_type, SQL_DECIMAL | SQL_NUMERIC)
 }
 
 /// Known ODBC C type identifiers in canonical form, including the SQL Server
@@ -288,7 +317,7 @@ pub(crate) fn resolve_default_c_type(
     sql_type: SqlSmallInt,
     odbc_version: OdbcVersion,
 ) -> Option<SqlSmallInt> {
-    let is_3_80 = odbc_version == OdbcVersion::Odbc3_80;
+    let is_3_80 = odbc_version.uses_3_80_types();
     Some(match sql_type {
         SQL_CHAR | SQL_VARCHAR | SQL_LONGVARCHAR => SQL_C_CHAR,
         SQL_WCHAR | SQL_WVARCHAR | SQL_WLONGVARCHAR => SQL_C_WCHAR,
@@ -361,7 +390,6 @@ mod tests {
     fn every_supported_sql_type_has_a_default_c_type() {
         for version in [
             OdbcVersion::Unset,
-            OdbcVersion::Odbc2,
             OdbcVersion::Odbc3,
             OdbcVersion::Odbc3_80,
         ] {
@@ -372,6 +400,59 @@ mod tests {
                 assert!(
                     resolve_default_c_type(sql_type, version).is_some(),
                     "SQL type {sql_type} is Supported but has no default C type at {version:?}"
+                );
+            }
+        }
+    }
+
+    /// The other half of that coupling, and the one with a buffer overrun on
+    /// the far side of it.
+    ///
+    /// Both `SQL_C_DEFAULT` resolvers refuse to resolve a fixed-width target
+    /// the caller's buffer cannot hold, and both ask [`element_stride`] how
+    /// wide that target is by calling it with `buffer_length` 0
+    /// (`get_data::resolve_default_target`,
+    /// `fetch_scroll::resolve_default_bindings`). `element_stride`'s catch-all
+    /// is `_ => buffer_length`, which is 0 there — so a fixed-width C type
+    /// *missing* from its match reports width 0, the `fixed_width > 0` guard
+    /// skips it, and the resolver hands a fixed-width target to a buffer the
+    /// application may have sized smaller.
+    ///
+    /// Nothing else fails in that case: `element_stride`'s own test checks a
+    /// hand-picked subset, so dropping a type from the match leaves every
+    /// behavioral test green. This closes it over the whole mapping rather than
+    /// a list that can go stale — a future row emitting a fixed-width C type
+    /// `element_stride` does not size fails here instead of at an application's
+    /// buffer.
+    ///
+    /// `SQL_C_NUMERIC` is the live example of why this is not hypothetical: it
+    /// is fixed-width and absent from `element_stride`, and is safe today only
+    /// because `SQL_DECIMAL` / `SQL_NUMERIC` map to `SQL_C_CHAR`. That is a
+    /// property of the mapping, not of the guard.
+    ///
+    /// Raised by Saurabh in review of PR #481.
+    #[test]
+    fn every_default_c_type_has_a_width_or_is_app_sized() {
+        use crate::api::fetch_scroll::element_stride;
+
+        // The targets ODBC sizes from the application's `BufferLength`, for
+        // which a 0 width is the correct answer rather than a gap.
+        const APP_SIZED: &[SqlSmallInt] = &[SQL_C_CHAR, SQL_C_WCHAR, SQL_C_BINARY, SQL_C_SS_VECTOR];
+
+        for version in [
+            OdbcVersion::Unset,
+            OdbcVersion::Odbc3,
+            OdbcVersion::Odbc3_80,
+        ] {
+            for sql_type in i16::MIN..=i16::MAX {
+                let Some(c_type) = resolve_default_c_type(sql_type, version) else {
+                    continue;
+                };
+                assert!(
+                    APP_SIZED.contains(&c_type) || element_stride(c_type, 0) > 0,
+                    "SQL_C_DEFAULT on SQL type {sql_type} at {version:?} resolves to C type \
+                     {c_type}, which element_stride reports as width 0 without being \
+                     application-sized; the resolvers' narrow-buffer guard cannot see it"
                 );
             }
         }
@@ -411,7 +492,7 @@ mod tests {
     /// difference is that the two SS date/time rows default to `SQL_C_BINARY`.
     #[test]
     fn ss_datetime_defaults_depend_on_the_odbc_version() {
-        for older in [OdbcVersion::Unset, OdbcVersion::Odbc2, OdbcVersion::Odbc3] {
+        for older in [OdbcVersion::Unset, OdbcVersion::Odbc3] {
             assert_eq!(
                 resolve_default_c_type(SQL_SS_TIME2, older),
                 Some(SQL_C_BINARY)
@@ -496,6 +577,14 @@ mod tests {
         assert!(!parameter_column_size_is_valid(SQL_VARCHAR, 8001));
         assert!(parameter_column_size_is_valid(SQL_SS_XML, 4000));
         assert!(!parameter_column_size_is_valid(SQL_SS_XML, 4001));
+        // A UDT bounds the top but keeps 0, which is the public
+        // `SQL_SS_LENGTH_UNLIMITED` and the only way to bind one larger than
+        // `SQL_PREC_UDT`. Matches msodbcsql's `case SQL_UDT_MAPPED`
+        // (`sqlcdesc.cpp:11790`), which tests only `> SQL_PREC_UDT`. Literals,
+        // so the assertion does not move if the constant does.
+        assert!(parameter_column_size_is_valid(SQL_SS_UDT, 0));
+        assert!(parameter_column_size_is_valid(SQL_SS_UDT, 8000));
+        assert!(!parameter_column_size_is_valid(SQL_SS_UDT, 8001));
         assert!(parameter_column_size_is_valid(SQL_DECIMAL, 38));
         assert!(!parameter_column_size_is_valid(SQL_DECIMAL, 39));
         // The `long` variants bound at the `text`/`ntext` sizes, and `ntext` is
@@ -525,6 +614,26 @@ mod tests {
         for sql_type in [SQL_INTEGER, SQL_SMALLINT, SQL_TINYINT, SQL_BIT, SQL_GUID] {
             assert!(parameter_column_size_is_valid(sql_type, 0));
             assert!(parameter_column_size_is_valid(sql_type, 999_999));
+        }
+    }
+
+    #[test]
+    fn parameter_size_is_precision_only_for_exact_numerics() {
+        assert!(parameter_size_is_precision(SQL_DECIMAL));
+        assert!(parameter_size_is_precision(SQL_NUMERIC));
+        for sql_type in [
+            SQL_CHAR,
+            SQL_VARCHAR,
+            SQL_WCHAR,
+            SQL_BINARY,
+            SQL_INTEGER,
+            SQL_FLOAT,
+            SQL_GUID,
+        ] {
+            assert!(
+                !parameter_size_is_precision(sql_type),
+                "{sql_type} should be stored as a length"
+            );
         }
     }
 }

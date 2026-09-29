@@ -11,8 +11,8 @@ affected code — do not critique pre-existing code outside the PR's scope.
 Every concrete number, constant, and known-failure list below is a dated observation,
 not a standing truth. Prefer the command that re-derives a fact over the value written
 here. If what you observe contradicts this file, trust the observation and report the
-drift separately — an issue or PR against this skill, not the summary of whatever PR
-you happen to be reviewing. Skill maintenance is not that author's problem.
+drift separately — see "Reporting Skill Drift", not the summary of whatever PR you
+happen to be reviewing. Skill maintenance is not that author's problem.
 
 ## Process
 
@@ -20,8 +20,10 @@ you happen to be reviewing. Skill maintenance is not that author's problem.
    missing or doesn't match the diff. This repo requires a linked GitHub issue or
    Azure DevOps work item — flag a PR that has neither. Resolving an `AB#` reference
    is worth it when you can: it catches a PR that drifts from what its work item
-   asked, or one still open against a closed item. See step 6 for handling ADO in an
-   unattended run.
+   asked, or one still open against a closed item. Attempt the lookup before treating
+   it as out of reach — see step 6 for what the Azure DevOps MCP server actually
+   does, what to do when a call fails or isn't exposed in this session at all, and
+   how unattended runs handle this differently.
 2. **Check the PR out locally.** A diff alone is not enough to review this codebase —
    most defects here turn on unchanged code (the other implementer of a trait, the
    caller three layers up, the `#[cfg]` variant of a constant). Use a dedicated
@@ -92,6 +94,18 @@ you happen to be reviewing. Skill maintenance is not that author's problem.
      `$BASE` and compare failure sets; only the difference belongs in the review.
    - **Is this coverage gap real?** Introduce the bug the missing test would catch and
      show the suite still passes.
+   - **Does the platform-gated half still compile?** `cargo check --target <triple>
+     --all-targets` / `cargo clippy --target <triple> --all-targets` type-checks
+     `#[cfg(windows)]` and `#[cfg(target_os = ...)]` code from any host, since
+     neither links. Use `--all-targets`, not `--lib`: a substantial share of this
+     repo's platform-gated code — including platform-gated tests — lives inside
+     inline `#[cfg(test)] mod tests` blocks, which `--lib` skips silently (a
+     different `--lib` than the `nextest run --lib` below, which does run those
+     tests). This is optional and doesn't *run* anything either — still confirm the
+     platform's CI job actually passed on the head commit rather than assuming the
+     matrix covers it. A non-Windows/non-macOS triple also pulls in `openssl-sys`,
+     whose build script can fail without a target sysroot; that's an environment
+     gap, not a finding.
 
    ```bash
    cargo nextest run -p <affected-crate> --lib --no-fail-fast   # or `cargo btest`
@@ -120,18 +134,23 @@ you happen to be reviewing. Skill maintenance is not that author's problem.
    - notes in the body that it came from an unattended run, so the author knows the
      findings were not checked by a human first.
    - never merges, and never resolves a thread it did not open.
-   - treats every interactive authentication path as unavailable, and prefers a tool
-     that fails loudly over one that waits politely. The Azure DevOps MCP server is the
-     known trap: its OAuth flow blocks on a browser nobody will open, and the run keeps
-     reporting itself as healthy while it hangs. Use whatever non-interactive ADO access
-     you have instead, bound it with a timeout, and mark ADO unavailable for the rest of
-     the run on the first failure rather than retrying per PR.
+   - treats every *interactive* authentication path as unavailable, and prefers a tool
+     that fails loudly over one that waits politely. The hazard belongs to the context
+     rather than to any one server: a flow that would open a browser has nobody to
+     answer it, and the run can keep reporting itself as healthy while it hangs. Bound
+     each such call with a timeout, and on a real failure mark that dependency
+     unavailable for the rest of the run instead of retrying per PR. This is not a
+     reason to skip the Azure DevOps MCP server: it answers `wit_work_item`
+     non-interactively on an already-authenticated host (verified 2026-09-02). Call
+     it, then decide.
 
-   **Fail open.** ADO is context, not a gate: it confirms a PR does what its work item
-   asked. When it is unreachable, take an `AB#<number>` at face value as satisfying the
-   linked-work-item requirement in step 1 and review normally. Report the skipped
-   cross-check in the run log, not in the PR — a reviewer's infrastructure trouble is
-   not the author's problem.
+   **Fail open — after a failed call, not instead of one.** ADO is context, not a
+   gate: it confirms a PR does what its work item asked. When a lookup *actually*
+   fails, or the tool isn't exposed in this session's inventory at all so there is
+   nothing to call, take an `AB#<number>` at face value as satisfying the
+   linked-work-item requirement in step 1, review normally, and report the skipped
+   cross-check in the run log rather than in the PR — a reviewer's infrastructure
+   trouble is not the author's problem.
 7. Ground yourself in reference code and public/private documentation/specifications.
    If you don't know the codebase, or which references to use, ask for context before
    reviewing.
@@ -344,6 +363,105 @@ than `gh pr review`, diff-hunk anchoring, `--paginate` when verifying — are in
 3. Each finding for a specific `file:line` gives a concrete fix or a focused code
    snippet — not just "this is wrong." Leave the comment at that line so it carries
    context and can be tracked to resolution.
+4. **Skill drift** — one line per observation, or `none`. Report it every time; a
+   section left off is indistinguishable from one nobody checked. This is a note to
+   the human, not part of the posted review. Exception: for suspected or confirmed
+   security vulnerabilities, emit only `Private MSRC reporting required` without
+   details, as described below.
+
+## Reporting Skill Drift
+
+You are the only reader who sees both this file and what the code actually did, and
+that pairing is gone the moment the review ends. Reconstructing it later from the
+thread is far more expensive than a line written now.
+
+Report when:
+
+- You retracted or downgraded a finding after checking it — most of all one this file
+  told you to check anyway.
+- A defect got past the checks in this file, whether CI, a human, or a later PR caught
+  it.
+- A fact here no longer matches the repo: a constant, a path, a workflow behavior, a
+  known-failure list.
+- A step cost time without changing the outcome, or you raised a class of finding that
+  a lint, test, or CI check could have caught before review.
+
+**Security vulnerabilities are excluded from public drift reporting.** For suspected
+or confirmed vulnerabilities, follow the private Microsoft Security Response Center
+reporting process linked from [SECURITY.md](../../../SECURITY.md):
+<https://aka.ms/SECURITY.md>. Do not create public issues or comments containing
+vulnerability details, even with secrets redacted. This applies to interactive and
+unattended runs; authorization to file drift does not authorize public disclosure.
+For such observations, the required drift output and any chat fallback must contain
+only `Private MSRC reporting required`, not the prepared report. Do not include
+vulnerability details or evidence in review/chat output or unattended logs; reserve
+them for the private reporting process. The marker indicates a required next step,
+not that a report has been submitted.
+
+Search before filing, including closed issues, using distinctive terms for the underlying
+drift mechanism. The same mistake can recur in different functions, tests, or files;
+use the local symbol only as an optional additional query. Recurrence belongs on the
+existing issue, where it is the evidence that promotes it:
+
+```bash
+gh issue list --repo microsoft/mssql-rs --label skill:code-review --state all --limit 1000 --search "in:title,body,comments <drift mechanism terms>"
+```
+
+Search includes comments because recurrence evidence is appended there. If the result
+count reaches the limit, split the query into non-overlapping `created:` date ranges
+and inspect every range; a truncated or failed search cannot establish that no match exists.
+
+Read potential matches to confirm they describe the same drift, not just the same symbol.
+If a match exists, append the structured report below as a comment and do not create a
+new issue:
+
+```bash
+gh issue comment <number> --repo microsoft/mssql-rs --body-file <path>
+```
+
+Only if no match exists, file a separate issue for the observation, with the evidence
+rather than a conclusion. Interactively, use the form so it prompts you for the fields:
+
+<https://github.com/microsoft/mssql-rs/issues/new?template=code_review_skill_drift.yml>
+
+`gh issue create` does not apply the form, so write the body yourself with the same
+required headings. For each dropdown, select one exact option from
+[the form](../../ISSUE_TEMPLATE/code_review_skill_drift.yml), rather than an alias or
+the full option list. An issue missing the required fields is a note, not something a
+later pass can promote:
+
+```markdown
+<!-- Do not report suspected or confirmed security vulnerabilities in public issues or comments, including as skill drift. Follow the private Microsoft Security Response Center reporting process at https://aka.ms/SECURITY.md instead. Redacting secrets does not make vulnerability details safe to publish. -->
+<!-- Before posting an issue or comment, redact sensitive information from all report fields and evidence, including commands, output, and diff excerpts. Do not include connection strings, passwords, access tokens, customer data, or non-public source. -->
+### Drift class
+<one exact option from the form's Drift class dropdown>
+### Where it happened
+<PR, review thread, or comment URL; for a local review, repository and base/HEAD commit IDs>
+### What the skill says today
+<quote the bullet, or state that nothing covers this>
+### What actually turned out to be true
+<the observation, in the terms a future reviewer would need>
+### Evidence
+<redacted file:line, command and output, or thread where it was settled; include only a redacted relevant diff excerpt for uncommitted changes>
+### What it cost
+<one exact option from the form's What it cost dropdown>
+```
+
+For a new issue only:
+
+```bash
+gh issue create --repo microsoft/mssql-rs --label skill:code-review \
+  --title "[review-skill] <one-line drift>" --body-file <path>
+```
+
+These issues are the queue a periodic maintenance pass reads, so one that isn't acted on
+immediately is still doing its job. The bar is whether a future review would repeat the
+mistake — a one-off you could not have anticipated is not drift. The confirmation and
+authorization rules in step 6 apply to both issue creation and comments. Unattended
+runs capture these too, with the same body, but write only when the run explicitly
+authorizes that action; permission to post a PR review alone does not authorize issue
+writes. Otherwise, include the prepared report in the chat output without posting it,
+except for security-related observations, which use only the private-MSRC marker above.
 
 ## Principles
 
@@ -354,6 +472,12 @@ than `gh pr review`, diff-hunk anchoring, `--paginate` when verifying — are in
   that contradiction *is* the finding.
 - Distinguish facts (verified in code) from concerns (worth checking). Don't state
   guesses as defects. Say what you ran and what you read.
+- **An unavailability is a claim, and it carries the same burden as a defect.** Write
+  "I could not check X" only after recording the attempt: the response, the timeout
+  after a bounded wait, or that the tool isn't in this session's inventory at all.
+  Keep two categories apart: *the environment cannot do this* needs a failed
+  invocation or a confirmed absence, while *the defect is inherently untestable*
+  (process teardown, a TOCTOU window) needs only an argument and stays valid.
 - If a change is correct, don't invent problems. An empty severity group means "none
   found" — say so briefly.
 - Reviewing is not merging. The PR author owns the merge — never merge someone

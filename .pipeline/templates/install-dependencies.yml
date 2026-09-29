@@ -41,12 +41,6 @@ steps:
       displayName: "Print Linux Agent info"
 
     - script: |
-        # This causes unexpected failures in APT package installation.
-        sudo systemctl disable unattended-upgrades || true
-      displayName: "Disable unattended upgrades"
-      continueOnError: true
-
-    - script: |
         scripts/install-deps.sh ${{ parameters.installdepsparams }}
       displayName: "Install linux dependencies"
 

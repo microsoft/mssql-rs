@@ -54,6 +54,7 @@ struct Config {
     std::string packet_size;
     std::string packet_size_keyword;
     std::string scenario;
+    std::string write_mode;
 
     /// Read and validate the cross-platform perf-lab environment contract.
     static Config from_environment();
@@ -161,8 +162,20 @@ public:
     /// Expose the statement only to the runner that controls its complete lifecycle.
     SQLHSTMT statement() const;
 
+    /// Separate statement used for setup and validation outside timed regions.
+    SQLHSTMT admin_statement() const;
+
     /// Execute setup/cleanup SQL and drain every result before reusing the statement.
     void execute_non_query(const std::string& sql);
+
+    /// Select explicit transaction mode for write workloads.
+    void set_autocommit(bool enabled);
+
+    /// Commit the current transaction.
+    void commit();
+
+    /// Roll back the current transaction without throwing during error cleanup.
+    void rollback_noexcept() noexcept;
 
     /// Verify setup row counts through the same driver path used by the benchmark.
     std::uint64_t query_count(const std::string& qualified_table);
@@ -174,6 +187,7 @@ private:
     SQLHENV env_ = SQL_NULL_HENV;
     SQLHDBC dbc_ = SQL_NULL_HDBC;
     SQLHSTMT stmt_ = SQL_NULL_HSTMT;
+    SQLHSTMT admin_stmt_ = SQL_NULL_HSTMT;
 };
 
 /// Recreate deterministic tables and verify their row counts before timing begins.
@@ -206,6 +220,8 @@ struct RetrievalMetrics {
     /// inside the fetch loop), in which case no counter is emitted.
     double metadata_bind_seconds = 0.0;
     double fetch_seconds = 0.0;
+    /// Number of SQLExecute calls used to submit a write workload.
+    std::uint64_t execute_calls = 0;
 };
 
 /// Drives one workload and validates that the timed work stays correct.
@@ -229,6 +245,28 @@ public:
 
 private:
     /// Hide ODBC headers and mutable fetch state from benchmark registration code.
+    class Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
+/// Runs the 2,000-row, three-column executemany write workload.
+///
+/// Parameter-array mode is used by the candidate and Microsoft reference.
+/// Sequential mode gives the pinned Rust baseline an honest comparison even
+/// when that commit rejects `SQL_ATTR_PARAMSET_SIZE > 1`.
+class ParameterArrayWriteRunner {
+public:
+    explicit ParameterArrayWriteRunner(OdbcSession& session, std::string mode);
+    ~ParameterArrayWriteRunner();
+
+    ParameterArrayWriteRunner(const ParameterArrayWriteRunner&) = delete;
+    ParameterArrayWriteRunner& operator=(const ParameterArrayWriteRunner&) = delete;
+
+    const char* name() const;
+    void preflight();
+    RetrievalMetrics execute();
+
+private:
     class Impl;
     std::unique_ptr<Impl> impl_;
 };

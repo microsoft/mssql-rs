@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! Exported ODBC entry points for the msodbcsql18 shared library.
+//! Exported ODBC entry points for the mssqlodbc shared library.
 //!
 //! Every `#[unsafe(no_mangle)] pub extern "C"` function that appears in the
 //! driver's symbol table is listed here. Implementations live in sibling
@@ -29,7 +29,6 @@ pub unsafe extern "C" fn SQLAllocHandle(
     input_handle: SqlHandle,
     output_handle_ptr: *mut SqlHandle,
 ) -> SqlReturn {
-    crate::init_tracing();
     unsafe { super::alloc_handle::sql_alloc_handle(handle_type, input_handle, output_handle_ptr) }
 }
 
@@ -40,7 +39,6 @@ pub unsafe extern "C" fn SQLAllocHandle(
 /// - `handle` must have been allocated by [`SQLAllocHandle`] and not already freed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn SQLFreeHandle(handle_type: SqlSmallInt, handle: SqlHandle) -> SqlReturn {
-    crate::init_tracing();
     unsafe { super::free_handle::sql_free_handle(handle_type, handle) }
 }
 
@@ -57,7 +55,6 @@ pub unsafe extern "C" fn SQLSetEnvAttr(
     value_ptr: SqlPointer,
     string_length: SqlInteger,
 ) -> SqlReturn {
-    crate::init_tracing();
     unsafe {
         super::set_env_attr::sql_set_env_attr(
             environment_handle,
@@ -81,7 +78,6 @@ pub unsafe extern "C" fn SQLGetEnvAttr(
     buffer_length: SqlInteger,
     string_length_ptr: *mut SqlInteger,
 ) -> SqlReturn {
-    crate::init_tracing();
     unsafe {
         super::get_env_attr::sql_get_env_attr(
             environment_handle,
@@ -98,7 +94,11 @@ pub unsafe extern "C" fn SQLGetEnvAttr(
 /// # Safety
 /// - `connection_handle` must be a valid DBC handle.
 /// - `attribute` must be a valid connection attribute identifier.
-/// - `value_ptr` validity depends on the attribute type.
+/// - For `SQL_COPT_SS_ACCESS_TOKEN`, `value_ptr` must point to a four-byte
+///   native-endian length followed by that many readable UTF-16LE token bytes.
+/// - For `SQL_ATTR_CURRENT_CATALOG`, `value_ptr` must be readable for
+///   `string_length` bytes of UTF-16, or through a NUL terminator when
+///   `string_length` is `SQL_NTS`.
 /// - `string_length` is used only for string-type attributes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn SQLSetConnectAttrW(
@@ -107,7 +107,6 @@ pub unsafe extern "C" fn SQLSetConnectAttrW(
     value_ptr: SqlPointer,
     string_length: SqlInteger,
 ) -> SqlReturn {
-    crate::init_tracing();
     unsafe {
         super::set_connect_attr::sql_set_connect_attr_w(
             connection_handle,
@@ -129,7 +128,11 @@ pub unsafe extern "C" fn SQLSetConnectAttrW(
 /// # Safety
 /// - `connection_handle` must be a valid DBC handle.
 /// - `attribute` must be a valid connection attribute identifier.
-/// - `value_ptr` validity depends on the attribute type.
+/// - For `SQL_COPT_SS_ACCESS_TOKEN`, `value_ptr` must point to a four-byte
+///   native-endian length followed by that many readable UTF-16LE token bytes.
+/// - For `SQL_ATTR_CURRENT_CATALOG`, `value_ptr` must be readable for
+///   `string_length` bytes, or through a NUL terminator when `string_length` is
+///   `SQL_NTS`.
 /// - `string_length` is used only for string-type attributes.
 #[cfg(not(windows))]
 #[unsafe(no_mangle)]
@@ -139,7 +142,6 @@ pub unsafe extern "C" fn SQLSetConnectAttr(
     value_ptr: SqlPointer,
     string_length: SqlInteger,
 ) -> SqlReturn {
-    crate::init_tracing();
     unsafe {
         super::set_connect_attr::sql_set_connect_attr(
             connection_handle,
@@ -164,7 +166,6 @@ pub unsafe extern "C" fn SQLGetStmtAttrW(
     buffer_length: SqlInteger,
     string_length_ptr: *mut SqlInteger,
 ) -> SqlReturn {
-    crate::init_tracing();
     unsafe {
         super::set_stmt_attr::sql_get_stmt_attr_w(
             statement_handle,
@@ -187,7 +188,6 @@ pub unsafe extern "C" fn SQLGetFunctions(
     function_id: SqlUSmallInt,
     supported_ptr: *mut SqlUSmallInt,
 ) -> SqlReturn {
-    crate::init_tracing();
     unsafe {
         super::get_functions::sql_get_functions(connection_handle, function_id, supported_ptr)
     }
@@ -206,7 +206,6 @@ pub unsafe extern "C" fn SQLGetInfoW(
     buffer_length: SqlSmallInt,
     string_length_ptr: *mut SqlSmallInt,
 ) -> SqlReturn {
-    crate::init_tracing();
     unsafe {
         super::get_info::sql_get_info_w(
             connection_handle,
@@ -214,6 +213,43 @@ pub unsafe extern "C" fn SQLGetInfoW(
             info_value_ptr,
             buffer_length,
             string_length_ptr,
+        )
+    }
+}
+
+/// ODBC entry point: `SQLNumParams`.
+///
+/// # Safety
+/// See [`super::num_params::sql_num_params`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn SQLNumParams(
+    statement_handle: SqlHandle,
+    parameter_count_ptr: *mut SqlSmallInt,
+) -> SqlReturn {
+    unsafe { super::num_params::sql_num_params(statement_handle, parameter_count_ptr) }
+}
+
+/// ODBC entry point: `SQLNativeSqlW`.
+///
+/// # Safety
+/// See [`super::native_sql::sql_native_sql_w`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn SQLNativeSqlW(
+    connection_handle: SqlHandle,
+    in_statement_text: *const SqlWChar,
+    text_length1: SqlInteger,
+    out_statement_text: *mut SqlWChar,
+    buffer_length: SqlInteger,
+    text_length2_ptr: *mut SqlInteger,
+) -> SqlReturn {
+    unsafe {
+        super::native_sql::sql_native_sql_w(
+            connection_handle,
+            in_statement_text,
+            text_length1,
+            out_statement_text,
+            buffer_length,
+            text_length2_ptr,
         )
     }
 }
@@ -242,7 +278,6 @@ pub unsafe extern "C" fn SQLGetDiagRecW(
     buffer_length: SqlSmallInt,
     text_length_ptr: *mut SqlSmallInt,
 ) -> SqlReturn {
-    crate::init_tracing();
     unsafe {
         super::get_diag::sql_get_diag_rec_w(
             handle_type,
@@ -276,7 +311,6 @@ pub unsafe extern "C" fn SQLGetDiagFieldW(
     buffer_length: SqlSmallInt,
     string_length_ptr: *mut SqlSmallInt,
 ) -> SqlReturn {
-    crate::init_tracing();
     unsafe {
         super::get_diag::sql_get_diag_field_w(
             handle_type,
@@ -312,7 +346,6 @@ pub unsafe extern "C" fn SQLConnectW(
     authentication: *const SqlWChar,
     name_length3: SqlSmallInt,
 ) -> SqlReturn {
-    crate::init_tracing();
     unsafe {
         super::connect::sql_connect_w(
             connection_handle,
@@ -345,7 +378,6 @@ pub unsafe extern "C" fn SQLDriverConnectW(
     string_length2_ptr: *mut SqlSmallInt,
     driver_completion: SqlUSmallInt,
 ) -> SqlReturn {
-    crate::init_tracing();
     unsafe {
         super::driver_connect::sql_driver_connect_w(
             connection_handle,
@@ -367,7 +399,6 @@ pub unsafe extern "C" fn SQLDriverConnectW(
 ///   `SQLAllocHandle(SQL_HANDLE_DBC, ...)`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn SQLDisconnect(connection_handle: SqlHandle) -> SqlReturn {
-    crate::init_tracing();
     unsafe { super::disconnect::sql_disconnect(connection_handle) }
 }
 
@@ -389,7 +420,6 @@ pub unsafe extern "C" fn SQLEndTran(
     handle: SqlHandle,
     completion_type: SqlSmallInt,
 ) -> SqlReturn {
-    crate::init_tracing();
     unsafe { super::end_tran::sql_end_tran(handle_type, handle, completion_type) }
 }
 
@@ -403,7 +433,6 @@ pub unsafe extern "C" fn SQLEndTran(
 /// - `statement_handle` must be a valid STMT handle returned by `SQLAllocHandle`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn SQLCloseCursor(statement_handle: SqlHandle) -> SqlReturn {
-    crate::init_tracing();
     unsafe { super::close_cursor::sql_close_cursor(statement_handle) }
 }
 
@@ -420,7 +449,6 @@ pub unsafe extern "C" fn SQLFreeStmt(
     statement_handle: SqlHandle,
     option: SqlUSmallInt,
 ) -> SqlReturn {
-    crate::init_tracing();
     match option {
         SQL_CLOSE => unsafe { super::close_cursor::sql_free_stmt_close(statement_handle) },
         SQL_RESET_PARAMS => unsafe {
@@ -445,6 +473,9 @@ pub unsafe extern "C" fn SQLFreeStmt(
 /// - `statement_handle` must be a valid STMT handle returned by `SQLAllocHandle`.
 /// - `parameter_value_ptr` / `strlen_or_ind_ptr`, if non-null, must remain valid
 ///   and readable until the statement is executed.
+/// - When `SQL_ATTR_PARAM_BIND_OFFSET_PTR` is non-null, the readable extents
+///   begin at each bound base plus the pointed-to signed byte offset, which may
+///   be negative, so every allocation must cover that displaced range.
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn SQLBindParameter(
@@ -459,7 +490,6 @@ pub unsafe extern "C" fn SQLBindParameter(
     buffer_length: SqlLen,
     strlen_or_ind_ptr: *mut SqlLen,
 ) -> SqlReturn {
-    crate::init_tracing();
     unsafe {
         super::bind_param::sql_bind_parameter(
             statement_handle,
@@ -491,7 +521,6 @@ pub unsafe extern "C" fn SQLPrepareW(
     statement_text: *const SqlWChar,
     text_length: SqlSmallInt,
 ) -> SqlReturn {
-    crate::init_tracing();
     unsafe { super::prepare::sql_prepare_w(statement_handle, statement_text, text_length) }
 }
 
@@ -510,7 +539,6 @@ pub unsafe extern "C" fn SQLDescribeParam(
     decimal_digits_ptr: *mut SqlSmallInt,
     nullable_ptr: *mut SqlSmallInt,
 ) -> SqlReturn {
-    crate::init_tracing();
     unsafe {
         super::describe_param::sql_describe_param(
             statement_handle,
@@ -530,13 +558,18 @@ pub unsafe extern "C" fn SQLDescribeParam(
 /// - `statement_handle` must be a valid STMT handle returned by `SQLAllocHandle`.
 /// - `statement_text`, if non-null, must be readable for `text_length` `SQLWCHAR`s.
 ///   If `text_length` is `SQL_NTS`, the string must be NUL-terminated.
+/// - Each non-data-at-execution parameter's currently bound value and length
+///   buffers must remain readable according to its C type and declared lengths.
+/// - When `SQL_ATTR_PARAM_BIND_OFFSET_PTR` is non-null, those readable extents
+///   begin at each bound base plus the pointed-to signed byte offset, which may
+///   be negative, so every allocation must cover that displaced range. The
+///   offset pointer itself must remain readable for one `SqlLen`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn SQLExecDirectW(
     statement_handle: SqlHandle,
     statement_text: *const SqlWChar,
     text_length: SqlSmallInt,
 ) -> SqlReturn {
-    crate::init_tracing();
     unsafe { super::exec_direct::sql_exec_direct_w(statement_handle, statement_text, text_length) }
 }
 
@@ -550,7 +583,6 @@ pub unsafe extern "C" fn SQLGetTypeInfoW(
     statement_handle: SqlHandle,
     data_type: SqlSmallInt,
 ) -> SqlReturn {
-    crate::init_tracing();
     unsafe { super::get_type_info::sql_get_type_info_w(statement_handle, data_type) }
 }
 
@@ -558,9 +590,14 @@ pub unsafe extern "C" fn SQLGetTypeInfoW(
 ///
 /// # Safety
 /// - `statement_handle` must be a valid STMT handle returned by `SQLAllocHandle`.
+/// - Each non-data-at-execution parameter's currently bound value and length
+///   buffers must remain readable according to its C type and declared lengths.
+/// - When `SQL_ATTR_PARAM_BIND_OFFSET_PTR` is non-null, those readable extents
+///   begin at each bound base plus the pointed-to signed byte offset, which may
+///   be negative, so every allocation must cover that displaced range. The
+///   offset pointer itself must remain readable for one `SqlLen`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn SQLExecute(statement_handle: SqlHandle) -> SqlReturn {
-    crate::init_tracing();
     unsafe { super::execute::sql_execute(statement_handle) }
 }
 
@@ -580,7 +617,6 @@ pub unsafe extern "C" fn SQLParamData(
     statement_handle: SqlHandle,
     value_ptr_ptr: *mut SqlPointer,
 ) -> SqlReturn {
-    crate::init_tracing();
     unsafe { super::param_data::sql_param_data(statement_handle, value_ptr_ptr) }
 }
 
@@ -594,13 +630,17 @@ pub unsafe extern "C" fn SQLParamData(
 /// - `statement_handle` must be a valid STMT handle returned by `SQLAllocHandle`.
 /// - `data_ptr`, when `strlen_or_ind` is a positive byte count, must be
 ///   readable for that many bytes.
+/// - `data_ptr`, when `strlen_or_ind` is `SQL_NTS`, must be non-null and
+///   NUL-terminated within an allocation it owns. The terminator search reads
+///   potentially unaligned `u16` units for `SQL_C_WCHAR` and `u8` units
+///   otherwise, and runs off the end of the allocation if no terminator is
+///   present.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn SQLPutData(
     statement_handle: SqlHandle,
     data_ptr: SqlPointer,
     strlen_or_ind: SqlLen,
 ) -> SqlReturn {
-    crate::init_tracing();
     unsafe { super::put_data::sql_put_data(statement_handle, data_ptr, strlen_or_ind) }
 }
 
@@ -612,21 +652,40 @@ pub unsafe extern "C" fn SQLPutData(
 ///
 /// # Safety
 /// - `statement_handle` must be a valid STMT handle returned by `SQLAllocHandle`.
+/// - Every active bound-column data buffer must be writable for
+///   `SQL_ATTR_ROW_ARRAY_SIZE` elements of `BufferLength` bytes for a character
+///   or binary target, or of the full C type size for a fixed-width target,
+///   even when `BufferLength` is zero or smaller. Its indicator and
+///   octet-length arrays must each be writable for `SQL_ATTR_ROW_ARRAY_SIZE`
+///   `SqlLen` values.
+/// - When `SQL_ATTR_ROW_BIND_OFFSET_PTR` is non-null, these bound-buffer
+///   extents begin at the base plus the pointed-to byte offset, so each
+///   allocation must also cover that leading displacement.
+/// - Non-null rowset pointer attributes must satisfy their declared extents:
+///   one `SqlULen` for `SQL_ATTR_ROWS_FETCHED_PTR` and
+///   `SQL_ATTR_ROW_BIND_OFFSET_PTR`, and `SQL_ATTR_ROW_ARRAY_SIZE`
+///   `SqlUSmallInt` values for `SQL_ATTR_ROW_STATUS_PTR`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn SQLFetch(statement_handle: SqlHandle) -> SqlReturn {
-    crate::init_tracing();
     unsafe { super::fetch::sql_fetch(statement_handle) }
 }
 
 /// Binds an application buffer to a result-set column.
 ///
-/// Passing null for both `target_value_ptr` and `strlen_or_ind_ptr` unbinds the
-/// column; a null data pointer with a live indicator keeps it bound for lengths
-/// only.
+/// A null `target_value_ptr` unbinds the column, regardless of
+/// `strlen_or_ind_ptr`; indicator-only bindings are not retained.
 ///
 /// # Safety
-/// `statement_handle` must be a valid statement handle or null. The buffers must
-/// stay valid until the column is unbound or the statement is freed.
+/// `statement_handle` must be a valid statement handle or null. The buffers
+/// must stay valid until the column is unbound or the statement is freed. At
+/// each fetch, a non-null `target_value_ptr` must be writable for
+/// `SQL_ATTR_ROW_ARRAY_SIZE` elements of `buffer_length` bytes for a character
+/// or binary target, or of the full C type size for a fixed-width target, even
+/// when `buffer_length` is zero or smaller. `strlen_or_ind_ptr`, when non-null,
+/// must be writable for `SQL_ATTR_ROW_ARRAY_SIZE` `SqlLen` values. When
+/// `SQL_ATTR_ROW_BIND_OFFSET_PTR` is non-null, these bound-buffer extents begin
+/// at the base plus the pointed-to byte offset, so each allocation must also
+/// cover that leading displacement.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn SQLBindCol(
     statement_handle: SqlHandle,
@@ -636,7 +695,6 @@ pub unsafe extern "C" fn SQLBindCol(
     buffer_length: SqlLen,
     strlen_or_ind_ptr: *mut SqlLen,
 ) -> SqlReturn {
-    crate::init_tracing();
     unsafe {
         super::bind_col::sql_bind_col(
             statement_handle,
@@ -656,13 +714,24 @@ pub unsafe extern "C" fn SQLBindCol(
 ///
 /// # Safety
 /// `statement_handle` must be a valid statement handle or null.
+/// Every active bound-column data buffer must be writable for
+/// `SQL_ATTR_ROW_ARRAY_SIZE` elements of `BufferLength` bytes for a character
+/// or binary target, or of the full C type size for a fixed-width target, even
+/// when `BufferLength` is zero or smaller. Its indicator and octet-length
+/// arrays must each be writable for `SQL_ATTR_ROW_ARRAY_SIZE` `SqlLen` values.
+/// When `SQL_ATTR_ROW_BIND_OFFSET_PTR` is non-null, these bound-buffer extents
+/// begin at the base plus the pointed-to byte offset, so each allocation must
+/// also cover that leading displacement.
+/// Non-null rowset pointer attributes must satisfy their declared extents: one
+/// `SqlULen` for `SQL_ATTR_ROWS_FETCHED_PTR` and
+/// `SQL_ATTR_ROW_BIND_OFFSET_PTR`, and `SQL_ATTR_ROW_ARRAY_SIZE`
+/// `SqlUSmallInt` values for `SQL_ATTR_ROW_STATUS_PTR`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn SQLFetchScroll(
     statement_handle: SqlHandle,
     fetch_orientation: SqlSmallInt,
     fetch_offset: SqlLen,
 ) -> SqlReturn {
-    crate::init_tracing();
     unsafe {
         super::fetch_scroll::sql_fetch_scroll(statement_handle, fetch_orientation, fetch_offset)
     }
@@ -678,7 +747,6 @@ pub unsafe extern "C" fn SQLNumResultCols(
     statement_handle: SqlHandle,
     column_count_ptr: *mut SqlSmallInt,
 ) -> SqlReturn {
-    crate::init_tracing();
     unsafe { super::num_result_cols::sql_num_result_cols(statement_handle, column_count_ptr) }
 }
 
@@ -700,7 +768,6 @@ pub unsafe extern "C" fn SQLDescribeColW(
     decimal_digits_ptr: *mut SqlSmallInt,
     nullable_ptr: *mut SqlSmallInt,
 ) -> SqlReturn {
-    crate::init_tracing();
     unsafe {
         super::describe_col::sql_describe_col_w(
             statement_handle,
@@ -735,7 +802,6 @@ pub unsafe extern "C" fn SQLColAttributeW(
     string_length_ptr: *mut SqlSmallInt,
     numeric_attribute_ptr: *mut SqlLen,
 ) -> SqlReturn {
-    crate::init_tracing();
     unsafe {
         super::col_attribute::sql_col_attribute_w(
             statement_handle,
@@ -753,7 +819,10 @@ pub unsafe extern "C" fn SQLColAttributeW(
 ///
 /// # Safety
 /// - `statement_handle` must be a valid STMT handle returned by `SQLAllocHandle`.
-/// - `target_value_ptr`, when non-null, must be writable for `buffer_length` bytes.
+/// - `target_value_ptr`, when non-null, must be writable for `buffer_length`
+///   bytes for variable-width targets. For a fixed-width target it must be
+///   writable for the full size of `target_type`, even when `buffer_length` is
+///   zero or smaller.
 /// - `strlen_or_ind_ptr`, when non-null, must be writable for one `SqlLen`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn SQLGetData(
@@ -764,7 +833,6 @@ pub unsafe extern "C" fn SQLGetData(
     buffer_length: SqlLen,
     strlen_or_ind_ptr: *mut SqlLen,
 ) -> SqlReturn {
-    crate::init_tracing();
     unsafe {
         super::get_data::sql_get_data(
             statement_handle,
@@ -787,7 +855,6 @@ pub unsafe extern "C" fn SQLGetData(
 /// - `statement_handle` must be a valid STMT handle.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn SQLMoreResults(statement_handle: SqlHandle) -> SqlReturn {
-    crate::init_tracing();
     unsafe { super::more_results::sql_more_results(statement_handle) }
 }
 
@@ -803,7 +870,6 @@ pub unsafe extern "C" fn SQLRowCount(
     statement_handle: SqlHandle,
     row_count_ptr: *mut SqlLen,
 ) -> SqlReturn {
-    crate::init_tracing();
     unsafe { super::row_count::sql_row_count(statement_handle, row_count_ptr) }
 }
 
@@ -813,7 +879,9 @@ pub unsafe extern "C" fn SQLRowCount(
 ///
 /// # Safety
 /// - `statement_handle` must be a valid STMT handle returned by `SQLAllocHandle`.
-/// - Each name pointer must be null or reference `*_len` readable UTF-16 units.
+/// - Each name pointer must be null, reference its paired length in readable
+///   UTF-16 units, or be readable through a NUL terminator when that length is
+///   `SQL_NTS`.
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn SQLTablesW(
@@ -827,7 +895,6 @@ pub unsafe extern "C" fn SQLTablesW(
     table_type: *const SqlWChar,
     name_length_4: SqlSmallInt,
 ) -> SqlReturn {
-    crate::init_tracing();
     unsafe {
         super::catalog::sql_tables_w(
             statement_handle,
@@ -847,7 +914,9 @@ pub unsafe extern "C" fn SQLTablesW(
 ///
 /// # Safety
 /// - `statement_handle` must be a valid STMT handle returned by `SQLAllocHandle`.
-/// - Each name pointer must be null or reference `*_len` readable UTF-16 units.
+/// - Each name pointer must be null, reference its paired length in readable
+///   UTF-16 units, or be readable through a NUL terminator when that length is
+///   `SQL_NTS`.
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn SQLColumnsW(
@@ -861,7 +930,6 @@ pub unsafe extern "C" fn SQLColumnsW(
     column_name: *const SqlWChar,
     name_length_4: SqlSmallInt,
 ) -> SqlReturn {
-    crate::init_tracing();
     unsafe {
         super::catalog::sql_columns_w(
             statement_handle,
@@ -881,7 +949,9 @@ pub unsafe extern "C" fn SQLColumnsW(
 ///
 /// # Safety
 /// - `statement_handle` must be a valid STMT handle returned by `SQLAllocHandle`.
-/// - Each name pointer must be null or reference `*_len` readable UTF-16 units.
+/// - Each name pointer must be null, reference its paired length in readable
+///   UTF-16 units, or be readable through a NUL terminator when that length is
+///   `SQL_NTS`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn SQLPrimaryKeysW(
     statement_handle: SqlHandle,
@@ -892,7 +962,6 @@ pub unsafe extern "C" fn SQLPrimaryKeysW(
     table_name: *const SqlWChar,
     name_length_3: SqlSmallInt,
 ) -> SqlReturn {
-    crate::init_tracing();
     unsafe {
         super::catalog::sql_primary_keys_w(
             statement_handle,
@@ -910,7 +979,9 @@ pub unsafe extern "C" fn SQLPrimaryKeysW(
 ///
 /// # Safety
 /// - `statement_handle` must be a valid STMT handle returned by `SQLAllocHandle`.
-/// - Each name pointer must be null or reference `*_len` readable UTF-16 units.
+/// - Each name pointer must be null, reference its paired length in readable
+///   UTF-16 units, or be readable through a NUL terminator when that length is
+///   `SQL_NTS`.
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn SQLForeignKeysW(
@@ -928,7 +999,6 @@ pub unsafe extern "C" fn SQLForeignKeysW(
     fk_table_name: *const SqlWChar,
     name_length_6: SqlSmallInt,
 ) -> SqlReturn {
-    crate::init_tracing();
     unsafe {
         super::catalog::sql_foreign_keys_w(
             statement_handle,
@@ -952,7 +1022,9 @@ pub unsafe extern "C" fn SQLForeignKeysW(
 ///
 /// # Safety
 /// - `statement_handle` must be a valid STMT handle returned by `SQLAllocHandle`.
-/// - Each name pointer must be null or reference `*_len` readable UTF-16 units.
+/// - Each name pointer must be null, reference its paired length in readable
+///   UTF-16 units, or be readable through a NUL terminator when that length is
+///   `SQL_NTS`.
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn SQLStatisticsW(
@@ -966,7 +1038,6 @@ pub unsafe extern "C" fn SQLStatisticsW(
     unique: SqlUSmallInt,
     reserved: SqlUSmallInt,
 ) -> SqlReturn {
-    crate::init_tracing();
     unsafe {
         super::catalog::sql_statistics_w(
             statement_handle,
@@ -987,7 +1058,9 @@ pub unsafe extern "C" fn SQLStatisticsW(
 ///
 /// # Safety
 /// - `statement_handle` must be a valid STMT handle returned by `SQLAllocHandle`.
-/// - Each name pointer must be null or reference `*_len` readable UTF-16 units.
+/// - Each name pointer must be null, reference its paired length in readable
+///   UTF-16 units, or be readable through a NUL terminator when that length is
+///   `SQL_NTS`.
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn SQLSpecialColumnsW(
@@ -1002,7 +1075,6 @@ pub unsafe extern "C" fn SQLSpecialColumnsW(
     scope: SqlUSmallInt,
     nullable: SqlUSmallInt,
 ) -> SqlReturn {
-    crate::init_tracing();
     unsafe {
         super::catalog::sql_special_columns_w(
             statement_handle,
@@ -1023,7 +1095,9 @@ pub unsafe extern "C" fn SQLSpecialColumnsW(
 ///
 /// # Safety
 /// - `statement_handle` must be a valid STMT handle returned by `SQLAllocHandle`.
-/// - Each name pointer must be null or reference `*_len` readable UTF-16 units.
+/// - Each name pointer must be null, reference its paired length in readable
+///   UTF-16 units, or be readable through a NUL terminator when that length is
+///   `SQL_NTS`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn SQLProceduresW(
     statement_handle: SqlHandle,
@@ -1034,7 +1108,6 @@ pub unsafe extern "C" fn SQLProceduresW(
     proc_name: *const SqlWChar,
     name_length_3: SqlSmallInt,
 ) -> SqlReturn {
-    crate::init_tracing();
     unsafe {
         super::catalog::sql_procedures_w(
             statement_handle,
@@ -1064,7 +1137,6 @@ pub unsafe extern "C" fn SQLGetConnectAttrW(
     buffer_length: SqlInteger,
     string_length_ptr: *mut SqlInteger,
 ) -> SqlReturn {
-    crate::init_tracing();
     unsafe {
         super::get_connect_attr::sql_get_connect_attr_w(
             connection_handle,
@@ -1090,7 +1162,6 @@ pub unsafe extern "C" fn SQLSetStmtAttrW(
     value_ptr: SqlPointer,
     string_length: SqlInteger,
 ) -> SqlReturn {
-    crate::init_tracing();
     unsafe {
         super::set_stmt_attr::sql_set_stmt_attr_w(
             statement_handle,
@@ -1119,7 +1190,6 @@ pub unsafe extern "C" fn SQLGetDescFieldW(
     buffer_length: SqlInteger,
     string_length_ptr: *mut SqlInteger,
 ) -> SqlReturn {
-    crate::init_tracing();
     unsafe {
         super::get_desc_field::sql_get_desc_field_w(
             descriptor_handle,
@@ -1151,7 +1221,6 @@ pub unsafe extern "C" fn SQLSetDescFieldW(
     value_ptr: SqlPointer,
     buffer_length: SqlInteger,
 ) -> SqlReturn {
-    crate::init_tracing();
     unsafe {
         super::set_desc_field::sql_set_desc_field_w(
             descriptor_handle,
@@ -1163,12 +1232,96 @@ pub unsafe extern "C" fn SQLSetDescFieldW(
     }
 }
 
+/// Gets multiple descriptor fields for one record in a single call: name,
+/// type, datetime/interval subcode, octet length, precision, scale, and
+/// nullability.
+///
+/// # Safety
+/// - `descriptor_handle` must be a valid descriptor handle.
+/// - `record_number` must be valid for the descriptor.
+/// - `name`, if non-null, must be writable for `buffer_length` `SQLWCHAR`s.
+/// - Every other output pointer, if non-null, must be valid and writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn SQLGetDescRecW(
+    descriptor_handle: SqlHandle,
+    record_number: SqlSmallInt,
+    name: *mut SqlWChar,
+    buffer_length: SqlSmallInt,
+    string_length_ptr: *mut SqlSmallInt,
+    type_ptr: *mut SqlSmallInt,
+    sub_type_ptr: *mut SqlSmallInt,
+    length_ptr: *mut SqlLen,
+    precision_ptr: *mut SqlSmallInt,
+    scale_ptr: *mut SqlSmallInt,
+    nullable_ptr: *mut SqlSmallInt,
+) -> SqlReturn {
+    unsafe {
+        super::get_desc_rec::sql_get_desc_rec_w(
+            descriptor_handle,
+            record_number,
+            name,
+            buffer_length,
+            string_length_ptr,
+            type_ptr,
+            sub_type_ptr,
+            length_ptr,
+            precision_ptr,
+            scale_ptr,
+            nullable_ptr,
+        )
+    }
+}
+
+/// Sets multiple descriptor fields for one record in a single call: type,
+/// datetime/interval subcode, octet length, precision, scale, data pointer,
+/// octet-length-indicator pointer, and indicator pointer. Not valid on an
+/// IRD handle.
+///
+/// Unlike `SQLGetDescRecW`, this function has no `W`/`A` variants: none of
+/// its arguments are character data, so the ODBC spec defines only one
+/// entry point, `SQLSetDescRec` (see `sql.h`'s declaration — no `SQLSetDescRecA`
+/// exists either).
+///
+/// # Safety
+/// - `descriptor_handle` must be a valid descriptor handle, not an IRD.
+/// - `data_ptr`, if non-null, is stored verbatim and not dereferenced by this
+///   call; the caller must keep it valid for as long as it remains bound.
+/// - `string_length_ptr`/`indicator_ptr`, if non-null, are stored verbatim
+///   and not dereferenced by this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn SQLSetDescRec(
+    descriptor_handle: SqlHandle,
+    record_number: SqlSmallInt,
+    field_type: SqlSmallInt,
+    sub_type: SqlSmallInt,
+    length: SqlLen,
+    precision: SqlSmallInt,
+    scale: SqlSmallInt,
+    data_ptr: SqlPointer,
+    string_length_ptr: *mut SqlLen,
+    indicator_ptr: *mut SqlLen,
+) -> SqlReturn {
+    unsafe {
+        super::set_desc_rec::sql_set_desc_rec(
+            descriptor_handle,
+            record_number,
+            field_type,
+            sub_type,
+            length,
+            precision,
+            scale,
+            data_ptr,
+            string_length_ptr,
+            indicator_ptr,
+        )
+    }
+}
+
 /// Cancels the processing of the statement.
 ///
 /// # Safety
 /// - `statement_handle` must be a valid STMT handle.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn SQLCancel(statement_handle: SqlHandle) -> SqlReturn {
-    crate::init_tracing();
     unsafe { super::cancel::sql_cancel(statement_handle) }
 }

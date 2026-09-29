@@ -9,6 +9,19 @@ Low-level TDS client handling connection negotiation (prelogin, TLS, login7),
 query execution, result set streaming, bulk copy, RPC calls, and transaction
 management. Built on Tokio.
 
+## SQL string decoding
+
+`SqlString::decode` and `to_utf8_string` use the encoding supplied by TDS metadata,
+not a byte-order mark (BOM) inferred from the value. Leading BOM-shaped bytes are
+data: UTF-16LE `FF FE` remains U+FEFF, `FE FF` remains U+FFFE without switching to
+big-endian decoding, and Windows-1252 `EF BB BF` remains U+00EF U+00BB U+00BF.
+
+This behavior also applies to decoded column strings in the `mssql-js` row writer
+and the `mssql-py-core` cursor, not just ODBC. Applications using those bindings
+can therefore receive leading characters that were previously stripped or decoded
+under the wrong encoding. Malformed-sequence handling is unchanged; preserving
+raw unpaired UTF-16 units in ODBC `SQL_C_WCHAR` buffers is a separate behavior.
+
 ## Feature flags
 
 | Flag | Default | Description |

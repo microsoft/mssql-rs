@@ -46,7 +46,7 @@ impl DriverVersion {
     }
 
     /// Creates a DriverVersion from the crate's Cargo.toml version at compile time.
-    /// Parses the `CARGO_PKG_VERSION` environment variable (e.g., "0.1.0").
+    /// Parses the `CARGO_PKG_VERSION` environment variable.
     pub fn from_cargo_version() -> Self {
         let parts: Vec<&str> = env!("CARGO_PKG_VERSION").split('.').collect();
         Self {
@@ -1681,9 +1681,15 @@ mod tests {
     #[test]
     fn test_driver_version_from_cargo() {
         let v = DriverVersion::from_cargo_version();
-        // Should parse the crate version "0.1.0"
-        assert_eq!(v, DriverVersion::new(0, 1, 0));
         assert_eq!(v.to_string(), env!("CARGO_PKG_VERSION"));
+        assert_eq!(
+            v,
+            DriverVersion::new(
+                env!("CARGO_PKG_VERSION_MAJOR").parse().unwrap(),
+                env!("CARGO_PKG_VERSION_MINOR").parse().unwrap(),
+                env!("CARGO_PKG_VERSION_PATCH").parse().unwrap(),
+            )
+        );
     }
 
     #[test]

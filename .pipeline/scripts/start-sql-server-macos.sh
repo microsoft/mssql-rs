@@ -43,7 +43,10 @@ PULL_BUDGET_SECONDS=${PULL_BUDGET_SECONDS:-900}
 READY_TIMEOUT_SECONDS=${READY_TIMEOUT_SECONDS:-240}
 # A container that exits immediately is abandoned in seconds, so cap the
 # attempts too — otherwise the budget alone would allow dozens of restarts.
-MAX_START_ATTEMPTS=${MAX_START_ATTEMPTS:-3}
+# 5, not 3: the container's known SQLPAL crash is ~1-in-8 per attempt, so a
+# three-attempt streak is plausible. The budget check above still bounds the
+# total wall clock.
+MAX_START_ATTEMPTS=${MAX_START_ATTEMPTS:-5}
 # Login timeout per probe; the sqlcmd default of ~9s makes probes expensive.
 PROBE_LOGIN_TIMEOUT_SECONDS=${PROBE_LOGIN_TIMEOUT_SECONDS:-5}
 PROBE_INTERVAL_SECONDS=${PROBE_INTERVAL_SECONDS:-3}

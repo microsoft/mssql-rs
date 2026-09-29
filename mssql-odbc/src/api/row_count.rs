@@ -32,6 +32,9 @@ pub(crate) unsafe fn sql_row_count(
     })
 }
 
+/// # Safety
+/// `statement_handle` must be null or point to a live `StmtHandle`.
+/// `row_count_ptr`, when non-null, must be writable for one `SqlLen`.
 unsafe fn sql_row_count_impl(statement_handle: SqlHandle, row_count_ptr: *mut SqlLen) -> SqlReturn {
     // msodbcsql relies on the Driver Manager to reject a null handle before the
     // driver is called and does not null-check it. We validate anyway to keep

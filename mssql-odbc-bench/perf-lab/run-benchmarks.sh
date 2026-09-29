@@ -32,7 +32,7 @@ SCIPY_VERSION="1.15.3"
 # Scenario catalog. The C++ harness filters its workloads by scenario, and every
 # downstream step - ordering, comparison, confirmation - iterates this list, so a
 # new scenario needs no other change here.
-SCENARIOS=(narrow wide rowset varwidth getdata)
+SCENARIOS=(narrow wide rowset varwidth getdata write)
 
 BASELINE_TEMP_DIR=""
 BASELINE_TREE=""
@@ -350,8 +350,34 @@ build_driver() {
     echo ">>> Building $label mssql-odbc driver..."
     (
         cd "$source_root"
-        CARGO_TARGET_DIR="$target_dir" cargo build -p mssql-odbc --release
+        CARGO_TARGET_DIR="$target_dir" cargo build \
+            --manifest-path mssql-odbc/Cargo.toml --release
     )
+}
+
+driver_artifact() {
+    # The pinned baseline can predate a cdylib rename, so resolve each checkout.
+    local source_root="$1"
+    local target_dir="$2"
+    local target_name
+    target_name="$(
+        awk '
+            /^\[lib\][[:space:]]*$/ { in_lib = 1; next }
+            /^\[/ { in_lib = 0 }
+            in_lib && /^[[:space:]]*name[[:space:]]*=/ {
+                name = $0
+                sub(/^[^"]*"/, "", name)
+                sub(/".*$/, "", name)
+                print name
+                exit
+            }
+        ' "$source_root/mssql-odbc/Cargo.toml"
+    )"
+    if [ -z "$target_name" ]; then
+        echo "ERROR: cdylib target name not found in $source_root/mssql-odbc/Cargo.toml" >&2
+        return 1
+    fi
+    printf '%s/release/lib%s.so\n' "$target_dir" "$target_name"
 }
 
 build_driver "$REPO_ROOT" "$CANDIDATE_TARGET_DIR" "candidate"
@@ -362,8 +388,8 @@ echo ">>> Adding baseline worktree for $BASELINE_COMMIT..."
 git worktree add --detach "$BASELINE_TREE" "$BASELINE_COMMIT"
 build_driver "$BASELINE_TREE" "$BASELINE_TARGET_DIR" "baseline"
 
-CANDIDATE_DRIVER="$CANDIDATE_TARGET_DIR/release/libmsodbcsql18.so"
-BASELINE_DRIVER="$BASELINE_TARGET_DIR/release/libmsodbcsql18.so"
+CANDIDATE_DRIVER="$(driver_artifact "$REPO_ROOT" "$CANDIDATE_TARGET_DIR")"
+BASELINE_DRIVER="$(driver_artifact "$BASELINE_TREE" "$BASELINE_TARGET_DIR")"
 BENCH_EXE="$HARNESS_BUILD_DIR/mssql_odbc_bench"
 ADMIN_EXE="$HARNESS_BUILD_DIR/mssql_odbc_bench_admin"
 for required_file in \
@@ -413,6 +439,9 @@ fi
     echo "microsoft_driver_sha256=$MICROSOFT_DRIVER_SHA256"
     echo "packet_size=$ODBC_BENCH_PACKET_SIZE"
     echo "packet_size_verified_by_harness=true"
+    echo "write_candidate_mode=parameter_array"
+    echo "write_baseline_mode=sequential"
+    echo "write_reference_mode=parameter_array"
     echo "repetitions=$REPETITIONS"
     echo "regression_ratio=$REGRESSION_RATIO"
     echo "confirm_runs=$CONFIRM_RUNS"
@@ -442,12 +471,22 @@ run_leg() {
     local scenario="$1"
     local driver="$2"
     local output="$3"
-    echo ">>> Running $scenario with $driver..."
+    local write_mode=parameter_array
+    # KNOWN GAP (microsoft/mssql-rs#534): this baseline/candidate mode split makes
+    # the regression gate apples-to-oranges for write/ - a sequential-mode
+    # baseline vs a batched candidate never crosses the 1.05 regression ratio, and
+    # it is selected by driver name rather than capability, so it will not
+    # self-heal once the baseline can run parameter arrays. See #534 for options.
+    if [ "$scenario" = "write" ] && [ "$driver" = "$BASELINE_DRIVER_NAME" ]; then
+        write_mode=sequential
+    fi
+    echo ">>> Running $scenario with $driver (write mode: $write_mode)..."
     # Linux keeps the PacketSize spelling for every driver, including Microsoft
     # ODBC: on Linux that driver rejects "Packet Size" (01S00) and accepts
     # "PacketSize" (01S02). Windows uses the "Packet Size" spelling instead.
     ODBC_BENCH_DRIVER="$driver" \
         ODBC_BENCH_SCENARIO="$scenario" \
+        ODBC_BENCH_WRITE_MODE="$write_mode" \
         ODBC_BENCH_PACKET_SIZE_KEYWORD="PacketSize" \
         "${BENCH_PREFIX[@]}" "$BENCH_EXE" \
         "--benchmark_repetitions=$REPETITIONS" \

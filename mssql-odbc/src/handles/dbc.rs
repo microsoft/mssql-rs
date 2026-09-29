@@ -5,8 +5,8 @@ use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
 
 use mssql_tds::connection::tds_client::TdsClient;
-use tokio::runtime::Runtime;
 
+use super::env::SharedRuntime;
 use super::{EnvHandle, HandleType, HasObjectType};
 use crate::api::odbc_types::{DEFAULT_PACKET_SIZE, SQL_MODE_READ_WRITE, SQL_TXN_READ_COMMITTED};
 use crate::error::{DiagRecord, HasDiagnostics};
@@ -36,7 +36,7 @@ pub(crate) struct DbcHandle {
     /// the ENV owns the DBC's lifetime, not the other way around.
     pub(crate) parent_env: *mut c_void,
     /// Shared Tokio runtime from the parent ENV.
-    pub(crate) runtime: Arc<Runtime>,
+    pub(crate) runtime: Arc<SharedRuntime>,
     pub(crate) inner: Mutex<DbcState>,
 }
 
@@ -118,11 +118,51 @@ pub(crate) struct DbcState {
     /// `SQL_ATTR_ACCESS_MODE`. Stored so a set/get round-trip agrees; the driver
     /// does not yet vary its behaviour on it.
     pub(crate) access_mode: u32,
+    /// `SQL_COPT_SS_WARN_ON_CP_ERROR`. When `true`, a value carrying a character
+    /// the narrow encoding it is sent in could not represent — substituted with
+    /// `?` on the way to the wire, matching msodbcsql — is reported as SQLSTATE
+    /// `01000` and turns the call's return into `SQL_SUCCESS_WITH_INFO`.
+    ///
+    /// That encoding is the one the parameter carries, which is the
+    /// connection's negotiated database collation; the driver does not know the
+    /// destination column here. So this observes the conversion *this driver*
+    /// performs, not the server's: a column collated differently from the
+    /// database can still lose characters server-side without this firing.
+    ///
+    /// Defaults to `false` (`SQL_WARN_NO`), as msodbcsql's does
+    /// (`sqlcconn.cpp:596`): the substitution is not an error, and warning
+    /// unconditionally would change the return code of every statement that
+    /// carries text a legacy code page cannot hold.
+    ///
+    /// msodbcsql only consults its copy on the retrieval direction — output
+    /// parameters (`sqlcdata.h:1297`) and columns (`:1310`); every
+    /// input-parameter path discards the loss flag. This driver applies it to
+    /// parameters instead, which is where our loss actually occurs:
+    /// `SQL_C_CHAR` is UTF-8 here, so a fetch can always represent whatever the
+    /// server sent and has nothing to substitute. Recorded as
+    /// parity-deviations entry 22 (AB#47598).
+    pub(crate) warn_on_cp_error: bool,
     /// `SQL_ATTR_CONNECTION_TIMEOUT` in seconds. Stored, not yet honored.
     /// `0` is the ODBC default and means "no timeout".
     pub(crate) connection_timeout: u32,
-    /// `SQL_ATTR_PACKET_SIZE` in bytes. Stored, not yet honored.
+    /// `SQL_ATTR_PACKET_SIZE` in bytes: the app-set attribute (or default),
+    /// surviving `SQLDisconnect` so the next connect attempt on this handle
+    /// starts from it again. Never overwritten with a resolved or negotiated
+    /// value — see [`effective_packet_size`](Self::effective_packet_size).
+    /// `0` is a valid stored value (msodbcsql's "let the connection pick its
+    /// own default" sentinel, exempt from the usual clamp — see
+    /// `set_connect_attr::sql_set_connect_attr_w_impl`); it is resolved to the
+    /// `ClientContext` default at connect time rather than seeded verbatim.
     pub(crate) packet_size: u32,
+    /// The packet size actually resolved for the current connection (attribute
+    /// seed, then any `PacketSize=` override), kept separate from
+    /// [`packet_size`](Self::packet_size) for the same reason as
+    /// [`effective_vendor_settings`](Self::effective_vendor_settings): a
+    /// connection-string keyword must not outlive the connection it came from
+    /// and leak onto the handle's next connect attempt. `None` when
+    /// disconnected; `SQLGetConnectAttr`/`SQLGetInfo` fall back to
+    /// [`packet_size`](Self::packet_size) in that case.
+    pub(crate) effective_packet_size: Option<u32>,
     /// `SQL_ATTR_AUTOCOMMIT`. `true` is the ODBC-mandated default
     /// (msodbcsql `SQL_AUTOCOMMIT_DEFAULT`); `false` selects manual-commit, in
     /// which the driver keeps a transaction open until `SQLEndTran`.
@@ -176,6 +216,43 @@ pub(crate) struct DbcState {
     /// to the connection's existing statements and records it here for future
     /// ones (msodbcsql `sqlcmisc.cpp:2879-2922`, `sqlcfunc.cpp:173`).
     pub(crate) stmt_query_timeout: u32,
+    /// Non-secret identity of the current session, answering `SQLGetInfo`'s
+    /// `SQL_DATA_SOURCE_NAME`, `SQL_SERVER_NAME`, and `SQL_USER_NAME` without a
+    /// round trip. Populated on a successful connect, cleared on disconnect.
+    pub(crate) identity: ConnectionIdentity,
+    /// Last-known database code page for `SQL_COLLATION_SEQ`, refreshed each
+    /// time an execution claims the client. Answers `SQLGetInfo` while a
+    /// data-at-execution sequence has moved the client onto a statement
+    /// (`SQL_NEED_DATA`), when [`client`](Self::client) is `None` but the DBC is
+    /// still connected. A plain code page, so the common path caches without
+    /// allocating. Cleared on disconnect.
+    pub(crate) last_collation_code_page: Option<u16>,
+    /// Legacy `CHARACTER_SET` name paired with
+    /// [`last_collation_code_page`](Self::last_collation_code_page), populated
+    /// only when the code page needs it to name `SQL_COLLATION_SEQ` (so modern
+    /// collation connections never allocate here). Cleared on disconnect.
+    pub(crate) last_char_set: Option<String>,
+}
+
+/// The parts of a connection's identity that `SQLGetInfo` reports back to the
+/// application.
+///
+/// Deliberately holds no credential: the connection string is never retained,
+/// and only the login name is kept, never the password or access token.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct ConnectionIdentity {
+    /// `SQL_DATA_SOURCE_NAME`. Empty for a DSN-less connection, matching
+    /// msodbcsql18.
+    pub(crate) data_source_name: String,
+    /// `SQL_SERVER_NAME`. The instance name the server reported for itself at
+    /// login (`@@SERVERNAME`), falling back to the host that was dialled when
+    /// the login response carried no INFO token.
+    pub(crate) server_name: String,
+    /// `SQL_USER_NAME`. The login the session authenticated as; empty for
+    /// integrated and token authentication, which never supply one. msodbcsql
+    /// instead reports `USER_NAME()`, which it fetches lazily on first use;
+    /// this driver has no way to issue an internal query mid-session.
+    pub(crate) user_name: String,
 }
 
 // Manual `Debug` so the bearer access token is never rendered in logs or panic
@@ -199,6 +276,7 @@ impl std::fmt::Debug for DbcState {
             .field("local_tran_started", &self.local_tran_started)
             .field("current_catalog", &self.current_catalog)
             .field("stmt_query_timeout", &self.stmt_query_timeout)
+            .field("identity", &self.identity)
             .finish()
     }
 }
@@ -213,7 +291,7 @@ impl HasDiagnostics for DbcState {
 }
 
 impl DbcHandle {
-    pub(crate) fn new(parent_env: *mut c_void, runtime: Arc<Runtime>) -> Self {
+    pub(crate) fn new(parent_env: *mut c_void, runtime: Arc<SharedRuntime>) -> Self {
         Self {
             object_type: HandleType::Dbc,
             parent_env,
@@ -230,8 +308,10 @@ impl DbcHandle {
                 effective_vendor_settings: None,
                 login_timeout: None,
                 access_mode: SQL_MODE_READ_WRITE,
+                warn_on_cp_error: false,
                 connection_timeout: 0,
                 packet_size: DEFAULT_PACKET_SIZE,
+                effective_packet_size: None,
                 autocommit: true,
                 txn_isolation: SQL_TXN_READ_COMMITTED,
                 local_tran_started: false,
@@ -239,6 +319,9 @@ impl DbcHandle {
                 reset_generation: 0,
                 current_catalog: None,
                 stmt_query_timeout: 0,
+                identity: ConnectionIdentity::default(),
+                last_collation_code_page: None,
+                last_char_set: None,
             }),
         }
     }

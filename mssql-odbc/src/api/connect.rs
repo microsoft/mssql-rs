@@ -61,6 +61,10 @@ pub(crate) unsafe fn sql_connect_w(
     })
 }
 
+/// # Safety
+/// `connection_handle` must be null or point to a live `DbcHandle`. Each
+/// non-null string pointer must be readable for its paired length in UTF-16
+/// code units, or through a NUL terminator when that length is `SQL_NTS`.
 unsafe fn sql_connect_w_impl(
     connection_handle: SqlHandle,
     server_name: *const SqlWChar,

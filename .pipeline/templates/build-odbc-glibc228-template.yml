@@ -19,6 +19,11 @@ parameters:
   - name: architecture
     type: string
     default: 'x64'
+  # Publish this template's own artifact (disable when the caller does one
+  # combined publish for the whole job, e.g. OneBranch's stages.yml).
+  - name: publishArtifacts
+    type: boolean
+    default: true
 
 steps:
   - script: |
@@ -35,9 +40,10 @@ steps:
       CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN)
       CARGO_REGISTRIES_MSSQL_RS_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_TOKEN)
 
-  - task: PublishPipelineArtifact@1
-    displayName: 'Publish ${{ parameters.artifactName }}'
-    condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
-    inputs:
-      targetPath: '$(Build.SourcesDirectory)/odbc-drop'
-      artifact: ${{ parameters.artifactName }}
+  - ${{ if eq(parameters.publishArtifacts, true) }}:
+    - task: PublishPipelineArtifact@1
+      displayName: 'Publish ${{ parameters.artifactName }}'
+      condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+      inputs:
+        targetPath: '$(Build.SourcesDirectory)/odbc-drop'
+        artifact: ${{ parameters.artifactName }}

@@ -44,7 +44,6 @@ use tracing::warn;
 const KNOWN_IGNORED_KEYS: &[&str] = &[
     "savefile",
     "filedsn",
-    "dsn",
     "description",
     "desc",
     "driver",
@@ -125,6 +124,7 @@ const AUTHENTICATION_VALUES: &[&str] = &[
 
 #[derive(Copy, Clone)]
 enum ConnAttrKey {
+    Dsn,
     Server,
     Database,
     Uid,
@@ -194,6 +194,7 @@ impl fmt::Display for InvalidAttrValue {
 /// Parsed connection parameters extracted from an ODBC connection string.
 #[derive(Clone, Default)]
 pub(crate) struct ConnectionParams {
+    pub(crate) dsn: String,
     pub(crate) server: String,
     pub(crate) database: String,
     pub(crate) uid: String,
@@ -220,6 +221,9 @@ impl ConnectionParams {
     pub(crate) fn fmt_as_odbc_conn_str(&self) -> String {
         let mut parts = Vec::new();
 
+        if !self.dsn.is_empty() {
+            parts.push(format!("DSN={}", quote_odbc_value(&self.dsn)));
+        }
         if !self.server.is_empty() {
             parts.push(format!("Server={}", quote_odbc_value(&self.server)));
         }
@@ -313,6 +317,7 @@ fn quote_odbc_value(value: &str) -> String {
 impl fmt::Debug for ConnectionParams {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ConnectionParams")
+            .field("dsn", &self.dsn)
             .field("server", &self.server)
             .field("database", &self.database)
             .field("uid", &self.uid)
@@ -367,6 +372,7 @@ fn is_odbc_space(c: char) -> bool {
 /// a key still requires a matching `ConnectionParams` field plus arms in
 /// `assign_value` (compiler-enforced), `fmt_as_odbc_conn_str`, and the `Debug` impl.
 const MAPPED_KEYS: &[(&str, ConnAttrKey)] = &[
+    ("dsn", ConnAttrKey::Dsn),
     ("server", ConnAttrKey::Server),
     ("addr", ConnAttrKey::Server),
     ("address", ConnAttrKey::Server),
@@ -412,6 +418,9 @@ fn assign_value(
     value: &str,
 ) -> Result<(), InvalidAttrValue> {
     match slot {
+        // The DSN's stored attributes are not resolved yet (see `SQLConnect`);
+        // the name is kept only to answer `SQLGetInfo(SQL_DATA_SOURCE_NAME)`.
+        ConnAttrKey::Dsn => params.dsn = value.to_string(),
         // The server/addr/address group is resolved in `parse_connection_string`
         // (Address takes precedence over Server), so this arm is never reached; it
         // only keeps the match exhaustive.

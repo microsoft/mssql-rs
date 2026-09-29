@@ -3,6 +3,8 @@
 
 //! Implementation of SQLAllocHandle — the ODBC handle allocation entry point.
 
+use std::sync::Arc;
+
 use tracing::{debug, error};
 
 use crate::api::odbc_types::{
@@ -10,6 +12,7 @@ use crate::api::odbc_types::{
     SQL_HANDLE_STMT, SQL_INVALID_HANDLE, SQL_NULL_HANDLE, SQL_SUCCESS, SqlHandle, SqlReturn,
     SqlSmallInt,
 };
+use crate::api::sqlstate::{ERR_ODBC_VERSION_NOT_SET, post_diag};
 use crate::error::free_errors;
 use crate::handles::desc::DescKind;
 use crate::handles::{
@@ -114,14 +117,30 @@ unsafe fn alloc_dbc(input_handle: SqlHandle, output_handle: *mut SqlHandle) -> S
     };
     free_errors(&mut env_state);
 
-    // DM enforces SQL_ATTR_ODBC_VERSION is set before SQLAllocConnect (HY010).
-    // We assert this in debug builds only.
-    debug_assert!(
-        env_state.odbc_version != OdbcVersion::Unset,
-        "SQLAllocHandle(DBC): SQL_ATTR_ODBC_VERSION not set on env"
-    );
+    // The version can legitimately still be `Unset` here, and it must not be
+    // treated as an internal invariant. A 2.x application declares
+    // `SQL_OV_ODBC2`, the Driver Manager stores it and answers the
+    // application, then forwards it to this driver — the DM does not map 2.x
+    // onto 3.x on the driver's behalf. This driver rejects it with `HY024`,
+    // so nothing is recorded, and the DM then allocates the connection anyway.
+    //
+    // Refuse here rather than proceeding. Continuing would hand a 2.x
+    // application the 3.x contract it did not ask for — `COLUMN_SIZE` where it
+    // expects `PRECISION`, `91`/`92`/`93` where it expects `9`/`10`/`11` — and
+    // it would read those as if they were its own. This is a deliberate
+    // divergence: msodbcsql serves such an application (`SQLAllocConnect`
+    // asserts in debug builds only, `odbc/sqlcconn.cpp:527`), because it
+    // accepts the 2.x declaration in the first place. Registry entry 14.
+    if env_state.odbc_version == OdbcVersion::Unset {
+        // Log the diagnostic's own text, not a paraphrase: on the Driver
+        // Manager path the application never sees it (the DM substitutes
+        // IM005), so tracing is the only place the reason survives.
+        error!("SQLAllocHandle(DBC): {}", ERR_ODBC_VERSION_NOT_SET.text);
+        post_diag(&mut env_state, ERR_ODBC_VERSION_NOT_SET);
+        return SQL_ERROR;
+    }
 
-    let dbc = Box::new(DbcHandle::new(input_handle, env.runtime.clone()));
+    let dbc = Box::new(DbcHandle::new(input_handle, Arc::clone(&env.runtime)));
     let raw = handle_to_raw(dbc);
     env_state.connections.push(raw);
 
@@ -239,9 +258,10 @@ mod tests {
 
     use super::*;
     use crate::api::free_handle::sql_free_handle;
-    use crate::api::odbc_types::{SQL_ATTR_ODBC_VERSION, SQL_OV_ODBC3_80};
+    use crate::api::odbc_types::{SQL_ATTR_ODBC_VERSION, SQL_OV_ODBC3, SQL_OV_ODBC3_80};
     use crate::api::set_env_attr::sql_set_env_attr;
-    use crate::handles::{HandleType, free_handle};
+    use crate::handles::{HandleType, free_handle, handle_from_raw};
+    use crate::test_support::TestHandles;
 
     /// Helper: alloc env and set ODBC version so DBC allocation is permitted.
     fn alloc_env_v3_80() -> SqlHandle {
@@ -258,6 +278,43 @@ mod tests {
         };
         assert_eq!(ret, SQL_SUCCESS);
         env
+    }
+
+    /// A 2.x application's `SQL_OV_ODBC2` is rejected by `SQLSetEnvAttr`, so
+    /// nothing is recorded on the environment — and the Driver Manager still
+    /// asks the driver for a connection. Refuse it with `HY010` rather than
+    /// serving a 3.x contract the application never asked for. Anchors
+    /// `SetEnvAttrTest.Odbc2ApplicationIsRefused` in the e2e suite.
+    #[test]
+    fn alloc_dbc_is_refused_when_no_odbc_version_was_recorded() {
+        let h = TestHandles::with_unset_env();
+        let env = unsafe { handle_from_raw::<EnvHandle>(h.env) };
+        assert_eq!(
+            env.inner.lock().unwrap().odbc_version,
+            OdbcVersion::Unset,
+            "precondition: no version recorded"
+        );
+
+        let mut dbc: SqlHandle = ptr::null_mut();
+        assert_eq!(
+            unsafe { sql_alloc_handle(SQL_HANDLE_DBC, h.env, &mut dbc) },
+            SQL_ERROR
+        );
+        assert!(dbc.is_null(), "no connection handle may be handed back");
+        assert_eq!(
+            env.inner.lock().unwrap().diag_records[0].sql_state,
+            *b"HY010"
+        );
+    }
+
+    /// The refusal above must be keyed on the declared version, not on the
+    /// environment being fresh: both supported versions still allocate.
+    #[test]
+    fn alloc_dbc_succeeds_for_every_supported_odbc_version() {
+        for version in [SQL_OV_ODBC3, SQL_OV_ODBC3_80] {
+            let h = TestHandles::with_env_dbc_version(version);
+            assert!(!h.dbc.is_null(), "{version} must allocate a connection");
+        }
     }
 
     #[test]

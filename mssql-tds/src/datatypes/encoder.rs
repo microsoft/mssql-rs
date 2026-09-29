@@ -1,14 +1,11 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-use async_trait::async_trait;
-
 use crate::{
     core::TdsResult, datatypes::sqltypes::SqlType, io::packet_writer::PacketWriter,
     message::parameters::rpc_parameters::RpcTypeMetadata, token::tokens::SqlCollation,
 };
 
-#[async_trait]
 pub(crate) trait SqlValueEncoder {
     async fn encode_sqlvalue(
         &self,
@@ -27,7 +24,6 @@ impl GenericEncoder {
     }
 }
 
-#[async_trait]
 impl SqlValueEncoder for GenericEncoder {
     async fn encode_sqlvalue(
         &self,

@@ -5,6 +5,7 @@
 
 use bytes::{BufMut, BytesMut};
 use std::collections::HashMap;
+use std::time::Duration;
 
 /// SQL data types supported by the mock server
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -19,6 +20,12 @@ pub enum SqlDataType {
     BigInt,
     /// NVarChar - UTF16 string
     NVarChar,
+    /// NVarChar(MAX) with caller-chosen PLP chunk boundaries.
+    NVarCharMax,
+    /// VarChar(MAX) with caller-chosen PLP chunk boundaries and column collation.
+    VarCharMax,
+    /// VarBinary(MAX) with caller-chosen PLP chunk boundaries.
+    VarBinaryMax,
 }
 
 impl SqlDataType {
@@ -29,7 +36,9 @@ impl SqlDataType {
             SqlDataType::SmallInt => 0x26, // IntN with length 2
             SqlDataType::Int => 0x26,      // IntN with length 4
             SqlDataType::BigInt => 0x26,   // IntN with length 8
-            SqlDataType::NVarChar => 0xE7, // NVarCharType
+            SqlDataType::NVarChar | SqlDataType::NVarCharMax => 0xE7, // NVarCharType
+            SqlDataType::VarCharMax => 0xA7,
+            SqlDataType::VarBinaryMax => 0xA5,
         }
     }
 
@@ -40,7 +49,8 @@ impl SqlDataType {
             SqlDataType::SmallInt => 2,
             SqlDataType::Int => 4,
             SqlDataType::BigInt => 8,
-            SqlDataType::NVarChar => 255, // Handled specially
+            SqlDataType::NVarChar | SqlDataType::NVarCharMax => 255, // Handled specially
+            SqlDataType::VarCharMax | SqlDataType::VarBinaryMax => 255,
         }
     }
 }
@@ -53,6 +63,14 @@ pub enum ColumnValue {
     Int(i32),
     BigInt(i64),
     NVarChar(String),
+    /// Nonempty wire chunks of raw UTF-16 units, including malformed sequences.
+    NVarCharMax(Vec<Vec<u16>>),
+    /// SQL_PLP_NULL for an nvarchar(max) column, without a chunk terminator.
+    NVarCharMaxNull,
+    /// Nonempty chunks of bytes encoded in the column's collation.
+    VarCharMax(Vec<Vec<u8>>),
+    /// Nonempty chunks of opaque bytes.
+    VarBinaryMax(Vec<Vec<u8>>),
     Null,
 }
 
@@ -65,6 +83,9 @@ impl ColumnValue {
             ColumnValue::Int(_) => SqlDataType::Int,
             ColumnValue::BigInt(_) => SqlDataType::BigInt,
             ColumnValue::NVarChar(_) => SqlDataType::NVarChar,
+            ColumnValue::NVarCharMax(_) | ColumnValue::NVarCharMaxNull => SqlDataType::NVarCharMax,
+            ColumnValue::VarCharMax(_) => SqlDataType::VarCharMax,
+            ColumnValue::VarBinaryMax(_) => SqlDataType::VarBinaryMax,
             ColumnValue::Null => SqlDataType::Int, // Default to Int for NULL
         }
     }
@@ -96,6 +117,29 @@ impl ColumnValue {
                 buf.put_u16_le(utf16_bytes.len() as u16);
                 buf.put_slice(&utf16_bytes);
             }
+            ColumnValue::NVarCharMax(chunks) => {
+                let total: u64 = chunks.iter().map(|chunk| chunk.len() as u64 * 2).sum();
+                buf.put_u64_le(total);
+                for chunk in chunks {
+                    assert!(!chunk.is_empty(), "an empty PLP chunk ends the value");
+                    buf.put_u32_le((chunk.len() * 2).try_into().expect("PLP chunk length"));
+                    for unit in chunk {
+                        buf.put_u16_le(*unit);
+                    }
+                }
+                buf.put_u32_le(0);
+            }
+            ColumnValue::NVarCharMaxNull => buf.put_u64_le(u64::MAX),
+            ColumnValue::VarCharMax(chunks) | ColumnValue::VarBinaryMax(chunks) => {
+                let total: u64 = chunks.iter().map(|chunk| chunk.len() as u64).sum();
+                buf.put_u64_le(total);
+                for chunk in chunks {
+                    assert!(!chunk.is_empty(), "an empty PLP chunk ends the value");
+                    buf.put_u32_le(chunk.len().try_into().expect("PLP chunk length"));
+                    buf.put_slice(chunk);
+                }
+                buf.put_u32_le(0);
+            }
             ColumnValue::Null => {
                 buf.put_u8(0); // Length 0 means NULL for IntN
             }
@@ -108,6 +152,8 @@ impl ColumnValue {
 pub struct ColumnDefinition {
     pub name: String,
     pub data_type: SqlDataType,
+    /// TDS collation bytes for string columns; ignored for other types.
+    pub collation: [u8; 5],
 }
 
 impl ColumnDefinition {
@@ -116,6 +162,7 @@ impl ColumnDefinition {
         Self {
             name: name.into(),
             data_type,
+            collation: [0x09, 0x04, 0xD0, 0x00, 0x34], // SQL_Latin1_General_CP1_CI_AS
         }
     }
 }
@@ -184,6 +231,29 @@ impl LeadingError {
     }
 }
 
+/// A server error that ends the batch immediately, with no result set at all.
+///
+/// Models a statement failing outright before producing a row set — for
+/// example SQL Server error 1222 ("Lock request time out period exceeded") on
+/// a `SELECT` blocked behind another session's lock. Unlike [`LeadingError`],
+/// no ColMetadata/Row/DONE follows: the ERROR token's DONE is itself terminal.
+#[derive(Debug, Clone)]
+pub struct TerminalError {
+    pub number: u32,
+    pub severity: u8,
+    pub message: String,
+}
+
+impl TerminalError {
+    pub fn new(number: u32, severity: u8, message: impl Into<String>) -> Self {
+        Self {
+            number,
+            severity,
+            message: message.into(),
+        }
+    }
+}
+
 /// A complete query response definition
 #[derive(Debug, Clone)]
 pub struct QueryResponse {
@@ -193,6 +263,12 @@ pub struct QueryResponse {
     /// An error emitted (with a DONE MORE token) before the result set, so the
     /// server keeps streaming the row set after a statement-scoped error.
     pub leading_error: Option<LeadingError>,
+    /// An error that ends the batch immediately, in place of `columns`/`rows`.
+    /// Takes precedence over `leading_error` when both are set.
+    pub terminal_error: Option<TerminalError>,
+    /// Artificial delay before the server sends this response, simulating a
+    /// slow-to-resolve statement (e.g. blocked on a server-side lock).
+    pub delay: Option<Duration>,
 }
 
 impl QueryResponse {
@@ -203,6 +279,8 @@ impl QueryResponse {
             rows,
             info_tokens: Vec::new(),
             leading_error: None,
+            terminal_error: None,
+            delay: None,
         }
     }
 
@@ -218,6 +296,26 @@ impl QueryResponse {
         self
     }
 
+    /// Replaces any result set with a single error that ends the batch, e.g.
+    /// to model a blocked statement that fails with SQL Server error 1222.
+    pub fn error_only(error: TerminalError) -> Self {
+        Self {
+            columns: Vec::new(),
+            rows: Vec::new(),
+            info_tokens: Vec::new(),
+            leading_error: None,
+            terminal_error: Some(error),
+            delay: None,
+        }
+    }
+
+    /// Delays the server's response by `duration`, simulating a statement
+    /// that blocks (e.g. on a row lock) before the server can answer it.
+    pub fn with_delay(mut self, duration: Duration) -> Self {
+        self.delay = Some(duration);
+        self
+    }
+
     /// Helper to create a response for SELECT 1
     pub fn select_one() -> Self {
         Self {
@@ -225,6 +323,8 @@ impl QueryResponse {
             rows: vec![Row::new(vec![ColumnValue::Int(1)])],
             info_tokens: Vec::new(),
             leading_error: None,
+            terminal_error: None,
+            delay: None,
         }
     }
 
@@ -243,13 +343,41 @@ impl QueryResponse {
             ])],
             info_tokens: Vec::new(),
             leading_error: None,
+            terminal_error: None,
+            delay: None,
         }
     }
 }
 
+/// Reserved [`QueryRegistry`] key that delays the mock server's answer to a
+/// TDS Transaction Manager `Begin` request (the implicit transaction begin an
+/// autocommit-off connection issues before its first statement). Not a SQL
+/// query, so it can never collide with a real registration; only its
+/// [`QueryResponse::delay`] is consulted — its result-set/error fields are
+/// ignored, since `Begin` always acknowledges with an `EnvChange` + `DONE`.
+pub const TM_BEGIN_DELAY_KEY: &str = "__MOCK_TDS_TM_BEGIN_DELAY__";
+
+/// Reserved [`QueryRegistry`] key that delays the mock server's answer to an
+/// RPC request that matched no specific registration.
+///
+/// RPC responses are otherwise matched by finding the registered (upper-cased)
+/// query text inside the request body, which works for `sp_prepexec`-style
+/// calls that carry caller-controlled SQL. It cannot address a call whose
+/// wire text the test does not choose — a catalog procedure, `sp_datatype_info`
+/// or `sp_describe_undeclared_parameters` — because the driver sends those
+/// proc names in lower case. This key delays those instead, so a test can
+/// prove `SQL_ATTR_QUERY_TIMEOUT` bounds the RPC itself rather than only the
+/// steps around it. Like [`TM_BEGIN_DELAY_KEY`], only its
+/// [`QueryResponse::delay`] is consulted.
+pub const RPC_DELAY_KEY: &str = "__MOCK_TDS_RPC_DELAY__";
+
 /// Registry of query responses
 pub struct QueryRegistry {
     responses: HashMap<String, QueryResponse>,
+    /// Info tokens emitted after a registered response's last row. Kept beside
+    /// the response rather than inside it so `QueryResponse` stays
+    /// literal-constructible by existing callers.
+    trailing_info: HashMap<String, Vec<InfoMessage>>,
 }
 
 impl QueryRegistry {
@@ -257,6 +385,7 @@ impl QueryRegistry {
     pub fn new() -> Self {
         let mut registry = Self {
             responses: HashMap::new(),
+            trailing_info: HashMap::new(),
         };
 
         // Add default responses
@@ -270,14 +399,90 @@ impl QueryRegistry {
     }
 
     /// Register a query response
+    ///
+    /// Replaces any previous registration for `query`, including trailing info
+    /// tokens set by [`register_with_trailing_info`](Self::register_with_trailing_info):
+    /// leaving those behind would pair a new response with the old warnings.
     pub fn register(&mut self, query: impl Into<String>, response: QueryResponse) {
         let query = query.into().to_uppercase();
-        self.responses.insert(query, response);
+        self.responses.insert(query.clone(), response);
+        self.trailing_info.remove(&query);
+    }
+
+    /// Register a query response whose info tokens are emitted *after* the
+    /// last row, before the terminal DONE — where SQL Server puts an aggregate
+    /// warning such as 8153. Unlike [`QueryResponse::with_info_tokens`], which
+    /// sends them between ColMetadata and the rows, these are only reachable
+    /// once a reader has consumed every row, so they exercise a driver's
+    /// terminal read-ahead rather than its execute path.
+    ///
+    /// Held here rather than on [`QueryResponse`] so that adding it cannot
+    /// invalidate an existing `QueryResponse` struct literal.
+    ///
+    /// Like [`register`](Self::register), this replaces any previous
+    /// registration for `query`.
+    pub fn register_with_trailing_info(
+        &mut self,
+        query: impl Into<String>,
+        response: QueryResponse,
+        trailing_info: Vec<InfoMessage>,
+    ) {
+        let query = query.into().to_uppercase();
+        self.register(query.clone(), response);
+        if !trailing_info.is_empty() {
+            self.trailing_info.insert(query, trailing_info);
+        }
     }
 
     /// Get a response for a query
     pub fn get(&self, query: &str) -> Option<&QueryResponse> {
         self.responses.get(&query.to_uppercase())
+    }
+
+    /// The info tokens registered to follow this query's last row, if any.
+    pub fn trailing_info(&self, query: &str) -> &[InfoMessage] {
+        self.trailing_info
+            .get(&query.to_uppercase())
+            .map_or(&[], Vec::as_slice)
+    }
+
+    /// Finds a registered response whose query text appears — encoded as
+    /// UTF-16LE, matching the wire encoding of an RPC string parameter —
+    /// anywhere inside `haystack`.
+    ///
+    /// Used to match `sp_prepexec` / `sp_execute` RPC requests (whose `@stmt`
+    /// / declared SQL text carries the query verbatim) without needing a full
+    /// RPC parameter parser: the mock server only needs to recognize a
+    /// specific, test-registered statement, not decode arbitrary parameters.
+    ///
+    /// The comparison is byte-exact against the *uppercased* registered
+    /// query (matching `register`'s case-insensitive key), so callers using
+    /// this path must register and send the same-case (conventionally
+    /// upper-case) SQL text — unlike [`get`](Self::get), which decodes and
+    /// uppercases the incoming text before comparing.
+    pub fn get_by_contained_utf16_text(&self, haystack: &[u8]) -> Option<&QueryResponse> {
+        self.get_by_contained_utf16_text_with_trailing_info(haystack)
+            .map(|(response, _)| response)
+    }
+
+    /// [`get_by_contained_utf16_text`](Self::get_by_contained_utf16_text),
+    /// also returning any info tokens registered to follow the last row.
+    pub fn get_by_contained_utf16_text_with_trailing_info(
+        &self,
+        haystack: &[u8],
+    ) -> Option<(&QueryResponse, &[InfoMessage])> {
+        self.responses.iter().find_map(|(query, response)| {
+            let needle: Vec<u8> = query
+                .encode_utf16()
+                .flat_map(|unit| unit.to_le_bytes())
+                .collect();
+            (!needle.is_empty() && haystack.windows(needle.len()).any(|w| w == needle)).then(|| {
+                (
+                    response,
+                    self.trailing_info.get(query).map_or(&[][..], Vec::as_slice),
+                )
+            })
+        })
     }
 }
 
@@ -316,6 +521,12 @@ mod tests {
         assert_eq!(&buf[..], &[0]);
         buf.clear();
 
+        let null_plp = ColumnValue::NVarCharMaxNull;
+        assert_eq!(null_plp.data_type(), SqlDataType::NVarCharMax);
+        null_plp.write_to_buffer(&mut buf);
+        assert_eq!(&buf[..], &[0xFF; 8]);
+        buf.clear();
+
         let nvarchar_val = ColumnValue::NVarChar("test".to_string());
         assert_eq!(nvarchar_val.data_type(), SqlDataType::NVarChar);
         nvarchar_val.write_to_buffer(&mut buf);
@@ -344,5 +555,48 @@ mod tests {
             .expect("registered query response should be available");
         assert_eq!(resp.columns.len(), 1);
         assert_eq!(resp.rows.len(), 1);
+    }
+
+    /// `register` replaces a previous registration, so it has to drop that
+    /// key's trailing info too. Otherwise a plain re-registration silently
+    /// inherits the earlier warnings and the mock emits them after a response
+    /// that never asked for them.
+    #[test]
+    fn plain_register_clears_trailing_info_from_a_previous_registration() {
+        let mut registry = QueryRegistry::new();
+        registry.register_with_trailing_info(
+            "SELECT trailing",
+            QueryResponse::select_one(),
+            vec![InfoMessage::new(8153, 10, "aggregate warning")],
+        );
+        assert_eq!(registry.trailing_info("SELECT trailing").len(), 1);
+
+        registry.register("SELECT trailing", QueryResponse::select_one());
+
+        assert!(
+            registry.trailing_info("SELECT trailing").is_empty(),
+            "the replacing response must not inherit the old warnings"
+        );
+    }
+
+    /// The same key re-registered with new trailing info must carry only the
+    /// new messages, not both sets.
+    #[test]
+    fn re_registering_trailing_info_replaces_rather_than_accumulates() {
+        let mut registry = QueryRegistry::new();
+        registry.register_with_trailing_info(
+            "SELECT trailing",
+            QueryResponse::select_one(),
+            vec![InfoMessage::new(8153, 10, "first")],
+        );
+        registry.register_with_trailing_info(
+            "SELECT trailing",
+            QueryResponse::select_one(),
+            vec![InfoMessage::new(8154, 10, "second")],
+        );
+
+        let trailing = registry.trailing_info("SELECT trailing");
+        assert_eq!(trailing.len(), 1);
+        assert_eq!(trailing[0].number, 8154);
     }
 }

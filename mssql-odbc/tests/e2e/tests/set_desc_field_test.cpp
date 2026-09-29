@@ -12,6 +12,12 @@
 //   6. InvalidCTypeOnApdReturnsError - unrecognized ValueType on APD -> SQL_ERROR / HY003
 //   7. NumericPrecisionOutOfRangeReturnsError - SQL_C_NUMERIC precision outside
 //      1..=38 -> SQL_ERROR / HY094
+//   8. ChangingTypeToNumericThroughArdUnbindsData - the ARD half of
+//      ChangingTypeToNumericResetsDefaultsAndUnbindsData: retyping an
+//      already-bound fetch column through the implicit ARD unbinds it too.
+//   9. ChangingTypeToNumericThroughExplicitDescUsedAsArdUnbindsData - same,
+//      but through an explicitly allocated descriptor associated as the ARD
+//      via SQL_ATTR_APP_ROW_DESC (PR #521 review thread PRRT_kwDOPLFXwM6gzXDQ).
 
 #include "odbc_test_fixture.h"
 
@@ -36,6 +42,13 @@ protected:
     SQLHDESC AppParamDesc() {
         SQLHDESC hdesc = SQL_NULL_HDESC;
         EXPECT_SQL_OK(SQLGetStmtAttrW(stmt_, SQL_ATTR_APP_PARAM_DESC, &hdesc, 0, nullptr),
+                      SQL_HANDLE_STMT, stmt_);
+        return hdesc;
+    }
+
+    SQLHDESC AppRowDesc() {
+        SQLHDESC hdesc = SQL_NULL_HDESC;
+        EXPECT_SQL_OK(SQLGetStmtAttrW(stmt_, SQL_ATTR_APP_ROW_DESC, &hdesc, 0, nullptr),
                       SQL_HANDLE_STMT, stmt_);
         return hdesc;
     }
@@ -89,6 +102,103 @@ TEST_F(SetDescFieldLiveTest, MssqlPythonNumericParameterSequence) {
         SQLGetDescFieldW(hdesc, 1, SQL_DESC_DATA_PTR, &data_ptr, sizeof(data_ptr), nullptr),
         SQL_HANDLE_DESC, hdesc);
     EXPECT_EQ(static_cast<void*>(&numeric_buf), data_ptr);
+}
+
+TEST_F(SetDescFieldLiveTest, ChangingTypeToNumericResetsDefaultsAndUnbindsData) {
+    SQLHDESC hdesc = AppParamDesc();
+    SQLINTEGER old_value = 7;
+    ASSERT_SQL_OK(
+        SQLSetDescFieldW(hdesc, 1, SQL_DESC_TYPE,
+                         reinterpret_cast<SQLPOINTER>(static_cast<SQLLEN>(SQL_C_LONG)), 0),
+        SQL_HANDLE_DESC, hdesc);
+    ASSERT_SQL_OK(SQLSetDescFieldW(hdesc, 1, SQL_DESC_DATA_PTR, &old_value, 0),
+                  SQL_HANDLE_DESC, hdesc);
+
+    ASSERT_SQL_OK(
+        SQLSetDescFieldW(hdesc, 1, SQL_DESC_TYPE,
+                         reinterpret_cast<SQLPOINTER>(static_cast<SQLLEN>(SQL_C_NUMERIC)), 0),
+        SQL_HANDLE_DESC, hdesc);
+
+    SQLPOINTER data_ptr = &old_value;
+    ASSERT_SQL_OK(
+        SQLGetDescFieldW(hdesc, 1, SQL_DESC_DATA_PTR, &data_ptr, sizeof(data_ptr), nullptr),
+        SQL_HANDLE_DESC, hdesc);
+    EXPECT_EQ(nullptr, data_ptr);
+    EXPECT_EQ(38, GetSmallInt(hdesc, 1, SQL_DESC_PRECISION));
+    EXPECT_EQ(0, GetSmallInt(hdesc, 1, SQL_DESC_SCALE));
+}
+
+// The ARD half of ChangingTypeToNumericResetsDefaultsAndUnbindsData:
+// msodbcsql's SQL_DESC_TYPE/CONCISE_TYPE handler resets `rgbValue` to
+// `NOT_BOUND` and calls `SetTypeDefaults` for every `ObjectType ==
+// SQL_HANDLE_AD` record (sqlcdesc.cpp:1736-1740), and that one object type
+// covers the ARD exactly as it does the APD (sqlsrv.h:542) -- retail never
+// special-cases APD over ARD here. Retyping an already-bound fetch column
+// through the ARD unbinds it too, and the fetch that follows must not write
+// through the stale pointer.
+TEST_F(SetDescFieldLiveTest, ChangingTypeToNumericThroughArdUnbindsData) {
+    ExecDirect("SELECT 1 AS v");
+
+    SQLINTEGER old_value = 7;
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_LONG, &old_value, sizeof(old_value), nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+
+    SQLHDESC hdesc = AppRowDesc();
+    ASSERT_SQL_OK(
+        SQLSetDescFieldW(hdesc, 1, SQL_DESC_TYPE,
+                         reinterpret_cast<SQLPOINTER>(static_cast<SQLLEN>(SQL_C_NUMERIC)), 0),
+        SQL_HANDLE_DESC, hdesc);
+
+    SQLPOINTER data_ptr = &old_value;
+    ASSERT_SQL_OK(
+        SQLGetDescFieldW(hdesc, 1, SQL_DESC_DATA_PTR, &data_ptr, sizeof(data_ptr), nullptr),
+        SQL_HANDLE_DESC, hdesc);
+    EXPECT_EQ(nullptr, data_ptr);
+    EXPECT_EQ(38, GetSmallInt(hdesc, 1, SQL_DESC_PRECISION));
+    EXPECT_EQ(0, GetSmallInt(hdesc, 1, SQL_DESC_SCALE));
+
+    // The unbound column no longer writes through the stale pointer.
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(7, old_value) << "an unbound column must not write through the stale pointer";
+    SQLFreeStmt(stmt_, SQL_UNBIND);
+    SQLCloseCursor(stmt_);
+}
+
+// Same as above, but through an explicitly allocated descriptor associated as
+// the ARD via SQL_ATTR_APP_ROW_DESC: `DescKind::Ad` is the kind such a
+// descriptor carries regardless of which role (ARD or APD) it is currently
+// plugged into (PR #521 review thread PRRT_kwDOPLFXwM6gzXDQ).
+TEST_F(SetDescFieldLiveTest, ChangingTypeToNumericThroughExplicitDescUsedAsArdUnbindsData) {
+    ExecDirect("SELECT 1 AS v");
+
+    SQLHDESC hdesc = SQL_NULL_HDESC;
+    ASSERT_SQL_OK(SQLAllocHandle(SQL_HANDLE_DESC, dbc_, &hdesc), SQL_HANDLE_DBC, dbc_);
+    ASSERT_SQL_OK(SQLSetStmtAttrW(stmt_, SQL_ATTR_APP_ROW_DESC, hdesc, 0), SQL_HANDLE_STMT,
+                  stmt_);
+
+    SQLINTEGER old_value = 7;
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_LONG, &old_value, sizeof(old_value), nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_SQL_OK(
+        SQLSetDescFieldW(hdesc, 1, SQL_DESC_TYPE,
+                         reinterpret_cast<SQLPOINTER>(static_cast<SQLLEN>(SQL_C_NUMERIC)), 0),
+        SQL_HANDLE_DESC, hdesc);
+
+    SQLPOINTER data_ptr = &old_value;
+    ASSERT_SQL_OK(
+        SQLGetDescFieldW(hdesc, 1, SQL_DESC_DATA_PTR, &data_ptr, sizeof(data_ptr), nullptr),
+        SQL_HANDLE_DESC, hdesc);
+    EXPECT_EQ(nullptr, data_ptr);
+
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(7, old_value) << "an unbound column must not write through the stale pointer";
+    SQLFreeStmt(stmt_, SQL_UNBIND);
+    SQLCloseCursor(stmt_);
+
+    ASSERT_SQL_OK(SQLSetStmtAttrW(stmt_, SQL_ATTR_APP_ROW_DESC, SQL_NULL_HDESC, 0),
+                  SQL_HANDLE_STMT, stmt_);
+    SQLFreeHandle(SQL_HANDLE_DESC, hdesc);
 }
 
 TEST_F(SetDescFieldLiveTest, CountGrowsAndShrinks) {

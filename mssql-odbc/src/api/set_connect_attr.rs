@@ -13,6 +13,7 @@
 use tracing::{debug, error};
 
 use super::current_catalog::set_current_catalog;
+use super::driver_connect::{MAX_PACKET_SIZE, MIN_PACKET_SIZE};
 use super::set_stmt_attr::clamp_query_timeout;
 use super::sqlstate::*;
 use super::txn::{reset_connection, set_autocommit, set_txn_isolation};
@@ -22,9 +23,9 @@ use crate::api::odbc_types::{
     SQL_ATTR_CURRENT_CATALOG, SQL_ATTR_LOGIN_TIMEOUT, SQL_ATTR_PACKET_SIZE, SQL_ATTR_QUERY_TIMEOUT,
     SQL_ATTR_RESET_CONNECTION, SQL_ATTR_TXN_ISOLATION, SQL_COPT_SS_ACCESS_TOKEN,
     SQL_COPT_SS_ENCRYPT, SQL_COPT_SS_INTEGRATED_SECURITY, SQL_COPT_SS_RESET_CONNECTION,
-    SQL_COPT_SS_TRUST_SERVER_CERTIFICATE, SQL_COPT_SS_TXN_ISOLATION, SQL_EN_OFF, SQL_EN_ON,
-    SQL_EN_STRICT, SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle,
-    SqlInteger, SqlPointer, SqlReturn,
+    SQL_COPT_SS_TRUST_SERVER_CERTIFICATE, SQL_COPT_SS_TXN_ISOLATION, SQL_COPT_SS_WARN_ON_CP_ERROR,
+    SQL_EN_OFF, SQL_EN_ON, SQL_EN_STRICT, SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS,
+    SQL_SUCCESS_WITH_INFO, SQL_WARN_NO, SQL_WARN_YES, SqlHandle, SqlInteger, SqlPointer, SqlReturn,
 };
 #[cfg(not(windows))]
 use crate::api::odbc_types::{SQL_NTS, SYSNAMELEN, SqlWChar};
@@ -48,7 +49,7 @@ const MAX_LOGIN_TIMEOUT_SECS: u64 = 0xfffe;
 /// # Safety
 /// - `connection_handle` must be a valid `DbcHandle` from `SQLAllocHandle`.
 /// - For `SQL_COPT_SS_ACCESS_TOKEN`, `value_ptr` must point to an ACCESSTOKEN
-///   struct: a 4-byte little-endian length prefix followed by that many bytes
+///   struct: a 4-byte native-endian length prefix followed by that many bytes
 ///   of the UTF-16-LE-encoded access token.
 /// - For `SQL_ATTR_CURRENT_CATALOG`, `value_ptr` must point to `string_length`
 ///   readable bytes of UTF-16, or to a NUL-terminated wide string when
@@ -77,6 +78,13 @@ pub(crate) unsafe fn sql_set_connect_attr_w(
 /// the target driver as ANSI bytes. Once the driver is loaded, it prefers the
 /// unsuffixed setter for replay. The native Linux msodbcsql driver exports this
 /// symbol alongside `SQLSetConnectAttrW` for the same path.
+///
+/// # Safety
+/// `connection_handle` must be null or point to a live `DbcHandle`. For
+/// `SQL_ATTR_CURRENT_CATALOG`, `value_ptr` must be readable for `string_length`
+/// bytes, or through a NUL terminator when `string_length` is `SQL_NTS`. Other
+/// attributes must satisfy the corresponding `SQLSetConnectAttrW` pointer
+/// contract.
 #[cfg(not(windows))]
 pub(crate) unsafe fn sql_set_connect_attr(
     connection_handle: SqlHandle,
@@ -102,6 +110,12 @@ fn requires_ansi_transcoding(attribute: SqlInteger) -> bool {
     matches!(attribute, SQL_ATTR_CURRENT_CATALOG)
 }
 
+/// # Safety
+/// `connection_handle` must be null or point to a live `DbcHandle`. For
+/// `SQL_ATTR_CURRENT_CATALOG`, `value_ptr` must be readable for `string_length`
+/// bytes, or through a NUL terminator when `string_length` is `SQL_NTS`. Other
+/// attributes must satisfy the corresponding `SQLSetConnectAttrW` pointer
+/// contract.
 #[cfg(not(windows))]
 unsafe fn sql_set_connect_attr_impl(
     connection_handle: SqlHandle,
@@ -144,6 +158,12 @@ unsafe fn sql_set_connect_attr_impl(
     }
 }
 
+/// # Safety
+/// `connection_handle` must be null or point to a live `DbcHandle`. For
+/// `SQL_COPT_SS_ACCESS_TOKEN`, `value_ptr` must point to a four-byte
+/// native-endian length followed by that many readable token bytes. For
+/// `SQL_ATTR_CURRENT_CATALOG`, it must be readable for `string_length` bytes of
+/// UTF-16, or through a NUL terminator when `string_length` is `SQL_NTS`.
 unsafe fn sql_set_connect_attr_w_impl(
     connection_handle: SqlHandle,
     attribute: SqlInteger,
@@ -271,6 +291,33 @@ unsafe fn sql_set_connect_attr_w_impl(
             );
             SQL_SUCCESS
         }
+        // Settable at any time, before or after connect: it changes only how the
+        // driver reports a substitution, never how the connection is made.
+        //
+        // Only SQL_WARN_NO / SQL_WARN_YES are legal, and anything else is
+        // HY024 (msodbcsql `sqlcmisc.cpp:2473`). Measured on retail 18.6.2.1:
+        // value 7 answers HY024 after connect, but is accepted silently
+        // *before* connect -- `dbcinfotoken.cpp:171` guards a path
+        // SQLSetConnectAttr does not reach. This driver validates in both
+        // states: storing an out-of-range value as "off" would make a typo read
+        // back as a deliberate setting. See parity-deviations entry 22.
+        SQL_COPT_SS_WARN_ON_CP_ERROR => {
+            let value = value_ptr as usize as u64;
+            if value != SQL_WARN_NO && value != SQL_WARN_YES {
+                error!(
+                    value,
+                    "SQLSetConnectAttrW: invalid SQL_COPT_SS_WARN_ON_CP_ERROR value"
+                );
+                post_diag(&mut state, ERR_INVALID_ATTRIBUTE_VALUE);
+                return SQL_ERROR;
+            }
+            state.warn_on_cp_error = value == SQL_WARN_YES;
+            debug!(
+                value,
+                "SQLSetConnectAttrW: warn-on-code-page-error preference stored"
+            );
+            SQL_SUCCESS
+        }
         SQL_ATTR_LOGIN_TIMEOUT => {
             // Integer attribute: the SQLUINTEGER value is passed by value in the
             // pointer slot (not a pointer to it). Store it so SQLDriverConnect
@@ -331,8 +378,24 @@ unsafe fn sql_set_connect_attr_w_impl(
                 );
                 return SQL_ERROR;
             }
-            state.packet_size = value_ptr as usize as u32;
-            SQL_SUCCESS
+            let requested = value_ptr as usize as u32;
+            if requested == 0 {
+                // msodbcsql's clamp explicitly exempts zero (`sqlcmisc.cpp:1909-1917`):
+                // it is the sentinel for "let the connection pick its own
+                // default", not a size to force into range. Store it as-is,
+                // with no `01S02` — `seed_and_apply_connection_params` resolves
+                // it to the TDS context default at connect time.
+                state.packet_size = 0;
+                return SQL_SUCCESS;
+            }
+            let clamped = requested.clamp(MIN_PACKET_SIZE, MAX_PACKET_SIZE);
+            state.packet_size = clamped;
+            if clamped != requested {
+                post_diag(&mut state, WARN_PACKET_SIZE_CHANGED);
+                SQL_SUCCESS_WITH_INFO
+            } else {
+                SQL_SUCCESS
+            }
         }
         // Set by the Driver Manager only, and not retrievable, so nothing to
         // store.
@@ -489,10 +552,10 @@ mod tests {
     use crate::test_support::TestHandles;
 
     /// Build a `SQL_COPT_SS_ACCESS_TOKEN` struct the way msodbcsql apps do:
-    /// a 4-byte little-endian length followed by UTF-16-LE token bytes.
+    /// a 4-byte native-endian length followed by UTF-16-LE token bytes.
     fn make_token_struct(jwt: &str) -> Vec<u8> {
         let token_bytes: Vec<u8> = jwt.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
-        let mut buf = (token_bytes.len() as u32).to_le_bytes().to_vec();
+        let mut buf = (token_bytes.len() as u32).to_ne_bytes().to_vec();
         buf.extend_from_slice(&token_bytes);
         buf
     }
@@ -960,6 +1023,93 @@ mod tests {
     }
 
     #[test]
+    fn packet_size_above_maximum_is_clamped() {
+        // Matches msodbcsql's own clamp for an out-of-range packet size
+        // (`sqlcmisc.cpp:1909-1917`, `IDS_01_S02_02` "Packet size changed").
+        // Also guards `get_info::max_statement_len`'s `128 * packet_size`:
+        // an unclamped caller-supplied value here could overflow that
+        // multiplication before the driver ever connects.
+        let h = TestHandles::with_env_dbc();
+        let ret = unsafe {
+            sql_set_connect_attr_w(
+                h.dbc,
+                SQL_ATTR_PACKET_SIZE,
+                u32::MAX as usize as SqlPointer,
+                0,
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS_WITH_INFO);
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let state = dbc.inner.lock().unwrap();
+        assert_eq!(state.packet_size, MAX_PACKET_SIZE);
+        let record = &state.diag_records()[0];
+        assert_eq!(record.sql_state, SQLSTATE_01S02);
+        assert!(
+            record.message.ends_with(WARN_PACKET_SIZE_CHANGED.text),
+            "got: {}",
+            record.message
+        );
+    }
+
+    #[test]
+    fn packet_size_below_minimum_is_clamped() {
+        let h = TestHandles::with_env_dbc();
+        let ret =
+            unsafe { sql_set_connect_attr_w(h.dbc, SQL_ATTR_PACKET_SIZE, 1usize as SqlPointer, 0) };
+        assert_eq!(ret, SQL_SUCCESS_WITH_INFO);
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let state = dbc.inner.lock().unwrap();
+        assert_eq!(state.packet_size, MIN_PACKET_SIZE);
+    }
+
+    #[test]
+    fn packet_size_zero_on_a_fresh_handle_is_stored_without_a_warning() {
+        // msodbcsql exempts zero from its packet-size clamp
+        // (`sqlcmisc.cpp:1909-1917`): it is the "let the connection pick its
+        // own default" sentinel, not a size to force into range, so this must
+        // succeed cleanly rather than clamp up to MIN_PACKET_SIZE with 01S02.
+        let h = TestHandles::with_env_dbc();
+        let ret =
+            unsafe { sql_set_connect_attr_w(h.dbc, SQL_ATTR_PACKET_SIZE, 0usize as SqlPointer, 0) };
+        assert_eq!(ret, SQL_SUCCESS);
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let state = dbc.inner.lock().unwrap();
+        assert_eq!(state.packet_size, 0);
+        assert!(state.diag_records().is_empty());
+    }
+
+    #[test]
+    fn packet_size_nonzero_to_zero_is_stored_without_a_warning() {
+        let h = TestHandles::with_env_dbc();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        unsafe { sql_set_connect_attr_w(h.dbc, SQL_ATTR_PACKET_SIZE, 16384usize as SqlPointer, 0) };
+        assert_eq!(dbc.inner.lock().unwrap().packet_size, 16384);
+        free_errors(&mut dbc.inner.lock().unwrap());
+
+        let ret =
+            unsafe { sql_set_connect_attr_w(h.dbc, SQL_ATTR_PACKET_SIZE, 0usize as SqlPointer, 0) };
+        assert_eq!(ret, SQL_SUCCESS);
+        let state = dbc.inner.lock().unwrap();
+        assert_eq!(state.packet_size, 0);
+        assert!(state.diag_records().is_empty());
+    }
+
+    #[test]
+    fn packet_size_repeated_zero_never_warns() {
+        let h = TestHandles::with_env_dbc();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        for _ in 0..3 {
+            let ret = unsafe {
+                sql_set_connect_attr_w(h.dbc, SQL_ATTR_PACKET_SIZE, 0usize as SqlPointer, 0)
+            };
+            assert_eq!(ret, SQL_SUCCESS);
+            let state = dbc.inner.lock().unwrap();
+            assert_eq!(state.packet_size, 0);
+            assert!(state.diag_records().is_empty());
+        }
+    }
+
+    #[test]
     fn accepted_standard_attributes_are_stored() {
         let h = TestHandles::with_env_dbc();
         for (attribute, value) in [
@@ -1156,6 +1306,56 @@ mod tests {
             };
             assert_eq!(stored, Some(expected), "attribute {attribute} value {raw}");
         }
+    }
+
+    /// `SQL_COPT_SS_WARN_ON_CP_ERROR` is a reporting preference, not a
+    /// connection property, so it is settable in either state; only
+    /// `SQL_WARN_YES` turns it on and anything outside the pair is `HY024`,
+    /// matching msodbcsql (measured on retail 18.6.2.1 post-connect). See
+    /// parity-deviations entry 22 (AB#47598).
+    #[test]
+    fn warn_on_cp_error_accepts_only_the_two_legal_values() {
+        for (raw, expected) in [(0usize, Some(false)), (1, Some(true)), (2, None), (7, None)] {
+            let h = TestHandles::with_env_dbc();
+            let ret = unsafe {
+                sql_set_connect_attr_w(h.dbc, SQL_COPT_SS_WARN_ON_CP_ERROR, raw as SqlPointer, 0)
+            };
+            let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+            let state = dbc.inner.lock().unwrap();
+            match expected {
+                Some(stored) => {
+                    assert_eq!(ret, SQL_SUCCESS, "value {raw}");
+                    assert_eq!(state.warn_on_cp_error, stored, "value {raw}");
+                }
+                None => {
+                    assert_eq!(ret, SQL_ERROR, "value {raw}");
+                    assert_eq!(
+                        state.diag_records()[0].sql_state,
+                        ERR_INVALID_ATTRIBUTE_VALUE.state,
+                        "value {raw}"
+                    );
+                    assert!(
+                        !state.warn_on_cp_error,
+                        "a rejected value must not change the setting"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Unlike the vendor attributes above, this one is accepted after connect:
+    /// it changes nothing about the session, only what the driver reports.
+    #[test]
+    fn warn_on_cp_error_is_settable_after_connect() {
+        let h = TestHandles::with_env_dbc();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        dbc.inner.lock().unwrap().connection_state = ConnectionState::Connected;
+
+        let ret = unsafe {
+            sql_set_connect_attr_w(h.dbc, SQL_COPT_SS_WARN_ON_CP_ERROR, 1usize as SqlPointer, 0)
+        };
+        assert_eq!(ret, SQL_SUCCESS);
+        assert!(dbc.inner.lock().unwrap().warn_on_cp_error);
     }
 
     #[test]

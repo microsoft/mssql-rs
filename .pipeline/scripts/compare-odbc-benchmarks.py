@@ -828,6 +828,12 @@ def summary_markdown(
             f"- Candidate samples: {describe_inputs(candidate_paths)}",
         ]
     )
+    if any(result["name"].startswith("write/") for result in results):
+        lines.append(
+            "- Write workload modes: candidate and Microsoft use one parameter-array "
+            "`SQLExecute`; the pinned Rust baseline uses 2,000 sequential prepared "
+            "`SQLExecute` calls because it predates parameter-array support."
+        )
     if reference_paths:
         lines.extend(
             [
