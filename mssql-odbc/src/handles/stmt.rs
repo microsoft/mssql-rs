@@ -17,6 +17,8 @@ use crate::api::odbc_types::{
     self, SQL_DESC_ALLOC_AUTO, SqlInteger, SqlLen, SqlPointer, SqlSmallInt, SqlULen, SqlUSmallInt,
 };
 use crate::api::set_desc_field::datetime_interval_code_for;
+use crate::conversion::client_encoding::ClientEncoding;
+use crate::conversion::fetch_convert::TextOutput;
 use crate::conversion::param_convert::{DaeLengthLimit, DaePlan, DaeTranscode};
 use crate::error::{DiagRecord, HasDiagnostics};
 use crate::handles::desc::UdtNames;
@@ -51,6 +53,7 @@ pub(crate) struct ActivePlpStream {
     /// Character reads drain old carry before decoding new wire input, so
     /// this tag covers the entire byte buffer.
     pub(crate) pending_bytes_utf16: bool,
+    pub(crate) pending_bytes_encoding: ClientEncoding,
     /// Narrow wire encoding resolved from the column's collation (or UTF-8 for
     /// `json`, which carries none), or `None` when the column is not narrow
     /// text. This is a property of the *column*, so a target type that arrives
@@ -129,6 +132,7 @@ impl ActivePlpStream {
             pending_high_surrogate: None,
             pending_bytes: Vec::new(),
             pending_bytes_utf16: false,
+            pending_bytes_encoding: ClientEncoding::UTF8,
             narrow_encoding,
             narrow_decoder: None,
             narrow_decoder_finished: false,
@@ -407,6 +411,7 @@ pub(crate) struct StmtHandle {
 #[derive(Debug)]
 pub(crate) struct StmtState {
     pub(crate) diag_records: Vec<DiagRecord>,
+    pub(crate) text_output: TextOutput,
     /// Column metadata from the most recent execution.
     pub(crate) column_metadata: Vec<ColumnMetadata>,
     /// UTF-16 column names built once when result metadata changes.
@@ -1575,6 +1580,7 @@ impl StmtHandle {
             ))),
             inner: Mutex::new(StmtState {
                 diag_records: Vec::new(),
+                text_output: TextOutput::UTF8,
                 column_metadata: Vec::new(),
                 column_names_utf16: Vec::new(),
                 plp_prefetch_scratch: Vec::new(),

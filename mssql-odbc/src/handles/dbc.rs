@@ -9,6 +9,7 @@ use mssql_tds::connection::tds_client::TdsClient;
 use super::env::SharedRuntime;
 use super::{EnvHandle, HandleType, HasObjectType};
 use crate::api::odbc_types::{DEFAULT_PACKET_SIZE, SQL_MODE_READ_WRITE, SQL_TXN_READ_COMMITTED};
+use crate::conversion::client_encoding::ClientEncoding;
 use crate::error::{DiagRecord, HasDiagnostics};
 
 /// Connection state machine — tracks whether the DBC is connected.
@@ -83,6 +84,7 @@ pub(crate) struct VendorConnOverrides {
 /// Mutable state within a connection handle, protected by `inner`.
 pub(crate) struct DbcState {
     pub(crate) diag_records: Vec<DiagRecord>,
+    pub(crate) client_encoding: ClientEncoding,
     pub(crate) connection_state: ConnectionState,
     /// Active child STMT handles
     pub(crate) statements: Vec<*mut c_void>,
@@ -298,6 +300,7 @@ impl DbcHandle {
             runtime,
             inner: Mutex::new(DbcState {
                 diag_records: Vec::new(),
+                client_encoding: ClientEncoding::system_default(),
                 connection_state: ConnectionState::Disconnected,
                 statements: Vec::new(),
                 descriptors: Vec::new(),

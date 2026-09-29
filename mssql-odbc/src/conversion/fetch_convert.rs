@@ -42,6 +42,25 @@ use mssql_tds::datatypes::column_values::{
 };
 use mssql_tds::datatypes::sql_string::{EncodingType, SqlString};
 
+use super::client_encoding::ClientEncoding;
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TextOutput {
+    pub(crate) encoding: ClientEncoding,
+    pub(crate) warn_on_loss: bool,
+}
+
+impl TextOutput {
+    pub(crate) const UTF8: Self = Self {
+        encoding: ClientEncoding::UTF8,
+        warn_on_loss: false,
+    };
+
+    pub(crate) fn can_copy_utf8(self, bytes: &[u8]) -> bool {
+        self.encoding.is_utf8() || (self.encoding.is_ascii_compatible() && bytes.is_ascii())
+    }
+}
+
 /// Decodes a character column without the panicking paths in
 /// `SqlString::to_utf8_string` (its UTF-8 branch unwraps); the UTF-16 and LCID
 /// branches decode through `encoding_rs`, which substitutes replacement

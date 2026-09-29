@@ -312,6 +312,19 @@ unsafe fn sql_set_connect_attr_w_impl(
                 return SQL_ERROR;
             }
             state.warn_on_cp_error = value == SQL_WARN_YES;
+            for &raw in &state.statements {
+                // SAFETY: the DBC owns its statements; its lock prevents
+                // removal while the child setting is updated.
+                let stmt = unsafe { handle_from_raw::<StmtHandle>(raw) };
+                let Ok(mut stmt_state) = stmt.inner.lock() else {
+                    error!(
+                        "SQLSetConnectAttrW: stmt mutex poisoned while setting code-page warnings"
+                    );
+                    post_diag(&mut state, ERR_INTERNAL_CONVERSION);
+                    return SQL_ERROR;
+                };
+                stmt_state.text_output.warn_on_loss = state.warn_on_cp_error;
+            }
             debug!(
                 value,
                 "SQLSetConnectAttrW: warn-on-code-page-error preference stored"
