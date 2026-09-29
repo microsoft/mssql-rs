@@ -422,11 +422,57 @@ function Invoke-Interleave {
 $CandidateSrc = Join-Path $RepoRoot 'mssql-tds'
 $StashedSrc   = Join-Path $RepoRoot '.mssql-tds-candidate'
 $BaselineTree = Join-Path ([System.IO.Path]::GetTempPath()) "perf-baseline-$([System.Guid]::NewGuid().ToString('N'))"
+
+# Read the [package] version from a Cargo manifest.
+function Get-PackageVersion {
+    param([Parameter(Mandatory)][string] $Manifest)
+    $inPkg = $false
+    foreach ($line in Get-Content -LiteralPath $Manifest) {
+        if ($line -match '^\[') { $inPkg = $line -match '^\[package\]'; continue }
+        if ($inPkg -and $line -match '^version\s*=\s*"([^"]*)"') { return $Matches[1] }
+    }
+    return $null
+}
+
+# Rewrite the [package] version in a Cargo manifest.
+function Set-PackageVersion {
+    param([Parameter(Mandatory)][string] $Manifest, [Parameter(Mandatory)][string] $Version)
+    $inPkg = $false
+    $done  = $false
+    $lines = foreach ($line in Get-Content -LiteralPath $Manifest) {
+        if ($line -match '^\[') { $inPkg = $line -match '^\[package\]'; $line; continue }
+        if ($inPkg -and -not $done -and $line -match '^version\s*=') { $done = $true; "version = `"$Version`""; continue }
+        $line
+    }
+    Set-Content -LiteralPath $Manifest -Value $lines
+}
+
+# Sibling workspace crates pin mssql-tds by version (e.g. mssql-mock-tds declares
+# `mssql-tds = { path = "../mssql-tds", version = "0.2.0" }`). Cargo resolves the whole
+# workspace, so once main bumps the crate version the older baseline source no longer
+# satisfies that requirement and the entire baseline build fails. The package version
+# affects no generated code, so stamp the candidate's onto the baseline manifest —
+# keeping the driver source the only variable that actually differs.
+function Sync-BaselineVersion {
+    $manifest = Join-Path $script:CandidateSrc 'Cargo.toml'
+    $cand = Get-PackageVersion (Join-Path $script:StashedSrc 'Cargo.toml')
+    $base = Get-PackageVersion $manifest
+    if (-not $cand -or -not $base) { throw 'could not read [package] version from the mssql-tds manifests.' }
+    if ($cand -ne $base) {
+        Write-Host ">>> Stamping candidate version $cand onto the baseline mssql-tds manifest (was $base)."
+        Set-PackageVersion $manifest $cand
+    }
+}
+
 function Set-BaselineSource {
     Move-Item $script:CandidateSrc $script:StashedSrc
     Copy-Item -Recurse (Join-Path $script:BaselineTree 'mssql-tds') $script:CandidateSrc
+    Sync-BaselineVersion
 }
+# Idempotent: this also runs from the finally block, and without the stash check a
+# second call would delete the freshly restored candidate source.
 function Restore-CandidateSource {
+    if (-not (Test-Path -LiteralPath $script:StashedSrc)) { return }
     Remove-Item -Recurse -Force $script:CandidateSrc
     Move-Item $script:StashedSrc $script:CandidateSrc
 }

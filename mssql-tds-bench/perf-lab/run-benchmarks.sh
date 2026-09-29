@@ -260,11 +260,53 @@ for line in sys.stdin:
         print((t.get("name") or "") + "\t" + ex)'
 }
 
+# Print the [package] version from a Cargo manifest. $1 = manifest path.
+package_version() {
+    awk '
+        /^\[/ { in_pkg = ($0 ~ /^\[package\]/); next }
+        in_pkg && /^version[[:space:]]*=/ && match($0, /"[^"]*"/) {
+            print substr($0, RSTART + 1, RLENGTH - 2); exit
+        }' "$1"
+}
+
+# Rewrite the [package] version in a Cargo manifest. $1 = manifest, $2 = version.
+set_package_version() {
+    awk -v v="$2" '
+        /^\[/ { in_pkg = ($0 ~ /^\[package\]/); print; next }
+        in_pkg && !done && /^version[[:space:]]*=/ { print "version = \"" v "\""; done = 1; next }
+        { print }' "$1" > "$1.tmp" && mv "$1.tmp" "$1"
+}
+
+# Sibling workspace crates pin mssql-tds by version (e.g. mssql-mock-tds declares
+# `mssql-tds = { path = "../mssql-tds", version = "0.2.0" }`). Cargo resolves the whole
+# workspace, so once main bumps the crate version the older baseline source no longer
+# satisfies that requirement and the entire baseline build fails. The package version
+# affects no generated code, so stamp the candidate's onto the baseline manifest —
+# keeping the driver source the only variable that actually differs.
+align_baseline_version() {
+    local manifest="$REPO_ROOT/mssql-tds/Cargo.toml"
+    local cand base
+    cand="$(package_version "$REPO_ROOT/.mssql-tds-candidate/Cargo.toml")"
+    base="$(package_version "$manifest")"
+    if [ -z "$cand" ] || [ -z "$base" ]; then
+        echo "ERROR: could not read [package] version from the mssql-tds manifests." >&2
+        exit 1
+    fi
+    if [ "$cand" != "$base" ]; then
+        echo ">>> Stamping candidate version ${cand} onto the baseline mssql-tds manifest (was ${base})."
+        set_package_version "$manifest" "$cand"
+    fi
+}
+
 swap_to_baseline() {
     mv "$REPO_ROOT/mssql-tds" "$REPO_ROOT/.mssql-tds-candidate"
     cp -r "$BASELINE_TREE/mssql-tds" "$REPO_ROOT/mssql-tds"
+    align_baseline_version
 }
+# Idempotent: this also runs from the EXIT trap, and without the stash check a
+# second call would rm -rf the freshly restored candidate source.
 restore_candidate() {
+    [ -d "$REPO_ROOT/.mssql-tds-candidate" ] || return 0
     rm -rf "$REPO_ROOT/mssql-tds"
     mv "$REPO_ROOT/.mssql-tds-candidate" "$REPO_ROOT/mssql-tds"
 }
