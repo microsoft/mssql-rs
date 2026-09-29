@@ -347,6 +347,20 @@ fn read_eof_outcome(enc_in_empty: bool) -> Poll<io::Result<()>> {
     }
 }
 
+/// Largest TLS ciphertext record: 5-byte header, 2^14 plaintext, 2048
+/// bytes of expansion (RFC 8446 §5.2, RFC 5246 §6.2.3).
+const MAX_TLS_RECORD: usize = 5 + 16384 + 2048;
+
+/// Bytes still needed before `enc_in` holds its first TLS record whole.
+fn missing_record_bytes(enc_in: &[u8]) -> usize {
+    match enc_in {
+        [_, _, _, hi, lo, ..] => {
+            (5 + u16::from_be_bytes([*hi, *lo]) as usize).saturating_sub(enc_in.len())
+        }
+        _ => 5 - enc_in.len(),
+    }
+}
+
 impl<S> AsyncRead for SchannelTlsStream<S>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -373,28 +387,24 @@ where
                 return Poll::Ready(Ok(()));
             }
 
-            // 2. Try to decrypt one record out of enc_in.
-            match record.decrypt(enc_in, plain_out) {
-                Ok(Decrypted::Ok) => continue, // back to step 1 to drain
-                Ok(Decrypted::PeerClosed) => return Poll::Ready(Ok(())),
-                Ok(Decrypted::NeedMoreInput) => {
-                    // 3. Need more bytes from the wire.
+            // 2. Try to decrypt one record out of enc_in. A partial record
+            // cannot decrypt, so skip the SChannel call until it is whole.
+            let missing = missing_record_bytes(enc_in);
+            if missing == 0 {
+                match record.decrypt(enc_in, plain_out) {
+                    Ok(Decrypted::Ok) => continue, // back to step 1 to drain
+                    Ok(Decrypted::PeerClosed) => return Poll::Ready(Ok(())),
+                    Ok(Decrypted::NeedMoreInput) => {}
+                    Err(e) => return Poll::Ready(Err(e)),
                 }
-                Err(e) => return Poll::Ready(Err(e)),
             }
 
-            // 3. Read more from the socket.
-            let mut tmp = [0u8; 8192];
-            let mut tmp_buf = ReadBuf::new(&mut tmp);
-            match Pin::new(&mut this.socket).poll_read(cx, &mut tmp_buf) {
-                Poll::Ready(Ok(())) => {
-                    let filled = tmp_buf.filled().len();
-                    if filled == 0 {
-                        return read_eof_outcome(enc_in.is_empty());
-                    }
-                    enc_in.extend_from_slice(&tmp[..filled]);
-                    // Loop and try decrypt again.
-                }
+            // 3. Read more from the socket, straight into enc_in, with room
+            // for at least one full record so it arrives in one read.
+            enc_in.reserve(missing.max(MAX_TLS_RECORD));
+            match tokio_util::io::poll_read_buf(Pin::new(&mut this.socket), cx, enc_in) {
+                Poll::Ready(Ok(0)) => return read_eof_outcome(enc_in.is_empty()),
+                Poll::Ready(Ok(_)) => {}
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Pending => return Poll::Pending,
             }
