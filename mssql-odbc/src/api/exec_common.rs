@@ -366,22 +366,25 @@ pub(super) fn return_client_busy(dbc: &DbcHandle, client: TdsClient) {
 /// is left rather than stranding it — so it takes the deferred-error route
 /// above, never the unposted one.
 ///
-/// `row_delivered` tells this call whether it actually delivered data —
-/// `true` for `SQLGetData` (a column was just captured) and for a
-/// `SQLFetch`/`SQLFetchScroll` whose rowset held at least one row, `false`
-/// for a zero-row `SQLFetchScroll`. Info messages are always drained from
-/// `client` once the claim is released, regardless of `row_delivered` —
-/// leaving them on `client` would otherwise leak into whichever statement
-/// claims the connection next and get posted under its unrelated
-/// diagnostics. Where they are *posted* still depends on `row_delivered`:
-/// with a row delivered, this call's own `SQL_SUCCESS`/`SQL_SUCCESS_WITH_INFO`
-/// return can carry them, so they are posted here directly. A zero-row
-/// fetch's `SQL_NO_DATA` return cannot carry `SQL_SUCCESS_WITH_INFO` (and few
-/// callers inspect diagnostics after it), so `fill_rowset` deliberately
-/// leaves them out of its own post — they are stashed on
-/// `StmtState::pending_fetch_info` instead, for `SQLMoreResults`'s
-/// `batch_exhausted` fast path or a cursor close to surface later, exactly
-/// like the deferred-error twin above.
+/// Info messages the peek consumed are drained and posted here, whether or not
+/// the claim is released: they arrived before this result set's DONE, so they
+/// belong to the call that read them. Leaving them on `client` would hand this
+/// result set's warning to whichever call reads next — `SQLMoreResults` posts
+/// only after advancing to the following result set — or drop it entirely if
+/// the application never calls `SQLMoreResults`. The return value tells
+/// row-delivering callers to promote an otherwise-clean success to
+/// `SQL_SUCCESS_WITH_INFO`; a zero-row fetch keeps `SQL_NO_DATA` while leaving
+/// the diagnostic available.
+///
+/// `post_preceding` runs under this call's statement lock, before any message
+/// the peek drains is posted. Everything the caller's own rows produced left
+/// the wire ahead of whatever the peek finds, and `SQLGetDiagRec` is ordinal,
+/// so it has to be recorded first; its return value reports whether it posted
+/// a server message. Callers with nothing pending pass `|_| false`.
+///
+/// Returns `(has_server_info, preceding_ran)`. `preceding_ran` is `false` when
+/// the statement lock was poisoned and the closure therefore never ran, so a
+/// caller that relies on it having posted can fall back rather than assume.
 ///
 /// # Caller obligation
 /// Only call this once every column of the row positioned when `client` was
@@ -392,8 +395,8 @@ pub(super) fn release_busy_if_row_exhausted(
     stmt: &StmtHandle,
     statement_handle: SqlHandle,
     mut client: TdsClient,
-    row_delivered: bool,
-) {
+    post_preceding: impl FnOnce(&mut StmtState) -> bool,
+) -> (bool, bool) {
     let peek_result = match client.try_peek_past_current_row() {
         Ok(CursorPoll::Ready(has_row)) => Ok(has_row),
         Ok(CursorPoll::Pending) => dbc.runtime.block_on(client.peek_past_current_row()),
@@ -433,22 +436,27 @@ pub(super) fn release_busy_if_row_exhausted(
         read_error = Some(error);
     }
 
-    let drained_info = if release {
-        client.take_info_messages()
-    } else {
-        Vec::new()
-    };
+    // Drained whether or not the claim is released. Everything the peek
+    // consumed came before this result set's DONE, so it belongs to the call
+    // that read it — msodbcsql posts a server message from `OnMessage` as the
+    // token is parsed (`sqlctokn.cpp:3217`) and clears the flag at the end of
+    // each fetch (`sqlccurs.cpp:2163`), so it never carries to a later call.
+    // Holding it on `client` for whoever reads next would hand this result
+    // set's warning to `SQLMoreResults`, which posts only after advancing to
+    // the following result set, and would drop it outright if the application
+    // never calls `SQLMoreResults` at all.
+    let drained_info = client.take_info_messages();
 
+    let mut has_server_info = false;
+    let mut preceding_ran = false;
     if let Ok(mut stmt_state) = stmt.inner.lock() {
         if release {
             stmt_state.pending_output_params =
                 Some((client.get_return_values(), client.get_return_status()));
         }
-        if row_delivered {
-            post_tds_info_messages(&mut stmt_state, &drained_info);
-        } else {
-            stmt_state.pending_fetch_info = drained_info;
-        }
+        preceding_ran = true;
+        has_server_info = post_preceding(&mut stmt_state);
+        has_server_info |= post_tds_info_messages(&mut stmt_state, &drained_info);
         if let Some(e) = read_error {
             error!(%e, "release_busy_if_row_exhausted: finishing current result failed");
             if batch_done {
@@ -472,6 +480,7 @@ pub(super) fn release_busy_if_row_exhausted(
             Some(statement_handle)
         };
     }
+    (has_server_info, preceding_ran)
 }
 
 /// Restores the client to idle, posts a TDS error to `stmt`, clears
@@ -1513,7 +1522,6 @@ mod tests {
                     .iter()
                     .any(|record| record.native_error == 50000)
             );
-            assert!(stmt_state.pending_fetch_info.is_empty());
         }
         assert_eq!(buffers, [-1, -1]);
         assert_eq!(lengths, [-1, -1]);
@@ -1905,7 +1913,7 @@ mod tests {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let client = dbc.inner.lock().unwrap().client.take().unwrap();
 
-        release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, true);
+        assert!(!release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false).0);
 
         assert!(dbc.inner.lock().unwrap().active_stmt.is_none());
         assert!(dbc.inner.lock().unwrap().client.is_some());
@@ -1938,7 +1946,7 @@ mod tests {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let client = dbc.inner.lock().unwrap().client.take().unwrap();
 
-        release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, true);
+        assert!(!release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false).0);
 
         assert!(dbc.inner.lock().unwrap().active_stmt.is_none());
         let ss = stmt.inner.lock().unwrap();
@@ -1955,7 +1963,7 @@ mod tests {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let client = dbc.inner.lock().unwrap().client.take().unwrap();
 
-        release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, true);
+        release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false);
 
         assert!(dbc.inner.lock().unwrap().active_stmt.is_none());
         let ss = stmt.inner.lock().unwrap();
@@ -1994,7 +2002,7 @@ mod tests {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let client = dbc.inner.lock().unwrap().client.take().unwrap();
 
-        release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, true);
+        release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false);
 
         assert_eq!(
             dbc.inner.lock().unwrap().active_stmt,
@@ -2036,7 +2044,10 @@ mod tests {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let client = dbc.inner.lock().unwrap().client.take().unwrap();
 
-        release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, true);
+        assert!(
+            release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false).0,
+            "the fetch caller must be told to return SQL_SUCCESS_WITH_INFO"
+        );
 
         let ss = stmt.inner.lock().unwrap();
         assert!(
@@ -2075,7 +2086,7 @@ mod tests {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let client = dbc.inner.lock().unwrap().client.take().unwrap();
 
-        release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, true);
+        release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false);
 
         assert!(
             dbc.inner.lock().unwrap().active_stmt.is_none(),
@@ -2129,7 +2140,7 @@ mod tests {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let client = dbc.inner.lock().unwrap().client.take().unwrap();
 
-        release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, true);
+        release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false);
 
         assert_eq!(dbc.inner.lock().unwrap().active_stmt, Some(h.stmt));
         assert!(dbc.inner.lock().unwrap().client.is_some());
@@ -2146,13 +2157,17 @@ mod tests {
         assert!(ss.pending_fetch_error.is_none());
     }
 
-    /// A zero-row fetch discovering the current result set is done, with a
-    /// further result set still pending in the batch, must leave any info
-    /// message already on the client alone — that message belongs to
-    /// whichever call (`SQLMoreResults`) actually reads the client next, not
-    /// to this one, since the claim was not released.
+    /// A fetch that exhausts the current result set with a further result set
+    /// still pending must still surface an info message the peek consumed on
+    /// the way: it arrived before this result set's DONE, so it belongs to
+    /// this call. msodbcsql posts a server message from `OnMessage` as the
+    /// token is parsed (`sqlctokn.cpp:3217`), independently of whether the
+    /// batch can release the connection. Deferring it to `SQLMoreResults`
+    /// would attach this result set's warning to the *next* one (that call
+    /// posts only after advancing), and lose it entirely for an application
+    /// that never calls `SQLMoreResults`.
     #[test]
-    fn release_busy_if_row_exhausted_leaves_info_messages_when_the_claim_is_not_released() {
+    fn release_busy_if_row_exhausted_posts_info_messages_when_the_claim_is_not_released() {
         use mssql_tds::test_client_support::info;
 
         let h = TestHandles::with_env_dbc_stmt();
@@ -2160,7 +2175,7 @@ mod tests {
             &h,
             vec![
                 col_metadata_empty(),
-                info(50000, 10, "leave me for SQLMoreResults"),
+                info(50000, 10, "belongs to the first result set"),
                 done_more(),
                 col_metadata_empty(),
                 done_no_more(),
@@ -2171,7 +2186,10 @@ mod tests {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let client = dbc.inner.lock().unwrap().client.take().unwrap();
 
-        release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, true);
+        assert!(
+            release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false).0,
+            "the caller must be told a server message was posted"
+        );
 
         assert_eq!(
             dbc.inner.lock().unwrap().active_stmt,
@@ -2179,15 +2197,13 @@ mod tests {
             "a pending second result set means the claim is not released"
         );
         assert!(
-            !stmt
-                .inner
+            stmt.inner
                 .lock()
                 .unwrap()
                 .diag_records
                 .iter()
-                .any(|d| d.message.contains("leave me for SQLMoreResults")),
-            "the message must not be posted under this call, which returns a \
-             code the caller may never inspect diagnostics for"
+                .any(|d| d.message.contains("belongs to the first result set")),
+            "the message must be posted under the call whose peek consumed it"
         );
         let dbc_state = dbc.inner.lock().unwrap();
         assert!(
@@ -2196,31 +2212,18 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .info_messages()
-                .iter()
-                .any(|m| m.message.contains("leave me for SQLMoreResults")),
-            "the message must still be resident on the client for \
-             SQLMoreResults to find and surface"
+                .is_empty(),
+            "must not also stay on the client, where SQLMoreResults would \
+             re-post it against the result set it advances to"
         );
     }
 
-    /// The other half of the `release` gate: even when the claim *is*
-    /// released (a single-statement zero-row batch — nothing pending after
-    /// it), a fetch that filled zero rows must still not post any drained
-    /// info message under its own return. `fill_rowset` deliberately does
-    /// not drain its own info messages for a zero-row fetch (its
-    /// `SQL_NO_DATA` return can't carry `SQL_SUCCESS_WITH_INFO`) — posting
-    /// them here anyway, just because `release` happens to be true, would
-    /// work against that. But leaving them resident on `client` isn't safe
-    /// either once the claim is released: a different statement could claim
-    /// the now-idle connection next and have its own unrelated diagnostics
-    /// contaminated by them (or, if nothing else claims it first,
-    /// `SQLMoreResults`'s `batch_exhausted` fast path wouldn't even look at
-    /// `client` to find them — see AB#47508 follow-up). So this drains the
-    /// message off `client` right away and stashes it on
-    /// `StmtState::pending_fetch_info` instead, for `SQLMoreResults` or a
-    /// cursor close to surface later.
+    /// Once a zero-row fetch releases the claim, trailing INFO cannot remain
+    /// on the idle client where another statement could inherit it. The helper
+    /// posts it immediately; SQL_NO_DATA remains the fetch return while the
+    /// diagnostic is available from SQLGetDiagRec.
     #[test]
-    fn release_busy_if_row_exhausted_stashes_info_messages_when_no_row_was_delivered() {
+    fn release_busy_if_row_exhausted_posts_info_messages_for_zero_row_fetch() {
         use mssql_tds::test_client_support::info;
 
         let h = TestHandles::with_env_dbc_stmt();
@@ -2237,7 +2240,7 @@ mod tests {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let client = dbc.inner.lock().unwrap().client.take().unwrap();
 
-        release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, false);
+        assert!(release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false).0);
 
         assert!(
             dbc.inner.lock().unwrap().active_stmt.is_none(),
@@ -2245,16 +2248,10 @@ mod tests {
         );
         let ss = stmt.inner.lock().unwrap();
         assert!(
-            !ss.diag_records
-                .iter()
-                .any(|d| d.message.contains("leave me for the next call")),
-            "row_delivered == false must suppress posting under this call's own return"
-        );
-        assert!(
-            ss.pending_fetch_info
+            ss.diag_records
                 .iter()
                 .any(|m| m.message.contains("leave me for the next call")),
-            "must be drained off the client and stashed for SQLMoreResults/close to surface"
+            "the zero-row fetch must expose the drained message immediately"
         );
         drop(ss);
         let dbc_state = dbc.inner.lock().unwrap();
@@ -2268,6 +2265,105 @@ mod tests {
             "must not stay resident on the client, where a different statement \
              claiming the connection next could have it misattributed to its \
              own diagnostics"
+        );
+    }
+
+    /// The closure runs under the statement lock, so a poisoned lock skips it
+    /// entirely. Reporting `preceding_ran == false` is what lets the caller
+    /// tell "nothing to post" apart from "never got the chance", instead of
+    /// assuming the closure ran and suppressing its own fallback.
+    #[test]
+    fn release_busy_if_row_exhausted_reports_a_skipped_preceding_closure() {
+        let h = TestHandles::with_env_dbc_stmt();
+        position_and_inject(&h, vec![col_metadata_empty(), done_no_more()]);
+
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let client = dbc.inner.lock().unwrap().client.take().unwrap();
+
+        // Poison the statement lock the helper needs.
+        assert!(
+            std::thread::scope(|scope| {
+                scope
+                    .spawn(|| {
+                        let _guard = stmt.inner.lock().unwrap();
+                        panic!("poison the stmt lock");
+                    })
+                    .join()
+            })
+            .is_err()
+        );
+
+        let ran = std::cell::Cell::new(false);
+        let (_, preceding_ran) = release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| {
+            ran.set(true);
+            true
+        });
+
+        assert!(!ran.get(), "the poisoned lock must skip the closure");
+        assert!(
+            !preceding_ran,
+            "a skipped closure must be reported, not assumed to have posted"
+        );
+    }
+
+    /// `SQLGetDiagRec` is ordinal, so records must come back in the order the
+    /// server sent them. Anything the caller's own rows produced left the wire
+    /// before this peek's messages do, so it has to be posted ahead of them
+    /// rather than appended after.
+    #[test]
+    fn release_busy_if_row_exhausted_posts_preceding_info_before_its_own() {
+        use mssql_tds::error::SqlInfoMessage;
+        use mssql_tds::test_client_support::info;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        position_and_inject(
+            &h,
+            vec![
+                col_metadata_empty(),
+                info(50000, 10, "terminal message"),
+                done_no_more(),
+            ],
+        );
+
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let client = dbc.inner.lock().unwrap().client.take().unwrap();
+        let earlier = [SqlInfoMessage {
+            message: "row loop message".to_string(),
+            state: 1,
+            class: 10,
+            number: 50000,
+            server_name: None,
+            proc_name: None,
+            line_number: None,
+        }];
+
+        assert!(
+            release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |s| {
+                post_tds_info_messages(s, &earlier)
+            })
+            .0
+        );
+
+        let ss = stmt.inner.lock().unwrap();
+        let order: Vec<&str> = ss
+            .diag_records
+            .iter()
+            .map(|d| {
+                if d.message.contains("row loop message") {
+                    "row"
+                } else if d.message.contains("terminal message") {
+                    "terminal"
+                } else {
+                    "other"
+                }
+            })
+            .collect();
+        assert_eq!(
+            order,
+            ["row", "terminal"],
+            "the row loop's message left the wire first and must be reported first"
         );
     }
 

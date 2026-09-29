@@ -66,6 +66,24 @@ The ODBC runner treats per-file pytest exit 2 as a test failure because a driver
 import error can prevent collection. Pytest internal/usage errors (3/4) and
 command-launch failures remain harness errors.
 
+The macOS job owns the locally built Rust and source-matched ODBC wheels and
+installs upstream editable with `--no-deps`. Its `requirements.txt` supplies
+third-party dependencies. Before SQL startup, `verify-mssql-python.py` runs as a
+pytest smoke check of the installed runtime: direct dependency versions/markers
+and the provider ID/driver path. Only the two native version pins are exempt.
+New missing/incompatible requirements fail setup; extras or URL requirements
+require explicit setup support rather than a custom dependency resolver.
+
+Provider API/id/path drift fails PR/local runs but produces a warning and a
+skipped smoke test on non-PR runs. Pytest publishes the setup result in either
+case; Docker/Colima provisioning, SQL startup, and driver tests run only after
+a successful smoke check. An advisory skip also skips Docker cleanup, but the
+upstream checkout is always cleaned up. The shared Docker template defaults to
+`succeeded()` for other callers. Native builds,
+packaging/install commands, dependency failures, import/loader errors, and
+unexpected exceptions remain blocking. Focused YAML assertions cover readiness
+gates and the shared default; actual PR jobs validate the build/install wiring.
+
 To advance the pin, review the upstream commit comparison, replace the full SHA,
 and validate both cross-repo jobs in the pin-update PR. CI following main never
 updates the pin automatically.

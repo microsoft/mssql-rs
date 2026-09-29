@@ -2727,14 +2727,12 @@ mod tests {
     /// that returned without calling `clear_exhaustion_state()`. Every other
     /// successful execute reaches `finish_execute` or `finish_parameter_array`,
     /// which do clear it. Left stale, a reused statement handle would surface
-    /// the *previous* query's `batch_exhausted`/`pending_fetch_error`/
-    /// `pending_fetch_info` against this brand new (all-ignored) execution —
-    /// the same class of bug fixed for the pure-DML branch in
-    /// `exec_direct_pure_dml_clears_stale_exhausted_and_pending_info`.
+    /// the previous query's `batch_exhausted`/`pending_fetch_error` against
+    /// this brand new (all-ignored) execution — the same class of bug fixed
+    /// for the pure-DML branch in
+    /// `exec_direct_pure_dml_clears_stale_exhausted_and_pending_error`.
     #[test]
-    fn all_ignored_array_clears_stale_exhausted_and_pending_info() {
-        use mssql_tds::error::SqlInfoMessage;
-
+    fn all_ignored_array_clears_stale_exhausted_and_pending_error() {
         let h = TestHandles::with_env_dbc_stmt();
         set_prepared(h.stmt, "INSERT INTO t VALUES (?)");
         let mut values = [10i32, 20, 30];
@@ -2777,21 +2775,11 @@ mod tests {
                 SQL_ATTR_PARAMS_PROCESSED_PTR,
                 (&raw mut processed) as SqlULen,
             );
-            // As if a previous query's zero-row fetch exhausted the whole
-            // batch and stashed a trailing INFO message and error, left over
-            // on the reused handle.
+            // As if a previous query's read-ahead exhausted the whole batch
+            // and left a deferred error on the reused handle.
             state.result_set_exhausted = true;
             state.batch_exhausted = true;
             state.pending_fetch_error = Some(TdsError::ProtocolError("stale".to_string()));
-            state.pending_fetch_info = vec![SqlInfoMessage {
-                message: "previous query's PRINT output".to_string(),
-                state: 1,
-                class: 0,
-                number: 0,
-                server_name: None,
-                proc_name: None,
-                line_number: None,
-            }];
         }
 
         let ret = sql_execute_safe(h.stmt, stmt);
@@ -2804,7 +2792,6 @@ mod tests {
         );
         assert!(!state.result_set_exhausted);
         assert!(state.pending_fetch_error.is_none());
-        assert!(state.pending_fetch_info.is_empty());
     }
 
     /// Stages four good rows, then invalidates some the way an application can
