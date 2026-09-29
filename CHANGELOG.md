@@ -8,6 +8,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ### Added
 
+- `mssql-odbc`: `SQLGetData` conversions from `varchar(max)` and `nvarchar(max)`
+  into supported numeric and date/time C targets, with the existing
+  bound-fetch 1 MiB source-data cap (AB#47238).
+
 - `mssql-odbc`: input parameter binding (`SQLBindParameter` with
   `SQL_PARAM_INPUT`) for the character and integer type families. Any other
   `ValueType` → `ParameterType` pairing is rejected at bind time with `HYC00`,
@@ -30,11 +34,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 - `mssql-odbc`: server informational/warning messages are surfaced as
   diagnostic records (`SQLGetDiagRec` / `SQLGetDiagField`), and successful calls
   that observed them return `SQL_SUCCESS_WITH_INFO`
-  (`SQLDriverConnect`, `SQLExecDirect`, `SQLFetch`, `SQLMoreResults`,
-  `SQLCloseCursor` / `SQLFreeStmt(SQL_CLOSE)`). INFO captured at end-of-rowset is
-  deferred to the next result-set boundary (`SQLMoreResults` advance or cursor
-  close) so it surfaces with a `SQL_SUCCESS_WITH_INFO` hint instead of being
-  posted under `SQL_NO_DATA`, which many applications never inspect.
+  (`SQLDriverConnect`, `SQLExecDirect`, `SQLExecute`,
+  `SQLFetch` / `SQLFetchScroll`, `SQLGetData`, `SQLMoreResults`,
+  `SQLCloseCursor` / `SQLFreeStmt(SQL_CLOSE)`, `SQLDescribeParam`,
+  `SQLSetConnectAttr(SQL_ATTR_CURRENT_CATALOG)`). A message consumed by a fetch's
+  terminal read-ahead is posted by the call that read it: a fetch or
+  terminal-column `SQLGetData` that delivered data returns
+  `SQL_SUCCESS_WITH_INFO`, and a zero-row fetch keeps `SQL_NO_DATA` while
+  leaving the record retrievable (AB#48821).
 
 - `mssql-odbc`: catalog functions — `SQLTables`, `SQLColumns`, `SQLPrimaryKeys`,
   `SQLForeignKeys`, `SQLSpecialColumns`, `SQLStatistics`, `SQLProcedures`
@@ -54,6 +61,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 - Initial public release of the mssql-rs workspace.
 
 ### Changed
+
+- `mssql-odbc`: empty character values retrieved as numeric or GUID C targets
+  now return success with indicator 0 and leave the value buffer unchanged,
+  matching msodbcsql18 for bound and unbound retrieval. Empty date/time
+  literals still return `22018`.
 
 - `mssql-odbc`: `SQLBindCol` now accepts `SQL_C_DEFAULT` and resolves it at
   fetch time from the current result column's SQL type, using the same mapping
@@ -120,6 +132,64 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   federated-auth flows.
 
 ### Fixed
+
+- `mssql-tds` / `mssql-odbc`: a character with no representation in the narrow
+  encoding a value is sent in is now replaced with `?` instead of being
+  rewritten as markup. `encoding_rs` implements WHATWG form-submission
+  semantics, so `Encoding::encode` substitutes a decimal numeric character
+  reference — `U+65E5`
+  became the eight ASCII bytes `&#26085;` — and both narrow encoders only logged
+  a warning, so the server stored markup instead of text, one character counted
+  as eight against the column's declared length, and the application saw success.
+  The two Latin-1 fallbacks in the parameter serializer (no known collation, and
+  an LCID this crate does not map) already substituted `?` and keep doing so.
+
+  The single `?` matches msodbcsql, which converts with `WideCharToMultiByte` /
+  `iconv` and takes the code page's default character, and matches SQL Server's
+  own `CAST(N'…' AS varchar(n))`. One substitute byte per UTF-16 code unit, so
+  an astral character yields two, matching `WideCharToMultiByte` and SQL Server;
+  msodbcsql's glibc leg emits one byte instead, recorded as parity deviation 21.
+  As in msodbcsql, the substitution is not an error and is silent by default.
+
+  An application that needs to know can set the `SQL_COPT_SS_WARN_ON_CP_ERROR`
+  (1243) connection attribute to `SQL_WARN_YES`, which reports SQLSTATE `01000`
+  *"Warning: Code page translation caused loss of data"*. The call that carries
+  the diagnostic is the one that completes the parameter: `SQLExecute` /
+  `SQLExecDirect` return `SQL_SUCCESS_WITH_INFO` for a materialized value, while
+  a value streamed with `SQLPutData` leaves those returning `SQL_NEED_DATA` and
+  the warning arrives on the final `SQLParamData` — a diagnostic posted on the
+  `SQLPutData` that produced the loss would be cleared by the next call on the
+  handle. Values outside `SQL_WARN_NO` / `SQL_WARN_YES` are rejected with
+  `HY024`, as msodbcsql rejects them. It reports the conversion *this driver*
+  performs, using the collation the parameter carries (the connection's
+  negotiated database collation); the destination column is not known at that
+  point, so a column collated differently from the database can still lose
+  characters in the server's own conversion without this firing.
+
+  msodbcsql owns the attribute but consults it only on the retrieval direction
+  (output parameters and columns); this driver applies it to parameters, which
+  is where its own loss occurs — `SQL_C_CHAR` is UTF-8 here, so a fetch can
+  always represent whatever the server sent. Recorded as parity deviation 22,
+  alongside 21 for the best-fit mapping msodbcsql performs and this driver does
+  not.
+
+  Bulk copy shares the same encoder and substitutes on the same terms. Its
+  messages also carry the flag, so `TdsClient::take_code_page_conversion_loss`
+  reports a bulk substitution rather than silently answering `false`.
+
+  New `mssql_tds::datatypes::sql_string::NarrowEncoded` (returned by the now
+  loss-reporting `encode_narrow`) and `NARROW_SUBSTITUTE_BYTE` (the byte written
+  in place of an unrepresentable character; whether a substitution happened is
+  reported by `NarrowEncoded::had_loss` and the connection's loss flag, not by
+  inspecting the bytes, since a literal `?` is the same byte),
+  `TdsClient::take_code_page_conversion_loss` /
+  `note_code_page_conversion_loss`, and
+  `StreamingBulkLoadWriter::code_page_conversion_loss`.
+
+- `mssql-odbc`: NULL values returned through `SQLGetData`, bound columns, and
+  output parameters now leave character output buffers untouched instead of
+  writing a terminator. Applications should use the `SQL_NULL_DATA` indicator
+  to distinguish NULL from an empty string (#555).
 
 - `mssql-odbc`: `SQL_ATTR_QUERY_TIMEOUT` is now enforced for the implemented
   catalog functions (`SQLTables`, `SQLColumns`, `SQLPrimaryKeys`,
@@ -211,4 +281,3 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   idle-connection reconnect (`TdsClient::reconnect`) now wraps each attempt's
   full connect (DNS through login) in the attempt's remaining budget instead
   of only capping the post-resolution TCP connect step.
-

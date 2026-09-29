@@ -26,8 +26,10 @@ use super::txn::begin_transaction_if_manual;
 use super::util::write_if_some;
 use crate::api::type_rules::parameter_size_is_precision;
 use crate::error::{free_errors, post_sql_error};
+use crate::handles::desc::{DescRecord, UdtNameClaims, UdtNames};
 use crate::handles::stmt::{ParameterDescription, STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_STARTED};
 use crate::handles::{DescHandle, HandleType, StmtHandle, handle_from_raw};
+use std::sync::Arc;
 
 use super::set_desc_field::datetime_interval_code_for;
 
@@ -36,6 +38,12 @@ const DESCRIBE_PARAMETERS_PROC: &str = "sp_describe_undeclared_parameters";
 const PARAMETER_ORDINAL: usize = 0;
 const SUGGESTED_PRECISION: usize = 5;
 const SUGGESTED_SCALE: usize = 6;
+// The three-part CLR type name, which only a UDT parameter carries. msodbcsql
+// reads the same columns in `AutoFillIPD` (`sqlcdesc.cpp:10040`); the ordinals
+// are `E_Col_sp_describe_undeclared_parameters` (`clntcomn.h`) minus one.
+const SUGGESTED_USER_TYPE_DATABASE: usize = 8;
+const SUGGESTED_USER_TYPE_SCHEMA: usize = 9;
+const SUGGESTED_USER_TYPE_NAME: usize = 10;
 const SUGGESTED_TDS_TYPE_ID: usize = 22;
 const SUGGESTED_TDS_LENGTH: usize = 23;
 
@@ -171,8 +179,16 @@ fn sql_describe_param_safe(
             // call is idempotent for an already-bound marker and still picks
             // up one that was unbound (or never bound) since the last call.
             let cached = stmt_state.parameter_metadata.clone();
+            // Replayed, not dropped: `SQLFreeStmt(SQL_RESET_PARAMS)` truncates
+            // the IPD while leaving this cache intact, so a second
+            // reset-then-describe cycle has to rebuild the UDT identity from
+            // here or the execute fails with no type name. mssql-python runs
+            // exactly that cycle on every execution (microsoft/mssql-python#818).
+            let cached_udt_names = stmt_state.parameter_udt_names.clone();
             drop(stmt_state);
-            refine_ipd(stmt, &cached);
+            if refine_ipd(stmt, &cached, &cached_udt_names) != SQL_SUCCESS {
+                return post_refine_failure(stmt);
+            }
             write_description(
                 description,
                 data_type_ptr,
@@ -280,6 +296,9 @@ fn sql_describe_param_safe(
 
     let described_count = marker_count - usize::from(return_status);
     let mut collector = DescriptionCollector::new(described_count);
+    // Sparse, because only a `udt` marker has a name: `(index, identity)` keyed
+    // by the same ordinal the collector uses.
+    let mut udt_names: Vec<(usize, Arc<UdtNames>)> = Vec::new();
     // INVARIANT: a row that cannot be mapped must not leave this loop early.
     // The result set has to be drained and `close_query()` called below, or the
     // connection is left mid-result and every later operation on it fails. That
@@ -288,7 +307,10 @@ fn sql_describe_param_safe(
     let parse_result = loop {
         match dbc.runtime.block_on(client.next_row()) {
             Ok(Some(row)) => match parse_parameter_row(&row, described_count) {
-                Ok((index, description)) => {
+                Ok((index, description, names)) => {
+                    if let Some(names) = names {
+                        udt_names.push((index, names));
+                    }
                     if let Err(e) = collector.accept(index, description) {
                         break Err(e);
                     }
@@ -317,7 +339,18 @@ fn sql_describe_param_safe(
     // precision 10, scale 0, nullable).
     if return_status {
         descriptions.insert(0, RETURN_STATUS_DESCRIPTION);
+        // The insert shifts every described marker one ordinal to the right.
+        for (index, _) in &mut udt_names {
+            *index += 1;
+        }
     }
+
+    // Sorted once here so `refine_ipd` can binary-search instead of scanning:
+    // it replays this list for every cached answer, so a describe-all pass
+    // over N markers would otherwise cost O(N^3) ordinal comparisons - 62.6M
+    // at 500 UDT placeholders. `sp_describe_undeclared_parameters` rows are
+    // not promised in ordinal order, so this cannot assume the push order.
+    udt_names.sort_unstable_by_key(|(index, _)| *index);
 
     let info_messages = client.take_info_messages();
     return_client_idle(dbc, statement_handle, client);
@@ -327,6 +360,7 @@ fn sql_describe_param_safe(
         return SQL_ERROR;
     };
     stmt_state.parameter_metadata = descriptions.clone();
+    stmt_state.parameter_udt_names = udt_names.clone();
     stmt_state.clear_state(STMT_STATE_EXEC_STARTED);
     let has_info = post_tds_info_messages(&mut stmt_state, &info_messages);
 
@@ -341,7 +375,9 @@ fn sql_describe_param_safe(
     // Dropped before refine_ipd locks the IPD: this crate never holds a
     // STMT lock while acquiring a DESC lock (see bind_col.rs's rationale).
     drop(stmt_state);
-    refine_ipd(stmt, &descriptions);
+    if refine_ipd(stmt, &descriptions, &udt_names) != SQL_SUCCESS {
+        return post_refine_failure(stmt);
+    }
     write_description(
         description,
         data_type_ptr,
@@ -383,14 +419,33 @@ fn sql_describe_param_safe(
 /// `SQLBindParameter` (or the record's un-bound default) set them.
 ///
 /// Call only after the STMT lock has been dropped (see `bind_col.rs`'s
-/// locking-order rationale). A poisoned IPD mutex is logged and otherwise
-/// ignored: `SQLDescribeParam`'s own answer, already written from the
-/// in-memory `descriptions`, does not depend on this refinement succeeding.
-fn refine_ipd(stmt: &StmtHandle, descriptions: &[ParameterDescription]) {
+/// locking-order rationale). Failure is reported, not swallowed: the UDT
+/// identity this writes is the only source of `SQL_CA_SS_UDT_TYPE_NAME` on the
+/// describe-before-bind route, so answering `SQL_SUCCESS` after it failed would
+/// surface later as a misleading missing-name error at execute, or reuse a
+/// stale prepared declaration. Both call sites route a failure through
+/// `post_refine_failure` and skip `write_description`. Matches
+/// `clear_auto_filled_udt_names`, which propagates its own poisoned-mutex
+/// failure for the same reason.
+///
+/// INVARIANT: `udt_names` is sorted by ordinal. This function is replayed for
+/// every cached answer, so it binary-searches rather than scanning - a linear
+/// scan made a describe-all pass over N markers cost O(N^3) comparisons.
+/// `sql_describe_param_safe` sorts once before caching; the `debug_assert`
+/// below catches any future caller that forgets.
+fn refine_ipd(
+    stmt: &StmtHandle,
+    descriptions: &[ParameterDescription],
+    udt_names: &[(usize, Arc<UdtNames>)],
+) -> SqlReturn {
+    debug_assert!(
+        udt_names.windows(2).all(|w| w[0].0 <= w[1].0),
+        "refine_ipd requires udt_names sorted by ordinal for binary search"
+    );
     let desc = unsafe { handle_from_raw::<DescHandle>(stmt.ipd) };
     let Ok(mut desc_state) = desc.inner.lock() else {
         error!("SQLDescribeParam: ipd mutex poisoned; parameter metadata left unrefined");
-        return;
+        return SQL_ERROR;
     };
     let target_count = desc_state.records.len().max(descriptions.len());
     desc_state.set_record_count(target_count, desc.kind);
@@ -425,6 +480,34 @@ fn refine_ipd(stmt: &StmtHandle, descriptions: &[ParameterDescription]) {
             record.length = description.parameter_size;
             record.precision = 0;
         }
+        // The server is the only source for a UDT's name when the application
+        // has not supplied one, matching msodbcsql's `AutoFillIPD`. The merge
+        // is per part, because provenance is: a part the application set wins,
+        // the same way an explicit bind does above; an unclaimed one is
+        // replaced, since a re-`SQLPrepare` keeps IPD records and the previous
+        // name may belong to a different statement's marker.
+        let described = udt_names
+            .binary_search_by_key(&i, |(index, _)| *index)
+            .ok()
+            .map(|position| &udt_names[position].1);
+        // Nothing described and nothing stored: the overwhelmingly common
+        // case, every marker on a statement with no UDT in it. Skipping is
+        // behaviour-preserving - the merge below would copy empty into empty
+        // and the cleanup would undo it - but the merge allocates an
+        // `Arc<UdtNames>` to do it, and `refine_ipd` is replayed for every
+        // cache-served describe answer (`:189`), so not skipping costs ~N^2
+        // allocations across a describe-all pass over N non-UDT markers.
+        //
+        // A claim always accompanies a stored identity (`set_udt_name` creates
+        // the record before claiming; both clears drop the record only when
+        // nothing is claimed), so this cannot skip a record with live claims.
+        debug_assert!(
+            record.udt_names.is_some() || record.udt_name_claimed == UdtNameClaims::default(),
+            "a claimed UDT name part must have a record to live on"
+        );
+        if described.is_some() || record.udt_names.is_some() {
+            merge_udt_identity(record, described);
+        }
         if previous != record.parameter_definition() {
             first_changed.get_or_insert(i + 1);
         }
@@ -434,7 +517,96 @@ fn refine_ipd(stmt: &StmtHandle, descriptions: &[ParameterDescription]) {
         && stmt.invalidate_parameter_definition(first_changed).is_err()
     {
         error!("SQLDescribeParam: failed invalidating refined parameter definition");
+        return SQL_ERROR;
     }
+    SQL_SUCCESS
+}
+
+/// Merges a describe's UDT identity into one IPD record, per wire part.
+///
+/// A part the application claimed through `SQLSetDescField` wins; an unclaimed
+/// one takes the describe's value, or is emptied when the describe reports no
+/// UDT at this ordinal. Only the caller's guard decides whether there is
+/// anything to merge at all - see the allocation note there.
+fn merge_udt_identity(record: &mut DescRecord, described: Option<&Arc<UdtNames>>) {
+    let empty = UdtNames::default();
+    // A describe reporting no UDT here clears the unclaimed parts rather than
+    // discarding the record: it may still carry claimed parts, or the
+    // echo-only assembly name, which no describe restores.
+    let fresh = described.map_or(&empty, |names| &**names);
+    let claims = record.udt_name_claimed;
+    // Steady state: a replay after the first call finds the record already
+    // holding exactly this identity, so there is nothing to write. Comparing
+    // the three wire parts costs no allocation, where rebuilding them cost one
+    // owned copy per marker per cache-served answer - O(N^2) across a
+    // describe-all pass.
+    let merged = |part: fn(&UdtNames) -> &String, claimed: bool| -> &str {
+        if claimed {
+            record.udt_names.as_deref().map_or("", |n| part(n))
+        } else {
+            part(fresh)
+        }
+    };
+    let unchanged = record.udt_names.as_ref().is_some_and(|current| {
+        current.catalog == merged(|n| &n.catalog, claims.catalog)
+            && current.schema == merged(|n| &n.schema, claims.schema)
+            && current.type_name == merged(|n| &n.type_name, claims.type_name)
+    });
+    if !unchanged {
+        // Nothing of the application's to preserve: share the describe's
+        // identity rather than copying its three strings per marker.
+        if let Some(described) = described
+            && claims.none()
+            && record
+                .udt_names
+                .as_ref()
+                .is_none_or(|n| n.assembly_type_name.is_empty())
+        {
+            record.udt_names = Some(Arc::clone(described));
+        } else {
+            let names = Arc::make_mut(record.udt_names.get_or_insert_with(Default::default));
+            // This driver does not read the assembly-qualified column (see
+            // `read_udt_names`), so an application's survives the refresh of
+            // the parts around it.
+            if !claims.catalog {
+                names.catalog.clone_from(&fresh.catalog);
+            }
+            if !claims.schema {
+                names.schema.clone_from(&fresh.schema);
+            }
+            if !claims.type_name {
+                names.type_name.clone_from(&fresh.type_name);
+            }
+        }
+    }
+    // Nothing left worth carrying: no claimed part, nothing described, no
+    // assembly name to echo.
+    if record.udt_names.as_ref().is_some_and(|n| {
+        claims.none()
+            && n.assembly_type_name.is_empty()
+            && n.catalog.is_empty()
+            && n.schema.is_empty()
+            && n.type_name.is_empty()
+    }) {
+        record.udt_names = None;
+    }
+}
+
+/// Posts the diagnostic for a failed `refine_ipd` and returns `SQL_ERROR`.
+///
+/// The STMT lock is taken here rather than passed in: `refine_ipd` runs with it
+/// released, since this crate never holds a STMT lock while acquiring a DESC
+/// lock. Same shape as `SQLPrepareW`'s poisoned-IPD exit.
+fn post_refine_failure(stmt: &StmtHandle) -> SqlReturn {
+    if let Ok(mut stmt_state) = stmt.inner.lock() {
+        post_sql_error(
+            &mut stmt_state,
+            SQLSTATE_HY000,
+            0,
+            "Internal error refining parameter metadata",
+        );
+    }
+    SQL_ERROR
 }
 
 fn fail_metadata_response(
@@ -482,7 +654,7 @@ fn write_description(
 fn parse_parameter_row(
     row: &[ColumnValues],
     marker_count: usize,
-) -> Result<(usize, ParameterDescription), String> {
+) -> Result<(usize, ParameterDescription, Option<Arc<UdtNames>>), String> {
     let ordinal = read_i32(row, PARAMETER_ORDINAL, "parameter_ordinal")?;
     let index = usize::try_from(ordinal)
         .ok()
@@ -498,10 +670,9 @@ fn parse_parameter_row(
     let precision = read_optional_u8(row, SUGGESTED_PRECISION, "suggested_precision")?;
     let scale = read_optional_u8(row, SUGGESTED_SCALE, "suggested_scale")?;
 
-    Ok((
-        index,
-        describe_tds_type(data_type, length, precision, scale)?,
-    ))
+    let description = describe_tds_type(data_type, length, precision, scale)?;
+    let udt_names = read_udt_names(row, description.data_type);
+    Ok((index, description, udt_names))
 }
 
 fn describe_tds_type(
@@ -754,6 +925,42 @@ fn read_optional_u8(row: &[ColumnValues], index: usize, name: &str) -> Result<Op
     }
 }
 
+/// Reads an optional character column, flattening SQL NULL and the empty
+/// string to `None` so an absent name part is never sent as a zero-length one.
+fn read_optional_string(row: &[ColumnValues], index: usize) -> Option<String> {
+    match row.get(index) {
+        Some(ColumnValues::String(value)) => {
+            let text = value.to_utf8_string();
+            (!text.is_empty()).then_some(text)
+        }
+        _ => None,
+    }
+}
+
+/// The CLR type identity for a described `udt` parameter, or `None` for every
+/// other type. msodbcsql fills the same three IPD fields from these columns.
+fn read_udt_names(row: &[ColumnValues], data_type: SqlSmallInt) -> Option<Arc<UdtNames>> {
+    if data_type != SQL_SS_UDT {
+        return None;
+    }
+    let type_name = read_optional_string(row, SUGGESTED_USER_TYPE_NAME)?;
+    Some(Arc::new(UdtNames {
+        catalog: read_optional_string(row, SUGGESTED_USER_TYPE_DATABASE).unwrap_or_default(),
+        schema: read_optional_string(row, SUGGESTED_USER_TYPE_SCHEMA).unwrap_or_default(),
+        type_name,
+        // Left empty by choice, not because the server is silent:
+        // `sp_describe_undeclared_parameters` does return
+        // `suggested_assembly_qualified_type_name` (0-based column 11), and
+        // msodbcsql even reads it (`sqlcdesc.cpp:9155-9162`). But it reads it
+        // into a scratch `FRS_Format` field and never adds it to the IPD name
+        // pool the way it does the catalog/schema/type parts, so the field
+        // reads back empty there too. Since the parameter `TYPE_INFO` has no
+        // slot for an assembly name either, reading the column would buy
+        // nothing and would overwrite whatever the application set.
+        assembly_type_name: String::new(),
+    }))
+}
+
 /// Places parsed metadata rows into their ordinal slots.
 ///
 /// `sp_describe_undeclared_parameters` is expected to return exactly one row per
@@ -798,6 +1005,23 @@ impl DescriptionCollector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::handles::desc::UdtNameClaims;
+
+    /// `SQLSetDescField` for one `SQL_CA_SS_UDT_*` name on record 1, so tests
+    /// exercise `set_udt_name`'s provenance claim rather than reaching past it.
+    fn set_udt_name_field(ipd: SqlHandle, field: SqlUSmallInt, value: &str) {
+        let mut wide: Vec<u16> = value.encode_utf16().chain(std::iter::once(0)).collect();
+        let ret = unsafe {
+            crate::api::set_desc_field::sql_set_desc_field_w(
+                ipd,
+                1,
+                field as SqlSmallInt,
+                wide.as_mut_ptr() as SqlPointer,
+                SqlInteger::from(SQL_NTS),
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS);
+    }
     use crate::test_support::TestHandles;
     use mssql_tds::connection::tds_client::PreparedStatement;
 
@@ -1187,7 +1411,7 @@ mod tests {
 
     #[test]
     fn parses_mssql_python_integer_metadata() {
-        let (_, description) =
+        let (_, description, _) =
             parse_parameter_row(&row(1, TdsDataType::IntN, 4, 10, 0), 1).unwrap();
         assert_eq!(
             description,
@@ -1250,7 +1474,7 @@ mod tests {
     #[test]
     fn udt_parameter_size_matches_msodbcsql() {
         for length in [892, -1, i32::from(u16::MAX)] {
-            let (_, description) =
+            let (_, description, _) =
                 parse_parameter_row(&row(1, TdsDataType::Udt, length, 0, 0), 1).unwrap();
 
             assert_eq!(
@@ -1263,6 +1487,63 @@ mod tests {
                 }
             );
         }
+    }
+
+    fn utf8(text: &str) -> mssql_tds::datatypes::sql_string::SqlString {
+        mssql_tds::datatypes::sql_string::SqlString::new(
+            text.as_bytes().to_vec(),
+            mssql_tds::datatypes::sql_string::EncodingType::Utf8,
+        )
+    }
+
+    /// The server is the only source for a UDT's name when the application has
+    /// not supplied one, matching msodbcsql's `AutoFillIPD`
+    /// (`sqlcdesc.cpp:9358`), which fills the same three IPD fields from the
+    /// same `suggested_user_type_*` columns.
+    #[test]
+    fn udt_names_come_from_the_server_describe_columns() {
+        let mut r = row(1, TdsDataType::Udt, 892, 0, 0);
+        r[SUGGESTED_USER_TYPE_DATABASE] = ColumnValues::String(utf8("mydb"));
+        r[SUGGESTED_USER_TYPE_SCHEMA] = ColumnValues::String(utf8("dbo"));
+        r[SUGGESTED_USER_TYPE_NAME] = ColumnValues::String(utf8("Point"));
+
+        let names = parse_parameter_row(&r, 1).unwrap().2.expect("udt names");
+        assert_eq!(names.catalog, "mydb");
+        assert_eq!(names.schema, "dbo");
+        assert_eq!(names.type_name, "Point");
+        // Never sent for a parameter, so never read from the describe row.
+        assert_eq!(names.assembly_type_name, "");
+    }
+
+    /// An unqualified name is the common case: the server resolves it against
+    /// the current database and default schema, so the optional parts stay
+    /// empty rather than becoming a literal empty name.
+    #[test]
+    fn udt_names_tolerate_absent_catalog_and_schema() {
+        let mut r = row(1, TdsDataType::Udt, 892, 0, 0);
+        r[SUGGESTED_USER_TYPE_NAME] = ColumnValues::String(utf8("hierarchyid"));
+
+        let names = parse_parameter_row(&r, 1).unwrap().2.expect("udt names");
+        assert_eq!(names.catalog, "");
+        assert_eq!(names.schema, "");
+        assert_eq!(names.type_name, "hierarchyid");
+    }
+
+    /// Only a `udt` row carries an identity; every other type leaves the IPD's
+    /// UDT fields alone.
+    #[test]
+    fn non_udt_rows_carry_no_udt_names() {
+        let mut r = row(1, TdsDataType::IntN, 4, 0, 0);
+        r[SUGGESTED_USER_TYPE_NAME] = ColumnValues::String(utf8("Point"));
+        assert!(parse_parameter_row(&r, 1).unwrap().2.is_none());
+    }
+
+    /// A `udt` row with no name is unusable - the wire format requires one -
+    /// so it must not produce an identity the execute path would then trust.
+    #[test]
+    fn a_udt_row_without_a_name_yields_no_identity() {
+        let r = row(1, TdsDataType::Udt, 892, 0, 0);
+        assert!(parse_parameter_row(&r, 1).unwrap().2.is_none());
     }
 
     #[test]
@@ -1373,7 +1654,7 @@ mod tests {
         let h = TestHandles::with_env_dbc_stmt();
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let descriptions = vec![param_description(SQL_VARCHAR, 50, 0, SQL_NULLABLE)];
-        refine_ipd(stmt, &descriptions);
+        refine_ipd(stmt, &descriptions, &[]);
 
         let records = ipd_records(&h);
         assert_eq!(records.len(), 1);
@@ -1396,7 +1677,7 @@ mod tests {
             param_description(SQL_DECIMAL, 12, 3, SQL_NULLABLE),
             param_description(SQL_VARCHAR, 80, 0, SQL_NO_NULLS),
         ];
-        refine_ipd(stmt, &descriptions);
+        refine_ipd(stmt, &descriptions, &[]);
 
         let records = ipd_records(&h);
         assert_eq!(records[0].precision, 12);
@@ -1425,6 +1706,7 @@ mod tests {
         refine_ipd(
             stmt,
             &[param_description(SQL_TYPE_TIMESTAMP, 27, 7, SQL_NULLABLE)],
+            &[],
         );
 
         let record = &ipd_records(&h)[0];
@@ -1448,7 +1730,11 @@ mod tests {
             let mut state = desc.inner.lock().unwrap();
             state.set_record_count(3, desc.kind);
         }
-        refine_ipd(stmt, &[param_description(SQL_INTEGER, 0, 0, SQL_NULLABLE)]);
+        refine_ipd(
+            stmt,
+            &[param_description(SQL_INTEGER, 0, 0, SQL_NULLABLE)],
+            &[],
+        );
         assert_eq!(
             ipd_records(&h).len(),
             3,
@@ -1468,7 +1754,11 @@ mod tests {
             state.set_record_count(1, desc.kind);
             state.record_mut(1).unwrap().parameter_type = SQL_PARAM_INPUT;
         }
-        refine_ipd(stmt, &[param_description(SQL_INTEGER, 0, 0, SQL_NULLABLE)]);
+        refine_ipd(
+            stmt,
+            &[param_description(SQL_INTEGER, 0, 0, SQL_NULLABLE)],
+            &[],
+        );
         assert_eq!(ipd_records(&h)[0].parameter_type, SQL_PARAM_INPUT);
     }
 
@@ -1492,7 +1782,11 @@ mod tests {
             record.scale = 7;
             record.explicitly_bound = true;
         }
-        refine_ipd(stmt, &[param_description(SQL_INTEGER, 4, 0, SQL_NO_NULLS)]);
+        refine_ipd(
+            stmt,
+            &[param_description(SQL_INTEGER, 4, 0, SQL_NO_NULLS)],
+            &[],
+        );
 
         let record = &ipd_records(&h)[0];
         assert_eq!(
@@ -1515,13 +1809,21 @@ mod tests {
     fn refine_ipd_refreshes_a_marker_it_previously_auto_filled_itself() {
         let h = TestHandles::with_env_dbc_stmt();
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
-        refine_ipd(stmt, &[param_description(SQL_INTEGER, 0, 0, SQL_NULLABLE)]);
+        refine_ipd(
+            stmt,
+            &[param_description(SQL_INTEGER, 0, 0, SQL_NULLABLE)],
+            &[],
+        );
         assert_eq!(ipd_records(&h)[0].concise_type, SQL_INTEGER);
 
         // Simulates a re-SQLPrepare landing a different query with a
         // differently-typed marker 1, without any application bind ever
         // touching this IPD record in between.
-        refine_ipd(stmt, &[param_description(SQL_VARCHAR, 80, 0, SQL_NO_NULLS)]);
+        refine_ipd(
+            stmt,
+            &[param_description(SQL_VARCHAR, 80, 0, SQL_NO_NULLS)],
+            &[],
+        );
 
         let record = &ipd_records(&h)[0];
         assert_eq!(
@@ -1529,5 +1831,378 @@ mod tests {
             "a record refine_ipd filled in itself must stay refreshable"
         );
         assert_eq!(record.length, 80);
+    }
+
+    fn udt_identity(type_name: &str) -> Arc<UdtNames> {
+        Arc::new(UdtNames {
+            catalog: String::new(),
+            schema: String::new(),
+            type_name: type_name.to_string(),
+            assembly_type_name: String::new(),
+        })
+    }
+
+    /// The same ambiguity `explicitly_bound` resolves for the type, applied to
+    /// the UDT identity: `udt_names.is_some()` cannot tell an application's
+    /// `SQLSetDescField` apart from a name this function auto-filled for an
+    /// earlier statement. A re-`SQLPrepare` keeps IPD records, so a stale
+    /// auto-filled name must be replaced - while an explicit one is kept.
+    #[test]
+    fn refine_ipd_replaces_a_udt_name_it_auto_filled_but_keeps_an_explicit_one() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let described = [param_description(SQL_SS_UDT, 8000, 0, SQL_NULLABLE)];
+
+        refine_ipd(stmt, &described, &[(0, udt_identity("hierarchyid"))]);
+        assert_eq!(
+            ipd_records(&h)[0].udt_names.as_ref().unwrap().type_name,
+            "hierarchyid"
+        );
+
+        // A second prepare describing a different UDT at the same ordinal.
+        refine_ipd(stmt, &described, &[(0, udt_identity("geography"))]);
+        assert_eq!(
+            ipd_records(&h)[0].udt_names.as_ref().unwrap().type_name,
+            "geography",
+            "a stale auto-filled identity must not outlive its statement"
+        );
+
+        // Now the application claims the identity; the server must not win.
+        {
+            let desc = unsafe { handle_from_raw::<DescHandle>(h.ipd()) };
+            let mut state = desc.inner.lock().unwrap();
+            let record = state.record_mut(1).unwrap();
+            record.udt_names = Some(Arc::new(UdtNames::clone(&udt_identity("Point"))));
+            record.udt_name_claimed = UdtNameClaims {
+                catalog: true,
+                schema: true,
+                type_name: true,
+            };
+        }
+        refine_ipd(stmt, &described, &[(0, udt_identity("geography"))]);
+        assert_eq!(
+            ipd_records(&h)[0].udt_names.as_ref().unwrap().type_name,
+            "Point",
+            "an application-supplied identity outranks the server's suggestion"
+        );
+    }
+
+    /// Steps 1-4 of the sequence `clear_auto_filled_udt_names` sits in the
+    /// middle of: describe, write an assembly name, re-prepare, describe again.
+    /// The assembly name is echo-only and never a claim on the wire identity,
+    /// so the record it leaves behind must stay refreshable - clearing the
+    /// provenance flag while keeping the record stranded the parameter with an
+    /// empty `type_name` that no later describe could refill, failing the
+    /// execute with `ERR_MISSING_UDT_TYPE_NAME`.
+    #[test]
+    fn an_assembly_name_does_not_strand_a_record_the_server_must_still_name() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let described = [param_description(SQL_SS_UDT, 8000, 0, SQL_NULLABLE)];
+        let ipd = unsafe { handle_from_raw::<DescHandle>(h.ipd()) };
+
+        refine_ipd(stmt, &described, &[(0, udt_identity("hierarchyid"))]);
+
+        // SQLSetDescField(SQL_CA_SS_UDT_ASSEMBLY_TYPE_NAME): echo-only state,
+        // deliberately not a claim on the wire identity.
+        {
+            let mut state = ipd.inner.lock().unwrap();
+            let record = state.record_mut(1).unwrap();
+            record
+                .udt_names
+                .as_mut()
+                .map(Arc::make_mut)
+                .unwrap()
+                .assembly_type_name = "MyAsm".to_string();
+        }
+
+        // SQLPrepare with new SQL supersedes the described identity.
+        assert_eq!(ipd.clear_auto_filled_udt_names(), SQL_SUCCESS);
+
+        // The describe for the new SQL must still be able to name the type.
+        refine_ipd(stmt, &described, &[(0, udt_identity("geography"))]);
+
+        let record = &ipd_records(&h)[0];
+        let names = record.udt_names.as_ref().expect("record must survive");
+        assert_eq!(
+            names.type_name, "geography",
+            "a record kept only for its assembly name must stay refreshable"
+        );
+        assert_eq!(
+            names.assembly_type_name, "MyAsm",
+            "the application's assembly name survives the refresh around it"
+        );
+    }
+
+    /// The three wire parts are independently writable, so provenance is
+    /// per field. Both writes go through `SQLSetDescField` so the test guards
+    /// `set_udt_name`'s claim as well as the merge. Two orders prove one flag
+    /// cannot express it:
+    ///
+    /// 1. Server fills the identity, then the application overrides only the
+    ///    schema. A single flag marks the whole identity application-owned,
+    ///    so `clear_auto_filled_udt_names` preserves the *server's* stale type
+    ///    name across a re-`SQLPrepare` instead of letting the next describe
+    ///    refresh it.
+    /// 2. The application writes only the catalog, then describes. A gate
+    ///    keyed off `type_name` alone lets the describe overwrite a part the
+    ///    application did set.
+    #[test]
+    fn per_field_udt_provenance_survives_both_orders() {
+        let described = [param_description(SQL_SS_UDT, 8000, 0, SQL_NULLABLE)];
+
+        // Order 1: server-filled, then an application schema override.
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let ipd_ptr = h.ipd();
+        let ipd = unsafe { handle_from_raw::<DescHandle>(ipd_ptr) };
+
+        refine_ipd(stmt, &described, &[(0, udt_identity("hierarchyid"))]);
+        set_udt_name_field(ipd_ptr, SQL_CA_SS_UDT_SCHEMA_NAME, "dbo");
+        assert_eq!(ipd.clear_auto_filled_udt_names(), SQL_SUCCESS);
+        refine_ipd(stmt, &described, &[(0, udt_identity("geography"))]);
+
+        let names = ipd_records(&h)[0].udt_names.as_ref().unwrap().clone();
+        assert_eq!(
+            names.schema, "dbo",
+            "the application's schema write must survive"
+        );
+        assert_eq!(
+            names.type_name, "geography",
+            "the server's stale type name must not outlive its statement"
+        );
+
+        // Order 2: application writes the catalog only, then describes.
+        let h2 = TestHandles::with_env_dbc_stmt();
+        let stmt2 = unsafe { handle_from_raw::<StmtHandle>(h2.stmt) };
+        let ipd2_ptr = h2.ipd();
+        {
+            let ipd2 = unsafe { handle_from_raw::<DescHandle>(ipd2_ptr) };
+            let mut state = ipd2.inner.lock().unwrap();
+            state.set_record_count(1, ipd2.kind);
+        }
+        set_udt_name_field(ipd2_ptr, SQL_CA_SS_UDT_CATALOG_NAME, "mydb");
+        refine_ipd(stmt2, &described, &[(0, udt_identity("hierarchyid"))]);
+
+        let names2 = ipd_records(&h2)[0].udt_names.as_ref().unwrap().clone();
+        assert_eq!(
+            names2.catalog, "mydb",
+            "an application catalog write must not be overwritten by a describe"
+        );
+        assert_eq!(
+            names2.type_name, "hierarchyid",
+            "the unclaimed type name is still the server's to supply"
+        );
+    }
+
+    /// The other half of the same rule: when a later describe reports no UDT
+    /// at this ordinal, the record may still exist only to carry the
+    /// application's echo-only assembly name. Dropping it outright would
+    /// discard state no describe can ever restore.
+    #[test]
+    fn a_describe_without_a_udt_keeps_an_application_assembly_name() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let ipd = unsafe { handle_from_raw::<DescHandle>(h.ipd()) };
+        refine_ipd(
+            stmt,
+            &[param_description(SQL_SS_UDT, 8000, 0, SQL_NULLABLE)],
+            &[(0, udt_identity("hierarchyid"))],
+        );
+        {
+            let mut state = ipd.inner.lock().unwrap();
+            let record = state.record_mut(1).unwrap();
+            record
+                .udt_names
+                .as_mut()
+                .map(Arc::make_mut)
+                .unwrap()
+                .assembly_type_name = "MyAsm".to_string();
+        }
+
+        // The new SQL's marker 1 is an ordinary scalar: no UDT is described.
+        refine_ipd(
+            stmt,
+            &[param_description(SQL_INTEGER, 10, 0, SQL_NULLABLE)],
+            &[],
+        );
+
+        let record = &ipd_records(&h)[0];
+        let names = record
+            .udt_names
+            .as_ref()
+            .expect("a record carrying an assembly name must survive");
+        assert_eq!(names.assembly_type_name, "MyAsm");
+        assert!(
+            names.type_name.is_empty(),
+            "no describe supplied a wire identity, so it stays empty"
+        );
+    }
+
+    /// The set-then-describe route into the same stranded state, reached
+    /// without any clear: writing only the echo-only assembly name on a
+    /// never-described record leaves `Some(..)` with an empty `type_name`.
+    /// Gating on the provenance bit alone skipped it, so route (b) -
+    /// describe-before-execute supplying the identity - silently failed with
+    /// `ERR_MISSING_UDT_TYPE_NAME` for an application that knew its assembly
+    /// but relied on the server for the type name.
+    #[test]
+    fn an_assembly_name_alone_does_not_block_the_server_from_naming_the_type() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let ipd = unsafe { handle_from_raw::<DescHandle>(h.ipd()) };
+
+        // Exactly what `set_udt_name` does for the assembly field on a fresh
+        // record: it claims no wire part.
+        {
+            let mut state = ipd.inner.lock().unwrap();
+            state.set_record_count(1, ipd.kind);
+            let record = state.record_mut(1).unwrap();
+            record.udt_names = Some(Arc::new(UdtNames {
+                assembly_type_name: "MyAsm".to_string(),
+                ..Default::default()
+            }));
+        }
+
+        refine_ipd(
+            stmt,
+            &[param_description(SQL_SS_UDT, 8000, 0, SQL_NULLABLE)],
+            &[(0, udt_identity("hierarchyid"))],
+        );
+
+        let names = ipd_records(&h)[0]
+            .udt_names
+            .as_ref()
+            .expect("record must survive")
+            .clone();
+        assert_eq!(
+            names.type_name, "hierarchyid",
+            "an assembly name alone claims no wire identity, so the server still names the type"
+        );
+        assert_eq!(
+            names.assembly_type_name, "MyAsm",
+            "the application's assembly name survives the refresh around it"
+        );
+    }
+
+    /// The other side of the same gate: a `type_name` the application actually
+    /// wrote is a claim, and no describe may replace it.
+    #[test]
+    fn an_application_type_name_still_outranks_the_server() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let ipd = unsafe { handle_from_raw::<DescHandle>(h.ipd()) };
+
+        {
+            let mut state = ipd.inner.lock().unwrap();
+            state.set_record_count(1, ipd.kind);
+            let record = state.record_mut(1).unwrap();
+            record.udt_names = Some(Arc::new(UdtNames::clone(&udt_identity("Point"))));
+            record.udt_name_claimed = UdtNameClaims {
+                catalog: true,
+                schema: true,
+                type_name: true,
+            };
+        }
+
+        refine_ipd(
+            stmt,
+            &[param_description(SQL_SS_UDT, 8000, 0, SQL_NULLABLE)],
+            &[(0, udt_identity("hierarchyid"))],
+        );
+
+        assert_eq!(
+            ipd_records(&h)[0].udt_names.as_ref().unwrap().type_name,
+            "Point",
+            "an application-supplied type name is a claim the server cannot override"
+        );
+    }
+
+    /// `refine_ipd` binary-searches `udt_names`, so every marker must still
+    /// resolve to its own identity rather than a neighbour's. Pins the
+    /// ordering contract the search depends on: `sp_describe_undeclared_
+    /// parameters` does not promise ordinal order, so the sort in
+    /// `sql_describe_param_safe` is what makes this hold.
+    #[test]
+    fn each_marker_resolves_its_own_identity_across_a_sorted_list() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+
+        // Three UDT markers with a non-UDT gap at ordinal 2, sorted as the
+        // caching path leaves them.
+        let described = [
+            param_description(SQL_SS_UDT, 8000, 0, SQL_NULLABLE),
+            param_description(SQL_SS_UDT, 8000, 0, SQL_NULLABLE),
+            param_description(SQL_INTEGER, 10, 0, SQL_NULLABLE),
+            param_description(SQL_SS_UDT, 8000, 0, SQL_NULLABLE),
+        ];
+        let names = [
+            (0, udt_identity("hierarchyid")),
+            (1, udt_identity("geometry")),
+            (3, udt_identity("geography")),
+        ];
+
+        refine_ipd(stmt, &described, &names);
+
+        let records = ipd_records(&h);
+        assert_eq!(
+            records[0].udt_names.as_ref().unwrap().type_name,
+            "hierarchyid"
+        );
+        assert_eq!(records[1].udt_names.as_ref().unwrap().type_name, "geometry");
+        assert!(
+            records[2].udt_names.is_none(),
+            "the gap ordinal has no identity to take"
+        );
+        assert_eq!(
+            records[3].udt_names.as_ref().unwrap().type_name,
+            "geography"
+        );
+    }
+
+    /// `SQLFreeStmt(SQL_RESET_PARAMS)` truncates the IPD but leaves the
+    /// parameter-metadata cache intact, so the next `SQLDescribeParam` is
+    /// served from the cache and has to rebuild the UDT identity from there.
+    /// Dropping it left the record with no type name and failed the execute.
+    /// mssql-python runs this reset-then-describe cycle on every execution
+    /// (microsoft/mssql-python#818), so the second cycle is the common path.
+    #[test]
+    fn a_cached_describe_still_supplies_the_udt_identity_after_a_parameter_reset() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.prepared = Some(crate::handles::stmt::PreparedPlan {
+                stmt: PreparedStatement::new("SELECT @P1".to_string()),
+                marker_count: 1,
+                original_sql: String::new(),
+            });
+            state
+                .parameter_metadata
+                .push(param_description(SQL_SS_UDT, 8000, 0, SQL_NULLABLE));
+            state.parameter_udt_names = vec![(0, udt_identity("hierarchyid"))];
+        }
+        // What SQL_RESET_PARAMS leaves behind: no IPD records, cache intact.
+        {
+            let desc = unsafe { handle_from_raw::<DescHandle>(h.ipd()) };
+            desc.inner.lock().unwrap().records.clear();
+        }
+
+        let rc = unsafe {
+            sql_describe_param(
+                h.stmt,
+                1,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(rc, SQL_SUCCESS);
+        assert_eq!(
+            ipd_records(&h)[0].udt_names.as_ref().unwrap().type_name,
+            "hierarchyid",
+            "the cache-served describe must restore the identity it first found"
+        );
     }
 }

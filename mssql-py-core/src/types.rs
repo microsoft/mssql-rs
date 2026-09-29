@@ -433,8 +433,11 @@ pub(crate) fn py_to_sql_type_with_hint(
         InputSqlType::Vector => hinted_vector(py_obj, hint),
         InputSqlType::Money | InputSqlType::SmallMoney => hinted_money(py_obj, hint),
         InputSqlType::Variant => Ok(SqlType::Variant(Box::new(py_to_sql_type(py_obj)?))),
-        // TODO(mssql-tds): Add a public SqlType::Udt input contract and RPC
-        // serializer carrying database, schema, and server UDT type names.
+        // `mssql-tds` now has the contract this once waited on (`SqlType::Udt`,
+        // `UdtTypeName`, `write_udt_type_name`). What is still missing is on
+        // the Python side: `setinputsizes` has no way to carry the type name.
+        // Tracked in microsoft/mssql-python#816, fixed by #818 (AB#48445),
+        // which resolves the name via SQLDescribeParam instead.
         InputSqlType::Udt => Err(unsupported_udt_parameter()),
     }
 }

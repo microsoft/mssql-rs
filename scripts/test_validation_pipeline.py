@@ -3,8 +3,13 @@
 
 """Regression tests for validation pipeline builds, tests, and artifacts."""
 
+import importlib.util
 import re
+import shutil
+import subprocess
+import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -13,6 +18,12 @@ _ROOT = Path(__file__).parents[1]
 _TEMPLATES = _ROOT / ".pipeline" / "templates"
 _NON_PR = "and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))"
 _PR = "and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))"
+_BASH = shutil.which("bash")
+_VERIFY = _ROOT / ".pipeline" / "scripts" / "verify-mssql-python.py"
+_SPEC = importlib.util.spec_from_file_location("verify_mssql_python", _VERIFY)
+assert _SPEC and _SPEC.loader
+verify_python = importlib.util.module_from_spec(_SPEC)
+_SPEC.loader.exec_module(verify_python)
 
 
 def load_template(name):
@@ -115,14 +126,165 @@ def test_cross_repo_jobs_share_the_pinned_checkout(template):
     assert "mssql-python-branch" not in text
 
 
-def test_mssql_python_macos_failures_fail_the_job():
+def test_macos_docker_condition_preserves_other_callers():
+    template = load_template("macos-docker-steps.yml")
+    condition = next(p for p in template["parameters"] if p["name"] == "condition")
+    assert condition == {"name": "condition", "type": "string", "default": "succeeded()"}
+    for step in template["steps"]:
+        assert step["condition"] == "${{ parameters.condition }}"
+        assert not step.get("continueOnError", False)
+
+    sql_steps = load_template("sql-setup-template.yml")["steps"]
+    macos = next(
+        step["${{ if eq(parameters.buildTarget, 'MacOS') }}"]
+        for step in sql_steps if "${{ if eq(parameters.buildTarget, 'MacOS') }}" in step
+    )
+    docker = next(step for step in macos if step.get("template") == "macos-docker-steps.yml")
+    assert "condition" not in docker.get("parameters", {})
+    sql = next(step for step in macos if "start-sql-server-macos.sh" in step.get("script", ""))
+    assert sql.get("condition", "succeeded()") == "succeeded()"
+
+
+def test_mssql_python_macos_readiness_gates_provisioning():
     steps = load_template("test-mssql-python-macos-template.yml")["steps"]
-    run = next(step for step in steps if step.get("displayName") == "Run mssql-python tests")
-    assert "continueOnError" not in run
-    publish = next(step for step in steps if step.get("task") == "PublishTestResults@2")
-    assert publish["condition"] == "succeededOrFailed()"
-    assert publish["inputs"]["failTaskOnFailedTests"] is True
-    assert publish["inputs"]["failTaskOnMissingResultsFile"] is True
+    named = {step["displayName"]: step for step in steps if "displayName" in step}
+    ready = "and(succeeded(), eq(variables['mssqlPythonReady'], 'true'))"
+    docker = next(step for step in steps if step.get("template") == "macos-docker-steps.yml")
+    assert docker["parameters"]["condition"] == ready
+    sql = named["Start SQL Server (Docker, no TLS certs)"]
+    tests = named["Run mssql-python tests"]
+    assert sql["condition"] == tests["condition"] == ready
+    smoke = named["Verify installed mssql-python runtime"]
+    assert steps.index(smoke) < steps.index(docker) < steps.index(sql) < steps.index(tests)
+    assert smoke.get("condition", "succeeded()") == "succeeded()"
+    for step in steps:
+        assert not step.get("continueOnError", False)
+
+    setup_results = named["Publish mssql-python macOS setup results"]
+    test_results = named["Publish mssql-python macOS test results"]
+    assert setup_results["condition"] == "succeededOrFailed()"
+    assert test_results["condition"] == (
+        "and(succeededOrFailed(), eq(variables['mssqlPythonReady'], 'true'))"
+    )
+    for publish in (setup_results, test_results):
+        assert publish["inputs"]["failTaskOnMissingResultsFile"] is True
+    assert named["Cleanup SQL Server"]["condition"] == (
+        "and(always(), eq(variables['mssqlPythonReady'], 'true'))"
+    )
+    assert named["Cleanup"]["condition"] == "always()"
+
+
+@pytest.mark.skipif(_BASH is None, reason="Bash is required")
+@pytest.mark.parametrize("count", [0, 1, 2])
+def test_odbc_wheel_installation(tmp_path, count):
+    steps = load_template("test-mssql-python-macos-template.yml")["steps"]
+    script = next(step["script"] for step in steps if step.get("displayName") == "Install mssql-python packages")
+    source = tmp_path / "rust"
+    source.mkdir()
+    wheels = tmp_path / "mssql-python" / "odbc-dist"
+    wheels.mkdir(parents=True)
+    for index in range(count):
+        (wheels / f"mssql_python_odbc-{index}.whl").touch()
+    result = subprocess.run(
+        [_BASH, "-s"], cwd=source, capture_output=True, text=True,
+        input='python() { printf "%s\\t" "$@"; printf "\\n"; }\n'
+        + script.replace("$(Build.SourcesDirectory)", "$PWD"),
+    )
+    assert result.returncode == (0 if count == 1 else 1), result.stdout + result.stderr
+    if count == 1:
+        installs = [line.split("\t")[:-1] for line in result.stdout.splitlines()]
+        assert len(installs) == 2
+        assert installs[0][:4] == ["-m", "pip", "install", "--no-deps"]
+        assert installs[0][4].endswith("mssql_python_odbc-0.whl")
+        assert installs[1][:5] == ["-m", "pip", "install", "--no-deps", "-e"]
+    else:
+        assert f"Expected exactly one mssql-python-odbc wheel, found {count}" in result.stdout
+        assert "\t" not in result.stdout
+
+
+@pytest.fixture
+def installed_runtime(tmp_path, monkeypatch):
+    driver = tmp_path / "driver.dylib"
+    driver.touch()
+    provider = {"id": "msodbcsql18", "driver_path": str(driver)}
+    module = SimpleNamespace(get_native_provider_info=lambda: provider)
+    monkeypatch.setitem(sys.modules, "mssql_python", module)
+    monkeypatch.setattr(verify_python.metadata, "requires", lambda _: [])
+    return module, provider
+
+
+@pytest.mark.parametrize(
+    ("requirement", "installed", "error"),
+    [
+        ("MSSQL_PYTHON_RS==9.9", "0.2", None),
+        ("mssql-python-odbc==9.9", "0.2", None),
+        ("new-dependency>=2", "3", None),
+        ("new-dependency>=2", None, "Missing runtime dependency"),
+        ("new-dependency>=2", "1", "update setup requirements"),
+        ("inactive; python_version < '2'", None, None),
+        ("optional; extra == 'feature'", None, None),
+        ("new-dependency[feature]", "1", "explicit setup support"),
+        ("new-dependency @ https://example.invalid/package.whl", "1", "explicit setup support"),
+        ("mssql-python-rs[feature]", "0.2", "explicit setup support"),
+        ("mssql-python-odbc @ https://example.invalid/package.whl", "18", "explicit setup support"),
+    ],
+)
+def test_runtime_requirements(installed_runtime, monkeypatch, requirement, installed, error):
+    monkeypatch.setattr(verify_python.metadata, "requires", lambda _: [requirement])
+
+    def version(_):
+        if installed is None:
+            raise verify_python.metadata.PackageNotFoundError(requirement)
+        return installed
+
+    monkeypatch.setattr(verify_python.metadata, "version", version)
+    if error:
+        with pytest.raises((AssertionError, pytest.fail.Exception), match=error):
+            verify_python.test_installed_runtime()
+    else:
+        verify_python.test_installed_runtime()
+
+
+@pytest.mark.parametrize("reason", [None, "PullRequest", "IndividualCI"])
+@pytest.mark.parametrize(
+    "case", ["ok", "bad-id", "missing-path", "nonexistent-path", "missing-api",
+             "required-argument", "query-error", "import-error"],
+)
+def test_provider_failure_policy(installed_runtime, monkeypatch, capsys, reason, case):
+    module, provider = installed_runtime
+    if reason is None:
+        monkeypatch.delenv("BUILD_REASON", raising=False)
+    else:
+        monkeypatch.setenv("BUILD_REASON", reason)
+    if case == "bad-id":
+        provider["id"] = "other"
+    elif case == "missing-path":
+        provider.pop("driver_path")
+    elif case == "nonexistent-path":
+        provider["driver_path"] += ".missing"
+    elif case == "missing-api":
+        del module.get_native_provider_info
+    elif case == "required-argument":
+        module.get_native_provider_info = lambda required: provider
+    elif case == "query-error":
+        def broken_query():
+            raise TypeError("unexpected provider failure")
+        module.get_native_provider_info = broken_query
+    elif case == "import-error":
+        monkeypatch.setitem(sys.modules, "mssql_python", None)
+    if case == "ok":
+        verify_python.test_installed_runtime()
+    else:
+        expected = {"query-error": TypeError, "import-error": ModuleNotFoundError}.get(
+            case, pytest.skip.Exception if reason == "IndividualCI" else pytest.fail.Exception,
+        )
+        with pytest.raises(expected):
+            verify_python.test_installed_runtime()
+    output = capsys.readouterr().out
+    assert ("mssqlPythonReady]true" in output) == (case == "ok")
+    assert ("type=warning" in output) == (
+        reason == "IndividualCI" and case not in ("ok", "query-error", "import-error")
+    )
 
 
 def test_pin_validation_is_not_path_filtered_or_optional():
@@ -135,10 +297,11 @@ def test_pin_validation_is_not_path_filtered_or_optional():
     stage = next(stage for stage in stages if stage["stage"] == "Build_mssql_python")
     assert stage["dependsOn"] == ["EvaluateDuplicate"]
     assert stage["condition"] == (
-        "and(not(canceled()), eq(variables['Build.Reason'], 'PullRequest'), "
+        "and(not(canceled()), "
         "eq('${{ parameters.RunFuzz }}', 'false'), "
         "eq('${{ parameters.RunLongHaul }}', 'false'), "
-        "ne(dependencies.EvaluateDuplicate.outputs['Evaluate.SetDuplicateState.skipDuplicate'], 'true'))"
+        "or(ne(variables['Build.Reason'], 'PullRequest'), "
+        "ne(dependencies.EvaluateDuplicate.outputs['Evaluate.SetDuplicateState.skipDuplicate'], 'true')))"
     )
     for job in stage["jobs"]:
         assert "condition" not in job
@@ -166,7 +329,7 @@ def test_alpine_gssapi_compilation_still_runs_on_prs():
     assert "--features gssapi" in script
 
 
-def test_mssql_python_odbc_failures_fail_the_job():
+def test_mssql_python_odbc_failures_are_advisory_only_in_ci():
     template_path = _TEMPLATES / "test-mssql-python-odbc-template.yml"
     template = template_path.read_text(encoding="utf-8")
     steps = yaml.safe_load(template)["steps"]
@@ -177,8 +340,9 @@ def test_mssql_python_odbc_failures_fail_the_job():
     )
     assert "continueOnError" not in test_step
     assert 'exit "$rc"' in test_step["script"]
-    assert "task.complete result=SucceededWithIssues" not in test_step["script"]
-    assert "SucceededWithIssues" not in template
+    assert "task.complete result=SucceededWithIssues" in test_step["script"]
+    publish = next(step for step in steps if step.get("task") == "PublishTestResults@2")
+    assert publish["inputs"]["failTaskOnFailedTests"] is False
 
     # A docker-exec launch failure (125/126/127), or the runner's own exit 2
     # for a broken harness, both mean the tests said nothing about the driver,
@@ -188,8 +352,7 @@ def test_mssql_python_odbc_failures_fail_the_job():
     assert re.search(r"125\|126\|127\)", test_step["script"])
     assert "exit \"$rc\"" in test_step["script"].rsplit("esac", 1)[-1]
 
-    # The step alone isn't the whole gate: a job-level continueOnError would
-    # silently restore the old non-blocking behavior regardless of exit code.
+    # Harness failures must not be masked by a job-level continueOnError.
     stages = yaml.safe_load(
         (_TEMPLATES / "validation-stages.yml").read_text(encoding="utf-8")
     )["stages"]
@@ -209,6 +372,83 @@ def test_mssql_python_odbc_failures_fail_the_job():
     dirty_run_parts = runner.split('if [ "$failed" -gt 0 ]', 1)
     assert len(dirty_run_parts) == 2, "dirty-run guard line not found in runner script"
     assert re.search(r"\bexit 1\b", dirty_run_parts[1])
+
+
+@pytest.mark.skipif(_BASH is None, reason="Bash is required")
+@pytest.mark.parametrize(
+    ("pytest_exit", "runner_exit"),
+    [(0, 0), (1, 1), (2, 1), (3, 2), (4, 2), (5, 0),
+     (124, 1), (125, 2), (126, 2), (127, 2), (137, 1), (139, 1)],
+)
+def test_odbc_runner_distinguishes_harness_errors(tmp_path, pytest_exit, runner_exit):
+    tests = tmp_path / "tests"
+    tests.mkdir()
+    (tests / "test_pass.py").touch()
+    (tests / "test_result.py").touch()
+    runner = _ROOT / ".pipeline" / "scripts" / "run-mssql-python-odbc-tests.sh"
+    (tmp_path / "runner.sh").write_text(runner.read_text(encoding="utf-8"), newline="\n")
+    script = f"""
+    python() {{ return 0; }}
+    timeout() {{
+        for arg in "$@"; do
+            case "$arg" in
+                tests/test_pass.py) return 0 ;;
+                tests/test_result.py) return {pytest_exit} ;;
+            esac
+        done
+        echo "Unexpected timeout arguments: $*" >&2
+        return 125
+    }}
+    MSSQL_PYTHON_DIR="$2" TEST_RESULTS_DIR="$2/test-results" \
+        PYTEST_FILE_TIMEOUT=10s PYTEST_TOTAL_BUDGET=120s source "$1"
+    """
+    script_path = tmp_path / "run-test.sh"
+    script_path.write_text(script, encoding="utf-8", newline="\n")
+    result = subprocess.run(
+        [_BASH, script_path.name, "./runner.sh", "."],
+        cwd=tmp_path, capture_output=True, text=True,
+    )
+    assert result.returncode == runner_exit, result.stdout + result.stderr
+    assert "Unexpected timeout arguments" not in result.stderr
+    assert f"passed: {2 if pytest_exit == 0 else 1} |" in result.stdout
+    assert f"harness errors: {int(runner_exit == 2)}" in result.stdout
+    assert len(list((tmp_path / "test-results").glob("*.xml"))) == 2
+
+
+@pytest.mark.skipif(_BASH is None, reason="Bash is required")
+@pytest.mark.parametrize(
+    ("template", "display_name", "command"),
+    [
+        ("test-mssql-python-macos-template.yml", "Run mssql-python tests", "pytest"),
+        (
+            "test-mssql-python-odbc-template.yml",
+            "Run mssql-python tests against mssql-odbc",
+            "docker",
+        ),
+    ],
+)
+@pytest.mark.parametrize("exit_code", [0, 1, 2, 3, 4, 5, 125, 126, 127, 137])
+@pytest.mark.parametrize("reason", ["PullRequest", "IndividualCI", "BatchedCI", "Manual", "Schedule", ""])
+def test_python_pipeline_test_exit_codes(tmp_path, template, display_name, command, exit_code, reason):
+    step = next(
+        step for step in load_template(template)["steps"]
+        if step.get("displayName") == display_name
+    )
+    script = step["script"].replace("$(Build.SourcesDirectory)", "/workspace")
+    script = re.sub(r"\$\{\{.*?\}\}", "10m", script)
+    script_path = tmp_path / "run-step.sh"
+    script_path.write_text(
+        f"BUILD_REASON='{reason}'\n{command}() {{ return {exit_code}; }}\n{script}",
+        encoding="utf-8", newline="\n",
+    )
+    result = subprocess.run(
+        [_BASH, script_path.name],
+        cwd=tmp_path, capture_output=True, text=True,
+    )
+    advisory = exit_code == 1 and reason not in ("PullRequest", "")
+    assert result.returncode == (0 if advisory else exit_code), result.stderr
+    assert ("task.logissue type=warning" in result.stdout) == advisory
+    assert ("task.complete result=SucceededWithIssues;" in result.stdout) == advisory
 
 
 @pytest.mark.parametrize("architecture", ["x64", "ARM64"])

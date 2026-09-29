@@ -12,6 +12,7 @@
 
 #include "odbc_test_fixture.h"
 
+#include <array>
 #include <cstring>
 #include <string>
 
@@ -23,6 +24,10 @@ protected:
             FAIL() << "No connection configured – set ODBC_TEST_SERVER or ODBC_TEST_CONNSTR";
         }
         Connect();
+        SQLCHAR version[32] = {};
+        ASSERT_SQL_OK(SQLGetInfoA(dbc_, SQL_DRIVER_VER, version, sizeof(version), nullptr),
+                      SQL_HANDLE_DBC, dbc_);
+        RecordProperty("driver_version", reinterpret_cast<const char*>(version));
     }
     SQLRETURN ExecDirect(const std::string& sql) {
         SqlTString s = ODBCTestUtils::ToSqlTStr(sql);
@@ -250,10 +255,53 @@ TEST_F(BinToCharLiveTest, NullVarbinaryMaxReportsNull) {
     ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_CHAR, buf, sizeof(buf), &ind), SQL_HANDLE_STMT,
                   stmt_);
     EXPECT_EQ(SQL_NULL_DATA, ind);
-    // No comparison skip: only the shared NULL indicator is asserted.
-    // The pre-existing NULL terminator difference is tracked in #555;
-    // buffer-content parity belongs with that fix, not hex conversion.
     SQLCloseCursor(stmt_);
+}
+
+// #555: msodbcsql18 18.6.2.1-1 (SQL_DRIVER_VER 18.06.0002), Linux/unixODBC,
+// leaves NULL destinations untouched, including bound columns and zero-length reads.
+TEST_F(BinToCharLiveTest, NullBinaryPreservesCharacterBuffers) {
+    for (const char* type : {"BINARY(3)", "VARBINARY(8)", "VARBINARY(MAX)"}) {
+        SCOPED_TRACE(type);
+        for (SQLSMALLINT target : {SQL_C_CHAR, SQL_C_WCHAR}) {
+            SCOPED_TRACE(target);
+            for (bool bound : {false, true}) {
+                SCOPED_TRACE(bound);
+                for (SQLLEN capacity : {0, 1, 2, 3, 32}) {
+                    SCOPED_TRACE(capacity);
+                    std::array<unsigned char, 32> buffer;
+                    buffer.fill(0x7E);
+                    const auto untouched = buffer;
+                    SQLLEN indicator = -99;
+                    if (bound) {
+                        ASSERT_EQ(SQL_SUCCESS, SQLBindCol(stmt_, 1, target, buffer.data(),
+                                                         capacity, &indicator));
+                    }
+                    ASSERT_EQ(SQL_SUCCESS, ExecDirect(
+                        "SELECT CAST(NULL AS " + std::string(type) + "), 42"));
+                    ASSERT_EQ(SQL_SUCCESS, SQLFetch(stmt_));
+                    if (!bound) {
+                        ASSERT_EQ(SQL_SUCCESS, SQLGetData(stmt_, 1, target, buffer.data(),
+                                                         capacity, &indicator));
+                    }
+                    EXPECT_EQ(SQL_NULL_DATA, indicator);
+                    EXPECT_EQ(untouched, buffer);
+                    EXPECT_EQ("", StmtDiagState());
+                    if (!bound) {
+                        EXPECT_EQ(SQL_NO_DATA, SQLGetData(stmt_, 1, target, buffer.data(),
+                                                         capacity, &indicator));
+                        EXPECT_EQ(untouched, buffer);
+                    }
+                    SQLINTEGER next = 0;
+                    ASSERT_EQ(SQL_SUCCESS, SQLGetData(stmt_, 2, SQL_C_SLONG, &next,
+                                                     sizeof(next), &indicator));
+                    EXPECT_EQ(42, next);
+                    ASSERT_EQ(SQL_SUCCESS, SQLCloseCursor(stmt_));
+                    ASSERT_EQ(SQL_SUCCESS, SQLFreeStmt(stmt_, SQL_UNBIND));
+                }
+            }
+        }
+    }
 }
 
 TEST_F(BinToCharLiveTest, StreamedHexChunksWithADecreasingRemainder) {

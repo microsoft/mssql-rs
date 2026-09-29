@@ -178,6 +178,18 @@ impl TvpColumnDef {
     }
 
     fn validate(&self) -> TdsResult<()> {
+        // A UDT column's COLMETADATA carries MAX_BYTE_SIZE and the
+        // assembly-qualified name; `write_type_info` only emits the RPC
+        // parameter form, so accepting one here would write malformed TDS.
+        // `serialize_table` runs this before any column metadata, so the
+        // malformed bytes are never written - only the TVP type byte and name
+        // precede the check.
+        if matches!(self.column_type, SqlType::Udt(_, _)) {
+            return Err(Error::UsageError(
+                "UDT columns are not supported in table-valued parameters".to_string(),
+            ));
+        }
+
         if let Some((precision, scale)) = self.decimal_metadata() {
             validate_decimal_metadata(precision, scale)?;
         }
@@ -339,6 +351,13 @@ impl TvpTableData {
     /// and that each cell's [`SqlType`] variant matches its column's type
     /// template. Variant matching uses [`std::mem::discriminant`], so the
     /// inner value (including `None` vs `Some`) is not compared.
+    ///
+    /// `serialize_table` runs this before any column metadata or row bytes are
+    /// written, so a rejection here keeps all of those off the wire. It is not
+    /// a full preflight: the TVP type byte and three-part name precede it, so
+    /// a failure leaves those in the writer and, if they overflowed a packet,
+    /// already sent - the same partial-request shape `validate_parameters`
+    /// exists to avoid for scalar parameters.
     pub(crate) fn validate(&self) -> TdsResult<()> {
         if self.columns.is_empty() {
             return Err(Error::UsageError(
@@ -422,7 +441,9 @@ pub(crate) async fn write_tvp_type_name(
 /// Writes a TDS B_VARCHAR: a `u8` UTF-16 character count followed by the
 /// UTF-16LE-encoded characters. `None` or an empty string writes a single
 /// `0x00` length byte.
-async fn write_b_varchar(
+///
+/// Shared with the UDT parameter header, which names its type in the same form.
+pub(crate) async fn write_b_varchar(
     packet_writer: &mut PacketWriter<'_>,
     value: Option<&str>,
 ) -> TdsResult<()> {
@@ -431,7 +452,7 @@ async fn write_b_varchar(
             let char_count = s.encode_utf16().count();
             if char_count > u8::MAX as usize {
                 return Err(Error::UsageError(format!(
-                    "TVP name part is too long: {char_count} UTF-16 code units (max 255)"
+                    "type name part is too long: {char_count} UTF-16 code units (max 255)"
                 )));
             }
             packet_writer.write_byte_async(char_count as u8).await?;
@@ -819,6 +840,21 @@ mod tests {
             vec![vec![SqlType::Int(Some(1))], vec![SqlType::Int(None)]],
         );
         assert!(data.validate().is_ok());
+    }
+
+    /// `write_type_info` emits only the RPC parameter form of a UDT, which
+    /// omits the MAX_BYTE_SIZE and assembly-qualified name a COLMETADATA UDT
+    /// column carries. Accepting one here would write malformed TDS.
+    #[test]
+    fn test_validate_rejects_a_udt_column() {
+        let data = TvpTableData::new(
+            vec![TvpColumnDef::new(SqlType::Udt(
+                crate::datatypes::sql_udt::UdtTypeName::new(None, None, "Point".to_string()),
+                None,
+            ))],
+            Vec::new(),
+        );
+        assert!(matches!(data.validate(), Err(Error::UsageError(_))));
     }
 
     #[test]

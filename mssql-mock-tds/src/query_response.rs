@@ -24,6 +24,8 @@ pub enum SqlDataType {
     NVarCharMax,
     /// VarChar(MAX) with caller-chosen PLP chunk boundaries and column collation.
     VarCharMax,
+    /// VarBinary(MAX) with caller-chosen PLP chunk boundaries.
+    VarBinaryMax,
 }
 
 impl SqlDataType {
@@ -36,6 +38,7 @@ impl SqlDataType {
             SqlDataType::BigInt => 0x26,   // IntN with length 8
             SqlDataType::NVarChar | SqlDataType::NVarCharMax => 0xE7, // NVarCharType
             SqlDataType::VarCharMax => 0xA7,
+            SqlDataType::VarBinaryMax => 0xA5,
         }
     }
 
@@ -47,7 +50,7 @@ impl SqlDataType {
             SqlDataType::Int => 4,
             SqlDataType::BigInt => 8,
             SqlDataType::NVarChar | SqlDataType::NVarCharMax => 255, // Handled specially
-            SqlDataType::VarCharMax => 255,
+            SqlDataType::VarCharMax | SqlDataType::VarBinaryMax => 255,
         }
     }
 }
@@ -62,8 +65,12 @@ pub enum ColumnValue {
     NVarChar(String),
     /// Nonempty wire chunks of raw UTF-16 units, including malformed sequences.
     NVarCharMax(Vec<Vec<u16>>),
+    /// SQL_PLP_NULL for an nvarchar(max) column, without a chunk terminator.
+    NVarCharMaxNull,
     /// Nonempty chunks of bytes encoded in the column's collation.
     VarCharMax(Vec<Vec<u8>>),
+    /// Nonempty chunks of opaque bytes.
+    VarBinaryMax(Vec<Vec<u8>>),
     Null,
 }
 
@@ -76,8 +83,9 @@ impl ColumnValue {
             ColumnValue::Int(_) => SqlDataType::Int,
             ColumnValue::BigInt(_) => SqlDataType::BigInt,
             ColumnValue::NVarChar(_) => SqlDataType::NVarChar,
-            ColumnValue::NVarCharMax(_) => SqlDataType::NVarCharMax,
+            ColumnValue::NVarCharMax(_) | ColumnValue::NVarCharMaxNull => SqlDataType::NVarCharMax,
             ColumnValue::VarCharMax(_) => SqlDataType::VarCharMax,
+            ColumnValue::VarBinaryMax(_) => SqlDataType::VarBinaryMax,
             ColumnValue::Null => SqlDataType::Int, // Default to Int for NULL
         }
     }
@@ -121,7 +129,8 @@ impl ColumnValue {
                 }
                 buf.put_u32_le(0);
             }
-            ColumnValue::VarCharMax(chunks) => {
+            ColumnValue::NVarCharMaxNull => buf.put_u64_le(u64::MAX),
+            ColumnValue::VarCharMax(chunks) | ColumnValue::VarBinaryMax(chunks) => {
                 let total: u64 = chunks.iter().map(|chunk| chunk.len() as u64).sum();
                 buf.put_u64_le(total);
                 for chunk in chunks {
@@ -365,6 +374,10 @@ pub const RPC_DELAY_KEY: &str = "__MOCK_TDS_RPC_DELAY__";
 /// Registry of query responses
 pub struct QueryRegistry {
     responses: HashMap<String, QueryResponse>,
+    /// Info tokens emitted after a registered response's last row. Kept beside
+    /// the response rather than inside it so `QueryResponse` stays
+    /// literal-constructible by existing callers.
+    trailing_info: HashMap<String, Vec<InfoMessage>>,
 }
 
 impl QueryRegistry {
@@ -372,6 +385,7 @@ impl QueryRegistry {
     pub fn new() -> Self {
         let mut registry = Self {
             responses: HashMap::new(),
+            trailing_info: HashMap::new(),
         };
 
         // Add default responses
@@ -385,14 +399,51 @@ impl QueryRegistry {
     }
 
     /// Register a query response
+    ///
+    /// Replaces any previous registration for `query`, including trailing info
+    /// tokens set by [`register_with_trailing_info`](Self::register_with_trailing_info):
+    /// leaving those behind would pair a new response with the old warnings.
     pub fn register(&mut self, query: impl Into<String>, response: QueryResponse) {
         let query = query.into().to_uppercase();
-        self.responses.insert(query, response);
+        self.responses.insert(query.clone(), response);
+        self.trailing_info.remove(&query);
+    }
+
+    /// Register a query response whose info tokens are emitted *after* the
+    /// last row, before the terminal DONE — where SQL Server puts an aggregate
+    /// warning such as 8153. Unlike [`QueryResponse::with_info_tokens`], which
+    /// sends them between ColMetadata and the rows, these are only reachable
+    /// once a reader has consumed every row, so they exercise a driver's
+    /// terminal read-ahead rather than its execute path.
+    ///
+    /// Held here rather than on [`QueryResponse`] so that adding it cannot
+    /// invalidate an existing `QueryResponse` struct literal.
+    ///
+    /// Like [`register`](Self::register), this replaces any previous
+    /// registration for `query`.
+    pub fn register_with_trailing_info(
+        &mut self,
+        query: impl Into<String>,
+        response: QueryResponse,
+        trailing_info: Vec<InfoMessage>,
+    ) {
+        let query = query.into().to_uppercase();
+        self.register(query.clone(), response);
+        if !trailing_info.is_empty() {
+            self.trailing_info.insert(query, trailing_info);
+        }
     }
 
     /// Get a response for a query
     pub fn get(&self, query: &str) -> Option<&QueryResponse> {
         self.responses.get(&query.to_uppercase())
+    }
+
+    /// The info tokens registered to follow this query's last row, if any.
+    pub fn trailing_info(&self, query: &str) -> &[InfoMessage] {
+        self.trailing_info
+            .get(&query.to_uppercase())
+            .map_or(&[], Vec::as_slice)
     }
 
     /// Finds a registered response whose query text appears — encoded as
@@ -410,13 +461,27 @@ impl QueryRegistry {
     /// upper-case) SQL text — unlike [`get`](Self::get), which decodes and
     /// uppercases the incoming text before comparing.
     pub fn get_by_contained_utf16_text(&self, haystack: &[u8]) -> Option<&QueryResponse> {
+        self.get_by_contained_utf16_text_with_trailing_info(haystack)
+            .map(|(response, _)| response)
+    }
+
+    /// [`get_by_contained_utf16_text`](Self::get_by_contained_utf16_text),
+    /// also returning any info tokens registered to follow the last row.
+    pub fn get_by_contained_utf16_text_with_trailing_info(
+        &self,
+        haystack: &[u8],
+    ) -> Option<(&QueryResponse, &[InfoMessage])> {
         self.responses.iter().find_map(|(query, response)| {
             let needle: Vec<u8> = query
                 .encode_utf16()
                 .flat_map(|unit| unit.to_le_bytes())
                 .collect();
-            (!needle.is_empty() && haystack.windows(needle.len()).any(|w| w == needle))
-                .then_some(response)
+            (!needle.is_empty() && haystack.windows(needle.len()).any(|w| w == needle)).then(|| {
+                (
+                    response,
+                    self.trailing_info.get(query).map_or(&[][..], Vec::as_slice),
+                )
+            })
         })
     }
 }
@@ -456,6 +521,12 @@ mod tests {
         assert_eq!(&buf[..], &[0]);
         buf.clear();
 
+        let null_plp = ColumnValue::NVarCharMaxNull;
+        assert_eq!(null_plp.data_type(), SqlDataType::NVarCharMax);
+        null_plp.write_to_buffer(&mut buf);
+        assert_eq!(&buf[..], &[0xFF; 8]);
+        buf.clear();
+
         let nvarchar_val = ColumnValue::NVarChar("test".to_string());
         assert_eq!(nvarchar_val.data_type(), SqlDataType::NVarChar);
         nvarchar_val.write_to_buffer(&mut buf);
@@ -484,5 +555,48 @@ mod tests {
             .expect("registered query response should be available");
         assert_eq!(resp.columns.len(), 1);
         assert_eq!(resp.rows.len(), 1);
+    }
+
+    /// `register` replaces a previous registration, so it has to drop that
+    /// key's trailing info too. Otherwise a plain re-registration silently
+    /// inherits the earlier warnings and the mock emits them after a response
+    /// that never asked for them.
+    #[test]
+    fn plain_register_clears_trailing_info_from_a_previous_registration() {
+        let mut registry = QueryRegistry::new();
+        registry.register_with_trailing_info(
+            "SELECT trailing",
+            QueryResponse::select_one(),
+            vec![InfoMessage::new(8153, 10, "aggregate warning")],
+        );
+        assert_eq!(registry.trailing_info("SELECT trailing").len(), 1);
+
+        registry.register("SELECT trailing", QueryResponse::select_one());
+
+        assert!(
+            registry.trailing_info("SELECT trailing").is_empty(),
+            "the replacing response must not inherit the old warnings"
+        );
+    }
+
+    /// The same key re-registered with new trailing info must carry only the
+    /// new messages, not both sets.
+    #[test]
+    fn re_registering_trailing_info_replaces_rather_than_accumulates() {
+        let mut registry = QueryRegistry::new();
+        registry.register_with_trailing_info(
+            "SELECT trailing",
+            QueryResponse::select_one(),
+            vec![InfoMessage::new(8153, 10, "first")],
+        );
+        registry.register_with_trailing_info(
+            "SELECT trailing",
+            QueryResponse::select_one(),
+            vec![InfoMessage::new(8154, 10, "second")],
+        );
+
+        let trailing = registry.trailing_info("SELECT trailing");
+        assert_eq!(trailing.len(), 1);
+        assert_eq!(trailing[0].number, 8154);
     }
 }

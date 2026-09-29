@@ -70,13 +70,17 @@ parameters:
   type: string
   default: librarytest
 
+- name: poolImageOverride
+  type: string
+  default: 'imageOverride -equals RUST-AZL3'
+
 jobs:
 - job: PrivateLink_Smoke
   displayName: Private Link Smoke Test (ACI)
   pool:
     name: ${{ parameters.poolName }}
     demands:
-      - imageOverride -equals RUST-UBUSLIM
+      - ${{ parameters.poolImageOverride }}
   timeoutInMinutes: 30
   steps:
   # --- Login ---

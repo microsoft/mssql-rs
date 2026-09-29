@@ -136,6 +136,100 @@ TEST_F(FetchScrollUtf16Test, RawUnitsInBoundRowArrays) {
     ASSERT_EQ(SQL_SUCCESS, SQLCloseCursor(stmt_));
 }
 
+// Benefits-from-mock-tds: this test can only observe that exactly one
+// 01003/8153 record surfaces and that the fetch returns SQL_SUCCESS_WITH_INFO.
+// It cannot see which TDS read consumed the INFO token, so it cannot tell a
+// terminal read-ahead promotion apart from the row loop having already drained
+// the message. A byte-level mock TDS server would let it assert that the token
+// was still unread when the rowset budget was reached and that the release
+// peek is what consumed it. `row_fetch_with_terminal_info_returns_success_with_info`
+// pins that split in Rust meanwhile.
+TEST_F(FetchScrollLiveTest, TerminalAggregateWarningIsReportedExactlyOnce) {
+    SQLCHAR version[32] = {};
+    ASSERT_SQL_OK(SQLGetInfoA(dbc_, SQL_DRIVER_VER, version, sizeof(version), nullptr),
+                  SQL_HANDLE_DBC, dbc_);
+    RecordProperty("driver_version", reinterpret_cast<const char*>(version));
+
+    // Exactly as many slots as the query returns rows: the fill loop stops on
+    // its own budget without probing a further row, so the terminal INFO is
+    // still unread on the wire and only the release peek can consume it. A
+    // wider rowset would make the loop read past the last row and drain the
+    // message through the ordinary row-loop path instead, leaving the
+    // terminal read-ahead promotion untested.
+    constexpr SQLULEN row_count = 2;
+    SQLINTEGER values[row_count] = {};
+    SQLLEN indicators[row_count] = {};
+    SQLULEN fetched = 0;
+    SQLUSMALLINT status[row_count] = {};
+
+    ASSERT_EQ(SQL_SUCCESS, SQLSetStmtAttr(stmt_, SQL_ATTR_ROW_ARRAY_SIZE,
+                                         reinterpret_cast<SQLPOINTER>(row_count), 0));
+    ASSERT_EQ(SQL_SUCCESS, SQLSetStmtAttr(stmt_, SQL_ATTR_ROWS_FETCHED_PTR, &fetched, 0));
+    ASSERT_EQ(SQL_SUCCESS, SQLSetStmtAttr(stmt_, SQL_ATTR_ROW_STATUS_PTR, status, 0));
+    ASSERT_EQ(SQL_SUCCESS, SQLBindCol(stmt_, 1, SQL_C_SLONG, values, sizeof(values[0]),
+                                     indicators));
+    SqlTString sql = ODBCTestUtils::ToSqlTStr(
+        "SELECT SUM(v) FROM (VALUES (1, CAST(1 AS int)), (1, NULL), (2, 2), (2, NULL)) "
+        "AS t(k, v) GROUP BY k ORDER BY k");
+    const SQLRETURN execute_rc =
+        SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS);
+    ASSERT_TRUE(execute_rc == SQL_SUCCESS || execute_rc == SQL_SUCCESS_WITH_INFO)
+        << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_STMT, stmt_);
+    const bool warning_on_execute =
+        ODBCTestUtils::HasDiagState(SQL_HANDLE_STMT, stmt_, "01003");
+    EXPECT_EQ(warning_on_execute ? SQL_SUCCESS_WITH_INFO : SQL_SUCCESS, execute_rc);
+    RecordProperty("warning_stage", warning_on_execute ? "execute" : "fetch");
+    SQLTCHAR state[6] = {};
+    SQLTCHAR message[256] = {};
+    SQLINTEGER native_error = 0;
+    if (warning_on_execute) {
+        ASSERT_EQ(SQL_SUCCESS,
+                  SQLGetDiagRec(SQL_HANDLE_STMT, stmt_, 1, state, &native_error, message,
+                                static_cast<SQLSMALLINT>(std::size(message)), nullptr));
+        EXPECT_EQ("01003", ODBCTestUtils::ToNarrow(SqlTString(state)));
+        EXPECT_EQ(8153, native_error);
+        EXPECT_EQ(SQL_NO_DATA,
+                  SQLGetDiagRec(SQL_HANDLE_STMT, stmt_, 2, state, &native_error, message,
+                                static_cast<SQLSMALLINT>(std::size(message)), nullptr));
+    }
+
+    // Drivers may expose the terminal INFO while executing or fetching,
+    // depending on when their TDS path processes it. The parity contract is
+    // one 01003/8153 record and one corresponding SQL_SUCCESS_WITH_INFO,
+    // followed by clean, non-replaying EOF fetches.
+    const SQLRETURN fetch_rc = SQLFetchScroll(stmt_, SQL_FETCH_NEXT, 0);
+    EXPECT_EQ(warning_on_execute ? SQL_SUCCESS : SQL_SUCCESS_WITH_INFO, fetch_rc);
+    EXPECT_EQ(2u, fetched);
+    EXPECT_EQ(1, values[0]);
+    EXPECT_EQ(2, values[1]);
+    EXPECT_EQ(SQL_ROW_SUCCESS, status[0]);
+    EXPECT_EQ(SQL_ROW_SUCCESS, status[1]);
+
+    const SQLRETURN fetch_diag_rc =
+        SQLGetDiagRec(SQL_HANDLE_STMT, stmt_, 1, state, &native_error, message,
+                      static_cast<SQLSMALLINT>(std::size(message)), nullptr);
+    if (warning_on_execute) {
+        EXPECT_EQ(SQL_NO_DATA, fetch_diag_rc);
+    } else {
+        ASSERT_EQ(SQL_SUCCESS, fetch_diag_rc);
+        EXPECT_EQ("01003", ODBCTestUtils::ToNarrow(SqlTString(state)));
+        EXPECT_EQ(8153, native_error);
+        EXPECT_EQ(SQL_NO_DATA,
+                  SQLGetDiagRec(SQL_HANDLE_STMT, stmt_, 2, state, &native_error, message,
+                                static_cast<SQLSMALLINT>(std::size(message)), nullptr));
+    }
+
+    EXPECT_EQ(SQL_NO_DATA, SQLFetchScroll(stmt_, SQL_FETCH_NEXT, 0));
+    EXPECT_EQ(SQL_NO_DATA,
+              SQLGetDiagRec(SQL_HANDLE_STMT, stmt_, 1, state, &native_error, message,
+                            static_cast<SQLSMALLINT>(std::size(message)), nullptr));
+    EXPECT_EQ(SQL_NO_DATA, SQLFetchScroll(stmt_, SQL_FETCH_NEXT, 0));
+    EXPECT_EQ(SQL_NO_DATA,
+              SQLGetDiagRec(SQL_HANDLE_STMT, stmt_, 1, state, &native_error, message,
+                            static_cast<SQLSMALLINT>(std::size(message)), nullptr));
+    ASSERT_EQ(SQL_SUCCESS, SQLCloseCursor(stmt_));
+}
+
 TEST_F(FetchScrollUtf16Test, Cp1252UnalignedColumnArrayFitsExactCapacity) {
     constexpr size_t row_count = 3;
     constexpr size_t capacity = 514;
@@ -766,6 +860,39 @@ TEST_F(FetchScrollLiveTest, BoundNullIsReportedThroughTheIndicator) {
     EXPECT_EQ(7, values[1]) << "a NULL must not disturb its data slot";
     EXPECT_EQ(3, values[2]);
     SQLCloseCursor(stmt_);
+}
+
+TEST_F(FetchScrollUtf16Test, BoundNullPreservesSeparateOctetLength) {
+    for (const char* type : {"BINARY(3)", "CHAR(8)", "VARBINARY(8)",
+                             "VARBINARY(MAX)", "VARCHAR(8)", "NVARCHAR(MAX)"}) {
+        SCOPED_TRACE(type);
+        for (SQLSMALLINT target : {SQL_C_CHAR, SQL_C_WCHAR}) {
+            SCOPED_TRACE(target);
+            for (SQLLEN capacity : {0, 1, 2, 3, 32}) {
+                SCOPED_TRACE(capacity);
+                std::vector<unsigned char> buffer(32, 0x7E);
+                SQLLEN indicator = -99;
+                SQLLEN octet_length = -98;
+                ASSERT_EQ(SQL_SUCCESS, SQLBindCol(stmt_, 1, target, buffer.data(),
+                                                 capacity, &indicator));
+                SQLHDESC ard = SQL_NULL_HDESC;
+                ASSERT_EQ(SQL_SUCCESS, SQLGetStmtAttr(stmt_, SQL_ATTR_APP_ROW_DESC,
+                                                     &ard, 0, nullptr));
+                ASSERT_EQ(SQL_SUCCESS, SQLSetDescField(
+                    ard, 1, SQL_DESC_INDICATOR_PTR, &indicator, 0));
+                ASSERT_EQ(SQL_SUCCESS, SQLSetDescField(
+                    ard, 1, SQL_DESC_OCTET_LENGTH_PTR, &octet_length, 0));
+                ExecDirect("SELECT CAST(NULL AS " + std::string(type) + ")");
+                ASSERT_EQ(SQL_SUCCESS, SQLFetchScroll(stmt_, SQL_FETCH_NEXT, 0));
+                EXPECT_EQ(SQL_NULL_DATA, indicator);
+                EXPECT_EQ(-98, octet_length);
+                EXPECT_EQ(std::vector<unsigned char>(buffer.size(), 0x7E), buffer);
+                EXPECT_EQ("", StmtDiagState());
+                ASSERT_EQ(SQL_SUCCESS, SQLCloseCursor(stmt_));
+                ASSERT_EQ(SQL_SUCCESS, SQLFreeStmt(stmt_, SQL_UNBIND));
+            }
+        }
+    }
 }
 
 // A bound column gets one shot at a fixed buffer, so an over-long value is

@@ -13,6 +13,9 @@ parameters:
   type: boolean
 - name: feed
   type: string
+- name: poolImageOverride
+  type: string
+  default: 'imageOverride -equals RUST-AZL3'
 
 jobs:
 - job: Build_${{ parameters.arch }}
@@ -31,7 +34,7 @@ jobs:
   pool:
     name: RUST-UTIL-WUS3
     demands:
-      - imageOverride -equals RUST-UBUSLIM
+      - ${{ parameters.poolImageOverride }}
   steps:
   - checkout: self
 

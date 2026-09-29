@@ -112,7 +112,7 @@ struct DaeExecution {
 }
 
 struct BatchExecution {
-    bound_params: Vec<Option<crate::params::BoundParam>>,
+    bound_params: Vec<Option<crate::params::ParamSnapshot>>,
     active_rows: Vec<usize>,
     marker_count: usize,
     bind_offset: isize,
@@ -146,7 +146,7 @@ enum ExecutionStaging {
 }
 
 struct PreparedRows<'a> {
-    bound_params: &'a [Option<crate::params::BoundParam>],
+    bound_params: &'a [Option<crate::params::ParamSnapshot>],
     active_rows: std::slice::Iter<'a, usize>,
     marker_count: usize,
     bind_offset: isize,
@@ -388,10 +388,8 @@ fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn
             // streams the values into the same `sp_execute` / `sp_prepexec` RPC a
             // materialized execute would have used, so the statement stays
             // prepared and reuses its handle across executes (msodbcsql parity).
-            // The orphan is not piggybacked here — the request stays open for the
-            // whole SQLPutData sequence and may never reach the server — so it
-            // rides along with the parked state and is released by the next
-            // execute or by SQLFreeHandle.
+            // The orphan stays owned by DAE until SQLParamData completes the
+            // send; cancellation restores it without creating another id.
             let begin_result = dbc.runtime.block_on(client.begin_execute_prepared(
                 &mut prepared.stmt,
                 params,
@@ -624,6 +622,15 @@ fn finish_parameter_array(
     let metadata = client.get_metadata().clone();
     let ird_ok = super::ird::populate_ird(stmt, &metadata).is_ok();
     let info_messages = client.take_info_messages();
+    // Parameter arrays are serialized through the same `PacketWriter` as a
+    // scalar execute (`execute_sp_execute_batch`), so an unmappable value in
+    // any parameter set marks the message exactly as one in a single set does.
+    // This path does not go through `finish_execute`, so it has to drain and
+    // post the flag itself -- otherwise the warning the attribute advertises
+    // would never fire for an array, and the undrained flag would leak into the
+    // next statement's verdict. Drained before the STMT lock for the DBC-then-
+    // STMT ordering reason `take_code_page_conversion_loss` documents.
+    let warn_cp_loss = super::exec_common::take_code_page_conversion_loss(dbc, &mut client);
     let Ok(mut stmt_state) = stmt.inner.lock() else {
         super::exec_common::return_client_busy(dbc, client);
         return SQL_ERROR;
@@ -636,7 +643,9 @@ fn finish_parameter_array(
         client.current_parameter_set(),
         has_more,
     );
-    if post_tds_info_messages(&mut stmt_state, &info_messages) && rc == SQL_SUCCESS {
+    let posted_info = post_tds_info_messages(&mut stmt_state, &info_messages)
+        | super::exec_common::post_code_page_conversion_loss(&mut stmt_state, warn_cp_loss);
+    if posted_info && rc == SQL_SUCCESS {
         rc = SQL_SUCCESS_WITH_INFO;
     }
     stmt_state.clear_exhaustion_state();
@@ -906,7 +915,11 @@ fn stage_execution(stmt: &StmtHandle) -> Result<ExecutionStaging, SqlReturn> {
     let output_flags: Vec<bool> = stmt_state
         .bound_params
         .iter()
-        .map(|param| param.is_some_and(|param| is_output_direction(param.input_output_type)))
+        .map(|param| {
+            param
+                .as_ref()
+                .is_some_and(|param| is_output_direction(param.param.input_output_type))
+        })
         .collect();
     let Some(plan) = stmt_state.prepared.as_ref() else {
         post_diag(&mut stmt_state, ERR_FUNCTION_SEQUENCE);
@@ -930,7 +943,7 @@ fn stage_execution(stmt: &StmtHandle) -> Result<ExecutionStaging, SqlReturn> {
                     post_diag(&mut stmt_state, ERR_UNBOUND_PARAMETER);
                     return Err(SQL_ERROR);
                 }
-                Some(param) if !is_output_direction(param.input_output_type) => {
+                Some(param) if !is_output_direction(param.param.input_output_type) => {
                     post_diag(&mut stmt_state, ERR_INVALID_PARAMETER_TYPE);
                     return Err(SQL_ERROR);
                 }
@@ -976,7 +989,7 @@ fn stage_execution(stmt: &StmtHandle) -> Result<ExecutionStaging, SqlReturn> {
                 post_diag(&mut stmt_state, ERR_UNBOUND_PARAMETER);
                 return Err(SQL_ERROR);
             };
-            if bound.input_output_type != SQL_PARAM_INPUT {
+            if bound.param.input_output_type != SQL_PARAM_INPUT {
                 post_sql_error(
                     &mut stmt_state,
                     SQLSTATE_HYC00,
@@ -1021,11 +1034,13 @@ fn stage_execution(stmt: &StmtHandle) -> Result<ExecutionStaging, SqlReturn> {
             }
 
             for parameter in 0..marker_count {
+                // Only the `Copy` half is needed per row; cloning the snapshot
+                // would reallocate the UDT identity for every row.
                 let bound = stmt_state
                     .bound_params
                     .get(parameter)
                     .and_then(Option::as_ref)
-                    .copied()
+                    .map(|snapshot| snapshot.param)
                     .ok_or_else(|| {
                         post_diag(&mut stmt_state, ERR_UNBOUND_PARAMETER);
                         SQL_ERROR
@@ -1151,6 +1166,55 @@ mod tests {
     use crate::handles::DescHandle;
     use crate::test_support::TestHandles;
     use mssql_tds::connection::tds_client::{PreparedStatement, StatementId};
+
+    /// A parameter array is serialized through the same `PacketWriter` as a
+    /// scalar execute, but completes through `finish_parameter_array` rather
+    /// than `finish_execute`, so it needs its own drain/post of the code-page
+    /// loss flag. Without it the warning the attribute advertises never fires
+    /// for an array, and the undrained flag leaks into the next statement's
+    /// verdict (AB#47598).
+    ///
+    /// Asserted against the helpers `finish_parameter_array` calls, since the
+    /// function itself needs a live batch result a unit test cannot build.
+    #[test]
+    fn parameter_array_completion_drains_and_posts_the_code_page_loss_flag() {
+        use crate::api::exec_common::{
+            post_code_page_conversion_loss, take_code_page_conversion_loss,
+        };
+        use crate::api::sqlstate::WARN_CODE_PAGE_CONVERSION_LOSS;
+        use crate::handles::DbcHandle;
+        use mssql_tds::test_client_support::{done_no_more, tds_client_from_tokens};
+
+        for attribute_on in [false, true] {
+            let h = TestHandles::with_env_dbc_stmt();
+            let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+            dbc.inner.lock().unwrap().warn_on_cp_error = attribute_on;
+
+            let mut client = tds_client_from_tokens(vec![done_no_more()]);
+            client.note_code_page_conversion_loss();
+
+            let warn = take_code_page_conversion_loss(dbc, &mut client);
+            assert_eq!(warn, attribute_on);
+            assert!(
+                !client.take_code_page_conversion_loss(),
+                "the flag must be drained whatever the attribute says, or it \
+                 leaks into the next statement"
+            );
+
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let mut stmt_state = stmt.inner.lock().unwrap();
+            assert_eq!(
+                post_code_page_conversion_loss(&mut stmt_state, warn),
+                attribute_on
+            );
+            if attribute_on {
+                assert_eq!(
+                    stmt_state.diag_records[0].sql_state,
+                    WARN_CODE_PAGE_CONVERSION_LOSS.state
+                );
+            }
+        }
+    }
 
     fn set_prepared(stmt_raw: SqlHandle, sql: &str) {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(stmt_raw) };
@@ -2179,6 +2243,160 @@ mod tests {
         }
     }
 
+    #[test]
+    fn streamed_cancel_rebind_and_failed_response_preserve_ownership() {
+        use crate::api::odbc_types::{SQL_DESC_LENGTH, SQL_NEED_DATA, SQL_NULL_DATA};
+        use crate::api::param_data::sql_param_data;
+        use crate::api::put_data::sql_put_data;
+        use mssql_tds::test_client_support::tds_client_from_tokens;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        h.mark_dbc_connected();
+        let mut token = 7_i32;
+        let mut indicator = SQL_DATA_AT_EXEC;
+        assert_eq!(
+            unsafe {
+                sql_bind_parameter(
+                    h.stmt,
+                    1,
+                    SQL_PARAM_INPUT,
+                    SQL_C_CHAR,
+                    SQL_VARCHAR,
+                    8,
+                    0,
+                    (&raw mut token).cast(),
+                    4,
+                    &mut indicator,
+                )
+            },
+            SQL_SUCCESS
+        );
+        let mut client = tds_client_from_tokens(Vec::new());
+        let id = client.register_prepared_handle_for_test(77);
+        materialize_test_plan(h.stmt, id);
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let dbc = stmt.parent_dbc();
+        dbc.inner.lock().unwrap().client = Some(client);
+
+        for length in [16, 24, 32] {
+            set_cached_desc_field(h.ipd(), SQL_DESC_LENGTH, length);
+            assert_eq!(unsafe { sql_execute(h.stmt) }, SQL_NEED_DATA);
+            assert_eq!(
+                unsafe { crate::api::cancel::sql_cancel(h.stmt) },
+                SQL_SUCCESS
+            );
+            let state = stmt.inner.lock().unwrap();
+            assert!(!state.needs_data());
+            assert!(state.prepared.as_ref().unwrap().stmt.id().is_none());
+            assert_eq!(state.pending_unprepare, Some(id));
+            drop(state);
+            assert_eq!(
+                dbc.inner
+                    .lock()
+                    .unwrap()
+                    .client
+                    .as_ref()
+                    .unwrap()
+                    .prepared_handle_for_test(id),
+                Some(77)
+            );
+        }
+
+        assert_eq!(unsafe { sql_execute(h.stmt) }, SQL_NEED_DATA);
+        let mut value_ptr = std::ptr::null_mut();
+        assert_eq!(
+            unsafe { sql_param_data(h.stmt, &mut value_ptr) },
+            SQL_NEED_DATA
+        );
+        assert_eq!(
+            unsafe { sql_put_data(h.stmt, std::ptr::null_mut(), SQL_NULL_DATA) },
+            SQL_SUCCESS
+        );
+        // The token double returns EOF after the complete request is sent.
+        assert_eq!(unsafe { sql_param_data(h.stmt, &mut value_ptr) }, SQL_ERROR);
+        let state = stmt.inner.lock().unwrap();
+        assert!(!state.needs_data());
+        assert!(state.pending_unprepare.is_none());
+        let new_id = state.prepared.as_ref().unwrap().stmt.id().unwrap();
+        assert_ne!(new_id, id);
+        drop(state);
+        set_cached_desc_field(h.ipd(), SQL_DESC_LENGTH, 40);
+        assert_eq!(stage_and_restore_plan(h.stmt), (None, Some(new_id)));
+    }
+
+    #[test]
+    fn data_at_execution_parking_keeps_collation_seq_answerable() {
+        use crate::api::get_info::sql_get_info_w;
+        use crate::api::odbc_types::{SQL_COLLATION_SEQ, SQL_NEED_DATA, SqlSmallInt};
+        use mssql_tds::test_client_support::tds_client_from_tokens;
+        use mssql_tds::token::tokens::SqlCollation;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        h.mark_dbc_connected();
+        let mut token = 7_i32;
+        let mut indicator = SQL_DATA_AT_EXEC;
+        assert_eq!(
+            unsafe {
+                sql_bind_parameter(
+                    h.stmt,
+                    1,
+                    SQL_PARAM_INPUT,
+                    SQL_C_CHAR,
+                    SQL_VARCHAR,
+                    8,
+                    0,
+                    (&raw mut token).cast(),
+                    4,
+                    &mut indicator,
+                )
+            },
+            SQL_SUCCESS
+        );
+        let mut client = tds_client_from_tokens(Vec::new());
+        // Windows Latin1 (LCID 0x0409) resolves to code page 1252 -> "ISO 8859-1".
+        client.set_database_collation_for_test(SqlCollation {
+            info: 0x0409,
+            lcid_language_id: 0,
+            col_flags: 0,
+            sort_id: 0,
+        });
+        let id = client.register_prepared_handle_for_test(77);
+        materialize_test_plan(h.stmt, id);
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let dbc = stmt.parent_dbc();
+        dbc.inner.lock().unwrap().client = Some(client);
+
+        // The application path: `sql_execute` parks the client on the statement,
+        // which is the only moment `claim_connection` snapshots the collation.
+        assert_eq!(unsafe { sql_execute(h.stmt) }, SQL_NEED_DATA);
+        {
+            let state = dbc.inner.lock().unwrap();
+            assert!(state.client.is_none(), "client is parked for DAE");
+            assert_eq!(state.last_collation_code_page, Some(1252));
+        }
+
+        let mut buf = [0u16; 64];
+        let mut len: SqlSmallInt = -1;
+        let rc = unsafe {
+            sql_get_info_w(
+                h.dbc,
+                SQL_COLLATION_SEQ,
+                buf.as_mut_ptr().cast(),
+                (buf.len() * std::mem::size_of::<u16>()) as SqlSmallInt,
+                &mut len,
+            )
+        };
+        assert_eq!(rc, SQL_SUCCESS);
+        let n = (len as usize) / 2;
+        assert_eq!(String::from_utf16_lossy(&buf[..n]), "ISO 8859-1");
+
+        // Unwind the parked sequence so the handles drop cleanly.
+        assert_eq!(
+            unsafe { crate::api::cancel::sql_cancel(h.stmt) },
+            SQL_SUCCESS
+        );
+    }
+
     /// Panics while holding the APD lock, leaving the mutex poisoned —
     /// mirrors `bind_param.rs`'s own `poison_apd` test helper.
     fn poison_apd(apd: SqlHandle) {
@@ -2642,14 +2860,12 @@ mod tests {
     /// that returned without calling `clear_exhaustion_state()`. Every other
     /// successful execute reaches `finish_execute` or `finish_parameter_array`,
     /// which do clear it. Left stale, a reused statement handle would surface
-    /// the *previous* query's `batch_exhausted`/`pending_fetch_error`/
-    /// `pending_fetch_info` against this brand new (all-ignored) execution —
-    /// the same class of bug fixed for the pure-DML branch in
-    /// `exec_direct_pure_dml_clears_stale_exhausted_and_pending_info`.
+    /// the previous query's `batch_exhausted`/`pending_fetch_error` against
+    /// this brand new (all-ignored) execution — the same class of bug fixed
+    /// for the pure-DML branch in
+    /// `exec_direct_pure_dml_clears_stale_exhausted_and_pending_error`.
     #[test]
-    fn all_ignored_array_clears_stale_exhausted_and_pending_info() {
-        use mssql_tds::error::SqlInfoMessage;
-
+    fn all_ignored_array_clears_stale_exhausted_and_pending_error() {
         let h = TestHandles::with_env_dbc_stmt();
         set_prepared(h.stmt, "INSERT INTO t VALUES (?)");
         let mut values = [10i32, 20, 30];
@@ -2692,21 +2908,11 @@ mod tests {
                 SQL_ATTR_PARAMS_PROCESSED_PTR,
                 (&raw mut processed) as SqlULen,
             );
-            // As if a previous query's zero-row fetch exhausted the whole
-            // batch and stashed a trailing INFO message and error, left over
-            // on the reused handle.
+            // As if a previous query's read-ahead exhausted the whole batch
+            // and left a deferred error on the reused handle.
             state.result_set_exhausted = true;
             state.batch_exhausted = true;
             state.pending_fetch_error = Some(TdsError::ProtocolError("stale".to_string()));
-            state.pending_fetch_info = vec![SqlInfoMessage {
-                message: "previous query's PRINT output".to_string(),
-                state: 1,
-                class: 0,
-                number: 0,
-                server_name: None,
-                proc_name: None,
-                line_number: None,
-            }];
         }
 
         let ret = sql_execute_safe(h.stmt, stmt);
@@ -2719,7 +2925,6 @@ mod tests {
         );
         assert!(!state.result_set_exhausted);
         assert!(state.pending_fetch_error.is_none());
-        assert!(state.pending_fetch_info.is_empty());
     }
 
     /// Stages four good rows, then invalidates some the way an application can

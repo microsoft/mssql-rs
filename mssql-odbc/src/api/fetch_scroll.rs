@@ -33,7 +33,7 @@ use mssql_tds::datatypes::sql_string::{EncodingType, SqlString, get_encoding_typ
 use mssql_tds::datatypes::sql_vector::SqlVector;
 use mssql_tds::datatypes::sqldatatypes::TdsDataType;
 use mssql_tds::encoding_rs;
-use mssql_tds::error::Error as TdsError;
+use mssql_tds::error::{Error as TdsError, SqlInfoMessage};
 use mssql_tds::query::metadata::PlpEncoding;
 use uuid::Uuid;
 
@@ -899,17 +899,10 @@ fn fetch_scroll_safe(
             // `release_busy_if_row_exhausted`): the call that found it had
             // already committed to delivering its own row successfully, so
             // the diagnostic was deferred here, to the call that would have
-            // hit it directly without the peek's read-ahead. This branch's
-            // `SQL_ERROR` (unlike the sibling `SQL_NO_DATA` below) can carry
-            // extra diagnostic records, so any INFO message stashed
-            // alongside it (`StmtState::pending_fetch_info`) is surfaced here
-            // too — this closes the cursor, so `SQLCloseCursor`/
-            // `SQLFreeStmt(SQL_CLOSE)` can no longer reach it afterward.
+            // hit it directly without the peek's read-ahead.
             let rc = if let Some(e) = stmt_state.pending_fetch_error.take() {
                 stmt_state.clear_state(STMT_STATE_CURSOR_OPEN);
                 post_tds_error(&mut stmt_state, &e, SQLSTATE_HY000);
-                let pending_info = std::mem::take(&mut stmt_state.pending_fetch_info);
-                post_tds_info_messages(&mut stmt_state, &pending_info);
                 SQL_ERROR
             } else {
                 SQL_NO_DATA
@@ -1417,11 +1410,13 @@ fn fill_rowset(
         fetch_error.is_none()
     });
 
-    // A zero-row end of set returns SQL_NO_DATA, which cannot carry
-    // SQL_SUCCESS_WITH_INFO, so anything drained here would be posted under a
-    // code most applications never inspect and cleared by the next call. Leave
-    // those messages on the client for SQLMoreResults or the cursor close to
-    // surface, exactly as SQLFetch does.
+    // Zero-row messages stay on the client so the release helper drains them
+    // together with anything its own peek consumes, posting the whole set in
+    // wire order under one lock. With rows delivered they are taken here and
+    // handed to that helper as `preceding` instead, since they came off the
+    // wire before it looks. Either way this fetch posts them — the helper now
+    // drains regardless of whether the batch can release, so SQLMoreResults
+    // never sees them.
     let info_messages = if rows_filled > 0 || fetch_error.is_some() {
         client.take_info_messages()
     } else {
@@ -1445,7 +1440,12 @@ fn fill_rowset(
     let peek_is_safe =
         !client.maybe_has_unread_rows() || row_array_size != 1 || last_column_read == column_count;
 
-    if fetch_error.is_some() {
+    // Each branch reports whether it posted a server message and whether the
+    // row diagnostics were actually written, rather than having a later line
+    // re-derive which branch was taken or assume the helper's closure ran:
+    // desyncing the two would either double-post the row diagnostics or drop
+    // them, and nothing would catch it.
+    let (release_has_server_info, row_diags_posted) = if fetch_error.is_some() {
         let Ok(mut dbc_state) = dbc.inner.lock() else {
             error!("SQLFetchScroll: dbc mutex poisoned returning client");
             return SQL_ERROR;
@@ -1454,8 +1454,17 @@ fn fill_rowset(
         if dbc_state.active_stmt == Some(statement_handle) {
             dbc_state.active_stmt = None;
         }
+        (false, false)
     } else if peek_is_safe {
-        release_busy_if_row_exhausted(dbc, stmt, statement_handle, client, rows_filled > 0);
+        // Everything the rows produced goes in through the closure rather than
+        // being posted below: it all left the wire before anything the release
+        // peek finds, and posting it afterward would invert the order
+        // SQLGetDiagRec reports it in.
+        let (posted, preceding_ran) =
+            release_busy_if_row_exhausted(dbc, stmt, statement_handle, client, |s| {
+                post_row_diagnostics(s, &info_messages, worst)
+            });
+        (posted, preceding_ran)
     } else {
         let Ok(mut dbc_state) = dbc.inner.lock() else {
             error!("SQLFetchScroll: dbc mutex poisoned returning client");
@@ -1463,7 +1472,8 @@ fn fill_rowset(
         };
         dbc_state.client = Some(client);
         dbc_state.active_stmt = Some(statement_handle);
-    }
+        (false, false)
+    };
 
     let Ok(mut stmt_state) = stmt.inner.lock() else {
         error!("SQLFetchScroll: stmt mutex poisoned recording rowset");
@@ -1490,7 +1500,12 @@ fn fill_rowset(
         return SQL_ERROR;
     }
 
-    let has_server_info = post_tds_info_messages(&mut stmt_state, &info_messages);
+    let row_has_server_info = if row_diags_posted {
+        false
+    } else {
+        post_row_diagnostics(&mut stmt_state, &info_messages, worst)
+    };
+    let has_server_info = release_has_server_info || row_has_server_info;
 
     if rows_filled == 0 {
         stmt_state.reset_row_stream();
@@ -1518,13 +1533,14 @@ fn fill_rowset(
 
     // Report why the rowset was imperfect with the SQLSTATE that value would
     // have produced through SQLGetData, rather than a blanket truncation
-    // warning. Per-row detail lives in the row status array.
+    // warning. Per-row detail lives in the row status array. The record itself
+    // was already posted by `post_row_diagnostics`, in wire order with the
+    // server's own messages; only the return code is decided here.
     // msodbcsql keys the return code on the rowset size, not on how many rows
     // failed: a block fetch demotes a row error to SQL_SUCCESS_WITH_INFO and
     // leaves the detail in the row status array, while a single-row fetch lets
     // the error stand (`sqlccurs.cpp`, gated on dwRowSize > 1).
-    if let Some(issue) = worst.issue() {
-        issue.post(&mut stmt_state);
+    if worst.issue().is_some() {
         if row_array_size == 1 && matches!(worst, RowOutcome::Error(_)) {
             return SQL_ERROR;
         }
@@ -1534,6 +1550,24 @@ fn fill_rowset(
         return SQL_SUCCESS_WITH_INFO;
     }
     SQL_SUCCESS
+}
+
+/// Posts every diagnostic the fill loop itself produced: server INFO messages
+/// drained off the client, then the worst per-row conversion issue. Both
+/// describe rows that left the wire before any terminal read-ahead, and
+/// `SQLGetDiagRec` is ordinal, so they must be recorded before whatever the
+/// release peek finds. Returns whether a *server* message was posted — a
+/// driver-generated row issue drives the return code separately.
+fn post_row_diagnostics(
+    stmt_state: &mut StmtState,
+    info_messages: &[SqlInfoMessage],
+    worst: RowOutcome,
+) -> bool {
+    let posted = post_tds_info_messages(stmt_state, info_messages);
+    if let Some(issue) = worst.issue() {
+        issue.post(stmt_state);
+    }
+    posted
 }
 
 /// How many rows this fetch may deliver.
@@ -1627,7 +1661,7 @@ const PLP_BOUND_CHUNK: usize = 8 * 1024;
 /// rather than letting an arbitrary MAX value exhaust the application process.
 const PLP_TYPED_MATERIALIZE_LIMIT: usize = 1024 * 1024;
 
-fn typed_plp_chunk_fits(current: usize, chunk: usize, known_total: Option<u64>) -> bool {
+pub(crate) fn typed_plp_chunk_fits(current: usize, chunk: usize, known_total: Option<u64>) -> bool {
     known_total.is_none_or(|total| total <= PLP_TYPED_MATERIALIZE_LIMIT as u64)
         && current
             .checked_add(chunk)
@@ -2293,14 +2327,6 @@ unsafe fn deliver_bound(
 
     if is_null {
         unsafe { write_if_some(indicator, SQL_NULL_DATA) };
-        // A character target still gets a terminator so the slot does not read
-        // back as whatever the previous row left there.
-        let buf_elements = char_buf_elements(binding.target_type, stride);
-        if binding.target_type == SQL_C_WCHAR {
-            unsafe { copy_with_nul(slot as *mut SqlWChar, buf_elements, &[]) };
-        } else if binding.target_type == SQL_C_CHAR {
-            unsafe { copy_with_nul(slot, buf_elements, &[]) };
-        }
         return RowOutcome::Success;
     }
     if is_typed_c_target(binding.target_type) {
@@ -2481,7 +2507,8 @@ mod tests {
     use crate::test_support::TestHandles;
     use mssql_tds::datatypes::sql_string::{EncodingType, SqlString};
     use mssql_tds::test_client_support::{
-        col_metadata_empty, done_no_more, int_columns, mixed_lob_columns, tds_client_from_int_rows,
+        col_metadata_empty, done_no_more, done_select_no_more, int_columns, mixed_lob_columns,
+        tds_client_from_int_rows, tds_client_from_int_rows_with_trailing_tokens,
         tds_client_from_mixed_lob_prefix_rows, tds_client_from_partial_int_rows,
         tds_client_from_tokens,
     };
@@ -4038,54 +4065,6 @@ mod tests {
         );
     }
 
-    /// The deferred-error fast path above closes the cursor before
-    /// returning, so `SQLCloseCursor`/`SQLFreeStmt(SQL_CLOSE)` can no longer
-    /// reach a `StmtState::pending_fetch_info` stashed alongside the error by
-    /// the same peek (see AB#47508's `release_busy_if_row_exhausted`, which
-    /// can set both together — a trailing INFO message read on the way to a
-    /// batch-ending SQL Server error). Since this branch's `SQL_ERROR` can
-    /// carry extra diagnostic records (unlike the sibling `SQL_NO_DATA`), the
-    /// stashed message must be surfaced here rather than silently discarded.
-    #[test]
-    fn exhausted_cursor_fast_path_surfaces_a_pending_fetch_info_alongside_the_error() {
-        use mssql_tds::error::SqlInfoMessage;
-
-        let h = TestHandles::with_env_dbc_stmt();
-        open_cursor(&h);
-        {
-            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
-            let mut s = stmt.inner.lock().unwrap();
-            s.result_set_exhausted = true;
-            s.pending_fetch_error = Some(TdsError::ProtocolError(
-                "simulated trailing SQL Server error".to_string(),
-            ));
-            s.pending_fetch_info = vec![SqlInfoMessage {
-                message: "trailing PRINT message".to_string(),
-                state: 1,
-                class: 0,
-                number: 0,
-                server_name: None,
-                proc_name: None,
-                line_number: None,
-            }];
-        }
-        let rc = unsafe { sql_fetch_scroll(h.stmt, SQL_FETCH_NEXT, 0) };
-        assert_eq!(rc, SQL_ERROR);
-
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
-        let s = stmt.inner.lock().unwrap();
-        assert!(
-            s.diag_records
-                .iter()
-                .any(|d| d.message.contains("trailing PRINT message")),
-            "the stashed INFO message must be surfaced alongside the deferred error"
-        );
-        assert!(
-            s.pending_fetch_info.is_empty(),
-            "must be taken so it cannot leak into a later call"
-        );
-    }
-
     /// Given the *consequence* of AB#47508's fix (a cursor whose fetch has
     /// already released the busy claim and marked its result set
     /// exhausted — the two post-conditions `release_busy_if_row_exhausted`
@@ -4181,6 +4160,238 @@ mod tests {
         );
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         assert!(stmt.inner.lock().unwrap().result_set_exhausted);
+    }
+
+    #[test]
+    fn zero_row_fetch_surfaces_terminal_info_once_on_no_data() {
+        use mssql_tds::test_client_support::info;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        {
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let mut s = stmt.inner.lock().unwrap();
+            s.set_state(STMT_STATE_CURSOR_OPEN);
+            s.column_metadata = int_columns(1);
+        }
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let mut client = tds_client_from_tokens(vec![
+            col_metadata_empty(),
+            info(8153, 10, "Null value is eliminated by an aggregate."),
+            done_no_more(),
+        ]);
+        dbc.runtime
+            .block_on(client.execute("SELECT 1 WHERE 1=0;".to_string(), ()))
+            .unwrap();
+        {
+            let mut ds = dbc.inner.lock().unwrap();
+            ds.client = Some(client);
+            ds.active_stmt = Some(h.stmt);
+        }
+
+        assert_eq!(
+            unsafe { sql_fetch_scroll(h.stmt, SQL_FETCH_NEXT, 0) },
+            SQL_NO_DATA
+        );
+        {
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let s = stmt.inner.lock().unwrap();
+            assert_eq!(s.diag_records.len(), 1);
+            assert_eq!(s.diag_records[0].sql_state, *b"01003");
+            assert_eq!(s.diag_records[0].native_error, 8153);
+        }
+
+        assert_eq!(
+            unsafe { sql_fetch_scroll(h.stmt, SQL_FETCH_NEXT, 0) },
+            SQL_NO_DATA
+        );
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        assert!(stmt.inner.lock().unwrap().diag_records.is_empty());
+    }
+
+    #[test]
+    fn row_fetch_with_terminal_info_returns_success_with_info() {
+        use mssql_tds::test_client_support::info;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let mut value = [0_i32];
+        let mut indicator = [0 as SqlLen];
+        {
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let mut s = stmt.inner.lock().unwrap();
+            s.set_state(STMT_STATE_CURSOR_OPEN);
+            s.column_metadata = int_columns(1);
+        }
+        assert_eq!(
+            unsafe {
+                sql_bind_col(
+                    h.stmt,
+                    1,
+                    SQL_C_SLONG,
+                    value.as_mut_ptr().cast(),
+                    0,
+                    indicator.as_mut_ptr(),
+                )
+            },
+            SQL_SUCCESS
+        );
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let mut client = tds_client_from_int_rows_with_trailing_tokens(
+            vec![vec![7]],
+            vec![
+                info(8153, 10, "Null value is eliminated by an aggregate."),
+                done_select_no_more(),
+            ],
+        );
+        dbc.runtime
+            .block_on(client.execute("SELECT 7;".to_string(), ()))
+            .unwrap();
+        {
+            let mut ds = dbc.inner.lock().unwrap();
+            ds.client = Some(client);
+            ds.active_stmt = Some(h.stmt);
+        }
+
+        assert_eq!(
+            unsafe { sql_fetch_scroll(h.stmt, SQL_FETCH_NEXT, 0) },
+            SQL_SUCCESS_WITH_INFO
+        );
+        assert_eq!(value[0], 7);
+        assert_eq!(indicator[0], 4);
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let s = stmt.inner.lock().unwrap();
+        assert_eq!(s.diag_records.len(), 1);
+        assert_eq!(s.diag_records[0].sql_state, *b"01003");
+        assert_eq!(s.diag_records[0].native_error, 8153);
+    }
+
+    /// A row-conversion diagnostic describes a row that left the wire before
+    /// the terminal read-ahead ran, so it must be reported ahead of the
+    /// terminal INFO rather than appended after it — `SQLGetDiagRec` is
+    /// ordinal, and msodbcsql inserts each record as its token is parsed.
+    #[test]
+    fn row_conversion_diagnostic_precedes_terminal_info() {
+        use mssql_tds::test_client_support::info;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let mut text = [0_u8; 4];
+        let mut indicator = [0 as SqlLen];
+        {
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let mut s = stmt.inner.lock().unwrap();
+            s.set_state(STMT_STATE_CURSOR_OPEN);
+            s.column_metadata = int_columns(1);
+        }
+        assert_eq!(
+            unsafe {
+                sql_bind_col(
+                    h.stmt,
+                    1,
+                    SQL_C_CHAR,
+                    text.as_mut_ptr().cast(),
+                    text.len() as SqlLen,
+                    indicator.as_mut_ptr(),
+                )
+            },
+            SQL_SUCCESS
+        );
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        // 1234567 cannot fit a 4-byte character target, so the row reports
+        // 01004 while a terminal INFO still waits unread on the wire.
+        let mut client = tds_client_from_int_rows_with_trailing_tokens(
+            vec![vec![1234567]],
+            vec![
+                info(8153, 10, "Null value is eliminated by an aggregate."),
+                done_select_no_more(),
+            ],
+        );
+        dbc.runtime
+            .block_on(client.execute("SELECT 1234567;".to_string(), ()))
+            .unwrap();
+        {
+            let mut ds = dbc.inner.lock().unwrap();
+            ds.client = Some(client);
+            ds.active_stmt = Some(h.stmt);
+        }
+
+        assert_eq!(
+            unsafe { sql_fetch_scroll(h.stmt, SQL_FETCH_NEXT, 0) },
+            SQL_SUCCESS_WITH_INFO
+        );
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let s = stmt.inner.lock().unwrap();
+        let states: Vec<[u8; 5]> = s.diag_records.iter().map(|d| d.sql_state).collect();
+        assert_eq!(
+            states,
+            [*b"01004", *b"01003"],
+            "the truncated row was read before the terminal INFO token, so it \
+             must be reported first"
+        );
+    }
+
+    /// The same promotion must hold when the batch has a further result set
+    /// pending: the INFO arrived before this result set's DONE, so the fetch
+    /// that consumed it owns it, even though the connection stays claimed and
+    /// `SQLMoreResults` has not run yet.
+    #[test]
+    fn row_fetch_with_terminal_info_before_a_second_result_returns_success_with_info() {
+        use mssql_tds::test_client_support::{done_more, info};
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let mut value = [0_i32];
+        let mut indicator = [0 as SqlLen];
+        {
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let mut s = stmt.inner.lock().unwrap();
+            s.set_state(STMT_STATE_CURSOR_OPEN);
+            s.column_metadata = int_columns(1);
+        }
+        assert_eq!(
+            unsafe {
+                sql_bind_col(
+                    h.stmt,
+                    1,
+                    SQL_C_SLONG,
+                    value.as_mut_ptr().cast(),
+                    0,
+                    indicator.as_mut_ptr(),
+                )
+            },
+            SQL_SUCCESS
+        );
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let mut client = tds_client_from_int_rows_with_trailing_tokens(
+            vec![vec![7]],
+            vec![
+                info(8153, 10, "Null value is eliminated by an aggregate."),
+                done_more(),
+                col_metadata_empty(),
+                done_select_no_more(),
+            ],
+        );
+        dbc.runtime
+            .block_on(client.execute("SELECT 7; SELECT 1;".to_string(), ()))
+            .unwrap();
+        {
+            let mut ds = dbc.inner.lock().unwrap();
+            ds.client = Some(client);
+            ds.active_stmt = Some(h.stmt);
+        }
+
+        assert_eq!(
+            unsafe { sql_fetch_scroll(h.stmt, SQL_FETCH_NEXT, 0) },
+            SQL_SUCCESS_WITH_INFO,
+            "the warning belongs to this fetch, not to a later SQLMoreResults"
+        );
+        assert_eq!(value[0], 7);
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let s = stmt.inner.lock().unwrap();
+        assert_eq!(s.diag_records.len(), 1);
+        assert_eq!(s.diag_records[0].sql_state, *b"01003");
+        assert_eq!(s.diag_records[0].native_error, 8153);
     }
 
     /// Row-wise binding is not implemented, and reporting HYC00 is better than
@@ -5255,6 +5466,36 @@ mod tests {
         assert!(matches!(outcome, RowOutcome::Success));
         assert_eq!(ind[1], SQL_NULL_DATA);
         assert_eq!(buf[1], 7, "a NULL must not disturb the data slot");
+    }
+
+    #[test]
+    fn null_preserves_character_slots_and_separate_octet_lengths() {
+        // Retail 18.6.2.1 / 18.06.0002: BoundNullPreservesSeparateOctetLength
+        // verifies the untouched length with split ARD pointers on Linux/unixODBC.
+        for target in [SQL_C_CHAR, SQL_C_WCHAR] {
+            for capacity in [0, 1, 2, 3, 32] {
+                let mut buffer = [0x7Eu8; 66];
+                let mut indicators = [-99; 2];
+                let mut lengths = [-98; 2];
+                let b = ColumnBinding {
+                    octet_length_ptr: lengths.as_mut_ptr(),
+                    ..binding(
+                        1,
+                        target,
+                        unsafe { buffer.as_mut_ptr().add(1) }.cast(),
+                        capacity,
+                        indicators.as_mut_ptr(),
+                    )
+                };
+                assert_eq!(
+                    unsafe { deliver_bound(&b, 1, 0, &ColumnValues::Null) },
+                    RowOutcome::Success
+                );
+                assert_eq!(buffer, [0x7E; 66]);
+                assert_eq!(indicators, [-99, SQL_NULL_DATA]);
+                assert_eq!(lengths, [-98; 2]);
+            }
+        }
     }
 
     /// `SQLBindCol` points both descriptor fields at one location, so a test

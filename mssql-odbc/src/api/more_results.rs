@@ -78,17 +78,9 @@ fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
             // release_busy_if_row_exhausted), but that call had already
             // committed to delivering its own row successfully, so the
             // diagnostic was deferred here instead of being lost under that
-            // call's own success return. The same peek can also have
-            // stashed a trailing INFO message it had no success return to
-            // post under (`StmtState::pending_fetch_info`, set alongside
-            // `pending_fetch_error` when `row_delivered == false`) — surface
-            // it here too, since `SQL_ERROR` (unlike the sibling
-            // `SQL_NO_DATA` below) can carry extra diagnostic records, same
-            // principle as the analogous fast path in `fetch_scroll.rs`.
-            let pending_info = std::mem::take(&mut stmt_state.pending_fetch_info);
+            // call's own success return.
             reset_cursor_state(&mut stmt_state);
             post_tds_error(&mut stmt_state, &e, SQLSTATE_HY000);
-            post_tds_info_messages(&mut stmt_state, &pending_info);
             return SQL_ERROR;
         }
         if stmt_state.batch_exhausted && stmt_state.pending_row_counts.is_empty() {
@@ -103,16 +95,6 @@ fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
             // Matches msodbcsql, whose SQLMoreResults has no busy
             // check of its own (`GetBatchCtxOrRecover` just falls through to
             // `SQL_NO_DATA_FOUND` once the batch context is gone).
-            //
-            // That same peek can have drained trailing server INFO messages
-            // it had no way to post under its own already-committed success
-            // return (see `StmtState::pending_fetch_info`) — surface them now,
-            // same as the `StatementResult::End` arm below does for a normal
-            // (non-fast-path) advance. `SQL_NO_DATA` still can't carry
-            // `SQL_SUCCESS_WITH_INFO`, but the diagnostic remains available
-            // via `SQLGetDiagRec` either way, and this is the last call that
-            // will ever get a chance to post it.
-            let pending_info = std::mem::take(&mut stmt_state.pending_fetch_info);
             let output_rc = if let Some((values, status)) = stmt_state.pending_output_params.take()
             {
                 // The values belong to this statement, not to the client that
@@ -129,7 +111,6 @@ fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
                 SQL_SUCCESS
             };
             reset_cursor_state(&mut stmt_state);
-            post_tds_info_messages(&mut stmt_state, &pending_info);
             debug!("SQLMoreResults: batch already known exhausted; returning SQL_NO_DATA");
             return if output_rc == SQL_SUCCESS {
                 SQL_NO_DATA
@@ -205,7 +186,13 @@ fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
         client
     };
 
-    let result = dbc.runtime.block_on(client.advance());
+    let result = dbc.runtime.block_on(async {
+        let result = client.advance().await?;
+        if matches!(result, StatementResult::Rows) {
+            client.peek_past_current_row().await?;
+        }
+        Ok(result)
+    });
     let array_rc = super::execute::update_parameter_array(stmt, &mut client);
     match result {
         Ok(StatementResult::Rows) => {
@@ -445,6 +432,7 @@ mod tests {
                 col_metadata_empty(), // stmt1 row set
                 done_more(),          // terminates stmt1, more to come
                 col_metadata_empty(), // stmt2 row set
+                done_no_more(),
             ],
         );
         assert_eq!(first, StatementResult::Rows);
@@ -454,6 +442,108 @@ mod tests {
 
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         assert_eq!(dbc.inner.lock().unwrap().active_stmt, Some(h.stmt));
+    }
+
+    #[test]
+    fn more_results_surfaces_an_error_before_the_first_row() {
+        use mssql_tds::test_client_support::{col_metadata, int_columns, sql_error};
+
+        let handles = TestHandles::with_env_dbc_stmt();
+        let first = position_first_and_inject(
+            &handles,
+            vec![
+                col_metadata(int_columns(1)),
+                done_more(),
+                col_metadata(int_columns(1)),
+                info(50000, 10, "before error"),
+                sql_error(1222, 16, "Lock request time out period exceeded."),
+                done_no_more(),
+            ],
+        );
+        assert_eq!(first, StatementResult::Rows);
+
+        assert_eq!(unsafe { sql_more_results(handles.stmt) }, SQL_ERROR);
+
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(handles.stmt) };
+        {
+            let state = stmt.inner.lock().unwrap();
+            assert!(
+                state
+                    .diag_records
+                    .iter()
+                    .any(|record| record.native_error == 1222)
+            );
+            assert!(
+                state
+                    .diag_records
+                    .iter()
+                    .any(|record| record.message.contains("before error"))
+            );
+            assert!(!state.has_state(STMT_STATE_CURSOR_OPEN));
+            assert!(state.pending_fetch_error.is_none());
+        }
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(handles.dbc) };
+        let state = dbc.inner.lock().unwrap();
+        assert!(state.client.is_some());
+        assert!(state.active_stmt.is_none());
+        drop(state);
+        assert_eq!(unsafe { sql_more_results(handles.stmt) }, SQL_NO_DATA);
+        assert!(stmt.inner.lock().unwrap().diag_records.is_empty());
+    }
+
+    #[test]
+    fn more_results_reports_info_before_the_first_row() {
+        use mssql_tds::test_client_support::{col_metadata, int_columns};
+
+        let handles = TestHandles::with_env_dbc_stmt();
+        position_first_and_inject(
+            &handles,
+            vec![
+                col_metadata(int_columns(1)),
+                done_more(),
+                col_metadata(int_columns(1)),
+                info(8153, 10, "Null value is eliminated by an aggregate."),
+                done_no_more(),
+            ],
+        );
+
+        assert_eq!(
+            unsafe { sql_more_results(handles.stmt) },
+            SQL_SUCCESS_WITH_INFO
+        );
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(handles.stmt) };
+        assert!(
+            stmt.inner
+                .lock()
+                .unwrap()
+                .diag_records
+                .iter()
+                .any(|record| record.native_error == 8153)
+        );
+        assert_eq!(unsafe { sql_more_results(handles.stmt) }, SQL_NO_DATA);
+        assert!(stmt.inner.lock().unwrap().diag_records.is_empty());
+    }
+
+    #[test]
+    fn more_results_does_not_peek_beyond_an_empty_result() {
+        use mssql_tds::test_client_support::{col_metadata, int_columns, sql_error};
+
+        let handles = TestHandles::with_env_dbc_stmt();
+        position_first_and_inject(
+            &handles,
+            vec![
+                col_metadata(int_columns(1)),
+                done_more(),
+                col_metadata(int_columns(1)),
+                done_more(),
+                col_metadata(int_columns(1)),
+                sql_error(1222, 16, "Lock request time out period exceeded."),
+                done_no_more(),
+            ],
+        );
+
+        assert_eq!(unsafe { sql_more_results(handles.stmt) }, SQL_SUCCESS);
+        assert_eq!(unsafe { sql_more_results(handles.stmt) }, SQL_ERROR);
     }
 
     /// The first result set was fetched to exhaustion, which releases
@@ -473,6 +563,7 @@ mod tests {
                 col_metadata_empty(), // stmt1 row set
                 done_more(),          // terminates stmt1, more to come
                 col_metadata_empty(), // stmt2 row set
+                done_no_more(),
             ],
         );
         assert_eq!(first, StatementResult::Rows);
@@ -505,6 +596,7 @@ mod tests {
                 col_metadata_empty(), // stmt1 row set
                 done_more(),          // terminates stmt1, more to come
                 col_metadata_empty(), // stmt2 row set
+                done_no_more(),
             ],
         );
         assert_eq!(first, StatementResult::Rows);
@@ -619,64 +711,6 @@ mod tests {
         assert!(!ss.has_state(STMT_STATE_CURSOR_OPEN));
     }
 
-    /// A prior fetch's read-ahead peek can find both a trailing SQL Server
-    /// error *and* a trailing INFO message on the way to the same
-    /// batch-ending token (see AB#47508's `release_busy_if_row_exhausted`,
-    /// which can stash `pending_fetch_error` and `pending_fetch_info`
-    /// together when `row_delivered == false`). This deferred-error fast
-    /// path returns `SQL_ERROR`, which — unlike the sibling `SQL_NO_DATA`
-    /// path below — can carry extra diagnostic records, so the stashed INFO
-    /// message must be surfaced alongside the error rather than silently
-    /// discarded by `reset_cursor_state`. Same principle as the analogous
-    /// fast path in `fetch_scroll.rs`.
-    #[test]
-    fn more_results_surfaces_a_pending_fetch_info_alongside_a_pending_fetch_error() {
-        use mssql_tds::error::SqlInfoMessage;
-
-        let h = TestHandles::with_env_dbc_stmt();
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
-        {
-            let mut ss = stmt.inner.lock().unwrap();
-            ss.set_state(STMT_STATE_CURSOR_OPEN);
-            ss.result_set_exhausted = true;
-            ss.pending_fetch_error = Some(TdsError::ProtocolError(
-                "simulated trailing SQL Server error".to_string(),
-            ));
-            ss.pending_fetch_info = vec![SqlInfoMessage {
-                message: "trailing PRINT message".to_string(),
-                state: 1,
-                class: 0,
-                number: 0,
-                server_name: None,
-                proc_name: None,
-                line_number: None,
-            }];
-        }
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
-        dbc.inner.lock().unwrap().active_stmt = Some(h.stmt);
-
-        let ret = unsafe { sql_more_results(h.stmt) };
-
-        assert_eq!(ret, SQL_ERROR);
-        let ss = stmt.inner.lock().unwrap();
-        assert!(
-            ss.diag_records
-                .iter()
-                .any(|d| d.message.contains("simulated trailing SQL Server error")),
-            "the deferred error must still be posted"
-        );
-        assert!(
-            ss.diag_records
-                .iter()
-                .any(|d| d.message.contains("trailing PRINT message")),
-            "the stashed INFO message must be surfaced alongside the deferred error"
-        );
-        assert!(
-            ss.pending_fetch_info.is_empty(),
-            "must be taken so it cannot leak into a later call"
-        );
-    }
-
     /// **The blocking regression this tick fixes**, reproducing the
     /// reviewer's exact probe: statement A executes a single-statement,
     /// single-result-set batch, fetches its only row to exhaustion (which
@@ -728,63 +762,6 @@ mod tests {
                 .lock()
                 .unwrap()
                 .has_state(STMT_STATE_CURSOR_OPEN)
-        );
-    }
-
-    /// A zero-row fetch that also exhausts the whole batch can drain a
-    /// trailing server INFO message its own `SQL_NO_DATA` return has no way
-    /// to carry, stashing it as `StmtState::pending_fetch_info` instead (see
-    /// AB#47508's `release_busy_if_row_exhausted`). The `batch_exhausted`
-    /// fast path above is the whole reason that stash exists: it answers
-    /// without touching the connection at all, so it must surface the
-    /// stashed message itself — leaving it on `client` would either strand
-    /// it forever (nothing else is coming to look) or, worse, let it leak
-    /// onto whichever different statement claims the connection next.
-    #[test]
-    fn more_results_fast_path_surfaces_a_pending_fetch_info() {
-        use mssql_tds::error::SqlInfoMessage;
-
-        let h = TestHandles::with_env_dbc_stmt();
-        let stmt_a = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
-        {
-            let mut sa = stmt_a.inner.lock().unwrap();
-            sa.set_state(STMT_STATE_CURSOR_OPEN);
-            // As if a zero-row SQLFetch's peek found the wire fully done,
-            // released the claim, and drained a trailing INFO message it had
-            // no success return to post under — exactly what
-            // release_busy_if_row_exhausted does for `row_delivered == false`.
-            sa.result_set_exhausted = true;
-            sa.batch_exhausted = true;
-            sa.pending_fetch_info = vec![SqlInfoMessage {
-                message: "trailing PRINT message".to_string(),
-                state: 1,
-                class: 0,
-                number: 0,
-                server_name: None,
-                proc_name: None,
-                line_number: None,
-            }];
-        }
-        // No client configured at all: if the fast path reached for the
-        // connection to find this message, it would fail with a different
-        // SQLSTATE (busy / no active client) instead of SQL_NO_DATA.
-
-        let ret = unsafe { sql_more_results(h.stmt) };
-
-        assert_eq!(
-            ret, SQL_NO_DATA,
-            "must still match msodbcsql's SQLMoreResults return for an exhausted batch"
-        );
-        let ss = stmt_a.inner.lock().unwrap();
-        assert!(
-            ss.diag_records
-                .iter()
-                .any(|d| d.message.contains("trailing PRINT message")),
-            "the stashed message must be surfaced, not silently dropped"
-        );
-        assert!(
-            ss.pending_fetch_info.is_empty(),
-            "must be taken so it cannot leak into a later call"
         );
     }
 

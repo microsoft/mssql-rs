@@ -161,7 +161,11 @@ fn sql_exec_direct_w_safe(
         let output_flags: Vec<bool> = stmt_state
             .bound_params
             .iter()
-            .map(|param| param.is_some_and(|param| is_output_direction(param.input_output_type)))
+            .map(|param| {
+                param
+                    .as_ref()
+                    .is_some_and(|param| is_output_direction(param.param.input_output_type))
+            })
             .collect();
         let (rewritten_sql, marker_count, mut call) =
             match translate_for_execution(&sql, stmt_state.inert_attrs.noscan(), &output_flags) {
@@ -200,12 +204,12 @@ fn sql_exec_direct_w_safe(
             };
             if index == 0
                 && call.as_ref().is_some_and(|c| c.returns_status)
-                && !is_output_direction(bound.input_output_type)
+                && !is_output_direction(bound.param.input_output_type)
             {
                 post_diag(&mut stmt_state, ERR_INVALID_PARAMETER_TYPE);
                 return SQL_ERROR;
             }
-            let Ok(positioned) = bound.for_row(0, bind_offset, SQL_BIND_BY_COLUMN) else {
+            let Ok(positioned) = bound.param.for_row(0, bind_offset, SQL_BIND_BY_COLUMN) else {
                 post_diag(&mut stmt_state, ERR_INVALID_STRING_OR_BUFFER_LENGTH);
                 return SQL_ERROR;
             };
@@ -248,6 +252,7 @@ fn sql_exec_direct_w_safe(
         stmt_state.prepared = None;
         stmt_state.direct_marker_count = Some(marker_count);
         stmt_state.parameter_metadata.clear();
+        stmt_state.parameter_udt_names.clear();
         stmt_state.clear_state(STMT_STATE_PREPARED);
         stmt_state.call_returns_status = call.as_ref().is_some_and(|c| c.returns_status);
         stmt_state.set_state(STMT_STATE_EXEC_STARTED);
@@ -962,20 +967,16 @@ mod tests {
     /// **Blocking, found in review**: `finish_execute`'s pure-DML branch (no
     /// result set, wire fully drained) was the only one of its three
     /// terminal branches that did not reset `result_set_exhausted`,
-    /// `batch_exhausted`, `pending_fetch_error`, and `pending_fetch_info` —
-    /// the sibling "statement-wise navigation" and "row-returning" branches
-    /// both do. Reusing a statement handle for a pure-DML re-execute after
-    /// those were left stale by a previous query (e.g. a zero-row fetch that
-    /// exhausted the whole batch and stashed a trailing INFO message) let
-    /// that stale state leak forward: `SQLMoreResults`'s `batch_exhausted`
-    /// fast path would post the *previous* query's INFO message — and a
-    /// stale `pending_fetch_error` would fail — as if they belonged to the
-    /// brand new query.
+    /// `batch_exhausted` and `pending_fetch_error` — the sibling
+    /// "statement-wise navigation" and "row-returning" branches both do.
+    /// Reusing a statement handle for a pure-DML re-execute after those were
+    /// left stale by a previous query could fast-path `SQLMoreResults` or
+    /// surface the previous query's deferred error against the new query.
     #[test]
-    fn exec_direct_pure_dml_clears_stale_exhausted_and_pending_info() {
+    fn exec_direct_pure_dml_clears_stale_exhausted_and_pending_error() {
         use crate::api::odbc_types::SQL_SUCCESS;
         use crate::handles::dbc::DbcHandle;
-        use mssql_tds::error::{Error as TdsError, SqlInfoMessage};
+        use mssql_tds::error::Error as TdsError;
         use mssql_tds::test_client_support::{done_no_more, tds_client_from_tokens};
 
         let h = TestHandles::with_env_dbc_stmt();
@@ -991,21 +992,11 @@ mod tests {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         {
             let mut ss = stmt.inner.lock().unwrap();
-            // As if a previous query's zero-row fetch exhausted the whole
-            // batch and stashed a trailing INFO message and error
-            // (release_busy_if_row_exhausted), left over on the reused handle.
+            // As if a previous query's read-ahead exhausted the whole batch
+            // and left a deferred error on the reused handle.
             ss.result_set_exhausted = true;
             ss.batch_exhausted = true;
             ss.pending_fetch_error = Some(TdsError::ProtocolError("stale".to_string()));
-            ss.pending_fetch_info = vec![SqlInfoMessage {
-                message: "previous query's PRINT output".to_string(),
-                state: 1,
-                class: 0,
-                number: 0,
-                server_name: None,
-                proc_name: None,
-                line_number: None,
-            }];
         }
 
         let ret = sql_exec_direct_w_safe(h.stmt, stmt, "UPDATE t1 SET x = 1".to_string());
@@ -1018,9 +1009,5 @@ mod tests {
             "must not fast-path this new query's SQLMoreResults to SQL_NO_DATA"
         );
         assert!(ss.pending_fetch_error.is_none());
-        assert!(
-            ss.pending_fetch_info.is_empty(),
-            "the previous query's INFO message must not leak onto the new query"
-        );
     }
 }

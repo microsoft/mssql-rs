@@ -459,6 +459,255 @@ TEST_F(GetInfoLiveTest, WorkItem48149CapabilitiesDescribeThisDriver) {
     }
 }
 
+// AB#47996: conversion-support masks. Values from msodbcsql's
+// `SQLGetInfoTable` (`sqlcinfo.cpp`), assembled from the same `SQL_CVT_*`
+// groupings the classic driver uses. Compared against retail 18.6.2.1.
+TEST_F(GetInfoLiveTest, WorkItem47996ConversionMasksMatchMsodbcsql) {
+    constexpr SQLUINTEGER kBinaryCvt = SQL_CVT_BINARY | SQL_CVT_VARBINARY;
+    constexpr SQLUINTEGER kIntCvt =
+        SQL_CVT_BIGINT | SQL_CVT_INTEGER | SQL_CVT_SMALLINT | SQL_CVT_TINYINT;
+    constexpr SQLUINTEGER kFloatCvt = SQL_CVT_FLOAT | SQL_CVT_REAL;
+    constexpr SQLUINTEGER kWCharCvt = SQL_CVT_WCHAR | SQL_CVT_WVARCHAR;
+    constexpr SQLUINTEGER kCharCvt = SQL_CVT_CHAR | SQL_CVT_VARCHAR;
+    constexpr SQLUINTEGER kNumericCvt = SQL_CVT_DECIMAL | SQL_CVT_NUMERIC;
+    constexpr SQLUINTEGER kTextCvt = SQL_CVT_LONGVARCHAR | SQL_CVT_WLONGVARCHAR;
+    constexpr SQLUINTEGER kCharSpt = kBinaryCvt | kIntCvt | kFloatCvt | kCharCvt |
+                                     kWCharCvt | SQL_CVT_DECIMAL | SQL_CVT_BIT |
+                                     kNumericCvt | SQL_CVT_TIMESTAMP | kTextCvt |
+                                     SQL_CVT_LONGVARBINARY | SQL_CVT_GUID;
+    constexpr SQLUINTEGER kBinarySpt = kBinaryCvt | kIntCvt | kCharCvt | kWCharCvt |
+                                       SQL_CVT_LONGVARBINARY | kNumericCvt;
+    constexpr SQLUINTEGER kNumberSpt = kBinaryCvt | kIntCvt | kFloatCvt | kCharCvt |
+                                       kWCharCvt | SQL_CVT_DECIMAL | SQL_CVT_BIT |
+                                       kNumericCvt;
+    constexpr SQLUINTEGER kApxnumSpt = kIntCvt | kFloatCvt | kCharCvt | kWCharCvt |
+                                       SQL_CVT_DECIMAL | SQL_CVT_BIT | kNumericCvt;
+    constexpr SQLUINTEGER kBitSpt = kBinaryCvt | kIntCvt | kFloatCvt | kCharCvt |
+                                    kWCharCvt | SQL_CVT_BIT | kNumericCvt;
+    constexpr SQLUINTEGER kGuidSpt = kCharCvt | kWCharCvt | SQL_CVT_GUID;
+    constexpr SQLUINTEGER kLongVarcharSpt = kCharCvt | kWCharCvt | kTextCvt;
+    constexpr SQLUINTEGER kLongVarbinarySpt = kBinaryCvt | SQL_CVT_LONGVARBINARY;
+    constexpr SQLUINTEGER kTimestampSpt =
+        kBinaryCvt | kCharCvt | kWCharCvt | SQL_CVT_TIMESTAMP;
+
+    struct Case { SQLUSMALLINT infoType; SQLUINTEGER expected; const char* name; };
+    const Case cases[] = {
+        {SQL_CONVERT_BIGINT, kNumberSpt, "SQL_CONVERT_BIGINT"},
+        {SQL_CONVERT_BINARY, kBinarySpt, "SQL_CONVERT_BINARY"},
+        {SQL_CONVERT_BIT, kBitSpt, "SQL_CONVERT_BIT"},
+        {SQL_CONVERT_CHAR, kCharSpt, "SQL_CONVERT_CHAR"},
+        {SQL_CONVERT_DECIMAL, kNumberSpt, "SQL_CONVERT_DECIMAL"},
+        {SQL_CONVERT_FLOAT, kApxnumSpt, "SQL_CONVERT_FLOAT"},
+        {SQL_CONVERT_GUID, kGuidSpt, "SQL_CONVERT_GUID"},
+        {SQL_CONVERT_INTEGER, kNumberSpt, "SQL_CONVERT_INTEGER"},
+        {SQL_CONVERT_LONGVARBINARY, kLongVarbinarySpt, "SQL_CONVERT_LONGVARBINARY"},
+        {SQL_CONVERT_LONGVARCHAR, kLongVarcharSpt, "SQL_CONVERT_LONGVARCHAR"},
+        {SQL_CONVERT_NUMERIC, kNumberSpt, "SQL_CONVERT_NUMERIC"},
+        {SQL_CONVERT_REAL, kApxnumSpt, "SQL_CONVERT_REAL"},
+        {SQL_CONVERT_SMALLINT, kNumberSpt, "SQL_CONVERT_SMALLINT"},
+        {SQL_CONVERT_TIMESTAMP, kTimestampSpt, "SQL_CONVERT_TIMESTAMP"},
+        {SQL_CONVERT_TINYINT, kNumberSpt, "SQL_CONVERT_TINYINT"},
+        {SQL_CONVERT_VARBINARY, kBinarySpt, "SQL_CONVERT_VARBINARY"},
+        {SQL_CONVERT_VARCHAR, kCharSpt, "SQL_CONVERT_VARCHAR"},
+        {SQL_CONVERT_WCHAR, kCharSpt, "SQL_CONVERT_WCHAR"},
+        {SQL_CONVERT_WVARCHAR, kCharSpt, "SQL_CONVERT_WVARCHAR"},
+        {SQL_CONVERT_WLONGVARCHAR, kLongVarcharSpt, "SQL_CONVERT_WLONGVARCHAR"},
+        {SQL_CONVERT_DATE, 0u, "SQL_CONVERT_DATE"},
+        {SQL_CONVERT_DOUBLE, 0u, "SQL_CONVERT_DOUBLE"},
+        {SQL_CONVERT_TIME, 0u, "SQL_CONVERT_TIME"},
+        {SQL_CONVERT_INTERVAL_DAY_TIME, 0u, "SQL_CONVERT_INTERVAL_DAY_TIME"},
+        {SQL_CONVERT_INTERVAL_YEAR_MONTH, 0u, "SQL_CONVERT_INTERVAL_YEAR_MONTH"},
+    };
+
+    for (const Case& c : cases) {
+        SQLRETURN rc = SQL_ERROR;
+        SQLSMALLINT len = -1;
+        EXPECT_EQ(c.expected, GetInfoU32(dbc_, c.infoType, &rc, &len)) << c.name;
+        EXPECT_EQ(SQL_SUCCESS, rc) << c.name;
+        EXPECT_EQ(static_cast<SQLSMALLINT>(sizeof(SQLUINTEGER)), len) << c.name;
+    }
+}
+
+// AB#47996: supported-SQL, driver, and limit masks that carry a `SQLUINTEGER`.
+TEST_F(GetInfoLiveTest, WorkItem47996U32ValuesMatchMsodbcsql) {
+    struct Case { SQLUSMALLINT infoType; SQLUINTEGER expected; const char* name; };
+    const Case cases[] = {
+        {SQL_AGGREGATE_FUNCTIONS, SQL_AF_ALL, "SQL_AGGREGATE_FUNCTIONS"},
+        {SQL_CREATE_TABLE, SQL_CT_CREATE_TABLE, "SQL_CREATE_TABLE"},
+        {SQL_DROP_TABLE, SQL_DT_DROP_TABLE, "SQL_DROP_TABLE"},
+        {SQL_DROP_VIEW, SQL_DV_DROP_VIEW, "SQL_DROP_VIEW"},
+        {SQL_CREATE_SCHEMA, SQL_CS_CREATE_SCHEMA | SQL_CS_AUTHORIZATION,
+         "SQL_CREATE_SCHEMA"},
+        {SQL_INDEX_KEYWORDS, SQL_IK_ALL, "SQL_INDEX_KEYWORDS"},
+        {SQL_INSERT_STATEMENT,
+         SQL_IS_INSERT_LITERALS | SQL_IS_INSERT_SEARCHED | SQL_IS_SELECT_INTO,
+         "SQL_INSERT_STATEMENT"},
+        {SQL_INFO_SCHEMA_VIEWS,
+         SQL_ISV_CHECK_CONSTRAINTS | SQL_ISV_COLUMN_DOMAIN_USAGE |
+             SQL_ISV_COLUMN_PRIVILEGES | SQL_ISV_COLUMNS |
+             SQL_ISV_CONSTRAINT_COLUMN_USAGE | SQL_ISV_CONSTRAINT_TABLE_USAGE |
+             SQL_ISV_DOMAIN_CONSTRAINTS | SQL_ISV_DOMAINS | SQL_ISV_KEY_COLUMN_USAGE |
+             SQL_ISV_REFERENTIAL_CONSTRAINTS | SQL_ISV_SCHEMATA |
+             SQL_ISV_TABLE_CONSTRAINTS | SQL_ISV_TABLE_PRIVILEGES | SQL_ISV_TABLES |
+             SQL_ISV_VIEW_COLUMN_USAGE | SQL_ISV_VIEW_TABLE_USAGE | SQL_ISV_VIEWS,
+         "SQL_INFO_SCHEMA_VIEWS"},
+        {SQL_STANDARD_CLI_CONFORMANCE, SQL_SCC_ISO92_CLI,
+         "SQL_STANDARD_CLI_CONFORMANCE"},
+        {SQL_MAX_INDEX_SIZE, 900u, "SQL_MAX_INDEX_SIZE"},
+        {SQL_ALTER_DOMAIN, 0u, "SQL_ALTER_DOMAIN"},
+        {SQL_CREATE_DOMAIN, 0u, "SQL_CREATE_DOMAIN"},
+        {SQL_DROP_SCHEMA, 0u, "SQL_DROP_SCHEMA"},
+        {SQL_DATETIME_LITERALS, 0u, "SQL_DATETIME_LITERALS"},
+        {SQL_CREATE_VIEW, SQL_CV_CREATE_VIEW | SQL_CV_CHECK_OPTION, "SQL_CREATE_VIEW"},
+        // Zero-mask capability types msodbcsql still answers.
+        {SQL_CREATE_CHARACTER_SET, 0u, "SQL_CREATE_CHARACTER_SET"},
+        {SQL_CREATE_COLLATION, 0u, "SQL_CREATE_COLLATION"},
+        {SQL_CREATE_TRANSLATION, 0u, "SQL_CREATE_TRANSLATION"},
+        {SQL_DROP_ASSERTION, 0u, "SQL_DROP_ASSERTION"},
+        {SQL_DROP_CHARACTER_SET, 0u, "SQL_DROP_CHARACTER_SET"},
+        {SQL_DROP_COLLATION, 0u, "SQL_DROP_COLLATION"},
+        {SQL_DROP_DOMAIN, 0u, "SQL_DROP_DOMAIN"},
+        {SQL_DROP_TRANSLATION, 0u, "SQL_DROP_TRANSLATION"},
+        // SQL-92 capability masks.
+        {SQL_SQL92_GRANT, SQL_SG_WITH_GRANT_OPTION, "SQL_SQL92_GRANT"},
+        {SQL_SQL92_REVOKE, SQL_SR_GRANT_OPTION_FOR, "SQL_SQL92_REVOKE"},
+        {SQL_SQL92_PREDICATES,
+         SQL_SP_BETWEEN | SQL_SP_COMPARISON | SQL_SP_EXISTS | SQL_SP_IN |
+             SQL_SP_ISNOTNULL | SQL_SP_ISNULL | SQL_SP_LIKE |
+             SQL_SP_QUANTIFIED_COMPARISON,
+         "SQL_SQL92_PREDICATES"},
+        {SQL_SQL92_RELATIONAL_JOIN_OPERATORS,
+         SQL_SRJO_CROSS_JOIN | SQL_SRJO_FULL_OUTER_JOIN | SQL_SRJO_INNER_JOIN |
+             SQL_SRJO_LEFT_OUTER_JOIN | SQL_SRJO_RIGHT_OUTER_JOIN | SQL_SRJO_UNION_JOIN,
+         "SQL_SQL92_RELATIONAL_JOIN_OPERATORS"},
+        {SQL_SQL92_ROW_VALUE_CONSTRUCTOR,
+         SQL_SRVC_VALUE_EXPRESSION | SQL_SRVC_NULL | SQL_SRVC_DEFAULT |
+             SQL_SRVC_ROW_SUBQUERY,
+         "SQL_SQL92_ROW_VALUE_CONSTRUCTOR"},
+        {SQL_SQL92_STRING_FUNCTIONS, SQL_SSF_LOWER | SQL_SSF_UPPER,
+         "SQL_SQL92_STRING_FUNCTIONS"},
+        {SQL_SQL92_VALUE_EXPRESSIONS,
+         SQL_SVE_CASE | SQL_SVE_CAST | SQL_SVE_COALESCE | SQL_SVE_NULLIF,
+         "SQL_SQL92_VALUE_EXPRESSIONS"},
+        {SQL_SQL92_DATETIME_FUNCTIONS, 0u, "SQL_SQL92_DATETIME_FUNCTIONS"},
+        {SQL_SQL92_FOREIGN_KEY_DELETE_RULE, 0u, "SQL_SQL92_FOREIGN_KEY_DELETE_RULE"},
+        {SQL_SQL92_FOREIGN_KEY_UPDATE_RULE, 0u, "SQL_SQL92_FOREIGN_KEY_UPDATE_RULE"},
+        {SQL_SQL92_NUMERIC_VALUE_FUNCTIONS, 0u, "SQL_SQL92_NUMERIC_VALUE_FUNCTIONS"},
+    };
+
+    for (const Case& c : cases) {
+        SQLRETURN rc = SQL_ERROR;
+        SQLSMALLINT len = -1;
+        EXPECT_EQ(c.expected, GetInfoU32(dbc_, c.infoType, &rc, &len)) << c.name;
+        EXPECT_EQ(SQL_SUCCESS, rc) << c.name;
+        EXPECT_EQ(static_cast<SQLSMALLINT>(sizeof(SQLUINTEGER)), len) << c.name;
+    }
+}
+
+// AB#47996: capability-ledger values that describe this driver rather than
+// msodbcsql. Async is unimplemented (`SQL_ASYNC_MODE = SQL_AM_NONE`), so no
+// async statements are advertised; the interface conformance is 0, not the
+// Level 2 msodbcsql claims, because the Core set itself is not fully met
+// (`SQLGetCursorName`/`SQLSetCursorName` are unimplemented) let alone the Level
+// 2 `SQLSetPos`/`SQLBulkOperations` surface. Both intentionally diverge from
+// retail, so the comparison leg is skipped.
+TEST_F(GetInfoLiveTest, WorkItem47996CapabilitiesDescribeThisDriver) {
+    SKIP_IF_COMPARING_MSODBCSQL();
+
+    struct Case { SQLUSMALLINT infoType; SQLUINTEGER expected; const char* name; };
+    const Case cases[] = {
+        {SQL_MAX_ASYNC_CONCURRENT_STATEMENTS, 0u,
+         "SQL_MAX_ASYNC_CONCURRENT_STATEMENTS"},
+        {SQL_ODBC_INTERFACE_CONFORMANCE, 0u,
+         "SQL_ODBC_INTERFACE_CONFORMANCE"},
+        // SQLSetPos is unimplemented (planned Phase 10), so this driver
+        // advertises no positioned operations or lock types, unlike retail.
+        {SQL_POS_OPERATIONS, 0u, "SQL_POS_OPERATIONS"},
+        {SQL_LOCK_TYPES, 0u, "SQL_LOCK_TYPES"},
+    };
+
+    for (const Case& c : cases) {
+        SQLRETURN rc = SQL_ERROR;
+        SQLSMALLINT len = -1;
+        EXPECT_EQ(c.expected, GetInfoU32(dbc_, c.infoType, &rc, &len)) << c.name;
+        EXPECT_EQ(SQL_SUCCESS, rc) << c.name;
+        EXPECT_EQ(static_cast<SQLSMALLINT>(sizeof(SQLUINTEGER)), len) << c.name;
+    }
+}
+
+// AB#47996: information types that carry a `SQLUSMALLINT`.
+TEST_F(GetInfoLiveTest, WorkItem47996U16ValuesMatchMsodbcsql) {
+    struct Case { SQLUSMALLINT infoType; SQLUSMALLINT expected; const char* name; };
+    const Case cases[] = {
+        {SQL_ACTIVE_ENVIRONMENTS, 0, "SQL_ACTIVE_ENVIRONMENTS"},
+        {SQL_FILE_USAGE, SQL_FILE_NOT_SUPPORTED, "SQL_FILE_USAGE"},
+        {SQL_CATALOG_LOCATION, SQL_QL_START, "SQL_CATALOG_LOCATION"},
+        {SQL_NON_NULLABLE_COLUMNS, SQL_NNC_NON_NULL, "SQL_NON_NULLABLE_COLUMNS"},
+        {SQL_MAX_CURSOR_NAME_LEN, 128, "SQL_MAX_CURSOR_NAME_LEN"},
+        {SQL_MAX_PROCEDURE_NAME_LEN, 134, "SQL_MAX_PROCEDURE_NAME_LEN"},
+    };
+
+    for (const Case& c : cases) {
+        SQLRETURN rc = SQL_ERROR;
+        SQLSMALLINT len = -1;
+        EXPECT_EQ(c.expected, GetInfoU16(dbc_, c.infoType, &rc, &len)) << c.name;
+        EXPECT_EQ(SQL_SUCCESS, rc) << c.name;
+        EXPECT_EQ(static_cast<SQLSMALLINT>(sizeof(SQLUSMALLINT)), len) << c.name;
+    }
+}
+
+// AB#47996: information types that carry a one-character `Y`/`N` string.
+TEST_F(GetInfoLiveTest, WorkItem47996StringValuesMatchMsodbcsql) {
+    struct Case { SQLUSMALLINT infoType; const char* expected; const char* name; };
+    const Case cases[] = {
+        {SQL_ROW_UPDATES, "N", "SQL_ROW_UPDATES"},
+        {SQL_MAX_ROW_SIZE_INCLUDES_LONG, "N", "SQL_MAX_ROW_SIZE_INCLUDES_LONG"},
+        {SQL_INTEGRITY, "Y", "SQL_INTEGRITY"},
+    };
+
+    for (const Case& c : cases) {
+        SQLRETURN rc = SQL_ERROR;
+        SQLSMALLINT len = -1;
+        EXPECT_EQ(c.expected, GetInfoString(dbc_, c.infoType, &rc, &len)) << c.name;
+        EXPECT_EQ(SQL_SUCCESS, rc) << c.name;
+        EXPECT_EQ(static_cast<SQLSMALLINT>(sizeof(SQLTCHAR)), len) << c.name;
+    }
+}
+
+// AB#47996: `SQL_COLLATION_SEQ` names three server code pages (1252, 850, 437)
+// derived from the database collation and is empty for every other. Expected is
+// computed from the connected database's code page so the assertion holds on
+// any server collation, and the compare leg pins it against retail.
+TEST_F(GetInfoLiveTest, WorkItem47996CollationSeqMatchesServerCodePage) {
+    SQLHSTMT stmt = SQL_NULL_HANDLE;
+    ASSERT_EQ(SQL_SUCCESS, SQLAllocHandle(SQL_HANDLE_STMT, dbc_, &stmt));
+    const SqlTString query = ODBCTestUtils::ToSqlTStr(
+        "SELECT COLLATIONPROPERTY(CAST(DATABASEPROPERTYEX(DB_NAME(),'Collation')"
+        " AS nvarchar(128)),'CodePage')");
+    ASSERT_EQ(SQL_SUCCESS,
+              SQLExecDirect(stmt, const_cast<SQLTCHAR*>(query.c_str()), SQL_NTS));
+    ASSERT_EQ(SQL_SUCCESS, SQLFetch(stmt));
+    SQLINTEGER codePage = 0;
+    SQLLEN ind = 0;
+    ASSERT_TRUE(SQL_SUCCEEDED(SQLGetData(stmt, 1, SQL_C_SLONG, &codePage,
+                                         sizeof(codePage), &ind)));
+    SQLFreeHandle(SQL_HANDLE_STMT, stmt);
+
+    const char* expected = "";
+    if (codePage == 1252) {
+        expected = "ISO 8859-1";
+    } else if (codePage == 850) {
+        expected = "Code page 850";
+    } else if (codePage == 437) {
+        expected = "Code page 437";
+    }
+
+    SQLRETURN rc = SQL_ERROR;
+    SQLSMALLINT len = -1;
+    EXPECT_EQ(expected, GetInfoString(dbc_, SQL_COLLATION_SEQ, &rc, &len));
+    EXPECT_EQ(SQL_SUCCESS, rc);
+}
+
 TEST_F(GetInfoLiveTest, DatabaseNameMatchesCurrentCatalog) {
     SQLRETURN rc = SQL_ERROR;
     std::string database = GetInfoString(dbc_, SQL_DATABASE_NAME, &rc, nullptr);

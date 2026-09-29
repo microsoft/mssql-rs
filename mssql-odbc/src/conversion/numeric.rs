@@ -26,12 +26,6 @@ pub(crate) enum NumericSource {
     /// and whether anything non-zero was dropped, which survives any length.
     /// `negative` is kept separately because `int_part` cannot hold the sign of
     /// `-0.something` and `approx` can underflow to `-0.0`.
-    ///
-    /// [`NumericSource::Float`] has no such rescue, and deliberately so: it
-    /// holds exponent forms, which msodbcsql also routes through a double
-    /// (`sqlccnvt.cpp:5118`). `"-1e-400"` is `-0.0` there too, so
-    /// [`NumericSource::is_negative`] answering `false` matches rather than
-    /// diverges. See `parse_numeric_text` for the routing.
     WideDecimal {
         approx: f64,
         negative: bool,
@@ -39,6 +33,8 @@ pub(crate) enum NumericSource {
         fraction_dropped: bool,
         fractional_precision: u32,
     },
+    /// Negative zero is not negative for bit conversion (`f < 0.0`), including
+    /// Windows exponent underflow; this matches msodbcsql's `dTemp < 0` check.
     Float(f64),
 }
 
@@ -190,7 +186,19 @@ pub(crate) fn narrow_f64_to_f32(v: f64) -> Result<f32, ConvError> {
     Ok(v as f32)
 }
 
+/// Selects the outcome when a nonzero exponent literal rounds to zero.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum UnderflowPolicy {
+    /// Non-Windows CharToDouble and decimal parameters on every platform.
+    Reject,
+    /// Windows OLE Automation preserves signed zero.
+    AcceptZero,
+}
+
 /// Interprets text as a number, for either direction (fetch & params).
+///
+/// Exponent underflow becomes signed zero on Windows and a range error elsewhere,
+/// matching the platform's CharToDouble implementation.
 ///
 /// Both directions must agree on what counts as a number, because msodbcsql
 /// answers the question once: `Convert` dispatches a character source to
@@ -210,6 +218,20 @@ pub(crate) fn narrow_f64_to_f32(v: f64) -> Result<f32, ConvError> {
 /// and flags any non-zero one past the scale (`sqlccnvt.cpp:7823`) however long
 /// the literal is.
 pub(crate) fn parse_numeric_text(text: &str) -> Result<NumericSource, ConvError> {
+    let policy = if cfg!(windows) {
+        UnderflowPolicy::AcceptZero
+    } else {
+        UnderflowPolicy::Reject
+    };
+    parse_numeric_text_with_policy(text, policy)
+}
+
+/// Decimal parameters reject underflow even on Windows, where CharToDouble
+/// accepts zero: ConvertToNumeric uses stringtonumeric (sqlccnvt.cpp:7101).
+pub(crate) fn parse_numeric_text_with_policy(
+    text: &str,
+    policy: UnderflowPolicy,
+) -> Result<NumericSource, ConvError> {
     // An embedded NUL ends the number. `CharToBigint` loops
     // `while (len < srclen && charstr[len] != '\0')` (`sqlccnvt.cpp:7800`), so an
     // application that passes `strlen + 1` as the length still parses.
@@ -228,6 +250,8 @@ pub(crate) fn parse_numeric_text(text: &str) -> Result<NumericSource, ConvError>
     // here. `a_non_numeric_literal_is_22018` is what holds that.
     let trimmed = text.trim_matches(' ');
 
+    // Plain decimals keep their existing exact path; underflow when later
+    // converting them with as_f64 is outside this exponent-parsing policy.
     if let Some(source) = parse_decimal_literal(trimmed) {
         return Ok(source);
     }
@@ -245,14 +269,23 @@ pub(crate) fn parse_numeric_text(text: &str) -> Result<NumericSource, ConvError>
     // `CharToBigint` (`:5109`, which walks digits and flags a dropped fraction)
     // but an exponent literal to `CharToDouble` (`:5118`, which keeps only what
     // the double holds).
-    //
-    // That makes the answer depend on the spelling, in both drivers: `"1e-400"`
-    // underflows to `0.0` and reports no dropped fraction, where the same value
-    // written out as `"0." + 400 zeros + "1"` reports one. Deliberately left
-    // alone - recovering the fraction from the text would be more self-
-    // consistent but would diverge from msodbcsql on both directions at once.
-    // The same routing is why `"-1e-400"` is `-0.0` and so not negative.
     match trimmed.parse::<f64>() {
+        // Rust silently rounds underflow to zero. The non-OLE VarR8FromStr
+        // rejects strtod zero with ERANGE (xplat/src/StringFunctions.cpp:1437-1442);
+        // its :1360 guard includes Linux and macOS. CharToDouble maps that error
+        // to CVT_PREC (sqlccnvt.cpp:7949-7954), whereas Windows OLE Automation
+        // succeeds with signed zero.
+        // Inspect only the significand: the exponent in "0e-999" is not a value.
+        Ok(f)
+            if matches!(policy, UnderflowPolicy::Reject)
+                && f == 0.0
+                && trimmed
+                    .bytes()
+                    .take_while(|b| !matches!(b, b'e' | b'E'))
+                    .any(|b| matches!(b, b'1'..=b'9')) =>
+        {
+            Err(ConvError::OutOfRange)
+        }
         Ok(f) if f.is_finite() => Ok(NumericSource::Float(f)),
         // Rust folds overflow into `Ok(inf)`, but msodbcsql's `VarR8FromStr`
         // reports `DISP_E_OVERFLOW` -> 22003 and keeps the cast error for text
@@ -455,34 +488,98 @@ mod tests {
         assert!(!parse_numeric_text(&zero).unwrap().is_negative());
     }
 
-    /// The answer depends on the spelling, and that is msodbcsql's behaviour,
-    /// not an oversight: `Convert` sends a plain literal to `CharToBigint`,
-    /// which walks digits and flags a dropped fraction, and an exponent literal
-    /// to `CharToDouble`, which keeps only what the double holds
-    /// (`sqlccnvt.cpp:5092`, `:5109`, `:5118`). An underflowing exponent is
-    /// therefore exactly zero, with no fraction to report and no sign.
     #[test]
-    fn an_underflowing_exponent_loses_its_fraction_as_msodbcsql_does() {
+    fn exponent_underflow_follows_the_platform_and_target() {
+        for text in [
+            "1e-999",
+            "-1e-999",
+            "1e-400",
+            "-1e-400",
+            "2e-324",
+            "+0.001E-999",
+            " 1e-999 ",
+            "1e-999\0ignored",
+        ] {
+            let expected = if cfg!(windows) {
+                Ok(NumericSource::Float(0.0))
+            } else {
+                Err(ConvError::OutOfRange)
+            };
+            assert_eq!(parse_numeric_text(text), expected, "{text:?}");
+            assert_eq!(
+                parse_numeric_text_with_policy(text, UnderflowPolicy::Reject),
+                Err(ConvError::OutOfRange),
+                "{text:?}"
+            );
+            let rounded = parse_numeric_text_with_policy(text, UnderflowPolicy::AcceptZero)
+                .unwrap()
+                .as_f64();
+            assert_eq!(rounded, 0.0);
+            assert_eq!(rounded.is_sign_negative(), text.starts_with('-'));
+        }
+    }
+
+    #[test]
+    fn zero_significands_are_not_underflow() {
+        // The positive-exponent cases pin Rust behavior, not Windows parity:
+        // Driver 18.6.2.1 returns 22003 for 0e999/0E+999 via SQL_C_DOUBLE.
+        // That existing exponent-range gap is outside this underflow fix.
+        for text in ["0e-999", "-0e-999", "+0.000E-999", "0e999", "0E+999"] {
+            assert_eq!(parse_numeric_text(text).unwrap().as_f64(), 0.0, "{text}");
+            for policy in [UnderflowPolicy::Reject, UnderflowPolicy::AcceptZero] {
+                assert_eq!(
+                    parse_numeric_text_with_policy(text, policy).map(|source| source.as_f64()),
+                    Ok(0.0),
+                    "{text}: {policy:?}"
+                );
+            }
+        }
+        assert!(
+            parse_numeric_text("-0e-999")
+                .unwrap()
+                .as_f64()
+                .is_sign_negative()
+        );
+        for text in ["0e-", "0e-999x", "1e-999x"] {
+            assert_eq!(
+                parse_numeric_text(text),
+                Err(ConvError::InvalidCharacterValue)
+            );
+        }
+    }
+
+    #[test]
+    fn representable_exponents_and_plain_fractions_are_unchanged() {
         let plain = format!("0.{}1", "0".repeat(400));
+        let source = parse_numeric_text_with_policy(&plain, UnderflowPolicy::Reject).unwrap();
         assert_eq!(
-            parse_numeric_text(&plain).unwrap().to_i128_truncating(),
+            source.as_f64(),
+            0.0,
+            "plain-decimal float underflow is unchanged"
+        );
+        assert_eq!(
+            source.to_i128_truncating(),
             Some((0, true)),
             "a plain literal keeps the digit walk"
         );
-        assert_eq!(
-            parse_numeric_text("1e-400").unwrap().to_i128_truncating(),
-            Some((0, false)),
-            "an exponent literal is whatever the double holds"
-        );
-
-        // Subnormal but non-zero: the double still carries a fraction.
+        // These subnormal assertions pin Rust behavior, not Linux parity:
+        // Driver 18.6.2.1 returns 22018 for 1e-320/5e-324 via SQL_C_DOUBLE.
+        // Nonzero subnormal parsing remains outside the underflow-to-zero fix.
         assert_eq!(
             parse_numeric_text("1e-320").unwrap().to_i128_truncating(),
             Some((0, true))
         );
 
-        // -0.0 is not negative, for the same reason.
-        assert!(!parse_numeric_text("-1e-400").unwrap().is_negative());
+        assert_eq!(
+            parse_numeric_text("5e-324").unwrap().as_f64(),
+            f64::from_bits(1)
+        );
+        assert_eq!(
+            parse_numeric_text("2.2250738585072014e-308")
+                .unwrap()
+                .as_f64(),
+            f64::MIN_POSITIVE
+        );
     }
 
     /// A literal past an exact mantissa still has to reach a float target at
