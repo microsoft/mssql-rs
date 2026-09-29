@@ -1976,7 +1976,9 @@ fn typed_null(
 /// Matches msodbcsql for ODBC 3.x applications: `CheckSqlPrec`
 /// (`Sql/Ntdbms/sqlncli/odbc/sqlcdesc.cpp`) rejects a zero `ColumnSize` on these
 /// types with `HY104`, and only clamps it to the maximum for a 2.x application
-/// (`IS2xAPP`). We report the same `HY104`, at execute rather than at bind.
+/// (`IS2xAPP`). `SQLBindParameter` reports the same `HY104` in the same phase
+/// msodbcsql does, through `parameter_column_size_is_valid`, so this is a
+/// backstop rather than the primary check.
 /// `varchar`/`nvarchar` differ deliberately -- see [`variable_length`].
 fn fixed_length(column_size: usize, max: usize) -> Result<u16, ParamBuildError> {
     u16::try_from(column_size)

@@ -3033,3 +3033,78 @@ TEST_F(ExtendedTypeLiveTest, BinaryVariantRoundTripsThroughASqlVariantColumn) {
                   SQL_HANDLE_STMT, stmt_);
     EXPECT_EQ("102030|varbinary", ExecuteAndReadBack());
 }
+
+// Conversion-matrix cells msodbcsql performs and this driver has not
+// implemented yet. Measured against msodbcsql18 on 2026-09-29: every cell below
+// binds, and all but TIMESTAMP->TYPE_DATE also execute (that one binds and then
+// fails at execute, because dropping a non-zero time is an error, not a
+// truncation). msodbcsql admits them from IsValidSQLConversion
+// (`Sql/Ntdbms/sqlncli/odbc/sqlcprot.h:2514`): its SQL_XML_MAPPED case accepts
+// SQL_C_BINARY, and its SQL_DATE / SQL_TIME cases refuse only SQL_C_TIME /
+// SQL_C_SS_TIME2 / SQL_C_DATE respectively, leaving the rest legal.
+//
+// This driver refuses all of them at bind with HYC00. That is the documented
+// "implemented, not legal" reading of the matrix, and AB#48249 is where the
+// remaining cells get implemented or flipped to 07006. Pinning the refusal here
+// means that work has to update this test deliberately rather than silently.
+TEST_F(CrossConversionLiveTest, UnimplementedMatrixCellsAreRefusedAtBind) {
+    SKIP_IF_COMPARING_MSODBCSQL();
+
+    struct Cell {
+        const char* name;
+        SQLSMALLINT c_type;
+        SQLSMALLINT sql_type;
+    };
+    const Cell cells[] = {
+        {"BINARY->SS_XML", SQL_C_BINARY, SQL_SS_XML},
+        {"TIMESTAMP->TYPE_TIME", SQL_C_TYPE_TIMESTAMP, SQL_TYPE_TIME},
+        {"TIMESTAMP->TYPE_DATE", SQL_C_TYPE_TIMESTAMP, SQL_TYPE_DATE},
+        {"DATE->TYPE_TIMESTAMP", SQL_C_TYPE_DATE, SQL_TYPE_TIMESTAMP},
+        {"TSOFFSET->TYPE_TIMESTAMP", SQL_C_SS_TIMESTAMPOFFSET, SQL_TYPE_TIMESTAMP},
+        {"TSOFFSET->SS_TIME2", SQL_C_SS_TIMESTAMPOFFSET, SQL_SS_TIME2},
+    };
+
+    SQL_TIMESTAMP_STRUCT ts = {2024, 5, 6, 7, 8, 9, 0};
+    SQL_DATE_STRUCT dt = {2024, 5, 6};
+    SQL_SS_TIMESTAMPOFFSET_STRUCT tso = {2024, 5, 6, 7, 8, 9, 0, 0, 0};
+    unsigned char xml[] = {0x3C, 0x00, 0x61, 0x00, 0x2F, 0x00, 0x3E, 0x00};
+
+    for (const Cell& cell : cells) {
+        ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
+
+        void* data = nullptr;
+        SQLLEN ind = 0;
+        SQLULEN size = 0;
+        SQLSMALLINT scale = 0;
+        switch (cell.c_type) {
+            case SQL_C_BINARY:
+                data = xml;
+                ind = sizeof(xml);
+                size = sizeof(xml);
+                break;
+            case SQL_C_TYPE_TIMESTAMP:
+                data = &ts;
+                ind = sizeof(ts);
+                size = 23;
+                scale = 3;
+                break;
+            case SQL_C_TYPE_DATE:
+                data = &dt;
+                ind = sizeof(dt);
+                size = 10;
+                break;
+            default:
+                data = &tso;
+                ind = sizeof(tso);
+                size = 34;
+                scale = 7;
+                break;
+        }
+
+        EXPECT_EQ(SQL_ERROR, SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, cell.c_type,
+                                              cell.sql_type, size, scale, data, ind, &ind))
+            << cell.name;
+        EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HYC00");
+        SQLFreeStmt(stmt_, SQL_RESET_PARAMS);
+    }
+}

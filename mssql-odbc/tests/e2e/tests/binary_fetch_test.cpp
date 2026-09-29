@@ -15,6 +15,10 @@
 #include <string>
 #include <vector>
 
+#ifndef SQL_SS_UDT
+#define SQL_SS_UDT (-151)
+#endif
+
 class BinaryFetchLiveTest : public ODBCTest {
 protected:
     void SetUp() override {
@@ -251,6 +255,52 @@ TEST_F(BinaryFetchLiveTest, GeometryDeliversItsWireBytes) {
     ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_BINARY, buf, sizeof(buf), &ind), SQL_HANDLE_STMT,
                   stmt_);
     EXPECT_EQ(22, ind) << "SRID 0 point, well-known binary";
+    SQLCloseCursor(stmt_);
+}
+
+// The path every geography/geometry fetch takes from mssql-python. Those
+// columns describe as length 0, and its fetch loop streams anything whose
+// column size is 0, unknown, or over 8000 - so the chunked read below is the
+// common case there, not an edge case. The two UDT tests above only cover a
+// value small enough for one call.
+TEST_F(BinaryFetchLiveTest, LargeGeometryChunksAcrossCalls) {
+    // Built here rather than in T-SQL so the test does not depend on a server
+    // version for string aggregation. ~1000 points puts the serialized value
+    // well past a single buffer.
+    std::string wkt = "LINESTRING(";
+    for (int i = 0; i < 1000; ++i) {
+        if (i != 0) {
+            wkt += ",";
+        }
+        wkt += std::to_string(i) + " " + std::to_string(i % 7);
+    }
+    wkt += ")";
+    FetchOne("SELECT geometry::STGeomFromText('" + wkt + "', 0)");
+    AssertColumnSqlType(SQL_SS_UDT);
+
+    unsigned char buf[4096] = {};
+    SQLLEN ind = 0;
+
+    ASSERT_EQ(SQL_SUCCESS_WITH_INFO, SQLGetData(stmt_, 1, SQL_C_BINARY, buf, sizeof(buf), &ind));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01004");
+    ASSERT_GT(ind, static_cast<SQLLEN>(sizeof(buf)))
+        << "the value must outrun one buffer or this pins nothing";
+    const SQLLEN total = ind;
+
+    // Drain, counting what each call actually delivered.
+    SQLLEN delivered = static_cast<SQLLEN>(sizeof(buf));
+    SQLRETURN rc = SQL_SUCCESS_WITH_INFO;
+    while (rc == SQL_SUCCESS_WITH_INFO) {
+        rc = SQLGetData(stmt_, 1, SQL_C_BINARY, buf, sizeof(buf), &ind);
+        ASSERT_TRUE(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO)
+            << "chunked UDT read failed part way through, rc=" << rc;
+        // The indicator reports what was left before the call, so the last one
+        // is the size of the final chunk.
+        delivered += (rc == SQL_SUCCESS) ? ind : static_cast<SQLLEN>(sizeof(buf));
+    }
+    EXPECT_EQ(total, delivered) << "chunks must sum to the length reported up front";
+
+    EXPECT_EQ(SQL_NO_DATA, SQLGetData(stmt_, 1, SQL_C_BINARY, buf, sizeof(buf), &ind));
     SQLCloseCursor(stmt_);
 }
 

@@ -314,3 +314,42 @@ TEST_F(DescribeParamLiveTest, DescribedDecimalRoundTripsPrecisionAndScale) {
     EXPECT_DOUBLE_EQ(1.5, std::stod(GetColumn(1)));
     EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }
+
+TEST_F(DescribeParamLiveTest, ATempTableParameterCannotBeDescribedButStillBinds) {
+    ExecDirect("CREATE TABLE #dp_tmp (id INT, data VARBINARY(32))");
+    ASSERT_SQL_OK(Prepare("INSERT INTO #dp_tmp (id, data) VALUES (?, ?)"), SQL_HANDLE_STMT,
+                  stmt_);
+
+    // sp_describe_undeclared_parameters cannot resolve a parameter against a
+    // temp table, and both drivers surface that as SQL_ERROR rather than a
+    // guessed type. mssql-python turns this failure into its SQL_VARCHAR
+    // fallback, which is why a VARBINARY NULL needs setinputsizes (GH-627).
+    for (SQLUSMALLINT ordinal = 1; ordinal <= 2; ++ordinal) {
+        ParamDescription probe;
+        EXPECT_EQ(SQL_ERROR, SQLDescribeParam(stmt_, ordinal, &probe.data_type, &probe.size,
+                                              &probe.scale, &probe.nullable))
+            << "ordinal " << ordinal;
+    }
+
+    // The failed describe must not poison the statement: the explicit binding
+    // that setinputsizes performs still has to execute on the same handle.
+    SQLLEN id_length = 0;
+    SQLINTEGER id = 7;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_LONG, SQL_INTEGER, 10, 0,
+                                   &id, 0, &id_length),
+                  SQL_HANDLE_STMT, stmt_);
+    SQLLEN data_length = SQL_NULL_DATA;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 2, SQL_PARAM_INPUT, SQL_C_BINARY, SQL_VARBINARY, 32,
+                                   0, nullptr, 0, &data_length),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_RESET_PARAMS), SQL_HANDLE_STMT, stmt_);
+    ExecDirect("SELECT id, data FROM #dp_tmp");
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("7", GetColumn(1));
+    SQLLEN fetched = 0;
+    GetColumn(2, &fetched);
+    EXPECT_EQ(SQL_NULL_DATA, fetched);
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+}
