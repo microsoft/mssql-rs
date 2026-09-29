@@ -19,17 +19,15 @@ std::string NativeCodeset() {
     const char* codeset = nl_langinfo(CODESET);
     std::string name;
     for (const unsigned char ch : std::string(codeset == nullptr ? "" : codeset)) {
-        if (ch != '-' && ch != '_') {
-            name += static_cast<char>(std::toupper(ch));
-        }
+        name += static_cast<char>(std::toupper(ch));
     }
-    if (name == "UTF8") {
+    if (name == "UTF8" || name == "UTF-8") {
         return "UTF-8";
     }
-    if (name == "UTF32LE") {
+    if (name == "UTF-32LE") {
         return "UTF-32LE";
     }
-    if (name == "BIG5" || name == "BIG5HKSCS") {
+    if (name == "BIG5" || name == "BIG5-HKSCS") {
         return "CP950";
     }
     if (name == "GB2312" || name == "GBK") {
@@ -43,9 +41,11 @@ std::string NativeCodeset() {
         }
     }
     for (const int part : {1, 2, 3, 4, 5, 6, 7, 8, 9, 13, 15}) {
-        if (name == "ISO8859" + std::to_string(part) ||
-            name == "8859" + std::to_string(part)) {
-            return "ISO8859-" + std::to_string(part);
+        for (const char* prefix : {
+                 "ISO-8859-", "8859_", "ISO8859-", "ISO8859", "ISO_8859-", "ISO_8859_"}) {
+            if (name == prefix + std::to_string(part)) {
+                return "ISO8859-" + std::to_string(part);
+            }
         }
     }
     // C/POSIX's ASCII codeset and unsupported locales use the UTF-8 fallback.
@@ -277,15 +277,18 @@ std::string ODBCTestUtils::Utf8ToNativeClient(const std::string& utf8,
     }
     return result;
 #else
-    // No setlocale call: capture the same active locale as a new connection.
+    // No setlocale call: snapshot the active codeset once, like the driver.
     // The test runners normally leave LC_CTYPE=C, which the driver treats as UTF-8.
     const auto validated = ConvertNativeTestText(utf8, "UTF-8", false, nullptr);
-    auto encoding = NativeCodeset();
+    static const auto nativeEncoding = NativeCodeset();
+    auto encoding = nativeEncoding;
     if (encoding == "UTF-8") {
         return validated;
     }
 #if defined(__GLIBC__) || defined(__APPLE__)
-    encoding += "//TRANSLIT";
+    if (encoding != "UTF-32LE") {
+        encoding += "//TRANSLIT";
+    }
 #endif
     return ConvertNativeTestText(validated, encoding, true, usedDefault);
 #endif
