@@ -510,6 +510,17 @@ pub struct TdsClient {
 
     pub(in crate::connection) return_values: Vec<ReturnValue>,
     info_messages: Vec<SqlInfoMessage>,
+    /// Whether the work most recently completed on this connection substituted
+    /// a character the narrow encoding it was sent in could not represent.
+    ///
+    /// Usually one message: captured from it once it is built, or noted
+    /// directly by a caller that converts a data-at-execution chunk itself.
+    /// A bulk copy is the exception — `BulkCopy::write_to_server_zerocopy`
+    /// spans several messages and restores the aggregate across every batch
+    /// here, so this is not always "the last message" and must not be
+    /// documented as such. Drained by
+    /// [`take_code_page_conversion_loss`](Self::take_code_page_conversion_loss).
+    code_page_conversion_loss: bool,
     /// Per-statement Always Encrypted parameter metadata, keyed by the same
     /// client-issued [`StatementId`] as `prepared_handles`. Captured by
     /// `execute_sp_prepare` / `sp_prepexec` from
@@ -674,6 +685,7 @@ impl TdsClient {
             prepared_batch: None,
             return_values: Vec::new(),
             info_messages: Vec::new(),
+            code_page_conversion_loss: false,
             prepared_param_encryption: HashMap::new(),
             query_metadata_cache: crate::security::query_metadata_cache::QueryMetadataCache::new(),
             describe_round_trips: 0,
@@ -2272,6 +2284,11 @@ impl TdsClient {
 
         let mut packet_writer =
             rpc.create_packet_writer(self.transport.as_writer(), timeout_sec, cancel_handle);
+        // A streamed sequence spans several calls and never reaches
+        // `finish_send`, whose assignment is what resets this for an ordinary
+        // request. Clear it here so the sequence starts from a clean verdict and
+        // every later site can OR into it.
+        self.code_page_conversion_loss = false;
         // Write the RPC prefix (headers, proc, positional + materialized named
         // params) then the first streamed parameter's header. The data-at-exec
         // branch of `serialize` writes name + status + TYPE_INFO and stops before
@@ -2708,6 +2725,13 @@ impl TdsClient {
             self.retract_partial_request(message).await;
             return Err(e);
         }
+        // Below the error return so a retracted request cannot leave the flag
+        // set. Harmless either way today -- `finish_execute` is the only drain
+        // point and is unreachable once a send site has failed, so a stale
+        // `true` is always overwritten by the next send's assignment before
+        // anything reads it -- but the contract the accessor documents is "the
+        // most recently *sent* message", and only this order matches it.
+        self.code_page_conversion_loss = message.code_page_conversion_loss();
         Ok(())
     }
 
@@ -2953,6 +2977,13 @@ impl TdsClient {
             // reading the response also aborts (the request is already on the
             // wire, so the connection must be reset before reuse).
             Ok(None) => {
+                // The materialized parameters in this message's prefix were
+                // serialized calls ago; the flag rode along on the suspended
+                // message, and this is the only point at which the whole
+                // message is known to be complete. OR rather than assign: the
+                // streamed chunks in between reported their own substitutions
+                // through `note_code_page_conversion_loss`.
+                self.code_page_conversion_loss |= message.code_page_conversion_loss();
                 drop(message);
                 match self.position_on_first_result().await {
                     Ok(result) => Ok(StreamedParamStatus::Complete(result)),
@@ -3036,6 +3067,12 @@ impl TdsClient {
         self.cancel_handle = cancel_handle.map(|handle| handle.child_handle());
 
         self.transport.reset_reader();
+
+        // This message's substitution accounting starts clean. Every exit below
+        // publishes a verdict for *this* batch, so a failure before any row is
+        // written must report no substitution rather than leave the previous
+        // message's verdict standing (AB#47598).
+        self.code_page_conversion_loss = false;
 
         // STEP 1: Filter column metadata to only include mapped columns
         // If we have column mappings, only include the destination columns that are mapped.
@@ -3159,6 +3196,23 @@ impl TdsClient {
             }
         }
 
+        // A bulk row goes through the same `TdsValueSerializer` as an RPC
+        // parameter, so a narrow value can be substituted here too. This path
+        // builds its own `PacketWriter` and never reaches `finish_send`, so the
+        // verdict is published by hand.
+        //
+        // Published *here*, before the error branch, rather than after `end`:
+        // every exit below then carries it. Rows streamed before a mid-batch
+        // failure can already have been applied — a bulk copy with no internal
+        // transaction commits as it streams — so a substitution among them is
+        // real, and `BulkCopy::write_to_server_zerocopy` drains this in its
+        // `Err` arm to fold into the operation's verdict. Reading it now also
+        // ends the
+        // writer's borrow of the transport before either exit needs `&mut self`,
+        // and `end` writes only the DONE token, so nothing can be substituted
+        // between here and the return.
+        self.code_page_conversion_loss = writer.code_page_conversion_loss();
+
         // Handle error during row streaming
         if let Some(original_error) = row_write_error {
             // Send attention packet to cancel the bulk load operation gracefully.
@@ -3175,6 +3229,9 @@ impl TdsClient {
         }
 
         // STEP 4: End streaming (write DONE token and finalize)
+        //
+        // The substitution verdict was published above so that the error exits
+        // carry it too; `end` cannot change it.
         let rows_written = writer.end().await?;
 
         // STEP 5: Drain the server response for error handling and INFO capture.
@@ -7756,6 +7813,60 @@ impl TdsClient {
 
     pub(crate) fn extend_info_messages(&mut self, messages: Vec<SqlInfoMessage>) {
         self.info_messages.extend(messages);
+    }
+
+    /// Records that a streamed chunk was written with a substituted character.
+    ///
+    /// The materialized path detects this during serialization and carries it on
+    /// the message; a data-at-execution chunk is converted by the caller and
+    /// written straight to the wire, so the caller reports it here instead. Both
+    /// land on the same flag, drained once by
+    /// [`take_code_page_conversion_loss`](Self::take_code_page_conversion_loss)
+    /// when the statement completes — a diagnostic posted on the `SQLPutData`
+    /// that produced it would be cleared by the next ODBC call on the handle.
+    pub fn note_code_page_conversion_loss(&mut self) {
+        self.code_page_conversion_loss = true;
+    }
+
+    /// Replaces the substitution verdict outright.
+    ///
+    /// In-crate only, and deliberately so: it lets the caller assert a verdict
+    /// for a message it did not serialize, which is safe exactly once — inside
+    /// [`BulkCopy::write_to_server_zerocopy`](crate::connection::bulk_copy::BulkCopy::write_to_server_zerocopy),
+    /// which drains the flag after each batch so one batch's verdict cannot
+    /// overwrite another's, then restores the accumulated result here. Mirrors
+    /// how it restores [`extend_info_messages`](Self::extend_info_messages) over
+    /// the same span. External callers get
+    /// [`note_code_page_conversion_loss`](Self::note_code_page_conversion_loss),
+    /// which can only ever set the flag.
+    pub(crate) fn set_code_page_conversion_loss(&mut self, had_loss: bool) {
+        self.code_page_conversion_loss = had_loss;
+    }
+
+    /// Drains the "a character was substituted on the way to the wire" flag for
+    /// the work most recently completed on this connection.
+    ///
+    /// Set when a narrow (VARCHAR/CHAR/TEXT) value carried a character the
+    /// encoding it was sent in could not represent: the serializers write `?`
+    /// for it, matching msodbcsql and SQL Server's own `CAST`, rather than the
+    /// numeric character reference `encoding_rs` would emit (AB#47598). That
+    /// encoding comes from the collation the value carries, so this reports the
+    /// conversion *this driver* performed, not any later one the server does.
+    /// The substitution is not an error — `mssql-odbc` reports it as SQLSTATE
+    /// `01000` only when the application asked for it via
+    /// `SQL_COPT_SS_WARN_ON_CP_ERROR`.
+    ///
+    /// Normally reflects one message and is replaced by the next send, so read
+    /// it before issuing another command. A bulk copy is the exception: it
+    /// spans several messages and reports the aggregate across every batch, so
+    /// one read after `write_to_server_zerocopy` covers the whole operation.
+    ///
+    /// Silent for an Always Encrypted column in either direction: cell
+    /// encryption consumes the value before the narrow serializer runs, so no
+    /// substitution happens and none is reported. See
+    /// [`StreamingBulkLoadWriter::code_page_conversion_loss`](crate::message::bulk_load::StreamingBulkLoadWriter::code_page_conversion_loss).
+    pub fn take_code_page_conversion_loss(&mut self) -> bool {
+        std::mem::take(&mut self.code_page_conversion_loss)
     }
 
     fn capture_info_message(&mut self, token: &crate::token::tokens::InfoToken) {

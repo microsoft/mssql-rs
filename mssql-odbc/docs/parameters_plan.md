@@ -456,16 +456,37 @@ guesswork - so it belongs with AB#47584 rather than as a local patch.
 
 **This is a behavioural regression for a subset of inputs, not a pure
 improvement.** `SQL_C_CHAR` `"[three U+2615]"` into `varchar(3)` was a correct
-`22001` under the byte count; it is now accepted as three units and fails
-downstream as an opaque `HY000` - or, under a single-byte collation, each
-character is unmappable and becomes a seven-byte numeric character reference
-(`&#9749;`, AB#47598), so 21 bytes are offered to a `varchar(3)`. CJK and astral
-input bound with an exact character count is the shape that regresses. The trade
-was taken because over-rejection has no application workaround - the byte count
-is encoding-dependent and the application cannot know it - while under-rejection
-still errors, and because byte-counting *both* C types would have broken the
-wide arm, the one msodbcsql gets right. No option preserved both parity and
-self-consistency.
+`22001` under the byte count; it is now accepted as three units, and what
+happens next depends on whether the target collation can represent the
+character:
+
+- **Representable** (a `_UTF8` collation, where each U+2615 is three bytes): the
+  value is over-long, and it fails downstream as an opaque `HY000` from
+  `serialize_char_varchar_direct` - or, on a `max` or `text`/`ntext` target, is
+  sent over-long with no check at all.
+- **Unmappable** (a single-byte collation, and the DBCS ones too - U+2615 has no
+  CP932 or GBK representation): each character becomes a single `?`
+  (AB#47598), so three bytes reach a `varchar(3)`, the value fits, and the
+  statement **succeeds** with the data altered.
+
+  A DBCS collation lands here rather than above *for this input*. It is the
+  encoding that decides, not the code-page family: a character a DBCS page can
+  hold takes two bytes and goes over-long like the `_UTF8` case, which is what
+  `SerializationFailureAfterAFlushLeavesTheConnectionUsable` exercises with
+  U+3042.
+
+CJK and astral input bound with an exact character count is the shape that
+regresses. The trade was taken because over-rejection has no application
+workaround - the byte count is encoding-dependent and the application cannot
+know it - while under-rejection still errors *for the representable case*, and
+because byte-counting *both* C types would have broken the wide arm, the one
+msodbcsql gets right. No option preserved both parity and self-consistency.
+
+The unmappable case is the one where under-rejection no longer errors, and it
+is not a new data-altering path: substitution is what msodbcsql and the engine
+both do, and `SQL_COPT_SS_WARN_ON_CP_ERROR` is how an application detects it
+(parity-deviations entries 21 and 22). What AB#47584 inherits is the length
+unit, not the substitution.
 
 Verified against msodbcsql source:
 
