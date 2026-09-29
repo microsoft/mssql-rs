@@ -319,7 +319,7 @@ pub(crate) enum RowIssue {
     /// 01000 — the client code page replaced an unrepresentable character.
     CodePageLoss,
     /// Retain both diagnostics when a lossy prefix also fills the buffer.
-    StringTruncatedCodePageLoss,
+    StringTruncatedWithCodePageLoss,
     /// Preserve the platform codec's diagnostic without losing its message.
     Conversion { state: [u8; 5], text: &'static str },
     /// 01S07 — fractional digits were dropped to fit the target.
@@ -347,7 +347,7 @@ impl RowIssue {
         match self {
             RowIssue::StringTruncated => post_diag(stmt_state, WARN_STRING_TRUNCATION),
             RowIssue::CodePageLoss => post_diag(stmt_state, WARN_CODE_PAGE_CONVERSION_LOSS),
-            RowIssue::StringTruncatedCodePageLoss => {
+            RowIssue::StringTruncatedWithCodePageLoss => {
                 post_diag(stmt_state, WARN_STRING_TRUNCATION);
                 post_diag(stmt_state, WARN_CODE_PAGE_CONVERSION_LOSS);
             }
@@ -417,9 +417,9 @@ impl RowOutcome {
                 RowOutcome::Info(RowIssue::CodePageLoss),
                 RowOutcome::Info(RowIssue::StringTruncated),
             )
-            | (RowOutcome::Info(RowIssue::StringTruncatedCodePageLoss), RowOutcome::Info(_))
-            | (RowOutcome::Info(_), RowOutcome::Info(RowIssue::StringTruncatedCodePageLoss)) => {
-                RowOutcome::Info(RowIssue::StringTruncatedCodePageLoss)
+            | (RowOutcome::Info(RowIssue::StringTruncatedWithCodePageLoss), RowOutcome::Info(_))
+            | (RowOutcome::Info(_), RowOutcome::Info(RowIssue::StringTruncatedWithCodePageLoss)) => {
+                RowOutcome::Info(RowIssue::StringTruncatedWithCodePageLoss)
             }
             (i @ RowOutcome::Info(_), _) => i,
             (_, i @ RowOutcome::Info(_)) => i,
@@ -1790,7 +1790,7 @@ fn trim_partial_utf8(bytes: &mut Vec<u8>) {
 
 fn client_text_outcome(truncated: bool, loss: bool) -> RowOutcome {
     match (truncated, loss) {
-        (true, true) => RowOutcome::Info(RowIssue::StringTruncatedCodePageLoss),
+        (true, true) => RowOutcome::Info(RowIssue::StringTruncatedWithCodePageLoss),
         (true, false) => RowOutcome::Info(RowIssue::StringTruncated),
         (false, true) => RowOutcome::Info(RowIssue::CodePageLoss),
         (false, false) => RowOutcome::Success,
@@ -2974,14 +2974,14 @@ mod tests {
         let h = TestHandles::with_env_dbc_stmt();
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let mut state = stmt.inner.lock().unwrap();
-        RowIssue::StringTruncatedCodePageLoss.post(&mut state);
+        RowIssue::StringTruncatedWithCodePageLoss.post(&mut state);
         assert_eq!(state.diag_records.len(), 2);
         assert_eq!(state.diag_records[0].sql_state, SQLSTATE_01004);
         assert_eq!(state.diag_records[1].sql_state, SQLSTATE_01000);
         assert_eq!(
             RowOutcome::Info(RowIssue::CodePageLoss)
                 .merge(RowOutcome::Info(RowIssue::StringTruncated)),
-            RowOutcome::Info(RowIssue::StringTruncatedCodePageLoss)
+            RowOutcome::Info(RowIssue::StringTruncatedWithCodePageLoss)
         );
         let diagnostic = ERR_INTERNAL_CONVERSION;
         RowIssue::from(diagnostic).post(&mut state);
