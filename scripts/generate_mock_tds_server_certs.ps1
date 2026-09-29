@@ -187,7 +187,7 @@ try {
     $serial = [byte[]]::new(8)
     [System.Security.Cryptography.RandomNumberGenerator]::Fill($serial)
     $leafNotBefore = [System.DateTimeOffset]::UtcNow
-    $leafCert = $leafRequest.Create($ca.Cert, $leafNotBefore, $leafNotBefore.AddYears(9), $serial)
+    $leafCert = $leafRequest.Create($ca.Cert, $leafNotBefore, $leafNotBefore.AddDays(825), $serial)
 
     Write-PemCertificate $leafCert.RawData $CaSignedCertPath
     Write-PemRsaKey $leafRsa $CaSignedKeyPath

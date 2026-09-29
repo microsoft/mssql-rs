@@ -43,8 +43,11 @@ pub fn load_certificate(source: &CertificateSource) -> TdsResult<Vec<u8>> {
             info!("Loaded certificate from: {path:?} ({} bytes)", der.len());
             return Ok(der);
         }
-        CertificateSource::Pem(data) => Certificate::from_pem(data)
-            .map_err(|_| Error::InvalidCertificateData { expected: "PEM" })?,
+        // macOS `from_pem` also accepts DER, so require a PEM block explicitly.
+        CertificateSource::Pem(data) => split_pem_certificates(data)
+            .and_then(|blocks| blocks.into_iter().next())
+            .and_then(|block| Certificate::from_pem(&block).ok())
+            .ok_or(Error::InvalidCertificateData { expected: "PEM" })?,
         CertificateSource::Der(data) => Certificate::from_der(data)
             .map_err(|_| Error::InvalidCertificateData { expected: "DER" })?,
     };

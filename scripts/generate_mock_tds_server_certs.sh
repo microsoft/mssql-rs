@@ -31,7 +31,9 @@ openssl req -x509 -newkey rsa:2048 \
     -out "$CERT_DIR/ca_cert.pem" \
     -days 3650 \
     -nodes \
-    -subj "/C=US/ST=Test/L=Test/O=Test/CN=Test Root CA" 2>/dev/null
+    -subj "/C=US/ST=Test/L=Test/O=Test/CN=Test Root CA" \
+    -addext "basicConstraints=critical,CA:TRUE" \
+    -addext "keyUsage=critical,keyCertSign,cRLSign" 2>/dev/null
 
 openssl req -newkey rsa:2048 \
     -keyout "$CERT_DIR/ca_signed_key.pem" \
@@ -39,15 +41,16 @@ openssl req -newkey rsa:2048 \
     -nodes \
     -subj "/C=US/ST=Test/L=Test/O=Test/CN=localhost" 2>/dev/null
 
-printf "subjectAltName=DNS:localhost,IP:127.0.0.1\nextendedKeyUsage=serverAuth\n" > "$CERT_DIR/ca_signed.ext"
+printf "subjectAltName=DNS:localhost,IP:127.0.0.1\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\n" > "$CERT_DIR/ca_signed.ext"
 
+# macOS rejects TLS server certificates valid for more than 825 days.
 openssl x509 -req \
     -in "$CERT_DIR/ca_signed.csr" \
     -CA "$CERT_DIR/ca_cert.pem" \
     -CAkey "$CERT_DIR/ca_key.pem" \
     -CAcreateserial \
     -out "$CERT_DIR/ca_signed_cert.pem" \
-    -days 3650 \
+    -days 825 \
     -extfile "$CERT_DIR/ca_signed.ext" 2>/dev/null
 
 rm -f "$CERT_DIR/ca_signed.csr" "$CERT_DIR/ca_signed.ext" "$CERT_DIR/ca_cert.srl"
@@ -58,7 +61,9 @@ openssl req -x509 -newkey rsa:2048 \
     -out "$CERT_DIR/unrelated_ca_cert.pem" \
     -days 3650 \
     -nodes \
-    -subj "/C=US/ST=Test/L=Test/O=Test/CN=Unrelated Root CA" 2>/dev/null
+    -subj "/C=US/ST=Test/L=Test/O=Test/CN=Unrelated Root CA" \
+    -addext "basicConstraints=critical,CA:TRUE" \
+    -addext "keyUsage=critical,keyCertSign,cRLSign" 2>/dev/null
 
 echo "Test certificates generated in $CERT_DIR:"
 echo "  - key.pem (private key)"
