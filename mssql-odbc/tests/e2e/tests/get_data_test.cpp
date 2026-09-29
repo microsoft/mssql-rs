@@ -1038,9 +1038,10 @@ TEST_F(GetDataUtf16Test, NativeClientCharDefaultsAcrossCollationsAndChunks) {
     }
 }
 
-// sqlcdata.h InternalGetColData reports IDS_01_000_16 for column translation
-// loss when fWarnOnCPConvertLoss is set. The connection default stays silent.
-TEST_F(GetDataUtf16Test, NativeClientCharLossWarnsOnlyWhenRequested) {
+// Measured with native Windows DLL 18.6.1.1 (FileVersion 2018.0186.0001.01):
+// fitting lossy reads stay SQL_SUCCESS even with WARN_ON_CP_ERROR enabled.
+// sqlcdata.h:1210-1217 bypasses the wError block that posts loss at 1311-1312.
+TEST_F(GetDataUtf16Test, NativeClientCharLossFitsWithoutWarning) {
 #ifdef _WIN32
     RecordProperty("client_acp", static_cast<int>(GetACP()));
 #endif
@@ -1049,12 +1050,20 @@ TEST_F(GetDataUtf16Test, NativeClientCharLossWarnsOnlyWhenRequested) {
     if (!substituted) {
         GTEST_SKIP() << "native client encoding represents the test character without loss";
     }
-    for (const bool warn : {false, true}) {
+    SQLUINTEGER setting = 99;
+    ASSERT_EQ(SQL_SUCCESS, SQLGetConnectAttr(dbc_, SQL_COPT_SS_WARN_ON_CP_ERROR,
+                                             &setting, sizeof(setting), nullptr));
+    ASSERT_EQ(0u, setting);
+    for (const bool warn : {false, true, false}) {
         // First iteration deliberately uses the untouched connection default.
-        if (warn) {
-            ASSERT_EQ(SQL_SUCCESS, SQLSetConnectAttr(dbc_, SQL_COPT_SS_WARN_ON_CP_ERROR,
-                                                     reinterpret_cast<SQLPOINTER>(1), 0));
+        if (setting != static_cast<SQLUINTEGER>(warn)) {
+            ASSERT_EQ(SQL_SUCCESS, SQLSetConnectAttr(
+                dbc_, SQL_COPT_SS_WARN_ON_CP_ERROR,
+                reinterpret_cast<SQLPOINTER>(static_cast<uintptr_t>(warn)), 0));
         }
+        ASSERT_EQ(SQL_SUCCESS, SQLGetConnectAttr(dbc_, SQL_COPT_SS_WARN_ON_CP_ERROR,
+                                                 &setting, sizeof(setting), nullptr));
+        ASSERT_EQ(static_cast<SQLUINTEGER>(warn), setting);
         for (const char* type : {"nvarchar(32)", "nvarchar(max)", "varchar(32)", "varchar(max)"}) {
             SCOPED_TRACE(::testing::Message() << type << " warn=" << warn);
             ASSERT_EQ(SQL_SUCCESS, ExecDirect(
@@ -1063,9 +1072,9 @@ TEST_F(GetDataUtf16Test, NativeClientCharLossWarnsOnlyWhenRequested) {
             ASSERT_EQ(SQL_SUCCESS, SQLFetch(stmt_));
             SQLCHAR output[32] = {};
             SQLLEN indicator = -99;
-            EXPECT_EQ(warn ? SQL_SUCCESS_WITH_INFO : SQL_SUCCESS,
+            EXPECT_EQ(SQL_SUCCESS,
                       SQLGetData(stmt_, 1, SQL_C_CHAR, output, sizeof(output), &indicator));
-            EXPECT_EQ(warn ? "01000" : "", StmtDiagState());
+            EXPECT_EQ("", StmtDiagState());
             EXPECT_EQ(expected, std::string(reinterpret_cast<const char*>(output)));
             EXPECT_EQ(static_cast<SQLLEN>(expected.size()), indicator);
             SQLWCHAR following[3] = {};
@@ -1075,6 +1084,58 @@ TEST_F(GetDataUtf16Test, NativeClientCharLossWarnsOnlyWhenRequested) {
             EXPECT_EQ('k', following[1]);
             EXPECT_EQ(0, following[2]);
             EXPECT_EQ("", StmtDiagState());
+            ASSERT_EQ(SQL_SUCCESS, SQLCloseCursor(stmt_));
+        }
+    }
+}
+
+// With native Windows ACP substitution the emoji is "??". A two-byte buffer
+// delivers one byte plus NUL, entering InternalGetColData's wError branch.
+TEST_F(GetDataUtf16Test, NativeClientCharLossTruncationHonorsWarningFlag) {
+#ifdef _WIN32
+    RecordProperty("client_acp", static_cast<int>(GetACP()));
+#endif
+    bool substituted = false;
+    const auto expected = ODBCTestUtils::Utf8ToNativeClient("\xF0\x9F\x98\x80", &substituted);
+    if (!substituted || expected.size() < 2) {
+        GTEST_SKIP() << "requires lossy native output spanning at least two bytes";
+    }
+    for (const bool warn : {false, true}) {
+        ASSERT_EQ(SQL_SUCCESS, SQLSetConnectAttr(
+            dbc_, SQL_COPT_SS_WARN_ON_CP_ERROR,
+            reinterpret_cast<SQLPOINTER>(static_cast<uintptr_t>(warn)), 0));
+        SQLUINTEGER setting = 99;
+        ASSERT_EQ(SQL_SUCCESS, SQLGetConnectAttr(dbc_, SQL_COPT_SS_WARN_ON_CP_ERROR,
+                                                 &setting, sizeof(setting), nullptr));
+        ASSERT_EQ(static_cast<SQLUINTEGER>(warn), setting);
+        for (const char* type : {"nvarchar(32)", "nvarchar(max)", "varchar(32)", "varchar(max)"}) {
+            SCOPED_TRACE(::testing::Message() << type << " warn=" << warn);
+            ASSERT_EQ(SQL_SUCCESS, ExecDirect(
+                "SELECT CAST((NCHAR(0xD83D) + NCHAR(0xDE00)) COLLATE "
+                "Latin1_General_100_CI_AS_SC_UTF8 AS " + std::string(type) + "), 42"));
+            ASSERT_EQ(SQL_SUCCESS, SQLFetch(stmt_));
+            SQLCHAR output[] = {0xCC, 0xCC, 0xCC, 0xCC};
+            SQLLEN indicator = -99;
+            ASSERT_EQ(SQL_SUCCESS_WITH_INFO,
+                      SQLGetData(stmt_, 1, SQL_C_CHAR, output + 1, 2, &indicator));
+            EXPECT_TRUE(ODBCTestUtils::HasDiagState(SQL_HANDLE_STMT, stmt_, "01004"));
+            EXPECT_EQ(warn, ODBCTestUtils::HasDiagState(SQL_HANDLE_STMT, stmt_, "01000"));
+            EXPECT_EQ(static_cast<SQLCHAR>(expected[0]), output[1]);
+            EXPECT_EQ(0, output[2]);
+            EXPECT_EQ(0xCC, output[0]);
+            EXPECT_EQ(0xCC, output[3]);
+            EXPECT_TRUE(indicator == SQL_NO_TOTAL || indicator >= 2);
+
+            SQLCHAR rest[32] = {};
+            ASSERT_EQ(SQL_SUCCESS, SQLGetData(stmt_, 1, SQL_C_CHAR, rest, sizeof(rest), &indicator));
+            EXPECT_EQ("", StmtDiagState());
+            EXPECT_EQ(expected.substr(1), std::string(reinterpret_cast<const char*>(rest)));
+            EXPECT_EQ(static_cast<SQLLEN>(expected.size() - 1), indicator);
+            EXPECT_EQ(SQL_NO_DATA, SQLGetData(stmt_, 1, SQL_C_CHAR, rest, sizeof(rest), &indicator));
+            SQLINTEGER following = -1;
+            ASSERT_EQ(SQL_SUCCESS, SQLGetData(stmt_, 2, SQL_C_SLONG,
+                                              &following, sizeof(following), &indicator));
+            EXPECT_EQ(42, following);
             ASSERT_EQ(SQL_SUCCESS, SQLCloseCursor(stmt_));
         }
     }

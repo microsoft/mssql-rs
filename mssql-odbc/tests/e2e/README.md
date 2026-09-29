@@ -123,7 +123,10 @@ AB#47565), `SQL_C_WCHAR` expectations, or raw `SQL_C_BINARY` wire bytes.
 
 `GetDataUtf16Test.NativeClientChar*` covers ordinary/MAX varchar and nvarchar,
 server collations different from the client, terminator-only probes, tiny
-continuations, final byte lengths, and opt-in code-page-loss warnings. Carry
+continuations, final byte lengths, and native code-page-loss warning semantics.
+Fitting conversions remain successful without warnings even with
+`SQL_COPT_SS_WARN_ON_CP_ERROR` enabled; lossy truncation exercises the diagnostic
+path with the flag both disabled and enabled. Carry
 tests that need UTF-8 expansion skip on both drivers when the active native
 encoding cannot create that carry; measured source-decoder divergences retain
 their separate reference-driver skips.
