@@ -347,6 +347,20 @@ fn read_eof_outcome(enc_in_empty: bool) -> Poll<io::Result<()>> {
     }
 }
 
+/// Largest TLS ciphertext record: 5-byte header, 2^14 plaintext, 2048
+/// bytes of expansion (RFC 8446 §5.2, RFC 5246 §6.2.3).
+const MAX_TLS_RECORD: usize = 5 + 16384 + 2048;
+
+/// Bytes still needed before `enc_in` holds its first TLS record whole.
+fn missing_record_bytes(enc_in: &[u8]) -> usize {
+    match enc_in {
+        [_, _, _, hi, lo, ..] => {
+            (5 + u16::from_be_bytes([*hi, *lo]) as usize).saturating_sub(enc_in.len())
+        }
+        _ => 5 - enc_in.len(),
+    }
+}
+
 impl<S> AsyncRead for SchannelTlsStream<S>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -373,28 +387,24 @@ where
                 return Poll::Ready(Ok(()));
             }
 
-            // 2. Try to decrypt one record out of enc_in.
-            match record.decrypt(enc_in, plain_out) {
-                Ok(Decrypted::Ok) => continue, // back to step 1 to drain
-                Ok(Decrypted::PeerClosed) => return Poll::Ready(Ok(())),
-                Ok(Decrypted::NeedMoreInput) => {
-                    // 3. Need more bytes from the wire.
+            // 2. Try to decrypt one record out of enc_in. A partial record
+            // cannot decrypt, so skip the SChannel call until it is whole.
+            let missing = missing_record_bytes(enc_in);
+            if missing == 0 {
+                match record.decrypt(enc_in, plain_out) {
+                    Ok(Decrypted::Ok) => continue, // back to step 1 to drain
+                    Ok(Decrypted::PeerClosed) => return Poll::Ready(Ok(())),
+                    Ok(Decrypted::NeedMoreInput) => {}
+                    Err(e) => return Poll::Ready(Err(e)),
                 }
-                Err(e) => return Poll::Ready(Err(e)),
             }
 
-            // 3. Read more from the socket.
-            let mut tmp = [0u8; 8192];
-            let mut tmp_buf = ReadBuf::new(&mut tmp);
-            match Pin::new(&mut this.socket).poll_read(cx, &mut tmp_buf) {
-                Poll::Ready(Ok(())) => {
-                    let filled = tmp_buf.filled().len();
-                    if filled == 0 {
-                        return read_eof_outcome(enc_in.is_empty());
-                    }
-                    enc_in.extend_from_slice(&tmp[..filled]);
-                    // Loop and try decrypt again.
-                }
+            // 3. Read more from the socket, straight into enc_in, with room
+            // for at least one full record so it arrives in one read.
+            enc_in.reserve(missing.max(MAX_TLS_RECORD));
+            match tokio_util::io::poll_read_buf(Pin::new(&mut this.socket), cx, enc_in) {
+                Poll::Ready(Ok(0)) => return read_eof_outcome(enc_in.is_empty()),
+                Poll::Ready(Ok(_)) => {}
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Pending => return Poll::Pending,
             }
@@ -659,11 +669,11 @@ mod tests {
         }
     }
 
-    fn streaming_stream(
-        socket: MockSocket,
+    fn streaming_stream<S>(
+        socket: S,
         pending_out: Vec<u8>,
         pending_plain_len: usize,
-    ) -> SchannelTlsStream<MockSocket> {
+    ) -> SchannelTlsStream<S> {
         let cred = super::super::cred::get_or_acquire(CredKind::NoValidate).unwrap();
         // SAFETY: SecPkgContext_StreamSizes is a plain POD struct; the
         // record layer isn't exercised by the pending-drain path under test.
@@ -784,6 +794,121 @@ mod tests {
         match Pin::new(&mut s).poll_read(&mut cx, &mut rb) {
             Poll::Ready(Ok(())) => assert_eq!(rb.filled().len(), 0, "clean EOF yields zero bytes"),
             other => panic!("expected graceful EOF, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_record_bytes_tracks_header_and_body() {
+        assert_eq!(missing_record_bytes(&[]), 5);
+        assert_eq!(missing_record_bytes(&[0x17, 3, 3]), 2);
+        let mut rec = vec![0x17, 3, 3, 0x01, 0x00];
+        assert_eq!(missing_record_bytes(&rec), 256);
+        rec.resize(5 + 255, 0);
+        assert_eq!(missing_record_bytes(&rec), 1);
+        rec.push(0);
+        assert_eq!(missing_record_bytes(&rec), 0);
+        rec.extend_from_slice(&[0x17, 3]);
+        assert_eq!(
+            missing_record_bytes(&rec),
+            0,
+            "trailing bytes of the next record"
+        );
+    }
+
+    /// Socket that serves `data` as fast as the caller's buffer allows, then
+    /// stays pending like a live peer with nothing more to send.
+    struct FeedSocket {
+        data: Vec<u8>,
+        pos: usize,
+        data_reads: usize,
+    }
+
+    impl AsyncRead for FeedSocket {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            let rest = &self.data[self.pos..];
+            if rest.is_empty() {
+                return Poll::Pending;
+            }
+            let n = rest.len().min(buf.remaining());
+            buf.put_slice(&rest[..n]);
+            self.pos += n;
+            self.data_reads += 1;
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for FeedSocket {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            b: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(b.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn record_prefix(body_len: u16, have: usize) -> Vec<u8> {
+        let [hi, lo] = body_len.to_be_bytes();
+        let mut rec = vec![0x17, 3, 3, hi, lo];
+        rec.resize(have, 0xAB);
+        rec
+    }
+
+    // The test context has a zeroed handle, so any DecryptMessage call fails.
+    // A Pending result therefore proves no decrypt ran on the partial record.
+    #[test]
+    fn poll_read_waits_for_whole_record_without_decrypt_in_one_socket_read() {
+        let waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        let body_len = 18_000;
+        let socket = FeedSocket {
+            data: record_prefix(body_len, 5 + body_len as usize - 1),
+            pos: 0,
+            data_reads: 0,
+        };
+        let mut s = streaming_stream(socket, Vec::new(), 0);
+        let mut backing = [0u8; 16];
+        let mut rb = ReadBuf::new(&mut backing);
+        match Pin::new(&mut s).poll_read(&mut cx, &mut rb) {
+            Poll::Pending => {}
+            other => panic!("partial record must wait, got {other:?}"),
+        }
+        assert_eq!(
+            s.socket.data_reads, 1,
+            "a record larger than 8 KB takes one read"
+        );
+        let Mode::Streaming { enc_in, .. } = &s.mode;
+        assert_eq!(enc_in.len(), 5 + body_len as usize - 1);
+    }
+
+    #[test]
+    fn poll_read_decrypts_once_record_is_whole() {
+        let waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        let body_len = 300;
+        let socket = FeedSocket {
+            data: record_prefix(body_len, 5 + body_len as usize),
+            pos: 0,
+            data_reads: 0,
+        };
+        let mut s = streaming_stream(socket, Vec::new(), 0);
+        let mut backing = [0u8; 16];
+        let mut rb = ReadBuf::new(&mut backing);
+        match Pin::new(&mut s).poll_read(&mut cx, &mut rb) {
+            Poll::Ready(Err(_)) => {}
+            other => panic!("whole record must reach DecryptMessage, got {other:?}"),
         }
     }
 }
