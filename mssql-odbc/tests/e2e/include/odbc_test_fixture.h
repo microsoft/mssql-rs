@@ -157,6 +157,12 @@ public:
 
     /// Convert SQLTCHAR string to narrow string (for logging).
     static std::string ToNarrow(const SqlTString& s);
+
+    /// Expected SQL_C_CHAR output, not parameter input: Windows ACP or the
+    /// supported Unix LC_CTYPE encoding (UTF-8 fallback for C/unknown locales).
+    /// Throws on invalid UTF-8 or a failed platform conversion.
+    static std::string Utf8ToNativeClient(const std::string& utf8,
+                                          bool* usedDefault = nullptr);
 };
 
 // ---------------------------------------------------------------------------

@@ -235,9 +235,10 @@ TEST_F(CharConversionLiveTest, CharParamDeclaresTheParameterType) {
 // Asserted server-side with UNICODE(): echoing the parameter back would decode
 // symmetrically and pass even if the payload were mis-encoded.
 //
-// Driver-specific on both ends: this driver's SQL_C_CHAR is UTF-8, while
-// msodbcsql reads and writes it in the client code page, so it takes the bound
-// 0xC3 0xA9 as two CP1252 characters.
+// The input remains driver-specific until AB#47565: SQL_C_CHAR parameters are
+// UTF-8 here, while msodbcsql decodes them in the client code page (CP1252 reads
+// 0xC3 0xA9 as two characters). Native fetch output from AB#47564 does not change
+// this server-side UNICODE probe, so its comparison skip is still needed.
 TEST_F(CharConversionLiveTest, CrossFamilyCharParamRoundTripsNonAscii) {
     SKIP_IF_COMPARING_MSODBCSQL();
 
@@ -1237,9 +1238,8 @@ TEST_F(CharConversionLiveTest, UnmappableCharacterIsSubstitutedInsideASqlVariant
 // IDS_01_000_16 only from its output-parameter and column arms
 // (sqlcdata.h:1297, :1310) and discards the loss flag on every input-parameter
 // path, so it returns plain SQL_SUCCESS here however the attribute is set.
-// This driver applies it to parameters, which is where its own loss occurs -
-// SQL_C_CHAR is UTF-8 here, so a fetch can always represent what the server
-// sent and the direction msodbcsql instruments is inert for us (AB#47598).
+// This driver also applies it to parameters (AB#47598). Native SQL_C_CHAR
+// fetch conversion is covered separately in get_data_test.cpp (AB#47564).
 TEST_F(CharConversionLiveTest, UnmappableCharacterWarnsWhenAsked) {
     SKIP_IF_COMPARING_MSODBCSQL();
 

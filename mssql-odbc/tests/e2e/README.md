@@ -111,6 +111,23 @@ Summary: 15 parity, 1 divergence(s), 0 shared failure(s), 0 skipped
 === Parity check FAILED (mssql-odbc rc=0, msodbcsql rc=0, parity rc=1) ===
 ```
 
+### Native narrow fetch expectations
+
+`SQL_C_CHAR` fetch output defaults to the Windows system ANSI code page (`GetACP`)
+or the supported active Unix `LC_CTYPE` encoding, with UTF-8 as the fallback for
+C/POSIX and unsupported locales. The usual test process starts in the C locale;
+this does not mean every Unix application receives UTF-8.
+Use `ODBCTestUtils::Utf8ToNativeClient` to convert UTF-8 expected text into native
+**output** bytes. Do not use it for narrow parameter input (still UTF-8 until
+AB#47565), `SQL_C_WCHAR` expectations, or raw `SQL_C_BINARY` wire bytes.
+
+`GetDataUtf16Test.NativeClientChar*` covers ordinary/MAX varchar and nvarchar,
+server collations different from the client, terminator-only probes, tiny
+continuations, final byte lengths, and opt-in code-page-loss warnings. Carry
+tests that need UTF-8 expansion skip on both drivers when the active native
+encoding cannot create that carry; measured source-decoder divergences retain
+their separate reference-driver skips.
+
 ### Intentional divergence: `SKIP_IF_COMPARING_MSODBCSQL()`
 
 Some tests assert behavior that is deliberately stricter in the Rust driver than
