@@ -234,8 +234,14 @@ impl HasDiagnostics for EnvState {
 /// Builds the runtime an ENV owns. Extracted from `EnvHandle::new` so the
 /// release-policy tests can construct one without an ENV around it.
 fn new_runtime() -> io::Result<Runtime> {
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(1)
+    let mut builder = if std::env::var_os("MSSQL_ODBC_MULTI_THREAD_RT").is_none() {
+        tokio::runtime::Builder::new_current_thread()
+    } else {
+        let mut b = tokio::runtime::Builder::new_multi_thread();
+        b.worker_threads(1);
+        b
+    };
+    builder
         .enable_all()
         .build()
         .inspect_err(|e| {
