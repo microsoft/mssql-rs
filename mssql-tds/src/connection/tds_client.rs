@@ -5323,21 +5323,22 @@ impl TdsClient {
                         // empty here. A transport failure while reading deliberately
                         // wins over the SQL errors collected so far: it decides
                         // whether the connection is retired.
-                        let mut look_ahead = 0u32;
                         loop {
-                            look_ahead += 1;
-                            if look_ahead > 10_000 {
-                                let error = crate::error::Error::ProtocolError(
-                                    "Too many ERROR tokens for one statement without a DONE"
-                                        .to_string(),
-                                );
-                                self.execution_context.set_has_open_batch(false);
-                                self.current_metadata = None;
-                                self.retire_after_failed_drain(&error);
-                                return Err(error);
-                            }
                             match self.next_response_token(&parser_context).await? {
                                 Tokens::Error(next_error) => {
+                                    // Bounded by the errors retained, not by tokens
+                                    // read: INFO is not kept here, and the token
+                                    // after the run is parked, not collected.
+                                    if all_errors.len() >= 10_000 {
+                                        let error = crate::error::Error::ProtocolError(
+                                            "Too many ERROR tokens for one statement without a DONE"
+                                                .to_string(),
+                                        );
+                                        self.execution_context.set_has_open_batch(false);
+                                        self.current_metadata = None;
+                                        self.retire_after_failed_drain(&error);
+                                        return Err(error);
+                                    }
                                     info!(?next_error);
                                     all_errors.push(self.record_error_token(&next_error));
                                     if !self.continues_after(&next_error) {
@@ -10546,6 +10547,36 @@ mod tests {
         assert!(matches!(error, crate::error::Error::ProtocolError(_)));
         assert!(client.is_connection_dead());
         assert!(!client.has_open_batch());
+    }
+
+    /// The bound counts the errors kept, not the tokens read: one error followed
+    /// by many INFO messages is a valid statement, and returns one `Err` with the
+    /// batch still open.
+    #[tokio::test]
+    async fn info_messages_do_not_count_against_the_statement_error_bound() {
+        let mut tokens = vec![Tokens::Error(error_token_with_severity(16))];
+        tokens.extend((0..10_001).map(|n| info_token(n, 0, "message")));
+        tokens.push(Tokens::Done(DoneToken {
+            status: DoneStatus::ERROR,
+            cur_cmd: CurrentCommand::Select,
+            row_count: 0,
+        }));
+        let mut client = create_test_client_with_tokens(tokens);
+        client.batch_error_mode = BatchErrorMode::Continue;
+
+        match client.advance_to_result_boundary().await {
+            Err(crate::error::Error::SqlServerError { diagnostics }) => {
+                assert_eq!(diagnostics.errors.len(), 1);
+            }
+            other => panic!("expected one SqlServerError, got {other:?}"),
+        }
+        assert!(!client.is_connection_dead());
+        assert!(client.has_open_batch());
+        assert_eq!(client.take_info_messages().len(), 10_001);
+        assert!(matches!(
+            client.advance_to_result_boundary().await.unwrap(),
+            ResultBoundaryKind::End
+        ));
     }
 
     /// If a later ERROR of the same statement is fatal, the whole run drains
