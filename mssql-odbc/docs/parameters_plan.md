@@ -81,8 +81,9 @@ transparent reconnects.
   defaulted binding gets the same answer as naming the C type. `BoundParam`
   stores only the resolved type: it needs no defaulted flag, because a typed NULL
   is built from `ParameterType` for every binding, not just defaulted ones.
-  `SQL_SS_UDT` and `SQL_SS_TABLE` are still rejected at bind
-  time, since they need a server type name no describe call reports.
+  `SQL_SS_TABLE` is still rejected at bind time, since it needs a server type
+  name no describe call reports. `SQL_SS_UDT` no longer is: since AB#48248 the
+  application supplies the name, or `SQLDescribeParam` fills it in.
 - **Value conversion** - the wire type follows `ParameterType`, not the C type:
   the buffer is declared as the SQL type the application named and converted to
   it. Integer and character buffers reach each other's SQL types (P5), and
@@ -90,7 +91,8 @@ transparent reconnects.
   the temporal types, `xml` and `sql_variant`. Those are same-family pairings
   apart from character to decimal and character to `sql_variant`, which exist
   because `SQL_C_DEFAULT` resolves both of those SQL types to a character C type.
-  `SQL_C_BINARY` reaches only the binary SQL types.
+  `SQL_C_BINARY` reaches the binary SQL types, `sql_variant`, and `SQL_SS_UDT`
+  (AB#48248).
   Character indicators support `SQL_NULL_DATA`, `SQL_NTS`, and
   explicit byte length; binary values use explicit byte length or
   `BufferLength` when no indicator pointer is supplied.
@@ -1026,17 +1028,21 @@ consumer reachability has not been assessed.
   AB#47590 is the unbounded close-time transform described above
   **[reachable** - DAE triggers above 4000 UTF-16 units / 8000 bytes**]**.
 
-  **The pairing note: mssql-python cannot emit a non-canonical C type.** Both
-  of its sources pair the C and SQL type together rather than letting an
-  application choose them independently. `_map_sql_type` and `DetectParamTypes`
-  return fixed `(sql_type, c_type)` tuples, and `setinputsizes` accepts only
-  `(sql_type, size, decimal_digits)` - it derives the C type itself with
-  `_get_c_type_for_sql_type` on both its tuple and bare-integer branches
-  (`cursor.py:1252-1274`). Every cell the matrix is still missing needs a C type
-  that is *not* the SQL type's default, so the remaining matrix work is ODBC
-  surface rather than consumer-gated. The one pairing mssql-python emits that is
-  not the default - `datetime.time` binding as `(SQL_TYPE_TIME, SQL_C_CHAR)`,
-  `cursor.py` inference - is already supported.
+  **The pairing note: the set of pairs mssql-python emits is fixed and finite.**
+  Neither source lets an application choose the C type: `_map_sql_type` and
+  `DetectParamTypes` return fixed `(sql_type, c_type)` tuples, and
+  `setinputsizes` accepts only `(sql_type, size, decimal_digits)`, deriving the
+  C type from `_SQL_TO_C_TYPE` (`cursor.py:1252-1274`). That set is *not* this
+  driver's `SQL_C_DEFAULT` resolution - mssql-python binds `SQL_DECIMAL` as
+  `SQL_C_NUMERIC`, `SQL_SS_TIME2` as `SQL_C_TYPE_TIME` and `SQL_SS_VARIANT` as
+  `SQL_C_BINARY`, where `resolve_default_c_type` answers `SQL_C_CHAR`,
+  `SQL_C_SS_TIME2` and `SQL_C_CHAR` - so reachability has to be decided by
+  auditing the set, not by comparing against the defaults. Audited 2026-09-29
+  over every `_SQL_TO_C_TYPE` entry, every `_map_sql_type` return, the
+  `executemany` decimal override, and the `SQL_VARCHAR` fallback a failed
+  `SQLDescribeParam` produces: every pair is in the matrix, including the one
+  that looks wrong, `datetime.time` binding as `(SQL_TYPE_TIME, SQL_C_CHAR)`.
+  No cell P9b_2, P9c or P9f would add appears in that set.
 - **Deferred features (AB#48148) [not reachable]:** output/input-output parameters in parameter arrays and TVPs. `DetectParamTypes` binds every parameter `SQL_PARAM_INPUT`, so mssql-python never reaches the output-array case; TVPs are unreachable for the separate reason above - they are input parameters, but `ParamInfo` carries no `SQL_SS_TABLE` type name to supply. Single-row output parameters are supported; input parameter arrays (`SQL_ATTR_PARAMSET_SIZE`) are implemented with the limitations above.
 - **`sp_prepexecrpc` for prepared canonical calls:** the calls landed with
   AB#46384 - `SQLExecDirect` sends an RPC by name for a single
