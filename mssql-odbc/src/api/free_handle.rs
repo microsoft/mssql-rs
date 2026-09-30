@@ -499,7 +499,9 @@ fn best_effort_unprepare_on_free_inner(
     // server-side) and releases a live one.
     //
     // msodbcsql's `DropPrepHandle` also bounds this cleanup by the statement
-    // timeout (`sqlcfunc.cpp:790-830`). A zero timeout stays unlimited.
+    // timeout (`sqlcfunc.cpp:790-830`). A zero timeout stays unlimited. Each
+    // release gets the full budget: the `pending_unprepare` invariant
+    // (`StmtState`) leaves at most one id here, so there is nothing to share.
     for statement_id in handles {
         if let Err(e) = dbc.runtime.block_on(client.unprepare(
             statement_id,
