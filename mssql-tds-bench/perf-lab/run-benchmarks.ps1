@@ -473,11 +473,14 @@ function Set-BaselineSource {
     Copy-Item -Recurse (Join-Path $script:BaselineTree 'mssql-tds') $script:CandidateSrc
     Sync-BaselineVersion
 }
-# Idempotent: this also runs from the finally block, and without the stash check a
-# second call would delete the freshly restored candidate source.
+# Idempotent, and safe on every path that can reach the finally block. Both directories
+# are checked: a second call finds no stash, and a Copy-Item failure in Set-BaselineSource
+# leaves the stash present with no destination - where an unguarded Remove-Item would
+# throw ItemNotFoundException under ErrorActionPreference 'Stop' and strand the candidate
+# before Move-Item ever ran. (The bash side needs no such guard; rm -rf no-ops.)
 function Restore-CandidateSource {
     if (-not (Test-Path -LiteralPath $script:StashedSrc)) { return }
-    Remove-Item -Recurse -Force $script:CandidateSrc
+    if (Test-Path -LiteralPath $script:CandidateSrc) { Remove-Item -Recurse -Force $script:CandidateSrc }
     Move-Item $script:StashedSrc $script:CandidateSrc
 }
 
