@@ -744,13 +744,13 @@ the compare leg, where a wrong reading fails rather than sits.
   scale > precision (`sqlcdesc.cpp:11529`), and the temporal types run
   `CheckSqlScale` against `SCALE_DATETIME2` / `SCALE_TIME` /
   `SCALE_DATETIMEOFFSET`, all 7 (`tds.h:273-278`). We apply the same rules with
-  the same `HY104` in `decimal_metadata` / `datetime_metadata`, only later -
-  the same divergence already accepted for `ColumnSize` in `fixed_length`.
-  Closing it means `parameter_column_size_is_valid` grows a scale argument, and
-  `MAX_DATETIME_SCALE` moves to `type_rules.rs` with it. A `ColumnSize` of 0 is
-  the one place the timing does not matter: `CheckSqlPrec` (`:11471`) reads 0 as
-  `SQL_PREC_UNLIMITED` and returns `HY104` for a 3.x application, which is what
-  we do. `FixupColumnSizeDecimalDigits` never runs for these types, so nothing
+  the same `HY104` in `decimal_metadata` / `datetime_metadata`, only later.
+  `DecimalDigits` is now the only value with that timing: `ColumnSize` used to
+  share it, but `SQLBindParameter` screens it through
+  `parameter_column_size_is_valid`, leaving `fixed_length` as a backstop.
+  Closing the scale half means `parameter_column_size_is_valid` grows a scale
+  argument, and `MAX_DATETIME_SCALE` moves to `type_rules.rs` with it.
+  `FixupColumnSizeDecimalDigits` never runs for these types, so nothing
   defaults the precision to 18 first.
 - **`SQL_TYPE_DATE` accepts any `DecimalDigits`.** msodbcsql requires
   `SCALE_DATE == 0` (`sqlcdesc.cpp:11641`); `typed_null` maps the type with no
