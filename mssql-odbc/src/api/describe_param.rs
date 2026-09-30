@@ -1454,6 +1454,11 @@ mod tests {
         assert_eq!(rc, SQL_ERROR);
 
         let ss = stmt.inner.lock().unwrap();
+        // 11529 has no entry in SERVER_ERROR_TO_SQL_STATE_MAP, so the state
+        // comes from severity 16 alone. Asserted because mssql-python
+        // classifies its exception types off the SQLSTATE.
+        assert_eq!(ss.diag_records[0].sql_state, SQLSTATE_42000);
+        assert_eq!(ss.diag_records[0].native_error, 11529);
         assert!(
             ss.diag_records
                 .iter()
