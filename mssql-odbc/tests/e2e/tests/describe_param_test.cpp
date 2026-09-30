@@ -351,6 +351,7 @@ TEST_F(DescribeParamLiveTest, ATempTableParameterCannotBeDescribedButStillBinds)
                   SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
 
+    ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_CLOSE), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_RESET_PARAMS), SQL_HANDLE_STMT, stmt_);
     ExecDirect("SELECT id, data FROM #dp_tmp");
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);

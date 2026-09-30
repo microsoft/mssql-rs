@@ -291,6 +291,7 @@ TEST_F(BinaryFetchLiveTest, LargeGeometryChunksAcrossCalls) {
     // re-delivered at the same offset or the order changed.
     std::vector<unsigned char> assembled(buf, buf + sizeof(buf));
     SQLLEN delivered = static_cast<SQLLEN>(sizeof(buf));
+    SQLLEN left = total - static_cast<SQLLEN>(sizeof(buf));
     SQLRETURN rc = SQL_SUCCESS_WITH_INFO;
     int guard = 0;
     const int max_calls = static_cast<int>(total / static_cast<SQLLEN>(sizeof(buf))) + 2;
@@ -299,12 +300,17 @@ TEST_F(BinaryFetchLiveTest, LargeGeometryChunksAcrossCalls) {
         rc = SQLGetData(stmt_, 1, SQL_C_BINARY, buf, sizeof(buf), &ind);
         ASSERT_TRUE(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO)
             << "chunked UDT read failed part way through, rc=" << rc;
-        // The indicator reports what was left before the call, so the last one
-        // is the size of the final chunk.
+        // SQL_NO_TOTAL (-4) would make the length below a wild read.
+        ASSERT_GE(ind, 0) << "indicator was not a byte count";
+        // The indicator reports what was left before the call, so it has to
+        // count down every call - checking only the last one would let a driver
+        // that stops decrementing mid-stream through.
+        EXPECT_EQ(left, ind) << "remaining count did not count down";
         const SQLLEN chunk = (rc == SQL_SUCCESS) ? ind : static_cast<SQLLEN>(sizeof(buf));
         ASSERT_LE(chunk, static_cast<SQLLEN>(sizeof(buf))) << "final chunk overruns the buffer";
         assembled.insert(assembled.end(), buf, buf + chunk);
         delivered += chunk;
+        left -= chunk;
     }
     EXPECT_EQ(total, delivered) << "chunks must sum to the length reported up front";
 

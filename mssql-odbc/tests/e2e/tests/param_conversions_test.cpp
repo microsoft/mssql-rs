@@ -3077,16 +3077,21 @@ TEST_F(CrossConversionLiveTest, UnimplementedMatrixCellsAreRefusedAtBind) {
         const char* name;
         SQLSMALLINT c_type;
         SQLSMALLINT sql_type;
+        // The target's own ColumnSize/DecimalDigits, not the source buffer's, so
+        // a cell that AB#48249 flips to success does not then fail HY104 and
+        // read as a broken flip rather than a stale fixture.
+        SQLULEN size;
+        SQLSMALLINT scale;
     };
     const Cell cells[] = {
-        {"BINARY->SS_XML", SQL_C_BINARY, SQL_SS_XML},
-        {"TIMESTAMP->TYPE_TIME", SQL_C_TYPE_TIMESTAMP, SQL_TYPE_TIME},
-        {"TIMESTAMP->TYPE_DATE", SQL_C_TYPE_TIMESTAMP, SQL_TYPE_DATE},
-        {"DATE->TYPE_TIMESTAMP", SQL_C_TYPE_DATE, SQL_TYPE_TIMESTAMP},
-        {"TSOFFSET->TYPE_TIMESTAMP", SQL_C_SS_TIMESTAMPOFFSET, SQL_TYPE_TIMESTAMP},
-        {"TSOFFSET->SS_TIME2", SQL_C_SS_TIMESTAMPOFFSET, SQL_SS_TIME2},
-        {"SS_TIME2->TYPE_TIMESTAMP", SQL_C_SS_TIME2, SQL_TYPE_TIMESTAMP},
-        {"SS_TIME2->SS_TIMESTAMPOFFSET", SQL_C_SS_TIME2, SQL_SS_TIMESTAMPOFFSET},
+        {"BINARY->SS_XML", SQL_C_BINARY, SQL_SS_XML, 0, 0},
+        {"TIMESTAMP->TYPE_TIME", SQL_C_TYPE_TIMESTAMP, SQL_TYPE_TIME, 16, 7},
+        {"TIMESTAMP->TYPE_DATE", SQL_C_TYPE_TIMESTAMP, SQL_TYPE_DATE, 10, 0},
+        {"DATE->TYPE_TIMESTAMP", SQL_C_TYPE_DATE, SQL_TYPE_TIMESTAMP, 23, 3},
+        {"TSOFFSET->TYPE_TIMESTAMP", SQL_C_SS_TIMESTAMPOFFSET, SQL_TYPE_TIMESTAMP, 23, 3},
+        {"TSOFFSET->SS_TIME2", SQL_C_SS_TIMESTAMPOFFSET, SQL_SS_TIME2, 16, 7},
+        {"SS_TIME2->TYPE_TIMESTAMP", SQL_C_SS_TIME2, SQL_TYPE_TIMESTAMP, 23, 3},
+        {"SS_TIME2->SS_TIMESTAMPOFFSET", SQL_C_SS_TIME2, SQL_SS_TIMESTAMPOFFSET, 34, 7},
     };
 
     SQL_TIMESTAMP_STRUCT ts = {2024, 5, 6, 7, 8, 9, 0};
@@ -3100,41 +3105,34 @@ TEST_F(CrossConversionLiveTest, UnimplementedMatrixCellsAreRefusedAtBind) {
 
         void* data = nullptr;
         SQLLEN ind = 0;
-        SQLULEN size = 0;
-        SQLSMALLINT scale = 0;
         switch (cell.c_type) {
             case SQL_C_BINARY:
                 data = xml;
                 ind = sizeof(xml);
-                size = sizeof(xml);
                 break;
             case SQL_C_TYPE_TIMESTAMP:
                 data = &ts;
                 ind = sizeof(ts);
-                size = 23;
-                scale = 3;
                 break;
             case SQL_C_TYPE_DATE:
                 data = &dt;
                 ind = sizeof(dt);
-                size = 10;
                 break;
             case SQL_C_SS_TIME2:
                 data = &t2;
                 ind = sizeof(t2);
-                size = 16;
-                scale = 7;
                 break;
-            default:
+            case SQL_C_SS_TIMESTAMPOFFSET:
                 data = &tso;
                 ind = sizeof(tso);
-                size = 34;
-                scale = 7;
                 break;
+            default:
+                FAIL() << "no buffer wired for " << cell.name;
         }
 
         EXPECT_EQ(SQL_ERROR, SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, cell.c_type,
-                                              cell.sql_type, size, scale, data, ind, &ind))
+                                              cell.sql_type, cell.size, cell.scale, data, ind,
+                                              &ind))
             << cell.name;
         EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HYC00") << cell.name;
         EXPECT_SQL_OK(SQLFreeStmt(stmt_, SQL_RESET_PARAMS), SQL_HANDLE_STMT, stmt_);
