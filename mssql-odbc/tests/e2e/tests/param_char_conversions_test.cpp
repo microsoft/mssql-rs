@@ -107,17 +107,19 @@ protected:
         return std::string(reinterpret_cast<const char*>(buf));
     }
 
-    // serialize_string picks the code page from the collation's LCID alone, so
-    // only the LCID has to be Latin1 for U+65E5 to be unmappable. The parameter
-    // carries the *database* collation, which need not match the instance's.
+    // serialize_string resolves the code page from the collation's UTF-8 flag,
+    // then its SQL sort ID, then its LCID (AB#48437). A Windows `Latin1_General`
+    // collation carries no sort ID, so its LCID alone decides, and U+65E5 is
+    // unmappable under it. The parameter carries the *database* collation, which
+    // need not match the instance's.
     //
-    // A `_UTF8` collation is excluded even though its name matches: the two
-    // parameter routes disagree there. A materialized value reaches
-    // serialize_string's LCID-only arm, which ignores the fUTF8 flag and still
-    // substitutes under CP1252, but a streamed one goes through `encode_narrow`
-    // (the only mssql-odbc caller is `DaeTranscode::encode`), which honours
-    // `col_flags & 0x40` and passes UTF-8 through intact. The DAE cases would
-    // therefore fail rather than skip. Unifying the two is AB#47590.
+    // A `_UTF8` collation is excluded even though its name matches, because
+    // under it nothing is unmappable: both the materialized and the streamed
+    // route now honour `col_flags & 0x40` and pass UTF-8 through intact, so a
+    // test expecting substitution would fail rather than skip. Before AB#48437
+    // the exclusion was needed for the opposite reason - the two routes
+    // disagreed, the inline one substituting under CP1252 while the streamed one
+    // passed UTF-8 through.
     bool DatabaseIsLatin1() {
         const std::string collation = DatabaseCollation();
         return collation.find("Latin1_General") != std::string::npos &&
@@ -188,6 +190,97 @@ protected:
             << "the session was rebuilt, so the request cost the connection";
     }
 };
+
+// A narrow parameter must reach the wire in the bytes the *database collation*
+// asks for, whatever that collation is. The driver used to resolve the code
+// page from the collation's LCID alone, ignoring both the UTF-8 flag and the
+// SQL sort ID, so under a `_UTF8` collation or a CP437/CP850 SQL collation it
+// encoded through the LCID's ANSI page instead - U+00E9 as `E9` where the
+// collation required `C3 A9` or `82` (AB#48437).
+//
+// Asserted against the server's own encoding of the same character rather than
+// a hard-coded byte string, so the test is collation-independent: it runs on
+// whatever collation the test database has and still fails if the driver and
+// the engine disagree. Echoing the value back as text would not catch this -
+// a symmetric mis-decode on the way out would hide a mis-encode on the way in.
+//
+// U+00E9 is deliberately the only probe. It is representable in every code page
+// a `Latin1_General`, CP437, CP850 or `_UTF8` collation selects, so the two
+// sides must agree on real bytes. A character the target page *cannot* hold
+// would compare the engine's best-fit transliteration against this driver's
+// `?` substitution and fail on that known deviation
+// (docs/parity-deviations.md, entry 21) rather than on the resolver. The
+// CP437/CP850 discrimination that needs unmappable characters is unit-tested in
+// `tds_value_serializer.rs`, where the collation is controlled directly.
+//
+// Runs unskipped: this is the engine's own verdict, not a driver comparison.
+TEST_F(CharConversionLiveTest, NarrowParamEncodesForTheDatabaseCollation) {
+    // What the engine itself stores for U+00E9 in a varchar under the database
+    // collation, as hex.
+    ASSERT_SQL_OK(
+        Prepare("SELECT CONVERT(VARCHAR(64),"
+                " CAST(CAST(NCHAR(233) AS VARCHAR(16)) AS VARBINARY(16)), 2)"),
+        SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    const std::string expected = GetColumnChar(1);
+    ASSERT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_FALSE(expected.empty());
+    // Guard the premise: if the engine substituted, the comparison below would
+    // be asserting that two substitutions agree rather than that the encoding
+    // is right.
+    ASSERT_NE("3F", expected) << "U+00E9 is unmappable under collation " << DatabaseCollation()
+                              << "; this probe assumes a code page that holds it";
+
+    // What the driver puts on the wire for the same character bound narrow.
+    ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(64), CAST(? AS VARBINARY(16)), 2)"),
+                  SQL_HANDLE_STMT, stmt_);
+    SQLWCHAR value[] = {0x00E9};
+    SQLLEN ind = static_cast<SQLLEN>(sizeof(value));
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_WCHAR, SQL_VARCHAR, 8, 0,
+                                   value, ind, &ind),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(expected, GetColumnChar(1))
+        << "U+00E9 was encoded for the wrong code page under collation " << DatabaseCollation();
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+}
+
+// The same check for the narrow C type, so both character C types are pinned to
+// the database collation rather than only the transcoding one.
+//
+// SQL_C_CHAR is UTF-8 in this driver (AB#47565), so the bound bytes are the
+// character's UTF-8 form; what reaches the wire must still be the collation's
+// encoding of it, not those bytes passed through.
+TEST_F(CharConversionLiveTest, NarrowCTypeParamEncodesForTheDatabaseCollation) {
+    SKIP_IF_COMPARING_MSODBCSQL();  // SQL_C_CHAR is UTF-8 here, the client code page there.
+
+    ASSERT_SQL_OK(
+        Prepare("SELECT CONVERT(VARCHAR(64),"
+                " CAST(CAST(NCHAR(233) AS VARCHAR(16)) AS VARBINARY(16)), 2)"),
+        SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    const std::string expected = GetColumnChar(1);
+    ASSERT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_FALSE(expected.empty());
+    ASSERT_NE("3F", expected) << "U+00E9 is unmappable under collation " << DatabaseCollation();
+
+    ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(64), CAST(? AS VARBINARY(16)), 2)"),
+                  SQL_HANDLE_STMT, stmt_);
+    // U+00E9 as UTF-8, which is what this driver reads a SQL_C_CHAR buffer as.
+    std::vector<SQLCHAR> utf8 = {0xC3, 0xA9};
+    SQLLEN ind = static_cast<SQLLEN>(utf8.size());
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_CHAR, SQL_VARCHAR, 8, 0,
+                                   utf8.data(), ind, &ind),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(expected, GetColumnChar(1))
+        << "U+00E9 was encoded for the wrong code page under collation " << DatabaseCollation();
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+}
 
 // The declared wire type follows ParameterType, not the C type that was bound,
 // so a cross-family pairing transcodes instead of being rejected.
@@ -959,6 +1052,69 @@ TEST_F(CharConversionLiveTest, UnmappableCharacterIsSubstituted) {
     EXPECT_EQ(SQL_SUCCESS, SQLExecute(stmt_));
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
     EXPECT_EQ("63/233/3", GetColumnChar(1)) << "'?' in the middle, 'e-acute' intact, 3 bytes";
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+}
+
+// An unpaired UTF-16 surrogate is an unmappable character like any other: it
+// has no scalar value and therefore no representation in any narrow code page.
+// It is repaired to U+FFFD on decode and then substituted by the target
+// collation, arriving as a single '?'.
+//
+// Runs on both legs, and the agreement is measured rather than assumed. On
+// retail msodbcsql18 against SQL Server on localhost, binding `a<D800>b` to a
+// varchar stored 61 3F 62 ("a?b") with SQL_SUCCESS and no diagnostic; the
+// engine's own CAST(NCHAR(97)+NCHAR(55296)+NCHAR(98) AS VARCHAR) produced the
+// identical 61 3F 62. This driver matches both, and additionally flags the
+// substitution so SQL_COPT_SS_WARN_ON_CP_ERROR can report it - see
+// UnpairedSurrogateSubstitutionWarnsWhenAsked below.
+//
+// Pinned because rejecting this input instead (e.g. as 22018) was tried and
+// reverted: it diverged from the reference driver *and* from the engine, and
+// bypassed the code-page loss channel that already covers it (AB#47598).
+TEST_F(CharConversionLiveTest, UnpairedSurrogateIsSubstitutedLikeAnyUnmappableCharacter) {
+    if (!DatabaseIsLatin1()) {
+        GTEST_SKIP() << "needs a Latin1 database collation";
+    }
+
+    // ASCII() of each position plus DATALENGTH, so a mis-encoded payload cannot
+    // hide behind a symmetric decode on the way back.
+    ASSERT_SQL_OK(
+        Prepare("SELECT CAST(ASCII(SUBSTRING(?, 1, 1)) AS VARCHAR(16)) + '/'"
+                " + CAST(ASCII(SUBSTRING(?, 2, 1)) AS VARCHAR(16)) + '/'"
+                " + CAST(ASCII(SUBSTRING(?, 3, 1)) AS VARCHAR(16)) + '/'"
+                " + CAST(DATALENGTH(?) AS VARCHAR(16))"),
+        SQL_HANDLE_STMT, stmt_);
+
+    SQLWCHAR lone[] = {'a', 0xD800, 'b'};  // unpaired high surrogate
+    SQLLEN ind = static_cast<SQLLEN>(sizeof(lone));
+    for (SQLUSMALLINT param = 1; param <= 4; ++param) {
+        ASSERT_SQL_OK(SQLBindParameter(stmt_, param, SQL_PARAM_INPUT, SQL_C_WCHAR, SQL_VARCHAR,
+                                       8, 0, lone, ind, &ind),
+                      SQL_HANDLE_STMT, stmt_);
+    }
+
+    // Exactly SQL_SUCCESS: silent by default, as measured on msodbcsql.
+    EXPECT_EQ(SQL_SUCCESS, SQLExecute(stmt_));
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    // 97 '/' 63 '/' 98 '/' 3  ->  "a?b", one byte per character.
+    EXPECT_EQ("97/63/98/3", GetColumnChar(1))
+        << "an unpaired surrogate must arrive as a single '?' with its neighbours intact";
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_RESET_PARAMS), SQL_HANDLE_STMT, stmt_);
+
+    // A well-formed pair is one supplementary character, not two unmappables,
+    // so it substitutes per UTF-16 unit like any other astral value
+    // (AstralUnmappableCharacterSubstitutesPerUtf16Unit) rather than being
+    // conflated with the lone-surrogate case above.
+    ASSERT_SQL_OK(Prepare("SELECT CAST(DATALENGTH(?) AS VARCHAR(16))"), SQL_HANDLE_STMT, stmt_);
+    SQLWCHAR pair[] = {0xD83D, 0xDE00};  // U+1F600
+    SQLLEN pair_ind = static_cast<SQLLEN>(sizeof(pair));
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_WCHAR, SQL_VARCHAR, 8, 0,
+                                   pair, pair_ind, &pair_ind),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(SQL_SUCCESS, SQLExecute(stmt_));
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("2", GetColumnChar(1)) << "a surrogate pair substitutes per UTF-16 unit";
     EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }
 

@@ -33,6 +33,79 @@ pub fn rpc_parameter_declaration(
     parameter.sql_declaration()
 }
 
+/// The per-value serialization context [`serialized_value_wire_bytes`] needs.
+///
+/// Re-exported rather than made public on `datatypes`: the module itself stays
+/// private, so this is reachable only with `test-util` on.
+pub use crate::datatypes::tds_value_serializer::TdsTypeContext;
+
+/// Serializes one value through the real parameter serializer and returns the
+/// wire bytes it produced, without a server.
+///
+/// `TdsValueSerializer::serialize_value` needs a `PacketWriter`, and `io` is
+/// `pub(crate)`, so an integration test cannot reach the serializer on its own.
+/// This runs it over a discard transport and hands back the packet body with
+/// the 8-byte TDS header stripped, which is what the corresponding in-crate
+/// unit tests assert against.
+///
+/// Exposed for the narrow-encoding tests in `tests/`, which need the collation
+/// resolution (UTF-8 flag, then SQL sort ID, then LCID) exercised through
+/// `serialize_value` rather than through the shared `encode_narrow` helper —
+/// asserting the helper alone would pass whether or not the serializer actually
+/// calls it (AB#48437).
+pub fn serialized_value_wire_bytes(
+    value: &crate::datatypes::column_values::ColumnValues,
+    ctx: &TdsTypeContext,
+) -> TdsResult<Vec<u8>> {
+    use crate::datatypes::tds_value_serializer::TdsValueSerializer;
+    use crate::io::packet_writer::PacketWriter;
+    use crate::message::messages::PacketType;
+
+    let mut sink = DiscardWriter { size: 4096 };
+    let mut writer = PacketWriter::new(PacketType::TabularResult, &mut sink, None, None);
+    futures::executor::block_on(TdsValueSerializer::serialize_value(&mut writer, value, ctx))?;
+    let packet = writer.get_payload().clone().into_inner();
+    Ok(packet[PACKET_HEADER_SIZE..].to_vec())
+}
+
+/// TDS packet header length, stripped by [`serialized_value_wire_bytes`].
+const PACKET_HEADER_SIZE: usize = 8;
+
+/// A [`NetworkWriter`] that accepts and drops everything. The bytes under test
+/// are read back out of the `PacketWriter`'s own buffer, so nothing needs to be
+/// captured here.
+struct DiscardWriter {
+    size: u32,
+}
+
+#[async_trait]
+impl TransportSslHandler for DiscardWriter {
+    async fn enable_ssl(&mut self) -> TdsResult<()> {
+        Ok(())
+    }
+    async fn disable_ssl(&mut self) -> TdsResult<()> {
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl NetworkWriter for DiscardWriter {
+    async fn send(&mut self, _data: &[u8]) -> TdsResult<()> {
+        Ok(())
+    }
+    fn packet_size(&self) -> u32 {
+        self.size
+    }
+    fn get_encryption_setting(&self) -> NegotiatedEncryptionSetting {
+        NegotiatedEncryptionSetting::NoEncryption
+    }
+    // This transport never carries a reset, so there is nothing to record.
+    fn note_reset_dispatched(&mut self) {}
+    fn take_reset_dispatched(&mut self) -> bool {
+        false
+    }
+}
+
 use crate::connection::client_context::ClientContext;
 use crate::connection::execution_context::ExecutionContext;
 use crate::connection::tds_client::TdsClient;
