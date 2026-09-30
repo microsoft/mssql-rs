@@ -7,7 +7,7 @@ use std::mem::ManuallyDrop;
 use std::sync::{Arc, Mutex};
 
 use tokio::runtime::Runtime;
-use tracing::error;
+use tracing::{debug, error};
 
 use super::{HandleType, HasObjectType};
 use crate::api::odbc_types::{SQL_OV_ODBC3, SQL_OV_ODBC3_80};
@@ -123,8 +123,17 @@ fn release_policy(process_is_shutting_down: bool) -> ReleasePolicy {
 
 fn release(runtime: Runtime, policy: ReleasePolicy) {
     match policy {
-        ReleasePolicy::Join => drop(runtime),
-        ReleasePolicy::Leak => std::mem::forget(runtime),
+        // Joining blocks until the runtime's worker and blocking-pool threads
+        // exit, so a hang in SQLFreeHandle(ENV) stops here; leaking is
+        // deliberate but means runtime threads outlive the handle.
+        ReleasePolicy::Join => {
+            debug!("SharedRuntime: joining runtime threads");
+            drop(runtime)
+        }
+        ReleasePolicy::Leak => {
+            debug!("SharedRuntime: leaking runtime during process shutdown");
+            std::mem::forget(runtime)
+        }
     }
 }
 

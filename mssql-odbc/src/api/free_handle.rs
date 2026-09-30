@@ -465,7 +465,15 @@ fn best_effort_unprepare_on_free_inner(
             stmt_state.pending_unprepare.take(),
             stmt_state.query_timeout,
         ),
-        Err(_) => return,
+        // Server-side prepared plans stay allocated until the connection
+        // closes, with nothing linking the leak back to this statement.
+        Err(_) => {
+            error!(
+                ?handle,
+                "SQLFreeHandle(STMT): stmt mutex poisoned; prepared handle cleanup skipped"
+            );
+            return;
+        }
     };
     let handles: Vec<StatementId> = [prepared.and_then(|p| p.id()), pending]
         .into_iter()

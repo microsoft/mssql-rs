@@ -56,6 +56,7 @@ pub(crate) unsafe fn sql_driver_connect_w(
 ) -> SqlReturn {
     debug!(
         ?connection_handle,
+        window_handle = ?_window_handle,
         ?in_connection_string,
         string_length_1,
         ?out_connection_string,

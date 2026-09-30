@@ -47,7 +47,7 @@
 //! Each entry point follows the crate's mandatory layering: FFI panic boundary
 //! → `unsafe` raw-handle shim → safe core (`README.md`; `num_result_cols.rs`).
 
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 use crate::api::attributes::{AttrOp, AttrScope, unimplemented_attr_diag};
 use crate::api::odbc_types::{
@@ -243,7 +243,7 @@ unsafe fn sql_set_stmt_attr_w_safe(
             if value_ptr as SqlULen == SQL_CURSOR_FORWARD_ONLY {
                 SQL_SUCCESS
             } else {
-                debug!(
+                warn!(
                     requested = value_ptr as SqlULen,
                     "SQLSetStmtAttrW: cursor type substituted with SQL_CURSOR_FORWARD_ONLY"
                 );
@@ -263,7 +263,7 @@ unsafe fn sql_set_stmt_attr_w_safe(
             if value_ptr as SqlULen == SQL_CONCUR_READ_ONLY {
                 SQL_SUCCESS
             } else {
-                debug!(
+                warn!(
                     requested = value_ptr as SqlULen,
                     "SQLSetStmtAttrW: concurrency substituted with SQL_CONCUR_READ_ONLY"
                 );
@@ -482,7 +482,7 @@ unsafe fn sql_set_stmt_attr_w_safe(
             // whatever was written.
             if state.inert_attrs.contains(attribute) {
                 state.inert_attrs.set(attribute, value_ptr as SqlULen);
-                debug!(
+                warn!(
                     attribute,
                     "SQLSetStmtAttrW: attribute stored without effect"
                 );

@@ -3,7 +3,7 @@
 
 //! SQLGetData implementation with incremental row materialization.
 
-use tracing::{debug, error};
+use tracing::{debug, error, trace};
 
 use std::sync::MutexGuard;
 
@@ -1376,7 +1376,11 @@ fn write_captured_column(
             // Leave the value resident so the column stays re-readable. A caller
             // that wants the undecodable bytes can re-read the column as
             // SQL_C_BINARY, which delivers them verbatim.
-            error!("SQLGetData: column payload could not be decoded as text");
+            // `trace!`, not `error!`: this is a per-value failure on a path
+            // called once per column per row, so malformed data in a large
+            // result set would emit it for every row at the default level.
+            // `post_diag` below is the bounded, caller-facing channel.
+            trace!("SQLGetData: column payload could not be decoded as text");
             post_diag(stmt_state, ERR_INVALID_CHARACTER_VALUE);
             return SQL_ERROR;
         }
