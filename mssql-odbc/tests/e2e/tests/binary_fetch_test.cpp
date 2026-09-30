@@ -287,21 +287,42 @@ TEST_F(BinaryFetchLiveTest, LargeGeometryChunksAcrossCalls) {
         << "the value must outrun one buffer or this pins nothing";
     const SQLLEN total = ind;
 
-    // Drain, counting what each call actually delivered.
+    // Reassemble as we drain: equal lengths would still pass if a chunk were
+    // re-delivered at the same offset or the order changed.
+    std::vector<unsigned char> assembled(buf, buf + sizeof(buf));
     SQLLEN delivered = static_cast<SQLLEN>(sizeof(buf));
     SQLRETURN rc = SQL_SUCCESS_WITH_INFO;
+    int guard = 0;
+    const int max_calls = static_cast<int>(total / static_cast<SQLLEN>(sizeof(buf))) + 2;
     while (rc == SQL_SUCCESS_WITH_INFO) {
+        ASSERT_LT(++guard, max_calls) << "chunked UDT read did not terminate";
         rc = SQLGetData(stmt_, 1, SQL_C_BINARY, buf, sizeof(buf), &ind);
         ASSERT_TRUE(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO)
             << "chunked UDT read failed part way through, rc=" << rc;
         // The indicator reports what was left before the call, so the last one
         // is the size of the final chunk.
-        delivered += (rc == SQL_SUCCESS) ? ind : static_cast<SQLLEN>(sizeof(buf));
+        const SQLLEN chunk = (rc == SQL_SUCCESS) ? ind : static_cast<SQLLEN>(sizeof(buf));
+        assembled.insert(assembled.end(), buf, buf + chunk);
+        delivered += chunk;
     }
     EXPECT_EQ(total, delivered) << "chunks must sum to the length reported up front";
 
     EXPECT_EQ(SQL_NO_DATA, SQLGetData(stmt_, 1, SQL_C_BINARY, buf, sizeof(buf), &ind));
     SQLCloseCursor(stmt_);
+
+    // The same value read whole, as the bytes the reassembled stream must equal.
+    std::vector<unsigned char> whole(static_cast<size_t>(total) + 16, 0);
+    FetchOne("SELECT CONVERT(VARBINARY(MAX), geometry::STGeomFromText('" + wkt + "', 0))");
+    SQLLEN whole_len = 0;
+    ASSERT_SQL_OK(
+        SQLGetData(stmt_, 1, SQL_C_BINARY, whole.data(), static_cast<SQLLEN>(whole.size()),
+                   &whole_len),
+        SQL_HANDLE_STMT, stmt_);
+    SQLCloseCursor(stmt_);
+
+    ASSERT_EQ(total, whole_len) << "the whole read must report the same length";
+    whole.resize(static_cast<size_t>(whole_len));
+    EXPECT_EQ(whole, assembled) << "the reassembled chunks must equal the value read whole";
 }
 
 // A character column read as binary yields its wire bytes, not its text.

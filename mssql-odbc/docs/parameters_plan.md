@@ -1041,7 +1041,9 @@ consumer reachability has not been assessed.
   over every `_SQL_TO_C_TYPE` entry, every `_map_sql_type` return, the
   `executemany` decimal override, and the `SQL_VARCHAR` fallback a failed
   `SQLDescribeParam` produces: every pair is in the matrix, including the one
-  that looks wrong, `datetime.time` binding as `(SQL_TYPE_TIME, SQL_C_CHAR)`.
+  that looks wrong, `datetime.time` binding as `(SQL_TYPE_TIME, SQL_C_WCHAR)` -
+  mssql-python's own `SQL_C_CHAR` constant is `-8`, which is ODBC's
+  `SQL_C_WCHAR`, and the native path agrees via `PARAM_C_TYPE_TEXT`.
   No cell P9b_2, P9c or P9f would add appears in that set.
 - **Deferred features (AB#48148) [not reachable]:** output/input-output parameters in parameter arrays and TVPs. `DetectParamTypes` binds every parameter `SQL_PARAM_INPUT`, so mssql-python never reaches the output-array case; TVPs are unreachable for the separate reason above - they are input parameters, but `ParamInfo` carries no `SQL_SS_TABLE` type name to supply. Single-row output parameters are supported; input parameter arrays (`SQL_ATTR_PARAMSET_SIZE`) are implemented with the limitations above.
 - **`sp_prepexecrpc` for prepared canonical calls:** the calls landed with

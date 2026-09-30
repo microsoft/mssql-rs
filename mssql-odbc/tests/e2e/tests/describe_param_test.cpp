@@ -315,6 +315,11 @@ TEST_F(DescribeParamLiveTest, DescribedDecimalRoundTripsPrecisionAndScale) {
     EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }
 
+// Benefits-from-mock-tds: this can only observe the outcome - SQL_ERROR, then a
+// later execute that works. A byte-level mock could assert what the outcome
+// implies but does not prove: that sp_describe_undeclared_parameters actually
+// went out, and that its server-error response was fully drained before the
+// statement and connection were reused.
 TEST_F(DescribeParamLiveTest, ATempTableParameterCannotBeDescribedButStillBinds) {
     ExecDirect("CREATE TABLE #dp_tmp (id INT, data VARBINARY(32))");
     ASSERT_SQL_OK(Prepare("INSERT INTO #dp_tmp (id, data) VALUES (?, ?)"), SQL_HANDLE_STMT,

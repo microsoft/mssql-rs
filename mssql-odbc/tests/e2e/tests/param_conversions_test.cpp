@@ -3035,18 +3035,41 @@ TEST_F(ExtendedTypeLiveTest, BinaryVariantRoundTripsThroughASqlVariantColumn) {
 }
 
 // Conversion-matrix cells msodbcsql performs and this driver has not
-// implemented yet. Measured against msodbcsql18 on 2026-09-29: every cell below
-// binds, and all but TIMESTAMP->TYPE_DATE also execute (that one binds and then
-// fails at execute, because dropping a non-zero time is an error, not a
-// truncation). msodbcsql admits them from IsValidSQLConversion
-// (`Sql/Ntdbms/sqlncli/odbc/sqlcprot.h:2514`): its SQL_XML_MAPPED case accepts
-// SQL_C_BINARY, and its SQL_DATE / SQL_TIME cases refuse only SQL_C_TIME /
-// SQL_C_SS_TIME2 / SQL_C_DATE respectively, leaving the rest legal.
+// implemented yet. The first six were measured against msodbcsql18 on
+// 2026-09-29: every one binds, and all but TIMESTAMP->TYPE_DATE also execute
+// (that one binds and then fails at execute, because dropping a non-zero time
+// is an error, not a truncation). The two SS_TIME2 rows are derived, not
+// measured - they share the DATETIMECONVERSION row with the TSOFFSET pair
+// above.
+//
+// msodbcsql accepts them at SQLBindParameter (`sqlcdesc.cpp:3031`), which folds
+// the 3.x concise C/SQL ids to their 2.x and *_MAPPED forms first (`:2975-2983`)
+// - so these pairings only reach `IsValidSQLConversion` under internal ids, not
+// the public ones named here. That function's switch subtracts exclusions and
+// then defers to `fValidConversion` (`sqlcprot.h:2625`), which is what actually
+// admits them: `SQL_C_BINARY`'s row is ALLCONVERSION (`sqlcmisc.cpp:495`,
+// `:588`) and the temporal C rows are DATETIMECONVERSION (`:518-526`, `:599-601`
+// for the 2.x forms, `:626-627` for the SS ones), whose bits cover every SQL
+// target below. Clearing the switch is therefore not sufficient on its own -
+// `SQL_C_GUID -> SQL_TYPE_TIME` passes it and is still refused, because
+// GUIDCONVERSION carries no SQL_TIME bit.
 //
 // This driver refuses all of them at bind with HYC00. That is the documented
 // "implemented, not legal" reading of the matrix, and AB#48249 is where the
-// remaining cells get implemented or flipped to 07006. Pinning the refusal here
+// remaining cells get implemented or flipped to 07006 - the state msodbcsql
+// already answers here (`IDS_07_006`, `sqlcdesc.cpp:3033`). Pinning the refusal
 // means that work has to update this test deliberately rather than silently.
+//
+// Selection rule, so this is not read as exhaustive: one cell per distinct
+// bitmap row reached by a C type this driver already binds, plus the SS_TIME2
+// mirrors of the SS_TIMESTAMPOFFSET pair, which share a row and are the ones
+// most likely to drift when AB#48249 lands. It is a sample, not the full table.
+//
+// EVIDENCE: the source reading above, plus a direct measurement against retail
+// msodbcsql18 18.6.2.1 (`SQL_DRIVER_VER` 18.06.0002) on 2026-09-29.
+// SKIP_IF_COMPARING_MSODBCSQL() means the reference leg never re-measures this
+// block, so AB#48249 should re-measure against the build it targets rather than
+// inherit a one-off observation.
 TEST_F(CrossConversionLiveTest, UnimplementedMatrixCellsAreRefusedAtBind) {
     SKIP_IF_COMPARING_MSODBCSQL();
 
@@ -3062,11 +3085,14 @@ TEST_F(CrossConversionLiveTest, UnimplementedMatrixCellsAreRefusedAtBind) {
         {"DATE->TYPE_TIMESTAMP", SQL_C_TYPE_DATE, SQL_TYPE_TIMESTAMP},
         {"TSOFFSET->TYPE_TIMESTAMP", SQL_C_SS_TIMESTAMPOFFSET, SQL_TYPE_TIMESTAMP},
         {"TSOFFSET->SS_TIME2", SQL_C_SS_TIMESTAMPOFFSET, SQL_SS_TIME2},
+        {"SS_TIME2->TYPE_TIMESTAMP", SQL_C_SS_TIME2, SQL_TYPE_TIMESTAMP},
+        {"SS_TIME2->SS_TIMESTAMPOFFSET", SQL_C_SS_TIME2, SQL_SS_TIMESTAMPOFFSET},
     };
 
     SQL_TIMESTAMP_STRUCT ts = {2024, 5, 6, 7, 8, 9, 0};
     SQL_DATE_STRUCT dt = {2024, 5, 6};
     SQL_SS_TIMESTAMPOFFSET_STRUCT tso = {2024, 5, 6, 7, 8, 9, 0, 0, 0};
+    SQL_SS_TIME2_STRUCT t2 = {7, 8, 9, 0};
     unsigned char xml[] = {0x3C, 0x00, 0x61, 0x00, 0x2F, 0x00, 0x3E, 0x00};
 
     for (const Cell& cell : cells) {
@@ -3093,6 +3119,12 @@ TEST_F(CrossConversionLiveTest, UnimplementedMatrixCellsAreRefusedAtBind) {
                 ind = sizeof(dt);
                 size = 10;
                 break;
+            case SQL_C_SS_TIME2:
+                data = &t2;
+                ind = sizeof(t2);
+                size = 16;
+                scale = 7;
+                break;
             default:
                 data = &tso;
                 ind = sizeof(tso);
@@ -3104,7 +3136,7 @@ TEST_F(CrossConversionLiveTest, UnimplementedMatrixCellsAreRefusedAtBind) {
         EXPECT_EQ(SQL_ERROR, SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, cell.c_type,
                                               cell.sql_type, size, scale, data, ind, &ind))
             << cell.name;
-        EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HYC00");
-        SQLFreeStmt(stmt_, SQL_RESET_PARAMS);
+        EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HYC00") << cell.name;
+        EXPECT_SQL_OK(SQLFreeStmt(stmt_, SQL_RESET_PARAMS), SQL_HANDLE_STMT, stmt_);
     }
 }
