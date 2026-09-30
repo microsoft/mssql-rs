@@ -1888,9 +1888,15 @@ fn reject_fraction_past_scale(
 /// from `lpparam->fSqlType` and never consults the bound C type.
 ///
 /// `column_size` and `decimal_digits` come straight from the application, so
-/// every value that participates in the `@P1 <type>` declaration is validated
-/// here: emitting `decimal(0,0)` or `char(0)` would otherwise fail server-side
-/// with an opaque syntax error instead of `HY104` at execute time.
+/// every value that participates in the `@P1 <type>` declaration is checked
+/// before it is rendered: emitting `decimal(0,0)` or `char(0)` would otherwise
+/// fail server-side with an opaque syntax error. The two reach here with
+/// different histories, though. `SQLBindParameter` has already screened
+/// `column_size` with `parameter_column_size_is_valid`, so that half is a
+/// backstop - see [`fixed_length`]. Scale is not screened there, so for
+/// `decimal_digits` this is the primary check and its `HY104` really is
+/// reported later than msodbcsql's `CheckSqlScale`; the parameter plan records
+/// that timing as an accepted divergence.
 ///
 /// The returned [`RpcTypeMetadata`] is the *only* place precision and scale are
 /// carried. [`RpcParameter`] uses it to render the declaration and to write the
@@ -1976,7 +1982,9 @@ fn typed_null(
 /// Matches msodbcsql for ODBC 3.x applications: `CheckSqlPrec`
 /// (`Sql/Ntdbms/sqlncli/odbc/sqlcdesc.cpp`) rejects a zero `ColumnSize` on these
 /// types with `HY104`, and only clamps it to the maximum for a 2.x application
-/// (`IS2xAPP`). We report the same `HY104`, at execute rather than at bind.
+/// (`IS2xAPP`). `SQLBindParameter` reports the same `HY104` in the same phase
+/// msodbcsql does, through `parameter_column_size_is_valid`, so this is a
+/// backstop rather than the primary check.
 /// `varchar`/`nvarchar` differ deliberately -- see [`variable_length`].
 fn fixed_length(column_size: usize, max: usize) -> Result<u16, ParamBuildError> {
     u16::try_from(column_size)
