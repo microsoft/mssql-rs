@@ -707,8 +707,11 @@ mod query_result_reads {
                                 steps.push(Step::Rows(values, connection.last_result_row_count()));
                                 break;
                             }
-                            Err(SqlServerError { diagnostics }) if connection.has_open_batch() => {
+                            Err(SqlServerError { diagnostics }) => {
                                 steps.push(Step::RowsThenError(values, messages(&diagnostics)));
+                                if !connection.has_open_batch() {
+                                    return steps;
+                                }
                                 break;
                             }
                             Err(e) => panic!("row read failed: {e:?}"),
@@ -874,6 +877,38 @@ mod query_result_reads {
                 Step::Error(vec!["last".to_string()]),
             ]
         );
+        assert_still_usable(&mut connection).await;
+    }
+
+    /// A statement can fail with more than one ERROR token: a failed BACKUP sends
+    /// the device error and then "terminating abnormally". Under `Continue` that
+    /// is one failed statement — one `Err` carrying both — and the batch goes on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn continue_returns_every_error_of_a_statement_together() {
+        let mut connection = begin_connection(&build_tcp_datasource()).await;
+
+        let steps = walk(
+            &mut connection,
+            "SELECT 1 AS a; \
+             BACKUP DATABASE master TO DISK = '/pr617_no_such_directory/x.bak'; \
+             SELECT 2 AS b;",
+            BatchErrorMode::Continue,
+        )
+        .await;
+
+        assert_eq!(steps.len(), 3, "got {steps:?}");
+        assert_eq!(steps[0], Step::Rows(vec![1], Some(1)));
+        match &steps[1] {
+            Step::Error(errors) => {
+                assert_eq!(errors.len(), 2, "both errors in one Err, got {errors:?}");
+                assert!(
+                    errors[1].contains("terminating abnormally"),
+                    "got {errors:?}"
+                );
+            }
+            other => panic!("expected one failed statement, got {other:?}"),
+        }
+        assert_eq!(steps[2], Step::Rows(vec![2], Some(1)));
         assert_still_usable(&mut connection).await;
     }
 

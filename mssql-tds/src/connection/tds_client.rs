@@ -516,6 +516,10 @@ pub struct TdsClient {
     /// DONE tokens completing that statement have not all been read. They carry
     /// the error flag, which is otherwise a protocol violation.
     statement_error_completion_pending: bool,
+    /// Errors of a statement that failed inside a row set under
+    /// [`BatchErrorMode::Continue`], held until the DONE ending the row set so
+    /// they are returned together.
+    row_set_errors: Vec<SqlErrorInfo>,
     /// DONE count of the row set just completed; see
     /// [`last_result_row_count`](Self::last_result_row_count).
     last_result_row_count: Option<u64>,
@@ -686,6 +690,7 @@ impl TdsClient {
             prepared_batch: None,
             batch_error_mode: BatchErrorMode::Abort,
             statement_error_completion_pending: false,
+            row_set_errors: Vec::new(),
             last_result_row_count: None,
             return_values: Vec::new(),
             info_messages: Vec::new(),
@@ -4976,6 +4981,7 @@ impl TdsClient {
         self.parked_token = None;
         self.current_result_set_has_been_read_till_end = true;
         self.current_result_ended_with_done_in_proc = false;
+        self.reset_statement_walk_state();
         self.current_command_ce_setting = ExecutionColumnEncryptionSetting::UseConnectionSetting;
         self.execution_context.set_has_open_batch(false);
     }
@@ -5151,6 +5157,10 @@ impl TdsClient {
                     );
 
                     self.validate_done_error(&done, is_done_in_proc)?;
+                    // This DONE ends a no-row statement, which has no row-set
+                    // count; drop the previous row set's so it is not read as this
+                    // statement's.
+                    self.last_result_row_count = None;
 
                     let count = self.count_map.entry(done.cur_cmd).or_insert(0);
                     // Use saturating_add to prevent integer overflow from malicious/corrupted TDS responses
@@ -5278,16 +5288,42 @@ impl TdsClient {
                 }
                 Tokens::Error(error_token) => {
                     info!(?error_token);
-                    let error = self.record_error_token(&error_token);
-                    if self.continues_after(&error_token) {
+                    let mut all_errors = vec![self.record_error_token(&error_token)];
+                    let mut continues = self.continues_after(&error_token);
+                    if continues {
+                        // One failed statement can send several ERROR tokens, with
+                        // INFO between them, before its DONE. Read them all so the
+                        // statement fails once with every diagnostic, and park the
+                        // first token past them for the next call.
+                        loop {
+                            match self.next_response_token(&parser_context).await? {
+                                Tokens::Error(next_error) => {
+                                    info!(?next_error);
+                                    all_errors.push(self.record_error_token(&next_error));
+                                    if !self.continues_after(&next_error) {
+                                        continues = false;
+                                        break;
+                                    }
+                                }
+                                Tokens::Info(info_token) => {
+                                    info!(?info_token);
+                                    self.capture_info_message(&info_token);
+                                }
+                                other => {
+                                    self.parked_token = Some(Box::new(other));
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if continues {
                         // Between results, so nothing is positioned on: drop the
                         // previous row set's metadata, or `on_rows` would still
                         // report it and `advance` would try to drain it again.
                         self.current_metadata = None;
                         self.current_result_set_has_been_read_till_end = true;
-                        return Err(self.statement_error_keeping_batch_open(error));
+                        return Err(self.statement_error_keeping_batch_open(all_errors));
                     }
-                    let mut all_errors = vec![error];
                     let drain_result = self.drain_stream().await;
                     // Reset batch state before propagating: the error terminates
                     // the batch regardless of whether the drain fully consumed
@@ -7687,11 +7723,18 @@ impl TdsClient {
                 }
                 let error = self.record_error_token(&error_token);
                 if self.continues_after(&error_token) {
-                    // The row set stays current: `next_row` may read on, and
-                    // `advance` drains what is left of it through its DONE.
-                    return Err(self.statement_error_keeping_batch_open(error));
+                    // A failed statement can send several ERROR tokens before the
+                    // DONE that ends its row set. Collect them here and return
+                    // them together from that DONE (see `handle_row_done`), so the
+                    // statement fails once, with every diagnostic. Rows cannot be
+                    // put back once decoded, so this path collects rather than
+                    // looking ahead as `advance_to_result_boundary` does.
+                    self.row_set_errors.push(error);
+                    self.statement_error_completion_pending = true;
+                    return Ok(None);
                 }
-                let mut all_errors = vec![error];
+                let mut all_errors = std::mem::take(&mut self.row_set_errors);
+                all_errors.push(error);
                 let drain_result = self.drain_stream().await;
                 // Reset batch state before propagating: the error terminates the
                 // batch regardless of whether the drain fully consumed it, so a
@@ -7756,6 +7799,14 @@ impl TdsClient {
             info!("No more rows for current command: {:?}", done.cur_cmd);
             self.execution_context.set_has_open_batch(false);
         }
+        // Errors collected from the row set under `Continue` are returned now,
+        // together, once the DONE that ends it has been processed: the row set is
+        // closed and the batch state reflects the DONE's MORE flag.
+        if !self.row_set_errors.is_empty() {
+            return Err(crate::error::Error::from_sql_errors(std::mem::take(
+                &mut self.row_set_errors,
+            )));
+        }
         Ok(Some(false))
     }
 
@@ -7809,17 +7860,21 @@ impl TdsClient {
     }
 
     /// Builds the error returned for a failed statement under
-    /// [`BatchErrorMode::Continue`], leaving the reader just past its ERROR token.
+    /// [`BatchErrorMode::Continue`] between results, leaving the reader just past
+    /// its ERROR tokens (the first token after them is parked for the next call).
     ///
     /// The batch is marked open because the response still has unread tokens —
     /// at least the DONE that completes the failed statement. Without this, an
     /// error on the batch's first statement (which comes before any result
     /// boundary has opened it) would read as a closed batch, and the next
     /// command would start reading this one's leftovers.
-    fn statement_error_keeping_batch_open(&mut self, error: SqlErrorInfo) -> crate::error::Error {
+    fn statement_error_keeping_batch_open(
+        &mut self,
+        errors: Vec<SqlErrorInfo>,
+    ) -> crate::error::Error {
         self.execution_context.set_has_open_batch(true);
         self.statement_error_completion_pending = true;
-        crate::error::Error::from_sql_errors(vec![error])
+        crate::error::Error::from_sql_errors(errors)
     }
 
     /// Clears what describes the statements of one request, at every request
@@ -7829,6 +7884,7 @@ impl TdsClient {
     fn reset_statement_walk_state(&mut self) {
         self.batch_error_mode = BatchErrorMode::Abort;
         self.statement_error_completion_pending = false;
+        self.row_set_errors.clear();
         self.last_result_row_count = None;
     }
 
@@ -7844,7 +7900,8 @@ impl TdsClient {
     /// `None` means the server reported no count — `SET NOCOUNT ON`, for one —
     /// which is deliberately distinct from `Some(0)`, an empty row set whose
     /// count was reported. It is also `None` while a row set is still being read,
-    /// and for prepared batches, which report counts through
+    /// after a no-row statement, after a cancellation, and for prepared batches,
+    /// which report counts through
     /// [`PreparedBatchResult`](crate::connection::PreparedBatchResult).
     pub fn last_result_row_count(&self) -> Option<u64> {
         self.last_result_row_count
@@ -8572,10 +8629,12 @@ pub enum BatchErrorMode {
     /// `false` when the batch has ended. A fatal error (severity >= 20) or a
     /// transport failure still closes the batch and retires the connection.
     ///
-    /// An error inside a row set is returned by `next_row`; the row set stays
-    /// current, so `next_row` may read on, and `advance` drains what is left of
-    /// it. [`close_query`](TdsClient::close_query) drains the rest of the batch
-    /// regardless and returns the errors it skipped.
+    /// A failed statement is one `Err`, carrying every ERROR the server sent for
+    /// it (it can send several) in [`SqlServerDiagnostics`](crate::error::SqlServerDiagnostics).
+    /// An error inside a row set is returned by `next_row` once the DONE ending
+    /// that row set has been read; rows read before it are kept, and `advance`
+    /// moves on. [`close_query`](TdsClient::close_query) drains the rest of the
+    /// batch regardless and returns the errors it skipped.
     Continue,
 }
 
@@ -9574,6 +9633,11 @@ mod tests {
                 rows_affected: Some(3)
             }
         );
+        assert_eq!(
+            client.last_result_row_count(),
+            None,
+            "a no-row statement must not report the previous row set's count"
+        );
 
         assert_eq!(client.advance().await.unwrap(), StatementResult::Rows);
         assert_eq!(
@@ -9728,6 +9792,28 @@ mod tests {
         client.check_and_reconnect(None, None).await.unwrap();
         assert_eq!(client.batch_error_mode, BatchErrorMode::Abort);
         assert!(!client.statement_error_completion_pending);
+    }
+
+    /// Cancellation ends the request without going through `begin_command` or
+    /// `check_and_reconnect`, so the attention cleanup clears the statement-walk
+    /// state itself: the cancelled statement's count is not reported, and the
+    /// DONE-error allowance does not stay armed.
+    #[test]
+    fn attention_cleanup_clears_the_statement_walk_state() {
+        let mut client = create_test_client();
+        client.batch_error_mode = BatchErrorMode::Continue;
+        client.statement_error_completion_pending = true;
+        client
+            .row_set_errors
+            .push(SqlErrorInfo::from(&error_token_with_severity(16)));
+        client.last_result_row_count = Some(4);
+
+        client.normalize_after_attention();
+
+        assert_eq!(client.batch_error_mode, BatchErrorMode::Abort);
+        assert!(!client.statement_error_completion_pending);
+        assert!(client.row_set_errors.is_empty());
+        assert_eq!(client.last_result_row_count(), None);
     }
 
     /// Returning an error must not cost the connection its retirement. A
@@ -10263,6 +10349,84 @@ mod tests {
         assert!(!client.is_connection_dead());
     }
 
+    /// One failed statement can send several ERROR tokens (with INFO between
+    /// them) before its DONE. Under `Continue` they come back as one `Err`
+    /// carrying all of them, not as one failed statement per token, and the first
+    /// token after them is kept for the next call.
+    #[tokio::test]
+    async fn continue_returns_every_error_of_a_statement_as_one_err() {
+        use crate::token::tokens::ErrorToken;
+        let error = |number: u32| {
+            Tokens::Error(ErrorToken {
+                number,
+                state: 1,
+                severity: 16,
+                message: format!("error {number}"),
+                server_name: String::new(),
+                proc_name: String::new(),
+                line_number: 1,
+            })
+        };
+        let mut client = create_test_client_with_tokens(vec![
+            error(50001),
+            info_token(3621, 0, "The statement has been terminated."),
+            error(50002),
+            Tokens::Done(DoneToken {
+                status: DoneStatus::ERROR | DoneStatus::MORE,
+                cur_cmd: CurrentCommand::Select,
+                row_count: 0,
+            }),
+            int_col_metadata(1),
+            done_count(CurrentCommand::Select, 0, false),
+        ]);
+
+        let first = client
+            .execute(
+                "q".to_string(),
+                ExecuteOptions::new().on_error(BatchErrorMode::Continue),
+            )
+            .await;
+
+        match first {
+            Err(crate::error::Error::SqlServerError { diagnostics }) => {
+                let numbers: Vec<u32> = diagnostics.errors.iter().map(|e| e.number).collect();
+                assert_eq!(numbers, vec![50001, 50002]);
+            }
+            other => panic!("expected one SqlServerError, got {other:?}"),
+        }
+        assert_eq!(client.take_info_messages().len(), 1);
+        assert!(client.has_open_batch());
+        assert_eq!(
+            client.advance().await.unwrap(),
+            StatementResult::Rows,
+            "the parked DONE closes the failed statement; no second Err"
+        );
+        assert!(client.next_row().await.unwrap().is_none());
+        assert_eq!(client.advance().await.unwrap(), StatementResult::End);
+    }
+
+    /// If a later ERROR of the same statement is fatal, the whole run drains
+    /// and closes as `Abort` would, and the earlier errors are not lost.
+    #[tokio::test]
+    async fn a_fatal_error_after_a_statement_error_still_closes_the_batch() {
+        let mut client = create_test_client_with_tokens(vec![
+            Tokens::Error(error_token_with_severity(16)),
+            Tokens::Error(error_token_with_severity(FATAL_ERROR_SEVERITY)),
+            done_no_more(),
+        ]);
+        client.batch_error_mode = BatchErrorMode::Continue;
+
+        match client.advance_to_result_boundary().await {
+            Err(crate::error::Error::SqlServerError { diagnostics }) => {
+                assert_eq!(diagnostics.errors.len(), 2);
+            }
+            other => panic!("expected SqlServerError, got {other:?}"),
+        }
+        assert!(client.is_connection_dead());
+        assert!(!client.has_open_batch());
+        assert!(client.parked_token.is_none());
+    }
+
     /// The default still ends the batch at the first error: the rest of the
     /// response is drained, so the result after the error is gone and the batch
     /// is closed.
@@ -10290,13 +10454,15 @@ mod tests {
         assert!(!client.is_connection_dead());
     }
 
-    /// An error inside a row set is returned by `next_row`. The row set stays
-    /// current, and `advance` drains the rest of it — accepting the DONE that
-    /// closes the failed statement — before moving to the next result.
+    /// An error inside a row set is returned by `next_row` once the DONE ending
+    /// the row set arrives, together with every other ERROR the statement sent.
+    /// The row set is then finished, and `advance` moves to the next result.
     #[tokio::test]
     async fn an_error_inside_a_row_set_comes_from_next_row_and_advance_moves_past_it() {
         let mut client = create_test_client_with_tokens(vec![
             int_col_metadata(1),
+            Tokens::Error(error_token_with_severity(16)),
+            info_token(3621, 0, "The statement has been terminated."),
             Tokens::Error(error_token_with_severity(16)),
             Tokens::Done(DoneToken {
                 status: DoneStatus::ERROR | DoneStatus::MORE,
@@ -10317,12 +10483,18 @@ mod tests {
                 .unwrap(),
             StatementResult::Rows
         );
-        assert!(matches!(
-            client.next_row().await,
-            Err(crate::error::Error::SqlServerError { .. })
-        ));
+        match client.next_row().await {
+            Err(crate::error::Error::SqlServerError { diagnostics }) => {
+                assert_eq!(diagnostics.errors.len(), 2, "one statement, one Err");
+            }
+            other => panic!("expected SqlServerError, got {other:?}"),
+        }
         assert!(client.has_open_batch());
-        assert!(client.on_rows(), "the failed row set is still current");
+        assert!(
+            client.next_row().await.unwrap().is_none(),
+            "the failed row set is finished"
+        );
+        assert_eq!(client.take_info_messages().len(), 1);
 
         assert_eq!(client.advance().await.unwrap(), StatementResult::Rows);
         assert!(client.next_row().await.unwrap().is_none());

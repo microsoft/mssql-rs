@@ -218,6 +218,7 @@ impl ClientContextValidator for DefaultClientContextValidator {
     }
 }
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 /// Connection configuration for a TDS session.
@@ -715,11 +716,13 @@ impl ClientContext {
     ///
     /// LOGIN7 stores this as an offset/length pair separate from the payload,
     /// so both must come from the same value — hence one accessor rather than
-    /// two call sites reading the override independently.
-    pub(crate) fn login_server_name(&self, transport: &TransportContext) -> String {
+    /// two call sites reading the override independently. It borrows the
+    /// override rather than cloning it, since each call site only reads it.
+    pub(crate) fn login_server_name(&self, transport: &TransportContext) -> Cow<'_, str> {
         self.login_server_name
-            .clone()
-            .unwrap_or_else(|| transport.get_login_server_name())
+            .as_deref()
+            .map(Cow::Borrowed)
+            .unwrap_or_else(|| Cow::Owned(transport.get_login_server_name()))
     }
 
     /// Looks up the Entra ID token factory for the current authentication method.

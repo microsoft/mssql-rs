@@ -985,7 +985,7 @@ impl<'a, 'n, 'context> Serializer<'a, 'n, 'context> {
                         .login_server_name(self.model.transport_context);
                     info!("Login Server name: {}", server_name);
                     self.payload_writer
-                        .write_string_unicode_async(server_name.as_str())
+                        .write_string_unicode_async(&server_name)
                         .await?;
                 }
                 LoginDeferredPayload::FeatureExtOffset => {
@@ -1342,9 +1342,15 @@ fn utf16_code_units(value: &str) -> TdsResult<u16> {
     })
 }
 
-impl SizedLoginItem for String {
+impl SizedLoginItem for str {
     fn len_bytes(&self) -> usize {
         self.encode_utf16().count() * 2
+    }
+}
+
+impl SizedLoginItem for String {
+    fn len_bytes(&self) -> usize {
+        self.as_str().len_bytes()
     }
 }
 
