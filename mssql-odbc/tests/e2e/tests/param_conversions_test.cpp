@@ -3053,10 +3053,11 @@ TEST_F(ExtendedTypeLiveTest, BinaryVariantRoundTripsThroughASqlVariantColumn) {
 // GUIDCONVERSION carries no SQL_TIME bit.
 //
 // This driver refuses all of them at bind with HYC00. That is the documented
-// "implemented, not legal" reading of the matrix, and AB#48249 is where the
-// remaining cells get implemented or flipped to 07006 - the state msodbcsql
-// already answers here (`IDS_07_006`, `sqlcdesc.cpp:3033`). Pinning the refusal
-// means that work has to update this test deliberately rather than silently.
+// reading of this matrix - it records what is implemented, not what is legal -
+// and AB#48249 is where the remaining cells get implemented or flipped to
+// 07006, the state msodbcsql already answers here (`IDS_07_006`,
+// `sqlcdesc.cpp:3033`). Pinning the refusal means that work has to update this
+// test deliberately rather than silently.
 //
 // Selection rule, so this is not read as exhaustive: one cell per distinct
 // bitmap row reached by a C type this driver already binds, plus the SS_TIME2
