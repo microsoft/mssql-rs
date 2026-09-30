@@ -99,9 +99,13 @@ binding, defaulted or not, matching msodbcsql's `CRPCSQLSender::SendParamList`.
 Defaulted bindings are *not* exempted from the conversion matrix: the same
 pairing must be accepted or rejected whether the application named the C type or
 let the driver pick it. The cost is that describe-then-bind can only bind the
-types the matrix already lists. `SQL_SS_UDT` and `SQL_SS_TABLE` stay rejected at
-bind time because they need a fully qualified server type name that
-`SQLDescribeParam` does not report.
+types the matrix already lists. `SQL_SS_TABLE` stays rejected at bind time
+because it needs a fully qualified server type name that `SQLDescribeParam` does
+not report. `SQL_SS_UDT` did too when this plan was written; since AB#48248 it
+binds from a `SQL_C_BINARY` buffer, taking its identity from the application's
+`SQL_CA_SS_UDT_*` descriptor fields or from the describe itself. See the
+`SQL_C_DEFAULT` resolution bullet in `parameters_plan.md` for the current
+contract.
 
 Precision and scale that a NULL `SqlType` cannot carry (decimal
 precision/scale lives inside the `Option` payload, temporal scale likewise)
