@@ -700,7 +700,11 @@ fn post_quit(ui_thread_id: &UiThreadId, reason: &str) {
         return;
     }
     debug!(reason, "interactive: ending the sign-in message pump");
-    let _ = unsafe { PostThreadMessageW(*thread_id, WM_QUIT, WPARAM(0), LPARAM(0)) };
+    // A failure here leaves the pump waiting on WM_QUIT forever, so the
+    // sign-in window outlives the login timeout with nothing to explain it.
+    if let Err(e) = unsafe { PostThreadMessageW(*thread_id, WM_QUIT, WPARAM(0), LPARAM(0)) } {
+        error!(%e, "interactive: could not signal the sign-in message pump to quit");
+    }
 }
 
 /// Closes a sign-in window that is still open, used when the caller's login

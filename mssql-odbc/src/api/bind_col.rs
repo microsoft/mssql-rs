@@ -49,7 +49,12 @@ pub(crate) unsafe fn sql_bind_col(
 ) -> SqlReturn {
     debug!(
         ?statement_handle,
-        column_number, target_type, buffer_length, "SQLBindCol called"
+        column_number,
+        target_type,
+        ?target_value_ptr,
+        buffer_length,
+        ?strlen_or_ind_ptr,
+        "SQLBindCol called"
     );
     crate::ffi_entry!("SQLBindCol", unsafe {
         sql_bind_col_impl(
