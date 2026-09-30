@@ -202,10 +202,12 @@ pub(super) async fn acquire_token(
             quote(&saml_response.body)
         )));
     }
+    // Unlike the other error paths, this 200 response may hold a bearer
+    // assertion under a prefix we do not recognise, so its body is withheld.
     let assertion = extract_assertion(&saml_response.body).ok_or_else(|| {
         failure(format!(
-            "{}\nSAML token not found in response.",
-            quote(&saml_response.body)
+            "SAML token not found in response ({} bytes).",
+            saml_response.body.len()
         ))
     })?;
 
@@ -628,7 +630,21 @@ async fn negotiate(
             format!("Negotiate {}", BASE64.encode(&token.data)),
         ));
         response = transport.send(&authenticated).await?;
-        if response.status != 401 || context.is_complete() {
+        if context.is_complete() {
+            return Ok(response);
+        }
+        if response.status != 401 {
+            // RFC 4559 §5: the final mutual-authentication token may ride on
+            // the successful response. Verify it rather than drop it; a server
+            // that omits it is still authenticated by TLS.
+            if let Some(Some(last)) = negotiate_challenge(&response) {
+                let (_, verified) = run_blocking(move || {
+                    let verified = context.generate_token(Some(&last));
+                    (context, verified)
+                })
+                .await?;
+                verified.map_err(Error::Security)?;
+            }
             return Ok(response);
         }
         match negotiate_challenge(&response) {
@@ -1132,6 +1148,65 @@ mod tests {
     }
 
     #[test]
+    fn a_final_negotiate_token_on_success_is_verified() {
+        let final_token = vec![9, 8, 7];
+        let header = format!("Negotiate {}", BASE64.encode(&final_token));
+        let script = |header: String| {
+            ScriptedTransport::new(move |request, earlier| {
+                if request.url != WST13_URL {
+                    return happy(request, earlier);
+                }
+                Ok(match earlier {
+                    0 => challenge("Negotiate"),
+                    _ => HttpResponse {
+                        www_authenticate: vec![header.clone()],
+                        ..response(200, &saml_response(SAML2))
+                    },
+                })
+            })
+        };
+        let context = || {
+            MockSecurityContext::multi_round(vec![1], vec![2])
+                .with_expected_challenges(vec![final_token.clone()])
+        };
+
+        let transport = script(header);
+        let token = run(
+            &transport,
+            FakeIdentity::with_context("alice@CONTOSO.COM", context()),
+            STS,
+        )
+        .expect("token");
+        assert_eq!(token, "eyJ.access.token");
+        let soap_sends = transport
+            .requests()
+            .iter()
+            .filter(|r| r.url == WST13_URL)
+            .count();
+        assert_eq!(soap_sends, 2, "the accepted request must not be replayed");
+
+        // A final token that fails verification fails mutual authentication.
+        let forged = script(format!("Negotiate {}", BASE64.encode([1, 1, 1])));
+        let error = run(
+            &forged,
+            FakeIdentity::with_context("alice@CONTOSO.COM", context()),
+            STS,
+        )
+        .expect_err("forged final token");
+        assert!(
+            matches!(error, Error::Security(SecurityError::InvalidToken)),
+            "{error:?}"
+        );
+        assert!(
+            !forged
+                .requests()
+                .iter()
+                .any(|r| r.url.contains("/oauth2/token")),
+            "no token exchange after failed mutual authentication"
+        );
+    }
+
+    #[test]
     fn a_security_context_error_is_surfaced() {
         let context = MockSecurityContext::single_round(vec![1]).with_error_on_round(
             0,
@@ -1208,9 +1283,13 @@ mod tests {
 
     #[test]
     fn a_response_without_an_assertion_fails() {
-        let transport = ScriptedTransport::new(|request, earlier| {
+        let secret = "<saml2:Assertion>bearer-credential</saml2:Assertion>";
+        let transport = ScriptedTransport::new(move |request, earlier| {
             if request.url == WST13_URL && has_authorization(request) {
-                Ok(response(200, "<s:Envelope><s:Body/></s:Envelope>"))
+                Ok(response(
+                    200,
+                    &format!("<s:Envelope><s:Body>{secret}</s:Body></s:Envelope>"),
+                ))
             } else {
                 happy(request, earlier)
             }
@@ -1219,6 +1298,10 @@ mod tests {
         assert!(
             error.contains("SAML token not found in response"),
             "{error}"
+        );
+        assert!(
+            !error.contains("bearer-credential"),
+            "body must be withheld: {error}"
         );
     }
 

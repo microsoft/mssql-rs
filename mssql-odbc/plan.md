@@ -490,7 +490,7 @@ driver to resolve.
 | AccessToken (JWT) | ✅ | Native | Implemented | Pre-acquired bearer token via `SQL_COPT_SS_ACCESS_TOKEN` |
 | ActiveDirectoryServicePrincipal | ✅ | Native | Implemented | Client ID + secret |
 | ActiveDirectoryManagedIdentity | ✅ | Access token | Implemented | System- or user-assigned identity |
-| ActiveDirectoryInteractive | ✅ | Native on Windows, access token elsewhere | Windows only | Browser sign-in; non-Windows resolves to Integrated, as msodbcsql does |
+| ActiveDirectoryInteractive | ✅ | Native on Windows, access token elsewhere | Implemented (Windows native; Integrated elsewhere) | Browser sign-in; non-Windows resolves to Integrated, as msodbcsql does |
 | ActiveDirectoryPassword | ✅ | Native | Out of scope (`HYC00`) | ROPC sends plaintext credentials to Entra, supports neither MFA nor conditional access, and is deprecated by the Microsoft identity platform. Excluded by signed-off design deviation (AB#45486) |
 | ActiveDirectoryDeviceCodeFlow | ✅ | Access token | `HYC00` | Not an msodbcsql18 keyword. mssql-python maps the `ActiveDirectoryDeviceCode` spelling and acquires the token itself; the `...Flow` spelling it does not map passes through and reaches this refusal |
 | ActiveDirectoryDefault | ✅ | Access token | `HYC00` | Not an msodbcsql18 keyword. mssql-python maps it and acquires the token itself, so it never sends the keyword; this driver recognizes it, so another ODBC consumer can still reach this refusal |
@@ -514,4 +514,6 @@ token, service principal, managed identity, Windows interactive, and
 (T0–T3). Compared with the msodbcsql18 source, one difference remains:
 `ActiveDirectoryPassword` is an accepted deliberate deviation (AB#45486).
 Retail behavior has not yet been measured for it.
-Non-Windows interactive was cut (AB#46683).
+A non-Windows interactive browser flow was cut (AB#46683); off Windows,
+`ActiveDirectoryInteractive` resolves to `ActiveDirectoryIntegrated`, matching
+msodbcsql's `authMode` fall-through (`Parse.cpp:3657-3660`).
