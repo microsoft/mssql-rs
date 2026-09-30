@@ -174,16 +174,18 @@ pub enum TdsAuthenticationMethod {
     ActiveDirectoryWorkloadIdentity,
     /// Azure AD integrated authentication using current user's Kerberos ticket.
     ActiveDirectoryIntegrated,
-    /// Azure CLI (`az login`) credentials.
-    ActiveDirectoryAzCli,
-    /// Azure Developer CLI (`azd auth login`) credentials.
-    ActiveDirectoryAzureDeveloperCli,
-    /// Azure Pipelines workload identity federation via a service connection.
-    ActiveDirectoryAzurePipelines,
-    /// Credentials taken from the standard `AZURE_*` environment variables.
-    ActiveDirectoryEnvironment,
-    /// Confidential client authenticating with a signed client assertion.
-    ActiveDirectoryClientAssertion,
+    /// Entra ID bearer token acquired by the application's registered
+    /// [`EntraIdTokenFactory`] from a credential source this crate does not
+    /// model — Azure CLI, Azure Developer CLI, Azure Pipelines, the `AZURE_*`
+    /// environment variables, a signed client assertion, and so on.
+    ///
+    /// The source changes how the token is obtained, not what goes on the wire:
+    /// the server is told the same thing for every one of them, and the token is
+    /// requested from the factory when the server asks for it during login. So
+    /// the choice of source stays with the factory, and a new source needs no new
+    /// variant here. Unlike [`AccessToken`](Self::AccessToken), no token is
+    /// supplied up front.
+    ActiveDirectoryTokenCredential,
     /// Pre-acquired access token (bearer JWT).
     AccessToken,
 }
@@ -325,6 +327,16 @@ pub struct ClientContext {
     /// The override is a login identity, not a one-hop dial target, so it is
     /// reused for a LOGIN7 retry after a server routing redirect. With no
     /// override, each login uses the address of its current transport.
+    ///
+    /// It does not affect TLS. LOGIN7 is sent after the handshake, and the
+    /// certificate is validated against the dialled host, or
+    /// [`EncryptionOptions::host_name_in_cert`](crate::core::EncryptionOptions::host_name_in_cert)
+    /// when that is set. Through a tunnel the certificate names the real server,
+    /// not `localhost`, so a caller setting this override usually sets
+    /// `host_name_in_cert` to the same name as well — or pins the certificate
+    /// with [`EncryptionOptions::server_certificate`](crate::core::EncryptionOptions::server_certificate).
+    /// The two are kept separate because they answer different questions: which
+    /// name the server is asked for, and which name its certificate must carry.
     ///
     /// `None` writes the dialled address, which is the previous behaviour.
     pub login_server_name: Option<String>,

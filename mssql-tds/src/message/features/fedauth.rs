@@ -106,14 +106,10 @@ impl FedAuthFeature {
             TdsAuthenticationMethod::ActiveDirectoryWorkloadIdentity => {
                 Ok(active_directory_workload_identity)
             }
-            // Every remaining flow resolves to a bearer token out of band, so the
-            // server is told the same thing as for any other non-password credential.
+            // Both resolve to a bearer token out of band, so the server is told
+            // the same thing as for any other non-password credential.
             TdsAuthenticationMethod::ActiveDirectoryDefault
-            | TdsAuthenticationMethod::ActiveDirectoryAzCli
-            | TdsAuthenticationMethod::ActiveDirectoryAzureDeveloperCli
-            | TdsAuthenticationMethod::ActiveDirectoryAzurePipelines
-            | TdsAuthenticationMethod::ActiveDirectoryEnvironment
-            | TdsAuthenticationMethod::ActiveDirectoryClientAssertion => {
+            | TdsAuthenticationMethod::ActiveDirectoryTokenCredential => {
                 Ok(active_directory_token_credential)
             }
             TdsAuthenticationMethod::Password
@@ -243,18 +239,14 @@ mod unittests {
         assert!(feature.get_work_flow_identifier().is_err());
     }
 
-    /// Every credential that resolves to a bearer token out of band is announced
-    /// to the server the same way, so a new one must not silently fall through
-    /// to the unsupported arm.
+    /// A token acquired by the application's factory is announced to the server
+    /// exactly as `ActiveDirectoryDefault` is: which credential source the
+    /// factory uses is invisible on the wire.
     #[test]
     fn token_credential_flows_share_one_workflow_identifier() {
         for method in [
             TdsAuthenticationMethod::ActiveDirectoryDefault,
-            TdsAuthenticationMethod::ActiveDirectoryAzCli,
-            TdsAuthenticationMethod::ActiveDirectoryAzureDeveloperCli,
-            TdsAuthenticationMethod::ActiveDirectoryAzurePipelines,
-            TdsAuthenticationMethod::ActiveDirectoryEnvironment,
-            TdsAuthenticationMethod::ActiveDirectoryClientAssertion,
+            TdsAuthenticationMethod::ActiveDirectoryTokenCredential,
         ] {
             let name = format!("{method:?}");
             let feature = FedAuthFeature::new(method, None, false);

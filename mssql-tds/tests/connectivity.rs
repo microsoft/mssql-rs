@@ -78,11 +78,7 @@ mod connectivity {
             TdsAuthenticationMethod::ActiveDirectoryMSI => todo!(),
             TdsAuthenticationMethod::ActiveDirectoryWorkloadIdentity => todo!(),
             TdsAuthenticationMethod::ActiveDirectoryIntegrated => todo!(),
-            TdsAuthenticationMethod::ActiveDirectoryAzCli => todo!(),
-            TdsAuthenticationMethod::ActiveDirectoryAzureDeveloperCli => todo!(),
-            TdsAuthenticationMethod::ActiveDirectoryAzurePipelines => todo!(),
-            TdsAuthenticationMethod::ActiveDirectoryEnvironment => todo!(),
-            TdsAuthenticationMethod::ActiveDirectoryClientAssertion => todo!(),
+            TdsAuthenticationMethod::ActiveDirectoryTokenCredential => todo!(),
             TdsAuthenticationMethod::AccessToken => todo!(),
         };
 
