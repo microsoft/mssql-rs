@@ -214,9 +214,26 @@ impl ClientContextValidator for DefaultClientContextValidator {
             )));
         }
 
+        // MS-TDS caps each LOGIN7 variable-length field at 128 characters. This
+        // one comes straight from the caller, so reject rather than truncate: a
+        // truncated server name is a name the caller did not choose, and the
+        // server would otherwise fail the login with an opaque error.
+        if let Some(name) = &context.login_server_name
+            && name.encode_utf16().count() > MAX_LOGIN7_NAME_CHARS
+        {
+            return Err(Error::UsageError(format!(
+                "login_server_name is {} characters; LOGIN7 allows at most {}.",
+                name.encode_utf16().count(),
+                MAX_LOGIN7_NAME_CHARS
+            )));
+        }
+
         Ok(())
     }
 }
+
+/// Maximum length, in UTF-16 code units, of a LOGIN7 variable-length field.
+const MAX_LOGIN7_NAME_CHARS: usize = 128;
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -717,10 +734,13 @@ impl ClientContext {
     /// LOGIN7 stores this as an offset/length pair separate from the payload,
     /// so both must come from the same value — hence one accessor rather than
     /// two call sites reading the override independently. It borrows the
-    /// override rather than cloning it, since each call site only reads it.
+    /// override rather than cloning it, since each call site only reads it. An
+    /// empty override is treated as unset: it is far more likely an unset
+    /// configuration value than a request to send the server no name.
     pub(crate) fn login_server_name(&self, transport: &TransportContext) -> Cow<'_, str> {
         self.login_server_name
             .as_deref()
+            .filter(|name| !name.is_empty())
             .map(Cow::Borrowed)
             .unwrap_or_else(|| Cow::Owned(transport.get_login_server_name()))
     }
@@ -1865,10 +1885,36 @@ mod tests {
     fn login_server_name_override_is_not_reformatted() {
         let transport = TransportContext::from_routing_token("localhost".to_string(), 1433);
         let mut context = ClientContext::default();
-        for name in ["bare-name", "host\\INSTANCE", "host,9999", ""] {
+        for name in ["bare-name", "host\\INSTANCE", "host,9999"] {
             context.login_server_name = Some(name.to_string());
             assert_eq!(context.login_server_name(&transport), name);
         }
+    }
+
+    /// An empty override is almost always an unset configuration value, so it
+    /// falls back to the dialled address rather than sending an empty name.
+    #[test]
+    fn an_empty_login_server_name_falls_back_to_the_dialled_address() {
+        let transport = TransportContext::from_routing_token("localhost".to_string(), 1433);
+        let context = ClientContext {
+            login_server_name: Some(String::new()),
+            ..Default::default()
+        };
+        assert_eq!(context.login_server_name(&transport), "localhost,1433");
+    }
+
+    /// LOGIN7 caps the field at 128 characters; a longer override is rejected
+    /// up front instead of failing the login opaquely.
+    #[test]
+    fn a_login_server_name_over_the_login7_limit_is_rejected() {
+        let mut context = ClientContext {
+            login_server_name: Some("n".repeat(MAX_LOGIN7_NAME_CHARS)),
+            ..Default::default()
+        };
+        assert!(context.validate().is_ok());
+
+        context.login_server_name = Some("n".repeat(MAX_LOGIN7_NAME_CHARS + 1));
+        assert!(matches!(context.validate(), Err(Error::UsageError(_))));
     }
 
     #[test]

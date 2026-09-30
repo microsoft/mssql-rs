@@ -43,7 +43,6 @@ async fn login_server_name_on_the_wire(override_name: Option<&str>) -> String {
     let handle = tokio::spawn(async move {
         let _ = server.run_with_shutdown(shutdown_rx).await;
     });
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
     let mut context = test_context();
     context.login_server_name = override_name.map(str::to_string);
