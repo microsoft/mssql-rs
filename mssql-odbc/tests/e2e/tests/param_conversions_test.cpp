@@ -3063,7 +3063,7 @@ TEST_F(ExtendedTypeLiveTest, BinaryVariantRoundTripsThroughASqlVariantColumn) {
 // Selection rule, so this is not read as exhaustive: one cell per distinct
 // bitmap row reached by a C type this driver already binds, plus the SS_TIME2
 // mirrors of the SS_TIMESTAMPOFFSET pair, which share a row and are the ones
-// most likely to drift when AB#48249 lands. It is a sample, not the full table.
+// most likely to drift when AB#48249 lands.
 //
 // EVIDENCE: the source reading above, plus a direct measurement against retail
 // msodbcsql18 18.6.2.1 (`SQL_DRIVER_VER` 18.06.0002) on 2026-09-29.

@@ -302,6 +302,7 @@ TEST_F(BinaryFetchLiveTest, LargeGeometryChunksAcrossCalls) {
         // The indicator reports what was left before the call, so the last one
         // is the size of the final chunk.
         const SQLLEN chunk = (rc == SQL_SUCCESS) ? ind : static_cast<SQLLEN>(sizeof(buf));
+        ASSERT_LE(chunk, static_cast<SQLLEN>(sizeof(buf))) << "final chunk overruns the buffer";
         assembled.insert(assembled.end(), buf, buf + chunk);
         delivered += chunk;
     }

@@ -1409,6 +1409,64 @@ mod tests {
         assert_eq!(ds.active_stmt, None);
     }
 
+    // Pins the branch `ATempTableParameterCannotBeDescribedButStillBinds` can
+    // only observe by outcome: a server error token reaching `fail_with_tds`,
+    // and the connection coming back unclaimed so the next call can use it.
+    #[test]
+    fn a_server_error_during_describe_returns_the_connection_for_reuse() {
+        use crate::handles::dbc::DbcHandle;
+        use mssql_tds::test_client_support::{done_no_more, sql_error, tds_client_from_tokens};
+
+        let h = TestHandles::with_env_dbc_stmt();
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        // 11529 is what the server answers when it cannot determine parameter
+        // metadata, which is how the temp-table case fails in practice.
+        let client = tds_client_from_tokens(vec![
+            sql_error(11529, 16, "no metadata could be determined"),
+            done_no_more(),
+        ]);
+        {
+            let mut ds = dbc.inner.lock().unwrap();
+            ds.client = Some(client);
+        }
+
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.prepared = Some(crate::handles::stmt::PreparedPlan {
+                stmt: PreparedStatement::new("SELECT @P1".to_string()),
+                marker_count: 1,
+                original_sql: String::new(),
+            });
+        }
+
+        let rc = unsafe {
+            sql_describe_param(
+                h.stmt,
+                1,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(rc, SQL_ERROR);
+
+        let ss = stmt.inner.lock().unwrap();
+        assert!(
+            ss.diag_records
+                .iter()
+                .any(|d| d.message.contains("no metadata could be determined"))
+        );
+        assert!(!ss.has_state(STMT_STATE_EXEC_STARTED));
+        drop(ss);
+
+        let ds = dbc.inner.lock().unwrap();
+        assert!(ds.client.is_some(), "the client must come back for reuse");
+        assert_eq!(ds.active_stmt, None);
+    }
+
     #[test]
     fn parses_mssql_python_integer_metadata() {
         let (_, description, _) =

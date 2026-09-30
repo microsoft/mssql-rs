@@ -318,8 +318,10 @@ TEST_F(DescribeParamLiveTest, DescribedDecimalRoundTripsPrecisionAndScale) {
 // Benefits-from-mock-tds: this can only observe the outcome - SQL_ERROR, then a
 // later execute that works. A byte-level mock could assert what the outcome
 // implies but does not prove: that sp_describe_undeclared_parameters actually
-// went out, and that its server-error response was fully drained before the
-// statement and connection were reused.
+// went out. The error-token half is pinned meanwhile by
+// `a_server_error_during_describe_returns_the_connection_for_reuse` in
+// `describe_param.rs`, which drives `fail_with_tds` from a server error and
+// asserts the connection comes back unclaimed.
 TEST_F(DescribeParamLiveTest, ATempTableParameterCannotBeDescribedButStillBinds) {
     ExecDirect("CREATE TABLE #dp_tmp (id INT, data VARBINARY(32))");
     ASSERT_SQL_OK(Prepare("INSERT INTO #dp_tmp (id, data) VALUES (?, ?)"), SQL_HANDLE_STMT,
