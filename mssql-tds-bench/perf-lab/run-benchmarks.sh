@@ -324,6 +324,15 @@ BASELINE_TREE="$(mktemp -d)/perf-baseline"
 echo ">>> Adding baseline worktree for ${BASELINE_COMMIT} at ${BASELINE_TREE}..."
 git worktree add --detach "$BASELINE_TREE" "$BASELINE_COMMIT"
 echo ">>> Building baseline bench binaries (target-base/)..."
+# A stash here means an earlier run died before restoring (only reachable outside the
+# lab, where the VM is rebuilt per run). Refuse rather than proceed: `mv` moves INTO an
+# existing directory, so the live source would nest inside the stale stash and the
+# restore would then put the stale tree back with exit 0 — silent corruption.
+if [ -e "$REPO_ROOT/.mssql-tds-candidate" ]; then
+    echo "ERROR: $REPO_ROOT/.mssql-tds-candidate already exists — an earlier run did not finish restoring." >&2
+    echo "       Move the real mssql-tds source back out of it, remove it, then re-run." >&2
+    exit 1
+fi
 # Arm the cleanup BEFORE the swap. swap_to_baseline is itself fallible (the version
 # stamping can exit non-zero), and from the moment the source moves, any exit would
 # otherwise leave mssql-tds/ holding the baseline copy with the candidate stranded in

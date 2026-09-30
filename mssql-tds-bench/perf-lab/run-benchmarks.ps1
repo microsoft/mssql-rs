@@ -492,6 +492,13 @@ if ($script:CandBins.Count -eq 0) { throw 'no candidate bench binaries found' }
 Write-Host ">>> Adding baseline worktree for $BaselineCommit at $BaselineTree..."
 Invoke-Native { git worktree add --detach $BaselineTree $BaselineCommit }
 Write-Host '>>> Building baseline bench binaries (target-base/)...'
+# A stash here means an earlier run died before restoring (only reachable outside the
+# lab, where the VM is rebuilt per run). Refuse rather than proceed: Move-Item moves
+# INTO an existing directory, so the live source would nest inside the stale stash and
+# the restore would then put the stale tree back without throwing - silent corruption.
+if (Test-Path -LiteralPath $StashedSrc) {
+    throw "$StashedSrc already exists - an earlier run did not finish restoring. Move the real mssql-tds source back out of it, remove it, then re-run."
+}
 # Set-BaselineSource runs INSIDE the try: it is itself fallible (the version stamping
 # can throw), and from the moment the source moves, any throw must still reach the
 # finally. Restore-CandidateSource is a no-op until the stash exists.
