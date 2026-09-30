@@ -3035,12 +3035,10 @@ TEST_F(ExtendedTypeLiveTest, BinaryVariantRoundTripsThroughASqlVariantColumn) {
 }
 
 // Conversion-matrix cells msodbcsql performs and this driver has not
-// implemented yet. The first six were measured against msodbcsql18 on
-// 2026-09-29: every one binds, and all but TIMESTAMP->TYPE_DATE also execute
-// (that one binds and then fails at execute, because dropping a non-zero time
-// is an error, not a truncation). The two SS_TIME2 rows are derived, not
-// measured - they share the DATETIMECONVERSION row with the TSOFFSET pair
-// above.
+// implemented yet. All eight were measured against msodbcsql18: every one
+// binds, and all but TIMESTAMP->TYPE_DATE also execute (that one binds and then
+// fails at execute with 22008, because dropping a non-zero time is an error,
+// not a truncation).
 //
 // msodbcsql accepts them at SQLBindParameter (`sqlcdesc.cpp:3031`), which folds
 // the 3.x concise C/SQL ids to their 2.x and *_MAPPED forms first (`:2975-2983`)
@@ -3065,8 +3063,12 @@ TEST_F(ExtendedTypeLiveTest, BinaryVariantRoundTripsThroughASqlVariantColumn) {
 // mirrors of the SS_TIMESTAMPOFFSET pair, which share a row and are the ones
 // most likely to drift when AB#48249 lands.
 //
-// EVIDENCE: the source reading above, plus a direct measurement against retail
-// msodbcsql18 18.6.2.1 (`SQL_DRIVER_VER` 18.06.0002) on 2026-09-29.
+// EVIDENCE: the source reading above, plus a direct measurement of all eight
+// cells against retail msodbcsql18 18.6.2.1 (`SQL_DRIVER_VER` 18.06.0002) - the
+// build `msodbcsqlVersion` pins - on 2026-09-29, the six original cells, and
+// 2026-09-30, the two SS_TIME2 mirrors. A 3.8 application is required: the
+// Driver Manager refuses the SS-extended C types with HY003 under SQL_OV_ODBC3,
+// so a probe that declares only 3.x measures the DM, not the driver.
 // SKIP_IF_COMPARING_MSODBCSQL() means the reference leg never re-measures this
 // block, so AB#48249 should re-measure against the build it targets rather than
 // inherit a one-off observation.
