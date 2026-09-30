@@ -131,8 +131,10 @@ instead of `HYC00`.
 - **Zero `ColumnSize` on `char`/`nchar`/`binary`** -- *matches* msodbcsql for
   ODBC 3.x applications. `CheckSqlPrec` (`sqlcdesc.cpp`) treats a zero precision
   as invalid and returns `HY104`, clamping to the maximum only for a 2.x
-  application (`IS2xAPP`). We report the same `HY104`, at execute rather than at
-  bind. `varchar`/`nvarchar` accept zero and widen to `max`, which also matches:
+  application (`IS2xAPP`). We report the same `HY104` in the same phase, from
+  `SQLBindParameter` through `parameter_column_size_is_valid`; `typed_null` and
+  `fixed_length` keep their own checks as a backstop. `varchar`/`nvarchar`
+  accept zero and widen to `max`, which also matches:
   msodbcsql skips precision validation entirely for `SQL_VARCHAR`/`SQL_WVARCHAR`
   (`sqlcmisc.cpp`) and uses the data length instead.
 - **Unbounded sizes reported as `0`** -- matches msodbcsql 18.6.2.1. Its
