@@ -966,8 +966,13 @@ fn finish_get_data(
     // A row's column was genuinely captured to reach this point (`ready`
     // requires it), so a row was always delivered here — unlike
     // `fetch_scroll.rs`'s zero-row fetch case.
-    release_busy_if_row_exhausted(dbc, stmt, statement_handle, client, true);
-    rc
+    let (has_server_info, _) =
+        release_busy_if_row_exhausted(dbc, stmt, statement_handle, client, |_| false);
+    if rc == SQL_SUCCESS && has_server_info {
+        SQL_SUCCESS_WITH_INFO
+    } else {
+        rc
+    }
 }
 
 /// The C type a `SQL_C_DEFAULT` retrieval of `col_index` names, taken from the
@@ -3893,7 +3898,10 @@ mod tests {
     use crate::test_support::TestHandles;
     use mssql_tds::datatypes::sql_string::SqlString;
     use mssql_tds::datatypes::sqldatatypes::TdsDataType;
-    use mssql_tds::test_client_support::{int_columns, tds_client_from_int_rows};
+    use mssql_tds::test_client_support::{
+        done_select_no_more, info, int_columns, tds_client_from_int_rows,
+        tds_client_from_int_rows_with_trailing_tokens,
+    };
 
     thread_local! {
         static FAIL_TYPED_PLP_RESERVE_AFTER: std::cell::Cell<Option<usize>> =
@@ -5064,6 +5072,249 @@ mod tests {
         let mut state = dbc.inner.lock().unwrap();
         state.client = Some(client);
         state.active_stmt = Some(h.stmt);
+    }
+
+    #[test]
+    fn terminal_info_promotes_clean_get_data_success() {
+        let h = TestHandles::with_env_dbc_stmt();
+        {
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let mut state = stmt.inner.lock().unwrap();
+            state.set_state(STMT_STATE_CURSOR_OPEN);
+            state.column_metadata = int_columns(1);
+            state.row_positioned = true;
+        }
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let mut client = tds_client_from_int_rows_with_trailing_tokens(
+            vec![vec![7]],
+            vec![
+                info(8153, 10, "Null value is eliminated by an aggregate."),
+                done_select_no_more(),
+            ],
+        );
+        dbc.runtime
+            .block_on(client.execute("SELECT 7;".to_string(), ()))
+            .unwrap();
+        assert!(dbc.runtime.block_on(client.next_row_cursor()).unwrap());
+        {
+            let mut state = dbc.inner.lock().unwrap();
+            state.client = Some(client);
+            state.active_stmt = Some(h.stmt);
+        }
+
+        let mut value = 0_i32;
+        let mut indicator = 0;
+        let rc = unsafe {
+            sql_get_data(
+                h.stmt,
+                1,
+                SQL_C_SLONG,
+                (&mut value as *mut i32).cast(),
+                0,
+                &mut indicator,
+            )
+        };
+        assert_eq!(rc, SQL_SUCCESS_WITH_INFO, "SQLGetData diagnostics: {:?}", {
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            stmt.inner.lock().unwrap().diag_records.clone()
+        });
+        assert_eq!((value, indicator), (7, 4));
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(state.diag_records.len(), 1);
+        assert_eq!(state.diag_records[0].sql_state, *b"01003");
+        assert_eq!(state.diag_records[0].native_error, 8153);
+    }
+
+    #[test]
+    fn terminal_info_preserves_existing_get_data_return_codes() {
+        for expected in [SQL_SUCCESS_WITH_INFO, SQL_ERROR] {
+            let h = TestHandles::with_env_dbc_stmt();
+            {
+                let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+                let mut state = stmt.inner.lock().unwrap();
+                state.column_metadata = int_columns(1);
+                state.current_row_last_col = 1;
+            }
+            h.mark_dbc_connected();
+            let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+            let mut client = tds_client_from_int_rows_with_trailing_tokens(
+                vec![vec![7]],
+                vec![info(8153, 10, "terminal warning"), done_select_no_more()],
+            );
+            dbc.runtime
+                .block_on(client.execute("SELECT 7;".to_string(), ()))
+                .unwrap();
+            assert!(dbc.runtime.block_on(client.next_row_cursor()).unwrap());
+            {
+                let mut state = dbc.inner.lock().unwrap();
+                state.client = Some(client);
+                state.active_stmt = Some(h.stmt);
+            }
+
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let state = stmt.inner.lock().unwrap();
+            let rc = finish_get_data(stmt, h.stmt, state, 1, expected);
+
+            assert_eq!(rc, expected);
+            let state = stmt.inner.lock().unwrap();
+            assert_eq!(state.diag_records.len(), 1);
+            assert_eq!(state.diag_records[0].sql_state, *b"01003");
+            assert_eq!(state.diag_records[0].native_error, 8153);
+        }
+    }
+
+    /// `finish_get_data` is reached with a literal `SQL_SUCCESS` from the PLP
+    /// completion arm too — the final chunk of a streamed long-data read, not
+    /// just the fixed-scalar arms the other terminal-INFO tests cover. That
+    /// return is what a classic chunking loop
+    /// (`while (rc == SQL_SUCCESS_WITH_INFO) SQLGetData(...)`) reads as
+    /// "truncated, call again", so promoting it has to stay safe: the state is
+    /// `01003`, not the `01004` that means truncation, and a loop driven by the
+    /// return code alone makes one further call that ends on `SQL_NO_DATA`.
+    #[test]
+    fn terminal_info_promotes_a_completed_plp_read() {
+        use mssql_mock_tds::{
+            ColumnDefinition, ColumnValue, InfoMessage, QueryResponse, Row, SqlDataType,
+        };
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        // One column only: the release peek needs every column of the row read,
+        // so a trailing scalar would keep the claim and never reach the INFO.
+        let response = QueryResponse::new(
+            vec![ColumnDefinition::new("value", SqlDataType::NVarCharMax)],
+            vec![Row::new(vec![ColumnValue::NVarCharMax(vec![vec![
+                0x41, 0x42, 0x43,
+            ]])])],
+        );
+        let _server = crate::test_support::connect_mock_server_with_trailing_info(
+            dbc,
+            "SELECT plp_info",
+            response,
+            vec![InfoMessage::new(
+                8153,
+                10,
+                "Null value is eliminated by an aggregate.",
+            )],
+        );
+        let sql: Vec<u16> = "SELECT plp_info\0".encode_utf16().collect();
+        assert_eq!(
+            unsafe { crate::api::exec_direct::sql_exec_direct_w(h.stmt, sql.as_ptr(), SQL_NTS) },
+            SQL_SUCCESS
+        );
+        assert_eq!(unsafe { crate::api::fetch::sql_fetch(h.stmt) }, SQL_SUCCESS);
+
+        // Buffer sized to hold the whole value plus its terminator, so this
+        // call completes the stream rather than truncating it.
+        let mut buffer = [0_u8; 16];
+        let mut indicator = -99;
+        let rc = unsafe {
+            sql_get_data(
+                h.stmt,
+                1,
+                SQL_C_CHAR,
+                buffer.as_mut_ptr().cast(),
+                buffer.len() as SqlLen,
+                &mut indicator,
+            )
+        };
+        assert_eq!(
+            rc, SQL_SUCCESS_WITH_INFO,
+            "the completed PLP read must carry the terminal INFO"
+        );
+        assert_eq!(&buffer[..3], b"ABC");
+
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let state = stmt.inner.lock().unwrap();
+            assert_eq!(state.diag_records.len(), 1);
+            assert_eq!(
+                state.diag_records[0].sql_state, *b"01003",
+                "01003, not the 01004 a chunking loop would read as truncation"
+            );
+            assert_eq!(state.diag_records[0].native_error, 8153);
+        }
+
+        // What a `while (rc == SQL_SUCCESS_WITH_INFO)` loop does next: one more
+        // call, which must terminate the loop rather than re-reading the value.
+        let mut tail = [0_u8; 16];
+        let mut tail_indicator = -99;
+        assert_eq!(
+            unsafe {
+                sql_get_data(
+                    h.stmt,
+                    1,
+                    SQL_C_CHAR,
+                    tail.as_mut_ptr().cast(),
+                    tail.len() as SqlLen,
+                    &mut tail_indicator,
+                )
+            },
+            SQL_NO_DATA,
+            "the chunking loop must terminate on the next call"
+        );
+    }
+
+    /// The terminal-column `SQLGetData` promotion must also hold with a second
+    /// result set pending: the peek consumes the INFO before this result set's
+    /// DONE, so this call owns it even though the claim is kept.
+    #[test]
+    fn terminal_info_before_a_second_result_promotes_get_data_success() {
+        use mssql_tds::test_client_support::{col_metadata_empty, done_more};
+
+        let h = TestHandles::with_env_dbc_stmt();
+        {
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let mut state = stmt.inner.lock().unwrap();
+            state.set_state(STMT_STATE_CURSOR_OPEN);
+            state.column_metadata = int_columns(1);
+            state.row_positioned = true;
+        }
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let mut client = tds_client_from_int_rows_with_trailing_tokens(
+            vec![vec![7]],
+            vec![
+                info(8153, 10, "Null value is eliminated by an aggregate."),
+                done_more(),
+                col_metadata_empty(),
+                done_select_no_more(),
+            ],
+        );
+        dbc.runtime
+            .block_on(client.execute("SELECT 7; SELECT 1;".to_string(), ()))
+            .unwrap();
+        assert!(dbc.runtime.block_on(client.next_row_cursor()).unwrap());
+        {
+            let mut state = dbc.inner.lock().unwrap();
+            state.client = Some(client);
+            state.active_stmt = Some(h.stmt);
+        }
+
+        let mut value = 0_i32;
+        let mut indicator = 0;
+        let rc = unsafe {
+            sql_get_data(
+                h.stmt,
+                1,
+                SQL_C_SLONG,
+                (&mut value as *mut i32).cast(),
+                0,
+                &mut indicator,
+            )
+        };
+        assert_eq!(
+            rc, SQL_SUCCESS_WITH_INFO,
+            "the warning belongs to this SQLGetData, not to a later SQLMoreResults"
+        );
+        assert_eq!(value, 7);
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(state.diag_records.len(), 1);
+        assert_eq!(state.diag_records[0].sql_state, *b"01003");
+        assert_eq!(state.diag_records[0].native_error, 8153);
     }
 
     #[test]

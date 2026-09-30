@@ -470,16 +470,13 @@ impl DescRecord {
             SQL_C_BINARY, SQL_C_CHAR, SQL_C_FLOAT, SQL_C_GUID, SQL_C_INTERVAL_DAY_TO_SECOND,
             SQL_C_INTERVAL_HOUR_TO_SECOND, SQL_C_INTERVAL_MINUTE_TO_SECOND, SQL_C_INTERVAL_SECOND,
             SQL_C_INTERVAL_YEAR, SQL_C_NUMERIC, SQL_C_SS_TIME2, SQL_C_SS_TIMESTAMPOFFSET,
-            SQL_C_TYPE_TIME, SQL_C_TYPE_TIMESTAMP, SQL_DECIMAL, SQL_FLOAT, SQL_LONGVARBINARY,
-            SQL_LONGVARCHAR, SQL_PREC_NUMERIC, SQL_VARBINARY, SQL_VARCHAR,
+            SQL_C_TYPE_TIME, SQL_C_TYPE_TIMESTAMP, SQL_PREC_NUMERIC,
         };
 
         let (length, precision, scale): (SqlULen, SqlSmallInt, SqlSmallInt) = match c_type {
-            SQL_C_CHAR | SQL_VARCHAR | SQL_LONGVARCHAR | SQL_C_BINARY | SQL_VARBINARY
-            | SQL_LONGVARBINARY => (1, 1, self.scale),
+            SQL_C_CHAR | SQL_C_BINARY => (1, 1, self.scale),
             SQL_C_GUID => (16, 16, self.scale),
-            SQL_C_NUMERIC | SQL_DECIMAL => (38, SQL_PREC_NUMERIC, 0),
-            SQL_FLOAT => (53, 53, self.scale),
+            SQL_C_NUMERIC => (38, SQL_PREC_NUMERIC, 0),
             SQL_C_FLOAT => (24, 24, self.scale),
             SQL_C_TYPE_TIME | SQL_C_TYPE_TIMESTAMP | SQL_C_SS_TIME2 | SQL_C_SS_TIMESTAMPOFFSET => {
                 (self.length, 7, 7)

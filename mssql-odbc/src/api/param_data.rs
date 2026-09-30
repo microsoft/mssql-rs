@@ -281,14 +281,21 @@ fn sql_param_data_safe(
                         carry.extend_from_slice(&pending);
                         let out = transcode.finish(&mut carry);
                         dae.progress.carry = carry;
-                        out
+                        (out.bytes, out.had_loss)
                     }
-                    None => std::mem::take(&mut pending),
+                    None => (std::mem::take(&mut pending), false),
                 }
             })
             .unwrap_or_default();
         (client, trailing)
     };
+    let (trailing, tail_had_loss) = trailing;
+
+    // As in `SQLPutData`: recorded on the connection and reported when the
+    // statement completes, not from this call.
+    if tail_had_loss {
+        client.note_code_page_conversion_loss();
+    }
 
     if !trailing.is_empty()
         && let Err(e) = dbc.runtime.block_on(client.write_streamed_chunk(&trailing))

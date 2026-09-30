@@ -569,7 +569,140 @@ msodbcsql build is measured.
     covered by unit tests and shares `variant_column_size`, but no comparison
     run records msodbcsql's SQLSTATE for an oversized character `sql_variant`;
     do not infer that half from this entry.
-21. **A `SQL_C_NUMERIC` parameter never writes to the application's struct.**
+21. **A character the target code page cannot represent is always substituted
+    with `?`; msodbcsql best-fit maps many of them.** Both drivers substitute
+    rather than reject, and agree on `0x3F` for a character with no mapping at
+    all. They differ on the characters Windows NLS can *transliterate*:
+    msodbcsql converts through `SystemLocale::FromUtf16` →
+    `WideCharToMultiByte(cp, 0, ...)` (`Common/include/LocalizationImpl.hpp:1442`),
+    where `dwFlags = 0` leaves best-fit mapping on and a best-fit result does
+    not even set the `lpUsedDefaultChar` loss flag. `encoding_rs` is a strict
+    WHATWG encoder with no best-fit tables. Measured under
+    `SQL_Latin1_General_CP1_CI_AS` — `WideCharToMultiByte` and the engine's own
+    `CAST(N'…' AS varchar)` agree on every row:
+
+    | Input | msodbcsql / engine | This driver |
+    |---|---|---|
+    | `Ā` U+0100, `Ć` U+0106, `ě` U+011B, `Ł` U+0141, `‐` U+2010 | `A` `C` `e` `L` `-`, no loss flag | `?` |
+    | `日` U+65E5 | `?`, loss flag set | `?` |
+    | `€` U+20AC (in CP1252) | `0x80` | `0x80` |
+
+    So the deviation is confined to characters with a best-fit mapping but no
+    true code-page representation — Latin Extended-A, General Punctuation.
+    Polish, Czech, Croatian, Turkish and Baltic text bound to a CP1252
+    `varchar` transliterates on msodbcsql and becomes `?` here.
+
+    **Not CP1252-specific.** Measured on the DBCS and OEM code pages too:
+    `WideCharToMultiByte(932, ...)` substitutes `U+0141` (`3F`, loss flag set)
+    while glibc `iconv -t CP932//TRANSLIT` best-fits it to `4C`, and CP437
+    best-fits it to `4C` on Windows. The table above is CP1252 because that is
+    where the application impact is widest, not because the behaviour is
+    confined to it.
+
+    **Not replicated because msodbcsql has no single behaviour to replicate.**
+    Its non-Windows legs take transliteration from `iconv`: `cp_iconv::g_cp_iconv`
+    appends `//TRANSLIT` (`LocalizationImpl.hpp:59`), which glibc honours with
+    its own table and which is compiled out entirely under musl
+    (`#define TRANSLIT ""`, `:51`). `Ł` is therefore `L` on Windows, `L` from a
+    possibly different table on glibc, and `?` on musl — one driver, one
+    version. Matching the Windows column would mean shipping and maintaining
+    per-code-page best-fit tables in `mssql-tds` (`encoding_rs` will not supply
+    them; `WideCharToMultiByte` is Windows-only) to chase a behaviour the
+    reference driver does not hold stable across its own platforms. The `?` we
+    emit is the musl leg's answer and the ODBC specification's substitution
+    wording.
+
+    **The same platform split decides the substitution *width* for an astral
+    character.** Windows converts per UTF-16 code unit, so `U+1F600` becomes two
+    `0x3F` bytes; so does the engine
+    (`DATALENGTH(CAST(N'😀' AS varchar(4)))` is 2). **Measured on glibc 2.35
+    (Ubuntu 22.04, the CI container's base): one byte.**
+    `iconv -f UTF-16LE -t CP1252//TRANSLIT` emits a single `3f`, because
+    `//TRANSLIT` makes iconv itself resolve the character and msodbcsql's own
+    per-`WCHAR` `EILSEQ` loop (`Globalization.h`, `SkipSingleCh` + `AddDefault`)
+    never runs.
+
+    **musl is not measured.** `TRANSLIT` is empty there (`:51`), so iconv should
+    instead return `EILSEQ` and hand the character back to that per-`WCHAR`
+    loop — a different mechanism, and therefore possibly a different width. The
+    claim here is deliberately limited to the leg that was measured; do not
+    infer musl's byte count from this entry, and measure it before relying on
+    one either way.
+
+    This driver follows the Windows and engine answer, which is also the one
+    that cannot let a `varchar(n)` accept a string those two reject, and it does
+    so identically on every platform.
+    `AstralUnmappableCharacterSubstitutesPerUtf16Unit` carries
+    `SKIP_IF_COMPARING_MSODBCSQL()` for the glibc leg.
+
+    Second-order consequence: under `SQL_COPT_SS_WARN_ON_CP_ERROR` (entry 22)
+    we warn for a best-fit character where msodbcsql would not, since it does
+    not count a best-fit result as loss.
+
+    Distinct from the AB#47598 defect this entry is the residue of, where
+    `encoding_rs`'s WHATWG *form-submission* semantics emitted a numeric
+    character reference — `U+65E5` as the eight ASCII bytes `&#26085;`, markup
+    stored in place of the value and one character counted as eight against the
+    column — behind only a `tracing::warn!`. `BestFitMappableCharacterDeviates`
+    carries `SKIP_IF_COMPARING_MSODBCSQL()` and pins the disagreement;
+    `UnmappableCharacterIsSubstituted` and its siblings run unskipped on the
+    rows both drivers agree on. Tracked in AB#47598.
+
+    **Human parity sign-off has not been recorded.** This entry describes an
+    application-visible regression against msodbcsql — Polish, Czech, Croatian,
+    Turkish and Baltic text bound to a CP1252 `varchar` transliterates there and
+    is substituted here — so the registry's "who signed off and when" applies.
+    The decision is evidenced (measured three ways, with the musl leg explicitly
+    unmeasured) but not approved; record the approver and date in AB#47598
+    before relying on this entry as settled.
+
+22. **`SQL_COPT_SS_WARN_ON_CP_ERROR` reports code-page loss on input
+    parameters; msodbcsql reports it only on retrieval.** msodbcsql posts
+    `IDS_01_000_16` ("Warning: Code page translation caused loss of data",
+    SQLSTATE `01000` via `cli_common/src/clntcomn.cpp:1183`) from exactly two
+    sites, both in `odbc/sqlcdata.h`: the output-parameter arm (`:1297`) and the
+    column arm (`:1310`). The input-parameter paths discard the loss flag
+    outright — `Xlat(..., TOSERVER, NULL, ...)` at `odbc/sqlcmisc.cpp:7364` and
+    `odbc/sqlccnvt.cpp:995`, and `FromUtf16(..., NULL)` at
+    `odbc/sqlccmd.cpp:10975`. With the attribute on and an unmappable bound
+    parameter, msodbcsql returns `SQL_SUCCESS` and posts nothing; this driver
+    returns `SQL_SUCCESS_WITH_INFO` and posts `01000`.
+
+    Taken because the retrieval direction msodbcsql instruments cannot lose
+    anything here: this driver's `SQL_C_CHAR` is UTF-8 (entry 3), so any
+    character the server sends has a representation in the target buffer and
+    there is nothing to substitute. Applying the attribute to the direction
+    where loss actually occurs keeps it meaningful rather than inert. The
+    substitution itself is silent by default on both drivers, so an application
+    that never sets the attribute cannot tell them apart.
+
+    Four tests carry `SKIP_IF_COMPARING_MSODBCSQL()` for this entry:
+    `UnmappableCharacterWarnsWhenAsked`,
+    `DataAtExecutionUnmappableCharacterWarnsWhenAsked` and
+    `DataAtExecutionTruncatedTailWarnsWhenAsked` in
+    `param_char_conversions_test.cpp`, and `ArrayUnmappableCharacterWarnsWhenAsked`
+    in `param_array_test.cpp`. The substitution they sit alongside is asserted
+    unskipped by `UnmappableCharacterIsSubstituted` and
+    `DataAtExecutionUnmappableCharacterIsSubstituted`.
+
+    `ArrayUnmappableCharacterWarnsWhenAsked` carries a second obligation worth
+    recording here: its follow-up statement, asserting plain `SQL_SUCCESS` on a
+    value with nothing unmappable, is the only assertion in the suite that
+    catches a missing `take_code_page_conversion_loss` in
+    `finish_parameter_array` — an undrained verdict would warn again on an
+    unrelated statement. Tracked in AB#47598.
+
+    **Value validation matches, with one measured exception.** msodbcsql
+    rejects anything but `SQL_WARN_NO`/`SQL_WARN_YES` with `HY024`
+    (`odbc/sqlcmisc.cpp:2473`), and so does this driver. Measured on retail
+    18.6.2.1: `SQLSetConnectAttr(dbc, 1243, (SQLPOINTER)7, 0)` answers `HY024`
+    after connect but is **accepted silently before** connect — the
+    `pAttributeValue > SQL_IS_ON` check at `odbc/dbcinfotoken.cpp:171` guards a
+    path `SQLSetConnectAttr` does not reach pre-connect. This driver validates
+    in both states; silently storing an out-of-range value is not behaviour
+    worth reproducing.
+
+23. **A `SQL_C_NUMERIC` parameter never writes to the application's struct.**
     When the APD precision/scale differ from the IPD's, msodbcsql copies the
     APD values into the bound `SQL_NUMERIC_STRUCT`'s `precision` and `scale`
     before converting (`sqlcfunc.cpp:3165-3176`), so an application reading its

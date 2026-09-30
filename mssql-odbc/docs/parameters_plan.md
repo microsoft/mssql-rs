@@ -456,16 +456,37 @@ guesswork - so it belongs with AB#47584 rather than as a local patch.
 
 **This is a behavioural regression for a subset of inputs, not a pure
 improvement.** `SQL_C_CHAR` `"[three U+2615]"` into `varchar(3)` was a correct
-`22001` under the byte count; it is now accepted as three units and fails
-downstream as an opaque `HY000` - or, under a single-byte collation, each
-character is unmappable and becomes a seven-byte numeric character reference
-(`&#9749;`, AB#47598), so 21 bytes are offered to a `varchar(3)`. CJK and astral
-input bound with an exact character count is the shape that regresses. The trade
-was taken because over-rejection has no application workaround - the byte count
-is encoding-dependent and the application cannot know it - while under-rejection
-still errors, and because byte-counting *both* C types would have broken the
-wide arm, the one msodbcsql gets right. No option preserved both parity and
-self-consistency.
+`22001` under the byte count; it is now accepted as three units, and what
+happens next depends on whether the target collation can represent the
+character:
+
+- **Representable** (a `_UTF8` collation, where each U+2615 is three bytes): the
+  value is over-long, and it fails downstream as an opaque `HY000` from
+  `serialize_char_varchar_direct` - or, on a `max` or `text`/`ntext` target, is
+  sent over-long with no check at all.
+- **Unmappable** (a single-byte collation, and the DBCS ones too - U+2615 has no
+  CP932 or GBK representation): each character becomes a single `?`
+  (AB#47598), so three bytes reach a `varchar(3)`, the value fits, and the
+  statement **succeeds** with the data altered.
+
+  A DBCS collation lands here rather than above *for this input*. It is the
+  encoding that decides, not the code-page family: a character a DBCS page can
+  hold takes two bytes and goes over-long like the `_UTF8` case, which is what
+  `SerializationFailureAfterAFlushLeavesTheConnectionUsable` exercises with
+  U+3042.
+
+CJK and astral input bound with an exact character count is the shape that
+regresses. The trade was taken because over-rejection has no application
+workaround - the byte count is encoding-dependent and the application cannot
+know it - while under-rejection still errors *for the representable case*, and
+because byte-counting *both* C types would have broken the wide arm, the one
+msodbcsql gets right. No option preserved both parity and self-consistency.
+
+The unmappable case is the one where under-rejection no longer errors, and it
+is not a new data-altering path: substitution is what msodbcsql and the engine
+both do, and `SQL_COPT_SS_WARN_ON_CP_ERROR` is how an application detects it
+(parity-deviations entries 21 and 22). What AB#47584 inherits is the length
+unit, not the substitution.
 
 Verified against msodbcsql source:
 
@@ -797,17 +818,26 @@ Consequences worth knowing before extending this:
   rules, so an offset can move a value onto another day, and can push a
   midnight literal off midnight and make a `date` target report `22008`.
 
-One open item, new surface rather than new behaviour - the parser has always
-been this permissive, but until AB#47851 only fetch could reach it, and fetch
-consumes server-rendered text that never takes these shapes:
+**AB#47246: `YYYY/MM/DD` and ODBC temporal escapes are supported** by the
+shared `parse_datetime_literal`, for character parameters and character-column
+fetches. Slash dates require `YYYY/MM/DD` without a time. Escapes use
+case-insensitive `d`, `t`, or `ts`, matching quotes/braces, fixed-width numeric
+fields and optional ASCII whitespace between tokens. `{d}` requires a dash
+date, `{t}` requires whole seconds, and `{ts}` requires a dash date and time,
+with an optional fraction of up to nine digits (including an empty fraction).
+Escapes do not accept offsets, ISO `T` separators, unpadded fields, or a payload
+inconsistent with their keyword. Existing permissive plain-text forms are
+unchanged. Target-specific conversion and error rules still apply after parsing.
 
-- **`YYYY/MM/DD` and the ODBC escape literals** (`{d '...'}`, `{ts '...'}`) are
-  `22018` here. Tracked by AB#47246, which is not direction-scoped - the fix is
-  in the shared `parse_datetime_literal`, so it closes both directions at once.
-  The parameter side is what makes it worth doing: the server never renders
-  either shape, but an application can bind one, and `{ts '...'}` appears in
-  msodbcsql's own test data. This is the one direction where msodbcsql is
-  *more* permissive, so it is an app-compat gap rather than harmless tolerance.
+Reference: `Sql/Ntdbms/sqlncli/odbc/sqlccnvt.cpp`, the `FindECode` temporal
+branch and `rgbECODE_DATE_SLASH` retry (lines 4196-4334), plus
+`ParseDateTime` and the `rgbECODE_DATE` / `TIME` / `TIMESTAMP` grammars.
+Measured on Linux with msodbcsql18 package `18.6.1.1-1`,
+`SQL_DRIVER_VER=18.06.0001`, on 2026-09-25. The two-driver tests
+`OdbcTemporalLiteralsRoundTrip` and `MalformedOdbcTemporalLiteralsAre22018`
+cover `SQL_C_CHAR` and `SQL_C_WCHAR` parameter binding;
+`OdbcTemporalLiteralsFromCharacterColumns` covers `SQLGetData` and `SQLBindCol`
+from `varchar`/`nvarchar`, including max columns and nine-digit fractions.
 
 Three measured divergences the other way, all verified against the msodbcsql
 source:
