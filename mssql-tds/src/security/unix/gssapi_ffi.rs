@@ -893,7 +893,10 @@ pub fn default_principal_name() -> Result<String, crate::security::SecurityError
         return Err(failure("Error retrieving principal name", major, minor));
     }
 
-    let principal = String::from_utf8_lossy(&unsafe { buffer.to_vec() }).into_owned();
+    // Some implementations count the C terminator in `length`.
+    let principal = String::from_utf8_lossy(&unsafe { buffer.to_vec() })
+        .trim_end_matches('\0')
+        .to_string();
     unsafe { (lib.gss_release_buffer)(&mut release_minor, &mut buffer) };
     Ok(principal)
 }
