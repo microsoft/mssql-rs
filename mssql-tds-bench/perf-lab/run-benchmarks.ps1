@@ -450,9 +450,13 @@ function Set-PackageVersion {
 # Sibling workspace crates pin mssql-tds by version (e.g. mssql-mock-tds declares
 # `mssql-tds = { path = "../mssql-tds", version = "0.2.0" }`). Cargo resolves the whole
 # workspace, so once main bumps the crate version the older baseline source no longer
-# satisfies that requirement and the entire baseline build fails. The package version
-# affects no generated code, so stamp the candidate's onto the baseline manifest —
-# keeping the driver source the only variable that actually differs.
+# satisfies that requirement and the entire baseline build fails.
+#
+# Stamp the candidate's version onto the baseline manifest. CARGO_PKG_VERSION is
+# compiled into the driver — DriverVersion::from_cargo_version() goes into the TDS login
+# packet and UserAgent::default().driver_version into the login metadata — so stamping
+# also makes that compiled-in metadata IDENTICAL on both sides. That removes a
+# difference between the two builds rather than introducing one.
 function Sync-BaselineVersion {
     $manifest = Join-Path $script:CandidateSrc 'Cargo.toml'
     $cand = Get-PackageVersion (Join-Path $script:StashedSrc 'Cargo.toml')
@@ -485,10 +489,11 @@ if ($script:CandBins.Count -eq 0) { throw 'no candidate bench binaries found' }
 Write-Host ">>> Adding baseline worktree for $BaselineCommit at $BaselineTree..."
 Invoke-Native { git worktree add --detach $BaselineTree $BaselineCommit }
 Write-Host '>>> Building baseline bench binaries (target-base/)...'
-Set-BaselineSource
-# finally, so a baseline compile failure cannot leave the checkout holding the
-# baseline source with the candidate stranded in the stash directory.
+# Set-BaselineSource runs INSIDE the try: it is itself fallible (the version stamping
+# can throw), and from the moment the source moves, any throw must still reach the
+# finally. Restore-CandidateSource is a no-op until the stash exists.
 try {
+    Set-BaselineSource
     Invoke-CompileBenches (Join-Path $RepoRoot 'target-base') 'baseline'
     $script:BaseBins = Get-BenchBinaries (Join-Path $RepoRoot 'target-base')
 } finally {

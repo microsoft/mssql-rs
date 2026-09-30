@@ -79,8 +79,10 @@ place, rather than re-pointing the dependency at the worktree, keeps a single
 baseline manifest's `[package]` version is then stamped with the candidate's, because
 sibling workspace crates pin `mssql-tds` by version and Cargo resolves the whole
 workspace — without this, any crate version bump after the pinned baseline breaks the
-baseline build outright. The version affects no generated code, so the source remains
-the only meaningful variable.
+baseline build outright. `CARGO_PKG_VERSION` *is* compiled into the driver (it supplies
+`DriverVersion::from_cargo_version()` for the TDS login packet and the default
+`UserAgent.driver_version`), so stamping additionally makes that metadata identical on
+both sides — one fewer difference between the two builds.
 
 ### Comparison flow: interleaved per-binary runs
 

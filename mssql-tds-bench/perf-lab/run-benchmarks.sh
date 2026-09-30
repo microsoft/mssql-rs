@@ -280,9 +280,13 @@ set_package_version() {
 # Sibling workspace crates pin mssql-tds by version (e.g. mssql-mock-tds declares
 # `mssql-tds = { path = "../mssql-tds", version = "0.2.0" }`). Cargo resolves the whole
 # workspace, so once main bumps the crate version the older baseline source no longer
-# satisfies that requirement and the entire baseline build fails. The package version
-# affects no generated code, so stamp the candidate's onto the baseline manifest —
-# keeping the driver source the only variable that actually differs.
+# satisfies that requirement and the entire baseline build fails.
+#
+# Stamp the candidate's version onto the baseline manifest. CARGO_PKG_VERSION is
+# compiled into the driver — DriverVersion::from_cargo_version() goes into the TDS login
+# packet and UserAgent::default().driver_version into the login metadata — so stamping
+# also makes that compiled-in metadata IDENTICAL on both sides. That removes a
+# difference between the two builds rather than introducing one.
 align_baseline_version() {
     local manifest="$REPO_ROOT/mssql-tds/Cargo.toml"
     local cand base
@@ -320,11 +324,13 @@ BASELINE_TREE="$(mktemp -d)/perf-baseline"
 echo ">>> Adding baseline worktree for ${BASELINE_COMMIT} at ${BASELINE_TREE}..."
 git worktree add --detach "$BASELINE_TREE" "$BASELINE_COMMIT"
 echo ">>> Building baseline bench binaries (target-base/)..."
-swap_to_baseline
-# From here until the swap is undone, any exit (a baseline compile failure, or
-# set -e on anything else) would otherwise leave mssql-tds/ holding the baseline
-# source and the candidate stranded in .mssql-tds-candidate.
+# Arm the cleanup BEFORE the swap. swap_to_baseline is itself fallible (the version
+# stamping can exit non-zero), and from the moment the source moves, any exit would
+# otherwise leave mssql-tds/ holding the baseline copy with the candidate stranded in
+# .mssql-tds-candidate. restore_candidate is a no-op until the stash exists, so arming
+# it ahead of the swap is safe.
 trap 'restore_candidate 2>/dev/null || true; git worktree remove --force "$BASELINE_TREE" 2>/dev/null || true' EXIT
+swap_to_baseline
 compile_benches "$REPO_ROOT/target-base" "baseline"
 BASE_BINS="$(bench_bins "$REPO_ROOT/target-base")"
 restore_candidate
