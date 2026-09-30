@@ -5,7 +5,7 @@
 
 use tracing::{debug, error};
 
-use super::exec_common::{return_client_idle, try_claim_idle_client};
+use super::exec_common::{deduct_query_timeout, return_client_idle, try_claim_idle_client};
 use crate::api::odbc_types::{
     SQL_ERROR, SQL_HANDLE_DBC, SQL_HANDLE_DBC_INFO_TOKEN, SQL_HANDLE_DESC, SQL_HANDLE_ENV,
     SQL_HANDLE_STMT, SQL_INVALID_HANDLE, SQL_SUCCESS, SqlHandle, SqlReturn, SqlSmallInt,
@@ -499,14 +499,22 @@ fn best_effort_unprepare_on_free_inner(
     // server-side) and releases a live one.
     //
     // msodbcsql's `DropPrepHandle` also bounds this cleanup by the statement
-    // timeout (`sqlcfunc.cpp:790-830`). A zero timeout stays unlimited. Each
-    // release gets the full budget: the `pending_unprepare` invariant
-    // (`StmtState`) leaves at most one id here, so there is nothing to share.
+    // timeout (`sqlcfunc.cpp:790-830`). A zero timeout stays unlimited. Both a
+    // live plan and a pending orphan can be present (an orphan is restored when
+    // its release fails on the `sp_execute` reuse path), so the releases share
+    // one budget rather than each restarting it.
+    let started = std::time::Instant::now();
     for statement_id in handles {
-        if let Err(e) = dbc.runtime.block_on(client.unprepare(
-            statement_id,
-            ExecuteOptions::new().timeout_secs(query_timeout),
-        )) {
+        let Ok(remaining) = deduct_query_timeout(query_timeout, started.elapsed()) else {
+            error!(
+                "SQLFreeHandle(STMT): query timeout expired — remaining handles leaked until disconnect"
+            );
+            break;
+        };
+        if let Err(e) = dbc
+            .runtime
+            .block_on(client.unprepare(statement_id, ExecuteOptions::new().timeout_secs(remaining)))
+        {
             error!(%e, "SQLFreeHandle(STMT): sp_unprepare failed — handle leaked until disconnect");
         }
     }
@@ -576,6 +584,56 @@ mod tests {
         assert!(
             started.elapsed() >= Duration::from_millis(1_200),
             "the default zero timeout must wait for the server's unprepare reply"
+        );
+    }
+
+    #[test]
+    fn free_stmt_releases_share_one_query_timeout_budget() {
+        use crate::test_support::TestHandles;
+        use mssql_mock_tds::QueryResponse;
+        use mssql_tds::connection::tds_client::PreparedStatement;
+        use std::time::{Duration, Instant};
+
+        let mut h = TestHandles::with_env_dbc();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let mock_server =
+            crate::test_support::connect_mock_server(dbc, "SELECT 1", QueryResponse::select_one());
+        mock_server.set_rpc_delay(Duration::from_secs(8));
+
+        let stmt_handle = h.alloc_extra_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(stmt_handle) };
+        let sql: Vec<u16> = "SELECT 1".encode_utf16().collect();
+        assert_eq!(
+            unsafe {
+                crate::api::SQLPrepareW(stmt_handle, sql.as_ptr(), sql.len().try_into().unwrap())
+            },
+            SQL_SUCCESS
+        );
+        // A live plan alongside a restored orphan: the state left after an
+        // orphan's release fails on the `sp_execute` reuse path.
+        let live = dbc
+            .inner
+            .lock()
+            .unwrap()
+            .client
+            .as_mut()
+            .unwrap()
+            .register_prepared_handle_for_test(2);
+        crate::test_support::arm_pending_unprepare(dbc, stmt);
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            let plan = state.prepared.as_mut().unwrap();
+            plan.stmt = PreparedStatement::materialized_for_test("SELECT 1", live);
+            state.query_timeout = 1;
+        }
+
+        let started = Instant::now();
+        assert_eq!(h.free_extra_stmt(stmt_handle), SQL_SUCCESS);
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(1_800),
+            "two releases took {elapsed:?}: they must share the one-second budget, \
+             not each restart it"
         );
     }
 
