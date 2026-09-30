@@ -444,7 +444,11 @@ function Set-PackageVersion {
         if ($inPkg -and -not $done -and $line -match '^version\s*=') { $done = $true; "version = `"$Version`""; continue }
         $line
     }
-    Set-Content -LiteralPath $Manifest -Value $lines
+    # Windows PowerShell 5.1 (what the perf image ships) defaults Set-Content to the
+    # active ANSI code page, which would transcode this manifest's non-ASCII characters
+    # into bytes cargo cannot read as UTF-8. Pin UTF-8 without BOM, as the result files
+    # written further down already do.
+    [System.IO.File]::WriteAllLines($Manifest, [string[]] $lines, (New-Object System.Text.UTF8Encoding($false)))
 }
 
 # Sibling workspace crates pin mssql-tds by version (e.g. mssql-mock-tds declares
@@ -489,16 +493,18 @@ Invoke-CompileBenches (Join-Path $RepoRoot 'target') 'candidate'
 $script:CandBins = Get-BenchBinaries (Join-Path $RepoRoot 'target')
 if ($script:CandBins.Count -eq 0) { throw 'no candidate bench binaries found' }
 
-Write-Host ">>> Adding baseline worktree for $BaselineCommit at $BaselineTree..."
-Invoke-Native { git worktree add --detach $BaselineTree $BaselineCommit }
-Write-Host '>>> Building baseline bench binaries (target-base/)...'
 # A stash here means an earlier run died before restoring (only reachable outside the
 # lab, where the VM is rebuilt per run). Refuse rather than proceed: Move-Item moves
 # INTO an existing directory, so the live source would nest inside the stale stash and
 # the restore would then put the stale tree back without throwing - silent corruption.
+# Checked before the worktree is created so a refusal leaves nothing to clean up.
 if (Test-Path -LiteralPath $StashedSrc) {
     throw "$StashedSrc already exists - an earlier run did not finish restoring. Move the real mssql-tds source back out of it, remove it, then re-run."
 }
+
+Write-Host ">>> Adding baseline worktree for $BaselineCommit at $BaselineTree..."
+Invoke-Native { git worktree add --detach $BaselineTree $BaselineCommit }
+Write-Host '>>> Building baseline bench binaries (target-base/)...'
 # Set-BaselineSource runs INSIDE the try: it is itself fallible (the version stamping
 # can throw), and from the moment the source moves, any throw must still reach the
 # finally. Restore-CandidateSource is a no-op until the stash exists.
