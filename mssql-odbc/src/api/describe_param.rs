@@ -1420,8 +1420,11 @@ mod tests {
         let h = TestHandles::with_env_dbc_stmt();
         h.mark_dbc_connected();
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
-        // 11529 is what the server answers when it cannot determine parameter
-        // metadata, which is how the temp-table case fails in practice.
+        // A server error with no `SERVER_ERROR_TO_SQL_STATE_MAP` entry, so the
+        // state comes from the severity tier alone. The live temp-table case
+        // measures as 208 (`42S02`, a mapped entry) followed by 11501
+        // (`42000`, this fallback); 11529 stands in for the unmapped half
+        // here because the mock drives one error token at a time.
         let client = tds_client_from_tokens(vec![
             sql_error(11529, 16, "no metadata could be determined"),
             done_no_more(),

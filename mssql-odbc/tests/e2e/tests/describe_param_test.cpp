@@ -331,11 +331,23 @@ TEST_F(DescribeParamLiveTest, ATempTableParameterCannotBeDescribedButStillBinds)
     // temp table, and both drivers surface that as SQL_ERROR rather than a
     // guessed type. mssql-python turns this failure into its SQL_VARCHAR
     // fallback, which is why a VARBINARY NULL needs setinputsizes (GH-627).
+    //
+    // The diagnostics are measured, not derived from the severity tier: both
+    // drivers report two records, and record 1 is the `42S02` for error 208
+    // ("Invalid object name '#dp_tmp'"), not the `42000` the compile-error
+    // record carries. Measured on both legs against msodbcsql18 18.6.2.1
+    // (`SQL_DRIVER_VER` 18.06.0002) and this driver on 2026-09-30. The pair
+    // exercises both mapping paths: 208 has an explicit
+    // `SERVER_ERROR_TO_SQL_STATE_MAP` entry, while 11501 has none and falls
+    // through to `sqlstate_for_severity(16)`.
     for (SQLUSMALLINT ordinal = 1; ordinal <= 2; ++ordinal) {
         ParamDescription probe;
         EXPECT_EQ(SQL_ERROR, SQLDescribeParam(stmt_, ordinal, &probe.data_type, &probe.size,
                                               &probe.scale, &probe.nullable))
             << "ordinal " << ordinal;
+        EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "42S02") << "ordinal " << ordinal;
+        EXPECT_TRUE(ODBCTestUtils::HasDiagState(SQL_HANDLE_STMT, stmt_, "42000"))
+            << "ordinal " << ordinal << ": the compile-error record must survive";
     }
 
     // The failed describe must not poison the statement: the explicit binding
