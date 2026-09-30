@@ -116,15 +116,21 @@ serializing a `NUMERIC(1,0)` header would truncate the first non-NULL value a
 caller sends on that statement.
 
 Non-NULL `SQL_C_DEFAULT` conversion and binding NULL values for server types
-whose required type names are not exposed by `SQLDescribeParam` are outside this
-work item. That exclusion is enforced in code: `bound_param_to_value` rejects a
-non-NULL defaulted bind unless `sql_type` is one of the six character SQL types.
-Without that guard the `c_type` match would read the buffer as text for the four
-SQL types `resolve_default_c_type` maps onto a character C type -- `SQL_DECIMAL`,
-`SQL_NUMERIC`, `SQL_SS_VARIANT` and `SQL_SS_XML` -- and send `varchar(max)` /
-`nvarchar(max)`. `sql_variant` is the sharp edge, since the server cannot assign
-`varchar(max)` to it, so the application would see an opaque server-side error
-instead of `HYC00`.
+whose required type names are not exposed by `SQLDescribeParam` were outside
+this work item. The first exclusion was enforced by a guard in
+`bound_param_to_value` that rejected a non-NULL defaulted bind unless `sql_type`
+was one of the six character SQL types, so a defaulted `SQL_DECIMAL`,
+`SQL_NUMERIC`, `SQL_SS_VARIANT` or `SQL_SS_XML` could not be read as text and
+sent as `varchar(max)` -- `sql_variant` being the sharp edge, since the server
+cannot assign `varchar(max)` to it.
+
+That guard no longer exists. `SQLBindParameter` resolves `SQL_C_DEFAULT` to a
+concrete C type before storing the binding (`resolve_default_c_type`) and runs
+the resolved pairing through the conversion matrix exactly as it would an
+explicitly named one, so `bound_param_to_value` never sees `SQL_C_DEFAULT` at
+all. A defaulted pairing the matrix does not carry is refused at bind with
+`HYC00`; one it carries converts. See the `SQL_C_DEFAULT` resolution bullet in
+`parameters_plan.md` for the current contract.
 
 ### Accepted parity deviations and confirmed matches
 
@@ -152,7 +158,9 @@ instead of `HYC00`.
 - Representative TDS-to-ODBC type mappings and malformed metadata.
 - Cache invalidation when prepared SQL is superseded.
 - Typed NULL conversion and exact SQL declaration generation.
-- Rejection of non-NULL defaulted binds outside the character SQL types.
+- `SQL_C_DEFAULT` resolved at bind and run through the conversion matrix, with a
+  defaulted UDT resolving to `SQL_C_BINARY`
+  (`default_c_type_udt_is_accepted_at_bind`).
 - The metadata-RPC error tail against a scripted server: an empty result set
   reports `HY000`, surfaces the server's info message, and hands the connection
   back idle.
