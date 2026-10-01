@@ -5171,17 +5171,25 @@ impl TdsClient {
                         done.has_more()
                     );
 
-                    self.validate_done_error(&done, is_done_in_proc)?;
                     // This DONE ends a no-row statement, which has no row-set
                     // count; drop the previous row set's so it is not read as this
                     // statement's.
                     self.last_result_row_count = None;
-                    // The first DONE after a statement error returned under
-                    // `Continue` completes that statement. Its outcome was the
-                    // `Err`, so it is not surfaced again as a result — even when it
-                    // carries a count, since ERROR and COUNT are independent flags.
-                    let completes_failed_statement =
+                    // A DONE completing a statement error already returned under
+                    // `Continue` is not surfaced again as a result — even with a
+                    // count, since ERROR and COUNT are independent flags. That is
+                    // the first DONE after the error, and also an error-flagged
+                    // DONEPROC or DONE that closes the same completion chain: one
+                    // error can be reflected by both the inner DONEINPROC and the
+                    // enclosing DONEPROC. Read before `validate_done_error`, which
+                    // closes the chain.
+                    let first_done_after_error =
                         std::mem::take(&mut self.failed_statement_done_pending);
+                    let closes_error_chain = !is_done_in_proc
+                        && done.has_error()
+                        && self.statement_error_completion_pending;
+                    let completes_failed_statement = first_done_after_error || closes_error_chain;
+                    self.validate_done_error(&done, is_done_in_proc)?;
 
                     let count = self.count_map.entry(done.cur_cmd).or_insert(0);
                     // Use saturating_add to prevent integer overflow from malicious/corrupted TDS responses
@@ -5320,24 +5328,42 @@ impl TdsClient {
                         // first token past them for the next call. Parking cannot
                         // overwrite an earlier one: `next_response_token` hands a
                         // parked token back before reading the wire, so the slot is
-                        // empty here. A transport failure while reading deliberately
-                        // wins over the SQL errors collected so far: it decides
-                        // whether the connection is retired.
+                        // empty here.
+                        //
+                        // Two bounds, because the run is fed by the server: at most
+                        // 10_000 errors kept, and at most 100_000 tokens read in
+                        // all, so a run of INFO with no DONE cannot spin forever.
+                        // The token bound is far above the error bound so a valid
+                        // statement with many messages is not rejected.
+                        let mut tokens_read = 0u32;
                         loop {
-                            match self.next_response_token(&parser_context).await? {
+                            tokens_read += 1;
+                            if tokens_read > 100_000 {
+                                return Err(self.abandon_failed_statement(
+                                    crate::error::Error::ProtocolError(
+                                        "Too many tokens after a statement error without a DONE"
+                                            .to_string(),
+                                    ),
+                                ));
+                            }
+                            // A transport failure here deliberately wins over the
+                            // SQL errors collected so far: it decides whether the
+                            // connection is retired.
+                            let token = match self.next_response_token(&parser_context).await {
+                                Ok(token) => token,
+                                Err(error) => {
+                                    return Err(self.abandon_failed_statement(error));
+                                }
+                            };
+                            match token {
                                 Tokens::Error(next_error) => {
-                                    // Bounded by the errors retained, not by tokens
-                                    // read: INFO is not kept here, and the token
-                                    // after the run is parked, not collected.
                                     if all_errors.len() >= 10_000 {
-                                        let error = crate::error::Error::ProtocolError(
-                                            "Too many ERROR tokens for one statement without a DONE"
-                                                .to_string(),
-                                        );
-                                        self.execution_context.set_has_open_batch(false);
-                                        self.current_metadata = None;
-                                        self.retire_after_failed_drain(&error);
-                                        return Err(error);
+                                        return Err(self.abandon_failed_statement(
+                                            crate::error::Error::ProtocolError(
+                                                "Too many ERROR tokens for one statement without a DONE"
+                                                    .to_string(),
+                                            ),
+                                        ));
                                     }
                                     info!(?next_error);
                                     all_errors.push(self.record_error_token(&next_error));
@@ -6688,6 +6714,11 @@ impl TdsClient {
                 Err(error) => {
                     self.settle_interrupted_read(&error);
                     self.abort_pending_prepare_capture();
+                    // Mid failed statement under `Continue`: the row set cannot
+                    // be finished, so close the batch rather than leave it open.
+                    if !self.row_set_errors.is_empty() {
+                        return Err(self.abandon_failed_statement(error));
+                    }
                     return Err(error);
                 }
             };
@@ -6938,6 +6969,9 @@ impl TdsClient {
                 Ok(header) => header,
                 Err(error) => {
                     self.settle_interrupted_read(&error);
+                    if !self.row_set_errors.is_empty() {
+                        return Err(self.abandon_failed_statement(error));
+                    }
                     return Err(error);
                 }
             };
@@ -7921,6 +7955,27 @@ impl TdsClient {
         // The client is positioned on the failure, not on the previous row set.
         self.last_result_row_count = None;
         crate::error::Error::from_sql_errors(errors)
+    }
+
+    /// Ends the batch when reading a failed statement's response under
+    /// [`BatchErrorMode::Continue`] cannot finish — a transport failure, or a
+    /// bound exceeded — and returns the error to report.
+    ///
+    /// Tokens have been consumed past the last boundary, so the response cannot
+    /// be resumed: the batch is closed and the statement state cleared, or the
+    /// next command would be refused as already executing. The connection is
+    /// retired unless the failure was an interruption whose ATTENTION settled
+    /// cleanly. The failure deliberately wins over the SQL errors collected so
+    /// far: it is what decides whether the connection can be reused.
+    fn abandon_failed_statement(&mut self, error: crate::error::Error) -> crate::error::Error {
+        self.execution_context.set_has_open_batch(false);
+        self.current_metadata = None;
+        self.current_result_set_has_been_read_till_end = true;
+        self.row_set_errors.clear();
+        self.statement_error_completion_pending = false;
+        self.failed_statement_done_pending = false;
+        self.retire_after_failed_drain(&error);
+        error
     }
 
     /// RPC entry points (`execute_sp_*`, prepared execution, stored procedures)
@@ -10577,6 +10632,102 @@ mod tests {
             client.advance_to_result_boundary().await.unwrap(),
             ResultBoundaryKind::End
         ));
+    }
+
+    /// One error can be reflected by the failing statement's DONEINPROC and by
+    /// the enclosing DONEPROC. When that DONEPROC carries a count as well, it is
+    /// the same failed statement and is not surfaced as a result either.
+    #[tokio::test]
+    async fn an_error_flagged_done_proc_with_a_count_is_not_surfaced_again() {
+        let mut client = create_test_client_with_tokens(vec![
+            Tokens::Error(error_token_with_severity(16)),
+            Tokens::DoneInProc(DoneToken {
+                status: DoneStatus::ERROR | DoneStatus::MORE,
+                cur_cmd: CurrentCommand::Insert,
+                row_count: 0,
+            }),
+            Tokens::DoneProc(DoneToken {
+                status: DoneStatus::ERROR | DoneStatus::COUNT | DoneStatus::MORE,
+                cur_cmd: CurrentCommand::Insert,
+                row_count: 2,
+            }),
+            done_count(CurrentCommand::Update, 3, false),
+        ]);
+        client.batch_error_mode = BatchErrorMode::Continue;
+
+        assert!(matches!(
+            client.advance_to_result_boundary().await,
+            Err(crate::error::Error::SqlServerError { .. })
+        ));
+        assert!(matches!(
+            client.advance_to_result_boundary().await.unwrap(),
+            ResultBoundaryKind::NoRows {
+                rows_affected: Some(3)
+            }
+        ));
+    }
+
+    /// INFO is not kept in the error list, so a separate bound on tokens read
+    /// stops a run of INFO that never reaches a DONE.
+    #[tokio::test]
+    async fn an_endless_run_of_info_after_a_statement_error_is_bounded() {
+        let mut tokens = vec![Tokens::Error(error_token_with_severity(16))];
+        tokens.extend((0..100_001).map(|n| info_token(n, 0, "message")));
+        let mut client = create_test_client_with_tokens(tokens);
+        client.execution_context.set_has_open_batch(true);
+        client.batch_error_mode = BatchErrorMode::Continue;
+
+        let error = client.advance_to_result_boundary().await.unwrap_err();
+
+        assert!(matches!(error, crate::error::Error::ProtocolError(_)));
+        assert!(client.is_connection_dead());
+        assert!(!client.has_open_batch());
+    }
+
+    /// A transport failure while gathering a statement's errors cannot be
+    /// resumed from, so it closes the batch and retires the connection — even
+    /// when an earlier result had opened the batch.
+    #[tokio::test]
+    async fn a_transport_failure_after_a_statement_error_closes_the_batch() {
+        let mut client =
+            create_test_client_with_tokens(vec![Tokens::Error(error_token_with_severity(16))]);
+        client.execution_context.set_has_open_batch(true);
+        client.batch_error_mode = BatchErrorMode::Continue;
+
+        let error = client.advance_to_result_boundary().await.unwrap_err();
+
+        assert!(matches!(error, crate::error::Error::ConnectionClosed(_)));
+        assert!(!client.has_open_batch());
+        assert!(client.is_connection_dead());
+        assert!(!client.statement_error_completion_pending);
+    }
+
+    /// The same inside a row set: the errors collected there are dropped with
+    /// the batch, and the batch does not stay open.
+    #[tokio::test]
+    async fn a_transport_failure_inside_a_failed_row_set_closes_the_batch() {
+        let mut client = create_test_client_with_tokens(vec![
+            int_col_metadata(1),
+            Tokens::Error(error_token_with_severity(16)),
+        ]);
+        assert_eq!(
+            client
+                .execute(
+                    "q".to_string(),
+                    ExecuteOptions::new().on_error(BatchErrorMode::Continue),
+                )
+                .await
+                .unwrap(),
+            StatementResult::Rows
+        );
+
+        assert!(matches!(
+            client.next_row().await,
+            Err(crate::error::Error::ConnectionClosed(_))
+        ));
+        assert!(!client.has_open_batch());
+        assert!(client.is_connection_dead());
+        assert!(client.row_set_errors.is_empty());
     }
 
     /// If a later ERROR of the same statement is fatal, the whole run drains

@@ -214,18 +214,17 @@ impl ClientContextValidator for DefaultClientContextValidator {
             )));
         }
 
-        // MS-TDS caps each LOGIN7 variable-length field at 128 characters. This
-        // one comes straight from the caller, so reject rather than truncate: a
-        // truncated server name is a name the caller did not choose, and the
-        // server would otherwise fail the login with an opaque error.
-        if let Some(name) = &context.login_server_name
-            && name.encode_utf16().count() > MAX_LOGIN7_NAME_CHARS
-        {
-            return Err(Error::UsageError(format!(
-                "login_server_name is {} characters; LOGIN7 allows at most {}.",
-                name.encode_utf16().count(),
-                MAX_LOGIN7_NAME_CHARS
-            )));
+        // MS-TDS caps each LOGIN7 variable-length field at 128 UTF-16 code units.
+        // This one comes straight from the caller, so reject rather than
+        // truncate: a truncated server name is a name the caller did not choose,
+        // and the server would otherwise fail the login with an opaque error.
+        if let Some(name) = &context.login_server_name {
+            let units = name.encode_utf16().count();
+            if units > MAX_LOGIN7_NAME_UNITS {
+                return Err(Error::UsageError(format!(
+                    "login_server_name is {units} UTF-16 code units; LOGIN7 allows at most {MAX_LOGIN7_NAME_UNITS}."
+                )));
+            }
         }
 
         Ok(())
@@ -233,7 +232,7 @@ impl ClientContextValidator for DefaultClientContextValidator {
 }
 
 /// Maximum length, in UTF-16 code units, of a LOGIN7 variable-length field.
-const MAX_LOGIN7_NAME_CHARS: usize = 128;
+const MAX_LOGIN7_NAME_UNITS: usize = 128;
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -1903,17 +1902,28 @@ mod tests {
         assert_eq!(context.login_server_name(&transport), "localhost,1433");
     }
 
-    /// LOGIN7 caps the field at 128 characters; a longer override is rejected
-    /// up front instead of failing the login opaquely.
+    /// LOGIN7 caps the field at 128 UTF-16 code units; a longer override is
+    /// rejected up front instead of failing the login opaquely. The boundary is
+    /// written as literals, not derived from the constant, so a wrong constant
+    /// fails this test instead of moving with it.
     #[test]
     fn a_login_server_name_over_the_login7_limit_is_rejected() {
         let mut context = ClientContext {
-            login_server_name: Some("n".repeat(MAX_LOGIN7_NAME_CHARS)),
+            login_server_name: Some("n".repeat(128)),
             ..Default::default()
         };
         assert!(context.validate().is_ok());
 
-        context.login_server_name = Some("n".repeat(MAX_LOGIN7_NAME_CHARS + 1));
+        context.login_server_name = Some("n".repeat(129));
+        match context.validate() {
+            Err(Error::UsageError(message)) => {
+                assert!(message.contains("129 UTF-16 code units"), "{message}");
+            }
+            other => panic!("expected UsageError, got {other:?}"),
+        }
+
+        // Counted in UTF-16 code units: 65 characters outside the BMP are 130.
+        context.login_server_name = Some("\u{1F600}".repeat(65));
         assert!(matches!(context.validate(), Err(Error::UsageError(_))));
     }
 

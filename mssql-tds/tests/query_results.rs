@@ -880,35 +880,35 @@ mod query_result_reads {
         assert_still_usable(&mut connection).await;
     }
 
-    /// A statement can fail with more than one ERROR token: a failed BACKUP sends
-    /// the device error and then "terminating abnormally". Under `Continue` that
-    /// is one failed statement — one `Err` carrying both — and the batch goes on.
+    /// A statement can fail with more than one ERROR token: adding a primary
+    /// key over duplicate values sends the duplicate-key error (1505) and then
+    /// "could not create constraint" (1750), on every server OS. Under
+    /// `Continue` that is one failed statement — one `Err` carrying both. This
+    /// failure also aborts the batch server-side, so the walk then reaches the
+    /// end, and the connection is still usable.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn continue_returns_every_error_of_a_statement_together() {
         let mut connection = begin_connection(&build_tcp_datasource()).await;
 
         let steps = walk(
             &mut connection,
-            "SELECT 1 AS a; \
-             BACKUP DATABASE master TO DISK = '/pr617_no_such_directory/x.bak'; \
+            "SET NOCOUNT ON; CREATE TABLE #dup (i int NOT NULL); \
+             INSERT INTO #dup VALUES (1), (1); SET NOCOUNT OFF; \
+             SELECT 1 AS a; \
+             ALTER TABLE #dup ADD PRIMARY KEY (i); \
              SELECT 2 AS b;",
             BatchErrorMode::Continue,
         )
         .await;
 
-        assert_eq!(steps.len(), 3, "got {steps:?}");
+        assert_eq!(steps.len(), 2, "got {steps:?}");
         assert_eq!(steps[0], Step::Rows(vec![1], Some(1)));
         match &steps[1] {
             Step::Error(errors) => {
                 assert_eq!(errors.len(), 2, "both errors in one Err, got {errors:?}");
-                assert!(
-                    errors[1].contains("terminating abnormally"),
-                    "got {errors:?}"
-                );
             }
             other => panic!("expected one failed statement, got {other:?}"),
         }
-        assert_eq!(steps[2], Step::Rows(vec![2], Some(1)));
         assert_still_usable(&mut connection).await;
     }
 
@@ -921,9 +921,9 @@ mod query_result_reads {
 
         let steps = walk(
             &mut connection,
-            "SET ANSI_WARNINGS ON; CREATE TABLE #div (x int); \
-             INSERT INTO #div VALUES (1), (2), (0), (5); \
-             SELECT 10 / x AS v FROM #div; \
+            "SET ANSI_WARNINGS ON; CREATE TABLE #div (id int PRIMARY KEY CLUSTERED, x int); \
+             INSERT INTO #div VALUES (1, 1), (2, 2), (3, 0), (4, 5); \
+             SELECT 10 / x AS v FROM #div ORDER BY id; \
              SELECT 7 AS w;",
             BatchErrorMode::Continue,
         )
@@ -953,9 +953,9 @@ mod query_result_reads {
 
         let steps = walk(
             &mut connection,
-            "CREATE TABLE #conv (s varchar(10)); \
-             INSERT INTO #conv VALUES ('10'), ('20'), ('x'), ('40'); \
-             SELECT CONVERT(int, s) AS v FROM #conv; \
+            "CREATE TABLE #conv (id int PRIMARY KEY CLUSTERED, s varchar(10)); \
+             INSERT INTO #conv VALUES (1, '10'), (2, '20'), (3, 'x'), (4, '40'); \
+             SELECT CONVERT(int, s) AS v FROM #conv ORDER BY id; \
              SELECT 7 AS w;",
             BatchErrorMode::Continue,
         )
