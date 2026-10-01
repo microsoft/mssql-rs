@@ -103,6 +103,24 @@ function(add_odbc_test TEST_NAME)
     add_executable(${TEST_NAME} ${ARGN})
     target_link_libraries(${TEST_NAME} PRIVATE odbc_test_lib gtest_main)
     add_test(NAME ${TEST_NAME} COMMAND ${TEST_NAME})
+    set_tests_properties(${TEST_NAME} PROPERTIES SKIP_RETURN_CODE 77)
+endfunction()
+
+# ---------------------------------------------------------------------------
+# Helper function: a test that loads the driver directly by path and so skips
+# wholesale on a leg where MSSQL_ODBC_DLL is not set.
+#
+# These link `lib/odbc_skip_aware_main.cpp` instead of `gtest_main` so a
+# fully-skipped run exits 77 rather than 0. Without it ctest records the binary
+# as passed — it only sees the process exit code, not gtest's per-case skips —
+# and the parity report scores a test that ran on one leg as PASS/PASS, which
+# reads as mutual confirmation when nothing was compared.
+# ---------------------------------------------------------------------------
+function(add_odbc_direct_load_test TEST_NAME)
+    add_executable(${TEST_NAME} ${ARGN} lib/odbc_skip_aware_main.cpp)
+    target_link_libraries(${TEST_NAME} PRIVATE odbc_test_lib)
+    add_test(NAME ${TEST_NAME} COMMAND ${TEST_NAME})
+    set_tests_properties(${TEST_NAME} PROPERTIES SKIP_RETURN_CODE 77)
 endfunction()
 
 # ---------------------------------------------------------------------------
@@ -158,5 +176,5 @@ add_odbc_test(time_to_timestamp_test tests/time_to_timestamp_test.cpp)
 add_odbc_test(numeric_types_test  tests/numeric_types_test.cpp)
 add_odbc_test(text_money_types_test tests/text_money_types_test.cpp)
 add_odbc_test(fetch_error_semantics_test tests/fetch_error_semantics_test.cpp)
-add_odbc_test(dll_unload_stress_test tests/dll_unload_stress_test.cpp)
-add_odbc_test(trace_rotation_test tests/trace_rotation_test.cpp)
+add_odbc_direct_load_test(dll_unload_stress_test tests/dll_unload_stress_test.cpp)
+add_odbc_direct_load_test(trace_rotation_test tests/trace_rotation_test.cpp)

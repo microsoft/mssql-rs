@@ -703,9 +703,10 @@ msodbcsql build is measured.
     worth reproducing.
 23. **Trace-file rotation is always on, sized in MB, and never truncates or
     deletes.** msodbcsql does rotate: `BIDTraceFileSize` from `odbcinst.ini`
-    feeds `_nTraceFileMaxSize` (`odbc/sqlcconn.cpp:5831-5832`), checked between
-    events in `logTrace` (`bid/bidapi.cpp:123-129`) with the same `>=` semantics
-    this driver uses. Four differences are deliberate:
+    feeds     `_nTraceFileMaxSize` (`Sql/Ntdbms/sqlncli/odbc/sqlcconn.cpp:5831-5832`),
+    checked between events in `logTrace`
+    (`Sql/Ntdbms/sqlncli/xplat/src/bidapi.cpp:123-129`) with the same `>=`
+    semantics this driver uses. Four differences are deliberate:
 
     - **Always on.** msodbcsql defaults `BIDTraceFileSize` to `0`, which
       disables rotation; this driver defaults to 100 MiB and rejects `0`, so
