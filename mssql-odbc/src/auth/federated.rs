@@ -181,7 +181,11 @@ pub(super) async fn acquire_token(
     resource: &str,
     retry: RetryPolicy,
 ) -> TdsResult<String> {
-    let host_end = sts_host_end(sts_url).ok_or_else(not_https)?;
+    if !sts_url.starts_with("https://") {
+        return Err(not_https());
+    }
+    let host_end = sts_host_end(sts_url)
+        .ok_or_else(|| failure("the authentication endpoint URL has no path".to_string()))?;
 
     let principal = blocking(Arc::clone(&identity), |id| id.principal()).await?;
     debug!(principal = %principal, "integrated: resolving the Entra user realm");
@@ -1034,14 +1038,14 @@ mod tests {
     }
 
     #[test]
-    fn a_non_https_sts_is_refused_before_any_request() {
-        for sts in [
-            "http://login.microsoftonline.com/tenant/",
-            "https://login.microsoftonline.com",
+    fn a_malformed_sts_is_refused_before_any_request() {
+        for (sts, expected) in [
+            ("http://login.microsoftonline.com/tenant/", "must use https"),
+            ("https://login.microsoftonline.com", "has no path"),
         ] {
             let transport = ScriptedTransport::new(happy);
             let error = message(run(&transport, FakeIdentity::new("alice@CONTOSO.COM"), sts));
-            assert!(error.contains("must use https"), "{error}");
+            assert!(error.contains(expected), "{error}");
             assert!(transport.requests().is_empty());
         }
     }
