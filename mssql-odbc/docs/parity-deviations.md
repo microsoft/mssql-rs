@@ -777,8 +777,8 @@ msodbcsql build is measured.
     serializer arm's default to Windows-1252 is a behaviour change on a path
     that fix did not otherwise touch, and
     `an_unmapped_collation_keeps_the_latin1_fallback` (unit and integration)
-    pins the current split in both crates so a future unification is a visible,
-    deliberate edit rather than a silent drift.
+    pins the current split from both inside and outside the crate, so a future
+    unification is a visible, deliberate edit rather than a silent drift.
 
     No application regresses at this entry's introduction: both rules predate
     it and AB#48437 preserved them unchanged, so no sign-off is recorded.
