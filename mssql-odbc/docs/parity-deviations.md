@@ -731,8 +731,12 @@ msodbcsql build is measured.
     fallback encoding anywhere in that function. This driver always produces
     bytes, and by **two different rules**:
 
-    - `encode_narrow` (`mssql-tds/src/datatypes/sql_string.rs`), used by fetches
-      and by the data-at-execution writer, falls back to **Windows-1252**.
+    - `resolve_collation` (`mssql-tds/src/datatypes/sql_string.rs`) falls back
+      to **Windows-1252**. This is the shared resolver: it backs
+      `EncodingType::resolved_encoding`, so it covers decoding a fetched value,
+      and `encode_narrow`, whose production callers are the `sql_variant`
+      serializer and ODBC's data-at-execution transcoder
+      (`DaeTarget::Narrow`).
     - `serialize_string`'s `VARCHAR | CHAR | TEXT` arm
       (`mssql-tds/src/datatypes/tds_value_serializer.rs`) falls back to a
       **Latin-1-like** mapping: a scalar at or below U+00FF is its own byte,
@@ -745,6 +749,24 @@ msodbcsql build is measured.
     An application can tell the difference from msodbcsql in both cases — it
     stores a value where the reference driver would fail the bind — so this is
     recorded rather than left to code comments, even though neither rule is new.
+
+    **Evidence level: source citation only; not measured.** The msodbcsql
+    branch above is read from `clntcomn.cpp`, not observed on a retail build,
+    so no `SQL_DRIVER_VER` is recorded. Reaching it needs a TDS collation whose
+    LCID `GetLocaleInfoA` cannot give an ANSI code page for, which an ordinary
+    server collation does not produce; the Driver Manager is not the obstacle.
+    The measurement that would close this: bind a narrow parameter under such a
+    collation against both drivers and record `SQL_DRIVER_VER` with each
+    result, or exercise `CodePageFromTDSCollation` directly with a synthesised
+    `TDSCOLLATION`.
+
+    The same evidence gap cuts the other way and is worth stating, because it
+    is the more reachable half: this crate's `lcid_to_encoding` table is
+    narrower than `GetLocaleInfoA`, so there are LCIDs msodbcsql resolves
+    correctly and this driver does not. For those, the fallbacks above send
+    *wrong bytes* where msodbcsql sends right ones — a silent divergence rather
+    than the error-versus-value one this entry's title describes. Which LCIDs
+    those are is likewise unmeasured.
 
     Taken because erroring on a collation the driver merely does not map is a
     poor trade for an application that would otherwise round-trip its data
@@ -760,4 +782,5 @@ msodbcsql build is measured.
 
     No application regresses at this entry's introduction: both rules predate
     it and AB#48437 preserved them unchanged, so no sign-off is recorded.
-    Unifying the two defaults needs one. Decision history in AB#48437.
+    Unifying the two defaults needs one, as does closing the table gap above.
+    Decision history in AB#48437.
