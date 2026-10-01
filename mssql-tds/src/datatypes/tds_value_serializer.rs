@@ -1423,6 +1423,29 @@ impl TdsValueSerializer {
                     return Self::serialize_char_varchar_direct(writer, raw_bytes, ctx).await;
                 }
 
+                // A UTF-8 source under a UTF-8 collation is already the wire
+                // form, so the decode/re-encode below is an identity pair:
+                // `to_utf8_string` would copy and re-validate bytes an
+                // `EncodingType::Utf8` `SqlString` has already validated, and
+                // `UTF_8.encode` borrows and is then copied back out. Skipping
+                // both is safe only because each half of the guard is exact --
+                // `Utf8` means the bytes are valid UTF-8, and `collation.utf8()`
+                // is `try_resolve_collation`'s first branch, so the resolved
+                // encoding is UTF-8 unconditionally. Nothing is lost either:
+                // UTF-8 represents every character, so the skipped
+                // `encode_narrow_with` could not have set `had_loss`. Framing is
+                // unchanged because `serialize_char_varchar_direct` measures the
+                // byte slice it is handed, which is the same length both ways.
+                //
+                // Reachable only since AB#48437: before it this arm resolved a
+                // UTF-8 collation to the LCID's single-byte page, so source and
+                // target never matched.
+                if matches!(value.encoding_type(), EncodingType::Utf8)
+                    && ctx.collation.is_some_and(|c| c.utf8())
+                {
+                    return Self::serialize_char_varchar_direct(writer, &value.bytes, ctx).await;
+                }
+
                 // Otherwise (UTF-8 or UTF-16 source), decode and re-encode to target code page
                 let decoded_str = value.to_utf8_string();
                 let encoded = Self::encode_narrow_for_wire(&decoded_str, ctx.collation);

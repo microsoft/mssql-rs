@@ -20,7 +20,9 @@
 
 use mssql_tds::datatypes::column_values::ColumnValues;
 use mssql_tds::datatypes::sql_string::{EncodingType, SqlString, encode_narrow};
-use mssql_tds::test_client_support::{TdsTypeContext, serialized_value_wire_bytes};
+use mssql_tds::test_client_support::{
+    CAPTURE_PACKET_SIZE, TdsTypeContext, serialized_value_wire_bytes,
+};
 use mssql_tds::token::tokens::SqlCollation;
 
 /// TDS type byte for VARCHAR (BIGVARCHAR).
@@ -383,8 +385,10 @@ fn an_unmapped_collation_keeps_the_latin1_fallback() {
 ///
 /// `PacketWriter` flushes each full packet through `NetworkWriter::send` and
 /// then reuses its buffer for the remainder, so a helper that read only that
-/// buffer would return the final fragment and silently pass. 4096 is the packet
-/// size `serialized_value_wire_bytes` configures, so ~12 KB spans several.
+/// buffer would return the final fragment and silently pass. The value is sized
+/// against [`CAPTURE_PACKET_SIZE`] rather than a literal, and the assertion
+/// below enforces that, so raising the helper's packet size fails loudly here
+/// instead of quietly reducing this to a single-packet test.
 ///
 /// Asserts against `encode_narrow` rather than a literal: the point is that
 /// nothing is dropped or duplicated at a boundary, not what any single byte is.
@@ -398,6 +402,10 @@ fn a_value_spanning_multiple_packets_is_returned_whole() {
         streamed.bytes.len(),
         12_000,
         "CP437 encodes U+00E9 to one byte"
+    );
+    assert!(
+        streamed.bytes.len() > CAPTURE_PACKET_SIZE as usize,
+        "probe no longer spans a packet boundary"
     );
 
     // varchar(max): PLP framing - 8-byte header, 4-byte chunk length, body,
@@ -417,13 +425,15 @@ fn a_value_spanning_multiple_packets_is_returned_whole() {
 #[test]
 fn a_bounded_value_spanning_multiple_packets_keeps_its_length_prefix() {
     let text = "\u{e9}".repeat(6_000);
+    let encoded = encode_narrow(&text, sort_id(32));
+    assert!(
+        encoded.bytes.len() > CAPTURE_PACKET_SIZE as usize,
+        "probe no longer spans a packet boundary"
+    );
     let bounded = payload(&text, sort_id(32), VARCHAR, 8000, false, false);
     let prefix = u16::from_le_bytes([bounded[0], bounded[1]]) as usize;
     assert_eq!(prefix, 6_000);
-    assert_eq!(
-        &bounded[2..],
-        encode_narrow(&text, sort_id(32)).bytes.as_slice()
-    );
+    assert_eq!(&bounded[2..], encoded.bytes.as_slice());
 }
 
 /// A lone UTF-16 surrogate reaching a *single-byte* narrow target is
