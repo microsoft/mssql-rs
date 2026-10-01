@@ -788,7 +788,7 @@ mod tests {
     use super::*;
     use crate::api::get_desc_field::sql_get_desc_field_w;
     use crate::api::odbc_types::{
-        SQL_ATTR_APP_PARAM_DESC, SQL_ATTR_APP_ROW_DESC, SQL_C_CHAR, SQL_C_LONG,
+        SQL_ATTR_APP_PARAM_DESC, SQL_ATTR_APP_ROW_DESC, SQL_C_CHAR, SQL_C_LONG, SQL_C_TYPE_DATE,
         SQL_C_TYPE_TIMESTAMP, SQL_C_WCHAR, SQL_INTEGER, SQL_INTERVAL_YEAR, SQL_INVALID_HANDLE,
         SQL_NAMED, SQL_NULL_HANDLE, SQL_NUMERIC, SQL_TYPE_DATE, SqlNumericStruct,
     };
@@ -1187,6 +1187,8 @@ mod tests {
         seed();
         set(SQL_DESC_TYPE, SQL_C_TYPE_TIMESTAMP as isize);
         assert_eq!(lps(), (10, 7, 7));
+        set(SQL_DESC_TYPE, SQL_C_TYPE_DATE as isize);
+        assert_eq!(lps(), (10, 0, 0));
 
         seed();
         set(SQL_DESC_TYPE, SQL_C_CHAR as isize);

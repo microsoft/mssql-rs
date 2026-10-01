@@ -470,24 +470,27 @@ impl DescRecord {
             SQL_C_BINARY, SQL_C_CHAR, SQL_C_FLOAT, SQL_C_GUID, SQL_C_INTERVAL_DAY_TO_SECOND,
             SQL_C_INTERVAL_HOUR_TO_SECOND, SQL_C_INTERVAL_MINUTE_TO_SECOND, SQL_C_INTERVAL_SECOND,
             SQL_C_INTERVAL_YEAR, SQL_C_NUMERIC, SQL_C_SS_TIME2, SQL_C_SS_TIMESTAMPOFFSET,
-            SQL_C_TYPE_TIME, SQL_C_TYPE_TIMESTAMP, SQL_PREC_NUMERIC,
+            SQL_C_TYPE_DATE, SQL_C_TYPE_TIME, SQL_C_TYPE_TIMESTAMP, SQL_PREC_NUMERIC,
         };
 
-        let (length, precision, scale): (SqlULen, SqlSmallInt, SqlSmallInt) = match c_type {
-            SQL_C_CHAR | SQL_C_BINARY => (1, 1, self.scale),
-            SQL_C_GUID => (16, 16, self.scale),
-            SQL_C_NUMERIC => (38, SQL_PREC_NUMERIC, 0),
-            SQL_C_FLOAT => (24, 24, self.scale),
-            SQL_C_TYPE_TIME | SQL_C_TYPE_TIMESTAMP | SQL_C_SS_TIME2 | SQL_C_SS_TIMESTAMPOFFSET => {
-                (self.length, 7, 7)
-            }
-            SQL_C_INTERVAL_SECOND
-            | SQL_C_INTERVAL_DAY_TO_SECOND
-            | SQL_C_INTERVAL_HOUR_TO_SECOND
-            | SQL_C_INTERVAL_MINUTE_TO_SECOND => (2, 6, 6),
-            SQL_C_INTERVAL_YEAR..=SQL_C_INTERVAL_MINUTE_TO_SECOND => (2, 0, 0),
-            _ => return,
-        };
+        let (length, precision, scale): (SqlULen, SqlSmallInt, SqlSmallInt) =
+            match crate::api::type_rules::canonical_c_type(c_type) {
+                SQL_C_CHAR | SQL_C_BINARY => (1, 1, self.scale),
+                SQL_C_GUID => (16, 16, self.scale),
+                SQL_C_NUMERIC => (38, SQL_PREC_NUMERIC, 0),
+                SQL_C_FLOAT => (24, 24, self.scale),
+                SQL_C_TYPE_DATE => (self.length, 0, 0),
+                SQL_C_TYPE_TIME
+                | SQL_C_TYPE_TIMESTAMP
+                | SQL_C_SS_TIME2
+                | SQL_C_SS_TIMESTAMPOFFSET => (self.length, 7, 7),
+                SQL_C_INTERVAL_SECOND
+                | SQL_C_INTERVAL_DAY_TO_SECOND
+                | SQL_C_INTERVAL_HOUR_TO_SECOND
+                | SQL_C_INTERVAL_MINUTE_TO_SECOND => (2, 6, 6),
+                SQL_C_INTERVAL_YEAR..=SQL_C_INTERVAL_MINUTE_TO_SECOND => (2, 0, 0),
+                _ => return,
+            };
         self.length = length;
         self.precision = precision;
         self.scale = scale;
@@ -927,6 +930,28 @@ mod tests {
         DescKind::ImpParam,
         DescKind::Ad,
     ];
+
+    #[test]
+    fn app_type_defaults_treat_2x_datetime_spellings_like_3x() {
+        use crate::api::odbc_types::{
+            SQL_C_DATE, SQL_C_TIME, SQL_C_TIMESTAMP, SQL_C_TYPE_DATE, SQL_C_TYPE_TIME,
+            SQL_C_TYPE_TIMESTAMP,
+        };
+
+        for (old, new) in [
+            (SQL_C_DATE, SQL_C_TYPE_DATE),
+            (SQL_C_TIME, SQL_C_TYPE_TIME),
+            (SQL_C_TIMESTAMP, SQL_C_TYPE_TIMESTAMP),
+        ] {
+            let lps = |c_type| {
+                let mut r = DescRecord::default_for(DescKind::AppParam);
+                (r.length, r.precision, r.scale) = (10, 5, 3);
+                r.apply_app_type_defaults(c_type);
+                (r.length, r.precision, r.scale)
+            };
+            assert_eq!(lps(old), lps(new), "{old}");
+        }
+    }
 
     #[test]
     fn special_parameter_definitions_keep_size_precision_and_scale() {
