@@ -133,7 +133,6 @@ impl NetworkWriter for CapturingWriter {
     fn get_encryption_setting(&self) -> NegotiatedEncryptionSetting {
         NegotiatedEncryptionSetting::NoEncryption
     }
-    // This transport never carries a reset, so there is nothing to record.
     fn note_reset_dispatched(&mut self) {}
     fn take_reset_dispatched(&mut self) -> bool {
         false

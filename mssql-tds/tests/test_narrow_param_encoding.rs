@@ -400,28 +400,74 @@ fn a_bounded_value_spanning_multiple_packets_keeps_its_length_prefix() {
     );
 }
 
-/// An unpaired UTF-16 surrogate has no scalar value, so it is repaired to
-/// U+FFFD on decode and then substituted by the target code page, arriving as a
-/// single `?` with the loss flagged.
+/// A lone UTF-16 surrogate reaching a narrow target is substituted, and the
+/// substitution is flagged.
 ///
-/// Measured against retail msodbcsql18 on SQL Server: binding `a<D800>b` to a
-/// varchar stored `61 3F 62` with `SQL_SUCCESS` and no diagnostic, and the
-/// engine's own `CAST(NCHAR(97)+NCHAR(55296)+NCHAR(98) AS VARCHAR)` produced the
-/// identical bytes. This driver matches both and additionally sets `had_loss`,
-/// which `serialize_string` reports through `SQL_COPT_SS_WARN_ON_CP_ERROR`
-/// (`01000`).
+/// Driven through `serialize_value` with a genuinely malformed UTF-16 source,
+/// so the decode is the one the serializer performs rather than a repair this
+/// test performed for it: `to_utf8_string` resolves `EncodingType::Utf16`
+/// through `encoding_rs`, which yields U+FFFD, and the collation then has no
+/// byte for that.
 ///
-/// Pinned because rejecting this input instead (as `22018`) was implemented and
-/// then reverted: it diverged from the reference driver *and* the engine, and
-/// bypassed the code-page loss channel that already covers it (AB#47598).
+/// Measured against retail msodbcsql18: binding `a<D800>b` to a varchar stored
+/// `61 3F 62` with `SQL_SUCCESS` and no diagnostic, and the engine's own
+/// `CAST(NCHAR(97)+NCHAR(55296)+NCHAR(98) AS VARCHAR)` produced the identical
+/// bytes. The `had_loss` flag this driver additionally raises is what
+/// `SQL_COPT_SS_WARN_ON_CP_ERROR` reports as `01000`; the end-to-end
+/// SQLSTATE behaviour is covered by the e2e suite.
 #[test]
-fn an_unpaired_surrogate_substitutes_and_reports_loss() {
-    // What the driver's decode produces for a lone surrogate, re-encoded under
-    // the collation - the last step of the materialized parameter path.
-    let encoded = encode_narrow("a\u{FFFD}b", windows_1252());
-    assert_eq!(encoded.bytes, b"a?b", "matches msodbcsql and the engine");
-    assert!(
-        encoded.had_loss,
-        "the substitution must be flagged so SQL_COPT_SS_WARN_ON_CP_ERROR can report it"
+fn a_lone_surrogate_reaching_a_narrow_target_is_substituted() {
+    // 'a', an unpaired high surrogate, 'b' as raw UTF-16LE - not decodable to
+    // a scalar, which is the whole point.
+    let utf16: Vec<u8> = [0x0061u16, 0xD800, 0x0062]
+        .iter()
+        .flat_map(|u| u.to_le_bytes())
+        .collect();
+    let ctx = TdsTypeContext {
+        tds_type: VARCHAR,
+        max_size: 8000,
+        is_plp: false,
+        is_fixed_length: false,
+        precision: None,
+        scale: None,
+        collation: Some(windows_1252()),
+        is_nullable: true,
+    };
+    let value = ColumnValues::String(SqlString::new(utf16, EncodingType::Utf16));
+    let payload = serialized_value_wire_bytes(&value, &ctx).expect("serializes");
+    assert_eq!(
+        payload, b"\x03\x00a?b",
+        "matches msodbcsql and the engine: one '?' per unpaired surrogate"
+    );
+}
+
+/// The resolver's `encoding_rs` arm carries 13 code pages besides the two OEM
+/// special cases, and this change routes inline parameters through it for the
+/// first time. Sort ID 105 is CP1251, where U+0410 is `C0` and is unmappable in
+/// the LCID's Windows-1252 — so a regression to LCID-only resolution shows up
+/// as a substitution rather than a wrong-but-plausible byte.
+#[test]
+fn a_sort_id_resolving_through_encoding_rs_is_honored() {
+    assert_eq!(
+        varchar_payload("\u{410}", sort_id(105)),
+        b"\x01\x00\xc0",
+        "CP1251 (sort id 105)"
+    );
+    assert_eq!(
+        varchar_payload("\u{410}", windows_1252()),
+        b"\x01\x00?",
+        "the same LCID without the sort ID cannot represent it"
+    );
+}
+
+/// A DBCS sort ID through the same arm, where one character is two bytes: the
+/// length prefix has to count encoded bytes, not characters. Sort ID 192 is
+/// CP932, where U+65E5 is `93 FA`.
+#[test]
+fn a_dbcs_sort_id_frames_by_encoded_byte_count() {
+    assert_eq!(
+        varchar_payload("\u{65e5}", sort_id(192)),
+        b"\x02\x00\x93\xfa",
+        "CP932 (sort id 192)"
     );
 }

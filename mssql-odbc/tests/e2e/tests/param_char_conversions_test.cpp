@@ -228,9 +228,12 @@ TEST_F(CharConversionLiveTest, NarrowParamEncodesForTheDatabaseCollation) {
     ASSERT_FALSE(expected.empty());
     // Guard the premise: if the engine substituted, the comparison below would
     // be asserting that two substitutions agree rather than that the encoding
-    // is right.
-    ASSERT_NE("3F", expected) << "U+00E9 is unmappable under collation " << DatabaseCollation()
-                              << "; this probe assumes a code page that holds it";
+    // is right. A collation whose code page cannot hold U+00E9 is out of this
+    // test's scope rather than a failure, so skip as DatabaseIsLatin1() does.
+    if (expected == "3F") {
+        GTEST_SKIP() << "U+00E9 is unmappable under collation " << DatabaseCollation()
+                     << "; this probe needs a code page that holds it";
+    }
 
     // What the driver puts on the wire for the same character bound narrow.
     ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(64), CAST(? AS VARBINARY(16)), 2)"),
@@ -265,7 +268,10 @@ TEST_F(CharConversionLiveTest, NarrowCTypeParamEncodesForTheDatabaseCollation) {
     const std::string expected = GetColumnChar(1);
     ASSERT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
     ASSERT_FALSE(expected.empty());
-    ASSERT_NE("3F", expected) << "U+00E9 is unmappable under collation " << DatabaseCollation();
+    if (expected == "3F") {
+        GTEST_SKIP() << "U+00E9 is unmappable under collation " << DatabaseCollation()
+                     << "; this probe needs a code page that holds it";
+    }
 
     ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(64), CAST(? AS VARBINARY(16)), 2)"),
                   SQL_HANDLE_STMT, stmt_);
