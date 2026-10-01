@@ -44,8 +44,8 @@ pub use crate::datatypes::tds_value_serializer::TdsTypeContext;
 ///
 /// `TdsValueSerializer::serialize_value` needs a `PacketWriter`, and `io` is
 /// `pub(crate)`, so an integration test cannot reach the serializer on its own.
-/// This runs it over a discard transport and hands back the packet body with
-/// the 8-byte TDS header stripped, which is what the corresponding in-crate
+/// This runs it over a capturing transport and hands back the message body with
+/// every TDS packet header stripped, which is what the corresponding in-crate
 /// unit tests assert against.
 ///
 /// Exposed for the narrow-encoding tests in `tests/`, which need the collation
@@ -53,6 +53,16 @@ pub use crate::datatypes::tds_value_serializer::TdsTypeContext;
 /// `serialize_value` rather than through the shared `encode_narrow` helper —
 /// asserting the helper alone would pass whether or not the serializer actually
 /// calls it (AB#48437).
+///
+/// Correct for a value of any size. Two things make the obvious one-buffer
+/// implementation wrong once the payload crosses `max_payload_size`:
+///
+/// - `PacketWriter` flushes each full packet through `NetworkWriter::send` and
+///   then copies the overflow back to the start of its buffer, so the buffer
+///   alone holds only the *final* partial packet. [`CapturingWriter`] keeps the
+///   flushed packets so they can be concatenated back in order.
+/// - `Cursor::into_inner` returns the whole `Vec`, which after that copy-back
+///   still has stale bytes beyond the cursor. Only `..position()` is read.
 pub fn serialized_value_wire_bytes(
     value: &crate::datatypes::column_values::ColumnValues,
     ctx: &TdsTypeContext,
@@ -61,25 +71,48 @@ pub fn serialized_value_wire_bytes(
     use crate::io::packet_writer::PacketWriter;
     use crate::message::messages::PacketType;
 
-    let mut sink = DiscardWriter { size: 4096 };
-    let mut writer = PacketWriter::new(PacketType::TabularResult, &mut sink, None, None);
-    futures::executor::block_on(TdsValueSerializer::serialize_value(&mut writer, value, ctx))?;
-    let packet = writer.get_payload().clone().into_inner();
-    Ok(packet[PACKET_HEADER_SIZE..].to_vec())
+    let mut sink = CapturingWriter {
+        size: 4096,
+        sent: Vec::new(),
+    };
+
+    // Scoped so the mutable borrow ends before the captured packets are read.
+    let tail = {
+        let mut writer = PacketWriter::new(PacketType::TabularResult, &mut sink, None, None);
+        futures::executor::block_on(TdsValueSerializer::serialize_value(&mut writer, value, ctx))?;
+        let cursor = writer.get_payload();
+        let end = cursor.position() as usize;
+        let buffer = cursor.into_inner();
+        // `end` can sit at the header when a value ends exactly on a packet
+        // boundary, which is an empty tail rather than an underflow.
+        buffer[PACKET_HEADER_SIZE.min(end)..end].to_vec()
+    };
+
+    let mut out = Vec::new();
+    for packet in &sink.sent {
+        out.extend_from_slice(&packet[PACKET_HEADER_SIZE..]);
+    }
+    out.extend_from_slice(&tail);
+    Ok(out)
 }
 
-/// TDS packet header length, stripped by [`serialized_value_wire_bytes`].
+/// TDS packet header length, stripped from every packet by
+/// [`serialized_value_wire_bytes`].
 const PACKET_HEADER_SIZE: usize = 8;
 
-/// A [`NetworkWriter`] that accepts and drops everything. The bytes under test
-/// are read back out of the `PacketWriter`'s own buffer, so nothing needs to be
-/// captured here.
-struct DiscardWriter {
+/// A [`NetworkWriter`] that keeps whatever is sent to it.
+///
+/// Deliberately not a discard sink: `PacketWriter` flushes completed packets
+/// through `send` and reuses its buffer for the remainder, so dropping them
+/// would silently truncate any value larger than one packet.
+struct CapturingWriter {
     size: u32,
+    /// Each flushed packet, header included.
+    sent: Vec<Vec<u8>>,
 }
 
 #[async_trait]
-impl TransportSslHandler for DiscardWriter {
+impl TransportSslHandler for CapturingWriter {
     async fn enable_ssl(&mut self) -> TdsResult<()> {
         Ok(())
     }
@@ -89,8 +122,9 @@ impl TransportSslHandler for DiscardWriter {
 }
 
 #[async_trait]
-impl NetworkWriter for DiscardWriter {
-    async fn send(&mut self, _data: &[u8]) -> TdsResult<()> {
+impl NetworkWriter for CapturingWriter {
+    async fn send(&mut self, data: &[u8]) -> TdsResult<()> {
+        self.sent.push(data.to_vec());
         Ok(())
     }
     fn packet_size(&self) -> u32 {
