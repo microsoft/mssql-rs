@@ -1,6 +1,18 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+//! File and stderr trace sinks for the ODBC driver.
+//!
+//! Rotation is bounded, but **nothing is ever deleted**: there is no retention
+//! policy, no file cap and no age-based cleanup. A cleanup pass scanning the
+//! trace directory cannot tell its own files from those of another process
+//! writing to the same directory, so it risks destroying diagnostics belonging
+//! to a concurrently running or longer-lived instance — exactly when they
+//! matter most. Rotation therefore bounds only the size of an individual file,
+//! so each one stays openable, searchable and attachable to a bug report.
+//! Total output is bounded by the operator, who owns reclaiming the space; see
+//! the tracing section of `mssql-odbc/README.md` (AB#48091).
+
 use chrono::Utc;
 use std::ffi::OsString;
 use std::fmt;
