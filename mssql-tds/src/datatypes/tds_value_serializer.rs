@@ -1609,6 +1609,14 @@ impl TdsValueSerializer {
     /// path has always sent. Unifying that default is a separate behaviour
     /// change and is not part of the resolver fix.
     ///
+    /// Both differ from msodbcsql, which has no fallback here at all:
+    /// `CodePageFromTDSCollation` (`cli_common/src/clntcomn.cpp:152-157`)
+    /// returns `E_FAIL` when the LCID names no ANSI code page, rather than
+    /// substituting one. So neither of this crate's defaults is the reference
+    /// behaviour -- they are a deliberate choice to keep sending *something*
+    /// for a collation the crate cannot map, made in knowledge of the
+    /// reference rather than in ignorance of it.
+    ///
     /// A character the resolved encoding cannot represent becomes
     /// [`NARROW_SUBSTITUTE_BYTE`] and sets [`NarrowEncoded::had_loss`], matching
     /// msodbcsql. That must not be left to `encoding_rs`, which emits a numeric
