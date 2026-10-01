@@ -298,6 +298,12 @@ pub(crate) struct MockServer {
 }
 
 impl MockServer {
+    pub(crate) fn register_query(&self, query: &str, response: mssql_mock_tds::QueryResponse) {
+        self.server_runtime.block_on(async {
+            self.query_registry.lock().await.register(query, response);
+        });
+    }
+
     /// Registers a delay for the server's answer to the TDS Transaction
     /// Manager `Begin` request — the implicit transaction begin an
     /// autocommit-off connection issues before its first statement. Lets a

@@ -96,7 +96,33 @@ pub(super) fn claim_dbc_client(dbc: &DbcHandle, op: &str) -> Result<TdsClient, S
     Ok(client)
 }
 
-/// Returns a client claimed by [`claim_dbc_client`].
+/// Claims the connection's TDS client for an **internal** connection-scoped
+/// query, without posting any diagnostic.
+///
+/// Unlike [`claim_dbc_client`], a refusal here is not an application-visible
+/// error: the caller must fall back to whatever it already knows. That mirrors
+/// msodbcsql's `RefreshShilohUDTCache` (`sqlccmd.cpp:10337`), which returns
+/// `void` — when the connection is busy it spawns a second connection, and if
+/// even that fails it simply leaves the cached value alone rather than failing
+/// the `SQLGetInfo` that triggered it.
+///
+/// Returns `None` — with no side effects and no diagnostic — when the DBC is
+/// not connected, a statement holds the connection, or the client is already
+/// claimed. On success the connection's current
+/// [`session_generation`](crate::handles::dbc::DbcState::session_generation) is
+/// returned with the client, so the caller can tell on the way back whether the
+/// session it queried is still the one installed on the handle.
+pub(super) fn try_claim_idle_dbc_client(dbc: &DbcHandle) -> Option<(TdsClient, u64)> {
+    let mut state = dbc.inner.lock().ok()?;
+    if state.connection_state != ConnectionState::Connected || state.active_stmt.is_some() {
+        return None;
+    }
+    let generation = state.session_generation;
+    state.client.take().map(|client| (client, generation))
+}
+
+/// Returns a client claimed by [`claim_dbc_client`] or
+/// [`try_claim_idle_dbc_client`].
 ///
 /// If the DBC mutex is poisoned the client cannot be stored and is dropped, so
 /// the connection is marked disconnected rather than left as `Connected` with

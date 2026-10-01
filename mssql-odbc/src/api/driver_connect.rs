@@ -491,8 +491,9 @@ fn do_connect(
             .filter(|name| !name.is_empty())
             .unwrap_or(params.server.as_str())
             .to_string(),
-        user_name: params.uid.clone(),
     };
+    state.database_user_name = None;
+    state.session_generation = state.session_generation.wrapping_add(1);
     // Published here (not right after resolving it above) for the same
     // failed-connect reason as the other fields in this block: kept separate
     // from `state.packet_size` (the app-set attribute/default) so a

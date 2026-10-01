@@ -15,7 +15,12 @@
 
 #include "odbc_test_fixture.h"
 
+#include <chrono>
 #include <string>
+
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 
 namespace {
 
@@ -59,6 +64,174 @@ SqlTString ConnStrWith(const std::string& extra) {
     if (!base.empty() && base.back() != ';') base += ';';
     return ODBCTestUtils::ToSqlTStr(base + extra);
 }
+
+// Runs |sql| on |stmt| and returns its single character value, so a test can
+// compare an information type against what the server itself reports.
+std::string QueryScalarString(SQLHSTMT stmt, const std::string& sql) {
+    SqlTString wide = ODBCTestUtils::ToSqlTStr(sql);
+    EXPECT_TRUE(SQL_SUCCEEDED(
+        SQLExecDirect(stmt, const_cast<SQLTCHAR*>(wide.c_str()), SQL_NTS)))
+        << "failed to run: " << sql;
+    EXPECT_EQ(SQL_SUCCESS, SQLFetch(stmt));
+
+    SQLTCHAR buf[1024] = {};
+    SQLLEN ind = -1;
+    EXPECT_TRUE(SQL_SUCCEEDED(
+        SQLGetData(stmt, 1, SQL_C_TCHAR, buf, sizeof(buf), &ind)));
+    SQLFreeStmt(stmt, SQL_CLOSE);
+    if (ind == SQL_NULL_DATA) return {};
+    return ODBCTestUtils::ToNarrow(SqlTString(buf));
+}
+
+// Runs |sql| on |stmt| and ignores any failure — used for best-effort fixture
+// setup and teardown, where a denied permission is an expected outcome.
+void ExecIgnore(SQLHSTMT stmt, const std::string& sql) {
+    SqlTString wide = ODBCTestUtils::ToSqlTStr(sql);
+    SQLExecDirect(stmt, const_cast<SQLTCHAR*>(wide.c_str()), SQL_NTS);
+    SQLFreeStmt(stmt, SQL_CLOSE);
+}
+
+// Like QueryScalarString, but tolerates a query that fails or returns no row —
+// used to verify best-effort fixture setup actually took effect.
+std::string QueryScalarOrEmpty(SQLHSTMT stmt, const std::string& sql) {
+    SqlTString wide = ODBCTestUtils::ToSqlTStr(sql);
+    std::string out;
+    if (SQL_SUCCEEDED(SQLExecDirect(stmt, const_cast<SQLTCHAR*>(wide.c_str()), SQL_NTS)) &&
+        SQLFetch(stmt) == SQL_SUCCESS) {
+        SQLTCHAR buf[1024] = {};
+        SQLLEN ind = -1;
+        if (SQL_SUCCEEDED(SQLGetData(stmt, 1, SQL_C_TCHAR, buf, sizeof(buf), &ind)) &&
+            ind != SQL_NULL_DATA) {
+            out = ODBCTestUtils::ToNarrow(SqlTString(buf));
+        }
+    }
+    SQLFreeStmt(stmt, SQL_CLOSE);
+    return out;
+}
+
+// Names unique to this process and call.
+//
+// The E2E legs share one SQL instance by design — validation-stages.yml runs
+// the Linux/ARM ODBC jobs against a single `sqlInstanceMode: shared` host with
+// no dependsOn serializing them — so a fixed fixture name would let one leg's
+// teardown (DROP DATABASE, SET SINGLE_USER WITH ROLLBACK IMMEDIATE) destroy
+// another leg's database mid-test.
+std::string UniqueSuffix() {
+#ifdef _WIN32
+    unsigned long long pid = static_cast<unsigned long long>(GetCurrentProcessId());
+#else
+    unsigned long long pid = static_cast<unsigned long long>(getpid());
+#endif
+    auto ticks = static_cast<unsigned long long>(
+        std::chrono::steady_clock::now().time_since_epoch().count());
+    return std::to_string(pid) + "_" + std::to_string(ticks & 0xFFFFFFFFull);
+}
+
+// A login whose database principal genuinely differs between databases, plus a
+// database to observe that in.
+//
+// The catalog-invalidation tests cannot otherwise fail. USER_NAME() resolves
+// the principal of the *calling* connection, and CI connects as `sa`
+// (ODBC_TEST_UID is 'sa' on every leg) — a sysadmin maps to `dbo` in every
+// database, so both sides of the comparison read "dbo" whether or not the
+// driver invalidated anything. Creating a user for some *other* login does not
+// help either; the test has to connect as a login that is not a sysadmin.
+//
+// This login owns nothing: in master it falls back to `guest`, and in the probe
+// database it is the explicitly created user. Every step is best effort, and
+// `ok` stays false if the environment denies any of it.
+struct ProbePrincipal {
+    bool ok = false;
+    SqlTString connStr;
+    std::string database;
+    std::string login;
+    std::string userName;
+};
+
+ProbePrincipal CreateProbePrincipal(SQLHSTMT stmt) {
+    ProbePrincipal probe;
+    const ODBCTestConfig& cfg = ODBCTestConfig::Instance();
+    // The probe login's own credentials are generated here, so the suite's
+    // UID/PWD are irrelevant — which also lets this run under integrated auth,
+    // where the ambient login is typically a sysadmin and therefore dbo
+    // everywhere. What is needed is a server plus some way to name the driver.
+    if (cfg.Server().empty()) return probe;
+    if (cfg.Driver().empty() && !cfg.HasDSN()) return probe;
+
+    const std::string suffix = UniqueSuffix();
+    probe.database = "odbc_un_db_" + suffix;
+    probe.login = "odbc_un_login_" + suffix;
+    probe.userName = "odbc_un_user_" + suffix;
+    const std::string pwd = "Pr0be#" + suffix + "!aZ";
+
+    ExecIgnore(stmt, "CREATE DATABASE [" + probe.database + "]");
+    ExecIgnore(stmt, "CREATE LOGIN [" + probe.login + "] WITH PASSWORD = '" + pwd +
+                         "', CHECK_POLICY = OFF, CHECK_EXPIRATION = OFF");
+    ExecIgnore(stmt, "USE [" + probe.database + "]; CREATE USER [" + probe.userName +
+                         "] FOR LOGIN [" + probe.login + "]");
+    ExecIgnore(stmt, "USE [master]");
+
+    // Verify rather than assume: CREATE LOGIN/USER may have been denied.
+    const std::string created =
+        QueryScalarOrEmpty(stmt, "SELECT name FROM [" + probe.database +
+                                     "].sys.database_principals WHERE name = '" +
+                                     probe.userName + "'");
+    if (created != probe.userName) return probe;
+
+    // Always SQL auth: the whole point is to authenticate as something other
+    // than the ambient (sysadmin) login the suite itself connects with.
+    std::string conn = cfg.HasDSN() ? ("DSN=" + cfg.DSN() + ";")
+                                    : ("Driver={" + cfg.Driver() + "};");
+    conn += "Server=" + cfg.Server() + ";UID=" + probe.login + ";PWD=" + pwd + ";";
+    if (!cfg.TrustCert().empty()) conn += "TrustServerCertificate=" + cfg.TrustCert() + ";";
+    if (!cfg.Encrypt().empty()) conn += "Encrypt=" + cfg.Encrypt() + ";";
+    probe.connStr = ODBCTestUtils::ToSqlTStr(conn);
+    probe.ok = true;
+    return probe;
+}
+
+void DropProbePrincipal(SQLHSTMT stmt, const ProbePrincipal& probe) {
+    if (probe.database.empty()) return;
+    ExecIgnore(stmt, "USE [master]");
+    // Safe to force here only because the name is unique to this process; a
+    // shared name would roll back a concurrently-running leg's sessions.
+    ExecIgnore(stmt, "ALTER DATABASE [" + probe.database + "] SET SINGLE_USER WITH ROLLBACK IMMEDIATE");
+    ExecIgnore(stmt, "DROP DATABASE IF EXISTS [" + probe.database + "]");
+    ExecIgnore(stmt, "DROP LOGIN [" + probe.login + "]");
+}
+
+// An independent connection opened as the probe login. Frees itself, so a
+// failed EXPECT cannot leak the handles.
+struct ProbeConnection {
+    SQLHENV env = SQL_NULL_HENV;
+    SQLHDBC dbc = SQL_NULL_HDBC;
+    SQLHSTMT stmt = SQL_NULL_HSTMT;
+
+    bool Open(const SqlTString& connStr) {
+        if (!SQL_SUCCEEDED(SQLAllocHandle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &env))) return false;
+        SQLSetEnvAttr(env, SQL_ATTR_ODBC_VERSION,
+                      reinterpret_cast<SQLPOINTER>(SQL_OV_ODBC3), 0);
+        if (!SQL_SUCCEEDED(SQLAllocHandle(SQL_HANDLE_DBC, env, &dbc))) return false;
+
+        SQLTCHAR outStr[1024] = {};
+        SQLSMALLINT outLen = 0;
+        if (!SQL_SUCCEEDED(SQLDriverConnect(dbc, nullptr,
+                                            const_cast<SQLTCHAR*>(connStr.c_str()), SQL_NTS,
+                                            outStr, 1024, &outLen, SQL_DRIVER_NOPROMPT))) {
+            return false;
+        }
+        return SQL_SUCCEEDED(SQLAllocHandle(SQL_HANDLE_STMT, dbc, &stmt));
+    }
+
+    ~ProbeConnection() {
+        if (stmt != SQL_NULL_HSTMT) SQLFreeHandle(SQL_HANDLE_STMT, stmt);
+        if (dbc != SQL_NULL_HDBC) {
+            SQLDisconnect(dbc);
+            SQLFreeHandle(SQL_HANDLE_DBC, dbc);
+        }
+        if (env != SQL_NULL_HENV) SQLFreeHandle(SQL_HANDLE_ENV, env);
+    }
+};
 
 }  // namespace
 
@@ -104,29 +277,160 @@ TEST_F(GetInfoLiveTest, ServerNameIsReportedAndStable) {
     EXPECT_EQ(len, len2);
 }
 
-// SQL_USER_NAME must be answerable; the value differs by design (see below).
+// SQL_USER_NAME is the database principal — USER_NAME() — not the login the
+// connection authenticated as. The two differ for contained users, for schemas
+// owned via AUTHORIZATION, and for every integrated or Entra login, where the
+// connection string carries no UID at all.
 TEST_F(GetInfoLiveTest, UserNameIsReported) {
     SQLRETURN rc = SQL_ERROR;
     SQLSMALLINT len = -1;
     std::string userName = GetInfoString(dbc_, SQL_USER_NAME, &rc, &len);
     ASSERT_TRUE(SQL_SUCCEEDED(rc));
     EXPECT_EQ(static_cast<SQLSMALLINT>(userName.size() * sizeof(SQLTCHAR)), len);
+    EXPECT_FALSE(userName.empty())
+        << "a connected session always maps to a database principal";
 
-    // DIVERGENCE: msodbcsql18 reports USER_NAME() (the database user, e.g.
-    // "dbo"). It fetches that lazily on the first SQLGetInfo(SQL_USER_NAME)
-    // after login, riding along on the batch that refreshes its alias-type
-    // cache (`sqlcstr.cpp` g_szSqlUdtQuery, driven by CONN_ST_REFRESH_UDT).
-    // mssql-odbc has no such cache and no facility for issuing an internal
-    // query mid-session, so it reports the login instead. Both are non-empty
-    // for SQL authentication; integrated and token authentication legitimately
-    // yield an empty string.
-    //
-    // ODBC_TEST_CONNSTR ignores ODBC_TEST_UID, so a stale UID in the environment
-    // says nothing about how the connection actually authenticated.
-    const ODBCTestConfig& cfg = ODBCTestConfig::Instance();
-    if (!cfg.HasConnStr() && cfg.HasCredentials()) {
-        EXPECT_FALSE(userName.empty());
+    EXPECT_EQ(QueryScalarString(stmt_, "SELECT USER_NAME()"), userName);
+
+    // Cached on the connection, so repeated reads must not drift.
+    SQLSMALLINT len2 = -1;
+    EXPECT_EQ(userName, GetInfoString(dbc_, SQL_USER_NAME, &rc, &len2));
+    EXPECT_TRUE(SQL_SUCCEEDED(rc));
+    EXPECT_EQ(len, len2);
+}
+
+// The value is database-scoped, so switching catalogs through the attribute
+// must re-resolve it rather than keep reporting the old database's principal.
+//
+// Runs on a dedicated non-sysadmin connection — see CreateProbePrincipal for
+// why the suite's own `sa` connection cannot observe this at all.
+TEST_F(GetInfoLiveTest, UserNameFollowsTheCurrentCatalog) {
+    ProbePrincipal probe = CreateProbePrincipal(stmt_);
+    if (!probe.ok) {
+        DropProbePrincipal(stmt_, probe);
+        GTEST_SKIP() << "could not create a login whose principal differs by database; "
+                        "the assertions below could not fail without one";
     }
+
+    {
+        ProbeConnection probeConn;
+        if (!probeConn.Open(probe.connStr)) {
+            DropProbePrincipal(stmt_, probe);
+            GTEST_SKIP() << "probe login could not connect";
+        }
+
+        SQLRETURN rc = SQL_ERROR;
+        std::string before = GetInfoString(probeConn.dbc, SQL_USER_NAME, &rc, nullptr);
+        EXPECT_TRUE(SQL_SUCCEEDED(rc));
+
+        SqlTString target = ODBCTestUtils::ToSqlTStr(probe.database);
+        EXPECT_TRUE(SQL_SUCCEEDED(SQLSetConnectAttr(probeConn.dbc, SQL_ATTR_CURRENT_CATALOG,
+                                                    const_cast<SQLTCHAR*>(target.c_str()),
+                                                    SQL_NTS)))
+            << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_DBC, probeConn.dbc);
+
+        std::string serverTruth = QueryScalarOrEmpty(probeConn.stmt, "SELECT USER_NAME()");
+        std::string afterSwitch = GetInfoString(probeConn.dbc, SQL_USER_NAME, &rc, nullptr);
+        EXPECT_TRUE(SQL_SUCCEEDED(rc));
+        EXPECT_EQ(serverTruth, afterSwitch);
+        EXPECT_EQ(probe.userName, afterSwitch);
+        // The discriminating assertion: only a driver that actually invalidated
+        // its cache can report the new database's principal.
+        EXPECT_NE(before, afterSwitch);
+    }
+
+    DropProbePrincipal(stmt_, probe);
+}
+
+// The same invalidation has to hold for a USE the driver did not issue: the
+// server reports it with an ENVCHANGE, which is exactly what msodbcsql keys its
+// own refresh on (sqlctokn.cpp ENV_DATABASE -> CONN_ST_REFRESH_UDT).
+TEST_F(GetInfoLiveTest, UserNameFollowsARawUseStatement) {
+    ProbePrincipal probe = CreateProbePrincipal(stmt_);
+    if (!probe.ok) {
+        DropProbePrincipal(stmt_, probe);
+        GTEST_SKIP() << "could not create a login whose principal differs by database; "
+                        "the assertions below could not fail without one";
+    }
+
+    {
+        ProbeConnection probeConn;
+        if (!probeConn.Open(probe.connStr)) {
+            DropProbePrincipal(stmt_, probe);
+            GTEST_SKIP() << "probe login could not connect";
+        }
+
+        SQLRETURN rc = SQL_ERROR;
+        std::string before = GetInfoString(probeConn.dbc, SQL_USER_NAME, &rc, nullptr);
+        EXPECT_TRUE(SQL_SUCCEEDED(rc));
+
+        ExecIgnore(probeConn.stmt, "USE [" + probe.database + "]");
+
+        std::string serverTruth = QueryScalarOrEmpty(probeConn.stmt, "SELECT USER_NAME()");
+        std::string afterUse = GetInfoString(probeConn.dbc, SQL_USER_NAME, &rc, nullptr);
+        EXPECT_TRUE(SQL_SUCCEEDED(rc));
+        EXPECT_EQ(serverTruth, afterUse);
+        EXPECT_EQ(probe.userName, afterUse);
+        EXPECT_NE(before, afterUse)
+            << "a USE the driver did not issue must still invalidate the cache";
+    }
+
+    DropProbePrincipal(stmt_, probe);
+}
+
+// The lookup is internal: it must not leave records on the connection for the
+// application to trip over. msodbcsql runs it on its hidden driver statement
+// and frees any records with it.
+TEST_F(GetInfoLiveTest, UserNameLeavesNoDiagnostics) {
+    SQLRETURN rc = SQL_ERROR;
+    GetInfoString(dbc_, SQL_USER_NAME, &rc, nullptr);
+    ASSERT_EQ(SQL_SUCCESS, rc) << "a plain read must not even warn";
+
+    SQLWCHAR state[6] = {};
+    SQLINTEGER native = 0;
+    SQLWCHAR message[256] = {};
+    SQLSMALLINT messageLen = 0;
+    EXPECT_EQ(SQL_NO_DATA, SQLGetDiagRecW(SQL_HANDLE_DBC, dbc_, 1, state, &native,
+                                          message, 256, &messageLen));
+}
+
+// An open transaction is not a reason to refuse: msodbcsql only sidesteps the
+// connection when it is *busy*, and runs the lookup inline otherwise.
+TEST_F(GetInfoLiveTest, UserNameIsReportedInsideAnOpenTransaction) {
+    ASSERT_TRUE(SQL_SUCCEEDED(SQLSetConnectAttr(
+        dbc_, SQL_ATTR_AUTOCOMMIT,
+        reinterpret_cast<SQLPOINTER>(SQL_AUTOCOMMIT_OFF), 0)));
+
+    // Opens the transaction; the cursor is drained so the connection is idle.
+    EXPECT_EQ("1", QueryScalarString(stmt_, "SELECT CAST(1 AS VARCHAR(1))"));
+
+    SQLRETURN rc = SQL_ERROR;
+    std::string userName = GetInfoString(dbc_, SQL_USER_NAME, &rc, nullptr);
+    EXPECT_TRUE(SQL_SUCCEEDED(rc));
+    EXPECT_EQ(QueryScalarString(stmt_, "SELECT USER_NAME()"), userName);
+
+    EXPECT_TRUE(SQL_SUCCEEDED(SQLEndTran(SQL_HANDLE_DBC, dbc_, SQL_ROLLBACK)));
+    EXPECT_TRUE(SQL_SUCCEEDED(SQLSetConnectAttr(
+        dbc_, SQL_ATTR_AUTOCOMMIT,
+        reinterpret_cast<SQLPOINTER>(SQL_AUTOCOMMIT_ON), 0)));
+}
+
+// Truncation follows the same contract as every other string information type:
+// 01004, a NUL-terminated partial value, and the full length still reported.
+TEST_F(GetInfoLiveTest, UserNameTruncatesWithTheFullLengthReported) {
+    SQLRETURN rc = SQL_ERROR;
+    SQLSMALLINT fullLen = -1;
+    std::string userName = GetInfoString(dbc_, SQL_USER_NAME, &rc, &fullLen);
+    ASSERT_TRUE(SQL_SUCCEEDED(rc));
+    ASSERT_GE(userName.size(), 2u) << "need a value long enough to truncate";
+
+    SQLWCHAR buf[2] = {0xFFFF, 0xFFFF};
+    SQLSMALLINT len = -1;
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO,
+              SQLGetInfoW(dbc_, SQL_USER_NAME, buf, sizeof(buf), &len));
+    EXPECT_EQ(static_cast<SQLSMALLINT>(userName.size() * sizeof(SQLWCHAR)), len);
+    EXPECT_EQ(0, buf[1]) << "the partial value must still be terminated";
+    EXPECT_SQLSTATE(SQL_HANDLE_DBC, dbc_, "01004");
 }
 
 // SQL_DATA_SOURCE_NAME is empty for a DSN-less connection and the DSN otherwise.
@@ -832,9 +1136,15 @@ TEST_F(GetInfoLiveTest, SuccessfulCallClearsPreviousDiagnostic) {
 }
 
 // SQLGetInfo must work while a cursor is open on a non-MARS connection, and
-// must leave that cursor usable. mssql-odbc satisfies this by answering from
-// state captured at login; msodbcsql spawns a second connection for its own
-// lazy lookup rather than disturbing the busy one (sqlccmd.cpp, bug #656241).
+// must leave that cursor usable.
+//
+// This is the *unprimed* case: nothing has asked for SQL_USER_NAME before the
+// cursor is opened, so the driver has no cached principal and the connection is
+// busy. mssql-odbc reports the empty string there; msodbcsql spawns a second
+// connection to run its lookup rather than disturb the busy one (sqlccmd.cpp
+// RefreshShilohUDTCache, bug #656241) and reports the real name. The shared
+// contract — and what this test pins — is that neither may fail and neither may
+// touch the cursor. The value divergence is recorded in docs/sql-get-info-plan.md.
 TEST_F(GetInfoLiveTest, WorksWithAnOpenCursorAndLeavesItUsable) {
     ExecDirect("SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3");
     ASSERT_EQ(SQL_SUCCESS, SQLFetch(stmt_));
