@@ -217,9 +217,21 @@ pub(crate) struct DbcState {
     /// ones (msodbcsql `sqlcmisc.cpp:2879-2922`, `sqlcfunc.cpp:173`).
     pub(crate) stmt_query_timeout: u32,
     /// Non-secret identity of the current session, answering `SQLGetInfo`'s
-    /// `SQL_DATA_SOURCE_NAME`, `SQL_SERVER_NAME`, and `SQL_USER_NAME` without a
-    /// round trip. Populated on a successful connect, cleared on disconnect.
+    /// `SQL_DATA_SOURCE_NAME` and `SQL_SERVER_NAME` without a round trip.
+    /// Populated on a successful connect, cleared on disconnect.
     pub(crate) identity: ConnectionIdentity,
+    /// `SQL_USER_NAME`: the database principal `USER_NAME()` reported, paired
+    /// with the catalog it was read in. Populated lazily on the first
+    /// `SQLGetInfo(SQL_USER_NAME)` rather than at connect, so an application
+    /// that never asks never pays the round trip — msodbcsql's model
+    /// (`CONN_ST_REFRESH_UDT`, `sqlcinfo.cpp:1189`).
+    ///
+    /// Invalidated two ways, as msodbcsql flags its refresh from two: cleared
+    /// outright when the session changes (connect/disconnect) or when
+    /// `SQL_ATTR_CURRENT_CATALOG` switches database, and otherwise caught by
+    /// the catalog key, which covers a `USE` the driver did not issue and only
+    /// learns about from the server's ENVCHANGE.
+    pub(crate) database_user_name: Option<CachedDatabaseUserName>,
     /// Last-known database code page for `SQL_COLLATION_SEQ`, refreshed each
     /// time an execution claims the client. Answers `SQLGetInfo` while a
     /// data-at-execution sequence has moved the client onto a statement
@@ -234,11 +246,12 @@ pub(crate) struct DbcState {
     pub(crate) last_char_set: Option<String>,
 }
 
-/// The parts of a connection's identity that `SQLGetInfo` reports back to the
-/// application.
+/// The connection identity that does not vary by database.
 ///
 /// Deliberately holds no credential: the connection string is never retained,
-/// and only the login name is kept, never the password or access token.
+/// and neither the login name nor the password or access token is kept. The
+/// login is not here because no information type reports it — `SQL_USER_NAME`
+/// is the *database* user, which [`DbcState::database_user_name`] caches.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct ConnectionIdentity {
     /// `SQL_DATA_SOURCE_NAME`. Empty for a DSN-less connection, matching
@@ -248,11 +261,19 @@ pub(crate) struct ConnectionIdentity {
     /// login (`@@SERVERNAME`), falling back to the host that was dialled when
     /// the login response carried no INFO token.
     pub(crate) server_name: String,
-    /// `SQL_USER_NAME`. The login the session authenticated as; empty for
-    /// integrated and token authentication, which never supply one. msodbcsql
-    /// instead reports `USER_NAME()`, which it fetches lazily on first use;
-    /// this driver has no way to issue an internal query mid-session.
-    pub(crate) user_name: String,
+}
+
+/// A [`DbcState::database_user_name`] entry: the `USER_NAME()` answer and the
+/// catalog it is only valid for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CachedDatabaseUserName {
+    /// The database the lookup ran in, as the TDS client reported it. Compared
+    /// case-insensitively, matching how `SQL_ATTR_CURRENT_CATALOG` decides a
+    /// `USE` is redundant.
+    pub(crate) catalog: String,
+    /// What `USER_NAME()` returned there — `dbo` for an owner, the contained
+    /// user's name, or `guest`.
+    pub(crate) value: String,
 }
 
 // Manual `Debug` so the bearer access token is never rendered in logs or panic
@@ -277,6 +298,7 @@ impl std::fmt::Debug for DbcState {
             .field("current_catalog", &self.current_catalog)
             .field("stmt_query_timeout", &self.stmt_query_timeout)
             .field("identity", &self.identity)
+            .field("database_user_name", &self.database_user_name)
             .finish()
     }
 }
@@ -320,6 +342,7 @@ impl DbcHandle {
                 current_catalog: None,
                 stmt_query_timeout: 0,
                 identity: ConnectionIdentity::default(),
+                database_user_name: None,
                 last_collation_code_page: None,
                 last_char_set: None,
             }),

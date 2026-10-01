@@ -222,6 +222,12 @@ fn switch_catalog(dbc: &DbcHandle, name: String, sql: String) -> SqlReturn {
     }
 
     state.current_catalog = Some(name);
+    // `SQL_USER_NAME` is database-scoped, so the new database needs a fresh
+    // `USER_NAME()`. The cache is keyed by catalog and would notice this switch
+    // on its own; dropping it here makes the invalidation independent of the
+    // ENVCHANGE the client tracks, matching msodbcsql, which flags the refresh
+    // from both this path and the token (`sqlctokn.cpp:2881`).
+    state.database_user_name = None;
     if post_tds_info_messages(&mut state, &info_messages) {
         return SQL_SUCCESS_WITH_INFO;
     }
