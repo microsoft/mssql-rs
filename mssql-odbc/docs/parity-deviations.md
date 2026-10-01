@@ -713,16 +713,21 @@ msodbcsql build is measured.
       failure AB#48091 exists to remove — it grows until it cannot be opened,
       searched, or attached to a bug report — so the off switch is not
       reproduced.
-    - **Unit and range.** msodbcsql reads bytes through `atol`, unbounded; this
-      driver takes whole MB through `MSSQL_TDS_TRACE_MAX_FILE_SIZE_MB` clamped
-      to 1-1024 and falls back to the default on anything else. A trace file is
-      an artifact a human has to open, so byte-level precision buys nothing and
-      an unbounded value re-creates the problem above.
-    - **The active file is unnumbered.** With rotation on, msodbcsql numbers
-      the first file (`%s%u%s`, counter from 1); here the active file is
-      `mssql_tds_trace_<timestamp>_<pid>.log` and only rollovers take a
-      `.1.log`, `.2.log` suffix, so the name an operator is told to look for
-      does not change when the first rollover happens.
+    - **Unit, range and invalid input.** msodbcsql reads bytes through `atol`,
+      unbounded; this driver takes whole MB through
+      `MSSQL_TDS_TRACE_MAX_FILE_SIZE_MB`, accepts 1 through 1024, and falls
+      back to the 100 MiB default for anything outside that range or malformed.
+      It does not clamp: `0` does not become `1`, and `1025` does not become
+      `1024` — both are rejected in favour of the default. A trace file is an
+      artifact a human has to open, so byte-level precision buys nothing and an
+      unbounded value re-creates the problem above.
+    - **The first file is unnumbered.** With rotation on, msodbcsql numbers
+      from the first file (`%s%u%s`, counter from 1). Here writing starts in an
+      unsuffixed `mssql_tds_trace_<timestamp>_<pid>.log`, and each rollover
+      creates and moves to `.1.log`, `.2.log`, so the highest-numbered file is
+      the live one. A process that never reaches the limit — the common case —
+      therefore leaves one file with no numeric suffix at all, rather than a
+      lone file confusingly named `...1.log`.
     - **Nothing is ever destroyed.** msodbcsql opens the trace file `"w"`, so
       restarting a process truncates the previous run's trace; this driver's
       timestamp-and-pid name makes each run a new file, and it never deletes a

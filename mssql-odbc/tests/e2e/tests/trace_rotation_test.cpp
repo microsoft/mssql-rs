@@ -7,7 +7,7 @@
 // binary rather than against the Rust unit-test seam:
 //
 //   * an active trace file rolls over once it reaches
-//     MSSQL_TDS_TRACE_MAX_FILE_SIZE_MB, producing numbered siblings;
+//     MSSQL_TDS_TRACE_MAX_FILE_SIZE_MB, moving to numbered successors;
 //   * every rolled-over file is retained. The driver has no retention policy,
 //     no maximum file count, and no age-based cleanup, so nothing it writes may
 //     ever disappear;
@@ -167,9 +167,9 @@ TEST(TraceRotation, RollsOverBySizeAndRetainsEveryFile) {
     ASSERT_GE(files.size(), 6u)
         << "expected repeated rollover at a 1 MiB limit; got " << files.size() << " file(s)";
 
-    // The active file is `<stem>.log` and each rollover adds `<stem>.<n>.log`, so
-    // the base is the shortest name. It is NOT the lexicographic first: '1' sorts
-    // below 'l', which puts `<stem>.1.log` ahead of `<stem>.log`.
+    // Writing starts in `<stem>.log` and each rollover moves to `<stem>.<n>.log`,
+    // so the base is the shortest name. It is NOT the lexicographic first: '1'
+    // sorts below 'l', which puts `<stem>.1.log` ahead of `<stem>.log`.
     const std::filesystem::path base = *std::min_element(
         files.begin(), files.end(), [](const auto& left, const auto& right) {
             return left.filename().string().size() < right.filename().string().size();
