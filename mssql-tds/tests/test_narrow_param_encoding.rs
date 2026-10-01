@@ -353,6 +353,53 @@ fn an_unmapped_collation_keeps_the_latin1_fallback() {
     assert_eq!(encode_narrow("\u{80}", unmapped).bytes, b"?");
 }
 
+/// A value larger than one TDS packet must come back whole.
+///
+/// `PacketWriter` flushes each full packet through `NetworkWriter::send` and
+/// then reuses its buffer for the remainder, so a helper that read only that
+/// buffer would return the final fragment and silently pass. 4096 is the packet
+/// size `serialized_value_wire_bytes` configures, so ~12 KB spans several.
+///
+/// Asserts against `encode_narrow` rather than a literal: the point is that
+/// nothing is dropped or duplicated at a boundary, not what any single byte is.
+#[test]
+fn a_value_spanning_multiple_packets_is_returned_whole() {
+    // Non-ASCII so every byte also exercises the resolver, and a repeating unit
+    // that is one byte under CP437 so the expected length is predictable.
+    let text = "\u{e9}".repeat(12_000);
+    let streamed = encode_narrow(&text, sort_id(32));
+    assert_eq!(
+        streamed.bytes.len(),
+        12_000,
+        "CP437 encodes U+00E9 to one byte"
+    );
+
+    // varchar(max): PLP framing - 8-byte header, 4-byte chunk length, body,
+    // 4-byte terminator.
+    let plp = payload(&text, sort_id(32), VARCHAR, 0, true, false);
+    let body = &plp[12..plp.len() - 4];
+    assert_eq!(
+        body.len(),
+        streamed.bytes.len(),
+        "multi-packet value was truncated or duplicated"
+    );
+    assert_eq!(body, streamed.bytes.as_slice());
+}
+
+/// The same check for the bounded form, which frames with a two-byte prefix
+/// rather than PLP. The prefix must still count the whole value.
+#[test]
+fn a_bounded_value_spanning_multiple_packets_keeps_its_length_prefix() {
+    let text = "\u{e9}".repeat(6_000);
+    let bounded = payload(&text, sort_id(32), VARCHAR, 8000, false, false);
+    let prefix = u16::from_le_bytes([bounded[0], bounded[1]]) as usize;
+    assert_eq!(prefix, 6_000);
+    assert_eq!(
+        &bounded[2..],
+        encode_narrow(&text, sort_id(32)).bytes.as_slice()
+    );
+}
+
 /// An unpaired UTF-16 surrogate has no scalar value, so it is repaired to
 /// U+FFFD on decode and then substituted by the target code page, arriving as a
 /// single `?` with the loss flagged.
