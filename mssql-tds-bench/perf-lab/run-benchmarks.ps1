@@ -422,12 +422,69 @@ function Invoke-Interleave {
 $CandidateSrc = Join-Path $RepoRoot 'mssql-tds'
 $StashedSrc   = Join-Path $RepoRoot '.mssql-tds-candidate'
 $BaselineTree = Join-Path ([System.IO.Path]::GetTempPath()) "perf-baseline-$([System.Guid]::NewGuid().ToString('N'))"
+
+# Read the [package] version from a Cargo manifest.
+function Get-PackageVersion {
+    param([Parameter(Mandatory)][string] $Manifest)
+    $inPkg = $false
+    foreach ($line in Get-Content -LiteralPath $Manifest) {
+        if ($line -match '^\[') { $inPkg = $line -match '^\[package\]'; continue }
+        if ($inPkg -and $line -match '^version\s*=\s*"([^"]*)"') { return $Matches[1] }
+    }
+    return $null
+}
+
+# Rewrite the [package] version in a Cargo manifest.
+function Set-PackageVersion {
+    param([Parameter(Mandatory)][string] $Manifest, [Parameter(Mandatory)][string] $Version)
+    $inPkg = $false
+    $done  = $false
+    $lines = foreach ($line in Get-Content -LiteralPath $Manifest) {
+        if ($line -match '^\[') { $inPkg = $line -match '^\[package\]'; $line; continue }
+        if ($inPkg -and -not $done -and $line -match '^version\s*=') { $done = $true; "version = `"$Version`""; continue }
+        $line
+    }
+    # Windows PowerShell 5.1 (what the perf image ships) defaults Set-Content to the
+    # active ANSI code page, which would transcode this manifest's non-ASCII characters
+    # into bytes cargo cannot read as UTF-8. Pin UTF-8 without BOM, as the result files
+    # written further down already do.
+    [System.IO.File]::WriteAllLines($Manifest, [string[]] $lines, (New-Object System.Text.UTF8Encoding($false)))
+}
+
+# Sibling workspace crates pin mssql-tds by version (e.g. mssql-mock-tds declares
+# `mssql-tds = { path = "../mssql-tds", version = "0.2.0" }`). Cargo resolves the whole
+# workspace, so once main bumps the crate version the older baseline source no longer
+# satisfies that requirement and the entire baseline build fails.
+#
+# Stamp the candidate's version onto the baseline manifest. CARGO_PKG_VERSION is
+# compiled into the driver — DriverVersion::from_cargo_version() goes into the TDS login
+# packet and UserAgent::default().driver_version into the login metadata — so stamping
+# also makes that compiled-in metadata IDENTICAL on both sides. That removes a
+# difference between the two builds rather than introducing one.
+function Sync-BaselineVersion {
+    $manifest = Join-Path $script:CandidateSrc 'Cargo.toml'
+    $cand = Get-PackageVersion (Join-Path $script:StashedSrc 'Cargo.toml')
+    $base = Get-PackageVersion $manifest
+    if (-not $cand -or -not $base) { throw 'could not read [package] version from the mssql-tds manifests.' }
+    if ($cand -ne $base) {
+        Write-Host ">>> Stamping candidate version $cand onto the baseline mssql-tds manifest (was $base)."
+        Set-PackageVersion $manifest $cand
+    }
+}
+
 function Set-BaselineSource {
     Move-Item $script:CandidateSrc $script:StashedSrc
     Copy-Item -Recurse (Join-Path $script:BaselineTree 'mssql-tds') $script:CandidateSrc
+    Sync-BaselineVersion
 }
+# Idempotent, and safe on every path that can reach the finally block. Both directories
+# are checked: a second call finds no stash, and a Copy-Item failure in Set-BaselineSource
+# leaves the stash present with no destination - where an unguarded Remove-Item would
+# throw ItemNotFoundException under ErrorActionPreference 'Stop' and strand the candidate
+# before Move-Item ever ran. (The bash side needs no such guard; rm -rf no-ops.)
 function Restore-CandidateSource {
-    Remove-Item -Recurse -Force $script:CandidateSrc
+    if (-not (Test-Path -LiteralPath $script:StashedSrc)) { return }
+    if (Test-Path -LiteralPath $script:CandidateSrc) { Remove-Item -Recurse -Force $script:CandidateSrc }
     Move-Item $script:StashedSrc $script:CandidateSrc
 }
 
@@ -436,13 +493,23 @@ Invoke-CompileBenches (Join-Path $RepoRoot 'target') 'candidate'
 $script:CandBins = Get-BenchBinaries (Join-Path $RepoRoot 'target')
 if ($script:CandBins.Count -eq 0) { throw 'no candidate bench binaries found' }
 
+# A stash here means an earlier run died before restoring (only reachable outside the
+# lab, where the VM is rebuilt per run). Refuse rather than proceed: Move-Item moves
+# INTO an existing directory, so the live source would nest inside the stale stash and
+# the restore would then put the stale tree back without throwing - silent corruption.
+# Checked before the worktree is created so a refusal leaves nothing to clean up.
+if (Test-Path -LiteralPath $StashedSrc) {
+    throw "$StashedSrc already exists - an earlier run did not finish restoring. Move the real mssql-tds source back out of it, remove it, then re-run."
+}
+
 Write-Host ">>> Adding baseline worktree for $BaselineCommit at $BaselineTree..."
 Invoke-Native { git worktree add --detach $BaselineTree $BaselineCommit }
 Write-Host '>>> Building baseline bench binaries (target-base/)...'
-Set-BaselineSource
-# finally, so a baseline compile failure cannot leave the checkout holding the
-# baseline source with the candidate stranded in the stash directory.
+# Set-BaselineSource runs INSIDE the try: it is itself fallible (the version stamping
+# can throw), and from the moment the source moves, any throw must still reach the
+# finally. Restore-CandidateSource is a no-op until the stash exists.
 try {
+    Set-BaselineSource
     Invoke-CompileBenches (Join-Path $RepoRoot 'target-base') 'baseline'
     $script:BaseBins = Get-BenchBinaries (Join-Path $RepoRoot 'target-base')
 } finally {

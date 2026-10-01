@@ -1239,7 +1239,7 @@ TEST_F(ScalarConversionLiveTest, CharTimestampLiteralRoundTrips) {
 //
 // Pre-existing and deliberate: the parser is shared with fetch, and the same
 // permissiveness covers `HH:MM` without seconds and unpadded fields like
-// `2023-6-5`. Narrowing it is AB#47246, not this PR.
+// `2023-6-5`. AB#47246 preserves these existing accepted forms.
 TEST_F(ScalarConversionLiveTest, CharTimestampAcceptsTheIsoSeparator) {
     SKIP_IF_COMPARING_MSODBCSQL();
 
@@ -1282,6 +1282,102 @@ TEST_F(ScalarConversionLiveTest, CharDateOnlyLiteralFillsATimestampAtMidnight) {
     ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(32), ?, 121)"), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(BindNarrow(SQL_TYPE_TIMESTAMP, "2024-05-20"), SQL_HANDLE_STMT, stmt_);
     EXPECT_EQ("2024-05-20 00:00:00.0000000", ExecuteAndReadBack());
+}
+
+// Benefits-from-mock-tds: capture temporal TYPE_INFO and encoded payloads
+// for narrow/wide parameters rather than only server-rendered values.
+TEST_F(ScalarConversionLiveTest, OdbcTemporalLiteralsRoundTrip) {
+    SQLCHAR version[32] = {};
+    ASSERT_SQL_OK(SQLGetInfoA(dbc_, SQL_DRIVER_VER, version, sizeof(version), nullptr),
+                  SQL_HANDLE_DBC, dbc_);
+    RecordProperty("driver_version", reinterpret_cast<const char*>(version));
+    struct Case {
+        SQLSMALLINT sql_type;
+        const char* literal;
+        const char* expected;
+    };
+    for (const Case& value : {
+             Case{SQL_TYPE_DATE, "2024/05/20", "2024-05-20"},
+             Case{SQL_TYPE_DATE, "2000/02/29", "2000-02-29"},
+             Case{SQL_TYPE_DATE, "{d '2024-05-20'}", "2024-05-20"},
+             Case{SQL_TYPE_DATE, "{D'2024-05-20'}", "2024-05-20"},
+             Case{SQL_TYPE_DATE, "{ d ' 2024 - 05 - 20 ' }", "2024-05-20"},
+             Case{SQL_TYPE_TIME, "{t '12:34:56'}", "12:34:56.0000000"},
+             Case{SQL_SS_TIME2, "{T'12:34:56'}", "12:34:56.0000000"},
+             Case{SQL_TYPE_TIME, "{ t ' 12 : 34 : 56 ' }", "12:34:56.0000000"},
+             Case{SQL_TYPE_TIMESTAMP, "{ts '2024-05-20 12:34:56.1234567'}",
+                  "2024-05-20 12:34:56.1234567"},
+             Case{SQL_TYPE_TIMESTAMP, "{Ts '2024-05-20\t12:34:56'}",
+                  "2024-05-20 12:34:56.0000000"},
+               Case{SQL_TYPE_TIMESTAMP, "{ts '2024-05-20 12:34:56.'}",
+                   "2024-05-20 12:34:56.0000000"},
+               Case{SQL_TYPE_TIMESTAMP, "{ts '2024-05-20 12:34:56 . 001 '}",
+                   "2024-05-20 12:34:56.0010000"},
+               Case{SQL_SS_TIMESTAMPOFFSET, "{ts '2024-05-20 12:34:56.1234567'}",
+                   "2024-05-20 12:34:56.1234567"},
+             Case{SQL_TYPE_TIMESTAMP, "{d '2024-05-20'}", "2024-05-20 00:00:00.0000000"},
+             Case{SQL_TYPE_TIMESTAMP, "2024/05/20", "2024-05-20 00:00:00.0000000"},
+         }) {
+        for (bool wide : {false, true}) {
+            SCOPED_TRACE(value.literal);
+            SCOPED_TRACE(wide);
+            ASSERT_SQL_OK(Prepare(value.sql_type == SQL_SS_TIMESTAMPOFFSET
+                                      ? "SELECT CONVERT(VARCHAR(64), CAST(? AS DATETIME2), 121)"
+                                      : "SELECT CONVERT(VARCHAR(64), ?, 121)"),
+                          SQL_HANDLE_STMT, stmt_);
+            ASSERT_SQL_OK(wide ? BindWide(value.sql_type, value.literal, 0, 7)
+                               : BindNarrow(value.sql_type, value.literal, 0, 7),
+                          SQL_HANDLE_STMT, stmt_);
+            EXPECT_EQ(value.expected, ExecuteAndReadBack());
+            ResetParams();
+        }
+    }
+}
+
+// Benefits-from-mock-tds: verify malformed literals are rejected before
+// any temporal parameter payload is sent, not just the returned SQLSTATE.
+TEST_F(ScalarConversionLiveTest, MalformedOdbcTemporalLiteralsAre22018) {
+    SQLCHAR version[32] = {};
+    ASSERT_SQL_OK(SQLGetInfoA(dbc_, SQL_DRIVER_VER, version, sizeof(version), nullptr),
+                  SQL_HANDLE_DBC, dbc_);
+    RecordProperty("driver_version", reinterpret_cast<const char*>(version));
+    struct Case {
+        SQLSMALLINT sql_type;
+        const char* literal;
+    };
+    for (const Case& value : {
+             Case{SQL_TYPE_DATE, "2024/05-20"},
+             Case{SQL_TYPE_DATE, "2024/5/20"},
+             Case{SQL_TYPE_DATE, "2024/05/20 12:34:56"},
+             Case{SQL_TYPE_DATE, "2023/02/29"},
+             Case{SQL_TYPE_DATE, "{d '2024/05/20'}"},
+             Case{SQL_TYPE_DATE, "{d '2024-05-20 12:34:56'}"},
+             Case{SQL_TYPE_TIME, "{t '2024-05-20'}"},
+             Case{SQL_TYPE_TIMESTAMP, "{ts '2024-05-20'}"},
+             Case{SQL_TYPE_DATE, "{d '2024-5-20'}"},
+             Case{SQL_TYPE_TIME, "{t '12:34'}"},
+             Case{SQL_TYPE_TIME, "{t '12:34:56.1'}"},
+             Case{SQL_TYPE_TIMESTAMP, "{ts '2024-05-20T12:34:56'}"},
+             Case{SQL_TYPE_TIMESTAMP, "{ts '2024-05-20 12:34:56+05:30'}"},
+             Case{SQL_TYPE_TIMESTAMP, "{ts '2024-05-20 12:34:56.1234567890'}"},
+             Case{SQL_TYPE_DATE, "{d '2024-05-20'} junk"},
+             Case{SQL_TYPE_TIMESTAMP, "{ts '2024-05-2012:34:56'}"},
+             Case{SQL_TYPE_DATE, "{d '2024-05-20'"},
+             Case{SQL_TYPE_DATE, "{d '2023-02-29'}"},
+             Case{SQL_TYPE_TIME, "{t '24:00:00'}"},
+         }) {
+        for (bool wide : {false, true}) {
+            SCOPED_TRACE(value.literal);
+            SCOPED_TRACE(wide);
+            ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
+            ASSERT_SQL_OK(wide ? BindWide(value.sql_type, value.literal, 0, 7)
+                               : BindNarrow(value.sql_type, value.literal, 0, 7),
+                          SQL_HANDLE_STMT, stmt_);
+            EXPECT_EQ(SQL_ERROR, SQLExecute(stmt_));
+            EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "22018");
+            ResetParams();
+        }
+    }
 }
 
 TEST_F(ScalarConversionLiveTest, UnparseableTemporalLiteralIs22018) {
@@ -2936,4 +3032,112 @@ TEST_F(ExtendedTypeLiveTest, BinaryVariantRoundTripsThroughASqlVariantColumn) {
                           " FROM #variant_param"),
                   SQL_HANDLE_STMT, stmt_);
     EXPECT_EQ("102030|varbinary", ExecuteAndReadBack());
+}
+
+// Conversion-matrix cells msodbcsql performs and this driver has not
+// implemented yet. All eight were measured against msodbcsql18: every one
+// binds, and all but TIMESTAMP->TYPE_DATE also execute (that one binds and then
+// fails at execute with 22008, because dropping a non-zero time is an error,
+// not a truncation).
+//
+// msodbcsql accepts them at SQLBindParameter (`sqlcdesc.cpp:3031`), which folds
+// the 3.x concise C/SQL ids to their 2.x and *_MAPPED forms first (`:2975-2983`)
+// - so these pairings only reach `IsValidSQLConversion` under internal ids, not
+// the public ones named here. That function's switch subtracts exclusions and
+// then defers to `fValidConversion` (`sqlcprot.h:2625`), which is what actually
+// admits them: `SQL_C_BINARY`'s row is ALLCONVERSION (`sqlcmisc.cpp:495`,
+// `:588`) and the temporal C rows are DATETIMECONVERSION (`:518-526`, `:599-601`
+// for the 2.x forms, `:626-627` for the SS ones), whose bits cover every SQL
+// target below. Clearing the switch is therefore not sufficient on its own -
+// `SQL_C_GUID -> SQL_TYPE_TIME` passes it and is still refused, because
+// GUIDCONVERSION carries no SQL_TIME bit.
+//
+// This driver refuses all of them at bind with HYC00. That is the documented
+// reading of this matrix - it records what is implemented, not what is legal -
+// and AB#48249 is where the remaining cells get implemented or flipped to
+// 07006, the state msodbcsql already answers here (`IDS_07_006`,
+// `sqlcdesc.cpp:3033`). Pinning the refusal means that work has to update this
+// test deliberately rather than silently.
+//
+// Selection rule, so this is not read as exhaustive: one cell per distinct
+// bitmap row reached by a C type this driver already binds, plus the SS_TIME2
+// mirrors of the SS_TIMESTAMPOFFSET pair, which share a row and are the ones
+// most likely to drift when AB#48249 lands.
+//
+// EVIDENCE: the source reading above, plus a direct measurement of all eight
+// cells against retail msodbcsql18 18.6.2.1 (`SQL_DRIVER_VER` 18.06.0002) - the
+// build `msodbcsqlVersion` pins - on 2026-09-29, the six original cells, and
+// 2026-09-30, the two SS_TIME2 mirrors. A 3.8 application is required: the
+// Driver Manager refuses the SS-extended C types with HY003 under SQL_OV_ODBC3,
+// so a probe that declares only 3.x measures the DM, not the driver.
+// SKIP_IF_COMPARING_MSODBCSQL() means the reference leg never re-measures this
+// block, so AB#48249 should re-measure against the build it targets rather than
+// inherit a one-off observation.
+TEST_F(CrossConversionLiveTest, UnimplementedMatrixCellsAreRefusedAtBind) {
+    SKIP_IF_COMPARING_MSODBCSQL();
+
+    struct Cell {
+        const char* name;
+        SQLSMALLINT c_type;
+        SQLSMALLINT sql_type;
+        // The target's own ColumnSize/DecimalDigits, not the source buffer's, so
+        // a cell that AB#48249 flips to success does not then fail HY104 and
+        // read as a broken flip rather than a stale fixture.
+        SQLULEN size;
+        SQLSMALLINT scale;
+    };
+    const Cell cells[] = {
+        {"BINARY->SS_XML", SQL_C_BINARY, SQL_SS_XML, 0, 0},
+        {"TIMESTAMP->TYPE_TIME", SQL_C_TYPE_TIMESTAMP, SQL_TYPE_TIME, 16, 7},
+        {"TIMESTAMP->TYPE_DATE", SQL_C_TYPE_TIMESTAMP, SQL_TYPE_DATE, 10, 0},
+        {"DATE->TYPE_TIMESTAMP", SQL_C_TYPE_DATE, SQL_TYPE_TIMESTAMP, 23, 3},
+        {"TSOFFSET->TYPE_TIMESTAMP", SQL_C_SS_TIMESTAMPOFFSET, SQL_TYPE_TIMESTAMP, 23, 3},
+        {"TSOFFSET->SS_TIME2", SQL_C_SS_TIMESTAMPOFFSET, SQL_SS_TIME2, 16, 7},
+        {"SS_TIME2->TYPE_TIMESTAMP", SQL_C_SS_TIME2, SQL_TYPE_TIMESTAMP, 23, 3},
+        {"SS_TIME2->SS_TIMESTAMPOFFSET", SQL_C_SS_TIME2, SQL_SS_TIMESTAMPOFFSET, 34, 7},
+    };
+
+    SQL_TIMESTAMP_STRUCT ts = {2024, 5, 6, 7, 8, 9, 0};
+    SQL_DATE_STRUCT dt = {2024, 5, 6};
+    SQL_SS_TIMESTAMPOFFSET_STRUCT tso = {2024, 5, 6, 7, 8, 9, 0, 0, 0};
+    SQL_SS_TIME2_STRUCT t2 = {7, 8, 9, 0};
+    unsigned char xml[] = {0x3C, 0x00, 0x61, 0x00, 0x2F, 0x00, 0x3E, 0x00};
+
+    for (const Cell& cell : cells) {
+        ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
+
+        void* data = nullptr;
+        SQLLEN ind = 0;
+        switch (cell.c_type) {
+            case SQL_C_BINARY:
+                data = xml;
+                ind = sizeof(xml);
+                break;
+            case SQL_C_TYPE_TIMESTAMP:
+                data = &ts;
+                ind = sizeof(ts);
+                break;
+            case SQL_C_TYPE_DATE:
+                data = &dt;
+                ind = sizeof(dt);
+                break;
+            case SQL_C_SS_TIME2:
+                data = &t2;
+                ind = sizeof(t2);
+                break;
+            case SQL_C_SS_TIMESTAMPOFFSET:
+                data = &tso;
+                ind = sizeof(tso);
+                break;
+            default:
+                FAIL() << "no buffer wired for " << cell.name;
+        }
+
+        EXPECT_EQ(SQL_ERROR, SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, cell.c_type,
+                                              cell.sql_type, cell.size, cell.scale, data, ind,
+                                              &ind))
+            << cell.name;
+        EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HYC00") << cell.name;
+        EXPECT_SQL_OK(SQLFreeStmt(stmt_, SQL_RESET_PARAMS), SQL_HANDLE_STMT, stmt_);
+    }
 }

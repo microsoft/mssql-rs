@@ -37,6 +37,7 @@ use crate::api::sqlstate::{
 use crate::api::util::{copy_with_nul, write_if_some};
 use crate::error::free_errors;
 use crate::handles::{DbcHandle, HandleType, handle_from_raw};
+use mssql_tds::connection::tds_client::TdsClient;
 
 /// `sysname`, the type of every identifier column in the catalog views, which
 /// bounds `SQL_MAX_COLUMN_NAME_LEN`, `SQL_MAX_SCHEMA_NAME_LEN`, and
@@ -69,6 +70,156 @@ const SQL_SERVER_MAX_SELECT_COLUMNS: u16 = 4096;
 const SQL_SERVER_MAX_TABLE_COLUMNS: u16 = 1024;
 const SQL_SERVER_MAX_ROW_SIZE: u32 = 8060;
 const SQL_SERVER_MAX_TABLES_IN_SELECT: u16 = 32;
+
+// AB#47996: SQLGetInfo conversion bitmask components (sqlext.h SQL_CVT_*).
+const CVT_CHAR: u32 = 0x0000_0001;
+const CVT_NUMERIC: u32 = 0x0000_0002;
+const CVT_DECIMAL: u32 = 0x0000_0004;
+const CVT_INTEGER: u32 = 0x0000_0008;
+const CVT_SMALLINT: u32 = 0x0000_0010;
+const CVT_FLOAT: u32 = 0x0000_0020;
+const CVT_REAL: u32 = 0x0000_0040;
+const CVT_VARCHAR: u32 = 0x0000_0100;
+const CVT_LONGVARCHAR: u32 = 0x0000_0200;
+const CVT_BINARY: u32 = 0x0000_0400;
+const CVT_VARBINARY: u32 = 0x0000_0800;
+const CVT_BIT: u32 = 0x0000_1000;
+const CVT_TINYINT: u32 = 0x0000_2000;
+const CVT_BIGINT: u32 = 0x0000_4000;
+const CVT_TIMESTAMP: u32 = 0x0002_0000;
+const CVT_LONGVARBINARY: u32 = 0x0004_0000;
+const CVT_WCHAR: u32 = 0x0020_0000;
+const CVT_WLONGVARCHAR: u32 = 0x0040_0000;
+const CVT_WVARCHAR: u32 = 0x0080_0000;
+const CVT_GUID: u32 = 0x0100_0000;
+
+// msodbcsql conversion groupings (`sqlcinfo.cpp` macros). `MONEYCVT` is
+// `SQL_CVT_DECIMAL`, `IMAGECVT` is `SQL_CVT_LONGVARBINARY`, `TIMESTAMPCVT` is
+// `SQL_CVT_TIMESTAMP`, `GUIDCVT` is `SQL_CVT_GUID`.
+const BINARYCVT: u32 = CVT_BINARY | CVT_VARBINARY;
+const INTCVT: u32 = CVT_BIGINT | CVT_INTEGER | CVT_SMALLINT | CVT_TINYINT;
+const FLOATCVT: u32 = CVT_FLOAT | CVT_REAL;
+const WCHARCVT: u32 = CVT_WCHAR | CVT_WVARCHAR;
+const CHARCVT: u32 = CVT_CHAR | CVT_VARCHAR;
+const NUMERICCVT: u32 = CVT_DECIMAL | CVT_NUMERIC;
+const TEXTCVT: u32 = CVT_LONGVARCHAR | CVT_WLONGVARCHAR;
+const CVT_CHAR_SPT: u32 = BINARYCVT
+    | INTCVT
+    | FLOATCVT
+    | CHARCVT
+    | WCHARCVT
+    | CVT_DECIMAL
+    | CVT_BIT
+    | NUMERICCVT
+    | CVT_TIMESTAMP
+    | TEXTCVT
+    | CVT_LONGVARBINARY
+    | CVT_GUID;
+const CVT_BINARY_SPT: u32 =
+    BINARYCVT | INTCVT | CHARCVT | WCHARCVT | CVT_LONGVARBINARY | NUMERICCVT;
+const CVT_NUMBER_SPT: u32 =
+    BINARYCVT | INTCVT | FLOATCVT | CHARCVT | WCHARCVT | CVT_DECIMAL | CVT_BIT | NUMERICCVT;
+const CVT_APXNUM_SPT: u32 =
+    INTCVT | FLOATCVT | CHARCVT | WCHARCVT | CVT_DECIMAL | CVT_BIT | NUMERICCVT;
+const CVT_BIT_SPT: u32 = BINARYCVT | INTCVT | FLOATCVT | CHARCVT | WCHARCVT | CVT_BIT | NUMERICCVT;
+const CVT_VARCHAR_SPT: u32 = CVT_CHAR_SPT;
+const CVT_GUID_SPT: u32 = CHARCVT | WCHARCVT | CVT_GUID;
+const CVT_LONGVARCHAR_SPT: u32 = CHARCVT | WCHARCVT | TEXTCVT;
+const CVT_LONGVARBINARY_SPT: u32 = BINARYCVT | CVT_LONGVARBINARY;
+const CVT_TIMESTAMP_SPT: u32 = BINARYCVT | CHARCVT | WCHARCVT | CVT_TIMESTAMP;
+
+// Other AB#47996 capability masks (sqlext.h bit names).
+const SQL_AF_ALL: u32 = 0x0000_0040;
+const SQL_CT_CREATE_TABLE: u32 = 0x0000_0001;
+const SQL_DT_DROP_TABLE: u32 = 0x0000_0001;
+const SQL_DV_DROP_VIEW: u32 = 0x0000_0001;
+const SQL_CS_CREATE_SCHEMA: u32 = 0x0000_0001;
+const SQL_CS_AUTHORIZATION: u32 = 0x0000_0002;
+const SQL_IK_ALL: u32 = 0x0000_0001 | 0x0000_0002;
+const SQL_IS_INSERT_LITERALS: u32 = 0x0000_0001;
+const SQL_IS_INSERT_SEARCHED: u32 = 0x0000_0002;
+const SQL_IS_SELECT_INTO: u32 = 0x0000_0004;
+const SQL_SCC_ISO92_CLI: u32 = 0x0000_0002;
+const SQL_QL_START: u16 = 0x0001;
+const SQL_NNC_NON_NULL: u16 = 0x0001;
+const SQL_FILE_NOT_SUPPORTED: u16 = 0x0000;
+// The `INFORMATION_SCHEMA` views SQL Server exposes (msodbcsql
+// `SQL_INFO_SCHEMA_VIEWS_SPT`): the 17 `SQL_ISV_*` bits it advertises.
+const SQL_INFO_SCHEMA_VIEWS_MASK: u32 = 0x0000_0004 // CHECK_CONSTRAINTS
+    | 0x0000_0010 // COLUMN_DOMAIN_USAGE
+    | 0x0000_0020 // COLUMN_PRIVILEGES
+    | 0x0000_0040 // COLUMNS
+    | 0x0000_0080 // CONSTRAINT_COLUMN_USAGE
+    | 0x0000_0100 // CONSTRAINT_TABLE_USAGE
+    | 0x0000_0200 // DOMAIN_CONSTRAINTS
+    | 0x0000_0400 // DOMAINS
+    | 0x0000_0800 // KEY_COLUMN_USAGE
+    | 0x0000_1000 // REFERENTIAL_CONSTRAINTS
+    | 0x0000_2000 // SCHEMATA
+    | 0x0000_8000 // TABLE_CONSTRAINTS
+    | 0x0001_0000 // TABLE_PRIVILEGES
+    | 0x0002_0000 // TABLES
+    | 0x0010_0000 // VIEW_COLUMN_USAGE
+    | 0x0020_0000 // VIEW_TABLE_USAGE
+    | 0x0040_0000; // VIEWS
+// SQL Server identifier and index limits from msodbcsql's `sqlsrv.h`/`tds.h`:
+// `MAXCURSORNAMESPHINX` = `SYSNAMELEN` (128), `MAXPROCNAMESPHINX` =
+// `MAX_PROCNAME + 6` = 128 + 6 (the `;nnnnn` numbered-procedure suffix), and
+// `MAXINDEXSIZESPHINX` = 900. The compare-leg E2E pins these against retail.
+const SQL_SERVER_MAX_CURSOR_NAME_LEN: u16 = 128;
+const SQL_SERVER_MAX_PROCEDURE_NAME_LEN: u16 = 134;
+const SQL_SERVER_MAX_INDEX_SIZE: u32 = 900;
+
+// `SQL_CREATE_VIEW` and the SQL-92 capability masks (sqlext.h bit names),
+// assembled to match msodbcsql's `SQLGetInfoTable`.
+const SQL_CV_CREATE_VIEW: u32 = 0x0000_0001;
+const SQL_CV_CHECK_OPTION: u32 = 0x0000_0002;
+const SQL_CREATE_VIEW_MASK: u32 = SQL_CV_CREATE_VIEW | SQL_CV_CHECK_OPTION;
+const SQL_SG_WITH_GRANT_OPTION: u32 = 0x0000_0010;
+const SQL_SR_GRANT_OPTION_FOR: u32 = 0x0000_0010;
+const SQL_SP_EXISTS: u32 = 0x0000_0001;
+const SQL_SP_ISNOTNULL: u32 = 0x0000_0002;
+const SQL_SP_ISNULL: u32 = 0x0000_0004;
+const SQL_SP_LIKE: u32 = 0x0000_0200;
+const SQL_SP_IN: u32 = 0x0000_0400;
+const SQL_SP_BETWEEN: u32 = 0x0000_0800;
+const SQL_SP_COMPARISON: u32 = 0x0000_1000;
+const SQL_SP_QUANTIFIED_COMPARISON: u32 = 0x0000_2000;
+const SQL_SQL92_PREDICATES_SPT: u32 = SQL_SP_BETWEEN
+    | SQL_SP_COMPARISON
+    | SQL_SP_EXISTS
+    | SQL_SP_IN
+    | SQL_SP_ISNOTNULL
+    | SQL_SP_ISNULL
+    | SQL_SP_LIKE
+    | SQL_SP_QUANTIFIED_COMPARISON;
+const SQL_SRJO_CROSS_JOIN: u32 = 0x0000_0002;
+const SQL_SRJO_FULL_OUTER_JOIN: u32 = 0x0000_0008;
+const SQL_SRJO_INNER_JOIN: u32 = 0x0000_0010;
+const SQL_SRJO_LEFT_OUTER_JOIN: u32 = 0x0000_0040;
+const SQL_SRJO_RIGHT_OUTER_JOIN: u32 = 0x0000_0100;
+const SQL_SRJO_UNION_JOIN: u32 = 0x0000_0200;
+const SQL_SQL92_RELATIONAL_JOIN_OPERATORS_SPT: u32 = SQL_SRJO_CROSS_JOIN
+    | SQL_SRJO_FULL_OUTER_JOIN
+    | SQL_SRJO_INNER_JOIN
+    | SQL_SRJO_LEFT_OUTER_JOIN
+    | SQL_SRJO_RIGHT_OUTER_JOIN
+    | SQL_SRJO_UNION_JOIN;
+const SQL_SRVC_VALUE_EXPRESSION: u32 = 0x0000_0001;
+const SQL_SRVC_NULL: u32 = 0x0000_0002;
+const SQL_SRVC_DEFAULT: u32 = 0x0000_0004;
+const SQL_SRVC_ROW_SUBQUERY: u32 = 0x0000_0008;
+const SQL_SQL92_ROW_VALUE_CONSTRUCTOR_SPT: u32 =
+    SQL_SRVC_VALUE_EXPRESSION | SQL_SRVC_NULL | SQL_SRVC_DEFAULT | SQL_SRVC_ROW_SUBQUERY;
+const SQL_SSF_LOWER: u32 = 0x0000_0002;
+const SQL_SSF_UPPER: u32 = 0x0000_0004;
+const SQL_SQL92_STRING_FUNCTIONS_SPT: u32 = SQL_SSF_LOWER | SQL_SSF_UPPER;
+const SQL_SVE_CASE: u32 = 0x0000_0001;
+const SQL_SVE_CAST: u32 = 0x0000_0002;
+const SQL_SVE_COALESCE: u32 = 0x0000_0004;
+const SQL_SVE_NULLIF: u32 = 0x0000_0008;
+const SQL_SQL92_VALUE_EXPRESSIONS_SPT: u32 =
+    SQL_SVE_CASE | SQL_SVE_CAST | SQL_SVE_COALESCE | SQL_SVE_NULLIF;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum InfoValue {
@@ -308,6 +459,317 @@ const STATIC_INFO: &[InfoEntry] = &[
         info_type: odbc::SQL_XOPEN_CLI_YEAR,
         value: InfoValue::String("1995"),
     },
+    // AB#47996: remaining ODBC 3.x information types. Values from msodbcsql's
+    // `SQLGetInfoTable` (`sqlcinfo.cpp`); confirmed against retail 18.6.2.1 by
+    // the compare-leg E2E suite.
+    InfoEntry {
+        info_type: odbc::SQL_ROW_UPDATES,
+        value: InfoValue::String("N"),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_MAX_ROW_SIZE_INCLUDES_LONG,
+        value: InfoValue::String("N"),
+    },
+    // `SQL_INTEGRITY` (`SQL_ODBC_SQL_OPT_IEF`): msodbcsql's code path forces "Y".
+    InfoEntry {
+        info_type: odbc::SQL_INTEGRITY,
+        value: InfoValue::String("Y"),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_ACTIVE_ENVIRONMENTS,
+        value: InfoValue::U16(NO_STATED_U16_LIMIT),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_FILE_USAGE,
+        value: InfoValue::U16(SQL_FILE_NOT_SUPPORTED),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_CATALOG_LOCATION,
+        value: InfoValue::U16(SQL_QL_START),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_NON_NULLABLE_COLUMNS,
+        value: InfoValue::U16(SQL_NNC_NON_NULL),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_MAX_CURSOR_NAME_LEN,
+        value: InfoValue::U16(SQL_SERVER_MAX_CURSOR_NAME_LEN),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_MAX_PROCEDURE_NAME_LEN,
+        value: InfoValue::U16(SQL_SERVER_MAX_PROCEDURE_NAME_LEN),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_MAX_INDEX_SIZE,
+        value: InfoValue::U32(SQL_SERVER_MAX_INDEX_SIZE),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_MAX_ASYNC_CONCURRENT_STATEMENTS,
+        // Async is not implemented (`SQL_ASYNC_MODE` is `SQL_AM_NONE`), so this
+        // reports no async statements rather than msodbcsql's 1 (see plan.md
+        // Phase 15). Capability ledger, not parity.
+        value: InfoValue::U32(0),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_ODBC_INTERFACE_CONFORMANCE,
+        // 0, not msodbcsql's Level 2 nor even Core: the Core interface set
+        // requires `SQLGetCursorName` / `SQLSetCursorName`, which are
+        // unimplemented (and correctly absent from `SQLGetFunctions`), so no
+        // named conformance level is fully met. Rises to Core when cursor-name
+        // support lands with Phase 10 (`docs/odbc-escape-sequences-plan.md`).
+        // Capability ledger, not parity.
+        value: InfoValue::U32(0),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_STANDARD_CLI_CONFORMANCE,
+        value: InfoValue::Bitmask(SQL_SCC_ISO92_CLI),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_AGGREGATE_FUNCTIONS,
+        value: InfoValue::Bitmask(SQL_AF_ALL),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_INDEX_KEYWORDS,
+        value: InfoValue::Bitmask(SQL_IK_ALL),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_INSERT_STATEMENT,
+        value: InfoValue::Bitmask(
+            SQL_IS_INSERT_LITERALS | SQL_IS_INSERT_SEARCHED | SQL_IS_SELECT_INTO,
+        ),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_INFO_SCHEMA_VIEWS,
+        value: InfoValue::Bitmask(SQL_INFO_SCHEMA_VIEWS_MASK),
+    },
+    // SQLSetPos is not implemented (planned in Phase 10), so this driver
+    // advertises no positioned operations or lock types.
+    InfoEntry {
+        info_type: odbc::SQL_LOCK_TYPES,
+        value: InfoValue::Bitmask(NO_CAPABILITIES),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_POS_OPERATIONS,
+        value: InfoValue::Bitmask(NO_CAPABILITIES),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_CREATE_SCHEMA,
+        value: InfoValue::Bitmask(SQL_CS_CREATE_SCHEMA | SQL_CS_AUTHORIZATION),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_CREATE_TABLE,
+        value: InfoValue::Bitmask(SQL_CT_CREATE_TABLE),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_DROP_TABLE,
+        value: InfoValue::Bitmask(SQL_DT_DROP_TABLE),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_DROP_VIEW,
+        value: InfoValue::Bitmask(SQL_DV_DROP_VIEW),
+    },
+    // Features SQL Server does not implement: ODBC specifies a zero mask, not a
+    // failure.
+    InfoEntry {
+        info_type: odbc::SQL_ALTER_DOMAIN,
+        value: InfoValue::Bitmask(NO_CAPABILITIES),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_DATETIME_LITERALS,
+        value: InfoValue::Bitmask(NO_CAPABILITIES),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_CREATE_CHARACTER_SET,
+        value: InfoValue::Bitmask(NO_CAPABILITIES),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_CREATE_COLLATION,
+        value: InfoValue::Bitmask(NO_CAPABILITIES),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_CREATE_DOMAIN,
+        value: InfoValue::Bitmask(NO_CAPABILITIES),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_CREATE_TRANSLATION,
+        value: InfoValue::Bitmask(NO_CAPABILITIES),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_DROP_ASSERTION,
+        value: InfoValue::Bitmask(NO_CAPABILITIES),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_DROP_CHARACTER_SET,
+        value: InfoValue::Bitmask(NO_CAPABILITIES),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_DROP_COLLATION,
+        value: InfoValue::Bitmask(NO_CAPABILITIES),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_DROP_DOMAIN,
+        value: InfoValue::Bitmask(NO_CAPABILITIES),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_DROP_SCHEMA,
+        value: InfoValue::Bitmask(NO_CAPABILITIES),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_DROP_TRANSLATION,
+        value: InfoValue::Bitmask(NO_CAPABILITIES),
+    },
+    // Conversion-support masks (msodbcsql `SQL_CVT_*_SPT`).
+    InfoEntry {
+        info_type: odbc::SQL_CONVERT_BIGINT,
+        value: InfoValue::Bitmask(CVT_NUMBER_SPT),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_CONVERT_BINARY,
+        value: InfoValue::Bitmask(CVT_BINARY_SPT),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_CONVERT_BIT,
+        value: InfoValue::Bitmask(CVT_BIT_SPT),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_CONVERT_CHAR,
+        value: InfoValue::Bitmask(CVT_CHAR_SPT),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_CONVERT_DECIMAL,
+        value: InfoValue::Bitmask(CVT_NUMBER_SPT),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_CONVERT_FLOAT,
+        value: InfoValue::Bitmask(CVT_APXNUM_SPT),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_CONVERT_GUID,
+        value: InfoValue::Bitmask(CVT_GUID_SPT),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_CONVERT_INTEGER,
+        value: InfoValue::Bitmask(CVT_NUMBER_SPT),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_CONVERT_LONGVARBINARY,
+        value: InfoValue::Bitmask(CVT_LONGVARBINARY_SPT),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_CONVERT_LONGVARCHAR,
+        value: InfoValue::Bitmask(CVT_LONGVARCHAR_SPT),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_CONVERT_NUMERIC,
+        value: InfoValue::Bitmask(CVT_NUMBER_SPT),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_CONVERT_REAL,
+        value: InfoValue::Bitmask(CVT_APXNUM_SPT),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_CONVERT_SMALLINT,
+        value: InfoValue::Bitmask(CVT_NUMBER_SPT),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_CONVERT_TIMESTAMP,
+        value: InfoValue::Bitmask(CVT_TIMESTAMP_SPT),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_CONVERT_TINYINT,
+        value: InfoValue::Bitmask(CVT_NUMBER_SPT),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_CONVERT_VARBINARY,
+        value: InfoValue::Bitmask(CVT_BINARY_SPT),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_CONVERT_VARCHAR,
+        value: InfoValue::Bitmask(CVT_VARCHAR_SPT),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_CONVERT_WCHAR,
+        value: InfoValue::Bitmask(CVT_CHAR_SPT),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_CONVERT_WVARCHAR,
+        value: InfoValue::Bitmask(CVT_VARCHAR_SPT),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_CONVERT_WLONGVARCHAR,
+        value: InfoValue::Bitmask(CVT_LONGVARCHAR_SPT),
+    },
+    // msodbcsql reports a zero conversion mask for these targets; kept for
+    // parity, not a statement about SQL Server's own CAST/CONVERT support.
+    InfoEntry {
+        info_type: odbc::SQL_CONVERT_DATE,
+        value: InfoValue::Bitmask(NO_CAPABILITIES),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_CONVERT_DOUBLE,
+        value: InfoValue::Bitmask(NO_CAPABILITIES),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_CONVERT_TIME,
+        value: InfoValue::Bitmask(NO_CAPABILITIES),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_CONVERT_INTERVAL_DAY_TIME,
+        value: InfoValue::Bitmask(NO_CAPABILITIES),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_CONVERT_INTERVAL_YEAR_MONTH,
+        value: InfoValue::Bitmask(NO_CAPABILITIES),
+    },
+    // `SQL_CREATE_VIEW` and the SQL-92 capability masks (msodbcsql `SQLGetInfoTable`).
+    InfoEntry {
+        info_type: odbc::SQL_CREATE_VIEW,
+        value: InfoValue::Bitmask(SQL_CREATE_VIEW_MASK),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_SQL92_GRANT,
+        value: InfoValue::Bitmask(SQL_SG_WITH_GRANT_OPTION),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_SQL92_REVOKE,
+        value: InfoValue::Bitmask(SQL_SR_GRANT_OPTION_FOR),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_SQL92_PREDICATES,
+        value: InfoValue::Bitmask(SQL_SQL92_PREDICATES_SPT),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_SQL92_RELATIONAL_JOIN_OPERATORS,
+        value: InfoValue::Bitmask(SQL_SQL92_RELATIONAL_JOIN_OPERATORS_SPT),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_SQL92_ROW_VALUE_CONSTRUCTOR,
+        value: InfoValue::Bitmask(SQL_SQL92_ROW_VALUE_CONSTRUCTOR_SPT),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_SQL92_STRING_FUNCTIONS,
+        value: InfoValue::Bitmask(SQL_SQL92_STRING_FUNCTIONS_SPT),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_SQL92_VALUE_EXPRESSIONS,
+        value: InfoValue::Bitmask(SQL_SQL92_VALUE_EXPRESSIONS_SPT),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_SQL92_DATETIME_FUNCTIONS,
+        value: InfoValue::Bitmask(NO_CAPABILITIES),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_SQL92_FOREIGN_KEY_DELETE_RULE,
+        value: InfoValue::Bitmask(NO_CAPABILITIES),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_SQL92_FOREIGN_KEY_UPDATE_RULE,
+        value: InfoValue::Bitmask(NO_CAPABILITIES),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_SQL92_NUMERIC_VALUE_FUNCTIONS,
+        value: InfoValue::Bitmask(NO_CAPABILITIES),
+    },
 ];
 
 /// `SQL_KEYWORDS`: SQL Server reserved words that are *not* in the ODBC
@@ -439,6 +901,28 @@ fn sql_get_info_w_safe(
                 buffer_length,
                 string_length_ptr,
                 &database,
+            )
+        }
+        odbc::SQL_COLLATION_SEQ => {
+            // Resolved from the live client, not snapshotted: the database
+            // collation (hence code page) changes on `USE` / catalog switch.
+            // While a data-at-execution sequence owns the client, fall back to
+            // the value cached when that execution claimed it.
+            let collation = match state.client.as_ref() {
+                Some(client) => {
+                    collation_seq_string(client.collation_code_page(), client.char_set())
+                }
+                None => collation_seq_string(
+                    state.last_collation_code_page,
+                    state.last_char_set.as_deref(),
+                ),
+            };
+            write_wide_str(
+                &mut state,
+                info_value_ptr,
+                buffer_length,
+                string_length_ptr,
+                &collation,
             )
         }
         SQL_MAX_DRIVER_CONNECTIONS => {
@@ -795,6 +1279,59 @@ fn driver_name() -> &'static str {
     env!("MSSQL_ODBC_ARTIFACT")
 }
 
+/// `SQL_COLLATION_SEQ` name for a server code page. msodbcsql names only these
+/// three (`sqlctokn.cpp` `ENV_DATABASECOLLATION`) and leaves the rest empty.
+fn collation_seq_name(code_page: Option<u16>) -> Option<&'static str> {
+    match code_page {
+        Some(1252) => Some("ISO 8859-1"),
+        Some(850) => Some("Code page 850"),
+        Some(437) => Some("Code page 437"),
+        _ => None,
+    }
+}
+
+/// The `SQL_COLLATION_SEQ` string for a database code page and optional legacy
+/// `CHARACTER_SET` name: the code page's msodbcsql name, else the legacy
+/// display name, else empty.
+fn collation_seq_string(code_page: Option<u16>, char_set: Option<&str>) -> String {
+    collation_seq_name(code_page)
+        .map(str::to_string)
+        .or_else(|| char_set.map(char_set_display_name))
+        .unwrap_or_default()
+}
+
+/// The connection-level `SQL_COLLATION_SEQ` cache inputs for a live client: the
+/// database code page, plus the legacy `CHARACTER_SET` name only when it is
+/// needed to name a code page [`collation_seq_name`] does not cover. Keeping
+/// the code page as a plain `u16` lets [`claim_connection`] refresh the cache
+/// without allocating on the common named-code-page path.
+///
+/// [`claim_connection`]: crate::api::exec_common::claim_connection
+pub(super) fn collation_cache_inputs(client: &TdsClient) -> (Option<u16>, Option<String>) {
+    let code_page = client.collation_code_page();
+    let char_set = if collation_seq_name(code_page).is_none() {
+        client.char_set().map(str::to_string)
+    } else {
+        None
+    };
+    (code_page, char_set)
+}
+
+/// Maps a legacy `CHARACTER_SET` `ENVCHANGE` name to its `SQL_COLLATION_SEQ`
+/// display form the way msodbcsql's `ENV_CHARSET` handler does
+/// (`sqlctokn.cpp`): `iso_1` becomes `ISO 8859-1`, everything else becomes
+/// `Code page <suffix>` after dropping the two-character prefix.
+fn char_set_display_name(char_set: &str) -> String {
+    if char_set.eq_ignore_ascii_case("iso_1") {
+        "ISO 8859-1".to_string()
+    } else if char_set.chars().count() > 2 {
+        let suffix: String = char_set.chars().skip(2).collect();
+        format!("Code page {suffix}")
+    } else {
+        char_set.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
@@ -893,6 +1430,12 @@ mod tests {
         odbc::SQL_MAX_IDENTIFIER_LEN,
         odbc::SQL_MAX_TABLES_IN_SELECT,
         odbc::SQL_MAX_USER_NAME_LEN,
+        odbc::SQL_ACTIVE_ENVIRONMENTS,
+        odbc::SQL_FILE_USAGE,
+        odbc::SQL_CATALOG_LOCATION,
+        odbc::SQL_NON_NULLABLE_COLUMNS,
+        odbc::SQL_MAX_CURSOR_NAME_LEN,
+        odbc::SQL_MAX_PROCEDURE_NAME_LEN,
     ];
 
     #[test]
@@ -900,7 +1443,7 @@ mod tests {
         let h = TestHandles::with_env_dbc();
         let mut seen = HashSet::new();
 
-        assert_eq!(STATIC_INFO.len(), 50);
+        assert_eq!(STATIC_INFO.len(), 122);
         for entry in STATIC_INFO {
             assert!(
                 seen.insert(entry.info_type),
@@ -1302,6 +1845,217 @@ mod tests {
         let state = dbc_ref.inner.lock().unwrap();
         assert_eq!(state.diag_records.len(), 1);
         assert_eq!(state.diag_records[0].sql_state, ERR_INVALID_INFO_TYPE.state);
+    }
+
+    // AB#47996: residual ODBC 3.x information types report their msodbcsql
+    // values instead of falling through to HY096.
+    #[test]
+    fn residual_u32_info_types_report_expected_values() {
+        let h = TestHandles::with_env_dbc();
+        for (info_type, expected) in [
+            (odbc::SQL_CONVERT_BIGINT, CVT_NUMBER_SPT),
+            (odbc::SQL_CONVERT_BINARY, CVT_BINARY_SPT),
+            (odbc::SQL_CONVERT_BIT, CVT_BIT_SPT),
+            (odbc::SQL_CONVERT_CHAR, CVT_CHAR_SPT),
+            (odbc::SQL_CONVERT_DECIMAL, CVT_NUMBER_SPT),
+            (odbc::SQL_CONVERT_FLOAT, CVT_APXNUM_SPT),
+            (odbc::SQL_CONVERT_GUID, CVT_GUID_SPT),
+            (odbc::SQL_CONVERT_INTEGER, CVT_NUMBER_SPT),
+            (odbc::SQL_CONVERT_LONGVARBINARY, CVT_LONGVARBINARY_SPT),
+            (odbc::SQL_CONVERT_LONGVARCHAR, CVT_LONGVARCHAR_SPT),
+            (odbc::SQL_CONVERT_NUMERIC, CVT_NUMBER_SPT),
+            (odbc::SQL_CONVERT_REAL, CVT_APXNUM_SPT),
+            (odbc::SQL_CONVERT_SMALLINT, CVT_NUMBER_SPT),
+            (odbc::SQL_CONVERT_TIMESTAMP, CVT_TIMESTAMP_SPT),
+            (odbc::SQL_CONVERT_TINYINT, CVT_NUMBER_SPT),
+            (odbc::SQL_CONVERT_VARBINARY, CVT_BINARY_SPT),
+            (odbc::SQL_CONVERT_VARCHAR, CVT_VARCHAR_SPT),
+            (odbc::SQL_CONVERT_DATE, 0),
+            (odbc::SQL_CONVERT_DOUBLE, 0),
+            (odbc::SQL_CONVERT_TIME, 0),
+            (odbc::SQL_CONVERT_INTERVAL_DAY_TIME, 0),
+            (odbc::SQL_CONVERT_INTERVAL_YEAR_MONTH, 0),
+            (odbc::SQL_AGGREGATE_FUNCTIONS, SQL_AF_ALL),
+            (odbc::SQL_INDEX_KEYWORDS, SQL_IK_ALL),
+            (
+                odbc::SQL_INSERT_STATEMENT,
+                SQL_IS_INSERT_LITERALS | SQL_IS_INSERT_SEARCHED | SQL_IS_SELECT_INTO,
+            ),
+            (odbc::SQL_INFO_SCHEMA_VIEWS, SQL_INFO_SCHEMA_VIEWS_MASK),
+            // SQLSetPos unimplemented: no positioned operations or lock types.
+            (odbc::SQL_LOCK_TYPES, 0),
+            (odbc::SQL_POS_OPERATIONS, 0),
+            (
+                odbc::SQL_CREATE_SCHEMA,
+                SQL_CS_CREATE_SCHEMA | SQL_CS_AUTHORIZATION,
+            ),
+            (odbc::SQL_CREATE_TABLE, SQL_CT_CREATE_TABLE),
+            (odbc::SQL_DROP_TABLE, SQL_DT_DROP_TABLE),
+            (odbc::SQL_DROP_VIEW, SQL_DV_DROP_VIEW),
+            (odbc::SQL_CREATE_VIEW, SQL_CREATE_VIEW_MASK),
+            (odbc::SQL_ALTER_DOMAIN, 0),
+            (odbc::SQL_DATETIME_LITERALS, 0),
+            (odbc::SQL_CREATE_DOMAIN, 0),
+            (odbc::SQL_DROP_SCHEMA, 0),
+            // Zero-mask capability types msodbcsql still answers (not HY096).
+            (odbc::SQL_CREATE_CHARACTER_SET, 0),
+            (odbc::SQL_CREATE_COLLATION, 0),
+            (odbc::SQL_CREATE_TRANSLATION, 0),
+            (odbc::SQL_DROP_ASSERTION, 0),
+            (odbc::SQL_DROP_CHARACTER_SET, 0),
+            (odbc::SQL_DROP_COLLATION, 0),
+            (odbc::SQL_DROP_DOMAIN, 0),
+            (odbc::SQL_DROP_TRANSLATION, 0),
+            // Wide conversion targets.
+            (odbc::SQL_CONVERT_WCHAR, CVT_CHAR_SPT),
+            (odbc::SQL_CONVERT_WVARCHAR, CVT_VARCHAR_SPT),
+            (odbc::SQL_CONVERT_WLONGVARCHAR, CVT_LONGVARCHAR_SPT),
+            // SQL-92 capability masks.
+            (odbc::SQL_SQL92_GRANT, SQL_SG_WITH_GRANT_OPTION),
+            (odbc::SQL_SQL92_REVOKE, SQL_SR_GRANT_OPTION_FOR),
+            (odbc::SQL_SQL92_PREDICATES, SQL_SQL92_PREDICATES_SPT),
+            (
+                odbc::SQL_SQL92_RELATIONAL_JOIN_OPERATORS,
+                SQL_SQL92_RELATIONAL_JOIN_OPERATORS_SPT,
+            ),
+            (
+                odbc::SQL_SQL92_ROW_VALUE_CONSTRUCTOR,
+                SQL_SQL92_ROW_VALUE_CONSTRUCTOR_SPT,
+            ),
+            (
+                odbc::SQL_SQL92_STRING_FUNCTIONS,
+                SQL_SQL92_STRING_FUNCTIONS_SPT,
+            ),
+            (
+                odbc::SQL_SQL92_VALUE_EXPRESSIONS,
+                SQL_SQL92_VALUE_EXPRESSIONS_SPT,
+            ),
+            (odbc::SQL_SQL92_DATETIME_FUNCTIONS, 0),
+            (odbc::SQL_SQL92_FOREIGN_KEY_DELETE_RULE, 0),
+            (odbc::SQL_SQL92_FOREIGN_KEY_UPDATE_RULE, 0),
+            (odbc::SQL_SQL92_NUMERIC_VALUE_FUNCTIONS, 0),
+            (odbc::SQL_MAX_INDEX_SIZE, SQL_SERVER_MAX_INDEX_SIZE),
+            (odbc::SQL_MAX_ASYNC_CONCURRENT_STATEMENTS, 0),
+            (odbc::SQL_ODBC_INTERFACE_CONFORMANCE, 0),
+            (odbc::SQL_STANDARD_CLI_CONFORMANCE, SQL_SCC_ISO92_CLI),
+        ] {
+            let (rc, val, len) = get_u32(h.dbc, info_type);
+            assert_eq!(rc, SQL_SUCCESS, "info_type {info_type}");
+            assert_eq!(val, expected, "info_type {info_type}");
+            assert_eq!(len, 4, "info_type {info_type}");
+        }
+    }
+
+    #[test]
+    fn residual_u16_info_types_report_expected_values() {
+        let h = TestHandles::with_env_dbc();
+        for (info_type, expected) in [
+            (odbc::SQL_ACTIVE_ENVIRONMENTS, 0u16),
+            (odbc::SQL_FILE_USAGE, SQL_FILE_NOT_SUPPORTED),
+            (odbc::SQL_CATALOG_LOCATION, SQL_QL_START),
+            (odbc::SQL_NON_NULLABLE_COLUMNS, SQL_NNC_NON_NULL),
+            (
+                odbc::SQL_MAX_CURSOR_NAME_LEN,
+                SQL_SERVER_MAX_CURSOR_NAME_LEN,
+            ),
+            (
+                odbc::SQL_MAX_PROCEDURE_NAME_LEN,
+                SQL_SERVER_MAX_PROCEDURE_NAME_LEN,
+            ),
+        ] {
+            let (rc, val, len) = get_u16(h.dbc, info_type);
+            assert_eq!(rc, SQL_SUCCESS, "info_type {info_type}");
+            assert_eq!(val, expected, "info_type {info_type}");
+            assert_eq!(len, 2, "info_type {info_type}");
+        }
+    }
+
+    #[test]
+    fn residual_string_info_types_report_expected_values() {
+        let h = TestHandles::with_env_dbc();
+        for (info_type, expected) in [
+            (odbc::SQL_ROW_UPDATES, "N"),
+            (odbc::SQL_MAX_ROW_SIZE_INCLUDES_LONG, "N"),
+            (odbc::SQL_INTEGRITY, "Y"),
+        ] {
+            let (rc, value, len) = get_wide_str(h.dbc, info_type);
+            assert_eq!(rc, SQL_SUCCESS, "info_type {info_type}");
+            assert_eq!(value, expected, "info_type {info_type}");
+            assert_eq!(len, 2, "info_type {info_type}");
+        }
+    }
+
+    // The five `SQL_DRIVER_H*` handle types and `SQL_DRIVER_AWARE_POOLING_SUPPORTED`
+    // are answered by the Driver Manager (or, in msodbcsql, `ERROR_FLAG`), so the
+    // driver core returns HY096.
+    #[test]
+    fn handle_and_pooling_info_types_return_hy096() {
+        let h = TestHandles::with_env_dbc();
+        for info_type in [
+            odbc::SQL_DRIVER_HDBC,
+            odbc::SQL_DRIVER_HENV,
+            odbc::SQL_DRIVER_HSTMT,
+            odbc::SQL_DRIVER_HLIB,
+            odbc::SQL_DRIVER_HDESC,
+            odbc::SQL_DRIVER_AWARE_POOLING_SUPPORTED,
+        ] {
+            let (rc, _, _) = get_u32(h.dbc, info_type);
+            assert_eq!(rc, SQL_ERROR, "info_type {info_type}");
+            let dbc_ref = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+            let state = dbc_ref.inner.lock().unwrap();
+            assert_eq!(
+                state.diag_records[0].sql_state, ERR_INVALID_INFO_TYPE.state,
+                "info_type {info_type}"
+            );
+        }
+    }
+
+    #[test]
+    fn collation_seq_is_empty_without_a_connection() {
+        let h = TestHandles::with_env_dbc();
+        let (rc, value, len) = get_wide_str(h.dbc, odbc::SQL_COLLATION_SEQ);
+        assert_eq!(rc, SQL_SUCCESS);
+        assert_eq!(value, "");
+        assert_eq!(len, 0);
+    }
+
+    #[test]
+    fn collation_seq_uses_the_cache_while_the_client_is_parked() {
+        let h = TestHandles::with_env_dbc();
+        let dbc_ref = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        {
+            // A data-at-execution sequence has moved the client onto a
+            // statement; the DBC stays connected with the collation cached.
+            let mut state = dbc_ref.inner.lock().unwrap();
+            assert!(state.client.is_none());
+            state.last_collation_code_page = Some(1252);
+        }
+        let (rc, value, len) = get_wide_str(h.dbc, odbc::SQL_COLLATION_SEQ);
+        assert_eq!(rc, SQL_SUCCESS);
+        assert_eq!(value, "ISO 8859-1");
+        assert_eq!(len, 20);
+    }
+
+    #[test]
+    fn collation_seq_name_maps_only_the_three_named_code_pages() {
+        assert_eq!(collation_seq_name(Some(1252)), Some("ISO 8859-1"));
+        assert_eq!(collation_seq_name(Some(850)), Some("Code page 850"));
+        assert_eq!(collation_seq_name(Some(437)), Some("Code page 437"));
+        assert_eq!(collation_seq_name(Some(1251)), None);
+        assert_eq!(collation_seq_name(Some(65001)), None);
+        assert_eq!(collation_seq_name(None), None);
+    }
+
+    #[test]
+    fn char_set_display_name_matches_env_charset_mapping() {
+        assert_eq!(char_set_display_name("iso_1"), "ISO 8859-1");
+        assert_eq!(char_set_display_name("cp850"), "Code page 850");
+        assert_eq!(char_set_display_name("cp1252"), "Code page 1252");
+        // Names whose multi-byte characters straddle byte offset 2 (where the
+        // old byte slice `&char_set[2..]` cut) must drop two whole characters
+        // without panicking on a UTF-8 boundary.
+        assert_eq!(char_set_display_name("日本語"), "Code page 語");
+        assert_eq!(char_set_display_name("aあx"), "Code page x");
     }
 
     #[test]

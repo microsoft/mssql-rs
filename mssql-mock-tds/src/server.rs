@@ -7,10 +7,10 @@ use crate::protocol::{
     PACKET_HEADER_SIZE, PacketHeader, PacketType, ProtocolError, TM_BEGIN_XACT,
     build_attention_ack_packet, build_done_token, build_error_response,
     build_feature_ext_ack_fedauth, build_fedauth_challenge_response, build_login_ack,
-    build_prelogin_response, build_prelogin_response_with_fedauth, build_query_result,
-    build_routing_response, build_transaction_manager_response, parse_fedauth_token,
-    parse_login7_auth, parse_sql_batch, parse_transaction_descriptor_header,
-    parse_transaction_manager_request,
+    build_prelogin_response, build_prelogin_response_with_fedauth,
+    build_query_result_with_trailing_info, build_routing_response,
+    build_transaction_manager_response, parse_fedauth_token, parse_login7_auth, parse_sql_batch,
+    parse_transaction_descriptor_header, parse_transaction_manager_request,
 };
 use crate::query_response::{QueryRegistry, RPC_DELAY_KEY, TM_BEGIN_DELAY_KEY};
 use bytes::BytesMut;
@@ -478,8 +478,14 @@ impl ConnectionProcessor {
 
                             // Look up query in registry. Cloned so the lock is
                             // released before any artificial delay below.
-                            let registered = self.query_registry.lock().await.get(&sql).cloned();
-                            if let Some(response_data) = registered {
+                            let registered = {
+                                let registry = self.query_registry.lock().await;
+                                registry
+                                    .get(&sql)
+                                    .cloned()
+                                    .map(|r| (r, registry.trailing_info(&sql).to_vec()))
+                            };
+                            if let Some((response_data, trailing_info)) = registered {
                                 info!("Found registered response for query");
                                 match self
                                     .wait_out_delay_or_attention(socket, response_data.delay)
@@ -490,7 +496,10 @@ impl ConnectionProcessor {
                                     DelayOutcome::Elapsed => {}
                                 }
                                 // build_query_result already wraps in a packet, so return directly
-                                let packet = build_query_result(&response_data);
+                                let packet = build_query_result_with_trailing_info(
+                                    &response_data,
+                                    &trailing_info,
+                                );
                                 Some(packet)
                             } else {
                                 info!("No registered response, returning empty result");
@@ -533,13 +542,13 @@ impl ConnectionProcessor {
                     // substring of the request body, which is sufficient for
                     // `sp_prepexec` / `sp_execute`'s `@stmt` parameter — see
                     // `QueryRegistry::get_by_contained_utf16_text`.
-                    let registered = self
-                        .query_registry
-                        .lock()
-                        .await
-                        .get_by_contained_utf16_text(packet_body)
-                        .cloned();
-                    if let Some(response_data) = registered {
+                    let registered = {
+                        let registry = self.query_registry.lock().await;
+                        registry
+                            .get_by_contained_utf16_text_with_trailing_info(packet_body)
+                            .map(|(response, trailing)| (response.clone(), trailing.to_vec()))
+                    };
+                    if let Some((response_data, trailing_info)) = registered {
                         info!("Found registered response for RPC request");
                         match self
                             .wait_out_delay_or_attention(socket, response_data.delay)
@@ -549,7 +558,10 @@ impl ConnectionProcessor {
                             DelayOutcome::Closed => return Ok(None),
                             DelayOutcome::Elapsed => {}
                         }
-                        Some(build_query_result(&response_data))
+                        Some(build_query_result_with_trailing_info(
+                            &response_data,
+                            &trailing_info,
+                        ))
                     } else {
                         info!("No registered response for RPC request, returning empty result");
                         // A test can still delay this answer via the reserved
@@ -1466,7 +1478,10 @@ async fn handle_connection(
                                 // Look up query in registry
                                 let registry = query_registry.lock().await;
                                 if let Some(response) = registry.get(&sql) {
-                                    Some(build_query_result(response))
+                                    Some(build_query_result_with_trailing_info(
+                                        response,
+                                        registry.trailing_info(&sql),
+                                    ))
                                 } else if sql.to_uppercase().starts_with("SELECT") {
                                     // Return empty result set with DONE for unknown SELECT queries
                                     let mut response = BytesMut::new();

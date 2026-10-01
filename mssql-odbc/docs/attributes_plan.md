@@ -69,6 +69,7 @@ mssql-python, so `SQL_ATTR_CONNECTION_POOLING` is out of scope.
 | `SQL_COPT_SS_INTEGRATED_SECURITY` | ✅ | ✅ | attribute overrides keyword |
 | `SQL_COPT_SS_ENCRYPT` | ✅ | ✅ | attribute overrides keyword |
 | `SQL_COPT_SS_TRUST_SERVER_CERTIFICATE` | ✅ | ✅ | reports effective policy |
+| `SQL_COPT_SS_WARN_ON_CP_ERROR` | ✅ | ✅ | settable pre- and post-connect; `HY024` outside `SQL_WARN_NO`/`SQL_WARN_YES` (deviation 22) |
 
 The remaining recognized connection attributes are pending in S5b and return
 their measured not-implemented diagnostic; an unknown identifier returns `HY092`.
