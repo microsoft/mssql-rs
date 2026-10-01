@@ -4475,6 +4475,11 @@ mod tests {
     /// same way, so the same value under the same collation reaches the wire as
     /// the same bytes whichever route it took. Before the fix the two disagreed
     /// under exactly the collations above.
+    ///
+    /// Driven through `serialize_varchar` rather than calling
+    /// `encode_narrow_for_wire` directly, so it also fails if `serialize_string`
+    /// is ever rerouted away from that helper — comparing the two helpers to
+    /// each other could not see that.
     #[test]
     fn the_inline_arm_agrees_with_the_streamed_encoder() {
         let probes = ["\u{e9}", "\u{3b1}", "\u{d3}", "Caf\u{e9} \u{65e5}", "plain"];
@@ -4486,14 +4491,23 @@ mod tests {
         ];
         for (what, collation) in collations {
             for probe in probes {
-                let inline = TdsValueSerializer::encode_narrow_for_wire(probe, Some(collation));
+                let (payload, had_loss) = serialize_varchar(probe, Some(collation));
                 let streamed = encode_narrow(probe, collation);
+                // `varchar(n)` frames with a two-byte little-endian prefix; the
+                // streamed encoder returns the bare body.
+                let prefix = u16::from_le_bytes([payload[0], payload[1]]) as usize;
                 assert_eq!(
-                    inline.bytes, streamed.bytes,
+                    &payload[2..],
+                    streamed.bytes.as_slice(),
                     "{what}: inline and streamed bytes differ for {probe:?}"
                 );
                 assert_eq!(
-                    inline.had_loss, streamed.had_loss,
+                    prefix,
+                    streamed.bytes.len(),
+                    "{what}: length prefix does not count the encoded bytes for {probe:?}"
+                );
+                assert_eq!(
+                    had_loss, streamed.had_loss,
                     "{what}: inline and streamed loss flags differ for {probe:?}"
                 );
             }
@@ -4580,6 +4594,31 @@ mod tests {
     /// the assertions above run through `serialize_string` rather than against
     /// the helper in isolation.
     fn serialize_varchar(text: &str, collation: Option<SqlCollation>) -> (Vec<u8>, bool) {
+        let value = ColumnValues::String(crate::datatypes::sql_string::SqlString::new(
+            text.as_bytes().to_vec(),
+            crate::datatypes::sql_string::EncodingType::Utf8,
+        ));
+        serialize_narrow(&value, collation)
+    }
+
+    /// [`serialize_varchar`] for a UTF-16LE source, so a genuinely malformed
+    /// one -- an unpaired surrogate, which cannot be expressed as a `&str` --
+    /// can be driven through the same path.
+    fn serialize_varchar_utf16(utf16le: &[u8], collation: SqlCollation) -> (Vec<u8>, bool) {
+        let value = ColumnValues::String(crate::datatypes::sql_string::SqlString::new(
+            utf16le.to_vec(),
+            crate::datatypes::sql_string::EncodingType::Utf16,
+        ));
+        serialize_narrow(&value, Some(collation))
+    }
+
+    /// Serializes an already-built `value` as a `varchar` parameter under
+    /// `collation`, returning the payload and the message's code-page loss
+    /// verdict.
+    ///
+    /// Shared by [`serialize_varchar`] and [`serialize_varchar_utf16`], which
+    /// differ only in how they build the `SqlString`.
+    fn serialize_narrow(value: &ColumnValues, collation: Option<SqlCollation>) -> (Vec<u8>, bool) {
         let mut mock = MockNetworkWriter::new(64);
         let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
         let ctx = TdsTypeContext {
@@ -4592,37 +4631,8 @@ mod tests {
             collation,
             is_nullable: true,
         };
-        let value = ColumnValues::String(crate::datatypes::sql_string::SqlString::new(
-            text.as_bytes().to_vec(),
-            crate::datatypes::sql_string::EncodingType::Utf8,
-        ));
-        block_on(TdsValueSerializer::serialize_value(&mut w, &value, &ctx)).expect("serializes");
-        let payload = w.get_payload().clone().into_inner()[8..].to_vec();
-        (payload, w.code_page_conversion_loss())
-    }
-
-    /// [`serialize_varchar`] for a UTF-16LE source, so a genuinely malformed
-    /// one -- an unpaired surrogate, which cannot be expressed as a `&str` --
-    /// can be driven through the same path.
-    fn serialize_varchar_utf16(utf16le: &[u8], collation: SqlCollation) -> (Vec<u8>, bool) {
-        let mut mock = MockNetworkWriter::new(64);
-        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
-        let ctx = TdsTypeContext {
-            tds_type: VARCHAR,
-            max_size: 8000,
-            is_plp: false,
-            is_fixed_length: false,
-            precision: None,
-            scale: None,
-            collation: Some(collation),
-            is_nullable: true,
-        };
-        let value = ColumnValues::String(crate::datatypes::sql_string::SqlString::new(
-            utf16le.to_vec(),
-            crate::datatypes::sql_string::EncodingType::Utf16,
-        ));
-        block_on(TdsValueSerializer::serialize_value(&mut w, &value, &ctx)).expect("serializes");
-        let payload = w.get_payload().clone().into_inner()[8..].to_vec();
+        block_on(TdsValueSerializer::serialize_value(&mut w, value, &ctx)).expect("serializes");
+        let payload = w.get_payload().into_inner()[PacketWriter::PACKET_HEADER_SIZE..].to_vec();
         (payload, w.code_page_conversion_loss())
     }
 

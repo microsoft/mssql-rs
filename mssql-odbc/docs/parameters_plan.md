@@ -117,9 +117,11 @@ transparent reconnects.
   across `SQLPutData` calls; not confirmed at the code-point level. Either
   way, whole-value buffering here is a documented deviation from msodbcsql's
   incremental approach, not a gap. The same-wideness narrow path
-  (`SQL_C_CHAR` against a narrow SQL type) still assumes UTF-8 on the wire
-  instead of reading the connection's collation (AB#47590); only the
-  wideness-mismatch half of that gap has closed. Under a UTF8-flagged
+  (`SQL_C_CHAR` against a narrow SQL type) still reads the *application
+  buffer* as UTF-8 rather than the client code page (AB#47565); the wire side
+  has read the connection's collation since `DaeTranscode` landed
+  (`DaeTarget::Narrow(collation)` encodes through `encode_narrow`), and only
+  the wideness-mismatch half of AB#47590 has closed. Under a UTF8-flagged
   database collation the streamed and inline paths now agree:
   `encode_narrow` checks `collation.utf8()` like `get_encoding_type` does,
   and since AB#48437 the serializer's `VARCHAR | CHAR | TEXT` arm resolves
