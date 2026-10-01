@@ -95,8 +95,35 @@ fn payload(
         is_nullable: true,
     };
     // A UTF-8 source is what the ODBC layer hands down for a character
-    // parameter, so the value under test is the re-encode, not a pass-through.
+    // parameter. Note this reaches the serializer's UTF-8 passthrough under a
+    // `_UTF8` collation, so for that collation the bytes are forwarded rather
+    // than re-encoded; use [`utf16_payload`] to drive the resolver itself.
     let value = ColumnValues::String(SqlString::new(text.as_bytes().to_vec(), EncodingType::Utf8));
+    serialized_value_wire_bytes(&value, &ctx).expect("serializes")
+}
+
+/// [`varchar_payload`] from a UTF-16LE source, so the value is decoded and
+/// re-encoded through `encode_narrow_for_wire` rather than taking the UTF-8
+/// passthrough.
+///
+/// Needed because that passthrough forwards an `EncodingType::Utf8` source
+/// under a `_UTF8` collation without consulting `try_resolve_collation` at all.
+/// A UTF-8-source assertion therefore cannot prove the resolver honours the
+/// UTF-8 flag -- it would pass even if that branch were removed -- so the
+/// collation-resolution claims are asserted from this side too.
+fn utf16_payload(text: &str, collation: SqlCollation) -> Vec<u8> {
+    let ctx = TdsTypeContext {
+        tds_type: VARCHAR,
+        max_size: 8000,
+        is_plp: false,
+        is_fixed_length: false,
+        precision: None,
+        scale: None,
+        collation: Some(collation),
+        is_nullable: true,
+    };
+    let utf16: Vec<u8> = text.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+    let value = ColumnValues::String(SqlString::new(utf16, EncodingType::Utf16));
     serialized_value_wire_bytes(&value, &ctx).expect("serializes")
 }
 
@@ -106,9 +133,19 @@ fn payload(
 /// The length prefix is asserted with it - the encoded form is two bytes for
 /// one character, so a prefix of 1 would frame the value short and desync the
 /// parameter stream rather than merely mis-encoding it.
+///
+/// Asserted from both sources. The UTF-8 one takes the serializer's
+/// passthrough, which forwards the bytes without consulting the resolver, so it
+/// alone would pass even with the resolver's UTF-8 branch removed; the UTF-16
+/// one is decoded and re-encoded, so it is what actually pins the branch.
 #[test]
 fn a_utf8_collation_encodes_utf8_rather_than_the_lcid_codepage() {
     assert_eq!(varchar_payload("\u{e9}", utf8()), b"\x02\x00\xc3\xa9");
+    assert_eq!(
+        utf16_payload("\u{e9}", utf8()),
+        b"\x02\x00\xc3\xa9",
+        "the resolver must honour the UTF-8 flag, not just the passthrough"
+    );
 }
 
 /// A SQL sort ID wins over the LCID. CP437 and CP850 both put U+00E9 at `82`,
@@ -203,9 +240,17 @@ fn the_inline_arm_agrees_with_the_streamed_encoder() {
 /// U+65E5 is three bytes under a UTF-8 collation and unmappable in every
 /// single-byte page, so this also shows the UTF-8 arm avoids the substitution
 /// the Windows-1252 control makes.
+///
+/// The UTF-16 source is what reaches the resolver; see
+/// [`a_utf8_collation_encodes_utf8_rather_than_the_lcid_codepage`].
 #[test]
 fn a_utf8_collation_frames_multibyte_output_by_byte_count() {
     assert_eq!(varchar_payload("\u{65e5}", utf8()), b"\x03\x00\xe6\x97\xa5");
+    assert_eq!(
+        utf16_payload("\u{65e5}", utf8()),
+        b"\x03\x00\xe6\x97\xa5",
+        "the resolver must frame the re-encoded form by byte count"
+    );
     assert_eq!(varchar_payload("\u{65e5}", windows_1252()), b"\x01\x00?");
 }
 
