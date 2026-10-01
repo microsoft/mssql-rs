@@ -85,20 +85,16 @@ pub fn serialized_value_wire_bytes(
         let buffer = cursor.into_inner();
         // `end` can sit at the header when a value ends exactly on a packet
         // boundary, which is an empty tail rather than an underflow.
-        buffer[PACKET_HEADER_SIZE.min(end)..end].to_vec()
+        buffer[PacketWriter::PACKET_HEADER_SIZE.min(end)..end].to_vec()
     };
 
     let mut out = Vec::new();
     for packet in &sink.sent {
-        out.extend_from_slice(&packet[PACKET_HEADER_SIZE..]);
+        out.extend_from_slice(&packet[PacketWriter::PACKET_HEADER_SIZE..]);
     }
     out.extend_from_slice(&tail);
     Ok(out)
 }
-
-/// TDS packet header length, stripped from every packet by
-/// [`serialized_value_wire_bytes`].
-const PACKET_HEADER_SIZE: usize = 8;
 
 /// A [`NetworkWriter`] that keeps whatever is sent to it.
 ///

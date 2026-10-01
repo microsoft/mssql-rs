@@ -171,7 +171,20 @@ impl NarrowEncoded {
 /// markup in place of the value, and one character would count as eight against
 /// the column's length (AB#47598).
 pub fn encode_narrow(text: &str, collation: SqlCollation) -> NarrowEncoded {
-    let (encoded, encoding_used, had_errors) = resolve_collation(collation).encode(text);
+    encode_narrow_with(text, resolve_collation(collation))
+}
+
+/// [`encode_narrow`] against an already-resolved encoding, for a caller that
+/// resolved the collation itself and must not resolve it twice.
+///
+/// Taking the resolution as an argument is what keeps the serializer's
+/// `VARCHAR | CHAR | TEXT` arm honest: that arm needs to know whether a
+/// collation resolves *before* it encodes, so it can fall back to Latin-1 when
+/// it does not. Re-deriving the encoding here would leave two resolutions that
+/// have to stay in agreement with nothing enforcing it -- the exact coupling
+/// AB#48437 was about.
+pub(crate) fn encode_narrow_with(text: &str, encoding: ResolvedEncoding) -> NarrowEncoded {
+    let (encoded, encoding_used, had_errors) = encoding.encode(text);
     if !had_errors {
         return NarrowEncoded::exact(encoded.into_owned());
     }
