@@ -524,6 +524,8 @@ pub struct TdsClient {
     /// [`BatchErrorMode::Continue`], held until the DONE ending the row set so
     /// they are returned together.
     row_set_errors: Vec<SqlErrorInfo>,
+    /// Tokens read since the first entry in `row_set_errors`; bounds that run.
+    row_set_error_tokens: u32,
     /// DONE count of the row set just completed; see
     /// [`last_result_row_count`](Self::last_result_row_count).
     last_result_row_count: Option<u64>,
@@ -696,6 +698,7 @@ impl TdsClient {
             statement_error_completion_pending: false,
             failed_statement_done_pending: false,
             row_set_errors: Vec::new(),
+            row_set_error_tokens: 0,
             last_result_row_count: None,
             return_values: Vec::new(),
             info_messages: Vec::new(),
@@ -5696,6 +5699,8 @@ impl TdsClient {
     /// still open; call `advance` again to move past it.
     #[instrument(skip(self), level = "info")]
     pub async fn advance(&mut self) -> TdsResult<StatementResult> {
+        // Moving on ends the previous row set's count, on every path below.
+        self.last_result_row_count = None;
         if !self.has_open_batch() {
             return Ok(StatementResult::End);
         }
@@ -5708,6 +5713,8 @@ impl TdsClient {
             self.abort_pending_prepare_capture();
             return Err(error);
         }
+        // The drain read the skipped row set's DONE; its count is not this result's.
+        self.last_result_row_count = None;
         // Draining the current result set may have consumed the batch's final
         // DONE token (has_more=false), which closes the batch. If so there is
         // nothing left on the wire to advance to; reading again would block
@@ -7762,6 +7769,20 @@ impl TdsClient {
 
     async fn handle_row_read_token(&mut self, token: Tokens) -> TdsResult<Option<bool>> {
         self.observe_prepared_batch_done(&token)?;
+        // Once a statement error has been collected under `Continue`, the server
+        // feeds this loop until the row set's DONE; bound it like the look-ahead
+        // between results. Rows do not pass through here, so a long row set is
+        // not counted.
+        if !self.row_set_errors.is_empty() {
+            self.row_set_error_tokens += 1;
+            if self.row_set_error_tokens > 100_000 {
+                return Err(
+                    self.abandon_failed_statement(crate::error::Error::ProtocolError(
+                        "Too many tokens after a statement error without a DONE".to_string(),
+                    )),
+                );
+            }
+        }
         match token {
             Tokens::DoneInProc(done) => self.handle_row_done(done, true),
             Tokens::DoneProc(done) | Tokens::Done(done) => self.handle_row_done(done, false),
@@ -7800,6 +7821,14 @@ impl TdsClient {
                 }
                 let error = self.record_error_token(&error_token);
                 if self.continues_after(&error_token) {
+                    if self.row_set_errors.len() >= 10_000 {
+                        return Err(self.abandon_failed_statement(
+                            crate::error::Error::ProtocolError(
+                                "Too many ERROR tokens for one statement without a DONE"
+                                    .to_string(),
+                            ),
+                        ));
+                    }
                     // A failed statement can send several ERROR tokens before the
                     // DONE that ends its row set. Collect them here and return
                     // them together from that DONE (see `handle_row_done`), so the
@@ -7882,6 +7911,7 @@ impl TdsClient {
         // row set's count is not reported; its outcome is the `Err`.
         if !self.row_set_errors.is_empty() {
             self.last_result_row_count = None;
+            self.row_set_error_tokens = 0;
             return Err(crate::error::Error::from_sql_errors(std::mem::take(
                 &mut self.row_set_errors,
             )));
@@ -7974,6 +8004,7 @@ impl TdsClient {
         self.current_metadata = None;
         self.current_result_set_has_been_read_till_end = true;
         self.row_set_errors.clear();
+        self.row_set_error_tokens = 0;
         self.statement_error_completion_pending = false;
         self.failed_statement_done_pending = false;
         self.retire_after_failed_drain(&error);
@@ -8000,6 +8031,7 @@ impl TdsClient {
         self.statement_error_completion_pending = false;
         self.failed_statement_done_pending = false;
         self.row_set_errors.clear();
+        self.row_set_error_tokens = 0;
         self.last_result_row_count = None;
     }
 
@@ -8015,10 +8047,9 @@ impl TdsClient {
     /// `None` means the server reported no count — `SET NOCOUNT ON`, for one —
     /// which is deliberately distinct from `Some(0)`, an empty row set whose
     /// count was reported. It is also `None` while a row set is still being read,
-    /// after a no-row statement, after a cancellation, after [`close_query`](Self::close_query),
-    /// and for prepared batches,
-    /// which report counts through
-    /// [`PreparedBatchResult`](crate::connection::PreparedBatchResult).
+    /// once [`advance()`](Self::advance) moves past it, after a no-row statement,
+    /// after a cancellation, after [`close_query`](Self::close_query), and for
+    /// prepared batches, which report counts through [`PreparedBatchResult`].
     pub fn last_result_row_count(&self) -> Option<u64> {
         self.last_result_row_count
     }
@@ -8734,7 +8765,7 @@ pub struct ExecuteOptions<'a> {
     /// by nothing else: the RPC entry points (`execute_sp_*`, prepared execution,
     /// `unprepare`) and transaction requests use [`BatchErrorMode::Abort`] and
     /// log at debug level when given `Continue`. Prepared batches report per-row
-    /// errors through [`PreparedBatchResult`](crate::connection::PreparedBatchResult).
+    /// errors through [`PreparedBatchResult`].
     pub on_error: BatchErrorMode,
 }
 
@@ -10804,6 +10835,7 @@ mod tests {
             }
         );
     }
+
     /// The first DONE after a returned error completes that statement even
     /// when it is a counted DONEINPROC — which the error-chain rule, scoped to
     /// DONEPROC and plain DONE, does not cover. The DML after it still surfaces.
@@ -10828,6 +10860,93 @@ mod tests {
             }
         ));
     }
+
+    /// Inside a row set the collected errors are bounded too: a server that
+    /// keeps sending ERROR before the row set's DONE retires the connection.
+    #[tokio::test]
+    async fn an_endless_run_of_errors_inside_a_row_set_is_bounded() {
+        let mut tokens = vec![int_col_metadata(1)];
+        tokens.extend(
+            std::iter::repeat_with(|| Tokens::Error(error_token_with_severity(16))).take(10_002),
+        );
+        let mut client = create_test_client_with_tokens(tokens);
+        assert_eq!(
+            client
+                .execute(
+                    "q".to_string(),
+                    ExecuteOptions::new().on_error(BatchErrorMode::Continue),
+                )
+                .await
+                .unwrap(),
+            StatementResult::Rows
+        );
+
+        assert!(matches!(
+            client.next_row().await,
+            Err(crate::error::Error::ProtocolError(_))
+        ));
+        assert!(client.is_connection_dead());
+        assert!(!client.has_open_batch());
+        assert!(client.row_set_errors.is_empty());
+    }
+
+    /// And so is the total run: one error inside a row set followed by INFO that
+    /// never reaches a DONE stops at the token bound.
+    #[tokio::test]
+    async fn an_endless_run_of_info_after_a_row_set_error_is_bounded() {
+        let mut tokens = vec![
+            int_col_metadata(1),
+            Tokens::Error(error_token_with_severity(16)),
+        ];
+        tokens.extend((0..100_001).map(|n| info_token(n, 0, "message")));
+        let mut client = create_test_client_with_tokens(tokens);
+        assert_eq!(
+            client
+                .execute(
+                    "q".to_string(),
+                    ExecuteOptions::new().on_error(BatchErrorMode::Continue),
+                )
+                .await
+                .unwrap(),
+            StatementResult::Rows
+        );
+
+        assert!(matches!(
+            client.next_row().await,
+            Err(crate::error::Error::ProtocolError(_))
+        ));
+        assert!(client.is_connection_dead());
+        assert!(!client.has_open_batch());
+    }
+
+    /// `advance` moves past the row set, so its count no longer applies —
+    /// whether the rows were read or drained by `advance` itself, and also
+    /// when the batch has already ended.
+    #[tokio::test]
+    async fn advance_clears_the_previous_row_set_count() {
+        let mut client = create_test_client_with_tokens(vec![
+            int_col_metadata(1),
+            done_count(CurrentCommand::Select, 2, false),
+        ]);
+        client.execute("q".to_string(), ()).await.unwrap();
+        assert!(client.next_row().await.unwrap().is_none());
+        assert_eq!(client.last_result_row_count(), Some(2));
+        assert_eq!(client.advance().await.unwrap(), StatementResult::End);
+        assert_eq!(client.last_result_row_count(), None);
+
+        let mut client = create_test_client_with_tokens(vec![
+            int_col_metadata(1),
+            done_count(CurrentCommand::Select, 2, false),
+        ]);
+        client.execute("q".to_string(), ()).await.unwrap();
+        assert_eq!(client.advance().await.unwrap(), StatementResult::End);
+        assert_eq!(
+            client.last_result_row_count(),
+            None,
+            "a row set drained by advance does not report its count"
+        );
+    }
+
     /// If a later ERROR of the same statement is fatal, the whole run drains
     /// and closes as `Abort` would, and the earlier errors are not lost.
     #[tokio::test]
@@ -19341,6 +19460,7 @@ mod tests {
         client.remaining_request_timeout = Some(Duration::from_secs(1));
         client.end_streamed_param().await.unwrap();
     }
+
     /// Little-endian UTF-16 encoding of `s`, matching how parameter names are
     /// written on the wire (length-prefixed unicode).
     fn utf16le(s: &str) -> Vec<u8> {
