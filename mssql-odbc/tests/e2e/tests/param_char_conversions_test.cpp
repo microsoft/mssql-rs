@@ -108,22 +108,30 @@ protected:
     }
 
     // serialize_string resolves the code page from the collation's UTF-8 flag,
-    // then its SQL sort ID, then its LCID (AB#48437). A Windows `Latin1_General`
-    // collation carries no sort ID, so its LCID alone decides, and U+65E5 is
-    // unmappable under it. The parameter carries the *database* collation, which
-    // need not match the instance's.
+    // then its SQL sort ID, then its LCID (AB#48437). The cases gated on this
+    // helper assert CP1252 bytes specifically - U+00E9 as 0xE9, U+20AC as 0x80 -
+    // so it must admit only collations that actually resolve to CP1252.
     //
-    // A `_UTF8` collation is excluded even though its name matches, because
-    // under it nothing is unmappable: both the materialized and the streamed
-    // route now honour `col_flags & 0x40` and pass UTF-8 through intact, so a
-    // test expecting substitution would fail rather than skip. Before AB#48437
-    // the exclusion was needed for the opposite reason - the two routes
-    // disagreed, the inline one substituting under CP1252 while the streamed one
-    // passed UTF-8 through.
+    // Two families carry the `Latin1_General` substring but do not:
+    //
+    // - `_UTF8` resolves to UTF-8 by the flag, where nothing is unmappable, so
+    //   a substitution test would fail rather than skip. (Before AB#48437 the
+    //   exclusion was needed for the opposite reason - the inline route
+    //   substituted under CP1252 while the streamed one passed UTF-8 through.)
+    // - `SQL_Latin1_General_CP437_*` and `..._CP850_*` carry a sort ID, which
+    //   now wins over the LCID, so U+00E9 would arrive as 0x82 and U+20AC would
+    //   substitute. This is exactly the behaviour this PR adds; before it the
+    //   inline path resolved through the LCID for every member of the family
+    //   and the broader guard was sufficient.
+    //
+    // The parameter carries the *database* collation, which need not match the
+    // instance's.
     bool DatabaseIsLatin1() {
         const std::string collation = DatabaseCollation();
         return collation.find("Latin1_General") != std::string::npos &&
-               collation.find("_UTF8") == std::string::npos;
+               collation.find("_UTF8") == std::string::npos &&
+               collation.find("CP437") == std::string::npos &&
+               collation.find("CP850") == std::string::npos;
     }
 
     // The database collation name, or an empty string if it could not be read.
