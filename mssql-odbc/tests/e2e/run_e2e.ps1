@@ -325,9 +325,10 @@ function Invoke-CtestRun([string]$Label, [string]$JunitName, [string]$DriverName
         # and skip without one. Set only for the Rust leg: the runtime teardown
         # is ours, and msodbcsql's rotation is configured through
         # BIDTraceFileSize in odbcinst.ini rather than the environment, so this
-        # harness cannot drive it. Skipping on the msodbcsql leg is
-        # parity-neutral — parity_report.py classifies a SKIP on either side as
-        # "skipped (not compared)".
+        # harness cannot drive it. Both link a skip-aware main that exits 77 on
+        # a fully-skipped run, so ctest records a skip and parity_report.py
+        # classifies the pair as "skipped (not compared)" rather than scoring an
+        # uncompared test as PASS/PASS.
         $env:MSSQL_ODBC_DLL = $RustDriverDll
         if ($RustDriverDll) {
             Write-Host "MSSQL_ODBC_DLL=$RustDriverDll"
