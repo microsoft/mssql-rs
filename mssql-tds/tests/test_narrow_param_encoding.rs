@@ -401,7 +401,7 @@ fn a_bounded_value_spanning_multiple_packets_keeps_its_length_prefix() {
 }
 
 /// A lone UTF-16 surrogate reaching a *single-byte* narrow target is
-/// substituted, and the substitution is flagged.
+/// substituted.
 ///
 /// Scoped to Windows-1252 deliberately. A `_UTF8` collation is also a narrow
 /// target, but U+FFFD is representable there, so it is *not* substituted —
@@ -417,19 +417,20 @@ fn a_bounded_value_spanning_multiple_packets_keeps_its_length_prefix() {
 /// Measured against retail msodbcsql18: binding `a<D800>b` to a varchar stored
 /// `61 3F 62` with `SQL_SUCCESS` and no diagnostic, and the engine's own
 /// `CAST(NCHAR(97)+NCHAR(55296)+NCHAR(98) AS VARCHAR)` produced the identical
-/// bytes. The `had_loss` flag this driver additionally raises is what
-/// `SQL_COPT_SS_WARN_ON_CP_ERROR` reports as `01000`; the end-to-end
-/// SQLSTATE behaviour is covered by the e2e suite.
+/// bytes.
+///
+/// Asserts the payload only. This driver additionally marks the message so
+/// `SQL_COPT_SS_WARN_ON_CP_ERROR` can report `01000`, but
+/// `serialized_value_wire_bytes` returns bytes alone, so that flag is not
+/// observable from here — it is pinned by
+/// `a_lone_surrogate_substitutes_and_marks_the_message` in
+/// `tds_value_serializer.rs`, which reads it off the `PacketWriter`.
 #[test]
 fn a_lone_surrogate_reaching_a_narrow_target_is_substituted() {
     assert_eq!(
         lone_surrogate_payload(windows_1252()),
         b"\x03\x00a?b",
         "matches msodbcsql and the engine: one '?' per unpaired surrogate"
-    );
-    assert!(
-        encode_narrow("a\u{FFFD}b", windows_1252()).had_loss,
-        "the substitution must be flagged so SQL_COPT_SS_WARN_ON_CP_ERROR can report it"
     );
 }
 
@@ -444,20 +445,16 @@ fn a_lone_surrogate_reaching_a_narrow_target_is_substituted() {
 /// yields `EF BF BD`, so msodbcsql is expected to agree — that leg is inferred
 /// from the API contract rather than measured against a `_UTF8` database.
 ///
-/// The consequence worth pinning is the quiet one: `had_loss` is false, so
-/// `SQL_COPT_SS_WARN_ON_CP_ERROR` reports no `01000` for this input under a
-/// UTF-8 collation. That is correct — nothing was lost — but it means the
-/// warning channel is collation-dependent for the same bound value.
+/// The quiet half — that nothing is lost, so no `01000` is reported for this
+/// input under this collation — is the counterpart assertion in
+/// `a_lone_surrogate_under_a_utf8_collation_leaves_the_message_unmarked`, for
+/// the same reason as above: the flag is not visible from this file.
 #[test]
 fn a_lone_surrogate_under_a_utf8_collation_is_not_substituted() {
     assert_eq!(
         lone_surrogate_payload(utf8()),
         b"\x05\x00a\xef\xbf\xbdb",
         "U+FFFD is representable in UTF-8, so it is not substituted"
-    );
-    assert!(
-        !encode_narrow("a\u{FFFD}b", utf8()).had_loss,
-        "nothing was lost, so the warning channel stays quiet"
     );
 }
 
