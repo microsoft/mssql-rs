@@ -110,7 +110,7 @@ fi
 
 # --- Generate and load TPC-H lineitem ---
 echo ">>> Generating TPC-H lineitem SF$SF..."
-"$VENVS/tools/bin/tpchgen-cli" -s "$SF" --tables lineitem --output-dir "$TBL_DIR" --overwrite --quiet
+"$VENVS/tools/bin/tpchgen-cli" -s "$SF" --tables lineitem --output-dir "$TBL_DIR" --quiet
 TBL="$TBL_DIR/lineitem.tbl"
 EXPECTED_ROWS="$(wc -l < "$TBL" | tr -d ' ')"
 echo ">>> Generated $EXPECTED_ROWS rows ($(du -h "$TBL" | cut -f1))."
