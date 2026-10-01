@@ -46,6 +46,7 @@ uuid = { version = "1", features = ["v4"] }
 # SAML-bearer assertion are base64, and the realm/token responses are JSON.
 base64 = "0.22"
 serde_json = "1"
+percent-encoding = "2.3"
 # msodbcsql widens a time-only value with the process-local current date
 # (`localtime_s` in sqlccnvt.cpp), which std cannot supply on every platform.
 libc = "0.2"

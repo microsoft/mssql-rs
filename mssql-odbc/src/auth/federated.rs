@@ -34,6 +34,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use mssql_tds::core::TdsResult;
 use mssql_tds::error::Error;
 use mssql_tds::security::{SecurityContext, SecurityError};
+use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use tracing::debug;
 
 /// msodbcsql's Entra application id, spelled as `AzureADAuth.cpp:688` sends it.
@@ -47,7 +48,42 @@ const DEFAULT_CLOUD_AUDIENCE: &str = "urn:federation:MicrosoftOnline";
 const TOKEN_API_VERSION: &str = "?api-version=2015-06-01";
 
 const WST13_ISSUE: &str = "http://docs.oasis-open.org/ws-sx/ws-trust/200512/RST/Issue";
+const WST13_NAMESPACE: &str = "http://docs.oasis-open.org/ws-sx/ws-trust/200512";
+const WST13_BEARER_KEY: &str = "http://docs.oasis-open.org/ws-sx/ws-trust/200512/Bearer";
+const WST13_REQUEST_ISSUE: &str = "http://docs.oasis-open.org/ws-sx/ws-trust/200512/Issue";
 const WST2005_ISSUE: &str = "http://schemas.xmlsoap.org/ws/2005/02/trust/RST/Issue";
+const WST2005_NAMESPACE: &str = "http://schemas.xmlsoap.org/ws/2005/02/trust";
+const WST2005_NO_PROOF_KEY: &str = "http://schemas.xmlsoap.org/ws/2005/05/identity/NoProofKey";
+const WST2005_REQUEST_ISSUE: &str = "http://schemas.xmlsoap.org/ws/2005/02/trust/Issue";
+
+const SAML2_NAMESPACE: &str = "urn:oasis:names:tc:SAML:2.0:assertion";
+/// Opening and closing tags of a SAML 2.0 and a SAML 1.1 assertion, in the
+/// order msodbcsql looks for them.
+const SAML_ASSERTION_TAGS: [(&str, &str); 2] = [
+    ("<saml:Assertion", "</saml:Assertion>"),
+    ("<saml1:Assertion", "</saml1:Assertion>"),
+];
+
+const SOAP_CONTENT_TYPE: &str = "application/soap+xml; charset=utf-8";
+const FORM_CONTENT_TYPE: &str = "application/x-www-form-urlencoded";
+const SOAP_FAULT_REASON: (&str, &str) = ("<s:Reason>", "</s:Reason>");
+const NEGOTIATE: &str = "Negotiate";
+
+/// The markers `AzureADAuth.cpp:461-535` scans the MEX document for.
+mod mex_tag {
+    pub(super) const POLICY_ID: &str = "<wsp:Policy wsu:Id=";
+    pub(super) const POLICY_END: &str = "</wsp:ExactlyOne>";
+    pub(super) const NEGOTIATE_ASSERTION: &str = "<http:NegotiateAuthentication";
+    pub(super) const BINDING_NAME: &str = "<wsdl:binding name=";
+    pub(super) const BINDING_END: &str = "</wsdl:binding>";
+    pub(super) const POLICY_REFERENCE: &str = "<wsp:PolicyReference URI=";
+    pub(super) const PORT_NAME: &str = "<wsdl:port name=";
+    pub(super) const PORT_BINDING: &str = "<wsdl:port binding=";
+    pub(super) const PORT_BINDING_ATTRIBUTE: &str = "binding=";
+    pub(super) const PORT_END: &str = "</wsdl:port>";
+    pub(super) const ADDRESS: &str = "<wsa10:Address>";
+    pub(super) const ADDRESS_END: &str = "</wsa10:Address>";
+}
 
 /// Bounds a Negotiate exchange that keeps answering 401 with a new token.
 const MAX_NEGOTIATE_ROUNDS: usize = 5;
@@ -187,10 +223,7 @@ pub(super) async fn acquire_token(
     let soap = HttpRequest::post(
         endpoint,
         vec![
-            (
-                "Content-Type".to_string(),
-                "application/soap+xml; charset=utf-8".to_string(),
-            ),
+            ("Content-Type".to_string(), SOAP_CONTENT_TYPE.to_string()),
             ("SOAPAction".to_string(), action.to_string()),
         ],
         envelope,
@@ -213,10 +246,7 @@ pub(super) async fn acquire_token(
 
     let token_request = HttpRequest::post(
         token_url(sts_url),
-        vec![(
-            "Content-Type".to_string(),
-            "application/x-www-form-urlencoded".to_string(),
-        )],
+        vec![("Content-Type".to_string(), FORM_CONTENT_TYPE.to_string())],
         token_request_body(resource, assertion),
     );
     let token = send_with_retry(transport, None, token_request, retry).await?;
@@ -261,21 +291,16 @@ fn realm_user(principal: &str) -> String {
     url_encode(principal)
 }
 
-/// Percent-encodes every byte outside the RFC 3986 unreserved set, with
-/// uppercase hex, as msodbcsql's `URLencode` does.
+/// RFC 3986 unreserved characters, the only bytes msodbcsql's `URLencode`
+/// leaves unescaped.
+const URL_ESCAPED: &AsciiSet = &NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'_')
+    .remove(b'.')
+    .remove(b'~');
+
 fn url_encode(value: &str) -> String {
-    const HEX: &[u8; 16] = b"0123456789ABCDEF";
-    let mut out = String::with_capacity(value.len());
-    for &b in value.as_bytes() {
-        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
-            out.push(b as char);
-        } else {
-            out.push('%');
-            out.push(HEX[usize::from(b >> 4)] as char);
-            out.push(HEX[usize::from(b & 15)] as char);
-        }
-    }
-    out
+    utf8_percent_encode(value, URL_ESCAPED).to_string()
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -347,11 +372,11 @@ fn select_endpoint(mex: &str) -> TdsResult<(String, bool)> {
 fn find_endpoints(mex: &str) -> [Vec<String>; 2] {
     let mut endpoints: [Vec<String>; 2] = Default::default();
     let mut cursor = 0;
-    while let Some((id_start, id_end)) = quoted_value_from(mex, cursor, "<wsp:Policy wsu:Id=") {
-        let Some(node_end) = find_from(mex, id_end, "</wsp:ExactlyOne>") else {
+    while let Some((id_start, id_end)) = quoted_value_from(mex, cursor, mex_tag::POLICY_ID) {
+        let Some(node_end) = find_from(mex, id_end, mex_tag::POLICY_END) else {
             break;
         };
-        if mex[id_start..node_end].contains("<http:NegotiateAuthentication") {
+        if mex[id_start..node_end].contains(mex_tag::NEGOTIATE_ASSERTION) {
             collect_bindings(mex, &mex[id_start..id_end], &mut endpoints);
         }
         cursor = node_end;
@@ -361,12 +386,12 @@ fn find_endpoints(mex: &str) -> [Vec<String>; 2] {
 
 fn collect_bindings(mex: &str, policy_id: &str, endpoints: &mut [Vec<String>; 2]) {
     let mut cursor = 0;
-    while let Some((name_start, name_end)) = quoted_value_from(mex, cursor, "<wsdl:binding name=") {
-        let Some(node_end) = find_from(mex, name_end, "</wsdl:binding>") else {
+    while let Some((name_start, name_end)) = quoted_value_from(mex, cursor, mex_tag::BINDING_NAME) {
+        let Some(node_end) = find_from(mex, name_end, mex_tag::BINDING_END) else {
             break;
         };
         let node = &mex[name_end..node_end];
-        let references_policy = quoted_value_from(node, 0, "<wsp:PolicyReference URI=")
+        let references_policy = quoted_value_from(node, 0, mex_tag::POLICY_REFERENCE)
             .is_some_and(|(s, e)| node[s..e].strip_prefix('#') == Some(policy_id));
         if references_policy {
             let wst13 = mex[name_start..node_end].contains(WST13_ISSUE);
@@ -385,19 +410,23 @@ fn collect_ports(mex: &str, binding_name: &str, endpoints: &mut Vec<String>) {
     loop {
         // msodbcsql tries `name=` first and falls back to a bare `binding=`.
         let (named, value_start, value_end) =
-            if let Some((s, e)) = quoted_value_from(mex, cursor, "<wsdl:port name=") {
+            if let Some((s, e)) = quoted_value_from(mex, cursor, mex_tag::PORT_NAME) {
                 (true, s, e)
-            } else if let Some((s, e)) = quoted_value_from(mex, cursor, "<wsdl:port binding=") {
+            } else if let Some((s, e)) = quoted_value_from(mex, cursor, mex_tag::PORT_BINDING) {
                 (false, s, e)
             } else {
                 break;
             };
         cursor = value_end;
-        let Some(node_end) = find_from(mex, value_end, "</wsdl:port>") else {
+        let Some(node_end) = find_from(mex, value_end, mex_tag::PORT_END) else {
             continue;
         };
         let binding = if named {
-            quoted_value_from(&mex[..node_end], value_start, "binding=")
+            quoted_value_from(
+                &mex[..node_end],
+                value_start,
+                mex_tag::PORT_BINDING_ATTRIBUTE,
+            )
         } else {
             Some((value_start, value_end))
         };
@@ -413,9 +442,9 @@ fn collect_ports(mex: &str, binding_name: &str, endpoints: &mut Vec<String>) {
         }
         let port = &mex[binding_end..node_end];
         if let (Some(open), Some(close)) =
-            (port.find("<wsa10:Address>"), port.find("</wsa10:Address>"))
+            (port.find(mex_tag::ADDRESS), port.find(mex_tag::ADDRESS_END))
         {
-            let start = open + "<wsa10:Address>".len();
+            let start = open + mex_tag::ADDRESS.len();
             if start <= close {
                 endpoints.push(port[start..close].to_string());
             }
@@ -453,16 +482,16 @@ fn soap_request(endpoint: &str, wst13: bool, audience: &str, message_id: &str) -
     let (action, namespace, key_type, request_type) = if wst13 {
         (
             WST13_ISSUE,
-            "http://docs.oasis-open.org/ws-sx/ws-trust/200512",
-            "http://docs.oasis-open.org/ws-sx/ws-trust/200512/Bearer",
-            "http://docs.oasis-open.org/ws-sx/ws-trust/200512/Issue",
+            WST13_NAMESPACE,
+            WST13_BEARER_KEY,
+            WST13_REQUEST_ISSUE,
         )
     } else {
         (
             WST2005_ISSUE,
-            "http://schemas.xmlsoap.org/ws/2005/02/trust",
-            "http://schemas.xmlsoap.org/ws/2005/05/identity/NoProofKey",
-            "http://schemas.xmlsoap.org/ws/2005/02/trust/Issue",
+            WST2005_NAMESPACE,
+            WST2005_NO_PROOF_KEY,
+            WST2005_REQUEST_ISSUE,
         )
     };
     format!(
@@ -485,10 +514,7 @@ fn soap_request(endpoint: &str, wst13: bool, audience: &str, message_id: &str) -
 /// The `<saml:Assertion>` (SAML 2.0) or `<saml1:Assertion>` (SAML 1.1)
 /// element, tags included (`AzureADAuth.cpp:614-630`).
 fn extract_assertion(response: &str) -> Option<&str> {
-    for (open, close) in [
-        ("<saml:Assertion", "</saml:Assertion>"),
-        ("<saml1:Assertion", "</saml1:Assertion>"),
-    ] {
+    for (open, close) in SAML_ASSERTION_TAGS {
         if let Some(start) = response.find(open)
             && let Some(end) = find_from(response, start, close)
         {
@@ -500,7 +526,7 @@ fn extract_assertion(response: &str) -> Option<&str> {
 
 /// The SAML-bearer grant (`AzureADAuth.cpp:862-870`).
 fn token_request_body(resource: &str, assertion: &str) -> String {
-    let grant = if assertion.contains("urn:oasis:names:tc:SAML:2.0:assertion") {
+    let grant = if assertion.contains(SAML2_NAMESPACE) {
         "saml2-bearer"
     } else {
         "saml1_1-bearer"
@@ -558,10 +584,11 @@ fn token_error_description(body: &str) -> String {
     {
         return description.to_string();
     }
-    if let Some(start) = body.find("<s:Reason>")
-        && let Some(end) = find_from(body, start, "</s:Reason>")
+    let (reason, reason_end) = SOAP_FAULT_REASON;
+    if let Some(start) = body.find(reason)
+        && let Some(end) = find_from(body, start, reason_end)
     {
-        return body[start + "<s:Reason>".len()..end].to_string();
+        return body[start + reason.len()..end].to_string();
     }
     quote(body).to_string()
 }
@@ -627,7 +654,7 @@ async fn negotiate(
         let mut authenticated = request.clone();
         authenticated.headers.push((
             "Authorization".to_string(),
-            format!("Negotiate {}", BASE64.encode(&token.data)),
+            format!("{NEGOTIATE} {}", BASE64.encode(&token.data)),
         ));
         response = transport.send(&authenticated).await?;
         if context.is_complete() {
@@ -666,7 +693,7 @@ fn negotiate_challenge(response: &HttpResponse) -> Option<Option<Vec<u8>>> {
         .find_map(|challenge| {
             let (scheme, rest) = challenge.split_once(' ').unwrap_or((challenge, ""));
             scheme
-                .eq_ignore_ascii_case("Negotiate")
+                .eq_ignore_ascii_case(NEGOTIATE)
                 .then(|| BASE64.decode(rest.trim()).ok().filter(|t| !t.is_empty()))
         })
 }

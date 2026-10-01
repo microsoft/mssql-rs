@@ -52,7 +52,7 @@ impl IntegratedTokenFactory {
     /// `login_timeout_secs` bounds transient retries on Windows. An unset or
     /// zero (unlimited) login timeout falls back to the default connect
     /// timeout so a persistently "transient" failure cannot retry forever.
-    #[cfg_attr(not(windows), allow(unused_variables))]
+    #[cfg_attr(not(windows), expect(unused_variables))]
     pub(crate) fn new(login_timeout_secs: Option<u32>) -> Self {
         Self {
             #[cfg(windows)]
