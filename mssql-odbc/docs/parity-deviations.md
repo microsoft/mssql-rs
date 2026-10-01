@@ -701,3 +701,45 @@ msodbcsql build is measured.
     path `SQLSetConnectAttr` does not reach pre-connect. This driver validates
     in both states; silently storing an out-of-range value is not behaviour
     worth reproducing.
+
+23. **A collation naming no encoding this crate maps is given a fallback
+    encoding; msodbcsql fails the conversion instead.** msodbcsql's
+    `CodePageFromTDSCollation` (`cli_common/src/clntcomn.cpp:103-160`) seeds
+    `*puiCodePage = CP_ACP`, takes `CP_UTF8` for a UTF8-flagged collation, the
+    sort-ID table entry when `bSortid` is non-zero, and otherwise looks the LCID
+    up in `x_rgLocaleMap` and then `GetLocaleInfoA`
+    (`SystemLocale::Singleton().AnsiCP()` on non-Windows builds). If that leaves
+    the code page at `CP_ACP` it returns `E_FAIL` (`:152-157`) — there is no
+    fallback encoding anywhere in that function. This driver always produces
+    bytes, and by **two different rules**:
+
+    - `encode_narrow` (`mssql-tds/src/datatypes/sql_string.rs`), used by fetches
+      and by the data-at-execution writer, falls back to **Windows-1252**.
+    - `serialize_string`'s `VARCHAR | CHAR | TEXT` arm
+      (`mssql-tds/src/datatypes/tds_value_serializer.rs`) falls back to a
+      **Latin-1-like** mapping: a scalar at or below U+00FF is its own byte,
+      anything above becomes `?`. The same arm uses it when no collation is
+      known at all.
+
+    The two disagree: U+0080 is `0x80` under the Latin-1 mapping and unmappable
+    in Windows-1252, whose `0x80` is the Euro sign, so it substitutes to `?`.
+
+    An application can tell the difference from msodbcsql in both cases — it
+    stores a value where the reference driver would fail the bind — so this is
+    recorded rather than left to code comments, even though neither rule is new.
+
+    Taken because erroring on a collation the driver merely does not map is a
+    poor trade for an application that would otherwise round-trip its data
+    correctly: the LCID tables are this crate's coverage limit, not a statement
+    about the value. The split between the two rules is **not** itself
+    deliberate design — it is two fallbacks that grew independently. AB#48437
+    deliberately preserved it rather than unifying it, because changing the
+    serializer arm's default to Windows-1252 is a behaviour change on a path
+    that fix did not otherwise touch, and
+    `an_unmapped_collation_keeps_the_latin1_fallback` (unit and integration)
+    pins the current split in both crates so a future unification is a visible,
+    deliberate edit rather than a silent drift.
+
+    No application regresses at this entry's introduction: both rules predate
+    it and AB#48437 preserved them unchanged, so no sign-off is recorded.
+    Unifying the two defaults needs one. Decision history in AB#48437.

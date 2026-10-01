@@ -1615,7 +1615,8 @@ impl TdsValueSerializer {
     /// substituting one. So neither of this crate's defaults is the reference
     /// behaviour -- they are a deliberate choice to keep sending *something*
     /// for a collation the crate cannot map, made in knowledge of the
-    /// reference rather than in ignorance of it.
+    /// reference rather than in ignorance of it. Recorded as entry 23 in
+    /// `mssql-odbc/docs/parity-deviations.md`.
     ///
     /// A character the resolved encoding cannot represent becomes
     /// [`NARROW_SUBSTITUTE_BYTE`] and sets [`NarrowEncoded::had_loss`], matching
