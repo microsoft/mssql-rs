@@ -400,14 +400,19 @@ fn a_bounded_value_spanning_multiple_packets_keeps_its_length_prefix() {
     );
 }
 
-/// A lone UTF-16 surrogate reaching a narrow target is substituted, and the
-/// substitution is flagged.
+/// A lone UTF-16 surrogate reaching a *single-byte* narrow target is
+/// substituted, and the substitution is flagged.
+///
+/// Scoped to Windows-1252 deliberately. A `_UTF8` collation is also a narrow
+/// target, but U+FFFD is representable there, so it is *not* substituted —
+/// that is the next test, and stating the contract in general terms here would
+/// contradict it.
 ///
 /// Driven through `serialize_value` with a genuinely malformed UTF-16 source,
 /// so the decode is the one the serializer performs rather than a repair this
 /// test performed for it: `to_utf8_string` resolves `EncodingType::Utf16`
-/// through `encoding_rs`, which yields U+FFFD, and the collation then has no
-/// byte for that.
+/// through `encoding_rs`, which yields U+FFFD, and a single-byte collation
+/// then has no byte for that.
 ///
 /// Measured against retail msodbcsql18: binding `a<D800>b` to a varchar stored
 /// `61 3F 62` with `SQL_SUCCESS` and no diagnostic, and the engine's own
