@@ -27,9 +27,9 @@ IDENT_SQL = (
 )
 # (baseline, candidate, title). Times are compared as candidate / baseline.
 COMPARISONS = [
-    ("before", "now", "Before (Tiberius release) → now (mssql-tds default)"),
-    ("now-tiberius", "now", "Driver only: same release, Tiberius → mssql-tds"),
-    ("before", "now-tiberius", "Control: release change only, Tiberius in both"),
+    ("baseline", "candidate", "Baseline (Tiberius release) → candidate (mssql-tds default)"),
+    ("candidate-tiberius", "candidate", "Driver only: candidate release, Tiberius → mssql-tds"),
+    ("baseline", "candidate-tiberius", "Control: release change only, Tiberius in both"),
 ]
 
 
@@ -193,15 +193,17 @@ def run(args):
 
 
 def check_identities(identities, failures):
-    # The runtime switch must change what goes on the wire; otherwise the
-    # "driver only" comparison measures Tiberius against itself.
+    # Baseline and candidate must differ on the wire; otherwise the A/B measures
+    # Tiberius against itself.
     by_scenario = {}
     for (key, arm), ident in identities.items():
         by_scenario.setdefault(key, {})[arm] = ident.get("client_interface_name")
     for key, arms in by_scenario.items():
-        tib, tds = arms.get("now-tiberius"), arms.get("now")
-        if tib is not None and tds is not None and tib == tds:
-            failures.append(f"{key}: 'now' and 'now-tiberius' report the same client_interface_name ({tib!r})")
+        tds = arms.get("candidate")
+        for tib_arm in ("baseline", "candidate-tiberius"):
+            tib = arms.get(tib_arm)
+            if tib is not None and tds is not None and tib == tds:
+                failures.append(f"{key}: 'candidate' and '{tib_arm}' report the same client_interface_name ({tib!r})")
 
 
 def build_report(args, scenarios, results, identities, failures, rng):

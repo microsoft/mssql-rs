@@ -5,16 +5,16 @@
 # run-benchmarks.sh — perf-lab testScript: ConnectorX TPC-H A/B, Tiberius vs mssql-tds.
 #
 # Runs on the dedicated perf VM (SQL Server 2022 colocated, pinned to the lower
-# half of the cores). The Perf.Test.Job template copies this directory to
-# ~/perf-tests, injects SQL_SERVER / SQL_PASSWORD / PERF_CLIENT_CPUS, and passes
-# the pipeline parameters as KEY=VALUE arguments.
+# half of the cores). The Perf.Test.Job template copies the repo to ~/perf-tests,
+# injects SQL_SERVER / SQL_PASSWORD / PERF_CLIENT_CPUS, and passes any
+# testScriptArgs through as KEY=VALUE arguments.
 #
 # Arms (each read runs in a fresh, CPU-pinned Python process):
-#   before        connectorx==$CX_BEFORE  — last release, Tiberius only
-#   now-tiberius  connectorx==$CX_AFTER   — cx.mssql_driver = "tiberius"
-#   now           connectorx==$CX_AFTER   — default driver (mssql-tds)
-# "before → now" is the user-visible change; "now-tiberius → now" isolates the
-# driver; "before → now-tiberius" is the control for non-driver release changes.
+#   baseline            connectorx==$CX_BASELINE  — last release before mssql-tds (Tiberius only)
+#   candidate           connectorx==$CX_CANDIDATE — default driver (mssql-tds)
+#   candidate-tiberius  connectorx==$CX_CANDIDATE with cx.mssql_driver = "tiberius";
+#                       only with INCLUDE_CONTROL=1. Separates the driver from other
+#                       changes between the two releases.
 set -euo pipefail
 set -E
 trap 'rc=$?; echo "ERROR: ${BASH_SOURCE[0]}:${LINENO}: \`${BASH_COMMAND}\` exited ${rc}" >&2' ERR
@@ -29,11 +29,12 @@ WARMUP_ROUNDS=1
 PARTITIONS=1,4
 ENCRYPT_MODES=false,true
 RETURN_TYPES=arrow
-CX_BEFORE=0.4.6
-CX_AFTER=0.4.7a1
+CX_BASELINE=0.4.6
+CX_CANDIDATE=0.4.7a1
+INCLUDE_CONTROL=0
 for kv in "$@"; do
     case "$kv" in
-        SF=*|ROUNDS=*|WARMUP_ROUNDS=*|PARTITIONS=*|ENCRYPT_MODES=*|RETURN_TYPES=*|CX_BEFORE=*|CX_AFTER=*)
+        SF=*|ROUNDS=*|WARMUP_ROUNDS=*|PARTITIONS=*|ENCRYPT_MODES=*|RETURN_TYPES=*|CX_BASELINE=*|CX_CANDIDATE=*|INCLUDE_CONTROL=*)
             declare "$kv" ;;
         *) echo "ERROR: unknown argument '$kv'" >&2; exit 2 ;;
     esac
@@ -45,8 +46,9 @@ check WARMUP_ROUNDS "$WARMUP_ROUNDS" '^[0-9]+$'
 check PARTITIONS "$PARTITIONS" '^[0-9]+(,[0-9]+)*$'
 check ENCRYPT_MODES "$ENCRYPT_MODES" '^(true|false)(,(true|false))*$'
 check RETURN_TYPES "$RETURN_TYPES" '^(arrow|pandas)(,(arrow|pandas))*$'
-check CX_BEFORE "$CX_BEFORE" '^[0-9A-Za-z.+-]+$'
-check CX_AFTER "$CX_AFTER" '^[0-9A-Za-z.+-]+$'
+check CX_BASELINE "$CX_BASELINE" '^[0-9A-Za-z.+-]+$'
+check CX_CANDIDATE "$CX_CANDIDATE" '^[0-9A-Za-z.+-]+$'
+check INCLUDE_CONTROL "$INCLUDE_CONTROL" '^[01]$'
 
 : "${SQL_SERVER:?SQL_SERVER not set}"
 : "${SQL_PASSWORD:?SQL_PASSWORD not set}"
@@ -54,7 +56,7 @@ DB_USER="${DB_USERNAME:-sa}"
 DB_NAME=tpch
 
 echo ">>> SF=$SF ROUNDS=$ROUNDS WARMUP_ROUNDS=$WARMUP_ROUNDS PARTITIONS=$PARTITIONS ENCRYPT_MODES=$ENCRYPT_MODES RETURN_TYPES=$RETURN_TYPES"
-echo ">>> connectorx before=$CX_BEFORE after=$CX_AFTER"
+echo ">>> connectorx baseline=$CX_BASELINE candidate=$CX_CANDIDATE include_control=$INCLUDE_CONTROL"
 
 SUDO=""
 [ "$(id -u)" -ne 0 ] && SUDO="sudo"
@@ -85,10 +87,10 @@ make_venv() {
 }
 echo ">>> Creating virtualenvs..."
 make_venv "$VENVS/tools" tpchgen-cli==3.0.0
-make_venv "$VENVS/before" "connectorx==$CX_BEFORE" "${COMMON_PKGS[@]}"
-make_venv "$VENVS/after" "connectorx==$CX_AFTER" "${COMMON_PKGS[@]}"
-if ! "$VENVS/after/bin/python" -c 'import connectorx as cx; assert hasattr(cx, "mssql_driver")'; then
-    echo "ERROR: connectorx==$CX_AFTER has no runtime mssql_driver switch; cannot build the driver-only arm." >&2
+make_venv "$VENVS/baseline" "connectorx==$CX_BASELINE" "${COMMON_PKGS[@]}"
+make_venv "$VENVS/candidate" "connectorx==$CX_CANDIDATE" "${COMMON_PKGS[@]}"
+if [ "$INCLUDE_CONTROL" = 1 ] && ! "$VENVS/candidate/bin/python" -c 'import connectorx as cx; assert hasattr(cx, "mssql_driver")'; then
+    echo "ERROR: connectorx==$CX_CANDIDATE has no runtime mssql_driver switch; cannot build the control arm." >&2
     exit 1
 fi
 
@@ -169,8 +171,8 @@ rm -f "$TBL"
     echo; echo "== SQL Server"; sqlq -Q "SET NOCOUNT ON; SELECT @@VERSION;"
     echo; echo "== client CPUs: ${PERF_CLIENT_CPUS:-unpinned}; SQL CPUs: ${PERF_SQL_CPUS:-unknown}"
     echo; echo "== python"; python3 --version
-    echo; echo "== venv before"; "$VENVS/before/bin/python" -m pip freeze
-    echo; echo "== venv after"; "$VENVS/after/bin/python" -m pip freeze
+    echo; echo "== venv baseline"; "$VENVS/baseline/bin/python" -m pip freeze
+    echo; echo "== venv candidate"; "$VENVS/candidate/bin/python" -m pip freeze
 } > "$RESULTS_DIR/environment.txt" 2>&1 || true
 
 # --- Pin the client away from SQL Server's cores ---
@@ -180,12 +182,14 @@ if [ -n "${PERF_CLIENT_CPUS:-}" ] && command -v taskset >/dev/null 2>&1; then
     PREFIX=(taskset -c "$PERF_CLIENT_CPUS")
 fi
 
+ARMS=(--arm "baseline|$VENVS/baseline/bin/python" --arm "candidate|$VENVS/candidate/bin/python")
+if [ "$INCLUDE_CONTROL" = 1 ]; then
+    ARMS+=(--arm "candidate-tiberius|$VENVS/candidate/bin/python|tiberius")
+fi
+
 echo ">>> Running A/B benchmark..."
 rc=0
-"$VENVS/after/bin/python" "$HERE/bench.py" run \
-    --arm "before|$VENVS/before/bin/python" \
-    --arm "now-tiberius|$VENVS/after/bin/python|tiberius" \
-    --arm "now|$VENVS/after/bin/python" \
+"$VENVS/candidate/bin/python" "$HERE/bench.py" run "${ARMS[@]}" \
     --host "$SQL_SERVER" --user "$DB_USER" --database "$DB_NAME" \
     --partitions "$PARTITIONS" --encrypt-modes "$ENCRYPT_MODES" --return-types "$RETURN_TYPES" \
     --rounds "$ROUNDS" --warmup-rounds "$WARMUP_ROUNDS" \

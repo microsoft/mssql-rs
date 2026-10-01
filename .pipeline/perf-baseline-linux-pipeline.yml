@@ -1,40 +1,10 @@
-# Fixed-baseline performance pipeline (dedicated perf lab)
-#
-# Compares the current commit against a fixed baseline pinned by a commit SHA
-# committed to mssql-tds-bench/perf-lab/baseline-commit.txt (advanced via PR),
-# using the mssql-tds-bench harness whose ONLY swapped input is the mssql-tds
-# source. The harness code, Criterion version, and toolchain are identical across
-# both runs, so any significant delta is attributable to mssql-tds itself.
-#
-# This pipeline consumes the shared PerfTest lab template, which runs the
-# benchmarks on a dedicated host VM (not on shared/noisy build agents):
-#   select region -> generate SSH key -> deploy VM -> copy repo -> run the
-#   testScript on the VM -> collect results -> tear down.
-#
-# The build happens ON the VM (the lab's documented model): the testScript
-# bootstraps the toolchain, builds the candidate from the working tree and the
-# baseline from a local `git worktree` of the commit in baseline-commit.txt, then
-# compares with critcmp. See mssql-tds-bench/perf-lab/run-benchmarks.{sh,ps1}.
-#
-# Complements benchmark-pipeline.yml (PR vs target branch). Trigger manually or
-# on the weekly schedule below.
-#
-# This definition is Linux-only (platform hard-coded below). Its Windows
-# counterpart is perf-baseline-windows-pipeline.yml; both extend the same shared
-# PerfTest template and are registered as separate ADO pipeline definitions, one
-# per platform — Windows and Linux numbers are not comparable and are scheduled
-# and gated independently.
+# THROWAWAY BRANCH: the fixed-baseline perf pipeline is repointed at the
+# ConnectorX TPC-H A/B harness (mssql-tds-bench/connectorx-tpch). Baseline is
+# connectorx==0.4.6 (Tiberius), candidate is connectorx==0.4.7a1 (mssql-tds).
+# Queue this definition on this branch; do not merge.
 
 trigger: none
 pr: none
-
-schedules:
-  - cron: '0 8 * * 1'
-    displayName: Weekly baseline comparison (Linux)
-    branches:
-      include:
-        - main
-    always: true
 
 resources:
   repositories:
@@ -47,23 +17,17 @@ extends:
   template: v1/Perf.Test.Job.yml@PerfTemplates
   parameters:
     platform: linux
-    # Ship the whole repo (including .git) so the testScript can create a local
-    # worktree of the baseline commit with no VM-side ADO authentication. The
-    # baseline commit must be present in the shipped history (full checkout).
-    testRootDir: $(Build.SourcesDirectory)/mssql-rs
-    # Relative to testRootDir.
-    testScript: mssql-tds-bench/perf-lab/run-benchmarks.sh
+    # Ship only the harness; results land in <testRootDir>/results.
+    testRootDir: $(Build.SourcesDirectory)/mssql-rs/mssql-tds-bench/connectorx-tpch
+    testScript: run-benchmarks.sh
+    # KEY=VALUE overrides, e.g. 'SF=10 ROUNDS=5 PARTITIONS=1,4 ENCRYPT_MODES=false,true INCLUDE_CONTROL=1'.
     testScriptArgs: none
     testResultsSubDir: results
-    testTimeoutMinutes: 120
+    testTimeoutMinutes: 240
     steps:
       - bash: |
           set -euo pipefail
-          report="$(Build.ArtifactStagingDirectory)/results/comparison.txt"
-          echo "=== Benchmark comparison (base -> candidate) ==="
-          if [ -f "$report" ]; then
-            cat "$report"
-          else
-            echo "comparison.txt not found"
-          fi
-        displayName: 'Show benchmark comparison'
+          summary="$(Build.ArtifactStagingDirectory)/results/summary.md"
+          if [ -f "$summary" ]; then cat "$summary"; else echo "summary.md not found"; fi
+        displayName: 'Show ConnectorX A/B summary'
+        condition: always()
