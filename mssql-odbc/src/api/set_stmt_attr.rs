@@ -74,7 +74,7 @@ use crate::api::util::{read_utf16_attr, write_if_some, write_wide_attr};
 use crate::error::{free_errors, post_sql_error};
 use crate::handles::desc::DescHandle;
 use crate::handles::stmt::{
-    STMT_STATE_EXEC_STARTED, STMT_STATE_FETCH_IN_PROGRESS, VendorStmtAttrs,
+    InertStmtAttrs, STMT_STATE_EXEC_STARTED, STMT_STATE_FETCH_IN_PROGRESS, VendorStmtAttrs,
 };
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 
@@ -482,10 +482,18 @@ unsafe fn sql_set_stmt_attr_w_safe(
             // whatever was written.
             if state.inert_attrs.contains(attribute) {
                 state.inert_attrs.set(attribute, value_ptr as SqlULen);
-                warn!(
-                    attribute,
-                    "SQLSetStmtAttrW: attribute stored without effect"
-                );
+                // Only the attributes nothing reads back are "without effect".
+                // NOSCAN and the parameter-array attributes are stored here but
+                // consumed at execute, so claiming they are ignored would be
+                // false — and `warn` is visible at the default trace level.
+                if InertStmtAttrs::is_honoured(attribute) {
+                    debug!(attribute, "SQLSetStmtAttrW: attribute stored");
+                } else {
+                    warn!(
+                        attribute,
+                        "SQLSetStmtAttrW: attribute stored without effect"
+                    );
+                }
                 SQL_SUCCESS
             } else {
                 post_diag(

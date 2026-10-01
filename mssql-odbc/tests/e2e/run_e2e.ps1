@@ -323,8 +323,9 @@ function Invoke-CtestRun([string]$Label, [string]$JunitName, [string]$DriverName
         # the latter because the file trace sink reads its configuration once per
         # driver load (AB#48091). Both need a path rather than a registered name
         # and skip without one. Set only for the Rust leg: the runtime teardown
-        # and the trace knobs are both ours, so pointing either at the reference
-        # driver would test nothing. Skipping on the msodbcsql leg is
+        # is ours, and msodbcsql's rotation is configured through
+        # BIDTraceFileSize in odbcinst.ini rather than the environment, so this
+        # harness cannot drive it. Skipping on the msodbcsql leg is
         # parity-neutral — parity_report.py classifies a SKIP on either side as
         # "skipped (not compared)".
         $env:MSSQL_ODBC_DLL = $RustDriverDll

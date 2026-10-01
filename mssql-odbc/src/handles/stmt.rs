@@ -668,6 +668,25 @@ const INERT_STMT_ATTRS: &[(SqlInteger, SqlULen)] = &[
     (odbc_types::SQL_ATTR_METADATA_ID, 0),
 ];
 
+/// The subset of [`INERT_STMT_ATTRS`] the execution path actually reads back.
+///
+/// These are stored and round-tripped like the rest of the inert set, but
+/// storing them is *not* without effect, so they must not be reported as
+/// ignored. Keep this in step with the consumers:
+/// - `SQL_ATTR_NOSCAN` via [`InertStmtAttrs::noscan`] (`prepare`, `exec_direct`,
+///   `execute`),
+/// - `SQL_ATTR_PARAM_BIND_OFFSET_PTR` via [`InertStmtAttrs::param_bind_offset`],
+/// - the remaining parameter-array attributes, read by `execute` and
+///   `exec_common` when binding and reporting a parameter set.
+const HONOURED_INERT_STMT_ATTRS: &[SqlInteger] = &[
+    odbc_types::SQL_ATTR_NOSCAN,
+    odbc_types::SQL_ATTR_PARAM_BIND_OFFSET_PTR,
+    odbc_types::SQL_ATTR_PARAM_BIND_TYPE,
+    odbc_types::SQL_ATTR_PARAM_OPERATION_PTR,
+    odbc_types::SQL_ATTR_PARAM_STATUS_PTR,
+    odbc_types::SQL_ATTR_PARAMS_PROCESSED_PTR,
+];
+
 /// Values for the [`INERT_STMT_ATTRS`] identifiers, positionally aligned with
 /// that table.
 ///
@@ -703,6 +722,13 @@ impl InertStmtAttrs {
     /// Returns whether `attribute` belongs to this store without changing it.
     pub(crate) fn contains(&self, attribute: SqlInteger) -> bool {
         Self::index_of(attribute).is_some()
+    }
+
+    /// Returns whether the execution path reads `attribute` back after it is
+    /// stored. See [`HONOURED_INERT_STMT_ATTRS`]; the complement is the set
+    /// that is genuinely accepted-and-ignored.
+    pub(crate) fn is_honoured(attribute: SqlInteger) -> bool {
+        HONOURED_INERT_STMT_ATTRS.contains(&attribute)
     }
 
     /// Returns the stored value, or `None` when `attribute` is not one of the
@@ -1664,6 +1690,44 @@ mod tests {
     use crate::api::odbc_types::{SQL_C_CHAR, SQL_C_SLONG, SQL_WVARCHAR};
     use crate::handles::desc::{DescHeader, DescKind};
     use mssql_tds::test_client_support::int_columns;
+
+    /// `SQLSetStmtAttrW` reports a stored attribute as "without effect" only
+    /// when nothing reads it back, and that claim is emitted at `warn`, which
+    /// is visible at the default trace level. A typo here, or an attribute
+    /// gaining a consumer without being listed, would make the driver assert
+    /// something false to every application that sets it.
+    #[test]
+    fn every_honoured_inert_attribute_is_part_of_the_inert_set() {
+        for attribute in HONOURED_INERT_STMT_ATTRS {
+            assert!(
+                INERT_STMT_ATTRS.iter().any(|(id, _)| id == attribute),
+                "honoured attribute {attribute} is not in INERT_STMT_ATTRS"
+            );
+            assert!(
+                InertStmtAttrs::is_honoured(*attribute),
+                "is_honoured disagrees with HONOURED_INERT_STMT_ATTRS for {attribute}"
+            );
+        }
+    }
+
+    /// The complement must stay non-empty, otherwise the "stored without
+    /// effect" branch is dead and the diagnostic it exists to give is gone.
+    #[test]
+    fn some_inert_attributes_are_still_genuinely_ignored() {
+        let ignored = INERT_STMT_ATTRS
+            .iter()
+            .filter(|(id, _)| !InertStmtAttrs::is_honoured(*id))
+            .count();
+        assert!(
+            ignored > 0,
+            "no attribute is reported as stored-without-effect"
+        );
+        assert_eq!(
+            ignored,
+            INERT_STMT_ATTRS.len() - HONOURED_INERT_STMT_ATTRS.len(),
+            "the honoured list must be a subset of the inert set, without duplicates"
+        );
+    }
 
     fn binding(column_number: SqlUSmallInt, target_type: SqlSmallInt) -> ColumnBinding {
         ColumnBinding {

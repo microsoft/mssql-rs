@@ -701,3 +701,44 @@ msodbcsql build is measured.
     path `SQLSetConnectAttr` does not reach pre-connect. This driver validates
     in both states; silently storing an out-of-range value is not behaviour
     worth reproducing.
+23. **Trace-file rotation is always on, sized in MB, and never truncates or
+    deletes.** msodbcsql does rotate: `BIDTraceFileSize` from `odbcinst.ini`
+    feeds `_nTraceFileMaxSize` (`odbc/sqlcconn.cpp:5831-5832`), checked between
+    events in `logTrace` (`bid/bidapi.cpp:123-129`) with the same `>=` semantics
+    this driver uses. Four differences are deliberate:
+
+    - **Always on.** msodbcsql defaults `BIDTraceFileSize` to `0`, which
+      disables rotation; this driver defaults to 100 MiB and rejects `0`, so
+      rotation cannot be turned off. An unbounded single trace file is the
+      failure AB#48091 exists to remove — it grows until it cannot be opened,
+      searched, or attached to a bug report — so the off switch is not
+      reproduced.
+    - **Unit and range.** msodbcsql reads bytes through `atol`, unbounded; this
+      driver takes whole MB through `MSSQL_TDS_TRACE_MAX_FILE_SIZE_MB` clamped
+      to 1-1024 and falls back to the default on anything else. A trace file is
+      an artifact a human has to open, so byte-level precision buys nothing and
+      an unbounded value re-creates the problem above.
+    - **The active file is unnumbered.** With rotation on, msodbcsql numbers
+      the first file (`%s%u%s`, counter from 1); here the active file is
+      `mssql_tds_trace_<timestamp>_<pid>.log` and only rollovers take a
+      `.1.log`, `.2.log` suffix, so the name an operator is told to look for
+      does not change when the first rollover happens.
+    - **Nothing is ever destroyed.** msodbcsql opens the trace file `"w"`, so
+      restarting a process truncates the previous run's trace; this driver's
+      timestamp-and-pid name makes each run a new file, and it never deletes a
+      trace file (no retention policy, no file cap, no age-based cleanup). A
+      cleanup pass scanning the directory cannot distinguish its own files from
+      a concurrently running process's. The cost is that an enabled
+      `MSSQL_TDS_TRACE_DIR` grows without bound and reclaiming space is the
+      operator's responsibility, which `mssql-odbc/README.md` states.
+
+    Configuration shape also differs: msodbcsql is driven from `odbcinst.ini`,
+    this driver from the environment. That is why `trace_rotation_test` skips on
+    the reference leg — the knob exists there, but the e2e harness cannot set
+    it — not because msodbcsql lacks rotation.
+
+    Evidence level: source reading only, and the msodbcsql citations above came
+    from PR review rather than a measurement taken here. No retail build was
+    instrumented to compare rollover boundaries or file naming. A measurement
+    that sets `BIDTraceFileSize` on a pinned msodbcsql build and compares the
+    resulting file set would close this gap. Tracked in AB#48091.

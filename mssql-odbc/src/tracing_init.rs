@@ -758,6 +758,76 @@ mod tests {
         remove_dir_all(dir).unwrap();
     }
 
+    /// The rollover-failure arm: a full or read-only volume must not stop the
+    /// driver writing, and must not re-attempt rotation on every later event.
+    #[test]
+    fn a_failed_rollover_keeps_writing_and_retries_once_per_limit() {
+        let dir = test_directory("rotation-failure");
+        let (path, file) = reserve_trace_file(&dir, "20260910123456789", 42).unwrap();
+        let writer = Arc::new(TraceFileWriter::new(path.clone(), file, 8));
+        let make_writer = SharedTraceFileWriter(Arc::clone(&writer));
+
+        // Point rollover at a directory that does not exist, so reserving the
+        // next file fails the way an unwritable volume would.
+        writer.state().base_path = dir.join("absent").join("mssql_tds_trace.log");
+
+        let write = |payload: &[u8]| {
+            make_writer
+                .make_writer_for_env_state(writer.state(), true)
+                .write_all(payload)
+                .unwrap();
+        };
+
+        write(b"aaaaaaaa"); // reaches the 8-byte limit
+        assert_eq!(writer.state().next_rotation, 1, "no attempt yet");
+
+        write(b"bb"); // crosses it: one failed rollover attempt
+        assert_eq!(
+            writer.state().next_rotation,
+            2,
+            "exactly one rollover attempt should have been made"
+        );
+
+        write(b"cc"); // still under the limit: must not retry
+        assert_eq!(
+            writer.state().next_rotation,
+            2,
+            "rollover must be retried at most once per max_file_size, not per event"
+        );
+
+        // Writing continued in the original file and nothing new was created.
+        writer.close();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "aaaaaaaabbcc");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        remove_dir_all(dir).unwrap();
+    }
+
+    /// `MSSQL_TDS_TRACE_MAX_FILE_SIZE_MB` is operator-supplied, so every
+    /// rejected shape must fall back to the default rather than propagate.
+    #[test]
+    fn bounded_env_u64_rejects_out_of_range_and_malformed_values() {
+        // A name unique to this test: the value is process-global, and the
+        // crate's other tests never read it.
+        const NAME: &str = "MSSQL_ODBC_TEST_BOUNDED_ENV_U64";
+        const DEFAULT: u64 = 100;
+
+        let bounded = || bounded_env_u64(NAME, DEFAULT, 1, 1024);
+
+        for rejected in ["0", "1025", "abc", "", "-1", "12.5", "99999999999999999999"] {
+            // SAFETY: single-threaded test, and no other test reads this name.
+            unsafe { std::env::set_var(NAME, rejected) };
+            assert_eq!(bounded(), DEFAULT, "{rejected:?} should fall back");
+        }
+
+        for (accepted, expected) in [("1", 1), ("512", 512), ("1024", 1024)] {
+            unsafe { std::env::set_var(NAME, accepted) };
+            assert_eq!(bounded(), expected, "{accepted:?} is in range");
+        }
+
+        unsafe { std::env::remove_var(NAME) };
+        assert_eq!(bounded(), DEFAULT, "unset should use the default");
+    }
+
     #[test]
     fn an_unrelated_file_in_the_trace_directory_is_left_alone() {
         // Init-time behaviour is covered end-to-end in
