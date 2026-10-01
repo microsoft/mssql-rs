@@ -327,8 +327,9 @@ on; these guarantees were verified against msodbcsql's behavior.
 
 `SQLSetDescFieldW` and `SQLSetDescRec` refuse with HY010 while any statement
 on the connection is fetching through the target descriptor as its effective
-ARD, matching `SQLBindCol`/`SQLFreeStmt(SQL_UNBIND)`/`SQLSetStmtAttr`.
-`DescHandle::update_definition` walks DBC → STMT and releases both locks
+ARD. `SQLBindCol`/`SQLFreeStmt(SQL_UNBIND)` check only the calling
+statement, so a shared explicit ARD is still mutable through a sibling
+statement while another fetches through it. `DescHandle::update_definition` walks DBC → STMT and releases both locks
 before taking the DESC lock. `STMT_STATE_FETCH_IN_PROGRESS` is specific to this
 driver, which does not hold the STMT lock across network I/O. The check is
 advisory, not atomic with the write: a fetch can start between the walk and

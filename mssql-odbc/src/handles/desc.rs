@@ -703,10 +703,12 @@ impl DescHandle {
     }
 
     /// Whether any statement is fetching through this descriptor as its
-    /// effective ARD. `SQLBindCol` refuses in the same window, because the
-    /// fetch writes through pointers it snapshotted from these records. An
-    /// explicit descriptor may be the ARD of several statements, so every
-    /// statement on the connection is checked, in DBC -> STMT order.
+    /// effective ARD; the fetch writes through pointers it snapshotted from
+    /// these records. An explicit descriptor may be the ARD of several
+    /// statements, so every statement on the connection is checked, in
+    /// DBC -> STMT order. `SQLBindCol` and `SQLFreeStmt(SQL_UNBIND)` check
+    /// only their own statement, so a shared explicit ARD is still mutable
+    /// through a sibling statement while another fetches through it.
     fn fetch_reads_through(&self) -> Result<bool, ()> {
         let dbc = unsafe { handle_from_raw::<DbcHandle>(self.parent_dbc) };
         let Ok(dbc_state) = dbc.inner.lock() else {
