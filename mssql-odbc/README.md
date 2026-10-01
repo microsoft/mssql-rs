@@ -177,7 +177,7 @@ Tracing is disabled by default and is intended for diagnostics.
 | `MSSQL_TDS_TRACE` | `false` | Set to `true` to enable tracing |
 | `MSSQL_TDS_TRACE_LEVEL` | `warn` | Set a `tracing_subscriber::EnvFilter` expression |
 | `MSSQL_TDS_TRACE_DIR` | unset | Write per-process trace files to this directory instead of stderr |
-| `MSSQL_TDS_TRACE_MAX_FILE_SIZE_MB` | `100` | Roll over to a new file once the live file reaches this size. Accepts 1-1024; any other value falls back to the default |
+| `MSSQL_TDS_TRACE_MAX_FILE_SIZE_MB` | `100` | Roll over to a new file once the live file reaches this size. Accepts 1-1024; any other value falls back to the default. A threshold, not a hard cap — see below |
 
 For example:
 
@@ -201,6 +201,14 @@ highest-numbered file is the live one and earlier files are left untouched. A
 process that never reaches the size limit leaves a single unsuffixed file. The
 driver never deletes a trace file, so an enabled `MSSQL_TDS_TRACE_DIR` grows
 without bound — reclaiming disk space is the operator's responsibility.
+
+`MSSQL_TDS_TRACE_MAX_FILE_SIZE_MB` is a rollover threshold rather than a hard
+cap, and an individual file can exceed it in two ways. The size is checked
+between events, so the event that crosses the threshold is written whole instead
+of being split across two files. And if creating the successor fails — a full or
+read-only volume, for example — the driver reports the error on stderr and keeps
+writing to the current file, retrying only after another size interval has been
+written; while rollover is failing, the per-file limit is not enforced.
 
 ## Contributing
 
