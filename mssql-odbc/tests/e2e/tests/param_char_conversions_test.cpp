@@ -1074,10 +1074,17 @@ TEST_F(CharConversionLiveTest, UnmappableCharacterIsSubstituted) {
     EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }
 
-// An unpaired UTF-16 surrogate is an unmappable character like any other: it
-// has no scalar value and therefore no representation in any narrow code page.
-// It is repaired to U+FFFD on decode and then substituted by the target
-// collation, arriving as a single '?'.
+// An unpaired UTF-16 surrogate has no scalar value, so it is repaired to
+// U+FFFD on decode and then handed to the target collation. Under the
+// single-byte Latin1 collations this test admits, U+FFFD has no representation
+// and is substituted, arriving as a single '?'.
+//
+// Scoped to those collations rather than to "any narrow code page": a `_UTF8`
+// collation is narrow too, but U+FFFD is representable there, so it survives as
+// EF BF BD with no loss flagged. That arm is pinned by
+// `a_lone_surrogate_under_a_utf8_collation_is_not_substituted` in
+// mssql-tds/tests/test_narrow_param_encoding.rs, and DatabaseIsLatin1() below
+// is what keeps this test off it.
 //
 // Runs on both legs, and the agreement is measured rather than assumed. On
 // retail msodbcsql18 against SQL Server on localhost, binding `a<D800>b` to a
