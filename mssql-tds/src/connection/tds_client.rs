@@ -1666,7 +1666,7 @@ impl TdsClient {
             column_encryption,
             on_error,
         } = options.into();
-        Self::note_rpc_ignores_on_error(on_error);
+        Self::note_on_error_ignored(on_error);
         self.current_command_ce_setting = column_encryption;
 
         if self.command_is_busy() {
@@ -1740,7 +1740,7 @@ impl TdsClient {
             column_encryption,
             on_error,
         } = options.into();
-        Self::note_rpc_ignores_on_error(on_error);
+        Self::note_on_error_ignored(on_error);
         self.current_command_ce_setting = column_encryption;
         self.remaining_request_timeout = timeout_sec
             .filter(|seconds| *seconds > 0)
@@ -2145,7 +2145,7 @@ impl TdsClient {
             column_encryption,
             on_error,
         } = options.into();
-        Self::note_rpc_ignores_on_error(on_error);
+        Self::note_on_error_ignored(on_error);
 
         if self.command_is_busy() {
             return Err(UsageError(ALREADY_EXECUTING_ERROR.to_string()));
@@ -3362,7 +3362,7 @@ impl TdsClient {
             column_encryption,
             on_error,
         } = options.into();
-        Self::note_rpc_ignores_on_error(on_error);
+        Self::note_on_error_ignored(on_error);
         self.current_command_ce_setting = column_encryption;
 
         let mut positional_parameters = positional_parameters;
@@ -3512,7 +3512,7 @@ impl TdsClient {
             column_encryption,
             on_error,
         } = options.into();
-        Self::note_rpc_ignores_on_error(on_error);
+        Self::note_on_error_ignored(on_error);
         self.current_command_ce_setting = column_encryption;
 
         let reconnect_elapsed = if command_started {
@@ -3703,8 +3703,10 @@ impl TdsClient {
         let ExecuteOptions {
             timeout: timeout_sec,
             cancel: cancel_handle,
+            on_error,
             ..
         } = options.into();
+        Self::note_on_error_ignored(on_error);
 
         // Store timeout and cancel handle for this operation
         let budget = Self::deduct_timeout(timeout_sec, Duration::ZERO);
@@ -4291,7 +4293,7 @@ impl TdsClient {
             column_encryption,
             on_error,
         } = options.into();
-        Self::note_rpc_ignores_on_error(on_error);
+        Self::note_on_error_ignored(on_error);
         self.current_command_ce_setting = column_encryption;
 
         // Store timeout and cancel handle for this operation
@@ -4478,7 +4480,7 @@ impl TdsClient {
             column_encryption,
             on_error,
         } = options.into();
-        Self::note_rpc_ignores_on_error(on_error);
+        Self::note_on_error_ignored(on_error);
         self.current_command_ce_setting = column_encryption;
 
         // Store timeout and cancel handle for this operation
@@ -7978,13 +7980,14 @@ impl TdsClient {
         error
     }
 
-    /// RPC entry points (`execute_sp_*`, prepared execution, stored procedures)
-    /// always use [`BatchErrorMode::Abort`]. The option is on the shared
-    /// [`ExecuteOptions`], so a caller can pass `Continue` to one of them; say so
-    /// in a trace rather than drop it silently.
-    fn note_rpc_ignores_on_error(on_error: BatchErrorMode) {
+    /// Only [`execute`](Self::execute) honours [`ExecuteOptions::on_error`]. The
+    /// option is on the shared [`ExecuteOptions`], so a caller can pass
+    /// `Continue` to any entry point that takes one — the RPC entry points,
+    /// `unprepare`, transaction requests — and each uses
+    /// [`BatchErrorMode::Abort`]; say so in a trace rather than drop it silently.
+    fn note_on_error_ignored(on_error: BatchErrorMode) {
         if on_error != BatchErrorMode::Abort {
-            debug!("BatchErrorMode::Continue is not honoured on RPC entry points; using Abort");
+            debug!("BatchErrorMode::Continue is honoured only by execute; using Abort");
         }
     }
 
@@ -8012,7 +8015,8 @@ impl TdsClient {
     /// `None` means the server reported no count — `SET NOCOUNT ON`, for one —
     /// which is deliberately distinct from `Some(0)`, an empty row set whose
     /// count was reported. It is also `None` while a row set is still being read,
-    /// after a no-row statement, after a cancellation, and for prepared batches,
+    /// after a no-row statement, after a cancellation, after [`close_query`](Self::close_query),
+    /// and for prepared batches,
     /// which report counts through
     /// [`PreparedBatchResult`](crate::connection::PreparedBatchResult).
     pub fn last_result_row_count(&self) -> Option<u64> {
@@ -8151,6 +8155,8 @@ impl TdsClient {
     pub async fn close_query(&mut self) -> TdsResult<()> {
         self.interrupted_read_settled = false;
         if !self.has_open_batch() {
+            // The request is over even when the walk already reached its end.
+            self.reset_statement_walk_state();
             return Ok(());
         }
         // Statement errors skipped under `Continue`; see below.
@@ -8213,6 +8219,7 @@ impl TdsClient {
         self.active_row_read_state = ActiveRowReadState::Idle;
         self.row_already_positioned = false;
         self.parked_token = None;
+        self.reset_statement_walk_state();
         self.current_command_ce_setting = ExecutionColumnEncryptionSetting::UseConnectionSetting;
         self.execution_context.set_has_open_batch(false);
 
@@ -8362,8 +8369,12 @@ impl TdsClient {
             ));
         }
         let ExecuteOptions {
-            timeout, cancel, ..
+            timeout,
+            cancel,
+            on_error,
+            ..
         } = options.into();
+        Self::note_on_error_ignored(on_error);
 
         self.begin_command();
         let reconnect_elapsed = self.check_and_reconnect(timeout, cancel).await?;
@@ -8719,10 +8730,11 @@ pub struct ExecuteOptions<'a> {
     /// [`BatchErrorMode::Abort`], the behaviour every caller had before this
     /// option existed.
     ///
-    /// Honoured by [`execute`](TdsClient::execute), which sends a SQL batch.
-    /// RPC entry points (`execute_sp_*`, prepared execution, stored procedures)
-    /// keep [`BatchErrorMode::Abort`]; prepared batches report per-row errors
-    /// through [`PreparedBatchResult`](crate::connection::PreparedBatchResult).
+    /// Honoured by [`execute`](TdsClient::execute), which sends a SQL batch, and
+    /// by nothing else: the RPC entry points (`execute_sp_*`, prepared execution,
+    /// `unprepare`) and transaction requests use [`BatchErrorMode::Abort`] and
+    /// log at debug level when given `Continue`. Prepared batches report per-row
+    /// errors through [`PreparedBatchResult`](crate::connection::PreparedBatchResult).
     pub on_error: BatchErrorMode,
 }
 
@@ -8793,10 +8805,10 @@ impl<'a> ExecuteOptions<'a> {
     /// Chooses what a statement error does to the rest of the batch; see
     /// [`BatchErrorMode`].
     ///
-    /// Honoured by [`execute`](TdsClient::execute) only. The RPC entry points —
-    /// `execute_sp_executesql`, the prepared-statement and stored-procedure paths
-    /// — always use [`BatchErrorMode::Abort`] and log at debug level when given
-    /// `Continue`.
+    /// Honoured by [`execute`](TdsClient::execute) only. Every other entry point
+    /// that takes [`ExecuteOptions`] — `execute_sp_executesql`, prepared
+    /// execution, `unprepare`, transaction requests — uses
+    /// [`BatchErrorMode::Abort`] and logs at debug level when given `Continue`.
     pub fn on_error(mut self, mode: BatchErrorMode) -> Self {
         self.on_error = mode;
         self
@@ -9777,6 +9789,10 @@ mod tests {
         assert!(client.next_row().await.unwrap().is_none());
         assert_eq!(client.last_result_row_count(), Some(1));
         assert_eq!(client.advance().await.unwrap(), StatementResult::End);
+
+        // Ending the request clears it, including when the walk already ended.
+        client.close_query().await.unwrap();
+        assert_eq!(client.last_result_row_count(), None);
     }
 
     /// Under `Continue` one error can be reflected by both the failing
@@ -10730,6 +10746,88 @@ mod tests {
         assert!(client.row_set_errors.is_empty());
     }
 
+    /// The pull-cursor reader has the same exit: a transport failure after a
+    /// row-set error closes the batch rather than leaving it open.
+    #[tokio::test]
+    async fn a_transport_failure_in_the_cursor_reader_after_a_row_set_error_closes_the_batch() {
+        let mut client = create_test_client_with_tokens(vec![
+            int_col_metadata(1),
+            Tokens::Error(error_token_with_severity(16)),
+        ]);
+        assert_eq!(
+            client
+                .execute(
+                    "q".to_string(),
+                    ExecuteOptions::new().on_error(BatchErrorMode::Continue),
+                )
+                .await
+                .unwrap(),
+            StatementResult::Rows
+        );
+
+        assert!(matches!(
+            client.next_row_cursor().await,
+            Err(crate::error::Error::ConnectionClosed(_))
+        ));
+        assert!(!client.has_open_batch());
+        assert!(client.is_connection_dead());
+        assert!(client.row_set_errors.is_empty());
+    }
+
+    /// The "next DONE completes the failed statement" flag belongs to that DONE.
+    /// When a new row set starts first, the flag is dropped, so a later DML count
+    /// is still surfaced.
+    #[tokio::test]
+    async fn a_row_set_after_a_statement_error_does_not_hide_a_later_count() {
+        let mut client = create_test_client_with_tokens(vec![
+            Tokens::Error(error_token_with_severity(16)),
+            int_col_metadata(1),
+            done_count(CurrentCommand::Select, 0, true),
+            done_count(CurrentCommand::Update, 3, false),
+        ]);
+
+        assert!(
+            client
+                .execute(
+                    "q".to_string(),
+                    ExecuteOptions::new().on_error(BatchErrorMode::Continue),
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(client.advance().await.unwrap(), StatementResult::Rows);
+        assert!(client.next_row().await.unwrap().is_none());
+        assert_eq!(
+            client.advance().await.unwrap(),
+            StatementResult::NoRows {
+                rows_affected: Some(3)
+            }
+        );
+    }
+    /// The first DONE after a returned error completes that statement even
+    /// when it is a counted DONEINPROC — which the error-chain rule, scoped to
+    /// DONEPROC and plain DONE, does not cover. The DML after it still surfaces.
+    #[tokio::test]
+    async fn a_counted_done_in_proc_completing_a_failed_statement_is_not_surfaced() {
+        let mut client = create_test_client_with_tokens(vec![
+            Tokens::Error(error_token_with_severity(16)),
+            Tokens::DoneInProc(DoneToken {
+                status: DoneStatus::ERROR | DoneStatus::COUNT | DoneStatus::MORE,
+                cur_cmd: CurrentCommand::Insert,
+                row_count: 2,
+            }),
+            done_count(CurrentCommand::Update, 3, false),
+        ]);
+        client.batch_error_mode = BatchErrorMode::Continue;
+
+        assert!(client.advance_to_result_boundary().await.is_err());
+        assert!(matches!(
+            client.advance_to_result_boundary().await.unwrap(),
+            ResultBoundaryKind::NoRows {
+                rows_affected: Some(3)
+            }
+        ));
+    }
     /// If a later ERROR of the same statement is fatal, the whole run drains
     /// and closes as `Abort` would, and the earlier errors are not lost.
     #[tokio::test]
@@ -10855,7 +10953,21 @@ mod tests {
                 row_count: 0,
             }),
             int_col_metadata(1),
-            done_count(CurrentCommand::Select, 0, false),
+            done_count(CurrentCommand::Select, 0, true),
+            Tokens::Error(crate::token::tokens::ErrorToken {
+                number: 50002,
+                state: 1,
+                severity: 16,
+                message: "also skipped".to_string(),
+                server_name: String::new(),
+                proc_name: String::new(),
+                line_number: 1,
+            }),
+            Tokens::Done(DoneToken {
+                status: DoneStatus::ERROR,
+                cur_cmd: CurrentCommand::Select,
+                row_count: 0,
+            }),
         ]);
         assert!(
             client
@@ -10867,14 +10979,20 @@ mod tests {
                 .is_err()
         );
 
+        // Two skipped errors, with a row set between them: stopping at the first
+        // would leave the rest of the batch unread and lose the second.
         match client.close_query().await {
             Err(crate::error::Error::SqlServerError { diagnostics }) => {
-                assert_eq!(diagnostics.errors.len(), 1);
-                assert_eq!(diagnostics.errors[0].number, 50001);
+                let numbers: Vec<u32> = diagnostics.errors.iter().map(|e| e.number).collect();
+                assert_eq!(numbers, vec![50001, 50002]);
             }
             other => panic!("expected the skipped error, got {other:?}"),
         }
         assert!(!client.has_open_batch());
+        // The request is over: nothing from its statement walk carries on.
+        assert_eq!(client.batch_error_mode, BatchErrorMode::Abort);
+        assert!(!client.statement_error_completion_pending);
+        assert!(!client.failed_statement_done_pending);
         assert!(
             !client.is_connection_dead(),
             "a statement error is not a reason to retire the connection"
