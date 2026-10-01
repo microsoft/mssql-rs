@@ -4130,6 +4130,8 @@ impl TdsClient {
                 .await?;
             return Ok(StreamedParamStatus::Complete(result));
         }
+        // `execute_prepared` above notes it for the materialized route.
+        Self::note_on_error_ignored(opts.on_error);
 
         if self.should_encrypt_parameters() {
             return Err(UsageError(
@@ -6634,7 +6636,7 @@ impl TdsClient {
         match result {
             Ok(read) => Ok(read),
             Err(error) => {
-                self.settle_interrupted_read(&error);
+                let error = self.fail_row_read(error);
                 self.abort_pending_prepare_capture();
                 Err(error)
             }
@@ -6800,13 +6802,8 @@ impl TdsClient {
             {
                 Ok(result) => result,
                 Err(error) => {
-                    self.settle_interrupted_read(&error);
+                    let error = self.fail_row_read(error);
                     self.abort_pending_prepare_capture();
-                    // Mid failed statement under `Continue`: the row set cannot
-                    // be finished, so close the batch rather than leave it open.
-                    if !self.row_set_errors.is_empty() {
-                        return Err(self.abandon_failed_statement(error));
-                    }
                     return Err(error);
                 }
             };
@@ -7055,13 +7052,7 @@ impl TdsClient {
             }
             let header = match header {
                 Ok(header) => header,
-                Err(error) => {
-                    self.settle_interrupted_read(&error);
-                    if !self.row_set_errors.is_empty() {
-                        return Err(self.abandon_failed_statement(error));
-                    }
-                    return Err(error);
-                }
+                Err(error) => return Err(self.fail_row_read(error)),
             };
 
             match header {
@@ -7497,7 +7488,7 @@ impl TdsClient {
                 "row continuation returned a control token".to_string(),
             )),
             Err(error) => {
-                self.settle_interrupted_read(&error);
+                let error = self.fail_row_read(error);
                 self.abort_pending_prepare_capture();
                 Err(error)
             }
@@ -7563,7 +7554,7 @@ impl TdsClient {
                 "Inline prefix continuation returned a control token".to_string(),
             )),
             Err(error) => {
-                self.settle_interrupted_read(&error);
+                let error = self.fail_row_read(error);
                 self.abort_pending_prepare_capture();
                 Err(error)
             }
@@ -7663,10 +7654,7 @@ impl TdsClient {
         }
         let result = match result {
             Ok(result) => result,
-            Err(error) => {
-                self.settle_interrupted_read(&error);
-                return Err(error);
-            }
+            Err(error) => return Err(self.fail_row_read(error)),
         };
 
         match result {
@@ -7775,10 +7763,7 @@ impl TdsClient {
             self.update_remaining_timeout(start);
             let read = match read {
                 Ok(read) => read,
-                Err(error) => {
-                    self.settle_interrupted_read(&error);
-                    return Err(error);
-                }
+                Err(error) => return Err(self.fail_row_read(error)),
             };
 
             if read == 0 && !plp_state.reached_end() {
@@ -7814,10 +7799,7 @@ impl TdsClient {
         self.update_remaining_timeout(start);
         let result = match result {
             Ok(result) => result,
-            Err(error) => {
-                self.settle_interrupted_read(&error);
-                return Err(error);
-            }
+            Err(error) => return Err(self.fail_row_read(error)),
         };
         match result {
             RowReadResult::RowWritten => {
@@ -8082,6 +8064,22 @@ impl TdsClient {
         error
     }
 
+    /// Settles a read that failed inside a row set and returns the error to
+    /// report.
+    ///
+    /// Every row-set read surface — whole rows, resumed rows, lazy columns, PLP
+    /// chunks — fails through here, so a row set that already collected
+    /// `row_set_errors` under [`BatchErrorMode::Continue`] always closes its
+    /// batch: the response cannot be resumed past the failed read, and an open
+    /// batch after `Err` would tell the caller to keep walking it.
+    fn fail_row_read(&mut self, error: crate::error::Error) -> crate::error::Error {
+        self.settle_interrupted_read(&error);
+        if self.row_set_errors.is_empty() {
+            return error;
+        }
+        self.abandon_failed_statement(error)
+    }
+
     /// Only [`execute`](Self::execute) honours [`ExecuteOptions::on_error`]. The
     /// option is on the shared [`ExecuteOptions`], so a caller can pass
     /// `Continue` to any entry point that takes one — the RPC entry points,
@@ -8334,8 +8332,8 @@ impl TdsClient {
             self.reset_statement_walk_state();
             return Ok(());
         }
-        // Statement errors skipped under `Continue`; see below.
-        let mut skipped_errors: Vec<SqlErrorInfo> = Vec::new();
+        // Statement diagnostics skipped under `Continue`; see below.
+        let mut skipped = crate::error::SqlServerDiagnostics::new(Vec::new(), Vec::new());
         // call next row to consume any remaining tokens
         let drain_result = loop {
             match self.advance_to_rows().await {
@@ -8347,27 +8345,28 @@ impl TdsClient {
                 Err(crate::error::Error::SqlServerError { diagnostics })
                     if self.has_open_batch() =>
                 {
-                    skipped_errors.extend(diagnostics.errors);
+                    skipped.errors.extend(diagnostics.errors);
+                    skipped.info_messages.extend(diagnostics.info_messages);
                 }
                 Err(error) => break Err(error),
             }
         };
         let drain_result = match drain_result {
-            Ok(()) if skipped_errors.is_empty() => Ok(()),
-            Ok(()) => Err(crate::error::Error::from_sql_errors(skipped_errors)),
+            Ok(()) if skipped.errors.is_empty() => Ok(()),
+            Ok(()) => Err(crate::error::Error::from_sql_diagnostics(skipped)),
             Err(crate::error::Error::SqlServerError { mut diagnostics }) => {
-                skipped_errors.append(&mut diagnostics.errors);
-                diagnostics.errors = skipped_errors;
-                Err(crate::error::Error::SqlServerError { diagnostics })
+                skipped.errors.append(&mut diagnostics.errors);
+                skipped.info_messages.append(&mut diagnostics.info_messages);
+                Err(crate::error::Error::from_sql_diagnostics(skipped))
             }
             Err(error) => {
                 // The failure that stopped the drain is returned, because it
                 // decides whether the connection is retired. The statement errors
                 // skipped before it cannot ride on that error type, so at least
                 // make their loss visible.
-                if !skipped_errors.is_empty() {
+                if !skipped.errors.is_empty() {
                     warn!(
-                        count = skipped_errors.len(),
+                        count = skipped.errors.len(),
                         "Discarding statement errors skipped during the close_query drain"
                     );
                 }
@@ -10947,6 +10946,85 @@ mod tests {
         assert!(!client.has_open_batch());
         assert!(client.is_connection_dead());
         assert!(client.row_set_errors.is_empty());
+    }
+
+    /// Every other read inside a row set — draining a paused row or PLP value
+    /// before the next row, pulling a column, finishing a row or its prefix,
+    /// reading PLP bytes — closes the batch the same way when it fails after a
+    /// row-set error.
+    #[tokio::test]
+    async fn every_row_set_read_failure_after_a_row_set_error_closes_the_batch() {
+        fn row_paused() -> ActiveRowReadState {
+            ActiveRowReadState::RowPaused(Box::new(RowPauseState {
+                next_column_index: 0,
+                metadata: int_column_metadata(2),
+                nbc_null_bitmap: None,
+                decryptor: None,
+            }))
+        }
+        fn plp_paused() -> ActiveRowReadState {
+            let metadata = mixed_lob_metadata(0);
+            let Some((Some(plp_stream), _used)) =
+                crate::datatypes::decoder::PlpColumnStream::try_begin_buffered(
+                    &metadata.columns[0],
+                    &4_u64.to_le_bytes(),
+                )
+                .unwrap()
+            else {
+                panic!("a known-length PLP header must yield a started stream");
+            };
+            ActiveRowReadState::PlpPaused(Box::new(PlpPauseState {
+                row_pause_state: RowPauseState {
+                    next_column_index: 0,
+                    metadata,
+                    nbc_null_bitmap: None,
+                    decryptor: None,
+                },
+                plp_stream,
+            }))
+        }
+        fn failed_row_set(state: ActiveRowReadState) -> TdsClient {
+            let mut client = create_test_client();
+            client.batch_error_mode = BatchErrorMode::Continue;
+            client.execution_context.set_has_open_batch(true);
+            client.current_metadata = Some(int_column_metadata(2));
+            client.active_row_read_state = state;
+            client
+                .row_set_errors
+                .push(SqlErrorInfo::from(&error_token_with_severity(16)));
+            client
+        }
+        fn assert_closed(client: &TdsClient, surface: &str) {
+            assert!(!client.has_open_batch(), "{surface}: batch left open");
+            assert!(client.is_connection_dead(), "{surface}: not retired");
+            assert!(client.row_set_errors.is_empty(), "{surface}: errors kept");
+        }
+
+        let mut writer = crate::datatypes::row_writer::DefaultRowWriter::new(2);
+
+        let mut client = failed_row_set(row_paused());
+        assert!(client.next_row_cursor().await.is_err());
+        assert_closed(&client, "next_row_cursor draining a paused row");
+
+        let mut client = failed_row_set(plp_paused());
+        assert!(client.next_row_cursor().await.is_err());
+        assert_closed(&client, "next_row_cursor draining a paused PLP value");
+
+        let mut client = failed_row_set(row_paused());
+        assert!(client.read_row_column(1).await.is_err());
+        assert_closed(&client, "read_row_column");
+
+        let mut client = failed_row_set(row_paused());
+        assert!(client.finish_row_into(&mut writer).await.is_err());
+        assert_closed(&client, "finish_row_into");
+
+        let mut client = failed_row_set(row_paused());
+        assert!(client.finish_row_prefix_into(1, &mut writer).await.is_err());
+        assert_closed(&client, "finish_row_prefix_into");
+
+        let mut client = failed_row_set(plp_paused());
+        assert!(client.read_active_plp_bytes(&mut [0u8; 4]).await.is_err());
+        assert_closed(&client, "read_active_plp_bytes");
     }
 
     /// The "next DONE completes the failed statement" flag belongs to that DONE.

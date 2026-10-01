@@ -1037,6 +1037,69 @@ mod query_result_reads {
         assert_still_usable(&mut connection).await;
     }
 
+    /// Errors unwinding nested procedures. SQL Server flags only the failing
+    /// statement's DONEINPROC; the enclosing DONEINPROC/DONEPROC frames arrive
+    /// unflagged, and a batch-aborting error ends the response with a single
+    /// error-flagged DONE and no procedure frames. Each shape must walk to the
+    /// end without a `ProtocolError` and leave the connection usable.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn continue_walks_through_errors_unwinding_nested_procedures() {
+        let conversion =
+            "Conversion failed when converting the varchar value 'x' to data type int.";
+        let divide = "Divide by zero error encountered.";
+        let cases: Vec<(&[&str], &str, Vec<Step>)> = vec![
+            // Statement error as the last statement, three frames deep.
+            (
+                &[
+                    "CREATE PROCEDURE #deep_inner AS RAISERROR('inner', 16, 1);",
+                    "CREATE PROCEDURE #deep_middle AS EXEC #deep_inner;",
+                    "CREATE PROCEDURE #deep_outer AS EXEC #deep_middle;",
+                ],
+                "EXEC #deep_outer; SELECT 5 AS e;",
+                vec![
+                    Step::Error(vec!["inner".to_string()]),
+                    Step::Rows(vec![5], Some(1)),
+                ],
+            ),
+            // Batch abort without a row set.
+            (
+                &[
+                    "CREATE PROCEDURE #abort_inner AS BEGIN DECLARE @i int = CONVERT(int, 'x'); END",
+                    "CREATE PROCEDURE #abort_outer AS BEGIN EXEC #abort_inner; SELECT 4 AS d; END",
+                ],
+                "EXEC #abort_outer; SELECT 5 AS e;",
+                vec![Step::Error(vec![conversion.to_string()])],
+            ),
+            // Batch abort inside a row set.
+            (
+                &[
+                    "CREATE PROCEDURE #rows_inner AS SELECT CONVERT(int, 'x');",
+                    "CREATE PROCEDURE #rows_outer AS BEGIN EXEC #rows_inner; SELECT 4 AS d; END",
+                ],
+                "EXEC #rows_outer; SELECT 5 AS e;",
+                vec![Step::RowsThenError(vec![], vec![conversion.to_string()])],
+            ),
+            // XACT_ABORT turns a statement error into a batch abort.
+            (
+                &[
+                    "CREATE PROCEDURE #xact_inner AS BEGIN DECLARE @i int = 1/0; SELECT 3 AS c; END",
+                    "CREATE PROCEDURE #xact_outer AS BEGIN EXEC #xact_inner; SELECT 4 AS d; END",
+                ],
+                "SET XACT_ABORT ON; EXEC #xact_outer; SELECT 5 AS e;",
+                vec![Step::Error(vec![divide.to_string()])],
+            ),
+        ];
+
+        for (ddl, sql, expected) in cases {
+            let mut connection = begin_connection(&build_tcp_datasource()).await;
+            for statement in ddl {
+                run_ddl(&mut connection, statement).await;
+            }
+            let steps = walk(&mut connection, sql, BatchErrorMode::Continue).await;
+            assert_eq!(steps, expected, "{sql}");
+            assert_still_usable(&mut connection).await;
+        }
+    }
     async fn run_ddl(connection: &mut TdsClient, sql: &str) {
         connection.execute(sql.to_string(), ()).await.unwrap();
         connection.close_query().await.unwrap();
