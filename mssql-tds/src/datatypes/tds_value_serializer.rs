@@ -1425,23 +1425,33 @@ impl TdsValueSerializer {
 
                 // A UTF-8 source under a UTF-8 collation is already the wire
                 // form, so the decode/re-encode below is an identity pair:
-                // `to_utf8_string` would copy and re-validate bytes an
-                // `EncodingType::Utf8` `SqlString` has already validated, and
+                // `to_utf8_string` would copy and re-validate the bytes, and
                 // `UTF_8.encode` borrows and is then copied back out. Skipping
-                // both is safe only because each half of the guard is exact --
-                // `Utf8` means the bytes are valid UTF-8, and `collation.utf8()`
-                // is `try_resolve_collation`'s first branch, so the resolved
-                // encoding is UTF-8 unconditionally. Nothing is lost either:
-                // UTF-8 represents every character, so the skipped
-                // `encode_narrow_with` could not have set `had_loss`. Framing is
-                // unchanged because `serialize_char_varchar_direct` measures the
-                // byte slice it is handed, which is the same length both ways.
+                // both saves two copies per parameter.
+                //
+                // `EncodingType::Utf8` is a declaration, not a guarantee --
+                // `SqlString::new` stores whatever bytes it is handed -- so the
+                // validity is checked here rather than assumed. Invalid bytes
+                // fall through to the established path, which is what they did
+                // before this fast path existed. `get_data.rs`'s narrow
+                // passthrough guards itself the same way, for the same reason.
+                // The check is a borrow-based validation with no allocation,
+                // against the two copies it avoids.
+                //
+                // The rest of the guard is exact: `collation.utf8()` is
+                // `try_resolve_collation`'s first branch, so the resolved
+                // encoding is UTF-8 unconditionally; UTF-8 represents every
+                // character, so the skipped encode could not have set
+                // `had_loss`; and framing is unchanged because
+                // `serialize_char_varchar_direct` measures the slice it is
+                // handed, which is the same length either way.
                 //
                 // Reachable only since AB#48437: before it this arm resolved a
                 // UTF-8 collation to the LCID's single-byte page, so source and
                 // target never matched.
                 if matches!(value.encoding_type(), EncodingType::Utf8)
                     && ctx.collation.is_some_and(|c| c.utf8())
+                    && std::str::from_utf8(&value.bytes).is_ok()
                 {
                     return Self::serialize_char_varchar_direct(writer, &value.bytes, ctx).await;
                 }
@@ -4418,6 +4428,30 @@ mod tests {
         let (payload, had_loss) = serialize_varchar("Caf\u{e9}", Some(windows_1252_collation()));
         assert_eq!(payload, b"\x04\x00Caf\xe9");
         assert!(!had_loss);
+    }
+
+    /// The UTF-8 passthrough must not forward bytes that are not actually
+    /// UTF-8. `EncodingType::Utf8` is a declaration -- `SqlString::new` stores
+    /// whatever it is handed -- so a caller can label malformed bytes as UTF-8,
+    /// and sending those to a `_UTF8` collation would put invalid data on the
+    /// wire under a declaration that it is valid.
+    ///
+    /// The fast path therefore validates before taking itself, and malformed
+    /// input falls through to the established decode path, which is what it did
+    /// before the fast path existed.
+    #[test]
+    #[should_panic(expected = "Utf8Error")]
+    fn the_utf8_passthrough_rejects_bytes_that_are_not_utf8() {
+        // A lone continuation byte: never valid UTF-8.
+        let value = ColumnValues::String(crate::datatypes::sql_string::SqlString::new(
+            vec![0x80],
+            crate::datatypes::sql_string::EncodingType::Utf8,
+        ));
+        // Falls through to `to_utf8_string`, whose `Utf8` arm unwraps a
+        // `String::from_utf8` and so panics. That is the pre-existing behaviour
+        // for this input and is deliberately not changed here; what matters is
+        // that the fast path does not silently forward the bytes instead.
+        let _ = serialize_narrow(&value, Some(utf8_collation()));
     }
 
     // ---- AB#48437: the inline serializer resolves the full collation --------
