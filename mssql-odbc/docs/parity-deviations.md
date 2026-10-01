@@ -722,11 +722,14 @@ msodbcsql build is measured.
     - `serialize_string`'s `VARCHAR | CHAR | TEXT` arm
       (`mssql-tds/src/datatypes/tds_value_serializer.rs`) falls back to a
       **Latin-1-like** mapping: a scalar at or below U+00FF is its own byte,
-      anything above becomes `?`. The same arm uses it when no collation is
-      known at all.
+      anything above becomes `?` — one per UTF-16 unit, so a supplementary
+      character becomes `??`. The same arm uses it when no collation is known
+      at all.
 
-    The two disagree: U+0080 is `0x80` under the Latin-1 mapping and unmappable
-    in Windows-1252, whose `0x80` is the Euro sign, so it substitutes to `?`.
+    Both rules substitute per UTF-16 unit, so the width agrees between them and
+    with deviation 21; measured, U+1F600 is `3F 3F` under either. What the two
+    disagree on is U+0080: `0x80` under the Latin-1 mapping, but unmappable in
+    Windows-1252, whose `0x80` is the Euro sign, so it substitutes to `?`.
 
     An application can tell the difference from msodbcsql in both cases — it
     stores a value where the reference driver would fail the bind — so this is
