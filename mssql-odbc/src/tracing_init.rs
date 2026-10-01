@@ -73,6 +73,20 @@ struct TraceFileState {
     next_rotation: u32,
 }
 
+impl TraceFileState {
+    /// Adds `written` to the rollover counter, saturating.
+    ///
+    /// `usize` is never wider than `u64` on a supported target, so the
+    /// `u64::MAX` arm is unreachable today. Taking the checked conversion
+    /// anyway keeps the counter from under-counting — and so from skipping a
+    /// rollover — rather than silently truncating if that ever stops holding.
+    fn record_written(&mut self, written: usize) {
+        self.bytes_written = self
+            .bytes_written
+            .saturating_add(u64::try_from(written).unwrap_or(u64::MAX));
+    }
+}
+
 #[derive(Clone)]
 struct SharedTraceFileWriter(Arc<TraceFileWriter>);
 
@@ -148,12 +162,12 @@ impl Write for TraceWriter<'_> {
                     .as_mut()
                     .ok_or_else(|| io::Error::other("trace file is closed"))?
                     .write(buf)?;
-                state.bytes_written = state.bytes_written.saturating_add(written as u64);
+                state.record_written(written);
                 Ok(written)
             }
             Self::Transient { file, state } => {
                 let written = file.write(buf)?;
-                state.bytes_written = state.bytes_written.saturating_add(written as u64);
+                state.record_written(written);
                 Ok(written)
             }
             Self::Sink(sink) => sink.write(buf),
