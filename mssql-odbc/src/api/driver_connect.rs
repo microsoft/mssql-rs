@@ -413,28 +413,17 @@ fn do_connect(
         context.login_timeout = Some(secs);
     }
 
-    if let Err(unsupported) = configure_auth(&mut context, resolved, &params.server) {
-        let UnsupportedAuth {
-            requested,
-            resolved,
-        } = &unsupported;
+    if let Err(UnsupportedAuth(method)) = configure_auth(&mut context, resolved, &params.server) {
         error!(
-            ?requested,
-            ?resolved,
+            ?method,
             "SQLDriverConnectW: authentication method not implemented"
         );
-        // Name the keyword the application actually supplied. Where the
-        // platform maps it to another method, say so rather than reporting a
-        // method the connection string never mentioned.
-        let message = if requested == resolved {
-            format!("Authentication method {requested:?} is not yet supported")
-        } else {
-            format!(
-                "Authentication method {requested:?} resolves to {resolved:?} on this platform, \
-                 which is not yet supported"
-            )
-        };
-        post_sql_error(state, SQLSTATE_HYC00, 0, message);
+        post_sql_error(
+            state,
+            SQLSTATE_HYC00,
+            0,
+            format!("Authentication method {method:?} is not yet supported"),
+        );
         return SQL_ERROR;
     }
 

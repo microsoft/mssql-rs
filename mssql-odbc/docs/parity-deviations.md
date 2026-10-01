@@ -494,7 +494,7 @@ msodbcsql build is measured.
     This driver parses and validates the keyword - including the rule that it
     requires both `UID` and `PWD` - and then returns `HYC00` from
     `SQLDriverConnectW`, because `configure_auth` (`src/auth/entra.rs`) has no
-    arm for it and falls through to `UnsupportedAuth::plain`. The refusal
+    arm for it and returns `UnsupportedAuth`. The refusal
     happens before any network activity.
     Excluded by design rather than deferred: the ratified authentication design
     scopes the driver to "full msodbcsql parity except AD Password" (mssql-rs

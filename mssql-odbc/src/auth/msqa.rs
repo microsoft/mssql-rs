@@ -860,9 +860,14 @@ pub(super) fn cancel_ui(ui_thread_id: &UiThreadId) {
 
 /// Converts a connection-derived string into the narrow C string the MSQA ABI
 /// takes, rejecting embedded NULs rather than silently truncating.
+/// A NUL in an input is deterministic, so this is never reported as the
+/// retryable `ConnectionError` OneAuth's transient statuses use.
 fn to_c_string(value: &str, what: &str) -> TdsResult<CString> {
-    CString::new(value)
-        .map_err(|_| Error::ConnectionError(format!("{what} contains an embedded NUL character")))
+    CString::new(value).map_err(|_| {
+        Error::Security(SecurityError::InternalError(format!(
+            "{what} contains an embedded NUL character"
+        )))
+    })
 }
 
 #[cfg(test)]
@@ -932,6 +937,10 @@ mod tests {
     fn embedded_nul_is_rejected() {
         let err = to_c_string("contoso\0evil", "STS URL").unwrap_err();
         assert!(err.to_string().contains("STS URL"), "got: {err}");
+        assert!(
+            matches!(err, Error::Security(SecurityError::InternalError(_))),
+            "a deterministic input error must not be retried as transient: {err:?}"
+        );
     }
 
     #[test]

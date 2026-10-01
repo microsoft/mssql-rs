@@ -465,7 +465,7 @@ fn quoted_value_from(buf: &str, from: usize, key: &str) -> Option<(usize, usize)
             _ => continue,
         };
         let start = value + 1;
-        let end = find_from(buf, start, &quote.to_string())?;
+        let end = buf.get(start..)?.find(quote)? + start;
         return Some((start, end));
     }
     None

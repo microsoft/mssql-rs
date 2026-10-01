@@ -335,27 +335,10 @@ pub(super) fn encode_utf16le(s: &str) -> Vec<u8> {
     s.encode_utf16().flat_map(|u| u.to_le_bytes()).collect()
 }
 
-/// An authentication method the driver cannot honour.
-///
-/// `requested` is what the connection string asked for and `resolved` is what
-/// platform resolution turned it into. They differ only where a keyword maps to
-/// a different method on this platform, and both are reported so the diagnostic
-/// never names a keyword the user did not write.
+/// An authentication method the driver cannot honour, as the connection string
+/// named it.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) struct UnsupportedAuth {
-    pub(crate) requested: TdsAuthenticationMethod,
-    pub(crate) resolved: TdsAuthenticationMethod,
-}
-
-impl UnsupportedAuth {
-    /// The method was not resolved to anything else; it is simply unimplemented.
-    fn plain(method: TdsAuthenticationMethod) -> Self {
-        Self {
-            requested: method.clone(),
-            resolved: method,
-        }
-    }
-}
+pub(crate) struct UnsupportedAuth(pub(crate) TdsAuthenticationMethod);
 
 /// Applies the resolved authentication to `context`: sets credentials for
 /// SQL/SSPI, the pre-acquired token for `AccessToken`, or builds and registers
@@ -439,7 +422,7 @@ pub(crate) fn configure_auth(
             return Ok(());
         }
         TdsAuthenticationMethod::ActiveDirectoryIntegrated => register_integrated(context),
-        other => return Err(UnsupportedAuth::plain(other)),
+        other => return Err(UnsupportedAuth(other)),
     }
     context.tds_authentication_method = method;
     Ok(())
@@ -731,10 +714,9 @@ mod tests {
         );
         assert_eq!(
             configure(&mut ctx, r),
-            Err(UnsupportedAuth::plain(
+            Err(UnsupportedAuth(
                 TdsAuthenticationMethod::ActiveDirectoryDeviceCodeFlow
-            )),
-            "a method that resolves to itself reports itself"
+            ))
         );
     }
 
