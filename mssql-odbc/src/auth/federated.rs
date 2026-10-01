@@ -188,7 +188,7 @@ pub(super) async fn acquire_token(
         .ok_or_else(|| failure("the authentication endpoint URL has no path".to_string()))?;
 
     let principal = blocking(Arc::clone(&identity), |id| id.principal()).await?;
-    debug!(principal = %principal, "integrated: resolving the Entra user realm");
+    debug!("integrated: resolving the Entra user realm");
 
     let realm_url = format!(
         "{}common/UserRealm/{}?api-version=1.0",
@@ -635,9 +635,10 @@ async fn negotiate(
     request: &HttpRequest,
 ) -> TdsResult<HttpResponse> {
     let mut response = transport.send(request).await?;
-    if response.status != 401 || negotiate_challenge(&response).is_none() {
-        return Ok(response);
-    }
+    let initial = match negotiate_challenge(&response) {
+        Some(initial) if response.status == 401 => initial,
+        _ => return Ok(response),
+    };
 
     let host = url::Url::parse(&request.url)
         .ok()
@@ -645,7 +646,8 @@ async fn negotiate(
         .ok_or_else(|| failure(format!("invalid endpoint URL {}", request.url)))?;
     let mut context = blocking(Arc::clone(identity), move |id| id.negotiate_context(&host)).await?;
 
-    let mut challenge: Option<Vec<u8>> = None;
+    // curl seeds the context from a token on the first challenge too.
+    let mut challenge = initial;
     for _ in 0..MAX_NEGOTIATE_ROUNDS {
         let (returned, token) = run_blocking(move || {
             let token = context.generate_token(challenge.as_deref());
@@ -743,6 +745,7 @@ fn quote(body: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mssql_tds::security::SspiAuthToken;
     use mssql_tds::security::mock::MockSecurityContext;
     use std::sync::Mutex;
 
@@ -918,6 +921,7 @@ mod tests {
         principal: Result<String, String>,
         context: MockSecurityContext,
         hosts: Mutex<Vec<String>>,
+        challenges: Arc<Mutex<Vec<Option<Vec<u8>>>>>,
     }
 
     impl FakeIdentity {
@@ -930,7 +934,43 @@ mod tests {
                 principal: Ok(principal.to_string()),
                 context,
                 hosts: Mutex::new(Vec::new()),
+                challenges: Arc::default(),
             })
+        }
+
+        fn challenges(&self) -> Vec<Option<Vec<u8>>> {
+            self.challenges.lock().expect("lock").clone()
+        }
+    }
+
+    /// Records the server token passed to each `generate_token` round.
+    struct RecordingContext {
+        inner: MockSecurityContext,
+        challenges: Arc<Mutex<Vec<Option<Vec<u8>>>>>,
+    }
+
+    impl SecurityContext for RecordingContext {
+        fn package_name(&self) -> &str {
+            self.inner.package_name()
+        }
+
+        fn generate_token(
+            &mut self,
+            server_token: Option<&[u8]>,
+        ) -> Result<SspiAuthToken, SecurityError> {
+            self.challenges
+                .lock()
+                .expect("lock")
+                .push(server_token.map(<[u8]>::to_vec));
+            self.inner.generate_token(server_token)
+        }
+
+        fn is_complete(&self) -> bool {
+            self.inner.is_complete()
+        }
+
+        fn spn(&self) -> &str {
+            self.inner.spn()
         }
     }
 
@@ -946,7 +986,10 @@ mod tests {
 
         fn negotiate_context(&self, host: &str) -> TdsResult<Box<dyn SecurityContext>> {
             self.hosts.lock().expect("lock").push(host.to_string());
-            Ok(Box::new(self.context.clone()))
+            Ok(Box::new(RecordingContext {
+                inner: self.context.clone(),
+                challenges: Arc::clone(&self.challenges),
+            }))
         }
     }
 
@@ -1057,6 +1100,7 @@ mod tests {
             principal: Err("Error acquiring Kerberos credentials".to_string()),
             context: MockSecurityContext::single_round(vec![1]),
             hosts: Mutex::new(Vec::new()),
+            challenges: Arc::default(),
         });
         let error = message(run(&transport, identity, STS));
         assert!(
@@ -1176,6 +1220,25 @@ mod tests {
                 Some(format!("Negotiate {}", BASE64.encode([2]))),
             ]
         );
+    }
+
+    #[test]
+    fn a_token_on_the_first_negotiate_challenge_seeds_the_context() {
+        let server_token = vec![9, 8, 7];
+        let challenge_header = format!("Negotiate {}", BASE64.encode(&server_token));
+        let transport = ScriptedTransport::new(move |request, earlier| {
+            if request.url != WST13_URL {
+                return happy(request, earlier);
+            }
+            Ok(match earlier {
+                0 => challenge(&challenge_header),
+                _ => response(200, &saml_response(SAML2)),
+            })
+        });
+        let identity = FakeIdentity::new("alice@CONTOSO.COM");
+        let token = run(&transport, Arc::clone(&identity), STS).expect("token");
+        assert_eq!(token, "eyJ.access.token");
+        assert_eq!(identity.challenges(), [Some(server_token)]);
     }
 
     #[test]
