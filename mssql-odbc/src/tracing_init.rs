@@ -817,6 +817,19 @@ mod tests {
             "rollover must be retried at most once per max_file_size, not per event"
         );
 
+        // Reaching the limit again must produce a *second* attempt: a
+        // regression that gave up permanently after the first failure would
+        // otherwise pass everything above.
+        write(b"dddd"); // 4 + 4 = 8; the check runs before the write, so no attempt yet
+        assert_eq!(writer.state().bytes_written, 8);
+
+        write(b"e"); // crosses again: second attempt, fails, counter resets
+        assert_eq!(
+            writer.state().bytes_written,
+            1,
+            "rotation must be attempted again once the limit is reached a second time"
+        );
+
         // A failed create must not consume the suffix: nothing was written to
         // `.1.log`, so a later recovery has to reuse it rather than skip to
         // `.2.log` and leave a gap that reads as a deleted file.
@@ -828,7 +841,7 @@ mod tests {
 
         // Writing continued in the original file and nothing new was created.
         writer.close();
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "aaaaaaaabbcc");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "aaaaaaaabbccdddde");
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
         remove_dir_all(dir).unwrap();
     }
