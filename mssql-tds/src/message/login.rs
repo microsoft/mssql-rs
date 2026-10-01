@@ -1342,15 +1342,11 @@ fn utf16_code_units(value: &str) -> TdsResult<u16> {
     })
 }
 
+// Length in UTF-16 bytes, which is how LOGIN7 stores strings. Implemented for
+// `str` only: a `String` call resolves here through deref.
 impl SizedLoginItem for str {
     fn len_bytes(&self) -> usize {
         self.encode_utf16().count() * 2
-    }
-}
-
-impl SizedLoginItem for String {
-    fn len_bytes(&self) -> usize {
-        self.as_str().len_bytes()
     }
 }
 

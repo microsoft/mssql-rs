@@ -65,6 +65,16 @@ const SYNTHETIC_POSITIONAL_PARAM_PREFIX: &str = "ce_pos_";
 /// it, even if the socket is still readable.
 const FATAL_ERROR_SEVERITY: u8 = 20;
 
+/// Most ERROR tokens kept for one failed statement under
+/// [`BatchErrorMode::Continue`] before its DONE. The run is fed by the server,
+/// so past this the server is treated as misbehaving and the connection retired.
+const MAX_ERRORS_PER_FAILED_STATEMENT: usize = 10_000;
+
+/// Most tokens read after a statement error under [`BatchErrorMode::Continue`]
+/// before its DONE. Well above [`MAX_ERRORS_PER_FAILED_STATEMENT`], so a valid
+/// statement that also sends many messages is not rejected.
+const MAX_TOKENS_AFTER_STATEMENT_ERROR: u32 = 100_000;
+
 /// Budget for withdrawing a request, independent of the request's own timeout.
 ///
 /// `remaining_request_timeout` is `None` whenever `SQL_ATTR_QUERY_TIMEOUT` is 0,
@@ -5335,20 +5345,15 @@ impl TdsClient {
                         // parked token back before reading the wire, so the slot is
                         // empty here.
                         //
-                        // Two bounds, because the run is fed by the server: at most
-                        // 10_000 errors kept, and at most 100_000 tokens read in
-                        // all, so a run of INFO with no DONE cannot spin forever.
-                        // The token bound is far above the error bound so a valid
-                        // statement with many messages is not rejected.
+                        // Two bounds, because the run is fed by the server: errors
+                        // kept and tokens read in all, so a run of INFO with no DONE
+                        // cannot spin forever either.
                         let mut tokens_read = 0u32;
                         loop {
                             tokens_read += 1;
-                            if tokens_read > 100_000 {
+                            if tokens_read > MAX_TOKENS_AFTER_STATEMENT_ERROR {
                                 return Err(self.abandon_failed_statement(
-                                    crate::error::Error::ProtocolError(
-                                        "Too many tokens after a statement error without a DONE"
-                                            .to_string(),
-                                    ),
+                                    Self::too_many_tokens_after_statement_error(),
                                 ));
                             }
                             // A transport failure here deliberately wins over the
@@ -5362,12 +5367,9 @@ impl TdsClient {
                             };
                             match token {
                                 Tokens::Error(next_error) => {
-                                    if all_errors.len() >= 10_000 {
+                                    if all_errors.len() >= MAX_ERRORS_PER_FAILED_STATEMENT {
                                         return Err(self.abandon_failed_statement(
-                                            crate::error::Error::ProtocolError(
-                                                "Too many ERROR tokens for one statement without a DONE"
-                                                    .to_string(),
-                                            ),
+                                            Self::too_many_errors_for_one_statement(),
                                         ));
                                     }
                                     info!(?next_error);
@@ -7775,11 +7777,9 @@ impl TdsClient {
         // not counted.
         if !self.row_set_errors.is_empty() {
             self.row_set_error_tokens += 1;
-            if self.row_set_error_tokens > 100_000 {
+            if self.row_set_error_tokens > MAX_TOKENS_AFTER_STATEMENT_ERROR {
                 return Err(
-                    self.abandon_failed_statement(crate::error::Error::ProtocolError(
-                        "Too many tokens after a statement error without a DONE".to_string(),
-                    )),
+                    self.abandon_failed_statement(Self::too_many_tokens_after_statement_error())
                 );
             }
         }
@@ -7821,13 +7821,9 @@ impl TdsClient {
                 }
                 let error = self.record_error_token(&error_token);
                 if self.continues_after(&error_token) {
-                    if self.row_set_errors.len() >= 10_000 {
-                        return Err(self.abandon_failed_statement(
-                            crate::error::Error::ProtocolError(
-                                "Too many ERROR tokens for one statement without a DONE"
-                                    .to_string(),
-                            ),
-                        ));
+                    if self.row_set_errors.len() >= MAX_ERRORS_PER_FAILED_STATEMENT {
+                        return Err(self
+                            .abandon_failed_statement(Self::too_many_errors_for_one_statement()));
                     }
                     // A failed statement can send several ERROR tokens before the
                     // DONE that ends its row set. Collect them here and return
@@ -7839,7 +7835,7 @@ impl TdsClient {
                     self.statement_error_completion_pending = true;
                     return Ok(None);
                 }
-                let mut all_errors = std::mem::take(&mut self.row_set_errors);
+                let mut all_errors = self.take_row_set_errors();
                 all_errors.push(error);
                 let drain_result = self.drain_stream().await;
                 // Reset batch state before propagating: the error terminates the
@@ -7911,10 +7907,9 @@ impl TdsClient {
         // row set's count is not reported; its outcome is the `Err`.
         if !self.row_set_errors.is_empty() {
             self.last_result_row_count = None;
-            self.row_set_error_tokens = 0;
-            return Err(crate::error::Error::from_sql_errors(std::mem::take(
-                &mut self.row_set_errors,
-            )));
+            return Err(crate::error::Error::from_sql_errors(
+                self.take_row_set_errors(),
+            ));
         }
         Ok(Some(false))
     }
@@ -8003,8 +7998,7 @@ impl TdsClient {
         self.execution_context.set_has_open_batch(false);
         self.current_metadata = None;
         self.current_result_set_has_been_read_till_end = true;
-        self.row_set_errors.clear();
-        self.row_set_error_tokens = 0;
+        self.take_row_set_errors();
         self.statement_error_completion_pending = false;
         self.failed_statement_done_pending = false;
         self.retire_after_failed_drain(&error);
@@ -8030,9 +8024,28 @@ impl TdsClient {
         self.batch_error_mode = BatchErrorMode::Abort;
         self.statement_error_completion_pending = false;
         self.failed_statement_done_pending = false;
-        self.row_set_errors.clear();
-        self.row_set_error_tokens = 0;
+        self.take_row_set_errors();
         self.last_result_row_count = None;
+    }
+
+    /// Takes the errors collected inside a row set, resetting the token count
+    /// that bounds their run with them. Every take or clear of the list goes
+    /// through here, so the two cannot disagree.
+    fn take_row_set_errors(&mut self) -> Vec<SqlErrorInfo> {
+        self.row_set_error_tokens = 0;
+        std::mem::take(&mut self.row_set_errors)
+    }
+
+    fn too_many_errors_for_one_statement() -> crate::error::Error {
+        crate::error::Error::ProtocolError(
+            "Too many ERROR tokens for one statement without a DONE".to_string(),
+        )
+    }
+
+    fn too_many_tokens_after_statement_error() -> crate::error::Error {
+        crate::error::Error::ProtocolError(
+            "Too many tokens after a statement error without a DONE".to_string(),
+        )
     }
 
     /// The row count the server reported in the DONE token that closed the row
