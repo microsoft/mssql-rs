@@ -1129,22 +1129,15 @@ TEST_F(CharConversionLiveTest, UnpairedSurrogateIsSubstitutedLikeAnyUnmappableCh
     EXPECT_EQ("97/63/98/3", GetColumnChar(1))
         << "an unpaired surrogate must arrive as a single '?' with its neighbours intact";
     EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
-    ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_RESET_PARAMS), SQL_HANDLE_STMT, stmt_);
 
-    // A well-formed pair is one supplementary character, not two unmappables,
-    // so it substitutes per UTF-16 unit like any other astral value
-    // (AstralUnmappableCharacterSubstitutesPerUtf16Unit) rather than being
-    // conflated with the lone-surrogate case above.
-    ASSERT_SQL_OK(Prepare("SELECT CAST(DATALENGTH(?) AS VARCHAR(16))"), SQL_HANDLE_STMT, stmt_);
-    SQLWCHAR pair[] = {0xD83D, 0xDE00};  // U+1F600
-    SQLLEN pair_ind = static_cast<SQLLEN>(sizeof(pair));
-    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_WCHAR, SQL_VARCHAR, 8, 0,
-                                   pair, pair_ind, &pair_ind),
-                  SQL_HANDLE_STMT, stmt_);
-    EXPECT_EQ(SQL_SUCCESS, SQLExecute(stmt_));
-    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
-    EXPECT_EQ("2", GetColumnChar(1)) << "a surrogate pair substitutes per UTF-16 unit";
-    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+    // A well-formed pair is deliberately *not* checked here. It is one
+    // supplementary character rather than two unmappables, and its substitution
+    // width is a measured platform divergence - two bytes on Windows and the
+    // engine, one on glibc msodbcsql (parity-deviations entry 21). Asserting it
+    // in this test would fail the msodbcsql comparison leg on Linux, because
+    // this test runs unskipped on both legs by design. That case is owned by
+    // AstralUnmappableCharacterSubstitutesPerUtf16Unit, which carries
+    // SKIP_IF_COMPARING_MSODBCSQL() for exactly that reason.
 }
 
 // The narrow C type is the *pre-existing* route to the same encoder -
