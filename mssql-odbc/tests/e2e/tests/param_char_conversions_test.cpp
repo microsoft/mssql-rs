@@ -112,26 +112,31 @@ protected:
     // helper assert CP1252 bytes specifically - U+00E9 as 0xE9, U+20AC as 0x80 -
     // so it must admit only collations that actually resolve to CP1252.
     //
-    // Two families carry the `Latin1_General` substring but do not:
+    // `Latin1_General` alone does not establish that. A SQL collation names its
+    // code page in the name and carries the matching sort ID, which now wins
+    // over the LCID, so every `SQL_Latin1_General_CP<n>_*` family but `_CP1_`
+    // resolves somewhere other than CP1252: CP437 and CP850 put U+00E9 at 0x82,
+    // and CP1251 cannot encode it at all while placing U+20AC at 0x88. Those
+    // would fail the gated assertions rather than skip them, which is what this
+    // guard exists to prevent. `_UTF8` is excluded for the adjacent reason -
+    // under it nothing is unmappable, so a substitution test would fail too.
     //
-    // - `_UTF8` resolves to UTF-8 by the flag, where nothing is unmappable, so
-    //   a substitution test would fail rather than skip. (Before AB#48437 the
-    //   exclusion was needed for the opposite reason - the inline route
-    //   substituted under CP1252 while the streamed one passed UTF-8 through.)
-    // - `SQL_Latin1_General_CP437_*` and `..._CP850_*` carry a sort ID, which
-    //   now wins over the LCID, so U+00E9 would arrive as 0x82 and U+20AC would
-    //   substitute. This is exactly the behaviour this PR adds; before it the
-    //   inline path resolved through the LCID for every member of the family
-    //   and the broader guard was sufficient.
+    // Matching on the absence of a `_CP` segment (Windows `Latin1_General_*`,
+    // which resolves through LCID 0x0409) or on `_CP1_` exactly closes the whole
+    // family in one rule rather than enumerating names. Before this PR the
+    // inline path resolved through the LCID for every member, so the broader
+    // guard was sufficient; honouring the sort ID is what split the family.
     //
     // The parameter carries the *database* collation, which need not match the
     // instance's.
     bool DatabaseIsLatin1() {
         const std::string collation = DatabaseCollation();
-        return collation.find("Latin1_General") != std::string::npos &&
-               collation.find("_UTF8") == std::string::npos &&
-               collation.find("CP437") == std::string::npos &&
-               collation.find("CP850") == std::string::npos;
+        if (collation.find("Latin1_General") == std::string::npos ||
+            collation.find("_UTF8") != std::string::npos) {
+            return false;
+        }
+        const size_t cp = collation.find("_CP");
+        return cp == std::string::npos || collation.compare(cp, 5, "_CP1_") == 0;
     }
 
     // The database collation name, or an empty string if it could not be read.

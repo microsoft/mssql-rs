@@ -4461,6 +4461,11 @@ mod tests {
     // arm reached an LCID-only helper, so asserting the helper alone would have
     // passed both before and after the fix.
     //
+    // Reaching the arm is not the same as reaching the resolver. A UTF-8 source
+    // under a `_UTF8` collation returns at the arm's passthrough and never
+    // consults `try_resolve_collation`, so the `_UTF8` cases below assert from a
+    // UTF-16 source as well, which is what pins the resolver's UTF-8 branch.
+    //
     // Every case below holds LCID 0x0409 (US English -> Windows-1252) fixed and
     // varies only the UTF-8 flag or the sort ID, so a byte that differs from the
     // Windows-1252 control is attributable to the resolver and nothing else.
@@ -4471,11 +4476,23 @@ mod tests {
     /// The length prefix is asserted with it: the encoded form is two bytes for
     /// one character, so a prefix of 1 would frame the value short and desync
     /// the parameter stream rather than merely mis-encoding it.
+    ///
+    /// Asserted from both sources. A UTF-8 source takes the arm's passthrough,
+    /// which forwards the bytes without consulting the resolver, so it alone
+    /// would pass even with the resolver's UTF-8 branch removed; the UTF-16 one
+    /// is decoded and re-encoded, so it is what pins the branch.
     #[test]
     fn a_utf8_collation_encodes_utf8_rather_than_the_lcid_codepage() {
         let (payload, had_loss) = serialize_varchar("\u{e9}", Some(utf8_collation()));
         assert_eq!(payload, b"\x02\x00\xc3\xa9");
         assert!(!had_loss, "UTF-8 represents every character");
+
+        let (payload, had_loss) = serialize_varchar_utf16(&utf16le("\u{e9}"), utf8_collation());
+        assert_eq!(
+            payload, b"\x02\x00\xc3\xa9",
+            "the resolver must honour the UTF-8 flag"
+        );
+        assert!(!had_loss);
     }
 
     /// A SQL sort ID wins over the LCID. CP437 and CP850 both put U+00E9 at
@@ -4600,6 +4617,9 @@ mod tests {
     /// A UTF-8 collation must not be mistaken for "no re-encoding needed" in
     /// general: a character outside ASCII still expands, and the length prefix
     /// has to count the encoded bytes.
+    ///
+    /// The UTF-16 source is what reaches the resolver; see
+    /// [`Self::a_utf8_collation_encodes_utf8_rather_than_the_lcid_codepage`].
     #[test]
     fn a_utf8_collation_frames_multibyte_output_by_byte_count() {
         // U+65E5 is three UTF-8 bytes and is unmappable in every single-byte
@@ -4607,6 +4627,13 @@ mod tests {
         // Windows-1252 control would make.
         let (payload, had_loss) = serialize_varchar("\u{65e5}", Some(utf8_collation()));
         assert_eq!(payload, b"\x03\x00\xe6\x97\xa5");
+        assert!(!had_loss);
+
+        let (payload, had_loss) = serialize_varchar_utf16(&utf16le("\u{65e5}"), utf8_collation());
+        assert_eq!(
+            payload, b"\x03\x00\xe6\x97\xa5",
+            "the resolver must frame the re-encoded form by byte count"
+        );
         assert!(!had_loss);
 
         let (payload, had_loss) = serialize_varchar("\u{65e5}", Some(windows_1252_collation()));
@@ -4718,6 +4745,12 @@ mod tests {
             .iter()
             .flat_map(|u| u.to_le_bytes())
             .collect()
+    }
+
+    /// `text` as raw UTF-16LE, for driving a value through the decode and
+    /// re-encode rather than the arm's UTF-8 passthrough.
+    fn utf16le(text: &str) -> Vec<u8> {
+        text.encode_utf16().flat_map(u16::to_le_bytes).collect()
     }
 
     /// A lone surrogate is repaired to U+FFFD, which a single-byte collation
