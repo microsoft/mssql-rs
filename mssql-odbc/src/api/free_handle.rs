@@ -561,6 +561,69 @@ mod tests {
         let state = dbc.inner.lock().unwrap();
         assert_eq!(state.active_stmt, None);
         assert!(state.client.is_some());
+        drop(state);
+
+        // The timeout left the client after an ATTENTION; the connection must
+        // still serve the next statement.
+        let next = h.alloc_extra_stmt();
+        let sql: Vec<u16> = "SELECT 1".encode_utf16().collect();
+        assert_eq!(
+            unsafe {
+                crate::api::SQLExecDirectW(next, sql.as_ptr(), sql.len().try_into().unwrap())
+            },
+            SQL_SUCCESS,
+            "the connection must survive a timed-out statement-free unprepare"
+        );
+    }
+
+    #[test]
+    fn free_stmt_releases_every_handle_within_budget() {
+        use crate::test_support::TestHandles;
+        use mssql_mock_tds::QueryResponse;
+        use mssql_tds::connection::tds_client::PreparedStatement;
+
+        let mut h = TestHandles::with_env_dbc();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let _mock_server =
+            crate::test_support::connect_mock_server(dbc, "SELECT 1", QueryResponse::select_one());
+
+        let stmt_handle = h.alloc_extra_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(stmt_handle) };
+        let sql: Vec<u16> = "SELECT 1".encode_utf16().collect();
+        assert_eq!(
+            unsafe {
+                crate::api::SQLPrepareW(stmt_handle, sql.as_ptr(), sql.len().try_into().unwrap())
+            },
+            SQL_SUCCESS
+        );
+        let live = dbc
+            .inner
+            .lock()
+            .unwrap()
+            .client
+            .as_mut()
+            .unwrap()
+            .register_prepared_handle_for_test(2);
+        crate::test_support::arm_pending_unprepare(dbc, stmt);
+        let orphan = {
+            let mut state = stmt.inner.lock().unwrap();
+            let plan = state.prepared.as_mut().unwrap();
+            plan.stmt = PreparedStatement::materialized_for_test("SELECT 1", live);
+            state.query_timeout = 5;
+            state.pending_unprepare.unwrap()
+        };
+
+        assert_eq!(h.free_extra_stmt(stmt_handle), SQL_SUCCESS);
+
+        let state = dbc.inner.lock().unwrap();
+        let client = state.client.as_ref().unwrap();
+        for id in [live, orphan] {
+            assert_eq!(
+                client.prepared_handle_for_test(id),
+                None,
+                "{id:?} must be released when the budget allows both releases"
+            );
+        }
     }
 
     #[test]

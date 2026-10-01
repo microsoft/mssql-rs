@@ -617,7 +617,8 @@ fn run_catalog(
         // retail behavior has not been measured. Sharing the budget keeps the
         // attribute's documented meaning — the caller's deadline for the
         // call they made — rather than letting an internal fallback double it.
-        // Decision recorded in mssql-rs#547.
+        // Decision recorded in mssql-rs#547; registry entry 20 in
+        // `docs/parity-deviations.md` (reference behavior is source-only).
         //
         // The gate above, by contrast, MATCHES msodbcsql: only a server error
         // retries, never a timeout or transport failure, mirroring its
