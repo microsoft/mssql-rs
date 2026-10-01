@@ -310,12 +310,38 @@ fn every_narrow_form_agrees_with_the_streamed_encoder() {
 /// directly (`resolve_narrow_wire_bytes`), so it was already correct and the
 /// resolver change must not have rerouted it. Pinned because the two paths now
 /// share a helper and could be merged by mistake.
+///
+/// The discriminating probe is the *unmapped* collation. Since AB#48437 the two
+/// helpers resolve identically for every collation they both map, so a mapped
+/// probe cannot tell them apart — the only observable difference left is the
+/// fallback: `encode_narrow` defaults to Windows-1252, where U+0080 is
+/// unmappable and substitutes to `3F`, while the serializer arm's Latin-1
+/// mapping passes it through as `80`. Verified by mutation: rewriting
+/// `resolve_narrow_wire_bytes` to call `encode_narrow_for_wire` leaves the
+/// CP437 assertion below green and fails only the unmapped one.
 #[test]
 fn the_sql_variant_narrow_path_still_encodes_through_the_shared_encoder() {
     const SQL_VARIANT: u8 = 0x62;
-    let bytes = payload("\u{e9}", sort_id(32), SQL_VARIANT, 8009, false, false);
 
-    // The encoded character is the last byte, whatever the header width.
+    // A collation naming no encoding this crate maps, so the two helpers'
+    // fallbacks diverge and the byte identifies which one ran.
+    let unmapped = SqlCollation {
+        info: 0x000F_FFFF,
+        lcid_language_id: 0,
+        col_flags: 0,
+        sort_id: 0,
+    };
+    let bytes = payload("\u{80}", unmapped, SQL_VARIANT, 8009, false, false);
+    assert_eq!(
+        bytes.last().copied(),
+        Some(0x3F),
+        "sql_variant must keep encode_narrow's Windows-1252 fallback, not the \
+         serializer arm's Latin-1 one: {bytes:02X?}"
+    );
+
+    // The sort ID is still honoured on a mapped collation. Not discriminating
+    // between the two helpers, but a real check of the variant path's resolver.
+    let bytes = payload("\u{e9}", sort_id(32), SQL_VARIANT, 8009, false, false);
     assert_eq!(
         bytes.last().copied(),
         Some(0x82),
