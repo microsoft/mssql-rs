@@ -554,7 +554,7 @@ msodbcsql build is measured.
     establishes this driver's behavior; the reference behavior is source-only,
     not a measured retail claim. A comparison that records `SQL_DRIVER_VER`
     and the tested msodbcsql build would close that evidence gap. Decision
-    recorded in #547.
+    recorded in #547. Human parity sign-off has not been recorded.
 21. **An oversized `sql_variant` payload with a non-zero overflow is refused by
     the driver, not the server.** `sql_variant` cannot hold a `max` type
     (server error 529), so a payload past the 8000-byte ceiling has to be
