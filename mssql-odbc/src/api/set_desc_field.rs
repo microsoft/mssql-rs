@@ -1213,8 +1213,8 @@ mod tests {
         assert!(!record.data_bound);
     }
 
-    fn set_fetch_in_progress(h: &TestHandles, on: bool) {
-        let stmt = unsafe { handle_from_raw::<crate::handles::StmtHandle>(h.stmt) };
+    fn set_fetch_in_progress(stmt: SqlHandle, on: bool) {
+        let stmt = unsafe { handle_from_raw::<crate::handles::StmtHandle>(stmt) };
         let mut s = stmt.inner.lock().unwrap();
         if on {
             s.set_state(STMT_STATE_FETCH_IN_PROGRESS);
@@ -1238,7 +1238,7 @@ mod tests {
     #[test]
     fn writes_to_the_implicit_ard_are_refused_while_a_fetch_is_in_progress() {
         let h = TestHandles::with_env_dbc_stmt();
-        set_fetch_in_progress(&h, true);
+        set_fetch_in_progress(h.stmt, true);
         assert_eq!(set_long_type(h.ard()), SQL_ERROR);
         assert_last_diag(&desc_diags(h.ard()), ERR_FUNCTION_SEQUENCE);
         assert_eq!(
@@ -1261,7 +1261,7 @@ mod tests {
         assert_last_diag(&desc_diags(h.ard()), ERR_FUNCTION_SEQUENCE);
         assert_eq!(set_long_type(h.apd()), SQL_SUCCESS);
 
-        set_fetch_in_progress(&h, false);
+        set_fetch_in_progress(h.stmt, false);
         assert_eq!(set_long_type(h.ard()), SQL_SUCCESS);
         assert!(desc_diags(h.ard()).is_empty());
     }
@@ -1274,11 +1274,30 @@ mod tests {
             unsafe { sql_set_stmt_attr_w(h.stmt, SQL_ATTR_APP_ROW_DESC, desc as SqlPointer, 0) },
             SQL_SUCCESS
         );
-        set_fetch_in_progress(&h, true);
+        set_fetch_in_progress(h.stmt, true);
         assert_eq!(set_long_type(desc), SQL_ERROR);
         assert_last_diag(&desc_diags(desc), ERR_FUNCTION_SEQUENCE);
         // The implicit ARD is no longer the one the fetch reads through.
         assert_eq!(set_long_type(h.ard()), SQL_SUCCESS);
+    }
+
+    #[test]
+    fn writes_to_a_shared_explicit_ard_are_refused_while_a_sibling_statement_fetches() {
+        let mut h = TestHandles::with_env_dbc_stmt();
+        let desc = h.alloc_explicit_desc();
+        let sibling = h.alloc_extra_stmt();
+        for stmt in [h.stmt, sibling] {
+            assert_eq!(
+                unsafe { sql_set_stmt_attr_w(stmt, SQL_ATTR_APP_ROW_DESC, desc as SqlPointer, 0) },
+                SQL_SUCCESS
+            );
+        }
+        set_fetch_in_progress(sibling, true);
+        assert_eq!(set_long_type(desc), SQL_ERROR);
+        assert_last_diag(&desc_diags(desc), ERR_FUNCTION_SEQUENCE);
+        set_fetch_in_progress(sibling, false);
+        assert_eq!(set_long_type(desc), SQL_SUCCESS);
+        assert_eq!(h.free_extra_stmt(sibling), SQL_SUCCESS);
     }
 
     #[test]
@@ -1289,7 +1308,7 @@ mod tests {
             unsafe { sql_set_stmt_attr_w(h.stmt, SQL_ATTR_APP_PARAM_DESC, desc as SqlPointer, 0) },
             SQL_SUCCESS
         );
-        set_fetch_in_progress(&h, true);
+        set_fetch_in_progress(h.stmt, true);
         assert_eq!(set_long_type(desc), SQL_SUCCESS);
     }
 
