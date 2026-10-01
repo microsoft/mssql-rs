@@ -761,8 +761,27 @@ msodbcsql build is measured.
     the reference leg — the knob exists there, but the e2e harness cannot set
     it — not because msodbcsql lacks rotation.
 
-    Evidence level: source reading only, and the msodbcsql citations above came
-    from PR review rather than a measurement taken here. No retail build was
-    instrumented to compare rollover boundaries or file naming. A measurement
-    that sets `BIDTraceFileSize` on a pinned msodbcsql build and compares the
-    resulting file set would close this gap. Tracked in AB#48091.
+    **Evidence level: source reading only — this entry does not yet meet
+    §2.1's bar and must not be treated as settled.** Everything asserted about
+    *this* driver is verified by the unit and e2e tests listed with AB#48091.
+    The msodbcsql half is not: the citations came from PR review rather than a
+    reading taken here, and no retail build was instrumented, so the rollover
+    boundary, the first-file numbering and the `"w"` truncation remain
+    unverified against retail.
+
+    §2.1 admits a source citation alone only where the Driver Manager prevents
+    measurement through a normal application path. That exception does **not**
+    apply here: the limitation is that the e2e harness does not configure
+    `BIDTraceFileSize`, not that the behaviour is unobservable. The pinned
+    build (18.6.2.1, per `msodbcsqlVersion` in
+    `.pipeline/validation-pipeline.yml`) is installable and the knob is
+    operator-settable, so the measurement is possible.
+
+    Closing measurement: on msodbcsql 18.6.2.1, enable BID file tracing with a
+    known `BIDTraceFileSize`, drive enough trace volume to cross it, and record
+    `SQL_DRIVER_VER` alongside (a) the byte offset at which the file rolls, (b)
+    whether the first file carries the `1` suffix, and (c) whether restarting
+    the process truncates the previous file. Until that is recorded, treat the
+    four differences above as a design decision justified on its own terms —
+    an unbounded single trace file is the failure AB#48091 removes — rather
+    than as a measured divergence. Tracked in AB#48091.
