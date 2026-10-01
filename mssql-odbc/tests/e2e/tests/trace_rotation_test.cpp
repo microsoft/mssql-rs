@@ -26,8 +26,11 @@
 //
 // Env:
 //   MSSQL_ODBC_DLL   Path to the driver under test. Set by run_e2e.ps1 for the
-//                    mssql-odbc leg only; the reference driver has no
-//                    equivalent knobs, so it skips (parity-neutral).
+//                    mssql-odbc leg only, so this skips on the reference leg
+//                    (parity-neutral). msodbcsql does rotate — BIDTraceFileSize
+//                    in odbcinst.ini — but it is configured through the ini
+//                    file rather than the environment, so this harness cannot
+//                    drive it. See docs/parity-deviations.md.
 
 #include <gtest/gtest.h>
 
