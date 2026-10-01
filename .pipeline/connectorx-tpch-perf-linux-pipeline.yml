@@ -1,0 +1,76 @@
+# ConnectorX TPC-H A/B performance pipeline (dedicated perf lab, Linux)
+#
+# Measures what the Tiberius -> mssql-tds migration in sfu-db/connector-x means
+# for ConnectorX users: loads TPC-H lineitem into the lab's colocated SQL Server
+# and times `cx.read_sql(..., "SELECT * FROM lineitem")` across three arms:
+#   before        connectorx==beforeVersion (last Tiberius-only release)
+#   now-tiberius  connectorx==afterVersion with cx.mssql_driver = "tiberius"
+#   now           connectorx==afterVersion default driver (mssql-tds)
+# See mssql-tds-bench/connectorx-tpch/README.md.
+#
+# Manual trigger only. The summary is rendered on the run's Summary tab and the
+# raw samples are in the perf-results artifact.
+
+trigger: none
+pr: none
+
+parameters:
+  - name: scaleFactor
+    displayName: TPC-H scale factor
+    type: string
+    default: '10'
+  - name: rounds
+    displayName: Measured rounds per arm and scenario
+    type: string
+    default: '5'
+  - name: partitions
+    displayName: ConnectorX partition_num values (comma-separated)
+    type: string
+    default: '1,4'
+  - name: encryptModes
+    displayName: encrypt= values (comma-separated)
+    type: string
+    default: 'false,true'
+  - name: returnTypes
+    displayName: return_type values (arrow, pandas)
+    type: string
+    default: 'arrow'
+  - name: beforeVersion
+    displayName: connectorx version for the "before" arm (Tiberius)
+    type: string
+    default: '0.4.6'
+  - name: afterVersion
+    displayName: connectorx version for the "now" arms (mssql-tds default)
+    type: string
+    default: '0.4.7a1'
+
+resources:
+  repositories:
+    - repository: PerfTemplates
+      type: git
+      name: InternalDriverTools/PerfTest
+      ref: refs/heads/main
+
+extends:
+  template: v1/Perf.Test.Job.yml@PerfTemplates
+  parameters:
+    platform: linux
+    testRootDir: $(Build.SourcesDirectory)/mssql-rs/mssql-tds-bench/connectorx-tpch
+    testScript: run-benchmarks.sh
+    testScriptArgs: >-
+      SF=${{ parameters.scaleFactor }}
+      ROUNDS=${{ parameters.rounds }}
+      PARTITIONS=${{ parameters.partitions }}
+      ENCRYPT_MODES=${{ parameters.encryptModes }}
+      RETURN_TYPES=${{ parameters.returnTypes }}
+      CX_BEFORE=${{ parameters.beforeVersion }}
+      CX_AFTER=${{ parameters.afterVersion }}
+    testResultsSubDir: results
+    testTimeoutMinutes: 240
+    steps:
+      - bash: |
+          set -euo pipefail
+          summary="$(Build.ArtifactStagingDirectory)/results/summary.md"
+          if [ -f "$summary" ]; then cat "$summary"; else echo "summary.md not found"; fi
+        displayName: 'Show ConnectorX A/B summary'
+        condition: always()
