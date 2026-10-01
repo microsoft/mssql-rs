@@ -107,6 +107,37 @@ protected:
         return std::string(reinterpret_cast<const char*>(buf));
     }
 
+    // The engine's own `varchar` bytes for U+00E9 under the database collation,
+    // as hex - or an empty string when that collation cannot hold the character
+    // *exactly*.
+    //
+    // The round trip is what establishes "exactly", and checking the byte
+    // against `3F` cannot: a code page without U+00E9 may best-fit it to ASCII
+    // `e` rather than substitute - CP1251 does - which passes a `!= "3F"` gate
+    // while being an unfaithful encoding. This driver deliberately does not
+    // best-fit (parity-deviations entry 21), so it answers `3F` where the
+    // engine answered `65`, and a probe gated only on `3F` would fail on that
+    // documented deviation rather than on the resolver it exists to test.
+    //
+    // The comparison is made on `varbinary`, not on the characters: an
+    // accent-insensitive collation considers `e` and `é` equal, so a character
+    // comparison would accept the very best-fit this guard exists to reject.
+    std::string EngineNarrowBytesForEAcute() {
+        const std::string sql =
+            "SELECT CASE WHEN CAST(CAST(CAST(NCHAR(233) AS VARCHAR(16)) AS NVARCHAR(16))"
+            "                 AS VARBINARY(16)) = CAST(NCHAR(233) AS VARBINARY(16))"
+            "            THEN CONVERT(VARCHAR(64),"
+            "                 CAST(CAST(NCHAR(233) AS VARCHAR(16)) AS VARBINARY(16)), 2)"
+            "            ELSE '' END";
+        if (!SQL_SUCCEEDED(Prepare(sql)) || !SQL_SUCCEEDED(SQLExecute(stmt_)) ||
+            !SQL_SUCCEEDED(SQLFetch(stmt_))) {
+            return std::string();
+        }
+        const std::string hex = GetColumnChar(1);
+        SQLCloseCursor(stmt_);
+        return hex;
+    }
+
     // serialize_string resolves the code page from the collation's UTF-8 flag,
     // then its SQL sort ID, then its LCID (AB#48437). The cases gated on this
     // helper assert CP1252 bytes specifically - U+00E9 as 0xE9, U+20AC as 0x80 -
@@ -235,23 +266,11 @@ protected:
 // mssql-tds/tests/test_narrow_param_encoding.rs.
 TEST_F(CharConversionLiveTest, NarrowParamEncodesForTheDatabaseCollation) {
     // What the engine itself stores for U+00E9 in a varchar under the database
-    // collation, as hex.
-    ASSERT_SQL_OK(
-        Prepare("SELECT CONVERT(VARCHAR(64),"
-                " CAST(CAST(NCHAR(233) AS VARCHAR(16)) AS VARBINARY(16)), 2)"),
-        SQL_HANDLE_STMT, stmt_);
-    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
-    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
-    const std::string expected = GetColumnChar(1);
-    ASSERT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
-    ASSERT_FALSE(expected.empty());
-    // Guard the premise: if the engine substituted, the comparison below would
-    // be asserting that two substitutions agree rather than that the encoding
-    // is right. A collation whose code page cannot hold U+00E9 is out of this
-    // test's scope rather than a failure, so skip as DatabaseIsLatin1() does.
-    if (expected == "3F") {
-        GTEST_SKIP() << "U+00E9 is unmappable under collation " << DatabaseCollation()
-                     << "; this probe needs a code page that holds it";
+    // collation, as hex, or empty when that collation cannot hold it exactly.
+    const std::string expected = EngineNarrowBytesForEAcute();
+    if (expected.empty()) {
+        GTEST_SKIP() << "collation " << DatabaseCollation()
+                     << " cannot hold U+00E9 exactly; this probe needs one that round-trips";
     }
 
     // What the driver puts on the wire for the same character bound narrow.
@@ -285,18 +304,10 @@ TEST_F(CharConversionLiveTest, NarrowParamEncodesForTheDatabaseCollation) {
 TEST_F(CharConversionLiveTest, NarrowCTypeParamEncodesForTheDatabaseCollation) {
     SKIP_IF_COMPARING_MSODBCSQL();  // SQL_C_CHAR is UTF-8 here, the client code page there.
 
-    ASSERT_SQL_OK(
-        Prepare("SELECT CONVERT(VARCHAR(64),"
-                " CAST(CAST(NCHAR(233) AS VARCHAR(16)) AS VARBINARY(16)), 2)"),
-        SQL_HANDLE_STMT, stmt_);
-    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
-    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
-    const std::string expected = GetColumnChar(1);
-    ASSERT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
-    ASSERT_FALSE(expected.empty());
-    if (expected == "3F") {
-        GTEST_SKIP() << "U+00E9 is unmappable under collation " << DatabaseCollation()
-                     << "; this probe needs a code page that holds it";
+    const std::string expected = EngineNarrowBytesForEAcute();
+    if (expected.empty()) {
+        GTEST_SKIP() << "collation " << DatabaseCollation()
+                     << " cannot hold U+00E9 exactly; this probe needs one that round-trips";
     }
 
     ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(64), CAST(? AS VARBINARY(16)), 2)"),
