@@ -347,17 +347,28 @@ fn init_file_tracing(dir: OsString) -> Result<(), String> {
     Ok(())
 }
 
+/// Validates an operator-supplied bound, falling back to `default` for
+/// anything unparseable or outside `min..=max`.
+///
+/// Split out of [`bounded_env_u64`] so the validation can be tested without
+/// mutating the process environment: `set_var` is unsound while any other
+/// thread may touch the environment, and the test harness runs tests
+/// concurrently with others in this crate that read environment variables.
+fn bounded_value(name: &str, value: &str, default: u64, min: u64, max: u64) -> u64 {
+    match value.parse::<u64>() {
+        Ok(parsed) if (min..=max).contains(&parsed) => parsed,
+        _ => {
+            report(format_args!(
+                "[mssql-odbc] ERROR: Invalid {name} value '{value}'; expected an integer from {min} through {max}. Falling back to {default}."
+            ));
+            default
+        }
+    }
+}
+
 fn bounded_env_u64(name: &str, default: u64, min: u64, max: u64) -> u64 {
     match std::env::var(name) {
-        Ok(value) => match value.parse::<u64>() {
-            Ok(parsed) if (min..=max).contains(&parsed) => parsed,
-            _ => {
-                report(format_args!(
-                    "[mssql-odbc] ERROR: Invalid {name} value '{value}'; expected an integer from {min} through {max}. Falling back to {default}."
-                ));
-                default
-            }
-        },
+        Ok(value) => bounded_value(name, &value, default, min, max),
         Err(std::env::VarError::NotPresent) => default,
         Err(error) => {
             report(format_args!(
@@ -849,28 +860,24 @@ mod tests {
 
     /// `MSSQL_TDS_TRACE_MAX_FILE_SIZE_MB` is operator-supplied, so every
     /// rejected shape must fall back to the default rather than propagate.
+    ///
+    /// Exercises [`bounded_value`] rather than [`bounded_env_u64`]: setting an
+    /// environment variable is unsound while sibling tests may be reading one
+    /// concurrently, so the validation is tested where it is pure.
     #[test]
-    fn bounded_env_u64_rejects_out_of_range_and_malformed_values() {
-        // A name unique to this test: the value is process-global, and the
-        // crate's other tests never read it.
-        const NAME: &str = "MSSQL_ODBC_TEST_BOUNDED_ENV_U64";
+    fn bounded_value_rejects_out_of_range_and_malformed_values() {
+        const NAME: &str = "MSSQL_TDS_TRACE_MAX_FILE_SIZE_MB";
         const DEFAULT: u64 = 100;
 
-        let bounded = || bounded_env_u64(NAME, DEFAULT, 1, 1024);
+        let bounded = |value: &str| bounded_value(NAME, value, DEFAULT, 1, 1024);
 
         for rejected in ["0", "1025", "abc", "", "-1", "12.5", "99999999999999999999"] {
-            // SAFETY: single-threaded test, and no other test reads this name.
-            unsafe { std::env::set_var(NAME, rejected) };
-            assert_eq!(bounded(), DEFAULT, "{rejected:?} should fall back");
+            assert_eq!(bounded(rejected), DEFAULT, "{rejected:?} should fall back");
         }
 
         for (accepted, expected) in [("1", 1), ("512", 512), ("1024", 1024)] {
-            unsafe { std::env::set_var(NAME, accepted) };
-            assert_eq!(bounded(), expected, "{accepted:?} is in range");
+            assert_eq!(bounded(accepted), expected, "{accepted:?} is in range");
         }
-
-        unsafe { std::env::remove_var(NAME) };
-        assert_eq!(bounded(), DEFAULT, "unset should use the default");
     }
 
     #[test]
