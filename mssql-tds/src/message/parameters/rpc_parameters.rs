@@ -6,6 +6,7 @@ use bitflags::bitflags;
 use crate::datatypes::column_values::DEFAULT_VARTIME_SCALE;
 use crate::datatypes::encoder::SqlValueEncoder;
 use crate::datatypes::sql_tvp::TvpTypeName;
+use crate::datatypes::sql_udt::UdtTypeName;
 use crate::datatypes::sqldatatypes::VectorBaseType;
 use crate::datatypes::sqltypes::SqlType;
 use crate::{
@@ -109,8 +110,10 @@ pub(crate) struct EncryptedRpcValue {
 /// independently - see [`RpcParameter::with_streamed_declaration`] - so a
 /// `varchar(10)` parameter still streams its body as `varchar(max)`.
 ///
-/// TODO: extend to the remaining PLP types (`xml`, `json`, `udt`, `text`, `ntext`,
-/// `image`) for parity with the incremental read path.
+/// TODO: `xml` and `udt` have no variant here and are buffered by the ODBC
+/// layer instead of streamed - correct on the wire, but it holds the whole
+/// value in memory (AB#48349). `text` / `ntext` / `image` need no variant:
+/// they are already mapped onto the `max` types above.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamedSqlType {
     /// Unicode MAX text.
@@ -372,6 +375,13 @@ impl RpcParameter {
             return Ok(Self::format_tvp_sql_name(type_name));
         }
 
+        // A UDT is declared by its own server-side type name, for the same
+        // reason: `udt` is a TDS wire type, not something `sp_executesql` can
+        // resolve.
+        if let SqlType::Udt(type_name, _) = value {
+            return Ok(Self::format_udt_sql_name(type_name));
+        }
+
         // For nullable types, we need to check the actual datatype to derive the name.
         let tds_type = TdsDataType::from(value);
         let type_name = tds_type.get_meta_type_name()?;
@@ -476,6 +486,95 @@ impl RpcParameter {
         format!("[{schema}].[{}] READONLY", type_name.type_name)
     }
 
+    /// Formats a UDT's declaration name for `sp_executesql`, e.g.
+    /// `[dbo].[Point]`.
+    ///
+    /// Only the parts the application supplied are emitted, so an unqualified
+    /// name stays unqualified and resolves against the current database and
+    /// default schema. msodbcsql builds the same one-, two-, or three-part
+    /// quoted name here (`sqlccmd.cpp:7485-7505`); unlike a TVP there is no
+    /// `READONLY` suffix and the catalog part is legal.
+    ///
+    /// A catalog with no schema keeps the slot empty (`[db]..[Point]`) rather
+    /// than naming a schema: T-SQL reads the empty slot as the caller's default
+    /// schema, which is what an omitted part means. Substituting `dbo` would
+    /// silently pick a different type for a caller whose default is not `dbo`.
+    /// msodbcsql lands on the same text - it quotes the absent schema to the
+    /// empty string and prints all three parts (`clntcomn.h:281`).
+    fn format_udt_sql_name(type_name: &UdtTypeName) -> String {
+        let quoted = |part: &str| format!("[{}]", part.replace(']', "]]"));
+        // `write_b_varchar` gives an empty part and an absent one the same
+        // zero-length encoding, so the declaration has to read them the same
+        // way too - otherwise `Some(String::new())` declares `[]` against a
+        // header that named nothing, and the execute fails.
+        match (
+            type_name.db_name.as_deref().filter(|s| !s.is_empty()),
+            type_name.schema_name.as_deref().filter(|s| !s.is_empty()),
+        ) {
+            (Some(db), schema) => format!(
+                "{}.{}.{}",
+                quoted(db),
+                schema.map(quoted).unwrap_or_default(),
+                quoted(&type_name.type_name)
+            ),
+            (None, Some(schema)) => {
+                format!("{}.{}", quoted(schema), quoted(&type_name.type_name))
+            }
+            (None, None) => quoted(&type_name.type_name),
+        }
+    }
+
+    /// The B_VARCHAR count for a parameter name is a single byte, so the name
+    /// is bounded. Shared by [`Self::validate_named_before_send`] and the
+    /// write path in `serialize`, so the two cannot drift.
+    ///
+    /// NOTE: the bound is measured in `len()` (UTF-8 bytes) while the payload
+    /// is written as UTF-16 by `write_string_unicode_async`. The two agree for
+    /// the ASCII names this driver generates (`@P1`, ...), but not in general.
+    /// Pre-existing behaviour, preserved here rather than changed silently.
+    fn validate_name_length(name: &str) -> TdsResult<()> {
+        if name.len() > 0xFF {
+            return Err(Error::UsageError(
+                "Parameter name is too long. Maximum length is 255 characters.".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Validates whatever must be correct before *any* byte of this parameter
+    /// reaches the wire.
+    ///
+    /// Delegates to [`SqlType::validate_for_send`], which owns the per-type
+    /// rules. Those checks also run inside `write_type_info`, but by then
+    /// `serialize` has already written this parameter's name and status flags,
+    /// and `PacketWriter` sends on overflow - so in a multi-parameter RPC an
+    /// earlier parameter may have flushed whole packets. Checking here, before
+    /// the RPC writes anything, is what keeps invalid local input a local
+    /// failure rather than a half-sent request needing cancel-and-drain.
+    ///
+    /// The name is checked separately by [`Self::validate_named_before_send`],
+    /// since only the named path writes it.
+    pub(crate) fn validate_before_send(&self) -> TdsResult<()> {
+        match &self.value {
+            RpcValue::Materialized(value) => value.validate_for_send(),
+            RpcValue::Streamed(_) => Ok(()),
+        }
+    }
+
+    /// [`Self::validate_before_send`] plus the parameter-name bound, for a
+    /// parameter the RPC will serialize through its *named* path.
+    ///
+    /// Kept apart because `serialize` only writes - and only length-checks -
+    /// the name when it is not positional, so validating it unconditionally
+    /// would reject a positional parameter whose unused name happens to be
+    /// overlong.
+    pub(crate) fn validate_named_before_send(&self) -> TdsResult<()> {
+        if let Some(name) = &self.name {
+            Self::validate_name_length(name)?;
+        }
+        self.validate_before_send()
+    }
+
     /// Serializes the RPC parameter into the provided `PacketWriter`.
     /// The `encoder` is used to encode the parameter value based on its data type.
     /// The `db_collation` is used for string types to determine the collation.
@@ -505,12 +604,7 @@ impl RpcParameter {
         } else {
             match self.name {
                 Some(ref name) => {
-                    if name.len() > 0xFF {
-                        return Err(Error::UsageError(
-                            "Parameter name is too long. Maximum length is 255 characters."
-                                .to_string(),
-                        ));
-                    }
+                    Self::validate_name_length(name)?;
                     let name_length = name.len() as u8;
                     // We can only send byte length.
                     packet_writer.write_byte_async(name_length).await?;
@@ -824,6 +918,7 @@ impl From<&SqlType> for TdsDataType {
             SqlType::VarcharMax(_) => TdsDataType::VarChar,
             SqlType::VarBinaryMax(_) => TdsDataType::VarBinary,
             SqlType::Xml(_) => TdsDataType::Xml,
+            SqlType::Udt(_, _) => TdsDataType::Udt,
             SqlType::Uuid(_) => TdsDataType::Guid,
             SqlType::DateTime(_) => TdsDataType::DateTime,
             SqlType::Date(_) => TdsDataType::DateN,
@@ -844,11 +939,83 @@ mod tests {
     };
 
     use crate::datatypes::encoder::GenericEncoder;
+    use crate::datatypes::sql_udt::UdtTypeName;
     use crate::io::packet_writer::PacketWriter;
     use crate::io::packet_writer::tests::MockNetworkWriter;
     use crate::message::messages::PacketType;
     use crate::token::tokens::SqlCollation;
     use futures::executor::block_on;
+
+    /// A UDT is declared by its own server-side name, not the TDS type name
+    /// `udt`, which `sp_executesql` cannot resolve ("Cannot find data type
+    /// udt", server error 2715). Only the parts the application supplied are
+    /// emitted, matching msodbcsql's three branches at `sqlccmd.cpp:7485`.
+    #[test]
+    fn a_udt_is_declared_by_its_qualified_type_name() {
+        let cases = [
+            (None, None, "hierarchyid", "[hierarchyid]"),
+            (None, Some("dbo"), "Point", "[dbo].[Point]"),
+            (Some("mydb"), Some("dbo"), "Point", "[mydb].[dbo].[Point]"),
+            // A catalog without a schema leaves the slot empty, which T-SQL
+            // reads as the caller's default schema - the meaning of an omitted
+            // part. msodbcsql produces the same text: its `%s.%s.%s` branch
+            // quotes the absent schema to the empty string (`clntcomn.h:281`).
+            (Some("mydb"), None, "Point", "[mydb]..[Point]"),
+        ];
+        for (db, schema, type_name, expected) in cases {
+            let value = SqlType::Udt(
+                UdtTypeName::new(
+                    db.map(str::to_string),
+                    schema.map(str::to_string),
+                    type_name.to_string(),
+                ),
+                Some(vec![0x01]),
+            );
+            assert_eq!(
+                RpcParameter::get_sql_name(&value, None).unwrap(),
+                expected,
+                "{db:?}.{schema:?}.{type_name}"
+            );
+        }
+    }
+
+    /// A `]` inside an identifier must be doubled or the quoting breaks out of
+    /// the bracketed name.
+    #[test]
+    fn a_udt_declaration_escapes_a_closing_bracket() {
+        let value = SqlType::Udt(
+            UdtTypeName::new(None, None, "od]d".to_string()),
+            Some(vec![0x01]),
+        );
+        assert_eq!(RpcParameter::get_sql_name(&value, None).unwrap(), "[od]]d]");
+    }
+
+    /// `write_b_varchar` encodes an empty part and an absent one identically,
+    /// so the declaration must too - `Some(String::new())` declaring `[]`
+    /// against a header that named nothing fails at the server.
+    #[test]
+    fn an_empty_udt_name_part_is_declared_as_absent() {
+        let cases = [
+            (Some(""), Some(""), "[Point]"),
+            (Some(""), Some("dbo"), "[dbo].[Point]"),
+            (Some("mydb"), Some(""), "[mydb]..[Point]"),
+        ];
+        for (db, schema, expected) in cases {
+            let value = SqlType::Udt(
+                UdtTypeName::new(
+                    db.map(str::to_string),
+                    schema.map(str::to_string),
+                    "Point".to_string(),
+                ),
+                Some(vec![0x01]),
+            );
+            assert_eq!(
+                RpcParameter::get_sql_name(&value, None).unwrap(),
+                expected,
+                "{db:?}.{schema:?}"
+            );
+        }
+    }
 
     #[test]
     fn ordinary_parameters_do_not_inline_streaming_and_encryption_metadata() {

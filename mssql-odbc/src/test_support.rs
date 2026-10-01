@@ -385,6 +385,18 @@ pub(crate) fn connect_mock_server(
     query: &str,
     response: mssql_mock_tds::QueryResponse,
 ) -> MockServer {
+    connect_mock_server_with_trailing_info(dbc, query, response, Vec::new())
+}
+
+/// [`connect_mock_server`], with info tokens emitted after the response's last
+/// row instead of before its first — where SQL Server puts an aggregate
+/// warning, and the only placement a driver's terminal read-ahead can observe.
+pub(crate) fn connect_mock_server_with_trailing_info(
+    dbc: &crate::handles::dbc::DbcHandle,
+    query: &str,
+    response: mssql_mock_tds::QueryResponse,
+    trailing_info: Vec<mssql_mock_tds::InfoMessage>,
+) -> MockServer {
     use crate::handles::dbc::ConnectionState;
     use mssql_mock_tds::MockTdsServer;
     use mssql_tds::connection::client_context::ClientContext;
@@ -401,7 +413,10 @@ pub(crate) fn connect_mock_server(
                 .expect("failed to start mock server");
             let addr = server.local_addr();
             let registry = server.query_registry();
-            registry.lock().await.register(query, response);
+            registry
+                .lock()
+                .await
+                .register_with_trailing_info(query, response, trailing_info);
             let (tx, rx) = tokio::sync::oneshot::channel();
             let handle = tokio::spawn(async move {
                 let _ = server.run_with_shutdown(rx).await;

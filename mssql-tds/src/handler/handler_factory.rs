@@ -99,7 +99,9 @@ pub(crate) struct NegotiatedSettings {
     login_database: String,
     login_language: String,
     login_database_collation: SqlCollation,
-    #[allow(dead_code)] // populated during login, consumed by future env-change tracking
+    /// Character-set name from the login `CHARACTER_SET` `ENVCHANGE`, surfaced
+    /// as `SQL_COLLATION_SEQ`. `None` when the server sends a `SQL_COLLATION`
+    /// change instead, which modern servers do.
     pub char_set: Option<String>,
     /// TDS version from LoginAckToken, captured for session recovery validation.
     pub login_ack_tds_version: Option<TdsVersion>,

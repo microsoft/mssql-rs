@@ -66,6 +66,16 @@ pub const SQL_COPT_SS_INTEGRATED_SECURITY: SqlInteger = 1203;
 pub const SQL_COPT_SS_ENCRYPT: SqlInteger = 1223;
 pub const SQL_COPT_SS_TRUST_SERVER_CERTIFICATE: SqlInteger = 1228;
 
+/// `SQL_COPT_SS_WARN_ON_CP_ERROR` (`SQL_COPT_SS_BASE_EX + 3`). Takes
+/// [`SQL_WARN_NO`] / [`SQL_WARN_YES`]; see
+/// [`DbcState::warn_on_cp_error`](crate::handles::dbc::DbcState::warn_on_cp_error).
+pub const SQL_COPT_SS_WARN_ON_CP_ERROR: SqlInteger = 1243;
+
+/// `SQL_COPT_SS_WARN_ON_CP_ERROR` values, as msodbcsql spells them.
+pub const SQL_WARN_NO: u64 = 0;
+/// See [`SQL_WARN_NO`].
+pub const SQL_WARN_YES: u64 = 1;
+
 // SQL_COPT_SS_ENCRYPT values. 0/1 are the historical off/on pair; 2 selects the
 // TDS 8.0 "strict" mode Driver 18 added. Measured: any other value is treated
 // as "on" rather than rejected.
@@ -340,6 +350,92 @@ pub const SQL_DESCRIBE_PARAMETER: SqlUSmallInt = 10002;
 pub const SQL_CATALOG_NAME: SqlUSmallInt = 10003;
 pub const SQL_MAX_IDENTIFIER_LEN: SqlUSmallInt = 10005;
 pub const SQL_ASYNC_MODE: SqlUSmallInt = 10021;
+
+// AB#47996: remaining ODBC 3.x SQLGetInfo information types.
+pub const SQL_ROW_UPDATES: SqlUSmallInt = 11;
+pub const SQL_MAX_CURSOR_NAME_LEN: SqlUSmallInt = 31;
+pub const SQL_MAX_PROCEDURE_NAME_LEN: SqlUSmallInt = 33;
+pub const SQL_CONVERT_BIGINT: SqlUSmallInt = 53;
+pub const SQL_CONVERT_BINARY: SqlUSmallInt = 54;
+pub const SQL_CONVERT_BIT: SqlUSmallInt = 55;
+pub const SQL_CONVERT_CHAR: SqlUSmallInt = 56;
+pub const SQL_CONVERT_DATE: SqlUSmallInt = 57;
+pub const SQL_CONVERT_DECIMAL: SqlUSmallInt = 58;
+pub const SQL_CONVERT_DOUBLE: SqlUSmallInt = 59;
+pub const SQL_CONVERT_FLOAT: SqlUSmallInt = 60;
+pub const SQL_CONVERT_INTEGER: SqlUSmallInt = 61;
+pub const SQL_CONVERT_LONGVARCHAR: SqlUSmallInt = 62;
+pub const SQL_CONVERT_NUMERIC: SqlUSmallInt = 63;
+pub const SQL_CONVERT_REAL: SqlUSmallInt = 64;
+pub const SQL_CONVERT_SMALLINT: SqlUSmallInt = 65;
+pub const SQL_CONVERT_TIME: SqlUSmallInt = 66;
+pub const SQL_CONVERT_TIMESTAMP: SqlUSmallInt = 67;
+pub const SQL_CONVERT_TINYINT: SqlUSmallInt = 68;
+pub const SQL_CONVERT_VARBINARY: SqlUSmallInt = 69;
+pub const SQL_CONVERT_VARCHAR: SqlUSmallInt = 70;
+pub const SQL_CONVERT_LONGVARBINARY: SqlUSmallInt = 71;
+pub const SQL_INTEGRITY: SqlUSmallInt = 73;
+pub const SQL_NON_NULLABLE_COLUMNS: SqlUSmallInt = 75;
+pub const SQL_LOCK_TYPES: SqlUSmallInt = 78;
+pub const SQL_POS_OPERATIONS: SqlUSmallInt = 79;
+pub const SQL_FILE_USAGE: SqlUSmallInt = 84;
+pub const SQL_MAX_INDEX_SIZE: SqlUSmallInt = 102;
+pub const SQL_MAX_ROW_SIZE_INCLUDES_LONG: SqlUSmallInt = 103;
+pub const SQL_CATALOG_LOCATION: SqlUSmallInt = 114;
+pub const SQL_ACTIVE_ENVIRONMENTS: SqlUSmallInt = 116;
+pub const SQL_ALTER_DOMAIN: SqlUSmallInt = 117;
+pub const SQL_DATETIME_LITERALS: SqlUSmallInt = 119;
+pub const SQL_CONVERT_INTERVAL_DAY_TIME: SqlUSmallInt = 123;
+pub const SQL_CONVERT_INTERVAL_YEAR_MONTH: SqlUSmallInt = 124;
+pub const SQL_CREATE_CHARACTER_SET: SqlUSmallInt = 128;
+pub const SQL_CREATE_COLLATION: SqlUSmallInt = 129;
+pub const SQL_CREATE_DOMAIN: SqlUSmallInt = 130;
+pub const SQL_CREATE_SCHEMA: SqlUSmallInt = 131;
+pub const SQL_CREATE_TABLE: SqlUSmallInt = 132;
+pub const SQL_CREATE_TRANSLATION: SqlUSmallInt = 133;
+pub const SQL_DROP_ASSERTION: SqlUSmallInt = 136;
+pub const SQL_DROP_CHARACTER_SET: SqlUSmallInt = 137;
+pub const SQL_DROP_COLLATION: SqlUSmallInt = 138;
+pub const SQL_DROP_DOMAIN: SqlUSmallInt = 139;
+pub const SQL_DROP_SCHEMA: SqlUSmallInt = 140;
+pub const SQL_DROP_TABLE: SqlUSmallInt = 141;
+pub const SQL_DROP_TRANSLATION: SqlUSmallInt = 142;
+pub const SQL_DROP_VIEW: SqlUSmallInt = 143;
+pub const SQL_INDEX_KEYWORDS: SqlUSmallInt = 148;
+pub const SQL_INFO_SCHEMA_VIEWS: SqlUSmallInt = 149;
+pub const SQL_ODBC_INTERFACE_CONFORMANCE: SqlUSmallInt = 152;
+pub const SQL_STANDARD_CLI_CONFORMANCE: SqlUSmallInt = 166;
+pub const SQL_AGGREGATE_FUNCTIONS: SqlUSmallInt = 169;
+pub const SQL_INSERT_STATEMENT: SqlUSmallInt = 172;
+pub const SQL_CONVERT_GUID: SqlUSmallInt = 173;
+pub const SQL_COLLATION_SEQ: SqlUSmallInt = 10004;
+pub const SQL_MAX_ASYNC_CONCURRENT_STATEMENTS: SqlUSmallInt = 10022;
+// Wide conversion targets, `SQL_CREATE_VIEW`, and the SQL-92 capability masks
+// complete the ODBC 3.x conversion/supported-SQL surface (msodbcsql answers all
+// of these in `SQLGetInfoTable`).
+pub const SQL_CONVERT_WCHAR: SqlUSmallInt = 122;
+pub const SQL_CONVERT_WLONGVARCHAR: SqlUSmallInt = 125;
+pub const SQL_CONVERT_WVARCHAR: SqlUSmallInt = 126;
+pub const SQL_CREATE_VIEW: SqlUSmallInt = 134;
+pub const SQL_SQL92_DATETIME_FUNCTIONS: SqlUSmallInt = 155;
+pub const SQL_SQL92_FOREIGN_KEY_DELETE_RULE: SqlUSmallInt = 156;
+pub const SQL_SQL92_FOREIGN_KEY_UPDATE_RULE: SqlUSmallInt = 157;
+pub const SQL_SQL92_GRANT: SqlUSmallInt = 158;
+pub const SQL_SQL92_NUMERIC_VALUE_FUNCTIONS: SqlUSmallInt = 159;
+pub const SQL_SQL92_PREDICATES: SqlUSmallInt = 160;
+pub const SQL_SQL92_RELATIONAL_JOIN_OPERATORS: SqlUSmallInt = 161;
+pub const SQL_SQL92_REVOKE: SqlUSmallInt = 162;
+pub const SQL_SQL92_ROW_VALUE_CONSTRUCTOR: SqlUSmallInt = 163;
+pub const SQL_SQL92_STRING_FUNCTIONS: SqlUSmallInt = 164;
+pub const SQL_SQL92_VALUE_EXPRESSIONS: SqlUSmallInt = 165;
+// Driver-Manager-owned information types: the DM answers these before the call
+// reaches the driver, so the driver core returns HY096 as a backstop.
+pub const SQL_DRIVER_HDBC: SqlUSmallInt = 3;
+pub const SQL_DRIVER_HENV: SqlUSmallInt = 4;
+pub const SQL_DRIVER_HSTMT: SqlUSmallInt = 5;
+pub const SQL_DRIVER_HLIB: SqlUSmallInt = 76;
+pub const SQL_DRIVER_HDESC: SqlUSmallInt = 135;
+pub const SQL_DRIVER_AWARE_POOLING_SUPPORTED: SqlUSmallInt = 10024;
 
 // SQLGetInfo return values.
 pub const SQL_AM_NONE: u32 = 0;

@@ -289,6 +289,14 @@ pub(crate) const ERR_DAE_LENGTH_MISMATCH: DiagMsg = DiagMsg {
     state: SQLSTATE_22026,
     text: "String data, length mismatch",
 };
+/// A `SQL_SS_UDT` parameter bound without `SQL_CA_SS_UDT_TYPE_NAME`. msodbcsql
+/// rejects the same binding before execute, also as `HY000`
+/// (`sqlccmd.cpp:9977`, `IDS_S1_000_95`). The SQLSTATE is the parity claim;
+/// this text is this driver's own and is not derived from the reference.
+pub(crate) const ERR_MISSING_UDT_TYPE_NAME: DiagMsg = DiagMsg {
+    state: SQLSTATE_HY000,
+    text: "A UDT parameter requires SQL_CA_SS_UDT_TYPE_NAME to be set",
+};
 // A streamed parameter is either NULL or a sequence of value chunks; mixing the
 // two in one `SQL_NEED_DATA` window has no representation on the wire
 // (msodbcsql `sqlccmd.cpp` -> IDS_HY_020).
@@ -339,6 +347,24 @@ pub(crate) const ERR_INVALID_TRANSACTION_STATE: DiagMsg = DiagMsg {
 pub(crate) const WARN_TRANSACTION_COMMITTED: DiagMsg = DiagMsg {
     state: SQLSTATE_01000,
     text: "The open transaction was committed because autocommit mode was enabled",
+};
+/// A character with no representation in the narrow encoding the outgoing value
+/// was sent in was substituted with `?` on the way to the wire.
+///
+/// That encoding comes from the collation the *parameter* carries — the
+/// connection's negotiated database collation — not from the destination
+/// column's. The driver does not know the destination column here, so a column
+/// whose collation differs from the database can still lose characters during
+/// the server-side conversion without this ever being posted.
+///
+/// msodbcsql's `IDS_01_000_16` verbatim (`local.rc:29`, SQLSTATE `01000` via
+/// `clntcomn.cpp:1183`). Posted only when the application opted in with
+/// `SQL_COPT_SS_WARN_ON_CP_ERROR`; see
+/// [`DbcState::warn_on_cp_error`](crate::handles::dbc::DbcState::warn_on_cp_error)
+/// for why the substitution itself is not an error (AB#47598).
+pub(crate) const WARN_CODE_PAGE_CONVERSION_LOSS: DiagMsg = DiagMsg {
+    state: SQLSTATE_01000,
+    text: "Warning: Code page translation caused loss of data",
 };
 /// `SQL_ATTR_TXN_ISOLATION` changed while a manual-commit transaction is open
 /// (msodbcsql `sqlcmisc.cpp:360`).

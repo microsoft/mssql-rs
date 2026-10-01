@@ -30,7 +30,7 @@ use crate::conversion::param_convert::{
     DaePlan, DaeTranscode, ParamBuildError, bound_param_to_rpc, buffered_dae_to_rpc,
     dae_length_limit, dae_plan, dae_streamed_declaration,
 };
-use crate::error::post_sql_error;
+use crate::error::{HasDiagnostics, post_sql_error};
 use crate::handles::dbc::ConnectionState;
 use crate::handles::stmt::{
     DaeParam, DaeState, PreparedPlan, STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT,
@@ -39,7 +39,7 @@ use crate::handles::stmt::{
 use crate::handles::{
     DbcHandle, DescHandle, StmtHandle, handle_from_raw, process_is_shutting_down,
 };
-use crate::params::{BoundParam, ParamArrayLayoutError};
+use crate::params::{BoundParam, ParamArrayLayoutError, ParamSnapshot};
 
 /// Clears the in-flight `EXEC_STARTED` flag on an execution failure so the
 /// statement is reusable.
@@ -250,6 +250,17 @@ pub(super) fn claim_connection(
     // Claim the connection before releasing the lock so concurrent threads see
     // active_stmt and get HY000 rather than "no active TDS client".
     dbc_state.active_stmt = Some(statement_handle);
+    // Snapshot the collation before the client leaves the DBC: a
+    // data-at-execution sequence parks it on the statement, so `SQLGetInfo`
+    // needs this to answer `SQL_COLLATION_SEQ` until the client returns.
+    let cache = dbc_state
+        .client
+        .as_ref()
+        .map(super::get_info::collation_cache_inputs);
+    if let Some((code_page, char_set)) = cache {
+        dbc_state.last_collation_code_page = code_page;
+        dbc_state.last_char_set = char_set;
+    }
     let Some(client) = dbc_state.client.take() else {
         error!("{op}: no active TDS client");
         dbc_state.active_stmt = None;
@@ -294,6 +305,40 @@ pub(super) fn return_client_idle(dbc: &DbcHandle, statement_handle: SqlHandle, c
             dbc_state.active_stmt = None;
         }
     }
+}
+
+/// Drains the connection's "a value reached the wire with a substituted
+/// character" flag and decides whether it is worth a diagnostic.
+///
+/// Always drains, so a substitution can never leak into the next statement's
+/// verdict, then reports it only if the application opted in with
+/// `SQL_COPT_SS_WARN_ON_CP_ERROR` (AB#47598).
+///
+/// Takes the DBC lock, so it must be called **before** the STMT lock the caller
+/// posts under: `SQLFreeHandle(SQL_HANDLE_DESC)` locks DBC then STMT, and
+/// reversing that here would risk an ABBA deadlock against it. Hence the split
+/// with [`post_code_page_conversion_loss`], which does the posting.
+pub(super) fn take_code_page_conversion_loss(dbc: &DbcHandle, client: &mut TdsClient) -> bool {
+    let had_loss = client.take_code_page_conversion_loss();
+    had_loss
+        && dbc
+            .inner
+            .lock()
+            .is_ok_and(|dbc_state| dbc_state.warn_on_cp_error)
+}
+
+/// Posts the `01000` substitution warning when
+/// [`take_code_page_conversion_loss`] said to. Returns whether a record was
+/// posted, so the caller can fold it into its `SQL_SUCCESS_WITH_INFO` decision
+/// exactly as it folds server INFO.
+pub(super) fn post_code_page_conversion_loss(
+    state: &mut impl HasDiagnostics,
+    should_warn: bool,
+) -> bool {
+    if should_warn {
+        post_diag(state, WARN_CODE_PAGE_CONVERSION_LOSS);
+    }
+    should_warn
 }
 
 /// Claims the TDS client only if the connection is live and **idle** (no
@@ -360,22 +405,25 @@ pub(super) fn return_client_busy(dbc: &DbcHandle, client: TdsClient) {
 /// is left rather than stranding it — so it takes the deferred-error route
 /// above, never the unposted one.
 ///
-/// `row_delivered` tells this call whether it actually delivered data —
-/// `true` for `SQLGetData` (a column was just captured) and for a
-/// `SQLFetch`/`SQLFetchScroll` whose rowset held at least one row, `false`
-/// for a zero-row `SQLFetchScroll`. Info messages are always drained from
-/// `client` once the claim is released, regardless of `row_delivered` —
-/// leaving them on `client` would otherwise leak into whichever statement
-/// claims the connection next and get posted under its unrelated
-/// diagnostics. Where they are *posted* still depends on `row_delivered`:
-/// with a row delivered, this call's own `SQL_SUCCESS`/`SQL_SUCCESS_WITH_INFO`
-/// return can carry them, so they are posted here directly. A zero-row
-/// fetch's `SQL_NO_DATA` return cannot carry `SQL_SUCCESS_WITH_INFO` (and few
-/// callers inspect diagnostics after it), so `fill_rowset` deliberately
-/// leaves them out of its own post — they are stashed on
-/// `StmtState::pending_fetch_info` instead, for `SQLMoreResults`'s
-/// `batch_exhausted` fast path or a cursor close to surface later, exactly
-/// like the deferred-error twin above.
+/// Info messages the peek consumed are drained and posted here, whether or not
+/// the claim is released: they arrived before this result set's DONE, so they
+/// belong to the call that read them. Leaving them on `client` would hand this
+/// result set's warning to whichever call reads next — `SQLMoreResults` posts
+/// only after advancing to the following result set — or drop it entirely if
+/// the application never calls `SQLMoreResults`. The return value tells
+/// row-delivering callers to promote an otherwise-clean success to
+/// `SQL_SUCCESS_WITH_INFO`; a zero-row fetch keeps `SQL_NO_DATA` while leaving
+/// the diagnostic available.
+///
+/// `post_preceding` runs under this call's statement lock, before any message
+/// the peek drains is posted. Everything the caller's own rows produced left
+/// the wire ahead of whatever the peek finds, and `SQLGetDiagRec` is ordinal,
+/// so it has to be recorded first; its return value reports whether it posted
+/// a server message. Callers with nothing pending pass `|_| false`.
+///
+/// Returns `(has_server_info, preceding_ran)`. `preceding_ran` is `false` when
+/// the statement lock was poisoned and the closure therefore never ran, so a
+/// caller that relies on it having posted can fall back rather than assume.
 ///
 /// # Caller obligation
 /// Only call this once every column of the row positioned when `client` was
@@ -386,8 +434,8 @@ pub(super) fn release_busy_if_row_exhausted(
     stmt: &StmtHandle,
     statement_handle: SqlHandle,
     mut client: TdsClient,
-    row_delivered: bool,
-) {
+    post_preceding: impl FnOnce(&mut StmtState) -> bool,
+) -> (bool, bool) {
     let peek_result = match client.try_peek_past_current_row() {
         Ok(CursorPoll::Ready(has_row)) => Ok(has_row),
         Ok(CursorPoll::Pending) => dbc.runtime.block_on(client.peek_past_current_row()),
@@ -427,22 +475,27 @@ pub(super) fn release_busy_if_row_exhausted(
         read_error = Some(error);
     }
 
-    let drained_info = if release {
-        client.take_info_messages()
-    } else {
-        Vec::new()
-    };
+    // Drained whether or not the claim is released. Everything the peek
+    // consumed came before this result set's DONE, so it belongs to the call
+    // that read it — msodbcsql posts a server message from `OnMessage` as the
+    // token is parsed (`sqlctokn.cpp:3217`) and clears the flag at the end of
+    // each fetch (`sqlccurs.cpp:2163`), so it never carries to a later call.
+    // Holding it on `client` for whoever reads next would hand this result
+    // set's warning to `SQLMoreResults`, which posts only after advancing to
+    // the following result set, and would drop it outright if the application
+    // never calls `SQLMoreResults` at all.
+    let drained_info = client.take_info_messages();
 
+    let mut has_server_info = false;
+    let mut preceding_ran = false;
     if let Ok(mut stmt_state) = stmt.inner.lock() {
         if release {
             stmt_state.pending_output_params =
                 Some((client.get_return_values(), client.get_return_status()));
         }
-        if row_delivered {
-            post_tds_info_messages(&mut stmt_state, &drained_info);
-        } else {
-            stmt_state.pending_fetch_info = drained_info;
-        }
+        preceding_ran = true;
+        has_server_info = post_preceding(&mut stmt_state);
+        has_server_info |= post_tds_info_messages(&mut stmt_state, &drained_info);
         if let Some(e) = read_error {
             error!(%e, "release_busy_if_row_exhausted: finishing current result failed");
             if batch_done {
@@ -466,6 +519,7 @@ pub(super) fn release_busy_if_row_exhausted(
             Some(statement_handle)
         };
     }
+    (has_server_info, preceding_ran)
 }
 
 /// Restores the client to idle, posts a TDS error to `stmt`, clears
@@ -660,7 +714,7 @@ fn dae_expected_length(indicator: SqlLen) -> Option<usize> {
 /// failure, and reported a misleading `07002` for one with markers.
 pub(super) fn snapshot_bound_params(
     stmt: &StmtHandle,
-) -> Result<Vec<Option<BoundParam>>, SqlReturn> {
+) -> Result<Vec<Option<ParamSnapshot>>, SqlReturn> {
     // Read before the STMT lock below, matching bind_param.rs's own
     // parent-before-child lock ordering for the same lookup.
     let odbc_version = {
@@ -727,18 +781,20 @@ pub(super) unsafe fn build_positional_params(
     op: &str,
 ) -> Result<ParamsWithDae, SqlReturn> {
     let bind_offset = unsafe { stmt_state.inert_attrs.param_bind_offset() };
-    let bound: Vec<Option<BoundParam>> =
-        stmt_state.bound_params.iter().skip(skip).copied().collect();
-    match unsafe {
+    // Borrowed, not cloned: the builder only reads this tail, and cloning it
+    // would reallocate every UDT identity on each stored-procedure call.
+    let bound = stmt_state.bound_params.get(skip..).unwrap_or_default();
+    let built = unsafe {
         build_named_params_for_row(
-            &bound,
+            bound,
             marker_count.saturating_sub(skip),
             bind_offset,
             crate::api::odbc_types::SQL_BIND_BY_COLUMN,
             0,
             false,
         )
-    } {
+    };
+    match built {
         Ok(params) => Ok(params),
         Err(error) => {
             error!(
@@ -807,7 +863,7 @@ pub(super) unsafe fn build_named_params(
 /// Every pointer in `bound_params`, after applying `bind_offset` and the
 /// row-specific stride, must satisfy the original `SQLBindParameter` contract.
 pub(super) unsafe fn build_named_params_for_row(
-    bound_params: &[Option<BoundParam>],
+    bound_params: &[Option<ParamSnapshot>],
     marker_count: usize,
     bind_offset: isize,
     param_bind_type: crate::api::odbc_types::SqlULen,
@@ -820,10 +876,12 @@ pub(super) unsafe fn build_named_params_for_row(
     let mut dae_params = Vec::new();
     let mut fractional_truncated = false;
     for i in 0..marker_count {
-        let Some(Some(bound_param)) = bound_params.get(i) else {
+        let Some(Some(snapshot)) = bound_params.get(i) else {
             return Err(ParamRowBuildError::Unbound { parameter: i + 1 });
         };
-        let bound_param = bound_param
+        let udt_names = snapshot.udt_names.as_deref();
+        let bound_param = snapshot
+            .param
             .for_row(row, bind_offset, param_bind_type)
             .map_err(|ParamArrayLayoutError::InvalidValueStride { .. }| {
                 ParamRowBuildError::Layout { parameter: i + 1 }
@@ -854,6 +912,7 @@ pub(super) unsafe fn build_named_params_for_row(
                 plan,
                 length_limit,
                 bound_param,
+                snapshot.udt_names.clone(),
             ));
             // Nothing to declare for a buffered parameter yet: its bytes are
             // not in, so its type and length are not known. The slot is filled
@@ -903,12 +962,10 @@ pub(super) unsafe fn build_named_params_for_row(
             };
             params.push(rpc);
         } else {
-            let (param, outcome) =
-                unsafe { bound_param_to_rpc(name, &bound_param) }.map_err(|source| {
-                    ParamRowBuildError::Conversion {
-                        parameter: i + 1,
-                        source,
-                    }
+            let (param, outcome) = unsafe { bound_param_to_rpc(name, &bound_param, udt_names) }
+                .map_err(|source| ParamRowBuildError::Conversion {
+                    parameter: i + 1,
+                    source,
                 })?;
             if outcome == ConvOk::Truncated && dae_params.is_empty() {
                 fractional_truncated = true;
@@ -992,7 +1049,13 @@ pub(super) fn rebuild_deferred_params(
             return Err(SQL_ERROR);
         };
         let name = parameter_name(*index);
-        match buffered_dae_to_rpc(name, &dae.binding, bytes, *is_null) {
+        match buffered_dae_to_rpc(
+            name,
+            &dae.binding,
+            dae.udt_names.as_deref(),
+            bytes,
+            *is_null,
+        ) {
             Ok((param, outcome)) => {
                 *slot = param;
                 fractional_truncated |= outcome == ConvOk::Truncated;
@@ -1065,6 +1128,7 @@ pub(super) fn finish_execute(
         // 24000). Do NOT drain the wire — that would collapse the rest of the
         // batch. Matches msodbcsql.
         let info_messages = client.take_info_messages();
+        let warn_cp_loss = take_code_page_conversion_loss(dbc, &mut client);
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("{op}: stmt mutex poisoned on no-row result");
             return_client_busy(dbc, client);
@@ -1079,7 +1143,8 @@ pub(super) fn finish_execute(
         stmt_state.clear_exhaustion_state();
         stmt_state.set_state(STMT_STATE_EXEC_CONTEXT | STMT_STATE_CURSOR_OPEN);
         stmt_state.clear_state(STMT_STATE_EXEC_STARTED);
-        let has_server_info = post_tds_info_messages(&mut stmt_state, &info_messages);
+        let has_server_info = post_tds_info_messages(&mut stmt_state, &info_messages)
+            | post_code_page_conversion_loss(&mut stmt_state, warn_cp_loss);
         drop(stmt_state);
         return_client_busy(dbc, client);
         if !ird_ok {
@@ -1105,6 +1170,7 @@ pub(super) fn finish_execute(
             return fail_with_tds(dbc, stmt, statement_handle, client, &e);
         }
         let info_messages = client.take_info_messages();
+        let warn_cp_loss = take_code_page_conversion_loss(dbc, &mut client);
         // A pure-DML batch (UPDATE; DELETE; INSERT) yields one count per
         // statement. Report the first here; queue the rest for SQLMoreResults to
         // step through, matching msodbcsql's one result set per DML statement.
@@ -1152,7 +1218,8 @@ pub(super) fn finish_execute(
         stmt_state.pending_row_counts = dml_counts;
         stmt_state.set_state(STMT_STATE_EXEC_CONTEXT);
         stmt_state.clear_state(STMT_STATE_CURSOR_OPEN | STMT_STATE_EXEC_STARTED);
-        let has_server_info = post_tds_info_messages(&mut stmt_state, &info_messages);
+        let has_server_info = post_tds_info_messages(&mut stmt_state, &info_messages)
+            | post_code_page_conversion_loss(&mut stmt_state, warn_cp_loss);
         drop(stmt_state);
         return_client_idle(dbc, statement_handle, client);
         if !ird_ok {
@@ -1201,6 +1268,7 @@ pub(super) fn finish_execute(
     // below the peek: the peek drains any INFO token in the post-metadata
     // window, and taking the messages first would leave them for a later fetch.
     let info_messages = client.take_info_messages();
+    let warn_cp_loss = take_code_page_conversion_loss(dbc, &mut client);
     let Ok(mut stmt_state) = stmt.inner.lock() else {
         error!("{op}: stmt mutex poisoned");
         if batch_exhausted {
@@ -1222,7 +1290,8 @@ pub(super) fn finish_execute(
     }
     stmt_state.set_state(STMT_STATE_EXEC_CONTEXT | STMT_STATE_CURSOR_OPEN);
     stmt_state.clear_state(STMT_STATE_EXEC_STARTED);
-    let has_server_info = post_tds_info_messages(&mut stmt_state, &info_messages);
+    let has_server_info = post_tds_info_messages(&mut stmt_state, &info_messages)
+        | post_code_page_conversion_loss(&mut stmt_state, warn_cp_loss);
     drop(stmt_state);
     if batch_exhausted {
         return_client_idle(dbc, statement_handle, client);
@@ -1380,6 +1449,55 @@ mod tests {
         );
     }
 
+    /// The substitution is reported only on request: `SQL_COPT_SS_WARN_ON_CP_ERROR`
+    /// defaults off, so an ordinary statement must not change its return code
+    /// just because a legacy code page could not hold one character (AB#47598).
+    /// The flag is drained either way, so a substitution can never be carried
+    /// into the next statement's verdict.
+    #[test]
+    fn code_page_conversion_loss_is_reported_only_when_the_attribute_is_on() {
+        for (attribute_on, loss, expect_warning) in [
+            (false, false, false),
+            (false, true, false),
+            (true, false, false),
+            (true, true, true),
+        ] {
+            let h = TestHandles::with_env_dbc_stmt();
+            let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+            dbc.inner.lock().unwrap().warn_on_cp_error = attribute_on;
+
+            let mut client = tds_client_from_tokens(vec![done_no_more()]);
+            if loss {
+                client.note_code_page_conversion_loss();
+            }
+
+            let should_warn = take_code_page_conversion_loss(dbc, &mut client);
+            assert_eq!(
+                should_warn, expect_warning,
+                "attribute {attribute_on}, loss {loss}"
+            );
+            assert!(
+                !client.take_code_page_conversion_loss(),
+                "the flag must be drained whatever the attribute says"
+            );
+
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let mut stmt_state = stmt.inner.lock().unwrap();
+            assert_eq!(
+                post_code_page_conversion_loss(&mut stmt_state, should_warn),
+                expect_warning
+            );
+            if expect_warning {
+                assert_eq!(
+                    stmt_state.diag_records[0].sql_state,
+                    WARN_CODE_PAGE_CONVERSION_LOSS.state
+                );
+            } else {
+                assert!(stmt_state.diag_records.is_empty());
+            }
+        }
+    }
+
     #[test]
     fn try_claim_idle_client_none_when_disconnected() {
         let h = TestHandles::with_env_dbc();
@@ -1498,7 +1616,6 @@ mod tests {
                     .iter()
                     .any(|record| record.native_error == 50000)
             );
-            assert!(stmt_state.pending_fetch_info.is_empty());
         }
         assert_eq!(buffers, [-1, -1]);
         assert_eq!(lengths, [-1, -1]);
@@ -1890,7 +2007,7 @@ mod tests {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let client = dbc.inner.lock().unwrap().client.take().unwrap();
 
-        release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, true);
+        assert!(!release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false).0);
 
         assert!(dbc.inner.lock().unwrap().active_stmt.is_none());
         assert!(dbc.inner.lock().unwrap().client.is_some());
@@ -1923,7 +2040,7 @@ mod tests {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let client = dbc.inner.lock().unwrap().client.take().unwrap();
 
-        release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, true);
+        assert!(!release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false).0);
 
         assert!(dbc.inner.lock().unwrap().active_stmt.is_none());
         let ss = stmt.inner.lock().unwrap();
@@ -1940,7 +2057,7 @@ mod tests {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let client = dbc.inner.lock().unwrap().client.take().unwrap();
 
-        release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, true);
+        release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false);
 
         assert!(dbc.inner.lock().unwrap().active_stmt.is_none());
         let ss = stmt.inner.lock().unwrap();
@@ -1979,7 +2096,7 @@ mod tests {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let client = dbc.inner.lock().unwrap().client.take().unwrap();
 
-        release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, true);
+        release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false);
 
         assert_eq!(
             dbc.inner.lock().unwrap().active_stmt,
@@ -2021,7 +2138,10 @@ mod tests {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let client = dbc.inner.lock().unwrap().client.take().unwrap();
 
-        release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, true);
+        assert!(
+            release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false).0,
+            "the fetch caller must be told to return SQL_SUCCESS_WITH_INFO"
+        );
 
         let ss = stmt.inner.lock().unwrap();
         assert!(
@@ -2060,7 +2180,7 @@ mod tests {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let client = dbc.inner.lock().unwrap().client.take().unwrap();
 
-        release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, true);
+        release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false);
 
         assert!(
             dbc.inner.lock().unwrap().active_stmt.is_none(),
@@ -2114,7 +2234,7 @@ mod tests {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let client = dbc.inner.lock().unwrap().client.take().unwrap();
 
-        release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, true);
+        release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false);
 
         assert_eq!(dbc.inner.lock().unwrap().active_stmt, Some(h.stmt));
         assert!(dbc.inner.lock().unwrap().client.is_some());
@@ -2131,13 +2251,17 @@ mod tests {
         assert!(ss.pending_fetch_error.is_none());
     }
 
-    /// A zero-row fetch discovering the current result set is done, with a
-    /// further result set still pending in the batch, must leave any info
-    /// message already on the client alone — that message belongs to
-    /// whichever call (`SQLMoreResults`) actually reads the client next, not
-    /// to this one, since the claim was not released.
+    /// A fetch that exhausts the current result set with a further result set
+    /// still pending must still surface an info message the peek consumed on
+    /// the way: it arrived before this result set's DONE, so it belongs to
+    /// this call. msodbcsql posts a server message from `OnMessage` as the
+    /// token is parsed (`sqlctokn.cpp:3217`), independently of whether the
+    /// batch can release the connection. Deferring it to `SQLMoreResults`
+    /// would attach this result set's warning to the *next* one (that call
+    /// posts only after advancing), and lose it entirely for an application
+    /// that never calls `SQLMoreResults`.
     #[test]
-    fn release_busy_if_row_exhausted_leaves_info_messages_when_the_claim_is_not_released() {
+    fn release_busy_if_row_exhausted_posts_info_messages_when_the_claim_is_not_released() {
         use mssql_tds::test_client_support::info;
 
         let h = TestHandles::with_env_dbc_stmt();
@@ -2145,7 +2269,7 @@ mod tests {
             &h,
             vec![
                 col_metadata_empty(),
-                info(50000, 10, "leave me for SQLMoreResults"),
+                info(50000, 10, "belongs to the first result set"),
                 done_more(),
                 col_metadata_empty(),
                 done_no_more(),
@@ -2156,7 +2280,10 @@ mod tests {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let client = dbc.inner.lock().unwrap().client.take().unwrap();
 
-        release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, true);
+        assert!(
+            release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false).0,
+            "the caller must be told a server message was posted"
+        );
 
         assert_eq!(
             dbc.inner.lock().unwrap().active_stmt,
@@ -2164,15 +2291,13 @@ mod tests {
             "a pending second result set means the claim is not released"
         );
         assert!(
-            !stmt
-                .inner
+            stmt.inner
                 .lock()
                 .unwrap()
                 .diag_records
                 .iter()
-                .any(|d| d.message.contains("leave me for SQLMoreResults")),
-            "the message must not be posted under this call, which returns a \
-             code the caller may never inspect diagnostics for"
+                .any(|d| d.message.contains("belongs to the first result set")),
+            "the message must be posted under the call whose peek consumed it"
         );
         let dbc_state = dbc.inner.lock().unwrap();
         assert!(
@@ -2181,31 +2306,18 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .info_messages()
-                .iter()
-                .any(|m| m.message.contains("leave me for SQLMoreResults")),
-            "the message must still be resident on the client for \
-             SQLMoreResults to find and surface"
+                .is_empty(),
+            "must not also stay on the client, where SQLMoreResults would \
+             re-post it against the result set it advances to"
         );
     }
 
-    /// The other half of the `release` gate: even when the claim *is*
-    /// released (a single-statement zero-row batch — nothing pending after
-    /// it), a fetch that filled zero rows must still not post any drained
-    /// info message under its own return. `fill_rowset` deliberately does
-    /// not drain its own info messages for a zero-row fetch (its
-    /// `SQL_NO_DATA` return can't carry `SQL_SUCCESS_WITH_INFO`) — posting
-    /// them here anyway, just because `release` happens to be true, would
-    /// work against that. But leaving them resident on `client` isn't safe
-    /// either once the claim is released: a different statement could claim
-    /// the now-idle connection next and have its own unrelated diagnostics
-    /// contaminated by them (or, if nothing else claims it first,
-    /// `SQLMoreResults`'s `batch_exhausted` fast path wouldn't even look at
-    /// `client` to find them — see AB#47508 follow-up). So this drains the
-    /// message off `client` right away and stashes it on
-    /// `StmtState::pending_fetch_info` instead, for `SQLMoreResults` or a
-    /// cursor close to surface later.
+    /// Once a zero-row fetch releases the claim, trailing INFO cannot remain
+    /// on the idle client where another statement could inherit it. The helper
+    /// posts it immediately; SQL_NO_DATA remains the fetch return while the
+    /// diagnostic is available from SQLGetDiagRec.
     #[test]
-    fn release_busy_if_row_exhausted_stashes_info_messages_when_no_row_was_delivered() {
+    fn release_busy_if_row_exhausted_posts_info_messages_for_zero_row_fetch() {
         use mssql_tds::test_client_support::info;
 
         let h = TestHandles::with_env_dbc_stmt();
@@ -2222,7 +2334,7 @@ mod tests {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let client = dbc.inner.lock().unwrap().client.take().unwrap();
 
-        release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, false);
+        assert!(release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false).0);
 
         assert!(
             dbc.inner.lock().unwrap().active_stmt.is_none(),
@@ -2230,16 +2342,10 @@ mod tests {
         );
         let ss = stmt.inner.lock().unwrap();
         assert!(
-            !ss.diag_records
-                .iter()
-                .any(|d| d.message.contains("leave me for the next call")),
-            "row_delivered == false must suppress posting under this call's own return"
-        );
-        assert!(
-            ss.pending_fetch_info
+            ss.diag_records
                 .iter()
                 .any(|m| m.message.contains("leave me for the next call")),
-            "must be drained off the client and stashed for SQLMoreResults/close to surface"
+            "the zero-row fetch must expose the drained message immediately"
         );
         drop(ss);
         let dbc_state = dbc.inner.lock().unwrap();
@@ -2256,7 +2362,112 @@ mod tests {
         );
     }
 
+    /// The closure runs under the statement lock, so a poisoned lock skips it
+    /// entirely. Reporting `preceding_ran == false` is what lets the caller
+    /// tell "nothing to post" apart from "never got the chance", instead of
+    /// assuming the closure ran and suppressing its own fallback.
+    #[test]
+    fn release_busy_if_row_exhausted_reports_a_skipped_preceding_closure() {
+        let h = TestHandles::with_env_dbc_stmt();
+        position_and_inject(&h, vec![col_metadata_empty(), done_no_more()]);
+
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let client = dbc.inner.lock().unwrap().client.take().unwrap();
+
+        // Poison the statement lock the helper needs.
+        assert!(
+            std::thread::scope(|scope| {
+                scope
+                    .spawn(|| {
+                        let _guard = stmt.inner.lock().unwrap();
+                        panic!("poison the stmt lock");
+                    })
+                    .join()
+            })
+            .is_err()
+        );
+
+        let ran = std::cell::Cell::new(false);
+        let (_, preceding_ran) = release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| {
+            ran.set(true);
+            true
+        });
+
+        assert!(!ran.get(), "the poisoned lock must skip the closure");
+        assert!(
+            !preceding_ran,
+            "a skipped closure must be reported, not assumed to have posted"
+        );
+    }
+
+    /// `SQLGetDiagRec` is ordinal, so records must come back in the order the
+    /// server sent them. Anything the caller's own rows produced left the wire
+    /// before this peek's messages do, so it has to be posted ahead of them
+    /// rather than appended after.
+    #[test]
+    fn release_busy_if_row_exhausted_posts_preceding_info_before_its_own() {
+        use mssql_tds::error::SqlInfoMessage;
+        use mssql_tds::test_client_support::info;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        position_and_inject(
+            &h,
+            vec![
+                col_metadata_empty(),
+                info(50000, 10, "terminal message"),
+                done_no_more(),
+            ],
+        );
+
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let client = dbc.inner.lock().unwrap().client.take().unwrap();
+        let earlier = [SqlInfoMessage {
+            message: "row loop message".to_string(),
+            state: 1,
+            class: 10,
+            number: 50000,
+            server_name: None,
+            proc_name: None,
+            line_number: None,
+        }];
+
+        assert!(
+            release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |s| {
+                post_tds_info_messages(s, &earlier)
+            })
+            .0
+        );
+
+        let ss = stmt.inner.lock().unwrap();
+        let order: Vec<&str> = ss
+            .diag_records
+            .iter()
+            .map(|d| {
+                if d.message.contains("row loop message") {
+                    "row"
+                } else if d.message.contains("terminal message") {
+                    "terminal"
+                } else {
+                    "other"
+                }
+            })
+            .collect();
+        assert_eq!(
+            order,
+            ["row", "terminal"],
+            "the row loop's message left the wire first and must be reported first"
+        );
+    }
+
     /// Builds a `BoundParam` over the given char buffer and NTS indicator.
+    /// `bound_params` holds the per-ordinal snapshot; these tests only ever
+    /// describe the binding half of it.
+    fn snap(param: BoundParam) -> Option<ParamSnapshot> {
+        Some(param.into())
+    }
+
     fn char_param(buf: &mut [u8], ind: &mut SqlLen) -> BoundParam {
         BoundParam {
             input_output_type: SQL_PARAM_INPUT,
@@ -2340,7 +2551,7 @@ mod tests {
             let mut param = char_param(&mut buffer, &mut indicator);
             param.input_output_type = direction;
             param.column_size = 8;
-            state.bound_params = vec![Some(param)];
+            state.bound_params = vec![snap(param)];
             let built = unsafe { build_named_params(&mut state, 1, "test") }.unwrap();
             assert!(built.dae_params.is_empty());
             assert_eq!(built.params.len(), 1);
@@ -2373,7 +2584,7 @@ mod tests {
                 let mut param = char_param(&mut buffer, &mut indicator);
                 param.input_output_type = direction;
                 param.sql_type = sql_type;
-                state.bound_params = vec![Some(param)];
+                state.bound_params = vec![snap(param)];
                 let built = unsafe { build_named_params(&mut state, 1, "test") }.unwrap();
                 assert_eq!(built.dae_params.len(), 1);
                 assert_eq!(built.dae_params[0].plan, plan);
@@ -2414,10 +2625,10 @@ mod tests {
         let mut state = stmt.inner.lock().unwrap();
         state
             .bound_params
-            .push(Some(char_param(&mut buf1, &mut ind1)));
+            .push(snap(char_param(&mut buf1, &mut ind1)));
         state
             .bound_params
-            .push(Some(char_param(&mut buf2, &mut ind2)));
+            .push(snap(char_param(&mut buf2, &mut ind2)));
 
         let built = unsafe { build_named_params(&mut state, 2, "test") }.unwrap();
         assert_eq!(built.params.len(), 2);
@@ -2449,7 +2660,7 @@ mod tests {
         let mut state = stmt.inner.lock().unwrap();
         state
             .bound_params
-            .push(Some(char_param(&mut buf, &mut ind)));
+            .push(snap(char_param(&mut buf, &mut ind)));
 
         let ret = unsafe { build_named_params(&mut state, 1, "test") };
         assert!(ret.is_err());
@@ -2475,8 +2686,8 @@ mod tests {
         let mut state = stmt.inner.lock().unwrap();
         state
             .bound_params
-            .push(Some(char_param(&mut first, &mut first_ind)));
-        state.bound_params.push(Some(BoundParam {
+            .push(snap(char_param(&mut first, &mut first_ind)));
+        state.bound_params.push(snap(BoundParam {
             input_output_type: SQL_PARAM_INPUT,
             c_type: SQL_C_CHAR,
             sql_type: SQL_VARCHAR,
@@ -2492,7 +2703,7 @@ mod tests {
         }));
         state
             .bound_params
-            .push(Some(char_param(&mut last, &mut last_ind)));
+            .push(snap(char_param(&mut last, &mut last_ind)));
 
         let dae = unsafe { build_named_params(&mut state, 3, "test") }.unwrap();
         assert_eq!(dae.params.len(), 3);
@@ -2524,7 +2735,7 @@ mod tests {
         let mut numeric_ind: SqlLen = std::mem::size_of::<SqlNumericStruct>() as SqlLen;
 
         let mut state = stmt.inner.lock().unwrap();
-        state.bound_params.push(Some(BoundParam {
+        state.bound_params.push(snap(BoundParam {
             input_output_type: SQL_PARAM_INPUT,
             c_type: SQL_C_CHAR,
             sql_type: SQL_VARCHAR,
@@ -2538,7 +2749,7 @@ mod tests {
             strlen_or_ind_ptr: &mut streamed_ind as *mut SqlLen,
             octet_length_ptr: &mut streamed_ind as *mut SqlLen,
         }));
-        state.bound_params.push(Some(BoundParam {
+        state.bound_params.push(snap(BoundParam {
             input_output_type: SQL_PARAM_INPUT,
             c_type: SQL_C_NUMERIC,
             sql_type: SQL_DECIMAL,
@@ -2693,7 +2904,7 @@ mod tests {
         let mut ind: SqlLen = sql_len_data_at_exec(7);
 
         let mut state = stmt.inner.lock().unwrap();
-        state.bound_params.push(Some(BoundParam {
+        state.bound_params.push(snap(BoundParam {
             input_output_type: SQL_PARAM_INPUT,
             c_type: SQL_C_CHAR,
             sql_type: SQL_VARCHAR,
@@ -2740,7 +2951,7 @@ mod tests {
 
             let mut ind: SqlLen = SQL_DATA_AT_EXEC;
             let mut state = stmt.inner.lock().unwrap();
-            state.bound_params.push(Some(BoundParam {
+            state.bound_params.push(snap(BoundParam {
                 input_output_type: SQL_PARAM_INPUT,
                 c_type,
                 sql_type,
@@ -2781,7 +2992,7 @@ mod tests {
 
         let mut buf: Vec<u8> = b"abc".to_vec();
         let mut state = stmt.inner.lock().unwrap();
-        state.bound_params.push(Some(BoundParam {
+        state.bound_params.push(snap(BoundParam {
             input_output_type: SQL_PARAM_INPUT,
             c_type: SQL_C_CHAR,
             sql_type: SQL_VARCHAR,
@@ -2813,7 +3024,7 @@ mod tests {
         let mut ind: SqlLen = SQL_DATA_AT_EXEC;
 
         let mut state = stmt.inner.lock().unwrap();
-        state.bound_params.push(Some(BoundParam {
+        state.bound_params.push(snap(BoundParam {
             input_output_type: SQL_PARAM_INPUT,
             c_type: SQL_C_LONG,
             sql_type: SQL_INTEGER,
@@ -2864,7 +3075,7 @@ mod tests {
         state
             .inert_attrs
             .set(SQL_ATTR_PARAM_BIND_OFFSET_PTR, &raw mut offset as SqlULen);
-        state.bound_params.push(Some(BoundParam {
+        state.bound_params.push(snap(BoundParam {
             input_output_type: SQL_PARAM_INPUT,
             c_type: SQL_C_LONG,
             sql_type: SQL_INTEGER,
@@ -2915,7 +3126,7 @@ mod tests {
         state
             .inert_attrs
             .set(SQL_ATTR_PARAM_BIND_OFFSET_PTR, &raw mut offset as SqlULen);
-        state.bound_params.push(Some(BoundParam {
+        state.bound_params.push(snap(BoundParam {
             input_output_type: SQL_PARAM_INPUT,
             c_type: SQL_C_CHAR,
             sql_type: SQL_VARCHAR,
@@ -2951,7 +3162,7 @@ mod tests {
         let mut inds: [SqlLen; 2] = [4, SQL_DATA_AT_EXEC];
 
         let mut state = stmt.inner.lock().unwrap();
-        state.bound_params.push(Some(BoundParam {
+        state.bound_params.push(snap(BoundParam {
             input_output_type: SQL_PARAM_INPUT,
             c_type: SQL_C_LONG,
             sql_type: SQL_INTEGER,

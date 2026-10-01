@@ -3,12 +3,13 @@
 
 use std::collections::VecDeque;
 use std::ffi::c_void;
+use std::sync::Arc;
 use std::sync::Mutex;
 
 use tracing::error;
 
 use mssql_tds::connection::tds_client::{PreparedStatement, StatementId, TdsClient};
-use mssql_tds::error::{Error as TdsError, SqlInfoMessage};
+use mssql_tds::error::Error as TdsError;
 
 use super::desc::{DescHandle, DescKind, DescRecord, DescState};
 use super::{DbcHandle, HandleType, HasObjectType, free_handle, handle_to_raw};
@@ -18,7 +19,8 @@ use crate::api::odbc_types::{
 use crate::api::set_desc_field::datetime_interval_code_for;
 use crate::conversion::param_convert::{DaeLengthLimit, DaePlan, DaeTranscode};
 use crate::error::{DiagRecord, HasDiagnostics};
-use crate::params::BoundParam;
+use crate::handles::desc::UdtNames;
+use crate::params::{BoundParam, ParamSnapshot};
 use mssql_tds::datatypes::column_values::ColumnValues;
 use mssql_tds::datatypes::sql_string::{ResolvedDecoder, ResolvedEncoding};
 use mssql_tds::datatypes::sqldatatypes::TdsDataType;
@@ -461,17 +463,6 @@ pub(crate) struct StmtState {
     /// since both it and `result_set_exhausted` describe facts about the
     /// same now-superseded result set.
     pub(crate) pending_fetch_error: Option<TdsError>,
-    /// Server INFO messages a read-ahead peek drained from the client when
-    /// `release_busy_if_row_exhausted` released the busy claim on a zero-row
-    /// fetch (`row_delivered == false`). `fill_rowset`'s own `SQL_NO_DATA`
-    /// can't carry `SQL_SUCCESS_WITH_INFO`, so these are stashed here instead
-    /// of posted immediately — for `SQLMoreResults`'s `batch_exhausted` fast
-    /// path or a cursor close to surface, exactly as the deferred-error
-    /// twin above. Both fast paths release the connection without the
-    /// caller re-touching the wire, so nothing else would ever drain them.
-    /// Cleared by [`StmtState::clear_exhaustion_state`] alongside
-    /// `batch_exhausted`.
-    pub(crate) pending_fetch_info: Vec<SqlInfoMessage>,
     /// Owned before the drained client can be reused by another statement.
     /// Delivered once by SQLMoreResults using the bindings current at that call.
     pub(crate) pending_output_params: Option<(Vec<ReturnValue>, Option<i32>)>,
@@ -487,9 +478,24 @@ pub(crate) struct StmtState {
     /// Metadata inferred by `SQLDescribeParam`, indexed by parameter ordinal.
     /// The first describe call fills every marker; `SQLPrepare` invalidates it.
     pub(crate) parameter_metadata: Vec<ParameterDescription>,
+    /// The `suggested_user_type_*` identities that came back with
+    /// `parameter_metadata`, as `(ordinal - 1, names)` for UDT markers only.
+    /// Kept beside the scalar descriptions rather than inside them so
+    /// `ParameterDescription` stays `Copy`, and invalidated with them.
+    ///
+    /// Sorted by ordinal: `refine_ipd` binary-searches it on every cached
+    /// describe, which a linear scan turned into O(N^3) work across a
+    /// describe-all pass.
+    ///
+    /// `Arc`, not `Box`: the list has to be cloned out from under the STMT
+    /// lock before `refine_ipd` can take the DESC lock, and that happens on
+    /// every cache-served answer. Deep-copying each identity's strings there
+    /// cost O(N^2) allocations across the same pass; sharing them makes it a
+    /// refcount bump. The descriptor still keeps its own owned copy.
+    pub(crate) parameter_udt_names: Vec<(usize, Arc<UdtNames>)>,
     /// Parameters bound via `SQLBindParameter`, indexed by `(ParameterNumber
     /// - 1)`. `None` slots are gaps left by binding a higher ordinal first.
-    pub(crate) bound_params: Vec<Option<BoundParam>>,
+    pub(crate) bound_params: Vec<Option<ParamSnapshot>>,
     /// The identity of a prepared statement superseded by a re-prepare / rebind
     /// / `SQLExecDirect`, whose server handle awaits release with `sp_unprepare`.
     /// The drop is deferred to the next point that already holds the TDS client
@@ -755,7 +761,7 @@ impl InertStmtAttrs {
 ///
 /// Keeping these fields together means the execution-time token and declared
 /// length cannot drift away from the binding they describe.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct DaeParam {
     /// 0-based index into [`StmtState::bound_params`], and equally the
     /// parameter's position in the RPC list, which is built in the same order.
@@ -774,6 +780,9 @@ pub(crate) struct DaeParam {
     /// The binding as of this execution, kept so a buffered value can be
     /// declared and converted from `ParameterType` when it closes.
     pub(crate) binding: BoundParam,
+    /// The binding's UDT identity, owned here because the descriptor snapshot
+    /// it came from does not outlive the execute that parks this sequence.
+    pub(crate) udt_names: Option<Arc<UdtNames>>,
     /// How a streamed chunk is re-encoded on its way to the wire. Filled in
     /// when the sequence is parked, where the connection's collation is known.
     pub(crate) transcode: Option<DaeTranscode>,
@@ -789,6 +798,7 @@ impl DaeParam {
         plan: DaePlan,
         length_limit: Option<DaeLengthLimit>,
         binding: BoundParam,
+        udt_names: Option<Arc<UdtNames>>,
     ) -> Self {
         Self {
             bound_index,
@@ -797,6 +807,7 @@ impl DaeParam {
             plan,
             length_limit,
             binding,
+            udt_names,
             transcode: None,
         }
     }
@@ -830,6 +841,7 @@ impl DaeParam {
             DaePlan::Stream(StreamedSqlType::VarBinaryMax),
             None,
             binding,
+            None,
         )
     }
 
@@ -1328,7 +1340,6 @@ impl StmtState {
         self.result_set_exhausted = false;
         self.batch_exhausted = false;
         self.pending_fetch_error = None;
-        self.pending_fetch_info.clear();
         self.pending_output_params = None;
     }
 
@@ -1570,11 +1581,11 @@ impl StmtHandle {
                 result_set_exhausted: false,
                 batch_exhausted: false,
                 pending_fetch_error: None,
-                pending_fetch_info: Vec::new(),
                 pending_output_params: None,
                 prepared: None,
                 direct_marker_count: None,
                 parameter_metadata: Vec::new(),
+                parameter_udt_names: Vec::new(),
                 bound_params: Vec::new(),
                 pending_unprepare: None,
                 parameter_array: None,
