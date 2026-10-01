@@ -153,8 +153,8 @@ CREATE TABLE dbo.lineitem (
 echo ">>> Loading lineitem with bcp..."
 load_start=$SECONDS
 "$TOOLS/bcp" "dbo.lineitem" in "$TBL" -S "$SQL_SERVER" -U "$DB_USER" -P "$SQL_PASSWORD" -d "$DB_NAME" -u \
-    -c -t '|' -r '|\n' -b 1000000 -a 32767 -h "TABLOCK,ORDER(l_orderkey ASC, l_linenumber ASC)" \
-    -e "$RESULTS_DIR/bcp-errors.txt" | tail -n 3
+    -c -t '|' -r '|\n' -b 1000000 -h "TABLOCK,ORDER(l_orderkey ASC, l_linenumber ASC)" \
+    -e "$RESULTS_DIR/bcp-errors.txt" 2>&1 | tee "$RESULTS_DIR/bcp.log"
 LOADED_ROWS="$(sqlq -d "$DB_NAME" -Q "SET NOCOUNT ON; SELECT COUNT_BIG(*) FROM dbo.lineitem;" | tr -d '[:space:]')"
 echo ">>> Loaded $LOADED_ROWS rows in $(( SECONDS - load_start ))s."
 if [ "$LOADED_ROWS" != "$EXPECTED_ROWS" ]; then
