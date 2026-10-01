@@ -110,11 +110,8 @@ endfunction()
 # Helper function: a test that loads the driver directly by path and so skips
 # wholesale on a leg where MSSQL_ODBC_DLL is not set.
 #
-# These link `lib/odbc_skip_aware_main.cpp` instead of `gtest_main` so a
-# fully-skipped run exits 77 rather than 0. Without it ctest records the binary
-# as passed — it only sees the process exit code, not gtest's per-case skips —
-# and the parity report scores a test that ran on one leg as PASS/PASS, which
-# reads as mutual confirmation when nothing was compared.
+# Links lib/odbc_skip_aware_main.cpp instead of gtest_main so a fully-skipped
+# run exits 77; see that file for why ctest needs the distinct exit code.
 # ---------------------------------------------------------------------------
 function(add_odbc_direct_load_test TEST_NAME)
     add_executable(${TEST_NAME} ${ARGN} lib/odbc_skip_aware_main.cpp)
