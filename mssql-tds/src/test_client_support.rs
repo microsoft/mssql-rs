@@ -85,7 +85,7 @@ pub fn serialized_value_wire_bytes(
         let buffer = cursor.into_inner();
         // `end` can sit at the header when a value ends exactly on a packet
         // boundary, which is an empty tail rather than an underflow.
-        buffer[PacketWriter::PACKET_HEADER_SIZE.min(end)..end].to_vec()
+        buffer[PacketWriter::PACKET_HEADER_SIZE..end].to_vec()
     };
 
     let mut out = Vec::new();
