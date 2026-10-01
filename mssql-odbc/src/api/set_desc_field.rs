@@ -229,6 +229,25 @@ fn set_record_count_field(
     SQL_SUCCESS
 }
 
+/// Applies the upper bound `SQL_DESC_ARRAY_SIZE` accepts, returning the value
+/// to store and whether the request had to be reduced.
+///
+/// Shared with the `SQL_ATTR_ROW_ARRAY_SIZE` / `SQL_ATTR_PARAMSET_SIZE`
+/// spellings of this same field (AB#48943, `set_stmt_attr.rs`). They write one
+/// storage location, so they must agree on what is storable: a clamp applied
+/// on only one route would let an application park a value through
+/// `SQLSetStmtAttrW` that `SQLSetDescFieldW` would have rejected.
+///
+/// `i32::MAX` always fits `SqlULen` (`usize`), so the cast cannot truncate.
+pub(crate) fn clamp_desc_array_size(requested: SqlULen) -> (SqlULen, bool) {
+    let max = i32::MAX as SqlULen;
+    if requested > max {
+        (max, true)
+    } else {
+        (requested, false)
+    }
+}
+
 /// Header fields other than `SQL_DESC_COUNT` (handled by the caller since it
 /// needs the record list, not just the header).
 fn set_header_field(
@@ -250,16 +269,13 @@ fn set_header_field(
                 post_diag(state, ERR_INVALID_ATTRIBUTE_VALUE);
                 return SQL_ERROR;
             }
-            let Ok(max) = SqlULen::try_from(i32::MAX) else {
-                return SQL_ERROR; // unreachable
-            };
-            if requested > max {
+            let (stored, clamped) = clamp_desc_array_size(requested);
+            state.header.array_size = stored;
+            if clamped {
                 // Clamped with 01S02, matching msodbcsql (sqlcdesc.cpp:4161-4167).
-                state.header.array_size = max;
                 post_diag(state, WARN_ARRAY_SIZE_CHANGED);
                 return SQL_SUCCESS_WITH_INFO;
             }
-            state.header.array_size = requested;
             SQL_SUCCESS
         }
         SQL_DESC_ARRAY_STATUS_PTR => {
