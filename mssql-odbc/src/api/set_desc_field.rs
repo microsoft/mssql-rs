@@ -788,9 +788,9 @@ mod tests {
     use super::*;
     use crate::api::get_desc_field::sql_get_desc_field_w;
     use crate::api::odbc_types::{
-        SQL_ATTR_APP_PARAM_DESC, SQL_ATTR_APP_ROW_DESC, SQL_C_LONG, SQL_C_WCHAR, SQL_INTEGER,
-        SQL_INTERVAL_YEAR, SQL_INVALID_HANDLE, SQL_NAMED, SQL_NULL_HANDLE, SQL_NUMERIC,
-        SQL_TYPE_DATE, SqlNumericStruct,
+        SQL_ATTR_APP_PARAM_DESC, SQL_ATTR_APP_ROW_DESC, SQL_C_CHAR, SQL_C_LONG,
+        SQL_C_TYPE_TIMESTAMP, SQL_C_WCHAR, SQL_INTEGER, SQL_INTERVAL_YEAR, SQL_INVALID_HANDLE,
+        SQL_NAMED, SQL_NULL_HANDLE, SQL_NUMERIC, SQL_TYPE_DATE, SqlNumericStruct,
     };
     use crate::api::set_stmt_attr::{sql_get_stmt_attr_w, sql_set_stmt_attr_w};
     use crate::api::sqlstate::ERR_FUNCTION_SEQUENCE;
@@ -1158,6 +1158,39 @@ mod tests {
         assert!(!record.data_bound);
         assert_eq!(record.precision, SQL_PREC_NUMERIC);
         assert_eq!(record.scale, 0);
+    }
+
+    // A type write applies `SetTypeDefaults` without zeroing first, unlike a
+    // bind: untouched fields keep their earlier values.
+    #[test]
+    fn type_write_on_apd_applies_type_defaults_without_zeroing() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let set = |field: SqlSmallInt, value: isize| {
+            assert_eq!(
+                unsafe { sql_set_desc_field_w(h.apd(), 1, field, value as SqlPointer, 0) },
+                SQL_SUCCESS
+            );
+        };
+        let seed = || {
+            set(SQL_DESC_TYPE, SQL_C_LONG as isize);
+            set(SQL_DESC_LENGTH as SqlSmallInt, 10);
+            set(SQL_DESC_PRECISION, 5);
+            set(SQL_DESC_SCALE, 2);
+        };
+        let lps = || {
+            let desc = unsafe { handle_from_raw::<DescHandle>(h.apd()) };
+            let state = desc.inner.lock().unwrap();
+            let r = state.record(1).unwrap();
+            (r.length, r.precision, r.scale)
+        };
+
+        seed();
+        set(SQL_DESC_TYPE, SQL_C_TYPE_TIMESTAMP as isize);
+        assert_eq!(lps(), (10, 7, 7));
+
+        seed();
+        set(SQL_DESC_TYPE, SQL_C_CHAR as isize);
+        assert_eq!(lps(), (1, 1, 2));
     }
 
     // Same as above, but through an explicitly allocated descriptor
