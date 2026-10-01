@@ -10,7 +10,7 @@ The `mssql-tds` crate implements the TDS protocol from the ground up in Rust, pr
 |---|---|
 | `mssql-tds` | Core TDS protocol library |
 | `mssql-js` | (Experimental) Node.js bindings via NAPI-RS |
-| `mssql-tds-cli` | Interactive CLI client tool |
+| `mssql-tds-cli` | Interactive CLI client - sqlcmd equivalent |
 | `mssql-mock-tds` | Mock TDS server for testing |
 | `mssql-odbc` | ODBC driver implementing the msodbcsql18 interface — cdylib for C/C++ |
 
