@@ -72,7 +72,7 @@ pub fn serialized_value_wire_bytes(
     use crate::message::messages::PacketType;
 
     let mut sink = CapturingWriter {
-        size: 4096,
+        size: CAPTURE_PACKET_SIZE,
         sent: Vec::new(),
     };
 
@@ -95,6 +95,14 @@ pub fn serialized_value_wire_bytes(
     out.extend_from_slice(&tail);
     Ok(out)
 }
+
+/// Packet size [`serialized_value_wire_bytes`] configures its sink with.
+///
+/// Public because it is load-bearing for a test asserting on multi-packet
+/// behaviour: such a test must size its value against this rather than a
+/// literal, or raising it would quietly reduce the test to the single-packet
+/// path it was written to avoid.
+pub const CAPTURE_PACKET_SIZE: u32 = 4096;
 
 /// A [`NetworkWriter`] that keeps whatever is sent to it.
 ///
