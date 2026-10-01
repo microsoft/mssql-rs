@@ -3969,9 +3969,15 @@ mod serializer_tests {
     /// A UTF-8-aware collation (`fUTF8`, `col_flags` bit `0x40`) must produce
     /// UTF-8 wire bytes for a narrow variant payload rather than
     /// codepage-mangled ones: `resolve_narrow_wire_bytes` calls the public,
-    /// collation-aware `encode_narrow` -- which special-cases `collation.utf8()`
-    /// -- instead of the codepage-only `encode_narrow_for_wire` used by the
-    /// pre-existing (unrelated) `serialize_string` VARCHAR path.
+    /// collation-aware `encode_narrow`, which special-cases `collation.utf8()`.
+    ///
+    /// Since AB#48437 `serialize_string`'s `VARCHAR | CHAR | TEXT` arm resolves
+    /// the UTF-8 flag too, so this is no longer a distinction between the two
+    /// helpers -- the only difference left is the unmapped-collation fallback,
+    /// recorded as entry 23 in `mssql-odbc/docs/parity-deviations.md`. The
+    /// variant path is pinned against being merged into that arm by
+    /// `the_sql_variant_narrow_path_still_encodes_through_the_shared_encoder`,
+    /// whose probe has to use an unmapped collation for exactly that reason.
     #[test]
     fn variant_varchar_utf8_collation_keeps_utf8_bytes() {
         let mut mock = MockNetworkWriter::new(128);

@@ -964,9 +964,11 @@ impl DaeTranscode {
             DaeTarget::Utf16 => {
                 DaeChunk::exact(text.encode_utf16().flat_map(u16::to_le_bytes).collect())
             }
-            // The same helper the materialized narrow path uses, so an LCID
-            // this crate cannot map falls back identically on both, and an
-            // unmappable character is substituted identically on both.
+            // The same helper the materialized `sql_variant` path uses, so an
+            // unmappable character is substituted identically on both. The
+            // unmapped-collation fallback is *not* identical to
+            // `serialize_string`'s narrow arm, which keeps a Latin-1 mapping
+            // where this defaults to Windows-1252 (parity-deviations entry 23).
             DaeTarget::Narrow(collation) => {
                 let encoded = encode_narrow(text, collation);
                 DaeChunk {
