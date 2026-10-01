@@ -435,7 +435,6 @@ fn reserve_rotated_trace_file(
 
     for _ in 0..MAX_FILENAME_ATTEMPTS {
         let path = directory.join(format!("{stem}.{}.log", *next_rotation));
-        *next_rotation = next_rotation.saturating_add(1);
         let mut options = OpenOptions::new();
         options.create_new(true).write(true);
 
@@ -446,8 +445,20 @@ fn reserve_rotated_trace_file(
         }
 
         match options.open(&path) {
-            Ok(file) => return Ok((path, file)),
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Ok(file) => {
+                // The suffix is now taken by a real file.
+                *next_rotation = next_rotation.saturating_add(1);
+                return Ok((path, file));
+            }
+            // Something else already holds this suffix, so skip it for good.
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                *next_rotation = next_rotation.saturating_add(1);
+                continue;
+            }
+            // Nothing was created, so the suffix must stay available. Burning
+            // it on a transient failure would leave a gap in the sequence once
+            // the volume recovers, and a missing number reads as a deleted
+            // file — which this driver never does.
             Err(error) => return Err(error),
         }
     }
@@ -779,26 +790,60 @@ mod tests {
         };
 
         write(b"aaaaaaaa"); // reaches the 8-byte limit
-        assert_eq!(writer.state().next_rotation, 1, "no attempt yet");
+        assert_eq!(writer.state().bytes_written, 8);
 
-        write(b"bb"); // crosses it: one failed rollover attempt
+        write(b"bb"); // crosses it: one failed rollover attempt, then 2 bytes
         assert_eq!(
-            writer.state().next_rotation,
+            writer.state().bytes_written,
             2,
-            "exactly one rollover attempt should have been made"
+            "a failed rollover must still reset the counter"
         );
 
         write(b"cc"); // still under the limit: must not retry
         assert_eq!(
-            writer.state().next_rotation,
-            2,
+            writer.state().bytes_written,
+            4,
             "rollover must be retried at most once per max_file_size, not per event"
+        );
+
+        // A failed create must not consume the suffix: nothing was written to
+        // `.1.log`, so a later recovery has to reuse it rather than skip to
+        // `.2.log` and leave a gap that reads as a deleted file.
+        assert_eq!(
+            writer.state().next_rotation,
+            1,
+            "a transient failure must not burn a rollover number"
         );
 
         // Writing continued in the original file and nothing new was created.
         writer.close();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "aaaaaaaabbcc");
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        remove_dir_all(dir).unwrap();
+    }
+
+    /// Once the volume recovers, rollover must resume at the number the failed
+    /// attempt did not consume, so the sequence stays contiguous.
+    #[test]
+    fn a_recovered_rollover_reuses_the_number_the_failure_left_free() {
+        let dir = test_directory("rotation-recovery");
+        let (path, file) = reserve_trace_file(&dir, "20260910123456789", 42).unwrap();
+        let mut next_rotation = 1;
+        let absent = dir.join("absent").join("mssql_tds_trace.log");
+
+        // Fails: the parent directory does not exist.
+        assert!(reserve_rotated_trace_file(&absent, &mut next_rotation).is_err());
+        assert_eq!(next_rotation, 1, "a failed create must not take the number");
+
+        // The same counter now yields `.1.log` against a usable directory.
+        let (recovered, _handle) = reserve_rotated_trace_file(&path, &mut next_rotation).unwrap();
+        assert_eq!(
+            recovered.file_name().unwrap(),
+            format!("{}.1.log", path.file_stem().unwrap().to_string_lossy()).as_str()
+        );
+        assert_eq!(next_rotation, 2);
+
+        drop(file);
         remove_dir_all(dir).unwrap();
     }
 
