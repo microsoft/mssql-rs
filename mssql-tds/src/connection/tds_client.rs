@@ -4771,6 +4771,11 @@ impl TdsClient {
 
     #[instrument(skip(self), level = "info")]
     async fn drain_rows(&mut self) -> TdsResult<()> {
+        let result = self.drain_rows_inner().await;
+        self.close_failed_row_set(result)
+    }
+
+    async fn drain_rows_inner(&mut self) -> TdsResult<()> {
         if self.maybe_has_unread_rows() {
             // A pull cursor (`next_row_cursor`) may have left the current row
             // partially read (`RowPaused`/`PlpPaused`). The push API used below
@@ -6610,6 +6615,11 @@ impl TdsClient {
     }
 
     pub(crate) async fn read_active_plp_bytes(&mut self, out: &mut [u8]) -> TdsResult<usize> {
+        let result = self.read_active_plp_bytes_inner(out).await;
+        self.close_failed_row_set(result)
+    }
+
+    async fn read_active_plp_bytes_inner(&mut self, out: &mut [u8]) -> TdsResult<usize> {
         let ActiveRowReadState::PlpPaused(plp_state) = &mut self.active_row_read_state else {
             // No active stream is a sequencing error, not EOF: returning `Ok(0)`
             // here is indistinguishable from a legitimately exhausted stream, so
@@ -6671,6 +6681,14 @@ impl TdsClient {
 
     /// Attempts to consume the next PLP output chunk entirely from buffered bytes.
     pub fn try_read_active_plp_chunk(&mut self, out: &mut [u8]) -> TdsResult<CursorPoll<PlpChunk>> {
+        let result = self.try_read_active_plp_chunk_inner(out);
+        self.close_failed_row_set(result)
+    }
+
+    fn try_read_active_plp_chunk_inner(
+        &mut self,
+        out: &mut [u8],
+    ) -> TdsResult<CursorPoll<PlpChunk>> {
         if self
             .cancel_handle
             .as_ref()
@@ -6723,6 +6741,14 @@ impl TdsClient {
     // `#[instrument]` adds enough state to exceed the 4096 B budget once the
     // lazy timeout future is inlined. Successful rows still emit `Row Received`.
     pub async fn next_row_into<W>(&mut self, writer: &mut W) -> TdsResult<bool>
+    where
+        W: RowWriter + Send + ?Sized,
+    {
+        let result = self.next_row_into_inner(writer).await;
+        self.close_failed_row_set(result)
+    }
+
+    async fn next_row_into_inner<W>(&mut self, writer: &mut W) -> TdsResult<bool>
     where
         W: RowWriter + Send + ?Sized,
     {
@@ -6846,6 +6872,11 @@ impl TdsClient {
     /// when the current row must first be drained, the next token needs async
     /// parsing, encryption keys need resolving, or the row header is incomplete.
     pub fn try_next_row_cursor(&mut self) -> TdsResult<CursorPoll<bool>> {
+        let result = self.try_next_row_cursor_inner();
+        self.close_failed_row_set(result)
+    }
+
+    fn try_next_row_cursor_inner(&mut self) -> TdsResult<CursorPoll<bool>> {
         if self.row_already_positioned {
             self.row_already_positioned = false;
             return Ok(CursorPoll::Ready(true));
@@ -6902,6 +6933,14 @@ impl TdsClient {
     where
         W: RowWriter + Send + ?Sized,
     {
+        let result = self.try_next_buffered_row_into_inner(writer);
+        self.close_failed_row_set(result)
+    }
+
+    fn try_next_buffered_row_into_inner<W>(&mut self, writer: &mut W) -> TdsResult<BufferedRowPoll>
+    where
+        W: RowWriter + Send + ?Sized,
+    {
         if self.current_metadata.is_none() {
             return Err(UsageError(
                 "No metadata found while fetching the next row. Have you called the execute method or was the query supposed to return resultset?".to_string(),
@@ -6948,6 +6987,18 @@ impl TdsClient {
 
     /// Attempts to position a row and capture its inline prefix from buffered bytes.
     pub fn try_next_buffered_row_prefix_into<W>(
+        &mut self,
+        prefix_len: usize,
+        writer: &mut W,
+    ) -> TdsResult<BufferedRowPoll>
+    where
+        W: RowWriter + Send + ?Sized,
+    {
+        let result = self.try_next_buffered_row_prefix_into_inner(prefix_len, writer);
+        self.close_failed_row_set(result)
+    }
+
+    fn try_next_buffered_row_prefix_into_inner<W>(
         &mut self,
         prefix_len: usize,
         writer: &mut W,
@@ -7009,6 +7060,11 @@ impl TdsClient {
     /// [`Self::try_next_row_cursor`] returns [`CursorPoll::Pending`].
     #[instrument(skip(self), level = "info")]
     pub async fn next_row_cursor(&mut self) -> TdsResult<bool> {
+        let result = self.next_row_cursor_inner().await;
+        self.close_failed_row_set(result)
+    }
+
+    async fn next_row_cursor_inner(&mut self) -> TdsResult<bool> {
         // A previous `peek_past_current_row` already read this row's header
         // off the wire and parked it in `active_row_read_state` — hand it
         // over as-is instead of draining it (see `drain_active_row_if_needed`,
@@ -7109,6 +7165,11 @@ impl TdsClient {
     /// for PLP, encrypted, skipped, unsupported, or incomplete columns. The
     /// caller then continues with [`Self::read_row_column`].
     pub fn try_read_row_column(&mut self, target: usize) -> TdsResult<CursorPoll<CursorColumn>> {
+        let result = self.try_read_row_column_inner(target);
+        self.close_failed_row_set(result)
+    }
+
+    fn try_read_row_column_inner(&mut self, target: usize) -> TdsResult<CursorPoll<CursorColumn>> {
         let (next_column, column_count) = match &self.active_row_read_state {
             ActiveRowReadState::Idle => return Ok(CursorPoll::Ready(CursorColumn::RowEnded)),
             ActiveRowReadState::PlpPaused(_) => return Ok(CursorPoll::Pending),
@@ -7239,6 +7300,15 @@ impl TdsClient {
         target: usize,
         out: &mut [u8],
     ) -> TdsResult<CursorPoll<Option<PlpChunk>>> {
+        let result = self.try_read_row_plp_complete_inner(target, out);
+        self.close_failed_row_set(result)
+    }
+
+    fn try_read_row_plp_complete_inner(
+        &mut self,
+        target: usize,
+        out: &mut [u8],
+    ) -> TdsResult<CursorPoll<Option<PlpChunk>>> {
         if self
             .cancel_handle
             .as_ref()
@@ -7306,6 +7376,14 @@ impl TdsClient {
     where
         W: RowWriter + Send + ?Sized,
     {
+        let result = self.try_finish_row_into_inner(writer);
+        self.close_failed_row_set(result)
+    }
+
+    fn try_finish_row_into_inner<W>(&mut self, writer: &mut W) -> TdsResult<bool>
+    where
+        W: RowWriter + Send + ?Sized,
+    {
         if self
             .cancel_handle
             .as_ref()
@@ -7338,6 +7416,18 @@ impl TdsClient {
 
     /// Attempts to finish an inline row prefix from bytes already buffered.
     pub fn try_finish_row_prefix_into<W>(
+        &mut self,
+        prefix_len: usize,
+        writer: &mut W,
+    ) -> TdsResult<bool>
+    where
+        W: RowWriter + Send + ?Sized,
+    {
+        let result = self.try_finish_row_prefix_into_inner(prefix_len, writer);
+        self.close_failed_row_set(result)
+    }
+
+    fn try_finish_row_prefix_into_inner<W>(
         &mut self,
         prefix_len: usize,
         writer: &mut W,
@@ -7440,6 +7530,14 @@ impl TdsClient {
     where
         W: RowWriter + Send + ?Sized,
     {
+        let result = self.finish_row_into_inner(writer).await;
+        self.close_failed_row_set(result)
+    }
+
+    async fn finish_row_into_inner<W>(&mut self, writer: &mut W) -> TdsResult<()>
+    where
+        W: RowWriter + Send + ?Sized,
+    {
         let state = std::mem::replace(&mut self.active_row_read_state, ActiveRowReadState::Idle);
         let pause_state = match state {
             ActiveRowReadState::RowPaused(pause_state) => pause_state,
@@ -7497,6 +7595,18 @@ impl TdsClient {
 
     /// Finishes a partially buffered inline prefix and pauses before its first PLP.
     pub async fn finish_row_prefix_into<W>(
+        &mut self,
+        prefix_len: usize,
+        writer: &mut W,
+    ) -> TdsResult<()>
+    where
+        W: RowWriter + Send + ?Sized,
+    {
+        let result = self.finish_row_prefix_into_inner(prefix_len, writer).await;
+        self.close_failed_row_set(result)
+    }
+
+    async fn finish_row_prefix_into_inner<W>(
         &mut self,
         prefix_len: usize,
         writer: &mut W,
@@ -7598,6 +7708,11 @@ impl TdsClient {
     /// out-of-range and returns `UsageError`.
     // Avoid a span for every SQLGetData column; row and token events retain observability.
     pub async fn read_row_column(&mut self, target: usize) -> TdsResult<CursorColumn> {
+        let result = self.read_row_column_inner(target).await;
+        self.close_failed_row_set(result)
+    }
+
+    async fn read_row_column_inner(&mut self, target: usize) -> TdsResult<CursorColumn> {
         match std::mem::replace(&mut self.active_row_read_state, ActiveRowReadState::Idle) {
             ActiveRowReadState::Idle => Ok(CursorColumn::RowEnded),
             ActiveRowReadState::RowPaused(pause_state) => {
@@ -7828,7 +7943,20 @@ impl TdsClient {
         }
     }
 
+    /// Every error here comes after a control token was consumed, so once the
+    /// row set has collected errors any of them ends the batch — including the
+    /// `UsageError` for an unexpected COLMETADATA, which
+    /// [`close_failed_row_set`](Self::close_failed_row_set) would exempt.
     async fn handle_row_read_token(&mut self, token: Tokens) -> TdsResult<Option<bool>> {
+        match self.handle_row_read_token_inner(token).await {
+            Err(error) if !self.row_set_errors.is_empty() => {
+                Err(self.abandon_failed_statement(error))
+            }
+            other => other,
+        }
+    }
+
+    async fn handle_row_read_token_inner(&mut self, token: Tokens) -> TdsResult<Option<bool>> {
         self.observe_prepared_batch_done(&token)?;
         // Once a statement error has been collected under `Continue`, the server
         // feeds this loop until the row set's DONE; bound it like the look-ahead
@@ -8078,6 +8206,27 @@ impl TdsClient {
             return error;
         }
         self.abandon_failed_statement(error)
+    }
+
+    /// Applied where every row-set read returns: an error that ends the read
+    /// after the row set collected `row_set_errors` under
+    /// [`BatchErrorMode::Continue`] closes the batch, whatever produced it — a
+    /// transport failure, a decode error, an unexpected or malformed token, a
+    /// failed key lookup. The reader stopped mid-response, so the batch cannot
+    /// be walked further, and leaving it open would tell the caller it can.
+    ///
+    /// A [`UsageError`] is exempt: it rejects a call before anything is read,
+    /// so the response is intact and the connection is healthy.
+    fn close_failed_row_set<T>(&mut self, result: TdsResult<T>) -> TdsResult<T> {
+        match result {
+            Err(error)
+                if !self.row_set_errors.is_empty()
+                    && !matches!(error, crate::error::Error::UsageError(_)) =>
+            {
+                Err(self.abandon_failed_statement(error))
+            }
+            other => other,
+        }
     }
 
     /// Only [`execute`](Self::execute) honours [`ExecuteOptions::on_error`]. The
@@ -11025,6 +11174,128 @@ mod tests {
         let mut client = failed_row_set(plp_paused());
         assert!(client.read_active_plp_bytes(&mut [0u8; 4]).await.is_err());
         assert_closed(&client, "read_active_plp_bytes");
+    }
+
+    /// A bad token after a row-set error ends the read just as a transport
+    /// failure does — here an unexpected COLMETADATA, whose `UsageError` is
+    /// raised after the token was consumed. Both row readers close the batch.
+    #[tokio::test]
+    async fn an_unexpected_token_after_a_row_set_error_closes_the_batch() {
+        fn tokens() -> Vec<Tokens> {
+            vec![
+                int_col_metadata(1),
+                Tokens::Error(error_token_with_severity(16)),
+                int_col_metadata(1),
+            ]
+        }
+        async fn continued(tokens: Vec<Tokens>) -> TdsClient {
+            let mut client = create_test_client_with_tokens(tokens);
+            assert_eq!(
+                client
+                    .execute(
+                        "q".to_string(),
+                        ExecuteOptions::new().on_error(BatchErrorMode::Continue),
+                    )
+                    .await
+                    .unwrap(),
+                StatementResult::Rows
+            );
+            client
+        }
+
+        let mut client = continued(tokens()).await;
+        assert!(matches!(
+            client.next_row().await,
+            Err(crate::error::Error::UsageError(_))
+        ));
+        assert!(!client.has_open_batch());
+        assert!(client.is_connection_dead());
+        assert!(client.row_set_errors.is_empty());
+
+        let mut client = continued(tokens()).await;
+        assert!(matches!(
+            client.next_row_cursor().await,
+            Err(crate::error::Error::UsageError(_))
+        ));
+        assert!(!client.has_open_batch());
+        assert!(client.is_connection_dead());
+        assert!(client.row_set_errors.is_empty());
+    }
+
+    /// The boundary check behind every row-set read: any error that ends a read
+    /// after a row-set error closes the batch, except a `UsageError`, which
+    /// rejects a call before anything is read.
+    #[test]
+    fn close_failed_row_set_closes_the_batch_unless_nothing_was_read() {
+        fn failed_row_set() -> TdsClient {
+            let mut client = create_test_client();
+            client.batch_error_mode = BatchErrorMode::Continue;
+            client.execution_context.set_has_open_batch(true);
+            client
+                .row_set_errors
+                .push(SqlErrorInfo::from(&error_token_with_severity(16)));
+            client
+        }
+
+        let mut client = failed_row_set();
+        let result: TdsResult<()> = client.close_failed_row_set(Err(
+            crate::error::Error::ProtocolError("decode".to_string()),
+        ));
+        assert!(matches!(result, Err(crate::error::Error::ProtocolError(_))));
+        assert!(!client.has_open_batch());
+        assert!(client.is_connection_dead());
+        assert!(client.row_set_errors.is_empty());
+
+        let mut client = failed_row_set();
+        let result: TdsResult<()> =
+            client.close_failed_row_set(Err(UsageError("misuse".to_string())));
+        assert!(matches!(result, Err(crate::error::Error::UsageError(_))));
+        assert!(client.has_open_batch());
+        assert!(!client.is_connection_dead());
+        assert_eq!(client.row_set_errors.len(), 1);
+
+        let mut client = failed_row_set();
+        assert_eq!(client.close_failed_row_set(Ok(7)).unwrap(), 7);
+        assert!(client.has_open_batch());
+
+        let mut client = create_test_client();
+        client.execution_context.set_has_open_batch(true);
+        let result: TdsResult<()> = client.close_failed_row_set(Err(
+            crate::error::Error::ProtocolError("decode".to_string()),
+        ));
+        assert!(result.is_err());
+        assert!(
+            client.has_open_batch(),
+            "no row-set error, nothing to close"
+        );
+    }
+
+    /// Misuse rejected before anything is read leaves a continued row set as it
+    /// was: the batch stays open and the connection healthy.
+    #[tokio::test]
+    async fn a_rejected_call_after_a_row_set_error_keeps_the_batch() {
+        let mut client = create_test_client();
+        client.batch_error_mode = BatchErrorMode::Continue;
+        client.execution_context.set_has_open_batch(true);
+        client.current_metadata = Some(int_column_metadata(1));
+        client.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(RowPauseState {
+            next_column_index: 0,
+            metadata: int_column_metadata(1),
+            nbc_null_bitmap: None,
+            decryptor: None,
+        }));
+        client
+            .row_set_errors
+            .push(SqlErrorInfo::from(&error_token_with_severity(16)));
+        let mut writer = crate::datatypes::row_writer::DefaultRowWriter::new(1);
+
+        assert!(matches!(
+            client.next_row_into(&mut writer).await,
+            Err(crate::error::Error::UsageError(_))
+        ));
+        assert!(client.has_open_batch());
+        assert!(!client.is_connection_dead());
+        assert_eq!(client.row_set_errors.len(), 1);
     }
 
     /// The "next DONE completes the failed statement" flag belongs to that DONE.
