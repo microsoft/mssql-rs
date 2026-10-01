@@ -417,8 +417,49 @@ fn a_bounded_value_spanning_multiple_packets_keeps_its_length_prefix() {
 /// SQLSTATE behaviour is covered by the e2e suite.
 #[test]
 fn a_lone_surrogate_reaching_a_narrow_target_is_substituted() {
-    // 'a', an unpaired high surrogate, 'b' as raw UTF-16LE - not decodable to
-    // a scalar, which is the whole point.
+    assert_eq!(
+        lone_surrogate_payload(windows_1252()),
+        b"\x03\x00a?b",
+        "matches msodbcsql and the engine: one '?' per unpaired surrogate"
+    );
+    assert!(
+        encode_narrow("a\u{FFFD}b", windows_1252()).had_loss,
+        "the substitution must be flagged so SQL_COPT_SS_WARN_ON_CP_ERROR can report it"
+    );
+}
+
+/// The same lone surrogate under a `_UTF8` collation, where it is *not*
+/// substituted: U+FFFD is representable in UTF-8, so the repaired character
+/// survives as its own three bytes and nothing is lost.
+///
+/// This changed with AB#48437. Before it, the inline arm resolved the LCID
+/// alone and sent `61 3F 62` with the loss flagged; now it agrees with the
+/// streamed `encode_narrow` path, which has behaved this way all along.
+/// `WideCharToMultiByte(CP_UTF8, ...)` without `WC_ERR_INVALID_CHARS` also
+/// yields `EF BF BD`, so msodbcsql is expected to agree — that leg is inferred
+/// from the API contract rather than measured against a `_UTF8` database.
+///
+/// The consequence worth pinning is the quiet one: `had_loss` is false, so
+/// `SQL_COPT_SS_WARN_ON_CP_ERROR` reports no `01000` for this input under a
+/// UTF-8 collation. That is correct — nothing was lost — but it means the
+/// warning channel is collation-dependent for the same bound value.
+#[test]
+fn a_lone_surrogate_under_a_utf8_collation_is_not_substituted() {
+    assert_eq!(
+        lone_surrogate_payload(utf8()),
+        b"\x05\x00a\xef\xbf\xbdb",
+        "U+FFFD is representable in UTF-8, so it is not substituted"
+    );
+    assert!(
+        !encode_narrow("a\u{FFFD}b", utf8()).had_loss,
+        "nothing was lost, so the warning channel stays quiet"
+    );
+}
+
+/// Serializes `'a'`, an unpaired high surrogate, `'b'` as raw UTF-16LE under
+/// `collation`. The source is deliberately not decodable to a scalar, so the
+/// repair to U+FFFD is the serializer's own.
+fn lone_surrogate_payload(collation: SqlCollation) -> Vec<u8> {
     let utf16: Vec<u8> = [0x0061u16, 0xD800, 0x0062]
         .iter()
         .flat_map(|u| u.to_le_bytes())
@@ -430,15 +471,11 @@ fn a_lone_surrogate_reaching_a_narrow_target_is_substituted() {
         is_fixed_length: false,
         precision: None,
         scale: None,
-        collation: Some(windows_1252()),
+        collation: Some(collation),
         is_nullable: true,
     };
     let value = ColumnValues::String(SqlString::new(utf16, EncodingType::Utf16));
-    let payload = serialized_value_wire_bytes(&value, &ctx).expect("serializes");
-    assert_eq!(
-        payload, b"\x03\x00a?b",
-        "matches msodbcsql and the engine: one '?' per unpaired surrogate"
-    );
+    serialized_value_wire_bytes(&value, &ctx).expect("serializes")
 }
 
 /// The resolver's `encoding_rs` arm carries 13 code pages besides the two OEM
@@ -470,4 +507,62 @@ fn a_dbcs_sort_id_frames_by_encoded_byte_count() {
         b"\x02\x00\x93\xfa",
         "CP932 (sort id 192)"
     );
+}
+
+/// Honoring the collation makes a value grow, and `serialize_char_varchar_direct`
+/// measures the *encoded* bytes against the declared length — so a value that
+/// fit under the LCID's single-byte page can now overflow it.
+///
+/// Under a `_UTF8` collation U+00E9 is two bytes, so `varchar(1)` is rejected
+/// where before this change it encoded to one CP1252 byte and succeeded. The
+/// rejection is correct in that the value genuinely does not fit, but it
+/// surfaces as an opaque `UsageError` (`HY000` at the ODBC layer) rather than
+/// the `22001` msodbcsql reports, because the ODBC layer measures the parameter
+/// in UTF-16 units before the collation is known (`param_convert.rs`,
+/// AB#47584).
+///
+/// Pinned so the regression direction stays visible: when AB#47584 gives the
+/// ODBC layer the collation, this assertion is what should change, and it
+/// should change to `22001` rather than to silent acceptance.
+#[test]
+fn a_utf8_collation_can_push_a_value_past_its_declared_length() {
+    let err = try_varchar_payload("\u{e9}", utf8(), 1)
+        .expect_err("two encoded bytes do not fit varchar(1)");
+    assert!(
+        err.to_string().contains("exceeds schema size"),
+        "expected the length guard, got: {err}"
+    );
+
+    // The same binding under the LCID's single-byte page still fits, which is
+    // what makes this about the collation rather than about the value.
+    assert_eq!(
+        varchar_payload_sized("\u{e9}", windows_1252(), 1),
+        b"\x01\x00\xe9"
+    );
+}
+
+/// [`varchar_payload`] against a declared length, returning the serializer's
+/// error instead of panicking on it.
+fn try_varchar_payload(
+    text: &str,
+    collation: SqlCollation,
+    max_size: usize,
+) -> Result<Vec<u8>, mssql_tds::error::Error> {
+    let ctx = TdsTypeContext {
+        tds_type: VARCHAR,
+        max_size,
+        is_plp: false,
+        is_fixed_length: false,
+        precision: None,
+        scale: None,
+        collation: Some(collation),
+        is_nullable: true,
+    };
+    let value = ColumnValues::String(SqlString::new(text.as_bytes().to_vec(), EncodingType::Utf8));
+    serialized_value_wire_bytes(&value, &ctx)
+}
+
+/// [`try_varchar_payload`] for a case expected to serialize.
+fn varchar_payload_sized(text: &str, collation: SqlCollation, max_size: usize) -> Vec<u8> {
+    try_varchar_payload(text, collation, max_size).expect("serializes")
 }

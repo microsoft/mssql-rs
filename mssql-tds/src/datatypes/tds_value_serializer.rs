@@ -14,7 +14,7 @@ use crate::datatypes::column_values::ColumnValues;
 use crate::datatypes::sql_json::SqlJson;
 use crate::datatypes::sql_string::{
     EncodingType, NARROW_SUBSTITUTE_BYTE, NarrowEncoded, SqlString, encode_narrow,
-    try_resolve_collation,
+    encode_narrow_with, try_resolve_collation,
 };
 use crate::datatypes::sql_vector::{SqlVector, VectorData};
 use crate::datatypes::sqldatatypes::TdsDataType;
@@ -1627,15 +1627,15 @@ impl TdsValueSerializer {
         let Some(collation) = collation else {
             return Self::encode_latin1_for_wire(text);
         };
-        if try_resolve_collation(collation).is_none() {
+        let Some(resolved) = try_resolve_collation(collation) else {
             let lcid = collation.info & 0x000F_FFFF;
             tracing::warn!(
                 "Unsupported collation (LCID 0x{lcid:04X}, sort ID {}), falling back to Latin-1.",
                 collation.sort_id
             );
             return Self::encode_latin1_for_wire(text);
-        }
-        encode_narrow(text, collation)
+        };
+        encode_narrow_with(text, resolved)
     }
 
     /// The Latin-1-like mapping [`Self::encode_narrow_for_wire`] falls back to:
