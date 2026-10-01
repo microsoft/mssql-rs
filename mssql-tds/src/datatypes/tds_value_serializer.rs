@@ -4601,6 +4601,74 @@ mod tests {
         (payload, w.code_page_conversion_loss())
     }
 
+    /// [`serialize_varchar`] for a UTF-16LE source, so a genuinely malformed
+    /// one -- an unpaired surrogate, which cannot be expressed as a `&str` --
+    /// can be driven through the same path.
+    fn serialize_varchar_utf16(utf16le: &[u8], collation: SqlCollation) -> (Vec<u8>, bool) {
+        let mut mock = MockNetworkWriter::new(64);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        let ctx = TdsTypeContext {
+            tds_type: VARCHAR,
+            max_size: 8000,
+            is_plp: false,
+            is_fixed_length: false,
+            precision: None,
+            scale: None,
+            collation: Some(collation),
+            is_nullable: true,
+        };
+        let value = ColumnValues::String(crate::datatypes::sql_string::SqlString::new(
+            utf16le.to_vec(),
+            crate::datatypes::sql_string::EncodingType::Utf16,
+        ));
+        block_on(TdsValueSerializer::serialize_value(&mut w, &value, &ctx)).expect("serializes");
+        let payload = w.get_payload().clone().into_inner()[8..].to_vec();
+        (payload, w.code_page_conversion_loss())
+    }
+
+    /// `'a'`, an unpaired high surrogate, `'b'` as raw UTF-16LE.
+    fn lone_surrogate_utf16le() -> Vec<u8> {
+        [0x0061u16, 0xD800, 0x0062]
+            .iter()
+            .flat_map(|u| u.to_le_bytes())
+            .collect()
+    }
+
+    /// A lone surrogate is repaired to U+FFFD, which a single-byte collation
+    /// cannot represent, so it is substituted *and the message is marked*.
+    ///
+    /// The mark is the point. `SQL_COPT_SS_WARN_ON_CP_ERROR` reports `01000`
+    /// off `code_page_conversion_loss`, and only this layer can observe it:
+    /// the integration tests in `tests/test_narrow_param_encoding.rs` see the
+    /// payload alone, so the flag has to be pinned here or not at all.
+    #[test]
+    fn a_lone_surrogate_substitutes_and_marks_the_message() {
+        let (payload, had_loss) =
+            serialize_varchar_utf16(&lone_surrogate_utf16le(), windows_1252_collation());
+        assert_eq!(payload, b"\x03\x00a?b");
+        assert!(
+            had_loss,
+            "the substitution must mark the message so SQL_COPT_SS_WARN_ON_CP_ERROR reports 01000"
+        );
+    }
+
+    /// The same input under a `_UTF8` collation is *not* substituted: U+FFFD is
+    /// representable, so the repaired character survives and nothing is lost.
+    ///
+    /// The message must therefore stay unmarked -- the warning channel is quiet
+    /// for the same bound value under this collation, which is the half a
+    /// payload-only assertion cannot show.
+    #[test]
+    fn a_lone_surrogate_under_a_utf8_collation_leaves_the_message_unmarked() {
+        let (payload, had_loss) =
+            serialize_varchar_utf16(&lone_surrogate_utf16le(), utf8_collation());
+        assert_eq!(payload, b"\x05\x00a\xef\xbf\xbdb");
+        assert!(
+            !had_loss,
+            "nothing was lost, so the message must stay unmarked"
+        );
+    }
+
     /// A value that substitutes and is then *rejected* must not mark the
     /// message: the bytes never reached the wire, and the bulk-load error path
     /// publishes this verdict, so a false positive there is observable.
