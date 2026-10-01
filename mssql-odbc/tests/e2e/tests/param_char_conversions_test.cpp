@@ -192,11 +192,10 @@ protected:
 };
 
 // A narrow parameter must reach the wire in the bytes the *database collation*
-// asks for, whatever that collation is. The driver used to resolve the code
-// page from the collation's LCID alone, ignoring both the UTF-8 flag and the
-// SQL sort ID, so under a `_UTF8` collation or a CP437/CP850 SQL collation it
-// encoded through the LCID's ANSI page instead - U+00E9 as `E9` where the
-// collation required `C3 A9` or `82` (AB#48437).
+// asks for, whatever that collation is. Resolving the code page from the
+// collation's LCID alone - ignoring the UTF-8 flag and the SQL sort ID - sends
+// U+00E9 as `E9` under a `_UTF8` or CP437/CP850 collation where `C3 A9` or
+// `82` is required (AB#48437).
 //
 // Asserted against the server's own encoding of the same character rather than
 // a hard-coded byte string, so the test is collation-independent: it runs on
@@ -214,6 +213,13 @@ protected:
 // `tds_value_serializer.rs`, where the collation is controlled directly.
 //
 // Runs unskipped: this is the engine's own verdict, not a driver comparison.
+//
+// Benefits-from-mock-tds: the RPC bytes are inferred from what SQL Server
+// stored, via CONVERT(..., VARBINARY). A byte-level mock TDS server could read
+// the parameter off the wire directly and assert both the encoded bytes and
+// the collation declared alongside them, which a CAST result cannot separate.
+// The exact bytes are pinned meanwhile by the collation cases in
+// mssql-tds/tests/test_narrow_param_encoding.rs.
 TEST_F(CharConversionLiveTest, NarrowParamEncodesForTheDatabaseCollation) {
     // What the engine itself stores for U+00E9 in a varchar under the database
     // collation, as hex.
@@ -256,6 +262,13 @@ TEST_F(CharConversionLiveTest, NarrowParamEncodesForTheDatabaseCollation) {
 // SQL_C_CHAR is UTF-8 in this driver (AB#47565), so the bound bytes are the
 // character's UTF-8 form; what reaches the wire must still be the collation's
 // encoding of it, not those bytes passed through.
+//
+// Benefits-from-mock-tds: like the wide case above, the RPC bytes are inferred
+// from what SQL Server stored. A byte-level mock TDS server could distinguish
+// the two steps this test can only observe collapsed together - decoding the
+// UTF-8 input buffer, and re-encoding it to the collation's code page - by
+// capturing the parameter as it is written rather than after the server has
+// applied its own conversion.
 TEST_F(CharConversionLiveTest, NarrowCTypeParamEncodesForTheDatabaseCollation) {
     SKIP_IF_COMPARING_MSODBCSQL();  // SQL_C_CHAR is UTF-8 here, the client code page there.
 
@@ -1071,12 +1084,22 @@ TEST_F(CharConversionLiveTest, UnmappableCharacterIsSubstituted) {
 // varchar stored 61 3F 62 ("a?b") with SQL_SUCCESS and no diagnostic; the
 // engine's own CAST(NCHAR(97)+NCHAR(55296)+NCHAR(98) AS VARCHAR) produced the
 // identical 61 3F 62. This driver matches both, and additionally flags the
-// substitution so SQL_COPT_SS_WARN_ON_CP_ERROR can report it - see
-// UnpairedSurrogateSubstitutionWarnsWhenAsked below.
+// substitution so SQL_COPT_SS_WARN_ON_CP_ERROR can report it - the warning
+// itself is covered generically by UnmappableCharacterWarnsWhenAsked below,
+// which this input reaches by the same path.
 //
-// Pinned because rejecting this input instead (e.g. as 22018) was tried and
-// reverted: it diverged from the reference driver *and* from the engine, and
-// bypassed the code-page loss channel that already covers it (AB#47598).
+// Rejecting the value instead - say as 22018 - would diverge from the
+// reference driver *and* from the engine, and would bypass the code-page loss
+// channel that already covers it (AB#47598), so the substitution is pinned
+// here rather than left implicit.
+//
+// Benefits-from-mock-tds: asserts only the stored outcome via ASCII() and
+// DATALENGTH(), so it cannot see the RPC itself. A byte-level mock TDS server
+// could assert that the parameter reached the wire as the single byte 0x3F
+// under the declared collation, rather than inferring it from what the server
+// stored; the exact bytes are pinned meanwhile by
+// `a_lone_surrogate_reaching_a_narrow_target_is_substituted` in
+// mssql-tds/tests/test_narrow_param_encoding.rs.
 TEST_F(CharConversionLiveTest, UnpairedSurrogateIsSubstitutedLikeAnyUnmappableCharacter) {
     if (!DatabaseIsLatin1()) {
         GTEST_SKIP() << "needs a Latin1 database collation";
