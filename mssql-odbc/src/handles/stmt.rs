@@ -1691,6 +1691,40 @@ mod tests {
     use crate::handles::desc::{DescHeader, DescKind};
     use mssql_tds::test_client_support::int_columns;
 
+    /// Pins the classification itself. Both checks below are relative to
+    /// `HONOURED_INERT_STMT_ATTRS`, so dropping an entry keeps them green
+    /// while `SQLSetStmtAttrW` starts reporting that attribute as "stored
+    /// without effect" at the default trace level — the false claim the split
+    /// exists to prevent. Each entry here is justified by a consumer:
+    ///
+    /// - `SQL_ATTR_NOSCAN` — `InertStmtAttrs::noscan`, read by `prepare`,
+    ///   `exec_direct` and `execute`.
+    /// - `SQL_ATTR_PARAM_BIND_OFFSET_PTR` — `InertStmtAttrs::param_bind_offset`.
+    /// - the remaining parameter-array attributes — read by `execute` and
+    ///   `exec_common` when binding and reporting a parameter set.
+    ///
+    /// Removing a consumer means moving its attribute out of the list here,
+    /// not just deleting the call site.
+    #[test]
+    fn the_honoured_inert_attributes_are_exactly_the_consumed_ones() {
+        let mut expected = vec![
+            odbc_types::SQL_ATTR_NOSCAN,
+            odbc_types::SQL_ATTR_PARAM_BIND_OFFSET_PTR,
+            odbc_types::SQL_ATTR_PARAM_BIND_TYPE,
+            odbc_types::SQL_ATTR_PARAM_OPERATION_PTR,
+            odbc_types::SQL_ATTR_PARAM_STATUS_PTR,
+            odbc_types::SQL_ATTR_PARAMS_PROCESSED_PTR,
+        ];
+        let mut actual = HONOURED_INERT_STMT_ATTRS.to_vec();
+        expected.sort_unstable();
+        actual.sort_unstable();
+        assert_eq!(
+            actual, expected,
+            "the honoured set changed; a removal here makes SQLSetStmtAttrW \
+             claim a consumed attribute was ignored"
+        );
+    }
+
     /// `SQLSetStmtAttrW` reports a stored attribute as "without effect" only
     /// when nothing reads it back, and that claim is emitted at `warn`, which
     /// is visible at the default trace level. A typo here, or an attribute
