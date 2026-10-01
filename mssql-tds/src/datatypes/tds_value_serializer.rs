@@ -4619,6 +4619,15 @@ mod tests {
     ///
     /// Shared by [`serialize_varchar`] and [`serialize_varchar_utf16`], which
     /// differ only in how they build the `SqlString`.
+    ///
+    /// **Single-packet only.** This reads the writer's current buffer, and
+    /// `PacketWriter` flushes a completed packet through `NetworkWriter::send`
+    /// and reuses that buffer for the remainder, so a value crossing
+    /// `max_payload_size` would come back as its tail alone -- plausible bytes
+    /// rather than a panic, against assertions that compare bytes exactly. The
+    /// assertion below turns that into a failure naming its own cause. A
+    /// multi-packet value belongs in `tests/test_narrow_param_encoding.rs`,
+    /// whose helper captures the flushed packets.
     fn serialize_narrow(value: &ColumnValues, collation: Option<SqlCollation>) -> (Vec<u8>, bool) {
         let mut mock = MockNetworkWriter::new(64);
         let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
@@ -4634,7 +4643,16 @@ mod tests {
         };
         block_on(TdsValueSerializer::serialize_value(&mut w, value, &ctx)).expect("serializes");
         let payload = w.get_payload().into_inner()[PacketWriter::PACKET_HEADER_SIZE..].to_vec();
-        (payload, w.code_page_conversion_loss())
+        let had_loss = w.code_page_conversion_loss();
+        // Ends the writer's borrow of `mock`, so the flush check below can read
+        // what was sent.
+        drop(w);
+        assert!(
+            mock.data.is_empty(),
+            "value crossed a packet boundary; this helper only reads the current buffer, \
+             so the payload it returned is a tail rather than the whole value"
+        );
+        (payload, had_loss)
     }
 
     /// `'a'`, an unpaired high surrogate, `'b'` as raw UTF-16LE.
