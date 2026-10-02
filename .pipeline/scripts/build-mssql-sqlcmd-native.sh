@@ -40,7 +40,7 @@ case "$target" in
   *-musl*) export RUSTFLAGS="${RUSTFLAGS:-} -C target-feature=-crt-static" ;;
 esac
 
-log="$(mktemp)"
+log="$(mktemp "${TMPDIR:-/tmp}/mssql-sqlcmd.XXXXXX")"
 trap 'rm -f "$log"' EXIT
 if ! cargo rustc -p mssql-sqlcmd --release --lib --target "$target" \
     --crate-type staticlib -- --print native-static-libs 2>"$log"; then
