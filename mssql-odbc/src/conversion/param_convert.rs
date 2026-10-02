@@ -1568,6 +1568,10 @@ fn numeric_apd_matches_ipd(param: &BoundParam) -> bool {
 /// A later execution that takes the fast path then forwards those fields, so
 /// skipping the write would send a different value.
 ///
+/// Not gated on the IPD type: retail writes for every IPD outside
+/// NUMERIC/DECIMAL too (`sqlcfunc.cpp:3168`), before conversion, so a target
+/// this driver cannot yet convert to still gets the write.
+///
 /// # Safety
 /// `param` must address the application's own buffer under the
 /// `SQLBindParameter` contract - never a driver-owned copy such as the
@@ -1599,8 +1603,8 @@ fn decimal_from_numeric(
     // copies the struct whole, including its own precision and scale
     // (`sqlcmisc.cpp:7014`), and SQL Server converts it to the declared type.
     // Otherwise the APD precision/scale describe `val[]`, and execution has
-    // already written them into the struct (`stamp_numeric_apd`). Measured on Driver
-    // 18.6.2.1 (`SQL_DRIVER_VER` 18.06.0002): a bare `(38, 0)` bind of
+    // already written them into the struct (`stamp_numeric_apd`). Measured on
+    // Driver 18.6.2.1 (`SQL_DRIVER_VER` 18.06.0002): a bare `(38, 0)` bind of
     // `12.5` (embedded scale 1) into `decimal(38,0)` returns `13`, and a bare
     // bind of embedded `12.345` into `decimal(10,2)` returns `12345.00`.
     if numeric_apd_matches_ipd(param) {
