@@ -968,7 +968,7 @@ stages:
 
     - template: templates/install-host-dependency.yaml
       parameters:
-        installAzCli: false
+        installAzCli: true
         installDocker: true
 
     - task: AzureCLI@2
@@ -1087,7 +1087,9 @@ stages:
     dependsOn:
     - BuildX64Images
     - BuildARM64Images
-    condition: eq('${{ parameters.buildUbuntuImages }}', 'true')
+    # Explicit succeeded(): without it a failed ARM64 build still publishes a
+    # manifest pairing fresh x64 images with stale arm64 ones.
+    condition: and(succeeded(), eq('${{ parameters.buildUbuntuImages }}', 'true'))
     pool:
       name: RUST-X64-WUS3
       demands:

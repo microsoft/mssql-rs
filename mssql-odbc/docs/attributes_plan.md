@@ -69,7 +69,7 @@ mssql-python, so `SQL_ATTR_CONNECTION_POOLING` is out of scope.
 | `SQL_COPT_SS_INTEGRATED_SECURITY` | ✅ | ✅ | attribute overrides keyword |
 | `SQL_COPT_SS_ENCRYPT` | ✅ | ✅ | attribute overrides keyword |
 | `SQL_COPT_SS_TRUST_SERVER_CERTIFICATE` | ✅ | ✅ | reports effective policy |
-| `SQL_COPT_SS_WARN_ON_CP_ERROR` | ✅ | ✅ | settable pre- and post-connect; `HY024` outside `SQL_WARN_NO`/`SQL_WARN_YES` (deviation 22) |
+| `SQL_COPT_SS_WARN_ON_CP_ERROR` | ✅ | ✅ | settable pre- and post-connect; `HY024` outside `SQL_WARN_NO`/`SQL_WARN_YES` (deviation 23) |
 
 The remaining recognized connection attributes are pending in S5b and return
 their measured not-implemented diagnostic; an unknown identifier returns `HY092`.
@@ -285,7 +285,7 @@ by unit + e2e tests.
 - `SQLGetConnectAttrW` deliberately has **no** arm, so it falls through to
   `HY092` exactly as msodbcsql does (`sqlcmisc.cpp:4378`).
 
-**Enforcement (AB#46385 — delivered):** the statement-scoped entry points that
+**Enforcement (AB#46385):** the statement-scoped entry points that
 run a wire operation thread `StmtState::query_timeout` into
 `ExecuteOptions::timeout_secs`, so a non-zero value bounds the wait for a
 response: on expiry the client sends `ATTENTION` and reports the failure as
@@ -306,11 +306,10 @@ functions and `SQLGetTypeInfo` are executed *through `SQLExecDirectW` itself*
 (`sqlcprot.h:1607`). `SQLPrepare` needs no wiring because this driver defers
 the server-side prepare to execute.
 
-**Known exception:** `SQLFreeHandle(SQL_HANDLE_STMT)`'s best-effort
-`sp_unprepare` (`free_handle.rs:497`) still runs unbounded. msodbcsql bounds
-its equivalent in `DropPrepHandle` (`sqlcfunc.cpp:790-830`); closing the gap
-here needs the timeout captured before the statement state is torn down, so it
-is tracked separately by mssql-rs#546 rather than folded into #466.
+`SQLFreeHandle(SQL_HANDLE_STMT)` also bounds its best-effort `sp_unprepare`
+by the statement's timeout (mssql-rs#546), like msodbcsql's `DropPrepHandle`
+(`sqlcfunc.cpp:790-830`). An expiry is logged and does not prevent the
+statement handle from being freed.
 
 **Acceptance:** `cursor.timeout = N` in mssql-python stops logging
 "Failed to set query timeout"; value round-trips through get; clamp + `01S02`

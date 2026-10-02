@@ -36,8 +36,8 @@ use mssql_tds::token::tokens::SqlCollation;
 use uuid::Uuid;
 
 use crate::api::odbc_types::{
-    SQL_BIGINT, SQL_BINARY, SQL_BIT, SQL_C_BINARY, SQL_C_CHAR, SQL_C_WCHAR, SQL_CHAR,
-    SQL_DATA_AT_EXEC, SQL_DECIMAL, SQL_DOUBLE, SQL_FLOAT, SQL_GUID, SQL_INTEGER,
+    SQL_BIGINT, SQL_BINARY, SQL_BIT, SQL_C_BINARY, SQL_C_CHAR, SQL_C_NUMERIC, SQL_C_WCHAR,
+    SQL_CHAR, SQL_DATA_AT_EXEC, SQL_DECIMAL, SQL_DOUBLE, SQL_FLOAT, SQL_GUID, SQL_INTEGER,
     SQL_LEN_DATA_AT_EXEC_OFFSET, SQL_LONGVARBINARY, SQL_LONGVARCHAR, SQL_NULL_DATA, SQL_NUMERIC,
     SQL_REAL, SQL_SMALLINT, SQL_SS_TIME2, SQL_SS_TIMESTAMPOFFSET, SQL_SS_UDT, SQL_SS_VARIANT,
     SQL_SS_VECTOR, SQL_SS_VECTOR_ELEMENT_SIZE, SQL_SS_XML, SQL_TINYINT, SQL_TYPE_DATE,
@@ -1557,26 +1557,57 @@ fn decimal_from_text(param: &BoundParam, text: AppText) -> Result<TypedValue, Pa
     Ok((decimal_of(param.sql_type, value), Some(metadata)))
 }
 
+fn numeric_apd_matches_ipd(param: &BoundParam) -> bool {
+    matches!(param.sql_type, SQL_NUMERIC | SQL_DECIMAL)
+        && usize::try_from(param.app_precision) == Ok(param.column_size)
+        && param.app_scale == param.decimal_digits
+}
+
+/// msodbcsql writes the APD precision and scale into the application's
+/// `SQL_NUMERIC_STRUCT` whenever it converts one (`sqlcfunc.cpp:3165-3176`).
+/// A later execution that takes the fast path then forwards those fields, so
+/// skipping the write would send a different value.
+///
+/// Not gated on the IPD type: retail writes for every IPD outside
+/// NUMERIC/DECIMAL too (`sqlcfunc.cpp:3168`), before conversion, so a target
+/// this driver cannot yet convert to still gets the write.
+///
+/// # Safety
+/// `param` must address the application's own buffer under the
+/// `SQLBindParameter` contract - never a driver-owned copy such as the
+/// data-at-execution staging buffer.
+pub(crate) unsafe fn stamp_numeric_apd(param: &BoundParam) {
+    if param.c_type != SQL_C_NUMERIC
+        || is_output_only(param.input_output_type)
+        || numeric_apd_matches_ipd(param)
+        || !matches!(unsafe { read_indicator(param) }, Ok(Indicator::Length(_)))
+    {
+        return;
+    }
+    let numeric = param.parameter_value_ptr.cast::<u8>();
+    // `precision` and `scale` are the struct's first two bytes; truncating to
+    // a byte matches retail's `(BYTE)` casts.
+    unsafe {
+        numeric.write(param.app_precision as u8);
+        numeric.add(1).write(param.app_scale as u8);
+    }
+}
+
 fn decimal_from_numeric(
     param: &BoundParam,
     source: SqlNumericStruct,
 ) -> Result<(TypedValue, ConvOk), ParamBuildError> {
     let magnitude = u128::from_le_bytes(source.val);
-    // msodbcsql's FastDescribeRPCParam copies a matching non-NULL
-    // SQL_NUMERIC_STRUCT whole, including its wire precision and scale
-    // (`sqlcmisc.cpp:7014`).
-    // Additionally requires an application-authored APD precision/scale
-    // (`SQLSetDescField`/`SQLSetDescRec`), not merely a coincidental match
-    // with this driver's own default-fill (`SQLBindParameter`'s
-    // `SQL_PREC_NUMERIC`/scale-0 reset, or a `SQL_DESC_TYPE` rewrite):
-    // msodbcsql's parity-comparison harness shows a bare `SQLBindParameter`
-    // whose IPD happens to be `(precision, scale=0)` does NOT take this fast
-    // path in retail — it still rescales the embedded struct to the IPD's
-    // scale, unlike an app that explicitly wrote matching APD fields.
-    if param.precision_scale_explicit
-        && usize::try_from(param.app_precision) == Ok(param.column_size)
-        && param.app_scale == param.decimal_digits
-    {
+    // msodbcsql decides from the current APD and IPD values alone
+    // (`sqlcfunc.cpp:3165-3176`). When they match, FastDescribeRPCParam
+    // copies the struct whole, including its own precision and scale
+    // (`sqlcmisc.cpp:7014`), and SQL Server converts it to the declared type.
+    // Otherwise the APD precision/scale describe `val[]`, and execution has
+    // already written them into the struct (`stamp_numeric_apd`). Measured on
+    // Driver 18.6.2.1 (`SQL_DRIVER_VER` 18.06.0002): a bare `(38, 0)` bind of
+    // `12.5` (embedded scale 1) into `decimal(38,0)` returns `13`, and a bare
+    // bind of embedded `12.345` into `decimal(10,2)` returns `12345.00`.
+    if numeric_apd_matches_ipd(param) {
         let metadata = RpcTypeMetadata {
             precision: Some(source.precision),
             scale: Some(source.scale as u8),
@@ -1602,19 +1633,7 @@ fn decimal_from_numeric(
     } else {
         magnitude
     };
-    // When the application never explicitly wrote the APD's precision/scale,
-    // there is no APD-declared scale to trust as a description of `val[]`'s
-    // layout - it is only this driver's own default-fill. Fall back to the
-    // struct's own embedded scale instead, matching retail: a bare
-    // `SQLBindParameter` bind still rescales the struct's *own* claimed scale
-    // to the IPD's target scale (verified against msodbcsql's parity-
-    // comparison harness), rather than assuming an unset APD scale of 0.
-    let source_scale = if param.precision_scale_explicit {
-        i64::from(param.app_scale)
-    } else {
-        i64::from(source.scale)
-    };
-    let (scaled, outcome) = rescale_mantissa(mantissa, source_scale, scale)?;
+    let (scaled, outcome) = rescale_mantissa(mantissa, i64::from(param.app_scale), scale)?;
     let value = decimal_from_magnitude(scaled, precision, scale)?;
     Ok(((decimal_of(param.sql_type, value), Some(metadata)), outcome))
 }
@@ -1888,9 +1907,15 @@ fn reject_fraction_past_scale(
 /// from `lpparam->fSqlType` and never consults the bound C type.
 ///
 /// `column_size` and `decimal_digits` come straight from the application, so
-/// every value that participates in the `@P1 <type>` declaration is validated
-/// here: emitting `decimal(0,0)` or `char(0)` would otherwise fail server-side
-/// with an opaque syntax error instead of `HY104` at execute time.
+/// every value that participates in the `@P1 <type>` declaration is checked
+/// before it is rendered: emitting `decimal(0,0)` or `char(0)` would otherwise
+/// fail server-side with an opaque syntax error. The two reach here with
+/// different histories, though. `SQLBindParameter` has already screened
+/// `column_size` with `parameter_column_size_is_valid`, so that half is a
+/// backstop - see [`fixed_length`]. Scale is not screened there, so for
+/// `decimal_digits` this is the primary check and its `HY104` really is
+/// reported later than msodbcsql's `CheckSqlScale`; the parameter plan records
+/// that timing as an accepted divergence.
 ///
 /// The returned [`RpcTypeMetadata`] is the *only* place precision and scale are
 /// carried. [`RpcParameter`] uses it to render the declaration and to write the
@@ -1976,7 +2001,9 @@ fn typed_null(
 /// Matches msodbcsql for ODBC 3.x applications: `CheckSqlPrec`
 /// (`Sql/Ntdbms/sqlncli/odbc/sqlcdesc.cpp`) rejects a zero `ColumnSize` on these
 /// types with `HY104`, and only clamps it to the maximum for a 2.x application
-/// (`IS2xAPP`). We report the same `HY104`, at execute rather than at bind.
+/// (`IS2xAPP`). `SQLBindParameter` reports the same `HY104` in the same phase
+/// msodbcsql does, through `parameter_column_size_is_valid`, so this is a
+/// backstop rather than the primary check.
 /// `varchar`/`nvarchar` differ deliberately -- see [`variable_length`].
 fn fixed_length(column_size: usize, max: usize) -> Result<u16, ParamBuildError> {
     u16::try_from(column_size)
@@ -2131,7 +2158,6 @@ mod tests {
             decimal_digits: 0,
             app_precision: 0,
             app_scale: 0,
-            precision_scale_explicit: false,
             parameter_value_ptr: ptr,
             buffer_length: 0,
             strlen_or_ind_ptr: ind,
@@ -2232,7 +2258,6 @@ mod tests {
             binding.column_size = 12;
             binding.decimal_digits = 2;
             binding.app_scale = 2;
-            binding.precision_scale_explicit = true;
 
             for (app_precision, source_precision) in [(8, 8), (12, 8), (12, 10)] {
                 binding.app_precision = app_precision;
@@ -2258,12 +2283,8 @@ mod tests {
         }
     }
 
-    /// Simulates an application that explicitly wrote the APD's
-    /// `SQL_DESC_SCALE` (`app_scale`) via `SQLSetDescFieldW`/`SQLSetDescRec`,
-    /// distinct from a bare `SQLBindParameter` bind, where the driver's own
-    /// default-fill leaves nothing "explicit" to trust over the struct's own
-    /// embedded scale. See `a_numeric_without_explicit_apd_precision_scale_*`
-    /// below for the bare-bind case.
+    /// `app_precision` stays 0, so these never match the IPD and always read
+    /// `val[]` at `app_scale`.
     fn convert_numeric(
         source: SqlNumericStruct,
         app_scale: SqlSmallInt,
@@ -2277,7 +2298,6 @@ mod tests {
         p.column_size = precision;
         p.decimal_digits = scale;
         p.app_scale = app_scale;
-        p.precision_scale_explicit = true;
         decimal_from_numeric(&p, source)
     }
 
@@ -2363,7 +2383,6 @@ mod tests {
         p.decimal_digits = 0;
         p.app_precision = 38;
         p.app_scale = 0;
-        p.precision_scale_explicit = true;
 
         let ((value, metadata), outcome) = decimal_from_numeric(&p, source).unwrap();
         assert_eq!(outcome, ConvOk::Exact);
@@ -2380,39 +2399,13 @@ mod tests {
         );
     }
 
-    /// A bare `SQLBindParameter` bind with no `SQLSetDescField` call: the APD
-    /// precision/scale numerically match the IPD's only because
-    /// `write_to_records` defaults `SQL_C_NUMERIC` to `(SQL_PREC_NUMERIC, 0)`
-    /// and the IPD also declares scale 0. msodbcsql's own parity-comparison
-    /// harness confirms retail does NOT take the fast path here - it still
-    /// rescales the embedded struct to the IPD's scale/precision, unlike an
-    /// app that explicitly wrote a matching APD precision/scale. A struct
-    /// whose embedded metadata would be rejected by the fast path's
-    /// overflow-tolerant copy (`1u128 << 127`, matching the sibling test
-    /// above) must instead go through the normal bounded rescale here.
+    /// The fast path is keyed on values alone, so a bare `(38, 0)` bind into
+    /// `decimal(38,0)` forwards the struct's own scale for SQL Server to
+    /// convert, and a mismatched bind reads `val[]` at the APD scale rather
+    /// than the struct's. Measured on Driver 18.6.2.1: embedded `12.345`
+    /// returns `12` and `12345.00` respectively.
     #[test]
-    fn a_numeric_without_explicit_apd_precision_scale_still_rescales() {
-        let source = numeric_struct(1u128 << 127, 1, 0);
-        let mut ind = std::mem::size_of::<SqlNumericStruct>() as SqlLen;
-        let mut p = param(SQL_C_NUMERIC, std::ptr::null_mut(), &mut ind);
-        p.sql_type = SQL_DECIMAL;
-        p.column_size = 38;
-        p.decimal_digits = 0;
-        p.app_precision = 38;
-        p.app_scale = 0;
-        p.precision_scale_explicit = false;
-
-        assert_eq!(
-            decimal_from_numeric(&p, source).unwrap_err(),
-            ParamBuildError::Value(ConvError::OutOfRange)
-        );
-    }
-
-    /// Same as above but with a value that fits the target: proves the
-    /// non-fast path really does forward the correctly-rescaled value rather
-    /// than merely rejecting the oversized case above by coincidence.
-    #[test]
-    fn a_numeric_without_explicit_apd_precision_scale_rescales_in_bounds_value() {
+    fn a_numeric_fast_path_depends_only_on_apd_and_ipd_values() {
         let source = numeric_struct(12345, 1, 3);
         let mut ind = std::mem::size_of::<SqlNumericStruct>() as SqlLen;
         let mut p = param(SQL_C_NUMERIC, std::ptr::null_mut(), &mut ind);
@@ -2421,13 +2414,75 @@ mod tests {
         p.decimal_digits = 0;
         p.app_precision = 38;
         p.app_scale = 0;
-        p.precision_scale_explicit = false;
 
-        let ((value, _), outcome) = decimal_from_numeric(&p, source).unwrap();
-        assert_eq!(outcome, ConvOk::Truncated);
+        let ((value, metadata), outcome) = decimal_from_numeric(&p, source).unwrap();
+        assert_eq!(outcome, ConvOk::Exact);
         assert_eq!(
             value,
-            SqlType::Decimal(Some(DecimalParts::new(true, 38, 0, 12)))
+            SqlType::Decimal(Some(DecimalParts::new(true, 38, 3, 12345)))
+        );
+        assert_eq!(metadata.unwrap().scale, Some(3));
+
+        p.column_size = 10;
+        p.decimal_digits = 2;
+        let ((value, _), outcome) = decimal_from_numeric(&p, source).unwrap();
+        assert_eq!(outcome, ConvOk::Exact);
+        assert_eq!(
+            value,
+            SqlType::Decimal(Some(DecimalParts::new(true, 10, 2, 1_234_500)))
+        );
+    }
+
+    /// Off the fast path the APD metadata lands in the application's struct, so
+    /// re-executing after aligning the APD with the IPD forwards `(38, 0)` and
+    /// sends `12345`, as msodbcsql does, rather than the original `12.345`.
+    #[test]
+    fn a_numeric_off_the_fast_path_writes_apd_metadata_into_the_struct() {
+        use crate::api::odbc_types::SQL_PARAM_OUTPUT;
+
+        fn mismatched(source: &mut SqlNumericStruct, ind: &mut SqlLen) -> BoundParam {
+            *source = SqlNumericStruct {
+                precision: 5,
+                ..numeric_struct(12345, 1, 3)
+            };
+            let mut p = param(SQL_C_NUMERIC, (source as *mut SqlNumericStruct).cast(), ind);
+            p.sql_type = SQL_DECIMAL;
+            p.column_size = 10;
+            p.decimal_digits = 2;
+            p.app_precision = 38;
+            p.app_scale = 0;
+            p
+        }
+        fn align(p: &mut BoundParam) {
+            p.app_precision = 10;
+            p.app_scale = 2;
+        }
+        let size = std::mem::size_of::<SqlNumericStruct>() as SqlLen;
+        let mut source = numeric_struct(0, 1, 0);
+
+        for (ind, configure, expected) in [
+            (size, (|_| {}) as fn(&mut BoundParam), (38, 0)),
+            (SQL_NTS as SqlLen, |_| {}, (38, 0)),
+            (size, align, (5, 3)),
+            (SQL_NULL_DATA, |_| {}, (5, 3)),
+            (size, |p| p.input_output_type = SQL_PARAM_OUTPUT, (5, 3)),
+            (size, |p| p.c_type = SQL_C_BINARY, (5, 3)),
+        ] {
+            let mut ind = ind;
+            let mut p = mismatched(&mut source, &mut ind);
+            configure(&mut p);
+            unsafe { stamp_numeric_apd(&p) };
+            assert_eq!((source.precision, source.scale), expected);
+        }
+
+        let mut ind = size;
+        let mut p = mismatched(&mut source, &mut ind);
+        unsafe { stamp_numeric_apd(&p) };
+        align(&mut p);
+        let ((value, _), _) = decimal_from_numeric(&p, source).unwrap();
+        assert_eq!(
+            value,
+            SqlType::Decimal(Some(DecimalParts::new(true, 38, 0, 12345)))
         );
     }
 
@@ -3900,7 +3955,7 @@ mod tests {
         );
 
         // Zero-only overflow: padding rather than data, so it is trimmed and
-        // sent instead of refused. This is the leg parity deviation 20 cites -
+        // sent instead of refused. This is the leg parity deviation 21 cites -
         // the reject case above uses `0xFF` and cannot show it, and
         // `an_all_zero_binary_overflow_is_trimmed_silently` covers the plain
         // `varbinary`/`binary`/`image` targets rather than a variant.

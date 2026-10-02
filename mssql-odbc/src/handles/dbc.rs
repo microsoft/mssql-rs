@@ -141,7 +141,7 @@ pub(crate) struct DbcState {
     /// (`sqlcdata.h:1210-1217`, measured on Windows msodbcsql 18.6.1.1).
     /// msodbcsql consults this flag only on
     /// retrieval (`sqlcdata.h:1297,1310`); retaining our input-parameter warning
-    /// is the remaining deviation in parity-deviations entry 22 (AB#47598).
+    /// is the remaining deviation in parity-deviations entry 23 (AB#47598).
     pub(crate) warn_on_cp_error: bool,
     /// `SQL_ATTR_CONNECTION_TIMEOUT` in seconds. Stored, not yet honored.
     /// `0` is the ODBC default and means "no timeout".

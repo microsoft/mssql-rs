@@ -314,3 +314,62 @@ TEST_F(DescribeParamLiveTest, DescribedDecimalRoundTripsPrecisionAndScale) {
     EXPECT_DOUBLE_EQ(1.5, std::stod(GetColumn(1)));
     EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }
+
+// Benefits-from-mock-tds: this can only observe the outcome - SQL_ERROR, then a
+// later execute that works. A byte-level mock could assert what the outcome
+// implies but does not prove: that sp_describe_undeclared_parameters actually
+// went out. The error-token half is pinned meanwhile by
+// `a_server_error_during_describe_returns_the_connection_for_reuse` in
+// `describe_param.rs`, which drives `fail_with_tds` from a server error and
+// asserts the connection comes back unclaimed.
+TEST_F(DescribeParamLiveTest, ATempTableParameterCannotBeDescribedButStillBinds) {
+    ExecDirect("CREATE TABLE #dp_tmp (id INT, data VARBINARY(32))");
+    ASSERT_SQL_OK(Prepare("INSERT INTO #dp_tmp (id, data) VALUES (?, ?)"), SQL_HANDLE_STMT,
+                  stmt_);
+
+    // sp_describe_undeclared_parameters cannot resolve a parameter against a
+    // temp table, and both drivers surface that as SQL_ERROR rather than a
+    // guessed type. mssql-python turns this failure into its SQL_VARCHAR
+    // fallback, which is why a VARBINARY NULL needs setinputsizes (GH-627).
+    //
+    // The diagnostics are measured, not derived from the severity tier: both
+    // drivers report two records, and record 1 is the `42S02` for error 208
+    // ("Invalid object name '#dp_tmp'"), not the `42000` the compile-error
+    // record carries. Measured on both legs against msodbcsql18 18.6.2.1
+    // (`SQL_DRIVER_VER` 18.06.0002) and this driver on 2026-09-30. The pair
+    // exercises both mapping paths: 208 has an explicit
+    // `SERVER_ERROR_TO_SQL_STATE_MAP` entry, while 11501 has none and falls
+    // through to `sqlstate_for_severity(16)`.
+    for (SQLUSMALLINT ordinal = 1; ordinal <= 2; ++ordinal) {
+        ParamDescription probe;
+        EXPECT_EQ(SQL_ERROR, SQLDescribeParam(stmt_, ordinal, &probe.data_type, &probe.size,
+                                              &probe.scale, &probe.nullable))
+            << "ordinal " << ordinal;
+        EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "42S02") << "ordinal " << ordinal;
+        EXPECT_TRUE(ODBCTestUtils::HasDiagState(SQL_HANDLE_STMT, stmt_, "42000"))
+            << "ordinal " << ordinal << ": the compile-error record must survive";
+    }
+
+    // The failed describe must not poison the statement: the explicit binding
+    // that setinputsizes performs still has to execute on the same handle.
+    SQLLEN id_length = 0;
+    SQLINTEGER id = 7;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_LONG, SQL_INTEGER, 10, 0,
+                                   &id, 0, &id_length),
+                  SQL_HANDLE_STMT, stmt_);
+    SQLLEN data_length = SQL_NULL_DATA;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 2, SQL_PARAM_INPUT, SQL_C_BINARY, SQL_VARBINARY, 32,
+                                   0, nullptr, 0, &data_length),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_CLOSE), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_RESET_PARAMS), SQL_HANDLE_STMT, stmt_);
+    ExecDirect("SELECT id, data FROM #dp_tmp");
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("7", GetColumn(1));
+    SQLLEN fetched = 0;
+    GetColumn(2, &fetched);
+    EXPECT_EQ(SQL_NULL_DATA, fetched);
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+}

@@ -394,11 +394,10 @@ fn do_connect(
     // Build ClientContext. T1 wired SQL password, integrated (SSPI/GSSAPI), and
     // pre-acquired access tokens; T2 added Entra service principal (secret) and
     // managed identity; T3 adds interactive sign-in (Windows only, matching
-    // msodbcsql) — all via a token factory. Methods that still need token
-    // acquisition (AD password, device code, workload identity, default
-    // credential, AD integrated) are rejected with HYC00 until a later tier.
-    // Off Windows an interactive request is reported as AD integrated, the same
-    // method msodbcsql falls through to there.
+    // msodbcsql); T4 adds AD integrated — all via a token factory. Methods that
+    // still need token acquisition (AD password, device code, workload
+    // identity, default credential) are rejected with HYC00. Off Windows an
+    // interactive request resolves to AD integrated, as it does in msodbcsql.
     let mut context = ClientContext::default();
     configure_driver_identity(&mut context);
     // The connection string wins over a pre-connect
@@ -414,28 +413,17 @@ fn do_connect(
         context.login_timeout = Some(secs);
     }
 
-    if let Err(unsupported) = configure_auth(&mut context, resolved, &params.server) {
-        let UnsupportedAuth {
-            requested,
-            resolved,
-        } = &unsupported;
+    if let Err(UnsupportedAuth(method)) = configure_auth(&mut context, resolved, &params.server) {
         error!(
-            ?requested,
-            ?resolved,
+            ?method,
             "SQLDriverConnectW: authentication method not implemented"
         );
-        // Name the keyword the application actually supplied. Where the
-        // platform maps it to another method, say so rather than reporting a
-        // method the connection string never mentioned.
-        let message = if requested == resolved {
-            format!("Authentication method {requested:?} is not yet supported")
-        } else {
-            format!(
-                "Authentication method {requested:?} resolves to {resolved:?} on this platform, \
-                 which is not yet supported"
-            )
-        };
-        post_sql_error(state, SQLSTATE_HYC00, 0, message);
+        post_sql_error(
+            state,
+            SQLSTATE_HYC00,
+            0,
+            format!("Authentication method {method:?} is not yet supported"),
+        );
         return SQL_ERROR;
     }
 

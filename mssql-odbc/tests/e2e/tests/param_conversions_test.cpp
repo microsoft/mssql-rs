@@ -1021,6 +1021,86 @@ TEST_F(ScalarConversionLiveTest, NumericStructWithoutDescriptorFieldWritesUsesDe
     EXPECT_EQ("12", ExecuteAndReadBack());
 }
 
+// The fast path forwards the struct's own scale, so SQL Server rounds rather
+// than the driver truncating. Measured on Windows Driver 18.6.2.1: 13.
+// Benefits-from-mock-tds: capture the RPC and assert the decimal TYPE_INFO
+// carries (3, 1) and the payload 125; today only the server's rounding shows.
+TEST_F(ScalarConversionLiveTest, NumericStructOnTheDefaultFastPathIsRoundedByTheServer) {
+    SQL_NUMERIC_STRUCT value = {};
+    value.precision = 3;
+    value.scale = 1;
+    value.sign = 1;
+    std::uint64_t magnitude = 125;
+    std::memcpy(value.val, &magnitude, sizeof(magnitude));
+    std::memcpy(storage_, &value, sizeof(value));
+
+    ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(64), ?)"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_NUMERIC, SQL_DECIMAL, 38, 0,
+                                   storage_, 0, nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("13", ExecuteAndReadBack());
+}
+
+// Off the fast path the default APD scale 0 describes val[], not the struct's
+// own scale 3. Measured on Windows Driver 18.6.2.1: 12345.00.
+// Benefits-from-mock-tds: capture the RPC and assert TYPE_INFO (10, 2) with
+// payload 1234500, pinning that val[] was read at APD scale 0.
+TEST_F(ScalarConversionLiveTest, NumericStructOffTheFastPathIgnoresTheEmbeddedScale) {
+    SQL_NUMERIC_STRUCT value = {};
+    value.precision = 5;
+    value.scale = 3;
+    value.sign = 1;
+    std::uint64_t magnitude = 12345;
+    std::memcpy(value.val, &magnitude, sizeof(magnitude));
+    std::memcpy(storage_, &value, sizeof(value));
+
+    ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(64), ?)"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_NUMERIC, SQL_DECIMAL, 10, 2,
+                                   storage_, 0, nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("12345.00", ExecuteAndReadBack());
+}
+
+// Off the fast path msodbcsql writes the APD precision/scale into the
+// application's struct (sqlcfunc.cpp:3165-3176). Aligning the APD with the IPD
+// afterwards takes the fast path, which forwards the written-back (38, 0), so
+// val[] is sent as 12345 rather than the original 12.345. Measured on Windows
+// Driver 18.6.2.1: (38, 0) after the first execute, then 12345.00 again.
+// Benefits-from-mock-tds: capture both RPCs and assert TYPE_INFO (10, 2) with
+// payload 1234500 on the first, then the fast path forwarding (38, 0) with
+// payload 12345 on the second.
+TEST_F(ScalarConversionLiveTest, NumericStructOffTheFastPathReceivesTheApdMetadata) {
+    SQL_NUMERIC_STRUCT value = {};
+    value.precision = 5;
+    value.scale = 3;
+    value.sign = 1;
+    std::uint64_t magnitude = 12345;
+    std::memcpy(value.val, &magnitude, sizeof(magnitude));
+    std::memcpy(storage_, &value, sizeof(value));
+
+    ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(64), ?)"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_NUMERIC, SQL_DECIMAL, 10, 2,
+                                   storage_, 0, nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("12345.00", ExecuteAndReadBack());
+    std::memcpy(&value, storage_, sizeof(value));
+    EXPECT_EQ(38, value.precision);
+    EXPECT_EQ(0, value.scale);
+
+    SQLHDESC apd = SQL_NULL_HDESC;
+    ASSERT_SQL_OK(SQLGetStmtAttrW(stmt_, SQL_ATTR_APP_PARAM_DESC, &apd, 0, nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLSetDescFieldW(apd, 1, SQL_DESC_PRECISION,
+                                   reinterpret_cast<SQLPOINTER>(static_cast<SQLLEN>(10)), 0),
+                  SQL_HANDLE_DESC, apd);
+    ASSERT_SQL_OK(SQLSetDescFieldW(apd, 1, SQL_DESC_SCALE,
+                                   reinterpret_cast<SQLPOINTER>(static_cast<SQLLEN>(2)), 0),
+                  SQL_HANDLE_DESC, apd);
+    ASSERT_SQL_OK(SQLSetDescFieldW(apd, 1, SQL_DESC_DATA_PTR, storage_, 0), SQL_HANDLE_DESC,
+                  apd);
+    EXPECT_EQ("12345.00", ExecuteAndReadBack());
+}
+
 // A rebind (same ordinal, same statement, no intervening SQL_RESET_PARAMS)
 // must not let a bare SQLBindParameter inherit APD precision/scale left by a
 // prior, differently-shaped binding: msodbcsql's SetADRecBP resets the whole
@@ -2238,7 +2318,7 @@ TEST_F(ExtendedTypeLiveTest, BinaryParamRoundTripsThroughSqlVariant) {
 // varbinary at its non-max ceiling (`variant_column_size`, which predates
 // binary variants and already governed the character ones) and refuses at
 // execute with `22001`, saving the round trip. Both legs are asserted so the
-// reference stays measured. Registered as deviation 20 in
+// reference stays measured. Registered as deviation 21 in
 // `mssql-odbc/docs/parity-deviations.md`.
 TEST_F(ExtendedTypeLiveTest, BinaryVariantPayloadPastTheCeilingIsRefused) {
     ASSERT_SQL_OK(Prepare("SELECT CAST(? AS VARBINARY(8000))"), SQL_HANDLE_STMT, stmt_);
@@ -3032,4 +3112,112 @@ TEST_F(ExtendedTypeLiveTest, BinaryVariantRoundTripsThroughASqlVariantColumn) {
                           " FROM #variant_param"),
                   SQL_HANDLE_STMT, stmt_);
     EXPECT_EQ("102030|varbinary", ExecuteAndReadBack());
+}
+
+// Conversion-matrix cells msodbcsql performs and this driver has not
+// implemented yet. All eight were measured against msodbcsql18: every one
+// binds, and all but TIMESTAMP->TYPE_DATE also execute (that one binds and then
+// fails at execute with 22008, because dropping a non-zero time is an error,
+// not a truncation).
+//
+// msodbcsql accepts them at SQLBindParameter (`sqlcdesc.cpp:3031`), which folds
+// the 3.x concise C/SQL ids to their 2.x and *_MAPPED forms first (`:2975-2983`)
+// - so these pairings only reach `IsValidSQLConversion` under internal ids, not
+// the public ones named here. That function's switch subtracts exclusions and
+// then defers to `fValidConversion` (`sqlcprot.h:2625`), which is what actually
+// admits them: `SQL_C_BINARY`'s row is ALLCONVERSION (`sqlcmisc.cpp:495`,
+// `:588`) and the temporal C rows are DATETIMECONVERSION (`:518-526`, `:599-601`
+// for the 2.x forms, `:626-627` for the SS ones), whose bits cover every SQL
+// target below. Clearing the switch is therefore not sufficient on its own -
+// `SQL_C_GUID -> SQL_TYPE_TIME` passes it and is still refused, because
+// GUIDCONVERSION carries no SQL_TIME bit.
+//
+// This driver refuses all of them at bind with HYC00. That is the documented
+// reading of this matrix - it records what is implemented, not what is legal -
+// and AB#48249 is where the remaining cells get implemented or flipped to
+// 07006, the state msodbcsql already answers here (`IDS_07_006`,
+// `sqlcdesc.cpp:3033`). Pinning the refusal means that work has to update this
+// test deliberately rather than silently.
+//
+// Selection rule, so this is not read as exhaustive: one cell per distinct
+// bitmap row reached by a C type this driver already binds, plus the SS_TIME2
+// mirrors of the SS_TIMESTAMPOFFSET pair, which share a row and are the ones
+// most likely to drift when AB#48249 lands.
+//
+// EVIDENCE: the source reading above, plus a direct measurement of all eight
+// cells against retail msodbcsql18 18.6.2.1 (`SQL_DRIVER_VER` 18.06.0002) - the
+// build `msodbcsqlVersion` pins - on 2026-09-29, the six original cells, and
+// 2026-09-30, the two SS_TIME2 mirrors. A 3.8 application is required: the
+// Driver Manager refuses the SS-extended C types with HY003 under SQL_OV_ODBC3,
+// so a probe that declares only 3.x measures the DM, not the driver.
+// SKIP_IF_COMPARING_MSODBCSQL() means the reference leg never re-measures this
+// block, so AB#48249 should re-measure against the build it targets rather than
+// inherit a one-off observation.
+TEST_F(CrossConversionLiveTest, UnimplementedMatrixCellsAreRefusedAtBind) {
+    SKIP_IF_COMPARING_MSODBCSQL();
+
+    struct Cell {
+        const char* name;
+        SQLSMALLINT c_type;
+        SQLSMALLINT sql_type;
+        // The target's own ColumnSize/DecimalDigits, not the source buffer's, so
+        // a cell that AB#48249 flips to success does not then fail HY104 and
+        // read as a broken flip rather than a stale fixture.
+        SQLULEN size;
+        SQLSMALLINT scale;
+    };
+    const Cell cells[] = {
+        {"BINARY->SS_XML", SQL_C_BINARY, SQL_SS_XML, 0, 0},
+        {"TIMESTAMP->TYPE_TIME", SQL_C_TYPE_TIMESTAMP, SQL_TYPE_TIME, 16, 7},
+        {"TIMESTAMP->TYPE_DATE", SQL_C_TYPE_TIMESTAMP, SQL_TYPE_DATE, 10, 0},
+        {"DATE->TYPE_TIMESTAMP", SQL_C_TYPE_DATE, SQL_TYPE_TIMESTAMP, 23, 3},
+        {"TSOFFSET->TYPE_TIMESTAMP", SQL_C_SS_TIMESTAMPOFFSET, SQL_TYPE_TIMESTAMP, 23, 3},
+        {"TSOFFSET->SS_TIME2", SQL_C_SS_TIMESTAMPOFFSET, SQL_SS_TIME2, 16, 7},
+        {"SS_TIME2->TYPE_TIMESTAMP", SQL_C_SS_TIME2, SQL_TYPE_TIMESTAMP, 23, 3},
+        {"SS_TIME2->SS_TIMESTAMPOFFSET", SQL_C_SS_TIME2, SQL_SS_TIMESTAMPOFFSET, 34, 7},
+    };
+
+    SQL_TIMESTAMP_STRUCT ts = {2024, 5, 6, 7, 8, 9, 0};
+    SQL_DATE_STRUCT dt = {2024, 5, 6};
+    SQL_SS_TIMESTAMPOFFSET_STRUCT tso = {2024, 5, 6, 7, 8, 9, 0, 0, 0};
+    SQL_SS_TIME2_STRUCT t2 = {7, 8, 9, 0};
+    unsigned char xml[] = {0x3C, 0x00, 0x61, 0x00, 0x2F, 0x00, 0x3E, 0x00};
+
+    for (const Cell& cell : cells) {
+        ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
+
+        void* data = nullptr;
+        SQLLEN ind = 0;
+        switch (cell.c_type) {
+            case SQL_C_BINARY:
+                data = xml;
+                ind = sizeof(xml);
+                break;
+            case SQL_C_TYPE_TIMESTAMP:
+                data = &ts;
+                ind = sizeof(ts);
+                break;
+            case SQL_C_TYPE_DATE:
+                data = &dt;
+                ind = sizeof(dt);
+                break;
+            case SQL_C_SS_TIME2:
+                data = &t2;
+                ind = sizeof(t2);
+                break;
+            case SQL_C_SS_TIMESTAMPOFFSET:
+                data = &tso;
+                ind = sizeof(tso);
+                break;
+            default:
+                FAIL() << "no buffer wired for " << cell.name;
+        }
+
+        EXPECT_EQ(SQL_ERROR, SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, cell.c_type,
+                                              cell.sql_type, cell.size, cell.scale, data, ind,
+                                              &ind))
+            << cell.name;
+        EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HYC00") << cell.name;
+        EXPECT_SQL_OK(SQLFreeStmt(stmt_, SQL_RESET_PARAMS), SQL_HANDLE_STMT, stmt_);
+    }
 }

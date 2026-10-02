@@ -23,7 +23,7 @@ mod gssapi_context;
 mod gssapi_ffi;
 
 pub use gssapi_context::GssapiContext;
-pub use gssapi_ffi::{has_valid_credentials, is_gssapi_available};
+pub use gssapi_ffi::{default_principal_name, has_valid_credentials, is_gssapi_available};
 
 /// Checks if GSSAPI is available on this system.
 pub fn is_available() -> bool {
