@@ -8475,9 +8475,12 @@ impl TdsClient {
             self.reset_statement_walk_state();
             return Ok(());
         }
-        // Statement errors skipped under `Continue`; see below. Their info
-        // messages are not collected here: they stay in `info_messages`, which
-        // this method deliberately leaves for `take_info_messages()`.
+        // Statement errors skipped under `Continue`; see below. Only the errors
+        // are carried: every `SqlServerError` reaching this drain is built by
+        // `Error::from_sql_errors` (statement_error_keeping_batch_open,
+        // handle_row_done, the draining ERROR arm), which attaches no info
+        // messages, so there are none to drop. Server messages reach the caller
+        // through `take_info_messages()` instead.
         let mut skipped_errors: Vec<SqlErrorInfo> = Vec::new();
         // call next row to consume any remaining tokens
         let drain_result = loop {

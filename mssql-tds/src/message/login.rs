@@ -1662,7 +1662,7 @@ mod tests {
 
         for name in ["db", "a-much-longer-name.database.windows.net", "n\u{e9}"] {
             let (len, offset) = lengths(Some(name));
-            let delta = name.to_string().len_bytes() as i32 - dialled.len_bytes() as i32;
+            let delta = name.len_bytes() as i32 - dialled.len_bytes() as i32;
             assert_eq!(
                 len - base_len,
                 delta,
