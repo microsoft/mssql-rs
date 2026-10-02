@@ -5480,11 +5480,6 @@ impl TdsClient {
                         }
                     }
                     if continues {
-                        // Between results, so nothing is positioned on: drop the
-                        // previous row set's metadata, or `on_rows` would still
-                        // report it and `advance` would try to drain it again.
-                        self.current_metadata = None;
-                        self.current_result_set_has_been_read_till_end = true;
                         return Err(self.statement_error_keeping_batch_open(all_errors));
                     }
                     let drain_result = self.drain_stream().await;
@@ -8141,7 +8136,14 @@ impl TdsClient {
         self.execution_context.set_has_open_batch(true);
         self.statement_error_completion_pending = true;
         self.failed_statement_done_pending = true;
-        // The client is positioned on the failure, not on the previous row set.
+        // The client is positioned on the failure, not on the previous result:
+        // nothing from it may still describe the current position. The metadata
+        // would let `on_rows` report the old row set and `advance` drain it again;
+        // the DONEINPROC flag would let `complete_current_result` settle an RPC
+        // terminator over the failed statement's own completion tokens.
+        self.current_metadata = None;
+        self.current_result_set_has_been_read_till_end = true;
+        self.current_result_ended_with_done_in_proc = false;
         self.last_result_row_count = None;
         crate::error::Error::from_sql_errors(errors)
     }
@@ -11294,6 +11296,49 @@ mod tests {
         let mut client = create_test_client_with_tokens(tokens());
         assert!(client.execute("q".to_string(), ()).await.is_err());
         assert!(!client.is_connection_dead(), "Abort behaviour changed");
+    }
+
+    /// A statement error positions the client on the failure, so nothing from
+    /// the previous result describes it: here that result was a row set ended by
+    /// a DONEINPROC, which must not lead `complete_current_result` to settle an
+    /// RPC terminator over the failed statement's own completion tokens.
+    #[tokio::test]
+    async fn a_statement_error_clears_the_previous_results_done_in_proc_position() {
+        let mut client = create_test_client_with_tokens(vec![
+            int_col_metadata(1),
+            Tokens::DoneInProc(DoneToken {
+                status: DoneStatus::COUNT | DoneStatus::MORE,
+                cur_cmd: CurrentCommand::Select,
+                row_count: 0,
+            }),
+            Tokens::Error(error_token_with_severity(16)),
+            Tokens::Done(DoneToken {
+                status: DoneStatus::ERROR | DoneStatus::MORE,
+                cur_cmd: CurrentCommand::None,
+                row_count: 0,
+            }),
+            int_col_metadata(1),
+            done_count(CurrentCommand::Select, 0, false),
+        ]);
+
+        assert_eq!(
+            execute_continue(&mut client).await.unwrap(),
+            StatementResult::Rows
+        );
+        assert!(client.next_row().await.unwrap().is_none());
+        assert!(client.current_result_ended_with_done_in_proc);
+
+        assert!(matches!(
+            client.advance().await,
+            Err(crate::error::Error::SqlServerError { .. })
+        ));
+        assert!(client.has_open_batch());
+        assert!(!client.current_result_ended_with_done_in_proc);
+        assert!(!client.complete_current_result().await.unwrap());
+
+        assert_eq!(client.advance().await.unwrap(), StatementResult::Rows);
+        assert!(client.next_row().await.unwrap().is_none());
+        assert_eq!(client.advance().await.unwrap(), StatementResult::End);
     }
 
     /// The rule does not depend on an earlier statement error: under
