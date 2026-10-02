@@ -815,7 +815,7 @@ impl<'a, 'n, 'context> Serializer<'a, 'n, 'context> {
     fn calculate_login_record_length(&self) -> TdsResult<(i32, i32)> {
         let mut login_record_length = FIXED_LOGIN_RECORD_LENGTH as usize;
         login_record_length += self.model.user_input.len_bytes();
-        login_record_length += self.server_name.len_bytes();
+        login_record_length += self.server_name.as_ref().len_bytes();
         login_record_length += 4; // Feature extension offset size.
 
         // Add SSPI token length if present
@@ -976,7 +976,7 @@ impl<'a, 'n, 'context> Serializer<'a, 'n, 'context> {
                 LoginDeferredPayload::ServerName => {
                     debug!("Login Server name: {}", self.server_name);
                     self.payload_writer
-                        .write_string_unicode_async(&self.server_name)
+                        .write_string_unicode_async(self.server_name.as_ref())
                         .await?;
                 }
                 LoginDeferredPayload::FeatureExtOffset => {
@@ -1123,7 +1123,7 @@ impl<'a, 'n, 'context> Serializer<'a, 'n, 'context> {
     /// format (host,port) for TCP connections.
     async fn write_server_name(&mut self) -> TdsResult<()> {
         if self
-            .write_metadata(utf16_code_units(&self.server_name)?)
+            .write_metadata(utf16_code_units(self.server_name.as_ref())?)
             .await?
         {
             self.deferred_actions_indicator

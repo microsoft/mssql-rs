@@ -56,7 +56,7 @@ async fn login_server_name_on_the_wire(override_name: Option<&str>) -> String {
     seen.unwrap_or_else(|failure| panic!("{failure}"))
 }
 
-/// Logs in through the mock server on `port` and waits for the ServerName it
+/// Logs in through the mock server on `port` and returns the ServerName it
 /// recorded. Failures are returned rather than asserted, so the caller can stop
 /// the server first.
 async fn read_login_server_name(
@@ -74,35 +74,24 @@ async fn read_login_server_name(
         .await
         .map_err(|error| format!("connect failed: {error:?}"))?;
 
-    // Dropping the client lets the server's handler finish, but nothing awaits
-    // it: the store is written only when that handler exits, so poll for the
-    // record rather than assume a fixed delay outlasts it.
+    // The mock records LOGIN7 before it sends LoginAck, so once `create_client`
+    // has returned, the ServerName is already in the store.
+    let recorded = {
+        let store = store.lock().await;
+        let connections = store.all();
+        if connections.len() != 1 {
+            return Err(format!(
+                "expected one connection, got {}",
+                connections.len()
+            ));
+        }
+        connections
+            .values()
+            .next()
+            .and_then(|c| c.received_server_name.clone())
+    };
     drop(client);
-
-    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(10);
-    loop {
-        let recorded = {
-            let store = store.lock().await;
-            let connections = store.all();
-            if connections.len() > 1 {
-                return Err(format!(
-                    "expected at most one connection, got {}",
-                    connections.len()
-                ));
-            }
-            connections
-                .values()
-                .next()
-                .and_then(|c| c.received_server_name.clone())
-        };
-        if let Some(name) = recorded {
-            return Ok(name);
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Err("server never recorded a ServerName from LOGIN7".to_string());
-        }
-        tokio::time::sleep(tokio::time::Duration::from_millis(25)).await;
-    }
+    recorded.ok_or_else(|| "server recorded no ServerName from LOGIN7".to_string())
 }
 
 #[tokio::test]

@@ -83,6 +83,52 @@ const MAX_ERROR_TEXT_BYTES_PER_FAILED_STATEMENT: usize = 8 * 1024 * 1024;
 /// statement that also sends many messages is not rejected.
 const MAX_TOKENS_AFTER_STATEMENT_ERROR: u32 = 100_000;
 
+/// Statement errors skipped by a [`TdsClient::close_query`] drain under
+/// [`BatchErrorMode::Continue`]. A batch can hold any number of failing
+/// statements, so the errors kept for the caller are bounded like one failed
+/// statement's: the first ones that fit both [`MAX_ERRORS_PER_FAILED_STATEMENT`]
+/// and [`MAX_ERROR_TEXT_BYTES_PER_FAILED_STATEMENT`]. The rest are only counted,
+/// and the drain goes on, because it must reach the end of the batch to leave
+/// the connection usable.
+#[derive(Default)]
+struct SkippedErrors {
+    errors: Vec<SqlErrorInfo>,
+    bytes: usize,
+    dropped: usize,
+}
+
+impl SkippedErrors {
+    fn keep(&mut self, errors: Vec<SqlErrorInfo>) {
+        for error in errors {
+            let bytes = TdsClient::error_text_bytes(&error);
+            // Once one is dropped, so is every later one: the caller gets a
+            // prefix of the batch's errors, never a gap in the middle.
+            if self.dropped == 0
+                && self.errors.len() < MAX_ERRORS_PER_FAILED_STATEMENT
+                && self.bytes + bytes <= MAX_ERROR_TEXT_BYTES_PER_FAILED_STATEMENT
+            {
+                self.bytes += bytes;
+                self.errors.push(error);
+            } else {
+                self.dropped += 1;
+            }
+        }
+    }
+
+    /// The kept errors as one [`SqlServerError`](crate::error::Error::SqlServerError).
+    /// Errors past the bounds cannot be returned, so their loss is logged.
+    fn into_error(self) -> crate::error::Error {
+        if self.dropped > 0 {
+            warn!(
+                kept = self.errors.len(),
+                dropped = self.dropped,
+                "close_query returns only the first statement errors skipped during its drain"
+            );
+        }
+        crate::error::Error::from_sql_errors(self.errors)
+    }
+}
+
 /// Budget for withdrawing a request, independent of the request's own timeout.
 ///
 /// `remaining_request_timeout` is `None` whenever `SQL_ATTR_QUERY_TIMEOUT` is 0,
@@ -8501,6 +8547,8 @@ impl TdsClient {
     /// does not stop the drain: the rest of the batch is still consumed, and the
     /// errors that were skipped are returned together as one
     /// [`SqlServerError`](crate::error::Error::SqlServerError) once it is done.
+    /// Like one failed statement's errors, at most 1,000 of them and 8 MiB of
+    /// their text are kept; any past that are logged as dropped.
     ///
     /// If the drain itself fails, the client state is reset regardless and the
     /// connection is retired: a drain that stops partway leaves the reader at an
@@ -8523,7 +8571,7 @@ impl TdsClient {
         // handle_row_done, the draining ERROR arm), which attaches no info
         // messages, so there are none to drop. Server messages reach the caller
         // through `take_info_messages()` instead.
-        let mut skipped_errors: Vec<SqlErrorInfo> = Vec::new();
+        let mut skipped = SkippedErrors::default();
         // call next row to consume any remaining tokens
         let drain_result = loop {
             match self.advance_to_rows().await {
@@ -8535,26 +8583,26 @@ impl TdsClient {
                 Err(crate::error::Error::SqlServerError { diagnostics })
                     if self.has_open_batch() =>
                 {
-                    skipped_errors.extend(diagnostics.errors);
+                    skipped.keep(diagnostics.errors);
                 }
                 Err(error) => break Err(error),
             }
         };
         let drain_result = match drain_result {
-            Ok(()) if skipped_errors.is_empty() => Ok(()),
-            Ok(()) => Err(crate::error::Error::from_sql_errors(skipped_errors)),
+            Ok(()) if skipped.errors.is_empty() => Ok(()),
+            Ok(()) => Err(skipped.into_error()),
             Err(crate::error::Error::SqlServerError { diagnostics }) => {
-                skipped_errors.extend(diagnostics.errors);
-                Err(crate::error::Error::from_sql_errors(skipped_errors))
+                skipped.keep(diagnostics.errors);
+                Err(skipped.into_error())
             }
             Err(error) => {
                 // The failure that stopped the drain is returned, because it
                 // decides whether the connection is retired. The statement errors
                 // skipped before it cannot ride on that error type, so at least
                 // make their loss visible.
-                if !skipped_errors.is_empty() {
+                if !skipped.errors.is_empty() {
                     warn!(
-                        count = skipped_errors.len(),
+                        count = skipped.errors.len() + skipped.dropped,
                         "Discarding statement errors skipped during the close_query drain"
                     );
                 }
@@ -12027,6 +12075,111 @@ mod tests {
             !client.is_connection_dead(),
             "a statement error is not a reason to retire the connection"
         );
+    }
+
+    /// A batch of failing statements built for `close_query` to drain: one
+    /// failure that `execute` returns, then `skipped` more, each with its own
+    /// error number from 1 and a message of `units` characters.
+    fn batch_of_failing_statements(skipped: u32, units: usize) -> Vec<Tokens> {
+        let mut tokens = Vec::new();
+        for number in 0..=skipped {
+            tokens.push(Tokens::Error(crate::token::tokens::ErrorToken {
+                number,
+                ..error_token_with_message_units(units)
+            }));
+            tokens.push(Tokens::Done(DoneToken {
+                status: if number == skipped {
+                    DoneStatus::ERROR
+                } else {
+                    DoneStatus::ERROR | DoneStatus::MORE
+                },
+                cur_cmd: CurrentCommand::Select,
+                row_count: 0,
+            }));
+        }
+        tokens
+    }
+
+    async fn close_query_after_a_failing_first_statement(
+        tokens: Vec<Tokens>,
+    ) -> (TdsClient, Vec<u32>) {
+        let mut client = create_test_client_with_tokens(tokens);
+        assert!(
+            client
+                .execute(
+                    "q".to_string(),
+                    ExecuteOptions::new().on_error(BatchErrorMode::Continue),
+                )
+                .await
+                .is_err()
+        );
+        let numbers = match client.close_query().await {
+            Err(crate::error::Error::SqlServerError { diagnostics }) => {
+                diagnostics.errors.iter().map(|e| e.number).collect()
+            }
+            other => panic!("expected the skipped errors, got {other:?}"),
+        };
+        (client, numbers)
+    }
+
+    /// A batch can hold any number of failing statements, so the errors a
+    /// drain keeps are bounded: the first ones, up to the per-statement count.
+    /// The drain itself still reaches the end, so the connection stays usable.
+    #[tokio::test]
+    async fn close_query_keeps_at_most_the_error_bound_from_a_long_batch() {
+        let skipped = MAX_ERRORS_PER_FAILED_STATEMENT as u32 + 5;
+        let (client, numbers) =
+            close_query_after_a_failing_first_statement(batch_of_failing_statements(skipped, 10))
+                .await;
+
+        let expected: Vec<u32> = (1..=MAX_ERRORS_PER_FAILED_STATEMENT as u32).collect();
+        assert_eq!(numbers, expected, "the first errors, in order");
+        assert!(!client.has_open_batch(), "the drain reached the end");
+        assert!(!client.is_connection_dead());
+    }
+
+    /// And by their text: long messages stop being kept at the text bound,
+    /// well before the count is reached.
+    #[tokio::test]
+    async fn close_query_keeps_at_most_the_error_text_bound_from_a_long_batch() {
+        let skipped =
+            (MAX_ERROR_TEXT_BYTES_PER_FAILED_STATEMENT / LONG_ERROR_MESSAGE_UNITS) as u32 + 5;
+        let (client, numbers) = close_query_after_a_failing_first_statement(
+            batch_of_failing_statements(skipped, LONG_ERROR_MESSAGE_UNITS),
+        )
+        .await;
+
+        let per_error = LONG_ERROR_MESSAGE_UNITS + "test-server".len();
+        let fit = (MAX_ERROR_TEXT_BYTES_PER_FAILED_STATEMENT / per_error) as u32;
+        assert!(fit < skipped);
+        let expected: Vec<u32> = (1..=fit).collect();
+        assert_eq!(numbers, expected, "the first errors that fit, in order");
+        assert!(!client.has_open_batch(), "the drain reached the end");
+        assert!(!client.is_connection_dead());
+    }
+
+    /// Once an error is dropped, so is every later one, even one small enough
+    /// to fit: the caller gets a prefix of the errors, never a gap.
+    #[test]
+    fn skipped_errors_keep_a_prefix() {
+        let error = |message: String| SqlErrorInfo {
+            message,
+            state: 1,
+            class: 16,
+            number: 1,
+            server_name: None,
+            proc_name: None,
+            line_number: None,
+        };
+        let mut skipped = SkippedErrors::default();
+        skipped.keep(vec![
+            error("x".repeat(MAX_ERROR_TEXT_BYTES_PER_FAILED_STATEMENT - 1)),
+            error("too long to fit".to_string()),
+            error(String::new()),
+        ]);
+
+        assert_eq!(skipped.errors.len(), 1);
+        assert_eq!(skipped.dropped, 2);
     }
 
     /// A RESETCONNECTION acknowledgement arriving in a `Continue` batch's
