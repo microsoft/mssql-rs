@@ -124,16 +124,20 @@ fn release_policy(process_is_shutting_down: bool) -> ReleasePolicy {
 fn release(runtime: Runtime, policy: ReleasePolicy) {
     match policy {
         // Joining blocks until the runtime's worker and blocking-pool threads
-        // exit, so a hang in SQLFreeHandle(ENV) stops here; leaking is
-        // deliberate but means runtime threads outlive the handle.
+        // exit, so a hang in SQLFreeHandle(ENV) stops here. Tracing is safe on
+        // this arm: the process is alive by construction.
         ReleasePolicy::Join => {
             debug!("SharedRuntime: joining runtime threads");
             drop(runtime)
         }
-        ReleasePolicy::Leak => {
-            debug!("SharedRuntime: leaking runtime during process shutdown");
-            std::mem::forget(runtime)
-        }
+        // Deliberately silent, and it must stay that way. This arm runs once
+        // the loader has terminated every thread but this one, and emitting an
+        // event enters the subscriber synchronously — taking the stderr handle
+        // or a layer's lock that a thread killed mid-instruction may still
+        // hold. That is the AB#47510 hang this policy exists to avoid, so the
+        // "nothing may be signalled or waited on" rule above covers tracing as
+        // much as it covers the scheduler.
+        ReleasePolicy::Leak => std::mem::forget(runtime),
     }
 }
 
@@ -435,5 +439,66 @@ mod tests {
             "Leak must not touch the scheduler; a released runtime stops polling, \
              which is exactly the teardown AB#47510 hangs on"
         );
+    }
+
+    /// Records whether any event reached the subscriber.
+    struct EventSpy(Arc<AtomicBool>);
+
+    impl tracing::Subscriber for EventSpy {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+            Some(tracing::level_filters::LevelFilter::TRACE)
+        }
+
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+        fn event(&self, _: &tracing::Event<'_>) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+
+        fn enter(&self, _: &tracing::span::Id) {}
+
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// The companion guard to the one above, for the other thing `Leak`
+    /// must not touch. `scheduler_still_runs_tasks` only proves the runtime
+    /// was left alone; emitting a trace event is just as forbidden here,
+    /// because dispatching one enters the subscriber synchronously and can
+    /// block on a lock held by a thread the loader already terminated —
+    /// AB#47510 again, by a different route.
+    #[test]
+    fn the_leak_policy_does_not_enter_the_trace_subscriber() {
+        let entered = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&entered);
+        let runtime = new_runtime().expect("failed to build runtime for test");
+
+        tracing::subscriber::with_default(EventSpy(observed), || {
+            release(runtime, ReleasePolicy::Leak);
+
+            assert!(
+                !entered.load(Ordering::SeqCst),
+                "the shutdown leak policy must not emit a trace event: dispatching \
+                 one takes locks that a force-terminated thread may still hold"
+            );
+
+            // Positive control. Without it the assertion above would also hold
+            // for a spy that never fires at all, making this test vacuous.
+            debug!("control event");
+            assert!(
+                entered.load(Ordering::SeqCst),
+                "the spy observed no event even when one was emitted, so the \
+                 assertion above proves nothing"
+            );
+        });
     }
 }
