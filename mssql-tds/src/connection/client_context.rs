@@ -25,7 +25,7 @@ pub enum IPAddressPreference {
 /// Sent in the PRELOGIN `VERSION` option and in Login7 `client_prog_ver`.
 ///
 /// Encoding:
-/// - Login7 `client_prog_ver`: 4 bytes, `[major][minor][build (16 bits)]` as an i32.
+/// - Login7 `client_prog_ver`: `(major << 24) | (minor << 16) | build`, written as a little-endian i32.
 /// - PRELOGIN `VERSION`: 6 bytes, `[major][minor][build BE (16 bits)][sub-build = 0 (16 bits)]`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DriverVersion {

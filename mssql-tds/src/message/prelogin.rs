@@ -316,11 +316,18 @@ impl<'a, 'n> Serializer<'a, 'n> {
     }
 
     async fn write_version(&mut self) -> TdsResult<()> {
-        let v = self.model.driver_version;
-        let [build_hi, build_lo] = v.build.to_be_bytes();
+        let driver_version = self.model.driver_version;
+        let [build_hi, build_lo] = driver_version.build.to_be_bytes();
         // Sub-build is always 0.
         self.payload_writer
-            .write_async(&[v.major, v.minor, build_hi, build_lo, 0, 0])
+            .write_async(&[
+                driver_version.major,
+                driver_version.minor,
+                build_hi,
+                build_lo,
+                0,
+                0,
+            ])
             .await
     }
 
