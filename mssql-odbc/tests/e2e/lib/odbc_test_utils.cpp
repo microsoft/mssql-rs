@@ -81,6 +81,16 @@ std::string ConvertNativeTestText(const std::string& utf8, const std::string& en
             }
             break;
         }
+        if (errno == E2BIG) {
+            const size_t written = static_cast<size_t>(output - result.data());
+            if (result.size() > result.max_size() / 2) {
+                throw std::length_error("native test conversion output exceeds buffer limit");
+            }
+            result.resize(result.size() * 2);
+            output = result.data() + written;
+            outputLeft = result.size() - written;
+            continue;
+        }
         if (errno != EILSEQ || !allowReplacement) {
             throw std::runtime_error("iconv native test conversion failed: " +
                                      std::to_string(errno));
@@ -102,12 +112,25 @@ std::string ConvertNativeTestText(const std::string& utf8, const std::string& en
             *usedDefault = true;
         }
     }
-    const size_t flushed = iconv(converter.value, nullptr, nullptr, &output, &outputLeft);
-    if (flushed == static_cast<size_t>(-1)) {
-        throw std::runtime_error("iconv native test flush failed: " + std::to_string(errno));
-    }
-    if (usedDefault != nullptr && flushed != 0) {
-        *usedDefault = true;
+    while (true) {
+        const size_t flushed = iconv(converter.value, nullptr, nullptr, &output, &outputLeft);
+        if (flushed != static_cast<size_t>(-1)) {
+            if (usedDefault != nullptr && flushed != 0) {
+                *usedDefault = true;
+            }
+            break;
+        }
+        if (errno != E2BIG) {
+            throw std::runtime_error("iconv native test flush failed: " +
+                                     std::to_string(errno));
+        }
+        const size_t written = static_cast<size_t>(output - result.data());
+        if (result.size() > result.max_size() / 2) {
+            throw std::length_error("native test conversion output exceeds buffer limit");
+        }
+        result.resize(result.size() * 2);
+        output = result.data() + written;
+        outputLeft = result.size() - written;
     }
     result.resize(result.size() - outputLeft);
     return result;

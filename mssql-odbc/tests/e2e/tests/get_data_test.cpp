@@ -21,10 +21,6 @@
 #include <tuple>
 #include <vector>
 
-#ifndef SQL_COPT_SS_WARN_ON_CP_ERROR
-#define SQL_COPT_SS_WARN_ON_CP_ERROR 1243
-#endif
-
 namespace {
 
 // Builds `token` repeated `count` times.

@@ -3305,9 +3305,9 @@ mod tests {
             (
                 EncodingType::Utf16,
                 PlpEncoding::Utf16Text,
-                vec![0x3d, 0xd8, 0x00, 0xde],
+                vec![0x40, 0xd8, 0x00, 0xdc],
                 54936,
-                &b"\x94\x39\xfc\x36"[..],
+                &b"\x95\x32\x82\x36"[..],
                 false,
             ),
             (

@@ -75,6 +75,25 @@ mod tests {
     }
 
     #[test]
+    fn client_byte_offsets_round_up_to_source_character_boundaries() {
+        let encoding = ClientEncoding::for_code_page(932).unwrap();
+        let text = "AあB";
+        for (offset, expected) in [
+            (0, 0),
+            (1, 1),
+            (2, "Aあ".len()),
+            (3, "Aあ".len()),
+            (4, text.len()),
+            (usize::MAX, text.len()),
+        ] {
+            assert_eq!(
+                encoding.utf8_offset_for_client_bytes(text, offset).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
     fn cp1252_round_trip_and_single_byte_boundaries() {
         let encoding = ClientEncoding::for_code_page(1252).unwrap();
         let text = "é €\0Z";
@@ -213,6 +232,29 @@ impl ClientEncoding {
                 });
         }
         platform::decode(self, bytes).map(Cow::Owned)
+    }
+
+    /// Returns the source UTF-8 offset after the client-encoded byte offset.
+    /// An offset inside a multibyte character consumes that whole character;
+    /// decoding a byte suffix at that position would fail or corrupt the carry.
+    pub(crate) fn utf8_offset_for_client_bytes(
+        self,
+        text: &str,
+        byte_offset: usize,
+    ) -> Result<usize, DiagMsg> {
+        if byte_offset == 0 {
+            return Ok(0);
+        }
+        let mut encoded_bytes = 0_usize;
+        for (source_offset, character) in text.char_indices() {
+            let mut utf8 = [0; 4];
+            let encoded = self.encode(character.encode_utf8(&mut utf8))?;
+            encoded_bytes = encoded_bytes.saturating_add(encoded.bytes.len());
+            if encoded_bytes >= byte_offset {
+                return Ok(source_offset + character.len_utf8());
+            }
+        }
+        Ok(text.len())
     }
 
     /// Bound-column truncation only. Resumable SQLGetData byte offsets need not
@@ -658,9 +700,9 @@ mod platform {
         #[test]
         fn gb18030_preserves_four_byte_character_boundaries() {
             let encoding = for_code_page(54936).unwrap();
-            let encoded = encoding.encode("A😀B").unwrap();
+            let encoded = encoding.encode("A𠀀B").unwrap();
             assert_eq!(encoded.bytes.len(), 6);
-            assert_eq!(encoding.decode(&encoded.bytes).unwrap(), "A😀B");
+            assert_eq!(encoding.decode(&encoded.bytes).unwrap(), "A𠀀B");
             for capacity in 1..5 {
                 assert_eq!(encoding.prefix_len(&encoded.bytes, capacity).unwrap(), 1);
             }

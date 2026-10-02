@@ -29,16 +29,30 @@
 #include <string>
 #include <vector>
 
-#ifndef SQL_COPT_SS_WARN_ON_CP_ERROR
-#define SQL_COPT_SS_WARN_ON_CP_ERROR 1243
-#endif
-
 namespace {
 std::string RepeatedPrefix(const std::string& character, size_t capacity) {
     std::string result;
     if (character.empty()) return result;
     while (character.size() <= capacity - result.size()) result += character;
     return result;
+}
+
+std::string RepeatedBytePrefix(const std::string& character, size_t capacity) {
+    std::string result;
+    if (character.empty()) return result;
+    result.reserve(capacity);
+    while (result.size() < capacity) {
+        result.append(character, 0, std::min(character.size(), capacity - result.size()));
+    }
+    return result;
+}
+
+std::string ExpectedBoundClientPrefix(const std::string& character, size_t capacity) {
+    const char* target = std::getenv("ODBC_TEST_TARGET");
+    if (target && std::string(target) == "msodbcsql") {
+        return RepeatedBytePrefix(character, capacity);
+    }
+    return RepeatedPrefix(character, capacity);
 }
 }
 
@@ -1782,8 +1796,8 @@ TEST_F(FetchScrollLiveTest, ABoundNvarcharMaxTranscodesNonAscii) {
     SQLCloseCursor(stmt_);
 }
 
-// The prefix contains only complete client characters; under UTF-8 a 32-byte
-// buffer holds 15 e-acute characters, while CP1252 holds 31.
+// This driver keeps complete client characters, while msodbcsql truncates at
+// the output byte capacity even when that splits a multibyte character.
 TEST_F(FetchScrollLiveTest, ABoundNvarcharMaxTruncatesOnACharacterBoundary) {
     ExecDirect("SELECT REPLICATE(CAST(NCHAR(233) AS NVARCHAR(MAX)), 5000) AS c1");
 
@@ -1794,7 +1808,8 @@ TEST_F(FetchScrollLiveTest, ABoundNvarcharMaxTruncatesOnACharacterBoundary) {
     EXPECT_EQ(SQL_SUCCESS_WITH_INFO, SQLFetch(stmt_));
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01004");
 
-    EXPECT_EQ(RepeatedPrefix(ODBCTestUtils::Utf8ToNativeClient("\xC3\xA9"), sizeof(buf) - 1),
+    EXPECT_EQ(ExpectedBoundClientPrefix(ODBCTestUtils::Utf8ToNativeClient("\xC3\xA9"),
+                                        sizeof(buf) - 1),
               reinterpret_cast<const char*>(buf));
     SQLFreeStmt(stmt_, SQL_UNBIND);
     SQLCloseCursor(stmt_);
@@ -1815,7 +1830,8 @@ TEST_F(FetchScrollLiveTest, ABoundJsonTruncatesOnACharacterBoundary) {
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01004");
 
     const auto prefix = ODBCTestUtils::Utf8ToNativeClient("[\"");
-    EXPECT_EQ(prefix + RepeatedPrefix(ODBCTestUtils::Utf8ToNativeClient("\xC3\xA9"), sizeof(buf) - 1 - prefix.size()),
+    EXPECT_EQ(prefix + ExpectedBoundClientPrefix(ODBCTestUtils::Utf8ToNativeClient("\xC3\xA9"),
+                                                 sizeof(buf) - 1 - prefix.size()),
               reinterpret_cast<const char*>(buf));
     SQLFreeStmt(stmt_, SQL_UNBIND);
     SQLCloseCursor(stmt_);

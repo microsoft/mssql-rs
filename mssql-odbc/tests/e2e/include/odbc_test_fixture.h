@@ -20,6 +20,10 @@
 #define SQL_OV_ODBC3_80 380UL
 #endif
 
+#ifndef SQL_COPT_SS_WARN_ON_CP_ERROR
+#define SQL_COPT_SS_WARN_ON_CP_ERROR 1243
+#endif
+
 #include <string>
 #include <vector>
 #include <chrono>

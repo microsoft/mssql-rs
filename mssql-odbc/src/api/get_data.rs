@@ -555,7 +555,21 @@ fn sql_get_data_safe(
 
 fn can_copy_narrow_value(output: TextOutput, value: &ColumnValues) -> bool {
     output.encoding.is_utf8()
-        || matches!(value, ColumnValues::String(value) if output.can_copy_utf8(&value.bytes))
+        || matches!(
+            value,
+            ColumnValues::String(value)
+                if output.can_copy_utf8(&value.bytes)
+                    || (output.encoding.is_ascii_compatible()
+                        && matches!(value.encoding_type(), EncodingType::Utf16)
+                        && is_utf16_ascii(&value.bytes))
+        )
+}
+
+fn is_utf16_ascii(bytes: &[u8]) -> bool {
+    bytes.len().is_multiple_of(2)
+        && bytes
+            .chunks_exact(2)
+            .all(|unit| unit[0].is_ascii() && unit[1] == 0)
 }
 
 /// Delivers a buffered string straight into the application buffer when the
@@ -604,10 +618,7 @@ unsafe fn try_write_complete_buffered_string(
 
     let utf16_ascii = target_type == SQL_C_CHAR
         && matches!(value.encoding_type(), EncodingType::Utf16)
-        && bytes.len().is_multiple_of(2)
-        && bytes
-            .chunks_exact(2)
-            .all(|unit| unit[1] == 0 && unit[0].is_ascii());
+        && is_utf16_ascii(bytes);
     let utf16_ascii_len = bytes.len() / 2;
     if utf16_ascii && (buffer_length as usize) > utf16_ascii_len {
         // SAFETY: same caller contract; `buffer_length > utf16_ascii_len` leaves
@@ -1159,14 +1170,11 @@ fn normalize_captured_plp_suffix(
         if previous_target == SQL_C_CHAR && !state.text_output.encoding.is_utf8() {
             let text =
                 std::str::from_utf8(&value.bytes).map_err(|_| ERR_INVALID_CHARACTER_VALUE)?;
-            let encoded = state.text_output.encoding.encode(text)?;
-            let suffix = &encoded.bytes[byte_offset.min(encoded.bytes.len())..];
-            value.bytes = state
+            let source_offset = state
                 .text_output
                 .encoding
-                .decode(suffix)?
-                .into_owned()
-                .into_bytes();
+                .utf8_offset_for_client_bytes(text, byte_offset)?;
+            value.bytes.drain(..source_offset);
         } else {
             value.bytes.drain(..byte_offset.min(value.bytes.len()));
         }
@@ -9022,6 +9030,61 @@ mod tests {
         );
         assert_eq!(narrow, [b'x', 0x80, 0]);
         assert_eq!(indicator, 4);
+        let mut wide = [0xcccc_u16; 3];
+        assert_eq!(
+            unsafe {
+                sql_get_data(
+                    h.stmt,
+                    1,
+                    SQL_C_WCHAR,
+                    wide.as_mut_ptr().cast(),
+                    6,
+                    &mut indicator,
+                )
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!(wide, [u16::from(b'4'), u16::from(b'2'), 0]);
+        assert_eq!(indicator, 4);
+    }
+
+    #[test]
+    fn client_dbcs_byte_offset_switches_to_the_next_whole_character() {
+        let h = TestHandles::with_env_dbc_stmt();
+        client_code_page(&h, 932, false);
+        prefetched_text_stream(&h, PlpEncoding::Utf16Text, None, utf16le("xあ42"), None);
+        let mut integer = -1_i32;
+        let mut indicator = -99;
+        assert_eq!(
+            unsafe {
+                sql_get_data(
+                    h.stmt,
+                    1,
+                    SQL_C_SLONG,
+                    (&mut integer as *mut i32).cast(),
+                    4,
+                    &mut indicator,
+                )
+            },
+            SQL_ERROR
+        );
+        let mut narrow = [0xcc; 3];
+        assert_eq!(
+            unsafe {
+                sql_get_data(
+                    h.stmt,
+                    1,
+                    SQL_C_CHAR,
+                    narrow.as_mut_ptr().cast(),
+                    3,
+                    &mut indicator,
+                )
+            },
+            SQL_SUCCESS_WITH_INFO
+        );
+        assert_eq!(narrow, [b'x', 0x82, 0]);
+        assert_eq!(indicator, 5);
+
         let mut wide = [0xcccc_u16; 3];
         assert_eq!(
             unsafe {
