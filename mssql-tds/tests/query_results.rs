@@ -1107,6 +1107,56 @@ mod query_result_reads {
         }
     }
 
+    /// Row counts around a failing statement inside a procedure. Each count
+    /// arrives on its own DONEINPROC and is reported once; the procedure's
+    /// DONEPROC carries no count (live captures show it as MORE only, with or
+    /// without the error), so nothing is reported twice or hidden.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn continue_reports_each_count_once_around_a_failing_procedure_statement() {
+        let conversion =
+            "Conversion failed when converting the varchar value 'x' to data type int.";
+        let cases: Vec<(&str, &str, Vec<Step>)> = vec![
+            (
+                "CREATE PROCEDURE #err_then_insert AS BEGIN RAISERROR('x', 16, 1); \
+                 CREATE TABLE #t1 (i int); INSERT #t1 VALUES (1),(2); END",
+                "EXEC #err_then_insert; SELECT 5 AS e;",
+                vec![
+                    Step::Error(vec!["x".to_string()]),
+                    Step::Count(Some(2)),
+                    Step::Rows(vec![5], Some(1)),
+                ],
+            ),
+            (
+                "CREATE PROCEDURE #insert_then_err AS BEGIN CREATE TABLE #t2 (i int); \
+                 INSERT #t2 VALUES (1),(2); RAISERROR('x', 16, 1); END",
+                "EXEC #insert_then_err; SELECT 5 AS e;",
+                vec![
+                    Step::Count(Some(2)),
+                    Step::Error(vec!["x".to_string()]),
+                    Step::Rows(vec![5], Some(1)),
+                ],
+            ),
+            // A batch-aborting error after a count: the count stays, the batch ends.
+            (
+                "CREATE PROCEDURE #insert_then_abort AS BEGIN CREATE TABLE #t3 (i int); \
+                 INSERT #t3 VALUES (1); UPDATE #t3 SET i = CONVERT(int, 'x'); END",
+                "EXEC #insert_then_abort; SELECT 5 AS e;",
+                vec![
+                    Step::Count(Some(1)),
+                    Step::Error(vec![conversion.to_string()]),
+                ],
+            ),
+        ];
+
+        for (ddl, sql, expected) in cases {
+            let mut connection = begin_connection(&build_tcp_datasource()).await;
+            run_ddl(&mut connection, ddl).await;
+            let steps = walk(&mut connection, sql, BatchErrorMode::Continue).await;
+            assert_eq!(steps, expected, "{sql}");
+            assert_still_usable(&mut connection).await;
+        }
+    }
+
     /// `close_query` under `Continue` drains past errors instead of stopping at
     /// the first one, which would leave unread tokens behind; the errors it
     /// skipped are returned.
