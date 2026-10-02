@@ -60,6 +60,24 @@ SqlTString ConnStrWith(const std::string& extra) {
     return ODBCTestUtils::ToSqlTStr(base + extra);
 }
 
+// Runs |sql| on |stmt| and returns its single character value, so a test can
+// compare an information type against what the server itself reports.
+std::string QueryScalarString(SQLHSTMT stmt, const std::string& sql) {
+    SqlTString wide = ODBCTestUtils::ToSqlTStr(sql);
+    EXPECT_TRUE(SQL_SUCCEEDED(
+        SQLExecDirect(stmt, const_cast<SQLTCHAR*>(wide.c_str()), SQL_NTS)))
+        << "failed to run: " << sql;
+    EXPECT_EQ(SQL_SUCCESS, SQLFetch(stmt));
+
+    SQLTCHAR buf[1024] = {};
+    SQLLEN ind = -1;
+    EXPECT_TRUE(SQL_SUCCEEDED(
+        SQLGetData(stmt, 1, SQL_C_TCHAR, buf, sizeof(buf), &ind)));
+    SQLFreeStmt(stmt, SQL_CLOSE);
+    if (ind == SQL_NULL_DATA) return {};
+    return ODBCTestUtils::ToNarrow(SqlTString(buf));
+}
+
 }  // namespace
 
 class GetInfoLiveTest : public ODBCTest {
@@ -104,29 +122,115 @@ TEST_F(GetInfoLiveTest, ServerNameIsReportedAndStable) {
     EXPECT_EQ(len, len2);
 }
 
-// SQL_USER_NAME must be answerable; the value differs by design (see below).
+// SQL_USER_NAME is the database principal — USER_NAME() — not the login the
+// connection authenticated as. The two differ for contained users, for schemas
+// owned via AUTHORIZATION, and for every integrated or Entra login, where the
+// connection string carries no UID at all.
 TEST_F(GetInfoLiveTest, UserNameIsReported) {
     SQLRETURN rc = SQL_ERROR;
     SQLSMALLINT len = -1;
     std::string userName = GetInfoString(dbc_, SQL_USER_NAME, &rc, &len);
     ASSERT_TRUE(SQL_SUCCEEDED(rc));
     EXPECT_EQ(static_cast<SQLSMALLINT>(userName.size() * sizeof(SQLTCHAR)), len);
+    EXPECT_FALSE(userName.empty())
+        << "a connected session always maps to a database principal";
 
-    // DIVERGENCE: msodbcsql18 reports USER_NAME() (the database user, e.g.
-    // "dbo"). It fetches that lazily on the first SQLGetInfo(SQL_USER_NAME)
-    // after login, riding along on the batch that refreshes its alias-type
-    // cache (`sqlcstr.cpp` g_szSqlUdtQuery, driven by CONN_ST_REFRESH_UDT).
-    // mssql-odbc has no such cache and no facility for issuing an internal
-    // query mid-session, so it reports the login instead. Both are non-empty
-    // for SQL authentication; integrated and token authentication legitimately
-    // yield an empty string.
-    //
-    // ODBC_TEST_CONNSTR ignores ODBC_TEST_UID, so a stale UID in the environment
-    // says nothing about how the connection actually authenticated.
-    const ODBCTestConfig& cfg = ODBCTestConfig::Instance();
-    if (!cfg.HasConnStr() && cfg.HasCredentials()) {
-        EXPECT_FALSE(userName.empty());
-    }
+    EXPECT_EQ(QueryScalarString(stmt_, "SELECT USER_NAME()"), userName);
+
+    // Cached on the connection, so repeated reads must not drift.
+    SQLSMALLINT len2 = -1;
+    EXPECT_EQ(userName, GetInfoString(dbc_, SQL_USER_NAME, &rc, &len2));
+    EXPECT_TRUE(SQL_SUCCEEDED(rc));
+    EXPECT_EQ(len, len2);
+}
+
+// The value is database-scoped, so switching catalogs through the attribute
+// must re-resolve it rather than keep reporting the old database's principal.
+TEST_F(GetInfoLiveTest, UserNameFollowsTheCurrentCatalog) {
+    SQLRETURN rc = SQL_ERROR;
+    ASSERT_FALSE(GetInfoString(dbc_, SQL_USER_NAME, &rc, nullptr).empty());
+    ASSERT_TRUE(SQL_SUCCEEDED(rc));
+
+    SqlTString tempdb = ODBCTestUtils::ToSqlTStr("tempdb");
+    ASSERT_TRUE(SQL_SUCCEEDED(SQLSetConnectAttr(
+        dbc_, SQL_ATTR_CURRENT_CATALOG, const_cast<SQLTCHAR*>(tempdb.c_str()),
+        SQL_NTS)))
+        << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_DBC, dbc_);
+
+    std::string afterSwitch = GetInfoString(dbc_, SQL_USER_NAME, &rc, nullptr);
+    EXPECT_TRUE(SQL_SUCCEEDED(rc));
+    EXPECT_EQ(QueryScalarString(stmt_, "SELECT USER_NAME()"), afterSwitch);
+}
+
+// The same invalidation has to hold for a USE the driver did not issue: the
+// server reports it with an ENVCHANGE, which is exactly what msodbcsql keys its
+// own refresh on (sqlctokn.cpp ENV_DATABASE -> CONN_ST_REFRESH_UDT).
+TEST_F(GetInfoLiveTest, UserNameFollowsARawUseStatement) {
+    SQLRETURN rc = SQL_ERROR;
+    ASSERT_FALSE(GetInfoString(dbc_, SQL_USER_NAME, &rc, nullptr).empty());
+    ASSERT_TRUE(SQL_SUCCEEDED(rc));
+
+    ExecDirect("USE tempdb");
+    SQLFreeStmt(stmt_, SQL_CLOSE);
+
+    std::string afterUse = GetInfoString(dbc_, SQL_USER_NAME, &rc, nullptr);
+    EXPECT_TRUE(SQL_SUCCEEDED(rc));
+    EXPECT_EQ(QueryScalarString(stmt_, "SELECT USER_NAME()"), afterUse);
+}
+
+// The lookup is internal: it must not leave records on the connection for the
+// application to trip over. msodbcsql runs it on its hidden driver statement
+// and frees any records with it.
+TEST_F(GetInfoLiveTest, UserNameLeavesNoDiagnostics) {
+    SQLRETURN rc = SQL_ERROR;
+    GetInfoString(dbc_, SQL_USER_NAME, &rc, nullptr);
+    ASSERT_EQ(SQL_SUCCESS, rc) << "a plain read must not even warn";
+
+    SQLWCHAR state[6] = {};
+    SQLINTEGER native = 0;
+    SQLWCHAR message[256] = {};
+    SQLSMALLINT messageLen = 0;
+    EXPECT_EQ(SQL_NO_DATA, SQLGetDiagRecW(SQL_HANDLE_DBC, dbc_, 1, state, &native,
+                                          message, 256, &messageLen));
+}
+
+// An open transaction is not a reason to refuse: msodbcsql only sidesteps the
+// connection when it is *busy*, and runs the lookup inline otherwise.
+TEST_F(GetInfoLiveTest, UserNameIsReportedInsideAnOpenTransaction) {
+    ASSERT_TRUE(SQL_SUCCEEDED(SQLSetConnectAttr(
+        dbc_, SQL_ATTR_AUTOCOMMIT,
+        reinterpret_cast<SQLPOINTER>(SQL_AUTOCOMMIT_OFF), 0)));
+
+    // Opens the transaction; the cursor is drained so the connection is idle.
+    EXPECT_EQ("1", QueryScalarString(stmt_, "SELECT CAST(1 AS VARCHAR(1))"));
+
+    SQLRETURN rc = SQL_ERROR;
+    std::string userName = GetInfoString(dbc_, SQL_USER_NAME, &rc, nullptr);
+    EXPECT_TRUE(SQL_SUCCEEDED(rc));
+    EXPECT_EQ(QueryScalarString(stmt_, "SELECT USER_NAME()"), userName);
+
+    EXPECT_TRUE(SQL_SUCCEEDED(SQLEndTran(SQL_HANDLE_DBC, dbc_, SQL_ROLLBACK)));
+    EXPECT_TRUE(SQL_SUCCEEDED(SQLSetConnectAttr(
+        dbc_, SQL_ATTR_AUTOCOMMIT,
+        reinterpret_cast<SQLPOINTER>(SQL_AUTOCOMMIT_ON), 0)));
+}
+
+// Truncation follows the same contract as every other string information type:
+// 01004, a NUL-terminated partial value, and the full length still reported.
+TEST_F(GetInfoLiveTest, UserNameTruncatesWithTheFullLengthReported) {
+    SQLRETURN rc = SQL_ERROR;
+    SQLSMALLINT fullLen = -1;
+    std::string userName = GetInfoString(dbc_, SQL_USER_NAME, &rc, &fullLen);
+    ASSERT_TRUE(SQL_SUCCEEDED(rc));
+    ASSERT_GE(userName.size(), 2u) << "need a value long enough to truncate";
+
+    SQLWCHAR buf[2] = {0xFFFF, 0xFFFF};
+    SQLSMALLINT len = -1;
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO,
+              SQLGetInfoW(dbc_, SQL_USER_NAME, buf, sizeof(buf), &len));
+    EXPECT_EQ(static_cast<SQLSMALLINT>(userName.size() * sizeof(SQLWCHAR)), len);
+    EXPECT_EQ(0, buf[1]) << "the partial value must still be terminated";
+    EXPECT_SQLSTATE(SQL_HANDLE_DBC, dbc_, "01004");
 }
 
 // SQL_DATA_SOURCE_NAME is empty for a DSN-less connection and the DSN otherwise.
@@ -832,9 +936,10 @@ TEST_F(GetInfoLiveTest, SuccessfulCallClearsPreviousDiagnostic) {
 }
 
 // SQLGetInfo must work while a cursor is open on a non-MARS connection, and
-// must leave that cursor usable. mssql-odbc satisfies this by answering from
-// state captured at login; msodbcsql spawns a second connection for its own
-// lazy lookup rather than disturbing the busy one (sqlccmd.cpp, bug #656241).
+// must leave that cursor usable. msodbcsql spawns a second connection for its
+// own lazy SQL_USER_NAME lookup rather than disturbing the busy one
+// (sqlccmd.cpp RefreshShilohUDTCache, bug #656241); mssql-odbc answers from the
+// value it already cached. Neither may fail, and neither may touch the cursor.
 TEST_F(GetInfoLiveTest, WorksWithAnOpenCursorAndLeavesItUsable) {
     ExecDirect("SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3");
     ASSERT_EQ(SQL_SUCCESS, SQLFetch(stmt_));
