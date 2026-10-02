@@ -108,7 +108,7 @@ impl OptionType {
 }
 
 pub struct PreloginRequestModel {
-    pub driver_version: Version,
+    pub driver_version: DriverVersion,
     pub connection_id: Uuid,
     pub activity_id: Uuid,
     pub activity_sequence_number: i32,
@@ -133,12 +133,7 @@ impl PreloginRequestModel {
         let encryption_setting = encryption_setting.unwrap_or(EncryptionSetting::Strict);
         let database_instance = database_instance.unwrap_or("MSSQLServer").to_string();
         PreloginRequestModel {
-            driver_version: Version::new(
-                driver_version.major,
-                driver_version.minor,
-                driver_version.build,
-                0,
-            ),
+            driver_version,
             connection_id,
             activity_id: Uuid::new_v4(),
             activity_sequence_number: REQUEST_COUNT.fetch_add(1, Relaxed),
@@ -321,19 +316,12 @@ impl<'a, 'n> Serializer<'a, 'n> {
     }
 
     async fn write_version(&mut self) -> TdsResult<()> {
+        let v = self.model.driver_version;
+        let [build_hi, build_lo] = v.build.to_be_bytes();
+        // Sub-build is always 0.
         self.payload_writer
-            .write_byte_async(self.model.driver_version.major)
-            .await?;
-        self.payload_writer
-            .write_byte_async(self.model.driver_version.minor)
-            .await?;
-        self.payload_writer
-            .write_i16_be_async(self.model.driver_version.build as i16)
-            .await?;
-        self.payload_writer
-            .write_i16_be_async(self.model.driver_version.revision as i16)
-            .await?;
-        Ok(())
+            .write_async(&[v.major, v.minor, build_hi, build_lo, 0, 0])
+            .await
     }
 
     async fn write_encryption(&mut self) -> TdsResult<()> {
@@ -497,8 +485,8 @@ pub(crate) mod tests {
         let payload_start = cursor.position() as usize;
         // Validate a few headers.
         assert_eq!(cursor.read_u8().unwrap(), OptionType::Version.to_u8());
-        let version_offset = cursor.read_i16::<BigEndian>().unwrap() as usize;
-        let version_len = cursor.read_i16::<BigEndian>().unwrap() as usize;
+        let version_offset = cursor.read_u16::<BigEndian>().unwrap() as usize;
+        let version_len = cursor.read_u16::<BigEndian>().unwrap() as usize;
         assert_eq!(version_offset, 36); // Initial content_next_offset.
         assert_eq!(version_len, 6);
 
