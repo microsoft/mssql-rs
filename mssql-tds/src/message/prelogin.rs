@@ -108,7 +108,7 @@ impl OptionType {
 }
 
 pub struct PreloginRequestModel {
-    pub sdk_version: Version,
+    pub driver_version: Version,
     pub connection_id: Uuid,
     pub activity_id: Uuid,
     pub activity_sequence_number: i32,
@@ -133,7 +133,7 @@ impl PreloginRequestModel {
         let encryption_setting = encryption_setting.unwrap_or(EncryptionSetting::Strict);
         let database_instance = database_instance.unwrap_or("MSSQLServer").to_string();
         PreloginRequestModel {
-            sdk_version: Version::new(
+            driver_version: Version::new(
                 driver_version.major,
                 driver_version.minor,
                 driver_version.build,
@@ -322,16 +322,16 @@ impl<'a, 'n> Serializer<'a, 'n> {
 
     async fn write_version(&mut self) -> TdsResult<()> {
         self.payload_writer
-            .write_byte_async(self.model.sdk_version.major)
+            .write_byte_async(self.model.driver_version.major)
             .await?;
         self.payload_writer
-            .write_byte_async(self.model.sdk_version.minor)
+            .write_byte_async(self.model.driver_version.minor)
             .await?;
         self.payload_writer
-            .write_i16_be_async(self.model.sdk_version.build as i16)
+            .write_i16_be_async(self.model.driver_version.build as i16)
             .await?;
         self.payload_writer
-            .write_i16_be_async(self.model.sdk_version.revision as i16)
+            .write_i16_be_async(self.model.driver_version.revision as i16)
             .await?;
         Ok(())
     }
@@ -497,15 +497,18 @@ pub(crate) mod tests {
         let payload_start = cursor.position() as usize;
         // Validate a few headers.
         assert_eq!(cursor.read_u8().unwrap(), OptionType::Version.to_u8());
-        assert_eq!(cursor.read_i16::<BigEndian>().unwrap(), 36); // Initial content_next_offset.
-        assert_eq!(cursor.read_i16::<BigEndian>().unwrap(), 6);
+        let version_offset = cursor.read_i16::<BigEndian>().unwrap() as usize;
+        let version_len = cursor.read_i16::<BigEndian>().unwrap() as usize;
+        assert_eq!(version_offset, 36); // Initial content_next_offset.
+        assert_eq!(version_len, 6);
 
         assert_eq!(cursor.read_u8().unwrap(), OptionType::Encryption.to_u8());
         assert_eq!(cursor.read_i16::<BigEndian>().unwrap(), 42); // Add the length of the previous header to the content_next_offset.
         assert_eq!(cursor.read_i16::<BigEndian>().unwrap(), 1);
 
         // SQL Server reports these bytes as the client driver version.
-        let version = &cursor.get_ref()[payload_start + 36..payload_start + 42];
+        let start = payload_start + version_offset;
+        let version = &cursor.get_ref()[start..start + version_len];
         assert_eq!(version, &[2, 5, 0x04, 0xD2, 0, 0]);
     }
 
