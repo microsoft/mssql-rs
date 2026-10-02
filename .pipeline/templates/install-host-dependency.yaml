@@ -12,13 +12,18 @@ parameters:
 steps:
 - ${{ if eq(parameters.installAzCli, true) }}:
   - script: |
-      if ! command -v az &> /dev/null
-      then
+      set -e
+      if command -v az &> /dev/null; then
+          echo "Azure CLI is already installed"
+      elif command -v tdnf &> /dev/null; then
+          # The RUST-AZL3-ARM64 image does not ship az (the Ubuntu ARM64 image did).
+          echo "Azure CLI not found, installing from the Azure Linux repo..."
+          sudo tdnf install -y azure-cli
+      else
           echo "ERROR: Az CLI is expected to be pre-installed in the build image. If this is a developer machine, then install az cli using \`curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash\`"
           exit 1
-      else
-          echo "Azure CLI is already installed"
       fi
+      az version
     displayName: Install Az CLI
     condition: succeeded()
 
