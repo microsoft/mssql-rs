@@ -8156,16 +8156,17 @@ impl TdsClient {
         self.execution_context.set_has_open_batch(false);
         self.current_metadata = None;
         self.current_result_set_has_been_read_till_end = true;
-        let dropped = self.take_row_set_errors();
-        if !dropped.is_empty() {
+        let dropped = self.row_set_errors.len();
+        if dropped > 0 {
             warn!(
-                count = dropped.len(),
+                count = dropped,
                 error = ?error,
                 "Discarding statement errors collected before the read failed"
             );
         }
-        self.statement_error_completion_pending = false;
-        self.failed_statement_done_pending = false;
+        // The walk is over: back to `Abort`, so the rule that brought us here
+        // does not fire again for the same failure.
+        self.reset_statement_walk_state();
         self.retire_after_failed_drain(&error);
         error
     }
@@ -8181,15 +8182,16 @@ impl TdsClient {
     /// Under [`BatchErrorMode::Continue`], `has_open_batch()` after an `Err`
     /// means the response can still be walked. A statement error keeps it open:
     /// the walk goes on past it. Any other error met while consuming the response
-    /// — a transport or decode failure, an unexpected or malformed token — leaves
-    /// the reader at an unknown point, so it closes the batch and retires the
-    /// connection (unless a timeout or cancellation settled cleanly, which has
-    /// already reset the walk). Every place that consumes the response routes its
+    /// — a transport or decode failure, an unexpected or malformed token —
+    /// leaves the reader at an unknown point, so it closes the batch and retires
+    /// the connection (unless a timeout or cancellation settled cleanly, which
+    /// has already reset the walk). That includes the window before the first
+    /// result boundary, when the batch is not yet marked open but its response is
+    /// already being read. Every place that consumes the response routes its
     /// errors through here; an error raised before anything is read leaves the
     /// stream intact and does not.
     fn end_walk_on_read_error(&mut self, error: crate::error::Error) -> crate::error::Error {
         if self.batch_error_mode == BatchErrorMode::Continue
-            && self.has_open_batch()
             && !matches!(error, crate::error::Error::SqlServerError { .. })
         {
             return self.abandon_failed_statement(error);
@@ -11256,6 +11258,31 @@ mod tests {
             Err(crate::error::Error::UsageError(_))
         ));
         assert_walk_ended(&client);
+    }
+
+    /// Before the first result boundary the batch is not yet marked open, but
+    /// its response is already being read: a protocol error there ends a
+    /// `Continue` walk too, so a desynchronized stream is not reused. `Abort` is
+    /// unchanged.
+    #[tokio::test]
+    async fn an_unexpected_first_token_ends_a_continue_walk() {
+        fn tokens() -> Vec<Tokens> {
+            vec![Tokens::Order(crate::token::tokens::OrderToken {
+                _order_columns: Vec::new(),
+            })]
+        }
+
+        let mut client = create_test_client_with_tokens(tokens());
+        assert!(matches!(
+            execute_continue(&mut client).await,
+            Err(crate::error::Error::UsageError(_))
+        ));
+        assert_walk_ended(&client);
+        assert_eq!(client.batch_error_mode, BatchErrorMode::Abort);
+
+        let mut client = create_test_client_with_tokens(tokens());
+        assert!(client.execute("q".to_string(), ()).await.is_err());
+        assert!(!client.is_connection_dead(), "Abort behaviour changed");
     }
 
     /// The rule does not depend on an earlier statement error: under
