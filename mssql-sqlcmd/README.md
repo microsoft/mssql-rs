@@ -90,7 +90,7 @@ Two pipelines of their own, separate from the Python wheels ones:
 | Pipeline | File | Does |
 |---|---|---|
 | Official mssql-sqlcmd Build | `.pipeline/OneBranch/OfficialMssqlSqlcmdBuild.yml` | Builds every runtime and packs `mssql-sqlcmd.<version>.nupkg` as the `drop_Build_MssqlSqlcmd_Package` artifact. Runs on merges to `stable` that touch this crate or its build scripts; never publishes. |
-| Official mssql-sqlcmd Release | `.pipeline/OneBranch/OfficialMssqlSqlcmdRelease.yml` | Manual. Validates the package of the Official Build run you pick and, with `publishNuGet`, publishes it to `public/mssql-rs_Public`. |
+| ADO-Release Nuget mssql-sqlcmd | `.pipeline/OneBranch/OfficialMssqlSqlcmdRelease.yml` | Manual. Validates the package of the Official Build run you pick and, with `publishNuGet`, publishes it to `public/mssql-rs_Public`. |
 
 The jobs live in `.pipeline/OneBranch/mssql-sqlcmd-stages.yml`.
 
