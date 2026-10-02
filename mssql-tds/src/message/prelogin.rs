@@ -491,8 +491,8 @@ pub(crate) mod tests {
         assert_eq!(version_len, 6);
 
         assert_eq!(cursor.read_u8().unwrap(), OptionType::Encryption.to_u8());
-        assert_eq!(cursor.read_i16::<BigEndian>().unwrap(), 42); // Add the length of the previous header to the content_next_offset.
-        assert_eq!(cursor.read_i16::<BigEndian>().unwrap(), 1);
+        assert_eq!(cursor.read_u16::<BigEndian>().unwrap(), 42); // Add the length of the previous header to the content_next_offset.
+        assert_eq!(cursor.read_u16::<BigEndian>().unwrap(), 1);
 
         // SQL Server reports these bytes as the client driver version.
         let start = payload_start + version_offset;

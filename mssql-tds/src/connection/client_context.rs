@@ -24,7 +24,9 @@ pub enum IPAddressPreference {
 /// Represents a driver version with major, minor, and build components.
 /// Sent in the PRELOGIN `VERSION` option and in Login7 `client_prog_ver`.
 ///
-/// Encoding: `[major (8 bits)][minor (8 bits)][build (16 bits)]`
+/// Encoding:
+/// - Login7 `client_prog_ver`: 4 bytes, `[major][minor][build (16 bits)]` as an i32.
+/// - PRELOGIN `VERSION`: 6 bytes, `[major][minor][build BE (16 bits)][sub-build = 0 (16 bits)]`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DriverVersion {
     /// Major version number.
