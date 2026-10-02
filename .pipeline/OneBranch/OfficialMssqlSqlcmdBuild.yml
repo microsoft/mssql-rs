@@ -1,23 +1,34 @@
 #################################################################################
 #                        OneBranch Pipelines - Official                         #
-# Official build pipeline for Python wheels and Rust crates. Builds across     #
-# all platforms with SDL enforcement and approval gates.                       #
-# This pipeline does NOT publish to any feed — publishing is handled by a      #
-# separate Release pipeline.                                                    #
+# Official build pipeline for the mssql-sqlcmd NuGet package: the static        #
+# library native ODBC sqlcmd (msodbcsql) links for --format json, built for     #
+# every runtime it ships on and packed into mssql-sqlcmd.<version>.nupkg.        #
+# This pipeline does NOT publish to any feed — publishing is handled by         #
+# OfficialMssqlSqlcmdRelease.yml.                                               #
 # Documentation:  https://aka.ms/obpipelines                                    #
 # Yaml Schema:    https://aka.ms/obpipelines/yaml/schema                        #
 # Retail Tasks:   https://aka.ms/obpipelines/tasks                              #
 # Support:        https://aka.ms/onebranchsup                                   #
 #################################################################################
 
-# Official build runs on every merge to the ADO stable branch (stable mirrors
-# GitHub main); no PR validation (PRs are validated by the separate validation
-# pipeline). Can also be queued manually.
+# Runs on merges to the ADO stable branch (stable mirrors GitHub main) that touch
+# what the package is built from. Can also be queued manually.
 trigger:
   batch: true
   branches:
     include:
       - stable
+  paths:
+    include:
+      - mssql-sqlcmd/*
+      - Cargo.toml
+      - rust-toolchain.toml
+      - .pipeline/OneBranch/OfficialMssqlSqlcmdBuild.yml
+      - .pipeline/OneBranch/mssql-sqlcmd-stages.yml
+      - .pipeline/templates/build-mssql-sqlcmd-linux-template.yml
+      - .pipeline/scripts/build-mssql-sqlcmd-native.ps1
+      - .pipeline/scripts/build-mssql-sqlcmd-native.sh
+      - .pipeline/scripts/pack-mssql-sqlcmd.ps1
 pr: none
 
 variables:
@@ -46,11 +57,6 @@ extends:
       clippy:
         enabled: true
     stages:
-    - template: /.pipeline/OneBranch/stages.yml@self
+    - template: /.pipeline/OneBranch/mssql-sqlcmd-stages.yml@self
       parameters:
-        buildAllTargets: true
-        buildPythonWheels: true
-        buildOdbcNative: true
-        buildRustCrates: true
-        testPythonWheelInstalls: true
         isOfficial: true
