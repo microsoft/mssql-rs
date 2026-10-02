@@ -9,7 +9,7 @@ line, connects and runs the batches.
 | Path | Purpose |
 |---|---|
 | `src/formatter/` | Output formatters. `json.rs` renders `--format json`. |
-| `src/ffi.rs` | The C ABI native sqlcmd calls. |
+| `src/ffi.rs` | The C ABI native sqlcmd calls, including `mssql_sqlcmd_version()`. |
 | `include/mssql_sqlcmd.h` | C/C++ declarations for that ABI. |
 
 ## JSON output

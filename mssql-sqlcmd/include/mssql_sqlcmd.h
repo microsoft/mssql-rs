@@ -24,6 +24,10 @@ extern "C" {
 #define MSSQL_SQLCMD_INVALID_STATE 2
 #define MSSQL_SQLCMD_INTERNAL_ERROR 3
 
+/* The library's version as a static, NUL-terminated UTF-8 string, e.g.
+   "0.1.0". Do not free it. */
+const char* MSSQL_SQLCMD_CALL mssql_sqlcmd_version(void);
+
 /* UTF-16 text with an explicit length. data == NULL means "absent"
    (SQL NULL for a row value). Invalid UTF-16 is replaced with U+FFFD. */
 typedef struct MssqlSqlcmdText {

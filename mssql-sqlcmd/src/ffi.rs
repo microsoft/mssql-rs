@@ -33,6 +33,17 @@ pub const MSSQL_SQLCMD_INVALID_STATE: i32 = 2;
 /// A Rust panic was caught at the boundary.
 pub const MSSQL_SQLCMD_INTERNAL_ERROR: i32 = 3;
 
+/// The crate version, NUL-terminated, so a caller can confirm which build of
+/// the library it linked.
+static VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "\0");
+
+/// Returns the library's version as a NUL-terminated UTF-8 string, e.g.
+/// `0.1.0`. The string is static: the caller must not free it.
+#[unsafe(no_mangle)]
+pub extern "C" fn mssql_sqlcmd_version() -> *const std::ffi::c_char {
+    VERSION.as_ptr().cast()
+}
+
 /// A UTF-16 string. `data` may be null only where a value is optional, in which
 /// case the value is absent (SQL `NULL` for a row value); `len` is then
 /// ignored. Invalid UTF-16 is replaced with U+FFFD rather than rejected.
@@ -303,6 +314,13 @@ pub unsafe extern "C" fn mssql_sqlcmd_free_text(text: *mut u16, len: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_version_is_the_crate_version() {
+        // SAFETY: `mssql_sqlcmd_version` returns a static NUL-terminated string.
+        let version = unsafe { std::ffi::CStr::from_ptr(mssql_sqlcmd_version()) };
+        assert_eq!(version.to_str().unwrap(), env!("CARGO_PKG_VERSION"));
+    }
 
     fn utf16(value: &str) -> Vec<u16> {
         value.encode_utf16().collect()
