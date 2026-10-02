@@ -179,6 +179,9 @@ pub struct Login7AuthInfo {
     pub access_token_bytes: Option<Vec<u8>>,
     /// FedAuth library type (0x01 = SecurityToken, 0x02 = MSAL)
     pub fedauth_library: u8,
+    /// MSAL workflow byte (MS-TDS 2.2.6.4: 0x01 password, 0x02 integrated,
+    /// 0x03 interactive/other) when the library is MSAL.
+    pub fedauth_workflow: Option<u8>,
     /// Server name from Login7 packet (the data source string sent by client)
     pub server_name: Option<String>,
     /// User Agent string from Login7 packet (if present)
@@ -316,6 +319,10 @@ pub fn parse_login7_auth(packet_data: &[u8]) -> Login7AuthInfo {
                 if !feat_data.is_empty() {
                     let options = feat_data[0];
                     auth_info.fedauth_library = (options >> 1) & 0x03;
+
+                    if auth_info.fedauth_library == 0x02 {
+                        auth_info.fedauth_workflow = feat_data.get(1).copied();
+                    }
 
                     if auth_info.fedauth_library == 0x01 && feat_data.len() > 5 {
                         let token_len = u32::from_le_bytes([
