@@ -4771,11 +4771,6 @@ impl TdsClient {
 
     #[instrument(skip(self), level = "info")]
     async fn drain_rows(&mut self) -> TdsResult<()> {
-        let result = self.drain_rows_inner().await;
-        self.close_failed_row_set(result)
-    }
-
-    async fn drain_rows_inner(&mut self) -> TdsResult<()> {
         if self.maybe_has_unread_rows() {
             // A pull cursor (`next_row_cursor`) may have left the current row
             // partially read (`RowPaused`/`PlpPaused`). The push API used below
@@ -5215,6 +5210,16 @@ impl TdsClient {
     /// call) always belongs to a no-row statement, because a row-returning
     /// statement's DONE is consumed while its rows are read/drained.
     async fn advance_to_result_boundary(&mut self) -> TdsResult<ResultBoundaryKind> {
+        // Every error below follows a read — including its two `UsageError`s,
+        // both raised on a token already consumed — so each ends a `Continue`
+        // walk unless it is a statement error.
+        match self.advance_to_result_boundary_inner().await {
+            Err(error) => Err(self.end_walk_on_read_error(error)),
+            ok => ok,
+        }
+    }
+
+    async fn advance_to_result_boundary_inner(&mut self) -> TdsResult<ResultBoundaryKind> {
         // Tell the COLMETADATA parser whether Always Encrypted was negotiated so
         // it can parse the CEK table and per-column crypto metadata.
         let parser_context = ParserContext::ColumnEncryption(
@@ -5613,13 +5618,14 @@ impl TdsClient {
         }
         let token = match result {
             Ok(token) => token,
-            Err(error) => {
-                self.settle_interrupted_read(&error);
-                return Err(error);
-            }
+            Err(error) => return Err(self.fail_read(error)),
         };
-        self.observe_response_token(&token)?;
-        self.observe_prepared_batch_done(&token)?;
+        if let Err(error) = self
+            .observe_response_token(&token)
+            .and_then(|()| self.observe_prepared_batch_done(&token))
+        {
+            return Err(self.end_walk_on_read_error(error));
+        }
         Ok(token)
     }
 
@@ -6615,11 +6621,6 @@ impl TdsClient {
     }
 
     pub(crate) async fn read_active_plp_bytes(&mut self, out: &mut [u8]) -> TdsResult<usize> {
-        let result = self.read_active_plp_bytes_inner(out).await;
-        self.close_failed_row_set(result)
-    }
-
-    async fn read_active_plp_bytes_inner(&mut self, out: &mut [u8]) -> TdsResult<usize> {
         let ActiveRowReadState::PlpPaused(plp_state) = &mut self.active_row_read_state else {
             // No active stream is a sequencing error, not EOF: returning `Ok(0)`
             // here is indistinguishable from a legitimately exhausted stream, so
@@ -6646,7 +6647,7 @@ impl TdsClient {
         match result {
             Ok(read) => Ok(read),
             Err(error) => {
-                let error = self.fail_row_read(error);
+                let error = self.fail_read(error);
                 self.abort_pending_prepare_capture();
                 Err(error)
             }
@@ -6682,7 +6683,7 @@ impl TdsClient {
     /// Attempts to consume the next PLP output chunk entirely from buffered bytes.
     pub fn try_read_active_plp_chunk(&mut self, out: &mut [u8]) -> TdsResult<CursorPoll<PlpChunk>> {
         let result = self.try_read_active_plp_chunk_inner(out);
-        self.close_failed_row_set(result)
+        self.end_walk_on_try_read_error(result)
     }
 
     fn try_read_active_plp_chunk_inner(
@@ -6741,14 +6742,6 @@ impl TdsClient {
     // `#[instrument]` adds enough state to exceed the 4096 B budget once the
     // lazy timeout future is inlined. Successful rows still emit `Row Received`.
     pub async fn next_row_into<W>(&mut self, writer: &mut W) -> TdsResult<bool>
-    where
-        W: RowWriter + Send + ?Sized,
-    {
-        let result = self.next_row_into_inner(writer).await;
-        self.close_failed_row_set(result)
-    }
-
-    async fn next_row_into_inner<W>(&mut self, writer: &mut W) -> TdsResult<bool>
     where
         W: RowWriter + Send + ?Sized,
     {
@@ -6828,7 +6821,7 @@ impl TdsClient {
             {
                 Ok(result) => result,
                 Err(error) => {
-                    let error = self.fail_row_read(error);
+                    let error = self.fail_read(error);
                     self.abort_pending_prepare_capture();
                     return Err(error);
                 }
@@ -6844,15 +6837,18 @@ impl TdsClient {
                 RowReadResult::RowPaused(_) | RowReadResult::PlpPaused(_) => {
                     // DecodeAll never pauses; a pause here is a protocol/logic error.
                     self.abort_pending_prepare_capture();
-                    return Err(crate::error::Error::ProtocolError(
-                        "Unexpected pause while decoding a full row (ColumnPolicy::DecodeAll)"
-                            .to_string(),
-                    ));
+                    return Err(
+                        self.end_walk_on_read_error(crate::error::Error::ProtocolError(
+                            "Unexpected pause while decoding a full row (ColumnPolicy::DecodeAll)"
+                                .to_string(),
+                        )),
+                    );
                 }
                 RowReadResult::Token(token) => {
                     let handled = match Box::pin(self.handle_row_read_token(token)).await {
                         Ok(handled) => handled,
                         Err(error) => {
+                            let error = self.end_walk_on_read_error(error);
                             self.abort_pending_prepare_capture();
                             return Err(error);
                         }
@@ -6873,7 +6869,7 @@ impl TdsClient {
     /// parsing, encryption keys need resolving, or the row header is incomplete.
     pub fn try_next_row_cursor(&mut self) -> TdsResult<CursorPoll<bool>> {
         let result = self.try_next_row_cursor_inner();
-        self.close_failed_row_set(result)
+        self.end_walk_on_try_read_error(result)
     }
 
     fn try_next_row_cursor_inner(&mut self) -> TdsResult<CursorPoll<bool>> {
@@ -6934,7 +6930,7 @@ impl TdsClient {
         W: RowWriter + Send + ?Sized,
     {
         let result = self.try_next_buffered_row_into_inner(writer);
-        self.close_failed_row_set(result)
+        self.end_walk_on_try_read_error(result)
     }
 
     fn try_next_buffered_row_into_inner<W>(&mut self, writer: &mut W) -> TdsResult<BufferedRowPoll>
@@ -6995,7 +6991,7 @@ impl TdsClient {
         W: RowWriter + Send + ?Sized,
     {
         let result = self.try_next_buffered_row_prefix_into_inner(prefix_len, writer);
-        self.close_failed_row_set(result)
+        self.end_walk_on_try_read_error(result)
     }
 
     fn try_next_buffered_row_prefix_into_inner<W>(
@@ -7060,11 +7056,6 @@ impl TdsClient {
     /// [`Self::try_next_row_cursor`] returns [`CursorPoll::Pending`].
     #[instrument(skip(self), level = "info")]
     pub async fn next_row_cursor(&mut self) -> TdsResult<bool> {
-        let result = self.next_row_cursor_inner().await;
-        self.close_failed_row_set(result)
-    }
-
-    async fn next_row_cursor_inner(&mut self) -> TdsResult<bool> {
         // A previous `peek_past_current_row` already read this row's header
         // off the wire and parked it in `active_row_read_state` — hand it
         // over as-is instead of draining it (see `drain_active_row_if_needed`,
@@ -7108,7 +7099,7 @@ impl TdsClient {
             }
             let header = match header {
                 Ok(header) => header,
-                Err(error) => return Err(self.fail_row_read(error)),
+                Err(error) => return Err(self.fail_read(error)),
             };
 
             match header {
@@ -7121,7 +7112,11 @@ impl TdsClient {
                     return Ok(true);
                 }
                 RowHeader::Token(token) => {
-                    if let Some(has_row) = Box::pin(self.handle_row_read_token(token)).await? {
+                    let handled = match Box::pin(self.handle_row_read_token(token)).await {
+                        Ok(handled) => handled,
+                        Err(error) => return Err(self.end_walk_on_read_error(error)),
+                    };
+                    if let Some(has_row) = handled {
                         return Ok(has_row);
                     }
                 }
@@ -7166,7 +7161,7 @@ impl TdsClient {
     /// caller then continues with [`Self::read_row_column`].
     pub fn try_read_row_column(&mut self, target: usize) -> TdsResult<CursorPoll<CursorColumn>> {
         let result = self.try_read_row_column_inner(target);
-        self.close_failed_row_set(result)
+        self.end_walk_on_try_read_error(result)
     }
 
     fn try_read_row_column_inner(&mut self, target: usize) -> TdsResult<CursorPoll<CursorColumn>> {
@@ -7301,7 +7296,7 @@ impl TdsClient {
         out: &mut [u8],
     ) -> TdsResult<CursorPoll<Option<PlpChunk>>> {
         let result = self.try_read_row_plp_complete_inner(target, out);
-        self.close_failed_row_set(result)
+        self.end_walk_on_try_read_error(result)
     }
 
     fn try_read_row_plp_complete_inner(
@@ -7377,7 +7372,7 @@ impl TdsClient {
         W: RowWriter + Send + ?Sized,
     {
         let result = self.try_finish_row_into_inner(writer);
-        self.close_failed_row_set(result)
+        self.end_walk_on_try_read_error(result)
     }
 
     fn try_finish_row_into_inner<W>(&mut self, writer: &mut W) -> TdsResult<bool>
@@ -7424,7 +7419,7 @@ impl TdsClient {
         W: RowWriter + Send + ?Sized,
     {
         let result = self.try_finish_row_prefix_into_inner(prefix_len, writer);
-        self.close_failed_row_set(result)
+        self.end_walk_on_try_read_error(result)
     }
 
     fn try_finish_row_prefix_into_inner<W>(
@@ -7530,14 +7525,6 @@ impl TdsClient {
     where
         W: RowWriter + Send + ?Sized,
     {
-        let result = self.finish_row_into_inner(writer).await;
-        self.close_failed_row_set(result)
-    }
-
-    async fn finish_row_into_inner<W>(&mut self, writer: &mut W) -> TdsResult<()>
-    where
-        W: RowWriter + Send + ?Sized,
-    {
         let state = std::mem::replace(&mut self.active_row_read_state, ActiveRowReadState::Idle);
         let pause_state = match state {
             ActiveRowReadState::RowPaused(pause_state) => pause_state,
@@ -7564,7 +7551,8 @@ impl TdsClient {
             self.update_remaining_timeout(start);
         }
 
-        match result {
+        // The arms that fail have consumed row bytes, so a `Continue` walk ends.
+        let outcome = match result {
             Ok(RowReadResult::RowWritten) => {
                 writer.end_row();
                 Ok(())
@@ -7586,27 +7574,16 @@ impl TdsClient {
                 "row continuation returned a control token".to_string(),
             )),
             Err(error) => {
-                let error = self.fail_row_read(error);
+                let error = self.fail_read(error);
                 self.abort_pending_prepare_capture();
                 Err(error)
             }
-        }
+        };
+        outcome.map_err(|error| self.end_walk_on_read_error(error))
     }
 
     /// Finishes a partially buffered inline prefix and pauses before its first PLP.
     pub async fn finish_row_prefix_into<W>(
-        &mut self,
-        prefix_len: usize,
-        writer: &mut W,
-    ) -> TdsResult<()>
-    where
-        W: RowWriter + Send + ?Sized,
-    {
-        let result = self.finish_row_prefix_into_inner(prefix_len, writer).await;
-        self.close_failed_row_set(result)
-    }
-
-    async fn finish_row_prefix_into_inner<W>(
         &mut self,
         prefix_len: usize,
         writer: &mut W,
@@ -7638,7 +7615,8 @@ impl TdsClient {
         if let Some(start) = start {
             self.update_remaining_timeout(start);
         }
-        match result {
+        // The arms that fail have consumed row bytes, so a `Continue` walk ends.
+        let outcome = match result {
             Ok(RowReadResult::RowPaused(pause_state))
                 if pause_state.next_column_index == prefix_len =>
             {
@@ -7664,11 +7642,12 @@ impl TdsClient {
                 "Inline prefix continuation returned a control token".to_string(),
             )),
             Err(error) => {
-                let error = self.fail_row_read(error);
+                let error = self.fail_read(error);
                 self.abort_pending_prepare_capture();
                 Err(error)
             }
-        }
+        };
+        outcome.map_err(|error| self.end_walk_on_read_error(error))
     }
 
     /// Pulls column `target` (0-based) of the currently positioned row,
@@ -7708,11 +7687,6 @@ impl TdsClient {
     /// out-of-range and returns `UsageError`.
     // Avoid a span for every SQLGetData column; row and token events retain observability.
     pub async fn read_row_column(&mut self, target: usize) -> TdsResult<CursorColumn> {
-        let result = self.read_row_column_inner(target).await;
-        self.close_failed_row_set(result)
-    }
-
-    async fn read_row_column_inner(&mut self, target: usize) -> TdsResult<CursorColumn> {
         match std::mem::replace(&mut self.active_row_read_state, ActiveRowReadState::Idle) {
             ActiveRowReadState::Idle => Ok(CursorColumn::RowEnded),
             ActiveRowReadState::RowPaused(pause_state) => {
@@ -7769,18 +7743,20 @@ impl TdsClient {
         }
         let result = match result {
             Ok(result) => result,
-            Err(error) => return Err(self.fail_row_read(error)),
+            Err(error) => return Err(self.fail_read(error)),
         };
 
         match result {
             RowReadResult::RowPaused(next_pause) => {
                 self.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(next_pause));
                 let variant_base = capture.variant_base(0);
-                let value = capture.take_row().into_iter().next().ok_or_else(|| {
-                    crate::error::Error::ProtocolError(format!(
-                        "Decoder produced no value for non-null column {target}"
-                    ))
-                })?;
+                let Some(value) = capture.take_row().into_iter().next() else {
+                    return Err(
+                        self.end_walk_on_read_error(crate::error::Error::ProtocolError(format!(
+                            "Decoder produced no value for non-null column {target}"
+                        ))),
+                    );
+                };
                 Ok(CursorColumn::Value {
                     value,
                     variant_base,
@@ -7793,11 +7769,13 @@ impl TdsClient {
                 // rewind from "no row positioned" track the column themselves.
                 self.active_row_read_state = ActiveRowReadState::Idle;
                 let variant_base = capture.variant_base(0);
-                let value = capture.take_row().into_iter().next().ok_or_else(|| {
-                    crate::error::Error::ProtocolError(format!(
-                        "Decoder produced no value for non-null column {target}"
-                    ))
-                })?;
+                let Some(value) = capture.take_row().into_iter().next() else {
+                    return Err(
+                        self.end_walk_on_read_error(crate::error::Error::ProtocolError(format!(
+                            "Decoder produced no value for non-null column {target}"
+                        ))),
+                    );
+                };
                 Ok(CursorColumn::Value {
                     value,
                     variant_base,
@@ -7808,8 +7786,10 @@ impl TdsClient {
                 self.active_row_read_state = ActiveRowReadState::PlpPaused(Box::new(plp_state));
                 Ok(CursorColumn::PlpStreaming { collation })
             }
-            RowReadResult::Token(_) => Err(crate::error::Error::ProtocolError(
-                "Unexpected token while resuming to a target column".to_string(),
+            RowReadResult::Token(_) => Err(self.end_walk_on_read_error(
+                crate::error::Error::ProtocolError(
+                    "Unexpected token while resuming to a target column".to_string(),
+                ),
             )),
         }
     }
@@ -7878,7 +7858,7 @@ impl TdsClient {
             self.update_remaining_timeout(start);
             let read = match read {
                 Ok(read) => read,
-                Err(error) => return Err(self.fail_row_read(error)),
+                Err(error) => return Err(self.fail_read(error)),
             };
 
             if read == 0 && !plp_state.reached_end() {
@@ -7914,7 +7894,7 @@ impl TdsClient {
         self.update_remaining_timeout(start);
         let result = match result {
             Ok(result) => result,
-            Err(error) => return Err(self.fail_row_read(error)),
+            Err(error) => return Err(self.fail_read(error)),
         };
         match result {
             RowReadResult::RowWritten => {
@@ -7931,7 +7911,11 @@ impl TdsClient {
                 Ok(true)
             }
             RowReadResult::Token(token) => {
-                if let Some(has_row) = self.handle_row_read_token(token).await? {
+                let handled = match self.handle_row_read_token(token).await {
+                    Ok(handled) => handled,
+                    Err(error) => return Err(self.end_walk_on_read_error(error)),
+                };
+                if let Some(has_row) = handled {
                     Ok(has_row)
                 } else {
                     // This should not happen in normal resume flow; keep as a defensive guard.
@@ -7943,20 +7927,7 @@ impl TdsClient {
         }
     }
 
-    /// Every error here comes after a control token was consumed, so once the
-    /// row set has collected errors any of them ends the batch — including the
-    /// `UsageError` for an unexpected COLMETADATA, which
-    /// [`close_failed_row_set`](Self::close_failed_row_set) would exempt.
     async fn handle_row_read_token(&mut self, token: Tokens) -> TdsResult<Option<bool>> {
-        match self.handle_row_read_token_inner(token).await {
-            Err(error) if !self.row_set_errors.is_empty() => {
-                Err(self.abandon_failed_statement(error))
-            }
-            other => other,
-        }
-    }
-
-    async fn handle_row_read_token_inner(&mut self, token: Tokens) -> TdsResult<Option<bool>> {
         self.observe_prepared_batch_done(&token)?;
         // Once a statement error has been collected under `Continue`, the server
         // feeds this loop until the row set's DONE; bound it like the look-ahead
@@ -8171,9 +8142,9 @@ impl TdsClient {
         crate::error::Error::from_sql_errors(errors)
     }
 
-    /// Ends the batch when reading a failed statement's response under
-    /// [`BatchErrorMode::Continue`] cannot finish — a transport failure, or a
-    /// bound exceeded — and returns the error to report.
+    /// Ends a [`BatchErrorMode::Continue`] walk whose response can no longer be
+    /// read — a transport, decode or protocol failure, or a bound exceeded — and
+    /// returns the error to report.
     ///
     /// Tokens have been consumed past the last boundary, so the response cannot
     /// be resumed: the batch is closed and the statement state cleared, or the
@@ -8185,45 +8156,54 @@ impl TdsClient {
         self.execution_context.set_has_open_batch(false);
         self.current_metadata = None;
         self.current_result_set_has_been_read_till_end = true;
-        self.take_row_set_errors();
+        let dropped = self.take_row_set_errors();
+        if !dropped.is_empty() {
+            warn!(
+                count = dropped.len(),
+                error = ?error,
+                "Discarding statement errors collected before the read failed"
+            );
+        }
         self.statement_error_completion_pending = false;
         self.failed_statement_done_pending = false;
         self.retire_after_failed_drain(&error);
         error
     }
 
-    /// Settles a read that failed inside a row set and returns the error to
-    /// report.
-    ///
-    /// Every row-set read surface — whole rows, resumed rows, lazy columns, PLP
-    /// chunks — fails through here, so a row set that already collected
-    /// `row_set_errors` under [`BatchErrorMode::Continue`] always closes its
-    /// batch: the response cannot be resumed past the failed read, and an open
-    /// batch after `Err` would tell the caller to keep walking it.
-    fn fail_row_read(&mut self, error: crate::error::Error) -> crate::error::Error {
+    /// Settles a read that failed while consuming the response and returns the
+    /// error to report, closing a [`BatchErrorMode::Continue`] walk the failure
+    /// leaves unreadable (see [`end_walk_on_read_error`](Self::end_walk_on_read_error)).
+    fn fail_read(&mut self, error: crate::error::Error) -> crate::error::Error {
         self.settle_interrupted_read(&error);
-        if self.row_set_errors.is_empty() {
-            return error;
-        }
-        self.abandon_failed_statement(error)
+        self.end_walk_on_read_error(error)
     }
 
-    /// Applied where every row-set read returns: an error that ends the read
-    /// after the row set collected `row_set_errors` under
-    /// [`BatchErrorMode::Continue`] closes the batch, whatever produced it — a
-    /// transport failure, a decode error, an unexpected or malformed token, a
-    /// failed key lookup. The reader stopped mid-response, so the batch cannot
-    /// be walked further, and leaving it open would tell the caller it can.
-    ///
-    /// A [`UsageError`] is exempt: it rejects a call before anything is read,
-    /// so the response is intact and the connection is healthy.
-    fn close_failed_row_set<T>(&mut self, result: TdsResult<T>) -> TdsResult<T> {
+    /// Under [`BatchErrorMode::Continue`], `has_open_batch()` after an `Err`
+    /// means the response can still be walked. A statement error keeps it open:
+    /// the walk goes on past it. Any other error met while consuming the response
+    /// — a transport or decode failure, an unexpected or malformed token — leaves
+    /// the reader at an unknown point, so it closes the batch and retires the
+    /// connection (unless a timeout or cancellation settled cleanly, which has
+    /// already reset the walk). Every place that consumes the response routes its
+    /// errors through here; an error raised before anything is read leaves the
+    /// stream intact and does not.
+    fn end_walk_on_read_error(&mut self, error: crate::error::Error) -> crate::error::Error {
+        if self.batch_error_mode == BatchErrorMode::Continue
+            && self.has_open_batch()
+            && !matches!(error, crate::error::Error::SqlServerError { .. })
+        {
+            return self.abandon_failed_statement(error);
+        }
+        error
+    }
+
+    /// [`end_walk_on_read_error`](Self::end_walk_on_read_error) for the
+    /// synchronous `try_*` row reads, applied where they return. A `UsageError`
+    /// is exempt: those reads raise it only to reject a call, before reading.
+    fn end_walk_on_try_read_error<T>(&mut self, result: TdsResult<T>) -> TdsResult<T> {
         match result {
-            Err(error)
-                if !self.row_set_errors.is_empty()
-                    && !matches!(error, crate::error::Error::UsageError(_)) =>
-            {
-                Err(self.abandon_failed_statement(error))
+            Err(error) if !matches!(error, UsageError(_)) => {
+                Err(self.end_walk_on_read_error(error))
             }
             other => other,
         }
@@ -11176,6 +11156,21 @@ mod tests {
         assert_closed(&client, "read_active_plp_bytes");
     }
 
+    fn assert_walk_ended(client: &TdsClient) {
+        assert!(!client.has_open_batch(), "batch left open");
+        assert!(client.is_connection_dead(), "connection not retired");
+        assert!(client.row_set_errors.is_empty(), "collected errors kept");
+    }
+
+    async fn execute_continue(client: &mut TdsClient) -> TdsResult<StatementResult> {
+        client
+            .execute(
+                "q".to_string(),
+                ExecuteOptions::new().on_error(BatchErrorMode::Continue),
+            )
+            .await
+    }
+
     /// A bad token after a row-set error ends the read just as a transport
     /// failure does — here an unexpected COLMETADATA, whose `UsageError` is
     /// raised after the token was consumed. Both row readers close the batch.
@@ -11188,86 +11183,195 @@ mod tests {
                 int_col_metadata(1),
             ]
         }
-        async fn continued(tokens: Vec<Tokens>) -> TdsClient {
-            let mut client = create_test_client_with_tokens(tokens);
-            assert_eq!(
-                client
-                    .execute(
-                        "q".to_string(),
-                        ExecuteOptions::new().on_error(BatchErrorMode::Continue),
-                    )
-                    .await
-                    .unwrap(),
-                StatementResult::Rows
-            );
-            client
-        }
 
-        let mut client = continued(tokens()).await;
+        let mut client = create_test_client_with_tokens(tokens());
+        assert_eq!(
+            execute_continue(&mut client).await.unwrap(),
+            StatementResult::Rows
+        );
         assert!(matches!(
             client.next_row().await,
             Err(crate::error::Error::UsageError(_))
         ));
-        assert!(!client.has_open_batch());
-        assert!(client.is_connection_dead());
-        assert!(client.row_set_errors.is_empty());
+        assert_walk_ended(&client);
 
-        let mut client = continued(tokens()).await;
+        let mut client = create_test_client_with_tokens(tokens());
+        assert_eq!(
+            execute_continue(&mut client).await.unwrap(),
+            StatementResult::Rows
+        );
         assert!(matches!(
             client.next_row_cursor().await,
             Err(crate::error::Error::UsageError(_))
         ));
-        assert!(!client.has_open_batch());
-        assert!(client.is_connection_dead());
-        assert!(client.row_set_errors.is_empty());
+        assert_walk_ended(&client);
     }
 
-    /// The boundary check behind every row-set read: any error that ends a read
-    /// after a row-set error closes the batch, except a `UsageError`, which
-    /// rejects a call before anything is read.
+    /// After a failed statement's error-flagged DONE with MORE, the walk goes
+    /// on; a transport failure reading what follows ends it rather than leave a
+    /// batch marked open that cannot be read.
+    #[tokio::test]
+    async fn a_transport_failure_after_a_completed_failed_statement_ends_the_walk() {
+        let mut client = create_test_client_with_tokens(vec![
+            Tokens::Error(error_token_with_severity(16)),
+            Tokens::Done(DoneToken {
+                status: DoneStatus::ERROR | DoneStatus::MORE,
+                cur_cmd: CurrentCommand::None,
+                row_count: 0,
+            }),
+        ]);
+
+        assert!(matches!(
+            execute_continue(&mut client).await,
+            Err(crate::error::Error::SqlServerError { .. })
+        ));
+        assert!(client.has_open_batch());
+
+        assert!(matches!(
+            client.advance().await,
+            Err(crate::error::Error::ConnectionClosed(_))
+        ));
+        assert_walk_ended(&client);
+    }
+
+    /// A protocol error between results — an unexpected token — ends the walk
+    /// too, even though `advance` reports it as a `UsageError`.
+    #[tokio::test]
+    async fn an_unexpected_token_between_results_ends_the_walk() {
+        let mut client = create_test_client_with_tokens(vec![
+            Tokens::Error(error_token_with_severity(16)),
+            Tokens::Done(DoneToken {
+                status: DoneStatus::ERROR | DoneStatus::MORE,
+                cur_cmd: CurrentCommand::None,
+                row_count: 0,
+            }),
+            Tokens::Order(crate::token::tokens::OrderToken {
+                _order_columns: Vec::new(),
+            }),
+        ]);
+
+        assert!(execute_continue(&mut client).await.is_err());
+        assert!(matches!(
+            client.advance().await,
+            Err(crate::error::Error::UsageError(_))
+        ));
+        assert_walk_ended(&client);
+    }
+
+    /// The rule does not depend on an earlier statement error: under
+    /// `Continue`, any read failure ends the walk.
+    #[tokio::test]
+    async fn a_read_failure_in_a_clean_continue_walk_ends_it() {
+        let mut client = create_test_client_with_tokens(vec![int_col_metadata(1)]);
+        assert_eq!(
+            execute_continue(&mut client).await.unwrap(),
+            StatementResult::Rows
+        );
+
+        assert!(matches!(
+            client.next_row().await,
+            Err(crate::error::Error::ConnectionClosed(_))
+        ));
+        assert_walk_ended(&client);
+    }
+
+    /// The rule itself. Under `Continue` with the batch open, a read error
+    /// closes it; a statement error does not; nothing changes under `Abort`.
+    /// The `try_*` form also exempts a `UsageError`, which those reads raise
+    /// only to reject a call.
     #[test]
-    fn close_failed_row_set_closes_the_batch_unless_nothing_was_read() {
-        fn failed_row_set() -> TdsClient {
+    fn a_read_error_ends_only_a_continue_walk() {
+        fn walking(mode: BatchErrorMode) -> TdsClient {
             let mut client = create_test_client();
-            client.batch_error_mode = BatchErrorMode::Continue;
+            client.batch_error_mode = mode;
             client.execution_context.set_has_open_batch(true);
             client
-                .row_set_errors
-                .push(SqlErrorInfo::from(&error_token_with_severity(16)));
-            client
         }
+        let protocol = || crate::error::Error::ProtocolError("decode".to_string());
 
-        let mut client = failed_row_set();
-        let result: TdsResult<()> = client.close_failed_row_set(Err(
-            crate::error::Error::ProtocolError("decode".to_string()),
-        ));
-        assert!(matches!(result, Err(crate::error::Error::ProtocolError(_))));
+        let mut client = walking(BatchErrorMode::Continue);
+        let _ = client.end_walk_on_read_error(protocol());
         assert!(!client.has_open_batch());
         assert!(client.is_connection_dead());
-        assert!(client.row_set_errors.is_empty());
 
-        let mut client = failed_row_set();
-        let result: TdsResult<()> =
-            client.close_failed_row_set(Err(UsageError("misuse".to_string())));
-        assert!(matches!(result, Err(crate::error::Error::UsageError(_))));
+        let mut client = walking(BatchErrorMode::Continue);
+        let _ = client.end_walk_on_read_error(crate::error::Error::from_sql_errors(vec![
+            SqlErrorInfo::from(&error_token_with_severity(16)),
+        ]));
         assert!(client.has_open_batch());
         assert!(!client.is_connection_dead());
-        assert_eq!(client.row_set_errors.len(), 1);
 
-        let mut client = failed_row_set();
-        assert_eq!(client.close_failed_row_set(Ok(7)).unwrap(), 7);
+        let mut client = walking(BatchErrorMode::Abort);
+        let _ = client.end_walk_on_read_error(protocol());
+        assert!(client.has_open_batch());
+        assert!(!client.is_connection_dead());
+
+        let mut client = walking(BatchErrorMode::Continue);
+        let result: TdsResult<()> =
+            client.end_walk_on_try_read_error(Err(UsageError("misuse".to_string())));
+        assert!(matches!(result, Err(crate::error::Error::UsageError(_))));
         assert!(client.has_open_batch());
 
-        let mut client = create_test_client();
-        client.execution_context.set_has_open_batch(true);
-        let result: TdsResult<()> = client.close_failed_row_set(Err(
-            crate::error::Error::ProtocolError("decode".to_string()),
-        ));
+        let mut client = walking(BatchErrorMode::Continue);
+        let result: TdsResult<()> = client.end_walk_on_try_read_error(Err(protocol()));
         assert!(result.is_err());
-        assert!(
-            client.has_open_batch(),
-            "no row-set error, nothing to close"
-        );
+        assert!(!client.has_open_batch());
+    }
+
+    /// A row read that consumed bytes and then hit a protocol violation ends a
+    /// `Continue` walk, whichever surface met it: a resumed row returning a
+    /// control token or pausing where it must not, a column pull that decoded
+    /// nothing, a paused row drained into a bad token.
+    #[tokio::test]
+    async fn a_protocol_error_in_a_resumed_row_read_ends_the_walk() {
+        fn paused() -> RowPauseState {
+            RowPauseState {
+                next_column_index: 0,
+                metadata: int_column_metadata(2),
+                nbc_null_bitmap: None,
+                decryptor: None,
+            }
+        }
+        fn walking(resume: RowReadResult) -> TdsClient {
+            let mut transport = TestTransport::new();
+            transport.resume_results.push_back(resume);
+            let mut client = create_test_client_with_transport(transport);
+            client.batch_error_mode = BatchErrorMode::Continue;
+            client.execution_context.set_has_open_batch(true);
+            client.current_metadata = Some(int_column_metadata(2));
+            client.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(paused()));
+            client
+        }
+        fn assert_ended(client: &TdsClient, surface: &str) {
+            assert!(!client.has_open_batch(), "{surface}: batch left open");
+            assert!(client.is_connection_dead(), "{surface}: not retired");
+        }
+        let mut writer = crate::datatypes::row_writer::DefaultRowWriter::new(2);
+
+        let mut client = walking(RowReadResult::Token(done_no_more()));
+        assert!(client.finish_row_into(&mut writer).await.is_err());
+        assert_ended(&client, "finish_row_into, control token");
+
+        let mut client = walking(RowReadResult::RowPaused(paused()));
+        assert!(client.finish_row_into(&mut writer).await.is_err());
+        assert_ended(&client, "finish_row_into, pause");
+
+        let mut client = walking(RowReadResult::Token(done_no_more()));
+        assert!(client.finish_row_prefix_into(1, &mut writer).await.is_err());
+        assert_ended(&client, "finish_row_prefix_into, control token");
+
+        let mut client = walking(RowReadResult::Token(done_no_more()));
+        assert!(client.read_row_column(1).await.is_err());
+        assert_ended(&client, "read_row_column, control token");
+
+        // The mock writes nothing, so the column pull decodes no value.
+        let mut client = walking(RowReadResult::RowWritten);
+        assert!(client.read_row_column(1).await.is_err());
+        assert_ended(&client, "read_row_column, no value");
+
+        let mut client = walking(RowReadResult::Token(int_col_metadata(1)));
+        assert!(client.next_row_cursor().await.is_err());
+        assert_ended(&client, "next_row_cursor draining a paused row");
     }
 
     /// Misuse rejected before anything is read leaves a continued row set as it

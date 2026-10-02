@@ -51,7 +51,11 @@ async fn login_server_name_on_the_wire(override_name: Option<&str>) -> String {
     // Boxed: connecting holds a large future, and leaving it inline makes this
     // helper's own future big enough to trip the `large_futures` lint.
     let client = Box::pin(TdsConnectionProvider {}.create_client(context, &datasource, None)).await;
-    assert!(client.is_ok(), "connect failed: {:?}", client.err());
+    assert!(
+        client.is_ok(),
+        "connect failed: {:?}",
+        client.as_ref().err()
+    );
 
     // Dropping the client lets the server's handler finish, but nothing awaits
     // it: the store is written only when that handler exits, so poll for the
