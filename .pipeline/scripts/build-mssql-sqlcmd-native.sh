@@ -42,7 +42,7 @@ esac
 
 log="$(mktemp)"
 trap 'rm -f "$log"' EXIT
-if ! cargo rustc --locked -p mssql-sqlcmd --release --lib --target "$target" \
+if ! cargo rustc -p mssql-sqlcmd --release --lib --target "$target" \
     --crate-type staticlib -- --print native-static-libs 2>"$log"; then
   cat "$log" >&2
   exit 1

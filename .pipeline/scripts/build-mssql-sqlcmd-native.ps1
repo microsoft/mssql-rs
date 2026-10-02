@@ -43,7 +43,7 @@ try {
 
         $log = New-TemporaryFile
         try {
-            & cargo rustc --locked -p mssql-sqlcmd --release --lib --target $target `
+            & cargo rustc -p mssql-sqlcmd --release --lib --target $target `
                 --crate-type staticlib -- --print native-static-libs 2> $log.FullName
             if ($LASTEXITCODE -ne 0) {
                 Get-Content $log.FullName | Write-Host
