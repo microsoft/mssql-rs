@@ -22,7 +22,7 @@ pub enum IPAddressPreference {
 }
 
 /// Represents a driver version with major, minor, and build components.
-/// Used to populate `client_prog_ver` in the TDS Login7 packet.
+/// Sent in the PRELOGIN `VERSION` option and in Login7 `client_prog_ver`.
 ///
 /// Encoding: `[major (8 bits)][minor (8 bits)][build (16 bits)]`
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -267,7 +267,8 @@ pub struct ClientContext {
     pub language: String,
     /// Client library name sent in the login packet.
     pub library_name: String,
-    /// Driver version used to populate `client_prog_ver` in the TDS Login7 packet.
+    /// Driver version sent in the PRELOGIN `VERSION` option (which SQL Server reports as
+    /// the client driver version) and in Login7 `client_prog_ver`.
     /// Defaults to the crate version from Cargo.toml.
     pub driver_version: DriverVersion,
     /// Token factories keyed by authentication method for Azure AD flows.
