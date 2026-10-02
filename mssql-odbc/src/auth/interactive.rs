@@ -15,9 +15,8 @@
 //!
 //! Off Windows, [`super::entra::configure_auth`] resolves the request to
 //! `ActiveDirectoryIntegrated`, mirroring the fall-through that msodbcsql's
-//! `authMode` ternary produces (`Parse.cpp:3657-3660`). The resulting
-//! diagnostic still names `ActiveDirectoryInteractive`, since that is the
-//! keyword the application supplied.
+//! `authMode` ternary produces (`Parse.cpp:3657-3660`): the connection then
+//! authenticates with the OS identity through [`super::integrated`].
 //!
 //! # Mechanism
 //!

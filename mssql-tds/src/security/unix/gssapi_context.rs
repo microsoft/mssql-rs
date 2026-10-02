@@ -47,9 +47,9 @@
 use super::gssapi_ffi::{
     self, GSS_C_DELEG_FLAG, GSS_C_MUTUAL_FLAG, GSS_C_NO_CHANNEL_BINDINGS, GSS_C_NO_CONTEXT,
     GSS_C_NO_CREDENTIAL, GSS_C_NO_OID, GSS_S_COMPLETE, GSS_S_CONTINUE_NEEDED, GssBufferDesc,
-    GssCtxIdT, GssNameT, GssOmUint32, get_gss_nt_service_name, get_gssapi_error,
+    GssCtxIdT, GssNameT, GssOid, GssOmUint32, get_gss_nt_service_name, get_gssapi_error,
     gss_delete_sec_context, gss_import_name, gss_init_sec_context, gss_release_buffer,
-    gss_release_name,
+    gss_release_name, spnego_mechanism,
 };
 use crate::security::{
     IntegratedAuthConfig, SecurityContext, SecurityError, SspiAuthToken,
@@ -115,6 +115,37 @@ pub struct GssapiContext {
     /// Channel bindings for extended protection
     #[allow(dead_code)]
     channel_bindings: Option<Vec<u8>>,
+
+    /// Mechanism and request flags passed to gss_init_sec_context.
+    purpose: ContextPurpose,
+}
+
+/// What a [GssapiContext] authenticates to, which fixes its mechanism and
+/// request flags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContextPurpose {
+    /// TDS login: default (Kerberos) mechanism with mutual authentication and
+    /// credential delegation.
+    TdsLogin,
+    /// HTTP Negotiate (RFC 4559): SPNEGO with mutual authentication and no
+    /// delegation, so the TGT is never forwarded to the web server.
+    HttpNegotiate,
+}
+
+impl ContextPurpose {
+    fn mechanism(self) -> GssOid {
+        match self {
+            Self::TdsLogin => GSS_C_NO_OID,
+            Self::HttpNegotiate => spnego_mechanism(),
+        }
+    }
+
+    fn req_flags(self) -> GssOmUint32 {
+        match self {
+            Self::TdsLogin => GSS_C_MUTUAL_FLAG | GSS_C_DELEG_FLAG,
+            Self::HttpNegotiate => GSS_C_MUTUAL_FLAG,
+        }
+    }
 }
 
 impl GssapiContext {
@@ -167,6 +198,27 @@ impl GssapiContext {
             target_name: GssNameHandle(target_name),
             is_complete: false,
             channel_bindings: config.channel_bindings.clone(),
+            purpose: ContextPurpose::TdsLogin,
+        })
+    }
+
+    /// Creates a context for HTTP Negotiate authentication to HTTP@host.
+    ///
+    /// Used for the ADFS WS-Trust request in Entra integrated authentication,
+    /// where msodbcsql uses curl's CURLAUTH_GSSNEGOTIATE
+    /// (AzureADAuth.cpp Request): SPNEGO, mutual authentication, and no
+    /// delegation, since msodbcsql never sets CURLOPT_GSSAPI_DELEGATION.
+    pub fn for_http_negotiate(host: &str) -> Result<Self, SecurityError> {
+        Self::check_availability()?;
+        let spn = format!("HTTP@{host}");
+        let target_name = import_name(&spn, true)?;
+        Ok(Self {
+            spn,
+            ctx_handle: GssCtxHandle::default(),
+            target_name: GssNameHandle(target_name),
+            is_complete: false,
+            channel_bindings: None,
+            purpose: ContextPurpose::HttpNegotiate,
         })
     }
 
@@ -189,7 +241,10 @@ impl GssapiContext {
 
 impl SecurityContext for GssapiContext {
     fn package_name(&self) -> &str {
-        "Kerberos"
+        match self.purpose {
+            ContextPurpose::TdsLogin => "Kerberos",
+            ContextPurpose::HttpNegotiate => "Negotiate",
+        }
     }
 
     /// Generates or continues GSSAPI authentication.
@@ -227,8 +282,7 @@ impl SecurityContext for GssapiContext {
             _ => ptr::null_mut(),
         };
 
-        // Request flags: mutual authentication and credential delegation
-        let req_flags = GSS_C_MUTUAL_FLAG | GSS_C_DELEG_FLAG;
+        let req_flags = self.purpose.req_flags();
 
         // Call gss_init_sec_context
         let major_status = unsafe {
@@ -237,7 +291,7 @@ impl SecurityContext for GssapiContext {
                 GSS_C_NO_CREDENTIAL, // Use default credentials (from kinit)
                 &mut self.ctx_handle.0,
                 self.target_name.0,
-                GSS_C_NO_OID, // Use default mechanism (Kerberos)
+                self.purpose.mechanism(),
                 req_flags,
                 0,                         // No time limit
                 GSS_C_NO_CHANNEL_BINDINGS, // Channel bindings not supported on non-Windows
@@ -486,6 +540,32 @@ mod tests {
                     println!("Got error: {:?}", e);
                 }
             }
+        }
+    }
+
+    #[test]
+    fn http_negotiate_uses_spnego_without_delegation() {
+        // Delegation toward a web server would forward the user's TGT to it.
+        let flags = ContextPurpose::HttpNegotiate.req_flags();
+        assert_eq!(flags & GSS_C_DELEG_FLAG, 0);
+        assert_ne!(flags & GSS_C_MUTUAL_FLAG, 0);
+        let oid = unsafe { &*ContextPurpose::HttpNegotiate.mechanism() };
+        let bytes = unsafe { std::slice::from_raw_parts(oid.elements as *const u8, 6) };
+        assert_eq!(oid.length, 6);
+        assert_eq!(bytes, [0x2b, 0x06, 0x01, 0x05, 0x05, 0x02]);
+        // The TDS login path keeps its existing mechanism and flags.
+        assert!(ContextPurpose::TdsLogin.mechanism().is_null());
+        assert_eq!(
+            ContextPurpose::TdsLogin.req_flags(),
+            GSS_C_MUTUAL_FLAG | GSS_C_DELEG_FLAG
+        );
+    }
+
+    #[test]
+    fn http_negotiate_targets_the_http_service() {
+        if let Ok(ctx) = GssapiContext::for_http_negotiate("adfs.contoso.com") {
+            assert_eq!(ctx.spn(), "HTTP@adfs.contoso.com");
+            assert_eq!(ctx.package_name(), "Negotiate");
         }
     }
 
