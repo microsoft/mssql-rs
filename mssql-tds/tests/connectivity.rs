@@ -43,13 +43,21 @@ mod connectivity {
     }
 
     /// Acquires a token for the methods these tests connect with. Any other
-    /// method is reported as a usage error through the token factory, so a
-    /// test that asks for one fails its connection instead of panicking here.
+    /// method, and a credential that cannot produce a token, is reported as an
+    /// error through the token factory, so the test fails its connection with
+    /// the reason instead of panicking here.
     async fn generate_access_token_with_sts_and_resource(
         spn: String,
         sts: String,
         auth_method: &TdsAuthenticationMethod,
     ) -> TdsResult<String> {
+        fn token_error(error: azure_core::Error) -> mssql_tds::error::Error {
+            mssql_tds::error::Error::Security(
+                mssql_tds::security::SecurityError::AuthenticationDenied(format!(
+                    "the test could not acquire an access token: {error}"
+                )),
+            )
+        }
         let scopes = &[spn.as_ref()];
         // `CustomConfiguration` is `#[non_exhaustive]`, so it must be built by
         // mutating a default; the field-reassign lint does not fire on it.
@@ -65,21 +73,26 @@ mod connectivity {
                     client_options,
                     user_assigned_id: None,
                 };
-                let vm_credential = ManagedIdentityCredential::new(Some(options)).unwrap();
-                vm_credential.get_token(scopes, None).await
+                ManagedIdentityCredential::new(Some(options))
+                    .map_err(token_error)?
+                    .get_token(scopes, None)
+                    .await
             }
             TdsAuthenticationMethod::ActiveDirectoryDefault => {
-                let credential = DeveloperToolsCredential::new(None);
-                credential.unwrap().get_token(scopes, None).await
+                DeveloperToolsCredential::new(None)
+                    .map_err(token_error)?
+                    .get_token(scopes, None)
+                    .await
             }
             other => {
                 return Err(mssql_tds::error::Error::UsageError(format!(
                     "the connectivity tests acquire no token for {other:?}"
                 )));
             }
-        };
+        }
+        .map_err(token_error)?;
 
-        let secret = token_response.as_ref().unwrap().token.secret();
+        let secret = token_response.token.secret();
         debug_assert!(!secret.is_empty(), "empty access token");
         Ok(secret.to_string())
     }
