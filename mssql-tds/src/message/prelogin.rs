@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+use crate::connection::client_context::DriverVersion;
 use crate::core::{EncryptionSetting, TdsResult};
 use crate::io::packet_reader::TdsPacketReader;
 use crate::message::messages::{PacketType, Request};
@@ -126,17 +127,18 @@ impl PreloginRequestModel {
         mars_enabled: Option<bool>,
         encryption_setting: Option<EncryptionSetting>,
         database_instance: Option<&str>,
+        driver_version: DriverVersion,
     ) -> Self {
         let mars_enabled = mars_enabled.unwrap_or(false);
         let encryption_setting = encryption_setting.unwrap_or(EncryptionSetting::Strict);
         let database_instance = database_instance.unwrap_or("MSSQLServer").to_string();
         PreloginRequestModel {
-            sdk_version: Version {
-                major: 0,
-                minor: 0,
-                build: 0,
-                revision: 1,
-            },
+            sdk_version: Version::new(
+                driver_version.major,
+                driver_version.minor,
+                driver_version.build,
+                0,
+            ),
             connection_id,
             activity_id: Uuid::new_v4(),
             activity_sequence_number: REQUEST_COUNT.fetch_add(1, Relaxed),
@@ -428,6 +430,7 @@ impl<'a, 'n> Serializer<'a, 'n> {
 pub(crate) mod tests {
     use std::vec;
 
+    use crate::connection::client_context::DriverVersion;
     use crate::core::{EncryptionSetting, SQLServerVersion, Version};
     use crate::message::messages::PacketType;
     use crate::message::prelogin::{
@@ -482,6 +485,7 @@ pub(crate) mod tests {
             Option::from(false),
             Option::from(EncryptionSetting::Required),
             Option::from("MSSQLServer"),
+            DriverVersion::new(2, 5, 1234),
         );
         let mut mock = MockNetworkWriter::new(1024);
         let mut packet_writer = PacketWriter::new(PacketType::PreLogin, &mut mock, None, None);
@@ -490,9 +494,7 @@ pub(crate) mod tests {
         block_on(serializer.serialize()).unwrap();
 
         let mut cursor = packet_writer.get_payload();
-
-        // Just validate that the version was serialized correctly to start with.
-
+        let payload_start = cursor.position() as usize;
         // Validate a few headers.
         assert_eq!(cursor.read_u8().unwrap(), OptionType::Version.to_u8());
         assert_eq!(cursor.read_i16::<BigEndian>().unwrap(), 36); // Initial content_next_offset.
@@ -501,6 +503,10 @@ pub(crate) mod tests {
         assert_eq!(cursor.read_u8().unwrap(), OptionType::Encryption.to_u8());
         assert_eq!(cursor.read_i16::<BigEndian>().unwrap(), 42); // Add the length of the previous header to the content_next_offset.
         assert_eq!(cursor.read_i16::<BigEndian>().unwrap(), 1);
+
+        // SQL Server reports these bytes as the client driver version.
+        let version = &cursor.get_ref()[payload_start + 36..payload_start + 42];
+        assert_eq!(version, &[2, 5, 0x04, 0xD2, 0, 0]);
     }
 
     #[test]
