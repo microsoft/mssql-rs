@@ -547,9 +547,6 @@ pub(crate) struct StmtState {
     /// (in memory — no cursor or connection), mirroring msodbcsql's one
     /// result set per DML statement.
     pub(crate) pending_row_counts: VecDeque<i64>,
-    /// Rowset size for block fetches (`SQL_ATTR_ROW_ARRAY_SIZE`). Defaults to 1
-    /// (single-row). Consumed by the columnar `SQLFetchScroll` path.
-    pub(crate) row_array_size: SqlULen,
     /// Application buffer that receives the count of rows fetched by a block
     /// fetch (`SQL_ATTR_ROWS_FETCHED_PTR`); null when unset. The application
     /// owns this buffer and must keep it valid across the fetch.
@@ -565,8 +562,6 @@ pub(crate) struct StmtState {
     /// when unset. Read at fetch rather than at bind, so the application can
     /// move the whole rowset by updating the pointed-to value.
     pub(crate) row_bind_offset_ptr: *mut SqlULen,
-    /// Number of parameter sets consumed by one SQLExecute.
-    pub(crate) paramset_size: SqlULen,
     /// The active application row descriptor for `SQL_ATTR_APP_ROW_DESC`:
     /// `None` means "use the implicit ARD" (`StmtHandle::ard`); `Some` holds
     /// an explicitly-allocated descriptor associated by
@@ -1596,12 +1591,10 @@ impl StmtHandle {
                 direct_text_target: None,
                 row_count: -1,
                 pending_row_counts: VecDeque::new(),
-                row_array_size: 1,
                 rows_fetched_ptr: std::ptr::null_mut(),
                 row_status_ptr: std::ptr::null_mut(),
                 row_bind_type: crate::api::odbc_types::SQL_BIND_BY_COLUMN,
                 row_bind_offset_ptr: std::ptr::null_mut(),
-                paramset_size: 1,
                 active_ard: None,
                 active_apd: None,
                 state_flags: 0,

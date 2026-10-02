@@ -19,7 +19,7 @@ use super::exec_common::{
     ParamsWithDae, build_named_params, build_named_params_for_row, claim_connection,
     deduct_query_timeout, fail_with_tds, finish_execute_with_param_warning, park_dae_client,
     park_deferred_dae, publish_scalar_processed, query_timeout_expired_error, return_client_idle,
-    snapshot_bound_params,
+    snapshot_bound_params_and_array_size,
 };
 use super::sqlstate::*;
 use super::txn::begin_transaction_if_manual;
@@ -852,8 +852,8 @@ fn stage_execution(stmt: &StmtHandle) -> Result<ExecutionStaging, SqlReturn> {
     // mirroring `SQLExecDirectW`'s handling of the same failure — rather
     // than leave `SQLGetDiagRec` reporting `SQL_NO_DATA` or a stale record
     // from a previous call.
-    let bound_params = match snapshot_bound_params(stmt) {
-        Ok(params) => params,
+    let (bound_params, paramset_size) = match snapshot_bound_params_and_array_size(stmt) {
+        Ok(snapshot) => snapshot,
         Err(rc) => {
             error!("SQLExecute: failed to snapshot parameter bindings");
             if let Ok(mut stmt_state) = stmt.inner.lock() {
@@ -963,8 +963,7 @@ fn stage_execution(stmt: &StmtHandle) -> Result<ExecutionStaging, SqlReturn> {
         return Err(SQL_ERROR);
     };
 
-    if stmt_state.paramset_size > 1 {
-        let paramset_size = stmt_state.paramset_size;
+    if paramset_size > 1 {
         let row_count = paramset_size;
         let bind_offset = unsafe { stmt_state.inert_attrs.param_bind_offset() };
         let param_bind_type = stmt_state
@@ -1158,9 +1157,9 @@ mod tests {
     use crate::api::odbc_types::{
         SQL_ATTR_PARAM_BIND_TYPE, SQL_ATTR_PARAM_OPERATION_PTR, SQL_ATTR_PARAM_STATUS_PTR,
         SQL_ATTR_PARAMS_PROCESSED_PTR, SQL_BIND_BY_COLUMN, SQL_C_CHAR, SQL_C_SLONG,
-        SQL_DATA_AT_EXEC, SQL_INTEGER, SQL_NULL_HANDLE, SQL_PARAM_ERROR, SQL_PARAM_IGNORE,
-        SQL_PARAM_INPUT, SQL_PARAM_OUTPUT, SQL_PARAM_PROCEED, SQL_PARAM_UNUSED, SQL_SUCCESS,
-        SQL_VARCHAR, SqlLen, SqlPointer, SqlULen,
+        SQL_DATA_AT_EXEC, SQL_DESC_ARRAY_SIZE, SQL_INTEGER, SQL_NULL_HANDLE, SQL_PARAM_ERROR,
+        SQL_PARAM_IGNORE, SQL_PARAM_INPUT, SQL_PARAM_OUTPUT, SQL_PARAM_PROCEED, SQL_PARAM_UNUSED,
+        SQL_SUCCESS, SQL_VARCHAR, SqlLen, SqlPointer, SqlULen,
     };
     use crate::api::util::rewrite_param_markers;
     use crate::handles::DescHandle;
@@ -1288,6 +1287,26 @@ mod tests {
                     raw,
                     1,
                     field.try_into().unwrap(),
+                    value as SqlPointer,
+                    0,
+                )
+            },
+            SQL_SUCCESS
+        );
+    }
+
+    /// `SQL_DESC_ARRAY_SIZE` is a descriptor *header* field, so it is written at
+    /// `RecNumber` 0 rather than through the record-oriented
+    /// `set_cached_desc_field` above. This is the canonical storage behind
+    /// `SQL_ATTR_PARAMSET_SIZE` (AB#48943), which is why the array tests below
+    /// stage their paramset size here instead of on `StmtState`.
+    fn set_array_size(raw: SqlHandle, value: isize) {
+        assert_eq!(
+            unsafe {
+                crate::api::SQLSetDescFieldW(
+                    raw,
+                    0,
+                    SQL_DESC_ARRAY_SIZE.try_into().unwrap(),
                     value as SqlPointer,
                     0,
                 )
@@ -2812,7 +2831,6 @@ mod tests {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         {
             let mut state = stmt.inner.lock().unwrap();
-            state.paramset_size = 3;
             state
                 .inert_attrs
                 .set(SQL_ATTR_PARAM_BIND_TYPE, SQL_BIND_BY_COLUMN);
@@ -2828,6 +2846,7 @@ mod tests {
                 (&raw mut processed) as SqlULen,
             );
         }
+        set_array_size(h.apd(), 3);
 
         let ExecutionStaging::Batch(batch) =
             stage_execution(stmt).expect("array staging should succeed")
@@ -2893,7 +2912,6 @@ mod tests {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         {
             let mut state = stmt.inner.lock().unwrap();
-            state.paramset_size = 3;
             state
                 .inert_attrs
                 .set(SQL_ATTR_PARAM_BIND_TYPE, SQL_BIND_BY_COLUMN);
@@ -2914,6 +2932,7 @@ mod tests {
             state.batch_exhausted = true;
             state.pending_fetch_error = Some(TdsError::ProtocolError("stale".to_string()));
         }
+        set_array_size(h.apd(), 3);
 
         let ret = sql_execute_safe(h.stmt, stmt);
 
@@ -2958,7 +2977,6 @@ mod tests {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         {
             let mut state = stmt.inner.lock().unwrap();
-            state.paramset_size = 4;
             state
                 .inert_attrs
                 .set(SQL_ATTR_PARAM_BIND_TYPE, SQL_BIND_BY_COLUMN);
@@ -2970,6 +2988,7 @@ mod tests {
                 (&raw mut *processed) as SqlULen,
             );
         }
+        set_array_size(h.apd(), 4);
         let ExecutionStaging::Batch(batch) =
             stage_execution(stmt).expect("array staging should succeed")
         else {
@@ -3055,7 +3074,6 @@ mod tests {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         {
             let mut state = stmt.inner.lock().unwrap();
-            state.paramset_size = 2;
             state
                 .inert_attrs
                 .set(SQL_ATTR_PARAM_STATUS_PTR, statuses.as_mut_ptr() as SqlULen);
@@ -3064,6 +3082,7 @@ mod tests {
                 (&raw mut processed) as SqlULen,
             );
         }
+        set_array_size(h.apd(), 2);
 
         assert!(stage_execution(stmt).is_err());
         assert_eq!(statuses[0], SQL_PARAM_ERROR);
@@ -3102,7 +3121,7 @@ mod tests {
 
         assert_eq!(rc, SQL_SUCCESS, "binding an output parameter must succeed");
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
-        stmt.inner.lock().unwrap().paramset_size = 2;
+        set_array_size(h.apd(), 2);
         assert!(stage_execution(stmt).is_err());
         assert_eq!(
             stmt.inner.lock().unwrap().diag_records[0].sql_state,
@@ -3142,7 +3161,6 @@ mod tests {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         {
             let mut state = stmt.inner.lock().unwrap();
-            state.paramset_size = 3;
             state.inert_attrs.set(
                 SQL_ATTR_PARAM_OPERATION_PTR,
                 operations.as_mut_ptr() as SqlULen,
@@ -3155,6 +3173,7 @@ mod tests {
                 (&raw mut processed) as SqlULen,
             );
         }
+        set_array_size(h.apd(), 3);
 
         let ExecutionStaging::Batch(batch) =
             stage_execution(stmt).expect("an unknown operation value must not fail")
@@ -3206,7 +3225,6 @@ mod tests {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         {
             let mut state = stmt.inner.lock().unwrap();
-            state.paramset_size = 3;
             state.inert_attrs.set(
                 SQL_ATTR_PARAM_OPERATION_PTR,
                 operations.as_mut_ptr() as SqlULen,
@@ -3219,6 +3237,7 @@ mod tests {
                 (&raw mut processed) as SqlULen,
             );
         }
+        set_array_size(h.apd(), 3);
 
         let ExecutionStaging::Batch(batch) =
             stage_execution(stmt).expect("array staging should succeed")
@@ -3245,7 +3264,7 @@ mod tests {
         let h = TestHandles::with_env_dbc_stmt();
         set_prepared(h.stmt, "INSERT INTO t VALUES (?)");
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
-        stmt.inner.lock().unwrap().paramset_size = 2;
+        set_array_size(h.apd(), 2);
 
         assert!(stage_execution(stmt).is_err());
         let state = stmt.inner.lock().unwrap();

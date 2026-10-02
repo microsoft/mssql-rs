@@ -552,6 +552,60 @@ TEST_F(FetchScrollLiveTest, AdvancesTheCursorLikeFetch) {
     SQLCloseCursor(stmt_);
 }
 
+// AB#48943: SQL_ATTR_ROW_ARRAY_SIZE is an alias of the ARD header's
+// SQL_DESC_ARRAY_SIZE, so the descriptor spelling must size the rowset the
+// fetch actually delivers, and both getters must report one value. The
+// pre-fix driver accepted the descriptor write, then fetched a single row and
+// reported success. The terminal call is included deliberately: it takes the
+// already-exhausted fast path, which marks the status array using that same
+// descriptor field.
+TEST_F(FetchScrollLiveTest, DescriptorArraySizeSizesTheRowset) {
+    ExecThreeRows();
+
+    SQLHDESC ard = SQL_NULL_HDESC;
+    ASSERT_SQL_OK(SQLGetStmtAttr(stmt_, SQL_ATTR_APP_ROW_DESC, &ard, 0, nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLSetDescField(ard, 0, SQL_DESC_ARRAY_SIZE,
+                                  reinterpret_cast<SQLPOINTER>(4), 0),
+                  SQL_HANDLE_DESC, ard);
+
+    SQLULEN reported = 0;
+    ASSERT_SQL_OK(SQLGetStmtAttr(stmt_, SQL_ATTR_ROW_ARRAY_SIZE, &reported, 0, nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(4u, reported) << "the two spellings are one value";
+
+    std::vector<SQLINTEGER> values(4, 0);
+    std::vector<SQLLEN> indicators(4, 0);
+    std::vector<SQLUSMALLINT> status(4, 0xFFFF);
+    SQLULEN rowsFetched = 0;
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_SLONG, values.data(), sizeof(SQLINTEGER),
+                             indicators.data()),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_ROW_STATUS_PTR, status.data(), 0),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_ROWS_FETCHED_PTR, &rowsFetched, 0),
+                  SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_SQL_OK(SQLFetchScroll(stmt_, SQL_FETCH_NEXT, 0), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(3u, rowsFetched) << "the descriptor sized the rowset";
+    EXPECT_EQ(1, values[0]);
+    EXPECT_EQ(2, values[1]);
+    EXPECT_EQ(3, values[2]);
+    EXPECT_EQ(SQL_ROW_NOROW, status[3]);
+
+    for (auto& entry : status) {
+        entry = 0xFFFF;
+    }
+    rowsFetched = 999;
+    EXPECT_EQ(SQL_NO_DATA, SQLFetchScroll(stmt_, SQL_FETCH_NEXT, 0));
+    EXPECT_EQ(0u, rowsFetched);
+    for (size_t i = 0; i < status.size(); ++i) {
+        EXPECT_EQ(SQL_ROW_NOROW, status[i])
+            << "end-of-set must mark the whole descriptor-sized rowset, index " << i;
+    }
+    SQLCloseCursor(stmt_);
+}
+
 TEST_F(FetchScrollLiveTest, ReportsRowsFetched) {
     ExecThreeRows();
     SQLULEN rowsFetched = 999;

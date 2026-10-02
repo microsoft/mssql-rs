@@ -14,7 +14,7 @@ use super::exec_common::{
     ParamsWithDae, build_named_params, build_positional_params, claim_connection,
     deduct_query_timeout, fail_with_tds, finish_execute_with_param_warning,
     flush_pending_unprepare, park_dae_client, park_deferred_dae, publish_scalar_processed,
-    query_timeout_expired_error, snapshot_bound_params,
+    query_timeout_expired_error, snapshot_bound_params_and_array_size,
 };
 use super::sqlstate::*;
 use super::txn::begin_transaction_if_manual;
@@ -116,7 +116,7 @@ fn sql_exec_direct_w_safe(
     // rationale). Not applied to `stmt_state.bound_params` until the
     // early-return checks below have passed, so a rejected re-entry during
     // an active DAE sequence can't clobber that sequence's own snapshot.
-    let Ok(bound_params) = snapshot_bound_params(stmt) else {
+    let Ok((bound_params, paramset_size)) = snapshot_bound_params_and_array_size(stmt) else {
         error!("SQLExecDirectW: failed to snapshot parameter bindings");
         if let Ok(mut stmt_state) = stmt.inner.lock() {
             // Cleared first so this diagnostic lands as record 1, not
@@ -183,7 +183,7 @@ fn sql_exec_direct_w_safe(
         // iRowEnd = dwArraySize regardless of parameter count
         // (sqlccmd.cpp:3192-3199), so running once instead of N times would
         // drop N-1 executions with nothing to show for it.
-        if stmt_state.paramset_size > 1 {
+        if paramset_size > 1 {
             error!("SQLExecDirectW: parameter arrays are not supported on this path");
             post_sql_error(
                 &mut stmt_state,

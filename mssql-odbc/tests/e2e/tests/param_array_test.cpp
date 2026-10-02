@@ -19,6 +19,9 @@
 //   - SQLRowCount reports the SUM of the sets' affected rows
 //
 //   1.  ArrayInsertWritesEveryParameterSet        - N sets, N rows
+//   1b. DescriptorArraySizeExecutesEveryParameterSet - descriptor alias
+//   1c. ParamsetSizeAndDescriptorArraySizeAgree   - both getters, one value
+//   1d. ExplicitAppParamDescCarriesItsOwnArraySize - per-descriptor storage
 //   2.  ArrayInsertAggregatesRowCount             - SQLRowCount is the sum
 //   3.  ArrayHandlesMixedNullAndNonNull           - per-row indicators
 //   4.  ArrayHandlesVariableWidthBuffers          - char/binary use BufferLength
@@ -263,6 +266,122 @@ TEST_F(ParamArrayTest, ArrayInsertWritesEveryParameterSet) {
     EXPECT_EQ("1,2,3,4",
               ScalarString("SELECT STRING_AGG(CONVERT(varchar(11), id), ',') "
                            "WITHIN GROUP (ORDER BY id) FROM #pa"));
+}
+
+// -------------------------------------------------------------------
+// 1b. SQL_DESC_ARRAY_SIZE on the APD is the same setting as
+// SQL_ATTR_PARAMSET_SIZE. This spelling must drive execution, not merely
+// round-trip through SQLGetDescField.
+// -------------------------------------------------------------------
+TEST_F(ParamArrayTest, DescriptorArraySizeExecutesEveryParameterSet) {
+    ExecDirect(kGuardTable);
+    Prepare("INSERT INTO #pa (id, v) VALUES (?, ?)");
+
+    SQLINTEGER ids[4] = {1, 2, 3, 4};
+    SQLINTEGER vals[4] = {10, 20, 30, 40};
+    SQLLEN ind[4] = {0, 0, 0, 0};
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_SLONG,
+                                   SQL_INTEGER, 10, 0, ids, 0, ind),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 2, SQL_PARAM_INPUT, SQL_C_SLONG,
+                                   SQL_INTEGER, 10, 0, vals, 0, ind),
+                  SQL_HANDLE_STMT, stmt_);
+
+    SQLHDESC apd = SQL_NULL_HDESC;
+    ASSERT_SQL_OK(SQLGetStmtAttr(stmt_, SQL_ATTR_APP_PARAM_DESC, &apd, 0, nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLSetDescField(apd, 0, SQL_DESC_ARRAY_SIZE,
+                                  reinterpret_cast<SQLPOINTER>(4), 0),
+                  SQL_HANDLE_DESC, apd);
+
+    SQLULEN statement_size = 0;
+    ASSERT_SQL_OK(SQLGetStmtAttr(stmt_, SQL_ATTR_PARAMSET_SIZE, &statement_size,
+                                 0, nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(4u, statement_size);
+
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(4, ScalarInt("SELECT COUNT(*) FROM #pa"));
+    EXPECT_EQ(100, ScalarInt("SELECT SUM(v) FROM #pa"));
+}
+
+// -------------------------------------------------------------------
+// 1c. The reverse direction of 1b. Separate storage let these two
+// getters report different values for what the spec says is one value,
+// so both directions are pinned, as is the row side staying put: it is
+// a different descriptor and must not move with the parameter side.
+// -------------------------------------------------------------------
+TEST_F(ParamArrayTest, ParamsetSizeAndDescriptorArraySizeAgree) {
+    SQLHDESC apd = SQL_NULL_HDESC;
+    ASSERT_SQL_OK(SQLGetStmtAttr(stmt_, SQL_ATTR_APP_PARAM_DESC, &apd, 0, nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+
+    SQLULEN descriptor_size = 0;
+    ASSERT_SQL_OK(
+        SQLGetDescField(apd, 0, SQL_DESC_ARRAY_SIZE, &descriptor_size, 0, nullptr),
+        SQL_HANDLE_DESC, apd);
+    EXPECT_EQ(1u, descriptor_size) << "both spellings default to a single set";
+
+    ASSERT_EQ(SQL_SUCCESS, SetStmtULen(SQL_ATTR_PARAMSET_SIZE, 5));
+    descriptor_size = 0;
+    ASSERT_SQL_OK(
+        SQLGetDescField(apd, 0, SQL_DESC_ARRAY_SIZE, &descriptor_size, 0, nullptr),
+        SQL_HANDLE_DESC, apd);
+    EXPECT_EQ(5u, descriptor_size) << "the attribute wrote the descriptor header";
+
+    SQLULEN row_size = 0;
+    ASSERT_SQL_OK(SQLGetStmtAttr(stmt_, SQL_ATTR_ROW_ARRAY_SIZE, &row_size, 0, nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(1u, row_size) << "the row side is a different descriptor";
+}
+
+// -------------------------------------------------------------------
+// 1d. An explicit APD carries its own SQL_DESC_ARRAY_SIZE, and once
+// associated it is the one execution uses. This is the case a
+// statement-side copy of the value could never model: an explicit
+// descriptor can be associated with several statements at once, so there
+// is no single statement field to mirror it into.
+// -------------------------------------------------------------------
+TEST_F(ParamArrayTest, ExplicitAppParamDescCarriesItsOwnArraySize) {
+    ExecDirect(kGuardTable);
+    Prepare("INSERT INTO #pa (id, v) VALUES (?, ?)");
+
+    SQLHDESC explicit_apd = SQL_NULL_HDESC;
+    ASSERT_SQL_OK(SQLAllocHandle(SQL_HANDLE_DESC, dbc_, &explicit_apd), SQL_HANDLE_DBC, dbc_);
+    ASSERT_SQL_OK(SQLSetDescField(explicit_apd, 0, SQL_DESC_ARRAY_SIZE,
+                                  reinterpret_cast<SQLPOINTER>(3), 0),
+                  SQL_HANDLE_DESC, explicit_apd);
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_APP_PARAM_DESC, explicit_apd, 0),
+                  SQL_HANDLE_STMT, stmt_);
+
+    SQLULEN reported = 0;
+    ASSERT_SQL_OK(SQLGetStmtAttr(stmt_, SQL_ATTR_PARAMSET_SIZE, &reported, 0, nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(3u, reported) << "the associated descriptor supplies the array size";
+
+    SQLINTEGER ids[3] = {1, 2, 3};
+    SQLINTEGER vals[3] = {10, 20, 30};
+    SQLLEN ind[3] = {0, 0, 0};
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_SLONG,
+                                   SQL_INTEGER, 10, 0, ids, 0, ind),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 2, SQL_PARAM_INPUT, SQL_C_SLONG,
+                                   SQL_INTEGER, 10, 0, vals, 0, ind),
+                  SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(3, ScalarInt("SELECT COUNT(*) FROM #pa"));
+    EXPECT_EQ(60, ScalarInt("SELECT SUM(v) FROM #pa"));
+
+    // Reverting to the implicit APD restores that descriptor's own value,
+    // which the explicit association never touched.
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_APP_PARAM_DESC, nullptr, 0),
+                  SQL_HANDLE_STMT, stmt_);
+    reported = 0;
+    ASSERT_SQL_OK(SQLGetStmtAttr(stmt_, SQL_ATTR_PARAMSET_SIZE, &reported, 0, nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(1u, reported);
+    EXPECT_EQ(SQL_SUCCESS, SQLFreeHandle(SQL_HANDLE_DESC, explicit_apd));
 }
 
 // -------------------------------------------------------------------

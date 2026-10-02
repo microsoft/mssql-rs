@@ -840,7 +840,6 @@ fn fetch_scroll_safe(
     // fetch on the same statement, so the snapshot cannot go stale under us.
     let (
         ard,
-        row_array_size,
         rows_fetched_ptr,
         row_status_ptr,
         column_count,
@@ -892,7 +891,7 @@ fn fetch_scroll_safe(
         if stmt_state.result_set_exhausted {
             let rows_fetched_ptr = stmt_state.rows_fetched_ptr;
             let row_status_ptr = stmt_state.row_status_ptr;
-            let row_array_size = stmt_state.row_array_size;
+            let ard = stmt_state.effective_ard(stmt);
             stmt_state.reset_row_stream();
             // That same peek can have found a trailing SQL Server error
             // instead of a clean end of set (see
@@ -909,7 +908,19 @@ fn fetch_scroll_safe(
             };
             drop(stmt_state);
             unsafe { write_if_some(rows_fetched_ptr, 0) };
-            mark_no_rows(row_status_ptr, 0, row_array_size);
+            // The rowset extent is the ARD header's `SQL_DESC_ARRAY_SIZE`
+            // (AB#48943), so reading it needs the DESC lock the STMT lock was
+            // just dropped for. Skipped entirely when no status array is
+            // bound, so the common terminal fetch takes no descriptor lock at
+            // all. A descriptor that cannot be read leaves the status array
+            // untouched rather than guessing an extent: `mark_no_rows` writes
+            // through an application pointer, so a guessed extent would
+            // overrun it. The verdict this path already computed is returned
+            // either way — an unreadable ARD must not turn a known
+            // `SQL_NO_DATA` into an error.
+            if !row_status_ptr.is_null() {
+                mark_no_rows(row_status_ptr, 0, ard_array_size(ard).unwrap_or(0));
+            }
             debug!(?rc, "SQLFetchScroll: result set already known exhausted");
             return rc;
         }
@@ -922,7 +933,8 @@ fn fetch_scroll_safe(
         // Claiming the statement here is what stops a concurrent SQLBindCol
         // from freeing an application buffer the fill loop is still reading
         // through after this lock is released; the mutating entry points
-        // refuse while this is set.
+        // refuse while this is set. Set before the ARD is read below so no
+        // rebind can slip in between the read and the claim.
         stmt_state.set_state(STMT_STATE_FETCH_IN_PROGRESS);
         let trailing_utf16_plp = stmt_state
             .column_metadata
@@ -931,7 +943,6 @@ fn fetch_scroll_safe(
             == Some(PlpEncoding::Utf16Text);
         (
             ard,
-            stmt_state.row_array_size,
             stmt_state.rows_fetched_ptr,
             stmt_state.row_status_ptr,
             stmt_state.column_metadata.len(),
@@ -948,7 +959,7 @@ fn fetch_scroll_safe(
     // statement is not left permanently stuck mid-fetch: silently treating it
     // as "nothing bound" would advance the cursor and report success for a
     // rowset the application never actually got the columns it asked for.
-    let bindings: Vec<ColumnBinding> = {
+    let (row_array_size, bindings): (SqlULen, Vec<ColumnBinding>) = {
         // `ard` can be an explicit descriptor resolved under the STMT lock,
         // already dropped by now — re-check liveness right before
         // dereferencing to narrow (not fully close) the race against a
@@ -981,6 +992,7 @@ fn fetch_scroll_safe(
             }
             return SQL_ERROR;
         };
+        let row_array_size = desc_state.header.array_size;
         let mut bindings = ColumnBinding::all_from_ard_state(&desc_state);
         drop(desc_state);
         if bindings
@@ -999,7 +1011,7 @@ fn fetch_scroll_safe(
                 .collect();
             resolve_default_bindings(&mut bindings, &column_sql_types, odbc_version);
         }
-        bindings
+        (row_array_size, bindings)
     };
     let get_data_fetch = row_array_size == 1 && bindings.is_empty();
     let reusable_get_data_row = if get_data_fetch {
@@ -1591,6 +1603,21 @@ fn dispatch_rows(row_budget: SqlULen, mut dispatch: impl FnMut() -> bool) {
             break;
         }
     }
+}
+
+/// Reads `SQL_DESC_ARRAY_SIZE` off a descriptor whose handle was resolved under
+/// a STMT lock that has since been dropped.
+///
+/// `None` when the descriptor was freed concurrently or its mutex is poisoned,
+/// so callers that only need the rowset extent to walk an application-owned
+/// status array can skip that walk instead of guessing a length.
+fn ard_array_size(ard: SqlHandle) -> Option<SqlULen> {
+    if crate::handles::live_type(ard) != Some(crate::handles::HandleType::Desc) {
+        return None;
+    }
+    let desc = unsafe { handle_from_raw::<DescHandle>(ard) };
+    let desc_state = desc.inner.lock().ok()?;
+    Some(desc_state.header.array_size)
 }
 
 /// Writes `SQL_ROW_NOROW` into the unused tail of the row status array.
@@ -2495,9 +2522,10 @@ mod tests {
     use super::*;
     use crate::api::bind_col::sql_bind_col;
     use crate::api::odbc_types::{
-        SQL_C_BINARY, SQL_C_SLONG, SQL_DESC_CONCISE_TYPE, SQL_DESC_DATA_PTR,
-        SQL_DESC_INDICATOR_PTR, SQL_DESC_OCTET_LENGTH_PTR, SQL_FETCH_ABSOLUTE, SQL_FETCH_FIRST,
-        SQL_FETCH_LAST, SQL_FETCH_PRIOR, SQL_FETCH_RELATIVE, SQL_GUID, SQL_INTEGER, SQL_WVARCHAR,
+        SQL_ATTR_ROW_ARRAY_SIZE, SQL_C_BINARY, SQL_C_SLONG, SQL_DESC_ARRAY_SIZE,
+        SQL_DESC_CONCISE_TYPE, SQL_DESC_DATA_PTR, SQL_DESC_INDICATOR_PTR,
+        SQL_DESC_OCTET_LENGTH_PTR, SQL_FETCH_ABSOLUTE, SQL_FETCH_FIRST, SQL_FETCH_LAST,
+        SQL_FETCH_PRIOR, SQL_FETCH_RELATIVE, SQL_GUID, SQL_INTEGER, SQL_WVARCHAR,
     };
     use crate::api::sqlstate::SQLSTATE_HY106;
     use crate::api::sqlstate::{ERR_CONNECTION_BUSY, SQLSTATE_24000, SQLSTATE_HY000};
@@ -2512,6 +2540,11 @@ mod tests {
         tds_client_from_mixed_lob_prefix_rows, tds_client_from_partial_int_rows,
         tds_client_from_tokens,
     };
+
+    fn set_row_array_size(h: &TestHandles, value: SqlULen) {
+        let ard = unsafe { handle_from_raw::<DescHandle>(h.ard()) };
+        ard.inner.lock().unwrap().header.array_size = value;
+    }
 
     fn binding(
         column_number: SqlUSmallInt,
@@ -3151,10 +3184,10 @@ mod tests {
             state.begin_result_set(int_columns(1));
             state.max_rows = 5;
             state.rows_returned = 4;
-            state.row_array_size = 4;
             state.rows_fetched_ptr = &mut rows_fetched;
             state.row_status_ptr = statuses.as_mut_ptr();
         }
+        set_row_array_size(&h, 4);
         assert_eq!(
             unsafe {
                 sql_bind_col(
@@ -3195,8 +3228,8 @@ mod tests {
             let mut state = stmt.inner.lock().unwrap();
             state.max_rows = 0;
             state.rows_returned = 0;
-            state.row_array_size = 1;
         }
+        set_row_array_size(&h, 1);
         assert_eq!(
             unsafe { sql_fetch_scroll(h.stmt, SQL_FETCH_NEXT, 0) },
             SQL_SUCCESS
@@ -3402,7 +3435,7 @@ mod tests {
         let multi = TestHandles::with_env_dbc_stmt();
         mixed_lob_stmt(&multi, vec![vec![10, 20], vec![30, 40]]);
         let multi_stmt = unsafe { handle_from_raw::<StmtHandle>(multi.stmt) };
-        multi_stmt.inner.lock().unwrap().row_array_size = 2;
+        set_row_array_size(&multi, 2);
         assert_eq!(
             unsafe { sql_fetch_scroll(multi.stmt, SQL_FETCH_NEXT, 0) },
             SQL_SUCCESS
@@ -3499,8 +3532,8 @@ mod tests {
             let mut state = stmt.inner.lock().unwrap();
             state.set_state(STMT_STATE_CURSOR_OPEN);
             state.begin_result_set(int_columns(1));
-            state.row_array_size = 2;
         }
+        set_row_array_size(&h, 2);
         assert_eq!(
             unsafe {
                 sql_bind_col(
@@ -3563,8 +3596,8 @@ mod tests {
             let mut state = stmt.inner.lock().unwrap();
             state.set_state(STMT_STATE_CURSOR_OPEN);
             state.begin_result_set(int_columns(1));
-            state.row_array_size = 2;
         }
+        set_row_array_size(&h, 2);
 
         // Bind column 1 entirely through SQLSetDescField, never SQLBindCol.
         // The descriptor API exposes SQL_DESC_INDICATOR_PTR and
@@ -3987,6 +4020,127 @@ mod tests {
             let s = stmt.inner.lock().unwrap();
             assert_eq!(s.diag_records.last().unwrap().sql_state, SQLSTATE_HY106);
         }
+    }
+
+    /// The exhausted fast path fills the unused tail of the row status array,
+    /// and its extent is the ARD header's `SQL_DESC_ARRAY_SIZE` (AB#48943) —
+    /// the same storage `SQL_ATTR_ROW_ARRAY_SIZE` writes. Reading it needs the
+    /// DESC lock, which is why this path drops the STMT lock before the walk;
+    /// the walk must still happen, and must still cover the whole rowset.
+    #[test]
+    fn exhausted_cursor_fast_path_marks_the_status_array_from_the_ard() {
+        let h = TestHandles::with_env_dbc_stmt();
+        open_cursor(&h);
+        let mut rows_fetched: SqlULen = 99;
+        let mut statuses = [0xBEEF_u16; 3];
+        {
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let mut s = stmt.inner.lock().unwrap();
+            s.result_set_exhausted = true;
+            s.rows_fetched_ptr = &mut rows_fetched;
+            s.row_status_ptr = statuses.as_mut_ptr();
+        }
+        // Sized through the descriptor spelling, never through StmtState.
+        assert_eq!(
+            unsafe {
+                crate::api::set_desc_field::sql_set_desc_field_w(
+                    h.ard(),
+                    0,
+                    SQL_DESC_ARRAY_SIZE as SqlSmallInt,
+                    3 as SqlPointer,
+                    0,
+                )
+            },
+            SQL_SUCCESS
+        );
+
+        assert_eq!(
+            unsafe { sql_fetch_scroll(h.stmt, SQL_FETCH_NEXT, 0) },
+            SQL_NO_DATA
+        );
+        assert_eq!(rows_fetched, 0);
+        assert_eq!(statuses, [SQL_ROW_NOROW; 3]);
+    }
+
+    /// `SQL_DESC_ARRAY_SIZE` on the ARD is the same setting as
+    /// `SQL_ATTR_ROW_ARRAY_SIZE`, so writing it through the descriptor
+    /// spelling must size the rowset a block fetch actually delivers — not
+    /// merely round-trip through `SQLGetDescField`. The pre-fix driver
+    /// returned a single row here while reporting success.
+    #[test]
+    fn descriptor_array_size_drives_the_block_fetch_rowset() {
+        let h = TestHandles::with_env_dbc_stmt();
+        h.mark_dbc_connected();
+        let mut values = [0_i32; 3];
+        let mut indicators = [0 as SqlLen; 3];
+        let mut rows_fetched: SqlULen = 0;
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.set_state(STMT_STATE_CURSOR_OPEN);
+            state.begin_result_set(int_columns(1));
+            state.rows_fetched_ptr = &mut rows_fetched;
+        }
+        assert_eq!(
+            unsafe {
+                crate::api::set_desc_field::sql_set_desc_field_w(
+                    h.ard(),
+                    0,
+                    SQL_DESC_ARRAY_SIZE as SqlSmallInt,
+                    3 as SqlPointer,
+                    0,
+                )
+            },
+            SQL_SUCCESS
+        );
+
+        // The statement attribute reports the descriptor's value, so the two
+        // getters cannot disagree about one logical setting.
+        let mut reported: SqlULen = 0;
+        assert_eq!(
+            unsafe {
+                crate::api::set_stmt_attr::sql_get_stmt_attr_w(
+                    h.stmt,
+                    SQL_ATTR_ROW_ARRAY_SIZE,
+                    (&mut reported as *mut SqlULen).cast(),
+                    0,
+                    std::ptr::null_mut(),
+                )
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!(reported, 3);
+
+        assert_eq!(
+            unsafe {
+                sql_bind_col(
+                    h.stmt,
+                    1,
+                    SQL_C_SLONG,
+                    values.as_mut_ptr().cast(),
+                    0,
+                    indicators.as_mut_ptr(),
+                )
+            },
+            SQL_SUCCESS
+        );
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let mut client = tds_client_from_int_rows(vec![vec![10], vec![20], vec![30]]);
+        dbc.runtime
+            .block_on(client.execute("SELECT descriptor rowset".to_string(), ()))
+            .unwrap();
+        {
+            let mut state = dbc.inner.lock().unwrap();
+            state.client = Some(client);
+            state.active_stmt = Some(h.stmt);
+        }
+
+        assert_eq!(
+            unsafe { sql_fetch_scroll(h.stmt, SQL_FETCH_NEXT, 0) },
+            SQL_SUCCESS
+        );
+        assert_eq!(rows_fetched, 3, "the descriptor sized the rowset");
+        assert_eq!(values, [10, 20, 30]);
     }
 
     #[test]
@@ -5634,11 +5788,11 @@ mod tests {
         {
             let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
             let mut s = stmt.inner.lock().unwrap();
-            s.row_array_size = 3;
             s.rows_fetched_ptr = &mut rows_fetched;
             s.row_status_ptr = status.as_mut_ptr();
             s.column_metadata = int_columns(1);
         }
+        set_row_array_size(&h, 3);
         // active_stmt stays None: an earlier fetch drained the connection.
         let rc = unsafe { sql_fetch_scroll(h.stmt, SQL_FETCH_NEXT, 0) };
         assert_eq!(rc, SQL_NO_DATA);
