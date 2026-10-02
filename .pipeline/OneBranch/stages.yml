@@ -67,6 +67,11 @@ parameters:
   default: false
   displayName: 'Publish NuGet package to Azure Artifacts feed'
 
+- name: buildMssqlSqlcmd
+  type: boolean
+  default: false
+  displayName: 'Also build the mssql-sqlcmd NuGet package (published with the wheels)'
+
 stages:
 #############################################################################
 # Build Stage - All platforms
@@ -653,6 +658,18 @@ stages:
           artifact: 'drop_Build_MacOS_universal2_macos_universal2'
           publishLocation: 'pipeline'
 
+  #########################################################################
+  # mssql-sqlcmd: the static-library NuGet package native ODBC sqlcmd
+  # (msodbcsql) restores. The Publish stage below publishes it next to the
+  # wheels package, with the same -dev/-nightly versioning.
+  #########################################################################
+  - ${{ if eq(parameters.buildMssqlSqlcmd, true) }}:
+    - template: /.pipeline/OneBranch/mssql-sqlcmd-jobs.yml
+      parameters:
+        linuxImage: ${{ parameters.linuxImage }}
+        linuxArmImage: ${{ parameters.linuxArmImage }}
+        isOfficial: ${{ parameters.isOfficial }}
+
 #############################################################################
 # Publish Stage - Collect wheels, create NuGet package, publish to feed
 #############################################################################
@@ -796,6 +813,19 @@ stages:
           packagesToPack: '$(Build.StagingDirectory)/mssql-python-rs-wheels.nuspec'
           packDestination: '$(ob_outputDirectory)/packages'
           basePath: '$(Build.StagingDirectory)'
+
+      # The mssql-sqlcmd package was packed by its Build job; OneBranch publishes
+      # it from the same folder as the wheels package.
+      - ${{ if eq(parameters.buildMssqlSqlcmd, true) }}:
+        - pwsh: |
+            $ErrorActionPreference = 'Stop'
+            $packages = @(Get-ChildItem "$(Pipeline.Workspace)/drop_Build_MssqlSqlcmd_Package" -Filter 'mssql-sqlcmd.*.nupkg')
+            if ($packages.Count -ne 1) {
+              throw "Expected one mssql-sqlcmd package, found $($packages.Count)"
+            }
+            Copy-Item $packages[0].FullName "$(ob_outputDirectory)/packages"
+            Write-Host "Publishing $($packages[0].Name)"
+          displayName: 'Stage the mssql-sqlcmd package'
 
       - pwsh: |
           Write-Host "=== NuGet package created ==="
