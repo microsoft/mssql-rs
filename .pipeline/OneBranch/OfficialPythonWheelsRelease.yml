@@ -29,6 +29,11 @@ parameters:
     type: boolean
     default: false  # Safety: default to false to prevent accidental releases
 
+  - name: publishMssqlSqlcmd
+    displayName: 'Publish the mssql-sqlcmd NuGet package to Azure Artifacts'
+    type: boolean
+    default: false  # Safety: default to false to prevent accidental releases
+
   - name: publishMssqlTds
     displayName: 'Publish mssql-tds to crates.io'
     type: boolean
@@ -225,6 +230,65 @@ extends:
               }
               Write-Host "NuGet WILL be published to feed (publishNuGet=true)"
             displayName: 'Verify NuGet package'
+
+    ###########################################################################
+    # mssql-sqlcmd: the static-library package native sqlcmd (msodbcsql)
+    # restores. The Official Build packed it; this publishes that exact file.
+    # msodbcsql's msodbcsql_PublicPackages feed reaches it through an upstream
+    # source pointing at this feed.
+    ###########################################################################
+    - ${{ if eq(parameters.publishMssqlSqlcmd, true) }}:
+      - stage: ReleaseMssqlSqlcmd
+        displayName: 'Publish mssql-sqlcmd NuGet package'
+        dependsOn: []
+        jobs:
+        - job: PublishMssqlSqlcmd
+          displayName: 'Publish mssql-sqlcmd'
+          pool:
+            type: windows
+          variables:
+            ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
+            ob_nugetPublishing_enabled: true
+          steps:
+          - download: officialBuild
+            artifact: drop_Build_MssqlSqlcmd_NuGet
+            displayName: 'Download the mssql-sqlcmd package from the Official Build'
+
+          # The feed is configured with continueOnConflict, which would skip an
+          # existing version silently and leave consumers on the old binaries.
+          # Fail instead: each release needs a version bump in Cargo.toml.
+          - pwsh: |
+              $ErrorActionPreference = 'Stop'
+              $source = "$(Pipeline.Workspace)/officialBuild/drop_Build_MssqlSqlcmd_NuGet"
+              $packages = @(Get-ChildItem $source -Filter 'mssql-sqlcmd.*.nupkg')
+              if ($packages.Count -ne 1) {
+                throw "Expected one mssql-sqlcmd package in $source, found $($packages.Count)"
+              }
+              $package = $packages[0]
+              $version = $package.BaseName.Substring('mssql-sqlcmd.'.Length)
+              if ($version -match '-') {
+                throw "mssql-sqlcmd $version is a prerelease; release from an Official Build run"
+              }
+
+              $flat = 'https://pkgs.dev.azure.com/sqlclientdrivers/public/_packaging/mssql-rs_Public/nuget/v3/flat2/mssql-sqlcmd/index.json'
+              $headers = @{ Authorization = "Bearer $env:SYSTEM_ACCESSTOKEN" }
+              try {
+                $published = (Invoke-RestMethod -Uri $flat -Headers $headers).versions
+              } catch {
+                if ($_.Exception.Response.StatusCode.value__ -ne 404) { throw }
+                $published = @()
+              }
+              if ($published -contains $version.ToLowerInvariant()) {
+                throw "mssql-sqlcmd $version is already on the feed; bump the version in mssql-sqlcmd/Cargo.toml"
+              }
+
+              $dest = "$(ob_outputDirectory)/packages"
+              New-Item -ItemType Directory -Force -Path $dest | Out-Null
+              Copy-Item $package.FullName $dest
+              Write-Host "Publishing $($package.Name) from build $(resources.pipeline.officialBuild.runID) ($(resources.pipeline.officialBuild.sourceCommit))"
+            displayName: 'Check and stage the mssql-sqlcmd package'
+            env:
+              SYSTEM_ACCESSTOKEN: $(System.AccessToken)
 
     ###########################################################################
     # Rust: offline integrity -> registry preflight -> ESRP -> availability.

@@ -54,3 +54,4 @@ extends:
         buildRustCrates: true
         testPythonWheelInstalls: true
         isOfficial: true
+        buildMssqlSqlcmd: true
