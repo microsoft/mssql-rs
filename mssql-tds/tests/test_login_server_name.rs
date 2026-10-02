@@ -83,7 +83,7 @@ async fn read_login_server_name(
     loop {
         let recorded = {
             let store = store.lock().await;
-            let connections: Vec<_> = store.all().values().collect();
+            let connections = store.all();
             if connections.len() > 1 {
                 return Err(format!(
                     "expected at most one connection, got {}",
@@ -91,7 +91,8 @@ async fn read_login_server_name(
                 ));
             }
             connections
-                .first()
+                .values()
+                .next()
                 .and_then(|c| c.received_server_name.clone())
         };
         if let Some(name) = recorded {

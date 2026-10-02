@@ -698,11 +698,10 @@ mod query_result_reads {
                     let mut values = Vec::new();
                     loop {
                         match connection.next_row().await {
-                            Ok(Some(row)) => {
-                                if let ColumnValues::Int(v) = row[0] {
-                                    values.push(v);
-                                }
-                            }
+                            Ok(Some(row)) => match row[0] {
+                                ColumnValues::Int(v) => values.push(v),
+                                ref other => panic!("expected an int first column, got {other:?}"),
+                            },
                             Ok(None) => {
                                 steps.push(Step::Rows(values, connection.last_result_row_count()));
                                 break;

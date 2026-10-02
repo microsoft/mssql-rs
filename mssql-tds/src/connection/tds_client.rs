@@ -5466,7 +5466,7 @@ impl TdsClient {
                                             Self::too_many_errors_for_one_statement(),
                                         ));
                                     }
-                                    info!(?next_error);
+                                    debug!(?next_error);
                                     all_errors.push(self.record_error_token(&next_error));
                                     if !self.continues_after(&next_error) {
                                         continues = false;
@@ -5474,7 +5474,7 @@ impl TdsClient {
                                     }
                                 }
                                 Tokens::Info(info_token) => {
-                                    info!(?info_token);
+                                    debug!(?info_token);
                                     self.capture_info_message(&info_token);
                                 }
                                 other => {
