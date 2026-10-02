@@ -962,6 +962,7 @@ pub(super) unsafe fn build_named_params_for_row(
             };
             params.push(rpc);
         } else {
+            unsafe { crate::conversion::param_convert::stamp_numeric_apd(&bound_param) };
             let (param, outcome) = unsafe { bound_param_to_rpc(name, &bound_param, udt_names) }
                 .map_err(|source| ParamRowBuildError::Conversion {
                     parameter: i + 1,
@@ -3136,6 +3137,49 @@ mod tests {
         assert_eq!(built.dae_params.first().unwrap().value_ptr, unsafe {
             value.as_mut_ptr().add(1).cast()
         });
+    }
+
+    /// Execution writes the APD precision and scale into the bound row's
+    /// `SQL_NUMERIC_STRUCT`, through the bind offset, like msodbcsql
+    /// (`sqlcfunc.cpp:3165-3176`); the unshifted struct is left alone.
+    #[test]
+    fn build_named_params_writes_apd_metadata_into_the_offset_numeric_struct() {
+        use crate::api::odbc_types::{SQL_C_NUMERIC, SQL_DECIMAL, SqlNumericStruct};
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+
+        let embedded = SqlNumericStruct {
+            precision: 5,
+            scale: 3,
+            sign: 1,
+            val: 12345u128.to_le_bytes(),
+        };
+        let mut values = [embedded; 2];
+        let mut offset = std::mem::size_of::<SqlNumericStruct>() as SqlLen;
+
+        let mut state = stmt.inner.lock().unwrap();
+        state
+            .inert_attrs
+            .set(SQL_ATTR_PARAM_BIND_OFFSET_PTR, &raw mut offset as SqlULen);
+        state.bound_params.push(snap(BoundParam {
+            input_output_type: SQL_PARAM_INPUT,
+            c_type: SQL_C_NUMERIC,
+            sql_type: SQL_DECIMAL,
+            column_size: 10,
+            decimal_digits: 2,
+            app_precision: 38,
+            app_scale: 0,
+            parameter_value_ptr: values.as_mut_ptr().cast(),
+            buffer_length: 0,
+            strlen_or_ind_ptr: std::ptr::null_mut(),
+            octet_length_ptr: std::ptr::null_mut(),
+        }));
+
+        unsafe { build_named_params(&mut state, 1, "test") }.unwrap();
+        drop(state);
+        assert_eq!((values[0].precision, values[0].scale), (5, 3));
+        assert_eq!((values[1].precision, values[1].scale), (38, 0));
     }
 
     /// The companion to the test above: with no offset set, the same binding

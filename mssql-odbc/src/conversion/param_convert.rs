@@ -36,8 +36,8 @@ use mssql_tds::token::tokens::SqlCollation;
 use uuid::Uuid;
 
 use crate::api::odbc_types::{
-    SQL_BIGINT, SQL_BINARY, SQL_BIT, SQL_C_BINARY, SQL_C_CHAR, SQL_C_WCHAR, SQL_CHAR,
-    SQL_DATA_AT_EXEC, SQL_DECIMAL, SQL_DOUBLE, SQL_FLOAT, SQL_GUID, SQL_INTEGER,
+    SQL_BIGINT, SQL_BINARY, SQL_BIT, SQL_C_BINARY, SQL_C_CHAR, SQL_C_NUMERIC, SQL_C_WCHAR,
+    SQL_CHAR, SQL_DATA_AT_EXEC, SQL_DECIMAL, SQL_DOUBLE, SQL_FLOAT, SQL_GUID, SQL_INTEGER,
     SQL_LEN_DATA_AT_EXEC_OFFSET, SQL_LONGVARBINARY, SQL_LONGVARCHAR, SQL_NULL_DATA, SQL_NUMERIC,
     SQL_REAL, SQL_SMALLINT, SQL_SS_TIME2, SQL_SS_TIMESTAMPOFFSET, SQL_SS_UDT, SQL_SS_VARIANT,
     SQL_SS_VECTOR, SQL_SS_VECTOR_ELEMENT_SIZE, SQL_SS_XML, SQL_TINYINT, SQL_TYPE_DATE,
@@ -1557,6 +1557,38 @@ fn decimal_from_text(param: &BoundParam, text: AppText) -> Result<TypedValue, Pa
     Ok((decimal_of(param.sql_type, value), Some(metadata)))
 }
 
+fn numeric_apd_matches_ipd(param: &BoundParam) -> bool {
+    matches!(param.sql_type, SQL_NUMERIC | SQL_DECIMAL)
+        && usize::try_from(param.app_precision) == Ok(param.column_size)
+        && param.app_scale == param.decimal_digits
+}
+
+/// msodbcsql writes the APD precision and scale into the application's
+/// `SQL_NUMERIC_STRUCT` whenever it converts one (`sqlcfunc.cpp:3165-3176`).
+/// A later execution that takes the fast path then forwards those fields, so
+/// skipping the write would send a different value.
+///
+/// # Safety
+/// `param` must address the application's own buffer under the
+/// `SQLBindParameter` contract - never a driver-owned copy such as the
+/// data-at-execution staging buffer.
+pub(crate) unsafe fn stamp_numeric_apd(param: &BoundParam) {
+    if param.c_type != SQL_C_NUMERIC
+        || is_output_only(param.input_output_type)
+        || numeric_apd_matches_ipd(param)
+        || !matches!(unsafe { read_indicator(param) }, Ok(Indicator::Length(_)))
+    {
+        return;
+    }
+    let numeric = param.parameter_value_ptr.cast::<u8>();
+    // `precision` and `scale` are the struct's first two bytes; truncating to
+    // a byte matches retail's `(BYTE)` casts.
+    unsafe {
+        numeric.write(param.app_precision as u8);
+        numeric.add(1).write(param.app_scale as u8);
+    }
+}
+
 fn decimal_from_numeric(
     param: &BoundParam,
     source: SqlNumericStruct,
@@ -1566,13 +1598,12 @@ fn decimal_from_numeric(
     // (`sqlcfunc.cpp:3165-3176`). When they match, FastDescribeRPCParam
     // copies the struct whole, including its own precision and scale
     // (`sqlcmisc.cpp:7014`), and SQL Server converts it to the declared type.
-    // Otherwise the APD precision/scale describe `val[]`. Measured on Driver
+    // Otherwise the APD precision/scale describe `val[]`, and execution has
+    // already written them into the struct (`stamp_numeric_apd`). Measured on Driver
     // 18.6.2.1 (`SQL_DRIVER_VER` 18.06.0002): a bare `(38, 0)` bind of
     // `12.5` (embedded scale 1) into `decimal(38,0)` returns `13`, and a bare
     // bind of embedded `12.345` into `decimal(10,2)` returns `12345.00`.
-    if usize::try_from(param.app_precision) == Ok(param.column_size)
-        && param.app_scale == param.decimal_digits
-    {
+    if numeric_apd_matches_ipd(param) {
         let metadata = RpcTypeMetadata {
             precision: Some(source.precision),
             scale: Some(source.scale as u8),
@@ -2387,6 +2418,59 @@ mod tests {
         assert_eq!(
             value,
             SqlType::Decimal(Some(DecimalParts::new(true, 10, 2, 1_234_500)))
+        );
+    }
+
+    /// Off the fast path the APD metadata lands in the application's struct, so
+    /// re-executing after aligning the APD with the IPD forwards `(38, 0)` and
+    /// sends `12345`, as msodbcsql does, rather than the original `12.345`.
+    #[test]
+    fn a_numeric_off_the_fast_path_writes_apd_metadata_into_the_struct() {
+        use crate::api::odbc_types::SQL_PARAM_OUTPUT;
+
+        fn mismatched(source: &mut SqlNumericStruct, ind: &mut SqlLen) -> BoundParam {
+            *source = SqlNumericStruct {
+                precision: 5,
+                ..numeric_struct(12345, 1, 3)
+            };
+            let mut p = param(SQL_C_NUMERIC, (source as *mut SqlNumericStruct).cast(), ind);
+            p.sql_type = SQL_DECIMAL;
+            p.column_size = 10;
+            p.decimal_digits = 2;
+            p.app_precision = 38;
+            p.app_scale = 0;
+            p
+        }
+        fn align(p: &mut BoundParam) {
+            p.app_precision = 10;
+            p.app_scale = 2;
+        }
+        let size = std::mem::size_of::<SqlNumericStruct>() as SqlLen;
+        let mut source = numeric_struct(0, 1, 0);
+
+        for (ind, configure, expected) in [
+            (size, (|_| {}) as fn(&mut BoundParam), (38, 0)),
+            (SQL_NTS as SqlLen, |_| {}, (38, 0)),
+            (size, align, (5, 3)),
+            (SQL_NULL_DATA, |_| {}, (5, 3)),
+            (size, |p| p.input_output_type = SQL_PARAM_OUTPUT, (5, 3)),
+            (size, |p| p.c_type = SQL_C_BINARY, (5, 3)),
+        ] {
+            let mut ind = ind;
+            let mut p = mismatched(&mut source, &mut ind);
+            configure(&mut p);
+            unsafe { stamp_numeric_apd(&p) };
+            assert_eq!((source.precision, source.scale), expected);
+        }
+
+        let mut ind = size;
+        let mut p = mismatched(&mut source, &mut ind);
+        unsafe { stamp_numeric_apd(&p) };
+        align(&mut p);
+        let ((value, _), _) = decimal_from_numeric(&p, source).unwrap();
+        assert_eq!(
+            value,
+            SqlType::Decimal(Some(DecimalParts::new(true, 38, 0, 12345)))
         );
     }
 
