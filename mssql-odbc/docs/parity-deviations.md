@@ -587,7 +587,7 @@ msodbcsql build is measured.
     covered by unit tests and shares `variant_column_size`, but no comparison
     run records msodbcsql's SQLSTATE for an oversized character `sql_variant`;
     do not infer that half from this entry.
-21. **A character the target code page cannot represent is always substituted
+22. **A character the target code page cannot represent is always substituted
     with `?`; msodbcsql best-fit maps many of them.** Both drivers substitute
     rather than reject, and agree on `0x3F` for a character with no mapping at
     all. They differ on the characters Windows NLS can *transliterate*:
@@ -653,7 +653,7 @@ msodbcsql build is measured.
     `AstralUnmappableCharacterSubstitutesPerUtf16Unit` carries
     `SKIP_IF_COMPARING_MSODBCSQL()` for the glibc leg.
 
-    Second-order consequence: under `SQL_COPT_SS_WARN_ON_CP_ERROR` (entry 22)
+    Second-order consequence: under `SQL_COPT_SS_WARN_ON_CP_ERROR` (entry 23)
     we warn for a best-fit character where msodbcsql would not, since it does
     not count a best-fit result as loss.
 
@@ -674,7 +674,7 @@ msodbcsql build is measured.
     unmeasured) but not approved; record the approver and date in AB#47598
     before relying on this entry as settled.
 
-22. **`SQL_COPT_SS_WARN_ON_CP_ERROR` reports code-page loss on input
+23. **`SQL_COPT_SS_WARN_ON_CP_ERROR` reports code-page loss on input
     parameters; msodbcsql reports it only on retrieval.** msodbcsql posts
     `IDS_01_000_16` ("Warning: Code page translation caused loss of data",
     SQLSTATE `01000` via `cli_common/src/clntcomn.cpp:1183`) from exactly two

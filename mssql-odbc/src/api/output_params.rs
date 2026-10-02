@@ -177,7 +177,6 @@ mod tests {
             decimal_digits: 0,
             app_precision: 0,
             app_scale: 0,
-            precision_scale_explicit: false,
             parameter_value_ptr: value,
             buffer_length,
             strlen_or_ind_ptr: indicator,

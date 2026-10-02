@@ -1021,6 +1021,86 @@ TEST_F(ScalarConversionLiveTest, NumericStructWithoutDescriptorFieldWritesUsesDe
     EXPECT_EQ("12", ExecuteAndReadBack());
 }
 
+// The fast path forwards the struct's own scale, so SQL Server rounds rather
+// than the driver truncating. Measured on Windows Driver 18.6.2.1: 13.
+// Benefits-from-mock-tds: capture the RPC and assert the decimal TYPE_INFO
+// carries (3, 1) and the payload 125; today only the server's rounding shows.
+TEST_F(ScalarConversionLiveTest, NumericStructOnTheDefaultFastPathIsRoundedByTheServer) {
+    SQL_NUMERIC_STRUCT value = {};
+    value.precision = 3;
+    value.scale = 1;
+    value.sign = 1;
+    std::uint64_t magnitude = 125;
+    std::memcpy(value.val, &magnitude, sizeof(magnitude));
+    std::memcpy(storage_, &value, sizeof(value));
+
+    ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(64), ?)"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_NUMERIC, SQL_DECIMAL, 38, 0,
+                                   storage_, 0, nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("13", ExecuteAndReadBack());
+}
+
+// Off the fast path the default APD scale 0 describes val[], not the struct's
+// own scale 3. Measured on Windows Driver 18.6.2.1: 12345.00.
+// Benefits-from-mock-tds: capture the RPC and assert TYPE_INFO (10, 2) with
+// payload 1234500, pinning that val[] was read at APD scale 0.
+TEST_F(ScalarConversionLiveTest, NumericStructOffTheFastPathIgnoresTheEmbeddedScale) {
+    SQL_NUMERIC_STRUCT value = {};
+    value.precision = 5;
+    value.scale = 3;
+    value.sign = 1;
+    std::uint64_t magnitude = 12345;
+    std::memcpy(value.val, &magnitude, sizeof(magnitude));
+    std::memcpy(storage_, &value, sizeof(value));
+
+    ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(64), ?)"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_NUMERIC, SQL_DECIMAL, 10, 2,
+                                   storage_, 0, nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("12345.00", ExecuteAndReadBack());
+}
+
+// Off the fast path msodbcsql writes the APD precision/scale into the
+// application's struct (sqlcfunc.cpp:3165-3176). Aligning the APD with the IPD
+// afterwards takes the fast path, which forwards the written-back (38, 0), so
+// val[] is sent as 12345 rather than the original 12.345. Measured on Windows
+// Driver 18.6.2.1: (38, 0) after the first execute, then 12345.00 again.
+// Benefits-from-mock-tds: capture both RPCs and assert TYPE_INFO (10, 2) with
+// payload 1234500 on the first, then the fast path forwarding (38, 0) with
+// payload 12345 on the second.
+TEST_F(ScalarConversionLiveTest, NumericStructOffTheFastPathReceivesTheApdMetadata) {
+    SQL_NUMERIC_STRUCT value = {};
+    value.precision = 5;
+    value.scale = 3;
+    value.sign = 1;
+    std::uint64_t magnitude = 12345;
+    std::memcpy(value.val, &magnitude, sizeof(magnitude));
+    std::memcpy(storage_, &value, sizeof(value));
+
+    ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(64), ?)"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_NUMERIC, SQL_DECIMAL, 10, 2,
+                                   storage_, 0, nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("12345.00", ExecuteAndReadBack());
+    std::memcpy(&value, storage_, sizeof(value));
+    EXPECT_EQ(38, value.precision);
+    EXPECT_EQ(0, value.scale);
+
+    SQLHDESC apd = SQL_NULL_HDESC;
+    ASSERT_SQL_OK(SQLGetStmtAttrW(stmt_, SQL_ATTR_APP_PARAM_DESC, &apd, 0, nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLSetDescFieldW(apd, 1, SQL_DESC_PRECISION,
+                                   reinterpret_cast<SQLPOINTER>(static_cast<SQLLEN>(10)), 0),
+                  SQL_HANDLE_DESC, apd);
+    ASSERT_SQL_OK(SQLSetDescFieldW(apd, 1, SQL_DESC_SCALE,
+                                   reinterpret_cast<SQLPOINTER>(static_cast<SQLLEN>(2)), 0),
+                  SQL_HANDLE_DESC, apd);
+    ASSERT_SQL_OK(SQLSetDescFieldW(apd, 1, SQL_DESC_DATA_PTR, storage_, 0), SQL_HANDLE_DESC,
+                  apd);
+    EXPECT_EQ("12345.00", ExecuteAndReadBack());
+}
+
 // A rebind (same ordinal, same statement, no intervening SQL_RESET_PARAMS)
 // must not let a bare SQLBindParameter inherit APD precision/scale left by a
 // prior, differently-shaped binding: msodbcsql's SetADRecBP resets the whole

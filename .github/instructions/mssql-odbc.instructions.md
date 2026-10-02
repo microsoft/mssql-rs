@@ -21,7 +21,7 @@ Crate-specific requirements for changes under `mssql-odbc/`.
 - [7.1. Handle hierarchy and locking](#71-handle-hierarchy-and-locking)
 - [7.1.1. DM guarantees we rely on](#711-dm-guarantees-we-rely-on)
 - [7.1.2. Locking rules](#712-locking-rules-mirroring-msodbcsql)
-- [7.2. Known descriptor concurrency gap](#72-known-descriptor-concurrency-gap)
+- [7.2. Descriptor writes during a fetch](#72-descriptor-writes-during-a-fetch)
 - [7.3. Prepared parameter definitions](#73-prepared-parameter-definitions)
 - [8. FFI boundary conventions](#8-ffi-boundary-conventions)
 - [9. Types and casts](#9-types-and-casts)
@@ -323,14 +323,22 @@ on; these guarantees were verified against msodbcsql's behavior.
   fire in debug builds only — in release builds the driver trusts the DM and
   frees unconditionally, matching msodbcsql.
 
-### 7.2. Known descriptor concurrency gap
+### 7.2. Descriptor writes during a fetch
 
-The different admission checks in `SQLBindCol`/`SQLFreeStmt`/`SQLSetStmtAttr`
-and the direct descriptor setters are tracked in
-[#472](https://github.com/microsoft/mssql-rs/issues/472). Do not justify a new
-buffer-use protocol by an application freeing storage that an outstanding
-fetch still needs. Establish the supported concurrency and completion
-guarantees first; preserve existing guards meanwhile.
+`SQLSetDescFieldW` and `SQLSetDescRec` refuse with HY010 while any statement
+on the connection is fetching through the target descriptor as its effective
+ARD. `SQLBindCol`/`SQLFreeStmt(SQL_UNBIND)` check only the calling
+statement, so a shared explicit ARD is still mutable through a sibling
+statement while another fetches through it.
+`DescHandle::update_definition` walks DBC → STMT and releases both locks
+before taking the DESC lock. `STMT_STATE_FETCH_IN_PROGRESS` is specific to this
+driver, which does not hold the STMT lock across network I/O. The check is
+advisory, not atomic with the write: a fetch can start between the walk and
+the DESC lock, as with `SQLBindCol`. That write still cannot tear, because
+fetch snapshots the ARD under the same DESC lock; closing the window would
+mean holding STMT while taking DESC, inverting §7.1's lock order. Do not justify a
+new buffer-use protocol by an application freeing storage that an outstanding
+fetch still needs.
 
 ### 7.3. Prepared parameter definitions
 
