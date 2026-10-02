@@ -2,8 +2,8 @@
 // Licensed under the MIT License.
 
 use crate::connection::client_context::{
-    ClientContext, ColumnEncryptionSetting, TdsAuthenticationMethod, TransportContext,
-    VectorVersion,
+    ClientContext, ColumnEncryptionSetting, MAX_LOGIN7_NAME_UNITS, TdsAuthenticationMethod,
+    TransportContext, VectorVersion,
 };
 use crate::message::features::jsonfeature::JsonFeature;
 use crate::message::login_options::{
@@ -20,6 +20,7 @@ use crate::token::tokens::{
     Token, Tokens,
 };
 use async_trait::async_trait;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt::Debug;
 
@@ -31,7 +32,7 @@ use super::features::utf8::Utf8Feature;
 use super::features::vectorfeature::VectorFeature;
 use crate::core::TdsResult;
 use crate::io::token_stream::{ParserContext, TdsTokenStreamReader};
-use tracing::{Level, debug, event, info, trace};
+use tracing::{Level, debug, event, trace};
 
 pub(crate) const FIXED_LOGIN_RECORD_LENGTH: i32 = 94;
 const MAX_LOGIN_RECORD_LENGTH: usize = 128 * 1024 - 1;
@@ -788,6 +789,9 @@ struct Serializer<'a, 'n, 'context> {
     features_request: &'a FeaturesRequest,
     content_next_offset: i32,
     deferred_actions_indicator: Vec<LoginDeferredPayload>,
+    /// The LOGIN7 ServerName, resolved once so the record length, the field's
+    /// offset/length and the payload all describe the same value.
+    server_name: Cow<'context, str>,
 }
 
 impl<'a, 'n, 'context> Serializer<'a, 'n, 'context> {
@@ -801,7 +805,33 @@ impl<'a, 'n, 'context> Serializer<'a, 'n, 'context> {
             features_request: &model.features_request,
             content_next_offset: FIXED_LOGIN_RECORD_LENGTH,
             deferred_actions_indicator: Vec::new(),
+            server_name: model.user_input.login_server_name(model.transport_context),
         }
+    }
+
+    /// SQL Server drops a login whose ServerName is longer than MS-TDS allows,
+    /// which the caller would only see as a failure to read the response.
+    /// `ClientContext::validate` rejects a long override up front; this also
+    /// covers the dialled address used without one, before anything is written.
+    fn check_server_name_length(&self) -> TdsResult<()> {
+        let units = self.server_name.encode_utf16().count();
+        if units > MAX_LOGIN7_NAME_UNITS {
+            // The accessor borrows the override and builds the dialled address,
+            // so the variant says which one is too long and what to change.
+            let remedy = match self.server_name {
+                Cow::Borrowed(_) => "Use a shorter login_server_name.",
+                Cow::Owned(_) => {
+                    "Connect through a shorter address, or set login_server_name to a \
+                     shorter name."
+                }
+            };
+            return Err(crate::error::Error::UsageError(format!(
+                "the LOGIN7 server name {:?} is {units} UTF-16 code units; at most \
+                 {MAX_LOGIN7_NAME_UNITS} are allowed. {remedy}",
+                self.server_name
+            )));
+        }
+        Ok(())
     }
 
     /// Calculate the length of the login record.
@@ -810,7 +840,7 @@ impl<'a, 'n, 'context> Serializer<'a, 'n, 'context> {
     fn calculate_login_record_length(&self) -> TdsResult<(i32, i32)> {
         let mut login_record_length = FIXED_LOGIN_RECORD_LENGTH as usize;
         login_record_length += self.model.user_input.len_bytes();
-        login_record_length += self.model.transport_context.len_bytes();
+        login_record_length += self.server_name.as_ref().len_bytes();
         login_record_length += 4; // Feature extension offset size.
 
         // Add SSPI token length if present
@@ -832,6 +862,7 @@ impl<'a, 'n, 'context> Serializer<'a, 'n, 'context> {
     }
 
     pub(crate) async fn serialize(&mut self) -> TdsResult<()> {
+        self.check_server_name_length()?;
         let (login_record_length, feature_extension_offset) =
             self.calculate_login_record_length()?;
         trace!(login_record_length);
@@ -969,12 +1000,9 @@ impl<'a, 'n, 'context> Serializer<'a, 'n, 'context> {
                         .await?;
                 }
                 LoginDeferredPayload::ServerName => {
-                    let server_name = self.model.transport_context.get_login_server_name();
-                    // Use get_login_server_name() to get DataSource format (host,port)
-                    // This matches SqlClient behavior for redirected connections
-                    info!("Login Server name: {}", server_name);
+                    debug!("Login Server name: {}", self.server_name);
                     self.payload_writer
-                        .write_string_unicode_async(server_name.as_str())
+                        .write_string_unicode_async(self.server_name.as_ref())
                         .await?;
                 }
                 LoginDeferredPayload::FeatureExtOffset => {
@@ -1116,13 +1144,12 @@ impl<'a, 'n, 'context> Serializer<'a, 'n, 'context> {
         Ok(())
     }
 
-    /// Writes the value of the target sql server to the login packet.
-    /// Uses get_login_server_name() to get DataSource format (host,port) for TCP connections.
+    /// Writes the value of the target sql server to the login packet: the
+    /// `login_server_name` override, or else the dialled address in DataSource
+    /// format (host,port) for TCP connections.
     async fn write_server_name(&mut self) -> TdsResult<()> {
         if self
-            .write_metadata(utf16_code_units(
-                &self.model.transport_context.get_login_server_name(),
-            )?)
+            .write_metadata(utf16_code_units(self.server_name.as_ref())?)
             .await?
         {
             self.deferred_actions_indicator
@@ -1331,15 +1358,9 @@ fn utf16_code_units(value: &str) -> TdsResult<u16> {
     })
 }
 
-impl SizedLoginItem for TransportContext {
-    fn len_bytes(&self) -> usize {
-        // Must match what get_login_server_name() returns for consistency
-        // with write_server_name() which serializes get_login_server_name()
-        self.get_login_server_name().len_bytes()
-    }
-}
-
-impl SizedLoginItem for String {
+// Length in UTF-16 bytes, which is how LOGIN7 stores strings. Implemented for
+// `str` only: a `String` call resolves here through deref.
+impl SizedLoginItem for str {
     fn len_bytes(&self) -> usize {
         self.encode_utf16().count() * 2
     }
@@ -1624,6 +1645,118 @@ mod tests {
         assert_eq!(payload.read_u16::<LittleEndian>().unwrap(), 0);
         assert_eq!(payload.read_u16::<LittleEndian>().unwrap(), 0);
         assert_eq!(payload.read_u32::<LittleEndian>().unwrap(), 70_000);
+    }
+
+    // ── Serializer::calculate_login_record_length ──
+
+    /// The record Length and feature-extension offset must describe the bytes
+    /// actually serialized. A ServerName override of a different length than
+    /// the dialled address is where the two can diverge, and the wire tests do
+    /// not catch it: they read the name back but never validate LOGIN7's own
+    /// embedded Length.
+    #[test]
+    fn the_record_length_follows_the_server_name_actually_written() {
+        fn lengths(override_name: Option<&str>) -> (i32, i32) {
+            let context = ClientContext {
+                connect_retry_count: 0,
+                login_server_name: override_name.map(str::to_string),
+                ..ClientContext::default()
+            };
+            let transport_context = context.transport_context.clone();
+            let model = LoginRequestModel::from_context(&context, false, &transport_context, None);
+            let mut mock = MockNetworkWriter::new(131_072);
+            let mut packet_writer = PacketWriter::new(PacketType::Login7, &mut mock, None, None);
+            Serializer::new(&model, &mut packet_writer)
+                .calculate_login_record_length()
+                .unwrap()
+        }
+
+        let dialled = ClientContext::default()
+            .transport_context
+            .get_login_server_name();
+        let (base_len, base_offset) = lengths(None);
+
+        for name in ["db", "a-much-longer-name.database.windows.net", "n\u{e9}"] {
+            let (len, offset) = lengths(Some(name));
+            let delta = name.len_bytes() as i32 - dialled.len_bytes() as i32;
+            assert_eq!(
+                len - base_len,
+                delta,
+                "record length should move with the written name for {name:?}"
+            );
+            assert_eq!(
+                offset - base_offset,
+                delta,
+                "feature offset should move with the written name for {name:?}"
+            );
+        }
+    }
+
+    /// Without an override, the ServerName is the dialled address, which can
+    /// also exceed LOGIN7's limit. SQL Server drops such a login without saying
+    /// why, so it is refused with a clear `UsageError` before anything is
+    /// written, while a name of exactly the limit still goes through.
+    #[tokio::test]
+    async fn a_dialled_address_too_long_for_login7_is_refused_before_writing() {
+        fn context_for_host(host: String) -> ClientContext {
+            let mut context = ClientContext {
+                connect_retry_count: 0,
+                ..ClientContext::default()
+            };
+            context.transport_context = TransportContext::Tcp {
+                host,
+                port: 1433,
+                instance_name: None,
+            };
+            context
+        }
+        let at_limit = MAX_LOGIN7_NAME_UNITS - ",1433".len();
+
+        let context = context_for_host("h".repeat(at_limit));
+        let model =
+            LoginRequestModel::from_context(&context, false, &context.transport_context, None);
+        let mut mock = MockNetworkWriter::new(131_072);
+        let mut packet_writer = PacketWriter::new(PacketType::Login7, &mut mock, None, None);
+        assert!(
+            Serializer::new(&model, &mut packet_writer)
+                .check_server_name_length()
+                .is_ok(),
+            "a name of exactly the limit is allowed"
+        );
+
+        let context = context_for_host("h".repeat(at_limit + 1));
+        let model =
+            LoginRequestModel::from_context(&context, false, &context.transport_context, None);
+        let mut mock = MockNetworkWriter::new(131_072);
+        let mut packet_writer = PacketWriter::new(PacketType::Login7, &mut mock, None, None);
+        let result = Serializer::new(&model, &mut packet_writer)
+            .serialize()
+            .await;
+        assert!(
+            matches!(&result, Err(crate::error::Error::UsageError(message))
+                if message.contains("129 UTF-16 code units")
+                    && message.contains("Connect through a shorter address")),
+            "{result:?}"
+        );
+        assert_eq!(
+            packet_writer.position(),
+            0,
+            "nothing is written for a refused login"
+        );
+
+        // When the long name is the override itself, the remedy names it.
+        let mut context = context_for_host("h".to_string());
+        context.login_server_name = Some("o".repeat(MAX_LOGIN7_NAME_UNITS + 1));
+        let model =
+            LoginRequestModel::from_context(&context, false, &context.transport_context, None);
+        let mut mock = MockNetworkWriter::new(131_072);
+        let mut packet_writer = PacketWriter::new(PacketType::Login7, &mut mock, None, None);
+        let result = Serializer::new(&model, &mut packet_writer).check_server_name_length();
+        assert!(
+            matches!(&result, Err(crate::error::Error::UsageError(message))
+                if message.contains("Use a shorter login_server_name")),
+            "{result:?}"
+        );
     }
 
     // ── FeaturesRequest::features() ──
