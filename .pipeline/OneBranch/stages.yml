@@ -852,7 +852,7 @@ stages:
         displayName: 'Publish mssql-sqlcmd package'
         inputs:
           targetPath: '$(ob_outputDirectory)/mssql-sqlcmd-nuget'
-          artifact: 'drop_Build_MssqlSqlcmd_NuGet'
+          artifact: 'drop_Build_MssqlSqlcmd_Package'
           publishLocation: 'pipeline'
 
 #############################################################################

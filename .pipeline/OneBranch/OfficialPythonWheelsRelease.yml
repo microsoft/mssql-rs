@@ -251,7 +251,7 @@ extends:
             ob_nugetPublishing_enabled: true
           steps:
           - download: officialBuild
-            artifact: drop_Build_MssqlSqlcmd_NuGet
+            artifact: drop_Build_MssqlSqlcmd_Package
             displayName: 'Download the mssql-sqlcmd package from the Official Build'
 
           # The feed is configured with continueOnConflict, which would skip an
@@ -259,7 +259,7 @@ extends:
           # Fail instead: each release needs a version bump in Cargo.toml.
           - pwsh: |
               $ErrorActionPreference = 'Stop'
-              $source = "$(Pipeline.Workspace)/officialBuild/drop_Build_MssqlSqlcmd_NuGet"
+              $source = "$(Pipeline.Workspace)/officialBuild/drop_Build_MssqlSqlcmd_Package"
               $packages = @(Get-ChildItem $source -Filter 'mssql-sqlcmd.*.nupkg')
               if ($packages.Count -ne 1) {
                 throw "Expected one mssql-sqlcmd package in $source, found $($packages.Count)"
