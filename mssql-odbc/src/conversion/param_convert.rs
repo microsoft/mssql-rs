@@ -3908,7 +3908,7 @@ mod tests {
         );
 
         // Zero-only overflow: padding rather than data, so it is trimmed and
-        // sent instead of refused. This is the leg parity deviation 20 cites -
+        // sent instead of refused. This is the leg parity deviation 21 cites -
         // the reject case above uses `0xFF` and cannot show it, and
         // `an_all_zero_binary_overflow_is_trimmed_silently` covers the plain
         // `varbinary`/`binary`/`image` targets rather than a variant.
