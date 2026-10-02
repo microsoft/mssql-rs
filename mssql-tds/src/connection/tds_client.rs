@@ -66,9 +66,17 @@ const SYNTHETIC_POSITIONAL_PARAM_PREFIX: &str = "ce_pos_";
 const FATAL_ERROR_SEVERITY: u8 = 20;
 
 /// Most ERROR tokens kept for one failed statement under
-/// [`BatchErrorMode::Continue`] before its DONE. The run is fed by the server,
-/// so past this the server is treated as misbehaving and the connection retired.
-const MAX_ERRORS_PER_FAILED_STATEMENT: usize = 10_000;
+/// [`BatchErrorMode::Continue`] before its DONE. A real statement sends a few;
+/// the run is fed by the server, so past this the server is treated as
+/// misbehaving and the connection retired.
+const MAX_ERRORS_PER_FAILED_STATEMENT: usize = 1_000;
+
+/// Most text, in bytes, kept across one failed statement's errors: message,
+/// server and procedure names. A SQL Server message is at most 2,048
+/// characters, so this admits [`MAX_ERRORS_PER_FAILED_STATEMENT`] full-length
+/// messages, while a server sending messages near the 65,535-unit protocol
+/// limit is stopped long before the count is reached.
+const MAX_ERROR_TEXT_BYTES_PER_FAILED_STATEMENT: usize = 8 * 1024 * 1024;
 
 /// Most tokens read after a statement error under [`BatchErrorMode::Continue`]
 /// before its DONE. Well above [`MAX_ERRORS_PER_FAILED_STATEMENT`], so a valid
@@ -536,6 +544,9 @@ pub struct TdsClient {
     row_set_errors: Vec<SqlErrorInfo>,
     /// Tokens read since the first entry in `row_set_errors`; bounds that run.
     row_set_error_tokens: u32,
+    /// Text bytes held in `row_set_errors`; see
+    /// [`MAX_ERROR_TEXT_BYTES_PER_FAILED_STATEMENT`].
+    row_set_error_bytes: usize,
     /// DONE count of the row set just completed; see
     /// [`last_result_row_count`](Self::last_result_row_count).
     last_result_row_count: Option<u64>,
@@ -720,6 +731,7 @@ impl TdsClient {
             failed_statement_done_pending: false,
             row_set_errors: Vec::new(),
             row_set_error_tokens: 0,
+            row_set_error_bytes: 0,
             last_result_row_count: None,
             return_values: Vec::new(),
             info_messages: Vec::new(),
@@ -5428,7 +5440,9 @@ impl TdsClient {
                 }
                 Tokens::Error(error_token) => {
                     info!(?error_token);
-                    let mut all_errors = vec![self.record_error_token(&error_token)];
+                    let first_error = self.record_error_token(&error_token);
+                    let mut error_bytes = Self::error_text_bytes(&first_error);
+                    let mut all_errors = vec![first_error];
                     let mut continues = self.continues_after(&error_token);
                     if continues {
                         // One failed statement can send several ERROR tokens, with
@@ -5439,9 +5453,9 @@ impl TdsClient {
                         // parked token back before reading the wire, so the slot is
                         // empty here.
                         //
-                        // Two bounds, because the run is fed by the server: errors
-                        // kept and tokens read in all, so a run of INFO with no DONE
-                        // cannot spin forever either.
+                        // Three bounds, because the run is fed by the server: errors
+                        // kept, the text they hold, and tokens read in all, so a
+                        // run of INFO with no DONE cannot spin forever either.
                         let mut tokens_read = 0u32;
                         loop {
                             tokens_read += 1;
@@ -5467,7 +5481,14 @@ impl TdsClient {
                                         ));
                                     }
                                     debug!(?next_error);
-                                    all_errors.push(self.record_error_token(&next_error));
+                                    let error = self.record_error_token(&next_error);
+                                    error_bytes += Self::error_text_bytes(&error);
+                                    if error_bytes > MAX_ERROR_TEXT_BYTES_PER_FAILED_STATEMENT {
+                                        return Err(self.abandon_failed_statement(
+                                            Self::too_much_error_text_for_one_statement(),
+                                        ));
+                                    }
+                                    all_errors.push(error);
                                     if !self.continues_after(&next_error) {
                                         continues = false;
                                         break;
@@ -7987,6 +8008,12 @@ impl TdsClient {
                         return Err(self
                             .abandon_failed_statement(Self::too_many_errors_for_one_statement()));
                     }
+                    self.row_set_error_bytes += Self::error_text_bytes(&error);
+                    if self.row_set_error_bytes > MAX_ERROR_TEXT_BYTES_PER_FAILED_STATEMENT {
+                        return Err(self.abandon_failed_statement(
+                            Self::too_much_error_text_for_one_statement(),
+                        ));
+                    }
                     // A failed statement can send several ERROR tokens before the
                     // DONE that ends its row set. Collect them here and return
                     // them together from that DONE (see `handle_row_done`), so the
@@ -8246,17 +8273,32 @@ impl TdsClient {
         self.last_result_row_count = None;
     }
 
-    /// Takes the errors collected inside a row set, resetting the token count
-    /// that bounds their run with them. Every take or clear of the list goes
-    /// through here, so the two cannot disagree.
+    /// Takes the errors collected inside a row set, resetting the token and
+    /// text counts that bound their run with them. Every take or clear of the
+    /// list goes through here, so the counts cannot disagree with it.
     fn take_row_set_errors(&mut self) -> Vec<SqlErrorInfo> {
         self.row_set_error_tokens = 0;
+        self.row_set_error_bytes = 0;
         std::mem::take(&mut self.row_set_errors)
+    }
+
+    /// Text an error holds, counted against
+    /// [`MAX_ERROR_TEXT_BYTES_PER_FAILED_STATEMENT`].
+    fn error_text_bytes(error: &SqlErrorInfo) -> usize {
+        error.message.len()
+            + error.server_name.as_ref().map_or(0, String::len)
+            + error.proc_name.as_ref().map_or(0, String::len)
     }
 
     fn too_many_errors_for_one_statement() -> crate::error::Error {
         crate::error::Error::ProtocolError(
             "Too many ERROR tokens for one statement without a DONE".to_string(),
+        )
+    }
+
+    fn too_much_error_text_for_one_statement() -> crate::error::Error {
+        crate::error::Error::ProtocolError(
+            "Too much ERROR text for one statement without a DONE".to_string(),
         )
     }
 
@@ -10968,7 +11010,7 @@ mod tests {
     async fn an_endless_run_of_statement_errors_is_bounded_and_retires_connection() {
         let mut client = create_test_client_with_tokens(
             std::iter::repeat_with(|| Tokens::Error(error_token_with_severity(16)))
-                .take(10_002)
+                .take(MAX_ERRORS_PER_FAILED_STATEMENT + 2)
                 .collect(),
         );
         client.batch_error_mode = BatchErrorMode::Continue;
@@ -10980,13 +11022,74 @@ mod tests {
         assert!(!client.has_open_batch());
     }
 
+    /// A long message is a real token of its own, so the text the errors hold
+    /// is bounded as well as their number: a run of errors near the protocol's
+    /// message limit retires the connection well before the count is reached.
+    #[tokio::test]
+    async fn the_text_of_one_statements_errors_is_bounded() {
+        let runaway = MAX_ERROR_TEXT_BYTES_PER_FAILED_STATEMENT / LONG_ERROR_MESSAGE_UNITS + 2;
+        assert!(runaway < MAX_ERRORS_PER_FAILED_STATEMENT);
+        let mut tokens: Vec<Tokens> = std::iter::repeat_with(|| {
+            Tokens::Error(error_token_with_message_units(LONG_ERROR_MESSAGE_UNITS))
+        })
+        .take(runaway)
+        .collect();
+        tokens.push(Tokens::Done(DoneToken {
+            status: DoneStatus::ERROR,
+            cur_cmd: CurrentCommand::Select,
+            row_count: 0,
+        }));
+        let mut client = create_test_client_with_tokens(tokens);
+        client.batch_error_mode = BatchErrorMode::Continue;
+
+        match client.advance_to_result_boundary().await.unwrap_err() {
+            crate::error::Error::ProtocolError(message) => {
+                assert!(message.contains("Too much ERROR text"), "{message}");
+            }
+            other => panic!("expected the text bound, got {other:?}"),
+        }
+        assert!(client.is_connection_dead());
+        assert!(!client.has_open_batch());
+    }
+
+    /// The bounds leave room for a real statement: the most errors allowed,
+    /// each with a full-length SQL Server message, fail the statement once
+    /// and keep the connection and the batch.
+    #[tokio::test]
+    async fn the_most_errors_a_statement_may_send_are_returned_together() {
+        let mut tokens: Vec<Tokens> = std::iter::repeat_with(|| {
+            Tokens::Error(error_token_with_message_units(SQL_SERVER_MESSAGE_UNITS))
+        })
+        .take(MAX_ERRORS_PER_FAILED_STATEMENT)
+        .collect();
+        tokens.push(Tokens::Done(DoneToken {
+            status: DoneStatus::ERROR,
+            cur_cmd: CurrentCommand::Select,
+            row_count: 0,
+        }));
+        let mut client = create_test_client_with_tokens(tokens);
+        client.execution_context.set_has_open_batch(true);
+        client.batch_error_mode = BatchErrorMode::Continue;
+
+        match client.advance_to_result_boundary().await {
+            Err(crate::error::Error::SqlServerError { diagnostics }) => {
+                assert_eq!(diagnostics.errors.len(), MAX_ERRORS_PER_FAILED_STATEMENT);
+            }
+            other => panic!("expected one SqlServerError, got {other:?}"),
+        }
+        assert!(!client.is_connection_dead());
+        assert!(client.has_open_batch());
+    }
+
     /// The bound counts the errors kept, not the tokens read: one error followed
     /// by many INFO messages is a valid statement, and returns one `Err` with the
     /// batch still open.
     #[tokio::test]
     async fn info_messages_do_not_count_against_the_statement_error_bound() {
         let mut tokens = vec![Tokens::Error(error_token_with_severity(16))];
-        tokens.extend((0..10_001).map(|n| info_token(n, 0, "message")));
+        tokens.extend(
+            (0..MAX_ERRORS_PER_FAILED_STATEMENT as u32 + 1).map(|n| info_token(n, 0, "message")),
+        );
         tokens.push(Tokens::Done(DoneToken {
             status: DoneStatus::ERROR,
             cur_cmd: CurrentCommand::Select,
@@ -11003,7 +11106,10 @@ mod tests {
         }
         assert!(!client.is_connection_dead());
         assert!(client.has_open_batch());
-        assert_eq!(client.take_info_messages().len(), 10_001);
+        assert_eq!(
+            client.take_info_messages().len(),
+            MAX_ERRORS_PER_FAILED_STATEMENT + 1
+        );
         assert!(matches!(
             client.advance_to_result_boundary().await.unwrap(),
             ResultBoundaryKind::End
@@ -11635,7 +11741,8 @@ mod tests {
     async fn an_endless_run_of_errors_inside_a_row_set_is_bounded() {
         let mut tokens = vec![int_col_metadata(1)];
         tokens.extend(
-            std::iter::repeat_with(|| Tokens::Error(error_token_with_severity(16))).take(10_002),
+            std::iter::repeat_with(|| Tokens::Error(error_token_with_severity(16)))
+                .take(MAX_ERRORS_PER_FAILED_STATEMENT + 2),
         );
         let mut client = create_test_client_with_tokens(tokens);
         assert_eq!(
@@ -11656,6 +11763,42 @@ mod tests {
         assert!(client.is_connection_dead());
         assert!(!client.has_open_batch());
         assert!(client.row_set_errors.is_empty());
+    }
+
+    /// The text bound applies inside a row set too, and abandoning the
+    /// statement clears what it was holding.
+    #[tokio::test]
+    async fn the_text_of_errors_inside_a_row_set_is_bounded() {
+        let runaway = MAX_ERROR_TEXT_BYTES_PER_FAILED_STATEMENT / LONG_ERROR_MESSAGE_UNITS + 2;
+        let mut tokens = vec![int_col_metadata(1)];
+        tokens.extend(
+            std::iter::repeat_with(|| {
+                Tokens::Error(error_token_with_message_units(LONG_ERROR_MESSAGE_UNITS))
+            })
+            .take(runaway),
+        );
+        let mut client = create_test_client_with_tokens(tokens);
+        assert_eq!(
+            client
+                .execute(
+                    "q".to_string(),
+                    ExecuteOptions::new().on_error(BatchErrorMode::Continue),
+                )
+                .await
+                .unwrap(),
+            StatementResult::Rows
+        );
+
+        match client.next_row().await {
+            Err(crate::error::Error::ProtocolError(message)) => {
+                assert!(message.contains("Too much ERROR text"), "{message}");
+            }
+            other => panic!("expected the text bound, got {other:?}"),
+        }
+        assert!(client.is_connection_dead());
+        assert!(!client.has_open_batch());
+        assert!(client.row_set_errors.is_empty());
+        assert_eq!(client.row_set_error_bytes, 0);
     }
 
     /// And so is the total run: one error inside a row set followed by INFO that
@@ -20427,6 +20570,19 @@ mod tests {
             server_name: "test-server".to_string(),
             proc_name: String::new(),
             line_number: 1,
+        }
+    }
+
+    /// Longest message SQL Server itself sends, in characters.
+    const SQL_SERVER_MESSAGE_UNITS: usize = 2_048;
+
+    /// A message near the protocol's 65,535-unit limit.
+    const LONG_ERROR_MESSAGE_UNITS: usize = 60_000;
+
+    fn error_token_with_message_units(units: usize) -> crate::token::tokens::ErrorToken {
+        crate::token::tokens::ErrorToken {
+            message: "x".repeat(units),
+            ..error_token_with_severity(16)
         }
     }
 

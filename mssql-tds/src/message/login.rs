@@ -20,6 +20,7 @@ use crate::token::tokens::{
     Token, Tokens,
 };
 use async_trait::async_trait;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt::Debug;
 
@@ -788,6 +789,9 @@ struct Serializer<'a, 'n, 'context> {
     features_request: &'a FeaturesRequest,
     content_next_offset: i32,
     deferred_actions_indicator: Vec<LoginDeferredPayload>,
+    /// The LOGIN7 ServerName, resolved once so the record length, the field's
+    /// offset/length and the payload all describe the same value.
+    server_name: Cow<'context, str>,
 }
 
 impl<'a, 'n, 'context> Serializer<'a, 'n, 'context> {
@@ -801,6 +805,7 @@ impl<'a, 'n, 'context> Serializer<'a, 'n, 'context> {
             features_request: &model.features_request,
             content_next_offset: FIXED_LOGIN_RECORD_LENGTH,
             deferred_actions_indicator: Vec::new(),
+            server_name: model.user_input.login_server_name(model.transport_context),
         }
     }
 
@@ -810,15 +815,7 @@ impl<'a, 'n, 'context> Serializer<'a, 'n, 'context> {
     fn calculate_login_record_length(&self) -> TdsResult<(i32, i32)> {
         let mut login_record_length = FIXED_LOGIN_RECORD_LENGTH as usize;
         login_record_length += self.model.user_input.len_bytes();
-        // Same accessor as write_server_name: this length and the bytes written
-        // later must come from the same value, or an override of a different
-        // length would leave the record Length and feature offset describing the
-        // dialled name instead of what was serialized.
-        login_record_length += self
-            .model
-            .user_input
-            .login_server_name(self.model.transport_context)
-            .len_bytes();
+        login_record_length += self.server_name.len_bytes();
         login_record_length += 4; // Feature extension offset size.
 
         // Add SSPI token length if present
@@ -977,15 +974,9 @@ impl<'a, 'n, 'context> Serializer<'a, 'n, 'context> {
                         .await?;
                 }
                 LoginDeferredPayload::ServerName => {
-                    // Same accessor as write_server_name: the length written there
-                    // and this payload must agree.
-                    let server_name = self
-                        .model
-                        .user_input
-                        .login_server_name(self.model.transport_context);
-                    debug!("Login Server name: {}", server_name);
+                    debug!("Login Server name: {}", self.server_name);
                     self.payload_writer
-                        .write_string_unicode_async(&server_name)
+                        .write_string_unicode_async(&self.server_name)
                         .await?;
                 }
                 LoginDeferredPayload::FeatureExtOffset => {
@@ -1127,15 +1118,14 @@ impl<'a, 'n, 'context> Serializer<'a, 'n, 'context> {
         Ok(())
     }
 
-    /// Writes the value of the target sql server to the login packet.
-    /// Uses get_login_server_name() to get DataSource format (host,port) for TCP connections,
-    /// unless `login_server_name` overrides it.
+    /// Writes the value of the target sql server to the login packet: the
+    /// `login_server_name` override, or else the dialled address in DataSource
+    /// format (host,port) for TCP connections.
     async fn write_server_name(&mut self) -> TdsResult<()> {
-        let server_name = self
-            .model
-            .user_input
-            .login_server_name(self.model.transport_context);
-        if self.write_metadata(utf16_code_units(&server_name)?).await? {
+        if self
+            .write_metadata(utf16_code_units(&self.server_name)?)
+            .await?
+        {
             self.deferred_actions_indicator
                 .push(LoginDeferredPayload::ServerName);
         }

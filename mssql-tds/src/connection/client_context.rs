@@ -2,6 +2,8 @@
 // Licensed under the MIT License.
 
 use async_trait::async_trait;
+use std::borrow::Cow;
+use std::collections::HashMap;
 
 use crate::connection::datasource_parser::{ParsedDataSource, ProtocolType};
 use crate::core::{EncryptionOptions, EncryptionSetting, TdsResult};
@@ -9,6 +11,12 @@ use crate::error::Error;
 use crate::message::login_options::{ApplicationIntent, TdsVersion};
 use crate::security::{IntegratedAuthConfig, is_loopback_address};
 use hostname;
+
+/// Maximum length, in UTF-16 code units, of the LOGIN7 ServerName field.
+///
+/// MS-TDS caps the other LOGIN7 name and credential fields at 128 as well, but
+/// only [`ClientContext::login_server_name`] is checked against it here.
+const MAX_LOGIN7_NAME_UNITS: usize = 128;
 
 /// Controls DNS resolution order when connecting to a server.
 #[derive(PartialEq, Copy, Clone)]
@@ -214,10 +222,10 @@ impl ClientContextValidator for DefaultClientContextValidator {
             )));
         }
 
-        // MS-TDS caps each LOGIN7 variable-length field at 128 UTF-16 code units.
-        // This one comes straight from the caller, so reject rather than
-        // truncate: a truncated server name is a name the caller did not choose,
-        // and the server would otherwise fail the login with an opaque error.
+        // MS-TDS caps the LOGIN7 ServerName field at 128 UTF-16 code units.
+        // Reject an override past that rather than truncate it: a truncated
+        // server name is a name the caller did not choose, and the server would
+        // otherwise fail the login with an opaque error.
         if let Some(name) = &context.login_server_name {
             let units = name.encode_utf16().count();
             if units > MAX_LOGIN7_NAME_UNITS {
@@ -230,12 +238,6 @@ impl ClientContextValidator for DefaultClientContextValidator {
         Ok(())
     }
 }
-
-/// Maximum length, in UTF-16 code units, of a LOGIN7 variable-length field.
-const MAX_LOGIN7_NAME_UNITS: usize = 128;
-
-use std::borrow::Cow;
-use std::collections::HashMap;
 
 /// Connection configuration for a TDS session.
 ///
@@ -354,6 +356,10 @@ pub struct ClientContext {
     /// with [`EncryptionOptions::server_certificate`](crate::core::EncryptionOptions::server_certificate).
     /// The two are kept separate because they answer different questions: which
     /// name the server is asked for, and which name its certificate must carry.
+    ///
+    /// It does not affect integrated authentication either. The SPN is derived
+    /// from the dialled address, so a caller using Kerberos through a tunnel sets
+    /// [`server_spn`](Self::server_spn) to the real server's SPN alongside this.
     ///
     /// `None` writes the dialled address, which is the previous behaviour.
     pub login_server_name: Option<String>,
