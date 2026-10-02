@@ -653,7 +653,7 @@ msodbcsql build is measured.
     `AstralUnmappableCharacterSubstitutesPerUtf16Unit` carries
     `SKIP_IF_COMPARING_MSODBCSQL()` for the glibc leg.
 
-    Second-order consequence: under `SQL_COPT_SS_WARN_ON_CP_ERROR` (entry 22)
+    Second-order consequence: under `SQL_COPT_SS_WARN_ON_CP_ERROR` (entry 23)
     we warn for a best-fit character where msodbcsql would not, since it does
     not count a best-fit result as loss.
 
