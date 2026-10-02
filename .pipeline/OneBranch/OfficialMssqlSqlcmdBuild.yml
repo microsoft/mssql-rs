@@ -11,24 +11,14 @@
 # Support:        https://aka.ms/onebranchsup                                   #
 #################################################################################
 
-# Runs on merges to the ADO stable branch (stable mirrors GitHub main) that touch
-# what the package is built from. Can also be queued manually.
+# Runs on every update of the ADO stable branch (stable mirrors GitHub main), so a
+# build is always ready to release. Can also be queued manually. Day-to-day
+# dev/nightly packages come from NonOfficialPythonWheelsPublish.yml instead.
 trigger:
   batch: true
   branches:
     include:
       - stable
-  paths:
-    include:
-      - mssql-sqlcmd/*
-      - Cargo.toml
-      - rust-toolchain.toml
-      - .pipeline/OneBranch/OfficialMssqlSqlcmdBuild.yml
-      - .pipeline/OneBranch/mssql-sqlcmd-stages.yml
-      - .pipeline/templates/build-mssql-sqlcmd-linux-template.yml
-      - .pipeline/scripts/build-mssql-sqlcmd-native.ps1
-      - .pipeline/scripts/build-mssql-sqlcmd-native.sh
-      - .pipeline/scripts/pack-mssql-sqlcmd.ps1
 pr: none
 
 variables:
@@ -57,6 +47,8 @@ extends:
       clippy:
         enabled: true
     stages:
-    - template: /.pipeline/OneBranch/mssql-sqlcmd-stages.yml@self
-      parameters:
-        isOfficial: true
+    - stage: Build
+      jobs:
+      - template: /.pipeline/OneBranch/mssql-sqlcmd-jobs.yml@self
+        parameters:
+          isOfficial: true

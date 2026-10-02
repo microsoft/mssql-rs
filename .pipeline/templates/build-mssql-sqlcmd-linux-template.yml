@@ -25,8 +25,8 @@ steps:
         -e CARGO_TARGET_DIR=/tmp/mssql-sqlcmd-target \
         -w /workspace \
         ${{ parameters.image }} \
-        sh -c 'command -v bash >/dev/null 2>&1 || apk add --no-cache bash >/dev/null; bash .pipeline/scripts/build-mssql-sqlcmd-native.sh "$0" "$1" /workspace/mssql-sqlcmd-native' \
-        ${{ parameters.target }} ${{ parameters.rid }}
+        sh -c 'command -v bash >/dev/null 2>&1 || apk add --no-cache bash >/dev/null; bash .pipeline/scripts/build-mssql-sqlcmd-native.sh "$1" "$2" /workspace/mssql-sqlcmd-native' \
+        sh ${{ parameters.target }} ${{ parameters.rid }}
     displayName: 'Build mssql-sqlcmd (${{ parameters.rid }})'
     env:
       CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN)

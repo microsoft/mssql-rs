@@ -128,7 +128,10 @@ extends:
             try {
               $published = (Invoke-RestMethod -Uri $flat -Headers @{ Authorization = "Bearer $env:SYSTEM_ACCESSTOKEN" }).versions
             } catch {
-              if ($_.Exception.Response.StatusCode.value__ -ne 404) { throw }
+              # A package never published has no index (404); any other failure,
+              # including one with no HTTP response at all, is real.
+              $response = $_.Exception.Response
+              if ($null -eq $response -or [int]$response.StatusCode -ne 404) { throw }
               $published = @()
             }
             if ($published -contains $version.ToLowerInvariant()) {

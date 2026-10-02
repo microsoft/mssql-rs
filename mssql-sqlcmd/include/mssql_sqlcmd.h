@@ -25,7 +25,7 @@ extern "C" {
 #define MSSQL_SQLCMD_INTERNAL_ERROR 3
 
 /* UTF-16 text with an explicit length. data == NULL means "absent"
-   (SQL NULL for a row value). */
+   (SQL NULL for a row value). Invalid UTF-16 is replaced with U+FFFD. */
 typedef struct MssqlSqlcmdText {
     const uint16_t* data;
     size_t len;
@@ -38,6 +38,9 @@ typedef struct MssqlSqlcmdConnection {
     int32_t encrypt; /* non-zero when encrypted */
 } MssqlSqlcmdConnection;
 
+/* Opaque document handle. Not thread-safe: calls on one handle, including
+   mssql_sqlcmd_json_free, must not run concurrently. Different handles are
+   independent. */
 typedef struct MssqlSqlcmdJsonDocument MssqlSqlcmdJsonDocument;
 
 MssqlSqlcmdJsonDocument* MSSQL_SQLCMD_CALL mssql_sqlcmd_json_new(void);
@@ -66,7 +69,8 @@ int32_t MSSQL_SQLCMD_CALL mssql_sqlcmd_json_add_message(
     MssqlSqlcmdText text);
 
 /* Renders the document as UTF-16 into *out / *out_len. Release it with
-   mssql_sqlcmd_free_text. The document still has to be freed. */
+   mssql_sqlcmd_free_text. The document still has to be freed. On failure
+   *out is NULL and *out_len is 0. */
 int32_t MSSQL_SQLCMD_CALL mssql_sqlcmd_json_render(
     MssqlSqlcmdJsonDocument* document,
     MssqlSqlcmdText version,

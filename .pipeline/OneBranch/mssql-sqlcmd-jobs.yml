@@ -1,0 +1,221 @@
+#################################################################################
+#                      mssql-sqlcmd: Build jobs template                        #
+# Builds the mssql-sqlcmd static library for every runtime native ODBC sqlcmd   #
+# (msodbcsql) ships on, and packs them into mssql-sqlcmd.<version>.nupkg:       #
+#   win-x64/x86/arm64, linux-x64/arm64 (manylinux_2_28 image),                  #
+#   linux-musl-x64/arm64 (musllinux_1_2 image), osx-x64/arm64.                  #
+# Each platform job stages runtimes/<rid>/native/ in its own artifact; the     #
+# package job collects them into drop_Build_MssqlSqlcmd_Package and fails if   #
+# any runtime is missing. Package layout: mssql-sqlcmd/README.md.              #
+#                                                                               #
+# Used by the Build stage of:                                                   #
+#   - NonOfficialPythonWheelsPublish.yml (via stages.yml, buildMssqlSqlcmd):    #
+#     dev/nightly versions, published to the feed by its Publish stage.         #
+#   - OfficialMssqlSqlcmdBuild.yml: the crate version, released by              #
+#     OfficialMssqlSqlcmdRelease.yml.                                           #
+#################################################################################
+
+parameters:
+- name: linuxImage
+  type: string
+  default: RUST-AZL3
+
+- name: linuxArmImage
+  type: string
+  default: RUST-AZL3-ARM64
+
+# Official builds pack the crate version as is; others add -dev/-nightly.
+- name: isOfficial
+  type: boolean
+  default: false
+
+jobs:
+- job: MssqlSqlcmd_Windows
+  displayName: 'mssql-sqlcmd Windows (x64, x86, ARM64)'
+  pool:
+    type: windows
+    isCustom: true
+    name: RUST-X64-WUS3
+    demands:
+      - imageOverride -equals RUST-W22-SQL25
+  variables:
+    ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
+    CARGO_TARGET_DIR: C:\cargo_target_dir
+  steps:
+  - template: /.pipeline/templates/cargo-authenticate-template.yml
+    parameters:
+      osType: Windows
+  - template: /.pipeline/templates/install-dependencies.yml
+    parameters:
+      osType: Windows
+      skipPythonSetup: true
+      skipRustupInstall: false
+      enableJsDeps: false
+  # A static library needs no linker, so ARM64 and x86 build here too.
+  - pwsh: >
+      .pipeline/scripts/build-mssql-sqlcmd-native.ps1
+      -OutputDirectory '$(ob_outputDirectory)\mssql-sqlcmd'
+    displayName: 'Build mssql-sqlcmd static libraries'
+  - task: PublishPipelineArtifact@1
+    displayName: 'Publish mssql-sqlcmd Windows libraries'
+    inputs:
+      targetPath: '$(ob_outputDirectory)\mssql-sqlcmd'
+      artifact: 'drop_Build_MssqlSqlcmd_Windows'
+      publishLocation: 'pipeline'
+
+# glibc and musl archives are built in the same manylinux_2_28 and
+# musllinux_1_2 images as the Python wheels and the ODBC driver.
+- job: MssqlSqlcmd_Linux_x64
+  displayName: 'mssql-sqlcmd Linux x64 (glibc, musl)'
+  pool:
+    type: linux
+    isCustom: true
+    name: RUST-X64-WUS3
+    demands:
+      - imageOverride -equals ${{ parameters.linuxImage }}
+  variables:
+    ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
+  steps:
+  - template: /.pipeline/templates/cargo-authenticate-template.yml
+    parameters:
+      osType: Linux
+  - task: DockerInstaller@0
+    inputs:
+      dockerVersion: '29.0.0'
+    displayName: 'Install Docker'
+  - template: /.pipeline/templates/install-host-dependency.yaml
+    parameters:
+      installDocker: true
+  - template: /.pipeline/templates/build-mssql-sqlcmd-linux-template.yml
+    parameters:
+      image: 'ghcr.io/microsoft/mssql-rs/python-build/manylinux_2_28_x86_64_rust:latest'
+      target: x86_64-unknown-linux-gnu
+      rid: linux-x64
+  - template: /.pipeline/templates/build-mssql-sqlcmd-linux-template.yml
+    parameters:
+      image: 'ghcr.io/microsoft/mssql-rs/python-build/musllinux_1_2_x86_64_rust:latest'
+      target: x86_64-unknown-linux-musl
+      rid: linux-musl-x64
+  - task: PublishPipelineArtifact@1
+    displayName: 'Publish mssql-sqlcmd Linux x64 libraries'
+    inputs:
+      targetPath: '$(Build.SourcesDirectory)/mssql-sqlcmd-native'
+      artifact: 'drop_Build_MssqlSqlcmd_Linux_x64'
+      publishLocation: 'pipeline'
+
+- job: MssqlSqlcmd_Linux_ARM64
+  displayName: 'mssql-sqlcmd Linux ARM64 (glibc, musl)'
+  pool:
+    type: linux
+    isCustom: true
+    name: RUST-ARM64-WUS3
+    demands:
+      - imageOverride -equals ${{ parameters.linuxArmImage }}
+  variables:
+    ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
+  steps:
+  - template: /.pipeline/templates/cargo-authenticate-template.yml
+    parameters:
+      osType: Linux
+  - task: DockerInstaller@0
+    inputs:
+      dockerVersion: '29.0.0'
+    displayName: 'Install Docker'
+  - template: /.pipeline/templates/install-host-dependency.yaml
+    parameters:
+      installDocker: true
+  - template: /.pipeline/templates/build-mssql-sqlcmd-linux-template.yml
+    parameters:
+      image: 'ghcr.io/microsoft/mssql-rs/python-build/manylinux_2_28_aarch64_rust:latest'
+      target: aarch64-unknown-linux-gnu
+      rid: linux-arm64
+  - template: /.pipeline/templates/build-mssql-sqlcmd-linux-template.yml
+    parameters:
+      image: 'ghcr.io/microsoft/mssql-rs/python-build/musllinux_1_2_aarch64_rust:latest'
+      target: aarch64-unknown-linux-musl
+      rid: linux-musl-arm64
+  - task: PublishPipelineArtifact@1
+    displayName: 'Publish mssql-sqlcmd Linux ARM64 libraries'
+    inputs:
+      targetPath: '$(Build.SourcesDirectory)/mssql-sqlcmd-native'
+      artifact: 'drop_Build_MssqlSqlcmd_Linux_ARM64'
+      publishLocation: 'pipeline'
+
+# One library per architecture, as native sqlcmd builds each separately.
+# The governed templates have no macOS pool type, so this uses `type: linux`
+# with `isCustom` and the Azure Pipelines macOS image, as the wheels macOS job
+# in stages.yml does; the hosted macOS-15 agent is what actually runs it.
+- job: MssqlSqlcmd_MacOS
+  displayName: 'mssql-sqlcmd macOS (x64, ARM64)'
+  pool:
+    type: linux
+    isCustom: true
+    name: Azure Pipelines
+    vmImage: macOS-15
+  variables:
+    ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
+  steps:
+  - template: /.pipeline/templates/cargo-authenticate-template.yml
+    parameters:
+      osType: MacOS
+  - template: /.pipeline/templates/install-dependencies.yml
+    parameters:
+      osType: MacOS
+  - script: |
+      set -e
+      bash .pipeline/scripts/build-mssql-sqlcmd-native.sh x86_64-apple-darwin osx-x64 "$(ob_outputDirectory)/mssql-sqlcmd"
+      bash .pipeline/scripts/build-mssql-sqlcmd-native.sh aarch64-apple-darwin osx-arm64 "$(ob_outputDirectory)/mssql-sqlcmd"
+    displayName: 'Build mssql-sqlcmd static libraries'
+  - task: PublishPipelineArtifact@1
+    displayName: 'Publish mssql-sqlcmd macOS libraries'
+    inputs:
+      targetPath: '$(ob_outputDirectory)/mssql-sqlcmd'
+      artifact: 'drop_Build_MssqlSqlcmd_MacOS'
+      publishLocation: 'pipeline'
+
+# Packs the libraries into mssql-sqlcmd.<version>.nupkg. It fails if any
+# runtime is missing, so a published package is always complete.
+- job: MssqlSqlcmd_Package
+  displayName: 'mssql-sqlcmd NuGet package'
+  dependsOn:
+    - MssqlSqlcmd_Windows
+    - MssqlSqlcmd_Linux_x64
+    - MssqlSqlcmd_Linux_ARM64
+    - MssqlSqlcmd_MacOS
+  pool:
+    type: windows
+    isCustom: true
+    name: RUST-X64-WUS3
+    demands:
+      - imageOverride -equals RUST-W22-SQL25
+  variables:
+    ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
+  steps:
+  - task: DownloadPipelineArtifact@2
+    displayName: 'Download mssql-sqlcmd libraries'
+    inputs:
+      buildType: current
+      itemPattern: 'drop_Build_MssqlSqlcmd_*/**'
+      targetPath: '$(Pipeline.Workspace)/mssql-sqlcmd-native'
+  - pwsh: >
+      .pipeline/scripts/pack-mssql-sqlcmd.ps1
+      -ArtifactsDirectory '$(Pipeline.Workspace)/mssql-sqlcmd-native'
+      -StagingDirectory '$(Build.StagingDirectory)/mssql-sqlcmd'
+      -BuildReason '$(Build.Reason)'
+      -BuildId '$(Build.BuildId)'
+      -SourceVersion '$(Build.SourceVersion)'
+      -IsOfficial '${{ parameters.isOfficial }}'
+    displayName: 'Stage mssql-sqlcmd package contents'
+  - task: NuGetCommand@2
+    displayName: 'Pack mssql-sqlcmd'
+    inputs:
+      command: pack
+      packagesToPack: '$(mssqlSqlcmdNuspec)'
+      packDestination: '$(ob_outputDirectory)/mssql-sqlcmd-nuget'
+      basePath: '$(Build.StagingDirectory)/mssql-sqlcmd'
+  - task: PublishPipelineArtifact@1
+    displayName: 'Publish mssql-sqlcmd package'
+    inputs:
+      targetPath: '$(ob_outputDirectory)/mssql-sqlcmd-nuget'
+      artifact: 'drop_Build_MssqlSqlcmd_Package'
+      publishLocation: 'pipeline'

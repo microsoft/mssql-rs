@@ -33,6 +33,12 @@ document once, at exit, with the connection details and exit code:
 
 Values are strings, as sqlcmd would print them; SQL `NULL` is JSON `null`.
 
+The whole document is held in memory until sqlcmd exits, because it begins
+with details only known then (the exit code). Peak memory is a few times the
+size of the output: the collected values, the rendered UTF-8 text, and the
+UTF-16 copy handed back to sqlcmd. For very large results, text output still
+streams.
+
 ## Building for native sqlcmd
 
 ```text
@@ -51,8 +57,9 @@ cargo rustc -p mssql-sqlcmd --release --lib -- --print native-static-libs
 
 Native sqlcmd does not build this crate. It restores the `mssql-sqlcmd` NuGet
 package, pinned in its `Directory.Packages.props`, from its own feed, which has
-`mssql-rs_Public` as an upstream source. The package holds one static library
-per runtime native sqlcmd ships on:
+the Release view of `mssql-rs_Public` (`mssql-rs_Public@Release`) as an
+upstream source. The package holds one static library per runtime native
+sqlcmd ships on:
 
 ```text
 include/mssql_sqlcmd.h
@@ -85,23 +92,30 @@ then `nuget pack <staging>/mssql-sqlcmd.nuspec`, or point native sqlcmd's
 
 ## Pipelines and releases
 
-Two pipelines of their own, separate from the Python wheels ones:
+| Pipeline | File | When | Package version |
+|---|---|---|---|
+| NonOfficial Python Wheels Publish | `.pipeline/OneBranch/NonOfficialPythonWheelsPublish.yml` | Every merge to `main` and nightly; anyone can queue it | `<crate>-dev.<date>.<build>` / `<crate>-nightly.<date>`, published to `mssql-rs_Public` automatically |
+| Official mssql-sqlcmd Build | `.pipeline/OneBranch/OfficialMssqlSqlcmdBuild.yml` | Every update of `stable` | The crate version, kept as the `drop_Build_MssqlSqlcmd_Package` artifact; never published |
+| ADO-Release Nuget mssql-sqlcmd | `.pipeline/OneBranch/OfficialMssqlSqlcmdRelease.yml` | Manual | Publishes an Official Build's package, without a suffix |
 
-| Pipeline | File | Does |
-|---|---|---|
-| Official mssql-sqlcmd Build | `.pipeline/OneBranch/OfficialMssqlSqlcmdBuild.yml` | Builds every runtime and packs `mssql-sqlcmd.<version>.nupkg` as the `drop_Build_MssqlSqlcmd_Package` artifact. Runs on merges to `stable` that touch this crate or its build scripts; never publishes. |
-| ADO-Release Nuget mssql-sqlcmd | `.pipeline/OneBranch/OfficialMssqlSqlcmdRelease.yml` | Manual. Validates the package of the Official Build run you pick and, with `publishNuGet`, publishes it to `public/mssql-rs_Public`. |
-
-The jobs live in `.pipeline/OneBranch/mssql-sqlcmd-stages.yml`.
+All three build the same jobs, from `.pipeline/OneBranch/mssql-sqlcmd-jobs.yml`.
+The non-official pipeline is for testing changes: point native sqlcmd at a
+`-dev` or `-nightly` version. The release pipeline is separate from the Python
+release.
 
 To release:
 
 1. Bump `version` in `Cargo.toml`. A version on a feed can never be replaced
    or reused, so every release is a new version.
-2. Merge; the Official Build produces the package with that version.
-3. Run the Official Release on that build with `publishNuGet` ticked. Without
-   it the run only validates: one package, not a prerelease, all nine runtimes
-   present, and a version not already on the feed.
-4. In msodbcsql, move the `mssql-sqlcmd` pin in `Directory.Packages.props` to
-   the new version. Native sqlcmd keeps building against the version it pins
-   until then.
+2. Merge to `main`, then to `stable`; the Official Build produces the package.
+3. Run ADO-Release Nuget mssql-sqlcmd on that build with `publishNuGet` ticked.
+   Without it the run only validates: one package, not a prerelease, all nine
+   runtimes present, and a version not already on the feed.
+4. Promote the new version to the **Release** view of `mssql-rs_Public`
+   (Artifacts → mssql-rs_Public → mssql-sqlcmd → the version → Promote →
+   `@Release`). Versions left only in the feed's local view are deleted after
+   30 days.
+5. In msodbcsql, move the `mssql-sqlcmd` pin in `Directory.Packages.props` to
+   the new version. msodbcsql reaches the package through the
+   `mssql-rs_Public@Release` upstream, so it sees only promoted versions, and
+   native sqlcmd keeps building against the version it pins until then.

@@ -9,9 +9,11 @@
 //! may contain embedded NULs.
 //!
 //! The document is an opaque handle owned by the caller between
-//! [`mssql_sqlcmd_json_new`] and [`mssql_sqlcmd_json_free`]. The rendered
-//! document is a separate allocation, released with
-//! [`mssql_sqlcmd_free_text`]. Every function that can fail returns an
+//! [`mssql_sqlcmd_json_new`] and [`mssql_sqlcmd_json_free`]. A handle is not
+//! thread-safe: calls on one handle, including the final free, must not run
+//! concurrently (native sqlcmd makes them all from one thread). Different
+//! handles are independent. The rendered document is a separate allocation,
+//! released with [`mssql_sqlcmd_free_text`]. Every function that can fail returns an
 //! [`MSSQL_SQLCMD_OK`]-style status rather than unwinding: a panic is caught at
 //! the boundary and reported as [`MSSQL_SQLCMD_INTERNAL_ERROR`].
 //!
@@ -96,7 +98,7 @@ unsafe fn read_texts(texts: *const MssqlSqlcmdText, count: usize) -> Option<Vec<
 ///
 /// # Safety
 /// `document` must be null or a live handle from [`mssql_sqlcmd_json_new`]
-/// that no other call is using.
+/// that no other call is using concurrently: the body gets exclusive access.
 unsafe fn with_document(
     document: *mut MssqlSqlcmdJsonDocument,
     body: impl FnOnce(&mut JsonDocument) -> i32,
@@ -120,7 +122,7 @@ pub extern "C" fn mssql_sqlcmd_json_new() -> *mut MssqlSqlcmdJsonDocument {
 ///
 /// # Safety
 /// `document` must be null or a handle from [`mssql_sqlcmd_json_new`] that has
-/// not been freed.
+/// not been freed and that no other call is using concurrently.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn mssql_sqlcmd_json_free(document: *mut MssqlSqlcmdJsonDocument) {
     if !document.is_null() {
@@ -233,7 +235,8 @@ pub unsafe extern "C" fn mssql_sqlcmd_json_add_message(
 
 /// Renders the document as UTF-16 into a new allocation, stored in `*out` with
 /// its length in `*out_len`. Release it with [`mssql_sqlcmd_free_text`]. The
-/// document itself is unchanged and still has to be freed.
+/// document itself is unchanged and still has to be freed. On any failure
+/// `*out` is null and `*out_len` is 0, so nothing stale can be freed.
 ///
 /// # Safety
 /// `document` as for [`mssql_sqlcmd_json_free`]; `version` must have non-null
@@ -250,6 +253,11 @@ pub unsafe extern "C" fn mssql_sqlcmd_json_render(
 ) -> i32 {
     if out.is_null() || out_len.is_null() {
         return MSSQL_SQLCMD_NULL_ARGUMENT;
+    }
+    // SAFETY: both were checked non-null and are writable, per the caller.
+    unsafe {
+        *out = std::ptr::null_mut();
+        *out_len = 0;
     }
     // SAFETY: forwarded from the caller's guarantees.
     let (version, connection) = unsafe {
@@ -492,5 +500,61 @@ mod tests {
         // SAFETY: freed once.
         unsafe { mssql_sqlcmd_json_free(document) };
         assert!(rendered.contains("[\"\u{FFFD}\"]"), "{rendered}");
+    }
+
+    /// A panic inside a call is caught at the boundary and reported as a
+    /// status, rather than unwinding into the native caller; the handle stays
+    /// usable afterwards.
+    #[test]
+    fn a_panic_is_reported_as_an_internal_error() {
+        let document = mssql_sqlcmd_json_new();
+        // SAFETY: a live handle, used by this call only.
+        let status = unsafe {
+            with_document(document, |_| -> i32 {
+                panic!("forced panic at the boundary")
+            })
+        };
+        assert_eq!(status, MSSQL_SQLCMD_INTERNAL_ERROR);
+
+        let rendered = render(
+            document,
+            MssqlSqlcmdConnection {
+                server: NULL_TEXT,
+                database: NULL_TEXT,
+                authentication: NULL_TEXT,
+                encrypt: 0,
+            },
+        );
+        // SAFETY: freed once.
+        unsafe { mssql_sqlcmd_json_free(document) };
+        assert!(rendered.contains("\"output\": []"), "{rendered}");
+    }
+
+    /// A failed render leaves the caller's out-parameters null and empty, so
+    /// an error path that frees them anyway frees nothing.
+    #[test]
+    fn a_failed_render_clears_the_outputs() {
+        let version = utf16("18.5");
+        let mut out = std::ptr::NonNull::<u16>::dangling().as_ptr();
+        let mut out_len = 42;
+        // SAFETY: a null document is reported before anything is read.
+        let status = unsafe {
+            mssql_sqlcmd_json_render(
+                std::ptr::null_mut(),
+                text(&version),
+                MssqlSqlcmdConnection {
+                    server: NULL_TEXT,
+                    database: NULL_TEXT,
+                    authentication: NULL_TEXT,
+                    encrypt: 0,
+                },
+                0,
+                &mut out,
+                &mut out_len,
+            )
+        };
+        assert_eq!(status, MSSQL_SQLCMD_NULL_ARGUMENT);
+        assert!(out.is_null());
+        assert_eq!(out_len, 0);
     }
 }

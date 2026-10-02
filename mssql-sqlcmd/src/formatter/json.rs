@@ -40,8 +40,17 @@
 //!
 //! Values are strings, exactly as sqlcmd would print them, so no precision is
 //! lost and every SQL type has a representation. SQL `NULL` is JSON `null`,
-//! which keeps it distinct from the string `"NULL"`. Output keeps the order in
-//! which the server produced it.
+//! which keeps it distinct from the string `"NULL"`.
+//!
+//! `output` lists entries in the order they began: a result set takes its place
+//! when its columns arrive, and all its rows stay inside it. A message the
+//! server sends while a result set's rows are still arriving therefore follows
+//! that whole result set, not the row it arrived after.
+//!
+//! The whole document is held in memory until `render`, because it starts with
+//! details only known at exit (the exit code) and must stay one valid JSON
+//! value even when sqlcmd stops part-way. Peak memory is a few times the size
+//! of the output; text output remains the way to stream very large results.
 
 use std::fmt::Write;
 
