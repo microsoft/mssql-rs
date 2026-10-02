@@ -17,10 +17,8 @@
 //! entry point — `sql.h` declares `SQLSetDescRec` directly, with no
 //! `SQLSetDescRecW`/`SQLSetDescRecA` pair.
 //!
-//! Shares `SQLSetDescFieldW`'s known, deferred gap: no
-//! `STMT_STATE_FETCH_IN_PROGRESS` check before writing an ARD/APD record a
-//! fetch may still be reading through — see
-//! [#472](https://github.com/microsoft/mssql-rs/issues/472).
+//! Shares `SQLSetDescFieldW`'s write path, including its HY010 refusal while
+//! a fetch is reading through the target ARD.
 
 use tracing::{debug, error};
 
