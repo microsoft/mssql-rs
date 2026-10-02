@@ -18,10 +18,6 @@ path = "src/lib.rs"
 name = "mssql-mock-tds"
 path = "src/main.rs"
 
-[features]
-default = []
-vendored-openssl = ["openssl/vendored"]
-
 [dependencies]
 mssql-tds = { path = "../mssql-tds", version = "0.2.0", default-features = false }
 tokio = { version = "1.48.0", features = ["full"] }
