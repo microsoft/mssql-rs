@@ -75,7 +75,14 @@ perf VM the baseline source is materialized with a local `git worktree` of the
 baseline commit from the shipped `.git`, then copied over `../mssql-tds` for the
 baseline run — so no VM-side ADO authentication is needed. (Swapping the source in
 place, rather than re-pointing the dependency at the worktree, keeps a single
-`mssql-tds` in the workspace and avoids a Cargo lockfile package collision.)
+`mssql-tds` in the workspace and avoids a Cargo lockfile package collision.) The
+baseline manifest's `[package]` version is then stamped with the candidate's, because
+sibling workspace crates pin `mssql-tds` by version and Cargo resolves the whole
+workspace — without this, any crate version bump after the pinned baseline breaks the
+baseline build outright. `CARGO_PKG_VERSION` *is* compiled into the driver (it supplies
+`DriverVersion::from_cargo_version()` for the TDS login packet and the default
+`UserAgent.driver_version`), so stamping additionally makes that metadata identical on
+both sides — one fewer difference between the two builds.
 
 ### Comparison flow: interleaved per-binary runs
 

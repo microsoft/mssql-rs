@@ -260,11 +260,57 @@ for line in sys.stdin:
         print((t.get("name") or "") + "\t" + ex)'
 }
 
+# Print the [package] version from a Cargo manifest. $1 = manifest path.
+package_version() {
+    awk '
+        /^\[/ { in_pkg = ($0 ~ /^\[package\]/); next }
+        in_pkg && /^version[[:space:]]*=/ && match($0, /"[^"]*"/) {
+            print substr($0, RSTART + 1, RLENGTH - 2); exit
+        }' "$1"
+}
+
+# Rewrite the [package] version in a Cargo manifest. $1 = manifest, $2 = version.
+set_package_version() {
+    awk -v v="$2" '
+        /^\[/ { in_pkg = ($0 ~ /^\[package\]/); print; next }
+        in_pkg && !done && /^version[[:space:]]*=/ { print "version = \"" v "\""; done = 1; next }
+        { print }' "$1" > "$1.tmp" && mv "$1.tmp" "$1"
+}
+
+# Sibling workspace crates pin mssql-tds by version (e.g. mssql-mock-tds declares
+# `mssql-tds = { path = "../mssql-tds", version = "0.2.0" }`). Cargo resolves the whole
+# workspace, so once main bumps the crate version the older baseline source no longer
+# satisfies that requirement and the entire baseline build fails.
+#
+# Stamp the candidate's version onto the baseline manifest. CARGO_PKG_VERSION is
+# compiled into the driver — DriverVersion::from_cargo_version() goes into the TDS login
+# packet and UserAgent::default().driver_version into the login metadata — so stamping
+# also makes that compiled-in metadata IDENTICAL on both sides. That removes a
+# difference between the two builds rather than introducing one.
+align_baseline_version() {
+    local manifest="$REPO_ROOT/mssql-tds/Cargo.toml"
+    local cand base
+    cand="$(package_version "$REPO_ROOT/.mssql-tds-candidate/Cargo.toml")"
+    base="$(package_version "$manifest")"
+    if [ -z "$cand" ] || [ -z "$base" ]; then
+        echo "ERROR: could not read [package] version from the mssql-tds manifests." >&2
+        exit 1
+    fi
+    if [ "$cand" != "$base" ]; then
+        echo ">>> Stamping candidate version ${cand} onto the baseline mssql-tds manifest (was ${base})."
+        set_package_version "$manifest" "$cand"
+    fi
+}
+
 swap_to_baseline() {
     mv "$REPO_ROOT/mssql-tds" "$REPO_ROOT/.mssql-tds-candidate"
     cp -r "$BASELINE_TREE/mssql-tds" "$REPO_ROOT/mssql-tds"
+    align_baseline_version
 }
+# Idempotent: this also runs from the EXIT trap, and without the stash check a
+# second call would rm -rf the freshly restored candidate source.
 restore_candidate() {
+    [ -d "$REPO_ROOT/.mssql-tds-candidate" ] || return 0
     rm -rf "$REPO_ROOT/mssql-tds"
     mv "$REPO_ROOT/.mssql-tds-candidate" "$REPO_ROOT/mssql-tds"
 }
@@ -274,15 +320,28 @@ compile_benches "$REPO_ROOT/target" "candidate"
 CAND_BINS="$(bench_bins "$REPO_ROOT/target")"
 [ -n "$CAND_BINS" ] || { echo "ERROR: no candidate bench binaries found"; exit 1; }
 
+# A stash here means an earlier run died before restoring (only reachable outside the
+# lab, where the VM is rebuilt per run). Refuse rather than proceed: `mv` moves INTO an
+# existing directory, so the live source would nest inside the stale stash and the
+# restore would then put the stale tree back with exit 0 — silent corruption. Checked
+# before the worktree is created so a refusal leaves nothing to clean up.
+if [ -e "$REPO_ROOT/.mssql-tds-candidate" ]; then
+    echo "ERROR: $REPO_ROOT/.mssql-tds-candidate already exists — an earlier run did not finish restoring." >&2
+    echo "       Move the real mssql-tds source back out of it, remove it, then re-run." >&2
+    exit 1
+fi
+
 BASELINE_TREE="$(mktemp -d)/perf-baseline"
 echo ">>> Adding baseline worktree for ${BASELINE_COMMIT} at ${BASELINE_TREE}..."
 git worktree add --detach "$BASELINE_TREE" "$BASELINE_COMMIT"
 echo ">>> Building baseline bench binaries (target-base/)..."
-swap_to_baseline
-# From here until the swap is undone, any exit (a baseline compile failure, or
-# set -e on anything else) would otherwise leave mssql-tds/ holding the baseline
-# source and the candidate stranded in .mssql-tds-candidate.
+# Arm the cleanup BEFORE the swap. swap_to_baseline is itself fallible (the version
+# stamping can exit non-zero), and from the moment the source moves, any exit would
+# otherwise leave mssql-tds/ holding the baseline copy with the candidate stranded in
+# .mssql-tds-candidate. restore_candidate is a no-op until the stash exists, so arming
+# it ahead of the swap is safe.
 trap 'restore_candidate 2>/dev/null || true; git worktree remove --force "$BASELINE_TREE" 2>/dev/null || true' EXIT
+swap_to_baseline
 compile_benches "$REPO_ROOT/target-base" "baseline"
 BASE_BINS="$(bench_bins "$REPO_ROOT/target-base")"
 restore_candidate

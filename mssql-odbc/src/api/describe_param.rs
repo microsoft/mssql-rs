@@ -1409,6 +1409,72 @@ mod tests {
         assert_eq!(ds.active_stmt, None);
     }
 
+    // Pins the branch `ATempTableParameterCannotBeDescribedButStillBinds` can
+    // only observe by outcome: a server error token reaching `fail_with_tds`,
+    // and the connection coming back unclaimed so the next call can use it.
+    #[test]
+    fn a_server_error_during_describe_returns_the_connection_for_reuse() {
+        use crate::handles::dbc::DbcHandle;
+        use mssql_tds::test_client_support::{done_no_more, sql_error, tds_client_from_tokens};
+
+        let h = TestHandles::with_env_dbc_stmt();
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        // A server error with no `SERVER_ERROR_TO_SQL_STATE_MAP` entry, so the
+        // state comes from the severity tier alone. The live temp-table case
+        // measures as 208 (`42S02`, a mapped entry) followed by 11501
+        // (`42000`, this fallback); 11529 stands in for the unmapped half
+        // here because the mock drives one error token at a time.
+        let client = tds_client_from_tokens(vec![
+            sql_error(11529, 16, "no metadata could be determined"),
+            done_no_more(),
+        ]);
+        {
+            let mut ds = dbc.inner.lock().unwrap();
+            ds.client = Some(client);
+        }
+
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.prepared = Some(crate::handles::stmt::PreparedPlan {
+                stmt: PreparedStatement::new("SELECT @P1".to_string()),
+                marker_count: 1,
+                original_sql: String::new(),
+            });
+        }
+
+        let rc = unsafe {
+            sql_describe_param(
+                h.stmt,
+                1,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(rc, SQL_ERROR);
+
+        let ss = stmt.inner.lock().unwrap();
+        // 11529 has no entry in SERVER_ERROR_TO_SQL_STATE_MAP, so the state
+        // comes from severity 16 alone. Asserted because mssql-python
+        // classifies its exception types off the SQLSTATE.
+        assert_eq!(ss.diag_records[0].sql_state, SQLSTATE_42000);
+        assert_eq!(ss.diag_records[0].native_error, 11529);
+        assert!(
+            ss.diag_records
+                .iter()
+                .any(|d| d.message.contains("no metadata could be determined"))
+        );
+        assert!(!ss.has_state(STMT_STATE_EXEC_STARTED));
+        drop(ss);
+
+        let ds = dbc.inner.lock().unwrap();
+        assert!(ds.client.is_some(), "the client must come back for reuse");
+        assert_eq!(ds.active_stmt, None);
+    }
+
     #[test]
     fn parses_mssql_python_integer_metadata() {
         let (_, description, _) =

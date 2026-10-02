@@ -81,8 +81,9 @@ transparent reconnects.
   defaulted binding gets the same answer as naming the C type. `BoundParam`
   stores only the resolved type: it needs no defaulted flag, because a typed NULL
   is built from `ParameterType` for every binding, not just defaulted ones.
-  `SQL_SS_UDT` and `SQL_SS_TABLE` are still rejected at bind
-  time, since they need a server type name no describe call reports.
+  `SQL_SS_TABLE` is still rejected at bind time, since it needs a server type
+  name no describe call reports. `SQL_SS_UDT` no longer is: since AB#48248 the
+  application supplies the name, or `SQLDescribeParam` fills it in.
 - **Value conversion** - the wire type follows `ParameterType`, not the C type:
   the buffer is declared as the SQL type the application named and converted to
   it. Integer and character buffers reach each other's SQL types (P5), and
@@ -90,7 +91,8 @@ transparent reconnects.
   the temporal types, `xml` and `sql_variant`. Those are same-family pairings
   apart from character to decimal and character to `sql_variant`, which exist
   because `SQL_C_DEFAULT` resolves both of those SQL types to a character C type.
-  `SQL_C_BINARY` reaches only the binary SQL types.
+  `SQL_C_BINARY` reaches the binary SQL types, `sql_variant`, and `SQL_SS_UDT`
+  (AB#48248).
   Character indicators support `SQL_NULL_DATA`, `SQL_NTS`, and
   explicit byte length; binary values use explicit byte length or
   `BufferLength` when no indicator pointer is supplied.
@@ -229,8 +231,8 @@ temporal types, `xml` and `sql_variant`. Money needs no row of its own: ODBC
 names no money type - there is no `SQL_MONEY` identifier and no entry for one in
 `rgbTRANSTYPE380` - so `money` and `smallmoney` parameters are bound as
 `SQL_DECIMAL`, which is what `SQLDescribeParam` reports for them, and P8's
-decimal row carries them. What remains is the P9 series: `vector`, UDT,
-and the off-diagonal cross-product.
+decimal row carries them. What remains is the P9 series: `vector`, the character
+source for UDT, and the off-diagonal cross-product.
 
 ### Design rules
 
@@ -283,7 +285,7 @@ one task per phase.
 | P6 | [47370](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47370) | Partly done | Parity and e2e hardening |
 | P7 | [47371](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47371) | Partly done | Cleanup and follow-up hooks |
 | P8 | [47500](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47500) | Code complete | Scalar rows: bit, float, decimal, GUID, temporal, XML, variant |
-| P9 | series under [46373](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/46373) | In progress | Complete the matrix. P9a `SQL_C_NUMERIC` ([47946](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47946), closed), P9b UDT / `sql_variant` ([48248](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/48248)), P9c temporal ([48246](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/48246)), P9d interval sources ([48247](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/48247)), P9e scalar values ([47790](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47790)), P9f the `07006` flip ([48249](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/48249)), P9g vector ([48326](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/48326)) |
+| P9 | series under [46373](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/46373) | In progress | Complete the matrix. P9a `SQL_C_NUMERIC` ([47946](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47946), closed), P9b UDT / `sql_variant` ([48248](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/48248), closed), P9b_2 character -> UDT ([48815](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/48815)), P9c temporal ([48246](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/48246)), P9d interval sources ([48247](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/48247)), P9e scalar values ([47790](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47790)), P9f the `07006` flip ([48249](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/48249)), P9g vector ([48326](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/48326)) |
 
 P6 and P7 are each partly delivered in code while their work items are still
 open; the bullets under their sections mark which parts have landed.
@@ -527,8 +529,10 @@ Verified against msodbcsql source:
 - Malformed UTF-8 stays lossy - there is no msodbcsql behaviour to copy, since
   its conversion goes through `SystemLocale::FromUtf16` (`sqlccmd.cpp:10952`),
   which is not in this source tree. `22018` is tracked with AB#47565.
-- Still `HYC00`: `SQL_SS_VECTOR` (P9g, AB#48326), `SQL_SS_UDT` (P9b, AB#48248)
-  and `SQL_SS_TABLE` (TVPs, AB#48148). `DescribesMaxLengthParameters` and
+- Still `HYC00`: `SQL_SS_VECTOR` (P9g, AB#48326) and `SQL_SS_TABLE` (TVPs,
+  AB#48148). `SQL_SS_UDT` binds from a `SQL_C_BINARY` buffer since AB#48248;
+  only the character source is still refused (P9b_2, AB#48815).
+  `DescribesMaxLengthParameters` and
   `DescribedDecimalRoundTripsPrecisionAndScale` are both re-enabled - the first
   with the binary types (AB#47688), the second with decimal (AB#47500).
 
@@ -740,13 +744,13 @@ the compare leg, where a wrong reading fails rather than sits.
   scale > precision (`sqlcdesc.cpp:11529`), and the temporal types run
   `CheckSqlScale` against `SCALE_DATETIME2` / `SCALE_TIME` /
   `SCALE_DATETIMEOFFSET`, all 7 (`tds.h:273-278`). We apply the same rules with
-  the same `HY104` in `decimal_metadata` / `datetime_metadata`, only later -
-  the same divergence already accepted for `ColumnSize` in `fixed_length`.
-  Closing it means `parameter_column_size_is_valid` grows a scale argument, and
-  `MAX_DATETIME_SCALE` moves to `type_rules.rs` with it. A `ColumnSize` of 0 is
-  the one place the timing does not matter: `CheckSqlPrec` (`:11471`) reads 0 as
-  `SQL_PREC_UNLIMITED` and returns `HY104` for a 3.x application, which is what
-  we do. `FixupColumnSizeDecimalDigits` never runs for these types, so nothing
+  the same `HY104` in `decimal_metadata` / `datetime_metadata`, only later.
+  `DecimalDigits` is now the only value with that timing: `ColumnSize` used to
+  share it, but `SQLBindParameter` screens it through
+  `parameter_column_size_is_valid`, leaving `fixed_length` as a backstop.
+  Closing the scale half means `parameter_column_size_is_valid` grows a scale
+  argument, and `MAX_DATETIME_SCALE` moves to `type_rules.rs` with it.
+  `FixupColumnSizeDecimalDigits` never runs for these types, so nothing
   defaults the precision to 18 first.
 - **`SQL_TYPE_DATE` accepts any `DecimalDigits`.** msodbcsql requires
   `SCALE_DATE == 0` (`sqlcdesc.cpp:11641`); `typed_null` maps the type with no
@@ -1006,13 +1010,15 @@ consumer reachability has not been assessed.
   `SQL_DECIMAL` and are declared `decimal(19,4)` / `decimal(10,4)` for the
   server to convert on assignment. msodbcsql declares the same, for the same
   reason. The remaining matrix work is now the P9 series under AB#46373
-  (`mssql-odbc | Parameter completeness`): UDT (P9b, AB#48248)
-  **[not reachable** - `ParamInfo` carries no type name, so mssql-python cannot
-  supply one**]**,
-  temporal completion (P9c, AB#48246) **[reachable]**, interval C sources (P9d,
+  (`mssql-odbc | Parameter completeness`): UDT from a character source (P9b_2,
+  AB#48815) **[not reachable** - `_SQL_TO_C_TYPE` maps `SQL_SS_UDT` to
+  `SQL_C_BINARY`, so the binary source that landed with AB#48248 is the only one
+  mssql-python binds**]**, temporal completion (P9c, AB#48246)
+  **[not reachable** - see the pairing note below**]**, interval C sources (P9d,
   AB#48247) **[not reachable** - no interval C type is bound**]**, scalar value
   conversions (P9e, AB#47790) **[reachable]**, the `HYC00` -> `07006` flip
-  (P9f, AB#48249) **[reachable** - diagnostic correctness**]**, and `vector`
+  (P9f, AB#48249) **[not reachable** - mssql-python never binds a missing cell,
+  so the state it would report is never observed**]**, and `vector`
   (P9g, AB#48326) **[not reachable]**. TVPs are tracked separately by AB#48148
   **[not reachable** - no `SQL_SS_TABLE` binding**]**. `ColumnSize` bounds a
   data-at-execution value within the character and binary families, enforced
@@ -1021,25 +1027,36 @@ consumer reachability has not been assessed.
   `max` declarations, which have no declared length. What remains under
   AB#47590 is the unbounded close-time transform described above
   **[reachable** - DAE triggers above 4000 UTF-16 units / 8000 bytes**]**.
+
+  **The pairing note: the set of pairs mssql-python emits is fixed and finite.**
+  Neither source lets an application choose the C type: `_map_sql_type` and
+  `DetectParamTypes` return fixed `(sql_type, c_type)` tuples, and
+  `setinputsizes` accepts only `(sql_type, size, decimal_digits)`, deriving the
+  C type from `_SQL_TO_C_TYPE` (`cursor.py:1252-1274`). That set is *not* this
+  driver's `SQL_C_DEFAULT` resolution - mssql-python binds `SQL_DECIMAL` as
+  `SQL_C_NUMERIC`, `SQL_SS_TIME2` as `SQL_C_TYPE_TIME` and `SQL_SS_VARIANT` as
+  `SQL_C_BINARY`, where `resolve_default_c_type` answers `SQL_C_CHAR`,
+  `SQL_C_SS_TIME2` and `SQL_C_CHAR` - so reachability has to be decided by
+  auditing the set, not by comparing against the defaults. Audited 2026-09-29
+  over every `_SQL_TO_C_TYPE` entry, every `_map_sql_type` return, the
+  `executemany` decimal override, and the `SQL_VARCHAR` fallback a failed
+  `SQLDescribeParam` produces: every pair is in the matrix, including the one
+  that looks wrong, `datetime.time` binding as `(SQL_TYPE_TIME, SQL_C_WCHAR)` -
+  mssql-python's own `SQL_C_CHAR` constant is `-8`, which is ODBC's
+  `SQL_C_WCHAR`, and the native path agrees via `PARAM_C_TYPE_TEXT`.
+  No cell P9b_2, P9c or P9f would add appears in that set.
 - **Deferred features (AB#48148) [not reachable]:** output/input-output parameters in parameter arrays and TVPs. `DetectParamTypes` binds every parameter `SQL_PARAM_INPUT`, so mssql-python never reaches the output-array case; TVPs are unreachable for the separate reason above - they are input parameters, but `ParamInfo` carries no `SQL_SS_TABLE` type name to supply. Single-row output parameters are supported; input parameter arrays (`SQL_ATTR_PARAMSET_SIZE`) are implemented with the limitations above.
-- **`mssql-tds` gap found by P8, closed by AB#47800:** a `sql_variant` could not
-  carry a `varchar` payload - `get_variant_base_type` and
-  `create_variant_inner_context` assumed every `ColumnValues::String` was
-  UTF-16. Both now resolve the base type and byte length from `SqlString`'s
-  own encoding, transcoding a narrow value's final wire bytes once and reusing
-  them for every length field and the data write, so a declared length can no
-  longer disagree with what is actually sent. The other half landed with P8
-  itself: `write_variant_type_info` and `calculate_type_info_length` answered
-  an unhandled base type with `unreachable!` and now return `ProtocolError`.
-- **Data-at-exec follow-ups:** `SQLParamData` / `SQLPutData` are implemented for
-  both `SQLPrepare` + `SQLExecute` and `SQLExecDirect` (see the
-  delivered-features list above and `data-at-execution-streaming.md`), and a
-  streamed execute keeps the statement prepared rather than falling back to
-  ad-hoc `sp_executesql`. A sequence that fails on the wire loses the request
-  and the socket, since a request interrupted mid-send cannot be retracted with
-  `EOM | IGNORE` the way a cancelled or driver-rejected one is; the session is
-  recovered lazily by the next execute via `check_and_reconnect`, matching
-  msodbcsql's `GetBatchCtxOrRecover`.
-- **Canonical procedure calls / `sp_prepexecrpc`:** support ODBC canonical
-  calls (`{call proc(?)}`) with the appropriate parameter-count and single-row
-  parameter-set guards. Ad-hoc T-SQL currently uses `sp_prepexec`.
+- **`sp_prepexecrpc` for prepared canonical calls:** the calls landed with
+  AB#46384 - `SQLExecDirect` sends an RPC by name for a single
+  `{[? =] call proc(…)}` whose arguments are all plain markers and none is
+  data-at-execution (`CallSite::is_rpc_eligible`, `api/exec_direct.rs`); named
+  arguments, `DEFAULT`, literals and the streaming paths take the translated
+  `EXEC` text. What remains is msodbcsql's `PREP_EXEC_RPC_CALL` optimization:
+  `SQLPrepare` discards the call site (`api/prepare.rs`), so the prepared route
+  re-executes `EXEC proc @P1,…` through `sp_prepexec` instead of preparing the
+  call as an RPC - `RpcProcs::PrepExecRpc` exists in
+  `mssql-tds/src/message/rpc.rs` with no ODBC caller, and is out of scope in
+  `odbc-escape-sequences-plan.md` §10. That same discard leaves it unverified
+  whether a prepared canonical call needs its own single-row guard: parameter
+  arrays are refused for every `SQLExecDirect` statement pending AB#47939
+  (`sqlccmd.cpp:3192-3199`), not by a call-specific check.

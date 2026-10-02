@@ -537,7 +537,25 @@ msodbcsql build is measured.
     Recorded following automated review feedback on #599 (2026-09-22);
     narrowed to the cross-identity case following review on 2026-09-24.
     Human parity sign-off has not been recorded. Tracked in #598.
-20. **An oversized `sql_variant` payload with a non-zero overflow is refused by
+20. **Catalog fallback shares the original query-timeout budget.** If a
+    qualified catalog call fails with a server error, `run_catalog` retries
+    unqualified across the seven implemented catalog functions. This driver
+    deducts cumulative elapsed time from the original `SQL_ATTR_QUERY_TIMEOUT`
+    before that retry; an exhausted budget reports the qualified attempt's
+    server error instead of attempting the fallback. Whole-second truncation
+    means this is not an exact 1x wall-clock cap: a sub-second remainder can
+    extend the call by less than one second. msodbcsql's `DoDD` recursively
+    retries through `SQLExecDirectW` (`sqlcdd.cpp:1894`), which re-reads the
+    undeducted `GetQueryTimeOut(lpstmt)` (`sqlcprot.h:1607`), predicting a
+    fresh full budget and up to 2x the configured timeout. Sharing the budget
+    avoids doubling an application-visible call's deadline for a fallback the
+    application did not request. The local mock-server test
+    `catalog_retry_budget_exhausted_reports_the_original_server_error`
+    establishes this driver's behavior; the reference behavior is source-only,
+    not a measured retail claim. A comparison that records `SQL_DRIVER_VER`
+    and the tested msodbcsql build would close that evidence gap. Decision
+    recorded in #547. Human parity sign-off has not been recorded.
+21. **An oversized `sql_variant` payload with a non-zero overflow is refused by
     the driver, not the server.** `sql_variant` cannot hold a `max` type
     (server error 529), so a payload past the 8000-byte ceiling has to be
     refused somewhere. msodbcsql sends it and surfaces the server's refusal as
