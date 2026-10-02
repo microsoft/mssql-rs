@@ -34,28 +34,45 @@ fn test_context() -> ClientContext {
 }
 
 /// Connects to a mock server and returns the ServerName it saw in LOGIN7.
+///
+/// The server is always shut down and its outcome checked, even when the
+/// connect or the read fails: those failures are reported only afterwards, so a
+/// failing test neither leaves the server running nor hides a server error.
 async fn login_server_name_on_the_wire(override_name: Option<&str>) -> String {
     let server = MockTdsServer::new("127.0.0.1:0").await.unwrap();
     let port = server.local_addr().port();
     let store = server.connection_store();
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    let handle = tokio::spawn(async move {
-        let _ = server.run_with_shutdown(shutdown_rx).await;
-    });
+    let handle = tokio::spawn(server.run_with_shutdown(shutdown_rx));
 
+    let seen = read_login_server_name(port, &store, override_name).await;
+
+    let _ = shutdown_tx.send(());
+    handle
+        .await
+        .expect("mock server task panicked")
+        .expect("mock server failed");
+    seen.unwrap_or_else(|failure| panic!("{failure}"))
+}
+
+/// Logs in through the mock server on `port` and waits for the ServerName it
+/// recorded. Failures are returned rather than asserted, so the caller can stop
+/// the server first.
+async fn read_login_server_name(
+    port: u16,
+    store: &std::sync::Arc<tokio::sync::Mutex<mssql_mock_tds::ConnectionStore>>,
+    override_name: Option<&str>,
+) -> Result<String, String> {
     let mut context = test_context();
     context.login_server_name = override_name.map(str::to_string);
 
     let datasource = format!("127.0.0.1,{port}");
     // Boxed: connecting holds a large future, and leaving it inline makes this
     // helper's own future big enough to trip the `large_futures` lint.
-    let client = Box::pin(TdsConnectionProvider {}.create_client(context, &datasource, None)).await;
-    assert!(
-        client.is_ok(),
-        "connect failed: {:?}",
-        client.as_ref().err()
-    );
+    let client = Box::pin(TdsConnectionProvider {}.create_client(context, &datasource, None))
+        .await
+        .map_err(|error| format!("connect failed: {error:?}"))?;
 
     // Dropping the client lets the server's handler finish, but nothing awaits
     // it: the store is written only when that handler exits, so poll for the
@@ -63,28 +80,28 @@ async fn login_server_name_on_the_wire(override_name: Option<&str>) -> String {
     drop(client);
 
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(10);
-    let seen = loop {
+    loop {
         let recorded = {
             let store = store.lock().await;
             let connections: Vec<_> = store.all().values().collect();
-            assert!(connections.len() <= 1, "expected at most one connection");
+            if connections.len() > 1 {
+                return Err(format!(
+                    "expected at most one connection, got {}",
+                    connections.len()
+                ));
+            }
             connections
                 .first()
                 .and_then(|c| c.received_server_name.clone())
         };
         if let Some(name) = recorded {
-            break name;
+            return Ok(name);
         }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "server never recorded a ServerName from LOGIN7"
-        );
+        if tokio::time::Instant::now() >= deadline {
+            return Err("server never recorded a ServerName from LOGIN7".to_string());
+        }
         tokio::time::sleep(tokio::time::Duration::from_millis(25)).await;
-    };
-
-    let _ = shutdown_tx.send(());
-    let _ = handle.await;
-    seen
+    }
 }
 
 #[tokio::test]

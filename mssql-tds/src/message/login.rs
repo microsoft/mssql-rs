@@ -31,7 +31,7 @@ use super::features::utf8::Utf8Feature;
 use super::features::vectorfeature::VectorFeature;
 use crate::core::TdsResult;
 use crate::io::token_stream::{ParserContext, TdsTokenStreamReader};
-use tracing::{Level, debug, event, info, trace};
+use tracing::{Level, debug, event, trace};
 
 pub(crate) const FIXED_LOGIN_RECORD_LENGTH: i32 = 94;
 const MAX_LOGIN_RECORD_LENGTH: usize = 128 * 1024 - 1;
@@ -983,7 +983,7 @@ impl<'a, 'n, 'context> Serializer<'a, 'n, 'context> {
                         .model
                         .user_input
                         .login_server_name(self.model.transport_context);
-                    info!("Login Server name: {}", server_name);
+                    debug!("Login Server name: {}", server_name);
                     self.payload_writer
                         .write_string_unicode_async(&server_name)
                         .await?;
