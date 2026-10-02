@@ -968,7 +968,7 @@ impl DaeTranscode {
             // unmappable character is substituted identically on both. The
             // unmapped-collation fallback is *not* identical to
             // `serialize_string`'s narrow arm, which keeps a Latin-1 mapping
-            // where this defaults to Windows-1252 (parity-deviations entry 23).
+            // where this defaults to Windows-1252 (parity-deviations entry 24).
             DaeTarget::Narrow(collation) => {
                 let encoded = encode_narrow(text, collation);
                 DaeChunk {

@@ -720,7 +720,7 @@ msodbcsql build is measured.
     in both states; silently storing an out-of-range value is not behaviour
     worth reproducing.
 
-23. **A collation naming no encoding this crate maps is given a fallback
+24. **A collation naming no encoding this crate maps is given a fallback
     encoding; msodbcsql fails the conversion instead.** msodbcsql's
     `CodePageFromTDSCollation` (`cli_common/src/clntcomn.cpp:103-160`) seeds
     `*puiCodePage = CP_ACP`, takes `CP_UTF8` for a UTF8-flagged collation, the
@@ -745,7 +745,7 @@ msodbcsql build is measured.
       at all.
 
     Both rules substitute per UTF-16 unit, so the width agrees between them and
-    with deviation 21; measured, U+1F600 is `3F 3F` under either. What the two
+    with deviation 22; measured, U+1F600 is `3F 3F` under either. What the two
     disagree on is U+0080: `0x80` under the Latin-1 mapping, but unmappable in
     Windows-1252, whose `0x80` is the Euro sign, so it substitutes to `?`.
 
