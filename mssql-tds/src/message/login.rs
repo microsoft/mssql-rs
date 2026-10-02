@@ -2,8 +2,8 @@
 // Licensed under the MIT License.
 
 use crate::connection::client_context::{
-    ClientContext, ColumnEncryptionSetting, TdsAuthenticationMethod, TransportContext,
-    VectorVersion,
+    ClientContext, ColumnEncryptionSetting, MAX_LOGIN7_NAME_UNITS, TdsAuthenticationMethod,
+    TransportContext, VectorVersion,
 };
 use crate::message::features::jsonfeature::JsonFeature;
 use crate::message::login_options::{
@@ -809,6 +809,23 @@ impl<'a, 'n, 'context> Serializer<'a, 'n, 'context> {
         }
     }
 
+    /// SQL Server drops a login whose ServerName is longer than MS-TDS allows,
+    /// which the caller would only see as a failure to read the response.
+    /// `ClientContext::validate` rejects a long override up front; this also
+    /// covers the dialled address used without one, before anything is written.
+    fn check_server_name_length(&self) -> TdsResult<()> {
+        let units = self.server_name.encode_utf16().count();
+        if units > MAX_LOGIN7_NAME_UNITS {
+            return Err(crate::error::Error::UsageError(format!(
+                "the LOGIN7 server name {:?} is {units} UTF-16 code units; at most \
+                 {MAX_LOGIN7_NAME_UNITS} are allowed. Connect through a shorter address, \
+                 or set login_server_name.",
+                self.server_name
+            )));
+        }
+        Ok(())
+    }
+
     /// Calculate the length of the login record.
     /// This includes the fixed length of the login record, the length of the variable length fields,
     /// and the length of the feature extension data.
@@ -837,6 +854,7 @@ impl<'a, 'n, 'context> Serializer<'a, 'n, 'context> {
     }
 
     pub(crate) async fn serialize(&mut self) -> TdsResult<()> {
+        self.check_server_name_length()?;
         let (login_record_length, feature_extension_offset) =
             self.calculate_login_record_length()?;
         trace!(login_record_length);
@@ -1664,6 +1682,58 @@ mod tests {
                 "feature offset should move with the written name for {name:?}"
             );
         }
+    }
+
+    /// Without an override, the ServerName is the dialled address, which can
+    /// also exceed LOGIN7's limit. SQL Server drops such a login without saying
+    /// why, so it is refused with a clear `UsageError` before anything is
+    /// written, while a name of exactly the limit still goes through.
+    #[tokio::test]
+    async fn a_dialled_address_too_long_for_login7_is_refused_before_writing() {
+        fn context_for_host(host: String) -> ClientContext {
+            let mut context = ClientContext {
+                connect_retry_count: 0,
+                ..ClientContext::default()
+            };
+            context.transport_context = TransportContext::Tcp {
+                host,
+                port: 1433,
+                instance_name: None,
+            };
+            context
+        }
+        let at_limit = MAX_LOGIN7_NAME_UNITS - ",1433".len();
+
+        let context = context_for_host("h".repeat(at_limit));
+        let model =
+            LoginRequestModel::from_context(&context, false, &context.transport_context, None);
+        let mut mock = MockNetworkWriter::new(131_072);
+        let mut packet_writer = PacketWriter::new(PacketType::Login7, &mut mock, None, None);
+        assert!(
+            Serializer::new(&model, &mut packet_writer)
+                .check_server_name_length()
+                .is_ok(),
+            "a name of exactly the limit is allowed"
+        );
+
+        let context = context_for_host("h".repeat(at_limit + 1));
+        let model =
+            LoginRequestModel::from_context(&context, false, &context.transport_context, None);
+        let mut mock = MockNetworkWriter::new(131_072);
+        let mut packet_writer = PacketWriter::new(PacketType::Login7, &mut mock, None, None);
+        let result = Serializer::new(&model, &mut packet_writer)
+            .serialize()
+            .await;
+        assert!(
+            matches!(&result, Err(crate::error::Error::UsageError(message))
+                if message.contains("129 UTF-16 code units")),
+            "{result:?}"
+        );
+        assert_eq!(
+            packet_writer.position(),
+            0,
+            "nothing is written for a refused login"
+        );
     }
 
     // ── FeaturesRequest::features() ──

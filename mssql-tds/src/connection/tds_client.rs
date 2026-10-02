@@ -6766,9 +6766,10 @@ impl TdsClient {
         }
         let start = self.request_timeout_start();
         let read = match &mut self.active_row_read_state {
-            ActiveRowReadState::PlpPaused(plp_state) => {
-                self.transport.try_read_buffered_plp(plp_state, out)?
-            }
+            ActiveRowReadState::PlpPaused(plp_state) => self
+                .transport
+                .try_read_buffered_plp(plp_state, out)
+                .map_err(Self::buffered_read_error)?,
             _ => {
                 return Err(UsageError(
                     "try_read_active_plp_chunk called with no active PLP stream".to_string(),
@@ -6975,7 +6976,10 @@ impl TdsClient {
 
         let context = ParserContext::ColumnMetadata(metadata, None);
         let start = self.request_timeout_start();
-        let pause_state = self.transport.try_receive_row_header(&context)?;
+        let pause_state = self
+            .transport
+            .try_receive_row_header(&context)
+            .map_err(Self::buffered_read_error)?;
         let Some(pause_state) = pause_state else {
             return Ok(CursorPoll::Pending);
         };
@@ -7029,12 +7033,17 @@ impl TdsClient {
 
         let context = ParserContext::ColumnMetadata(metadata, None);
         let start = self.request_timeout_start();
-        let Some(mut pause_state) = self.transport.try_receive_row_header(&context)? else {
+        let Some(mut pause_state) = self
+            .transport
+            .try_receive_row_header(&context)
+            .map_err(Self::buffered_read_error)?
+        else {
             return Ok(BufferedRowPoll::Pending);
         };
         let complete = self
             .transport
-            .try_read_buffered_row_into(&mut pause_state, writer)?;
+            .try_read_buffered_row_into(&mut pause_state, writer)
+            .map_err(Self::buffered_read_error)?;
         if let Some(start) = start {
             self.update_remaining_timeout(start);
         }
@@ -7093,14 +7102,17 @@ impl TdsClient {
         );
         let context = ParserContext::ColumnMetadata(metadata, None);
         let start = self.request_timeout_start();
-        let Some(mut pause_state) = self.transport.try_receive_row_header(&context)? else {
+        let Some(mut pause_state) = self
+            .transport
+            .try_receive_row_header(&context)
+            .map_err(Self::buffered_read_error)?
+        else {
             return Ok(BufferedRowPoll::Pending);
         };
-        let complete = self.transport.try_read_buffered_row_prefix_into(
-            &mut pause_state,
-            prefix_len,
-            writer,
-        )?;
+        let complete = self
+            .transport
+            .try_read_buffered_row_prefix_into(&mut pause_state, prefix_len, writer)
+            .map_err(Self::buffered_read_error)?;
         if let Some(start) = start {
             self.update_remaining_timeout(start);
         }
@@ -7293,7 +7305,9 @@ impl TdsClient {
                     .get(target)
                     .is_some_and(|metadata| metadata.is_plp()) =>
             {
-                self.transport.try_begin_buffered_plp(pause_state, target)?
+                self.transport
+                    .try_begin_buffered_plp(pause_state, target)
+                    .map_err(Self::buffered_read_error)?
             }
             _ => None,
         };
@@ -7329,7 +7343,8 @@ impl TdsClient {
         let value = match &self.active_row_read_state {
             ActiveRowReadState::RowPaused(pause_state) => self
                 .transport
-                .try_read_buffered_column_with_base(pause_state, target)?,
+                .try_read_buffered_column_with_base(pause_state, target)
+                .map_err(Self::buffered_read_error)?,
             ActiveRowReadState::Idle | ActiveRowReadState::PlpPaused(_) => None,
         };
         let Some((value, variant_base)) = value else {
@@ -7401,7 +7416,8 @@ impl TdsClient {
             match &self.active_row_read_state {
                 ActiveRowReadState::RowPaused(pause_state) => self
                     .transport
-                    .try_read_complete_buffered_plp_column(pause_state, target, out)?,
+                    .try_read_complete_buffered_plp_column(pause_state, target, out)
+                    .map_err(Self::buffered_read_error)?,
                 _ => None,
             }
         };
@@ -7458,7 +7474,8 @@ impl TdsClient {
         let complete = match &mut self.active_row_read_state {
             ActiveRowReadState::RowPaused(pause_state) => self
                 .transport
-                .try_read_buffered_row_into(pause_state, writer)?,
+                .try_read_buffered_row_into(pause_state, writer)
+                .map_err(Self::buffered_read_error)?,
             ActiveRowReadState::PlpPaused(_) => return Ok(false),
             ActiveRowReadState::Idle => {
                 return Err(UsageError(
@@ -7508,7 +7525,8 @@ impl TdsClient {
         let complete = match &mut self.active_row_read_state {
             ActiveRowReadState::RowPaused(pause_state) => self
                 .transport
-                .try_read_buffered_row_prefix_into(pause_state, prefix_len, writer)?,
+                .try_read_buffered_row_prefix_into(pause_state, prefix_len, writer)
+                .map_err(Self::buffered_read_error)?,
             ActiveRowReadState::PlpPaused(_) => return Ok(false),
             ActiveRowReadState::Idle => {
                 return Err(UsageError(
@@ -8287,11 +8305,26 @@ impl TdsClient {
     /// [`end_walk_on_read_error`](Self::end_walk_on_read_error) for the
     /// synchronous `try_*` row reads, applied where they return. A `UsageError`
     /// is exempt: those reads raise it only to reject a call, before reading.
+    /// What their transport reads return passes through
+    /// [`buffered_read_error`](Self::buffered_read_error) first, so a failure
+    /// after bytes were consumed can never carry that variant.
     fn end_walk_on_try_read_error<T>(&mut self, result: TdsResult<T>) -> TdsResult<T> {
         match result {
             Err(error) if !matches!(error, UsageError(_)) => {
                 Err(self.end_walk_on_read_error(error))
             }
+            other => other,
+        }
+    }
+
+    /// Reports a failure of a synchronous `try_*` transport read as a
+    /// [`ProtocolError`](crate::error::Error::ProtocolError) rather than a
+    /// `UsageError`. Once the response is being read, a failure is about the
+    /// response, not the call, so it must end a `Continue` walk; see
+    /// [`end_walk_on_try_read_error`](Self::end_walk_on_try_read_error).
+    fn buffered_read_error(error: crate::error::Error) -> crate::error::Error {
+        match error {
+            UsageError(message) => crate::error::Error::ProtocolError(message),
             other => other,
         }
     }
@@ -9400,6 +9433,9 @@ mod tests {
         known_dead: bool,
         receive_error: Option<crate::error::Error>,
         sync_header_available: bool,
+        /// Returned by the next `try_receive_row_header`, as if the buffered
+        /// bytes it read were rejected.
+        sync_header_error: Option<crate::error::Error>,
         sync_columns: VecDeque<ColumnValues>,
         encryption_setting: NegotiatedEncryptionSetting,
         /// The `remaining_request_timeout` handed to each `receive_token`, so a
@@ -9432,6 +9468,7 @@ mod tests {
                 known_dead: false,
                 receive_error: None,
                 sync_header_available: false,
+                sync_header_error: None,
                 sync_columns: VecDeque::new(),
                 encryption_setting: NegotiatedEncryptionSetting::NoEncryption,
                 receive_timeouts: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -9478,6 +9515,9 @@ mod tests {
             &mut self,
             context: &ParserContext,
         ) -> TdsResult<Option<RowPauseState>> {
+            if let Some(error) = self.sync_header_error.take() {
+                return Err(error);
+            }
             if !self.sync_header_available {
                 return Ok(None);
             }
@@ -11598,6 +11638,30 @@ mod tests {
         let result: TdsResult<()> = client.end_walk_on_try_read_error(Err(protocol()));
         assert!(result.is_err());
         assert!(!client.has_open_batch());
+    }
+
+    /// The `UsageError` exemption is for rejected calls only. A sync read that
+    /// had reached the transport cannot be resumed whatever its error says, so
+    /// a `UsageError` coming back from the transport is reported as a
+    /// `ProtocolError` and ends the walk.
+    #[test]
+    fn a_usage_error_from_a_sync_transport_read_still_ends_the_walk() {
+        let mut transport = TestTransport::new();
+        transport.sync_header_error = Some(UsageError("rejected while decoding".to_string()));
+        let mut client = create_test_client_with_transport(transport);
+        client.batch_error_mode = BatchErrorMode::Continue;
+        client.execution_context.set_has_open_batch(true);
+        client.current_metadata = Some(int_column_metadata(1));
+        client.current_result_set_has_been_read_till_end = false;
+
+        let result = client.try_next_row_cursor();
+
+        assert!(
+            matches!(&result, Err(crate::error::Error::ProtocolError(message)) if message == "rejected while decoding"),
+            "{result:?}"
+        );
+        assert!(!client.has_open_batch());
+        assert!(client.is_connection_dead());
     }
 
     /// A row read that consumed bytes and then hit a protocol violation ends a

@@ -15,8 +15,10 @@ use hostname;
 /// Maximum length, in UTF-16 code units, of the LOGIN7 ServerName field.
 ///
 /// MS-TDS caps the other LOGIN7 name and credential fields at 128 as well, but
-/// only [`ClientContext::login_server_name`] is checked against it here.
-const MAX_LOGIN7_NAME_UNITS: usize = 128;
+/// only the ServerName is checked against it: [`ClientContext::login_server_name`]
+/// when the caller sets it, and the dialled address otherwise, when LOGIN7 is
+/// built.
+pub(crate) const MAX_LOGIN7_NAME_UNITS: usize = 128;
 
 /// Controls DNS resolution order when connecting to a server.
 #[derive(PartialEq, Copy, Clone)]
