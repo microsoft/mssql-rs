@@ -162,7 +162,7 @@ impl NarrowEncoded {
 /// difference is the fallback for a collation naming no encoding this crate
 /// maps: this helper defaults to Windows-1252, that arm keeps a Latin-1
 /// mapping. Both diverge from msodbcsql, which fails the conversion instead of
-/// falling back; recorded as entry 23 in
+/// falling back; recorded as entry 24 in
 /// `mssql-odbc/docs/parity-deviations.md`.
 ///
 /// A character the encoding cannot represent becomes

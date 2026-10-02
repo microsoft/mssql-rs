@@ -1648,7 +1648,7 @@ impl TdsValueSerializer {
     /// substituting one. So neither of this crate's defaults is the reference
     /// behaviour -- they are a deliberate choice to keep sending *something*
     /// for a collation the crate cannot map, made in knowledge of the
-    /// reference rather than in ignorance of it. Recorded as entry 23 in
+    /// reference rather than in ignorance of it. Recorded as entry 24 in
     /// `mssql-odbc/docs/parity-deviations.md`.
     ///
     /// A character the resolved encoding cannot represent becomes
@@ -3974,7 +3974,7 @@ mod serializer_tests {
     /// Since AB#48437 `serialize_string`'s `VARCHAR | CHAR | TEXT` arm resolves
     /// the UTF-8 flag too, so this is no longer a distinction between the two
     /// helpers -- the only difference left is the unmapped-collation fallback,
-    /// recorded as entry 23 in `mssql-odbc/docs/parity-deviations.md`. The
+    /// recorded as entry 24 in `mssql-odbc/docs/parity-deviations.md`. The
     /// variant path is pinned against being merged into that arm by
     /// `the_sql_variant_narrow_path_still_encodes_through_the_shared_encoder`,
     /// whose probe has to use an unmapped collation for exactly that reason.

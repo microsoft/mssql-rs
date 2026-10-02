@@ -121,7 +121,7 @@ protected:
     // against `3F` cannot: a code page without U+00E9 may best-fit it to ASCII
     // `e` rather than substitute - CP1251 does - which passes a `!= "3F"` gate
     // while being an unfaithful encoding. This driver deliberately does not
-    // best-fit (parity-deviations entry 21), so it answers `3F` where the
+    // best-fit (parity-deviations entry 22), so it answers `3F` where the
     // engine answered `65`, and a probe gated only on `3F` would fail on that
     // documented deviation rather than on the resolver it exists to test.
     //
@@ -258,7 +258,7 @@ protected:
 // sides must agree on real bytes. A character the target page *cannot* hold
 // would compare the engine's best-fit transliteration against this driver's
 // `?` substitution and fail on that known deviation
-// (docs/parity-deviations.md, entry 21) rather than on the resolver. The
+// (docs/parity-deviations.md, entry 22) rather than on the resolver. The
 // CP437/CP850 discrimination that needs unmappable characters is unit-tested in
 // `tds_value_serializer.rs`, where the collation is controlled directly.
 //
@@ -1178,7 +1178,7 @@ TEST_F(CharConversionLiveTest, UnpairedSurrogateIsSubstitutedLikeAnyUnmappableCh
     // A well-formed pair is deliberately *not* checked here. It is one
     // supplementary character rather than two unmappables, and its substitution
     // width is a measured platform divergence - two bytes on Windows and the
-    // engine, one on glibc msodbcsql (parity-deviations entry 21). Asserting it
+    // engine, one on glibc msodbcsql (parity-deviations entry 22). Asserting it
     // in this test would fail the msodbcsql comparison leg on Linux, because
     // this test runs unskipped on both legs by design. That case is owned by
     // AstralUnmappableCharacterSubstitutesPerUtf16Unit, which carries
