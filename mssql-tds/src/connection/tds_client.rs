@@ -5266,6 +5266,11 @@ impl TdsClient {
                     // The failed statement's own DONE did not come first; nothing
                     // later is its completion.
                     self.failed_statement_done_pending = false;
+                    // Nor its error-flagged DONEs: those precede the next result
+                    // set (live captures show the failing statement's DONEINPROC
+                    // before the COLMETADATA, and no enclosing DONEPROC flagged),
+                    // so an error-flagged DONE from here on is unpaired.
+                    self.statement_error_completion_pending = false;
                     return Ok(ResultBoundaryKind::RowSet(Arc::new(md)));
                 }
                 Tokens::DoneInProc(done) | Tokens::DoneProc(done) | Tokens::Done(done) => {
@@ -8093,9 +8098,10 @@ impl TdsClient {
     /// One error can be reflected at two levels — the failing statement's
     /// DONEINPROC and the enclosing procedure's DONEPROC — so the allowance
     /// survives a DONEINPROC and is spent by the DONEPROC or plain DONE that
-    /// closes the chain. Spending it on the DONEINPROC would report the DONEPROC
-    /// as unpaired and retire a healthy connection; keeping it past the closing
-    /// DONE would let it excuse an unrelated error-flagged DONE later.
+    /// closes the chain, or ends when the next result set begins. Spending it on
+    /// the DONEINPROC would report the DONEPROC as unpaired and retire a healthy
+    /// connection; keeping it past the closing DONE would let it excuse an
+    /// unrelated error-flagged DONE later.
     fn validate_done_error(&mut self, done: &DoneToken, is_done_in_proc: bool) -> TdsResult<()> {
         let completes_returned_error = self.statement_error_completion_pending;
         if !is_done_in_proc {
@@ -8469,8 +8475,10 @@ impl TdsClient {
             self.reset_statement_walk_state();
             return Ok(());
         }
-        // Statement diagnostics skipped under `Continue`; see below.
-        let mut skipped = crate::error::SqlServerDiagnostics::new(Vec::new(), Vec::new());
+        // Statement errors skipped under `Continue`; see below. Their info
+        // messages are not collected here: they stay in `info_messages`, which
+        // this method deliberately leaves for `take_info_messages()`.
+        let mut skipped_errors: Vec<SqlErrorInfo> = Vec::new();
         // call next row to consume any remaining tokens
         let drain_result = loop {
             match self.advance_to_rows().await {
@@ -8482,28 +8490,26 @@ impl TdsClient {
                 Err(crate::error::Error::SqlServerError { diagnostics })
                     if self.has_open_batch() =>
                 {
-                    skipped.errors.extend(diagnostics.errors);
-                    skipped.info_messages.extend(diagnostics.info_messages);
+                    skipped_errors.extend(diagnostics.errors);
                 }
                 Err(error) => break Err(error),
             }
         };
         let drain_result = match drain_result {
-            Ok(()) if skipped.errors.is_empty() => Ok(()),
-            Ok(()) => Err(crate::error::Error::from_sql_diagnostics(skipped)),
-            Err(crate::error::Error::SqlServerError { mut diagnostics }) => {
-                skipped.errors.append(&mut diagnostics.errors);
-                skipped.info_messages.append(&mut diagnostics.info_messages);
-                Err(crate::error::Error::from_sql_diagnostics(skipped))
+            Ok(()) if skipped_errors.is_empty() => Ok(()),
+            Ok(()) => Err(crate::error::Error::from_sql_errors(skipped_errors)),
+            Err(crate::error::Error::SqlServerError { diagnostics }) => {
+                skipped_errors.extend(diagnostics.errors);
+                Err(crate::error::Error::from_sql_errors(skipped_errors))
             }
             Err(error) => {
                 // The failure that stopped the drain is returned, because it
                 // decides whether the connection is retired. The statement errors
                 // skipped before it cannot ride on that error type, so at least
                 // make their loss visible.
-                if !skipped.errors.is_empty() {
+                if !skipped_errors.is_empty() {
                     warn!(
-                        count = skipped.errors.len(),
+                        count = skipped_errors.len(),
                         "Discarding statement errors skipped during the close_query drain"
                     );
                 }
@@ -10202,6 +10208,39 @@ mod tests {
         ));
     }
 
+    /// The allowance also ends where the next result set begins: in a procedure
+    /// doing `RAISERROR(...); SELECT 2`, the failed statement's error-flagged
+    /// DONEINPROC precedes the COLMETADATA, so an error-flagged DONEINPROC
+    /// closing the succeeding row set is unpaired.
+    #[tokio::test]
+    async fn the_allowance_does_not_span_the_next_row_set() {
+        let mut client = create_test_client_with_tokens(vec![
+            Tokens::Error(error_token_with_severity(16)),
+            Tokens::DoneInProc(DoneToken {
+                status: DoneStatus::ERROR | DoneStatus::MORE,
+                cur_cmd: CurrentCommand::Select,
+                row_count: 0,
+            }),
+            int_col_metadata(1),
+            Tokens::DoneInProc(DoneToken {
+                status: DoneStatus::ERROR | DoneStatus::MORE,
+                cur_cmd: CurrentCommand::Select,
+                row_count: 0,
+            }),
+        ]);
+
+        assert!(matches!(
+            execute_continue(&mut client).await,
+            Err(crate::error::Error::SqlServerError { .. })
+        ));
+        assert_eq!(client.advance().await.unwrap(), StatementResult::Rows);
+        assert!(!client.statement_error_completion_pending);
+        assert!(matches!(
+            client.next_row().await,
+            Err(crate::error::Error::ProtocolError(_))
+        ));
+    }
+
     /// `Continue` is not a blanket excuse: a DONE with the error flag and no
     /// preceding ERROR is still a protocol violation.
     #[tokio::test]
@@ -11106,6 +11145,7 @@ mod tests {
                 decryptor: None,
             }))
         }
+
         fn plp_paused() -> ActiveRowReadState {
             let metadata = mixed_lob_metadata(0);
             let Some((Some(plp_stream), _used)) =
@@ -11127,6 +11167,7 @@ mod tests {
                 plp_stream,
             }))
         }
+
         fn failed_row_set(state: ActiveRowReadState) -> TdsClient {
             let mut client = create_test_client();
             client.batch_error_mode = BatchErrorMode::Continue;
@@ -11138,6 +11179,7 @@ mod tests {
                 .push(SqlErrorInfo::from(&error_token_with_severity(16)));
             client
         }
+
         fn assert_closed(client: &TdsClient, surface: &str) {
             assert!(!client.has_open_batch(), "{surface}: batch left open");
             assert!(client.is_connection_dead(), "{surface}: not retired");
@@ -11415,6 +11457,7 @@ mod tests {
                 decryptor: None,
             }
         }
+
         fn walking(resume: RowReadResult) -> TdsClient {
             let mut transport = TestTransport::new();
             transport.resume_results.push_back(resume);
@@ -11425,6 +11468,7 @@ mod tests {
             client.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(paused()));
             client
         }
+
         fn assert_ended(client: &TdsClient, surface: &str) {
             assert!(!client.has_open_batch(), "{surface}: batch left open");
             assert!(client.is_connection_dead(), "{surface}: not retired");

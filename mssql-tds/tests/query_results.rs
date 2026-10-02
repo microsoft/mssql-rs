@@ -742,6 +742,12 @@ mod query_result_reads {
         run_query_and_check_results(connection, "SELECT 1".to_string(), &expected).await;
     }
 
+    /// Runs DDL that sets up a test, such as a temporary procedure.
+    async fn run_ddl(connection: &mut TdsClient, sql: &str) {
+        connection.execute(sql.to_string(), ()).await.unwrap();
+        connection.close_query().await.unwrap();
+    }
+
     /// Variable assignment is tagged `SQLSELECT` and still carries a count; a
     /// tool must not print a row count for `SET @x = 1`. The expected sequence is
     /// what ODBC `sqlcmd` prints for this batch: one count for the INSERT and one
@@ -1099,10 +1105,6 @@ mod query_result_reads {
             assert_eq!(steps, expected, "{sql}");
             assert_still_usable(&mut connection).await;
         }
-    }
-    async fn run_ddl(connection: &mut TdsClient, sql: &str) {
-        connection.execute(sql.to_string(), ()).await.unwrap();
-        connection.close_query().await.unwrap();
     }
 
     /// `close_query` under `Continue` drains past errors instead of stopping at
