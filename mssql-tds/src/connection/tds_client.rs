@@ -7862,9 +7862,11 @@ impl TdsClient {
             };
 
             if read == 0 && !plp_state.reached_end() {
-                return Err(crate::error::Error::ProtocolError(
-                    "Active PLP drain made no progress before end-of-stream".to_string(),
-                ));
+                return Err(
+                    self.end_walk_on_read_error(crate::error::Error::ProtocolError(
+                        "Active PLP drain made no progress before end-of-stream".to_string(),
+                    )),
+                );
             }
         }
         Ok(())
@@ -7919,9 +7921,11 @@ impl TdsClient {
                     Ok(has_row)
                 } else {
                     // This should not happen in normal resume flow; keep as a defensive guard.
-                    Err(crate::error::Error::ProtocolError(
-                        "Unexpected token during row resume".to_string(),
-                    ))
+                    Err(
+                        self.end_walk_on_read_error(crate::error::Error::ProtocolError(
+                            "Unexpected token during row resume".to_string(),
+                        )),
+                    )
                 }
             }
         }
@@ -9271,6 +9275,9 @@ mod tests {
         /// `read_row_column` down a specific arm (e.g. a `PlpPaused` result that
         /// makes the cursor emit `CursorColumn::PlpStreaming`).
         resume_results: VecDeque<RowReadResult>,
+        /// Byte counts the mock replays from `read_active_plp_bytes` before it
+        /// fails as a closed connection.
+        plp_read_results: VecDeque<usize>,
         /// When set, the next (and every subsequent) `send` fails, simulating a
         /// mid-message wire failure. Shared so a test can flip it after setup.
         send_should_fail: Arc<std::sync::atomic::AtomicBool>,
@@ -9312,6 +9319,7 @@ mod tests {
                 packet_data: Vec::new(),
                 packet_pos: 0,
                 resume_results: VecDeque::new(),
+                plp_read_results: VecDeque::new(),
                 send_should_fail: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 send_should_hang: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 cancel_after_send: None,
@@ -9475,6 +9483,9 @@ mod tests {
             _cancel_handle: Option<&CancelHandle>,
             _out: &mut [u8],
         ) -> TdsResult<usize> {
+            if let Some(read) = self.plp_read_results.pop_front() {
+                return Ok(read);
+            }
             Err(crate::error::Error::ConnectionClosed("test".to_string()))
         }
     }
@@ -11399,6 +11410,47 @@ mod tests {
         let mut client = walking(RowReadResult::Token(int_col_metadata(1)));
         assert!(client.next_row_cursor().await.is_err());
         assert_ended(&client, "next_row_cursor draining a paused row");
+
+        // A token the handler absorbs without ending the row cannot finish a resume.
+        let mut client = walking(RowReadResult::Token(Tokens::Order(
+            crate::token::tokens::OrderToken {
+                _order_columns: Vec::new(),
+            },
+        )));
+        assert!(client.next_row_cursor().await.is_err());
+        assert_ended(&client, "next_row_cursor, resume ended on a non-row token");
+
+        // A PLP drain that reads nothing before the stream ends.
+        let metadata = mixed_lob_metadata(0);
+        let Some((Some(plp_stream), _used)) =
+            crate::datatypes::decoder::PlpColumnStream::try_begin_buffered(
+                &metadata.columns[0],
+                &4_u64.to_le_bytes(),
+            )
+            .unwrap()
+        else {
+            panic!("a known-length PLP header must yield a started stream");
+        };
+        let mut transport = TestTransport::new();
+        transport.plp_read_results.push_back(0);
+        let mut client = create_test_client_with_transport(transport);
+        client.batch_error_mode = BatchErrorMode::Continue;
+        client.execution_context.set_has_open_batch(true);
+        client.current_metadata = Some(Arc::clone(&metadata));
+        client.active_row_read_state = ActiveRowReadState::PlpPaused(Box::new(PlpPauseState {
+            row_pause_state: RowPauseState {
+                next_column_index: 0,
+                metadata,
+                nbc_null_bitmap: None,
+                decryptor: None,
+            },
+            plp_stream,
+        }));
+        assert!(matches!(
+            client.next_row_cursor().await,
+            Err(crate::error::Error::ProtocolError(_))
+        ));
+        assert_ended(&client, "next_row_cursor, PLP drain without progress");
     }
 
     /// Misuse rejected before anything is read leaves a continued row set as it
