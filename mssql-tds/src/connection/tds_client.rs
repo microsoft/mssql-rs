@@ -12091,6 +12091,56 @@ mod tests {
         }
     }
 
+    /// A decode failure in a synchronous column pull ends a `Continue` walk like
+    /// one on the async path: a sql_variant whose base type byte is not a type.
+    #[tokio::test]
+    async fn a_decode_failure_in_try_read_row_column_ends_the_walk() {
+        let column = crate::query::metadata::ColumnMetadata {
+            user_type: 0,
+            flags: 0,
+            type_info: crate::datatypes::sqldatatypes::TypeInfo::var_len(
+                TdsDataType::SsVariant,
+                8009,
+            )
+            .unwrap(),
+            data_type: TdsDataType::SsVariant,
+            column_name: "variant".to_string(),
+            multi_part_name: None,
+            crypto_metadata: None,
+        };
+        let metadata = Arc::new(ColMetadataToken {
+            column_count: 1,
+            columns: vec![column],
+            cek_table: Vec::new(),
+        });
+        let mut payload = vec![0xff, TokenType::Row as u8];
+        payload.extend_from_slice(&6_u32.to_le_bytes());
+        payload.extend_from_slice(&[0x01, 0]);
+        payload.extend_from_slice(&42_i32.to_le_bytes());
+        let mut packet =
+            TestPacketBuilder::new(crate::message::messages::PacketType::TabularResult);
+        let mut transport =
+            create_network_transport_with_data(&packet.append_bytes(&payload).build());
+        assert_eq!(transport.read_byte().await.unwrap(), 0xff);
+        let mut client = create_test_client_with_any_transport(AnyTransport::network(transport));
+        client.current_metadata = Some(metadata);
+        client.current_result_set_has_been_read_till_end = false;
+        client.batch_error_mode = BatchErrorMode::Continue;
+        client.execution_context.set_has_open_batch(true);
+
+        assert_eq!(
+            client.try_next_row_cursor().unwrap(),
+            CursorPoll::Ready(true)
+        );
+        let result = client.try_read_row_column(0);
+        assert!(
+            matches!(&result, Err(e) if !matches!(e, UsageError(_))),
+            "expected a decode failure, got {result:?}"
+        );
+        assert!(!client.has_open_batch());
+        assert!(client.is_connection_dead());
+    }
+
     #[tokio::test]
     async fn sync_cursor_decodes_buffered_sql_variant_with_base_type() {
         let column = crate::query::metadata::ColumnMetadata {
