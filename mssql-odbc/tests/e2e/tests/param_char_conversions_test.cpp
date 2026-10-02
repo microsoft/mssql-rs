@@ -253,16 +253,20 @@ protected:
 // the engine disagree. Echoing the value back as text would not catch this -
 // a symmetric mis-decode on the way out would hide a mis-encode on the way in.
 //
-// U+00E9 is deliberately the only probe. It is representable in every code page
-// a `Latin1_General`, CP437, CP850 or `_UTF8` collation selects, so the two
-// sides must agree on real bytes. A character the target page *cannot* hold
-// would compare the engine's best-fit transliteration against this driver's
-// `?` substitution and fail on that known deviation
-// (docs/parity-deviations.md, entry 22) rather than on the resolver. The
-// CP437/CP850 discrimination that needs unmappable characters is unit-tested in
+// U+00E9 is deliberately the only probe, and `EngineNarrowBytesForEAcute`
+// decides whether the database collation can carry it. The probe needs a code
+// page that holds the character *exactly*, which the CP1252, CP437, CP850 and
+// `_UTF8` families do; a `Latin1_General` name is not sufficient on its own,
+// since `SQL_Latin1_General_CP1251_*` best-fits U+00E9 to ASCII `e` rather than
+// encoding it, and the round-trip guard skips that rather than comparing the
+// engine's best-fit against this driver's `?` substitution and failing on a
+// known deviation (docs/parity-deviations.md, entry 22). The CP437/CP850
+// discrimination that needs unmappable characters is unit-tested in
 // `tds_value_serializer.rs`, where the collation is controlled directly.
 //
-// Runs unskipped: this is the engine's own verdict, not a driver comparison.
+// Not skipped for the msodbcsql leg - this is the engine's own verdict, not a
+// driver comparison - but it does skip entirely when the collation cannot hold
+// U+00E9 exactly.
 //
 // Benefits-from-mock-tds: the RPC bytes are inferred from what SQL Server
 // stored, via CONVERT(..., VARBINARY). A byte-level mock TDS server could read
