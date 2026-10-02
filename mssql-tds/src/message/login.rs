@@ -816,10 +816,18 @@ impl<'a, 'n, 'context> Serializer<'a, 'n, 'context> {
     fn check_server_name_length(&self) -> TdsResult<()> {
         let units = self.server_name.encode_utf16().count();
         if units > MAX_LOGIN7_NAME_UNITS {
+            // The accessor borrows the override and builds the dialled address,
+            // so the variant says which one is too long and what to change.
+            let remedy = match self.server_name {
+                Cow::Borrowed(_) => "Use a shorter login_server_name.",
+                Cow::Owned(_) => {
+                    "Connect through a shorter address, or set login_server_name to a \
+                     shorter name."
+                }
+            };
             return Err(crate::error::Error::UsageError(format!(
                 "the LOGIN7 server name {:?} is {units} UTF-16 code units; at most \
-                 {MAX_LOGIN7_NAME_UNITS} are allowed. Connect through a shorter address, \
-                 or set login_server_name.",
+                 {MAX_LOGIN7_NAME_UNITS} are allowed. {remedy}",
                 self.server_name
             )));
         }
@@ -1726,13 +1734,28 @@ mod tests {
             .await;
         assert!(
             matches!(&result, Err(crate::error::Error::UsageError(message))
-                if message.contains("129 UTF-16 code units")),
+                if message.contains("129 UTF-16 code units")
+                    && message.contains("Connect through a shorter address")),
             "{result:?}"
         );
         assert_eq!(
             packet_writer.position(),
             0,
             "nothing is written for a refused login"
+        );
+
+        // When the long name is the override itself, the remedy names it.
+        let mut context = context_for_host("h".to_string());
+        context.login_server_name = Some("o".repeat(MAX_LOGIN7_NAME_UNITS + 1));
+        let model =
+            LoginRequestModel::from_context(&context, false, &context.transport_context, None);
+        let mut mock = MockNetworkWriter::new(131_072);
+        let mut packet_writer = PacketWriter::new(PacketType::Login7, &mut mock, None, None);
+        let result = Serializer::new(&model, &mut packet_writer).check_server_name_length();
+        assert!(
+            matches!(&result, Err(crate::error::Error::UsageError(message))
+                if message.contains("Use a shorter login_server_name")),
+            "{result:?}"
         );
     }
 

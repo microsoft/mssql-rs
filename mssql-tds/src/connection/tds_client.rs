@@ -8336,7 +8336,10 @@ impl TdsClient {
     /// [`BatchErrorMode::Abort`]; say so in a trace rather than drop it silently.
     fn note_on_error_ignored(on_error: BatchErrorMode) {
         if on_error != BatchErrorMode::Abort {
-            debug!("BatchErrorMode::Continue is honoured only by execute; using Abort");
+            debug!(
+                ?on_error,
+                "Only execute honours ExecuteOptions::on_error; using Abort"
+            );
         }
     }
 

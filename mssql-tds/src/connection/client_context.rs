@@ -232,7 +232,9 @@ impl ClientContextValidator for DefaultClientContextValidator {
             let units = name.encode_utf16().count();
             if units > MAX_LOGIN7_NAME_UNITS {
                 return Err(Error::UsageError(format!(
-                    "login_server_name is {units} UTF-16 code units; LOGIN7 allows at most {MAX_LOGIN7_NAME_UNITS}."
+                    "login_server_name {name:?} is {units} UTF-16 code units; LOGIN7 allows at \
+                     most {MAX_LOGIN7_NAME_UNITS}. Use a shorter name, or leave it unset (or \
+                     empty) to send the dialled address."
                 )));
             }
         }
