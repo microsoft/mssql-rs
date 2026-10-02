@@ -1066,6 +1066,9 @@ TEST_F(ScalarConversionLiveTest, NumericStructOffTheFastPathIgnoresTheEmbeddedSc
 // afterwards takes the fast path, which forwards the written-back (38, 0), so
 // val[] is sent as 12345 rather than the original 12.345. Measured on Windows
 // Driver 18.6.2.1: (38, 0) after the first execute, then 12345.00 again.
+// Benefits-from-mock-tds: capture both RPCs and assert TYPE_INFO (10, 2) with
+// payload 1234500 on the first, then the fast path forwarding (38, 0) with
+// payload 12345 on the second.
 TEST_F(ScalarConversionLiveTest, NumericStructOffTheFastPathReceivesTheApdMetadata) {
     SQL_NUMERIC_STRUCT value = {};
     value.precision = 5;
