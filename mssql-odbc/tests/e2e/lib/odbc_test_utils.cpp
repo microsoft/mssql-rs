@@ -65,75 +65,82 @@ std::string ConvertNativeTestText(const std::string& utf8, const std::string& en
                 iconv_close(value);
             }
         }
-    } converter{iconv_open(encoding.c_str(), "UTF-8")};
-    if (converter.value == reinterpret_cast<iconv_t>(-1)) {
-        throw std::runtime_error("iconv_open failed for " + encoding);
-    }
-    char* input = const_cast<char*>(utf8.data());
-    size_t inputLeft = utf8.size();
-    char* output = result.data();
-    size_t outputLeft = result.size();
-    while (inputLeft != 0) {
-        const size_t converted = iconv(converter.value, &input, &inputLeft, &output, &outputLeft);
-        if (converted != static_cast<size_t>(-1)) {
-            if (usedDefault != nullptr && converted != 0) {
-                *usedDefault = true;
-            }
-            break;
+    };
+    while (true) {
+        Converter converter{iconv_open(encoding.c_str(), "UTF-8")};
+        if (converter.value == reinterpret_cast<iconv_t>(-1)) {
+            throw std::runtime_error("iconv_open failed for " + encoding);
         }
-        if (errno == E2BIG) {
-            const size_t written = static_cast<size_t>(output - result.data());
+        char* input = const_cast<char*>(utf8.data());
+        size_t inputLeft = utf8.size();
+        char* output = result.data();
+        size_t outputLeft = result.size();
+        bool attemptUsedDefault = false;
+        bool retry = false;
+        while (inputLeft != 0) {
+            const size_t converted =
+                iconv(converter.value, &input, &inputLeft, &output, &outputLeft);
+            if (converted != static_cast<size_t>(-1)) {
+                attemptUsedDefault = attemptUsedDefault || converted != 0;
+                break;
+            }
+            if (errno == E2BIG) {
+                if (result.size() > result.max_size() / 2) {
+                    throw std::length_error("native test conversion output exceeds buffer limit");
+                }
+                result.resize(result.size() * 2);
+                retry = true;
+                break;
+            }
+            if (errno != EILSEQ || !allowReplacement) {
+                throw std::runtime_error("iconv native test conversion failed: " +
+                                         std::to_string(errno));
+            }
+            // Input was validated before native conversion. If transliteration
+            // fails, the native converter substitutes once per UTF-16 code unit.
+            const unsigned char lead = static_cast<unsigned char>(*input);
+            const size_t sourceBytes =
+                lead < 0x80 ? 1 : lead < 0xE0 ? 2 : lead < 0xF0 ? 3 : 4;
+            const size_t replacements = sourceBytes == 4 ? 2 : 1;
+            if (sourceBytes > inputLeft || replacements > outputLeft) {
+                throw std::runtime_error("iconv substitution exceeds test buffer");
+            }
+            std::fill_n(output, replacements, '?');
+            input += sourceBytes;
+            inputLeft -= sourceBytes;
+            output += replacements;
+            outputLeft -= replacements;
+            attemptUsedDefault = true;
+        }
+        if (retry) {
+            continue;
+        }
+        while (true) {
+            const size_t flushed = iconv(converter.value, nullptr, nullptr, &output, &outputLeft);
+            if (flushed != static_cast<size_t>(-1)) {
+                attemptUsedDefault = attemptUsedDefault || flushed != 0;
+                break;
+            }
+            if (errno != E2BIG) {
+                throw std::runtime_error("iconv native test flush failed: " +
+                                         std::to_string(errno));
+            }
             if (result.size() > result.max_size() / 2) {
                 throw std::length_error("native test conversion output exceeds buffer limit");
             }
             result.resize(result.size() * 2);
-            output = result.data() + written;
-            outputLeft = result.size() - written;
-            continue;
-        }
-        if (errno != EILSEQ || !allowReplacement) {
-            throw std::runtime_error("iconv native test conversion failed: " +
-                                     std::to_string(errno));
-        }
-        // Input was validated before native conversion. If transliteration
-        // fails, the native converter substitutes once per UTF-16 code unit.
-        const unsigned char lead = static_cast<unsigned char>(*input);
-        const size_t sourceBytes = lead < 0x80 ? 1 : lead < 0xE0 ? 2 : lead < 0xF0 ? 3 : 4;
-        const size_t replacements = sourceBytes == 4 ? 2 : 1;
-        if (sourceBytes > inputLeft || replacements > outputLeft) {
-            throw std::runtime_error("iconv substitution exceeds test buffer");
-        }
-        std::fill_n(output, replacements, '?');
-        input += sourceBytes;
-        inputLeft -= sourceBytes;
-        output += replacements;
-        outputLeft -= replacements;
-        if (usedDefault != nullptr) {
-            *usedDefault = true;
-        }
-    }
-    while (true) {
-        const size_t flushed = iconv(converter.value, nullptr, nullptr, &output, &outputLeft);
-        if (flushed != static_cast<size_t>(-1)) {
-            if (usedDefault != nullptr && flushed != 0) {
-                *usedDefault = true;
-            }
+            retry = true;
             break;
         }
-        if (errno != E2BIG) {
-            throw std::runtime_error("iconv native test flush failed: " +
-                                     std::to_string(errno));
+        if (retry) {
+            continue;
         }
-        const size_t written = static_cast<size_t>(output - result.data());
-        if (result.size() > result.max_size() / 2) {
-            throw std::length_error("native test conversion output exceeds buffer limit");
+        result.resize(result.size() - outputLeft);
+        if (usedDefault != nullptr && attemptUsedDefault) {
+            *usedDefault = true;
         }
-        result.resize(result.size() * 2);
-        output = result.data() + written;
-        outputLeft = result.size() - written;
+        return result;
     }
-    result.resize(result.size() - outputLeft);
-    return result;
 }
 
 }  // namespace
