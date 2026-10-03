@@ -698,18 +698,36 @@ mod platform {
         }
 
         #[test]
-        fn gb18030_preserves_four_byte_character_boundaries() {
+        fn gb18030_preserves_multibyte_character_boundaries() {
             let encoding = for_code_page(54936).unwrap();
-            let text = "A𠀀B";
-            let encoded = encoding.encode(text).unwrap();
-            assert_eq!(encoded.bytes.len(), 6);
-            assert!(!encoded.had_loss);
-            assert_eq!(encoding.decode(&encoded.bytes).unwrap(), text);
-            for capacity in 1..5 {
-                assert_eq!(encoding.prefix_len(&encoded.bytes, capacity).unwrap(), 1);
+            let first = encoding.encode("A").unwrap();
+            let character = encoding.encode("𠀀").unwrap();
+            let last = encoding.encode("B").unwrap();
+            assert!(!character.had_loss);
+            assert!(character.bytes.len() > 1);
+
+            let character_start = first.bytes.len();
+            let character_end = character_start + character.bytes.len();
+            let mut encoded = Vec::with_capacity(character_end + last.bytes.len());
+            encoded.extend_from_slice(&first.bytes);
+            encoded.extend_from_slice(&character.bytes);
+            encoded.extend_from_slice(&last.bytes);
+            assert_eq!(encoding.decode(&encoded).unwrap(), "A𠀀B");
+
+            for capacity in character_start..character_end {
+                assert_eq!(
+                    encoding.prefix_len(&encoded, capacity).unwrap(),
+                    character_start
+                );
             }
-            assert_eq!(encoding.prefix_len(&encoded.bytes, 5).unwrap(), 5);
-            assert_eq!(encoding.prefix_len(&encoded.bytes, 6).unwrap(), 6);
+            assert_eq!(
+                encoding.prefix_len(&encoded, character_end).unwrap(),
+                character_end
+            );
+            assert_eq!(
+                encoding.prefix_len(&encoded, encoded.len()).unwrap(),
+                encoded.len()
+            );
         }
 
         #[cfg(target_env = "gnu")]
