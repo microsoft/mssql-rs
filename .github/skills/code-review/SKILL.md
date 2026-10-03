@@ -64,6 +64,22 @@ happen to be reviewing. Skill maintenance is not that author's problem.
    gh pr checks <N>
    ```
 
+   Resolution state is only in GraphQL; the REST comments endpoint lacks it. GraphQL
+   connections cap at 100 nodes per page with no warning, so an unresolved count is
+   only valid after reading every page. `--paginate` needs `$endCursor` and
+   `pageInfo{hasNextPage endCursor}` in the query; without them it stops at 100.
+
+   ```bash
+   gh api graphql --paginate -F owner=microsoft -F repo=mssql-rs -F n=<N> -f query='
+     query($owner:String!,$repo:String!,$n:Int!,$endCursor:String){
+       repository(owner:$owner,name:$repo){pullRequest(number:$n){
+         reviewThreads(first:100,after:$endCursor){
+           pageInfo{hasNextPage endCursor}
+           nodes{id isResolved isOutdated path line
+             comments(first:1){nodes{databaseId author{login} body}}}}}}}' \
+     -q '.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved|not)'
+   ```
+
    The review *body* is the easiest slot to miss and often the most important:
    Copilot's low-confidence findings are **suppressed**, appearing only there inside a
    collapsed `<details>` block, never as an inline comment. An author's rebuttal to
