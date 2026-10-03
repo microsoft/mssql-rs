@@ -719,3 +719,71 @@ msodbcsql build is measured.
     path `SQLSetConnectAttr` does not reach pre-connect. This driver validates
     in both states; silently storing an out-of-range value is not behaviour
     worth reproducing.
+
+24. **A collation naming no encoding this crate maps is given a fallback
+    encoding; msodbcsql fails the conversion instead.** msodbcsql's
+    `CodePageFromTDSCollation` (`cli_common/src/clntcomn.cpp:103-160`) seeds
+    `*puiCodePage = CP_ACP`, takes `CP_UTF8` for a UTF8-flagged collation, the
+    sort-ID table entry when `bSortid` is non-zero, and otherwise looks the LCID
+    up in `x_rgLocaleMap` and then `GetLocaleInfoA`
+    (`SystemLocale::Singleton().AnsiCP()` on non-Windows builds). If that leaves
+    the code page at `CP_ACP` it returns `E_FAIL` (`:152-157`) — there is no
+    fallback encoding anywhere in that function. This driver always produces
+    bytes, and by **two different rules**:
+
+    - `resolve_collation` (`mssql-tds/src/datatypes/sql_string.rs`) falls back
+      to **Windows-1252**. This is the shared resolver: it backs
+      `EncodingType::resolved_encoding`, so it covers decoding a fetched value,
+      and `encode_narrow`, whose production callers are the `sql_variant`
+      serializer and ODBC's data-at-execution transcoder
+      (`DaeTarget::Narrow`).
+    - `serialize_string`'s `VARCHAR | CHAR | TEXT` arm
+      (`mssql-tds/src/datatypes/tds_value_serializer.rs`) falls back to a
+      **Latin-1-like** mapping: a scalar at or below U+00FF is its own byte,
+      anything above becomes `?` — one per UTF-16 unit, so a supplementary
+      character becomes `??`. The same arm uses it when no collation is known
+      at all.
+
+    Both rules substitute per UTF-16 unit, so the width agrees between them and
+    with deviation 22; measured, U+1F600 is `3F 3F` under either. What the two
+    disagree on is U+0080: `0x80` under the Latin-1 mapping, but unmappable in
+    Windows-1252, whose `0x80` is the Euro sign, so it substitutes to `?`.
+
+    An application can tell the difference from msodbcsql in both cases — it
+    stores a value where the reference driver would fail the bind — so this is
+    recorded rather than left to code comments, even though neither rule is new.
+
+    **Evidence level: source citation only; not measured.** The msodbcsql
+    branch above is read from `clntcomn.cpp`, not observed on a retail build,
+    so no `SQL_DRIVER_VER` is recorded. Reaching it needs a TDS collation whose
+    LCID `GetLocaleInfoA` cannot give an ANSI code page for, which an ordinary
+    server collation does not produce; the Driver Manager is not the obstacle.
+    The measurement that would close this: bind a narrow parameter under such a
+    collation against both drivers and record `SQL_DRIVER_VER` with each
+    result, or exercise `CodePageFromTDSCollation` directly with a synthesised
+    `TDSCOLLATION`.
+
+    The same evidence gap cuts the other way and is worth stating, because it
+    is the more reachable half: this crate's `lcid_to_encoding` table is
+    narrower than `GetLocaleInfoA`, so there are LCIDs msodbcsql resolves
+    correctly and this driver does not. For those, the fallbacks above send
+    *wrong bytes* where msodbcsql sends right ones — a silent divergence rather
+    than the error-versus-value one this entry's title describes. Which LCIDs
+    those are is likewise unmeasured.
+
+    Taken because erroring on a collation the driver merely does not map is a
+    poor trade for an application that would otherwise round-trip its data
+    correctly: the LCID tables are this crate's coverage limit, not a statement
+    about the value. The split between the two rules is **not** itself
+    deliberate design — it is two fallbacks that grew independently. AB#48437
+    deliberately preserved it rather than unifying it, because changing the
+    serializer arm's default to Windows-1252 is a behaviour change on a path
+    that fix did not otherwise touch, and
+    `an_unmapped_collation_keeps_the_latin1_fallback` (unit and integration)
+    pins the current split from both inside and outside the crate, so a future
+    unification is a visible, deliberate edit rather than a silent drift.
+
+    No application regresses at this entry's introduction: both rules predate
+    it and AB#48437 preserved them unchanged, so no sign-off is recorded.
+    Unifying the two defaults needs one, as does closing the table gap above.
+    Decision history in AB#48437.
