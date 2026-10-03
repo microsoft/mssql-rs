@@ -135,12 +135,20 @@ protected:
             "            THEN CONVERT(VARCHAR(64),"
             "                 CAST(CAST(NCHAR(233) AS VARCHAR(16)) AS VARBINARY(16)), 2)"
             "            ELSE '' END";
-        if (!SQL_SUCCEEDED(Prepare(sql)) || !SQL_SUCCEEDED(SQLExecute(stmt_)) ||
-            !SQL_SUCCEEDED(SQLFetch(stmt_))) {
+        if (!SQL_SUCCEEDED(Prepare(sql)) || !SQL_SUCCEEDED(SQLExecute(stmt_))) {
             return std::nullopt;
         }
-        const std::string hex = GetColumnChar(1);
+        // Closed on every exit after a successful execute. A `SQLFetch` that
+        // returns `SQL_NO_DATA` still leaves the cursor open, and leaking it
+        // would make the next `Prepare()` on this handle fail with a
+        // cursor-state error instead of the real cause - the opposite of what
+        // the failed-probe split below is for.
+        const bool fetched = SQL_SUCCEEDED(SQLFetch(stmt_));
+        const std::string hex = fetched ? GetColumnChar(1) : std::string();
         SQLCloseCursor(stmt_);
+        if (!fetched) {
+            return std::nullopt;
+        }
         return hex;
     }
 
