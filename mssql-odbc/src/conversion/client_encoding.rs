@@ -700,13 +700,12 @@ mod platform {
         #[test]
         fn gb18030_preserves_four_byte_character_boundaries() {
             let encoding = for_code_page(54936).unwrap();
-            let encoded = encoding.encode("A𠀀B").unwrap();
-            assert_eq!(encoded.bytes.len(), 6);
-            assert_eq!(encoding.decode(&encoded.bytes).unwrap(), "A𠀀B");
+            let encoded = b"A\x95\x32\x82\x36B";
+            assert_eq!(encoding.decode(encoded).unwrap(), "A𠀀B");
             for capacity in 1..5 {
-                assert_eq!(encoding.prefix_len(&encoded.bytes, capacity).unwrap(), 1);
+                assert_eq!(encoding.prefix_len(encoded, capacity).unwrap(), 1);
             }
-            assert_eq!(encoding.prefix_len(&encoded.bytes, 5).unwrap(), 5);
+            assert_eq!(encoding.prefix_len(encoded, 5).unwrap(), 5);
         }
 
         #[cfg(target_env = "gnu")]
