@@ -67,30 +67,12 @@ then `nuget pack <staging>/mssql-sqlcmd.nuspec`, or point native sqlcmd's
 
 ## Pipelines and releases
 
-| Pipeline | File | When | Package version |
-|---|---|---|---|
-| NonOfficial Python Wheels Publish | `.pipeline/OneBranch/NonOfficialPythonWheelsPublish.yml` | Every merge to `main` and nightly; anyone can queue it | `<crate>-dev.<date>.<build>` / `<crate>-nightly.<date>`, published to `mssql-rs_Public` automatically |
-| Official mssql-sqlcmd Build | `.pipeline/OneBranch/OfficialMssqlSqlcmdBuild.yml` | Every update of `stable` | The crate version, kept as the `drop_Build_MssqlSqlcmd_Package` artifact; never published |
-| ADO-Release Nuget mssql-sqlcmd | `.pipeline/OneBranch/OfficialMssqlSqlcmdRelease.yml` | Manual | Publishes an Official Build's package, without a suffix |
+Test builds (`-dev` on every merge to `main`, `-nightly` each night) are
+published to the `mssql-rs_Public` feed automatically. Releases are built by the
+Official mssql-sqlcmd Build when `stable` changes, published by hand with the
+ADO-Release Nuget mssql-sqlcmd pipeline, and then promoted to the feed's
+`Release` view, which is what msodbcsql consumes.
 
-All three build the same jobs, from `.pipeline/OneBranch/mssql-sqlcmd-jobs.yml`.
-The non-official pipeline is for testing changes: point native sqlcmd at a
-`-dev` or `-nightly` version. The release pipeline is separate from the Python
-release.
-
-To release:
-
-1. Bump `version` in `Cargo.toml`. A version on a feed can never be replaced
-   or reused, so every release is a new version.
-2. Merge to `main`, then to `stable`; the Official Build produces the package.
-3. Run ADO-Release Nuget mssql-sqlcmd on that build with `publishNuGet` ticked.
-   Without it the run only validates: one package, not a prerelease, all nine
-   runtimes present, and a version not already on the feed.
-4. Promote the new version to the **Release** view of `mssql-rs_Public`
-   (Artifacts → mssql-rs_Public → mssql-sqlcmd → the version → Promote →
-   `@Release`). Versions left only in the feed's local view are deleted after
-   30 days.
-5. In msodbcsql, move the `mssql-sqlcmd` pin in `Directory.Packages.props` to
-   the new version. msodbcsql reaches the package through the
-   `mssql-rs_Public@Release` upstream, so it sees only promoted versions, and
-   native sqlcmd keeps building against the version it pins until then.
+The full process (pipelines, versions, feed retention, the release steps,
+the msodbcsql side, and troubleshooting) is in
+[docs/mssql-sqlcmd-release-management.md](../docs/mssql-sqlcmd-release-management.md).
