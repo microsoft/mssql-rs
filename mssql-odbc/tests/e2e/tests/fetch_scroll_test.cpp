@@ -42,7 +42,8 @@ std::string RepeatedBytePrefix(const std::string& character, size_t capacity) {
     if (character.empty()) return result;
     result.reserve(capacity);
     while (result.size() < capacity) {
-        result.append(character, 0, std::min(character.size(), capacity - result.size()));
+        const size_t remaining = capacity - result.size();
+        result.append(character, 0, remaining < character.size() ? remaining : character.size());
     }
     return result;
 }
