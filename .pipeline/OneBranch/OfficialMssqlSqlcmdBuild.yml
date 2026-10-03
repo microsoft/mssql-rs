@@ -1,0 +1,54 @@
+#################################################################################
+#                        OneBranch Pipelines - Official                         #
+# Official build pipeline for the mssql-sqlcmd NuGet package: the static        #
+# library native ODBC sqlcmd (msodbcsql) links for --format json, built for     #
+# every runtime it ships on and packed into mssql-sqlcmd.<version>.nupkg.        #
+# This pipeline does NOT publish to any feed — publishing is handled by         #
+# OfficialMssqlSqlcmdRelease.yml.                                               #
+# Documentation:  https://aka.ms/obpipelines                                    #
+# Yaml Schema:    https://aka.ms/obpipelines/yaml/schema                        #
+# Retail Tasks:   https://aka.ms/obpipelines/tasks                              #
+# Support:        https://aka.ms/onebranchsup                                   #
+#################################################################################
+
+# Runs on every update of the ADO stable branch (stable mirrors GitHub main), so a
+# build is always ready to release. Can also be queued manually. Day-to-day
+# dev/nightly packages come from NonOfficialPythonWheelsPublish.yml instead.
+trigger:
+  batch: true
+  branches:
+    include:
+      - stable
+pr: none
+
+variables:
+  CDP_DEFINITION_BUILD_COUNT: $[counter('', 0)]  # For onebranch.pipeline.version task
+  LinuxContainerImage: 'mcr.microsoft.com/onebranch/azurelinux/build:3.0'
+  WindowsContainerImage: 'onebranch.azurecr.io/windows/ltsc2022/vse2022:latest'
+  DEBIAN_FRONTEND: noninteractive
+  toolchainFeed: 'https://sqlclientdrivers.pkgs.visualstudio.com/mssql-rs/_packaging/mssql-rs/nuget/v3/index.json'
+
+resources:
+  repositories:
+    - repository: templates
+      type: git
+      name: OneBranch.Pipelines/GovernedTemplates
+      ref: refs/heads/main
+
+extends:
+  template: v2/OneBranch.Official.CrossPlat.yml@templates
+  parameters:
+    featureFlags:
+      EnableCDPxPAT: false
+      WindowsHostVersion: 1ESWindows2022
+    globalSdl:
+      binskim:
+        scanOutputDirectoryOnly: true
+      clippy:
+        enabled: true
+    stages:
+    - stage: Build
+      jobs:
+      - template: /.pipeline/OneBranch/mssql-sqlcmd-jobs.yml@self
+        parameters:
+          isOfficial: true

@@ -1,0 +1,154 @@
+#################################################################################
+#                        OneBranch Pipelines - Official Release                 #
+# Publishes the mssql-sqlcmd NuGet package built by OfficialMssqlSqlcmdBuild.yml #
+# to the mssql-rs_Public Azure Artifacts feed, from which native ODBC sqlcmd    #
+# (msodbcsql) restores it through an upstream source of its own feed.           #
+#                                                                               #
+# This pipeline does NOT build anything. The operator picks the Official Build  #
+# run to release; the package is validated on every run and published only     #
+# with publishNuGet. A published version cannot be replaced, so each release    #
+# needs a new version in mssql-sqlcmd/Cargo.toml.                              #
+#                                                                               #
+# Documentation:  https://aka.ms/obpipelines                                    #
+# Yaml Schema:    https://aka.ms/obpipelines/yaml/schema                        #
+# Support:        https://aka.ms/onebranchsup                                   #
+#################################################################################
+
+name: $(Year:YY)$(DayOfYear)$(Rev:.r)-Release
+
+# Manual trigger only — releases should be deliberate
+trigger: none
+pr: none
+
+parameters:
+  - name: publishNuGet
+    displayName: 'Publish the mssql-sqlcmd NuGet package to Azure Artifacts'
+    type: boolean
+    default: false  # Safety: default to false to prevent accidental releases
+
+variables:
+  CDP_DEFINITION_BUILD_COUNT: $[counter('', 0)]
+  LinuxContainerImage: 'mcr.microsoft.com/onebranch/azurelinux/build:3.0'
+  WindowsContainerImage: 'onebranch.azurecr.io/windows/ltsc2022/vse2022:latest'
+  DEBIAN_FRONTEND: noninteractive
+
+resources:
+  repositories:
+    - repository: templates
+      type: git
+      name: OneBranch.Pipelines/GovernedTemplates
+      ref: refs/heads/main
+
+  # The Official Build pipeline. When running this release pipeline, the
+  # operator selects which build run to release from.
+  pipelines:
+    - pipeline: officialBuild
+      source: 'Official mssql-sqlcmd Build'  # ADO pipeline definition name of OfficialMssqlSqlcmdBuild.yml
+      trigger: none  # Manual only — no automatic release on build completion
+
+extends:
+  template: v2/OneBranch.Official.CrossPlat.yml@templates
+  parameters:
+    featureFlags:
+      EnableCDPxPAT: false
+      WindowsHostVersion: 1ESWindows2022
+    globalSdl:
+      binskim:
+        enabled: true
+        scanOutputDirectoryOnly: true
+      credscan:
+        enabled: true
+      policheck:
+        enabled: true
+    nugetPublishing:
+      feeds:
+      - name: public/mssql-rs_Public
+        # A version already on the feed fails the publish instead of being
+        # skipped, so a release never silently leaves consumers on old bits.
+        continueOnConflict: false
+
+    stages:
+    - stage: Release
+      displayName: 'Validate mssql-sqlcmd and optionally publish'
+      dependsOn: []
+      jobs:
+      - job: PublishRelease
+        displayName: 'Validate the package and optionally publish'
+        pool:
+          type: windows
+        variables:
+          ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
+          ob_nugetPublishing_enabled: ${{ parameters.publishNuGet }}
+        steps:
+        - download: officialBuild
+          artifact: drop_Build_MssqlSqlcmd_Package
+          displayName: 'Download the mssql-sqlcmd package from the Official Build'
+
+        - pwsh: |
+            $ErrorActionPreference = 'Stop'
+            Add-Type -AssemblyName System.IO.Compression.FileSystem
+
+            $source = "$(Pipeline.Workspace)/officialBuild/drop_Build_MssqlSqlcmd_Package"
+            $packages = @(Get-ChildItem $source -Filter 'mssql-sqlcmd.*.nupkg')
+            if ($packages.Count -ne 1) {
+              throw "Expected one mssql-sqlcmd package in $source, found $($packages.Count)"
+            }
+            $package = $packages[0]
+            $version = $package.BaseName.Substring('mssql-sqlcmd.'.Length)
+            Write-Host "Package: $($package.Name) from build $(resources.pipeline.officialBuild.runID) ($(resources.pipeline.officialBuild.sourceCommit))"
+
+            # Only a clean version is released; prereleases come from
+            # non-official builds.
+            if ($version -match '-') {
+              throw "mssql-sqlcmd $version is a prerelease; release from an Official Build run"
+            }
+
+            # Every runtime native sqlcmd ships on must be present.
+            $required = @(
+              'include/mssql_sqlcmd.h',
+              'runtimes/win-x64/native/mssql_sqlcmd.lib', 'runtimes/win-x86/native/mssql_sqlcmd.lib', 'runtimes/win-arm64/native/mssql_sqlcmd.lib',
+              'runtimes/linux-x64/native/libmssql_sqlcmd.a', 'runtimes/linux-arm64/native/libmssql_sqlcmd.a',
+              'runtimes/linux-musl-x64/native/libmssql_sqlcmd.a', 'runtimes/linux-musl-arm64/native/libmssql_sqlcmd.a',
+              'runtimes/osx-x64/native/libmssql_sqlcmd.a', 'runtimes/osx-arm64/native/libmssql_sqlcmd.a'
+            )
+            $zip = [IO.Compression.ZipFile]::OpenRead($package.FullName)
+            try {
+              $entries = @($zip.Entries | ForEach-Object { $_.FullName })
+            } finally {
+              $zip.Dispose()
+            }
+            $missing = @($required | Where-Object { $entries -notcontains $_ })
+            if ($missing) { throw "The package is missing: $($missing -join ', ')" }
+            Write-Host "Contents:"
+            $entries | Where-Object { $_ -match '^(include|runtimes)/' } | Sort-Object | ForEach-Object { Write-Host "  $_" }
+
+            # A published version cannot be replaced: fail early with a clear
+            # message rather than at the publish step.
+            $flat = 'https://pkgs.dev.azure.com/sqlclientdrivers/public/_packaging/mssql-rs_Public/nuget/v3/flat2/mssql-sqlcmd/index.json'
+            try {
+              $published = (Invoke-RestMethod -Uri $flat -Headers @{ Authorization = "Bearer $env:SYSTEM_ACCESSTOKEN" }).versions
+            } catch {
+              # A package never published has no index (404); any other failure,
+              # including one with no HTTP response at all, is real.
+              $response = $_.Exception.Response
+              if ($null -eq $response -or [int]$response.StatusCode -ne 404) { throw }
+              $published = @()
+            }
+            if ($published -contains $version.ToLowerInvariant()) {
+              throw "mssql-sqlcmd $version is already on mssql-rs_Public; bump the version in mssql-sqlcmd/Cargo.toml"
+            }
+            Write-Host "mssql-sqlcmd $version is not on the feed yet."
+            Write-Host "##vso[task.setvariable variable=packagePath]$($package.FullName)"
+            Write-Host "##vso[task.setvariable variable=packageVersion]$version"
+          displayName: 'Validate the mssql-sqlcmd package'
+          env:
+            SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+
+        - ${{ if eq(parameters.publishNuGet, true) }}:
+          - pwsh: |
+              $ErrorActionPreference = 'Stop'
+              $dest = "$(ob_outputDirectory)/packages"
+              New-Item -ItemType Directory -Force -Path $dest | Out-Null
+              Copy-Item "$(packagePath)" $dest
+              Write-Host "mssql-sqlcmd $(packageVersion) WILL be published to public/mssql-rs_Public"
+            displayName: 'Stage the mssql-sqlcmd package for publishing'
