@@ -1928,6 +1928,9 @@ mod tests {
         match context.validate() {
             Err(Error::UsageError(message)) => {
                 assert!(message.contains("129 UTF-16 code units"), "{message}");
+                // The source wraps this message with `\` continuations, which
+                // skip the next line's indentation: no runs of spaces leak in.
+                assert!(!message.contains("  "), "{message:?}");
             }
             other => panic!("expected UsageError, got {other:?}"),
         }

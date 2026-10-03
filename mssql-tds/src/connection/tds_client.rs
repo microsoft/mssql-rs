@@ -87,9 +87,10 @@ const MAX_TOKENS_AFTER_STATEMENT_ERROR: u32 = 100_000;
 /// [`BatchErrorMode::Continue`]. A batch can hold any number of failing
 /// statements, so the errors kept for the caller are bounded like one failed
 /// statement's: the first ones that fit both [`MAX_ERRORS_PER_FAILED_STATEMENT`]
-/// and [`MAX_ERROR_TEXT_BYTES_PER_FAILED_STATEMENT`]. The rest are only counted,
-/// and the drain goes on, because it must reach the end of the batch to leave
-/// the connection usable.
+/// and [`MAX_ERROR_TEXT_BYTES_PER_FAILED_STATEMENT`]. The first error is always
+/// kept, so a drain that skipped any error always reports one. The rest are only
+/// counted, and the drain goes on, because it must reach the end of the batch to
+/// leave the connection usable.
 #[derive(Default)]
 struct SkippedErrors {
     errors: Vec<SqlErrorInfo>,
@@ -103,9 +104,10 @@ impl SkippedErrors {
             let bytes = TdsClient::error_text_bytes(&error);
             // Once one is dropped, so is every later one: the caller gets a
             // prefix of the batch's errors, never a gap in the middle.
-            if self.dropped == 0
-                && self.errors.len() < MAX_ERRORS_PER_FAILED_STATEMENT
-                && self.bytes + bytes <= MAX_ERROR_TEXT_BYTES_PER_FAILED_STATEMENT
+            if self.errors.is_empty()
+                || (self.dropped == 0
+                    && self.errors.len() < MAX_ERRORS_PER_FAILED_STATEMENT
+                    && self.bytes + bytes <= MAX_ERROR_TEXT_BYTES_PER_FAILED_STATEMENT)
             {
                 self.bytes += bytes;
                 self.errors.push(error);
@@ -113,6 +115,11 @@ impl SkippedErrors {
                 self.dropped += 1;
             }
         }
+    }
+
+    /// Whether the drain skipped any statement error, kept or not.
+    fn any(&self) -> bool {
+        !self.errors.is_empty() || self.dropped > 0
     }
 
     /// The kept errors as one [`SqlServerError`](crate::error::Error::SqlServerError).
@@ -8625,7 +8632,7 @@ impl TdsClient {
             }
         };
         let drain_result = match drain_result {
-            Ok(()) if skipped.errors.is_empty() => Ok(()),
+            Ok(()) if !skipped.any() => Ok(()),
             Ok(()) => Err(skipped.into_error()),
             Err(crate::error::Error::SqlServerError { diagnostics }) => {
                 skipped.keep(diagnostics.errors);
@@ -8636,7 +8643,7 @@ impl TdsClient {
                 // decides whether the connection is retired. The statement errors
                 // skipped before it cannot ride on that error type, so at least
                 // make their loss visible.
-                if !skipped.errors.is_empty() {
+                if skipped.any() {
                     warn!(
                         count = skipped.errors.len() + skipped.dropped,
                         "Discarding statement errors skipped during the close_query drain"
@@ -12247,6 +12254,30 @@ mod tests {
 
         assert_eq!(skipped.errors.len(), 1);
         assert_eq!(skipped.dropped, 2);
+    }
+
+    /// The first skipped error is kept whatever its size, so a drain that
+    /// skipped anything always returns an error rather than `Ok`.
+    #[test]
+    fn the_first_skipped_error_is_always_kept() {
+        let error = |message: String| SqlErrorInfo {
+            message,
+            state: 1,
+            class: 16,
+            number: 1,
+            server_name: None,
+            proc_name: None,
+            line_number: None,
+        };
+        let mut skipped = SkippedErrors::default();
+        skipped.keep(vec![
+            error("x".repeat(MAX_ERROR_TEXT_BYTES_PER_FAILED_STATEMENT + 1)),
+            error("next".to_string()),
+        ]);
+
+        assert_eq!(skipped.errors.len(), 1);
+        assert_eq!(skipped.dropped, 1);
+        assert!(skipped.any());
     }
 
     /// A RESETCONNECTION acknowledgement arriving in a `Continue` batch's

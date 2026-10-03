@@ -1735,7 +1735,10 @@ mod tests {
         assert!(
             matches!(&result, Err(crate::error::Error::UsageError(message))
                 if message.contains("129 UTF-16 code units")
-                    && message.contains("Connect through a shorter address")),
+                    && message.contains("Connect through a shorter address")
+                    // `\` continuations in the source skip the next line's
+                    // indentation, so no runs of spaces leak into the text.
+                    && !message.contains("  ")),
             "{result:?}"
         );
         assert_eq!(
@@ -1754,7 +1757,7 @@ mod tests {
         let result = Serializer::new(&model, &mut packet_writer).check_server_name_length();
         assert!(
             matches!(&result, Err(crate::error::Error::UsageError(message))
-                if message.contains("Use a shorter login_server_name")),
+                if message.contains("Use a shorter login_server_name") && !message.contains("  ")),
             "{result:?}"
         );
     }
