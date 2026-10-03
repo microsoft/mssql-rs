@@ -417,6 +417,7 @@ impl PreloginHandler<'_> {
             Option::from(self.factory.context.mars_enabled),
             Option::from(self.factory.context.encryption_options.mode),
             Option::from(self.factory.context.database_instance.as_str()),
+            self.factory.context.driver_version,
         );
         let prelogin_request = PreloginRequest {
             model: &request_model,
