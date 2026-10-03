@@ -9,6 +9,7 @@ use mssql_tds::connection::tds_client::TdsClient;
 use super::env::SharedRuntime;
 use super::{EnvHandle, HandleType, HasObjectType};
 use crate::api::odbc_types::{DEFAULT_PACKET_SIZE, SQL_MODE_READ_WRITE, SQL_TXN_READ_COMMITTED};
+use crate::conversion::client_encoding::ClientEncoding;
 use crate::error::{DiagRecord, HasDiagnostics};
 
 /// Connection state machine — tracks whether the DBC is connected.
@@ -83,6 +84,7 @@ pub(crate) struct VendorConnOverrides {
 /// Mutable state within a connection handle, protected by `inner`.
 pub(crate) struct DbcState {
     pub(crate) diag_records: Vec<DiagRecord>,
+    pub(crate) client_encoding: ClientEncoding,
     pub(crate) connection_state: ConnectionState,
     /// Active child STMT handles
     pub(crate) statements: Vec<*mut c_void>,
@@ -134,13 +136,12 @@ pub(crate) struct DbcState {
     /// unconditionally would change the return code of every statement that
     /// carries text a legacy code page cannot hold.
     ///
-    /// msodbcsql only consults its copy on the retrieval direction — output
-    /// parameters (`sqlcdata.h:1297`) and columns (`:1310`); every
-    /// input-parameter path discards the loss flag. This driver applies it to
-    /// parameters instead, which is where our loss actually occurs:
-    /// `SQL_C_CHAR` is UTF-8 here, so a fetch can always represent whatever the
-    /// server sent and has nothing to substitute. Recorded as
-    /// parity-deviations entry 23 (AB#47598).
+    /// Also reports retrieval loss on the native warning path. A converted
+    /// result that fits bypasses that path, even when this flag is set
+    /// (`sqlcdata.h:1210-1217`, measured on Windows msodbcsql 18.6.1.1).
+    /// msodbcsql consults this flag only on
+    /// retrieval (`sqlcdata.h:1297,1310`); retaining our input-parameter warning
+    /// is the remaining deviation in parity-deviations entry 23 (AB#47598).
     pub(crate) warn_on_cp_error: bool,
     /// `SQL_ATTR_CONNECTION_TIMEOUT` in seconds. Stored, not yet honored.
     /// `0` is the ODBC default and means "no timeout".
@@ -298,6 +299,7 @@ impl DbcHandle {
             runtime,
             inner: Mutex::new(DbcState {
                 diag_records: Vec::new(),
+                client_encoding: ClientEncoding::system_default(),
                 connection_state: ConnectionState::Disconnected,
                 statements: Vec::new(),
                 descriptors: Vec::new(),

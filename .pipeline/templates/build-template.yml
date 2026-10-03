@@ -65,6 +65,12 @@ steps:
     displayName: Rust Clippy Lint (workspace + mssql-py-core)
     condition: and(succeeded(), or(eq('${{parameters.buildType}}', 'Release'), eq('${{parameters.buildType}}', 'Both')), eq(variables['Build.Reason'], 'PullRequest'))
 
+- ${{ if and(eq(parameters.enableClippy, true), eq(parameters.osType, 'MacOS')) }}:
+  - script: rustup component add clippy
+    displayName: Install Rust Clippy
+    condition: and(succeeded(), or(eq('${{parameters.buildType}}', 'Release'), eq('${{parameters.buildType}}', 'Both')), eq(variables['Build.Reason'], 'PullRequest'))
+    retryCountOnTaskFailure: 3
+
 - ${{ if and(eq(parameters.enableClippy, true), ne(parameters.osType, 'Windows')) }}:
   - script: ./scripts/bclippy.sh
     displayName: Rust Clippy Lint (workspace + mssql-py-core)

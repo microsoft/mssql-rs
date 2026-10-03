@@ -94,6 +94,10 @@ target_link_libraries(odbc_test_lib PUBLIC
     gtest
     ${ODBC_LIBRARIES}
 )
+if(NOT WIN32)
+    find_package(Iconv REQUIRED)
+    target_link_libraries(odbc_test_lib PUBLIC Iconv::Iconv)
+endif()
 
 # ---------------------------------------------------------------------------
 # Helper function: add a test executable under tests/

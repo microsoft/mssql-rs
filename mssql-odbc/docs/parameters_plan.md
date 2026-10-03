@@ -519,13 +519,15 @@ Verified against msodbcsql source:
   (`sqlcdesc.cpp:3311`, `cbColDef *= sizeof(WCHAR)`); every `/ sizeof(WCHAR)`
   elsewhere undoes that. An earlier revision of this plan called it a deliberate
   deviation - a misreading.
-- **`SQL_C_CHAR` is UTF-8 deliberately**, because the only supported consumer,
-  mssql-python, is UTF-8 native. msodbcsql reads the client code page
+- **Input `SQL_C_CHAR` parameters remain UTF-8** pending AB#47565. msodbcsql reads the client code page
   (`sqlcprot.h:2830`, `Localization.hpp:742`, `LocalizationImpl.hpp:386`,
   consulted at `sqlcfunc.cpp:2913`), so the two agree on a UTF-8 locale and
   differ on a default Windows one. The spec fixes no encoding for `SQL_C_CHAR`.
-  Code page support is AB#47565 (parameters) / AB#47564 (fetch); the
-  server-collation axis is already handled by `serialize_string`.
+  Fetches and output parameters now use the platform client encoding
+  (AB#47564), including bound and streamed values. mssql-python's default text
+  input and fetching use `SQL_C_WCHAR`, so those defaults do not require
+  unconditional UTF-8 narrow output. Explicit narrow decoding must match the
+  platform encoding. The server-collation axis remains separate.
 - Malformed UTF-8 stays lossy - there is no msodbcsql behaviour to copy, since
   its conversion goes through `SystemLocale::FromUtf16` (`sqlccmd.cpp:10952`),
   which is not in this source tree. `22018` is tracked with AB#47565.

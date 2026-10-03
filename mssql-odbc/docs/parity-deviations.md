@@ -63,18 +63,20 @@ msodbcsql build is measured.
    is **not** a deviation. `DefaultCTypeWideCharParam` and
    `DefaultCTypeGuidRoundTrips` carry `SKIP_IF_COMPARING_MSODBCSQL()` for the
    two parameter-side halves. Tracked in AB#47365.
-3. `SQL_C_CHAR` is **UTF-8** in both directions; the driver never reads or
-   writes the client code page. msodbcsql uses the client code page -
+3. Input `SQL_C_CHAR` parameters remain **UTF-8** pending AB#47565.
+   msodbcsql uses the client code page -
    `dwClientCodePage = SystemLocale::Singleton().AnsiCP()`
    (`odbc/sqlcprot.h:2830`), which is `GetACP()` on Windows
    (`Common/include/Localization.hpp:742`) and `nl_langinfo(CODESET)` elsewhere
    (`LocalizationImpl.hpp:386`); the parameter path reads it directly at
    `sqlcfunc.cpp:2913`. The two therefore agree under a UTF-8 locale and differ
-   on a default Windows one. Taken because mssql-python, the only supported
-   consumer, is UTF-8 native; the ODBC "C Data Types" appendix fixes no encoding
-   for `SQL_C_CHAR`, so neither choice is more conformant. Revisit if a second
-   consumer targets this driver on Windows. Tracked in AB#47564 (fetch) and
-   AB#47565 (parameters). `SQL_C_WCHAR` is UTF-16LE on both drivers.
+   on a default Windows one for narrow inputs. The original rationale that
+   mssql-python requires UTF-8 in both directions was incorrect: its default
+   text input and fetching use `SQL_C_WCHAR`, while explicit non-UTF-8 narrow
+   fetching on Windows exposes this difference.
+   AB#47564 removes the retrieval deviation: columns and output parameters
+   use platform client encoding, with native conversion and optional
+   `SQL_COPT_SS_WARN_ON_CP_ERROR` diagnostics. `SQL_C_WCHAR` remains UTF-16LE.
 4. **Parameter length is measured in UTF-16 units for both character C types.**
    msodbcsql counts UTF-16 units in three of its four arms - both wide-source
    arms, and the narrow-to-wide walk, which counts an astral character as two
@@ -674,7 +676,7 @@ msodbcsql build is measured.
     unmeasured) but not approved; record the approver and date in AB#47598
     before relying on this entry as settled.
 
-23. **`SQL_COPT_SS_WARN_ON_CP_ERROR` reports code-page loss on input
+23. **`SQL_COPT_SS_WARN_ON_CP_ERROR` also reports code-page loss on input
     parameters; msodbcsql reports it only on retrieval.** msodbcsql posts
     `IDS_01_000_16` ("Warning: Code page translation caused loss of data",
     SQLSTATE `01000` via `cli_common/src/clntcomn.cpp:1183`) from exactly two
@@ -686,13 +688,11 @@ msodbcsql build is measured.
     parameter, msodbcsql returns `SQL_SUCCESS` and posts nothing; this driver
     returns `SQL_SUCCESS_WITH_INFO` and posts `01000`.
 
-    Taken because the retrieval direction msodbcsql instruments cannot lose
-    anything here: this driver's `SQL_C_CHAR` is UTF-8 (entry 3), so any
-    character the server sends has a representation in the target buffer and
-    there is nothing to substitute. Applying the attribute to the direction
-    where loss actually occurs keeps it meaningful rather than inert. The
-    substitution itself is silent by default on both drivers, so an application
-    that never sets the attribute cannot tell them apart.
+    Initially applied to input parameters because retrieval was always UTF-8.
+    AB#47564 adds the native retrieval behavior for columns and output
+    parameters; input-parameter warnings remain an additional diagnostic rather
+    than being removed as part of the fetch change. Substitution remains
+    silent by default on both drivers.
 
     Four tests carry `SKIP_IF_COMPARING_MSODBCSQL()` for this entry:
     `UnmappableCharacterWarnsWhenAsked`,

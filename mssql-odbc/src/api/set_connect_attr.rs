@@ -312,6 +312,19 @@ unsafe fn sql_set_connect_attr_w_impl(
                 return SQL_ERROR;
             }
             state.warn_on_cp_error = value == SQL_WARN_YES;
+            for &raw in &state.statements {
+                // SAFETY: the DBC owns its statements; its lock prevents
+                // removal while the child setting is updated.
+                let stmt = unsafe { handle_from_raw::<StmtHandle>(raw) };
+                let Ok(mut stmt_state) = stmt.inner.lock() else {
+                    error!(
+                        "SQLSetConnectAttrW: stmt mutex poisoned while setting code-page warnings"
+                    );
+                    post_diag(&mut state, ERR_INTERNAL_CONVERSION);
+                    return SQL_ERROR;
+                };
+                stmt_state.text_output.warn_on_loss = state.warn_on_cp_error;
+            }
             debug!(
                 value,
                 "SQLSetConnectAttrW: warn-on-code-page-error preference stored"
@@ -550,6 +563,32 @@ mod tests {
     use crate::error::HasDiagnostics;
     use crate::handles::dbc::VendorConnOverrides;
     use crate::test_support::TestHandles;
+
+    #[test]
+    fn code_page_warning_setting_updates_existing_and_new_statements() {
+        let mut h = TestHandles::with_env_dbc_stmt();
+        for value in [SQL_WARN_YES, SQL_WARN_NO] {
+            assert_eq!(
+                unsafe {
+                    sql_set_connect_attr_w(
+                        h.dbc,
+                        SQL_COPT_SS_WARN_ON_CP_ERROR,
+                        value as usize as SqlPointer,
+                        0,
+                    )
+                },
+                SQL_SUCCESS
+            );
+            let extra = h.alloc_extra_stmt();
+            for raw in [h.stmt, extra] {
+                let stmt = unsafe { handle_from_raw::<StmtHandle>(raw) };
+                assert_eq!(
+                    stmt.inner.lock().unwrap().text_output.warn_on_loss,
+                    value == SQL_WARN_YES
+                );
+            }
+        }
+    }
 
     /// Build a `SQL_COPT_SS_ACCESS_TOKEN` struct the way msodbcsql apps do:
     /// a 4-byte native-endian length followed by UTF-16-LE token bytes.
