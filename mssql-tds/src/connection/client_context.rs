@@ -2,6 +2,8 @@
 // Licensed under the MIT License.
 
 use async_trait::async_trait;
+use std::borrow::Cow;
+use std::collections::HashMap;
 
 use crate::connection::datasource_parser::{ParsedDataSource, ProtocolType};
 use crate::core::{EncryptionOptions, EncryptionSetting, TdsResult};
@@ -9,6 +11,14 @@ use crate::error::Error;
 use crate::message::login_options::{ApplicationIntent, TdsVersion};
 use crate::security::{IntegratedAuthConfig, is_loopback_address};
 use hostname;
+
+/// Maximum length, in UTF-16 code units, of the LOGIN7 ServerName field.
+///
+/// MS-TDS caps the other LOGIN7 name and credential fields at 128 as well, but
+/// only the ServerName is checked against it: [`ClientContext::login_server_name`]
+/// when the caller sets it, and the dialled address otherwise, when LOGIN7 is
+/// built.
+pub(crate) const MAX_LOGIN7_NAME_UNITS: usize = 128;
 
 /// Controls DNS resolution order when connecting to a server.
 #[derive(PartialEq, Copy, Clone)]
@@ -22,9 +32,11 @@ pub enum IPAddressPreference {
 }
 
 /// Represents a driver version with major, minor, and build components.
-/// Used to populate `client_prog_ver` in the TDS Login7 packet.
+/// Sent in the PRELOGIN `VERSION` option and in Login7 `client_prog_ver`.
 ///
-/// Encoding: `[major (8 bits)][minor (8 bits)][build (16 bits)]`
+/// Encoding:
+/// - Login7 `client_prog_ver`: `(major << 24) | (minor << 16) | build`, written as a little-endian i32.
+/// - PRELOGIN `VERSION`: 6 bytes, `[major][minor][build BE (16 bits)][sub-build = 0 (16 bits)]`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DriverVersion {
     /// Major version number.
@@ -174,6 +186,18 @@ pub enum TdsAuthenticationMethod {
     ActiveDirectoryWorkloadIdentity,
     /// Azure AD integrated authentication using current user's Kerberos ticket.
     ActiveDirectoryIntegrated,
+    /// Entra ID bearer token acquired by the application's registered
+    /// [`EntraIdTokenFactory`] from a credential source this crate does not
+    /// model — Azure CLI, Azure Developer CLI, Azure Pipelines, the `AZURE_*`
+    /// environment variables, a signed client assertion, and so on.
+    ///
+    /// The source changes how the token is obtained, not what goes on the wire:
+    /// the server is told the same thing for every one of them, and the token is
+    /// requested from the factory when the server asks for it during login. So
+    /// the choice of source stays with the factory, and a new source needs no new
+    /// variant here. Unlike [`AccessToken`](Self::AccessToken), no token is
+    /// supplied up front.
+    ActiveDirectoryTokenCredential,
     /// Pre-acquired access token (bearer JWT).
     AccessToken,
 }
@@ -202,11 +226,24 @@ impl ClientContextValidator for DefaultClientContextValidator {
             )));
         }
 
+        // MS-TDS caps the LOGIN7 ServerName field at 128 UTF-16 code units.
+        // Reject an override past that rather than truncate it: a truncated
+        // server name is a name the caller did not choose, and the server would
+        // otherwise fail the login with an opaque error.
+        if let Some(name) = &context.login_server_name {
+            let units = name.encode_utf16().count();
+            if units > MAX_LOGIN7_NAME_UNITS {
+                return Err(Error::UsageError(format!(
+                    "login_server_name {name:?} is {units} UTF-16 code units; LOGIN7 allows at \
+                     most {MAX_LOGIN7_NAME_UNITS}. Use a shorter name, or leave it unset (or \
+                     empty) to send the dialled address."
+                )));
+            }
+        }
+
         Ok(())
     }
 }
-
-use std::collections::HashMap;
 
 /// Connection configuration for a TDS session.
 ///
@@ -267,7 +304,8 @@ pub struct ClientContext {
     pub language: String,
     /// Client library name sent in the login packet.
     pub library_name: String,
-    /// Driver version used to populate `client_prog_ver` in the TDS Login7 packet.
+    /// Driver version sent in the PRELOGIN `VERSION` option (which SQL Server reports as
+    /// the client driver version) and in Login7 `client_prog_ver`.
     /// Defaults to the crate version from Cargo.toml.
     pub driver_version: DriverVersion,
     /// Token factories keyed by authentication method for Azure AD flows.
@@ -303,6 +341,35 @@ pub struct ClientContext {
     /// If not provided, the SPN will be automatically generated from the server address.
     /// Format: MSSQLSvc/<hostname>:<port> or MSSQLSvc/<hostname>:<instance>
     pub server_spn: Option<String>,
+    /// Overrides the server name written into the LOGIN7 packet, leaving the
+    /// address actually dialled untouched.
+    ///
+    /// This separates *where to connect* from *what name to present at login*,
+    /// which is what a connection through a tunnel, proxy or port-forward
+    /// needs: the socket goes to `localhost:1433` while the login must still
+    /// name the real server so server-side routing and any name-based policy
+    /// see the intended target.
+    ///
+    /// The override is a login identity, not a one-hop dial target, so it is
+    /// reused for a LOGIN7 retry after a server routing redirect. With no
+    /// override, each login uses the address of its current transport.
+    ///
+    /// It does not affect TLS. LOGIN7 is sent after the handshake, and the
+    /// certificate is validated against the dialled host, or
+    /// [`EncryptionOptions::host_name_in_cert`](crate::core::EncryptionOptions::host_name_in_cert)
+    /// when that is set. Through a tunnel the certificate names the real server,
+    /// not `localhost`, so a caller setting this override usually sets
+    /// `host_name_in_cert` to the same name as well — or pins the certificate
+    /// with [`EncryptionOptions::server_certificate`](crate::core::EncryptionOptions::server_certificate).
+    /// The two are kept separate because they answer different questions: which
+    /// name the server is asked for, and which name its certificate must carry.
+    ///
+    /// It does not affect integrated authentication either. The SPN is derived
+    /// from the dialled address, so a caller using Kerberos through a tunnel sets
+    /// [`server_spn`](Self::server_spn) to the real server's SPN alongside this.
+    ///
+    /// `None` writes the dialled address, which is the previous behaviour.
+    pub login_server_name: Option<String>,
     pub(crate) transport_context: TransportContext,
     /// Protocol vector version for feature negotiation.
     pub vector_version: VectorVersion,
@@ -501,6 +568,7 @@ impl ClientContext {
             pooling: false,
             replication: false,
             server_spn: None,
+            login_server_name: None,
             tds_authentication_method: TdsAuthenticationMethod::Password,
             user_instance: false,
             user_name: "".to_string(),
@@ -568,6 +636,7 @@ impl ClientContext {
             user_name: "".to_string(),
             workstation_id: ClientContext::default_workstation_id(hostname::get),
             server_spn: None,
+            login_server_name: None,
             access_token: None,
             transport_context: TransportContext::Tcp {
                 host: "localhost".to_string(),
@@ -669,6 +738,23 @@ impl ClientContext {
     /// Ok(()) if validation passes, or an Error if validation fails.
     pub fn validate_with<V: ClientContextValidator>(&self, validator: &V) -> TdsResult<()> {
         validator.validate(self)
+    }
+
+    /// The server name to write into LOGIN7: the `login_server_name` override
+    /// when one is set, otherwise the address being dialled.
+    ///
+    /// LOGIN7 stores this as an offset/length pair separate from the payload,
+    /// so both must come from the same value — hence one accessor rather than
+    /// two call sites reading the override independently. It borrows the
+    /// override rather than cloning it, since each call site only reads it. An
+    /// empty override is treated as unset: it is far more likely an unset
+    /// configuration value than a request to send the server no name.
+    pub(crate) fn login_server_name(&self, transport: &TransportContext) -> Cow<'_, str> {
+        self.login_server_name
+            .as_deref()
+            .filter(|name| !name.is_empty())
+            .map(Cow::Borrowed)
+            .unwrap_or_else(|| Cow::Owned(transport.get_login_server_name()))
     }
 
     /// Looks up the Entra ID token factory for the current authentication method.
@@ -814,6 +900,7 @@ impl Clone for ClientContext {
             user_name: self.user_name.clone(),
             workstation_id: self.workstation_id.clone(),
             server_spn: self.server_spn.clone(),
+            login_server_name: self.login_server_name.clone(),
             access_token: self.access_token.clone(),
             transport_context: self.transport_context.clone(),
             vector_version: self.vector_version,
@@ -1775,6 +1862,82 @@ mod tests {
             ctx.get_login_server_name(),
             "myhost.database.windows.net,1433"
         );
+    }
+
+    /// Without an override the login name is the dialled address, so existing
+    /// callers see no change.
+    #[test]
+    fn login_server_name_falls_back_to_the_dialled_address() {
+        let transport = TransportContext::from_routing_token("myhost".to_string(), 1433);
+        let context = ClientContext::default();
+        assert!(context.login_server_name.is_none());
+        assert_eq!(context.login_server_name(&transport), "myhost,1433");
+    }
+
+    /// The override replaces the name at login while the dialled address, which
+    /// the socket still uses, is left alone.
+    #[test]
+    fn login_server_name_override_replaces_only_the_login_name() {
+        let transport = TransportContext::from_routing_token("localhost".to_string(), 1433);
+        let context = ClientContext {
+            login_server_name: Some("real-server.contoso.com".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            context.login_server_name(&transport),
+            "real-server.contoso.com"
+        );
+        assert_eq!(transport.get_login_server_name(), "localhost,1433");
+    }
+
+    /// An override is taken verbatim: it is a name the caller chose, not an
+    /// address to be reformatted into DataSource form.
+    #[test]
+    fn login_server_name_override_is_not_reformatted() {
+        let transport = TransportContext::from_routing_token("localhost".to_string(), 1433);
+        let mut context = ClientContext::default();
+        for name in ["bare-name", "host\\INSTANCE", "host,9999"] {
+            context.login_server_name = Some(name.to_string());
+            assert_eq!(context.login_server_name(&transport), name);
+        }
+    }
+
+    /// An empty override is almost always an unset configuration value, so it
+    /// falls back to the dialled address rather than sending an empty name.
+    #[test]
+    fn an_empty_login_server_name_falls_back_to_the_dialled_address() {
+        let transport = TransportContext::from_routing_token("localhost".to_string(), 1433);
+        let context = ClientContext {
+            login_server_name: Some(String::new()),
+            ..Default::default()
+        };
+        assert_eq!(context.login_server_name(&transport), "localhost,1433");
+    }
+
+    /// LOGIN7 caps the field at 128 UTF-16 code units; a longer override is
+    /// rejected up front instead of failing the login opaquely. The boundary is
+    /// written as literals, not derived from the constant, so a wrong constant
+    /// fails this test instead of moving with it.
+    #[test]
+    fn a_login_server_name_over_the_login7_limit_is_rejected() {
+        let mut context = ClientContext {
+            login_server_name: Some("n".repeat(128)),
+            ..Default::default()
+        };
+        assert!(context.validate().is_ok());
+
+        context.login_server_name = Some("n".repeat(129));
+        match context.validate() {
+            Err(Error::UsageError(message)) => {
+                assert!(message.contains("129 UTF-16 code units"), "{message}");
+            }
+            other => panic!("expected UsageError, got {other:?}"),
+        }
+
+        // Counted in UTF-16 code units: 65 characters outside the BMP are 130.
+        context.login_server_name = Some("\u{1F600}".repeat(65));
+        assert!(matches!(context.validate(), Err(Error::UsageError(_))));
     }
 
     #[test]

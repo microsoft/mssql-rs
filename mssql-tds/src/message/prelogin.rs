@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+use crate::connection::client_context::DriverVersion;
 use crate::core::{EncryptionSetting, TdsResult};
 use crate::io::packet_reader::TdsPacketReader;
 use crate::message::messages::{PacketType, Request};
@@ -107,7 +108,7 @@ impl OptionType {
 }
 
 pub struct PreloginRequestModel {
-    pub sdk_version: Version,
+    pub driver_version: DriverVersion,
     pub connection_id: Uuid,
     pub activity_id: Uuid,
     pub activity_sequence_number: i32,
@@ -126,17 +127,13 @@ impl PreloginRequestModel {
         mars_enabled: Option<bool>,
         encryption_setting: Option<EncryptionSetting>,
         database_instance: Option<&str>,
+        driver_version: DriverVersion,
     ) -> Self {
         let mars_enabled = mars_enabled.unwrap_or(false);
         let encryption_setting = encryption_setting.unwrap_or(EncryptionSetting::Strict);
         let database_instance = database_instance.unwrap_or("MSSQLServer").to_string();
         PreloginRequestModel {
-            sdk_version: Version {
-                major: 0,
-                minor: 0,
-                build: 0,
-                revision: 1,
-            },
+            driver_version,
             connection_id,
             activity_id: Uuid::new_v4(),
             activity_sequence_number: REQUEST_COUNT.fetch_add(1, Relaxed),
@@ -319,19 +316,19 @@ impl<'a, 'n> Serializer<'a, 'n> {
     }
 
     async fn write_version(&mut self) -> TdsResult<()> {
+        let driver_version = self.model.driver_version;
+        let [build_hi, build_lo] = driver_version.build.to_be_bytes();
+        // Sub-build is always 0.
         self.payload_writer
-            .write_byte_async(self.model.sdk_version.major)
-            .await?;
-        self.payload_writer
-            .write_byte_async(self.model.sdk_version.minor)
-            .await?;
-        self.payload_writer
-            .write_i16_be_async(self.model.sdk_version.build as i16)
-            .await?;
-        self.payload_writer
-            .write_i16_be_async(self.model.sdk_version.revision as i16)
-            .await?;
-        Ok(())
+            .write_async(&[
+                driver_version.major,
+                driver_version.minor,
+                build_hi,
+                build_lo,
+                0,
+                0,
+            ])
+            .await
     }
 
     async fn write_encryption(&mut self) -> TdsResult<()> {
@@ -428,6 +425,7 @@ impl<'a, 'n> Serializer<'a, 'n> {
 pub(crate) mod tests {
     use std::vec;
 
+    use crate::connection::client_context::DriverVersion;
     use crate::core::{EncryptionSetting, SQLServerVersion, Version};
     use crate::message::messages::PacketType;
     use crate::message::prelogin::{
@@ -482,6 +480,7 @@ pub(crate) mod tests {
             Option::from(false),
             Option::from(EncryptionSetting::Required),
             Option::from("MSSQLServer"),
+            DriverVersion::new(2, 5, 1234),
         );
         let mut mock = MockNetworkWriter::new(1024);
         let mut packet_writer = PacketWriter::new(PacketType::PreLogin, &mut mock, None, None);
@@ -490,17 +489,22 @@ pub(crate) mod tests {
         block_on(serializer.serialize()).unwrap();
 
         let mut cursor = packet_writer.get_payload();
-
-        // Just validate that the version was serialized correctly to start with.
-
+        let payload_start = cursor.position() as usize;
         // Validate a few headers.
         assert_eq!(cursor.read_u8().unwrap(), OptionType::Version.to_u8());
-        assert_eq!(cursor.read_i16::<BigEndian>().unwrap(), 36); // Initial content_next_offset.
-        assert_eq!(cursor.read_i16::<BigEndian>().unwrap(), 6);
+        let version_offset = cursor.read_u16::<BigEndian>().unwrap() as usize;
+        let version_len = cursor.read_u16::<BigEndian>().unwrap() as usize;
+        assert_eq!(version_offset, 36); // Initial content_next_offset.
+        assert_eq!(version_len, 6);
 
         assert_eq!(cursor.read_u8().unwrap(), OptionType::Encryption.to_u8());
-        assert_eq!(cursor.read_i16::<BigEndian>().unwrap(), 42); // Add the length of the previous header to the content_next_offset.
-        assert_eq!(cursor.read_i16::<BigEndian>().unwrap(), 1);
+        assert_eq!(cursor.read_u16::<BigEndian>().unwrap(), 42); // Add the length of the previous header to the content_next_offset.
+        assert_eq!(cursor.read_u16::<BigEndian>().unwrap(), 1);
+
+        // SQL Server reports these bytes as the client driver version.
+        let start = payload_start + version_offset;
+        let version = &cursor.get_ref()[start..start + version_len];
+        assert_eq!(version, &[2, 5, 0x04, 0xD2, 0, 0]);
     }
 
     #[test]
