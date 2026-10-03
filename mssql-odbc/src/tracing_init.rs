@@ -695,6 +695,57 @@ mod tests {
         remove_dir_all(dir).unwrap();
     }
 
+    /// The no-ENV path writes through a handle reopened per event rather than
+    /// the cached one, and it has to keep the same rollover accounting. The
+    /// test above pins only that nothing is cached, with a `u64::MAX`
+    /// threshold, so dropping `record_written` from `TraceWriter::Transient`
+    /// leaves it green — and a process with no live environment would then
+    /// write one unbounded file, which is the failure AB#48091 exists to
+    /// remove.
+    #[test]
+    fn rotation_follows_the_writer_without_an_environment_too() {
+        let dir = test_directory("transient-rotation");
+        let (path, file) = reserve_trace_file(&dir, "20260910123456789", 42).unwrap();
+        let writer = Arc::new(TraceFileWriter::new(path.clone(), file, 5));
+        let make_writer = SharedTraceFileWriter(Arc::clone(&writer));
+        writer.close();
+
+        let write = |payload: &[u8]| {
+            make_writer
+                .make_writer_for_env_state(writer.state(), false)
+                .write_all(payload)
+                .unwrap();
+        };
+        let rotated = path.with_file_name(format!(
+            "{}.1.log",
+            path.file_stem().unwrap().to_string_lossy()
+        ));
+
+        write(b"first");
+        assert_eq!(
+            writer.state().bytes_written,
+            5,
+            "the no-ENV path must advance the rollover counter like the cached one"
+        );
+
+        write(b"second"); // crosses the 5-byte limit, so this event rolls over
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "first");
+        assert_eq!(std::fs::read_to_string(&rotated).unwrap(), "second");
+
+        // A failed reservation must leave this path writing to the current
+        // file and must not consume the number, exactly as the cached path does.
+        writer.state().base_path = dir.join("absent").join("mssql_tds_trace.log");
+        write(b"third");
+        assert_eq!(
+            writer.state().next_rotation,
+            2,
+            "a transient failure must not burn a rollover number"
+        );
+        assert_eq!(std::fs::read_to_string(&rotated).unwrap(), "secondthird");
+
+        remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn trace_file_writer_recovers_a_poisoned_lock() {
         let dir = test_directory("poison");
