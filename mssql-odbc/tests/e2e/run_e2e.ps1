@@ -318,13 +318,17 @@ function Invoke-CtestRun([string]$Label, [string]$JunitName, [string]$DriverName
         # ODBC_TEST_DRIVER selects the driver by name in the connection string.
         $env:ODBC_TEST_TARGET = $Label
         $env:ODBC_TEST_DRIVER = $DriverName
-        # dll_unload_stress_test loads the driver directly with LoadLibrary to
-        # exercise free-then-unload (AB#47831), so it needs a path rather than a
-        # registered name and skips without one. Set only for the Rust leg: the
-        # runtime whose teardown it guards is ours, so pointing it at the
-        # reference driver would test nothing. Skipping on the msodbcsql leg is
-        # parity-neutral — parity_report.py classifies a SKIP on either side as
-        # "skipped (not compared)".
+        # dll_unload_stress_test and trace_rotation_test load the driver directly
+        # with LoadLibrary — the former to exercise free-then-unload (AB#47831),
+        # the latter because the file trace sink reads its configuration once per
+        # driver load (AB#48091). Both need a path rather than a registered name
+        # and skip without one. Set only for the Rust leg: the runtime teardown
+        # and the MSSQL_TDS_TRACE_* configuration are both specific to this
+        # driver, so there is nothing for the harness to point at on the
+        # reference leg. Both link a skip-aware main that exits 77 on a
+        # fully-skipped run, so ctest records a skip and parity_report.py
+        # classifies the pair as "skipped (not compared)" rather than scoring an
+        # uncompared test as PASS/PASS.
         $env:MSSQL_ODBC_DLL = $RustDriverDll
         if ($RustDriverDll) {
             Write-Host "MSSQL_ODBC_DLL=$RustDriverDll"

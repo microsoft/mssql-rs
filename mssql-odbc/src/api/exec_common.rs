@@ -44,8 +44,11 @@ use crate::params::{BoundParam, ParamArrayLayoutError, ParamSnapshot};
 /// Clears the in-flight `EXEC_STARTED` flag on an execution failure so the
 /// statement is reusable.
 pub(super) fn clear_exec_started(stmt: &StmtHandle) {
-    if let Ok(mut stmt_state) = stmt.inner.lock() {
-        stmt_state.clear_state(STMT_STATE_EXEC_STARTED);
+    match stmt.inner.lock() {
+        Ok(mut stmt_state) => stmt_state.clear_state(STMT_STATE_EXEC_STARTED),
+        // Leaving EXEC_STARTED set makes the next SQLExecute/SQLPrepare on this
+        // statement fail with an unrelated-looking sequence error.
+        Err(_) => error!("clear_exec_started: stmt mutex poisoned; EXEC_STARTED left set"),
     }
 }
 
@@ -299,11 +302,19 @@ pub(super) fn publish_scalar_processed(stmt_state: &crate::handles::stmt::StmtSt
 /// Returns `client` to the DBC and releases the busy claim. Used on the
 /// DDL/DML success path and on error recovery.
 pub(super) fn return_client_idle(dbc: &DbcHandle, statement_handle: SqlHandle, client: TdsClient) {
-    if let Ok(mut dbc_state) = dbc.inner.lock() {
-        dbc_state.client = Some(client);
-        if dbc_state.active_stmt == Some(statement_handle) {
-            dbc_state.active_stmt = None;
+    match dbc.inner.lock() {
+        Ok(mut dbc_state) => {
+            dbc_state.client = Some(client);
+            if dbc_state.active_stmt == Some(statement_handle) {
+                dbc_state.active_stmt = None;
+            }
         }
+        // The client is dropped here, so the connection keeps recording this
+        // statement as busy and can never be used again.
+        Err(_) => error!(
+            ?statement_handle,
+            "return_client_idle: dbc mutex poisoned; client not returned"
+        ),
     }
 }
 
@@ -355,6 +366,12 @@ pub(super) fn try_claim_idle_client(
     statement_handle: SqlHandle,
 ) -> Option<TdsClient> {
     let Ok(mut dbc_state) = dbc.inner.lock() else {
+        // Distinct from the ordinary `None` returns below: those are expected
+        // (disconnected or busy), this one means the lock is unusable.
+        error!(
+            ?statement_handle,
+            "try_claim_idle_client: dbc mutex poisoned"
+        );
         return None;
     };
     if dbc_state.connection_state != ConnectionState::Connected || dbc_state.active_stmt.is_some() {
