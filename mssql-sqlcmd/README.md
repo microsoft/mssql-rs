@@ -15,23 +15,62 @@ line, connects and runs the batches.
 ## JSON output
 
 Native sqlcmd hands each piece of output to a JSON document instead of printing
-it — result sets and rows, row counts, server messages — and renders the
-document once, at exit, with the connection details and exit code:
+it — the batches it sends, result sets and rows, row counts, server messages —
+and renders the document once, at exit, with the connection details, timing,
+status and exit code:
 
 ```json
 {
-  "sqlcmd": { "version": "18.5.1.1" },
-  "connection": { "server": "localhost", "database": "master", "authentication": "SqlPassword", "encrypt": true },
+  "formatVersion": 1,
+  "sqlcmd": { "version": "18.7.0001.1", "platform": "win-x64" },
+  "connection": { "server": "tcp:localhost,1433", "database": null, "authentication": "SqlPassword",
+                  "encrypt": true, "serverVersion": "17.00.4085", "connectMs": 167 },
+  "startTime": "2026-10-03T04:17:02.118Z",
+  "durationMs": 178,
+  "status": "success",
   "exitCode": 0,
   "output": [
-    { "type": "resultSet", "columns": ["id"], "rows": [["1"], [null]] },
-    { "type": "rowsAffected", "count": 2 },
-    { "type": "error", "number": 50000, "state": 1, "severity": 16, "message": "boom" }
+    { "type": "batch", "index": 1, "durationMs": 7, "text": "SELECT id, price FROM t;\nPRINT 'done';\n" },
+    { "type": "resultSet",
+      "columns": [ { "name": "id", "type": "int" }, { "name": "price", "type": "decimal(10,2)" } ],
+      "rows": [ ["1", "9.99"], ["2", null] ],
+      "rowsAffected": 2 },
+    { "type": "message", "number": 0, "state": 1, "severity": 0, "line": 2, "message": "done" },
+    { "type": "batch", "index": 2, "durationMs": 1, "text": "UPDATE t SET price = 1;\nRAISERROR('boom', 16, 1);\n" },
+    { "type": "rowsAffected", "count": 1 },
+    { "type": "error", "number": 50000, "state": 1, "severity": 16, "line": 2, "message": "boom" }
   ]
 }
 ```
 
-Values are strings, as sqlcmd would print them; SQL `NULL` is JSON `null`.
+- **Header.** `formatVersion` changes only for a change that could break a
+  reader. `platform` is the runtime (`win-x64`, `linux-musl-arm64`, ...).
+  `serverVersion` and `connectMs` appear once sqlcmd has connected.
+  `startTime` (UTC) and `durationMs` cover the whole run.
+- **Status.** `status` is `failed` when sqlcmd exits non-zero or was
+  cancelled, with `failure.kind` saying why: `connection`, `authentication`,
+  `query` (a statement error stopped the run, e.g. under `-b`), `timeout` (the
+  last error before the failure was a timeout; sqlcmd does not stop on one),
+  `cancelled` or `other` (e.g. `:EXIT(7)`). A statement error that does not
+  stop the run is an `error` entry in a `success` document.
+- **Batches.** One `batch` entry per batch sent (`GO` separates batches), with
+  its duration. Its `text` is included only with `-e`, as text mode echoes it
+  only with `-e`, so a password in, say, `CREATE LOGIN` is not written out by
+  default.
+- **Result sets.** `columns` give each column's name and its type as T-SQL
+  declares it. Values are strings, as sqlcmd would print them (binary with a
+  `0x` prefix); SQL `NULL` is JSON `null`. `rowsAffected` is the result set's
+  "(n rows affected)", absent under `SET NOCOUNT ON`; a statement without a
+  result set gets its own `rowsAffected` entry.
+- **`FOR JSON` / `FOR XML`.** The server's own conversion is kept. Its rows,
+  split into chunks by the server, are joined: JSON is written as the server
+  sent it (`"serverFormat": "json", "json": [...]`) once it is known to parse,
+  or as a string (`"text"`) when it does not, as with `WITHOUT_ARRAY_WRAPPER`
+  over several rows; XML is a string (`"serverFormat": "xml", "xml": "..."`).
+  `FOR JSON` over no rows gives `"json": null`. These entries have no
+  `rowsAffected`, which would count chunks.
+- **Messages and errors** carry `number`, `state`, `severity`, and `line` and
+  `procedure` when the server reports them.
 
 The whole document is held in memory until sqlcmd exits, because it begins
 with details only known then (the exit code). Peak memory is a few times the
