@@ -4445,6 +4445,14 @@ mod tests {
     /// The fast path therefore validates before taking itself, and malformed
     /// input falls through to the established decode path, which is what it did
     /// before the fast path existed.
+    ///
+    /// **The panic is tolerated, not a contract.** It comes from
+    /// `SqlString::decode`'s `String::from_utf8(..).unwrap()`
+    /// (`sql_string.rs`), which AB#47576 tracks removing; `param_convert.rs`'s
+    /// `AppText::transcode` cites the same work item and pre-sanitises with
+    /// `from_utf8_lossy`, which is why ODBC never reaches it. When that unwrap
+    /// goes, this assertion has to be rewritten -- what must survive is that
+    /// the fast path declines the bytes, not that the fallthrough panics.
     #[test]
     #[should_panic(expected = "Utf8Error")]
     fn the_utf8_passthrough_rejects_bytes_that_are_not_utf8() {
@@ -4453,10 +4461,9 @@ mod tests {
             vec![0x80],
             crate::datatypes::sql_string::EncodingType::Utf8,
         ));
-        // Falls through to `to_utf8_string`, whose `Utf8` arm unwraps a
-        // `String::from_utf8` and so panics. That is the pre-existing behaviour
-        // for this input and is deliberately not changed here; what matters is
-        // that the fast path does not silently forward the bytes instead.
+        // Falls through to `to_utf8_string`, which panics on this input today
+        // (AB#47576). What matters is that the fast path does not silently
+        // forward the bytes instead.
         let _ = serialize_narrow(&value, Some(utf8_collation()));
     }
 
