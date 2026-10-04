@@ -1431,12 +1431,18 @@ impl TdsValueSerializer {
                 //
                 // `EncodingType::Utf8` is a declaration, not a guarantee --
                 // `SqlString::new` stores whatever bytes it is handed -- so the
-                // validity is checked here rather than assumed. Invalid bytes
-                // fall through to the established path, which is what they did
+                // validity is checked rather than assumed. Invalid bytes fall
+                // through to the established path, which is what they did
                 // before this fast path existed. `get_data.rs`'s narrow
                 // passthrough guards itself the same way, for the same reason.
-                // The check is a borrow-based validation with no allocation,
-                // against the two copies it avoids.
+                //
+                // The validation is hoisted out of the `if` so the borrow it
+                // produces can be reused below: a valid UTF-8 source bound
+                // against a *non*-UTF-8 collation still has to be decoded, and
+                // `to_utf8_string` would `to_vec()` the whole value and
+                // re-validate the copy only to hand `encode_narrow_for_wire` a
+                // `&str` it could have borrowed. That case -- the common one
+                // for a narrow parameter -- now borrows instead.
                 //
                 // The rest of the guard is exact: `collation.utf8()` is
                 // `try_resolve_collation`'s first branch, so the resolved
@@ -1449,15 +1455,23 @@ impl TdsValueSerializer {
                 // Reachable only since AB#48437: before it this arm resolved a
                 // UTF-8 collation to the LCID's single-byte page, so source and
                 // target never matched.
-                if matches!(value.encoding_type(), EncodingType::Utf8)
-                    && ctx.collation.is_some_and(|c| c.utf8())
-                    && std::str::from_utf8(&value.bytes).is_ok()
-                {
+                let borrowed = match value.encoding_type() {
+                    EncodingType::Utf8 => std::str::from_utf8(&value.bytes).ok(),
+                    _ => None,
+                };
+                if borrowed.is_some() && ctx.collation.is_some_and(|c| c.utf8()) {
                     return Self::serialize_char_varchar_direct(writer, &value.bytes, ctx).await;
                 }
 
-                // Otherwise (UTF-8 or UTF-16 source), decode and re-encode to target code page
-                let decoded_str = value.to_utf8_string();
+                // Otherwise (UTF-16 source, or a UTF-8 source whose target is
+                // not UTF-8) decode and re-encode to the target code page.
+                // Declared-but-malformed UTF-8 takes the `Owned` arm and so
+                // still panics inside `to_utf8_string` exactly as before; that
+                // is AB#47576's to change, not this.
+                let decoded_str: Cow<'_, str> = match borrowed {
+                    Some(text) => Cow::Borrowed(text),
+                    None => Cow::Owned(value.to_utf8_string()),
+                };
                 let encoded = Self::encode_narrow_for_wire(&decoded_str, ctx.collation);
                 // Marked only once the value has actually serialized.
                 // `serialize_char_varchar_direct` rejects an over-length value
