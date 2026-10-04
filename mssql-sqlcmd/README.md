@@ -11,9 +11,6 @@ line, connects and runs the batches.
 | `src/ffi.rs` | The C ABI native sqlcmd calls. |
 | `include/mssql_sqlcmd.h` | C/C++ declarations for that ABI. |
 
-The library exports `mssql_sqlcmd_version()` so far; the features sqlcmd
-hands to it are added on top.
-
 ## Building for native sqlcmd
 
 ```text

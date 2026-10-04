@@ -65,8 +65,6 @@ The pack step fails if any runtime is missing.
   PR builds build but never publish.
 - The Official build and the release pipeline are sqlcmd's own.
 - All three build the same jobs, from `.pipeline/OneBranch/mssql-sqlcmd-jobs.yml`.
-- Official pipelines must be registered in the product catalog (classification
-  **Production**, service **SQL Server Rust Client**). 2347 is registered.
 
 ## Versions
 
@@ -123,9 +121,8 @@ Done by the release owner, the person who runs the release pipeline.
   downloads the same pinned version into `packages/`, where the sqlcmd Makefile
   finds it.
 - **Upstream:** `msodbcsql_PublicPackages` reads `mssql-rs_Public@Release` as
-  an upstream source. Adding it is a one-time change by a feed admin
-  (Cheena Malhotra, David Engel, Mahendra Chavan, Milos Cimfl, or a project
-  admin). No cross-project write permission is needed.
+  an upstream source. Adding it is a one-time change by a feed admin. No
+  cross-project write permission is needed.
 - **Opt-in:** until a released version is reachable, restoring the package is
   off unless `SQLCMD_RUST_PACKAGE_ENABLED=true`. Without the package, sqlcmd
   builds as before, without the Rust features.
@@ -143,8 +140,6 @@ Done by the release owner, the person who runs the release pipeline.
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| Official build fails in **PolicyValidation → Inventory Compliance Validation**: "Pipeline is missing service assignment or classification in product catalog" | the pipeline is not registered in the product catalog | Assign it to the service (classification **Production**) through the link in the error, e.g. `https://product-catalog-web.prod.space.microsoft.com/ownership/build/7207cf78-9b57-4b4b-b274-c803cac0efe0/b95cf060-8083-439d-8ef1-405d5bf219d8/<definitionId>`. See [aka.ms/pipelineassignment](https://aka.ms/pipelineassignment). Needs a service admin. |
-| A new pipeline waits on **Checkpoint.Authorization** for `RUST-X64-WUS3` / `RUST-ARM64-WUS3` | the agent pools are not yet authorized for it | A pool admin permits it once from the run page. |
 | Release fails: version already on the feed | the version was published before | Bump `version` in `Cargo.toml`; versions cannot be reused. |
 | Release fails: prerelease version | the selected build is not an Official build | Select a run of the Official mssql-sqlcmd Build (2347). |
 | No `-dev` package after a run | the run was a PR build | PR builds never publish; merges, nightly and manual runs do. |
