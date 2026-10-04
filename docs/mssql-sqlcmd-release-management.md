@@ -2,8 +2,7 @@
 
 How `mssql-sqlcmd` (the Rust library native sqlcmd links) is built, versioned,
 released and consumed. For the crate itself, see
-[mssql-sqlcmd/README.md](../mssql-sqlcmd/README.md). The Python wheels follow
-their own process, in [release-management.md](release-management.md).
+[mssql-sqlcmd/README.md](../mssql-sqlcmd/README.md).
 
 ## Architecture
 
@@ -61,11 +60,10 @@ The pack step fails if any runtime is missing.
 | Official mssql-sqlcmd Build | [2347](https://sqlclientdrivers.visualstudio.com/mssql-rs/_build?definitionId=2347) | `.pipeline/OneBranch/OfficialMssqlSqlcmdBuild.yml` | every update of `stable`; manual | nothing; keeps the package as the `drop_Build_MssqlSqlcmd_Package` artifact |
 | ADO-Release Nuget mssql-sqlcmd | [2348](https://sqlclientdrivers.visualstudio.com/mssql-rs/_build?definitionId=2348) | `.pipeline/OneBranch/OfficialMssqlSqlcmdRelease.yml` | manual only | the clean version, when `publishNuGet` is ticked |
 
-- The NonOfficial pipeline is the repo's shared test-build pipeline. It builds
-  the Python wheels and, with `buildMssqlSqlcmd: true`, the sqlcmd package.
+- The NonOfficial pipeline is the repo's shared test-build pipeline; with
+  `buildMssqlSqlcmd: true` it builds and publishes the sqlcmd package.
   PR builds build but never publish.
-- The Official build and the release pipeline are separate from the Python
-  ones, so the sqlcmd release does not depend on the Python release process.
+- The Official build and the release pipeline are sqlcmd's own.
 - All three build the same jobs, from `.pipeline/OneBranch/mssql-sqlcmd-jobs.yml`.
 - Official pipelines must be registered in the product catalog (classification
   **Production**, service **SQL Server Rust Client**). 2347 is registered.
@@ -95,14 +93,11 @@ oldest ones beyond that, except versions **downloaded in the last 30 days**.
 Versions **promoted to the `Release` view are never deleted**.
 
 Test builds are never promoted and clean themselves up. A released version must
-be promoted, or a busy stream of `-dev` builds will push it out. The Python
-releases follow the same rule: every released `mssql-py-core-wheels` and
-`mssql-python-rs-wheels` version is in the `Release` view.
+be promoted, or a busy stream of `-dev` builds will push it out.
 
 ## Releasing
 
-Done by the release owner, the person who runs the release pipeline. For the
-Python wheels this has been Saurabh and Saumya.
+Done by the release owner, the person who runs the release pipeline.
 
 1. **Bump the version.** Set `version` in `mssql-sqlcmd/Cargo.toml`, merge to
    `main`.
