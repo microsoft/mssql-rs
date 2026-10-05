@@ -779,9 +779,14 @@ msodbcsql build is measured.
     deliberately preserved it rather than unifying it, because changing the
     serializer arm's default to Windows-1252 is a behaviour change on a path
     that fix did not otherwise touch, and
-    `an_unmapped_collation_keeps_the_latin1_fallback` (unit and integration)
-    pins the current split from both inside and outside the crate, so a future
-    unification is a visible, deliberate edit rather than a silent drift.
+    `an_unmapped_collation_keeps_the_latin1_fallback`
+    (`mssql-tds/src/datatypes/tds_value_serializer.rs`) pins the current split,
+    so a future unification is a visible, deliberate edit rather than a silent
+    drift. `the_sql_variant_narrow_path_still_encodes_through_the_shared_encoder`
+    (`mssql-tds/tests/test_narrow_param_encoding.rs`) pins the other side of it:
+    the unmapped collation is the only probe that can still tell the two
+    helpers apart, so it is what keeps the `sql_variant` route from being
+    merged into the serializer arm.
 
     No application regresses at this entry's introduction: both rules predate
     it and AB#48437 preserved them unchanged, so no sign-off is recorded.
