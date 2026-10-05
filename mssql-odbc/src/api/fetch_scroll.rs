@@ -900,15 +900,12 @@ fn fetch_scroll_safe(
         };
         env_state.odbc_version
     };
-    let text_output = {
+    let client_encoding = {
         let Ok(dbc_state) = stmt.parent_dbc().inner.lock() else {
             error!("SQLFetchScroll: dbc mutex poisoned reading client encoding");
             return SQL_ERROR;
         };
-        TextOutput {
-            encoding: dbc_state.client_encoding,
-            warn_on_loss: dbc_state.warn_on_cp_error,
-        }
+        dbc_state.client_encoding
     };
 
     // Snapshot the rowset controls and the effective ARD, then release the
@@ -923,13 +920,14 @@ fn fetch_scroll_safe(
         column_count,
         row_bind_offset_ptr,
         trailing_utf16_plp,
+        text_output,
     ) = {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("SQLFetchScroll: stmt mutex poisoned");
             return SQL_ERROR;
         };
         free_errors(&mut stmt_state);
-        stmt_state.text_output = text_output;
+        stmt_state.text_output.encoding = client_encoding;
 
         if fetch_orientation != SQL_FETCH_NEXT {
             error!(
@@ -1015,6 +1013,7 @@ fn fetch_scroll_safe(
             stmt_state.column_metadata.len(),
             stmt_state.row_bind_offset_ptr,
             trailing_utf16_plp,
+            stmt_state.text_output,
         )
     };
 
@@ -3459,6 +3458,31 @@ mod tests {
     }
 
     #[test]
+    fn fetch_preserves_statement_warning_setting_when_refreshing_encoding() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let encoding = client_output(932, false).encoding;
+        dbc.inner.lock().unwrap().client_encoding = encoding;
+        for warn_on_loss in [true, false] {
+            // Model a setter's fan-out occurring after an older DBC snapshot.
+            dbc.inner.lock().unwrap().warn_on_cp_error = !warn_on_loss;
+            stmt.inner.lock().unwrap().text_output.warn_on_loss = warn_on_loss;
+            assert_eq!(
+                unsafe { sql_fetch_scroll(h.stmt, SQL_FETCH_NEXT, 0) },
+                SQL_ERROR
+            );
+            let state = stmt.inner.lock().unwrap();
+            assert_eq!(state.text_output.encoding, encoding);
+            assert_eq!(state.text_output.warn_on_loss, warn_on_loss);
+            assert_eq!(
+                state.diag_records[0].sql_state,
+                ERR_INVALID_CURSOR_STATE.state
+            );
+        }
+    }
+
+    #[test]
     fn fetch_snapshots_client_encoding_for_bound_row_arrays() {
         use mssql_mock_tds::{ColumnDefinition, ColumnValue, QueryResponse, Row, SqlDataType};
 
@@ -3502,8 +3526,18 @@ mod tests {
                 {
                     let mut state = dbc.inner.lock().unwrap();
                     state.client_encoding = text_output.encoding;
-                    state.warn_on_cp_error = warn_on_loss;
                 }
+                assert_eq!(
+                    unsafe {
+                        crate::api::set_connect_attr::sql_set_connect_attr_w(
+                            h.dbc,
+                            crate::api::odbc_types::SQL_COPT_SS_WARN_ON_CP_ERROR,
+                            usize::from(warn_on_loss) as SqlPointer,
+                            0,
+                        )
+                    },
+                    SQL_SUCCESS
+                );
                 let sql: Vec<u16> = "SELECT client_rows\0".encode_utf16().collect();
                 assert_eq!(
                     unsafe {
@@ -3549,6 +3583,10 @@ mod tests {
                 assert_eq!(
                     stmt.inner.lock().unwrap().text_output.encoding,
                     text_output.encoding
+                );
+                assert_eq!(
+                    stmt.inner.lock().unwrap().text_output.warn_on_loss,
+                    warn_on_loss
                 );
                 assert!(stmt.inner.lock().unwrap().diag_records.is_empty());
             }
