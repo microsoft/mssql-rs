@@ -1644,11 +1644,15 @@ mod ae_colmetadata_tests {
         }
 
         // U+00E9 under LCID 0x0409: `C3 A9` as UTF-8, `82` under CP437, `E9`
-        // under the Windows-1252 the LCID alone would select.
+        // under the Windows-1252 the LCID alone would select. The connection
+        // default is Windows-1252 throughout, so the first two cases also fail
+        // if `begin()` stops propagating the column's own collation; the third
+        // is the control where the two agree.
+        let connection_default = collation(0, 0);
         for (what, column_collation, expected) in [
             ("_UTF8", collation(0x40, 0), b"\xc3\xa9".as_slice()),
             ("CP437", collation(0, 32), b"\x82".as_slice()),
-            ("CP1252", collation(0, 0), b"\xe9".as_slice()),
+            ("CP1252", connection_default, b"\xe9".as_slice()),
         ] {
             let column =
                 BulkCopyColumnMetadata::new("v", SqlDbType::VarChar, TdsDataType::BigVarChar as u8)
@@ -1663,7 +1667,7 @@ mod ae_colmetadata_tests {
                     &mut packet_writer,
                     "T".to_string(),
                     vec![column],
-                    column_collation,
+                    connection_default,
                 );
                 writer.begin().await.unwrap();
 
