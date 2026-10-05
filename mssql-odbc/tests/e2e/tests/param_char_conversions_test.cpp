@@ -152,6 +152,19 @@ protected:
         return hex;
     }
 
+    // `true` when the database collation encodes characters as UTF-8, i.e. a
+    // `_UTF8` name.
+    //
+    // Since AB#48437 the narrow serializer honours that flag, so a character
+    // outside ASCII occupies more bytes than the UTF-16 units the ODBC layer
+    // counted when it validated the parameter against its declared length. A
+    // value that fits a `varchar(n)` in units can therefore overflow it in
+    // bytes and be rejected during serialization. That gap is AB#47584; a test
+    // whose premise is "this value fits" has to skip here rather than assert.
+    bool DatabaseIsUtf8() {
+        return DatabaseCollation().find("_UTF8") != std::string::npos;
+    }
+
     // serialize_string resolves the code page from the collation's UTF-8 flag,
     // then its SQL sort ID, then its LCID (AB#48437). The cases gated on this
     // helper assert CP1252 bytes specifically - U+00E9 as 0xE9, U+20AC as 0x80 -
@@ -574,8 +587,22 @@ TEST_F(CharConversionLiveTest, NarrowToWideOverflowingBlanksAreTrimmed) {
 // DBCS or _UTF8 collation the server bound is larger than the units we counted,
 // so an over-long value reaches serialize_char_varchar_direct and fails there
 // with an opaque driver error rather than 22001 (AB#47584).
+//
+// Skipped on a `_UTF8` database for exactly that reason. Since AB#48437 the
+// narrow serializer encodes to UTF-8 there, so this probe's five bytes exceed
+// the `varchar(4)` the four units were validated against and the first
+// `SQLExecute` below is rejected. The probe's premise - that the value fits -
+// only holds on a collation whose code page gives `é` one byte, which every
+// single-byte page here does. Measured: `caf\u00E9` into `varchar(4)` is
+// accepted under CP1252, CP437 and CP932, and rejected under `_UTF8`.
 TEST_F(CharConversionLiveTest, NarrowMultibyteIsMeasuredInUtf16Units) {
     SKIP_IF_COMPARING_MSODBCSQL();
+
+    if (DatabaseIsUtf8()) {
+        GTEST_SKIP() << "collation " << DatabaseCollation()
+                     << " encodes this value in more bytes than the units it was measured in; "
+                        "the over-length rejection is AB#47584, not this probe's subject";
+    }
 
     std::vector<SQLCHAR> value = {'c', 'a', 'f', 0xC3, 0xA9};
     SQLLEN ind = static_cast<SQLLEN>(value.size());
