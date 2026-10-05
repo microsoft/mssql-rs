@@ -1616,4 +1616,83 @@ mod ae_colmetadata_tests {
             );
         }
     }
+
+    /// A bulk-copy cell is encoded for its *column's* collation, which
+    /// `begin()` copies out of `BulkCopyColumnMetadata` into `column_contexts`
+    /// and hands to `TdsValueSerializer::serialize_value`.
+    ///
+    /// Before AB#48437 that arm resolved the LCID alone, so a column declared
+    /// `_UTF8` or with a CP437/CP850 sort ID in COLMETADATA was sent the LCID's
+    /// single-byte encoding instead -- the server stored a corrupt cell rather
+    /// than a mis-framed one, since the declared collation and the bytes
+    /// disagreed. Asserting the bytes on the wire, rather than the loss flag,
+    /// is what distinguishes the two.
+    ///
+    /// Driven through `begin()` and `write_column_value` so it also pins
+    /// `column_contexts` carrying the per-column collation; a context built by
+    /// hand would pass even if that copy were dropped. The source is UTF-16 so
+    /// the `_UTF8` case reaches the resolver instead of the UTF-8 passthrough.
+    #[tokio::test]
+    async fn bulk_row_encodes_for_the_column_collation() {
+        fn collation(col_flags: u8, sort_id: u8) -> SqlCollation {
+            SqlCollation {
+                info: 0x0409,
+                lcid_language_id: 0,
+                col_flags,
+                sort_id,
+            }
+        }
+
+        // U+00E9 under LCID 0x0409: `C3 A9` as UTF-8, `82` under CP437, `E9`
+        // under the Windows-1252 the LCID alone would select. The connection
+        // default is Windows-1252 throughout, so the first two cases also fail
+        // if `begin()` stops propagating the column's own collation; the third
+        // is the control where the two agree.
+        let connection_default = collation(0, 0);
+        for (what, column_collation, expected) in [
+            ("_UTF8", collation(0x40, 0), b"\xc3\xa9".as_slice()),
+            ("CP437", collation(0, 32), b"\x82".as_slice()),
+            ("CP1252", connection_default, b"\xe9".as_slice()),
+        ] {
+            let column =
+                BulkCopyColumnMetadata::new("v", SqlDbType::VarChar, TdsDataType::BigVarChar as u8)
+                    .with_length(8, TypeLength::Variable(8))
+                    .with_collation(column_collation);
+
+            let mut net = CapturingWriter { buffer: Vec::new() };
+            {
+                let mut packet_writer =
+                    PacketWriter::new(PacketType::BulkLoad, &mut net, None, None);
+                let mut writer = StreamingBulkLoadWriter::new(
+                    &mut packet_writer,
+                    "T".to_string(),
+                    vec![column],
+                    connection_default,
+                );
+                writer.begin().await.unwrap();
+
+                let value = ColumnValues::String(crate::datatypes::sql_string::SqlString::new(
+                    "\u{e9}".encode_utf16().flat_map(u16::to_le_bytes).collect(),
+                    crate::datatypes::sql_string::EncodingType::Utf16,
+                ));
+                writer.write_column_value(0, &value).await.unwrap();
+                let _ = writer.end().await.unwrap();
+            }
+
+            // `end()` appends a nine-byte DONE token, and the `varchar(n)` cell
+            // is the last thing before it: a two-byte little-endian length
+            // prefix and that many encoded bytes. Asserting the prefix as well
+            // as the bytes is what makes a mis-encoded cell fail here rather
+            // than merely shift.
+            let done = 9;
+            let mut cell = (expected.len() as u16).to_le_bytes().to_vec();
+            cell.extend_from_slice(expected);
+            assert_eq!(
+                &net.buffer[net.buffer.len() - done - cell.len()..net.buffer.len() - done],
+                cell.as_slice(),
+                "{what} column, full packet {:02x?}",
+                net.buffer
+            );
+        }
+    }
 }

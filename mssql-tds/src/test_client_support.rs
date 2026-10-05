@@ -33,6 +33,111 @@ pub fn rpc_parameter_declaration(
     parameter.sql_declaration()
 }
 
+/// The per-value serialization context [`serialized_value_wire_bytes`] needs.
+///
+/// Re-exported rather than made public on `datatypes`: the module itself stays
+/// private, so this is reachable only with `test-util` on.
+pub use crate::datatypes::tds_value_serializer::TdsTypeContext;
+
+/// Serializes one value through the real parameter serializer and returns the
+/// wire bytes it produced, without a server.
+///
+/// `TdsValueSerializer::serialize_value` needs a `PacketWriter`, and `io` is
+/// `pub(crate)`, so an integration test cannot reach the serializer on its own.
+/// This runs it over a capturing transport and hands back the message body with
+/// every TDS packet header stripped, which is what the corresponding in-crate
+/// unit tests assert against.
+///
+/// Exposed for the narrow-encoding tests in `tests/`, which need the collation
+/// resolution (UTF-8 flag, then SQL sort ID, then LCID) exercised through
+/// `serialize_value` rather than through the shared `encode_narrow` helper —
+/// asserting the helper alone would pass whether or not the serializer actually
+/// calls it (AB#48437).
+///
+/// Correct for a value of any size: `PacketWriter` flushes each full packet
+/// through `NetworkWriter::send` and copies the overflow back to the start of
+/// its buffer, so [`CapturingWriter`] keeps the flushed packets and only
+/// `..position()` of the final buffer is read.
+pub fn serialized_value_wire_bytes(
+    value: &crate::datatypes::column_values::ColumnValues,
+    ctx: &TdsTypeContext,
+) -> TdsResult<Vec<u8>> {
+    use crate::datatypes::tds_value_serializer::TdsValueSerializer;
+    use crate::io::packet_writer::PacketWriter;
+    use crate::message::messages::PacketType;
+
+    let mut sink = CapturingWriter {
+        size: CAPTURE_PACKET_SIZE,
+        sent: Vec::new(),
+    };
+
+    // Scoped so the mutable borrow ends before the captured packets are read.
+    let tail = {
+        let mut writer = PacketWriter::new(PacketType::TabularResult, &mut sink, None, None);
+        futures::executor::block_on(TdsValueSerializer::serialize_value(&mut writer, value, ctx))?;
+        let cursor = writer.get_payload();
+        let end = cursor.position() as usize;
+        let buffer = cursor.into_inner();
+        // `end` can sit at the header when a value ends exactly on a packet
+        // boundary, which is an empty tail rather than an underflow.
+        buffer[PacketWriter::PACKET_HEADER_SIZE..end].to_vec()
+    };
+
+    let mut out = Vec::new();
+    for packet in &sink.sent {
+        out.extend_from_slice(&packet[PacketWriter::PACKET_HEADER_SIZE..]);
+    }
+    out.extend_from_slice(&tail);
+    Ok(out)
+}
+
+/// Packet size [`serialized_value_wire_bytes`] configures its sink with.
+///
+/// Public because it is load-bearing for a test asserting on multi-packet
+/// behaviour: such a test must size its value against this rather than a
+/// literal, or raising it would quietly reduce the test to the single-packet
+/// path it was written to avoid.
+pub const CAPTURE_PACKET_SIZE: u32 = 4096;
+
+/// A [`NetworkWriter`] that keeps whatever is sent to it.
+///
+/// Deliberately not a discard sink: `PacketWriter` flushes completed packets
+/// through `send` and reuses its buffer for the remainder, so dropping them
+/// would silently truncate any value larger than one packet.
+struct CapturingWriter {
+    size: u32,
+    /// Each flushed packet, header included.
+    sent: Vec<Vec<u8>>,
+}
+
+#[async_trait]
+impl TransportSslHandler for CapturingWriter {
+    async fn enable_ssl(&mut self) -> TdsResult<()> {
+        Ok(())
+    }
+    async fn disable_ssl(&mut self) -> TdsResult<()> {
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl NetworkWriter for CapturingWriter {
+    async fn send(&mut self, data: &[u8]) -> TdsResult<()> {
+        self.sent.push(data.to_vec());
+        Ok(())
+    }
+    fn packet_size(&self) -> u32 {
+        self.size
+    }
+    fn get_encryption_setting(&self) -> NegotiatedEncryptionSetting {
+        NegotiatedEncryptionSetting::NoEncryption
+    }
+    fn note_reset_dispatched(&mut self) {}
+    fn take_reset_dispatched(&mut self) -> bool {
+        false
+    }
+}
+
 use crate::connection::client_context::ClientContext;
 use crate::connection::execution_context::ExecutionContext;
 use crate::connection::tds_client::TdsClient;

@@ -117,18 +117,18 @@ transparent reconnects.
   across `SQLPutData` calls; not confirmed at the code-point level. Either
   way, whole-value buffering here is a documented deviation from msodbcsql's
   incremental approach, not a gap. The same-wideness narrow path
-  (`SQL_C_CHAR` against a narrow SQL type) still assumes UTF-8 on the wire
-  instead of reading the connection's collation (AB#47590); only the
-  wideness-mismatch half of that gap has closed. Under a UTF8-flagged
-  database collation, this transcode fix is now *more* correct than the
-  materialized (non-DAE) path: `encode_narrow` checks `collation.utf8()`
-  like `get_encoding_type` does, but the serializer's `VARCHAR | CHAR | TEXT`
-  arm predates that flag and always encodes through the single-byte LCID
-  codepage regardless of it, so the same value now gets correct UTF-8 wire
-  bytes streamed but single-byte-miscoded bytes bound inline - a new
-  instance of the same "two ways to bind disagree" shape, just with the
-  streamed side on the correct end this time (AB#47590; the serializer fix
-  itself is out of scope here).
+  (`SQL_C_CHAR` against a narrow SQL type) still reads the *application
+  buffer* as UTF-8 rather than the client code page (AB#47565); the wire side
+  has read the connection's collation since `DaeTranscode` landed
+  (`DaeTarget::Narrow(collation)` encodes through `encode_narrow`), and only
+  the wideness-mismatch half of AB#47590 has closed. Under a UTF8-flagged
+  database collation the streamed and inline paths now agree:
+  `encode_narrow` checks `collation.utf8()` like `get_encoding_type` does,
+  and since AB#48437 the serializer's `VARCHAR | CHAR | TEXT` arm resolves
+  through the same helper rather than the LCID alone, so the same value
+  reaches the wire as the same bytes whichever route it took. Before that
+  fix the streamed side was correct and the inline side encoded through the
+  single-byte LCID codepage regardless of the flag.
   `SQLPutData`'s `try_reserve` guard against an unbounded `SQL_DATA_AT_EXEC`
   value only bounds accumulation: the transform `SQLParamData` runs at close
   (`decode_utf16le`, `String::from_utf8_lossy`, `encode_narrow`) still
