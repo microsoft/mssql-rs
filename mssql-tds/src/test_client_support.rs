@@ -54,15 +54,10 @@ pub use crate::datatypes::tds_value_serializer::TdsTypeContext;
 /// asserting the helper alone would pass whether or not the serializer actually
 /// calls it (AB#48437).
 ///
-/// Correct for a value of any size. Two things make the obvious one-buffer
-/// implementation wrong once the payload crosses `max_payload_size`:
-///
-/// - `PacketWriter` flushes each full packet through `NetworkWriter::send` and
-///   then copies the overflow back to the start of its buffer, so the buffer
-///   alone holds only the *final* partial packet. [`CapturingWriter`] keeps the
-///   flushed packets so they can be concatenated back in order.
-/// - `Cursor::into_inner` returns the whole `Vec`, which after that copy-back
-///   still has stale bytes beyond the cursor. Only `..position()` is read.
+/// Correct for a value of any size: `PacketWriter` flushes each full packet
+/// through `NetworkWriter::send` and copies the overflow back to the start of
+/// its buffer, so [`CapturingWriter`] keeps the flushed packets and only
+/// `..position()` of the final buffer is read.
 pub fn serialized_value_wire_bytes(
     value: &crate::datatypes::column_values::ColumnValues,
     ctx: &TdsTypeContext,

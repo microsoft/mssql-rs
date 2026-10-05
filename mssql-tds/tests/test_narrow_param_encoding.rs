@@ -500,12 +500,9 @@ fn a_bounded_value_spanning_multiple_packets_keeps_its_length_prefix() {
 /// `CAST(NCHAR(97)+NCHAR(55296)+NCHAR(98) AS VARCHAR)` produced the identical
 /// bytes.
 ///
-/// Asserts the payload only. This driver additionally marks the message so
-/// `SQL_COPT_SS_WARN_ON_CP_ERROR` can report `01000`, but
-/// `serialized_value_wire_bytes` returns bytes alone, so that flag is not
-/// observable from here — it is pinned by
+/// Asserts the payload only; the loss flag is pinned by
 /// `a_lone_surrogate_substitutes_and_marks_the_message` in
-/// `tds_value_serializer.rs`, which reads it off the `PacketWriter`.
+/// `tds_value_serializer.rs`, which can read it off the `PacketWriter`.
 #[test]
 fn a_lone_surrogate_reaching_a_narrow_target_is_substituted() {
     assert_eq!(
@@ -525,11 +522,6 @@ fn a_lone_surrogate_reaching_a_narrow_target_is_substituted() {
 /// `WideCharToMultiByte(CP_UTF8, ...)` without `WC_ERR_INVALID_CHARS` also
 /// yields `EF BF BD`, so msodbcsql is expected to agree — that leg is inferred
 /// from the API contract rather than measured against a `_UTF8` database.
-///
-/// The quiet half — that nothing is lost, so no `01000` is reported for this
-/// input under this collation — is the counterpart assertion in
-/// `a_lone_surrogate_under_a_utf8_collation_leaves_the_message_unmarked`, for
-/// the same reason as above: the flag is not visible from this file.
 #[test]
 fn a_lone_surrogate_under_a_utf8_collation_is_not_substituted() {
     assert_eq!(

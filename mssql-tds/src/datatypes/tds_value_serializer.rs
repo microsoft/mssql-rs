@@ -1423,34 +1423,17 @@ impl TdsValueSerializer {
                     return Self::serialize_char_varchar_direct(writer, raw_bytes, ctx).await;
                 }
 
-                // A UTF-8 source under a UTF-8 collation is already the wire
-                // form, so the decode/re-encode below is an identity pair:
-                // `to_utf8_string` would copy and re-validate the bytes, and
-                // `UTF_8.encode` borrows and is then copied back out. Skipping
-                // both saves two copies per parameter.
-                //
                 // `EncodingType::Utf8` is a declaration, not a guarantee --
                 // `SqlString::new` stores whatever bytes it is handed -- so the
-                // validity is checked rather than assumed. Invalid bytes fall
-                // through to the established path, which is what they did
-                // before this fast path existed. `get_data.rs`'s narrow
-                // passthrough guards itself the same way, for the same reason.
+                // validity is checked rather than assumed, as `get_data.rs`'s
+                // narrow passthrough does. Invalid bytes fall through to the
+                // established path, which is what they did before this fast
+                // path existed.
                 //
-                // The validation is hoisted out of the `if` so the borrow it
-                // produces can be reused below: a valid UTF-8 source bound
-                // against a *non*-UTF-8 collation still has to be decoded, and
-                // `to_utf8_string` would `to_vec()` the whole value and
-                // re-validate the copy only to hand `encode_narrow_for_wire` a
-                // `&str` it could have borrowed. That case -- the common one
-                // for a narrow parameter -- now borrows instead.
-                //
-                // The rest of the guard is exact: `collation.utf8()` is
+                // Skipping the encode is sound because `collation.utf8()` is
                 // `try_resolve_collation`'s first branch, so the resolved
-                // encoding is UTF-8 unconditionally; UTF-8 represents every
-                // character, so the skipped encode could not have set
-                // `had_loss`; and framing is unchanged because
-                // `serialize_char_varchar_direct` measures the slice it is
-                // handed, which is the same length either way.
+                // encoding is UTF-8 unconditionally, and UTF-8 represents every
+                // character, so no substitution can be lost.
                 //
                 // Reachable only since AB#48437: before it this arm resolved a
                 // UTF-8 collation to the LCID's single-byte page, so source and
@@ -1463,11 +1446,8 @@ impl TdsValueSerializer {
                     return Self::serialize_char_varchar_direct(writer, &value.bytes, ctx).await;
                 }
 
-                // Otherwise (UTF-16 source, or a UTF-8 source whose target is
-                // not UTF-8) decode and re-encode to the target code page.
-                // Declared-but-malformed UTF-8 takes the `Owned` arm and so
-                // still panics inside `to_utf8_string` exactly as before; that
-                // is AB#47576's to change, not this.
+                // Declared-but-malformed UTF-8 takes the `Owned` arm and still
+                // panics inside `to_utf8_string`; that is AB#47576's to change.
                 let decoded_str: Cow<'_, str> = match borrowed {
                     Some(text) => Cow::Borrowed(text),
                     None => Cow::Owned(value.to_utf8_string()),
@@ -1643,11 +1623,7 @@ impl TdsValueSerializer {
     ///
     /// Resolution is [`try_resolve_collation`], the same order [`encode_narrow`]
     /// uses: the UTF-8 flag, then the SQL sort ID's code page, then the LCID's.
-    /// It previously resolved the LCID alone, so a UTF-8-flagged collation wrote
-    /// `E9` for U+00E9 instead of `C3 A9`, and a CP437/CP850 sort ID over LCID
-    /// 0x0409 wrote `E9` instead of `82` -- inline parameters disagreeing with
-    /// both streamed ones and fetched values under exactly those collations
-    /// (AB#48437).
+    /// It previously resolved the LCID alone (AB#48437).
     ///
     /// The fallback is deliberately *not* shared. [`encode_narrow`] defaults an
     /// unmapped collation to Windows-1252; this arm keeps its own Latin-1
