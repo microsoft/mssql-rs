@@ -13,10 +13,16 @@
 //! CP437/CP850 collations (AB#48437).
 //!
 //! No server is required: the bytes come from the serializer itself via
-//! `test_client_support::serialized_value_wire_bytes`. The in-crate unit tests
-//! in `tds_value_serializer.rs` cover the same ground; these run the same
-//! assertions from outside the crate, so a change that narrows the public
-//! surface or reroutes serialization shows up here too.
+//! `test_client_support::serialized_value_wire_bytes`.
+//!
+//! The per-collation truth table — which code page each flag and sort ID
+//! resolves to, and the bytes it produces — lives in the unit tests in
+//! `tds_value_serializer.rs`, which can also read `code_page_conversion_loss()`
+//! off the `PacketWriter` and so assert the loss flag this file cannot see.
+//! What is here is what only an out-of-crate caller reaches: the `test-util`
+//! export itself, the framing of every narrow form, the `sql_variant` route,
+//! values spanning a TDS packet boundary, the `encoding_rs` arm of the
+//! resolver, and the over-length behaviour AB#47584 tracks.
 
 use mssql_tds::datatypes::column_values::ColumnValues;
 use mssql_tds::datatypes::sql_string::{EncodingType, SqlString, encode_narrow};
@@ -97,161 +103,9 @@ fn payload(
     // A UTF-8 source is what the ODBC layer hands down for a character
     // parameter. Note this reaches the serializer's UTF-8 passthrough under a
     // `_UTF8` collation, so for that collation the bytes are forwarded rather
-    // than re-encoded; use [`utf16_payload`] to drive the resolver itself.
+    // than re-encoded; the resolver itself is pinned by the unit tests.
     let value = ColumnValues::String(SqlString::new(text.as_bytes().to_vec(), EncodingType::Utf8));
     serialized_value_wire_bytes(&value, &ctx).expect("serializes")
-}
-
-/// [`varchar_payload`] from a UTF-16LE source, so the value is decoded and
-/// re-encoded through `encode_narrow_for_wire` rather than taking the UTF-8
-/// passthrough.
-///
-/// Needed because that passthrough forwards an `EncodingType::Utf8` source
-/// under a `_UTF8` collation without consulting `try_resolve_collation` at all.
-/// A UTF-8-source assertion therefore cannot prove the resolver honours the
-/// UTF-8 flag -- it would pass even if that branch were removed -- so the
-/// collation-resolution claims are asserted from this side too.
-fn utf16_payload(text: &str, collation: SqlCollation) -> Vec<u8> {
-    let ctx = TdsTypeContext {
-        tds_type: VARCHAR,
-        max_size: 8000,
-        is_plp: false,
-        is_fixed_length: false,
-        precision: None,
-        scale: None,
-        collation: Some(collation),
-        is_nullable: true,
-    };
-    let utf16: Vec<u8> = text.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
-    let value = ColumnValues::String(SqlString::new(utf16, EncodingType::Utf16));
-    serialized_value_wire_bytes(&value, &ctx).expect("serializes")
-}
-
-/// The UTF-8 flag wins over the LCID: U+00E9 is `C3 A9`, not the `E9` that
-/// LCID 0x0409 alone would produce.
-///
-/// The length prefix is asserted with it - the encoded form is two bytes for
-/// one character, so a prefix of 1 would frame the value short and desync the
-/// parameter stream rather than merely mis-encoding it.
-///
-/// Asserted from both sources. The UTF-8 one takes the serializer's
-/// passthrough, which forwards the bytes without consulting the resolver, so it
-/// alone would pass even with the resolver's UTF-8 branch removed; the UTF-16
-/// one is decoded and re-encoded, so it is what actually pins the branch.
-#[test]
-fn a_utf8_collation_encodes_utf8_rather_than_the_lcid_codepage() {
-    assert_eq!(varchar_payload("\u{e9}", utf8()), b"\x02\x00\xc3\xa9");
-    assert_eq!(
-        utf16_payload("\u{e9}", utf8()),
-        b"\x02\x00\xc3\xa9",
-        "the resolver must honour the UTF-8 flag, not just the passthrough"
-    );
-}
-
-/// A SQL sort ID wins over the LCID. CP437 and CP850 both put U+00E9 at `82`,
-/// where Windows-1252 puts it at `E9`.
-#[test]
-fn a_sql_sort_id_selects_its_code_page_over_the_lcid() {
-    for (id, what) in [(32u8, "CP437"), (42u8, "CP850")] {
-        assert_eq!(
-            varchar_payload("\u{e9}", sort_id(id)),
-            b"\x01\x00\x82",
-            "{what} (sort id {id})"
-        );
-    }
-}
-
-/// CP437 and CP850 are not interchangeable, so the sort ID has to select
-/// between them rather than standing for "some OEM page".
-///
-/// Both put a character at `E0`, but a different one: U+03B1 GREEK SMALL ALPHA
-/// in CP437, U+00D3 LATIN CAPITAL O WITH ACUTE in CP850. Each is unmappable in
-/// the other page and becomes `?`, so swapping the two arms of the resolver
-/// fails all four assertions.
-#[test]
-fn cp437_and_cp850_are_told_apart() {
-    assert_eq!(
-        varchar_payload("\u{3b1}", sort_id(32)),
-        b"\x01\x00\xe0",
-        "U+03B1 is CP437's E0"
-    );
-    assert_eq!(
-        varchar_payload("\u{3b1}", sort_id(42)),
-        b"\x01\x00?",
-        "U+03B1 has no CP850 encoding"
-    );
-    assert_eq!(
-        varchar_payload("\u{d3}", sort_id(42)),
-        b"\x01\x00\xe0",
-        "U+00D3 is CP850's E0"
-    );
-    assert_eq!(
-        varchar_payload("\u{d3}", sort_id(32)),
-        b"\x01\x00?",
-        "U+00D3 has no CP437 encoding"
-    );
-}
-
-/// The control: an ordinary Windows collation still resolves through the LCID
-/// exactly as before, so the fix adds branches ahead of that path rather than
-/// replacing it.
-#[test]
-fn a_windows_collation_still_encodes_through_the_lcid_codepage() {
-    assert_eq!(varchar_payload("\u{e9}", windows_1252()), b"\x01\x00\xe9");
-}
-
-/// Buffered and streamed writes must agree. `encode_narrow` is what the
-/// data-at-execution path streams through; the inline arm now resolves the same
-/// way, so one value under one collation reaches the wire as the same bytes
-/// whichever route it took. Before the fix the two disagreed under exactly the
-/// collations above.
-#[test]
-fn the_inline_arm_agrees_with_the_streamed_encoder() {
-    let probes = ["\u{e9}", "\u{3b1}", "\u{d3}", "Caf\u{e9} \u{65e5}", "plain"];
-    let collations = [
-        ("utf8", utf8()),
-        ("cp437", sort_id(32)),
-        ("cp850", sort_id(42)),
-        ("windows-1252", windows_1252()),
-    ];
-    for (what, collation) in collations {
-        for probe in probes {
-            let inline = varchar_payload(probe, collation);
-            let streamed = encode_narrow(probe, collation).bytes;
-            // The inline payload carries a two-byte length prefix; the streamed
-            // one is bare bytes. Compare the bodies, and check the prefix counts
-            // them.
-            let prefix = u16::from_le_bytes([inline[0], inline[1]]) as usize;
-            assert_eq!(
-                &inline[2..],
-                streamed.as_slice(),
-                "{what}: inline and streamed bytes differ for {probe:?}"
-            );
-            assert_eq!(
-                prefix,
-                streamed.len(),
-                "{what}: length prefix does not count the encoded bytes for {probe:?}"
-            );
-        }
-    }
-}
-
-/// A multibyte UTF-8 result must be framed by byte count, not character count.
-/// U+65E5 is three bytes under a UTF-8 collation and unmappable in every
-/// single-byte page, so this also shows the UTF-8 arm avoids the substitution
-/// the Windows-1252 control makes.
-///
-/// The UTF-16 source is what reaches the resolver; see
-/// [`a_utf8_collation_encodes_utf8_rather_than_the_lcid_codepage`].
-#[test]
-fn a_utf8_collation_frames_multibyte_output_by_byte_count() {
-    assert_eq!(varchar_payload("\u{65e5}", utf8()), b"\x03\x00\xe6\x97\xa5");
-    assert_eq!(
-        utf16_payload("\u{65e5}", utf8()),
-        b"\x03\x00\xe6\x97\xa5",
-        "the resolver must frame the re-encoded form by byte count"
-    );
-    assert_eq!(varchar_payload("\u{65e5}", windows_1252()), b"\x01\x00?");
 }
 
 /// ASCII is identical in all four code pages, so it must round-trip unchanged
@@ -399,31 +253,6 @@ fn the_sql_variant_narrow_path_still_encodes_through_the_shared_encoder() {
         encode_narrow("\u{e9}", sort_id(32)).bytes.last().copied(),
         "sql_variant and the streamed encoder disagree"
     );
-}
-
-/// A collation naming no encoding this crate maps keeps the serializer's own
-/// Latin-1 fallback rather than inheriting `encode_narrow`'s Windows-1252 one.
-/// Deliberately not unified: that is a behaviour change on a path the resolver
-/// fix does not otherwise touch.
-///
-/// U+0080 separates the two - it is its own byte under the Latin-1 mapping and
-/// unmappable in Windows-1252, whose `80` is the Euro sign.
-#[test]
-fn an_unmapped_collation_keeps_the_latin1_fallback() {
-    let unmapped = SqlCollation {
-        info: 0x000F_FFFF,
-        lcid_language_id: 0,
-        col_flags: 0,
-        sort_id: 0,
-    };
-    assert_eq!(
-        varchar_payload("\u{80}", unmapped),
-        b"\x01\x00\x80",
-        "Latin-1 passes U+0080 through"
-    );
-    // Windows-1252 would have substituted instead, which is what makes the
-    // assertion above about the fallback rather than about U+0080.
-    assert_eq!(encode_narrow("\u{80}", unmapped).bytes, b"?");
 }
 
 /// A value larger than one TDS packet must come back whole.
