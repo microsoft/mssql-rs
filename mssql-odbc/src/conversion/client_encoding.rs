@@ -700,15 +700,15 @@ mod platform {
         #[test]
         fn gb18030_preserves_multibyte_character_boundaries() {
             let encoding = for_code_page(54936).unwrap();
-            // U+20000's GB18030 mapping is four bytes. Use the wire bytes
-            // directly because platform transliteration support varies.
-            let encoded: &[u8] = b"A\x95\x32\x82\x36B";
+            // U+0100 uses a four-byte GB18030 sequence supported by older
+            // platform tables that do not include supplementary mappings.
+            let encoded: &[u8] = b"A\x81\x30\x8b\x38B";
             let character_start = 1;
             let character_end = 5;
             let decoded = encoding
                 .decode(encoded)
                 .unwrap_or_else(|_| panic!("GB18030 failed to decode {encoded:02x?}"));
-            assert_eq!(decoded, "A𠀀B", "encoded bytes: {encoded:02x?}");
+            assert_eq!(decoded, "AĀB", "encoded bytes: {encoded:02x?}");
 
             for capacity in character_start..character_end {
                 let prefix_len = encoding.prefix_len(encoded, capacity).unwrap_or_else(|_| {
