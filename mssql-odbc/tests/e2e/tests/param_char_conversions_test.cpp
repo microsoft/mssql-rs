@@ -11,6 +11,7 @@
 
 #include "odbc_test_fixture.h"
 
+#include <cstdlib>
 #include <optional>
 #include <string>
 #include <vector>
@@ -152,17 +153,35 @@ protected:
         return hex;
     }
 
-    // `true` when the database collation encodes characters as UTF-8, i.e. a
-    // `_UTF8` name.
+    // The number of `varchar` bytes the database collation needs for U+00E9, or
+    // `std::nullopt` when the probe itself failed.
     //
-    // Since AB#48437 the narrow serializer honours that flag, so a character
-    // outside ASCII occupies more bytes than the UTF-16 units the ODBC layer
-    // counted when it validated the parameter against its declared length. A
-    // value that fits a `varchar(n)` in units can therefore overflow it in
-    // bytes and be rejected during serialization. That gap is AB#47584; a test
-    // whose premise is "this value fits" has to skip here rather than assert.
-    bool DatabaseIsUtf8() {
-        return DatabaseCollation().find("_UTF8") != std::string::npos;
+    // The ODBC layer validates a character parameter against its declared
+    // length in UTF-16 units, but the serializer writes collation bytes, and
+    // since AB#48437 those are the collation's own. Where a character needs
+    // more bytes than units, a value that fits a `varchar(n)` in units
+    // overflows it in bytes and is rejected during serialization - the gap
+    // AB#47584 tracks. A test whose premise is "this value fits" has to skip on
+    // such a collation rather than assert.
+    //
+    // Measured rather than inferred from the name: `_UTF8` needs two bytes, and
+    // so does any DBCS page that genuinely encodes the character rather than
+    // substituting it - CP936 gives `A8 A6`, where CP932, CP949 and CP950 all
+    // substitute to a single `3F` and stay within the count. Matching on the
+    // collation name would have to enumerate which DBCS pages map U+00E9, which
+    // the engine can simply be asked.
+    std::optional<int> DatabaseNarrowByteLengthOfEAcute() {
+        if (!SQL_SUCCEEDED(Prepare("SELECT DATALENGTH(CAST(NCHAR(233) AS VARCHAR(16)))")) ||
+            !SQL_SUCCEEDED(SQLExecute(stmt_))) {
+            return std::nullopt;
+        }
+        const bool fetched = SQL_SUCCEEDED(SQLFetch(stmt_));
+        const std::string text = fetched ? GetColumnChar(1) : std::string();
+        SQLCloseCursor(stmt_);
+        if (!fetched || text.empty()) {
+            return std::nullopt;
+        }
+        return std::atoi(text.c_str());
     }
 
     // serialize_string resolves the code page from the collation's UTF-8 flag,
@@ -588,20 +607,28 @@ TEST_F(CharConversionLiveTest, NarrowToWideOverflowingBlanksAreTrimmed) {
 // so an over-long value reaches serialize_char_varchar_direct and fails there
 // with an opaque driver error rather than 22001 (AB#47584).
 //
-// Skipped on a `_UTF8` database for exactly that reason. Since AB#48437 the
-// narrow serializer encodes to UTF-8 there, so this probe's five bytes exceed
-// the `varchar(4)` the four units were validated against and the first
-// `SQLExecute` below is rejected. The probe's premise - that the value fits -
-// only holds on a collation whose code page gives `é` one byte, which every
-// single-byte page here does. Measured: `caf\u00E9` into `varchar(4)` is
-// accepted under CP1252, CP437 and CP932, and rejected under `_UTF8`.
+// Skipped wherever the collation needs more bytes for this value than the units
+// it was measured in. Since AB#48437 the narrow serializer writes the
+// collation's own encoding, so the five bytes `caf\u00E9` becomes under `_UTF8`
+// - or under a DBCS page that genuinely encodes U+00E9, such as CP936's
+// `A8 A6` - exceed the `varchar(4)` the four UTF-16 units were validated
+// against, and the first `SQLExecute` below is rejected. That over-length
+// rejection is AB#47584, not this probe's subject.
+//
+// Gated on the measured width rather than the collation name: CP932, CP949 and
+// CP950 substitute U+00E9 to a single `3F` and stay within the count, so a
+// name-based DBCS exclusion would skip tests that should run.
 TEST_F(CharConversionLiveTest, NarrowMultibyteIsMeasuredInUtf16Units) {
     SKIP_IF_COMPARING_MSODBCSQL();
 
-    if (DatabaseIsUtf8()) {
-        GTEST_SKIP() << "collation " << DatabaseCollation()
-                     << " encodes this value in more bytes than the units it was measured in; "
-                        "the over-length rejection is AB#47584, not this probe's subject";
+    const std::optional<int> eacute_bytes = DatabaseNarrowByteLengthOfEAcute();
+    ASSERT_TRUE(eacute_bytes.has_value())
+        << "probing the collation's byte width for U+00E9 failed; this is a defect, not a "
+           "collation this probe cannot run on";
+    if (*eacute_bytes > 1) {
+        GTEST_SKIP() << "collation " << DatabaseCollation() << " needs " << *eacute_bytes
+                     << " bytes for U+00E9, so this value exceeds the varchar(4) it was "
+                        "measured into; the over-length rejection is AB#47584";
     }
 
     std::vector<SQLCHAR> value = {'c', 'a', 'f', 0xC3, 0xA9};
