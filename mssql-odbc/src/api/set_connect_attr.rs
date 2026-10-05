@@ -878,6 +878,57 @@ mod tests {
     }
 
     #[test]
+    fn code_page_warning_fan_out_reports_a_poisoned_statement() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        std::thread::scope(|scope| {
+            assert!(
+                scope
+                    .spawn(|| {
+                        let _guard = stmt.inner.lock().unwrap();
+                        panic!("poison the statement lock");
+                    })
+                    .join()
+                    .is_err()
+            );
+        });
+        assert_eq!(
+            unsafe {
+                sql_set_connect_attr_w(
+                    h.dbc,
+                    SQL_COPT_SS_WARN_ON_CP_ERROR,
+                    SQL_WARN_YES as SqlPointer,
+                    0,
+                )
+            },
+            SQL_ERROR
+        );
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let state = dbc.inner.lock().unwrap();
+        assert!(state.warn_on_cp_error);
+        assert_eq!(state.diag_records.len(), 1);
+        assert_eq!(
+            state.diag_records[0].sql_state,
+            ERR_INTERNAL_CONVERSION.state
+        );
+        stmt.inner.clear_poison();
+        drop(state);
+        assert_eq!(
+            unsafe {
+                sql_set_connect_attr_w(
+                    h.dbc,
+                    SQL_COPT_SS_WARN_ON_CP_ERROR,
+                    SQL_WARN_YES as SqlPointer,
+                    0,
+                )
+            },
+            SQL_SUCCESS
+        );
+        assert!(stmt.inner.lock().unwrap().text_output.warn_on_loss);
+        assert!(dbc.inner.lock().unwrap().diag_records.is_empty());
+    }
+
+    #[test]
     fn query_timeout_fails_cleanly_on_a_poisoned_connection() {
         let h = TestHandles::with_env_dbc();
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };

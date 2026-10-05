@@ -23,6 +23,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn allocation_capacity_overflow_is_a_conversion_error() {
+        assert_eq!(
+            zeroed_buffer::<u8>(usize::MAX).unwrap_err().state,
+            ERR_INTERNAL_CONVERSION.state
+        );
+        assert!(zeroed_buffer::<u8>(0).unwrap().is_empty());
+    }
+
+    #[test]
     fn utf8_and_ascii_borrow_the_input() {
         for code_page in [65001, 1252, 932] {
             let encoding = ClientEncoding::for_code_page(code_page).unwrap();
@@ -639,6 +648,87 @@ mod platform {
         use super::*;
 
         #[test]
+        fn supported_iso_codesets_round_trip_without_windows_aliases() {
+            for (suffix, code_page) in [
+                (1, 28591),
+                (2, 28592),
+                (3, 28593),
+                (4, 28594),
+                (5, 28595),
+                (6, 28596),
+                (7, 28597),
+                (8, 28598),
+                (9, 28599),
+                (13, 28603),
+                (15, 28605),
+            ] {
+                let name = format!("ISO8859-{suffix}");
+                assert_eq!(from_codeset(name.as_bytes()), ClientEncoding(code_page));
+                let encoding = for_code_page(code_page).unwrap();
+                let encoded = encoding.encode("\u{a0}").unwrap();
+                assert_eq!(&*encoded.bytes, b"\xa0");
+                assert!(!encoded.had_loss);
+                assert_eq!(encoding.decode(&encoded.bytes).unwrap(), "\u{a0}");
+            }
+            for name in [b"ISO8859-0".as_slice(), b"ISO8859-10", b"ISO8859-"] {
+                assert_eq!(from_codeset(name), ClientEncoding::UTF8);
+            }
+        }
+
+        #[test]
+        fn invalid_converter_names_report_internal_conversion_errors() {
+            for (to, from) in [
+                (c"unsupported-client-encoding", c"UTF-8"),
+                (c"UTF-8", c"unsupported-client-encoding"),
+            ] {
+                assert_eq!(
+                    convert_all(b"A", to, from, None).unwrap_err().state,
+                    ERR_INTERNAL_CONVERSION.state
+                );
+            }
+            let encoding = ClientEncoding(u32::MAX);
+            assert_eq!(
+                encoding.encode("é").unwrap_err().state,
+                ERR_INTERNAL_CONVERSION.state
+            );
+            assert_eq!(
+                encoding.decode(b"\xe9").unwrap_err().state,
+                ERR_INTERNAL_CONVERSION.state
+            );
+            assert_eq!(
+                encoding
+                    .utf8_offset_for_client_bytes("é", 1)
+                    .unwrap_err()
+                    .state,
+                ERR_INTERNAL_CONVERSION.state
+            );
+        }
+
+        #[test]
+        fn malformed_multibyte_prefixes_report_character_errors() {
+            for (code_page, bytes) in [(932, b"A\x82".as_slice()), (12000, b"A\0\0".as_slice())] {
+                let encoding = for_code_page(code_page).unwrap();
+                assert_eq!(
+                    encoding.prefix_len(bytes, bytes.len()).unwrap_err().state,
+                    ERR_INVALID_CHARACTER_VALUE.state
+                );
+            }
+            let encoding = for_code_page(12000).unwrap();
+            let invalid_scalar = b"\0\xd8\0\0";
+            assert_eq!(
+                encoding
+                    .prefix_len(invalid_scalar, invalid_scalar.len())
+                    .unwrap_err()
+                    .state,
+                ERR_INVALID_CHARACTER_VALUE.state
+            );
+            assert_eq!(
+                encoding.decode(invalid_scalar).unwrap_err().state,
+                ERR_INVALID_CHARACTER_VALUE.state
+            );
+        }
+
+        #[test]
         fn locale_aliases_and_native_utf8_fallback() {
             for codeset in [
                 b"C".as_slice(),
@@ -949,5 +1039,54 @@ mod platform {
         // SAFETY: info is a writable CPINFO.
         unsafe { GetCPInfo(code_page, &mut info) }.ok()?;
         Some(ClientEncoding(code_page))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn native_conversion_failures_preserve_internal_error_diagnostics() {
+            let encoding = ClientEncoding(u32::MAX);
+            assert_eq!(
+                encoding.encode("é").unwrap_err().state,
+                ERR_INTERNAL_CONVERSION.state
+            );
+            assert_eq!(
+                encoding.decode(b"\xe9").unwrap_err().state,
+                ERR_INTERNAL_CONVERSION.state
+            );
+            assert_eq!(
+                encoding.prefix_len(b"\xe9", 1).unwrap_err().state,
+                ERR_INTERNAL_CONVERSION.state
+            );
+            assert_eq!(
+                encoding
+                    .utf8_offset_for_client_bytes("é", 1)
+                    .unwrap_err()
+                    .state,
+                ERR_INTERNAL_CONVERSION.state
+            );
+        }
+
+        #[test]
+        fn windows_length_limit_is_checked_without_allocating() {
+            let max_length = usize::try_from(i32::MAX).unwrap();
+            assert!(check_length(max_length).is_ok());
+            assert_eq!(
+                check_length(max_length + 1).unwrap_err().state,
+                ERR_INTERNAL_CONVERSION.state
+            );
+        }
+
+        #[test]
+        fn utf8_native_boundary_scan_rejects_unsupported_character_width() {
+            assert_eq!(
+                prefix_len(ClientEncoding::UTF8, "é".as_bytes(), 1)
+                    .unwrap_err()
+                    .state,
+                ERR_INTERNAL_CONVERSION.state
+            );
+        }
     }
 }

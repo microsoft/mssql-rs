@@ -5215,6 +5215,61 @@ mod tests {
     }
 
     #[test]
+    fn client_pending_conversion_preserves_emitted_prefix_and_reports_bad_utf8() {
+        let encoding = ClientEncoding::for_code_page(932).unwrap();
+        for start in [0, 2] {
+            let mut pending = b"OK".to_vec();
+            pending.extend_from_slice("あ".as_bytes());
+            assert!(!encode_plp_pending(&mut pending, start, encoding).unwrap());
+            assert_eq!(pending, b"OK\x82\xa0");
+        }
+        let mut pending = b"OK\xff".to_vec();
+        assert_eq!(
+            encode_plp_pending(&mut pending, 2, encoding)
+                .unwrap_err()
+                .state,
+            ERR_INVALID_CHARACTER_VALUE.state
+        );
+        assert_eq!(pending, b"OK\xff");
+        let mut pending = b"OK".to_vec();
+        assert!(!encode_plp_pending(&mut pending, 2, encoding).unwrap());
+        assert_eq!(pending, b"OK");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn client_utf32_binary_hex_get_data_resumes_in_encoded_pairs() {
+        let h = TestHandles::with_env_dbc_stmt();
+        client_code_page(&h, 12000, false);
+        stmt_with_captured(&h, ColumnValues::Bytes(vec![0xab, 0xcd]));
+        let mut output = [0xcc; 11];
+        let mut indicator = -99;
+        for (expected, remaining, rc) in [
+            (b"A\0\0\0B\0\0\0".as_slice(), 16, SQL_SUCCESS_WITH_INFO),
+            (b"C\0\0\0D\0\0\0".as_slice(), 8, SQL_SUCCESS),
+        ] {
+            output.fill(0xcc);
+            assert_eq!(
+                unsafe {
+                    sql_get_data(
+                        h.stmt,
+                        1,
+                        SQL_C_CHAR,
+                        output.as_mut_ptr().cast(),
+                        10,
+                        &mut indicator,
+                    )
+                },
+                rc
+            );
+            assert_eq!(indicator, remaining);
+            assert_eq!(&output[..8], expected);
+            assert_eq!(output[8], 0);
+            assert_eq!(&output[9..], &[0xcc; 2]);
+        }
+    }
+
+    #[test]
     fn client_code_page_applies_to_captured_and_direct_buffered_text() {
         for buffered in [false, true] {
             for source in [
