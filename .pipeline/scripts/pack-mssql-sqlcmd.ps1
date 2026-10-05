@@ -15,7 +15,7 @@
         <StagingDirectory>/LICENSE.txt
         <StagingDirectory>/mssql-sqlcmd.nuspec
 
-    The package version is the crate version from mssql-sqlcmd/Cargo.toml. An
+    The package version is the crate version, as cargo metadata reports it. An
     official build produces it as is, since consumers pin an exact version;
     other builds get a -nightly or -dev prerelease suffix. The .nuspec path and
     the version are written to the pipeline variables mssqlSqlcmdNuspec and
@@ -52,11 +52,27 @@ $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 $crateDir = Join-Path $repoRoot 'mssql-sqlcmd'
 
 # Version: the crate's, with a prerelease suffix unless this is an official build.
-$cargoToml = Get-Content (Join-Path $crateDir 'Cargo.toml') -Raw
-$packageSection = [regex]::Match($cargoToml, '(?ms)^\[package\]\s*$(?<body>.*?)(?=^\[|\z)')
-$versionMatch = [regex]::Match($packageSection.Groups['body'].Value, '(?m)^\s*version\s*=\s*"([^"]+)"')
-if (-not $versionMatch.Success) { throw 'Could not read [package].version from mssql-sqlcmd/Cargo.toml' }
-$crateVersion = $versionMatch.Groups[1].Value
+# The Windows build records it from cargo metadata (mssql-sqlcmd-version.txt);
+# every recorded copy must agree. Without one (a local pack of other runtimes),
+# cargo metadata is asked directly.
+$recorded = @(Get-ChildItem -Path $ArtifactsDirectory -Recurse -File -Filter 'mssql-sqlcmd-version.txt' |
+    ForEach-Object { (Get-Content $_.FullName -Raw).Trim() } | Sort-Object -Unique)
+if ($recorded.Count -gt 1) {
+    throw "The artifacts record different mssql-sqlcmd versions: $($recorded -join ', ')"
+}
+if ($recorded.Count -eq 1) {
+    $crateVersion = $recorded[0]
+} else {
+    Push-Location $repoRoot
+    try {
+        $metadata = & cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
+        if ($LASTEXITCODE -ne 0) { throw 'cargo metadata failed' }
+    } finally {
+        Pop-Location
+    }
+    $crateVersion = ($metadata.packages | Where-Object name -eq 'mssql-sqlcmd').version
+}
+if (-not $crateVersion) { throw 'Could not determine the mssql-sqlcmd version' }
 
 $dateStamp = Get-Date -Format 'yyyyMMdd'
 $isOfficialBuild = $IsOfficial -eq 'True'

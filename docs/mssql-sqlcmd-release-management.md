@@ -142,5 +142,7 @@ Done by the release owner, the person who runs the release pipeline.
 |---|---|---|
 | Release fails: version already on the feed | the version was published before | Bump `version` in `Cargo.toml`; versions cannot be reused. |
 | Release fails: prerelease version | the selected build is not an Official build | Select a run of the Official mssql-sqlcmd Build (2347). |
+| Release fails: Official Build not eligible | the selected run did not complete successfully | Select a successful run, or rerun the Official Build. |
+| Publish fails: not from stable | the release run, or the selected Official Build, is not from `refs/heads/stable` | Queue the release from `stable` and select an Official Build of `stable`. |
 | No `-dev` package after a run | the run was a PR build | PR builds never publish; merges, nightly and manual runs do. |
 | msodbcsql cannot find a released version | not promoted, or the upstream is missing | Promote it to `Release`; check `msodbcsql_PublicPackages` has the `mssql-rs_Public@Release` upstream. |

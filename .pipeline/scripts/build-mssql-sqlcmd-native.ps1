@@ -9,6 +9,8 @@
         <OutputDirectory>/runtimes/<rid>/native/mssql_sqlcmd.lib
         <OutputDirectory>/runtimes/<rid>/native/native-static-libs.txt
 
+    and, once, <OutputDirectory>/mssql-sqlcmd-version.txt: the crate version, as`n    cargo metadata reports it, which the package is versioned from.
+
     native-static-libs.txt holds the system libraries the archive needs, exactly
     as rustc reports them. A static library needs no linker, so every target is
     built from one x64 agent with only its Rust standard library added.
@@ -35,6 +37,15 @@ $targetDir = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Pa
 
 Push-Location $repoRoot
 try {
+    # The crate version, for the package (pack-mssql-sqlcmd.ps1). The packaging
+    # job has no Rust toolchain, so it is recorded here, where cargo runs.
+    $metadata = & cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
+    if ($LASTEXITCODE -ne 0) { throw 'cargo metadata failed' }
+    $crate = $metadata.packages | Where-Object name -eq 'mssql-sqlcmd'
+    if (-not $crate) { throw 'cargo metadata lists no mssql-sqlcmd package' }
+    New-Item -ItemType Directory -Force -Path $OutputDirectory | Out-Null
+    Set-Content -Path (Join-Path $OutputDirectory 'mssql-sqlcmd-version.txt') -Value $crate.version -Encoding ascii
+
     foreach ($target in $Targets.Keys) {
         $rid = $Targets[$target]
 
