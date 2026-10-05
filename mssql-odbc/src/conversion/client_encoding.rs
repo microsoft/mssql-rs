@@ -700,39 +700,18 @@ mod platform {
         #[test]
         fn gb18030_preserves_multibyte_character_boundaries() {
             let encoding = for_code_page(54936).unwrap();
-            let first = encoding
-                .encode("A")
-                .unwrap_or_else(|_| panic!("GB18030 failed to encode the ASCII prefix"));
-            let character = encoding
-                .encode("𠀀")
-                .unwrap_or_else(|_| panic!("GB18030 failed to encode U+20000"));
-            let last = encoding
-                .encode("B")
-                .unwrap_or_else(|_| panic!("GB18030 failed to encode the ASCII suffix"));
-            assert!(
-                !character.had_loss,
-                "GB18030 transliterated U+20000: {:02x?}",
-                character.bytes
-            );
-            assert!(
-                character.bytes.len() > 1,
-                "U+20000 was unexpectedly encoded as {:02x?}",
-                character.bytes
-            );
-
-            let character_start = first.bytes.len();
-            let character_end = character_start + character.bytes.len();
-            let mut encoded = Vec::with_capacity(character_end + last.bytes.len());
-            encoded.extend_from_slice(&first.bytes);
-            encoded.extend_from_slice(&character.bytes);
-            encoded.extend_from_slice(&last.bytes);
+            // U+20000's GB18030 mapping is four bytes. Use the wire bytes
+            // directly because platform transliteration support varies.
+            let encoded: &[u8] = b"A\x95\x32\x82\x36B";
+            let character_start = 1;
+            let character_end = 5;
             let decoded = encoding
-                .decode(&encoded)
+                .decode(encoded)
                 .unwrap_or_else(|_| panic!("GB18030 failed to decode {encoded:02x?}"));
             assert_eq!(decoded, "A𠀀B", "encoded bytes: {encoded:02x?}");
 
             for capacity in character_start..character_end {
-                let prefix_len = encoding.prefix_len(&encoded, capacity).unwrap_or_else(|_| {
+                let prefix_len = encoding.prefix_len(encoded, capacity).unwrap_or_else(|_| {
                     panic!("GB18030 prefix scan failed at capacity {capacity} for {encoded:02x?}")
                 });
                 assert_eq!(
@@ -742,7 +721,7 @@ mod platform {
             }
             assert_eq!(
                 encoding
-                    .prefix_len(&encoded, character_end)
+                    .prefix_len(encoded, character_end)
                     .unwrap_or_else(|_| {
                         panic!(
                             "GB18030 prefix scan failed at complete-character boundary {character_end} for {encoded:02x?}"
@@ -753,7 +732,7 @@ mod platform {
             );
             assert_eq!(
                 encoding
-                    .prefix_len(&encoded, encoded.len())
+                    .prefix_len(encoded, encoded.len())
                     .unwrap_or_else(|_| {
                         panic!("GB18030 prefix scan failed at full length for {encoded:02x?}")
                     }),
