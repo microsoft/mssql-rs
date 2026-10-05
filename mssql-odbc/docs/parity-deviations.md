@@ -792,3 +792,19 @@ msodbcsql build is measured.
     it and AB#48437 preserved them unchanged, so no sign-off is recorded.
     Unifying the two defaults needs one, as does closing the table gap above.
     Decision history in AB#48437.
+
+    **Scope is the shared serializer, not only parameters.**
+    `TdsValueSerializer::serialize_value` is also what bulk copy
+    (`mssql-tds/src/message/bulk_load.rs`, per column from
+    `col_meta.collation`) and TVP rows (`mssql-tds/src/datatypes/sql_tvp.rs`,
+    from `db_collation`) write through, so the fallbacks above and the
+    resolution order AB#48437 corrected apply on those routes too. Both
+    previously sent the LCID's single-byte encoding under a collation they had
+    declared as `_UTF8` or a CP437/CP850 sort ID, storing corrupt cells rather
+    than merely mis-framed ones; that is fixed. The corollary is that
+    deviation 4's over-length behaviour now reaches them as well -- a cell that
+    fit before can exceed its declared length once the encoding grows it, and
+    on those routes it surfaces mid-stream rather than before the first row is
+    written. Deviation 4's sign-off was given for the ODBC parameter layer and
+    does not extend to bulk copy or TVP; AB#47584 owns closing that gap for all
+    three.

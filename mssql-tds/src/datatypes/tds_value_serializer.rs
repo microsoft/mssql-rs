@@ -1647,6 +1647,17 @@ impl TdsValueSerializer {
     /// character reference (`U+65E5` as the eight ASCII bytes `&#26085;`)
     /// rather than substituting a single byte (AB#47598); [`encode_narrow`]
     /// handles it.
+    ///
+    /// **Not only parameters.** `serialize_value` is also the serializer for
+    /// bulk copy (`message/bulk_load.rs`, per column from `col_meta.collation`)
+    /// and for TVP rows (`datatypes/sql_tvp.rs`, from `db_collation`), so both
+    /// resolve through here. Both were previously writing the LCID's
+    /// single-byte encoding under a collation they had declared as `_UTF8` or
+    /// a CP437/CP850 sort ID -- a BCP cell stored corrupt rather than merely
+    /// mis-framed -- and both are fixed by the same change. The over-length
+    /// rejection below reaches them too: a cell that fit before can now exceed
+    /// its declared length once the encoding grows it, surfacing mid-stream
+    /// rather than before the first row is written (AB#47584).
     fn encode_narrow_for_wire(text: &str, collation: Option<SqlCollation>) -> NarrowEncoded {
         let Some(collation) = collation else {
             return Self::encode_latin1_for_wire(text);
@@ -4424,6 +4435,75 @@ mod tests {
         let (payload, had_loss) = serialize_varchar("Caf\u{e9}", Some(windows_1252_collation()));
         assert_eq!(payload, b"\x04\x00Caf\xe9");
         assert!(!had_loss);
+    }
+
+    /// Bulk copy and TVP reach this arm through the same `serialize_value`,
+    /// carrying a *per-column* collation (`col_meta.collation` in
+    /// `message/bulk_load.rs`, `db_collation` in `datatypes/sql_tvp.rs`) rather
+    /// than a parameter's. Both therefore changed with AB#48437: each
+    /// previously wrote the LCID's single-byte encoding under a collation it
+    /// had already declared as `_UTF8` or a CP437/CP850 sort ID, so a non-ASCII
+    /// cell was stored corrupt rather than merely mis-framed.
+    ///
+    /// Asserted on the context shape those callers build - a real collation on
+    /// a bounded `varchar` column - from a UTF-16 source, so the value is
+    /// decoded and re-encoded through the resolver rather than taking the arm's
+    /// UTF-8 passthrough, which would forward the bytes unexamined under a
+    /// `_UTF8` column and pin nothing.
+    #[test]
+    fn a_per_column_collation_resolves_the_same_way_as_a_parameter() {
+        for (what, collation, expected) in [
+            (
+                "_UTF8 column",
+                utf8_collation(),
+                b"\x02\x00\xc3\xa9".as_slice(),
+            ),
+            (
+                "CP437 column",
+                sort_id_collation(32),
+                b"\x01\x00\x82".as_slice(),
+            ),
+            (
+                "CP1252 column",
+                windows_1252_collation(),
+                b"\x01\x00\xe9".as_slice(),
+            ),
+        ] {
+            let (payload, had_loss) = serialize_varchar_utf16(&utf16le("\u{e9}"), collation);
+            assert_eq!(payload, expected, "{what}");
+            assert!(!had_loss, "{what} represents U+00E9");
+        }
+    }
+
+    /// The other half of that reach: honouring the collation grows the value,
+    /// and `serialize_char_varchar_direct` measures encoded bytes against the
+    /// declared length, so a cell that fit before can now be rejected. On the
+    /// bulk-copy and TVP routes this surfaces mid-stream, after earlier rows
+    /// are already buffered, rather than before anything is written (AB#47584).
+    #[test]
+    fn a_grown_value_can_exceed_a_column_length_it_previously_fit() {
+        let value = ColumnValues::String(crate::datatypes::sql_string::SqlString::new(
+            utf16le("\u{e9}"),
+            crate::datatypes::sql_string::EncodingType::Utf16,
+        ));
+        let ctx = TdsTypeContext {
+            tds_type: VARCHAR,
+            max_size: 1,
+            is_plp: false,
+            is_fixed_length: false,
+            precision: None,
+            scale: None,
+            collation: Some(utf8_collation()),
+            is_nullable: true,
+        };
+        let mut mock = MockNetworkWriter::new(64);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        let err = block_on(TdsValueSerializer::serialize_value(&mut w, &value, &ctx))
+            .expect_err("two encoded bytes do not fit varchar(1)");
+        assert!(
+            err.to_string().contains("exceeds schema size"),
+            "expected the length guard, got: {err}"
+        );
     }
 
     /// The UTF-8 passthrough must not forward bytes that are not actually
