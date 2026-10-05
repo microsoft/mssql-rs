@@ -1676,7 +1676,8 @@ impl TdsValueSerializer {
     /// The Latin-1-like mapping [`Self::encode_narrow_for_wire`] falls back to:
     /// a scalar value at or below U+00FF is its own byte, and anything above it
     /// becomes [`NARROW_SUBSTITUTE_BYTE`] -- one per UTF-16 code unit, for the
-    /// reason [`substitute_unmappable`] documents.
+    /// reason [`crate::datatypes::sql_string::substitute_unmappable`]
+    /// documents.
     fn encode_latin1_for_wire(text: &str) -> NarrowEncoded {
         let mut had_loss = false;
         let mut bytes = Vec::with_capacity(text.len());
@@ -4437,49 +4438,16 @@ mod tests {
         assert!(!had_loss);
     }
 
-    /// Bulk copy and TVP reach this arm through the same `serialize_value`,
-    /// carrying a *per-column* collation (`col_meta.collation` in
-    /// `message/bulk_load.rs`, `db_collation` in `datatypes/sql_tvp.rs`) rather
-    /// than a parameter's. Both therefore changed with AB#48437: each
-    /// previously wrote the LCID's single-byte encoding under a collation it
-    /// had already declared as `_UTF8` or a CP437/CP850 sort ID, so a non-ASCII
-    /// cell was stored corrupt rather than merely mis-framed.
-    ///
-    /// Asserted on the context shape those callers build - a real collation on
-    /// a bounded `varchar` column - from a UTF-16 source, so the value is
-    /// decoded and re-encoded through the resolver rather than taking the arm's
-    /// UTF-8 passthrough, which would forward the bytes unexamined under a
-    /// `_UTF8` column and pin nothing.
-    #[test]
-    fn a_per_column_collation_resolves_the_same_way_as_a_parameter() {
-        for (what, collation, expected) in [
-            (
-                "_UTF8 column",
-                utf8_collation(),
-                b"\x02\x00\xc3\xa9".as_slice(),
-            ),
-            (
-                "CP437 column",
-                sort_id_collation(32),
-                b"\x01\x00\x82".as_slice(),
-            ),
-            (
-                "CP1252 column",
-                windows_1252_collation(),
-                b"\x01\x00\xe9".as_slice(),
-            ),
-        ] {
-            let (payload, had_loss) = serialize_varchar_utf16(&utf16le("\u{e9}"), collation);
-            assert_eq!(payload, expected, "{what}");
-            assert!(!had_loss, "{what} represents U+00E9");
-        }
-    }
-
-    /// The other half of that reach: honouring the collation grows the value,
-    /// and `serialize_char_varchar_direct` measures encoded bytes against the
-    /// declared length, so a cell that fit before can now be rejected. On the
+    /// Honouring the collation grows the value, and
+    /// `serialize_char_varchar_direct` measures encoded bytes against the
+    /// declared length, so a value that fit before can now be rejected. On the
     /// bulk-copy and TVP routes this surfaces mid-stream, after earlier rows
     /// are already buffered, rather than before anything is written (AB#47584).
+    ///
+    /// The encoding itself is pinned for a real per-column collation by
+    /// `bulk_row_encodes_for_the_column_collation` in `message/bulk_load.rs`,
+    /// which drives `begin()` and so also covers `column_contexts` carrying
+    /// that collation into this arm.
     #[test]
     fn a_grown_value_can_exceed_a_column_length_it_previously_fit() {
         let value = ColumnValues::String(crate::datatypes::sql_string::SqlString::new(
