@@ -9,7 +9,8 @@
         <OutputDirectory>/runtimes/<rid>/native/mssql_sqlcmd.lib
         <OutputDirectory>/runtimes/<rid>/native/native-static-libs.txt
 
-    and, once, <OutputDirectory>/mssql-sqlcmd-version.txt: the crate version, as`n    cargo metadata reports it, which the package is versioned from.
+    and, once, <OutputDirectory>/mssql-sqlcmd-version.txt: the crate version, as
+    cargo metadata reports it, which the package is versioned from.
 
     native-static-libs.txt holds the system libraries the archive needs, exactly
     as rustc reports them. A static library needs no linker, so every target is
