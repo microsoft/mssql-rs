@@ -31,6 +31,7 @@ pub(crate) unsafe fn sql_get_env_attr(
         ?environment_handle,
         attribute,
         ?value_ptr,
+        buffer_length = _buffer_length,
         ?string_length_ptr,
         "SQLGetEnvAttr called",
     );

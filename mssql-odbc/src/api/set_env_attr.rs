@@ -35,6 +35,7 @@ pub(crate) unsafe fn sql_set_env_attr(
         ?environment_handle,
         attribute,
         ?value_ptr,
+        string_length = _string_length,
         "SQLSetEnvAttr called",
     );
 

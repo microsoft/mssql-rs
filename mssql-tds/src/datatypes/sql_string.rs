@@ -40,31 +40,20 @@ pub struct SqlString {
     encoding_type: EncodingType,
 }
 
-/// Maps a collation's LCID to an encoding, falling back to Windows-1252 with a
-/// warning when the LCID is not one we map.
-fn lcid_encoding_or_fallback(collation: SqlCollation) -> &'static encoding_rs::Encoding {
-    // LCID lives in the lower 20 bits of collation.info.
-    let lcid = collation.info & 0x000F_FFFF;
-    match lcid_to_encoding(lcid) {
-        Ok(encoding) => encoding,
-        Err(e) => {
-            warn!(
-                "Unsupported LCID 0x{:04X} ({}), falling back to Windows-1252. Error: {}",
-                lcid, lcid, e
-            );
-            encoding_rs::WINDOWS_1252
-        }
-    }
-}
-
-fn resolve_collation(collation: SqlCollation) -> ResolvedEncoding {
+/// Resolves `collation` to its narrow encoding, or `None` when neither the
+/// UTF-8 flag, the SQL sort ID, nor the LCID names one this crate maps.
+///
+/// Split from [`resolve_collation`] so a caller with its own fallback -- the
+/// parameter serializer's `VARCHAR | CHAR | TEXT` arm keeps a Latin-1 one --
+/// can share the resolution order without inheriting the Windows-1252 default.
+pub(crate) fn try_resolve_collation(collation: SqlCollation) -> Option<ResolvedEncoding> {
     if collation.utf8() {
-        return encoding_rs::UTF_8.into();
+        return Some(encoding_rs::UTF_8.into());
     }
     if let Some(code_page) = CODE_PAGE_FROM_SORT_ID[usize::from(collation.sort_id)] {
         let encoding = match code_page {
-            437 => return ResolvedEncoding::Oem437,
-            850 => return ResolvedEncoding::Oem850,
+            437 => return Some(ResolvedEncoding::Oem437),
+            850 => return Some(ResolvedEncoding::Oem850),
             874 => encoding_rs::WINDOWS_874,
             932 => encoding_rs::SHIFT_JIS,
             936 => encoding_rs::GBK,
@@ -83,12 +72,24 @@ fn resolve_collation(collation: SqlCollation) -> ResolvedEncoding {
                     "Unsupported code page {} for SQL sort ID {}, falling back to LCID",
                     code_page, collation.sort_id
                 );
-                return lcid_encoding_or_fallback(collation).into();
+                return lcid_to_encoding(collation.info & 0x000F_FFFF)
+                    .ok()
+                    .map(Into::into);
             }
         };
-        return encoding.into();
+        return Some(encoding.into());
     }
-    lcid_encoding_or_fallback(collation).into()
+    lcid_to_encoding(collation.info & 0x000F_FFFF)
+        .ok()
+        .map(Into::into)
+}
+
+fn resolve_collation(collation: SqlCollation) -> ResolvedEncoding {
+    try_resolve_collation(collation).unwrap_or_else(|| {
+        let lcid = collation.info & 0x000F_FFFF;
+        warn!("Unsupported LCID 0x{lcid:04X} ({lcid}), falling back to Windows-1252.");
+        encoding_rs::WINDOWS_1252.into()
+    })
 }
 
 /// The Windows code page the server's `collation` selects, mirroring the value
@@ -154,12 +155,15 @@ impl NarrowEncoded {
 /// value, for a caller that must produce collation-correct wire bytes
 /// directly instead of routing through the parameter serializer -- e.g. a
 /// data-at-execution write, which streams bytes to the wire before the normal
-/// parameter-serialization path runs. Does *not* mirror that serializer's own
-/// `VARCHAR | CHAR | TEXT` arm (`tds_value_serializer.rs`): that arm still
-/// resolves only the LCID, ignoring both the UTF-8 flag and SQL sort ID.
-/// Inline string parameters can therefore encode differently from this helper
-/// and from fetched values under UTF-8 or SQL sort-ID collations. Unifying that
-/// serializer path is deferred alongside the UTF-8 discrepancy in AB#47590.
+/// parameter-serialization path runs. The serializer's own
+/// `VARCHAR | CHAR | TEXT` arm (`tds_value_serializer.rs`) resolves the same
+/// way since AB#48437, so an inline parameter, a streamed one, and a fetched
+/// value now agree under UTF-8 and SQL sort-ID collations. The one remaining
+/// difference is the fallback for a collation naming no encoding this crate
+/// maps: this helper defaults to Windows-1252, that arm keeps a Latin-1
+/// mapping. Both diverge from msodbcsql, which fails the conversion instead of
+/// falling back; recorded as entry 24 in
+/// `mssql-odbc/docs/parity-deviations.md`.
 ///
 /// A character the encoding cannot represent becomes
 /// [`NARROW_SUBSTITUTE_BYTE`] and sets [`NarrowEncoded::had_loss`]. It must not
@@ -169,7 +173,20 @@ impl NarrowEncoded {
 /// markup in place of the value, and one character would count as eight against
 /// the column's length (AB#47598).
 pub fn encode_narrow(text: &str, collation: SqlCollation) -> NarrowEncoded {
-    let (encoded, encoding_used, had_errors) = resolve_collation(collation).encode(text);
+    encode_narrow_with(text, resolve_collation(collation))
+}
+
+/// [`encode_narrow`] against an already-resolved encoding, for a caller that
+/// resolved the collation itself and must not resolve it twice.
+///
+/// Taking the resolution as an argument is what keeps the serializer's
+/// `VARCHAR | CHAR | TEXT` arm honest: that arm needs to know whether a
+/// collation resolves *before* it encodes, so it can fall back to Latin-1 when
+/// it does not. Re-deriving the encoding here would leave two resolutions that
+/// have to stay in agreement with nothing enforcing it -- the exact coupling
+/// AB#48437 was about.
+pub(crate) fn encode_narrow_with(text: &str, encoding: ResolvedEncoding) -> NarrowEncoded {
+    let (encoded, encoding_used, had_errors) = encoding.encode(text);
     if !had_errors {
         return NarrowEncoded::exact(encoded.into_owned());
     }
