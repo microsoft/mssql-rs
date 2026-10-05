@@ -26,6 +26,7 @@ from test_verify_python_wheels import write_wheel_matrix
 _ROOT = Path(__file__).parents[1]
 _PIPELINE = _ROOT / ".pipeline" / "OneBranch" / "OfficialPythonWheelsRelease.yml"
 _PYPI_PIPELINE = _ROOT / ".pipeline" / "OneBranch" / "PyPIRelease.yml"
+_SQLCMD_RELEASE_PIPELINE = _ROOT / ".pipeline" / "OneBranch" / "OfficialMssqlSqlcmdRelease.yml"
 _BUILD_STAGES = _ROOT / ".pipeline" / "OneBranch" / "stages.yml"
 _WHEEL_INSTALL_TEMPLATE = (
     _ROOT / ".pipeline" / "templates" / "test-python-wheel-installs-template.yml"
@@ -412,6 +413,159 @@ def test_pypi_publish_requires_both_stable_branches(
     )
 
     assert (result.returncode == 0) == succeeds
+
+
+def _sqlcmd_release_job(publish: bool) -> dict:
+    pipeline = expand(
+        yaml.safe_load(_SQLCMD_RELEASE_PIPELINE.read_text(encoding="utf-8")),
+        {"publishNuGet": publish},
+    )
+    stages = pipeline["extends"]["parameters"]["stages"]
+    assert len(stages) == 1 and len(stages[0]["jobs"]) == 1
+    return stages[0]["jobs"][0]
+
+
+def _sqlcmd_release_step(publish: bool, name: str) -> dict:
+    return next(
+        step for step in _sqlcmd_release_job(publish)["steps"] if step.get("displayName") == name
+    )
+
+
+@pytest.mark.parametrize("publish", [False, True])
+def test_sqlcmd_release_gates_precede_download(publish: bool) -> None:
+    source = yaml.safe_load(_SQLCMD_RELEASE_PIPELINE.read_text(encoding="utf-8"))
+    assert source["parameters"] == [
+        {
+            "name": "publishNuGet",
+            "displayName": "Publish the mssql-sqlcmd NuGet package to Azure Artifacts",
+            "type": "boolean",
+            "default": False,
+        }
+    ]
+    assert source["trigger"] == "none"
+    assert source["pr"] == "none"
+
+    job = _sqlcmd_release_job(publish)
+    assert job["variables"]["ob_nugetPublishing_enabled"] == _literal(publish)
+    steps = job["steps"]
+    names = [step.get("displayName") for step in steps]
+    downloads = [i for i, step in enumerate(steps) if step.get("download") == "officialBuild"]
+    assert len(downloads) == 1
+
+    assert names.count("Require a successful Official Build") == 1
+    assert names.index("Require a successful Official Build") < downloads[0]
+    assert steps[names.index("Require a successful Official Build")]["env"] == {
+        "OFFICIAL_BUILD_RUN_ID": "$(resources.pipeline.officialBuild.runID)",
+        "SYSTEM_ACCESSTOKEN": "$(System.AccessToken)",
+        "SYSTEM_COLLECTIONURI": "$(System.CollectionUri)",
+        "SYSTEM_TEAMPROJECTID": "$(System.TeamProjectId)",
+    }
+
+    assert names.count("Require the stable branch for publish") == int(publish)
+    assert ("Stage the mssql-sqlcmd package for publishing" in names) == publish
+    if publish:
+        stable = names.index("Require the stable branch for publish")
+        assert stable < downloads[0]
+        assert steps[stable]["env"] == {
+            "RELEASE_SOURCE_BRANCH": "$(Build.SourceBranch)",
+            "OFFICIAL_BUILD_SOURCE_BRANCH": "$(resources.pipeline.officialBuild.sourceBranch)",
+        }
+
+
+@pytest.mark.parametrize(
+    ("run_id", "status", "result", "succeeds"),
+    [
+        ("123", "completed", "succeeded", True),
+        ("123", "completed", "failed", False),
+        ("123", "completed", "partiallySucceeded", False),
+        ("123", "completed", "canceled", False),
+        ("123", "completed", "Succeeded", False),
+        ("123", "inProgress", "", False),
+        ("123", "notStarted", "", False),
+        ("not-a-number", "completed", "succeeded", False),
+        ("", "completed", "succeeded", False),
+    ],
+)
+def test_sqlcmd_release_requires_successful_official_build(
+    run_id: str, status: str, result: str, succeeds: bool
+) -> None:
+    script = _sqlcmd_release_step(False, "Require a successful Official Build")["pwsh"]
+    stub = r"""
+    function Invoke-RestMethod {
+        param($Method, $Uri, $Headers)
+        Write-Host 'Builds API called'
+        if ($Method -cne 'Get') { throw "Unexpected method: $Method" }
+        if ($Uri -cne 'https://dev.azure.com/test/project-id/_apis/build/builds/123?api-version=7.1') {
+            throw "Unexpected URI: $Uri"
+        }
+        if ($Headers.Authorization -cne 'Bearer test-token') {
+            throw "Unexpected authorization header"
+        }
+        [pscustomobject]@{
+            status = $env:MOCK_BUILD_STATUS
+            result = $env:MOCK_BUILD_RESULT
+        }
+    }
+    """
+    completed = subprocess.run(
+        ["pwsh", "-NoProfile", "-Command", stub + script],
+        capture_output=True,
+        text=True,
+        check=False,
+        env={
+            **os.environ,
+            "OFFICIAL_BUILD_RUN_ID": run_id,
+            "SYSTEM_ACCESSTOKEN": "test-token",
+            "SYSTEM_COLLECTIONURI": "https://dev.azure.com/test/",
+            "SYSTEM_TEAMPROJECTID": "project-id",
+            "MOCK_BUILD_STATUS": status,
+            "MOCK_BUILD_RESULT": result,
+        },
+    )
+
+    assert (completed.returncode == 0) == succeeds, completed.stderr
+    if succeeds:
+        assert "Selected Official Build 123 is completed and succeeded." in completed.stdout
+    elif run_id != "123":
+        assert f"Invalid Official Build run ID: {run_id}" in completed.stderr
+        assert "Builds API called" not in completed.stdout
+    else:
+        assert (
+            f"Official Build 123 is not eligible for release: status='{status}', "
+            f"result='{result}'."
+        ) in completed.stderr
+
+
+@pytest.mark.parametrize(
+    ("release_branch", "build_branch", "error"),
+    [
+        ("refs/heads/stable", "refs/heads/stable", None),
+        ("refs/heads/main", "refs/heads/stable", "allowed only from refs/heads/stable"),
+        ("refs/heads/STABLE", "refs/heads/stable", "allowed only from refs/heads/stable"),
+        ("refs/heads/stable", "refs/heads/main", "an Official Build produced from"),
+        ("refs/heads/stable", "refs/heads/STABLE", "an Official Build produced from"),
+        ("refs/heads/stable", "", "an Official Build produced from"),
+    ],
+)
+def test_sqlcmd_publish_requires_both_stable_branches(
+    release_branch: str, build_branch: str, error: str | None
+) -> None:
+    script = _sqlcmd_release_step(True, "Require the stable branch for publish")["pwsh"]
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-Command", script],
+        capture_output=True,
+        text=True,
+        check=False,
+        env={
+            **os.environ,
+            "RELEASE_SOURCE_BRANCH": release_branch,
+            "OFFICIAL_BUILD_SOURCE_BRANCH": build_branch,
+        },
+    )
+
+    assert (result.returncode == 0) == (error is None), result.stderr
+    if error:
+        assert error in result.stderr
 
 
 def prepare_pypi_release(tmp_path: Path, *, duplicate: bool = False):
