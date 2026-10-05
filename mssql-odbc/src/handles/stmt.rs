@@ -5,6 +5,7 @@ use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use tracing::error;
 
@@ -682,6 +683,23 @@ const HONOURED_INERT_STMT_ATTRS: &[SqlInteger] = &[
     odbc_types::SQL_ATTR_PARAMS_PROCESSED_PTR,
 ];
 
+/// One bit per [`INERT_STMT_ATTRS`] entry, set the first time that attribute is
+/// reported as stored without effect.
+///
+/// Latched per attribute rather than once for the whole category. The two
+/// cursor substitutions can share a single latch because they post `01S02` to
+/// the caller on every call, so suppressing a repeat loses nothing. This arm
+/// returns `SQL_SUCCESS` with no diagnostic at all, which makes the trace line
+/// the only channel that ever reports the attribute was ignored — a shared
+/// latch would silence the *first* report of every attribute after the first,
+/// and that information has no other outlet.
+static IGNORED_ATTR_REPORTED: AtomicU32 = AtomicU32::new(0);
+
+const _: () = assert!(
+    INERT_STMT_ATTRS.len() <= u32::BITS as usize,
+    "IGNORED_ATTR_REPORTED holds one bit per inert attribute"
+);
+
 /// Values for the [`INERT_STMT_ATTRS`] identifiers, positionally aligned with
 /// that table.
 ///
@@ -724,6 +742,22 @@ impl InertStmtAttrs {
     /// that is genuinely accepted-and-ignored.
     pub(crate) fn is_honoured(attribute: SqlInteger) -> bool {
         HONOURED_INERT_STMT_ATTRS.contains(&attribute)
+    }
+
+    /// Returns whether `attribute` has not yet been reported as stored without
+    /// effect in this process, claiming the report if so.
+    ///
+    /// See [`IGNORED_ATTR_REPORTED`]: each identifier reports once, so a caller
+    /// that sets several ignored attributes hears about each of them, while one
+    /// that re-sets the same attribute per statement does not repeat. An
+    /// identifier outside the table is not latched — it cannot reach this path
+    /// today, and reporting it is the safer answer if it ever does.
+    pub(crate) fn claim_ignored_report(attribute: SqlInteger) -> bool {
+        let Some(index) = Self::index_of(attribute) else {
+            return true;
+        };
+        let bit = 1u32 << index;
+        IGNORED_ATTR_REPORTED.fetch_or(bit, Ordering::Relaxed) & bit == 0
     }
 
     /// Returns the stored value, or `None` when `attribute` is not one of the
@@ -1754,6 +1788,33 @@ mod tests {
             ignored,
             INERT_STMT_ATTRS.len() - HONOURED_INERT_STMT_ATTRS.len(),
             "the honoured list must be a subset of the inert set, without duplicates"
+        );
+    }
+
+    /// The "stored without effect" report is latched per attribute, not once
+    /// for the category. That arm returns `SQL_SUCCESS` with no diagnostic, so
+    /// the trace line is the only channel saying the attribute was ignored;
+    /// sharing one latch would silence the first report of every attribute
+    /// after the first.
+    #[test]
+    fn each_ignored_attribute_is_reported_once_in_its_own_right() {
+        let first = odbc_types::SQL_ATTR_ASYNC_ENABLE;
+        let second = odbc_types::SQL_ATTR_RETRIEVE_DATA;
+        assert!(!InertStmtAttrs::is_honoured(first));
+        assert!(!InertStmtAttrs::is_honoured(second));
+
+        assert!(InertStmtAttrs::claim_ignored_report(first), "first report");
+        assert!(
+            !InertStmtAttrs::claim_ignored_report(first),
+            "a repeat of the same attribute must stay quiet"
+        );
+        assert!(
+            InertStmtAttrs::claim_ignored_report(second),
+            "a different ignored attribute must still be reported once"
+        );
+        assert!(
+            !InertStmtAttrs::claim_ignored_report(second),
+            "a repeat of the second attribute must stay quiet too"
         );
     }
 

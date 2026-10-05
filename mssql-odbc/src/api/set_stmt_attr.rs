@@ -80,8 +80,7 @@ use crate::handles::stmt::{
 };
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 
-/// First-occurrence latches for the three "accepted but not honoured" reports
-/// below.
+/// First-occurrence latches for the two cursor substitution reports below.
 ///
 /// Each of those substitutions is an unconditional property of this driver
 /// rather than a per-call event: a scrollable cursor *always* becomes
@@ -96,11 +95,12 @@ use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 /// Per process rather than per handle: statements are commonly allocated one
 /// per query, so a per-handle latch would still emit one line per statement
 /// and would not bound anything. Suppression is only about the trace stream —
-/// the caller still receives its `01S02` diagnostic, or the stored value, on
-/// every call.
+/// the caller still receives its `01S02` diagnostic on every call, which is
+/// also why one latch per arm is enough here. The inert "stored without
+/// effect" report posts no diagnostic at all, so it latches per attribute
+/// instead; see [`InertStmtAttrs::claim_ignored_report`].
 static CURSOR_TYPE_SUBSTITUTED: AtomicBool = AtomicBool::new(false);
 static CONCURRENCY_SUBSTITUTED: AtomicBool = AtomicBool::new(false);
-static INERT_ATTR_IGNORED: AtomicBool = AtomicBool::new(false);
 
 /// Returns whether this is the first time `latch` has been reached, taking it
 /// if so.
@@ -534,7 +534,7 @@ unsafe fn sql_set_stmt_attr_w_safe(
                 // false — and `warn` is visible at the default trace level.
                 if InertStmtAttrs::is_honoured(attribute) {
                     debug!(attribute, "SQLSetStmtAttrW: attribute stored");
-                } else if first_occurrence(&INERT_ATTR_IGNORED) {
+                } else if InertStmtAttrs::claim_ignored_report(attribute) {
                     warn!(
                         attribute,
                         "SQLSetStmtAttrW: attribute stored without effect"
