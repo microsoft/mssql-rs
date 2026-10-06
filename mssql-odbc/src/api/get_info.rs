@@ -3038,16 +3038,18 @@ mod tests {
             "the old session's principal must not be cached against the new one"
         );
     }
+
     /// The internal query's INFO messages must not reach the application. They
     /// belong to no application statement, so a leak would turn an unrelated
     /// `SQLExecDirect` into `SQL_SUCCESS_WITH_INFO` carrying a message the
     /// caller never provoked.
     ///
-    /// The guarantee comes from `TdsClient::begin_command`, which clears
-    /// `info_messages` at the top of every command — not from anything this
-    /// module does. That is precisely why it is worth pinning here: the
-    /// property this driver depends on lives one layer down, where a change
-    /// would not obviously implicate `SQLGetInfo`.
+    /// `database_user_name` discards them explicitly. `TdsClient::begin_command`
+    /// would also clear them at the top of this `SQLExecDirect`, so this case
+    /// alone cannot tell the two apart — and that ambiguity once led to the
+    /// discard being removed as redundant. The close-cursor case below is what
+    /// pins it: that path never starts a command, so only the explicit discard
+    /// saves it. Treat the two as a pair.
     #[test]
     fn user_name_lookup_does_not_leak_info_messages_to_the_next_statement() {
         use crate::api::exec_direct::sql_exec_direct_w;
