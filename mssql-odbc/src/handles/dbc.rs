@@ -234,17 +234,20 @@ pub(crate) struct DbcState {
     /// finishing lookup overwrite the new client with the old one and attach the
     /// old session's answer to it.
     pub(crate) session_generation: u64,
-    /// `SQL_USER_NAME`: the database principal `USER_NAME()` reported, paired
-    /// with the catalog it was read in. Populated lazily on the first
-    /// `SQLGetInfo(SQL_USER_NAME)` rather than at connect, so an application
-    /// that never asks never pays the round trip — msodbcsql's model
-    /// (`CONN_ST_REFRESH_UDT`, `sqlcinfo.cpp:1189`).
+    /// `SQL_USER_NAME`: the database principal `USER_NAME()` reported, keyed to
+    /// the session state it was read in — see [`CachedDatabaseUserName`].
+    /// Populated lazily on the first `SQLGetInfo(SQL_USER_NAME)` rather than at
+    /// connect, so an application that never asks never pays the round trip —
+    /// msodbcsql's model (`CONN_ST_REFRESH_UDT`, `sqlcinfo.cpp:1189`).
     ///
-    /// Invalidated two ways, as msodbcsql flags its refresh from two: cleared
-    /// outright when the session changes (connect/disconnect) or when
-    /// `SQL_ATTR_CURRENT_CATALOG` switches database, and otherwise caught by
-    /// the catalog key, which covers a `USE` the driver did not issue and only
-    /// learns about from the server's ENVCHANGE.
+    /// Invalidated three ways: cleared outright when the session changes
+    /// (connect/disconnect), when `SQL_ATTR_CURRENT_CATALOG` switches database,
+    /// and when `SQL_ATTR_RESET_CONNECTION` recycles the connection — the last
+    /// because a reset undoes an `EXECUTE AS` while returning the session to
+    /// the same default database the entry was keyed to, which the key alone
+    /// cannot see. Otherwise caught by the key itself, which pairs the catalog
+    /// with the client's database-change count so a `USE` the driver did not
+    /// issue — including a `USE [X]` while already in `X` — still invalidates.
     pub(crate) database_user_name: Option<CachedDatabaseUserName>,
     /// Last-known database code page for `SQL_COLLATION_SEQ`, refreshed each
     /// time an execution claims the client. Answers `SQLGetInfo` while a
@@ -293,6 +296,11 @@ pub(crate) struct CachedDatabaseUserName {
     /// only signal that the database principal changed while the database name
     /// did not — msodbcsql refreshes there because it flags on any
     /// `ENV_DATABASE` token without comparing names (`sqlctokn.cpp:2866-2882`).
+    /// It also covers a transparent reconnect, which replaces the session
+    /// without any ODBC-level clear running.
+    ///
+    /// Compared for equality only: the count is a change token, not a
+    /// watermark.
     pub(crate) database_change_count: u64,
     /// What `SQL_USER_NAME` reports for [`catalog`](Self::catalog) — usually
     /// what `USER_NAME()` returned there (`dbo` for an owner, the contained

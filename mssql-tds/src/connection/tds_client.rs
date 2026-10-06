@@ -986,7 +986,16 @@ impl TdsClient {
         session_state_tokens: &[crate::token::tokens::SessionStateToken],
     ) -> TdsResult<()> {
         self.transport = transport;
+        let database_changes = self.negotiated_settings.database_change_count;
         self.negotiated_settings = settings;
+        // A recovered session is a *different* session — new login, so the
+        // security context, impersonation and temp tables of the old one are
+        // gone — but the settings block was built fresh and starts its count at
+        // zero. Carry the old count forward and advance it, so per-database
+        // caches cannot match across the reconnect. Without this the counter
+        // moves backwards and an entry cached before the blip can match after
+        // it, which is the one direction that is unsafe.
+        self.negotiated_settings.database_change_count = database_changes.wrapping_add(1);
         self.execution_context = execution_context;
 
         // Reset per-request state
@@ -1288,7 +1297,14 @@ impl TdsClient {
 
     /// How many database-change events this session has seen: every
     /// `ENV_DATABASE` the server reported, plus every restore to login defaults
-    /// on a connection reset.
+    /// on a connection reset, plus every transparent reconnect — a recovered
+    /// session is a different session, so a per-database cache must not match
+    /// across one.
+    ///
+    /// **Compare for equality, do not treat as a watermark.** The count is
+    /// carried across a reconnect and advanced, so it does not decrease today,
+    /// but it is a change token rather than a monotonic clock and wraps on
+    /// overflow; only "same value" carries meaning.
     ///
     /// Pair this with [`database()`](Self::database) when caching per-database
     /// state. The name alone misses a `USE [X]` issued while already in `X`,
@@ -21200,6 +21216,34 @@ mod tests {
             .drain_stream()
             .await
             .expect("the recovered session must serve responses normally");
+    }
+
+    /// A recovered session is a different session — new login, so impersonation
+    /// and every other session-scoped effect is gone — but its settings block
+    /// is built fresh and starts counting at zero. The count must therefore be
+    /// carried forward and advanced, or it moves *backwards* across a reconnect
+    /// and a per-database cache entry from before the blip can match after it.
+    #[tokio::test]
+    async fn adopting_a_recovered_session_advances_the_database_change_count() {
+        let mut client = create_test_client_with_tokens(vec![done_no_more()]);
+        // Stand in for a session that has already seen some database activity.
+        client.negotiated_settings.database_change_count = 7;
+
+        client
+            .adopt_recovered_session(
+                AnyTransport::dynamic(TestTransport::with_tokens(vec![done_no_more()])),
+                crate::handler::handler_factory::create_test_negotiated_settings_internal(),
+                ExecutionContext::new(),
+                Vec::new(),
+                &[],
+            )
+            .expect("adopting a recovered session must succeed");
+
+        assert_eq!(
+            client.database_change_count(),
+            8,
+            "the recovered session must not reuse a count a cache could already hold"
+        );
     }
 
     /// Regression: the cursor RPCs consume their responses via `drain_stream`
