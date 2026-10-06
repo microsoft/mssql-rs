@@ -120,6 +120,9 @@ this does not mean every Unix application receives UTF-8.
 Use `ODBCTestUtils::Utf8ToNativeClient` to convert UTF-8 expected text into native
 **output** bytes. Do not use it for narrow parameter input (still UTF-8 until
 AB#47565), `SQL_C_WCHAR` expectations, or raw `SQL_C_BINARY` wire bytes.
+Compare native output with explicit byte lengths, not C-string semantics:
+UTF-32LE contains embedded zero bytes. Chunk helpers use sentinel-filled buffers
+to locate the final terminator without treating those embedded zeros as the end.
 
 `GetDataUtf16Test.NativeClientChar*` covers ordinary/MAX varchar and nvarchar,
 server collations different from the client, terminator-only probes, tiny

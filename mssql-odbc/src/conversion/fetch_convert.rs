@@ -59,6 +59,33 @@ impl TextOutput {
     pub(crate) fn can_copy_utf8(self, bytes: &[u8]) -> bool {
         self.encoding.is_utf8() || (self.encoding.is_ascii_compatible() && bytes.is_ascii())
     }
+
+    /// Counts loss only where encoded characters overlap the delivered byte range.
+    pub(crate) fn range_has_loss(
+        self,
+        text: &str,
+        offset: usize,
+        length: usize,
+    ) -> Result<bool, crate::api::sqlstate::DiagMsg> {
+        if length == 0 {
+            return Ok(false);
+        }
+        let end = offset.saturating_add(length);
+        let mut written = 0_usize;
+        let mut scalar = [0; 4];
+        for ch in text.chars() {
+            let encoded = self.encoding.encode(ch.encode_utf8(&mut scalar))?;
+            let next = written.saturating_add(encoded.bytes.len());
+            if next > offset && written < end && encoded.had_loss {
+                return Ok(true);
+            }
+            written = next;
+            if written >= end {
+                break;
+            }
+        }
+        Ok(false)
+    }
 }
 
 /// Decodes a character column without the panicking paths in

@@ -42,7 +42,7 @@ std::string ReadCharDataInChunks(SQLHSTMT stmt, SQLUSMALLINT col, size_t buf_siz
     std::vector<SQLCHAR> buf(buf_size, 0);
     size_t calls = 0;
     while (true) {
-        std::fill(buf.begin(), buf.end(), 0);
+        std::fill(buf.begin(), buf.end(), 0xCC);
         SQLLEN ind = 0;
         SQLRETURN rc = SQLGetData(stmt, col, SQL_C_CHAR, buf.data(),
                                   static_cast<SQLLEN>(buf.size()), &ind);
@@ -51,7 +51,13 @@ std::string ReadCharDataInChunks(SQLHSTMT stmt, SQLUSMALLINT col, size_t buf_siz
         if (rc != SQL_SUCCESS && rc != SQL_SUCCESS_WITH_INFO) {
             break;
         }
-        value.append(reinterpret_cast<const char*>(buf.data()));
+        size_t written = buf.size();
+        while (written != 0 && buf[written - 1] == 0xCC) --written;
+        if (written == 0 || buf[written - 1] != 0) {
+            ADD_FAILURE() << "SQLGetData did not write a terminator";
+            break;
+        }
+        value.append(reinterpret_cast<const char*>(buf.data()), written - 1);
         if (rc == SQL_SUCCESS) {
             if (final_ind != nullptr) {
                 *final_ind = ind;
@@ -944,8 +950,10 @@ TEST_F(GetDataUtf16Test, Issue627FittingMaxCharReadCompletesImmediately) {
 
 TEST(NativeClientEncodingTest, ConvertsValidUtf8AndPreservesEmbeddedNul) {
     EXPECT_EQ("", ODBCTestUtils::Utf8ToNativeClient(""));
-    EXPECT_EQ("ASCII", ODBCTestUtils::Utf8ToNativeClient("ASCII"));
-    EXPECT_EQ(std::string("A\0B", 3),
+    const bool utf32 = ODBCTestUtils::Utf8ToNativeClient("A") == std::string("A\0\0\0", 4);
+    EXPECT_EQ(utf32 ? std::string("A\0\0\0S\0\0\0C\0\0\0I\0\0\0I\0\0\0", 20) : "ASCII",
+              ODBCTestUtils::Utf8ToNativeClient("ASCII"));
+    EXPECT_EQ(utf32 ? std::string("A\0\0\0\0\0\0\0B\0\0\0", 12) : std::string("A\0B", 3),
               ODBCTestUtils::Utf8ToNativeClient(std::string("A\0B", 3)));
     EXPECT_THROW(ODBCTestUtils::Utf8ToNativeClient("\xC3"), std::runtime_error);
     EXPECT_THROW(ODBCTestUtils::Utf8ToNativeClient("\xED\xA0\x80"), std::runtime_error);
@@ -1071,7 +1079,7 @@ TEST_F(GetDataUtf16Test, NativeClientCharLossFitsWithoutWarning) {
             EXPECT_EQ(SQL_SUCCESS,
                       SQLGetData(stmt_, 1, SQL_C_CHAR, output, sizeof(output), &indicator));
             EXPECT_EQ("", StmtDiagState());
-            EXPECT_EQ(expected, std::string(reinterpret_cast<const char*>(output)));
+            EXPECT_EQ(expected, std::string(reinterpret_cast<const char*>(output), expected.size()));
             EXPECT_EQ(static_cast<SQLLEN>(expected.size()), indicator);
             SQLWCHAR following[3] = {};
             ASSERT_EQ(SQL_SUCCESS, SQLGetData(stmt_, 2, SQL_C_WCHAR,
@@ -1125,7 +1133,7 @@ TEST_F(GetDataUtf16Test, NativeClientCharLossTruncationHonorsWarningFlag) {
             SQLCHAR rest[32] = {};
             ASSERT_EQ(SQL_SUCCESS, SQLGetData(stmt_, 1, SQL_C_CHAR, rest, sizeof(rest), &indicator));
             EXPECT_EQ("", StmtDiagState());
-            EXPECT_EQ(expected.substr(1), std::string(reinterpret_cast<const char*>(rest)));
+            EXPECT_EQ(expected.substr(1), std::string(reinterpret_cast<const char*>(rest), expected.size() - 1));
             EXPECT_EQ(static_cast<SQLLEN>(expected.size() - 1), indicator);
             EXPECT_EQ(SQL_NO_DATA, SQLGetData(stmt_, 1, SQL_C_CHAR, rest, sizeof(rest), &indicator));
             SQLINTEGER following = -1;
@@ -2015,20 +2023,25 @@ TEST_F(GetDataUtf16Test, PlpTargetSwitchCompletesSurrogateAfterPriorOutput) {
 }
 
 TEST_F(GetDataUtf16Test, PlpTargetSwitchCompletesDbcsAfterPriorOutput) {
-    const auto expected = ODBCTestUtils::Utf8ToNativeClient("A\xCE\xB1") + std::string(8, 'B');
+    const auto expected = ODBCTestUtils::Utf8ToNativeClient("A\xCE\xB1" "BBBBBBBB");
     ASSERT_SQL_OK(
         ExecDirect("SELECT CAST((N'A' + NCHAR(0x03B1) + REPLICATE(N'B', 8)) "
                    "COLLATE Chinese_PRC_CI_AS AS varchar(max)), 42"),
         SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
-    SQLCHAR first[7] = {};
+    SQLCHAR first[7];
+    std::fill(std::begin(first), std::end(first), 0xCC);
     SQLLEN ind = 0;
     ASSERT_EQ(SQL_SUCCESS_WITH_INFO,
               SQLGetData(stmt_, 1, SQL_C_CHAR, first, sizeof(first), &ind));
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01004");
     EXPECT_EQ(static_cast<SQLLEN>(expected.size()), ind);
-    std::string delivered(reinterpret_cast<const char*>(first));
-    SQLCHAR rest[32] = {};
+    size_t written = sizeof(first);
+    while (written != 0 && first[written - 1] == 0xCC) --written;
+    ASSERT_GT(written, 0u);
+    ASSERT_EQ(0, first[written - 1]);
+    std::string delivered(reinterpret_cast<const char*>(first), written - 1);
+    SQLCHAR rest[64] = {};
     ASSERT_EQ(SQL_SUCCESS, SQLGetData(stmt_, 1, SQL_C_BINARY, rest, sizeof(rest), &ind));
     ASSERT_GE(ind, 0);
     ASSERT_LE(ind, static_cast<SQLLEN>(sizeof(rest)));

@@ -201,6 +201,20 @@ msodbcsql build is measured.
    stops at 6. `ABoundUtf8CollationVarcharMaxTruncatesOnACharacterBoundary`
    splits per-leg on `ODBC_TEST_TARGET` rather than skipping, so the shared part
    — both truncate, report `01004`, and deliver a prefix — stays measured.
+
+   AB#47564 extends this driver's whole-character policy to native client
+   encodings for bound `SQL_C_CHAR` output from `nvarchar(max)` and JSON.
+   `ABoundNvarcharMaxTruncatesOnACharacterBoundary` and
+   `ABoundJsonTruncatesOnACharacterBoundary` compute the character width with
+   `Utf8ToNativeClient` and compare whole-character output against the reference
+   driver's byte-capacity prefix. This preserves valid client text rather than
+   introducing encoding-dependent partial characters. Evidence is limited to
+   the existing UTF-8 measurement above and the standard-locale comparison runs;
+   it does not establish retail behavior for every supported multibyte locale.
+   A non-UTF-8 multibyte-locale comparison recording `SQL_DRIVER_VER`, client
+   codeset, build, bytes, and indicator is still needed. Track that measurement
+   and explicit approval of the generalized deviation in AB#47564 / AB#47767;
+   neither is implied by the generalized test expectation.
 9. A bound `time` / `datetimeoffset` column strides by
     `sizeof(SQL_SS_TIME2_STRUCT)` (12) and
     `sizeof(SQL_SS_TIMESTAMPOFFSET_STRUCT)` (20) rather than by `BufferLength`.

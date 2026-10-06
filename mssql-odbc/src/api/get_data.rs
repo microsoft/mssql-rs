@@ -1474,7 +1474,17 @@ fn write_captured_column(
             strlen_or_ind_ptr,
         );
         if encoded.had_loss && stmt_state.text_output.warn_on_loss && rc == SQL_SUCCESS_WITH_INFO {
-            post_diag(stmt_state, WARN_CODE_PAGE_CONVERSION_LOSS);
+            match stmt_state
+                .text_output
+                .range_has_loss(&as_text, offset, consumed)
+            {
+                Ok(true) => post_diag(stmt_state, WARN_CODE_PAGE_CONVERSION_LOSS),
+                Ok(false) => {}
+                Err(diag) => {
+                    post_diag(stmt_state, diag);
+                    return SQL_ERROR;
+                }
+            }
         }
         (rc, consumed, bytes.len())
     };
@@ -5352,6 +5362,97 @@ mod tests {
             );
             assert_eq!(indicator, (expected.len() - offset) as SqlLen);
             assert_eq!(output, [byte, 0, 0xcc]);
+        }
+    }
+
+    #[test]
+    fn client_code_page_chunk_warnings_only_cover_delivered_loss() {
+        for columns in [0, 2, 8] {
+            for warn in [false, true] {
+                for text in ["ABC你DEF", "A😀BC"] {
+                    let h = TestHandles::with_env_dbc_stmt();
+                    client_code_page(&h, 1252, warn);
+                    let source = SqlString::new(utf16le(text), EncodingType::Utf16);
+                    if columns != 0 {
+                        stmt_with_buffered_string(&h, source);
+                        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+                        let mut state = stmt.inner.lock().unwrap();
+                        state.column_metadata = int_columns(columns);
+                        state
+                            .buffered_get_data_row
+                            .as_mut()
+                            .unwrap()
+                            .values
+                            .resize(columns, None);
+                    } else {
+                        stmt_with_captured(&h, ColumnValues::String(source));
+                    }
+                    let mut probe = [0xcc; 2];
+                    let mut probe_length = -99;
+                    assert_eq!(
+                        unsafe {
+                            sql_get_data(
+                                h.stmt,
+                                1,
+                                SQL_C_CHAR,
+                                probe.as_mut_ptr().cast(),
+                                1,
+                                &mut probe_length,
+                            )
+                        },
+                        SQL_SUCCESS_WITH_INFO
+                    );
+                    assert_eq!(probe, [0, 0xcc]);
+                    let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+                    assert_eq!(stmt.inner.lock().unwrap().diag_records.len(), 1);
+                    let encoding = ClientEncoding::for_code_page(1252).unwrap();
+                    let expected = encoding.encode(text).unwrap();
+                    for (offset, &byte) in expected.bytes.iter().enumerate() {
+                        let mut output = [0xcc; 3];
+                        let mut indicator = -99;
+                        let truncated = offset + 1 < expected.bytes.len();
+                        assert_eq!(
+                            unsafe {
+                                sql_get_data(
+                                    h.stmt,
+                                    1,
+                                    SQL_C_CHAR,
+                                    output.as_mut_ptr().cast(),
+                                    2,
+                                    &mut indicator,
+                                )
+                            },
+                            if truncated {
+                                SQL_SUCCESS_WITH_INFO
+                            } else {
+                                SQL_SUCCESS
+                            }
+                        );
+                        assert_eq!(output, [byte, 0, 0xcc]);
+                        assert_eq!(
+                            indicator,
+                            SqlLen::try_from(expected.bytes.len() - offset).unwrap()
+                        );
+                        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+                        let state = stmt.inner.lock().unwrap();
+                        let losses = state
+                            .diag_records
+                            .iter()
+                            .filter(|d| d.sql_state == WARN_CODE_PAGE_CONVERSION_LOSS.state)
+                            .count();
+                        let expected_loss = warn && truncated && byte == b'?';
+                        assert_eq!(
+                            losses,
+                            usize::from(expected_loss),
+                            "{text:?} at byte {offset}"
+                        );
+                        assert_eq!(
+                            state.diag_records.len(),
+                            usize::from(truncated) + usize::from(expected_loss)
+                        );
+                    }
+                }
+            }
         }
     }
 

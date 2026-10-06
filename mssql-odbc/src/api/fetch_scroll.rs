@@ -1811,30 +1811,6 @@ fn whole_pair_capacity(capacity: usize, pair_width: usize) -> usize {
     capacity / pair_width * pair_width
 }
 
-/// A truncated tail was not delivered; only substitutions in the delivered
-/// prefix should generate the optional loss warning.
-fn client_prefix_loss(
-    text: &str,
-    capacity: usize,
-    text_output: TextOutput,
-) -> Result<bool, DiagMsg> {
-    let mut written = 0;
-    let mut loss = false;
-    let mut scalar = [0; 4];
-    for ch in text.chars() {
-        let encoded = text_output.encoding.encode(ch.encode_utf8(&mut scalar))?;
-        if encoded.bytes.len() > capacity.saturating_sub(written) {
-            // A supplementary scalar may become two substitution bytes. Even
-            // one delivered replacement byte is a lossy target character.
-            loss |= written < capacity && encoded.had_loss;
-            break;
-        }
-        written += encoded.bytes.len();
-        loss |= encoded.had_loss;
-    }
-    Ok(loss)
-}
-
 /// # Safety
 /// `slot` is null or writable for `capacity` bytes, and `length` is null or
 /// writable for one `SqlLen`.
@@ -1864,7 +1840,7 @@ unsafe fn deliver_client_text(
     let truncated = take < encoded.bytes.len();
     let loss = if text_output.warn_on_loss && encoded.had_loss {
         if truncated {
-            match client_prefix_loss(text, take, text_output) {
+            match text_output.range_has_loss(text, 0, take) {
                 Ok(loss) => loss,
                 Err(diag) => return RowOutcome::Error(diag.into()),
             }
@@ -2456,7 +2432,7 @@ unsafe fn deliver_bound_client_plp(
                 truncated = take < encoded.bytes.len();
                 if text_output.warn_on_loss && encoded.had_loss {
                     loss |= if truncated {
-                        client_prefix_loss(text, take, text_output)?
+                        text_output.range_has_loss(text, 0, take)?
                     } else {
                         true
                     };
