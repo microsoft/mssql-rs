@@ -345,8 +345,36 @@ mod tests {
             sub_type: EnvChangeTokenSubType::Database,
             change_type: EnvChangeContainer::from(("OldDB".to_string(), "NewDB".to_string())),
         };
+        let before = ns.database_change_count;
         ctx.capture_change_property(&change_token, &mut ns).unwrap();
         assert_eq!(ns.database, "NewDB");
+        assert_eq!(ns.database_change_count, before.wrapping_add(1));
+    }
+
+    /// `USE [X]` while already in `X` reports an `ENV_DATABASE` whose old and
+    /// new names are equal. The name alone therefore cannot tell a consumer
+    /// anything changed, which is why the count advances regardless — msodbcsql
+    /// flags its `USER_NAME()` refresh on any such token without comparing
+    /// names (`sqlctokn.cpp:2866-2882`), and combined with an `EXECUTE AS` this
+    /// is the only signal that the database principal moved.
+    #[test]
+    fn test_capture_database_change_counts_a_same_name_event() {
+        let mut ctx = ExecutionContext::new();
+        let mut ns = new_ns();
+        let change_token = EnvChangeToken {
+            sub_type: EnvChangeTokenSubType::Database,
+            change_type: EnvChangeContainer::from(("master".to_string(), "master".to_string())),
+        };
+        let before = ns.database_change_count;
+
+        ctx.capture_change_property(&change_token, &mut ns).unwrap();
+
+        assert_eq!(ns.database, "master", "the name is unchanged, as expected");
+        assert_eq!(
+            ns.database_change_count,
+            before.wrapping_add(1),
+            "a same-name database change must still be counted; the name cannot carry this"
+        );
     }
 
     #[test]

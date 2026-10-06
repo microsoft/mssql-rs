@@ -783,6 +783,26 @@ mod tests {
         }
     }
 
+    /// A connection reset returns the session to its login database, which is
+    /// usually the database already in use — so the name carries no signal and
+    /// a per-database cache would survive a reset that replaced the session.
+    /// Counted like a server-reported change for that reason.
+    #[test]
+    fn restoring_login_defaults_counts_as_a_database_change() {
+        let mut ns = create_test_negotiated_settings_internal();
+        ns.database = "master".to_string();
+        let before = ns.database_change_count;
+
+        ns.restore_login_defaults();
+
+        assert_eq!(ns.database, "master", "the login default is the same name");
+        assert_eq!(
+            ns.database_change_count,
+            before.wrapping_add(1),
+            "the session's database was replaced, so per-database state must not survive"
+        );
+    }
+
     #[test]
     fn server_name_comes_from_the_first_login_message_that_carries_one() {
         let messages = vec![info_message(Some("SQLPROD01")), info_message(Some("OTHER"))];
