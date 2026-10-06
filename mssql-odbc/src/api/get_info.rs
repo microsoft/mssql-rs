@@ -1498,10 +1498,20 @@ async fn fetch_database_user_name(
     {
         // `execute` sends the batch and then reads to the first result
         // boundary, so this covers both "never reached the server" and "was
-        // accepted but the first read failed". Either way there is normally no
-        // batch to close; a partially-written one is drained rather than left
-        // open. Reported as not-executed so the next call retries — see
-        // `LookupFailure` for why that is the safe direction to err in.
+        // accepted but the first read failed". Reported as not-executed so the
+        // next call retries — see `LookupFailure` for why that is the safe
+        // direction to err in.
+        //
+        // The close is reachable but not by a batch this call opened:
+        // `begin_command` does not touch `has_open_batch`, so after a failed
+        // `execute` the flag still holds whatever it had on entry. It is `true`
+        // only when the claimed client already had a batch open —
+        // `try_claim_idle_dbc_client` gates on `active_stmt`, not on batch
+        // state, so that is not excluded. Closing it there is what keeps the
+        // INVARIANT below true for the one caller that could otherwise inherit
+        // someone else's open batch. Not unit-tested: reaching it needs a
+        // client handed over mid-batch *and* a failing `execute`, which the
+        // mock server cannot currently stage.
         if client.has_open_batch() {
             let _ = client.close_query().await;
         }
@@ -3232,6 +3242,48 @@ mod tests {
             state.database_user_name.is_none(),
             "the old session's principal must not be cached against the new one"
         );
+    }
+
+    /// A plain `SQLDisconnect` with **no** reconnect behind it is the case the
+    /// generation check cannot see: `sql_disconnect_safe` clears the client and
+    /// marks the DBC `Disconnected` without touching `session_generation`
+    /// (`do_connect` is its only writer), so the generation still matches on the
+    /// way back. Without the `connection_state` half of the guard the lookup
+    /// would install a live `TdsClient` on a handle the application has already
+    /// disconnected — leaving the session open until the next connect or
+    /// `SQLFreeHandle`, and the DBC `Disconnected` with `client == Some(..)`.
+    #[test]
+    fn user_name_discards_its_answer_when_the_handle_was_disconnected() {
+        use crate::api::disconnect::sql_disconnect;
+        use crate::api::txn::try_claim_idle_dbc_client;
+
+        let (h, _server) = user_name_fixture(user_name_row("dbo"));
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+
+        let (client, generation, _) =
+            try_claim_idle_dbc_client(dbc).expect("fixture leaves the connection idle");
+        assert_eq!(unsafe { sql_disconnect(h.dbc) }, SQL_SUCCESS);
+
+        // The generation is deliberately unchanged — a disconnect alone does
+        // not advance it, which is exactly why this half of the guard exists.
+        let reported = super::publish_lookup(
+            dbc,
+            client,
+            generation,
+            "master".to_string(),
+            0,
+            Some("dbo".to_string()),
+            "stale".to_string(),
+        );
+
+        assert_eq!(reported, "", "a disconnected handle reports no principal");
+        let state = dbc.inner.lock().unwrap();
+        assert!(
+            state.client.is_none(),
+            "the lookup must not resurrect a client on a disconnected handle"
+        );
+        assert_eq!(state.connection_state, ConnectionState::Disconnected);
+        assert!(state.database_user_name.is_none());
     }
 
     /// The internal query's INFO messages must not reach the application. They
