@@ -108,10 +108,10 @@ pub(super) fn claim_dbc_client(dbc: &DbcHandle, op: &str) -> Result<TdsClient, S
 ///
 /// Returns `None` — with no side effects and no diagnostic — when the DBC is
 /// not connected, a statement holds the connection, or the client is already
-/// claimed. On success the connection's current
-/// [`session_generation`](crate::handles::dbc::DbcState::session_generation) is
-/// returned with the client, so the caller can tell on the way back whether the
-/// session it queried is still the one installed on the handle.
+/// claimed. On success the cached `USER_NAME()` entry is returned **with** the
+/// client, read under the same lock: the caller uses it as the value to report
+/// if the lookup yields nothing, and reading it separately would let a session
+/// change land in between and attach one session's principal to another.
 ///
 /// The claim leaves `active_stmt` alone, because an internal query has no
 /// statement handle to attribute it to. A concurrent execution that lands in
@@ -121,13 +121,21 @@ pub(super) fn claim_dbc_client(dbc: &DbcHandle, op: &str) -> Result<TdsClient, S
 /// quality, not contract. [`claim_dbc_client`] has the same window for commit,
 /// rollback, and isolation changes; closing it needs a connection-level claim
 /// marker that both would share.
-pub(super) fn try_claim_idle_dbc_client(dbc: &DbcHandle) -> Option<(TdsClient, u64)> {
+pub(super) fn try_claim_idle_dbc_client(dbc: &DbcHandle) -> Option<(TdsClient, u64, String)> {
     let mut state = dbc.inner.lock().ok()?;
     if state.connection_state != ConnectionState::Connected || state.active_stmt.is_some() {
         return None;
     }
     let generation = state.session_generation;
-    state.client.take().map(|client| (client, generation))
+    let cached = state
+        .database_user_name
+        .as_ref()
+        .map(|entry| entry.value.clone())
+        .unwrap_or_default();
+    state
+        .client
+        .take()
+        .map(|client| (client, generation, cached))
 }
 
 /// Returns a client claimed by [`claim_dbc_client`] or

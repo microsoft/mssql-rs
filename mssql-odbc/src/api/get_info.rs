@@ -1272,7 +1272,7 @@ fn database_user_name(dbc: &DbcHandle) -> String {
     // leaves `DBUserName` untouched on a failed refresh and keeps answering
     // from it, retrying on the next call because `ExecImmediate` returning
     // `SQL_ERROR` skips the `CONN_ST_REFRESH_UDT` clear (`sqlccmd.cpp:10387`).
-    let (fallback, timeout_secs, snapshot_generation) = {
+    let (busy_fallback, timeout_secs) = {
         let Ok(state) = dbc.inner.lock() else {
             error!("SQLGetInfoW(SQL_USER_NAME): dbc mutex poisoned");
             return String::new();
@@ -1308,28 +1308,20 @@ fn database_user_name(dbc: &DbcHandle) -> String {
         // There is no statement here to take `SQL_ATTR_QUERY_TIMEOUT` from:
         // `SQLGetInfo` is a connection-level call, and msodbcsql reaches for
         // the connection timeout for exactly that reason.
-        (stale, state.connection_timeout, state.session_generation)
+        (stale, state.connection_timeout)
     };
 
-    let Some((mut client, generation)) = try_claim_idle_dbc_client(dbc) else {
+    // The claim returns the cache entry with the client, read under its own
+    // lock. That is what keeps the value this call may report — and, for a NULL
+    // row or a post-execution failure, re-cache — tied to the session it is
+    // about: a disconnect and a fresh connect can both complete between the
+    // snapshot above and this claim, and `publish_lookup`'s check cannot catch
+    // that, since by then the claim has already read the new session's
+    // generation. Reading it here means there is no window to catch: a fresh
+    // connect clears the entry, so the claim simply finds nothing.
+    let Some((mut client, generation, fallback)) = try_claim_idle_dbc_client(dbc) else {
         debug!("SQLGetInfoW(SQL_USER_NAME): connection is busy; reporting the cached value");
-        return fallback;
-    };
-    // The snapshot above and this claim are separate critical sections, so a
-    // disconnect and a fresh connect can both complete in between. `fallback`
-    // then describes a principal from a session this one has nothing to do
-    // with, and `publish_lookup`'s generation check cannot catch it — that
-    // compares the claim against the publish, and by here the claim has already
-    // read the *new* session's generation. Carrying it across would report, and
-    // on a NULL row or a post-execution failure cache, the old connection's
-    // principal against the new session.
-    let fallback = if generation == snapshot_generation {
-        fallback
-    } else {
-        debug!(
-            "SQLGetInfoW(SQL_USER_NAME): session replaced before the claim; dropping the cached value"
-        );
-        String::new()
+        return busy_fallback;
     };
     let outcome = dbc
         .runtime
