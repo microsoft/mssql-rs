@@ -96,7 +96,64 @@ pub(super) fn claim_dbc_client(dbc: &DbcHandle, op: &str) -> Result<TdsClient, S
     Ok(client)
 }
 
-/// Returns a client claimed by [`claim_dbc_client`].
+/// Claims the connection's TDS client for an **internal** connection-scoped
+/// query, without posting any diagnostic.
+///
+/// Unlike [`claim_dbc_client`], a refusal here is not an application-visible
+/// error: the caller must fall back to whatever it already knows. That mirrors
+/// msodbcsql's `RefreshShilohUDTCache` (`sqlccmd.cpp:10337`), which returns
+/// `void` — when the connection is busy it spawns a second connection, and if
+/// even that fails it simply leaves the cached value alone rather than failing
+/// the `SQLGetInfo` that triggered it.
+///
+/// Returns `None` — with no side effects and no diagnostic — when the DBC is
+/// not connected, a statement holds the connection, or the client is already
+/// claimed. On success the cached `USER_NAME()` entry is returned **with** the
+/// client, read under the same lock: the caller uses it as the value to report
+/// if the lookup yields nothing, and reading it separately would let a session
+/// change land in between and attach one session's principal to another.
+///
+/// The claim leaves `active_stmt` alone, because an internal query has no
+/// statement handle to attribute it to. A concurrent execution that lands in
+/// the in-flight window therefore passes
+/// [`super::exec_common::claim_connection`]'s busy check and reports
+/// `ERR_NO_ACTIVE_TDS_CLIENT` instead of `ERR_CONNECTION_BUSY`
+/// (`exec_common.rs:253-275`) — both `HY000`, so the difference is message
+/// quality, not contract. [`claim_dbc_client`] has the same window for commit,
+/// rollback, and isolation changes; closing it needs a connection-level claim
+/// marker that both would share.
+pub(super) fn try_claim_idle_dbc_client(dbc: &DbcHandle) -> Option<(TdsClient, u64, String)> {
+    let mut state = dbc.inner.lock().ok()?;
+    if state.connection_state != ConnectionState::Connected || state.active_stmt.is_some() {
+        return None;
+    }
+    let generation = state.session_generation;
+    let cached = state
+        .database_user_name
+        .as_ref()
+        .map(|entry| entry.value.clone())
+        .unwrap_or_default();
+    // Snapshot the collation before the client leaves the DBC, exactly as
+    // `claim_connection` does: `SQL_COLLATION_SEQ` reads the live client when it
+    // is present and these fields when it is not, so a concurrent read during
+    // the lookup would otherwise report the empty string for a connection that
+    // answers normally on either side of it.
+    let cache = state
+        .client
+        .as_ref()
+        .map(super::get_info::collation_cache_inputs);
+    if let Some((code_page, char_set)) = cache {
+        state.last_collation_code_page = code_page;
+        state.last_char_set = char_set;
+    }
+    state
+        .client
+        .take()
+        .map(|client| (client, generation, cached))
+}
+
+/// Returns a client claimed by [`claim_dbc_client`] or
+/// [`try_claim_idle_dbc_client`].
 ///
 /// If the DBC mutex is poisoned the client cannot be stored and is dropped, so
 /// the connection is marked disconnected rather than left as `Connected` with
@@ -451,9 +508,17 @@ pub(super) fn reset_connection(dbc: &DbcHandle, value: u64) -> SqlReturn {
     // leaves no window in which another thread's checkout SET could still
     // short-circuit. Arming may yet fail below, in which case the flag costs at
     // most one redundant SET on a connection the pool is about to discard.
+    //
+    // The cached database user goes with it, for the same reason and one more:
+    // `release_dbc_client` below makes the client claimable again a few lines
+    // before the post-arm block runs, so a clear deferred to there would leave a
+    // window in which `SQL_USER_NAME` still answers from this borrower's
+    // principal. Clearing here also covers the rollback-failure path, which
+    // returns before that block is reached.
     let started = match dbc.inner.lock() {
         Ok(mut state) => {
             state.server_isolation_unknown = true;
+            state.database_user_name = None;
             state.local_tran_started
         }
         Err(_) => {
@@ -527,6 +592,14 @@ pub(super) fn reset_connection(dbc: &DbcHandle, value: u64) -> SqlReturn {
     // The reset is armed; the server discards the transaction before it
     // processes the carrying request, so the driver's view catches up here.
     state.local_tran_started = false;
+    // The reset restores the login's defaults — security context included, so
+    // an `EXECUTE AS` this borrower ran is undone — but the cached principal
+    // would survive it. The catalog key cannot catch that: the reset returns
+    // the session to the login's default database, which is usually the one
+    // the entry was already keyed to, so the next borrower would get a cache
+    // hit carrying the previous borrower's `USER_NAME()`. Re-asserted here with
+    // the isolation flag; the clear that closes the window is the early one.
+    state.database_user_name = None;
     // Re-assert the invalidation under the lock that records the completed arm,
     // and bump the generation. The early set above narrows the window before
     // arming; this pair is what makes the invalidation stick afterwards. A
@@ -1273,6 +1346,11 @@ mod tests {
             // No tokens: the rollback round trip runs dry and fails.
             state.client = Some(tds_client_from_tokens_in_transaction(vec![], 0xDEAD_BEEF));
             state.local_tran_started = true;
+            state.database_user_name = Some(crate::handles::dbc::CachedDatabaseUserName {
+                catalog: "master".to_string(),
+                database_change_count: 0,
+                value: "impersonated_user".to_string(),
+            });
         }
 
         assert_eq!(reset_connection(dbc, 1), SQL_ERROR);
@@ -1286,6 +1364,11 @@ mod tests {
             state.server_isolation_unknown,
             "the connection is being recycled, so the cached isolation level is no longer \
              evidence about the server even though arming failed"
+        );
+        assert!(
+            state.database_user_name.is_none(),
+            "this path returns before the post-arm block, so only the early clear can have \
+             dropped the principal — and it must, since the client was handed back"
         );
     }
 
@@ -1366,6 +1449,39 @@ mod tests {
         assert!(
             !client.is_connection_dead(),
             "arming must not poison a healthy connection"
+        );
+    }
+
+    #[test]
+    fn reset_connection_drops_the_cached_database_user() {
+        // A pooled connection is the case this protects: one borrower can
+        // `EXECUTE AS USER` and prime `SQL_USER_NAME`, and the reset undoes the
+        // impersonation without touching the cache. The catalog key cannot
+        // notice, because the reset returns the session to the same default
+        // database the entry was keyed to — so the next borrower would read the
+        // previous borrower's principal.
+        use crate::handles::dbc::CachedDatabaseUserName;
+        use crate::test_support::TestHandles;
+        use mssql_tds::test_client_support::tds_client_from_tokens;
+
+        let h = TestHandles::with_env_dbc();
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        {
+            let mut state = dbc.inner.lock().unwrap();
+            state.client = Some(tds_client_from_tokens(vec![]));
+            state.database_user_name = Some(CachedDatabaseUserName {
+                catalog: "master".to_string(),
+                database_change_count: 0,
+                value: "impersonated_user".to_string(),
+            });
+        }
+
+        assert_eq!(reset_connection(dbc, 1), SQL_SUCCESS);
+
+        assert!(
+            dbc.inner.lock().unwrap().database_user_name.is_none(),
+            "the next borrower must not inherit this session's principal"
         );
     }
 
