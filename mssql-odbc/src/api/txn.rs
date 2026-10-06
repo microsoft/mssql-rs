@@ -562,6 +562,15 @@ pub(super) fn reset_connection(dbc: &DbcHandle, value: u64) -> SqlReturn {
     // The reset is armed; the server discards the transaction before it
     // processes the carrying request, so the driver's view catches up here.
     state.local_tran_started = false;
+    // The reset restores the login's defaults — security context included, so
+    // an `EXECUTE AS` this borrower ran is undone — but the cached principal
+    // would survive it. The catalog key cannot catch that: the reset returns
+    // the session to the login's default database, which is usually the one
+    // the entry was already keyed to, so the next borrower would get a cache
+    // hit carrying the previous borrower's `USER_NAME()`. Dropped here for the
+    // same reason connect and disconnect drop it — the session the name
+    // belonged to is gone.
+    state.database_user_name = None;
     // Re-assert the invalidation under the lock that records the completed arm,
     // and bump the generation. The early set above narrows the window before
     // arming; this pair is what makes the invalidation stick afterwards. A
@@ -1401,6 +1410,38 @@ mod tests {
         assert!(
             !client.is_connection_dead(),
             "arming must not poison a healthy connection"
+        );
+    }
+
+    #[test]
+    fn reset_connection_drops_the_cached_database_user() {
+        // A pooled connection is the case this protects: one borrower can
+        // `EXECUTE AS USER` and prime `SQL_USER_NAME`, and the reset undoes the
+        // impersonation without touching the cache. The catalog key cannot
+        // notice, because the reset returns the session to the same default
+        // database the entry was keyed to — so the next borrower would read the
+        // previous borrower's principal.
+        use crate::handles::dbc::CachedDatabaseUserName;
+        use crate::test_support::TestHandles;
+        use mssql_tds::test_client_support::tds_client_from_tokens;
+
+        let h = TestHandles::with_env_dbc();
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        {
+            let mut state = dbc.inner.lock().unwrap();
+            state.client = Some(tds_client_from_tokens(vec![]));
+            state.database_user_name = Some(CachedDatabaseUserName {
+                catalog: "master".to_string(),
+                value: "impersonated_user".to_string(),
+            });
+        }
+
+        assert_eq!(reset_connection(dbc, 1), SQL_SUCCESS);
+
+        assert!(
+            dbc.inner.lock().unwrap().database_user_name.is_none(),
+            "the next borrower must not inherit this session's principal"
         );
     }
 
