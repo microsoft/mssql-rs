@@ -2860,15 +2860,26 @@ mod tests {
         );
         assert_eq!(diag_states(h.dbc), vec!["HY090"]);
 
-        // Observe the records from another thread while the lookup is blocked
-        // on the server: they must already be gone.
+        // Synchronize on the lookup actually being in flight rather than on a
+        // fixed delay. The client leaves the DBC only in `database_user_name`,
+        // which runs after the first critical section above — so observing
+        // `client == None` proves the clear either happened or was skipped,
+        // never merely that the main thread had not reached it yet.
         let probe = std::thread::spawn({
             let dbc_ptr = h.dbc as usize;
             move || {
-                std::thread::sleep(Duration::from_millis(400));
                 let dbc = unsafe { handle_from_raw::<DbcHandle>(dbc_ptr as SqlHandle) };
-                let state = dbc.inner.lock().unwrap();
-                state.diag_records.len()
+                let deadline = std::time::Instant::now() + Duration::from_secs(30);
+                while std::time::Instant::now() < deadline {
+                    {
+                        let state = dbc.inner.lock().unwrap();
+                        if state.client.is_none() {
+                            return Some(state.diag_records.len());
+                        }
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                None
             }
         });
 
@@ -2876,7 +2887,7 @@ mod tests {
         assert_eq!(rc, SQL_SUCCESS);
         assert_eq!(
             probe.join().unwrap(),
-            0,
+            Some(0),
             "the previous call's diagnostics must be cleared before the lookup, \
              not after it returns"
         );

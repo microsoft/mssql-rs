@@ -289,6 +289,14 @@ TEST_F(GetInfoLiveTest, ServerNameIsReportedAndStable) {
 // connection authenticated as. The two differ for contained users, for schemas
 // owned via AUTHORIZATION, and for every integrated or Entra login, where the
 // connection string carries no UID at all.
+//
+// Benefits-from-mock-tds: the repeated read below can only show the value does
+// not drift; it cannot see whether the second SQLGetInfo went back to the
+// server, because issuing SELECT USER_NAME() twice reports the same name. A
+// byte-level mock TDS server would let this assert that exactly one request was
+// sent for two reads. Pinned meanwhile by the Rust unit test
+// `user_name_is_queried_lazily_then_served_from_the_cache`, which re-registers a
+// different answer and proves the second read never reaches the server.
 TEST_F(GetInfoLiveTest, UserNameIsReported) {
     SQLRETURN rc = SQL_ERROR;
     SQLSMALLINT len = -1;
