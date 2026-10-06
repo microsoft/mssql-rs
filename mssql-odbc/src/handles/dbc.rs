@@ -277,16 +277,23 @@ pub(crate) struct ConnectionIdentity {
     pub(crate) server_name: String,
 }
 
-/// A [`DbcState::database_user_name`] entry: the `USER_NAME()` answer and the
-/// catalog it is only valid for.
+/// A [`DbcState::database_user_name`] entry: the value `SQL_USER_NAME` reports
+/// for a catalog, and the catalog it is only valid for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CachedDatabaseUserName {
     /// The database the lookup ran in, as the TDS client reported it. Compared
     /// exactly: both sides are the server's own ENVCHANGE name, and a
     /// case-sensitive instance can hold two databases differing only by case.
     pub(crate) catalog: String,
-    /// What `USER_NAME()` returned there — `dbo` for an owner, the contained
-    /// user's name, or `guest`.
+    /// What `SQL_USER_NAME` reports for [`catalog`](Self::catalog) — usually
+    /// what `USER_NAME()` returned there (`dbo` for an owner, the contained
+    /// user's name, or `guest`), but **not always**. When the query ran and
+    /// produced no name — a NULL row, no row, or a read that failed after the
+    /// server accepted the batch — the previous answer is stored under the new
+    /// catalog instead, which is how msodbcsql behaves: `SQLGetData` leaves its
+    /// `DBUserName` buffer untouched for a NULL, and the refresh flag is
+    /// already cleared by then, so it reports the old value and stops asking.
+    /// Empty when there was no previous answer to keep.
     pub(crate) value: String,
 }
 
