@@ -1513,9 +1513,25 @@ async fn fetch_database_user_name(
     };
 
     // Everything from here on happened after the server accepted the batch.
-    match read.and_then(|value| closed.map(|()| value)) {
-        Ok(value) => Ok(value),
-        Err(error) => Err(LookupFailure {
+    match (read, closed) {
+        // A name that was read before anything went wrong stands, even if the
+        // trailing drain then failed. msodbcsql writes `DBUserName` in
+        // `SQLGetData` and only afterwards calls `SQLMoreResults`
+        // (`sqlccmd.cpp:10395-10399`), so a later failure cannot revert the
+        // value it already captured.
+        (Ok(Some(value)), closed) => {
+            if let Err(error) = closed {
+                debug!(
+                    %error,
+                    "SQLGetInfoW(SQL_USER_NAME): drain failed after the name was read; keeping it"
+                );
+            }
+            Ok(Some(value))
+        }
+        (Ok(None), Ok(())) => Ok(None),
+        // Nothing was read, so there is no value to keep and the failure
+        // decides the outcome. Still `executed`, so the caller stops asking.
+        (Ok(None), Err(error)) | (Err(error), _) => Err(LookupFailure {
             executed: true,
             error,
         }),
@@ -2938,6 +2954,58 @@ mod tests {
             "the previous call's diagnostics must be cleared before the lookup, \
              not after it returns"
         );
+    }
+
+    /// A drain failure *after* the name was read must not throw the name away.
+    /// msodbcsql has already written `DBUserName` in `SQLGetData` by the time
+    /// it calls `SQLMoreResults`, so the value survives a later failure — the
+    /// refresh stops either way, but it stops holding the *new* answer.
+    #[test]
+    fn user_name_keeps_a_name_read_before_the_drain_failed() {
+        use mssql_mock_tds::{ColumnDefinition, ColumnValue, QueryResponse, Row, SqlDataType};
+
+        let (h, server) = user_name_fixture(user_name_row("dbo"));
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        assert_eq!(get_wide_str(h.dbc, SQL_USER_NAME).1, "dbo");
+
+        // Force a refresh whose first row reads cleanly and whose *second* row
+        // is short, so the failure lands in the trailing drain rather than in
+        // the read that produced the name.
+        dbc.inner
+            .lock()
+            .unwrap()
+            .database_user_name
+            .as_mut()
+            .unwrap()
+            .catalog = "elsewhere".to_string();
+        server.register_query(
+            DATABASE_USER_NAME_QUERY,
+            QueryResponse::new(
+                vec![
+                    ColumnDefinition::new("", SqlDataType::NVarChar),
+                    ColumnDefinition::new("", SqlDataType::Int),
+                ],
+                vec![
+                    Row::new(vec![
+                        ColumnValue::NVarChar("fetched_user".to_string()),
+                        ColumnValue::Int(1),
+                    ]),
+                    Row::new(vec![ColumnValue::NVarChar("short".to_string())]),
+                ],
+            ),
+        );
+
+        let (rc, value, _) = get_wide_str(h.dbc, SQL_USER_NAME);
+        assert_eq!(rc, SQL_SUCCESS);
+        assert_eq!(
+            value, "fetched_user",
+            "the name was read before the drain failed, so it must not revert to the old one"
+        );
+        assert!(diag_states(h.dbc).is_empty());
+
+        // And it is what got cached, not the stale fallback.
+        server.register_query(DATABASE_USER_NAME_QUERY, user_name_row("never_read"));
+        assert_eq!(get_wide_str(h.dbc, SQL_USER_NAME).1, "fetched_user");
     }
 
     /// A failure *after* the server accepted the batch is on msodbcsql's
