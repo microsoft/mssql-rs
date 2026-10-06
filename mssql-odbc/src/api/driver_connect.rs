@@ -492,7 +492,19 @@ fn do_connect(
             .unwrap_or(params.server.as_str())
             .to_string(),
     };
+    // Belt-and-braces: `sql_disconnect_safe` already clears this, and the DM
+    // rejects a connect on a still-connected handle with `08002`, so no
+    // reachable path arrives here with an entry. Kept because this block is
+    // where the new session is published, and deliberately *not* pinned by a
+    // test — removing it changes no observable behavior, so any test for it
+    // would have to write the field by hand and would pin nothing.
     state.database_user_name = None;
+    // Bumped on every successful connect, and read by `publish_lookup` to tell
+    // whether the session a lookup queried is still the one on the handle. The
+    // other half of that check, `connection_state != Connected`, is false in
+    // exactly the case this counter exists for — a reconnect that has already
+    // completed — so this is what distinguishes the sessions. Pinned by
+    // `connect_advances_the_session_generation_and_clears_the_database_user`.
     state.session_generation = state.session_generation.wrapping_add(1);
     // Published here (not right after resolving it above) for the same
     // failed-connect reason as the other fields in this block: kept separate
@@ -1773,6 +1785,104 @@ mod tests {
                  DEFAULT_PACKET_SIZE"
             );
         }
+
+        let _ = shutdown_tx.send(());
+        let _ = server_runtime
+            .block_on(async { tokio::time::timeout(Duration::from_secs(2), server_handle).await });
+    }
+
+    /// A successful connect must advance `session_generation` and clear the
+    /// cached database principal.
+    ///
+    /// `do_connect` is the only producer of `session_generation` in the crate;
+    /// everything else reads it. `publish_lookup` compares it to decide whether
+    /// the session it queried is still the one on the handle, and without the
+    /// bump that comparison can never fire from a real connect — leaving only
+    /// the `connection_state != Connected` half of the condition, which is
+    /// false in exactly the case the counter exists for: a reconnect that has
+    /// already completed, so the handle is `Connected` again on a *different*
+    /// session.
+    ///
+    /// Driven through a real connect rather than by writing the field, so the
+    /// producer is pinned and not just the comparison.
+    #[test]
+    fn connect_advances_the_session_generation_and_clears_the_database_user() {
+        use crate::api::disconnect::sql_disconnect;
+        use crate::handles::dbc::CachedDatabaseUserName;
+        use mssql_mock_tds::MockTdsServer;
+        use std::time::Duration;
+
+        let server_runtime =
+            tokio::runtime::Runtime::new().expect("failed to build mock-server runtime");
+        let (server_addr, shutdown_tx, server_handle) = server_runtime.block_on(async {
+            let server = MockTdsServer::new("127.0.0.1:0")
+                .await
+                .expect("failed to start mock server");
+            let addr = server.local_addr();
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let handle = tokio::spawn(async move {
+                let _ = server.run_with_shutdown(rx).await;
+            });
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            (addr, tx, handle)
+        });
+
+        let h = TestHandles::with_env_dbc();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let conn_str: Vec<u16> = cs(&format!(
+            "Server=tcp:{},{};UID=sa;<PW>=unused;Database=master;Encrypt=no;\
+             TrustServerCertificate=yes",
+            server_addr.ip(),
+            server_addr.port()
+        ))
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+
+        let connect = || {
+            let ret = unsafe {
+                sql_driver_connect_w(
+                    h.dbc,
+                    std::ptr::null_mut(),
+                    conn_str.as_ptr(),
+                    SQL_NTS,
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                    SQL_DRIVER_NOPROMPT,
+                )
+            };
+            assert!(
+                matches!(ret, SQL_SUCCESS | SQL_SUCCESS_WITH_INFO),
+                "connect failed: {ret}"
+            );
+        };
+
+        connect();
+        let first = dbc.inner.lock().unwrap().session_generation;
+
+        // Stand in for a lookup having cached this session's principal, and
+        // replace the session underneath it.
+        {
+            let mut state = dbc.inner.lock().unwrap();
+            state.database_user_name = Some(CachedDatabaseUserName {
+                catalog: "master".to_string(),
+                value: "first_session_user".to_string(),
+            });
+        }
+        assert_eq!(unsafe { sql_disconnect(h.dbc) }, SQL_SUCCESS);
+        connect();
+
+        let state = dbc.inner.lock().unwrap();
+        assert_ne!(
+            state.session_generation, first,
+            "a lookup in flight across this reconnect must be able to tell the sessions apart"
+        );
+        assert!(
+            state.database_user_name.is_none(),
+            "the new session's principal is unrelated to the old one's"
+        );
+        drop(state);
 
         let _ = shutdown_tx.send(());
         let _ = server_runtime
