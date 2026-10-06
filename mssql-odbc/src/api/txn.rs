@@ -486,9 +486,17 @@ pub(super) fn reset_connection(dbc: &DbcHandle, value: u64) -> SqlReturn {
     // leaves no window in which another thread's checkout SET could still
     // short-circuit. Arming may yet fail below, in which case the flag costs at
     // most one redundant SET on a connection the pool is about to discard.
+    //
+    // The cached database user goes with it, for the same reason and one more:
+    // `release_dbc_client` below makes the client claimable again a few lines
+    // before the post-arm block runs, so a clear deferred to there would leave a
+    // window in which `SQL_USER_NAME` still answers from this borrower's
+    // principal. Clearing here also covers the rollback-failure path, which
+    // returns before that block is reached.
     let started = match dbc.inner.lock() {
         Ok(mut state) => {
             state.server_isolation_unknown = true;
+            state.database_user_name = None;
             state.local_tran_started
         }
         Err(_) => {
@@ -567,9 +575,8 @@ pub(super) fn reset_connection(dbc: &DbcHandle, value: u64) -> SqlReturn {
     // would survive it. The catalog key cannot catch that: the reset returns
     // the session to the login's default database, which is usually the one
     // the entry was already keyed to, so the next borrower would get a cache
-    // hit carrying the previous borrower's `USER_NAME()`. Dropped here for the
-    // same reason connect and disconnect drop it — the session the name
-    // belonged to is gone.
+    // hit carrying the previous borrower's `USER_NAME()`. Re-asserted here with
+    // the isolation flag; the clear that closes the window is the early one.
     state.database_user_name = None;
     // Re-assert the invalidation under the lock that records the completed arm,
     // and bump the generation. The early set above narrows the window before
@@ -1317,6 +1324,10 @@ mod tests {
             // No tokens: the rollback round trip runs dry and fails.
             state.client = Some(tds_client_from_tokens_in_transaction(vec![], 0xDEAD_BEEF));
             state.local_tran_started = true;
+            state.database_user_name = Some(crate::handles::dbc::CachedDatabaseUserName {
+                catalog: "master".to_string(),
+                value: "impersonated_user".to_string(),
+            });
         }
 
         assert_eq!(reset_connection(dbc, 1), SQL_ERROR);
@@ -1330,6 +1341,11 @@ mod tests {
             state.server_isolation_unknown,
             "the connection is being recycled, so the cached isolation level is no longer \
              evidence about the server even though arming failed"
+        );
+        assert!(
+            state.database_user_name.is_none(),
+            "this path returns before the post-arm block, so only the early clear can have \
+             dropped the principal — and it must, since the client was handed back"
         );
     }
 
