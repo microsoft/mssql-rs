@@ -1360,15 +1360,15 @@ fn database_user_name(dbc: &DbcHandle) -> String {
         // NULL, so the previous answer is what it goes on reporting.
         // `fallback` is that same previous answer.
         Ok(looked_up) => Some(looked_up.unwrap_or_else(|| fallback.clone())),
-        // Draining or closing failed *after* the batch was accepted. msodbcsql
+        // Draining or closing failed after `execute` returned `Ok`. msodbcsql
         // has already cleared its refresh flag by this point, so this stops
         // asking too and keeps reporting the previous answer.
         Err(failure) if failure.executed => {
             debug!(error = %failure.error, "SQLGetInfoW(SQL_USER_NAME): lookup failed after execution");
             Some(fallback.clone())
         }
-        // The batch never ran, which is the only case that leaves the refresh
-        // outstanding — so nothing is cached and the next call retries.
+        // `execute` itself failed, which is the only case that leaves the
+        // refresh outstanding — so nothing is cached and the next call retries.
         Err(failure) => {
             debug!(error = %failure.error, "SQLGetInfoW(SQL_USER_NAME): execution failed; reporting the cached value");
             None
@@ -1438,13 +1438,19 @@ fn publish_lookup(
     }
 }
 
-/// A `USER_NAME()` lookup that did not produce a value, and whether the batch
-/// had been accepted by the server when it failed.
+/// A `USER_NAME()` lookup that did not produce a value, and whether
+/// [`TdsClient::execute`] had returned `Ok` when it failed.
 ///
-/// The distinction is the caching boundary: msodbcsql stops asking the moment
-/// `ExecImmediate` succeeds (`sqlccmd.cpp:10387`), so only a failure to execute
-/// leaves the refresh outstanding. Collapsing the two would make every later
-/// `SQLGetInfo` re-issue the query after a mid-drain network blip.
+/// That is the caching boundary, and it is deliberately the *conservative*
+/// reading of msodbcsql's: retail stops asking the moment `ExecImmediate`
+/// succeeds (`sqlccmd.cpp:10387`). `execute` is not a pure send — it writes the
+/// batch and then reads as far as the first result boundary — so an `Err` from
+/// it can mean the server did accept the batch and the failure came while
+/// reading the response. Treating that as not-executed costs at most one
+/// re-issued query on the next `SQLGetInfo`; the opposite error, treating an
+/// un-run query as executed, would cache a stale principal indefinitely.
+/// Collapsing the two would also make every later call re-issue the query
+/// after a mid-drain network blip.
 struct LookupFailure {
     executed: bool,
     error: mssql_tds::error::Error,
@@ -1476,8 +1482,12 @@ async fn fetch_database_user_name(
         )
         .await
     {
-        // Nothing was accepted, so there is normally no batch to close; a
-        // partially-written one is drained anyway rather than left open.
+        // `execute` sends the batch and then reads to the first result
+        // boundary, so this covers both "never reached the server" and "was
+        // accepted but the first read failed". Either way there is normally no
+        // batch to close; a partially-written one is drained rather than left
+        // open. Reported as not-executed so the next call retries — see
+        // `LookupFailure` for why that is the safe direction to err in.
         if client.has_open_batch() {
             let _ = client.close_query().await;
         }
@@ -1512,7 +1522,7 @@ async fn fetch_database_user_name(
         Ok(())
     };
 
-    // Everything from here on happened after the server accepted the batch.
+    // Everything from here on happened after `execute` returned `Ok`.
     match (read, closed) {
         // A name that was read before anything went wrong stands, even if the
         // trailing drain then failed. msodbcsql writes `DBUserName` in
@@ -3008,10 +3018,10 @@ mod tests {
         assert_eq!(get_wide_str(h.dbc, SQL_USER_NAME).1, "fetched_user");
     }
 
-    /// A failure *after* the server accepted the batch is on msodbcsql's
-    /// stop-asking side of the boundary: `CONN_ST_REFRESH_UDT` is already clear
-    /// by then, so the previous answer stands and is not re-queried. Only a
-    /// failure to execute leaves the refresh outstanding.
+    /// A failure after `execute` returned `Ok` is on msodbcsql's stop-asking
+    /// side of the boundary: `CONN_ST_REFRESH_UDT` is already clear by then, so
+    /// the previous answer stands and is not re-queried. Only a failure from
+    /// `execute` itself leaves the refresh outstanding.
     #[test]
     fn user_name_caches_the_fallback_when_the_drain_fails_after_execution() {
         use mssql_mock_tds::{ColumnDefinition, QueryResponse, Row, SqlDataType};
