@@ -1284,25 +1284,28 @@ fn database_user_name(dbc: &DbcHandle) -> String {
             return String::new();
         }
         let stale = match &state.database_user_name {
-            // Keyed by catalog, so a database change refreshes the answer
-            // whether it arrived through `SQL_ATTR_CURRENT_CATALOG` or through
-            // raw T-SQL the server reports with an ENVCHANGE — the same two
-            // routes that set msodbcsql's `CONN_ST_REFRESH_UDT`
-            // (`sqlctokn.cpp:2881`). While another statement holds the client
-            // the catalog cannot be read, so the entry is taken as current.
+            // Keyed by catalog *and* the client's database-change count, so a
+            // database change refreshes the answer whether it arrived through
+            // `SQL_ATTR_CURRENT_CATALOG`, through raw T-SQL the server reports
+            // with an ENVCHANGE, or through a `USE [X]` issued while already in
+            // `X` — which changes no name but still fires the event, and paired
+            // with an `EXECUTE AS` is the only sign the principal moved.
+            // msodbcsql flags its refresh from any `ENV_DATABASE` token without
+            // comparing names (`sqlctokn.cpp:2866-2882`).
             //
-            // Compared exactly, not case-insensitively: both sides are the
-            // server's own ENVCHANGE name, so there is no application-supplied
-            // casing to normalize — unlike `SQL_ATTR_CURRENT_CATALOG`, which
-            // folds case because it matches a caller's string against that
-            // name. A case-sensitive instance can hold both `Sales` and
-            // `sales`, and folding would serve one database's principal for the
-            // other.
+            // The catalog is compared exactly: both sides are the server's own
+            // ENVCHANGE name, so there is no caller-supplied casing to
+            // normalize — unlike `SQL_ATTR_CURRENT_CATALOG`, which folds case
+            // because it matches a caller's string against that name. A
+            // case-sensitive instance can hold both `Sales` and `sales`.
+            //
+            // While another statement holds the client neither can be read, so
+            // the entry is taken as current.
             Some(cached)
-                if state
-                    .client
-                    .as_ref()
-                    .is_none_or(|client| client.database() == cached.catalog) =>
+                if state.client.as_ref().is_none_or(|client| {
+                    client.database() == cached.catalog
+                        && client.database_change_count() == cached.database_change_count
+                }) =>
             {
                 return cached.value.clone();
             }
@@ -1343,6 +1346,7 @@ fn database_user_name(dbc: &DbcHandle) -> String {
     // database. Keying the entry to where the answer actually came from keeps a
     // later read from matching it against a database it was never valid for.
     let catalog = client.database().to_string();
+    let database_change_count = client.database_change_count();
     // Discarded on every path, success and failure alike: these belong to the
     // hidden lookup, and the next consumer of this connection is not
     // necessarily a command that would clear them (see the note above).
@@ -1375,7 +1379,15 @@ fn database_user_name(dbc: &DbcHandle) -> String {
         }
     };
 
-    publish_lookup(dbc, client, generation, catalog, cache, fallback)
+    publish_lookup(
+        dbc,
+        client,
+        generation,
+        catalog,
+        database_change_count,
+        cache,
+        fallback,
+    )
 }
 
 /// Hands the claimed client back and installs the cache entry **in one critical
@@ -1403,6 +1415,7 @@ fn publish_lookup(
     client: TdsClient,
     generation: u64,
     catalog: String,
+    database_change_count: u64,
     cache: Option<String>,
     fallback: String,
 ) -> String {
@@ -1430,6 +1443,7 @@ fn publish_lookup(
         Some(value) => {
             state.database_user_name = Some(CachedDatabaseUserName {
                 catalog,
+                database_change_count,
                 value: value.clone(),
             });
             value
@@ -2663,9 +2677,40 @@ mod tests {
         );
     }
 
-    /// The control for the case above: an identical catalog is reused without a
-    /// round trip, so the refresh is driven by the name actually differing and
-    /// not by every read going back to the server.
+    /// A `USE [X]` issued while already in `X` changes no catalog name but
+    /// still fires an `ENV_DATABASE` event — and paired with an `EXECUTE AS`
+    /// that is the only signal the database principal moved. msodbcsql flags
+    /// its refresh on any such token without comparing names
+    /// (`sqlctokn.cpp:2866-2882`), so the name alone cannot be the whole key.
+    #[test]
+    fn user_name_is_refreshed_by_a_same_catalog_database_change_event() {
+        let (h, server) = user_name_fixture(user_name_row("dbo"));
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        assert_eq!(get_wide_str(h.dbc, SQL_USER_NAME).1, "dbo");
+
+        // Stand in for the server reporting `USE [master]` while already in
+        // master: same name, new event. The mock does not emit ENVCHANGE for a
+        // registered batch, so the count is advanced directly — the catalog is
+        // deliberately left alone, which is the whole point of the case.
+        {
+            let mut state = dbc.inner.lock().unwrap();
+            let cached = state.database_user_name.as_mut().unwrap();
+            assert_eq!(cached.catalog, "master", "fixture connects to master");
+            cached.database_change_count = cached.database_change_count.wrapping_sub(1);
+        }
+        server.register_query(DATABASE_USER_NAME_QUERY, user_name_row("guest"));
+
+        assert_eq!(
+            get_wide_str(h.dbc, SQL_USER_NAME).1,
+            "guest",
+            "a same-name database-change event must still invalidate the entry"
+        );
+    }
+
+    /// The control for both cases above: an identical catalog with no
+    /// database-change event is reused without a round trip, so the refresh is
+    /// driven by something actually changing and not by every read going back
+    /// to the server.
     #[test]
     fn user_name_cache_matches_an_identical_catalog() {
         let (h, server) = user_name_fixture(user_name_row("dbo"));
@@ -3172,6 +3217,7 @@ mod tests {
             client,
             generation,
             "master".to_string(),
+            0,
             Some("dbo".to_string()),
             "stale".to_string(),
         );

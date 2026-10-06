@@ -1348,6 +1348,7 @@ mod tests {
             state.local_tran_started = true;
             state.database_user_name = Some(crate::handles::dbc::CachedDatabaseUserName {
                 catalog: "master".to_string(),
+                database_change_count: 0,
                 value: "impersonated_user".to_string(),
             });
         }
@@ -1471,6 +1472,7 @@ mod tests {
             state.client = Some(tds_client_from_tokens(vec![]));
             state.database_user_name = Some(CachedDatabaseUserName {
                 catalog: "master".to_string(),
+                database_change_count: 0,
                 value: "impersonated_user".to_string(),
             });
         }

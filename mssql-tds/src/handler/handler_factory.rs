@@ -112,6 +112,17 @@ pub(crate) struct NegotiatedSettings {
     /// than read back from `TdsClient::info_messages`, which is cleared at the
     /// start of every command and is empty on a pooled connection.
     pub server_reported_name: Option<String>,
+    /// Counts every `ENV_DATABASE` the server has reported, plus every restore
+    /// to login defaults.
+    ///
+    /// The name alone cannot detect every database change: `USE [master]` while
+    /// already in `master` still produces an `ENVCHANGE`, and msodbcsql flags
+    /// its `USER_NAME()` cache for refresh on *any* `ENV_DATABASE` token
+    /// without comparing names (`sqlctokn.cpp:2866-2882`). Combined with an
+    /// `EXECUTE AS`, that same-name event is the only signal that the database
+    /// principal may have changed. Consumers caching per-database state pair
+    /// this with the name so a same-name event still invalidates.
+    pub database_change_count: u64,
 }
 
 impl NegotiatedSettings {
@@ -136,6 +147,7 @@ impl NegotiatedSettings {
             login_ack_tds_version,
             login_ack_server_version,
             server_reported_name: None,
+            database_change_count: 0,
         }
     }
 
@@ -147,6 +159,10 @@ impl NegotiatedSettings {
         self.database = self.login_database.clone();
         self.language = self.login_language.clone();
         self.database_collation = self.login_database_collation;
+        // Counted like a server-reported change: the session's database is
+        // being replaced, so per-database caches must not survive it even when
+        // the login default happens to be the database already in use.
+        self.database_change_count = self.database_change_count.wrapping_add(1);
     }
 
     /// Check if session recovery was acknowledged by the server in FEATUREEXTACK.
@@ -243,6 +259,7 @@ pub(crate) fn create_test_negotiated_settings_internal() -> NegotiatedSettings {
         login_ack_tds_version: None,
         login_ack_server_version: None,
         server_reported_name: None,
+        database_change_count: 0,
     }
 }
 

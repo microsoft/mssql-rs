@@ -285,6 +285,15 @@ pub(crate) struct CachedDatabaseUserName {
     /// exactly: both sides are the server's own ENVCHANGE name, and a
     /// case-sensitive instance can hold two databases differing only by case.
     pub(crate) catalog: String,
+    /// [`TdsClient::database_change_count`] when the lookup ran, compared
+    /// alongside [`catalog`](Self::catalog).
+    ///
+    /// The name alone cannot see a `USE [X]` issued while already in `X`. That
+    /// still produces an `ENVCHANGE`, and paired with an `EXECUTE AS` it is the
+    /// only signal that the database principal changed while the database name
+    /// did not — msodbcsql refreshes there because it flags on any
+    /// `ENV_DATABASE` token without comparing names (`sqlctokn.cpp:2866-2882`).
+    pub(crate) database_change_count: u64,
     /// What `SQL_USER_NAME` reports for [`catalog`](Self::catalog) — usually
     /// what `USER_NAME()` returned there (`dbo` for an owner, the contained
     /// user's name, or `guest`), but **not always**. When the query ran and

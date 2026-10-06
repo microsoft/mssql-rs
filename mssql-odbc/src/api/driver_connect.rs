@@ -1867,6 +1867,7 @@ mod tests {
             let mut state = dbc.inner.lock().unwrap();
             state.database_user_name = Some(CachedDatabaseUserName {
                 catalog: "master".to_string(),
+                database_change_count: 0,
                 value: "first_session_user".to_string(),
             });
         }

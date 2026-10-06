@@ -109,6 +109,14 @@ impl ExecutionContext {
                 if let EnvChangeContainer::String(string_change) = change_type {
                     info!("Database change detected: {}", string_change.new_value());
                     negotiated_settings.database = string_change.new_value().clone();
+                    // Counted on every token, not only when the name differs:
+                    // `USE [master]` while already in `master` still reports a
+                    // change, and it is the only signal a per-database cache
+                    // gets that the principal may have changed under an
+                    // `EXECUTE AS`. msodbcsql flags its own refresh the same
+                    // unconditional way (`sqlctokn.cpp:2866-2882`).
+                    negotiated_settings.database_change_count =
+                        negotiated_settings.database_change_count.wrapping_add(1);
                     Ok(())
                 } else {
                     Err(crate::error::Error::ProtocolError(format!(

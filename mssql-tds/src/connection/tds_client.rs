@@ -1286,6 +1286,20 @@ impl TdsClient {
         &self.negotiated_settings.database
     }
 
+    /// How many database-change events this session has seen: every
+    /// `ENV_DATABASE` the server reported, plus every restore to login defaults
+    /// on a connection reset.
+    ///
+    /// Pair this with [`database()`](Self::database) when caching per-database
+    /// state. The name alone misses a `USE [X]` issued while already in `X`,
+    /// which still produces an `ENVCHANGE` and, combined with an `EXECUTE AS`,
+    /// is the only indication the database principal may have changed.
+    /// msodbcsql flags its own `USER_NAME()` refresh on any `ENV_DATABASE`
+    /// token without comparing names (`sqlctokn.cpp:2866-2882`).
+    pub fn database_change_count(&self) -> u64 {
+        self.negotiated_settings.database_change_count
+    }
+
     /// Returns the language the connection is currently using.
     ///
     /// Reflects any change made after login (e.g. `SET LANGUAGE`, surfaced via
