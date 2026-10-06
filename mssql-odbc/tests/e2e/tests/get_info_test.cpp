@@ -434,17 +434,21 @@ TEST_F(GetInfoLiveTest, UserNameIsReportedInsideAnOpenTransaction) {
 // Truncation follows the same contract as every other string information type:
 // 01004, a NUL-terminated partial value, and the full length still reported.
 TEST_F(GetInfoLiveTest, UserNameTruncatesWithTheFullLengthReported) {
-    SQLRETURN rc = SQL_ERROR;
+    // Establish the expected length with SQLGetInfoW itself. The narrow value
+    // from GetInfoString is UTF-8 on Unix, whose byte count is not the UTF-16
+    // count SQLGetInfoW reports — "análisis" is 9 UTF-8 bytes but 8 UTF-16
+    // units — so deriving one from the other fails for a non-ASCII principal.
     SQLSMALLINT fullLen = -1;
-    std::string userName = GetInfoString(dbc_, SQL_USER_NAME, &rc, &fullLen);
-    ASSERT_TRUE(SQL_SUCCEEDED(rc));
-    ASSERT_GE(userName.size(), 2u) << "need a value long enough to truncate";
+    ASSERT_TRUE(SQL_SUCCEEDED(
+        SQLGetInfoW(dbc_, SQL_USER_NAME, nullptr, 0, &fullLen)));
+    ASSERT_GE(fullLen, static_cast<SQLSMALLINT>(2 * sizeof(SQLWCHAR)))
+        << "need a value long enough to truncate";
 
     SQLWCHAR buf[2] = {0xFFFF, 0xFFFF};
     SQLSMALLINT len = -1;
     EXPECT_EQ(SQL_SUCCESS_WITH_INFO,
               SQLGetInfoW(dbc_, SQL_USER_NAME, buf, sizeof(buf), &len));
-    EXPECT_EQ(static_cast<SQLSMALLINT>(userName.size() * sizeof(SQLWCHAR)), len);
+    EXPECT_EQ(fullLen, len);
     EXPECT_EQ(0, buf[1]) << "the partial value must still be terminated";
     EXPECT_SQLSTATE(SQL_HANDLE_DBC, dbc_, "01004");
 }
