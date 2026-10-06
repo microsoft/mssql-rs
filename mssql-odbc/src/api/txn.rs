@@ -112,6 +112,15 @@ pub(super) fn claim_dbc_client(dbc: &DbcHandle, op: &str) -> Result<TdsClient, S
 /// [`session_generation`](crate::handles::dbc::DbcState::session_generation) is
 /// returned with the client, so the caller can tell on the way back whether the
 /// session it queried is still the one installed on the handle.
+///
+/// The claim leaves `active_stmt` alone, because an internal query has no
+/// statement handle to attribute it to. A concurrent execution that lands in
+/// the in-flight window therefore passes [`claim_connection`]'s busy check and
+/// reports `ERR_NO_ACTIVE_TDS_CLIENT` instead of `ERR_CONNECTION_BUSY`
+/// (`exec_common.rs:253-275`) — both `HY000`, so the difference is message
+/// quality, not contract. [`claim_dbc_client`] has the same window for commit,
+/// rollback, and isolation changes; closing it needs a connection-level claim
+/// marker that both would share.
 pub(super) fn try_claim_idle_dbc_client(dbc: &DbcHandle) -> Option<(TdsClient, u64)> {
     let mut state = dbc.inner.lock().ok()?;
     if state.connection_state != ConnectionState::Connected || state.active_stmt.is_some() {

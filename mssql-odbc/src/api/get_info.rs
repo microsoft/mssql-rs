@@ -2927,6 +2927,18 @@ mod tests {
             value,
             "a post-execution failure must stop asking, like msodbcsql's cleared flag"
         );
+
+        // The lookup must not cost the application its connection: the batch was
+        // closed despite the mid-drain failure, so the next refresh still works.
+        dbc.inner
+            .lock()
+            .unwrap()
+            .database_user_name
+            .as_mut()
+            .unwrap()
+            .catalog = "elsewhere_again".to_string();
+        server.register_query(DATABASE_USER_NAME_QUERY, user_name_row("recovered"));
+        assert_eq!(get_wide_str(h.dbc, SQL_USER_NAME).1, "recovered");
     }
 
     /// The lookup releases the DBC lock for its round trip. If the session is
