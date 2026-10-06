@@ -2849,7 +2849,7 @@ mod tests {
         // the gap is what proves the deadline, not the server, ended the wait.
         const BOUND: Duration = Duration::from_secs(5);
 
-        let (h, _server) = user_name_fixture(user_name_row("dbo").with_delay(RESPONSE_DELAY));
+        let (h, server) = user_name_fixture(user_name_row("dbo").with_delay(RESPONSE_DELAY));
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         dbc.inner.lock().unwrap().connection_timeout = TIMEOUT_SECS;
 
@@ -2868,6 +2868,19 @@ mod tests {
         );
         assert_eq!(value, "", "nothing was learned, so nothing is reported");
         assert!(diag_states(h.dbc).is_empty());
+
+        // The deadline is the one failure mode where a desynchronized
+        // attention/response would be easiest to introduce, so hold it to the
+        // same "a best-effort lookup must never cost the application its
+        // connection" invariant the other failure paths are held to.
+        {
+            let state = dbc.inner.lock().unwrap();
+            assert!(state.client.is_some(), "the client must go back to the DBC");
+            assert!(state.active_stmt.is_none(), "no cursor claim may be left");
+            assert_eq!(state.connection_state, ConnectionState::Connected);
+        }
+        server.register_query(DATABASE_USER_NAME_QUERY, user_name_row("recovered"));
+        assert_eq!(get_wide_str(h.dbc, SQL_USER_NAME).1, "recovered");
     }
 
     /// An invalid buffer length must be rejected *before* the driver issues a
@@ -2963,6 +2976,64 @@ mod tests {
             Some(0),
             "the previous call's diagnostics must be cleared before the lookup, \
              not after it returns"
+        );
+    }
+
+    /// `SQL_COLLATION_SEQ` must report the same thing while the lookup holds
+    /// the client as it does on either side of it. It reads the live client
+    /// when present and `last_collation_code_page` / `last_char_set` when not,
+    /// so `try_claim_idle_dbc_client` refreshes those before taking it — the
+    /// same bookkeeping `claim_connection` does for a data-at-execution park.
+    /// Without it the client-absent read falls back to whatever happened to be
+    /// in those fields, which need not describe this connection at all.
+    #[test]
+    fn collation_seq_stays_answerable_while_the_user_name_lookup_holds_the_client() {
+        use std::time::Duration;
+
+        let (h, _server) =
+            user_name_fixture(user_name_row("dbo").with_delay(Duration::from_secs(2)));
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+
+        // What this connection actually reports, read from the live client.
+        let live = get_wide_str(h.dbc, odbc::SQL_COLLATION_SEQ).1;
+
+        // Seed the fallback fields with a value this connection never had, so
+        // the probe below can tell a refreshed snapshot from a stale one.
+        dbc.inner.lock().unwrap().last_collation_code_page = Some(437);
+        assert_eq!(
+            collation_seq_name(Some(437)),
+            Some("Code page 437"),
+            "the seeded value must be one that would be visible if used"
+        );
+
+        // Synchronize on the client actually being claimed, not on a delay.
+        let probe = std::thread::spawn({
+            let dbc_ptr = h.dbc as usize;
+            move || {
+                let dbc_ref = unsafe { handle_from_raw::<DbcHandle>(dbc_ptr as SqlHandle) };
+                let deadline = std::time::Instant::now() + Duration::from_secs(30);
+                while std::time::Instant::now() < deadline {
+                    if dbc_ref.inner.lock().unwrap().client.is_none() {
+                        return Some(get_wide_str(dbc_ptr as SqlHandle, odbc::SQL_COLLATION_SEQ).1);
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                None
+            }
+        });
+
+        assert_eq!(get_wide_str(h.dbc, SQL_USER_NAME).1, "dbo");
+
+        assert_eq!(
+            probe.join().unwrap(),
+            Some(live.clone()),
+            "while the lookup holds the client, SQL_COLLATION_SEQ must still describe this \
+             connection — not whatever was left in the fallback fields"
+        );
+        assert_eq!(
+            get_wide_str(h.dbc, odbc::SQL_COLLATION_SEQ).1,
+            live,
+            "and the live client must report the same value once it is back"
         );
     }
 
