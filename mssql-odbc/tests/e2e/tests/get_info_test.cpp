@@ -221,7 +221,14 @@ struct ProbeConnection {
                                             outStr, 1024, &outLen, SQL_DRIVER_NOPROMPT))) {
             return false;
         }
-        return SQL_SUCCEEDED(SQLAllocHandle(SQL_HANDLE_STMT, dbc, &stmt));
+        // Disconnect on a post-connect failure so `false` always means "not
+        // connected": the callers run DROP LOGIN while this object is still in
+        // scope, and SQL Server refuses to drop a login that is still logged in.
+        if (!SQL_SUCCEEDED(SQLAllocHandle(SQL_HANDLE_STMT, dbc, &stmt))) {
+            SQLDisconnect(dbc);
+            return false;
+        }
+        return true;
     }
 
     ~ProbeConnection() {
