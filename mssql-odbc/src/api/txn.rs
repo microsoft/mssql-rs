@@ -115,8 +115,9 @@ pub(super) fn claim_dbc_client(dbc: &DbcHandle, op: &str) -> Result<TdsClient, S
 ///
 /// The claim leaves `active_stmt` alone, because an internal query has no
 /// statement handle to attribute it to. A concurrent execution that lands in
-/// the in-flight window therefore passes [`claim_connection`]'s busy check and
-/// reports `ERR_NO_ACTIVE_TDS_CLIENT` instead of `ERR_CONNECTION_BUSY`
+/// the in-flight window therefore passes
+/// [`super::exec_common::claim_connection`]'s busy check and reports
+/// `ERR_NO_ACTIVE_TDS_CLIENT` instead of `ERR_CONNECTION_BUSY`
 /// (`exec_common.rs:253-275`) — both `HY000`, so the difference is message
 /// quality, not contract. [`claim_dbc_client`] has the same window for commit,
 /// rollback, and isolation changes; closing it needs a connection-level claim
@@ -132,6 +133,19 @@ pub(super) fn try_claim_idle_dbc_client(dbc: &DbcHandle) -> Option<(TdsClient, u
         .as_ref()
         .map(|entry| entry.value.clone())
         .unwrap_or_default();
+    // Snapshot the collation before the client leaves the DBC, exactly as
+    // `claim_connection` does: `SQL_COLLATION_SEQ` reads the live client when it
+    // is present and these fields when it is not, so a concurrent read during
+    // the lookup would otherwise report the empty string for a connection that
+    // answers normally on either side of it.
+    let cache = state
+        .client
+        .as_ref()
+        .map(super::get_info::collation_cache_inputs);
+    if let Some((code_page, char_set)) = cache {
+        state.last_collation_code_page = code_page;
+        state.last_char_set = char_set;
+    }
     state
         .client
         .take()

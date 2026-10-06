@@ -282,8 +282,8 @@ pub(crate) struct ConnectionIdentity {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CachedDatabaseUserName {
     /// The database the lookup ran in, as the TDS client reported it. Compared
-    /// case-insensitively, matching how `SQL_ATTR_CURRENT_CATALOG` decides a
-    /// `USE` is redundant.
+    /// exactly: both sides are the server's own ENVCHANGE name, and a
+    /// case-sensitive instance can hold two databases differing only by case.
     pub(crate) catalog: String,
     /// What `USER_NAME()` returned there — `dbo` for an owner, the contained
     /// user's name, or `guest`.

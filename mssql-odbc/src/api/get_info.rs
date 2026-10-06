@@ -1263,10 +1263,13 @@ fn sql_get_info_w_safe(
 /// Neither the internal query's INFO messages nor its errors reach the
 /// application's diagnostics. They belong to no application statement, which is
 /// also how msodbcsql treats them — its lookup runs on the hidden driver
-/// statement (`lpdbcIn->lpstmtDvr`) and any records are freed with it. Nothing
-/// is drained here to achieve that: `TdsClient::begin_command` already clears
-/// `info_messages` at the top of every command, so the next statement to use
-/// this connection starts from a clean slate on its own.
+/// statement (`lpdbcIn->lpstmtDvr`) and any records are freed with it. The
+/// messages are discarded here rather than left for the next command to clear:
+/// `TdsClient::begin_command` does clear them, but not every consumer of this
+/// connection starts a command first. `SQLCloseCursor` on an already-exhausted
+/// cursor takes the idle client, calls `close_query` — which deliberately does
+/// not clear `info_messages` — and posts `take_info_messages()` straight to the
+/// application's statement (`close_cursor.rs:323-330`).
 fn database_user_name(dbc: &DbcHandle) -> String {
     // Holding a stale entry rather than clearing it is deliberate: msodbcsql
     // leaves `DBUserName` untouched on a failed refresh and keeps answering
@@ -1287,10 +1290,19 @@ fn database_user_name(dbc: &DbcHandle) -> String {
             // routes that set msodbcsql's `CONN_ST_REFRESH_UDT`
             // (`sqlctokn.cpp:2881`). While another statement holds the client
             // the catalog cannot be read, so the entry is taken as current.
+            //
+            // Compared exactly, not case-insensitively: both sides are the
+            // server's own ENVCHANGE name, so there is no application-supplied
+            // casing to normalize — unlike `SQL_ATTR_CURRENT_CATALOG`, which
+            // folds case because it matches a caller's string against that
+            // name. A case-sensitive instance can hold both `Sales` and
+            // `sales`, and folding would serve one database's principal for the
+            // other.
             Some(cached)
-                if state.client.as_ref().is_none_or(|client| {
-                    client.database().eq_ignore_ascii_case(&cached.catalog)
-                }) =>
+                if state
+                    .client
+                    .as_ref()
+                    .is_none_or(|client| client.database() == cached.catalog) =>
             {
                 return cached.value.clone();
             }
@@ -1331,6 +1343,10 @@ fn database_user_name(dbc: &DbcHandle) -> String {
     // database. Keying the entry to where the answer actually came from keeps a
     // later read from matching it against a database it was never valid for.
     let catalog = client.database().to_string();
+    // Discarded on every path, success and failure alike: these belong to the
+    // hidden lookup, and the next consumer of this connection is not
+    // necessarily a command that would clear them (see the note above).
+    let _ = client.take_info_messages();
 
     let cache = match outcome {
         // The query ran. Cache the outcome even when it carried no name, so the
@@ -2596,11 +2612,13 @@ mod tests {
         assert_eq!(get_wide_str(h.dbc, SQL_USER_NAME).1, "guest");
     }
 
-    /// Case-insensitive, so a server that reports `MASTER` where the lookup ran
-    /// in `master` does not force a needless round trip — the same comparison
-    /// `SQL_ATTR_CURRENT_CATALOG` uses to decide a `USE` is redundant.
+    /// A catalog that differs only by case is a *different* database on a
+    /// case-sensitive instance, so the entry must not be reused for it. Both
+    /// sides of the comparison are the server's own ENVCHANGE name, so folding
+    /// case would buy nothing and could serve one database's principal for
+    /// another's.
     #[test]
-    fn user_name_cache_matches_the_catalog_case_insensitively() {
+    fn user_name_cache_does_not_match_a_catalog_differing_only_by_case() {
         let (h, server) = user_name_fixture(user_name_row("dbo"));
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         assert_eq!(get_wide_str(h.dbc, SQL_USER_NAME).1, "dbo");
@@ -2610,9 +2628,30 @@ mod tests {
             let cached = state.database_user_name.as_mut().unwrap();
             cached.catalog = cached.catalog.to_uppercase();
         }
-        server.register_query(DATABASE_USER_NAME_QUERY, user_name_row("changed"));
+        server.register_query(DATABASE_USER_NAME_QUERY, user_name_row("other_db_user"));
 
+        assert_eq!(
+            get_wide_str(h.dbc, SQL_USER_NAME).1,
+            "other_db_user",
+            "a case-differing catalog is a different database, so the entry must not be reused"
+        );
+    }
+
+    /// The control for the case above: an identical catalog is reused without a
+    /// round trip, so the refresh is driven by the name actually differing and
+    /// not by every read going back to the server.
+    #[test]
+    fn user_name_cache_matches_an_identical_catalog() {
+        let (h, server) = user_name_fixture(user_name_row("dbo"));
         assert_eq!(get_wide_str(h.dbc, SQL_USER_NAME).1, "dbo");
+
+        server.register_query(DATABASE_USER_NAME_QUERY, user_name_row("never_read"));
+
+        assert_eq!(
+            get_wide_str(h.dbc, SQL_USER_NAME).1,
+            "dbo",
+            "an unchanged catalog must be served from the cache"
+        );
     }
 
     /// msodbcsql spawns a second connection when the first is busy and, if that
@@ -3054,6 +3093,62 @@ mod tests {
         assert_eq!(
             rc, SQL_SUCCESS,
             "a leaked INFO would also downgrade this to SQL_SUCCESS_WITH_INFO"
+        );
+    }
+
+    /// The close-cursor path is the one `begin_command` does not cover: it
+    /// takes the idle client and posts `take_info_messages()` without starting
+    /// a command, so the lookup has to discard its own INFO rather than leave
+    /// it for the next command to clear.
+    #[test]
+    fn user_name_lookup_does_not_leak_info_messages_to_a_closing_cursor() {
+        use crate::api::close_cursor::sql_close_cursor;
+        use crate::api::exec_direct::sql_exec_direct_w;
+        use crate::api::odbc_types::SQL_NTS;
+        use mssql_mock_tds::InfoMessage;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let _server = crate::test_support::connect_mock_server(
+            dbc,
+            DATABASE_USER_NAME_QUERY,
+            user_name_row("dbo").with_info_tokens(vec![InfoMessage::new(
+                5701,
+                0,
+                "Changed database context to 'master'.",
+            )]),
+        );
+
+        // Open a cursor and run it to exhaustion: the fetch releases the
+        // connection claim while the cursor stays logically open, which is the
+        // state that lets the lookup run and `SQLCloseCursor` follow it.
+        let sql: Vec<u16> = "SELECT 1\0".encode_utf16().collect();
+        assert_eq!(
+            unsafe { sql_exec_direct_w(h.stmt, sql.as_ptr(), SQL_NTS) },
+            SQL_SUCCESS
+        );
+        while unsafe { crate::api::fetch::sql_fetch(h.stmt) } == SQL_SUCCESS {}
+
+        assert_eq!(get_wide_str(h.dbc, SQL_USER_NAME).1, "dbo");
+
+        let rc = unsafe { sql_close_cursor(h.stmt) };
+
+        let stmt = unsafe { handle_from_raw::<crate::handles::StmtHandle>(h.stmt) };
+        let leaked: Vec<String> = stmt
+            .inner
+            .lock()
+            .unwrap()
+            .diag_records
+            .iter()
+            .map(|d| format!("{} {}", String::from_utf8_lossy(&d.sql_state), d.message))
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "the lookup's INFO surfaced on the closing cursor: {leaked:?}"
+        );
+        assert_eq!(
+            rc, SQL_SUCCESS,
+            "a leaked INFO would downgrade this to SQL_SUCCESS_WITH_INFO"
         );
     }
 
