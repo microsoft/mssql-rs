@@ -83,6 +83,7 @@ fn auth_method_to_str(auth_method: &TdsAuthenticationMethod) -> &'static str {
             "activedirectoryworkloadidentity"
         }
         TdsAuthenticationMethod::ActiveDirectoryIntegrated => "activedirectoryintegrated",
+        TdsAuthenticationMethod::ActiveDirectoryTokenCredential => "activedirectorytokencredential",
         TdsAuthenticationMethod::Password => "password",
         TdsAuthenticationMethod::SSPI => "sspi",
         TdsAuthenticationMethod::AccessToken => "accesstoken",

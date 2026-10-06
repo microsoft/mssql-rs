@@ -1,6 +1,18 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+//! File and stderr trace sinks for the ODBC driver.
+//!
+//! Rotation is bounded, but **nothing is ever deleted**: there is no retention
+//! policy, no file cap and no age-based cleanup. A cleanup pass scanning the
+//! trace directory cannot tell its own files from those of another process
+//! writing to the same directory, so it risks destroying diagnostics belonging
+//! to a concurrently running or longer-lived instance — exactly when they
+//! matter most. Rotation therefore bounds only the size of an individual file,
+//! so each one stays openable, searchable and attachable to a bug report.
+//! Total output is bounded by the operator, who owns reclaiming the space; see
+//! the tracing section of `mssql-odbc/README.md` (AB#48091).
+
 use chrono::Utc;
 use std::ffi::OsString;
 use std::fmt;
@@ -19,9 +31,12 @@ static TRACE_FILE_WRITER: Mutex<Option<Weak<TraceFileWriter>>> = Mutex::new(None
 const ENV_TRACE: &str = "MSSQL_TDS_TRACE";
 const ENV_TRACE_LEVEL: &str = "MSSQL_TDS_TRACE_LEVEL";
 const ENV_TRACE_DIR: &str = "MSSQL_TDS_TRACE_DIR";
+const ENV_TRACE_MAX_FILE_SIZE_MB: &str = "MSSQL_TDS_TRACE_MAX_FILE_SIZE_MB";
 const DEFAULT_TRACE_LEVEL: &str = "warn";
 const LOG_FILE_PREFIX: &str = "mssql_tds_trace";
 const MAX_FILENAME_ATTEMPTS: u32 = 100;
+const DEFAULT_MAX_FILE_SIZE_MB: u64 = 100;
+const MAX_FILE_SIZE_MB: u64 = 1024;
 
 struct LogFormatter;
 
@@ -56,43 +71,96 @@ where
 }
 
 struct TraceFileWriter {
-    path: PathBuf,
-    file: Mutex<Option<std::fs::File>>,
+    state: Mutex<TraceFileState>,
+    max_file_size: u64,
     #[cfg(test)]
     open_count: std::sync::atomic::AtomicU32,
+}
+
+struct TraceFileState {
+    base_path: PathBuf,
+    path: PathBuf,
+    file: Option<std::fs::File>,
+    bytes_written: u64,
+    next_rotation: u32,
+}
+
+impl TraceFileState {
+    /// Adds `written` to the rollover counter, saturating.
+    ///
+    /// `usize` is never wider than `u64` on a supported target, so the
+    /// `u64::MAX` arm is unreachable today. Taking the checked conversion
+    /// anyway keeps the counter from under-counting — and so from skipping a
+    /// rollover — rather than silently truncating if that ever stops holding.
+    fn record_written(&mut self, written: usize) {
+        self.bytes_written = self
+            .bytes_written
+            .saturating_add(u64::try_from(written).unwrap_or(u64::MAX));
+    }
 }
 
 #[derive(Clone)]
 struct SharedTraceFileWriter(Arc<TraceFileWriter>);
 
 impl TraceFileWriter {
-    fn new(path: PathBuf, file: std::fs::File) -> Self {
+    fn new(path: PathBuf, file: std::fs::File, max_file_size: u64) -> Self {
         Self {
-            path,
-            file: Mutex::new(Some(file)),
+            state: Mutex::new(TraceFileState {
+                base_path: path.clone(),
+                path,
+                file: Some(file),
+                bytes_written: 0,
+                next_rotation: 1,
+            }),
+            max_file_size,
             #[cfg(test)]
             open_count: std::sync::atomic::AtomicU32::new(1),
         }
     }
 
-    fn file(&self) -> MutexGuard<'_, Option<std::fs::File>> {
-        self.file
+    fn state(&self) -> MutexGuard<'_, TraceFileState> {
+        self.state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     fn close(&self) {
-        self.file().take();
+        self.state().file.take();
+    }
+
+    fn rotate_if_needed(&self, state: &mut TraceFileState) {
+        if state.bytes_written < self.max_file_size {
+            return;
+        }
+
+        match reserve_rotated_trace_file(&state.base_path, &mut state.next_rotation) {
+            Ok((path, file)) => {
+                state.file = Some(file);
+                state.path = path;
+                state.bytes_written = 0;
+            }
+            Err(error) => {
+                report(format_args!(
+                    "[mssql-odbc] ERROR: could not rotate trace file {:?}: {error}. Continuing in the current file.",
+                    state.path
+                ));
+                // Retry at most once per `max_file_size` bytes. Leaving the counter
+                // at or above the threshold would make every later event re-attempt
+                // rotation, turning a persistent failure (full or read-only volume)
+                // into a burst of failed file-creation syscalls per trace write.
+                state.bytes_written = 0;
+            }
+        }
     }
 }
 
 enum TraceWriter<'writer> {
     Cached {
-        file: MutexGuard<'writer, Option<std::fs::File>>,
+        state: MutexGuard<'writer, TraceFileState>,
     },
     Transient {
         file: std::fs::File,
-        _guard: MutexGuard<'writer, Option<std::fs::File>>,
+        state: MutexGuard<'writer, TraceFileState>,
     },
     Sink(io::Sink),
 }
@@ -100,18 +168,28 @@ enum TraceWriter<'writer> {
 impl Write for TraceWriter<'_> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         match self {
-            Self::Cached { file } => file
-                .as_mut()
-                .ok_or_else(|| io::Error::other("trace file is closed"))?
-                .write(buf),
-            Self::Transient { file, .. } => file.write(buf),
+            Self::Cached { state } => {
+                let written = state
+                    .file
+                    .as_mut()
+                    .ok_or_else(|| io::Error::other("trace file is closed"))?
+                    .write(buf)?;
+                state.record_written(written);
+                Ok(written)
+            }
+            Self::Transient { file, state } => {
+                let written = file.write(buf)?;
+                state.record_written(written);
+                Ok(written)
+            }
             Self::Sink(sink) => sink.write(buf),
         }
     }
 
     fn flush(&mut self) -> io::Result<()> {
         match self {
-            Self::Cached { file } => file
+            Self::Cached { state } => state
+                .file
                 .as_mut()
                 .ok_or_else(|| io::Error::other("trace file is closed"))?
                 .flush(),
@@ -129,54 +207,53 @@ impl<'writer> MakeWriter<'writer> for SharedTraceFileWriter {
             return TraceWriter::Sink(io::sink());
         }
 
-        let file = self.0.file();
+        let state = self.0.state();
         let has_live_env = crate::handles::live_env_count() != 0;
-        self.make_writer_for_env_state(file, has_live_env)
+        self.make_writer_for_env_state(state, has_live_env)
     }
 }
 
 impl SharedTraceFileWriter {
     fn make_writer_for_env_state<'writer>(
         &'writer self,
-        mut cached_file: MutexGuard<'writer, Option<std::fs::File>>,
+        mut state: MutexGuard<'writer, TraceFileState>,
         has_live_env: bool,
     ) -> TraceWriter<'writer> {
+        self.0.rotate_if_needed(&mut state);
+
         if !has_live_env {
-            return match OpenOptions::new().append(true).open(&self.0.path) {
-                Ok(file) => TraceWriter::Transient {
-                    file,
-                    _guard: cached_file,
-                },
+            state.file.take();
+            return match OpenOptions::new().append(true).open(&state.path) {
+                Ok(file) => TraceWriter::Transient { file, state },
                 Err(error) => {
                     report(format_args!(
                         "[mssql-odbc] ERROR: could not reopen trace file {:?}: {error}",
-                        self.0.path
+                        state.path
                     ));
                     TraceWriter::Sink(io::sink())
                 }
             };
         }
 
-        if cached_file.is_none() {
-            match OpenOptions::new().append(true).open(&self.0.path) {
+        if state.file.is_none() {
+            match OpenOptions::new().append(true).open(&state.path) {
                 Ok(reopened) => {
-                    *cached_file = Some(reopened);
+                    state.file = Some(reopened);
                     #[cfg(test)]
                     self.0
                         .open_count
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
                 Err(error) => {
-                    drop(cached_file);
                     report(format_args!(
                         "[mssql-odbc] ERROR: could not reopen trace file {:?}: {error}",
-                        self.0.path
+                        state.path
                     ));
                     return TraceWriter::Sink(io::sink());
                 }
             }
         }
-        TraceWriter::Cached { file: cached_file }
+        TraceWriter::Cached { state }
     }
 }
 
@@ -247,11 +324,21 @@ fn init_file_tracing(dir: OsString) -> Result<(), String> {
     }
 
     let dir = prepare_trace_directory(PathBuf::from(dir))?;
+    let max_file_size_mb = bounded_env_u64(
+        ENV_TRACE_MAX_FILE_SIZE_MB,
+        DEFAULT_MAX_FILE_SIZE_MB,
+        1,
+        MAX_FILE_SIZE_MB,
+    );
 
     let timestamp = Utc::now().format("%Y%m%d%H%M%S%3f").to_string();
     let (log_path, file) = reserve_trace_file(&dir, &timestamp, std::process::id())
         .map_err(|error| format!("could not create a trace file in {dir:?}: {error}"))?;
-    let writer = Arc::new(TraceFileWriter::new(log_path.clone(), file));
+    let writer = Arc::new(TraceFileWriter::new(
+        log_path.clone(),
+        file,
+        max_file_size_mb * 1024 * 1024,
+    ));
 
     let init_result = tracing_subscriber::fmt()
         .with_env_filter(trace_filter())
@@ -270,6 +357,38 @@ fn init_file_tracing(dir: OsString) -> Result<(), String> {
 
     report(format_args!("[mssql-odbc] Tracing to {log_path:?}"));
     Ok(())
+}
+
+/// Validates an operator-supplied bound, falling back to `default` for
+/// anything unparseable or outside `min..=max`.
+///
+/// Split out of [`bounded_env_u64`] so the validation can be tested without
+/// mutating the process environment: `set_var` is unsound while any other
+/// thread may touch the environment, and the test harness runs tests
+/// concurrently with others in this crate that read environment variables.
+fn bounded_value(name: &str, value: &str, default: u64, min: u64, max: u64) -> u64 {
+    match value.parse::<u64>() {
+        Ok(parsed) if (min..=max).contains(&parsed) => parsed,
+        _ => {
+            report(format_args!(
+                "[mssql-odbc] ERROR: Invalid {name} value '{value}'; expected an integer from {min} through {max}. Falling back to {default}."
+            ));
+            default
+        }
+    }
+}
+
+fn bounded_env_u64(name: &str, default: u64, min: u64, max: u64) -> u64 {
+    match std::env::var(name) {
+        Ok(value) => bounded_value(name, &value, default, min, max),
+        Err(std::env::VarError::NotPresent) => default,
+        Err(error) => {
+            report(format_args!(
+                "[mssql-odbc] ERROR: Could not read {name}: {error}. Falling back to {default}."
+            ));
+            default
+        }
+    }
 }
 
 fn prepare_trace_directory(dir: PathBuf) -> Result<PathBuf, String> {
@@ -322,6 +441,54 @@ fn reserve_trace_file(
     Err(io::Error::new(
         io::ErrorKind::AlreadyExists,
         "could not allocate a unique trace filename",
+    ))
+}
+
+fn reserve_rotated_trace_file(
+    current_path: &Path,
+    next_rotation: &mut u32,
+) -> io::Result<(PathBuf, std::fs::File)> {
+    let directory = current_path
+        .parent()
+        .ok_or_else(|| io::Error::other("trace path has no parent directory"))?;
+    let stem = current_path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .ok_or_else(|| io::Error::other("trace filename is not valid UTF-8"))?;
+
+    for _ in 0..MAX_FILENAME_ATTEMPTS {
+        let path = directory.join(format!("{stem}.{}.log", *next_rotation));
+        let mut options = OpenOptions::new();
+        options.create_new(true).write(true);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+
+        match options.open(&path) {
+            Ok(file) => {
+                // The suffix is now taken by a real file.
+                *next_rotation = next_rotation.saturating_add(1);
+                return Ok((path, file));
+            }
+            // Something else already holds this suffix, so skip it for good.
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                *next_rotation = next_rotation.saturating_add(1);
+                continue;
+            }
+            // Nothing was created, so the suffix must stay available. Burning
+            // it on a transient failure would leave a gap in the sequence once
+            // the volume recovers, and a missing number reads as a deleted
+            // file — which this driver never does.
+            Err(error) => return Err(error),
+        }
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not allocate a unique rotated trace filename",
     ))
 }
 
@@ -478,15 +645,15 @@ mod tests {
     fn trace_file_writer_reuses_the_handle_until_closed() {
         let dir = test_directory("writer");
         let (path, file) = reserve_trace_file(&dir, "20260910123456789", 42).unwrap();
-        let writer = Arc::new(TraceFileWriter::new(path.clone(), file));
+        let writer = Arc::new(TraceFileWriter::new(path.clone(), file, u64::MAX));
         let make_writer = SharedTraceFileWriter(Arc::clone(&writer));
 
         make_writer
-            .make_writer_for_env_state(writer.file(), true)
+            .make_writer_for_env_state(writer.state(), true)
             .write_all(b"first\n")
             .unwrap();
         make_writer
-            .make_writer_for_env_state(writer.file(), true)
+            .make_writer_for_env_state(writer.state(), true)
             .write_all(b"second\n")
             .unwrap();
 
@@ -498,7 +665,7 @@ mod tests {
         std::fs::rename(&moved_path, &path).unwrap();
 
         make_writer
-            .make_writer_for_env_state(writer.file(), true)
+            .make_writer_for_env_state(writer.state(), true)
             .write_all(b"third\n")
             .unwrap();
         assert_eq!(writer.open_count.load(Ordering::Relaxed), 2);
@@ -515,15 +682,66 @@ mod tests {
     fn trace_file_writer_does_not_cache_without_an_environment() {
         let dir = test_directory("transient-writer");
         let (path, file) = reserve_trace_file(&dir, "20260910123456789", 42).unwrap();
-        let writer = Arc::new(TraceFileWriter::new(path.clone(), file));
+        let writer = Arc::new(TraceFileWriter::new(path.clone(), file, u64::MAX));
         writer.close();
         let make_writer = SharedTraceFileWriter(Arc::clone(&writer));
 
         make_writer
-            .make_writer_for_env_state(writer.file(), false)
+            .make_writer_for_env_state(writer.state(), false)
             .write_all(b"first\n")
             .unwrap();
-        assert!(writer.file().is_none());
+        assert!(writer.state().file.is_none());
+
+        remove_dir_all(dir).unwrap();
+    }
+
+    /// The no-ENV path writes through a handle reopened per event rather than
+    /// the cached one, and it has to keep the same rollover accounting. The
+    /// test above pins only that nothing is cached, with a `u64::MAX`
+    /// threshold, so dropping `record_written` from `TraceWriter::Transient`
+    /// leaves it green — and a process with no live environment would then
+    /// write one unbounded file, which is the failure AB#48091 exists to
+    /// remove.
+    #[test]
+    fn rotation_follows_the_writer_without_an_environment_too() {
+        let dir = test_directory("transient-rotation");
+        let (path, file) = reserve_trace_file(&dir, "20260910123456789", 42).unwrap();
+        let writer = Arc::new(TraceFileWriter::new(path.clone(), file, 5));
+        let make_writer = SharedTraceFileWriter(Arc::clone(&writer));
+        writer.close();
+
+        let write = |payload: &[u8]| {
+            make_writer
+                .make_writer_for_env_state(writer.state(), false)
+                .write_all(payload)
+                .unwrap();
+        };
+        let rotated = path.with_file_name(format!(
+            "{}.1.log",
+            path.file_stem().unwrap().to_string_lossy()
+        ));
+
+        write(b"first");
+        assert_eq!(
+            writer.state().bytes_written,
+            5,
+            "the no-ENV path must advance the rollover counter like the cached one"
+        );
+
+        write(b"second"); // crosses the 5-byte limit, so this event rolls over
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "first");
+        assert_eq!(std::fs::read_to_string(&rotated).unwrap(), "second");
+
+        // A failed reservation must leave this path writing to the current
+        // file and must not consume the number, exactly as the cached path does.
+        writer.state().base_path = dir.join("absent").join("mssql_tds_trace.log");
+        write(b"third");
+        assert_eq!(
+            writer.state().next_rotation,
+            2,
+            "a transient failure must not burn a rollover number"
+        );
+        assert_eq!(std::fs::read_to_string(&rotated).unwrap(), "secondthird");
 
         remove_dir_all(dir).unwrap();
     }
@@ -532,15 +750,15 @@ mod tests {
     fn trace_file_writer_recovers_a_poisoned_lock() {
         let dir = test_directory("poison");
         let (path, file) = reserve_trace_file(&dir, "20260910123456789", 42).unwrap();
-        let writer = Arc::new(TraceFileWriter::new(path.clone(), file));
+        let writer = Arc::new(TraceFileWriter::new(path.clone(), file, u64::MAX));
         let make_writer = SharedTraceFileWriter(Arc::clone(&writer));
         let _ = std::panic::catch_unwind(|| {
-            let _guard = writer.file.lock().unwrap();
+            let _guard = writer.state.lock().unwrap();
             panic!("poison the trace serialization lock");
         });
 
         make_writer
-            .make_writer_for_env_state(writer.file(), true)
+            .make_writer_for_env_state(writer.state(), true)
             .write_all(b"after poison\n")
             .unwrap();
 
@@ -553,17 +771,206 @@ mod tests {
     fn event_writer_serializes_close_until_it_is_dropped() {
         let dir = test_directory("close-serialization");
         let (path, file) = reserve_trace_file(&dir, "20260910123456789", 42).unwrap();
-        let writer = Arc::new(TraceFileWriter::new(path, file));
+        let writer = Arc::new(TraceFileWriter::new(path, file, u64::MAX));
         let make_writer = SharedTraceFileWriter(Arc::clone(&writer));
-        let event_writer = make_writer.make_writer_for_env_state(writer.file(), true);
+        let event_writer = make_writer.make_writer_for_env_state(writer.state(), true);
 
         assert!(matches!(
-            writer.file.try_lock(),
+            writer.state.try_lock(),
             Err(std::sync::TryLockError::WouldBlock)
         ));
         drop(event_writer);
         writer.close();
-        assert!(writer.file().is_none());
+        assert!(writer.state().file.is_none());
+        remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn trace_file_writer_rotates_between_events_and_keeps_every_file() {
+        let dir = test_directory("rotation");
+        let (path, file) = reserve_trace_file(&dir, "20260910123456789", 42).unwrap();
+        let writer = Arc::new(TraceFileWriter::new(path.clone(), file, 5));
+        let make_writer = SharedTraceFileWriter(Arc::clone(&writer));
+        let rotation = |index: u32| {
+            path.with_file_name(format!(
+                "{}.{index}.log",
+                path.file_stem().unwrap().to_string_lossy()
+            ))
+        };
+
+        // The 5-byte threshold is reached by each write, so the next event rolls
+        // over. An event is never split across two files.
+        for payload in [
+            b"first".as_slice(),
+            b"second".as_slice(),
+            b"third".as_slice(),
+        ] {
+            make_writer
+                .make_writer_for_env_state(writer.state(), true)
+                .write_all(payload)
+                .unwrap();
+        }
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "first");
+        assert_eq!(std::fs::read_to_string(rotation(1)).unwrap(), "second");
+        assert_eq!(std::fs::read_to_string(rotation(2)).unwrap(), "third");
+
+        writer.close();
+        remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn rotation_never_removes_an_earlier_trace_file() {
+        let dir = test_directory("no-deletion");
+        let (path, file) = reserve_trace_file(&dir, "20260910123456789", 42).unwrap();
+        let writer = Arc::new(TraceFileWriter::new(path, file, 1));
+        let make_writer = SharedTraceFileWriter(Arc::clone(&writer));
+
+        // A one-byte threshold rolls over on every event after the first.
+        for _ in 0..12 {
+            make_writer
+                .make_writer_for_env_state(writer.state(), true)
+                .write_all(b"x")
+                .unwrap();
+        }
+        writer.close();
+
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            12,
+            "the driver must retain every rotated trace file"
+        );
+        remove_dir_all(dir).unwrap();
+    }
+
+    /// The rollover-failure arm: a full or read-only volume must not stop the
+    /// driver writing, and must not re-attempt rotation on every later event.
+    #[test]
+    fn a_failed_rollover_keeps_writing_and_retries_once_per_limit() {
+        let dir = test_directory("rotation-failure");
+        let (path, file) = reserve_trace_file(&dir, "20260910123456789", 42).unwrap();
+        let writer = Arc::new(TraceFileWriter::new(path.clone(), file, 8));
+        let make_writer = SharedTraceFileWriter(Arc::clone(&writer));
+
+        // Point rollover at a directory that does not exist, so reserving the
+        // next file fails the way an unwritable volume would.
+        writer.state().base_path = dir.join("absent").join("mssql_tds_trace.log");
+
+        let write = |payload: &[u8]| {
+            make_writer
+                .make_writer_for_env_state(writer.state(), true)
+                .write_all(payload)
+                .unwrap();
+        };
+
+        write(b"aaaaaaaa"); // reaches the 8-byte limit
+        assert_eq!(writer.state().bytes_written, 8);
+
+        write(b"bb"); // crosses it: one failed rollover attempt, then 2 bytes
+        assert_eq!(
+            writer.state().bytes_written,
+            2,
+            "a failed rollover must still reset the counter"
+        );
+
+        write(b"cc"); // still under the limit: must not retry
+        assert_eq!(
+            writer.state().bytes_written,
+            4,
+            "rollover must be retried at most once per max_file_size, not per event"
+        );
+
+        // Reaching the limit again must produce a *second* attempt: a
+        // regression that gave up permanently after the first failure would
+        // otherwise pass everything above.
+        write(b"dddd"); // 4 + 4 = 8; the check runs before the write, so no attempt yet
+        assert_eq!(writer.state().bytes_written, 8);
+
+        write(b"e"); // crosses again: second attempt, fails, counter resets
+        assert_eq!(
+            writer.state().bytes_written,
+            1,
+            "rotation must be attempted again once the limit is reached a second time"
+        );
+
+        // A failed create must not consume the suffix: nothing was written to
+        // `.1.log`, so a later recovery has to reuse it rather than skip to
+        // `.2.log` and leave a gap that reads as a deleted file.
+        assert_eq!(
+            writer.state().next_rotation,
+            1,
+            "a transient failure must not burn a rollover number"
+        );
+
+        // Writing continued in the original file and nothing new was created.
+        writer.close();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "aaaaaaaabbccdddde");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        remove_dir_all(dir).unwrap();
+    }
+
+    /// Once the volume recovers, rollover must resume at the number the failed
+    /// attempt did not consume, so the sequence stays contiguous.
+    #[test]
+    fn a_recovered_rollover_reuses_the_number_the_failure_left_free() {
+        let dir = test_directory("rotation-recovery");
+        let (path, file) = reserve_trace_file(&dir, "20260910123456789", 42).unwrap();
+        let mut next_rotation = 1;
+        let absent = dir.join("absent").join("mssql_tds_trace.log");
+
+        // Fails: the parent directory does not exist.
+        assert!(reserve_rotated_trace_file(&absent, &mut next_rotation).is_err());
+        assert_eq!(next_rotation, 1, "a failed create must not take the number");
+
+        // The same counter now yields `.1.log` against a usable directory.
+        let (recovered, _handle) = reserve_rotated_trace_file(&path, &mut next_rotation).unwrap();
+        assert_eq!(
+            recovered.file_name().unwrap(),
+            format!("{}.1.log", path.file_stem().unwrap().to_string_lossy()).as_str()
+        );
+        assert_eq!(next_rotation, 2);
+
+        drop(file);
+        remove_dir_all(dir).unwrap();
+    }
+
+    /// `MSSQL_TDS_TRACE_MAX_FILE_SIZE_MB` is operator-supplied, so every
+    /// rejected shape must fall back to the default rather than propagate.
+    ///
+    /// Exercises [`bounded_value`] rather than [`bounded_env_u64`]: setting an
+    /// environment variable is unsound while sibling tests may be reading one
+    /// concurrently, so the validation is tested where it is pure.
+    #[test]
+    fn bounded_value_rejects_out_of_range_and_malformed_values() {
+        const NAME: &str = "MSSQL_TDS_TRACE_MAX_FILE_SIZE_MB";
+        const DEFAULT: u64 = 100;
+
+        let bounded = |value: &str| bounded_value(NAME, value, DEFAULT, 1, 1024);
+
+        for rejected in ["0", "1025", "abc", "", "-1", "12.5", "99999999999999999999"] {
+            assert_eq!(bounded(rejected), DEFAULT, "{rejected:?} should fall back");
+        }
+
+        for (accepted, expected) in [("1", 1), ("512", 512), ("1024", 1024)] {
+            assert_eq!(bounded(accepted), expected, "{accepted:?} is in range");
+        }
+    }
+
+    #[test]
+    fn an_unrelated_file_in_the_trace_directory_is_left_alone() {
+        // Init-time behaviour is covered end-to-end in
+        // `tests/e2e/tests/trace_rotation_test.cpp`, which loads the real driver.
+        // Asserting it here would require installing a global tracing subscriber,
+        // which would redirect every later test in this binary.
+        let dir = test_directory("no-cleanup");
+        let bystander = dir.join("mssql_tds_trace_from_another_process.log");
+        std::fs::write(&bystander, b"keep").unwrap();
+
+        let resolved = prepare_trace_directory(dir.clone()).unwrap();
+        let (_path, file) = reserve_trace_file(&resolved, "20260910123456789", 42).unwrap();
+        drop(file);
+
+        assert_eq!(std::fs::read_to_string(&bystander).unwrap(), "keep");
         remove_dir_all(dir).unwrap();
     }
 

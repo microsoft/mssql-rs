@@ -9,7 +9,9 @@ mod query_result_reads {
         ExpectedQueryResultType, begin_connection, build_tcp_datasource,
         connect_query_and_validate, run_query_and_check_results,
     };
-    use mssql_tds::connection::tds_client::ResultSet;
+    use mssql_tds::connection::tds_client::{
+        BatchErrorMode, ExecuteOptions, ResultSet, StatementResult, TdsClient,
+    };
     use mssql_tds::datatypes::column_values::ColumnValues;
     use mssql_tds::error::Error::{SqlServerError, UsageError};
 
@@ -658,6 +660,527 @@ mod query_result_reads {
         // Make sure the connection is still usable.
         let expected = [ExpectedQueryResultType::Result(1)];
         run_query_and_check_results(&mut connection, "SELECT 1".to_string(), &expected).await;
+    }
+
+    /// One thing observed while walking a batch statement by statement.
+    #[derive(Debug, PartialEq)]
+    enum Step {
+        /// A row set: the first column of each row, then its DONE count.
+        Rows(Vec<i32>, Option<u64>),
+        /// A row set that failed part-way: the rows read before the error, then
+        /// the error's messages.
+        RowsThenError(Vec<i32>, Vec<String>),
+        /// A no-row statement's count.
+        Count(Option<u64>),
+        /// A statement error.
+        Error(Vec<String>),
+    }
+
+    fn messages(diagnostics: &mssql_tds::error::SqlServerDiagnostics) -> Vec<String> {
+        diagnostics
+            .errors
+            .iter()
+            .map(|e| e.message.clone())
+            .collect()
+    }
+
+    /// Walks a batch the way a sqlcmd-style tool does: every error arrives as
+    /// `Err` at the statement that failed, `has_open_batch` says whether the
+    /// batch goes on, and every count comes from the walk itself.
+    async fn walk(connection: &mut TdsClient, sql: &str, mode: BatchErrorMode) -> Vec<Step> {
+        let mut steps = Vec::new();
+        let mut result = connection
+            .execute(sql.to_string(), ExecuteOptions::new().on_error(mode))
+            .await;
+        loop {
+            match result {
+                Ok(StatementResult::Rows) => {
+                    let mut values = Vec::new();
+                    loop {
+                        match connection.next_row().await {
+                            Ok(Some(row)) => match row[0] {
+                                ColumnValues::Int(v) => values.push(v),
+                                ref other => panic!("expected an int first column, got {other:?}"),
+                            },
+                            Ok(None) => {
+                                steps.push(Step::Rows(values, connection.last_result_row_count()));
+                                break;
+                            }
+                            Err(SqlServerError { diagnostics }) => {
+                                steps.push(Step::RowsThenError(values, messages(&diagnostics)));
+                                if !connection.has_open_batch() {
+                                    return steps;
+                                }
+                                break;
+                            }
+                            Err(e) => panic!("row read failed: {e:?}"),
+                        }
+                    }
+                }
+                Ok(StatementResult::NoRows { rows_affected }) => {
+                    steps.push(Step::Count(rows_affected));
+                }
+                Ok(StatementResult::End) => break,
+                Err(SqlServerError { diagnostics }) => {
+                    steps.push(Step::Error(messages(&diagnostics)));
+                    if !connection.has_open_batch() {
+                        break;
+                    }
+                }
+                Err(e) => panic!("batch failed: {e:?}"),
+            }
+            result = connection.advance().await;
+        }
+        steps
+    }
+
+    /// The walk must leave the connection clean for the next command.
+    async fn assert_still_usable(connection: &mut TdsClient) {
+        assert!(!connection.has_open_batch());
+        let expected = [ExpectedQueryResultType::Result(1)];
+        run_query_and_check_results(connection, "SELECT 1".to_string(), &expected).await;
+    }
+
+    /// Runs DDL that sets up a test, such as a temporary procedure.
+    async fn run_ddl(connection: &mut TdsClient, sql: &str) {
+        connection.execute(sql.to_string(), ()).await.unwrap();
+        connection.close_query().await.unwrap();
+    }
+
+    /// Variable assignment is tagged `SQLSELECT` and still carries a count; a
+    /// tool must not print a row count for `SET @x = 1`. The expected sequence is
+    /// what ODBC `sqlcmd` prints for this batch: one count for the INSERT and one
+    /// for the real SELECT, nothing else.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn variable_assignment_counts_are_not_reported() {
+        let mut connection = begin_connection(&build_tcp_datasource()).await;
+
+        let steps = walk(
+            &mut connection,
+            "DECLARE @x int; SET @x = 1; CREATE TABLE #va (i int); \
+             INSERT INTO #va VALUES (1),(2); SELECT @x = i FROM #va; \
+             SELECT i FROM #va ORDER BY i;",
+            BatchErrorMode::Abort,
+        )
+        .await;
+
+        assert_eq!(
+            steps,
+            vec![Step::Count(Some(2)), Step::Rows(vec![1, 2], Some(2))]
+        );
+        assert_still_usable(&mut connection).await;
+    }
+
+    /// A DML batch reports one count per statement, in order, through the
+    /// statement walk — what a tool printing "(N rows affected)" after each
+    /// statement needs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn statement_counts_arrive_one_per_statement() {
+        let mut connection = begin_connection(&build_tcp_datasource()).await;
+
+        let steps = walk(
+            &mut connection,
+            "CREATE TABLE #counts (i int); \
+             INSERT INTO #counts VALUES (1), (2), (3); \
+             UPDATE #counts SET i = i * 2 WHERE i > 1; \
+             DELETE FROM #counts;",
+            BatchErrorMode::Abort,
+        )
+        .await;
+
+        // CREATE reports no count and is collapsed; the DML reports 3, 2 and 3.
+        assert_eq!(
+            steps,
+            vec![
+                Step::Count(Some(3)),
+                Step::Count(Some(2)),
+                Step::Count(Some(3))
+            ]
+        );
+    }
+
+    /// `SET NOCOUNT ON` suppresses the count itself. A row set still returns its
+    /// rows, but its count must read as "none reported", not as the rows read.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn nocount_reports_no_counts() {
+        let mut connection = begin_connection(&build_tcp_datasource()).await;
+
+        let steps = walk(
+            &mut connection,
+            "SET NOCOUNT ON; CREATE TABLE #nc (i int); INSERT INTO #nc VALUES (1), (2); \
+             SELECT i FROM #nc ORDER BY i;",
+            BatchErrorMode::Abort,
+        )
+        .await;
+
+        assert_eq!(steps, vec![Step::Rows(vec![1, 2], None)]);
+    }
+
+    /// Under `Continue`, a statement that fails mid-batch no longer hides the
+    /// result sets after it, and its error arrives in order between them.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn continue_exposes_results_after_the_failing_statement() {
+        let mut connection = begin_connection(&build_tcp_datasource()).await;
+
+        let steps = walk(
+            &mut connection,
+            "SELECT 1 AS a; RAISERROR('boom', 16, 1); SELECT 2 AS b;",
+            BatchErrorMode::Continue,
+        )
+        .await;
+
+        assert_eq!(
+            steps,
+            vec![
+                Step::Rows(vec![1], Some(1)),
+                Step::Error(vec!["boom".to_string()]),
+                Step::Rows(vec![2], Some(1)),
+            ]
+        );
+        assert_still_usable(&mut connection).await;
+    }
+
+    /// `Abort` is the default and unchanged: the batch ends at the first error.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn abort_still_ends_the_batch_at_the_first_error() {
+        let mut connection = begin_connection(&build_tcp_datasource()).await;
+
+        let steps = walk(
+            &mut connection,
+            "SELECT 1 AS a; RAISERROR('boom', 16, 1); SELECT 2 AS b;",
+            BatchErrorMode::Abort,
+        )
+        .await;
+
+        assert_eq!(
+            steps,
+            vec![
+                Step::Rows(vec![1], Some(1)),
+                Step::Error(vec!["boom".to_string()]),
+            ]
+        );
+        assert_still_usable(&mut connection).await;
+    }
+
+    /// An error in the last statement is still returned as `Err` — it is not
+    /// folded into a normal end of results.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn continue_reports_an_error_in_the_last_statement() {
+        let mut connection = begin_connection(&build_tcp_datasource()).await;
+
+        let steps = walk(
+            &mut connection,
+            "SELECT 1 AS a; RAISERROR('last', 16, 1);",
+            BatchErrorMode::Continue,
+        )
+        .await;
+
+        assert_eq!(
+            steps,
+            vec![
+                Step::Rows(vec![1], Some(1)),
+                Step::Error(vec!["last".to_string()]),
+            ]
+        );
+        assert_still_usable(&mut connection).await;
+    }
+
+    /// A statement can fail with more than one ERROR token: adding a primary
+    /// key over duplicate values sends the duplicate-key error (1505) and then
+    /// "could not create constraint" (1750), on every server OS. Under
+    /// `Continue` that is one failed statement — one `Err` carrying both. This
+    /// failure also aborts the batch server-side, so the walk then reaches the
+    /// end, and the connection is still usable.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn continue_returns_every_error_of_a_statement_together() {
+        let mut connection = begin_connection(&build_tcp_datasource()).await;
+
+        let steps = walk(
+            &mut connection,
+            "SET NOCOUNT ON; CREATE TABLE #dup (i int NOT NULL); \
+             INSERT INTO #dup VALUES (1), (1); SET NOCOUNT OFF; \
+             SELECT 1 AS a; \
+             ALTER TABLE #dup ADD PRIMARY KEY (i); \
+             SELECT 2 AS b;",
+            BatchErrorMode::Continue,
+        )
+        .await;
+
+        assert_eq!(steps.len(), 2, "got {steps:?}");
+        assert_eq!(steps[0], Step::Rows(vec![1], Some(1)));
+        match &steps[1] {
+            Step::Error(errors) => {
+                assert_eq!(errors.len(), 2, "both errors in one Err, got {errors:?}");
+            }
+            other => panic!("expected one failed statement, got {other:?}"),
+        }
+        assert_still_usable(&mut connection).await;
+    }
+
+    /// An error inside a row set comes from `next_row`: the rows read before it
+    /// are kept, and `advance` moves on to the next statement. Divide-by-zero
+    /// ends only its statement, so the server goes on to the next one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn continue_keeps_rows_read_before_an_error_inside_a_row_set() {
+        let mut connection = begin_connection(&build_tcp_datasource()).await;
+
+        let steps = walk(
+            &mut connection,
+            "SET ANSI_WARNINGS ON; CREATE TABLE #div (id int PRIMARY KEY CLUSTERED, x int); \
+             INSERT INTO #div VALUES (1, 1), (2, 2), (3, 0), (4, 5); \
+             SELECT 10 / x AS v FROM #div ORDER BY id; \
+             SELECT 7 AS w;",
+            BatchErrorMode::Continue,
+        )
+        .await;
+
+        assert_eq!(steps.len(), 3, "got {steps:?}");
+        assert_eq!(steps[0], Step::Count(Some(4)));
+        match &steps[1] {
+            Step::RowsThenError(values, errors) => {
+                assert_eq!(values, &vec![10, 5], "rows before the error are kept");
+                assert_eq!(errors.len(), 1);
+                assert!(errors[0].contains("Divide by zero"), "got {errors:?}");
+            }
+            other => panic!("expected rows then an error, got {other:?}"),
+        }
+        assert_eq!(steps[2], Step::Rows(vec![7], Some(1)));
+        assert_still_usable(&mut connection).await;
+    }
+
+    /// `Continue` cannot resurrect statements the server never ran. A
+    /// conversion error aborts the whole batch server-side, so after it the walk
+    /// reaches the end of results — with the error reported and the rows before
+    /// it kept — and the connection is still usable.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn continue_ends_when_the_server_aborts_the_batch() {
+        let mut connection = begin_connection(&build_tcp_datasource()).await;
+
+        let steps = walk(
+            &mut connection,
+            "CREATE TABLE #conv (id int PRIMARY KEY CLUSTERED, s varchar(10)); \
+             INSERT INTO #conv VALUES (1, '10'), (2, '20'), (3, 'x'), (4, '40'); \
+             SELECT CONVERT(int, s) AS v FROM #conv ORDER BY id; \
+             SELECT 7 AS w;",
+            BatchErrorMode::Continue,
+        )
+        .await;
+
+        assert_eq!(steps.len(), 2, "got {steps:?}");
+        assert_eq!(steps[0], Step::Count(Some(4)));
+        match &steps[1] {
+            Step::RowsThenError(values, errors) => {
+                assert_eq!(values, &vec![10, 20], "rows before the error are kept");
+                assert!(errors[0].contains("Conversion failed"), "got {errors:?}");
+            }
+            other => panic!("expected rows then an error, got {other:?}"),
+        }
+        assert_still_usable(&mut connection).await;
+    }
+
+    /// A failing statement inside a procedure is reflected by its DONEINPROC and
+    /// by the procedure's DONEPROC. Walking past it must accept both, and must
+    /// still reach the rest of the procedure and of the batch.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn continue_walks_through_a_failing_stored_procedure() {
+        let mut connection = begin_connection(&build_tcp_datasource()).await;
+        run_ddl(
+            &mut connection,
+            "CREATE PROCEDURE #fails AS BEGIN RAISERROR('in proc', 16, 1); SELECT 2 AS b; END",
+        )
+        .await;
+
+        let steps = walk(
+            &mut connection,
+            "EXEC #fails; SELECT 3 AS c;",
+            BatchErrorMode::Continue,
+        )
+        .await;
+
+        assert_eq!(
+            steps,
+            vec![
+                Step::Error(vec!["in proc".to_string()]),
+                Step::Rows(vec![2], Some(1)),
+                Step::Rows(vec![3], Some(1)),
+            ]
+        );
+        assert_still_usable(&mut connection).await;
+    }
+
+    /// The same through a nested call, where more than one procedure completes
+    /// after the error.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn continue_walks_through_a_nested_failing_procedure() {
+        let mut connection = begin_connection(&build_tcp_datasource()).await;
+        run_ddl(
+            &mut connection,
+            "CREATE PROCEDURE #inner_fails AS RAISERROR('inner', 16, 1);",
+        )
+        .await;
+        run_ddl(
+            &mut connection,
+            "CREATE PROCEDURE #outer_calls AS BEGIN EXEC #inner_fails; SELECT 4 AS d; END",
+        )
+        .await;
+
+        let steps = walk(
+            &mut connection,
+            "EXEC #outer_calls; SELECT 5 AS e;",
+            BatchErrorMode::Continue,
+        )
+        .await;
+
+        assert_eq!(
+            steps,
+            vec![
+                Step::Error(vec!["inner".to_string()]),
+                Step::Rows(vec![4], Some(1)),
+                Step::Rows(vec![5], Some(1)),
+            ]
+        );
+        assert_still_usable(&mut connection).await;
+    }
+
+    /// Errors unwinding nested procedures. SQL Server flags only the failing
+    /// statement's DONEINPROC; the enclosing DONEINPROC/DONEPROC frames arrive
+    /// unflagged, and a batch-aborting error ends the response with a single
+    /// error-flagged DONE and no procedure frames. Each shape must walk to the
+    /// end without a `ProtocolError` and leave the connection usable.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn continue_walks_through_errors_unwinding_nested_procedures() {
+        let conversion =
+            "Conversion failed when converting the varchar value 'x' to data type int.";
+        let divide = "Divide by zero error encountered.";
+        let cases: Vec<(&[&str], &str, Vec<Step>)> = vec![
+            // Statement error as the last statement, three frames deep.
+            (
+                &[
+                    "CREATE PROCEDURE #deep_inner AS RAISERROR('inner', 16, 1);",
+                    "CREATE PROCEDURE #deep_middle AS EXEC #deep_inner;",
+                    "CREATE PROCEDURE #deep_outer AS EXEC #deep_middle;",
+                ],
+                "EXEC #deep_outer; SELECT 5 AS e;",
+                vec![
+                    Step::Error(vec!["inner".to_string()]),
+                    Step::Rows(vec![5], Some(1)),
+                ],
+            ),
+            // Batch abort without a row set.
+            (
+                &[
+                    "CREATE PROCEDURE #abort_inner AS BEGIN DECLARE @i int = CONVERT(int, 'x'); END",
+                    "CREATE PROCEDURE #abort_outer AS BEGIN EXEC #abort_inner; SELECT 4 AS d; END",
+                ],
+                "EXEC #abort_outer; SELECT 5 AS e;",
+                vec![Step::Error(vec![conversion.to_string()])],
+            ),
+            // Batch abort inside a row set.
+            (
+                &[
+                    "CREATE PROCEDURE #rows_inner AS SELECT CONVERT(int, 'x');",
+                    "CREATE PROCEDURE #rows_outer AS BEGIN EXEC #rows_inner; SELECT 4 AS d; END",
+                ],
+                "EXEC #rows_outer; SELECT 5 AS e;",
+                vec![Step::RowsThenError(vec![], vec![conversion.to_string()])],
+            ),
+            // XACT_ABORT turns a statement error into a batch abort.
+            (
+                &[
+                    "CREATE PROCEDURE #xact_inner AS BEGIN DECLARE @i int = 1/0; SELECT 3 AS c; END",
+                    "CREATE PROCEDURE #xact_outer AS BEGIN EXEC #xact_inner; SELECT 4 AS d; END",
+                ],
+                "SET XACT_ABORT ON; EXEC #xact_outer; SELECT 5 AS e;",
+                vec![Step::Error(vec![divide.to_string()])],
+            ),
+        ];
+
+        for (ddl, sql, expected) in cases {
+            let mut connection = begin_connection(&build_tcp_datasource()).await;
+            for statement in ddl {
+                run_ddl(&mut connection, statement).await;
+            }
+            let steps = walk(&mut connection, sql, BatchErrorMode::Continue).await;
+            assert_eq!(steps, expected, "{sql}");
+            assert_still_usable(&mut connection).await;
+        }
+    }
+
+    /// Row counts around a failing statement inside a procedure. Each count
+    /// arrives on its own DONEINPROC and is reported once; the procedure's
+    /// DONEPROC carries no count (live captures show it as MORE only, with or
+    /// without the error), so nothing is reported twice or hidden.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn continue_reports_each_count_once_around_a_failing_procedure_statement() {
+        let conversion =
+            "Conversion failed when converting the varchar value 'x' to data type int.";
+        let cases: Vec<(&str, &str, Vec<Step>)> = vec![
+            (
+                "CREATE PROCEDURE #err_then_insert AS BEGIN RAISERROR('x', 16, 1); \
+                 CREATE TABLE #t1 (i int); INSERT #t1 VALUES (1),(2); END",
+                "EXEC #err_then_insert; SELECT 5 AS e;",
+                vec![
+                    Step::Error(vec!["x".to_string()]),
+                    Step::Count(Some(2)),
+                    Step::Rows(vec![5], Some(1)),
+                ],
+            ),
+            (
+                "CREATE PROCEDURE #insert_then_err AS BEGIN CREATE TABLE #t2 (i int); \
+                 INSERT #t2 VALUES (1),(2); RAISERROR('x', 16, 1); END",
+                "EXEC #insert_then_err; SELECT 5 AS e;",
+                vec![
+                    Step::Count(Some(2)),
+                    Step::Error(vec!["x".to_string()]),
+                    Step::Rows(vec![5], Some(1)),
+                ],
+            ),
+            // A batch-aborting error after a count: the count stays, the batch ends.
+            (
+                "CREATE PROCEDURE #insert_then_abort AS BEGIN CREATE TABLE #t3 (i int); \
+                 INSERT #t3 VALUES (1); UPDATE #t3 SET i = CONVERT(int, 'x'); END",
+                "EXEC #insert_then_abort; SELECT 5 AS e;",
+                vec![
+                    Step::Count(Some(1)),
+                    Step::Error(vec![conversion.to_string()]),
+                ],
+            ),
+        ];
+
+        for (ddl, sql, expected) in cases {
+            let mut connection = begin_connection(&build_tcp_datasource()).await;
+            run_ddl(&mut connection, ddl).await;
+            let steps = walk(&mut connection, sql, BatchErrorMode::Continue).await;
+            assert_eq!(steps, expected, "{sql}");
+            assert_still_usable(&mut connection).await;
+        }
+    }
+
+    /// `close_query` under `Continue` drains past errors instead of stopping at
+    /// the first one, which would leave unread tokens behind; the errors it
+    /// skipped are returned.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn close_query_drains_a_continue_batch_past_its_errors() {
+        let mut connection = begin_connection(&build_tcp_datasource()).await;
+
+        let first = connection
+            .execute(
+                "SELECT 1 AS a; RAISERROR('one', 16, 1); SELECT 2 AS b; \
+                 RAISERROR('two', 16, 1); SELECT 3 AS c;"
+                    .to_string(),
+                ExecuteOptions::new().on_error(BatchErrorMode::Continue),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first, StatementResult::Rows);
+
+        match connection.close_query().await {
+            Err(SqlServerError { diagnostics }) => {
+                assert_eq!(messages(&diagnostics), vec!["one", "two"]);
+            }
+            other => panic!("expected the skipped errors, got {other:?}"),
+        }
+        assert_still_usable(&mut connection).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

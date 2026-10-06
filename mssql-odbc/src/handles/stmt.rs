@@ -5,6 +5,7 @@ use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use tracing::error;
 
@@ -663,6 +664,42 @@ const INERT_STMT_ATTRS: &[(SqlInteger, SqlULen)] = &[
     (odbc_types::SQL_ATTR_METADATA_ID, 0),
 ];
 
+/// The subset of [`INERT_STMT_ATTRS`] the execution path actually reads back.
+///
+/// These are stored and round-tripped like the rest of the inert set, but
+/// storing them is *not* without effect, so they must not be reported as
+/// ignored. Keep this in step with the consumers:
+/// - `SQL_ATTR_NOSCAN` via [`InertStmtAttrs::noscan`] (`prepare`, `exec_direct`,
+///   `execute`),
+/// - `SQL_ATTR_PARAM_BIND_OFFSET_PTR` via [`InertStmtAttrs::param_bind_offset`],
+/// - the remaining parameter-array attributes, read by `execute` and
+///   `exec_common` when binding and reporting a parameter set.
+const HONOURED_INERT_STMT_ATTRS: &[SqlInteger] = &[
+    odbc_types::SQL_ATTR_NOSCAN,
+    odbc_types::SQL_ATTR_PARAM_BIND_OFFSET_PTR,
+    odbc_types::SQL_ATTR_PARAM_BIND_TYPE,
+    odbc_types::SQL_ATTR_PARAM_OPERATION_PTR,
+    odbc_types::SQL_ATTR_PARAM_STATUS_PTR,
+    odbc_types::SQL_ATTR_PARAMS_PROCESSED_PTR,
+];
+
+/// One bit per [`INERT_STMT_ATTRS`] entry, set the first time that attribute is
+/// reported as stored without effect.
+///
+/// Latched per attribute rather than once for the whole category. The two
+/// cursor substitutions can share a single latch because they post `01S02` to
+/// the caller on every call, so suppressing a repeat loses nothing. This arm
+/// returns `SQL_SUCCESS` with no diagnostic at all, which makes the trace line
+/// the only channel that ever reports the attribute was ignored — a shared
+/// latch would silence the *first* report of every attribute after the first,
+/// and that information has no other outlet.
+static IGNORED_ATTR_REPORTED: AtomicU32 = AtomicU32::new(0);
+
+const _: () = assert!(
+    INERT_STMT_ATTRS.len() <= u32::BITS as usize,
+    "IGNORED_ATTR_REPORTED holds one bit per inert attribute"
+);
+
 /// Values for the [`INERT_STMT_ATTRS`] identifiers, positionally aligned with
 /// that table.
 ///
@@ -698,6 +735,29 @@ impl InertStmtAttrs {
     /// Returns whether `attribute` belongs to this store without changing it.
     pub(crate) fn contains(&self, attribute: SqlInteger) -> bool {
         Self::index_of(attribute).is_some()
+    }
+
+    /// Returns whether the execution path reads `attribute` back after it is
+    /// stored. See [`HONOURED_INERT_STMT_ATTRS`]; the complement is the set
+    /// that is genuinely accepted-and-ignored.
+    pub(crate) fn is_honoured(attribute: SqlInteger) -> bool {
+        HONOURED_INERT_STMT_ATTRS.contains(&attribute)
+    }
+
+    /// Returns whether `attribute` has not yet been reported as stored without
+    /// effect in this process, claiming the report if so.
+    ///
+    /// See [`IGNORED_ATTR_REPORTED`]: each identifier reports once, so a caller
+    /// that sets several ignored attributes hears about each of them, while one
+    /// that re-sets the same attribute per statement does not repeat. An
+    /// identifier outside the table is not latched — it cannot reach this path
+    /// today, and reporting it is the safer answer if it ever does.
+    pub(crate) fn claim_ignored_report(attribute: SqlInteger) -> bool {
+        let Some(index) = Self::index_of(attribute) else {
+            return true;
+        };
+        let bit = 1u32 << index;
+        IGNORED_ATTR_REPORTED.fetch_or(bit, Ordering::Relaxed) & bit == 0
     }
 
     /// Returns the stored value, or `None` when `attribute` is not one of the
@@ -1658,6 +1718,105 @@ mod tests {
     use crate::api::odbc_types::{SQL_C_CHAR, SQL_C_SLONG, SQL_WVARCHAR};
     use crate::handles::desc::{DescHeader, DescKind};
     use mssql_tds::test_client_support::int_columns;
+
+    /// Pins the classification itself. Both checks below are relative to
+    /// `HONOURED_INERT_STMT_ATTRS`, so dropping an entry keeps them green
+    /// while `SQLSetStmtAttrW` starts reporting that attribute as "stored
+    /// without effect" at the default trace level — the false claim the split
+    /// exists to prevent. Each entry here is justified by a consumer:
+    ///
+    /// - `SQL_ATTR_NOSCAN` — `InertStmtAttrs::noscan`, read by `prepare`,
+    ///   `exec_direct` and `execute`.
+    /// - `SQL_ATTR_PARAM_BIND_OFFSET_PTR` — `InertStmtAttrs::param_bind_offset`.
+    /// - the remaining parameter-array attributes — read by `execute` and
+    ///   `exec_common` when binding and reporting a parameter set.
+    ///
+    /// Removing a consumer means moving its attribute out of the list here,
+    /// not just deleting the call site.
+    #[test]
+    fn the_honoured_inert_attributes_are_exactly_the_consumed_ones() {
+        let mut expected = vec![
+            odbc_types::SQL_ATTR_NOSCAN,
+            odbc_types::SQL_ATTR_PARAM_BIND_OFFSET_PTR,
+            odbc_types::SQL_ATTR_PARAM_BIND_TYPE,
+            odbc_types::SQL_ATTR_PARAM_OPERATION_PTR,
+            odbc_types::SQL_ATTR_PARAM_STATUS_PTR,
+            odbc_types::SQL_ATTR_PARAMS_PROCESSED_PTR,
+        ];
+        let mut actual = HONOURED_INERT_STMT_ATTRS.to_vec();
+        expected.sort_unstable();
+        actual.sort_unstable();
+        assert_eq!(
+            actual, expected,
+            "the honoured set changed; a removal here makes SQLSetStmtAttrW \
+             claim a consumed attribute was ignored"
+        );
+    }
+
+    /// `SQLSetStmtAttrW` reports a stored attribute as "without effect" only
+    /// when nothing reads it back, and that claim is emitted at `warn`, which
+    /// is visible at the default trace level. A typo here, or an attribute
+    /// gaining a consumer without being listed, would make the driver assert
+    /// something false to every application that sets it.
+    #[test]
+    fn every_honoured_inert_attribute_is_part_of_the_inert_set() {
+        for attribute in HONOURED_INERT_STMT_ATTRS {
+            assert!(
+                INERT_STMT_ATTRS.iter().any(|(id, _)| id == attribute),
+                "honoured attribute {attribute} is not in INERT_STMT_ATTRS"
+            );
+            assert!(
+                InertStmtAttrs::is_honoured(*attribute),
+                "is_honoured disagrees with HONOURED_INERT_STMT_ATTRS for {attribute}"
+            );
+        }
+    }
+
+    /// The complement must stay non-empty, otherwise the "stored without
+    /// effect" branch is dead and the diagnostic it exists to give is gone.
+    #[test]
+    fn some_inert_attributes_are_still_genuinely_ignored() {
+        let ignored = INERT_STMT_ATTRS
+            .iter()
+            .filter(|(id, _)| !InertStmtAttrs::is_honoured(*id))
+            .count();
+        assert!(
+            ignored > 0,
+            "no attribute is reported as stored-without-effect"
+        );
+        assert_eq!(
+            ignored,
+            INERT_STMT_ATTRS.len() - HONOURED_INERT_STMT_ATTRS.len(),
+            "the honoured list must be a subset of the inert set, without duplicates"
+        );
+    }
+
+    /// The "stored without effect" report is latched per attribute, not once
+    /// for the category. That arm returns `SQL_SUCCESS` with no diagnostic, so
+    /// the trace line is the only channel saying the attribute was ignored;
+    /// sharing one latch would silence the first report of every attribute
+    /// after the first.
+    #[test]
+    fn each_ignored_attribute_is_reported_once_in_its_own_right() {
+        let first = odbc_types::SQL_ATTR_ASYNC_ENABLE;
+        let second = odbc_types::SQL_ATTR_RETRIEVE_DATA;
+        assert!(!InertStmtAttrs::is_honoured(first));
+        assert!(!InertStmtAttrs::is_honoured(second));
+
+        assert!(InertStmtAttrs::claim_ignored_report(first), "first report");
+        assert!(
+            !InertStmtAttrs::claim_ignored_report(first),
+            "a repeat of the same attribute must stay quiet"
+        );
+        assert!(
+            InertStmtAttrs::claim_ignored_report(second),
+            "a different ignored attribute must still be reported once"
+        );
+        assert!(
+            !InertStmtAttrs::claim_ignored_report(second),
+            "a repeat of the second attribute must stay quiet too"
+        );
+    }
 
     fn binding(column_number: SqlUSmallInt, target_type: SqlSmallInt) -> ColumnBinding {
         ColumnBinding {

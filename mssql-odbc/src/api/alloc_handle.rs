@@ -74,7 +74,8 @@ unsafe fn alloc_env(input_handle: SqlHandle, output_handle: *mut SqlHandle) -> S
 
     let env = match EnvHandle::new() {
         Ok(e) => Box::new(e),
-        Err(_) => {
+        Err(e) => {
+            error!(%e, "SQLAllocHandle(ENV): environment initialization failed");
             return SQL_ERROR;
         }
     };

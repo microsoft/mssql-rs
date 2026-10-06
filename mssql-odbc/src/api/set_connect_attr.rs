@@ -64,6 +64,7 @@ pub(crate) unsafe fn sql_set_connect_attr_w(
         ?connection_handle,
         attribute,
         ?value_ptr,
+        string_length,
         "SQLSetConnectAttrW called",
     );
 

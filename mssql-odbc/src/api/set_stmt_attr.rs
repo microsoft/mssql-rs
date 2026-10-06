@@ -47,7 +47,9 @@
 //! Each entry point follows the crate's mandatory layering: FFI panic boundary
 //! → `unsafe` raw-handle shim → safe core (`README.md`; `num_result_cols.rs`).
 
-use tracing::{debug, error};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use tracing::{debug, error, warn};
 
 use crate::api::attributes::{AttrOp, AttrScope, unimplemented_attr_diag};
 use crate::api::odbc_types::{
@@ -74,9 +76,37 @@ use crate::api::util::{read_utf16_attr, write_if_some, write_wide_attr};
 use crate::error::{free_errors, post_sql_error};
 use crate::handles::desc::DescHandle;
 use crate::handles::stmt::{
-    STMT_STATE_EXEC_STARTED, STMT_STATE_FETCH_IN_PROGRESS, VendorStmtAttrs,
+    InertStmtAttrs, STMT_STATE_EXEC_STARTED, STMT_STATE_FETCH_IN_PROGRESS, VendorStmtAttrs,
 };
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
+
+/// First-occurrence latches for the two cursor substitution reports below.
+///
+/// Each of those substitutions is an unconditional property of this driver
+/// rather than a per-call event: a scrollable cursor *always* becomes
+/// forward-only here, so once an operator has been told, the thousandth
+/// identical line carries no further information. `warn` is the default trace
+/// level and the file sink writes unbuffered while holding the serialization
+/// lock, so an application that sets one of these per statement would
+/// otherwise pay a formatted, locked write per statement to restate a fact it
+/// already has. The first occurrence keeps `warn` so the condition stays
+/// visible without raising the level; the rest drop to `debug`.
+///
+/// Per process rather than per handle: statements are commonly allocated one
+/// per query, so a per-handle latch would still emit one line per statement
+/// and would not bound anything. Suppression is only about the trace stream —
+/// the caller still receives its `01S02` diagnostic on every call, which is
+/// also why one latch per arm is enough here. The inert "stored without
+/// effect" report posts no diagnostic at all, so it latches per attribute
+/// instead; see [`InertStmtAttrs::claim_ignored_report`].
+static CURSOR_TYPE_SUBSTITUTED: AtomicBool = AtomicBool::new(false);
+static CONCURRENCY_SUBSTITUTED: AtomicBool = AtomicBool::new(false);
+
+/// Returns whether this is the first time `latch` has been reached, taking it
+/// if so.
+fn first_occurrence(latch: &AtomicBool) -> bool {
+    !latch.swap(true, Ordering::Relaxed)
+}
 
 /// Clamps a requested `SQL_ATTR_QUERY_TIMEOUT` to the largest value the driver
 /// accepts, reporting whether the request had to be reduced.
@@ -243,10 +273,18 @@ unsafe fn sql_set_stmt_attr_w_safe(
             if value_ptr as SqlULen == SQL_CURSOR_FORWARD_ONLY {
                 SQL_SUCCESS
             } else {
-                debug!(
-                    requested = value_ptr as SqlULen,
-                    "SQLSetStmtAttrW: cursor type substituted with SQL_CURSOR_FORWARD_ONLY"
-                );
+                let requested = value_ptr as SqlULen;
+                if first_occurrence(&CURSOR_TYPE_SUBSTITUTED) {
+                    warn!(
+                        requested,
+                        "SQLSetStmtAttrW: cursor type substituted with SQL_CURSOR_FORWARD_ONLY"
+                    );
+                } else {
+                    debug!(
+                        requested,
+                        "SQLSetStmtAttrW: cursor type substituted with SQL_CURSOR_FORWARD_ONLY"
+                    );
+                }
                 post_sql_error(
                     &mut state,
                     SQLSTATE_01S02,
@@ -263,10 +301,18 @@ unsafe fn sql_set_stmt_attr_w_safe(
             if value_ptr as SqlULen == SQL_CONCUR_READ_ONLY {
                 SQL_SUCCESS
             } else {
-                debug!(
-                    requested = value_ptr as SqlULen,
-                    "SQLSetStmtAttrW: concurrency substituted with SQL_CONCUR_READ_ONLY"
-                );
+                let requested = value_ptr as SqlULen;
+                if first_occurrence(&CONCURRENCY_SUBSTITUTED) {
+                    warn!(
+                        requested,
+                        "SQLSetStmtAttrW: concurrency substituted with SQL_CONCUR_READ_ONLY"
+                    );
+                } else {
+                    debug!(
+                        requested,
+                        "SQLSetStmtAttrW: concurrency substituted with SQL_CONCUR_READ_ONLY"
+                    );
+                }
                 post_sql_error(
                     &mut state,
                     SQLSTATE_01S02,
@@ -482,10 +528,23 @@ unsafe fn sql_set_stmt_attr_w_safe(
             // whatever was written.
             if state.inert_attrs.contains(attribute) {
                 state.inert_attrs.set(attribute, value_ptr as SqlULen);
-                debug!(
-                    attribute,
-                    "SQLSetStmtAttrW: attribute stored without effect"
-                );
+                // Only the attributes nothing reads back are "without effect".
+                // NOSCAN and the parameter-array attributes are stored here but
+                // consumed at execute, so claiming they are ignored would be
+                // false — and `warn` is visible at the default trace level.
+                if InertStmtAttrs::is_honoured(attribute) {
+                    debug!(attribute, "SQLSetStmtAttrW: attribute stored");
+                } else if InertStmtAttrs::claim_ignored_report(attribute) {
+                    warn!(
+                        attribute,
+                        "SQLSetStmtAttrW: attribute stored without effect"
+                    );
+                } else {
+                    debug!(
+                        attribute,
+                        "SQLSetStmtAttrW: attribute stored without effect"
+                    );
+                }
                 SQL_SUCCESS
             } else {
                 post_diag(

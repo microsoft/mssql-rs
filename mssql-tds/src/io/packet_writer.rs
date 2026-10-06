@@ -785,6 +785,19 @@ impl TdsPacketWriterUnchecked for PacketWriter<'_> {
     }
 }
 
+/// Read-only access to the buffer the writer has accumulated, for tests that
+/// assert on serialized bytes without a server.
+///
+/// Gated on `test-util` as well as `test` so integration tests and downstream
+/// crates can reach it through [`crate::test_client_support`]; `io` is
+/// `pub(crate)`, so this stays crate-internal either way.
+#[cfg(any(test, feature = "test-util"))]
+impl PacketWriter<'_> {
+    pub(crate) fn get_payload(&self) -> Cursor<Vec<u8>> {
+        self.payload_cursor.clone()
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use std::vec;
@@ -794,13 +807,6 @@ pub(crate) mod tests {
     use crate::core::NegotiatedEncryptionSetting;
     use async_trait::async_trait;
     use futures::executor::block_on;
-
-    // Expose copy of internal buffer in PacketWriter for tests in other modules.
-    impl PacketWriter<'_> {
-        pub(crate) fn get_payload(&self) -> Cursor<Vec<u8>> {
-            self.payload_cursor.clone()
-        }
-    }
 
     pub(crate) struct MockNetworkWriter {
         pub(crate) size: u32,

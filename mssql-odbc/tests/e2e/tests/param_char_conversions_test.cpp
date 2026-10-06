@@ -11,6 +11,8 @@
 
 #include "odbc_test_fixture.h"
 
+#include <cstdlib>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -107,21 +109,111 @@ protected:
         return std::string(reinterpret_cast<const char*>(buf));
     }
 
-    // serialize_string picks the code page from the collation's LCID alone, so
-    // only the LCID has to be Latin1 for U+65E5 to be unmappable. The parameter
-    // carries the *database* collation, which need not match the instance's.
+    // The engine's own `varchar` bytes for U+00E9 under the database collation,
+    // as hex - empty when that collation cannot hold the character *exactly*,
+    // and `std::nullopt` when the probe itself failed.
     //
-    // A `_UTF8` collation is excluded even though its name matches: the two
-    // parameter routes disagree there. A materialized value reaches
-    // serialize_string's LCID-only arm, which ignores the fUTF8 flag and still
-    // substitutes under CP1252, but a streamed one goes through `encode_narrow`
-    // (the only mssql-odbc caller is `DaeTranscode::encode`), which honours
-    // `col_flags & 0x40` and passes UTF-8 through intact. The DAE cases would
-    // therefore fail rather than skip. Unifying the two is AB#47590.
+    // The two are kept apart deliberately. An empty result is a legitimate
+    // reason to skip; a failed probe is a defect, and collapsing them would let
+    // a regression in `Prepare`, `SQLExecute` or `SQLFetch` turn these tests
+    // into silent skips instead of failures.
+    //
+    // The round trip is what establishes "exactly", and checking the byte
+    // against `3F` cannot: a code page without U+00E9 may best-fit it to ASCII
+    // `e` rather than substitute - CP1251 does - which passes a `!= "3F"` gate
+    // while being an unfaithful encoding. This driver deliberately does not
+    // best-fit (parity-deviations entry 22), so it answers `3F` where the
+    // engine answered `65`, and a probe gated only on `3F` would fail on that
+    // documented deviation rather than on the resolver it exists to test.
+    //
+    // The comparison is made on `varbinary`, not on the characters: an
+    // accent-insensitive collation considers `e` and `é` equal, so a character
+    // comparison would accept the very best-fit this guard exists to reject.
+    std::optional<std::string> EngineNarrowBytesForEAcute() {
+        const std::string sql =
+            "SELECT CASE WHEN CAST(CAST(CAST(NCHAR(233) AS VARCHAR(16)) AS NVARCHAR(16))"
+            "                 AS VARBINARY(16)) = CAST(NCHAR(233) AS VARBINARY(16))"
+            "            THEN CONVERT(VARCHAR(64),"
+            "                 CAST(CAST(NCHAR(233) AS VARCHAR(16)) AS VARBINARY(16)), 2)"
+            "            ELSE '' END";
+        if (!SQL_SUCCEEDED(Prepare(sql)) || !SQL_SUCCEEDED(SQLExecute(stmt_))) {
+            return std::nullopt;
+        }
+        // Closed on every exit after a successful execute. A `SQLFetch` that
+        // returns `SQL_NO_DATA` still leaves the cursor open, and leaking it
+        // would make the next `Prepare()` on this handle fail with a
+        // cursor-state error instead of the real cause - the opposite of what
+        // the failed-probe split below is for.
+        const bool fetched = SQL_SUCCEEDED(SQLFetch(stmt_));
+        const std::string hex = fetched ? GetColumnChar(1) : std::string();
+        SQLCloseCursor(stmt_);
+        if (!fetched) {
+            return std::nullopt;
+        }
+        return hex;
+    }
+
+    // The number of `varchar` bytes the database collation needs for U+00E9, or
+    // `std::nullopt` when the probe itself failed.
+    //
+    // The ODBC layer validates a character parameter against its declared
+    // length in UTF-16 units, but the serializer writes collation bytes, and
+    // since AB#48437 those are the collation's own. Where a character needs
+    // more bytes than units, a value that fits a `varchar(n)` in units
+    // overflows it in bytes and is rejected during serialization - the gap
+    // AB#47584 tracks. A test whose premise is "this value fits" has to skip on
+    // such a collation rather than assert.
+    //
+    // Measured rather than inferred from the name: `_UTF8` needs two bytes, and
+    // so does any DBCS page that genuinely encodes the character rather than
+    // substituting it - CP936 gives `A8 A6`, where CP932, CP949 and CP950 all
+    // substitute to a single `3F` and stay within the count. Matching on the
+    // collation name would have to enumerate which DBCS pages map U+00E9, which
+    // the engine can simply be asked.
+    std::optional<int> DatabaseNarrowByteLengthOfEAcute() {
+        if (!SQL_SUCCEEDED(Prepare("SELECT DATALENGTH(CAST(NCHAR(233) AS VARCHAR(16)))")) ||
+            !SQL_SUCCEEDED(SQLExecute(stmt_))) {
+            return std::nullopt;
+        }
+        const bool fetched = SQL_SUCCEEDED(SQLFetch(stmt_));
+        const std::string text = fetched ? GetColumnChar(1) : std::string();
+        SQLCloseCursor(stmt_);
+        if (!fetched || text.empty()) {
+            return std::nullopt;
+        }
+        return std::atoi(text.c_str());
+    }
+
+    // serialize_string resolves the code page from the collation's UTF-8 flag,
+    // then its SQL sort ID, then its LCID (AB#48437). The cases gated on this
+    // helper assert CP1252 bytes specifically - U+00E9 as 0xE9, U+20AC as 0x80 -
+    // so it must admit only collations that actually resolve to CP1252.
+    //
+    // `Latin1_General` alone does not establish that. A SQL collation names its
+    // code page in the name and carries the matching sort ID, which now wins
+    // over the LCID, so every `SQL_Latin1_General_CP<n>_*` family but `_CP1_`
+    // resolves somewhere other than CP1252: CP437 and CP850 put U+00E9 at 0x82,
+    // and CP1251 cannot encode it at all while placing U+20AC at 0x88. Those
+    // would fail the gated assertions rather than skip them, which is what this
+    // guard exists to prevent. `_UTF8` is excluded for the adjacent reason -
+    // under it nothing is unmappable, so a substitution test would fail too.
+    //
+    // Matching on the absence of a `_CP` segment (Windows `Latin1_General_*`,
+    // which resolves through LCID 0x0409) or on `_CP1_` exactly closes the whole
+    // family in one rule rather than enumerating names. Before this PR the
+    // inline path resolved through the LCID for every member, so the broader
+    // guard was sufficient; honouring the sort ID is what split the family.
+    //
+    // The parameter carries the *database* collation, which need not match the
+    // instance's.
     bool DatabaseIsLatin1() {
         const std::string collation = DatabaseCollation();
-        return collation.find("Latin1_General") != std::string::npos &&
-               collation.find("_UTF8") == std::string::npos;
+        if (collation.find("Latin1_General") == std::string::npos ||
+            collation.find("_UTF8") != std::string::npos) {
+            return false;
+        }
+        const size_t cp = collation.find("_CP");
+        return cp == std::string::npos || collation.compare(cp, 5, "_CP1_") == 0;
     }
 
     // The database collation name, or an empty string if it could not be read.
@@ -188,6 +280,108 @@ protected:
             << "the session was rebuilt, so the request cost the connection";
     }
 };
+
+// A narrow parameter must reach the wire in the bytes the *database collation*
+// asks for, whatever that collation is. Resolving the code page from the
+// collation's LCID alone - ignoring the UTF-8 flag and the SQL sort ID - sends
+// U+00E9 as `E9` under a `_UTF8` or CP437/CP850 collation where `C3 A9` or
+// `82` is required (AB#48437).
+//
+// Asserted against the server's own encoding of the same character rather than
+// a hard-coded byte string, so the test is collation-independent: it runs on
+// whatever collation the test database has and still fails if the driver and
+// the engine disagree. Echoing the value back as text would not catch this -
+// a symmetric mis-decode on the way out would hide a mis-encode on the way in.
+//
+// U+00E9 is deliberately the only probe, and `EngineNarrowBytesForEAcute`
+// decides whether the database collation can carry it. The probe needs a code
+// page that holds the character *exactly*, which the CP1252, CP437, CP850 and
+// `_UTF8` families do; a `Latin1_General` name is not sufficient on its own,
+// since `SQL_Latin1_General_CP1251_*` best-fits U+00E9 to ASCII `e` rather than
+// encoding it, and the round-trip guard skips that rather than comparing the
+// engine's best-fit against this driver's `?` substitution and failing on a
+// known deviation (docs/parity-deviations.md, entry 22). The CP437/CP850
+// discrimination that needs unmappable characters is unit-tested in
+// `tds_value_serializer.rs`, where the collation is controlled directly.
+//
+// Not skipped for the msodbcsql leg - this is the engine's own verdict, not a
+// driver comparison - but it does skip entirely when the collation cannot hold
+// U+00E9 exactly.
+//
+// Benefits-from-mock-tds: the RPC bytes are inferred from what SQL Server
+// stored, via CONVERT(..., VARBINARY). A byte-level mock TDS server could read
+// the parameter off the wire directly and assert both the encoded bytes and
+// the collation declared alongside them, which a CAST result cannot separate.
+// The exact bytes are pinned meanwhile by the collation cases in
+// mssql-tds/tests/test_narrow_param_encoding.rs.
+TEST_F(CharConversionLiveTest, NarrowParamEncodesForTheDatabaseCollation) {
+    // What the engine itself stores for U+00E9 in a varchar under the database
+    // collation, as hex, or empty when that collation cannot hold it exactly.
+    const std::optional<std::string> engine_bytes = EngineNarrowBytesForEAcute();
+    ASSERT_TRUE(engine_bytes.has_value())
+        << "probing the engine's own encoding of U+00E9 failed; this is a defect, not a "
+           "collation that cannot represent it";
+    if (engine_bytes->empty()) {
+        GTEST_SKIP() << "collation " << DatabaseCollation()
+                     << " cannot hold U+00E9 exactly; this probe needs one that round-trips";
+    }
+    const std::string& expected = *engine_bytes;
+
+    // What the driver puts on the wire for the same character bound narrow.
+    ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(64), CAST(? AS VARBINARY(16)), 2)"),
+                  SQL_HANDLE_STMT, stmt_);
+    SQLWCHAR value[] = {0x00E9};
+    SQLLEN ind = static_cast<SQLLEN>(sizeof(value));
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_WCHAR, SQL_VARCHAR, 8, 0,
+                                   value, ind, &ind),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(expected, GetColumnChar(1))
+        << "U+00E9 was encoded for the wrong code page under collation " << DatabaseCollation();
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+}
+
+// The same check for the narrow C type, so both character C types are pinned to
+// the database collation rather than only the transcoding one.
+//
+// SQL_C_CHAR is UTF-8 in this driver (AB#47565), so the bound bytes are the
+// character's UTF-8 form; what reaches the wire must still be the collation's
+// encoding of it, not those bytes passed through.
+//
+// Benefits-from-mock-tds: like the wide case above, the RPC bytes are inferred
+// from what SQL Server stored. A byte-level mock TDS server could distinguish
+// the two steps this test can only observe collapsed together - decoding the
+// UTF-8 input buffer, and re-encoding it to the collation's code page - by
+// capturing the parameter as it is written rather than after the server has
+// applied its own conversion.
+TEST_F(CharConversionLiveTest, NarrowCTypeParamEncodesForTheDatabaseCollation) {
+    SKIP_IF_COMPARING_MSODBCSQL();  // SQL_C_CHAR is UTF-8 here, the client code page there.
+
+    const std::optional<std::string> engine_bytes = EngineNarrowBytesForEAcute();
+    ASSERT_TRUE(engine_bytes.has_value())
+        << "probing the engine's own encoding of U+00E9 failed; this is a defect, not a "
+           "collation that cannot represent it";
+    if (engine_bytes->empty()) {
+        GTEST_SKIP() << "collation " << DatabaseCollation()
+                     << " cannot hold U+00E9 exactly; this probe needs one that round-trips";
+    }
+    const std::string& expected = *engine_bytes;
+
+    ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(64), CAST(? AS VARBINARY(16)), 2)"),
+                  SQL_HANDLE_STMT, stmt_);
+    // U+00E9 as UTF-8, which is what this driver reads a SQL_C_CHAR buffer as.
+    std::vector<SQLCHAR> utf8 = {0xC3, 0xA9};
+    SQLLEN ind = static_cast<SQLLEN>(utf8.size());
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_CHAR, SQL_VARCHAR, 8, 0,
+                                   utf8.data(), ind, &ind),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(expected, GetColumnChar(1))
+        << "U+00E9 was encoded for the wrong code page under collation " << DatabaseCollation();
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+}
 
 // The declared wire type follows ParameterType, not the C type that was bound,
 // so a cross-family pairing transcodes instead of being rejected.
@@ -412,8 +606,30 @@ TEST_F(CharConversionLiveTest, NarrowToWideOverflowingBlanksAreTrimmed) {
 // DBCS or _UTF8 collation the server bound is larger than the units we counted,
 // so an over-long value reaches serialize_char_varchar_direct and fails there
 // with an opaque driver error rather than 22001 (AB#47584).
+//
+// Skipped wherever the collation needs more bytes for this value than the units
+// it was measured in. Since AB#48437 the narrow serializer writes the
+// collation's own encoding, so the five bytes `caf\u00E9` becomes under `_UTF8`
+// - or under a DBCS page that genuinely encodes U+00E9, such as CP936's
+// `A8 A6` - exceed the `varchar(4)` the four UTF-16 units were validated
+// against, and the first `SQLExecute` below is rejected. That over-length
+// rejection is AB#47584, not this probe's subject.
+//
+// Gated on the measured width rather than the collation name: CP932, CP949 and
+// CP950 substitute U+00E9 to a single `3F` and stay within the count, so a
+// name-based DBCS exclusion would skip tests that should run.
 TEST_F(CharConversionLiveTest, NarrowMultibyteIsMeasuredInUtf16Units) {
     SKIP_IF_COMPARING_MSODBCSQL();
+
+    const std::optional<int> eacute_bytes = DatabaseNarrowByteLengthOfEAcute();
+    ASSERT_TRUE(eacute_bytes.has_value())
+        << "probing the collation's byte width for U+00E9 failed; this is a defect, not a "
+           "collation this probe cannot run on";
+    if (*eacute_bytes > 1) {
+        GTEST_SKIP() << "collation " << DatabaseCollation() << " needs " << *eacute_bytes
+                     << " bytes for U+00E9, so this value exceeds the varchar(4) it was "
+                        "measured into; the over-length rejection is AB#47584";
+    }
 
     std::vector<SQLCHAR> value = {'c', 'a', 'f', 0xC3, 0xA9};
     SQLLEN ind = static_cast<SQLLEN>(value.size());
@@ -960,6 +1176,79 @@ TEST_F(CharConversionLiveTest, UnmappableCharacterIsSubstituted) {
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
     EXPECT_EQ("63/233/3", GetColumnChar(1)) << "'?' in the middle, 'e-acute' intact, 3 bytes";
     EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+}
+
+// An unpaired UTF-16 surrogate has no scalar value, so it is repaired to
+// U+FFFD on decode and then handed to the target collation. Under the
+// single-byte Latin1 collations this test admits, U+FFFD has no representation
+// and is substituted, arriving as a single '?'.
+//
+// Scoped to those collations rather than to "any narrow code page": a `_UTF8`
+// collation is narrow too, but U+FFFD is representable there, so it survives as
+// EF BF BD with no loss flagged. That arm is pinned by
+// `a_lone_surrogate_under_a_utf8_collation_is_not_substituted` in
+// mssql-tds/tests/test_narrow_param_encoding.rs, and DatabaseIsLatin1() below
+// is what keeps this test off it.
+//
+// Runs on both legs, and the agreement is measured rather than assumed. On
+// retail msodbcsql18 against SQL Server on localhost, binding `a<D800>b` to a
+// varchar stored 61 3F 62 ("a?b") with SQL_SUCCESS and no diagnostic; the
+// engine's own CAST(NCHAR(97)+NCHAR(55296)+NCHAR(98) AS VARCHAR) produced the
+// identical 61 3F 62. This driver matches both, and additionally flags the
+// substitution so SQL_COPT_SS_WARN_ON_CP_ERROR can report it - the warning
+// itself is covered generically by UnmappableCharacterWarnsWhenAsked below,
+// which this input reaches by the same path.
+//
+// Rejecting the value instead - say as 22018 - would diverge from the
+// reference driver *and* from the engine, and would bypass the code-page loss
+// channel that already covers it (AB#47598), so the substitution is pinned
+// here rather than left implicit.
+//
+// Benefits-from-mock-tds: asserts only the stored outcome via ASCII() and
+// DATALENGTH(), so it cannot see the RPC itself. A byte-level mock TDS server
+// could assert that the parameter reached the wire as the single byte 0x3F
+// under the declared collation, rather than inferring it from what the server
+// stored; the exact bytes are pinned meanwhile by
+// `a_lone_surrogate_reaching_a_narrow_target_is_substituted` in
+// mssql-tds/tests/test_narrow_param_encoding.rs.
+TEST_F(CharConversionLiveTest, UnpairedSurrogateIsSubstitutedLikeAnyUnmappableCharacter) {
+    if (!DatabaseIsLatin1()) {
+        GTEST_SKIP() << "needs a Latin1 database collation";
+    }
+
+    // ASCII() of each position plus DATALENGTH, so a mis-encoded payload cannot
+    // hide behind a symmetric decode on the way back.
+    ASSERT_SQL_OK(
+        Prepare("SELECT CAST(ASCII(SUBSTRING(?, 1, 1)) AS VARCHAR(16)) + '/'"
+                " + CAST(ASCII(SUBSTRING(?, 2, 1)) AS VARCHAR(16)) + '/'"
+                " + CAST(ASCII(SUBSTRING(?, 3, 1)) AS VARCHAR(16)) + '/'"
+                " + CAST(DATALENGTH(?) AS VARCHAR(16))"),
+        SQL_HANDLE_STMT, stmt_);
+
+    SQLWCHAR lone[] = {'a', 0xD800, 'b'};  // unpaired high surrogate
+    SQLLEN ind = static_cast<SQLLEN>(sizeof(lone));
+    for (SQLUSMALLINT param = 1; param <= 4; ++param) {
+        ASSERT_SQL_OK(SQLBindParameter(stmt_, param, SQL_PARAM_INPUT, SQL_C_WCHAR, SQL_VARCHAR,
+                                       8, 0, lone, ind, &ind),
+                      SQL_HANDLE_STMT, stmt_);
+    }
+
+    // Exactly SQL_SUCCESS: silent by default, as measured on msodbcsql.
+    EXPECT_EQ(SQL_SUCCESS, SQLExecute(stmt_));
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    // 97 '/' 63 '/' 98 '/' 3  ->  "a?b", one byte per character.
+    EXPECT_EQ("97/63/98/3", GetColumnChar(1))
+        << "an unpaired surrogate must arrive as a single '?' with its neighbours intact";
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    // A well-formed pair is deliberately *not* checked here. It is one
+    // supplementary character rather than two unmappables, and its substitution
+    // width is a measured platform divergence - two bytes on Windows and the
+    // engine, one on glibc msodbcsql (parity-deviations entry 22). Asserting it
+    // in this test would fail the msodbcsql comparison leg on Linux, because
+    // this test runs unskipped on both legs by design. That case is owned by
+    // AstralUnmappableCharacterSubstitutesPerUtf16Unit, which carries
+    // SKIP_IF_COMPARING_MSODBCSQL() for exactly that reason.
 }
 
 // The narrow C type is the *pre-existing* route to the same encoder -
