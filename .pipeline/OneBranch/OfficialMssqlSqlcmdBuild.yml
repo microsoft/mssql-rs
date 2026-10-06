@@ -11,9 +11,10 @@
 # Support:        https://aka.ms/onebranchsup                                   #
 #################################################################################
 
-# Runs on every update of the ADO stable branch (stable mirrors GitHub main), so a
-# build is always ready to release. Can also be queued manually. Day-to-day
-# dev/nightly packages come from NonOfficialPythonWheelsPublish.yml instead.
+# Runs on every update of the ADO stable branch, which is updated from main when
+# a release is prepared, so the release candidate is always built. Can also be
+# queued manually. Day-to-day dev/nightly packages come from
+# NonOfficialPythonWheelsPublish.yml instead.
 trigger:
   batch: true
   branches:

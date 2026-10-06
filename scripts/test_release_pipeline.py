@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import tarfile
 import xml.etree.ElementTree as ET
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -566,6 +567,155 @@ def test_sqlcmd_publish_requires_both_stable_branches(
     assert (result.returncode == 0) == (error is None), result.stderr
     if error:
         assert error in result.stderr
+
+
+_SQLCMD_PACKAGE_ENTRIES = (
+    "include/mssql_sqlcmd.h",
+    "runtimes/win-x64/native/mssql_sqlcmd.lib",
+    "runtimes/win-x86/native/mssql_sqlcmd.lib",
+    "runtimes/win-arm64/native/mssql_sqlcmd.lib",
+    "runtimes/linux-x64/native/libmssql_sqlcmd.a",
+    "runtimes/linux-arm64/native/libmssql_sqlcmd.a",
+    "runtimes/linux-musl-x64/native/libmssql_sqlcmd.a",
+    "runtimes/linux-musl-arm64/native/libmssql_sqlcmd.a",
+    "runtimes/osx-x64/native/libmssql_sqlcmd.a",
+    "runtimes/osx-arm64/native/libmssql_sqlcmd.a",
+)
+
+# Stands in for the feed's flat-container index. MOCK_FEED is a comma-separated
+# list of published versions, an HTTP status code to fail with, or
+# "noresponse" for a failure with no HTTP response at all.
+_SQLCMD_FEED_STUB = r"""
+function Invoke-RestMethod {
+    param($Uri, $Headers)
+    Write-Host 'Feed queried'
+    if ($Uri -cne 'https://pkgs.dev.azure.com/sqlclientdrivers/public/_packaging/mssql-rs_Public/nuget/v3/flat2/mssql-sqlcmd/index.json') {
+        throw "Unexpected URI: $Uri"
+    }
+    if ($Headers.Authorization -cne 'Bearer test-token') {
+        throw 'Unexpected authorization header'
+    }
+    if ($env:MOCK_FEED -eq 'noresponse') {
+        throw [System.Net.Http.HttpRequestException]::new('No such host is known.')
+    }
+    if ($env:MOCK_FEED -match '^\d+$') {
+        $status = [System.Net.HttpStatusCode][int]$env:MOCK_FEED
+        throw [Microsoft.PowerShell.Commands.HttpResponseException]::new(
+            "Response status code does not indicate success: $([int]$status).",
+            [System.Net.Http.HttpResponseMessage]::new($status))
+    }
+    [pscustomobject]@{ versions = @($env:MOCK_FEED -split ',' | Where-Object { $_ }) }
+}
+"""
+
+
+def run_sqlcmd_package_validation(
+    tmp_path: Path, packages: dict[str, tuple[str, ...]], feed: str
+) -> subprocess.CompletedProcess[str]:
+    drop = tmp_path / "workspace" / "officialBuild" / "drop_Build_MssqlSqlcmd_Package"
+    drop.mkdir(parents=True)
+    for name, entries in packages.items():
+        with zipfile.ZipFile(drop / name, "w") as archive:
+            for entry in entries:
+                archive.writestr(entry, b"content")
+
+    script = (
+        _sqlcmd_release_step(False, "Validate the mssql-sqlcmd package")["pwsh"]
+        .replace("$(Pipeline.Workspace)", str(tmp_path / "workspace"))
+        .replace("$(resources.pipeline.officialBuild.runID)", "123")
+        .replace("$(resources.pipeline.officialBuild.sourceCommit)", "abc123")
+    )
+    assert not re.search(r"\$\([A-Za-z][\w.]*\)", script), "an unexpanded pipeline macro"
+    return subprocess.run(
+        ["pwsh", "-NoProfile", "-Command", _SQLCMD_FEED_STUB + script],
+        capture_output=True,
+        text=True,
+        check=False,
+        env={**os.environ, "SYSTEM_ACCESSTOKEN": "test-token", "MOCK_FEED": feed},
+    )
+
+
+@pytest.mark.parametrize("feed", ["404", "0.0.9,0.0.10"])
+def test_sqlcmd_release_validation_accepts_a_complete_unpublished_version(
+    tmp_path: Path, feed: str
+) -> None:
+    result = run_sqlcmd_package_validation(
+        tmp_path, {"mssql-sqlcmd.0.1.0.nupkg": _SQLCMD_PACKAGE_ENTRIES}, feed
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "Package: mssql-sqlcmd.0.1.0.nupkg from build 123 (abc123)" in result.stdout
+    assert "Feed queried" in result.stdout
+    assert "mssql-sqlcmd 0.1.0 is not on the feed yet." in result.stdout
+    assert "##vso[task.setvariable variable=packageVersion]0.1.0" in result.stdout
+    path = re.search(r"##vso\[task\.setvariable variable=packagePath\](.+)", result.stdout)
+    assert path and Path(path[1].strip()).name == "mssql-sqlcmd.0.1.0.nupkg"
+
+
+@pytest.mark.parametrize("feed", ["0.0.9,0.1.0", "0.1.0"])
+def test_sqlcmd_release_validation_rejects_a_published_version(
+    tmp_path: Path, feed: str
+) -> None:
+    result = run_sqlcmd_package_validation(
+        tmp_path, {"mssql-sqlcmd.0.1.0.nupkg": _SQLCMD_PACKAGE_ENTRIES}, feed
+    )
+
+    assert result.returncode != 0
+    assert "mssql-sqlcmd 0.1.0 is already on mssql-rs_Public" in result.stderr
+    assert "##vso[task.setvariable" not in result.stdout
+
+
+@pytest.mark.parametrize("version", ["0.1.0-dev.20261005.1", "0.1.0-nightly.20261005"])
+def test_sqlcmd_release_validation_rejects_a_prerelease(tmp_path: Path, version: str) -> None:
+    result = run_sqlcmd_package_validation(
+        tmp_path, {f"mssql-sqlcmd.{version}.nupkg": _SQLCMD_PACKAGE_ENTRIES}, "404"
+    )
+
+    assert result.returncode != 0
+    assert f"mssql-sqlcmd {version} is a prerelease" in result.stderr
+    assert "Feed queried" not in result.stdout
+
+
+@pytest.mark.parametrize("missing", _SQLCMD_PACKAGE_ENTRIES)
+def test_sqlcmd_release_validation_requires_every_runtime(
+    tmp_path: Path, missing: str
+) -> None:
+    entries = tuple(entry for entry in _SQLCMD_PACKAGE_ENTRIES if entry != missing)
+    result = run_sqlcmd_package_validation(
+        tmp_path, {"mssql-sqlcmd.0.1.0.nupkg": entries}, "404"
+    )
+
+    assert result.returncode != 0
+    assert f"The package is missing: {missing}" in result.stderr
+    assert "Feed queried" not in result.stdout
+
+
+@pytest.mark.parametrize("count", [0, 2])
+def test_sqlcmd_release_validation_requires_exactly_one_package(
+    tmp_path: Path, count: int
+) -> None:
+    packages = {
+        f"mssql-sqlcmd.0.1.{patch}.nupkg": _SQLCMD_PACKAGE_ENTRIES for patch in range(count)
+    }
+    result = run_sqlcmd_package_validation(tmp_path, packages, "404")
+
+    assert result.returncode != 0
+    assert "Expected one mssql-sqlcmd package" in result.stderr
+    assert f"found {count}" in result.stderr
+
+
+@pytest.mark.parametrize("feed", ["500", "401", "noresponse"])
+def test_sqlcmd_release_validation_fails_when_the_feed_cannot_be_read(
+    tmp_path: Path, feed: str
+) -> None:
+    result = run_sqlcmd_package_validation(
+        tmp_path, {"mssql-sqlcmd.0.1.0.nupkg": _SQLCMD_PACKAGE_ENTRIES}, feed
+    )
+
+    assert result.returncode != 0
+    assert "Feed queried" in result.stdout
+    assert "is not on the feed yet" not in result.stdout
+    assert "##vso[task.setvariable" not in result.stdout
 
 
 def prepare_pypi_release(tmp_path: Path, *, duplicate: bool = False):

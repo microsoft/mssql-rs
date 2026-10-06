@@ -72,4 +72,4 @@ ADO-Release Nuget mssql-sqlcmd pipeline, and then promoted to the feed's
 
 The full process (pipelines, versions, feed retention, the release steps,
 the msodbcsql side, and troubleshooting) is in
-[docs/mssql-sqlcmd-release-management.md](../docs/mssql-sqlcmd-release-management.md).
+[docs/mssql-sqlcmd-release-management.md](https://github.com/microsoft/mssql-rs/blob/main/docs/mssql-sqlcmd-release-management.md).
