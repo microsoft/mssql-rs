@@ -15,12 +15,10 @@
 
 #include "odbc_test_fixture.h"
 
-#include <chrono>
+#include <cstdint>
+#include <cstdio>
+#include <random>
 #include <string>
-
-#ifndef _WIN32
-#include <unistd.h>
-#endif
 
 namespace {
 
@@ -110,22 +108,23 @@ std::string QueryScalarOrEmpty(SQLHSTMT stmt, const std::string& sql) {
     return out;
 }
 
-// Names unique to this process and call.
+// A random suffix for this call's fixture names.
 //
 // The E2E legs share one SQL instance by design — validation-stages.yml runs
 // the Linux/ARM ODBC jobs against a single `sqlInstanceMode: shared` host with
 // no dependsOn serializing them — so a fixed fixture name would let one leg's
 // teardown (DROP DATABASE, SET SINGLE_USER WITH ROLLBACK IMMEDIATE) destroy
-// another leg's database mid-test.
+// another leg's database mid-test. Drawn the same way `catalog_test.cpp` draws
+// its own: 64 random bits, not a PID or a clock reading, since concurrent CI
+// agents are separate containers that can share a PID and boot close enough
+// together to land on a similar monotonic count.
 std::string UniqueSuffix() {
-#ifdef _WIN32
-    unsigned long long pid = static_cast<unsigned long long>(GetCurrentProcessId());
-#else
-    unsigned long long pid = static_cast<unsigned long long>(getpid());
-#endif
-    auto ticks = static_cast<unsigned long long>(
-        std::chrono::steady_clock::now().time_since_epoch().count());
-    return std::to_string(pid) + "_" + std::to_string(ticks & 0xFFFFFFFFull);
+    std::random_device rd;
+    std::mt19937_64 gen(rd());
+    std::uniform_int_distribution<uint64_t> dist;
+    char buf[17] = {};
+    std::snprintf(buf, sizeof(buf), "%016llx", static_cast<unsigned long long>(dist(gen)));
+    return std::string(buf);
 }
 
 // A login whose database principal genuinely differs between databases, plus a
