@@ -65,8 +65,9 @@ SqlTString ConnStrWith(const std::string& extra) {
     return ODBCTestUtils::ToSqlTStr(base + extra);
 }
 
-// Runs |sql| on |stmt| and returns its single character value, so a test can
-// compare an information type against what the server itself reports.
+// Runs |sql| on |stmt| and returns the string value of its first column in the
+// first row, so a test can compare an information type against what the server
+// itself reports. Expects exactly that shape; a NULL reads as empty.
 std::string QueryScalarString(SQLHSTMT stmt, const std::string& sql) {
     SqlTString wide = ODBCTestUtils::ToSqlTStr(sql);
     EXPECT_TRUE(SQL_SUCCEEDED(
