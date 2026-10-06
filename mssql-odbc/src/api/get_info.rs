@@ -34,15 +34,22 @@ use crate::api::odbc_types::{
 use crate::api::sqlstate::{
     ERR_INVALID_INFO_TYPE, ERR_INVALID_STRING_OR_BUFFER_LENGTH, WARN_STRING_TRUNCATION, post_diag,
 };
+use crate::api::txn::try_claim_idle_dbc_client;
 use crate::api::util::{copy_with_nul, write_if_some};
 use crate::error::free_errors;
+use crate::handles::dbc::{CachedDatabaseUserName, ConnectionState};
 use crate::handles::{DbcHandle, HandleType, handle_from_raw};
-use mssql_tds::connection::tds_client::TdsClient;
+use mssql_tds::connection::tds_client::{ExecuteOptions, ResultSet, TdsClient};
+use mssql_tds::datatypes::column_values::ColumnValues;
 
 /// `sysname`, the type of every identifier column in the catalog views, which
 /// bounds `SQL_MAX_COLUMN_NAME_LEN`, `SQL_MAX_SCHEMA_NAME_LEN`, and
 /// `SQL_MAX_TABLE_NAME_LEN` alike.
 const MAX_IDENTIFIER_LEN: u16 = 128;
+
+/// The `SQL_USER_NAME` lookup. See [`fetch_database_user_name`] for why this is
+/// the whole of msodbcsql's `g_szSqlUdtQuery` that applies to this driver.
+const DATABASE_USER_NAME_QUERY: &str = "SELECT USER_NAME()";
 
 const MAX_SQL_BLOCKS: u32 = 128;
 const NO_CAPABILITIES: u32 = 0;
@@ -868,6 +875,46 @@ fn sql_get_info_w_safe(
     buffer_length: SqlSmallInt,
     string_length_ptr: *mut SqlSmallInt,
 ) -> SqlReturn {
+    // `SQL_USER_NAME` is the one information type whose value can require a
+    // server round trip, and the DBC mutex must not be held across one. It is
+    // resolved between two short critical sections rather than inside the single
+    // one the other types share: the first does the entry-point bookkeeping
+    // every ODBC call owes — clearing the previous call's diagnostics and
+    // zeroing the output length — and rejects an invalid buffer before anything
+    // reaches the wire; the second writes the answer.
+    if info_type == SQL_USER_NAME {
+        {
+            let Ok(mut state) = dbc.inner.lock() else {
+                error!("SQLGetInfoW: dbc mutex poisoned");
+                return SQL_ERROR;
+            };
+            free_errors(&mut state);
+            unsafe { write_if_some(string_length_ptr, 0) };
+            // Checked here as well as in `write_wide_str` so a caller that
+            // passes a negative length gets `HY090` without the driver first
+            // issuing — and caching — a query on its behalf.
+            if buffer_length < 0 {
+                error!(buffer_length, "SQLGetInfoW: negative buffer length");
+                post_diag(&mut state, ERR_INVALID_STRING_OR_BUFFER_LENGTH);
+                return SQL_ERROR;
+            }
+        }
+
+        let value = database_user_name(dbc);
+
+        let Ok(mut state) = dbc.inner.lock() else {
+            error!("SQLGetInfoW: dbc mutex poisoned");
+            return SQL_ERROR;
+        };
+        return write_wide_str(
+            &mut state,
+            info_value_ptr,
+            buffer_length,
+            string_length_ptr,
+            &value,
+        );
+    }
+
     let Ok(mut state) = dbc.inner.lock() else {
         error!("SQLGetInfoW: dbc mutex poisoned");
         return SQL_ERROR;
@@ -877,13 +924,11 @@ fn sql_get_info_w_safe(
     unsafe { write_if_some(string_length_ptr, 0) };
 
     match info_type {
-        SQL_DATA_SOURCE_NAME | SQL_SERVER_NAME | SQL_USER_NAME => {
+        SQL_DATA_SOURCE_NAME | SQL_SERVER_NAME => {
             let value = if info_type == SQL_DATA_SOURCE_NAME {
                 state.identity.data_source_name.clone()
-            } else if info_type == SQL_SERVER_NAME {
-                state.identity.server_name.clone()
             } else {
-                state.identity.user_name.clone()
+                state.identity.server_name.clone()
             };
             write_wide_str(
                 &mut state,
@@ -1199,6 +1244,331 @@ fn sql_get_info_w_safe(
                 SQL_ERROR
             }
         },
+    }
+}
+
+/// Answers `SQL_USER_NAME`: the database principal reported by `USER_NAME()`,
+/// looked up lazily on first use and cached against the catalog it belongs to.
+///
+/// **Never fails and never posts a diagnostic.** msodbcsql's lookup
+/// (`RefreshShilohUDTCache`, `sqlccmd.cpp:10337`) returns `void`: a busy
+/// connection, a failed query, and a NULL or absent row all leave the cached
+/// `conninfo.DBUserName` untouched, and `SQLGetInfo` then reports whatever that
+/// buffer holds (`sqlcinfo.cpp:1189-1192`). Surfacing an error instead would
+/// make `SQL_USER_NAME` the only information type that can fail on a healthy
+/// connection, and would break the ODBC guarantee — which the driver's own
+/// `WorksWithAnOpenCursorAndLeavesItUsable` E2E case pins — that `SQLGetInfo`
+/// is answerable while a cursor is open.
+///
+/// Neither the internal query's INFO messages nor its errors reach the
+/// application's diagnostics. They belong to no application statement, which is
+/// also how msodbcsql treats them — its lookup runs on the hidden driver
+/// statement (`lpdbcIn->lpstmtDvr`) and any records are freed with it. The
+/// messages are discarded here rather than left for the next command to clear:
+/// `TdsClient::begin_command` does clear them, but not every consumer of this
+/// connection starts a command first. `SQLCloseCursor` on an already-exhausted
+/// cursor takes the idle client, calls `close_query` — which deliberately does
+/// not clear `info_messages` — and posts `take_info_messages()` straight to the
+/// application's statement (`close_cursor.rs:323-330`).
+fn database_user_name(dbc: &DbcHandle) -> String {
+    // Holding a stale entry rather than clearing it is deliberate: msodbcsql
+    // leaves `DBUserName` untouched on a failed refresh and keeps answering
+    // from it, retrying on the next call because `ExecImmediate` returning
+    // `SQL_ERROR` skips the `CONN_ST_REFRESH_UDT` clear (`sqlccmd.cpp:10387`).
+    let (busy_fallback, timeout_secs) = {
+        let Ok(state) = dbc.inner.lock() else {
+            error!("SQLGetInfoW(SQL_USER_NAME): dbc mutex poisoned");
+            return String::new();
+        };
+        if state.connection_state != ConnectionState::Connected {
+            return String::new();
+        }
+        let stale = match &state.database_user_name {
+            // Keyed by catalog *and* the client's database-change count, so a
+            // database change refreshes the answer whether it arrived through
+            // `SQL_ATTR_CURRENT_CATALOG`, through raw T-SQL the server reports
+            // with an ENVCHANGE, or through a `USE [X]` issued while already in
+            // `X` — which changes no name but still fires the event, and paired
+            // with an `EXECUTE AS` is the only sign the principal moved.
+            // msodbcsql flags its refresh from any `ENV_DATABASE` token without
+            // comparing names (`sqlctokn.cpp:2866-2882`).
+            //
+            // The catalog is compared exactly: both sides are the server's own
+            // ENVCHANGE name, so there is no caller-supplied casing to
+            // normalize — unlike `SQL_ATTR_CURRENT_CATALOG`, which folds case
+            // because it matches a caller's string against that name. A
+            // case-sensitive instance can hold both `Sales` and `sales`.
+            //
+            // While another statement holds the client neither can be read, so
+            // the entry is taken as current.
+            Some(cached)
+                if state.client.as_ref().is_none_or(|client| {
+                    client.database() == cached.catalog
+                        && client.database_change_count() == cached.database_change_count
+                }) =>
+            {
+                return cached.value.clone();
+            }
+            Some(cached) => cached.value.clone(),
+            None => String::new(),
+        };
+        // `SQL_ATTR_CONNECTION_TIMEOUT`, which is what msodbcsql bounds this
+        // same internal query with: `GetNetIOTimeOut` reads the millisecond
+        // form of that attribute (`sqlcprot.h:1559-1563, 1605`) and
+        // `RefreshShilohUDTCache` passes it to `ExecImmediate`
+        // (`sqlccmd.cpp:10369, 10387`). `0` is the ODBC default and means no
+        // deadline, which `ExecuteOptions::timeout_secs` spells the same way —
+        // so an application that never sets the attribute is unaffected.
+        //
+        // There is no statement here to take `SQL_ATTR_QUERY_TIMEOUT` from:
+        // `SQLGetInfo` is a connection-level call, and msodbcsql reaches for
+        // the connection timeout for exactly that reason.
+        (stale, state.connection_timeout)
+    };
+
+    // The claim returns the cache entry with the client, read under its own
+    // lock. That is what keeps the value this call may report — and, for a NULL
+    // row or a post-execution failure, re-cache — tied to the session it is
+    // about: a disconnect and a fresh connect can both complete between the
+    // snapshot above and this claim, and `publish_lookup`'s check cannot catch
+    // that, since by then the claim has already read the new session's
+    // generation. Reading it here means there is no window to catch: a fresh
+    // connect clears the entry, so the claim simply finds nothing.
+    let Some((mut client, generation, fallback)) = try_claim_idle_dbc_client(dbc) else {
+        debug!("SQLGetInfoW(SQL_USER_NAME): connection is busy; reporting the cached value");
+        return busy_fallback;
+    };
+    let outcome = dbc
+        .runtime
+        .block_on(fetch_database_user_name(&mut client, timeout_secs));
+    // Read after the query, not before: `execute` can transparently reconnect a
+    // dropped session, and the reconnected one may land on the login's default
+    // database. Keying the entry to where the answer actually came from keeps a
+    // later read from matching it against a database it was never valid for.
+    let catalog = client.database().to_string();
+    let database_change_count = client.database_change_count();
+    // Discarded on every path, success and failure alike: these belong to the
+    // hidden lookup, and the next consumer of this connection is not
+    // necessarily a command that would clear them (see the note above).
+    let _ = client.take_info_messages();
+
+    let cache = match outcome {
+        // The query ran. Cache the outcome even when it carried no name, so the
+        // round trip is paid once per database rather than on every call:
+        // msodbcsql clears `CONN_ST_REFRESH_UDT` the moment `ExecImmediate`
+        // succeeds — *before* it fetches (`sqlccmd.cpp:10387-10397`) — so a
+        // NULL or absent row stops it asking too.
+        //
+        // `USER_NAME()` is NULL for a login with no principal in the current
+        // database, and `SQLGetData` leaves msodbcsql's buffer untouched for a
+        // NULL, so the previous answer is what it goes on reporting.
+        // `fallback` is that same previous answer.
+        Ok(looked_up) => Some(looked_up.unwrap_or_else(|| fallback.clone())),
+        // Draining or closing failed after `execute` returned `Ok`. msodbcsql
+        // has already cleared its refresh flag by this point, so this stops
+        // asking too and keeps reporting the previous answer.
+        Err(failure) if failure.executed => {
+            debug!(error = %failure.error, "SQLGetInfoW(SQL_USER_NAME): lookup failed after execution");
+            Some(fallback.clone())
+        }
+        // `execute` itself failed, which is the only case that leaves the
+        // refresh outstanding — so nothing is cached and the next call retries.
+        Err(failure) => {
+            debug!(error = %failure.error, "SQLGetInfoW(SQL_USER_NAME): execution failed; reporting the cached value");
+            None
+        }
+    };
+
+    publish_lookup(
+        dbc,
+        client,
+        generation,
+        catalog,
+        database_change_count,
+        cache,
+        fallback,
+    )
+}
+
+/// Hands the claimed client back and installs the cache entry **in one critical
+/// section**, so no concurrent operation can slip between the two.
+///
+/// Both orderings are unsafe if split. Releasing first lets another thread
+/// claim the client, switch catalogs and clear the cache, after which this
+/// thread's write would resurrect an entry the switch had just invalidated.
+/// Caching first would briefly advertise a principal for a session whose client
+/// is not back yet.
+///
+/// `generation` is the session this answer came from. A `SQLDisconnect` plus a
+/// fresh `SQLDriverConnect` can complete while the lookup is in flight, and the
+/// client in hand then belongs to a closed session: storing it would overwrite
+/// the live one and attach the old principal to it. In that case the client is
+/// dropped and nothing is reported, because nothing is known about the session
+/// now on the handle.
+///
+/// Returns the value to report: the cached one when `cache` is `Some`,
+/// `fallback` when the lookup produced nothing worth caching, and the empty
+/// string when the session turned over and nothing is known about its
+/// replacement.
+fn publish_lookup(
+    dbc: &DbcHandle,
+    client: TdsClient,
+    generation: u64,
+    catalog: String,
+    database_change_count: u64,
+    cache: Option<String>,
+    fallback: String,
+) -> String {
+    let mut state = match dbc.inner.lock() {
+        Ok(state) => state,
+        Err(mut poisoned) => {
+            // The client cannot be stored, so the DBC must not keep claiming to
+            // be connected — the same correction `release_dbc_client` makes.
+            error!("SQLGetInfoW(SQL_USER_NAME): dbc mutex poisoned; marking DBC disconnected");
+            poisoned.get_mut().connection_state = ConnectionState::Disconnected;
+            return String::new();
+        }
+    };
+
+    if state.session_generation != generation
+        || state.connection_state != ConnectionState::Connected
+    {
+        debug!("SQLGetInfoW(SQL_USER_NAME): session replaced during the lookup; discarding it");
+        drop(client);
+        return String::new();
+    }
+
+    state.client = Some(client);
+    match cache {
+        Some(value) => {
+            state.database_user_name = Some(CachedDatabaseUserName {
+                catalog,
+                database_change_count,
+                value: value.clone(),
+            });
+            value
+        }
+        None => fallback,
+    }
+}
+
+/// A `USER_NAME()` lookup that did not produce a value, and whether
+/// [`TdsClient::execute`] had returned `Ok` when it failed.
+///
+/// That is the caching boundary, and it is deliberately the *conservative*
+/// reading of msodbcsql's: retail stops asking the moment `ExecImmediate`
+/// succeeds (`sqlccmd.cpp:10387`). `execute` is not a pure send — it writes the
+/// batch and then reads as far as the first result boundary — so an `Err` from
+/// it can mean the server did accept the batch and the failure came while
+/// reading the response. Treating that as not-executed costs at most one
+/// re-issued query on the next `SQLGetInfo`; the opposite error, treating an
+/// un-run query as executed, would cache a stale principal indefinitely.
+/// Collapsing the two would also make every later call re-issue the query
+/// after a mid-drain network blip.
+struct LookupFailure {
+    executed: bool,
+    error: mssql_tds::error::Error,
+}
+
+/// Runs the `USER_NAME()` lookup on an already-claimed client and drains the
+/// response.
+///
+/// msodbcsql issues `set implicit_transactions off select USER_NAME()` plus its
+/// alias-type query in one `sp_executesql` (`sqlcstr.cpp:46`). The
+/// `set implicit_transactions off` is there because msodbcsql implements
+/// manual-commit with `SET IMPLICIT_TRANSACTIONS` and must keep this internal
+/// query from opening a transaction (`sqlccmd.cpp` bug #656241); this driver
+/// drives transactions with TDS transaction-manager requests and never enables
+/// implicit transactions, so a bare batch already carries that guarantee. The
+/// alias-type half has no counterpart here — there is no UDT cache to refresh —
+/// which leaves just the `SELECT`.
+/// `timeout_secs` is `SQL_ATTR_CONNECTION_TIMEOUT`, with `0` meaning no
+/// deadline; see the call site for why that is the attribute msodbcsql bounds
+/// this query with.
+async fn fetch_database_user_name(
+    client: &mut TdsClient,
+    timeout_secs: u32,
+) -> Result<Option<String>, LookupFailure> {
+    if let Err(error) = client
+        .execute(
+            DATABASE_USER_NAME_QUERY.to_string(),
+            ExecuteOptions::new().timeout_secs(timeout_secs),
+        )
+        .await
+    {
+        // `execute` sends the batch and then reads to the first result
+        // boundary, so this covers both "never reached the server" and "was
+        // accepted but the first read failed". Reported as not-executed so the
+        // next call retries — see `LookupFailure` for why that is the safe
+        // direction to err in.
+        //
+        // The close is reachable but not by a batch this call opened:
+        // `begin_command` does not touch `has_open_batch`, so after a failed
+        // `execute` the flag still holds whatever it had on entry. It is `true`
+        // only when the claimed client already had a batch open —
+        // `try_claim_idle_dbc_client` gates on `active_stmt`, not on batch
+        // state, so that is not excluded. Closing it there is what keeps the
+        // INVARIANT below true for the one caller that could otherwise inherit
+        // someone else's open batch. Not unit-tested: reaching it needs a
+        // client handed over mid-batch *and* a failing `execute`, which the
+        // mock server cannot currently stage.
+        if client.has_open_batch() {
+            let _ = client.close_query().await;
+        }
+        return Err(LookupFailure {
+            executed: false,
+            error,
+        });
+    }
+
+    let read = async {
+        if !client.on_rows() && client.has_open_batch() {
+            client.advance_to_rows().await?;
+        }
+        let value = match client.next_row().await? {
+            Some(row) => match row.first() {
+                Some(ColumnValues::String(value)) => Some(value.to_utf8_string()),
+                _ => None,
+            },
+            None => None,
+        };
+        Ok::<_, mssql_tds::error::Error>(value)
+    }
+    .await;
+
+    // INVARIANT: the batch has to be closed even when the read above failed
+    // part-way. Leaving the connection mid-result would fail every later
+    // operation on it — the lookup is best-effort, but it must not cost the
+    // application its connection.
+    let closed = if client.has_open_batch() {
+        client.close_query().await
+    } else {
+        Ok(())
+    };
+
+    // Everything from here on happened after `execute` returned `Ok`.
+    match (read, closed) {
+        // A name that was read before anything went wrong stands, even if the
+        // trailing drain then failed. msodbcsql writes `DBUserName` in
+        // `SQLGetData` and only afterwards calls `SQLMoreResults`
+        // (`sqlccmd.cpp:10395-10399`), so a later failure cannot revert the
+        // value it already captured.
+        (Ok(Some(value)), closed) => {
+            if let Err(error) = closed {
+                debug!(
+                    %error,
+                    "SQLGetInfoW(SQL_USER_NAME): drain failed after the name was read; keeping it"
+                );
+            }
+            Ok(Some(value))
+        }
+        (Ok(None), Ok(())) => Ok(None),
+        // Nothing was read, so there is no value to keep and the failure
+        // decides the outcome. Still `executed`, so the caller stops asking.
+        (Ok(None), Err(error)) | (Err(error), _) => Err(LookupFailure {
+            executed: true,
+            error,
+        }),
     }
 }
 
@@ -2165,14 +2535,12 @@ mod tests {
             state.identity = crate::handles::dbc::ConnectionIdentity {
                 data_source_name: "ReportingDsn".to_string(),
                 server_name: "SQLPROD01\\INST".to_string(),
-                user_name: "reporting_app".to_string(),
             };
         }
 
         for (info_type, expected) in [
             (SQL_DATA_SOURCE_NAME, "ReportingDsn"),
             (SQL_SERVER_NAME, "SQLPROD01\\INST"),
-            (SQL_USER_NAME, "reporting_app"),
         ] {
             let (rc, value, len) = get_wide_str(h.dbc, info_type);
             assert_eq!(rc, SQL_SUCCESS, "info_type {info_type}");
@@ -2183,6 +2551,989 @@ mod tests {
                 "info_type {info_type}"
             );
         }
+    }
+
+    /// Shared setup for the `SQL_USER_NAME` cases: a mock server answering the
+    /// lookup with `first`, and a connected DBC.
+    fn user_name_fixture(
+        first: mssql_mock_tds::QueryResponse,
+    ) -> (TestHandles, crate::test_support::MockServer) {
+        let h = TestHandles::with_env_dbc();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let server = crate::test_support::connect_mock_server(dbc, DATABASE_USER_NAME_QUERY, first);
+        (h, server)
+    }
+
+    fn user_name_row(value: &str) -> mssql_mock_tds::QueryResponse {
+        use mssql_mock_tds::{ColumnDefinition, ColumnValue, QueryResponse, Row, SqlDataType};
+        QueryResponse::new(
+            vec![ColumnDefinition::new("", SqlDataType::NVarChar)],
+            vec![Row::new(vec![ColumnValue::NVarChar(value.to_string())])],
+        )
+    }
+
+    fn diag_states(dbc: SqlHandle) -> Vec<String> {
+        let dbc_ref = unsafe { handle_from_raw::<DbcHandle>(dbc) };
+        let state = dbc_ref.inner.lock().unwrap();
+        state
+            .diag_records
+            .iter()
+            .map(|d| String::from_utf8_lossy(&d.sql_state).into_owned())
+            .collect()
+    }
+
+    fn set_catalog(dbc: SqlHandle, name: &str) -> SqlReturn {
+        use crate::api::odbc_types::{SQL_ATTR_CURRENT_CATALOG, SQL_NTS, SqlInteger};
+        use crate::api::set_connect_attr::sql_set_connect_attr_w;
+        let wide: Vec<u16> = format!("{name}\0").encode_utf16().collect();
+        unsafe {
+            sql_set_connect_attr_w(
+                dbc,
+                SQL_ATTR_CURRENT_CATALOG,
+                wide.as_ptr() as SqlPointer,
+                SqlInteger::from(SQL_NTS),
+            )
+        }
+    }
+
+    /// The lookup is lazy — nothing is cached until the first ask — and the
+    /// answer is then reused, matching msodbcsql's `CONN_ST_REFRESH_UDT` model
+    /// rather than paying a round trip at connect.
+    #[test]
+    fn user_name_is_queried_lazily_then_served_from_the_cache() {
+        let (h, server) = user_name_fixture(user_name_row("dbo"));
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+
+        assert!(
+            dbc.inner.lock().unwrap().database_user_name.is_none(),
+            "connecting must not pay the USER_NAME() round trip"
+        );
+
+        let (rc, value, len) = get_wide_str(h.dbc, SQL_USER_NAME);
+        assert_eq!(rc, SQL_SUCCESS);
+        assert_eq!(value, "dbo");
+        assert_eq!(len, 6, "byte count, not character count");
+        assert!(diag_states(h.dbc).is_empty());
+
+        // Re-registering proves the second call never reaches the server.
+        server.register_query(DATABASE_USER_NAME_QUERY, user_name_row("report_reader"));
+        assert_eq!(get_wide_str(h.dbc, SQL_USER_NAME).1, "dbo");
+    }
+
+    /// The value is database-scoped, so `SQL_ATTR_CURRENT_CATALOG` must make the
+    /// next read go back to the server.
+    #[test]
+    fn user_name_is_refreshed_after_a_catalog_change() {
+        use mssql_mock_tds::QueryResponse;
+
+        let (h, server) = user_name_fixture(user_name_row("dbo"));
+        assert_eq!(get_wide_str(h.dbc, SQL_USER_NAME).1, "dbo");
+
+        server.register_query(DATABASE_USER_NAME_QUERY, user_name_row("report_reader"));
+        server.register_query(
+            "USE [reporting]",
+            QueryResponse::new(Vec::new(), Vec::new()),
+        );
+        assert_eq!(set_catalog(h.dbc, "reporting"), SQL_SUCCESS);
+
+        assert_eq!(
+            get_wide_str(h.dbc, SQL_USER_NAME),
+            (SQL_SUCCESS, "report_reader".to_string(), 26)
+        );
+    }
+
+    /// A `USE` the driver did not issue still reaches the client as an
+    /// ENVCHANGE, so the catalog key — not just the attribute path — has to
+    /// invalidate the entry. Driven directly here because the mock server does
+    /// not emit ENVCHANGE for a registered batch.
+    #[test]
+    fn user_name_is_refreshed_when_the_client_reports_a_different_catalog() {
+        let (h, server) = user_name_fixture(user_name_row("dbo"));
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        assert_eq!(get_wide_str(h.dbc, SQL_USER_NAME).1, "dbo");
+
+        {
+            let mut state = dbc.inner.lock().unwrap();
+            let cached = state.database_user_name.as_mut().unwrap();
+            cached.catalog = "some_other_database".to_string();
+        }
+        server.register_query(DATABASE_USER_NAME_QUERY, user_name_row("guest"));
+
+        assert_eq!(get_wide_str(h.dbc, SQL_USER_NAME).1, "guest");
+    }
+
+    /// A catalog that differs only by case is a *different* database on a
+    /// case-sensitive instance, so the entry must not be reused for it. Both
+    /// sides of the comparison are the server's own ENVCHANGE name, so folding
+    /// case would buy nothing and could serve one database's principal for
+    /// another's.
+    #[test]
+    fn user_name_cache_does_not_match_a_catalog_differing_only_by_case() {
+        let (h, server) = user_name_fixture(user_name_row("dbo"));
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        assert_eq!(get_wide_str(h.dbc, SQL_USER_NAME).1, "dbo");
+
+        {
+            let mut state = dbc.inner.lock().unwrap();
+            let cached = state.database_user_name.as_mut().unwrap();
+            cached.catalog = cached.catalog.to_uppercase();
+        }
+        server.register_query(DATABASE_USER_NAME_QUERY, user_name_row("other_db_user"));
+
+        assert_eq!(
+            get_wide_str(h.dbc, SQL_USER_NAME).1,
+            "other_db_user",
+            "a case-differing catalog is a different database, so the entry must not be reused"
+        );
+    }
+
+    /// A `USE [X]` issued while already in `X` changes no catalog name but
+    /// still fires an `ENV_DATABASE` event — and paired with an `EXECUTE AS`
+    /// that is the only signal the database principal moved. msodbcsql flags
+    /// its refresh on any such token without comparing names
+    /// (`sqlctokn.cpp:2866-2882`), so the name alone cannot be the whole key.
+    #[test]
+    fn user_name_is_refreshed_by_a_same_catalog_database_change_event() {
+        let (h, server) = user_name_fixture(user_name_row("dbo"));
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        assert_eq!(get_wide_str(h.dbc, SQL_USER_NAME).1, "dbo");
+
+        // Stand in for the server reporting `USE [master]` while already in
+        // master: same name, new event. The mock does not emit ENVCHANGE for a
+        // registered batch, so the count is advanced directly — the catalog is
+        // deliberately left alone, which is the whole point of the case.
+        {
+            let mut state = dbc.inner.lock().unwrap();
+            let cached = state.database_user_name.as_mut().unwrap();
+            assert_eq!(cached.catalog, "master", "fixture connects to master");
+            cached.database_change_count = cached.database_change_count.wrapping_sub(1);
+        }
+        server.register_query(DATABASE_USER_NAME_QUERY, user_name_row("guest"));
+
+        assert_eq!(
+            get_wide_str(h.dbc, SQL_USER_NAME).1,
+            "guest",
+            "a same-name database-change event must still invalidate the entry"
+        );
+    }
+
+    /// The control for both cases above: an identical catalog with no
+    /// database-change event is reused without a round trip, so the refresh is
+    /// driven by something actually changing and not by every read going back
+    /// to the server.
+    #[test]
+    fn user_name_cache_matches_an_identical_catalog() {
+        let (h, server) = user_name_fixture(user_name_row("dbo"));
+        assert_eq!(get_wide_str(h.dbc, SQL_USER_NAME).1, "dbo");
+
+        server.register_query(DATABASE_USER_NAME_QUERY, user_name_row("never_read"));
+
+        assert_eq!(
+            get_wide_str(h.dbc, SQL_USER_NAME).1,
+            "dbo",
+            "an unchanged catalog must be served from the cache"
+        );
+    }
+
+    /// msodbcsql spawns a second connection when the first is busy and, if that
+    /// fails, reports the cached value — `RefreshShilohUDTCache` cannot fail the
+    /// caller. This driver has no spawn facility, so the cached value is the
+    /// whole answer; what must not happen is an error or a diagnostic, because
+    /// `SQLGetInfo` has to stay answerable while a cursor is open.
+    #[test]
+    fn user_name_reports_the_cached_value_while_the_connection_is_busy() {
+        let (mut h, server) = user_name_fixture(user_name_row("dbo"));
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        assert_eq!(get_wide_str(h.dbc, SQL_USER_NAME).1, "dbo");
+
+        let stmt = h.alloc_extra_stmt();
+        dbc.inner.lock().unwrap().active_stmt = Some(stmt);
+        server.register_query(DATABASE_USER_NAME_QUERY, user_name_row("never_read"));
+
+        let (rc, value, _) = get_wide_str(h.dbc, SQL_USER_NAME);
+        assert_eq!(
+            rc, SQL_SUCCESS,
+            "a busy connection must not fail SQLGetInfo"
+        );
+        assert_eq!(value, "dbo");
+        assert!(
+            diag_states(h.dbc).is_empty(),
+            "the refusal to refresh is internal and must post nothing"
+        );
+
+        dbc.inner.lock().unwrap().active_stmt = None;
+    }
+
+    /// The same busy path before anything was cached: an empty string, still
+    /// `SQL_SUCCESS`. msodbcsql reports its zero-initialized buffer here.
+    #[test]
+    fn user_name_is_empty_when_busy_before_the_first_lookup() {
+        let (mut h, _server) = user_name_fixture(user_name_row("dbo"));
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+
+        let stmt = h.alloc_extra_stmt();
+        dbc.inner.lock().unwrap().active_stmt = Some(stmt);
+
+        assert_eq!(
+            get_wide_str(h.dbc, SQL_USER_NAME),
+            (SQL_SUCCESS, String::new(), 0)
+        );
+        assert!(diag_states(h.dbc).is_empty());
+
+        dbc.inner.lock().unwrap().active_stmt = None;
+    }
+
+    /// A server-side failure leaves the previous answer standing and posts
+    /// nothing — msodbcsql's `ExecImmediate` failure path skips the fetch, keeps
+    /// `DBUserName`, and discards the records with its driver statement. The
+    /// connection must also survive, so the next lookup can succeed.
+    #[test]
+    fn user_name_survives_a_failed_lookup_without_diagnostics() {
+        use mssql_mock_tds::{QueryResponse, TerminalError};
+
+        let (h, server) = user_name_fixture(user_name_row("dbo"));
+        assert_eq!(get_wide_str(h.dbc, SQL_USER_NAME).1, "dbo");
+
+        // Force a refresh, then make that refresh fail.
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        dbc.inner
+            .lock()
+            .unwrap()
+            .database_user_name
+            .as_mut()
+            .unwrap()
+            .catalog = "elsewhere".to_string();
+        server.register_query(
+            DATABASE_USER_NAME_QUERY,
+            QueryResponse::error_only(TerminalError::new(
+                229,
+                14,
+                "The SELECT permission was denied on the object 'USER_NAME'",
+            )),
+        );
+
+        let (rc, value, _) = get_wide_str(h.dbc, SQL_USER_NAME);
+        assert_eq!(
+            rc, SQL_SUCCESS,
+            "a failed internal lookup is not the caller's error"
+        );
+        assert_eq!(value, "dbo", "the previous answer stands");
+        assert!(diag_states(h.dbc).is_empty());
+
+        // The client went back idle, so a later refresh still works.
+        server.register_query(DATABASE_USER_NAME_QUERY, user_name_row("recovered"));
+        assert_eq!(get_wide_str(h.dbc, SQL_USER_NAME).1, "recovered");
+    }
+
+    /// `USER_NAME()` is NULL for a login with no principal in the current
+    /// database. msodbcsql's `SQLGetData` leaves its buffer untouched for a
+    /// NULL, so the previous answer stands rather than being cleared — and
+    /// because the exec itself succeeded, it stops asking as well.
+    #[test]
+    fn user_name_keeps_the_previous_answer_for_a_null_result() {
+        use mssql_mock_tds::{ColumnDefinition, ColumnValue, QueryResponse, Row, SqlDataType};
+
+        let (h, server) = user_name_fixture(user_name_row("dbo"));
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        assert_eq!(get_wide_str(h.dbc, SQL_USER_NAME).1, "dbo");
+
+        dbc.inner
+            .lock()
+            .unwrap()
+            .database_user_name
+            .as_mut()
+            .unwrap()
+            .catalog = "elsewhere".to_string();
+        server.register_query(
+            DATABASE_USER_NAME_QUERY,
+            QueryResponse::new(
+                vec![ColumnDefinition::new("", SqlDataType::Int)],
+                vec![Row::new(vec![ColumnValue::Null])],
+            ),
+        );
+
+        let (rc, value, _) = get_wide_str(h.dbc, SQL_USER_NAME);
+        assert_eq!(rc, SQL_SUCCESS);
+        assert_eq!(value, "dbo");
+        assert!(diag_states(h.dbc).is_empty());
+
+        // Re-keyed to the database the NULL came from, so the next read is
+        // served from the cache instead of repeating the round trip.
+        server.register_query(DATABASE_USER_NAME_QUERY, user_name_row("never_read"));
+        assert_eq!(get_wide_str(h.dbc, SQL_USER_NAME).1, "dbo");
+    }
+
+    /// An empty result set is the other "nothing to report" shape. The query
+    /// still *ran*, so — like msodbcsql, which clears `CONN_ST_REFRESH_UDT` on
+    /// exec success before it fetches — the outcome is cached and the round
+    /// trip is not repeated on every later call.
+    #[test]
+    fn user_name_tolerates_a_lookup_that_returns_no_row() {
+        use mssql_mock_tds::{ColumnDefinition, QueryResponse, SqlDataType};
+
+        let (h, server) = user_name_fixture(QueryResponse::new(
+            vec![ColumnDefinition::new("", SqlDataType::NVarChar)],
+            Vec::new(),
+        ));
+
+        assert_eq!(
+            get_wide_str(h.dbc, SQL_USER_NAME),
+            (SQL_SUCCESS, String::new(), 0)
+        );
+        assert!(diag_states(h.dbc).is_empty());
+
+        // Registering a real answer the second call must not see proves the
+        // lookup stopped asking rather than re-querying forever.
+        server.register_query(DATABASE_USER_NAME_QUERY, user_name_row("never_read"));
+        assert_eq!(
+            get_wide_str(h.dbc, SQL_USER_NAME),
+            (SQL_SUCCESS, String::new(), 0)
+        );
+    }
+
+    /// `SQL_ATTR_CONNECTION_TIMEOUT` bounds the internal query, as it does in
+    /// msodbcsql (`GetNetIOTimeOut` → `ExecImmediate`). Expiry must still not
+    /// fail the caller: the deadline ends the *lookup*, not the `SQLGetInfo`.
+    #[test]
+    fn user_name_lookup_is_bounded_by_the_connection_timeout() {
+        use std::time::{Duration, Instant};
+
+        const RESPONSE_DELAY: Duration = Duration::from_secs(8);
+        const TIMEOUT_SECS: u32 = 1;
+        // Comfortably above the timeout plus RTT, comfortably below the delay —
+        // the gap is what proves the deadline, not the server, ended the wait.
+        const BOUND: Duration = Duration::from_secs(5);
+
+        let (h, server) = user_name_fixture(user_name_row("dbo").with_delay(RESPONSE_DELAY));
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        dbc.inner.lock().unwrap().connection_timeout = TIMEOUT_SECS;
+
+        let started = Instant::now();
+        let (rc, value, _) = get_wide_str(h.dbc, SQL_USER_NAME);
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < BOUND,
+            "SQLGetInfo took {elapsed:?} — a {TIMEOUT_SECS}s SQL_ATTR_CONNECTION_TIMEOUT must \
+             bound the lookup well below the server's {RESPONSE_DELAY:?} delay"
+        );
+        assert_eq!(
+            rc, SQL_SUCCESS,
+            "a lookup deadline is not the caller's error"
+        );
+        assert_eq!(value, "", "nothing was learned, so nothing is reported");
+        assert!(diag_states(h.dbc).is_empty());
+
+        // The deadline is the one failure mode where a desynchronized
+        // attention/response would be easiest to introduce, so hold it to the
+        // same "a best-effort lookup must never cost the application its
+        // connection" invariant the other failure paths are held to.
+        {
+            let state = dbc.inner.lock().unwrap();
+            assert!(state.client.is_some(), "the client must go back to the DBC");
+            assert!(state.active_stmt.is_none(), "no cursor claim may be left");
+            assert_eq!(state.connection_state, ConnectionState::Connected);
+        }
+        server.register_query(DATABASE_USER_NAME_QUERY, user_name_row("recovered"));
+        assert_eq!(get_wide_str(h.dbc, SQL_USER_NAME).1, "recovered");
+    }
+
+    /// An invalid buffer length must be rejected *before* the driver issues a
+    /// query on the caller's behalf. Otherwise `SQLGetInfoW(..., -1, ...)` pays
+    /// — and caches — a round trip only to return `HY090`, and with no
+    /// connection timeout set it could block indefinitely first.
+    #[test]
+    fn user_name_rejects_a_negative_buffer_length_without_querying() {
+        let (h, server) = user_name_fixture(user_name_row("dbo"));
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+
+        let mut buf = [0u16; 8];
+        let mut len: SqlSmallInt = -1;
+        let rc = unsafe {
+            sql_get_info_w(
+                h.dbc,
+                SQL_USER_NAME,
+                buf.as_mut_ptr() as SqlPointer,
+                -1,
+                &mut len,
+            )
+        };
+
+        assert_eq!(rc, SQL_ERROR);
+        assert_eq!(diag_states(h.dbc), vec!["HY090"]);
+        assert!(
+            dbc.inner.lock().unwrap().database_user_name.is_none(),
+            "no query may be issued, so nothing may be cached"
+        );
+
+        // Registering a different answer the next call must not see would be
+        // ambiguous; instead prove the lookup still works afterwards.
+        server.register_query(DATABASE_USER_NAME_QUERY, user_name_row("dbo"));
+        assert_eq!(get_wide_str(h.dbc, SQL_USER_NAME).1, "dbo");
+    }
+
+    /// The previous call's diagnostics must be cleared at entry, not after the
+    /// lookup returns — otherwise they stay visible to `SQLGetDiagRec` for the
+    /// whole round trip, and survive entirely if the lookup never completes.
+    #[test]
+    fn user_name_clears_diagnostics_before_the_lookup_runs() {
+        use std::time::Duration;
+
+        let (h, _server) =
+            user_name_fixture(user_name_row("dbo").with_delay(Duration::from_secs(4)));
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        dbc.inner.lock().unwrap().connection_timeout = 1;
+
+        // Leave a record behind from an earlier call.
+        let mut small = [0u16; 2];
+        let mut len: SqlSmallInt = -1;
+        assert_eq!(
+            unsafe {
+                sql_get_info_w(
+                    h.dbc,
+                    SQL_SERVER_NAME,
+                    small.as_mut_ptr() as SqlPointer,
+                    -1,
+                    &mut len,
+                )
+            },
+            SQL_ERROR
+        );
+        assert_eq!(diag_states(h.dbc), vec!["HY090"]);
+
+        // Synchronize on the lookup actually being in flight rather than on a
+        // fixed delay. The client leaves the DBC only in `database_user_name`,
+        // which runs after the first critical section above — so observing
+        // `client == None` proves the clear either happened or was skipped,
+        // never merely that the main thread had not reached it yet.
+        let probe = std::thread::spawn({
+            let dbc_ptr = h.dbc as usize;
+            move || {
+                let dbc = unsafe { handle_from_raw::<DbcHandle>(dbc_ptr as SqlHandle) };
+                let deadline = std::time::Instant::now() + Duration::from_secs(30);
+                while std::time::Instant::now() < deadline {
+                    {
+                        let state = dbc.inner.lock().unwrap();
+                        if state.client.is_none() {
+                            return Some(state.diag_records.len());
+                        }
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                None
+            }
+        });
+
+        let (rc, _, _) = get_wide_str(h.dbc, SQL_USER_NAME);
+        assert_eq!(rc, SQL_SUCCESS);
+        assert_eq!(
+            probe.join().unwrap(),
+            Some(0),
+            "the previous call's diagnostics must be cleared before the lookup, \
+             not after it returns"
+        );
+    }
+
+    /// `SQL_COLLATION_SEQ` must report the same thing while the lookup holds
+    /// the client as it does on either side of it. It reads the live client
+    /// when present and `last_collation_code_page` / `last_char_set` when not,
+    /// so `try_claim_idle_dbc_client` refreshes those before taking it — the
+    /// same bookkeeping `claim_connection` does for a data-at-execution park.
+    /// Without it the client-absent read falls back to whatever happened to be
+    /// in those fields, which need not describe this connection at all.
+    #[test]
+    fn collation_seq_stays_answerable_while_the_user_name_lookup_holds_the_client() {
+        use std::time::Duration;
+
+        let (h, _server) =
+            user_name_fixture(user_name_row("dbo").with_delay(Duration::from_secs(2)));
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+
+        // What this connection actually reports, read from the live client.
+        let live = get_wide_str(h.dbc, odbc::SQL_COLLATION_SEQ).1;
+
+        // Seed the fallback fields with a value this connection never had, so
+        // the probe below can tell a refreshed snapshot from a stale one.
+        dbc.inner.lock().unwrap().last_collation_code_page = Some(437);
+        assert_eq!(
+            collation_seq_name(Some(437)),
+            Some("Code page 437"),
+            "the seeded value must be one that would be visible if used"
+        );
+
+        // Synchronize on the client actually being claimed, not on a delay.
+        let probe = std::thread::spawn({
+            let dbc_ptr = h.dbc as usize;
+            move || {
+                let dbc_ref = unsafe { handle_from_raw::<DbcHandle>(dbc_ptr as SqlHandle) };
+                let deadline = std::time::Instant::now() + Duration::from_secs(30);
+                while std::time::Instant::now() < deadline {
+                    if dbc_ref.inner.lock().unwrap().client.is_none() {
+                        return Some(get_wide_str(dbc_ptr as SqlHandle, odbc::SQL_COLLATION_SEQ).1);
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                None
+            }
+        });
+
+        assert_eq!(get_wide_str(h.dbc, SQL_USER_NAME).1, "dbo");
+
+        assert_eq!(
+            probe.join().unwrap(),
+            Some(live.clone()),
+            "while the lookup holds the client, SQL_COLLATION_SEQ must still describe this \
+             connection — not whatever was left in the fallback fields"
+        );
+        assert_eq!(
+            get_wide_str(h.dbc, odbc::SQL_COLLATION_SEQ).1,
+            live,
+            "and the live client must report the same value once it is back"
+        );
+    }
+
+    /// A drain failure *after* the name was read must not throw the name away.
+    /// msodbcsql has already written `DBUserName` in `SQLGetData` by the time
+    /// it calls `SQLMoreResults`, so the value survives a later failure — the
+    /// refresh stops either way, but it stops holding the *new* answer.
+    #[test]
+    fn user_name_keeps_a_name_read_before_the_drain_failed() {
+        use mssql_mock_tds::{ColumnDefinition, ColumnValue, QueryResponse, Row, SqlDataType};
+
+        let (h, server) = user_name_fixture(user_name_row("dbo"));
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        assert_eq!(get_wide_str(h.dbc, SQL_USER_NAME).1, "dbo");
+
+        // Force a refresh whose first row reads cleanly and whose *second* row
+        // is short, so the failure lands in the trailing drain rather than in
+        // the read that produced the name.
+        dbc.inner
+            .lock()
+            .unwrap()
+            .database_user_name
+            .as_mut()
+            .unwrap()
+            .catalog = "elsewhere".to_string();
+        server.register_query(
+            DATABASE_USER_NAME_QUERY,
+            QueryResponse::new(
+                vec![
+                    ColumnDefinition::new("", SqlDataType::NVarChar),
+                    ColumnDefinition::new("", SqlDataType::Int),
+                ],
+                vec![
+                    Row::new(vec![
+                        ColumnValue::NVarChar("fetched_user".to_string()),
+                        ColumnValue::Int(1),
+                    ]),
+                    Row::new(vec![ColumnValue::NVarChar("short".to_string())]),
+                ],
+            ),
+        );
+
+        let (rc, value, _) = get_wide_str(h.dbc, SQL_USER_NAME);
+        assert_eq!(rc, SQL_SUCCESS);
+        assert_eq!(
+            value, "fetched_user",
+            "the name was read before the drain failed, so it must not revert to the old one"
+        );
+        assert!(diag_states(h.dbc).is_empty());
+
+        // And it is what got cached, not the stale fallback.
+        server.register_query(DATABASE_USER_NAME_QUERY, user_name_row("never_read"));
+        assert_eq!(get_wide_str(h.dbc, SQL_USER_NAME).1, "fetched_user");
+    }
+
+    /// A failure after `execute` returned `Ok` is on msodbcsql's stop-asking
+    /// side of the boundary: `CONN_ST_REFRESH_UDT` is already clear by then, so
+    /// the previous answer stands and is not re-queried. Only a failure from
+    /// `execute` itself leaves the refresh outstanding.
+    #[test]
+    fn user_name_caches_the_fallback_when_the_drain_fails_after_execution() {
+        use mssql_mock_tds::{ColumnDefinition, QueryResponse, Row, SqlDataType};
+
+        let (h, server) = user_name_fixture(user_name_row("dbo"));
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        assert_eq!(get_wide_str(h.dbc, SQL_USER_NAME).1, "dbo");
+
+        // Force a refresh, and make that refresh fail mid-drain: the response
+        // announces a column it never sends a complete row for.
+        dbc.inner
+            .lock()
+            .unwrap()
+            .database_user_name
+            .as_mut()
+            .unwrap()
+            .catalog = "elsewhere".to_string();
+        server.register_query(
+            DATABASE_USER_NAME_QUERY,
+            QueryResponse::new(
+                vec![
+                    ColumnDefinition::new("", SqlDataType::NVarChar),
+                    ColumnDefinition::new("", SqlDataType::Int),
+                ],
+                vec![Row::new(vec![mssql_mock_tds::ColumnValue::NVarChar(
+                    "partial".to_string(),
+                )])],
+            ),
+        );
+
+        let (rc, value, _) = get_wide_str(h.dbc, SQL_USER_NAME);
+        assert_eq!(rc, SQL_SUCCESS);
+        assert!(diag_states(h.dbc).is_empty());
+
+        // Whatever it reported, it must not go back to the server for it.
+        server.register_query(DATABASE_USER_NAME_QUERY, user_name_row("never_read"));
+        assert_eq!(
+            get_wide_str(h.dbc, SQL_USER_NAME).1,
+            value,
+            "a post-execution failure must stop asking, like msodbcsql's cleared flag"
+        );
+
+        // The lookup must not cost the application its connection: the batch was
+        // closed despite the mid-drain failure, so the next refresh still works.
+        dbc.inner
+            .lock()
+            .unwrap()
+            .database_user_name
+            .as_mut()
+            .unwrap()
+            .catalog = "elsewhere_again".to_string();
+        server.register_query(DATABASE_USER_NAME_QUERY, user_name_row("recovered"));
+        assert_eq!(get_wide_str(h.dbc, SQL_USER_NAME).1, "recovered");
+    }
+
+    /// The lookup releases the DBC lock for its round trip. If the session is
+    /// replaced in that window, the client in hand belongs to a closed session:
+    /// storing it would overwrite the live one and attach the old principal to
+    /// it.
+    #[test]
+    fn user_name_discards_its_answer_when_the_session_is_replaced() {
+        let (h, _server) = user_name_fixture(user_name_row("dbo"));
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+
+        // Stand in for "a disconnect and a fresh connect completed while the
+        // lookup was in flight" by publishing a newer generation.
+        let (client, generation) = {
+            let mut state = dbc.inner.lock().unwrap();
+            let client = state.client.take().expect("fixture installs a client");
+            let generation = state.session_generation;
+            state.session_generation = generation.wrapping_add(1);
+            (client, generation)
+        };
+
+        let reported = super::publish_lookup(
+            dbc,
+            client,
+            generation,
+            "master".to_string(),
+            0,
+            Some("dbo".to_string()),
+            "stale".to_string(),
+        );
+
+        assert_eq!(reported, "", "nothing is known about the new session");
+        let state = dbc.inner.lock().unwrap();
+        assert!(
+            state.client.is_none(),
+            "the stale client must not be installed over the new session"
+        );
+        assert!(
+            state.database_user_name.is_none(),
+            "the old session's principal must not be cached against the new one"
+        );
+    }
+
+    /// A plain `SQLDisconnect` with **no** reconnect behind it is the case the
+    /// generation check cannot see: `sql_disconnect_safe` clears the client and
+    /// marks the DBC `Disconnected` without touching `session_generation`
+    /// (`do_connect` is its only writer), so the generation still matches on the
+    /// way back. Without the `connection_state` half of the guard the lookup
+    /// would install a live `TdsClient` on a handle the application has already
+    /// disconnected — leaving the session open until the next connect or
+    /// `SQLFreeHandle`, and the DBC `Disconnected` with `client == Some(..)`.
+    #[test]
+    fn user_name_discards_its_answer_when_the_handle_was_disconnected() {
+        use crate::api::disconnect::sql_disconnect;
+        use crate::api::txn::try_claim_idle_dbc_client;
+
+        let (h, _server) = user_name_fixture(user_name_row("dbo"));
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+
+        let (client, generation, _) =
+            try_claim_idle_dbc_client(dbc).expect("fixture leaves the connection idle");
+        assert_eq!(unsafe { sql_disconnect(h.dbc) }, SQL_SUCCESS);
+
+        // The generation is deliberately unchanged — a disconnect alone does
+        // not advance it, which is exactly why this half of the guard exists.
+        let reported = super::publish_lookup(
+            dbc,
+            client,
+            generation,
+            "master".to_string(),
+            0,
+            Some("dbo".to_string()),
+            "stale".to_string(),
+        );
+
+        assert_eq!(reported, "", "a disconnected handle reports no principal");
+        let state = dbc.inner.lock().unwrap();
+        assert!(
+            state.client.is_none(),
+            "the lookup must not resurrect a client on a disconnected handle"
+        );
+        assert_eq!(state.connection_state, ConnectionState::Disconnected);
+        assert!(state.database_user_name.is_none());
+    }
+
+    /// The internal query's INFO messages must not reach the application. They
+    /// belong to no application statement, so a leak would turn an unrelated
+    /// `SQLExecDirect` into `SQL_SUCCESS_WITH_INFO` carrying a message the
+    /// caller never provoked.
+    ///
+    /// `database_user_name` discards them explicitly. `TdsClient::begin_command`
+    /// would also clear them at the top of this `SQLExecDirect`, so this case
+    /// alone cannot tell the two apart — and that ambiguity once led to the
+    /// discard being removed as redundant. The close-cursor case below is what
+    /// pins it: that path never starts a command, so only the explicit discard
+    /// saves it. Treat the two as a pair.
+    #[test]
+    fn user_name_lookup_does_not_leak_info_messages_to_the_next_statement() {
+        use crate::api::exec_direct::sql_exec_direct_w;
+        use crate::api::odbc_types::SQL_NTS;
+        use mssql_mock_tds::InfoMessage;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let _server = crate::test_support::connect_mock_server(
+            dbc,
+            DATABASE_USER_NAME_QUERY,
+            user_name_row("dbo").with_info_tokens(vec![InfoMessage::new(
+                5701,
+                0,
+                "Changed database context to 'master'.",
+            )]),
+        );
+
+        assert_eq!(get_wide_str(h.dbc, SQL_USER_NAME).1, "dbo");
+        assert!(
+            diag_states(h.dbc).is_empty(),
+            "the internal query's INFO must not reach the DBC either"
+        );
+
+        // "SELECT 1" is a default registration on the mock server and carries
+        // no INFO of its own, so anything reported here leaked from the lookup.
+        let sql: Vec<u16> = "SELECT 1\0".encode_utf16().collect();
+        let rc = unsafe { sql_exec_direct_w(h.stmt, sql.as_ptr(), SQL_NTS) };
+
+        let stmt = unsafe { handle_from_raw::<crate::handles::StmtHandle>(h.stmt) };
+        let leaked: Vec<String> = stmt
+            .inner
+            .lock()
+            .unwrap()
+            .diag_records
+            .iter()
+            .map(|d| format!("{} {}", String::from_utf8_lossy(&d.sql_state), d.message))
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "the lookup's INFO surfaced on an unrelated statement: {leaked:?}"
+        );
+        assert_eq!(
+            rc, SQL_SUCCESS,
+            "a leaked INFO would also downgrade this to SQL_SUCCESS_WITH_INFO"
+        );
+    }
+
+    /// The close-cursor path is the one `begin_command` does not cover: it
+    /// takes the idle client and posts `take_info_messages()` without starting
+    /// a command, so the lookup has to discard its own INFO rather than leave
+    /// it for the next command to clear.
+    #[test]
+    fn user_name_lookup_does_not_leak_info_messages_to_a_closing_cursor() {
+        use crate::api::close_cursor::sql_close_cursor;
+        use crate::api::exec_direct::sql_exec_direct_w;
+        use crate::api::odbc_types::SQL_NTS;
+        use mssql_mock_tds::InfoMessage;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let _server = crate::test_support::connect_mock_server(
+            dbc,
+            DATABASE_USER_NAME_QUERY,
+            user_name_row("dbo").with_info_tokens(vec![InfoMessage::new(
+                5701,
+                0,
+                "Changed database context to 'master'.",
+            )]),
+        );
+
+        // Open a cursor and run it to exhaustion: the fetch releases the
+        // connection claim while the cursor stays logically open, which is the
+        // state that lets the lookup run and `SQLCloseCursor` follow it.
+        let sql: Vec<u16> = "SELECT 1\0".encode_utf16().collect();
+        assert_eq!(
+            unsafe { sql_exec_direct_w(h.stmt, sql.as_ptr(), SQL_NTS) },
+            SQL_SUCCESS
+        );
+        while unsafe { crate::api::fetch::sql_fetch(h.stmt) } == SQL_SUCCESS {}
+
+        assert_eq!(get_wide_str(h.dbc, SQL_USER_NAME).1, "dbo");
+
+        let rc = unsafe { sql_close_cursor(h.stmt) };
+
+        let stmt = unsafe { handle_from_raw::<crate::handles::StmtHandle>(h.stmt) };
+        let leaked: Vec<String> = stmt
+            .inner
+            .lock()
+            .unwrap()
+            .diag_records
+            .iter()
+            .map(|d| format!("{} {}", String::from_utf8_lossy(&d.sql_state), d.message))
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "the lookup's INFO surfaced on the closing cursor: {leaked:?}"
+        );
+        assert_eq!(
+            rc, SQL_SUCCESS,
+            "a leaked INFO would downgrade this to SQL_SUCCESS_WITH_INFO"
+        );
+    }
+
+    /// The lookup must leave the connection idle and usable: it claims the
+    /// client only for the round trip and returns it, never keeping
+    /// `active_stmt`.
+    #[test]
+    fn user_name_lookup_leaves_the_connection_idle() {
+        let (h, _server) = user_name_fixture(user_name_row("dbo"));
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+
+        assert_eq!(get_wide_str(h.dbc, SQL_USER_NAME).1, "dbo");
+
+        let state = dbc.inner.lock().unwrap();
+        assert!(state.client.is_some(), "the client must go back to the DBC");
+        assert!(
+            state.active_stmt.is_none(),
+            "no cursor claim may be left behind"
+        );
+        assert_eq!(state.connection_state, ConnectionState::Connected);
+        assert!(
+            !state.local_tran_started,
+            "the internal lookup must not open a user transaction"
+        );
+        // `local_tran_started` is the driver's own bookkeeping, which the
+        // internal lookup bypasses entirely — so on its own it would stay false
+        // even if the batch had left a transaction open on the server. Ask the
+        // client what actually happened on the wire.
+        assert!(
+            !state
+                .client
+                .as_ref()
+                .expect("client is present")
+                .has_active_transaction(),
+            "the internal lookup must not leave the session in a server transaction"
+        );
+    }
+
+    /// A name longer than the caller's buffer truncates with `01004` and
+    /// reports the full length, like every other string information type.
+    #[test]
+    fn user_name_truncates_with_01004() {
+        let (h, _server) = user_name_fixture(user_name_row("reporting_reader"));
+
+        let mut buf = [0u16; 4];
+        let mut len: SqlSmallInt = -1;
+        let rc = unsafe {
+            sql_get_info_w(
+                h.dbc,
+                SQL_USER_NAME,
+                buf.as_mut_ptr() as SqlPointer,
+                (buf.len() * std::mem::size_of::<SqlWChar>()) as SqlSmallInt,
+                &mut len,
+            )
+        };
+
+        assert_eq!(rc, SQL_SUCCESS_WITH_INFO);
+        assert_eq!(
+            len, 32,
+            "the full untruncated byte length is still reported"
+        );
+        assert_eq!(String::from_utf16_lossy(&buf[..3]), "rep");
+        assert_eq!(buf[3], 0, "missing NUL");
+        assert_eq!(diag_states(h.dbc), vec!["01004"]);
+    }
+
+    /// A null buffer is a length probe, and must not re-run the lookup.
+    #[test]
+    fn user_name_reports_its_length_with_a_null_buffer() {
+        let (h, server) = user_name_fixture(user_name_row("dbo"));
+
+        let mut len: SqlSmallInt = -1;
+        let rc = unsafe { sql_get_info_w(h.dbc, SQL_USER_NAME, ptr::null_mut(), 0, &mut len) };
+        assert_eq!(rc, SQL_SUCCESS);
+        assert_eq!(len, 6);
+
+        server.register_query(DATABASE_USER_NAME_QUERY, user_name_row("changed"));
+        assert_eq!(get_wide_str(h.dbc, SQL_USER_NAME).1, "dbo");
+    }
+
+    /// A non-ASCII principal survives the UTF-16 round trip with a byte length
+    /// measured in code units, not characters.
+    #[test]
+    fn user_name_reports_a_non_ascii_principal() {
+        let (h, _server) = user_name_fixture(user_name_row("análisis"));
+
+        let (rc, value, len) = get_wide_str(h.dbc, SQL_USER_NAME);
+        assert_eq!(rc, SQL_SUCCESS);
+        assert_eq!(value, "análisis");
+        assert_eq!(len, 16);
+    }
+
+    /// Disconnecting ends the session the name belonged to, so the entry must
+    /// not survive into the handle's next connection.
+    #[test]
+    fn user_name_cache_is_dropped_on_disconnect() {
+        let (h, _server) = user_name_fixture(user_name_row("dbo"));
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        assert_eq!(get_wide_str(h.dbc, SQL_USER_NAME).1, "dbo");
+
+        assert_eq!(
+            unsafe { crate::api::disconnect::sql_disconnect(h.dbc) },
+            SQL_SUCCESS
+        );
+
+        assert!(dbc.inner.lock().unwrap().database_user_name.is_none());
+        assert_eq!(
+            get_wide_str(h.dbc, SQL_USER_NAME),
+            (SQL_SUCCESS, String::new(), 0),
+            "a disconnected handle reports no database user"
+        );
+    }
+
+    /// The lookup must not resurrect diagnostics the call is supposed to clear.
+    #[test]
+    fn user_name_clears_the_previous_calls_diagnostic() {
+        let (h, _server) = user_name_fixture(user_name_row("dbo"));
+
+        let mut small = [0u16; 2];
+        let mut len: SqlSmallInt = -1;
+        assert_eq!(
+            unsafe {
+                sql_get_info_w(
+                    h.dbc,
+                    SQL_USER_NAME,
+                    small.as_mut_ptr() as SqlPointer,
+                    (small.len() * std::mem::size_of::<SqlWChar>()) as SqlSmallInt,
+                    &mut len,
+                )
+            },
+            SQL_SUCCESS_WITH_INFO
+        );
+        assert_eq!(diag_states(h.dbc), vec!["01004"]);
+
+        assert_eq!(get_wide_str(h.dbc, SQL_USER_NAME).0, SQL_SUCCESS);
+        assert!(diag_states(h.dbc).is_empty());
     }
 
     #[test]
