@@ -2272,7 +2272,8 @@ fn stream_active_plp_chunk_once<'a>(
                     emit,
                 );
             }
-            stream.pending_bytes.drain(..emit);
+            let loss = stream.drain_pending_bytes(emit);
+            progress.code_page_loss |= target_type == SQL_C_CHAR && loss;
             if stream.pending_bytes.is_empty() {
                 stream.pending_bytes_utf16 = false;
                 stream.pending_bytes_encoding = ClientEncoding::UTF8;
@@ -2638,6 +2639,7 @@ fn stream_active_plp_chunk_once<'a>(
                 pending_byte,
                 pending_high_surrogate,
                 pending_bytes: pending_utf8,
+                pending_loss_ranges,
                 ..
             } = stream;
             let pending_before = pending_utf8.len();
@@ -2654,9 +2656,13 @@ fn stream_active_plp_chunk_once<'a>(
             } else {
                 // Old carry was drained before reading wire bytes. Only this
                 // newly decoded, complete Unicode chunk is encoded here.
-                match encode_plp_pending(pending_utf8, pending_before, text_output.encoding) {
-                    Ok(had_loss) => {
-                        progress.code_page_loss |= had_loss;
+                match encode_plp_pending_with_loss(
+                    pending_utf8,
+                    pending_loss_ranges,
+                    pending_before,
+                    text_output.encoding,
+                ) {
+                    Ok(()) => {
                         stream.pending_bytes_encoding = text_output.encoding;
                         payload_capacity.min(stream.pending_bytes.len())
                     }
@@ -2677,7 +2683,7 @@ fn stream_active_plp_chunk_once<'a>(
                     SqlLen::try_from(emit).unwrap_or(SqlLen::MAX),
                 );
             }
-            stream.pending_bytes.drain(..emit);
+            progress.code_page_loss |= stream.drain_pending_bytes(emit);
             // Forward progress, mirroring the widening branch's guard. The
             // extra read > 0 term is the UTF-16 difference: a chunk can be a
             // lone carried high surrogate (the #211 straddle), consuming wire
@@ -2786,6 +2792,7 @@ fn stream_active_plp_chunk_once<'a>(
                 narrow_decoder,
                 narrow_decoder_finished,
                 pending_bytes: pending_utf8,
+                pending_loss_ranges,
                 ..
             } = stream;
             let Some(decoder) = narrow_decoder.as_mut() else {
@@ -2805,9 +2812,13 @@ fn stream_active_plp_chunk_once<'a>(
             let emit = if text_output.encoding.is_utf8() {
                 emit
             } else {
-                match encode_plp_pending(pending_utf8, pending_before, text_output.encoding) {
-                    Ok(had_loss) => {
-                        progress.code_page_loss |= had_loss;
+                match encode_plp_pending_with_loss(
+                    pending_utf8,
+                    pending_loss_ranges,
+                    pending_before,
+                    text_output.encoding,
+                ) {
+                    Ok(()) => {
                         stream.pending_bytes_encoding = text_output.encoding;
                         payload_capacity.min(stream.pending_bytes.len())
                     }
@@ -2828,7 +2839,7 @@ fn stream_active_plp_chunk_once<'a>(
                     SqlLen::try_from(emit).unwrap_or(SqlLen::MAX),
                 );
             }
-            stream.pending_bytes.drain(..emit);
+            progress.code_page_loss |= stream.drain_pending_bytes(emit);
             // Same forward-progress guard as the widening branch: consuming wire
             // while emitting nothing is progress (the decoder is holding a
             // partial sequence); doing neither is a stalled stream.
@@ -3207,14 +3218,33 @@ fn narrow_decoder_has_partial_character(decoder: &ResolvedDecoder) -> bool {
     decoder.has_pending_narrow_character()
 }
 
-fn encode_plp_pending(
+fn encode_plp_pending_with_loss(
     pending: &mut Vec<u8>,
+    loss_ranges: &mut Vec<std::ops::Range<usize>>,
     start: usize,
     encoding: ClientEncoding,
-) -> Result<bool, DiagMsg> {
+) -> Result<(), DiagMsg> {
     let text = std::str::from_utf8(&pending[start..]).map_err(|_| ERR_INVALID_CHARACTER_VALUE)?;
     let encoded = encoding.encode(text)?;
-    let had_loss = encoded.had_loss;
+    if encoded.had_loss {
+        let mut offset = start;
+        let mut scalar = [0; 4];
+        for ch in text.chars() {
+            let character = encoding.encode(ch.encode_utf8(&mut scalar))?;
+            let end = offset.saturating_add(character.bytes.len());
+            if character.had_loss {
+                if let Some(previous) = loss_ranges.last_mut().filter(|range| range.end == offset) {
+                    previous.end = end;
+                } else {
+                    loss_ranges
+                        .try_reserve(1)
+                        .map_err(|_| ERR_MEMORY_ALLOCATION)?;
+                    loss_ranges.push(offset..end);
+                }
+            }
+            offset = end;
+        }
+    }
     if let std::borrow::Cow::Owned(bytes) = encoded.bytes {
         if start == 0 {
             *pending = bytes;
@@ -3223,7 +3253,7 @@ fn encode_plp_pending(
             pending.extend_from_slice(&bytes);
         }
     }
-    Ok(had_loss)
+    Ok(())
 }
 
 /// Converted bytes include both emitted output and decoded bytes withheld by
@@ -3285,6 +3315,7 @@ fn append_typed_plp_text(
         bytes.extend_from_slice(&stream.pending_bytes);
     }
     stream.pending_bytes.clear();
+    stream.pending_loss_ranges.clear();
     stream.pending_bytes_utf16 = false;
     stream.pending_bytes_encoding = ClientEncoding::UTF8;
     if !stream.pending_units.is_empty() {
@@ -5231,22 +5262,24 @@ mod tests {
     #[test]
     fn client_pending_conversion_preserves_emitted_prefix_and_reports_bad_utf8() {
         let encoding = ClientEncoding::for_code_page(932).unwrap();
+        let mut loss_ranges = Vec::new();
         for start in [0, 2] {
             let mut pending = b"OK".to_vec();
             pending.extend_from_slice("あ".as_bytes());
-            assert!(!encode_plp_pending(&mut pending, start, encoding).unwrap());
+            encode_plp_pending_with_loss(&mut pending, &mut loss_ranges, start, encoding).unwrap();
+            assert!(loss_ranges.is_empty());
             assert_eq!(pending, b"OK\x82\xa0");
         }
         let mut pending = b"OK\xff".to_vec();
         assert_eq!(
-            encode_plp_pending(&mut pending, 2, encoding)
+            encode_plp_pending_with_loss(&mut pending, &mut loss_ranges, 2, encoding)
                 .unwrap_err()
                 .state,
             ERR_INVALID_CHARACTER_VALUE.state
         );
         assert_eq!(pending, b"OK\xff");
         let mut pending = b"OK".to_vec();
-        assert!(!encode_plp_pending(&mut pending, 2, encoding).unwrap());
+        encode_plp_pending_with_loss(&mut pending, &mut loss_ranges, 2, encoding).unwrap();
         assert_eq!(pending, b"OK");
     }
 
@@ -9029,6 +9062,65 @@ mod tests {
         state.current_row_last_col = 1;
         state.row_positioned = true;
         state.active_plp = Some(stream);
+    }
+
+    #[test]
+    fn client_code_page_plp_carry_warns_only_for_delivered_substitutions() {
+        let text = "A😀BC";
+        let encoding = ClientEncoding::for_code_page(1252).unwrap();
+        let expected = encoding.encode(text).unwrap();
+        assert!(expected.had_loss);
+        for warn in [false, true] {
+            for known in [false, true] {
+                for (source, source_encoding, wire) in [
+                    (PlpEncoding::Utf16Text, None, utf16le(text)),
+                    (
+                        PlpEncoding::Utf8Text,
+                        Some(encoding_rs::UTF_8.into()),
+                        text.as_bytes().to_vec(),
+                    ),
+                    (
+                        PlpEncoding::SingleByteText,
+                        Some(encoding_rs::UTF_8.into()),
+                        text.as_bytes().to_vec(),
+                    ),
+                ] {
+                    let h = TestHandles::with_env_dbc_stmt();
+                    client_code_page(&h, 1252, warn);
+                    let total = known.then_some(u64::try_from(wire.len()).unwrap());
+                    prefetched_text_stream(&h, source, source_encoding, wire, total);
+                    let mut received = Vec::new();
+                    for &byte in expected.bytes.iter() {
+                        let mut output = [0xcc; 3];
+                        let mut indicator = -99;
+                        let rc = unsafe {
+                            sql_get_data(
+                                h.stmt,
+                                1,
+                                SQL_C_CHAR,
+                                output.as_mut_ptr().cast(),
+                                2,
+                                &mut indicator,
+                            )
+                        };
+                        assert!(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+                        assert_eq!(output, [byte, 0, 0xcc]);
+                        received.push(byte);
+                        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+                        let state = stmt.inner.lock().unwrap();
+                        assert_eq!(
+                            state
+                                .diag_records
+                                .iter()
+                                .any(|d| d.sql_state == WARN_CODE_PAGE_CONVERSION_LOSS.state),
+                            warn && byte == b'?' && rc == SQL_SUCCESS_WITH_INFO,
+                            "source {source:?}, delivered {received:?}"
+                        );
+                    }
+                    assert_eq!(received, expected.bytes.as_ref());
+                }
+            }
+        }
     }
 
     #[test]

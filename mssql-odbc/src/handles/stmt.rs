@@ -55,6 +55,8 @@ pub(crate) struct ActivePlpStream {
     /// this tag covers the entire byte buffer.
     pub(crate) pending_bytes_utf16: bool,
     pub(crate) pending_bytes_encoding: ClientEncoding,
+    /// Substitution byte ranges relative to the undelivered converted carry.
+    pub(crate) pending_loss_ranges: Vec<std::ops::Range<usize>>,
     /// Narrow wire encoding resolved from the column's collation (or UTF-8 for
     /// `json`, which carries none), or `None` when the column is not narrow
     /// text. This is a property of the *column*, so a target type that arrives
@@ -134,6 +136,7 @@ impl ActivePlpStream {
             pending_bytes: Vec::new(),
             pending_bytes_utf16: false,
             pending_bytes_encoding: ClientEncoding::UTF8,
+            pending_loss_ranges: Vec::new(),
             narrow_encoding,
             narrow_decoder: None,
             narrow_decoder_finished: false,
@@ -145,6 +148,23 @@ impl ActivePlpStream {
             prefetched_reached_end: false,
             prefetch_error: None,
         }
+    }
+
+    pub(crate) fn drain_pending_bytes(&mut self, count: usize) -> bool {
+        let loss = self
+            .pending_loss_ranges
+            .iter()
+            .any(|range| range.start < count);
+        self.pending_loss_ranges.retain_mut(|range| {
+            if range.end <= count {
+                return false;
+            }
+            range.start = range.start.saturating_sub(count);
+            range.end -= count;
+            true
+        });
+        self.pending_bytes.drain(..count);
+        loss
     }
 
     /// Builds the narrow decoder if this column has an encoding and no decoder

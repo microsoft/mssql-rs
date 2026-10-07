@@ -133,6 +133,9 @@ path with the flag both disabled and enabled. Carry
 tests that need UTF-8 expansion skip on both drivers when the active native
 encoding cannot create that carry; measured source-decoder divergences retain
 their separate reference-driver skips.
+The DBCS text-to-binary continuation regression requires an ASCII-compatible
+client encoding: its binary continuation returns wire bytes, not UTF-32LE
+converted carry.
 
 ### Intentional divergence: `SKIP_IF_COMPARING_MSODBCSQL()`
 

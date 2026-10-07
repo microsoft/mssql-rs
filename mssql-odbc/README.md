@@ -170,6 +170,11 @@ represented use the platform's best-fit/substitution behavior. Set
 retrieval truncates and conversion reports loss. Like msodbcsql, a converted
 result that fits returns success without a loss warning, even with this
 option enabled; do not use the option as a guarantee of lossless retrieval.
+Loss warnings describe only the bytes delivered by that call. Streamed
+converted carry retains coalesced substitution ranges until those bytes are
+consumed, so tiny continuations do not lose warnings or repeat them for an
+already-delivered substitution. Range metadata is allocated only for lossy
+conversion.
 
 Use `SQL_C_WCHAR` for lossless Unicode retrieval; it remains UTF-16LE.
 `SQL_C_BINARY` continues to return unconverted wire bytes. mssql-python's

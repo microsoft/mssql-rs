@@ -2011,18 +2011,23 @@ TEST_F(GetDataUtf16Test, PlpTargetSwitchCompletesSurrogateAfterPriorOutput) {
         ExecDirect("SELECT CAST(N'A' + NCHAR(0xD83D) + NCHAR(0xDE00) AS nvarchar(max)), 42"),
         SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
-    SQLCHAR output[8] = {};
-    SQLLEN ind = 0;
-    ASSERT_EQ(SQL_SUCCESS, SQLGetData(stmt_, 1, SQL_C_CHAR, output, sizeof(output), &ind));
     const auto expected = ODBCTestUtils::Utf8ToNativeClient("A\xF0\x9F\x98\x80");
+    std::vector<SQLCHAR> output(expected.size() + 1, 0xCC);
+    SQLLEN ind = 0;
+    ASSERT_EQ(SQL_SUCCESS, SQLGetData(stmt_, 1, SQL_C_CHAR, output.data(),
+                                      static_cast<SQLLEN>(output.size()), &ind));
     EXPECT_EQ(static_cast<SQLLEN>(expected.size()), ind);
-    EXPECT_EQ(0, std::memcmp(output, expected.c_str(), expected.size() + 1));
+    EXPECT_EQ(0, std::memcmp(output.data(), expected.c_str(), expected.size() + 1));
     EXPECT_EQ(SQL_NO_DATA,
-              SQLGetData(stmt_, 1, SQL_C_BINARY, output, sizeof(output), &ind));
+              SQLGetData(stmt_, 1, SQL_C_BINARY, output.data(),
+                         static_cast<SQLLEN>(output.size()), &ind));
     ASSERT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }
 
 TEST_F(GetDataUtf16Test, PlpTargetSwitchCompletesDbcsAfterPriorOutput) {
+    if (ODBCTestUtils::Utf8ToNativeClient("A") != "A") {
+        GTEST_SKIP() << "requires an ASCII-compatible client encoding to combine converted text and wire bytes";
+    }
     const auto expected = ODBCTestUtils::Utf8ToNativeClient("A\xCE\xB1" "BBBBBBBB");
     ASSERT_SQL_OK(
         ExecDirect("SELECT CAST((N'A' + NCHAR(0x03B1) + REPLICATE(N'B', 8)) "
