@@ -33,13 +33,13 @@ std::string RepeatToken(const std::string& token, size_t count) {
     return out;
 }
 
-size_t CharChunkWrittenLength(const std::vector<SQLCHAR>& buf, SQLRETURN rc, SQLLEN ind) {
+size_t CharChunkWrittenLength(const SQLCHAR* buf, size_t capacity, SQLRETURN rc, SQLLEN ind) {
     // Direct wire reads may initialize unused output slots. The final indicator
     // counts payload bytes, including embedded NULs, rather than initialized slots.
-    if (rc == SQL_SUCCESS && ind >= 0 && static_cast<size_t>(ind) < buf.size()) {
+    if (rc == SQL_SUCCESS && ind >= 0 && static_cast<size_t>(ind) < capacity) {
         return static_cast<size_t>(ind) + 1;
     }
-    size_t written = buf.size();
+    size_t written = capacity;
     while (written != 0 && buf[written - 1] == 0xCC) --written;
     return written;
 }
@@ -62,7 +62,7 @@ std::string ReadCharDataInChunks(SQLHSTMT stmt, SQLUSMALLINT col, size_t buf_siz
         if (rc != SQL_SUCCESS && rc != SQL_SUCCESS_WITH_INFO) {
             break;
         }
-        const size_t written = CharChunkWrittenLength(buf, rc, ind);
+        const size_t written = CharChunkWrittenLength(buf.data(), buf.size(), rc, ind);
         if (written == 0 || buf[written - 1] != 0) {
             ADD_FAILURE() << "SQLGetData did not write a terminator";
             break;
@@ -977,11 +977,14 @@ TEST(NativeClientEncodingTest, ConvertsValidUtf8AndPreservesEmbeddedNul) {
 
 TEST(NativeClientEncodingTest, ChunkLengthExcludesInitializedPaddingButPreservesNuls) {
     const std::vector<SQLCHAR> padded = {'A', 0, 'B', 0, 0, 0, 0, 0};
-    EXPECT_EQ(4u, CharChunkWrittenLength(padded, SQL_SUCCESS, 3));
+    EXPECT_EQ(4u, CharChunkWrittenLength(padded.data(), padded.size(), SQL_SUCCESS, 3));
     const std::vector<SQLCHAR> utf32 = {'A', 0, 0, 0, 0, 0xCC, 0xCC};
-    EXPECT_EQ(5u, CharChunkWrittenLength(utf32, SQL_SUCCESS, 4));
-    EXPECT_EQ(5u, CharChunkWrittenLength(utf32, SQL_SUCCESS_WITH_INFO, SQL_NO_TOTAL));
-    EXPECT_EQ(5u, CharChunkWrittenLength(utf32, SQL_SUCCESS_WITH_INFO, 40));
+    EXPECT_EQ(5u, CharChunkWrittenLength(utf32.data(), utf32.size(), SQL_SUCCESS, 4));
+    EXPECT_EQ(5u, CharChunkWrittenLength(utf32.data(), utf32.size(), SQL_SUCCESS_WITH_INFO, SQL_NO_TOTAL));
+    EXPECT_EQ(5u, CharChunkWrittenLength(utf32.data(), utf32.size(), SQL_SUCCESS_WITH_INFO, 40));
+    const SQLCHAR guarded_zero[] = {0xCC, 0, 0, 0xCC};
+    EXPECT_EQ(2u, CharChunkWrittenLength(guarded_zero + 1, 2, SQL_SUCCESS_WITH_INFO, SQL_NO_TOTAL));
+    EXPECT_EQ(2u, CharChunkWrittenLength(guarded_zero + 1, 2, SQL_SUCCESS, 1));
 }
 
 // AB#47564: the bytes a narrow client (including mssql-python) receives are
@@ -1027,9 +1030,11 @@ TEST_F(GetDataUtf16Test, NativeClientCharDefaultsAcrossCollationsAndChunks) {
                         static_cast<SQLLEN>(capacity), &indicator);
                     ASSERT_TRUE(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO)
                         << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_STMT, stmt_);
-                    const auto end = std::find(bytes.begin() + 1, bytes.end() - 1, 0);
-                    ASSERT_NE(bytes.end() - 1, end) << "missing terminator";
-                    const size_t delivered = static_cast<size_t>(end - bytes.begin() - 1);
+                    const size_t written = CharChunkWrittenLength(
+                        bytes.data() + 1, capacity, rc, indicator);
+                    ASSERT_GT(written, 0u) << "missing terminator";
+                    ASSERT_EQ(0, bytes[written]) << "missing terminator";
+                    const size_t delivered = written - 1;
                     EXPECT_EQ(0xCC, bytes.front());
                     EXPECT_EQ(0xCC, bytes.back());
                     actual.append(reinterpret_cast<const char*>(bytes.data() + 1), delivered);
