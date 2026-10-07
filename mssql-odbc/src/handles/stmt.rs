@@ -57,6 +57,9 @@ pub(crate) struct ActivePlpStream {
     pub(crate) pending_bytes_encoding: ClientEncoding,
     /// Substitution byte ranges relative to the undelivered converted carry.
     pub(crate) pending_loss_ranges: Vec<std::ops::Range<usize>>,
+    /// Original UTF-8 chunk and delivered client-byte offset for native carry.
+    /// Retained only while converted output remains, to locate typed-switch boundaries.
+    pub(crate) pending_narrow_source: Option<(Vec<u8>, usize)>,
     /// Narrow wire encoding resolved from the column's collation (or UTF-8 for
     /// `json`, which carries none), or `None` when the column is not narrow
     /// text. This is a property of the *column*, so a target type that arrives
@@ -137,6 +140,7 @@ impl ActivePlpStream {
             pending_bytes_utf16: false,
             pending_bytes_encoding: ClientEncoding::UTF8,
             pending_loss_ranges: Vec::new(),
+            pending_narrow_source: None,
             narrow_encoding,
             narrow_decoder: None,
             narrow_decoder_finished: false,
@@ -164,6 +168,11 @@ impl ActivePlpStream {
             true
         });
         self.pending_bytes.drain(..count);
+        if self.pending_bytes.is_empty() {
+            self.pending_narrow_source = None;
+        } else if let Some((_, offset)) = self.pending_narrow_source.as_mut() {
+            *offset = offset.saturating_add(count);
+        }
         loss
     }
 

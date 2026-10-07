@@ -2667,6 +2667,7 @@ fn stream_active_plp_chunk_once<'a>(
                 pending_high_surrogate,
                 pending_bytes: pending_utf8,
                 pending_loss_ranges,
+                pending_narrow_source,
                 ..
             } = stream;
             let pending_before = pending_utf8.len();
@@ -2686,8 +2687,10 @@ fn stream_active_plp_chunk_once<'a>(
                 match encode_plp_pending_with_loss(
                     pending_utf8,
                     pending_loss_ranges,
+                    pending_narrow_source,
                     pending_before,
                     text_output.encoding,
+                    payload_capacity,
                 ) {
                     Ok(()) => {
                         stream.pending_bytes_encoding = text_output.encoding;
@@ -2820,6 +2823,7 @@ fn stream_active_plp_chunk_once<'a>(
                 narrow_decoder_finished,
                 pending_bytes: pending_utf8,
                 pending_loss_ranges,
+                pending_narrow_source,
                 ..
             } = stream;
             let Some(decoder) = narrow_decoder.as_mut() else {
@@ -2842,8 +2846,10 @@ fn stream_active_plp_chunk_once<'a>(
                 match encode_plp_pending_with_loss(
                     pending_utf8,
                     pending_loss_ranges,
+                    pending_narrow_source,
                     pending_before,
                     text_output.encoding,
+                    payload_capacity,
                 ) {
                     Ok(()) => {
                         stream.pending_bytes_encoding = text_output.encoding;
@@ -3248,8 +3254,10 @@ fn narrow_decoder_has_partial_character(decoder: &ResolvedDecoder) -> bool {
 fn encode_plp_pending_with_loss(
     pending: &mut Vec<u8>,
     loss_ranges: &mut Vec<std::ops::Range<usize>>,
+    source: &mut Option<(Vec<u8>, usize)>,
     start: usize,
     encoding: ClientEncoding,
+    payload_capacity: usize,
 ) -> Result<(), DiagMsg> {
     let text = std::str::from_utf8(&pending[start..]).map_err(|_| ERR_INVALID_CHARACTER_VALUE)?;
     let encoded = encoding.encode(text)?;
@@ -3274,7 +3282,9 @@ fn encode_plp_pending_with_loss(
     }
     if let std::borrow::Cow::Owned(bytes) = encoded.bytes {
         if start == 0 {
-            *pending = bytes;
+            let retain_source = bytes.len() > payload_capacity;
+            let original = std::mem::replace(pending, bytes);
+            *source = retain_source.then_some((original, 0));
         } else {
             pending.truncate(start);
             pending.extend_from_slice(&bytes);
@@ -3332,9 +3342,24 @@ fn append_typed_plp_text(
             bytes,
         )?;
     } else if !stream.pending_bytes_encoding.is_utf8() {
+        let skip = if let Some((source, delivered)) = stream.pending_narrow_source.as_ref() {
+            let text = std::str::from_utf8(source).map_err(|_| ERR_INVALID_CHARACTER_VALUE)?;
+            let offset = stream
+                .pending_bytes_encoding
+                .utf8_offset_for_client_bytes(text, *delivered)?;
+            stream
+                .pending_bytes_encoding
+                .encode(&text[..offset])?
+                .bytes
+                .len()
+                .saturating_sub(*delivered)
+                .min(stream.pending_bytes.len())
+        } else {
+            0
+        };
         let text = stream
             .pending_bytes_encoding
-            .decode(&stream.pending_bytes)?;
+            .decode(&stream.pending_bytes[skip..])?;
         reserve_typed_plp_bytes(bytes, text.len())?;
         bytes.extend_from_slice(text.as_bytes());
     } else {
@@ -3343,6 +3368,7 @@ fn append_typed_plp_text(
     }
     stream.pending_bytes.clear();
     stream.pending_loss_ranges.clear();
+    stream.pending_narrow_source = None;
     stream.pending_bytes_utf16 = false;
     stream.pending_bytes_encoding = ClientEncoding::UTF8;
     if !stream.pending_units.is_empty() {
@@ -5291,23 +5317,47 @@ mod tests {
     fn client_pending_conversion_preserves_emitted_prefix_and_reports_bad_utf8() {
         let encoding = ClientEncoding::for_code_page(932).unwrap();
         let mut loss_ranges = Vec::new();
+        let mut source = None;
         for start in [0, 2] {
             let mut pending = b"OK".to_vec();
             pending.extend_from_slice("あ".as_bytes());
-            encode_plp_pending_with_loss(&mut pending, &mut loss_ranges, start, encoding).unwrap();
+            encode_plp_pending_with_loss(
+                &mut pending,
+                &mut loss_ranges,
+                &mut source,
+                start,
+                encoding,
+                usize::MAX,
+            )
+            .unwrap();
             assert!(loss_ranges.is_empty());
             assert_eq!(pending, b"OK\x82\xa0");
         }
         let mut pending = b"OK\xff".to_vec();
         assert_eq!(
-            encode_plp_pending_with_loss(&mut pending, &mut loss_ranges, 2, encoding)
-                .unwrap_err()
-                .state,
+            encode_plp_pending_with_loss(
+                &mut pending,
+                &mut loss_ranges,
+                &mut source,
+                2,
+                encoding,
+                usize::MAX
+            )
+            .unwrap_err()
+            .state,
             ERR_INVALID_CHARACTER_VALUE.state
         );
         assert_eq!(pending, b"OK\xff");
         let mut pending = b"OK".to_vec();
-        encode_plp_pending_with_loss(&mut pending, &mut loss_ranges, 2, encoding).unwrap();
+        encode_plp_pending_with_loss(
+            &mut pending,
+            &mut loss_ranges,
+            &mut source,
+            2,
+            encoding,
+            usize::MAX,
+        )
+        .unwrap();
         assert_eq!(pending, b"OK");
     }
 
@@ -9454,6 +9504,100 @@ mod tests {
         );
         assert_eq!(wide, [u16::from(b'4'), u16::from(b'2'), 0]);
         assert_eq!(indicator, 4);
+    }
+
+    #[test]
+    fn client_multibyte_plp_typed_switch_skips_partial_converted_character() {
+        let cases = [
+            (932, "あ"),
+            (936, "你"),
+            #[cfg(unix)]
+            (54936, "Ā"),
+            #[cfg(unix)]
+            (12000, "Ā"),
+        ];
+        for (code_page, character) in cases {
+            let encoding = ClientEncoding::for_code_page(code_page).unwrap();
+            let prefix = encoding.encode("x").unwrap();
+            let encoded_character = encoding.encode(character).unwrap();
+            assert!(encoded_character.bytes.len() > 1);
+            let text = format!("x{character}42");
+            for split in 1..encoded_character.bytes.len() {
+                for continued in 0..=encoded_character.bytes.len() - split {
+                    for (source, narrow, wire) in [
+                        (PlpEncoding::Utf16Text, None, utf16le(&text)),
+                        (
+                            PlpEncoding::Utf8Text,
+                            Some(encoding_rs::UTF_8.into()),
+                            text.as_bytes().to_vec(),
+                        ),
+                        (
+                            PlpEncoding::SingleByteText,
+                            Some(encoding_rs::UTF_8.into()),
+                            text.as_bytes().to_vec(),
+                        ),
+                    ] {
+                        let h = TestHandles::with_env_dbc_stmt();
+                        client_code_page(&h, code_page, false);
+                        let total = u64::try_from(wire.len()).unwrap();
+                        prefetched_text_stream(&h, source, narrow, wire, Some(total));
+                        let payload_length = prefix.bytes.len() + split;
+                        let mut output = vec![0xcc_u8; payload_length + 1];
+                        let mut indicator = -99;
+                        assert_eq!(
+                            unsafe {
+                                crate::api::exports::SQLGetData(
+                                    h.stmt,
+                                    1,
+                                    SQL_C_CHAR,
+                                    output.as_mut_ptr().cast(),
+                                    SqlLen::try_from(output.len()).unwrap(),
+                                    &mut indicator,
+                                )
+                            },
+                            SQL_SUCCESS_WITH_INFO,
+                            "page {code_page}, source {source:?}, split {split}"
+                        );
+                        let encoded = encoding.encode(&text).unwrap();
+                        assert_eq!(&output[..payload_length], &encoded.bytes[..payload_length]);
+                        assert_eq!(output[payload_length], 0);
+                        for offset in 0..continued {
+                            let mut byte = [0xcc_u8; 2];
+                            assert_eq!(
+                                unsafe {
+                                    crate::api::exports::SQLGetData(
+                                        h.stmt,
+                                        1,
+                                        SQL_C_CHAR,
+                                        byte.as_mut_ptr().cast(),
+                                        2,
+                                        &mut indicator,
+                                    )
+                                },
+                                SQL_SUCCESS_WITH_INFO
+                            );
+                            assert_eq!(byte, [encoded.bytes[payload_length + offset], 0]);
+                        }
+                        let mut value = -99_i32;
+                        assert_eq!(
+                            unsafe {
+                                crate::api::exports::SQLGetData(
+                                    h.stmt,
+                                    1,
+                                    SQL_C_SLONG,
+                                    (&mut value as *mut i32).cast(),
+                                    4,
+                                    &mut indicator,
+                                )
+                            },
+                            SQL_SUCCESS,
+                            "page {code_page}, source {source:?}, split {split}, continued {continued}"
+                        );
+                        assert_eq!((value, indicator), (42, 4));
+                    }
+                }
+            }
+        }
     }
 
     #[test]
