@@ -122,7 +122,7 @@ fn sql_set_desc_field_w_safe(
     value_ptr: SqlPointer,
     buffer_length: SqlInteger,
 ) -> SqlReturn {
-    desc.update_definition(record_number, "SQLSetDescFieldW", |state| {
+    let update = |state: &mut DescState| {
         set_desc_field(
             state,
             desc.kind,
@@ -131,7 +131,22 @@ fn sql_set_desc_field_w_safe(
             value_ptr,
             buffer_length,
         )
-    })
+    };
+    // The IRD/IPD status and rows-processed pointers alias attributes that
+    // `SQLSetStmtAttrW` refuses mid-fetch/execute; refuse this spelling too.
+    let header_pointer = matches!(
+        SqlUSmallInt::try_from(field_identifier),
+        Ok(SQL_DESC_ARRAY_STATUS_PTR | SQL_DESC_ROWS_PROCESSED_PTR)
+    );
+    match desc.kind {
+        DescKind::ImpRow if header_pointer => {
+            desc.update_definition_gated(record_number, "SQLSetDescFieldW", true, false, update)
+        }
+        DescKind::ImpParam if header_pointer => {
+            desc.update_definition_gated(record_number, "SQLSetDescFieldW", false, true, update)
+        }
+        _ => desc.update_definition(record_number, "SQLSetDescFieldW", update),
+    }
 }
 
 fn set_desc_field(
@@ -287,12 +302,9 @@ fn set_header_field(
             SQL_SUCCESS
         }
         SQL_DESC_BIND_TYPE => {
-            let requested = value_ptr as SqlULen;
-            let Ok(v) = SqlInteger::try_from(requested) else {
-                post_diag(state, ERR_INVALID_ATTRIBUTE_VALUE);
-                return SQL_ERROR;
-            };
-            state.header.bind_type = v;
+            // Stored unvalidated at full width, like msodbcsql's
+            // `SetADHeaderField` (measured: 0x80000000 succeeds there).
+            state.header.bind_type = value_ptr as SqlULen;
             SQL_SUCCESS
         }
         SQL_DESC_ROWS_PROCESSED_PTR => {

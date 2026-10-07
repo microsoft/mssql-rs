@@ -99,10 +99,12 @@ fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
             {
                 // The values belong to this statement, not to the client that
                 // may already be executing a different statement.
+                let bound = bound_params.as_ref().ok();
                 unsafe {
                     write_back_output_params(
                         &mut stmt_state,
-                        bound_params.as_deref().unwrap_or_default(),
+                        bound.map(|b| b.params.as_slice()).unwrap_or_default(),
+                        &bound.map(|b| b.header).unwrap_or_default(),
                         &values,
                         status,
                     )
@@ -336,10 +338,12 @@ fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
             // application read a value the spec says is not available yet.
             let return_values = client.get_return_values();
             let return_status = client.get_return_status();
+            let bound = bound_params.as_ref().ok();
             let output_rc = unsafe {
                 write_back_output_params(
                     &mut stmt_state,
-                    bound_params.as_deref().unwrap_or_default(),
+                    bound.map(|b| b.params.as_slice()).unwrap_or_default(),
+                    &bound.map(|b| b.header).unwrap_or_default(),
                     &return_values,
                     return_status,
                 )

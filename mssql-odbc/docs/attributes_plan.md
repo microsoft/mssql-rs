@@ -418,7 +418,7 @@ ideal rather than what this driver does.
 | 3 | `MAX_LENGTH` | 0 | 0 and 8000 → success; any other non-zero → `01S02` and the stored value is substituted with 8000 |
 | 4 | `ASYNC_ENABLE` | 0 | stored |
 | 8 | `KEYSET_SIZE` | 0 | 0 → success; non-zero → `01S02`, stays 0 |
-| 9 | `SQL_ROWSET_SIZE` | 1 | stored, **independent of `ROW_ARRAY_SIZE`** |
+| 9 | `SQL_ROWSET_SIZE` | 1 | stored on the effective ARD, **independent of `ROW_ARRAY_SIZE`** |
 | 10 | `SIMULATE_CURSOR` | `SQL_SC_UNIQUE` | only unique; otherwise `01S02`, unchanged |
 | 11 | `RETRIEVE_DATA` | `SQL_RD_ON` | stored |
 | 12 | `USE_BOOKMARKS` | 0 | stored |

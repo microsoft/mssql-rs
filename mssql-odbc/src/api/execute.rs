@@ -16,19 +16,18 @@ use mssql_tds::error::Error as TdsError;
 use mssql_tds::message::parameters::rpc_parameters::RpcParameter;
 
 use super::exec_common::{
-    ParamsWithDae, build_named_params, build_named_params_for_row, claim_connection,
+    BoundParamSet, ParamsWithDae, build_named_params, build_named_params_for_row, claim_connection,
     deduct_query_timeout, fail_with_tds, finish_execute_with_param_warning, park_dae_client,
     park_deferred_dae, publish_scalar_processed, query_timeout_expired_error, return_client_idle,
-    snapshot_bound_params_and_array_size,
+    snapshot_bound_params,
 };
 use super::sqlstate::*;
 use super::txn::begin_transaction_if_manual;
 use crate::api::odbc_types::{
-    SQL_ATTR_PARAM_BIND_TYPE, SQL_ATTR_PARAM_OPERATION_PTR, SQL_ATTR_PARAM_STATUS_PTR,
-    SQL_ATTR_PARAMS_PROCESSED_PTR, SQL_BIND_BY_COLUMN, SQL_ERROR, SQL_INVALID_HANDLE,
-    SQL_NO_ROWCOUNT_TOTAL, SQL_PARAM_ERROR, SQL_PARAM_IGNORE, SQL_PARAM_INPUT, SQL_PARAM_PROCEED,
-    SQL_PARAM_SUCCESS, SQL_PARAM_SUCCESS_WITH_INFO, SQL_PARAM_UNUSED, SQL_SUCCESS,
-    SQL_SUCCESS_WITH_INFO, SqlHandle, SqlReturn, SqlULen, SqlUSmallInt,
+    SQL_ERROR, SQL_INVALID_HANDLE, SQL_NO_ROWCOUNT_TOTAL, SQL_PARAM_ERROR, SQL_PARAM_IGNORE,
+    SQL_PARAM_INPUT, SQL_PARAM_PROCEED, SQL_PARAM_SUCCESS, SQL_PARAM_SUCCESS_WITH_INFO,
+    SQL_PARAM_UNUSED, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle, SqlReturn, SqlULen,
+    SqlUSmallInt,
 };
 use crate::conversion::param_convert::{is_data_at_exec_indicator, is_output_direction};
 use crate::error::free_errors;
@@ -37,7 +36,7 @@ use crate::handles::stmt::{
     DaeParam, PreparedPlan, STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT,
     STMT_STATE_EXEC_STARTED,
 };
-use crate::handles::{HandleType, StmtHandle, handle_from_raw};
+use crate::handles::{DescHandle, HandleType, StmtHandle, handle_from_raw};
 
 /// Executes the prepared statement on `statement_handle`.
 ///
@@ -681,20 +680,34 @@ pub(super) fn update_parameter_array(
     stmt: &StmtHandle,
     client: &mut mssql_tds::connection::tds_client::TdsClient,
 ) -> SqlReturn {
+    // The IPD pointers are read before the STMT lock (never nested), and only
+    // when a batch is pending, so the common path takes no descriptor lock.
+    let pending = match stmt.inner.lock() {
+        Ok(stmt_state) => stmt_state.parameter_array.is_some(),
+        Err(_) => return SQL_ERROR,
+    };
+    if !pending {
+        return SQL_SUCCESS;
+    }
+    let ipd = unsafe { handle_from_raw::<DescHandle>(stmt.ipd) };
+    let (param_status_ptr, params_processed_ptr) = {
+        let Ok(ipd_state) = ipd.inner.lock() else {
+            error!("reporting parameter array: ipd mutex poisoned");
+            return SQL_ERROR;
+        };
+        (
+            ipd_state.header.array_status_ptr.cast::<SqlUSmallInt>(),
+            ipd_state.header.rows_processed_ptr.cast::<SqlULen>(),
+        )
+    };
     let Ok(mut stmt_state) = stmt.inner.lock() else {
         return SQL_ERROR;
     };
     let Some(mut batch) = stmt_state.parameter_array.take() else {
         return SQL_SUCCESS;
     };
-    batch.outputs.param_status_ptr = stmt_state
-        .inert_attrs
-        .get(SQL_ATTR_PARAM_STATUS_PTR)
-        .unwrap_or(0) as *mut SqlUSmallInt;
-    batch.outputs.params_processed_ptr = stmt_state
-        .inert_attrs
-        .get(SQL_ATTR_PARAMS_PROCESSED_PTR)
-        .unwrap_or(0) as *mut SqlULen;
+    batch.outputs.param_status_ptr = param_status_ptr;
+    batch.outputs.params_processed_ptr = params_processed_ptr;
     let has_more = client.has_open_batch();
     let rc = match client.take_prepared_batch_results() {
         Some(result) => report_parameter_array(
@@ -842,15 +855,9 @@ fn parameter_array_return_code(
 ///
 /// The sequencing checks and the `EXEC_STARTED` claim happen here, *before* the
 /// APD is read, and the claim is held across the whole of
-/// [`stage_execution_claimed`]. Staging reads the parameter-set size from the
-/// APD under the DESC lock (AB#48943) but the array controls from `inert_attrs`
-/// under a later STMT lock, and the crate's locking rule forbids holding both at
-/// once — so nothing but the claim keeps the two consistent. Without it a
-/// concurrent `SQLSetStmtAttrW` could shrink `SQL_ATTR_PARAMSET_SIZE` and rebind
-/// a smaller `SQL_ATTR_PARAM_OPERATION_PTR` / `..._STATUS_PTR` between the two
-/// reads, leaving execution walking the stale, larger count over the new, shorter
-/// arrays. Those setters already refuse while `EXEC_STARTED` is set
-/// (`set_stmt_attr.rs`); the claim was simply taken too late to cover staging.
+/// [`stage_execution_claimed`]. Staging reads the size and every array control
+/// in one APD/IPD snapshot; the claim is what makes both spellings of those
+/// setters refuse while the snapshotted pointers are in use.
 ///
 /// Before AB#48943 the size lived on `StmtState` and was read in the same lock
 /// acquisition as the controls, so the pair could not drift and no claim was
@@ -927,7 +934,10 @@ fn stage_execution_claimed(stmt: &StmtHandle) -> Result<ExecutionStaging, SqlRet
     // mirroring `SQLExecDirectW`'s handling of the same failure — rather
     // than leave `SQLGetDiagRec` reporting `SQL_NO_DATA` or a stale record
     // from a previous call.
-    let (bound_params, paramset_size) = match snapshot_bound_params_and_array_size(stmt) {
+    let BoundParamSet {
+        params: bound_params,
+        header,
+    } = match snapshot_bound_params(stmt) {
         Ok(snapshot) => snapshot,
         Err(rc) => {
             error!("SQLExecute: failed to snapshot parameter bindings");
@@ -1009,25 +1019,14 @@ fn stage_execution_claimed(stmt: &StmtHandle) -> Result<ExecutionStaging, SqlRet
         return Err(SQL_ERROR);
     };
 
+    let paramset_size = header.array_size;
     if paramset_size > 1 {
         let row_count = paramset_size;
-        let bind_offset = unsafe { stmt_state.inert_attrs.param_bind_offset() };
-        let param_bind_type = stmt_state
-            .inert_attrs
-            .get(SQL_ATTR_PARAM_BIND_TYPE)
-            .unwrap_or(SQL_BIND_BY_COLUMN);
-        let operation_ptr = stmt_state
-            .inert_attrs
-            .get(SQL_ATTR_PARAM_OPERATION_PTR)
-            .unwrap_or(0) as *const SqlUSmallInt;
-        let param_status_ptr = stmt_state
-            .inert_attrs
-            .get(SQL_ATTR_PARAM_STATUS_PTR)
-            .unwrap_or(0) as *mut SqlUSmallInt;
-        let params_processed_ptr = stmt_state
-            .inert_attrs
-            .get(SQL_ATTR_PARAMS_PROCESSED_PTR)
-            .unwrap_or(0) as *mut SqlULen;
+        let bind_offset = unsafe { header.bind_offset() };
+        let param_bind_type = header.bind_type;
+        let operation_ptr = header.operation_ptr;
+        let param_status_ptr = header.status_ptr;
+        let params_processed_ptr = header.processed_ptr;
 
         for parameter in 0..marker_count {
             let Some(Some(bound)) = stmt_state.bound_params.get(parameter) else {
@@ -1154,12 +1153,13 @@ fn stage_execution_claimed(stmt: &StmtHandle) -> Result<ExecutionStaging, SqlRet
 
     // Scan for data-at-execution parameters.  If any are present, use the
     // streaming path; otherwise, go through the normal prepared-execute path.
-    publish_scalar_processed(&stmt_state);
+    publish_scalar_processed(&header);
+    let bind_offset = unsafe { header.bind_offset() };
     let ParamsWithDae {
         params,
         dae_params,
         fractional_truncated,
-    } = unsafe { build_named_params(&mut stmt_state, marker_count, "SQLExecute") }?;
+    } = unsafe { build_named_params(&mut stmt_state, marker_count, bind_offset, "SQLExecute") }?;
 
     // All fallible validation passed: move the prepared plan out (written
     // back after the execute) and take any orphaned handle for piggyback drop.
@@ -1203,14 +1203,32 @@ mod tests {
     use crate::api::odbc_types::{
         SQL_ATTR_PARAM_BIND_TYPE, SQL_ATTR_PARAM_OPERATION_PTR, SQL_ATTR_PARAM_STATUS_PTR,
         SQL_ATTR_PARAMS_PROCESSED_PTR, SQL_BIND_BY_COLUMN, SQL_C_CHAR, SQL_C_SLONG,
-        SQL_DATA_AT_EXEC, SQL_DESC_ARRAY_SIZE, SQL_INTEGER, SQL_NULL_HANDLE, SQL_PARAM_ERROR,
-        SQL_PARAM_IGNORE, SQL_PARAM_INPUT, SQL_PARAM_OUTPUT, SQL_PARAM_PROCEED, SQL_PARAM_UNUSED,
-        SQL_SUCCESS, SQL_VARCHAR, SqlLen, SqlPointer, SqlULen,
+        SQL_DATA_AT_EXEC, SQL_DESC_ARRAY_SIZE, SQL_DESC_ARRAY_STATUS_PTR, SQL_DESC_BIND_OFFSET_PTR,
+        SQL_DESC_BIND_TYPE, SQL_DESC_ROWS_PROCESSED_PTR, SQL_INTEGER, SQL_NULL_HANDLE,
+        SQL_PARAM_ERROR, SQL_PARAM_IGNORE, SQL_PARAM_INPUT, SQL_PARAM_OUTPUT, SQL_PARAM_PROCEED,
+        SQL_PARAM_UNUSED, SQL_SUCCESS, SQL_VARCHAR, SqlInteger, SqlLen, SqlPointer, SqlSmallInt,
+        SqlULen,
     };
     use crate::api::util::rewrite_param_markers;
     use crate::handles::DescHandle;
     use crate::test_support::TestHandles;
     use mssql_tds::connection::tds_client::{PreparedStatement, StatementId};
+
+    /// Sets an attribute through `SQLSetStmtAttrW`, wherever the driver keeps it.
+    fn set_param_attr(stmt: SqlHandle, attribute: SqlInteger, value: SqlULen) {
+        assert_eq!(
+            unsafe {
+                crate::api::set_stmt_attr::sql_set_stmt_attr_w(
+                    stmt,
+                    attribute,
+                    value as SqlPointer,
+                    0,
+                )
+            },
+            SQL_SUCCESS,
+            "set attribute {attribute}"
+        );
+    }
 
     /// A parameter array is serialized through the same `PacketWriter` as a
     /// scalar execute, but completes through `finish_parameter_array` rather
@@ -2875,23 +2893,22 @@ mod tests {
             SQL_SUCCESS
         );
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
-        {
-            let mut state = stmt.inner.lock().unwrap();
-            state
-                .inert_attrs
-                .set(SQL_ATTR_PARAM_BIND_TYPE, SQL_BIND_BY_COLUMN);
-            state.inert_attrs.set(
-                SQL_ATTR_PARAM_OPERATION_PTR,
-                operations.as_mut_ptr() as SqlULen,
-            );
-            state
-                .inert_attrs
-                .set(SQL_ATTR_PARAM_STATUS_PTR, statuses.as_mut_ptr() as SqlULen);
-            state.inert_attrs.set(
-                SQL_ATTR_PARAMS_PROCESSED_PTR,
-                (&raw mut processed) as SqlULen,
-            );
-        }
+        set_param_attr(h.stmt, SQL_ATTR_PARAM_BIND_TYPE, SQL_BIND_BY_COLUMN);
+        set_param_attr(
+            h.stmt,
+            SQL_ATTR_PARAM_OPERATION_PTR,
+            operations.as_mut_ptr() as SqlULen,
+        );
+        set_param_attr(
+            h.stmt,
+            SQL_ATTR_PARAM_STATUS_PTR,
+            statuses.as_mut_ptr() as SqlULen,
+        );
+        set_param_attr(
+            h.stmt,
+            SQL_ATTR_PARAMS_PROCESSED_PTR,
+            (&raw mut processed) as SqlULen,
+        );
         set_array_size(h.apd(), 3);
 
         let ExecutionStaging::Batch(batch) =
@@ -2918,6 +2935,104 @@ mod tests {
             rows.iter().map(|(index, _)| *index).collect::<Vec<_>>(),
             vec![0, 2]
         );
+    }
+
+    /// Every parameter-array control set only through its APD/IPD descriptor
+    /// field must reach staging.
+    #[test]
+    fn descriptor_spellings_drive_parameter_array_staging() {
+        #[repr(C)]
+        struct Row {
+            value: i32,
+            indicator: SqlLen,
+        }
+        let h = TestHandles::with_env_dbc_stmt();
+        set_prepared(h.stmt, "INSERT INTO t VALUES (?)");
+        // Row 0 is slack the offset skips over; rows 1..=3 are the batch.
+        let mut rows = [10, 20, 30, 40].map(|value| Row {
+            value,
+            indicator: size_of::<i32>() as SqlLen,
+        });
+        let mut offset: SqlLen = size_of::<Row>() as SqlLen;
+        let mut operations = [SQL_PARAM_PROCEED, SQL_PARAM_IGNORE, SQL_PARAM_PROCEED];
+        let mut statuses = [99 as SqlUSmallInt; 3];
+        let mut processed: SqlULen = 99;
+        assert_eq!(
+            unsafe {
+                sql_bind_parameter(
+                    h.stmt,
+                    1,
+                    SQL_PARAM_INPUT,
+                    SQL_C_SLONG,
+                    SQL_INTEGER,
+                    0,
+                    0,
+                    (&raw mut rows[0].value).cast(),
+                    size_of::<i32>() as SqlLen,
+                    &raw mut rows[0].indicator,
+                )
+            },
+            SQL_SUCCESS
+        );
+        let set_field = |desc: SqlHandle, field: SqlUSmallInt, value: SqlPointer| {
+            assert_eq!(
+                unsafe {
+                    crate::api::set_desc_field::sql_set_desc_field_w(
+                        desc,
+                        0,
+                        field as SqlSmallInt,
+                        value,
+                        0,
+                    )
+                },
+                SQL_SUCCESS,
+                "set descriptor field {field}"
+            );
+        };
+        set_field(h.apd(), SQL_DESC_ARRAY_SIZE, 3 as SqlPointer);
+        set_field(h.apd(), SQL_DESC_BIND_TYPE, size_of::<Row>() as SqlPointer);
+        set_field(h.apd(), SQL_DESC_BIND_OFFSET_PTR, (&raw mut offset).cast());
+        set_field(
+            h.apd(),
+            SQL_DESC_ARRAY_STATUS_PTR,
+            operations.as_mut_ptr().cast(),
+        );
+        set_field(
+            h.ipd(),
+            SQL_DESC_ARRAY_STATUS_PTR,
+            statuses.as_mut_ptr().cast(),
+        );
+        set_field(
+            h.ipd(),
+            SQL_DESC_ROWS_PROCESSED_PTR,
+            (&raw mut processed).cast(),
+        );
+
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let ExecutionStaging::Batch(batch) =
+            stage_execution(stmt).expect("array staging should succeed")
+        else {
+            panic!("expected array staging");
+        };
+        assert_eq!(
+            batch.active_rows,
+            vec![0, 2],
+            "APD operations skipped set 1"
+        );
+        assert_eq!(
+            statuses, [SQL_PARAM_UNUSED; 3],
+            "IPD status array prefilled"
+        );
+        assert_eq!(processed, 0, "IPD processed count reset");
+        assert_eq!(batch.param_bind_type, size_of::<Row>(), "APD bind type");
+        assert_eq!(
+            batch.bind_offset,
+            size_of::<Row>() as isize,
+            "APD bind offset"
+        );
+        assert_eq!(batch.outputs.paramset_size, 3);
+        assert_eq!(batch.outputs.param_status_ptr, statuses.as_mut_ptr());
+        assert_eq!(batch.outputs.params_processed_ptr, &raw mut processed);
     }
 
     /// **Found in review**: the all-`SQL_PARAM_IGNORE` batch early return
@@ -2956,22 +3071,24 @@ mod tests {
             SQL_SUCCESS
         );
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        set_param_attr(h.stmt, SQL_ATTR_PARAM_BIND_TYPE, SQL_BIND_BY_COLUMN);
+        set_param_attr(
+            h.stmt,
+            SQL_ATTR_PARAM_OPERATION_PTR,
+            operations.as_mut_ptr() as SqlULen,
+        );
+        set_param_attr(
+            h.stmt,
+            SQL_ATTR_PARAM_STATUS_PTR,
+            statuses.as_mut_ptr() as SqlULen,
+        );
+        set_param_attr(
+            h.stmt,
+            SQL_ATTR_PARAMS_PROCESSED_PTR,
+            (&raw mut processed) as SqlULen,
+        );
         {
             let mut state = stmt.inner.lock().unwrap();
-            state
-                .inert_attrs
-                .set(SQL_ATTR_PARAM_BIND_TYPE, SQL_BIND_BY_COLUMN);
-            state.inert_attrs.set(
-                SQL_ATTR_PARAM_OPERATION_PTR,
-                operations.as_mut_ptr() as SqlULen,
-            );
-            state
-                .inert_attrs
-                .set(SQL_ATTR_PARAM_STATUS_PTR, statuses.as_mut_ptr() as SqlULen);
-            state.inert_attrs.set(
-                SQL_ATTR_PARAMS_PROCESSED_PTR,
-                (&raw mut processed) as SqlULen,
-            );
             // As if a previous query's read-ahead exhausted the whole batch
             // and left a deferred error on the reused handle.
             state.result_set_exhausted = true;
@@ -3021,19 +3138,17 @@ mod tests {
             SQL_SUCCESS
         );
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
-        {
-            let mut state = stmt.inner.lock().unwrap();
-            state
-                .inert_attrs
-                .set(SQL_ATTR_PARAM_BIND_TYPE, SQL_BIND_BY_COLUMN);
-            state
-                .inert_attrs
-                .set(SQL_ATTR_PARAM_STATUS_PTR, statuses.as_mut_ptr() as SqlULen);
-            state.inert_attrs.set(
-                SQL_ATTR_PARAMS_PROCESSED_PTR,
-                (&raw mut *processed) as SqlULen,
-            );
-        }
+        set_param_attr(h.stmt, SQL_ATTR_PARAM_BIND_TYPE, SQL_BIND_BY_COLUMN);
+        set_param_attr(
+            h.stmt,
+            SQL_ATTR_PARAM_STATUS_PTR,
+            statuses.as_mut_ptr() as SqlULen,
+        );
+        set_param_attr(
+            h.stmt,
+            SQL_ATTR_PARAMS_PROCESSED_PTR,
+            (&raw mut *processed) as SqlULen,
+        );
         set_array_size(h.apd(), 4);
         let ExecutionStaging::Batch(batch) =
             stage_execution(stmt).expect("array staging should succeed")
@@ -3118,16 +3233,16 @@ mod tests {
             SQL_SUCCESS
         );
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
-        {
-            let mut state = stmt.inner.lock().unwrap();
-            state
-                .inert_attrs
-                .set(SQL_ATTR_PARAM_STATUS_PTR, statuses.as_mut_ptr() as SqlULen);
-            state.inert_attrs.set(
-                SQL_ATTR_PARAMS_PROCESSED_PTR,
-                (&raw mut processed) as SqlULen,
-            );
-        }
+        set_param_attr(
+            h.stmt,
+            SQL_ATTR_PARAM_STATUS_PTR,
+            statuses.as_mut_ptr() as SqlULen,
+        );
+        set_param_attr(
+            h.stmt,
+            SQL_ATTR_PARAMS_PROCESSED_PTR,
+            (&raw mut processed) as SqlULen,
+        );
         set_array_size(h.apd(), 2);
 
         assert!(stage_execution(stmt).is_err());
@@ -3205,20 +3320,21 @@ mod tests {
             SQL_SUCCESS
         );
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
-        {
-            let mut state = stmt.inner.lock().unwrap();
-            state.inert_attrs.set(
-                SQL_ATTR_PARAM_OPERATION_PTR,
-                operations.as_mut_ptr() as SqlULen,
-            );
-            state
-                .inert_attrs
-                .set(SQL_ATTR_PARAM_STATUS_PTR, statuses.as_mut_ptr() as SqlULen);
-            state.inert_attrs.set(
-                SQL_ATTR_PARAMS_PROCESSED_PTR,
-                (&raw mut processed) as SqlULen,
-            );
-        }
+        set_param_attr(
+            h.stmt,
+            SQL_ATTR_PARAM_OPERATION_PTR,
+            operations.as_mut_ptr() as SqlULen,
+        );
+        set_param_attr(
+            h.stmt,
+            SQL_ATTR_PARAM_STATUS_PTR,
+            statuses.as_mut_ptr() as SqlULen,
+        );
+        set_param_attr(
+            h.stmt,
+            SQL_ATTR_PARAMS_PROCESSED_PTR,
+            (&raw mut processed) as SqlULen,
+        );
         set_array_size(h.apd(), 3);
 
         let ExecutionStaging::Batch(batch) =
@@ -3269,20 +3385,21 @@ mod tests {
             SQL_SUCCESS
         );
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
-        {
-            let mut state = stmt.inner.lock().unwrap();
-            state.inert_attrs.set(
-                SQL_ATTR_PARAM_OPERATION_PTR,
-                operations.as_mut_ptr() as SqlULen,
-            );
-            state
-                .inert_attrs
-                .set(SQL_ATTR_PARAM_STATUS_PTR, statuses.as_mut_ptr() as SqlULen);
-            state.inert_attrs.set(
-                SQL_ATTR_PARAMS_PROCESSED_PTR,
-                (&raw mut processed) as SqlULen,
-            );
-        }
+        set_param_attr(
+            h.stmt,
+            SQL_ATTR_PARAM_OPERATION_PTR,
+            operations.as_mut_ptr() as SqlULen,
+        );
+        set_param_attr(
+            h.stmt,
+            SQL_ATTR_PARAM_STATUS_PTR,
+            statuses.as_mut_ptr() as SqlULen,
+        );
+        set_param_attr(
+            h.stmt,
+            SQL_ATTR_PARAMS_PROCESSED_PTR,
+            (&raw mut processed) as SqlULen,
+        );
         set_array_size(h.apd(), 3);
 
         let ExecutionStaging::Batch(batch) =

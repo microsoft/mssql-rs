@@ -610,6 +610,382 @@ TEST_F(FetchScrollLiveTest, DescriptorArraySizeSizesTheRowset) {
     SQLCloseCursor(stmt_);
 }
 
+// AB#49060: rowset controls set only through the ARD/IRD descriptor fields
+// drive the fetch.
+TEST_F(FetchScrollLiveTest, DescriptorSpellingsDriveTheBlockFetch) {
+    ExecThreeRows();
+
+    SQLHDESC ard = SQL_NULL_HDESC;
+    SQLHDESC ird = SQL_NULL_HDESC;
+    ASSERT_SQL_OK(SQLGetStmtAttr(stmt_, SQL_ATTR_APP_ROW_DESC, &ard, 0, nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLGetStmtAttr(stmt_, SQL_ATTR_IMP_ROW_DESC, &ird, 0, nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+
+    // The offset skips two SQLINTEGER values and one SQLLEN indicator.
+    std::vector<SQLINTEGER> values(5, -1);
+    std::vector<SQLLEN> indicators(4, -7);
+    std::vector<SQLUSMALLINT> status(3, 0xFFFF);
+    SQLULEN rowsFetched = 999;
+    SQLLEN offset = sizeof(SQLLEN);
+
+    ASSERT_SQL_OK(SQLSetDescField(ard, 0, SQL_DESC_ARRAY_SIZE,
+                                  reinterpret_cast<SQLPOINTER>(3), 0),
+                  SQL_HANDLE_DESC, ard);
+    ASSERT_SQL_OK(SQLSetDescField(ard, 0, SQL_DESC_BIND_OFFSET_PTR, &offset, 0),
+                  SQL_HANDLE_DESC, ard);
+    ASSERT_SQL_OK(SQLSetDescField(ird, 0, SQL_DESC_ROWS_PROCESSED_PTR, &rowsFetched, 0),
+                  SQL_HANDLE_DESC, ird);
+    ASSERT_SQL_OK(SQLSetDescField(ird, 0, SQL_DESC_ARRAY_STATUS_PTR, status.data(), 0),
+                  SQL_HANDLE_DESC, ird);
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_SLONG, values.data(), sizeof(SQLINTEGER),
+                             indicators.data()),
+                  SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_SQL_OK(SQLFetchScroll(stmt_, SQL_FETCH_NEXT, 0), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(3u, rowsFetched) << "IRD SQL_DESC_ROWS_PROCESSED_PTR received the count";
+    for (int i = 0; i < 3; ++i) {
+        EXPECT_EQ(SQL_ROW_SUCCESS, status[i]) << "IRD status array, row " << i;
+    }
+    EXPECT_EQ(-1, values[0]) << "ARD SQL_DESC_BIND_OFFSET_PTR displaced the rowset";
+    EXPECT_EQ(-1, values[1]);
+    EXPECT_EQ(1, values[2]);
+    EXPECT_EQ(2, values[3]);
+    EXPECT_EQ(3, values[4]);
+    EXPECT_EQ(-7, indicators[0]) << "the indicator slack is untouched";
+    SQLCloseCursor(stmt_);
+}
+
+// AB#49060: each row-side attribute and its descriptor field are one value.
+TEST_F(FetchScrollLiveTest, RowAttributesAndDescriptorFieldsAgree) {
+    SQLHDESC ard = SQL_NULL_HDESC;
+    SQLHDESC ird = SQL_NULL_HDESC;
+    ASSERT_SQL_OK(SQLGetStmtAttr(stmt_, SQL_ATTR_APP_ROW_DESC, &ard, 0, nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLGetStmtAttr(stmt_, SQL_ATTR_IMP_ROW_DESC, &ird, 0, nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+
+    SQLLEN offset = 0;
+    SQLUSMALLINT operations[2] = {};
+    SQLUSMALLINT status[2] = {};
+    SQLULEN fetched = 0;
+    struct Case {
+        SQLINTEGER attribute;
+        SQLHDESC desc;
+        SQLSMALLINT field;
+        SQLPOINTER value;
+    };
+    const Case cases[] = {
+        {SQL_ATTR_ROW_BIND_OFFSET_PTR, ard, SQL_DESC_BIND_OFFSET_PTR, &offset},
+        {SQL_ATTR_ROW_OPERATION_PTR, ard, SQL_DESC_ARRAY_STATUS_PTR, operations},
+        {SQL_ATTR_ROW_STATUS_PTR, ird, SQL_DESC_ARRAY_STATUS_PTR, status},
+        {SQL_ATTR_ROWS_FETCHED_PTR, ird, SQL_DESC_ROWS_PROCESSED_PTR, &fetched},
+    };
+    for (const Case& c : cases) {
+        ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, c.attribute, c.value, 0), SQL_HANDLE_STMT,
+                      stmt_);
+        SQLPOINTER read = nullptr;
+        ASSERT_SQL_OK(SQLGetDescField(c.desc, 0, c.field, &read, 0, nullptr),
+                      SQL_HANDLE_DESC, c.desc);
+        EXPECT_EQ(c.value, read) << "attribute " << c.attribute << " -> field " << c.field;
+
+        ASSERT_SQL_OK(SQLSetDescField(c.desc, 0, c.field, nullptr, 0), SQL_HANDLE_DESC,
+                      c.desc);
+        read = &offset;
+        ASSERT_SQL_OK(SQLGetStmtAttr(stmt_, c.attribute, &read, 0, nullptr),
+                      SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ(nullptr, read) << "field " << c.field << " -> attribute " << c.attribute;
+    }
+
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_ROW_BIND_TYPE,
+                                 reinterpret_cast<SQLPOINTER>(24), 0),
+                  SQL_HANDLE_STMT, stmt_);
+    SQLINTEGER bindType = 0;
+    ASSERT_SQL_OK(SQLGetDescField(ard, 0, SQL_DESC_BIND_TYPE, &bindType, 0, nullptr),
+                  SQL_HANDLE_DESC, ard);
+    EXPECT_EQ(24, bindType);
+    ASSERT_SQL_OK(SQLSetDescField(ard, 0, SQL_DESC_BIND_TYPE,
+                                  reinterpret_cast<SQLPOINTER>(SQL_BIND_BY_COLUMN), 0),
+                  SQL_HANDLE_DESC, ard);
+    SQLULEN reported = 99;
+    ASSERT_SQL_OK(SQLGetStmtAttr(stmt_, SQL_ATTR_ROW_BIND_TYPE, &reported, 0, nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(static_cast<SQLULEN>(SQL_BIND_BY_COLUMN), reported);
+}
+
+// AB#49060: SQL_ROWSET_SIZE lives on the ARD (msodbcsql `ADTag::dwRowSetSize`),
+// so it follows an ARD association.
+TEST_F(FetchScrollLiveTest, RowsetSizeFollowsTheAssociatedArd) {
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ROWSET_SIZE, reinterpret_cast<SQLPOINTER>(5), 0),
+                  SQL_HANDLE_STMT, stmt_);
+    SQLHDESC implicit_ard = SQL_NULL_HDESC;
+    ASSERT_SQL_OK(SQLGetStmtAttr(stmt_, SQL_ATTR_APP_ROW_DESC, &implicit_ard, 0, nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+
+    SQLHDESC explicit_ard = SQL_NULL_HDESC;
+    ASSERT_SQL_OK(SQLAllocHandle(SQL_HANDLE_DESC, dbc_, &explicit_ard), SQL_HANDLE_DBC,
+                  dbc_);
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_APP_ROW_DESC, explicit_ard, 0),
+                  SQL_HANDLE_STMT, stmt_);
+    SQLULEN reported = 0;
+    ASSERT_SQL_OK(SQLGetStmtAttr(stmt_, SQL_ROWSET_SIZE, &reported, 0, nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(1u, reported) << "the newly associated ARD's own default";
+
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_APP_ROW_DESC, implicit_ard, 0),
+                  SQL_HANDLE_STMT, stmt_);
+    reported = 0;
+    ASSERT_SQL_OK(SQLGetStmtAttr(stmt_, SQL_ROWSET_SIZE, &reported, 0, nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(5u, reported) << "the implicit ARD kept its value";
+    SQLFreeHandle(SQL_HANDLE_DESC, explicit_ard);
+}
+
+// AB#49060 parity audit: expectations below were measured on msodbcsql first.
+
+namespace {
+SQLHDESC StmtDesc(SQLHSTMT stmt, SQLINTEGER which) {
+    SQLHDESC desc = SQL_NULL_HDESC;
+    EXPECT_SQL_OK(SQLGetStmtAttr(stmt, which, &desc, 0, nullptr), SQL_HANDLE_STMT, stmt);
+    return desc;
+}
+
+SQLULEN StmtULen(SQLHSTMT stmt, SQLINTEGER attribute) {
+    SQLULEN value = 0xDEADBEEF;
+    EXPECT_SQL_OK(SQLGetStmtAttr(stmt, attribute, &value, 0, nullptr), SQL_HANDLE_STMT,
+                  stmt);
+    return value;
+}
+} // namespace
+
+// A row that fails conversion still counts as fetched (msodbcsql FetchRows).
+TEST_F(FetchScrollLiveTest, RowsFetchedCountsAnErrorRowInTheRowset) {
+    ExecDirect("SELECT CAST(1 AS INT) AS c UNION ALL SELECT 300 UNION ALL SELECT 2 "
+               "ORDER BY c");
+    SQLHDESC ird = StmtDesc(stmt_, SQL_ATTR_IMP_ROW_DESC);
+    signed char v[3] = {42, 42, 42};
+    SQLLEN ind[3] = {0, 0, 0};
+    SQLUSMALLINT status[3] = {0xFFFF, 0xFFFF, 0xFFFF};
+    SQLULEN fetched = 99;
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_ROW_ARRAY_SIZE,
+                                 reinterpret_cast<SQLPOINTER>(3), 0),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLSetDescField(ird, 0, SQL_DESC_ROWS_PROCESSED_PTR, &fetched, 0),
+                  SQL_HANDLE_DESC, ird);
+    ASSERT_SQL_OK(SQLSetDescField(ird, 0, SQL_DESC_ARRAY_STATUS_PTR, status, 0),
+                  SQL_HANDLE_DESC, ird);
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_STINYINT, v, sizeof(signed char), ind),
+                  SQL_HANDLE_STMT, stmt_);
+
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, SQLFetchScroll(stmt_, SQL_FETCH_NEXT, 0));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "22003");
+    EXPECT_EQ(3u, fetched) << "the error row is still a fetched row";
+    EXPECT_EQ(SQL_ROW_SUCCESS, status[0]);
+    EXPECT_EQ(SQL_ROW_SUCCESS, status[1]);
+    EXPECT_EQ(SQL_ROW_ERROR, status[2]) << "300 does not fit a signed byte";
+    SQLCloseCursor(stmt_);
+}
+
+// A truncated row: msodbcsql reports SQL_ROW_ERROR through SQLFetch and
+// SQL_ROW_SUCCESS_WITH_INFO through SQLFetchScroll; mssql-odbc reports the
+// latter through both (see `RowOutcome::status`). Each leg asserts its own.
+TEST_F(FetchScrollLiveTest, TruncatedRowStatusThroughSQLFetchAndSQLFetchScroll) {
+    const char* target = std::getenv("ODBC_TEST_TARGET");
+    const bool reference = target && std::string(target) == "msodbcsql";
+    for (bool scroll : {false, true}) {
+        SCOPED_TRACE(scroll ? "SQLFetchScroll" : "SQLFetch");
+        ExecDirect("SELECT 'abcdef' AS s UNION ALL SELECT 'gh' ORDER BY s");
+        char text[2][4] = {};
+        SQLLEN len[2] = {0, 0};
+        SQLUSMALLINT status[2] = {0xFFFF, 0xFFFF};
+        SQLULEN fetched = 99;
+        ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_ROW_ARRAY_SIZE,
+                                     reinterpret_cast<SQLPOINTER>(2), 0),
+                      SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_ROW_STATUS_PTR, status, 0),
+                      SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_ROWS_FETCHED_PTR, &fetched, 0),
+                      SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_CHAR, text, sizeof(text[0]), len),
+                      SQL_HANDLE_STMT, stmt_);
+
+        const SQLRETURN rc = scroll ? SQLFetchScroll(stmt_, SQL_FETCH_NEXT, 0)
+                                    : SQLFetch(stmt_);
+        EXPECT_EQ(SQL_SUCCESS_WITH_INFO, rc);
+        EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01004");
+        EXPECT_EQ(2u, fetched);
+        const SQLUSMALLINT truncated =
+            (reference && !scroll) ? SQL_ROW_ERROR : SQL_ROW_SUCCESS_WITH_INFO;
+        EXPECT_EQ(truncated, status[0]) << "'abcdef' truncated to 3 bytes";
+        EXPECT_EQ(SQL_ROW_SUCCESS, status[1]);
+        EXPECT_STREQ("abc", text[0]);
+        EXPECT_EQ(6, len[0]) << "the full length is still reported";
+        SQLFreeStmt(stmt_, SQL_UNBIND);
+        SQLCloseCursor(stmt_);
+    }
+}
+
+// A fetch refused by validation leaves the rows-fetched buffer alone.
+TEST_F(FetchScrollLiveTest, ARefusedFetchLeavesRowsFetchedAlone) {
+    ExecThreeRows();
+    SQLULEN fetched = 77;
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_ROWS_FETCHED_PTR, &fetched, 0),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(SQL_ERROR, SQLFetchScroll(stmt_, SQL_FETCH_PRIOR, 0));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HY106");
+    EXPECT_EQ(77u, fetched);
+    SQLCloseCursor(stmt_);
+}
+
+// The bind offset is read per fetch, including after repointing it via the ARD.
+TEST_F(FetchScrollLiveTest, TheRowBindOffsetIsReadOnEveryFetch) {
+    ExecThreeRows();
+    SQLHDESC ard = StmtDesc(stmt_, SQL_ATTR_APP_ROW_DESC);
+    SQLINTEGER values[3] = {-1, -1, -1};
+    SQLLEN ind[3] = {0, 0, 0};
+    SQLLEN offset = 0;
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_ROW_BIND_OFFSET_PTR, &offset, 0),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_SLONG, values, sizeof(SQLINTEGER), ind),
+                  SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    offset = sizeof(SQLINTEGER);  // the indicator moves by the same 4 bytes
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    SQLLEN repointed = 2 * sizeof(SQLINTEGER);
+    ASSERT_SQL_OK(SQLSetDescField(ard, 0, SQL_DESC_BIND_OFFSET_PTR, &repointed, 0),
+                  SQL_HANDLE_DESC, ard);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    EXPECT_EQ(1, values[0]);
+    EXPECT_EQ(2, values[1]);
+    EXPECT_EQ(3, values[2]);
+    SQLCloseCursor(stmt_);
+}
+
+// The array size and rows-fetched pointer can change between fetches.
+TEST_F(FetchScrollLiveTest, RowsetControlsCanChangeBetweenFetches) {
+    ExecDirect("SELECT n FROM (VALUES (1), (2), (3), (4), (5), (6)) AS t(n) ORDER BY n");
+    SQLHDESC ard = StmtDesc(stmt_, SQL_ATTR_APP_ROW_DESC);
+    SQLHDESC ird = StmtDesc(stmt_, SQL_ATTR_IMP_ROW_DESC);
+    SQLINTEGER values[3] = {};
+    SQLLEN ind[3] = {};
+    SQLULEN fetched = 0;
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_SLONG, values, sizeof(SQLINTEGER), ind),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_ROWS_FETCHED_PTR, &fetched, 0),
+                  SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_ROW_ARRAY_SIZE,
+                                 reinterpret_cast<SQLPOINTER>(2), 0),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetchScroll(stmt_, SQL_FETCH_NEXT, 0), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(2u, fetched);
+    EXPECT_EQ(2, values[1]);
+
+    ASSERT_SQL_OK(SQLSetDescField(ard, 0, SQL_DESC_ARRAY_SIZE,
+                                  reinterpret_cast<SQLPOINTER>(3), 0),
+                  SQL_HANDLE_DESC, ard);
+    ASSERT_SQL_OK(SQLFetchScroll(stmt_, SQL_FETCH_NEXT, 0), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(3u, fetched);
+    EXPECT_EQ(3, values[0]);
+    EXPECT_EQ(5, values[2]);
+
+    ASSERT_SQL_OK(SQLSetDescField(ird, 0, SQL_DESC_ROWS_PROCESSED_PTR, nullptr, 0),
+                  SQL_HANDLE_DESC, ird);
+    fetched = 77;
+    ASSERT_SQL_OK(SQLFetchScroll(stmt_, SQL_FETCH_NEXT, 0), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(77u, fetched) << "a cleared pointer is no longer written";
+    EXPECT_EQ(6, values[0]);
+    SQLCloseCursor(stmt_);
+}
+
+// One explicit descriptor as one statement's ARD and another's APD has one
+// header (from msodbcsql's DescFpp suite).
+TEST_F(FetchScrollLiveTest, OneDescriptorAsArdAndApdSharesEveryHeaderAlias) {
+    SQLHSTMT other = AllocStmt();
+    SQLHDESC shared = SQL_NULL_HDESC;
+    ASSERT_SQL_OK(SQLAllocHandle(SQL_HANDLE_DESC, dbc_, &shared), SQL_HANDLE_DBC, dbc_);
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_APP_ROW_DESC, shared, 0), SQL_HANDLE_STMT,
+                  stmt_);
+    ASSERT_SQL_OK(SQLSetStmtAttr(other, SQL_ATTR_APP_PARAM_DESC, shared, 0),
+                  SQL_HANDLE_STMT, other);
+
+    SQLLEN offset = 0;
+    SQLUSMALLINT operations[2] = {};
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_ROW_ARRAY_SIZE,
+                                 reinterpret_cast<SQLPOINTER>(7), 0),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_ROW_BIND_OFFSET_PTR, &offset, 0),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLSetStmtAttr(other, SQL_ATTR_PARAM_BIND_TYPE,
+                                 reinterpret_cast<SQLPOINTER>(16), 0),
+                  SQL_HANDLE_STMT, other);
+    ASSERT_SQL_OK(SQLSetStmtAttr(other, SQL_ATTR_PARAM_OPERATION_PTR, operations, 0),
+                  SQL_HANDLE_STMT, other);
+
+    EXPECT_EQ(7u, StmtULen(other, SQL_ATTR_PARAMSET_SIZE));
+    EXPECT_EQ(reinterpret_cast<SQLULEN>(&offset),
+              StmtULen(other, SQL_ATTR_PARAM_BIND_OFFSET_PTR));
+    EXPECT_EQ(16u, StmtULen(stmt_, SQL_ATTR_ROW_BIND_TYPE));
+    EXPECT_EQ(reinterpret_cast<SQLULEN>(operations),
+              StmtULen(stmt_, SQL_ATTR_ROW_OPERATION_PTR));
+
+    FreeStmt(other);
+    SQLFreeHandle(SQL_HANDLE_DESC, shared);
+}
+
+// Freeing an associated ARD reverts the row aliases to the implicit ARD's.
+TEST_F(FetchScrollLiveTest, FreeingTheAssociatedArdRevertsTheRowAliases) {
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_ROW_ARRAY_SIZE,
+                                 reinterpret_cast<SQLPOINTER>(4), 0),
+                  SQL_HANDLE_STMT, stmt_);
+    SQLHDESC implicit_ard = StmtDesc(stmt_, SQL_ATTR_APP_ROW_DESC);
+    SQLHDESC explicit_ard = SQL_NULL_HDESC;
+    ASSERT_SQL_OK(SQLAllocHandle(SQL_HANDLE_DESC, dbc_, &explicit_ard), SQL_HANDLE_DBC,
+                  dbc_);
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_APP_ROW_DESC, explicit_ard, 0),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_ROW_ARRAY_SIZE,
+                                 reinterpret_cast<SQLPOINTER>(9), 0),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_ROW_BIND_TYPE,
+                                 reinterpret_cast<SQLPOINTER>(24), 0),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(9u, StmtULen(stmt_, SQL_ATTR_ROW_ARRAY_SIZE));
+
+    ASSERT_SQL_OK(SQLFreeHandle(SQL_HANDLE_DESC, explicit_ard), SQL_HANDLE_DESC,
+                  explicit_ard);
+    EXPECT_EQ(implicit_ard, StmtDesc(stmt_, SQL_ATTR_APP_ROW_DESC));
+    EXPECT_EQ(4u, StmtULen(stmt_, SQL_ATTR_ROW_ARRAY_SIZE));
+    EXPECT_EQ(static_cast<SQLULEN>(SQL_BIND_BY_COLUMN),
+              StmtULen(stmt_, SQL_ATTR_ROW_BIND_TYPE));
+}
+
+// Both spellings store a bind type wider than SQLINTEGER; SQLGetDescField
+// reports the low 32 bits.
+#if defined(_WIN64) || defined(__LP64__)
+TEST_F(FetchScrollLiveTest, AWideBindTypeIsStoredWholeThroughEitherSpelling) {
+    SQLHDESC ard = StmtDesc(stmt_, SQL_ATTR_APP_ROW_DESC);
+    const SQLULEN wide = (static_cast<SQLULEN>(1) << 32) | 0x18;
+
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_ROW_BIND_TYPE,
+                                 reinterpret_cast<SQLPOINTER>(wide), 0),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(wide, StmtULen(stmt_, SQL_ATTR_ROW_BIND_TYPE));
+    SQLINTEGER narrow = -1;
+    ASSERT_SQL_OK(SQLGetDescField(ard, 0, SQL_DESC_BIND_TYPE, &narrow, 0, nullptr),
+                  SQL_HANDLE_DESC, ard);
+    EXPECT_EQ(0x18, narrow);
+
+    const SQLULEN over_int32 = static_cast<SQLULEN>(0x80000000u);
+    EXPECT_EQ(SQL_SUCCESS, SQLSetDescField(ard, 0, SQL_DESC_BIND_TYPE,
+                                           reinterpret_cast<SQLPOINTER>(over_int32), 0))
+        << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_DESC, ard);
+    EXPECT_EQ(over_int32, StmtULen(stmt_, SQL_ATTR_ROW_BIND_TYPE));
+}
+#endif
+
 TEST_F(FetchScrollLiveTest, ReportsRowsFetched) {
     ExecThreeRows();
     SQLULEN rowsFetched = 999;

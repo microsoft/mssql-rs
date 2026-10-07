@@ -11,10 +11,10 @@ use mssql_tds::connection::tds_client::{ExecuteOptions, StreamedParamStatus};
 
 use super::escape::{CallSite, translate_for_execution};
 use super::exec_common::{
-    ParamsWithDae, build_named_params, build_positional_params, claim_connection,
+    BoundParamSet, ParamsWithDae, build_named_params, build_positional_params, claim_connection,
     deduct_query_timeout, fail_with_tds, finish_execute_with_param_warning,
     flush_pending_unprepare, park_dae_client, park_deferred_dae, publish_scalar_processed,
-    query_timeout_expired_error, snapshot_bound_params_and_array_size,
+    query_timeout_expired_error, snapshot_bound_params,
 };
 use super::sqlstate::*;
 use super::txn::begin_transaction_if_manual;
@@ -154,7 +154,10 @@ fn sql_exec_direct_w_safe(
             // early-return checks below have passed, so a rejected re-entry
             // during an active DAE sequence can't clobber that sequence's own
             // snapshot.
-            let Ok((bound_params, paramset_size)) = snapshot_bound_params_and_array_size(stmt)
+            let Ok(BoundParamSet {
+                params: bound_params,
+                header,
+            }) = snapshot_bound_params(stmt)
             else {
                 error!("SQLExecDirectW: failed to snapshot parameter bindings");
                 if let Ok(mut stmt_state) = stmt.inner.lock() {
@@ -206,7 +209,7 @@ fn sql_exec_direct_w_safe(
             // iRowEnd = dwArraySize regardless of parameter count
             // (sqlccmd.cpp:3192-3199), so running once instead of N times would
             // drop N-1 executions with nothing to show for it.
-            if paramset_size > 1 {
+            if header.array_size > 1 {
                 error!("SQLExecDirectW: parameter arrays are not supported on this path");
                 post_sql_error(
                     &mut stmt_state,
@@ -217,8 +220,8 @@ fn sql_exec_direct_w_safe(
                 );
                 return Err(SQL_ERROR);
             }
-            publish_scalar_processed(&stmt_state);
-            let bind_offset = unsafe { stmt_state.inert_attrs.param_bind_offset() };
+            publish_scalar_processed(&header);
+            let bind_offset = unsafe { header.bind_offset() };
             let mut has_dae = false;
             for index in 0..marker_count {
                 let Some(Some(bound)) = stmt_state.bound_params.get(index) else {
@@ -252,13 +255,14 @@ fn sql_exec_direct_w_safe(
                             &mut stmt_state,
                             marker_count,
                             skip,
+                            bind_offset,
                             "SQLExecDirectW",
                         )
                     }?
                 }
-                None => {
-                    unsafe { build_named_params(&mut stmt_state, marker_count, "SQLExecDirectW") }?
-                }
+                None => unsafe {
+                    build_named_params(&mut stmt_state, marker_count, bind_offset, "SQLExecDirectW")
+                }?,
             };
             // A new execute invalidates prior metadata/context immediately, so a
             // later execute failure cannot expose stale SQLNumResultCols/DescribeCol state.
