@@ -158,9 +158,11 @@ jobs:
   - template: /.pipeline/templates/cargo-authenticate-template.yml
     parameters:
       osType: MacOS
-  - template: /.pipeline/templates/install-dependencies.yml
-    parameters:
-      osType: MacOS
+  # Only the Rust toolchain: the crate depends on nothing beyond std, so the
+  # shared install-dependencies template's Python, Kerberos and Node installs
+  # (ungated on macOS) are not needed here.
+  - script: .pipeline/scripts/install-rustup.sh
+    displayName: 'Install Rustup'
   - script: |
       set -e
       bash .pipeline/scripts/build-mssql-sqlcmd-native.sh x86_64-apple-darwin osx-x64 "$(ob_outputDirectory)/mssql-sqlcmd"
