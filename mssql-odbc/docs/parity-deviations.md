@@ -75,37 +75,16 @@ msodbcsql build is measured.
    for `SQL_C_CHAR`, so neither choice is more conformant. Revisit if a second
    consumer targets this driver on Windows. Tracked in AB#47564 (fetch) and
    AB#47565 (parameters). `SQL_C_WCHAR` is UTF-16LE on both drivers.
-4. **Parameter length is measured in UTF-16 units for both character C types.**
-   msodbcsql counts UTF-16 units in three of its four arms - both wide-source
-   arms, and the narrow-to-wide walk, which counts an astral character as two
-   (`odbc/sqlcfunc.cpp:2935`) - but counts source bytes for narrow-to-narrow
-   (`cchDest = cbData`, `:2952`). That byte count is the wire length only while
-   no client-side transcode happens: TDS carries a collation with char data, so
-   the bytes normally ship under a declared collation and the server converts.
-   `DoCharToCharConversion` (`odbc/sqlcprot.h:4113`) enables client-side
-   conversion for an encoding TDS cannot name - a UTF-8 client against a
-   non-UTF-8 server, or the ISO-8859-x range - and translation is on by default
-   (`SQL_XL_DEFAULT`). In that configuration msodbcsql transcodes yet still
-   measures the *pre-transcode* UTF-8 bytes, so it rejects a four-character
-   accented string from a `varchar(4)` that the four bytes it actually sends
-   would fit, while accepting the same value as `SQL_C_WCHAR`. Because this
-   driver's `SQL_C_CHAR` is always UTF-8, copying the byte rule made that
-   latent msodbcsql defect unconditional. The uniform unit is therefore taken
-   to stop the two C types disagreeing on one value, not to match msodbcsql -
-   it is a divergence in the configuration closest to this driver, on the same
-   footing as the narrow-to-wide off-by-one at `sqlcfunc.cpp:2926` that is also
-   deliberately not replicated. The count still errs low against a `_UTF8` or
-   DBCS collation: a bounded `char`/`varchar` surfaces `HY000` from
-   `serialize_char_varchar_direct` rather than `22001`, and the `max` and
-   `text`/`ntext` types carry no check at all and send the over-long value.
-   **This regresses a subset of inputs rather than being a pure win** - three
-   U+2615 into `varchar(3)` was a correct `22001` and is now an opaque failure,
-   so CJK and astral input bound with an exact character count is the shape that
-   suffers. Taken because over-rejection has no application workaround while
-   under-rejection still errors, and because byte-counting both C types would
-   break the wide arm that msodbcsql gets right. Exactness needs the collation at
-   this layer. Signed off by Theekshna Kotian (product owner) on 2026-08-27.
-   Tracked in AB#47584.
+4. **Narrow parameter length is measured after destination transcoding.**
+   `varchar(n)` bounds bytes in the database collation, so both `SQL_C_CHAR`
+   and `SQL_C_WCHAR` are converted to that encoding before the bound is
+   applied. msodbcsql follows this rule for wide input, but its
+   narrow-to-narrow arm can count client bytes before conversion
+   (`odbc/sqlcfunc.cpp:2952`). Because this driver's `SQL_C_CHAR` is always
+   UTF-8, copying that rule would reject an accented UTF-8 value that becomes
+   one byte in CP1252. The driver therefore measures the actual destination
+   bytes for both C types. Overflow consisting only of trailing spaces is
+   trimmed; any other overflow is `22001`. Implemented by AB#47584.
 5. **An integer parameter bound to a character type is length-checked.**
    msodbcsql length-checks no integer C type (`odbc/sqlcfunc.cpp:2586`, `:2854`,
    `:3165`, `:3177`); what it does instead is undefined per build. Binding
@@ -802,12 +781,10 @@ msodbcsql build is measured.
     previously sent the LCID's single-byte encoding under a collation they had
     declared as `_UTF8` or a CP437/CP850 sort ID, storing corrupt cells rather
     than merely mis-framed ones; that is fixed. The corollary is that
-    deviation 4's over-length behaviour now reaches them as well -- a cell that
-    fit before can exceed its declared length once the encoding grows it, and
-    on those routes it surfaces mid-stream rather than before the first row is
-    written. Deviation 4's sign-off was given for the ODBC parameter layer and
-    does not extend to bulk copy or TVP; AB#47584 owns closing that gap for all
-    three.
+    encoded-length validation now reaches them as well -- a cell that fit
+    before can exceed its declared length once the encoding grows it. Bulk copy
+    and TVP serialization report the typed overflow where the row is written;
+    RPC parameters preflight it before the request is sent.
 25. **An array size of 0 is rejected with `HY024` on three of the four
     spellings; msodbcsql accepts and stores it on all four.** msodbcsql has no
     lower-bound check anywhere: `IsSetStmtOptionValid` (`odbc/sqlcmisc.cpp`)

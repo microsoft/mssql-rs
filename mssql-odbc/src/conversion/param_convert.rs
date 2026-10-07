@@ -226,6 +226,10 @@ pub(crate) unsafe fn bound_param_to_rpc(
         Some(metadata) => parameter.with_type_metadata(metadata),
         None => parameter,
     };
+    if param.sql_type == SQL_LONGVARCHAR {
+        parameter =
+            parameter.with_narrow_string_byte_limit(param.column_size.min(SQL_PREC_TEXTIMAGE));
+    }
     if matches!(param.sql_type, SQL_NUMERIC | SQL_DECIMAL) {
         // The IPD defines @params; the numeric fast path can retain a different
         // precision/scale in the incoming SQL_NUMERIC_STRUCT wire value.
@@ -477,13 +481,11 @@ pub(crate) enum DaeBound {
     /// Application-buffer bytes. Binary counts them directly, and a
     /// `SQL_C_WCHAR` character is a fixed two of them, so both are exact.
     Bytes(usize),
-    /// UTF-16 code units of a UTF-8 buffer. `SQL_C_CHAR` bytes are not
-    /// characters, and the materialized path measures every character input in
-    /// UTF-16 units (`trim_blank_overflow`), so counting bytes here would reject
-    /// a value -- one non-ASCII character against `varchar(1)` -- that the same
-    /// binding materialized accepts. The unit is an approximation of collation
-    /// bytes on both paths; making it exact is AB#47584.
+    /// UTF-16 code units of a UTF-8 buffer for a wide SQL target.
     Utf16Units(usize),
+    /// Bytes after the value has been transcoded into the narrow target's
+    /// collation encoding.
+    EncodedBytes(usize),
 }
 
 /// How much a buffered parameter may accept, and what its overflow is allowed
@@ -514,7 +516,11 @@ impl DaeLengthLimit {
     /// `true` when a chunk can end part-way through this bound's unit, so
     /// `fit_chunk` may hold bytes back between calls.
     pub(crate) fn carries_partial_units(&self) -> bool {
-        self.pad_unit.len() > 1
+        !self.requires_encoded_input() && self.pad_unit.len() > 1
+    }
+
+    pub(crate) fn requires_encoded_input(&self) -> bool {
+        matches!(self.bound, DaeBound::EncodedBytes(_))
     }
 
     /// Applies the limit to one chunk of a multi-call sequence, carrying a unit
@@ -595,7 +601,7 @@ impl DaeLengthLimit {
         };
 
         let (split, consumed) = match self.bound {
-            DaeBound::Bytes(max) => {
+            DaeBound::Bytes(max) | DaeBound::EncodedBytes(max) => {
                 let keep = max.saturating_sub(already);
                 if chunk.len() <= keep {
                     return Ok((chunk, chunk.len()));
@@ -652,23 +658,14 @@ pub(crate) fn dae_length_limit(
         other => return Err(ParamBuildError::UnsupportedCType(other)),
     };
 
-    // A pairing can be measured here when the declaration's unit and the
-    // buffer's unit are the same thing. Within the character family they always
-    // are, whatever the wideness: `convert_character_sql` derives its limit from
-    // `sql_type` and `ColumnSize` alone and hands it to `trim_blank_overflow`,
-    // which measures the *source* in UTF-16 units -- the C type never enters
-    // into the unit. So `varchar(n)` and `nvarchar(n)` both bound n UTF-16 units
-    // of whatever buffer was bound, and a wideness mismatch is measurable on
-    // exactly the same terms as a matched pair.
+    // A character pairing can be measured as chunks arrive. Wide targets use
+    // UTF-16 units, while narrow targets are transcoded first and measured in
+    // their collation encoding.
     //
     // Cross-*family* is the case that genuinely does not correspond: a binary
     // byte is not a character, so its bound is left to the close-time
     // conversion.
     //
-    // The unit is an approximation of collation bytes on both paths -- msodbcsql
-    // converts to the server code page to measure exactly
-    // (`ValidatePutDataLength`, `odbc/sqlccmd.cpp:10931`), and closing that gap
-    // is AB#47584. Agreeing with the materialized path is what matters here.
     let same_unit = match c_type {
         // A UDT's payload is bytes the driver passes through untouched, so a
         // binary buffer's unit is already the declaration's unit - the same
@@ -715,16 +712,24 @@ pub(crate) fn dae_length_limit(
         other => return Err(ParamBuildError::UnsupportedSqlType(other)),
     };
 
-    Ok(units.map(|units| DaeLengthLimit {
-        // `SQL_C_CHAR` is the one buffer whose bytes are not its units: it holds
-        // UTF-8, so the declaration's character count is measured in UTF-16
-        // units to agree with the materialized path. The other two have a fixed
-        // byte width per unit and stay exact.
-        bound: match c_type {
-            SQL_C_CHAR => DaeBound::Utf16Units(units),
-            _ => DaeBound::Bytes(units.saturating_mul(unit_bytes)),
-        },
-        pad_unit,
+    let narrow_character_target =
+        sql_family(sql_type) == Some(SqlFamily::Character) && !is_wide_character_sql_type(sql_type);
+
+    Ok(units.map(|units| {
+        if narrow_character_target {
+            DaeLengthLimit {
+                bound: DaeBound::EncodedBytes(units),
+                pad_unit: b" ",
+            }
+        } else {
+            DaeLengthLimit {
+                bound: match c_type {
+                    SQL_C_CHAR => DaeBound::Utf16Units(units),
+                    _ => DaeBound::Bytes(units.saturating_mul(unit_bytes)),
+                },
+                pad_unit,
+            }
+        }
     }))
 }
 
@@ -1243,25 +1248,16 @@ fn convert_character_sql(
     })
 }
 
-/// Trims `text` to `limit` units, or reports `22001`.
+/// Trims `text` to `limit` UTF-16 units, or reports `22001`.
 ///
-/// The unit is an approximation on purpose: `varchar(n)` bounds *collation*
-/// bytes and the collation is only applied downstream by `serialize_string`, so
-/// the exact count is unknowable here. Every source is measured in UTF-16 units
-/// instead - msodbcsql's own unit in three of its four arms
-/// (`sqlcfunc.cpp:2946`, `:2935`). Holding the fourth to it too is a registered
-/// deviation; see `.github/instructions/mssql-odbc.instructions.md`.
+/// Wide targets are bounded in these units. Narrow targets also pass through
+/// this early check, then the RPC layer applies their exact collation-byte
+/// bound once the live database collation is available.
 ///
 /// Overflowing *blanks* are dropped silently, anything else is `22001` -
 /// msodbcsql checks the overflow with `CheckTrailingChars` first
 /// (`sqlcfunc.cpp:2957`), and inbound truncation is an error unlike the benign
 /// outbound `01004`.
-///
-/// TODO: the count errs low, so an over-long value can still reach the wire.
-/// `serialize_string` can grow it - GB18030 emits 4 bytes where UTF-8 uses 2 -
-/// and `serialize_char_varchar_direct` then reports an opaque `UsageError`
-/// rather than `22001`, the `max` and `text`/`ntext` types not even that.
-/// Exactness needs the collation at this layer (AB#47584).
 ///
 /// TODO: msodbcsql's narrow-to-wide arm never reaches this logic - its walk
 /// tests `cchDest > cchMax` before incrementing and `break`s past the trim
@@ -4501,12 +4497,11 @@ mod tests {
         assert_eq!(limit.bound, DaeBound::Bytes(2));
         assert_eq!(limit.pad_unit, [0u8]);
 
-        // A narrow character buffer is measured in the UTF-16 units the
-        // materialized path uses, not in its UTF-8 bytes.
+        // A narrow target is measured after transcoding into wire bytes.
         let limit = dae_length_limit(SQL_C_CHAR, SQL_VARCHAR, 4)
             .unwrap()
             .expect("a bounded varchar is limited");
-        assert_eq!(limit.bound, DaeBound::Utf16Units(4));
+        assert_eq!(limit.bound, DaeBound::EncodedBytes(4));
         assert_eq!(limit.pad_unit, *b" ");
 
         // Four characters of nvarchar are eight bytes of SQL_C_WCHAR buffer.
@@ -4551,7 +4546,7 @@ mod tests {
         let limit = dae_length_limit(SQL_C_CHAR, SQL_LONGVARCHAR, 3)
             .unwrap()
             .expect("text is bounded by ColumnSize");
-        assert_eq!(limit.bound, DaeBound::Utf16Units(3));
+        assert_eq!(limit.bound, DaeBound::EncodedBytes(3));
     }
 
     /// A zero `ColumnSize` is the `max` spelling for the variable-width types
@@ -4624,44 +4619,37 @@ mod tests {
         );
     }
 
-    /// A `SQL_C_CHAR` buffer holds UTF-8, so its bytes are not its units. The
-    /// materialized path measures every character input in UTF-16 units
-    /// (`trim_blank_overflow`), and counting bytes here instead would reject a
-    /// value the same binding materialized accepts -- one non-ASCII character
-    /// against `varchar(1)` is two bytes but one unit.
+    /// A narrow target is bounded by its encoded wire bytes.
     #[test]
-    fn dae_limit_fit_measures_a_narrow_buffer_in_utf16_units() {
+    fn dae_limit_fit_measures_encoded_narrow_bytes() {
         let limit = dae_length_limit(SQL_C_CHAR, SQL_VARCHAR, 1)
             .unwrap()
             .unwrap();
-        // U+00E9, two UTF-8 bytes, one UTF-16 unit: it fits `varchar(1)`.
-        assert_eq!(limit.fit("é".as_bytes(), 0).unwrap(), ("é".as_bytes(), 1));
+        assert_eq!(limit.fit(&[0xE9], 0).unwrap(), (&[0xE9][..], 1));
+        assert_eq!(
+            limit.fit("é".as_bytes(), 0).unwrap_err(),
+            ParamBuildError::StringTruncation
+        );
 
         let limit = dae_length_limit(SQL_C_CHAR, SQL_VARCHAR, 4)
             .unwrap()
             .unwrap();
-        // Four characters, six bytes: a byte count would have rejected these.
-        assert_eq!(limit.fit("café".as_bytes(), 0).unwrap().1, 4);
-        // U+1D11E is four UTF-8 bytes and a surrogate pair, so it costs two of
-        // the four units, exactly as the materialized path counts it.
-        assert_eq!(limit.fit("𝄞ab".as_bytes(), 0).unwrap().1, 4);
+        assert_eq!(limit.fit(b"caf\xe9", 0).unwrap().1, 4);
+        assert_eq!(
+            limit.fit("café".as_bytes(), 0).unwrap_err(),
+            ParamBuildError::StringTruncation
+        );
     }
 
-    /// The unit count is taken from each byte on its own, so a character split
-    /// across two `SQLPutData` calls is counted once, at its lead, without the
-    /// limit carrying any decode state between chunks.
+    /// Split source characters are carried by `DaeTranscode`; the length limit
+    /// only sees completed encoded bytes.
     #[test]
-    fn dae_limit_fit_counts_a_split_character_once() {
+    fn encoded_dae_limit_needs_no_partial_source_units() {
         let limit = dae_length_limit(SQL_C_CHAR, SQL_VARCHAR, 2)
             .unwrap()
             .unwrap();
-        // "é" arrives as its lead byte and then its continuation byte.
-        let (_, first) = limit.fit(&[0xC3], 0).unwrap();
-        assert_eq!(first, 1, "the lead pays for the character");
-        let (_, second) = limit.fit(&[0xA9], first).unwrap();
-        assert_eq!(second, 0, "the continuation is already paid for");
-        // One unit consumed in total, so a second character still fits.
-        assert_eq!(limit.fit(b"z", first + second).unwrap().1, 1);
+        assert!(limit.requires_encoded_input());
+        assert!(!limit.carries_partial_units());
     }
 
     /// The pairings `park_dae_client` leaves without a transcode, so
@@ -4709,16 +4697,16 @@ mod tests {
             );
         }
 
-        // UTF-16 source against a narrow declaration: a unit is a fixed two
-        // bytes, so the byte bound is exact.
+        // UTF-16 source against a narrow declaration is measured after
+        // transcoding, so its source width is irrelevant.
         for sql_type in [SQL_VARCHAR, SQL_CHAR, SQL_LONGVARCHAR] {
             assert_eq!(
                 dae_length_limit(SQL_C_WCHAR, sql_type, 10).unwrap(),
                 Some(DaeLengthLimit {
-                    bound: DaeBound::Bytes(20),
-                    pad_unit: &[b' ', 0],
+                    bound: DaeBound::EncodedBytes(10),
+                    pad_unit: b" ",
                 }),
-                "SQL_C_WCHAR -> {sql_type} bounds 10 units as 20 buffer bytes"
+                "SQL_C_WCHAR -> {sql_type} bounds 10 encoded bytes"
             );
         }
     }
@@ -5375,11 +5363,8 @@ mod tests {
         }
     }
 
-    /// An astral character is two UTF-16 units and four UTF-8 bytes, so a wide
-    /// source measured against a narrow target passes at two units and ships
-    /// four bytes. Harmless under a single-byte collation, which cannot encode
-    /// it anyway, but on a `_UTF8` database the value the server sizes is twice
-    /// what was validated (AB#47584).
+    /// The early conversion check uses UTF-16 units. RPC preflight later
+    /// applies the narrow target's exact collation-byte bound.
     #[test]
     fn an_astral_char_costs_two_units_but_four_bytes() {
         let emoji = "\u{1F600}";
@@ -5396,16 +5381,14 @@ mod tests {
         );
     }
 
-    /// Malformed narrow input is repaired before it is measured, so the count
-    /// covers the U+FFFD it will become - but a value that fits in units can
-    /// still exceed the declared length in collation bytes, since each U+FFFD
-    /// occupies three. The narrow mirror of
-    /// `a_lone_surrogate_is_measured_before_repair` (AB#47584).
+    /// Malformed narrow input is repaired before the early unit check. RPC
+    /// preflight later measures the repaired value in collation bytes.
     #[test]
     fn invalid_utf8_at_the_limit_grows_past_it() {
         // Three bytes into a limit of three never reaches the measurement: the
         // byte-count short-circuit settles it, because no UTF-8 buffer yields
-        // more UTF-16 units than bytes. The growth still happens on the wire.
+        // more UTF-16 units than bytes. RPC preflight catches any encoded-byte
+        // growth before the value reaches the wire.
         let mut buf: Vec<u8> = vec![b'a', b'b', 0xFF];
         let mut ind: SqlLen = buf.len() as SqlLen;
         let mut p = param(SQL_C_CHAR, buf.as_mut_ptr() as *mut c_void, &mut ind);

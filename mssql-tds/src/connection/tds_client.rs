@@ -20224,13 +20224,10 @@ mod tests {
         );
     }
 
-    /// Drives a real send site, so removing the retraction from
-    /// `execute_sp_executesql` cannot leave the suite green. Parameter 1 flushes
-    /// a packet; parameter 2 is rejected by `serialize_string` after it.
+    /// Parameter validation covers the complete list before serialization, so
+    /// a late encoded-length failure cannot flush the earlier large parameter.
     #[tokio::test]
-    async fn a_send_site_retracts_when_serialization_fails_after_a_flush() {
-        use crate::message::messages::PacketStatusFlags;
-
+    async fn a_send_site_rejects_encoded_overflow_before_writing() {
         let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
         let big = RpcParameter::new(
             Some("@big".to_string()),
@@ -20250,22 +20247,18 @@ mod tests {
             .execute_sp_executesql("SELECT @big, @bad".to_string(), vec![big, overlong], ())
             .await;
 
-        assert!(result.is_err(), "the over-long value must be rejected");
-
-        let wire = sent.lock().unwrap().clone();
-        let last = &wire[wire.len() - PacketWriter::PACKET_HEADER_SIZE..];
-        assert_eq!(
-            last[1],
-            PacketStatusFlags::Eom as u8 | PacketStatusFlags::Ignore as u8,
-            "the half-sent request must be withdrawn, not dropped"
+        assert_overlong_parameter_error(result.expect_err("the over-long value must be rejected"));
+        assert!(
+            sent.lock().unwrap().is_empty(),
+            "preflight must reject every parameter before writing the RPC"
         );
         assert!(
             !client.is_connection_dead(),
-            "a withdrawn request leaves the connection reusable"
+            "a locally rejected request leaves the connection reusable"
         );
     }
 
-    fn partially_serializable_cursor_params() -> Vec<RpcParameter> {
+    fn cursor_params_with_encoded_overflow() -> Vec<RpcParameter> {
         vec![
             RpcParameter::new(
                 Some("@big".to_string()),
@@ -20310,20 +20303,37 @@ mod tests {
     }
 
     fn assert_overlong_parameter_error(error: crate::error::Error) {
+        assert!(matches!(
+            error,
+            crate::error::Error::EncodedValueTooLong {
+                actual: 10,
+                maximum: 1
+            }
+        ));
+    }
+
+    fn assert_cursor_parameter_preflight_sent_nothing(
+        client: &TdsClient,
+        sent: &Arc<std::sync::Mutex<Vec<u8>>>,
+    ) {
         assert!(
-            error.to_string().contains("exceeds schema size"),
-            "the caller must receive the original serialization error, got {error}"
+            sent.lock().unwrap().is_empty(),
+            "parameter preflight must complete before the cursor RPC is written"
+        );
+        assert!(
+            !client.is_connection_dead(),
+            "a locally rejected cursor RPC must leave the connection reusable"
         );
     }
 
     #[tokio::test]
-    async fn cursor_open_with_params_retracts_a_partial_send() {
+    async fn cursor_open_with_params_rejects_encoded_overflow_before_writing() {
         let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
 
         let error = client
             .cursor_open_with_params(
                 "SELECT @big, @bad",
-                partially_serializable_cursor_params(),
+                cursor_params_with_encoded_overflow(),
                 crate::cursor::CursorScrollOption::FORWARD_ONLY,
                 crate::cursor::CursorConcurrency::READONLY,
                 0,
@@ -20334,7 +20344,7 @@ mod tests {
             .expect_err("the over-long cursor parameter must fail");
 
         assert_overlong_parameter_error(error);
-        assert_cursor_send_was_retracted(&client, &sent);
+        assert_cursor_parameter_preflight_sent_nothing(&client, &sent);
     }
 
     #[tokio::test]
@@ -20418,7 +20428,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn perform_cursor_operation_retracts_a_partial_send() {
+    async fn perform_cursor_operation_rejects_encoded_overflow_before_writing() {
         let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
 
         let error = client
@@ -20427,7 +20437,7 @@ mod tests {
                 crate::cursor::CursorOperation::UPDATE,
                 1,
                 "",
-                partially_serializable_cursor_params(),
+                cursor_params_with_encoded_overflow(),
                 None,
                 None,
             )
@@ -20435,17 +20445,17 @@ mod tests {
             .expect_err("the over-long cursor parameter must fail");
 
         assert_overlong_parameter_error(error);
-        assert_cursor_send_was_retracted(&client, &sent);
+        assert_cursor_parameter_preflight_sent_nothing(&client, &sent);
     }
 
     #[tokio::test]
-    async fn cursor_prepexec_retracts_a_partial_send() {
+    async fn cursor_prepexec_rejects_encoded_overflow_before_writing() {
         let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
 
         let error = client
             .cursor_prepexec(
                 "SELECT @big, @bad",
-                partially_serializable_cursor_params(),
+                cursor_params_with_encoded_overflow(),
                 crate::cursor::CursorScrollOption::FORWARD_ONLY,
                 crate::cursor::CursorConcurrency::READONLY,
                 0,
@@ -20456,17 +20466,17 @@ mod tests {
             .expect_err("the over-long cursor parameter must fail");
 
         assert_overlong_parameter_error(error);
-        assert_cursor_send_was_retracted(&client, &sent);
+        assert_cursor_parameter_preflight_sent_nothing(&client, &sent);
     }
 
     #[tokio::test]
-    async fn cursor_execute_retracts_a_partial_send() {
+    async fn cursor_execute_rejects_encoded_overflow_before_writing() {
         let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
 
         let error = client
             .cursor_execute(
                 1,
-                partially_serializable_cursor_params(),
+                cursor_params_with_encoded_overflow(),
                 crate::cursor::CursorScrollOption::FORWARD_ONLY,
                 crate::cursor::CursorConcurrency::READONLY,
                 0,
@@ -20477,7 +20487,7 @@ mod tests {
             .expect_err("the over-long cursor parameter must fail");
 
         assert_overlong_parameter_error(error);
-        assert_cursor_send_was_retracted(&client, &sent);
+        assert_cursor_parameter_preflight_sent_nothing(&client, &sent);
     }
 
     /// The retraction runs on its own budget, so a request that had a timeout

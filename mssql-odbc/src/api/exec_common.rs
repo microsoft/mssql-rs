@@ -142,21 +142,7 @@ pub(super) fn park_dae_client(
     // writes bytes verbatim, so the re-encoding has to happen before them
     // (AB#47590).
     let collation = client.get_collation();
-    for param in &mut dae_params {
-        if !param.plan.is_buffered() {
-            let transcode =
-                DaeTranscode::new(param.binding.c_type, param.binding.sql_type, collation);
-            // A pairing whose buffer bytes already are the wire's bytes keeps
-            // `None`, so `SQLPutData` forwards its chunks borrowed instead of
-            // copying each one through a conversion that would return them
-            // unchanged. Skipping the transcode also skips the close-time
-            // flush, which is right: a passthrough parameter never holds back a
-            // partial character to carry.
-            if !transcode.is_passthrough() {
-                param.transcode = Some(transcode);
-            }
-        }
-    }
+    set_dae_transcodes(&mut dae_params, collation, true);
     let Ok(mut stmt_state) = stmt.inner.lock() else {
         // The client has nowhere to go: the statement that owns it is
         // unreachable and the DBC still records it as busy.
@@ -183,13 +169,14 @@ pub(super) fn park_deferred_dae(
     client: TdsClient,
     prepared: Option<PreparedPlan>,
     orphaned: Option<StatementId>,
-    dae_params: Vec<DaeParam>,
+    mut dae_params: Vec<DaeParam>,
     prebuilt: Vec<RpcParameter>,
     sql: Option<String>,
     timeout_secs: u32,
     fractional_truncated: bool,
     op: &str,
 ) -> SqlReturn {
+    set_dae_transcodes(&mut dae_params, client.get_collation(), false);
     let Ok(mut stmt_state) = stmt.inner.lock() else {
         error!("{op}: stmt mutex poisoned while parking deferred DAE state");
         return SQL_ERROR;
@@ -201,6 +188,26 @@ pub(super) fn park_deferred_dae(
         post_diag(&mut stmt_state, WARN_FRACTIONAL_TRUNCATION);
     }
     SQL_NEED_DATA
+}
+
+fn set_dae_transcodes(
+    dae_params: &mut [DaeParam],
+    collation: mssql_tds::token::tokens::SqlCollation,
+    include_streamed: bool,
+) {
+    for param in dae_params {
+        if (include_streamed && !param.plan.is_buffered())
+            || param
+                .length_limit
+                .is_some_and(|limit| limit.requires_encoded_input())
+        {
+            let transcode =
+                DaeTranscode::new(param.binding.c_type, param.binding.sql_type, collation);
+            if !transcode.is_passthrough() {
+                param.transcode = Some(transcode);
+            }
+        }
+    }
 }
 
 /// Aborts a data-at-execution sequence with a diagnostic. Always `SQL_ERROR`.
@@ -1346,8 +1353,8 @@ pub(super) fn finish_execute(
 mod tests {
     use super::*;
     use crate::api::odbc_types::{
-        SQL_ATTR_PARAM_BIND_OFFSET_PTR, SQL_C_CHAR, SQL_C_LONG, SQL_DEFAULT_PARAM, SQL_INTEGER,
-        SQL_NTS, SQL_PARAM_INPUT, SQL_VARCHAR, SqlLen, SqlULen, sql_len_data_at_exec,
+        SQL_ATTR_PARAM_BIND_OFFSET_PTR, SQL_C_CHAR, SQL_C_LONG, SQL_C_WCHAR, SQL_DEFAULT_PARAM,
+        SQL_INTEGER, SQL_NTS, SQL_PARAM_INPUT, SQL_VARCHAR, SqlLen, SqlULen, sql_len_data_at_exec,
     };
     use crate::handles::handle_from_raw;
     use crate::params::BoundParam;
@@ -1371,6 +1378,35 @@ mod tests {
         assert_eq!(dae_expected_length(sql_len_data_at_exec(0)), None);
         assert_eq!(dae_expected_length(sql_len_data_at_exec(1)), Some(1));
         assert_eq!(dae_expected_length(sql_len_data_at_exec(4)), Some(4));
+    }
+
+    #[test]
+    fn deferred_dae_configures_transcoding_for_encoded_length_limits() {
+        let collation = mssql_tds::token::tokens::SqlCollation {
+            info: 0x0409,
+            lcid_language_id: 0,
+            col_flags: 0,
+            sort_id: 0,
+        };
+        for (c_type, input) in [
+            (SQL_C_CHAR, &[0xC3, 0xA9][..]),
+            (SQL_C_WCHAR, &[0xE9, 0x00][..]),
+        ] {
+            let limit = dae_length_limit(c_type, SQL_VARCHAR, 1).unwrap().unwrap();
+            let mut params = vec![
+                DaeParam::unbounded(0, std::ptr::null_mut(), None)
+                    .with_binding_types(c_type, SQL_VARCHAR)
+                    .with_length_limit(limit),
+            ];
+
+            set_dae_transcodes(&mut params, collation, false);
+
+            let transcode = params[0]
+                .transcode
+                .expect("deferred encoded-byte validation needs a transcoder");
+            let mut carry = Vec::new();
+            assert_eq!(transcode.push(&mut carry, input).bytes, [0xE9]);
+        }
     }
 
     #[test]

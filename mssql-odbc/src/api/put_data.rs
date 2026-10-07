@@ -11,14 +11,15 @@
 //! for `data_ptr`.
 
 use std::borrow::Cow;
+use std::mem::size_of;
 
 use tracing::{debug, error};
 
 use super::exec_common::{abort_dae_with_diag, fail_with_tds, return_client_idle};
 use super::sqlstate::*;
 use crate::api::odbc_types::{
-    SQL_C_WCHAR, SQL_ERROR, SQL_INVALID_HANDLE, SQL_NTS, SQL_NULL_DATA, SQL_SUCCESS, SqlHandle,
-    SqlLen, SqlPointer, SqlReturn,
+    SQL_C_CHAR, SQL_C_WCHAR, SQL_ERROR, SQL_INVALID_HANDLE, SQL_NTS, SQL_NULL_DATA, SQL_SUCCESS,
+    SqlHandle, SqlLen, SqlPointer, SqlReturn,
 };
 use crate::conversion::param_convert::reserve_dae_buffer;
 use crate::error::free_errors;
@@ -417,6 +418,60 @@ unsafe fn sql_put_data_safe(
             unsafe { std::slice::from_raw_parts(data_ptr as *const u8, byte_count) }
         };
 
+        let encoded_length_limit = dae
+            .current_param()
+            .and_then(|param| param.length_limit)
+            .filter(|limit| limit.requires_encoded_input());
+        if will_buffer && let Some(limit) = encoded_length_limit {
+            if dae.call_in_flight() {
+                error!("SQLPutData: DAE sequence is in use by another call");
+                post_diag(&mut stmt_state, ERR_FUNCTION_SEQUENCE);
+                return SQL_ERROR;
+            }
+
+            let measured = match dae.current_param().and_then(|param| param.transcode) {
+                Some(transcode) => {
+                    let mut carry = std::mem::take(&mut dae.progress.carry);
+                    let output = transcode.push(&mut carry, chunk);
+                    dae.progress.carry = carry;
+                    output.bytes
+                }
+                None => chunk.to_vec(),
+            };
+            let mut no_carry = Vec::new();
+            let retained_before = dae.progress.retained_units;
+            let (kept, consumed) = match limit.fit_chunk(&mut no_carry, &measured, retained_before)
+            {
+                Ok(fitted) => fitted,
+                Err(error) => {
+                    drop(stmt_state);
+                    return abort_dae_with_diag(dbc, stmt, statement_handle, error.diag());
+                }
+            };
+            let Some(c_type) = dae.current_param().map(|param| param.binding.c_type) else {
+                error!("SQLPutData: open data-at-execution parameter has no binding");
+                post_diag(&mut stmt_state, ERR_FUNCTION_SEQUENCE);
+                return SQL_ERROR;
+            };
+            dae.progress.buffer.extend_from_slice(chunk);
+            let trimmed_spaces = measured.len().saturating_sub(kept.len());
+            if trim_buffered_encoded_spaces(&mut dae.progress.buffer, c_type, trimmed_spaces)
+                .is_err()
+            {
+                drop(stmt_state);
+                return abort_dae_with_diag(
+                    dbc,
+                    stmt,
+                    statement_handle,
+                    ERR_PARAM_STRING_TRUNCATION,
+                );
+            }
+            dae.progress.bytes_sent = app_total;
+            dae.progress.retained_units = retained_before.saturating_add(consumed);
+            dae.progress.put_data_called = true;
+            return SQL_SUCCESS;
+        }
+
         // `ColumnSize` bounds the accumulated value, and it is applied here -
         // before the streamed/buffered split and against the *application*
         // buffer - exactly where msodbcsql applies `ValidatePutDataLength`
@@ -437,7 +492,10 @@ unsafe fn sql_put_data_safe(
         // rather than measured or dropped: dropping it would shift every later
         // chunk off the application's code-unit grid and silently change the
         // value, and measuring it would misread a split pad unit as overflow.
-        let limit = dae.current_param().and_then(|param| param.length_limit);
+        let limit = dae
+            .current_param()
+            .and_then(|param| param.length_limit)
+            .filter(|limit| !limit.requires_encoded_input());
         let mut unit_carry = std::mem::take(&mut dae.progress.unit_carry);
         // `fit_chunk` consumes the carry it is handed, so the retriable failures
         // below can run after this call's realignment is already folded in.
@@ -447,7 +505,7 @@ unsafe fn sql_put_data_safe(
         // diagnostic. Keeping the entry state costs at most one unit.
         let unit_carry_restore = unit_carry.clone();
         let fitted: Cow<'_, [u8]>;
-        let consumed: usize;
+        let mut consumed: usize;
         match limit {
             Some(limit) => match limit.fit_chunk(&mut unit_carry, chunk, retained_before) {
                 Ok((kept, used)) => {
@@ -470,7 +528,6 @@ unsafe fn sql_put_data_safe(
             return SQL_ERROR;
         };
         dae.progress.unit_carry = unit_carry;
-        let retained_total = retained_before.saturating_add(consumed);
 
         // A buffered parameter never touches the wire here: it accumulates and
         // is converted whole when `SQLParamData` closes it. In a deferred
@@ -496,7 +553,7 @@ unsafe fn sql_put_data_safe(
             }
             dae.progress.buffer.extend_from_slice(&fitted);
             dae.progress.bytes_sent = app_total;
-            dae.progress.retained_units = retained_total;
+            dae.progress.retained_units = retained_before.saturating_add(consumed);
             dae.progress.put_data_called = true;
             return SQL_SUCCESS;
         }
@@ -513,7 +570,7 @@ unsafe fn sql_put_data_safe(
         // across the checkout costs a few bytes and makes the failure free of
         // side effects.
         let mut carry_restore: Option<Vec<u8>> = None;
-        let outgoing: Cow<'_, [u8]> = match transcode {
+        let mut outgoing: Cow<'_, [u8]> = match transcode {
             Some(transcode) => match stmt_state.dae.as_mut() {
                 Some(dae) => {
                     let mut carry = std::mem::take(&mut dae.progress.carry);
@@ -530,6 +587,21 @@ unsafe fn sql_put_data_safe(
             },
             None => fitted,
         };
+
+        if let Some(limit) = encoded_length_limit {
+            let mut no_carry = Vec::new();
+            match limit.fit_chunk(&mut no_carry, &outgoing, retained_before) {
+                Ok((kept, used)) => {
+                    outgoing = Cow::Owned(kept);
+                    consumed = used;
+                }
+                Err(error) => {
+                    drop(stmt_state);
+                    return abort_dae_with_diag(dbc, stmt, statement_handle, error.diag());
+                }
+            }
+        }
+        let retained_total = retained_before.saturating_add(consumed);
 
         let client = if outgoing.is_empty() {
             None
@@ -625,6 +697,34 @@ unsafe fn sql_put_data_safe(
             fail_with_tds(dbc, stmt, statement_handle, client, &e)
         }
     }
+}
+
+fn trim_buffered_encoded_spaces(
+    buffer: &mut Vec<u8>,
+    c_type: i16,
+    encoded_spaces: usize,
+) -> Result<(), ()> {
+    if encoded_spaces == 0 {
+        return Ok(());
+    }
+    let source_bytes = match c_type {
+        SQL_C_CHAR => encoded_spaces,
+        SQL_C_WCHAR => encoded_spaces.saturating_mul(size_of::<u16>()),
+        _ => return Err(()),
+    };
+    let keep = buffer.len().checked_sub(source_bytes).ok_or(())?;
+    let is_padding = match c_type {
+        SQL_C_CHAR => buffer[keep..].iter().all(|byte| *byte == b' '),
+        SQL_C_WCHAR => buffer[keep..]
+            .chunks_exact(size_of::<u16>())
+            .all(|unit| unit == [b' ', 0]),
+        _ => false,
+    };
+    if !is_padding {
+        return Err(());
+    }
+    buffer.truncate(keep);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -974,6 +1074,97 @@ mod tests {
             "the ColumnSize budget counts only what survived trimming"
         );
         assert_eq!(dae.progress.buffer, b"ab", "the blanks were trimmed away");
+    }
+
+    #[test]
+    fn buffered_narrow_length_uses_collation_bytes_not_utf8_source_bytes() {
+        let limit = crate::conversion::param_convert::dae_length_limit(SQL_C_CHAR, SQL_VARCHAR, 1)
+            .unwrap()
+            .unwrap();
+        let collation = mssql_tds::token::tokens::SqlCollation {
+            info: 0x0409,
+            lcid_language_id: 0,
+            col_flags: 0,
+            sort_id: 0,
+        };
+        let transcode =
+            crate::conversion::param_convert::DaeTranscode::new(SQL_C_CHAR, SQL_VARCHAR, collation);
+        let mut carry = Vec::new();
+        assert_eq!(transcode.push(&mut carry, &[0xC3, 0xA9]).bytes, [0xE9]);
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            let mut param = DaeParam::unbounded(0, std::ptr::null_mut(), None)
+                .with_binding_types(SQL_C_CHAR, SQL_VARCHAR)
+                .with_length_limit(limit);
+            param.transcode = Some(transcode);
+            let mut dae = DaeState::for_test(vec![param], Some(0));
+            dae.deferred = true;
+            state.dae = Some(dae);
+            let stored = state
+                .dae
+                .as_ref()
+                .unwrap()
+                .current_param()
+                .unwrap()
+                .transcode
+                .unwrap();
+            let mut carry = Vec::new();
+            assert_eq!(stored.push(&mut carry, &[0xC3, 0xA9]).bytes, [0xE9]);
+        }
+
+        let mut value = [0xC3u8, 0xA9];
+        assert_eq!(
+            unsafe { sql_put_data(h.stmt, value.as_mut_ptr().cast(), 2) },
+            SQL_SUCCESS
+        );
+
+        let state = stmt.inner.lock().unwrap();
+        let dae = state.dae.as_ref().unwrap();
+        assert_eq!(dae.progress.bytes_sent, 2);
+        assert_eq!(dae.progress.retained_units, 1);
+        assert_eq!(dae.progress.buffer, "é".as_bytes());
+    }
+
+    #[test]
+    fn streamed_narrow_overflow_reports_22001_after_transcoding() {
+        let limit = crate::conversion::param_convert::dae_length_limit(SQL_C_CHAR, SQL_VARCHAR, 1)
+            .unwrap()
+            .unwrap();
+        let collation = mssql_tds::token::tokens::SqlCollation {
+            info: 0x0409,
+            lcid_language_id: 0,
+            col_flags: 0x40,
+            sort_id: 0,
+        };
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            let mut param = DaeParam::unbounded(0, std::ptr::null_mut(), None)
+                .with_binding_types(SQL_C_CHAR, SQL_VARCHAR)
+                .with_length_limit(limit);
+            param.transcode = Some(crate::conversion::param_convert::DaeTranscode::new(
+                SQL_C_CHAR,
+                SQL_VARCHAR,
+                collation,
+            ));
+            state.dae = Some(DaeState::for_test(vec![param], Some(0)));
+        }
+
+        let mut value = [0xC3u8, 0xA9];
+        assert_eq!(
+            unsafe { sql_put_data(h.stmt, value.as_mut_ptr().cast(), 2) },
+            SQL_ERROR
+        );
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(
+            state.diag_records[0].sql_state,
+            ERR_PARAM_STRING_TRUNCATION.state
+        );
     }
 
     #[test]

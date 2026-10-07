@@ -188,6 +188,10 @@ pub struct RpcParameter {
     /// Cold metadata stays boxed to keep ordinary parameter arrays compact.
     streamed_declaration: Option<Box<SqlType>>,
 
+    /// Optional encoded-byte limit imposed by the caller on a narrow string.
+    /// This is independent of PLP framing and the SQL declaration.
+    narrow_string_byte_limit: Option<usize>,
+
     /// When present, the parameter is sent encrypted (Always Encrypted): the
     /// ciphertext is serialized as a BIGVARBINARY with the ENCRYPTED status flag
     /// and a trailing CryptoMetaData block, bypassing the plaintext `value`.
@@ -212,6 +216,7 @@ impl RpcParameter {
             type_metadata: None,
             numeric_declaration: None,
             streamed_declaration: None,
+            narrow_string_byte_limit: None,
             encrypted: None,
             force_column_encryption: false,
         }
@@ -230,6 +235,7 @@ impl RpcParameter {
             type_metadata: None,
             numeric_declaration: None,
             streamed_declaration: None,
+            narrow_string_byte_limit: None,
             encrypted: None,
             force_column_encryption: false,
         }
@@ -249,6 +255,15 @@ impl RpcParameter {
     /// own value.
     pub fn with_streamed_declaration(mut self, declaration: SqlType) -> Self {
         self.streamed_declaration = Some(Box::new(declaration));
+        self
+    }
+
+    /// Limits a narrow string value by its encoded wire-byte length.
+    ///
+    /// This remains active for PLP-framed values whose SQL declaration is
+    /// `varchar(max)`, allowing an API layer to enforce its own length contract.
+    pub fn with_narrow_string_byte_limit(mut self, maximum: usize) -> Self {
+        self.narrow_string_byte_limit = Some(maximum);
         self
     }
 
@@ -554,9 +569,11 @@ impl RpcParameter {
     ///
     /// The name is checked separately by [`Self::validate_named_before_send`],
     /// since only the named path writes it.
-    pub(crate) fn validate_before_send(&self) -> TdsResult<()> {
+    pub(crate) fn validate_before_send(&self, db_collation: &SqlCollation) -> TdsResult<()> {
         match &self.value {
-            RpcValue::Materialized(value) => value.validate_for_send(),
+            RpcValue::Materialized(value) => {
+                value.validate_for_send(db_collation, self.narrow_string_byte_limit)
+            }
             RpcValue::Streamed(_) => Ok(()),
         }
     }
@@ -568,11 +585,11 @@ impl RpcParameter {
     /// the name when it is not positional, so validating it unconditionally
     /// would reject a positional parameter whose unused name happens to be
     /// overlong.
-    pub(crate) fn validate_named_before_send(&self) -> TdsResult<()> {
+    pub(crate) fn validate_named_before_send(&self, db_collation: &SqlCollation) -> TdsResult<()> {
         if let Some(name) = &self.name {
             Self::validate_name_length(name)?;
         }
-        self.validate_before_send()
+        self.validate_before_send(db_collation)
     }
 
     /// Serializes the RPC parameter into the provided `PacketWriter`.
@@ -663,7 +680,13 @@ impl RpcParameter {
             RpcValue::Streamed(_) => unreachable!("streamed value handled above"),
         };
         encoder
-            .encode_sqlvalue(packet_writer, value, db_collation, self.type_metadata)
+            .encode_sqlvalue(
+                packet_writer,
+                value,
+                db_collation,
+                self.type_metadata,
+                self.narrow_string_byte_limit,
+            )
             .await?;
         Ok(())
     }

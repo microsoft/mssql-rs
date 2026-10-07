@@ -160,6 +160,44 @@ fn sql_param_data_safe(
         return abort_dae_with_diag(dbc, stmt, statement_handle, diag);
     }
 
+    let deferred_tail_error = {
+        let Ok(mut stmt_state) = stmt.inner.lock() else {
+            error!("SQLParamData: stmt mutex poisoned validating buffered transcoder tail");
+            return SQL_ERROR;
+        };
+        let Some(dae) = stmt_state.dae.as_mut() else {
+            error!("SQLParamData: DAE sequence vanished validating buffered transcoder tail");
+            return SQL_ERROR;
+        };
+        if !dae.deferred {
+            None
+        } else if let Some(limit) = dae
+            .current_param()
+            .and_then(|param| param.length_limit)
+            .filter(|limit| limit.requires_encoded_input())
+        {
+            let trailing = match dae.current_param().and_then(|param| param.transcode) {
+                Some(transcode) => transcode.finish(&mut dae.progress.carry).bytes,
+                None => Vec::new(),
+            };
+            let mut no_carry = Vec::new();
+            match limit.fit_chunk(&mut no_carry, &trailing, dae.progress.retained_units) {
+                Ok((_, consumed)) => {
+                    dae.progress.retained_units =
+                        dae.progress.retained_units.saturating_add(consumed);
+                    None
+                }
+                Err(error) => Some(error.diag()),
+            }
+        } else {
+            None
+        }
+    };
+    if let Some(diag) = deferred_tail_error {
+        error!("SQLParamData: buffered transcoder tail exceeds the parameter length");
+        return abort_dae_with_diag(dbc, stmt, statement_handle, diag);
+    }
+
     // ── Deferred sequence: no request is open ───────────────────────────────
     // The parameter closes into its buffer rather than onto the wire, and the
     // execute runs once the last one is in (AB#47590).
@@ -241,10 +279,6 @@ fn sql_param_data_safe(
             error!("SQLParamData: stmt mutex poisoned taking dae_client");
             return SQL_ERROR;
         };
-        // Checked out before the carry is drained: if this fails (a concurrent
-        // call already holds the client), the sequence stays open for a retry
-        // with the partial character still intact rather than silently
-        // discarded.
         let client = match stmt_state
             .dae
             .as_mut()
@@ -257,7 +291,6 @@ fn sql_param_data_safe(
                 return SQL_ERROR;
             }
         };
-
         // A value that ended part-way through a character leaves bytes in the
         // carry that no further chunk will complete. Flush them before the
         // terminator so they reach the wire lossily rather than vanishing.
@@ -266,7 +299,7 @@ fn sql_param_data_safe(
         // chunk ended mid-code-unit has that half unit held there, and it has to
         // rejoin the value before the transcoder sees it, or the tail character
         // is silently lost.
-        let trailing = stmt_state
+        let mut trailing = stmt_state
             .dae
             .as_mut()
             .map(|dae| {
@@ -287,6 +320,30 @@ fn sql_param_data_safe(
                 }
             })
             .unwrap_or_default();
+
+        if let Some(dae) = stmt_state.dae.as_mut()
+            && let Some(limit) = dae
+                .current_param()
+                .and_then(|param| param.length_limit)
+                .filter(|limit| limit.requires_encoded_input())
+        {
+            let mut no_carry = Vec::new();
+            match limit.fit_chunk(&mut no_carry, &trailing.0, dae.progress.retained_units) {
+                Ok((kept, consumed)) => {
+                    trailing.0 = kept;
+                    dae.progress.retained_units =
+                        dae.progress.retained_units.saturating_add(consumed);
+                }
+                Err(error) => {
+                    if let Some(dae) = stmt_state.dae.as_mut() {
+                        dae.return_client(client);
+                    }
+                    drop(stmt_state);
+                    return abort_dae_with_diag(dbc, stmt, statement_handle, error.diag());
+                }
+            }
+        }
+
         (client, trailing)
     };
     let (trailing, tail_had_loss) = trailing;
@@ -742,7 +799,7 @@ fn run_deferred_execute(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::odbc_types::{SQL_C_CHAR, SQL_NULL_HANDLE};
+    use crate::api::odbc_types::{SQL_C_CHAR, SQL_NULL_HANDLE, SQL_VARCHAR};
     use crate::handles::stmt::{DaeParam, DaeState};
     use crate::test_support::TestHandles;
 
@@ -846,6 +903,49 @@ mod tests {
             state.dae.as_ref().unwrap().progress.carry,
             vec![0xC3],
             "the pending partial character must survive a failed checkout"
+        );
+    }
+
+    #[test]
+    fn buffered_partial_utf8_overflow_is_reported_at_close() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            let limit =
+                crate::conversion::param_convert::dae_length_limit(SQL_C_CHAR, SQL_VARCHAR, 1)
+                    .unwrap()
+                    .unwrap();
+            let collation = mssql_tds::token::tokens::SqlCollation {
+                info: 0x0409,
+                lcid_language_id: 0,
+                col_flags: 0x40,
+                sort_id: 0,
+            };
+            let mut param = DaeParam::unbounded(0, std::ptr::null_mut(), None)
+                .with_binding_types(SQL_C_CHAR, SQL_VARCHAR)
+                .with_length_limit(limit);
+            param.transcode = Some(crate::conversion::param_convert::DaeTranscode::new(
+                SQL_C_CHAR,
+                SQL_VARCHAR,
+                collation,
+            ));
+            let mut dae = DaeState::for_test(vec![param], Some(0));
+            dae.deferred = true;
+            dae.progress.put_data_called = true;
+            dae.progress.bytes_sent = 1;
+            dae.progress.buffer = vec![0xC3];
+            dae.progress.carry = vec![0xC3];
+            state.dae = Some(dae);
+        }
+
+        let mut p: SqlPointer = std::ptr::null_mut();
+        assert_eq!(unsafe { sql_param_data(h.stmt, &mut p) }, SQL_ERROR);
+
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(
+            state.diag_records[0].sql_state,
+            ERR_PARAM_STRING_TRUNCATION.state
         );
     }
 

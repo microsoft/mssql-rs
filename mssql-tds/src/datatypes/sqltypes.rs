@@ -700,11 +700,28 @@ impl SqlType {
     /// carry them (a typed NULL decimal or temporal). The caller derives the SQL
     /// declaration from the same metadata, so the declared type and the wire
     /// `TYPE_INFO` always agree.
+    #[allow(dead_code)]
     pub(crate) async fn serialize(
         &self,
         packet_writer: &mut PacketWriter<'_>,
         db_collation: &SqlCollation,
         type_metadata: Option<RpcTypeMetadata>,
+    ) -> TdsResult<()> {
+        self.serialize_with_narrow_string_byte_limit(
+            packet_writer,
+            db_collation,
+            type_metadata,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn serialize_with_narrow_string_byte_limit(
+        &self,
+        packet_writer: &mut PacketWriter<'_>,
+        db_collation: &SqlCollation,
+        type_metadata: Option<RpcTypeMetadata>,
+        narrow_string_byte_limit: Option<usize>,
     ) -> TdsResult<()> {
         // JSON needs special handling: TdsValueSerializer converts to UTF-16LE for bulk copy,
         // but RPC sends raw UTF-8 bytes with TDS type 0xF4.
@@ -726,7 +743,13 @@ impl SqlType {
 
         // Step 2: Convert to ColumnValues + TdsTypeContext and serialize value
         let (column_value, ctx) = self.to_column_value_and_context(db_collation);
-        TdsValueSerializer::serialize_value(packet_writer, &column_value, &ctx).await?;
+        TdsValueSerializer::serialize_value_with_narrow_string_byte_limit(
+            packet_writer,
+            &column_value,
+            &ctx,
+            narrow_string_byte_limit,
+        )
+        .await?;
 
         Ok(())
     }
@@ -1088,12 +1111,30 @@ impl SqlType {
     /// it is a larger change than this one - it is tracked in AB#48248 rather
     /// than half-done here. A TVP with invalid table data can therefore still
     /// fail mid-write; do not read this method as covering it.
-    pub(crate) fn validate_for_send(&self) -> TdsResult<()> {
+    pub(crate) fn validate_for_send(
+        &self,
+        db_collation: &SqlCollation,
+        narrow_string_byte_limit: Option<usize>,
+    ) -> TdsResult<()> {
         match self {
             SqlType::Udt(type_name, _) => type_name.validate(),
-            SqlType::Variant(inner) => Self::validate_variant_inner(inner),
+            SqlType::Variant(inner) => {
+                Self::validate_variant_inner(inner)?;
+                inner.validate_for_send(db_collation, None)
+            }
             SqlType::Vector(vector, dimensions, base_type) => {
                 Self::validate_vector(vector.as_ref(), *dimensions, *base_type)
+            }
+            SqlType::Char(_, _)
+            | SqlType::Varchar(_, _)
+            | SqlType::VarcharMax(_)
+            | SqlType::Text(_) => {
+                let (value, ctx) = self.to_column_value_and_context(db_collation);
+                TdsValueSerializer::validate_narrow_string_length(
+                    &value,
+                    &ctx,
+                    narrow_string_byte_limit,
+                )
             }
             _ => Ok(()),
         }
@@ -1665,14 +1706,8 @@ mod variant_tests {
         assert!(cursor.chunk().is_empty());
     }
 
-    /// A narrow value's transcoded byte length can exceed its declared `n` in
-    /// ways the ODBC-side bind-time clamp (`variant_column_size` /
-    /// `trim_blank_overflow` in `mssql-odbc`) does not catch, because that
-    /// clamp measures source units, not the collation-transcoded result --
-    /// the same pre-existing gap `trim_blank_overflow` already documents for
-    /// plain `varchar` (AB#47584), now also reachable through `sql_variant`.
-    /// The wire-level 8000-byte cap this function enforces is still the
-    /// backstop that refuses an over-large narrow variant.
+    /// The serializer's wire-level 8000-byte cap remains the backstop for a
+    /// caller that reaches variant serialization without RPC preflight.
     ///
     /// The expansion that used to reach that cap no longer happens: 2000
     /// repetitions of U+65E5 (3 UTF-8 bytes each = 6000 source bytes, under the

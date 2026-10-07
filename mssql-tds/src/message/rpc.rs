@@ -112,10 +112,10 @@ impl<'a> SqlRpc<'a> {
     /// adding one; tracked in AB#48248.
     fn validate_parameters(&self) -> TdsResult<()> {
         for parameter in self.positional_parameters.iter().flatten() {
-            parameter.validate_before_send()?;
+            parameter.validate_before_send(self.db_collation)?;
         }
         for parameter in self.named_parameters.iter().flatten() {
-            parameter.validate_named_before_send()?;
+            parameter.validate_named_before_send(self.db_collation)?;
         }
         Ok(())
     }
@@ -634,6 +634,50 @@ mod tests {
         assert!(
             mock.data.is_empty(),
             "no packet may reach the network before every parameter is validated"
+        );
+    }
+
+    #[test]
+    fn an_overlong_encoded_later_parameter_sends_nothing() {
+        let parameters = vec![
+            RpcParameter::new(
+                None,
+                StatusFlags::NONE,
+                SqlType::NVarchar(Some(SqlString::from_utf8_string("x".repeat(600))), 4000),
+            ),
+            RpcParameter::new(
+                None,
+                StatusFlags::NONE,
+                SqlType::Varchar(Some(SqlString::from_utf8_string("éé".to_string())), 3),
+            ),
+        ];
+
+        let mut mock = MockNetworkWriter::new(512);
+        let mut writer = PacketWriter::new(PacketType::RpcRequest, &mut mock, None, None);
+        let collation = SqlCollation {
+            info: 0x0409,
+            lcid_language_id: 0,
+            col_flags: 0x40,
+            sort_id: 0,
+        };
+        let rpc = SqlRpc::new(
+            RpcType::ProcId(RpcProcs::ExecuteSql),
+            Some(parameters),
+            None,
+            &collation,
+            &ExecutionContext::new(),
+        );
+
+        assert!(matches!(
+            block_on(rpc.serialize_prefix(&mut writer)),
+            Err(crate::error::Error::EncodedValueTooLong {
+                actual: 4,
+                maximum: 3
+            })
+        ));
+        assert!(
+            mock.data.is_empty(),
+            "encoded length validation must finish before the first packet is sent"
         );
     }
 }
