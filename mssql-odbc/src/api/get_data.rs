@@ -5551,7 +5551,13 @@ mod tests {
                             .iter()
                             .filter(|d| d.sql_state == WARN_CODE_PAGE_CONVERSION_LOSS.state)
                             .count();
-                        let expected_loss = warn && truncated && byte == b'?';
+                        let loss_start = if text.starts_with("ABC") { 3 } else { 1 };
+                        let loss_end =
+                            expected.bytes.len() - if text.ends_with("DEF") { 3 } else { 2 };
+                        let expected_loss = warn
+                            && truncated
+                            && expected.had_loss
+                            && (loss_start..loss_end).contains(&offset);
                         assert_eq!(
                             losses,
                             usize::from(expected_loss),
@@ -5592,6 +5598,9 @@ mod tests {
                 SQL_SUCCESS
             );
             assert_eq!(indicator, 1);
+            #[cfg(target_env = "musl")]
+            assert_eq!(&output[..2], b"*\0");
+            #[cfg(not(target_env = "musl"))]
             assert_eq!(&output[..2], b"?\0");
             let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
             {
@@ -5618,6 +5627,119 @@ mod tests {
             );
             assert!(stmt.inner.lock().unwrap().diag_records.is_empty());
         }
+    }
+
+    // Retail Linux msodbcsql 18.7.1.1 reports only 01004 for successful
+    // ISO-8859-1 iconv substitution, even with WARN_ON_CP_ERROR enabled.
+    #[cfg(any(target_env = "gnu", target_env = "musl"))]
+    #[test]
+    fn successful_iconv_substitution_matches_native_get_data_diagnostics() {
+        for warn in [false, true] {
+            for text in ["ABCD", "éABC", "你ABC"] {
+                for capacity in [2, 16] {
+                    for plp in [false, true] {
+                        let h = TestHandles::with_env_dbc_stmt();
+                        client_code_page(&h, 28591, warn);
+                        if plp {
+                            prefetched_text_stream(
+                                &h,
+                                PlpEncoding::Utf16Text,
+                                None,
+                                utf16le(text),
+                                None,
+                            );
+                        } else {
+                            stmt_with_captured(
+                                &h,
+                                ColumnValues::String(SqlString::new(
+                                    utf16le(text),
+                                    EncodingType::Utf16,
+                                )),
+                            );
+                        }
+                        let mut output = [0xcc_u8; 17];
+                        let mut indicator = -99;
+                        let rc = unsafe {
+                            crate::api::exports::SQLGetData(
+                                h.stmt,
+                                1,
+                                SQL_C_CHAR,
+                                output.as_mut_ptr().cast(),
+                                capacity,
+                                &mut indicator,
+                            )
+                        };
+                        let expected: &[u8] = match text {
+                            "ABCD" => b"ABCD",
+                            "éABC" => b"\xe9ABC",
+                            #[cfg(target_env = "musl")]
+                            _ => b"*ABC",
+                            #[cfg(not(target_env = "musl"))]
+                            _ => b"?ABC",
+                        };
+                        let delivered = if capacity == 2 { 1 } else { 4 };
+                        assert_eq!(
+                            rc,
+                            if capacity == 2 {
+                                SQL_SUCCESS_WITH_INFO
+                            } else {
+                                SQL_SUCCESS
+                            }
+                        );
+                        assert_eq!(&output[..delivered], &expected[..delivered]);
+                        assert_eq!(output[delivered], 0);
+                        assert_eq!(output[capacity as usize], 0xcc);
+                        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+                        let state = stmt.inner.lock().unwrap();
+                        assert_eq!(
+                            state
+                                .diag_records
+                                .iter()
+                                .map(|diag| diag.sql_state)
+                                .collect::<Vec<_>>(),
+                            if capacity == 2 {
+                                vec![SQLSTATE_01004]
+                            } else {
+                                vec![]
+                            },
+                        );
+                        assert_eq!(
+                            indicator,
+                            if plp && capacity == 2 {
+                                SQL_NO_TOTAL
+                            } else {
+                                4
+                            }
+                        );
+                    }
+                }
+            }
+        }
+        let h = TestHandles::with_env_dbc_stmt();
+        client_code_page(&h, 28591, true);
+        stmt_with_captured(
+            &h,
+            ColumnValues::String(SqlString::new(vec![0xff], EncodingType::Utf8)),
+        );
+        let mut output = [0xcc_u8; 4];
+        assert_eq!(
+            unsafe {
+                crate::api::exports::SQLGetData(
+                    h.stmt,
+                    1,
+                    SQL_C_CHAR,
+                    output.as_mut_ptr().cast(),
+                    4,
+                    std::ptr::null_mut(),
+                )
+            },
+            SQL_ERROR,
+        );
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        assert_last_diag(
+            &stmt.inner.lock().unwrap().diag_records,
+            ERR_INVALID_CHARACTER_VALUE,
+        );
     }
 
     #[test]
@@ -9147,7 +9269,6 @@ mod tests {
         let text = "A😀BC";
         let encoding = ClientEncoding::for_code_page(1252).unwrap();
         let expected = encoding.encode(text).unwrap();
-        assert!(expected.had_loss);
         for warn in [false, true] {
             for known in [false, true] {
                 for (source, source_encoding, wire) in [
@@ -9168,7 +9289,8 @@ mod tests {
                     let total = known.then_some(u64::try_from(wire.len()).unwrap());
                     prefetched_text_stream(&h, source, source_encoding, wire, total);
                     let mut received = Vec::new();
-                    for &byte in expected.bytes.iter() {
+                    let loss_end = expected.bytes.len() - 2;
+                    for (offset, &byte) in expected.bytes.iter().enumerate() {
                         let mut output = [0xcc; 3];
                         let mut indicator = -99;
                         let rc = unsafe {
@@ -9191,7 +9313,9 @@ mod tests {
                                 .diag_records
                                 .iter()
                                 .any(|d| d.sql_state == WARN_CODE_PAGE_CONVERSION_LOSS.state),
-                            warn && byte == b'?' && rc == SQL_SUCCESS_WITH_INFO,
+                            warn && expected.had_loss
+                                && (1..loss_end).contains(&offset)
+                                && rc == SQL_SUCCESS_WITH_INFO,
                             "source {source:?}, delivered {received:?}"
                         );
                     }
@@ -9433,6 +9557,9 @@ mod tests {
             },
             SQL_SUCCESS_WITH_INFO
         );
+        #[cfg(target_env = "musl")]
+        assert_eq!(output, [b'*', 0]);
+        #[cfg(not(target_env = "musl"))]
         assert_eq!(output, [b'?', 0]);
         assert_eq!(indicator, SQL_NO_TOTAL);
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
@@ -9443,7 +9570,18 @@ mod tests {
                 .iter()
                 .any(|d| d.sql_state == WARN_STRING_TRUNCATION.state)
         );
-        assert_last_diag(&state.diag_records, WARN_CODE_PAGE_CONVERSION_LOSS);
+        let expected_loss = ClientEncoding::for_code_page(1252)
+            .unwrap()
+            .encode("你")
+            .unwrap()
+            .had_loss;
+        assert_eq!(
+            state
+                .diag_records
+                .iter()
+                .any(|diag| diag.sql_state == WARN_CODE_PAGE_CONVERSION_LOSS.state),
+            expected_loss
+        );
     }
 
     #[test]

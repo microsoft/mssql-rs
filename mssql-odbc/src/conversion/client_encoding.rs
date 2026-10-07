@@ -127,6 +127,9 @@ mod tests {
         assert_eq!(&*encoded.bytes, b"A?\0Z");
         #[cfg(target_env = "musl")]
         assert_eq!(&*encoded.bytes, b"A*\0Z");
+        #[cfg(any(target_env = "gnu", target_env = "musl"))]
+        assert!(!encoded.had_loss);
+        #[cfg(not(any(target_env = "gnu", target_env = "musl")))]
         assert!(encoded.had_loss);
         assert!(!encoded.bytes.windows(2).any(|pair| pair == b"&#"));
     }
@@ -443,7 +446,6 @@ mod platform {
     struct Converted {
         read: usize,
         written: usize,
-        loss: bool,
         error: Option<std::io::Error>,
     }
 
@@ -485,7 +487,6 @@ mod platform {
             Converted {
                 read: input.len() - input_left,
                 written: output.len() - output_left,
-                loss: result != usize::MAX && result != 0,
                 error: (result == usize::MAX).then(std::io::Error::last_os_error),
             }
         }
@@ -520,11 +521,11 @@ mod platform {
                 let converted = converter.convert(Some(remaining), tail);
                 read += converted.read;
                 written += converted.written;
-                loss |= converted.loss;
+                // Globalization.h::EncodingConverter::Convert ignores successful
+                // nonreversible counts; only its AddDefault recovery reports loss.
                 if let Some(error) = converted.error {
                     if error.raw_os_error() == Some(libc::E2BIG) {
-                        // Restart, rather than resume: iconv discards its
-                        // nonreversible-conversion count when reporting E2BIG.
+                        // Restart from complete input after growing the output.
                         size = size.checked_mul(2).ok_or(ERR_INTERNAL_CONVERSION)?;
                         continue 'retry;
                     }
@@ -577,7 +578,7 @@ mod platform {
                 return Err(ERR_INTERNAL_CONVERSION);
             }
             output.truncate(written + flushed.written);
-            return Ok((output, loss || flushed.loss));
+            return Ok((output, loss));
         }
     }
 
@@ -833,11 +834,11 @@ mod platform {
 
         #[cfg(target_env = "gnu")]
         #[test]
-        fn transliteration_expansion_retains_loss_across_buffer_growth() {
+        fn successful_transliteration_does_not_report_diagnostic_loss_after_growth() {
             let encoding = for_code_page(28591).unwrap();
             let text = format!("漢{}", "Ⅷ".repeat(80));
             let encoded = encoding.encode(&text).unwrap();
-            assert!(encoded.had_loss);
+            assert!(!encoded.had_loss);
             assert_eq!(encoded.bytes.len(), 1 + 4 * 80);
             assert_eq!(
                 &*encoded.bytes,

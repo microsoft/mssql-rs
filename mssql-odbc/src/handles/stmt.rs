@@ -39,13 +39,13 @@ pub(crate) struct ActivePlpStream {
     /// Wire encoding of the PLP column.
     pub(crate) encoding: PlpEncoding,
     /// Trailing odd wire byte from the previous read, awaiting its pair. Only
-    /// used on the UTF-16LE -> UTF-8 (`nvarchar(max)` -> `SQL_C_CHAR`) path,
+    /// used on the UTF-16LE -> client bytes (`nvarchar(max)` -> `SQL_C_CHAR`) path,
     /// where a chunk boundary can fall between the two bytes of a code unit.
     pub(crate) pending_byte: Option<u8>,
     /// High surrogate whose low half lands in the next chunk. Held back so the
     /// pair is transcoded together instead of each half becoming U+FFFD.
     pub(crate) pending_high_surrogate: Option<u16>,
-    /// Converted output that did not fit. Usually UTF-8, but a continuation
+    /// Converted native client output that did not fit, but a continuation
     /// also moves pending UTF-16 units here so either text target can drain
     /// their bytes verbatim, including a byte split after a target switch.
     pub(crate) pending_bytes: Vec<u8>,

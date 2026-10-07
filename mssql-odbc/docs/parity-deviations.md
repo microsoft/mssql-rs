@@ -194,8 +194,8 @@ msodbcsql build is measured.
    `SKIP_IF_COMPARING_MSODBCSQL()`. Tracked in AB#47767.
 
    The same rule applies to a bound UTF-8-collation `varchar(max)` delivered as
-   `SQL_C_CHAR`, which is verbatim on both drivers because the wire bytes are
-   already UTF-8. Measured on build 173919 with a 3-byte character against an
+   `SQL_C_CHAR` with a UTF-8 client, which is verbatim on both drivers because
+   the wire and client encodings match. Measured on build 173919 with a 3-byte character against an
    8-byte payload slot: msodbcsql fills all 8 and returns
    `"\xE4\xBD\xA0\xE4\xBD\xA0\xE4\xBD"`, ending mid-character, where this driver
    stops at 6. `ABoundUtf8CollationVarcharMaxTruncatesOnACharacterBoundary`

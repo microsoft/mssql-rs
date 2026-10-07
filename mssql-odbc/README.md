@@ -170,19 +170,10 @@ represented use the platform's best-fit/substitution behavior. Set
 retrieval truncates and conversion reports loss. Like msodbcsql, a converted
 result that fits returns success without a loss warning, even with this
 option enabled; do not use the option as a guarantee of lossless retrieval.
-Loss warnings describe only the bytes delivered by that call. Streamed
-converted carry retains coalesced substitution ranges until those bytes are
-consumed, so tiny continuations do not lose warnings or repeat them for an
-already-delivered substitution. Range metadata is allocated only for lossy
-conversion.
-Native converted carry retains its original Unicode chunk only while output
-remains, transferring the existing buffer rather than copying it. A switch to
-a typed target uses that chunk to skip a partially delivered client character
-before decoding the remaining native bytes; byte continuations still drain
-the original converted bytes unchanged.
-Captured narrow continuations cache client-copy eligibility separately from
-source validation, avoiding full-value ASCII scans on each small read. Replacing
-or normalizing the captured value invalidates that eligibility.
+Loss warnings describe only the bytes delivered by that call. On Unix,
+successful iconv substitutions/transliterations do not produce loss warnings;
+explicit conversion-error recovery remains distinct, matching the native
+driver. Malformed source text is not a successful client substitution.
 
 Use `SQL_C_WCHAR` for lossless Unicode retrieval; it remains UTF-16LE.
 `SQL_C_BINARY` continues to return unconverted wire bytes. mssql-python's

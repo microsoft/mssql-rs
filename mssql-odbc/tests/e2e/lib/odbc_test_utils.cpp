@@ -81,7 +81,6 @@ std::string ConvertNativeTestText(const std::string& utf8, const std::string& en
             const size_t converted =
                 iconv(converter.value, &input, &inputLeft, &output, &outputLeft);
             if (converted != static_cast<size_t>(-1)) {
-                attemptUsedDefault = attemptUsedDefault || converted != 0;
                 break;
             }
             if (errno == E2BIG) {
@@ -118,7 +117,6 @@ std::string ConvertNativeTestText(const std::string& utf8, const std::string& en
         while (true) {
             const size_t flushed = iconv(converter.value, nullptr, nullptr, &output, &outputLeft);
             if (flushed != static_cast<size_t>(-1)) {
-                attemptUsedDefault = attemptUsedDefault || flushed != 0;
                 break;
             }
             if (errno != E2BIG) {
