@@ -658,6 +658,11 @@ TEST_F(FetchScrollLiveTest, DescriptorSpellingsDriveTheBlockFetch) {
 
 // AB#49060: each row-side attribute and its descriptor field are one value.
 TEST_F(FetchScrollLiveTest, RowAttributesAndDescriptorFieldsAgree) {
+    // Executed first for the IRD cases below: SQLGet/SetDescField on an IRD is
+    // HY007 ("associated statement is not prepared") unless the statement is
+    // prepared or executed. unixODBC enforces that; the Windows DM does not.
+    ExecThreeRows();
+
     SQLHDESC ard = SQL_NULL_HDESC;
     SQLHDESC ird = SQL_NULL_HDESC;
     ASSERT_SQL_OK(SQLGetStmtAttr(stmt_, SQL_ATTR_APP_ROW_DESC, &ard, 0, nullptr),
@@ -711,6 +716,7 @@ TEST_F(FetchScrollLiveTest, RowAttributesAndDescriptorFieldsAgree) {
     ASSERT_SQL_OK(SQLGetStmtAttr(stmt_, SQL_ATTR_ROW_BIND_TYPE, &reported, 0, nullptr),
                   SQL_HANDLE_STMT, stmt_);
     EXPECT_EQ(static_cast<SQLULEN>(SQL_BIND_BY_COLUMN), reported);
+    SQLCloseCursor(stmt_);
 }
 
 // AB#49060: SQL_ROWSET_SIZE lives on the ARD (msodbcsql `ADTag::dwRowSetSize`),
