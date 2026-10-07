@@ -709,6 +709,7 @@ pub(crate) fn post_tds_error(state: &mut impl HasDiagnostics, err: &TdsError, de
     let sqlstate = match err {
         TdsError::ConnectionResetNotAcknowledged => SQLSTATE_08S01,
         TdsError::TimeoutError(_) => SQLSTATE_HYT00,
+        TdsError::EncodedValueTooLong { .. } => SQLSTATE_22001,
         _ => default,
     };
     post_sql_error(state, sqlstate, 0, err.to_string());
@@ -958,6 +959,19 @@ mod tests {
         post_tds_error(&mut s, &err, SQLSTATE_HY000);
         assert_eq!(s.records.len(), 1);
         assert_eq!(s.records[0].sql_state, SQLSTATE_HY000);
+        assert_eq!(s.records[0].native_error, 0);
+    }
+
+    #[test]
+    fn encoded_value_overflow_maps_to_22001() {
+        let mut s = FakeState::default();
+        let err = TdsError::EncodedValueTooLong {
+            actual: 5,
+            maximum: 3,
+        };
+        post_tds_error(&mut s, &err, SQLSTATE_HY000);
+        assert_eq!(s.records.len(), 1);
+        assert_eq!(s.records[0].sql_state, SQLSTATE_22001);
         assert_eq!(s.records[0].native_error, 0);
     }
 

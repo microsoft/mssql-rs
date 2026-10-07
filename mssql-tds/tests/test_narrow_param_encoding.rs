@@ -22,7 +22,7 @@
 //! What is here is what only an out-of-crate caller reaches: the `test-util`
 //! export itself, the framing of every narrow form, the `sql_variant` route,
 //! values spanning a TDS packet boundary, the `encoding_rs` arm of the
-//! resolver, and the over-length behaviour AB#47584 tracks.
+//! resolver, and exact encoded-length rejection.
 
 use mssql_tds::datatypes::column_values::ColumnValues;
 use mssql_tds::datatypes::sql_string::{EncodingType, SqlString, encode_narrow};
@@ -413,29 +413,23 @@ fn a_dbcs_sort_id_frames_by_encoded_byte_count() {
     );
 }
 
-/// Honoring the collation makes a value grow, and `serialize_char_varchar_direct`
-/// measures the *encoded* bytes against the declared length — so a value that
-/// fit under the LCID's single-byte page can now overflow it.
+/// Honoring the collation can make a value grow, and the typed length error
+/// reports the encoded byte count and declaration.
 ///
 /// Under a `_UTF8` collation U+00E9 is two bytes, so `varchar(1)` is rejected
 /// where before this change it encoded to one CP1252 byte and succeeded. The
-/// rejection is correct in that the value genuinely does not fit, but it
-/// surfaces as an opaque `UsageError` (`HY000` at the ODBC layer) rather than
-/// the `22001` msodbcsql reports, because the ODBC layer measures the parameter
-/// in UTF-16 units before the collation is known (`param_convert.rs`,
-/// AB#47584).
-///
-/// Pinned so the regression direction stays visible: when AB#47584 gives the
-/// ODBC layer the collation, this assertion is what should change, and it
-/// should change to `22001` rather than to silent acceptance.
+/// rejection is correct because the value genuinely does not fit.
 #[test]
 fn a_utf8_collation_can_push_a_value_past_its_declared_length() {
     let err = try_varchar_payload("\u{e9}", utf8(), 1)
         .expect_err("two encoded bytes do not fit varchar(1)");
-    assert!(
-        err.to_string().contains("exceeds schema size"),
-        "expected the length guard, got: {err}"
-    );
+    assert!(matches!(
+        err,
+        mssql_tds::error::Error::EncodedValueTooLong {
+            actual: 2,
+            maximum: 1
+        }
+    ));
 
     // The same binding under the LCID's single-byte page still fits, which is
     // what makes this about the collation rather than about the value.

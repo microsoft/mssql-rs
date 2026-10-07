@@ -233,6 +233,15 @@ pub enum Error {
     #[error("Type Conversion Error: {0}")]
     TypeConversionError(String),
 
+    /// A value's encoded bytes exceed the caller's declared limit.
+    #[error("Encoded value length {actual} bytes exceeds the maximum {maximum} bytes")]
+    EncodedValueTooLong {
+        /// Encoded byte length of the value.
+        actual: usize,
+        /// Maximum encoded byte length accepted by the caller.
+        maximum: usize,
+    },
+
     /// Connection was closed by server or transport.
     #[error("Connection closed: {0}")]
     ConnectionClosed(String),

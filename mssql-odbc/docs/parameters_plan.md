@@ -414,81 +414,30 @@ character; an overflow of trailing blanks is trimmed silently
 (`CheckTrailingChars` / `CheckTrailingWChars`, `:2957`). The checks at `:2630` /
 `:2653` are the `SQL_C_BINARY` arm, which pads with `'0'`.
 
-**The length is measured in msodbcsql's units, which approximate** (AB#47584).
-The exact count is unknowable at conversion time - `varchar(n)` bounds
-*collation* bytes, applied downstream by `serialize_string`. Every source is
-therefore measured in the UTF-16 units it holds or would produce (`cchDest =
-cbData/sizeof(WCHAR)`, *"Assumption: 1 WCHAR converts to 1 byte"*, `:2946`),
-whichever family it lands in. Counting transcoded UTF-8 would falsely reject
-values that fit: under a single-byte collation "cafe" with an acute accent is
-four collation bytes, not five.
+**Narrow character length is measured in destination collation bytes**
+(AB#47584). `varchar(n)` bounds the bytes produced by the database collation,
+not UTF-8 source bytes or UTF-16 code units. Materialized parameters are
+transcoded during RPC preflight, before any request bytes are written. Streamed
+parameters are measured after each `DaeTranscode` step and before that chunk is
+written. Both paths trim only an overflowing suffix of spaces and otherwise
+return `22001`.
 
-The unit is deliberately the same for both character C types, and this is where
-P4 parts company with msodbcsql. Three of its four arms already count UTF-16
-units - both wide-source arms, and the narrow-to-wide walk, which even counts an
-astral character as two (`:2935`). Only narrow-to-narrow counts source bytes
-(`cchDest = cbData`, `:2952`).
+The TDS layer reports an `EncodedValueTooLong` error with the actual and maximum
+byte counts. The ODBC layer maps that typed error to `22001`; it does not match
+error text. `SQL_LONGVARCHAR` continues to use `varchar(max)` wire framing, but
+its ODBC `ColumnSize` is carried separately and enforced against the encoded
+value. A true `varchar(max)` declaration remains unbounded.
 
-That byte count is the wire length only while no client-side transcode happens,
-which is the ordinary case: TDS carries a collation with char data, so the bytes
-ship under a declared collation and the *server* converts.
-`DoCharToCharConversion` (`sqlcprot.h:4113`) enables the client-side conversion
-only for an encoding TDS cannot name - a UTF-8 client against a non-UTF-8 server,
-or the ISO-8859-x range - and translation is on by default (`SQL_XL_DEFAULT`).
+This follows msodbcsql's convert-then-validate principle without copying its
+client-code-page assumption. This driver defines `SQL_C_CHAR` as UTF-8, so
+measuring the UTF-8 source would falsely reject values such as an accented
+character that becomes one byte in CP1252. Measuring the actual destination
+bytes keeps `SQL_C_CHAR` and `SQL_C_WCHAR` consistent.
 
-A UTF-8 `SQL_C_CHAR` is this driver's permanent state, so that predicate would
-always hold here. In that configuration msodbcsql transcodes but still measures
-the *pre-transcode* UTF-8 bytes, rejecting "cafe" with an acute accent from a
-`varchar(4)` that the four bytes it actually sends would fit. Copying the byte
-rule reproduced that defect and left the two C types disagreeing on one value -
-the same string was accepted as `SQL_C_WCHAR` and `22001` as `SQL_C_CHAR`. So it
-is not replicated, on the same footing as the narrow-to-wide off-by-one below.
-Holding both C types to UTF-16 units is what makes them agree; `char` counts
-would not, since an astral character is one `char` but two units.
-
-The residual error now runs one way only: the count errs low, never high. On a
-collation whose bytes outnumber the units counted - reachable on any `_UTF8`
-collation, not just a DBCS one - an over-long value passes here and
-`serialize_char_varchar_direct` rejects it as a `UsageError`, surfacing `HY000`
-rather than the `22001` the application should see. The `max` types and
-`text`/`ntext` carry no such check at all and send the over-long value, which is
-the worse outcome of the two. Routing either to `ERR_PARAM_STRING_TRUNCATION`
-needs a typed error out of `mssql-tds` - matching on the message text would be
-guesswork - so it belongs with AB#47584 rather than as a local patch.
-
-**This is a behavioural regression for a subset of inputs, not a pure
-improvement.** `SQL_C_CHAR` `"[three U+2615]"` into `varchar(3)` was a correct
-`22001` under the byte count; it is now accepted as three units, and what
-happens next depends on whether the target collation can represent the
-character:
-
-- **Representable** (a `_UTF8` collation, where each U+2615 is three bytes): the
-  value is over-long, and it fails downstream as an opaque `HY000` from
-  `serialize_char_varchar_direct` - or, on a `max` or `text`/`ntext` target, is
-  sent over-long with no check at all.
-- **Unmappable** (a single-byte collation, and the DBCS ones too - U+2615 has no
-  CP932 or GBK representation): each character becomes a single `?`
-  (AB#47598), so three bytes reach a `varchar(3)`, the value fits, and the
-  statement **succeeds** with the data altered.
-
-  A DBCS collation lands here rather than above *for this input*. It is the
-  encoding that decides, not the code-page family: a character a DBCS page can
-  hold takes two bytes and goes over-long like the `_UTF8` case, which is what
-  `SerializationFailureAfterAFlushLeavesTheConnectionUsable` exercises with
-  U+3042.
-
-CJK and astral input bound with an exact character count is the shape that
-regresses. The trade was taken because over-rejection has no application
-workaround - the byte count is encoding-dependent and the application cannot
-know it - while under-rejection still errors *for the representable case*, and
-because byte-counting *both* C types would have broken the wide arm, the one
-msodbcsql gets right. No option preserved both parity and self-consistency.
-
-The unmappable case is the one where under-rejection no longer errors, and it
-is not a new data-altering path: substitution is what msodbcsql and the engine
-both do, and `SQL_COPT_SS_WARN_ON_CP_ERROR` is how an application detects it
-(parity-deviations entries 22 and 23). What AB#47584 inherits is the length
-unit, not the substitution.
+Unmappable characters still follow the existing substitution behavior, and
+`SQL_COPT_SS_WARN_ON_CP_ERROR` remains the mechanism for reporting conversion
+loss (parity-deviations entries 22 and 23). The length check applies to the
+bytes after that conversion.
 
 Verified against msodbcsql source:
 
@@ -540,10 +489,10 @@ Deferred:
 
 **mssql-python reachability for this section.** `param_detect.hpp` binds text
 with `PARAM_C_TYPE_TEXT`, which is `SQL_C_WCHAR` on every platform, and routes
-any non-ASCII string to `SQL_WVARCHAR`. The narrow-target hazards above -
-approximate truncation units (AB#47584), numeric-character-reference
-substitution for unmappable characters (AB#47598), and the `SQL_C_CHAR` code
-page (AB#47565) - are therefore **not on its default path**. They become
+any non-ASCII string to `SQL_WVARCHAR`. The remaining narrow-target behaviors -
+numeric-character-reference substitution for unmappable characters (AB#47598)
+and the `SQL_C_CHAR` code page (AB#47565) - are therefore **not on its default
+path**. They become
 reachable when an application forces a narrow C or SQL type through
 `setinputsizes`. The byte-encoding path additionally requires an explicit real
 narrow C type, for example

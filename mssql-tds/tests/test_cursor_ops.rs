@@ -96,10 +96,13 @@ fn partially_serializable_cursor_params() -> Vec<RpcParameter> {
 }
 
 fn assert_overlong_parameter_error(error: mssql_tds::error::Error) {
-    assert!(
-        error.to_string().contains("exceeds schema size"),
-        "the caller must receive the original serialization error, got {error}"
-    );
+    assert!(matches!(
+        error,
+        mssql_tds::error::Error::EncodedValueTooLong {
+            actual: 10,
+            maximum: 1
+        }
+    ));
 }
 
 // --- Basic Lifecycle Tests ---

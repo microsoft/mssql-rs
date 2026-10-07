@@ -132,13 +132,54 @@ impl TdsValueSerializer {
     where
         'b: 'a,
     {
+        Self::serialize_value_with_narrow_string_byte_limit(writer, value, ctx, None).await
+    }
+
+    #[inline]
+    pub(crate) async fn serialize_value_with_narrow_string_byte_limit<'a, 'b>(
+        writer: &'a mut PacketWriter<'b>,
+        value: &ColumnValues,
+        ctx: &TdsTypeContext,
+        narrow_string_byte_limit: Option<usize>,
+    ) -> TdsResult<()>
+    where
+        'b: 'a,
+    {
         // Check if target column is sql_variant (TDS type SQL_VARIANT)
         // If so, wrap the value with variant wire format
         if ctx.tds_type == SQL_VARIANT {
             return Self::serialize_as_variant(writer, value, ctx).await;
         }
 
-        Self::serialize_value_inner(writer, value, ctx).await
+        Self::serialize_value_inner(writer, value, ctx, narrow_string_byte_limit).await
+    }
+
+    pub(crate) fn validate_narrow_string_length(
+        value: &ColumnValues,
+        ctx: &TdsTypeContext,
+        narrow_string_byte_limit: Option<usize>,
+    ) -> TdsResult<()> {
+        let ColumnValues::String(value) = value else {
+            return Ok(());
+        };
+        if !matches!(ctx.tds_type, VARCHAR | CHAR | TEXT) {
+            return Ok(());
+        }
+
+        let maximum = match narrow_string_byte_limit {
+            Some(maximum) => maximum,
+            None if !ctx.is_plp => ctx.max_size,
+            None => return Ok(()),
+        };
+        if let Some(bytes) = value.as_raw_wire_bytes() {
+            Self::fit_narrow_bytes(bytes, maximum)?;
+            return Ok(());
+        }
+
+        let text = value.to_utf8_string();
+        let encoded = Self::encode_narrow_for_wire(&text, ctx.collation);
+        Self::fit_narrow_bytes(&encoded.bytes, maximum)?;
+        Ok(())
     }
 
     /// Serialize a NULL value using the appropriate NULL marker for the type.
@@ -1377,6 +1418,7 @@ impl TdsValueSerializer {
         writer: &'a mut PacketWriter<'b>,
         value: &crate::datatypes::sql_string::SqlString,
         ctx: &TdsTypeContext,
+        narrow_string_byte_limit: Option<usize>,
     ) -> TdsResult<()>
     where
         'b: 'a,
@@ -1420,7 +1462,13 @@ impl TdsValueSerializer {
                 // use them directly without decode→re-encode roundtrip.
                 // This is critical for the RPC path where bytes are pre-encoded.
                 if let Some(raw_bytes) = value.as_raw_wire_bytes() {
-                    return Self::serialize_char_varchar_direct(writer, raw_bytes, ctx).await;
+                    return Self::serialize_char_varchar_direct(
+                        writer,
+                        raw_bytes,
+                        ctx,
+                        narrow_string_byte_limit,
+                    )
+                    .await;
                 }
 
                 // `EncodingType::Utf8` is a declaration, not a guarantee --
@@ -1443,7 +1491,13 @@ impl TdsValueSerializer {
                     _ => None,
                 };
                 if borrowed.is_some() && ctx.collation.is_some_and(|c| c.utf8()) {
-                    return Self::serialize_char_varchar_direct(writer, &value.bytes, ctx).await;
+                    return Self::serialize_char_varchar_direct(
+                        writer,
+                        &value.bytes,
+                        ctx,
+                        narrow_string_byte_limit,
+                    )
+                    .await;
                 }
 
                 // Declared-but-malformed UTF-8 takes the `Owned` arm and still
@@ -1460,7 +1514,13 @@ impl TdsValueSerializer {
                 // Marking first would report loss for bytes that never reached
                 // the wire, which the bulk-load error path then publishes
                 // (AB#47598).
-                let result = Self::serialize_char_varchar_direct(writer, &encoded.bytes, ctx).await;
+                let result = Self::serialize_char_varchar_direct(
+                    writer,
+                    &encoded.bytes,
+                    ctx,
+                    narrow_string_byte_limit,
+                )
+                .await;
                 if result.is_ok() && encoded.had_loss {
                     writer.note_code_page_conversion_loss();
                 }
@@ -1847,24 +1907,35 @@ impl TdsValueSerializer {
     /// Helper to serialize a single-byte string for CHAR/VARCHAR types.
     ///
     /// Takes single-byte encoded data and serializes it according to the TDS type context.
+    fn fit_narrow_bytes(bytes: &[u8], maximum: usize) -> TdsResult<&[u8]> {
+        if bytes.len() <= maximum {
+            return Ok(bytes);
+        }
+        if bytes[maximum..].iter().all(|byte| *byte == b' ') {
+            return Ok(&bytes[..maximum]);
+        }
+        Err(Error::EncodedValueTooLong {
+            actual: bytes.len(),
+            maximum,
+        })
+    }
+
     async fn serialize_char_varchar_direct<'a, 'b>(
         writer: &'a mut PacketWriter<'b>,
         single_byte_data: &[u8],
         ctx: &TdsTypeContext,
+        narrow_string_byte_limit: Option<usize>,
     ) -> TdsResult<()>
     where
         'b: 'a,
     {
+        let maximum = narrow_string_byte_limit.or_else(|| (!ctx.is_plp).then_some(ctx.max_size));
+        let single_byte_data = match maximum {
+            Some(maximum) => Self::fit_narrow_bytes(single_byte_data, maximum)?,
+            None => single_byte_data,
+        };
         let char_count = single_byte_data.len();
         let schema_char_count = ctx.max_size;
-
-        // Check for size overflow (skip for PLP types)
-        if !ctx.is_plp && char_count > schema_char_count {
-            return Err(Error::UsageError(format!(
-                "String length ({} characters) exceeds schema size ({} characters)",
-                char_count, schema_char_count
-            )));
-        }
 
         // Serialize based on type classification
         if ctx.tds_type == TEXT {
@@ -2054,8 +2125,10 @@ impl TdsValueSerializer {
         // other value, including a wide string sent as-is, uses the normal
         // inner serializer.
         match &resolved_narrow {
-            Some(bytes) => Self::serialize_char_varchar_direct(writer, bytes, &temp_ctx).await?,
-            None => Self::serialize_value_inner(writer, value, &temp_ctx).await?,
+            Some(bytes) => {
+                Self::serialize_char_varchar_direct(writer, bytes, &temp_ctx, None).await?
+            }
+            None => Self::serialize_value_inner(writer, value, &temp_ctx, None).await?,
         }
 
         if narrow_had_loss {
@@ -2649,6 +2722,7 @@ impl TdsValueSerializer {
         writer: &'a mut PacketWriter<'b>,
         value: &ColumnValues,
         ctx: &TdsTypeContext,
+        narrow_string_byte_limit: Option<usize>,
     ) -> TdsResult<()>
     where
         'b: 'a,
@@ -2676,7 +2750,9 @@ impl TdsValueSerializer {
             ColumnValues::SmallDateTime(v) => Self::serialize_smalldatetime(writer, v, ctx).await,
             ColumnValues::Bytes(v) => Self::serialize_bytes(writer, v, ctx).await,
             ColumnValues::Json(v) => Self::serialize_json(writer, v, ctx).await,
-            ColumnValues::String(v) => Self::serialize_string(writer, v, ctx).await,
+            ColumnValues::String(v) => {
+                Self::serialize_string(writer, v, ctx, narrow_string_byte_limit).await
+            }
             ColumnValues::Vector(v) => Self::serialize_vector(writer, v, ctx).await,
             ColumnValues::Xml(v) => Self::serialize_xml(writer, v, ctx).await,
             ColumnValues::Uuid(v) => Self::serialize_uuid(writer, v, ctx).await,
@@ -4105,6 +4181,7 @@ mod tests {
     use crate::datatypes::column_values::ColumnValues;
     use crate::datatypes::lcid_encoding::lcid_to_encoding;
     use crate::datatypes::sql_string::encode_narrow;
+    use crate::error::Error;
     use crate::io::packet_writer::PacketWriter;
     use crate::io::packet_writer::tests::MockNetworkWriter;
     use crate::message::messages::PacketType;
@@ -4468,10 +4545,53 @@ mod tests {
         let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
         let err = block_on(TdsValueSerializer::serialize_value(&mut w, &value, &ctx))
             .expect_err("two encoded bytes do not fit varchar(1)");
-        assert!(
-            err.to_string().contains("exceeds schema size"),
-            "expected the length guard, got: {err}"
+        assert!(matches!(
+            err,
+            Error::EncodedValueTooLong {
+                actual: 2,
+                maximum: 1
+            }
+        ));
+    }
+
+    #[test]
+    fn encoded_length_validation_trims_only_trailing_blanks() {
+        assert_eq!(
+            TdsValueSerializer::fit_narrow_bytes("é ".as_bytes(), 2).unwrap(),
+            "é".as_bytes()
         );
+        assert!(matches!(
+            TdsValueSerializer::fit_narrow_bytes(" é".as_bytes(), 2),
+            Err(Error::EncodedValueTooLong {
+                actual: 3,
+                maximum: 2
+            })
+        ));
+    }
+
+    #[test]
+    fn explicit_limit_applies_to_plp_narrow_strings() {
+        let value = ColumnValues::String(crate::datatypes::sql_string::SqlString::new(
+            utf16le("éé"),
+            crate::datatypes::sql_string::EncodingType::Utf16,
+        ));
+        let ctx = TdsTypeContext {
+            tds_type: VARCHAR,
+            max_size: usize::MAX,
+            is_plp: true,
+            is_fixed_length: false,
+            precision: None,
+            scale: None,
+            collation: Some(utf8_collation()),
+            is_nullable: true,
+        };
+        assert!(matches!(
+            TdsValueSerializer::validate_narrow_string_length(&value, &ctx, Some(3)),
+            Err(Error::EncodedValueTooLong {
+                actual: 4,
+                maximum: 3
+            })
+        ));
     }
 
     /// The UTF-8 passthrough must not forward bytes that are not actually
