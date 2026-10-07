@@ -340,14 +340,14 @@ unsafe fn sql_put_data_safe(
             return abort_dae_with_diag(dbc, stmt, statement_handle, ERR_DAE_LENGTH_MISMATCH);
         }
 
-        let plan = dae.current_param().map(|param| param.plan);
-        let Some(plan) = plan else {
+        let Some(will_buffer) = dae
+            .current_param()
+            .map(|param| param.plan.is_buffered() || dae.deferred)
+        else {
             error!("SQLPutData: open data-at-execution parameter has no plan");
             post_diag(&mut stmt_state, ERR_FUNCTION_SEQUENCE);
             return SQL_ERROR;
         };
-
-        let will_buffer = plan.is_buffered() || dae.deferred;
 
         // `SQL_DATA_AT_EXEC` declares no total, so nothing bounds how large a
         // chunk can claim to be, and every allocation that follows --
@@ -912,6 +912,46 @@ mod tests {
         let dae = state.dae.as_ref().expect("sequence still active");
         assert_eq!(dae.progress.bytes_sent, 0);
         assert!(!dae.progress.put_data_called);
+    }
+
+    #[test]
+    fn plp_targets_do_not_retain_the_supplied_chunk() {
+        use mssql_tds::datatypes::sql_udt::UdtTypeName;
+        use mssql_tds::message::parameters::rpc_parameters::StreamedSqlType;
+
+        for (c_type, sql_type, plan) in [
+            (
+                crate::api::odbc_types::SQL_C_WCHAR,
+                crate::api::odbc_types::SQL_SS_XML,
+                StreamedSqlType::Xml,
+            ),
+            (
+                crate::api::odbc_types::SQL_C_BINARY,
+                crate::api::odbc_types::SQL_SS_UDT,
+                StreamedSqlType::Udt(UdtTypeName::new(None, None, "hierarchyid".to_string())),
+            ),
+        ] {
+            let h = TestHandles::with_env_dbc_stmt();
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            {
+                let mut param = DaeParam::unbounded(0, std::ptr::null_mut(), None)
+                    .with_binding_types(c_type, sql_type);
+                param.plan = crate::conversion::param_convert::DaePlan::Stream(plan);
+                let mut state = stmt.inner.lock().unwrap();
+                state.dae = Some(DaeState::for_test(vec![param], Some(0)));
+            }
+
+            let mut chunk = vec![0x5Au8; 1024 * 1024];
+            let ret =
+                unsafe { sql_put_data(h.stmt, chunk.as_mut_ptr().cast(), chunk.len() as SqlLen) };
+            assert_eq!(ret, SQL_ERROR, "the test has no parked client");
+
+            let state = stmt.inner.lock().unwrap();
+            let dae = state.dae.as_ref().expect("sequence still active");
+            assert_eq!(dae.progress.buffer.capacity(), 0, "{sql_type}");
+            assert_eq!(dae.progress.carry.capacity(), 0, "{sql_type}");
+            assert_eq!(dae.progress.unit_carry.capacity(), 0, "{sql_type}");
+        }
     }
 
     /// A parameter whose C type and SQL type disagree on wideness still needs

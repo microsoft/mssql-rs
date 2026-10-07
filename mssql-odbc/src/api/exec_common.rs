@@ -916,12 +916,12 @@ pub(super) unsafe fn build_named_params_for_row(
             unsafe { crate::conversion::param_convert::data_at_exec_indicator(&bound_param) };
 
         if let Some(indicator) = dae_indicator {
-            let plan = dae_plan(bound_param.c_type, bound_param.sql_type).map_err(|source| {
-                ParamRowBuildError::Conversion {
+            let plan = dae_plan(bound_param.c_type, bound_param.sql_type, udt_names).map_err(
+                |source| ParamRowBuildError::Conversion {
                     parameter: i + 1,
                     source,
-                }
-            })?;
+                },
+            )?;
             let length_limit = dae_length_limit(
                 bound_param.c_type,
                 bound_param.sql_type,
@@ -934,7 +934,7 @@ pub(super) unsafe fn build_named_params_for_row(
             dae_params.push(DaeParam::new(
                 i,
                 dae_expected_length(indicator),
-                plan,
+                plan.clone(),
                 length_limit,
                 bound_param,
                 snapshot.udt_names.clone(),
@@ -2818,7 +2818,7 @@ mod tests {
         use crate::api::odbc_types::{SQL_C_NUMERIC, SQL_DECIMAL, SqlNumericStruct};
 
         assert!(matches!(
-            dae_plan(SQL_C_NUMERIC, SQL_DECIMAL),
+            dae_plan(SQL_C_NUMERIC, SQL_DECIMAL, None),
             Err(ParamBuildError::UnsupportedCType(SQL_C_NUMERIC))
         ));
 

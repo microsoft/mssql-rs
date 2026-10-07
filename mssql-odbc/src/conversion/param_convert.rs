@@ -783,7 +783,7 @@ fn buffered_dae_binding(binding: &BoundParam, buffer: &[u8], indicator: &mut Sql
 /// alone* - `ColumnSize` does not enter into it, because a bounded declaration
 /// is carried in the `@params` string while the value body stays a `max`
 /// (AB#47590).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum DaePlan {
     /// Streamed as PLP chunks, each transcoded on the way out.
     Stream(StreamedSqlType),
@@ -794,7 +794,7 @@ pub(crate) enum DaePlan {
 }
 
 impl DaePlan {
-    pub(crate) fn is_buffered(self) -> bool {
+    pub(crate) fn is_buffered(&self) -> bool {
         matches!(self, Self::Buffer)
     }
 }
@@ -808,6 +808,7 @@ impl DaePlan {
 pub(crate) fn dae_plan(
     c_type: SqlSmallInt,
     sql_type: SqlSmallInt,
+    udt_names: Option<&UdtNames>,
 ) -> Result<DaePlan, ParamBuildError> {
     if !matches!(c_type, SQL_C_CHAR | SQL_C_WCHAR | SQL_C_BINARY) {
         return Err(ParamBuildError::UnsupportedCType(c_type));
@@ -818,6 +819,8 @@ pub(crate) fn dae_plan(
         SQL_VARCHAR | SQL_LONGVARCHAR => DaePlan::Stream(StreamedSqlType::VarcharMax),
         SQL_WVARCHAR | SQL_WLONGVARCHAR => DaePlan::Stream(StreamedSqlType::NVarcharMax),
         SQL_VARBINARY | SQL_LONGVARBINARY => DaePlan::Stream(StreamedSqlType::VarBinaryMax),
+        SQL_SS_XML => DaePlan::Stream(StreamedSqlType::Xml),
+        SQL_SS_UDT => DaePlan::Stream(StreamedSqlType::Udt(udt_type_name(udt_names)?)),
         _ => DaePlan::Buffer,
     })
 }
@@ -840,7 +843,7 @@ pub(crate) fn dae_streamed_declaration(
             .map(|length| SqlType::NVarchar(None, length)),
         SQL_VARBINARY => variable_length(column_size, SQL_PREC_BIGCHARBINARY)
             .map(|length| SqlType::VarBinary(None, length)),
-        SQL_LONGVARCHAR | SQL_WLONGVARCHAR | SQL_LONGVARBINARY => None,
+        SQL_LONGVARCHAR | SQL_WLONGVARCHAR | SQL_LONGVARBINARY | SQL_SS_XML | SQL_SS_UDT => None,
         other => return Err(ParamBuildError::UnsupportedSqlType(other)),
     })
 }
@@ -893,6 +896,7 @@ impl DaeTranscode {
             _ => DaeSource::Raw,
         };
         let target = match sql_family(sql_type) {
+            Some(SqlFamily::Xml) => DaeTarget::Utf16,
             Some(SqlFamily::Character) if is_wide_character_sql_type(sql_type) => DaeTarget::Utf16,
             Some(SqlFamily::Character) => DaeTarget::Narrow(collation),
             _ => DaeTarget::Raw,
@@ -4250,19 +4254,19 @@ mod tests {
     #[test]
     fn dae_plan_covers_the_supported_c_types() {
         assert_eq!(
-            dae_plan(SQL_C_CHAR, SQL_VARCHAR),
+            dae_plan(SQL_C_CHAR, SQL_VARCHAR, None),
             Ok(DaePlan::Stream(StreamedSqlType::VarcharMax))
         );
         assert_eq!(
-            dae_plan(SQL_C_WCHAR, SQL_WVARCHAR),
+            dae_plan(SQL_C_WCHAR, SQL_WVARCHAR, None),
             Ok(DaePlan::Stream(StreamedSqlType::NVarcharMax))
         );
         assert_eq!(
-            dae_plan(SQL_C_BINARY, SQL_VARBINARY),
+            dae_plan(SQL_C_BINARY, SQL_VARBINARY, None),
             Ok(DaePlan::Stream(StreamedSqlType::VarBinaryMax))
         );
 
-        let err = dae_plan(SQL_C_LONG, SQL_VARCHAR).unwrap_err();
+        let err = dae_plan(SQL_C_LONG, SQL_VARCHAR, None).unwrap_err();
         assert!(matches!(err, ParamBuildError::UnsupportedCType(SQL_C_LONG)));
         assert_eq!(err.diag().state, ERR_PARAM_C_TYPE_NOT_IMPLEMENTED.state);
     }
@@ -4281,9 +4285,10 @@ mod tests {
             (SQL_C_WCHAR, SQL_WLONGVARCHAR),
             (SQL_C_BINARY, SQL_VARBINARY),
             (SQL_C_BINARY, SQL_LONGVARBINARY),
+            (SQL_C_WCHAR, SQL_SS_XML),
         ] {
             assert!(
-                matches!(dae_plan(c_type, sql_type), Ok(DaePlan::Stream(_))),
+                matches!(dae_plan(c_type, sql_type, None), Ok(DaePlan::Stream(_))),
                 "{c_type}/{sql_type} is PLP-framable and should stream"
             );
         }
@@ -4302,7 +4307,7 @@ mod tests {
             (SQL_C_WCHAR, SQL_BIGINT),
         ] {
             assert_eq!(
-                dae_plan(c_type, sql_type),
+                dae_plan(c_type, sql_type, None),
                 Ok(DaePlan::Buffer),
                 "{c_type}/{sql_type} cannot be PLP-framed"
             );
@@ -4480,9 +4485,12 @@ mod tests {
     fn transcode_passes_matching_encodings_through() {
         let collation = SqlCollation::default();
         assert!(DaeTranscode::new(SQL_C_BINARY, SQL_VARBINARY, collation).is_passthrough());
+        assert!(DaeTranscode::new(SQL_C_BINARY, SQL_SS_UDT, collation).is_passthrough());
         assert!(DaeTranscode::new(SQL_C_WCHAR, SQL_WVARCHAR, collation).is_passthrough());
+        assert!(DaeTranscode::new(SQL_C_WCHAR, SQL_SS_XML, collation).is_passthrough());
         // A narrow buffer into a wide target always re-encodes.
         assert!(!DaeTranscode::new(SQL_C_CHAR, SQL_WVARCHAR, collation).is_passthrough());
+        assert!(!DaeTranscode::new(SQL_C_CHAR, SQL_SS_XML, collation).is_passthrough());
     }
 
     /// `ColumnSize` bounds a streamed parameter as the chunks arrive, rather
@@ -4929,7 +4937,7 @@ mod tests {
             (SQL_C_CHAR, SQL_VARBINARY),
         ] {
             assert!(
-                matches!(dae_plan(c_type, sql_type), Ok(DaePlan::Stream(_))),
+                matches!(dae_plan(c_type, sql_type, None), Ok(DaePlan::Stream(_))),
                 "{c_type} -> {sql_type} should stream"
             );
         }
@@ -4943,7 +4951,7 @@ mod tests {
             (SQL_C_WCHAR, SQL_BIGINT),
         ] {
             assert_eq!(
-                dae_plan(c_type, sql_type),
+                dae_plan(c_type, sql_type, None),
                 Ok(DaePlan::Buffer),
                 "{c_type} -> {sql_type} should buffer"
             );
@@ -4951,7 +4959,7 @@ mod tests {
 
         // An unsupported wire type is still refused, since no conversion exists
         // for it on either path.
-        let err = dae_plan(SQL_C_CHAR, SQL_SS_VECTOR).unwrap_err();
+        let err = dae_plan(SQL_C_CHAR, SQL_SS_VECTOR, None).unwrap_err();
         assert_eq!(err.diag().state, ERR_PARAM_SQL_TYPE_NOT_IMPLEMENTED.state);
     }
 
@@ -4972,7 +4980,7 @@ mod tests {
             (SQL_C_CHAR, SQL_WLONGVARCHAR, StreamedSqlType::NVarcharMax),
         ] {
             assert_eq!(
-                dae_plan(c_type, sql_type),
+                dae_plan(c_type, sql_type, None),
                 Ok(DaePlan::Stream(streamed)),
                 "{c_type} -> {sql_type}"
             );
@@ -6380,34 +6388,26 @@ mod tests {
         }
     }
 
-    /// A UDT streams through data-at-execution in msodbcsql's own regression
-    /// suite (`TCLargeUDT.cpp`, `variation_10`, which supplies a 100017-byte
-    /// value that way). It is collected rather than streamed here - the same
-    /// way every PLP target except character and binary behaves, tracked by
-    /// AB#48349 - but the collected bytes must still reach the wire as the
-    /// UDT's payload, with the name carried across from the original binding.
+    /// A UDT streams through data-at-execution with its identity in `TYPE_INFO`.
     #[test]
-    fn a_udt_supplied_at_execution_keeps_its_name_and_payload() {
-        let mut stale_indicator = SQL_DATA_AT_EXEC;
-        let mut binding = param(SQL_C_BINARY, std::ptr::null_mut(), &mut stale_indicator);
-        binding.sql_type = SQL_SS_UDT;
+    fn a_udt_supplied_at_execution_keeps_its_name() {
         let names = udt_binding("hierarchyid", "", "dbo");
 
-        assert_eq!(dae_plan(SQL_C_BINARY, SQL_SS_UDT), Ok(DaePlan::Buffer));
-
-        let mut buffered_length = 3;
-        let synthetic = buffered_dae_binding(&binding, &[0x5A, 0x00, 0x01], &mut buffered_length);
-        match unsafe { bound_param_to_value_named(&synthetic, names.as_deref()) }
-            .unwrap()
-            .0
-        {
-            SqlType::Udt(name, Some(payload)) => {
-                assert_eq!(payload, vec![0x5A, 0x00, 0x01]);
+        match dae_plan(SQL_C_BINARY, SQL_SS_UDT, names.as_deref()).unwrap() {
+            DaePlan::Stream(StreamedSqlType::Udt(name)) => {
                 assert_eq!(name.type_name, "hierarchyid");
                 assert_eq!(name.schema_name.as_deref(), Some("dbo"));
             }
-            other => panic!("expected a UDT, got {other:?}"),
+            other => panic!("expected a streamed UDT, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_streamed_udt_requires_its_type_name() {
+        assert_eq!(
+            dae_plan(SQL_C_BINARY, SQL_SS_UDT, None),
+            Err(ParamBuildError::MissingUdtTypeName)
+        );
     }
 
     /// A bounded `ColumnSize` bounds the payload: msodbcsql raises `22001`

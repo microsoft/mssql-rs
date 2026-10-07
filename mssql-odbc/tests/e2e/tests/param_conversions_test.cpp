@@ -16,6 +16,7 @@
 
 #include "odbc_test_fixture.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -2009,6 +2010,36 @@ TEST_F(ScalarConversionLiveTest, XmlParamRoundTrips) {
     EXPECT_EQ(xml, ExecuteAndReadBack());
 }
 
+TEST_F(ScalarConversionLiveTest, LargeXmlStreamsThroughDataAtExecution) {
+    std::string xml = "<root>";
+    const std::string element = "<v>abcdefghij</v>";
+    for (int i = 0; i < 10000; ++i) {
+        xml += element;
+    }
+    xml += "</root>";
+
+    ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(32), LEN(CONVERT(NVARCHAR(MAX), ?)))"),
+                  SQL_HANDLE_STMT, stmt_);
+    SQLCHAR token = 0;
+    SQLLEN indicator = SQL_LEN_DATA_AT_EXEC(static_cast<SQLLEN>(xml.size()));
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_CHAR, SQL_SS_XML, 0, 0,
+                                   &token, 0, &indicator),
+                  SQL_HANDLE_STMT, stmt_);
+
+    SQLPOINTER returned = nullptr;
+    ASSERT_EQ(SQL_NEED_DATA, SQLExecute(stmt_));
+    ASSERT_EQ(SQL_NEED_DATA, SQLParamData(stmt_, &returned));
+    constexpr size_t kChunkSize = 4093;
+    for (size_t offset = 0; offset < xml.size(); offset += kChunkSize) {
+        const size_t length = std::min(kChunkSize, xml.size() - offset);
+        ASSERT_SQL_OK(SQLPutData(stmt_, xml.data() + offset, static_cast<SQLLEN>(length)),
+                      SQL_HANDLE_STMT, stmt_);
+    }
+    ASSERT_SQL_OK(SQLParamData(stmt_, &returned), SQL_HANDLE_STMT, stmt_);
+
+    EXPECT_EQ(std::to_string(xml.size()), ReadBack());
+}
+
 // sql_variant wraps the inner declaration rather than declaring itself, so the
 // server reports the inner base type.
 //
@@ -2428,16 +2459,44 @@ protected:
     // ordinal carried its own name rather than reusing the first.
     std::vector<SQLCHAR> SerializedGeometry(const std::string& wkt) {
         SqlTString sql = ODBCTestUtils::ToSqlTStr(
-            "SELECT CAST(geometry::STGeomFromText('" + wkt + "', 0) AS VARBINARY(8000))");
+            "SELECT CAST(geometry::STGeomFromText('" + wkt + "', 0) AS VARBINARY(MAX))");
         EXPECT_SQL_OK(SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS),
                       SQL_HANDLE_STMT, stmt_);
         EXPECT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
-        SQLCHAR buf[8000] = {0};
+        SQLCHAR buf[4096] = {0};
         SQLLEN ind = 0;
-        EXPECT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_BINARY, buf, sizeof(buf), &ind), SQL_HANDLE_STMT,
-                      stmt_);
+        SQLRETURN rc = SQLGetData(stmt_, 1, SQL_C_BINARY, buf, sizeof(buf), &ind);
+        EXPECT_TRUE(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+        EXPECT_GE(ind, 0);
+        std::vector<SQLCHAR> value;
+        const int max_calls =
+            ind > 0 ? static_cast<int>(ind / static_cast<SQLLEN>(sizeof(buf))) + 2 : 1;
+        int calls = 0;
+        while (rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO) {
+            if (++calls > max_calls) {
+                ADD_FAILURE() << "chunked geometry read did not terminate";
+                break;
+            }
+            if (ind < 0) {
+                ADD_FAILURE() << "chunked geometry read returned no byte count";
+                break;
+            }
+            const SQLLEN chunk =
+                (rc == SQL_SUCCESS) ? ind : static_cast<SQLLEN>(sizeof(buf));
+            if (chunk > static_cast<SQLLEN>(sizeof(buf))) {
+                ADD_FAILURE() << "final geometry chunk overruns the buffer";
+                break;
+            }
+            value.insert(value.end(), buf, buf + chunk);
+            if (rc == SQL_SUCCESS) {
+                break;
+            }
+            rc = SQLGetData(stmt_, 1, SQL_C_BINARY, buf, sizeof(buf), &ind);
+            EXPECT_TRUE(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+            EXPECT_GE(ind, 0);
+        }
         EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
-        return std::vector<SQLCHAR>(buf, buf + (ind > 0 ? ind : 0));
+        return value;
     }
 
     SQLLEN indicator_ = 0;
@@ -2860,13 +2919,9 @@ TEST_F(UdtParamLiveTest, AUdtParameterWorksInAWhereClause) {
     EXPECT_EQ("1", ExecuteAndReadBack());
 }
 
-// msodbcsql supplies a large UDT through data-at-execution. This driver
-// collects the chunks rather than streaming them (AB#48349), but the value that
-// reaches the server must be the same.
-//
-// Benefits-from-mock-tds: buffered and streamed are indistinguishable from the
-// result, so this cannot observe which one ran - exactly the behaviour AB#48349
-// changes. A mock TDS server would let it assert PLP chunking on the wire.
+// The byte-level unit tests assert that the UDT identity precedes an open PLP
+// body. This live case verifies that SQLParamData/SQLPutData completes that body
+// and the server resolves it as the named CLR type.
 TEST_F(UdtParamLiveTest, AUdtParameterCanBeSuppliedAtExecution) {
     std::vector<SQLCHAR> payload = SerializedHierarchyId("/3/");
     ASSERT_FALSE(payload.empty());
@@ -2882,8 +2937,9 @@ TEST_F(UdtParamLiveTest, AUdtParameterCanBeSuppliedAtExecution) {
     SQLPOINTER returned = nullptr;
     ASSERT_EQ(SQL_NEED_DATA, SQLExecute(stmt_));
     ASSERT_EQ(SQL_NEED_DATA, SQLParamData(stmt_, &returned));
-    ASSERT_SQL_OK(SQLPutData(stmt_, payload.data(), static_cast<SQLLEN>(payload.size())),
-                  SQL_HANDLE_STMT, stmt_);
+    for (SQLCHAR& byte : payload) {
+        ASSERT_SQL_OK(SQLPutData(stmt_, &byte, 1), SQL_HANDLE_STMT, stmt_);
+    }
     ASSERT_SQL_OK(SQLParamData(stmt_, &returned), SQL_HANDLE_STMT, stmt_);
 
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
@@ -2893,6 +2949,41 @@ TEST_F(UdtParamLiveTest, AUdtParameterCanBeSuppliedAtExecution) {
                   stmt_);
     EXPECT_STREQ("/3/", reinterpret_cast<const char*>(buf));
     EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+}
+
+TEST_F(UdtParamLiveTest, LargeUdtStreamsThroughDataAtExecution) {
+    std::string wkt = "LINESTRING(";
+    for (int i = 0; i < 1000; ++i) {
+        if (i != 0) {
+            wkt += ",";
+        }
+        wkt += std::to_string(i) + " " + std::to_string(i % 7);
+    }
+    wkt += ")";
+    std::vector<SQLCHAR> payload = SerializedGeometry(wkt);
+    ASSERT_GT(payload.size(), 8000u);
+
+    ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(32), CAST(? AS geometry).STNumPoints())"),
+                  SQL_HANDLE_STMT, stmt_);
+    SQLPOINTER token = reinterpret_cast<SQLPOINTER>(1);
+    indicator_ = SQL_LEN_DATA_AT_EXEC(static_cast<SQLLEN>(payload.size()));
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_BINARY, SQL_SS_UDT, 0, 0,
+                                   token, 0, &indicator_),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SetUdtName("geometry"), SQL_HANDLE_STMT, stmt_);
+
+    SQLPOINTER returned = nullptr;
+    ASSERT_EQ(SQL_NEED_DATA, SQLExecute(stmt_));
+    ASSERT_EQ(SQL_NEED_DATA, SQLParamData(stmt_, &returned));
+    constexpr size_t kChunkSize = 4093;
+    for (size_t offset = 0; offset < payload.size(); offset += kChunkSize) {
+        const size_t length = std::min(kChunkSize, payload.size() - offset);
+        ASSERT_SQL_OK(SQLPutData(stmt_, payload.data() + offset, static_cast<SQLLEN>(length)),
+                      SQL_HANDLE_STMT, stmt_);
+    }
+    ASSERT_SQL_OK(SQLParamData(stmt_, &returned), SQL_HANDLE_STMT, stmt_);
+
+    EXPECT_EQ("1000", ReadBack());
 }
 
 // A scalar C type cannot reach a UDT: fValidConversion admits only the three

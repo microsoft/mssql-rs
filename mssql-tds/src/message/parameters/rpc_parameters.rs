@@ -100,21 +100,15 @@ pub(crate) struct EncryptedRpcValue {
 
 /// Wire-type selector for a data-at-execution (streamed) PLP parameter.
 ///
-/// Limited to the MAX types, whose TYPE_INFO is fully determined by the variant
-/// itself and whose value body is plain PLP framing: unknown-length opener,
-/// length-prefixed chunks, terminator. That is what lets the parameter header be
-/// written before the total value length is known. Callers buffer any other type
-/// and send it materialized.
+/// Limited to PLP types whose parameter header can be written before the total
+/// value length is known. UDT carries its server-side identity because that
+/// metadata precedes the PLP body in `TYPE_INFO`.
 ///
 /// This selects the *wire* type only. The `@params` declaration can be narrowed
 /// independently - see [`RpcParameter::with_streamed_declaration`] - so a
 /// `varchar(10)` parameter still streams its body as `varchar(max)`.
 ///
-/// TODO: `xml` and `udt` have no variant here and are buffered by the ODBC
-/// layer instead of streamed - correct on the wire, but it holds the whole
-/// value in memory (AB#48349). `text` / `ntext` / `image` need no variant:
-/// they are already mapped onto the `max` types above.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamedSqlType {
     /// Unicode MAX text.
     NVarcharMax,
@@ -122,6 +116,10 @@ pub enum StreamedSqlType {
     VarcharMax,
     /// MAX binary data.
     VarBinaryMax,
+    /// XML data.
+    Xml,
+    /// CLR user-defined type data.
+    Udt(UdtTypeName),
 }
 
 impl StreamedSqlType {
@@ -131,15 +129,24 @@ impl StreamedSqlType {
     /// [`RpcParameter::get_sql_name_impl`] on the equivalent materialized
     /// [`SqlType`] rather than duplicating the `nvarchar(MAX)` / `varchar(MAX)`
     /// / `varbinary(MAX)` strings, so the two can't drift apart.
-    fn sql_name(self) -> TdsResult<String> {
+    fn sql_name(&self) -> TdsResult<String> {
         RpcParameter::get_sql_name_impl(&self.as_sql_type(), None)
     }
 
-    fn as_sql_type(self) -> SqlType {
+    fn as_sql_type(&self) -> SqlType {
         match self {
             Self::NVarcharMax => SqlType::NVarcharMax(None),
             Self::VarcharMax => SqlType::VarcharMax(None),
             Self::VarBinaryMax => SqlType::VarBinaryMax(None),
+            Self::Xml => SqlType::Xml(None),
+            Self::Udt(type_name) => SqlType::Udt(type_name.clone(), None),
+        }
+    }
+
+    fn validate(&self) -> TdsResult<()> {
+        match self {
+            Self::Udt(type_name) => type_name.validate(),
+            _ => Ok(()),
         }
     }
 }
@@ -557,7 +564,7 @@ impl RpcParameter {
     pub(crate) fn validate_before_send(&self) -> TdsResult<()> {
         match &self.value {
             RpcValue::Materialized(value) => value.validate_for_send(),
-            RpcValue::Streamed(_) => Ok(()),
+            RpcValue::Streamed(streamed) => streamed.validate(),
         }
     }
 
@@ -631,7 +638,7 @@ impl RpcParameter {
         // still resolve to NULL before any data is sent. This is the write
         // analogue of the incremental read's pause point: the same serialize
         // method, parked partway through the value.
-        if let RpcValue::Streamed(st) = self.value {
+        if let RpcValue::Streamed(st) = &self.value {
             if self.encrypted.is_some() {
                 return Err(Error::UsageError(
                     "Encrypted parameters cannot be streamed incrementally.".to_string(),
@@ -1514,6 +1521,37 @@ mod tests {
         assert_eq!(streamed_header_bytes(&param, true), expected);
     }
 
+    #[test]
+    fn serialize_data_at_exec_xml_named() {
+        let param = RpcParameter::data_at_exec(
+            Some("@p".to_string()),
+            StatusFlags::NONE,
+            StreamedSqlType::Xml,
+        );
+
+        let mut expected = vec![0x02, 0x40, 0x00, 0x70, 0x00];
+        expected.push(StatusFlags::NONE.bits());
+        expected.extend_from_slice(&type_info_bytes(&SqlType::Xml(None)));
+
+        assert_eq!(streamed_header_bytes(&param, false), expected);
+    }
+
+    #[test]
+    fn serialize_data_at_exec_udt_includes_type_name() {
+        let type_name = UdtTypeName::new(None, Some("dbo".to_string()), "Point".to_string());
+        let param = RpcParameter::data_at_exec(
+            Some("@p".to_string()),
+            StatusFlags::NONE,
+            StreamedSqlType::Udt(type_name.clone()),
+        );
+
+        let mut expected = vec![0x02, 0x40, 0x00, 0x70, 0x00];
+        expected.push(StatusFlags::NONE.bits());
+        expected.extend_from_slice(&type_info_bytes(&SqlType::Udt(type_name, None)));
+
+        assert_eq!(streamed_header_bytes(&param, false), expected);
+    }
+
     /// Every streamed type declares itself in the `sp_executesql` `@params`
     /// string under its own T-SQL name, so the server binds the same type it
     /// sees in TYPE_INFO.
@@ -1523,13 +1561,22 @@ mod tests {
             (StreamedSqlType::NVarcharMax, "nvarchar(MAX)"),
             (StreamedSqlType::VarcharMax, "varchar(MAX)"),
             (StreamedSqlType::VarBinaryMax, "varbinary(MAX)"),
+            (StreamedSqlType::Xml, "xml"),
+            (
+                StreamedSqlType::Udt(UdtTypeName::new(
+                    None,
+                    Some("dbo".to_string()),
+                    "Point".to_string(),
+                )),
+                "[dbo].[Point]",
+            ),
         ];
 
         for (streamed, expected_name) in cases {
             let params = vec![RpcParameter::data_at_exec(
                 Some("@p".to_string()),
                 StatusFlags::NONE,
-                streamed,
+                streamed.clone(),
             )];
             let mut list = String::new();
             build_parameter_list_string(&params, &mut list).unwrap();
