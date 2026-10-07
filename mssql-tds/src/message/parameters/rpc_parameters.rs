@@ -116,9 +116,9 @@ pub enum StreamedSqlType {
     VarcharMax,
     /// MAX binary data.
     VarBinaryMax,
-    /// XML data.
+    /// XML data. Chunks must contain UTF-16LE bytes.
     Xml,
-    /// CLR user-defined type data.
+    /// CLR user-defined type data. Chunks are the opaque CLR-serialized payload.
     Udt(UdtTypeName),
 }
 

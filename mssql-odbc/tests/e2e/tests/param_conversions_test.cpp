@@ -2010,6 +2010,9 @@ TEST_F(ScalarConversionLiveTest, XmlParamRoundTrips) {
     EXPECT_EQ(xml, ExecuteAndReadBack());
 }
 
+// Benefits-from-mock-tds: assert XML TYPE_INFO followed by an unknown-length
+// PLP opener and one chunk per SQLPutData call; the final length alone cannot
+// distinguish streaming from whole-value buffering.
 TEST_F(ScalarConversionLiveTest, LargeXmlStreamsThroughDataAtExecution) {
     std::string xml = "<root>";
     const std::string element = "<v>abcdefghij</v>";
@@ -2031,13 +2034,15 @@ TEST_F(ScalarConversionLiveTest, LargeXmlStreamsThroughDataAtExecution) {
     ASSERT_EQ(SQL_NEED_DATA, SQLParamData(stmt_, &returned));
     constexpr size_t kChunkSize = 4093;
     for (size_t offset = 0; offset < xml.size(); offset += kChunkSize) {
-        const size_t length = std::min(kChunkSize, xml.size() - offset);
+        const size_t length = (std::min)(kChunkSize, xml.size() - offset);
         ASSERT_SQL_OK(SQLPutData(stmt_, xml.data() + offset, static_cast<SQLLEN>(length)),
                       SQL_HANDLE_STMT, stmt_);
     }
     ASSERT_SQL_OK(SQLParamData(stmt_, &returned), SQL_HANDLE_STMT, stmt_);
 
-    EXPECT_EQ(std::to_string(xml.size()), ReadBack());
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(std::to_string(xml.size()), GetColumnChar());
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }
 
 // sql_variant wraps the inner declaration rather than declaring itself, so the
@@ -2919,9 +2924,8 @@ TEST_F(UdtParamLiveTest, AUdtParameterWorksInAWhereClause) {
     EXPECT_EQ("1", ExecuteAndReadBack());
 }
 
-// The byte-level unit tests assert that the UDT identity precedes an open PLP
-// body. This live case verifies that SQLParamData/SQLPutData completes that body
-// and the server resolves it as the named CLR type.
+// Benefits-from-mock-tds: assert the UDT identity precedes an unknown-length
+// PLP opener and that each one-byte SQLPutData call becomes its own chunk.
 TEST_F(UdtParamLiveTest, AUdtParameterCanBeSuppliedAtExecution) {
     std::vector<SQLCHAR> payload = SerializedHierarchyId("/3/");
     ASSERT_FALSE(payload.empty());
@@ -2951,6 +2955,8 @@ TEST_F(UdtParamLiveTest, AUdtParameterCanBeSuppliedAtExecution) {
     EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }
 
+// Benefits-from-mock-tds: assert the large geometry payload is emitted as
+// successive PLP chunks rather than accumulated and serialized as one value.
 TEST_F(UdtParamLiveTest, LargeUdtStreamsThroughDataAtExecution) {
     std::string wkt = "LINESTRING(";
     for (int i = 0; i < 1000; ++i) {
@@ -2977,7 +2983,7 @@ TEST_F(UdtParamLiveTest, LargeUdtStreamsThroughDataAtExecution) {
     ASSERT_EQ(SQL_NEED_DATA, SQLParamData(stmt_, &returned));
     constexpr size_t kChunkSize = 4093;
     for (size_t offset = 0; offset < payload.size(); offset += kChunkSize) {
-        const size_t length = std::min(kChunkSize, payload.size() - offset);
+        const size_t length = (std::min)(kChunkSize, payload.size() - offset);
         ASSERT_SQL_OK(SQLPutData(stmt_, payload.data() + offset, static_cast<SQLLEN>(length)),
                       SQL_HANDLE_STMT, stmt_);
     }

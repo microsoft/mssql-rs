@@ -2255,7 +2255,9 @@ impl TdsClient {
     ///
     /// Streamed parameters must be named and must use one of the
     /// [`StreamedSqlType`] variants. Streaming is not supported when Always
-    /// Encrypted is active.
+    /// Encrypted is active. Chunk bytes must use the representation required by
+    /// the selected variant: XML is UTF-16LE and UDT is the opaque
+    /// CLR-serialized payload.
     ///
     /// # Errors
     /// Returns a usage error for invalid streamed parameters or an active
@@ -2414,6 +2416,7 @@ impl TdsClient {
             if param.name.is_none() {
                 return Err(UsageError("Streamed parameters must be named.".to_string()));
             }
+            param.validate_named_before_send()?;
         }
 
         Ok((streamed_params, materialized_params))
@@ -2496,6 +2499,9 @@ impl TdsClient {
     /// [`end_streamed_param`](Self::end_streamed_param).
     /// Prepared streams use
     /// [`end_execute_prepared_param`](Self::end_execute_prepared_param) instead.
+    ///
+    /// The bytes are written verbatim. XML chunks must be UTF-16LE; UDT chunks
+    /// must contain the opaque CLR-serialized payload.
     ///
     /// Empty chunks are ignored: a zero-length PLP chunk header is the value
     /// terminator, so it must never be emitted mid-value.
@@ -9402,6 +9408,7 @@ mod tests {
     use crate::connection::transport::tds_transport::TdsTransport;
     use crate::core::{CancelHandle, TdsResult};
     use crate::datatypes::row_writer::RowWriter;
+    use crate::error::Error;
     use crate::io::packet_reader::TdsPacketReader;
     use crate::io::reader_writer::{NetworkReader, NetworkWriter};
     use crate::io::token_stream::{
@@ -18115,6 +18122,20 @@ mod tests {
             StatusFlags::NONE,
             StreamedSqlType::VarBinaryMax,
         )
+    }
+
+    #[test]
+    fn streamed_udt_metadata_is_validated_before_the_rpc_opens() {
+        use crate::datatypes::sql_udt::UdtTypeName;
+
+        let param = RpcParameter::data_at_exec(
+            Some("@v".to_string()),
+            StatusFlags::NONE,
+            StreamedSqlType::Udt(UdtTypeName::new(None, None, "x".repeat(256))),
+        );
+
+        let error = TdsClient::split_and_validate_streamed_params(vec![param]).unwrap_err();
+        assert!(matches!(error, Error::UsageError(_)));
     }
 
     /// A single streamed chunk is framed as `[u32 len][bytes]` and the value is

@@ -68,7 +68,7 @@ use crate::conversion::numeric::{
 };
 use crate::conversion::param_buffer::{AppValue, Indicator, read_indicator, read_param_value};
 use crate::handles::desc::UdtNames;
-use crate::params::BoundParam;
+use crate::params::{BoundParam, conversion_matrix::is_supported_conversion};
 
 /// Why a bound parameter could not be turned into an RPC parameter.
 ///
@@ -819,8 +819,12 @@ pub(crate) fn dae_plan(
         SQL_VARCHAR | SQL_LONGVARCHAR => DaePlan::Stream(StreamedSqlType::VarcharMax),
         SQL_WVARCHAR | SQL_WLONGVARCHAR => DaePlan::Stream(StreamedSqlType::NVarcharMax),
         SQL_VARBINARY | SQL_LONGVARBINARY => DaePlan::Stream(StreamedSqlType::VarBinaryMax),
-        SQL_SS_XML => DaePlan::Stream(StreamedSqlType::Xml),
-        SQL_SS_UDT => DaePlan::Stream(StreamedSqlType::Udt(udt_type_name(udt_names)?)),
+        SQL_SS_XML if is_supported_conversion(c_type, sql_type) => {
+            DaePlan::Stream(StreamedSqlType::Xml)
+        }
+        SQL_SS_UDT if is_supported_conversion(c_type, sql_type) => {
+            DaePlan::Stream(StreamedSqlType::Udt(udt_type_name(udt_names)?))
+        }
         _ => DaePlan::Buffer,
     })
 }
@@ -2147,7 +2151,6 @@ mod tests {
         SQL_C_TYPE_TIMESTAMP, SQL_C_UBIGINT, SQL_C_WCHAR, SQL_DATA_AT_EXEC, SQL_DEFAULT_PARAM,
         SQL_NO_TOTAL, SQL_NTS, SQL_NULL_DATA, SQL_PARAM_INPUT, SQL_SS_UDT, SqlULen,
     };
-    use crate::params::conversion_matrix::is_supported_conversion;
     use std::ffi::c_void;
 
     /// A `ColumnSize` past every non-`max` limit, as an application binding an
@@ -4303,6 +4306,9 @@ mod tests {
             (SQL_C_CHAR, SQL_CHAR),
             (SQL_C_WCHAR, SQL_WCHAR),
             (SQL_C_BINARY, SQL_BINARY),
+            (SQL_C_BINARY, SQL_SS_XML),
+            (SQL_C_CHAR, SQL_SS_UDT),
+            (SQL_C_WCHAR, SQL_SS_UDT),
             (SQL_C_CHAR, SQL_INTEGER),
             (SQL_C_WCHAR, SQL_BIGINT),
         ] {
