@@ -122,7 +122,8 @@ Use `ODBCTestUtils::Utf8ToNativeClient` to convert UTF-8 expected text into nati
 AB#47565), `SQL_C_WCHAR` expectations, or raw `SQL_C_BINARY` wire bytes.
 Compare native output with explicit byte lengths, not C-string semantics:
 UTF-32LE contains embedded zero bytes. Chunk helpers use sentinel-filled buffers
-to locate the final terminator without treating those embedded zeros as the end.
+for truncated chunks and the final successful call's indicator to locate the
+terminator, preserving embedded zeros without counting initialized padding.
 
 `GetDataUtf16Test.NativeClientChar*` covers ordinary/MAX varchar and nvarchar,
 server collations different from the client, terminator-only probes, tiny

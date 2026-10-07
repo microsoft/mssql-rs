@@ -474,6 +474,7 @@ fn sql_get_data_safe(
             row.consumed = row.consumed.max(col_index);
             let variant_base = row.variant_bases.get(col_index - 1).copied().flatten();
             stmt_state.last_captured = Some((col_index, value));
+            stmt_state.captured_narrow_copy = None;
             stmt_state.last_variant_base = variant_base.map(|base| (col_index, base));
             let rc = write_captured_column(
                 &mut stmt_state,
@@ -563,6 +564,28 @@ fn can_copy_narrow_value(output: TextOutput, value: &ColumnValues) -> bool {
                         && matches!(value.encoding_type(), EncodingType::Utf16)
                         && is_utf16_ascii(&value.bytes))
         )
+}
+
+fn captured_can_copy_narrow(state: &mut StmtState) -> bool {
+    let encoding = state.text_output.encoding;
+    if encoding.is_utf8() {
+        return true;
+    }
+    if let Some((cached_encoding, direct)) = state.captured_narrow_copy
+        && cached_encoding == encoding
+    {
+        return direct;
+    }
+    let direct = state
+        .last_captured
+        .as_ref()
+        .is_some_and(|(_, value)| can_copy_narrow_value(state.text_output, value));
+    state.captured_narrow_copy = Some((encoding, direct));
+    #[cfg(test)]
+    {
+        state.captured_narrow_copy_scans += 1;
+    }
+    direct
 }
 
 fn is_utf16_ascii(bytes: &[u8]) -> bool {
@@ -1124,6 +1147,7 @@ fn prepare_captured_plp_text(
         }
     }
     *value = SqlString::new(bytes, encoding);
+    state.captured_narrow_copy = None;
     state.direct_text_target = Some((col_index, target_type));
     Ok(())
 }
@@ -1181,6 +1205,7 @@ fn normalize_captured_plp_suffix(
         // A byte/surrogate fragment is still readable in its original target.
         // A different encoding or typed conversion must validate that fragment.
         state.direct_text_target = Some((col_index, previous_target));
+        state.captured_narrow_copy = None;
     }
     state.partial_text_offset = None;
     if let Some(wire) = state.captured_plp_wire.as_mut() {
@@ -1277,6 +1302,7 @@ fn write_captured_column(
     // column type leaves the value resident and re-readable on the next call.
     // The presence check above already returned 24000; repeating it here keeps
     // the failure a diagnostic rather than a panic across the FFI boundary.
+    let direct = target_type != SQL_C_CHAR || captured_can_copy_narrow(stmt_state);
     let Some((_, value)) = stmt_state.last_captured.as_ref() else {
         post_sql_error(
             stmt_state,
@@ -1356,7 +1382,6 @@ fn write_captured_column(
     // `target_type`, so `target_value_ptr` is null or writable for that many
     // elements; `strlen_or_ind_ptr` is null or writable for one `SqlLen`.
     // `value` is a captured column that neither pointer aliases.
-    let direct = target_type != SQL_C_CHAR || can_copy_narrow_value(stmt_state.text_output, value);
     if let Some((truncated, consumed, remaining)) = direct
         .then(|| unsafe {
             try_write_direct_captured_string_chunk(
@@ -1735,6 +1760,7 @@ fn apply_cursor_result(
         }) => {
             if let Ok(mut stmt_state) = stmt.inner.lock() {
                 stmt_state.last_captured = Some((column_number, value));
+                stmt_state.captured_narrow_copy = None;
                 stmt_state.last_variant_base = variant_base.map(|base| (column_number, base));
                 stmt_state.row_exhausted = false;
                 stmt_state.partial_text_offset = None;
@@ -2512,6 +2538,7 @@ fn stream_active_plp_chunk_once<'a>(
                 EncodingType::Utf8,
             )),
         ));
+        state.captured_narrow_copy = None;
         state.captured_plp_wire = Some(CapturedPlpWire {
             column: col_index,
             bytes: std::mem::take(&mut progress.typed_wire),
@@ -5244,6 +5271,7 @@ mod tests {
         s.column_metadata = int_columns(2);
         s.row_positioned = true;
         s.last_captured = Some((1, value));
+        s.captured_narrow_copy = None;
     }
 
     fn client_code_page(h: &TestHandles, code_page: u32, warn: bool) {
@@ -9120,6 +9148,134 @@ mod tests {
                     assert_eq!(received, expected.bytes.as_ref());
                 }
             }
+        }
+    }
+
+    #[test]
+    fn captured_narrow_continuations_scan_client_copy_eligibility_once() {
+        for retained_plp in [false, true] {
+            let h = TestHandles::with_env_dbc_stmt();
+            client_code_page(&h, 1252, false);
+            let text = "A".repeat(8192);
+            if retained_plp {
+                prefetched_text_stream(
+                    &h,
+                    PlpEncoding::Utf8Text,
+                    Some(encoding_rs::UTF_8.into()),
+                    text.as_bytes().to_vec(),
+                    Some(8192),
+                );
+                let mut number = 0_i32;
+                let mut indicator = 0;
+                assert_eq!(
+                    unsafe {
+                        sql_get_data(
+                            h.stmt,
+                            1,
+                            SQL_C_SLONG,
+                            (&mut number as *mut i32).cast(),
+                            4,
+                            &mut indicator,
+                        )
+                    },
+                    SQL_ERROR
+                );
+            } else {
+                stmt_with_captured(
+                    &h,
+                    ColumnValues::String(SqlString::from_utf8_string(text.clone())),
+                );
+            }
+            let mut received = Vec::new();
+            for index in 0..text.len() {
+                let mut output = [0xcc; 2];
+                let mut indicator = 0;
+                assert_eq!(
+                    unsafe {
+                        sql_get_data(
+                            h.stmt,
+                            1,
+                            SQL_C_CHAR,
+                            output.as_mut_ptr().cast(),
+                            2,
+                            &mut indicator,
+                        )
+                    },
+                    if index + 1 == text.len() {
+                        SQL_SUCCESS
+                    } else {
+                        SQL_SUCCESS_WITH_INFO
+                    }
+                );
+                assert_eq!(output, [b'A', 0]);
+                received.push(output[0]);
+            }
+            assert_eq!(received, text.as_bytes());
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            assert_eq!(stmt.inner.lock().unwrap().captured_narrow_copy_scans, 1);
+        }
+    }
+
+    #[test]
+    fn captured_narrow_copy_cache_refreshes_for_replacement_and_normalization() {
+        let h = TestHandles::with_env_dbc_stmt();
+        client_code_page(&h, 1252, false);
+        stmt_with_captured(
+            &h,
+            ColumnValues::String(SqlString::from_utf8_string("ABC".into())),
+        );
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            assert!(captured_can_copy_narrow(&mut state));
+            assert_eq!(state.captured_narrow_copy_scans, 1);
+        }
+        stmt_with_captured(
+            &h,
+            ColumnValues::String(SqlString::from_utf8_string("éBC".into())),
+        );
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.captured_plp_wire = Some(CapturedPlpWire {
+                column: 1,
+                bytes: "éBC".as_bytes().to_vec(),
+                offset: 0,
+                text_target: None,
+            });
+            prepare_captured_plp_text(&mut state, 1, SQL_C_WCHAR).unwrap();
+            prepare_captured_plp_text(&mut state, 1, SQL_C_CHAR).unwrap();
+            assert_eq!(state.direct_text_target, Some((1, SQL_C_CHAR)));
+            assert!(!captured_can_copy_narrow(&mut state));
+            assert_eq!(state.captured_narrow_copy_scans, 2);
+        }
+        let mut output = [0xcc_u8; 2];
+        let mut indicator = 0;
+        assert_eq!(
+            unsafe {
+                sql_get_data(
+                    h.stmt,
+                    1,
+                    SQL_C_CHAR,
+                    output.as_mut_ptr().cast(),
+                    2,
+                    &mut indicator,
+                )
+            },
+            SQL_SUCCESS_WITH_INFO
+        );
+        assert_eq!(output, [0xe9, 0]);
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            assert_eq!(state.captured_narrow_copy_scans, 2);
+            prepare_captured_plp_text(&mut state, 1, SQL_C_WCHAR).unwrap();
+            prepare_captured_plp_text(&mut state, 1, SQL_C_CHAR).unwrap();
+            assert!(captured_can_copy_narrow(&mut state));
+            assert_eq!(state.captured_narrow_copy_scans, 3);
+            state.text_output.encoding = ClientEncoding::for_code_page(932).unwrap();
+            assert!(captured_can_copy_narrow(&mut state));
+            assert_eq!(state.captured_narrow_copy_scans, 4);
+            state.reset_row_stream();
+            assert_eq!(state.captured_narrow_copy, None);
         }
     }
 

@@ -570,6 +570,10 @@ pub(crate) struct StmtState {
     pub(crate) partial_text_offset: Option<(usize, usize)>,
     /// Direct string path already validated for `(1-based column, C target type)`.
     pub(crate) direct_text_target: Option<(usize, SqlSmallInt)>,
+    /// Client-copy eligibility for the current captured value, independent of source validation.
+    pub(crate) captured_narrow_copy: Option<(ClientEncoding, bool)>,
+    #[cfg(test)]
+    pub(crate) captured_narrow_copy_scans: usize,
     /// Rows affected by the last execution, reported by `SQLRowCount`. `-1`
     /// means "not available" (no statement executed yet, a result-returning
     /// SELECT, DDL, or `SET NOCOUNT ON`) — matching msodbcsql's
@@ -1510,6 +1514,7 @@ impl StmtState {
         self.current_row_last_col = 0;
         self.partial_text_offset = None;
         self.direct_text_target = None;
+        self.captured_narrow_copy = None;
     }
 
     /// Positions the row stream on a freshly fetched row: clears all per-row
@@ -1688,6 +1693,9 @@ impl StmtHandle {
                 current_row_last_col: 0,
                 partial_text_offset: None,
                 direct_text_target: None,
+                captured_narrow_copy: None,
+                #[cfg(test)]
+                captured_narrow_copy_scans: 0,
                 row_count: -1,
                 pending_row_counts: VecDeque::new(),
                 row_array_size: 1,

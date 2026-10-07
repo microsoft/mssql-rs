@@ -175,6 +175,9 @@ converted carry retains coalesced substitution ranges until those bytes are
 consumed, so tiny continuations do not lose warnings or repeat them for an
 already-delivered substitution. Range metadata is allocated only for lossy
 conversion.
+Captured narrow continuations cache client-copy eligibility separately from
+source validation, avoiding full-value ASCII scans on each small read. Replacing
+or normalizing the captured value invalidates that eligibility.
 
 Use `SQL_C_WCHAR` for lossless Unicode retrieval; it remains UTF-16LE.
 `SQL_C_BINARY` continues to return unconverted wire bytes. mssql-python's

@@ -33,6 +33,17 @@ std::string RepeatToken(const std::string& token, size_t count) {
     return out;
 }
 
+size_t CharChunkWrittenLength(const std::vector<SQLCHAR>& buf, SQLRETURN rc, SQLLEN ind) {
+    // Direct wire reads may initialize unused output slots. The final indicator
+    // counts payload bytes, including embedded NULs, rather than initialized slots.
+    if (rc == SQL_SUCCESS && ind >= 0 && static_cast<size_t>(ind) < buf.size()) {
+        return static_cast<size_t>(ind) + 1;
+    }
+    size_t written = buf.size();
+    while (written != 0 && buf[written - 1] == 0xCC) --written;
+    return written;
+}
+
 // Streams one SQL_C_CHAR column across as many SQLGetData calls as it takes,
 // using a small buffer. Returns the fully assembled value. Sets `*final_ind`
 // to the indicator reported on the final (SQL_SUCCESS) call when provided.
@@ -51,8 +62,7 @@ std::string ReadCharDataInChunks(SQLHSTMT stmt, SQLUSMALLINT col, size_t buf_siz
         if (rc != SQL_SUCCESS && rc != SQL_SUCCESS_WITH_INFO) {
             break;
         }
-        size_t written = buf.size();
-        while (written != 0 && buf[written - 1] == 0xCC) --written;
+        const size_t written = CharChunkWrittenLength(buf, rc, ind);
         if (written == 0 || buf[written - 1] != 0) {
             ADD_FAILURE() << "SQLGetData did not write a terminator";
             break;
@@ -963,6 +973,15 @@ TEST(NativeClientEncodingTest, ConvertsValidUtf8AndPreservesEmbeddedNul) {
                   ODBCTestUtils::Utf8ToNativeClient("caf\xC3\xA9 \xE2\x82\xAC"));
     }
 #endif
+}
+
+TEST(NativeClientEncodingTest, ChunkLengthExcludesInitializedPaddingButPreservesNuls) {
+    const std::vector<SQLCHAR> padded = {'A', 0, 'B', 0, 0, 0, 0, 0};
+    EXPECT_EQ(4u, CharChunkWrittenLength(padded, SQL_SUCCESS, 3));
+    const std::vector<SQLCHAR> utf32 = {'A', 0, 0, 0, 0, 0xCC, 0xCC};
+    EXPECT_EQ(5u, CharChunkWrittenLength(utf32, SQL_SUCCESS, 4));
+    EXPECT_EQ(5u, CharChunkWrittenLength(utf32, SQL_SUCCESS_WITH_INFO, SQL_NO_TOTAL));
+    EXPECT_EQ(5u, CharChunkWrittenLength(utf32, SQL_SUCCESS_WITH_INFO, 40));
 }
 
 // AB#47564: the bytes a narrow client (including mssql-python) receives are
