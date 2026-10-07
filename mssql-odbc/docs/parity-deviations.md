@@ -873,8 +873,10 @@ msodbcsql build is measured.
     msodbcsql has no statement-state check for these writes:
     `SQLSetDescField`'s preconditions (`odbc/sqlcdesc.cpp`) check only handle
     type, the IRD two-field whitelist, TVP nesting and `RecNumber`, then assign
-    `rgfArrayStatus` / `pRowsProcessed` unconditionally, and `SQLSetStmtAttr`
-    (`odbc/sqlcmisc.cpp`) refuses only while an *async* call is in progress.
+    `rgfArrayStatus` / `pRowsProcessed` unconditionally. `SQLSetStmtAttr`'s
+    `IsSetStmtOptionValid` (`odbc/sqlcmisc.cpp`) only range-checks these
+    attributes; its one `HY010` is scoped to setting `SQL_ATTR_ASYNC_ENABLE`
+    itself, so none of them is refused for statement state, async or not.
 
     This driver refuses, through both spellings, a write to a descriptor that a
     statement is currently fetching through (ARD or IRD,
