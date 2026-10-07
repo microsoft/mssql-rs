@@ -840,7 +840,6 @@ fn fetch_scroll_safe(
     // fetch on the same statement, so the snapshot cannot go stale under us.
     let (
         ard,
-        row_array_size,
         rows_fetched_ptr,
         row_status_ptr,
         column_count,
@@ -892,7 +891,7 @@ fn fetch_scroll_safe(
         if stmt_state.result_set_exhausted {
             let rows_fetched_ptr = stmt_state.rows_fetched_ptr;
             let row_status_ptr = stmt_state.row_status_ptr;
-            let row_array_size = stmt_state.row_array_size;
+            let ard = stmt_state.effective_ard(stmt);
             stmt_state.reset_row_stream();
             // That same peek can have found a trailing SQL Server error
             // instead of a clean end of set (see
@@ -907,9 +906,74 @@ fn fetch_scroll_safe(
             } else {
                 SQL_NO_DATA
             };
+            // `row_status_ptr` is snapshotted above under this lock, but the
+            // extent it is walked with is read under the DESC lock after this
+            // one is released. Claiming the statement across that window keeps
+            // the pair consistent: otherwise a concurrent
+            // `SQLSetStmtAttrW(SQL_ATTR_ROW_ARRAY_SIZE, n)` grows the extent
+            // after the pointer was captured and `mark_no_rows` writes past the
+            // end of the application's array. Claimed only when there is an
+            // array to walk, so the common terminal fetch takes no descriptor
+            // lock at all.
+            let claimed = !row_status_ptr.is_null();
+            if claimed {
+                stmt_state.set_state(STMT_STATE_FETCH_IN_PROGRESS);
+            }
             drop(stmt_state);
             unsafe { write_if_some(rows_fetched_ptr, 0) };
-            mark_no_rows(row_status_ptr, 0, row_array_size);
+            // The rowset extent is the ARD header's `SQL_DESC_ARRAY_SIZE`
+            // (AB#48943), so reading it needs the DESC lock the STMT lock was
+            // just dropped for. A concurrent free must not turn a known
+            // `SQL_NO_DATA` into an error, so a freed descriptor returns the
+            // already-computed verdict unchanged rather than walking with a
+            // guessed extent — the status array is then left holding whatever
+            // the previous rowset wrote into it, since there is no extent that
+            // can safely be walked. A *poisoned* lock is an internal failure,
+            // and reporting normal completion through it would violate the
+            // crate's poisoned-mutex contract.
+            //
+            // Filling the status array here is a divergence from msodbcsql,
+            // which returns `SQL_NO_DATA` with zero rows fetched and leaves the
+            // array untouched (measured on ADO build 180837, Linux and Windows,
+            // against msodbcsql 18.6.2.1). It predates AB#48943 and lives only
+            // on this path, so it is recorded here rather than in
+            // `docs/parity-deviations.md`, whose entry criteria exclude a
+            // difference confined to one function. The partial-rowset tail fill
+            // on the *non*-terminal path is not divergent. Pinned by
+            // `exhausted_cursor_fast_path_marks_the_status_array_from_the_ard`.
+            if claimed {
+                let extent = ard_array_size(ard);
+                if let ArdExtent::Size(extent) = extent {
+                    mark_no_rows(row_status_ptr, 0, extent);
+                }
+                let poisoned = matches!(extent, ArdExtent::Poisoned);
+                if poisoned {
+                    error!("SQLFetchScroll: ard mutex poisoned sizing the row status array");
+                }
+                // Released only after the walk, in the same acquisition that
+                // posts any diagnostic: dropping the claim earlier would
+                // reopen the window it exists to close. A poisoned statement
+                // lock cannot be absorbed here — the claim would stay set and
+                // the call would still report `SQL_NO_DATA`, announcing normal
+                // completion through an internal synchronization failure.
+                let Ok(mut stmt_state) = stmt.inner.lock() else {
+                    error!("SQLFetchScroll: stmt mutex poisoned releasing the fetch claim");
+                    return SQL_ERROR;
+                };
+                stmt_state.clear_state(STMT_STATE_FETCH_IN_PROGRESS);
+                if poisoned {
+                    post_sql_error(
+                        &mut stmt_state,
+                        SQLSTATE_HY000,
+                        0,
+                        "Internal error reading the row array size",
+                    );
+                }
+                drop(stmt_state);
+                if poisoned {
+                    return SQL_ERROR;
+                }
+            }
             debug!(?rc, "SQLFetchScroll: result set already known exhausted");
             return rc;
         }
@@ -922,7 +986,8 @@ fn fetch_scroll_safe(
         // Claiming the statement here is what stops a concurrent SQLBindCol
         // from freeing an application buffer the fill loop is still reading
         // through after this lock is released; the mutating entry points
-        // refuse while this is set.
+        // refuse while this is set. Set before the ARD is read below so no
+        // rebind can slip in between the read and the claim.
         stmt_state.set_state(STMT_STATE_FETCH_IN_PROGRESS);
         let trailing_utf16_plp = stmt_state
             .column_metadata
@@ -931,7 +996,6 @@ fn fetch_scroll_safe(
             == Some(PlpEncoding::Utf16Text);
         (
             ard,
-            stmt_state.row_array_size,
             stmt_state.rows_fetched_ptr,
             stmt_state.row_status_ptr,
             stmt_state.column_metadata.len(),
@@ -948,7 +1012,7 @@ fn fetch_scroll_safe(
     // statement is not left permanently stuck mid-fetch: silently treating it
     // as "nothing bound" would advance the cursor and report success for a
     // rowset the application never actually got the columns it asked for.
-    let bindings: Vec<ColumnBinding> = {
+    let (row_array_size, bindings): (SqlULen, Vec<ColumnBinding>) = {
         // `ard` can be an explicit descriptor resolved under the STMT lock,
         // already dropped by now — re-check liveness right before
         // dereferencing to narrow (not fully close) the race against a
@@ -981,6 +1045,7 @@ fn fetch_scroll_safe(
             }
             return SQL_ERROR;
         };
+        let row_array_size = desc_state.header.array_size;
         let mut bindings = ColumnBinding::all_from_ard_state(&desc_state);
         drop(desc_state);
         if bindings
@@ -999,7 +1064,7 @@ fn fetch_scroll_safe(
                 .collect();
             resolve_default_bindings(&mut bindings, &column_sql_types, odbc_version);
         }
-        bindings
+        (row_array_size, bindings)
     };
     let get_data_fetch = row_array_size == 1 && bindings.is_empty();
     let reusable_get_data_row = if get_data_fetch {
@@ -1590,6 +1655,37 @@ fn dispatch_rows(row_budget: SqlULen, mut dispatch: impl FnMut() -> bool) {
         if !dispatch() {
             break;
         }
+    }
+}
+
+/// Why the exhausted fast path could not size a row status array walk.
+enum ArdExtent {
+    /// The effective ARD's `SQL_DESC_ARRAY_SIZE`.
+    Size(SqlULen),
+    /// The descriptor was freed concurrently. There is no extent to walk with,
+    /// but nothing is internally broken.
+    Gone,
+    /// The descriptor's mutex is poisoned — an internal synchronization
+    /// failure, which the crate requires be reported as `SQL_ERROR` rather
+    /// than absorbed (`.github/instructions/mssql-odbc.instructions.md`,
+    /// "No panics").
+    Poisoned,
+}
+
+/// Reads `SQL_DESC_ARRAY_SIZE` off a descriptor whose handle was resolved under
+/// a STMT lock that has since been dropped.
+///
+/// The two failure modes are kept apart deliberately: a freed descriptor only
+/// costs the caller an extent it can do without, while a poisoned lock is an
+/// internal failure that must not be reported as normal completion.
+fn ard_array_size(ard: SqlHandle) -> ArdExtent {
+    if crate::handles::live_type(ard) != Some(crate::handles::HandleType::Desc) {
+        return ArdExtent::Gone;
+    }
+    let desc = unsafe { handle_from_raw::<DescHandle>(ard) };
+    match desc.inner.lock() {
+        Ok(desc_state) => ArdExtent::Size(desc_state.header.array_size),
+        Err(_) => ArdExtent::Poisoned,
     }
 }
 
@@ -2495,9 +2591,10 @@ mod tests {
     use super::*;
     use crate::api::bind_col::sql_bind_col;
     use crate::api::odbc_types::{
-        SQL_C_BINARY, SQL_C_SLONG, SQL_DESC_CONCISE_TYPE, SQL_DESC_DATA_PTR,
-        SQL_DESC_INDICATOR_PTR, SQL_DESC_OCTET_LENGTH_PTR, SQL_FETCH_ABSOLUTE, SQL_FETCH_FIRST,
-        SQL_FETCH_LAST, SQL_FETCH_PRIOR, SQL_FETCH_RELATIVE, SQL_GUID, SQL_INTEGER, SQL_WVARCHAR,
+        SQL_ATTR_ROW_ARRAY_SIZE, SQL_C_BINARY, SQL_C_SLONG, SQL_DESC_ARRAY_SIZE,
+        SQL_DESC_CONCISE_TYPE, SQL_DESC_DATA_PTR, SQL_DESC_INDICATOR_PTR,
+        SQL_DESC_OCTET_LENGTH_PTR, SQL_FETCH_ABSOLUTE, SQL_FETCH_FIRST, SQL_FETCH_LAST,
+        SQL_FETCH_PRIOR, SQL_FETCH_RELATIVE, SQL_GUID, SQL_INTEGER, SQL_WVARCHAR,
     };
     use crate::api::sqlstate::SQLSTATE_HY106;
     use crate::api::sqlstate::{ERR_CONNECTION_BUSY, SQLSTATE_24000, SQLSTATE_HY000};
@@ -2512,6 +2609,11 @@ mod tests {
         tds_client_from_mixed_lob_prefix_rows, tds_client_from_partial_int_rows,
         tds_client_from_tokens,
     };
+
+    fn set_row_array_size(h: &TestHandles, value: SqlULen) {
+        let ard = unsafe { handle_from_raw::<DescHandle>(h.ard()) };
+        ard.inner.lock().unwrap().header.array_size = value;
+    }
 
     fn binding(
         column_number: SqlUSmallInt,
@@ -3151,10 +3253,10 @@ mod tests {
             state.begin_result_set(int_columns(1));
             state.max_rows = 5;
             state.rows_returned = 4;
-            state.row_array_size = 4;
             state.rows_fetched_ptr = &mut rows_fetched;
             state.row_status_ptr = statuses.as_mut_ptr();
         }
+        set_row_array_size(&h, 4);
         assert_eq!(
             unsafe {
                 sql_bind_col(
@@ -3195,8 +3297,8 @@ mod tests {
             let mut state = stmt.inner.lock().unwrap();
             state.max_rows = 0;
             state.rows_returned = 0;
-            state.row_array_size = 1;
         }
+        set_row_array_size(&h, 1);
         assert_eq!(
             unsafe { sql_fetch_scroll(h.stmt, SQL_FETCH_NEXT, 0) },
             SQL_SUCCESS
@@ -3402,7 +3504,7 @@ mod tests {
         let multi = TestHandles::with_env_dbc_stmt();
         mixed_lob_stmt(&multi, vec![vec![10, 20], vec![30, 40]]);
         let multi_stmt = unsafe { handle_from_raw::<StmtHandle>(multi.stmt) };
-        multi_stmt.inner.lock().unwrap().row_array_size = 2;
+        set_row_array_size(&multi, 2);
         assert_eq!(
             unsafe { sql_fetch_scroll(multi.stmt, SQL_FETCH_NEXT, 0) },
             SQL_SUCCESS
@@ -3499,8 +3601,8 @@ mod tests {
             let mut state = stmt.inner.lock().unwrap();
             state.set_state(STMT_STATE_CURSOR_OPEN);
             state.begin_result_set(int_columns(1));
-            state.row_array_size = 2;
         }
+        set_row_array_size(&h, 2);
         assert_eq!(
             unsafe {
                 sql_bind_col(
@@ -3563,8 +3665,8 @@ mod tests {
             let mut state = stmt.inner.lock().unwrap();
             state.set_state(STMT_STATE_CURSOR_OPEN);
             state.begin_result_set(int_columns(1));
-            state.row_array_size = 2;
         }
+        set_row_array_size(&h, 2);
 
         // Bind column 1 entirely through SQLSetDescField, never SQLBindCol.
         // The descriptor API exposes SQL_DESC_INDICATOR_PTR and
@@ -3987,6 +4089,405 @@ mod tests {
             let s = stmt.inner.lock().unwrap();
             assert_eq!(s.diag_records.last().unwrap().sql_state, SQLSTATE_HY106);
         }
+    }
+
+    /// The exhausted fast path fills the unused tail of the row status array,
+    /// and its extent is the ARD header's `SQL_DESC_ARRAY_SIZE` (AB#48943) —
+    /// the same storage `SQL_ATTR_ROW_ARRAY_SIZE` writes. Reading it needs the
+    /// DESC lock, which is why this path drops the STMT lock before the walk;
+    /// the walk must still happen, and must still cover the whole rowset.
+    #[test]
+    fn exhausted_cursor_fast_path_marks_the_status_array_from_the_ard() {
+        let h = TestHandles::with_env_dbc_stmt();
+        open_cursor(&h);
+        let mut rows_fetched: SqlULen = 99;
+        let mut statuses = [0xBEEF_u16; 3];
+        {
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let mut s = stmt.inner.lock().unwrap();
+            s.result_set_exhausted = true;
+            s.rows_fetched_ptr = &mut rows_fetched;
+            s.row_status_ptr = statuses.as_mut_ptr();
+        }
+        // Sized through the descriptor spelling, never through StmtState.
+        assert_eq!(
+            unsafe {
+                crate::api::set_desc_field::sql_set_desc_field_w(
+                    h.ard(),
+                    0,
+                    SQL_DESC_ARRAY_SIZE as SqlSmallInt,
+                    3 as SqlPointer,
+                    0,
+                )
+            },
+            SQL_SUCCESS
+        );
+
+        assert_eq!(
+            unsafe { sql_fetch_scroll(h.stmt, SQL_FETCH_NEXT, 0) },
+            SQL_NO_DATA
+        );
+        assert_eq!(rows_fetched, 0);
+        assert_eq!(statuses, [SQL_ROW_NOROW; 3]);
+    }
+
+    /// The exhausted fast path snapshots `row_status_ptr` under the STMT lock
+    /// but reads the extent under the DESC lock after releasing it. Claiming
+    /// `STMT_STATE_FETCH_IN_PROGRESS` before dropping the STMT lock is what
+    /// keeps the pair consistent; this pins that the setter is actually
+    /// refused.
+    ///
+    /// The helper thread holds the ARD lock for the whole check, parking the
+    /// fetch inside the window rather than racing it. It takes the
+    /// DESC-then-STMT order the crate forbids in driver code, which is safe
+    /// only because the fetch releases the STMT lock before reaching for the
+    /// DESC one — there is no hold-and-wait cycle to close.
+    #[test]
+    fn exhausted_fast_path_refuses_a_concurrent_rowset_resize() {
+        use std::sync::mpsc;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        open_cursor(&h);
+        // One element bound, and one is the extent the fetch must keep using.
+        let mut statuses = [0xBEEF_u16; 1];
+        set_row_array_size(&h, 1);
+        {
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let mut s = stmt.inner.lock().unwrap();
+            s.result_set_exhausted = true;
+            s.row_status_ptr = statuses.as_mut_ptr();
+        }
+
+        // Raw handles are not `Send`; move them as addresses instead.
+        let stmt_addr = h.stmt as usize;
+        let ard_addr = h.ard() as usize;
+        let (holding_tx, holding_rx) = mpsc::channel::<()>();
+        let (rc_tx, rc_rx) = mpsc::channel::<SqlReturn>();
+
+        let helper = std::thread::spawn(move || {
+            let ard = unsafe { handle_from_raw::<DescHandle>(ard_addr as SqlHandle) };
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(stmt_addr as SqlHandle) };
+            let guard = ard.inner.lock().unwrap();
+            holding_tx.send(()).unwrap();
+
+            // The fetch cannot leave the window while this thread holds the
+            // ARD lock, so polling for the claim terminates rather than racing.
+            let mut claimed = false;
+            for _ in 0..100_000 {
+                if stmt
+                    .inner
+                    .lock()
+                    .map(|s| s.has_state(STMT_STATE_FETCH_IN_PROGRESS))
+                    .unwrap_or(false)
+                {
+                    claimed = true;
+                    break;
+                }
+                std::thread::yield_now();
+            }
+            assert!(claimed, "the fast path must claim the statement");
+
+            let rc = unsafe {
+                crate::api::set_stmt_attr::sql_set_stmt_attr_w(
+                    stmt_addr as SqlHandle,
+                    SQL_ATTR_ROW_ARRAY_SIZE,
+                    4 as SqlPointer,
+                    0,
+                )
+            };
+            rc_tx.send(rc).unwrap();
+            drop(guard);
+        });
+
+        holding_rx.recv().unwrap();
+        let fetch_rc = unsafe { sql_fetch_scroll(h.stmt, SQL_FETCH_NEXT, 0) };
+        helper.join().unwrap();
+
+        assert_eq!(
+            rc_rx.recv().unwrap(),
+            SQL_ERROR,
+            "resizing the rowset mid-fetch must be refused, not silently applied"
+        );
+        assert_eq!(fetch_rc, SQL_NO_DATA);
+        assert_eq!(
+            statuses, [SQL_ROW_NOROW; 1],
+            "the one bound element is written, and only that one"
+        );
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        assert!(
+            !stmt
+                .inner
+                .lock()
+                .unwrap()
+                .has_state(STMT_STATE_FETCH_IN_PROGRESS),
+            "the claim must be released before returning"
+        );
+    }
+
+    /// Releasing the claim needs the STMT lock back, and that lock can be
+    /// poisoned while the fetch waits on the ARD. Absorbing it would leave the
+    /// claim set *and* report `SQL_NO_DATA`, which the crate's poisoned-mutex
+    /// contract forbids. The ARD itself is readable here, so only the relock
+    /// can produce the error.
+    #[test]
+    fn exhausted_fast_path_errors_when_the_claim_cannot_be_released() {
+        use std::sync::mpsc;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        open_cursor(&h);
+        let mut statuses = [0xBEEF_u16; 2];
+        set_row_array_size(&h, 2);
+        {
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let mut s = stmt.inner.lock().unwrap();
+            s.result_set_exhausted = true;
+            s.row_status_ptr = statuses.as_mut_ptr();
+        }
+
+        let stmt_addr = h.stmt as usize;
+        let ard_addr = h.ard() as usize;
+        let (holding_tx, holding_rx) = mpsc::channel::<()>();
+
+        let helper = std::thread::spawn(move || {
+            let ard = unsafe { handle_from_raw::<DescHandle>(ard_addr as SqlHandle) };
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(stmt_addr as SqlHandle) };
+            let guard = ard.inner.lock().unwrap();
+            holding_tx.send(()).unwrap();
+
+            // Holding the ARD lock parks the fetch between dropping the STMT
+            // lock and reacquiring it, which is the only window in which this
+            // poisoning is reachable.
+            let mut claimed = false;
+            for _ in 0..100_000 {
+                if stmt
+                    .inner
+                    .lock()
+                    .map(|s| s.has_state(STMT_STATE_FETCH_IN_PROGRESS))
+                    .unwrap_or(false)
+                {
+                    claimed = true;
+                    break;
+                }
+                std::thread::yield_now();
+            }
+            assert!(claimed, "the fast path must claim the statement");
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _g = stmt.inner.lock().unwrap();
+                panic!("poison the stmt lock");
+            }));
+            drop(guard);
+        });
+
+        holding_rx.recv().unwrap();
+        let rc = unsafe { sql_fetch_scroll(h.stmt, SQL_FETCH_NEXT, 0) };
+        helper.join().unwrap();
+
+        assert_eq!(
+            rc, SQL_ERROR,
+            "a poisoned relock must not be reported as SQL_NO_DATA"
+        );
+        // Let the fixture tear down through the normal free path.
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        stmt.inner.clear_poison();
+    }
+
+    /// The claim above is only safe if every exit releases it — a statement
+    /// left marked fetch-in-progress refuses its own rowset setters forever.
+    /// Covers all three arms, including the poisoned one that returns early.
+    #[test]
+    fn exhausted_fast_path_always_releases_its_claim() {
+        for arm in ["size", "gone", "poisoned"] {
+            let mut h = TestHandles::with_env_dbc_stmt();
+            let explicit = h.alloc_explicit_desc();
+            open_cursor(&h);
+            let mut statuses = [0xBEEF_u16; 2];
+            {
+                let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+                let mut s = stmt.inner.lock().unwrap();
+                s.result_set_exhausted = true;
+                s.row_status_ptr = statuses.as_mut_ptr();
+            }
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            match arm {
+                "gone" => {
+                    assert_eq!(h.free_explicit_desc(explicit), SQL_SUCCESS);
+                    stmt.inner.lock().unwrap().active_ard = Some(explicit);
+                }
+                "poisoned" => {
+                    let ard = unsafe { handle_from_raw::<DescHandle>(h.ard()) };
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let _g = ard.inner.lock().unwrap();
+                        panic!("poison the ard lock");
+                    }));
+                }
+                _ => {}
+            }
+
+            let _ = unsafe { sql_fetch_scroll(h.stmt, SQL_FETCH_NEXT, 0) };
+            assert!(
+                !stmt
+                    .inner
+                    .lock()
+                    .unwrap()
+                    .has_state(STMT_STATE_FETCH_IN_PROGRESS),
+                "{arm}: the claim must be released on every exit"
+            );
+            if arm == "gone" {
+                stmt.inner.lock().unwrap().active_ard = None;
+            }
+        }
+    }
+
+    /// A descriptor freed inside the resolve/lock window must **not** be an
+    /// error: the verdict was computed before the ARD was consulted, and the
+    /// only thing lost is an optional status-array fill. Without this, nothing
+    /// distinguishes `ArdExtent::Gone` from `ArdExtent::Poisoned` — flipping
+    /// `Gone` to return `SQL_ERROR` otherwise leaves the whole suite green.
+    #[test]
+    fn exhausted_cursor_fast_path_tolerates_a_freed_ard() {
+        let mut h = TestHandles::with_env_dbc_stmt();
+        let explicit = h.alloc_explicit_desc();
+        open_cursor(&h);
+        let mut rows_fetched: SqlULen = 99;
+        let mut statuses = [0xBEEF_u16; 2];
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut s = stmt.inner.lock().unwrap();
+            s.result_set_exhausted = true;
+            s.rows_fetched_ptr = &mut rows_fetched;
+            s.row_status_ptr = statuses.as_mut_ptr();
+        }
+        // Free through the fixture so the DBC stops tracking it, then restore
+        // the association: that is the state the resolve/lock window leaves
+        // behind, with `active_ard` pointing at a dead handle.
+        assert_eq!(h.free_explicit_desc(explicit), SQL_SUCCESS);
+        stmt.inner.lock().unwrap().active_ard = Some(explicit);
+
+        assert_eq!(
+            unsafe { sql_fetch_scroll(h.stmt, SQL_FETCH_NEXT, 0) },
+            SQL_NO_DATA,
+            "a concurrently freed ARD must not turn a known SQL_NO_DATA into an error"
+        );
+        assert_eq!(rows_fetched, 0, "the fetched count is still reported");
+        assert_eq!(
+            statuses, [0xBEEF_u16; 2],
+            "no extent is knowable, so the application's array is left alone"
+        );
+
+        stmt.inner.lock().unwrap().active_ard = None;
+    }
+
+    /// A poisoned ARD must not be absorbed into normal completion: reporting
+    /// `SQL_NO_DATA` through an internal synchronization failure would violate
+    /// the crate's poisoned-mutex contract, so this fails with `SQL_ERROR`
+    /// even though the descriptor is only consulted to size an optional walk.
+    #[test]
+    fn exhausted_cursor_fast_path_errors_on_a_poisoned_ard() {
+        let h = TestHandles::with_env_dbc_stmt();
+        open_cursor(&h);
+        let mut statuses = [0xBEEF_u16; 2];
+        {
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let mut s = stmt.inner.lock().unwrap();
+            s.result_set_exhausted = true;
+            s.row_status_ptr = statuses.as_mut_ptr();
+        }
+        let ard = unsafe { handle_from_raw::<DescHandle>(h.ard()) };
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = ard.inner.lock().unwrap();
+            panic!("poison the ard lock");
+        }));
+
+        assert_eq!(
+            unsafe { sql_fetch_scroll(h.stmt, SQL_FETCH_NEXT, 0) },
+            SQL_ERROR
+        );
+        assert_eq!(last_state(&h), SQLSTATE_HY000);
+        assert_eq!(
+            statuses, [0xBEEF_u16; 2],
+            "an unreadable ARD must not be walked with a guessed extent"
+        );
+    }
+
+    /// `SQL_DESC_ARRAY_SIZE` on the ARD is the same setting as
+    /// `SQL_ATTR_ROW_ARRAY_SIZE`, so writing it through the descriptor
+    /// spelling must size the rowset a block fetch actually delivers — not
+    /// merely round-trip through `SQLGetDescField`. The pre-fix driver
+    /// returned a single row here while reporting success.
+    #[test]
+    fn descriptor_array_size_drives_the_block_fetch_rowset() {
+        let h = TestHandles::with_env_dbc_stmt();
+        h.mark_dbc_connected();
+        let mut values = [0_i32; 3];
+        let mut indicators = [0 as SqlLen; 3];
+        let mut rows_fetched: SqlULen = 0;
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.set_state(STMT_STATE_CURSOR_OPEN);
+            state.begin_result_set(int_columns(1));
+            state.rows_fetched_ptr = &mut rows_fetched;
+        }
+        assert_eq!(
+            unsafe {
+                crate::api::set_desc_field::sql_set_desc_field_w(
+                    h.ard(),
+                    0,
+                    SQL_DESC_ARRAY_SIZE as SqlSmallInt,
+                    3 as SqlPointer,
+                    0,
+                )
+            },
+            SQL_SUCCESS
+        );
+
+        // The statement attribute reports the descriptor's value, so the two
+        // getters cannot disagree about one logical setting.
+        let mut reported: SqlULen = 0;
+        assert_eq!(
+            unsafe {
+                crate::api::set_stmt_attr::sql_get_stmt_attr_w(
+                    h.stmt,
+                    SQL_ATTR_ROW_ARRAY_SIZE,
+                    (&mut reported as *mut SqlULen).cast(),
+                    0,
+                    std::ptr::null_mut(),
+                )
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!(reported, 3);
+
+        assert_eq!(
+            unsafe {
+                sql_bind_col(
+                    h.stmt,
+                    1,
+                    SQL_C_SLONG,
+                    values.as_mut_ptr().cast(),
+                    0,
+                    indicators.as_mut_ptr(),
+                )
+            },
+            SQL_SUCCESS
+        );
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let mut client = tds_client_from_int_rows(vec![vec![10], vec![20], vec![30]]);
+        dbc.runtime
+            .block_on(client.execute("SELECT descriptor rowset".to_string(), ()))
+            .unwrap();
+        {
+            let mut state = dbc.inner.lock().unwrap();
+            state.client = Some(client);
+            state.active_stmt = Some(h.stmt);
+        }
+
+        assert_eq!(
+            unsafe { sql_fetch_scroll(h.stmt, SQL_FETCH_NEXT, 0) },
+            SQL_SUCCESS
+        );
+        assert_eq!(rows_fetched, 3, "the descriptor sized the rowset");
+        assert_eq!(values, [10, 20, 30]);
     }
 
     #[test]
@@ -5634,11 +6135,11 @@ mod tests {
         {
             let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
             let mut s = stmt.inner.lock().unwrap();
-            s.row_array_size = 3;
             s.rows_fetched_ptr = &mut rows_fetched;
             s.row_status_ptr = status.as_mut_ptr();
             s.column_metadata = int_columns(1);
         }
+        set_row_array_size(&h, 3);
         // active_stmt stays None: an earlier fetch drained the connection.
         let rc = unsafe { sql_fetch_scroll(h.stmt, SQL_FETCH_NEXT, 0) };
         assert_eq!(rc, SQL_NO_DATA);
