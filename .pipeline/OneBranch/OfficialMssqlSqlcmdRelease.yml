@@ -149,6 +149,9 @@ extends:
               'runtimes/linux-musl-x64/native/libmssql_sqlcmd.a', 'runtimes/linux-musl-arm64/native/libmssql_sqlcmd.a',
               'runtimes/osx-x64/native/libmssql_sqlcmd.a', 'runtimes/osx-arm64/native/libmssql_sqlcmd.a'
             )
+            # Each runtime also carries the link flags consumers need.
+            $required += @('win-x64', 'win-x86', 'win-arm64', 'linux-x64', 'linux-arm64', 'linux-musl-x64', 'linux-musl-arm64', 'osx-x64', 'osx-arm64' |
+              ForEach-Object { "runtimes/$_/native/native-static-libs.txt" })
             $zip = [IO.Compression.ZipFile]::OpenRead($package.FullName)
             try {
               $entries = @($zip.Entries | ForEach-Object { $_.FullName })

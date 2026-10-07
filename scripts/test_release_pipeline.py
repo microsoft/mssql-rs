@@ -581,6 +581,19 @@ _SQLCMD_PACKAGE_ENTRIES = (
     "runtimes/linux-musl-arm64/native/libmssql_sqlcmd.a",
     "runtimes/osx-x64/native/libmssql_sqlcmd.a",
     "runtimes/osx-arm64/native/libmssql_sqlcmd.a",
+) + tuple(
+    f"runtimes/{rid}/native/native-static-libs.txt"
+    for rid in (
+        "win-x64",
+        "win-x86",
+        "win-arm64",
+        "linux-x64",
+        "linux-arm64",
+        "linux-musl-x64",
+        "linux-musl-arm64",
+        "osx-x64",
+        "osx-arm64",
+    )
 )
 
 # Stands in for the feed's flat-container index. MOCK_FEED is a comma-separated
