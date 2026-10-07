@@ -10,7 +10,7 @@
 
 use tracing::{debug, error};
 
-use crate::api::exec_common::{ParamArrayHeader, snapshot_bound_params};
+use crate::api::exec_common::snapshot_bound_params;
 use crate::api::output_params::write_back_output_params;
 
 use mssql_tds::connection::tds_client::{ResultSet, StatementResult};
@@ -55,15 +55,17 @@ unsafe fn sql_more_results_impl(statement_handle: SqlHandle) -> SqlReturn {
 
 fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn {
     // DESC locks must not nest beneath STMT, including the exhausted fast path.
-    let bound_params = snapshot_bound_params(stmt);
+    let snapshot = snapshot_bound_params(stmt);
     // Free any stale diagnostics and observe cursor state.
-    let cursor_open = {
+    let (cursor_open, bound_params) = {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("SQLMoreResults: stmt mutex poisoned");
             return SQL_ERROR;
         };
         free_errors(&mut stmt_state);
-        if bound_params.is_err() {
+        // Unwrapped here, after `free_errors`, so both write-back sites below
+        // get the params and header from one snapshot without a fallback.
+        let Ok(bound_params) = snapshot else {
             post_sql_error(
                 &mut stmt_state,
                 SQLSTATE_HY000,
@@ -71,7 +73,7 @@ fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
                 "Internal error snapshotting output parameter bindings",
             );
             return SQL_ERROR;
-        }
+        };
         if let Some(e) = stmt_state.pending_fetch_error.take() {
             // A prior fetch's read-ahead peek already discovered this result
             // set ends in a SQL Server error (see AB#47508's
@@ -99,15 +101,14 @@ fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
             {
                 // The values belong to this statement, not to the client that
                 // may already be executing a different statement.
-                // Params and header are matched in one step: they must come
-                // from the same snapshot, since a default header's null
-                // pointers are only safe alongside an empty param slice.
-                let (params, header) = match bound_params.as_ref() {
-                    Ok(b) => (b.params.as_slice(), b.header),
-                    Err(_) => (&[][..], ParamArrayHeader::default()),
-                };
                 unsafe {
-                    write_back_output_params(&mut stmt_state, params, &header, &values, status)
+                    write_back_output_params(
+                        &mut stmt_state,
+                        bound_params.params.as_slice(),
+                        &bound_params.header,
+                        &values,
+                        status,
+                    )
                 }
             } else {
                 SQL_SUCCESS
@@ -143,7 +144,7 @@ fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
             }
             return SQL_SUCCESS;
         }
-        stmt_state.has_state(STMT_STATE_CURSOR_OPEN)
+        (stmt_state.has_state(STMT_STATE_CURSOR_OPEN), bound_params)
     };
 
     if !cursor_open {
@@ -338,16 +339,11 @@ fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
             // application read a value the spec says is not available yet.
             let return_values = client.get_return_values();
             let return_status = client.get_return_status();
-            // One match, as above: a default header only pairs with no params.
-            let (params, header) = match bound_params.as_ref() {
-                Ok(b) => (b.params.as_slice(), b.header),
-                Err(_) => (&[][..], ParamArrayHeader::default()),
-            };
             let output_rc = unsafe {
                 write_back_output_params(
                     &mut stmt_state,
-                    params,
-                    &header,
+                    bound_params.params.as_slice(),
+                    &bound_params.header,
                     &return_values,
                     return_status,
                 )

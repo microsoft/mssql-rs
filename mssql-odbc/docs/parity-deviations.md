@@ -907,4 +907,6 @@ msodbcsql build is measured.
     the msodbcsql half of this entry as read from source and not observed.
 
     The ARD/APD half predates AB#49060; AB#49060 extended it to the IRD/IPD
-    status and rows-processed pointers and to every header-alias attribute.
+    status and rows-processed pointers, and to every header-alias attribute
+    plus `SQL_ROWSET_SIZE`, which is ARD-resident without being an alias and
+    so reaches the same `readers_through` walk through `set_desc_header`.
