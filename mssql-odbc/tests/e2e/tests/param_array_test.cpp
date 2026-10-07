@@ -19,6 +19,18 @@
 //   - SQLRowCount reports the SUM of the sets' affected rows
 //
 //   1.  ArrayInsertWritesEveryParameterSet        - N sets, N rows
+//   1b. DescriptorArraySizeExecutesEveryParameterSet - descriptor alias
+//   1c. ParamsetSizeAndDescriptorArraySizeAgree   - both getters, one value
+//   1d. ExplicitAppParamDescCarriesItsOwnArraySize - per-descriptor storage
+//   1e. ArraySizeZeroIsRejected                   - divergence: registry 25
+//   1f. OverlargeParamsetSizeIsStoredVerbatim     - parity: no upper clamp
+//   1g. DescriptorSpellingsDriveARowWiseBatch     - AB#49060: APD/IPD aliases
+//   1h. DescriptorOperationArraySkipsIgnoredSets  - AB#49060: APD status ptr
+//   1i. ParameterAttributesAndDescriptorFieldsAgree - AB#49060: both getters
+//   1j. ASharedExplicitApdCarriesItsSizeToTheOtherStatement - one header
+//   1k. RepointingTheApdBindOffsetMovesTheNextExecute - read per execute
+//   1l. ScalarExecutePublishesProcessedThroughTheIpdSpelling
+//   1m. ParameterControlsCanChangeWhileACursorIsOpen - no mid-execute gate
 //   2.  ArrayInsertAggregatesRowCount             - SQLRowCount is the sum
 //   3.  ArrayHandlesMixedNullAndNonNull           - per-row indicators
 //   4.  ArrayHandlesVariableWidthBuffers          - char/binary use BufferLength
@@ -81,6 +93,7 @@
 #define SQL_WARN_YES 1L
 #endif
 
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -263,6 +276,535 @@ TEST_F(ParamArrayTest, ArrayInsertWritesEveryParameterSet) {
     EXPECT_EQ("1,2,3,4",
               ScalarString("SELECT STRING_AGG(CONVERT(varchar(11), id), ',') "
                            "WITHIN GROUP (ORDER BY id) FROM #pa"));
+}
+
+// -------------------------------------------------------------------
+// 1b. SQL_DESC_ARRAY_SIZE on the APD is the same setting as
+// SQL_ATTR_PARAMSET_SIZE. This spelling must drive execution, not merely
+// round-trip through SQLGetDescField.
+// -------------------------------------------------------------------
+TEST_F(ParamArrayTest, DescriptorArraySizeExecutesEveryParameterSet) {
+    ExecDirect(kGuardTable);
+    Prepare("INSERT INTO #pa (id, v) VALUES (?, ?)");
+
+    SQLINTEGER ids[4] = {1, 2, 3, 4};
+    SQLINTEGER vals[4] = {10, 20, 30, 40};
+    SQLLEN ind[4] = {0, 0, 0, 0};
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_SLONG,
+                                   SQL_INTEGER, 10, 0, ids, 0, ind),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 2, SQL_PARAM_INPUT, SQL_C_SLONG,
+                                   SQL_INTEGER, 10, 0, vals, 0, ind),
+                  SQL_HANDLE_STMT, stmt_);
+
+    SQLHDESC apd = SQL_NULL_HDESC;
+    ASSERT_SQL_OK(SQLGetStmtAttr(stmt_, SQL_ATTR_APP_PARAM_DESC, &apd, 0, nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLSetDescField(apd, 0, SQL_DESC_ARRAY_SIZE,
+                                  reinterpret_cast<SQLPOINTER>(4), 0),
+                  SQL_HANDLE_DESC, apd);
+
+    SQLULEN statement_size = 0;
+    ASSERT_SQL_OK(SQLGetStmtAttr(stmt_, SQL_ATTR_PARAMSET_SIZE, &statement_size,
+                                 0, nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(4u, statement_size);
+
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(4, ScalarInt("SELECT COUNT(*) FROM #pa"));
+    EXPECT_EQ(100, ScalarInt("SELECT SUM(v) FROM #pa"));
+}
+
+// -------------------------------------------------------------------
+// 1c. The reverse direction of 1b. Separate storage let these two
+// getters report different values for what the spec says is one value,
+// so both directions are pinned, as is the row side staying put: it is
+// a different descriptor and must not move with the parameter side.
+// -------------------------------------------------------------------
+TEST_F(ParamArrayTest, ParamsetSizeAndDescriptorArraySizeAgree) {
+    SQLHDESC apd = SQL_NULL_HDESC;
+    ASSERT_SQL_OK(SQLGetStmtAttr(stmt_, SQL_ATTR_APP_PARAM_DESC, &apd, 0, nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+
+    SQLULEN descriptor_size = 0;
+    ASSERT_SQL_OK(
+        SQLGetDescField(apd, 0, SQL_DESC_ARRAY_SIZE, &descriptor_size, 0, nullptr),
+        SQL_HANDLE_DESC, apd);
+    EXPECT_EQ(1u, descriptor_size) << "both spellings default to a single set";
+
+    ASSERT_EQ(SQL_SUCCESS, SetStmtULen(SQL_ATTR_PARAMSET_SIZE, 5));
+    descriptor_size = 0;
+    ASSERT_SQL_OK(
+        SQLGetDescField(apd, 0, SQL_DESC_ARRAY_SIZE, &descriptor_size, 0, nullptr),
+        SQL_HANDLE_DESC, apd);
+    EXPECT_EQ(5u, descriptor_size) << "the attribute wrote the descriptor header";
+
+    SQLULEN row_size = 0;
+    ASSERT_SQL_OK(SQLGetStmtAttr(stmt_, SQL_ATTR_ROW_ARRAY_SIZE, &row_size, 0, nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(1u, row_size) << "the row side is a different descriptor";
+}
+
+// -------------------------------------------------------------------
+// 1d. An explicit APD carries its own SQL_DESC_ARRAY_SIZE, and once
+// associated it is the one execution uses. This is the case a
+// statement-side copy of the value could never model: an explicit
+// descriptor can be associated with several statements at once, so there
+// is no single statement field to mirror it into.
+// -------------------------------------------------------------------
+TEST_F(ParamArrayTest, ExplicitAppParamDescCarriesItsOwnArraySize) {
+    ExecDirect(kGuardTable);
+    Prepare("INSERT INTO #pa (id, v) VALUES (?, ?)");
+
+    SQLHDESC explicit_apd = SQL_NULL_HDESC;
+    ASSERT_SQL_OK(SQLAllocHandle(SQL_HANDLE_DESC, dbc_, &explicit_apd), SQL_HANDLE_DBC, dbc_);
+    ASSERT_SQL_OK(SQLSetDescField(explicit_apd, 0, SQL_DESC_ARRAY_SIZE,
+                                  reinterpret_cast<SQLPOINTER>(3), 0),
+                  SQL_HANDLE_DESC, explicit_apd);
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_APP_PARAM_DESC, explicit_apd, 0),
+                  SQL_HANDLE_STMT, stmt_);
+
+    SQLULEN reported = 0;
+    ASSERT_SQL_OK(SQLGetStmtAttr(stmt_, SQL_ATTR_PARAMSET_SIZE, &reported, 0, nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(3u, reported) << "the associated descriptor supplies the array size";
+
+    SQLINTEGER ids[3] = {1, 2, 3};
+    SQLINTEGER vals[3] = {10, 20, 30};
+    SQLLEN ind[3] = {0, 0, 0};
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_SLONG,
+                                   SQL_INTEGER, 10, 0, ids, 0, ind),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 2, SQL_PARAM_INPUT, SQL_C_SLONG,
+                                   SQL_INTEGER, 10, 0, vals, 0, ind),
+                  SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(3, ScalarInt("SELECT COUNT(*) FROM #pa"));
+    EXPECT_EQ(60, ScalarInt("SELECT SUM(v) FROM #pa"));
+
+    // Reverting to the implicit APD restores that descriptor's own value,
+    // which the explicit association never touched.
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_APP_PARAM_DESC, nullptr, 0),
+                  SQL_HANDLE_STMT, stmt_);
+    reported = 0;
+    ASSERT_SQL_OK(SQLGetStmtAttr(stmt_, SQL_ATTR_PARAMSET_SIZE, &reported, 0, nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(1u, reported);
+    EXPECT_EQ(SQL_SUCCESS, SQLFreeHandle(SQL_HANDLE_DESC, explicit_apd));
+}
+
+// -------------------------------------------------------------------
+// 1e. An array size of 0 is rejected here and accepted by msodbcsql -
+// deviation registry entry 25. Both legs assert their own expected
+// result rather than skipping the reference, so the reference stays
+// measured on every run (mssql-odbc.instructions.md 2.1).
+//
+// Only the SQLSetDescField spelling is asserted on the reference leg.
+// The statement-attribute spellings reach the driver through a Driver
+// Manager that validates them itself, and "a test that invokes
+// SQLSetStmtAttr through a Driver Manager measures the Driver Manager,
+// not this driver's setter" (instructions 2.2). Measured on build
+// 180735 across Windows, Linux and macOS:
+//   SQLSetStmtAttr(SQL_ROWSET_SIZE, 0)   -> SQL_ERROR on BOTH drivers,
+//     every platform; the DM rejects it before either driver is called,
+//     so no driver-level difference is observable.
+//   SQLSetStmtAttr(PARAMSET_SIZE, 0)     -> msodbcsql answers SQL_SUCCESS
+//     on Linux/macOS but SQL_ERROR on Windows, i.e. the Windows DM masks
+//     the divergence. Platform-dependent DM behaviour is not asserted.
+//   SQLSetDescField(apd, ARRAY_SIZE, 0)  -> SQL_SUCCESS on msodbcsql on
+//     every platform, SQL_ERROR here. That is the real, observable
+//     divergence, and it is what this case pins.
+// -------------------------------------------------------------------
+TEST_F(ParamArrayTest, ArraySizeZeroIsRejected) {
+    SQLHDESC apd = SQL_NULL_HDESC;
+    ASSERT_SQL_OK(SQLGetStmtAttr(stmt_, SQL_ATTR_APP_PARAM_DESC, &apd, 0, nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_EQ(SQL_SUCCESS, SetStmtULen(SQL_ATTR_PARAMSET_SIZE, 4));
+
+    const SQLRETURN attr_rc = SetStmtULen(SQL_ATTR_PARAMSET_SIZE, 0);
+    // Captured immediately: every SQLSetStmtAttr frees the statement's
+    // diagnostics on entry, so reading this after a later set would find an
+    // empty record list and fail even when the rejection worked correctly.
+    const std::string attr_state = ODBCTestUtils::GetDiagState(SQL_HANDLE_STMT, stmt_);
+    const SQLRETURN desc_rc = SQLSetDescField(
+        apd, 0, SQL_DESC_ARRAY_SIZE, reinterpret_cast<SQLPOINTER>(0), 0);
+    const std::string desc_state = ODBCTestUtils::GetDiagState(SQL_HANDLE_DESC, apd);
+    // The row-side statement spelling, and the ARD side of the descriptor
+    // spelling. Neither had been measured on either leg; DM filtering has
+    // already proved to be per-attribute and per-platform, and this is the
+    // spelling a Driver Manager is most likely to validate as a zero rowset
+    // size, so it cannot be assumed to behave like its APD twin.
+    const SQLRETURN row_rc = SetStmtULen(SQL_ATTR_ROW_ARRAY_SIZE, 0);
+    SQLHDESC ard = SQL_NULL_HDESC;
+    ASSERT_SQL_OK(SQLGetStmtAttr(stmt_, SQL_ATTR_APP_ROW_DESC, &ard, 0, nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    const SQLRETURN ard_desc_rc = SQLSetDescField(
+        ard, 0, SQL_DESC_ARRAY_SIZE, reinterpret_cast<SQLPOINTER>(0), 0);
+    RecordProperty("row_array_size_zero_rc", static_cast<int>(row_rc));
+    RecordProperty("ard_desc_array_size_zero_rc", static_cast<int>(ard_desc_rc));
+
+    if (ComparingMsodbcsql()) {
+        // SQLSetDescField reaches the driver unfiltered - the DM forwards
+        // descriptor-field writes - so this one is a driver measurement.
+        // msodbcsql's SQL_DESC_ARRAY_SIZE branch clamps only the upper bound.
+        EXPECT_EQ(SQL_SUCCESS, desc_rc)
+            << "msodbcsql accepts a zero SQL_DESC_ARRAY_SIZE";
+        // `row_rc` and `ard_desc_rc` are recorded, not asserted: whether the
+        // DM filters either spelling is exactly what has not been measured,
+        // and the APD result above does not establish the ARD one - the DM
+        // tracks the ARD's rowset size for its own fetch bookkeeping, so it
+        // has a reason to validate that side which does not apply to the APD.
+        // Registry entry 25 will be settled from the recorded values rather
+        // than predicted from a sibling spelling.
+        return;
+    }
+
+    EXPECT_EQ(SQL_ERROR, attr_rc);
+    EXPECT_EQ(std::string("HY024"), attr_state);
+    EXPECT_EQ(SQL_ERROR, desc_rc);
+    EXPECT_EQ(std::string("HY024"), desc_state);
+    // Safe on either side of the DM question: the driver rejects a zero rowset
+    // size, and every DM known to filter this spelling also rejects it, so the
+    // application sees SQL_ERROR regardless of which layer answered.
+    EXPECT_EQ(SQL_ERROR, row_rc);
+    EXPECT_EQ(SQL_ERROR, ard_desc_rc);
+
+    // A rejected set must leave the previous value in place, or the failure
+    // would silently resize the application's array.
+    SQLULEN reported = 0;
+    ASSERT_SQL_OK(SQLGetStmtAttr(stmt_, SQL_ATTR_PARAMSET_SIZE, &reported, 0, nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(4u, reported);
+}
+
+// -------------------------------------------------------------------
+// 1f. The upper bound is NOT part of that divergence. msodbcsql's
+// validator is keyed on the attribute, not the field: the row-side
+// spellings clamp to INT32_MAX while SQL_ATTR_PARAMSET_SIZE sits under
+// "Attributes with no validation" and is stored verbatim. Making the
+// descriptor canonical must not quietly impose the row-side bound on the
+// parameter side, so this asserts on both legs.
+//
+// Return codes and read-back values only: the 01S02 record that
+// accompanies the clamp is not retrievable through the Windows Driver
+// Manager on either driver (measured, build 180735), so asserting it
+// would again be measuring the DM rather than the driver. The unit test
+// `row_array_size_clamps_but_paramset_size_stores_verbatim` pins the
+// diagnostic at the driver boundary, where it is unambiguous.
+// -------------------------------------------------------------------
+TEST_F(ParamArrayTest, OverlargeParamsetSizeIsStoredVerbatim) {
+    const SQLULEN over = static_cast<SQLULEN>(INT32_MAX) + 1000;
+    EXPECT_EQ(SQL_SUCCESS, SetStmtULen(SQL_ATTR_PARAMSET_SIZE, over))
+        << "PARAMSET_SIZE has no upper clamp on either driver";
+
+    SQLULEN reported = 0;
+    ASSERT_SQL_OK(SQLGetStmtAttr(stmt_, SQL_ATTR_PARAMSET_SIZE, &reported, 0, nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(over, reported);
+
+    // The row-side spelling, in the validator's clamping case, does bound it.
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, SetStmtULen(SQL_ATTR_ROW_ARRAY_SIZE, over));
+    reported = 0;
+    ASSERT_SQL_OK(SQLGetStmtAttr(stmt_, SQL_ATTR_ROW_ARRAY_SIZE, &reported, 0, nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(static_cast<SQLULEN>(INT32_MAX), reported);
+
+    // SQL_ROWSET_SIZE shares that same validator case, so it clamps too. Kept
+    // on both legs because this is a new SQL_SUCCESS_WITH_INFO where the driver
+    // previously returned plain SQL_SUCCESS - the reference leg is what makes
+    // "parity fix" a measurement rather than a claim.
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, SetStmtULen(SQL_ROWSET_SIZE, over));
+    reported = 0;
+    ASSERT_SQL_OK(SQLGetStmtAttr(stmt_, SQL_ROWSET_SIZE, &reported, 0, nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(static_cast<SQLULEN>(INT32_MAX), reported);
+}
+
+// -------------------------------------------------------------------
+// 1g. AB#49060: a row-wise batch driven only through the APD/IPD descriptor
+// fields (bind type, bind offset, status array, processed count).
+// -------------------------------------------------------------------
+TEST_F(ParamArrayTest, DescriptorSpellingsDriveARowWiseBatch) {
+    ExecDirect(kGuardTable);
+    Prepare("INSERT INTO #pa (id, v) VALUES (?, ?)");
+
+    struct Row {
+        SQLINTEGER id;
+        SQLLEN id_ind;
+        SQLINTEGER v;
+        SQLLEN v_ind;
+    };
+    // Row 0 is slack the offset skips; rows 1..3 are the batch.
+    Row rows[4] = {};
+    for (int i = 0; i < 4; ++i) {
+        rows[i].id = i;
+        rows[i].v = i * 11;
+    }
+    SQLLEN offset = sizeof(Row);
+    SQLUSMALLINT status[3] = {0xFFFF, 0xFFFF, 0xFFFF};
+    SQLULEN processed = 0xDEAD;
+
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_SLONG,
+                                   SQL_INTEGER, 10, 0, &rows[0].id, 0,
+                                   &rows[0].id_ind),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 2, SQL_PARAM_INPUT, SQL_C_SLONG,
+                                   SQL_INTEGER, 10, 0, &rows[0].v, 0,
+                                   &rows[0].v_ind),
+                  SQL_HANDLE_STMT, stmt_);
+
+    SQLHDESC apd = SQL_NULL_HDESC;
+    SQLHDESC ipd = SQL_NULL_HDESC;
+    ASSERT_SQL_OK(SQLGetStmtAttr(stmt_, SQL_ATTR_APP_PARAM_DESC, &apd, 0, nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLGetStmtAttr(stmt_, SQL_ATTR_IMP_PARAM_DESC, &ipd, 0, nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLSetDescField(apd, 0, SQL_DESC_ARRAY_SIZE,
+                                  reinterpret_cast<SQLPOINTER>(3), 0),
+                  SQL_HANDLE_DESC, apd);
+    ASSERT_SQL_OK(SQLSetDescField(apd, 0, SQL_DESC_BIND_TYPE,
+                                  reinterpret_cast<SQLPOINTER>(sizeof(Row)), 0),
+                  SQL_HANDLE_DESC, apd);
+    ASSERT_SQL_OK(SQLSetDescField(apd, 0, SQL_DESC_BIND_OFFSET_PTR, &offset, 0),
+                  SQL_HANDLE_DESC, apd);
+    ASSERT_SQL_OK(SQLSetDescField(ipd, 0, SQL_DESC_ARRAY_STATUS_PTR, status, 0),
+                  SQL_HANDLE_DESC, ipd);
+    ASSERT_SQL_OK(SQLSetDescField(ipd, 0, SQL_DESC_ROWS_PROCESSED_PTR, &processed, 0),
+                  SQL_HANDLE_DESC, ipd);
+
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    EXPECT_EQ("1:11,2:22,3:33",
+              ScalarString("SELECT STRING_AGG(CONCAT(id, ':', v), ',') "
+                           "WITHIN GROUP (ORDER BY id) FROM #pa"))
+        << "APD bind type strided by the struct and the offset skipped row 0";
+    EXPECT_EQ(3u, processed) << "IPD SQL_DESC_ROWS_PROCESSED_PTR received the count";
+    for (int i = 0; i < 3; ++i) {
+        EXPECT_EQ(SQL_PARAM_SUCCESS, status[i]) << "IPD status array, set " << i;
+    }
+}
+
+// -------------------------------------------------------------------
+// 1h. AB#49060: the operation array set as the APD's
+// SQL_DESC_ARRAY_STATUS_PTR skips ignored sets. Only the rows that reach the
+// server are asserted: msodbcsql mis-indexes the status array (11b).
+// -------------------------------------------------------------------
+TEST_F(ParamArrayTest, DescriptorOperationArraySkipsIgnoredSets) {
+    ExecDirect(kGuardTable);
+    Prepare("INSERT INTO #pa (id, v) VALUES (?, ?)");
+
+    SQLINTEGER ids[4] = {1, 2, 3, 4};
+    SQLINTEGER vals[4] = {1, 2, 3, 4};
+    SQLLEN ind[4] = {0, 0, 0, 0};
+    SQLUSMALLINT operation[4] = {SQL_PARAM_PROCEED, SQL_PARAM_IGNORE,
+                                 SQL_PARAM_PROCEED, SQL_PARAM_IGNORE};
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_SLONG,
+                                   SQL_INTEGER, 10, 0, ids, 0, ind),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 2, SQL_PARAM_INPUT, SQL_C_SLONG,
+                                   SQL_INTEGER, 10, 0, vals, 0, ind),
+                  SQL_HANDLE_STMT, stmt_);
+
+    SQLHDESC apd = SQL_NULL_HDESC;
+    ASSERT_SQL_OK(SQLGetStmtAttr(stmt_, SQL_ATTR_APP_PARAM_DESC, &apd, 0, nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLSetDescField(apd, 0, SQL_DESC_ARRAY_SIZE,
+                                  reinterpret_cast<SQLPOINTER>(4), 0),
+                  SQL_HANDLE_DESC, apd);
+    ASSERT_SQL_OK(SQLSetDescField(apd, 0, SQL_DESC_ARRAY_STATUS_PTR, operation, 0),
+                  SQL_HANDLE_DESC, apd);
+
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("1,3",
+              ScalarString("SELECT STRING_AGG(CONVERT(varchar(11), id), ',') "
+                           "WITHIN GROUP (ORDER BY id) FROM #pa"));
+}
+
+// -------------------------------------------------------------------
+// 1i. AB#49060: each parameter-side attribute and its descriptor field are
+// one value, in both directions.
+// -------------------------------------------------------------------
+TEST_F(ParamArrayTest, ParameterAttributesAndDescriptorFieldsAgree) {
+    SQLHDESC apd = SQL_NULL_HDESC;
+    SQLHDESC ipd = SQL_NULL_HDESC;
+    ASSERT_SQL_OK(SQLGetStmtAttr(stmt_, SQL_ATTR_APP_PARAM_DESC, &apd, 0, nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLGetStmtAttr(stmt_, SQL_ATTR_IMP_PARAM_DESC, &ipd, 0, nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+
+    SQLLEN offset = 0;
+    SQLUSMALLINT operations[2] = {};
+    SQLUSMALLINT status[2] = {};
+    SQLULEN processed = 0;
+    struct Case {
+        SQLINTEGER attribute;
+        SQLHDESC desc;
+        SQLSMALLINT field;
+        SQLPOINTER value;
+    };
+    const Case cases[] = {
+        {SQL_ATTR_PARAM_BIND_OFFSET_PTR, apd, SQL_DESC_BIND_OFFSET_PTR, &offset},
+        {SQL_ATTR_PARAM_OPERATION_PTR, apd, SQL_DESC_ARRAY_STATUS_PTR, operations},
+        {SQL_ATTR_PARAM_STATUS_PTR, ipd, SQL_DESC_ARRAY_STATUS_PTR, status},
+        {SQL_ATTR_PARAMS_PROCESSED_PTR, ipd, SQL_DESC_ROWS_PROCESSED_PTR, &processed},
+    };
+    for (const Case& c : cases) {
+        ASSERT_EQ(SQL_SUCCESS, SetStmtPtr(c.attribute, c.value));
+        SQLPOINTER read = nullptr;
+        ASSERT_SQL_OK(SQLGetDescField(c.desc, 0, c.field, &read, 0, nullptr),
+                      SQL_HANDLE_DESC, c.desc);
+        EXPECT_EQ(c.value, read) << "attribute " << c.attribute << " -> field " << c.field;
+
+        ASSERT_SQL_OK(SQLSetDescField(c.desc, 0, c.field, nullptr, 0), SQL_HANDLE_DESC,
+                      c.desc);
+        read = &offset;
+        ASSERT_SQL_OK(SQLGetStmtAttr(stmt_, c.attribute, &read, 0, nullptr),
+                      SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ(nullptr, read) << "field " << c.field << " -> attribute " << c.attribute;
+    }
+
+    ASSERT_EQ(SQL_SUCCESS, SetStmtULen(SQL_ATTR_PARAM_BIND_TYPE, 32));
+    SQLINTEGER bindType = 0;
+    ASSERT_SQL_OK(SQLGetDescField(apd, 0, SQL_DESC_BIND_TYPE, &bindType, 0, nullptr),
+                  SQL_HANDLE_DESC, apd);
+    EXPECT_EQ(32, bindType);
+    ASSERT_SQL_OK(SQLSetDescField(apd, 0, SQL_DESC_BIND_TYPE,
+                                  reinterpret_cast<SQLPOINTER>(SQL_PARAM_BIND_BY_COLUMN), 0),
+                  SQL_HANDLE_DESC, apd);
+    SQLULEN reported = 99;
+    ASSERT_SQL_OK(SQLGetStmtAttr(stmt_, SQL_ATTR_PARAM_BIND_TYPE, &reported, 0, nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(static_cast<SQLULEN>(SQL_PARAM_BIND_BY_COLUMN), reported);
+}
+
+// -------------------------------------------------------------------
+// 1j. An explicit APD shared by two statements is one header: the size set
+// through one is the batch the other executes.
+// -------------------------------------------------------------------
+TEST_F(ParamArrayTest, ASharedExplicitApdCarriesItsSizeToTheOtherStatement) {
+    ExecDirect(kGuardTable);
+    SQLHSTMT writer = AllocStmt();
+    SQLHDESC shared = SQL_NULL_HDESC;
+    ASSERT_SQL_OK(SQLAllocHandle(SQL_HANDLE_DESC, dbc_, &shared), SQL_HANDLE_DBC, dbc_);
+    ASSERT_SQL_OK(SQLSetStmtAttr(writer, SQL_ATTR_APP_PARAM_DESC, shared, 0),
+                  SQL_HANDLE_STMT, writer);
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_APP_PARAM_DESC, shared, 0),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLSetStmtAttr(writer, SQL_ATTR_PARAMSET_SIZE,
+                                 reinterpret_cast<SQLPOINTER>(3), 0),
+                  SQL_HANDLE_STMT, writer);
+
+    Prepare("INSERT INTO #pa (id, v) VALUES (?, ?)");
+    SQLINTEGER ids[3] = {1, 2, 3};
+    SQLINTEGER vals[3] = {5, 6, 7};
+    SQLLEN ind[3] = {0, 0, 0};
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_SLONG,
+                                   SQL_INTEGER, 10, 0, ids, 0, ind),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 2, SQL_PARAM_INPUT, SQL_C_SLONG,
+                                   SQL_INTEGER, 10, 0, vals, 0, ind),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(3, ScalarInt("SELECT COUNT(*) FROM #pa"));
+    EXPECT_EQ(18, ScalarInt("SELECT SUM(v) FROM #pa"));
+
+    FreeStmt(writer);
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_APP_PARAM_DESC, nullptr, 0),
+                  SQL_HANDLE_STMT, stmt_);
+    SQLFreeHandle(SQL_HANDLE_DESC, shared);
+}
+
+// -------------------------------------------------------------------
+// 1k. The APD's bind-offset pointer is read at every execute.
+// -------------------------------------------------------------------
+TEST_F(ParamArrayTest, RepointingTheApdBindOffsetMovesTheNextExecute) {
+    ExecDirect(kGuardTable);
+    Prepare("INSERT INTO #pa (id, v) VALUES (?, 0)");
+    SQLINTEGER ids[4] = {10, 20, 30, 40};
+    SQLLEN ind[4] = {0, 0, 0, 0};
+    SQLLEN none = 0;
+    SQLLEN two = 2 * sizeof(SQLINTEGER);  // the indicator array is all zeroes either way
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_SLONG,
+                                   SQL_INTEGER, 10, 0, ids, 0, ind),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_EQ(SQL_SUCCESS, SetStmtULen(SQL_ATTR_PARAMSET_SIZE, 2));
+    SQLHDESC apd = SQL_NULL_HDESC;
+    ASSERT_SQL_OK(SQLGetStmtAttr(stmt_, SQL_ATTR_APP_PARAM_DESC, &apd, 0, nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_SQL_OK(SQLSetDescField(apd, 0, SQL_DESC_BIND_OFFSET_PTR, &none, 0),
+                  SQL_HANDLE_DESC, apd);
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLSetDescField(apd, 0, SQL_DESC_BIND_OFFSET_PTR, &two, 0),
+                  SQL_HANDLE_DESC, apd);
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    EXPECT_EQ("10,20,30,40",
+              ScalarString("SELECT STRING_AGG(CONVERT(varchar(11), id), ',') "
+                           "WITHIN GROUP (ORDER BY id) FROM #pa"));
+}
+
+// -------------------------------------------------------------------
+// 1l. A single-set execute publishes its processed count through the IPD
+// spelling of the pointer.
+// -------------------------------------------------------------------
+TEST_F(ParamArrayTest, ScalarExecutePublishesProcessedThroughTheIpdSpelling) {
+    ExecDirect(kGuardTable);
+    Prepare("INSERT INTO #pa (id, v) VALUES (?, 1)");
+    SQLINTEGER id = 5;
+    SQLLEN ind = 0;
+    SQLULEN processed = 0xDEAD;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER,
+                                   10, 0, &id, 0, &ind),
+                  SQL_HANDLE_STMT, stmt_);
+    SQLHDESC ipd = SQL_NULL_HDESC;
+    ASSERT_SQL_OK(SQLGetStmtAttr(stmt_, SQL_ATTR_IMP_PARAM_DESC, &ipd, 0, nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLSetDescField(ipd, 0, SQL_DESC_ROWS_PROCESSED_PTR, &processed, 0),
+                  SQL_HANDLE_DESC, ipd);
+
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(1u, processed);
+}
+
+// -------------------------------------------------------------------
+// 1m. With a cursor open the statement is not executing, so the descriptor
+// writes gated mid-execute must succeed and drive the next batch.
+// -------------------------------------------------------------------
+TEST_F(ParamArrayTest, ParameterControlsCanChangeWhileACursorIsOpen) {
+    ExecDirect(kGuardTable);
+    ExecDirect("SELECT 1 UNION ALL SELECT 2");  // leaves a cursor open on stmt_
+
+    SQLHDESC apd = SQL_NULL_HDESC;
+    SQLHDESC ipd = SQL_NULL_HDESC;
+    ASSERT_SQL_OK(SQLGetStmtAttr(stmt_, SQL_ATTR_APP_PARAM_DESC, &apd, 0, nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLGetStmtAttr(stmt_, SQL_ATTR_IMP_PARAM_DESC, &ipd, 0, nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    SQLUSMALLINT status[2] = {0xFFFF, 0xFFFF};
+    SQLULEN processed = 0xDEAD;
+    EXPECT_SQL_OK(SQLSetDescField(ipd, 0, SQL_DESC_ARRAY_STATUS_PTR, status, 0),
+                  SQL_HANDLE_DESC, ipd);
+    EXPECT_SQL_OK(SQLSetDescField(ipd, 0, SQL_DESC_ROWS_PROCESSED_PTR, &processed, 0),
+                  SQL_HANDLE_DESC, ipd);
+    EXPECT_SQL_OK(SQLSetDescField(apd, 0, SQL_DESC_ARRAY_SIZE,
+                                  reinterpret_cast<SQLPOINTER>(2), 0),
+                  SQL_HANDLE_DESC, apd);
+    EXPECT_EQ(SQL_SUCCESS, SetStmtULen(SQL_ATTR_PARAM_BIND_TYPE, SQL_PARAM_BIND_BY_COLUMN));
+    ASSERT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    Prepare("INSERT INTO #pa (id, v) VALUES (?, 0)");
+    SQLINTEGER ids[2] = {7, 8};
+    SQLLEN ind[2] = {0, 0};
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_SLONG,
+                                   SQL_INTEGER, 10, 0, ids, 0, ind),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(2u, processed);
+    EXPECT_EQ(SQL_PARAM_SUCCESS, status[0]);
+    EXPECT_EQ(SQL_PARAM_SUCCESS, status[1]);
+    EXPECT_EQ(2, ScalarInt("SELECT COUNT(*) FROM #pa"));
 }
 
 // -------------------------------------------------------------------

@@ -60,23 +60,26 @@ use crate::api::odbc_types::{
     SQL_ATTR_PARAM_BIND_TYPE, SQL_ATTR_PARAM_OPERATION_PTR, SQL_ATTR_PARAM_STATUS_PTR,
     SQL_ATTR_PARAMS_PROCESSED_PTR, SQL_ATTR_PARAMSET_SIZE, SQL_ATTR_QUERY_TIMEOUT,
     SQL_ATTR_ROW_ARRAY_SIZE, SQL_ATTR_ROW_BIND_OFFSET_PTR, SQL_ATTR_ROW_BIND_TYPE,
-    SQL_ATTR_ROW_NUMBER, SQL_ATTR_ROW_STATUS_PTR, SQL_ATTR_ROWS_FETCHED_PTR,
-    SQL_ATTR_SIMULATE_CURSOR, SQL_CONCUR_READ_ONLY, SQL_CURSOR_FORWARD_ONLY, SQL_ERROR, SQL_FALSE,
-    SQL_INSENSITIVE, SQL_INVALID_HANDLE, SQL_NONSCROLLABLE, SQL_NTS, SQL_SC_UNIQUE,
-    SQL_SOPT_SS_CURRENT_COMMAND, SQL_SOPT_SS_QUERYNOTIFICATION_MSGTEXT,
-    SQL_SOPT_SS_QUERYNOTIFICATION_OPTIONS, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SQL_TRUE, SqlHandle,
-    SqlInteger, SqlPointer, SqlReturn, SqlULen, SqlUSmallInt, SqlWChar,
+    SQL_ATTR_ROW_NUMBER, SQL_ATTR_ROW_OPERATION_PTR, SQL_ATTR_ROW_STATUS_PTR,
+    SQL_ATTR_ROWS_FETCHED_PTR, SQL_ATTR_SIMULATE_CURSOR, SQL_CONCUR_READ_ONLY,
+    SQL_CURSOR_FORWARD_ONLY, SQL_ERROR, SQL_FALSE, SQL_INSENSITIVE, SQL_INVALID_HANDLE,
+    SQL_NONSCROLLABLE, SQL_NTS, SQL_ROWSET_SIZE, SQL_SC_UNIQUE, SQL_SOPT_SS_CURRENT_COMMAND,
+    SQL_SOPT_SS_QUERYNOTIFICATION_MSGTEXT, SQL_SOPT_SS_QUERYNOTIFICATION_OPTIONS, SQL_SUCCESS,
+    SQL_SUCCESS_WITH_INFO, SQL_TRUE, SqlHandle, SqlInteger, SqlPointer, SqlReturn, SqlULen,
+    SqlWChar,
 };
+use crate::api::set_desc_field::clamp_array_size;
 use crate::api::sqlstate::{
     DiagMsg, ERR_FUNCTION_SEQUENCE, ERR_INVALID_ATTRIBUTE_VALUE, ERR_INVALID_CURSOR_STATE,
     ERR_INVALID_USE_OF_AUTO_DESC, ERR_OPTIONAL_FEATURE_NOT_IMPLEMENTED, SQLSTATE_01S02,
-    WARN_OPTION_VALUE_CHANGED, post_diag,
+    SQLSTATE_HY000, WARN_ARRAY_SIZE_CHANGED, WARN_OPTION_VALUE_CHANGED, post_diag,
 };
 use crate::api::util::{read_utf16_attr, write_if_some, write_wide_attr};
 use crate::error::{free_errors, post_sql_error};
-use crate::handles::desc::DescHandle;
+use crate::handles::desc::{DescHandle, DescHeader, DescKind};
 use crate::handles::stmt::{
-    InertStmtAttrs, STMT_STATE_EXEC_STARTED, STMT_STATE_FETCH_IN_PROGRESS, VendorStmtAttrs,
+    InertStmtAttrs, STMT_STATE_EXEC_STARTED, STMT_STATE_FETCH_IN_PROGRESS, StmtState,
+    VendorStmtAttrs,
 };
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 
@@ -210,11 +213,17 @@ unsafe fn sql_set_stmt_attr_w_safe(
         }
         // The rowset controls are read into a fetch's snapshot, so moving them
         // mid-fetch would point it at buffers of the wrong size or shape.
+        // `SQL_ATTR_ROW_OPERATION_PTR` is unconsumed today but gated so both
+        // spellings of the ARD's `SQL_DESC_ARRAY_STATUS_PTR` agree.
+        // `SQL_ROWSET_SIZE` has no descriptor spelling; it is gated
+        // pre-emptively, for consistency with the other rowset controls.
         SQL_ATTR_ROW_ARRAY_SIZE
+        | SQL_ROWSET_SIZE
         | SQL_ATTR_ROWS_FETCHED_PTR
         | SQL_ATTR_ROW_STATUS_PTR
         | SQL_ATTR_ROW_BIND_OFFSET_PTR
         | SQL_ATTR_ROW_BIND_TYPE
+        | SQL_ATTR_ROW_OPERATION_PTR
             if state.has_state(STMT_STATE_FETCH_IN_PROGRESS) =>
         {
             error!(
@@ -229,40 +238,90 @@ unsafe fn sql_set_stmt_attr_w_safe(
             // is an invalid rowset size (HY024) — reject rather than paper over.
             let n = value_ptr as SqlULen;
             if n == 0 {
+                // Registry entry 25 (docs/parity-deviations.md): msodbcsql
+                // accepts and stores 0 here; this driver rejects it.
                 error!("SQLSetStmtAttrW: SQL_ATTR_ROW_ARRAY_SIZE of 0 is invalid");
                 post_diag(&mut state, ERR_INVALID_ATTRIBUTE_VALUE);
                 return SQL_ERROR;
             }
-            state.row_array_size = n;
-            debug!(
-                row_array_size = n,
-                "SQLSetStmtAttrW: SQL_ATTR_ROW_ARRAY_SIZE set"
+            let ard = state.effective_ard(stmt);
+            drop(state);
+            let (rc, stored) = set_desc_header(
+                stmt,
+                ard,
+                HeaderField::ArraySize,
+                value_ptr,
+                ArraySizeClamp::ToI32Max,
             );
-            SQL_SUCCESS
+            if rc != SQL_ERROR {
+                debug!(
+                    row_array_size = stored,
+                    "SQLSetStmtAttrW: SQL_ATTR_ROW_ARRAY_SIZE set"
+                );
+            }
+            rc
         }
-        SQL_ATTR_ROWS_FETCHED_PTR => {
-            state.rows_fetched_ptr = value_ptr as *mut SqlULen;
-            SQL_SUCCESS
-        }
-        SQL_ATTR_ROW_STATUS_PTR => {
-            state.row_status_ptr = value_ptr as *mut SqlUSmallInt;
-            SQL_SUCCESS
-        }
-        SQL_ATTR_ROW_BIND_TYPE => {
-            state.row_bind_type = value_ptr as SqlULen;
-            SQL_SUCCESS
-        }
-        SQL_ATTR_PARAMSET_SIZE => match value_ptr as SqlULen {
-            0 => {
+        SQL_ATTR_PARAMSET_SIZE => {
+            if value_ptr as SqlULen == 0 {
                 error!("SQLSetStmtAttrW: SQL_ATTR_PARAMSET_SIZE of 0 is invalid");
                 post_diag(&mut state, ERR_INVALID_ATTRIBUTE_VALUE);
-                SQL_ERROR
+                return SQL_ERROR;
             }
-            n => {
-                state.paramset_size = n;
-                SQL_SUCCESS
-            }
-        },
+            let apd = state.effective_apd(stmt);
+            drop(state);
+            set_desc_header(
+                stmt,
+                apd,
+                HeaderField::ArraySize,
+                value_ptr,
+                ArraySizeClamp::None,
+            )
+            .0
+        }
+        SQL_ROWSET_SIZE => {
+            // Not an alias of `SQL_DESC_ARRAY_SIZE`, but ARD-resident like
+            // msodbcsql's `pARD->dwRowSetSize`. It shares the array-size
+            // *validation* case, clamping to
+            // `INT32_MAX` with `01S02` (`IsSetStmtOptionValid`). Deliberately
+            // no zero check, unlike the two spellings above: msodbcsql accepts
+            // 0 on all of them, and a conforming Driver Manager rejects a zero
+            // `SQL_ROWSET_SIZE` before either driver is called. See registry
+            // entry 25.
+            let ard = state.effective_ard(stmt);
+            drop(state);
+            set_desc_header(
+                stmt,
+                ard,
+                HeaderField::RowsetSize,
+                value_ptr,
+                ArraySizeClamp::ToI32Max,
+            )
+            .0
+        }
+        // The remaining header aliases: unvalidated in msodbcsql
+        // (`IsSetStmtOptionValid`), stored verbatim on the owning descriptor.
+        SQL_ATTR_ROW_BIND_TYPE
+        | SQL_ATTR_ROW_BIND_OFFSET_PTR
+        | SQL_ATTR_ROW_OPERATION_PTR
+        | SQL_ATTR_ROW_STATUS_PTR
+        | SQL_ATTR_ROWS_FETCHED_PTR
+        | SQL_ATTR_PARAM_BIND_TYPE
+        | SQL_ATTR_PARAM_BIND_OFFSET_PTR
+        | SQL_ATTR_PARAM_OPERATION_PTR
+        | SQL_ATTR_PARAM_STATUS_PTR
+        | SQL_ATTR_PARAMS_PROCESSED_PTR => {
+            let Some((owner, field)) = header_alias(attribute) else {
+                // Unreachable: every identifier in this arm is in the table.
+                post_diag(
+                    &mut state,
+                    unimplemented_attr_diag(AttrScope::Stmt, AttrOp::Set, attribute),
+                );
+                return SQL_ERROR;
+            };
+            let raw = owner.resolve(&state, stmt);
+            drop(state);
+            set_desc_header(stmt, raw, field, value_ptr, ArraySizeClamp::None).0
+        }
         SQL_ATTR_CURSOR_TYPE => {
             // The driver is forward-only. Accept SQL_CURSOR_FORWARD_ONLY as-is;
             // for any other cursor type substitute forward-only and warn with
@@ -321,11 +380,6 @@ unsafe fn sql_set_stmt_attr_w_safe(
                 );
                 SQL_SUCCESS_WITH_INFO
             }
-        }
-        SQL_ATTR_ROW_BIND_OFFSET_PTR => {
-            state.row_bind_offset_ptr = value_ptr as *mut SqlULen;
-            debug!("SQLSetStmtAttrW: SQL_ATTR_ROW_BIND_OFFSET_PTR set");
-            SQL_SUCCESS
         }
         SQL_ATTR_QUERY_TIMEOUT => {
             let (seconds, clamped) = clamp_query_timeout(value_ptr as SqlULen);
@@ -557,6 +611,228 @@ unsafe fn sql_set_stmt_attr_w_safe(
     }
 }
 
+/// Whether an array-size spelling clamps its request, mirroring msodbcsql's
+/// `IsSetStmtOptionValid` validator table (`odbc/sqlcmisc.cpp`).
+///
+/// That table is keyed on the *attribute*, not on the field it lands in, so two
+/// spellings of one storage location can validate differently — and in
+/// msodbcsql they do. `SQL_ATTR_ROW_ARRAY_SIZE` shares a `case` with
+/// `SQL_ROWSET_SIZE` that clamps to `INT32_MAX` and reports `IDS_01_S02`, while
+/// `SQL_ATTR_PARAMSET_SIZE` sits under `// Attributes with no validation` and
+/// is stored verbatim by `SQLSetStmtAttr` (`pAPDActual->dwArraySize = vParam`).
+/// Making the descriptor canonical (AB#48943) changed where the value is kept,
+/// not which rule guards each entry point, so this reproduces the asymmetry
+/// instead of imposing a uniform bound the reference driver does not have.
+#[derive(Clone, Copy)]
+enum ArraySizeClamp {
+    /// Clamp to `i32::MAX` and report `01S02` — the `SQL_ATTR_ROW_ARRAY_SIZE`
+    /// and `SQL_ROWSET_SIZE` rule.
+    ToI32Max,
+    /// Store the request verbatim — the `SQL_ATTR_PARAMSET_SIZE` rule.
+    None,
+}
+
+/// The statement's descriptor a header alias lives on: the effective ARD/APD,
+/// or the statement's own IRD/IPD.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HeaderOwner {
+    Ard,
+    Apd,
+    Ird,
+    Ipd,
+}
+
+impl HeaderOwner {
+    /// Resolved under the caller's STMT lock, which must be dropped before the
+    /// handle is dereferenced (§7.1).
+    fn resolve(self, state: &StmtState, stmt: &StmtHandle) -> SqlHandle {
+        match self {
+            HeaderOwner::Ard => state.effective_ard(stmt),
+            HeaderOwner::Apd => state.effective_apd(stmt),
+            HeaderOwner::Ird => stmt.ird,
+            HeaderOwner::Ipd => stmt.ipd,
+        }
+    }
+}
+
+/// A `DescHeader` field reachable through a statement attribute.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HeaderField {
+    ArraySize,
+    BindType,
+    BindOffsetPtr,
+    ArrayStatusPtr,
+    RowsProcessedPtr,
+    /// Not an ODBC header field — see [`DescHeader::rowset_size`].
+    RowsetSize,
+}
+
+impl HeaderField {
+    /// The value as `SQLGetStmtAttrW` reports it (all pointer-width).
+    fn read(self, header: &DescHeader) -> SqlULen {
+        match self {
+            HeaderField::ArraySize => header.array_size,
+            HeaderField::BindType => header.bind_type,
+            HeaderField::BindOffsetPtr => header.bind_offset_ptr.addr(),
+            HeaderField::ArrayStatusPtr => header.array_status_ptr.addr(),
+            HeaderField::RowsProcessedPtr => header.rows_processed_ptr.addr(),
+            HeaderField::RowsetSize => header.rowset_size,
+        }
+    }
+
+    /// Pointer fields take `value_ptr` as is; size fields take `size`.
+    fn write(self, header: &mut DescHeader, value_ptr: SqlPointer, size: SqlULen) {
+        match self {
+            HeaderField::ArraySize => header.array_size = size,
+            HeaderField::BindType => header.bind_type = size,
+            HeaderField::BindOffsetPtr => header.bind_offset_ptr = value_ptr,
+            HeaderField::ArrayStatusPtr => header.array_status_ptr = value_ptr,
+            HeaderField::RowsProcessedPtr => header.rows_processed_ptr = value_ptr,
+            HeaderField::RowsetSize => header.rowset_size = size,
+        }
+    }
+}
+
+/// Statement attributes stored on a descriptor header: the alias table in
+/// `handles::desc`, plus `SQL_ROWSET_SIZE`. Mirrors where msodbcsql's
+/// `SQLSetStmtAttr`/`SQLGetStmtAttr` keep each one. msodbcsql routes
+/// `PARAMSET_SIZE`/`PARAM_BIND_TYPE`/`PARAM_BIND_OFFSET_PTR` to the TVP child
+/// APD under `SQL_SOPT_SS_PARAM_FOCUS` (`pAPDActual`) but
+/// `PARAM_OPERATION_PTR` to the statement's APD; the same here today only
+/// because param focus is rejected.
+fn header_alias(attribute: SqlInteger) -> Option<(HeaderOwner, HeaderField)> {
+    let alias = match attribute {
+        SQL_ATTR_ROW_ARRAY_SIZE => (HeaderOwner::Ard, HeaderField::ArraySize),
+        SQL_ATTR_PARAMSET_SIZE => (HeaderOwner::Apd, HeaderField::ArraySize),
+        SQL_ATTR_ROW_BIND_TYPE => (HeaderOwner::Ard, HeaderField::BindType),
+        SQL_ATTR_PARAM_BIND_TYPE => (HeaderOwner::Apd, HeaderField::BindType),
+        SQL_ATTR_ROW_BIND_OFFSET_PTR => (HeaderOwner::Ard, HeaderField::BindOffsetPtr),
+        SQL_ATTR_PARAM_BIND_OFFSET_PTR => (HeaderOwner::Apd, HeaderField::BindOffsetPtr),
+        SQL_ATTR_ROW_OPERATION_PTR => (HeaderOwner::Ard, HeaderField::ArrayStatusPtr),
+        SQL_ATTR_PARAM_OPERATION_PTR => (HeaderOwner::Apd, HeaderField::ArrayStatusPtr),
+        SQL_ATTR_ROW_STATUS_PTR => (HeaderOwner::Ird, HeaderField::ArrayStatusPtr),
+        SQL_ATTR_PARAM_STATUS_PTR => (HeaderOwner::Ipd, HeaderField::ArrayStatusPtr),
+        SQL_ATTR_ROWS_FETCHED_PTR => (HeaderOwner::Ird, HeaderField::RowsProcessedPtr),
+        SQL_ATTR_PARAMS_PROCESSED_PTR => (HeaderOwner::Ipd, HeaderField::RowsProcessedPtr),
+        SQL_ROWSET_SIZE => (HeaderOwner::Ard, HeaderField::RowsetSize),
+        _ => return None,
+    };
+    Some(alias)
+}
+
+/// Writes one descriptor-header alias on the descriptor that owns it, applying
+/// the clamp rule that belongs to the attribute spelling the caller used.
+///
+/// `raw` is resolved under the STMT lock by the caller and that lock is dropped
+/// before this runs, so the handle is re-checked for liveness here.
+/// Returns the status and the size actually stored (size fields only), so the
+/// caller can trace it without recomputing the clamp.
+fn set_desc_header(
+    stmt: &StmtHandle,
+    raw: SqlHandle,
+    field: HeaderField,
+    value_ptr: SqlPointer,
+    clamp: ArraySizeClamp,
+) -> (SqlReturn, SqlULen) {
+    let (stored, clamped) = match clamp {
+        ArraySizeClamp::ToI32Max => clamp_array_size(value_ptr as SqlULen),
+        ArraySizeClamp::None => (value_ptr as SqlULen, false),
+    };
+    if crate::handles::live_type(raw) != Some(HandleType::Desc) {
+        return (
+            desc_header_error(stmt, "descriptor was freed concurrently"),
+            stored,
+        );
+    }
+    let desc = unsafe { handle_from_raw::<DescHandle>(raw) };
+    // `SQLSetDescFieldW` refuses this exact write while any statement on the
+    // connection is fetching through this descriptor as its effective ARD or
+    // executing through it as its effective APD
+    // (`DescHandle::update_definition`). The two spellings are one value, so
+    // refusing on only one would let a sibling statement's in-flight fetch have
+    // its rowset extent, bind offset or binding shape changed underneath the
+    // pointers it already snapshotted, or its execute have its parameter-set
+    // layout changed underneath the status array it already sized. Checked
+    // before the DESC lock, matching `update_definition`'s DBC -> STMT -> DESC
+    // order; consulted rather than reused because its diagnostic lands on the
+    // descriptor and the application called `SQLSetStmtAttrW`.
+    //
+    // Only `Ad` is passed: the calling statement is already refused by the
+    // in-progress arms at the top of `sql_set_stmt_attr_w_safe`,
+    // `validate_descriptor_association` rejects another statement's implicit
+    // descriptor with `HY017`, and an IRD/IPD is never shared, so for every
+    // other kind both answers are structurally `false`. Only an explicit
+    // descriptor can have a sibling reader. The residual same-statement window
+    // is the advisory one recorded in §7.2 of the ODBC instructions; closing it
+    // needs the descriptor-side interlock, not a second check with the same
+    // gap.
+    let readers = desc.readers_through(
+        matches!(desc.kind, DescKind::Ad),
+        matches!(desc.kind, DescKind::Ad),
+    );
+    // One walk can only report one failure, so the two previously-separate
+    // "fetch state" / "execute state" traces fold into one. The posted `HY000`
+    // text was identical either way; only the `error!` loses that resolution.
+    let (fetching, executing) = match readers {
+        Ok(pair) => pair,
+        Err(()) => {
+            return (
+                desc_header_error(stmt, "failed to check descriptor reader state"),
+                stored,
+            );
+        }
+    };
+    if fetching || executing {
+        if fetching {
+            error!("SQLSetStmtAttrW: a fetch is in progress through this descriptor");
+        } else {
+            error!("SQLSetStmtAttrW: an execute is in progress through this descriptor");
+        }
+        let Ok(mut state) = stmt.inner.lock() else {
+            error!("SQLSetStmtAttrW: stmt mutex poisoned refusing an in-flight descriptor write");
+            return (SQL_ERROR, stored);
+        };
+        post_diag(&mut state, ERR_FUNCTION_SEQUENCE);
+        return (SQL_ERROR, stored);
+    }
+    let Ok(mut desc_state) = desc.inner.lock() else {
+        return (desc_header_error(stmt, "descriptor mutex poisoned"), stored);
+    };
+    field.write(&mut desc_state.header, value_ptr, stored);
+    // Released before the STMT lock below: the crate's locking rule forbids
+    // nesting these in either order (`free_desc` already walks DBC->STMT).
+    drop(desc_state);
+    if clamped {
+        // Posted on the statement, not the descriptor: the application called
+        // `SQLSetStmtAttrW`, so that is the handle it reads diagnostics from.
+        // A poisoned lock here cannot be absorbed — returning
+        // `SQL_SUCCESS_WITH_INFO` with no record to read would hand the caller
+        // a warning it can never retrieve.
+        let Ok(mut state) = stmt.inner.lock() else {
+            error!("SQLSetStmtAttrW: stmt mutex poisoned posting the array-size clamp warning");
+            return (SQL_ERROR, stored);
+        };
+        post_diag(&mut state, WARN_ARRAY_SIZE_CHANGED);
+        return (SQL_SUCCESS_WITH_INFO, stored);
+    }
+    (SQL_SUCCESS, stored)
+}
+
+fn desc_header_error(stmt: &StmtHandle, message: &'static str) -> SqlReturn {
+    error!("SQLSet/GetStmtAttrW: {message}");
+    // Already returning `SQL_ERROR`, so a poisoned statement lock costs only
+    // the diagnostic record, not the status the caller sees.
+    if let Ok(mut state) = stmt.inner.lock() {
+        post_sql_error(
+            &mut state,
+            SQLSTATE_HY000,
+            0,
+            "Internal error accessing statement descriptor",
+        );
+    }
+    SQL_ERROR
+}
+
 /// Validates a new `SQL_ATTR_APP_ROW_DESC`/`SQL_ATTR_APP_PARAM_DESC` value and
 /// returns the slot to store in `StmtState::active_ard`/`active_apd`:
 /// `own_implicit` is the statement's own permanent implicit descriptor for
@@ -679,6 +955,14 @@ unsafe fn sql_get_stmt_attr_w_safe(
     };
     free_errors(&mut state);
 
+    // Header aliases are read from the owning descriptor, after dropping this
+    // lock.
+    if let Some((owner, field)) = header_alias(attribute) {
+        let raw = owner.resolve(&state, stmt);
+        drop(state);
+        return unsafe { get_desc_header(stmt, raw, field, value_ptr, string_length_ptr) };
+    }
+
     // Every attribute reported here is a pointer-sized integer or pointer,
     // except the two query-notification strings, which return directly because
     // they own `buffer_length` / `string_length_ptr` themselves.
@@ -700,21 +984,6 @@ unsafe fn sql_get_stmt_attr_w_safe(
                 )
             };
         }
-        SQL_ATTR_ROW_ARRAY_SIZE => unsafe {
-            write_if_some(value_ptr as *mut SqlULen, state.row_array_size);
-        },
-        SQL_ATTR_ROWS_FETCHED_PTR => unsafe {
-            write_if_some(value_ptr as *mut *mut SqlULen, state.rows_fetched_ptr);
-        },
-        SQL_ATTR_ROW_STATUS_PTR => unsafe {
-            write_if_some(value_ptr as *mut *mut SqlUSmallInt, state.row_status_ptr);
-        },
-        SQL_ATTR_ROW_BIND_TYPE => unsafe {
-            write_if_some(value_ptr as *mut SqlULen, state.row_bind_type);
-        },
-        SQL_ATTR_ROW_BIND_OFFSET_PTR => unsafe {
-            write_if_some(value_ptr as *mut *mut SqlULen, state.row_bind_offset_ptr);
-        },
         SQL_ATTR_QUERY_TIMEOUT => unsafe {
             write_if_some(value_ptr as *mut SqlULen, state.query_timeout as SqlULen);
         },
@@ -748,19 +1017,6 @@ unsafe fn sql_get_stmt_attr_w_safe(
         },
         SQL_ATTR_CONCURRENCY => unsafe {
             write_if_some(value_ptr as *mut SqlULen, SQL_CONCUR_READ_ONLY);
-        },
-        SQL_ATTR_PARAMSET_SIZE => unsafe {
-            write_if_some(value_ptr as *mut SqlULen, state.paramset_size);
-        },
-        SQL_ATTR_PARAM_BIND_TYPE
-        | SQL_ATTR_PARAM_BIND_OFFSET_PTR
-        | SQL_ATTR_PARAM_OPERATION_PTR
-        | SQL_ATTR_PARAM_STATUS_PTR
-        | SQL_ATTR_PARAMS_PROCESSED_PTR => unsafe {
-            write_if_some(
-                value_ptr as *mut SqlULen,
-                state.inert_attrs.get(attribute).unwrap_or(0),
-            );
         },
         // ARD/APD report the active association (an explicit descriptor if
         // one was set via SQLSetStmtAttrW, else the implicit default), so
@@ -826,27 +1082,76 @@ unsafe fn sql_get_stmt_attr_w_safe(
     SQL_SUCCESS
 }
 
+/// Reports a descriptor-header alias as the value of its statement attribute.
+///
+/// Returns early from the common attribute path, so it owns the value-width
+/// write that path performs at its tail.
+///
+/// # Safety
+/// `value_ptr`, when non-null, must be writable for one `SqlULen`, and
+/// `string_length_ptr`, when non-null, for one `SqlInteger` — the same
+/// contract `SQLGetStmtAttrW` places on every integer-valued attribute.
+/// `raw` must be null or a descriptor handle resolved from `stmt`; it is
+/// re-checked for liveness before being dereferenced.
+unsafe fn get_desc_header(
+    stmt: &StmtHandle,
+    raw: SqlHandle,
+    field: HeaderField,
+    value_ptr: SqlPointer,
+    string_length_ptr: *mut SqlInteger,
+) -> SqlReturn {
+    if crate::handles::live_type(raw) != Some(HandleType::Desc) {
+        return desc_header_error(stmt, "descriptor was freed concurrently");
+    }
+    let desc = unsafe { handle_from_raw::<DescHandle>(raw) };
+    // Copied out before the writes below: `write_if_some` dereferences
+    // application-supplied pointers, which can fault a page in, and holding
+    // the DESC guard across that would block every sibling statement sharing
+    // an explicit descriptor for no benefit. Matches `set_desc_header`, which
+    // drops its guard before touching anything else.
+    let value = {
+        let Ok(desc_state) = desc.inner.lock() else {
+            return desc_header_error(stmt, "descriptor mutex poisoned");
+        };
+        field.read(&desc_state.header)
+    };
+    unsafe {
+        write_if_some(value_ptr as *mut SqlULen, value);
+        write_if_some(
+            string_length_ptr,
+            SqlInteger::try_from(size_of::<SqlULen>()).unwrap_or(SqlInteger::MAX),
+        );
+    }
+    SQL_SUCCESS
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::get_desc_field::sql_get_desc_field_w;
     use crate::api::odbc_types::{
         SQL_ATTR_ASYNC_ENABLE, SQL_ATTR_ENABLE_AUTO_IPD, SQL_ATTR_FETCH_BOOKMARK_PTR,
-        SQL_ATTR_METADATA_ID, SQL_ATTR_NOSCAN, SQL_ATTR_PARAM_BIND_OFFSET_PTR,
-        SQL_ATTR_PARAM_BIND_TYPE, SQL_ATTR_PARAM_OPERATION_PTR, SQL_ATTR_PARAM_STATUS_PTR,
-        SQL_ATTR_PARAMS_PROCESSED_PTR, SQL_ATTR_RETRIEVE_DATA, SQL_ATTR_ROW_BIND_OFFSET_PTR,
-        SQL_ATTR_ROW_OPERATION_PTR, SQL_ATTR_USE_BOOKMARKS, SQL_BIND_BY_COLUMN, SQL_NTS,
-        SQL_NULL_HANDLE, SQL_RD_ON, SQL_ROWSET_SIZE, SQL_SOPT_SS_COLUMN_ENCRYPTION,
-        SQL_SOPT_SS_CURSOR_OPTIONS, SQL_SOPT_SS_DEFER_PREPARE, SQL_SOPT_SS_HIDDEN_COLUMNS,
-        SQL_SOPT_SS_NAME_SCOPE, SQL_SOPT_SS_NOBROWSETABLE, SQL_SOPT_SS_NOCOUNT_STATUS,
-        SQL_SOPT_SS_PARAM_FOCUS, SQL_SOPT_SS_QUERYNOTIFICATION_TIMEOUT, SQL_SOPT_SS_REGIONALIZE,
-        SQL_SOPT_SS_TEXTPTR_LOGGING, SqlLen,
+        SQL_ATTR_METADATA_ID, SQL_ATTR_NOSCAN, SQL_ATTR_RETRIEVE_DATA, SQL_ATTR_USE_BOOKMARKS,
+        SQL_BIND_BY_COLUMN, SQL_DESC_ARRAY_SIZE, SQL_DESC_ARRAY_STATUS_PTR,
+        SQL_DESC_BIND_OFFSET_PTR, SQL_DESC_BIND_TYPE, SQL_DESC_ROWS_PROCESSED_PTR, SQL_NTS,
+        SQL_NULL_HANDLE, SQL_RD_ON, SQL_SOPT_SS_COLUMN_ENCRYPTION, SQL_SOPT_SS_CURSOR_OPTIONS,
+        SQL_SOPT_SS_DEFER_PREPARE, SQL_SOPT_SS_HIDDEN_COLUMNS, SQL_SOPT_SS_NAME_SCOPE,
+        SQL_SOPT_SS_NOBROWSETABLE, SQL_SOPT_SS_NOCOUNT_STATUS, SQL_SOPT_SS_PARAM_FOCUS,
+        SQL_SOPT_SS_QUERYNOTIFICATION_TIMEOUT, SQL_SOPT_SS_REGIONALIZE,
+        SQL_SOPT_SS_TEXTPTR_LOGGING, SqlSmallInt, SqlUSmallInt,
     };
+    use crate::api::set_desc_field::sql_set_desc_field_w;
     use crate::api::sqlstate::{
         SQLSTATE_01004, SQLSTATE_24000, SQLSTATE_HY024, SQLSTATE_HY092, SQLSTATE_HYC00,
     };
     use crate::handles::handle_from_raw;
     use crate::handles::stmt::InertStmtAttrs;
     use crate::test_support::TestHandles;
+
+    fn header_of(desc: SqlHandle) -> DescHeader {
+        let desc = unsafe { handle_from_raw::<DescHandle>(desc) };
+        desc.inner.lock().unwrap().header
+    }
 
     #[test]
     fn set_stmt_attr_null_handle() {
@@ -956,9 +1261,6 @@ mod tests {
             unsafe { sql_set_stmt_attr_w(h.stmt, SQL_ATTR_ROW_ARRAY_SIZE, 128 as SqlPointer, 0) };
         assert_eq!(ret, SQL_SUCCESS);
 
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
-        assert_eq!(stmt.inner.lock().unwrap().row_array_size, 128);
-
         let mut out: SqlULen = 0;
         let ret = unsafe {
             sql_get_stmt_attr_w(
@@ -980,8 +1282,7 @@ mod tests {
             unsafe { sql_set_stmt_attr_w(h.stmt, SQL_ATTR_ROW_ARRAY_SIZE, 0 as SqlPointer, 0) };
         assert_eq!(ret, SQL_ERROR);
         // The previous (default) value must be left untouched.
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
-        assert_eq!(stmt.inner.lock().unwrap().row_array_size, 1);
+        assert_eq!(get_attr(h.stmt, SQL_ATTR_ROW_ARRAY_SIZE), 1);
     }
 
     #[test]
@@ -991,8 +1292,7 @@ mod tests {
         let ptr = &mut rows_fetched as *mut SqlULen;
         let ret = unsafe { sql_set_stmt_attr_w(h.stmt, SQL_ATTR_ROWS_FETCHED_PTR, ptr.cast(), 0) };
         assert_eq!(ret, SQL_SUCCESS);
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
-        assert_eq!(stmt.inner.lock().unwrap().rows_fetched_ptr, ptr);
+        assert_eq!(header_of(h.ird()).rows_processed_ptr, ptr.cast());
     }
 
     /// Previously accepted as a no-op, which silently misplaced every bound
@@ -1005,8 +1305,7 @@ mod tests {
         let ret =
             unsafe { sql_set_stmt_attr_w(h.stmt, SQL_ATTR_ROW_BIND_OFFSET_PTR, ptr.cast(), 0) };
         assert_eq!(ret, SQL_SUCCESS);
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
-        assert_eq!(stmt.inner.lock().unwrap().row_bind_offset_ptr, ptr);
+        assert_eq!(header_of(h.ard()).bind_offset_ptr, ptr.cast());
 
         // An attribute that can be set has to be readable back: reading the
         // stored field alone would not have caught a missing getter arm.
@@ -1031,8 +1330,7 @@ mod tests {
         let ptr = &mut status as *mut SqlUSmallInt;
         let ret = unsafe { sql_set_stmt_attr_w(h.stmt, SQL_ATTR_ROW_STATUS_PTR, ptr.cast(), 0) };
         assert_eq!(ret, SQL_SUCCESS);
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
-        assert_eq!(stmt.inner.lock().unwrap().row_status_ptr, ptr);
+        assert_eq!(header_of(h.ird()).array_status_ptr, ptr.cast());
     }
 
     /// The rowset pointers are the only statement attributes whose value *is* a
@@ -1377,6 +1675,522 @@ mod tests {
         assert_eq!(out, 1);
     }
 
+    fn desc_array_size(desc: SqlHandle) -> SqlULen {
+        let mut out: SqlULen = 0;
+        assert_eq!(
+            unsafe {
+                sql_get_desc_field_w(
+                    desc,
+                    0,
+                    SQL_DESC_ARRAY_SIZE as SqlSmallInt,
+                    (&mut out as *mut SqlULen).cast(),
+                    0,
+                    std::ptr::null_mut(),
+                )
+            },
+            SQL_SUCCESS
+        );
+        out
+    }
+
+    fn set_desc_array_size_field(desc: SqlHandle, value: SqlULen) -> SqlReturn {
+        unsafe {
+            sql_set_desc_field_w(
+                desc,
+                0,
+                SQL_DESC_ARRAY_SIZE as SqlSmallInt,
+                value as SqlPointer,
+                0,
+            )
+        }
+    }
+
+    #[test]
+    fn array_size_statement_attributes_write_descriptor_headers() {
+        let h = TestHandles::with_env_dbc_stmt();
+        for (attribute, desc, value) in [
+            (SQL_ATTR_PARAMSET_SIZE, h.apd(), 7),
+            (SQL_ATTR_ROW_ARRAY_SIZE, h.ard(), 9),
+        ] {
+            assert_eq!(set_attr(h.stmt, attribute, value), SQL_SUCCESS);
+            assert_eq!(desc_array_size(desc), value);
+        }
+    }
+
+    #[test]
+    fn array_size_descriptor_fields_are_visible_as_statement_attributes() {
+        let h = TestHandles::with_env_dbc_stmt();
+        for (desc, attribute, value) in [
+            (h.apd(), SQL_ATTR_PARAMSET_SIZE, 11),
+            (h.ard(), SQL_ATTR_ROW_ARRAY_SIZE, 13),
+        ] {
+            assert_eq!(set_desc_array_size_field(desc, value), SQL_SUCCESS);
+            assert_eq!(get_attr(h.stmt, attribute), value);
+        }
+    }
+
+    /// msodbcsql validates per *attribute*, not per field: `IsSetStmtOptionValid`
+    /// clamps `SQL_ATTR_ROW_ARRAY_SIZE` to `INT32_MAX` with `01S02`, but lists
+    /// `SQL_ATTR_PARAMSET_SIZE` under `// Attributes with no validation` and
+    /// stores it verbatim. Making the descriptor canonical must not quietly
+    /// impose the row-side bound on the parameter side.
+    #[test]
+    fn row_array_size_clamps_but_paramset_size_stores_verbatim() {
+        let max = i32::MAX as SqlULen;
+        let over = max + 1000;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        assert_eq!(
+            set_attr(h.stmt, SQL_ATTR_ROW_ARRAY_SIZE, over),
+            SQL_SUCCESS_WITH_INFO
+        );
+        // Read before any `sql_get_stmt_attr_w`, which frees diagnostics.
+        assert_eq!(stmt_sql_state(h.stmt), SQLSTATE_01S02);
+        assert_eq!(desc_array_size(h.ard()), max);
+        assert_eq!(get_attr(h.stmt, SQL_ATTR_ROW_ARRAY_SIZE), max);
+
+        let h = TestHandles::with_env_dbc_stmt();
+        assert_eq!(set_attr(h.stmt, SQL_ATTR_PARAMSET_SIZE, over), SQL_SUCCESS);
+        assert_eq!(
+            desc_array_size(h.apd()),
+            over,
+            "PARAMSET_SIZE is stored verbatim, matching msodbcsql"
+        );
+        assert_eq!(get_attr(h.stmt, SQL_ATTR_PARAMSET_SIZE), over);
+    }
+
+    /// The descriptor spelling clamps on *either* descriptor, independently of
+    /// which attribute aliases it. `SQLSetDescField` is the one route msodbcsql
+    /// bounds unconditionally, so an over-large APD write still clamps even
+    /// though `SQL_ATTR_PARAMSET_SIZE` does not.
+    #[test]
+    fn descriptor_spelling_clamps_on_both_descriptors() {
+        let max = i32::MAX as SqlULen;
+        let h = TestHandles::with_env_dbc_stmt();
+        for desc in [h.apd(), h.ard()] {
+            assert_eq!(
+                set_desc_array_size_field(desc, max + 1000),
+                SQL_SUCCESS_WITH_INFO
+            );
+            assert_eq!(desc_array_size(desc), max);
+        }
+    }
+
+    /// Exactly at the bound is not a clamp, so it must stay `SQL_SUCCESS` with
+    /// no diagnostic — the off-by-one neighbour of the cases above.
+    #[test]
+    fn array_size_at_the_clamp_boundary_is_plain_success() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let max = i32::MAX as SqlULen;
+        assert_eq!(set_attr(h.stmt, SQL_ATTR_ROW_ARRAY_SIZE, max), SQL_SUCCESS);
+        assert_eq!(desc_array_size(h.ard()), max);
+        assert_eq!(set_attr(h.stmt, SQL_ATTR_PARAMSET_SIZE, max), SQL_SUCCESS);
+        assert_eq!(desc_array_size(h.apd()), max);
+    }
+
+    /// Registry entry 25 covers three spellings, not four: `SQL_ROWSET_SIZE`
+    /// accepts 0 and stores it, matching msodbcsql. Rejecting it would widen
+    /// the divergence for no observable gain — a conforming Driver Manager
+    /// rejects a zero rowset size before either driver is called (measured,
+    /// build 180735). Pinned so the entry and the code cannot drift apart.
+    #[test]
+    fn rowset_size_accepts_zero_like_msodbcsql() {
+        let h = TestHandles::with_env_dbc_stmt();
+        assert_eq!(set_attr(h.stmt, SQL_ROWSET_SIZE, 7), SQL_SUCCESS);
+        assert_eq!(set_attr(h.stmt, SQL_ROWSET_SIZE, 0), SQL_SUCCESS);
+        assert_eq!(get_attr(h.stmt, SQL_ROWSET_SIZE), 0);
+
+        // The two consumed spellings still reject it.
+        assert_eq!(set_attr(h.stmt, SQL_ATTR_ROW_ARRAY_SIZE, 0), SQL_ERROR);
+        assert_eq!(set_attr(h.stmt, SQL_ATTR_PARAMSET_SIZE, 0), SQL_ERROR);
+    }
+
+    /// Every rowset control is refused mid-fetch, because a fetch snapshots
+    /// them and moving one would point it at buffers of the wrong size or
+    /// shape. `SQL_ROWSET_SIZE` is in that list for consistency rather than
+    /// necessity — nothing reads it today. Pinned so the guard is not narrowed
+    /// back without the omission being noticed.
+    #[test]
+    fn rowset_controls_are_refused_during_a_fetch() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        stmt.inner
+            .lock()
+            .unwrap()
+            .set_state(STMT_STATE_FETCH_IN_PROGRESS);
+
+        for attribute in [
+            SQL_ATTR_ROW_ARRAY_SIZE,
+            SQL_ROWSET_SIZE,
+            SQL_ATTR_ROW_BIND_TYPE,
+        ] {
+            assert_eq!(
+                set_attr(h.stmt, attribute, 4),
+                SQL_ERROR,
+                "attribute {attribute} must be refused mid-fetch"
+            );
+            assert_eq!(stmt_sql_state(h.stmt), ERR_FUNCTION_SEQUENCE.state);
+        }
+
+        stmt.inner
+            .lock()
+            .unwrap()
+            .clear_state(STMT_STATE_FETCH_IN_PROGRESS);
+        assert_eq!(set_attr(h.stmt, SQL_ROWSET_SIZE, 4), SQL_SUCCESS);
+        assert_eq!(get_attr(h.stmt, SQL_ROWSET_SIZE), 4);
+    }
+
+    /// `SQL_ROWSET_SIZE` shares msodbcsql's array-size validation case with
+    /// `SQL_ATTR_ROW_ARRAY_SIZE`, so it clamps the same way, without touching
+    /// `SQL_DESC_ARRAY_SIZE`.
+    #[test]
+    fn rowset_size_clamps_without_touching_the_array_size() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let max = i32::MAX as SqlULen;
+        assert_eq!(
+            set_attr(h.stmt, SQL_ROWSET_SIZE, max + 1000),
+            SQL_SUCCESS_WITH_INFO
+        );
+        assert_eq!(stmt_sql_state(h.stmt), SQLSTATE_01S02);
+        assert_eq!(get_attr(h.stmt, SQL_ROWSET_SIZE), max);
+        assert_eq!(
+            desc_array_size(h.ard()),
+            1,
+            "SQL_ROWSET_SIZE is not an alias of the ARD header field"
+        );
+        assert_eq!(set_attr(h.stmt, SQL_ROWSET_SIZE, 7), SQL_SUCCESS);
+        assert_eq!(get_attr(h.stmt, SQL_ROWSET_SIZE), 7);
+    }
+
+    /// The parameter-side half of the fetch gate above: `stage_execution`
+    /// snapshots the parameter-set size and then walks the caller's
+    /// `SQL_ATTR_PARAM_STATUS_PTR` array to that count, so both spellings of
+    /// the value must refuse a mid-execute write or the array is walked past
+    /// its extent.
+    #[test]
+    fn descriptor_array_size_is_refused_while_the_owning_statement_executes() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        stmt.inner
+            .lock()
+            .unwrap()
+            .set_state(STMT_STATE_EXEC_STARTED);
+
+        assert_eq!(set_attr(h.stmt, SQL_ATTR_PARAMSET_SIZE, 9), SQL_ERROR);
+        assert_eq!(
+            set_desc_array_size_field(h.apd(), 9),
+            SQL_ERROR,
+            "the descriptor spelling must refuse it too"
+        );
+        assert_eq!(
+            desc_array_size(h.apd()),
+            1,
+            "the size the execute snapshotted must not move"
+        );
+
+        stmt.inner
+            .lock()
+            .unwrap()
+            .clear_state(STMT_STATE_EXEC_STARTED);
+        assert_eq!(set_desc_array_size_field(h.apd(), 9), SQL_SUCCESS);
+    }
+
+    /// The cross-statement half: an explicit APD shared by two statements is
+    /// `DescKind::Ad`, and the sibling's own `EXEC_STARTED` is clear, so
+    /// nothing in the calling statement's state refuses this. Only a walk of
+    /// every statement on the connection can see it.
+    #[test]
+    fn array_size_attribute_is_refused_while_a_sibling_executes_through_the_apd() {
+        let mut h = TestHandles::with_env_dbc_stmt();
+        let shared = h.alloc_explicit_desc();
+        let sibling = h.alloc_extra_stmt();
+        for stmt in [h.stmt, sibling] {
+            assert_eq!(set_desc(stmt, SQL_ATTR_APP_PARAM_DESC, shared), SQL_SUCCESS);
+        }
+        assert_eq!(set_attr(h.stmt, SQL_ATTR_PARAMSET_SIZE, 2), SQL_SUCCESS);
+
+        let sibling_handle = unsafe { handle_from_raw::<StmtHandle>(sibling) };
+        sibling_handle
+            .inner
+            .lock()
+            .unwrap()
+            .set_state(STMT_STATE_EXEC_STARTED);
+
+        assert_eq!(set_attr(h.stmt, SQL_ATTR_PARAMSET_SIZE, 1000), SQL_ERROR);
+        assert_eq!(stmt_sql_state(h.stmt), ERR_FUNCTION_SEQUENCE.state);
+        assert_eq!(
+            set_desc_array_size_field(shared, 1000),
+            SQL_ERROR,
+            "the descriptor spelling must refuse it on the sibling's behalf too"
+        );
+        assert_eq!(
+            desc_array_size(shared),
+            2,
+            "the sibling's in-flight parameter-set size must not move"
+        );
+
+        sibling_handle
+            .inner
+            .lock()
+            .unwrap()
+            .clear_state(STMT_STATE_EXEC_STARTED);
+        assert_eq!(set_attr(h.stmt, SQL_ATTR_PARAMSET_SIZE, 1000), SQL_SUCCESS);
+        assert_eq!(h.free_extra_stmt(sibling), SQL_SUCCESS);
+    }
+
+    /// A rejected set must not disturb the canonical storage — otherwise a
+    /// failed call would silently resize an application's array.
+    #[test]
+    fn array_size_zero_leaves_the_descriptor_untouched() {
+        for (attribute, use_apd) in [
+            (SQL_ATTR_PARAMSET_SIZE, true),
+            (SQL_ATTR_ROW_ARRAY_SIZE, false),
+        ] {
+            let h = TestHandles::with_env_dbc_stmt();
+            let desc = if use_apd { h.apd() } else { h.ard() };
+
+            assert_eq!(set_attr(h.stmt, attribute, 5), SQL_SUCCESS);
+            assert_eq!(set_attr(h.stmt, attribute, 0), SQL_ERROR);
+            assert_eq!(stmt_sql_state(h.stmt), SQLSTATE_HY024);
+            assert_eq!(desc_array_size(desc), 5);
+            assert_eq!(get_attr(h.stmt, attribute), 5);
+        }
+    }
+
+    /// The two array sizes are aliases of *different* descriptors, so folding
+    /// them onto one canonical field must not fold them onto each other.
+    #[test]
+    fn row_and_param_array_sizes_stay_on_separate_descriptors() {
+        let h = TestHandles::with_env_dbc_stmt();
+        assert_eq!(set_attr(h.stmt, SQL_ATTR_PARAMSET_SIZE, 3), SQL_SUCCESS);
+        assert_eq!(set_attr(h.stmt, SQL_ATTR_ROW_ARRAY_SIZE, 8), SQL_SUCCESS);
+
+        assert_eq!(get_attr(h.stmt, SQL_ATTR_PARAMSET_SIZE), 3);
+        assert_eq!(get_attr(h.stmt, SQL_ATTR_ROW_ARRAY_SIZE), 8);
+        assert_eq!(desc_array_size(h.apd()), 3);
+        assert_eq!(desc_array_size(h.ard()), 8);
+    }
+
+    /// `SQLSetDescFieldW(shared_ard, SQL_DESC_ARRAY_SIZE, n)` is refused with
+    /// `HY010` while any statement on the connection fetches through that
+    /// descriptor (`DescHandle::update_definition`), and AB#48943 makes the
+    /// attribute the same value, so the attribute spelling must refuse it too.
+    /// A shared explicit ARD lets one statement reach another's rowset extent,
+    /// whose in-flight fetch has already snapshotted a `row_status_ptr` sized
+    /// for the old extent; the caller's own `STMT_STATE_FETCH_IN_PROGRESS`
+    /// guard only looks at itself.
+    #[test]
+    fn array_size_attribute_is_refused_while_a_sibling_fetches_through_the_ard() {
+        let mut h = TestHandles::with_env_dbc_stmt();
+        let shared = h.alloc_explicit_desc();
+        let sibling = h.alloc_extra_stmt();
+        for stmt in [h.stmt, sibling] {
+            assert_eq!(set_desc(stmt, SQL_ATTR_APP_ROW_DESC, shared), SQL_SUCCESS);
+        }
+        assert_eq!(set_attr(h.stmt, SQL_ATTR_ROW_ARRAY_SIZE, 2), SQL_SUCCESS);
+
+        let sibling_handle = unsafe { handle_from_raw::<StmtHandle>(sibling) };
+        sibling_handle
+            .inner
+            .lock()
+            .unwrap()
+            .set_state(STMT_STATE_FETCH_IN_PROGRESS);
+
+        assert_eq!(set_attr(h.stmt, SQL_ATTR_ROW_ARRAY_SIZE, 4), SQL_ERROR);
+        assert_eq!(stmt_sql_state(h.stmt), ERR_FUNCTION_SEQUENCE.state);
+        assert_eq!(
+            desc_array_size(shared),
+            2,
+            "the sibling's rowset extent must not move under its snapshot"
+        );
+
+        sibling_handle
+            .inner
+            .lock()
+            .unwrap()
+            .clear_state(STMT_STATE_FETCH_IN_PROGRESS);
+        assert_eq!(set_attr(h.stmt, SQL_ATTR_ROW_ARRAY_SIZE, 4), SQL_SUCCESS);
+        assert_eq!(desc_array_size(shared), 4);
+        assert_eq!(h.free_extra_stmt(sibling), SQL_SUCCESS);
+    }
+
+    /// The storage is the *effective* descriptor, so associating an explicit
+    /// one swaps the value the attribute reports and writes, and the implicit
+    /// descriptor keeps its own untouched until it is restored. This is the
+    /// behaviour that makes a two-way statement/descriptor sync impossible and
+    /// is why the descriptor was made canonical.
+    #[test]
+    fn array_size_follows_the_effective_descriptor() {
+        let mut h = TestHandles::with_env_dbc_stmt();
+        let implicit_apd = h.apd();
+        let explicit = h.alloc_explicit_desc();
+
+        assert_eq!(set_attr(h.stmt, SQL_ATTR_PARAMSET_SIZE, 5), SQL_SUCCESS);
+        assert_eq!(set_desc_array_size_field(explicit, 42), SQL_SUCCESS);
+
+        assert_eq!(
+            set_desc(h.stmt, SQL_ATTR_APP_PARAM_DESC, explicit),
+            SQL_SUCCESS
+        );
+        assert_eq!(get_attr(h.stmt, SQL_ATTR_PARAMSET_SIZE), 42);
+
+        // A set now lands on the explicit descriptor, not the implicit one.
+        assert_eq!(set_attr(h.stmt, SQL_ATTR_PARAMSET_SIZE, 9), SQL_SUCCESS);
+        assert_eq!(desc_array_size(explicit), 9);
+        assert_eq!(desc_array_size(implicit_apd), 5);
+
+        // Restoring the implicit descriptor restores its own value.
+        assert_eq!(
+            set_desc(h.stmt, SQL_ATTR_APP_PARAM_DESC, SQL_NULL_HANDLE),
+            SQL_SUCCESS
+        );
+        assert_eq!(get_attr(h.stmt, SQL_ATTR_PARAMSET_SIZE), 5);
+    }
+
+    /// Freeing an associated explicit descriptor resets the statement to its
+    /// implicit one, so the reported array size must revert with it rather
+    /// than keep reading through a dead handle.
+    #[test]
+    fn freeing_an_explicit_descriptor_reverts_the_array_size() {
+        let mut h = TestHandles::with_env_dbc_stmt();
+        let explicit = h.alloc_explicit_desc();
+
+        assert_eq!(set_attr(h.stmt, SQL_ATTR_ROW_ARRAY_SIZE, 4), SQL_SUCCESS);
+        assert_eq!(
+            set_desc(h.stmt, SQL_ATTR_APP_ROW_DESC, explicit),
+            SQL_SUCCESS
+        );
+        assert_eq!(set_attr(h.stmt, SQL_ATTR_ROW_ARRAY_SIZE, 16), SQL_SUCCESS);
+        assert_eq!(get_attr(h.stmt, SQL_ATTR_ROW_ARRAY_SIZE), 16);
+
+        assert_eq!(h.free_explicit_desc(explicit), SQL_SUCCESS);
+        assert_eq!(get_attr(h.stmt, SQL_ATTR_ROW_ARRAY_SIZE), 4);
+        assert_eq!(desc_array_size(h.ard()), 4);
+    }
+
+    /// Panics while holding a descriptor's lock, leaving the mutex poisoned.
+    fn poison_desc(desc: SqlHandle) {
+        let handle = unsafe { handle_from_raw::<DescHandle>(desc) };
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = handle.inner.lock().unwrap();
+            panic!("poison the desc lock");
+        }));
+    }
+
+    /// Reads `SQL_ATTR_PARAMSET_SIZE` without asserting success, for the
+    /// failure paths below.
+    fn try_get_paramset_size(stmt: SqlHandle) -> SqlReturn {
+        let mut out: SqlULen = 0;
+        unsafe {
+            sql_get_stmt_attr_w(
+                stmt,
+                SQL_ATTR_PARAMSET_SIZE,
+                (&mut out as *mut SqlULen).cast(),
+                0,
+                std::ptr::null_mut(),
+            )
+        }
+    }
+
+    /// Both array-size paths resolve the effective descriptor under the STMT
+    /// lock and release it before taking the DESC lock, so the descriptor can
+    /// be freed in that window. Each must fail cleanly with `HY000` rather
+    /// than dereference freed memory — and both have to be covered, since the
+    /// set and get paths resolve independently.
+    #[test]
+    fn array_size_fails_cleanly_on_a_freed_descriptor() {
+        for get_path in [false, true] {
+            let mut h = TestHandles::with_env_dbc_stmt();
+            let explicit = h.alloc_explicit_desc();
+            assert_eq!(
+                set_desc(h.stmt, SQL_ATTR_APP_PARAM_DESC, explicit),
+                SQL_SUCCESS
+            );
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            // Clearing the association first keeps `free_desc`'s reset walk
+            // from undoing the setup; restoring it afterwards reproduces the
+            // dangling pointer the resolve/lock window leaves behind. The free
+            // still goes through the fixture so the descriptor is unregistered
+            // from the DBC and untracked, leaving teardown's
+            // outstanding-descriptor assertion satisfied.
+            stmt.inner.lock().unwrap().active_apd = None;
+            assert_eq!(h.free_explicit_desc(explicit), SQL_SUCCESS);
+            stmt.inner.lock().unwrap().active_apd = Some(explicit);
+
+            let rc = if get_path {
+                try_get_paramset_size(h.stmt)
+            } else {
+                set_attr(h.stmt, SQL_ATTR_PARAMSET_SIZE, 4)
+            };
+            assert_eq!(rc, SQL_ERROR, "get_path={get_path}");
+            assert_eq!(stmt_sql_state(h.stmt), SQLSTATE_HY000);
+
+            // Drop the dangling association before teardown walks it.
+            stmt.inner.lock().unwrap().active_apd = None;
+        }
+    }
+
+    /// The other arm of the same helper: a descriptor whose mutex is poisoned
+    /// must fail the call rather than report a fabricated array size.
+    #[test]
+    fn array_size_fails_cleanly_on_a_poisoned_descriptor() {
+        for get_path in [false, true] {
+            let mut h = TestHandles::with_env_dbc_stmt();
+            let explicit = h.alloc_explicit_desc();
+            assert_eq!(
+                set_desc(h.stmt, SQL_ATTR_APP_PARAM_DESC, explicit),
+                SQL_SUCCESS
+            );
+            poison_desc(explicit);
+
+            let rc = if get_path {
+                try_get_paramset_size(h.stmt)
+            } else {
+                set_attr(h.stmt, SQL_ATTR_PARAMSET_SIZE, 4)
+            };
+            assert_eq!(rc, SQL_ERROR, "get_path={get_path}");
+            assert_eq!(stmt_sql_state(h.stmt), SQLSTATE_HY000);
+        }
+    }
+
+    /// Both array-size gets return early from the common attribute path to
+    /// reach the descriptor, so they own the value-width write that path
+    /// performs at its tail. Leaving it unwritten would hand the caller
+    /// whatever was already in that memory.
+    #[test]
+    fn array_size_get_reports_the_value_width() {
+        let h = TestHandles::with_env_dbc_stmt();
+        for attribute in [SQL_ATTR_ROW_ARRAY_SIZE, SQL_ATTR_PARAMSET_SIZE] {
+            let mut out: SqlULen = 999;
+            let mut written: SqlInteger = -1;
+            assert_eq!(
+                unsafe {
+                    sql_get_stmt_attr_w(
+                        h.stmt,
+                        attribute,
+                        (&mut out as *mut SqlULen).cast(),
+                        0,
+                        &mut written,
+                    )
+                },
+                SQL_SUCCESS
+            );
+            assert_eq!(out, 1, "both default to a single set/row");
+            assert_eq!(written, size_of::<SqlULen>() as SqlInteger);
+
+            // A null value pointer is still a success, and still reports the
+            // width.
+            written = -1;
+            assert_eq!(
+                unsafe {
+                    sql_get_stmt_attr_w(h.stmt, attribute, std::ptr::null_mut(), 0, &mut written)
+                },
+                SQL_SUCCESS
+            );
+            assert_eq!(written, size_of::<SqlULen>() as SqlInteger);
+        }
+    }
+
     #[test]
     fn get_stmt_attr_null_value_ptr_is_noop_success() {
         let h = TestHandles::with_env_dbc_stmt();
@@ -1592,46 +2406,6 @@ mod tests {
         assert_eq!(set_attr(h.stmt, SQL_ATTR_METADATA_ID, 2), SQL_ERROR);
         assert_eq!(stmt_sql_state(h.stmt), SQLSTATE_HY024);
         assert_eq!(get_attr(h.stmt, SQL_ATTR_METADATA_ID), 0);
-    }
-
-    /// `SQL_ATTR_PARAM_BIND_OFFSET_PTR` holds a *pointer to* the offset, so it
-    /// is dereferenced at execute time rather than read at set time. An
-    /// application can therefore step a binding across a buffer by writing one
-    /// `SQLLEN` between executions.
-    #[test]
-    fn param_bind_offset_is_read_through_the_stored_pointer() {
-        let mut attrs = InertStmtAttrs::default();
-        assert_eq!(
-            unsafe { attrs.param_bind_offset() },
-            0,
-            "unset is no offset"
-        );
-
-        let mut offset: SqlLen = 24;
-        let slot = &raw mut offset;
-        attrs.set(SQL_ATTR_PARAM_BIND_OFFSET_PTR, slot as SqlULen);
-        assert_eq!(unsafe { attrs.param_bind_offset() }, 24);
-
-        // Written after the set: the value is read at execute time, not
-        // captured when the attribute was assigned.
-        unsafe { slot.write(-8) };
-        assert_eq!(unsafe { attrs.param_bind_offset() }, -8);
-    }
-
-    #[test]
-    fn param_bind_offset_accepts_a_misaligned_application_pointer() {
-        let mut attrs = InertStmtAttrs::default();
-        let mut storage: [SqlLen; 2] = [0; 2];
-        let slot = unsafe { storage.as_mut_ptr().cast::<u8>().add(1).cast::<SqlLen>() };
-        assert_ne!(
-            slot as usize % std::mem::align_of::<SqlLen>(),
-            0,
-            "test pointer must be misaligned"
-        );
-        unsafe { slot.write_unaligned(24) };
-        attrs.set(SQL_ATTR_PARAM_BIND_OFFSET_PTR, slot as SqlULen);
-
-        assert_eq!(unsafe { attrs.param_bind_offset() }, 24);
     }
 
     /// `SQL_ROWSET_SIZE` shares a name with `SQL_ATTR_ROW_ARRAY_SIZE` but not a
@@ -2577,5 +3351,356 @@ mod tests {
             read_desc(h.stmt, SQL_ATTR_APP_ROW_DESC),
             (SQL_SUCCESS, desc)
         );
+    }
+
+    /// Every header alias: attribute, owning descriptor, descriptor field.
+    fn header_aliases(h: &TestHandles) -> [(SqlInteger, SqlHandle, SqlUSmallInt); 12] {
+        [
+            (SQL_ATTR_ROW_ARRAY_SIZE, h.ard(), SQL_DESC_ARRAY_SIZE),
+            (SQL_ATTR_PARAMSET_SIZE, h.apd(), SQL_DESC_ARRAY_SIZE),
+            (SQL_ATTR_ROW_BIND_TYPE, h.ard(), SQL_DESC_BIND_TYPE),
+            (SQL_ATTR_PARAM_BIND_TYPE, h.apd(), SQL_DESC_BIND_TYPE),
+            (
+                SQL_ATTR_ROW_BIND_OFFSET_PTR,
+                h.ard(),
+                SQL_DESC_BIND_OFFSET_PTR,
+            ),
+            (
+                SQL_ATTR_PARAM_BIND_OFFSET_PTR,
+                h.apd(),
+                SQL_DESC_BIND_OFFSET_PTR,
+            ),
+            (
+                SQL_ATTR_ROW_OPERATION_PTR,
+                h.ard(),
+                SQL_DESC_ARRAY_STATUS_PTR,
+            ),
+            (
+                SQL_ATTR_PARAM_OPERATION_PTR,
+                h.apd(),
+                SQL_DESC_ARRAY_STATUS_PTR,
+            ),
+            (SQL_ATTR_ROW_STATUS_PTR, h.ird(), SQL_DESC_ARRAY_STATUS_PTR),
+            (
+                SQL_ATTR_PARAM_STATUS_PTR,
+                h.ipd(),
+                SQL_DESC_ARRAY_STATUS_PTR,
+            ),
+            (
+                SQL_ATTR_ROWS_FETCHED_PTR,
+                h.ird(),
+                SQL_DESC_ROWS_PROCESSED_PTR,
+            ),
+            (
+                SQL_ATTR_PARAMS_PROCESSED_PTR,
+                h.ipd(),
+                SQL_DESC_ROWS_PROCESSED_PTR,
+            ),
+        ]
+    }
+
+    /// Distinct per alias, non-zero, and fits `SQL_DESC_BIND_TYPE`'s
+    /// `SQLINTEGER`. Pointer values are never dereferenced by set/get.
+    fn alias_value(index: usize) -> SqlULen {
+        0x1000 + 0x10 * index
+    }
+
+    fn desc_get(desc: SqlHandle, field: SqlUSmallInt) -> SqlULen {
+        let mut out: SqlULen = 0;
+        assert_eq!(
+            unsafe {
+                sql_get_desc_field_w(
+                    desc,
+                    0,
+                    field as SqlSmallInt,
+                    (&mut out as *mut SqlULen).cast(),
+                    0,
+                    std::ptr::null_mut(),
+                )
+            },
+            SQL_SUCCESS,
+            "get descriptor field {field}"
+        );
+        out
+    }
+
+    fn desc_set(desc: SqlHandle, field: SqlUSmallInt, value: SqlULen) -> SqlReturn {
+        unsafe { sql_set_desc_field_w(desc, 0, field as SqlSmallInt, value as SqlPointer, 0) }
+    }
+
+    fn desc_sql_state(desc: SqlHandle) -> [u8; 5] {
+        let desc = unsafe { handle_from_raw::<DescHandle>(desc) };
+        desc.inner.lock().unwrap().diag_records[0].sql_state
+    }
+
+    #[test]
+    fn each_alias_attribute_is_visible_through_its_descriptor_field() {
+        let h = TestHandles::with_env_dbc_stmt();
+        for (index, (attribute, desc, field)) in header_aliases(&h).into_iter().enumerate() {
+            let value = alias_value(index);
+            assert_eq!(
+                set_attr(h.stmt, attribute, value),
+                SQL_SUCCESS,
+                "set {attribute}"
+            );
+            assert_eq!(
+                desc_get(desc, field),
+                value,
+                "attribute {attribute} must be the descriptor field {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn each_alias_descriptor_field_is_visible_through_its_attribute() {
+        let h = TestHandles::with_env_dbc_stmt();
+        for (index, (attribute, desc, field)) in header_aliases(&h).into_iter().enumerate() {
+            let value = alias_value(index);
+            assert_eq!(
+                desc_set(desc, field, value),
+                SQL_SUCCESS,
+                "set field {field}"
+            );
+            assert_eq!(
+                get_attr(h.stmt, attribute),
+                value,
+                "descriptor field {field} must be attribute {attribute}"
+            );
+        }
+    }
+
+    /// A copy in the statement's store would let the two spellings drift.
+    #[test]
+    fn no_descriptor_resident_attribute_is_kept_in_the_inert_store() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let attrs = InertStmtAttrs::default();
+        for (attribute, _, _) in header_aliases(&h) {
+            assert!(!attrs.contains(attribute), "{attribute} is split storage");
+        }
+        assert!(!attrs.contains(SQL_ROWSET_SIZE));
+    }
+
+    /// Application-side aliases follow the effective ARD/APD; a newly
+    /// associated descriptor reports its own defaults (1 for `SQL_ROWSET_SIZE`).
+    #[test]
+    fn application_aliases_follow_the_effective_descriptor() {
+        let mut h = TestHandles::with_env_dbc_stmt();
+        let cases = [
+            (SQL_ATTR_ROW_BIND_TYPE, SQL_ATTR_APP_ROW_DESC, 24, 0),
+            (
+                SQL_ATTR_ROW_BIND_OFFSET_PTR,
+                SQL_ATTR_APP_ROW_DESC,
+                0x2000,
+                0,
+            ),
+            (SQL_ATTR_ROW_OPERATION_PTR, SQL_ATTR_APP_ROW_DESC, 0x3000, 0),
+            (SQL_ROWSET_SIZE, SQL_ATTR_APP_ROW_DESC, 5, 1),
+            (SQL_ATTR_PARAM_BIND_TYPE, SQL_ATTR_APP_PARAM_DESC, 48, 0),
+            (
+                SQL_ATTR_PARAM_BIND_OFFSET_PTR,
+                SQL_ATTR_APP_PARAM_DESC,
+                0x4000,
+                0,
+            ),
+            (
+                SQL_ATTR_PARAM_OPERATION_PTR,
+                SQL_ATTR_APP_PARAM_DESC,
+                0x5000,
+                0,
+            ),
+        ];
+        for (attribute, association, value, fresh_default) in cases {
+            // Fresh per case: one explicit descriptor has a single header.
+            let explicit = h.alloc_explicit_desc();
+            let implicit = if association == SQL_ATTR_APP_ROW_DESC {
+                h.ard()
+            } else {
+                h.apd()
+            };
+            assert_eq!(set_attr(h.stmt, attribute, value), SQL_SUCCESS);
+
+            assert_eq!(set_desc(h.stmt, association, explicit), SQL_SUCCESS);
+            assert_eq!(
+                get_attr(h.stmt, attribute),
+                fresh_default,
+                "{attribute} must report the newly associated descriptor's value"
+            );
+            assert_eq!(set_attr(h.stmt, attribute, value + 1), SQL_SUCCESS);
+
+            assert_eq!(set_desc(h.stmt, association, implicit), SQL_SUCCESS);
+            assert_eq!(
+                get_attr(h.stmt, attribute),
+                value,
+                "{attribute} on the implicit descriptor must be untouched"
+            );
+
+            assert_eq!(set_desc(h.stmt, association, explicit), SQL_SUCCESS);
+            assert_eq!(get_attr(h.stmt, attribute), value + 1);
+            assert_eq!(set_desc(h.stmt, association, implicit), SQL_SUCCESS);
+        }
+    }
+
+    #[test]
+    fn implementation_aliases_do_not_follow_an_application_descriptor_swap() {
+        let mut h = TestHandles::with_env_dbc_stmt();
+        let explicit = h.alloc_explicit_desc();
+        assert_eq!(
+            set_attr(h.stmt, SQL_ATTR_ROW_STATUS_PTR, 0x6000),
+            SQL_SUCCESS
+        );
+        assert_eq!(
+            set_attr(h.stmt, SQL_ATTR_PARAM_STATUS_PTR, 0x7000),
+            SQL_SUCCESS
+        );
+        assert_eq!(
+            set_desc(h.stmt, SQL_ATTR_APP_ROW_DESC, explicit),
+            SQL_SUCCESS
+        );
+        assert_eq!(
+            set_desc(h.stmt, SQL_ATTR_APP_PARAM_DESC, explicit),
+            SQL_SUCCESS
+        );
+        assert_eq!(get_attr(h.stmt, SQL_ATTR_ROW_STATUS_PTR), 0x6000);
+        assert_eq!(get_attr(h.stmt, SQL_ATTR_PARAM_STATUS_PTR), 0x7000);
+    }
+
+    /// Both spellings store the full width; `SQLGetDescField` reports the low
+    /// 32 bits (msodbcsql `GetADHeaderField`).
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn a_wide_bind_type_is_whole_through_the_attribute_and_narrowed_by_the_descriptor() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let wide: SqlULen = 0x1_0000_0018;
+        assert_eq!(set_attr(h.stmt, SQL_ATTR_ROW_BIND_TYPE, wide), SQL_SUCCESS);
+        assert_eq!(get_attr(h.stmt, SQL_ATTR_ROW_BIND_TYPE), wide);
+
+        let mut narrow: SqlInteger = -1;
+        let mut length: SqlInteger = 0;
+        assert_eq!(
+            unsafe {
+                sql_get_desc_field_w(
+                    h.ard(),
+                    0,
+                    SQL_DESC_BIND_TYPE as SqlSmallInt,
+                    (&raw mut narrow).cast(),
+                    0,
+                    &raw mut length,
+                )
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!(narrow, 0x18);
+        assert_eq!(length, size_of::<SqlInteger>() as SqlInteger);
+
+        let over_int32: SqlULen = 0x8000_0000;
+        assert_eq!(
+            desc_set(h.ard(), SQL_DESC_BIND_TYPE, over_int32),
+            SQL_SUCCESS
+        );
+        assert_eq!(get_attr(h.stmt, SQL_ATTR_ROW_BIND_TYPE), over_int32);
+    }
+
+    /// The IRD/IPD pointer fields are refused mid-fetch/execute like their
+    /// attribute spelling; other IRD writes keep `HY016`.
+    #[test]
+    fn implementation_header_pointers_are_refused_mid_call_through_the_descriptor() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        for (desc, flag) in [
+            (h.ird(), STMT_STATE_FETCH_IN_PROGRESS),
+            (h.ipd(), STMT_STATE_EXEC_STARTED),
+        ] {
+            stmt.inner.lock().unwrap().set_state(flag);
+            for field in [SQL_DESC_ARRAY_STATUS_PTR, SQL_DESC_ROWS_PROCESSED_PTR] {
+                assert_eq!(desc_set(desc, field, 0x8000), SQL_ERROR, "field {field}");
+                assert_eq!(desc_sql_state(desc), ERR_FUNCTION_SEQUENCE.state);
+                assert_eq!(desc_get(desc, field), 0, "the value must not move");
+            }
+            stmt.inner.lock().unwrap().clear_state(flag);
+            for field in [SQL_DESC_ARRAY_STATUS_PTR, SQL_DESC_ROWS_PROCESSED_PTR] {
+                assert_eq!(desc_set(desc, field, 0x8000), SQL_SUCCESS, "field {field}");
+            }
+        }
+
+        stmt.inner
+            .lock()
+            .unwrap()
+            .set_state(STMT_STATE_FETCH_IN_PROGRESS);
+        assert_eq!(desc_set(h.ird(), SQL_DESC_ARRAY_SIZE, 4), SQL_ERROR);
+        assert_eq!(
+            desc_sql_state(h.ird()),
+            *b"HY016",
+            "the blanket IRD gate still answers first"
+        );
+        stmt.inner
+            .lock()
+            .unwrap()
+            .clear_state(STMT_STATE_FETCH_IN_PROGRESS);
+    }
+
+    /// Both spellings of every header alias must refuse while the statement
+    /// fetches or executes through the owning descriptor.
+    #[test]
+    fn both_spellings_of_each_alias_are_refused_mid_call() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        for (attribute, desc, field) in header_aliases(&h) {
+            let flag = if desc == h.ard() || desc == h.ird() {
+                STMT_STATE_FETCH_IN_PROGRESS
+            } else {
+                STMT_STATE_EXEC_STARTED
+            };
+            stmt.inner.lock().unwrap().set_state(flag);
+            assert_eq!(
+                set_attr(h.stmt, attribute, 8),
+                SQL_ERROR,
+                "attribute {attribute}"
+            );
+            assert_eq!(stmt_sql_state(h.stmt), ERR_FUNCTION_SEQUENCE.state);
+            assert_eq!(
+                desc_set(desc, field, 8),
+                SQL_ERROR,
+                "field {field} of {attribute}"
+            );
+            assert_eq!(desc_sql_state(desc), ERR_FUNCTION_SEQUENCE.state);
+            stmt.inner.lock().unwrap().clear_state(flag);
+        }
+    }
+
+    /// A sibling fetching/executing through a shared explicit descriptor
+    /// refuses an alias write made through another statement.
+    #[test]
+    fn alias_attributes_are_refused_while_a_sibling_reads_the_shared_descriptor() {
+        let mut h = TestHandles::with_env_dbc_stmt();
+        let shared = h.alloc_explicit_desc();
+        let sibling = h.alloc_extra_stmt();
+        let sibling_handle = unsafe { handle_from_raw::<StmtHandle>(sibling) };
+        for (association, flag, attribute) in [
+            (
+                SQL_ATTR_APP_ROW_DESC,
+                STMT_STATE_FETCH_IN_PROGRESS,
+                SQL_ATTR_ROW_BIND_OFFSET_PTR,
+            ),
+            (
+                SQL_ATTR_APP_PARAM_DESC,
+                STMT_STATE_EXEC_STARTED,
+                SQL_ATTR_PARAM_BIND_TYPE,
+            ),
+        ] {
+            for stmt in [h.stmt, sibling] {
+                assert_eq!(set_desc(stmt, association, shared), SQL_SUCCESS);
+            }
+            sibling_handle.inner.lock().unwrap().set_state(flag);
+            assert_eq!(set_attr(h.stmt, attribute, 64), SQL_ERROR);
+            assert_eq!(stmt_sql_state(h.stmt), ERR_FUNCTION_SEQUENCE.state);
+            assert_eq!(
+                get_attr(h.stmt, attribute),
+                0,
+                "the shared value must not move"
+            );
+            sibling_handle.inner.lock().unwrap().clear_state(flag);
+            assert_eq!(set_attr(h.stmt, attribute, 64), SQL_SUCCESS);
+        }
+        assert_eq!(h.free_extra_stmt(sibling), SQL_SUCCESS);
     }
 }

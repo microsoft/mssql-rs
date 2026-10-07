@@ -34,17 +34,28 @@
 //! storage, since nothing above needs them to close the ARD/APD/IRD/IPD
 //! binding-and-metadata gap this module used to describe.
 //!
-//! Same scope note applies to four `DescHeader` fields the ODBC spec defines
-//! as *aliases* of statement attributes rather than as independent storage:
-//! `SQL_DESC_ARRAY_SIZE` (`SQL_ATTR_ROW_ARRAY_SIZE` / `PARAMSET_SIZE`),
-//! `SQL_DESC_BIND_TYPE` (`SQL_ATTR_ROW_BIND_TYPE`), `SQL_DESC_ARRAY_STATUS_PTR`
-//! (`SQL_ATTR_ROW_STATUS_PTR`), and `SQL_DESC_ROWS_PROCESSED_PTR`
-//! (`SQL_ATTR_ROWS_FETCHED_PTR`). `DescHeader` stores these independently of
-//! `StmtState`'s equivalent fields (`set_stmt_attr.rs`), so a
-//! `SQLSetStmtAttrW`/`SQLGetDescFieldW` pair (or the reverse) on the same
-//! logical value currently sees two unaliased copies. This is the one
-//! header-field gap AB#47437 did not close: it scoped record-level binding
-//! and metadata, not header-level attribute aliasing.
+//! The header fields ODBC defines as *aliases* of statement attributes are the
+//! only storage for those attributes (AB#48943, AB#49060):
+//!
+//! | Header field | Attribute (descriptor) |
+//! | --- | --- |
+//! | `SQL_DESC_ARRAY_SIZE` | `SQL_ATTR_ROW_ARRAY_SIZE` (ARD), `SQL_ATTR_PARAMSET_SIZE` (APD) |
+//! | `SQL_DESC_BIND_TYPE` | `SQL_ATTR_ROW_BIND_TYPE` (ARD), `SQL_ATTR_PARAM_BIND_TYPE` (APD) |
+//! | `SQL_DESC_BIND_OFFSET_PTR` | `SQL_ATTR_ROW_BIND_OFFSET_PTR` (ARD), `SQL_ATTR_PARAM_BIND_OFFSET_PTR` (APD) |
+//! | `SQL_DESC_ARRAY_STATUS_PTR` | `SQL_ATTR_ROW_OPERATION_PTR` (ARD), `SQL_ATTR_PARAM_OPERATION_PTR` (APD), `SQL_ATTR_ROW_STATUS_PTR` (IRD), `SQL_ATTR_PARAM_STATUS_PTR` (IPD) |
+//! | `SQL_DESC_ROWS_PROCESSED_PTR` | `SQL_ATTR_ROWS_FETCHED_PTR` (IRD), `SQL_ATTR_PARAMS_PROCESSED_PTR` (IPD) |
+//!
+//! `set_stmt_attr::header_alias` maps each attribute to its owning descriptor
+//! (the *effective* ARD/APD, or the statement's own IRD/IPD), so an ARD/APD
+//! association swaps the values, as msodbcsql's `lpstmt->pARD`/`pAPD` does.
+//! Validation stays per attribute, as in msodbcsql's `IsSetStmtOptionValid`.
+//! `SQL_ROWSET_SIZE` is not an alias but is ARD-resident in msodbcsql
+//! (`ADTag::dwRowSetSize`), so it lives here as [`DescHeader::rowset_size`].
+//!
+//! The IRD/IPD rows are easy to misread: msodbcsql writes
+//! `lpstmt->rgfArrayStatus` / `lpstmt->cmdp.pRowsProcessed`, but both fields
+//! are declared in `GENDESCTAG` and reached by inheritance
+//! (`tagSTMT : IRDTag`, `cmdp : IPDTag`), so they are the IRD/IPD headers.
 //!
 //! The equivalent *record*-side gap — `SQLBindCol` storing bindings
 //! somewhere other than the ARD, invisible to a column bound purely through
@@ -64,18 +75,19 @@ use std::ffi::c_void;
 use std::sync::Arc;
 use std::sync::Mutex;
 
-use super::stmt::STMT_STATE_FETCH_IN_PROGRESS;
+use super::stmt::{STMT_STATE_EXEC_STARTED, STMT_STATE_FETCH_IN_PROGRESS};
 use super::{DbcHandle, HandleType, HasObjectType, StmtHandle, handle_from_raw};
 use crate::api::odbc_types::{
-    SQL_C_DEFAULT, SQL_CA_SS_UDT_ASSEMBLY_TYPE_NAME, SQL_CA_SS_UDT_CATALOG_NAME,
-    SQL_CA_SS_UDT_SCHEMA_NAME, SQL_CA_SS_UDT_TYPE_NAME, SQL_DESC_ALLOC_AUTO, SQL_DESC_ALLOC_TYPE,
-    SQL_DESC_ALLOC_USER, SQL_DESC_ARRAY_SIZE, SQL_DESC_ARRAY_STATUS_PTR, SQL_DESC_BIND_OFFSET_PTR,
-    SQL_DESC_BIND_TYPE, SQL_DESC_CONCISE_TYPE, SQL_DESC_COUNT, SQL_DESC_DATA_PTR,
-    SQL_DESC_DATETIME_INTERVAL_CODE, SQL_DESC_INDICATOR_PTR, SQL_DESC_LENGTH, SQL_DESC_NAME,
-    SQL_DESC_NULLABLE, SQL_DESC_OCTET_LENGTH, SQL_DESC_OCTET_LENGTH_PTR, SQL_DESC_PARAMETER_TYPE,
-    SQL_DESC_PRECISION, SQL_DESC_ROWS_PROCESSED_PTR, SQL_DESC_SCALE, SQL_DESC_TYPE,
-    SQL_DESC_UNNAMED, SQL_ERROR, SQL_NULLABLE, SQL_PARAM_INPUT, SQL_ROWSET_SIZE_DEFAULT,
-    SQL_SUCCESS, SqlInteger, SqlLen, SqlPointer, SqlReturn, SqlSmallInt, SqlULen, SqlUSmallInt,
+    SQL_BIND_BY_COLUMN, SQL_C_DEFAULT, SQL_CA_SS_UDT_ASSEMBLY_TYPE_NAME,
+    SQL_CA_SS_UDT_CATALOG_NAME, SQL_CA_SS_UDT_SCHEMA_NAME, SQL_CA_SS_UDT_TYPE_NAME,
+    SQL_DESC_ALLOC_AUTO, SQL_DESC_ALLOC_TYPE, SQL_DESC_ALLOC_USER, SQL_DESC_ARRAY_SIZE,
+    SQL_DESC_ARRAY_STATUS_PTR, SQL_DESC_BIND_OFFSET_PTR, SQL_DESC_BIND_TYPE, SQL_DESC_CONCISE_TYPE,
+    SQL_DESC_COUNT, SQL_DESC_DATA_PTR, SQL_DESC_DATETIME_INTERVAL_CODE, SQL_DESC_INDICATOR_PTR,
+    SQL_DESC_LENGTH, SQL_DESC_NAME, SQL_DESC_NULLABLE, SQL_DESC_OCTET_LENGTH,
+    SQL_DESC_OCTET_LENGTH_PTR, SQL_DESC_PARAMETER_TYPE, SQL_DESC_PRECISION,
+    SQL_DESC_ROWS_PROCESSED_PTR, SQL_DESC_SCALE, SQL_DESC_TYPE, SQL_DESC_UNNAMED, SQL_ERROR,
+    SQL_NULLABLE, SQL_PARAM_INPUT, SQL_ROWSET_SIZE_DEFAULT, SQL_SUCCESS, SqlInteger, SqlLen,
+    SqlPointer, SqlReturn, SqlSmallInt, SqlULen, SqlUSmallInt,
 };
 use crate::api::sqlstate::{ERR_FUNCTION_SEQUENCE, SQLSTATE_HY000, post_diag};
 use crate::error::{DiagRecord, HasDiagnostics, free_errors, post_sql_error};
@@ -159,14 +171,24 @@ pub(crate) struct DescHeader {
     pub(crate) array_status_ptr: SqlPointer,
     /// `SQL_DESC_BIND_OFFSET_PTR`. ARD/APD only.
     pub(crate) bind_offset_ptr: SqlPointer,
-    /// `SQL_DESC_BIND_TYPE`. ARD/APD only. `SQLINTEGER`-width per the ODBC
-    /// descriptor field table (confirmed against msodbcsql's
-    /// `GetADHeaderField`, `sqlcdesc.cpp:4060-4063`) — unlike its
-    /// statement-attribute twin `SQL_ATTR_ROW_BIND_TYPE`/`SQL_ATTR_PARAM_BIND_TYPE`,
-    /// which are `SQLULEN`.
-    pub(crate) bind_type: SqlInteger,
+    /// `SQL_DESC_BIND_TYPE`. ARD/APD only. Pointer-width like msodbcsql's
+    /// `ADTag::dwBindType` (`SIZE_T`); only the descriptor read narrows it.
+    pub(crate) bind_type: SqlULen,
     /// `SQL_DESC_ROWS_PROCESSED_PTR`. IRD/IPD only.
     pub(crate) rows_processed_ptr: SqlPointer,
+    /// `SQL_ROWSET_SIZE` (ODBC 2.x `SQLExtendedFetch` rowset size). ARD/APD
+    /// only; no `SQL_DESC_*` field exposes it. Separate from `array_size`, as
+    /// msodbcsql's `dwRowSetSize` is. Stored and reported, never consumed.
+    pub(crate) rowset_size: SqlULen,
+}
+
+impl DescHeader {
+    /// `SQL_DESC_BIND_TYPE` as `SQLGetDescFieldW` reports it: the low 32 bits,
+    /// matching msodbcsql's `GetADHeaderField` (`(SDWORD)fDesc`).
+    pub(crate) fn bind_type_as_desc_field(&self) -> SqlInteger {
+        // Deliberate truncation.
+        self.bind_type as u32 as SqlInteger
+    }
 }
 
 impl Default for DescHeader {
@@ -176,11 +198,9 @@ impl Default for DescHeader {
             array_size: SQL_ROWSET_SIZE_DEFAULT,
             array_status_ptr: std::ptr::null_mut(),
             bind_offset_ptr: std::ptr::null_mut(),
-            // `SQL_BIND_BY_COLUMN` (0) — the constant is `SqlULen`-typed since
-            // it doubles as `SQL_ATTR_ROW_BIND_TYPE`'s value, but this field
-            // is `SQLINTEGER`-width (see field doc comment).
-            bind_type: 0,
+            bind_type: SQL_BIND_BY_COLUMN,
             rows_processed_ptr: std::ptr::null_mut(),
+            rowset_size: SQL_ROWSET_SIZE_DEFAULT,
         }
     }
 }
@@ -631,29 +651,48 @@ impl DescHandle {
     }
 
     /// Captures partial failed writes too. Never acquires DBC/STMT while DESC
-    /// is locked: the ARD fetch check runs before the DESC lock is taken.
+    /// is locked: the ARD fetch and APD execute checks both run before the
+    /// DESC lock is taken.
     pub(crate) fn update_definition(
         &self,
         record_number: SqlSmallInt,
         op: &str,
         update: impl FnOnce(&mut DescState) -> SqlReturn,
     ) -> SqlReturn {
-        let fetching = match self.kind {
-            DescKind::AppRow | DescKind::Ad => self.fetch_reads_through(),
-            _ => Ok(false),
-        };
+        // The ARD half is the fetch gate; the APD half is the parameter-side
+        // equivalent (AB#48943) — nothing else refuses a descriptor-spelling
+        // write while the owning statement is mid-execute, while the statement
+        // spelling does, so without it the two spellings of one value disagree
+        // exactly where the value bounds an application buffer.
+        self.update_definition_gated(
+            record_number,
+            op,
+            matches!(self.kind, DescKind::AppRow | DescKind::Ad),
+            matches!(self.kind, DescKind::AppParam | DescKind::Ad),
+            update,
+        )
+    }
+
+    /// [`Self::update_definition`] with the reader gate chosen by the caller.
+    /// Used for the IRD/IPD status and rows-processed pointers, so that their
+    /// descriptor spelling is refused mid-fetch/execute like the attribute
+    /// spelling. Only those two fields: other IRD writes must keep `HY016`.
+    pub(crate) fn update_definition_gated(
+        &self,
+        record_number: SqlSmallInt,
+        op: &str,
+        want_fetch: bool,
+        want_exec: bool,
+        update: impl FnOnce(&mut DescState) -> SqlReturn,
+    ) -> SqlReturn {
+        let readers = self.readers_through(want_fetch, want_exec);
         let Ok(mut state) = self.inner.lock() else {
             error!("{op}: desc mutex poisoned");
             return SQL_ERROR;
         };
         free_errors(&mut state);
-        match fetching {
-            Ok(false) => {}
-            Ok(true) => {
-                error!("{op}: a fetch is in progress through this descriptor");
-                post_diag(&mut state, ERR_FUNCTION_SEQUENCE);
-                return SQL_ERROR;
-            }
+        let (fetching, executing) = match readers {
+            Ok(pair) => pair,
             Err(()) => {
                 post_sql_error(
                     &mut state,
@@ -663,6 +702,16 @@ impl DescHandle {
                 );
                 return SQL_ERROR;
             }
+        };
+        if fetching {
+            error!("{op}: a fetch is in progress through this descriptor");
+            post_diag(&mut state, ERR_FUNCTION_SEQUENCE);
+            return SQL_ERROR;
+        }
+        if executing {
+            error!("{op}: an execute is in progress through this descriptor");
+            post_diag(&mut state, ERR_FUNCTION_SEQUENCE);
+            return SQL_ERROR;
         }
         let is_ipd = self.kind == DescKind::ImpParam;
         let previous_count = state.records.len();
@@ -705,32 +754,79 @@ impl DescHandle {
         rc
     }
 
-    /// Whether any statement is fetching through this descriptor as its
-    /// effective ARD; the fetch writes through pointers it snapshotted from
-    /// these records. An explicit descriptor may be the ARD of several
-    /// statements, so every statement on the connection is checked, in
-    /// DBC -> STMT order. `SQLBindCol` and `SQLFreeStmt(SQL_UNBIND)` check
-    /// only their own statement, so a shared explicit ARD is still mutable
-    /// through a sibling statement while another fetches through it.
-    fn fetch_reads_through(&self) -> Result<bool, ()> {
+    /// One DBC -> STMT walk answering both reader questions.
+    ///
+    /// `want_fetch` asks whether any statement is fetching through this
+    /// descriptor as its effective ARD; the fetch writes through pointers it
+    /// snapshotted from these records. `want_exec` asks the same of execution
+    /// through it as an effective APD, which snapshots the parameter-set size
+    /// and then walks the application's operation and status arrays to that
+    /// count. An explicit descriptor may be the ARD or APD of several
+    /// statements at once, so every statement on the connection is checked, in
+    /// DBC -> STMT order — a statement's own `FETCH_IN_PROGRESS`/`EXEC_STARTED`
+    /// says nothing about its siblings. (`SQLBindCol` and
+    /// `SQLFreeStmt(SQL_UNBIND)` check only their own statement, so a shared
+    /// explicit ARD stays mutable through a sibling while another fetches.)
+    ///
+    /// Both answers come from one pass: `update_definition` needs both for a
+    /// `DescKind::Ad`, and it wraps *every* descriptor write, so asking
+    /// separately would make binding N columns cost 2N connection-wide walks.
+    /// `set_stmt_attr::set_desc_header` also calls this directly, with
+    /// narrower predicates, so its diagnostic lands on the statement the
+    /// application called.
+    pub(crate) fn readers_through(
+        &self,
+        want_fetch: bool,
+        want_exec: bool,
+    ) -> Result<(bool, bool), ()> {
+        if !want_fetch && !want_exec {
+            return Ok((false, false));
+        }
         let dbc = unsafe { handle_from_raw::<DbcHandle>(self.parent_dbc) };
         let Ok(dbc_state) = dbc.inner.lock() else {
-            error!("checking ARD fetch state: dbc mutex poisoned");
+            error!("checking descriptor reader state: dbc mutex poisoned");
             return Err(());
         };
+        // An *implicit* descriptor has exactly one possible reader: the
+        // statement it belongs to. `SQL_ATTR_APP_ROW_DESC` /
+        // `SQL_ATTR_APP_PARAM_DESC` reject another statement's implicit
+        // descriptor with `HY017`, so `effective_ard`/`effective_apd` can point
+        // here for at most one statement, and an IRD/IPD is never shared.
+        // Finding it therefore ends the walk whether or not it is reading,
+        // sparing the common case the full O(statements) traversal.
+        let single_owner = !matches!(self.kind, DescKind::Ad);
+        let (mut fetching, mut executing, mut owner_found) = (false, false, false);
         for &raw in &dbc_state.statements {
             let stmt = unsafe { handle_from_raw::<StmtHandle>(raw) };
             let Ok(state) = stmt.inner.lock() else {
-                error!("checking ARD fetch state: stmt mutex poisoned");
+                error!("checking descriptor reader state: stmt mutex poisoned");
                 return Err(());
             };
-            if state.has_state(STMT_STATE_FETCH_IN_PROGRESS)
-                && std::ptr::eq(state.effective_ard(stmt).cast::<DescHandle>(), self)
+            // A fetch also reads the IRD header, an execute the IPD header.
+            if want_fetch
+                && !fetching
+                && (std::ptr::eq(state.effective_ard(stmt).cast::<DescHandle>(), self)
+                    || std::ptr::eq(stmt.ird.cast::<DescHandle>(), self))
             {
-                return Ok(true);
+                owner_found = true;
+                fetching = state.has_state(STMT_STATE_FETCH_IN_PROGRESS);
+            }
+            if want_exec
+                && !executing
+                && (std::ptr::eq(state.effective_apd(stmt).cast::<DescHandle>(), self)
+                    || std::ptr::eq(stmt.ipd.cast::<DescHandle>(), self))
+            {
+                owner_found = true;
+                executing = state.has_state(STMT_STATE_EXEC_STARTED);
+            }
+            if (!want_fetch || fetching) && (!want_exec || executing) {
+                break;
+            }
+            if single_owner && owner_found {
+                break;
             }
         }
-        Ok(false)
+        Ok((fetching, executing))
     }
 
     fn invalidate_prepared_owner(&self, first_changed: usize) -> Result<(), ()> {

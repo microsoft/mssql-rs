@@ -21,7 +21,7 @@ Crate-specific requirements for changes under `mssql-odbc/`.
 - [7.1. Handle hierarchy and locking](#71-handle-hierarchy-and-locking)
 - [7.1.1. DM guarantees we rely on](#711-dm-guarantees-we-rely-on)
 - [7.1.2. Locking rules](#712-locking-rules-mirroring-msodbcsql)
-- [7.2. Descriptor writes during a fetch](#72-descriptor-writes-during-a-fetch)
+- [7.2. Descriptor writes during a fetch or execute](#72-descriptor-writes-during-a-fetch-or-execute)
 - [7.3. Prepared parameter definitions](#73-prepared-parameter-definitions)
 - [8. FFI boundary conventions](#8-ffi-boundary-conventions)
 - [9. Types and casts](#9-types-and-casts)
@@ -311,34 +311,28 @@ on; these guarantees were verified against msodbcsql's behavior.
   but are not a complete lifetime guarantee. Establish the supported concurrent
   call sequence before treating [#441](https://github.com/microsoft/mssql-rs/issues/441)
   as a requirement for a broader ownership redesign.
-- **APD before IPD**: `SQLBindParameter`'s `bind_param_records` is the only
-  place in this crate that holds two DESC locks at once (writing a
-  parameter's APD and IPD records together). It locks APD before IPD, and
-  that must stay the only order used anywhere both are locked together —
-  `BoundParam::all_from_descriptor_states` (used by
-  `snapshot_bound_params`) only ever reads them, never locks both
-  simultaneously, so it does not need to follow this rule itself.
+- **APD before IPD**: `SQLBindParameter`'s `bind_param_records` and
+  `exec_common::snapshot_bound_params` are the only places in this crate that
+  hold two DESC locks at once. Both lock APD before IPD, and that must stay the
+  only order used anywhere both are locked together.
 - **`debug_assert!` for DM invariants**: The free path uses `debug_assert!` to
   verify the DM upheld its guarantees (e.g., no outstanding children). These
   fire in debug builds only — in release builds the driver trusts the DM and
   frees unconditionally, matching msodbcsql.
 
-### 7.2. Descriptor writes during a fetch
+### 7.2. Descriptor writes during a fetch or execute
 
-`SQLSetDescFieldW` and `SQLSetDescRec` refuse with HY010 while any statement
-on the connection is fetching through the target descriptor as its effective
-ARD. `SQLBindCol`/`SQLFreeStmt(SQL_UNBIND)` check only the calling
-statement, so a shared explicit ARD is still mutable through a sibling
-statement while another fetches through it.
-`DescHandle::update_definition` walks DBC → STMT and releases both locks
-before taking the DESC lock. `STMT_STATE_FETCH_IN_PROGRESS` is specific to this
-driver, which does not hold the STMT lock across network I/O. The check is
-advisory, not atomic with the write: a fetch can start between the walk and
-the DESC lock, as with `SQLBindCol`. That write still cannot tear, because
-fetch snapshots the ARD under the same DESC lock; closing the window would
-mean holding STMT while taking DESC, inverting §7.1's lock order. Do not justify a
-new buffer-use protocol by an application freeing storage that an outstanding
-fetch still needs.
+- The HY010 checks that refuse descriptor writes while a statement fetches or
+  executes through the descriptor (`DescHandle::readers_through`) are
+  driver-specific (registry entry 26) and advisory, not atomic with the write.
+  Do not close that window by holding a STMT lock while taking a DESC lock
+  (§7.1), or by a buffer-use protocol justified by an application freeing
+  storage early (§6.1).
+- An array size and the status array it bounds must not change between the
+  reads that pair them. Execute reads both under the APD and IPD locks at
+  once. Fetch reads the ARD and IRD in two acquisitions after taking the fetch
+  claim, which every setter of either value respects; do not merge them with a
+  second two-DESC lock order without a supported call sequence (§6.1).
 
 ### 7.3. Prepared parameter definitions
 

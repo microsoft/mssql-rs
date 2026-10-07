@@ -154,6 +154,32 @@ TEST_F(OutputParamsTest, CurrentBindOffsetDisplacesAllDescriptorPointers) {
     EXPECT_EQ(sizeof(SQLINTEGER), lengths[1]);
 }
 
+// AB#49060: outputs are written after the result sets, so the APD offset
+// pointer in force then (not at execute) decides where they land.
+TEST_F(OutputParamsTest, WriteBackFollowsAnApdOffsetPointerRepointedAfterExecute) {
+    ExecDirect("CREATE PROCEDURE #outputs @v int OUTPUT AS "
+               "SET NOCOUNT ON; SELECT 1; SET @v=73");
+    std::array<SQLINTEGER, 4> values = {-1, -1, -1, -1};
+    std::array<SQLLEN, 2> indicators = {-1, -1};
+    SQLLEN none = 0;
+    SQLLEN one_slot = sizeof(SQLLEN);
+    BindInt(1, values[0], indicators[0]);
+    SQLHDESC apd = SQL_NULL_HDESC;
+    ASSERT_SQL_OK(SQLGetStmtAttr(stmt_, SQL_ATTR_APP_PARAM_DESC, &apd, 0, nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLSetDescField(apd, 0, SQL_DESC_BIND_OFFSET_PTR, &none, 0),
+                  SQL_HANDLE_DESC, apd);
+    ASSERT_SQL_OK(Direct("{call #outputs(?)}"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLSetDescField(apd, 0, SQL_DESC_BIND_OFFSET_PTR, &one_slot, 0),
+                  SQL_HANDLE_DESC, apd);
+    FetchOnlyRow();
+    EXPECT_EQ(SQL_NO_DATA, Exhaust());
+    EXPECT_EQ(-1, values[0]) << "the pointer in force at execute is not the one used";
+    EXPECT_EQ(73, values[sizeof(SQLLEN) / sizeof(SQLINTEGER)]);
+    EXPECT_EQ(-1, indicators[0]);
+    EXPECT_EQ(sizeof(SQLINTEGER), indicators[1]);
+}
+
 TEST_F(OutputParamsTest, OutputConversionErrorsReachTheApiReturnCode) {
     ExecDirect("CREATE PROCEDURE #outputs @v varchar(8) OUTPUT AS "
                "SET NOCOUNT ON; SET @v='invalid'");

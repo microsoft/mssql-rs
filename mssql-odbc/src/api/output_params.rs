@@ -15,10 +15,11 @@ use mssql_tds::datatypes::column_values::ColumnValues;
 use mssql_tds::query::result::ReturnValue;
 use mssql_tds::token::tokenitems::ReturnValueStatus;
 
+use crate::api::exec_common::ParamArrayHeader;
 use crate::api::fetch_scroll::{RowOutcome, deliver_bound_value};
 use crate::api::odbc_types::{
-    SQL_ATTR_PARAM_BIND_TYPE, SQL_BIND_BY_COLUMN, SQL_ERROR, SQL_PARAM_INPUT_OUTPUT,
-    SQL_PARAM_OUTPUT, SQL_RETURN_VALUE, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlReturn,
+    SQL_ERROR, SQL_PARAM_INPUT_OUTPUT, SQL_PARAM_OUTPUT, SQL_RETURN_VALUE, SQL_SUCCESS,
+    SQL_SUCCESS_WITH_INFO, SqlReturn,
 };
 use crate::api::sqlstate::{ERR_INVALID_STRING_OR_BUFFER_LENGTH, post_diag};
 use crate::conversion::fetch_convert::TextOutput;
@@ -36,12 +37,13 @@ use crate::params::{BoundParam, ParamSnapshot};
 ///
 /// # Safety
 /// Every bound output parameter's value and indicator buffers must still be
-/// writable at the current parameter binding offset. `bound_params` must be a
-/// fresh effective APD/IPD snapshot, taken before acquiring the STMT lock, not
-/// the execution-time input snapshot.
+/// writable at the current parameter binding offset. `bound_params` and
+/// `header` must be a fresh effective APD/IPD snapshot, taken before acquiring
+/// the STMT lock, not the execution-time input snapshot.
 pub(crate) unsafe fn write_back_output_params(
     stmt_state: &mut StmtState,
     bound_params: &[Option<ParamSnapshot>],
+    header: &ParamArrayHeader,
     return_values: &[ReturnValue],
     return_status: Option<i32>,
 ) -> SqlReturn {
@@ -56,12 +58,9 @@ pub(crate) unsafe fn write_back_output_params(
                 SQL_PARAM_OUTPUT | SQL_PARAM_INPUT_OUTPUT | SQL_RETURN_VALUE
             )
         });
-    // The application can change the pointed-to offset after execution.
-    let bind_offset = unsafe { stmt_state.inert_attrs.param_bind_offset() };
-    let bind_type = stmt_state
-        .inert_attrs
-        .get(SQL_ATTR_PARAM_BIND_TYPE)
-        .unwrap_or(SQL_BIND_BY_COLUMN);
+    // The application can change the offset after execution.
+    let bind_offset = unsafe { header.bind_offset() };
+    let bind_type = header.bind_type;
 
     // Output parameters only; a UDF return value is not one of them.
     let outputs: Vec<&ReturnValue> = return_values
@@ -308,7 +307,7 @@ mod tests {
                 std::ptr::null_mut(),
             );
             bind(&h, old_param);
-            let stale = snapshot_bound_params(stmt).unwrap();
+            let stale = snapshot_bound_params(stmt).unwrap().params;
             {
                 let mut state = stmt.inner.lock().unwrap();
                 state.bound_params = stale;
@@ -411,7 +410,15 @@ mod tests {
         for direct_rpc in [false, true] {
             state.call_returns_status = direct_rpc;
             assert_eq!(
-                unsafe { write_back_output_params(&mut state, &[snap(param)], &values, Some(19)) },
+                unsafe {
+                    write_back_output_params(
+                        &mut state,
+                        &[snap(param)],
+                        &ParamArrayHeader::default(),
+                        &values,
+                        Some(19),
+                    )
+                },
                 SQL_SUCCESS
             );
             assert_eq!(value, if direct_rpc { 19 } else { 37 });
@@ -436,6 +443,7 @@ mod tests {
                 write_back_output_params(
                     &mut state,
                     &[None, snap(param)],
+                    &ParamArrayHeader::default(),
                     &[returned("@P1", 0, ColumnValues::Int(7))],
                     None,
                 )
@@ -448,6 +456,7 @@ mod tests {
                 write_back_output_params(
                     &mut state,
                     &[None, snap(param)],
+                    &ParamArrayHeader::default(),
                     &[returned("", 1, ColumnValues::Int(9))],
                     None,
                 )
@@ -498,7 +507,15 @@ mod tests {
         ];
         let mut state = stmt.inner.lock().unwrap();
         assert_eq!(
-            unsafe { write_back_output_params(&mut state, &bindings, &values, None) },
+            unsafe {
+                write_back_output_params(
+                    &mut state,
+                    &bindings,
+                    &ParamArrayHeader::default(),
+                    &values,
+                    None,
+                )
+            },
             SQL_ERROR
         );
         let states: Vec<_> = state.diag_records.iter().map(|r| r.sql_state).collect();

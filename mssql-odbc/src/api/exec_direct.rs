@@ -9,9 +9,9 @@ use std::time::Instant;
 
 use mssql_tds::connection::tds_client::{ExecuteOptions, StreamedParamStatus};
 
-use super::escape::translate_for_execution;
+use super::escape::{CallSite, translate_for_execution};
 use super::exec_common::{
-    ParamsWithDae, build_named_params, build_positional_params, claim_connection,
+    BoundParamSet, ParamsWithDae, build_named_params, build_positional_params, claim_connection,
     deduct_query_timeout, fail_with_tds, finish_execute_with_param_warning,
     flush_pending_unprepare, park_dae_client, park_deferred_dae, publish_scalar_processed,
     query_timeout_expired_error, snapshot_bound_params,
@@ -111,38 +111,24 @@ fn sql_exec_direct_w_safe(
 
     let dbc = stmt.parent_dbc();
 
-    // Snapshotted before the STMT lock below is taken — this crate never
-    // holds a STMT lock while acquiring a DESC lock (see bind_col.rs's
-    // rationale). Not applied to `stmt_state.bound_params` until the
-    // early-return checks below have passed, so a rejected re-entry during
-    // an active DAE sequence can't clobber that sequence's own snapshot.
-    let Ok(bound_params) = snapshot_bound_params(stmt) else {
-        error!("SQLExecDirectW: failed to snapshot parameter bindings");
-        if let Ok(mut stmt_state) = stmt.inner.lock() {
-            // Cleared first so this diagnostic lands as record 1, not
-            // appended after whatever a previous call left behind.
-            free_errors(&mut stmt_state);
-            post_sql_error(
-                &mut stmt_state,
-                SQLSTATE_HY000,
-                0,
-                "Internal error reading parameter bindings",
-            );
-        }
-        return SQL_ERROR;
-    };
-
-    // Check STMT state, gather parameter values, and reset prior context.
-    let (named_params, rewritten_sql, marker_count, call, query_timeout) = {
+    // The `EXEC_STARTED` claim must be taken before the APD is read and held
+    // across the staging closure: staging reads the parameter-set size under the
+    // DESC lock but the bind offset under the later STMT lock, and the crate
+    // forbids holding both at once, so only the claim keeps the pair consistent.
+    // A concurrent `SQLSetStmtAttrW` raising `SQL_ATTR_PARAMSET_SIZE` past 1
+    // between the reads would let the stale size of 1 skip the `HYC00` refusal
+    // below while the new offset shifts the one set that does run. Same
+    // two-phase shape as `execute.rs`'s `stage_execution`.
+    {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("SQLExecDirectW: stmt mutex poisoned");
             return SQL_ERROR;
         };
         free_errors(&mut stmt_state);
         // A statement awaiting data-at-execution input is in the ODBC "Need
-        // Data" state, where anything but SQLPutData/SQLParamData/SQLCancel is a
-        // sequence error rather than the cursor error a merely-busy statement
-        // gets.
+        // Data" state, where anything but SQLPutData/SQLParamData/SQLCancel is
+        // a sequence error rather than the cursor error a merely-busy
+        // statement gets.
         if stmt_state.needs_data() {
             error!("SQLExecDirectW: statement is awaiting data-at-execution input");
             post_diag(&mut stmt_state, ERR_FUNCTION_SEQUENCE);
@@ -153,116 +139,167 @@ fn sql_exec_direct_w_safe(
             post_diag(&mut stmt_state, ERR_INVALID_CURSOR_STATE);
             return SQL_ERROR;
         }
-        stmt_state.bound_params = bound_params;
-        // Translate escapes and rewrite markers, then read the bound parameter
-        // buffers, all before mutating any state — so a malformed escape
-        // (42000 / 22018 / 22001) or a binding error (07002 / HYC00) leaves the
-        // statement unchanged and nothing reaches the wire.
-        let output_flags: Vec<bool> = stmt_state
-            .bound_params
-            .iter()
-            .map(|param| {
-                param
-                    .as_ref()
-                    .is_some_and(|param| is_output_direction(param.param.input_output_type))
-            })
-            .collect();
-        let (rewritten_sql, marker_count, mut call) =
-            match translate_for_execution(&sql, stmt_state.inert_attrs.noscan(), &output_flags) {
-                Ok(parts) => parts,
-                Err(e) => {
-                    error!(error = %e, "SQLExecDirectW: escape translation failed");
-                    post_sql_error(&mut stmt_state, e.state(), 0, e.message());
-                    return SQL_ERROR;
-                }
-            };
-        // msodbcsql batches one sp_executesql per set here (sqlccmd.cpp:3310).
-        // Refused until AB#47939 wires that up: no shipped consumer drives it -
-        // mssql-python's executemany always uses the prepare + execute path
-        // (ddbc_bindings.cpp:3052). Refused with no markers too: msodbcsql sets
-        // iRowEnd = dwArraySize regardless of parameter count
-        // (sqlccmd.cpp:3192-3199), so running once instead of N times would
-        // drop N-1 executions with nothing to show for it.
-        if stmt_state.paramset_size > 1 {
-            error!("SQLExecDirectW: parameter arrays are not supported on this path");
-            post_sql_error(
-                &mut stmt_state,
-                SQLSTATE_HYC00,
-                0,
-                "Parameter arrays are not supported with SQLExecDirect; \
-                 prepare the statement and use SQLExecute",
-            );
-            return SQL_ERROR;
-        }
-        publish_scalar_processed(&stmt_state);
-        let bind_offset = unsafe { stmt_state.inert_attrs.param_bind_offset() };
-        let mut has_dae = false;
-        for index in 0..marker_count {
-            let Some(Some(bound)) = stmt_state.bound_params.get(index) else {
-                post_diag(&mut stmt_state, ERR_UNBOUND_PARAMETER);
-                return SQL_ERROR;
-            };
-            if index == 0
-                && call.as_ref().is_some_and(|c| c.returns_status)
-                && !is_output_direction(bound.param.input_output_type)
-            {
-                post_diag(&mut stmt_state, ERR_INVALID_PARAMETER_TYPE);
-                return SQL_ERROR;
-            }
-            let Ok(positioned) = bound.param.for_row(0, bind_offset, SQL_BIND_BY_COLUMN) else {
-                post_diag(&mut stmt_state, ERR_INVALID_STRING_OR_BUFFER_LENGTH);
-                return SQL_ERROR;
-            };
-            has_dae |= unsafe { data_at_exec_indicator(&positioned) }.is_some();
-        }
-        // Both streaming implementations execute text, so they need every named
-        // variable, including a return assignment, rather than RPC arguments.
-        call = call.filter(|c| c.is_rpc_eligible() && !has_dae);
-        // A canonical call binds its parameters by position; everything else
-        // binds them by the `@P1..@Pn` names the rewritten text declares.
-        let rpc_call = call.as_ref();
-        let named_params = match rpc_call {
-            Some(c) => {
-                let skip = usize::from(c.returns_status);
-                match unsafe {
-                    build_positional_params(&mut stmt_state, marker_count, skip, "SQLExecDirectW")
-                } {
-                    Ok(params) => params,
-                    Err(rc) => return rc,
-                }
-            }
-            None => {
-                match unsafe { build_named_params(&mut stmt_state, marker_count, "SQLExecDirectW") }
-                {
-                    Ok(params) => params,
-                    Err(rc) => return rc,
-                }
-            }
-        };
-        // A new execute invalidates prior metadata/context immediately, so a
-        // later execute failure cannot expose stale SQLNumResultCols/DescribeCol state.
-        stmt_state.clear_state(STMT_STATE_EXEC_CONTEXT);
-        stmt_state.clear_result_metadata();
-        stmt_state.reset_row_stream();
-        stmt_state.row_count = SQL_NO_ROWCOUNT_TOTAL;
-        stmt_state.pending_row_counts.clear();
-        // Superseding a prepared plan orphans its server handle; release it
-        // (deferred) once we hold the client below.
-        stmt_state.orphan_prepared_handle();
-        stmt_state.prepared = None;
-        stmt_state.direct_marker_count = Some(marker_count);
-        stmt_state.parameter_metadata.clear();
-        stmt_state.parameter_udt_names.clear();
-        stmt_state.clear_state(STMT_STATE_PREPARED);
-        stmt_state.call_returns_status = call.as_ref().is_some_and(|c| c.returns_status);
         stmt_state.set_state(STMT_STATE_EXEC_STARTED);
-        (
-            named_params,
-            rewritten_sql,
-            marker_count,
-            call,
-            stmt_state.query_timeout,
-        )
+    }
+
+    // Check STMT state, gather parameter values, and reset prior context.
+    let staged =
+        (|| -> Result<(ParamsWithDae, String, usize, Option<CallSite>, u32), SqlReturn> {
+            // Snapshotted before the STMT lock below is taken — this crate
+            // never holds a STMT lock while acquiring a DESC lock (see
+            // bind_col.rs's rationale). Inside the closure so its failure
+            // funnels through the single release point below; nothing else
+            // clears `STMT_STATE_EXEC_STARTED`, so a leak here bricks the
+            // handle. Not applied to `stmt_state.bound_params` until the
+            // early-return checks below have passed, so a rejected re-entry
+            // during an active DAE sequence can't clobber that sequence's own
+            // snapshot.
+            let Ok(BoundParamSet {
+                params: bound_params,
+                header,
+            }) = snapshot_bound_params(stmt)
+            else {
+                error!("SQLExecDirectW: failed to snapshot parameter bindings");
+                if let Ok(mut stmt_state) = stmt.inner.lock() {
+                    // The claim block above already cleared the diagnostics,
+                    // and nothing between there and here posts one, so this
+                    // `HY000` is record 1 without clearing again.
+                    post_sql_error(
+                        &mut stmt_state,
+                        SQLSTATE_HY000,
+                        0,
+                        "Internal error reading parameter bindings",
+                    );
+                }
+                return Err(SQL_ERROR);
+            };
+
+            let Ok(mut stmt_state) = stmt.inner.lock() else {
+                error!("SQLExecDirectW: stmt mutex poisoned");
+                return Err(SQL_ERROR);
+            };
+            stmt_state.bound_params = bound_params;
+            // Translate escapes and rewrite markers, then read the bound parameter
+            // buffers, all before mutating any state — so a malformed escape
+            // (42000 / 22018 / 22001) or a binding error (07002 / HYC00) leaves the
+            // statement unchanged and nothing reaches the wire.
+            let output_flags: Vec<bool> = stmt_state
+                .bound_params
+                .iter()
+                .map(|param| {
+                    param
+                        .as_ref()
+                        .is_some_and(|param| is_output_direction(param.param.input_output_type))
+                })
+                .collect();
+            let (rewritten_sql, marker_count, mut call) =
+                match translate_for_execution(&sql, stmt_state.inert_attrs.noscan(), &output_flags)
+                {
+                    Ok(parts) => parts,
+                    Err(e) => {
+                        error!(error = %e, "SQLExecDirectW: escape translation failed");
+                        post_sql_error(&mut stmt_state, e.state(), 0, e.message());
+                        return Err(SQL_ERROR);
+                    }
+                };
+            // msodbcsql batches one sp_executesql per set here (sqlccmd.cpp:3310).
+            // Refused until AB#47939 wires that up: no shipped consumer drives it -
+            // mssql-python's executemany always uses the prepare + execute path
+            // (ddbc_bindings.cpp:3052). Refused with no markers too: msodbcsql sets
+            // iRowEnd = dwArraySize regardless of parameter count
+            // (sqlccmd.cpp:3192-3199), so running once instead of N times would
+            // drop N-1 executions with nothing to show for it.
+            if header.array_size > 1 {
+                error!("SQLExecDirectW: parameter arrays are not supported on this path");
+                post_sql_error(
+                    &mut stmt_state,
+                    SQLSTATE_HYC00,
+                    0,
+                    "Parameter arrays are not supported with SQLExecDirect; \
+                     prepare the statement and use SQLExecute",
+                );
+                return Err(SQL_ERROR);
+            }
+            publish_scalar_processed(&header);
+            let bind_offset = unsafe { header.bind_offset() };
+            let mut has_dae = false;
+            for index in 0..marker_count {
+                let Some(Some(bound)) = stmt_state.bound_params.get(index) else {
+                    post_diag(&mut stmt_state, ERR_UNBOUND_PARAMETER);
+                    return Err(SQL_ERROR);
+                };
+                if index == 0
+                    && call.as_ref().is_some_and(|c| c.returns_status)
+                    && !is_output_direction(bound.param.input_output_type)
+                {
+                    post_diag(&mut stmt_state, ERR_INVALID_PARAMETER_TYPE);
+                    return Err(SQL_ERROR);
+                }
+                let Ok(positioned) = bound.param.for_row(0, bind_offset, SQL_BIND_BY_COLUMN) else {
+                    post_diag(&mut stmt_state, ERR_INVALID_STRING_OR_BUFFER_LENGTH);
+                    return Err(SQL_ERROR);
+                };
+                has_dae |= unsafe { data_at_exec_indicator(&positioned) }.is_some();
+            }
+            // Both streaming implementations execute text, so they need every named
+            // variable, including a return assignment, rather than RPC arguments.
+            call = call.filter(|c| c.is_rpc_eligible() && !has_dae);
+            // A canonical call binds its parameters by position; everything else
+            // binds them by the `@P1..@Pn` names the rewritten text declares.
+            let rpc_call = call.as_ref();
+            let named_params = match rpc_call {
+                Some(c) => {
+                    let skip = usize::from(c.returns_status);
+                    unsafe {
+                        build_positional_params(
+                            &mut stmt_state,
+                            marker_count,
+                            skip,
+                            bind_offset,
+                            "SQLExecDirectW",
+                        )
+                    }?
+                }
+                None => unsafe {
+                    build_named_params(&mut stmt_state, marker_count, bind_offset, "SQLExecDirectW")
+                }?,
+            };
+            // A new execute invalidates prior metadata/context immediately, so a
+            // later execute failure cannot expose stale SQLNumResultCols/DescribeCol state.
+            stmt_state.clear_state(STMT_STATE_EXEC_CONTEXT);
+            stmt_state.clear_result_metadata();
+            stmt_state.reset_row_stream();
+            stmt_state.row_count = SQL_NO_ROWCOUNT_TOTAL;
+            stmt_state.pending_row_counts.clear();
+            // Superseding a prepared plan orphans its server handle; release it
+            // (deferred) once we hold the client below.
+            stmt_state.orphan_prepared_handle();
+            stmt_state.prepared = None;
+            stmt_state.direct_marker_count = Some(marker_count);
+            stmt_state.parameter_metadata.clear();
+            stmt_state.parameter_udt_names.clear();
+            stmt_state.clear_state(STMT_STATE_PREPARED);
+            stmt_state.call_returns_status = call.as_ref().is_some_and(|c| c.returns_status);
+            stmt_state.set_state(STMT_STATE_EXEC_STARTED);
+            Ok((
+                named_params,
+                rewritten_sql,
+                marker_count,
+                call,
+                stmt_state.query_timeout,
+            ))
+        })();
+    let (named_params, rewritten_sql, marker_count, call, query_timeout) = match staged {
+        Ok(staged) => staged,
+        Err(rc) => {
+            // Released at one point rather than at each of the staging block's
+            // early returns: a statement left claimed would refuse its own
+            // parameter setters and every later execute.
+            if let Ok(mut stmt_state) = stmt.inner.lock() {
+                stmt_state.clear_state(STMT_STATE_EXEC_STARTED);
+            }
+            return rc;
+        }
     };
 
     let ParamsWithDae {
@@ -574,6 +611,84 @@ mod tests {
         );
     }
 
+    /// The `EXEC_STARTED` claim is what keeps the APD size and the STMT-side
+    /// bind offset consistent (see `sql_exec_direct_w_safe`). The helper holds
+    /// the APD lock, which parks staging inside the window rather than racing
+    /// it, so the setter must already be refused by the time staging blocks.
+    #[test]
+    fn paramset_size_cannot_be_raised_during_exec_direct_staging() {
+        use std::sync::mpsc;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt_addr = h.stmt as usize;
+        let apd_addr = h.apd() as usize;
+        let (ready_tx, ready_rx) = mpsc::channel::<()>();
+        let (rc_tx, rc_rx) = mpsc::channel::<SqlReturn>();
+
+        let helper = std::thread::spawn(move || {
+            let apd = unsafe { handle_from_raw::<DescHandle>(apd_addr as SqlHandle) };
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(stmt_addr as SqlHandle) };
+            let guard = apd.inner.lock().unwrap();
+            ready_tx.send(()).unwrap();
+
+            let mut claimed = false;
+            for _ in 0..100_000 {
+                if stmt
+                    .inner
+                    .lock()
+                    .map(|s| s.has_state(crate::handles::stmt::STMT_STATE_EXEC_STARTED))
+                    .unwrap_or(false)
+                {
+                    claimed = true;
+                    break;
+                }
+                std::thread::yield_now();
+            }
+            assert!(claimed, "staging must claim before it reads the APD");
+
+            let rc = unsafe {
+                crate::api::set_stmt_attr::sql_set_stmt_attr_w(
+                    stmt_addr as SqlHandle,
+                    crate::api::odbc_types::SQL_ATTR_PARAMSET_SIZE,
+                    4 as crate::api::odbc_types::SqlPointer,
+                    0,
+                )
+            };
+            rc_tx.send(rc).unwrap();
+            drop(guard);
+        });
+
+        ready_rx.recv().unwrap();
+        // Fails on the unbound marker, well after the window under test.
+        let sql: Vec<u16> = "SELECT ? AS v"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let _ = unsafe { sql_exec_direct_w(h.stmt, sql.as_ptr(), SQL_NTS) };
+        helper.join().unwrap();
+
+        assert_eq!(
+            rc_rx.recv().unwrap(),
+            SQL_ERROR,
+            "raising the parameter set mid-staging must be refused"
+        );
+        let apd = unsafe { handle_from_raw::<DescHandle>(h.apd()) };
+        assert_eq!(
+            apd.inner.lock().unwrap().header.array_size,
+            1,
+            "the size staging read must still be the stored one"
+        );
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        assert!(
+            !stmt
+                .inner
+                .lock()
+                .unwrap()
+                .has_state(crate::handles::stmt::STMT_STATE_EXEC_STARTED),
+            "a failed staging must release the claim"
+        );
+    }
+
     #[test]
     fn unbound_parameter_marker_returns_07002() {
         let h = TestHandles::with_env_dbc_stmt();
@@ -692,6 +807,10 @@ mod tests {
             state.diag_records[0]
                 .message
                 .contains("Internal error reading parameter bindings")
+        );
+        assert!(
+            !state.has_state(STMT_STATE_EXEC_STARTED),
+            "a failed snapshot must release the claim"
         );
     }
 

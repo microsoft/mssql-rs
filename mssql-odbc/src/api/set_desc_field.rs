@@ -122,7 +122,7 @@ fn sql_set_desc_field_w_safe(
     value_ptr: SqlPointer,
     buffer_length: SqlInteger,
 ) -> SqlReturn {
-    desc.update_definition(record_number, "SQLSetDescFieldW", |state| {
+    let update = |state: &mut DescState| {
         set_desc_field(
             state,
             desc.kind,
@@ -131,7 +131,22 @@ fn sql_set_desc_field_w_safe(
             value_ptr,
             buffer_length,
         )
-    })
+    };
+    // The IRD/IPD status and rows-processed pointers alias attributes that
+    // `SQLSetStmtAttrW` refuses mid-fetch/execute; refuse this spelling too.
+    let header_pointer = matches!(
+        SqlUSmallInt::try_from(field_identifier),
+        Ok(SQL_DESC_ARRAY_STATUS_PTR | SQL_DESC_ROWS_PROCESSED_PTR)
+    );
+    match desc.kind {
+        DescKind::ImpRow if header_pointer => {
+            desc.update_definition_gated(record_number, "SQLSetDescFieldW", true, false, update)
+        }
+        DescKind::ImpParam if header_pointer => {
+            desc.update_definition_gated(record_number, "SQLSetDescFieldW", false, true, update)
+        }
+        _ => desc.update_definition(record_number, "SQLSetDescFieldW", update),
+    }
 }
 
 fn set_desc_field(
@@ -226,6 +241,27 @@ fn set_record_count_field(
     SQL_SUCCESS
 }
 
+/// Clamps a requested rowset/array size to `i32::MAX`, returning the value to
+/// store and whether the request had to be reduced.
+///
+/// msodbcsql applies this same bound with the same `01S02` from two
+/// independent places: this file's `SQL_DESC_ARRAY_SIZE` branch, and
+/// `IsSetStmtOptionValid`'s shared `case SQL_ROWSET_SIZE:` /
+/// `case SQL_ATTR_ROW_ARRAY_SIZE:` branch (`odbc/sqlcmisc.cpp`). It is
+/// deliberately *not* applied to `SQL_ATTR_PARAMSET_SIZE`, which that same
+/// validator lists under `// Attributes with no validation` — see
+/// `set_stmt_attr::ArraySizeClamp`, which carries that table.
+///
+/// `i32::MAX` always fits `SqlULen` (`usize`), so the cast cannot truncate.
+pub(crate) fn clamp_array_size(requested: SqlULen) -> (SqlULen, bool) {
+    let max = i32::MAX as SqlULen;
+    if requested > max {
+        (max, true)
+    } else {
+        (requested, false)
+    }
+}
+
 /// Header fields other than `SQL_DESC_COUNT` (handled by the caller since it
 /// needs the record list, not just the header).
 fn set_header_field(
@@ -237,26 +273,24 @@ fn set_header_field(
         SQL_DESC_ARRAY_SIZE => {
             let requested = value_ptr as SqlULen;
             // Zero is not a valid rowset size — matches this crate's own
-            // SQL_ATTR_ROW_ARRAY_SIZE validation (set_stmt_attr.rs) and the
-            // ODBC-mandated minimum of 1 row per rowset. Deliberate
-            // divergence from msodbcsql, which stores 0 unvalidated and only
-            // clamps the upper bound (`sqlcdesc.cpp:4161-4167`) — do not
-            // "fix" this back toward msodbcsql's behavior.
+            // SQL_ATTR_ROW_ARRAY_SIZE / SQL_ATTR_PARAMSET_SIZE validation
+            // (set_stmt_attr.rs) and the ODBC-mandated minimum of 1 row per
+            // rowset. Deliberate divergence from msodbcsql, which stores 0
+            // unvalidated and only clamps the upper bound: registry entry 25
+            // in docs/parity-deviations.md owns that decision — do not "fix"
+            // this back toward msodbcsql's behavior without updating it.
             if requested == 0 {
                 error!("SQLSetDescFieldW: SQL_DESC_ARRAY_SIZE of 0 is invalid");
                 post_diag(state, ERR_INVALID_ATTRIBUTE_VALUE);
                 return SQL_ERROR;
             }
-            let Ok(max) = SqlULen::try_from(i32::MAX) else {
-                return SQL_ERROR; // unreachable
-            };
-            if requested > max {
+            let (stored, clamped) = clamp_array_size(requested);
+            state.header.array_size = stored;
+            if clamped {
                 // Clamped with 01S02, matching msodbcsql (sqlcdesc.cpp:4161-4167).
-                state.header.array_size = max;
                 post_diag(state, WARN_ARRAY_SIZE_CHANGED);
                 return SQL_SUCCESS_WITH_INFO;
             }
-            state.header.array_size = requested;
             SQL_SUCCESS
         }
         SQL_DESC_ARRAY_STATUS_PTR => {
@@ -268,12 +302,9 @@ fn set_header_field(
             SQL_SUCCESS
         }
         SQL_DESC_BIND_TYPE => {
-            let requested = value_ptr as SqlULen;
-            let Ok(v) = SqlInteger::try_from(requested) else {
-                post_diag(state, ERR_INVALID_ATTRIBUTE_VALUE);
-                return SQL_ERROR;
-            };
-            state.header.bind_type = v;
+            // Stored unvalidated at full width, like msodbcsql's
+            // `SetADHeaderField` (measured: 0x80000000 succeeds there).
+            state.header.bind_type = value_ptr as SqlULen;
             SQL_SUCCESS
         }
         SQL_DESC_ROWS_PROCESSED_PTR => {

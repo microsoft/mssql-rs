@@ -937,7 +937,6 @@ reach for reasons unrelated to mssql-python.
 | 4 | data-at-execution combined with an array | `HYC00` at execute | No - drops to a row-by-row loop when any parameter is DAE | AB#47958 |
 | 5 | output / `InputOutput` parameters in arrays only (`SQL_ATTR_PARAMSET_SIZE > 1`) | binding accepted; array execution returns `HYC00` | No - binds `SQL_PARAM_INPUT` only | AB#48148 |
 | 6 | array stride for `SQL_C_SS_VECTOR` | binding refused | No - never binds the vector C type | AB#48326 |
-| 7 | array size set through `SQLSetDescField(apd, SQL_DESC_ARRAY_SIZE, n)` | accepted, then one set executes | No - uses `SQLSetStmtAttr`; `SQLSetDescField` only for `SQL_C_NUMERIC` | AB#47945 |
 | 8 | server reports fewer sets than `PARAMSET_SIZE` with no error | `SQL_SUCCESS_WITH_INFO` and `01000` naming the reported count; msodbcsql returns `SQL_SUCCESS`; no known server behaviour produces it | n/a - not consumer-gated | AB#47945 |
 | 9 | `SQL_DIAG_ROW_NUMBER` on a diagnostic raised during array execution | always `SQL_NO_ROW_NUMBER` - no per-set attribution is plumbed through `post_tds_error` yet, so a batch with several failing sets reports several records with no mapping back to the row that produced each one | No - the array errors surface, but `AppendDiagRecords` reads records with `SQLGetDiagRecW` and its only `SQLGetDiagFieldW` call asks for `SQL_DIAG_SQLSTATE`, so the missing attribution is never observed | microsoft/mssql-rs#541 |
 
@@ -961,17 +960,6 @@ only as DONE tokens arrive - and it has no `SQL_PARAM_UNUSED` pre-fill, so its
 unreported status entries keep whatever the application left in the buffer. Read
 from source; not measured, because neither driver can be driven into the state.
 
-Divergence 7 is new surface rather than new behaviour. ODBC defines
-`SQL_ATTR_PARAMSET_SIZE` as an alias for the APD header's
-`SQL_DESC_ARRAY_SIZE`, but the two have separate storage here:
-`set_stmt_attr.rs` writes `StmtState::paramset_size`, `set_desc_field.rs` writes
-the descriptor header, and `stage_execution` reads only the former. The split
-predates this work - the row-side attributes have the same shape - but it was
-harmless while `PARAMSET_SIZE > 1` was refused outright. Now the descriptor
-route is the one spelling that silently executes a single set, and
-`SQLGetDescField` and `SQLGetStmtAttr` can disagree about the same logical
-value.
-
 Only 1 is partly a decision: `stage_execution` already walks every
 `(row, parameter)` pair once for the input-only and data-at-execution
 refusals, so the pass itself is not what streaming avoids. Matching
@@ -983,8 +971,8 @@ code, correct there because nothing ran, and reporting it over committed
 rows would invite a retry that double-inserts. The rest are gaps.
 
 Divergences 1, 2 and 4 are pinned by `param_array_test.cpp` cases gated with
-`SKIP_IF_COMPARING_MSODBCSQL()` (there is no divergence 3; the numbers are
-stable identifiers and are not reused); 5 by
+`SKIP_IF_COMPARING_MSODBCSQL()` (there is no divergence 3, and 7 was resolved by
+AB#48943/AB#49060; the numbers are stable identifiers and are not reused); 5 by
 the input-only array validation in `stage_execution`.
 
 Single-row output/input-output parameters and call return values are supported (AB#46384 / AB#48049). Direct RPC and `EXEC ... OUTPUT` text routes match returned parameters by name or ordinal. Delivery uses current bindings and bind offsets, survives fetch exhaustion and connection reuse, and respects rebind/`SQL_RESET_PARAMS`. Writeback reports string/fractional truncation (`01004`/`01S07`) and conversion/indicator errors (`22018`/`22002`).
