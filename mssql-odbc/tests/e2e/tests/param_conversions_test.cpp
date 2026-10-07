@@ -2014,6 +2014,8 @@ TEST_F(ScalarConversionLiveTest, XmlParamRoundTrips) {
 // PLP opener and one chunk per SQLPutData call; the final length alone cannot
 // distinguish streaming from whole-value buffering.
 TEST_F(ScalarConversionLiveTest, LargeXmlStreamsThroughDataAtExecution) {
+    SKIP_IF_COMPARING_MSODBCSQL();
+
     std::string xml = "<root>";
     const std::string element = "<v>abcdefghij</v>";
     for (int i = 0; i < 10000; ++i) {
@@ -2025,8 +2027,8 @@ TEST_F(ScalarConversionLiveTest, LargeXmlStreamsThroughDataAtExecution) {
                   SQL_HANDLE_STMT, stmt_);
     SQLCHAR token = 0;
     SQLLEN indicator = SQL_LEN_DATA_AT_EXEC(static_cast<SQLLEN>(xml.size()));
-    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_CHAR, SQL_SS_XML, 0, 0,
-                                   &token, 0, &indicator),
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_CHAR, SQL_SS_XML,
+                                   static_cast<SQLULEN>(xml.size()), 0, &token, 0, &indicator),
                   SQL_HANDLE_STMT, stmt_);
 
     SQLPOINTER returned = nullptr;
