@@ -242,13 +242,10 @@ unsafe fn sql_set_stmt_attr_w_safe(
             }
             let ard = state.effective_ard(stmt);
             drop(state);
-            let rc = set_desc_array_size(stmt, ard, n, ArraySizeClamp::ToI32Max);
+            let (rc, stored) = set_desc_array_size(stmt, ard, n, ArraySizeClamp::ToI32Max);
             if rc != SQL_ERROR {
                 debug!(
-                    // The stored size, not the request: on the clamp path
-                    // these differ, and the trace is where the real value
-                    // matters most.
-                    row_array_size = clamp_array_size(n).0,
+                    row_array_size = stored,
                     "SQLSetStmtAttrW: SQL_ATTR_ROW_ARRAY_SIZE set"
                 );
             }
@@ -275,7 +272,7 @@ unsafe fn sql_set_stmt_attr_w_safe(
             n => {
                 let apd = state.effective_apd(stmt);
                 drop(state);
-                set_desc_array_size(stmt, apd, n, ArraySizeClamp::None)
+                set_desc_array_size(stmt, apd, n, ArraySizeClamp::None).0
             }
         },
         SQL_ROWSET_SIZE => {
@@ -623,18 +620,23 @@ enum ArraySizeClamp {
 ///
 /// `raw` is resolved under the STMT lock by the caller and that lock is dropped
 /// before this runs, so the handle is re-checked for liveness here.
+/// Returns the status and the size actually stored — the caller traces that
+/// rather than recomputing the clamp, so the rule lives in one place.
 fn set_desc_array_size(
     stmt: &StmtHandle,
     raw: SqlHandle,
     value: SqlULen,
     clamp: ArraySizeClamp,
-) -> SqlReturn {
+) -> (SqlReturn, SqlULen) {
     let (stored, clamped) = match clamp {
         ArraySizeClamp::ToI32Max => clamp_array_size(value),
         ArraySizeClamp::None => (value, false),
     };
     if crate::handles::live_type(raw) != Some(HandleType::Desc) {
-        return desc_array_size_error(stmt, "descriptor was freed concurrently");
+        return (
+            desc_array_size_error(stmt, "descriptor was freed concurrently"),
+            stored,
+        );
     }
     let desc = unsafe { handle_from_raw::<DescHandle>(raw) };
     // `SQLSetDescFieldW` refuses this exact write while any statement on the
@@ -667,7 +669,12 @@ fn set_desc_array_size(
     // text was identical either way; only the `error!` loses that resolution.
     let (fetching, executing) = match readers {
         Ok(pair) => pair,
-        Err(()) => return desc_array_size_error(stmt, "failed to check descriptor reader state"),
+        Err(()) => {
+            return (
+                desc_array_size_error(stmt, "failed to check descriptor reader state"),
+                stored,
+            );
+        }
     };
     if fetching || executing {
         if fetching {
@@ -677,13 +684,16 @@ fn set_desc_array_size(
         }
         let Ok(mut state) = stmt.inner.lock() else {
             error!("SQLSetStmtAttrW: stmt mutex poisoned refusing an in-flight resize");
-            return SQL_ERROR;
+            return (SQL_ERROR, stored);
         };
         post_diag(&mut state, ERR_FUNCTION_SEQUENCE);
-        return SQL_ERROR;
+        return (SQL_ERROR, stored);
     }
     let Ok(mut desc_state) = desc.inner.lock() else {
-        return desc_array_size_error(stmt, "descriptor mutex poisoned");
+        return (
+            desc_array_size_error(stmt, "descriptor mutex poisoned"),
+            stored,
+        );
     };
     desc_state.header.array_size = stored;
     // Released before the STMT lock below: the crate's locking rule forbids
@@ -697,12 +707,12 @@ fn set_desc_array_size(
         // a warning it can never retrieve.
         let Ok(mut state) = stmt.inner.lock() else {
             error!("SQLSetStmtAttrW: stmt mutex poisoned posting the array-size clamp warning");
-            return SQL_ERROR;
+            return (SQL_ERROR, stored);
         };
         post_diag(&mut state, WARN_ARRAY_SIZE_CHANGED);
-        return SQL_SUCCESS_WITH_INFO;
+        return (SQL_SUCCESS_WITH_INFO, stored);
     }
-    SQL_SUCCESS
+    (SQL_SUCCESS, stored)
 }
 
 fn desc_array_size_error(stmt: &StmtHandle, message: &'static str) -> SqlReturn {

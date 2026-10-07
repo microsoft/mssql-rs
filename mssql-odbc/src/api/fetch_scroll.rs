@@ -926,9 +926,11 @@ fn fetch_scroll_safe(
             // just dropped for. A concurrent free must not turn a known
             // `SQL_NO_DATA` into an error, so a freed descriptor returns the
             // already-computed verdict unchanged rather than walking with a
-            // guessed extent. A *poisoned* lock is an internal failure, and
-            // reporting normal completion through it would violate the crate's
-            // poisoned-mutex contract.
+            // guessed extent — the status array is then left holding whatever
+            // the previous rowset wrote into it, since there is no extent that
+            // can safely be walked. A *poisoned* lock is an internal failure,
+            // and reporting normal completion through it would violate the
+            // crate's poisoned-mutex contract.
             //
             // Filling the status array here is a divergence from msodbcsql,
             // which returns `SQL_NO_DATA` with zero rows fetched and leaves the
