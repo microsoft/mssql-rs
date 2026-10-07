@@ -20,7 +20,6 @@ steps:
     osType: MacOS
 
 - script: |
-    brew update
     brew uninstall cmake --ignore-dependencies || echo "CMake not installed or already removed"
     brew install cmake
   displayName: 'Install CMake'
