@@ -55,7 +55,14 @@ if [ -z "$native_libs" ]; then
   exit 1
 fi
 
-archive="${CARGO_TARGET_DIR:-$repo_root/target}/$target/release/libmssql_sqlcmd.a"
+# Cargo's resolved target directory honors CARGO_TARGET_DIR and [build] target-dir.
+target_dir="$(cargo metadata --no-deps --format-version 1 |
+  sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')"
+if [ -z "$target_dir" ]; then
+  echo "ERROR: cargo metadata reports no target_directory" >&2
+  exit 1
+fi
+archive="$target_dir/$target/release/libmssql_sqlcmd.a"
 dest="$out_dir/runtimes/$rid/native"
 mkdir -p "$dest"
 cp -f "$archive" "$dest/libmssql_sqlcmd.a"

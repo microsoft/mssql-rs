@@ -14,6 +14,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tarfile
 import xml.etree.ElementTree as ET
 import zipfile
@@ -896,6 +897,114 @@ def test_sqlcmd_pack_rejects_a_runtime_from_two_artifacts(tmp_path: Path) -> Non
 
     assert result.returncode != 0
     assert "Runtime linux-x64 was staged by more than one artifact" in result.stderr
+
+
+# Stands in for cargo: metadata reports FAKE_TARGET_DIR the way cargo resolves
+# [build] target-dir, and rustc writes a "fresh" archive there.
+_FAKE_CARGO = """\
+import json, os, sys
+args = sys.argv[1:]
+target_dir = os.environ["FAKE_TARGET_DIR"]
+if args and args[0] == "metadata":
+    packages = [{"name": "mssql-sqlcmd", "version": "0.1.0"}]
+    print(json.dumps({"packages": packages, "target_directory": target_dir}, separators=(",", ":")))
+elif args and args[0] == "rustc":
+    target = args[args.index("--target") + 1]
+    release = os.path.join(target_dir, target, "release")
+    os.makedirs(release, exist_ok=True)
+    name = "mssql_sqlcmd.lib" if "windows" in target else "libmssql_sqlcmd.a"
+    with open(os.path.join(release, name), "w") as archive:
+        archive.write("fresh\\n")
+    print("note: native-static-libs: -lfake", file=sys.stderr)
+"""
+
+
+def _sqlcmd_native_build_fixture(tmp_path: Path, script: str) -> tuple[Path, dict[str, str]]:
+    """A repository holding only the build script, with a stale archive in the
+    default target/ and cargo configured to build elsewhere."""
+    repo = tmp_path / "repo"
+    scripts = repo / ".pipeline" / "scripts"
+    scripts.mkdir(parents=True)
+    shutil.copy2(_ROOT / ".pipeline" / "scripts" / script, scripts / script)
+
+    for target, name in (
+        ("x86_64-pc-windows-msvc", "mssql_sqlcmd.lib"),
+        ("x86_64-unknown-linux-gnu", "libmssql_sqlcmd.a"),
+    ):
+        stale = repo / "target" / target / "release"
+        stale.mkdir(parents=True)
+        (stale / name).write_text("stale\n", encoding="utf-8")
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "fake_cargo.py").write_text(_FAKE_CARGO, encoding="utf-8")
+    for tool, body in (("cargo", '"$(dirname "$0")/fake_cargo.py"'), ("rustup", None)):
+        if sys.platform == "win32":
+            run = f'@"{sys.executable}" "%~dp0fake_cargo.py" %*' if body else "@exit /b 0"
+            (bin_dir / f"{tool}.cmd").write_text(run + "\r\n", encoding="ascii")
+        else:
+            run = f'exec "{sys.executable}" {body} "$@"' if body else "exit 0"
+            stub = bin_dir / tool
+            stub.write_text(f"#!/usr/bin/env bash\n{run}\n", newline="\n")
+            stub.chmod(0o755)
+
+    env = {k: v for k, v in os.environ.items() if k != "CARGO_TARGET_DIR"}
+    env["PATH"] = str(bin_dir) + os.pathsep + env["PATH"]
+    env["FAKE_TARGET_DIR"] = str(tmp_path / "configured-target")
+    return repo, env
+
+
+@pytest.mark.skipif(shutil.which("pwsh") is None, reason="needs pwsh")
+def test_sqlcmd_windows_build_stages_from_cargos_target_directory(tmp_path: Path) -> None:
+    repo, env = _sqlcmd_native_build_fixture(tmp_path, "build-mssql-sqlcmd-native.ps1")
+    out = tmp_path / "out"
+    result = subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-File",
+            str(repo / ".pipeline" / "scripts" / "build-mssql-sqlcmd-native.ps1"),
+            "-OutputDirectory",
+            str(out),
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    for rid in ("win-x64", "win-x86", "win-arm64"):
+        native = out / "runtimes" / rid / "native"
+        assert (native / "mssql_sqlcmd.lib").read_text(encoding="utf-8") == "fresh\n"
+        assert (native / "native-static-libs.txt").read_text(encoding="ascii").strip() == "-lfake"
+    assert (out / "mssql-sqlcmd-version.txt").read_text(encoding="ascii").strip() == "0.1.0"
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32" or shutil.which("bash") is None, reason="needs a Unix bash"
+)
+def test_sqlcmd_unix_build_stages_from_cargos_target_directory(tmp_path: Path) -> None:
+    repo, env = _sqlcmd_native_build_fixture(tmp_path, "build-mssql-sqlcmd-native.sh")
+    out = tmp_path / "out"
+    result = subprocess.run(
+        [
+            "bash",
+            str(repo / ".pipeline" / "scripts" / "build-mssql-sqlcmd-native.sh"),
+            "x86_64-unknown-linux-gnu",
+            "linux-x64",
+            str(out),
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    native = out / "runtimes" / "linux-x64" / "native"
+    assert (native / "libmssql_sqlcmd.a").read_text(encoding="utf-8") == "fresh\n"
+    assert (native / "native-static-libs.txt").read_text(encoding="ascii").strip() == "-lfake"
 
 
 def test_sqlcmd_pack_takes_required_runtimes_as_one_comma_separated_argument(

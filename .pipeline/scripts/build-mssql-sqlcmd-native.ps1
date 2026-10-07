@@ -34,7 +34,6 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
-$targetDir = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $repoRoot 'target' }
 
 Push-Location $repoRoot
 try {
@@ -42,6 +41,9 @@ try {
     # job has no Rust toolchain, so it is recorded here, where cargo runs.
     $metadata = & cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
     if ($LASTEXITCODE -ne 0) { throw 'cargo metadata failed' }
+    # Cargo's resolved target directory honors CARGO_TARGET_DIR and [build] target-dir.
+    $targetDir = $metadata.target_directory
+    if (-not $targetDir) { throw 'cargo metadata reports no target_directory' }
     $crate = $metadata.packages | Where-Object name -eq 'mssql-sqlcmd'
     if (-not $crate) { throw 'cargo metadata lists no mssql-sqlcmd package' }
     New-Item -ItemType Directory -Force -Path $OutputDirectory | Out-Null
