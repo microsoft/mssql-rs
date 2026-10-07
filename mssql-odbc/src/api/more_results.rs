@@ -10,7 +10,7 @@
 
 use tracing::{debug, error};
 
-use crate::api::exec_common::snapshot_bound_params;
+use crate::api::exec_common::{ParamArrayHeader, snapshot_bound_params};
 use crate::api::output_params::write_back_output_params;
 
 use mssql_tds::connection::tds_client::{ResultSet, StatementResult};
@@ -99,15 +99,15 @@ fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
             {
                 // The values belong to this statement, not to the client that
                 // may already be executing a different statement.
-                let bound = bound_params.as_ref().ok();
+                // Params and header are matched in one step: they must come
+                // from the same snapshot, since a default header's null
+                // pointers are only safe alongside an empty param slice.
+                let (params, header) = match bound_params.as_ref() {
+                    Ok(b) => (b.params.as_slice(), b.header),
+                    Err(_) => (&[][..], ParamArrayHeader::default()),
+                };
                 unsafe {
-                    write_back_output_params(
-                        &mut stmt_state,
-                        bound.map(|b| b.params.as_slice()).unwrap_or_default(),
-                        &bound.map(|b| b.header).unwrap_or_default(),
-                        &values,
-                        status,
-                    )
+                    write_back_output_params(&mut stmt_state, params, &header, &values, status)
                 }
             } else {
                 SQL_SUCCESS
@@ -338,12 +338,16 @@ fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
             // application read a value the spec says is not available yet.
             let return_values = client.get_return_values();
             let return_status = client.get_return_status();
-            let bound = bound_params.as_ref().ok();
+            // One match, as above: a default header only pairs with no params.
+            let (params, header) = match bound_params.as_ref() {
+                Ok(b) => (b.params.as_slice(), b.header),
+                Err(_) => (&[][..], ParamArrayHeader::default()),
+            };
             let output_rc = unsafe {
                 write_back_output_params(
                     &mut stmt_state,
-                    bound.map(|b| b.params.as_slice()).unwrap_or_default(),
-                    &bound.map(|b| b.header).unwrap_or_default(),
+                    params,
+                    &header,
                     &return_values,
                     return_status,
                 )

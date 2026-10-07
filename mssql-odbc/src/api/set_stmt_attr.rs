@@ -213,8 +213,10 @@ unsafe fn sql_set_stmt_attr_w_safe(
         }
         // The rowset controls are read into a fetch's snapshot, so moving them
         // mid-fetch would point it at buffers of the wrong size or shape.
-        // `SQL_ROWSET_SIZE` and `SQL_ATTR_ROW_OPERATION_PTR` are unconsumed
-        // today but gated so both spellings of each ARD field agree.
+        // `SQL_ATTR_ROW_OPERATION_PTR` is unconsumed today but gated so both
+        // spellings of the ARD's `SQL_DESC_ARRAY_STATUS_PTR` agree.
+        // `SQL_ROWSET_SIZE` has no descriptor spelling; it is gated
+        // pre-emptively, for consistency with the other rowset controls.
         SQL_ATTR_ROW_ARRAY_SIZE
         | SQL_ROWSET_SIZE
         | SQL_ATTR_ROWS_FETCHED_PTR
