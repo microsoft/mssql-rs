@@ -548,21 +548,8 @@ pub(crate) struct StmtState {
     /// (in memory — no cursor or connection), mirroring msodbcsql's one
     /// result set per DML statement.
     pub(crate) pending_row_counts: VecDeque<i64>,
-    /// Application buffer that receives the count of rows fetched by a block
-    /// fetch (`SQL_ATTR_ROWS_FETCHED_PTR`); null when unset. The application
-    /// owns this buffer and must keep it valid across the fetch.
-    pub(crate) rows_fetched_ptr: *mut SqlULen,
-    /// Application array that receives per-row status codes
-    /// (`SQL_ATTR_ROW_STATUS_PTR`); null when unset.
-    pub(crate) row_status_ptr: *mut SqlUSmallInt,
-    /// Row binding orientation (`SQL_ATTR_ROW_BIND_TYPE`): `SQL_BIND_BY_COLUMN`
-    /// (0) for column-wise arrays, otherwise a row-struct byte size.
-    pub(crate) row_bind_type: SqlULen,
-    /// Application-supplied byte offset added to every bound column's data and
-    /// indicator pointer at fetch time (`SQL_ATTR_ROW_BIND_OFFSET_PTR`); null
-    /// when unset. Read at fetch rather than at bind, so the application can
-    /// move the whole rowset by updating the pointed-to value.
-    pub(crate) row_bind_offset_ptr: *mut SqlULen,
+    // The row-side header aliases (rows fetched, row status, row bind type and
+    // offset) live on the ARD/IRD, not here: see `handles::desc`.
     /// The active application row descriptor for `SQL_ATTR_APP_ROW_DESC`:
     /// `None` means "use the implicit ARD" (`StmtHandle::ard`); `Some` holds
     /// an explicitly-allocated descriptor associated by
@@ -628,10 +615,12 @@ pub(crate) struct StmtState {
 ///
 /// Every entry was measured against msodbcsql 18 rather than taken from the
 /// ODBC headers, because several defaults are driver choices rather than
-/// specification values: `SQL_ATTR_SIMULATE_CURSOR` reports `SQL_SC_UNIQUE`,
-/// `SQL_ROWSET_SIZE` reports 1, and `SQL_ATTR_CURSOR_SENSITIVITY` reports
-/// `SQL_INSENSITIVE` even though the header default is `SQL_UNSPECIFIED`.
-/// See `docs/attributes_plan.md` §8.
+/// specification values: `SQL_ATTR_SIMULATE_CURSOR` reports `SQL_SC_UNIQUE`
+/// and `SQL_ATTR_CURSOR_SENSITIVITY` reports `SQL_INSENSITIVE` even though the
+/// header default is `SQL_UNSPECIFIED`. See `docs/attributes_plan.md` §8.
+///
+/// Descriptor-resident attributes (`SQL_ROWSET_SIZE` and the header aliases)
+/// do not belong here even when unconsumed: they must follow a descriptor swap.
 const INERT_STMT_ATTRS: &[(SqlInteger, SqlULen)] = &[
     (
         odbc_types::SQL_ATTR_CURSOR_SENSITIVITY,
@@ -641,7 +630,6 @@ const INERT_STMT_ATTRS: &[(SqlInteger, SqlULen)] = &[
     (odbc_types::SQL_ATTR_MAX_LENGTH, 0),
     (odbc_types::SQL_ATTR_ASYNC_ENABLE, 0),
     (odbc_types::SQL_ATTR_KEYSET_SIZE, 0),
-    (odbc_types::SQL_ROWSET_SIZE, 1),
     (
         odbc_types::SQL_ATTR_SIMULATE_CURSOR,
         odbc_types::SQL_SC_UNIQUE,
@@ -650,12 +638,6 @@ const INERT_STMT_ATTRS: &[(SqlInteger, SqlULen)] = &[
     (odbc_types::SQL_ATTR_USE_BOOKMARKS, 0),
     (odbc_types::SQL_ATTR_ENABLE_AUTO_IPD, 0),
     (odbc_types::SQL_ATTR_FETCH_BOOKMARK_PTR, 0),
-    (odbc_types::SQL_ATTR_PARAM_BIND_OFFSET_PTR, 0),
-    (odbc_types::SQL_ATTR_PARAM_BIND_TYPE, 0),
-    (odbc_types::SQL_ATTR_PARAM_OPERATION_PTR, 0),
-    (odbc_types::SQL_ATTR_PARAM_STATUS_PTR, 0),
-    (odbc_types::SQL_ATTR_PARAMS_PROCESSED_PTR, 0),
-    (odbc_types::SQL_ATTR_ROW_OPERATION_PTR, 0),
     (odbc_types::SQL_ATTR_METADATA_ID, 0),
 ];
 
@@ -665,18 +647,8 @@ const INERT_STMT_ATTRS: &[(SqlInteger, SqlULen)] = &[
 /// storing them is *not* without effect, so they must not be reported as
 /// ignored. Keep this in step with the consumers:
 /// - `SQL_ATTR_NOSCAN` via [`InertStmtAttrs::noscan`] (`prepare`, `exec_direct`,
-///   `execute`),
-/// - `SQL_ATTR_PARAM_BIND_OFFSET_PTR` via [`InertStmtAttrs::param_bind_offset`],
-/// - the remaining parameter-array attributes, read by `execute` and
-///   `exec_common` when binding and reporting a parameter set.
-const HONOURED_INERT_STMT_ATTRS: &[SqlInteger] = &[
-    odbc_types::SQL_ATTR_NOSCAN,
-    odbc_types::SQL_ATTR_PARAM_BIND_OFFSET_PTR,
-    odbc_types::SQL_ATTR_PARAM_BIND_TYPE,
-    odbc_types::SQL_ATTR_PARAM_OPERATION_PTR,
-    odbc_types::SQL_ATTR_PARAM_STATUS_PTR,
-    odbc_types::SQL_ATTR_PARAMS_PROCESSED_PTR,
-];
+///   `execute`).
+const HONOURED_INERT_STMT_ATTRS: &[SqlInteger] = &[odbc_types::SQL_ATTR_NOSCAN];
 
 /// One bit per [`INERT_STMT_ATTRS`] entry, set the first time that attribute is
 /// reported as stored without effect.
@@ -701,7 +673,7 @@ const _: () = assert!(
 /// A flat array keyed by a linear scan is deliberate: the set is small and
 /// fixed, and holding the identifiers and their defaults in one auditable
 /// table keeps a measured default from drifting away from the attribute it
-/// belongs to, which nineteen separate struct fields would invite.
+/// belongs to, which one struct field per attribute would invite.
 #[derive(Debug, Clone)]
 pub(crate) struct InertStmtAttrs([SqlULen; INERT_STMT_ATTRS.len()]);
 
@@ -780,28 +752,6 @@ impl InertStmtAttrs {
             }
             None => false,
         }
-    }
-
-    /// Reads the byte offset `SQL_ATTR_PARAM_BIND_OFFSET_PTR` currently points
-    /// at, or 0 when the application has not set one.
-    ///
-    /// The attribute holds a *pointer to* the offset rather than the offset
-    /// itself, so the application can move every binding by writing one
-    /// `SQLLEN` between executions. It is therefore read at execute time, not
-    /// at set time.
-    ///
-    /// # Safety
-    /// When set, the pointer must address a live `SQLLEN` for the duration of
-    /// the execution, per the `SQLSetStmtAttr` contract. ODBC does not require
-    /// application pointers to be aligned.
-    pub(crate) unsafe fn param_bind_offset(&self) -> isize {
-        let ptr = self
-            .get(odbc_types::SQL_ATTR_PARAM_BIND_OFFSET_PTR)
-            .unwrap_or(0) as *const odbc_types::SqlLen;
-        if ptr.is_null() {
-            return 0;
-        }
-        unsafe { ptr.read_unaligned() }
     }
 }
 
@@ -1651,10 +1601,6 @@ impl StmtHandle {
                 direct_text_target: None,
                 row_count: -1,
                 pending_row_counts: VecDeque::new(),
-                rows_fetched_ptr: std::ptr::null_mut(),
-                row_status_ptr: std::ptr::null_mut(),
-                row_bind_type: crate::api::odbc_types::SQL_BIND_BY_COLUMN,
-                row_bind_offset_ptr: std::ptr::null_mut(),
                 active_ard: None,
                 active_apd: None,
                 state_flags: 0,
@@ -1720,22 +1666,12 @@ mod tests {
     ///
     /// - `SQL_ATTR_NOSCAN` — `InertStmtAttrs::noscan`, read by `prepare`,
     ///   `exec_direct` and `execute`.
-    /// - `SQL_ATTR_PARAM_BIND_OFFSET_PTR` — `InertStmtAttrs::param_bind_offset`.
-    /// - the remaining parameter-array attributes — read by `execute` and
-    ///   `exec_common` when binding and reporting a parameter set.
     ///
     /// Removing a consumer means moving its attribute out of the list here,
     /// not just deleting the call site.
     #[test]
     fn the_honoured_inert_attributes_are_exactly_the_consumed_ones() {
-        let mut expected = vec![
-            odbc_types::SQL_ATTR_NOSCAN,
-            odbc_types::SQL_ATTR_PARAM_BIND_OFFSET_PTR,
-            odbc_types::SQL_ATTR_PARAM_BIND_TYPE,
-            odbc_types::SQL_ATTR_PARAM_OPERATION_PTR,
-            odbc_types::SQL_ATTR_PARAM_STATUS_PTR,
-            odbc_types::SQL_ATTR_PARAMS_PROCESSED_PTR,
-        ];
+        let mut expected = vec![odbc_types::SQL_ATTR_NOSCAN];
         let mut actual = HONOURED_INERT_STMT_ATTRS.to_vec();
         expected.sort_unstable();
         actual.sort_unstable();
@@ -1972,7 +1908,8 @@ mod tests {
             assert!(ColumnBinding::all_from_ard_state(s).is_empty());
         });
         let handle = StmtHandle::new(std::ptr::null_mut(), 0);
-        assert!(handle.inner.lock().unwrap().row_bind_offset_ptr.is_null());
+        let ard = unsafe { crate::handles::handle_from_raw::<DescHandle>(handle.ard) };
+        assert!(ard.inner.lock().unwrap().header.bind_offset_ptr.is_null());
     }
 
     #[test]

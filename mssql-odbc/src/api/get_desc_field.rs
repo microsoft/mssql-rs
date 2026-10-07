@@ -202,7 +202,7 @@ fn header_field_value(header: &DescHeader, field: SqlUSmallInt) -> Option<FieldV
         SQL_DESC_ARRAY_SIZE => FieldValue::ULen(header.array_size),
         SQL_DESC_ARRAY_STATUS_PTR => FieldValue::Pointer(header.array_status_ptr),
         SQL_DESC_BIND_OFFSET_PTR => FieldValue::Pointer(header.bind_offset_ptr),
-        SQL_DESC_BIND_TYPE => FieldValue::Integer(header.bind_type),
+        SQL_DESC_BIND_TYPE => FieldValue::Integer(header.bind_type_as_desc_field()),
         SQL_DESC_ROWS_PROCESSED_PTR => FieldValue::Pointer(header.rows_processed_ptr),
         _ => return None,
     };

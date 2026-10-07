@@ -55,15 +55,17 @@ unsafe fn sql_more_results_impl(statement_handle: SqlHandle) -> SqlReturn {
 
 fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn {
     // DESC locks must not nest beneath STMT, including the exhausted fast path.
-    let bound_params = snapshot_bound_params(stmt);
+    let snapshot = snapshot_bound_params(stmt);
     // Free any stale diagnostics and observe cursor state.
-    let cursor_open = {
+    let (cursor_open, bound_params) = {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("SQLMoreResults: stmt mutex poisoned");
             return SQL_ERROR;
         };
         free_errors(&mut stmt_state);
-        if bound_params.is_err() {
+        // Unwrapped here, after `free_errors`, so both write-back sites below
+        // get the params and header from one snapshot without a fallback.
+        let Ok(bound_params) = snapshot else {
             post_sql_error(
                 &mut stmt_state,
                 SQLSTATE_HY000,
@@ -71,7 +73,7 @@ fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
                 "Internal error snapshotting output parameter bindings",
             );
             return SQL_ERROR;
-        }
+        };
         if let Some(e) = stmt_state.pending_fetch_error.take() {
             // A prior fetch's read-ahead peek already discovered this result
             // set ends in a SQL Server error (see AB#47508's
@@ -102,7 +104,8 @@ fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
                 unsafe {
                     write_back_output_params(
                         &mut stmt_state,
-                        bound_params.as_deref().unwrap_or_default(),
+                        bound_params.params.as_slice(),
+                        &bound_params.header,
                         &values,
                         status,
                     )
@@ -141,7 +144,7 @@ fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
             }
             return SQL_SUCCESS;
         }
-        stmt_state.has_state(STMT_STATE_CURSOR_OPEN)
+        (stmt_state.has_state(STMT_STATE_CURSOR_OPEN), bound_params)
     };
 
     if !cursor_open {
@@ -339,7 +342,8 @@ fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
             let output_rc = unsafe {
                 write_back_output_params(
                     &mut stmt_state,
-                    bound_params.as_deref().unwrap_or_default(),
+                    bound_params.params.as_slice(),
+                    &bound_params.header,
                     &return_values,
                     return_status,
                 )

@@ -868,3 +868,45 @@ msodbcsql build is measured.
     Introduced with AB#48943, which made the descriptor header the canonical
     storage behind the two array-size attributes; the rejection itself predates
     it on all three spellings.
+26. **A descriptor-header write that races an in-flight fetch or execute
+    through that descriptor is refused with `HY010`; msodbcsql applies it.**
+    msodbcsql has no statement-state check for these writes:
+    `SQLSetDescField`'s preconditions (`odbc/sqlcdesc.cpp`) check only handle
+    type, the IRD two-field whitelist, TVP nesting and `RecNumber`, then assign
+    `rgfArrayStatus` / `pRowsProcessed` unconditionally. `SQLSetStmtAttr`'s
+    `IsSetStmtOptionValid` (`odbc/sqlcmisc.cpp`) only range-checks these
+    attributes; its one `HY010` is scoped to setting `SQL_ATTR_ASYNC_ENABLE`
+    itself, so none of them is refused for statement state, async or not.
+
+    This driver refuses, through both spellings, a write to a descriptor that a
+    statement is currently fetching through (ARD or IRD,
+    `STMT_STATE_FETCH_IN_PROGRESS`) or executing through (APD or IPD,
+    `STMT_STATE_EXEC_STARTED`) — including a sibling statement sharing an
+    explicit ARD/APD (`DescHandle::readers_through`). The driver does not hold
+    the STMT lock across network I/O; fetch and execute snapshot these pointers
+    and sizes, so a write mid-call would desynchronize the snapshot from the
+    application's buffers. The check is advisory (instructions §7.2).
+
+    Reachable only by a call concurrent with the fetch/execute: a
+    single-threaded application cannot call during one, and the Driver Manager
+    already refuses descriptor writes during a Need Data sequence
+    (instructions §7.3).
+
+    Evidence level: source reading only. No `SQL_DRIVER_VER` or tested build is
+    recorded, and unlike entry 14 nothing prevents measuring this — the
+    concurrent call is a second *thread*, not a Driver-Manager-blocked path, and
+    ODBC's
+    [multithreading contract](https://learn.microsoft.com/sql/odbc/reference/develop-app/multithreading)
+    makes it a supported application path that reaches the driver normally. A
+    `--compare-with-msodbcsql` case that writes the descriptor from one thread
+    while another is blocked in `SQLFetch`/`SQLExecute` would close it. That
+    case does not exist yet: the e2e suite has no two-thread fixture outside
+    `session_recovery_test`, and the Rust unit tests reach the refusal by
+    setting `STMT_STATE_FETCH_IN_PROGRESS` / `STMT_STATE_EXEC_STARTED`
+    directly rather than through a real in-flight call. Until it does, treat
+    the msodbcsql half of this entry as read from source and not observed.
+
+    The ARD/APD half predates AB#49060; AB#49060 extended it to the IRD/IPD
+    status and rows-processed pointers, and to every header-alias attribute
+    plus `SQL_ROWSET_SIZE`, which is ARD-resident without being an alias and
+    so reaches the same `readers_through` walk through `set_desc_header`.
