@@ -900,7 +900,9 @@ def test_sqlcmd_pack_rejects_a_runtime_from_two_artifacts(tmp_path: Path) -> Non
 
 
 # Stands in for cargo: metadata reports FAKE_TARGET_DIR the way cargo resolves
-# [build] target-dir, and rustc writes a "fresh" archive there.
+# [build] target-dir, and rustc writes a "fresh" archive there. The Unix build
+# script has its own test, .pipeline/scripts/test_build_mssql_sqlcmd_native.py,
+# which the Linux validation job runs.
 _FAKE_CARGO = """\
 import json, os, sys
 args = sys.argv[1:]
@@ -979,32 +981,6 @@ def test_sqlcmd_windows_build_stages_from_cargos_target_directory(tmp_path: Path
         assert (native / "mssql_sqlcmd.lib").read_text(encoding="utf-8") == "fresh\n"
         assert (native / "native-static-libs.txt").read_text(encoding="ascii").strip() == "-lfake"
     assert (out / "mssql-sqlcmd-version.txt").read_text(encoding="ascii").strip() == "0.1.0"
-
-
-@pytest.mark.skipif(
-    sys.platform == "win32" or shutil.which("bash") is None, reason="needs a Unix bash"
-)
-def test_sqlcmd_unix_build_stages_from_cargos_target_directory(tmp_path: Path) -> None:
-    repo, env = _sqlcmd_native_build_fixture(tmp_path, "build-mssql-sqlcmd-native.sh")
-    out = tmp_path / "out"
-    result = subprocess.run(
-        [
-            "bash",
-            str(repo / ".pipeline" / "scripts" / "build-mssql-sqlcmd-native.sh"),
-            "x86_64-unknown-linux-gnu",
-            "linux-x64",
-            str(out),
-        ],
-        env=env,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-
-    assert result.returncode == 0, result.stdout + result.stderr
-    native = out / "runtimes" / "linux-x64" / "native"
-    assert (native / "libmssql_sqlcmd.a").read_text(encoding="utf-8") == "fresh\n"
-    assert (native / "native-static-libs.txt").read_text(encoding="ascii").strip() == "-lfake"
 
 
 def test_sqlcmd_pack_takes_required_runtimes_as_one_comma_separated_argument(

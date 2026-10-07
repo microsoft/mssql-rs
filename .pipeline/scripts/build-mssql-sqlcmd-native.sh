@@ -57,7 +57,7 @@ fi
 
 # Cargo's resolved target directory honors CARGO_TARGET_DIR and [build] target-dir.
 target_dir="$(cargo metadata --no-deps --format-version 1 |
-  sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')"
+  sed -n 's/.*"target_directory"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
 if [ -z "$target_dir" ]; then
   echo "ERROR: cargo metadata reports no target_directory" >&2
   exit 1
