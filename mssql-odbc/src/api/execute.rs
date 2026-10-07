@@ -19,7 +19,7 @@ use super::exec_common::{
     ParamsWithDae, build_named_params, build_named_params_for_row, claim_connection,
     deduct_query_timeout, fail_with_tds, finish_execute_with_param_warning, park_dae_client,
     park_deferred_dae, publish_scalar_processed, query_timeout_expired_error, return_client_idle,
-    snapshot_bound_params,
+    snapshot_bound_params_and_array_size,
 };
 use super::sqlstate::*;
 use super::txn::begin_transaction_if_manual;
@@ -839,7 +839,82 @@ fn parameter_array_return_code(
 /// Validates statement state and builds the parameter list under the STMT lock,
 /// setting `EXEC_STARTED` on success. Application value buffers are read here by
 /// reference (no network I/O).
+///
+/// The sequencing checks and the `EXEC_STARTED` claim happen here, *before* the
+/// APD is read, and the claim is held across the whole of
+/// [`stage_execution_claimed`]. Staging reads the parameter-set size from the
+/// APD under the DESC lock (AB#48943) but the array controls from `inert_attrs`
+/// under a later STMT lock, and the crate's locking rule forbids holding both at
+/// once — so nothing but the claim keeps the two consistent. Without it a
+/// concurrent `SQLSetStmtAttrW` could shrink `SQL_ATTR_PARAMSET_SIZE` and rebind
+/// a smaller `SQL_ATTR_PARAM_OPERATION_PTR` / `..._STATUS_PTR` between the two
+/// reads, leaving execution walking the stale, larger count over the new, shorter
+/// arrays. Those setters already refuse while `EXEC_STARTED` is set
+/// (`set_stmt_attr.rs`); the claim was simply taken too late to cover staging.
+///
+/// Before AB#48943 the size lived on `StmtState` and was read in the same lock
+/// acquisition as the controls, so the pair could not drift and no claim was
+/// needed this early.
 fn stage_execution(stmt: &StmtHandle) -> Result<ExecutionStaging, SqlReturn> {
+    {
+        let Ok(mut stmt_state) = stmt.inner.lock() else {
+            error!("SQLExecute: stmt mutex poisoned");
+            return Err(SQL_ERROR);
+        };
+        free_errors(&mut stmt_state);
+
+        // A statement awaiting data-at-execution input is in the ODBC "Need
+        // Data" state, where every function other than
+        // SQLPutData/SQLParamData/SQLCancel and the diagnostic calls is a
+        // sequence error rather than a cursor error.
+        //
+        // Checked before the prepared-plan guard below: parking a DAE sequence
+        // moves the plan into `DaeState`, so a statement in Need Data has
+        // `prepared == None` and would otherwise be reported as never prepared.
+        if stmt_state.needs_data() {
+            error!("SQLExecute: statement is awaiting data-at-execution input");
+            post_diag(&mut stmt_state, ERR_FUNCTION_SEQUENCE);
+            return Err(SQL_ERROR);
+        }
+
+        // SQLExecute on an unprepared statement is HY010 — a DM-enforced
+        // precondition (the spec marks it "(DM)"), so assert rather than post.
+        // The release-path fallback still returns SQL_ERROR since we have no
+        // SQL to run, but it can't be reached through a conforming Driver
+        // Manager.
+        debug_assert!(
+            stmt_state.prepared.is_some(),
+            "SQLExecute: statement not prepared — DM should have rejected this"
+        );
+        if stmt_state.prepared.is_none() {
+            error!("SQLExecute: statement has not been prepared");
+            return Err(SQL_ERROR);
+        }
+
+        if stmt_state.has_state(STMT_STATE_EXEC_STARTED | STMT_STATE_CURSOR_OPEN) {
+            error!("SQLExecute: statement has an active execute or open cursor");
+            post_diag(&mut stmt_state, ERR_INVALID_CURSOR_STATE);
+            return Err(SQL_ERROR);
+        }
+
+        stmt_state.set_state(STMT_STATE_EXEC_STARTED);
+    }
+
+    let staged = stage_execution_claimed(stmt);
+    if staged.is_err() {
+        // Released on every staging failure, in one place rather than at each
+        // of the early returns below: a statement left claimed would refuse
+        // its own parameter setters and every later execute.
+        if let Ok(mut stmt_state) = stmt.inner.lock() {
+            stmt_state.clear_state(STMT_STATE_EXEC_STARTED);
+        }
+    }
+    staged
+}
+
+/// The staging body, run with `EXEC_STARTED` already claimed by
+/// [`stage_execution`], which also releases it if this returns `Err`.
+fn stage_execution_claimed(stmt: &StmtHandle) -> Result<ExecutionStaging, SqlReturn> {
     // Snapshotted before the STMT lock below is taken — this crate never
     // holds a STMT lock while acquiring a DESC lock (see bind_col.rs's
     // rationale). Not applied to `stmt_state.bound_params` until every
@@ -852,12 +927,15 @@ fn stage_execution(stmt: &StmtHandle) -> Result<ExecutionStaging, SqlReturn> {
     // mirroring `SQLExecDirectW`'s handling of the same failure — rather
     // than leave `SQLGetDiagRec` reporting `SQL_NO_DATA` or a stale record
     // from a previous call.
-    let bound_params = match snapshot_bound_params(stmt) {
-        Ok(params) => params,
+    let (bound_params, paramset_size) = match snapshot_bound_params_and_array_size(stmt) {
+        Ok(snapshot) => snapshot,
         Err(rc) => {
             error!("SQLExecute: failed to snapshot parameter bindings");
             if let Ok(mut stmt_state) = stmt.inner.lock() {
-                free_errors(&mut stmt_state);
+                // `stage_execution` already cleared the diagnostics before it
+                // claimed the statement, and nothing between there and here
+                // posts one, so this `HY000` is record 1 without clearing
+                // again.
                 post_sql_error(
                     &mut stmt_state,
                     SQLSTATE_HY000,
@@ -873,43 +951,11 @@ fn stage_execution(stmt: &StmtHandle) -> Result<ExecutionStaging, SqlReturn> {
         error!("SQLExecute: stmt mutex poisoned");
         return Err(SQL_ERROR);
     };
-    free_errors(&mut stmt_state);
 
-    // A statement awaiting data-at-execution input is in the ODBC "Need Data"
-    // state, where every function other than SQLPutData/SQLParamData/SQLCancel
-    // and the diagnostic calls is a sequence error rather than a cursor error.
-    //
-    // Checked before the prepared-plan guard below: parking a DAE sequence
-    // moves the plan into `DaeState`, so a statement in Need Data has
-    // `prepared == None` and would otherwise be reported as never prepared.
-    if stmt_state.needs_data() {
-        error!("SQLExecute: statement is awaiting data-at-execution input");
-        post_diag(&mut stmt_state, ERR_FUNCTION_SEQUENCE);
-        return Err(SQL_ERROR);
-    }
-
-    // SQLExecute on an unprepared statement is HY010 — a DM-enforced
-    // precondition (the spec marks it "(DM)"), so assert rather than post.
-    // The release-path fallback still returns SQL_ERROR since we have no SQL
-    // to run, but it can't be reached through a conforming Driver Manager.
-    debug_assert!(
-        stmt_state.prepared.is_some(),
-        "SQLExecute: statement not prepared — DM should have rejected this"
-    );
-    if stmt_state.prepared.is_none() {
-        error!("SQLExecute: statement has not been prepared");
-        return Err(SQL_ERROR);
-    }
-
-    if stmt_state.has_state(STMT_STATE_EXEC_STARTED | STMT_STATE_CURSOR_OPEN) {
-        error!("SQLExecute: statement has an active execute or open cursor");
-        post_diag(&mut stmt_state, ERR_INVALID_CURSOR_STATE);
-        return Err(SQL_ERROR);
-    }
-
-    // All state-sequencing checks passed: this is a real new execute, so the
-    // fresh snapshot now becomes the one `build_named_params` and any DAE
-    // sequence it opens will read for the rest of this execute.
+    // All state-sequencing checks passed in `stage_execution` before the claim
+    // was taken: this is a real new execute, so the fresh snapshot now becomes
+    // the one `build_named_params` and any DAE sequence it opens will read for
+    // the rest of this execute.
     stmt_state.bound_params = bound_params;
     stmt_state.call_returns_status = false;
     let output_flags: Vec<bool> = stmt_state
@@ -963,8 +1009,7 @@ fn stage_execution(stmt: &StmtHandle) -> Result<ExecutionStaging, SqlReturn> {
         return Err(SQL_ERROR);
     };
 
-    if stmt_state.paramset_size > 1 {
-        let paramset_size = stmt_state.paramset_size;
+    if paramset_size > 1 {
         let row_count = paramset_size;
         let bind_offset = unsafe { stmt_state.inert_attrs.param_bind_offset() };
         let param_bind_type = stmt_state
@@ -1158,9 +1203,9 @@ mod tests {
     use crate::api::odbc_types::{
         SQL_ATTR_PARAM_BIND_TYPE, SQL_ATTR_PARAM_OPERATION_PTR, SQL_ATTR_PARAM_STATUS_PTR,
         SQL_ATTR_PARAMS_PROCESSED_PTR, SQL_BIND_BY_COLUMN, SQL_C_CHAR, SQL_C_SLONG,
-        SQL_DATA_AT_EXEC, SQL_INTEGER, SQL_NULL_HANDLE, SQL_PARAM_ERROR, SQL_PARAM_IGNORE,
-        SQL_PARAM_INPUT, SQL_PARAM_OUTPUT, SQL_PARAM_PROCEED, SQL_PARAM_UNUSED, SQL_SUCCESS,
-        SQL_VARCHAR, SqlLen, SqlPointer, SqlULen,
+        SQL_DATA_AT_EXEC, SQL_DESC_ARRAY_SIZE, SQL_INTEGER, SQL_NULL_HANDLE, SQL_PARAM_ERROR,
+        SQL_PARAM_IGNORE, SQL_PARAM_INPUT, SQL_PARAM_OUTPUT, SQL_PARAM_PROCEED, SQL_PARAM_UNUSED,
+        SQL_SUCCESS, SQL_VARCHAR, SqlLen, SqlPointer, SqlULen,
     };
     use crate::api::util::rewrite_param_markers;
     use crate::handles::DescHandle;
@@ -1288,6 +1333,26 @@ mod tests {
                     raw,
                     1,
                     field.try_into().unwrap(),
+                    value as SqlPointer,
+                    0,
+                )
+            },
+            SQL_SUCCESS
+        );
+    }
+
+    /// `SQL_DESC_ARRAY_SIZE` is a descriptor *header* field, so it is written at
+    /// `RecNumber` 0 rather than through the record-oriented
+    /// `set_cached_desc_field` above. This is the canonical storage behind
+    /// `SQL_ATTR_PARAMSET_SIZE` (AB#48943), which is why the array tests below
+    /// stage their paramset size here instead of on `StmtState`.
+    fn set_array_size(raw: SqlHandle, value: isize) {
+        assert_eq!(
+            unsafe {
+                crate::api::SQLSetDescFieldW(
+                    raw,
+                    0,
+                    SQL_DESC_ARRAY_SIZE.try_into().unwrap(),
                     value as SqlPointer,
                     0,
                 )
@@ -2812,7 +2877,6 @@ mod tests {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         {
             let mut state = stmt.inner.lock().unwrap();
-            state.paramset_size = 3;
             state
                 .inert_attrs
                 .set(SQL_ATTR_PARAM_BIND_TYPE, SQL_BIND_BY_COLUMN);
@@ -2828,6 +2892,7 @@ mod tests {
                 (&raw mut processed) as SqlULen,
             );
         }
+        set_array_size(h.apd(), 3);
 
         let ExecutionStaging::Batch(batch) =
             stage_execution(stmt).expect("array staging should succeed")
@@ -2893,7 +2958,6 @@ mod tests {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         {
             let mut state = stmt.inner.lock().unwrap();
-            state.paramset_size = 3;
             state
                 .inert_attrs
                 .set(SQL_ATTR_PARAM_BIND_TYPE, SQL_BIND_BY_COLUMN);
@@ -2914,6 +2978,7 @@ mod tests {
             state.batch_exhausted = true;
             state.pending_fetch_error = Some(TdsError::ProtocolError("stale".to_string()));
         }
+        set_array_size(h.apd(), 3);
 
         let ret = sql_execute_safe(h.stmt, stmt);
 
@@ -2958,7 +3023,6 @@ mod tests {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         {
             let mut state = stmt.inner.lock().unwrap();
-            state.paramset_size = 4;
             state
                 .inert_attrs
                 .set(SQL_ATTR_PARAM_BIND_TYPE, SQL_BIND_BY_COLUMN);
@@ -2970,6 +3034,7 @@ mod tests {
                 (&raw mut *processed) as SqlULen,
             );
         }
+        set_array_size(h.apd(), 4);
         let ExecutionStaging::Batch(batch) =
             stage_execution(stmt).expect("array staging should succeed")
         else {
@@ -3055,7 +3120,6 @@ mod tests {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         {
             let mut state = stmt.inner.lock().unwrap();
-            state.paramset_size = 2;
             state
                 .inert_attrs
                 .set(SQL_ATTR_PARAM_STATUS_PTR, statuses.as_mut_ptr() as SqlULen);
@@ -3064,6 +3128,7 @@ mod tests {
                 (&raw mut processed) as SqlULen,
             );
         }
+        set_array_size(h.apd(), 2);
 
         assert!(stage_execution(stmt).is_err());
         assert_eq!(statuses[0], SQL_PARAM_ERROR);
@@ -3102,7 +3167,7 @@ mod tests {
 
         assert_eq!(rc, SQL_SUCCESS, "binding an output parameter must succeed");
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
-        stmt.inner.lock().unwrap().paramset_size = 2;
+        set_array_size(h.apd(), 2);
         assert!(stage_execution(stmt).is_err());
         assert_eq!(
             stmt.inner.lock().unwrap().diag_records[0].sql_state,
@@ -3142,7 +3207,6 @@ mod tests {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         {
             let mut state = stmt.inner.lock().unwrap();
-            state.paramset_size = 3;
             state.inert_attrs.set(
                 SQL_ATTR_PARAM_OPERATION_PTR,
                 operations.as_mut_ptr() as SqlULen,
@@ -3155,6 +3219,7 @@ mod tests {
                 (&raw mut processed) as SqlULen,
             );
         }
+        set_array_size(h.apd(), 3);
 
         let ExecutionStaging::Batch(batch) =
             stage_execution(stmt).expect("an unknown operation value must not fail")
@@ -3206,7 +3271,6 @@ mod tests {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         {
             let mut state = stmt.inner.lock().unwrap();
-            state.paramset_size = 3;
             state.inert_attrs.set(
                 SQL_ATTR_PARAM_OPERATION_PTR,
                 operations.as_mut_ptr() as SqlULen,
@@ -3219,6 +3283,7 @@ mod tests {
                 (&raw mut processed) as SqlULen,
             );
         }
+        set_array_size(h.apd(), 3);
 
         let ExecutionStaging::Batch(batch) =
             stage_execution(stmt).expect("array staging should succeed")
@@ -3238,6 +3303,91 @@ mod tests {
         assert!(stmt.inner.lock().unwrap().diag_records.is_empty());
     }
 
+    /// Staging reads the parameter-set size from the APD under the DESC lock
+    /// but the array controls from `inert_attrs` under a later STMT lock, and
+    /// the crate's locking rule forbids holding both at once — so only the
+    /// `EXEC_STARTED` claim keeps the pair consistent. Shrinking the size and
+    /// rebinding shorter control arrays between those two reads would leave
+    /// execution walking the stale, larger count over the new, shorter arrays.
+    ///
+    /// The helper holds the APD lock, which parks staging inside the window
+    /// rather than racing it: the claim is taken before the APD is read, so
+    /// the setter must already be refused by the time staging blocks there.
+    /// Before AB#48943 the size was statement-local and read in the same
+    /// acquisition as the controls, so this could not drift.
+    #[test]
+    fn parameter_set_size_cannot_be_resized_during_staging() {
+        use std::sync::mpsc;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        set_prepared(h.stmt, "INSERT INTO t VALUES (?)");
+        set_array_size(h.apd(), 4);
+
+        let stmt_addr = h.stmt as usize;
+        let apd_addr = h.apd() as usize;
+        let (ready_tx, ready_rx) = mpsc::channel::<()>();
+        let (rc_tx, rc_rx) = mpsc::channel::<SqlReturn>();
+
+        let helper = std::thread::spawn(move || {
+            let apd = unsafe { handle_from_raw::<DescHandle>(apd_addr as SqlHandle) };
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(stmt_addr as SqlHandle) };
+            let guard = apd.inner.lock().unwrap();
+            ready_tx.send(()).unwrap();
+
+            let mut claimed = false;
+            for _ in 0..100_000 {
+                if stmt
+                    .inner
+                    .lock()
+                    .map(|s| s.has_state(STMT_STATE_EXEC_STARTED))
+                    .unwrap_or(false)
+                {
+                    claimed = true;
+                    break;
+                }
+                std::thread::yield_now();
+            }
+            assert!(claimed, "staging must claim before it reads the APD");
+
+            let rc = unsafe {
+                crate::api::set_stmt_attr::sql_set_stmt_attr_w(
+                    stmt_addr as SqlHandle,
+                    crate::api::odbc_types::SQL_ATTR_PARAMSET_SIZE,
+                    2 as SqlPointer,
+                    0,
+                )
+            };
+            rc_tx.send(rc).unwrap();
+            drop(guard);
+        });
+
+        ready_rx.recv().unwrap();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        // Fails on the unbound marker, well after the window under test.
+        let _ = stage_execution(stmt);
+        helper.join().unwrap();
+
+        assert_eq!(
+            rc_rx.recv().unwrap(),
+            SQL_ERROR,
+            "resizing the parameter set mid-staging must be refused"
+        );
+        let apd = unsafe { handle_from_raw::<DescHandle>(h.apd()) };
+        assert_eq!(
+            apd.inner.lock().unwrap().header.array_size,
+            4,
+            "the size staging read must still be the stored one"
+        );
+        assert!(
+            !stmt
+                .inner
+                .lock()
+                .unwrap()
+                .has_state(STMT_STATE_EXEC_STARTED),
+            "a failed staging must release the claim"
+        );
+    }
+
     /// A marker with no binding is 07002 on the array path too, and must be
     /// caught before any set is sent.
     #[test]
@@ -3245,7 +3395,7 @@ mod tests {
         let h = TestHandles::with_env_dbc_stmt();
         set_prepared(h.stmt, "INSERT INTO t VALUES (?)");
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
-        stmt.inner.lock().unwrap().paramset_size = 2;
+        set_array_size(h.apd(), 2);
 
         assert!(stage_execution(stmt).is_err());
         let state = stmt.inner.lock().unwrap();

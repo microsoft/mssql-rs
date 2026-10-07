@@ -732,6 +732,14 @@ fn dae_expected_length(indicator: SqlLen) -> Option<usize> {
 pub(super) fn snapshot_bound_params(
     stmt: &StmtHandle,
 ) -> Result<Vec<Option<ParamSnapshot>>, SqlReturn> {
+    snapshot_bound_params_and_array_size(stmt).map(|(params, _)| params)
+}
+
+/// Snapshots the effective APD's parameter records and array size under the
+/// same descriptor lock.
+pub(super) fn snapshot_bound_params_and_array_size(
+    stmt: &StmtHandle,
+) -> Result<(Vec<Option<ParamSnapshot>>, SqlULen), SqlReturn> {
     // Read before the STMT lock below, matching bind_param.rs's own
     // parent-before-child lock ordering for the same lookup.
     let odbc_version = {
@@ -770,10 +778,10 @@ pub(super) fn snapshot_bound_params(
         error!("snapshotting parameters: ipd mutex poisoned");
         return Err(SQL_ERROR);
     };
-    Ok(BoundParam::all_from_descriptor_states(
-        &apd_state,
-        &ipd_state,
-        odbc_version,
+    let array_size = apd_state.header.array_size;
+    Ok((
+        BoundParam::all_from_descriptor_states(&apd_state, &ipd_state, odbc_version),
+        array_size,
     ))
 }
 

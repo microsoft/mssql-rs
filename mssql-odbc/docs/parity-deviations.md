@@ -808,3 +808,63 @@ msodbcsql build is measured.
     written. Deviation 4's sign-off was given for the ODBC parameter layer and
     does not extend to bulk copy or TVP; AB#47584 owns closing that gap for all
     three.
+25. **An array size of 0 is rejected with `HY024` on three of the four
+    spellings; msodbcsql accepts and stores it on all four.** msodbcsql has no
+    lower-bound check anywhere: `IsSetStmtOptionValid` (`odbc/sqlcmisc.cpp`)
+    bounds only the top of the range in its shared `case SQL_ROWSET_SIZE:` /
+    `case SQL_ATTR_ROW_ARRAY_SIZE:` branch (`*pvParam > INT32_MAX` -> clamp plus
+    `IDS_01_S02`), lists `SQL_ATTR_PARAMSET_SIZE` under
+    `// Attributes with no validation`, and `SQLSetDescField`'s
+    `SQL_DESC_ARRAY_SIZE` branch (`odbc/sqlcdesc.cpp`) likewise clamps only the
+    upper bound. Zero is carried downstream rather than treated as an error:
+    `odbc/sqlcmisc.cpp:5657` asserts
+    `iRowStart <= pAPD->dwArraySize || pAPD->dwArraySize == 0`.
+
+    This driver rejects 0 with `HY024` on `SQL_ATTR_ROW_ARRAY_SIZE`,
+    `SQL_ATTR_PARAMSET_SIZE` and `SQL_DESC_ARRAY_SIZE`, leaving the previous
+    value in place, because every reader of the value (`fetch_scroll`'s rowset
+    loop, `stage_execution`'s batch builder) would otherwise carry a degenerate
+    case whose only behaviour is to succeed doing nothing. **`SQL_ROWSET_SIZE`
+    is deliberately not in that list** -- it accepts and stores 0, matching
+    msodbcsql, since rejecting there would widen the divergence rather than
+    close it (`rowset_size_accepts_zero_like_msodbcsql`). The upper bound is
+    not part of this deviation: this driver matches msodbcsql's clamp including
+    its per-attribute asymmetry, so `SQL_ATTR_PARAMSET_SIZE` stores an
+    over-large request verbatim while the row-side spellings clamp with `01S02`.
+
+    **Evidence level: measured.** `ArraySizeZeroIsRejected` and
+    `OverlargeParamsetSizeIsStoredVerbatim` ran under `--compare-with-msodbcsql`
+    on Windows, Linux and macOS (ADO build 180735) against retail msodbcsql
+    18.6.2.1 / `SQL_DRIVER_VER` 18.06.0002, the version pinned by
+    `msodbcsqlVersion` in `.pipeline/validation-pipeline.yml`. The harness does
+    not call `SQLGetInfo(SQL_DRIVER_VER)`, so the per-platform string is
+    attributed from that pin rather than read back per leg.
+
+    The deviation is a property of this driver's setters and is pinned for all
+    three rejecting spellings by unit tests calling them directly. Whether an
+    application can *observe* it depends on the Driver Manager in front
+    (instructions §2.2) and varies per spelling and platform:
+
+    - `SQLSetDescField(apd, SQL_DESC_ARRAY_SIZE, 0)` -> `SQL_SUCCESS` on
+      msodbcsql everywhere, `SQL_ERROR`/`HY024` here. The DM forwards
+      descriptor-field writes unfiltered, so this is the observable form.
+    - `SQLSetStmtAttr(SQL_ATTR_PARAMSET_SIZE, 0)` -> `SQL_SUCCESS` on msodbcsql
+      on Linux and macOS, `SQL_ERROR` on Windows: masked by the Windows DM.
+    - `SQLSetStmtAttr(SQL_ROWSET_SIZE, 0)` -> `SQL_ERROR` on **both** drivers
+      everywhere; the DM rejects it itself, so this driver's acceptance of 0 is
+      not application-observable and the e2e case does not assert it.
+    - `SQLSetStmtAttr(SQL_ATTR_ROW_ARRAY_SIZE, 0)` and the **ARD** side of
+      `SQLSetDescField` are **not yet measured on the reference leg** --
+      `ArraySizeZeroIsRejected` records their return codes as test properties
+      rather than asserting them, since DM filtering has proved both
+      per-attribute and per-platform. Until that lands this entry claims nothing
+      about the row-side statement spelling's observability; the driver-level
+      rejection is pinned by `array_size_zero_leaves_the_descriptor_untouched`.
+    - The `01S02` record on the upper clamp is not retrievable through the
+      Windows DM on either driver, so the e2e case asserts return codes and
+      read-back values only; the SQLSTATE is pinned at the driver boundary by
+      `row_array_size_clamps_but_paramset_size_stores_verbatim`.
+
+    Introduced with AB#48943, which made the descriptor header the canonical
+    storage behind the two array-size attributes; the rejection itself predates
+    it on all three spellings.
