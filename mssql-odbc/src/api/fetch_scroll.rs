@@ -1654,21 +1654,20 @@ fn finish_exhausted_fetch(
     };
     unsafe { write_if_some(rows_fetched_ptr, 0) };
     // A freed ARD keeps the known `SQL_NO_DATA` and skips the walk (no safe
-    // extent); a poisoned one is an internal failure, but only matters when
-    // there is an array to walk.
+    // extent); a poisoned one is an internal failure and is always reported.
     //
     // Filling the status array here diverges from msodbcsql, which leaves it
     // untouched (measured, 18.6.2.1). The divergence predates AB#48943 and is
     // confined to this path. Pinned by
     // `exhausted_cursor_fast_path_marks_the_status_array_from_the_ard`.
-    let poisoned = !row_status_ptr.is_null() && matches!(ard_read, ArdRead::Poisoned);
+    let poisoned = matches!(ard_read, ArdRead::Poisoned);
     if !row_status_ptr.is_null()
         && let ArdRead::Read(snapshot) = ard_read
     {
         mark_no_rows(row_status_ptr, 0, snapshot.array_size);
     }
     if poisoned {
-        error!("SQLFetchScroll: ard mutex poisoned sizing the row status array");
+        error!("SQLFetchScroll: ard mutex poisoned on an exhausted cursor");
     }
     // Released only after the walk, in the same acquisition that posts any
     // diagnostic: dropping the claim earlier would reopen the window it exists
@@ -4419,6 +4418,55 @@ mod tests {
         assert_eq!(
             statuses, [0xBEEF_u16; 2],
             "an unreadable ARD must not be walked with a guessed extent"
+        );
+    }
+
+    /// The poisoned ARD has been read either way, so it is reported even when
+    /// no status array would have been walked.
+    #[test]
+    fn exhausted_cursor_fast_path_errors_on_a_poisoned_ard_without_a_status_array() {
+        let h = TestHandles::with_env_dbc_stmt();
+        open_cursor(&h);
+        {
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            stmt.inner.lock().unwrap().result_set_exhausted = true;
+        }
+        let ard = unsafe { handle_from_raw::<DescHandle>(h.ard()) };
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = ard.inner.lock().unwrap();
+            panic!("poison the ard lock");
+        }));
+
+        assert_eq!(
+            unsafe { sql_fetch_scroll(h.stmt, SQL_FETCH_NEXT, 0) },
+            SQL_ERROR
+        );
+        assert_eq!(last_state(&h), SQLSTATE_HY000);
+    }
+
+    /// A poisoned IRD fails the fetch with `HY000` and releases the claim.
+    #[test]
+    fn fetch_errors_on_a_poisoned_ird_and_releases_its_claim() {
+        let h = TestHandles::with_env_dbc_stmt();
+        open_cursor(&h);
+        let ird = unsafe { handle_from_raw::<DescHandle>(h.ird()) };
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = ird.inner.lock().unwrap();
+            panic!("poison the ird lock");
+        }));
+
+        assert_eq!(
+            unsafe { sql_fetch_scroll(h.stmt, SQL_FETCH_NEXT, 0) },
+            SQL_ERROR
+        );
+        assert_eq!(last_state(&h), SQLSTATE_HY000);
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        assert!(
+            !stmt
+                .inner
+                .lock()
+                .unwrap()
+                .has_state(STMT_STATE_FETCH_IN_PROGRESS)
         );
     }
 

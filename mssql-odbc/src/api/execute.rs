@@ -693,6 +693,14 @@ pub(super) fn update_parameter_array(
     let (param_status_ptr, params_processed_ptr) = {
         let Ok(ipd_state) = ipd.inner.lock() else {
             error!("reporting parameter array: ipd mutex poisoned");
+            if let Ok(mut stmt_state) = stmt.inner.lock() {
+                post_sql_error(
+                    &mut stmt_state,
+                    SQLSTATE_HY000,
+                    0,
+                    "Internal error reading the parameter status pointers",
+                );
+            }
             return SQL_ERROR;
         };
         (
@@ -3702,6 +3710,44 @@ mod tests {
             "a query-timeout expiry must report HYT00, got {:?}",
             state.diag_records[0].sql_state
         );
+    }
+
+    /// A poisoned IPD fails parameter-array reporting with a diagnostic, not a
+    /// bare `SQL_ERROR`.
+    #[test]
+    fn update_parameter_array_posts_hy000_on_a_poisoned_ipd() {
+        use crate::handles::dbc::DbcHandle;
+        use mssql_mock_tds::QueryResponse;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let _mock_server =
+            crate::test_support::connect_mock_server(dbc, "SELECT 1", QueryResponse::select_one());
+        let mut client = dbc.inner.lock().unwrap().client.take().unwrap();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        stmt.inner.lock().unwrap().parameter_array = Some(BatchClientResults {
+            outputs: ParamArrayOutputs {
+                paramset_size: 2,
+                param_status_ptr: std::ptr::null_mut(),
+                params_processed_ptr: std::ptr::null_mut(),
+            },
+            client_side_failures: 0,
+            truncated_rows: Vec::new(),
+            rows_affected: None,
+            processed: 0,
+        });
+        let ipd = unsafe { handle_from_raw::<DescHandle>(h.ipd()) };
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = ipd.inner.lock().unwrap();
+            panic!("poison the ipd lock");
+        }));
+
+        assert_eq!(update_parameter_array(stmt, &mut client), SQL_ERROR);
+        assert_eq!(
+            stmt.inner.lock().unwrap().diag_records[0].sql_state,
+            SQLSTATE_HY000
+        );
+        dbc.inner.lock().unwrap().client = Some(client);
     }
 
     #[test]

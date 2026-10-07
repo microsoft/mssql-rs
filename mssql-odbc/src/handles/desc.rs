@@ -186,8 +186,8 @@ impl DescHeader {
     /// `SQL_DESC_BIND_TYPE` as `SQLGetDescFieldW` reports it: the low 32 bits,
     /// matching msodbcsql's `GetADHeaderField` (`(SDWORD)fDesc`).
     pub(crate) fn bind_type_as_desc_field(&self) -> SqlInteger {
-        let low = u32::try_from(self.bind_type & 0xFFFF_FFFF).unwrap_or(0);
-        SqlInteger::from_ne_bytes(low.to_ne_bytes())
+        // Deliberate truncation.
+        self.bind_type as u32 as SqlInteger
     }
 }
 

@@ -213,13 +213,15 @@ unsafe fn sql_set_stmt_attr_w_safe(
         }
         // The rowset controls are read into a fetch's snapshot, so moving them
         // mid-fetch would point it at buffers of the wrong size or shape.
-        // `SQL_ROWSET_SIZE` is unconsumed today but gated for consistency.
+        // `SQL_ROWSET_SIZE` and `SQL_ATTR_ROW_OPERATION_PTR` are unconsumed
+        // today but gated so both spellings of each ARD field agree.
         SQL_ATTR_ROW_ARRAY_SIZE
         | SQL_ROWSET_SIZE
         | SQL_ATTR_ROWS_FETCHED_PTR
         | SQL_ATTR_ROW_STATUS_PTR
         | SQL_ATTR_ROW_BIND_OFFSET_PTR
         | SQL_ATTR_ROW_BIND_TYPE
+        | SQL_ATTR_ROW_OPERATION_PTR
             if state.has_state(STMT_STATE_FETCH_IN_PROGRESS) =>
         {
             error!(
@@ -691,7 +693,11 @@ impl HeaderField {
 
 /// Statement attributes stored on a descriptor header: the alias table in
 /// `handles::desc`, plus `SQL_ROWSET_SIZE`. Mirrors where msodbcsql's
-/// `SQLSetStmtAttr`/`SQLGetStmtAttr` keep each one.
+/// `SQLSetStmtAttr`/`SQLGetStmtAttr` keep each one. msodbcsql routes
+/// `PARAMSET_SIZE`/`PARAM_BIND_TYPE`/`PARAM_BIND_OFFSET_PTR` to the TVP child
+/// APD under `SQL_SOPT_SS_PARAM_FOCUS` (`pAPDActual`) but
+/// `PARAM_OPERATION_PTR` to the statement's APD; the same here today only
+/// because param focus is rejected.
 fn header_alias(attribute: SqlInteger) -> Option<(HeaderOwner, HeaderField)> {
     let alias = match attribute {
         SQL_ATTR_ROW_ARRAY_SIZE => (HeaderOwner::Ard, HeaderField::ArraySize),
@@ -3628,6 +3634,35 @@ mod tests {
             .lock()
             .unwrap()
             .clear_state(STMT_STATE_FETCH_IN_PROGRESS);
+    }
+
+    /// Both spellings of every header alias must refuse while the statement
+    /// fetches or executes through the owning descriptor.
+    #[test]
+    fn both_spellings_of_each_alias_are_refused_mid_call() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        for (attribute, desc, field) in header_aliases(&h) {
+            let flag = if desc == h.ard() || desc == h.ird() {
+                STMT_STATE_FETCH_IN_PROGRESS
+            } else {
+                STMT_STATE_EXEC_STARTED
+            };
+            stmt.inner.lock().unwrap().set_state(flag);
+            assert_eq!(
+                set_attr(h.stmt, attribute, 8),
+                SQL_ERROR,
+                "attribute {attribute}"
+            );
+            assert_eq!(stmt_sql_state(h.stmt), ERR_FUNCTION_SEQUENCE.state);
+            assert_eq!(
+                desc_set(desc, field, 8),
+                SQL_ERROR,
+                "field {field} of {attribute}"
+            );
+            assert_eq!(desc_sql_state(desc), ERR_FUNCTION_SEQUENCE.state);
+            stmt.inner.lock().unwrap().clear_state(flag);
+        }
     }
 
     /// A sibling fetching/executing through a shared explicit descriptor

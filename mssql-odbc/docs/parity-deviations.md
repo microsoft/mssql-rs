@@ -868,3 +868,28 @@ msodbcsql build is measured.
     Introduced with AB#48943, which made the descriptor header the canonical
     storage behind the two array-size attributes; the rejection itself predates
     it on all three spellings.
+26. **A descriptor-header write that races an in-flight fetch or execute
+    through that descriptor is refused with `HY010`; msodbcsql applies it.**
+    msodbcsql has no statement-state check for these writes:
+    `SQLSetDescField`'s preconditions (`odbc/sqlcdesc.cpp`) check only handle
+    type, the IRD two-field whitelist, TVP nesting and `RecNumber`, then assign
+    `rgfArrayStatus` / `pRowsProcessed` unconditionally, and `SQLSetStmtAttr`
+    (`odbc/sqlcmisc.cpp`) refuses only while an *async* call is in progress.
+
+    This driver refuses, through both spellings, a write to a descriptor that a
+    statement is currently fetching through (ARD or IRD,
+    `STMT_STATE_FETCH_IN_PROGRESS`) or executing through (APD or IPD,
+    `STMT_STATE_EXEC_STARTED`) — including a sibling statement sharing an
+    explicit ARD/APD (`DescHandle::readers_through`). The driver does not hold
+    the STMT lock across network I/O; fetch and execute snapshot these pointers
+    and sizes, so a write mid-call would desynchronize the snapshot from the
+    application's buffers. The check is advisory (instructions §7.2).
+
+    Reachable only by a call concurrent with the fetch/execute: single-threaded
+    applications cannot call during one, and the Driver Manager already refuses
+    descriptor writes during a Need Data sequence. **Evidence level: source
+    only.** Measuring it needs a two-thread e2e case that writes while another
+    thread is blocked in `SQLFetch`/`SQLExecute`.
+
+    The ARD/APD half predates AB#49060; AB#49060 extended it to the IRD/IPD
+    status and rows-processed pointers and to every header-alias attribute.

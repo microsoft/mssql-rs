@@ -324,12 +324,15 @@ on; these guarantees were verified against msodbcsql's behavior.
 
 - The HY010 checks that refuse descriptor writes while a statement fetches or
   executes through the descriptor (`DescHandle::readers_through`) are
-  advisory, not atomic with the write. Do not close that window by holding a
-  STMT lock while taking a DESC lock (§7.1), or by a buffer-use protocol
-  justified by an application freeing storage early (§6.1).
-- Read an array size and the status array it bounds as one consistent
-  snapshot. Do not add a second two-DESC lock order without a supported call
-  sequence that needs it (§6.1).
+  driver-specific (registry entry 26) and advisory, not atomic with the write.
+  Do not close that window by holding a STMT lock while taking a DESC lock
+  (§7.1), or by a buffer-use protocol justified by an application freeing
+  storage early (§6.1).
+- An array size and the status array it bounds must not change between the
+  reads that pair them. Execute reads both under the APD and IPD locks at
+  once. Fetch reads the ARD and IRD in two acquisitions after taking the fetch
+  claim, which every setter of either value respects; do not merge them with a
+  second two-DESC lock order without a supported call sequence (§6.1).
 
 ### 7.3. Prepared parameter definitions
 
