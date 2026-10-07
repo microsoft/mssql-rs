@@ -887,11 +887,24 @@ msodbcsql build is measured.
     and sizes, so a write mid-call would desynchronize the snapshot from the
     application's buffers. The check is advisory (instructions §7.2).
 
-    Reachable only by a call concurrent with the fetch/execute: single-threaded
-    applications cannot call during one, and the Driver Manager already refuses
-    descriptor writes during a Need Data sequence. **Evidence level: source
-    only.** Measuring it needs a two-thread e2e case that writes while another
-    thread is blocked in `SQLFetch`/`SQLExecute`.
+    Reachable only by a call concurrent with the fetch/execute: a
+    single-threaded application cannot call during one, and the Driver Manager
+    already refuses descriptor writes during a Need Data sequence
+    (instructions §7.3).
+
+    Evidence level: source reading only. No `SQL_DRIVER_VER` or tested build is
+    recorded, and unlike entry 14 nothing prevents measuring this — the
+    concurrent call is a second *thread*, not a Driver-Manager-blocked path, and
+    ODBC's
+    [multithreading contract](https://learn.microsoft.com/sql/odbc/reference/develop-app/multithreading)
+    makes it a supported application path that reaches the driver normally. A
+    `--compare-with-msodbcsql` case that writes the descriptor from one thread
+    while another is blocked in `SQLFetch`/`SQLExecute` would close it. That
+    case does not exist yet: the e2e suite has no two-thread fixture outside
+    `session_recovery_test`, and the Rust unit tests reach the refusal by
+    setting `STMT_STATE_FETCH_IN_PROGRESS` / `STMT_STATE_EXEC_STARTED`
+    directly rather than through a real in-flight call. Until it does, treat
+    the msodbcsql half of this entry as read from source and not observed.
 
     The ARD/APD half predates AB#49060; AB#49060 extended it to the IRD/IPD
     status and rows-processed pointers and to every header-alias attribute.
