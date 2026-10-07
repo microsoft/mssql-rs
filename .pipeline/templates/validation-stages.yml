@@ -774,6 +774,7 @@ stages:
   jobs:
   - job: Build_mssql_python_MacOS
     displayName: Build mssql-python macOS (cross-repo)
+    timeoutInMinutes: 120
     pool:
       name: Azure Pipelines
       vmImage: macOS-latest
