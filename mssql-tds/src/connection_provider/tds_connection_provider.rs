@@ -6,6 +6,7 @@ use tokio::time::timeout;
 use tracing::{debug, info};
 
 use crate::connection::client_context::{ClientContext, TransportContext};
+use crate::connection::connect_stage;
 use crate::connection::connection_actions::{
     ActionOutcome, ConnectionAction, ConnectionActionChain, ExecutionContext,
 };
@@ -484,6 +485,13 @@ impl TdsConnectionProvider {
         };
         debug!(server = %server, instance = %instance, timeout_ms, "Executing SSRP query");
 
+        let stage = tracing::info_span!(
+            target: connect_stage::TARGET,
+            connect_stage::INSTANCE_LOOKUP,
+            server = %server,
+            instance = %instance,
+            ok = tracing::field::Empty
+        );
         let instance_info =
             ssrp::get_instance_info_ext(&server, &instance, ssrp::SSRP_PORT, timeout_ms)
                 .await
@@ -543,6 +551,7 @@ impl TdsConnectionProvider {
             exec_context.store_outcome(ActionOutcome::SsrpResolvedPipe { pipe_path: pipe });
         }
 
+        stage.record(connect_stage::OK, true);
         Ok(())
     }
 

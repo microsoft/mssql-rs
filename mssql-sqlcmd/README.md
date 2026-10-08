@@ -2,13 +2,16 @@
 
 sqlcmd components in Rust. Native (ODBC) sqlcmd links this crate as a static
 library and calls it through a C ABI; native sqlcmd still parses the command
-line, connects and runs the batches.
+line, connects and runs the batches. The one exception is `sqlcmd diagnose`,
+which connects through this crate (with `mssql-tds`) to check the connection
+stage by stage.
 
 ## Layout
 
 | Path | Purpose |
 |---|---|
 | `src/formatter/` | Output formatters. `json.rs` renders `--format json`. |
+| `src/diagnostics.rs`, `src/diagnostics/` | `sqlcmd diagnose`: the checks, depth by depth; `target.rs` parses `-S`, `stages.rs` times the `mssql-tds` connect stages, `redact.rs` makes output share-safe, `report.rs` renders text and JSON. |
 | `src/ffi.rs` | The C ABI native sqlcmd calls, including `mssql_sqlcmd_version()`. |
 | `include/mssql_sqlcmd.h` | C/C++ declarations for that ABI. |
 
@@ -85,6 +88,75 @@ size of the output: the collected values, the rendered UTF-8 text, and the
 UTF-16 copy handed back to sqlcmd. For very large results, text output still
 streams.
 
+## Diagnose
+
+`sqlcmd diagnose -S <server> [-U/-P | -E] [-d] [-N...] [-C] [-F] [-l] [--depth <depth>] [--local-detail] [--format json]`
+checks, from the bottom up, that a connection can be made, and when it cannot,
+where and why. It follows the diagnostic depths of the sqlcmd specification;
+each includes the ones before it, and the deepest is the default:
+
+| Depth (`--depth`) | Checks |
+|---|---|
+| `connectionInput` | parse the server given to `-S`; no external call |
+| `endpointResolution` | resolve the host name; ask SQL Server Browser for a named instance's port (never guessing 1433) |
+| `networkReachability` | a TCP connect to every resolved address |
+| `connectionAttempt` | one connection attempt, with its pre-login, TLS and login phases |
+| `sessionValidation` | a minimal query on the new session: the engine edition and the server's UTC clock |
+
+Checks run best effort: a failed check skips only what needs its result, and
+each skipped check names what blocked it. Each reports a coverage state
+(`passed`, `diagnosed`, `classified`, `inconclusive`, `skipped`,
+`notApplicable`), its duration on a monotonic clock, its time limit (`-l`, 8 s by
+default; 2 s for SQL Server Browser), and what it found: the addresses
+resolved, the operating system's result for every TCP connect (`refused`,
+`timedOut`, `hostUnreachable`, ...), the connection's phases, and with `-E` the
+SPN the client requests and, off Windows, whether a Kerberos ticket cache
+exists. Session validation reports how far the server's clock is from the
+client's. The report adds:
+
+- `executionStatus` (`completed`, `partial`, `canceled`, `failed`,
+  `invalidInvocation`) and `diagnosticOutcome` (`passed`, `issueDetected`,
+  `inconclusive`, `notEvaluated`), and an exit code per category: 0 passed,
+  1 issue detected, 2 inconclusive, 3 partial, 4 canceled, 5 internal failure,
+  6 invalid invocation. A run is `partial` when this computer would not let a
+  check run (for example, the operating system refused to open the socket), and
+  `canceled` when the host cancels it (`mssql_sqlcmd_diagnostics_cancel`; sqlcmd
+  does so on Ctrl+C): the checks that finished are kept and the others are
+  skipped as `canceled`;
+- findings marked `confirmed`, `suspected` or `informational`, and no
+  remediation advice;
+- the ordered error chain with its identifiers (SQL Server error, state and
+  class, operating-system error, symbolic code), noting where a classification
+  relied on message text;
+- the specialist domain for a support handoff (`connectivity.network`,
+  `security.tlsCertificate`, `security.authentication.sql`, ..., or
+  `undetermined` with candidates), never presented as a root cause;
+- limitations, such as the connection client used;
+- the client's operating system and version;
+- `tracingGuide`, a stable link to the driver-tracing documentation, when the
+  connection attempt or session validation ends where the client's evidence
+  does not reach;
+- `coverageMatrixVersion`, the version of
+  [the diagnostic coverage matrix](docs/diagnose-coverage.md) the checks follow.
+
+Output is share-safe by default: server, instance, database, host (the `-F`
+certificate name included), address, SPN and user identifiers are replaced with labels (`host-1`, `address-2`) that are
+stable within one run only, in the text and JSON report alike, and error text
+is flagged for review before sharing. `--local-detail` shows the values and
+marks the output as not share-safe. The password is never part of the report.
+
+sqlcmd resolves the name, queries SQL Server Browser and connects over TCP
+itself. A server given without a protocol prefix is diagnosed over TCP
+throughout, the connection attempt included; on Windows, where sqlcmd can then
+also use shared memory or named pipes, a TCP failure says so, and `lpc:` or
+`np:` diagnoses those transports. The connection attempt is made with `mssql-tds`; its connect-stage
+spans (target `mssql_tds::connect`, see `mssql_tds::connection::connect_stage`)
+give the pre-login, TLS and login phases and their timings, recorded by a
+`tracing` layer that enables nothing else.
+
+`mssql-tds` is 64-bit only, so 32-bit builds (`win-x86`) leave diagnose out:
+there `mssql_sqlcmd_diagnostics_run` returns `MSSQL_SQLCMD_UNSUPPORTED`.
+
 ## Building for native sqlcmd
 
 ```text
@@ -92,9 +164,11 @@ cargo build -p mssql-sqlcmd --release
 ```
 
 produces `target/release/mssql_sqlcmd.lib` (Windows) or `libmssql_sqlcmd.a`.
-Its Rust dependencies (`serde`, `serde_json`) are compiled into the archive, so a
-consumer links no third-party library; the system libraries it needs at link
-time are listed by:
+Its Rust dependencies (`serde`, `serde_json`, and on 64-bit targets `mssql-tds`
+for diagnose) are compiled into the archive, so a consumer links no third-party
+Rust library. `mssql-tds` needs the TLS libraries it uses: Schannel and other
+Win32 libraries on Windows, OpenSSL (`libssl`, `libcrypto`) on Linux. The system
+libraries it needs at link time are listed by:
 
 ```text
 cargo rustc -p mssql-sqlcmd --release --lib -- --print native-static-libs
@@ -124,7 +198,10 @@ runtimes/<rid>/native/native-static-libs.txt
 
 `native-static-libs.txt` is one line: the system libraries that runtime's
 library needs, exactly as rustc reports them (`-l` flags, or `.lib` names on
-Windows). Consumers link these rather than a hard-coded list.
+Windows). Consumers link these rather than a hard-coded list. On Windows the list
+includes import libraries of the Rust `windows` crates (`windows.0.52.0.lib`
+and the like), which are not in the Windows SDK; they are shipped next to the
+library, so consumers add that directory to the linker's library path.
 
 To build the same layout locally:
 

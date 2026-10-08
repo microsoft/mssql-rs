@@ -30,7 +30,7 @@ use crate::error::Error;
 // ---------------------------------------------------------------------------
 
 /// SQL Server Browser listens on UDP port 1434.
-pub const SSRP_PORT: u16 = 1434;
+pub(crate) const SSRP_PORT: u16 = 1434;
 
 /// Request type: unicast query for a specific named instance.
 const CLNT_UCAST_INST: u8 = 0x04;
@@ -39,7 +39,7 @@ const CLNT_UCAST_INST: u8 = 0x04;
 const SVR_RESP: u8 = 0x05;
 
 /// Default timeout for SSRP queries (matches msodbcsql DEFAULT_SSRPGETINFO_TIMEOUT).
-pub const DEFAULT_SSRP_TIMEOUT_MS: u64 = 1000;
+pub(crate) const DEFAULT_SSRP_TIMEOUT_MS: u64 = 1000;
 
 /// Maximum number of resolved IP addresses to query (matches msodbcsql MAX_SOCKET_NUM).
 const MAX_SSRP_ADDRESSES: usize = 64;
@@ -88,12 +88,164 @@ pub(crate) async fn get_instance_info_ext(
     ssrp_port: u16,
     timeout_ms: u64,
 ) -> TdsResult<Vec<SsrpInstanceInfo>> {
-    let response = query_browser(server, instance, ssrp_port, timeout_ms).await?;
+    let resolve = tokio::net::lookup_host((server, ssrp_port));
+    let response = query_browser(server, instance, resolve, timeout_ms, None)
+        .await
+        .map_err(Error::from)?;
     Ok(response.protocols)
 }
 
+/// Why a SQL Server Browser lookup failed, as [`lookup_instance`] reports it,
+/// with the operating system's error where there is one.
+#[derive(Debug)]
+pub enum SsrpLookupError {
+    /// The server name did not resolve.
+    Resolve {
+        /// The server looked up.
+        server: String,
+        /// The resolver's error.
+        error: std::io::Error,
+    },
+    /// The server name resolved to no address.
+    NoAddresses {
+        /// The server looked up.
+        server: String,
+    },
+    /// No UDP socket could be opened; the last bind error.
+    Socket(Option<std::io::Error>),
+    /// Every UDP send failed; the last send error.
+    Send(Option<std::io::Error>),
+    /// Receiving the answer failed.
+    Receive(std::io::Error),
+    /// SQL Server Browser did not answer in time.
+    NoAnswer {
+        /// How long it was given.
+        timeout_ms: u64,
+        /// The first address asked.
+        address: String,
+    },
+    /// Resolving the server used up the whole time limit, so SQL Server
+    /// Browser was never asked.
+    TimedOut {
+        /// The server looked up.
+        server: String,
+        /// How long it was given.
+        timeout_ms: u64,
+    },
+    /// The answer could not be parsed.
+    InvalidResponse(Error),
+}
+
+impl SsrpLookupError {
+    /// A stable identifier for the failure.
+    pub fn code(&self) -> &'static str {
+        match self {
+            SsrpLookupError::Resolve { .. } => "nameResolutionFailed",
+            SsrpLookupError::NoAddresses { .. } => "noAddresses",
+            SsrpLookupError::Socket(_) => "socketFailed",
+            SsrpLookupError::Send(_) => "sendFailed",
+            SsrpLookupError::Receive(_) => "receiveFailed",
+            SsrpLookupError::NoAnswer { .. } => "noAnswer",
+            SsrpLookupError::TimedOut { .. } => "timedOut",
+            SsrpLookupError::InvalidResponse(_) => "invalidResponse",
+        }
+    }
+
+    /// The operating system's error code, when the failure has one.
+    pub fn os_error(&self) -> Option<i32> {
+        match self {
+            SsrpLookupError::Resolve { error, .. } | SsrpLookupError::Receive(error) => {
+                error.raw_os_error()
+            }
+            SsrpLookupError::Socket(error) | SsrpLookupError::Send(error) => {
+                error.as_ref().and_then(std::io::Error::raw_os_error)
+            }
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for SsrpLookupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SsrpLookupError::Resolve { server, error } => write!(
+                f,
+                "Failed to resolve server '{server}' for SQL Browser query: {error}"
+            ),
+            SsrpLookupError::NoAddresses { server } => {
+                write!(f, "No addresses resolved for server '{server}'")
+            }
+            SsrpLookupError::Socket(_) => {
+                write!(f, "Failed to create any UDP sockets for SQL Browser query")
+            }
+            SsrpLookupError::Send(_) => write!(
+                f,
+                "All UDP sends to SQL Server Browser failed. \
+                 Verify network connectivity to the server."
+            ),
+            SsrpLookupError::Receive(error) => {
+                write!(f, "UDP receive error from SQL Server Browser: {error}")
+            }
+            SsrpLookupError::NoAnswer {
+                timeout_ms,
+                address,
+            } => write!(
+                f,
+                "SQL Server Browser did not respond within {timeout_ms}ms. \
+                 Verify that the SQL Server Browser service is running on '{address}'."
+            ),
+            SsrpLookupError::TimedOut { server, timeout_ms } => write!(
+                f,
+                "Resolving '{server}' for the SQL Server Browser lookup did not complete within {timeout_ms}ms."
+            ),
+            SsrpLookupError::InvalidResponse(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for SsrpLookupError {}
+
+impl From<SsrpLookupError> for Error {
+    fn from(error: SsrpLookupError) -> Self {
+        match error {
+            SsrpLookupError::InvalidResponse(error) => error,
+            other => Error::ConnectionError(other.to_string()),
+        }
+    }
+}
+
+/// Asks SQL Server Browser on `server` for the endpoints of the named
+/// `instance`, as a client resolving a named instance does. `timeout_ms`
+/// bounds the whole lookup, resolving `server` included: resolving that
+/// runs out of time is [`SsrpLookupError::TimedOut`], and a Browser that
+/// does not answer in the time left is [`SsrpLookupError::NoAnswer`]. Used by
+/// connection diagnostics, which report this step on its own.
+pub async fn lookup_instance(
+    server: &str,
+    instance: &str,
+    timeout_ms: u64,
+) -> Result<Vec<SsrpInstanceInfo>, SsrpLookupError> {
+    let resolve = tokio::net::lookup_host((server, SSRP_PORT));
+    lookup_instance_with(server, instance, resolve, timeout_ms).await
+}
+
+async fn lookup_instance_with<A>(
+    server: &str,
+    instance: &str,
+    resolve: impl std::future::Future<Output = std::io::Result<A>>,
+    timeout_ms: u64,
+) -> Result<Vec<SsrpInstanceInfo>, SsrpLookupError>
+where
+    A: Iterator<Item = SocketAddr>,
+{
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
+    query_browser(server, instance, resolve, timeout_ms, Some(deadline))
+        .await
+        .map(|response| response.protocols)
+}
+
 /// Convert SSRP instance info into an ordered list of [`TransportContext`] variants.
-pub fn build_transport_list(
+pub(crate) fn build_transport_list(
     instance_info: Vec<SsrpInstanceInfo>,
     server: &str,
     _instance: &str,
@@ -266,59 +418,89 @@ fn push_protocol(
     }
 }
 
-/// Full SSRP query: resolve hostname, send CLNT_UCAST_INST to all addresses,
-/// return the first valid SVR_RESP.
-async fn query_browser(
+/// Full SSRP query: resolve hostname (`resolve`, the Browser port included),
+/// send CLNT_UCAST_INST to all addresses, return the first valid SVR_RESP.
+/// Without a `deadline`, resolving is not bounded and the answer is waited for
+/// `timeout_ms` after it; with one, both share it.
+async fn query_browser<A>(
     server: &str,
     instance: &str,
-    ssrp_port: u16,
+    resolve: impl std::future::Future<Output = std::io::Result<A>>,
     timeout_ms: u64,
-) -> TdsResult<SsrpResponse> {
-    debug!(
-        server,
-        instance, ssrp_port, timeout_ms, "Querying SQL Server Browser"
-    );
+    deadline: Option<tokio::time::Instant>,
+) -> Result<SsrpResponse, SsrpLookupError>
+where
+    A: Iterator<Item = SocketAddr>,
+{
+    debug!(server, instance, timeout_ms, "Querying SQL Server Browser");
 
     let request = build_instance_request(instance);
 
     // Resolve server to all IP addresses
-    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((server, ssrp_port))
-        .await
-        .map_err(|e| {
-            Error::ConnectionError(format!(
-                "Failed to resolve server '{}' for SQL Browser query: {}",
-                server, e
-            ))
+    let resolved = match deadline {
+        Some(deadline) => tokio::time::timeout_at(deadline, resolve)
+            .await
+            .map_err(|_| SsrpLookupError::TimedOut {
+                server: server.to_string(),
+                timeout_ms,
+            })?,
+        None => resolve.await,
+    };
+    let addrs: Vec<SocketAddr> = resolved
+        .map_err(|error| SsrpLookupError::Resolve {
+            server: server.to_string(),
+            error,
         })?
         .take(MAX_SSRP_ADDRESSES)
         .collect();
 
     if addrs.is_empty() {
-        return Err(Error::ConnectionError(format!(
-            "No addresses resolved for server '{}'",
-            server
-        )));
+        return Err(SsrpLookupError::NoAddresses {
+            server: server.to_string(),
+        });
     }
 
     debug!(address_count = addrs.len(), "Resolved server addresses");
 
-    let raw = send_and_receive_first(&request, &addrs, timeout_ms).await?;
+    let deadline =
+        deadline.unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_millis(timeout_ms));
+    // The deadline covers opening the sockets and sending too, not only
+    // waiting for the answer: a send that stalls is no answer in time.
+    let asked = tokio::time::Instant::now();
+    let raw =
+        match tokio::time::timeout_at(deadline, send_and_receive_first(&request, &addrs, deadline))
+            .await
+        {
+            Ok(result) => result?,
+            Err(_) => {
+                return Err(SsrpLookupError::NoAnswer {
+                    timeout_ms: u64::try_from(
+                        deadline.saturating_duration_since(asked).as_millis(),
+                    )
+                    .unwrap_or(u64::MAX),
+                    address: addrs
+                        .first()
+                        .map(|a| a.ip().to_string())
+                        .unwrap_or_default(),
+                });
+            }
+        };
 
     trace!(len = raw.len(), "Received SSRP response");
 
-    parse_ssrp_response(&raw)
+    parse_ssrp_response(&raw).map_err(SsrpLookupError::InvalidResponse)
 }
 
 /// Send `request` to every address in `addrs` (one UDP socket per address family)
-/// and return the first valid response within `timeout_ms`.
+/// and return the first valid response by `deadline`.
 ///
 /// Uses `recv_from` and validates the sender address against `addrs` to prevent
 /// spoofed UDP packets from redirecting instance resolution.
 async fn send_and_receive_first(
     request: &[u8],
     addrs: &[SocketAddr],
-    timeout_ms: u64,
-) -> TdsResult<Vec<u8>> {
+    deadline: tokio::time::Instant,
+) -> Result<Vec<u8>, SsrpLookupError> {
     let has_v4 = addrs.iter().any(|a| a.is_ipv4());
     let has_v6 = addrs.iter().any(|a| a.is_ipv6());
 
@@ -328,18 +510,24 @@ async fn send_and_receive_first(
 
     // IPv4
     let mut any_send_succeeded = false;
+    let mut bind_error = None;
+    let mut send_error = None;
     if has_v4 {
         match UdpSocket::bind("0.0.0.0:0").await {
             Ok(sock) => {
                 let sock = Arc::new(sock);
                 for addr in addrs.iter().filter(|a| a.is_ipv4()) {
-                    if sock.send_to(request, addr).await.is_ok() {
-                        any_send_succeeded = true;
+                    match sock.send_to(request, addr).await {
+                        Ok(_) => any_send_succeeded = true,
+                        Err(e) => send_error = Some(e),
                     }
                 }
                 sockets.push(sock);
             }
-            Err(e) => debug!("Failed to bind IPv4 UDP socket: {}", e),
+            Err(e) => {
+                debug!("Failed to bind IPv4 UDP socket: {}", e);
+                bind_error = Some(e);
+            }
         }
     }
 
@@ -349,28 +537,26 @@ async fn send_and_receive_first(
             Ok(sock) => {
                 let sock = Arc::new(sock);
                 for addr in addrs.iter().filter(|a| a.is_ipv6()) {
-                    if sock.send_to(request, addr).await.is_ok() {
-                        any_send_succeeded = true;
+                    match sock.send_to(request, addr).await {
+                        Ok(_) => any_send_succeeded = true,
+                        Err(e) => send_error = Some(e),
                     }
                 }
                 sockets.push(sock);
             }
-            Err(e) => debug!("Failed to bind IPv6 UDP socket: {}", e),
+            Err(e) => {
+                debug!("Failed to bind IPv6 UDP socket: {}", e);
+                bind_error = Some(e);
+            }
         }
     }
 
     if sockets.is_empty() {
-        return Err(Error::ConnectionError(
-            "Failed to create any UDP sockets for SQL Browser query".to_string(),
-        ));
+        return Err(SsrpLookupError::Socket(bind_error));
     }
 
     if !any_send_succeeded {
-        return Err(Error::ConnectionError(
-            "All UDP sends to SQL Server Browser failed. \
-             Verify network connectivity to the server."
-                .to_string(),
-        ));
+        return Err(SsrpLookupError::Send(send_error));
     }
 
     // Race all socket recv futures against the timeout.
@@ -396,21 +582,17 @@ async fn send_and_receive_first(
         })
         .collect();
 
-    match tokio::time::timeout(Duration::from_millis(timeout_ms), select_all(recv_futures)).await {
+    let waited = deadline.saturating_duration_since(tokio::time::Instant::now());
+    match tokio::time::timeout_at(deadline, select_all(recv_futures)).await {
         Ok((Ok(buf), _, _)) => Ok(buf),
-        Ok((Err(e), _, _)) => Err(Error::ConnectionError(format!(
-            "UDP receive error from SQL Server Browser: {}",
-            e
-        ))),
-        Err(_) => Err(Error::ConnectionError(format!(
-            "SQL Server Browser did not respond within {}ms. \
-             Verify that the SQL Server Browser service is running on '{}'.",
-            timeout_ms,
-            addrs
+        Ok((Err(e), _, _)) => Err(SsrpLookupError::Receive(e)),
+        Err(_) => Err(SsrpLookupError::NoAnswer {
+            timeout_ms: u64::try_from(waited.as_millis()).unwrap_or(u64::MAX),
+            address: addrs
                 .first()
                 .map(|a| a.ip().to_string())
-                .unwrap_or_default()
-        ))),
+                .unwrap_or_default(),
+        }),
     }
 }
 
@@ -571,5 +753,47 @@ mod tests {
             "unexpected error: {}",
             msg
         );
+    }
+
+    /// Resolves to `address` after `delay`, as a slow DNS server would.
+    async fn resolve_after(
+        delay: u64,
+        address: SocketAddr,
+    ) -> std::io::Result<std::vec::IntoIter<SocketAddr>> {
+        tokio::time::sleep(Duration::from_millis(delay)).await;
+        Ok(vec![address].into_iter())
+    }
+
+    /// Resolving takes part of the time limit; a Browser that stays silent
+    /// for the rest is no answer, not a lookup that ran out of time.
+    #[tokio::test]
+    async fn a_silent_browser_after_slow_resolving_is_no_answer() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = socket.local_addr().unwrap();
+        let _hold = socket;
+
+        let started = std::time::Instant::now();
+        let error = lookup_instance_with("db01", "NOPE", resolve_after(150, address), 400)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), "noAnswer", "{error}");
+        let waited = match error {
+            SsrpLookupError::NoAnswer { timeout_ms, .. } => timeout_ms,
+            _ => unreachable!(),
+        };
+        assert!(waited < 400, "the Browser had only the time left: {waited}");
+        assert!(started.elapsed() < Duration::from_millis(1500));
+    }
+
+    /// Resolving that uses up the whole time limit never asks the Browser.
+    #[tokio::test]
+    async fn resolving_that_uses_up_the_time_limit_is_timed_out() {
+        let address = SocketAddr::from(([127, 0, 0, 1], 9));
+        let started = std::time::Instant::now();
+        let error = lookup_instance_with("db01", "NOPE", resolve_after(5000, address), 200)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), "timedOut", "{error}");
+        assert!(started.elapsed() < Duration::from_millis(1500));
     }
 }

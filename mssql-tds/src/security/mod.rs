@@ -57,6 +57,22 @@ pub use windows::WindowsSspiContext;
 #[cfg(unix)]
 pub use unix::GssapiContext;
 
+/// The `server_spn` setting ([`IntegratedAuthConfig::server_spn`], or the
+/// client context's) that requests the SPN `spn`, made as [`make_spn`] makes
+/// it. A configured SPN is used as given, so it must already be in the form
+/// the platform takes: SSPI's `service/host:port`, or GSSAPI's host-based
+/// `service@host`, into which an SPN the client makes itself is converted.
+pub fn configured_spn(spn: &str) -> String {
+    #[cfg(unix)]
+    {
+        unix::convert_spn_to_gssapi_format(spn)
+    }
+    #[cfg(not(unix))]
+    {
+        spn.to_string()
+    }
+}
+
 /// Creates a platform-appropriate security context.
 ///
 /// On Windows, creates a `WindowsSspiContext`.
@@ -101,4 +117,33 @@ pub fn create_security_context(
     Err(SecurityError::NotSupported(
         "Integrated authentication is only supported on Windows and Unix platforms".to_string(),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    /// A configured SPN must request the SPN the client would make itself.
+    #[test]
+    fn a_configured_spn_is_in_the_form_the_platform_takes() {
+        let spn = super::make_spn("db.contoso.com", None, 1433);
+        assert_eq!(spn, "MSSQLSvc/db.contoso.com:1433");
+        let expected = if cfg!(unix) {
+            "MSSQLSvc@db.contoso.com"
+        } else {
+            "MSSQLSvc/db.contoso.com:1433"
+        };
+        assert_eq!(super::configured_spn(&spn), expected);
+
+        // An IPv6 host keeps its colons; only the port is dropped.
+        let spn = super::make_spn("::1", None, 1433);
+        let expected = if cfg!(unix) {
+            "MSSQLSvc@::1"
+        } else {
+            "MSSQLSvc/::1:1433"
+        };
+        assert_eq!(super::configured_spn(&spn), expected);
+        let spn = super::make_spn("fe80::1", Some("INST"), 1433);
+        if cfg!(unix) {
+            assert_eq!(super::configured_spn(&spn), "MSSQLSvc@fe80::1");
+        }
+    }
 }

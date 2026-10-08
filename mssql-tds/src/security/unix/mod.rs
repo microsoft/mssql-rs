@@ -23,6 +23,7 @@ mod gssapi_context;
 mod gssapi_ffi;
 
 pub use gssapi_context::GssapiContext;
+pub(crate) use gssapi_context::convert_spn_to_gssapi_format;
 pub use gssapi_ffi::{default_principal_name, has_valid_credentials, is_gssapi_available};
 
 /// Checks if GSSAPI is available on this system.

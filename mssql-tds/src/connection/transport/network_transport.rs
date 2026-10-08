@@ -3,6 +3,7 @@
 
 use crate::connection::bulk_copy_state::ATTENTION_TIMEOUT_SECONDS;
 use crate::connection::client_context::{IPAddressPreference, TransportContext};
+use crate::connection::connect_stage;
 use crate::connection::transport::buffers::TdsReadBuffer;
 use crate::connection::transport::extractable_stream;
 use crate::connection::transport::parallel_connect::{ParallelConnectConfig, parallel_connect};
@@ -360,6 +361,13 @@ async fn create_base_stream_sequential(
     // blocking the calling thread, so a slow or stuck resolver stays subject to the
     // `timeout()`/deadline machinery in the retry loop above this call instead of
     // silently escaping it.
+    let dns_stage = tracing::info_span!(
+        target: connect_stage::TARGET,
+        connect_stage::DNS,
+        host = %host,
+        addresses = tracing::field::Empty,
+        ok = tracing::field::Empty
+    );
     let mut socket_addresses: Vec<SocketAddr> =
         tokio::net::lookup_host((host, port)).await?.collect();
 
@@ -369,8 +377,25 @@ async fn create_base_stream_sequential(
     sort_by_ip_preference(&mut socket_addresses, ipaddress_preference);
 
     info!("Socket addresses: {:?}", socket_addresses);
+    if !dns_stage.is_disabled() {
+        let found: Vec<String> = socket_addresses
+            .iter()
+            .map(|a| a.ip().to_string())
+            .collect();
+        dns_stage.record("addresses", found.join(", "));
+    }
+    if !socket_addresses.is_empty() {
+        dns_stage.record(connect_stage::OK, true);
+    }
+    drop(dns_stage);
 
     for socket_address in socket_addresses {
+        let tcp_stage = tracing::info_span!(
+            target: connect_stage::TARGET,
+            connect_stage::TCP,
+            address = %socket_address,
+            ok = tracing::field::Empty
+        );
         let socket = if socket_address.is_ipv6() {
             net::TcpSocket::new_v6()?
         } else {
@@ -393,6 +418,7 @@ async fn create_base_stream_sequential(
         {
             Ok(Ok(stream)) => {
                 info!("Connected to TCP transport: {}:{}", host, port);
+                tcp_stage.record(connect_stage::OK, true);
                 Some(stream)
             }
             Ok(Err(e)) => {
@@ -449,7 +475,16 @@ async fn create_base_stream_parallel(
         keep_alive_interval_in_ms,
     };
 
+    let tcp_stage = tracing::info_span!(
+        target: connect_stage::TARGET,
+        connect_stage::TCP,
+        address = tracing::field::Empty,
+        ok = tracing::field::Empty
+    );
     let result = parallel_connect(host, port, &config).await?;
+    tcp_stage.record("address", tracing::field::display(result.connected_address));
+    tcp_stage.record(connect_stage::OK, true);
+    drop(tcp_stage);
 
     info!(
         "Parallel connection succeeded to {} (tried {} addresses, {} failed)",
@@ -491,9 +526,16 @@ async fn create_transport_for_version(
             // Enable TLS immediately for TDS 8.0 (before any TDS packets are exchanged)
             info!("Creating NetworkTransport for TDS 8.0 with immediate TLS");
 
+            let tls_stage = tracing::info_span!(
+                target: connect_stage::TARGET,
+                connect_stage::TLS,
+                ok = tracing::field::Empty
+            );
             let encrypted_stream = ssl_handler
                 .enable_ssl_async(stream, NegotiatedEncryptionSetting::Strict)
                 .await?;
+            tls_stage.record(connect_stage::OK, true);
+            drop(tls_stage);
 
             Ok(NetworkTransport::new(
                 encrypted_stream,

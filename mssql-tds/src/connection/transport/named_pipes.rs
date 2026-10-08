@@ -34,7 +34,7 @@ const LOCAL_IPV6_LOOPBACK: &str = "::1";
 /// often fails with "Access is denied" even on the local machine. Using
 /// `\\.\pipe\...` connects through the local IPC namespace instead, matching
 /// ODBC/SNI behavior.
-pub(crate) fn localize_pipe_path(pipe: &str) -> String {
+pub fn localize_pipe_path(pipe: &str) -> String {
     // Must start with \\
     if !pipe.starts_with("\\\\") {
         return pipe.to_string();

@@ -439,6 +439,15 @@ fn from_wide_string(buffer: &[u16]) -> String {
 /// # Returns
 /// The named pipe path to connect to the instance
 pub async fn resolve_localdb_instance(instance_name: &str) -> TdsResult<String> {
+    resolve_localdb_pipe(instance_name)
+}
+
+/// Resolves a LocalDB instance name (for example `MSSQLLocalDB`) to the named
+/// pipe path to connect to, starting the instance if it is stopped.
+///
+/// This blocks: it loads the LocalDB API and may wait for the instance to
+/// start, so async callers should run it on a thread of its own.
+pub fn resolve_localdb_pipe(instance_name: &str) -> TdsResult<String> {
     info!("Resolving LocalDB instance: {}", instance_name);
 
     // Load the LocalDB API

@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 use crate::connection::client_context::{ClientContext, TransportContext};
+use crate::connection::connect_stage;
 use crate::connection::session_recovery::SessionRecoveryData;
 use crate::core::{EncryptionSetting, NegotiatedEncryptionSetting, TdsResult, Version};
 use crate::error::{Error, SqlInfoMessage, SqlServerDiagnostics};
@@ -287,20 +288,41 @@ impl<'a, 'b> SessionHandler<'a, 'b> {
         Vec<SqlInfoMessage>,
         Vec<SessionStateToken>,
     )> {
+        let prelogin_stage = tracing::info_span!(
+            target: connect_stage::TARGET,
+            connect_stage::PRELOGIN,
+            encryption = tracing::field::Empty,
+            ok = tracing::field::Empty
+        );
         let pre_login_result = self.get_pre_login_result(reader_writer).await?;
         self.validate_prelogin_result(&pre_login_result)?;
+        prelogin_stage.record(
+            "encryption",
+            tracing::field::debug(pre_login_result.encryption_setting),
+        );
+        prelogin_stage.record(connect_stage::OK, true);
+        drop(prelogin_stage);
 
         // Note: This must happen before login because the login process can use the negotiated
         // encryption setting.
         reader_writer.notify_encryption_setting_change(pre_login_result.encryption_setting);
 
+        // Includes the TLS handshake (its own stage) when encryption starts at login.
+        let login_stage = tracing::info_span!(
+            target: connect_stage::TARGET,
+            connect_stage::LOGIN,
+            ok = tracing::field::Empty
+        );
         let mut login_result = self
             .get_login_result(reader_writer, pre_login_result.is_fed_auth_supported)
             .await?;
         self.validate_login_result(&mut login_result)?;
-
+        // Inferring the session settings can still reject the response, so
+        // the login stage succeeds only after it.
         let negotiated_settings =
             self.infer_negotiated_settings(&pre_login_result, &mut login_result)?;
+        login_stage.record(connect_stage::OK, true);
+        drop(login_stage);
         let info_messages = std::mem::take(&mut login_result.diagnostics.info_messages);
         let session_state_tokens = std::mem::take(&mut login_result.session_state_tokens);
         reader_writer.notify_session_setting_change(&negotiated_settings.session_settings);
@@ -536,7 +558,15 @@ impl LoginHandler<'_> {
         {
             // Note: We should not toggle encryption on if Strict is used because it is already,
             // and we shouldn't alter the streams.
+            let tls_stage = tracing::info_span!(
+                target: connect_stage::TARGET,
+                connect_stage::TLS,
+                ok = tracing::field::Empty
+            );
             reader_writer.enable_ssl().await?;
+            tls_stage.record(connect_stage::OK, true);
+            // Closed here, so the span times the handshake only, not the login.
+            drop(tls_stage);
         }
 
         let (request_model, mut sspi_handler) = self

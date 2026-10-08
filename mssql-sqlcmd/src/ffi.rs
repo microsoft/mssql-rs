@@ -26,6 +26,8 @@
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
+#[cfg(target_pointer_width = "64")]
+use crate::diagnostics::{self, Authentication, Depth, Encrypt, Request};
 use crate::formatter::json::{Column, Connection, JsonDocument, Message, RunEnd};
 
 /// The call succeeded.
@@ -40,6 +42,8 @@ pub const MSSQL_SQLCMD_INVALID_STATE: i32 = 2;
 pub const MSSQL_SQLCMD_INTERNAL_ERROR: i32 = 3;
 /// An argument is out of its range, e.g. an unknown `MSSQL_SQLCMD_RUN_*` value.
 pub const MSSQL_SQLCMD_INVALID_ARGUMENT: i32 = 4;
+/// This build does not have the feature: diagnostics in a 32-bit build.
+pub const MSSQL_SQLCMD_UNSUPPORTED: i32 = 5;
 
 /// [`mssql_sqlcmd_json_render`]'s `end`: sqlcmd ran to its end, and the exit
 /// code says whether the work succeeded.
@@ -518,8 +522,9 @@ pub unsafe extern "C" fn mssql_sqlcmd_json_render(
     }
 }
 
-/// Releases text returned by [`mssql_sqlcmd_json_render`]. A null pointer is
-/// ignored. Nothing unwinds across the boundary.
+/// Releases text returned by [`mssql_sqlcmd_json_render`] or
+/// [`mssql_sqlcmd_diagnostics_run`]. A null pointer is ignored. Nothing unwinds
+/// across the boundary.
 ///
 /// # Safety
 /// `text` and `len` must be exactly what a render call returned (`len` in
@@ -535,6 +540,253 @@ pub unsafe extern "C" fn mssql_sqlcmd_free_text(text: *const u16, len: usize) {
     }
 }
 
+/// `authentication` of [`MssqlSqlcmdDiagnosticsRequest`]: SQL Server
+/// authentication with `user` and `password`.
+pub const MSSQL_SQLCMD_AUTH_SQL_PASSWORD: i32 = 0;
+/// Windows authentication (Kerberos off Windows); `user` and `password` are
+/// ignored.
+pub const MSSQL_SQLCMD_AUTH_INTEGRATED: i32 = 1;
+
+/// `encrypt` of [`MssqlSqlcmdDiagnosticsRequest`], as sqlcmd's `-N` sets it.
+pub const MSSQL_SQLCMD_ENCRYPT_OPTIONAL: i32 = 0;
+pub const MSSQL_SQLCMD_ENCRYPT_MANDATORY: i32 = 1;
+pub const MSSQL_SQLCMD_ENCRYPT_STRICT: i32 = 2;
+
+/// `format` of [`mssql_sqlcmd_diagnostics_run`].
+pub const MSSQL_SQLCMD_REPORT_TEXT: i32 = 0;
+pub const MSSQL_SQLCMD_REPORT_JSON: i32 = 1;
+
+/// `depth` of [`MssqlSqlcmdDiagnosticsRequest`]: how far the diagnosis goes.
+/// Each depth includes the ones before it.
+pub const MSSQL_SQLCMD_DEPTH_DEFAULT: i32 = -1;
+pub const MSSQL_SQLCMD_DEPTH_CONNECTION_INPUT: i32 = 0;
+pub const MSSQL_SQLCMD_DEPTH_ENDPOINT_RESOLUTION: i32 = 1;
+pub const MSSQL_SQLCMD_DEPTH_NETWORK_REACHABILITY: i32 = 2;
+pub const MSSQL_SQLCMD_DEPTH_CONNECTION_ATTEMPT: i32 = 3;
+pub const MSSQL_SQLCMD_DEPTH_SESSION_VALIDATION: i32 = 4;
+
+/// What `sqlcmd diagnose` checks.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct MssqlSqlcmdDiagnosticsRequest {
+    /// As given to `-S`. Required.
+    pub server: MssqlSqlcmdText,
+    /// Null or empty: the login's default database.
+    pub database: MssqlSqlcmdText,
+    /// An `MSSQL_SQLCMD_AUTH_*` value.
+    pub authentication: i32,
+    pub user: MssqlSqlcmdText,
+    pub password: MssqlSqlcmdText,
+    /// An `MSSQL_SQLCMD_ENCRYPT_*` value.
+    pub encrypt: i32,
+    /// Non-zero for `-C`.
+    pub trust_server_certificate: i32,
+    /// `-F`; null or empty when not given.
+    pub host_name_in_certificate: MssqlSqlcmdText,
+    /// `-l`, in seconds; 0 or less for the default.
+    pub login_timeout_seconds: i32,
+    /// An `MSSQL_SQLCMD_DEPTH_*` value; [`MSSQL_SQLCMD_DEPTH_DEFAULT`] is session
+    /// validation, the deepest.
+    pub depth: i32,
+    /// Non-zero to show identifiers as they are instead of share-safe labels.
+    pub local_detail: i32,
+    /// Why sqlcmd rejected the request; null or empty when it is valid. A
+    /// rejected request runs nothing and reports itself as an invalid
+    /// invocation (`server` may then be empty).
+    pub invalid_reason: MssqlSqlcmdText,
+}
+
+/// Diagnoses the connection `request` describes, up to its depth, and renders
+/// the report as text or JSON (`format`, an `MSSQL_SQLCMD_REPORT_*` value) into
+/// `*out` / `*out_len`, as UTF-16; release it with [`mssql_sqlcmd_free_text`].
+/// `*exit_code` is sqlcmd's exit code for the outcome: 0 passed, 1 issue
+/// detected, 2 inconclusive or not evaluated, 3 partial, 4 canceled, 5 internal
+/// failure, 6 invalid invocation. Opens at most one connection, and runs only a
+/// minimal query on it (session validation); blocks until the diagnosis ends.
+/// `version` is sqlcmd's, for the JSON report.
+///
+/// A failed connection is a report, not an error: the call returns
+/// [`MSSQL_SQLCMD_OK`]. On an error `*out` is null, `*out_len` 0 and
+/// `*exit_code` 5.
+///
+/// # Safety
+/// `request`, `out`, `out_len` and `exit_code` must be null or valid; the
+/// texts in `request` and `version` follow [`MssqlSqlcmdText`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mssql_sqlcmd_diagnostics_run(
+    request: *const MssqlSqlcmdDiagnosticsRequest,
+    version: MssqlSqlcmdText,
+    format: i32,
+    out: *mut *const u16,
+    out_len: *mut usize,
+    exit_code: *mut i32,
+) -> i32 {
+    // Each output is cleared on its own, so one null cannot leave another stale.
+    // SAFETY: each is written only when non-null, and is then writable, per the caller.
+    unsafe {
+        if !out.is_null() {
+            *out = std::ptr::null();
+        }
+        if !out_len.is_null() {
+            *out_len = 0;
+        }
+        if !exit_code.is_null() {
+            *exit_code = 5;
+        }
+    }
+    if out.is_null() || out_len.is_null() || exit_code.is_null() {
+        return MSSQL_SQLCMD_NULL_ARGUMENT;
+    }
+    if request.is_null() {
+        return MSSQL_SQLCMD_NULL_ARGUMENT;
+    }
+    // SAFETY: a non-null request is valid, per the caller.
+    let request = unsafe { *request };
+    let valid = matches!(
+        request.authentication,
+        MSSQL_SQLCMD_AUTH_SQL_PASSWORD | MSSQL_SQLCMD_AUTH_INTEGRATED
+    ) && matches!(
+        request.encrypt,
+        MSSQL_SQLCMD_ENCRYPT_OPTIONAL
+            | MSSQL_SQLCMD_ENCRYPT_MANDATORY
+            | MSSQL_SQLCMD_ENCRYPT_STRICT
+    ) && matches!(format, MSSQL_SQLCMD_REPORT_TEXT | MSSQL_SQLCMD_REPORT_JSON)
+        && (MSSQL_SQLCMD_DEPTH_DEFAULT..=MSSQL_SQLCMD_DEPTH_SESSION_VALIDATION)
+            .contains(&request.depth);
+    if !valid {
+        return MSSQL_SQLCMD_INVALID_ARGUMENT;
+    }
+    // SAFETY: the texts follow the caller's guarantees.
+    let input = unsafe {
+        let invalid_reason = read_optional_text(request.invalid_reason);
+        let server = read_optional_text(request.server);
+        let Some(server) = server.or_else(|| invalid_reason.as_ref().map(|_| String::new())) else {
+            return MSSQL_SQLCMD_NULL_ARGUMENT;
+        };
+        let Some(version) = read_text(version) else {
+            return MSSQL_SQLCMD_NULL_ARGUMENT;
+        };
+        DiagnosticsInput {
+            server,
+            database: read_optional_text(request.database),
+            integrated: request.authentication == MSSQL_SQLCMD_AUTH_INTEGRATED,
+            user: read_text(request.user).unwrap_or_default(),
+            password: read_text(request.password).unwrap_or_default(),
+            encrypt: request.encrypt,
+            trust_server_certificate: request.trust_server_certificate != 0,
+            host_name_in_certificate: read_optional_text(request.host_name_in_certificate),
+            login_timeout_seconds: u32::try_from(request.login_timeout_seconds).unwrap_or(0),
+            depth: request.depth,
+            local_detail: request.local_detail != 0,
+            invalid_reason,
+            version,
+            json: format == MSSQL_SQLCMD_REPORT_JSON,
+        }
+    };
+
+    let Ok(rendered) = catch_unwind(AssertUnwindSafe(|| diagnose(input))) else {
+        return MSSQL_SQLCMD_INTERNAL_ERROR;
+    };
+    let Some((text, code)) = rendered else {
+        return MSSQL_SQLCMD_UNSUPPORTED;
+    };
+    let rendered: Box<[u16]> = text.encode_utf16().collect();
+    // SAFETY: checked non-null and writable above.
+    unsafe {
+        *out_len = rendered.len();
+        *out = Box::into_raw(rendered).cast::<u16>().cast_const();
+        *exit_code = code;
+    }
+    MSSQL_SQLCMD_OK
+}
+
+/// A diagnostics request read from its C form, with the arguments already
+/// checked.
+#[cfg_attr(not(target_pointer_width = "64"), allow(dead_code))]
+struct DiagnosticsInput {
+    server: String,
+    database: Option<String>,
+    integrated: bool,
+    user: String,
+    password: String,
+    encrypt: i32,
+    trust_server_certificate: bool,
+    host_name_in_certificate: Option<String>,
+    login_timeout_seconds: u32,
+    depth: i32,
+    local_detail: bool,
+    invalid_reason: Option<String>,
+    version: String,
+    json: bool,
+}
+
+/// Runs the diagnosis and renders the report, with sqlcmd's exit code.
+#[cfg(target_pointer_width = "64")]
+fn diagnose(input: DiagnosticsInput) -> Option<(String, i32)> {
+    let request = Request {
+        server: input.server,
+        database: input.database,
+        authentication: if input.integrated {
+            Authentication::Integrated
+        } else {
+            Authentication::SqlPassword {
+                user: input.user,
+                password: input.password,
+            }
+        },
+        encrypt: match input.encrypt {
+            MSSQL_SQLCMD_ENCRYPT_OPTIONAL => Encrypt::Optional,
+            MSSQL_SQLCMD_ENCRYPT_STRICT => Encrypt::Strict,
+            _ => Encrypt::Mandatory,
+        },
+        trust_server_certificate: input.trust_server_certificate,
+        host_name_in_certificate: input.host_name_in_certificate,
+        login_timeout_seconds: input.login_timeout_seconds,
+        depth: match input.depth {
+            MSSQL_SQLCMD_DEPTH_CONNECTION_INPUT => Depth::ConnectionInput,
+            MSSQL_SQLCMD_DEPTH_ENDPOINT_RESOLUTION => Depth::EndpointResolution,
+            MSSQL_SQLCMD_DEPTH_NETWORK_REACHABILITY => Depth::NetworkReachability,
+            MSSQL_SQLCMD_DEPTH_CONNECTION_ATTEMPT => Depth::ConnectionAttempt,
+            _ => Depth::SessionValidation,
+        },
+        depth_selected: input.depth != MSSQL_SQLCMD_DEPTH_DEFAULT,
+        local_detail: input.local_detail,
+        invalid: input.invalid_reason,
+    };
+    let report = diagnostics::run(request);
+    let text = if input.json {
+        // These view types cannot fail to serialize; if they did, the FFI
+        // boundary reports the panic as an internal error.
+        diagnostics::report::json(&report, &input.version).expect("a report always serializes")
+    } else {
+        diagnostics::report::text(&report)
+    };
+    Some((text, report.exit_code()))
+}
+
+/// 32-bit builds have no diagnose: `mssql-tds` is 64-bit only.
+#[cfg(not(target_pointer_width = "64"))]
+fn diagnose(_input: DiagnosticsInput) -> Option<(String, i32)> {
+    None
+}
+/// Cancels the diagnosis [`mssql_sqlcmd_diagnostics_run`] is running: it
+/// returns soon after with the checks that finished, the others skipped as
+/// canceled, and exit code 4. Callable from any thread, a console control or
+/// signal handler included (it only updates an atomic, without locking).
+/// Does nothing when no diagnosis is running, and never cancels a later one. 32-bit builds return
+/// [`MSSQL_SQLCMD_UNSUPPORTED`].
+#[unsafe(no_mangle)]
+pub extern "C" fn mssql_sqlcmd_diagnostics_cancel() -> i32 {
+    #[cfg(target_pointer_width = "64")]
+    {
+        crate::diagnostics::cancel();
+        MSSQL_SQLCMD_OK
+    }
+    #[cfg(not(target_pointer_width = "64"))]
+    {
+        MSSQL_SQLCMD_UNSUPPORTED
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1218,5 +1470,339 @@ mod tests {
         assert_eq!(len_only, MSSQL_SQLCMD_NULL_ARGUMENT);
         assert!(out.is_null());
         assert_eq!(out_len, 0);
+    }
+
+    fn diagnostics_request(
+        server: &[u16],
+        user: &[u16],
+        password: &[u16],
+    ) -> MssqlSqlcmdDiagnosticsRequest {
+        MssqlSqlcmdDiagnosticsRequest {
+            server: text(server),
+            database: NULL_TEXT,
+            authentication: MSSQL_SQLCMD_AUTH_SQL_PASSWORD,
+            user: text(user),
+            password: text(password),
+            encrypt: MSSQL_SQLCMD_ENCRYPT_MANDATORY,
+            trust_server_certificate: 1,
+            host_name_in_certificate: NULL_TEXT,
+            login_timeout_seconds: 5,
+            depth: MSSQL_SQLCMD_DEPTH_DEFAULT,
+            local_detail: 0,
+            invalid_reason: NULL_TEXT,
+        }
+    }
+
+    fn run_diagnostics(request: &MssqlSqlcmdDiagnosticsRequest, format: i32) -> (i32, String, i32) {
+        let version = utf16("18.7.0001.1");
+        let mut out = std::ptr::null();
+        let mut out_len = 0;
+        let mut exit_code = -1;
+        // SAFETY: every pointer is valid for the call.
+        let status = unsafe {
+            mssql_sqlcmd_diagnostics_run(
+                request,
+                text(&version),
+                format,
+                &mut out,
+                &mut out_len,
+                &mut exit_code,
+            )
+        };
+        let rendered = if out.is_null() {
+            String::new()
+        } else {
+            // SAFETY: the library returned `out_len` values at `out`, freed once here.
+            unsafe {
+                let rendered = String::from_utf16_lossy(std::slice::from_raw_parts(out, out_len));
+                mssql_sqlcmd_free_text(out, out_len);
+                rendered
+            }
+        };
+        (status, rendered, exit_code)
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn diagnose_of_a_refused_connection_renders_as_text_and_json() {
+        let (server, user, password) = (utf16("tcp:127.0.0.1,1"), utf16("sa"), utf16("not-shown"));
+        let request = diagnostics_request(&server, &user, &password);
+
+        let (status, rendered, exit_code) = run_diagnostics(&request, MSSQL_SQLCMD_REPORT_TEXT);
+        assert_eq!(status, MSSQL_SQLCMD_OK);
+        assert_eq!(exit_code, 1, "issue detected");
+        assert!(
+            rendered.starts_with("sqlcmd diagnose: server-1\n"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("TCP connect           DIAGNOSED"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("not-shown"));
+        assert!(!rendered.contains("127.0.0.1"), "share-safe by default");
+
+        let (status, rendered, exit_code) = run_diagnostics(&request, MSSQL_SQLCMD_REPORT_JSON);
+        assert_eq!(status, MSSQL_SQLCMD_OK);
+        assert_eq!(exit_code, 1);
+        assert!(rendered.contains("\"command\": \"diagnose\""), "{rendered}");
+        assert!(
+            rendered.contains("\"diagnosticOutcome\": \"issueDetected\""),
+            "{rendered}"
+        );
+        assert!(rendered.contains("\"exitCode\": 1"), "{rendered}");
+        assert!(!rendered.contains("not-shown"));
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn diagnose_honours_depth_local_detail_and_an_invalid_request() {
+        let (server, user, password) = (utf16("tcp:127.0.0.1,1"), utf16("sa"), utf16("x"));
+        let mut request = diagnostics_request(&server, &user, &password);
+        request.depth = MSSQL_SQLCMD_DEPTH_CONNECTION_INPUT;
+        request.local_detail = 1;
+        let (status, rendered, exit_code) = run_diagnostics(&request, MSSQL_SQLCMD_REPORT_JSON);
+        assert_eq!(status, MSSQL_SQLCMD_OK);
+        assert_eq!(exit_code, 0, "parsing alone passes");
+        assert!(
+            rendered.contains("\"requestedDepth\": \"connectionInput\""),
+            "{rendered}"
+        );
+        assert!(rendered.contains("\"shareSafe\": false"), "{rendered}");
+        assert!(rendered.contains("\"host\": \"127.0.0.1\""), "{rendered}");
+        assert!(!rendered.contains("tcpConnect"), "{rendered}");
+
+        let reason = utf16("-Q cannot be used");
+        let mut invalid = diagnostics_request(&[], &user, &password);
+        invalid.server = NULL_TEXT;
+        invalid.invalid_reason = text(&reason);
+        let (status, rendered, exit_code) = run_diagnostics(&invalid, MSSQL_SQLCMD_REPORT_JSON);
+        assert_eq!(status, MSSQL_SQLCMD_OK);
+        assert_eq!(exit_code, 6);
+        assert!(
+            rendered.contains("\"executionStatus\": \"invalidInvocation\""),
+            "{rendered}"
+        );
+    }
+    #[cfg(not(target_pointer_width = "64"))]
+    #[test]
+    fn diagnostics_are_unsupported_in_a_32_bit_build() {
+        let (server, user, password) = (utf16("tcp:127.0.0.1,1"), utf16("sa"), utf16("x"));
+        let request = diagnostics_request(&server, &user, &password);
+        let (status, rendered, exit_code) = run_diagnostics(&request, MSSQL_SQLCMD_REPORT_TEXT);
+        assert_eq!(status, MSSQL_SQLCMD_UNSUPPORTED);
+        assert_eq!(rendered, "");
+        assert_eq!(exit_code, 5);
+    }
+
+    #[test]
+    fn diagnostics_reject_bad_arguments_before_connecting() {
+        let (server, user, password) = (utf16("tcp:127.0.0.1,1"), utf16("sa"), utf16("x"));
+        let empty: [u16; 0] = [];
+        let mut cases = Vec::new();
+        let mut bad = diagnostics_request(&server, &user, &password);
+        bad.authentication = 7;
+        cases.push((bad, MSSQL_SQLCMD_REPORT_TEXT, MSSQL_SQLCMD_INVALID_ARGUMENT));
+        let mut bad = diagnostics_request(&server, &user, &password);
+        bad.encrypt = -1;
+        cases.push((bad, MSSQL_SQLCMD_REPORT_TEXT, MSSQL_SQLCMD_INVALID_ARGUMENT));
+        let good = diagnostics_request(&server, &user, &password);
+        cases.push((good, 9, MSSQL_SQLCMD_INVALID_ARGUMENT));
+        let mut bad = diagnostics_request(&server, &user, &password);
+        bad.depth = 5;
+        cases.push((bad, MSSQL_SQLCMD_REPORT_TEXT, MSSQL_SQLCMD_INVALID_ARGUMENT));
+        let mut bad = diagnostics_request(&server, &user, &password);
+        bad.server = text(&empty);
+        cases.push((bad, MSSQL_SQLCMD_REPORT_TEXT, MSSQL_SQLCMD_NULL_ARGUMENT));
+        let mut bad = diagnostics_request(&server, &user, &password);
+        bad.server = NULL_TEXT;
+        cases.push((bad, MSSQL_SQLCMD_REPORT_TEXT, MSSQL_SQLCMD_NULL_ARGUMENT));
+        for (request, format, expected) in cases {
+            let (status, rendered, exit_code) = run_diagnostics(&request, format);
+            assert_eq!(status, expected);
+            assert_eq!(rendered, "");
+            assert_eq!(exit_code, 5);
+        }
+
+        let version = utf16("v");
+        let request = diagnostics_request(&server, &user, &password);
+        let (mut out, mut out_len, mut exit_code) = (std::ptr::null(), 0, 0);
+        // SAFETY: null pointers are what is being tested; the rest are valid.
+        unsafe {
+            assert_eq!(
+                mssql_sqlcmd_diagnostics_run(
+                    std::ptr::null(),
+                    text(&version),
+                    0,
+                    &mut out,
+                    &mut out_len,
+                    &mut exit_code
+                ),
+                MSSQL_SQLCMD_NULL_ARGUMENT
+            );
+            assert_eq!(exit_code, 5);
+            // One null output: the others are still cleared.
+            (out_len, exit_code) = (42, 0);
+            assert_eq!(
+                mssql_sqlcmd_diagnostics_run(
+                    &request,
+                    text(&version),
+                    0,
+                    std::ptr::null_mut(),
+                    &mut out_len,
+                    &mut exit_code
+                ),
+                MSSQL_SQLCMD_NULL_ARGUMENT
+            );
+            assert_eq!((out_len, exit_code), (0, 5));
+            let stale = std::ptr::NonNull::<u16>::dangling().as_ptr().cast_const();
+            (out, exit_code) = (stale, 0);
+            assert_eq!(
+                mssql_sqlcmd_diagnostics_run(
+                    &request,
+                    text(&version),
+                    0,
+                    &mut out,
+                    std::ptr::null_mut(),
+                    &mut exit_code
+                ),
+                MSSQL_SQLCMD_NULL_ARGUMENT
+            );
+            assert!(out.is_null());
+            assert_eq!(exit_code, 5);
+            (out, out_len) = (stale, 42);
+            assert_eq!(
+                mssql_sqlcmd_diagnostics_run(
+                    &request,
+                    text(&version),
+                    0,
+                    &mut out,
+                    &mut out_len,
+                    std::ptr::null_mut()
+                ),
+                MSSQL_SQLCMD_NULL_ARGUMENT
+            );
+            assert!(out.is_null());
+            assert_eq!(out_len, 0);
+            assert_eq!(
+                mssql_sqlcmd_diagnostics_run(
+                    &request,
+                    NULL_TEXT,
+                    0,
+                    &mut out,
+                    &mut out_len,
+                    &mut exit_code
+                ),
+                MSSQL_SQLCMD_NULL_ARGUMENT
+            );
+        }
+    }
+
+    /// The header declares exactly the functions this module exports, and its
+    /// constants have the values of the Rust ones.
+    #[test]
+    fn the_header_matches_the_exports() {
+        let header = include_str!("../include/mssql_sqlcmd.h");
+        let source = include_str!("ffi.rs");
+        let mut declared: Vec<&str> = header
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .filter(|word| word.starts_with("mssql_sqlcmd_"))
+            .collect();
+        declared.sort_unstable();
+        declared.dedup();
+        let mut exported: Vec<&str> = source
+            .lines()
+            .filter_map(|line| line.trim().split_once("extern \"C\" fn "))
+            .map(|(_, rest)| rest.split('(').next().unwrap_or_default())
+            .collect();
+        exported.sort_unstable();
+        assert_eq!(declared, exported);
+
+        let constants = [
+            ("MSSQL_SQLCMD_OK", MSSQL_SQLCMD_OK),
+            ("MSSQL_SQLCMD_NULL_ARGUMENT", MSSQL_SQLCMD_NULL_ARGUMENT),
+            ("MSSQL_SQLCMD_INVALID_STATE", MSSQL_SQLCMD_INVALID_STATE),
+            ("MSSQL_SQLCMD_INTERNAL_ERROR", MSSQL_SQLCMD_INTERNAL_ERROR),
+            (
+                "MSSQL_SQLCMD_INVALID_ARGUMENT",
+                MSSQL_SQLCMD_INVALID_ARGUMENT,
+            ),
+            ("MSSQL_SQLCMD_UNSUPPORTED", MSSQL_SQLCMD_UNSUPPORTED),
+            ("MSSQL_SQLCMD_RUN_FINISHED", MSSQL_SQLCMD_RUN_FINISHED),
+            ("MSSQL_SQLCMD_RUN_CANCELED", MSSQL_SQLCMD_RUN_CANCELED),
+            (
+                "MSSQL_SQLCMD_RUN_INVALID_INVOCATION",
+                MSSQL_SQLCMD_RUN_INVALID_INVOCATION,
+            ),
+            (
+                "MSSQL_SQLCMD_AUTH_SQL_PASSWORD",
+                MSSQL_SQLCMD_AUTH_SQL_PASSWORD,
+            ),
+            ("MSSQL_SQLCMD_AUTH_INTEGRATED", MSSQL_SQLCMD_AUTH_INTEGRATED),
+            (
+                "MSSQL_SQLCMD_ENCRYPT_OPTIONAL",
+                MSSQL_SQLCMD_ENCRYPT_OPTIONAL,
+            ),
+            (
+                "MSSQL_SQLCMD_ENCRYPT_MANDATORY",
+                MSSQL_SQLCMD_ENCRYPT_MANDATORY,
+            ),
+            ("MSSQL_SQLCMD_ENCRYPT_STRICT", MSSQL_SQLCMD_ENCRYPT_STRICT),
+            ("MSSQL_SQLCMD_REPORT_TEXT", MSSQL_SQLCMD_REPORT_TEXT),
+            ("MSSQL_SQLCMD_REPORT_JSON", MSSQL_SQLCMD_REPORT_JSON),
+            ("MSSQL_SQLCMD_DEPTH_DEFAULT", MSSQL_SQLCMD_DEPTH_DEFAULT),
+            (
+                "MSSQL_SQLCMD_DEPTH_CONNECTION_INPUT",
+                MSSQL_SQLCMD_DEPTH_CONNECTION_INPUT,
+            ),
+            (
+                "MSSQL_SQLCMD_DEPTH_ENDPOINT_RESOLUTION",
+                MSSQL_SQLCMD_DEPTH_ENDPOINT_RESOLUTION,
+            ),
+            (
+                "MSSQL_SQLCMD_DEPTH_NETWORK_REACHABILITY",
+                MSSQL_SQLCMD_DEPTH_NETWORK_REACHABILITY,
+            ),
+            (
+                "MSSQL_SQLCMD_DEPTH_CONNECTION_ATTEMPT",
+                MSSQL_SQLCMD_DEPTH_CONNECTION_ATTEMPT,
+            ),
+            (
+                "MSSQL_SQLCMD_DEPTH_SESSION_VALIDATION",
+                MSSQL_SQLCMD_DEPTH_SESSION_VALIDATION,
+            ),
+        ];
+        let defines: Vec<(&str, i32)> = header
+            .lines()
+            .filter_map(|line| line.strip_prefix("#define MSSQL_SQLCMD_"))
+            .filter_map(|rest| {
+                let mut words = rest.split_whitespace();
+                let name = words.next()?;
+                let value = words.next()?.parse().ok()?;
+                Some((name, value))
+            })
+            .collect();
+        assert_eq!(defines.len(), constants.len(), "{defines:?}");
+        for (name, value) in constants {
+            let short = name.trim_start_matches("MSSQL_SQLCMD_");
+            assert!(
+                defines.contains(&(short, value)),
+                "{name} = {value} in the header"
+            );
+        }
+    }
+    #[test]
+    fn cancel_is_safe_to_call_with_no_diagnosis_running() {
+        // Hold the run lock, so this cannot cancel another test's diagnosis.
+        #[cfg(target_pointer_width = "64")]
+        let _only = crate::diagnostics::RUNNING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let expected = if cfg!(target_pointer_width = "64") {
+            MSSQL_SQLCMD_OK
+        } else {
+            MSSQL_SQLCMD_UNSUPPORTED
+        };
+        assert_eq!(mssql_sqlcmd_diagnostics_cancel(), expected);
     }
 }

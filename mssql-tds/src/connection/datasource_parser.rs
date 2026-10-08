@@ -173,11 +173,11 @@ impl ParsedDataSource {
     /// # Protocol Detection Logic
     ///
     /// 1. Searches for the first colon (`:`) delimiter in the normalized string
-    /// 2. Checks if the string is an IPv6 address by detecting:
-    ///    - Double colon (`::`) patterns
-    ///    - Multiple colons (more than one)
-    /// 3. If not IPv6, validates the prefix against known protocols
-    /// 4. Stores the protocol in `result.protocol_name` if valid
+    /// 2. Validates the text before it against the known protocols. None of
+    ///    them is hexadecimal, so none can be an IPv6 group: an IPv6 address
+    ///    is never taken for a prefix, and a prefixed one (`tcp:::1`) keeps
+    ///    its prefix
+    /// 3. Stores the protocol in `result.protocol_name` if valid
     ///
     /// # Supported Protocols
     ///
@@ -213,8 +213,13 @@ impl ParsedDataSource {
     ///
     /// // IPv6 with port
     /// // Input: "2001:db8::1,1433"
-    /// // Extracts: nothing (multiple colons = IPv6)
+    /// // Extracts: nothing (2001 is not a protocol)
     /// // Returns: ("2001:db8::1,1433", "2001:db8::1,1433")
+    ///
+    /// // Prefixed IPv6
+    /// // Input: "tcp:::1"
+    /// // Extracts: protocol_name = "tcp"
+    /// // Returns: ("::1", "::1")
     ///
     /// // No protocol specified
     /// // Input: "myserver\instance"
@@ -233,22 +238,16 @@ impl ParsedDataSource {
     ) -> TdsResult<(&'a str, &'a str)> {
         // Look for colon delimiter in normalized string
         if let Some(colon_pos) = normalized.find(':') {
-            // Check if this is IPv6 address (multiple colons)
-            let before_colon = &normalized[..colon_pos];
-
-            // IPv6 addresses contain :: or multiple colons
-            let is_ipv6 = normalized.contains("::") || normalized.matches(':').count() > 1;
-
-            if !is_ipv6 && !before_colon.is_empty() {
-                // Valid protocol prefix
-                let protocol = before_colon.trim();
-                if matches!(protocol, "tcp" | "np" | "lpc" | "admin") {
-                    result.protocol_name = protocol.to_string();
-                    return Ok((
-                        normalized[colon_pos + 1..].trim_start(),
-                        original[colon_pos + 1..].trim_start(),
-                    ));
-                }
+            // Only a known protocol is a prefix. None is hexadecimal, so an
+            // IPv6 address's first group (`fe80`, or empty in `::1`) never
+            // matches, and `tcp:::1` is TCP to `::1`.
+            let protocol = normalized[..colon_pos].trim();
+            if matches!(protocol, "tcp" | "np" | "lpc" | "admin") {
+                result.protocol_name = protocol.to_string();
+                return Ok((
+                    normalized[colon_pos + 1..].trim_start(),
+                    original[colon_pos + 1..].trim_start(),
+                ));
             }
         }
 
@@ -290,23 +289,29 @@ impl ParsedDataSource {
 
         // Parse instance from pipe path
         let pipe_path = &after_slashes[server_end..];
+        // Windows pipe names are case-insensitive (`\PIPE\`, `MSSQL$`); the
+        // names are taken from `pipe_path`, at the same (ASCII) offsets.
+        let lower = pipe_path.to_ascii_lowercase();
 
         // Standard default instance: \pipe\sql\query
-        if pipe_path == "\\pipe\\sql\\query" {
+        if lower == "\\pipe\\sql\\query" {
             result.instance_name = String::new(); // default instance
             result.standard_instance_name = true;
         }
         // Standard named instance: \pipe\MSSQL$instance\sql\query
-        else if pipe_path.starts_with("\\pipe\\mssql$") && pipe_path.ends_with("\\sql\\query") {
+        else if lower.starts_with("\\pipe\\mssql$")
+            && lower.ends_with("\\sql\\query")
+            && lower.len() > "\\pipe\\mssql$\\sql\\query".len()
+        {
             let start = "\\pipe\\mssql$".len();
             let end = pipe_path.len() - "\\sql\\query".len();
             result.instance_name = pipe_path[start..end].to_string();
             result.standard_instance_name = true;
         }
         // Non-standard pipe
-        else if let Some(custom_path) = pipe_path.strip_prefix("\\pipe\\") {
+        else if lower.starts_with("\\pipe\\") {
             // Use "pipe<rest_of_path>" format
-            result.instance_name = format!("pipe{}", custom_path);
+            result.instance_name = format!("pipe{}", &pipe_path["\\pipe\\".len()..]);
             result.standard_instance_name = false;
         } else {
             return Err(Error::ProtocolError(format!(
@@ -1047,6 +1052,48 @@ mod tests {
         let parsed = ParsedDataSource::parse("::1", false).unwrap();
         assert_eq!(parsed.protocol_name, "");
         assert_eq!(parsed.server_name, "::1");
+    }
+
+    /// Pipe names are case-insensitive on Windows, as the client opens them.
+    #[cfg(windows)]
+    #[test]
+    fn a_pipe_path_is_matched_whatever_its_case() {
+        let parsed = ParsedDataSource::parse("\\\\.\\PIPE\\SQL\\QUERY", false).unwrap();
+        assert_eq!(parsed.protocol_name, "np");
+        assert!(parsed.standard_instance_name);
+        assert_eq!(parsed.instance_name, "");
+        assert_eq!(parsed.protocol_parameter, "\\\\.\\PIPE\\SQL\\QUERY");
+
+        let parsed =
+            ParsedDataSource::parse("np:\\\\db01\\Pipe\\MSSQL$Sql2022\\SQL\\Query", false).unwrap();
+        assert!(parsed.standard_instance_name);
+        assert_eq!(parsed.instance_name, "Sql2022");
+
+        let parsed = ParsedDataSource::parse("\\\\db01\\PIPE\\Custom", false).unwrap();
+        assert!(!parsed.standard_instance_name);
+        assert_eq!(parsed.instance_name, "pipeCustom");
+
+        assert!(ParsedDataSource::parse("\\\\db01\\PIPEX\\sql\\query", false).is_err());
+    }
+
+    #[test]
+    fn a_prefixed_ipv6_address_keeps_its_prefix() {
+        let parsed = ParsedDataSource::parse("tcp:::1", false).unwrap();
+        assert_eq!(parsed.protocol_name, "tcp");
+        assert_eq!(parsed.server_name, "::1");
+
+        let parsed = ParsedDataSource::parse("tcp:fe80::1,1433", false).unwrap();
+        assert_eq!(parsed.protocol_name, "tcp");
+        assert_eq!(parsed.server_name, "fe80::1");
+        assert_eq!(parsed.protocol_parameter, "1433");
+
+        let parsed = ParsedDataSource::parse("fe80::1,1433", false).unwrap();
+        assert_eq!(parsed.protocol_name, "tcp");
+        assert_eq!(parsed.server_name, "fe80::1");
+
+        let parsed = ParsedDataSource::parse("admin:fe80::1", false).unwrap();
+        assert_eq!(parsed.protocol_name, "admin");
+        assert_eq!(parsed.server_name, "fe80::1");
     }
 
     #[test]
