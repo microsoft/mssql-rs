@@ -182,15 +182,26 @@ TEST_F(BinaryFetchLiveTest, NullVarbinaryReportsNull) {
 TEST_F(BinaryFetchLiveTest, EmptyImageReportsZeroLengthAndNullImageReportsNull) {
     FetchOne("SELECT CAST(0x AS IMAGE), CAST(NULL AS IMAGE), CAST(0x0102 AS IMAGE)");
 
-    unsigned char buf[8] = {};
+    unsigned char buf[8];
+    std::memset(buf, 0xEE, sizeof(buf));
     SQLLEN ind = -77;
     EXPECT_EQ(SQL_SUCCESS, SQLGetData(stmt_, 1, SQL_C_BINARY, buf, sizeof(buf), &ind));
     EXPECT_EQ(0, ind);
+    for (unsigned char byte : buf) {
+        EXPECT_EQ(0xEE, byte) << "an empty value must not disturb the buffer";
+    }
     EXPECT_EQ(SQL_NO_DATA, SQLGetData(stmt_, 1, SQL_C_BINARY, buf, sizeof(buf), &ind));
+    for (unsigned char byte : buf) {
+        EXPECT_EQ(0xEE, byte) << "SQL_NO_DATA must not disturb the buffer";
+    }
 
+    std::memset(buf, 0xEE, sizeof(buf));
     ind = -77;
     EXPECT_EQ(SQL_SUCCESS, SQLGetData(stmt_, 2, SQL_C_BINARY, buf, sizeof(buf), &ind));
     EXPECT_EQ(SQL_NULL_DATA, ind);
+    for (unsigned char byte : buf) {
+        EXPECT_EQ(0xEE, byte) << "a NULL value must not disturb the buffer";
+    }
 
     ind = -77;
     EXPECT_EQ(SQL_SUCCESS, SQLGetData(stmt_, 3, SQL_C_BINARY, buf, sizeof(buf), &ind));
@@ -452,9 +463,11 @@ TEST_F(BinaryFetchLiveTest, BoundEmptyImageReportsZeroLengthAndNullImageReportsN
         ExecDirect("SELECT CAST(0x AS IMAGE), CAST(NULL AS IMAGE), CAST(0x0102 AS IMAGE)"),
         SQL_HANDLE_STMT, stmt_);
 
-    unsigned char emptyBuf[8] = {};
-    unsigned char nullBuf[8] = {};
+    unsigned char emptyBuf[8];
+    unsigned char nullBuf[8];
     unsigned char valueBuf[8] = {};
+    std::memset(emptyBuf, 0xEE, sizeof(emptyBuf));
+    std::memset(nullBuf, 0xDD, sizeof(nullBuf));
     SQLLEN emptyInd = -77;
     SQLLEN nullInd = -77;
     SQLLEN valueInd = -77;
@@ -466,7 +479,13 @@ TEST_F(BinaryFetchLiveTest, BoundEmptyImageReportsZeroLengthAndNullImageReportsN
                   SQL_HANDLE_STMT, stmt_);
     EXPECT_EQ(SQL_SUCCESS, SQLFetch(stmt_));
     EXPECT_EQ(0, emptyInd);
+    for (unsigned char byte : emptyBuf) {
+        EXPECT_EQ(0xEE, byte) << "an empty value must not disturb the buffer";
+    }
     EXPECT_EQ(SQL_NULL_DATA, nullInd);
+    for (unsigned char byte : nullBuf) {
+        EXPECT_EQ(0xDD, byte) << "a NULL value must not disturb the buffer";
+    }
     EXPECT_EQ(2, valueInd);
     EXPECT_EQ(0, std::memcmp(valueBuf, "\x01\x02", 2));
     SQLFreeStmt(stmt_, SQL_UNBIND);
