@@ -219,7 +219,7 @@ Manager (`odbc32`) and unixODBC. The tests live under
 driver legs; they record `SQL_DRIVER_VER`. Coverage includes execute, fetch,
 MoreResults, immediate cancel-then-close, final SQLParamData, and a blocked
 SQLPutData packet followed by connection reuse. MoreResults has the explicitly
-approved return-code difference in [registry entry 26](../../docs/parity-deviations.md).
+approved return-code difference in [registry entry 27](../../docs/parity-deviations.md).
 
 The write test uses a loopback TCP proxy which forwards TLS unchanged and
 temporarily stops reading client bytes. It asserts that the write and cancel

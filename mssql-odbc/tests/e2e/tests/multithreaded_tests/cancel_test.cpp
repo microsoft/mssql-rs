@@ -60,7 +60,7 @@ protected:
         const auto rc = operation.get();
         ASSERT_EQ(std::future_status::ready, settled);
         EXPECT_LT(std::chrono::steady_clock::now() - started, 5s);
-        // Registry entry 26: native MoreResults reports exhaustion here.
+        // Registry entry 27: native MoreResults reports exhaustion here.
         const auto* target = std::getenv("ODBC_TEST_TARGET");
         const bool nativeMoreResults =
             moreResults && target && std::string(target) == "msodbcsql";

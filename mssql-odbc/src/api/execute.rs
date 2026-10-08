@@ -3036,7 +3036,7 @@ mod tests {
         );
 
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
-        let ExecutionStaging::Batch(batch) =
+        let (ExecutionStaging::Batch(batch), _) =
             stage_execution(stmt).expect("array staging should succeed")
         else {
             panic!("expected array staging");
