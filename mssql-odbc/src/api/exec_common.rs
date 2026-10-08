@@ -21,9 +21,9 @@ use mssql_tds::message::parameters::rpc_parameters::{RpcParameter, StreamedSqlTy
 use super::ird::populate_ird;
 use super::sqlstate::*;
 use crate::api::odbc_types::{
-    SQL_ATTR_PARAMS_PROCESSED_PTR, SQL_DATA_AT_EXEC, SQL_ERROR, SQL_LEN_DATA_AT_EXEC_OFFSET,
-    SQL_NEED_DATA, SQL_NO_DATA, SQL_SS_XML, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle, SqlLen,
-    SqlReturn, SqlULen,
+    SQL_DATA_AT_EXEC, SQL_ERROR, SQL_LEN_DATA_AT_EXEC_OFFSET, SQL_NEED_DATA, SQL_NO_DATA,
+    SQL_SS_XML, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle, SqlLen, SqlReturn, SqlULen,
+    SqlUSmallInt,
 };
 use crate::api::type_rules::parameter_column_size_is_valid;
 use crate::conversion::error::ConvOk;
@@ -33,6 +33,7 @@ use crate::conversion::param_convert::{
 };
 use crate::error::{HasDiagnostics, post_sql_error};
 use crate::handles::dbc::ConnectionState;
+use crate::handles::desc::DescHeader;
 use crate::handles::stmt::{
     DaeParam, DaeState, PreparedPlan, STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT,
     STMT_STATE_EXEC_STARTED, StmtState,
@@ -290,11 +291,8 @@ pub(super) fn claim_connection(
 ///
 /// Without this, `executemany(sql, [one_row])` - which sets `PARAMSET_SIZE = 1`
 /// and a processed pointer - reads back whatever was in its own buffer.
-pub(super) fn publish_scalar_processed(stmt_state: &crate::handles::stmt::StmtState) {
-    let ptr = stmt_state
-        .inert_attrs
-        .get(SQL_ATTR_PARAMS_PROCESSED_PTR)
-        .unwrap_or(0) as *mut SqlULen;
+pub(super) fn publish_scalar_processed(header: &ParamArrayHeader) {
+    let ptr = header.processed_ptr;
     if !ptr.is_null() {
         unsafe { ptr.write_unaligned(1) };
     }
@@ -730,17 +728,7 @@ fn dae_expected_length(indicator: SqlLen) -> Option<usize> {
 /// than silently snapshotting "every parameter unbound" — which used to let
 /// a zero-marker statement execute successfully despite the internal
 /// failure, and reported a misleading `07002` for one with markers.
-pub(super) fn snapshot_bound_params(
-    stmt: &StmtHandle,
-) -> Result<Vec<Option<ParamSnapshot>>, SqlReturn> {
-    snapshot_bound_params_and_array_size(stmt).map(|(params, _)| params)
-}
-
-/// Snapshots the effective APD's parameter records and array size under the
-/// same descriptor lock.
-pub(super) fn snapshot_bound_params_and_array_size(
-    stmt: &StmtHandle,
-) -> Result<(Vec<Option<ParamSnapshot>>, SqlULen), SqlReturn> {
+pub(super) fn snapshot_bound_params(stmt: &StmtHandle) -> Result<BoundParamSet, SqlReturn> {
     // Read before the STMT lock below, matching bind_param.rs's own
     // parent-before-child lock ordering for the same lookup.
     let odbc_version = {
@@ -779,11 +767,70 @@ pub(super) fn snapshot_bound_params_and_array_size(
         error!("snapshotting parameters: ipd mutex poisoned");
         return Err(SQL_ERROR);
     };
-    let array_size = apd_state.header.array_size;
-    Ok((
-        BoundParam::all_from_descriptor_states(&apd_state, &ipd_state, odbc_version),
-        array_size,
-    ))
+    Ok(BoundParamSet {
+        params: BoundParam::all_from_descriptor_states(&apd_state, &ipd_state, odbc_version),
+        header: ParamArrayHeader::from_headers(&apd_state.header, &ipd_state.header),
+    })
+}
+
+/// The effective APD's records and the APD/IPD header fields, read under the
+/// same two descriptor locks.
+#[derive(Debug)]
+pub(crate) struct BoundParamSet {
+    pub(crate) params: Vec<Option<ParamSnapshot>>,
+    pub(crate) header: ParamArrayHeader,
+}
+
+/// A snapshot of the APD/IPD header fields behind the parameter-array
+/// attributes, for one execution or output write-back. Never written back.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ParamArrayHeader {
+    /// APD `SQL_DESC_ARRAY_SIZE` — `SQL_ATTR_PARAMSET_SIZE`.
+    pub(crate) array_size: SqlULen,
+    /// APD `SQL_DESC_BIND_TYPE` — `SQL_ATTR_PARAM_BIND_TYPE`.
+    pub(crate) bind_type: SqlULen,
+    /// APD `SQL_DESC_BIND_OFFSET_PTR` — `SQL_ATTR_PARAM_BIND_OFFSET_PTR`.
+    pub(crate) bind_offset_ptr: *const SqlLen,
+    /// APD `SQL_DESC_ARRAY_STATUS_PTR` — `SQL_ATTR_PARAM_OPERATION_PTR`.
+    pub(crate) operation_ptr: *const SqlUSmallInt,
+    /// IPD `SQL_DESC_ARRAY_STATUS_PTR` — `SQL_ATTR_PARAM_STATUS_PTR`.
+    pub(crate) status_ptr: *mut SqlUSmallInt,
+    /// IPD `SQL_DESC_ROWS_PROCESSED_PTR` — `SQL_ATTR_PARAMS_PROCESSED_PTR`.
+    pub(crate) processed_ptr: *mut SqlULen,
+}
+
+impl Default for ParamArrayHeader {
+    fn default() -> Self {
+        Self::from_headers(&DescHeader::default(), &DescHeader::default())
+    }
+}
+
+impl ParamArrayHeader {
+    fn from_headers(apd: &DescHeader, ipd: &DescHeader) -> Self {
+        Self {
+            array_size: apd.array_size,
+            bind_type: apd.bind_type,
+            bind_offset_ptr: apd.bind_offset_ptr.cast_const().cast(),
+            operation_ptr: apd.array_status_ptr.cast_const().cast(),
+            status_ptr: ipd.array_status_ptr.cast(),
+            processed_ptr: ipd.rows_processed_ptr.cast(),
+        }
+    }
+
+    /// The `SQLLEN` the bind-offset pointer points at, or 0 when unset. Read
+    /// at execute time, so the application can move every binding between
+    /// executions.
+    ///
+    /// # Safety
+    /// When set, the pointer must address a live `SQLLEN` for the duration of
+    /// the execution, per the `SQLSetStmtAttr`/`SQLSetDescField` contract.
+    /// ODBC does not require application pointers to be aligned.
+    pub(crate) unsafe fn bind_offset(&self) -> isize {
+        if self.bind_offset_ptr.is_null() {
+            return 0;
+        }
+        unsafe { self.bind_offset_ptr.read_unaligned() }
+    }
 }
 
 /// Builds the parameter list for a TDS RPC, where parameters bind by
@@ -804,9 +851,9 @@ pub(super) unsafe fn build_positional_params(
     stmt_state: &mut StmtState,
     marker_count: usize,
     skip: usize,
+    bind_offset: isize,
     op: &str,
 ) -> Result<ParamsWithDae, SqlReturn> {
-    let bind_offset = unsafe { stmt_state.inert_attrs.param_bind_offset() };
     // Borrowed, not cloned: the builder only reads this tail, and cloning it
     // would reallocate every UDT identity on each stored-procedure call.
     let bound = stmt_state.bound_params.get(skip..).unwrap_or_default();
@@ -852,14 +899,13 @@ pub(super) unsafe fn build_positional_params(
 /// `SQL_ATTR_PARAM_BIND_OFFSET_PTR` is non-null, their readable extents begin at
 /// each bound base plus the pointed-to signed byte offset, which may be
 /// negative, so every allocation must cover that displaced range.
+/// `bind_offset` is that pointed-to value ([`ParamArrayHeader::bind_offset`]).
 pub(super) unsafe fn build_named_params(
     stmt_state: &mut StmtState,
     marker_count: usize,
+    bind_offset: isize,
     op: &str,
 ) -> Result<ParamsWithDae, SqlReturn> {
-    // Read once per execution: the attribute holds a pointer, and every
-    // binding shifts by the same amount.
-    let bind_offset = unsafe { stmt_state.inert_attrs.param_bind_offset() };
     match unsafe {
         build_named_params_for_row(
             &stmt_state.bound_params,
@@ -1234,7 +1280,8 @@ pub(super) fn finish_execute(
             unsafe {
                 crate::api::output_params::write_back_output_params(
                     &mut stmt_state,
-                    &bound_params,
+                    &bound_params.params,
+                    &bound_params.header,
                     &return_values,
                     return_status,
                 )
@@ -1355,8 +1402,8 @@ pub(super) fn finish_execute(
 mod tests {
     use super::*;
     use crate::api::odbc_types::{
-        SQL_ATTR_PARAM_BIND_OFFSET_PTR, SQL_C_CHAR, SQL_C_LONG, SQL_DEFAULT_PARAM, SQL_INTEGER,
-        SQL_NTS, SQL_PARAM_INPUT, SQL_VARCHAR, SqlLen, SqlULen, sql_len_data_at_exec,
+        SQL_C_CHAR, SQL_C_LONG, SQL_DEFAULT_PARAM, SQL_INTEGER, SQL_NTS, SQL_PARAM_INPUT,
+        SQL_VARCHAR, sql_len_data_at_exec,
     };
     use crate::handles::handle_from_raw;
     use crate::params::BoundParam;
@@ -2614,7 +2661,7 @@ mod tests {
         let h = TestHandles::with_env_dbc_stmt();
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let mut state = stmt.inner.lock().unwrap();
-        let built = unsafe { build_named_params(&mut state, 0, "test") }.unwrap();
+        let built = unsafe { build_named_params(&mut state, 0, 0, "test") }.unwrap();
         assert!(built.params.is_empty());
         assert!(built.dae_params.is_empty());
     }
@@ -2633,7 +2680,7 @@ mod tests {
             param.input_output_type = direction;
             param.column_size = 8;
             state.bound_params = vec![snap(param)];
-            let built = unsafe { build_named_params(&mut state, 1, "test") }.unwrap();
+            let built = unsafe { build_named_params(&mut state, 1, 0, "test") }.unwrap();
             assert!(built.dae_params.is_empty());
             assert_eq!(built.params.len(), 1);
             assert!(
@@ -2666,7 +2713,7 @@ mod tests {
                 param.input_output_type = direction;
                 param.sql_type = sql_type;
                 state.bound_params = vec![snap(param)];
-                let built = unsafe { build_named_params(&mut state, 1, "test") }.unwrap();
+                let built = unsafe { build_named_params(&mut state, 1, 0, "test") }.unwrap();
                 assert_eq!(built.dae_params.len(), 1);
                 assert_eq!(built.dae_params[0].plan, plan);
                 assert_eq!(
@@ -2711,7 +2758,7 @@ mod tests {
             .bound_params
             .push(snap(char_param(&mut buf2, &mut ind2)));
 
-        let built = unsafe { build_named_params(&mut state, 2, "test") }.unwrap();
+        let built = unsafe { build_named_params(&mut state, 2, 0, "test") }.unwrap();
         assert_eq!(built.params.len(), 2);
         assert!(built.dae_params.is_empty());
     }
@@ -2722,7 +2769,7 @@ mod tests {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         // One marker expected, but nothing bound.
         let mut state = stmt.inner.lock().unwrap();
-        let ret = unsafe { build_named_params(&mut state, 1, "test") };
+        let ret = unsafe { build_named_params(&mut state, 1, 0, "test") };
         assert!(ret.is_err());
         assert_eq!(state.diag_records[0].sql_state, SQLSTATE_07002);
     }
@@ -2743,7 +2790,7 @@ mod tests {
             .bound_params
             .push(snap(char_param(&mut buf, &mut ind)));
 
-        let ret = unsafe { build_named_params(&mut state, 1, "test") };
+        let ret = unsafe { build_named_params(&mut state, 1, 0, "test") };
         assert!(ret.is_err());
         assert_eq!(state.diag_records[0].sql_state, SQLSTATE_07S01);
     }
@@ -2785,7 +2832,7 @@ mod tests {
             .bound_params
             .push(snap(char_param(&mut last, &mut last_ind)));
 
-        let dae = unsafe { build_named_params(&mut state, 3, "test") }.unwrap();
+        let dae = unsafe { build_named_params(&mut state, 3, 0, "test") }.unwrap();
         assert_eq!(dae.params.len(), 3);
         assert_eq!(dae.dae_params.len(), 1);
         assert_eq!(dae.dae_params[0].bound_index, 1);
@@ -2842,7 +2889,7 @@ mod tests {
             octet_length_ptr: &mut numeric_ind as *mut SqlLen,
         }));
 
-        let built = unsafe { build_named_params(&mut state, 2, "test") }.unwrap();
+        let built = unsafe { build_named_params(&mut state, 2, 0, "test") }.unwrap();
         assert_eq!(built.dae_params.len(), 1);
         assert!(!built.fractional_truncated);
     }
@@ -2995,7 +3042,7 @@ mod tests {
             octet_length_ptr: &mut ind as *mut SqlLen,
         }));
 
-        let dae = unsafe { build_named_params(&mut state, 1, "test") }.unwrap();
+        let dae = unsafe { build_named_params(&mut state, 1, 0, "test") }.unwrap();
         assert_eq!(dae.dae_params.len(), 1);
         assert_eq!(dae.dae_params[0].bound_index, 0);
         assert_eq!(dae.dae_params[0].expected_len, Some(7));
@@ -3041,7 +3088,7 @@ mod tests {
                 octet_length_ptr: &mut ind as *mut SqlLen,
             }));
 
-            let dae = unsafe { build_named_params(&mut state, 1, "test") }.unwrap();
+            let dae = unsafe { build_named_params(&mut state, 1, 0, "test") }.unwrap();
             let bounded = dae.dae_params[0].length_limit.is_some();
             assert_eq!(
                 bounded, expect_narrowed,
@@ -3081,7 +3128,7 @@ mod tests {
             octet_length_ptr: std::ptr::null_mut(),
         }));
 
-        let built = unsafe { build_named_params(&mut state, 1, "test") }.unwrap();
+        let built = unsafe { build_named_params(&mut state, 1, 0, "test") }.unwrap();
         assert_eq!(built.params.len(), 1);
         assert!(built.dae_params.is_empty());
     }
@@ -3112,7 +3159,7 @@ mod tests {
             octet_length_ptr: &mut ind as *mut SqlLen,
         }));
 
-        let ret = unsafe { build_named_params(&mut state, 1, "test") };
+        let ret = unsafe { build_named_params(&mut state, 1, 0, "test") };
         assert!(ret.is_err());
         assert_eq!(
             state.diag_records[0].sql_state,
@@ -3142,12 +3189,9 @@ mod tests {
         // only row 1 carries the data-at-execution marker.
         let mut values: [i32; 4] = [7; 4];
         let mut inds: [SqlLen; 2] = [4, SQL_DATA_AT_EXEC];
-        let mut offset: SqlLen = size_of::<SqlLen>() as SqlLen;
+        let offset: SqlLen = size_of::<SqlLen>() as SqlLen;
 
         let mut state = stmt.inner.lock().unwrap();
-        state
-            .inert_attrs
-            .set(SQL_ATTR_PARAM_BIND_OFFSET_PTR, &raw mut offset as SqlULen);
         state.bound_params.push(snap(BoundParam {
             input_output_type: SQL_PARAM_INPUT,
             c_type: SQL_C_LONG,
@@ -3165,7 +3209,7 @@ mod tests {
         // `SQL_C_LONG` is not streamable, so reaching the DAE branch is
         // reported as `HYC00`. That rejection is the observable proof the
         // offset indicator was the one consulted.
-        let ret = unsafe { build_named_params(&mut state, 1, "test") };
+        let ret = unsafe { build_named_params(&mut state, 1, offset, "test") };
         assert!(ret.is_err(), "the offset indicator marks this param as DAE");
         assert_eq!(
             state.diag_records[0].sql_state,
@@ -3192,12 +3236,9 @@ mod tests {
             "test pointer must be misaligned"
         );
         unsafe { shifted_indicator.write_unaligned(SQL_DATA_AT_EXEC) };
-        let mut offset: SqlLen = 1;
+        let offset: SqlLen = 1;
 
         let mut state = stmt.inner.lock().unwrap();
-        state
-            .inert_attrs
-            .set(SQL_ATTR_PARAM_BIND_OFFSET_PTR, &raw mut offset as SqlULen);
         state.bound_params.push(snap(BoundParam {
             input_output_type: SQL_PARAM_INPUT,
             c_type: SQL_C_CHAR,
@@ -3212,7 +3253,7 @@ mod tests {
             octet_length_ptr: indicator_storage.as_mut_ptr(),
         }));
 
-        let built = unsafe { build_named_params(&mut state, 1, "test") }
+        let built = unsafe { build_named_params(&mut state, 1, offset, "test") }
             .expect("the shifted DAE marker is streamable");
         assert_eq!(built.dae_params.len(), 1);
         assert_eq!(built.dae_params.first().unwrap().value_ptr, unsafe {
@@ -3237,12 +3278,9 @@ mod tests {
             val: 12345u128.to_le_bytes(),
         };
         let mut values = [embedded; 2];
-        let mut offset = std::mem::size_of::<SqlNumericStruct>() as SqlLen;
+        let offset = std::mem::size_of::<SqlNumericStruct>() as SqlLen;
 
         let mut state = stmt.inner.lock().unwrap();
-        state
-            .inert_attrs
-            .set(SQL_ATTR_PARAM_BIND_OFFSET_PTR, &raw mut offset as SqlULen);
         state.bound_params.push(snap(BoundParam {
             input_output_type: SQL_PARAM_INPUT,
             c_type: SQL_C_NUMERIC,
@@ -3257,7 +3295,7 @@ mod tests {
             octet_length_ptr: std::ptr::null_mut(),
         }));
 
-        unsafe { build_named_params(&mut state, 1, "test") }.unwrap();
+        unsafe { build_named_params(&mut state, 1, offset, "test") }.unwrap();
         drop(state);
         assert_eq!((values[0].precision, values[0].scale), (5, 3));
         assert_eq!((values[1].precision, values[1].scale), (38, 0));
@@ -3290,12 +3328,43 @@ mod tests {
             octet_length_ptr: inds.as_mut_ptr(),
         }));
 
-        let built = unsafe { build_named_params(&mut state, 1, "test") }
+        let built = unsafe { build_named_params(&mut state, 1, 0, "test") }
             .expect("row 0 is an ordinary length, not a DAE marker");
         assert!(
             built.dae_params.is_empty(),
             "nothing should be staged for streaming"
         );
+    }
+
+    /// The offset is read through the pointer each time, not captured.
+    #[test]
+    fn param_bind_offset_is_read_through_the_stored_pointer() {
+        let mut header = ParamArrayHeader::default();
+        assert_eq!(unsafe { header.bind_offset() }, 0, "unset is no offset");
+
+        let mut offset: SqlLen = 24;
+        let slot = &raw mut offset;
+        header.bind_offset_ptr = slot;
+        assert_eq!(unsafe { header.bind_offset() }, 24);
+
+        unsafe { slot.write(-8) };
+        assert_eq!(unsafe { header.bind_offset() }, -8);
+    }
+
+    #[test]
+    fn param_bind_offset_accepts_a_misaligned_application_pointer() {
+        let mut header = ParamArrayHeader::default();
+        let mut storage: [SqlLen; 2] = [0; 2];
+        let slot = unsafe { storage.as_mut_ptr().cast::<u8>().add(1).cast::<SqlLen>() };
+        assert_ne!(
+            slot as usize % std::mem::align_of::<SqlLen>(),
+            0,
+            "test pointer must be misaligned"
+        );
+        unsafe { slot.write_unaligned(24) };
+        header.bind_offset_ptr = slot;
+
+        assert_eq!(unsafe { header.bind_offset() }, 24);
     }
 
     /// State consistency for the AB#47510 guard on the data-at-execution

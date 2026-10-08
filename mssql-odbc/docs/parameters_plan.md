@@ -958,20 +958,6 @@ only as DONE tokens arrive - and it has no `SQL_PARAM_UNUSED` pre-fill, so its
 unreported status entries keep whatever the application left in the buffer. Read
 from source; not measured, because neither driver can be driven into the state.
 
-AB#48943 resolved former divergence 7 by making the APD/ARD
-`SQL_DESC_ARRAY_SIZE` header canonical. The corresponding statement attributes
-now read and write that header, and execution/fetch consume it directly. Note
-that this moved *storage* only, not validation: msodbcsql's
-`IsSetStmtOptionValid` is keyed on the attribute rather than on the field, so
-`SQL_ATTR_PARAMSET_SIZE` is still stored verbatim while the row-side spellings
-clamp to `INT32_MAX` with `01S02`, and this driver reproduces that asymmetry.
-The remaining header aliases (`SQL_DESC_BIND_TYPE`, `SQL_DESC_BIND_OFFSET_PTR`,
-`SQL_DESC_ARRAY_STATUS_PTR`, `SQL_DESC_ROWS_PROCESSED_PTR`) still keep
-statement-side copies — eleven attribute spellings in total, counting
-`SQL_ROWSET_SIZE`, which is a different field rather than an alias but is
-descriptor-resident in msodbcsql all the same. `handles/desc.rs` carries the
-full table; tracked in AB#49060.
-
 Only 1 is partly a decision: `stage_execution` already walks every
 `(row, parameter)` pair once for the input-only and data-at-execution
 refusals, so the pass itself is not what streaming avoids. Matching
@@ -983,8 +969,8 @@ code, correct there because nothing ran, and reporting it over committed
 rows would invite a retry that double-inserts. The rest are gaps.
 
 Divergences 1, 2 and 4 are pinned by `param_array_test.cpp` cases gated with
-`SKIP_IF_COMPARING_MSODBCSQL()` (there is no divergence 3; the numbers are
-stable identifiers and are not reused); 5 by
+`SKIP_IF_COMPARING_MSODBCSQL()` (there is no divergence 3, and 7 was resolved by
+AB#48943/AB#49060; the numbers are stable identifiers and are not reused); 5 by
 the input-only array validation in `stage_execution`.
 
 Single-row output/input-output parameters and call return values are supported (AB#46384 / AB#48049). Direct RPC and `EXEC ... OUTPUT` text routes match returned parameters by name or ordinal. Delivery uses current bindings and bind offsets, survives fetch exhaustion and connection reuse, and respects rebind/`SQL_RESET_PARAMS`. Writeback reports string/fractional truncation (`01004`/`01S07`) and conversion/indicator errors (`22018`/`22002`).
