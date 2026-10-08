@@ -1775,6 +1775,121 @@ mod tests {
         assert_eq!(markers, 1);
     }
 
+    fn scan_markers(sql: &str) -> Vec<usize> {
+        let mut scan = CodeScan::new(sql);
+        let mut markers = Vec::new();
+        while let Some(step) = scan.next_step() {
+            if step.code && step.ch == '?' {
+                markers.push(step.start);
+            }
+        }
+        markers
+    }
+
+    #[test]
+    fn code_scan_ignores_markers_and_escape_text_in_protected_regions() {
+        for sql in [
+            "SELECT '?', ?",
+            "SELECT 'it''s ? and {fn ABS(''1'')}', ?",
+            r#"SELECT "?", ?"#,
+            r#"SELECT "col""?", ?"#,
+            "SELECT [?], ?",
+            "SELECT [col]]?], ?",
+            "SELECT -- ? {fn ABS(1)}\n ?",
+            "SELECT /* ? {fn ABS(1)} */ ?",
+        ] {
+            let markers = scan_markers(sql);
+            assert_eq!(
+                markers.len(),
+                1,
+                "expected only executable markers to be visible: {sql:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn code_scan_handles_escaped_delimiters_without_leaking_into_code() {
+        assert_eq!(scan_markers("SELECT 'a''?''b', ?"), vec![18]);
+        assert_eq!(scan_markers(r#"SELECT "a""?""b", ?"#), vec![18]);
+        assert_eq!(scan_markers("SELECT [a]]?] , ?"), vec![16]);
+    }
+
+    #[test]
+    fn code_scan_preserves_marker_order_across_lexical_boundaries() {
+        let sql = "SELECT ? AS a, ' ? ', ?, -- ?\n[b?], /* ? */ ?, \"?\", ?";
+        assert_eq!(scan_markers(sql), vec![7, 22, 44, 52]);
+    }
+
+    #[test]
+    fn code_scan_preserves_text_and_byte_spans_for_unicode_input() {
+        let sql = "SELECT N'東京 ?', [名前?], /* 注? */ ?";
+        let mut scan = CodeScan::new(sql);
+        let mut steps = Vec::new();
+        while let Some(step) = scan.next_step() {
+            steps.push((step.start, step.end, step.ch, step.code));
+        }
+
+        let mut rebuilt = String::new();
+        for &(start, end, _, _) in &steps {
+            rebuilt.push_str(&sql[start..end]);
+        }
+
+        assert_eq!(rebuilt, sql);
+        assert_eq!(steps.last().unwrap().2, '?');
+        assert!(steps.last().unwrap().3);
+        assert_eq!(
+            steps
+                .iter()
+                .filter(|(_, _, ch, code)| *ch == '?' && *code)
+                .map(|(start, _, _, _)| *start)
+                .collect::<Vec<_>>(),
+            vec![42]
+        );
+    }
+
+    #[test]
+    fn code_scan_uses_odbc_non_nested_block_comments() {
+        let sql = "/* outer /* inner */ ? still outer */ ?";
+        assert_eq!(scan_markers(sql), vec![21, 38]);
+
+        let sql = "/* ? */ ? /* ? */ ?";
+        assert_eq!(scan_markers(sql), vec![8, 18]);
+    }
+
+    #[test]
+    fn code_scan_treats_canonical_odbc_extension_as_code() {
+        // This is intentionally different from the Python scanner. CodeScan
+        // recognizes the canonical ODBC comment extension, so both markers are
+        // executable. The Python scanner treats the line as an ordinary SQL
+        // line comment and only rewrites the marker after the newline. (#561)
+        let sql = "--(* Vendor(Microsoft), Product(ODBC) x *)-- ?\n?";
+        assert_eq!(scan_markers(sql), vec![45, 47]);
+        assert!(scan_markers("-- ordinary comment ?").is_empty());
+        assert!(scan_markers("-- comment *)-- ?").is_empty());
+    }
+
+    #[test]
+    fn code_scan_keeps_unterminated_protected_regions_protected() {
+        for sql in [
+            "SELECT 'unterminated ?",
+            r#"SELECT "unterminated ?"#,
+            "SELECT [unterminated ?",
+            "SELECT /* unterminated ?",
+            "SELECT -- unterminated ?",
+        ] {
+            assert!(
+                scan_markers(sql).is_empty(),
+                "unterminated protected region leaked a marker: {sql:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn code_scan_treats_odbc_escape_contents_as_code() {
+        let sql = "SELECT {fn ABS(?)}, '{d ''2020-01-02''}', [q?mark], -- ?\n?";
+        assert_eq!(scan_markers(sql), vec![15, 57]);
+    }
+
     // -- phase 1 + phase 2 together ---------------------------------------
 
     #[test]
