@@ -116,7 +116,8 @@ pub enum StreamedSqlType {
     VarcharMax,
     /// MAX binary data.
     VarBinaryMax,
-    /// XML data. Chunks must contain UTF-16LE bytes.
+    /// XML data. Chunks must contain UTF-16LE bytes; the streaming client adds
+    /// a BOM when absent and preserves exactly one when present.
     Xml,
     /// CLR user-defined type data. Chunks are the opaque CLR-serialized payload.
     Udt(UdtTypeName),
@@ -263,6 +264,13 @@ impl RpcParameter {
     /// data-at-execution (streamed) path.
     pub(crate) fn is_data_at_exec(&self) -> bool {
         matches!(self.value, RpcValue::Streamed(_))
+    }
+
+    pub(crate) fn streamed_sql_type(&self) -> Option<&StreamedSqlType> {
+        match &self.value {
+            RpcValue::Streamed(sql_type) => Some(sql_type),
+            RpcValue::Materialized(_) => None,
+        }
     }
 
     /// Returns a usage error if any parameter in `params` is data-at-execution
