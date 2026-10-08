@@ -176,6 +176,29 @@ TEST_F(BinaryFetchLiveTest, NullVarbinaryReportsNull) {
     SQLCloseCursor(stmt_);
 }
 
+// AB#49220: a zero-length IMAGE is a present, empty value, not NULL. The legacy
+// LOB wire format marks NULL with a zero text-pointer length; a present pointer
+// with zero data bytes is empty. The non-empty trailing column pins alignment.
+TEST_F(BinaryFetchLiveTest, EmptyImageReportsZeroLengthAndNullImageReportsNull) {
+    FetchOne("SELECT CAST(0x AS IMAGE), CAST(NULL AS IMAGE), CAST(0x0102 AS IMAGE)");
+
+    unsigned char buf[8] = {};
+    SQLLEN ind = -77;
+    EXPECT_EQ(SQL_SUCCESS, SQLGetData(stmt_, 1, SQL_C_BINARY, buf, sizeof(buf), &ind));
+    EXPECT_EQ(0, ind);
+    EXPECT_EQ(SQL_NO_DATA, SQLGetData(stmt_, 1, SQL_C_BINARY, buf, sizeof(buf), &ind));
+
+    ind = -77;
+    EXPECT_EQ(SQL_SUCCESS, SQLGetData(stmt_, 2, SQL_C_BINARY, buf, sizeof(buf), &ind));
+    EXPECT_EQ(SQL_NULL_DATA, ind);
+
+    ind = -77;
+    EXPECT_EQ(SQL_SUCCESS, SQLGetData(stmt_, 3, SQL_C_BINARY, buf, sizeof(buf), &ind));
+    EXPECT_EQ(2, ind);
+    EXPECT_EQ(0, std::memcmp(buf, "\x01\x02", 2));
+    SQLCloseCursor(stmt_);
+}
+
 // ---------------------------------------------------------------------------
 // PLP: varbinary(max) and the UDT types, which arrive as a wire stream rather
 // than a materialized value.
@@ -420,6 +443,32 @@ TEST_F(BinaryFetchLiveTest, BoundBinaryNullsReportNullWithoutDisturbingBuffers) 
     EXPECT_EQ(SQL_NULL_DATA, plpInd);
     EXPECT_EQ(0xEE, fixedBuf[0]);
     EXPECT_EQ(0xDD, plpBuf[0]);
+    SQLFreeStmt(stmt_, SQL_UNBIND);
+    SQLCloseCursor(stmt_);
+}
+
+TEST_F(BinaryFetchLiveTest, BoundEmptyImageReportsZeroLengthAndNullImageReportsNull) {
+    ASSERT_SQL_OK(
+        ExecDirect("SELECT CAST(0x AS IMAGE), CAST(NULL AS IMAGE), CAST(0x0102 AS IMAGE)"),
+        SQL_HANDLE_STMT, stmt_);
+
+    unsigned char emptyBuf[8] = {};
+    unsigned char nullBuf[8] = {};
+    unsigned char valueBuf[8] = {};
+    SQLLEN emptyInd = -77;
+    SQLLEN nullInd = -77;
+    SQLLEN valueInd = -77;
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_BINARY, emptyBuf, sizeof(emptyBuf), &emptyInd),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 2, SQL_C_BINARY, nullBuf, sizeof(nullBuf), &nullInd),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 3, SQL_C_BINARY, valueBuf, sizeof(valueBuf), &valueInd),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(SQL_SUCCESS, SQLFetch(stmt_));
+    EXPECT_EQ(0, emptyInd);
+    EXPECT_EQ(SQL_NULL_DATA, nullInd);
+    EXPECT_EQ(2, valueInd);
+    EXPECT_EQ(0, std::memcmp(valueBuf, "\x01\x02", 2));
     SQLFreeStmt(stmt_, SQL_UNBIND);
     SQLCloseCursor(stmt_);
 }

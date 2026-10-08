@@ -3063,20 +3063,17 @@ impl SqlTypeDecode for GenericDecoder {
                 }
             }?,
             TdsDataType::Image => {
+                // Only a zero text-pointer length means NULL. A present pointer
+                // with a zero data length is an empty value , as in
+                // the TEXT/NTEXT branch.
                 let text_ptr_len = read_sync_first!(reader, try_read_byte, read_byte) as usize;
-
-                let length = if text_ptr_len > 0 {
+                if text_ptr_len == 0 {
+                    ColumnValues::Null
+                } else {
                     const TIMESTAMP_BYTE_COUNT: usize = 8;
                     reader.skip_bytes(text_ptr_len).await?;
                     reader.skip_bytes(TIMESTAMP_BYTE_COUNT).await?;
-                    read_sync_first!(reader, try_read_uint32, read_uint32) as usize
-                } else {
-                    0
-                };
-
-                if length == 0 {
-                    ColumnValues::Null
-                } else {
+                    let length = read_sync_first!(reader, try_read_uint32, read_uint32) as usize;
                     if length > MAX_ALLOC_SIZE {
                         return Err(crate::error::Error::ProtocolError(format!(
                             "Image length {length} exceeds maximum allowed size of {MAX_ALLOC_SIZE} bytes"
@@ -7684,6 +7681,44 @@ mod test {
             assert_eq!(
                 decode_generic(plp_known(&[], 1), &md, true).await,
                 vec![sunk(&[], None)]
+            );
+        }
+
+        fn image_wire(payload: &[u8]) -> Vec<u8> {
+            let mut wire = vec![16u8];
+            wire.extend_from_slice(&[0u8; 16]); // textptr
+            wire.extend_from_slice(&[0u8; 8]); // timestamp
+            wire.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            wire.extend_from_slice(payload);
+            wire
+        }
+
+        /// AB#49220: a present text pointer with a zero data length is an empty
+        /// value, not NULL.
+        #[tokio::test]
+        async fn image_with_text_pointer_and_zero_length_is_empty_not_null() {
+            let md = varlen_metadata(TdsDataType::Image, 0x7FFFFFFF);
+            assert_eq!(
+                decode_generic(image_wire(&[]), &md, true).await,
+                vec![Event::OwnedBytes(Vec::new())]
+            );
+        }
+
+        #[tokio::test]
+        async fn image_null_text_pointer_is_null() {
+            let md = varlen_metadata(TdsDataType::Image, 0x7FFFFFFF);
+            assert_eq!(
+                decode_generic(vec![0u8], &md, true).await,
+                vec![Event::Null]
+            );
+        }
+
+        #[tokio::test]
+        async fn image_with_payload_returns_its_bytes() {
+            let md = varlen_metadata(TdsDataType::Image, 0x7FFFFFFF);
+            assert_eq!(
+                decode_generic(image_wire(&[1, 2, 3]), &md, true).await,
+                vec![Event::OwnedBytes(vec![1, 2, 3])]
             );
         }
 
