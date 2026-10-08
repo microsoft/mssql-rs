@@ -1943,6 +1943,7 @@ unsafe fn deliver_bound_plp(
     } else {
         None
     };
+    let mut narrow_decoder_finalized = false;
     let compatible = matches!(
         (target, encoding),
         (SQL_C_WCHAR, PlpEncoding::Utf16Text)
@@ -2102,6 +2103,7 @@ unsafe fn deliver_bound_plp(
             decoded_units.clear();
             widen_into_pending(
                 decoder,
+                &mut narrow_decoder_finalized,
                 &mut decoded_units,
                 &scratch[..chunk.read],
                 chunk.reached_end,
