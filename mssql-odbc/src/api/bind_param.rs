@@ -14,9 +14,8 @@ use crate::api::odbc_types::{
     SqlUSmallInt,
 };
 use crate::api::type_rules::{
-    SQL_PREC_NCHAR, SQL_PREC_UNLIMITED, SqlTypeSupport, canonical_c_type,
-    classify_parameter_sql_type, is_valid_c_type, parameter_column_size_is_valid,
-    resolve_default_c_type,
+    SqlTypeSupport, canonical_c_type, classify_parameter_sql_type, is_valid_c_type,
+    parameter_column_size_is_valid, resolve_default_c_type,
 };
 use crate::conversion::param_convert::is_data_at_exec_indicator;
 use crate::error::{free_errors, post_sql_error};
@@ -158,7 +157,7 @@ fn sql_bind_parameter_safe(
     // locks. The STMT lock is dropped before those are taken — this crate
     // never holds a STMT lock while acquiring a DESC lock (see
     // bind_col.rs's identical rationale for SQLBindCol).
-    let (apd, c_type, column_size) = {
+    let (apd, c_type) = {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("SQLBindParameter: stmt mutex poisoned");
             return SQL_ERROR;
@@ -246,22 +245,18 @@ fn sql_bind_parameter_safe(
             return SQL_ERROR;
         }
 
-        let column_size = if parameter_type == SQL_SS_XML
-            && column_size > SQL_PREC_NCHAR
+        let column_size_is_valid = parameter_column_size_is_valid(parameter_type, column_size);
+        let large_xml_dae = !column_size_is_valid
+            && parameter_type == SQL_SS_XML
             && matches!(input_output_type, SQL_PARAM_INPUT | SQL_PARAM_INPUT_OUTPUT)
             && !strlen_or_ind_ptr.is_null()
             // SAFETY: input and input/output bindings require a readable
             // StrLen_or_IndPtr under SQLBindParameter's caller contract.
-            && is_data_at_exec_indicator(unsafe { strlen_or_ind_ptr.read_unaligned() })
-        {
-            SQL_PREC_UNLIMITED
-        } else {
-            column_size
-        };
+            && is_data_at_exec_indicator(unsafe { strlen_or_ind_ptr.read_unaligned() });
 
         // ColumnSize is validated last, after the type and conversion checks, the
         // order msodbcsql's SQLBindParameter uses before CheckSqlPrecScale.
-        if !parameter_column_size_is_valid(parameter_type, column_size) {
+        if !column_size_is_valid && !large_xml_dae {
             error!(
                 parameter_type,
                 column_size, "SQLBindParameter: invalid ColumnSize for the SQL type"
@@ -302,7 +297,7 @@ fn sql_bind_parameter_safe(
         // SQLBindParameter/SetIPDRec in sqlcdesc.cpp retain indicator-only
         // output bindings; GetReturnValue treats a null destination as size 0.
 
-        (stmt_state.effective_apd(stmt), c_type, column_size)
+        (stmt_state.effective_apd(stmt), c_type)
     };
 
     let bound = BoundParam {
@@ -1032,7 +1027,7 @@ mod tests {
     }
 
     #[test]
-    fn large_xml_data_at_execution_normalizes_column_size_to_unlimited() {
+    fn large_xml_data_at_execution_preserves_column_size_for_execute() {
         let h = TestHandles::with_env_dbc_stmt();
         let mut token = 0u8;
         let mut ind = sql_len_data_at_exec(4001);
@@ -1053,7 +1048,7 @@ mod tests {
         assert_eq!(ret, SQL_SUCCESS);
         let binding = bound_params(&h);
         let bound = binding[0].as_ref().expect("parameter 1 should be bound");
-        assert_eq!(bound.param.column_size, SQL_PREC_UNLIMITED);
+        assert_eq!(bound.param.column_size, 4001);
     }
 
     #[test]

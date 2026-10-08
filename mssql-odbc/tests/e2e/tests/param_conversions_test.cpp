@@ -2474,22 +2474,29 @@ protected:
         SQLLEN ind = 0;
         SQLRETURN rc = SQLGetData(stmt_, 1, SQL_C_BINARY, buf, sizeof(buf), &ind);
         EXPECT_TRUE(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
-        EXPECT_GE(ind, 0);
+        EXPECT_TRUE(ind >= 0 || ind == SQL_NO_TOTAL);
         std::vector<SQLCHAR> value;
+        // Unknown-length PLP has no count-derived guard; 1,000,000 calls caps
+        // this test at roughly 4 GiB without constraining a valid geometry.
+        constexpr int kUnknownTotalMaxCalls = 1000000;
         const int max_calls =
-            ind > 0 ? static_cast<int>(ind / static_cast<SQLLEN>(sizeof(buf))) + 2 : 1;
+            ind > 0 ? static_cast<int>(ind / static_cast<SQLLEN>(sizeof(buf))) + 2
+                    : kUnknownTotalMaxCalls;
         int calls = 0;
         while (rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO) {
             if (++calls > max_calls) {
                 ADD_FAILURE() << "chunked geometry read did not terminate";
                 break;
             }
-            if (ind < 0) {
-                ADD_FAILURE() << "chunked geometry read returned no byte count";
+            if (ind < 0 && ind != SQL_NO_TOTAL) {
+                ADD_FAILURE() << "chunked geometry read returned an invalid indicator";
                 break;
             }
-            const SQLLEN chunk =
-                (rc == SQL_SUCCESS) ? ind : static_cast<SQLLEN>(sizeof(buf));
+            if (rc == SQL_SUCCESS && ind == SQL_NO_TOTAL) {
+                ADD_FAILURE() << "final geometry chunk returned no byte count";
+                break;
+            }
+            const SQLLEN chunk = (rc == SQL_SUCCESS) ? ind : static_cast<SQLLEN>(sizeof(buf));
             if (chunk > static_cast<SQLLEN>(sizeof(buf))) {
                 ADD_FAILURE() << "final geometry chunk overruns the buffer";
                 break;
@@ -2500,7 +2507,7 @@ protected:
             }
             rc = SQLGetData(stmt_, 1, SQL_C_BINARY, buf, sizeof(buf), &ind);
             EXPECT_TRUE(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
-            EXPECT_GE(ind, 0);
+            EXPECT_TRUE(ind >= 0 || ind == SQL_NO_TOTAL);
         }
         EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
         return value;
