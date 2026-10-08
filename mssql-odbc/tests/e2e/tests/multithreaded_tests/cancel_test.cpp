@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+#include "tcp_pause_proxy.h"
 #include "odbc_test_fixture.h"
 
 #include <future>
@@ -125,4 +126,103 @@ TEST_F(CancelLiveTest, FetchCancellationReportsHy008) {
 
 TEST_F(CancelLiveTest, MoreResultsCancellationReturnCode) {
     CancelCursor(true, false);
+}
+
+TEST_F(CancelLiveTest, PutDataCancelFinishesPendingPacketAndPreservesConnection) {
+    using namespace std::chrono_literals;
+    auto& config = ODBCTestConfig::Instance();
+    if (config.HasConnStr() || config.HasDSN() || config.Server().find('\\') != std::string::npos)
+        GTEST_SKIP() << "Backpressure proxy requires ODBC_TEST_SERVER as a direct TCP endpoint";
+    TcpPauseProxy proxy(config.Server());
+    auto connection = ODBCTestUtils::ToNarrow(ODBCTestUtils::BuildConnectionString());
+    const auto endpoint = "Server=" + config.Server() + ";";
+    const auto position = connection.find(endpoint);
+    ASSERT_NE(std::string::npos, position);
+    connection.replace(position, endpoint.size(),
+                       "Server=127.0.0.1," + std::to_string(proxy.Port()) + ";");
+    ASSERT_SQL_OK(SQLFreeHandle(SQL_HANDLE_STMT, stmt_), SQL_HANDLE_STMT, stmt_);
+    stmt_ = SQL_NULL_HSTMT;
+    ASSERT_SQL_OK(SQLDisconnect(dbc_), SQL_HANDLE_DBC, dbc_);
+    auto text = ODBCTestUtils::ToSqlTStr(connection);
+    ASSERT_SQL_OK(SQLDriverConnect(dbc_, nullptr, const_cast<SQLTCHAR*>(text.c_str()),
+                                  SQL_NTS, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT),
+                  SQL_HANDLE_DBC, dbc_);
+    ASSERT_SQL_OK(SQLAllocHandle(SQL_HANDLE_STMT, dbc_, &stmt_), SQL_HANDLE_DBC, dbc_);
+    ASSERT_SQL_OK(SQLSetConnectAttr(dbc_, SQL_ATTR_CONNECTION_TIMEOUT,
+                                   reinterpret_cast<SQLPOINTER>(5), 0),
+                  SQL_HANDLE_DBC, dbc_);
+    auto sql = ODBCTestUtils::ToSqlTStr("SELECT ? AS v");
+    ASSERT_SQL_OK(SQLPrepare(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS),
+                  SQL_HANDLE_STMT, stmt_);
+    SQLLEN indicator = SQL_DATA_AT_EXEC;
+    char token = 0;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_CHAR, SQL_VARCHAR,
+                                  0, 0, &token, 0, &indicator), SQL_HANDLE_STMT, stmt_);
+    ASSERT_EQ(SQL_NEED_DATA, SQLExecute(stmt_));
+    SQLPOINTER value = nullptr;
+    ASSERT_EQ(SQL_NEED_DATA, SQLParamData(stmt_, &value));
+
+    std::vector<char> chunk(8 * 1024 * 1024, 'a');
+    proxy.Pause();
+    auto writing = std::async(std::launch::async, [&] {
+        return SQLPutData(stmt_, chunk.data(), static_cast<SQLLEN>(chunk.size()));
+    });
+    EXPECT_EQ(std::future_status::timeout, writing.wait_for(200ms));
+    auto cancelling = std::async(std::launch::async, [&] { return SQLCancel(stmt_); });
+    const auto pendingCancel = cancelling.wait_for(50ms);
+    // Always release backpressure before asserting or destroying the futures.
+    proxy.Resume();
+    const auto cancelReady = cancelling.wait_for(5s);
+    const auto writeReady = writing.wait_for(5s);
+    const auto cancelRc = cancelling.get();
+    const auto writeRc = writing.get();
+    EXPECT_EQ(std::future_status::timeout, pendingCancel);
+    ASSERT_EQ(std::future_status::ready, cancelReady);
+    ASSERT_EQ(std::future_status::ready, writeReady);
+    ASSERT_EQ(SQL_SUCCESS, cancelRc);
+    ASSERT_EQ(SQL_ERROR, writeRc);
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HY008");
+    SQLUINTEGER dead = SQL_CD_TRUE;
+    ASSERT_SQL_OK(SQLGetConnectAttr(dbc_, SQL_ATTR_CONNECTION_DEAD, &dead,
+                                   SQL_IS_UINTEGER, nullptr), SQL_HANDLE_DBC, dbc_);
+    EXPECT_EQ(SQL_CD_FALSE, dead);
+    ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_CLOSE), SQL_HANDLE_STMT, stmt_);
+    AssertReusable();
+    EXPECT_FALSE(proxy.Failed());
+    ASSERT_SQL_OK(SQLFreeHandle(SQL_HANDLE_STMT, stmt_), SQL_HANDLE_STMT, stmt_);
+    stmt_ = SQL_NULL_HSTMT;
+    ASSERT_SQL_OK(SQLDisconnect(dbc_), SQL_HANDLE_DBC, dbc_);
+}
+
+TEST_F(CancelLiveTest, FinalParamDataCancellationRestoresPreparedStatement) {
+    using namespace std::chrono_literals;
+    auto sql = ODBCTestUtils::ToSqlTStr("WAITFOR DELAY '00:00:10'; SELECT ? AS v");
+    ASSERT_SQL_OK(SQLPrepare(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_QUERY_TIMEOUT,
+                                reinterpret_cast<SQLPOINTER>(15), 0), SQL_HANDLE_STMT, stmt_);
+    SQLLEN indicator = SQL_DATA_AT_EXEC;
+    char token = 0;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_CHAR, SQL_VARCHAR,
+                                  0, 0, &token, 0, &indicator), SQL_HANDLE_STMT, stmt_);
+    ASSERT_EQ(SQL_NEED_DATA, SQLExecute(stmt_));
+    SQLPOINTER value = nullptr;
+    ASSERT_EQ(SQL_NEED_DATA, SQLParamData(stmt_, &value));
+    char data[] = "cancel-me";
+    ASSERT_SQL_OK(SQLPutData(stmt_, data, sizeof(data) - 1), SQL_HANDLE_STMT, stmt_);
+    auto execution = std::async(std::launch::async, [&] {
+        SQLPOINTER next = nullptr;
+        return SQLParamData(stmt_, &next);
+    });
+    EXPECT_EQ(std::future_status::timeout, execution.wait_for(500ms));
+    EXPECT_EQ(SQL_SUCCESS, SQLCancel(stmt_));
+    const auto ready = execution.wait_for(5s);
+    const auto rc = execution.get();
+    ASSERT_EQ(std::future_status::ready, ready);
+    ASSERT_EQ(SQL_ERROR, rc);
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HY008");
+    ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_CLOSE), SQL_HANDLE_STMT, stmt_);
+    ASSERT_EQ(SQL_NEED_DATA, SQLExecute(stmt_));
+    ASSERT_SQL_OK(SQLCancel(stmt_), SQL_HANDLE_STMT, stmt_);
+    AssertReusable();
 }

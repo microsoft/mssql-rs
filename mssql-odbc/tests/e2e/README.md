@@ -211,6 +211,39 @@ rustc that produced the instrumented `.so`. In CI, the Linux x64 PR build sets
 `ODBC_E2E_COVERAGE=1`, publishes the report as `CoberturaCoverageOdbcE2E_Linux`,
 and the Merge Coverage stage unions it into the diff-coverage report.
 
+### Cancellation PR coverage
+
+`cancel_test` is registered on every platform, including the Windows Driver
+Manager (`odbc32`) and unixODBC. The tests live under
+[`tests/multithreaded_tests/`](tests/multithreaded_tests/). Run them on both
+driver legs; they record `SQL_DRIVER_VER`. Coverage includes execute, fetch,
+MoreResults, immediate cancel-then-close, final SQLParamData, and a blocked
+SQLPutData packet followed by connection reuse. MoreResults has the explicitly
+approved return-code difference in [registry entry 26](../../docs/parity-deviations.md).
+
+The write test uses a loopback TCP proxy which forwards TLS unchanged and
+temporarily stops reading client bytes. It asserts that the write and cancel
+are pending before resuming forwarding, then verifies HY008 and a live,
+reusable connection. It needs `ODBC_TEST_SERVER` as a direct TCP endpoint
+(host or host,port); a DSN, full connection-string override, or named instance
+cannot be routed by this proxy and is reported as skipped.
+
+The Unix runner creates temporary registrations with `Threading=0` for both
+drivers, without modifying the installed reference registration. This prevents
+the Driver Manager from serializing away the cross-thread call. Rust tests cover
+buffer-only DAE calls, token-publication races, simultaneous cancellers,
+indefinitely stalled writes, and missing acknowledgement deadlines.
+
+To select just this test executable:
+
+```bash
+./run_e2e.sh --filter='^cancel_test$' --compare-with-msodbcsql
+```
+
+```powershell
+.\run_e2e.ps1 -FilterTests '^cancel_test$' -CompareWithMsodbcsql
+```
+
 ### Windows (requires Administrator)
 
 ```powershell

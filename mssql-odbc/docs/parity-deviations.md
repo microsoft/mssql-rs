@@ -930,8 +930,9 @@ msodbcsql build is measured.
     `SQL_DRIVER_VER` and assert each driver's exact return code. Measured on
     Linux through unixODBC with `Threading=0`, native library
     `libmsodbcsql-18.6.so.1.1` / `SQL_DRIVER_VER=18.06.0001`, against SQL Server
-    2025 CU9 (`17.0.5005.3`). Other native builds and Windows DM behavior have
-    not been measured for this sequence.
+    2025 CU9 (`17.0.5005.3`). The same sequence was also measured through
+    Windows Driver Manager against native `SQL_DRIVER_VER=18.06.0001` with
+    the same result. Other native builds have not been measured.
 
     Explicitly approved by the requester on 2026-10-07 for
     [AB#49223](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/49223):

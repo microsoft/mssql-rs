@@ -129,8 +129,13 @@ status describes the current crate, not merely whether supporting code exists in
   waiting for the active operation's completion; an immediate SQLFreeStmt(SQL_CLOSE)
   is safe without joining the caller thread. Cancellation discovered during
   read-ahead reports HY008 on that call, not a subsequent fetch.
-  AB#49222 and AB#49223 must ship together. Cancellation timeout policy and broader race coverage remain
-  follow-up work; this is not complete SQLCancel support or async execution.
+  In-flight SQLPutData/SQLParamData cancellation (AB#49224) also unwinds
+  buffered calls. Pending packet writes finish within the cancellation budget
+  before state-aware withdrawal; an uncertain packet or failed acknowledgement
+  retires the connection. SQL_ATTR_CONNECTION_TIMEOUT supplies that budget,
+  with 120 seconds when zero, across packet completion and response settlement.
+  General network-I/O timeout enforcement and ODBC async execution remain out
+  of scope. AB#49222, AB#49223, and AB#49224 ship together.
 - SQLPrepare / SQLExecute via **deferred prepare**: the first `SQLExecute`
   prepares and runs in one round trip with `sp_prepexec`, caches the returned
   handle, and subsequent executes reuse it via `sp_execute` (a rebind or
