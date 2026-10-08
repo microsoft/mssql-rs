@@ -180,7 +180,16 @@ fn sql_get_type_info_w_safe(
     // through `SQLExecDirectW` itself (`sqlcdd.cpp:2239`), inheriting
     // `GetQueryTimeOut(lpstmt)`, and the function's documented SQLSTATE table
     // lists `HYT00` naming this attribute. `0` (the default) stays unlimited.
-    flush_pending_unprepare(dbc, stmt, &mut client, "SQLGetTypeInfoW", query_timeout);
+    if let Err(e) = flush_pending_unprepare(
+        dbc,
+        stmt,
+        &mut client,
+        "SQLGetTypeInfoW",
+        query_timeout,
+        &cancel_handle,
+    ) {
+        return fail_with_tds(dbc, stmt, statement_handle, client, &e);
+    }
 
     let query_timeout = match deduct_query_timeout(budget, started.elapsed()) {
         Ok(remaining) => remaining,
@@ -195,8 +204,13 @@ fn sql_get_type_info_w_safe(
         }
     };
 
-    if let Err(e) = begin_transaction_if_manual(dbc, &mut client, "SQLGetTypeInfoW", query_timeout)
-    {
+    if let Err(e) = begin_transaction_if_manual(
+        dbc,
+        &mut client,
+        "SQLGetTypeInfoW",
+        query_timeout,
+        &cancel_handle,
+    ) {
         return fail_with_tds(dbc, stmt, statement_handle, client, &e);
     }
 

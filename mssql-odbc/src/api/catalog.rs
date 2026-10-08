@@ -563,7 +563,11 @@ fn run_catalog(
     // unlimited. Steps are charged against the *fixed* original budget using
     // *cumulative* elapsed time, so no step is double-charged and sub-second
     // remainders accumulate rather than being floored away independently.
-    flush_pending_unprepare(dbc, stmt, &mut client, name, query_timeout);
+    if let Err(e) =
+        flush_pending_unprepare(dbc, stmt, &mut client, name, query_timeout, &cancel_handle)
+    {
+        return fail_with_tds(dbc, stmt, statement_handle, client, &e);
+    }
 
     let query_timeout = match deduct_query_timeout(budget, started.elapsed()) {
         Ok(remaining) => remaining,
@@ -578,7 +582,9 @@ fn run_catalog(
         }
     };
 
-    if let Err(e) = begin_transaction_if_manual(dbc, &mut client, name, query_timeout) {
+    if let Err(e) =
+        begin_transaction_if_manual(dbc, &mut client, name, query_timeout, &cancel_handle)
+    {
         return fail_with_tds(dbc, stmt, statement_handle, client, &e);
     }
 

@@ -156,7 +156,7 @@ pub(crate) struct SuspendedMessage {
 impl SuspendedMessage {
     pub(crate) fn check_cancellation(&self) -> TdsResult<()> {
         if self.cancel_handle.as_ref().is_some_and(|handle| {
-            handle.cancel_timeout_secs().is_some() && handle.cancel_token.is_cancelled()
+            handle.has_settlement_budget() && handle.cancel_token.is_cancelled()
         }) {
             Err(OperationCancelledError("Request was cancelled".to_string()))
         } else {
@@ -165,11 +165,9 @@ impl SuspendedMessage {
     }
 
     pub(crate) fn cancellation_deadline(&self) -> Option<tokio::time::Instant> {
-        self.cancel_handle.as_ref().and_then(|handle| {
-            handle
-                .cancel_timeout_secs()
-                .map(|_| handle.settlement_deadline(std::time::Duration::ZERO))
-        })
+        self.cancel_handle
+            .as_ref()
+            .and_then(CancelHandle::configured_settlement_deadline)
     }
 
     /// A polled send may have written bytes even if cancellation prevented it
@@ -500,7 +498,7 @@ impl<'a> PacketWriter<'a> {
         };
         let mut cancelled = false;
         if let Some(handle) = handle
-            && handle.cancel_timeout_secs().is_some()
+            && handle.has_settlement_budget()
         {
             tokio::pin!(send_data_fut);
             tokio::select! {

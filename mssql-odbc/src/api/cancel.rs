@@ -647,6 +647,14 @@ mod tests {
     }
 
     fn cancel_blocked(h: &TestHandles, execute: impl FnOnce(SqlHandle) -> SqlReturn + Send) {
+        cancel_blocked_then(h, execute, || {});
+    }
+
+    fn cancel_blocked_then(
+        h: &TestHandles,
+        execute: impl FnOnce(SqlHandle) -> SqlReturn + Send,
+        before_reuse: impl FnOnce(),
+    ) {
         use std::time::{Duration, Instant};
         let dbc = unsafe { handle_from_raw::<crate::handles::DbcHandle>(h.dbc) };
         let raw = h.stmt as usize;
@@ -697,6 +705,7 @@ mod tests {
                 0,
             )
         });
+        before_reuse();
         let sql: Vec<u16> = "SELECT 1".encode_utf16().collect();
         assert_eq!(SQL_SUCCESS, unsafe {
             crate::api::SQLExecDirectW(h.stmt, sql.as_ptr(), i16::try_from(sql.len()).unwrap())
@@ -719,6 +728,20 @@ mod tests {
 
     #[test]
     fn cancel_interrupts_statement_execute_paths_and_connection_is_reusable() {
+        cancel_statement_phase("execute");
+    }
+
+    #[test]
+    fn cancel_interrupts_implicit_transaction_startup_with_unlimited_query_timeout() {
+        cancel_statement_phase("transaction");
+    }
+
+    #[test]
+    fn cancel_interrupts_orphan_cleanup_with_unlimited_query_timeout() {
+        cancel_statement_phase("unprepare");
+    }
+
+    fn cancel_statement_phase(phase: &str) {
         use crate::api::odbc_types::*;
         use mssql_mock_tds::QueryResponse;
         use std::time::Duration;
@@ -732,9 +755,17 @@ mod tests {
             "type_info",
             "catalog",
             "describe_param",
+            "streamed",
+            "deferred",
         ] {
+            if phase != "transaction" && matches!(path, "streamed" | "deferred")
+                || phase == "unprepare" && path == "prepared"
+            {
+                continue;
+            }
             let h = TestHandles::with_env_dbc_stmt();
             let dbc = unsafe { handle_from_raw::<crate::handles::DbcHandle>(h.dbc) };
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
             let server = crate::test_support::connect_mock_server(
                 dbc,
                 "WAITFOR",
@@ -746,16 +777,42 @@ mod tests {
             );
             server.register_query("SELECT 1", QueryResponse::select_one());
             server.set_rpc_delay(Duration::from_secs(8));
+            if phase == "transaction" {
+                server.set_tm_begin_delay(Duration::from_secs(8));
+                dbc.inner.lock().unwrap().autocommit = false;
+            }
+            dbc.inner.lock().unwrap().connection_timeout = 1;
             let sql: Vec<u16> = match path {
                 "rpc" => "{call cancel_test}",
                 "parameterized" | "array" => "WAITFOR DELAY '00:00:08'; SELECT ?",
-                "describe_param" => "SELECT ?",
+                "describe_param" | "streamed" | "deferred" => "SELECT ?",
                 _ => "WAITFOR DELAY '00:00:08'; SELECT 2",
             }
             .encode_utf16()
             .collect();
             let sql_len = i16::try_from(sql.len()).unwrap();
             let mut values = [7i32, 8];
+            let mut indicator = SQL_DATA_AT_EXEC;
+            if matches!(path, "streamed" | "deferred") {
+                assert_eq!(SQL_SUCCESS, unsafe {
+                    crate::api::SQLBindParameter(
+                        h.stmt,
+                        1,
+                        SQL_PARAM_INPUT,
+                        SQL_C_CHAR,
+                        if path == "streamed" {
+                            SQL_VARCHAR
+                        } else {
+                            SQL_INTEGER
+                        },
+                        10,
+                        0,
+                        values.as_mut_ptr().cast(),
+                        4,
+                        &mut indicator,
+                    )
+                });
+            }
             if matches!(path, "parameterized" | "array") {
                 assert_eq!(SQL_SUCCESS, unsafe {
                     crate::api::SQLBindParameter(
@@ -782,37 +839,52 @@ mod tests {
                     )
                 });
             }
-            if matches!(path, "prepared" | "array" | "describe_param") {
+            if matches!(
+                path,
+                "prepared" | "array" | "describe_param" | "streamed" | "deferred"
+            ) {
                 assert_eq!(SQL_SUCCESS, unsafe {
                     crate::api::SQLPrepareW(h.stmt, sql.as_ptr(), sql_len)
                 });
             }
-            cancel_blocked(&h, move |raw| unsafe {
-                match path {
-                    "prepared" | "array" => crate::api::SQLExecute(raw),
-                    "type_info" => crate::api::SQLGetTypeInfoW(raw, SQL_ALL_TYPES),
-                    "catalog" => crate::api::SQLTablesW(
-                        raw,
-                        std::ptr::null(),
-                        0,
-                        std::ptr::null(),
-                        0,
-                        std::ptr::null(),
-                        0,
-                        std::ptr::null(),
-                        0,
-                    ),
-                    "describe_param" => crate::api::SQLDescribeParam(
-                        raw,
-                        1,
-                        std::ptr::null_mut(),
-                        std::ptr::null_mut(),
-                        std::ptr::null_mut(),
-                        std::ptr::null_mut(),
-                    ),
-                    _ => crate::api::SQLExecDirectW(raw, sql.as_ptr(), sql_len),
-                }
-            });
+            if phase == "unprepare" {
+                crate::test_support::arm_pending_unprepare(dbc, stmt);
+            }
+            cancel_blocked_then(
+                &h,
+                move |raw| unsafe {
+                    match path {
+                        "prepared" | "array" | "streamed" | "deferred" => {
+                            crate::api::SQLExecute(raw)
+                        }
+                        "type_info" => crate::api::SQLGetTypeInfoW(raw, SQL_ALL_TYPES),
+                        "catalog" => crate::api::SQLTablesW(
+                            raw,
+                            std::ptr::null(),
+                            0,
+                            std::ptr::null(),
+                            0,
+                            std::ptr::null(),
+                            0,
+                            std::ptr::null(),
+                            0,
+                        ),
+                        "describe_param" => crate::api::SQLDescribeParam(
+                            raw,
+                            1,
+                            std::ptr::null_mut(),
+                            std::ptr::null_mut(),
+                            std::ptr::null_mut(),
+                            std::ptr::null_mut(),
+                        ),
+                        _ => crate::api::SQLExecDirectW(raw, sql.as_ptr(), sql_len),
+                    }
+                },
+                || {
+                    server.set_rpc_delay(Duration::ZERO);
+                    server.set_tm_begin_delay(Duration::ZERO);
+                },
+            );
         }
     }
 

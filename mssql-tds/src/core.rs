@@ -81,16 +81,27 @@ impl CancelHandle {
             .filter(|seconds| *seconds != 0)
     }
 
-    pub(crate) fn settlement_deadline(&self, default: Duration) -> Instant {
+    pub(crate) fn has_settlement_budget(&self) -> bool {
+        self.cancel_timeout_secs().is_some()
+            || self
+                .settlement
+                .as_ref()
+                .is_some_and(|settings| settings.deadline.get().is_some())
+    }
+
+    pub(crate) fn configured_settlement_deadline(&self) -> Option<Instant> {
         self.settlement
             .as_ref()
             .and_then(|settings| settings.deadline.get().copied())
-            .unwrap_or_else(|| {
-                Instant::now()
-                    + self
-                        .cancel_timeout_secs()
-                        .map_or(default, |seconds| Duration::from_secs(u64::from(seconds)))
+            .or_else(|| {
+                self.cancel_timeout_secs()
+                    .map(|seconds| Instant::now() + Duration::from_secs(u64::from(seconds)))
             })
+    }
+
+    pub(crate) fn settlement_deadline(&self, default: Duration) -> Instant {
+        self.configured_settlement_deadline()
+            .unwrap_or_else(|| Instant::now() + default)
     }
 
     /// Derive a child handle that is cancelled when this handle is.
@@ -222,6 +233,17 @@ mod tests {
         handle.cancel();
         tokio::time::advance(Duration::from_secs(1)).await;
         handle.cancel();
+        assert_eq!(
+            child.settlement_deadline(Duration::from_secs(5)),
+            start + Duration::from_secs(3)
+        );
+        handle.set_cancel_timeout_secs(0);
+        assert_eq!(child.cancel_timeout_secs(), None);
+        assert!(child.has_settlement_budget());
+        assert_eq!(
+            child.configured_settlement_deadline(),
+            Some(start + Duration::from_secs(3))
+        );
         assert_eq!(
             child.settlement_deadline(Duration::from_secs(5)),
             start + Duration::from_secs(3)

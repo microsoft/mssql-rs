@@ -123,6 +123,8 @@ status describes the current crate, not merely whether supporting code exists in
 - SQLCancel: core token plumbing and cross-thread synchronous execute cancellation
   (AB#49222), including statement-owned metadata RPCs and deferred SQLParamData
   execution; interrupted calls report HY008 and settle ATTENTION before reuse.
+  The same handle covers implicit transaction startup and orphan-handle cleanup
+  performed within those calls; standalone connection transaction APIs are unchanged.
   Parked data-at-execution unwind remains supported. Fetch/SQLGetData/SQLMoreResults
   and cursor-close cancellation (AB#49223) clear cursor/stream state and release
   the connection claim before SQLCancel returns. Cancellation signals before

@@ -15,6 +15,7 @@ use std::time::Duration;
 use mssql_tds::connection::tds_client::{
     CursorPoll, ExecuteOptions, ResultSet, StatementId, TdsClient,
 };
+use mssql_tds::core::CancelHandle;
 use mssql_tds::error::{Error as TdsError, TimeoutErrorType};
 use mssql_tds::message::parameters::rpc_parameters::{RpcParameter, StreamedSqlType};
 
@@ -626,7 +627,7 @@ pub(super) fn fail_with_tds(
 
 /// Releases a statement's pending orphaned prepared handle (from a re-prepare,
 /// rebind, or `SQLExecDirect` supersede) via `sp_unprepare`, using the already
-/// claimed `client`. Best-effort: any failure is logged and swallowed — a
+/// claimed `client`. Best-effort except for cancellation: other failures are logged — a
 /// leaked handle is freed when the connection closes, and must not fail the
 /// caller's execution.
 ///
@@ -647,26 +648,44 @@ pub(super) fn flush_pending_unprepare(
     client: &mut TdsClient,
     op: &str,
     timeout_secs: u32,
-) {
+    cancel: &CancelHandle,
+) -> Result<(), TdsError> {
     let pending = match stmt.inner.lock() {
         Ok(mut stmt_state) => stmt_state.pending_unprepare.take(),
         Err(_) => {
             error!("{op}: stmt mutex poisoned taking pending unprepare");
-            return;
+            return Err(TdsError::ImplementationError(
+                "statement state is poisoned during orphan cleanup".to_string(),
+            ));
         }
     };
     let Some(handle) = pending else {
-        return;
+        return Ok(());
     };
     // `unprepare` recovers a dead connection first, then drops the handle only
     // if it still belongs to the (recovered) session — a superseded handle is
     // already gone server-side and is skipped without an RPC.
-    if let Err(e) = dbc
-        .runtime
-        .block_on(client.unprepare(handle, ExecuteOptions::new().timeout_secs(timeout_secs)))
-    {
+    if let Err(e) = dbc.runtime.block_on(
+        client.unprepare(
+            handle,
+            ExecuteOptions::new()
+                .timeout_secs(timeout_secs)
+                .cancel(cancel),
+        ),
+    ) {
+        if matches!(e, TdsError::OperationCancelledError(_)) {
+            // Unprepare retains an unsent handle, but forgets one whose send
+            // was attempted. Retrying this id is safe: absent handles are skipped.
+            if let Ok(mut state) = stmt.inner.lock() {
+                state.pending_unprepare = Some(handle);
+            } else {
+                error!("{op}: stmt mutex poisoned restoring cancelled orphan cleanup");
+            }
+            return Err(e);
+        }
         error!(%e, "{op}: sp_unprepare failed — handle leaked until disconnect");
     }
+    Ok(())
 }
 
 /// Deducts elapsed wall-clock time from a `SQL_ATTR_QUERY_TIMEOUT` budget

@@ -3950,19 +3950,23 @@ impl TdsClient {
     async fn unprepare_orphan(
         &mut self,
         orphaned: &mut Option<StatementId>,
-        mut options: ExecuteOptions<'_>,
+        options: ExecuteOptions<'_>,
     ) -> TdsResult<()> {
         let Some(id) = *orphaned else {
             return Ok(());
         };
-        // Internal handle cleanup must finish even when its owning execution
-        // has been cancelled; the next statement operation observes the token.
-        options.cancel = None;
+        let cancel = options.cancel;
         let result = self.execute_sp_unprepare(id, true, options).await;
         if !self.prepared_handles.contains_key(&id) {
             *orphaned = None;
         }
-        result
+        result?;
+        if cancel.is_some_and(|handle| handle.cancel_token.is_cancelled()) {
+            return Err(crate::error::Error::OperationCancelledError(
+                "Request was cancelled during orphan cleanup".to_string(),
+            ));
+        }
+        Ok(())
     }
 
     /// Executes `statement`, transparently recovering the connection and
@@ -4123,8 +4127,7 @@ impl TdsClient {
         let declaration_params = first_params.clone();
         RpcParameter::reject_data_at_exec(declaration_params.iter())?;
         let mut opts = options.into();
-        // Do not start cleanup for an already-cancelled batch. Once admitted,
-        // internal unprepare itself remains uncancellable.
+        // Do not start cleanup for an already-cancelled batch.
         if opts
             .cancel
             .is_some_and(|handle| handle.cancel_token.is_cancelled())
@@ -8897,7 +8900,10 @@ impl TdsClient {
             TransactionManagementRequest::new(transaction_params, &self.execution_context);
         let mut packet_writer =
             transaction.create_packet_writer(self.transport.as_writer(), timeout_sec, cancel);
-        transaction.serialize(&mut packet_writer).await?;
+        let sent = transaction.serialize(&mut packet_writer).await;
+        let message = packet_writer.suspend();
+        drop(transaction);
+        self.finish_send(sent, message).await?;
 
         self.consume_transaction_response().await?;
 
@@ -19369,23 +19375,101 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn internal_unprepare_does_not_inherit_execution_cancellation() {
-        let (mut client, _) = create_capturing_client(vec![done_no_more()]);
+    async fn internal_unprepare_retains_an_unsent_orphan_on_cancellation() {
+        let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
         let id = client.issue_statement_id();
         client.prepared_handles.insert(id, 77);
         let mut orphaned = Some(id);
         let cancel = CancelHandle::new();
         cancel.cancel();
-        client
+        let error = client
             .unprepare_orphan(
                 &mut orphaned,
                 ExecuteOptions::new().timeout_secs(1).cancel(&cancel),
             )
             .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            crate::error::Error::OperationCancelledError(_)
+        ));
+        assert_eq!(orphaned, Some(id));
+        assert!(client.prepared_handles.contains_key(&id));
+        assert!(sent.lock().unwrap().is_empty());
+        client
+            .unprepare_orphan(&mut orphaned, ExecuteOptions::new())
+            .await
             .unwrap();
         assert!(orphaned.is_none());
         assert!(!client.prepared_handles.contains_key(&id));
         assert!(client.cancel_handle.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn internal_unprepare_cancellation_bounds_a_stalled_write() {
+        let mut cancel = CancelHandle::new();
+        cancel.set_cancel_timeout_secs(1);
+        let mut transport = TestTransport::new();
+        transport.cancel_during_send = Some(cancel.cancel_token.clone());
+        let sent = Arc::clone(&transport.sent);
+        let closes = Arc::clone(&transport.close_calls);
+        let mut client = create_test_client_with_transport(transport);
+        let id = client.issue_statement_id();
+        client.prepared_handles.insert(id, 77);
+        let mut orphaned = Some(id);
+        let start = tokio::time::Instant::now();
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.unprepare_orphan(&mut orphaned, ExecuteOptions::new().cancel(&cancel)),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            crate::error::Error::OperationCancelledError(_)
+        ));
+        assert_eq!(start.elapsed(), Duration::from_secs(1));
+        assert!(client.is_connection_dead());
+        assert!(
+            orphaned.is_none(),
+            "an attempted release is not safe to resend"
+        );
+        assert!(!client.prepared_handles.contains_key(&id));
+        assert_eq!(sent.lock().unwrap().len(), 8);
+        assert_eq!(closes.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn transaction_begin_cancellation_bounds_and_retires_a_stalled_write() {
+        let mut cancel = CancelHandle::new();
+        cancel.set_cancel_timeout_secs(1);
+        let mut transport = TestTransport::new();
+        transport.cancel_during_send = Some(cancel.cancel_token.clone());
+        let sent = Arc::clone(&transport.sent);
+        let closes = Arc::clone(&transport.close_calls);
+        let mut client = create_test_client_with_transport(transport);
+        let start = tokio::time::Instant::now();
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.begin_transaction_with_options(
+                TransactionIsolationLevel::NoChange,
+                None,
+                ExecuteOptions::new().cancel(&cancel),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            crate::error::Error::OperationCancelledError(_)
+        ));
+        assert_eq!(start.elapsed(), Duration::from_secs(1));
+        assert!(client.is_connection_dead());
+        assert!(!client.has_active_transaction());
+        assert_eq!(sent.lock().unwrap().len(), 8);
+        assert_eq!(closes.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -19652,7 +19736,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn begin_execute_prepared_defers_release_cancellation_to_execution() {
+    async fn begin_execute_prepared_cancels_during_release_without_opening_stream() {
         use crate::security::describe_parameter_encryption::DescribeParameterEncryptionResult;
 
         for send_started in [false, true] {
@@ -19678,7 +19762,7 @@ mod tests {
                 PreparedStatement::materialized_for_test("INSERT INTO t(v) VALUES (@v)", live_id);
 
             assert!(!cancel.cancel_token.is_cancelled());
-            let status = tokio::time::timeout(
+            let error = tokio::time::timeout(
                 Duration::from_secs(1),
                 client.begin_execute_prepared(
                     &mut statement,
@@ -19689,23 +19773,21 @@ mod tests {
             )
             .await
             .unwrap()
-            .unwrap();
-            assert!(matches!(status, StreamedParamStatus::NeedData { .. }));
+            .unwrap_err();
             assert!(cancel.cancel_token.is_cancelled());
-            assert!(orphaned.is_none());
-            assert!(!client.prepared_handles.contains_key(&id));
-            assert!(!client.prepared_param_encryption.contains_key(&id));
-            let release_bytes = sent.lock().unwrap().len();
-            let error = client
-                .end_execute_prepared_param(&mut statement, &mut orphaned)
-                .await
-                .unwrap_err();
+            assert_eq!(orphaned, if send_started { None } else { Some(id) });
+            assert_eq!(client.prepared_handles.contains_key(&id), !send_started);
+            assert_eq!(
+                client.prepared_param_encryption.contains_key(&id),
+                !send_started
+            );
             assert!(matches!(
                 error,
                 crate::error::Error::OperationCancelledError(_)
             ));
-            assert_eq!(sent.lock().unwrap().len(), release_bytes);
-            assert!(!client.is_connection_dead());
+            // This scripted reader reports cancellation without acknowledging
+            // ATTENTION. A release already sent cannot leave that link reusable.
+            assert_eq!(client.is_connection_dead(), send_started);
             assert!(matches!(
                 client.streamed_write_state,
                 StreamedWriteState::Idle
@@ -19717,7 +19799,7 @@ mod tests {
                     .windows(4)
                     .filter(|w| *w == [0xFF, 0xFF, 0x0F, 0x00])
                     .count(),
-                1
+                usize::from(send_started)
             );
         }
     }
@@ -20694,6 +20776,29 @@ mod tests {
         let message = suspend_message_under(&mut client, 10_000, Some(&cancel)).await;
         cancel.cancel();
         tokio::time::advance(Duration::from_secs(1)).await;
+        client.retract_partial_request(message).await;
+        assert_eq!(
+            *observed.lock().unwrap(),
+            vec![Some(Duration::from_secs(2))]
+        );
+        assert!(!client.is_connection_dead());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn configured_withdrawal_keeps_deadline_when_timeout_is_reset() {
+        let (mut client, observed) = create_timeout_observing_client(vec![done_no_more()]);
+        let mut cancel = CancelHandle::new();
+        cancel.set_cancel_timeout_secs(3);
+        let message = suspend_message_under(&mut client, 10_000, Some(&cancel)).await;
+        cancel.cancel();
+        let deadline = message.cancellation_deadline().unwrap();
+        cancel.set_cancel_timeout_secs(0);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_eq!(message.cancellation_deadline(), Some(deadline));
+        assert!(matches!(
+            message.check_cancellation(),
+            Err(crate::error::Error::OperationCancelledError(_))
+        ));
         client.retract_partial_request(message).await;
         assert_eq!(
             *observed.lock().unwrap(),

@@ -340,8 +340,8 @@ impl MockServer {
 /// Arms `stmt` with a pending `sp_unprepare` that will actually reach the wire.
 ///
 /// `flush_pending_unprepare` runs before every statement-scoped operation and
-/// is deliberately best-effort: it logs a failure — including a timeout — and
-/// returns normally. That is exactly why each call site re-checks the budget
+/// is best-effort for non-cancellation errors: it logs a failure — including a
+/// timeout — and returns normally. That is why each call site re-checks the budget
 /// afterwards, and it is the only step whose timeout can be *survived*, so it
 /// is the one way a test can reach those "budget exhausted before the statement
 /// could be sent" arms deterministically rather than by racing a stopwatch.

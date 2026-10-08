@@ -247,7 +247,16 @@ fn sql_describe_param_safe(
     // regardless — `SQLDescribeParam` reaches `AutoFillIPD`, which reads
     // `GetQueryTimeOut(lpstmt)` (`sqlcdesc.cpp:9379`) — so matching it is a
     // parity requirement, not a discretionary extra. `0` stays unlimited.
-    flush_pending_unprepare(dbc, stmt, &mut client, "SQLDescribeParam", query_timeout);
+    if let Err(e) = flush_pending_unprepare(
+        dbc,
+        stmt,
+        &mut client,
+        "SQLDescribeParam",
+        query_timeout,
+        &cancel_handle,
+    ) {
+        return fail_with_tds(dbc, stmt, statement_handle, client, &e);
+    }
 
     let query_timeout = match deduct_query_timeout(budget, started.elapsed()) {
         Ok(remaining) => remaining,
@@ -262,8 +271,13 @@ fn sql_describe_param_safe(
         }
     };
 
-    if let Err(e) = begin_transaction_if_manual(dbc, &mut client, "SQLDescribeParam", query_timeout)
-    {
+    if let Err(e) = begin_transaction_if_manual(
+        dbc,
+        &mut client,
+        "SQLDescribeParam",
+        query_timeout,
+        &cancel_handle,
+    ) {
         return fail_with_tds(dbc, stmt, statement_handle, client, &e);
     }
 

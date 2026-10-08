@@ -239,9 +239,13 @@ fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn
             };
             let started = Instant::now();
 
-            if let Err(e) =
-                begin_transaction_if_manual(dbc, &mut client, "SQLExecute", query_timeout)
-            {
+            if let Err(e) = begin_transaction_if_manual(
+                dbc,
+                &mut client,
+                "SQLExecute",
+                query_timeout,
+                &cancel_handle,
+            ) {
                 // Nothing ran, so put the staged statement (and any pending orphan)
                 // back before reporting, exactly as the failed-claim path does.
                 if let Ok(mut stmt_state) = stmt.inner.lock() {
@@ -343,9 +347,13 @@ fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn
             };
             let started = Instant::now();
 
-            if let Err(e) =
-                begin_transaction_if_manual(dbc, &mut client, "SQLExecute", query_timeout)
-            {
+            if let Err(e) = begin_transaction_if_manual(
+                dbc,
+                &mut client,
+                "SQLExecute",
+                query_timeout,
+                &cancel_handle,
+            ) {
                 if let Ok(mut stmt_state) = stmt.inner.lock() {
                     stmt_state.prepared = Some(prepared);
                     stmt_state.pending_unprepare = orphaned;
@@ -490,9 +498,13 @@ fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn
                 }
             };
             let started = Instant::now();
-            if let Err(e) =
-                begin_transaction_if_manual(dbc, &mut client, "SQLExecute", query_timeout)
-            {
+            if let Err(e) = begin_transaction_if_manual(
+                dbc,
+                &mut client,
+                "SQLExecute",
+                query_timeout,
+                &cancel_handle,
+            ) {
                 if let Ok(mut stmt_state) = stmt.inner.lock() {
                     stmt_state.prepared = Some(prepared);
                     stmt_state.pending_unprepare = orphaned;
