@@ -66,6 +66,7 @@ pub(crate) const SQLSTATE_HY113: [u8; 5] = *b"HY113";
 /// elapsed before the driver got a response. Distinct from `HY000` so an
 /// application can tell "my deadline passed" from "something else broke".
 pub(crate) const SQLSTATE_HYT00: [u8; 5] = *b"HYT00";
+pub(crate) const SQLSTATE_HY008: [u8; 5] = *b"HY008";
 
 // Driver-raised diagnostics: a fixed SQLSTATE paired with its canonical
 // message text. Bundling the two means a call site posts one value and can't
@@ -709,6 +710,7 @@ pub(crate) fn post_tds_error(state: &mut impl HasDiagnostics, err: &TdsError, de
     let sqlstate = match err {
         TdsError::ConnectionResetNotAcknowledged => SQLSTATE_08S01,
         TdsError::TimeoutError(_) => SQLSTATE_HYT00,
+        TdsError::OperationCancelledError(_) => SQLSTATE_HY008,
         _ => default,
     };
     post_sql_error(state, sqlstate, 0, err.to_string());
@@ -974,6 +976,15 @@ mod tests {
         assert_eq!(s.records.len(), 1);
         assert_eq!(s.records[0].sql_state, SQLSTATE_HYT00);
         assert_eq!(s.records[0].native_error, 0);
+    }
+
+    #[test]
+    fn post_tds_error_cancel_maps_to_hy008_regardless_of_default() {
+        let mut s = FakeState::default();
+        let err = TdsError::OperationCancelledError("Request was cancelled".to_string());
+        post_tds_error(&mut s, &err, SQLSTATE_HY000);
+        assert_eq!(s.records.len(), 1);
+        assert_eq!(s.records[0].sql_state, SQLSTATE_HY008);
     }
 
     #[test]

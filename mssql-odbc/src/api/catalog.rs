@@ -514,9 +514,13 @@ fn run_catalog(
     not_null_cols: &[usize],
     renames: &[(usize, &'static str)],
 ) -> SqlReturn {
+    let _operation = match stmt.begin_operation() {
+        Ok(operation) => operation,
+        Err(rc) => return rc,
+    };
     let dbc = stmt.parent_dbc();
 
-    let query_timeout = {
+    let (query_timeout, cancel_handle) = {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("{name}: stmt mutex poisoned");
             return SQL_ERROR;
@@ -527,6 +531,10 @@ fn run_catalog(
             post_diag(&mut stmt_state, ERR_INVALID_CURSOR_STATE);
             return SQL_ERROR;
         }
+        let cancel_handle = match stmt.new_execution_cancel() {
+            Ok(handle) => handle,
+            Err(rc) => return rc,
+        };
         // A new query invalidates prior metadata/context immediately, matching
         // SQLGetTypeInfo/SQLExecDirect: a later failure cannot expose stale
         // SQLNumResultCols/DescribeCol state.
@@ -537,7 +545,7 @@ fn run_catalog(
         stmt_state.prepared = None;
         stmt_state.clear_state(STMT_STATE_PREPARED);
         stmt_state.set_state(STMT_STATE_EXEC_STARTED);
-        stmt_state.query_timeout
+        (stmt_state.query_timeout, cancel_handle)
     };
 
     let mut client = match claim_connection(dbc, stmt, statement_handle, name) {
@@ -588,12 +596,16 @@ fn run_catalog(
     };
 
     let (positional, named) = build_params(false);
-    let mut exec_result = dbc.runtime.block_on(client.execute_stored_procedure(
-        qualified_proc_name(catalog, proc),
-        Some(positional),
-        named,
-        ExecuteOptions::new().timeout_secs(query_timeout),
-    ));
+    let mut exec_result = dbc.runtime.block_on(
+        client.execute_stored_procedure(
+            qualified_proc_name(catalog, proc),
+            Some(positional),
+            named,
+            ExecuteOptions::new()
+                .timeout_secs(query_timeout)
+                .cancel(&cancel_handle),
+        ),
+    );
 
     if retry_on_error && matches!(exec_result, Err(TdsError::SqlServerError { .. })) {
         debug!(%proc, "{name}: qualified catalog call failed, retrying unqualified");
@@ -639,12 +651,16 @@ fn run_catalog(
             }
         };
         let (retry_positional, retry_named) = build_params(true);
-        exec_result = dbc.runtime.block_on(client.execute_stored_procedure(
-            qualified_proc_name(&None, proc),
-            Some(retry_positional),
-            retry_named,
-            ExecuteOptions::new().timeout_secs(retry_timeout),
-        ));
+        exec_result = dbc.runtime.block_on(
+            client.execute_stored_procedure(
+                qualified_proc_name(&None, proc),
+                Some(retry_positional),
+                retry_named,
+                ExecuteOptions::new()
+                    .timeout_secs(retry_timeout)
+                    .cancel(&cancel_handle),
+            ),
+        );
     }
 
     if let Err(e) = exec_result {

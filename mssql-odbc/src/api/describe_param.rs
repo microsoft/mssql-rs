@@ -140,9 +140,13 @@ fn sql_describe_param_safe(
     decimal_digits_ptr: *mut SqlSmallInt,
     nullable_ptr: *mut SqlSmallInt,
 ) -> SqlReturn {
+    let _operation = match stmt.begin_operation() {
+        Ok(operation) => operation,
+        Err(rc) => return rc,
+    };
     let dbc = stmt.parent_dbc();
 
-    let (sql, marker_count, return_status, query_timeout) = {
+    let (sql, marker_count, return_status, query_timeout, cancel_handle) = {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("SQLDescribeParam: stmt mutex poisoned");
             return SQL_ERROR;
@@ -216,8 +220,18 @@ fn sql_describe_param_safe(
                 return SQL_ERROR;
             }
         };
+        let cancel_handle = match stmt.new_execution_cancel() {
+            Ok(handle) => handle,
+            Err(rc) => return rc,
+        };
         stmt_state.set_state(STMT_STATE_EXEC_STARTED);
-        (sql, marker_count, return_status, stmt_state.query_timeout)
+        (
+            sql,
+            marker_count,
+            return_status,
+            stmt_state.query_timeout,
+            cancel_handle,
+        )
     };
 
     let mut client = match claim_connection(dbc, stmt, statement_handle, "SQLDescribeParam") {
@@ -267,12 +281,16 @@ fn sql_describe_param_safe(
     };
 
     let command = RpcParameter::new(None, StatusFlags::NONE, metadata_request_value(sql));
-    let execute_result = dbc.runtime.block_on(client.execute_stored_procedure(
-        DESCRIBE_PARAMETERS_PROC.to_string(),
-        Some(vec![command]),
-        None,
-        ExecuteOptions::new().timeout_secs(query_timeout),
-    ));
+    let execute_result = dbc.runtime.block_on(
+        client.execute_stored_procedure(
+            DESCRIBE_PARAMETERS_PROC.to_string(),
+            Some(vec![command]),
+            None,
+            ExecuteOptions::new()
+                .timeout_secs(query_timeout)
+                .cancel(&cancel_handle),
+        ),
+    );
     if let Err(e) = execute_result {
         error!(%e, "SQLDescribeParam: metadata RPC failed");
         return fail_with_tds(dbc, stmt, statement_handle, client, &e);

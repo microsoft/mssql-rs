@@ -17,7 +17,7 @@ use super::odbc_types::{
 };
 use super::sqlstate::*;
 use crate::api::describe_col::odbc_sql_type;
-use crate::api::exec_common::release_busy_if_row_exhausted;
+use crate::api::exec_common::{finish_cancelled_cursor, release_busy_if_row_exhausted};
 use crate::api::fetch_scroll::{element_stride, typed_plp_chunk_fits};
 use crate::api::odbc_types::SqlWChar;
 use crate::api::type_rules::{canonical_c_type, is_valid_c_type, resolve_default_c_type};
@@ -146,6 +146,10 @@ fn sql_get_data_safe(
     buffer_length: SqlLen,
     strlen_or_ind_ptr: *mut SqlLen,
 ) -> SqlReturn {
+    let _operation = match stmt.begin_operation() {
+        Ok(operation) => operation,
+        Err(rc) => return rc,
+    };
     debug_assert!(
         buffer_length >= 0,
         "SQLGetData: DM should reject negative buffer_length (HY090)"
@@ -966,9 +970,11 @@ fn finish_get_data(
     // A row's column was genuinely captured to reach this point (`ready`
     // requires it), so a row was always delivered here — unlike
     // `fetch_scroll.rs`'s zero-row fetch case.
-    let (has_server_info, _) =
+    let (has_server_info, _, cancelled) =
         release_busy_if_row_exhausted(dbc, stmt, statement_handle, client, |_| false);
-    if rc == SQL_SUCCESS && has_server_info {
+    if cancelled {
+        SQL_ERROR
+    } else if rc == SQL_SUCCESS && has_server_info {
         SQL_SUCCESS_WITH_INFO
     } else {
         rc
@@ -1658,7 +1664,7 @@ fn resume_row_to_column(
         }
     };
 
-    apply_cursor_result(stmt, column_number, cursor_result)
+    apply_cursor_result(stmt, statement_handle, column_number, cursor_result)
 }
 
 /// Applies one TDS cursor result to the statement's `SQLGetData` state.
@@ -1668,6 +1674,7 @@ fn resume_row_to_column(
 /// row-exhaustion bookkeeping.
 fn apply_cursor_result(
     stmt: &StmtHandle,
+    statement_handle: SqlHandle,
     column_number: usize,
     cursor_result: TdsResult<CursorColumn>,
 ) -> SqlReturn {
@@ -1718,6 +1725,9 @@ fn apply_cursor_result(
             SQL_ERROR
         }
         Err(e) => {
+            if matches!(e, mssql_tds::error::Error::OperationCancelledError(_)) {
+                return finish_cancelled_cursor(stmt, statement_handle, &e);
+            }
             if let Ok(mut stmt_state) = stmt.inner.lock() {
                 stmt_state.reset_row_stream();
                 stmt_state.clear_state(STMT_STATE_CURSOR_OPEN);
@@ -2360,6 +2370,10 @@ fn stream_active_plp_chunk_once<'a>(
     } = match read_result {
         Ok(chunk) => chunk,
         Err(e) => {
+            if matches!(e, mssql_tds::error::Error::OperationCancelledError(_)) {
+                drop(retained_stmt_state.take());
+                return finish_cancelled_cursor(stmt, statement_handle, &e);
+            }
             if let Some(mut s) = retained_stmt_state.take() {
                 s.clear_state(STMT_STATE_CURSOR_OPEN);
                 post_tds_error(&mut s, &e, SQLSTATE_HY000);
@@ -3037,6 +3051,7 @@ fn read_plp_wire(
                         let carry = (prefetch_scratch, tail, chunk.total_read);
                         Ok((chunk, Some(carry), None, None))
                     }
+                    Err(error @ mssql_tds::error::Error::OperationCancelledError(_)) => Err(error),
                     Err(error) => Ok((chunk, None, Some(prefetch_scratch), Some(error))),
                 }
             });

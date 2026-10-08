@@ -102,12 +102,16 @@ fn sql_get_type_info_w_safe(
     stmt: &StmtHandle,
     data_type: SqlSmallInt,
 ) -> SqlReturn {
+    let _operation = match stmt.begin_operation() {
+        Ok(operation) => operation,
+        Err(rc) => return rc,
+    };
     let dbc = stmt.parent_dbc();
 
     // Validate the requested type and reset prior context under the stmt lock.
     // Validation runs before any state mutation so an invalid type leaves the
     // statement unchanged, matching msodbcsql.
-    let query_timeout = {
+    let (query_timeout, cancel_handle) = {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("SQLGetTypeInfoW: stmt mutex poisoned");
             return SQL_ERROR;
@@ -141,6 +145,10 @@ fn sql_get_type_info_w_safe(
             }
         }
 
+        let cancel_handle = match stmt.new_execution_cancel() {
+            Ok(handle) => handle,
+            Err(rc) => return rc,
+        };
         // A new query invalidates prior metadata/context immediately, so a later
         // failure cannot expose stale SQLNumResultCols/DescribeCol state.
         stmt_state.clear_state(STMT_STATE_EXEC_CONTEXT);
@@ -154,7 +162,7 @@ fn sql_get_type_info_w_safe(
         stmt_state.parameter_udt_names.clear();
         stmt_state.clear_state(STMT_STATE_PREPARED);
         stmt_state.set_state(STMT_STATE_EXEC_STARTED);
-        stmt_state.query_timeout
+        (stmt_state.query_timeout, cancel_handle)
     };
 
     // `@data_type` is positional and uses the ODBC 3.x identifier unchanged.
@@ -205,12 +213,16 @@ fn sql_get_type_info_w_safe(
         }
     };
 
-    let exec_result = dbc.runtime.block_on(client.execute_stored_procedure(
-        DATATYPE_INFO_PROC.to_string(),
-        Some(positional),
-        named,
-        ExecuteOptions::new().timeout_secs(query_timeout),
-    ));
+    let exec_result = dbc.runtime.block_on(
+        client.execute_stored_procedure(
+            DATATYPE_INFO_PROC.to_string(),
+            Some(positional),
+            named,
+            ExecuteOptions::new()
+                .timeout_secs(query_timeout)
+                .cancel(&cancel_handle),
+        ),
+    );
     if let Err(e) = exec_result {
         error!(%e, "SQLGetTypeInfoW: execution failed");
         return fail_with_tds(dbc, stmt, statement_handle, client, &e);

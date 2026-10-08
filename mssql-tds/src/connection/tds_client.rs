@@ -3130,9 +3130,8 @@ impl TdsClient {
                 })
             }
             // Last streamed parameter closed and the message was sent: consume
-            // the response exactly like execute_sp_executesql does. A failure
-            // reading the response also aborts (the request is already on the
-            // wire, so the connection must be reset before reuse).
+            // the response exactly like execute_sp_executesql does. An
+            // acknowledged ATTENTION costs only this request, not the session.
             Ok(None) => {
                 // The materialized parameters in this message's prefix were
                 // serialized calls ago; the flag rode along on the suspended
@@ -3145,7 +3144,9 @@ impl TdsClient {
                 match self.position_on_first_result().await {
                     Ok(result) => Ok(StreamedParamStatus::Complete(result)),
                     Err(e) => {
-                        self.abort_streamed_write().await;
+                        if !self.take_settled_drain_interruption(&e) {
+                            self.abort_streamed_write().await;
+                        }
                         Err(e)
                     }
                 }
@@ -3935,11 +3936,14 @@ impl TdsClient {
     async fn unprepare_orphan(
         &mut self,
         orphaned: &mut Option<StatementId>,
-        options: ExecuteOptions<'_>,
+        mut options: ExecuteOptions<'_>,
     ) -> TdsResult<()> {
         let Some(id) = *orphaned else {
             return Ok(());
         };
+        // Internal handle cleanup must finish even when its owning execution
+        // has been cancelled; the next statement operation observes the token.
+        options.cancel = None;
         let result = self.execute_sp_unprepare(id, true, options).await;
         if !self.prepared_handles.contains_key(&id) {
             *orphaned = None;
@@ -4251,6 +4255,7 @@ impl TdsClient {
             let remaining = Self::deduct_timeout(opts.timeout, started.elapsed()).into_timeout()?;
             timeout_sec = remaining.seconds();
             self.remaining_request_timeout = remaining.duration();
+            self.cancel_handle = opts.cancel.map(CancelHandle::child_handle);
         }
 
         let live_handle = statement
@@ -19297,18 +19302,23 @@ mod tests {
             client.prepared_handles.insert(old_id, 77);
             let mut orphaned = Some(old_id);
             let offset = sent.lock().unwrap().len();
+            let cancel = CancelHandle::new();
             client
                 .begin_execute_prepared(
                     &mut statement,
                     vec![streamed_varbinary("@v")],
                     &mut orphaned,
-                    ExecuteOptions::new().timeout_secs(1),
+                    ExecuteOptions::new().timeout_secs(1).cancel(&cancel),
                 )
                 .await
                 .unwrap();
             assert!(orphaned.is_none());
             assert!(!client.prepared_handles.contains_key(&old_id));
             assert_eq!(statement.id(), Some(live_id));
+            assert!(
+                client.cancel_handle.is_some(),
+                "unprepare must restore the execution token"
+            );
             assert!(matches!(
                 client
                     .end_execute_prepared_param(&mut statement, &mut orphaned)
@@ -19332,6 +19342,45 @@ mod tests {
             assert!(!wire.windows(4).any(|w| w == [0xFF, 0xFF, 0x0D, 0x00]));
             assert_eq!(client.prepared_handles.get(&live_id), Some(&99));
         }
+    }
+
+    #[tokio::test]
+    async fn internal_unprepare_does_not_inherit_execution_cancellation() {
+        let (mut client, _) = create_capturing_client(vec![done_no_more()]);
+        let id = client.issue_statement_id();
+        client.prepared_handles.insert(id, 77);
+        let mut orphaned = Some(id);
+        let cancel = CancelHandle::new();
+        cancel.cancel();
+        client
+            .unprepare_orphan(
+                &mut orphaned,
+                ExecuteOptions::new().timeout_secs(1).cancel(&cancel),
+            )
+            .await
+            .unwrap();
+        assert!(orphaned.is_none());
+        assert!(!client.prepared_handles.contains_key(&id));
+        assert!(client.cancel_handle.is_none());
+    }
+
+    #[tokio::test]
+    async fn final_streamed_param_retires_unsettled_cancellation() {
+        let mut client = create_test_client_with_transport(TestTransport::with_tokens_then_error(
+            Vec::new(),
+            crate::error::Error::OperationCancelledError("unsettled cancellation".to_string()),
+        ));
+        client
+            .begin_sp_executesql("SELECT @v".to_string(), vec![streamed_varbinary("@v")], ())
+            .await
+            .unwrap();
+        let err = client.end_streamed_param().await.unwrap_err();
+        assert!(matches!(
+            err,
+            crate::error::Error::OperationCancelledError(_)
+        ));
+        assert!(!client.has_open_batch());
+        assert!(client.transport.connection_known_dead());
     }
 
     #[tokio::test]
@@ -19579,14 +19628,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn begin_execute_prepared_release_cancellation_tracks_send_attempt() {
+    async fn begin_execute_prepared_defers_release_cancellation_to_execution() {
         use crate::security::describe_parameter_encryption::DescribeParameterEncryptionResult;
 
         for send_started in [false, true] {
             let cancel = CancelHandle::new();
             let mut transport = TestTransport::with_tokens(vec![done_no_more()]);
             if send_started {
-                transport.cancel_during_send = Some(cancel.cancel_token.clone());
+                transport.cancel_after_send = Some(cancel.cancel_token.clone());
             } else {
                 transport.cancel_on_writer_creation = Some(cancel.cancel_token.clone());
             }
@@ -19605,7 +19654,7 @@ mod tests {
                 PreparedStatement::materialized_for_test("INSERT INTO t(v) VALUES (@v)", live_id);
 
             assert!(!cancel.cancel_token.is_cancelled());
-            let error = tokio::time::timeout(
+            let status = tokio::time::timeout(
                 Duration::from_secs(1),
                 client.begin_execute_prepared(
                     &mut statement,
@@ -19616,38 +19665,36 @@ mod tests {
             )
             .await
             .unwrap()
-            .unwrap_err();
+            .unwrap();
+            assert!(matches!(status, StreamedParamStatus::NeedData { .. }));
+            assert!(cancel.cancel_token.is_cancelled());
+            assert!(orphaned.is_none());
+            assert!(!client.prepared_handles.contains_key(&id));
+            assert!(!client.prepared_param_encryption.contains_key(&id));
+            let release_bytes = sent.lock().unwrap().len();
+            let error = client
+                .end_execute_prepared_param(&mut statement, &mut orphaned)
+                .await
+                .unwrap_err();
             assert!(matches!(
                 error,
                 crate::error::Error::OperationCancelledError(_)
             ));
-            assert_eq!(sent.lock().unwrap().len(), if send_started { 8 } else { 0 });
-            assert_eq!(client.is_connection_dead(), send_started);
-            assert_eq!(orphaned, if send_started { None } else { Some(id) });
-            assert_eq!(client.prepared_handles.contains_key(&id), !send_started);
-            assert_eq!(
-                client.prepared_param_encryption.contains_key(&id),
-                !send_started
-            );
+            assert_eq!(sent.lock().unwrap().len(), release_bytes);
+            assert!(!client.is_connection_dead());
             assert!(matches!(
                 client.streamed_write_state,
                 StreamedWriteState::Idle
             ));
-            if !send_started {
-                client.unprepare(id, ()).await.unwrap();
-                assert_eq!(client.prepared_handles.get(&live_id), Some(&99));
-                assert!(!client.prepared_handles.contains_key(&id));
-                assert!(client.prepared_param_encryption.is_empty());
-                assert!(!client.is_connection_dead());
-                let bytes = sent.lock().unwrap();
-                assert_eq!(
-                    bytes
-                        .windows(4)
-                        .filter(|w| *w == [0xFF, 0xFF, 0x0F, 0x00])
-                        .count(),
-                    1
-                );
-            }
+            assert_eq!(client.prepared_handles.get(&live_id), Some(&99));
+            let bytes = sent.lock().unwrap();
+            assert_eq!(
+                bytes
+                    .windows(4)
+                    .filter(|w| *w == [0xFF, 0xFF, 0x0F, 0x00])
+                    .count(),
+                1
+            );
         }
     }
 

@@ -120,7 +120,17 @@ status describes the current crate, not merely whether supporting code exists in
 - SQLBindCol
 - SQLNumResultCols, SQLDescribeCol, SQLRowCount
 - SQLMoreResults for multi-statement batches
-- SQLCancel for query cancellation and timeout handling
+- SQLCancel: core token plumbing and cross-thread synchronous execute cancellation
+  (AB#49222), including statement-owned metadata RPCs and deferred SQLParamData
+  execution; interrupted calls report HY008 and settle ATTENTION before reuse.
+  Parked data-at-execution unwind remains supported. Fetch/SQLGetData/SQLMoreResults
+  and cursor-close cancellation (AB#49223) clear cursor/stream state and release
+  the connection claim before SQLCancel returns. Cancellation signals before
+  waiting for the active operation's completion; an immediate SQLFreeStmt(SQL_CLOSE)
+  is safe without joining the caller thread. Cancellation discovered during
+  read-ahead reports HY008 on that call, not a subsequent fetch.
+  AB#49222 and AB#49223 must ship together. Cancellation timeout policy and broader race coverage remain
+  follow-up work; this is not complete SQLCancel support or async execution.
 - SQLPrepare / SQLExecute via **deferred prepare**: the first `SQLExecute`
   prepares and runs in one round trip with `sp_prepexec`, caches the returned
   handle, and subsequent executes reuse it via `sp_execute` (a rebind or

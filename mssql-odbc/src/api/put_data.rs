@@ -111,6 +111,10 @@ unsafe fn sql_put_data_safe(
     data_ptr: SqlPointer,
     strlen_or_ind: SqlLen,
 ) -> SqlReturn {
+    let _operation = match stmt.begin_operation() {
+        Ok(operation) => operation,
+        Err(rc) => return rc,
+    };
     let dbc = stmt.parent_dbc();
 
     // ── Validate state ──────────────────────────────────────────────────────

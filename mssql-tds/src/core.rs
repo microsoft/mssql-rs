@@ -33,7 +33,7 @@ impl CancelHandle {
     }
 
     /// Trigger cancellation, notifying all child handles.
-    pub fn cancel(self) {
+    pub fn cancel(&self) {
         self.cancel_token.cancel();
     }
 
@@ -195,6 +195,17 @@ mod tests {
     fn cancel_handle_default() {
         let handle = CancelHandle::default();
         assert!(!handle.cancel_token.is_cancelled());
+    }
+
+    #[test]
+    fn cancellation_can_be_repeated_and_propagates_to_late_children() {
+        let handle = CancelHandle::new();
+        let child = handle.child_handle();
+        handle.cancel();
+        handle.cancel();
+        assert!(child.cancel_token.is_cancelled());
+        assert!(handle.child_handle().cancel_token.is_cancelled());
+        assert!(!CancelHandle::new().cancel_token.is_cancelled());
     }
 
     #[tokio::test]

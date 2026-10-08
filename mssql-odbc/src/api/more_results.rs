@@ -54,6 +54,10 @@ unsafe fn sql_more_results_impl(statement_handle: SqlHandle) -> SqlReturn {
 }
 
 fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn {
+    let _operation = match stmt.begin_operation() {
+        Ok(operation) => operation,
+        Err(rc) => return rc,
+    };
     // DESC locks must not nest beneath STMT, including the exhausted fast path.
     let snapshot = snapshot_bound_params(stmt);
     // Free any stale diagnostics and observe cursor state.
