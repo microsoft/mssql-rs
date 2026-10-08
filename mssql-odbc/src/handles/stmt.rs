@@ -72,6 +72,8 @@ pub(crate) struct ActivePlpStream {
     /// `encoding_rs::Decoder` already holds that partial sequence internally,
     /// which keeps the boundary rule in one place instead of one per codepage.
     pub(crate) narrow_decoder: Option<ResolvedDecoder>,
+    /// Whether the narrow decoder has received the final end-of-stream signal.
+    /// Converted output may still need later calls to drain after finalization.
     pub(crate) narrow_decoder_finished: bool,
     /// Code units already decoded on a previous call that did not fit the
     /// caller's buffer, delivered before any further wire bytes.
@@ -262,6 +264,7 @@ impl std::fmt::Debug for ActivePlpStream {
             .field("pending_high_surrogate", &self.pending_high_surrogate)
             .field("pending_bytes", &self.pending_bytes.len())
             .field("narrow_decoder", &self.narrow_decoder.is_some())
+            .field("narrow_decoder_finished", &self.narrow_decoder_finished)
             .field("pending_units", &self.pending_units.len())
             .field(
                 "prefetched_wire_remaining",
