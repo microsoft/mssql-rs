@@ -2039,14 +2039,13 @@ fn stream_active_plp_chunk_once<'a>(
             //   SQL_C_WCHAR  <- nvarchar(max)/xml, already UTF-16LE on the wire
             //   SQL_C_WCHAR  <- varchar(max)/json, widened through the column's
             //                   collation (or UTF-8 for json, which has none)
-            //   SQL_C_CHAR   <- any of the three, as UTF-8
+            //   SQL_C_CHAR   <- any of the three, encoded for the client
             // Binary columns stream through this same loop, with no terminator
             // and the raw wire bytes (AB#47239).
             //
-            // Codepage note: as in the non-PLP path, SQL_C_CHAR output is UTF-8
-            // unconditionally, where msodbcsql converts to the client codepage it
-            // derives from the platform -- so the two agree under a UTF-8 locale and
-            // diverge under any other. SQL_C_WCHAR is UTF-16LE on both drivers.
+            // Narrow output uses the client encoding. UTF-8 wire text is copied
+            // only when that encoding is UTF-8; otherwise it is transcoded like
+            // the other character sources.
             let stream = stmt_state.active_plp.as_ref();
             let encoding = stream.map(|s| s.encoding);
             // A narrow column can only be converted when its collation resolved to a
@@ -2888,7 +2887,8 @@ fn stream_active_plp_chunk_once<'a>(
         // decode through); anything else took the transcode branch above. The
         // two arms are kept separate so the distinction stays recorded: `json`
         // (`Utf8Text`) carries no collation at all and must never be folded into
-        // the codepage conversion, or non-ASCII json silently corrupts.
+        // the conversion logic: it has no collation, but still needs transcoding
+        // when the client encoding is not UTF-8.
         let copy_verbatim = || unsafe {
             if direct_wire_output {
                 target_value_ptr.cast::<u8>().add(read).write_unaligned(0);
@@ -2905,8 +2905,8 @@ fn stream_active_plp_chunk_once<'a>(
             // varchar(max)/char/text under a UTF-8 collation — already UTF-8 on
             // the wire, so verbatim is the conversion.
             Some(PlpEncoding::SingleByteText) => copy_verbatim(),
-            // json — UTF-8 on the wire; delivered verbatim to SQL_C_CHAR. Must
-            // stay distinct from SingleByteText (see above).
+            // json — UTF-8 on the wire with no collation; this branch is reached
+            // only when the client encoding also permits verbatim delivery.
             Some(PlpEncoding::Utf8Text) => copy_verbatim(),
             // Utf16Text/Binary/None never reach this branch: the compatibility
             // gate rejects them or an earlier arm handles them. Assert the
