@@ -277,6 +277,28 @@ The same path unwinds a sequence the driver rejects (`22026`, `HY020`,
 `HY010`), so a misused API call does not cost the application its connection
 either.
 
+Cross-thread cancellation also covers an active `SQLPutData` or `SQLParamData`.
+The interrupted call owns cleanup and reports `HY008`; SQLCancel signals first
+and waits for its final client/state hand-back. Calls which only buffer data or
+advance to the next parameter still observe cancellation before publishing
+completion, so they cannot leave a cancelled sequence parked in Need Data.
+An existing call error keeps its diagnostic while cancellation releases DAE.
+
+A packet write already in progress is allowed to finish within the cancellation
+budget. Cleanup then discards an unsent request, withdraws a partially sent
+request with `EOM | IGNORE`, or sends ATTENTION for a complete request. If the
+packet cannot finish, the driver retires the transport without writing IGNORE,
+ATTENTION, or TLS shutdown onto an uncertain record.
+
+`SQL_ATTR_CONNECTION_TIMEOUT` selects the cancellation budget in seconds;
+zero uses msodbcsql's 120-second default. Explicit cancellation reads the current
+attribute, including changes after execution started. The deadline is shared
+by pending-packet completion and subsequent withdrawal/acknowledgement, rather
+than restarted at each phase. Query-timeout cleanup uses the same configured
+budget without changing the query timeout itself. Non-ODBC TDS callers that
+do not configure a cancellation budget retain the existing defaults. This does
+not implement the attribute as a general network-I/O timeout.
+
 ## Limitations (Phase 1)
 
 - Only `SQL_C_CHAR`, `SQL_C_WCHAR`, and `SQL_C_BINARY` C types are supported for

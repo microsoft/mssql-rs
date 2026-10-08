@@ -129,6 +129,34 @@ pub(super) fn finish_dae_unwind(
     }
 }
 
+pub(super) fn finish_cancelled_dae_call(
+    stmt: &StmtHandle,
+    statement_handle: SqlHandle,
+    rc: SqlReturn,
+) -> SqlReturn {
+    let cancelled_success = matches!(rc, SQL_SUCCESS | SQL_SUCCESS_WITH_INFO | SQL_NEED_DATA);
+    let needs_data = match stmt.inner.lock() {
+        Ok(state) => state.needs_data(),
+        Err(_) => {
+            error!("finishing cancelled DAE call: stmt mutex poisoned");
+            return SQL_ERROR;
+        }
+    };
+    if !needs_data {
+        return rc;
+    }
+    unwind_dae(
+        stmt.parent_dbc(),
+        stmt,
+        statement_handle,
+        cancelled_success.then_some(DiagMsg {
+            state: SQLSTATE_HY008,
+            text: "Operation canceled",
+        }),
+    );
+    if cancelled_success { SQL_ERROR } else { rc }
+}
+
 /// Parks the streaming client on the statement so `SQLParamData` / `SQLPutData`
 /// can drive the sequence, and enters the ODBC "Need Data" state. The DBC keeps
 /// `active_stmt` set, so the connection stays busy for the duration.

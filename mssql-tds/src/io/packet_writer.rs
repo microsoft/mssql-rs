@@ -3,7 +3,7 @@
 
 use super::reader_writer::NetworkWriter;
 use crate::core::{CancelHandle, TdsResult};
-use crate::error::Error::TimeoutError;
+use crate::error::Error::{OperationCancelledError, TimeoutError};
 use crate::error::TimeoutErrorType;
 use crate::message::messages::{PacketStatusFlags, PacketType, ResetConnectionMode};
 use byteorder::{BigEndian, WriteBytesExt};
@@ -154,6 +154,24 @@ pub(crate) struct SuspendedMessage {
 }
 
 impl SuspendedMessage {
+    pub(crate) fn check_cancellation(&self) -> TdsResult<()> {
+        if self.cancel_handle.as_ref().is_some_and(|handle| {
+            handle.cancel_timeout_secs().is_some() && handle.cancel_token.is_cancelled()
+        }) {
+            Err(OperationCancelledError("Request was cancelled".to_string()))
+        } else {
+            Ok(())
+        }
+    }
+
+    pub(crate) fn cancellation_deadline(&self) -> Option<tokio::time::Instant> {
+        self.cancel_handle.as_ref().and_then(|handle| {
+            handle
+                .cancel_timeout_secs()
+                .map(|_| handle.settlement_deadline(std::time::Duration::ZERO))
+        })
+    }
+
     /// A polled send may have written bytes even if cancellation prevented it
     /// from completing. False proves the server never saw this message.
     pub(crate) fn send_attempted(&self) -> bool {
@@ -471,19 +489,38 @@ impl<'a> PacketWriter<'a> {
         );
         let data_slice = &self.payload_cursor.get_ref().as_slice()[..packet_length];
 
-        // Send the packet data. The write must complete fully — dropping a
-        // write future mid-flight leaves the TLS stream (especially SChannel
-        // on Windows) in an inconsistent internal state, which causes the
-        // next write to panic (issue #513). The timeout is checked *after*
-        // the write finishes so that the stream always remains in a clean
-        // state and attention packets can be sent safely on timeout.
-        let send_data_fut = CancelHandle::run_until_cancelled(self.cancel_handle.as_ref(), async {
+        let handle = self.cancel_handle.as_ref();
+        if handle.is_some_and(|handle| handle.cancel_token.is_cancelled()) {
+            return Err(OperationCancelledError("Request was cancelled".to_string()));
+        }
+        let send_data_fut = async {
             self.send_attempted = true;
             self.send_incomplete = true;
             self.network_writer.send(data_slice).await
-        });
-
-        send_data_fut.await?;
+        };
+        let mut cancelled = false;
+        if let Some(handle) = handle
+            && handle.cancel_timeout_secs().is_some()
+        {
+            tokio::pin!(send_data_fut);
+            tokio::select! {
+                biased;
+                result = &mut send_data_fut => result?,
+                () = handle.cancel_token.cancelled() => {
+                    cancelled = true;
+                    // Finish the same packet/TLS record before any withdrawal.
+                    // On expiry send_incomplete stays set: no further write is safe.
+                    tokio::time::timeout_at(
+                        handle.settlement_deadline(std::time::Duration::ZERO),
+                        &mut send_data_fut,
+                    ).await.map_err(|_| OperationCancelledError(
+                        "Cancellation timed out completing the current packet".to_string(),
+                    ))??;
+                }
+            }
+        } else {
+            CancelHandle::run_until_cancelled(handle, send_data_fut).await?;
+        }
         self.send_incomplete = false;
 
         // Set before anything that can fail below: once these bytes are on the
@@ -544,6 +581,9 @@ impl<'a> PacketWriter<'a> {
 
         // Restore the cursor position.
         self.payload_cursor.set_position(saved_position);
+        if cancelled {
+            return Err(OperationCancelledError("Request was cancelled".to_string()));
+        }
         Ok(())
     }
 

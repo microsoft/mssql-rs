@@ -1535,16 +1535,41 @@ struct StatementCancellation {
     active: bool,
     requested: bool,
     waiters: usize,
+    cancelling: bool,
 }
 
-pub(crate) struct StatementOperation<'a>(&'a StmtHandle);
+pub(crate) struct StatementOperation<'a> {
+    stmt: &'a StmtHandle,
+    active: bool,
+}
+
+impl StatementOperation<'_> {
+    /// Atomically finish a DAE call if cancellation did not arrive. Otherwise
+    /// retain ownership while its buffered/parked request is unwound.
+    pub(crate) fn finish_unless_cancelled(&mut self) -> Result<bool, odbc_types::SqlReturn> {
+        let Ok(mut state) = self.stmt.cancel.lock() else {
+            error!("finishing DAE operation: cancel mutex poisoned");
+            return Err(odbc_types::SQL_ERROR);
+        };
+        if state.requested {
+            return Ok(false);
+        }
+        state.active = false;
+        self.active = false;
+        self.stmt.operation_finished.notify_all();
+        Ok(true)
+    }
+}
 
 impl Drop for StatementOperation<'_> {
     fn drop(&mut self) {
-        match self.0.cancel.lock() {
+        if !self.active {
+            return;
+        }
+        match self.stmt.cancel.lock() {
             Ok(mut state) => {
                 state.active = false;
-                self.0.operation_finished.notify_all();
+                self.stmt.operation_finished.notify_all();
             }
             Err(_) => error!("finishing statement operation: cancel mutex poisoned"),
         }
@@ -1561,6 +1586,7 @@ impl Drop for StatementCancel<'_> {
         match self.stmt.cancel.lock() {
             Ok(mut state) => {
                 state.waiters -= 1;
+                state.cancelling = false;
                 self.stmt.operation_finished.notify_all();
             }
             Err(_) => error!("finishing cancellation: cancel mutex poisoned"),
@@ -1569,9 +1595,28 @@ impl Drop for StatementCancel<'_> {
 }
 
 impl StmtHandle {
+    #[cfg(test)]
+    pub(crate) fn cancellation_state_for_test(&self) -> (bool, bool) {
+        let state = self.cancel.lock().unwrap();
+        (state.active, state.requested)
+    }
+
+    fn cancel_timeout_secs(&self) -> Result<u32, odbc_types::SqlReturn> {
+        let Ok(state) = self.parent_dbc().inner.lock() else {
+            error!("reading cancellation timeout: dbc mutex poisoned");
+            return Err(odbc_types::SQL_ERROR);
+        };
+        Ok(if state.connection_timeout == 0 {
+            120
+        } else {
+            state.connection_timeout
+        })
+    }
+
     /// Track the whole call, including its final client hand-back and state
     /// updates. The guard holds no mutex across I/O.
     pub(crate) fn begin_operation(&self) -> Result<StatementOperation<'_>, odbc_types::SqlReturn> {
+        let timeout_secs = self.cancel_timeout_secs()?;
         let Ok(mut state) = self.cancel.lock() else {
             error!("starting statement operation: cancel mutex poisoned");
             return Err(odbc_types::SQL_ERROR);
@@ -1587,23 +1632,29 @@ impl StmtHandle {
         }
         state.active = true;
         state.requested = false;
-        Ok(StatementOperation(self))
+        state.handle.set_cancel_timeout_secs(timeout_secs);
+        Ok(StatementOperation {
+            stmt: self,
+            active: true,
+        })
     }
 
     /// Signal before waiting, and keep a new call from entering until this
     /// cancellation has finished inspecting any parked DAE state.
     pub(crate) fn cancel_operation(&self) -> Result<StatementCancel<'_>, odbc_types::SqlReturn> {
+        let timeout_secs = self.cancel_timeout_secs()?;
         let Ok(mut state) = self.cancel.lock() else {
             error!("cancelling statement operation: cancel mutex poisoned");
             return Err(odbc_types::SQL_ERROR);
         };
         let interrupted = state.active;
+        state.handle.set_cancel_timeout_secs(timeout_secs);
         if interrupted {
             state.requested = true;
             state.handle.cancel();
         }
         state.waiters += 1;
-        while state.active {
+        while state.active || state.cancelling {
             state = match self.operation_finished.wait(state) {
                 Ok(state) => state,
                 Err(_) => {
@@ -1612,6 +1663,7 @@ impl StmtHandle {
                 }
             };
         }
+        state.cancelling = true;
         Ok(StatementCancel {
             stmt: self,
             interrupted,
@@ -1626,7 +1678,11 @@ impl StmtHandle {
             error!("starting execution: cancel mutex poisoned");
             return Err(odbc_types::SQL_ERROR);
         };
+        let timeout_secs = cancel.handle.cancel_timeout_secs();
         cancel.handle = CancelHandle::new();
+        if let Some(seconds) = timeout_secs {
+            cancel.handle.set_cancel_timeout_secs(seconds);
+        }
         if cancel.requested {
             cancel.handle.cancel();
         }
@@ -1773,6 +1829,66 @@ impl Drop for StmtHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connection_timeout_reaches_existing_execution_children() {
+        let h = crate::test_support::TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { crate::handles::handle_from_raw::<StmtHandle>(h.stmt) };
+        let operation = stmt.begin_operation().unwrap();
+        let child = stmt.new_execution_cancel().unwrap();
+        assert_eq!(child.cancel_timeout_secs(), Some(120));
+        drop(operation);
+        stmt.parent_dbc().inner.lock().unwrap().connection_timeout = 2;
+        let fetch = stmt.begin_operation().unwrap();
+        assert_eq!(child.cancel_timeout_secs(), Some(2));
+        drop(fetch);
+        stmt.parent_dbc().inner.lock().unwrap().connection_timeout = 3;
+        let cancel = stmt.cancel_operation().unwrap();
+        assert_eq!(child.cancel_timeout_secs(), Some(3));
+        drop(cancel);
+    }
+
+    #[test]
+    fn concurrent_cancellers_serialize_cleanup_and_exclude_new_operations() {
+        use std::time::{Duration, Instant};
+        let h = crate::test_support::TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { crate::handles::handle_from_raw::<StmtHandle>(h.stmt) };
+        let operation = stmt.begin_operation().unwrap();
+        std::thread::scope(|scope| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let mut releases = Vec::new();
+            for id in 0..2 {
+                let tx = tx.clone();
+                let (release, released) = std::sync::mpsc::channel();
+                releases.push(release);
+                scope.spawn(move || {
+                    let cancellation = stmt.cancel_operation().unwrap();
+                    tx.send(id).unwrap();
+                    released.recv_timeout(Duration::from_secs(2)).unwrap();
+                    drop(cancellation);
+                });
+            }
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while stmt.cancel.lock().unwrap().waiters != 2 {
+                assert!(Instant::now() < deadline);
+                std::thread::yield_now();
+            }
+            scope.spawn(move || {
+                let _next = stmt.begin_operation().unwrap();
+                tx.send(2).unwrap();
+            });
+            drop(operation);
+            let first = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert!(first < 2);
+            assert!(rx.recv_timeout(Duration::from_millis(25)).is_err());
+            releases[first].send(()).unwrap();
+            let second = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert!(second < 2);
+            assert!(rx.recv_timeout(Duration::from_millis(25)).is_err());
+            releases[second].send(()).unwrap();
+            assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), 2);
+        });
+    }
 
     #[test]
     fn cancellation_waits_for_operation_cleanup_without_holding_statement_locks() {

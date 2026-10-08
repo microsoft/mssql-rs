@@ -817,7 +817,11 @@ where
         None
     } else {
         attention_stream.map(|stream| {
-            let deadline = Instant::now() + Duration::from_secs(ATTENTION_TIMEOUT_SECONDS);
+            let timeout = Duration::from_secs(ATTENTION_TIMEOUT_SECONDS);
+            let deadline = cancel_handle.map_or_else(
+                || Instant::now() + timeout,
+                |handle| handle.settlement_deadline(timeout),
+            );
             (deadline, stream)
         })
     };
@@ -6106,6 +6110,35 @@ pub(crate) mod tests {
             matches!(result, Err(TimeoutError(_))),
             "the caller must still see its timeout, got {result:?}"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn configured_cancel_timeout_bounds_attention_for_cancel_and_query_timeout() {
+        for seconds in [1, 7, 120] {
+            for cancelled in [false, true] {
+                let (mut transport, _written) =
+                    create_network_transport_with_live_peer_capturing_writes(&[]);
+                let mut handle = CancelHandle::new();
+                handle.set_cancel_timeout_secs(seconds);
+                if cancelled {
+                    handle.cancel();
+                }
+                let request_timeout = (!cancelled).then_some(Duration::from_millis(50));
+                let start = Instant::now();
+                let result = transport
+                    .receive_token(&ParserContext::None(()), request_timeout, Some(&handle))
+                    .await;
+                assert!(
+                    matches!(result, Err(OperationCancelledError(_))) && cancelled
+                        || matches!(result, Err(TimeoutError(_))) && !cancelled
+                );
+                assert_eq!(
+                    start.elapsed(),
+                    Duration::from_secs(u64::from(seconds)) + request_timeout.unwrap_or_default()
+                );
+                assert!(is_known_dead(&transport));
+            }
+        }
     }
 
     /// An unacknowledged ATTENTION leaves the TDS stream at an unknown point,

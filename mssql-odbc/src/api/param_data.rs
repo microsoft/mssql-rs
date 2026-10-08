@@ -89,10 +89,23 @@ fn sql_param_data_safe(
     stmt: &StmtHandle,
     value_ptr_ptr: *mut SqlPointer,
 ) -> SqlReturn {
-    let _operation = match stmt.begin_operation() {
+    let mut operation = match stmt.begin_operation() {
         Ok(operation) => operation,
         Err(rc) => return rc,
     };
+    let rc = sql_param_data_operation(statement_handle, stmt, value_ptr_ptr);
+    match operation.finish_unless_cancelled() {
+        Ok(true) => rc,
+        Ok(false) => super::exec_common::finish_cancelled_dae_call(stmt, statement_handle, rc),
+        Err(rc) => rc,
+    }
+}
+
+fn sql_param_data_operation(
+    statement_handle: SqlHandle,
+    stmt: &StmtHandle,
+    value_ptr_ptr: *mut SqlPointer,
+) -> SqlReturn {
     let dbc = stmt.parent_dbc();
 
     // ── Validate state ──────────────────────────────────────────────────────

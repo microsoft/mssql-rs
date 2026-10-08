@@ -2592,6 +2592,7 @@ impl TdsClient {
         .await;
         let message = packet_writer.suspend();
 
+        let result = result.and_then(|()| message.check_cancellation());
         match result {
             Ok(()) => {
                 // Chunk framed cleanly: re-park the message so the next chunk or
@@ -2610,16 +2611,7 @@ impl TdsClient {
                 Ok(())
             }
             Err(e) => {
-                // A partial value chunk is now on the wire, so this message can no
-                // longer be continued safely. Drop it and abort the streamed
-                // write rather than re-parking it as resumable.
-                let send_incomplete = message.send_incomplete();
-                drop(message);
-                if send_incomplete {
-                    self.retire_without_writing();
-                } else {
-                    self.abort_streamed_write().await;
-                }
+                self.retract_partial_request(message).await;
                 Err(e)
             }
         }
@@ -2746,23 +2738,20 @@ impl TdsClient {
             // instead, which is msodbcsql's `STATE_BATCH_CMDSENT` arm. The
             // transport marks itself dead if the attention goes unacknowledged.
             //
-            // Bounded by `ATTENTION_TIMEOUT_SECONDS`, not `CANCEL_TIMEOUT`:
-            // msodbcsql passes its 120s cancel budget here too, but an ACK that
-            // has not arrived in 5s is not coming, and the bulk-load abort takes
-            // the same bound for the same reason.
-            //
             // Dropped rather than abandoned: this message carried its reset bit
             // all the way out and `note_reset_dispatched` recorded it, so the
             // acknowledgement is already being tracked. Re-arming would send it
             // twice.
+            let timeout = message
+                .cancellation_deadline()
+                .map_or(Duration::from_secs(ATTENTION_TIMEOUT_SECONDS), |deadline| {
+                    deadline.saturating_duration_since(tokio::time::Instant::now())
+                });
             drop(message);
             // `send_attention_and_wait` logs its own timeouts, but the write
             // failure path returns without logging - and that is the one that
             // costs a connection.
-            if let Err(error) = self
-                .send_attention_with_timeout(Duration::from_secs(ATTENTION_TIMEOUT_SECONDS))
-                .await
-            {
+            if let Err(error) = self.send_attention_with_timeout(timeout).await {
                 warn!(%error, "Failed to cancel a fully sent request");
             }
             return;
@@ -2783,10 +2772,8 @@ impl TdsClient {
         }
     }
 
-    /// Closes an already-sent message with `EOM | IGNORE`, allowing 60 seconds
-    /// for the write and then 120 seconds to consume its DONE. A stalled write
-    /// hits the 120-second outer deadline and skips the drain. msodbcsql instead
-    /// allows 120 seconds for each sequential leg.
+    /// Withdraws with `EOM | IGNORE`. A configured cancellation budget covers
+    /// the write and drain together; otherwise the historical TDS limits apply.
     async fn withdraw_sent_message(&mut self, message: SuspendedMessage) -> Withdrawal {
         // Cached read, not `is_connection_dead`: that one `try_read`s a byte,
         // which here could swallow the server's answer to the half-written
@@ -2801,10 +2788,15 @@ impl TdsClient {
         // Read before `resume` takes it: the server discards an ignored message
         // whole, so a reset bit already on the wire has to ride a later request.
         let carried_reset = message.reset_mode();
+        let deadline = message.cancellation_deadline();
 
         let mut packet_writer = PacketWriter::resume(
             message
-                .with_write_timeout(Some(CANCEL_WRITE_TIMEOUT_SECS))
+                .with_write_timeout(if deadline.is_some() {
+                    None
+                } else {
+                    Some(CANCEL_WRITE_TIMEOUT_SECS)
+                })
                 .without_cancellation(),
             self.transport.as_writer(),
         );
@@ -2812,8 +2804,11 @@ impl TdsClient {
         // ignore packet needs an outer deadline too. Reaching that one means the
         // write never came back, so the future is dropped mid-record and the
         // transport is retired without being written to again.
-        let ignored =
-            tokio::time::timeout(CANCEL_TIMEOUT, packet_writer.cancel_current_message()).await;
+        let ignored = tokio::time::timeout_at(
+            deadline.unwrap_or_else(|| tokio::time::Instant::now() + CANCEL_TIMEOUT),
+            packet_writer.cancel_current_message(),
+        )
+        .await;
         let message = packet_writer.suspend();
         let send_incomplete = message.send_incomplete();
         drop(message);
@@ -2834,9 +2829,26 @@ impl TdsClient {
 
         // The server acknowledges an ignored message with a DONE. Leaving it
         // unread would desynchronize the next command.
-        let saved_timeout = self.remaining_request_timeout.replace(CANCEL_TIMEOUT);
+        let budget = deadline.map_or(CANCEL_TIMEOUT, |deadline| {
+            deadline.saturating_duration_since(tokio::time::Instant::now())
+        });
+        let saved_timeout = self.remaining_request_timeout.replace(budget);
         let saved_cancel = self.cancel_handle.take();
-        let drained = self.drain_stream().await;
+        let drained = if let Some(deadline) = deadline {
+            match tokio::time::timeout_at(deadline, self.drain_stream()).await {
+                Ok(result) => result,
+                Err(_) => {
+                    self.retire_without_writing();
+                    Err(crate::error::Error::TimeoutError(
+                        crate::error::TimeoutErrorType::String(
+                            "Timed out draining an ignored request".to_string(),
+                        ),
+                    ))
+                }
+            }
+        } else {
+            self.drain_stream().await
+        };
         self.cancel_handle = saved_cancel;
         self.remaining_request_timeout = saved_timeout;
         match drained {
@@ -3110,6 +3122,8 @@ impl TdsClient {
             }
         }
 
+        let write_outcome =
+            write_outcome.and_then(|next| message.check_cancellation().map(|()| next));
         match write_outcome {
             // Another streamed parameter is now open for data.
             Ok(Some(next_name)) => {
@@ -4109,6 +4123,16 @@ impl TdsClient {
         let declaration_params = first_params.clone();
         RpcParameter::reject_data_at_exec(declaration_params.iter())?;
         let mut opts = options.into();
+        // Do not start cleanup for an already-cancelled batch. Once admitted,
+        // internal unprepare itself remains uncancellable.
+        if opts
+            .cancel
+            .is_some_and(|handle| handle.cancel_token.is_cancelled())
+        {
+            return Err(crate::error::Error::OperationCancelledError(
+                "Request was cancelled before starting its prepared batch".to_string(),
+            ));
+        }
         self.current_command_ce_setting = opts.column_encryption;
         if self.should_encrypt_parameters() {
             return Err(UsageError(
@@ -20571,6 +20595,111 @@ mod tests {
                 "request budget {request_budget:?} must not reach the withdrawal"
             );
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn configured_cancel_finishes_the_packet_then_withdraws_streamed_data() {
+        for finish_parameter in [false, true] {
+            let mut cancel = CancelHandle::new();
+            cancel.set_cancel_timeout_secs(2);
+            let mut transport = TestTransport::with_tokens(vec![done_no_more()]);
+            transport.send_delay = Some(Duration::from_millis(500));
+            let sent = Arc::clone(&transport.sent);
+            let attentions = Arc::clone(&transport.attentions);
+            let mut client = create_test_client_with_transport(transport);
+            client
+                .begin_sp_executesql(
+                    "SELECT @p".to_string(),
+                    vec![streamed_varbinary("@p")],
+                    ExecuteOptions::new().cancel(&cancel),
+                )
+                .await
+                .unwrap();
+            let task = tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                cancel.cancel();
+            });
+            let start = tokio::time::Instant::now();
+            let error = if finish_parameter {
+                client.end_streamed_param().await.unwrap_err()
+            } else {
+                client
+                    .write_streamed_chunk(&vec![7; 10_000])
+                    .await
+                    .unwrap_err()
+            };
+            task.await.unwrap();
+            assert!(matches!(
+                error,
+                crate::error::Error::OperationCancelledError(_)
+            ));
+            assert_eq!(start.elapsed(), Duration::from_millis(500));
+            assert!(!client.is_connection_dead());
+            assert!(matches!(
+                client.streamed_write_state,
+                StreamedWriteState::Idle
+            ));
+            let bytes = sent.lock().unwrap();
+            if finish_parameter {
+                assert_eq!(attentions.load(std::sync::atomic::Ordering::SeqCst), 1);
+                assert_eq!(bytes[1] & 1, 1);
+            } else {
+                assert_eq!(attentions.load(std::sync::atomic::Ordering::SeqCst), 0);
+                assert_eq!(&bytes[bytes.len() - 8..bytes.len() - 4], &[3, 3, 0, 8]);
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn configured_cancel_retires_a_packet_that_cannot_finish() {
+        let mut cancel = CancelHandle::new();
+        cancel.set_cancel_timeout_secs(1);
+        let mut transport = TestTransport::new();
+        transport.cancel_during_send = Some(cancel.cancel_token.clone());
+        let sent = Arc::clone(&transport.sent);
+        let closes = Arc::clone(&transport.close_calls);
+        let mut client = create_test_client_with_transport(transport);
+        client
+            .begin_sp_executesql(
+                "SELECT @p".to_string(),
+                vec![streamed_varbinary("@p")],
+                ExecuteOptions::new().cancel(&cancel),
+            )
+            .await
+            .unwrap();
+        let start = tokio::time::Instant::now();
+        let error = client
+            .write_streamed_chunk(&vec![7; 10_000])
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            crate::error::Error::OperationCancelledError(_)
+        ));
+        assert_eq!(start.elapsed(), Duration::from_secs(1));
+        assert!(client.is_connection_dead());
+        assert_eq!(
+            sent.lock().unwrap().len(),
+            8,
+            "no IGNORE, ATTENTION or TLS shutdown after a partial packet"
+        );
+        assert_eq!(closes.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn configured_withdrawal_shares_the_original_cancellation_deadline() {
+        let (mut client, observed) = create_timeout_observing_client(vec![done_no_more()]);
+        let mut cancel = CancelHandle::new();
+        cancel.set_cancel_timeout_secs(3);
+        let message = suspend_message_under(&mut client, 10_000, Some(&cancel)).await;
+        cancel.cancel();
+        tokio::time::advance(Duration::from_secs(1)).await;
+        client.retract_partial_request(message).await;
+        assert_eq!(
+            *observed.lock().unwrap(),
+            vec![Some(Duration::from_secs(2))]
+        );
+        assert!(!client.is_connection_dead());
     }
 
     /// A parked streamed write owns the connection until it closes. A second

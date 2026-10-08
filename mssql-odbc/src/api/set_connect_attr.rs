@@ -344,15 +344,15 @@ unsafe fn sql_set_connect_attr_w_impl(
                 SQL_SUCCESS
             }
         }
-        // Standard attributes the Driver Manager sets before connecting. Stored
-        // rather than discarded so `SQLGetConnectAttrW` reports back what was
-        // set; none of them changes behaviour on the wire yet.
-        // TODO: honor these (connection timeout, packet size, access mode).
+        // Access mode remains stored-only; packet size is a login setting.
         SQL_ATTR_ACCESS_MODE => {
             state.access_mode = value_ptr as usize as u32;
             SQL_SUCCESS
         }
         SQL_ATTR_CONNECTION_TIMEOUT => {
+            // Statement cancellation reads this at entry and again when signalled.
+            // Zero selects the native driver's 120-second cancellation default.
+            // General non-cancellation network-I/O timeout enforcement is separate.
             // Shares msodbcsql's clamp with SQL_ATTR_LOGIN_TIMEOUT
             // (`sqlcmisc.cpp:1733-1741`), but names this attribute in the
             // warning rather than reusing msodbcsql's "Login timeout changed".

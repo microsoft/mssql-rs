@@ -216,6 +216,108 @@ mod tests {
         dbc.inner.lock().unwrap().client = Some(client);
     }
 
+    #[test]
+    fn cancellation_during_buffered_dae_calls_unwinds_before_returning() {
+        use crate::api::odbc_types::*;
+        use std::time::{Duration, Instant};
+
+        for phase in ["put", "empty_put", "null_put", "first_param", "next_param"] {
+            let h = TestHandles::with_env_dbc_stmt();
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let dbc = stmt.parent_dbc();
+            let _server = crate::test_support::connect_mock_server(
+                dbc,
+                "SELECT 1",
+                mssql_mock_tds::QueryResponse::select_one(),
+            );
+            let sql: Vec<u16> = "SELECT ? + ?".encode_utf16().collect();
+            assert_eq!(SQL_SUCCESS, unsafe {
+                crate::api::SQLPrepareW(h.stmt, sql.as_ptr(), i16::try_from(sql.len()).unwrap())
+            });
+            let mut indicators = [SQL_DATA_AT_EXEC; 2];
+            let mut tokens = [0u8; 2];
+            for index in 0..2 {
+                assert_eq!(SQL_SUCCESS, unsafe {
+                    crate::api::SQLBindParameter(
+                        h.stmt,
+                        (index + 1) as u16,
+                        SQL_PARAM_INPUT,
+                        SQL_C_CHAR,
+                        SQL_INTEGER,
+                        10,
+                        0,
+                        tokens.as_mut_ptr().add(index).cast(),
+                        0,
+                        indicators.as_mut_ptr().add(index),
+                    )
+                });
+            }
+            assert_eq!(SQL_NEED_DATA, unsafe { crate::api::SQLExecute(h.stmt) });
+            let mut token = std::ptr::null_mut();
+            if phase != "first_param" {
+                assert_eq!(SQL_NEED_DATA, unsafe {
+                    crate::api::SQLParamData(h.stmt, &mut token)
+                });
+            }
+            let mut value = b'7';
+            if phase == "next_param" {
+                assert_eq!(SQL_SUCCESS, unsafe {
+                    crate::api::SQLPutData(h.stmt, (&mut value as *mut u8).cast(), 1)
+                });
+            }
+            let raw = h.stmt as usize;
+            std::thread::scope(|scope| {
+                // Stop the worker after operation registration but before it
+                // reads/modifies DAE state, so cancellation cannot miss the call.
+                let state = stmt.inner.lock().unwrap();
+                let worker = scope.spawn(move || unsafe {
+                    if phase.ends_with("param") {
+                        let mut token = std::ptr::null_mut();
+                        crate::api::SQLParamData(raw as SqlHandle, &mut token)
+                    } else {
+                        let mut value = b'7';
+                        crate::api::SQLPutData(
+                            raw as SqlHandle,
+                            (&mut value as *mut u8).cast(),
+                            match phase {
+                                "empty_put" => 0,
+                                "null_put" => SQL_NULL_DATA,
+                                _ => 1,
+                            },
+                        )
+                    }
+                });
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while !stmt.cancellation_state_for_test().0 {
+                    assert!(
+                        Instant::now() < deadline,
+                        "{phase}: operation did not start"
+                    );
+                    std::thread::yield_now();
+                }
+                let cancel =
+                    scope.spawn(move || unsafe { crate::api::SQLCancel(raw as SqlHandle) });
+                while !stmt.cancellation_state_for_test().1 {
+                    assert!(Instant::now() < deadline, "{phase}: cancel did not signal");
+                    std::thread::yield_now();
+                }
+                drop(state);
+                assert_eq!(SQL_SUCCESS, cancel.join().unwrap());
+                assert!(!stmt.inner.lock().unwrap().needs_data());
+                assert_eq!(
+                    stmt.inner.lock().unwrap().diag_records[0].sql_state,
+                    *b"HY008"
+                );
+                assert_eq!(SQL_ERROR, worker.join().unwrap(), "{phase}");
+            });
+            let sql: Vec<u16> = "SELECT 1".encode_utf16().collect();
+            assert_eq!(SQL_SUCCESS, unsafe {
+                crate::api::SQLExecDirectW(h.stmt, sql.as_ptr(), i16::try_from(sql.len()).unwrap())
+            });
+            assert_eq!(SQL_SUCCESS, unsafe { crate::api::SQLFetch(h.stmt) });
+        }
+    }
+
     #[derive(Clone, Copy, Debug)]
     enum CursorPhase {
         Fetch,
@@ -227,7 +329,7 @@ mod tests {
         Close,
     }
 
-    fn cancel_cursor_phase(phase: CursorPhase, acknowledge: bool) {
+    fn cancel_cursor_phase(phase: CursorPhase, acknowledge: bool, stall: bool) {
         use crate::api::odbc_types::*;
         use crate::handles::stmt::STMT_STATE_CURSOR_OPEN;
         use mssql_mock_tds::protocol::{build_attention_ack_packet, build_query_result};
@@ -323,6 +425,9 @@ mod tests {
                             attention_tx.send(()).unwrap();
                             settle_rx.take().unwrap().await.unwrap();
                             if !acknowledge {
+                                if stall {
+                                    tokio::time::sleep(Duration::from_secs(3)).await;
+                                }
                                 break;
                             }
                             socket.write_all(&tail).await.unwrap();
@@ -408,6 +513,18 @@ mod tests {
             );
         }
         let raw = h.stmt as usize;
+        if stall {
+            // Change after execution to verify the current connection attribute,
+            // not the execute-time snapshot, controls SQLCancel's deadline.
+            assert_eq!(SQL_SUCCESS, unsafe {
+                crate::api::SQLSetConnectAttrW(
+                    h.dbc,
+                    SQL_ATTR_CONNECTION_TIMEOUT,
+                    1usize as SqlPointer,
+                    0,
+                )
+            });
+        }
         std::thread::scope(|scope| {
             let operation = scope.spawn(move || unsafe {
                 let raw = raw as SqlHandle;
@@ -450,6 +567,7 @@ mod tests {
                 std::thread::yield_now();
             }
             let (cancel_tx, cancel_rx) = std::sync::mpsc::channel();
+            let cancelled_at = Instant::now();
             let cancel = scope.spawn(move || {
                 let rc = unsafe { crate::api::SQLCancel(raw as SqlHandle) };
                 cancel_tx.send(rc).unwrap();
@@ -467,6 +585,10 @@ mod tests {
                 SQL_SUCCESS,
                 cancel_rx.recv_timeout(Duration::from_secs(5)).unwrap()
             );
+            if stall {
+                assert!(cancelled_at.elapsed() >= Duration::from_secs(1));
+                assert!(cancelled_at.elapsed() < Duration::from_secs(2));
+            }
             // Do not join the operation before checking the cancellation fence.
             {
                 let state = stmt.inner.lock().unwrap();
@@ -510,13 +632,18 @@ mod tests {
             CursorPhase::MoreResults,
             CursorPhase::Close,
         ] {
-            cancel_cursor_phase(phase, true);
+            cancel_cursor_phase(phase, true, false);
         }
     }
 
     #[test]
     fn failed_cursor_cancellation_settlement_retires_connection() {
-        cancel_cursor_phase(CursorPhase::Fetch, false);
+        cancel_cursor_phase(CursorPhase::Fetch, false, false);
+    }
+
+    #[test]
+    fn connection_timeout_bounds_sql_cancel_and_retires_unacknowledged_connection() {
+        cancel_cursor_phase(CursorPhase::Fetch, false, true);
     }
 
     fn cancel_blocked(h: &TestHandles, execute: impl FnOnce(SqlHandle) -> SqlReturn + Send) {
