@@ -79,3 +79,4 @@ extends:
         buildRustCrates: true
         isOfficial: false
         publishToFeed: ${{ parameters.publishToFeed }}
+        buildMssqlSqlcmd: true

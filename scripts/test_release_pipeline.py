@@ -14,8 +14,10 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tarfile
 import xml.etree.ElementTree as ET
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -26,12 +28,14 @@ from test_verify_python_wheels import write_wheel_matrix
 _ROOT = Path(__file__).parents[1]
 _PIPELINE = _ROOT / ".pipeline" / "OneBranch" / "OfficialPythonWheelsRelease.yml"
 _PYPI_PIPELINE = _ROOT / ".pipeline" / "OneBranch" / "PyPIRelease.yml"
+_SQLCMD_RELEASE_PIPELINE = _ROOT / ".pipeline" / "OneBranch" / "OfficialMssqlSqlcmdRelease.yml"
 _BUILD_STAGES = _ROOT / ".pipeline" / "OneBranch" / "stages.yml"
 _WHEEL_INSTALL_TEMPLATE = (
     _ROOT / ".pipeline" / "templates" / "test-python-wheel-installs-template.yml"
 )
 _METADATA = _ROOT / ".pipeline" / "scripts" / "get-python-release-metadata.ps1"
 _VERIFY_WHEELS_SCRIPT = _ROOT / ".pipeline" / "scripts" / "verify-python-wheels.ps1"
+_SQLCMD_PACK_SCRIPT = _ROOT / ".pipeline" / "scripts" / "pack-mssql-sqlcmd.ps1"
 _SWITCHES = (
     "publishNuGet",
     "publishMssqlTds",
@@ -412,6 +416,584 @@ def test_pypi_publish_requires_both_stable_branches(
     )
 
     assert (result.returncode == 0) == succeeds
+
+
+def _sqlcmd_release_job(publish: bool) -> dict:
+    pipeline = expand(
+        yaml.safe_load(_SQLCMD_RELEASE_PIPELINE.read_text(encoding="utf-8")),
+        {"publishNuGet": publish},
+    )
+    stages = pipeline["extends"]["parameters"]["stages"]
+    assert len(stages) == 1 and len(stages[0]["jobs"]) == 1
+    return stages[0]["jobs"][0]
+
+
+def _sqlcmd_release_step(publish: bool, name: str) -> dict:
+    return next(
+        step for step in _sqlcmd_release_job(publish)["steps"] if step.get("displayName") == name
+    )
+
+
+@pytest.mark.parametrize("publish", [False, True])
+def test_sqlcmd_release_gates_precede_download(publish: bool) -> None:
+    source = yaml.safe_load(_SQLCMD_RELEASE_PIPELINE.read_text(encoding="utf-8"))
+    assert source["parameters"] == [
+        {
+            "name": "publishNuGet",
+            "displayName": "Publish the mssql-sqlcmd NuGet package to Azure Artifacts",
+            "type": "boolean",
+            "default": False,
+        }
+    ]
+    assert source["trigger"] == "none"
+    assert source["pr"] == "none"
+
+    job = _sqlcmd_release_job(publish)
+    assert job["variables"]["ob_nugetPublishing_enabled"] == _literal(publish)
+    steps = job["steps"]
+    names = [step.get("displayName") for step in steps]
+    downloads = [i for i, step in enumerate(steps) if step.get("download") == "officialBuild"]
+    assert len(downloads) == 1
+
+    assert names.count("Require a successful Official Build") == 1
+    assert names.index("Require a successful Official Build") < downloads[0]
+    assert steps[names.index("Require a successful Official Build")]["env"] == {
+        "OFFICIAL_BUILD_RUN_ID": "$(resources.pipeline.officialBuild.runID)",
+        "SYSTEM_ACCESSTOKEN": "$(System.AccessToken)",
+        "SYSTEM_COLLECTIONURI": "$(System.CollectionUri)",
+        "SYSTEM_TEAMPROJECTID": "$(System.TeamProjectId)",
+    }
+
+    assert names.count("Require the stable branch for publish") == int(publish)
+    assert ("Stage the mssql-sqlcmd package for publishing" in names) == publish
+    if publish:
+        stable = names.index("Require the stable branch for publish")
+        assert stable < downloads[0]
+        assert steps[stable]["env"] == {
+            "RELEASE_SOURCE_BRANCH": "$(Build.SourceBranch)",
+            "OFFICIAL_BUILD_SOURCE_BRANCH": "$(resources.pipeline.officialBuild.sourceBranch)",
+        }
+
+
+@pytest.mark.parametrize(
+    ("run_id", "status", "result", "succeeds"),
+    [
+        ("123", "completed", "succeeded", True),
+        ("123", "completed", "failed", False),
+        ("123", "completed", "partiallySucceeded", False),
+        ("123", "completed", "canceled", False),
+        ("123", "completed", "Succeeded", False),
+        ("123", "inProgress", "", False),
+        ("123", "notStarted", "", False),
+        ("not-a-number", "completed", "succeeded", False),
+        ("", "completed", "succeeded", False),
+    ],
+)
+def test_sqlcmd_release_requires_successful_official_build(
+    run_id: str, status: str, result: str, succeeds: bool
+) -> None:
+    script = _sqlcmd_release_step(False, "Require a successful Official Build")["pwsh"]
+    stub = r"""
+    function Invoke-RestMethod {
+        param($Method, $Uri, $Headers)
+        Write-Host 'Builds API called'
+        if ($Method -cne 'Get') { throw "Unexpected method: $Method" }
+        if ($Uri -cne 'https://dev.azure.com/test/project-id/_apis/build/builds/123?api-version=7.1') {
+            throw "Unexpected URI: $Uri"
+        }
+        if ($Headers.Authorization -cne 'Bearer test-token') {
+            throw "Unexpected authorization header"
+        }
+        [pscustomobject]@{
+            status = $env:MOCK_BUILD_STATUS
+            result = $env:MOCK_BUILD_RESULT
+        }
+    }
+    """
+    completed = subprocess.run(
+        ["pwsh", "-NoProfile", "-Command", stub + script],
+        capture_output=True,
+        text=True,
+        check=False,
+        env={
+            **os.environ,
+            "OFFICIAL_BUILD_RUN_ID": run_id,
+            "SYSTEM_ACCESSTOKEN": "test-token",
+            "SYSTEM_COLLECTIONURI": "https://dev.azure.com/test/",
+            "SYSTEM_TEAMPROJECTID": "project-id",
+            "MOCK_BUILD_STATUS": status,
+            "MOCK_BUILD_RESULT": result,
+        },
+    )
+
+    assert (completed.returncode == 0) == succeeds, completed.stderr
+    if succeeds:
+        assert "Selected Official Build 123 is completed and succeeded." in completed.stdout
+    elif run_id != "123":
+        assert f"Invalid Official Build run ID: {run_id}" in completed.stderr
+        assert "Builds API called" not in completed.stdout
+    else:
+        assert (
+            f"Official Build 123 is not eligible for release: status='{status}', "
+            f"result='{result}'."
+        ) in completed.stderr
+
+
+@pytest.mark.parametrize(
+    ("release_branch", "build_branch", "error"),
+    [
+        ("refs/heads/stable", "refs/heads/stable", None),
+        ("refs/heads/main", "refs/heads/stable", "allowed only from refs/heads/stable"),
+        ("refs/heads/STABLE", "refs/heads/stable", "allowed only from refs/heads/stable"),
+        ("refs/heads/stable", "refs/heads/main", "an Official Build produced from"),
+        ("refs/heads/stable", "refs/heads/STABLE", "an Official Build produced from"),
+        ("refs/heads/stable", "", "an Official Build produced from"),
+    ],
+)
+def test_sqlcmd_publish_requires_both_stable_branches(
+    release_branch: str, build_branch: str, error: str | None
+) -> None:
+    script = _sqlcmd_release_step(True, "Require the stable branch for publish")["pwsh"]
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-Command", script],
+        capture_output=True,
+        text=True,
+        check=False,
+        env={
+            **os.environ,
+            "RELEASE_SOURCE_BRANCH": release_branch,
+            "OFFICIAL_BUILD_SOURCE_BRANCH": build_branch,
+        },
+    )
+
+    assert (result.returncode == 0) == (error is None), result.stderr
+    if error:
+        assert error in result.stderr
+
+
+_SQLCMD_PACKAGE_ENTRIES = (
+    "include/mssql_sqlcmd.h",
+    "runtimes/win-x64/native/mssql_sqlcmd.lib",
+    "runtimes/win-x86/native/mssql_sqlcmd.lib",
+    "runtimes/win-arm64/native/mssql_sqlcmd.lib",
+    "runtimes/linux-x64/native/libmssql_sqlcmd.a",
+    "runtimes/linux-arm64/native/libmssql_sqlcmd.a",
+    "runtimes/linux-musl-x64/native/libmssql_sqlcmd.a",
+    "runtimes/linux-musl-arm64/native/libmssql_sqlcmd.a",
+    "runtimes/osx-x64/native/libmssql_sqlcmd.a",
+    "runtimes/osx-arm64/native/libmssql_sqlcmd.a",
+) + tuple(
+    f"runtimes/{rid}/native/native-static-libs.txt"
+    for rid in (
+        "win-x64",
+        "win-x86",
+        "win-arm64",
+        "linux-x64",
+        "linux-arm64",
+        "linux-musl-x64",
+        "linux-musl-arm64",
+        "osx-x64",
+        "osx-arm64",
+    )
+)
+
+# Stands in for the feed's flat-container index. MOCK_FEED is a comma-separated
+# list of published versions, an HTTP status code to fail with, or
+# "noresponse" for a failure with no HTTP response at all.
+_SQLCMD_FEED_STUB = r"""
+function Invoke-RestMethod {
+    param($Uri, $Headers)
+    Write-Host 'Feed queried'
+    if ($Uri -cne 'https://pkgs.dev.azure.com/sqlclientdrivers/public/_packaging/mssql-rs_Public/nuget/v3/flat2/mssql-sqlcmd/index.json') {
+        throw "Unexpected URI: $Uri"
+    }
+    if ($Headers.Authorization -cne 'Bearer test-token') {
+        throw 'Unexpected authorization header'
+    }
+    if ($env:MOCK_FEED -eq 'noresponse') {
+        throw [System.Net.Http.HttpRequestException]::new('No such host is known.')
+    }
+    if ($env:MOCK_FEED -match '^\d+$') {
+        $status = [System.Net.HttpStatusCode][int]$env:MOCK_FEED
+        throw [Microsoft.PowerShell.Commands.HttpResponseException]::new(
+            "Response status code does not indicate success: $([int]$status).",
+            [System.Net.Http.HttpResponseMessage]::new($status))
+    }
+    [pscustomobject]@{ versions = @($env:MOCK_FEED -split ',' | Where-Object { $_ }) }
+}
+"""
+
+
+def run_sqlcmd_package_validation(
+    tmp_path: Path, packages: dict[str, tuple[str, ...]], feed: str
+) -> subprocess.CompletedProcess[str]:
+    drop = tmp_path / "workspace" / "officialBuild" / "drop_Build_MssqlSqlcmd_Package"
+    drop.mkdir(parents=True)
+    for name, entries in packages.items():
+        with zipfile.ZipFile(drop / name, "w") as archive:
+            for entry in entries:
+                archive.writestr(entry, b"content")
+
+    script = (
+        _sqlcmd_release_step(False, "Validate the mssql-sqlcmd package")["pwsh"]
+        .replace("$(Pipeline.Workspace)", str(tmp_path / "workspace"))
+        .replace("$(resources.pipeline.officialBuild.runID)", "123")
+        .replace("$(resources.pipeline.officialBuild.sourceCommit)", "abc123")
+    )
+    assert not re.search(r"\$\([A-Za-z][\w.]*\)", script), "an unexpanded pipeline macro"
+    return subprocess.run(
+        ["pwsh", "-NoProfile", "-Command", _SQLCMD_FEED_STUB + script],
+        capture_output=True,
+        text=True,
+        check=False,
+        env={**os.environ, "SYSTEM_ACCESSTOKEN": "test-token", "MOCK_FEED": feed},
+    )
+
+
+@pytest.mark.parametrize("feed", ["404", "0.0.9,0.0.10"])
+def test_sqlcmd_release_validation_accepts_a_complete_unpublished_version(
+    tmp_path: Path, feed: str
+) -> None:
+    result = run_sqlcmd_package_validation(
+        tmp_path, {"mssql-sqlcmd.0.1.0.nupkg": _SQLCMD_PACKAGE_ENTRIES}, feed
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "Package: mssql-sqlcmd.0.1.0.nupkg from build 123 (abc123)" in result.stdout
+    assert "Feed queried" in result.stdout
+    assert "mssql-sqlcmd 0.1.0 is not on the feed yet." in result.stdout
+    assert "##vso[task.setvariable variable=packageVersion]0.1.0" in result.stdout
+    path = re.search(r"##vso\[task\.setvariable variable=packagePath\](.+)", result.stdout)
+    assert path and Path(path[1].strip()).name == "mssql-sqlcmd.0.1.0.nupkg"
+
+
+@pytest.mark.parametrize("feed", ["0.0.9,0.1.0", "0.1.0"])
+def test_sqlcmd_release_validation_rejects_a_published_version(
+    tmp_path: Path, feed: str
+) -> None:
+    result = run_sqlcmd_package_validation(
+        tmp_path, {"mssql-sqlcmd.0.1.0.nupkg": _SQLCMD_PACKAGE_ENTRIES}, feed
+    )
+
+    assert result.returncode != 0
+    assert "mssql-sqlcmd 0.1.0 is already on mssql-rs_Public" in result.stderr
+    assert "##vso[task.setvariable" not in result.stdout
+
+
+@pytest.mark.parametrize("version", ["0.1.0-dev.20261005.1", "0.1.0-nightly.20261005"])
+def test_sqlcmd_release_validation_rejects_a_prerelease(tmp_path: Path, version: str) -> None:
+    result = run_sqlcmd_package_validation(
+        tmp_path, {f"mssql-sqlcmd.{version}.nupkg": _SQLCMD_PACKAGE_ENTRIES}, "404"
+    )
+
+    assert result.returncode != 0
+    assert f"mssql-sqlcmd {version} is a prerelease" in result.stderr
+    assert "Feed queried" not in result.stdout
+
+
+@pytest.mark.parametrize("missing", _SQLCMD_PACKAGE_ENTRIES)
+def test_sqlcmd_release_validation_requires_every_runtime(
+    tmp_path: Path, missing: str
+) -> None:
+    entries = tuple(entry for entry in _SQLCMD_PACKAGE_ENTRIES if entry != missing)
+    result = run_sqlcmd_package_validation(
+        tmp_path, {"mssql-sqlcmd.0.1.0.nupkg": entries}, "404"
+    )
+
+    assert result.returncode != 0
+    assert f"The package is missing: {missing}" in result.stderr
+    assert "Feed queried" not in result.stdout
+
+
+@pytest.mark.parametrize("count", [0, 2])
+def test_sqlcmd_release_validation_requires_exactly_one_package(
+    tmp_path: Path, count: int
+) -> None:
+    packages = {
+        f"mssql-sqlcmd.0.1.{patch}.nupkg": _SQLCMD_PACKAGE_ENTRIES for patch in range(count)
+    }
+    result = run_sqlcmd_package_validation(tmp_path, packages, "404")
+
+    assert result.returncode != 0
+    assert "Expected one mssql-sqlcmd package" in result.stderr
+    assert f"found {count}" in result.stderr
+
+
+@pytest.mark.parametrize("feed", ["500", "401", "noresponse"])
+def test_sqlcmd_release_validation_fails_when_the_feed_cannot_be_read(
+    tmp_path: Path, feed: str
+) -> None:
+    result = run_sqlcmd_package_validation(
+        tmp_path, {"mssql-sqlcmd.0.1.0.nupkg": _SQLCMD_PACKAGE_ENTRIES}, feed
+    )
+
+    assert result.returncode != 0
+    assert "Feed queried" in result.stdout
+    assert "is not on the feed yet" not in result.stdout
+    assert "##vso[task.setvariable" not in result.stdout
+
+
+_SQLCMD_RIDS = (
+    "win-x64",
+    "win-x86",
+    "win-arm64",
+    "linux-x64",
+    "linux-arm64",
+    "linux-musl-x64",
+    "linux-musl-arm64",
+    "osx-x64",
+    "osx-arm64",
+)
+
+
+def _sqlcmd_library(rid: str) -> str:
+    return "mssql_sqlcmd.lib" if rid.startswith("win-") else "libmssql_sqlcmd.a"
+
+
+def write_sqlcmd_artifacts(
+    root: Path,
+    rids: tuple[str, ...] = _SQLCMD_RIDS,
+    versions: tuple[str, ...] = ("0.1.0",),
+    skip: str | None = None,
+) -> None:
+    """Lay out downloaded build artifacts as the package job receives them: one
+    drop per build job, each with runtimes/<rid>/native, and the version the
+    Windows build records."""
+    for rid in rids:
+        drop = "Windows" if rid.startswith("win-") else rid.replace("-", "_")
+        native = root / f"drop_Build_MssqlSqlcmd_{drop}" / "runtimes" / rid / "native"
+        native.mkdir(parents=True, exist_ok=True)
+        for name in (_sqlcmd_library(rid), "native-static-libs.txt"):
+            if f"{rid}/{name}" != skip:
+                (native / name).write_text(f"{rid} {name}\n", encoding="utf-8")
+    for index, version in enumerate(versions):
+        drop = root / f"drop_Build_MssqlSqlcmd_Windows{index or ''}"
+        drop.mkdir(parents=True, exist_ok=True)
+        (drop / "mssql-sqlcmd-version.txt").write_text(f"{version}\n", encoding="ascii")
+
+
+def run_sqlcmd_pack(tmp_path: Path, *arguments: str) -> tuple[subprocess.CompletedProcess[str], Path]:
+    staging = tmp_path / "staging"
+    result = subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-File",
+            str(_SQLCMD_PACK_SCRIPT),
+            "-ArtifactsDirectory",
+            str(tmp_path / "artifacts"),
+            "-StagingDirectory",
+            str(staging),
+            *arguments,
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return result, staging
+
+
+def _packed_version(result: subprocess.CompletedProcess[str]) -> str:
+    match = re.search(r"##vso\[task\.setvariable variable=mssqlSqlcmdVersion\](\S+)", result.stdout)
+    assert match, result.stdout + result.stderr
+    return match[1]
+
+
+def test_sqlcmd_pack_stages_every_runtime_and_writes_the_nuspec(tmp_path: Path) -> None:
+    write_sqlcmd_artifacts(tmp_path / "artifacts")
+    result, staging = run_sqlcmd_pack(
+        tmp_path, "-IsOfficial", "True", "-BuildId", "7", "-SourceVersion", "abc123"
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert _packed_version(result) == "0.1.0"
+    for rid in _SQLCMD_RIDS:
+        native = staging / "runtimes" / rid / "native"
+        assert (native / _sqlcmd_library(rid)).read_text(encoding="utf-8").startswith(rid)
+        assert (native / "native-static-libs.txt").is_file()
+    assert (staging / "include" / "mssql_sqlcmd.h").read_bytes() == (
+        _ROOT / "mssql-sqlcmd" / "include" / "mssql_sqlcmd.h"
+    ).read_bytes()
+    assert (staging / "README.md").is_file() and (staging / "LICENSE.txt").is_file()
+
+    nuspec = ET.parse(staging / "mssql-sqlcmd.nuspec").getroot()
+    ns = {"n": "http://schemas.microsoft.com/packaging/2013/05/nuspec.xsd"}
+    assert nuspec.findtext("n:metadata/n:id", namespaces=ns) == "mssql-sqlcmd"
+    assert nuspec.findtext("n:metadata/n:version", namespaces=ns) == "0.1.0"
+    assert nuspec.find("n:metadata/n:repository", ns).get("commit") == "abc123"
+    nuspec_path = re.search(r"variable=mssqlSqlcmdNuspec\](.+)", result.stdout)
+    assert nuspec_path and Path(nuspec_path[1].strip()) == staging / "mssql-sqlcmd.nuspec"
+
+
+@pytest.mark.parametrize(
+    ("arguments", "pattern"),
+    [
+        (("-IsOfficial", "True", "-BuildReason", "Manual"), r"0\.1\.0"),
+        # An official build is never suffixed, whatever started it.
+        (("-IsOfficial", "True", "-BuildReason", "Schedule"), r"0\.1\.0"),
+        (("-IsOfficial", "False", "-BuildReason", "Schedule"), r"0\.1\.0-nightly\.\d{8}"),
+        (("-IsOfficial", "False", "-BuildReason", "IndividualCI", "-BuildId", "42"), r"0\.1\.0-dev\.\d{8}\.42"),
+        (("-IsOfficial", "False", "-BuildReason", "Manual", "-BuildId", "43"), r"0\.1\.0-dev\.\d{8}\.43"),
+        (("-BuildId", "44",), r"0\.1\.0-dev\.\d{8}\.44"),
+    ],
+)
+def test_sqlcmd_pack_versions_official_nightly_and_dev_builds(
+    tmp_path: Path, arguments: tuple[str, ...], pattern: str
+) -> None:
+    write_sqlcmd_artifacts(tmp_path / "artifacts")
+    result, _ = run_sqlcmd_pack(tmp_path, *arguments)
+
+    assert result.returncode == 0, result.stderr
+    assert re.fullmatch(pattern, _packed_version(result))
+
+
+def test_sqlcmd_pack_accepts_matching_recorded_versions(tmp_path: Path) -> None:
+    write_sqlcmd_artifacts(tmp_path / "artifacts", versions=("0.2.0", "0.2.0"))
+    result, _ = run_sqlcmd_pack(tmp_path, "-IsOfficial", "True")
+
+    assert result.returncode == 0, result.stderr
+    assert _packed_version(result) == "0.2.0"
+
+
+def test_sqlcmd_pack_rejects_conflicting_recorded_versions(tmp_path: Path) -> None:
+    write_sqlcmd_artifacts(tmp_path / "artifacts", versions=("0.1.0", "0.2.0"))
+    result, _ = run_sqlcmd_pack(tmp_path, "-IsOfficial", "True")
+
+    assert result.returncode != 0
+    assert "The artifacts record different mssql-sqlcmd versions: 0.1.0, 0.2.0" in result.stderr
+
+
+@pytest.mark.skipif(shutil.which("cargo") is None, reason="needs cargo for the fallback")
+def test_sqlcmd_pack_falls_back_to_cargo_metadata(tmp_path: Path) -> None:
+    write_sqlcmd_artifacts(tmp_path / "artifacts", versions=())
+    result, _ = run_sqlcmd_pack(tmp_path, "-IsOfficial", "True")
+
+    crate = (_ROOT / "mssql-sqlcmd" / "Cargo.toml").read_text(encoding="utf-8")
+    expected = re.search(r'^version = "([^"]+)"', crate, re.MULTILINE)[1]
+    assert result.returncode == 0, result.stderr
+    assert _packed_version(result) == expected
+
+
+@pytest.mark.parametrize(
+    "missing",
+    [f"{rid}/{_sqlcmd_library(rid)}" for rid in _SQLCMD_RIDS]
+    + [f"{rid}/native-static-libs.txt" for rid in ("win-x64", "linux-musl-arm64", "osx-x64")],
+)
+def test_sqlcmd_pack_requires_every_runtime(tmp_path: Path, missing: str) -> None:
+    write_sqlcmd_artifacts(tmp_path / "artifacts", skip=missing)
+    result, _ = run_sqlcmd_pack(tmp_path, "-IsOfficial", "True")
+
+    assert result.returncode != 0
+    assert f"Missing from the build artifacts: {missing}" in result.stderr
+    assert "variable=mssqlSqlcmdVersion" not in result.stdout
+
+
+def test_sqlcmd_pack_rejects_a_runtime_from_two_artifacts(tmp_path: Path) -> None:
+    write_sqlcmd_artifacts(tmp_path / "artifacts")
+    duplicate = tmp_path / "artifacts" / "drop_Extra" / "runtimes" / "linux-x64" / "native"
+    duplicate.mkdir(parents=True)
+    (duplicate / "libmssql_sqlcmd.a").write_text("other\n", encoding="utf-8")
+    result, _ = run_sqlcmd_pack(tmp_path, "-IsOfficial", "True")
+
+    assert result.returncode != 0
+    assert "Runtime linux-x64 was staged by more than one artifact" in result.stderr
+
+
+# Stands in for cargo: metadata reports FAKE_TARGET_DIR the way cargo resolves
+# [build] target-dir, and rustc writes a "fresh" archive there. The Unix build
+# script has its own test, .pipeline/scripts/test_build_mssql_sqlcmd_native.py,
+# which the Linux validation job runs.
+_FAKE_CARGO = """\
+import json, os, sys
+args = sys.argv[1:]
+target_dir = os.environ["FAKE_TARGET_DIR"]
+if args and args[0] == "metadata":
+    packages = [{"name": "mssql-sqlcmd", "version": "0.1.0"}]
+    print(json.dumps({"packages": packages, "target_directory": target_dir}, separators=(",", ":")))
+elif args and args[0] == "rustc":
+    target = args[args.index("--target") + 1]
+    release = os.path.join(target_dir, target, "release")
+    os.makedirs(release, exist_ok=True)
+    name = "mssql_sqlcmd.lib" if "windows" in target else "libmssql_sqlcmd.a"
+    with open(os.path.join(release, name), "w") as archive:
+        archive.write("fresh\\n")
+    print("note: native-static-libs: -lfake", file=sys.stderr)
+"""
+
+
+def _sqlcmd_native_build_fixture(tmp_path: Path, script: str) -> tuple[Path, dict[str, str]]:
+    """A repository holding only the build script, with a stale archive in the
+    default target/ and cargo configured to build elsewhere."""
+    repo = tmp_path / "repo"
+    scripts = repo / ".pipeline" / "scripts"
+    scripts.mkdir(parents=True)
+    shutil.copy2(_ROOT / ".pipeline" / "scripts" / script, scripts / script)
+
+    for target, name in (
+        ("x86_64-pc-windows-msvc", "mssql_sqlcmd.lib"),
+        ("x86_64-unknown-linux-gnu", "libmssql_sqlcmd.a"),
+    ):
+        stale = repo / "target" / target / "release"
+        stale.mkdir(parents=True)
+        (stale / name).write_text("stale\n", encoding="utf-8")
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "fake_cargo.py").write_text(_FAKE_CARGO, encoding="utf-8")
+    for tool, body in (("cargo", '"$(dirname "$0")/fake_cargo.py"'), ("rustup", None)):
+        if sys.platform == "win32":
+            run = f'@"{sys.executable}" "%~dp0fake_cargo.py" %*' if body else "@exit /b 0"
+            (bin_dir / f"{tool}.cmd").write_text(run + "\r\n", encoding="ascii")
+        else:
+            run = f'exec "{sys.executable}" {body} "$@"' if body else "exit 0"
+            stub = bin_dir / tool
+            stub.write_text(f"#!/usr/bin/env bash\n{run}\n", newline="\n")
+            stub.chmod(0o755)
+
+    env = {k: v for k, v in os.environ.items() if k != "CARGO_TARGET_DIR"}
+    env["PATH"] = str(bin_dir) + os.pathsep + env["PATH"]
+    env["FAKE_TARGET_DIR"] = str(tmp_path / "configured-target")
+    return repo, env
+
+
+@pytest.mark.skipif(shutil.which("pwsh") is None, reason="needs pwsh")
+def test_sqlcmd_windows_build_stages_from_cargos_target_directory(tmp_path: Path) -> None:
+    repo, env = _sqlcmd_native_build_fixture(tmp_path, "build-mssql-sqlcmd-native.ps1")
+    out = tmp_path / "out"
+    result = subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-File",
+            str(repo / ".pipeline" / "scripts" / "build-mssql-sqlcmd-native.ps1"),
+            "-OutputDirectory",
+            str(out),
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    for rid in ("win-x64", "win-x86", "win-arm64"):
+        native = out / "runtimes" / rid / "native"
+        assert (native / "mssql_sqlcmd.lib").read_text(encoding="utf-8") == "fresh\n"
+        assert (native / "native-static-libs.txt").read_text(encoding="ascii").strip() == "-lfake"
+    assert (out / "mssql-sqlcmd-version.txt").read_text(encoding="ascii").strip() == "0.1.0"
+
+
+def test_sqlcmd_pack_takes_required_runtimes_as_one_comma_separated_argument(
+    tmp_path: Path,
+) -> None:
+    # `pwsh -File` passes a list as a single string.
+    write_sqlcmd_artifacts(tmp_path / "artifacts", rids=("win-x64", "linux-x64"))
+    result, staging = run_sqlcmd_pack(
+        tmp_path, "-IsOfficial", "True", "-RequiredRids", "win-x64, linux-x64"
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert sorted(p.name for p in (staging / "runtimes").iterdir()) == ["linux-x64", "win-x64"]
 
 
 def prepare_pypi_release(tmp_path: Path, *, duplicate: bool = False):

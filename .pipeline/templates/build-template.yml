@@ -141,7 +141,7 @@ steps:
 
   - script: |
         export CERT_HOST_NAME="sql1"
-        cargo llvm-cov nextest ${{ parameters.testFilter }} --frozen --no-report --all-targets --package mssql-tds --package mssqlodbc --no-fail-fast --profile ci --success-output immediate
+        cargo llvm-cov nextest ${{ parameters.testFilter }} --frozen --no-report --all-targets --package mssql-tds --package mssqlodbc --package mssql-sqlcmd --no-fail-fast --profile ci --success-output immediate
     displayName: Run tests (mssql-tds and mssqlodbc packages)
     condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
     env:
@@ -160,7 +160,7 @@ steps:
   # `test_client_support.rs` is test-only scaffolding (gated behind the
   # `test-util` feature) used to drive a `TdsClient` from scripted tokens in
   # unit tests; it is not product code, so it is excluded from coverage.
-  - script: cargo llvm-cov report --package mssql-tds --package mssqlodbc --ignore-filename-regex 'test_client_support\.rs' --lcov --output-path "$(Build.SourcesDirectory)/target/lcov.info"
+  - script: cargo llvm-cov report --package mssql-tds --package mssqlodbc --package mssql-sqlcmd --ignore-filename-regex 'test_client_support\.rs' --lcov --output-path "$(Build.SourcesDirectory)/target/lcov.info"
     condition: and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'))
     workingDirectory: "$(Build.SourcesDirectory)"
     displayName: Save code coverage in lcov format (mssql-tds and mssqlodbc)
@@ -180,7 +180,7 @@ steps:
   # with the mssql-py-core Python report and publishes the single combined
   # report to the ADO coverage tab, because ADO does not merge coverage across
   # stages/jobs. The merged report is what the GitHub diff-cover workflow uses.
-  - script: cargo llvm-cov report --package mssql-tds --package mssqlodbc --ignore-filename-regex 'test_client_support\.rs' --cobertura --output-path "$(Build.SourcesDirectory)/target/cobertura.xml"
+  - script: cargo llvm-cov report --package mssql-tds --package mssqlodbc --package mssql-sqlcmd --ignore-filename-regex 'test_client_support\.rs' --cobertura --output-path "$(Build.SourcesDirectory)/target/cobertura.xml"
     condition: and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'))
     workingDirectory: "$(Build.SourcesDirectory)"
     displayName: Save code coverage in Cobertura format (mssql-tds and mssqlodbc)
