@@ -799,6 +799,29 @@ mod tests {
             crate::api::SQLExecDirectW(h.stmt, sql.as_ptr(), i16::try_from(sql.len()).unwrap())
         });
         assert_eq!(SQL_SUCCESS, unsafe { crate::api::SQLFetch(h.stmt) });
+        assert_eq!(SQL_SUCCESS, unsafe {
+            crate::api::SQLFreeStmt(h.stmt, SQL_CLOSE)
+        });
+
+        // A continued execution reuses the statement's handle without
+        // replacing it; the settled signal must not have left it latched.
+        assert_eq!(
+            SQL_SUCCESS,
+            finish_after_late_cancel(stmt, h.stmt, SQL_SUCCESS)
+        );
+        let continued = stmt.execution_cancel().unwrap();
+        let mut client = dbc.inner.lock().unwrap().client.take().unwrap();
+        dbc.runtime.block_on(async {
+            client
+                .execute(
+                    "SELECT 1".to_string(),
+                    mssql_tds::connection::tds_client::ExecuteOptions::new().cancel(&continued),
+                )
+                .await
+                .unwrap();
+            client.close_query().await.unwrap();
+        });
+        dbc.inner.lock().unwrap().client = Some(client);
     }
 
     fn cancel_blocked(h: &TestHandles, execute: impl FnOnce(SqlHandle) -> SqlReturn + Send) {

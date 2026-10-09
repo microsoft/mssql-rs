@@ -1585,6 +1585,16 @@ struct StatementCancellation {
     cancelling: bool,
 }
 
+impl StatementCancellation {
+    fn replace_handle(&mut self) {
+        let timeout_secs = self.handle.cancel_timeout_secs();
+        self.handle = CancelHandle::new();
+        if let Some(seconds) = timeout_secs {
+            self.handle.set_cancel_timeout_secs(seconds);
+        }
+    }
+}
+
 pub(crate) struct StatementOperation<'a> {
     stmt: &'a StmtHandle,
     active: bool,
@@ -1615,6 +1625,11 @@ impl Drop for StatementOperation<'_> {
         }
         match self.stmt.cancel.lock() {
             Ok(mut state) => {
+                // This call settled the signal; the latched token must not
+                // reach a later call that reuses the statement's handle.
+                if state.requested {
+                    state.replace_handle();
+                }
                 state.active = false;
                 self.stmt.operation_finished.notify_all();
             }
@@ -1725,11 +1740,7 @@ impl StmtHandle {
             error!("starting execution: cancel mutex poisoned");
             return Err(odbc_types::SQL_ERROR);
         };
-        let timeout_secs = cancel.handle.cancel_timeout_secs();
-        cancel.handle = CancelHandle::new();
-        if let Some(seconds) = timeout_secs {
-            cancel.handle.set_cancel_timeout_secs(seconds);
-        }
+        cancel.replace_handle();
         if cancel.requested {
             cancel.handle.cancel();
         }
