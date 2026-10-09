@@ -410,7 +410,11 @@ on; these guarantees were verified against msodbcsql's behavior.
   accepting the statement execution claim; a rejected concurrent call must not
   replace the active execution's correlation. Propagate context explicitly to
   blocking/native workers with `trace_context::propagate`. Never retain a
-  thread-local guard across an independently scheduled future.
+  thread-local guard across an independently scheduled future; wrap spawned
+  futures with `trace_context::propagate_future`, which scopes each poll.
+  Include internal metadata RPCs such as uncached `SQLDescribeParam` when
+  identifying execution entry points; cached answers must not activate a new
+  result execution.
 - Verify diagnostic identifiers against wire bytes and the reference driver's
   API representation. PRELOGIN TRACEID contains connection GUID, activity GUID,
   then sequence, with Microsoft GUID byte order. The ODBC client-connection-ID

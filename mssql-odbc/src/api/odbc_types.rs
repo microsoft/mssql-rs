@@ -66,6 +66,9 @@ pub const SQL_COPT_SS_INTEGRATED_SECURITY: SqlInteger = 1203;
 pub const SQL_COPT_SS_ENCRYPT: SqlInteger = 1223;
 pub const SQL_COPT_SS_TRUST_SERVER_CERTIFICATE: SqlInteger = 1228;
 
+/// Physical client connection GUID string. Get-only; requires a connection.
+pub const SQL_COPT_SS_CLIENT_CONNECTION_ID: SqlInteger = 1233;
+
 /// `SQL_COPT_SS_WARN_ON_CP_ERROR` (`SQL_COPT_SS_BASE_EX + 3`). Takes
 /// [`SQL_WARN_NO`] / [`SQL_WARN_YES`]; see
 /// [`DbcState::warn_on_cp_error`](crate::handles::dbc::DbcState::warn_on_cp_error).
@@ -914,7 +917,6 @@ pub const SQL_SOPT_SS_NOCOUNT_STATUS: SqlInteger = 1231;
 pub const SQL_SOPT_SS_DEFER_PREPARE: SqlInteger = 1232;
 /// Query-notification subscription timeout, in seconds.
 pub const SQL_SOPT_SS_QUERYNOTIFICATION_TIMEOUT: SqlInteger = 1233;
-pub const SQL_COPT_SS_CLIENT_CONNECTION_ID: SqlInteger = 1233;
 /// Query-notification message text. String-valued.
 pub const SQL_SOPT_SS_QUERYNOTIFICATION_MSGTEXT: SqlInteger = 1234;
 /// Query-notification service/broker options. String-valued.

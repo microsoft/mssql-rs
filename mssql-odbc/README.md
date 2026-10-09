@@ -242,6 +242,10 @@ the process-identifying filenames when combining captures. A reconnect changes
 environment-wide calls, invalid handles, and connection attempts before PRELOGIN
 have `cid=-`. Authentication workers retain the identity of the attempt that
 started them, even if a timeout lets a later attempt begin.
+MultiSubnetFailover connection tasks carry context during each future poll;
+TCP attempts have `cid=-` until PRELOGIN supplies a GUID. `SQLDescribeParam`
+metadata RPCs have their own execution sequence; cached descriptions do not
+replace the active result's sequence.
 Diagnostic retrieval logs identify the connection and statement but omit `exec`:
 a rejected concurrent call may have replaced diagnostics without replacing the
 active result. Use the generating call's error/return event for its execution ID.

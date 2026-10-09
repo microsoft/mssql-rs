@@ -220,6 +220,7 @@ fn sql_describe_param_safe(
             }
         };
         stmt_state.set_state(STMT_STATE_EXEC_STARTED);
+        mssql_tds::trace_context::activate_execution();
         (sql, marker_count, return_status, stmt_state.query_timeout)
     };
 

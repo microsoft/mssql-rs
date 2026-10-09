@@ -325,6 +325,7 @@ pub(crate) fn starts_execution(api: &str) -> bool {
         api,
         "SQLExecute"
             | "SQLExecDirectW"
+            | "SQLDescribeParam"
             | "SQLTablesW"
             | "SQLColumnsW"
             | "SQLPrimaryKeysW"
@@ -1109,6 +1110,92 @@ mod tests {
         mssql_tds::trace_context::enable();
         tracing::subscriber::with_default(subscriber, work);
         String::from_utf8(output.lock().unwrap().clone()).unwrap()
+    }
+
+    #[test]
+    fn describe_parameter_rpcs_start_executions_but_cached_reads_do_not_activate_them() {
+        use crate::api::SQLDescribeParam;
+        use crate::api::odbc_types::{SQL_ERROR, SQL_INTEGER, SQL_NULLABLE, SQL_SUCCESS};
+        use crate::handles::stmt::{ParameterDescription, PreparedPlan};
+        use crate::handles::{DbcHandle, StmtHandle, handle_from_raw};
+        use crate::test_support::TestHandles;
+        use mssql_tds::connection::tds_client::PreparedStatement;
+        use mssql_tds::test_client_support::{done_no_more, sql_error, tds_client_from_tokens};
+
+        let id = uuid::Uuid::new_v4();
+        let output = capture_correlation(|| {
+            let h = TestHandles::with_env_dbc_stmt();
+            h.mark_dbc_connected();
+            let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+            dbc.trace.establish(id);
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            stmt.inner.lock().unwrap().prepared = Some(PreparedPlan {
+                stmt: PreparedStatement::new("SELECT @P1".to_string()),
+                marker_count: 1,
+                original_sql: "SELECT ?".to_string(),
+            });
+            let describe = |parameter| unsafe {
+                SQLDescribeParam(
+                    h.stmt,
+                    parameter,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            };
+            for execution in 1..=2 {
+                dbc.inner.lock().unwrap().client = Some(tds_client_from_tokens(vec![
+                    sql_error(11529, 16, "no metadata could be determined"),
+                    done_no_more(),
+                ]));
+                assert_eq!(describe(1), SQL_ERROR);
+                let _scope = unsafe { context_for(h.stmt, "SQLRowCount") }.enter();
+                assert_eq!(mssql_tds::trace_context::snapshot().exec, Some(execution));
+            }
+            stmt.inner
+                .lock()
+                .unwrap()
+                .parameter_metadata
+                .push(ParameterDescription {
+                    data_type: SQL_INTEGER,
+                    parameter_size: 10,
+                    decimal_digits: 0,
+                    nullable: SQL_NULLABLE,
+                });
+            assert_eq!(describe(1), SQL_SUCCESS);
+            assert_eq!(describe(0), SQL_ERROR);
+            let _scope = unsafe { context_for(h.stmt, "SQLRowCount") }.enter();
+            assert_eq!(mssql_tds::trace_context::snapshot().exec, Some(2));
+        });
+        let cid = format!("cid={} ", id.to_string().to_uppercase());
+        for execution in 1..=2 {
+            let execution = format!("exec={execution} ");
+            let lines: Vec<_> = output
+                .lines()
+                .filter(|line| line.contains(&execution))
+                .collect();
+            assert!(
+                lines
+                    .iter()
+                    .any(|line| line.contains("SQLDescribeParam called"))
+            );
+            assert!(lines.iter().any(|line| line.contains(", mssql_tds::")));
+            assert!(
+                lines
+                    .iter()
+                    .any(|line| line.contains("SQLDescribeParam: metadata RPC failed"))
+            );
+            assert!(
+                lines.iter().any(|line| line.contains(", DEBUG, ")
+                    && line.contains("SQLDescribeParam returning"))
+            );
+            assert!(
+                lines
+                    .iter()
+                    .all(|line| line.contains(&cid) && line.contains("stmt="))
+            );
+        }
     }
 
     #[test]

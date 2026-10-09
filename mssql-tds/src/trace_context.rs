@@ -293,6 +293,29 @@ where
     }
 }
 
+/// Captures the caller's context for an independently scheduled future.
+/// Enters only while polling, preserving changes between polls without leaving
+/// connection identity installed on an idle executor thread.
+pub fn propagate_future<F: std::future::Future>(
+    future: F,
+) -> impl std::future::Future<Output = F::Output> {
+    let mut context = enabled().then(Context::capture);
+    async move {
+        let mut future = std::pin::pin!(future);
+        std::future::poll_fn(move |cx| {
+            let Some(context) = context.as_mut() else {
+                return future.as_mut().poll(cx);
+            };
+            let scope = std::mem::take(context).enter();
+            let result = future.as_mut().poll(cx);
+            *context = CURRENT.with(RefCell::take);
+            drop(scope);
+            result
+        })
+        .await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -307,6 +330,100 @@ mod tests {
             std::thread::spawn(work).join().unwrap(),
             Snapshot::default()
         );
+        let future = propagate_future(async { snapshot() });
+        assert_eq!(
+            std::thread::spawn(|| futures::executor::block_on(future))
+                .join()
+                .unwrap(),
+            Snapshot::default()
+        );
+    }
+
+    #[test]
+    fn propagated_future_restores_each_worker_and_keeps_updates_across_polls() {
+        use std::future::{Future, poll_fn};
+        use std::task::{Context as TaskContext, Poll, Waker};
+
+        enable();
+        let connection = Arc::new(ConnectionTrace::default());
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        connection.establish(first);
+        let (mut future, expected) = {
+            let _scope = Context::connection(Arc::clone(&connection)).enter();
+            let expected = snapshot();
+            let mut polls = 0;
+            let future = propagate_future(poll_fn(move |_| {
+                polls += 1;
+                assert_eq!(snapshot().dbc, expected.dbc);
+                match polls {
+                    1 => {
+                        assert_eq!(snapshot().cid, Some(first));
+                        connection.begin_attempt(second);
+                        Poll::Pending
+                    }
+                    2 => {
+                        assert_eq!(snapshot().cid, Some(second));
+                        Poll::Ready(snapshot())
+                    }
+                    _ => panic!("future polled after completion"),
+                }
+            }));
+            (Box::pin(future), expected)
+        };
+        future = std::thread::spawn(move || {
+            let _worker = Context::connection(Arc::default()).enter();
+            let worker = snapshot();
+            assert!(
+                future
+                    .as_mut()
+                    .poll(&mut TaskContext::from_waker(Waker::noop()))
+                    .is_pending()
+            );
+            assert_eq!(snapshot(), worker);
+            future
+        })
+        .join()
+        .unwrap();
+        let result = std::thread::spawn(move || {
+            let result = future
+                .as_mut()
+                .poll(&mut TaskContext::from_waker(Waker::noop()));
+            assert_eq!(snapshot(), Snapshot::default());
+            result
+        })
+        .join()
+        .unwrap();
+        assert_eq!(
+            result,
+            Poll::Ready(Snapshot {
+                cid: Some(second),
+                ..expected
+            })
+        );
+        assert_eq!(snapshot(), Snapshot::default());
+    }
+
+    #[test]
+    fn propagated_future_restores_context_when_poll_panics() {
+        use std::future::Future;
+        use std::task::{Context as TaskContext, Waker};
+
+        enable();
+        let mut future = {
+            let _scope = Context::connection(Arc::default()).enter();
+            Box::pin(propagate_future(async {
+                assert!(snapshot().dbc.is_some());
+                panic!("poll failed");
+            }))
+        };
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            future
+                .as_mut()
+                .poll(&mut TaskContext::from_waker(Waker::noop()))
+        }));
+        assert!(result.is_err());
+        assert_eq!(snapshot(), Snapshot::default());
     }
 
     #[test]
