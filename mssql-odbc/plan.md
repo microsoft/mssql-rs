@@ -120,7 +120,27 @@ status describes the current crate, not merely whether supporting code exists in
 - SQLBindCol
 - SQLNumResultCols, SQLDescribeCol, SQLRowCount
 - SQLMoreResults for multi-statement batches
-- SQLCancel for query cancellation and timeout handling
+- SQLCancel: core token plumbing and cross-thread synchronous execute cancellation
+  (AB#49222), including statement-owned metadata RPCs and deferred SQLParamData
+  execution; interrupted calls report HY008 and settle ATTENTION before reuse.
+  The same handle covers implicit transaction startup and orphan-handle cleanup
+  performed within those calls; standalone connection transaction APIs are unchanged.
+  Parked data-at-execution unwind remains supported. Fetch/SQLGetData/SQLMoreResults
+  and cursor-close cancellation (AB#49223) clear cursor/stream state and release
+  the connection claim before SQLCancel returns. Cancellation signals before
+  waiting for the active operation's completion; an immediate SQLFreeStmt(SQL_CLOSE)
+  is safe without joining the caller thread. Cancellation discovered during
+  read-ahead reports HY008 on that call, not a subsequent fetch. A signal that
+  arrives after a call's last read is settled by that call: a still-pending
+  response is abandoned with ATTENTION and the call reports HY008, while a
+  fully received response is left intact.
+  In-flight SQLPutData/SQLParamData cancellation (AB#49224) also unwinds
+  buffered calls. Pending packet writes finish within the cancellation budget
+  before state-aware withdrawal; an uncertain packet or failed acknowledgement
+  retires the connection. SQL_ATTR_CONNECTION_TIMEOUT supplies that budget,
+  with 120 seconds when zero, across packet completion and response settlement.
+  General network-I/O timeout enforcement and ODBC async execution remain out
+  of scope. AB#49222, AB#49223, and AB#49224 ship together.
 - SQLPrepare / SQLExecute via **deferred prepare**: the first `SQLExecute`
   prepares and runs in one round trip with `sp_prepexec`, caches the returned
   handle, and subsequent executes reuse it via `sp_execute` (a rebind or

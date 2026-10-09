@@ -914,8 +914,8 @@ msodbcsql build is measured.
     makes it a supported application path that reaches the driver normally. A
     `--compare-with-msodbcsql` case that writes the descriptor from one thread
     while another is blocked in `SQLFetch`/`SQLExecute` would close it. That
-    case does not exist yet: the e2e suite has no two-thread fixture outside
-    `session_recovery_test`, and the Rust unit tests reach the refusal by
+    case does not exist yet: the e2e suite does not exercise concurrent
+    descriptor-header writes, and the Rust unit tests reach the refusal by
     setting `STMT_STATE_FETCH_IN_PROGRESS` / `STMT_STATE_EXEC_STARTED`
     directly rather than through a real in-flight call. Until it does, treat
     the msodbcsql half of this entry as read from source and not observed.
@@ -924,3 +924,41 @@ msodbcsql build is measured.
     status and rows-processed pointers, and to every header-alias attribute
     plus `SQL_ROWSET_SIZE`, which is ARD-resident without being an alias and
     so reaches the same `readers_through` walk through `set_desc_header`.
+27. **Cancellation of a blocked `SQLMoreResults` reports `SQL_ERROR` / `HY008`
+    rather than silently ending result navigation.** In the measured sequence
+    (an unread large first row, `WAITFOR`, then a second result), native
+    `SQLMoreResults` returns `SQL_NO_DATA` after cross-thread cancellation.
+    Its synchronous path flushes the old result and reports no data when the
+    batch no longer owns pending results (`Sql/Ntdbms/sqlncli/odbc/sqlcresl.cpp`,
+    `ExportImp::SQLMoreResults`, the `!IsBusyWithMe` / no-results branch at
+    lines 238-246); the explicit cancellation-to-`IDS_S1_008` check at lines
+    170-185 is in its asynchronous branch.
+
+    This driver preserves the explicit cancellation outcome across execute,
+    fetch, GetData, and MoreResults instead of treating cancellation as normal
+    exhaustion. This does not change teardown ordering: both drivers settle the
+    interrupted operation before successful cross-thread SQLCancel returns, so
+    immediately calling SQLFreeStmt(SQL_CLOSE) is safe.
+
+    The same choice covers a signal that lands after the call's last read but
+    before it returns. msodbcsql's `SQLCancel` sends ATTN while that call still
+    holds `csStmt` (`sqlcmisc.cpp:759`), and the next call to read the batch
+    reports `HY008` (`sqlccmd.cpp:11821-11826`). This driver settles the
+    pending response in the call that was interrupted, so `HY008` is reported
+    one call earlier and a cancellation never reaches a later call or a
+    subsequent close. A response already fully received is left intact in both
+    drivers. This half is read from source and covered by Rust unit tests; it
+    has not been measured against native, because the window is not
+    reproducible from an application.
+
+    **Evidence level: measured.** The `CancelLiveTest` MoreResults cases record
+    `SQL_DRIVER_VER` and assert each driver's exact return code. Measured on
+    Linux through unixODBC with `Threading=0`, native library
+    `libmsodbcsql-18.6.so.1.1` / `SQL_DRIVER_VER=18.06.0001`, against SQL Server
+    2025 CU9 (`17.0.5005.3`). The same sequence was also measured through
+    Windows Driver Manager against native `SQL_DRIVER_VER=18.06.0001` with
+    the same result. Other native builds have not been measured.
+
+    Explicitly approved by the requester on 2026-10-07 for
+    [AB#49223](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/49223):
+    retain HY008, document the difference, and match native teardown ordering.

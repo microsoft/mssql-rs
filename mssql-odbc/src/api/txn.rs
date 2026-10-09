@@ -12,6 +12,7 @@
 //! `NoChange` and inherits the session setting.
 
 use mssql_tds::connection::tds_client::{ExecuteOptions, TdsClient};
+use mssql_tds::core::CancelHandle;
 use mssql_tds::message::transaction_management::TransactionIsolationLevel;
 use tracing::{debug, error};
 
@@ -336,6 +337,9 @@ pub(super) fn end_transaction(dbc: &DbcHandle, commit: bool, op: &str) -> SqlRet
 /// The transaction-manager request carries `NoChange` so it inherits the
 /// session isolation level already applied by `SET TRANSACTION ISOLATION LEVEL`.
 ///
+/// The owning statement's cancellation handle also bounds startup and settlement;
+/// standalone connection-scoped transaction operations do not use this helper.
+///
 /// This runs before every statement, so it is a hot path: both steady states
 /// (autocommit on, and manual-commit with a transaction already open and
 /// recorded) cost exactly one lock and no network round trip. The DBC lock is
@@ -345,6 +349,7 @@ pub(super) fn begin_transaction_if_manual(
     client: &mut TdsClient,
     op: &str,
     timeout_secs: u32,
+    cancel: &CancelHandle,
 ) -> Result<(), mssql_tds::error::Error> {
     let (autocommit, already_recorded) = match dbc.inner.lock() {
         Ok(state) => (state.autocommit, state.local_tran_started),
@@ -359,31 +364,36 @@ pub(super) fn begin_transaction_if_manual(
         return Ok(());
     }
 
-    if client.has_active_transaction() {
+    let result = if client.has_active_transaction() {
         // Steady state: transaction already open and already recorded, so there
         // is nothing to write back and no reason to retake the lock.
         if already_recorded {
             return Ok(());
         }
+        Ok(())
     } else {
         debug!("{op}: manual-commit mode with no active transaction — beginning one");
-        dbc.runtime.block_on(client.begin_transaction_with_options(
-            TransactionIsolationLevel::NoChange,
-            None,
-            ExecuteOptions::new().timeout_secs(timeout_secs),
-        ))?;
-    }
+        dbc.runtime.block_on(
+            client.begin_transaction_with_options(
+                TransactionIsolationLevel::NoChange,
+                None,
+                ExecuteOptions::new()
+                    .timeout_secs(timeout_secs)
+                    .cancel(cancel),
+            ),
+        )
+    };
 
-    // The transaction is open on the server at this point; failing to record it
-    // would leak it past commit/rollback and past disconnect.
+    // ATTENTION may arrive after BEGIN succeeded. Preserve the transaction
+    // state observed during settlement even when the owning statement is cancelled.
     let Ok(mut state) = dbc.inner.lock() else {
         error!("{op}: dbc mutex poisoned recording transaction state");
         return Err(mssql_tds::error::Error::ImplementationError(
             "connection state is poisoned".to_string(),
         ));
     };
-    state.local_tran_started = true;
-    Ok(())
+    state.local_tran_started = client.has_active_transaction();
+    result
 }
 
 /// Applies `SQL_ATTR_AUTOCOMMIT`.
@@ -1020,6 +1030,21 @@ pub(super) fn apply_post_connect_txn_settings(dbc: &DbcHandle) -> SqlReturn {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn implicit_begin_records_server_transaction_even_when_its_response_fails() {
+        use mssql_tds::test_client_support::{
+            env_change_begin_transaction, tds_client_from_tokens,
+        };
+        let h = crate::test_support::TestHandles::with_env_dbc_stmt();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        dbc.inner.lock().unwrap().autocommit = false;
+        let mut client = tds_client_from_tokens(vec![env_change_begin_transaction(42)]);
+        let result = begin_transaction_if_manual(dbc, &mut client, "test", 0, &CancelHandle::new());
+        assert!(result.is_err(), "the response has no terminating DONE");
+        assert!(client.has_active_transaction());
+        assert!(dbc.inner.lock().unwrap().local_tran_started);
+    }
 
     #[test]
     fn isolation_maps_to_expected_tsql() {

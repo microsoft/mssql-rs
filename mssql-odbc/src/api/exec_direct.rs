@@ -109,6 +109,19 @@ fn sql_exec_direct_w_safe(
 ) -> SqlReturn {
     debug!(sql = %sql, "SQLExecDirectW: executing");
 
+    let operation = match stmt.begin_operation() {
+        Ok(operation) => operation,
+        Err(rc) => return rc,
+    };
+    let rc = sql_exec_direct_w_operation(statement_handle, stmt, sql);
+    super::exec_common::finish_operation(operation, stmt, statement_handle, rc)
+}
+
+fn sql_exec_direct_w_operation(
+    statement_handle: SqlHandle,
+    stmt: &StmtHandle,
+    sql: String,
+) -> SqlReturn {
     let dbc = stmt.parent_dbc();
 
     // The `EXEC_STARTED` claim must be taken before the APD is read and held
@@ -119,7 +132,7 @@ fn sql_exec_direct_w_safe(
     // between the reads would let the stale size of 1 skip the `HYC00` refusal
     // below while the new offset shifts the one set that does run. Same
     // two-phase shape as `execute.rs`'s `stage_execution`.
-    {
+    let cancel_handle = {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("SQLExecDirectW: stmt mutex poisoned");
             return SQL_ERROR;
@@ -139,8 +152,13 @@ fn sql_exec_direct_w_safe(
             post_diag(&mut stmt_state, ERR_INVALID_CURSOR_STATE);
             return SQL_ERROR;
         }
+        let cancel_handle = match stmt.new_execution_cancel() {
+            Ok(handle) => handle,
+            Err(rc) => return rc,
+        };
         stmt_state.set_state(STMT_STATE_EXEC_STARTED);
-    }
+        cancel_handle
+    };
 
     // Check STMT state, gather parameter values, and reset prior context.
     let staged =
@@ -317,7 +335,16 @@ fn sql_exec_direct_w_safe(
 
     // Release any handle orphaned by the reset above before running the batch.
     // Bounded by the full budget: nothing has run yet to charge against it.
-    flush_pending_unprepare(dbc, stmt, &mut client, "SQLExecDirectW", query_timeout);
+    if let Err(e) = flush_pending_unprepare(
+        dbc,
+        stmt,
+        &mut client,
+        "SQLExecDirectW",
+        query_timeout,
+        &cancel_handle,
+    ) {
+        return fail_with_tds(dbc, stmt, statement_handle, client, &e);
+    }
 
     // `query_timeout` (SQL_ATTR_QUERY_TIMEOUT) bounds every wire operation this
     // call makes, not just the final execute — matching msodbcsql's
@@ -344,7 +371,13 @@ fn sql_exec_direct_w_safe(
         }
     };
 
-    if let Err(e) = begin_transaction_if_manual(dbc, &mut client, "SQLExecDirectW", query_timeout) {
+    if let Err(e) = begin_transaction_if_manual(
+        dbc,
+        &mut client,
+        "SQLExecDirectW",
+        query_timeout,
+        &cancel_handle,
+    ) {
         return fail_with_tds(dbc, stmt, statement_handle, client, &e);
     }
 
@@ -382,11 +415,15 @@ fn sql_exec_direct_w_safe(
                 "SQLExecDirectW",
             );
         }
-        let begin_result = dbc.runtime.block_on(client.begin_sp_executesql(
-            rewritten_sql,
-            params,
-            ExecuteOptions::new().timeout_secs(query_timeout),
-        ));
+        let begin_result = dbc.runtime.block_on(
+            client.begin_sp_executesql(
+                rewritten_sql,
+                params,
+                ExecuteOptions::new()
+                    .timeout_secs(query_timeout)
+                    .cancel(&cancel_handle),
+            ),
+        );
         return match begin_result {
             // Defensive: staging only reports DAE parameters when at least one
             // placeholder is present, so the TDS layer should not complete here.
@@ -431,20 +468,28 @@ fn sql_exec_direct_w_safe(
         // batch, or with a literal argument — took the EXEC text form during
         // translation and runs through sp_executesql below.
         dbc.runtime
-            .block_on(client.execute_stored_procedure(
-                call.proc_name.clone(),
-                Some(params),
-                None,
-                ExecuteOptions::new().timeout_secs(query_timeout),
-            ))
+            .block_on(
+                client.execute_stored_procedure(
+                    call.proc_name.clone(),
+                    Some(params),
+                    None,
+                    ExecuteOptions::new()
+                        .timeout_secs(query_timeout)
+                        .cancel(&cancel_handle),
+                ),
+            )
             .map(|_| ())
     } else if marker_count > 0 {
         dbc.runtime
-            .block_on(client.execute_sp_executesql(
-                rewritten_sql,
-                params,
-                ExecuteOptions::new().timeout_secs(query_timeout),
-            ))
+            .block_on(
+                client.execute_sp_executesql(
+                    rewritten_sql,
+                    params,
+                    ExecuteOptions::new()
+                        .timeout_secs(query_timeout)
+                        .cancel(&cancel_handle),
+                ),
+            )
             .map(|_| ())
     } else {
         // Statement-wise navigation: position on the batch's first statement
@@ -453,10 +498,14 @@ fn sql_exec_direct_w_safe(
         // resulting client state. The *translated* text is sent: a statement
         // with no parameter markers can still carry escapes.
         dbc.runtime
-            .block_on(client.execute(
-                rewritten_sql,
-                ExecuteOptions::new().timeout_secs(query_timeout),
-            ))
+            .block_on(
+                client.execute(
+                    rewritten_sql,
+                    ExecuteOptions::new()
+                        .timeout_secs(query_timeout)
+                        .cancel(&cancel_handle),
+                ),
+            )
             .map(|_| ())
     };
     if let Err(e) = exec_result {

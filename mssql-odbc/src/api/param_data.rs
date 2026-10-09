@@ -89,6 +89,19 @@ fn sql_param_data_safe(
     stmt: &StmtHandle,
     value_ptr_ptr: *mut SqlPointer,
 ) -> SqlReturn {
+    let operation = match stmt.begin_operation() {
+        Ok(operation) => operation,
+        Err(rc) => return rc,
+    };
+    let rc = sql_param_data_operation(statement_handle, stmt, value_ptr_ptr);
+    super::exec_common::finish_operation(operation, stmt, statement_handle, rc)
+}
+
+fn sql_param_data_operation(
+    statement_handle: SqlHandle,
+    stmt: &StmtHandle,
+    value_ptr_ptr: *mut SqlPointer,
+) -> SqlReturn {
     let dbc = stmt.parent_dbc();
 
     // ── Validate state ──────────────────────────────────────────────────────
@@ -461,6 +474,10 @@ fn open_deferred_rpc(
     stmt: &StmtHandle,
     statement_handle: SqlHandle,
 ) -> Option<SqlReturn> {
+    let cancel_handle = match stmt.execution_cancel() {
+        Ok(handle) => handle,
+        Err(rc) => return Some(rc),
+    };
     let taken = {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("SQLParamData: stmt mutex poisoned opening the deferred RPC");
@@ -524,7 +541,9 @@ fn open_deferred_rpc(
     let (mut client, params, mut prepared, mut orphaned, sql, timeout_secs, fractional_truncated) =
         taken;
     let collation = client.get_collation();
-    let options = ExecuteOptions::new().timeout_secs(timeout_secs);
+    let options = ExecuteOptions::new()
+        .timeout_secs(timeout_secs)
+        .cancel(&cancel_handle);
 
     let begin_result = match (prepared.as_mut(), sql) {
         (Some(plan), _) => dbc.runtime.block_on(client.begin_execute_prepared(
@@ -633,6 +652,10 @@ fn run_deferred_execute(
     // Take everything the execute needs, and end the sequence, in one critical
     // section: a statement observed between the two would look idle but
     // unprepared.
+    let cancel_handle = match stmt.execution_cancel() {
+        Ok(handle) => handle,
+        Err(rc) => return rc,
+    };
     let taken = {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("SQLParamData: stmt mutex poisoned starting the deferred execute");
@@ -699,7 +722,9 @@ fn run_deferred_execute(
         return SQL_ERROR;
     };
 
-    let options = ExecuteOptions::new().timeout_secs(timeout_secs);
+    let options = ExecuteOptions::new()
+        .timeout_secs(timeout_secs)
+        .cancel(&cancel_handle);
     let exec_result = match (prepared.as_mut(), sql) {
         (Some(plan), _) => dbc
             .runtime

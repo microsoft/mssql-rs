@@ -887,6 +887,19 @@ fn fetch_scroll_safe(
     fetch_orientation: SqlSmallInt,
     _fetch_offset: SqlLen,
 ) -> SqlReturn {
+    let operation = match stmt.begin_operation() {
+        Ok(operation) => operation,
+        Err(rc) => return rc,
+    };
+    let rc = fetch_scroll_operation(statement_handle, stmt, fetch_orientation);
+    super::exec_common::finish_operation(operation, stmt, statement_handle, rc)
+}
+
+fn fetch_scroll_operation(
+    statement_handle: SqlHandle,
+    stmt: &StmtHandle,
+    fetch_orientation: SqlSmallInt,
+) -> SqlReturn {
     // The declared ODBC version selects the SQL_C_DEFAULT table. Read it before
     // the stmt lock to preserve parent-before-child lock ordering (the same
     // order as `bind_param.rs` and `catalog.rs`).
@@ -1495,7 +1508,7 @@ fn fill_rowset(
     // re-derive which branch was taken or assume the helper's closure ran:
     // desyncing the two would either double-post the row diagnostics or drop
     // them, and nothing would catch it.
-    let (release_has_server_info, row_diags_posted) = if fetch_error.is_some() {
+    let (release_has_server_info, row_diags_posted, cancelled) = if fetch_error.is_some() {
         let Ok(mut dbc_state) = dbc.inner.lock() else {
             error!("SQLFetchScroll: dbc mutex poisoned returning client");
             return SQL_ERROR;
@@ -1504,17 +1517,17 @@ fn fill_rowset(
         if dbc_state.active_stmt == Some(statement_handle) {
             dbc_state.active_stmt = None;
         }
-        (false, false)
+        (false, false, false)
     } else if peek_is_safe {
         // Everything the rows produced goes in through the closure rather than
         // being posted below: it all left the wire before anything the release
         // peek finds, and posting it afterward would invert the order
         // SQLGetDiagRec reports it in.
-        let (posted, preceding_ran) =
+        let (posted, preceding_ran, cancelled) =
             release_busy_if_row_exhausted(dbc, stmt, statement_handle, client, |s| {
                 post_row_diagnostics(s, &info_messages, worst)
             });
-        (posted, preceding_ran)
+        (posted, preceding_ran, cancelled)
     } else {
         let Ok(mut dbc_state) = dbc.inner.lock() else {
             error!("SQLFetchScroll: dbc mutex poisoned returning client");
@@ -1522,7 +1535,7 @@ fn fill_rowset(
         };
         dbc_state.client = Some(client);
         dbc_state.active_stmt = Some(statement_handle);
-        (false, false)
+        (false, false, false)
     };
 
     let Ok(mut stmt_state) = stmt.inner.lock() else {
@@ -1537,12 +1550,14 @@ fn fill_rowset(
     unsafe { write_if_some(rows_fetched_ptr, rows_filled) };
     mark_no_rows(row_status_ptr, rows_filled, row_array_size);
 
+    if cancelled {
+        return SQL_ERROR;
+    }
     if let Some(e) = fetch_error {
         error!(%e, "SQLFetchScroll: row fetch failed");
         // The cursor cannot be resumed after a protocol failure, so tear the
         // row stream down rather than leaving it addressable.
-        stmt_state.reset_row_stream();
-        stmt_state.clear_state(STMT_STATE_CURSOR_OPEN);
+        super::close_cursor::reset_cursor_state(&mut stmt_state);
         // Fans a server error out into one diagnostic per record, keeping each
         // SQLSTATE and native error rather than flattening them into HY000.
         post_tds_error(&mut stmt_state, &e, SQLSTATE_HY000);
