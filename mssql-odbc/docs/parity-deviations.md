@@ -926,6 +926,17 @@ msodbcsql build is measured.
     interrupted operation before successful cross-thread SQLCancel returns, so
     immediately calling SQLFreeStmt(SQL_CLOSE) is safe.
 
+    The same choice covers a signal that lands after the call's last read but
+    before it returns. msodbcsql's `SQLCancel` sends ATTN while that call still
+    holds `csStmt` (`sqlcmisc.cpp:759`), and the next call to read the batch
+    reports `HY008` (`sqlccmd.cpp:11821-11826`). This driver settles the
+    pending response in the call that was interrupted, so `HY008` is reported
+    one call earlier and a cancellation never reaches a later call or a
+    subsequent close. A response already fully received is left intact in both
+    drivers. This half is read from source and covered by Rust unit tests; it
+    has not been measured against native, because the window is not
+    reproducible from an application.
+
     **Evidence level: measured.** The `CancelLiveTest` MoreResults cases record
     `SQL_DRIVER_VER` and assert each driver's exact return code. Measured on
     Linux through unixODBC with `Threading=0`, native library

@@ -109,10 +109,19 @@ fn sql_exec_direct_w_safe(
 ) -> SqlReturn {
     debug!(sql = %sql, "SQLExecDirectW: executing");
 
-    let _operation = match stmt.begin_operation() {
+    let operation = match stmt.begin_operation() {
         Ok(operation) => operation,
         Err(rc) => return rc,
     };
+    let rc = sql_exec_direct_w_operation(statement_handle, stmt, sql);
+    super::exec_common::finish_operation(operation, stmt, statement_handle, rc)
+}
+
+fn sql_exec_direct_w_operation(
+    statement_handle: SqlHandle,
+    stmt: &StmtHandle,
+    sql: String,
+) -> SqlReturn {
     let dbc = stmt.parent_dbc();
 
     // The `EXEC_STARTED` claim must be taken before the APD is read and held

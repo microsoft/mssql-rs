@@ -204,10 +204,15 @@ impl Iterator for PreparedRows<'_> {
 }
 
 fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn {
-    let _operation = match stmt.begin_operation() {
+    let operation = match stmt.begin_operation() {
         Ok(operation) => operation,
         Err(rc) => return rc,
     };
+    let rc = sql_execute_operation(statement_handle, stmt);
+    super::exec_common::finish_operation(operation, stmt, statement_handle, rc)
+}
+
+fn sql_execute_operation(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn {
     let dbc = stmt.parent_dbc();
 
     let (staging, cancel_handle) = match stage_execution(stmt) {

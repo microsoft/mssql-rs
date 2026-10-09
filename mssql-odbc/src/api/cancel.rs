@@ -646,6 +646,110 @@ mod tests {
         cancel_cursor_phase(CursorPhase::Fetch, false, true);
     }
 
+    /// Replays a SQLCancel that signals after a call's last read but before
+    /// the call returns, then finishes that call with `rc`.
+    fn finish_after_late_cancel(stmt: &StmtHandle, raw: SqlHandle, rc: SqlReturn) -> SqlReturn {
+        use std::time::{Duration, Instant};
+        let operation = stmt.begin_operation().unwrap();
+        let raw = raw as usize;
+        std::thread::scope(|scope| {
+            let cancel = scope.spawn(move || unsafe { crate::api::SQLCancel(raw as SqlHandle) });
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !stmt.cancellation_state_for_test().1 {
+                assert!(Instant::now() < deadline, "cancel did not signal");
+                std::thread::yield_now();
+            }
+            let rc =
+                super::super::exec_common::finish_operation(operation, stmt, raw as SqlHandle, rc);
+            assert_eq!(SQL_SUCCESS, cancel.join().unwrap());
+            rc
+        })
+    }
+
+    #[test]
+    fn late_cancellation_abandons_pending_rows_before_the_call_returns() {
+        use crate::api::odbc_types::*;
+        use crate::handles::stmt::STMT_STATE_CURSOR_OPEN;
+        use mssql_mock_tds::{ColumnDefinition, ColumnValue, QueryResponse, Row, SqlDataType};
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let dbc = stmt.parent_dbc();
+        let rows = (1..=3)
+            .map(|n| Row::new(vec![ColumnValue::Int(n)]))
+            .collect();
+        let _server = crate::test_support::connect_mock_server(
+            dbc,
+            "SELECT 1",
+            QueryResponse::new(vec![ColumnDefinition::new("", SqlDataType::Int)], rows),
+        );
+        let sql: Vec<u16> = "SELECT 1".encode_utf16().collect();
+        let exec = || unsafe {
+            crate::api::SQLExecDirectW(h.stmt, sql.as_ptr(), i16::try_from(sql.len()).unwrap())
+        };
+        assert_eq!(SQL_SUCCESS, exec());
+        assert_eq!(SQL_SUCCESS, unsafe { crate::api::SQLFetch(h.stmt) });
+        assert_eq!(dbc.inner.lock().unwrap().active_stmt, Some(h.stmt));
+
+        assert_eq!(
+            SQL_ERROR,
+            finish_after_late_cancel(stmt, h.stmt, SQL_SUCCESS)
+        );
+        {
+            let state = stmt.inner.lock().unwrap();
+            assert!(!state.has_state(STMT_STATE_CURSOR_OPEN));
+            assert_eq!(state.diag_records.last().unwrap().sql_state, *b"HY008");
+        }
+        {
+            let state = dbc.inner.lock().unwrap();
+            assert!(state.active_stmt.is_none());
+            assert!(!state.client.as_ref().unwrap().is_connection_dead());
+        }
+        // The settled signal must not reach the close or the next execution.
+        assert_eq!(SQL_SUCCESS, unsafe {
+            crate::api::SQLFreeStmt(h.stmt, SQL_CLOSE)
+        });
+        assert_eq!(SQL_SUCCESS, exec());
+        for _ in 0..3 {
+            assert_eq!(SQL_SUCCESS, unsafe { crate::api::SQLFetch(h.stmt) });
+        }
+        assert_eq!(SQL_NO_DATA, unsafe { crate::api::SQLFetch(h.stmt) });
+    }
+
+    #[test]
+    fn late_cancellation_after_the_response_completed_leaves_the_call_intact() {
+        use crate::api::odbc_types::*;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let dbc = stmt.parent_dbc();
+        let _server = crate::test_support::connect_mock_server(
+            dbc,
+            "SELECT 1",
+            mssql_mock_tds::QueryResponse::select_one(),
+        );
+        let sql: Vec<u16> = "SELECT 1".encode_utf16().collect();
+        assert_eq!(SQL_SUCCESS, unsafe {
+            crate::api::SQLExecDirectW(h.stmt, sql.as_ptr(), i16::try_from(sql.len()).unwrap())
+        });
+        assert_eq!(SQL_SUCCESS, unsafe { crate::api::SQLFetch(h.stmt) });
+        assert!(dbc.inner.lock().unwrap().active_stmt.is_none());
+
+        assert_eq!(
+            SQL_SUCCESS,
+            finish_after_late_cancel(stmt, h.stmt, SQL_SUCCESS)
+        );
+        assert!(stmt.inner.lock().unwrap().diag_records.is_empty());
+        assert_eq!(SQL_NO_DATA, unsafe { crate::api::SQLFetch(h.stmt) });
+        assert_eq!(SQL_SUCCESS, unsafe {
+            crate::api::SQLFreeStmt(h.stmt, SQL_CLOSE)
+        });
+        assert_eq!(SQL_SUCCESS, unsafe {
+            crate::api::SQLExecDirectW(h.stmt, sql.as_ptr(), i16::try_from(sql.len()).unwrap())
+        });
+        assert_eq!(SQL_SUCCESS, unsafe { crate::api::SQLFetch(h.stmt) });
+    }
+
     fn cancel_blocked(h: &TestHandles, execute: impl FnOnce(SqlHandle) -> SqlReturn + Send) {
         cancel_blocked_then(h, execute, || {});
     }

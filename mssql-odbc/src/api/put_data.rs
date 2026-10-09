@@ -111,16 +111,12 @@ unsafe fn sql_put_data_safe(
     data_ptr: SqlPointer,
     strlen_or_ind: SqlLen,
 ) -> SqlReturn {
-    let mut operation = match stmt.begin_operation() {
+    let operation = match stmt.begin_operation() {
         Ok(operation) => operation,
         Err(rc) => return rc,
     };
     let rc = unsafe { sql_put_data_operation(statement_handle, stmt, data_ptr, strlen_or_ind) };
-    match operation.finish_unless_cancelled() {
-        Ok(true) => rc,
-        Ok(false) => super::exec_common::finish_cancelled_dae_call(stmt, statement_handle, rc),
-        Err(rc) => rc,
-    }
+    super::exec_common::finish_operation(operation, stmt, statement_handle, rc)
 }
 
 /// # Safety

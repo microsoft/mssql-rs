@@ -146,10 +146,31 @@ fn sql_get_data_safe(
     buffer_length: SqlLen,
     strlen_or_ind_ptr: *mut SqlLen,
 ) -> SqlReturn {
-    let _operation = match stmt.begin_operation() {
+    let operation = match stmt.begin_operation() {
         Ok(operation) => operation,
         Err(rc) => return rc,
     };
+    let rc = sql_get_data_operation(
+        statement_handle,
+        stmt,
+        column_number,
+        target_type,
+        target_value_ptr,
+        buffer_length,
+        strlen_or_ind_ptr,
+    );
+    super::exec_common::finish_operation(operation, stmt, statement_handle, rc)
+}
+
+fn sql_get_data_operation(
+    statement_handle: SqlHandle,
+    stmt: &StmtHandle,
+    column_number: SqlUSmallInt,
+    target_type: SqlSmallInt,
+    target_value_ptr: SqlPointer,
+    buffer_length: SqlLen,
+    strlen_or_ind_ptr: *mut SqlLen,
+) -> SqlReturn {
     debug_assert!(
         buffer_length >= 0,
         "SQLGetData: DM should reject negative buffer_length (HY090)"

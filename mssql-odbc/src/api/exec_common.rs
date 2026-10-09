@@ -35,7 +35,7 @@ use crate::handles::dbc::ConnectionState;
 use crate::handles::desc::DescHeader;
 use crate::handles::stmt::{
     DaeParam, DaeState, PreparedPlan, STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT,
-    STMT_STATE_EXEC_STARTED, StmtState,
+    STMT_STATE_EXEC_STARTED, StatementOperation, StmtState,
 };
 use crate::handles::{
     DbcHandle, DescHandle, StmtHandle, handle_from_raw, process_is_shutting_down,
@@ -130,7 +130,7 @@ pub(super) fn finish_dae_unwind(
     }
 }
 
-pub(super) fn finish_cancelled_dae_call(
+fn finish_cancelled_dae_call(
     stmt: &StmtHandle,
     statement_handle: SqlHandle,
     rc: SqlReturn,
@@ -150,12 +150,81 @@ pub(super) fn finish_cancelled_dae_call(
         stmt.parent_dbc(),
         stmt,
         statement_handle,
-        cancelled_success.then_some(DiagMsg {
-            state: SQLSTATE_HY008,
-            text: "Operation canceled",
-        }),
+        cancelled_success.then_some(ERR_OPERATION_CANCELED),
     );
     if cancelled_success { SQL_ERROR } else { rc }
+}
+
+/// Ends a call registered with [`StmtHandle::begin_operation`].
+///
+/// SQLCancel can signal after the call's last cancellable read but before it
+/// returns. The signal latches the token the client still holds, so leaving it
+/// unsettled would cancel a later, unrelated call on this statement and fail
+/// the drain of SQLFreeStmt(SQL_CLOSE) or SQLEndTran. msodbcsql sends ATTN in
+/// that window too (`sqlcmisc.cpp`, `pBatchCtx->Cancel` while `csStmt` is
+/// held), so the pending response is abandoned here, before SQLCancel returns.
+pub(super) fn finish_operation(
+    mut operation: StatementOperation<'_>,
+    stmt: &StmtHandle,
+    statement_handle: SqlHandle,
+    rc: SqlReturn,
+) -> SqlReturn {
+    match operation.finish_unless_cancelled() {
+        Ok(true) => rc,
+        Ok(false) => settle_late_cancellation(stmt, statement_handle, rc),
+        Err(rc) => rc,
+    }
+}
+
+fn settle_late_cancellation(
+    stmt: &StmtHandle,
+    statement_handle: SqlHandle,
+    rc: SqlReturn,
+) -> SqlReturn {
+    let cursor_open = match stmt.inner.lock() {
+        Ok(state) if state.needs_data() => {
+            drop(state);
+            return finish_cancelled_dae_call(stmt, statement_handle, rc);
+        }
+        Ok(state) => state.has_state(STMT_STATE_CURSOR_OPEN),
+        Err(_) => {
+            error!("settling cancellation: stmt mutex poisoned");
+            return SQL_ERROR;
+        }
+    };
+    // A released claim means the complete response was already read, so
+    // nothing remains for the signal to abandon.
+    let owns_wire = match stmt.parent_dbc().inner.lock() {
+        Ok(state) => state.active_stmt == Some(statement_handle),
+        Err(_) => {
+            error!("settling cancellation: dbc mutex poisoned");
+            return SQL_ERROR;
+        }
+    };
+    if !cursor_open || !owns_wire {
+        return rc;
+    }
+    match stmt.inner.lock() {
+        Ok(mut state) => {
+            state.pending_fetch_error = None;
+            super::close_cursor::reset_cursor_state(&mut state);
+        }
+        Err(_) => {
+            error!("settling cancellation: stmt mutex poisoned");
+            return SQL_ERROR;
+        }
+    }
+    let drained = !matches!(
+        super::close_cursor::drain_and_release(stmt, statement_handle),
+        super::close_cursor::DrainOutcome::Failed
+    );
+    if drained
+        && matches!(rc, SQL_SUCCESS | SQL_SUCCESS_WITH_INFO | SQL_NO_DATA)
+        && let Ok(mut state) = stmt.inner.lock()
+    {
+        post_diag(&mut state, ERR_OPERATION_CANCELED);
+    }
+    SQL_ERROR
 }
 
 /// Parks the streaming client on the statement so `SQLParamData` / `SQLPutData`

@@ -87,6 +87,10 @@ pub(crate) const ERR_INVALID_CURSOR_STATE: DiagMsg = DiagMsg {
     state: SQLSTATE_24000,
     text: "Invalid cursor state",
 };
+pub(crate) const ERR_OPERATION_CANCELED: DiagMsg = DiagMsg {
+    state: SQLSTATE_HY008,
+    text: "Operation canceled",
+};
 pub(crate) const ERR_CONNECTION_DOES_NOT_EXIST: DiagMsg = DiagMsg {
     state: SQLSTATE_08003,
     text: "Connection does not exist",

@@ -274,6 +274,11 @@ on the `master` branch.
   finishes. Keep read-ahead cancellation on the interrupted call rather than
   deferring it to `pending_fetch_error`. This completion barrier mirrors
   msodbcsql's post-signal acquisition of `csStmt` (`sqlcmisc.cpp:762-767`).
+  A call that can leave a response pending must end through
+  `exec_common::finish_operation`, not by dropping the guard: a signal that
+  lands after its last read latches the client's token, so the call itself
+  abandons the pending response and reports HY008 rather than leaking the
+  cancellation into a later call.
 
 ### 7.1. Handle hierarchy and locking
 

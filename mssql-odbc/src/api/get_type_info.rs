@@ -102,10 +102,19 @@ fn sql_get_type_info_w_safe(
     stmt: &StmtHandle,
     data_type: SqlSmallInt,
 ) -> SqlReturn {
-    let _operation = match stmt.begin_operation() {
+    let operation = match stmt.begin_operation() {
         Ok(operation) => operation,
         Err(rc) => return rc,
     };
+    let rc = sql_get_type_info_w_operation(statement_handle, stmt, data_type);
+    super::exec_common::finish_operation(operation, stmt, statement_handle, rc)
+}
+
+fn sql_get_type_info_w_operation(
+    statement_handle: SqlHandle,
+    stmt: &StmtHandle,
+    data_type: SqlSmallInt,
+) -> SqlReturn {
     let dbc = stmt.parent_dbc();
 
     // Validate the requested type and reset prior context under the stmt lock.

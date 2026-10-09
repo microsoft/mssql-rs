@@ -820,10 +820,19 @@ fn fetch_scroll_safe(
     fetch_orientation: SqlSmallInt,
     _fetch_offset: SqlLen,
 ) -> SqlReturn {
-    let _operation = match stmt.begin_operation() {
+    let operation = match stmt.begin_operation() {
         Ok(operation) => operation,
         Err(rc) => return rc,
     };
+    let rc = fetch_scroll_operation(statement_handle, stmt, fetch_orientation);
+    super::exec_common::finish_operation(operation, stmt, statement_handle, rc)
+}
+
+fn fetch_scroll_operation(
+    statement_handle: SqlHandle,
+    stmt: &StmtHandle,
+    fetch_orientation: SqlSmallInt,
+) -> SqlReturn {
     // The declared ODBC version selects the SQL_C_DEFAULT table. Read it before
     // the stmt lock to preserve parent-before-child lock ordering (the same
     // order as `bind_param.rs` and `catalog.rs`).

@@ -514,10 +514,36 @@ fn run_catalog(
     not_null_cols: &[usize],
     renames: &[(usize, &'static str)],
 ) -> SqlReturn {
-    let _operation = match stmt.begin_operation() {
+    let operation = match stmt.begin_operation() {
         Ok(operation) => operation,
         Err(rc) => return rc,
     };
+    let rc = run_catalog_operation(
+        statement_handle,
+        name,
+        stmt,
+        proc,
+        catalog,
+        retry_on_error,
+        build_params,
+        not_null_cols,
+        renames,
+    );
+    super::exec_common::finish_operation(operation, stmt, statement_handle, rc)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_catalog_operation(
+    statement_handle: SqlHandle,
+    name: &'static str,
+    stmt: &StmtHandle,
+    proc: &str,
+    catalog: &Arg,
+    retry_on_error: bool,
+    build_params: impl Fn(bool) -> (Vec<RpcParameter>, Option<Vec<RpcParameter>>),
+    not_null_cols: &[usize],
+    renames: &[(usize, &'static str)],
+) -> SqlReturn {
     let dbc = stmt.parent_dbc();
 
     let (query_timeout, cancel_handle) = {

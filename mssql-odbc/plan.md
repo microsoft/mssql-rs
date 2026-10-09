@@ -130,7 +130,10 @@ status describes the current crate, not merely whether supporting code exists in
   the connection claim before SQLCancel returns. Cancellation signals before
   waiting for the active operation's completion; an immediate SQLFreeStmt(SQL_CLOSE)
   is safe without joining the caller thread. Cancellation discovered during
-  read-ahead reports HY008 on that call, not a subsequent fetch.
+  read-ahead reports HY008 on that call, not a subsequent fetch. A signal that
+  arrives after a call's last read is settled by that call: a still-pending
+  response is abandoned with ATTENTION and the call reports HY008, while a
+  fully received response is left intact.
   In-flight SQLPutData/SQLParamData cancellation (AB#49224) also unwinds
   buffered calls. Pending packet writes finish within the cancellation budget
   before state-aware withdrawal; an uncertain packet or failed acknowledgement
