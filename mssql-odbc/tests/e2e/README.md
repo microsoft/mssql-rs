@@ -111,6 +111,33 @@ Summary: 15 parity, 1 divergence(s), 0 shared failure(s), 0 skipped
 === Parity check FAILED (mssql-odbc rc=0, msodbcsql rc=0, parity rc=1) ===
 ```
 
+### Native narrow fetch expectations
+
+`SQL_C_CHAR` fetch output defaults to the Windows system ANSI code page (`GetACP`)
+or the supported active Unix `LC_CTYPE` encoding, with UTF-8 as the fallback for
+C/POSIX and unsupported locales. The usual test process starts in the C locale;
+this does not mean every Unix application receives UTF-8.
+Use `ODBCTestUtils::Utf8ToNativeClient` to convert UTF-8 expected text into native
+**output** bytes. Do not use it for narrow parameter input (still UTF-8 until
+AB#47565), `SQL_C_WCHAR` expectations, or raw `SQL_C_BINARY` wire bytes.
+Compare native output with explicit byte lengths, not C-string semantics:
+UTF-32LE contains embedded zero bytes. Chunk helpers use sentinel-filled buffers
+for truncated chunks and the final successful call's indicator to locate the
+terminator, preserving embedded zeros without counting initialized padding.
+
+`GetDataUtf16Test.NativeClientChar*` covers ordinary/MAX varchar and nvarchar,
+server collations different from the client, terminator-only probes, tiny
+continuations, final byte lengths, and native code-page-loss warning semantics.
+Fitting conversions remain successful without warnings even with
+`SQL_COPT_SS_WARN_ON_CP_ERROR` enabled; lossy truncation exercises the diagnostic
+path with the flag both disabled and enabled. Carry
+tests that need UTF-8 expansion skip on both drivers when the active native
+encoding cannot create that carry; measured source-decoder divergences retain
+their separate reference-driver skips.
+The DBCS text-to-binary continuation regression requires an ASCII-compatible
+client encoding: its binary continuation returns wire bytes, not UTF-32LE
+converted carry.
+
 ### Intentional divergence: `SKIP_IF_COMPARING_MSODBCSQL()`
 
 Some tests assert behavior that is deliberately stricter in the Rust driver than
