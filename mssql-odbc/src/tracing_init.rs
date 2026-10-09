@@ -1113,6 +1113,92 @@ mod tests {
     }
 
     #[test]
+    fn descriptor_reads_correlate_to_the_owning_connection_not_the_ambient_statement() {
+        use crate::api::SQLGetDescFieldW;
+        use crate::api::odbc_types::{SQL_DESC_COUNT, SQL_SUCCESS, SqlSmallInt};
+        use crate::handles::{DbcHandle, handle_from_raw};
+        use crate::test_support::TestHandles;
+        use mssql_tds::trace_context::{self, Snapshot};
+
+        trace_context::enable();
+        let mut h = TestHandles::with_env_dbc_stmt();
+        let explicit = h.alloc_explicit_desc();
+        let mut other = TestHandles::with_env_dbc();
+        let other_descriptor = other.alloc_explicit_desc();
+        for handle in [h.dbc, other.dbc] {
+            let dbc = unsafe { handle_from_raw::<DbcHandle>(handle) };
+            dbc.trace.establish(uuid::Uuid::new_v4());
+        }
+
+        for (descriptor, owner) in [
+            (h.ard(), h.dbc),
+            (h.apd(), h.dbc),
+            (h.ird(), h.dbc),
+            (h.ipd(), h.dbc),
+            (explicit, h.dbc),
+            (other_descriptor, other.dbc),
+        ] {
+            let expected = {
+                let _owner = unsafe { context_for(owner, "SQLGetConnectAttrW") }.enter();
+                trace_context::snapshot()
+            };
+            assert!(expected.dbc.is_some());
+            assert!(expected.cid.is_some());
+            assert_eq!(expected.stmt, None);
+            assert_eq!(expected.exec, None);
+
+            let output = capture_correlation(|| {
+                let _ambient = unsafe { context_for(h.stmt, "SQLExecute") }.enter();
+                let ambient = trace_context::snapshot();
+                assert!(ambient.stmt.is_some());
+                assert!(ambient.exec.is_some());
+                {
+                    let _descriptor =
+                        unsafe { context_for(descriptor, "SQLGetDescFieldW") }.enter();
+                    assert_eq!(trace_context::snapshot(), expected);
+                }
+                let mut count: SqlSmallInt = -1;
+                assert_eq!(
+                    unsafe {
+                        SQLGetDescFieldW(
+                            descriptor,
+                            0,
+                            SqlSmallInt::try_from(SQL_DESC_COUNT).unwrap(),
+                            (&mut count as *mut SqlSmallInt).cast(),
+                            0,
+                            std::ptr::null_mut(),
+                        )
+                    },
+                    SQL_SUCCESS
+                );
+                assert_eq!(count, 0);
+                assert_eq!(trace_context::snapshot(), ambient);
+            });
+            let lines: Vec<_> = output.lines().collect();
+            assert!(
+                lines
+                    .iter()
+                    .any(|line| line.contains("SQLGetDescFieldW called"))
+            );
+            assert!(
+                lines
+                    .iter()
+                    .any(|line| line.contains("SQLGetDescFieldW returning"))
+            );
+            for line in lines {
+                assert!(line.contains(&format!("dbc={} ", expected.dbc.unwrap())));
+                assert!(line.contains(&format!(
+                    "cid={} ",
+                    expected.cid.unwrap().to_string().to_uppercase()
+                )));
+                assert!(!line.contains("stmt="));
+                assert!(!line.contains("exec="));
+            }
+            assert_eq!(trace_context::snapshot(), Snapshot::default());
+        }
+    }
+
+    #[test]
     fn describe_parameter_rpcs_start_executions_but_cached_reads_do_not_activate_them() {
         use crate::api::SQLDescribeParam;
         use crate::api::odbc_types::{SQL_ERROR, SQL_INTEGER, SQL_NULLABLE, SQL_SUCCESS};
