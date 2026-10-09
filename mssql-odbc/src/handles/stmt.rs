@@ -18,6 +18,8 @@ use crate::api::odbc_types::{
     self, SQL_DESC_ALLOC_AUTO, SqlInteger, SqlLen, SqlPointer, SqlSmallInt, SqlULen, SqlUSmallInt,
 };
 use crate::api::set_desc_field::datetime_interval_code_for;
+use crate::conversion::client_encoding::ClientEncoding;
+use crate::conversion::fetch_convert::TextOutput;
 use crate::conversion::param_convert::{DaeLengthLimit, DaePlan, DaeTranscode};
 use crate::error::{DiagRecord, HasDiagnostics};
 use crate::handles::desc::UdtNames;
@@ -37,13 +39,13 @@ pub(crate) struct ActivePlpStream {
     /// Wire encoding of the PLP column.
     pub(crate) encoding: PlpEncoding,
     /// Trailing odd wire byte from the previous read, awaiting its pair. Only
-    /// used on the UTF-16LE -> UTF-8 (`nvarchar(max)` -> `SQL_C_CHAR`) path,
+    /// used on the UTF-16LE -> client bytes (`nvarchar(max)` -> `SQL_C_CHAR`) path,
     /// where a chunk boundary can fall between the two bytes of a code unit.
     pub(crate) pending_byte: Option<u8>,
     /// High surrogate whose low half lands in the next chunk. Held back so the
     /// pair is transcoded together instead of each half becoming U+FFFD.
     pub(crate) pending_high_surrogate: Option<u16>,
-    /// Converted output that did not fit. Usually UTF-8, but a continuation
+    /// Converted native client output that did not fit, but a continuation
     /// also moves pending UTF-16 units here so either text target can drain
     /// their bytes verbatim, including a byte split after a target switch.
     pub(crate) pending_bytes: Vec<u8>,
@@ -52,6 +54,12 @@ pub(crate) struct ActivePlpStream {
     /// Character reads drain old carry before decoding new wire input, so
     /// this tag covers the entire byte buffer.
     pub(crate) pending_bytes_utf16: bool,
+    pub(crate) pending_bytes_encoding: ClientEncoding,
+    /// Substitution byte ranges relative to the undelivered converted carry.
+    pub(crate) pending_loss_ranges: Vec<std::ops::Range<usize>>,
+    /// Original UTF-8 chunk and delivered client-byte offset for native carry.
+    /// Retained only while converted output remains, to locate typed-switch boundaries.
+    pub(crate) pending_narrow_source: Option<(Vec<u8>, usize)>,
     /// Narrow wire encoding resolved from the column's collation (or UTF-8 for
     /// `json`, which carries none), or `None` when the column is not narrow
     /// text. This is a property of the *column*, so a target type that arrives
@@ -130,6 +138,9 @@ impl ActivePlpStream {
             pending_high_surrogate: None,
             pending_bytes: Vec::new(),
             pending_bytes_utf16: false,
+            pending_bytes_encoding: ClientEncoding::UTF8,
+            pending_loss_ranges: Vec::new(),
+            pending_narrow_source: None,
             narrow_encoding,
             narrow_decoder: None,
             narrow_decoder_finished: false,
@@ -141,6 +152,28 @@ impl ActivePlpStream {
             prefetched_reached_end: false,
             prefetch_error: None,
         }
+    }
+
+    pub(crate) fn drain_pending_bytes(&mut self, count: usize) -> bool {
+        let loss = self
+            .pending_loss_ranges
+            .iter()
+            .any(|range| range.start < count);
+        self.pending_loss_ranges.retain_mut(|range| {
+            if range.end <= count {
+                return false;
+            }
+            range.start = range.start.saturating_sub(count);
+            range.end -= count;
+            true
+        });
+        self.pending_bytes.drain(..count);
+        if self.pending_bytes.is_empty() {
+            self.pending_narrow_source = None;
+        } else if let Some((_, offset)) = self.pending_narrow_source.as_mut() {
+            *offset = offset.saturating_add(count);
+        }
+        loss
     }
 
     /// Builds the narrow decoder if this column has an encoding and no decoder
@@ -209,7 +242,15 @@ impl ActivePlpStream {
             .len()
             .saturating_sub(self.prefetched_offset);
         if remaining == 0 {
-            return None;
+            // Conversion overflow can outlive the final wire chunk. Preserve
+            // EOF while that output is drained instead of resuming the client.
+            return self.prefetched_reached_end.then_some((
+                0,
+                true,
+                self.prefetched_known_total,
+                self.prefetched_total_read_before
+                    .saturating_add(self.prefetched_offset),
+            ));
         }
 
         let read = remaining.min(out.len());
@@ -403,6 +444,7 @@ pub(crate) struct StmtHandle {
 #[derive(Debug)]
 pub(crate) struct StmtState {
     pub(crate) diag_records: Vec<DiagRecord>,
+    pub(crate) text_output: TextOutput,
     /// Column metadata from the most recent execution.
     pub(crate) column_metadata: Vec<ColumnMetadata>,
     /// UTF-16 column names built once when result metadata changes.
@@ -537,6 +579,10 @@ pub(crate) struct StmtState {
     pub(crate) partial_text_offset: Option<(usize, usize)>,
     /// Direct string path already validated for `(1-based column, C target type)`.
     pub(crate) direct_text_target: Option<(usize, SqlSmallInt)>,
+    /// Client-copy eligibility for the current captured value, independent of source validation.
+    pub(crate) captured_narrow_copy: Option<(ClientEncoding, bool)>,
+    #[cfg(test)]
+    pub(crate) captured_narrow_copy_scans: usize,
     /// Rows affected by the last execution, reported by `SQLRowCount`. `-1`
     /// means "not available" (no statement executed yet, a result-returning
     /// SELECT, DDL, or `SET NOCOUNT ON`) — matching msodbcsql's
@@ -1422,6 +1468,7 @@ impl StmtState {
         self.current_row_last_col = 0;
         self.partial_text_offset = None;
         self.direct_text_target = None;
+        self.captured_narrow_copy = None;
     }
 
     /// Positions the row stream on a freshly fetched row: clears all per-row
@@ -1574,6 +1621,7 @@ impl StmtHandle {
             ))),
             inner: Mutex::new(StmtState {
                 diag_records: Vec::new(),
+                text_output: TextOutput::UTF8,
                 column_metadata: Vec::new(),
                 column_names_utf16: Vec::new(),
                 plp_prefetch_scratch: Vec::new(),
@@ -1599,6 +1647,9 @@ impl StmtHandle {
                 current_row_last_col: 0,
                 partial_text_offset: None,
                 direct_text_target: None,
+                captured_narrow_copy: None,
+                #[cfg(test)]
+                captured_narrow_copy_scans: 0,
                 row_count: -1,
                 pending_row_counts: VecDeque::new(),
                 active_ard: None,
@@ -1980,6 +2031,11 @@ mod tests {
             Some((4, true, Some(14), 14))
         );
         assert_eq!(&second[..4], &[3, 4, 5, 6]);
+        assert_eq!(
+            stream.read_prefetched_wire(&mut second),
+            Some((0, true, Some(14), 14))
+        );
+        stream.take_prefetch_buffer();
         assert_eq!(stream.read_prefetched_wire(&mut second), None);
     }
 

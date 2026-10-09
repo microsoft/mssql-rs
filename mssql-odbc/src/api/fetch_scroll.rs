@@ -64,7 +64,7 @@ use crate::api::util::{
 use crate::conversion::datetime::DateTimeParts;
 use crate::conversion::error::{ConvError, ConvOk};
 use crate::conversion::fetch_convert::{
-    date_parts, datetime2_parts, datetimeoffset_parts, is_typed_c_target, time_parts,
+    TextOutput, date_parts, datetime2_parts, datetimeoffset_parts, is_typed_c_target, time_parts,
 };
 use crate::error::{free_errors, post_sql_error};
 use crate::handles::OdbcVersion;
@@ -316,6 +316,12 @@ pub(crate) unsafe fn sql_fetch_scroll_impl(
 pub(crate) enum RowIssue {
     /// 01004 — the value did not fit the bound buffer.
     StringTruncated,
+    /// 01000 — the client code page replaced an unrepresentable character.
+    CodePageLoss,
+    /// Retain both diagnostics when a lossy prefix also fills the buffer.
+    StringTruncatedWithCodePageLoss,
+    /// Preserve the platform codec's diagnostic without losing its message.
+    Conversion { state: [u8; 5], text: &'static str },
     /// 01S07 — fractional digits were dropped to fit the target.
     FractionalTruncated,
     /// 22003 — numeric value out of the target's range.
@@ -340,6 +346,12 @@ impl RowIssue {
     pub(crate) fn post(self, stmt_state: &mut StmtState) {
         match self {
             RowIssue::StringTruncated => post_diag(stmt_state, WARN_STRING_TRUNCATION),
+            RowIssue::CodePageLoss => post_diag(stmt_state, WARN_CODE_PAGE_CONVERSION_LOSS),
+            RowIssue::StringTruncatedWithCodePageLoss => {
+                post_diag(stmt_state, WARN_STRING_TRUNCATION);
+                post_diag(stmt_state, WARN_CODE_PAGE_CONVERSION_LOSS);
+            }
+            RowIssue::Conversion { state, text } => post_diag(stmt_state, DiagMsg { state, text }),
             RowIssue::FractionalTruncated => post_diag(stmt_state, WARN_FRACTIONAL_TRUNCATION),
             RowIssue::OutOfRange => post_diag(stmt_state, ERR_NUMERIC_OUT_OF_RANGE),
             RowIssue::InvalidDatetimeFormat => post_diag(stmt_state, ERR_INVALID_DATETIME_FORMAT),
@@ -354,6 +366,15 @@ impl RowIssue {
                 0,
                 "Column type conversion not yet implemented",
             ),
+        }
+    }
+}
+
+impl From<DiagMsg> for RowIssue {
+    fn from(diag: DiagMsg) -> Self {
+        Self::Conversion {
+            state: diag.state,
+            text: diag.text,
         }
     }
 }
@@ -393,6 +414,18 @@ impl RowOutcome {
         match (self, other) {
             (e @ RowOutcome::Error(_), _) => e,
             (_, e @ RowOutcome::Error(_)) => e,
+            (
+                RowOutcome::Info(RowIssue::StringTruncated),
+                RowOutcome::Info(RowIssue::CodePageLoss),
+            )
+            | (
+                RowOutcome::Info(RowIssue::CodePageLoss),
+                RowOutcome::Info(RowIssue::StringTruncated),
+            )
+            | (RowOutcome::Info(RowIssue::StringTruncatedWithCodePageLoss), RowOutcome::Info(_))
+            | (RowOutcome::Info(_), RowOutcome::Info(RowIssue::StringTruncatedWithCodePageLoss)) => {
+                RowOutcome::Info(RowIssue::StringTruncatedWithCodePageLoss)
+            }
             (i @ RowOutcome::Info(_), _) => i,
             (_, i @ RowOutcome::Info(_)) => i,
             _ => RowOutcome::Success,
@@ -413,6 +446,7 @@ struct BoundRowWriter<'a> {
     row_index: usize,
     /// Byte displacement from `SQL_ATTR_ROW_BIND_OFFSET_PTR`.
     bind_offset: usize,
+    text_output: TextOutput,
     /// Worst conversion outcome observed for this row.
     outcome: RowOutcome,
     /// Highest bound column ordinal consumed from the row.
@@ -430,12 +464,14 @@ impl<'a> BoundRowWriter<'a> {
         bindings: &'a [ColumnBinding],
         row_index: usize,
         bind_offset: usize,
+        text_output: TextOutput,
     ) -> BoundRowWriter<'a> {
         BoundRowWriter {
             bindings,
             next_binding: 0,
             row_index,
             bind_offset,
+            text_output,
             outcome: RowOutcome::Success,
             last_column_read: 0,
         }
@@ -466,7 +502,15 @@ impl<'a> BoundRowWriter<'a> {
         let Some(binding) = self.take_binding(col) else {
             return;
         };
-        let delivered = unsafe { deliver_bound(binding, self.row_index, self.bind_offset, &value) };
+        let delivered = unsafe {
+            deliver_bound(
+                binding,
+                self.row_index,
+                self.bind_offset,
+                &value,
+                self.text_output,
+            )
+        };
         self.outcome = self.outcome.merge(delivered);
     }
 
@@ -483,7 +527,15 @@ impl<'a> BoundRowWriter<'a> {
         let delivered = if binding.target_type == target_type {
             unsafe { deliver_fixed_bound(binding, self.row_index, self.bind_offset, value) }
         } else {
-            unsafe { deliver_bound(binding, self.row_index, self.bind_offset, &fallback()) }
+            unsafe {
+                deliver_bound(
+                    binding,
+                    self.row_index,
+                    self.bind_offset,
+                    &fallback(),
+                    self.text_output,
+                )
+            }
         };
         self.outcome = self.outcome.merge(delivered);
     }
@@ -514,7 +566,15 @@ impl<'a> BoundRowWriter<'a> {
                 Err(error) => typed_conv_outcome(Err(error)),
             }
         } else {
-            unsafe { deliver_bound(binding, self.row_index, self.bind_offset, &value()) }
+            unsafe {
+                deliver_bound(
+                    binding,
+                    self.row_index,
+                    self.bind_offset,
+                    &value(),
+                    self.text_output,
+                )
+            }
         };
         self.outcome = self.outcome.merge(delivered);
     }
@@ -567,7 +627,14 @@ impl RowWriter for BoundRowWriter<'_> {
             return;
         };
         let delivered = unsafe {
-            deliver_encoded_string(binding, self.row_index, self.bind_offset, bytes, encoding)
+            deliver_encoded_string(
+                binding,
+                self.row_index,
+                self.bind_offset,
+                bytes,
+                encoding,
+                self.text_output,
+            )
         };
         self.outcome = self.outcome.merge(delivered);
     }
@@ -838,17 +905,25 @@ fn fetch_scroll_safe(
         };
         env_state.odbc_version
     };
+    let client_encoding = {
+        let Ok(dbc_state) = stmt.parent_dbc().inner.lock() else {
+            error!("SQLFetchScroll: dbc mutex poisoned reading client encoding");
+            return SQL_ERROR;
+        };
+        dbc_state.client_encoding
+    };
 
     // Under the STMT lock: validate, resolve the effective ARD and claim the
     // statement. The lock is released before any DESC lock (§7.1) and before
     // network I/O. The claim precedes every descriptor read so no rebind or
     // rowset setter (either spelling) can slip in between read and claim.
-    let (ard, column_count, trailing_utf16_plp, exhausted) = {
+    let (ard, column_count, trailing_utf16_plp, exhausted, text_output) = {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("SQLFetchScroll: stmt mutex poisoned");
             return SQL_ERROR;
         };
         free_errors(&mut stmt_state);
+        stmt_state.text_output.encoding = client_encoding;
 
         if fetch_orientation != SQL_FETCH_NEXT {
             error!(
@@ -881,6 +956,7 @@ fn fetch_scroll_safe(
             stmt_state.column_metadata.len(),
             trailing_utf16_plp,
             stmt_state.result_set_exhausted,
+            stmt_state.text_output,
         )
     };
 
@@ -988,6 +1064,7 @@ fn fetch_scroll_safe(
         row_bind_offset_ptr,
         reusable_get_data_row,
         buffer_trailing_utf16_plp,
+        text_output,
     );
 
     // Single clearing point for the guard, so every early return inside the
@@ -1011,6 +1088,7 @@ fn fill_rowset(
     row_bind_offset_ptr: *mut SqlULen,
     mut reusable_get_data_row: Option<BufferedGetDataRow>,
     buffer_trailing_utf16_plp: bool,
+    text_output: TextOutput,
 ) -> SqlReturn {
     // The application asked for at most `SQL_ATTR_MAX_ROWS` rows from this
     // result set. Once that many have been returned the cursor stops without
@@ -1163,7 +1241,8 @@ fn fill_rowset(
         let mut outcome = RowOutcome::Success;
         let mut columns_read = 0usize;
         if can_write_complete_rows {
-            let mut writer = BoundRowWriter::new(bindings, rows_filled as usize, bind_offset);
+            let mut writer =
+                BoundRowWriter::new(bindings, rows_filled as usize, bind_offset, text_output);
             let result = match client.try_next_buffered_row_into(&mut writer) {
                 Ok(BufferedRowPoll::Complete) => Ok(()),
                 Ok(BufferedRowPoll::Partial) => {
@@ -1326,7 +1405,13 @@ fn fill_rowset(
                 columns_read = column;
                 let result = match pulled {
                     Ok(CursorColumn::Value { value, .. }) => unsafe {
-                        deliver_bound(binding, rows_filled as usize, bind_offset, &value)
+                        deliver_bound(
+                            binding,
+                            rows_filled as usize,
+                            bind_offset,
+                            &value,
+                            text_output,
+                        )
                     },
                     Ok(CursorColumn::PlpStreaming { .. }) => {
                         let scratch = plp_scratch.get_or_insert_with(|| vec![0u8; PLP_BOUND_CHUNK]);
@@ -1339,6 +1424,7 @@ fn fill_rowset(
                                 bind_offset,
                                 plp_columns.get(column - 1).copied().flatten(),
                                 scratch,
+                                text_output,
                             )
                         };
                         match delivered {
@@ -1799,6 +1885,82 @@ fn trim_partial_utf8(bytes: &mut Vec<u8>) {
     }
 }
 
+fn client_text_outcome(truncated: bool, loss: bool) -> RowOutcome {
+    match (truncated, loss) {
+        (true, true) => RowOutcome::Info(RowIssue::StringTruncated)
+            .merge(RowOutcome::Info(RowIssue::CodePageLoss)),
+        (true, false) => RowOutcome::Info(RowIssue::StringTruncated),
+        // msodbcsql's sqlcdata.h success exit bypasses the warning poster,
+        // even when WARN_ON_CP_ERROR is enabled and conversion was lossy.
+        (false, _) => RowOutcome::Success,
+    }
+}
+
+fn client_hex_pair_width(text_output: TextOutput) -> Result<usize, DiagMsg> {
+    let width = text_output.encoding.encode("00")?.bytes.len();
+    if width == 0 {
+        Err(ERR_INTERNAL_CONVERSION)
+    } else {
+        Ok(width)
+    }
+}
+
+fn whole_pair_capacity(capacity: usize, pair_width: usize) -> usize {
+    capacity / pair_width * pair_width
+}
+
+/// # Safety
+/// `slot` is null or writable for `capacity` bytes, and `length` is null or
+/// writable for one `SqlLen`.
+unsafe fn deliver_client_text(
+    slot: *mut u8,
+    length: *mut SqlLen,
+    capacity: usize,
+    text: &str,
+    text_output: TextOutput,
+) -> RowOutcome {
+    let encoded = match text_output.encoding.encode(text) {
+        Ok(encoded) => encoded,
+        Err(diag) => return RowOutcome::Error(diag.into()),
+    };
+    let payload_capacity = if slot.is_null() {
+        0
+    } else {
+        capacity.saturating_sub(1)
+    };
+    let take = match text_output
+        .encoding
+        .prefix_len(&encoded.bytes, payload_capacity)
+    {
+        Ok(take) => take,
+        Err(diag) => return RowOutcome::Error(diag.into()),
+    };
+    let truncated = take < encoded.bytes.len();
+    let loss = if text_output.warn_on_loss && encoded.had_loss {
+        if truncated {
+            match text_output.range_has_loss(text, 0, take) {
+                Ok(loss) => loss,
+                Err(diag) => return RowOutcome::Error(diag.into()),
+            }
+        } else {
+            true
+        }
+    } else {
+        false
+    };
+    unsafe {
+        write_if_some(
+            length,
+            SqlLen::try_from(encoded.bytes.len()).unwrap_or(SqlLen::MAX),
+        );
+        if !slot.is_null() && capacity > 0 {
+            std::ptr::copy_nonoverlapping(encoded.bytes.as_ptr(), slot, take);
+            slot.add(take).write(0);
+        }
+    }
+    client_text_outcome(truncated, loss)
+}
+
 /// Clears a stale `SQL_NULL_DATA` a split indicator pointer could still be
 /// holding from an earlier NULL row, before non-NULL data is delivered to
 /// independent length/indicator pointers — otherwise a later non-NULL row
@@ -1853,6 +2015,7 @@ unsafe fn displaced_len_ptr(ptr: *mut SqlLen, bind_offset: usize, row_index: usi
 ///
 /// # Safety
 /// Same contract as `deliver_bound`.
+#[allow(clippy::too_many_arguments)]
 unsafe fn deliver_bound_plp(
     client: &mut mssql_tds::connection::tds_client::TdsClient,
     runtime: &tokio::runtime::Runtime,
@@ -1861,6 +2024,7 @@ unsafe fn deliver_bound_plp(
     bind_offset: usize,
     column_info: Option<PlpColumnInfo>,
     scratch: &mut [u8],
+    text_output: TextOutput,
 ) -> Result<RowOutcome, TdsError> {
     // Unreachable today, kept as a guard rather than an `unreachable!()`.
     // The PLP snapshot is skipped only when every column is non-PLP, so
@@ -1906,8 +2070,27 @@ unsafe fn deliver_bound_plp(
                 row_index,
                 bind_offset,
                 &ColumnValues::String(SqlString::new(bytes, text_encoding)),
+                text_output,
             )
         });
+    }
+
+    if binding.target_type == SQL_C_CHAR
+        && !text_output.encoding.is_utf8()
+        && (column_info.text_encoding.is_some() || !text_output.encoding.is_ascii_compatible())
+    {
+        return unsafe {
+            deliver_bound_client_plp(
+                client,
+                runtime,
+                binding,
+                row_index,
+                bind_offset,
+                column_info,
+                scratch,
+                text_output,
+            )
+        };
     }
 
     let stride = element_stride(binding.target_type, binding.buffer_length);
@@ -1932,9 +2115,8 @@ unsafe fn deliver_bound_plp(
     let narrow_wire_encoding = column_info
         .text_encoding
         .and_then(|encoding| encoding.resolved_encoding());
-    // Codepage text delivered as SQL_C_CHAR must be decoded through the column's
-    // collation, since SQL_C_CHAR output is UTF-8 (AB#47566). A UTF-8 collation
-    // is already in the target encoding, so it stays on the verbatim path.
+    // Non-UTF-8 client text was routed above. Keep this UTF-8 path's conversion
+    // and length-accounting rules unchanged (AB#47566).
     let transcode_narrow_to_utf8 = target == SQL_C_CHAR
         && matches!(encoding, PlpEncoding::SingleByteText)
         && narrow_wire_encoding.is_some_and(|encoding| encoding != encoding_rs::UTF_8.into());
@@ -2243,6 +2425,189 @@ unsafe fn deliver_bound_plp(
     })
 }
 
+/// Streams through Unicode into the client code page, retaining a source
+/// decoder across chunks. Once a complete target character cannot fit, the
+/// remaining stream is drained without conversion. Memory is bounded by the
+/// scratch chunk, not the LOB or the size of the application's buffer.
+///
+/// # Safety
+/// Same bound-buffer contract as [`deliver_bound_plp`].
+#[allow(clippy::too_many_arguments)]
+unsafe fn deliver_bound_client_plp(
+    client: &mut mssql_tds::connection::tds_client::TdsClient,
+    runtime: &tokio::runtime::Runtime,
+    binding: &ColumnBinding,
+    row_index: usize,
+    bind_offset: usize,
+    column_info: PlpColumnInfo,
+    scratch: &mut [u8],
+    text_output: TextOutput,
+) -> Result<RowOutcome, TdsError> {
+    let mut decoder = match column_info.text_encoding {
+        Some(encoding) => match encoding.resolved_encoding() {
+            Some(encoding) => Some(encoding.new_decoder_without_bom_handling()),
+            None => {
+                drain_plp_to_end(client, runtime, scratch)?;
+                return Ok(RowOutcome::Error(RowIssue::Unsupported));
+            }
+        },
+        None => None,
+    };
+    let stride = element_stride(binding.target_type, binding.buffer_length);
+    let slot = if binding.target_value_ptr.is_null() {
+        std::ptr::null_mut()
+    } else {
+        unsafe {
+            binding
+                .target_value_ptr
+                .cast::<u8>()
+                .add(bind_offset + row_index * stride)
+        }
+    };
+    let indicator = unsafe { displaced_len_ptr(binding.strlen_or_ind_ptr, bind_offset, row_index) };
+    let length = unsafe { displaced_len_ptr(binding.octet_length_ptr, bind_offset, row_index) };
+    let capacity = if slot.is_null() {
+        0
+    } else {
+        stride.saturating_sub(1)
+    };
+    let hex_pair_width = if decoder.is_none() {
+        match client_hex_pair_width(text_output) {
+            Ok(width) => Some(width),
+            Err(diag) => {
+                drain_plp_to_end(client, runtime, scratch)?;
+                return Ok(RowOutcome::Error(diag.into()));
+            }
+        }
+    } else {
+        None
+    };
+    let capacity = hex_pair_width.map_or(capacity, |width| whole_pair_capacity(capacity, width));
+    let mut decoded = Vec::new();
+    let mut produced = 0_usize;
+    let mut truncated = false;
+    let mut loss = false;
+    let mut conversion_error = None;
+    let mut wire_total: Option<u64>;
+    let narrow_source = matches!(
+        column_info.wire_encoding,
+        PlpEncoding::SingleByteText | PlpEncoding::Utf8Text
+    );
+    let mut converted_bytes = 0_usize;
+    let mut converted_wire_read = 0_usize;
+
+    loop {
+        let read_limit = if narrow_source && !truncated {
+            capacity.saturating_sub(produced).max(1).min(scratch.len())
+        } else {
+            scratch.len()
+        };
+        let chunk = runtime.block_on(client.read_active_plp_chunk(&mut scratch[..read_limit]))?;
+        wire_total = chunk.known_total;
+        if !truncated && conversion_error.is_none() {
+            decoded.clear();
+            if let Some(decoder) = decoder.as_mut() {
+                decode_narrow_into_pending(
+                    decoder,
+                    &mut decoded,
+                    &scratch[..chunk.read],
+                    chunk.reached_end,
+                );
+            } else {
+                for byte in &scratch[..chunk.read] {
+                    decoded.extend_from_slice(&crate::api::get_data::hex_pair(*byte));
+                }
+            }
+            let converted = (|| -> Result<(), DiagMsg> {
+                let text =
+                    std::str::from_utf8(&decoded).map_err(|_| ERR_INVALID_CHARACTER_VALUE)?;
+                let encoded = text_output.encoding.encode(text)?;
+                converted_bytes = converted_bytes.saturating_add(encoded.bytes.len());
+                converted_wire_read = chunk.total_read;
+                let take = text_output
+                    .encoding
+                    .prefix_len(&encoded.bytes, capacity.saturating_sub(produced))?;
+                truncated = take < encoded.bytes.len();
+                if text_output.warn_on_loss && encoded.had_loss {
+                    loss |= if truncated {
+                        text_output.range_has_loss(text, 0, take)?
+                    } else {
+                        true
+                    };
+                }
+                if take > 0 {
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            encoded.bytes.as_ptr(),
+                            slot.add(produced),
+                            take,
+                        )
+                    };
+                }
+                produced += take;
+                Ok(())
+            })();
+            if let Err(diag) = converted {
+                conversion_error = Some(RowOutcome::Error(diag.into()));
+            }
+            if narrow_source
+                && truncated
+                && !chunk.reached_end
+                && let Some(decoder) = decoder.as_mut()
+            {
+                decoded.resize(decoder.max_utf8_buffer_length(0).unwrap_or(16), 0);
+                let (result, _, written) =
+                    decoder.decode_to_utf8_without_replacement(&[], &mut decoded, true);
+                if let encoding_rs::DecoderResult::Malformed(length, after) = result {
+                    converted_wire_read = converted_wire_read
+                        .saturating_sub(usize::from(length) + usize::from(after));
+                }
+                if written != 0 {
+                    let converted = std::str::from_utf8(&decoded[..written])
+                        .map_err(|_| ERR_INVALID_CHARACTER_VALUE)
+                        .and_then(|text| text_output.encoding.encode(text));
+                    match converted {
+                        Ok(encoded) => {
+                            converted_bytes = converted_bytes.saturating_add(encoded.bytes.len());
+                        }
+                        Err(diag) => conversion_error = Some(RowOutcome::Error(diag.into())),
+                    }
+                }
+            }
+        }
+        if chunk.reached_end {
+            break;
+        }
+    }
+    if let Some(error) = conversion_error {
+        return Ok(error);
+    }
+    unsafe {
+        clear_stale_null_indicator(indicator, length);
+        write_if_some(
+            length,
+            if let Some(width) = hex_pair_width {
+                plp_indicator(
+                    produced,
+                    truncated,
+                    false,
+                    wire_total.and_then(|total| total.checked_mul(width as u64)),
+                )
+            } else if truncated && narrow_source {
+                converted_narrow_indicator(wire_total, converted_wire_read, converted_bytes)
+            } else if truncated {
+                SQL_NO_TOTAL
+            } else {
+                SqlLen::try_from(produced).unwrap_or(SqlLen::MAX)
+            },
+        );
+        if !slot.is_null() && stride > 0 {
+            slot.add(produced).write(0);
+        }
+    }
+    Ok(client_text_outcome(truncated, loss))
+}
+
 /// Consumes whatever is left of the active PLP stream and discards it.
 fn drain_plp_to_end(
     client: &mut mssql_tds::connection::tds_client::TdsClient,
@@ -2272,22 +2637,29 @@ unsafe fn deliver_encoded_string(
     bind_offset: usize,
     bytes: Cow<'_, [u8]>,
     encoding: EncodingType,
+    text_output: TextOutput,
 ) -> RowOutcome {
     let direct_char = binding.target_type == SQL_C_CHAR
-        && (matches!(encoding, EncodingType::Utf8) && std::str::from_utf8(&bytes).is_ok()
-            || matches!(encoding, EncodingType::LcidBased(_)) && bytes.is_ascii());
+        && ((text_output.encoding.is_utf8()
+            && matches!(encoding, EncodingType::Utf8)
+            && std::str::from_utf8(&bytes).is_ok())
+            || (text_output.encoding.is_ascii_compatible()
+                && matches!(encoding, EncodingType::Utf8 | EncodingType::LcidBased(_))
+                && bytes.is_ascii()));
     let direct_wchar = binding.target_type == SQL_C_WCHAR
         && matches!(encoding, EncodingType::Utf16)
         && bytes.len().is_multiple_of(2);
     let cp1252 = binding.target_type == SQL_C_WCHAR && is_cp1252(&encoding);
+    let client_char = binding.target_type == SQL_C_CHAR && !text_output.encoding.is_utf8();
 
-    if !direct_char && !direct_wchar && !cp1252 {
+    if !direct_char && !direct_wchar && !cp1252 && !client_char {
         return unsafe {
             deliver_bound(
                 binding,
                 row_index,
                 bind_offset,
                 &ColumnValues::String(SqlString::new(bytes.into_owned(), encoding)),
+                text_output,
             )
         };
     }
@@ -2311,6 +2683,20 @@ unsafe fn deliver_encoded_string(
         } else {
             RowOutcome::Success
         };
+    }
+    if client_char {
+        let text = if matches!(encoding, EncodingType::Utf8) {
+            match std::str::from_utf8(&bytes) {
+                Ok(text) => Cow::Borrowed(text),
+                Err(_) => return RowOutcome::Error(RowIssue::InvalidCharacter),
+            }
+        } else {
+            let Some(encoding) = encoding.resolved_encoding() else {
+                return RowOutcome::Error(RowIssue::Unsupported);
+            };
+            encoding.decode_without_bom_handling(&bytes).0
+        };
+        return unsafe { deliver_client_text(slot, octet_length, stride, &text, text_output) };
     }
 
     let byte_len = if cp1252 {
@@ -2374,8 +2760,9 @@ unsafe fn copy_bound_utf16le_with_nul(
 pub(crate) unsafe fn deliver_bound_value(
     binding: &ColumnBinding,
     value: &ColumnValues,
+    text_output: TextOutput,
 ) -> RowOutcome {
-    unsafe { deliver_bound(binding, 0, 0, value) }
+    unsafe { deliver_bound(binding, 0, 0, value, text_output) }
 }
 
 /// Writes one column value into its bound buffer slot for row `row_index`.
@@ -2389,6 +2776,7 @@ unsafe fn deliver_bound(
     row_index: usize,
     bind_offset: usize,
     value: &ColumnValues,
+    text_output: TextOutput,
 ) -> RowOutcome {
     // A zero stride only arises from a character or binary binding with
     // BufferLength 0, which msodbcsql treats as a length probe: the indicator
@@ -2504,7 +2892,19 @@ unsafe fn deliver_bound(
 
     let buf_elements = char_buf_elements(binding.target_type, stride);
     let buf_elements = if matches!(value, ColumnValues::Bytes(_)) {
-        hex_buffer_elements(buf_elements)
+        if binding.target_type == SQL_C_CHAR && !text_output.encoding.is_ascii_compatible() {
+            let width = match client_hex_pair_width(text_output) {
+                Ok(width) => width,
+                Err(diag) => return RowOutcome::Error(diag.into()),
+            };
+            if buf_elements == 0 {
+                0
+            } else {
+                whole_pair_capacity(buf_elements - 1, width) + 1
+            }
+        } else {
+            hex_buffer_elements(buf_elements)
+        }
     } else {
         buf_elements
     };
@@ -2516,6 +2916,11 @@ unsafe fn deliver_bound(
             return RowOutcome::Info(RowIssue::StringTruncated);
         }
     } else {
+        if !text_output.can_copy_utf8(text.as_bytes()) {
+            return unsafe {
+                deliver_client_text(slot, octet_length, buf_elements, &text, text_output)
+            };
+        }
         let bytes = text.as_bytes();
         unsafe { write_if_some(octet_length, bytes.len() as SqlLen) };
         let truncated = unsafe { copy_with_nul(slot, buf_elements, bytes) };
@@ -2660,6 +3065,636 @@ mod tests {
         s.diag_records.last().unwrap().sql_state
     }
 
+    fn client_output(code_page: u32, warn_on_loss: bool) -> TextOutput {
+        TextOutput {
+            encoding: crate::conversion::client_encoding::ClientEncoding::for_code_page(code_page)
+                .unwrap(),
+            warn_on_loss,
+        }
+    }
+
+    fn cp1252_loss_bytes(text: &str) -> Vec<u8> {
+        // Win32/glibc and musl have different native substitution characters.
+        let encoded = client_output(1252, true).encoding.encode(text).unwrap();
+        encoded.bytes.into_owned()
+    }
+
+    #[test]
+    fn bound_client_text_uses_target_bytes_and_whole_characters() {
+        for (code_page, text, expected) in [
+            (1252, "é€", &b"\xe9\x80"[..]),
+            (932, "あい", &b"\x82\xa0\x82\xa2"[..]),
+        ] {
+            let text_output = client_output(code_page, true);
+            for source_encoding in [EncodingType::Utf8, EncodingType::Utf16] {
+                let source = if matches!(source_encoding, EncodingType::Utf16) {
+                    text.encode_utf16()
+                        .flat_map(u16::to_le_bytes)
+                        .collect::<Vec<_>>()
+                } else {
+                    text.as_bytes().to_vec()
+                };
+                for capacity in 0..=expected.len() + 1 {
+                    let mut output = [0xcc_u8; 16];
+                    let mut length = -99;
+                    let binding = binding(
+                        1,
+                        SQL_C_CHAR,
+                        unsafe { output.as_mut_ptr().add(1).cast() },
+                        capacity as SqlLen,
+                        &mut length,
+                    );
+                    let outcome = unsafe {
+                        deliver_encoded_string(
+                            &binding,
+                            0,
+                            0,
+                            Cow::Borrowed(&source),
+                            source_encoding,
+                            text_output,
+                        )
+                    };
+                    let unit = if code_page == 932 { 2 } else { 1 };
+                    let take = (capacity.saturating_sub(1) / unit * unit).min(expected.len());
+                    assert_eq!(outcome, client_text_outcome(take < expected.len(), false));
+                    assert_eq!(length, expected.len() as SqlLen);
+                    assert_eq!(&output[1..1 + take], &expected[..take]);
+                    if capacity > 0 {
+                        assert_eq!(output[1 + take], 0);
+                    }
+                    assert_eq!(output[0], 0xcc);
+                    assert!(output[1 + capacity..].iter().all(|byte| *byte == 0xcc));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bound_client_text_reports_only_delivered_loss_and_keeps_both_warnings() {
+        let expected = cp1252_loss_bytes("AあZ");
+        let had_loss = client_output(1252, true)
+            .encoding
+            .encode("AあZ")
+            .unwrap()
+            .had_loss;
+        for warn_on_loss in [false, true] {
+            for capacity in [2, 3, 4] {
+                let mut output = [0xcc_u8; 8];
+                let mut length = -99;
+                let value = ColumnValues::String(SqlString::from_utf8_string("AあZ".into()));
+                let binding = binding(
+                    1,
+                    SQL_C_CHAR,
+                    output.as_mut_ptr().cast(),
+                    capacity,
+                    &mut length,
+                );
+                let outcome = unsafe {
+                    deliver_bound_value(&binding, &value, client_output(1252, warn_on_loss))
+                };
+                let take = capacity as usize - 1;
+                assert_eq!(&output[..take], &expected[..take]);
+                assert_eq!(output[take], 0);
+                assert_eq!(length, 3);
+                assert_eq!(
+                    outcome,
+                    client_text_outcome(capacity < 4, warn_on_loss && had_loss && take >= 2)
+                );
+            }
+        }
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let mut state = stmt.inner.lock().unwrap();
+        RowIssue::StringTruncatedWithCodePageLoss.post(&mut state);
+        assert_eq!(state.diag_records.len(), 2);
+        assert_eq!(state.diag_records[0].sql_state, SQLSTATE_01004);
+        assert_eq!(state.diag_records[1].sql_state, SQLSTATE_01000);
+        assert_eq!(
+            RowOutcome::Info(RowIssue::CodePageLoss)
+                .merge(RowOutcome::Info(RowIssue::StringTruncated)),
+            RowOutcome::Info(RowIssue::StringTruncatedWithCodePageLoss)
+        );
+        let diagnostic = ERR_INTERNAL_CONVERSION;
+        RowIssue::from(diagnostic).post(&mut state);
+        assert_eq!(
+            state.diag_records.last().unwrap().sql_state,
+            diagnostic.state
+        );
+    }
+
+    #[test]
+    fn bound_client_text_decodes_collations_and_variant_writer_uses_snapshot() {
+        use mssql_tds::token::tokens::SqlCollation;
+
+        let substituted = cp1252_loss_bytes("あ");
+        for (lcid, source, code_page, expected, loss) in [
+            (0x0409, &b"\xe9\x80"[..], 1252, &b"\xe9\x80"[..], false),
+            (0x0411, &b"\x82\xa0"[..], 932, &b"\x82\xa0"[..], false),
+            (0x0411, &b"\x82\xa0"[..], 1252, substituted.as_slice(), true),
+        ] {
+            let source_encoding = EncodingType::LcidBased(SqlCollation {
+                info: lcid,
+                lcid_language_id: lcid as i32,
+                col_flags: 0,
+                sort_id: 0,
+            });
+            let mut output = [[0xcc_u8; 8]; 2];
+            let mut lengths = [-99; 2];
+            let bindings = [binding(
+                1,
+                SQL_C_CHAR,
+                output.as_mut_ptr().cast(),
+                8,
+                lengths.as_mut_ptr(),
+            )];
+            let mut writer = BoundRowWriter::new(&bindings, 1, 0, client_output(code_page, true));
+            writer.write_variant_base_type(0, TdsDataType::BigVarChar);
+            writer.write_string(0, Cow::Borrowed(source), source_encoding);
+            assert_eq!(writer.outcome, client_text_outcome(false, loss));
+            assert_eq!(output[0], [0xcc; 8]);
+            assert_eq!(&output[1][..expected.len()], expected);
+            assert_eq!(output[1][expected.len()], 0);
+            assert_eq!(lengths, [-99, expected.len() as SqlLen]);
+        }
+    }
+
+    #[test]
+    fn bound_hex_capacity_keeps_whole_encoded_pairs() {
+        for width in [2, 4, 8] {
+            for capacity in 0..=24 {
+                let take = whole_pair_capacity(capacity, width);
+                assert!(take <= capacity);
+                assert_eq!(take % width, 0);
+                assert!(capacity - take < width);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bound_non_ascii_compatible_client_keeps_hex_pairs_and_lengths() {
+        use mssql_mock_tds::{ColumnDefinition, ColumnValue, QueryResponse, Row, SqlDataType};
+
+        let text_output = client_output(12000, false);
+        let expected: Vec<u8> = "ABCD"
+            .chars()
+            .flat_map(|ch| u32::from(ch).to_le_bytes())
+            .collect();
+        let value = ColumnValues::Bytes(vec![0xab, 0xcd]);
+        let response = QueryResponse::new(
+            vec![
+                ColumnDefinition::new("", SqlDataType::NVarCharMax),
+                ColumnDefinition::new("", SqlDataType::Int),
+            ],
+            vec![Row::new(vec![
+                ColumnValue::NVarCharMax(vec![vec![0xcdab]]),
+                ColumnValue::Int(42),
+            ])],
+        );
+        let h = TestHandles::with_env_dbc_stmt();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let _server = crate::test_support::connect_mock_server(dbc, "SELECT native_hex", response);
+        let mut state = dbc.inner.lock().unwrap();
+        let client = state.client.as_mut().unwrap();
+        for capacity in 0..=expected.len() + 1 {
+            let take = whole_pair_capacity(capacity.saturating_sub(1), 8);
+            for plp in [false, true] {
+                let mut output = [0xcc_u8; 24];
+                let mut length = -99;
+                let binding = binding(
+                    1,
+                    SQL_C_CHAR,
+                    output.as_mut_ptr().cast(),
+                    capacity as SqlLen,
+                    &mut length,
+                );
+                let outcome = if plp {
+                    dbc.runtime
+                        .block_on(client.execute("SELECT native_hex".into(), ()))
+                        .unwrap();
+                    assert!(dbc.runtime.block_on(client.next_row_cursor()).unwrap());
+                    assert!(matches!(
+                        dbc.runtime.block_on(client.read_row_column(0)).unwrap(),
+                        CursorColumn::PlpStreaming { .. }
+                    ));
+                    let mut scratch = [0; 1];
+                    let outcome = unsafe {
+                        deliver_bound_plp(
+                            client,
+                            &dbc.runtime,
+                            &binding,
+                            0,
+                            0,
+                            Some(PlpColumnInfo {
+                                wire_encoding: PlpEncoding::Binary,
+                                text_encoding: None,
+                            }),
+                            &mut scratch,
+                            text_output,
+                        )
+                    }
+                    .unwrap();
+                    assert!(matches!(
+                        dbc.runtime.block_on(client.read_row_column(1)).unwrap(),
+                        CursorColumn::Value {
+                            value: ColumnValues::Int(42),
+                            ..
+                        }
+                    ));
+                    assert!(!dbc.runtime.block_on(client.next_row_cursor()).unwrap());
+                    outcome
+                } else {
+                    unsafe { deliver_bound_value(&binding, &value, text_output) }
+                };
+                assert_eq!(outcome, client_text_outcome(take < expected.len(), false));
+                assert_eq!(length, 16);
+                assert_eq!(&output[..take], &expected[..take]);
+                if capacity > 0 {
+                    assert_eq!(output[take], 0);
+                }
+                assert!(output[capacity..].iter().all(|byte| *byte == 0xcc));
+            }
+        }
+        let mut output = [0xcc_u8; 16];
+        let mut length = -99;
+        let binding = binding(1, SQL_C_CHAR, output.as_mut_ptr().cast(), 16, &mut length);
+        assert_eq!(
+            unsafe {
+                deliver_encoded_string(
+                    &binding,
+                    0,
+                    0,
+                    Cow::Borrowed(b"AB"),
+                    EncodingType::Utf8,
+                    text_output,
+                )
+            },
+            RowOutcome::Success
+        );
+        assert_eq!(length, 8);
+        assert_eq!(&output[..9], b"A\0\0\0B\0\0\0\0");
+    }
+
+    #[test]
+    fn bound_client_encoding_preserves_wide_and_binary_outputs() {
+        let value = ColumnValues::String(SqlString::from_utf8_string("éあ😀".into()));
+        for target in [SQL_C_WCHAR, SQL_C_BINARY] {
+            for capacity in [0, 3, 7, 16] {
+                let mut baseline = [0xcc_u8; 16];
+                let mut expected_length = -99;
+                let baseline_binding = binding(
+                    1,
+                    target,
+                    baseline.as_mut_ptr().cast(),
+                    capacity,
+                    &mut expected_length,
+                );
+                let expected =
+                    unsafe { deliver_bound_value(&baseline_binding, &value, TextOutput::UTF8) };
+                for code_page in [1252, 932] {
+                    let mut output = [0xcc_u8; 16];
+                    let mut length = -99;
+                    let binding =
+                        binding(1, target, output.as_mut_ptr().cast(), capacity, &mut length);
+                    assert_eq!(
+                        unsafe {
+                            deliver_bound_value(&binding, &value, client_output(code_page, true))
+                        },
+                        expected
+                    );
+                    assert_eq!(output, baseline);
+                    assert_eq!(length, expected_length);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bound_client_plp_carries_source_and_target_characters_and_drains() {
+        use mssql_mock_tds::{ColumnDefinition, ColumnValue, QueryResponse, Row, SqlDataType};
+        use mssql_tds::token::tokens::SqlCollation;
+
+        let cp932 = EncodingType::LcidBased(SqlCollation {
+            info: 0x0411,
+            lcid_language_id: 0x0411,
+            col_flags: 0,
+            sort_id: 0,
+        });
+        let cp1252 = EncodingType::LcidBased(SqlCollation {
+            info: 0x0409,
+            lcid_language_id: 0x0409,
+            col_flags: 0,
+            sort_id: 0,
+        });
+        let supplementary_loss = cp1252_loss_bytes("A😀Z");
+        let dbcs_loss = cp1252_loss_bytes("あい");
+        // The system GB18030 converter can transliterate this character
+        // differently across platforms; this test covers PLP delivery.
+        #[cfg(unix)]
+        let gb18030_output = client_output(54936, false).encoding.encode("𠀀").unwrap();
+        let cases = [
+            (
+                EncodingType::Utf16,
+                PlpEncoding::Utf16Text,
+                vec![0x41, 0x00, 0x3d, 0xd8, 0x00, 0xde, 0x5a, 0x00],
+                1252,
+                supplementary_loss.as_slice(),
+                client_output(1252, true)
+                    .encoding
+                    .encode("A😀Z")
+                    .unwrap()
+                    .had_loss,
+            ),
+            #[cfg(unix)]
+            (
+                EncodingType::Utf16,
+                PlpEncoding::Utf16Text,
+                vec![0x40, 0xd8, 0x00, 0xdc],
+                54936,
+                gb18030_output.bytes.as_ref(),
+                gb18030_output.had_loss,
+            ),
+            (
+                EncodingType::Utf16,
+                PlpEncoding::Utf16Text,
+                vec![0x42, 0x30, 0x44, 0x30],
+                932,
+                &b"\x82\xa0\x82\xa2"[..],
+                false,
+            ),
+            (
+                cp932,
+                PlpEncoding::SingleByteText,
+                vec![0x82, 0xa0, 0x82, 0xa2],
+                932,
+                &b"\x82\xa0\x82\xa2"[..],
+                false,
+            ),
+            (
+                cp932,
+                PlpEncoding::SingleByteText,
+                vec![0x82, 0xa0, 0x82, 0xa2],
+                1252,
+                dbcs_loss.as_slice(),
+                client_output(1252, true)
+                    .encoding
+                    .encode("あい")
+                    .unwrap()
+                    .had_loss,
+            ),
+            (
+                cp1252,
+                PlpEncoding::SingleByteText,
+                vec![0xe9, 0x80],
+                1252,
+                &b"\xe9\x80"[..],
+                false,
+            ),
+            (
+                EncodingType::Utf8,
+                PlpEncoding::Utf8Text,
+                "あZ".as_bytes().to_vec(),
+                932,
+                &b"\x82\xa0Z"[..],
+                false,
+            ),
+        ];
+        for (source_encoding, wire_encoding, source, code_page, expected, had_loss) in cases {
+            // The raw UTF-16 carrier provides arbitrary even-sized payloads.
+            // One-byte scratch reads independently force every source split.
+            let chunks = source
+                .chunks_exact(2)
+                .map(|pair| vec![u16::from_le_bytes([pair[0], pair[1]])])
+                .collect();
+            let response = QueryResponse::new(
+                vec![
+                    ColumnDefinition::new("", SqlDataType::NVarCharMax),
+                    ColumnDefinition::new("", SqlDataType::Int),
+                ],
+                vec![Row::new(vec![
+                    ColumnValue::NVarCharMax(chunks),
+                    ColumnValue::Int(42),
+                ])],
+            );
+            let h = TestHandles::with_env_dbc_stmt();
+            let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+            let _server =
+                crate::test_support::connect_mock_server(dbc, "SELECT client_plp", response);
+            let mut state = dbc.inner.lock().unwrap();
+            let client = state.client.as_mut().unwrap();
+            for warn_on_loss in [false, true] {
+                for capacity in 0..=expected.len() + 1 {
+                    dbc.runtime
+                        .block_on(client.execute("SELECT client_plp".into(), ()))
+                        .unwrap();
+                    assert!(dbc.runtime.block_on(client.next_row_cursor()).unwrap());
+                    assert!(matches!(
+                        dbc.runtime.block_on(client.read_row_column(0)).unwrap(),
+                        CursorColumn::PlpStreaming { .. }
+                    ));
+                    let mut output = [0xcc_u8; 16];
+                    let mut length = -99;
+                    let binding = binding(
+                        1,
+                        SQL_C_CHAR,
+                        output.as_mut_ptr().cast(),
+                        capacity as SqlLen,
+                        &mut length,
+                    );
+                    let text_output = client_output(code_page, warn_on_loss);
+                    let take = text_output
+                        .encoding
+                        .prefix_len(expected, capacity.saturating_sub(1))
+                        .unwrap();
+                    let mut scratch = [0; 1];
+                    let outcome = unsafe {
+                        deliver_bound_plp(
+                            client,
+                            &dbc.runtime,
+                            &binding,
+                            0,
+                            0,
+                            Some(PlpColumnInfo {
+                                wire_encoding,
+                                text_encoding: Some(source_encoding),
+                            }),
+                            &mut scratch,
+                            text_output,
+                        )
+                    }
+                    .unwrap();
+                    let loss_offset = usize::from(expected.first() == Some(&b'A'));
+                    let loss_in_prefix = had_loss && take > loss_offset;
+                    assert_eq!(
+                        outcome,
+                        client_text_outcome(take < expected.len(), warn_on_loss && loss_in_prefix)
+                    );
+                    assert_eq!(
+                        length,
+                        if take < expected.len() && wire_encoding == PlpEncoding::Utf16Text {
+                            SQL_NO_TOTAL
+                        } else if take == 0
+                            && source.len() > expected.len()
+                            && wire_encoding == PlpEncoding::SingleByteText
+                        {
+                            // One two-byte source character was converted to
+                            // one substitute; the unread pair is still wire bytes.
+                            (source.len() - 1) as SqlLen
+                        } else {
+                            expected.len() as SqlLen
+                        }
+                    );
+                    assert_eq!(&output[..take], &expected[..take]);
+                    if capacity > 0 {
+                        assert_eq!(output[take], 0);
+                    }
+                    assert!(output[capacity..].iter().all(|byte| *byte == 0xcc));
+                    assert!(matches!(
+                        dbc.runtime.block_on(client.read_row_column(1)).unwrap(),
+                        CursorColumn::Value {
+                            value: ColumnValues::Int(42),
+                            ..
+                        }
+                    ));
+                    assert!(!dbc.runtime.block_on(client.next_row_cursor()).unwrap());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fetch_preserves_statement_warning_setting_when_refreshing_encoding() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let encoding = client_output(932, false).encoding;
+        dbc.inner.lock().unwrap().client_encoding = encoding;
+        for warn_on_loss in [true, false] {
+            // Model a setter's fan-out occurring after an older DBC snapshot.
+            dbc.inner.lock().unwrap().warn_on_cp_error = !warn_on_loss;
+            stmt.inner.lock().unwrap().text_output.warn_on_loss = warn_on_loss;
+            assert_eq!(
+                unsafe { sql_fetch_scroll(h.stmt, SQL_FETCH_NEXT, 0) },
+                SQL_ERROR
+            );
+            let state = stmt.inner.lock().unwrap();
+            assert_eq!(state.text_output.encoding, encoding);
+            assert_eq!(state.text_output.warn_on_loss, warn_on_loss);
+            assert_eq!(
+                state.diag_records[0].sql_state,
+                ERR_INVALID_CURSOR_STATE.state
+            );
+        }
+    }
+
+    #[test]
+    fn fetch_snapshots_client_encoding_for_bound_row_arrays() {
+        use mssql_mock_tds::{ColumnDefinition, ColumnValue, QueryResponse, Row, SqlDataType};
+
+        let substituted = cp1252_loss_bytes("あ");
+        for plp in [false, true] {
+            for (code_page, text, expected, warn_on_loss) in [
+                (1252, "é€", &b"\xe9\x80"[..], true),
+                (932, "あい", &b"\x82\xa0\x82\xa2"[..], true),
+                (1252, "あ", substituted.as_slice(), true),
+                (1252, "あ", substituted.as_slice(), false),
+            ] {
+                let rows = (0..2)
+                    .map(|_| {
+                        Row::new(vec![if plp {
+                            ColumnValue::NVarCharMax(vec![text.encode_utf16().collect()])
+                        } else {
+                            ColumnValue::NVarChar(text.into())
+                        }])
+                    })
+                    .collect();
+                let response = QueryResponse::new(
+                    vec![ColumnDefinition::new(
+                        "",
+                        if plp {
+                            SqlDataType::NVarCharMax
+                        } else {
+                            SqlDataType::NVarChar
+                        },
+                    )],
+                    rows,
+                );
+                let h = TestHandles::with_env_dbc_stmt();
+                let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+                let _server =
+                    crate::test_support::connect_mock_server(dbc, "SELECT client_rows", response);
+                let text_output = client_output(code_page, warn_on_loss);
+                let mut output = [[0xcc_u8; 8]; 2];
+                let mut lengths = [-99; 2];
+                let mut statuses = [SQL_ROW_NOROW; 2];
+                let mut fetched = 0;
+                {
+                    let mut state = dbc.inner.lock().unwrap();
+                    state.client_encoding = text_output.encoding;
+                }
+                assert_eq!(
+                    unsafe {
+                        crate::api::set_connect_attr::sql_set_connect_attr_w(
+                            h.dbc,
+                            crate::api::odbc_types::SQL_COPT_SS_WARN_ON_CP_ERROR,
+                            usize::from(warn_on_loss) as SqlPointer,
+                            0,
+                        )
+                    },
+                    SQL_SUCCESS
+                );
+                let sql: Vec<u16> = "SELECT client_rows\0".encode_utf16().collect();
+                assert_eq!(
+                    unsafe {
+                        crate::api::exec_direct::sql_exec_direct_w(
+                            h.stmt,
+                            sql.as_ptr(),
+                            crate::api::odbc_types::SQL_NTS as _,
+                        )
+                    },
+                    SQL_SUCCESS
+                );
+                let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+                set_row_array_size(&h, 2);
+                set_rows_fetched_ptr(&h, &mut fetched);
+                set_row_status_ptr(&h, statuses.as_mut_ptr());
+                assert_eq!(
+                    unsafe {
+                        sql_bind_col(
+                            h.stmt,
+                            1,
+                            SQL_C_CHAR,
+                            output.as_mut_ptr().cast(),
+                            8,
+                            lengths.as_mut_ptr(),
+                        )
+                    },
+                    SQL_SUCCESS
+                );
+                assert_eq!(
+                    unsafe { sql_fetch_scroll(h.stmt, SQL_FETCH_NEXT, 0) },
+                    SQL_SUCCESS
+                );
+                assert_eq!(fetched, 2);
+                for row in 0..2 {
+                    assert_eq!(&output[row][..expected.len()], expected);
+                    assert_eq!(output[row][expected.len()], 0);
+                    assert_eq!(lengths[row], expected.len() as SqlLen);
+                    assert_eq!(statuses[row], SQL_ROW_SUCCESS);
+                }
+                assert_eq!(
+                    stmt.inner.lock().unwrap().text_output.encoding,
+                    text_output.encoding
+                );
+                assert_eq!(
+                    stmt.inner.lock().unwrap().text_output.warn_on_loss,
+                    warn_on_loss
+                );
+                assert!(stmt.inner.lock().unwrap().diag_records.is_empty());
+            }
+        }
+    }
+
     // The live BoundTruncationPreservesOnlyCompletePairs test covers SQL Server.
     // This mock additionally forces the pair across a PLP wire-chunk boundary.
     #[test]
@@ -2741,6 +3776,7 @@ mod tests {
                             text_encoding: Some(EncodingType::Utf16),
                         }),
                         &mut scratch,
+                        TextOutput::UTF8,
                     )
                 }
                 .unwrap();
@@ -2841,6 +3877,7 @@ mod tests {
                             })),
                         }),
                         &mut scratch,
+                        TextOutput::UTF8,
                     )
                 }
                 .unwrap();
@@ -2931,6 +3968,7 @@ mod tests {
                     })),
                 }),
                 &mut scratch,
+                TextOutput::UTF8,
             )
         }
         .unwrap();
@@ -3964,7 +5002,7 @@ mod tests {
         let value = ColumnValues::Uuid(uuid::Uuid::from_u128(
             0x0102_0304_0506_0708_090A_0B0C_0D0E_0F10,
         ));
-        let outcome = unsafe { deliver_bound(&bindings[0], 0, 0, &value) };
+        let outcome = unsafe { deliver_bound(&bindings[0], 0, 0, &value, TextOutput::UTF8) };
         assert!(
             matches!(outcome, RowOutcome::Error(RowIssue::Unsupported)),
             "the row must fail rather than overrun the slot, got {outcome:?}"
@@ -5127,7 +6165,8 @@ mod tests {
             ind.as_mut_ptr(),
         );
         for (row, value) in [10i32, 20, 30].iter().enumerate() {
-            let outcome = unsafe { deliver_bound(&b, row, 0, &ColumnValues::Int(*value)) };
+            let outcome =
+                unsafe { deliver_bound(&b, row, 0, &ColumnValues::Int(*value), TextOutput::UTF8) };
             assert!(matches!(outcome, RowOutcome::Success));
         }
         assert_eq!(buf, [10, 20, 30, 0]);
@@ -5180,8 +6219,16 @@ mod tests {
             strlen_or_ind_ptr: &mut indicator,
             octet_length_ptr: &mut octet_length,
         };
-        let outcome =
-            unsafe { deliver_encoded_string(&b, 0, 0, Cow::Borrowed(b"hi"), EncodingType::Utf8) };
+        let outcome = unsafe {
+            deliver_encoded_string(
+                &b,
+                0,
+                0,
+                Cow::Borrowed(b"hi"),
+                EncodingType::Utf8,
+                TextOutput::UTF8,
+            )
+        };
         assert!(matches!(outcome, RowOutcome::Success));
         assert_eq!(&buf[..2], b"hi");
         assert_eq!(octet_length, 2, "the length must land on the octet pointer");
@@ -5233,7 +6280,7 @@ mod tests {
             wide_ind.as_mut_ptr(),
         );
         let bindings = [narrow_binding, wide_binding];
-        let mut writer = BoundRowWriter::new(&bindings, 0, 0);
+        let mut writer = BoundRowWriter::new(&bindings, 0, 0, TextOutput::UTF8);
 
         writer.write_string(0, Cow::Borrowed(b"hello"), EncodingType::Utf8);
         writer.write_string(1, Cow::Borrowed(b"h\0i\0"), EncodingType::Utf16);
@@ -5266,7 +6313,7 @@ mod tests {
                 ptr::null_mut(),
             ),
         ];
-        let mut writer = BoundRowWriter::new(&bindings, 0, 0);
+        let mut writer = BoundRowWriter::new(&bindings, 0, 0, TextOutput::UTF8);
 
         writer.write_i32(0, 10);
         writer.write_i32(1, 20);
@@ -5301,7 +6348,10 @@ mod tests {
                     scale: 7,
                 },
             });
-            assert_eq!(unsafe { deliver_bound(&column, 0, 0, &value) }, expected);
+            assert_eq!(
+                unsafe { deliver_bound(&column, 0, 0, &value, TextOutput::UTF8) },
+                expected
+            );
             assert_eq!(indicator, 0);
             assert_eq!(
                 length,
@@ -5338,7 +6388,10 @@ mod tests {
                 } else {
                     RowOutcome::Success
                 };
-                assert_eq!(unsafe { deliver_bound(&column, 0, 0, &value) }, expected);
+                assert_eq!(
+                    unsafe { deliver_bound(&column, 0, 0, &value, TextOutput::UTF8) },
+                    expected
+                );
                 assert_eq!(indicator, 0);
                 assert_eq!(length, if target == SQL_C_WCHAR { 38 } else { 19 });
             }
@@ -5474,7 +6527,7 @@ mod tests {
                     octet_length_ptr: octet_lengths.as_mut_ptr().cast(),
                 };
                 let bindings = [column];
-                let mut writer = BoundRowWriter::new(&bindings, 1, 1);
+                let mut writer = BoundRowWriter::new(&bindings, 1, 1, TextOutput::UTF8);
                 match value {
                     ColumnValues::Time(value) => writer.write_time(1, value.clone()),
                     ColumnValues::DateTime2(value) => writer.write_datetime2(1, value.clone()),
@@ -5495,7 +6548,7 @@ mod tests {
                 assert_eq!(writer.outcome.status(), SQL_ROW_ERROR);
                 assert_eq!(writer.last_column_read, 2);
                 assert_eq!(
-                    unsafe { deliver_bound(&bindings[0], 1, 1, value) },
+                    unsafe { deliver_bound(&bindings[0], 1, 1, value, TextOutput::UTF8) },
                     writer.outcome
                 );
                 assert_eq!(output, [0xA5; 80]);
@@ -5540,12 +6593,20 @@ mod tests {
             }];
             let before = current_local_date().unwrap();
             let outcome = if use_writer {
-                let mut writer = BoundRowWriter::new(&bindings, 0, 0);
+                let mut writer = BoundRowWriter::new(&bindings, 0, 0, TextOutput::UTF8);
                 writer.write_time(0, value);
                 assert_eq!(writer.last_column_read, 1);
                 writer.outcome
             } else {
-                unsafe { deliver_bound(&bindings[0], 0, 0, &ColumnValues::Time(value)) }
+                unsafe {
+                    deliver_bound(
+                        &bindings[0],
+                        0,
+                        0,
+                        &ColumnValues::Time(value),
+                        TextOutput::UTF8,
+                    )
+                }
             };
             let after = current_local_date().unwrap();
             assert_eq!(outcome, RowOutcome::Success, "use_writer={use_writer}");
@@ -5582,10 +6643,11 @@ mod tests {
                     unsafe { baseline_ind.as_mut_ptr().add(1) }.cast(),
                 );
                 let bindings = [direct_binding];
-                let mut writer = BoundRowWriter::new(&bindings, 1, 1);
+                let mut writer = BoundRowWriter::new(&bindings, 1, 1, TextOutput::UTF8);
 
                 $write(&mut writer);
-                let expected = unsafe { deliver_bound(&baseline_binding, 1, 1, &value) };
+                let expected =
+                    unsafe { deliver_bound(&baseline_binding, 1, 1, &value, TextOutput::UTF8) };
                 let slot_offset = 2 + element_stride($target, 64);
                 let direct_value = unsafe {
                     direct_data
@@ -5812,7 +6874,7 @@ mod tests {
             0,
             ptr::null_mut(),
         )];
-        let mut writer = BoundRowWriter::new(&bindings, 0, 0);
+        let mut writer = BoundRowWriter::new(&bindings, 0, 0, TextOutput::UTF8);
 
         writer.write_i32(1, 42);
         writer.write_string(2, Cow::Borrowed(b"unused"), EncodingType::Utf8);
@@ -5836,7 +6898,7 @@ mod tests {
             ptr::null_mut(),
         );
         let bindings = [invalid_binding];
-        let mut writer = BoundRowWriter::new(&bindings, 0, 0);
+        let mut writer = BoundRowWriter::new(&bindings, 0, 0, TextOutput::UTF8);
         writer.write_string(0, Cow::Borrowed(&[0xFF]), EncodingType::Utf8);
         assert_eq!(
             writer.outcome,
@@ -5853,7 +6915,7 @@ mod tests {
             &mut probe_indicator,
         );
         let bindings = [probe_binding];
-        let mut writer = BoundRowWriter::new(&bindings, 0, 0);
+        let mut writer = BoundRowWriter::new(&bindings, 0, 0, TextOutput::UTF8);
         writer.write_string(0, Cow::Borrowed(b"h\0"), EncodingType::Utf16);
         assert_eq!(writer.outcome, RowOutcome::Info(RowIssue::StringTruncated));
         assert_eq!(probe_indicator, 2);
@@ -5867,7 +6929,7 @@ mod tests {
             ptr::null_mut(),
         );
         let bindings = [truncated_binding];
-        let mut writer = BoundRowWriter::new(&bindings, 0, 0);
+        let mut writer = BoundRowWriter::new(&bindings, 0, 0, TextOutput::UTF8);
         writer.write_string(0, Cow::Borrowed(b"h\0i\0"), EncodingType::Utf16);
         assert_eq!(truncated, [u16::from(b'h'), 0]);
         assert_eq!(writer.outcome, RowOutcome::Info(RowIssue::StringTruncated));
@@ -5929,7 +6991,7 @@ mod tests {
         ] {
             for row in [0, 2] {
                 for offset in [0, 1] {
-                    let mut writer = BoundRowWriter::new(&bindings, row, offset);
+                    let mut writer = BoundRowWriter::new(&bindings, row, offset, TextOutput::UTF8);
                     writer.write_string(0, Cow::Borrowed(bytes), encoding);
                     assert_eq!(writer.outcome, RowOutcome::Success);
                     assert_eq!(writer.last_column_read, 0);
@@ -5982,8 +7044,9 @@ mod tests {
                                     1,
                                     Cow::Borrowed(&bytes),
                                     encoding,
+                                    TextOutput::UTF8,
                                 ),
-                                1 => deliver_bound(&b, row, 1, &value),
+                                1 => deliver_bound(&b, row, 1, &value, TextOutput::UTF8),
                                 _ => {
                                     let b = ColumnBinding {
                                         target_value_ptr: output.as_mut_ptr().add(offset).cast(),
@@ -5999,7 +7062,7 @@ mod tests {
                                             .cast(),
                                         ..b
                                     };
-                                    deliver_bound_value(&b, &value)
+                                    deliver_bound_value(&b, &value, TextOutput::UTF8)
                                 }
                             }
                         };
@@ -6088,6 +7151,7 @@ mod tests {
                                 1,
                                 Cow::Borrowed(&bytes),
                                 EncodingType::Utf16,
+                                TextOutput::UTF8,
                             )
                         }
                     } else {
@@ -6100,6 +7164,7 @@ mod tests {
                                     bytes.clone(),
                                     EncodingType::Utf16,
                                 )),
+                                TextOutput::UTF8,
                             )
                         }
                     };
@@ -6147,7 +7212,7 @@ mod tests {
             0,
             ind.as_mut_ptr(),
         );
-        let outcome = unsafe { deliver_bound(&b, 1, 0, &ColumnValues::Null) };
+        let outcome = unsafe { deliver_bound(&b, 1, 0, &ColumnValues::Null, TextOutput::UTF8) };
         assert!(matches!(outcome, RowOutcome::Success));
         assert_eq!(ind[1], SQL_NULL_DATA);
         assert_eq!(buf[1], 7, "a NULL must not disturb the data slot");
@@ -6173,7 +7238,7 @@ mod tests {
                     )
                 };
                 assert_eq!(
-                    unsafe { deliver_bound(&b, 1, 0, &ColumnValues::Null) },
+                    unsafe { deliver_bound(&b, 1, 0, &ColumnValues::Null, TextOutput::UTF8) },
                     RowOutcome::Success
                 );
                 assert_eq!(buffer, [0x7E; 66]);
@@ -6204,7 +7269,7 @@ mod tests {
         };
 
         let value = ColumnValues::Bytes(vec![1, 2, 3, 4, 5, 6]);
-        let outcome = unsafe { deliver_bound(&b, 0, 0, &value) };
+        let outcome = unsafe { deliver_bound(&b, 0, 0, &value, TextOutput::UTF8) };
 
         assert!(matches!(
             outcome,
@@ -6232,7 +7297,7 @@ mod tests {
             ind.as_mut_ptr(),
         );
         let value = ColumnValues::Int(1234567890);
-        let outcome = unsafe { deliver_bound(&b, 0, 0, &value) };
+        let outcome = unsafe { deliver_bound(&b, 0, 0, &value, TextOutput::UTF8) };
         assert!(matches!(
             outcome,
             RowOutcome::Info(RowIssue::StringTruncated)
@@ -6297,7 +7362,7 @@ mod tests {
         );
 
         let value = ColumnValues::String(SqlString::new(b"hello".to_vec(), EncodingType::Utf8));
-        let outcome = unsafe { deliver_bound(&b, 0, 0, &value) };
+        let outcome = unsafe { deliver_bound(&b, 0, 0, &value, TextOutput::UTF8) };
 
         assert!(matches!(
             outcome,
@@ -6428,7 +7493,7 @@ mod tests {
             0,
             ptr::null_mut(),
         );
-        let outcome = unsafe { deliver_bound(&b, 0, 0, &ColumnValues::Null) };
+        let outcome = unsafe { deliver_bound(&b, 0, 0, &ColumnValues::Null, TextOutput::UTF8) };
         assert_eq!(outcome.issue(), Some(RowIssue::IndicatorRequired));
         assert_eq!(outcome.status(), SQL_ROW_ERROR);
         assert_eq!(
@@ -6448,7 +7513,7 @@ mod tests {
             0,
             ptr::null_mut(),
         );
-        let outcome = unsafe { deliver_bound(&b, 0, 0, &ColumnValues::Int(42)) };
+        let outcome = unsafe { deliver_bound(&b, 0, 0, &ColumnValues::Int(42), TextOutput::UTF8) };
         assert!(matches!(outcome, RowOutcome::Success));
         assert_eq!(buf[0], 42);
     }
@@ -6469,7 +7534,8 @@ mod tests {
         // A whole-rowset displacement, which is what the attribute is for: a
         // byte count that leaves both arrays naturally aligned.
         let offset = std::mem::size_of::<SqlLen>();
-        let outcome = unsafe { deliver_bound(&b, 0, offset, &ColumnValues::Int(99)) };
+        let outcome =
+            unsafe { deliver_bound(&b, 0, offset, &ColumnValues::Int(99), TextOutput::UTF8) };
         assert!(matches!(outcome, RowOutcome::Success));
         assert_eq!(buf[0], 0, "the offset must skip past the first slots");
         assert_eq!(buf[offset / std::mem::size_of::<i32>()], 99);
@@ -6498,7 +7564,8 @@ mod tests {
             0,
             ind.as_mut_ptr(),
         );
-        let outcome = unsafe { deliver_bound(&b, 0, 0, &ColumnValues::BigInt(i64::MAX)) };
+        let outcome =
+            unsafe { deliver_bound(&b, 0, 0, &ColumnValues::BigInt(i64::MAX), TextOutput::UTF8) };
         assert_eq!(outcome.issue(), Some(RowIssue::OutOfRange));
 
         // A target this driver does not deliver is HYC00, not a truncation.
@@ -6510,7 +7577,8 @@ mod tests {
             8,
             ind.as_mut_ptr(),
         );
-        let outcome = unsafe { deliver_bound(&unsupported, 0, 0, &ColumnValues::Int(1)) };
+        let outcome =
+            unsafe { deliver_bound(&unsupported, 0, 0, &ColumnValues::Int(1), TextOutput::UTF8) };
         assert_eq!(outcome.issue(), Some(RowIssue::Unsupported));
     }
 

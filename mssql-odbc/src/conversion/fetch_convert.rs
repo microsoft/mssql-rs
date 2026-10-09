@@ -42,6 +42,52 @@ use mssql_tds::datatypes::column_values::{
 };
 use mssql_tds::datatypes::sql_string::{EncodingType, SqlString};
 
+use super::client_encoding::ClientEncoding;
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TextOutput {
+    pub(crate) encoding: ClientEncoding,
+    pub(crate) warn_on_loss: bool,
+}
+
+impl TextOutput {
+    pub(crate) const UTF8: Self = Self {
+        encoding: ClientEncoding::UTF8,
+        warn_on_loss: false,
+    };
+
+    pub(crate) fn can_copy_utf8(self, bytes: &[u8]) -> bool {
+        self.encoding.is_utf8() || (self.encoding.is_ascii_compatible() && bytes.is_ascii())
+    }
+
+    /// Counts loss only where encoded characters overlap the delivered byte range.
+    pub(crate) fn range_has_loss(
+        self,
+        text: &str,
+        offset: usize,
+        length: usize,
+    ) -> Result<bool, crate::api::sqlstate::DiagMsg> {
+        if length == 0 {
+            return Ok(false);
+        }
+        let end = offset.saturating_add(length);
+        let mut written = 0_usize;
+        let mut scalar = [0; 4];
+        for ch in text.chars() {
+            let encoded = self.encoding.encode(ch.encode_utf8(&mut scalar))?;
+            let next = written.saturating_add(encoded.bytes.len());
+            if next > offset && written < end && encoded.had_loss {
+                return Ok(true);
+            }
+            written = next;
+            if written >= end {
+                break;
+            }
+        }
+        Ok(false)
+    }
+}
+
 /// Decodes a character column without the panicking paths in
 /// `SqlString::to_utf8_string` (its UTF-8 branch unwraps); the UTF-16 and LCID
 /// branches decode through `encoding_rs`, which substitutes replacement
