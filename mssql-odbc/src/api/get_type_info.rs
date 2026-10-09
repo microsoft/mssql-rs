@@ -69,11 +69,12 @@ pub(crate) unsafe fn sql_get_type_info_w(
     statement_handle: SqlHandle,
     data_type: SqlSmallInt,
 ) -> SqlReturn {
-    debug!(?statement_handle, data_type, "SQLGetTypeInfoW called");
-
-    crate::ffi_entry!("SQLGetTypeInfoW", unsafe {
-        sql_get_type_info_w_impl(statement_handle, data_type)
-    })
+    crate::ffi_entry!(
+        "SQLGetTypeInfoW",
+        statement_handle,
+        debug!(?statement_handle, data_type, "SQLGetTypeInfoW called"),
+        unsafe { sql_get_type_info_w_impl(statement_handle, data_type) }
+    )
 }
 
 /// # Safety
@@ -154,6 +155,7 @@ fn sql_get_type_info_w_safe(
         stmt_state.parameter_udt_names.clear();
         stmt_state.clear_state(STMT_STATE_PREPARED);
         stmt_state.set_state(STMT_STATE_EXEC_STARTED);
+        mssql_tds::trace_context::activate_execution();
         stmt_state.query_timeout
     };
 

@@ -35,14 +35,18 @@ use crate::api::odbc_types::{SQL_FETCH_NEXT, SqlHandle, SqlReturn};
 /// values, and `SQL_ATTR_ROW_BIND_OFFSET_PTR` must be readable for one
 /// `SqlULen`, whenever those attributes are non-null.
 pub(crate) unsafe fn sql_fetch(statement_handle: SqlHandle) -> SqlReturn {
-    debug!(?statement_handle, "SQLFetch called");
-    crate::ffi_entry!("SQLFetch", unsafe {
-        let rc = sql_fetch_scroll_impl(statement_handle, SQL_FETCH_NEXT, 0);
-        if rc == crate::api::odbc_types::SQL_ERROR {
-            error!("SQLFetch: fetch failed");
+    crate::ffi_entry!(
+        "SQLFetch",
+        statement_handle,
+        debug!(?statement_handle, "SQLFetch called"),
+        unsafe {
+            let rc = sql_fetch_scroll_impl(statement_handle, SQL_FETCH_NEXT, 0);
+            if rc == crate::api::odbc_types::SQL_ERROR {
+                error!("SQLFetch: fetch failed");
+            }
+            rc
         }
-        rc
-    })
+    )
 }
 
 #[cfg(test)]

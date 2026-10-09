@@ -6,9 +6,9 @@
 //! Reports the attributes `SQLSetConnectAttrW` accepts, so a set/get round-trip
 //! returns the configured value (matching msodbcsql, which answers
 //! `SQL_ATTR_ACCESS_MODE`, `SQL_ATTR_PACKET_SIZE` and the two timeouts at
-//! `sqlcmisc.cpp:3038-3391`). `SQL_ATTR_CURRENT_CATALOG` is the one character
-//! attribute. Any other identifier returns `HY092` rather than claiming success
-//! without writing.
+//! `sqlcmisc.cpp:3038-3391`). Current catalog and client connection ID are
+//! character attributes. Unsupported identifiers return a diagnostic rather
+//! than claiming success without writing.
 
 use mssql_tds::connection::client_context::DEFAULT_CONNECT_TIMEOUT_SECS;
 use tracing::{debug, error};
@@ -20,13 +20,14 @@ use crate::api::odbc_types::{
     SQL_ATTR_ACCESS_MODE, SQL_ATTR_AUTOCOMMIT, SQL_ATTR_CONNECTION_DEAD,
     SQL_ATTR_CONNECTION_TIMEOUT, SQL_ATTR_CURRENT_CATALOG, SQL_ATTR_LOGIN_TIMEOUT,
     SQL_ATTR_PACKET_SIZE, SQL_ATTR_TXN_ISOLATION, SQL_AUTOCOMMIT_OFF, SQL_AUTOCOMMIT_ON,
-    SQL_CD_FALSE, SQL_CD_TRUE, SQL_COPT_SS_ENCRYPT, SQL_COPT_SS_INTEGRATED_SECURITY,
-    SQL_COPT_SS_TRUST_SERVER_CERTIFICATE, SQL_COPT_SS_TXN_ISOLATION, SQL_COPT_SS_WARN_ON_CP_ERROR,
-    SQL_EN_ON, SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS, SQL_WARN_NO, SQL_WARN_YES, SqlHandle,
-    SqlInteger, SqlPointer, SqlReturn,
+    SQL_CD_FALSE, SQL_CD_TRUE, SQL_COPT_SS_CLIENT_CONNECTION_ID, SQL_COPT_SS_ENCRYPT,
+    SQL_COPT_SS_INTEGRATED_SECURITY, SQL_COPT_SS_TRUST_SERVER_CERTIFICATE,
+    SQL_COPT_SS_TXN_ISOLATION, SQL_COPT_SS_WARN_ON_CP_ERROR, SQL_EN_ON, SQL_ERROR,
+    SQL_INVALID_HANDLE, SQL_SUCCESS, SQL_WARN_NO, SQL_WARN_YES, SqlHandle, SqlInteger, SqlPointer,
+    SqlReturn,
 };
 use crate::api::util::write_if_some;
-use crate::error::free_errors;
+use crate::error::{free_errors, post_sql_error};
 use crate::handles::dbc::ConnectionState;
 use crate::handles::{DbcHandle, HandleType, handle_from_raw};
 
@@ -39,8 +40,9 @@ const DEFAULT_LOGIN_TIMEOUT_SECS: u32 = DEFAULT_CONNECT_TIMEOUT_SECS;
 /// # Safety
 /// - `connection_handle` must be a valid `DbcHandle` from `SQLAllocHandle`.
 /// - `value_ptr`, when non-null, must be writable for `buffer_length` bytes for
-///   `SQL_ATTR_CURRENT_CATALOG`, or for one value of the requested fixed-width
-///   attribute type otherwise.
+///   current catalog or client connection ID, or for one value of the requested
+///   fixed-width attribute type otherwise. A client connection ID request with
+///   `SQL_NO_TOTAL` requires a 74-byte output buffer.
 /// - `string_length_ptr`, when non-null, must be writable for one `SqlInteger`.
 pub(crate) unsafe fn sql_get_connect_attr_w(
     connection_handle: SqlHandle,
@@ -49,32 +51,35 @@ pub(crate) unsafe fn sql_get_connect_attr_w(
     buffer_length: SqlInteger,
     string_length_ptr: *mut SqlInteger,
 ) -> SqlReturn {
-    debug!(
-        ?connection_handle,
-        attribute,
-        ?value_ptr,
-        buffer_length,
-        ?string_length_ptr,
-        "SQLGetConnectAttrW called",
-    );
-
-    crate::ffi_entry!("SQLGetConnectAttrW", unsafe {
-        sql_get_connect_attr_w_impl(
-            connection_handle,
+    crate::ffi_entry!(
+        "SQLGetConnectAttrW",
+        connection_handle,
+        debug!(
+            ?connection_handle,
             attribute,
-            value_ptr,
+            ?value_ptr,
             buffer_length,
-            string_length_ptr,
-        )
-    })
+            ?string_length_ptr,
+            "SQLGetConnectAttrW called",
+        ),
+        unsafe {
+            sql_get_connect_attr_w_impl(
+                connection_handle,
+                attribute,
+                value_ptr,
+                buffer_length,
+                string_length_ptr,
+            )
+        }
+    )
 }
 
 /// # Safety
 /// `connection_handle` must be null or point to a live `DbcHandle`.
 /// `value_ptr`, when non-null, must be writable for `buffer_length` bytes for
-/// `SQL_ATTR_CURRENT_CATALOG`, or for one value of the requested fixed-width
-/// attribute type otherwise. `string_length_ptr`, when non-null, must be
-/// writable for one `SqlInteger`.
+/// current catalog or client connection ID, or for one fixed-width attribute
+/// value otherwise. `SQL_NO_TOTAL` requires a 74-byte client connection ID
+/// buffer. `string_length_ptr` must be null or writable for one `SqlInteger`.
 unsafe fn sql_get_connect_attr_w_impl(
     connection_handle: SqlHandle,
     attribute: SqlInteger,
@@ -121,6 +126,49 @@ fn sql_get_connect_attr_w_safe(
     free_errors(&mut state);
 
     match attribute {
+        SQL_COPT_SS_CLIENT_CONNECTION_ID => {
+            if state.connection_state != ConnectionState::Connected {
+                post_diag(&mut state, ERR_CONNECTION_DOES_NOT_EXIST);
+                return SQL_ERROR;
+            }
+            let Some(id) = state
+                .identity
+                .client_connection_id
+                .as_ref()
+                .and_then(|identity| identity.client_connection_id())
+            else {
+                error!("SQLGetConnectAttrW: connected session has no client connection ID");
+                post_sql_error(
+                    &mut *state,
+                    SQLSTATE_HY000,
+                    0,
+                    "Connected session has no client connection ID",
+                );
+                return SQL_ERROR;
+            };
+            // msodbcsql's getter uses PrintGUID and fCopyStrToBuffer, not a
+            // binary SQLGUID (sqlcmisc.cpp, SQL_COPT_SS_CLIENT_CONNECTION_ID).
+            let mut buffer = uuid::Uuid::encode_buffer();
+            let value = id.hyphenated().encode_upper(&mut buffer);
+            let buffer_length = if buffer_length == -4 {
+                // The reference accepts SQL_NO_TOTAL for a full string buffer.
+                74
+            } else if buffer_length < 0 {
+                post_diag(&mut state, ERR_INVALID_STRING_OR_BUFFER_LENGTH);
+                return SQL_ERROR;
+            } else {
+                buffer_length
+            };
+            unsafe {
+                super::util::write_wide_attr(
+                    &mut *state,
+                    value_ptr.cast(),
+                    buffer_length,
+                    string_length_ptr,
+                    value,
+                )
+            }
+        }
         SQL_ATTR_LOGIN_TIMEOUT => {
             if value_ptr.is_null() {
                 error!("SQLGetConnectAttrW: SQL_ATTR_LOGIN_TIMEOUT value pointer is null");
@@ -281,6 +329,204 @@ mod tests {
     use crate::api::set_connect_attr::sql_set_connect_attr_w;
     use crate::handles::dbc::VendorConnOverrides;
     use crate::test_support::TestHandles;
+
+    fn install_identity(h: &TestHandles, id: uuid::Uuid) {
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        dbc.trace.establish(id);
+        let mut state = dbc.inner.lock().unwrap();
+        state.connection_state = ConnectionState::Connected;
+        state.identity.client_connection_id = Some(std::sync::Arc::clone(&dbc.trace));
+    }
+
+    #[test]
+    fn client_connection_id_is_a_wide_string_and_tracks_reconnect() {
+        let h = TestHandles::with_env_dbc();
+        for id in [uuid::Uuid::new_v4(), uuid::Uuid::new_v4()] {
+            install_identity(&h, id);
+            let mut output = [0_u16; 37];
+            let mut length = -1;
+            assert_eq!(
+                unsafe {
+                    crate::api::exports::SQLGetConnectAttrW(
+                        h.dbc,
+                        SQL_COPT_SS_CLIENT_CONNECTION_ID,
+                        output.as_mut_ptr().cast(),
+                        74,
+                        &mut length,
+                    )
+                },
+                SQL_SUCCESS
+            );
+            assert_eq!(length, 72);
+            assert_eq!(output[36], 0);
+            assert_eq!(
+                uuid::Uuid::parse_str(&String::from_utf16(&output[..36]).unwrap()).unwrap(),
+                id
+            );
+        }
+    }
+
+    #[test]
+    fn client_connection_id_length_probe_truncation_and_invalid_length() {
+        let h = TestHandles::with_env_dbc();
+        install_identity(&h, uuid::Uuid::new_v4());
+        let mut length = -1;
+        assert_eq!(
+            unsafe {
+                crate::api::exports::SQLGetConnectAttrW(
+                    h.dbc,
+                    SQL_COPT_SS_CLIENT_CONNECTION_ID,
+                    std::ptr::null_mut(),
+                    0,
+                    &mut length,
+                )
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!(length, 72);
+        let mut output = [0xffff_u16; 5];
+        assert_eq!(
+            unsafe {
+                crate::api::exports::SQLGetConnectAttrW(
+                    h.dbc,
+                    SQL_COPT_SS_CLIENT_CONNECTION_ID,
+                    output.as_mut_ptr().cast(),
+                    8,
+                    &mut length,
+                )
+            },
+            crate::api::odbc_types::SQL_SUCCESS_WITH_INFO
+        );
+        assert_eq!(length, 72);
+        assert_eq!(output[3], 0);
+        assert_eq!(output[4], 0xffff);
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        assert_eq!(
+            dbc.inner.lock().unwrap().diag_records[0].sql_state,
+            *b"01004"
+        );
+        assert_eq!(
+            unsafe {
+                crate::api::exports::SQLGetConnectAttrW(
+                    h.dbc,
+                    SQL_COPT_SS_CLIENT_CONNECTION_ID,
+                    output.as_mut_ptr().cast(),
+                    -2,
+                    &mut length,
+                )
+            },
+            SQL_ERROR
+        );
+        assert_eq!(
+            dbc.inner.lock().unwrap().diag_records[0].sql_state,
+            SQLSTATE_HY090
+        );
+    }
+
+    #[test]
+    fn client_connection_id_requires_a_connection_and_is_read_only() {
+        let h = TestHandles::with_env_dbc();
+        assert_eq!(
+            unsafe {
+                crate::api::exports::SQLGetConnectAttrW(
+                    h.dbc,
+                    SQL_COPT_SS_CLIENT_CONNECTION_ID,
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                )
+            },
+            SQL_ERROR
+        );
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        assert_eq!(
+            dbc.inner.lock().unwrap().diag_records[0].sql_state,
+            *b"08003"
+        );
+        assert_eq!(
+            unsafe {
+                crate::api::exports::SQLSetConnectAttrW(
+                    h.dbc,
+                    SQL_COPT_SS_CLIENT_CONNECTION_ID,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            },
+            SQL_ERROR
+        );
+        assert_eq!(
+            dbc.inner.lock().unwrap().diag_records[0].sql_state,
+            SQLSTATE_HY092
+        );
+        assert_eq!(
+            unsafe {
+                crate::api::exports::SQLGetConnectAttrW(
+                    std::ptr::null_mut(),
+                    SQL_COPT_SS_CLIENT_CONNECTION_ID,
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                )
+            },
+            SQL_INVALID_HANDLE
+        );
+    }
+
+    #[test]
+    fn client_connection_id_accepts_unaligned_and_legacy_unbounded_buffers() {
+        let h = TestHandles::with_env_dbc();
+        let id = uuid::Uuid::new_v4();
+        install_identity(&h, id);
+        let mut output = crate::test_support::AlignedBuffer([0xaa_u8; 76]);
+        let mut length = -1;
+        assert_eq!(
+            unsafe {
+                crate::api::SQLGetConnectAttrW(
+                    h.dbc,
+                    SQL_COPT_SS_CLIENT_CONNECTION_ID,
+                    output.0.as_mut_ptr().add(1).cast(),
+                    -4,
+                    &mut length,
+                )
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!(length, 72);
+        assert_eq!(output.0[0], 0xaa);
+        assert_eq!(output.0[75], 0xaa);
+        assert_eq!(&output.0[73..75], &[0, 0]);
+        let text: Vec<_> = output.0[1..73]
+            .chunks_exact(2)
+            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+            .collect();
+        assert_eq!(
+            String::from_utf16(&text).unwrap(),
+            id.to_string().to_uppercase()
+        );
+    }
+
+    #[test]
+    fn missing_connected_identity_is_an_explicit_error() {
+        let h = TestHandles::with_env_dbc();
+        h.mark_dbc_connected();
+        assert_eq!(
+            unsafe {
+                crate::api::SQLGetConnectAttrW(
+                    h.dbc,
+                    SQL_COPT_SS_CLIENT_CONNECTION_ID,
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                )
+            },
+            SQL_ERROR
+        );
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        assert_eq!(
+            dbc.inner.lock().unwrap().diag_records[0].sql_state,
+            SQLSTATE_HY000
+        );
+    }
 
     #[test]
     fn login_timeout_set_get_round_trips() {

@@ -380,10 +380,12 @@ impl<'a, 'n> Serializer<'a, 'n> {
     }
 
     async fn write_trace_id(&mut self) -> TdsResult<()> {
-        let activity_id_bytes = self.model.activity_id.as_bytes();
-        let connection_id_bytes = self.model.connection_id.as_bytes();
-        self.payload_writer.write_async(activity_id_bytes).await?;
-        self.payload_writer.write_async(connection_id_bytes).await?;
+        let connection_id_bytes = self.model.connection_id.to_bytes_le();
+        let activity_id_bytes = self.model.activity_id.to_bytes_le();
+        self.payload_writer
+            .write_async(&connection_id_bytes)
+            .await?;
+        self.payload_writer.write_async(&activity_id_bytes).await?;
         self.payload_writer
             .write_i32_async(self.model.activity_sequence_number)
             .await?;
@@ -505,6 +507,42 @@ pub(crate) mod tests {
         let start = payload_start + version_offset;
         let version = &cursor.get_ref()[start..start + version_len];
         assert_eq!(version, &[2, 5, 0x04, 0xD2, 0, 0]);
+    }
+
+    #[test]
+    fn trace_id_uses_connection_then_activity_in_guid_byte_order() {
+        let mut model = PreloginRequestModel::new(
+            Uuid::from_u128(0x01234567_89ab_cdef_0123_456789abcdef),
+            Some(false),
+            Some(EncryptionSetting::Required),
+            Some("MSSQLServer"),
+            DriverVersion::new(2, 5, 1234),
+        );
+        model.activity_id = Uuid::from_u128(0xfedcba98_7654_3210_fedc_ba9876543210);
+        model.activity_sequence_number = 0x12345678;
+        let mut mock = MockNetworkWriter::new(1024);
+        let mut writer = PacketWriter::new(PacketType::PreLogin, &mut mock, None, None);
+        block_on(Serializer::new(&model, &mut writer).serialize()).unwrap();
+        let mut payload = writer.get_payload();
+        let start = payload.position() as usize;
+        loop {
+            let token = payload.read_u8().unwrap();
+            assert_ne!(token, 0xff, "TRACEID option missing");
+            let offset = payload.read_u16::<BigEndian>().unwrap() as usize;
+            let length = payload.read_u16::<BigEndian>().unwrap() as usize;
+            if token == OptionType::TraceId.to_u8() {
+                assert_eq!(length, 36);
+                assert_eq!(
+                    &payload.get_ref()[start + offset..start + offset + length],
+                    &[
+                        0x67, 0x45, 0x23, 0x01, 0xab, 0x89, 0xef, 0xcd, 0x01, 0x23, 0x45, 0x67,
+                        0x89, 0xab, 0xcd, 0xef, 0x98, 0xba, 0xdc, 0xfe, 0x54, 0x76, 0x10, 0x32,
+                        0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32, 0x10, 0x78, 0x56, 0x34, 0x12,
+                    ]
+                );
+                break;
+            }
+        }
     }
 
     #[test]

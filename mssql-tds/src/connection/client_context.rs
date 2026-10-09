@@ -251,6 +251,10 @@ impl ClientContextValidator for DefaultClientContextValidator {
 /// Construct via [`ClientContext::with_data_source()`] and pass to
 /// [`TdsConnectionProvider::create_client()`](crate::connection_provider::tds_connection_provider::TdsConnectionProvider::create_client).
 pub struct ClientContext {
+    // New ClientContext state follows the pinned-box ownership convention.
+    #[allow(clippy::redundant_allocation)]
+    pub(crate) connection_trace:
+        Option<std::pin::Pin<Box<std::sync::Arc<crate::trace_context::ConnectionTrace>>>>,
     /// Read-write or read-only application intent. Default: `ReadWrite`.
     pub application_intent: ApplicationIntent,
     /// Application name reported in the TDS login packet.
@@ -538,6 +542,7 @@ impl ClientContext {
     /// ```
     pub fn with_data_source(data_source: &str) -> ClientContext {
         ClientContext {
+            connection_trace: None,
             application_intent: ApplicationIntent::ReadWrite,
             application_name: "TDSX Rust Client".to_string(),
             attach_db_file: "".to_string(),
@@ -602,6 +607,7 @@ impl ClientContext {
     )]
     pub fn new() -> ClientContext {
         ClientContext {
+            connection_trace: None,
             application_intent: ApplicationIntent::ReadWrite,
             application_name: "TDSX Rust Client".to_string(),
             attach_db_file: "".to_string(),
@@ -661,6 +667,14 @@ impl ClientContext {
             self.tds_authentication_method,
             TdsAuthenticationMethod::SSPI
         )
+    }
+
+    #[doc(hidden)]
+    pub fn set_connection_trace(
+        &mut self,
+        trace: std::sync::Arc<crate::trace_context::ConnectionTrace>,
+    ) {
+        self.connection_trace = Some(Box::pin(trace));
     }
 
     pub(crate) fn tds_version(&self) -> TdsVersion {
@@ -866,6 +880,7 @@ impl ClientContext {
 impl Clone for ClientContext {
     fn clone(&self) -> Self {
         ClientContext {
+            connection_trace: self.connection_trace.clone(),
             application_intent: self.application_intent,
             application_name: self.application_name.clone(),
             attach_db_file: self.attach_db_file.clone(),

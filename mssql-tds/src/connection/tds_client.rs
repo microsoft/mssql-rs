@@ -752,6 +752,9 @@ impl TdsClient {
         client_context: ClientContext,
         login_session_state_tokens: Vec<SessionStateToken>,
     ) -> Self {
+        if let Some(trace) = &client_context.connection_trace {
+            trace.establish(negotiated_settings.client_connection_id);
+        }
         let mut recovery_context = RecoveryContext::new();
         recovery_context.initialize(
             client_context,
@@ -1042,6 +1045,14 @@ impl TdsClient {
         // response report the reset as unacknowledged and discard a healthy,
         // brand-new connection.
         self.reset_state = ResetAckState::Idle;
+        if let Some(trace) = self
+            .recovery_context
+            .client_context
+            .as_ref()
+            .and_then(|context| context.connection_trace.as_ref())
+        {
+            trace.establish(self.negotiated_settings.client_connection_id);
+        }
         Ok(())
     }
 
@@ -1354,6 +1365,12 @@ impl TdsClient {
     /// (`@@SERVERNAME`), which is not necessarily the host the client dialled.
     pub fn server_reported_name(&self) -> Option<&str> {
         self.negotiated_settings.server_reported_name.as_deref()
+    }
+
+    /// The GUID sent in PRELOGIN for the current physical connection.
+    /// Changes after transparent recovery, but not after a pool reset.
+    pub fn client_connection_id(&self) -> uuid::Uuid {
+        self.negotiated_settings.client_connection_id
     }
 
     /// Returns the character-set name the server sent in the login
@@ -9903,6 +9920,45 @@ mod tests {
                 "{setting:?}"
             );
         }
+    }
+
+    #[test]
+    fn client_connection_id_tracks_physical_sessions_not_pool_resets() {
+        use crate::handler::handler_factory::create_test_negotiated_settings_internal;
+        use crate::trace_context::ConnectionTrace;
+
+        let trace = Arc::new(ConnectionTrace::default());
+        let mut context = ClientContext::default();
+        context.set_connection_trace(Arc::clone(&trace));
+        let first = uuid::Uuid::new_v4();
+        let second = uuid::Uuid::new_v4();
+        let mut settings = create_test_negotiated_settings_internal();
+        settings.client_connection_id = first;
+        let mut client = TdsClient::new(
+            AnyTransport::dynamic(TestTransport::new()),
+            settings,
+            ExecutionContext::new(),
+            context,
+            Vec::new(),
+        );
+        assert_eq!(client.client_connection_id(), first);
+        assert_eq!(trace.client_connection_id(), Some(first));
+        client.prepare_reset_connection(false);
+        assert_eq!(client.client_connection_id(), first);
+        assert_eq!(trace.client_connection_id(), Some(first));
+        let mut recovered = create_test_negotiated_settings_internal();
+        recovered.client_connection_id = second;
+        client
+            .adopt_recovered_session(
+                AnyTransport::dynamic(TestTransport::new()),
+                recovered,
+                ExecutionContext::new(),
+                Vec::new(),
+                &[],
+            )
+            .unwrap();
+        assert_eq!(client.client_connection_id(), second);
+        assert_eq!(trace.client_connection_id(), Some(second));
     }
 
     #[test]

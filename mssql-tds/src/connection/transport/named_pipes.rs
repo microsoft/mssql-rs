@@ -123,9 +123,9 @@ pub(crate) async fn open_named_pipe_with_retry(
                     // Wait for pipe to become available (synchronous Windows API call)
                     // Use spawn_blocking to avoid blocking the tokio runtime
                     let pipe_path_owned = pipe_path.to_string();
-                    match tokio::task::spawn_blocking(move || {
+                    match tokio::task::spawn_blocking(crate::trace_context::propagate(move || {
                         wait_for_named_pipe(&pipe_path_owned, remaining_ms)
-                    })
+                    }))
                     .await
                     {
                         Ok(Ok(())) => {

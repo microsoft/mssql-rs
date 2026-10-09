@@ -56,10 +56,12 @@ pub(crate) unsafe fn sql_param_data(
     statement_handle: SqlHandle,
     value_ptr_ptr: *mut SqlPointer,
 ) -> SqlReturn {
-    debug!(?statement_handle, ?value_ptr_ptr, "SQLParamData called");
-    crate::ffi_entry!("SQLParamData", unsafe {
-        sql_param_data_impl(statement_handle, value_ptr_ptr)
-    })
+    crate::ffi_entry!(
+        "SQLParamData",
+        statement_handle,
+        debug!(?statement_handle, ?value_ptr_ptr, "SQLParamData called"),
+        unsafe { sql_param_data_impl(statement_handle, value_ptr_ptr) }
+    )
 }
 
 /// # Safety

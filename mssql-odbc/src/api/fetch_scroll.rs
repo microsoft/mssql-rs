@@ -273,13 +273,15 @@ pub(crate) unsafe fn sql_fetch_scroll(
     fetch_orientation: SqlSmallInt,
     fetch_offset: SqlLen,
 ) -> SqlReturn {
-    debug!(
-        ?statement_handle,
-        fetch_orientation, fetch_offset, "SQLFetchScroll called"
-    );
-    crate::ffi_entry!("SQLFetchScroll", unsafe {
-        sql_fetch_scroll_impl(statement_handle, fetch_orientation, fetch_offset)
-    })
+    crate::ffi_entry!(
+        "SQLFetchScroll",
+        statement_handle,
+        debug!(
+            ?statement_handle,
+            fetch_orientation, fetch_offset, "SQLFetchScroll called"
+        ),
+        unsafe { sql_fetch_scroll_impl(statement_handle, fetch_orientation, fetch_offset) }
+    )
 }
 
 /// # Safety

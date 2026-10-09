@@ -24,32 +24,35 @@ use mssql_tds::connection::tds_client::{ExecuteOptions, StatementId};
 /// # Safety
 /// See the exported function's doc for caller requirements.
 pub(crate) unsafe fn sql_free_handle(handle_type: SqlSmallInt, handle: SqlHandle) -> SqlReturn {
-    debug!(handle_type, ?handle, "SQLFreeHandle called");
-
-    crate::ffi_entry!("SQLFreeHandle", {
-        if handle.is_null() {
-            error!("SQLFreeHandle: handle is null");
-            return SQL_INVALID_HANDLE;
-        }
-
-        match handle_type {
-            SQL_HANDLE_ENV => unsafe { free_env(handle) },
-            SQL_HANDLE_DBC => unsafe { free_dbc(handle) },
-            SQL_HANDLE_STMT => unsafe { free_stmt(handle) },
-            SQL_HANDLE_DESC => unsafe { free_desc(handle) },
-            SQL_HANDLE_DBC_INFO_TOKEN => {
-                error!(
-                    handle_type,
-                    "SQLFreeHandle: handle type not yet implemented"
-                );
-                SQL_ERROR
+    crate::ffi_entry!(
+        "SQLFreeHandle",
+        handle,
+        debug!(handle_type, ?handle, "SQLFreeHandle called"),
+        {
+            if handle.is_null() {
+                error!("SQLFreeHandle: handle is null");
+                return SQL_INVALID_HANDLE;
             }
-            _ => {
-                error!(handle_type, "SQLFreeHandle: unknown handle type");
-                SQL_INVALID_HANDLE
+
+            match handle_type {
+                SQL_HANDLE_ENV => unsafe { free_env(handle) },
+                SQL_HANDLE_DBC => unsafe { free_dbc(handle) },
+                SQL_HANDLE_STMT => unsafe { free_stmt(handle) },
+                SQL_HANDLE_DESC => unsafe { free_desc(handle) },
+                SQL_HANDLE_DBC_INFO_TOKEN => {
+                    error!(
+                        handle_type,
+                        "SQLFreeHandle: handle type not yet implemented"
+                    );
+                    SQL_ERROR
+                }
+                _ => {
+                    error!(handle_type, "SQLFreeHandle: unknown handle type");
+                    SQL_INVALID_HANDLE
+                }
             }
         }
-    })
+    )
 }
 
 /// Mirrors msodbcsql's `SQLFreeEnv` behavior.

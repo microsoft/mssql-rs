@@ -914,6 +914,7 @@ pub const SQL_SOPT_SS_NOCOUNT_STATUS: SqlInteger = 1231;
 pub const SQL_SOPT_SS_DEFER_PREPARE: SqlInteger = 1232;
 /// Query-notification subscription timeout, in seconds.
 pub const SQL_SOPT_SS_QUERYNOTIFICATION_TIMEOUT: SqlInteger = 1233;
+pub const SQL_COPT_SS_CLIENT_CONNECTION_ID: SqlInteger = 1233;
 /// Query-notification message text. String-valued.
 pub const SQL_SOPT_SS_QUERYNOTIFICATION_MSGTEXT: SqlInteger = 1234;
 /// Query-notification service/broker options. String-valued.

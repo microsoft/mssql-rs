@@ -52,16 +52,17 @@ pub(crate) unsafe fn sql_exec_direct_w(
     statement_text: *const SqlWChar,
     text_length: SqlSmallInt,
 ) -> SqlReturn {
-    debug!(
-        ?statement_handle,
-        ?statement_text,
-        text_length,
-        "SQLExecDirectW called",
-    );
-
-    crate::ffi_entry!("SQLExecDirectW", unsafe {
-        sql_exec_direct_w_impl(statement_handle, statement_text, text_length)
-    })
+    crate::ffi_entry!(
+        "SQLExecDirectW",
+        statement_handle,
+        debug!(
+            ?statement_handle,
+            ?statement_text,
+            text_length,
+            "SQLExecDirectW called",
+        ),
+        unsafe { sql_exec_direct_w_impl(statement_handle, statement_text, text_length) }
+    )
 }
 
 /// # Safety
@@ -140,6 +141,7 @@ fn sql_exec_direct_w_safe(
             return SQL_ERROR;
         }
         stmt_state.set_state(STMT_STATE_EXEC_STARTED);
+        mssql_tds::trace_context::activate_execution();
     }
 
     // Check STMT state, gather parameter values, and reset prior context.

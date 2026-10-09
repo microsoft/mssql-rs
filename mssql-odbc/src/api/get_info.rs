@@ -815,24 +815,27 @@ pub(crate) unsafe fn sql_get_info_w(
     buffer_length: SqlSmallInt,
     string_length_ptr: *mut SqlSmallInt,
 ) -> SqlReturn {
-    debug!(
-        ?connection_handle,
-        info_type,
-        ?info_value_ptr,
-        buffer_length,
-        ?string_length_ptr,
-        "SQLGetInfoW called",
-    );
-
-    crate::ffi_entry!("SQLGetInfoW", unsafe {
-        sql_get_info_w_impl(
-            connection_handle,
+    crate::ffi_entry!(
+        "SQLGetInfoW",
+        connection_handle,
+        debug!(
+            ?connection_handle,
             info_type,
-            info_value_ptr,
+            ?info_value_ptr,
             buffer_length,
-            string_length_ptr,
-        )
-    })
+            ?string_length_ptr,
+            "SQLGetInfoW called",
+        ),
+        unsafe {
+            sql_get_info_w_impl(
+                connection_handle,
+                info_type,
+                info_value_ptr,
+                buffer_length,
+                string_length_ptr,
+            )
+        }
+    )
 }
 
 /// # Safety
@@ -2533,6 +2536,7 @@ mod tests {
             let dbc_ref = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
             let mut state = dbc_ref.inner.lock().unwrap();
             state.identity = crate::handles::dbc::ConnectionIdentity {
+                client_connection_id: None,
                 data_source_name: "ReportingDsn".to_string(),
                 server_name: "SQLPROD01\\INST".to_string(),
             };

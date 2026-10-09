@@ -54,29 +54,32 @@ pub(crate) unsafe fn sql_driver_connect_w(
     string_length_2_ptr: *mut SqlSmallInt,
     driver_completion: SqlUSmallInt,
 ) -> SqlReturn {
-    debug!(
-        ?connection_handle,
-        window_handle = ?_window_handle,
-        ?in_connection_string,
-        string_length_1,
-        ?out_connection_string,
-        buffer_length,
-        ?string_length_2_ptr,
-        driver_completion,
-        "SQLDriverConnectW called",
-    );
-
-    crate::ffi_entry!("SQLDriverConnectW", unsafe {
-        sql_driver_connect_w_impl(
-            connection_handle,
-            in_connection_string,
+    crate::ffi_entry!(
+        "SQLDriverConnectW",
+        connection_handle,
+        debug!(
+            ?connection_handle,
+            window_handle = ?_window_handle,
+            ?in_connection_string,
             string_length_1,
-            out_connection_string,
+            ?out_connection_string,
             buffer_length,
-            string_length_2_ptr,
+            ?string_length_2_ptr,
             driver_completion,
-        )
-    })
+            "SQLDriverConnectW called",
+        ),
+        unsafe {
+            sql_driver_connect_w_impl(
+                connection_handle,
+                in_connection_string,
+                string_length_1,
+                out_connection_string,
+                buffer_length,
+                string_length_2_ptr,
+                driver_completion,
+            )
+        }
+    )
 }
 
 /// # Safety
@@ -400,6 +403,8 @@ fn do_connect(
     // identity, default credential) are rejected with HYC00. Off Windows an
     // interactive request resolves to AD integrated, as it does in msodbcsql.
     let mut context = ClientContext::default();
+    dbc.trace.clear();
+    context.set_connection_trace(std::sync::Arc::clone(&dbc.trace));
     configure_driver_identity(&mut context);
     // The connection string wins over a pre-connect
     // `SQLSetConnectAttr(SQL_ATTR_CURRENT_CATALOG)`: msodbcsql overwrites the
@@ -483,6 +488,7 @@ fn do_connect(
     state.effective_vendor_settings =
         Some(effective_vendor_settings(&params, client.is_encrypted()));
     state.identity = ConnectionIdentity {
+        client_connection_id: Some(std::sync::Arc::clone(&dbc.trace)),
         data_source_name: params.dsn.clone(),
         // The server names itself in the INFO tokens it sends at login; the host
         // the caller dialled is only a fallback for a server that sent none.

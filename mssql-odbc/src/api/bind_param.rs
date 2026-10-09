@@ -43,34 +43,37 @@ pub(crate) unsafe fn sql_bind_parameter(
     buffer_length: SqlLen,
     strlen_or_ind_ptr: *mut SqlLen,
 ) -> SqlReturn {
-    debug!(
-        ?statement_handle,
-        parameter_number,
-        input_output_type,
-        value_type,
-        parameter_type,
-        column_size,
-        decimal_digits,
-        ?parameter_value_ptr,
-        buffer_length,
-        ?strlen_or_ind_ptr,
-        "SQLBindParameter called",
-    );
-
-    crate::ffi_entry!("SQLBindParameter", unsafe {
-        sql_bind_parameter_impl(
-            statement_handle,
+    crate::ffi_entry!(
+        "SQLBindParameter",
+        statement_handle,
+        debug!(
+            ?statement_handle,
             parameter_number,
             input_output_type,
             value_type,
             parameter_type,
             column_size,
             decimal_digits,
-            parameter_value_ptr,
+            ?parameter_value_ptr,
             buffer_length,
-            strlen_or_ind_ptr,
-        )
-    })
+            ?strlen_or_ind_ptr,
+            "SQLBindParameter called",
+        ),
+        unsafe {
+            sql_bind_parameter_impl(
+                statement_handle,
+                parameter_number,
+                input_output_type,
+                value_type,
+                parameter_type,
+                column_size,
+                decimal_digits,
+                parameter_value_ptr,
+                buffer_length,
+                strlen_or_ind_ptr,
+            )
+        }
+    )
 }
 
 /// # Safety
@@ -398,10 +401,12 @@ fn bind_param_records(
 /// # Safety
 /// `statement_handle` must be a valid `StmtHandle` or null.
 pub(crate) unsafe fn sql_free_stmt_reset_params(statement_handle: SqlHandle) -> SqlReturn {
-    debug!(?statement_handle, "SQLFreeStmt(SQL_RESET_PARAMS) called");
-    crate::ffi_entry!("SQLFreeStmt(SQL_RESET_PARAMS)", unsafe {
-        sql_free_stmt_reset_params_impl(statement_handle)
-    })
+    crate::ffi_entry!(
+        "SQLFreeStmt(SQL_RESET_PARAMS)",
+        statement_handle,
+        debug!(?statement_handle, "SQLFreeStmt(SQL_RESET_PARAMS) called"),
+        unsafe { sql_free_stmt_reset_params_impl(statement_handle) }
+    )
 }
 
 /// # Safety

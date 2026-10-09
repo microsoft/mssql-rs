@@ -37,16 +37,17 @@ pub(crate) unsafe fn sql_prepare_w(
     statement_text: *const SqlWChar,
     text_length: SqlSmallInt,
 ) -> SqlReturn {
-    debug!(
-        ?statement_handle,
-        ?statement_text,
-        text_length,
-        "SQLPrepareW called",
-    );
-
-    crate::ffi_entry!("SQLPrepareW", unsafe {
-        sql_prepare_w_impl(statement_handle, statement_text, text_length)
-    })
+    crate::ffi_entry!(
+        "SQLPrepareW",
+        statement_handle,
+        debug!(
+            ?statement_handle,
+            ?statement_text,
+            text_length,
+            "SQLPrepareW called",
+        ),
+        unsafe { sql_prepare_w_impl(statement_handle, statement_text, text_length) }
+    )
 }
 
 /// # Safety

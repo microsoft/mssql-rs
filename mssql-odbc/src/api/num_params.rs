@@ -30,15 +30,16 @@ pub(crate) unsafe fn sql_num_params(
     statement_handle: SqlHandle,
     parameter_count_ptr: *mut SqlSmallInt,
 ) -> SqlReturn {
-    debug!(
-        ?statement_handle,
-        ?parameter_count_ptr,
-        "SQLNumParams called"
-    );
-
-    crate::ffi_entry!("SQLNumParams", unsafe {
-        sql_num_params_impl(statement_handle, parameter_count_ptr)
-    })
+    crate::ffi_entry!(
+        "SQLNumParams",
+        statement_handle,
+        debug!(
+            ?statement_handle,
+            ?parameter_count_ptr,
+            "SQLNumParams called"
+        ),
+        unsafe { sql_num_params_impl(statement_handle, parameter_count_ptr) }
+    )
 }
 
 /// # Safety

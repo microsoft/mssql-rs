@@ -37,28 +37,31 @@ pub(crate) unsafe fn sql_connect_w(
     authentication: *const SqlWChar,
     name_length_3: SqlSmallInt,
 ) -> SqlReturn {
-    debug!(
-        ?connection_handle,
-        ?server_name,
-        name_length_1,
-        ?user_name,
-        name_length_2,
-        ?authentication,
-        name_length_3,
-        "SQLConnectW called",
-    );
-
-    crate::ffi_entry!("SQLConnectW", unsafe {
-        sql_connect_w_impl(
-            connection_handle,
-            server_name,
+    crate::ffi_entry!(
+        "SQLConnectW",
+        connection_handle,
+        debug!(
+            ?connection_handle,
+            ?server_name,
             name_length_1,
-            user_name,
+            ?user_name,
             name_length_2,
-            authentication,
+            ?authentication,
             name_length_3,
-        )
-    })
+            "SQLConnectW called",
+        ),
+        unsafe {
+            sql_connect_w_impl(
+                connection_handle,
+                server_name,
+                name_length_1,
+                user_name,
+                name_length_2,
+                authentication,
+                name_length_3,
+            )
+        }
+    )
 }
 
 /// # Safety
