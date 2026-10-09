@@ -924,3 +924,24 @@ msodbcsql build is measured.
     status and rows-processed pointers, and to every header-alias attribute
     plus `SQL_ROWSET_SIZE`, which is ARD-resident without being an alias and
     so reaches the same `readers_through` walk through `set_desc_header`.
+
+27. **A large XML input supplied through data-at-execution treats its
+    `ColumnSize` as unlimited.** msodbcsql rejects `SQL_SS_XML` above 4,000 with
+    `HY104`: `CheckSqlPrec`'s `SQL_XML_MAPPED` arm uses the
+    `SQL_PREC_NCHAR` ceiling (`Sql/Ntdbms/sqlncli/odbc/sqlcdesc.cpp`), reached
+    from `SQLBindParameter` through `CheckSqlPrecScale<TRUE>`. This driver keeps
+    that result for materialized XML, but admits an input or input/output
+    binding above the ceiling when `StrLen_or_IndPtr` already carries
+    `SQL_DATA_AT_EXEC` or `SQL_LEN_DATA_AT_EXEC(n)`. The original `ColumnSize`
+    remains in the descriptor and is revalidated against the execution-time
+    indicator, so changing the indicator to a materialized length before
+    `SQLExecute` still reports `HY104`.
+
+    mssql-python preserves the caller's `setinputsizes((SQL_SS_XML, n, 0))`
+    size when it switches values above 4,000 to data-at-execution. Rejecting
+    that shape prevents the PLP streaming path from running at all, while XML
+    has no bounded TDS declaration to preserve. The exception is limited to
+    data-at-execution so ordinary oversized bindings retain the existing
+    `HY104` compatibility behavior. `LargeXmlStreamsThroughDataAtExecution`
+    covers the consumer's binding shape and is skipped on the comparison leg
+    because the reference driver rejects it. Tracked in AB#48349.

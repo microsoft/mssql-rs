@@ -96,8 +96,8 @@ jobs:
     permissions:
       contents: read
       pull-requests: write
-    # Build runs ~45 min in ADO; the artifact wait can take up to 1h15m.
-    timeout-minutes: 120
+    # ADO validation can run for 120 min; leave time to download and report.
+    timeout-minutes: 150
     steps:
       - name: Determine PR context
         id: prctx
@@ -176,10 +176,10 @@ jobs:
           ARTIFACTS_URL="https://dev.azure.com/${ADO_ORG}/${ADO_PROJECT}/_apis/build/builds/${BUILD_ID}/artifacts?api-version=7.1-preview.5"
 
           echo "📥 Polling for '$COVERAGE_ARTIFACT_NAME' artifact for build $BUILD_ID..."
-          # PR builds run ~45 min, so wait up to 1h15m for the coverage artifact,
+          # PR builds can run for 120 min, so wait up to 130 min for the coverage artifact,
           # polling at a random interval between 5 and 10 minutes.
           DOWNLOAD_URL=""
-          DEADLINE=$(( $(date +%s) + 75 * 60 ))
+          DEADLINE=$(( $(date +%s) + 130 * 60 ))
           attempt=0
           while :; do
             attempt=$((attempt + 1))
@@ -204,7 +204,7 @@ jobs:
             fi
 
             if [[ $(date +%s) -ge $DEADLINE ]]; then
-              echo "❌ Timeout: coverage artifact not found within 75 minutes"
+              echo "❌ Timeout: coverage artifact not found within 130 minutes"
               exit 1
             fi
 

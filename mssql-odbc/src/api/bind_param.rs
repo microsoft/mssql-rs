@@ -10,12 +10,14 @@ use super::sqlstate::*;
 use crate::api::odbc_types::{
     SQL_C_DEFAULT, SQL_ERROR, SQL_INVALID_HANDLE, SQL_PARAM_INPUT, SQL_PARAM_INPUT_OUTPUT,
     SQL_PARAM_INPUT_OUTPUT_STREAM, SQL_PARAM_OUTPUT, SQL_PARAM_OUTPUT_STREAM, SQL_RETURN_VALUE,
-    SQL_SUCCESS, SqlHandle, SqlLen, SqlPointer, SqlReturn, SqlSmallInt, SqlULen, SqlUSmallInt,
+    SQL_SS_XML, SQL_SUCCESS, SqlHandle, SqlLen, SqlPointer, SqlReturn, SqlSmallInt, SqlULen,
+    SqlUSmallInt,
 };
 use crate::api::type_rules::{
     SqlTypeSupport, canonical_c_type, classify_parameter_sql_type, is_valid_c_type,
     parameter_column_size_is_valid, resolve_default_c_type,
 };
+use crate::conversion::param_convert::is_data_at_exec_indicator;
 use crate::error::{free_errors, post_sql_error};
 use crate::handles::{DescHandle, HandleType, StmtHandle, handle_from_raw};
 use crate::params::BoundParam;
@@ -243,9 +245,18 @@ fn sql_bind_parameter_safe(
             return SQL_ERROR;
         }
 
+        let column_size_is_valid = parameter_column_size_is_valid(parameter_type, column_size);
+        let large_xml_dae = !column_size_is_valid
+            && parameter_type == SQL_SS_XML
+            && matches!(input_output_type, SQL_PARAM_INPUT | SQL_PARAM_INPUT_OUTPUT)
+            && !strlen_or_ind_ptr.is_null()
+            // SAFETY: input and input/output bindings require a readable
+            // StrLen_or_IndPtr under SQLBindParameter's caller contract.
+            && is_data_at_exec_indicator(unsafe { strlen_or_ind_ptr.read_unaligned() });
+
         // ColumnSize is validated last, after the type and conversion checks, the
         // order msodbcsql's SQLBindParameter uses before CheckSqlPrecScale.
-        if !parameter_column_size_is_valid(parameter_type, column_size) {
+        if !column_size_is_valid && !large_xml_dae {
             error!(
                 parameter_type,
                 column_size, "SQLBindParameter: invalid ColumnSize for the SQL type"
@@ -495,8 +506,8 @@ fn sql_free_stmt_reset_params_safe(stmt: &StmtHandle) -> SqlReturn {
 mod tests {
     use super::*;
     use crate::api::odbc_types::{
-        SQL_C_CHAR, SQL_C_SLONG, SQL_GUID, SQL_INTEGER, SQL_NULL_DATA, SQL_NULL_HANDLE,
-        SQL_PARAM_OUTPUT, SQL_SS_UDT, SQL_VARBINARY, SQL_VARCHAR,
+        SQL_C_CHAR, SQL_C_SLONG, SQL_GUID, SQL_INTEGER, SQL_NTS, SQL_NULL_DATA, SQL_NULL_HANDLE,
+        SQL_PARAM_OUTPUT, SQL_SS_UDT, SQL_VARBINARY, SQL_VARCHAR, sql_len_data_at_exec,
     };
     use crate::handles::handle_from_raw;
     use crate::test_support::TestHandles;
@@ -1013,6 +1024,56 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn large_xml_data_at_execution_preserves_column_size_for_execute() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let mut token = 0u8;
+        let mut ind = sql_len_data_at_exec(4001);
+        let ret = unsafe {
+            sql_bind_parameter(
+                h.stmt,
+                1,
+                SQL_PARAM_INPUT,
+                SQL_C_CHAR,
+                SQL_SS_XML,
+                4001,
+                0,
+                (&raw mut token).cast(),
+                0,
+                &mut ind,
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS);
+        let binding = bound_params(&h);
+        let bound = binding[0].as_ref().expect("parameter 1 should be bound");
+        assert_eq!(bound.param.column_size, 4001);
+    }
+
+    #[test]
+    fn large_materialized_xml_column_size_remains_invalid() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let mut value = b"<x/>\0".to_vec();
+        let mut ind: SqlLen = SQL_NTS.into();
+        let ret = unsafe {
+            sql_bind_parameter(
+                h.stmt,
+                1,
+                SQL_PARAM_INPUT,
+                SQL_C_CHAR,
+                SQL_SS_XML,
+                4001,
+                0,
+                value.as_mut_ptr().cast(),
+                SqlLen::try_from(value.len()).unwrap(),
+                &mut ind,
+            )
+        };
+        assert_eq!(ret, SQL_ERROR);
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(state.diag_records[0].sql_state, SQLSTATE_HY104);
     }
 
     #[test]
