@@ -243,10 +243,34 @@ fn sql_describe_param_safe(
         Cached::Answered(rc) => return rc,
         Cached::Missing => {}
     }
-    let _operation = match stmt.begin_operation() {
+    let operation = match stmt.begin_operation() {
         Ok(operation) => operation,
         Err(rc) => return rc,
     };
+    // A cursor opened concurrently still owns the token this call registered
+    // against, so a signal must be settled here rather than reach its fetch.
+    let rc = describe_param_operation(
+        statement_handle,
+        stmt,
+        parameter_number,
+        data_type_ptr,
+        parameter_size_ptr,
+        decimal_digits_ptr,
+        nullable_ptr,
+    );
+    super::exec_common::finish_operation(operation, stmt, statement_handle, rc)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn describe_param_operation(
+    statement_handle: SqlHandle,
+    stmt: &StmtHandle,
+    parameter_number: SqlUSmallInt,
+    data_type_ptr: *mut SqlSmallInt,
+    parameter_size_ptr: *mut SqlULen,
+    decimal_digits_ptr: *mut SqlSmallInt,
+    nullable_ptr: *mut SqlSmallInt,
+) -> SqlReturn {
     let dbc = stmt.parent_dbc();
 
     let (sql, marker_count, return_status, query_timeout, cancel_handle) = {
@@ -1493,6 +1517,122 @@ mod tests {
             .expect("cached describe waited for the active operation");
         assert_eq!(rc, SQL_SUCCESS);
         assert_eq!(data_type, SQL_INTEGER);
+    }
+
+    /// The cache can fill, and a cursor open, while a describe that missed
+    /// it waits to register. A signal then reaches the cursor's token, so the
+    /// describe must settle it rather than leave it for the next fetch.
+    #[test]
+    fn registered_describe_settles_cancellation_over_a_concurrent_cursor() {
+        use mssql_mock_tds::{ColumnDefinition, ColumnValue, QueryResponse, Row, SqlDataType};
+        use std::time::{Duration, Instant};
+
+        for cache_filled in [true, false] {
+            let h = TestHandles::with_env_dbc_stmt();
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let dbc = stmt.parent_dbc();
+            let rows = (1..=3)
+                .map(|n| Row::new(vec![ColumnValue::Int(n)]))
+                .collect();
+            let _server = crate::test_support::connect_mock_server(
+                dbc,
+                "SELECT 1",
+                QueryResponse::new(vec![ColumnDefinition::new("", SqlDataType::Int)], rows),
+            );
+            let sql: Vec<u16> = "SELECT 1".encode_utf16().collect();
+            let exec = || unsafe {
+                crate::api::SQLExecDirectW(h.stmt, sql.as_ptr(), i16::try_from(sql.len()).unwrap())
+            };
+            assert_eq!(SQL_SUCCESS, exec());
+            assert_eq!(dbc.inner.lock().unwrap().active_stmt, Some(h.stmt));
+            {
+                let mut state = stmt.inner.lock().unwrap();
+                state.prepared = Some(crate::handles::stmt::PreparedPlan {
+                    stmt: PreparedStatement::new("SELECT @P1".to_string()),
+                    marker_count: 1,
+                    original_sql: String::new(),
+                });
+                state.parameter_metadata.clear();
+                state.diag_records.push(crate::error::DiagRecord::new(
+                    *b"01000",
+                    0,
+                    "first lookup",
+                ));
+            }
+
+            let raw = h.stmt as usize;
+            std::thread::scope(|scope| {
+                let deadline = Instant::now() + Duration::from_secs(2);
+                let guard = stmt.begin_operation().unwrap();
+                let describe = scope.spawn(move || {
+                    let mut data_type = 0;
+                    unsafe {
+                        sql_describe_param(
+                            raw as SqlHandle,
+                            1,
+                            &mut data_type,
+                            std::ptr::null_mut(),
+                            std::ptr::null_mut(),
+                            std::ptr::null_mut(),
+                        )
+                    }
+                });
+                // The first lookup clears diagnostics before missing.
+                while !stmt.inner.lock().unwrap().diag_records.is_empty() {
+                    assert!(Instant::now() < deadline, "first lookup did not run");
+                    std::thread::yield_now();
+                }
+                let mut state = stmt.inner.lock().unwrap();
+                if cache_filled {
+                    state.parameter_metadata.push(ParameterDescription {
+                        data_type: SQL_INTEGER,
+                        parameter_size: 10,
+                        decimal_digits: 0,
+                        nullable: SQL_NULLABLE,
+                    });
+                }
+                drop(guard);
+                while !stmt.cancellation_state_for_test().0 {
+                    assert!(Instant::now() < deadline, "describe did not register");
+                    std::thread::yield_now();
+                }
+                let cancel =
+                    scope.spawn(move || unsafe { crate::api::SQLCancel(raw as SqlHandle) });
+                while !stmt.cancellation_state_for_test().1 {
+                    assert!(Instant::now() < deadline, "cancel did not signal");
+                    std::thread::yield_now();
+                }
+                drop(state);
+                assert_eq!(
+                    SQL_ERROR,
+                    describe.join().unwrap(),
+                    "cache_filled={cache_filled}"
+                );
+                assert_eq!(SQL_SUCCESS, cancel.join().unwrap());
+            });
+
+            {
+                let state = stmt.inner.lock().unwrap();
+                assert!(!state.has_state(STMT_STATE_CURSOR_OPEN));
+                let states: Vec<_> = state.diag_records.iter().map(|d| d.sql_state).collect();
+                let expected: &[[u8; 5]] = if cache_filled {
+                    &[*b"HY008"]
+                } else {
+                    &[*b"HY010", *b"HY008"]
+                };
+                assert_eq!(states, expected);
+            }
+            {
+                let state = dbc.inner.lock().unwrap();
+                assert!(state.active_stmt.is_none());
+                assert!(!state.client.as_ref().unwrap().is_connection_dead());
+            }
+            assert_eq!(SQL_SUCCESS, exec());
+            for _ in 0..3 {
+                assert_eq!(SQL_SUCCESS, unsafe { crate::api::SQLFetch(h.stmt) });
+            }
+            assert_eq!(SQL_NO_DATA, unsafe { crate::api::SQLFetch(h.stmt) });
+        }
     }
 
     /// A metadata result set that carries no rows exercises the whole error
