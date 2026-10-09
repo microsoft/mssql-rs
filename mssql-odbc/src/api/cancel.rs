@@ -58,10 +58,20 @@ unsafe fn sql_cancel_impl(statement_handle: SqlHandle) -> SqlReturn {
     }
     let client = {
         // Calls not participating in cancellation can briefly hold inner.
-        // An idle cancel need not wait for them or alter their diagnostics.
+        // An idle cancel waits for them only when a DAE sequence is parked.
         let mut stmt_state = match stmt.inner.try_lock() {
             Ok(state) => state,
-            Err(TryLockError::WouldBlock) => return SQL_SUCCESS,
+            Err(TryLockError::WouldBlock) => match dae_may_be_parked(stmt, statement_handle) {
+                Ok(false) => return SQL_SUCCESS,
+                Ok(true) => match stmt.inner.lock() {
+                    Ok(state) => state,
+                    Err(_) => {
+                        error!("SQLCancel: stmt mutex poisoned");
+                        return SQL_ERROR;
+                    }
+                },
+                Err(rc) => return rc,
+            },
             Err(TryLockError::Poisoned(_)) => {
                 error!("SQLCancel: stmt mutex poisoned");
                 return SQL_ERROR;
@@ -91,6 +101,17 @@ unsafe fn sql_cancel_impl(statement_handle: SqlHandle) -> SqlReturn {
     );
 
     SQL_SUCCESS
+}
+
+/// Parking moves the client off the DBC while keeping this statement's busy
+/// claim, which is visible without `inner`. Only then is a brief `inner`
+/// holder worth waiting for; the cancellation fence keeps new calls out.
+fn dae_may_be_parked(stmt: &StmtHandle, statement_handle: SqlHandle) -> Result<bool, SqlReturn> {
+    let Ok(state) = stmt.parent_dbc().inner.lock() else {
+        error!("SQLCancel: dbc mutex poisoned");
+        return Err(SQL_ERROR);
+    };
+    Ok(state.active_stmt == Some(statement_handle) && state.client.is_none())
 }
 
 #[cfg(test)]
@@ -134,6 +155,36 @@ mod tests {
 
         assert_eq!(SQL_SUCCESS, unsafe { sql_cancel(h.stmt) });
 
+        let state = stmt.inner.lock().unwrap();
+        assert!(!state.needs_data());
+        assert!(!state.has_state(STMT_STATE_EXEC_STARTED));
+    }
+
+    #[test]
+    fn parked_dae_cancel_waits_for_a_brief_stmt_lock_holder() {
+        use std::time::Duration;
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.set_state(STMT_STATE_EXEC_STARTED);
+            state.dae = Some(dae_with_one_param(None));
+        }
+        {
+            let mut dbc = stmt.parent_dbc().inner.lock().unwrap();
+            dbc.client = None;
+            dbc.active_stmt = Some(h.stmt);
+        }
+        std::thread::scope(|scope| {
+            let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+            scope.spawn(move || {
+                let _state = stmt.inner.lock().unwrap();
+                locked_tx.send(()).unwrap();
+                std::thread::sleep(Duration::from_millis(100));
+            });
+            locked_rx.recv().unwrap();
+            assert_eq!(SQL_SUCCESS, unsafe { sql_cancel(h.stmt) });
+        });
         let state = stmt.inner.lock().unwrap();
         assert!(!state.needs_data());
         assert!(!state.has_state(STMT_STATE_EXEC_STARTED));

@@ -112,22 +112,32 @@ TEST_F(CancelLiveTest, CrossThreadCancelInterruptsWaitforAndConnectionRemainsUsa
     EXPECT_EQ(static_cast<SQLLEN>(sizeof(value)), length);
 }
 
+// Benefits-from-mock-tds: cancel.rs pins that ATTENTION was acknowledged before
+// SQLCancel returned; this observes only that the immediate close succeeds.
 TEST_F(CancelLiveTest, FetchCancelThenImmediateCloseIsSafe) {
     CancelCursor(false, true);
 }
 
+// Benefits-from-mock-tds: cancel.rs pins that ATTENTION was acknowledged before
+// SQLCancel returned; this observes only that the immediate close succeeds.
 TEST_F(CancelLiveTest, MoreResultsCancelThenImmediateCloseIsSafe) {
     CancelCursor(true, true);
 }
 
+// Benefits-from-mock-tds: assert ATTENTION and its DONE_ATTN acknowledgement on
+// the wire, not just the HY008 outcome and connection reuse.
 TEST_F(CancelLiveTest, FetchCancellationReportsHy008) {
     CancelCursor(false, false);
 }
 
+// Benefits-from-mock-tds: assert ATTENTION and its DONE_ATTN acknowledgement on
+// the wire, not just each driver's return code and connection reuse.
 TEST_F(CancelLiveTest, MoreResultsCancellationReturnCode) {
     CancelCursor(true, false);
 }
 
+// Benefits-from-mock-tds: assert the paused packet completed before IGNORE or
+// ATTENTION withdrew the request; the proxy only shows the connection survived.
 TEST_F(CancelLiveTest, PutDataCancelFinishesPendingPacketAndPreservesConnection) {
     using namespace std::chrono_literals;
     auto& config = ODBCTestConfig::Instance();
@@ -194,6 +204,8 @@ TEST_F(CancelLiveTest, PutDataCancelFinishesPendingPacketAndPreservesConnection)
     ASSERT_SQL_OK(SQLDisconnect(dbc_), SQL_HANDLE_DBC, dbc_);
 }
 
+// Benefits-from-mock-tds: assert ATTENTION after the completed RPC and that the
+// retry reuses the prepared handle; this observes only the restored outcome.
 TEST_F(CancelLiveTest, FinalParamDataCancellationRestoresPreparedStatement) {
     using namespace std::chrono_literals;
     auto sql = ODBCTestUtils::ToSqlTStr("WAITFOR DELAY '00:00:10'; SELECT ? AS v");

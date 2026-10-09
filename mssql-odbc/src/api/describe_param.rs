@@ -27,9 +27,11 @@ use super::util::write_if_some;
 use crate::api::type_rules::parameter_size_is_precision;
 use crate::error::{free_errors, post_sql_error};
 use crate::handles::desc::{DescRecord, UdtNameClaims, UdtNames};
-use crate::handles::stmt::{ParameterDescription, STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_STARTED};
+use crate::handles::stmt::{
+    ParameterDescription, STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_STARTED, StmtState,
+};
 use crate::handles::{DescHandle, HandleType, StmtHandle, handle_from_raw};
-use std::sync::Arc;
+use std::sync::{Arc, MutexGuard};
 
 use super::set_desc_field::datetime_interval_code_for;
 
@@ -130,6 +132,94 @@ unsafe fn sql_describe_param_impl(
     )
 }
 
+enum Cached {
+    Answered(SqlReturn),
+    Missing,
+}
+
+/// Validates the marker and answers from cached metadata when available.
+fn describe_from_cache(
+    stmt: &StmtHandle,
+    parameter_number: SqlUSmallInt,
+    data_type_ptr: *mut SqlSmallInt,
+    parameter_size_ptr: *mut SqlULen,
+    decimal_digits_ptr: *mut SqlSmallInt,
+    nullable_ptr: *mut SqlSmallInt,
+) -> Cached {
+    let Ok(mut stmt_state) = stmt.inner.lock() else {
+        error!("SQLDescribeParam: stmt mutex poisoned");
+        return Cached::Answered(SQL_ERROR);
+    };
+    free_errors(&mut stmt_state);
+    let Some(plan) = stmt_state.prepared.as_ref() else {
+        post_diag(&mut stmt_state, ERR_FUNCTION_SEQUENCE);
+        return Cached::Answered(SQL_ERROR);
+    };
+    let marker_count = plan.marker_count;
+    if parameter_number == 0 || usize::from(parameter_number) > marker_count {
+        post_diag(&mut stmt_state, ERR_INVALID_DESCRIPTOR_INDEX);
+        return Cached::Answered(SQL_ERROR);
+    }
+    if stmt_state.parameter_metadata.len() != marker_count {
+        return Cached::Missing;
+    }
+    Cached::Answered(serve_cached(
+        stmt,
+        stmt_state,
+        parameter_number,
+        data_type_ptr,
+        parameter_size_ptr,
+        decimal_digits_ptr,
+        nullable_ptr,
+    ))
+}
+
+/// Serving from the cache needs no connection, so it stays available while a
+/// cursor is open - matching msodbcsql, which also answers `SQLDescribeParam`
+/// from cached parameter metadata.
+fn serve_cached(
+    stmt: &StmtHandle,
+    mut stmt_state: MutexGuard<'_, StmtState>,
+    parameter_number: SqlUSmallInt,
+    data_type_ptr: *mut SqlSmallInt,
+    parameter_size_ptr: *mut SqlULen,
+    decimal_digits_ptr: *mut SqlSmallInt,
+    nullable_ptr: *mut SqlSmallInt,
+) -> SqlReturn {
+    let Some(description) = stmt_state
+        .parameter_metadata
+        .get(usize::from(parameter_number) - 1)
+        .copied()
+    else {
+        post_diag(&mut stmt_state, ERR_INVALID_DESCRIPTOR_INDEX);
+        return SQL_ERROR;
+    };
+    // Called on every cache-served answer, not just the first:
+    // `refine_ipd` itself only ever fills in a marker that has never
+    // been explicitly bound (see its doc comment), so repeating this
+    // call is idempotent for an already-bound marker and still picks
+    // up one that was unbound (or never bound) since the last call.
+    let cached = stmt_state.parameter_metadata.clone();
+    // Replayed, not dropped: `SQLFreeStmt(SQL_RESET_PARAMS)` truncates
+    // the IPD while leaving this cache intact, so a second
+    // reset-then-describe cycle has to rebuild the UDT identity from
+    // here or the execute fails with no type name. mssql-python runs
+    // exactly that cycle on every execution (microsoft/mssql-python#818).
+    let cached_udt_names = stmt_state.parameter_udt_names.clone();
+    drop(stmt_state);
+    if refine_ipd(stmt, &cached, &cached_udt_names) != SQL_SUCCESS {
+        return post_refine_failure(stmt);
+    }
+    write_description(
+        description,
+        data_type_ptr,
+        parameter_size_ptr,
+        decimal_digits_ptr,
+        nullable_ptr,
+    );
+    SQL_SUCCESS
+}
+
 #[allow(clippy::too_many_arguments)]
 fn sql_describe_param_safe(
     statement_handle: SqlHandle,
@@ -140,6 +230,19 @@ fn sql_describe_param_safe(
     decimal_digits_ptr: *mut SqlSmallInt,
     nullable_ptr: *mut SqlSmallInt,
 ) -> SqlReturn {
+    // A cache-served answer runs no request, so it must not own cancellation:
+    // a concurrent SQLCancel would otherwise latch an open cursor's token.
+    match describe_from_cache(
+        stmt,
+        parameter_number,
+        data_type_ptr,
+        parameter_size_ptr,
+        decimal_digits_ptr,
+        nullable_ptr,
+    ) {
+        Cached::Answered(rc) => return rc,
+        Cached::Missing => {}
+    }
     let _operation = match stmt.begin_operation() {
         Ok(operation) => operation,
         Err(rc) => return rc,
@@ -164,43 +267,17 @@ fn sql_describe_param_safe(
             return SQL_ERROR;
         }
 
-        // Serving from the cache needs no connection, so it stays available
-        // while a cursor is open - matching msodbcsql, which also answers
-        // `SQLDescribeParam` from cached parameter metadata. The state check
-        // below only guards the path that has to run the metadata RPC.
+        // Filled by a concurrent call since the check above.
         if stmt_state.parameter_metadata.len() == marker_count {
-            let Some(description) = stmt_state
-                .parameter_metadata
-                .get(usize::from(parameter_number) - 1)
-                .copied()
-            else {
-                post_diag(&mut stmt_state, ERR_INVALID_DESCRIPTOR_INDEX);
-                return SQL_ERROR;
-            };
-            // Called on every cache-served answer, not just the first:
-            // `refine_ipd` itself only ever fills in a marker that has never
-            // been explicitly bound (see its doc comment), so repeating this
-            // call is idempotent for an already-bound marker and still picks
-            // up one that was unbound (or never bound) since the last call.
-            let cached = stmt_state.parameter_metadata.clone();
-            // Replayed, not dropped: `SQLFreeStmt(SQL_RESET_PARAMS)` truncates
-            // the IPD while leaving this cache intact, so a second
-            // reset-then-describe cycle has to rebuild the UDT identity from
-            // here or the execute fails with no type name. mssql-python runs
-            // exactly that cycle on every execution (microsoft/mssql-python#818).
-            let cached_udt_names = stmt_state.parameter_udt_names.clone();
-            drop(stmt_state);
-            if refine_ipd(stmt, &cached, &cached_udt_names) != SQL_SUCCESS {
-                return post_refine_failure(stmt);
-            }
-            write_description(
-                description,
+            return serve_cached(
+                stmt,
+                stmt_state,
+                parameter_number,
                 data_type_ptr,
                 parameter_size_ptr,
                 decimal_digits_ptr,
                 nullable_ptr,
             );
-            return SQL_SUCCESS;
         }
 
         if stmt_state.has_state(STMT_STATE_EXEC_STARTED | STMT_STATE_CURSOR_OPEN) {
@@ -1370,6 +1447,52 @@ mod tests {
             )
         };
         assert_eq!(rc, SQL_SUCCESS);
+    }
+
+    /// A cached answer runs no request, so it must not take part in
+    /// cancellation; otherwise SQLCancel would latch an open cursor's token.
+    #[test]
+    fn cached_description_does_not_register_a_cancellable_operation() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.prepared = Some(crate::handles::stmt::PreparedPlan {
+                stmt: PreparedStatement::new("SELECT @P1".to_string()),
+                marker_count: 1,
+                original_sql: String::new(),
+            });
+            state.parameter_metadata.push(ParameterDescription {
+                data_type: SQL_INTEGER,
+                parameter_size: 10,
+                decimal_digits: 0,
+                nullable: SQL_NULLABLE,
+            });
+            state.set_state(STMT_STATE_CURSOR_OPEN);
+        }
+        // An active operation would make a registering describe wait here.
+        let _cursor_call = stmt.begin_operation().unwrap();
+        let raw = h.stmt as usize;
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut data_type = 0;
+            let rc = unsafe {
+                sql_describe_param(
+                    raw as SqlHandle,
+                    1,
+                    &mut data_type,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            };
+            tx.send((rc, data_type)).unwrap();
+        });
+        let (rc, data_type) = rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("cached describe waited for the active operation");
+        assert_eq!(rc, SQL_SUCCESS);
+        assert_eq!(data_type, SQL_INTEGER);
     }
 
     /// A metadata result set that carries no rows exercises the whole error
