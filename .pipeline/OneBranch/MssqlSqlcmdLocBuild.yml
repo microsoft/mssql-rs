@@ -1,0 +1,74 @@
+#################################################################################
+#                 mssql-sqlcmd localization OneLocBuild pipeline                #
+#################################################################################
+
+trigger:
+  batch: true
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - mssql-sqlcmd/i18n/locales/en-US/sqlcmd.json
+
+pr: none
+
+schedules:
+- cron: '0 3 * * 1'
+  displayName: Weekly localization sync
+  branches:
+    include:
+      - main
+  always: true
+
+variables:
+  CDP_DEFINITION_BUILD_COUNT: $[counter('', 0)]
+  WindowsContainerImage: 'onebranch.azurecr.io/windows/ltsc2022/vse2022:latest'
+
+resources:
+  repositories:
+    - repository: templates
+      type: git
+      name: OneBranch.Pipelines/GovernedTemplates
+      ref: refs/heads/main
+
+extends:
+  template: v2/OneBranch.NonOfficial.CrossPlat.yml@templates
+  parameters:
+    featureFlags:
+      EnableCDPxPAT: false
+      WindowsHostVersion: 1ESWindows2022
+    stages:
+    - stage: Localization
+      displayName: mssql-sqlcmd localization
+      jobs:
+      - job: OneLocBuild
+        displayName: Create or update localization PR
+        pool:
+          type: windows
+          isCustom: true
+          name: RUST-X64-WUS3
+          demands:
+            - imageOverride -equals RUST-W22-SQL25
+        variables:
+          ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
+        steps:
+        - checkout: self
+          persistCredentials: true
+        - task: OneLocBuild@2
+          env:
+            SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+          inputs:
+            isCreatePrSelected: true
+            repoType: 'github'
+            locProj: mssql-sqlcmd/i18n/LocProject.json
+            outDir: '$(Build.ArtifactStagingDirectory)'
+            packageSourceAuth: patAuth
+            dependencyPackageSource: 'https://pkgs.dev.azure.com/msdata/_packaging/SQLDS_SSMS/nuget/v3/index.json'
+            patVariable: $(System.AccessToken)
+            isAutoCompletePrSelected: false
+            isShouldReusePrSelected: true
+        - task: PublishPipelineArtifact@1
+          inputs:
+            targetPath: '$(Build.ArtifactStagingDirectory)'
+            artifact: drop

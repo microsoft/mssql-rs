@@ -45,6 +45,15 @@ typedef struct MssqlSqlcmdText {
     const uint16_t* data;
     size_t len; /* in UTF-16 code units, not bytes */
 } MssqlSqlcmdText;
+/* Sets the locale used by Rust-generated human text. Native sqlcmd calls this
+   once at startup with the language it resolved for SQLCMD.rll; on Windows this
+   may be an LCID as decimal text, for example "1031". If never called, the
+   library resolves the locale from the environment and then the user default UI
+   language on Windows. Returns MSSQL_SQLCMD_INVALID_ARGUMENT when the locale is
+   not recognized; English fallback is still selected. A NULL pointer with zero
+   length is treated as an empty locale: it resets to English fallback and
+   returns MSSQL_SQLCMD_INVALID_ARGUMENT. */
+int32_t MSSQL_SQLCMD_CALL mssql_sqlcmd_set_locale(MssqlSqlcmdText locale);
 
 /* A result-set column, as the driver describes it. Only the name is always
    given; a negative number or a NULL or empty type name means the driver did
