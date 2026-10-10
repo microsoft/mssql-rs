@@ -243,7 +243,9 @@ environment-wide calls, invalid handles, and connection attempts before PRELOGIN
 have `cid=-`. Authentication workers retain the identity of the attempt that
 started them, even if a timeout lets a later attempt begin.
 MultiSubnetFailover connection tasks carry context during each future poll;
-TCP attempts have `cid=-` until PRELOGIN supplies a GUID. `SQLDescribeParam`
+TCP attempts, including retries, redirects, and recovery, have `cid=-` until
+PRELOGIN supplies a GUID. The connection-ID getter retains the last established
+GUID until recovery succeeds. `SQLDescribeParam`
 metadata RPCs have their own execution sequence; cached descriptions do not
 replace the active result's sequence.
 Diagnostic retrieval logs identify the connection and statement but omit `exec`:

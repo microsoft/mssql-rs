@@ -251,7 +251,8 @@ impl ClientContextValidator for DefaultClientContextValidator {
 /// Construct via [`ClientContext::with_data_source()`] and pass to
 /// [`TdsConnectionProvider::create_client()`](crate::connection_provider::tds_connection_provider::TdsConnectionProvider::create_client).
 pub struct ClientContext {
-    // New ClientContext state follows the pinned-box ownership convention.
+    // Follows ClientContext's pinned-box ownership convention. Arc is already
+    // pointer-sized: this adds an allocation on setup/clone, not a size saving.
     #[allow(clippy::redundant_allocation)]
     pub(crate) connection_trace:
         Option<std::pin::Pin<Box<std::sync::Arc<crate::trace_context::ConnectionTrace>>>>,

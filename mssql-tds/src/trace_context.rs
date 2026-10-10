@@ -98,9 +98,20 @@ impl Default for ConnectionTrace {
 }
 
 impl ConnectionTrace {
+    /// A new transport has no wire GUID until PRELOGIN. Retain the established
+    /// identity separately so a failed recovery does not replace the getter.
+    pub fn begin_transport_attempt(&self) {
+        self.set_current(None);
+    }
+
     pub fn begin_attempt(&self, id: Uuid) {
-        let previous = self.current.load();
-        self.current.store(Some(id));
+        let previous = self.current.load().or_else(|| self.established.load());
+        self.set_current(Some(id));
+        tracing::debug!(?previous, client_connection_id = %id, "Starting connection attempt");
+    }
+
+    fn set_current(&self, id: Option<Uuid>) {
+        self.current.store(id);
         if enabled() {
             CURRENT.with(|current| {
                 let mut context = current.borrow_mut();
@@ -109,12 +120,11 @@ impl ConnectionTrace {
                     .as_ref()
                     .is_some_and(|connection| connection.id == self.id)
                 {
-                    context.fallback_id = Some(id);
+                    context.fallback_id = id;
                     context.follow_connection = true;
                 }
             });
         }
-        tracing::debug!(?previous, client_connection_id = %id, "Starting connection attempt");
     }
 
     pub fn establish(&self, id: Uuid) {
@@ -480,6 +490,35 @@ mod tests {
         connection.begin_attempt(id);
         assert_eq!(snapshot().cid, Some(id));
         assert_eq!(connection.client_connection_id(), None);
+    }
+
+    #[test]
+    fn pending_transport_clears_stale_log_identity_but_keeps_established_identity() {
+        enable();
+        let connection = Arc::new(ConnectionTrace::default());
+        let original = Uuid::new_v4();
+        connection.establish(original);
+        let _scope = Context::connection(Arc::clone(&connection)).enter();
+        let old_worker = Context::capture();
+        let original_dbc = snapshot().dbc;
+
+        for _ in 0..2 {
+            connection.begin_transport_attempt();
+            assert_eq!(snapshot().dbc, original_dbc);
+            assert_eq!(snapshot().cid, None);
+            assert_eq!(connection.client_connection_id(), Some(original));
+            {
+                let _worker = old_worker.clone().enter();
+                assert_eq!(snapshot().cid, Some(original));
+            }
+            let next = Uuid::new_v4();
+            connection.begin_attempt(next);
+            assert_eq!(snapshot().cid, Some(next));
+            assert_eq!(connection.client_connection_id(), Some(original));
+        }
+        let recovered = snapshot().cid.unwrap();
+        connection.establish(recovered);
+        assert_eq!(connection.client_connection_id(), Some(recovered));
     }
 
     #[test]
