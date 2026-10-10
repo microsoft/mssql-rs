@@ -1286,24 +1286,67 @@ mod tests {
 
     #[test]
     fn exported_execution_and_tds_events_share_correlation() {
+        assert_exported_execution_correlation(false);
+    }
+
+    #[test]
+    fn exported_prepared_execution_and_continuations_share_correlation() {
+        assert_exported_execution_correlation(true);
+    }
+
+    fn assert_exported_execution_correlation(prepared: bool) {
         use crate::api::odbc_types::{SQL_NTS, SQL_SUCCESS};
-        use crate::api::{SQLExecDirectW, SQLRowCount};
+        use crate::api::{SQLExecDirectW, SQLExecute, SQLPrepareW, SQLRowCount};
         use crate::handles::{DbcHandle, StmtHandle, handle_from_raw};
         use crate::test_support::TestHandles;
-        use mssql_tds::test_client_support::{done_no_more, tds_client_from_tokens};
+        use mssql_tds::datatypes::column_values::ColumnValues;
+        use mssql_tds::query::result::ReturnValue;
+        use mssql_tds::test_client_support::{
+            done_no_more, done_proc_no_more, int_columns, return_value, tds_client_from_tokens,
+        };
+        use mssql_tds::token::tokenitems::ReturnValueStatus;
 
         let id = uuid::Uuid::new_v4();
+        let api = if prepared {
+            "SQLExecute"
+        } else {
+            "SQLExecDirectW"
+        };
         let output = capture_correlation(|| {
             let h = TestHandles::with_env_dbc_stmt();
             h.mark_dbc_connected();
             let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
             dbc.trace.establish(id);
-            for execution in 1..=2 {
-                dbc.inner.lock().unwrap().client =
-                    Some(tds_client_from_tokens(vec![done_no_more()]));
-                let sql: Vec<u16> = "SELECT 1".encode_utf16().chain([0]).collect();
+            let sql: Vec<u16> = "SELECT 1".encode_utf16().chain([0]).collect();
+            let mut responses = Vec::new();
+            if prepared {
                 assert_eq!(
-                    unsafe { SQLExecDirectW(h.stmt, sql.as_ptr(), SQL_NTS) },
+                    unsafe { SQLPrepareW(h.stmt, sql.as_ptr(), SQL_NTS) },
+                    SQL_SUCCESS
+                );
+                responses.push(return_value(ReturnValue {
+                    param_ordinal: 0,
+                    param_name: "@handle".to_string(),
+                    value: ColumnValues::Int(27),
+                    column_metadata: Box::new(int_columns(1).remove(0)),
+                    status: ReturnValueStatus::OutputParam,
+                }));
+            }
+            responses.extend(if prepared {
+                [done_proc_no_more(), done_proc_no_more()]
+            } else {
+                [done_no_more(), done_no_more()]
+            });
+            dbc.inner.lock().unwrap().client = Some(tds_client_from_tokens(responses));
+            for execution in 1..=2 {
+                assert_eq!(
+                    unsafe {
+                        if prepared {
+                            SQLExecute(h.stmt)
+                        } else {
+                            SQLExecDirectW(h.stmt, sql.as_ptr(), SQL_NTS)
+                        }
+                    },
                     SQL_SUCCESS
                 );
                 let mut rows = 0;
@@ -1331,12 +1374,12 @@ mod tests {
             assert!(
                 lines
                     .iter()
-                    .any(|line| line.contains("SQLExecDirectW called"))
+                    .any(|line| line.contains(&format!("{api} called")))
             );
             assert!(
                 lines
                     .iter()
-                    .any(|line| line.contains("SQLExecDirectW returning"))
+                    .any(|line| line.contains(&format!("{api} returning")))
             );
             assert!(lines.iter().any(|line| line.contains("SQLRowCount called")));
             assert!(lines.iter().any(|line| line.contains(", mssql_tds::")));

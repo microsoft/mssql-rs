@@ -153,10 +153,9 @@ fn sql_get_connect_attr_w_safe(
             let buffer_length = if buffer_length == -4 {
                 // The reference accepts SQL_NO_TOTAL for a full string buffer.
                 74
-            } else if buffer_length < 0 {
-                post_diag(&mut state, ERR_INVALID_STRING_OR_BUFFER_LENGTH);
-                return SQL_ERROR;
             } else {
+                // Other negative lengths follow the shared zero-capacity
+                // truncation path, matching native ODBC's -2 result (01004).
                 buffer_length
             };
             unsafe {
@@ -367,7 +366,7 @@ mod tests {
     }
 
     #[test]
-    fn client_connection_id_length_probe_truncation_and_invalid_length() {
+    fn client_connection_id_length_probe_and_truncation() {
         let h = TestHandles::with_env_dbc();
         install_identity(&h, uuid::Uuid::new_v4());
         let mut length = -1;
@@ -405,22 +404,29 @@ mod tests {
             dbc.inner.lock().unwrap().diag_records[0].sql_state,
             *b"01004"
         );
-        assert_eq!(
-            unsafe {
-                crate::api::exports::SQLGetConnectAttrW(
-                    h.dbc,
-                    SQL_COPT_SS_CLIENT_CONNECTION_ID,
-                    output.as_mut_ptr().cast(),
-                    -2,
-                    &mut length,
-                )
-            },
-            SQL_ERROR
-        );
-        assert_eq!(
-            dbc.inner.lock().unwrap().diag_records[0].sql_state,
-            SQLSTATE_HY090
-        );
+        for buffer_length in [-2, 0, 1] {
+            output.fill(0xffff);
+            length = -1;
+            assert_eq!(
+                unsafe {
+                    crate::api::exports::SQLGetConnectAttrW(
+                        h.dbc,
+                        SQL_COPT_SS_CLIENT_CONNECTION_ID,
+                        output.as_mut_ptr().cast(),
+                        buffer_length,
+                        &mut length,
+                    )
+                },
+                crate::api::odbc_types::SQL_SUCCESS_WITH_INFO
+            );
+            assert_eq!(length, 72);
+            assert_eq!(output, [0xffff; 5], "zero capacity must not write");
+            assert_eq!(dbc.inner.lock().unwrap().diag_records.len(), 1);
+            assert_eq!(
+                dbc.inner.lock().unwrap().diag_records[0].sql_state,
+                *b"01004"
+            );
+        }
     }
 
     #[test]

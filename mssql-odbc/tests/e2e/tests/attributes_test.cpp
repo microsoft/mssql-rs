@@ -333,6 +333,16 @@ TEST_F(AttributesTest, ClientConnectionIdSupportsLengthAndTruncationAndRejectsSe
     EXPECT_SQLSTATE(SQL_HANDLE_DBC, dbc_, "HY092");
 }
 
+TEST_F(AttributesTest, ClientConnectionIdNegativeLengthReportsTruncation) {
+    constexpr SQLINTEGER clientConnectionId = 1233;
+    SQLWCHAR buffer[37] = {};
+    SQLINTEGER bytes = -1;
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO,
+              SQLGetConnectAttrW(dbc_, clientConnectionId, buffer, -2, &bytes));
+    EXPECT_SQLSTATE(SQL_HANDLE_DBC, dbc_, "01004");
+    EXPECT_EQ(72, bytes);
+}
+
 // ===========================================================================
 // SQL_ATTR_QUERY_TIMEOUT
 // ===========================================================================
