@@ -1,0 +1,1790 @@
+{
+  "language": "en-US",
+  "messages": [
+    {
+      "id": "diagnose.check.connection_attempt",
+      "message": "Connection attempt",
+      "translation": "Connection attempt",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.check.connection_input",
+      "message": "Connection input",
+      "translation": "Connection input",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.check.instance_resolution",
+      "message": "Instance resolution",
+      "translation": "Instance resolution",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.check.name_resolution",
+      "message": "Name resolution",
+      "translation": "Name resolution",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.check.session_validation",
+      "message": "Session validation",
+      "translation": "Session validation",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.check.tcp_connect",
+      "message": "TCP connect",
+      "translation": "TCP connect",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.client.line",
+      "message": "Client: {client}; time limit {seconds} s per step (-l), {browser_seconds} s for SQL Server Browser",
+      "translation": "Client: {client}; time limit {seconds} s per step (-l), {browser_seconds} s for SQL Server Browser",
+      "placeholders": [
+        {
+          "id": "client",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "client"
+        },
+        {
+          "id": "seconds",
+          "string": "%[2]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 2,
+          "expr": "seconds"
+        },
+        {
+          "id": "browser_seconds",
+          "string": "%[3]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 3,
+          "expr": "browser_seconds"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.comma_value",
+      "message": ", {value}",
+      "translation": ", {value}",
+      "placeholders": [
+        {
+          "id": "value",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "value"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.depth.certificate_name",
+      "message": "; certificate name {name} (-F)",
+      "translation": "; certificate name {name} (-F)",
+      "placeholders": [
+        {
+          "id": "name",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "name"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.depth.certificate_trusted",
+      "message": "; server certificate trusted (-C)",
+      "translation": "; server certificate trusted (-C)",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.depth.connection_attempt",
+      "message": "Connection attempt",
+      "translation": "Connection attempt",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.depth.connection_input",
+      "message": "Connection input",
+      "translation": "Connection input",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.depth.database_suffix",
+      "message": "; database {database}",
+      "translation": "; database {database}",
+      "placeholders": [
+        {
+          "id": "database",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "database"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.depth.default_suffix",
+      "message": " (default)",
+      "translation": " (default)",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.depth.encrypt_suffix",
+      "message": "; encrypt {encrypt}",
+      "translation": "; encrypt {encrypt}",
+      "placeholders": [
+        {
+          "id": "encrypt",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "encrypt"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.depth.endpoint_resolution",
+      "message": "Endpoint resolution",
+      "translation": "Endpoint resolution",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.depth.line",
+      "message": "Depth: {depth}{default}; {auth} login",
+      "translation": "Depth: {depth}{default}; {auth} login",
+      "placeholders": [
+        {
+          "id": "depth",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "depth"
+        },
+        {
+          "id": "default",
+          "string": "%[2]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 2,
+          "expr": "default"
+        },
+        {
+          "id": "auth",
+          "string": "%[3]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 3,
+          "expr": "auth"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.depth.line_with_user",
+      "message": "Depth: {depth}{default}; {auth} login {user}",
+      "translation": "Depth: {depth}{default}; {auth} login {user}",
+      "placeholders": [
+        {
+          "id": "depth",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "depth"
+        },
+        {
+          "id": "default",
+          "string": "%[2]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 2,
+          "expr": "default"
+        },
+        {
+          "id": "auth",
+          "string": "%[3]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 3,
+          "expr": "auth"
+        },
+        {
+          "id": "user",
+          "string": "%[4]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 4,
+          "expr": "user"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.depth.network_reachability",
+      "message": "Network reachability",
+      "translation": "Network reachability",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.depth.session_validation",
+      "message": "Session validation",
+      "translation": "Session validation",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.detail.clock_offset_suffix",
+      "message": "; server clock {offset} ms from the client's",
+      "translation": "; server clock {offset} ms from the client's",
+      "placeholders": [
+        {
+          "id": "offset",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "offset"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.detail.database",
+      "message": "database {database}",
+      "translation": "database {database}",
+      "placeholders": [
+        {
+          "id": "database",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "database"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.detail.encryption_suffix",
+      "message": "; encryption {encryption}",
+      "translation": "; encryption {encryption}",
+      "placeholders": [
+        {
+          "id": "encryption",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "encryption"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.detail.host",
+      "message": "host {host}",
+      "translation": "host {host}",
+      "placeholders": [
+        {
+          "id": "host",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "host"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.detail.instance",
+      "message": "instance {instance}",
+      "translation": "instance {instance}",
+      "placeholders": [
+        {
+          "id": "instance",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "instance"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.detail.instance_no_port",
+      "message": "{host}\\{instance}: no usable port",
+      "translation": "{host}\\{instance}: no usable port",
+      "placeholders": [
+        {
+          "id": "host",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "host"
+        },
+        {
+          "id": "instance",
+          "string": "%[2]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 2,
+          "expr": "instance"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.detail.instance_pipe",
+      "message": "{host}\\{instance}: pipe {pipe}",
+      "translation": "{host}\\{instance}: pipe {pipe}",
+      "placeholders": [
+        {
+          "id": "host",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "host"
+        },
+        {
+          "id": "instance",
+          "string": "%[2]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 2,
+          "expr": "instance"
+        },
+        {
+          "id": "pipe",
+          "string": "%[3]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 3,
+          "expr": "pipe"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.detail.instance_port",
+      "message": "{host}\\{instance}: port {port}",
+      "translation": "{host}\\{instance}: port {port}",
+      "placeholders": [
+        {
+          "id": "host",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "host"
+        },
+        {
+          "id": "instance",
+          "string": "%[2]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 2,
+          "expr": "instance"
+        },
+        {
+          "id": "port",
+          "string": "%[3]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 3,
+          "expr": "port"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.detail.phase",
+      "message": "{stage} {duration}",
+      "translation": "{stage} {duration}",
+      "placeholders": [
+        {
+          "id": "stage",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "stage"
+        },
+        {
+          "id": "duration",
+          "string": "%[2]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 2,
+          "expr": "duration"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.detail.phase_failed",
+      "message": "{stage} {duration} FAILED",
+      "translation": "{stage} {duration} FAILED",
+      "placeholders": [
+        {
+          "id": "stage",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "stage"
+        },
+        {
+          "id": "duration",
+          "string": "%[2]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 2,
+          "expr": "duration"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.detail.port",
+      "message": "port {port}",
+      "translation": "port {port}",
+      "placeholders": [
+        {
+          "id": "port",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "port"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.detail.port_attempts",
+      "message": "port {port}: {attempts}",
+      "translation": "port {port}: {attempts}",
+      "placeholders": [
+        {
+          "id": "port",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "port"
+        },
+        {
+          "id": "attempts",
+          "string": "%[2]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 2,
+          "expr": "attempts"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.detail.spn_suffix",
+      "message": "; SPN {spn}",
+      "translation": "; SPN {spn}",
+      "placeholders": [
+        {
+          "id": "spn",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "spn"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.detail.target_engine",
+      "message": "{target} (engine edition {edition})",
+      "translation": "{target} (engine edition {edition})",
+      "placeholders": [
+        {
+          "id": "target",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "target"
+        },
+        {
+          "id": "edition",
+          "string": "%[2]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 2,
+          "expr": "edition"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.detail.ticket_cache_suffix",
+      "message": "; ticket cache {state}",
+      "translation": "; ticket cache {state}",
+      "placeholders": [
+        {
+          "id": "state",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "state"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.detail.tls_failure_suffix",
+      "message": "; TLS failure: {tls}",
+      "translation": "; TLS failure: {tls}",
+      "placeholders": [
+        {
+          "id": "tls",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "tls"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.error_id.os_error",
+      "message": "os error {number}",
+      "translation": "os error {number}",
+      "placeholders": [
+        {
+          "id": "number",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "number"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.error_id.sql_error",
+      "message": "error {number}",
+      "translation": "error {number}",
+      "placeholders": [
+        {
+          "id": "number",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "number"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.error_id.state_class",
+      "message": "state {state}, class {class}",
+      "translation": "state {state}, class {class}",
+      "placeholders": [
+        {
+          "id": "state",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "state"
+        },
+        {
+          "id": "class",
+          "string": "%[2]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 2,
+          "expr": "class"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.error.browser_no_tcp_port",
+      "message": "SQL Server Browser answered but listed no TCP port for the instance",
+      "translation": "SQL Server Browser answered but listed no TCP port for the instance",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.error.name_no_addresses",
+      "message": "the name resolved to no address",
+      "translation": "the name resolved to no address",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.error.no_answer_ms",
+      "message": "no answer within {ms} ms",
+      "translation": "no answer within {ms} ms",
+      "placeholders": [
+        {
+          "id": "ms",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "ms"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.error.no_answer_seconds",
+      "message": "no answer within {seconds} s",
+      "translation": "no answer within {seconds} s",
+      "placeholders": [
+        {
+          "id": "seconds",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "seconds"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.error.not_tried_time_spent",
+      "message": "not tried: the {seconds} s time limit was spent on earlier addresses",
+      "translation": "not tried: the {seconds} s time limit was spent on earlier addresses",
+      "placeholders": [
+        {
+          "id": "seconds",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "seconds"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.error.ssrp_invalid_response",
+      "message": "the answer could not be parsed: {error}",
+      "translation": "the answer could not be parsed: {error}",
+      "placeholders": [
+        {
+          "id": "error",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "error"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.error.ssrp_no_addresses",
+      "message": "the server name resolved to no address",
+      "translation": "the server name resolved to no address",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.error.ssrp_no_answer",
+      "message": "no answer",
+      "translation": "no answer",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.error.ssrp_receive",
+      "message": "receiving the answer failed: {error}",
+      "translation": "receiving the answer failed: {error}",
+      "placeholders": [
+        {
+          "id": "error",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "error"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.error.ssrp_resolve_failed",
+      "message": "the server name did not resolve: {error}",
+      "translation": "the server name did not resolve: {error}",
+      "placeholders": [
+        {
+          "id": "error",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "error"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.error.ssrp_send",
+      "message": "no UDP request could be sent",
+      "translation": "no UDP request could be sent",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.error.ssrp_socket",
+      "message": "no UDP socket could be opened",
+      "translation": "no UDP socket could be opened",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.error.ssrp_timed_out",
+      "message": "resolving the server name did not finish",
+      "translation": "resolving the server name did not finish",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.error.tcp_address_port",
+      "message": "{address}:{port}: {message}",
+      "translation": "{address}:{port}: {message}",
+      "placeholders": [
+        {
+          "id": "address",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "address"
+        },
+        {
+          "id": "port",
+          "string": "%[2]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 2,
+          "expr": "port"
+        },
+        {
+          "id": "message",
+          "string": "%[3]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 3,
+          "expr": "message"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.errors.header",
+      "message": "Errors, in order:",
+      "translation": "Errors, in order:",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.execution.line",
+      "message": "Execution: {execution}; deepest phase evaluated: {depth}",
+      "translation": "Execution: {execution}; deepest phase evaluated: {depth}",
+      "placeholders": [
+        {
+          "id": "execution",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "execution"
+        },
+        {
+          "id": "depth",
+          "string": "%[2]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 2,
+          "expr": "depth"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.exit.canceled",
+      "message": "the diagnosis was canceled",
+      "translation": "the diagnosis was canceled",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.exit.failed",
+      "message": "sqlcmd failed internally; the summary is not trustworthy",
+      "translation": "sqlcmd failed internally; the summary is not trustworthy",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.exit.inconclusive",
+      "message": "the diagnosis could not establish whether the connection works",
+      "translation": "the diagnosis could not establish whether the connection works",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.exit.invalid_invocation",
+      "message": "the request was invalid; nothing ran",
+      "translation": "the request was invalid; nothing ran",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.exit.issue_detected",
+      "message": "the diagnosis identified an issue",
+      "translation": "the diagnosis identified an issue",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.exit.partial",
+      "message": "some checks that should have run could not complete",
+      "translation": "some checks that should have run could not complete",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.exit.passed",
+      "message": "every check at the requested depth passed",
+      "translation": "every check at the requested depth passed",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.finding.browser_no_pipe",
+      "message": "SQL Server Browser on {host} gave no pipe for instance {instance}: {problem}; the client then uses the instance's standard pipe.",
+      "translation": "SQL Server Browser on {host} gave no pipe for instance {instance}: {problem}; the client then uses the instance's standard pipe.",
+      "placeholders": [
+        {
+          "id": "host",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "host"
+        },
+        {
+          "id": "instance",
+          "string": "%[2]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 2,
+          "expr": "instance"
+        },
+        {
+          "id": "problem",
+          "string": "%[3]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 3,
+          "expr": "problem"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.finding.browser_no_usable_port",
+      "message": "SQL Server Browser on {host} gave no usable port for instance {instance}: {problem}.",
+      "translation": "SQL Server Browser on {host} gave no usable port for instance {instance}: {problem}.",
+      "placeholders": [
+        {
+          "id": "host",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "host"
+        },
+        {
+          "id": "instance",
+          "string": "%[2]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 2,
+          "expr": "instance"
+        },
+        {
+          "id": "problem",
+          "string": "%[3]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 3,
+          "expr": "problem"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.finding.clock_offset_ahead",
+      "message": "The server's clock is {seconds} s ahead of the client's, more than the 5 minutes Kerberos tolerates by default.",
+      "translation": "The server's clock is {seconds} s ahead of the client's, more than the 5 minutes Kerberos tolerates by default.",
+      "placeholders": [
+        {
+          "id": "seconds",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "seconds"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.finding.clock_offset_behind",
+      "message": "The server's clock is {seconds} s behind the client's, more than the 5 minutes Kerberos tolerates by default.",
+      "translation": "The server's clock is {seconds} s behind the client's, more than the 5 minutes Kerberos tolerates by default.",
+      "placeholders": [
+        {
+          "id": "seconds",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "seconds"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.finding.connection_attempt_failed",
+      "message": "The connection attempt failed: {error}",
+      "translation": "The connection attempt failed: {error}",
+      "placeholders": [
+        {
+          "id": "error",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "error"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.finding.connection_attempt_failed_during_phase",
+      "message": "The connection attempt failed during {phase}: {error}",
+      "translation": "The connection attempt failed during {phase}: {error}",
+      "placeholders": [
+        {
+          "id": "phase",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "phase"
+        },
+        {
+          "id": "error",
+          "string": "%[2]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 2,
+          "expr": "error"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.finding.integrated_auth_client_failed",
+      "message": "Integrated authentication failed on the client: {error}",
+      "translation": "Integrated authentication failed on the client: {error}",
+      "placeholders": [
+        {
+          "id": "error",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "error"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.finding.name_resolution_failed",
+      "message": "Name resolution for {host} failed ({code}): {message}.",
+      "translation": "Name resolution for {host} failed ({code}): {message}.",
+      "placeholders": [
+        {
+          "id": "host",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "host"
+        },
+        {
+          "id": "code",
+          "string": "%[2]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 2,
+          "expr": "code"
+        },
+        {
+          "id": "message",
+          "string": "%[3]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 3,
+          "expr": "message"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.finding.named_instance_requires_port",
+      "message": "The checks that need a port were not run: sqlcmd does not try port 1433 or any other port for a named instance whose port SQL Server Browser did not give.",
+      "translation": "The checks that need a port were not run: sqlcmd does not try port 1433 or any other port for a named instance whose port SQL Server Browser did not give.",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.finding.no_address_accepted_tcp",
+      "message": "No address accepted a TCP connection on port {port}: {summary}.",
+      "translation": "No address accepted a TCP connection on port {port}: {summary}.",
+      "placeholders": [
+        {
+          "id": "port",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "port"
+        },
+        {
+          "id": "summary",
+          "string": "%[2]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 2,
+          "expr": "summary"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.finding.no_kerberos_ticket_cache",
+      "message": "No Kerberos ticket cache was found for this user, so the integrated login had no ticket to present.",
+      "translation": "No Kerberos ticket cache was found for this user, so the integrated login had no ticket to present.",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.finding.no_tcp_listener",
+      "message": "Nothing is listening on port {port} at those addresses.",
+      "translation": "Nothing is listening on port {port} at those addresses.",
+      "placeholders": [
+        {
+          "id": "port",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "port"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.finding.server_ended_login",
+      "message": "The server ended the login with error {number}: {text}",
+      "translation": "The server ended the login with error {number}: {text}",
+      "placeholders": [
+        {
+          "id": "number",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "number"
+        },
+        {
+          "id": "text",
+          "string": "%[2]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 2,
+          "expr": "text"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.finding.server_ended_login_with_identifiers",
+      "message": "The server ended the login with error {number} ({identifiers}): {text}",
+      "translation": "The server ended the login with error {number} ({identifiers}): {text}",
+      "placeholders": [
+        {
+          "id": "number",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "number"
+        },
+        {
+          "id": "identifiers",
+          "string": "%[2]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 2,
+          "expr": "identifiers"
+        },
+        {
+          "id": "text",
+          "string": "%[3]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 3,
+          "expr": "text"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.finding.server_parse_failed",
+      "message": "The server given to -S could not be parsed: {error}.",
+      "translation": "The server given to -S could not be parsed: {error}.",
+      "placeholders": [
+        {
+          "id": "error",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "error"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.finding.session_query_failed",
+      "message": "The session was opened but a minimal query failed: {error}.",
+      "translation": "The session was opened but a minimal query failed: {error}.",
+      "placeholders": [
+        {
+          "id": "error",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "error"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.finding.session_query_timed_out",
+      "message": "The session was opened but a minimal query had no answer within {seconds} s.",
+      "translation": "The session was opened but a minimal query had no answer within {seconds} s.",
+      "placeholders": [
+        {
+          "id": "seconds",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "seconds"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.finding.tls_handshake_failed",
+      "message": "The TLS handshake failed: {error}",
+      "translation": "The TLS handshake failed: {error}",
+      "placeholders": [
+        {
+          "id": "error",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "error"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.finding.tls_handshake_failed_with_category",
+      "message": "The TLS handshake failed ({category}): {error}",
+      "translation": "The TLS handshake failed ({category}): {error}",
+      "placeholders": [
+        {
+          "id": "category",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "category"
+        },
+        {
+          "id": "error",
+          "string": "%[2]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 2,
+          "expr": "error"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.findings.header",
+      "message": "Findings:",
+      "translation": "Findings:",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.header.invalid_request",
+      "message": "sqlcmd diagnose: the request is invalid; nothing ran.",
+      "translation": "sqlcmd diagnose: the request is invalid; nothing ran.",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.header.server",
+      "message": "sqlcmd diagnose: {server}",
+      "translation": "sqlcmd diagnose: {server}",
+      "placeholders": [
+        {
+          "id": "server",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "server"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.limitation.admin_named_instance_dac_unsupported",
+      "message": "The dedicated administrator connection to a named instance gets its port from SQL Server Browser's DAC request, which this diagnosis does not make, so its endpoint and connection are not checked.",
+      "translation": "The dedicated administrator connection to a named instance gets its port from SQL Server Browser's DAC request, which this diagnosis does not make, so its endpoint and connection are not checked.",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.limitation.async_runtime",
+      "message": "The diagnosis could not start its async runtime: {error}.",
+      "translation": "The diagnosis could not start its async runtime: {error}.",
+      "placeholders": [
+        {
+          "id": "error",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "error"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.limitation.default_protocol_tcp_only",
+      "message": "Without a protocol prefix, sqlcmd on Windows can also connect over shared memory (to this computer) or named pipes; this diagnosis checks TCP only. Give lpc: or np: to diagnose those.",
+      "translation": "Without a protocol prefix, sqlcmd on Windows can also connect over shared memory (to this computer) or named pipes; this diagnosis checks TCP only. Give lpc: or np: to diagnose those.",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.limitation.dns_result_from_text",
+      "message": "This platform does not expose the resolver's result code; the name-resolution result was classified from the resolver's message.",
+      "translation": "This platform does not expose the resolver's result code; the name-resolution result was classified from the resolver's message.",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.limitation.kerberos_cache_not_checked",
+      "message": "The Kerberos ticket cache could not be looked for within the time limit.",
+      "translation": "The Kerberos ticket cache could not be looked for within the time limit.",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.limitation.kerberos_cache_unverified",
+      "message": "The Kerberos ticket cache is a {location} cache, which sqlcmd does not inspect.",
+      "translation": "The Kerberos ticket cache is a {location} cache, which sqlcmd does not inspect.",
+      "placeholders": [
+        {
+          "id": "location",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "location"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.limitation.kerberos_default_cache_only",
+      "message": "Only the default file ticket cache was looked for; a KCM or KEYRING cache set in krb5.conf is not inspected.",
+      "translation": "Only the default file ticket cache was looked for; a KCM or KEYRING cache set in krb5.conf is not inspected.",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.limitation.kerberos_spn_not_proof",
+      "message": "Kerberos encryption types and delegation are not inspected; the SPN is the one the client requests, not proof that it is registered.",
+      "translation": "Kerberos encryption types and delegation are not inspected; the SPN is the one the client requests, not proof that it is registered.",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.limitation.local_facility_error",
+      "message": "This computer did not let sqlcmd open a network connection (operating-system error {codes}); network reachability could not be checked.",
+      "translation": "This computer did not let sqlcmd open a network connection (operating-system error {codes}); network reachability could not be checked.",
+      "placeholders": [
+        {
+          "id": "codes",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "codes"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.limitation.mssql_tds",
+      "message": "The connection attempt is made with the mssql-tds client, which reports its pre-login, TLS and login phases; it is not the ODBC driver sqlcmd uses for queries, so TLS and login behavior can differ from a query run.",
+      "translation": "The connection attempt is made with the mssql-tds client, which reports its pre-login, TLS and login phases; it is not the ODBC driver sqlcmd uses for queries, so TLS and login behavior can differ from a query run.",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.limitation.spn_canonicalization_timeout",
+      "message": "The SPN's host name could not be canonicalized within the {seconds} s time limit, so the SPN is requested and shown with the host name as given.",
+      "translation": "The SPN's host name could not be canonicalized within the {seconds} s time limit, so the SPN is requested and shown with the host name as given.",
+      "placeholders": [
+        {
+          "id": "seconds",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "seconds"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.limitation.tls_classified_from_text",
+      "message": "The TLS failure was classified from the error text; no stable error code was available.",
+      "translation": "The TLS failure was classified from the error text; no stable error code was available.",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.limitations.header",
+      "message": "Limitations:",
+      "translation": "Limitations:",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.list.semicolon_separator",
+      "message": "; ",
+      "translation": "; ",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.list.separator",
+      "message": ", ",
+      "translation": ", ",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.login.line",
+      "message": "Login:     {auth} {outcome}",
+      "translation": "Login:     {auth} {outcome}",
+      "placeholders": [
+        {
+          "id": "auth",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "auth"
+        },
+        {
+          "id": "outcome",
+          "string": "%[2]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 2,
+          "expr": "outcome"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.none",
+      "message": "none",
+      "translation": "none",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.outcome.line",
+      "message": "Outcome:   {outcome} (exit code {code}: {meaning})",
+      "translation": "Outcome:   {outcome} (exit code {code}: {meaning})",
+      "placeholders": [
+        {
+          "id": "outcome",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "outcome"
+        },
+        {
+          "id": "code",
+          "string": "%[2]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 2,
+          "expr": "code"
+        },
+        {
+          "id": "meaning",
+          "string": "%[3]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 3,
+          "expr": "meaning"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.review_errors_before_sharing",
+      "message": "Review error messages before sharing: they may hold names sqlcmd cannot recognize.",
+      "translation": "Review error messages before sharing: they may hold names sqlcmd cannot recognize.",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.server.detail_suffix",
+      "message": ", database {database}, packet size {packet_size}, {encryption}",
+      "translation": ", database {database}, packet size {packet_size}, {encryption}",
+      "placeholders": [
+        {
+          "id": "database",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "database"
+        },
+        {
+          "id": "packet_size",
+          "string": "%[2]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 2,
+          "expr": "packet_size"
+        },
+        {
+          "id": "encryption",
+          "string": "%[3]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 3,
+          "expr": "encryption"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.server.encrypted",
+      "message": "encrypted",
+      "translation": "encrypted",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.server.line_prefix",
+      "message": "Server:    SQL Server",
+      "translation": "Server:    SQL Server",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.server.login_only_encrypted",
+      "message": "only the login encrypted",
+      "translation": "only the login encrypted",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.share_safe.not_share_safe",
+      "message": "NOT SHARE-SAFE: identifiers are shown as they are (--local-detail).",
+      "translation": "NOT SHARE-SAFE: identifiers are shown as they are (--local-detail).",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.share_safe.safe",
+      "message": "Share-safe: identifiers are shown as labels (host-1, ...); --local-detail shows them.",
+      "translation": "Share-safe: identifiers are shown as labels (host-1, ...); --local-detail shows them.",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.skip.admin_port_1434",
+      "message": "the dedicated administrator connection uses port 1434",
+      "translation": "the dedicated administrator connection uses port 1434",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.skip.blocked_by",
+      "message": "blocked by {check}",
+      "translation": "blocked by {check}",
+      "placeholders": [
+        {
+          "id": "check",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "check"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.skip.canceled",
+      "message": "canceled before it finished",
+      "translation": "canceled before it finished",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.skip.not_named_instance",
+      "message": "not a named instance",
+      "translation": "not a named instance",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.skip.not_tcp",
+      "message": "the connection does not use TCP",
+      "translation": "the connection does not use TCP",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.skip.port_given",
+      "message": "a port was given",
+      "translation": "a port was given",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.skip.port_required",
+      "message": "needs a confirmed port: give an explicit host,port for the named instance",
+      "translation": "needs a confirmed port: give an explicit host,port for the named instance",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.specialist.candidates_suffix",
+      "message": " (candidates: {candidates})",
+      "translation": " (candidates: {candidates})",
+      "placeholders": [
+        {
+          "id": "candidates",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "candidates"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.specialist.explanation_suffix",
+      "message": " - the area for a support handoff, not a confirmed cause.",
+      "translation": " - the area for a support handoff, not a confirmed cause.",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.specialist.line",
+      "message": "Specialist area: {domain}",
+      "translation": "Specialist area: {domain}",
+      "placeholders": [
+        {
+          "id": "domain",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "domain"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.stage.dns",
+      "message": "DNS lookup",
+      "translation": "DNS lookup",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.stage.instance_lookup",
+      "message": "Instance lookup",
+      "translation": "Instance lookup",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.stage.login_detail",
+      "message": "login",
+      "translation": "login",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.stage.prelogin_detail",
+      "message": "pre-login",
+      "translation": "pre-login",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.stage.tcp",
+      "message": "TCP connect",
+      "translation": "TCP connect",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.stage.tls_detail",
+      "message": "TLS",
+      "translation": "TLS",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.status.classified",
+      "message": "CLASSIFIED",
+      "translation": "CLASSIFIED",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.status.diagnosed",
+      "message": "DIAGNOSED",
+      "translation": "DIAGNOSED",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.status.inconclusive",
+      "message": "INCONCLUSIVE",
+      "translation": "INCONCLUSIVE",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.status.not_applicable",
+      "message": "N/A",
+      "translation": "N/A",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.status.passed",
+      "message": "PASSED",
+      "translation": "PASSED",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.status.skipped",
+      "message": "SKIPPED",
+      "translation": "SKIPPED",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.table.check",
+      "message": "Check",
+      "translation": "Check",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.table.details",
+      "message": "Details",
+      "translation": "Details",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.table.result",
+      "message": "Result",
+      "translation": "Result",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.table.time",
+      "message": "Time",
+      "translation": "Time",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.target.empty",
+      "message": "no server was given",
+      "translation": "no server was given",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.target.invalid_pipe",
+      "message": "`{path}` is not a pipe path of the form \\\\host\\pipe\\name",
+      "translation": "`{path}` is not a pipe path of the form \\\\host\\pipe\\name",
+      "placeholders": [
+        {
+          "id": "path",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "path"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.target.invalid_port",
+      "message": "`{port}` is not a port number from 1 to 65535",
+      "translation": "`{port}` is not a port number from 1 to 65535",
+      "placeholders": [
+        {
+          "id": "port",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "port"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.target.missing_host",
+      "message": "the server name is empty",
+      "translation": "the server name is empty",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.target.missing_instance",
+      "message": "the instance name after `\\` is empty",
+      "translation": "the instance name after `\\` is empty",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.target.port_not_allowed",
+      "message": "a port is given only with TCP; `{protocol}:` takes none",
+      "translation": "a port is given only with TCP; `{protocol}:` takes none",
+      "placeholders": [
+        {
+          "id": "protocol",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "protocol"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.target.reserved_instance",
+      "message": "MSSQLSERVER is the default instance's reserved name; give the server without it",
+      "translation": "MSSQLSERVER is the default instance's reserved name; give the server without it",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.target.unknown_protocol",
+      "message": "unknown protocol prefix `{protocol}:` (expected tcp, np, lpc or admin)",
+      "translation": "unknown protocol prefix `{protocol}:` (expected tcp, np, lpc or admin)",
+      "placeholders": [
+        {
+          "id": "protocol",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "protocol"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.time.less_than_one_ms",
+      "message": "<1 ms",
+      "translation": "<1 ms",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.time.ms",
+      "message": "{ms} ms",
+      "translation": "{ms} ms",
+      "placeholders": [
+        {
+          "id": "ms",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "ms"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.tracing_guide",
+      "message": "Driver tracing can show more than these checks; see {url}",
+      "translation": "Driver tracing can show more than these checks; see {url}",
+      "placeholders": [
+        {
+          "id": "url",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "url"
+        }
+      ]
+    }
+  ]
+}
+

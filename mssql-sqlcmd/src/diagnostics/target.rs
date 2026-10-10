@@ -12,6 +12,8 @@
 
 use std::fmt;
 
+use crate::i18n;
+
 /// The transport the server string selects.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Protocol {
@@ -107,35 +109,39 @@ impl ParseError {
             ParseError::ReservedInstance => "reservedInstance",
         }
     }
+
+    pub fn message_id(&self) -> &'static str {
+        match self {
+            ParseError::Empty => "diagnose.target.empty",
+            ParseError::UnknownProtocol(_) => "diagnose.target.unknown_protocol",
+            ParseError::MissingHost => "diagnose.target.missing_host",
+            ParseError::MissingInstance => "diagnose.target.missing_instance",
+            ParseError::InvalidPort(_) => "diagnose.target.invalid_port",
+            ParseError::PortNotAllowed(_) => "diagnose.target.port_not_allowed",
+            ParseError::InvalidPipe(_) => "diagnose.target.invalid_pipe",
+            ParseError::ReservedInstance => "diagnose.target.reserved_instance",
+        }
+    }
+
+    pub fn message_args(&self) -> Vec<(&'static str, String)> {
+        match self {
+            ParseError::UnknownProtocol(protocol) => vec![("protocol", protocol.clone())],
+            ParseError::InvalidPort(port) => vec![("port", port.clone())],
+            ParseError::PortNotAllowed(protocol) => vec![("protocol", (*protocol).to_string())],
+            ParseError::InvalidPipe(path) => vec![("path", path.clone())],
+            _ => Vec::new(),
+        }
+    }
 }
 
 impl fmt::Display for ParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ParseError::Empty => write!(f, "no server was given"),
-            ParseError::UnknownProtocol(p) => write!(
-                f,
-                "unknown protocol prefix `{p}:` (expected tcp, np, lpc or admin)"
-            ),
-            ParseError::MissingHost => write!(f, "the server name is empty"),
-            ParseError::MissingInstance => write!(f, "the instance name after `\\` is empty"),
-            ParseError::InvalidPort(p) => {
-                write!(f, "`{p}` is not a port number from 1 to 65535")
-            }
-            ParseError::PortNotAllowed(p) => {
-                write!(f, "a port is given only with TCP; `{p}:` takes none")
-            }
-            ParseError::InvalidPipe(p) => {
-                write!(
-                    f,
-                    "`{p}` is not a pipe path of the form \\\\host\\pipe\\name"
-                )
-            }
-            ParseError::ReservedInstance => write!(
-                f,
-                "`MSSQLSERVER` is the default instance's reserved name; give the server without it"
-            ),
-        }
+        let owned_args = self.message_args();
+        let args: Vec<(&str, &dyn fmt::Display)> = owned_args
+            .iter()
+            .map(|(name, value)| (*name, value as &dyn fmt::Display))
+            .collect();
+        write!(f, "{}", i18n::tr(self.message_id(), &args))
     }
 }
 

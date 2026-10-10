@@ -29,6 +29,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 #[cfg(target_pointer_width = "64")]
 use crate::diagnostics::{self, Authentication, Depth, Encrypt, Request};
 use crate::formatter::json::{Column, Connection, JsonDocument, Message, RunEnd};
+use crate::i18n;
 
 /// The call succeeded.
 pub const MSSQL_SQLCMD_OK: i32 = 0;
@@ -63,6 +64,41 @@ static VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "\0");
 #[unsafe(no_mangle)]
 pub extern "C" fn mssql_sqlcmd_version() -> *const std::ffi::c_char {
     VERSION.as_ptr().cast()
+}
+
+/// Sets the locale used by Rust-generated human text.
+///
+/// Native sqlcmd calls this once at startup with the language it resolved for
+/// SQLCMD.rll. On Windows that may be an LCID as decimal text, for example
+/// `1031`. If this is never called, the library resolves the locale from the
+/// environment and, on Windows, the user default UI language.
+/// A null pointer with zero length resets the locale to the English fallback
+/// and returns [`MSSQL_SQLCMD_INVALID_ARGUMENT`] because an empty locale is not
+/// recognized.
+///
+/// # Safety
+/// A non-null `locale.data` must point to `locale.len` readable `u16` values.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mssql_sqlcmd_set_locale(locale: MssqlSqlcmdText) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if locale.data.is_null() {
+            if locale.len != 0 {
+                return MSSQL_SQLCMD_NULL_ARGUMENT;
+            }
+            i18n::set_locale("");
+            return MSSQL_SQLCMD_INVALID_ARGUMENT;
+        }
+        // SAFETY: forwarded from the caller's guarantees.
+        let Some(locale) = (unsafe { read_text(locale) }) else {
+            return MSSQL_SQLCMD_NULL_ARGUMENT;
+        };
+        if i18n::set_locale(&locale) {
+            MSSQL_SQLCMD_OK
+        } else {
+            MSSQL_SQLCMD_INVALID_ARGUMENT
+        }
+    }))
+    .unwrap_or(MSSQL_SQLCMD_INTERNAL_ERROR)
 }
 
 /// A UTF-16 string with an explicit length. It need not be NUL-terminated and
@@ -1584,6 +1620,46 @@ mod tests {
             "{rendered}"
         );
     }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn diagnose_invalid_target_renders_in_the_selected_locale() {
+        let pseudo = utf16("qps-ploc");
+        // SAFETY: test text points to readable UTF-16 data.
+        assert_eq!(
+            unsafe { mssql_sqlcmd_set_locale(text(&pseudo)) },
+            MSSQL_SQLCMD_OK
+        );
+
+        let (server, user, password) = (utf16("tcp:127.0.0.1,0"), utf16("sa"), utf16("x"));
+        let mut request = diagnostics_request(&server, &user, &password);
+        request.depth = MSSQL_SQLCMD_DEPTH_CONNECTION_INPUT;
+        let (status, rendered, exit_code) = run_diagnostics(&request, MSSQL_SQLCMD_REPORT_JSON);
+        assert_eq!(status, MSSQL_SQLCMD_OK);
+        assert_eq!(exit_code, 1);
+        assert!(!rendered.is_empty());
+        assert!(
+            !rendered.contains("is not a port number from 1 to 65535"),
+            "{rendered}"
+        );
+        let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        assert!(
+            value["findings"][0]["text"]
+                .as_str()
+                .unwrap()
+                .starts_with("[!!!"),
+            "{rendered}"
+        );
+        assert!(
+            value["errors"][0]["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("[!!!"),
+            "{rendered}"
+        );
+        assert!(crate::i18n::set_locale("en-US"));
+    }
+
     #[cfg(not(target_pointer_width = "64"))]
     #[test]
     fn diagnostics_are_unsupported_in_a_32_bit_build() {
@@ -1696,6 +1772,48 @@ mod tests {
                 MSSQL_SQLCMD_NULL_ARGUMENT
             );
         }
+    }
+
+    #[test]
+    fn set_locale_reports_status() {
+        let german = utf16("1031");
+        // SAFETY: test text points to readable UTF-16 data.
+        assert_eq!(
+            unsafe { mssql_sqlcmd_set_locale(text(&german)) },
+            MSSQL_SQLCMD_OK
+        );
+        assert_eq!(crate::i18n::locale(), "de-DE");
+
+        // SAFETY: null with zero length is the documented empty-locale reset.
+        assert_eq!(
+            unsafe { mssql_sqlcmd_set_locale(NULL_TEXT) },
+            MSSQL_SQLCMD_INVALID_ARGUMENT
+        );
+        assert_eq!(crate::i18n::locale(), "en-US");
+
+        // SAFETY: test text points to readable UTF-16 data.
+        assert_eq!(
+            unsafe { mssql_sqlcmd_set_locale(text(&german)) },
+            MSSQL_SQLCMD_OK
+        );
+
+        let invalid = utf16("not-a-locale");
+        // SAFETY: test text points to readable UTF-16 data.
+        assert_eq!(
+            unsafe { mssql_sqlcmd_set_locale(text(&invalid)) },
+            MSSQL_SQLCMD_INVALID_ARGUMENT
+        );
+        assert_eq!(crate::i18n::locale(), "en-US");
+
+        let null_with_len = MssqlSqlcmdText {
+            data: std::ptr::null(),
+            len: 1,
+        };
+        // SAFETY: null data is passed to validate the FFI error path.
+        assert_eq!(
+            unsafe { mssql_sqlcmd_set_locale(null_with_len) },
+            MSSQL_SQLCMD_NULL_ARGUMENT
+        );
     }
 
     /// The header declares exactly the functions this module exports, and its

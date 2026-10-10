@@ -37,8 +37,9 @@ use serde::{Serialize, Serializer};
 
 use super::redact::{Category, Redactor};
 use super::stages::Step;
-use super::{Check, Coverage, Depth, Report, Skip};
+use super::{Check, Coverage, Depth, LocalizedText, Report, Skip};
 use crate::formatter::json::{PLATFORM, to_json_string, utc_timestamp};
+use crate::i18n;
 
 /// Version of the JSON report's contract, `major.minor`.
 pub const CONTRACT_VERSION: &str = "1.0";
@@ -161,25 +162,35 @@ fn redactor(report: &Report) -> Redactor {
     r
 }
 
-fn status_label(coverage: Coverage) -> &'static str {
-    match coverage {
-        Coverage::Passed => "PASSED",
-        Coverage::Diagnosed => "DIAGNOSED",
-        Coverage::Classified => "CLASSIFIED",
-        Coverage::Inconclusive => "INCONCLUSIVE",
-        Coverage::Skipped => "SKIPPED",
-        Coverage::NotApplicable => "N/A",
-    }
+fn tr(locale: &str, id: &str, args: &[(&str, &dyn std::fmt::Display)]) -> String {
+    i18n::tr_for_locale(locale, id, args)
 }
 
-fn skip_text(skip: &Skip) -> String {
+fn status_label(coverage: Coverage, locale: &str) -> String {
+    tr(
+        locale,
+        match coverage {
+            Coverage::Passed => "diagnose.status.passed",
+            Coverage::Diagnosed => "diagnose.status.diagnosed",
+            Coverage::Classified => "diagnose.status.classified",
+            Coverage::Inconclusive => "diagnose.status.inconclusive",
+            Coverage::Skipped => "diagnose.status.skipped",
+            Coverage::NotApplicable => "diagnose.status.not_applicable",
+        },
+        &[],
+    )
+}
+
+fn skip_text(skip: &Skip, locale: &str) -> String {
     match skip {
-        Skip::BlockedBy(check) => format!("blocked by {}", check.title()),
-        Skip::PortRequired => {
-            "needs a confirmed port: give an explicit host,port for the named instance".to_string()
-        }
-        Skip::NotApplicable(why) => (*why).to_string(),
-        Skip::Canceled => "canceled before it finished".to_string(),
+        Skip::BlockedBy(check) => tr(
+            locale,
+            "diagnose.skip.blocked_by",
+            &[("check", &check.title_in(locale))],
+        ),
+        Skip::PortRequired => tr(locale, "diagnose.skip.port_required", &[]),
+        Skip::NotApplicable(why) => why.render(locale),
+        Skip::Canceled => tr(locale, "diagnose.skip.canceled", &[]),
     }
 }
 
@@ -194,36 +205,143 @@ fn skip_reason(skip: &Skip) -> &'static str {
 
 /// A duration for the text report. Work that took under a millisecond reads
 /// as `<1 ms` rather than `0 ms`, which looks like it did not run.
-fn ms_text(ms: u64) -> String {
+fn ms_text(ms: u64, locale: &str) -> String {
     if ms == 0 {
-        "<1 ms".to_string()
+        tr(locale, "diagnose.time.less_than_one_ms", &[])
     } else {
-        format!("{ms} ms")
+        tr(locale, "diagnose.time.ms", &[("ms", &ms)])
     }
 }
 
-fn phases_text(phases: &[Step]) -> String {
+fn phases_text(phases: &[Step], locale: &str) -> String {
     phases
         .iter()
         .map(|p| {
-            format!(
-                "{} {}{}",
-                p.stage
-                    .title()
-                    .to_lowercase()
-                    .replace("tls handshake", "TLS"),
-                ms_text(p.duration_ms),
-                if p.ok { "" } else { " FAILED" }
-            )
+            let stage = p.stage.detail_title_in(locale);
+            let duration = ms_text(p.duration_ms, locale);
+            if p.ok {
+                tr(
+                    locale,
+                    "diagnose.detail.phase",
+                    &[("stage", &stage), ("duration", &duration)],
+                )
+            } else {
+                tr(
+                    locale,
+                    "diagnose.detail.phase_failed",
+                    &[("stage", &stage), ("duration", &duration)],
+                )
+            }
         })
         .collect::<Vec<_>>()
-        .join(", ")
+        .join(&tr(locale, "diagnose.list.separator", &[]))
+}
+
+fn render(text: &LocalizedText, locale: &str, r: &mut Redactor) -> String {
+    r.text(&text.render(locale))
+}
+
+fn encrypted_text(encrypted: bool, locale: &str) -> String {
+    if encrypted {
+        tr(locale, "diagnose.server.encrypted", &[])
+    } else {
+        tr(locale, "diagnose.server.login_only_encrypted", &[])
+    }
+}
+
+fn certificate_trusted_text(locale: &str) -> String {
+    tr(locale, "diagnose.depth.certificate_trusted", &[])
+}
+
+fn certificate_name_text(locale: &str, name: &str) -> String {
+    tr(
+        locale,
+        "diagnose.depth.certificate_name",
+        &[("name", &name)],
+    )
+}
+
+fn field_label(locale: &str, id: &str) -> String {
+    tr(locale, id, &[])
+}
+
+fn table_widths(report: &Report, locale: &str) -> (usize, usize, usize) {
+    let check = report
+        .checks
+        .iter()
+        .map(|check| display_width(&check.id.title_in(locale)))
+        .chain([display_width(&field_label(locale, "diagnose.table.check"))])
+        .max()
+        .unwrap_or(20)
+        .max(20);
+    let result = report
+        .checks
+        .iter()
+        .map(|check| display_width(&status_label(check.coverage, locale)))
+        .chain([display_width(&field_label(locale, "diagnose.table.result"))])
+        .max()
+        .unwrap_or(12)
+        .max(12);
+    let time = report
+        .checks
+        .iter()
+        .filter_map(|check| check.duration_ms)
+        .map(|ms| display_width(&ms_text(ms, locale)))
+        .chain([display_width(&field_label(locale, "diagnose.table.time"))])
+        .max()
+        .unwrap_or(8)
+        .max(8);
+    (check, result, time)
+}
+
+fn pad_right(text: &str, width: usize) -> String {
+    format!(
+        "{text}{}",
+        " ".repeat(width.saturating_sub(display_width(text)))
+    )
+}
+
+fn pad_left(text: &str, width: usize) -> String {
+    format!(
+        "{}{}",
+        " ".repeat(width.saturating_sub(display_width(text))),
+        text
+    )
+}
+
+fn display_width(text: &str) -> usize {
+    text.chars().map(char_display_width).sum()
+}
+
+fn char_display_width(ch: char) -> usize {
+    match ch as u32 {
+        0x0300..=0x036F => 0,
+        0x0483..=0x0489
+        | 0x0591..=0x05BD
+        | 0x05BF..=0x05C7
+        | 0x064B..=0x065F
+        | 0x0670
+        | 0x20D0..=0x20F0 => 0,
+        0x1100..=0x115F
+        | 0x2E80..=0xA4CF
+        | 0xAC00..=0xD7A3
+        | 0xF900..=0xFAFF
+        | 0xFE30..=0xFE4F
+        | 0xFF00..=0xFF60
+        | 0xFFE0..=0xFFE6
+        | 0x20000..=0x3FFFD
+            if !matches!(ch as u32, 0x303F | 0x4DC0..=0x4DFF) =>
+        {
+            2
+        }
+        _ => 1,
+    }
 }
 
 /// What a check found, in a few words, for the text report.
-fn check_text(check: &Check, r: &mut Redactor) -> String {
+fn check_text(check: &Check, r: &mut Redactor, locale: &str) -> String {
     if let Some(skip) = &check.skip {
-        return skip_text(skip);
+        return skip_text(skip, locale);
     }
     let field = |key: &str| check.field(key).unwrap_or_default().to_string();
     let named = |r: &mut Redactor, key: &str| {
@@ -243,19 +361,31 @@ fn check_text(check: &Check, r: &mut Redactor) -> String {
                 return error.to_string();
             }
             let mut parts = vec![field("protocol")];
-            parts.push(format!("host {}", named(r, "host").join("")));
+            parts.push(tr(
+                locale,
+                "diagnose.detail.host",
+                &[("host", &named(r, "host").join(""))],
+            ));
             let instance = named(r, "instance");
             if !instance.is_empty() {
-                parts.push(format!("instance {}", instance.join("")));
+                parts.push(tr(
+                    locale,
+                    "diagnose.detail.instance",
+                    &[("instance", &instance.join(""))],
+                ));
             }
             if let Some(port) = check.field("port") {
-                parts.push(format!("port {port}"));
+                parts.push(tr(locale, "diagnose.detail.port", &[("port", &port)]));
             }
             let database = named(r, "database");
             if !database.is_empty() {
-                parts.push(format!("database {}", database.join("")));
+                parts.push(tr(
+                    locale,
+                    "diagnose.detail.database",
+                    &[("database", &database.join(""))],
+                ));
             }
-            parts.join(", ")
+            parts.join(&tr(locale, "diagnose.list.separator", &[]))
         }
         super::CheckId::NameResolution => {
             let host = named(r, "host").join("");
@@ -263,25 +393,38 @@ fn check_text(check: &Check, r: &mut Redactor) -> String {
             if addresses.is_empty() {
                 format!("{host}: {}", field("result"))
             } else {
-                format!("{host}: {}", addresses.join(", "))
+                format!(
+                    "{host}: {}",
+                    addresses.join(&tr(locale, "diagnose.list.separator", &[]))
+                )
             }
         }
         super::CheckId::InstanceResolution => match check.field("port") {
-            Some(port) => format!(
-                "{}\\{}: port {port}",
-                named(r, "host").join(""),
-                named(r, "instance").join("")
+            Some(port) => tr(
+                locale,
+                "diagnose.detail.instance_port",
+                &[
+                    ("host", &named(r, "host").join("")),
+                    ("instance", &named(r, "instance").join("")),
+                    ("port", &port),
+                ],
             ),
-            None if check.field("pipe").is_some() => format!(
-                "{}\\{}: pipe {}",
-                named(r, "host").join(""),
-                named(r, "instance").join(""),
-                named(r, "pipe").join("")
+            None if check.field("pipe").is_some() => tr(
+                locale,
+                "diagnose.detail.instance_pipe",
+                &[
+                    ("host", &named(r, "host").join("")),
+                    ("instance", &named(r, "instance").join("")),
+                    ("pipe", &named(r, "pipe").join("")),
+                ],
             ),
-            None => format!(
-                "{}\\{}: no usable port",
-                named(r, "host").join(""),
-                named(r, "instance").join("")
+            None => tr(
+                locale,
+                "diagnose.detail.instance_no_port",
+                &[
+                    ("host", &named(r, "host").join("")),
+                    ("instance", &named(r, "instance").join("")),
+                ],
             ),
         },
         super::CheckId::TcpConnect => {
@@ -297,35 +440,89 @@ fn check_text(check: &Check, r: &mut Redactor) -> String {
                     )
                 })
                 .collect();
-            format!("port {}: {}", field("port"), attempts.join(", "))
+            tr(
+                locale,
+                "diagnose.detail.port_attempts",
+                &[
+                    ("port", &field("port")),
+                    (
+                        "attempts",
+                        &attempts.join(&tr(locale, "diagnose.list.separator", &[])),
+                    ),
+                ],
+            )
         }
         super::CheckId::ConnectionAttempt => {
-            let mut text = phases_text(&check.subphases);
+            let mut text = phases_text(&check.subphases, locale);
             if let Some(encryption) = check.field("encryption") {
-                let _ = write!(text, "; encryption {encryption}");
+                let _ = write!(
+                    text,
+                    "{}",
+                    tr(
+                        locale,
+                        "diagnose.detail.encryption_suffix",
+                        &[("encryption", &encryption)]
+                    )
+                );
             }
             if let Some(tls) = check.field("tlsFailure") {
-                let _ = write!(text, "; TLS failure: {tls}");
+                let _ = write!(
+                    text,
+                    "{}",
+                    tr(
+                        locale,
+                        "diagnose.detail.tls_failure_suffix",
+                        &[("tls", &tls)]
+                    )
+                );
             }
             let spn = named(r, "spn");
             if !spn.is_empty() {
-                let _ = write!(text, "; SPN {}", spn.join(""));
+                let _ = write!(
+                    text,
+                    "{}",
+                    tr(
+                        locale,
+                        "diagnose.detail.spn_suffix",
+                        &[("spn", &spn.join(""))]
+                    )
+                );
             }
             if let Some(cache) = check.field("kerberosTicketCache") {
-                let _ = write!(text, "; ticket cache {cache}");
+                let _ = write!(
+                    text,
+                    "{}",
+                    tr(
+                        locale,
+                        "diagnose.detail.ticket_cache_suffix",
+                        &[("state", &cache)]
+                    )
+                );
             }
             text
         }
         super::CheckId::SessionValidation => {
             let mut text = match check.field("targetType") {
-                Some(target) => format!(
-                    "{target} (engine edition {})",
-                    check.field("engineEdition").unwrap_or("?")
+                Some(target) => tr(
+                    locale,
+                    "diagnose.detail.target_engine",
+                    &[
+                        ("target", &target),
+                        ("edition", &check.field("engineEdition").unwrap_or("?")),
+                    ],
                 ),
                 None => String::new(),
             };
             if let Some(offset) = check.field("clockOffsetMs") {
-                let _ = write!(text, "; server clock {offset} ms from the client's");
+                let _ = write!(
+                    text,
+                    "{}",
+                    tr(
+                        locale,
+                        "diagnose.detail.clock_offset_suffix",
+                        &[("offset", &offset)]
+                    )
+                );
             }
             text
         }
@@ -334,77 +531,131 @@ fn check_text(check: &Check, r: &mut Redactor) -> String {
 
 /// The report as text, each line ending in `\n`.
 pub fn text(report: &Report) -> String {
+    text_in(report, i18n::locale())
+}
+
+pub fn text_in(report: &Report, locale: &str) -> String {
     let mut r = redactor(report);
     let request = &report.request;
     let mut out = String::new();
 
     if report.execution_status == super::ExecutionStatus::InvalidInvocation {
-        out.push_str("sqlcmd diagnose: the request is invalid; nothing ran.\n\n");
+        let _ = writeln!(
+            out,
+            "{}",
+            tr(locale, "diagnose.header.invalid_request", &[])
+        );
+        out.push('\n');
     } else {
         let _ = writeln!(
             out,
-            "sqlcmd diagnose: {}",
-            r.name(Category::Server, &request.server)
+            "{}",
+            tr(
+                locale,
+                "diagnose.header.server",
+                &[("server", &r.name(Category::Server, &request.server))]
+            )
         );
-        let _ = write!(
-            out,
-            "Depth: {}{}; {} login",
-            request.depth.title(),
-            if request.depth_selected {
-                ""
-            } else {
-                " (default)"
-            },
-            request.authentication.name()
+        let depth = request.depth.title_in(locale);
+        let default_suffix = if request.depth_selected {
+            String::new()
+        } else {
+            tr(locale, "diagnose.depth.default_suffix", &[])
+        };
+        // The user name goes inside the sentence, so a translation can place it.
+        let mut depth_line = match &request.authentication {
+            super::Authentication::SqlPassword { user, .. } => tr(
+                locale,
+                "diagnose.depth.line_with_user",
+                &[
+                    ("depth", &depth),
+                    ("default", &default_suffix),
+                    ("auth", &request.authentication.name()),
+                    ("user", &r.name(Category::User, user)),
+                ],
+            ),
+            super::Authentication::Integrated => tr(
+                locale,
+                "diagnose.depth.line",
+                &[
+                    ("depth", &depth),
+                    ("default", &default_suffix),
+                    ("auth", &request.authentication.name()),
+                ],
+            ),
+        };
+        let encrypt = tr(
+            locale,
+            "diagnose.depth.encrypt_suffix",
+            &[("encrypt", &request.encrypt.name())],
         );
-        if let super::Authentication::SqlPassword { user, .. } = &request.authentication {
-            let _ = write!(out, " {}", r.name(Category::User, user));
-        }
-        let _ = write!(out, "; encrypt {}", request.encrypt.name());
+        depth_line.push_str(&encrypt);
         if let Some(database) = &request.database {
-            let _ = write!(out, "; database {}", r.name(Category::Database, database));
+            depth_line.push_str(&tr(
+                locale,
+                "diagnose.depth.database_suffix",
+                &[("database", &r.name(Category::Database, database))],
+            ));
         }
         if request.trust_server_certificate {
-            out.push_str("; server certificate trusted (-C)");
+            depth_line.push_str(&certificate_trusted_text(locale));
         }
         if let Some(name) = &request.host_name_in_certificate {
-            let _ = write!(
-                out,
-                "; certificate name {} (-F)",
-                r.name(Category::Host, name)
-            );
+            depth_line.push_str(&certificate_name_text(
+                locale,
+                &r.name(Category::Host, name),
+            ));
         }
-        out.push('\n');
+        let _ = writeln!(out, "{depth_line}");
         let _ = writeln!(
             out,
-            "Client: {}; time limit {} s per step (-l), {} s for SQL Server Browser",
-            os_version().unwrap_or_else(|| os_family().to_string()),
-            request.timeout_ms() / 1000,
-            super::BROWSER_TIMEOUT_MS / 1000
+            "{}",
+            tr(
+                locale,
+                "diagnose.client.line",
+                &[
+                    (
+                        "client",
+                        &os_version().unwrap_or_else(|| os_family().to_string())
+                    ),
+                    ("seconds", &(request.timeout_ms() / 1000)),
+                    ("browser_seconds", &(super::BROWSER_TIMEOUT_MS / 1000)),
+                ],
+            )
         );
-        out.push_str(if r.reveals() {
-            "NOT SHARE-SAFE: identifiers are shown as they are (--local-detail).\n\n"
-        } else {
-            "Share-safe: identifiers are shown as labels (host-1, ...); --local-detail shows them.\n\n"
-        });
+        let _ = writeln!(
+            out,
+            "{}\n",
+            if r.reveals() {
+                tr(locale, "diagnose.share_safe.not_share_safe", &[])
+            } else {
+                tr(locale, "diagnose.share_safe.safe", &[])
+            }
+        );
 
         if !report.checks.is_empty() {
+            let (check_width, result_width, time_width) = table_widths(report, locale);
             let _ = writeln!(
                 out,
-                "  {:<20}  {:<12}  {:>8}  Details",
-                "Check", "Result", "Time"
+                "  {}  {}  {}  {}",
+                pad_right(&field_label(locale, "diagnose.table.check"), check_width),
+                pad_right(&field_label(locale, "diagnose.table.result"), result_width),
+                pad_left(&field_label(locale, "diagnose.table.time"), time_width),
+                field_label(locale, "diagnose.table.details")
             );
-        }
-        for check in &report.checks {
-            let duration = check.duration_ms.map_or(String::new(), ms_text);
-            let detail = check_text(check, &mut r);
-            let line = format!(
-                "  {:<20}  {:<12}  {:>8}  {detail}",
-                check.id.title(),
-                status_label(check.coverage),
-                duration
-            );
-            let _ = writeln!(out, "{}", line.trim_end());
+            for check in &report.checks {
+                let duration = check
+                    .duration_ms
+                    .map_or(String::new(), |ms| ms_text(ms, locale));
+                let detail = check_text(check, &mut r, locale);
+                let line = format!(
+                    "  {}  {}  {}  {detail}",
+                    pad_right(&check.id.title_in(locale), check_width),
+                    pad_right(&status_label(check.coverage, locale), result_width),
+                    pad_left(&duration, time_width)
+                );
+                let _ = writeln!(out, "{}", line.trim_end());
+            }
         }
         if !report.checks.is_empty() {
             out.push('\n');
@@ -414,29 +665,49 @@ pub fn text(report: &Report) -> String {
     let category = report.exit_category();
     let _ = writeln!(
         out,
-        "Outcome:   {} (exit code {}: {})",
-        report.outcome.name(),
-        category.code(),
-        category.meaning()
+        "{}",
+        tr(
+            locale,
+            "diagnose.outcome.line",
+            &[
+                ("outcome", &report.outcome.name()),
+                ("code", &category.code()),
+                ("meaning", &category.meaning_in(locale)),
+            ],
+        )
+    );
+    let deepest = report.deepest_phase_evaluated().map_or_else(
+        || tr(locale, "diagnose.none", &[]),
+        |depth| depth.title_in(locale),
     );
     let _ = writeln!(
         out,
-        "Execution: {}; deepest phase evaluated: {}",
-        report.execution_status.name(),
-        report
-            .deepest_phase_evaluated()
-            .map_or("none", Depth::title)
+        "{}",
+        tr(
+            locale,
+            "diagnose.execution.line",
+            &[
+                ("execution", &report.execution_status.name()),
+                ("depth", &deepest),
+            ],
+        )
     );
     if let Some(auth) = report.authentication {
         let _ = writeln!(
             out,
-            "Login:     {} {}",
-            request.authentication.name(),
-            auth.name()
+            "{}",
+            tr(
+                locale,
+                "diagnose.login.line",
+                &[
+                    ("auth", &request.authentication.name()),
+                    ("outcome", &auth.name()),
+                ],
+            )
         );
     }
     if let Some(server) = &report.server {
-        let _ = write!(out, "Server:    SQL Server");
+        let _ = write!(out, "{}", tr(locale, "diagnose.server.line_prefix", &[]));
         if let Some(version) = &server.version {
             let _ = write!(out, " {version}");
         }
@@ -445,57 +716,97 @@ pub fn text(report: &Report) -> String {
         }
         let _ = write!(
             out,
-            ", database {}, packet size {}, {}",
-            r.name(Category::Database, &server.database),
-            server.packet_size,
-            if server.encrypted {
-                "encrypted"
-            } else {
-                "only the login encrypted"
-            }
+            "{}",
+            tr(
+                locale,
+                "diagnose.server.detail_suffix",
+                &[
+                    ("database", &r.name(Category::Database, &server.database)),
+                    ("packet_size", &server.packet_size),
+                    ("encryption", &encrypted_text(server.encrypted, locale)),
+                ],
+            )
         );
         if let Some(target_type) = server.target_type() {
-            let _ = write!(out, ", {target_type}");
+            let _ = write!(
+                out,
+                "{}",
+                tr(locale, "diagnose.comma_value", &[("value", &target_type)])
+            );
         }
         out.push('\n');
     }
 
     if !report.findings.is_empty() {
-        out.push_str("\nFindings:\n");
+        let _ = writeln!(out, "\n{}", tr(locale, "diagnose.findings.header", &[]));
         for finding in &report.findings {
             let _ = writeln!(
                 out,
                 "  [{}] {}",
                 finding.certainty.name(),
-                r.text(&finding.text)
+                render(&finding.text, locale, &mut r)
             );
         }
     }
     if let Some(domain) = &report.domain {
-        let _ = write!(out, "\nSpecialist area: {}", domain.primary);
+        let _ = write!(
+            out,
+            "\n{}",
+            tr(
+                locale,
+                "diagnose.specialist.line",
+                &[("domain", &domain.primary)]
+            )
+        );
         if !domain.candidates.is_empty() {
-            let _ = write!(out, " (candidates: {})", domain.candidates.join(", "));
+            let _ = write!(
+                out,
+                "{}",
+                tr(
+                    locale,
+                    "diagnose.specialist.candidates_suffix",
+                    &[(
+                        "candidates",
+                        &domain
+                            .candidates
+                            .join(&tr(locale, "diagnose.list.separator", &[])),
+                    )]
+                )
+            );
         }
-        out.push_str(" - the area for a support handoff, not a confirmed cause.\n");
+        let _ = writeln!(
+            out,
+            "{}",
+            tr(locale, "diagnose.specialist.explanation_suffix", &[])
+        );
     }
     if let Some(guide) = report.tracing_guide {
         let _ = writeln!(
             out,
-            "Driver tracing can show more than these checks; see {guide}"
+            "{}",
+            tr(locale, "diagnose.tracing_guide", &[("url", &guide)])
         );
     }
     if !report.errors.is_empty() {
-        out.push_str("\nErrors, in order:\n");
+        let _ = writeln!(out, "\n{}", tr(locale, "diagnose.errors.header", &[]));
         for error in &report.errors {
             let mut ids = Vec::new();
             if let Some(number) = error.number {
-                ids.push(format!("error {number}"));
+                ids.push(tr(
+                    locale,
+                    "diagnose.error_id.sql_error",
+                    &[("number", &number)],
+                ));
             }
             if let (Some(state), Some(class)) = (error.state, error.class) {
-                ids.push(format!("state {state}, class {class}"));
+                ids.push(tr(
+                    locale,
+                    "diagnose.error_id.state_class",
+                    &[("state", &state), ("class", &class)],
+                ));
             }
             if let Some(os) = error.os_error {
-                ids.push(format!("os error {os}"));
+                ids.push(tr(locale, "diagnose.error_id.os_error", &[("number", &os)]));
             }
             if let Some(code) = &error.code {
                 ids.push(code.clone());
@@ -503,18 +814,30 @@ pub fn text(report: &Report) -> String {
             let ids = if ids.is_empty() {
                 String::new()
             } else {
-                format!(" [{}]", ids.join("; "))
+                format!(
+                    " [{}]",
+                    ids.join(&tr(locale, "diagnose.list.semicolon_separator", &[]))
+                )
             };
-            let _ = writeln!(out, "  {}{ids}: {}", error.source, r.text(&error.message));
+            let _ = writeln!(
+                out,
+                "  {}{ids}: {}",
+                error.source,
+                render(&error.message, locale, &mut r)
+            );
         }
         if !r.reveals() {
-            out.push_str("  Review error messages before sharing: they may hold names sqlcmd cannot recognize.\n");
+            let _ = writeln!(
+                out,
+                "  {}",
+                tr(locale, "diagnose.review_errors_before_sharing", &[])
+            );
         }
     }
     if !report.limitations.is_empty() {
-        out.push_str("\nLimitations:\n");
+        let _ = writeln!(out, "\n{}", tr(locale, "diagnose.limitations.header", &[]));
         for limitation in &report.limitations {
-            let _ = writeln!(out, "  - {limitation}");
+            let _ = writeln!(out, "  - {}", limitation.render(locale));
         }
     }
     out
@@ -526,6 +849,10 @@ const ONE_LINE_DEPTH: usize = 3;
 
 /// The report as one JSON document, ending in `\n`. `version` is sqlcmd's.
 pub fn json(report: &Report, version: &str) -> Result<String, serde_json::Error> {
+    json_in(report, version, i18n::locale())
+}
+
+pub fn json_in(report: &Report, version: &str, locale: &str) -> Result<String, serde_json::Error> {
     let mut r = redactor(report);
     let request = &report.request;
     let share_safe = !r.reveals();
@@ -572,12 +899,12 @@ pub fn json(report: &Report, version: &str) -> Result<String, serde_json::Error>
         exit_code: category.code(),
         exit_category: ExitCategoryView {
             name: category.name(),
-            meaning: category.meaning(),
+            meaning: category.meaning_in(locale),
         },
         checks: report
             .checks
             .iter()
-            .map(|check| CheckView::new(check, &mut r))
+            .map(|check| CheckView::new(check, &mut r, locale))
             .collect(),
         authentication: report.authentication.map(|auth| AuthenticationView {
             method: request.authentication.name(),
@@ -600,7 +927,7 @@ pub fn json(report: &Report, version: &str) -> Result<String, serde_json::Error>
             .map(|finding| FindingView {
                 certainty: finding.certainty.name(),
                 check: finding.check.name(),
-                text: r.text(&finding.text),
+                text: render(&finding.text, locale, &mut r),
             })
             .collect(),
         tracing_guide: report.tracing_guide,
@@ -619,11 +946,15 @@ pub fn json(report: &Report, version: &str) -> Result<String, serde_json::Error>
                 class: error.class,
                 os_error: error.os_error,
                 code: error.code.as_deref(),
-                message: r.text(&error.message),
+                message: render(&error.message, locale, &mut r),
                 from_message_text: error.from_message_text,
             })
             .collect(),
-        limitations: &report.limitations,
+        limitations: report
+            .limitations
+            .iter()
+            .map(|limitation| limitation.render(locale))
+            .collect(),
         // Free text can hold names sqlcmd cannot recognize (certificate
         // names, SPNs): flagged for review rather than trusted as share-safe.
         review_before_sharing: if !report.errors.is_empty() && share_safe {
@@ -668,7 +999,7 @@ struct ReportView<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     specialist_domain: Option<DomainView<'a>>,
     errors: Vec<ErrorView<'a>>,
-    limitations: &'a [String],
+    limitations: Vec<String>,
     review_before_sharing: Vec<&'static str>,
 }
 
@@ -702,7 +1033,7 @@ struct ClientView {
 #[derive(Serialize)]
 struct ExitCategoryView {
     name: &'static str,
-    meaning: &'static str,
+    meaning: String,
 }
 
 #[derive(Serialize)]
@@ -813,7 +1144,7 @@ struct PhaseView {
 }
 
 impl CheckView {
-    fn new(check: &Check, r: &mut Redactor) -> Self {
+    fn new(check: &Check, r: &mut Redactor, locale: &str) -> Self {
         // A key can repeat (one `addresses` field per address); its values
         // are gathered under the first occurrence.
         let mut fields: Vec<(&'static str, FieldValue)> = Vec::new();
@@ -852,7 +1183,7 @@ impl CheckView {
                 Skip::BlockedBy(by) => SkipView::BlockedBy(by.name()),
                 skip => SkipView::Other {
                     reason: skip_reason(skip),
-                    detail: skip_text(skip),
+                    detail: skip_text(skip, locale),
                 },
             }),
             fields,
@@ -1026,7 +1357,11 @@ mod tests {
                     duration_ms: None,
                     ..Check::skipped(
                         CheckId::InstanceResolution,
-                        Skip::NotApplicable("not a named instance"),
+                        Skip::not_applicable(
+                            "diagnose.skip.not_named_instance",
+                            "not a named instance",
+                            vec![],
+                        ),
                     )
                 },
                 tcp,
@@ -1056,7 +1391,7 @@ mod tests {
             tracing_guide: None,
             execution_status: ExecutionStatus::Completed,
             outcome: DiagnosticOutcome::Passed,
-            limitations: vec!["A limitation.".to_string()],
+            limitations: vec!["A limitation.".to_string().into()],
         }
     }
 
@@ -1080,9 +1415,14 @@ mod tests {
         report.findings = vec![Finding {
             certainty: Certainty::Confirmed,
             check: CheckId::TcpConnect,
-            text:
-                "No address accepted a TCP connection on port 1433: 10.0.0.1 refused, ::1 refused."
-                    .to_string(),
+            text: LocalizedText::new(
+                "diagnose.finding.no_address_accepted_tcp",
+                "No address accepted a TCP connection on port 1433: 10.0.0.1 refused, ::1 refused.",
+                vec![
+                    ("port", "1433".to_string()),
+                    ("summary", "10.0.0.1 refused, ::1 refused".to_string()),
+                ],
+            ),
         }];
         let mut error = ErrorRecord::new(
             "os",
@@ -1093,6 +1433,63 @@ mod tests {
         error.code = Some("refused".to_string());
         report.errors = vec![error];
         report
+    }
+
+    fn qps_passing_report() -> Report {
+        let mut report = passing_report();
+        report.limitations = vec![LocalizedText::new(
+            "diagnose.limitation.mssql_tds",
+            "The connection attempt is made with the mssql-tds client, which reports its pre-login, TLS and login phases; it is not the ODBC driver sqlcmd uses for queries, so TLS and login behavior can differ from a query run.",
+            vec![],
+        )];
+        report
+    }
+
+    fn qps_failing_report() -> Report {
+        let mut report = failing_report();
+        report.limitations = Vec::new();
+        report
+    }
+
+    fn assert_pseudo_localized(rendered: &str) {
+        for plain in [
+            "sqlcmd diagnose",
+            "Depth:",
+            "Share-safe",
+            "Check",
+            "Result",
+            "Details",
+            "Connection input",
+            "Name resolution",
+            "not a named instance",
+            "Outcome:",
+            "Execution:",
+            "Login:",
+            "Server:",
+            "Findings:",
+            "Specialist area:",
+            "Errors, in order:",
+            "Review error messages",
+            "Limitations:",
+            "The connection attempt",
+            "No address accepted",
+        ] {
+            assert!(!rendered.contains(plain), "{plain} survived in {rendered}");
+        }
+    }
+
+    #[test]
+    fn display_width_counts_cjk_and_combining_marks_for_padding() {
+        assert_eq!(display_width("检查"), 4);
+        assert_eq!(display_width("e\u{0301}"), 1);
+        assert_eq!(display_width("ש\u{05B0}"), 1);
+        assert_eq!(display_width("ن\u{064E}"), 1);
+        assert_eq!(display_width("\u{303F}"), 1);
+        assert_eq!(display_width("\u{4DC0}"), 1);
+        assert_eq!(pad_right("检查", 6), "检查  ");
+        assert_eq!(display_width(&pad_right("检查", 6)), 6);
+        let line = format!("{}|{}|", pad_right("检查", 6), pad_right("Result", 6));
+        assert_eq!(line, "检查  |Result|");
     }
 
     #[test]
@@ -1277,6 +1674,58 @@ Limitations:
             "{json}"
         );
         assert!(json.contains("\"exitCategory\": {\n    \"name\""), "{json}");
+    }
+
+    #[test]
+    fn qps_ploc_routes_text_report_prose_through_catalog() {
+        let passing = text_in(&qps_passing_report(), "qps-ploc");
+        assert_pseudo_localized(&passing);
+        assert!(
+            passing.contains("[!!!") && passing.contains("!!!]"),
+            "{passing}"
+        );
+
+        // The login's user label sits inside the translated sentence.
+        let depth = passing
+            .lines()
+            .find(|line| line.contains("user-1"))
+            .unwrap_or_default();
+        assert!(
+            depth.contains("user-1 !!!]") && !depth.contains("!!!] user-1"),
+            "{depth}"
+        );
+
+        let failing = text_in(&qps_failing_report(), "qps-ploc");
+        assert_pseudo_localized(&failing);
+        assert!(
+            failing.contains("issueDetected") && failing.contains("connectivity.network"),
+            "contract values stay unchanged: {failing}"
+        );
+    }
+
+    #[test]
+    fn qps_ploc_routes_json_human_text_but_not_contract_values() {
+        let json = json_in(&qps_failing_report(), "v", "qps-ploc").unwrap();
+        assert_pseudo_localized(&json);
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["checks"][0]["check"], "connectionInput");
+        assert_eq!(value["checks"][0]["status"], "passed");
+        assert_eq!(value["diagnosticOutcome"], "issueDetected");
+        assert_eq!(value["specialistDomain"]["primary"], "undetermined");
+        assert!(
+            value["findings"][0]["text"]
+                .as_str()
+                .unwrap()
+                .starts_with("[!!!"),
+            "{json}"
+        );
+        assert!(
+            value["checks"][2]["detail"]
+                .as_str()
+                .unwrap()
+                .starts_with("[!!!"),
+            "{json}"
+        );
     }
 
     #[test]

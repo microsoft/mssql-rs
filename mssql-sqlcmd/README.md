@@ -157,6 +157,28 @@ give the pre-login, TLS and login phases and their timings, recorded by a
 `mssql-tds` is 64-bit only, so 32-bit builds (`win-x86`) leave diagnose out:
 there `mssql_sqlcmd_diagnostics_run` returns `MSSQL_SQLCMD_UNSUPPORTED`.
 
+## Localization
+
+Rust-generated human text is routed through the `i18n` message catalog. Stable
+JSON keys, enum values, identifiers, numeric codes and server/driver text are
+not localized. Existing diagnostics and formatter strings are being moved to the
+catalog incrementally; only catalog-backed Rust messages participate today.
+
+Locale selection is process-wide. Native sqlcmd may call
+`mssql_sqlcmd_set_locale` once at startup with the language it resolved for its
+resource DLL (on Windows this can be an LCID such as `1031`). If it does not,
+the crate resolves `SQLCMD_LANG`, `LC_ALL`, `LC_MESSAGES`, then `LANG`, and on
+Windows finally `GetUserDefaultUILanguage()`. Values may be BCP-47 (`de-DE`),
+POSIX (`de_DE.UTF-8`) or LCID decimal/hex (`1031`, `0x0407`). Unknown locales
+fall back to `en-US`; missing translated messages fall back per message.
+
+The source catalog is `i18n/locales/en-US/sqlcmd.json`. OneLocBuild uses
+`i18n/LocProject.json` and `i18n/P306PairNamesToProcess.lss` to create or reuse
+a pull request that writes translated catalogs under `i18n/localized/<Lang>/`.
+Do not hand-edit localized catalogs. To verify that a string is catalog-routed,
+run with `SQLCMD_LANG=qps-ploc`; pseudo-localized text is wrapped with
+`[!!! ... !!!]` while placeholders keep working.
+
 ## Building for native sqlcmd
 
 ```text
