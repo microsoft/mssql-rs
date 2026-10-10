@@ -44,35 +44,39 @@ pub(crate) unsafe fn sql_get_desc_rec_w(
     scale_ptr: *mut SqlSmallInt,
     nullable_ptr: *mut SqlSmallInt,
 ) -> SqlReturn {
-    debug!(
-        ?descriptor_handle,
-        record_number,
-        ?name,
-        buffer_length,
-        ?string_length_ptr,
-        ?type_ptr,
-        ?sub_type_ptr,
-        ?length_ptr,
-        ?precision_ptr,
-        ?scale_ptr,
-        ?nullable_ptr,
-        "SQLGetDescRecW called",
-    );
-    crate::ffi_entry!("SQLGetDescRecW", unsafe {
-        sql_get_desc_rec_w_impl(
-            descriptor_handle,
+    crate::ffi_entry!(
+        "SQLGetDescRecW",
+        descriptor_handle,
+        debug!(
+            ?descriptor_handle,
             record_number,
-            name,
+            ?name,
             buffer_length,
-            string_length_ptr,
-            type_ptr,
-            sub_type_ptr,
-            length_ptr,
-            precision_ptr,
-            scale_ptr,
-            nullable_ptr,
-        )
-    })
+            ?string_length_ptr,
+            ?type_ptr,
+            ?sub_type_ptr,
+            ?length_ptr,
+            ?precision_ptr,
+            ?scale_ptr,
+            ?nullable_ptr,
+            "SQLGetDescRecW called",
+        ),
+        unsafe {
+            sql_get_desc_rec_w_impl(
+                descriptor_handle,
+                record_number,
+                name,
+                buffer_length,
+                string_length_ptr,
+                type_ptr,
+                sub_type_ptr,
+                length_ptr,
+                precision_ptr,
+                scale_ptr,
+                nullable_ptr,
+            )
+        }
+    )
 }
 
 /// # Safety

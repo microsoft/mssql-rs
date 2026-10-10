@@ -31,17 +31,18 @@ pub(crate) unsafe fn sql_set_env_attr(
     value_ptr: SqlPointer,
     _string_length: SqlInteger,
 ) -> SqlReturn {
-    debug!(
-        ?environment_handle,
-        attribute,
-        ?value_ptr,
-        string_length = _string_length,
-        "SQLSetEnvAttr called",
-    );
-
-    crate::ffi_entry!("SQLSetEnvAttr", unsafe {
-        sql_set_env_attr_impl(environment_handle, attribute, value_ptr)
-    })
+    crate::ffi_entry!(
+        "SQLSetEnvAttr",
+        environment_handle,
+        debug!(
+            ?environment_handle,
+            attribute,
+            ?value_ptr,
+            string_length = _string_length,
+            "SQLSetEnvAttr called",
+        ),
+        unsafe { sql_set_env_attr_impl(environment_handle, attribute, value_ptr) }
+    )
 }
 
 /// # Safety

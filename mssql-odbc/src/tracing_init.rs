@@ -65,6 +65,26 @@ where
             metadata.level(),
             metadata.target()
         )?;
+        let correlation = mssql_tds::trace_context::snapshot();
+        if let Some(dbc) = correlation.dbc {
+            write!(writer, "dbc={dbc} ")?;
+        }
+        if let Some(cid) = correlation.cid {
+            let mut buffer = uuid::Uuid::encode_buffer();
+            write!(
+                writer,
+                "cid={} ",
+                cid.hyphenated().encode_upper(&mut buffer)
+            )?;
+        } else {
+            write!(writer, "cid=- ")?;
+        }
+        if let Some(stmt) = correlation.stmt {
+            write!(writer, "stmt={stmt} ")?;
+        }
+        if let Some(exec) = correlation.exec {
+            write!(writer, "exec={exec} ")?;
+        }
         ctx.field_format().format_fields(writer.by_ref(), event)?;
         writeln!(writer)
     }
@@ -294,8 +314,95 @@ pub(crate) fn init_tracing() {
 
         if let Err(error) = result {
             report(format_args!("[mssql-odbc] ERROR: {error}"));
+        } else {
+            mssql_tds::trace_context::enable();
         }
     });
+}
+
+pub(crate) fn starts_execution(api: &str) -> bool {
+    matches!(
+        api,
+        "SQLExecute"
+            | "SQLExecDirectW"
+            | "SQLDescribeParam"
+            | "SQLTablesW"
+            | "SQLColumnsW"
+            | "SQLPrimaryKeysW"
+            | "SQLForeignKeysW"
+            | "SQLStatisticsW"
+            | "SQLSpecialColumnsW"
+            | "SQLProceduresW"
+            | "SQLGetTypeInfoW"
+    )
+}
+
+fn continues_execution(api: &str) -> bool {
+    matches!(
+        api,
+        "SQLFetch"
+            | "SQLFetchScroll"
+            | "SQLGetData"
+            | "SQLMoreResults"
+            | "SQLRowCount"
+            | "SQLNumResultCols"
+            | "SQLDescribeColW"
+            | "SQLColAttributeW"
+            | "SQLParamData"
+            | "SQLPutData"
+            | "SQLCancel"
+            | "SQLCloseCursor"
+            | "SQLFreeStmt(SQL_CLOSE)"
+    )
+}
+
+/// The registry check permits stale/null handles on diagnostics and free paths
+/// without dereferencing them. Live handles remain subject to the API's
+/// existing lifetime contract. No handle lock is acquired for correlation.
+///
+/// # Safety
+/// A live `handle` and its parent must remain allocated through this call.
+pub(crate) unsafe fn context_for(
+    handle: crate::api::odbc_types::SqlHandle,
+    api: &str,
+) -> mssql_tds::trace_context::Context {
+    use crate::handles::{DbcHandle, DescHandle, HandleType, StmtHandle, handle_from_raw};
+    use mssql_tds::trace_context::Context;
+
+    match crate::handles::live_type(handle) {
+        Some(HandleType::Dbc) => {
+            let dbc = unsafe { handle_from_raw::<DbcHandle>(handle) };
+            let context = Context::connection(Arc::clone(&dbc.trace));
+            if matches!(api, "SQLConnectW" | "SQLDriverConnectW") {
+                context.pending_connection()
+            } else {
+                context
+            }
+        }
+        Some(HandleType::Stmt) => {
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(handle) };
+            let context = Context::connection(Arc::clone(&stmt.parent_dbc().trace));
+            match &stmt.trace {
+                Some(trace) => {
+                    let context = context.statement(Arc::clone(trace), starts_execution(api));
+                    if !starts_execution(api) && !continues_execution(api) {
+                        // Preparation, configuration, and diagnostic calls must
+                        // not attribute their errors to an earlier execution.
+                        context.without_execution()
+                    } else {
+                        context
+                    }
+                }
+                None => context,
+            }
+        }
+        Some(HandleType::Desc) => {
+            let desc = unsafe { handle_from_raw::<DescHandle>(handle) };
+            let dbc = unsafe { handle_from_raw::<DbcHandle>(desc.parent_dbc) };
+            Context::connection(Arc::clone(&dbc.trace))
+        }
+        _ => Context::default(),
+    }
 }
 
 fn trace_filter() -> EnvFilter {
@@ -1008,6 +1115,449 @@ mod tests {
         assert!(fields[4].contains("operation_id=42"));
         assert!(!output.contains("sql_command"));
         assert!(!output.contains("SECRET_SQL_LITERAL"));
+    }
+
+    fn capture_correlation(work: impl FnOnce()) -> String {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&output);
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(move || TestWriter(Arc::clone(&sink)))
+                .event_format(LogFormatter),
+        );
+        mssql_tds::trace_context::enable();
+        tracing::subscriber::with_default(subscriber, work);
+        String::from_utf8(output.lock().unwrap().clone()).unwrap()
+    }
+
+    #[test]
+    fn new_disconnected_connect_validation_clears_the_previous_attempt_guid() {
+        use crate::api::odbc_types::{
+            SQL_DRIVER_PROMPT, SQL_ERROR, SQL_HANDLE_DBC, SQL_NTS, SQL_SUCCESS,
+        };
+        use crate::api::{SQLDriverConnectW, SQLGetDiagRecW};
+        use crate::handles::dbc::ConnectionState;
+        use crate::handles::{DbcHandle, handle_from_raw};
+        use crate::test_support::TestHandles;
+        use mssql_tds::trace_context;
+
+        for state in [
+            ConnectionState::Disconnected,
+            ConnectionState::Connecting,
+            ConnectionState::Connected,
+        ] {
+            let id = uuid::Uuid::new_v4();
+            let expected = if state == ConnectionState::Disconnected {
+                None
+            } else {
+                Some(id)
+            };
+            let output = capture_correlation(|| {
+                let h = TestHandles::with_env_dbc();
+                let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+                dbc.trace.begin_attempt(id);
+                dbc.inner.lock().unwrap().connection_state = state;
+                assert_eq!(
+                    unsafe {
+                        SQLDriverConnectW(
+                            h.dbc,
+                            std::ptr::null_mut(),
+                            std::ptr::null(),
+                            SQL_NTS,
+                            std::ptr::null_mut(),
+                            0,
+                            std::ptr::null_mut(),
+                            SQL_DRIVER_PROMPT,
+                        )
+                    },
+                    SQL_ERROR
+                );
+                assert_eq!(dbc.inner.lock().unwrap().connection_state, state);
+                let mut sqlstate = [0_u16; 6];
+                assert_eq!(
+                    unsafe {
+                        SQLGetDiagRecW(
+                            SQL_HANDLE_DBC,
+                            h.dbc,
+                            1,
+                            sqlstate.as_mut_ptr(),
+                            std::ptr::null_mut(),
+                            std::ptr::null_mut(),
+                            0,
+                            std::ptr::null_mut(),
+                        )
+                    },
+                    SQL_SUCCESS
+                );
+                assert_eq!(String::from_utf16(&sqlstate[..5]).unwrap(), "HY110");
+                let _scope = unsafe { context_for(h.dbc, "SQLGetDiagRecW") }.enter();
+                assert_eq!(trace_context::snapshot().cid, expected);
+            });
+            let cid = expected.map_or_else(
+                || "cid=- ".to_string(),
+                |id| format!("cid={} ", id.to_string().to_uppercase()),
+            );
+            let lines: Vec<_> = output
+                .lines()
+                .filter(|line| line.contains("SQLGetDiagRecW"))
+                .collect();
+            assert!(!lines.is_empty());
+            assert!(lines.iter().all(|line| line.contains(&cid)));
+        }
+    }
+
+    #[test]
+    fn descriptor_reads_correlate_to_the_owning_connection_not_the_ambient_statement() {
+        use crate::api::SQLGetDescFieldW;
+        use crate::api::odbc_types::{SQL_DESC_COUNT, SQL_SUCCESS, SqlSmallInt};
+        use crate::handles::{DbcHandle, handle_from_raw};
+        use crate::test_support::TestHandles;
+        use mssql_tds::trace_context::{self, Snapshot};
+
+        trace_context::enable();
+        let mut h = TestHandles::with_env_dbc_stmt();
+        let explicit = h.alloc_explicit_desc();
+        let mut other = TestHandles::with_env_dbc();
+        let other_descriptor = other.alloc_explicit_desc();
+        for handle in [h.dbc, other.dbc] {
+            let dbc = unsafe { handle_from_raw::<DbcHandle>(handle) };
+            dbc.trace.establish(uuid::Uuid::new_v4());
+        }
+
+        for (descriptor, owner) in [
+            (h.ard(), h.dbc),
+            (h.apd(), h.dbc),
+            (h.ird(), h.dbc),
+            (h.ipd(), h.dbc),
+            (explicit, h.dbc),
+            (other_descriptor, other.dbc),
+        ] {
+            let expected = {
+                let _owner = unsafe { context_for(owner, "SQLGetConnectAttrW") }.enter();
+                trace_context::snapshot()
+            };
+            assert!(expected.dbc.is_some());
+            assert!(expected.cid.is_some());
+            assert_eq!(expected.stmt, None);
+            assert_eq!(expected.exec, None);
+
+            let output = capture_correlation(|| {
+                let _ambient = unsafe { context_for(h.stmt, "SQLExecute") }.enter();
+                let ambient = trace_context::snapshot();
+                assert!(ambient.stmt.is_some());
+                assert!(ambient.exec.is_some());
+                {
+                    let _descriptor =
+                        unsafe { context_for(descriptor, "SQLGetDescFieldW") }.enter();
+                    assert_eq!(trace_context::snapshot(), expected);
+                }
+                let mut count: SqlSmallInt = -1;
+                assert_eq!(
+                    unsafe {
+                        SQLGetDescFieldW(
+                            descriptor,
+                            0,
+                            SqlSmallInt::try_from(SQL_DESC_COUNT).unwrap(),
+                            (&mut count as *mut SqlSmallInt).cast(),
+                            0,
+                            std::ptr::null_mut(),
+                        )
+                    },
+                    SQL_SUCCESS
+                );
+                assert_eq!(count, 0);
+                assert_eq!(trace_context::snapshot(), ambient);
+            });
+            let lines: Vec<_> = output.lines().collect();
+            assert!(
+                lines
+                    .iter()
+                    .any(|line| line.contains("SQLGetDescFieldW called"))
+            );
+            assert!(
+                lines
+                    .iter()
+                    .any(|line| line.contains("SQLGetDescFieldW returning"))
+            );
+            for line in lines {
+                assert!(line.contains(&format!("dbc={} ", expected.dbc.unwrap())));
+                assert!(line.contains(&format!(
+                    "cid={} ",
+                    expected.cid.unwrap().to_string().to_uppercase()
+                )));
+                assert!(!line.contains("stmt="));
+                assert!(!line.contains("exec="));
+            }
+            assert_eq!(trace_context::snapshot(), Snapshot::default());
+        }
+    }
+
+    #[test]
+    fn describe_parameter_rpcs_start_executions_but_cached_reads_do_not_activate_them() {
+        use crate::api::SQLDescribeParam;
+        use crate::api::odbc_types::{SQL_ERROR, SQL_INTEGER, SQL_NULLABLE, SQL_SUCCESS};
+        use crate::handles::stmt::{ParameterDescription, PreparedPlan};
+        use crate::handles::{DbcHandle, StmtHandle, handle_from_raw};
+        use crate::test_support::TestHandles;
+        use mssql_tds::connection::tds_client::PreparedStatement;
+        use mssql_tds::test_client_support::{done_no_more, sql_error, tds_client_from_tokens};
+
+        let id = uuid::Uuid::new_v4();
+        let output = capture_correlation(|| {
+            let h = TestHandles::with_env_dbc_stmt();
+            h.mark_dbc_connected();
+            let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+            dbc.trace.establish(id);
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            stmt.inner.lock().unwrap().prepared = Some(PreparedPlan {
+                stmt: PreparedStatement::new("SELECT @P1".to_string()),
+                marker_count: 1,
+                original_sql: "SELECT ?".to_string(),
+            });
+            let describe = |parameter| unsafe {
+                SQLDescribeParam(
+                    h.stmt,
+                    parameter,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            };
+            for execution in 1..=2 {
+                dbc.inner.lock().unwrap().client = Some(tds_client_from_tokens(vec![
+                    sql_error(11529, 16, "no metadata could be determined"),
+                    done_no_more(),
+                ]));
+                assert_eq!(describe(1), SQL_ERROR);
+                let _scope = unsafe { context_for(h.stmt, "SQLRowCount") }.enter();
+                assert_eq!(mssql_tds::trace_context::snapshot().exec, Some(execution));
+            }
+            stmt.inner
+                .lock()
+                .unwrap()
+                .parameter_metadata
+                .push(ParameterDescription {
+                    data_type: SQL_INTEGER,
+                    parameter_size: 10,
+                    decimal_digits: 0,
+                    nullable: SQL_NULLABLE,
+                });
+            assert_eq!(describe(1), SQL_SUCCESS);
+            assert_eq!(describe(0), SQL_ERROR);
+            let _scope = unsafe { context_for(h.stmt, "SQLRowCount") }.enter();
+            assert_eq!(mssql_tds::trace_context::snapshot().exec, Some(2));
+        });
+        let cid = format!("cid={} ", id.to_string().to_uppercase());
+        for execution in 1..=2 {
+            let execution = format!("exec={execution} ");
+            let lines: Vec<_> = output
+                .lines()
+                .filter(|line| line.contains(&execution))
+                .collect();
+            assert!(
+                lines
+                    .iter()
+                    .any(|line| line.contains("SQLDescribeParam called"))
+            );
+            assert!(lines.iter().any(|line| line.contains(", mssql_tds::")));
+            assert!(
+                lines
+                    .iter()
+                    .any(|line| line.contains("SQLDescribeParam: metadata RPC failed"))
+            );
+            assert!(
+                lines.iter().any(|line| line.contains(", DEBUG, ")
+                    && line.contains("SQLDescribeParam returning"))
+            );
+            assert!(
+                lines
+                    .iter()
+                    .all(|line| line.contains(&cid) && line.contains("stmt="))
+            );
+        }
+    }
+
+    #[test]
+    fn exported_execution_and_tds_events_share_correlation() {
+        assert_exported_execution_correlation(false);
+    }
+
+    #[test]
+    fn exported_prepared_execution_and_continuations_share_correlation() {
+        assert_exported_execution_correlation(true);
+    }
+
+    fn assert_exported_execution_correlation(prepared: bool) {
+        use crate::api::odbc_types::{
+            SQL_C_LONG, SQL_ERROR, SQL_INTEGER, SQL_NTS, SQL_PARAM_INPUT, SQL_SUCCESS,
+        };
+        use crate::api::{
+            SQLBindParameter, SQLExecDirectW, SQLExecute, SQLPrepareW, SQLRowCount, SQLSetStmtAttrW,
+        };
+        use crate::handles::{DbcHandle, StmtHandle, handle_from_raw};
+        use crate::test_support::TestHandles;
+        use mssql_tds::datatypes::column_values::ColumnValues;
+        use mssql_tds::query::result::ReturnValue;
+        use mssql_tds::test_client_support::{
+            done_no_more, done_proc_no_more, int_columns, return_value, tds_client_from_tokens,
+        };
+        use mssql_tds::token::tokenitems::ReturnValueStatus;
+
+        let id = uuid::Uuid::new_v4();
+        let api = if prepared {
+            "SQLExecute"
+        } else {
+            "SQLExecDirectW"
+        };
+        let output = capture_correlation(|| {
+            let h = TestHandles::with_env_dbc_stmt();
+            h.mark_dbc_connected();
+            let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+            dbc.trace.establish(id);
+            let sql: Vec<u16> = "SELECT 1".encode_utf16().chain([0]).collect();
+            let mut responses = Vec::new();
+            if prepared {
+                assert_eq!(
+                    unsafe { SQLPrepareW(h.stmt, sql.as_ptr(), SQL_NTS) },
+                    SQL_SUCCESS
+                );
+                responses.push(return_value(ReturnValue {
+                    param_ordinal: 0,
+                    param_name: "@handle".to_string(),
+                    value: ColumnValues::Int(27),
+                    column_metadata: Box::new(int_columns(1).remove(0)),
+                    status: ReturnValueStatus::OutputParam,
+                }));
+            }
+            responses.extend(if prepared {
+                [done_proc_no_more(), done_proc_no_more()]
+            } else {
+                [done_no_more(), done_no_more()]
+            });
+            dbc.inner.lock().unwrap().client = Some(tds_client_from_tokens(responses));
+            for execution in 1..=2 {
+                assert_eq!(
+                    unsafe {
+                        if prepared {
+                            SQLExecute(h.stmt)
+                        } else {
+                            SQLExecDirectW(h.stmt, sql.as_ptr(), SQL_NTS)
+                        }
+                    },
+                    SQL_SUCCESS
+                );
+                let mut rows = 0;
+                assert_eq!(unsafe { SQLRowCount(h.stmt, &mut rows) }, SQL_SUCCESS);
+                let context = unsafe { context_for(h.stmt, "SQLRowCount") };
+                let _scope = context.enter();
+                assert_eq!(mssql_tds::trace_context::snapshot().exec, Some(execution));
+            }
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            assert!(stmt.trace.is_some());
+            assert_eq!(mssql_tds::trace_context::snapshot(), Default::default());
+            let _diagnostic = unsafe { context_for(h.stmt, "SQLGetDiagRecW") }.enter();
+            let snapshot = mssql_tds::trace_context::snapshot();
+            assert_eq!(snapshot.cid, Some(id));
+            assert!(snapshot.stmt.is_some());
+            assert_eq!(snapshot.exec, None);
+            drop(_diagnostic);
+
+            let next: Vec<u16> = "SELECT ?".encode_utf16().chain([0]).collect();
+            assert_eq!(
+                unsafe { SQLPrepareW(h.stmt, next.as_ptr(), SQL_NTS) },
+                SQL_SUCCESS
+            );
+            let mut value = 7_i32;
+            assert_eq!(
+                unsafe {
+                    SQLBindParameter(
+                        h.stmt,
+                        1,
+                        SQL_PARAM_INPUT,
+                        SQL_C_LONG,
+                        SQL_INTEGER,
+                        10,
+                        0,
+                        (&mut value as *mut i32).cast(),
+                        0,
+                        std::ptr::null_mut(),
+                    )
+                },
+                SQL_SUCCESS
+            );
+            assert_eq!(
+                unsafe { SQLSetStmtAttrW(h.stmt, -999, std::ptr::null_mut(), 0) },
+                SQL_ERROR
+            );
+        });
+        let expected_id = format!("cid={} ", id.to_string().to_uppercase());
+        for api in ["SQLPrepareW", "SQLBindParameter", "SQLSetStmtAttrW"] {
+            let lines: Vec<_> = output.lines().filter(|line| line.contains(api)).collect();
+            assert!(!lines.is_empty());
+            assert!(lines.iter().all(|line| {
+                line.contains(&expected_id) && line.contains("stmt=") && !line.contains("exec=")
+            }));
+        }
+        for execution in 1..=2 {
+            let execution = format!("exec={execution} ");
+            let lines: Vec<_> = output
+                .lines()
+                .filter(|line| line.contains(&execution))
+                .collect();
+            assert!(
+                lines
+                    .iter()
+                    .any(|line| line.contains(&format!("{api} called")))
+            );
+            assert!(
+                lines
+                    .iter()
+                    .any(|line| line.contains(&format!("{api} returning")))
+            );
+            assert!(lines.iter().any(|line| line.contains("SQLRowCount called")));
+            assert!(lines.iter().any(|line| line.contains(", mssql_tds::")));
+            assert!(
+                lines
+                    .iter()
+                    .all(|line| line.contains(&expected_id) && line.contains("stmt="))
+            );
+        }
+    }
+
+    #[test]
+    fn panic_free_and_invalid_handle_logs_keep_safe_context() {
+        use crate::api::odbc_types::SQL_ERROR;
+        use crate::test_support::TestHandles;
+
+        let id = uuid::Uuid::new_v4();
+        let output = capture_correlation(|| {
+            let mut h = TestHandles::with_env_dbc_stmt();
+            let dbc =
+                unsafe { crate::handles::handle_from_raw::<crate::handles::DbcHandle>(h.dbc) };
+            dbc.trace.establish(id);
+            let ret = crate::ffi_entry!(
+                "CorrelationPanic",
+                h.stmt,
+                tracing::debug!("panic entry"),
+                panic!("test panic")
+            );
+            assert_eq!(ret, SQL_ERROR);
+            assert_eq!(mssql_tds::trace_context::snapshot(), Default::default());
+            let extra = h.alloc_extra_stmt();
+            h.free_extra_stmt(extra);
+            let _invalid = unsafe { context_for(extra, "SQLFreeHandle") }.enter();
+            assert_eq!(mssql_tds::trace_context::snapshot(), Default::default());
+        });
+        for marker in [
+            "CorrelationPanic: panic caught",
+            "CorrelationPanic returning",
+            "Handle freed",
+        ] {
+            assert!(output.lines().any(|line| line.contains(marker)
+                && line.contains(&format!("cid={} ", id.to_string().to_uppercase()))));
+        }
     }
 
     #[cfg(unix)]

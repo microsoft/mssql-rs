@@ -924,3 +924,32 @@ msodbcsql build is measured.
     status and rows-processed pointers, and to every header-alias attribute
     plus `SQL_ROWSET_SIZE`, which is ARD-resident without being an alias and
     so reaches the same `readers_through` walk through `set_desc_header`.
+27. **Connection-scoped trace events carry the full client connection GUID.**
+    Classic ODBC's `CConnection::SendPreloginPacket`
+    (`Sql/Ntdbms/sqlncli/tds/prelogin.cpp`, TRACEID branch) logs the GUID at
+    PRELOGIN; its BID handle-allocation records link statements to connections.
+    AB#48090 requests direct correlation rather than that two-step lookup.
+    This driver adds `dbc`, `cid`, `stmt`, and `exec` context to existing events,
+    including nested TDS events, without rendering arbitrary tracing-span fields.
+    Environment-wide and invalid-handle events do not invent a connection ID.
+    Command returns are DEBUG events so a DEBUG collection includes both ends.
+
+    This deliberately increases enabled trace volume in exchange for
+    independently useful incident lines and correlation across rotated files.
+    No wire request or query is added. The full GUID is preferred to a
+    collision-prone abbreviation. Approved by David Engel on 2026-10-09.
+    Tracked in [AB#48090](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/48090).
+
+    The native per-line-format comparison is source evidence, not a captured
+    retail BID trace; a retail BID capture remains the measurement needed to
+    confirm that half. The connection-ID attribute itself is not a deviation:
+    Windows msodbcsql `SQL_DRIVER_VER=18.06.0001` (DLL file version
+    `2018.0186.0001.01`), tested against SQL LocalDB 17.0.4085.5, returns an
+    uppercase 36-character GUID string (72 UTF-16 bytes),
+    supports a null length probe, reports `01004` on truncation, `HY092` on SET,
+    and `08003` after disconnect. Its getter's `PrintGUID`/`fCopyStrToBuffer`
+    branch in `odbc/sqlcmisc.cpp` is the implementation reference.
+    On the same server, the Rust getter, command trace, and an Extended Events
+    `sql_batch_starting` capture with the `client_connection_id` action reported
+    the identical GUID; the deterministic PRELOGIN test pins the byte order
+    and the connection/activity field order independently.

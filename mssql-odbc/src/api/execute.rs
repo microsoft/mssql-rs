@@ -50,8 +50,12 @@ use crate::handles::{DescHandle, HandleType, StmtHandle, handle_from_raw};
 /// displaced range. The offset pointer itself must remain readable for one
 /// `SqlLen`.
 pub(crate) unsafe fn sql_execute(statement_handle: SqlHandle) -> SqlReturn {
-    debug!(?statement_handle, "SQLExecute called");
-    crate::ffi_entry!("SQLExecute", unsafe { sql_execute_impl(statement_handle) })
+    crate::ffi_entry!(
+        "SQLExecute",
+        statement_handle,
+        debug!(?statement_handle, "SQLExecute called"),
+        unsafe { sql_execute_impl(statement_handle) }
+    )
 }
 
 /// # Safety
@@ -913,6 +917,7 @@ fn stage_execution(stmt: &StmtHandle) -> Result<ExecutionStaging, SqlReturn> {
         }
 
         stmt_state.set_state(STMT_STATE_EXEC_STARTED);
+        mssql_tds::trace_context::activate_execution();
     }
 
     let staged = stage_execution_claimed(stmt);

@@ -38,16 +38,17 @@ pub(crate) unsafe fn sql_get_functions(
     function_id: SqlUSmallInt,
     supported_ptr: *mut SqlUSmallInt,
 ) -> SqlReturn {
-    debug!(
-        ?connection_handle,
-        function_id,
-        ?supported_ptr,
-        "SQLGetFunctions called",
-    );
-
-    crate::ffi_entry!("SQLGetFunctions", unsafe {
-        sql_get_functions_impl(connection_handle, function_id, supported_ptr)
-    })
+    crate::ffi_entry!(
+        "SQLGetFunctions",
+        connection_handle,
+        debug!(
+            ?connection_handle,
+            function_id,
+            ?supported_ptr,
+            "SQLGetFunctions called",
+        ),
+        unsafe { sql_get_functions_impl(connection_handle, function_id, supported_ptr) }
+    )
 }
 
 /// # Safety

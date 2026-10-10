@@ -60,17 +60,20 @@ pub(crate) unsafe fn sql_set_connect_attr_w(
     value_ptr: SqlPointer,
     string_length: SqlInteger,
 ) -> SqlReturn {
-    debug!(
-        ?connection_handle,
-        attribute,
-        ?value_ptr,
-        string_length,
-        "SQLSetConnectAttrW called",
-    );
-
-    crate::ffi_entry!("SQLSetConnectAttrW", unsafe {
-        sql_set_connect_attr_w_impl(connection_handle, attribute, value_ptr, string_length)
-    })
+    crate::ffi_entry!(
+        "SQLSetConnectAttrW",
+        connection_handle,
+        debug!(
+            ?connection_handle,
+            attribute,
+            ?value_ptr,
+            string_length,
+            "SQLSetConnectAttrW called",
+        ),
+        unsafe {
+            sql_set_connect_attr_w_impl(connection_handle, attribute, value_ptr, string_length)
+        }
+    )
 }
 
 /// Unix ANSI entry point used by unixODBC to replay pre-connect attributes.
@@ -93,17 +96,20 @@ pub(crate) unsafe fn sql_set_connect_attr(
     value_ptr: SqlPointer,
     string_length: SqlInteger,
 ) -> SqlReturn {
-    debug!(
-        ?connection_handle,
-        attribute,
-        ?value_ptr,
-        string_length,
-        "SQLSetConnectAttr called",
-    );
-
-    crate::ffi_entry!("SQLSetConnectAttr", unsafe {
-        sql_set_connect_attr_impl(connection_handle, attribute, value_ptr, string_length)
-    })
+    crate::ffi_entry!(
+        "SQLSetConnectAttr",
+        connection_handle,
+        debug!(
+            ?connection_handle,
+            attribute,
+            ?value_ptr,
+            string_length,
+            "SQLSetConnectAttr called",
+        ),
+        unsafe {
+            sql_set_connect_attr_impl(connection_handle, attribute, value_ptr, string_length)
+        }
+    )
 }
 
 #[cfg(not(windows))]

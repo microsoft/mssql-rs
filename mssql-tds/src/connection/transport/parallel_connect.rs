@@ -394,7 +394,7 @@ async fn race_connections(
         .into_iter()
         .map(|fut| {
             let tx = tx.clone();
-            tokio::spawn(async move {
+            tokio::spawn(crate::trace_context::propagate_future(async move {
                 let result = fut.await;
                 match result {
                     Ok((stream, addr, idx)) => {
@@ -406,7 +406,7 @@ async fn race_connections(
                         let _ = tx.send(Err(e)).await;
                     }
                 }
-            })
+            }))
         })
         .collect();
 
@@ -448,6 +448,46 @@ mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn parallel_attempt_tasks_inherit_context_without_leaking_it() {
+        use crate::trace_context::{self, ConnectionTrace, Context, Snapshot, snapshot};
+        use std::sync::Arc;
+
+        trace_context::enable();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let connection = Arc::new(ConnectionTrace::default());
+        let _scope = Context::connection(connection).pending_connection().enter();
+        let expected = snapshot();
+        assert!(expected.dbc.is_some());
+        assert_eq!(expected.cid, None, "TCP attempts precede PRELOGIN");
+        let attempts = (0..2)
+            .map(|index| async move {
+                assert_eq!(snapshot(), expected);
+                tokio::task::yield_now().await;
+                assert_eq!(snapshot(), expected);
+                Err((
+                    std::io::Error::from(std::io::ErrorKind::ConnectionRefused),
+                    SocketAddr::from(([127, 0, 0, 1], 0)),
+                    index,
+                ))
+            })
+            .collect();
+        let result = runtime.block_on(race_connections(attempts));
+        assert_eq!(
+            result.unwrap_err().kind(),
+            std::io::ErrorKind::ConnectionRefused
+        );
+        assert_eq!(snapshot(), expected);
+        let worker_context = runtime
+            .block_on(runtime.spawn(async { snapshot() }))
+            .unwrap();
+        assert_eq!(worker_context, Snapshot::default());
+    }
 
     /// Regression coverage for AB#47704: `parallel_connect` used to resolve
     /// DNS via blocking `to_socket_addrs()`, which never yields to the

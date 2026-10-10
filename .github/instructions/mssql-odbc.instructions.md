@@ -375,8 +375,12 @@ on; these guarantees were verified against msodbcsql's behavior.
 
   ```rust
   pub(crate) unsafe fn sql_xxx(/* raw args */) -> SqlReturn {
-      debug!(/* all args */, "SQLXxx called");
-      crate::ffi_entry!("SQLXxx", unsafe { sql_xxx_impl(/* raw args */) })
+      crate::ffi_entry!(
+          "SQLXxx",
+          handle,
+          debug!(/* all args */, "SQLXxx called"),
+          unsafe { sql_xxx_impl(/* raw args */) }
+      )
   }
 
   // Thin unsafe shim: raw pointers -> validated references, then delegate.
@@ -398,8 +402,25 @@ on; these guarantees were verified against msodbcsql's behavior.
 - Check Driver Manager-enforced preconditions with `debug_assert!`; do not turn
   them into release-build error paths. Runtime-check application inputs that the
   Driver Manager does not validate.
-- The first line of every FFI implementation function must be a `debug!` log
-  of every argument (pointers logged with `?` — no deref).
+- Every FFI implementation passes its handle and an entry `debug!` event to
+  `ffi_entry!`. Log every argument (pointers with `?`, no dereference). Do not
+  emit the entry event before the macro: initialization and correlation must
+  precede it, and correlation must survive panic conversion and the return log.
+- New execution paths call `trace_context::activate_execution` only after
+  accepting the statement execution claim; a rejected concurrent call must not
+  replace the active execution's correlation. Propagate context explicitly to
+  blocking/native workers with `trace_context::propagate`. Never retain a
+  thread-local guard across an independently scheduled future; wrap spawned
+  futures with `trace_context::propagate_future`, which scopes each poll.
+  Include internal metadata RPCs such as uncached `SQLDescribeParam` when
+  identifying execution entry points; cached answers must not activate a new
+  result execution.
+  Restrict `continues_execution` to result, streaming, and cleanup APIs;
+  preparation, configuration, and diagnostics must not inherit a prior `exec`.
+- Verify diagnostic identifiers against wire bytes and the reference driver's
+  API representation. PRELOGIN TRACEID contains connection GUID, activity GUID,
+  then sequence, with Microsoft GUID byte order. The ODBC client-connection-ID
+  attribute is a GUID **string**, not a binary `SQLGUID`.
 - Do not call `crate::init_tracing()` from the `pub extern "C"` wrapper in
   `exports.rs`. `ffi_entry!` already calls it as the first statement inside its
   `catch_unwind` (`src/lib.rs`), so the wrappers stay thin delegates; adding a

@@ -45,26 +45,29 @@ pub(crate) unsafe fn sql_native_sql_w(
     buffer_length: SqlInteger,
     text_length2_ptr: *mut SqlInteger,
 ) -> SqlReturn {
-    debug!(
-        ?connection_handle,
-        ?in_statement_text,
-        ?out_statement_text,
-        ?text_length2_ptr,
-        text_length1,
-        buffer_length,
-        "SQLNativeSqlW called",
-    );
-
-    crate::ffi_entry!("SQLNativeSqlW", unsafe {
-        sql_native_sql_w_impl(
-            connection_handle,
-            in_statement_text,
+    crate::ffi_entry!(
+        "SQLNativeSqlW",
+        connection_handle,
+        debug!(
+            ?connection_handle,
+            ?in_statement_text,
+            ?out_statement_text,
+            ?text_length2_ptr,
             text_length1,
-            out_statement_text,
             buffer_length,
-            text_length2_ptr,
-        )
-    })
+            "SQLNativeSqlW called",
+        ),
+        unsafe {
+            sql_native_sql_w_impl(
+                connection_handle,
+                in_statement_text,
+                text_length1,
+                out_statement_text,
+                buffer_length,
+                text_length2_ptr,
+            )
+        }
+    )
 }
 
 /// # Safety

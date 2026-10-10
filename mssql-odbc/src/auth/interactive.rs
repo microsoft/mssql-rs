@@ -140,7 +140,7 @@ where
     T: Send + 'static,
     F: FnOnce() -> TdsResult<T> + Send + 'static,
 {
-    match tokio::task::spawn_blocking(step).await {
+    match tokio::task::spawn_blocking(mssql_tds::trace_context::propagate(step)).await {
         Ok(result) => result,
         Err(e) => Err(Error::ConnectionError(format!(
             "Entra interactive sign-in did not run to completion: {e}"

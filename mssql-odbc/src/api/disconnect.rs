@@ -23,10 +23,12 @@ use crate::handles::{HandleType, free_handle, handle_from_raw};
 /// - `connection_handle` must be a valid `DbcHandle` allocated by
 ///   `SQLAllocHandle(SQL_HANDLE_DBC, ...)`.
 pub(crate) unsafe fn sql_disconnect(connection_handle: SqlHandle) -> SqlReturn {
-    debug!(?connection_handle, "SQLDisconnect called");
-    crate::ffi_entry!("SQLDisconnect", unsafe {
-        sql_disconnect_impl(connection_handle)
-    })
+    crate::ffi_entry!(
+        "SQLDisconnect",
+        connection_handle,
+        debug!(?connection_handle, "SQLDisconnect called"),
+        unsafe { sql_disconnect_impl(connection_handle) }
+    )
 }
 
 /// # Safety
@@ -153,6 +155,7 @@ fn sql_disconnect_safe(dbc: &DbcHandle) -> SqlReturn {
     state.effective_vendor_settings = None;
     state.effective_packet_size = None;
     state.identity = ConnectionIdentity::default();
+    dbc.trace.clear();
     state.database_user_name = None;
     state.last_collation_code_page = None;
     state.last_char_set = None;

@@ -52,33 +52,37 @@ pub(crate) unsafe fn sql_set_desc_rec(
     string_length_ptr: *mut SqlLen,
     indicator_ptr: *mut SqlLen,
 ) -> SqlReturn {
-    debug!(
-        ?descriptor_handle,
-        record_number,
-        field_type,
-        sub_type,
-        length,
-        precision,
-        scale,
-        ?data_ptr,
-        ?string_length_ptr,
-        ?indicator_ptr,
-        "SQLSetDescRec called",
-    );
-    crate::ffi_entry!("SQLSetDescRec", unsafe {
-        sql_set_desc_rec_impl(
-            descriptor_handle,
+    crate::ffi_entry!(
+        "SQLSetDescRec",
+        descriptor_handle,
+        debug!(
+            ?descriptor_handle,
             record_number,
             field_type,
             sub_type,
             length,
             precision,
             scale,
-            data_ptr,
-            string_length_ptr,
-            indicator_ptr,
-        )
-    })
+            ?data_ptr,
+            ?string_length_ptr,
+            ?indicator_ptr,
+            "SQLSetDescRec called",
+        ),
+        unsafe {
+            sql_set_desc_rec_impl(
+                descriptor_handle,
+                record_number,
+                field_type,
+                sub_type,
+                length,
+                precision,
+                scale,
+                data_ptr,
+                string_length_ptr,
+                indicator_ptr,
+            )
+        }
+    )
 }
 
 /// # Safety

@@ -41,32 +41,35 @@ pub(crate) unsafe fn sql_describe_col_w(
     decimal_digits_ptr: *mut SqlSmallInt,
     nullable_ptr: *mut SqlSmallInt,
 ) -> SqlReturn {
-    debug!(
-        ?statement_handle,
-        column_number,
-        ?column_name,
-        buffer_length,
-        ?name_length_ptr,
-        ?data_type_ptr,
-        ?column_size_ptr,
-        ?decimal_digits_ptr,
-        ?nullable_ptr,
-        "SQLDescribeColW called",
-    );
-
-    crate::ffi_entry!("SQLDescribeColW", unsafe {
-        sql_describe_col_w_impl(
-            statement_handle,
+    crate::ffi_entry!(
+        "SQLDescribeColW",
+        statement_handle,
+        debug!(
+            ?statement_handle,
             column_number,
-            column_name,
+            ?column_name,
             buffer_length,
-            name_length_ptr,
-            data_type_ptr,
-            column_size_ptr,
-            decimal_digits_ptr,
-            nullable_ptr,
-        )
-    })
+            ?name_length_ptr,
+            ?data_type_ptr,
+            ?column_size_ptr,
+            ?decimal_digits_ptr,
+            ?nullable_ptr,
+            "SQLDescribeColW called",
+        ),
+        unsafe {
+            sql_describe_col_w_impl(
+                statement_handle,
+                column_number,
+                column_name,
+                buffer_length,
+                name_length_ptr,
+                data_type_ptr,
+                column_size_ptr,
+                decimal_digits_ptr,
+                nullable_ptr,
+            )
+        }
+    )
 }
 
 /// # Safety

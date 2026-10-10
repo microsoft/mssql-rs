@@ -72,26 +72,29 @@ pub(crate) unsafe fn sql_describe_param(
     decimal_digits_ptr: *mut SqlSmallInt,
     nullable_ptr: *mut SqlSmallInt,
 ) -> SqlReturn {
-    debug!(
-        ?statement_handle,
-        parameter_number,
-        ?data_type_ptr,
-        ?parameter_size_ptr,
-        ?decimal_digits_ptr,
-        ?nullable_ptr,
-        "SQLDescribeParam called",
-    );
-
-    crate::ffi_entry!("SQLDescribeParam", unsafe {
-        sql_describe_param_impl(
-            statement_handle,
+    crate::ffi_entry!(
+        "SQLDescribeParam",
+        statement_handle,
+        debug!(
+            ?statement_handle,
             parameter_number,
-            data_type_ptr,
-            parameter_size_ptr,
-            decimal_digits_ptr,
-            nullable_ptr,
-        )
-    })
+            ?data_type_ptr,
+            ?parameter_size_ptr,
+            ?decimal_digits_ptr,
+            ?nullable_ptr,
+            "SQLDescribeParam called",
+        ),
+        unsafe {
+            sql_describe_param_impl(
+                statement_handle,
+                parameter_number,
+                data_type_ptr,
+                parameter_size_ptr,
+                decimal_digits_ptr,
+                nullable_ptr,
+            )
+        }
+    )
 }
 
 /// # Safety
@@ -217,6 +220,7 @@ fn sql_describe_param_safe(
             }
         };
         stmt_state.set_state(STMT_STATE_EXEC_STARTED);
+        mssql_tds::trace_context::activate_execution();
         (sql, marker_count, return_status, stmt_state.query_timeout)
     };
 

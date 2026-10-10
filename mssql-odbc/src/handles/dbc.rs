@@ -32,6 +32,7 @@ pub(crate) enum ConnectionState {
 /// msodbcsql's connection-level critical section.
 #[derive(Debug)]
 pub(crate) struct DbcHandle {
+    pub(crate) trace: Arc<mssql_tds::trace_context::ConnectionTrace>,
     pub(crate) object_type: HandleType,
     /// Back-pointer to the parent ENV handle. Stored as opaque pointer because
     /// the ENV owns the DBC's lifetime, not the other way around.
@@ -270,8 +271,11 @@ pub(crate) struct DbcState {
 /// and neither the login name nor the password or access token is kept. The
 /// login is not here because no information type reports it — `SQL_USER_NAME`
 /// is the *database* user, which [`DbcState::database_user_name`] caches.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone)]
 pub(crate) struct ConnectionIdentity {
+    /// Shared with TDS so a transparent reconnect updates the getter even
+    /// while a statement owns the client outside the DBC mutex.
+    pub(crate) client_connection_id: Option<Arc<mssql_tds::trace_context::ConnectionTrace>>,
     /// `SQL_DATA_SOURCE_NAME`. Empty for a DSN-less connection, matching
     /// msodbcsql18.
     pub(crate) data_source_name: String,
@@ -354,6 +358,7 @@ impl HasDiagnostics for DbcState {
 impl DbcHandle {
     pub(crate) fn new(parent_env: *mut c_void, runtime: Arc<SharedRuntime>) -> Self {
         Self {
+            trace: Arc::default(),
             object_type: HandleType::Dbc,
             parent_env,
             runtime,

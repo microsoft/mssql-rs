@@ -718,11 +718,13 @@ where
     T: Send + 'static,
     F: FnOnce() -> T + Send + 'static,
 {
-    tokio::task::spawn_blocking(call).await.map_err(|e| {
-        Error::Security(SecurityError::InternalError(format!(
-            "Kerberos processing did not run to completion: {e}"
-        )))
-    })
+    tokio::task::spawn_blocking(mssql_tds::trace_context::propagate(call))
+        .await
+        .map_err(|e| {
+            Error::Security(SecurityError::InternalError(format!(
+                "Kerberos processing did not run to completion: {e}"
+            )))
+        })
 }
 
 fn failure(detail: String) -> Error {

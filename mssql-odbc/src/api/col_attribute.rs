@@ -54,28 +54,31 @@ pub(crate) unsafe fn sql_col_attribute_w(
     string_length_ptr: *mut SqlSmallInt,
     numeric_attribute_ptr: *mut SqlLen,
 ) -> SqlReturn {
-    debug!(
-        ?statement_handle,
-        column_number,
-        field_identifier,
-        ?character_attribute_ptr,
-        buffer_length,
-        ?string_length_ptr,
-        ?numeric_attribute_ptr,
-        "SQLColAttributeW called",
-    );
-
-    crate::ffi_entry!("SQLColAttributeW", unsafe {
-        sql_col_attribute_w_impl(
-            statement_handle,
+    crate::ffi_entry!(
+        "SQLColAttributeW",
+        statement_handle,
+        debug!(
+            ?statement_handle,
             column_number,
             field_identifier,
-            character_attribute_ptr,
+            ?character_attribute_ptr,
             buffer_length,
-            string_length_ptr,
-            numeric_attribute_ptr,
-        )
-    })
+            ?string_length_ptr,
+            ?numeric_attribute_ptr,
+            "SQLColAttributeW called",
+        ),
+        unsafe {
+            sql_col_attribute_w_impl(
+                statement_handle,
+                column_number,
+                field_identifier,
+                character_attribute_ptr,
+                buffer_length,
+                string_length_ptr,
+                numeric_attribute_ptr,
+            )
+        }
+    )
 }
 
 /// # Safety

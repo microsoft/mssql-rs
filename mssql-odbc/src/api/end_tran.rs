@@ -28,10 +28,12 @@ pub(crate) unsafe fn sql_end_tran(
     handle: SqlHandle,
     completion_type: SqlSmallInt,
 ) -> SqlReturn {
-    debug!(handle_type, ?handle, completion_type, "SQLEndTran called");
-    crate::ffi_entry!("SQLEndTran", unsafe {
-        sql_end_tran_impl(handle_type, handle, completion_type)
-    })
+    crate::ffi_entry!(
+        "SQLEndTran",
+        handle,
+        debug!(handle_type, ?handle, completion_type, "SQLEndTran called"),
+        unsafe { sql_end_tran_impl(handle_type, handle, completion_type) }
+    )
 }
 
 /// # Safety
@@ -124,6 +126,8 @@ unsafe fn sql_end_tran_env_safe(env: &EnvHandle, completion_type: SqlSmallInt) -
     let mut worst = SQL_SUCCESS;
     let mut failed = 0usize;
     for dbc_ptr in connections {
+        let _trace_scope = mssql_tds::trace_context::enabled()
+            .then(|| unsafe { crate::tracing_init::context_for(dbc_ptr, "SQLEndTran") }.enter());
         // SAFETY: pointers in `connections` came from `handle_to_raw::<DbcHandle>`
         // and are owned by this ENV. A concurrent
         // `SQLFreeHandle(SQL_HANDLE_DBC)` could still free one between the clone

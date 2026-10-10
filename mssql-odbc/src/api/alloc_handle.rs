@@ -29,33 +29,36 @@ pub(crate) unsafe fn sql_alloc_handle(
     input_handle: SqlHandle,
     output_handle: *mut SqlHandle,
 ) -> SqlReturn {
-    debug!(
-        handle_type,
-        ?input_handle,
-        ?output_handle,
-        "SQLAllocHandle called"
-    );
+    crate::ffi_entry!(
+        "SQLAllocHandle",
+        input_handle,
+        debug!(
+            handle_type,
+            ?input_handle,
+            ?output_handle,
+            "SQLAllocHandle called"
+        ),
+        {
+            if output_handle.is_null() {
+                error!("SQLAllocHandle: output_handle is null");
+                return SQL_INVALID_HANDLE;
+            }
 
-    crate::ffi_entry!("SQLAllocHandle", {
-        if output_handle.is_null() {
-            error!("SQLAllocHandle: output_handle is null");
-            return SQL_INVALID_HANDLE;
-        }
+            // Per ODBC spec, initialize output to null before attempting allocation.
+            unsafe { output_handle.write(SQL_NULL_HANDLE) };
 
-        // Per ODBC spec, initialize output to null before attempting allocation.
-        unsafe { output_handle.write(SQL_NULL_HANDLE) };
-
-        match handle_type {
-            SQL_HANDLE_ENV => unsafe { alloc_env(input_handle, output_handle) },
-            SQL_HANDLE_DBC => unsafe { alloc_dbc(input_handle, output_handle) },
-            SQL_HANDLE_STMT => unsafe { alloc_stmt(input_handle, output_handle) },
-            SQL_HANDLE_DESC => unsafe { alloc_desc(input_handle, output_handle) },
-            _ => {
-                error!(handle_type, "SQLAllocHandle: unknown handle type");
-                SQL_INVALID_HANDLE
+            match handle_type {
+                SQL_HANDLE_ENV => unsafe { alloc_env(input_handle, output_handle) },
+                SQL_HANDLE_DBC => unsafe { alloc_dbc(input_handle, output_handle) },
+                SQL_HANDLE_STMT => unsafe { alloc_stmt(input_handle, output_handle) },
+                SQL_HANDLE_DESC => unsafe { alloc_desc(input_handle, output_handle) },
+                _ => {
+                    error!(handle_type, "SQLAllocHandle: unknown handle type");
+                    SQL_INVALID_HANDLE
+                }
             }
         }
-    })
+    )
 }
 
 /// Allocates an environment handle.
@@ -83,7 +86,7 @@ unsafe fn alloc_env(input_handle: SqlHandle, output_handle: *mut SqlHandle) -> S
 
     unsafe { output_handle.write(raw) };
 
-    debug!(?raw, "Allocated ENV handle");
+    debug!(henv = ?raw, "Allocated ENV handle");
     SQL_SUCCESS
 }
 
@@ -147,7 +150,9 @@ unsafe fn alloc_dbc(input_handle: SqlHandle, output_handle: *mut SqlHandle) -> S
 
     unsafe { output_handle.write(raw) };
 
-    debug!(?raw, ?input_handle, "Allocated DBC handle");
+    let _trace_scope = mssql_tds::trace_context::enabled()
+        .then(|| unsafe { crate::tracing_init::context_for(raw, "SQLAllocHandle") }.enter());
+    debug!(hdbc = ?raw, created_by_henv = ?input_handle, "Allocated DBC handle");
     SQL_SUCCESS
 }
 
@@ -195,7 +200,9 @@ unsafe fn alloc_stmt(input_handle: SqlHandle, output_handle: *mut SqlHandle) -> 
 
     unsafe { output_handle.write(raw) };
 
-    debug!(?raw, ?input_handle, "Allocated STMT handle");
+    let _trace_scope = mssql_tds::trace_context::enabled()
+        .then(|| unsafe { crate::tracing_init::context_for(raw, "SQLAllocHandle") }.enter());
+    debug!(hstmt = ?raw, created_by_hdbc = ?input_handle, "Allocated STMT handle");
     SQL_SUCCESS
 }
 
@@ -257,7 +264,7 @@ unsafe fn alloc_desc(input_handle: SqlHandle, output_handle: *mut SqlHandle) -> 
 
     unsafe { output_handle.write(raw) };
 
-    debug!(?raw, ?input_handle, "Allocated DESC handle");
+    debug!(hdesc = ?raw, created_by_hdbc = ?input_handle, "Allocated DESC handle");
     SQL_SUCCESS
 }
 
