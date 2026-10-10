@@ -24,6 +24,7 @@ extern "C" {
 #define MSSQL_SQLCMD_INVALID_STATE 2
 #define MSSQL_SQLCMD_INTERNAL_ERROR 3
 #define MSSQL_SQLCMD_INVALID_ARGUMENT 4
+#define MSSQL_SQLCMD_UNSUPPORTED 5 /* not in this build: diagnostics when 32-bit */
 
 /* How the run ended: the end argument of mssql_sqlcmd_json_render. With the
    exit code it decides executionStatus and operationOutcome. */
@@ -157,6 +158,67 @@ int32_t MSSQL_SQLCMD_CALL mssql_sqlcmd_json_render(
 /* text and len (UTF-16 code units) exactly as mssql_sqlcmd_json_render returned them. */
 void MSSQL_SQLCMD_CALL mssql_sqlcmd_free_text(const uint16_t* text, size_t len);
 
+/* sqlcmd diagnose -------------------------------------------------------- */
+
+#define MSSQL_SQLCMD_AUTH_SQL_PASSWORD 0 /* user and password */
+#define MSSQL_SQLCMD_AUTH_INTEGRATED 1   /* Windows; Kerberos elsewhere */
+
+#define MSSQL_SQLCMD_ENCRYPT_OPTIONAL 0  /* -No */
+#define MSSQL_SQLCMD_ENCRYPT_MANDATORY 1 /* -N, -Nm (sqlcmd's default) */
+#define MSSQL_SQLCMD_ENCRYPT_STRICT 2    /* -Ns */
+
+#define MSSQL_SQLCMD_REPORT_TEXT 0
+#define MSSQL_SQLCMD_REPORT_JSON 1
+
+/* How far the diagnosis goes; each depth includes the ones before it. */
+#define MSSQL_SQLCMD_DEPTH_DEFAULT -1             /* session validation */
+#define MSSQL_SQLCMD_DEPTH_CONNECTION_INPUT 0     /* parse -S; no external call */
+#define MSSQL_SQLCMD_DEPTH_ENDPOINT_RESOLUTION 1  /* + DNS, SQL Server Browser */
+#define MSSQL_SQLCMD_DEPTH_NETWORK_REACHABILITY 2 /* + TCP connect */
+#define MSSQL_SQLCMD_DEPTH_CONNECTION_ATTEMPT 3   /* + one connection attempt */
+#define MSSQL_SQLCMD_DEPTH_SESSION_VALIDATION 4   /* + a minimal query */
+
+typedef struct MssqlSqlcmdDiagnosticsRequest {
+    MssqlSqlcmdText server;   /* -S; required unless invalid_reason is given */
+    MssqlSqlcmdText database; /* -d; NULL or empty for the login's default */
+    int32_t authentication;   /* MSSQL_SQLCMD_AUTH_* */
+    MssqlSqlcmdText user;     /* -U */
+    MssqlSqlcmdText password; /* -P */
+    int32_t encrypt;          /* MSSQL_SQLCMD_ENCRYPT_* */
+    int32_t trust_server_certificate; /* -C: non-zero to trust */
+    MssqlSqlcmdText host_name_in_certificate; /* -F; NULL or empty if not given */
+    int32_t login_timeout_seconds; /* -l; 0 or less for the default */
+    int32_t depth;            /* MSSQL_SQLCMD_DEPTH_* */
+    int32_t local_detail;     /* non-zero: show identifiers (not share-safe) */
+    MssqlSqlcmdText invalid_reason; /* why sqlcmd rejected the request; NULL or
+                                       empty when it is valid */
+} MssqlSqlcmdDiagnosticsRequest;
+
+/* Diagnoses the connection up to request->depth (name resolution, SQL Server
+   Browser, TCP connect, one connection attempt with its pre-login, TLS and
+   login phases, then a minimal query) and renders the report as text or JSON
+   (format: MSSQL_SQLCMD_REPORT_*) into *out / *out_len as UTF-16. Release it
+   with mssql_sqlcmd_free_text. *exit_code is sqlcmd's exit code: 0 passed,
+   1 issue detected, 2 inconclusive or not evaluated, 3 partial, 4 canceled,
+   5 internal failure, 6 invalid invocation. A failed connection still returns
+   MSSQL_SQLCMD_OK with a report; on an error *out is NULL and *exit_code 5.
+   32-bit builds return MSSQL_SQLCMD_UNSUPPORTED (mssql-tds is 64-bit only).
+   version is sqlcmd's, for the JSON report. Blocks until the diagnosis ends. */
+int32_t MSSQL_SQLCMD_CALL mssql_sqlcmd_diagnostics_run(
+    const MssqlSqlcmdDiagnosticsRequest* request,
+    MssqlSqlcmdText version,
+    int32_t format,
+    const uint16_t** out,
+    size_t* out_len,
+    int32_t* exit_code);
+
+/* Cancels the diagnosis mssql_sqlcmd_diagnostics_run is running: it returns
+   soon after with the checks that finished, the others skipped as canceled,
+   and exit code 4. Callable from any thread, a console control or signal
+   handler included (it only updates an atomic, without locking). Does nothing
+   when no diagnosis is running, and never cancels a later one. 32-bit builds
+   return MSSQL_SQLCMD_UNSUPPORTED. */
+int32_t MSSQL_SQLCMD_CALL mssql_sqlcmd_diagnostics_cancel(void);
 #ifdef __cplusplus
 }
 #endif

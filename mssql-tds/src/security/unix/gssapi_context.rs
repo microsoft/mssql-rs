@@ -453,7 +453,7 @@ fn import_name(spn: &str, user_provided: bool) -> Result<GssNameT, SecurityError
 /// - `MSSQLSvc/sql.example.local:1433` → `MSSQLSvc@sql.example.local`
 /// - `MSSQLSvc/server:INSTANCE1` → `MSSQLSvc@server`
 /// - `MSSQLSvc@host` (already in GSSAPI format) → `MSSQLSvc@host`
-fn convert_spn_to_gssapi_format(spn: &str) -> String {
+pub(crate) fn convert_spn_to_gssapi_format(spn: &str) -> String {
     // If already in GSSAPI format (contains @), return as-is
     if spn.contains('@') && !spn.contains('/') {
         return spn.to_string();
@@ -464,8 +464,10 @@ fn convert_spn_to_gssapi_format(spn: &str) -> String {
         let service = &spn[..slash_pos];
         let rest = &spn[slash_pos + 1..];
 
-        // Extract host (everything before the colon, or the whole string if no colon)
-        let host = if let Some(colon_pos) = rest.find(':') {
+        // Extract host: everything before the last colon, which starts the
+        // port or instance (an IPv6 host has colons of its own), or the whole
+        // string if there is no colon
+        let host = if let Some(colon_pos) = rest.rfind(':') {
             &rest[..colon_pos]
         } else {
             rest

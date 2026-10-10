@@ -158,8 +158,9 @@ jobs:
   - template: /.pipeline/templates/cargo-authenticate-template.yml
     parameters:
       osType: MacOS
-  # Only the Rust toolchain: the crate's dependencies (serde, serde_json) are
-  # pure Rust that Cargo builds into the archive, so the shared
+  # Only the Rust toolchain: the crate's dependencies (serde, serde_json, and
+  # for diagnose mssql-tds, which uses the system Security framework for TLS on
+  # macOS) are Rust crates that Cargo builds into the archive, so the shared
   # install-dependencies template's Python, Kerberos and Node installs (ungated
   # on macOS) are not needed here.
   - script: .pipeline/scripts/install-rustup.sh

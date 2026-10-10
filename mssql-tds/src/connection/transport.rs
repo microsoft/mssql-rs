@@ -8,6 +8,10 @@ pub(crate) mod extractable_stream;
 #[cfg(windows)]
 pub(crate) mod localdb;
 #[cfg(windows)]
+pub use localdb::resolve_localdb_pipe;
+#[cfg(windows)]
+pub use named_pipes::localize_pipe_path;
+#[cfg(windows)]
 pub(crate) mod named_pipes;
 /// Network transport creation and TLS negotiation.
 pub mod network_transport;

@@ -96,7 +96,8 @@ pub mod message;
 pub mod query;
 pub mod security;
 pub(crate) mod sql_identifier;
-pub(crate) mod ssrp;
+/// SQL Server Browser (SSRP): resolves a named instance to its endpoints.
+pub mod ssrp;
 pub mod token;
 
 // Expose internal APIs for fuzzing
