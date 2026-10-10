@@ -337,6 +337,25 @@ pub(crate) fn starts_execution(api: &str) -> bool {
     )
 }
 
+fn continues_execution(api: &str) -> bool {
+    matches!(
+        api,
+        "SQLFetch"
+            | "SQLFetchScroll"
+            | "SQLGetData"
+            | "SQLMoreResults"
+            | "SQLRowCount"
+            | "SQLNumResultCols"
+            | "SQLDescribeColW"
+            | "SQLColAttributeW"
+            | "SQLParamData"
+            | "SQLPutData"
+            | "SQLCancel"
+            | "SQLCloseCursor"
+            | "SQLFreeStmt(SQL_CLOSE)"
+    )
+}
+
 /// The registry check permits stale/null handles on diagnostics and free paths
 /// without dereferencing them. Live handles remain subject to the API's
 /// existing lifetime contract. No handle lock is acquired for correlation.
@@ -366,9 +385,9 @@ pub(crate) unsafe fn context_for(
             match &stmt.trace {
                 Some(trace) => {
                     let context = context.statement(Arc::clone(trace), starts_execution(api));
-                    if matches!(api, "SQLGetDiagRecW" | "SQLGetDiagFieldW") {
-                        // A rejected concurrent execute can replace diagnostics
-                        // without replacing the active result's execution ID.
+                    if !starts_execution(api) && !continues_execution(api) {
+                        // Preparation, configuration, and diagnostic calls must
+                        // not attribute their errors to an earlier execution.
                         context.without_execution()
                     } else {
                         context
@@ -1113,6 +1132,82 @@ mod tests {
     }
 
     #[test]
+    fn new_disconnected_connect_validation_clears_the_previous_attempt_guid() {
+        use crate::api::odbc_types::{
+            SQL_DRIVER_PROMPT, SQL_ERROR, SQL_HANDLE_DBC, SQL_NTS, SQL_SUCCESS,
+        };
+        use crate::api::{SQLDriverConnectW, SQLGetDiagRecW};
+        use crate::handles::dbc::ConnectionState;
+        use crate::handles::{DbcHandle, handle_from_raw};
+        use crate::test_support::TestHandles;
+        use mssql_tds::trace_context;
+
+        for state in [
+            ConnectionState::Disconnected,
+            ConnectionState::Connecting,
+            ConnectionState::Connected,
+        ] {
+            let id = uuid::Uuid::new_v4();
+            let expected = if state == ConnectionState::Disconnected {
+                None
+            } else {
+                Some(id)
+            };
+            let output = capture_correlation(|| {
+                let h = TestHandles::with_env_dbc();
+                let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+                dbc.trace.begin_attempt(id);
+                dbc.inner.lock().unwrap().connection_state = state;
+                assert_eq!(
+                    unsafe {
+                        SQLDriverConnectW(
+                            h.dbc,
+                            std::ptr::null_mut(),
+                            std::ptr::null(),
+                            SQL_NTS,
+                            std::ptr::null_mut(),
+                            0,
+                            std::ptr::null_mut(),
+                            SQL_DRIVER_PROMPT,
+                        )
+                    },
+                    SQL_ERROR
+                );
+                assert_eq!(dbc.inner.lock().unwrap().connection_state, state);
+                let mut sqlstate = [0_u16; 6];
+                assert_eq!(
+                    unsafe {
+                        SQLGetDiagRecW(
+                            SQL_HANDLE_DBC,
+                            h.dbc,
+                            1,
+                            sqlstate.as_mut_ptr(),
+                            std::ptr::null_mut(),
+                            std::ptr::null_mut(),
+                            0,
+                            std::ptr::null_mut(),
+                        )
+                    },
+                    SQL_SUCCESS
+                );
+                assert_eq!(String::from_utf16(&sqlstate[..5]).unwrap(), "HY110");
+                let _scope = unsafe { context_for(h.dbc, "SQLGetDiagRecW") }.enter();
+                assert_eq!(trace_context::snapshot().cid, expected);
+            });
+            let cid = expected.map_or_else(
+                || "cid=- ".to_string(),
+                |id| format!("cid={} ", id.to_string().to_uppercase()),
+            );
+            let lines: Vec<_> = output
+                .lines()
+                .filter(|line| line.contains("SQLGetDiagRecW"))
+                .collect();
+            assert!(!lines.is_empty());
+            assert!(lines.iter().all(|line| line.contains(&cid)));
+        }
+    }
+
+    #[test]
     fn descriptor_reads_correlate_to_the_owning_connection_not_the_ambient_statement() {
         use crate::api::SQLGetDescFieldW;
         use crate::api::odbc_types::{SQL_DESC_COUNT, SQL_SUCCESS, SqlSmallInt};
@@ -1295,8 +1390,12 @@ mod tests {
     }
 
     fn assert_exported_execution_correlation(prepared: bool) {
-        use crate::api::odbc_types::{SQL_NTS, SQL_SUCCESS};
-        use crate::api::{SQLExecDirectW, SQLExecute, SQLPrepareW, SQLRowCount};
+        use crate::api::odbc_types::{
+            SQL_C_LONG, SQL_ERROR, SQL_INTEGER, SQL_NTS, SQL_PARAM_INPUT, SQL_SUCCESS,
+        };
+        use crate::api::{
+            SQLBindParameter, SQLExecDirectW, SQLExecute, SQLPrepareW, SQLRowCount, SQLSetStmtAttrW,
+        };
         use crate::handles::{DbcHandle, StmtHandle, handle_from_raw};
         use crate::test_support::TestHandles;
         use mssql_tds::datatypes::column_values::ColumnValues;
@@ -1363,8 +1462,44 @@ mod tests {
             assert_eq!(snapshot.cid, Some(id));
             assert!(snapshot.stmt.is_some());
             assert_eq!(snapshot.exec, None);
+            drop(_diagnostic);
+
+            let next: Vec<u16> = "SELECT ?".encode_utf16().chain([0]).collect();
+            assert_eq!(
+                unsafe { SQLPrepareW(h.stmt, next.as_ptr(), SQL_NTS) },
+                SQL_SUCCESS
+            );
+            let mut value = 7_i32;
+            assert_eq!(
+                unsafe {
+                    SQLBindParameter(
+                        h.stmt,
+                        1,
+                        SQL_PARAM_INPUT,
+                        SQL_C_LONG,
+                        SQL_INTEGER,
+                        10,
+                        0,
+                        (&mut value as *mut i32).cast(),
+                        0,
+                        std::ptr::null_mut(),
+                    )
+                },
+                SQL_SUCCESS
+            );
+            assert_eq!(
+                unsafe { SQLSetStmtAttrW(h.stmt, -999, std::ptr::null_mut(), 0) },
+                SQL_ERROR
+            );
         });
         let expected_id = format!("cid={} ", id.to_string().to_uppercase());
+        for api in ["SQLPrepareW", "SQLBindParameter", "SQLSetStmtAttrW"] {
+            let lines: Vec<_> = output.lines().filter(|line| line.contains(api)).collect();
+            assert!(!lines.is_empty());
+            assert!(lines.iter().all(|line| {
+                line.contains(&expected_id) && line.contains("stmt=") && !line.contains("exec=")
+            }));
+        }
         for execution in 1..=2 {
             let execution = format!("exec={execution} ");
             let lines: Vec<_> = output

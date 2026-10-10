@@ -332,6 +332,25 @@ mod tests {
 
     #[test]
     fn disabled_propagation_does_not_capture_context() {
+        const CHILD: &str = "MSSQL_TDS_DISABLED_PROPAGATION_CHILD";
+        // Sibling tests may have irreversibly enabled tracing in this process.
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "trace_context::tests::disabled_propagation_does_not_capture_context",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "disabled-mode subprocess failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
         assert!(!enabled());
         let _scope = Context::connection(Arc::default()).enter();
         assert!(Context::capture().snapshot().dbc.is_none());

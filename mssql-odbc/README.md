@@ -248,6 +248,10 @@ PRELOGIN supplies a GUID. The connection-ID getter retains the last established
 GUID until recovery succeeds. `SQLDescribeParam`
 metadata RPCs have their own execution sequence; cached descriptions do not
 replace the active result's sequence.
+Only result/stream continuation and cleanup APIs inherit the last accepted
+execution's `exec`; this includes `SQLRowCount` after a completed no-row command.
+Preparation, binding, and statement-configuration calls omit `exec` so their
+errors cannot be attributed to an earlier command.
 Diagnostic retrieval logs identify the connection and statement but omit `exec`:
 a rejected concurrent call may have replaced diagnostics without replacing the
 active result. Use the generating call's error/return event for its execution ID.

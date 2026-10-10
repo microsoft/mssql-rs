@@ -147,6 +147,9 @@ pub(crate) fn sql_driver_connect_w_safe(
         return SQL_ERROR;
     };
 
+    if state.connection_state == ConnectionState::Disconnected {
+        dbc.trace.clear();
+    }
     free_errors(&mut state);
 
     // Only SQL_DRIVER_NOPROMPT is supported (no UI prompting).
@@ -403,7 +406,6 @@ fn do_connect(
     // identity, default credential) are rejected with HYC00. Off Windows an
     // interactive request resolves to AD integrated, as it does in msodbcsql.
     let mut context = ClientContext::default();
-    dbc.trace.clear();
     context.set_connection_trace(std::sync::Arc::clone(&dbc.trace));
     configure_driver_identity(&mut context);
     // The connection string wins over a pre-connect
