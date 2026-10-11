@@ -230,7 +230,7 @@ The mapping is `type_rules::resolve_default_c_type`, shared with `SQLBindParamet
 
 | SQL type | This driver | msodbcsql | Why the deviation is kept |
 | --- | --- | --- | --- |
-| `SQL_WCHAR`, `SQL_WVARCHAR`, `SQL_WLONGVARCHAR` | `SQL_C_WCHAR` | `SQL_C_CHAR` | The narrow default is an artifact of a driver shipped in both ANSI and Unicode builds. This driver has only the Unicode one and its `SQL_C_CHAR` is UTF-8, so following msodbcsql would transcode every wide column by default |
+| `SQL_WCHAR`, `SQL_WVARCHAR`, `SQL_WLONGVARCHAR` | `SQL_C_WCHAR` | `SQL_C_CHAR` | Retain lossless wide delivery by default rather than implicitly converting to the platform client code page; explicit `SQL_C_CHAR` fetches use that code page (AB#47564) |
 | `SQL_GUID` | `SQL_C_GUID` | `SQL_C_CHAR` | Follows the ODBC 3.x default-C-type table. This is the one deviation that also changes the rowset layout: the stride becomes `sizeof(SQLGUID)` rather than `BufferLength`, per the fixed-width rule above. A slot at least 16 bytes wide — including the 36-character text form msodbcsql would fill — takes the narrower stride and stays inside the application's array; a narrower declared slot is refused rather than resolved (see below) |
 
 `SQL_SS_XML` is *not* in that table. msodbcsql maps it to `SQL_C_WCHAR` as well (`rgbTRANSTYPE` and `rgbTRANSTYPE380` both read `SQL_C_WCHAR, // SQL_XML_MAPPED`, `sqlcmisc.cpp:179` and `:218`), which a probe confirms: an `xml` column bound `SQL_C_DEFAULT` against msodbcsql18 comes back as UTF-16 (`3C 00 72 00 …`, indicator `30` for 15 characters), not narrow bytes. It is unreachable on this path in any case — `describe_col.rs` reports xml and json columns as `SQL_WLONGVARCHAR`, never `SQL_SS_XML`.

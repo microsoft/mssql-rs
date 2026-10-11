@@ -133,6 +133,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ### Fixed
 
+- `mssql-tds` and bindings: an `IMAGE` value with a present text pointer and a
+  zero payload length now decodes as empty instead of NULL (AB#49220). In the
+  legacy LOB wire format NULL is a zero *text-pointer* length; the decoder
+  treated any zero *data* length as NULL, so a present but empty value was
+  reported as NULL. `TEXT`/`NTEXT` already made this distinction, so only
+  `IMAGE` was affected. This changes what consumers see for an empty `IMAGE`:
+  `mssql-odbc` reports indicator `0` rather than `SQL_NULL_DATA` (matching
+  msodbcsql), `mssql-py-core` returns `b""` rather than `None`, and `mssql-js`
+  returns an empty `Buffer` rather than `null`. A genuine NULL is unchanged.
+
 - `mssql-tds` / `mssql-odbc`: a character with no representation in the narrow
   encoding a value is sent in is now replaced with `?` instead of being
   rewritten as markup. `encoding_rs` implements WHATWG form-submission

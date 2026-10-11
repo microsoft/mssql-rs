@@ -3063,20 +3063,16 @@ impl SqlTypeDecode for GenericDecoder {
                 }
             }?,
             TdsDataType::Image => {
+                // Only a zero text-pointer length means NULL. A present pointer
+                // with zero data bytes is empty, as in the TEXT/NTEXT branch.
                 let text_ptr_len = read_sync_first!(reader, try_read_byte, read_byte) as usize;
-
-                let length = if text_ptr_len > 0 {
+                if text_ptr_len == 0 {
+                    ColumnValues::Null
+                } else {
                     const TIMESTAMP_BYTE_COUNT: usize = 8;
                     reader.skip_bytes(text_ptr_len).await?;
                     reader.skip_bytes(TIMESTAMP_BYTE_COUNT).await?;
-                    read_sync_first!(reader, try_read_uint32, read_uint32) as usize
-                } else {
-                    0
-                };
-
-                if length == 0 {
-                    ColumnValues::Null
-                } else {
+                    let length = read_sync_first!(reader, try_read_uint32, read_uint32) as usize;
                     if length > MAX_ALLOC_SIZE {
                         return Err(crate::error::Error::ProtocolError(format!(
                             "Image length {length} exceeds maximum allowed size of {MAX_ALLOC_SIZE} bytes"
@@ -3759,6 +3755,15 @@ mod test {
         },
         sqldatatypes::TdsDataType,
     };
+
+    fn legacy_lob_wire(payload: &[u8]) -> Vec<u8> {
+        let mut wire = vec![16u8];
+        wire.extend_from_slice(&[0u8; 16]); // textptr
+        wire.extend_from_slice(&[0u8; 8]); // timestamp
+        wire.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        wire.extend_from_slice(payload);
+        wire
+    }
 
     #[test]
     fn test_f64_conversion() {
@@ -7355,6 +7360,31 @@ mod test {
         // ── BigBinary empty ────────────────────────────────────────────
 
         #[tokio::test]
+        async fn ntext_with_text_pointer_and_zero_length_is_empty_not_null() {
+            let md = varlen_metadata(TdsDataType::NText, 0x7FFFFFFF);
+            let value = assert_decode_equivalence(super::legacy_lob_wire(&[]), &md).await;
+            let ColumnValues::String(value) = value else {
+                panic!("empty NTEXT must decode as a string, got {value:?}");
+            };
+            assert!(value.to_utf8_string().is_empty());
+        }
+
+        #[tokio::test]
+        async fn text_with_text_pointer_and_zero_length_is_empty_not_null() {
+            let mut md = varlen_metadata(TdsDataType::Text, 0x7FFFFFFF);
+            md.type_info.type_info_variant = TypeInfoVariant::VarLenString(
+                VariableLengthTypes::Text,
+                0x7FFFFFFF,
+                Some(SqlCollation::default()),
+            );
+            let value = assert_decode_equivalence(super::legacy_lob_wire(&[]), &md).await;
+            let ColumnValues::String(value) = value else {
+                panic!("empty TEXT must decode as a string, got {value:?}");
+            };
+            assert!(value.to_utf8_string().is_empty());
+        }
+
+        #[tokio::test]
         async fn bigbinary_empty() {
             let md = varlen_metadata(TdsDataType::BigBinary, 100);
             let val = assert_decode_equivalence(vec![0x00, 0x00], &md).await;
@@ -7404,7 +7434,9 @@ mod test {
         use crate::datatypes::sql_json::SqlJson;
         use crate::datatypes::sql_string::EncodingType;
         use crate::datatypes::sql_vector::SqlVector;
-        use crate::datatypes::sqldatatypes::{PartialLengthType, TdsDataType};
+        use crate::datatypes::sqldatatypes::{
+            PartialLengthType, TdsDataType, TypeInfoVariant, VariableLengthTypes,
+        };
         use crate::query::metadata::ColumnMetadata;
         use crate::token::tokens::SqlCollation;
         use std::borrow::Cow;
@@ -7687,6 +7719,35 @@ mod test {
             );
         }
 
+        /// AB#49220: a present text pointer with a zero data length is an empty
+        /// value, not NULL.
+        #[tokio::test]
+        async fn image_with_text_pointer_and_zero_length_is_empty_not_null() {
+            let md = varlen_metadata(TdsDataType::Image, 0x7FFFFFFF);
+            assert_eq!(
+                decode_generic(super::legacy_lob_wire(&[]), &md, true).await,
+                vec![Event::OwnedBytes(Vec::new())]
+            );
+        }
+
+        #[tokio::test]
+        async fn image_null_text_pointer_is_null() {
+            let md = varlen_metadata(TdsDataType::Image, 0x7FFFFFFF);
+            assert_eq!(
+                decode_generic(vec![0u8], &md, true).await,
+                vec![Event::Null]
+            );
+        }
+
+        #[tokio::test]
+        async fn image_with_payload_returns_its_bytes() {
+            let md = varlen_metadata(TdsDataType::Image, 0x7FFFFFFF);
+            assert_eq!(
+                decode_generic(super::legacy_lob_wire(&[1, 2, 3]), &md, true).await,
+                vec![Event::OwnedBytes(vec![1, 2, 3])]
+            );
+        }
+
         // ---------------------------------------------------------------
         // Strings — raw wire bytes are handed over without transcoding
         // ---------------------------------------------------------------
@@ -7738,14 +7799,32 @@ mod test {
                 .encode_utf16()
                 .flat_map(u16::to_le_bytes)
                 .collect();
-            let mut wire = vec![16u8];
-            wire.extend_from_slice(&[0u8; 16]); // textptr
-            wire.extend_from_slice(&[0u8; 8]); // timestamp
-            wire.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-            wire.extend_from_slice(&payload);
             assert_eq!(
-                decode_string(wire, &md, true).await,
+                decode_string(super::legacy_lob_wire(&payload), &md, true).await,
                 vec![Event::OwnedString(payload)]
+            );
+        }
+
+        #[tokio::test]
+        async fn ntext_with_text_pointer_and_zero_length_is_empty_not_null() {
+            let md = varlen_metadata(TdsDataType::NText, 0x7FFFFFFF);
+            assert_eq!(
+                decode_string(super::legacy_lob_wire(&[]), &md, true).await,
+                vec![Event::OwnedString(Vec::new())]
+            );
+        }
+
+        #[tokio::test]
+        async fn text_with_text_pointer_and_zero_length_is_empty_not_null() {
+            let mut md = varlen_metadata(TdsDataType::Text, 0x7FFFFFFF);
+            md.type_info.type_info_variant = TypeInfoVariant::VarLenString(
+                VariableLengthTypes::Text,
+                0x7FFFFFFF,
+                Some(SqlCollation::default()),
+            );
+            assert_eq!(
+                decode_string(super::legacy_lob_wire(&[]), &md, true).await,
+                vec![Event::OwnedString(Vec::new())]
             );
         }
 

@@ -15,6 +15,7 @@
 //! bind-time matrix in `crate::params` for parameters, [`error::ConvError`]
 //! returned from inside the converters for fetch.
 
+pub(crate) mod client_encoding;
 pub(crate) mod datetime;
 pub(crate) mod error;
 pub(crate) mod fetch_convert;

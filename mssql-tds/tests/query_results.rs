@@ -229,6 +229,70 @@ mod query_result_reads {
         connection.close_query().await.unwrap();
     }
 
+    async fn collect_rows(connection: &mut TdsClient, sql: &str) -> Vec<Vec<ColumnValues>> {
+        connection.execute(sql.to_string(), ()).await.unwrap();
+        let mut rows = Vec::new();
+        loop {
+            if connection.on_rows() {
+                while let Some(row) = connection.next_row().await.unwrap() {
+                    rows.push(row);
+                }
+            }
+            if !connection.advance_to_rows().await.unwrap() {
+                break;
+            }
+        }
+        connection.close_query().await.unwrap();
+        rows
+    }
+
+    /// AB#49220: a zero-length IMAGE is a present, empty value, not NULL.
+    /// `DATALENGTH` is 0 for it and NULL only for a real NULL, which pins what
+    /// the server stored. The non-empty row keeps the stream aligned past it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_empty_image_is_empty_not_null() {
+        let mut connection = begin_connection(&build_tcp_datasource()).await;
+
+        let stored = collect_rows(
+            &mut connection,
+            "
+            CREATE TABLE #EmptyImage (id INT PRIMARY KEY, img IMAGE NULL);
+            INSERT INTO #EmptyImage (id, img) VALUES (1, 0x), (2, NULL), (3, 0x0102);
+            SELECT id, img, DATALENGTH(img) FROM #EmptyImage ORDER BY id;",
+        )
+        .await;
+        assert_eq!(
+            stored,
+            vec![
+                vec![
+                    ColumnValues::Int(1),
+                    ColumnValues::Bytes(Vec::new()),
+                    ColumnValues::Int(0),
+                ],
+                vec![ColumnValues::Int(2), ColumnValues::Null, ColumnValues::Null],
+                vec![
+                    ColumnValues::Int(3),
+                    ColumnValues::Bytes(vec![0x01, 0x02]),
+                    ColumnValues::Int(2),
+                ],
+            ]
+        );
+
+        let computed = collect_rows(
+            &mut connection,
+            "SELECT CAST(0x AS IMAGE), CAST(NULL AS IMAGE), CAST(0x0102 AS IMAGE)",
+        )
+        .await;
+        assert_eq!(
+            computed,
+            vec![vec![
+                ColumnValues::Bytes(Vec::new()),
+                ColumnValues::Null,
+                ColumnValues::Bytes(vec![0x01, 0x02]),
+            ]]
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_tds_connection_reuse() {
         let mut connection = begin_connection(&build_tcp_datasource()).await;

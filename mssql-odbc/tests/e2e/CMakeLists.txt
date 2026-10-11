@@ -94,6 +94,10 @@ target_link_libraries(odbc_test_lib PUBLIC
     gtest
     ${ODBC_LIBRARIES}
 )
+if(NOT WIN32)
+    find_package(Iconv REQUIRED)
+    target_link_libraries(odbc_test_lib PUBLIC Iconv::Iconv)
+endif()
 
 # ---------------------------------------------------------------------------
 # Helper function: add a test executable under tests/
@@ -135,6 +139,15 @@ add_odbc_test(get_diag_rec_test  tests/get_diag_rec_test.cpp)
 add_odbc_test(describe_col_test  tests/describe_col_test.cpp)
 add_odbc_test(col_attribute_test tests/col_attribute_test.cpp)
 add_odbc_test(fetch_scroll_test tests/fetch_scroll_test.cpp)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(get_data_iso88591_test
+        tests/get_data_iso88591_test.cpp
+        lib/odbc_iso88591_main.cpp
+    )
+    target_link_libraries(get_data_iso88591_test PRIVATE odbc_test_lib)
+    add_test(NAME get_data_iso88591_test COMMAND get_data_iso88591_test)
+    set_tests_properties(get_data_iso88591_test PROPERTIES SKIP_RETURN_CODE 77)
+endif()
 add_odbc_test(num_result_cols_test tests/num_result_cols_test.cpp)
 add_odbc_test(get_diag_field_test tests/get_diag_field_test.cpp)
 add_odbc_test(get_desc_field_test tests/get_desc_field_test.cpp)
