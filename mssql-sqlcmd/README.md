@@ -168,7 +168,8 @@ client's. The report adds:
   [the diagnostic coverage matrix](docs/diagnose-coverage.md) the checks follow.
 
 Diagnose output is for review before sharing; it is never share-safe. Every
-report begins with this warning (in JSON, the top-level `sharingWarning`):
+report begins with this warning, localized (`diagnose.sharing.warning`; in
+JSON, the top-level `sharingWarning`):
 "Diagnostic output may contain unobfuscated server names, host names, and IP
 addresses. Review the output before sharing it." Server, instance and host
 names (the `-F` certificate name included), IP addresses, named pipe paths and
@@ -210,6 +211,33 @@ or `np:` diagnoses a transport directly.
 
 `mssql-tds` is 64-bit only, so 32-bit builds (`win-x86`) leave diagnose out:
 there `mssql_sqlcmd_diagnostics_run` returns `MSSQL_SQLCMD_UNSUPPORTED`.
+
+## Localization
+
+Rust-generated human text is routed through the `i18n` message catalog. Stable
+JSON keys, enum values, identifiers, numeric codes and text from SQL Server,
+the operating system or `mssql-tds` are not localized. The ODBC driver's
+wording that diagnose's error lines reuse (the `Sqlcmd: Error: mssql-tds : ...`
+line, the provider messages and the driver's summaries, in text and in
+`errors[].text`) is in the catalog too; the operating system's, SQL Server's
+and OpenSSL's text inside it is passed through as it is. Existing diagnostics
+and formatter strings are being moved to the catalog incrementally; only
+catalog-backed Rust messages participate today.
+
+Locale selection is process-wide. Native sqlcmd may call
+`mssql_sqlcmd_set_locale` once at startup with the language it resolved for its
+resource DLL (on Windows this can be an LCID such as `1031`). If it does not,
+the crate resolves `SQLCMD_LANG`, `LC_ALL`, `LC_MESSAGES`, then `LANG`, and on
+Windows finally `GetUserDefaultUILanguage()`. Values may be BCP-47 (`de-DE`),
+POSIX (`de_DE.UTF-8`) or LCID decimal/hex (`1031`, `0x0407`). Unknown locales
+fall back to `en-US`; missing translated messages fall back per message.
+
+The source catalog is `i18n/locales/en-US/sqlcmd.json`. OneLocBuild uses
+`i18n/LocProject.json` and `i18n/P306PairNamesToProcess.lss` to create or reuse
+a pull request that writes translated catalogs under `i18n/localized/<Lang>/`.
+Do not hand-edit localized catalogs. To verify that a string is catalog-routed,
+run with `SQLCMD_LANG=qps-ploc`; pseudo-localized text is wrapped with
+`[!!! ... !!!]` while placeholders keep working.
 
 ## Building for native sqlcmd
 

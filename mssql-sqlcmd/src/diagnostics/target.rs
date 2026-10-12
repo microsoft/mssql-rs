@@ -12,6 +12,9 @@
 
 use std::borrow::Cow;
 use std::fmt;
+
+use crate::i18n;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Protocol {
     /// No prefix: the client's protocol order. On Windows it tries shared
@@ -140,43 +143,42 @@ impl ParseError {
             ParseError::SharedMemoryNotSupported => "sharedMemoryNotSupported",
         }
     }
+
+    pub fn message_id(&self) -> &'static str {
+        match self {
+            ParseError::Empty => "diagnose.target.empty",
+            ParseError::UnknownProtocol(_) => "diagnose.target.unknown_protocol",
+            ParseError::MissingHost => "diagnose.target.missing_host",
+            ParseError::MissingInstance => "diagnose.target.missing_instance",
+            ParseError::InvalidPort(_) => "diagnose.target.invalid_port",
+            ParseError::PortNotAllowed(_) => "diagnose.target.port_not_allowed",
+            ParseError::InvalidPipe(_) => "diagnose.target.invalid_pipe",
+            ParseError::ReservedInstance => "diagnose.target.reserved_instance",
+            ParseError::SharedMemoryNotLocal(_) => "diagnose.target.shared_memory_not_local",
+            ParseError::SharedMemoryNotSupported => "diagnose.target.shared_memory_not_supported",
+        }
+    }
+
+    pub fn message_args(&self) -> Vec<(&'static str, String)> {
+        match self {
+            ParseError::UnknownProtocol(protocol) => vec![("protocol", protocol.clone())],
+            ParseError::InvalidPort(port) => vec![("port", port.clone())],
+            ParseError::PortNotAllowed(protocol) => vec![("protocol", (*protocol).to_string())],
+            ParseError::InvalidPipe(path) => vec![("path", path.clone())],
+            ParseError::SharedMemoryNotLocal(host) => vec![("host", host.clone())],
+            _ => Vec::new(),
+        }
+    }
 }
 
 impl fmt::Display for ParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ParseError::Empty => write!(f, "no server was given"),
-            ParseError::UnknownProtocol(p) => write!(
-                f,
-                "unknown protocol prefix `{p}:` (expected tcp, np, lpc or admin)"
-            ),
-            ParseError::MissingHost => write!(f, "the server name is empty"),
-            ParseError::MissingInstance => write!(f, "the instance name after `\\` is empty"),
-            ParseError::InvalidPort(p) => {
-                write!(f, "`{p}` is not a port number from 1 to 65535")
-            }
-            ParseError::PortNotAllowed(p) => {
-                write!(f, "a port is given only with TCP; `{p}:` takes none")
-            }
-            ParseError::InvalidPipe(p) => {
-                write!(
-                    f,
-                    "`{p}` is not a pipe path of the form \\\\host\\pipe\\name"
-                )
-            }
-            ParseError::ReservedInstance => write!(
-                f,
-                "`MSSQLSERVER` is the default instance's reserved name, which the client does not accept as an instance name without a port"
-            ),
-            ParseError::SharedMemoryNotLocal(host) => write!(
-                f,
-                "shared memory (`lpc:`) requires a local server; `{host}` is not this computer"
-            ),
-            ParseError::SharedMemoryNotSupported => write!(
-                f,
-                "shared memory (`lpc:`) is not supported on this platform; it is a Windows-only feature"
-            ),
-        }
+        let owned_args = self.message_args();
+        let args: Vec<(&str, &dyn fmt::Display)> = owned_args
+            .iter()
+            .map(|(name, value)| (*name, value as &dyn fmt::Display))
+            .collect();
+        write!(f, "{}", i18n::tr(self.message_id(), &args))
     }
 }
 
