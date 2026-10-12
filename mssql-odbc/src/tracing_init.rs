@@ -1394,7 +1394,8 @@ mod tests {
             SQL_C_LONG, SQL_ERROR, SQL_INTEGER, SQL_NTS, SQL_PARAM_INPUT, SQL_SUCCESS,
         };
         use crate::api::{
-            SQLBindParameter, SQLExecDirectW, SQLExecute, SQLPrepareW, SQLRowCount, SQLSetStmtAttrW,
+            SQLBindParameter, SQLExecDirectW, SQLExecute, SQLNumResultCols, SQLPrepareW,
+            SQLRowCount, SQLSetStmtAttrW,
         };
         use crate::handles::{DbcHandle, StmtHandle, handle_from_raw};
         use crate::test_support::TestHandles;
@@ -1464,11 +1465,55 @@ mod tests {
             assert_eq!(snapshot.exec, None);
             drop(_diagnostic);
 
+            let invalid: Vec<u16> = "{call}".encode_utf16().chain([0]).collect();
+            assert_eq!(
+                unsafe { SQLPrepareW(h.stmt, invalid.as_ptr(), SQL_NTS) },
+                SQL_ERROR
+            );
+            let mut columns = -1;
+            assert_eq!(
+                unsafe { SQLNumResultCols(h.stmt, &mut columns) },
+                SQL_SUCCESS
+            );
+            assert_eq!(columns, 0);
+            {
+                let _scope = unsafe { context_for(h.stmt, "SQLNumResultCols") }.enter();
+                assert_eq!(mssql_tds::trace_context::snapshot().exec, Some(2));
+            }
+
             let next: Vec<u16> = "SELECT ?".encode_utf16().chain([0]).collect();
             assert_eq!(
                 unsafe { SQLPrepareW(h.stmt, next.as_ptr(), SQL_NTS) },
                 SQL_SUCCESS
             );
+            for api in ["SQLNumResultCols", "SQLDescribeColW", "SQLColAttributeW"] {
+                let _scope = unsafe { context_for(h.stmt, api) }.enter();
+                let snapshot = mssql_tds::trace_context::snapshot();
+                assert_eq!(snapshot.cid, Some(id));
+                assert!(snapshot.stmt.is_some());
+                assert_eq!(snapshot.exec, None);
+            }
+            let metadata = capture_correlation(|| {
+                assert_eq!(unsafe { SQLNumResultCols(h.stmt, &mut columns) }, SQL_ERROR);
+                let state = stmt.inner.lock().unwrap();
+                assert_eq!(state.diag_records[0].sql_state, *b"HY010");
+            });
+            let lines: Vec<_> = metadata.lines().collect();
+            assert!(
+                lines
+                    .iter()
+                    .any(|line| line.contains("SQLNumResultCols called"))
+            );
+            assert!(
+                lines
+                    .iter()
+                    .any(|line| line.contains("SQLNumResultCols returning"))
+            );
+            assert!(lines.iter().all(|line| {
+                line.contains(&format!("cid={} ", id.to_string().to_uppercase()))
+                    && line.contains("stmt=")
+                    && !line.contains("exec=")
+            }));
             let mut value = 7_i32;
             assert_eq!(
                 unsafe {

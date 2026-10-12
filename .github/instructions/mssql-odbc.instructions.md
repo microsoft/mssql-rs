@@ -417,6 +417,8 @@ on; these guarantees were verified against msodbcsql's behavior.
   result execution.
   Restrict `continues_execution` to result, streaming, and cleanup APIs;
   preparation, configuration, and diagnostics must not inherit a prior `exec`.
+  When a successful prepare replaces the result context, clear the stored trace
+  execution as well so metadata probes cannot inherit the replaced command's ID.
 - Verify diagnostic identifiers against wire bytes and the reference driver's
   API representation. PRELOGIN TRACEID contains connection GUID, activity GUID,
   then sequence, with Microsoft GUID byte order. The ODBC client-connection-ID

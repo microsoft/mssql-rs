@@ -159,6 +159,14 @@ impl Default for StatementTrace {
     }
 }
 
+impl StatementTrace {
+    /// Invalidates future continuations without changing existing scopes or
+    /// reusing the sequence number when the next command executes.
+    pub fn clear_execution(&self) {
+        self.active_execution.store(0, Ordering::Relaxed);
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Context {
     connection: Option<Arc<ConnectionTrace>>,
@@ -557,6 +565,29 @@ mod tests {
             assert_eq!(snapshot(), Snapshot::default());
         });
         result.join().unwrap();
+    }
+
+    #[test]
+    fn clearing_execution_preserves_existing_scope_and_sequence() {
+        enable();
+        let statement = Arc::new(StatementTrace::default());
+        {
+            let _scope = Context::default()
+                .statement(Arc::clone(&statement), true)
+                .enter();
+            activate_execution();
+            statement.clear_execution();
+            assert_eq!(snapshot().exec, Some(1));
+        }
+        {
+            let _scope = Context::default()
+                .statement(Arc::clone(&statement), false)
+                .enter();
+            assert_eq!(snapshot().exec, None);
+        }
+        let _scope = Context::default().statement(statement, true).enter();
+        activate_execution();
+        assert_eq!(snapshot().exec, Some(2));
     }
 
     #[test]

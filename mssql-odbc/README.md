@@ -252,6 +252,8 @@ Only result/stream continuation and cleanup APIs inherit the last accepted
 execution's `exec`; this includes `SQLRowCount` after a completed no-row command.
 Preparation, binding, and statement-configuration calls omit `exec` so their
 errors cannot be attributed to an earlier command.
+Successful preparation also invalidates the prior execution identity: metadata
+probes for the replacement statement have no `exec` until it executes.
 Diagnostic retrieval logs identify the connection and statement but omit `exec`:
 a rejected concurrent call may have replaced diagnostics without replacing the
 active result. Use the generating call's error/return event for its execution ID.
