@@ -23,7 +23,9 @@ so tests can be migrated between the two.
 tests/e2e/
 ├── CMakeLists.txt              # Top-level CMake build
 ├── include/
-│   └── odbc_test_fixture.h     # Base test fixture & assertion macros
+│   ├── odbc_test_fixture.h     # Base test fixture & assertion macros
+│   ├── odbc_concurrent_test.h  # ODBC_TEST_F: one test body, single- and multithreaded
+│   └── odbc_sql_server_types.h # SQL Server ODBC extension types and constants
 ├── lib/
 │   ├── odbc_test_fixture.cpp   # ODBCTest fixture (HENV/HDBC/HSTMT lifecycle)
 │   ├── odbc_test_utils.cpp     # Diagnostic helpers
@@ -305,8 +307,9 @@ set once via the `msodbcsqlVersion` pipeline variable (in
 
 When `ODBC_TEST_SERVER` is unset, a dev SQL Server on `localhost:1433` is
 auto-detected — the password is taken from `ODBC_TEST_PWD`, then `SQL_PASSWORD`,
-then `SQL_PASSWORD=` in `mssql-tds\.env`, falling back to integrated auth. This
-matches `run_e2e.sh`.
+then `SQL_PASSWORD=` in `mssql-tds\.env`. With a password, `ODBC_TEST_UID`
+defaults to `sa`; without one, UID stays unset and the fixture uses integrated
+auth. This matches `run_e2e.sh`.
 
 `run_e2e.ps1 -Coverage` builds the Rust driver with LLVM source-based
 instrumentation so the driver code exercised by the C++ tests — which load the
@@ -419,9 +422,10 @@ environment variables to enable them:
 ### Auto-detection
 
 When `ODBC_TEST_SERVER` is not set, `run_e2e.sh` probes `localhost:1433`. If a
-SQL Server is listening, it auto-configures `ODBC_TEST_SERVER=localhost`,
-`ODBC_TEST_UID=sa`, and resolves the password from `ODBC_TEST_PWD`,
-`SQL_PASSWORD`, or `mssql-tds/.env` (in that order).
+SQL Server is listening, it auto-configures `ODBC_TEST_SERVER=localhost` and
+resolves the password from `ODBC_TEST_PWD`, `SQL_PASSWORD`, or `mssql-tds/.env`
+(in that order). If a password is found, `ODBC_TEST_UID` defaults to `sa`;
+otherwise UID stays unset and the fixture uses integrated auth.
 
 To bring up a local SQL Server in Docker:
 
@@ -470,6 +474,29 @@ add_odbc_test(my_feature_test  tests/my_feature_test.cpp)
 ```bash
 cmake --build build && ctest --test-dir build --output-on-failure
 ```
+
+### 4. Optional: also run it multithreaded
+
+Write the test with `ODBC_TEST_F` instead of `TEST_F` (include
+`odbc_concurrent_test.h`). The body is unchanged; the macro registers the
+single-threaded test plus `/CrossThread`, `/SharedEnv`, and `/SharedStmt`
+variants that run it across threads. `ODBC_TEST_F_MODES(..., odbc_concurrency::kAllModes)`
+adds `/SharedDbc`. Use `Worker()`, `Iteration()`, and `WorkerToken()` for
+values that must differ per run.
+
+```bash
+# 8 threads x 20 iterations, only the multithreaded variants
+MSSQL_ODBC_MT_THREADS=8 MSSQL_ODBC_MT_ITERS=20 \
+  ./build/get_data_test --gtest_filter='*/CrossThread:*/SharedEnv:*/SharedStmt:*/SharedDbc'
+```
+
+`MSSQL_ODBC_MT_THREADS` (default 2) is how many threads run at once,
+`MSSQL_ODBC_MT_ITERS` (default 1) how many times each runs the body, and
+`MSSQL_ODBC_MT_TIMEOUT_SECONDS` (default 300) the hang watchdog. On a hang the
+watchdog writes a minidump on Windows (to `MSSQL_ODBC_MT_DUMP_DIR`, default the
+working directory) or aborts for a core dump elsewhere; it leaves a process
+under a debugger alone. Which tests can use which mode, and why, is in
+[multithreaded-testing-plan.md](../../docs/multithreaded-testing-plan.md).
 
 ## How It Works
 

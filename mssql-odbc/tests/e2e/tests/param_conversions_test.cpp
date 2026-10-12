@@ -15,61 +15,13 @@
 // Tests that require a live SQL Server are gated by ODBCTestConfig::HasConnection().
 
 #include "odbc_test_fixture.h"
+#include "odbc_sql_server_types.h"
 
 #include <cstdint>
 #include <cstring>
 #include <limits>
 #include <string>
 #include <vector>
-
-// SQL Server extension types, declared here rather than pulled from
-// msodbcsql.h for the reason datetime_types_test.cpp gives: this suite builds
-// on Linux and Windows, where that header lives in different places. Layout and
-// values copied from msodbcsql.h and cross-checked against the driver's own
-// definitions in api/odbc_types.rs; the static_asserts fail the build rather
-// than silently misread a buffer if either drifts.
-#ifndef SQL_C_SS_TIME2
-#define SQL_C_TYPES_EXTENDED 0x04000L
-#define SQL_C_SS_TIME2 (SQL_C_TYPES_EXTENDED + 0)
-#define SQL_C_SS_TIMESTAMPOFFSET (SQL_C_TYPES_EXTENDED + 1)
-
-typedef struct tagSS_TIME2_STRUCT {
-    SQLUSMALLINT hour;
-    SQLUSMALLINT minute;
-    SQLUSMALLINT second;
-    SQLUINTEGER fraction;
-} SQL_SS_TIME2_STRUCT;
-
-typedef struct tagSS_TIMESTAMPOFFSET_STRUCT {
-    SQLSMALLINT year;
-    SQLUSMALLINT month;
-    SQLUSMALLINT day;
-    SQLUSMALLINT hour;
-    SQLUSMALLINT minute;
-    SQLUSMALLINT second;
-    SQLUINTEGER fraction;
-    SQLSMALLINT timezone_hour;
-    SQLSMALLINT timezone_minute;
-} SQL_SS_TIMESTAMPOFFSET_STRUCT;
-#endif
-
-#ifndef SQL_SS_VARIANT
-#define SQL_SS_VARIANT (-150)
-#endif
-#ifndef SQL_SS_XML
-#define SQL_SS_XML (-152)
-#endif
-#ifndef SQL_SS_TIME2
-#define SQL_SS_TIME2 (-154)
-#endif
-#ifndef SQL_SS_TIMESTAMPOFFSET
-#define SQL_SS_TIMESTAMPOFFSET (-155)
-#endif
-
-static_assert(sizeof(SQL_SS_TIME2_STRUCT) == 12,
-              "SQL_SS_TIME2_STRUCT layout does not match the msodbcsql ABI");
-static_assert(sizeof(SQL_SS_TIMESTAMPOFFSET_STRUCT) == 20,
-              "SQL_SS_TIMESTAMPOFFSET_STRUCT layout does not match the msodbcsql ABI");
 
 class CrossConversionLiveTest : public ODBCTest {
 protected:

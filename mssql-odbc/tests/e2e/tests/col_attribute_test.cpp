@@ -41,39 +41,11 @@
 //   34. VariantBaseTypesMatchMsodbcsql    - every measured-parity base type
 
 #include "odbc_test_fixture.h"
+#include "odbc_sql_server_types.h"
 
 #include <algorithm>
 #include <cstdlib>
 #include <string>
-
-// SQL Server-specific identifiers not in standard <sqlext.h>.
-#ifndef SQL_CA_SS_VARIANT_TYPE
-#define SQL_CA_SS_VARIANT_TYPE (1215)
-#endif
-#ifndef SQL_SS_VARIANT
-#define SQL_SS_VARIANT (-150)
-#endif
-#ifndef SQL_SS_UDT
-#define SQL_SS_UDT (-151)
-#endif
-#ifndef SQL_CA_SS_UDT_CATALOG_NAME
-#define SQL_CA_SS_UDT_CATALOG_NAME (1218)
-#endif
-#ifndef SQL_CA_SS_UDT_SCHEMA_NAME
-#define SQL_CA_SS_UDT_SCHEMA_NAME (1219)
-#endif
-#ifndef SQL_CA_SS_UDT_TYPE_NAME
-#define SQL_CA_SS_UDT_TYPE_NAME (1220)
-#endif
-#ifndef SQL_CA_SS_UDT_ASSEMBLY_TYPE_NAME
-#define SQL_CA_SS_UDT_ASSEMBLY_TYPE_NAME (1221)
-#endif
-#ifndef SQL_C_SS_TIME2
-#define SQL_C_SS_TIME2 0x4000
-#endif
-#ifndef SQL_C_SS_TIMESTAMPOFFSET
-#define SQL_C_SS_TIMESTAMPOFFSET 0x4001
-#endif
 
 class ColAttributeLiveTest : public ODBCTest {
 protected:

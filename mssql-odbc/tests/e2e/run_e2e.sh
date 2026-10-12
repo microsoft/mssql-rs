@@ -351,7 +351,6 @@ setup_dev_sql_env() {
     fi
 
     export ODBC_TEST_SERVER="localhost"
-    export ODBC_TEST_UID="${ODBC_TEST_UID:-sa}"
     export ODBC_TEST_TRUST_CERT="${ODBC_TEST_TRUST_CERT:-Yes}"
 
     if [ -z "${ODBC_TEST_PWD:-}" ]; then
@@ -367,10 +366,16 @@ setup_dev_sql_env() {
     fi
 
     if [ -n "${ODBC_TEST_PWD:-}" ]; then
-        echo "Auto-detected dev SQL Server at localhost:1433 (sa login)"
+        # Default the SQL login only once a password exists; a UID without one
+        # makes the fixture attempt SQL auth with an empty password.
+        export ODBC_TEST_UID="${ODBC_TEST_UID:-sa}"
+        echo "Auto-detected dev SQL Server at localhost:1433 (${ODBC_TEST_UID} login)"
+    elif [ -n "${ODBC_TEST_UID:-}" ]; then
+        echo "Warning: SQL Server detected on localhost:1433 but no password found for ODBC_TEST_UID=${ODBC_TEST_UID}."
+        echo "  Set SQL_PASSWORD or ODBC_TEST_PWD, or unset ODBC_TEST_UID to use integrated auth."
     else
-        echo "Warning: SQL Server detected on localhost:1433 but no password found."
-        echo "  Set SQL_PASSWORD, ODBC_TEST_PWD, or run dev/dev-launchsql.sh first."
+        echo "Warning: SQL Server detected on localhost:1433 but no password found; using integrated auth."
+        echo "  Set SQL_PASSWORD, ODBC_TEST_PWD, or run dev/dev-launchsql.sh first, to use SQL auth."
     fi
 }
 

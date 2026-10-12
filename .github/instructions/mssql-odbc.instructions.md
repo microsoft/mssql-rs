@@ -471,6 +471,26 @@ on; these guarantees were verified against msodbcsql's behavior.
   the first of the three reasons the macro is admissible; see §2.1 for the other
   two and for the preference against skipping when the test exists solely to pin
   one registered divergence.
+- Write new behavioral e2e tests with `ODBC_TEST_F` (from
+  `odbc_concurrent_test.h`) instead of `TEST_F`. The body is unchanged; the macro
+  also runs it across threads (`/CrossThread`, `/SharedEnv`, `/SharedStmt`), so
+  concurrency coverage comes without a second copy of the test.
+  - Keep `TEST_F`, or pick the safe modes with `ODBC_TEST_F_MODES`, for tests
+    that change ENV, pooling, or process state, test connect, disconnect, or
+    driver loading, create fixed-name permanent objects, or free or replace
+    `stmt_` or `dbc_` in the body.
+  - Derive values from `WorkerToken()` (or `Worker()` and `Iteration()`) when a
+    result delivered to the wrong connection must fail the test; constant data
+    cannot detect that.
+  - Opt into `/SharedDbc` with `ODBC_TEST_F_MODES(..., odbc_concurrency::kAllModes)`
+    only when the body changes no connection attributes or transactions, gives
+    temporary objects per-worker names, is safe to rerun after a busy retry, and
+    does not rely on `HasFatalFailure()`. Do not opt in until CI runs that mode
+    nightly only (AB#49263).
+  - Scenarios with no single-threaded meaning (races on one STMT, handle churn,
+    connect races) go under `tests/e2e/tests/multithreaded_tests/`.
+  - A concurrent failure that msodbcsql passes is a driver bug: file it rather
+    than loosen the assertion or the mode.
 - Every new `SQLXxx` function must have at least:
   - A success-path test.
   - A null-output-handle test.

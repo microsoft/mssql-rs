@@ -98,6 +98,14 @@ if(NOT WIN32)
     find_package(Iconv REQUIRED)
     target_link_libraries(odbc_test_lib PUBLIC Iconv::Iconv)
 endif()
+# odbc_concurrent_test.h runs test bodies on std::thread workers, and its hang
+# watchdog writes a minidump through dbghelp on Windows.
+if(TARGET Threads::Threads)
+    target_link_libraries(odbc_test_lib PUBLIC Threads::Threads)
+endif()
+if(WIN32)
+    target_link_libraries(odbc_test_lib PUBLIC dbghelp)
+endif()
 
 # ---------------------------------------------------------------------------
 # Helper function: add a test executable under tests/

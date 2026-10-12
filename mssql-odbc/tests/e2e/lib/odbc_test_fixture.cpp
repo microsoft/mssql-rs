@@ -13,6 +13,11 @@
 void ODBCTest::SetUp() {
     test_start_ = std::chrono::steady_clock::now();
 
+    if (lent_env_ != SQL_NULL_HENV) {
+        env_ = lent_env_;
+        return;
+    }
+
     // Allocate environment handle
     SQLRETURN rc = SQLAllocHandle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &env_);
     ASSERT_TRUE(SQL_SUCCEEDED(rc))
@@ -41,17 +46,17 @@ void ODBCTest::TearDown() {
     }
 
     // Disconnect and free connection
-    if (dbc_ != SQL_NULL_HDBC) {
+    if (dbc_ != SQL_NULL_HDBC && dbc_ != lent_dbc_) {
         SQLDisconnect(dbc_);
         SQLFreeHandle(SQL_HANDLE_DBC, dbc_);
-        dbc_ = SQL_NULL_HDBC;
     }
+    dbc_ = SQL_NULL_HDBC;
 
     // Free environment
-    if (env_ != SQL_NULL_HENV) {
+    if (env_ != SQL_NULL_HENV && env_ != lent_env_) {
         SQLFreeHandle(SQL_HANDLE_ENV, env_);
-        env_ = SQL_NULL_HENV;
     }
+    env_ = SQL_NULL_HENV;
 }
 
 // ---------------------------------------------------------------------------
@@ -60,6 +65,13 @@ void ODBCTest::TearDown() {
 
 void ODBCTest::Connect() {
     ASSERT_TRUE(env_ != SQL_NULL_HENV) << "Call SetUp() before Connect()";
+
+    if (lent_dbc_ != SQL_NULL_HDBC) {
+        dbc_ = lent_dbc_;
+        SQLRETURN rc = SQLAllocHandle(SQL_HANDLE_STMT, dbc_, &stmt_);
+        ASSERT_SQL_OK(rc, SQL_HANDLE_DBC, dbc_);
+        return;
+    }
 
     // Allocate connection handle
     SQLRETURN rc = SQLAllocHandle(SQL_HANDLE_DBC, env_, &dbc_);
