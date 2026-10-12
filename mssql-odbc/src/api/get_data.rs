@@ -3542,6 +3542,11 @@ pub(crate) fn widen_into_pending(
         );
         pending.truncate(base + written);
         *decoder_finalized = reached_end;
+    } else if *decoder_finalized {
+        debug_assert!(
+            payload.is_empty() && reached_end,
+            "widening decoder received input after finalization"
+        );
     }
     out_units.min(pending.len())
 }
@@ -3611,6 +3616,11 @@ pub(crate) fn transcode_narrow_into_pending(
     if !*decoder_finalized && (!payload.is_empty() || reached_end) {
         decode_narrow_into_pending(decoder, pending, payload, reached_end);
         *decoder_finalized = reached_end;
+    } else if *decoder_finalized {
+        debug_assert!(
+            payload.is_empty() && reached_end,
+            "narrow decoder received input after finalization"
+        );
     }
     // A character may be split across two SQLGetData calls at the byte level,
     // exactly as the UTF-16 transcode does it: the application concatenates the
@@ -5167,7 +5177,6 @@ mod tests {
     /// `utf16_chunk_trailing_odd_byte_at_end_is_replacement`. A GBK lead byte
     /// with no trail byte is reachable from SQL: `CAST(0xD0 AS VARCHAR(MAX))`
     /// under a DBCS collation puts exactly that on the wire.
-    ///
     #[test]
     fn narrow_transcode_malformed_sequence_at_end_is_replacement() {
         let mut decoder =
