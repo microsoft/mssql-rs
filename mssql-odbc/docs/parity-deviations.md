@@ -931,17 +931,33 @@ msodbcsql build is measured.
     `SQL_PREC_NCHAR` ceiling (`Sql/Ntdbms/sqlncli/odbc/sqlcdesc.cpp`), reached
     from `SQLBindParameter` through `CheckSqlPrecScale<TRUE>`. This driver keeps
     that result for materialized XML, but admits an input or input/output
-    binding above the ceiling when `StrLen_or_IndPtr` already carries
-    `SQL_DATA_AT_EXEC` or `SQL_LEN_DATA_AT_EXEC(n)`. The original `ColumnSize`
-    remains in the descriptor and is revalidated against the execution-time
-    indicator, so changing the indicator to a materialized length before
-    `SQLExecute` still reports `HY104`.
+    binding above the ceiling because `StrLen_or_IndPtr` is deferred input and
+    need not be initialized until execution. The original `ColumnSize` remains
+    in the descriptor and is revalidated against the positioned execution-time
+    indicator: data-at-execution values stream without a bounded XML
+    declaration, while a materialized value reports `HY104` from
+    `SQLExecute`/`SQLExecDirect` rather than from `SQLBindParameter`.
 
     mssql-python preserves the caller's `setinputsizes((SQL_SS_XML, n, 0))`
     size when it switches values above 4,000 to data-at-execution. Rejecting
     that shape prevents the PLP streaming path from running at all, while XML
     has no bounded TDS declaration to preserve. The exception is limited to
-    data-at-execution so ordinary oversized bindings retain the existing
-    `HY104` compatibility behavior. `LargeXmlStreamsThroughDataAtExecution`
+    input and input/output bindings, and execution-time revalidation keeps
+    ordinary oversized materialized values rejected. `LargeXmlStreamsThroughDataAtExecution`
     covers the consumer's binding shape and is skipped on the comparison leg
     because the reference driver rejects it. Tracked in AB#48349.
+
+28. **A streamed XML value that already starts with a UTF-16LE byte-order mark
+    keeps exactly one mark; msodbcsql sends two.** msodbcsql's
+    `ConvertLongData` uses `fPrependXmlBOM` (`odbc/sqlccnvt.cpp:879-911`),
+    selected by `WAITING_FOR_DATA` on the first `SQLPutData` call
+    (`odbc/sqlccmd.cpp:4860-4876`), to prepend `XML_BOM_BYTES` before forwarding
+    the application's bytes unchanged. It does not inspect those bytes, so an
+    application-supplied `FF FE` follows the driver's `FF FE`.
+
+    This driver buffers at most the first two XML bytes across `SQLPutData`
+    calls. It emits one `FF FE` itself and suppresses the buffered bytes only
+    when they are the same mark. This matches the materialized XML serializer,
+    avoids a duplicate XML declaration marker, and preserves all non-BOM input.
+    Wire-level tests cover an absent BOM, a BOM split across calls, and later
+    chunks after BOM classification. Tracked in AB#48349.

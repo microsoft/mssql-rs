@@ -2011,7 +2011,7 @@ TEST_F(ScalarConversionLiveTest, XmlParamRoundTrips) {
 }
 
 // Benefits-from-mock-tds: assert XML TYPE_INFO followed by an unknown-length
-// PLP opener and one chunk per SQLPutData call; the final length alone cannot
+// PLP opener and incrementally emitted chunks; the final length alone cannot
 // distinguish streaming from whole-value buffering.
 TEST_F(ScalarConversionLiveTest, LargeXmlStreamsThroughDataAtExecution) {
     SKIP_IF_COMPARING_MSODBCSQL();

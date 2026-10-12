@@ -496,17 +496,24 @@ enum StreamedWriteState {
 #[derive(Debug)]
 enum StreamedXmlBomState {
     NotXml,
-    Pending(Vec<u8>),
+    Pending { prefix: [u8; 2], len: u8 },
     Written,
 }
 
 impl StreamedXmlBomState {
     fn for_param(param: &RpcParameter) -> Self {
         if matches!(param.streamed_sql_type(), Some(StreamedSqlType::Xml)) {
-            Self::Pending(Vec::with_capacity(2))
+            Self::Pending {
+                prefix: [0; 2],
+                len: 0,
+            }
         } else {
             Self::NotXml
         }
+    }
+
+    fn has_pending_bytes(&self) -> bool {
+        matches!(self, Self::Pending { len, .. } if *len != 0)
     }
 }
 
@@ -2612,11 +2619,18 @@ impl TdsClient {
 
         let mut xml_prefix_len = 0;
         let mut xml_had_bom = false;
-        if let StreamedXmlBomState::Pending(prefix) = &mut xml_bom_state {
-            let take = (2 - prefix.len()).min(chunk.len());
-            prefix.extend_from_slice(&chunk[..take]);
-            xml_prefix_len = take;
-            if prefix.len() < 2 {
+        if let StreamedXmlBomState::Pending { prefix, len } = &mut xml_bom_state {
+            let prefix_len = usize::from(*len);
+            let take = if prefix_len == 0 && chunk.len() > 1 {
+                2u8
+            } else {
+                1u8
+            };
+            *len += take;
+            xml_prefix_len = usize::from(take);
+            prefix[prefix_len..prefix_len + xml_prefix_len]
+                .copy_from_slice(&chunk[..xml_prefix_len]);
+            if usize::from(*len) < prefix.len() {
                 self.streamed_write_state =
                     StreamedWriteState::Active(Box::new(StreamedWriteContext {
                         message,
@@ -2630,7 +2644,7 @@ impl TdsClient {
                     }));
                 return Ok(());
             }
-            xml_had_bom = prefix.as_slice() == [0xFF, 0xFE];
+            xml_had_bom = *prefix == [0xFF, 0xFE];
         }
 
         let mut packet_writer = PacketWriter::resume(message, self.transport.as_writer());
@@ -2641,12 +2655,14 @@ impl TdsClient {
             if !value_opened {
                 packet_writer.write_u64_async(PLP_UNKNOWN_LEN).await?;
             }
-            if let StreamedXmlBomState::Pending(prefix) = &xml_bom_state {
+            if let StreamedXmlBomState::Pending { prefix, len } = &xml_bom_state {
                 packet_writer.write_u32_async(2).await?;
                 packet_writer.write_async(&[0xFF, 0xFE]).await?;
                 if !xml_had_bom {
-                    packet_writer.write_u32_async(2).await?;
-                    packet_writer.write_async(prefix).await?;
+                    packet_writer.write_u32_async(u32::from(*len)).await?;
+                    packet_writer
+                        .write_async(&prefix[..usize::from(*len)])
+                        .await?;
                 }
                 let remainder = &chunk[xml_prefix_len..];
                 if !remainder.is_empty() {
@@ -2676,7 +2692,7 @@ impl TdsClient {
                         db_collation,
                         value_opened: true,
                         xml_bom_state: match xml_bom_state {
-                            StreamedXmlBomState::Pending(_) => StreamedXmlBomState::Written,
+                            StreamedXmlBomState::Pending { .. } => StreamedXmlBomState::Written,
                             other => other,
                         },
                         null_signaled: false,
@@ -3028,9 +3044,9 @@ impl TdsClient {
             prepared,
         } = *ctx;
 
-        if value_opened {
-            // Chunks are already on the wire; the value cannot become NULL. Re-park
-            // the (still-clean) message — this is a caller sequencing error.
+        if value_opened || xml_bom_state.has_pending_bytes() {
+            // Data was already supplied, so the value cannot become NULL. Re-park
+            // the message — this is a caller sequencing error.
             self.streamed_write_state =
                 StreamedWriteState::Active(Box::new(StreamedWriteContext {
                     message,
@@ -3148,12 +3164,14 @@ impl TdsClient {
                 if !value_opened {
                     packet_writer.write_u64_async(PLP_UNKNOWN_LEN).await?;
                 }
-                if let StreamedXmlBomState::Pending(prefix) = &xml_bom_state {
+                if let StreamedXmlBomState::Pending { prefix, len } = &xml_bom_state {
                     packet_writer.write_u32_async(2).await?;
                     packet_writer.write_async(&[0xFF, 0xFE]).await?;
-                    if !prefix.is_empty() {
-                        packet_writer.write_u32_async(prefix.len() as u32).await?;
-                        packet_writer.write_async(prefix).await?;
+                    if *len != 0 {
+                        packet_writer.write_u32_async(u32::from(*len)).await?;
+                        packet_writer
+                            .write_async(&prefix[..usize::from(*len)])
+                            .await?;
                     }
                 }
                 packet_writer.write_u32_async(PLP_TERMINATOR).await?;
@@ -18306,7 +18324,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn streamed_xml_preserves_one_bom_when_split_across_chunks() {
+    async fn streamed_xml_preserves_one_bom_across_later_chunks() {
         let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
 
         client
@@ -18315,6 +18333,7 @@ mod tests {
             .unwrap();
         client.write_streamed_chunk(&[0xFF]).await.unwrap();
         client.write_streamed_chunk(&[0xFE, b'<', 0]).await.unwrap();
+        client.write_streamed_chunk(&[b'r', 0]).await.unwrap();
         client.end_streamed_param().await.unwrap();
 
         let payload = reassemble_sent(&sent.lock().unwrap());
@@ -18324,6 +18343,8 @@ mod tests {
         expected.extend_from_slice(&[0xFF, 0xFE]);
         expected.extend_from_slice(&2u32.to_le_bytes());
         expected.extend_from_slice(&[b'<', 0]);
+        expected.extend_from_slice(&2u32.to_le_bytes());
+        expected.extend_from_slice(&[b'r', 0]);
         expected.extend_from_slice(&PLP_TERMINATOR_BYTES);
         assert_eq!(
             &payload[pos + PLP_UNKNOWN_LEN_BYTES.len()..],
@@ -18346,6 +18367,34 @@ mod tests {
         let mut expected = Vec::new();
         expected.extend_from_slice(&2u32.to_le_bytes());
         expected.extend_from_slice(&[0xFF, 0xFE]);
+        expected.extend_from_slice(&PLP_TERMINATOR_BYTES);
+        assert_eq!(
+            &payload[pos + PLP_UNKNOWN_LEN_BYTES.len()..],
+            expected.as_slice()
+        );
+    }
+
+    #[tokio::test]
+    async fn streamed_xml_pending_byte_prevents_null() {
+        let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
+
+        client
+            .begin_sp_executesql("SELECT @v".to_string(), vec![streamed_xml("@v")], ())
+            .await
+            .unwrap();
+        client.write_streamed_chunk(b"<").await.unwrap();
+
+        let error = client.write_streamed_null().unwrap_err();
+        assert!(matches!(error, UsageError(_)));
+        client.end_streamed_param().await.unwrap();
+
+        let payload = reassemble_sent(&sent.lock().unwrap());
+        let pos = find_last(&payload, &PLP_UNKNOWN_LEN_BYTES).unwrap();
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&2u32.to_le_bytes());
+        expected.extend_from_slice(&[0xFF, 0xFE]);
+        expected.extend_from_slice(&1u32.to_le_bytes());
+        expected.push(b'<');
         expected.extend_from_slice(&PLP_TERMINATOR_BYTES);
         assert_eq!(
             &payload[pos + PLP_UNKNOWN_LEN_BYTES.len()..],
