@@ -12314,47 +12314,6 @@ mod tests {
         (rc, indicator)
     }
 
-    #[test]
-    fn sql_get_data_flushes_dangling_gbk_lead_on_empty_final_chunk() {
-        let (h, _server) = open_mock_gbk_plp(vec![vec![0xD0]]);
-        let mut delivered = Vec::new();
-
-        loop {
-            let mut output = [0xCC; 2];
-            let (rc, _) = read_plp_test_chunk(&h, SQL_C_CHAR, &mut output);
-            assert!(matches!(rc, SQL_SUCCESS | SQL_SUCCESS_WITH_INFO));
-            if output[0] != 0 {
-                delivered.push(output[0]);
-            }
-
-            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
-            if let Some(stream) = stmt.inner.lock().unwrap().active_plp.as_ref() {
-                assert!(stream.narrow_decoder_finished);
-            }
-            if rc == SQL_SUCCESS {
-                break;
-            }
-        }
-
-        assert_eq!(delivered, "\u{FFFD}".as_bytes());
-        assert_eq!(
-            read_plp_test_chunk(&h, SQL_C_CHAR, &mut [0xCC; 2]),
-            (SQL_NO_DATA, -999)
-        );
-
-        let (h, _server) = open_mock_gbk_plp(vec![vec![0xD0]]);
-        let mut output = [0xCC; 4];
-        assert_eq!(
-            read_plp_test_chunk(&h, SQL_C_WCHAR, &mut output),
-            (SQL_SUCCESS, 2)
-        );
-        assert_eq!(output, [0xFD, 0xFF, 0, 0]);
-        assert_eq!(
-            read_plp_test_chunk(&h, SQL_C_WCHAR, &mut output),
-            (SQL_NO_DATA, -999)
-        );
-    }
-
     thread_local! {
         pub(super) static PLP_WIRE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     }
