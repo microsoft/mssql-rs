@@ -368,7 +368,7 @@ fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn
             // are all in, so the RPC cannot be opened yet: park the sequence
             // with no request in flight and run the execute from the last
             // `SQLParamData`, once every value can be built (AB#47590).
-            if dae_params.iter().any(|param| param.plan.is_buffered()) {
+            if dae_params.iter().any(|param| param.is_buffered()) {
                 return park_deferred_dae(
                     stmt,
                     client,
@@ -2283,10 +2283,7 @@ mod tests {
             let expected = ((!changed).then_some(id), changed.then_some(id));
             assert_eq!((execution.prepared.stmt.id(), execution.orphaned), expected);
             assert_eq!(
-                execution
-                    .dae_params
-                    .iter()
-                    .any(|param| param.plan.is_buffered()),
+                execution.dae_params.iter().any(|param| param.is_buffered()),
                 deferred
             );
             let client = tds_client_from_tokens(Vec::new());

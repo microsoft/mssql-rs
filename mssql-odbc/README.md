@@ -66,10 +66,14 @@ Character input is transcoded incrementally when its application and wire
 encodings differ. XML uses UTF-16LE on the wire and is normalized to exactly one
 leading byte-order mark; CLR UDT chunks remain their opaque serialized bytes.
 
-Streaming keeps peak memory bounded by the active conversion and packet buffers,
-but validation that depends on the completed value can occur during
-`SQLPutData` or when `SQLParamData` closes the parameter rather than at bind
-time.
+Streaming keeps peak memory bounded by the active conversion and packet buffers
+when every remaining DAE parameter is streamable. Bind order is observable in a
+mixed sequence: a streamable parameter before a fixed-width or otherwise
+buffered parameter is collected whole until that later parameter is available,
+because `SQLParamData` tokens must remain in bind order. Once no buffered
+parameters remain, subsequent PLP values stream normally. Validation that
+depends on the completed value can occur during `SQLPutData` or when
+`SQLParamData` closes the parameter rather than at bind time.
 
 ## Platform artifacts
 

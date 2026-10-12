@@ -342,7 +342,7 @@ unsafe fn sql_put_data_safe(
 
         let Some(will_buffer) = dae
             .current_param()
-            .map(|param| param.plan.is_buffered() || dae.deferred)
+            .map(|param| param.is_buffered() || dae.deferred)
         else {
             error!("SQLPutData: open data-at-execution parameter has no plan");
             post_diag(&mut stmt_state, ERR_FUNCTION_SEQUENCE);
@@ -916,19 +916,14 @@ mod tests {
 
     #[test]
     fn plp_targets_do_not_retain_the_supplied_chunk() {
-        use mssql_tds::datatypes::sql_udt::UdtTypeName;
-        use mssql_tds::message::parameters::rpc_parameters::StreamedSqlType;
-
-        for (c_type, sql_type, plan) in [
+        for (c_type, sql_type) in [
             (
                 crate::api::odbc_types::SQL_C_WCHAR,
                 crate::api::odbc_types::SQL_SS_XML,
-                StreamedSqlType::Xml,
             ),
             (
                 crate::api::odbc_types::SQL_C_BINARY,
                 crate::api::odbc_types::SQL_SS_UDT,
-                StreamedSqlType::Udt(UdtTypeName::new(None, None, "hierarchyid".to_string())),
             ),
         ] {
             let h = TestHandles::with_env_dbc_stmt();
@@ -936,7 +931,7 @@ mod tests {
             {
                 let mut param = DaeParam::unbounded(0, std::ptr::null_mut(), None)
                     .with_binding_types(c_type, sql_type);
-                param.plan = crate::conversion::param_convert::DaePlan::Stream(plan);
+                param.set_buffered(false);
                 let mut state = stmt.inner.lock().unwrap();
                 state.dae = Some(DaeState::for_test(vec![param], Some(0)));
             }

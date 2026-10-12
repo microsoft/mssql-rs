@@ -145,7 +145,7 @@ pub(super) fn park_dae_client(
     // (AB#47590).
     let collation = client.get_collation();
     for param in &mut dae_params {
-        if !param.plan.is_buffered() {
+        if !param.is_buffered() {
             let transcode =
                 DaeTranscode::new(param.binding.c_type, param.binding.sql_type, collation);
             // A pairing whose buffer bytes already are the wire's bytes keeps
@@ -978,14 +978,7 @@ pub(super) unsafe fn build_named_params_for_row(
                 parameter: i + 1,
                 source,
             })?;
-            dae_params.push(DaeParam::new(
-                i,
-                dae_expected_length(indicator),
-                plan.clone(),
-                length_limit,
-                bound_param,
-                snapshot.udt_names.clone(),
-            ));
+            let buffered = plan.is_buffered();
             // Nothing to declare for a buffered parameter yet: its bytes are
             // not in, so its type and length are not known. The slot is filled
             // to keep parameter positions lined up and is rebuilt by
@@ -1033,6 +1026,14 @@ pub(super) unsafe fn build_named_params_for_row(
                 }
             };
             params.push(rpc);
+            dae_params.push(DaeParam::new(
+                i,
+                dae_expected_length(indicator),
+                buffered,
+                length_limit,
+                bound_param,
+                snapshot.udt_names.clone(),
+            ));
         } else {
             if bound_param.sql_type == SQL_SS_XML
                 && !parameter_column_size_is_valid(bound_param.sql_type, bound_param.column_size)
@@ -2715,7 +2716,7 @@ mod tests {
                 state.bound_params = vec![snap(param)];
                 let built = unsafe { build_named_params(&mut state, 1, 0, "test") }.unwrap();
                 assert_eq!(built.dae_params.len(), 1);
-                assert_eq!(built.dae_params[0].plan, plan);
+                assert_eq!(built.dae_params[0].is_buffered(), plan.is_buffered());
                 assert_eq!(
                     rpc_parameter_status(&built.params[0]).bits(),
                     expected.bits(),
@@ -2898,7 +2899,7 @@ mod tests {
         use crate::api::odbc_types::SQL_DECIMAL;
 
         let mut param = DaeParam::unbounded(bound_index, std::ptr::null_mut(), None);
-        param.plan = DaePlan::Buffer;
+        param.set_buffered(true);
         param.binding.c_type = SQL_C_CHAR;
         param.binding.sql_type = SQL_DECIMAL;
         param.binding.column_size = 5;
@@ -3016,6 +3017,38 @@ mod tests {
 
         assert_eq!(result.unwrap_err(), SQL_ERROR);
         assert!(!state.diag_records.is_empty());
+    }
+
+    #[test]
+    fn rebuild_deferred_params_revalidates_oversized_xml() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let mut state = stmt.inner.lock().unwrap();
+        let mut param = DaeParam::unbounded(0, std::ptr::null_mut(), None)
+            .with_binding_types(SQL_C_CHAR, SQL_SS_XML);
+        param.binding.column_size = 4001;
+        let dae_params = [param];
+
+        let result = rebuild_deferred_params(
+            &mut state,
+            vec![deferred_slot()],
+            &[(0, b"<x/>".to_vec(), false)],
+            &dae_params,
+            "test",
+        );
+
+        assert_eq!(result.unwrap_err(), SQL_ERROR);
+        assert_eq!(state.diag_records[0].sql_state, SQLSTATE_HY104);
+
+        state.diag_records.clear();
+        let null_result = rebuild_deferred_params(
+            &mut state,
+            vec![deferred_slot()],
+            &[(0, Vec::new(), true)],
+            &dae_params,
+            "test",
+        );
+        assert!(null_result.is_ok(), "a DAE NULL has no materialized value");
     }
 
     /// `SQL_LEN_DATA_AT_EXEC(n)` promises `n` bytes, which the closing
