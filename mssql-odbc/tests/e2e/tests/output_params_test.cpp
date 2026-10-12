@@ -92,6 +92,24 @@ TEST_F(OutputParamsTest, ResetBindingsDiscardsPendingWrites) {
     EXPECT_EQ(-1, length);
 }
 
+TEST_F(OutputParamsTest, NonAsciiCharacterOutputUsesNativeClientEncoding) {
+    ExecDirect("CREATE PROCEDURE #native_output @v nvarchar(16) OUTPUT AS "
+               "SET NOCOUNT ON; SET @v=NCHAR(233)+NCHAR(8364)+NCHAR(241)");
+    const auto expected = ODBCTestUtils::Utf8ToNativeClient("\xC3\xA9\xE2\x82\xAC\xC3\xB1");
+    std::array<SQLCHAR, 64> output;
+    output.fill(0xCC);
+    SQLLEN length = -99;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_OUTPUT, SQL_C_CHAR,
+                                  SQL_WVARCHAR, 16, 0, output.data(),
+                                  output.size(), &length),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(SQL_NO_DATA, Exhaust(Direct("{call #native_output(?)}")));
+    ASSERT_EQ(static_cast<SQLLEN>(expected.size()), length);
+    EXPECT_EQ(expected, std::string(reinterpret_cast<const char*>(output.data()), expected.size()));
+    EXPECT_EQ(0, output[expected.size()]);
+    EXPECT_EQ(0xCC, output[expected.size() + 1]);
+}
+
 TEST_F(OutputParamsTest, RebindingRedirectsPendingWrites) {
     ExecDirect("CREATE PROCEDURE #outputs @v int OUTPUT AS "
                "SET NOCOUNT ON; SELECT 1; SET @v=73");

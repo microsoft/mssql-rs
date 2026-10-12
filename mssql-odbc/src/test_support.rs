@@ -112,6 +112,13 @@ impl TestHandles {
             SQL_SUCCESS
         );
         assert!(!dbc.is_null());
+        // Conversion tests choose their encoding explicitly, independent of the
+        // host locale. Native defaults are exercised by the allocation/e2e tests.
+        unsafe { handle_from_raw::<DbcHandle>(dbc) }
+            .inner
+            .lock()
+            .unwrap()
+            .client_encoding = crate::conversion::client_encoding::ClientEncoding::UTF8;
         h.dbc = dbc;
         h
     }
