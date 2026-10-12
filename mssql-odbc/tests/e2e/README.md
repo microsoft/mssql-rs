@@ -475,14 +475,27 @@ add_odbc_test(my_feature_test  tests/my_feature_test.cpp)
 cmake --build build && ctest --test-dir build --output-on-failure
 ```
 
-### 4. Optional: also run it multithreaded
+### 4. Write it with `ODBC_TEST_F` so it also runs multithreaded
 
-Write the test with `ODBC_TEST_F` instead of `TEST_F` (include
+Write new behavioral tests with `ODBC_TEST_F` instead of `TEST_F` (include
 `odbc_concurrent_test.h`). The body is unchanged; the macro registers the
 single-threaded test plus `/CrossThread`, `/SharedEnv`, and `/SharedStmt`
 variants that run it across threads. `ODBC_TEST_F_MODES(..., odbc_concurrency::kAllModes)`
 adds `/SharedDbc`. Use `Worker()`, `Iteration()`, and `WorkerToken()` for
 values that must differ per run.
+
+Keep `TEST_F`, or pick the safe modes with `ODBC_TEST_F_MODES`, only when the
+test:
+
+- changes ENV, pooling, or other process-wide state;
+- tests connect, disconnect, or driver loading;
+- creates fixed-name permanent objects;
+- frees or replaces `stmt_` or `dbc_` in the body; or
+- relies on `HasFatalFailure()` (concurrent workers capture failures per
+  thread, so it cannot see them).
+
+The rule and the `/SharedDbc` conditions are in
+`.github/instructions/mssql-odbc.instructions.md` §10.
 
 ```bash
 # 8 threads x 20 iterations, only the multithreaded variants
@@ -494,8 +507,9 @@ MSSQL_ODBC_MT_THREADS=8 MSSQL_ODBC_MT_ITERS=20 \
 `MSSQL_ODBC_MT_ITERS` (default 1) how many times each runs the body, and
 `MSSQL_ODBC_MT_TIMEOUT_SECONDS` (default 300) the hang watchdog. On a hang the
 watchdog writes a minidump on Windows (to `MSSQL_ODBC_MT_DUMP_DIR`, default the
-working directory) or aborts for a core dump elsewhere; it leaves a process
-under a debugger alone. Which tests can use which mode, and why, is in
+working directory) or aborts for a core dump elsewhere. It leaves a process
+alone when a debugger is attached or when it cannot tell (detection covers
+Windows, Linux, and macOS). Which tests can use which mode, and why, is in
 [multithreaded-testing-plan.md](../../docs/multithreaded-testing-plan.md).
 
 ## How It Works

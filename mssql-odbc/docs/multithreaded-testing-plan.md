@@ -168,7 +168,7 @@ another. With `THREADS=3`, `ITERS=2`:
 | Mode | `THREADS=3` means | Body runs | `Worker()`, `Iteration()` |
 |---|---|---|---|
 | `Single` | ignored | 1 | 0, 0 |
-| `CrossThread` | ignored (always 3 threads, one after another) | 1 | 0, 0 |
+| `CrossThread` | ignored (always 3 threads, all alive, taking turns) | 1 | 0, 0 |
 | `SharedEnv`, `SharedDbc` | 3 workers in parallel | 3 × 2 = 6, at most 3 at once | (0..2, 0..1) |
 | `SharedStmt` | 1 owner + 2 observers | 2, one after another | (0, 0..1) |
 
@@ -211,8 +211,9 @@ MSSQL_ODBC_MT_THREADS=8 MSSQL_ODBC_MT_ITERS=20 \
   `CrossThread body thread`. The first failure stops all workers.
 - On a hang the watchdog prints each worker's completed iterations, then
   writes a minidump of every thread and exits with 124 on Windows, or calls
-  `abort()` for a core dump elsewhere. It leaves a process under a debugger
-  alone.
+  `abort()` for a core dump elsewhere. It leaves a process alone when a
+  debugger is attached (detected on Windows, Linux, and macOS) or when it
+  cannot tell.
 - To tell a race from a plain bug, filter one variant and set
   `MSSQL_ODBC_MT_THREADS=1 MSSQL_ODBC_MT_ITERS=1`.
 - Use a conditional breakpoint such as `Worker()==3` when several workers run

@@ -57,8 +57,12 @@
 
 #include <gtest/gtest-spi.h>
 
-#ifdef _WIN32
+#if defined(_WIN32)
 #include <dbghelp.h>
+#elif defined(__APPLE__)
+#include <sys/sysctl.h>
+#include <sys/types.h>
+#include <unistd.h>
 #endif
 
 #include <algorithm>
@@ -69,6 +73,7 @@
 #include <condition_variable>
 #include <cstdlib>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -204,25 +209,39 @@ class StartGate {
 //            so an abort() there leaves nothing to inspect.
 //   Others   abort(), so the OS writes a core file when core dumps are enabled.
 // A process under a debugger is never terminated: sitting at a breakpoint for
-// longer than the timeout is not a hang.
+// longer than the timeout is not a hang. Nor is one whose debugger status
+// cannot be determined (detection exists for Windows, Linux, and macOS).
 //
 // Env: MSSQL_ODBC_MT_DUMP_DIR  directory for the Windows minidump (default:
 //      the working directory).
 
-inline bool DebuggerAttached() {
+enum class DebuggerState { kAbsent, kAttached, kUnknown };
+
+inline DebuggerState QueryDebugger() {
 #if defined(_WIN32)
-    return IsDebuggerPresent() != FALSE;
+    return IsDebuggerPresent() != FALSE ? DebuggerState::kAttached : DebuggerState::kAbsent;
 #elif defined(__linux__)
     std::ifstream status("/proc/self/status");
     std::string line;
     while (std::getline(status, line)) {
         if (line.rfind("TracerPid:", 0) == 0) {
-            return std::strtol(line.c_str() + 10, nullptr, 10) != 0;
+            return std::strtol(line.c_str() + 10, nullptr, 10) != 0 ? DebuggerState::kAttached
+                                                                    : DebuggerState::kAbsent;
         }
     }
-    return false;
+    return DebuggerState::kUnknown;
+#elif defined(__APPLE__)
+    // Apple Technical Q&A QA1361: the kernel marks a traced process P_TRACED.
+    int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, static_cast<int>(getpid())};
+    struct kinfo_proc info = {};
+    size_t size = sizeof(info);
+    if (sysctl(mib, 4, &info, &size, nullptr, 0) != 0) {
+        return DebuggerState::kUnknown;
+    }
+    return (info.kp_proc.p_flag & P_TRACED) != 0 ? DebuggerState::kAttached
+                                                 : DebuggerState::kAbsent;
 #else
-    return false;
+    return DebuggerState::kUnknown;
 #endif
 }
 
@@ -269,9 +288,13 @@ class Watchdog {
               if (cv_.wait_for(lock, timeout, [this] { return stopped_; })) {
                   return;
               }
-              if (DebuggerAttached()) {
-                  std::cerr << label << ": watchdog expired after " << timeout.count()
-                            << "s with a debugger attached; not terminating.\n";
+              const DebuggerState debugger = QueryDebugger();
+              if (debugger != DebuggerState::kAbsent) {
+                  std::cerr << label << ": watchdog expired after " << timeout.count() << "s "
+                            << (debugger == DebuggerState::kAttached
+                                    ? "with a debugger attached"
+                                    : "and cannot tell whether a debugger is attached")
+                            << "; not terminating.\n";
                   cv_.wait(lock, [this] { return stopped_; });
                   return;
               }
@@ -534,6 +557,11 @@ void RunConcurrent(T& coordinator, Mode mode, const char* name) {
         for (std::thread& worker : workers) {
             worker.join();
         }
+        // Still under the watchdog: a defect that leaves the DBC locked would
+        // otherwise hang here with no dump.
+        if (mode == kSharedDbc) {
+            VerifyConnectionIdle(dbc);
+        }
     }
     const long long elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                      std::chrono::steady_clock::now() - started)
@@ -552,9 +580,6 @@ void RunConcurrent(T& coordinator, Mode mode, const char* name) {
     std::cout << label << " completed: iterations=" << completed << " conflicts=" << conflicts
               << " elapsed_ms=" << elapsed_ms << std::endl;
 
-    if (mode == kSharedDbc) {
-        VerifyConnectionIdle(dbc);
-    }
     if (::testing::Test::HasFailure() || ::testing::Test::IsSkipped()) {
         return;
     }
@@ -568,6 +593,9 @@ void RunConcurrent(T& coordinator, Mode mode, const char* name) {
 
 // CrossThread: handles are allocated on one thread, used on a second, and freed
 // on a third, the way thread pools, async runtimes, and finalizers move them.
+// All three threads exist before SetUp starts and outlive TearDown, so the OS
+// cannot hand a finished thread's ID to a later phase and let a driver's
+// affinity check pass by accident. The phases still run one at a time.
 template <typename T>
 void RunCrossThread(Mode mode, const char* name) {
     const Config config = LoadConfig();
@@ -578,20 +606,42 @@ void RunCrossThread(Mode mode, const char* name) {
     Watchdog watchdog(label, std::chrono::seconds(config.timeout_seconds), progress);
 
     std::unique_ptr<T> test(new T(mode));
-    std::thread([&] {
-        SCOPED_TRACE("CrossThread SetUp thread");
-        test->ConcurrentSetUp(SQL_NULL_HENV, SQL_NULL_HDBC, 0, 0);
-    }).join();
-    if (!::testing::Test::HasFatalFailure() && !::testing::Test::IsSkipped()) {
-        std::thread([&] {
-            SCOPED_TRACE("CrossThread body thread");
-            test->ConcurrentBody();
-        }).join();
+    std::mutex mutex;
+    std::condition_variable cv;
+    int phase = 0;
+    constexpr int kDone = 3;
+    // Each phase thread waits for its turn, runs, passes the turn on, and then
+    // stays alive until the last phase has finished.
+    const auto phase_thread = [&](int turn, const char* role, std::function<void()> work) {
+        return std::thread([&, turn, role, work] {
+            std::unique_lock<std::mutex> lock(mutex);
+            cv.wait(lock, [&] { return phase == turn; });
+            lock.unlock();
+            {
+                SCOPED_TRACE(role);
+                work();
+            }
+            lock.lock();
+            ++phase;
+            cv.notify_all();
+            cv.wait(lock, [&] { return phase == kDone; });
+        });
+    };
+    std::thread threads[] = {
+        phase_thread(0, "CrossThread SetUp thread",
+                     [&] { test->ConcurrentSetUp(SQL_NULL_HENV, SQL_NULL_HDBC, 0, 0); }),
+        phase_thread(1, "CrossThread body thread",
+                     [&] {
+                         if (!::testing::Test::HasFatalFailure() &&
+                             !::testing::Test::IsSkipped()) {
+                             test->ConcurrentBody();
+                         }
+                     }),
+        phase_thread(2, "CrossThread TearDown thread", [&] { test->ConcurrentTearDown(); }),
+    };
+    for (std::thread& thread : threads) {
+        thread.join();
     }
-    std::thread([&] {
-        SCOPED_TRACE("CrossThread TearDown thread");
-        test->ConcurrentTearDown();
-    }).join();
     progress[0].store(1);
 }
 
