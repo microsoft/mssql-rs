@@ -2409,7 +2409,8 @@ protected:
     // Sets the UDT identity on the IPD. That is one of two sources for the
     // type name; the other is SQLDescribeParam's `suggested_user_type_*`
     // columns, which the tests below exercise separately.
-    SQLRETURN SetUdtName(const std::string& type_name, const std::string& schema = "") {
+    SQLRETURN SetUdtName(const std::string& type_name, const std::string& schema = "",
+                         SQLSMALLINT record = 1) {
         SQLHDESC ipd = nullptr;
         SQLRETURN rc = SQLGetStmtAttr(stmt_, SQL_ATTR_IMP_PARAM_DESC, &ipd, 0, nullptr);
         if (!SQL_SUCCEEDED(rc)) {
@@ -2417,14 +2418,14 @@ protected:
         }
         if (!schema.empty()) {
             SqlTString s = ODBCTestUtils::ToSqlTStr(schema);
-            rc = SQLSetDescField(ipd, 1, SQL_CA_SS_UDT_SCHEMA_NAME,
+            rc = SQLSetDescField(ipd, record, SQL_CA_SS_UDT_SCHEMA_NAME,
                                  const_cast<SQLTCHAR*>(s.c_str()), SQL_NTS);
             if (!SQL_SUCCEEDED(rc)) {
                 return rc;
             }
         }
         SqlTString t = ODBCTestUtils::ToSqlTStr(type_name);
-        return SQLSetDescField(ipd, 1, SQL_CA_SS_UDT_TYPE_NAME,
+        return SQLSetDescField(ipd, record, SQL_CA_SS_UDT_TYPE_NAME,
                                const_cast<SQLTCHAR*>(t.c_str()), SQL_NTS);
     }
 
@@ -2962,6 +2963,60 @@ TEST_F(UdtParamLiveTest, AUdtParameterCanBeSuppliedAtExecution) {
                   stmt_);
     EXPECT_STREQ("/3/", reinterpret_cast<const char*>(buf));
     EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+}
+
+TEST_F(UdtParamLiveTest, DataAtExecutionOverflowingColumnSizeIsRejected) {
+    std::vector<SQLCHAR> payload = SerializedHierarchyId("/1/2/3/4/");
+    ASSERT_GT(payload.size(), 1u);
+
+    ASSERT_SQL_OK(Prepare("SELECT CAST(? AS hierarchyid).ToString()"), SQL_HANDLE_STMT, stmt_);
+    SQLCHAR token = 0;
+    indicator_ = SQL_DATA_AT_EXEC;
+    const SQLULEN too_small = static_cast<SQLULEN>(payload.size() - 1);
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_BINARY, SQL_SS_UDT, too_small,
+                                   0, &token, 0, &indicator_),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SetUdtName("hierarchyid"), SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_EQ(SQL_NEED_DATA, SQLExecute(stmt_));
+    SQLPOINTER returned = nullptr;
+    ASSERT_EQ(SQL_NEED_DATA, SQLParamData(stmt_, &returned));
+    EXPECT_EQ(SQL_ERROR,
+              SQLPutData(stmt_, payload.data(), static_cast<SQLLEN>(payload.size())));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "22001");
+}
+
+// Benefits-from-mock-tds: assert the materialized hierarchyid stays ahead of
+// the streamed geometry and each ordinal's UDT TYPE_INFO carries its own name.
+TEST_F(UdtParamLiveTest, MaterializedAndStreamedUdtParametersKeepTheirOwnNames) {
+    std::vector<SQLCHAR> hierarchyid = SerializedHierarchyId("/1/");
+    std::vector<SQLCHAR> geometry = SerializedGeometry("POINT (3 4)");
+    ASSERT_FALSE(hierarchyid.empty());
+    ASSERT_FALSE(geometry.empty());
+
+    ASSERT_SQL_OK(Prepare("SELECT CAST(? AS hierarchyid).ToString()"
+                          " + '|' + CAST(? AS geometry).STAsText()"),
+                  SQL_HANDLE_STMT, stmt_);
+    SQLLEN hierarchyidLen = static_cast<SQLLEN>(hierarchyid.size());
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_BINARY, SQL_SS_UDT, 0, 0,
+                                   hierarchyid.data(), hierarchyidLen, &hierarchyidLen),
+                  SQL_HANDLE_STMT, stmt_);
+    SQLCHAR token = 0;
+    SQLLEN geometryInd = SQL_DATA_AT_EXEC;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 2, SQL_PARAM_INPUT, SQL_C_BINARY, SQL_SS_UDT, 0, 0,
+                                   &token, 0, &geometryInd),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SetUdtName("hierarchyid", "", 1), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SetUdtName("geometry", "", 2), SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_EQ(SQL_NEED_DATA, SQLExecute(stmt_));
+    SQLPOINTER returned = nullptr;
+    ASSERT_EQ(SQL_NEED_DATA, SQLParamData(stmt_, &returned));
+    EXPECT_EQ(&token, returned);
+    ASSERT_SQL_OK(SQLPutData(stmt_, geometry.data(), static_cast<SQLLEN>(geometry.size())),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLParamData(stmt_, &returned), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("/1/|POINT (3 4)", ReadBack());
 }
 
 // Benefits-from-mock-tds: assert the large geometry payload is emitted as
