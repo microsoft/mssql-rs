@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+use mssql_tds::core::TdsResult;
 use mssql_tds::datatypes::sql_tvp::{TvpColumnDef, TvpTableData, TvpTypeName};
 use mssql_tds::datatypes::sqldatatypes::VectorBaseType;
 use mssql_tds::datatypes::sqltypes::SqlType;
@@ -9,7 +10,7 @@ use pyo3::exceptions::{PyKeyError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
 
-use crate::types::{ParameterHint, null_sql_type, py_to_sql_type, py_to_sql_type_with_hint};
+use crate::types::{ParameterHint, py_to_sql_type, py_to_sql_type_with_hint, tvp_column_sql_type};
 
 /// Comparable SQL declaration metadata used to decide whether a prepared
 /// statement can be reused with a new set of bound values.
@@ -291,12 +292,10 @@ fn build_tvp_table(columns: &Bound<'_, PyAny>, rows: &Bound<'_, PyAny>) -> PyRes
                 "TVP columns do not support UDT, TEXT, or NTEXT input types",
             ));
         }
-        let mut column = TvpColumnDef::new(
-            null_sql_type(*hint).map_err(|error| PyValueError::new_err(error.to_string()))?,
+        column_defs.push(
+            tvp_column_definition(*hint)
+                .map_err(|error| PyValueError::new_err(error.to_string()))?,
         );
-        column.precision = hint.precision();
-        column.scale = hint.scale();
-        column_defs.push(column);
     }
 
     let mut converted_rows = Vec::new();
@@ -314,14 +313,25 @@ fn build_tvp_table(columns: &Bound<'_, PyAny>, rows: &Bound<'_, PyAny>) -> PyRes
             .iter()
             .zip(&hints)
             .map(|(cell, hint)| {
-                py_to_sql_type_with_hint(cell, *hint)
-                    .map_err(|error| PyTypeError::new_err(error.to_string()))
+                if cell.is_none() {
+                    tvp_column_sql_type(*hint)
+                } else {
+                    py_to_sql_type_with_hint(cell, *hint)
+                }
+                .map_err(|error| PyTypeError::new_err(error.to_string()))
             })
             .collect::<PyResult<Vec<_>>>()?;
         converted_rows.push(converted);
     }
 
     Ok(TvpTableData::new(column_defs, converted_rows))
+}
+
+fn tvp_column_definition(hint: ParameterHint) -> TdsResult<TvpColumnDef> {
+    let mut column = TvpColumnDef::new(tvp_column_sql_type(hint)?);
+    column.precision = hint.precision();
+    column.scale = hint.scale();
+    Ok(column)
 }
 
 /// Lexer state for [`rewrite_placeholders`].
@@ -803,7 +813,37 @@ fn rewrite_placeholders(sql: &str, named: bool) -> PyResult<(String, Vec<Placeho
 
 #[cfg(test)]
 mod tests {
-    use super::rewrite_placeholders;
+    use super::{rewrite_placeholders, tvp_column_definition};
+    use crate::types::ParameterHint;
+    use mssql_tds::datatypes::sqltypes::SqlType;
+
+    #[test]
+    fn tvp_column_definitions_preserve_numeric_and_temporal_metadata() {
+        let decimal = tvp_column_definition(ParameterHint::new(3, 12, 2).unwrap()).unwrap();
+        assert!(matches!(decimal.column_type, SqlType::Decimal(None)));
+        assert_eq!(decimal.precision, Some(12));
+        assert_eq!(decimal.scale, Some(2));
+
+        let numeric = tvp_column_definition(ParameterHint::new(2, 38, 10).unwrap()).unwrap();
+        assert!(matches!(numeric.column_type, SqlType::Numeric(None)));
+        assert_eq!(numeric.precision, Some(38));
+        assert_eq!(numeric.scale, Some(10));
+
+        for (sql_type, expected) in [
+            (92, SqlType::Time(None)),
+            (93, SqlType::DateTime2(None)),
+            (-155, SqlType::DateTimeOffset(None)),
+        ] {
+            let temporal =
+                tvp_column_definition(ParameterHint::new(sql_type, 0, 3).unwrap()).unwrap();
+            assert_eq!(
+                std::mem::discriminant(&temporal.column_type),
+                std::mem::discriminant(&expected)
+            );
+            assert_eq!(temporal.precision, None);
+            assert_eq!(temporal.scale, Some(3));
+        }
+    }
 
     #[test]
     fn rewrites_only_executable_qmarks() {
