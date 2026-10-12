@@ -76,13 +76,16 @@ ODBC_TEST_F_MODES(GetDataLiveTest, EachRunReadsItsOwnValue,
 |---|---|---|---|
 | `Single` | The body once, on the main thread | As `TEST_F` | - |
 | `CrossThread` | SetUp, body, and TearDown on three different threads | As `TEST_F`; catches thread affinity (handles move between threads in pools, async runtimes, and finalizers) | - |
-| `SharedEnv` | `THREADS` workers x `ITERS` runs; shared ENV, own DBC and STMT | Every run passes | Tests that change ENV, pooling, or process state; connect, disconnect, or driver-load tests; fixed-name permanent objects |
-| `SharedDbc` (opt-in via `ODBC_TEST_F_MODES` with `kAllModes`) | `THREADS` workers x `ITERS` runs; shared DBC, own STMT | Only `HY000` connection busy may fail, and is retried; the connection is idle afterward | As `SharedEnv`, plus connection-attribute or transaction changes, shared temp-object names, bodies unsafe to rerun, reliance on `HasFatalFailure()` |
-| `SharedStmt` | Owner runs the body `ITERS` times; `THREADS - 1` observers read its STMT and DBC diagnostics | Owner as `Single`; every record well formed | Bodies that free or replace `stmt_` or `dbc_` |
+| `SharedEnv` | `THREADS` workers x `ITERS` runs; shared ENV, own DBC and STMT | Every run passes | Tests that change ENV, pooling, or process state; connect, disconnect, or driver-load tests; fixed-name permanent objects; reliance on `HasFatalFailure()` |
+| `SharedDbc` (opt-in via `ODBC_TEST_F_MODES` with `kAllModes`) | `THREADS` workers x `ITERS` runs; shared DBC, own STMT | Only `HY000` connection busy may fail, and is retried; the connection is idle afterward | As `SharedEnv`, plus connection-attribute or transaction changes, shared temp-object names, bodies unsafe to rerun |
+| `SharedStmt` | Owner runs the body `ITERS` times; `THREADS - 1` observers read its STMT and DBC diagnostics | Owner as `Single`; observers read in every iteration; every record well formed | Bodies that free or replace `stmt_` or `dbc_` |
 
-- `SharedDbc` intercepts failures per thread to classify busy errors, so
-  `HasFatalFailure()` in the body does not see them; they are re-reported with
-  their original file and line.
+- gtest keeps one result per test, not per thread. `SharedEnv` and `SharedDbc`
+  therefore capture each run's failures on its own thread (and `SharedDbc`
+  classifies busy errors), so one worker's failure or skip cannot stop another,
+  and `HasFatalFailure()` in the body does not see them. They are re-reported
+  with their original file and line. `SharedStmt` observers hand their first
+  error to the main thread, which reports it after joining.
 - `SharedStmt` observers call only `SQLGetDiagRec` and `SQLGetDiagField`. Every
   other call clears the owner's diagnostics, and an idle `SQLCancel` also
   aborts msodbcsql's open cursor. Cross-thread cancel gets its own test
@@ -156,12 +159,7 @@ flowchart LR
 ```
 
 Each run in a concurrent mode is one fresh fixture (`CrossThread` borrows
-nothing and allocates all its own handles):
-
-```mermaid
-flowchart LR
-    new["new fixture"] --> lend["LendHandles<br/>(shared ENV / DBC)"] --> setup["SetUp + Connect<br/>(only unshared handles)"] --> body["test body<br/>Worker(), Iteration()"] --> tear["TearDown<br/>(frees only its own handles)"]
-```
+nothing and allocates all its own handles).
 
 **Threads and iterations.** `MSSQL_ODBC_MT_THREADS` is how many threads run at
 once; `MSSQL_ODBC_MT_ITERS` is how many times each runs the body, one after
@@ -257,8 +255,10 @@ Measured 2026-10-08 on both drivers unless noted.
    max-length values in small `SQLGetData` chunks; every truncated chunk fills
    the buffer, even when that splits a UTF-8 character (checked only under a
    UTF-8 client encoding), and the indicator counts down or is `SQL_NO_TOTAL`.
-   Covered for narrow and wide targets from `varchar(max)`, `nvarchar(max)`,
-   `nvarchar(n)`, `ntext`, and `xml`. Edge cases: NULL and empty values, length probes,
+   Covered for character targets from `varchar(max)`, `varchar(n)`, `text`,
+   `nvarchar(max)`, `nvarchar(n)`, `ntext`, and `xml`, and for binary targets
+   from `varbinary(max)` and `binary(n)`, which have no terminator and so fill
+   all of `BufferLength`. Edge cases: NULL and empty values, length probes,
    abandoned partial reads, mid-row cursor close, surrogate pairs across
    chunks, typed-to-character conversions, multiple results, and long row
    streams. `vector` waits for a fetch contract.
@@ -325,8 +325,8 @@ Scenarios 8 and 9 reach the driver concurrently only on unixODBC
 | Nightly | msodbcsql | 2 x 1 | All concurrent modes | Windows, Linux |
 | Weekly soak | mssql-odbc | 16 x 50 or time-bound | Same as nightly | Windows, unixODBC `Threading=0` |
 
-Measured on `get_data_test` (15 converted tests, 45 concurrent variants, local
-SQL Server):
+Measured on `get_data_test` with 16 converted tests (48 concurrent variants),
+local SQL Server:
 
 | Run | msodbcsql | mssql-odbc |
 |---|---|---|
@@ -378,7 +378,7 @@ SQL Server):
 Tracked under AB#49256:
 
 1. **AB#49257 (this PR):** the harness with all five modes; the
-   `get_data_test.cpp` pilot (five converted tests, one worker-token test, eight
+   `get_data_test.cpp` pilot (five converted tests, one worker-token test, twelve
    chunk-fill tests); empty-value, NULL, and parameterized-`THROW` tests.
 2. **AB#49263:** CTest split, PR filter, nightly and weekly profiles, dumps.
 3. **AB#49260:** fetch and GetData suites, plus worker-token tests.

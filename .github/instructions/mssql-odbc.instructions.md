@@ -477,15 +477,16 @@ on; these guarantees were verified against msodbcsql's behavior.
   concurrency coverage comes without a second copy of the test.
   - Keep `TEST_F`, or pick the safe modes with `ODBC_TEST_F_MODES`, for tests
     that change ENV, pooling, or process state, test connect, disconnect, or
-    driver loading, create fixed-name permanent objects, or free or replace
-    `stmt_` or `dbc_` in the body.
+    driver loading, create fixed-name permanent objects, free or replace
+    `stmt_` or `dbc_` in the body, or rely on `HasFatalFailure()` (concurrent
+    workers capture failures per thread, so it cannot see them).
   - Derive values from `WorkerToken()` (or `Worker()` and `Iteration()`) when a
     result delivered to the wrong connection must fail the test; constant data
     cannot detect that.
   - Opt into `/SharedDbc` with `ODBC_TEST_F_MODES(..., odbc_concurrency::kAllModes)`
     only when the body changes no connection attributes or transactions, gives
-    temporary objects per-worker names, is safe to rerun after a busy retry, and
-    does not rely on `HasFatalFailure()`. Do not opt in until CI runs that mode
+    temporary objects per-worker names, and is safe to rerun after a busy retry.
+    Do not opt in until CI runs that mode
     nightly only (AB#49263).
   - Scenarios with no single-threaded meaning (races on one STMT, handle churn,
     connect races) go under `tests/e2e/tests/multithreaded_tests/`.

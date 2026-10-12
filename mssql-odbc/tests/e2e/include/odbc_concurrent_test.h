@@ -16,14 +16,15 @@
 //                thread, so handles are allocated, used, and freed on three
 //                threads. Deterministic.
 //   SharedEnv    Workers share the test's ENV; each SetUp connects its own DBC.
-//                Failures are reported as they happen, exactly as in TEST_F.
+//                Every failure fails the test.
 //   SharedDbc    Workers share the test's DBC; each worker gets its own STMT.
 //                Without MARS a statement can find the connection busy (HY000);
 //                an iteration whose only failures are busy errors is retried.
-//                Failures are intercepted per thread and then re-reported, so
-//                HasFatalFailure() inside the body does not see them. Opt in only
-//                for bodies that create no fixed-name objects and do not depend
-//                on HasFatalFailure().
+//                Opt in only for bodies that create no fixed-name objects.
+//   (SharedEnv and SharedDbc capture each worker's failures on its own thread
+//   and re-report them with their original file and line, so HasFatalFailure()
+//   inside the body does not see them. Do not use these modes for bodies that
+//   rely on it.)
 //   SharedStmt   An owner thread runs the body on its own connection while
 //                observer threads read that STMT's and DBC's diagnostics with
 //                SQLGetDiagField and SQLGetDiagRec, the only calls that change
@@ -100,9 +101,10 @@ inline const char* ModeName(Mode mode) {
             return "SharedEnv";
         case kSharedDbc:
             return "SharedDbc";
-        default:
+        case kSharedStmt:
             return "SharedStmt";
     }
+    return "UnknownMode";
 }
 
 class WorkerScope {
@@ -392,44 +394,65 @@ struct WorkerResult {
     std::string skip_message;
 };
 
-// SharedEnv: failures reach gtest directly, so fixture semantics are unchanged.
+// Runs one iteration with its failures captured for this thread only. Workers
+// must not report into, or read, the current test's shared TestResult while
+// other workers write to it: gtest appends to it under a lock but reads it
+// (HasFailure, IsSkipped) without one.
 template <typename T>
-bool RunSharedEnvIteration(SQLHENV env, Mode mode, int worker, int iteration) {
+void RunCapturedIteration(SQLHENV env, SQLHDBC dbc, Mode mode, int worker, int iteration,
+                          const std::string& tag, ::testing::TestPartResultArray& parts,
+                          bool& statement_busy) {
+    ::testing::ScopedFakeTestPartResultReporter reporter(
+        ::testing::ScopedFakeTestPartResultReporter::INTERCEPT_ONLY_CURRENT_THREAD, &parts);
+    SCOPED_TRACE(tag);
     std::unique_ptr<T> test(new T(mode));
-    test->ConcurrentSetUp(env, SQL_NULL_HDBC, worker, iteration);
-    if (!::testing::Test::HasFatalFailure() && !::testing::Test::IsSkipped()) {
+    test->ConcurrentSetUp(env, dbc, worker, iteration);
+    bool set_up = true;
+    for (int i = 0; i < parts.size(); ++i) {
+        const ::testing::TestPartResult& part = parts.GetTestPartResult(i);
+        set_up = set_up && !part.fatally_failed() && !part.skipped();
+    }
+    if (set_up) {
         test->ConcurrentBody();
     }
+    statement_busy = StatementReportsBusy(test->ConcurrentStmt());
     test->ConcurrentTearDown();
-    return !::testing::Test::HasFailure() && !::testing::Test::IsSkipped();
 }
 
-// SharedDbc: failures are held until the iteration is classified, so a busy
-// connection can be retried instead of failing the test.
+// SharedEnv: every failure fails the iteration; nothing is retried.
+template <typename T>
+bool RunSharedEnvIteration(SQLHENV env, Mode mode, int worker, int iteration,
+                           const std::string& tag, WorkerResult& result) {
+    ::testing::TestPartResultArray parts;
+    bool statement_busy = false;
+    RunCapturedIteration<T>(env, SQL_NULL_HDBC, mode, worker, iteration, tag, parts,
+                            statement_busy);
+    bool failed = false;
+    bool skipped = false;
+    for (int i = 0; i < parts.size(); ++i) {
+        failed = failed || parts.GetTestPartResult(i).failed();
+        skipped = skipped || parts.GetTestPartResult(i).skipped();
+    }
+    if (failed) {
+        ReportFailures(parts);
+        return false;
+    }
+    if (skipped) {
+        result.skip_message = FirstMessage(parts);
+        return false;
+    }
+    return true;
+}
+
+// SharedDbc: an iteration whose only failures are a busy connection is retried
+// instead of failing the test.
 template <typename T>
 bool RunSharedDbcIteration(SQLHENV env, SQLHDBC dbc, Mode mode, int worker, int iteration,
                            const std::string& tag, WorkerResult& result) {
     for (int attempt = 0;; ++attempt) {
         ::testing::TestPartResultArray parts;
         bool statement_busy = false;
-        {
-            ::testing::ScopedFakeTestPartResultReporter reporter(
-                ::testing::ScopedFakeTestPartResultReporter::INTERCEPT_ONLY_CURRENT_THREAD,
-                &parts);
-            SCOPED_TRACE(tag);
-            std::unique_ptr<T> test(new T(mode));
-            test->ConcurrentSetUp(env, dbc, worker, iteration);
-            bool set_up = true;
-            for (int i = 0; i < parts.size(); ++i) {
-                const ::testing::TestPartResult& part = parts.GetTestPartResult(i);
-                set_up = set_up && !part.fatally_failed() && !part.skipped();
-            }
-            if (set_up) {
-                test->ConcurrentBody();
-            }
-            statement_busy = StatementReportsBusy(test->ConcurrentStmt());
-            test->ConcurrentTearDown();
-        }
+        RunCapturedIteration<T>(env, dbc, mode, worker, iteration, tag, parts, statement_busy);
         switch (Classify(parts, statement_busy)) {
             case Outcome::kClean:
                 return true;
@@ -493,8 +516,8 @@ void RunConcurrent(T& coordinator, Mode mode, const char* name) {
                                             " iteration=" + std::to_string(iteration);
                     bool ok = false;
                     if (mode == kSharedEnv) {
-                        SCOPED_TRACE(tag);
-                        ok = RunSharedEnvIteration<T>(env, mode, worker, iteration);
+                        ok = RunSharedEnvIteration<T>(env, mode, worker, iteration, tag,
+                                                      results[index]);
                     } else {
                         ok = RunSharedDbcIteration<T>(env, dbc, mode, worker, iteration, tag,
                                                       results[index]);
@@ -628,7 +651,10 @@ inline bool CheckDiagnostics(SQLSMALLINT type, SQLHANDLE handle, std::string& er
 // SharedStmt: observers read diagnostics while the owner runs the body. They
 // see the owner's handles only between SetUp and TearDown; the owner retracts
 // them under an exclusive lock, so no observer is inside a call on a handle
-// when TearDown frees it.
+// when TearDown frees it. Before retracting, the owner waits for at least one
+// observer read, so a short body cannot leave the mode observing nothing.
+// Observers keep their first error and the main thread reports it, so no
+// thread writes the test's result while the owner reads it.
 template <typename T>
 void RunSharedStmt(T& coordinator, Mode mode, const char* name) {
     const Config config = LoadConfig();
@@ -647,7 +673,10 @@ void RunSharedStmt(T& coordinator, Mode mode, const char* name) {
     std::atomic<bool> retracting{false};
     std::atomic<bool> stop{false};
     std::atomic<bool> observer_failed{false};
+    std::mutex observer_error_mutex;
+    std::string observer_error;
     std::atomic<long long> reads{0};
+    int observed_iterations = 0;
     std::vector<std::atomic<int>> progress(1);
     progress[0].store(0);
     const auto started = std::chrono::steady_clock::now();
@@ -668,10 +697,12 @@ void RunSharedStmt(T& coordinator, Mode mode, const char* name) {
                         if (observed_stmt != SQL_NULL_HSTMT) {
                             if (!CheckDiagnostics(SQL_HANDLE_STMT, observed_stmt, error) ||
                                 !CheckDiagnostics(SQL_HANDLE_DBC, observed_dbc, error)) {
-                                if (!observer_failed.exchange(true)) {
-                                    ADD_FAILURE() << label << " observer=" << observer << " "
-                                                  << error;
+                                std::lock_guard<std::mutex> guard(observer_error_mutex);
+                                if (observer_error.empty()) {
+                                    observer_error =
+                                        "observer=" + std::to_string(observer) + " " + error;
                                 }
+                                observer_failed.store(true);
                                 return;
                             }
                             reads.fetch_add(1);
@@ -687,12 +718,18 @@ void RunSharedStmt(T& coordinator, Mode mode, const char* name) {
             std::unique_ptr<T> test(new T(mode));
             test->ConcurrentSetUp(env, SQL_NULL_HDBC, 0, iteration);
             if (!::testing::Test::HasFatalFailure() && !::testing::Test::IsSkipped()) {
+                long long reads_before = 0;
                 {
                     std::unique_lock<std::shared_mutex> lock(handles_mutex);
                     observed_stmt = test->ConcurrentStmt();
                     observed_dbc = test->ConcurrentDbc();
+                    reads_before = reads.load();
                 }
                 test->ConcurrentBody();
+                while (reads.load() == reads_before && !observer_failed.load()) {
+                    std::this_thread::yield();
+                }
+                ++observed_iterations;
                 retracting.store(true);
                 {
                     std::unique_lock<std::shared_mutex> lock(handles_mutex);
@@ -703,7 +740,8 @@ void RunSharedStmt(T& coordinator, Mode mode, const char* name) {
             }
             test->ConcurrentTearDown();
             progress[0].store(iteration + 1);
-            if (::testing::Test::HasFailure() || ::testing::Test::IsSkipped()) {
+            if (::testing::Test::HasFailure() || ::testing::Test::IsSkipped() ||
+                observer_failed.load()) {
                 break;
             }
         }
@@ -718,6 +756,15 @@ void RunSharedStmt(T& coordinator, Mode mode, const char* name) {
     std::cout << label << " completed: iterations=" << progress[0].load()
               << " diagnostic_reads=" << reads.load() << " elapsed_ms=" << elapsed_ms
               << std::endl;
+
+    if (!observer_error.empty()) {
+        ADD_FAILURE() << label << " " << observer_error;
+        return;
+    }
+    if (observed_iterations > 0 && !::testing::Test::HasFailure()) {
+        EXPECT_GE(reads.load(), observed_iterations)
+            << label << ": observers did not read the owner's diagnostics every iteration";
+    }
 }
 
 }  // namespace detail
@@ -727,17 +774,19 @@ void RunTest(T& test, Mode mode, const char* name) {
     switch (mode) {
         case kSingle:
             test.ConcurrentBody();
-            break;
+            return;
         case kCrossThread:
             detail::RunCrossThread<T>(mode, name);
-            break;
+            return;
+        case kSharedEnv:
+        case kSharedDbc:
+            detail::RunConcurrent(test, mode, name);
+            return;
         case kSharedStmt:
             detail::RunSharedStmt(test, mode, name);
-            break;
-        default:
-            detail::RunConcurrent(test, mode, name);
-            break;
+            return;
     }
+    ADD_FAILURE() << name << ": unhandled mode " << static_cast<unsigned>(mode);
 }
 
 // The factory returns Fixture*, so gtest files these tests under the same

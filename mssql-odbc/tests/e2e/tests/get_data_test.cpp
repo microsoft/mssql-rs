@@ -67,14 +67,17 @@ std::vector<Unit> RepeatUnits(std::initializer_list<Unit> pattern, size_t total)
 
 // Streams 'column' through a buffer of 'buffer_units' target units and checks
 // that every truncated chunk is full, as SQLGetData specifies: BufferLength
-// minus the terminator. A short chunk loses no data, but it costs callers extra
-// round trips and breaks those that advance by BufferLength - 1 per chunk.
+// minus the terminator for character data, all of BufferLength for binary data
+// ('terminated' false). A short chunk loses no data, but it costs callers extra
+// round trips and breaks those that advance by a full chunk per call.
 // 'expected' is the whole value in target units; the indicator must count down
-// the bytes still available before each call, or be SQL_NO_TOTAL.
+// the bytes still available before each call, or be SQL_NO_TOTAL. Binary chunk
+// lengths come from 'expected', never from scanning, since zero is valid data.
 template <typename Unit>
 void ExpectEveryTruncatedChunkFull(SQLHSTMT stmt, SQLUSMALLINT column, SQLSMALLINT c_type,
-                                   const std::vector<Unit>& expected, size_t buffer_units) {
-    const size_t payload_units = buffer_units - 1;
+                                   const std::vector<Unit>& expected, size_t buffer_units,
+                                   bool terminated = true) {
+    const size_t payload_units = terminated ? buffer_units - 1 : buffer_units;
     std::vector<Unit> buffer(buffer_units);
     size_t consumed = 0;
     for (int call = 0; consumed < expected.size(); ++call) {
@@ -99,6 +102,13 @@ void ExpectEveryTruncatedChunkFull(SQLHSTMT stmt, SQLUSMALLINT column, SQLSMALLI
         // CP1252 -> SQL_C_WCHAR. Any other value must count down exactly.
         if (indicator != SQL_NO_TOTAL) {
             EXPECT_EQ(static_cast<SQLLEN>(remaining * sizeof(Unit)), indicator);
+        }
+        if (!terminated) {
+            EXPECT_TRUE(std::equal(buffer.begin(), buffer.begin() + expected_payload,
+                                   expected.begin() + static_cast<std::ptrdiff_t>(consumed)))
+                << "chunk content";
+            consumed += expected_payload;
+            continue;
         }
         const size_t length = static_cast<size_t>(
             std::find(buffer.begin(), buffer.end(), static_cast<Unit>(0)) - buffer.begin());
@@ -2747,31 +2757,83 @@ ODBC_TEST_F(GetDataLiveTest, VarcharMaxAsciiFillsEveryTruncatedCharBuffer) {
 // null-termination character", with no exception for character boundaries, and
 // the rest of the character opens the next chunk. Measured, not assumed:
 // msodbcsql 18 in a process whose ANSI code page is UTF-8 returns these exact
-// bytes for this query, as well as for VARCHAR(100) and NVARCHAR(MAX) sources.
-// Both drivers deliver SQL_C_CHAR in the client encoding, so this needs a UTF-8
-// client; in single-byte code pages such as CP1252 nothing can split.
-ODBC_TEST_F(GetDataLiveTest, VarcharMaxCp1252ToCharSplitsUtf8CharacterToFillBuffer) {
+// bytes for all three sources below. Both drivers deliver SQL_C_CHAR in the
+// client encoding, so this needs a UTF-8 client; in single-byte code pages such
+// as CP1252 nothing can split.
+ODBC_TEST_F(GetDataLiveTest, CharChunksSplitAUtf8CharacterToFillBuffer) {
     if (ODBCTestUtils::Utf8ToNativeClient("\xE2\x82\xAC") != "\xE2\x82\xAC") {
         GTEST_SKIP() << "requires a UTF-8 client encoding to split a character";
     }
+    const char* const sources[] = {
+        "SELECT REPLICATE(CAST(N'aaaaa' + NCHAR(0x20AC) "
+        "COLLATE Latin1_General_100_CI_AS AS VARCHAR(MAX)), 1000)",
+        "SELECT CAST(REPLICATE(N'aaaaa' + NCHAR(0x20AC), 10) "
+        "COLLATE Latin1_General_100_CI_AS AS VARCHAR(100))",
+        "SELECT REPLICATE(CAST(N'aaaaa' + NCHAR(0x20AC) AS NVARCHAR(MAX)), 1000)",
+    };
+    const std::string expected[] = {"aaaaa\xE2\x82", "\xAC" "aaaaa\xE2", "\x82\xAC" "aaaaa"};
+    for (const char* source : sources) {
+        SCOPED_TRACE(source);
+        ASSERT_SQL_OK(ExecDirect(source), SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+        for (const std::string& chunk : expected) {
+            SCOPED_TRACE(chunk);
+            SQLCHAR buffer[8] = {};
+            SQLLEN indicator = -1;
+            const SQLRETURN rc =
+                SQLGetData(stmt_, 1, SQL_C_CHAR, buffer, sizeof(buffer), &indicator);
+            ASSERT_EQ(SQL_SUCCESS_WITH_INFO, rc);
+            EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01004");
+            EXPECT_EQ(chunk, reinterpret_cast<const char*>(buffer));
+        }
+        SQLCloseCursor(stmt_);
+    }
+}
+
+// The non-PLP narrow paths. VARCHAR(n) arrives materialized rather than
+// streamed, and TEXT is the legacy LOB stream. ASCII, for the reason given on
+// NvarcharMaxAsciiFillsEveryTruncatedCharBuffer below.
+ODBC_TEST_F(GetDataLiveTest, VarcharFillsEveryTruncatedCharBuffer) {
+    ASSERT_SQL_OK(ExecDirect("SELECT CAST(REPLICATE('A', 8000) AS VARCHAR(8000)) AS c1"),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    ExpectEveryTruncatedChunkFull<SQLCHAR>(stmt_, 1, SQL_C_CHAR,
+                                           std::vector<SQLCHAR>(8000, 'A'), 2039);
+    SQLCloseCursor(stmt_);
+}
+
+ODBC_TEST_F(GetDataLiveTest, TextFillsEveryTruncatedCharBuffer) {
     ASSERT_SQL_OK(
-        ExecDirect("SELECT REPLICATE(CAST(N'aaaaa' + NCHAR(0x20AC) "
-                   "COLLATE Latin1_General_100_CI_AS AS VARCHAR(MAX)), 1000) AS c1"),
+        ExecDirect("SELECT CAST(REPLICATE(CAST('A' AS VARCHAR(MAX)), 24000) AS TEXT) AS c1"),
         SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    ExpectEveryTruncatedChunkFull<SQLCHAR>(stmt_, 1, SQL_C_CHAR,
+                                           std::vector<SQLCHAR>(24000, 'A'), 2039);
+    SQLCloseCursor(stmt_);
+}
 
-    const std::string expected[] = {"aaaaa\xE2\x82", "\xAC" "aaaaa\xE2", "\x82\xAC" "aaaaa"};
-    for (const std::string& chunk : expected) {
-        SCOPED_TRACE(chunk);
-        SQLCHAR buffer[8] = {};
-        SQLLEN indicator = -1;
-        const SQLRETURN rc =
-            SQLGetData(stmt_, 1, SQL_C_CHAR, buffer, sizeof(buffer), &indicator);
-        ASSERT_EQ(SQL_SUCCESS_WITH_INFO, rc);
-        EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01004");
-        EXPECT_EQ(chunk, reinterpret_cast<const char*>(buffer));
-    }
+// Binary data has no terminator, so every truncated chunk must fill all of
+// BufferLength. The pattern includes 0x00 and the helper's 0x5A sentinel, so
+// neither a zero scan nor an untouched buffer could pass by accident.
+ODBC_TEST_F(GetDataLiveTest, VarbinaryMaxFillsEveryTruncatedBinaryBuffer) {
+    ASSERT_SQL_OK(
+        ExecDirect("SELECT REPLICATE(CAST(0x00FF5A01 AS VARBINARY(MAX)), 6000) AS c1"),
+        SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    ExpectEveryTruncatedChunkFull<SQLCHAR>(
+        stmt_, 1, SQL_C_BINARY, RepeatUnits<SQLCHAR>({0x00, 0xFF, 0x5A, 0x01}, 24000), 2039,
+        /*terminated=*/false);
+    SQLCloseCursor(stmt_);
+}
 
+ODBC_TEST_F(GetDataLiveTest, BinaryFillsEveryTruncatedBinaryBuffer) {
+    ASSERT_SQL_OK(ExecDirect("SELECT CAST(REPLICATE(CAST(0x00FF5A01 AS VARBINARY(MAX)), 2000) "
+                             "AS BINARY(8000)) AS c1"),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    ExpectEveryTruncatedChunkFull<SQLCHAR>(
+        stmt_, 1, SQL_C_BINARY, RepeatUnits<SQLCHAR>({0x00, 0xFF, 0x5A, 0x01}, 8000), 1021,
+        /*terminated=*/false);
     SQLCloseCursor(stmt_);
 }
 
