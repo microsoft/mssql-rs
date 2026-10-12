@@ -23,6 +23,8 @@ use tracing_subscriber::Layer;
 use tracing_subscriber::layer::{Context, Filter};
 use tracing_subscriber::registry::LookupSpan;
 
+use crate::i18n;
+
 /// A stage of opening a connection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Stage {
@@ -63,16 +65,51 @@ impl Stage {
         }
     }
 
-    /// The stage's name in the text report.
-    pub fn title(self) -> &'static str {
+    pub fn detail_title_in(self, locale: &str) -> String {
+        i18n::tr_for_locale(locale, self.detail_title_id(), &[])
+    }
+
+    pub(crate) fn detail_title_id(self) -> &'static str {
+        match self {
+            Stage::Dns => "diagnose.stage.dns",
+            Stage::InstanceLookup => "diagnose.stage.instance_lookup",
+            Stage::Tcp => "diagnose.stage.tcp",
+            Stage::Pipe => "diagnose.stage.pipe",
+            Stage::Prelogin => "diagnose.stage.prelogin_detail",
+            Stage::Tls => "diagnose.stage.tls_detail",
+            Stage::Login => "diagnose.stage.login_detail",
+        }
+    }
+
+    /// The stage's name on its own, as an error names a stage that gave no
+    /// message of its own.
+    pub(crate) fn title_id(self) -> &'static str {
+        match self {
+            Stage::Prelogin => "diagnose.stage.prelogin",
+            Stage::Tls => "diagnose.stage.tls",
+            Stage::Login => "diagnose.stage.login",
+            _ => self.detail_title_id(),
+        }
+    }
+
+    pub(crate) fn title_english(self) -> &'static str {
+        match self {
+            Stage::Prelogin => "Pre-login",
+            Stage::Tls => "TLS handshake",
+            Stage::Login => "Login",
+            _ => self.detail_title_english(),
+        }
+    }
+
+    pub(crate) fn detail_title_english(self) -> &'static str {
         match self {
             Stage::Dns => "DNS lookup",
             Stage::InstanceLookup => "Instance lookup",
             Stage::Tcp => "TCP connect",
             Stage::Pipe => "Pipe open",
-            Stage::Prelogin => "Pre-login",
-            Stage::Tls => "TLS handshake",
-            Stage::Login => "Login",
+            Stage::Prelogin => "pre-login",
+            Stage::Tls => "TLS",
+            Stage::Login => "login",
         }
     }
 }
