@@ -97,7 +97,9 @@ addresses, and `tcpConnect` is still checked with those addresses. The report ad
   [the diagnostic coverage matrix](diagnose-coverage.md) the checks follow.
 
 Diagnose output is for review before sharing; it is never share-safe. Every
-report begins with this warning (in JSON, the top-level `sharingWarning`):
+report begins with this warning (localized in the text report,
+`diagnose.sharing.warning`; in JSON, the top-level `sharingWarning`, always in
+English):
 "Diagnostic output may contain unobfuscated server names, host names, and IP
 addresses. Review the output before sharing it." Server, instance and host
 names (the `-F` certificate name included), IP addresses, named pipe paths and
