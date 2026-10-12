@@ -3020,7 +3020,7 @@ mod tests {
     }
 
     #[test]
-    fn rebuild_deferred_params_revalidates_oversized_xml() {
+    fn rebuild_deferred_params_keeps_oversized_dae_xml_unlimited() {
         let h = TestHandles::with_env_dbc_stmt();
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let mut state = stmt.inner.lock().unwrap();
@@ -3029,26 +3029,20 @@ mod tests {
         param.binding.column_size = 4001;
         let dae_params = [param];
 
-        let result = rebuild_deferred_params(
-            &mut state,
-            vec![deferred_slot()],
-            &[(0, b"<x/>".to_vec(), false)],
-            &dae_params,
-            "test",
-        );
-
-        assert_eq!(result.unwrap_err(), SQL_ERROR);
-        assert_eq!(state.diag_records[0].sql_state, SQLSTATE_HY104);
-
-        state.diag_records.clear();
-        let null_result = rebuild_deferred_params(
-            &mut state,
-            vec![deferred_slot()],
-            &[(0, Vec::new(), true)],
-            &dae_params,
-            "test",
-        );
-        assert!(null_result.is_ok(), "a DAE NULL has no materialized value");
+        for (bytes, is_null) in [(b"<x/>".to_vec(), false), (Vec::new(), true)] {
+            let result = rebuild_deferred_params(
+                &mut state,
+                vec![deferred_slot()],
+                &[(0, bytes, is_null)],
+                &dae_params,
+                "test",
+            );
+            assert!(
+                result.is_ok(),
+                "internal deferral must not change DAE XML validity"
+            );
+            assert!(state.diag_records.is_empty());
+        }
     }
 
     /// `SQL_LEN_DATA_AT_EXEC(n)` promises `n` bytes, which the closing

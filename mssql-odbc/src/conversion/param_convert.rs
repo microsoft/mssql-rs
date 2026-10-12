@@ -55,7 +55,7 @@ use crate::api::sqlstate::{
 };
 use crate::api::type_rules::{
     SQL_PREC_BIGCHARBINARY, SQL_PREC_NCHAR, SQL_PREC_NTEXT, SQL_PREC_NUMERIC, SQL_PREC_TEXTIMAGE,
-    SQL_PREC_UDT, SQL_PREC_UNLIMITED, is_wide_character_sql_type, parameter_column_size_is_valid,
+    SQL_PREC_UDT, SQL_PREC_UNLIMITED, is_wide_character_sql_type,
 };
 use crate::conversion::datetime::{
     DateTimeParts, MAX_DAYS_SINCE_0001, TICKS_PER_DAY, civil_from_days_since_0001,
@@ -746,12 +746,6 @@ pub(crate) fn buffered_dae_to_rpc(
     buffer: &[u8],
     is_null: bool,
 ) -> Result<(RpcParameter, ConvOk), ParamBuildError> {
-    if !is_null
-        && binding.sql_type == SQL_SS_XML
-        && !parameter_column_size_is_valid(binding.sql_type, binding.column_size)
-    {
-        return Err(ParamBuildError::InvalidParameterSize(binding.column_size));
-    }
     let mut indicator: SqlLen = if is_null {
         SQL_NULL_DATA
     } else {

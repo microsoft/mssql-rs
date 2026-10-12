@@ -934,8 +934,9 @@ msodbcsql build is measured.
     binding above the ceiling because `StrLen_or_IndPtr` is deferred input and
     need not be initialized until execution. The original `ColumnSize` remains
     in the descriptor and is revalidated against the positioned execution-time
-    indicator: data-at-execution values stream without a bounded XML
-    declaration, while a materialized value reports `HY104` from
+    indicator: data-at-execution values use unlimited XML semantics, including
+    when a mixed DAE sequence must collect an earlier value to preserve bind
+    order. A non-DAE materialized value reports `HY104` from
     `SQLExecute`/`SQLExecDirect` rather than from `SQLBindParameter`.
 
     mssql-python preserves the caller's `setinputsizes((SQL_SS_XML, n, 0))`
