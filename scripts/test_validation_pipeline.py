@@ -33,7 +33,7 @@ def load_template(name):
 @pytest.mark.parametrize(
     "selector",
     [
-        "scripts/test_bump_released_crate_versions.py",
+        "scripts/test_bump_released_versions.py",
         "scripts/test_validation_pipeline.py",
     ],
 )

@@ -1,0 +1,68 @@
+name: Bump Released Versions
+
+on:
+  schedule:
+    # Every Tuesday at 07:30 UTC (13:00 IST). The job guards the day of month so
+    # only the 1st and 3rd Tuesday act: day 1-7 holds exactly one Tuesday, as
+    # does day 15-21. The guard lives here rather than in the cron day-of-month
+    # field because cron implementations disagree on whether a restricted day of
+    # month and day of week are combined with AND or OR. GitHub may delay or skip
+    # scheduled runs.
+    - cron: '30 7 * * 2'
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: bump-released-versions
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Check cadence
+        id: cadence
+        run: |
+          python3 - <<'PY'
+          import os
+          from datetime import datetime, timezone
+          day = datetime.now(timezone.utc).day
+          due = os.environ["GITHUB_EVENT_NAME"] != "schedule" or day <= 7 or 15 <= day <= 21
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"due={str(due).lower()}\n")
+          PY
+
+      - name: Mint app token
+        id: app-token
+        if: steps.cadence.outputs.due == 'true'
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ secrets.VERSION_BUMP_APP_ID }}
+          private-key: ${{ secrets.VERSION_BUMP_APP_PRIVATE_KEY }}
+
+      - name: Checkout default branch
+        if: steps.cadence.outputs.due == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          token: ${{ steps.app-token.outputs.token }}
+          persist-credentials: true
+          # Full history: the job pushes new branches, which a shallow clone
+          # cannot do reliably.
+          fetch-depth: 0
+
+      - name: Open version bump pull requests
+        if: steps.cadence.outputs.due == 'true'
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GIT_AUTHOR_NAME: ${{ steps.app-token.outputs.app-slug }}[bot]
+          GIT_AUTHOR_EMAIL: ${{ steps.app-token.outputs.app-slug }}[bot]@users.noreply.github.com
+          GIT_COMMITTER_NAME: ${{ steps.app-token.outputs.app-slug }}[bot]
+          GIT_COMMITTER_EMAIL: ${{ steps.app-token.outputs.app-slug }}[bot]@users.noreply.github.com
+          RUSTUP_TOOLCHAIN: stable
+        run: python3 scripts/bump-released-versions.py

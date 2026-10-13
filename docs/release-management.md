@@ -53,65 +53,97 @@ its platform. Free-threaded CPython is not supported by `abi3`.
 
 ## Version Scheme
 
-### Scheduled Rust crate version bumps
+### Scheduled version bumps
 
-The **Bump Released Crate Versions** GitHub workflow checks the default branch
-against crates.io every three UTC days. A daily trigger at 08:23 UTC runs the
-check on days whose Unix day number is divisible by three; unlike `*/3` in the
-day-of-month field, this does not reset at month boundaries. GitHub may delay or
-skip scheduled runs. **Run workflow** bypasses the date check and still targets
-the default branch.
+The **Bump Released Versions** GitHub workflow opens version bump pull requests
+on the first and third Tuesday of each month at 07:30 UTC (13:00 IST). The cron
+trigger fires every Tuesday and the job then checks the day of month: days 1-7
+hold exactly one Tuesday, as do days 15-21. The ordinal guard lives in the job
+rather than in the cron day-of-month field because cron implementations disagree
+on whether a restricted day of month and day of week combine with AND or OR.
+GitHub may delay or skip scheduled runs. **Run workflow** bypasses the date check
+and still targets the default branch.
 
-`mssql-tds` and `mssql-mock-tds` are checked independently. If a crate's exact
-`[package].version` exists among its published versions (including older or
-yanked releases), the workflow suggests the next minor version: `0.1.7` becomes
-`0.2.0`. Unpublished source versions and crates that return HTTP 404 are left
-alone. Other registry errors fail the run rather than assuming a crate is
-unpublished. If the proposed next minor version is also published, the run fails
-and a maintainer must choose a new version. Before any bump is planned, the
-workflow also fails when the current `mssql-tds` and `mssql-mock-tds` source
-versions differ in either direction (`mssql-tds` and `mssql-mock-tds` must stay
-aligned for a release), because silently tolerating a drifted state can leave the
-repo in a release-invalid configuration. If the mock source version is ahead of
-the core target, the run also fails so a maintainer can choose the versions
-manually. A mock-only bump is deferred until the current `mssql-tds` version is
-published, because the mock crate's exact versioned dependency must resolve from
-the registry when it is packaged. When `mssql-tds` is bumped, the mock source
-version is kept aligned with the core target because the release pipeline stamps
-the mock crate from the core version.
+The workflow runs two independent tracks. A failure in one does not stop the
+other; the run fails at the end if either track failed.
 
-Local versions come from `cargo metadata`. The workflow does not edit files,
-push branches, create PRs, publish crates, merge anything, or change the release
-pipeline's existing version-stamping policy. If a matching open version-bump PR
-targets the default branch, the workflow skips issue creation.
+#### Released Rust crates
 
-When a bump is needed, the workflow creates or updates one tracking issue labeled
-`automation:crate-version-bump`. The issue includes:
+`mssql-tds` and `mssql-mock-tds` are checked against crates.io independently. If
+a crate's exact `[package].version` exists among its published versions
+(including older or yanked releases), the workflow bumps it to the next minor
+version: `0.1.7` becomes `0.2.0`. Unpublished source versions and crates that
+return HTTP 404 are left alone. Other registry errors fail the track rather than
+assuming a crate is unpublished. If the proposed next minor version is also
+published, the track fails and a maintainer must choose a new version. Before any
+bump is planned, the track also fails when the current `mssql-tds` and
+`mssql-mock-tds` source versions differ in either direction (`mssql-tds` and
+`mssql-mock-tds` must stay aligned for a release), because silently tolerating a
+drifted state can leave the repo in a release-invalid configuration. If the mock
+source version is ahead of the core target, the track also fails so a maintainer
+can choose the versions manually. A mock-only bump is deferred until the current
+`mssql-tds` version is published, because the mock crate's exact versioned
+dependency must resolve from the registry when it is packaged. When `mssql-tds`
+is bumped, the mock source version and the mock crate's versioned `mssql-tds`
+requirement are kept aligned with the core target because the release pipeline
+stamps the mock crate from the core version.
 
-1. the affected crates and suggested next minor versions;
-2. TOML snippets for the manifest edits, including the mock crate's versioned
-   `mssql-tds` dependency when the core crate is bumped;
-3. crisp maintainer instructions to apply the snippets, run `cargo fetch` (or
-   `cargo update --workspace --offline`) to refresh `Cargo.lock`, then run
-   `cargo bfmt`, `cargo bclippy`, and `cargo btest`, and finally open a PR with
-   `Fixes #<issue-number>` and the version summary in the PR description.
+Local versions come from `cargo metadata`. `Cargo.lock` is not tracked, and
+`--no-deps` means no lockfile is resolved or committed.
 
-The workflow queries only open issues labeled `automation:crate-version-bump`,
-then checks the hidden marker in their bodies before reusing or updating one.
-It regenerates the issue body while the bump is pending; put maintainer notes
-in issue comments. The label is created automatically when needed; multiple
-matching open issues fail the run for manual cleanup.
-When no bump is needed, no issue is changed. If a bump becomes unnecessary, close
-its issue manually.
+#### `mssql-python-rs`
 
-The shared validation pipeline runs `scripts/test_bump_released_crate_versions.py`
-in its Windows Python test step for both PR validation and main-branch CI.
-Cargo metadata, registry, pull request, and issue requests are mocked. No
-cargo-edit installation or live issue/PR writes are needed.
+The `[project].version` in `mssql-py-core/pyproject.toml` is checked against
+PyPI on the same schedule and with the same rule: if the current version is
+already published, bump to the next minor version. The independently versioned
+`mssql-py-core` Rust crate is never touched.
 
-The workflow uses the built-in `GITHUB_TOKEN` with contents read, issues write,
-and pull request read permissions. No custom secret or permission to create PRs
-is needed. Normal validation and review are still required before merging.
+#### Issues, branches, and pull requests
+
+Each track creates or updates one tracking issue, then pushes a branch from the
+default branch tip and opens a pull request that closes it:
+
+| Track | Issue label | Branch |
+| --- | --- | --- |
+| Crates | `automation:crate-version-bump` | `automation/bump-released-crates` |
+| `mssql-python-rs` | `automation:python-version-bump` | `automation/bump-mssql-python-rs` |
+
+The issue exists because **PR Linked Issue Check** requires every pull request to
+reference a GitHub issue or an ADO work item; the generated PR body carries
+`Fixes #<issue-number>`. The workflow queries only open issues with the track's
+label, then checks the hidden marker in their bodies before reusing or updating
+one. It regenerates the issue body while the bump is pending; put maintainer
+notes in issue comments. The label is created automatically when needed; multiple
+matching open issues fail the track for manual cleanup.
+
+To release a different version, push to the open pull request. The workflow
+force-updates its branch only while the planned versions change, and it skips a
+track entirely when a pull request on some *other* branch already proposes the
+same transitions. When no bump is needed, nothing is written. If a bump becomes
+unnecessary, close the pull request and its issue manually.
+
+Normal validation and review are still required before merging. The workflow
+does not publish crates, merge anything, or change the release pipeline's
+existing version-stamping policy.
+
+#### Credentials
+
+Branch pushes and pull requests use a GitHub App installation token minted from
+the `VERSION_BUMP_APP_ID` and `VERSION_BUMP_APP_PRIVATE_KEY` repository secrets.
+The app installation needs **contents: write** and **pull requests: write** on
+this repository, plus **issues: write** for the tracking issues. The workflow's
+own `GITHUB_TOKEN` stays at `contents: read`.
+
+An app token is used rather than `GITHUB_TOKEN` because pull requests opened with
+`GITHUB_TOKEN` create workflow runs in an approval-required state, so every bump
+PR would need a maintainer to click **Approve workflows to run** before CI
+started. If the secrets are missing, the token step fails and no branch is
+pushed.
+
+The shared validation pipeline runs `scripts/test_bump_released_versions.py` in
+its Windows Python test step for both PR validation and main-branch CI. Cargo
+metadata, registry, git, pull request, and issue calls are mocked. No live
+writes are needed.
 
 ### Python and NuGet versions
 
