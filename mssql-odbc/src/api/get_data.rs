@@ -3500,6 +3500,8 @@ fn append_typed_utf16(
 /// carries code units the caller's buffer had no room for. Both are needed:
 /// the wire and the caller advance at rates that are unrelated when the
 /// encoding is variable-width.
+/// `decoder_finalized` is caller-owned state that must live with `decoder`; it
+/// is set once when `reached_end` first arrives and must not be reset.
 pub(crate) fn widen_into_pending(
     decoder: &mut ResolvedDecoder,
     decoder_finalized: &mut bool,
@@ -3545,7 +3547,7 @@ pub(crate) fn widen_into_pending(
     } else if *decoder_finalized {
         debug_assert!(
             payload.is_empty() && reached_end,
-            "widening decoder received input after finalization"
+            "widening decoder used after finalization: expected a drain-only call"
         );
     }
     out_units.min(pending.len())
@@ -3602,6 +3604,8 @@ fn narrow_source_fit(source: &[u8], room: usize, held_partial: bool) -> usize {
 /// carries bytes the caller's buffer had no room for. Both are needed: the wire
 /// and the caller advance at unrelated rates once the encoding is
 /// variable-width on either side.
+/// `decoder_finalized` is caller-owned state that must live with `decoder`; it
+/// is set once when `reached_end` first arrives and must not be reset.
 pub(crate) fn transcode_narrow_into_pending(
     decoder: &mut ResolvedDecoder,
     decoder_finalized: &mut bool,
@@ -3619,7 +3623,7 @@ pub(crate) fn transcode_narrow_into_pending(
     } else if *decoder_finalized {
         debug_assert!(
             payload.is_empty() && reached_end,
-            "narrow decoder received input after finalization"
+            "narrow decoder used after finalization: expected a drain-only call"
         );
     }
     // A character may be split across two SQLGetData calls at the byte level,
@@ -12312,6 +12316,42 @@ mod tests {
             )
         };
         (rc, indicator)
+    }
+
+    #[test]
+    fn sql_get_data_drains_replacement_for_dangling_gbk_lead_at_end_of_stream() {
+        let (h, _server) = open_mock_gbk_plp(vec![vec![0xD0]]);
+        let mut delivered = Vec::new();
+
+        loop {
+            let mut output = [0xCC; 2];
+            let (rc, _) = read_plp_test_chunk(&h, SQL_C_CHAR, &mut output);
+            assert!(matches!(rc, SQL_SUCCESS | SQL_SUCCESS_WITH_INFO));
+            if output[0] != 0 {
+                delivered.push(output[0]);
+            }
+            if rc == SQL_SUCCESS {
+                break;
+            }
+        }
+
+        assert_eq!(delivered, "\u{FFFD}".as_bytes());
+        assert_eq!(
+            read_plp_test_chunk(&h, SQL_C_CHAR, &mut [0xCC; 2]),
+            (SQL_NO_DATA, -999)
+        );
+
+        let (h, _server) = open_mock_gbk_plp(vec![vec![0xD0]]);
+        let mut output = [0xCC; 4];
+        assert_eq!(
+            read_plp_test_chunk(&h, SQL_C_WCHAR, &mut output),
+            (SQL_SUCCESS, 2)
+        );
+        assert_eq!(output, [0xFD, 0xFF, 0, 0]);
+        assert_eq!(
+            read_plp_test_chunk(&h, SQL_C_WCHAR, &mut output),
+            (SQL_NO_DATA, -999)
+        );
     }
 
     thread_local! {
