@@ -99,8 +99,9 @@ Run the Rust test suite from the repository root:
 cargo nextest run -p mssqlodbc --lib
 ```
 
-The 128 KiB application-thread stack regression uses the optimized driver.
-Run it separately from debug/coverage tests:
+The application-thread stack regression also runs in debug/coverage builds with
+a larger 512 KiB budget for unoptimized frames. To enforce the 128 KiB release
+stack budget, run:
 
 ```bash
 cargo nextest run --release --frozen -p mssqlodbc --lib -E 'test(exec_direct_on_small_stack)'

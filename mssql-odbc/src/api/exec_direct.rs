@@ -864,13 +864,20 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(debug_assertions, ignore = "small-stack budget requires --release")]
     fn exec_direct_on_small_stack() {
         use crate::api::exports::{SQLExecDirectW, SQLFetch, SQLFreeStmt, SQLGetData};
         use crate::api::odbc_types::{SQL_C_LONG, SQL_CLOSE, SQL_NO_DATA, SQL_SUCCESS, SqlLen};
         use crate::handles::dbc::DbcHandle;
         use mssql_mock_tds::QueryResponse;
         use std::time::Duration;
+
+        // Debug/coverage builds need room for unoptimized frames; only release
+        // builds enforce musl's 128 KiB application-thread stack budget.
+        const STACK_BYTES: usize = if cfg!(debug_assertions) {
+            512 * 1024
+        } else {
+            128 * 1024
+        };
 
         let h = TestHandles::with_env_dbc_stmt();
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
@@ -883,7 +890,7 @@ mod tests {
 
         // The owner retains the handle chain until the application thread joins.
         std::thread::Builder::new()
-            .stack_size(128 * 1024)
+            .stack_size(STACK_BYTES)
             .spawn(move || {
                 let stmt = stmt_addr as SqlHandle;
                 let sql: Vec<u16> = "SELECT 1\0".encode_utf16().collect();
