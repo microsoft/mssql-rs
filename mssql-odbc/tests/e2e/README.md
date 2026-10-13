@@ -257,9 +257,11 @@ reusable connection. It needs `ODBC_TEST_SERVER` as a direct TCP endpoint
 (host or host,port); a DSN, full connection-string override, or named instance
 cannot be routed by this proxy and is reported as skipped.
 
-The Unix runner creates temporary registrations with `Threading=0` for both
-drivers, without modifying the installed reference registration. This prevents
-the Driver Manager from serializing away the cross-thread call. Rust tests cover
+The Unix runner creates temporary registrations with `Threading=1` for both
+drivers, without modifying the installed reference registration. unixODBC
+locks `SQLCancel` only at level 3, so at 1 the cross-thread cancel still
+reaches the driver while the other call runs (see "How the scripts register
+the driver"). Rust tests cover
 buffer-only DAE calls, token-publication races, simultaneous cancellers,
 indefinitely stalled writes, and missing acknowledgement deadlines.
 
@@ -352,7 +354,12 @@ infrastructure works (`runtests.c`).
   `[ODBC Driver 18 for SQL Server (Rust)]`, and sets `ODBCSYSINI` to point at
   it. The env var is scoped to the script process, so the parent shell is never
   affected. A `trap cleanup EXIT` ensures the temp directory is removed even on
-  failure.
+  failure. With `--compare-with-msodbcsql`, the same file also gets a copy of
+  the msodbcsql section from `--msodbcsql-ini`. Both registrations set
+  `Threading=1`, so unixODBC serializes calls on each handle as the Windows
+  Driver Manager does, except `SQLCancel`, which it locks only at level 3. At
+  the unixODBC default of 0, the `/SharedStmt` variants crash inside
+  `libodbc` with either driver.
 
 - **Windows (`run_e2e.ps1`)**: Writes `Driver` and `Setup` values under
   `HKLM\Software\ODBC\ODBCINST.INI\ODBC Driver 18 for SQL Server (Rust)`, so an

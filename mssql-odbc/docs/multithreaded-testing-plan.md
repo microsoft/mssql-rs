@@ -237,10 +237,15 @@ Measured 2026-10-08 on both drivers unless noted.
   a busy STMT, or on a descriptor associated with it, waits; only `SQLCancel`
   bypasses the lock. Calls on another STMT, the DBC, or an unassociated
   descriptor proceed. So on Windows only `SharedDbc` and `SQLCancel` reach the
-  driver concurrently; same-handle races need unixODBC.
+  driver concurrently; same-handle races need the driver loaded without a
+  Driver Manager (see `Threading` below).
 - **unixODBC `Threading`:** 0 none, 1 per handle, 2 per DBC, 3 global (which
   also locks `SQLCancel`). unixODBC master defaults to 0 when odbcinst.ini does
-  not set it; `run_e2e.sh` must set it explicitly.
+  not set it; `run_e2e.sh` sets 1 for both legs. At 0, unixODBC's own
+  per-handle diagnostic list is unlocked: `/SharedStmt` crashed inside
+  `libodbc` (under `SQLGetDiagField`) with either driver loaded, in 7 of 10
+  runs at 2 x 1 (WSL, unixODBC 2.3.9), and in none of 60 at 1. macOS CI hit
+  it first; Linux CI passed by luck.
 - Every non-diagnostic call clears the handle's diagnostics, including an idle
   `SQLCancel`, `SQLGetStmtAttr`, and `SQLNumResultCols`.
 - An idle `SQLCancel` leaves an open cursor alone in this driver, as ODBC 3.5
@@ -259,7 +264,8 @@ Measured 2026-10-08 on both drivers unless noted.
    Covered for character targets from `varchar(max)`, `varchar(n)`, `text`,
    `nvarchar(max)`, `nvarchar(n)`, `ntext`, and `xml`, and for binary targets
    from `varbinary(max)` and `binary(n)`, which have no terminator and so fill
-   all of `BufferLength`. Edge cases: NULL and empty values, length probes,
+   all of `BufferLength`; one case of each ends on an exactly full chunk.
+   Edge cases: NULL and empty values, length probes,
    abandoned partial reads, mid-row cursor close, surrogate pairs across
    chunks, typed-to-character conversions, multiple results, and long row
    streams. `vector` waits for a fetch contract.
@@ -314,28 +320,35 @@ Purpose-built workloads using the same settings, start gate, and watchdog.
     DBC stays usable. Debug and release builds; Rust-driver robustness, not
     parity.
 
-Scenarios 8 and 9 reach the driver concurrently only on unixODBC
-`Threading=0`, which is also the ThreadSanitizer target.
+Scenarios 8 and 9 need same-handle calls to reach the driver concurrently. No
+Driver Manager provides that safely: Windows serializes them, and unixODBC at
+`Threading=0` corrupts its own diagnostic list. So they call the driver
+library directly, without a Driver Manager, which is also the
+ThreadSanitizer target (AB#49259).
 
 ## Stress Profiles
 
 | Profile | Driver | Threads x iterations | Runs | Platforms |
 |---|---|---|---|---|
-| PR | both | 2 x 1 | `Single`, `CrossThread`, `SharedEnv` | Windows, Linux |
-| Nightly | mssql-odbc | 8 x 20 | All concurrent modes, scenarios 7-10 | Windows, unixODBC `Threading=0` |
+| PR | both | 2 x 1 | `Single`, `CrossThread`, `SharedEnv` | Windows, Linux, macOS |
+| Nightly | mssql-odbc | 8 x 20 | All concurrent modes, scenarios 7-10 | Windows, Linux, macOS; scenarios 8-9 without a Driver Manager |
 | Nightly | msodbcsql | 2 x 1 | All concurrent modes | Windows, Linux |
-| Weekly soak | mssql-odbc | 16 x 50 or time-bound | Same as nightly | Windows, unixODBC `Threading=0` |
+| Weekly soak | mssql-odbc | 16 x 50 or time-bound | Same as nightly | Same as nightly |
 
-Measured on `get_data_test` with 16 converted tests (48 concurrent variants),
+unixODBC runs use `Threading=1` (see Driver Manager facts).
+
+Measured on `get_data_test` with 22 converted tests (66 concurrent variants),
 local SQL Server:
 
 | Run | msodbcsql | mssql-odbc |
 |---|---|---|
-| Single-threaded, all tests | 6 s | 6.5 s |
-| Concurrent variants at 2 x 1 | 2.4 s | 2.0 s |
-| Concurrent variants at 16 x 50 | 72-74 s | 79-87 s |
+| Single-threaded, all tests | 6.5 s | 5.5 s |
+| Concurrent variants at 2 x 1 | 3-4 s | 3-4 s |
+| Concurrent variants at 16 x 50 | 96 s | 115 s |
 
-- 16 x 50 costs about 5-6 s per converted test, mostly `SharedEnv` connecting
+- At 2 x 1 a single slow connect adds seconds to one variant (runs of up to
+  9 s seen on both drivers), so PR timing is noisy at this size.
+- 16 x 50 costs about 4.5-5 s per converted test, mostly `SharedEnv` connecting
   on every run. For about 700 converted tests that extrapolates to roughly an
   hour per driver per platform, so it is weekly. 8 x 20 is a fifth of that and
   reproduced AB#49225.
@@ -379,8 +392,8 @@ local SQL Server:
 Tracked under AB#49256:
 
 1. **AB#49257 (this PR):** the harness with all five modes; the
-   `get_data_test.cpp` pilot (five converted tests, one worker-token test, twelve
-   chunk-fill tests); empty-value, NULL, and parameterized-`THROW` tests.
+   `get_data_test.cpp` pilot (five converted tests, one worker-token test,
+   fourteen chunk-fill tests); empty-value, NULL, and parameterized-`THROW` tests.
 2. **AB#49263:** CTest split, PR filter, nightly and weekly profiles, dumps.
 3. **AB#49260:** fetch and GetData suites, plus worker-token tests.
 4. **AB#49258:** parameter and execution suites, plus worker-token tests.
@@ -402,7 +415,8 @@ Tracked under AB#49256:
   - A cancel just before execute must not leak into that or the next
     execution; a cancel after completion leaves the cursor as it was (skip
     msodbcsql, which aborts it).
-  - Add `SQLCancel` to scenario 8b. On unixODBC run at `Threading` 0-2.
+  - Add `SQLCancel` to scenario 8b. On unixODBC run at `Threading` 1-2 (3
+    also locks `SQLCancel`; 0 races in the Driver Manager).
 - **Disconnect or free during use:** add to 8b once handle lifetimes are
   reference-counted or generation-checked.
 - **Async execution and MARS:** once the driver supports them.

@@ -2826,6 +2826,31 @@ ODBC_TEST_F(GetDataLiveTest, VarbinaryMaxFillsEveryTruncatedBinaryBuffer) {
     SQLCloseCursor(stmt_);
 }
 
+// Exact fit: the value divides evenly into full chunks, so the last chunk is
+// exactly payload-sized. That is where truncation flips to SQL_SUCCESS and a
+// terminator off-by-one would surface; every case above ends on a short chunk.
+// 24000 = 12 x 2000: 2000 characters plus the terminator in a 2001-byte buffer,
+// or 2000 bytes in a 2000-byte binary buffer.
+ODBC_TEST_F(GetDataLiveTest, VarcharMaxExactFitFinalCharChunkSucceeds) {
+    ASSERT_SQL_OK(ExecDirect("SELECT REPLICATE(CAST('A' AS VARCHAR(MAX)), 24000) AS c1"),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    ExpectEveryTruncatedChunkFull<SQLCHAR>(stmt_, 1, SQL_C_CHAR,
+                                           std::vector<SQLCHAR>(24000, 'A'), 2001);
+    SQLCloseCursor(stmt_);
+}
+
+ODBC_TEST_F(GetDataLiveTest, VarbinaryMaxExactFitFinalBinaryChunkSucceeds) {
+    ASSERT_SQL_OK(
+        ExecDirect("SELECT REPLICATE(CAST(0x00FF5A01 AS VARBINARY(MAX)), 6000) AS c1"),
+        SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    ExpectEveryTruncatedChunkFull<SQLCHAR>(
+        stmt_, 1, SQL_C_BINARY, RepeatUnits<SQLCHAR>({0x00, 0xFF, 0x5A, 0x01}, 24000), 2000,
+        /*terminated=*/false);
+    SQLCloseCursor(stmt_);
+}
+
 ODBC_TEST_F(GetDataLiveTest, BinaryFillsEveryTruncatedBinaryBuffer) {
     ASSERT_SQL_OK(ExecDirect("SELECT CAST(REPLICATE(CAST(0x00FF5A01 AS VARBINARY(MAX)), 2000) "
                              "AS BINARY(8000)) AS c1"),
