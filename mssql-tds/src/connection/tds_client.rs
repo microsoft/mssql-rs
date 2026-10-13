@@ -1574,7 +1574,9 @@ impl TdsClient {
         };
 
         let start = Instant::now();
-        self.reconnect(reconnect_timeout, cancel_handle).await?;
+        // Keep the login/recovery state out of every command's future. Allocate
+        // only after detecting a dead connection, not on the healthy hot path.
+        Box::pin(self.reconnect(reconnect_timeout, cancel_handle)).await?;
         Ok(start.elapsed())
     }
 
@@ -10038,6 +10040,49 @@ mod tests {
         for (name, size) in [
             ("ResultSet::next_row", result_set_next_row),
             ("ResultSet::next_row_into", result_set_next_row_into),
+        ] {
+            assert!(
+                size <= MAX,
+                "{name} future is {size} B, expected <= {MAX} B"
+            );
+        }
+    }
+
+    // A cold reconnect future used to inflate all command futures, overflowing
+    // musl's 128 KiB application-thread stack through ODBC's block_on calls.
+    #[test]
+    fn command_futures_stay_small() {
+        const MAX: usize = 8192;
+        let mut client = create_test_client();
+        let mut prepared = PreparedStatement::new(String::new());
+        let mut orphaned = None;
+
+        let reconnect = std::mem::size_of_val(&client.check_and_reconnect(None, None));
+        assert!(reconnect <= 128, "reconnect check future is {reconnect} B");
+        let execute = std::mem::size_of_val(&client.execute(String::new(), ()));
+        let execute_sp_executesql =
+            std::mem::size_of_val(&client.execute_sp_executesql(String::new(), Vec::new(), ()));
+        let begin_sp_executesql =
+            std::mem::size_of_val(&client.begin_sp_executesql(String::new(), Vec::new(), ()));
+        let execute_stored_procedure =
+            std::mem::size_of_val(&client.execute_stored_procedure(String::new(), None, None, ()));
+        let execute_prepared = std::mem::size_of_val(&client.execute_prepared(
+            &mut prepared,
+            Vec::new(),
+            &mut orphaned,
+            (),
+        ));
+        let begin_transaction = std::mem::size_of_val(
+            &client.begin_transaction(TransactionIsolationLevel::NoChange, None),
+        );
+
+        for (name, size) in [
+            ("execute", execute),
+            ("execute_sp_executesql", execute_sp_executesql),
+            ("begin_sp_executesql", begin_sp_executesql),
+            ("execute_stored_procedure", execute_stored_procedure),
+            ("execute_prepared", execute_prepared),
+            ("begin_transaction", begin_transaction),
         ] {
             assert!(
                 size <= MAX,

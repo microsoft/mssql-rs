@@ -99,6 +99,13 @@ Run the Rust test suite from the repository root:
 cargo nextest run -p mssqlodbc --lib
 ```
 
+The 128 KiB application-thread stack regression uses the optimized driver.
+Run it separately from debug/coverage tests:
+
+```bash
+cargo nextest run --release --frozen -p mssqlodbc --lib -E 'test(exec_direct_on_small_stack)'
+```
+
 ### C++ end-to-end tests
 
 The C++ end-to-end suite loads the built library through the real ODBC Driver

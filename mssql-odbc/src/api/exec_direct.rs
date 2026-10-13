@@ -863,6 +863,62 @@ mod tests {
         );
     }
 
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "small-stack budget requires --release")]
+    fn exec_direct_on_small_stack() {
+        use crate::api::exports::{SQLExecDirectW, SQLFetch, SQLFreeStmt, SQLGetData};
+        use crate::api::odbc_types::{SQL_C_LONG, SQL_CLOSE, SQL_NO_DATA, SQL_SUCCESS, SqlLen};
+        use crate::handles::dbc::DbcHandle;
+        use mssql_mock_tds::QueryResponse;
+        use std::time::Duration;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let _server = crate::test_support::connect_mock_server(
+            dbc,
+            "SELECT 1",
+            QueryResponse::select_one().with_delay(Duration::from_millis(10)),
+        );
+        let stmt_addr = h.stmt as usize;
+
+        // The owner retains the handle chain until the application thread joins.
+        std::thread::Builder::new()
+            .stack_size(128 * 1024)
+            .spawn(move || {
+                let stmt = stmt_addr as SqlHandle;
+                let sql: Vec<u16> = "SELECT 1\0".encode_utf16().collect();
+                for _ in 0..3 {
+                    assert_eq!(
+                        unsafe { SQLExecDirectW(stmt, sql.as_ptr(), SQL_NTS) },
+                        SQL_SUCCESS
+                    );
+                    assert_eq!(unsafe { SQLFetch(stmt) }, SQL_SUCCESS);
+                    let mut value = 0i32;
+                    let mut length: SqlLen = 0;
+                    assert_eq!(
+                        unsafe {
+                            SQLGetData(
+                                stmt,
+                                1,
+                                SQL_C_LONG,
+                                std::ptr::from_mut(&mut value).cast(),
+                                SqlLen::try_from(size_of::<i32>()).unwrap(),
+                                &mut length,
+                            )
+                        },
+                        SQL_SUCCESS
+                    );
+                    assert_eq!(value, 1);
+                    assert_eq!(length, SqlLen::try_from(size_of::<i32>()).unwrap());
+                    assert_eq!(unsafe { SQLFetch(stmt) }, SQL_NO_DATA);
+                    assert_eq!(unsafe { SQLFreeStmt(stmt, SQL_CLOSE) }, SQL_SUCCESS);
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
     /// A plain batch whose first statement is a no-row result (DML row count)
     /// followed by more statements leaves the cursor open with zero columns and
     /// the connection busy, so SQLMoreResults can advance past it (msodbcsql
