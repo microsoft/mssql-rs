@@ -15,6 +15,7 @@ use std::time::Duration;
 use mssql_tds::connection::tds_client::{
     CursorPoll, ExecuteOptions, ResultSet, StatementId, TdsClient,
 };
+use mssql_tds::core::CancelHandle;
 use mssql_tds::error::{Error as TdsError, TimeoutErrorType};
 use mssql_tds::message::parameters::rpc_parameters::{RpcParameter, StreamedSqlType};
 
@@ -34,7 +35,7 @@ use crate::handles::dbc::ConnectionState;
 use crate::handles::desc::DescHeader;
 use crate::handles::stmt::{
     DaeParam, DaeState, PreparedPlan, STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT,
-    STMT_STATE_EXEC_STARTED, StmtState,
+    STMT_STATE_EXEC_STARTED, StatementOperation, StmtState,
 };
 use crate::handles::{
     DbcHandle, DescHandle, StmtHandle, handle_from_raw, process_is_shutting_down,
@@ -101,6 +102,16 @@ fn unwind_dae_inner(
         client
     };
 
+    finish_dae_unwind(dbc, statement_handle, client, process_is_shutting_down);
+}
+
+/// Completes an unwind whose DAE state was already taken under the STMT lock.
+pub(super) fn finish_dae_unwind(
+    dbc: &DbcHandle,
+    statement_handle: SqlHandle,
+    client: Option<TdsClient>,
+    process_is_shutting_down: bool,
+) {
     if let Some(mut client) = client {
         // `cancel_streamed_write` writes the request's cancel and drains the
         // response, so it needs the scheduler's worker to drive the socket.
@@ -117,6 +128,103 @@ fn unwind_dae_inner(
         }
         return_client_idle(dbc, statement_handle, client);
     }
+}
+
+fn finish_cancelled_dae_call(
+    stmt: &StmtHandle,
+    statement_handle: SqlHandle,
+    rc: SqlReturn,
+) -> SqlReturn {
+    let cancelled_success = matches!(rc, SQL_SUCCESS | SQL_SUCCESS_WITH_INFO | SQL_NEED_DATA);
+    let needs_data = match stmt.inner.lock() {
+        Ok(state) => state.needs_data(),
+        Err(_) => {
+            error!("finishing cancelled DAE call: stmt mutex poisoned");
+            return SQL_ERROR;
+        }
+    };
+    if !needs_data {
+        return rc;
+    }
+    unwind_dae(
+        stmt.parent_dbc(),
+        stmt,
+        statement_handle,
+        cancelled_success.then_some(ERR_OPERATION_CANCELED),
+    );
+    if cancelled_success { SQL_ERROR } else { rc }
+}
+
+/// Ends a call registered with [`StmtHandle::begin_operation`].
+///
+/// SQLCancel can signal after the call's last cancellable read but before it
+/// returns. The signal latches the token the client still holds, so leaving it
+/// unsettled would cancel a later, unrelated call on this statement and fail
+/// the drain of SQLFreeStmt(SQL_CLOSE) or SQLEndTran. msodbcsql sends ATTN in
+/// that window too (`sqlcmisc.cpp`, `pBatchCtx->Cancel` while `csStmt` is
+/// held), so the pending response is abandoned here, before SQLCancel returns.
+pub(super) fn finish_operation(
+    mut operation: StatementOperation<'_>,
+    stmt: &StmtHandle,
+    statement_handle: SqlHandle,
+    rc: SqlReturn,
+) -> SqlReturn {
+    match operation.finish_unless_cancelled() {
+        Ok(true) => rc,
+        Ok(false) => settle_late_cancellation(stmt, statement_handle, rc),
+        Err(rc) => rc,
+    }
+}
+
+fn settle_late_cancellation(
+    stmt: &StmtHandle,
+    statement_handle: SqlHandle,
+    rc: SqlReturn,
+) -> SqlReturn {
+    let cursor_open = match stmt.inner.lock() {
+        Ok(state) if state.needs_data() => {
+            drop(state);
+            return finish_cancelled_dae_call(stmt, statement_handle, rc);
+        }
+        Ok(state) => state.has_state(STMT_STATE_CURSOR_OPEN),
+        Err(_) => {
+            error!("settling cancellation: stmt mutex poisoned");
+            return SQL_ERROR;
+        }
+    };
+    // A released claim means the complete response was already read, so
+    // nothing remains for the signal to abandon.
+    let owns_wire = match stmt.parent_dbc().inner.lock() {
+        Ok(state) => state.active_stmt == Some(statement_handle),
+        Err(_) => {
+            error!("settling cancellation: dbc mutex poisoned");
+            return SQL_ERROR;
+        }
+    };
+    if !cursor_open || !owns_wire {
+        return rc;
+    }
+    match stmt.inner.lock() {
+        Ok(mut state) => {
+            state.pending_fetch_error = None;
+            super::close_cursor::reset_cursor_state(&mut state);
+        }
+        Err(_) => {
+            error!("settling cancellation: stmt mutex poisoned");
+            return SQL_ERROR;
+        }
+    }
+    let drained = !matches!(
+        super::close_cursor::drain_and_release(stmt, statement_handle),
+        super::close_cursor::DrainOutcome::Failed
+    );
+    if drained
+        && matches!(rc, SQL_SUCCESS | SQL_SUCCESS_WITH_INFO | SQL_NO_DATA)
+        && let Ok(mut state) = stmt.inner.lock()
+    {
+        post_diag(&mut state, ERR_OPERATION_CANCELED);
+    }
+    SQL_ERROR
 }
 
 /// Parks the streaming client on the statement so `SQLParamData` / `SQLPutData`
@@ -435,7 +543,7 @@ pub(super) fn return_client_busy(dbc: &DbcHandle, client: TdsClient) {
 /// so it has to be recorded first; its return value reports whether it posted
 /// a server message. Callers with nothing pending pass `|_| false`.
 ///
-/// Returns `(has_server_info, preceding_ran)`. `preceding_ran` is `false` when
+/// Returns `(has_server_info, preceding_ran, cancelled)`. `preceding_ran` is `false` when
 /// the statement lock was poisoned and the closure therefore never ran, so a
 /// caller that relies on it having posted can fall back rather than assume.
 ///
@@ -449,7 +557,7 @@ pub(super) fn release_busy_if_row_exhausted(
     statement_handle: SqlHandle,
     mut client: TdsClient,
     post_preceding: impl FnOnce(&mut StmtState) -> bool,
-) -> (bool, bool) {
+) -> (bool, bool, bool) {
     let peek_result = match client.try_peek_past_current_row() {
         Ok(CursorPoll::Ready(has_row)) => Ok(has_row),
         Ok(CursorPoll::Pending) => dbc.runtime.block_on(client.peek_past_current_row()),
@@ -482,12 +590,12 @@ pub(super) fn release_busy_if_row_exhausted(
         Some(Ok(done)) => *done,
         _ => !client.has_open_batch(),
     };
-    let release = result_set_exhausted && batch_done;
-
     let mut read_error = peek_result.err();
     if let Some(Err(error)) = completion_result {
         read_error = Some(error);
     }
+    let cancelled = matches!(read_error, Some(TdsError::OperationCancelledError(_)));
+    let release = cancelled || (result_set_exhausted && batch_done);
 
     // Drained whether or not the claim is released. Everything the peek
     // consumed came before this result set's DONE, so it belongs to the call
@@ -503,7 +611,7 @@ pub(super) fn release_busy_if_row_exhausted(
     let mut has_server_info = false;
     let mut preceding_ran = false;
     if let Ok(mut stmt_state) = stmt.inner.lock() {
-        if release {
+        if release && !cancelled {
             stmt_state.pending_output_params =
                 Some((client.get_return_values(), client.get_return_status()));
         }
@@ -512,14 +620,17 @@ pub(super) fn release_busy_if_row_exhausted(
         has_server_info |= post_tds_info_messages(&mut stmt_state, &drained_info);
         if let Some(e) = read_error {
             error!(%e, "release_busy_if_row_exhausted: finishing current result failed");
-            if batch_done {
+            if cancelled {
+                super::close_cursor::reset_cursor_state(&mut stmt_state);
+                post_tds_error(&mut stmt_state, &e, SQLSTATE_HY000);
+            } else if batch_done {
                 stmt_state.pending_fetch_error = Some(e);
             }
         }
-        if result_set_exhausted {
+        if result_set_exhausted && !cancelled {
             stmt_state.result_set_exhausted = true;
         }
-        if release {
+        if release && !cancelled {
             stmt_state.batch_exhausted = true;
         }
     }
@@ -533,7 +644,32 @@ pub(super) fn release_busy_if_row_exhausted(
             Some(statement_handle)
         };
     }
-    (has_server_info, preceding_ran)
+    (has_server_info, preceding_ran, cancelled)
+}
+
+/// The TDS read has settled or retired its transport and returned the client.
+/// Release the ODBC claim without deferring cancellation to a later call.
+pub(super) fn finish_cancelled_cursor(
+    stmt: &StmtHandle,
+    statement_handle: SqlHandle,
+    err: &TdsError,
+) -> SqlReturn {
+    let dbc = stmt.parent_dbc();
+    let Ok(mut dbc_state) = dbc.inner.lock() else {
+        error!("finishing cancelled cursor: dbc mutex poisoned");
+        return SQL_ERROR;
+    };
+    if dbc_state.active_stmt == Some(statement_handle) {
+        dbc_state.active_stmt = None;
+    }
+    drop(dbc_state);
+    let Ok(mut state) = stmt.inner.lock() else {
+        error!("finishing cancelled cursor: stmt mutex poisoned");
+        return SQL_ERROR;
+    };
+    super::close_cursor::reset_cursor_state(&mut state);
+    post_tds_error(&mut state, err, SQLSTATE_HY000);
+    SQL_ERROR
 }
 
 /// Restores the client to idle, posts a TDS error to `stmt`, clears
@@ -560,7 +696,7 @@ pub(super) fn fail_with_tds(
 
 /// Releases a statement's pending orphaned prepared handle (from a re-prepare,
 /// rebind, or `SQLExecDirect` supersede) via `sp_unprepare`, using the already
-/// claimed `client`. Best-effort: any failure is logged and swallowed — a
+/// claimed `client`. Best-effort except for cancellation: other failures are logged — a
 /// leaked handle is freed when the connection closes, and must not fail the
 /// caller's execution.
 ///
@@ -581,26 +717,44 @@ pub(super) fn flush_pending_unprepare(
     client: &mut TdsClient,
     op: &str,
     timeout_secs: u32,
-) {
+    cancel: &CancelHandle,
+) -> Result<(), TdsError> {
     let pending = match stmt.inner.lock() {
         Ok(mut stmt_state) => stmt_state.pending_unprepare.take(),
         Err(_) => {
             error!("{op}: stmt mutex poisoned taking pending unprepare");
-            return;
+            return Err(TdsError::ImplementationError(
+                "statement state is poisoned during orphan cleanup".to_string(),
+            ));
         }
     };
     let Some(handle) = pending else {
-        return;
+        return Ok(());
     };
     // `unprepare` recovers a dead connection first, then drops the handle only
     // if it still belongs to the (recovered) session — a superseded handle is
     // already gone server-side and is skipped without an RPC.
-    if let Err(e) = dbc
-        .runtime
-        .block_on(client.unprepare(handle, ExecuteOptions::new().timeout_secs(timeout_secs)))
-    {
+    if let Err(e) = dbc.runtime.block_on(
+        client.unprepare(
+            handle,
+            ExecuteOptions::new()
+                .timeout_secs(timeout_secs)
+                .cancel(cancel),
+        ),
+    ) {
+        if matches!(e, TdsError::OperationCancelledError(_)) {
+            // Unprepare retains an unsent handle, but forgets one whose send
+            // was attempted. Retrying this id is safe: absent handles are skipped.
+            if let Ok(mut state) = stmt.inner.lock() {
+                state.pending_unprepare = Some(handle);
+            } else {
+                error!("{op}: stmt mutex poisoned restoring cancelled orphan cleanup");
+            }
+            return Err(e);
+        }
         error!(%e, "{op}: sp_unprepare failed — handle leaked until disconnect");
     }
+    Ok(())
 }
 
 /// Deducts elapsed wall-clock time from a `SQL_ATTR_QUERY_TIMEOUT` budget
@@ -2461,10 +2615,11 @@ mod tests {
         );
 
         let ran = std::cell::Cell::new(false);
-        let (_, preceding_ran) = release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| {
-            ran.set(true);
-            true
-        });
+        let (_, preceding_ran, _) =
+            release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| {
+                ran.set(true);
+                true
+            });
 
         assert!(!ran.get(), "the poisoned lock must skip the closure");
         assert!(

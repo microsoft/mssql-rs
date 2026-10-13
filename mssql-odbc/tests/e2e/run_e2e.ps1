@@ -15,6 +15,7 @@
 # Requires: Administrator privileges (writes to HKLM).
 # Usage: .\run_e2e.ps1 [-Release] [-Retries N] [-Coverage] [-CoverageOutput PATH]
 #                      [-CompareWithMsodbcsql] [-MsodbcsqlDll PATH]
+#                      [-FilterTests REGEX]
 #
 # -Retries N reruns each failing test up to N extra times (ctest
 # --repeat until-pass:N+1). A test that passes on any attempt counts as a
@@ -57,6 +58,7 @@ param(
     [string]$CoverageOutput = "",
     [switch]$CompareWithMsodbcsql,
     [string]$MsodbcsqlDll = "",
+    [string]$FilterTests = "",
     # Optional ctest name-exclusion regex (ctest -E). Empty by default: the Windows
     # driver gaps tracked in AB#46973 (get_type_info_test, driver_connect_test) are
     # fixed, so the full suite runs on Windows. Pass -ExcludeTests '<regex>' to skip.
@@ -305,6 +307,9 @@ function Invoke-CtestRun([string]$Label, [string]$JunitName, [string]$DriverName
     $prevDll = $env:MSSQL_ODBC_DLL
     try {
         $ctestArgs = @('--output-on-failure', '-C', 'Debug', '--output-junit', $JunitName)
+        if ($FilterTests) {
+            $ctestArgs += @('-R', $FilterTests)
+        }
         if ($Retries -gt 0) {
             $ctestArgs += @('--repeat', "until-pass:$($Retries + 1)")
         }

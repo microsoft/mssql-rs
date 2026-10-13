@@ -12,6 +12,7 @@
 #   ./run_e2e.sh [--release] [--verbose] [--retries=N] [--coverage[=OUTPUT]]
 #                [--compare-with-msodbcsql] [--msodbcsql-ini=PATH]
 #                [--skip-build] [--driver=PATH]
+#                [--filter=REGEX]
 #
 # Default: runs the e2e suite against mssql-odbc only.
 #
@@ -131,6 +132,7 @@ COVERAGE_OUTPUT="${COVERAGE_OUTPUT:-$ODBC_CRATE_DIR/../target/cobertura-odbc-e2e
 MSODBCSQL_INI="/etc/odbcinst.ini"
 SKIP_BUILD=0
 DRIVER_OVERRIDE=""
+TEST_FILTER=""
 
 CTEST_ARGS=(--output-on-failure)
 RUST_INI_DIR=""    # tempdir holding our generated odbcinst.ini
@@ -160,6 +162,7 @@ parse_args() {
             --msodbcsql-ini=*) MSODBCSQL_INI="${arg#--msodbcsql-ini=}" ;;
             --skip-build) SKIP_BUILD=1 ;;
             --driver=*) DRIVER_OVERRIDE="${arg#--driver=}" ;;
+            --filter=*) TEST_FILTER="${arg#--filter=}" ;;
             -h|--help) usage; exit 0 ;;
             *) echo "Unknown argument: $arg" >&2; usage >&2; exit 2 ;;
         esac
@@ -286,6 +289,7 @@ register_rust_driver() {
 [$RUST_DRIVER_SECTION]
 Description=Microsoft ODBC Driver 18 for SQL Server (Rust)
 Driver=$RUST_DRIVER_PATH
+Threading=0
 UsageCount=1
 EOF
     echo "Rust driver registered at: $RUST_INI_DIR/odbcinst.ini"
@@ -322,6 +326,17 @@ validate_compare_preconditions() {
     # Resolve to absolute path so subprocesses see the same file regardless of cwd.
     MSODBCSQL_INI="$(cd "$(dirname "$MSODBCSQL_INI")" && pwd)/$(basename "$MSODBCSQL_INI")"
     echo "msodbcsql ini: $MSODBCSQL_INI"
+    # Keep installed registrations untouched while allowing concurrent driver
+    # calls on both comparison legs.
+    printf '\n' >> "$RUST_INI_DIR/odbcinst.ini"
+    awk -v section="[$MSODBCSQL_DRIVER_SECTION]" '
+        /^\[/ {
+            selected = index($0, section) == 1
+            if (selected) { print; print "Threading=0" }
+            next
+        }
+        selected && tolower($0) !~ /^[[:space:]]*threading[[:space:]]*=/ { print }
+    ' "$MSODBCSQL_INI" >> "$RUST_INI_DIR/odbcinst.ini"
 }
 
 # ----------------------------------------------------------------------------
@@ -473,6 +488,9 @@ generate_coverage_report() {
 # ----------------------------------------------------------------------------
 main() {
     parse_args "$@"
+    if [ -n "$TEST_FILTER" ]; then
+        CTEST_ARGS+=(-R "$TEST_FILTER")
+    fi
     if [ "$RETRIES" -gt 0 ] 2>/dev/null; then
         # until-pass:N runs a failing test up to N times total, so N retries = N+1.
         CTEST_ARGS+=(--repeat "until-pass:$((RETRIES + 1))")
@@ -515,9 +533,7 @@ main() {
     fi
 
     # Comparison mode: also run against the C++ driver, then print the table.
-    local ms_ini_dir
-    ms_ini_dir="$(dirname "$MSODBCSQL_INI")"
-    run_tests "msodbcsql"  "$ms_ini_dir"  "$ms_junit" "$MSODBCSQL_DRIVER_SECTION" || ms_rc=$?
+    run_tests "msodbcsql" "$RUST_INI_DIR" "$ms_junit" "$MSODBCSQL_DRIVER_SECTION" || ms_rc=$?
     assert_tests_executed "$ms_junit" "msodbcsql"
 
     local parity_rc=0

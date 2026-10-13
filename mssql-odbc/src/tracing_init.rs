@@ -1380,6 +1380,70 @@ mod tests {
     }
 
     #[test]
+    fn cross_thread_cancel_keeps_the_interrupted_execution_correlation() {
+        use crate::api::odbc_types::{SQL_ERROR, SQL_NTS, SQL_SUCCESS, SqlHandle};
+        use crate::api::{SQLCancel, SQLExecDirectW};
+        use crate::handles::{DbcHandle, StmtHandle, handle_from_raw};
+        use crate::test_support::{TestHandles, connect_mock_server};
+        use mssql_mock_tds::QueryResponse;
+        use std::time::{Duration, Instant};
+
+        let id = uuid::Uuid::new_v4();
+        let output = capture_correlation(|| {
+            let h = TestHandles::with_env_dbc_stmt();
+            let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+            let _server = connect_mock_server(
+                dbc,
+                "SELECT 1",
+                QueryResponse::select_one().with_delay(Duration::from_secs(8)),
+            );
+            dbc.trace.establish(id);
+            dbc.inner.lock().unwrap().connection_timeout = 1;
+            let raw = h.stmt as usize;
+            let dispatch = tracing::dispatcher::get_default(Clone::clone);
+            std::thread::scope(|scope| {
+                let worker = scope.spawn(move || {
+                    tracing::dispatcher::with_default(&dispatch, || {
+                        let sql: Vec<u16> = "SELECT 1".encode_utf16().chain([0]).collect();
+                        unsafe { SQLExecDirectW(raw as SqlHandle, sql.as_ptr(), SQL_NTS) }
+                    })
+                });
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while dbc.inner.lock().unwrap().client.is_some() && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                assert!(dbc.inner.lock().unwrap().client.is_none());
+                assert_eq!(unsafe { SQLCancel(h.stmt) }, SQL_SUCCESS);
+                assert_eq!(worker.join().unwrap(), SQL_ERROR);
+            });
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            assert_eq!(
+                stmt.inner.lock().unwrap().diag_records[0].sql_state,
+                *b"HY008"
+            );
+            assert_eq!(mssql_tds::trace_context::snapshot(), Default::default());
+        });
+        for api in ["SQLExecDirectW", "SQLCancel"] {
+            let lines: Vec<_> = output.lines().filter(|line| line.contains(api)).collect();
+            assert!(
+                lines
+                    .iter()
+                    .any(|line| line.contains(&format!("{api} called")))
+            );
+            assert!(
+                lines
+                    .iter()
+                    .any(|line| line.contains(&format!("{api} returning")))
+            );
+            assert!(lines.iter().all(|line| {
+                line.contains(&format!("cid={} ", id.to_string().to_uppercase()))
+                    && line.contains("stmt=")
+                    && line.contains("exec=1 ")
+            }));
+        }
+    }
+
+    #[test]
     fn exported_execution_and_tds_events_share_correlation() {
         assert_exported_execution_correlation(false);
     }

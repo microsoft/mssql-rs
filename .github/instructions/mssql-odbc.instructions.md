@@ -184,6 +184,10 @@ on the `master` branch.
 - Every ODBC entry point must clear the handle's diagnostic records at API
   entry by calling `free_errors(...)` after acquiring the handle lock, so a
   fresh call starts without stale diagnostics.
+  Cross-thread `SQLCancel` is an exception: it only signals the execution
+  token and must neither clear nor post diagnostics belonging to the
+  interrupted call. Cancelling a parked DAE sequence still clears its
+  diagnostics before unwinding.
 - **A success code is a promise about the caller's buffer, so never report
   `SQL_SUCCESS` for a call that wrote less than the indicator claims.** Report
   `SQL_SUCCESS_WITH_INFO` with `01004` when a read truncates, so the caller knows
@@ -264,6 +268,17 @@ on the `master` branch.
 - Handle poison explicitly with `std::sync::Mutex` — see the no-panics
   rule above for the canonical `let Ok(state) = ... else { return SQL_ERROR; }`
   pattern.
+- Cancellable statement calls retain a `StatementOperation` until their client
+  hand-back and state/diagnostic writes are complete. SQLCancel signals first,
+  then waits without holding STMT/DBC locks; new calls wait until cancellation
+  finishes. Keep read-ahead cancellation on the interrupted call rather than
+  deferring it to `pending_fetch_error`. This completion barrier mirrors
+  msodbcsql's post-signal acquisition of `csStmt` (`sqlcmisc.cpp:762-767`).
+  A call that can leave a response pending must end through
+  `exec_common::finish_operation`, not by dropping the guard: a signal that
+  lands after its last read latches the client's token, so the call itself
+  abandons the pending response and reports HY008 rather than leaking the
+  cancellation into a later call.
 
 ### 7.1. Handle hierarchy and locking
 
