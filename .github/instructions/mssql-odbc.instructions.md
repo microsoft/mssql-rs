@@ -279,6 +279,9 @@ on the `master` branch.
   lands after its last read latches the client's token, so the call itself
   abandons the pending response and reports HY008 rather than leaking the
   cancellation into a later call.
+  Publish the operation's reserved trace execution under the same cancellation
+  lock as `active`, before token publication. SQLCancel binds its trace scope
+  when it selects the target under that lock, not from an earlier FFI snapshot.
 
 ### 7.1. Handle hierarchy and locking
 

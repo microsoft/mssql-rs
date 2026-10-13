@@ -57,6 +57,10 @@ unsafe fn sql_cancel_impl(statement_handle: SqlHandle) -> SqlReturn {
         Ok(cancellation) => cancellation,
         Err(rc) => return rc,
     };
+    debug!(
+        interrupted = cancellation.interrupted,
+        "SQLCancel: target settled"
+    );
     if cancellation.interrupted {
         return SQL_SUCCESS;
     }

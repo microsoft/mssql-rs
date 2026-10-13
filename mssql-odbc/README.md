@@ -252,6 +252,9 @@ Only result/stream continuation and cleanup APIs inherit the last accepted
 execution's `exec`; this includes `SQLRowCount` after a completed no-row command.
 Preparation, binding, and statement-configuration calls omit `exec` so their
 errors cannot be attributed to an earlier command.
+`SQLCancel`'s entry event omits `exec` until it selects the target under the
+cancellation lock. Its target/return events then identify the interrupted
+operation, including cancellation before the starter publishes its token.
 Successful preparation also invalidates the prior execution identity: metadata
 probes for the replacement statement have no `exec` until it executes.
 Diagnostic retrieval logs identify the connection and statement but omit `exec`:

@@ -1584,6 +1584,7 @@ unsafe impl Sync for StmtHandle {}
 struct StatementCancellation {
     handle: CancelHandle,
     active: bool,
+    trace_execution: Option<u64>,
     requested: bool,
     waiters: usize,
     cancelling: bool,
@@ -1696,6 +1697,10 @@ impl StmtHandle {
                 }
             };
         }
+        state.trace_execution = self
+            .trace
+            .as_ref()
+            .and_then(|trace| trace.operation_execution());
         state.active = true;
         state.requested = false;
         state.handle.set_cancel_timeout_secs(timeout_secs);
@@ -1714,6 +1719,13 @@ impl StmtHandle {
             return Err(odbc_types::SQL_ERROR);
         };
         let interrupted = state.active;
+        if let Some(trace) = &self.trace {
+            trace.correlate_cancellation(if interrupted {
+                state.trace_execution
+            } else {
+                trace.last_execution()
+            });
+        }
         state.handle.set_cancel_timeout_secs(timeout_secs);
         if interrupted {
             state.requested = true;

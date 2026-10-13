@@ -350,7 +350,6 @@ fn continues_execution(api: &str) -> bool {
             | "SQLColAttributeW"
             | "SQLParamData"
             | "SQLPutData"
-            | "SQLCancel"
             | "SQLCloseCursor"
             | "SQLFreeStmt(SQL_CLOSE)"
     )
@@ -386,8 +385,8 @@ pub(crate) unsafe fn context_for(
                 Some(trace) => {
                     let context = context.statement(Arc::clone(trace), starts_execution(api));
                     if !starts_execution(api) && !continues_execution(api) {
-                        // Preparation, configuration, and diagnostic calls must
-                        // not attribute their errors to an earlier execution.
+                        // SQLCancel binds its target under the cancellation
+                        // lock. Other non-continuations never inherit exec.
                         context.without_execution()
                     } else {
                         context
@@ -1435,11 +1434,114 @@ mod tests {
                     .iter()
                     .any(|line| line.contains(&format!("{api} returning")))
             );
-            assert!(lines.iter().all(|line| {
-                line.contains(&format!("cid={} ", id.to_string().to_uppercase()))
-                    && line.contains("stmt=")
-                    && line.contains("exec=1 ")
-            }));
+            for line in lines {
+                assert!(line.contains(&format!("cid={} ", id.to_string().to_uppercase())));
+                assert!(line.contains("stmt="));
+                if line.contains("SQLCancel called") {
+                    assert!(!line.contains("exec="));
+                } else {
+                    assert!(line.contains("exec=1 "));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cancel_before_token_publication_targets_the_reserved_execution() {
+        use crate::api::SQLCancel;
+        use crate::api::odbc_types::{SQL_SUCCESS, SqlHandle};
+        use crate::handles::{DbcHandle, StmtHandle, handle_from_raw};
+        use crate::test_support::TestHandles;
+        use mssql_tds::connection::tds_client::ExecuteOptions;
+        use mssql_tds::error::Error as TdsError;
+        use mssql_tds::test_client_support::{done_no_more, tds_client_from_tokens};
+        use mssql_tds::trace_context;
+        use std::time::{Duration, Instant};
+
+        for previous_execution in [false, true] {
+            let id = uuid::Uuid::new_v4();
+            let expected_execution = if previous_execution { 2 } else { 1 };
+            let output = capture_correlation(|| {
+                let h = TestHandles::with_env_dbc_stmt();
+                let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+                let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+                dbc.trace.establish(id);
+                if previous_execution {
+                    let _previous = unsafe { context_for(h.stmt, "SQLExecute") }.enter();
+                    trace_context::activate_execution();
+                }
+
+                let _execution = unsafe { context_for(h.stmt, "SQLExecute") }.enter();
+                let operation = stmt.begin_operation().unwrap();
+                assert_eq!(trace_context::snapshot().exec, Some(expected_execution));
+                let raw = h.stmt as usize;
+                let dispatch = tracing::dispatcher::get_default(Clone::clone);
+                std::thread::scope(|scope| {
+                    let (done, completed) = std::sync::mpsc::channel();
+                    let cancel = scope.spawn(move || {
+                        tracing::dispatcher::with_default(&dispatch, || {
+                            let rc = unsafe { SQLCancel(raw as SqlHandle) };
+                            assert_eq!(trace_context::snapshot(), Default::default());
+                            done.send(rc).unwrap();
+                        });
+                    });
+                    let deadline = Instant::now() + Duration::from_secs(2);
+                    while !stmt.cancellation_state_for_test().1 {
+                        assert!(Instant::now() < deadline, "SQLCancel never signalled");
+                        std::thread::yield_now();
+                    }
+                    let token = stmt.new_execution_cancel().unwrap();
+                    let mut client = tds_client_from_tokens(vec![done_no_more()]);
+                    let result = dbc.runtime.block_on(
+                        client
+                            .execute("SELECT 1".to_string(), ExecuteOptions::new().cancel(&token)),
+                    );
+                    assert!(matches!(result, Err(TdsError::OperationCancelledError(_))));
+                    // No accepted execution has been published yet.
+                    {
+                        let _continuation = unsafe { context_for(h.stmt, "SQLRowCount") }.enter();
+                        assert_eq!(
+                            trace_context::snapshot().exec,
+                            previous_execution.then_some(1)
+                        );
+                    }
+                    trace_context::activate_execution();
+                    assert!(completed.try_recv().is_err());
+                    drop(operation);
+                    assert_eq!(
+                        completed.recv_timeout(Duration::from_secs(2)).unwrap(),
+                        SQL_SUCCESS
+                    );
+                    cancel.join().unwrap();
+                });
+                assert_eq!(trace_context::snapshot().exec, Some(expected_execution));
+            });
+            let lines: Vec<_> = output
+                .lines()
+                .filter(|line| line.contains("SQLCancel"))
+                .collect();
+            assert!(
+                lines
+                    .iter()
+                    .any(|line| line.contains("SQLCancel: target settled"))
+            );
+            assert!(
+                lines
+                    .iter()
+                    .any(|line| line.contains("SQLCancel returning"))
+            );
+            for line in lines {
+                assert!(line.contains(&format!("cid={} ", id.to_string().to_uppercase())));
+                assert!(line.contains("stmt="));
+                if line.contains("SQLCancel called") {
+                    assert!(!line.contains("exec="));
+                } else {
+                    assert!(
+                        line.contains(&format!("exec={expected_execution} ")),
+                        "{line}"
+                    );
+                }
+            }
         }
     }
 

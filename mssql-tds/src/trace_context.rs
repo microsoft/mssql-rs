@@ -165,6 +165,47 @@ impl StatementTrace {
     pub fn clear_execution(&self) {
         self.active_execution.store(0, Ordering::Relaxed);
     }
+
+    /// Snapshot the operation admitted by the caller's cancellation lock. A
+    /// starter uses its reserved ID before it accepts the execution claim;
+    /// continuations refresh their ID after waiting for a previous call.
+    pub fn operation_execution(&self) -> Option<u64> {
+        CURRENT.with(|current| {
+            let mut context = current.borrow_mut();
+            if context
+                .statement
+                .as_ref()
+                .is_none_or(|statement| statement.id != self.id)
+            {
+                return self.last_execution();
+            }
+            if !context.new_execution {
+                context.execution = self.active_execution.load(Ordering::Relaxed);
+            }
+            (context.execution != 0).then_some(context.execution)
+        })
+    }
+
+    pub fn last_execution(&self) -> Option<u64> {
+        let execution = self.active_execution.load(Ordering::Relaxed);
+        (execution != 0).then_some(execution)
+    }
+
+    /// Bind the current cancel scope to the operation selected under the
+    /// cancellation lock without publishing it as an accepted execution.
+    pub fn correlate_cancellation(&self, execution: Option<u64>) {
+        CURRENT.with(|current| {
+            let mut context = current.borrow_mut();
+            if context
+                .statement
+                .as_ref()
+                .is_some_and(|statement| statement.id == self.id)
+            {
+                context.execution = execution.unwrap_or(0);
+                context.new_execution = false;
+            }
+        });
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -565,6 +606,34 @@ mod tests {
             assert_eq!(snapshot(), Snapshot::default());
         });
         result.join().unwrap();
+    }
+
+    #[test]
+    fn operation_correlation_uses_reserved_or_latest_accepted_execution() {
+        enable();
+        let statement = Arc::new(StatementTrace::default());
+        let continuation = Context::default().statement(Arc::clone(&statement), false);
+        {
+            let _starter = Context::default()
+                .statement(Arc::clone(&statement), true)
+                .enter();
+            assert_eq!(statement.operation_execution(), Some(1));
+            assert_eq!(statement.last_execution(), None);
+            activate_execution();
+        }
+        {
+            let _continuation = continuation.enter();
+            assert_eq!(snapshot().exec, None);
+            assert_eq!(statement.operation_execution(), Some(1));
+            assert_eq!(snapshot().exec, Some(1));
+        }
+        assert_eq!(statement.operation_execution(), Some(1));
+        let _other = Context::default().statement(Arc::default(), true).enter();
+        let other = snapshot();
+        statement.correlate_cancellation(Some(99));
+        assert_eq!(snapshot(), other);
+        assert_eq!(statement.operation_execution(), Some(1));
+        assert_eq!(snapshot(), other);
     }
 
     #[test]
