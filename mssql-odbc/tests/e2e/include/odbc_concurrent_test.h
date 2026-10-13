@@ -31,6 +31,10 @@
 //                no state and clear no records. Observers check that every
 //                record is well formed. Owner failures are reported directly.
 //                The body must not free or replace stmt_ or dbc_.
+//                The Driver Manager serializes calls per handle (Windows, and
+//                unixODBC at the Threading=1 run_e2e.sh sets), so only the DBC
+//                reads overlap the owner's calls in the driver; STMT reads run
+//                between them.
 //
 // Worker() and Iteration() identify the run (0, 0 when single-threaded).
 // WorkerToken() derives a value unique to the run, so a result delivered to

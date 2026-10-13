@@ -78,7 +78,7 @@ ODBC_TEST_F_MODES(GetDataLiveTest, EachRunReadsItsOwnValue,
 | `CrossThread` | SetUp, body, and TearDown on three different threads | As `TEST_F`; catches thread affinity (handles move between threads in pools, async runtimes, and finalizers) | - |
 | `SharedEnv` | `THREADS` workers x `ITERS` runs; shared ENV, own DBC and STMT | Every run passes | Tests that change ENV, pooling, or process state; connect, disconnect, or driver-load tests; fixed-name permanent objects; reliance on `HasFatalFailure()` |
 | `SharedDbc` (opt-in via `ODBC_TEST_F_MODES` with `kAllModes`) | `THREADS` workers x `ITERS` runs; shared DBC, own STMT | Only `HY000` connection busy may fail, and is retried; the connection is idle afterward | As `SharedEnv`, plus connection-attribute or transaction changes, shared temp-object names, bodies unsafe to rerun |
-| `SharedStmt` | Owner runs the body `ITERS` times; `THREADS - 1` observers read its STMT and DBC diagnostics | Owner as `Single`; observers read in every iteration; every record well formed | Bodies that free or replace `stmt_` or `dbc_` |
+| `SharedStmt` | Owner runs the body `ITERS` times; `THREADS - 1` observers read its STMT and DBC diagnostics | Owner as `Single`; observers read in every iteration; every record well formed. Only the DBC reads overlap the owner's calls in the driver; STMT reads are serialized by the Driver Manager (see Driver Manager facts) | Bodies that free or replace `stmt_` or `dbc_` |
 
 - gtest keeps one result per test, not per thread. `SharedEnv` and `SharedDbc`
   therefore capture each run's failures on its own thread (and `SharedDbc`
@@ -236,10 +236,18 @@ Measured 2026-10-08 on both drivers unless noted.
 - **The Windows Driver Manager serializes calls per handle.** A second call on
   a busy STMT, or on a descriptor associated with it, waits; only `SQLCancel`
   bypasses the lock. Calls on another STMT, the DBC, or an unassociated
-  descriptor proceed. So on Windows only `SharedDbc` and `SQLCancel` reach the
-  driver concurrently; same-handle races need the driver loaded without a
-  Driver Manager (see `Threading` below).
-- **unixODBC `Threading`:** 0 none, 1 per handle, 2 per DBC, 3 global (which
+  descriptor proceed.
+- **Effect on the modes, on every platform** (Windows, and unixODBC at the
+  `Threading=1` that `run_e2e.sh` sets, below): calls on one handle never
+  reach the driver concurrently, except `SQLCancel`. `SharedDbc` reaches it
+  concurrently through STMTs on one DBC. `SharedStmt` does through its DBC
+  diagnostic reads only; its STMT reads run between the owner's calls, so
+  that half checks crashes, malformed records, and wrong-thread access, not
+  same-STMT races. It does not detect diagnostics kept per thread: zero
+  records passes, since the owner may have cleared them. Same-STMT races
+  are scenario 8, which loads the driver without a Driver Manager.
+- **unixODBC `Threading`:** 0 none, 1 per handle (a STMT call locks that
+  STMT, a DBC call that DBC), 2 per DBC, 3 global (which
   also locks `SQLCancel`). unixODBC master defaults to 0 when odbcinst.ini does
   not set it; `run_e2e.sh` sets 1 for both legs. At 0, unixODBC's own
   per-handle diagnostic list is unlocked: `/SharedStmt` crashed inside
@@ -279,7 +287,8 @@ Measured 2026-10-08 on both drivers unless noted.
    AB#49263 runs the mode nightly only. Array DML stays out until a busy retry
    cannot duplicate rows.
 4. **Shared STMT diagnostics** (`SharedStmt`): every converted test, especially
-   those that post warnings and errors.
+   those that post warnings and errors. Concurrent in the driver on the DBC
+   only (see Driver Manager facts); same-STMT races are scenario 8.
 5. **Thread handoff** (`CrossThread`): every converted test.
 6. **Diagnostics isolation** (`SharedEnv`, `SharedDbc`): distinct concurrent
    errors appear only on their own handle and clear on successful reuse.
