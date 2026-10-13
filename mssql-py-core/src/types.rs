@@ -533,6 +533,8 @@ pub(crate) fn null_sql_type(hint: ParameterHint) -> TdsResult<SqlType> {
 ///
 /// TVP column definitions carry numeric and temporal metadata separately, so
 /// their templates are not limited to the defaults required by scalar NULLs.
+/// The same template types NULL row cells, whose [`SqlType`] discriminant must
+/// match the column definition for TVP validation.
 pub(crate) fn tvp_column_sql_type(hint: ParameterHint) -> TdsResult<SqlType> {
     match hint.sql_type {
         InputSqlType::Numeric => Ok(SqlType::Numeric(None)),

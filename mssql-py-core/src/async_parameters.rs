@@ -813,19 +813,20 @@ fn rewrite_placeholders(sql: &str, named: bool) -> PyResult<(String, Vec<Placeho
 
 #[cfg(test)]
 mod tests {
-    use super::{rewrite_placeholders, tvp_column_definition};
+    use super::{build_tvp_table, rewrite_placeholders, tvp_column_definition};
     use crate::types::ParameterHint;
     use mssql_tds::datatypes::sqltypes::SqlType;
+    use pyo3::{IntoPyObject, Python};
 
     #[test]
     fn tvp_column_definitions_preserve_numeric_and_temporal_metadata() {
         let decimal = tvp_column_definition(ParameterHint::new(3, 12, 2).unwrap()).unwrap();
-        assert!(matches!(decimal.column_type, SqlType::Decimal(None)));
+        assert_eq!(decimal.column_type, SqlType::Decimal(None));
         assert_eq!(decimal.precision, Some(12));
         assert_eq!(decimal.scale, Some(2));
 
         let numeric = tvp_column_definition(ParameterHint::new(2, 38, 10).unwrap()).unwrap();
-        assert!(matches!(numeric.column_type, SqlType::Numeric(None)));
+        assert_eq!(numeric.column_type, SqlType::Numeric(None));
         assert_eq!(numeric.precision, Some(38));
         assert_eq!(numeric.scale, Some(10));
 
@@ -836,13 +837,28 @@ mod tests {
         ] {
             let temporal =
                 tvp_column_definition(ParameterHint::new(sql_type, 0, 3).unwrap()).unwrap();
-            assert_eq!(
-                std::mem::discriminant(&temporal.column_type),
-                std::mem::discriminant(&expected)
-            );
+            assert_eq!(temporal.column_type, expected);
             assert_eq!(temporal.precision, None);
             assert_eq!(temporal.scale, Some(3));
         }
+    }
+
+    #[test]
+    fn tvp_null_cells_use_column_templates() {
+        Python::attach(|py| {
+            let columns = vec![(3, 12, 2), (92, 0, 3), (4, 0, 0)]
+                .into_pyobject(py)
+                .unwrap();
+            let rows = vec![vec![None::<i32>, None, None]]
+                .into_pyobject(py)
+                .unwrap();
+
+            let table = build_tvp_table(columns.as_any(), rows.as_any()).unwrap();
+
+            assert_eq!(table.rows[0][0], SqlType::Decimal(None));
+            assert_eq!(table.rows[0][1], SqlType::Time(None));
+            assert_eq!(table.rows[0][2], SqlType::Int(None));
+        });
     }
 
     #[test]

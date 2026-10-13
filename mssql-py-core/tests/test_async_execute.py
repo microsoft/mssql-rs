@@ -983,6 +983,7 @@ def test_table_valued_parameter_preserves_numeric_and_temporal_metadata(client_c
         (93, 0, 3),
         (-155, 0, 3),
     ]
+    expected_offset = datetime.timedelta(hours=-5, minutes=-30)
     populated_row = (
         Decimal("123.45"),
         Decimal("123.4500000000"),
@@ -996,7 +997,7 @@ def test_table_valued_parameter_preserves_numeric_and_temporal_metadata(client_c
             34,
             56,
             123000,
-            tzinfo=datetime.timezone(datetime.timedelta(hours=-5, minutes=-30)),
+            tzinfo=datetime.timezone(expected_offset),
         ),
     )
 
@@ -1022,7 +1023,8 @@ def test_table_valued_parameter_preserves_numeric_and_temporal_metadata(client_c
             await cursor.execute("SELECT * FROM ?", populated)
             row = await cursor.fetchone()
             assert row is not None
-            assert row[:5] == populated_row
+            assert row == populated_row
+            assert row[4].utcoffset() == expected_offset
             assert await cursor.fetchone() is None
 
             null_cells = mssql_py_core.TableValuedParameter(
