@@ -108,6 +108,7 @@ pub(crate) struct EncryptedRpcValue {
 /// independently - see [`RpcParameter::with_streamed_declaration`] - so a
 /// `varchar(10)` parameter still streams its body as `varchar(max)`.
 ///
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamedSqlType {
     /// Unicode MAX text.

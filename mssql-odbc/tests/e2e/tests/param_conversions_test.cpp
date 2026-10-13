@@ -2463,11 +2463,11 @@ protected:
         return std::vector<SQLCHAR>(buf, buf + (ind > 0 ? ind : 0));
     }
 
-    // A second system CLR type, so a multi-parameter test can prove each
-    // ordinal carried its own name rather than reusing the first.
-    std::vector<SQLCHAR> SerializedGeometry(const std::string& wkt) {
+    std::vector<SQLCHAR> SerializedSpatial(const std::string& type_name, const std::string& wkt,
+                                           int srid) {
         SqlTString sql = ODBCTestUtils::ToSqlTStr(
-            "SELECT CAST(geometry::STGeomFromText('" + wkt + "', 0) AS VARBINARY(MAX))");
+            "SELECT CAST(" + type_name + "::STGeomFromText('" + wkt + "', " +
+            std::to_string(srid) + ") AS VARBINARY(MAX))");
         EXPECT_SQL_OK(SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS),
                       SQL_HANDLE_STMT, stmt_);
         EXPECT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
@@ -2478,7 +2478,7 @@ protected:
         EXPECT_TRUE(ind >= 0 || ind == SQL_NO_TOTAL);
         std::vector<SQLCHAR> value;
         // Unknown-length PLP has no count-derived guard; 1,000,000 calls caps
-        // this test at roughly 4 GiB without constraining a valid geometry.
+        // this test at roughly 4 GiB without constraining a valid spatial value.
         constexpr int kUnknownTotalMaxCalls = 1000000;
         const int max_calls =
             ind > 0 ? static_cast<int>(ind / static_cast<SQLLEN>(sizeof(buf))) + 2
@@ -2486,20 +2486,20 @@ protected:
         int calls = 0;
         while (rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO) {
             if (++calls > max_calls) {
-                ADD_FAILURE() << "chunked geometry read did not terminate";
+                ADD_FAILURE() << "chunked spatial read did not terminate";
                 break;
             }
             if (ind < 0 && ind != SQL_NO_TOTAL) {
-                ADD_FAILURE() << "chunked geometry read returned an invalid indicator";
+                ADD_FAILURE() << "chunked spatial read returned an invalid indicator";
                 break;
             }
             if (rc == SQL_SUCCESS && ind == SQL_NO_TOTAL) {
-                ADD_FAILURE() << "final geometry chunk returned no byte count";
+                ADD_FAILURE() << "final spatial chunk returned no byte count";
                 break;
             }
             const SQLLEN chunk = (rc == SQL_SUCCESS) ? ind : static_cast<SQLLEN>(sizeof(buf));
             if (chunk > static_cast<SQLLEN>(sizeof(buf))) {
-                ADD_FAILURE() << "final geometry chunk overruns the buffer";
+                ADD_FAILURE() << "final spatial chunk overruns the buffer";
                 break;
             }
             value.insert(value.end(), buf, buf + chunk);
@@ -2512,6 +2512,14 @@ protected:
         }
         EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
         return value;
+    }
+
+    std::vector<SQLCHAR> SerializedGeometry(const std::string& wkt) {
+        return SerializedSpatial("geometry", wkt, 0);
+    }
+
+    std::vector<SQLCHAR> SerializedGeography(const std::string& wkt) {
+        return SerializedSpatial("geography", wkt, 4326);
     }
 
     SQLLEN indicator_ = 0;
@@ -2987,36 +2995,49 @@ TEST_F(UdtParamLiveTest, DataAtExecutionOverflowingColumnSizeIsRejected) {
 }
 
 // Benefits-from-mock-tds: assert the materialized hierarchyid stays ahead of
-// the streamed geometry and each ordinal's UDT TYPE_INFO carries its own name.
+// the streamed spatial values and each ordinal's UDT TYPE_INFO carries its own name.
 TEST_F(UdtParamLiveTest, MaterializedAndStreamedUdtParametersKeepTheirOwnNames) {
     std::vector<SQLCHAR> hierarchyid = SerializedHierarchyId("/1/");
     std::vector<SQLCHAR> geometry = SerializedGeometry("POINT (3 4)");
+    std::vector<SQLCHAR> geography = SerializedGeography("POINT (-122.349 47.651)");
     ASSERT_FALSE(hierarchyid.empty());
     ASSERT_FALSE(geometry.empty());
+    ASSERT_FALSE(geography.empty());
 
     ASSERT_SQL_OK(Prepare("SELECT CAST(? AS hierarchyid).ToString()"
-                          " + '|' + CAST(? AS geometry).STAsText()"),
+                          " + '|' + CAST(? AS geometry).STAsText()"
+                          " + '|' + CAST(? AS geography).STAsText()"),
                   SQL_HANDLE_STMT, stmt_);
     SQLLEN hierarchyidLen = static_cast<SQLLEN>(hierarchyid.size());
     ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_BINARY, SQL_SS_UDT, 0, 0,
                                    hierarchyid.data(), hierarchyidLen, &hierarchyidLen),
                   SQL_HANDLE_STMT, stmt_);
-    SQLCHAR token = 0;
+    SQLCHAR geometryToken = 0;
     SQLLEN geometryInd = SQL_DATA_AT_EXEC;
     ASSERT_SQL_OK(SQLBindParameter(stmt_, 2, SQL_PARAM_INPUT, SQL_C_BINARY, SQL_SS_UDT, 0, 0,
-                                   &token, 0, &geometryInd),
+                                   &geometryToken, 0, &geometryInd),
+                  SQL_HANDLE_STMT, stmt_);
+    SQLCHAR geographyToken = 0;
+    SQLLEN geographyInd = SQL_DATA_AT_EXEC;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 3, SQL_PARAM_INPUT, SQL_C_BINARY, SQL_SS_UDT, 0, 0,
+                                   &geographyToken, 0, &geographyInd),
                   SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(SetUdtName("hierarchyid", "", 1), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(SetUdtName("geometry", "", 2), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SetUdtName("geography", "", 3), SQL_HANDLE_STMT, stmt_);
 
     ASSERT_EQ(SQL_NEED_DATA, SQLExecute(stmt_));
     SQLPOINTER returned = nullptr;
     ASSERT_EQ(SQL_NEED_DATA, SQLParamData(stmt_, &returned));
-    EXPECT_EQ(&token, returned);
+    EXPECT_EQ(&geometryToken, returned);
     ASSERT_SQL_OK(SQLPutData(stmt_, geometry.data(), static_cast<SQLLEN>(geometry.size())),
                   SQL_HANDLE_STMT, stmt_);
+    ASSERT_EQ(SQL_NEED_DATA, SQLParamData(stmt_, &returned));
+    EXPECT_EQ(&geographyToken, returned);
+    ASSERT_SQL_OK(SQLPutData(stmt_, geography.data(), static_cast<SQLLEN>(geography.size())),
+                  SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(SQLParamData(stmt_, &returned), SQL_HANDLE_STMT, stmt_);
-    EXPECT_EQ("/1/|POINT (3 4)", ReadBack());
+    EXPECT_EQ("/1/|POINT (3 4)|POINT (-122.349 47.651)", ReadBack());
 }
 
 // Benefits-from-mock-tds: assert the large geometry payload is emitted as

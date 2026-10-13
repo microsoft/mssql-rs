@@ -735,7 +735,9 @@ pub(crate) fn dae_length_limit(
 /// collected buffer, so a streamed value is declared and converted by exactly
 /// the code a materialized one is: `ParameterType` picks the declaration,
 /// `ColumnSize` bounds it with the same trim-or-`22001` rule, and a cross-family
-/// pairing transcodes instead of being refused (AB#47590).
+/// pairing transcodes instead of being refused (AB#47590). XML remains
+/// unlimited because collecting a DAE value to preserve bind order does not
+/// change the application's execution-time indicator.
 ///
 /// `is_null` carries a parameter that `SQLPutData` marked `SQL_NULL_DATA`, which
 /// must produce a typed NULL rather than an empty value.

@@ -344,7 +344,7 @@ unsafe fn sql_put_data_safe(
             .current_param()
             .map(|param| param.is_buffered() || dae.deferred)
         else {
-            error!("SQLPutData: open data-at-execution parameter has no plan");
+            error!("SQLPutData: no open data-at-execution parameter");
             post_diag(&mut stmt_state, ERR_FUNCTION_SEQUENCE);
             return SQL_ERROR;
         };
