@@ -236,7 +236,9 @@ Measured 2026-10-08 on both drivers unless noted.
   `SQLGetData`, `SQLMoreResults`, `SQLPutData`, or final `SQLParamData` from
   another thread; the call fails `HY008` (msodbcsql's `SQLMoreResults`
   returns `SQL_NO_DATA`, [parity registry](parity-deviations.md) entry 27).
-  Covered on both Driver Managers by `multithreaded_tests/cancel_test.cpp`.
+  `multithreaded_tests/cancel_test.cpp` covers all of those on both Driver
+  Managers except a blocked `SQLGetData`, which entry 27 pins from source and
+  Rust unit tests; its e2e case is listed under AB#49258 below.
 - **The Windows Driver Manager serializes calls per handle.** A second call on
   a busy STMT, or on a descriptor associated with it, waits; only `SQLCancel`
   bypasses the lock. Calls on another STMT, the DBC, or an unassociated
@@ -417,7 +419,7 @@ Tracked under AB#49256:
 2. **AB#49263:** CTest split, PR filter, nightly and weekly profiles, dumps.
 3. **AB#49260:** fetch and GetData suites, plus worker-token tests.
 4. **AB#49258:** parameter and execution suites, plus worker-token tests; and
-   three cancel cases `cancel_test.cpp` does not cover, added to it:
+   four cancel cases `cancel_test.cpp` does not cover, added to it:
    - An idle cancel with an open cursor leaves it as it was (skip msodbcsql,
      which aborts it).
    - A cancel just before execute does not leak into that or the next
@@ -425,6 +427,8 @@ Tracked under AB#49256:
      directly).
    - A fetch blocked by a row lock held by a second connection, rather than a
      `WAITFOR` inside the batch.
+   - A `SQLGetData` blocked mid-stream on a PLP column, the one operation in
+     the cancel list above with no e2e case.
 5. **AB#49262:** diagnostics, descriptor, metadata, and attribute suites;
    scenario 6.
 6. **AB#49261:** scenarios 7 and 10.
