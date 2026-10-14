@@ -1021,9 +1021,15 @@ def test_table_valued_parameter_preserves_numeric_and_temporal_metadata(client_c
                 qualified_type_name, columns, [populated_row]
             )
             await cursor.execute("SELECT * FROM ?", populated)
+            description = cursor.description
+            assert description is not None
+            assert [column[5] for column in description] == [2, 10, 3, 3, 3]
+
             row = await cursor.fetchone()
             assert row is not None
             assert row == populated_row
+            assert row[0].as_tuple().exponent == -2
+            assert row[1].as_tuple().exponent == -10
             assert row[4].utcoffset() == expected_offset
             assert await cursor.fetchone() is None
 
@@ -1033,7 +1039,7 @@ def test_table_valued_parameter_preserves_numeric_and_temporal_metadata(client_c
             await cursor.execute("SELECT * FROM ?", null_cells)
             row = await cursor.fetchone()
             assert row is not None
-            assert row[:5] == (None,) * len(columns)
+            assert row == (None,) * len(columns)
             assert await cursor.fetchone() is None
 
             empty = mssql_py_core.TableValuedParameter(qualified_type_name, columns, [])

@@ -312,19 +312,71 @@ fn build_tvp_table(columns: &Bound<'_, PyAny>, rows: &Bound<'_, PyAny>) -> PyRes
         let converted = cells
             .iter()
             .zip(&hints)
-            .map(|(cell, hint)| {
-                if cell.is_none() {
-                    tvp_column_sql_type(*hint)
+            .zip(&column_defs)
+            .enumerate()
+            .map(|(column_index, ((cell, hint), column))| {
+                let value = if cell.is_none() {
+                    Ok(column.column_type.clone())
                 } else {
                     py_to_sql_type_with_hint(cell, *hint)
                 }
-                .map_err(|error| PyTypeError::new_err(error.to_string()))
+                .map_err(|error| PyTypeError::new_err(error.to_string()))?;
+                validate_tvp_cell_length(row_index, column_index, &column.column_type, &value)?;
+                Ok(value)
             })
             .collect::<PyResult<Vec<_>>>()?;
         converted_rows.push(converted);
     }
 
     Ok(TvpTableData::new(column_defs, converted_rows))
+}
+
+fn validate_tvp_cell_length(
+    row_index: usize,
+    column_index: usize,
+    column_type: &SqlType,
+    cell_type: &SqlType,
+) -> PyResult<()> {
+    let mismatch = match (column_type, cell_type) {
+        (SqlType::Char(_, declared), SqlType::Char(_, actual)) if actual > declared => {
+            Some(("CHAR", u32::from(*declared), u32::from(*actual)))
+        }
+        (SqlType::Varchar(_, declared), SqlType::Varchar(_, actual)) if actual > declared => {
+            Some(("VARCHAR", u32::from(*declared), u32::from(*actual)))
+        }
+        (SqlType::Varchar(_, declared), SqlType::VarcharMax(Some(value))) => {
+            Some(("VARCHAR", u32::from(*declared), value.bytes.len() as u32))
+        }
+        (SqlType::NChar(_, declared), SqlType::NChar(_, actual)) if actual > declared => {
+            Some(("NCHAR", u32::from(*declared), u32::from(*actual)))
+        }
+        (SqlType::NVarchar(_, declared), SqlType::NVarchar(_, actual)) if actual > declared => {
+            Some(("NVARCHAR", u32::from(*declared), u32::from(*actual)))
+        }
+        (SqlType::NVarchar(_, declared), SqlType::NVarcharMax(Some(value))) => Some((
+            "NVARCHAR",
+            u32::from(*declared),
+            value.to_utf8_string().encode_utf16().count() as u32,
+        )),
+        (SqlType::Binary(_, declared), SqlType::Binary(_, actual)) if actual > declared => {
+            Some(("BINARY", u32::from(*declared), u32::from(*actual)))
+        }
+        (SqlType::VarBinary(_, declared), SqlType::VarBinary(_, actual)) if actual > declared => {
+            Some(("VARBINARY", u32::from(*declared), u32::from(*actual)))
+        }
+        (SqlType::VarBinary(_, declared), SqlType::VarBinaryMax(Some(value))) => {
+            Some(("VARBINARY", u32::from(*declared), value.len() as u32))
+        }
+        _ => None,
+    };
+
+    if let Some((type_name, declared, actual)) = mismatch {
+        return Err(PyTypeError::new_err(format!(
+            "TVP row {row_index} column {column_index} value length {actual} exceeds declared {type_name}({declared}) capacity"
+        )));
+    }
+
+    Ok(())
 }
 
 fn tvp_column_definition(hint: ParameterHint) -> TdsResult<TvpColumnDef> {
@@ -858,6 +910,82 @@ mod tests {
             assert_eq!(table.rows[0][0], SqlType::Decimal(None));
             assert_eq!(table.rows[0][1], SqlType::Time(None));
             assert_eq!(table.rows[0][2], SqlType::Int(None));
+        });
+    }
+
+    #[test]
+    fn tvp_bounded_cells_accept_exact_declared_lengths() {
+        Python::attach(|py| {
+            let columns = vec![(12, 4, 0), (-9, 2, 0), (-3, 4, 0)]
+                .into_pyobject(py)
+                .unwrap();
+            let rows = pyo3::types::PyList::new(
+                py,
+                [pyo3::types::PyTuple::new(
+                    py,
+                    [
+                        "four".into_pyobject(py).unwrap().into_any(),
+                        "😀".into_pyobject(py).unwrap().into_any(),
+                        vec![1_u8, 2, 3, 4].into_pyobject(py).unwrap().into_any(),
+                    ],
+                )
+                .unwrap()],
+            )
+            .unwrap();
+
+            build_tvp_table(columns.as_any(), rows.as_any()).unwrap();
+        });
+    }
+
+    #[test]
+    fn tvp_bounded_cells_report_declared_length_overruns() {
+        Python::attach(|py| {
+            for (sql_type, size, value, expected) in [
+                (12, 4, "fives", "VARCHAR(4)"),
+                (-9, 2, "abc", "NVARCHAR(2)"),
+            ] {
+                let columns = vec![(sql_type, size, 0)].into_pyobject(py).unwrap();
+                let rows = vec![vec![value]].into_pyobject(py).unwrap();
+
+                let error = build_tvp_table(columns.as_any(), rows.as_any()).unwrap_err();
+
+                assert!(error.to_string().contains("TVP row 0 column 0"));
+                assert!(error.to_string().contains(expected));
+            }
+
+            let columns = vec![(-3, 4, 0)].into_pyobject(py).unwrap();
+            let rows = vec![vec![vec![1_u8, 2, 3, 4, 5]]]
+                .into_pyobject(py)
+                .unwrap();
+            let error = build_tvp_table(columns.as_any(), rows.as_any()).unwrap_err();
+
+            assert!(error.to_string().contains("TVP row 0 column 0"));
+            assert!(error.to_string().contains("VARBINARY(4)"));
+        });
+    }
+
+    #[test]
+    fn tvp_bounded_cells_report_max_promotion_as_length_overrun() {
+        Python::attach(|py| {
+            for (sql_type, size, value, expected) in [
+                (12, 8_000, "x".repeat(8_001), "VARCHAR(8000)"),
+                (-9, 4_000, "x".repeat(4_001), "NVARCHAR(4000)"),
+            ] {
+                let columns = vec![(sql_type, size, 0)].into_pyobject(py).unwrap();
+                let rows = vec![vec![value]].into_pyobject(py).unwrap();
+
+                let error = build_tvp_table(columns.as_any(), rows.as_any()).unwrap_err();
+
+                assert!(error.to_string().contains("TVP row 0 column 0"));
+                assert!(error.to_string().contains(expected));
+            }
+
+            let columns = vec![(-3, 8_000, 0)].into_pyobject(py).unwrap();
+            let rows = vec![vec![vec![0_u8; 8_001]]].into_pyobject(py).unwrap();
+            let error = build_tvp_table(columns.as_any(), rows.as_any()).unwrap_err();
+
+            assert!(error.to_string().contains("TVP row 0 column 0"));
+            assert!(error.to_string().contains("VARBINARY(8000)"));
         });
     }
 
