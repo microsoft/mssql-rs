@@ -505,6 +505,19 @@ bool RunPhase(const char* location, F&& phase) {
     return false;
 }
 
+// Serializes fixture construction and destruction. testing::Test holds a
+// GTestFlagSaver: its constructor reads every process-global gtest flag and its
+// destructor writes them all back, through the non-Abseil GTEST_FLAG_GET/SET,
+// which are bare global accesses. Five of those flags are std::string, so two
+// workers overlapping there is a data race with real teardown risk, not just a
+// stale value, even though no test body touches a flag. Only this runner builds
+// fixtures off the gtest thread; CrossThread, SharedStmt, and the gtest factory
+// each build theirs on one thread.
+inline std::mutex& FixtureLifecycleMutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
 // Runs one iteration with its failures captured for this thread only. Workers
 // must not report into, or read, the current test's shared TestResult while
 // other workers write to it: gtest appends to it under a lock but reads it
@@ -517,7 +530,18 @@ void RunCapturedIteration(SQLHENV env, SQLHDBC dbc, Mode mode, int worker, int i
         ::testing::ScopedFakeTestPartResultReporter::INTERCEPT_ONLY_CURRENT_THREAD, &parts);
     SCOPED_TRACE(tag);
     std::unique_ptr<T> test;
-    if (!RunPhase("the test fixture's constructor", [&] { test.reset(new T(mode)); })) {
+    // Destroys the fixture under the lock its construction took, on every path.
+    struct SerialDestroy {
+        std::unique_ptr<T>& test;
+        ~SerialDestroy() {
+            std::lock_guard<std::mutex> guard(FixtureLifecycleMutex());
+            test.reset();
+        }
+    } serial_destroy{test};
+    if (!RunPhase("the test fixture's constructor", [&] {
+            std::lock_guard<std::mutex> guard(FixtureLifecycleMutex());
+            test.reset(new T(mode));
+        })) {
         return;
     }
     RunPhase("SetUp()", [&] { test->ConcurrentSetUp(env, dbc, worker, iteration); });
