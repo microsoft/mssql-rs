@@ -769,16 +769,25 @@ inline bool CheckDiagnostics(SQLSMALLINT type, SQLHANDLE handle, std::string& er
             error = where + "SQLGetDiagRec rc=" + std::to_string(rc);
             return false;
         }
+        // SQLSTATE is five characters plus a terminator. Check the terminator
+        // before formatting: ToNarrow takes a SqlTString, which scans for a null,
+        // so an unterminated buffer would be read past its end — the corruption
+        // this validator exists to catch. The characters are formatted with an
+        // explicit length so that holds however this is reordered later.
+        if (state[5] != 0) {
+            error = where + "unterminated SQLSTATE";
+            return false;
+        }
         for (int i = 0; i < 5; ++i) {
             const SQLTCHAR c = state[i];
             if (!((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z'))) {
-                error = where + "malformed SQLSTATE '" + ODBCTestUtils::ToNarrow(state) + "'";
+                error = where + "malformed SQLSTATE '" +
+                        ODBCTestUtils::ToNarrow(SqlTString(state, 5)) + "'";
                 return false;
             }
         }
-        if (state[5] != 0 || text_len < 0) {
-            error = where + "unterminated SQLSTATE or negative length " +
-                    std::to_string(text_len);
+        if (text_len < 0) {
+            error = where + "negative message length " + std::to_string(text_len);
             return false;
         }
         if (rc == SQL_SUCCESS) {
