@@ -182,6 +182,40 @@ void MSSQL_SQLCMD_CALL mssql_sqlcmd_free_text(const uint16_t* text, size_t len);
 #define MSSQL_SQLCMD_SOURCE_COMMAND_LINE 1
 #define MSSQL_SQLCMD_SOURCE_ENVIRONMENT 2
 #define MSSQL_SQLCMD_SOURCE_DEFAULT 3
+/* One diagnostic record of sqlcmd's own driver connection, as sqlcmd reads it. */
+typedef struct MssqlSqlcmdDriverRecord {
+    MssqlSqlcmdText sql_state; /* the ODBC SQLSTATE */
+    int32_t native_error;      /* SQL Server's error number or the driver's; 0 for none */
+    int32_t severity;          /* SQL Server's severity; -1 for a record the driver raised */
+    int32_t state;             /* SQL Server's state; -1 for none */
+    MssqlSqlcmdText message;   /* without the driver's [vendor][component] prefix */
+    MssqlSqlcmdText line;      /* the line sqlcmd prints for it; NULL or empty for none */
+} MssqlSqlcmdDriverRecord;
+
+/* What sqlcmd's own driver connection did; filled by the callback. */
+typedef struct MssqlSqlcmdDriverResult {
+    int32_t connected;         /* non-zero when the connection succeeded */
+    int64_t connect_ms;
+    int32_t query_failed;      /* non-zero when the query ran and failed */
+    int64_t query_ms;
+    const MssqlSqlcmdText* values; /* the query's first row; a NULL data is SQL NULL */
+    size_t value_count;
+    const MssqlSqlcmdDriverRecord* records; /* the connection's, then the query's */
+    size_t record_count;
+    MssqlSqlcmdText driver_name; /* e.g. "Microsoft ODBC Driver 18 for SQL Server" */
+} MssqlSqlcmdDriverResult;
+
+/* sqlcmd's own driver connection: connects with sqlcmd's driver and settings
+   within timeout_seconds, runs query when it is not NULL or empty, disconnects,
+   and fills *result. Returns MSSQL_SQLCMD_OK (a failed connection is a result,
+   not an error). Called at most once per diagnosis, on the thread that called
+   mssql_sqlcmd_diagnostics_run; what *result points to must stay valid until
+   that call returns. */
+typedef int32_t (MSSQL_SQLCMD_CALL *MssqlSqlcmdDriverConnect)(
+    void* context,
+    MssqlSqlcmdText query,
+    int32_t timeout_seconds,
+    MssqlSqlcmdDriverResult* result);
 
 typedef struct MssqlSqlcmdDiagnosticsRequest {
     MssqlSqlcmdText server;   /* -S; required unless invalid_reason is given */
@@ -213,6 +247,12 @@ typedef struct MssqlSqlcmdDiagnosticsRequest {
     MssqlSqlcmdText trust_server_certificate_source_name;
     MssqlSqlcmdText host_name_in_certificate_source_name;
     MssqlSqlcmdText login_timeout_source_name;
+    /* sqlcmd's own driver connection, or NULL. When given, the connection
+       attempt and session validation are made through it and decide the
+       result; mssql-tds then only adds evidence where the driver's errors
+       leave the cause open. */
+    MssqlSqlcmdDriverConnect driver_connect;
+    void* driver_context;       /* passed to driver_connect as it is */
 } MssqlSqlcmdDiagnosticsRequest;
 
 /* Diagnoses the connection up to request->depth (name resolution, SQL Server

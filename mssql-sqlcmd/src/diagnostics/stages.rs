@@ -173,6 +173,14 @@ impl StageRecorder {
         Self::default()
     }
 
+    /// Forgets the stages recorded so far: a second connection's stages are
+    /// not mixed with the first's.
+    pub fn clear(&self) {
+        if let Ok(mut steps) = self.steps.lock() {
+            steps.clear();
+        }
+    }
+
     /// The stages recorded so far, in the order they ended, which is the order
     /// they ran in (login, which contains the TLS handshake when encryption
     /// starts at login, follows it). A login is timed without its TLS
