@@ -2,9 +2,11 @@
 // Licensed under the MIT License.
 
 use mssql_tds::core::TdsResult;
+use mssql_tds::datatypes::sql_string::SqlString;
 use mssql_tds::datatypes::sql_tvp::{TvpColumnDef, TvpTableData, TvpTypeName};
 use mssql_tds::datatypes::sqldatatypes::VectorBaseType;
 use mssql_tds::datatypes::sqltypes::SqlType;
+use mssql_tds::error::Error;
 use mssql_tds::message::parameters::rpc_parameters::{RpcParameter, StatusFlags};
 use pyo3::exceptions::{PyKeyError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
@@ -318,10 +320,11 @@ fn build_tvp_table(columns: &Bound<'_, PyAny>, rows: &Bound<'_, PyAny>) -> PyRes
                 let value = if cell.is_none() {
                     Ok(column.column_type.clone())
                 } else {
-                    py_to_sql_type_with_hint(cell, *hint)
+                    tvp_cell_sql_type(cell, *hint, &column.column_type)
                 }
                 .map_err(|error| PyTypeError::new_err(error.to_string()))?;
                 validate_tvp_cell_length(row_index, column_index, &column.column_type, &value)?;
+                validate_tvp_cell_temporal_scale(row_index, column_index, column, &value)?;
                 Ok(value)
             })
             .collect::<PyResult<Vec<_>>>()?;
@@ -331,6 +334,27 @@ fn build_tvp_table(columns: &Bound<'_, PyAny>, rows: &Bound<'_, PyAny>) -> PyRes
     Ok(TvpTableData::new(column_defs, converted_rows))
 }
 
+fn tvp_cell_sql_type(
+    cell: &Bound<'_, PyAny>,
+    hint: ParameterHint,
+    column_type: &SqlType,
+) -> TdsResult<SqlType> {
+    let narrow_value = || {
+        cell.extract::<String>()
+            .map(SqlString::from_utf8_string)
+            .map_err(|error| {
+                Error::UsageError(format!("Failed to convert parameter to string: {error}"))
+            })
+    };
+
+    match column_type {
+        SqlType::Char(_, declared) => Ok(SqlType::Char(Some(narrow_value()?), *declared)),
+        SqlType::Varchar(_, declared) => Ok(SqlType::Varchar(Some(narrow_value()?), *declared)),
+        SqlType::VarcharMax(_) => Ok(SqlType::VarcharMax(Some(narrow_value()?))),
+        _ => py_to_sql_type_with_hint(cell, hint),
+    }
+}
+
 fn validate_tvp_cell_length(
     row_index: usize,
     column_index: usize,
@@ -338,15 +362,6 @@ fn validate_tvp_cell_length(
     cell_type: &SqlType,
 ) -> PyResult<()> {
     let mismatch = match (column_type, cell_type) {
-        (SqlType::Char(_, declared), SqlType::Char(_, actual)) if actual > declared => {
-            Some(("CHAR", u32::from(*declared), u32::from(*actual)))
-        }
-        (SqlType::Varchar(_, declared), SqlType::Varchar(_, actual)) if actual > declared => {
-            Some(("VARCHAR", u32::from(*declared), u32::from(*actual)))
-        }
-        (SqlType::Varchar(_, declared), SqlType::VarcharMax(Some(value))) => {
-            Some(("VARCHAR", u32::from(*declared), value.bytes.len() as u32))
-        }
         (SqlType::NChar(_, declared), SqlType::NChar(_, actual)) if actual > declared => {
             Some(("NCHAR", u32::from(*declared), u32::from(*actual)))
         }
@@ -373,6 +388,31 @@ fn validate_tvp_cell_length(
     if let Some((type_name, declared, actual)) = mismatch {
         return Err(PyTypeError::new_err(format!(
             "TVP row {row_index} column {column_index} value length {actual} exceeds declared {type_name}({declared}) capacity"
+        )));
+    }
+
+    Ok(())
+}
+
+fn validate_tvp_cell_temporal_scale(
+    row_index: usize,
+    column_index: usize,
+    column: &TvpColumnDef,
+    cell_type: &SqlType,
+) -> PyResult<()> {
+    let Some(scale) = column.scale else {
+        return Ok(());
+    };
+    let time_nanoseconds = match cell_type {
+        SqlType::Time(Some(value)) => value.time_nanoseconds,
+        SqlType::DateTime2(Some(value)) => value.time.time_nanoseconds,
+        SqlType::DateTimeOffset(Some(value)) => value.datetime2.time.time_nanoseconds,
+        _ => return Ok(()),
+    };
+    let scale_factor = 10_u64.pow(u32::from(7 - scale));
+    if !time_nanoseconds.is_multiple_of(scale_factor) {
+        return Err(PyTypeError::new_err(format!(
+            "TVP row {row_index} column {column_index} temporal value cannot be represented at scale {scale}"
         )));
     }
 
@@ -868,6 +908,7 @@ mod tests {
     use super::{build_tvp_table, rewrite_placeholders, tvp_column_definition};
     use crate::types::ParameterHint;
     use mssql_tds::datatypes::sqltypes::SqlType;
+    use pyo3::types::PyAnyMethods;
     use pyo3::{IntoPyObject, Python};
 
     #[test]
@@ -938,20 +979,14 @@ mod tests {
     }
 
     #[test]
-    fn tvp_bounded_cells_report_declared_length_overruns() {
+    fn tvp_unicode_and_binary_cells_report_declared_length_overruns() {
         Python::attach(|py| {
-            for (sql_type, size, value, expected) in [
-                (12, 4, "fives", "VARCHAR(4)"),
-                (-9, 2, "abc", "NVARCHAR(2)"),
-            ] {
-                let columns = vec![(sql_type, size, 0)].into_pyobject(py).unwrap();
-                let rows = vec![vec![value]].into_pyobject(py).unwrap();
+            let columns = vec![(-9, 2, 0)].into_pyobject(py).unwrap();
+            let rows = vec![vec!["abc"]].into_pyobject(py).unwrap();
+            let error = build_tvp_table(columns.as_any(), rows.as_any()).unwrap_err();
 
-                let error = build_tvp_table(columns.as_any(), rows.as_any()).unwrap_err();
-
-                assert!(error.to_string().contains("TVP row 0 column 0"));
-                assert!(error.to_string().contains(expected));
-            }
+            assert!(error.to_string().contains("TVP row 0 column 0"));
+            assert!(error.to_string().contains("NVARCHAR(2)"));
 
             let columns = vec![(-3, 4, 0)].into_pyobject(py).unwrap();
             let rows = vec![vec![vec![1_u8, 2, 3, 4, 5]]]
@@ -965,20 +1000,14 @@ mod tests {
     }
 
     #[test]
-    fn tvp_bounded_cells_report_max_promotion_as_length_overrun() {
+    fn tvp_unicode_and_binary_cells_report_max_promotion_as_length_overrun() {
         Python::attach(|py| {
-            for (sql_type, size, value, expected) in [
-                (12, 8_000, "x".repeat(8_001), "VARCHAR(8000)"),
-                (-9, 4_000, "x".repeat(4_001), "NVARCHAR(4000)"),
-            ] {
-                let columns = vec![(sql_type, size, 0)].into_pyobject(py).unwrap();
-                let rows = vec![vec![value]].into_pyobject(py).unwrap();
+            let columns = vec![(-9, 4_000, 0)].into_pyobject(py).unwrap();
+            let rows = vec![vec!["x".repeat(4_001)]].into_pyobject(py).unwrap();
+            let error = build_tvp_table(columns.as_any(), rows.as_any()).unwrap_err();
 
-                let error = build_tvp_table(columns.as_any(), rows.as_any()).unwrap_err();
-
-                assert!(error.to_string().contains("TVP row 0 column 0"));
-                assert!(error.to_string().contains(expected));
-            }
+            assert!(error.to_string().contains("TVP row 0 column 0"));
+            assert!(error.to_string().contains("NVARCHAR(4000)"));
 
             let columns = vec![(-3, 8_000, 0)].into_pyobject(py).unwrap();
             let rows = vec![vec![vec![0_u8; 8_001]]].into_pyobject(py).unwrap();
@@ -986,6 +1015,108 @@ mod tests {
 
             assert!(error.to_string().contains("TVP row 0 column 0"));
             assert!(error.to_string().contains("VARBINARY(8000)"));
+        });
+    }
+
+    #[test]
+    fn tvp_narrow_cells_preserve_column_templates_before_collation_encoding() {
+        Python::attach(|py| {
+            let columns = vec![(1, 1, 0), (12, 1, 0), (12, 8_000, 0), (12, 8_001, 0)]
+                .into_pyobject(py)
+                .unwrap();
+            let rows = vec![vec![
+                "é".to_string(),
+                "é".to_string(),
+                "é".repeat(4_001),
+                "é".to_string(),
+            ]]
+            .into_pyobject(py)
+            .unwrap();
+
+            let table = build_tvp_table(columns.as_any(), rows.as_any()).unwrap();
+
+            assert!(matches!(table.rows[0][0], SqlType::Char(Some(_), 1)));
+            assert!(matches!(table.rows[0][1], SqlType::Varchar(Some(_), 1)));
+            assert!(matches!(table.rows[0][2], SqlType::Varchar(Some(_), 8_000)));
+            assert!(matches!(table.rows[0][3], SqlType::VarcharMax(Some(_))));
+        });
+    }
+
+    #[test]
+    fn tvp_temporal_cells_require_values_representable_at_declared_scale() {
+        Python::attach(|py| {
+            let datetime = pyo3::types::PyModule::import(py, "datetime").unwrap();
+            let cases = [
+                (
+                    92,
+                    datetime
+                        .getattr("time")
+                        .unwrap()
+                        .call1((12, 34, 56, 123456))
+                        .unwrap(),
+                ),
+                (
+                    93,
+                    datetime
+                        .getattr("datetime")
+                        .unwrap()
+                        .call1((2024, 1, 2, 12, 34, 56, 123456))
+                        .unwrap(),
+                ),
+                (
+                    -155,
+                    datetime
+                        .getattr("datetime")
+                        .unwrap()
+                        .call1((
+                            2024,
+                            1,
+                            2,
+                            12,
+                            34,
+                            56,
+                            123456,
+                            datetime
+                                .getattr("timezone")
+                                .unwrap()
+                                .getattr("utc")
+                                .unwrap(),
+                        ))
+                        .unwrap(),
+                ),
+            ];
+
+            for (sql_type, value) in cases {
+                let columns = vec![(sql_type, 0, 3)].into_pyobject(py).unwrap();
+                let row = pyo3::types::PyTuple::new(py, [value]).unwrap();
+                let rows = pyo3::types::PyList::new(py, [row]).unwrap();
+
+                let error = build_tvp_table(columns.as_any(), rows.as_any()).unwrap_err();
+
+                assert!(error.to_string().contains("TVP row 0 column 0"));
+                assert!(
+                    error
+                        .to_string()
+                        .contains("cannot be represented at scale 3")
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn tvp_temporal_cells_accept_values_representable_at_declared_scale() {
+        Python::attach(|py| {
+            let datetime = pyo3::types::PyModule::import(py, "datetime").unwrap();
+            let value = datetime
+                .getattr("time")
+                .unwrap()
+                .call1((12, 34, 56, 123000))
+                .unwrap();
+            let columns = vec![(92, 0, 3)].into_pyobject(py).unwrap();
+            let row = pyo3::types::PyTuple::new(py, [value]).unwrap();
+            let rows = pyo3::types::PyList::new(py, [row]).unwrap();
+
+            build_tvp_table(columns.as_any(), rows.as_any()).unwrap();
         });
     }
 
