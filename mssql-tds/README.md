@@ -9,6 +9,15 @@ Low-level TDS client handling connection negotiation (prelogin, TLS, login7),
 query execution, result set streaming, bulk copy, RPC calls, and transaction
 management. Built on Tokio.
 
+## Execution stack usage
+
+Command execution keeps session-recovery state in a separately boxed future,
+allocated only when a dead connection needs recovery. Healthy commands do not
+pay for that allocation or carry the login state inline. This reduces caller
+stack use for synchronous adapters such as ODBC on musl's small worker stacks,
+without moving execution to another thread or changing cancellation and timeout
+handling.
+
 ## SQL string decoding
 
 `SqlString::decode` and `to_utf8_string` use the encoding supplied by TDS metadata,

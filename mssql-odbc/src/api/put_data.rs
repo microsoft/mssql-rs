@@ -111,6 +111,22 @@ unsafe fn sql_put_data_safe(
     data_ptr: SqlPointer,
     strlen_or_ind: SqlLen,
 ) -> SqlReturn {
+    let operation = match stmt.begin_operation() {
+        Ok(operation) => operation,
+        Err(rc) => return rc,
+    };
+    let rc = unsafe { sql_put_data_operation(statement_handle, stmt, data_ptr, strlen_or_ind) };
+    super::exec_common::finish_operation(operation, stmt, statement_handle, rc)
+}
+
+/// # Safety
+/// The handle and application buffer satisfy `sql_put_data_safe`'s contract.
+unsafe fn sql_put_data_operation(
+    statement_handle: SqlHandle,
+    stmt: &StmtHandle,
+    data_ptr: SqlPointer,
+    strlen_or_ind: SqlLen,
+) -> SqlReturn {
     let dbc = stmt.parent_dbc();
 
     // ── Validate state ──────────────────────────────────────────────────────
