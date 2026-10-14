@@ -2827,11 +2827,14 @@ ODBC_TEST_F(GetDataLiveTest, TextFillsEveryTruncatedCharBuffer) {
 // Binary data has no terminator, so every truncated chunk must fill all of
 // BufferLength. The pattern includes 0x00 and the helper's 0x5A sentinel, so
 // neither a zero scan nor an untouched buffer could pass by accident.
+// REPLICATE converts a binary argument to varchar, so the outer cast is what
+// makes the column varbinary(max) rather than a character value read as bytes.
 // Benefits-from-mock-tds: place the PLP chunk boundaries at and around the
 // buffer boundary; SQL Server picks them, so this cannot steer them.
 ODBC_TEST_F(GetDataLiveTest, VarbinaryMaxFillsEveryTruncatedBinaryBuffer) {
     ASSERT_SQL_OK(
-        ExecDirect("SELECT REPLICATE(CAST(0x00FF5A01 AS VARBINARY(MAX)), 6000) AS c1"),
+        ExecDirect("SELECT CAST(REPLICATE(CAST(0x00FF5A01 AS VARBINARY(MAX)), 6000) "
+                   "AS VARBINARY(MAX)) AS c1"),
         SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
     ExpectEveryTruncatedChunkFull<SQLCHAR>(
@@ -2860,7 +2863,8 @@ ODBC_TEST_F(GetDataLiveTest, VarcharMaxExactFitFinalCharChunkSucceeds) {
 // boundary, so the terminator chunk arrives as a separate read.
 ODBC_TEST_F(GetDataLiveTest, VarbinaryMaxExactFitFinalBinaryChunkSucceeds) {
     ASSERT_SQL_OK(
-        ExecDirect("SELECT REPLICATE(CAST(0x00FF5A01 AS VARBINARY(MAX)), 6000) AS c1"),
+        ExecDirect("SELECT CAST(REPLICATE(CAST(0x00FF5A01 AS VARBINARY(MAX)), 6000) "
+                   "AS VARBINARY(MAX)) AS c1"),
         SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
     ExpectEveryTruncatedChunkFull<SQLCHAR>(
