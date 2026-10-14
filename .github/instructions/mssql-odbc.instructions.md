@@ -480,6 +480,9 @@ on; these guarantees were verified against msodbcsql's behavior.
     driver loading, create fixed-name permanent objects, free or replace
     `stmt_` or `dbc_` in the body, or rely on `HasFatalFailure()` (concurrent
     workers capture failures per thread, so it cannot see them).
+  - A fixture that allocates no statement (`SetUp()` never calls `Connect()`)
+    must leave `/SharedStmt` out of its modes: observers have nothing to read.
+    The mode fails such a variant with that advice rather than hanging.
   - Derive values from `WorkerToken()` (or `Worker()` and `Iteration()`) when a
     result delivered to the wrong connection must fail the test; constant data
     cannot detect that.

@@ -30,7 +30,10 @@
 //                SQLGetDiagField and SQLGetDiagRec, the only calls that change
 //                no state and clear no records. Observers check that every
 //                record is well formed. Owner failures are reported directly.
-//                The body must not free or replace stmt_ or dbc_.
+//                The body must not free or replace stmt_ or dbc_, and the
+//                fixture must Connect() in SetUp(): there is nothing to observe
+//                without a statement, so an ENV-only fixture must leave this
+//                mode out with ODBC_TEST_F_MODES rather than register it.
 //                The Driver Manager serializes calls per handle (Windows, and
 //                unixODBC at the Threading=1 run_e2e.sh sets), so only the DBC
 //                reads overlap the owner's calls in the driver; STMT reads run
@@ -896,25 +899,39 @@ void RunSharedStmt(T& coordinator, Mode mode, const char* name) {
             }
             RunPhase("SetUp()", [&] { test->ConcurrentSetUp(env, SQL_NULL_HDBC, 0, iteration); });
             if (!::testing::Test::HasFatalFailure() && !::testing::Test::IsSkipped()) {
-                long long reads_before = 0;
-                {
-                    std::unique_lock<std::shared_mutex> lock(handles_mutex);
-                    observed_stmt = test->ConcurrentStmt();
-                    observed_dbc = test->ConcurrentDbc();
-                    reads_before = reads.load();
+                if (test->ConcurrentStmt() == SQL_NULL_HSTMT ||
+                    test->ConcurrentDbc() == SQL_NULL_HDBC) {
+                    // Observers count a read only against a published, non-null
+                    // STMT, so the wait below could never be satisfied: it would
+                    // spin until the watchdog killed the process. Fail here
+                    // instead; TearDown still runs.
+                    ADD_FAILURE()
+                        << label
+                        << ": SharedStmt needs a fixture that calls Connect() in SetUp(); "
+                           "a fixture that allocates no statement must leave the mode out "
+                           "with ODBC_TEST_F_MODES";
+                } else {
+                    long long reads_before = 0;
+                    {
+                        std::unique_lock<std::shared_mutex> lock(handles_mutex);
+                        observed_stmt = test->ConcurrentStmt();
+                        observed_dbc = test->ConcurrentDbc();
+                        reads_before = reads.load();
+                    }
+                    RunPhase("the test body", [&] { test->ConcurrentBody(); });
+                    while (observers > 0 && reads.load() == reads_before &&
+                           !observer_failed.load()) {
+                        std::this_thread::yield();
+                    }
+                    ++observed_iterations;
+                    retracting.store(true);
+                    {
+                        std::unique_lock<std::shared_mutex> lock(handles_mutex);
+                        observed_stmt = SQL_NULL_HSTMT;
+                        observed_dbc = SQL_NULL_HDBC;
+                    }
+                    retracting.store(false);
                 }
-                RunPhase("the test body", [&] { test->ConcurrentBody(); });
-                while (observers > 0 && reads.load() == reads_before && !observer_failed.load()) {
-                    std::this_thread::yield();
-                }
-                ++observed_iterations;
-                retracting.store(true);
-                {
-                    std::unique_lock<std::shared_mutex> lock(handles_mutex);
-                    observed_stmt = SQL_NULL_HSTMT;
-                    observed_dbc = SQL_NULL_HDBC;
-                }
-                retracting.store(false);
             }
             RunPhase("TearDown()", [&] { test->ConcurrentTearDown(); });
             progress[0].store(iteration + 1);

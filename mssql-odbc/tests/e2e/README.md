@@ -505,6 +505,12 @@ test:
 - relies on `HasFatalFailure()` (concurrent workers capture failures per
   thread, so it cannot see them).
 
+A fixture whose `SetUp()` does not `Connect()` — an ENV-only fixture such as
+`smoke_test.cpp`'s `ODBCTest` — has no statement for `/SharedStmt` observers to
+read, so leave that mode out:
+`ODBC_TEST_F_MODES(Fixture, Name, odbc_concurrency::kSingle | odbc_concurrency::kCrossThread | odbc_concurrency::kSharedEnv)`.
+Registering it anyway fails the variant with that advice rather than hanging.
+
 The rule and the `/SharedDbc` conditions are in
 `.github/instructions/mssql-odbc.instructions.md` §10.
 
