@@ -722,6 +722,14 @@ pub fn done_select_no_more() -> ScriptedToken {
     }))
 }
 
+/// A transaction descriptor observed before the server's terminal DONE.
+pub fn env_change_begin_transaction(descriptor: u64) -> ScriptedToken {
+    ScriptedToken(Tokens::EnvChange(EnvChangeToken {
+        sub_type: EnvChangeTokenSubType::BeginTransaction,
+        change_type: EnvChangeContainer::from((0u64, descriptor)),
+    }))
+}
+
 /// A `RollbackTransaction` ENVCHANGE token — the acknowledgement the server
 /// emits for a Transaction Manager rollback request, clearing the client's
 /// transaction descriptor.
