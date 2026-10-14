@@ -52,8 +52,10 @@
 //                                  (default 2)
 //   MSSQL_ODBC_MT_ITERS            Times each worker, or the SharedStmt owner,
 //                                  runs the body (default 1)
-//   MSSQL_ODBC_MT_TIMEOUT_SECONDS  Hang watchdog per test (default 300); see
-//                                  Watchdog for what happens on expiry
+//   MSSQL_ODBC_MT_TIMEOUT_SECONDS  Hang watchdog (default 300) for each phase
+//                                  of a non-Single test: the fixture's SetUp,
+//                                  the run, and its TearDown; see Watchdog for
+//                                  what happens on expiry
 //   MSSQL_ODBC_MT_DUMP_DIR         Where the watchdog writes a Windows
 //                                  minidump (default: working directory)
 //   CrossThread ignores the first two: it always runs the body once.
@@ -332,6 +334,52 @@ class Watchdog {
     std::condition_variable cv_;
     bool stopped_ = false;
     std::thread thread_;
+};
+
+// gtest runs the coordinator fixture's SetUp() before TestBody() and its
+// TearDown() after, outside the runners' watchdogs. In a non-Single mode those
+// phases can hang on what the run left behind (a SharedDbc connection left
+// locked hangs the coordinator's disconnect), so each gets a watchdog of its
+// own. The run in between keeps the runner's watchdog, which reports
+// per-worker progress. Only the gtest-created coordinator is watched this way;
+// the runners' per-iteration fixtures are already inside a runner's watchdog.
+class CoordinatorWatch {
+   public:
+    void WatchCoordinator(std::string test_label) {
+        label_ = std::move(test_label);
+        Arm("SetUp()");
+    }
+
+   protected:
+    template <typename Run>
+    void RunWatched(Run&& run) {
+        const bool watched = watchdog_ != nullptr;
+        watchdog_.reset();
+        try {
+            run();
+        } catch (...) {
+            if (watched) {
+                Arm("TearDown()");
+            }
+            throw;
+        }
+        if (watched) {
+            Arm("TearDown()");
+        }
+    }
+
+   private:
+    void Arm(const char* phase) {
+        watchdog_.reset();
+        watchdog_.reset(new Watchdog(label_ + " coordinator " + phase,
+                                     std::chrono::seconds(LoadConfig().timeout_seconds),
+                                     progress_));
+    }
+
+    std::string label_;
+    // No workers outside the run, so the watchdog has no progress to report.
+    std::vector<std::atomic<int>> progress_;
+    std::unique_ptr<Watchdog> watchdog_;
 };
 
 inline bool MentionsConnectionBusy(const std::string& text) {
@@ -925,8 +973,15 @@ bool Register(const char* suite, const char* name, const char* file, int line, u
         }
         const std::string test_name =
             mode == kSingle ? std::string(name) : std::string(name) + "/" + ModeName(mode);
+        const std::string label = std::string(suite) + "." + test_name;
         ::testing::RegisterTest(suite, test_name.c_str(), nullptr, nullptr, file, line,
-                                [mode]() -> Fixture* { return new T(mode); });
+                                [mode, label]() -> Fixture* {
+                                    T* test = new T(mode);
+                                    if (mode != kSingle) {
+                                        test->WatchCoordinator(label);
+                                    }
+                                    return test;
+                                });
     }
     return true;
 }
@@ -938,12 +993,15 @@ bool Register(const char* suite, const char* name, const char* file, int line, u
 #define ODBC_TEST_F_MODES(Fixture, Name, modes)                                                \
     class ODBC_CONCURRENT_TEST_CLASS_(Fixture, Name) final                                     \
         : public Fixture,                                                                      \
-          public ::odbc_concurrency::WorkerScope {                                             \
+          public ::odbc_concurrency::WorkerScope,                                              \
+          public ::odbc_concurrency::detail::CoordinatorWatch {                                \
        public:                                                                                 \
         explicit ODBC_CONCURRENT_TEST_CLASS_(Fixture, Name)(::odbc_concurrency::Mode mode)     \
             : mode_(mode) {}                                                                   \
         void TestBody() override {                                                             \
-            ::odbc_concurrency::RunTest(*this, mode_, #Fixture "." #Name);                     \
+            RunWatched([this] {                                                                \
+                ::odbc_concurrency::RunTest(*this, mode_, #Fixture "." #Name);                 \
+            });                                                                                \
         }                                                                                      \
         void ConcurrentBody();                                                                 \
         void ConcurrentSetUp(SQLHENV env, SQLHDBC dbc, int worker, int iteration) {            \

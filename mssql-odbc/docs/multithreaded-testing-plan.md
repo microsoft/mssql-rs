@@ -190,7 +190,7 @@ more chances to be hit. AB#49225 reproduced reliably at 8x20 but not at 4x2.
 |---|---|---|
 | `MSSQL_ODBC_MT_THREADS` | 2 | Threads running at once |
 | `MSSQL_ODBC_MT_ITERS` | 1 | Runs of the body per thread |
-| `MSSQL_ODBC_MT_TIMEOUT_SECONDS` | 300 | Hang watchdog per test |
+| `MSSQL_ODBC_MT_TIMEOUT_SECONDS` | 300 | Hang watchdog for each phase of a concurrent variant: fixture `SetUp`, the run, fixture `TearDown` |
 | `MSSQL_ODBC_MT_DUMP_DIR` | working directory | Where the watchdog writes a Windows minidump |
 
 Select variants with a gtest filter, on the command line or through

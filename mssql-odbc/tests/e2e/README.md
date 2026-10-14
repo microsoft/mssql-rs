@@ -516,7 +516,9 @@ MSSQL_ODBC_MT_THREADS=8 MSSQL_ODBC_MT_ITERS=20 \
 
 `MSSQL_ODBC_MT_THREADS` (default 2) is how many threads run at once,
 `MSSQL_ODBC_MT_ITERS` (default 1) how many times each runs the body, and
-`MSSQL_ODBC_MT_TIMEOUT_SECONDS` (default 300) the hang watchdog. On a hang the
+`MSSQL_ODBC_MT_TIMEOUT_SECONDS` (default 300) the hang watchdog, which applies
+separately to a multithreaded variant's fixture `SetUp`, its run, and its
+`TearDown` (the single-threaded test has none, like `TEST_F`). On a hang the
 watchdog writes a minidump on Windows (to `MSSQL_ODBC_MT_DUMP_DIR`, default the
 working directory) or aborts for a core dump elsewhere. It leaves a process
 alone when a debugger is attached or when it cannot tell (detection covers
