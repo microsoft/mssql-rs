@@ -505,18 +505,20 @@ bool RunPhase(const char* location, F&& phase) {
     return false;
 }
 
-// Serializes fixture construction and destruction. testing::Test holds a
-// GTestFlagSaver: its constructor reads every process-global gtest flag and its
-// destructor writes them all back, through the non-Abseil GTEST_FLAG_GET/SET,
-// which are bare global accesses. Five of those flags are std::string, so two
-// workers overlapping there is a data race with real teardown risk, not just a
-// stale value, even though no test body touches a flag. Only this runner builds
-// fixtures off the gtest thread; CrossThread, SharedStmt, and the gtest factory
-// each build theirs on one thread.
-inline std::mutex& FixtureLifecycleMutex() {
-    static std::mutex mutex;
-    return mutex;
-}
+// A worker's finished fixtures, destroyed after every worker has joined.
+// testing::Test holds a GTestFlagSaver: its destructor writes every
+// process-global gtest flag back through the non-Abseil GTEST_FLAG_SET, a bare
+// global assignment. Workers read those same globals the whole time they run —
+// RunPhase reads catch_exceptions, and gtest's failure reporting reads
+// break_on_failure and throw_on_failure — so destroying a fixture on its worker
+// races every other worker, and serializing destruction against construction
+// alone does not fix it. Keeping the fixtures alive leaves only flag reads in
+// the parallel window, which is safe. TearDown has already run, so no ODBC
+// handle is held open by the wait. Only this runner builds fixtures off the
+// gtest thread; CrossThread, SharedStmt, and the gtest factory each build and
+// destroy theirs on one thread.
+template <typename T>
+using RetainedFixtures = std::vector<std::unique_ptr<T>>;
 
 // Runs one iteration with its failures captured for this thread only. Workers
 // must not report into, or read, the current test's shared TestResult while
@@ -525,23 +527,22 @@ inline std::mutex& FixtureLifecycleMutex() {
 template <typename T>
 void RunCapturedIteration(SQLHENV env, SQLHDBC dbc, Mode mode, int worker, int iteration,
                           const std::string& tag, ::testing::TestPartResultArray& parts,
-                          bool& statement_busy) {
+                          bool& statement_busy, RetainedFixtures<T>& retained) {
     ::testing::ScopedFakeTestPartResultReporter reporter(
         ::testing::ScopedFakeTestPartResultReporter::INTERCEPT_ONLY_CURRENT_THREAD, &parts);
     SCOPED_TRACE(tag);
     std::unique_ptr<T> test;
-    // Destroys the fixture under the lock its construction took, on every path.
-    struct SerialDestroy {
+    // Retains the fixture on every path out, including a throwing constructor.
+    struct Retain {
         std::unique_ptr<T>& test;
-        ~SerialDestroy() {
-            std::lock_guard<std::mutex> guard(FixtureLifecycleMutex());
-            test.reset();
+        RetainedFixtures<T>& retained;
+        ~Retain() {
+            if (test != nullptr) {
+                retained.push_back(std::move(test));
+            }
         }
-    } serial_destroy{test};
-    if (!RunPhase("the test fixture's constructor", [&] {
-            std::lock_guard<std::mutex> guard(FixtureLifecycleMutex());
-            test.reset(new T(mode));
-        })) {
+    } retain{test, retained};
+    if (!RunPhase("the test fixture's constructor", [&] { test.reset(new T(mode)); })) {
         return;
     }
     RunPhase("SetUp()", [&] { test->ConcurrentSetUp(env, dbc, worker, iteration); });
@@ -562,11 +563,12 @@ void RunCapturedIteration(SQLHENV env, SQLHDBC dbc, Mode mode, int worker, int i
 // SharedEnv: every failure fails the iteration; nothing is retried.
 template <typename T>
 bool RunSharedEnvIteration(SQLHENV env, Mode mode, int worker, int iteration,
-                           const std::string& tag, WorkerResult& result) {
+                           const std::string& tag, WorkerResult& result,
+                           RetainedFixtures<T>& retained) {
     ::testing::TestPartResultArray parts;
     bool statement_busy = false;
     RunCapturedIteration<T>(env, SQL_NULL_HDBC, mode, worker, iteration, tag, parts,
-                            statement_busy);
+                            statement_busy, retained);
     bool failed = false;
     bool skipped = false;
     for (int i = 0; i < parts.size(); ++i) {
@@ -588,11 +590,13 @@ bool RunSharedEnvIteration(SQLHENV env, Mode mode, int worker, int iteration,
 // instead of failing the test.
 template <typename T>
 bool RunSharedDbcIteration(SQLHENV env, SQLHDBC dbc, Mode mode, int worker, int iteration,
-                           const std::string& tag, WorkerResult& result) {
+                           const std::string& tag, WorkerResult& result,
+                           RetainedFixtures<T>& retained) {
     for (int attempt = 0;; ++attempt) {
         ::testing::TestPartResultArray parts;
         bool statement_busy = false;
-        RunCapturedIteration<T>(env, dbc, mode, worker, iteration, tag, parts, statement_busy);
+        RunCapturedIteration<T>(env, dbc, mode, worker, iteration, tag, parts, statement_busy,
+                                retained);
         switch (Classify(parts, statement_busy)) {
             case Outcome::kClean:
                 return true;
@@ -634,6 +638,9 @@ void RunConcurrent(T& coordinator, Mode mode, const char* name) {
 
     const size_t count = static_cast<size_t>(config.threads);
     std::vector<WorkerResult> results(count);
+    // One per worker, so retaining never synchronizes between them. Destroyed
+    // after the join below; see RetainedFixtures.
+    std::vector<RetainedFixtures<T>> retained(count);
     std::vector<std::atomic<int>> progress(count);
     for (std::atomic<int>& p : progress) {
         p.store(0);
@@ -657,10 +664,10 @@ void RunConcurrent(T& coordinator, Mode mode, const char* name) {
                     bool ok = false;
                     if (mode == kSharedEnv) {
                         ok = RunSharedEnvIteration<T>(env, mode, worker, iteration, tag,
-                                                      results[index]);
+                                                      results[index], retained[index]);
                     } else {
                         ok = RunSharedDbcIteration<T>(env, dbc, mode, worker, iteration, tag,
-                                                      results[index]);
+                                                      results[index], retained[index]);
                     }
                     if (!ok) {
                         stop.store(true);
@@ -674,6 +681,9 @@ void RunConcurrent(T& coordinator, Mode mode, const char* name) {
         for (std::thread& worker : workers) {
             worker.join();
         }
+        // Every worker has joined, so this thread is the only one left to touch
+        // the gtest flag globals; see RetainedFixtures.
+        retained.clear();
         // Still under the watchdog: a defect that leaves the DBC locked would
         // otherwise hang here with no dump.
         if (mode == kSharedDbc) {
