@@ -11,7 +11,7 @@ plus small concurrent smoke runs; nightly and weekly runs hunt races.
   runs across threads. No second copy to drift.
 - **Multithreaded-only scenarios** in `tests/e2e/tests/multithreaded_tests/`,
   for what has no single-threaded form: handle churn, races on one STMT, a
-  shared APD, connect races, and cancel.
+  shared APD, connect races, and cancel (`cancel_test.cpp`, from #703).
 
 Separate copies drifted from the single-threaded suite (a fixed bug was
 re-filed from stale expectations); running three GetData test bodies under
@@ -88,8 +88,8 @@ ODBC_TEST_F_MODES(GetDataLiveTest, EachRunReadsItsOwnValue,
   error to the main thread, which reports it after joining.
 - `SharedStmt` observers call only `SQLGetDiagRec` and `SQLGetDiagField`. Every
   other call clears the owner's diagnostics, and an idle `SQLCancel` also
-  aborts msodbcsql's open cursor. Cross-thread cancel gets its own test
-  ([Deferred](#deferred)).
+  aborts msodbcsql's open cursor. Cross-thread cancel has its own test,
+  `multithreaded_tests/cancel_test.cpp`.
 - There is no mode that runs the whole body on one shared STMT or descriptor.
   Bound buffers live on each body's stack, and even without bindings a STMT
   holds one cursor:
@@ -230,9 +230,11 @@ Measured 2026-10-08 on both drivers unless noted.
   source; scenario 10 relies on it).
 - `SQLDisconnect` frees child STMTs and can race an in-flight child call: a
   known lifetime bug, not a test scenario.
-- `SQLCancel` is not implemented (AB#47083) beyond abandoning
-  data-at-execution. A cross-thread cancel waits for the running call (1.7 s
-  for a 2 s `WAITFOR`); msodbcsql returns in 1 ms and the call fails `HY008`.
+- `SQLCancel` (#703; AB#49222-49224) interrupts a running execute, fetch,
+  `SQLGetData`, `SQLMoreResults`, `SQLPutData`, or final `SQLParamData` from
+  another thread; the call fails `HY008` (msodbcsql's `SQLMoreResults`
+  returns `SQL_NO_DATA`, [parity registry](parity-deviations.md) entry 27).
+  Covered on both Driver Managers by `multithreaded_tests/cancel_test.cpp`.
 - **The Windows Driver Manager serializes calls per handle.** A second call on
   a busy STMT, or on a descriptor associated with it, waits; only `SQLCancel`
   bypasses the lock. Calls on another STMT, the DBC, or an unassociated
@@ -255,7 +257,9 @@ Measured 2026-10-08 on both drivers unless noted.
   runs at 2 x 1 (WSL, unixODBC 2.3.9), and in none of 60 at 1. macOS CI hit
   it first; Linux CI passed by luck.
 - Every non-diagnostic call clears the handle's diagnostics, including an idle
-  `SQLCancel`, `SQLGetStmtAttr`, and `SQLNumResultCols`.
+  `SQLCancel`, `SQLGetStmtAttr`, and `SQLNumResultCols`. For an idle
+  `SQLCancel` the Windows Driver Manager does the clearing; the driver itself
+  leaves them (#703). Measured again after #703 on Windows.
 - An idle `SQLCancel` leaves an open cursor alone in this driver, as ODBC 3.5
   specifies; msodbcsql aborts it (next call `HY010`).
 
@@ -392,7 +396,7 @@ local SQL Server:
   "No active TDS client" instead of the busy error. Reproduced at 8x20 with the
   GetData pilot tests opted into `SharedDbc` locally.
 - Divergence, not a bug: msodbcsql aborts an open cursor on an idle `SQLCancel`;
-  ODBC 3.5 says it has no effect. Assert the spec in AB#49224.
+  ODBC 3.5 says it has no effect. Not yet asserted in e2e ([Deferred](#deferred)).
 - Fixed: AB#49220 (empty `IMAGE` read as NULL), by PR #700; AB#49219 (`run_e2e`
   auto-detect used `sa` with no password), in this PR.
 
@@ -413,19 +417,17 @@ Tracked under AB#49256:
 
 ## Deferred
 
-- **Cross-thread cancel** (AB#49224, after AB#49222 and AB#49223 implement
-  `SQLCancel`): `multithreaded_tests/cancel_test.cpp`.
-  - A server-side delay keeps the call running: `WAITFOR` in `SQLExecDirect`
-    and `SQLExecute`, `SELECT 1; WAITFOR ...; SELECT 2` in `SQLMoreResults`,
-    and a row lock held by a second connection for `SQLFetch`.
-  - Cancel at +300 ms. `SQLCancel` returns within 1 s; the call fails `HY008`
-    or completes correctly; the cancel posts no records; STMT and DBC stay
-    usable.
-  - A cancel just before execute must not leak into that or the next
-    execution; a cancel after completion leaves the cursor as it was (skip
-    msodbcsql, which aborts it).
-  - Add `SQLCancel` to scenario 8b. On unixODBC run at `Threading` 1-2 (3
-    also locks `SQLCancel`; 0 races in the Driver Manager).
+- **Cancel cases `cancel_test.cpp` (#703) does not cover yet** (under
+  AB#47083):
+  - An idle cancel with an open cursor leaves it as it was (skip msodbcsql,
+    which aborts it).
+  - A cancel just before execute does not leak into that or the next
+    execution, through a Driver Manager (the driver's unit tests cover it
+    directly).
+  - A fetch blocked by a row lock held by a second connection, rather than a
+    `WAITFOR` inside the batch.
+  - `SQLCancel` in scenario 8b. On unixODBC run at `Threading` 1-2 (3 also
+    locks `SQLCancel`; 0 races in the Driver Manager).
 - **Disconnect or free during use:** add to 8b once handle lifetimes are
   reference-counted or generation-checked.
 - **Async execution and MARS:** once the driver supports them.
