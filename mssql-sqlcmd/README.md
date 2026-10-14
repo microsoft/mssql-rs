@@ -208,6 +208,20 @@ errors of a transport the order moved past stay in the JSON report, marked
 elsewhere, it is TCP alone, and `lpc:` (on Windows, to this computer only)
 or `np:` diagnoses a transport directly.
 
+When the caller passes its own driver connection (`driver_connect`: native
+sqlcmd connects with its ODBC driver and every connection option, as for a
+query), that connection makes the connection attempt and session validation
+and decides the result. `mssql-tds` still makes its diagnostic connection for
+the name, instance and transport checks, stopping once the transport is open,
+without logging in; it logs in, as a normal run does, only when the driver
+failed and its errors leave the cause open (not for a refused login or
+database, so a wrong password is never tried twice), and its findings are then
+evidence. The driver's
+records are the chain's `driver` errors: in text, those sqlcmd prints appear as
+sqlcmd printed them (`Sqlcmd: Error: <ODBC driver name> : ...`); the JSON
+report keeps every one, with its `sqlState`.
+They include the driver's own summaries, so diagnose adds none.
+
 `mssql-tds` is 64-bit only, so 32-bit builds (`win-x86`) leave diagnose out:
 there `mssql_sqlcmd_diagnostics_run` returns `MSSQL_SQLCMD_UNSUPPORTED`.
 
