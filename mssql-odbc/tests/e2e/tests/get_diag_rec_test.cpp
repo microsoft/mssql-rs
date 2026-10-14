@@ -197,6 +197,9 @@ protected:
 // record carrying SQLSTATE 42000, the bound number as the native error, and the
 // bound message. The error must not leak onto the connection handle, and a
 // successful reuse of the same statement and bindings clears it.
+// Benefits-from-mock-tds: place the ERROR token mid-batch and control its
+// number, state, and class directly; SQL Server decides all three here, and
+// only a mock can prove nothing was posted on the DBC rather than observing it.
 ODBC_TEST_F(GetDiagRecLiveTest, ParameterizedThrowPostsOneStatementRecordAndClearsOnReuse) {
     SQLINTEGER number = 50000 + Worker() * 1000 + Iteration() % 1000;
     const std::string message = WorkerToken("diag-throw");
