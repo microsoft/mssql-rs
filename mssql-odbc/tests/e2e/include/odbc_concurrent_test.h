@@ -41,12 +41,15 @@
 // the wrong connection or statement cannot match.
 //
 // Failures in a non-Single mode carry a trace naming the mode and the worker,
-// iteration, or thread role. The first failure stops further iterations.
+// iteration, or thread role. The first failure stops further iterations. An
+// exception from a fixture phase on any thread fails the test as gtest would
+// on its own thread (see RunPhase).
 //
 // Env (defaults are the PR smoke size; nightly sets the stress size):
 //   MSSQL_ODBC_MT_THREADS          Threads running at once: SharedEnv and
 //                                  SharedDbc workers, or the SharedStmt owner
-//                                  plus observers (default 2)
+//                                  plus observers, so 1 runs the owner alone
+//                                  (default 2)
 //   MSSQL_ODBC_MT_ITERS            Times each worker, or the SharedStmt owner,
 //                                  runs the body (default 1)
 //   MSSQL_ODBC_MT_TIMEOUT_SECONDS  Hang watchdog per test (default 300); see
@@ -76,6 +79,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib>
+#include <exception>
 #include <fstream>
 #include <functional>
 #include <iostream>
@@ -421,6 +425,35 @@ struct WorkerResult {
     std::string skip_message;
 };
 
+// gtest turns an exception into a test failure only on the thread running the
+// test, and only around the calls it makes itself. The runners call fixture
+// phases themselves, often on other threads, where an escaping exception would
+// call std::terminate (and, in CrossThread, strand the next phase). RunPhase
+// runs one phase the way gtest would: an exception becomes a fatal failure on
+// the calling thread, worded as gtest words it, and the runner goes on to
+// TearDown. With --gtest_catch_exceptions=0 it propagates instead, as gtest's
+// own handling does, so the process dies where it threw and leaves a dump.
+// Returns false when the phase threw.
+template <typename F>
+bool RunPhase(const char* location, F&& phase) {
+    if (!GTEST_FLAG_GET(catch_exceptions)) {
+        phase();
+        return true;
+    }
+    std::string message;
+    try {
+        phase();
+        return true;
+    } catch (const std::exception& e) {
+        message = std::string("C++ exception with description \"") + e.what() +
+                  "\" thrown in " + location + ".";
+    } catch (...) {
+        message = std::string("Unknown C++ exception thrown in ") + location + ".";
+    }
+    [&] { FAIL() << message; }();
+    return false;
+}
+
 // Runs one iteration with its failures captured for this thread only. Workers
 // must not report into, or read, the current test's shared TestResult while
 // other workers write to it: gtest appends to it under a lock but reads it
@@ -432,18 +465,23 @@ void RunCapturedIteration(SQLHENV env, SQLHDBC dbc, Mode mode, int worker, int i
     ::testing::ScopedFakeTestPartResultReporter reporter(
         ::testing::ScopedFakeTestPartResultReporter::INTERCEPT_ONLY_CURRENT_THREAD, &parts);
     SCOPED_TRACE(tag);
-    std::unique_ptr<T> test(new T(mode));
-    test->ConcurrentSetUp(env, dbc, worker, iteration);
+    std::unique_ptr<T> test;
+    if (!RunPhase("the test fixture's constructor", [&] { test.reset(new T(mode)); })) {
+        return;
+    }
+    RunPhase("SetUp()", [&] { test->ConcurrentSetUp(env, dbc, worker, iteration); });
     bool set_up = true;
     for (int i = 0; i < parts.size(); ++i) {
         const ::testing::TestPartResult& part = parts.GetTestPartResult(i);
         set_up = set_up && !part.fatally_failed() && !part.skipped();
     }
     if (set_up) {
-        test->ConcurrentBody();
+        RunPhase("the test body", [&] { test->ConcurrentBody(); });
     }
-    statement_busy = StatementReportsBusy(test->ConcurrentStmt());
-    test->ConcurrentTearDown();
+    RunPhase("TearDown()", [&] {
+        statement_busy = StatementReportsBusy(test->ConcurrentStmt());
+        test->ConcurrentTearDown();
+    });
 }
 
 // SharedEnv: every failure fails the iteration; nothing is retried.
@@ -633,15 +671,20 @@ void RunCrossThread(Mode mode, const char* name) {
     };
     std::thread threads[] = {
         phase_thread(0, "CrossThread SetUp thread",
-                     [&] { test->ConcurrentSetUp(SQL_NULL_HENV, SQL_NULL_HDBC, 0, 0); }),
+                     [&] {
+                         RunPhase("SetUp()", [&] {
+                             test->ConcurrentSetUp(SQL_NULL_HENV, SQL_NULL_HDBC, 0, 0);
+                         });
+                     }),
         phase_thread(1, "CrossThread body thread",
                      [&] {
                          if (!::testing::Test::HasFatalFailure() &&
                              !::testing::Test::IsSkipped()) {
-                             test->ConcurrentBody();
+                             RunPhase("the test body", [&] { test->ConcurrentBody(); });
                          }
                      }),
-        phase_thread(2, "CrossThread TearDown thread", [&] { test->ConcurrentTearDown(); }),
+        phase_thread(2, "CrossThread TearDown thread",
+                     [&] { RunPhase("TearDown()", [&] { test->ConcurrentTearDown(); }); }),
     };
     for (std::thread& thread : threads) {
         thread.join();
@@ -707,8 +750,10 @@ inline bool CheckDiagnostics(SQLSMALLINT type, SQLHANDLE handle, std::string& er
 // them under an exclusive lock, so no observer is inside a call on a handle
 // when TearDown frees it. Before retracting, the owner waits for at least one
 // observer read, so a short body cannot leave the mode observing nothing.
-// Observers keep their first error and the main thread reports it, so no
-// thread writes the test's result while the owner reads it.
+// Observers keep their first error, including an exception, and the main
+// thread reports it, so no thread writes the test's result while the owner
+// reads it. MSSQL_ODBC_MT_THREADS=1 runs the owner alone, which is how a
+// SharedStmt failure is told apart from a plain bug in the body.
 template <typename T>
 void RunSharedStmt(T& coordinator, Mode mode, const char* name) {
     const Config config = LoadConfig();
@@ -716,7 +761,7 @@ void RunSharedStmt(T& coordinator, Mode mode, const char* name) {
     const SQLHENV env = coordinator.ConcurrentEnv();
     ASSERT_TRUE(env != SQL_NULL_HENV) << name << ": fixture SetUp() allocated no ENV";
 
-    const int observers = (std::max)(1, config.threads - 1);
+    const int observers = config.threads - 1;
     const std::string label = std::string(name) + " [" + ModeName(mode) + "]";
     std::cout << label << ": observers=" << observers << " iterations=" << config.iterations
               << std::endl;
@@ -729,6 +774,13 @@ void RunSharedStmt(T& coordinator, Mode mode, const char* name) {
     std::atomic<bool> observer_failed{false};
     std::mutex observer_error_mutex;
     std::string observer_error;
+    const auto record_observer_error = [&](int observer, const std::string& error) {
+        std::lock_guard<std::mutex> guard(observer_error_mutex);
+        if (observer_error.empty()) {
+            observer_error = "observer=" + std::to_string(observer) + " " + error;
+        }
+        observer_failed.store(true);
+    };
     std::atomic<long long> reads{0};
     int observed_iterations = 0;
     std::vector<std::atomic<int>> progress(1);
@@ -737,40 +789,64 @@ void RunSharedStmt(T& coordinator, Mode mode, const char* name) {
     {
         Watchdog watchdog(label, std::chrono::seconds(config.timeout_seconds), progress);
         std::vector<std::thread> threads;
+        // Joinable threads must not outlive this scope, whatever leaves it.
+        struct JoinObservers {
+            std::atomic<bool>& stop;
+            std::vector<std::thread>& threads;
+            ~JoinObservers() {
+                stop.store(true);
+                for (std::thread& thread : threads) {
+                    if (thread.joinable()) {
+                        thread.join();
+                    }
+                }
+            }
+        } join_observers{stop, threads};
         threads.reserve(static_cast<size_t>(observers));
         for (int observer = 0; observer < observers; ++observer) {
             threads.emplace_back([&, observer] {
-                while (!stop.load()) {
-                    if (retracting.load()) {
-                        std::this_thread::yield();
-                        continue;
-                    }
-                    std::string error;
-                    {
-                        std::shared_lock<std::shared_mutex> lock(handles_mutex);
-                        if (observed_stmt != SQL_NULL_HSTMT) {
-                            if (!CheckDiagnostics(SQL_HANDLE_STMT, observed_stmt, error) ||
-                                !CheckDiagnostics(SQL_HANDLE_DBC, observed_dbc, error)) {
-                                std::lock_guard<std::mutex> guard(observer_error_mutex);
-                                if (observer_error.empty()) {
-                                    observer_error =
-                                        "observer=" + std::to_string(observer) + " " + error;
-                                }
-                                observer_failed.store(true);
-                                return;
-                            }
-                            reads.fetch_add(1);
+                const auto observe = [&] {
+                    while (!stop.load()) {
+                        if (retracting.load()) {
+                            std::this_thread::yield();
+                            continue;
                         }
+                        std::string error;
+                        {
+                            std::shared_lock<std::shared_mutex> lock(handles_mutex);
+                            if (observed_stmt != SQL_NULL_HSTMT) {
+                                if (!CheckDiagnostics(SQL_HANDLE_STMT, observed_stmt, error) ||
+                                    !CheckDiagnostics(SQL_HANDLE_DBC, observed_dbc, error)) {
+                                    record_observer_error(observer, error);
+                                    return;
+                                }
+                                reads.fetch_add(1);
+                            }
+                        }
+                        std::this_thread::yield();
                     }
-                    std::this_thread::yield();
+                };
+                if (!GTEST_FLAG_GET(catch_exceptions)) {
+                    observe();
+                    return;
+                }
+                try {
+                    observe();
+                } catch (const std::exception& e) {
+                    record_observer_error(observer, std::string("threw \"") + e.what() + "\"");
+                } catch (...) {
+                    record_observer_error(observer, "threw an unknown exception");
                 }
             });
         }
 
         for (int iteration = 0; iteration < config.iterations; ++iteration) {
             SCOPED_TRACE(std::string(ModeName(mode)) + " iteration=" + std::to_string(iteration));
-            std::unique_ptr<T> test(new T(mode));
-            test->ConcurrentSetUp(env, SQL_NULL_HDBC, 0, iteration);
+            std::unique_ptr<T> test;
+            if (!RunPhase("the test fixture's constructor", [&] { test.reset(new T(mode)); })) {
+                break;
+            }
+            RunPhase("SetUp()", [&] { test->ConcurrentSetUp(env, SQL_NULL_HDBC, 0, iteration); });
             if (!::testing::Test::HasFatalFailure() && !::testing::Test::IsSkipped()) {
                 long long reads_before = 0;
                 {
@@ -779,8 +855,8 @@ void RunSharedStmt(T& coordinator, Mode mode, const char* name) {
                     observed_dbc = test->ConcurrentDbc();
                     reads_before = reads.load();
                 }
-                test->ConcurrentBody();
-                while (reads.load() == reads_before && !observer_failed.load()) {
+                RunPhase("the test body", [&] { test->ConcurrentBody(); });
+                while (observers > 0 && reads.load() == reads_before && !observer_failed.load()) {
                     std::this_thread::yield();
                 }
                 ++observed_iterations;
@@ -792,16 +868,12 @@ void RunSharedStmt(T& coordinator, Mode mode, const char* name) {
                 }
                 retracting.store(false);
             }
-            test->ConcurrentTearDown();
+            RunPhase("TearDown()", [&] { test->ConcurrentTearDown(); });
             progress[0].store(iteration + 1);
             if (::testing::Test::HasFailure() || ::testing::Test::IsSkipped() ||
                 observer_failed.load()) {
                 break;
             }
-        }
-        stop.store(true);
-        for (std::thread& thread : threads) {
-            thread.join();
         }
     }
     const long long elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -815,7 +887,7 @@ void RunSharedStmt(T& coordinator, Mode mode, const char* name) {
         ADD_FAILURE() << label << " " << observer_error;
         return;
     }
-    if (observed_iterations > 0 && !::testing::Test::HasFailure()) {
+    if (observers > 0 && observed_iterations > 0 && !::testing::Test::HasFailure()) {
         EXPECT_GE(reads.load(), observed_iterations)
             << label << ": observers did not read the owner's diagnostics every iteration";
     }

@@ -2556,6 +2556,8 @@ TEST_F(GetDataLiveTest, EmptyNvarcharMaxWchar) {
 // writes only the terminator. Covers the types with no dedicated empty-value
 // test; VARBINARY(n), VARBINARY(MAX), VARCHAR(MAX), and NVARCHAR(MAX) have their
 // own tests above, and IMAGE is in binary_fetch_test.cpp.
+// Benefits-from-mock-tds: send each type's zero-length encoding (PLP length 0
+// with its terminator, non-PLP length 0) directly, not via SQL Server casts.
 ODBC_TEST_F(GetDataLiveTest, EmptyValuesAreZeroLengthNotNull) {
     struct Column {
         const char* expression;
@@ -2603,6 +2605,8 @@ ODBC_TEST_F(GetDataLiveTest, EmptyValuesAreZeroLengthNotNull) {
 // IMAGE are tested elsewhere. The spec requires only the indicator; the target
 // buffer is also checked to be untouched except for SQL_C_NUMERIC, which
 // msodbcsql 18 writes on NULL (measured).
+// Benefits-from-mock-tds: send each type's NULL encoding (PLP NULL, 0xFFFF
+// short-length NULL, legacy LOB without a text pointer) directly.
 ODBC_TEST_F(GetDataLiveTest, NullReportsNullDataAcrossTypedTargets) {
     struct Column {
         const char* sql_type;
@@ -2743,6 +2747,8 @@ TEST_F(GetDataLiveTest, PlpKnownLengthIndicatorCountsDown) {
 // Every truncated SQL_C_CHAR chunk of an ASCII VARCHAR(MAX) fills the buffer:
 // 2038 bytes plus the terminator in a 2039-byte buffer, matching msodbcsql. The
 // PLP refill once reserved room / 3, returning 679 bytes per chunk.
+// Benefits-from-mock-tds: place the PLP chunk boundaries at and around the
+// buffer boundary; SQL Server picks them, so this cannot steer them.
 ODBC_TEST_F(GetDataLiveTest, VarcharMaxAsciiFillsEveryTruncatedCharBuffer) {
     ASSERT_SQL_OK(ExecDirect("SELECT REPLICATE(CAST('A' AS VARCHAR(MAX)), 24000) AS c1"),
                   SQL_HANDLE_STMT, stmt_);
@@ -2760,6 +2766,8 @@ ODBC_TEST_F(GetDataLiveTest, VarcharMaxAsciiFillsEveryTruncatedCharBuffer) {
 // bytes for all three sources below. Both drivers deliver SQL_C_CHAR in the
 // client encoding, so this needs a UTF-8 client; in single-byte code pages such
 // as CP1252 nothing can split.
+// Benefits-from-mock-tds: supply the exact collation bytes and end a PLP chunk
+// inside the euro sign; SQL Server decides both here.
 ODBC_TEST_F(GetDataLiveTest, CharChunksSplitAUtf8CharacterToFillBuffer) {
     if (ODBCTestUtils::Utf8ToNativeClient("\xE2\x82\xAC") != "\xE2\x82\xAC") {
         GTEST_SKIP() << "requires a UTF-8 client encoding to split a character";
@@ -2793,6 +2801,8 @@ ODBC_TEST_F(GetDataLiveTest, CharChunksSplitAUtf8CharacterToFillBuffer) {
 // The non-PLP narrow paths. VARCHAR(n) arrives materialized rather than
 // streamed, and TEXT is the legacy LOB stream. ASCII, for the reason given on
 // NvarcharMaxAsciiFillsEveryTruncatedCharBuffer below.
+// Benefits-from-mock-tds: split the value across TDS packets at the buffer
+// boundary; the negotiated packet size decides the split here.
 ODBC_TEST_F(GetDataLiveTest, VarcharFillsEveryTruncatedCharBuffer) {
     ASSERT_SQL_OK(ExecDirect("SELECT CAST(REPLICATE('A', 8000) AS VARCHAR(8000)) AS c1"),
                   SQL_HANDLE_STMT, stmt_);
@@ -2802,6 +2812,8 @@ ODBC_TEST_F(GetDataLiveTest, VarcharFillsEveryTruncatedCharBuffer) {
     SQLCloseCursor(stmt_);
 }
 
+// Benefits-from-mock-tds: split the legacy LOB value across TDS packets at the
+// buffer boundary; the negotiated packet size decides the split here.
 ODBC_TEST_F(GetDataLiveTest, TextFillsEveryTruncatedCharBuffer) {
     ASSERT_SQL_OK(
         ExecDirect("SELECT CAST(REPLICATE(CAST('A' AS VARCHAR(MAX)), 24000) AS TEXT) AS c1"),
@@ -2815,6 +2827,8 @@ ODBC_TEST_F(GetDataLiveTest, TextFillsEveryTruncatedCharBuffer) {
 // Binary data has no terminator, so every truncated chunk must fill all of
 // BufferLength. The pattern includes 0x00 and the helper's 0x5A sentinel, so
 // neither a zero scan nor an untouched buffer could pass by accident.
+// Benefits-from-mock-tds: place the PLP chunk boundaries at and around the
+// buffer boundary; SQL Server picks them, so this cannot steer them.
 ODBC_TEST_F(GetDataLiveTest, VarbinaryMaxFillsEveryTruncatedBinaryBuffer) {
     ASSERT_SQL_OK(
         ExecDirect("SELECT REPLICATE(CAST(0x00FF5A01 AS VARBINARY(MAX)), 6000) AS c1"),
@@ -2831,6 +2845,8 @@ ODBC_TEST_F(GetDataLiveTest, VarbinaryMaxFillsEveryTruncatedBinaryBuffer) {
 // terminator off-by-one would surface; every case above ends on a short chunk.
 // 24000 = 12 x 2000: 2000 characters plus the terminator in a 2001-byte buffer,
 // or 2000 bytes in a 2000-byte binary buffer.
+// Benefits-from-mock-tds: end the final PLP chunk exactly at the last buffer
+// boundary, so the terminator chunk arrives as a separate read.
 ODBC_TEST_F(GetDataLiveTest, VarcharMaxExactFitFinalCharChunkSucceeds) {
     ASSERT_SQL_OK(ExecDirect("SELECT REPLICATE(CAST('A' AS VARCHAR(MAX)), 24000) AS c1"),
                   SQL_HANDLE_STMT, stmt_);
@@ -2840,6 +2856,8 @@ ODBC_TEST_F(GetDataLiveTest, VarcharMaxExactFitFinalCharChunkSucceeds) {
     SQLCloseCursor(stmt_);
 }
 
+// Benefits-from-mock-tds: end the final PLP chunk exactly at the last buffer
+// boundary, so the terminator chunk arrives as a separate read.
 ODBC_TEST_F(GetDataLiveTest, VarbinaryMaxExactFitFinalBinaryChunkSucceeds) {
     ASSERT_SQL_OK(
         ExecDirect("SELECT REPLICATE(CAST(0x00FF5A01 AS VARBINARY(MAX)), 6000) AS c1"),
@@ -2851,6 +2869,8 @@ ODBC_TEST_F(GetDataLiveTest, VarbinaryMaxExactFitFinalBinaryChunkSucceeds) {
     SQLCloseCursor(stmt_);
 }
 
+// Benefits-from-mock-tds: split the value across TDS packets at the buffer
+// boundary; the negotiated packet size decides the split here.
 ODBC_TEST_F(GetDataLiveTest, BinaryFillsEveryTruncatedBinaryBuffer) {
     ASSERT_SQL_OK(ExecDirect("SELECT CAST(REPLICATE(CAST(0x00FF5A01 AS VARBINARY(MAX)), 2000) "
                              "AS BINARY(8000)) AS c1"),
@@ -2867,6 +2887,8 @@ ODBC_TEST_F(GetDataLiveTest, BinaryFillsEveryTruncatedBinaryBuffer) {
 // PLP path once did. Values mix ASCII, Latin-1 (U+00E9), and CJK (U+4E2D) units.
 
 // UTF-16 to UTF-16, streamed as PLP.
+// Benefits-from-mock-tds: end a PLP chunk on an odd byte, inside a UTF-16 code
+// unit; SQL Server sends whole units, so this cannot.
 ODBC_TEST_F(GetDataLiveTest, NvarcharMaxFillsEveryTruncatedWcharBuffer) {
     ASSERT_SQL_OK(ExecDirect("SELECT LEFT(REPLICATE(CAST(N'a' + NCHAR(233) + NCHAR(20013) "
                              "AS NVARCHAR(MAX)), 8000), 24000) AS c1"),
@@ -2878,6 +2900,8 @@ ODBC_TEST_F(GetDataLiveTest, NvarcharMaxFillsEveryTruncatedWcharBuffer) {
 }
 
 // A CP1252 VARCHAR(MAX) widened to UTF-16.
+// Benefits-from-mock-tds: place the PLP chunk boundaries at and around the
+// buffer boundary; SQL Server picks them, so this cannot steer them.
 ODBC_TEST_F(GetDataLiveTest, VarcharMaxCp1252FillsEveryTruncatedWcharBuffer) {
     ASSERT_SQL_OK(ExecDirect("SELECT REPLICATE(CAST(N'a' + NCHAR(233) "
                              "COLLATE Latin1_General_100_CI_AS AS VARCHAR(MAX)), 12000) AS c1"),
@@ -2891,6 +2915,8 @@ ODBC_TEST_F(GetDataLiveTest, VarcharMaxCp1252FillsEveryTruncatedWcharBuffer) {
 // An NVARCHAR(MAX) narrowed to SQL_C_CHAR. ASCII only: SQL_C_CHAR uses the
 // client encoding (AB#47564), and ASCII is identical in every encoding this
 // suite runs under, while still exposing worst-case reservation per unit.
+// Benefits-from-mock-tds: end a PLP chunk on an odd byte, inside a UTF-16 code
+// unit; SQL Server sends whole units, so this cannot.
 ODBC_TEST_F(GetDataLiveTest, NvarcharMaxAsciiFillsEveryTruncatedCharBuffer) {
     ASSERT_SQL_OK(ExecDirect("SELECT REPLICATE(CAST(N'A' AS NVARCHAR(MAX)), 24000) AS c1"),
                   SQL_HANDLE_STMT, stmt_);
@@ -2901,6 +2927,8 @@ ODBC_TEST_F(GetDataLiveTest, NvarcharMaxAsciiFillsEveryTruncatedCharBuffer) {
 }
 
 // A non-PLP NVARCHAR(4000), which arrives materialized rather than streamed.
+// Benefits-from-mock-tds: split the value across TDS packets inside a UTF-16
+// code unit; the negotiated packet size decides the split here.
 ODBC_TEST_F(GetDataLiveTest, NvarcharFillsEveryTruncatedWcharBuffer) {
     ASSERT_SQL_OK(ExecDirect("SELECT CAST(REPLICATE(N'a' + NCHAR(233) + NCHAR(20013), 1333) "
                              "+ N'a' AS NVARCHAR(4000)) AS c1"),
@@ -2912,6 +2940,8 @@ ODBC_TEST_F(GetDataLiveTest, NvarcharFillsEveryTruncatedWcharBuffer) {
 }
 
 // NTEXT, the legacy LOB stream.
+// Benefits-from-mock-tds: split the legacy LOB value across TDS packets inside
+// a UTF-16 code unit; the negotiated packet size decides the split here.
 ODBC_TEST_F(GetDataLiveTest, NtextFillsEveryTruncatedWcharBuffer) {
     ASSERT_SQL_OK(ExecDirect("SELECT CAST(LEFT(REPLICATE(CAST(N'a' + NCHAR(233) + NCHAR(20013) "
                              "AS NVARCHAR(MAX)), 8000), 24000) AS NTEXT) AS c1"),
@@ -2923,6 +2953,8 @@ ODBC_TEST_F(GetDataLiveTest, NtextFillsEveryTruncatedWcharBuffer) {
 }
 
 // XML, which the server sends as a UTF-16 PLP stream.
+// Benefits-from-mock-tds: end a PLP chunk on an odd byte, inside a UTF-16 code
+// unit; SQL Server sends whole units, so this cannot.
 ODBC_TEST_F(GetDataLiveTest, XmlFillsEveryTruncatedWcharBuffer) {
     ASSERT_SQL_OK(ExecDirect("SELECT CAST(N'<r>' + LEFT(REPLICATE(CAST(N'a' + NCHAR(233) + "
                              "NCHAR(20013) AS NVARCHAR(MAX)), 8000), 23993) + N'</r>' AS XML) "
@@ -4528,6 +4560,8 @@ ODBC_TEST_F(GetDataLiveTest, DefaultTargetStreamsAVarcharMaxAcrossChunks) {
 // matching an identical constant. Covers a fixed-width, narrow, wide, binary,
 // and multi-chunk PLP read on one row. Opts into SharedDbc once that mode runs
 // nightly only (AB#49263); AB#49225 fails it intermittently.
+// Benefits-from-mock-tds: delay one connection's response so concurrent reads
+// interleave by construction rather than by scheduling.
 ODBC_TEST_F(GetDataLiveTest, RunUniqueValuesSurviveEveryRetrievalPath) {
     const SQLINTEGER id = Worker() * 100000 + Iteration();
     const std::string token = WorkerToken("getdata");

@@ -215,7 +215,8 @@ MSSQL_ODBC_MT_THREADS=8 MSSQL_ODBC_MT_ITERS=20 \
   debugger is attached (detected on Windows, Linux, and macOS) or when it
   cannot tell.
 - To tell a race from a plain bug, filter one variant and set
-  `MSSQL_ODBC_MT_THREADS=1 MSSQL_ODBC_MT_ITERS=1`.
+  `MSSQL_ODBC_MT_THREADS=1 MSSQL_ODBC_MT_ITERS=1` (one worker, or the
+  `SharedStmt` owner with no observers).
 - Use a conditional breakpoint such as `Worker()==3` when several workers run
   the body. Avoid `--gtest_break_on_failure` with `SharedDbc`: it also breaks
   on the busy failures the harness retries.
@@ -345,7 +346,7 @@ ThreadSanitizer target (AB#49259).
 
 | Profile | Driver | Threads x iterations | Runs | Platforms |
 |---|---|---|---|---|
-| PR | both | 2 x 1 | `Single`, `CrossThread`, `SharedEnv` | Windows, Linux, macOS |
+| PR | both | 2 x 1 | `Single`, `CrossThread`, `SharedEnv`, `SharedStmt` | Windows, Linux, macOS |
 | Nightly | mssql-odbc | 8 x 20 | All concurrent modes, scenarios 7-10 | Windows, Linux, macOS; scenarios 8-9 without a Driver Manager |
 | Nightly | msodbcsql | 2 x 1 | All concurrent modes | Windows, Linux |
 | Weekly soak | mssql-odbc | 16 x 50 or time-bound | Same as nightly | Same as nightly |
@@ -387,6 +388,10 @@ local SQL Server:
   turns off Windows Error Reporting when it catches exceptions
   (`SetErrorMode(SEM_NOGPFAULTERRORBOX)`), so nightly runs with
   `--gtest_catch_exceptions=0` and WER LocalDumps; Linux enables core dumps.
+  That flag also lets a C++ exception from a test terminate the process
+  instead of failing the test. A Debug build then stops at the CRT's modal
+  `abort()` dialog until the watchdog dumps it, so nightly Windows runs use a
+  Release build (observed locally).
 - msodbcsql has failed or exited without a result a few times at 8 x 20 or more
   (one `0xC0000409` in 41 runs; a chunk-fill failure and a silent exit in about
   16 runs at 16 x 50), none reproducible on demand. Dumps will tell a harness

@@ -310,8 +310,10 @@ set once via the `msodbcsqlVersion` pipeline variable (in
 When `ODBC_TEST_SERVER` is unset, a dev SQL Server on `localhost:1433` is
 auto-detected — the password is taken from `ODBC_TEST_PWD`, then `SQL_PASSWORD`,
 then `SQL_PASSWORD=` in `mssql-tds\.env`. With a password, `ODBC_TEST_UID`
-defaults to `sa`; without one, UID stays unset and the fixture uses integrated
-auth. This matches `run_e2e.sh`.
+defaults to `sa`. Without one, an unset `ODBC_TEST_UID` stays unset and the
+fixture uses integrated auth; a `ODBC_TEST_UID` you set yourself is kept, and
+the script warns that the fixture will try SQL auth with an empty password.
+This matches `run_e2e.sh`.
 
 `run_e2e.ps1 -Coverage` builds the Rust driver with LLVM source-based
 instrumentation so the driver code exercised by the C++ tests — which load the
@@ -431,8 +433,10 @@ environment variables to enable them:
 When `ODBC_TEST_SERVER` is not set, `run_e2e.sh` probes `localhost:1433`. If a
 SQL Server is listening, it auto-configures `ODBC_TEST_SERVER=localhost` and
 resolves the password from `ODBC_TEST_PWD`, `SQL_PASSWORD`, or `mssql-tds/.env`
-(in that order). If a password is found, `ODBC_TEST_UID` defaults to `sa`;
-otherwise UID stays unset and the fixture uses integrated auth.
+(in that order). If a password is found, `ODBC_TEST_UID` defaults to `sa`.
+Otherwise an unset `ODBC_TEST_UID` stays unset and the fixture uses integrated
+auth; a `ODBC_TEST_UID` you set yourself is kept, with a warning that the
+fixture will try SQL auth with an empty password.
 
 To bring up a local SQL Server in Docker:
 
