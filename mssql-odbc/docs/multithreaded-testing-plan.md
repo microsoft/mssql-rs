@@ -230,7 +230,8 @@ Measured 2026-10-08 on both drivers unless noted.
   source; scenario 10 relies on it).
 - `SQLDisconnect` frees child STMTs and can race an in-flight child call: a
   known lifetime bug, not a test scenario.
-- `SQLCancel` (#703; AB#49222-49224) interrupts a running execute, fetch,
+- `SQLCancel` is complete (AB#47083, closed; #703). It interrupts a running
+  execute, fetch,
   `SQLGetData`, `SQLMoreResults`, `SQLPutData`, or final `SQLParamData` from
   another thread; the call fails `HY008` (msodbcsql's `SQLMoreResults`
   returns `SQL_NO_DATA`, [parity registry](parity-deviations.md) entry 27).
@@ -311,8 +312,9 @@ Purpose-built workloads using the same settings, start gate, and watchdog.
      test process stays memory-safe.
    - **8b. Binding and descriptor races:** 8a plus `SQLBindCol`,
      `SQLBindParameter`, `SQLFreeStmt(SQL_UNBIND / SQL_RESET_PARAMS)`,
-     `SQLSetStmtAttr`, and updates and `SQLCopyDesc` on the STMT's own APD and
-     ARD. Buffers outlive every thread.
+     `SQLSetStmtAttr`, `SQLCancel`, and updates and `SQLCopyDesc` on the STMT's
+     own APD and ARD. Buffers outlive every thread. A cancelled call may also
+     fail `HY008`.
    - **8a/8b checks:** one column shape for every query; self-checking values
      (a worker/row token with a checksum) so torn or mixed reads fail; only
      success, `SQL_NO_DATA`, `HY010`, `24000`, or `HY000` busy; afterwards
@@ -396,7 +398,7 @@ local SQL Server:
   "No active TDS client" instead of the busy error. Reproduced at 8x20 with the
   GetData pilot tests opted into `SharedDbc` locally.
 - Divergence, not a bug: msodbcsql aborts an open cursor on an idle `SQLCancel`;
-  ODBC 3.5 says it has no effect. Not yet asserted in e2e ([Deferred](#deferred)).
+  ODBC 3.5 says it has no effect. Not yet asserted in e2e (AB#49258, below).
 - Fixed: AB#49220 (empty `IMAGE` read as NULL), by PR #700; AB#49219 (`run_e2e`
   auto-detect used `sa` with no password), in this PR.
 
@@ -409,7 +411,15 @@ Tracked under AB#49256:
    fourteen chunk-fill tests); empty-value, NULL, and parameterized-`THROW` tests.
 2. **AB#49263:** CTest split, PR filter, nightly and weekly profiles, dumps.
 3. **AB#49260:** fetch and GetData suites, plus worker-token tests.
-4. **AB#49258:** parameter and execution suites, plus worker-token tests.
+4. **AB#49258:** parameter and execution suites, plus worker-token tests; and
+   three cancel cases `cancel_test.cpp` does not cover, added to it:
+   - An idle cancel with an open cursor leaves it as it was (skip msodbcsql,
+     which aborts it).
+   - A cancel just before execute does not leak into that or the next
+     execution, through a Driver Manager (the driver's unit tests cover it
+     directly).
+   - A fetch blocked by a row lock held by a second connection, rather than a
+     `WAITFOR` inside the batch.
 5. **AB#49262:** diagnostics, descriptor, metadata, and attribute suites;
    scenario 6.
 6. **AB#49261:** scenarios 7 and 10.
@@ -417,17 +427,6 @@ Tracked under AB#49256:
 
 ## Deferred
 
-- **Cancel cases `cancel_test.cpp` (#703) does not cover yet** (under
-  AB#47083):
-  - An idle cancel with an open cursor leaves it as it was (skip msodbcsql,
-    which aborts it).
-  - A cancel just before execute does not leak into that or the next
-    execution, through a Driver Manager (the driver's unit tests cover it
-    directly).
-  - A fetch blocked by a row lock held by a second connection, rather than a
-    `WAITFOR` inside the batch.
-  - `SQLCancel` in scenario 8b. On unixODBC run at `Threading` 1-2 (3 also
-    locks `SQLCancel`; 0 races in the Driver Manager).
 - **Disconnect or free during use:** add to 8b once handle lifetimes are
   reference-counted or generation-checked.
 - **Async execution and MARS:** once the driver supports them.
