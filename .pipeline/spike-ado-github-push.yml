@@ -29,11 +29,15 @@ steps:
 
 - script: |
     set -euo pipefail
-    HEADER="$(git config --get http.https://github.com/.extraheader || true)"
-    if [ -z "$HEADER" ]; then
-      echo "RESULT: NO_EXTRAHEADER - credential is not persisted at the expected key."
+    KEY="$(git config --list | sed -n 's/^\(http\..*\.extraheader\)=.*/\1/p' | head -n1)"
+    if [ -z "$KEY" ]; then
+      echo "RESULT: NO_EXTRAHEADER - no persisted credential found."
       exit 1
     fi
+    echo "RESULT: credential key = $KEY"
+    HEADER="$(git config --get "$KEY")"
+    SCHEME="$(printf '%s' "$HEADER" | awk '{print $2}')"
+    echo "RESULT: auth scheme = $SCHEME"
     DECODED="$(printf '%s' "${HEADER##* }" | base64 -d)"
     TOKEN="${DECODED#*:}"
     echo "RESULT: credential user part = ${DECODED%%:*}"
