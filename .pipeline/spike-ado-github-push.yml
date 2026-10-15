@@ -12,9 +12,7 @@ variables:
   value: true
 
 pool:
-  name: RUST-X64-WUS3
-  demands:
-  - imageOverride -equals RUST-AZL3
+  vmImage: ubuntu-latest
 
 steps:
 - checkout: self
