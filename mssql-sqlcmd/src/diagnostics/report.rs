@@ -601,29 +601,39 @@ pub fn text(report: &Report) -> String {
             "Driver tracing can show more than these checks; see {guide}"
         );
     }
-    // A transport the client moved past is in the JSON report only; each line
-    // once, wherever it repeats. Without a line to print, no heading either.
+    // As a normal sqlcmd run prints each error, when the driver has a wording
+    // for the event. A transport the client moved past is in the JSON report
+    // only; each line once, wherever it repeats (the JSON keeps every record).
+    // Without a line to print, no heading either.
     let mut lines: Vec<String> = Vec::new();
     for error in report.errors.iter().filter(|e| !e.superseded) {
-        let mut ids = Vec::new();
-        if let Some(number) = error.number {
-            ids.push(format!("error {number}"));
-        }
-        if let (Some(state), Some(class)) = (error.state, error.class) {
-            ids.push(format!("state {state}, class {class}"));
-        }
-        if let Some(os) = error.os_error {
-            ids.push(format!("os error {os}"));
-        }
-        if let Some(code) = &error.code {
-            ids.push(code.clone());
-        }
-        let ids = if ids.is_empty() {
-            String::new()
+        let line = if let Some(text) = &error.text {
+            format!(
+                "  Sqlcmd: Error: {} : {}.",
+                super::driver_text::CLIENT,
+                r.text(text)
+            )
         } else {
-            format!(" [{}]", ids.join("; "))
+            let mut ids = Vec::new();
+            if let Some(number) = error.number {
+                ids.push(format!("error {number}"));
+            }
+            if let (Some(state), Some(class)) = (error.state, error.class) {
+                ids.push(format!("state {state}, class {class}"));
+            }
+            if let Some(os) = error.os_error {
+                ids.push(format!("os error {os}"));
+            }
+            if let Some(code) = &error.code {
+                ids.push(code.clone());
+            }
+            let ids = if ids.is_empty() {
+                String::new()
+            } else {
+                format!(" [{}]", ids.join("; "))
+            };
+            format!("  {}{ids}: {}", error.source, r.text(&error.message))
         };
-        let line = format!("  {}{ids}: {}", error.source, r.text(&error.message));
         if !lines.contains(&line) {
             lines.push(line);
         }
@@ -746,6 +756,7 @@ pub fn json(report: &Report, version: &str) -> Result<String, serde_json::Error>
                 os_error: error.os_error,
                 code: error.code.as_deref(),
                 message: r.text(&error.message),
+                text: error.text.as_deref().map(|text| r.text(text)),
                 superseded: error.superseded,
                 from_message_text: error.from_message_text,
             })
@@ -756,7 +767,7 @@ pub fn json(report: &Report, version: &str) -> Result<String, serde_json::Error>
         review_before_sharing: {
             let mut paths = Vec::new();
             if !report.errors.is_empty() {
-                paths.push("errors[].message");
+                paths.extend(["errors[].message", "errors[].text"]);
             }
             if quotes_messages(report) {
                 paths.push("findings[].text");
@@ -987,6 +998,9 @@ struct ErrorView<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     code: Option<&'a str>,
     message: String,
+    /// What a normal sqlcmd run prints for the same event.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text: Option<String>,
     /// From a transport the client then moved past; a normal run does not
     /// print it.
     #[serde(skip_serializing_if = "is_false")]
@@ -1604,7 +1618,7 @@ Limitations:
                 .unwrap();
         assert_eq!(
             value["reviewBeforeSharing"],
-            serde_json::json!(["errors[].message"])
+            serde_json::json!(["errors[].message", "errors[].text"])
         );
     }
 
@@ -1708,7 +1722,7 @@ Limitations:
         // Its finding is sqlcmd's own sentence, with labels: only the errors.
         assert_eq!(
             value["reviewBeforeSharing"],
-            serde_json::json!(["errors[].message"])
+            serde_json::json!(["errors[].message", "errors[].text"])
         );
     }
 
@@ -1808,17 +1822,122 @@ Limitations:
         }
     }
 
+    /// A login failure as `finish` leaves it: the record carries the text a
+    /// normal sqlcmd run prints.
+    fn login_failed_report() -> Report {
+        let mut report = failing_report();
+        let mut error = ErrorRecord::new(
+            "sqlServer",
+            CheckId::ConnectionAttempt,
+            "Login failed for user 'sa'.",
+        );
+        error.number = Some(18456);
+        error.text = Some(error.message.clone());
+        report.errors = vec![error];
+        report
+    }
+
+    #[test]
+    fn an_error_with_driver_text_prints_as_a_normal_sqlcmd_run_does() {
+        let shared = text(&login_failed_report());
+        assert!(
+            shared.contains("\n  Sqlcmd: Error: mssql-tds : Login failed for user 'user-1'..\n"),
+            "{shared}"
+        );
+        assert!(!shared.contains("'sa'"), "{shared}");
+
+        let mut report = login_failed_report();
+        report.request.local_detail = true;
+        let local = text(&report);
+        assert!(
+            local.contains("\n  Sqlcmd: Error: mssql-tds : Login failed for user 'sa'..\n"),
+            "{local}"
+        );
+
+        let json = json(&login_failed_report(), "v").unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            value["errors"][0]["text"],
+            "Login failed for user 'user-1'."
+        );
+        assert_eq!(
+            value["errors"][0]["message"],
+            "Login failed for user 'user-1'."
+        );
+    }
+
+    #[test]
+    fn the_same_driver_text_from_two_addresses_prints_once() {
+        let mut report = failing_report();
+        let refused = |address: &str| {
+            let mut error = ErrorRecord::new(
+                "os",
+                CheckId::TcpConnect,
+                format!("{address}:1433: refused"),
+            );
+            error.code = Some("refused".to_string());
+            error.text = Some("TCP Provider: refused.".to_string());
+            error
+        };
+        report.errors = vec![refused("10.0.0.1"), refused("::1")];
+        let text = text(&report);
+        assert_eq!(
+            text.matches("Sqlcmd: Error: mssql-tds : TCP Provider: refused..")
+                .count(),
+            1,
+            "{text}"
+        );
+        // JSON keeps both records: each address is evidence.
+        let value: serde_json::Value = serde_json::from_str(&json(&report, "v").unwrap()).unwrap();
+        assert_eq!(value["errors"].as_array().map(Vec::len), Some(2));
+    }
+
+    /// The same line is printed once wherever it repeats, not only when the
+    /// repeats are next to each other; the JSON keeps every record.
+    #[test]
+    fn interleaved_duplicate_error_lines_print_once() {
+        let mut report = failing_report();
+        let failed = |address: &str, code: &str, text: &str| {
+            let mut error =
+                ErrorRecord::new("os", CheckId::TcpConnect, format!("{address}:1433: {code}"));
+            error.code = Some(code.to_string());
+            error.text = Some(text.to_string());
+            error
+        };
+        report.errors = vec![
+            failed("10.0.0.1", "refused", "TCP Provider: refused."),
+            failed("10.0.0.2", "hostUnreachable", "TCP Provider: unreachable."),
+            failed("10.0.0.3", "refused", "TCP Provider: refused."),
+        ];
+        let text = text(&report);
+        for line in [
+            "Sqlcmd: Error: mssql-tds : TCP Provider: refused..",
+            "Sqlcmd: Error: mssql-tds : TCP Provider: unreachable..",
+        ] {
+            assert_eq!(text.matches(line).count(), 1, "{line}: {text}");
+        }
+        assert!(
+            text.find("refused..").unwrap() < text.find("unreachable..").unwrap(),
+            "first-seen order: {text}"
+        );
+        let value: serde_json::Value = serde_json::from_str(&json(&report, "v").unwrap()).unwrap();
+        assert_eq!(value["errors"].as_array().map(Vec::len), Some(3));
+    }
+
     #[test]
     fn a_superseded_error_is_kept_in_json_and_not_printed() {
         let mut report = failing_report();
         report.errors[0].superseded = true;
         let mut pipe = ErrorRecord::new("os", CheckId::ConnectionAttempt, "pipe not found");
         pipe.os_error = Some(53);
+        pipe.text = Some(
+            "Named Pipes Provider: Could not open a connection to SQL Server [53]. ".to_string(),
+        );
         report.errors.push(pipe);
         let text = text(&report);
         assert!(!text.contains("connection refused by"), "{text}");
         assert!(
-            text.contains("  os [os error 53]: pipe not found\n"),
+            text.contains("  Sqlcmd: Error: mssql-tds : Named Pipes Provider: Could not open a connection to SQL Server [53]. .\n"),
             "{text}"
         );
         let value: serde_json::Value = serde_json::from_str(&json(&report, "v").unwrap()).unwrap();
@@ -1871,6 +1990,20 @@ Limitations:
             "{line}\n{no_phase}"
         );
         assert!(!line.contains("  ; "), "{line}\n{no_phase}");
+    }
+
+    #[test]
+    fn an_error_without_driver_text_keeps_its_identifiers() {
+        let text = text(&failing_report());
+        assert!(
+            text.contains(
+                "  os [os error 10061; refused]: 10.0.0.1:1433: connection refused by db01"
+            ),
+            "{text}"
+        );
+        let value: serde_json::Value =
+            serde_json::from_str(&json(&failing_report(), "v").unwrap()).unwrap();
+        assert!(value["errors"][0].get("text").is_none(), "{value}");
     }
 
     #[test]
