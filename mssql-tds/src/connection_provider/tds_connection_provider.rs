@@ -1,11 +1,14 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tracing::{debug, info};
 
 use crate::connection::client_context::{ClientContext, TransportContext};
+use crate::connection::connect_stage;
 use crate::connection::connection_actions::{
     ActionOutcome, ConnectionAction, ConnectionActionChain, ExecutionContext,
 };
@@ -36,6 +39,179 @@ pub(crate) static PARSER_REGISTRY: LazyLock<GenericTokenParserRegistry> =
 
 /// Factory for establishing TDS connections and producing [`TdsClient`] instances.
 pub struct TdsConnectionProvider;
+
+/// Where a diagnostic connection attempt ([`TdsConnectionProvider::diagnose_client`])
+/// stops.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiagnosticStop {
+    /// After the name or instance is resolved: SQL Server Browser asked, the
+    /// TCP host resolved, a LocalDB instance's pipe found; before anything
+    /// is connected to.
+    Resolution,
+    /// After the transport opened (a TCP connection, or a pipe), before
+    /// pre-login. With strict encryption (TDS 8.0) the TLS handshake is part
+    /// of opening the transport.
+    Transport,
+}
+
+/// What a diagnostic connection attempt does beyond a normal one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DiagnosticProbe {
+    /// Stop there, instead of logging in.
+    pub stop_after: Option<DiagnosticStop>,
+    /// Over TCP (without MultiSubnetFailover), once an address accepts the
+    /// connection, also connect to every address after it, at the same time
+    /// and each within the connect timeout, closing each connection at once.
+    /// The connection used is the first one, so the login does not wait.
+    pub all_addresses: bool,
+}
+
+/// What a diagnostic connection attempt came to, when it did not fail.
+// Returned once per attempt and taken apart at once: boxing the client would
+// only add an allocation.
+#[allow(clippy::large_enum_variant)]
+pub enum DiagnosticConnection {
+    /// It logged in.
+    Connected(TdsClient),
+    /// It stopped where it was asked to.
+    Stopped(DiagnosticStop),
+}
+
+/// What [`DiagnosticProbe`] asks of one connection attempt, and what came of
+/// it, passed down the connect path. [`NO_PROBE`], what every
+/// normal connection passes, asks nothing.
+#[derive(Clone, Default)]
+pub(crate) struct ConnectProbe(Option<Arc<ProbeState>>);
+
+struct ProbeState {
+    options: DiagnosticProbe,
+    /// Where the attempt stopped.
+    stopped: Mutex<Option<DiagnosticStop>>,
+    /// The connects to the addresses after the one used. Owned so that
+    /// dropping the probe, as canceling the attempt does, aborts them.
+    extra_attempts: Arc<Mutex<Vec<AbortOnDrop>>>,
+}
+
+/// A task that is aborted when this is dropped, unlike a `JoinHandle`, which
+/// leaves the task running.
+struct AbortOnDrop(JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+impl std::future::Future for AbortOnDrop {
+    type Output = Result<(), tokio::task::JoinError>;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        std::pin::Pin::new(&mut self.0).poll(cx)
+    }
+}
+
+/// The probe of every normal connection: it asks nothing.
+pub(crate) static NO_PROBE: ConnectProbe = ConnectProbe(None);
+
+impl ConnectProbe {
+    fn new(options: DiagnosticProbe) -> Self {
+        Self(Some(Arc::new(ProbeState {
+            options,
+            stopped: Mutex::new(None),
+            extra_attempts: Arc::new(Mutex::new(Vec::new())),
+        })))
+    }
+
+    /// Whether this is a diagnostic connection.
+    pub(crate) fn is_active(&self) -> bool {
+        self.0.is_some()
+    }
+
+    /// Whether to connect to every address.
+    pub(crate) fn all_addresses(&self) -> bool {
+        self.0
+            .as_ref()
+            .is_some_and(|state| state.options.all_addresses)
+    }
+
+    /// Fails, after noting where, when the attempt stops at `stop`. The
+    /// error is not transient, so neither a retry nor another transport
+    /// follows it.
+    pub(crate) fn check_stop(&self, stop: DiagnosticStop) -> TdsResult<()> {
+        if self.stops_at(stop) {
+            Err(Self::stop_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Whether the attempt stops at `stop`; if so, notes it. The caller then
+    /// fails with [`Self::stop_error`].
+    pub(crate) fn stops_at(&self, stop: DiagnosticStop) -> bool {
+        match &self.0 {
+            Some(state) if state.options.stop_after == Some(stop) => {
+                *state
+                    .stopped
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(stop);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The error a diagnostic stop unwinds the attempt with.
+    pub(crate) fn stop_error() -> Error {
+        OperationCancelledError("diagnostic stop".to_string())
+    }
+
+    /// Keeps the connect to an address after the one used, to wait for it.
+    pub(crate) fn add_extra_attempt(&self, attempt: JoinHandle<()>) {
+        if let Some(state) = &self.0 {
+            state
+                .extra_attempts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(AbortOnDrop(attempt));
+        }
+    }
+
+    fn stopped(&self) -> Option<DiagnosticStop> {
+        self.0.as_ref().and_then(|state| {
+            *state
+                .stopped
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        })
+    }
+
+    /// Waits for the connects to the other addresses, at most `bound_ms`
+    /// (0: no bound); those still running then are aborted, as they are if
+    /// this is dropped while waiting.
+    async fn finish_extra_attempts(&self, bound_ms: u64) {
+        let Some(state) = &self.0 else {
+            return;
+        };
+        let attempts: Vec<AbortOnDrop> = std::mem::take(
+            &mut *state
+                .extra_attempts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        if attempts.is_empty() {
+            return;
+        }
+        let all = futures::future::join_all(attempts);
+        if bound_ms == 0 {
+            all.await;
+        } else {
+            let _ = timeout(Duration::from_millis(bound_ms), all).await;
+        }
+    }
+}
 
 impl Default for TdsConnectionProvider {
     fn default() -> Self {
@@ -104,6 +280,59 @@ impl TdsConnectionProvider {
         datasource: &str,
         cancel_handle: Option<&CancelHandle>,
     ) -> TdsResult<TdsClient> {
+        let action_chain = Self::action_chain(&mut context, datasource)?;
+
+        // Execute the action chain to get transport contexts
+        self.execute_action_chain(&context, action_chain, cancel_handle, &NO_PROBE)
+            .await
+    }
+
+    /// [`create_client`](Self::create_client) for connection diagnostics: the
+    /// same connection attempt, observed through its connect-stage spans
+    /// ([`connect_stage`](crate::connection::connect_stage)), with what
+    /// `probe` asks besides. A diagnostic attempt does not use or update the
+    /// instance cache, so a named instance is always looked up.
+    ///
+    /// Returns once the attempt has logged in, stopped where `probe` asks,
+    /// or failed, and the connects to other addresses `probe` asks for have
+    /// ended (each is bounded by the connect timeout). To cancel it, drop
+    /// the future.
+    pub async fn diagnose_client(
+        &self,
+        context: ClientContext,
+        datasource: &str,
+        probe: DiagnosticProbe,
+    ) -> TdsResult<DiagnosticConnection> {
+        if context.multi_subnet_failover && probe.stop_after == Some(DiagnosticStop::Resolution) {
+            return Err(Error::UsageError(
+                "A diagnostic attempt with MultiSubnetFailover cannot stop after resolution: \
+                 resolving is part of the parallel connect."
+                    .to_string(),
+            ));
+        }
+        let connect_probe = ConnectProbe::new(probe);
+        let bound_ms = u64::from(context.connect_timeout) * 1000;
+        let mut context = context;
+        let result = match Self::action_chain(&mut context, datasource) {
+            Ok(action_chain) => {
+                self.execute_action_chain(&context, action_chain, None, &connect_probe)
+                    .await
+            }
+            Err(error) => Err(error),
+        };
+        connect_probe.finish_extra_attempts(bound_ms).await;
+        if let Some(stop) = connect_probe.stopped() {
+            return Ok(DiagnosticConnection::Stopped(stop));
+        }
+        result.map(DiagnosticConnection::Connected)
+    }
+
+    /// Parses `datasource`, validates `context` for it, and gives the
+    /// connection strategy.
+    fn action_chain(
+        context: &mut ClientContext,
+        datasource: &str,
+    ) -> TdsResult<ConnectionActionChain> {
         // Parse the datasource to get the action chain
         let parsed = context.parse_datasource(datasource)?;
 
@@ -128,9 +357,7 @@ impl TdsConnectionProvider {
 
         debug!("Connection strategy:\n{}", action_chain.describe());
 
-        // Execute the action chain to get transport contexts
-        self.execute_action_chain(&context, action_chain, cancel_handle)
-            .await
+        Ok(action_chain)
     }
 
     /// Execute an action chain to create a client
@@ -142,6 +369,7 @@ impl TdsConnectionProvider {
         context: &ClientContext,
         action_chain: ConnectionActionChain,
         cancel_handle: Option<&CancelHandle>,
+        probe: &ConnectProbe,
     ) -> TdsResult<TdsClient> {
         CancelHandle::run_until_cancelled(cancel_handle, async move {
             // Resolve SSRP (SQL Browser) if the action chain requires it.
@@ -180,7 +408,7 @@ impl TdsConnectionProvider {
                 let timeout_duration =
                     deadline.map(|dl| dl.saturating_duration_since(Instant::now()));
                 let connect_future =
-                    Self::connect_with_transport_context(context, &sm_transport, None);
+                    Self::connect_with_transport_context(context, &sm_transport, None, probe);
                 let sm_result = match timeout_duration.as_ref() {
                     Some(duration) => match timeout(*duration, connect_future).await {
                         Ok(result) => result,
@@ -240,7 +468,9 @@ impl TdsConnectionProvider {
                         )
                     })?;
 
-                if action_chain.uses_cache() {
+                // A diagnostic connection always asks SQL Server Browser,
+                // and does not leave its answer in the cache.
+                if action_chain.uses_cache() && !probe.is_active() {
                     if let Some(cached) = InstanceCache::global().get(server, instance)? {
                         debug!(?cached, server, instance, "SSRP cache hit");
                         exec_context.store_outcome(ActionOutcome::CacheHit {
@@ -250,11 +480,11 @@ impl TdsConnectionProvider {
                         });
                     } else {
                         debug!(server, instance, "SSRP cache miss");
-                        Self::resolve_ssrp(&action_chain, &mut exec_context, context.ssrp_timeout_ms).await?;
+                        Self::resolve_ssrp(&action_chain, &mut exec_context, context.ssrp_timeout_ms, probe.is_active()).await?;
                         cache_key = Some((server.to_string(), instance.to_string()));
                     }
                 } else {
-                    Self::resolve_ssrp(&action_chain, &mut exec_context, context.ssrp_timeout_ms).await?;
+                    Self::resolve_ssrp(&action_chain, &mut exec_context, context.ssrp_timeout_ms, probe.is_active()).await?;
                 }
             }
 
@@ -367,7 +597,7 @@ impl TdsConnectionProvider {
                         ));
                     }
 
-                    let connect_future = Self::connect_with_transport_context(&context, transport_ctx, None);
+                    let connect_future = Self::connect_with_transport_context(&context, transport_ctx, None, probe);
 
                     // Recompute remaining time budget before each timeout call
                     let remaining = deadline.map(|dl| dl.saturating_duration_since(Instant::now()));
@@ -412,6 +642,7 @@ impl TdsConnectionProvider {
                                     &context,
                                     &tcp_transport_context,
                                     None,
+                                    probe,
                                 );
                                 // Recompute remaining time budget for redirected connect
                                 let remaining = deadline
@@ -457,10 +688,14 @@ impl TdsConnectionProvider {
     }
 
     /// Query SQL Browser (SSRP) to resolve the TCP port or named pipe path for a named instance.
+    /// A diagnostic attempt (`bound_resolution`) has resolving the server count
+    /// against `ssrp_timeout_ms` too, so a slow resolver cannot outlast the
+    /// limit reported for the lookup.
     async fn resolve_ssrp(
         action_chain: &ConnectionActionChain,
         exec_context: &mut ExecutionContext,
         ssrp_timeout_ms: u64,
+        bound_resolution: bool,
     ) -> TdsResult<()> {
         let (server, instance) = action_chain
             .actions()
@@ -484,17 +719,54 @@ impl TdsConnectionProvider {
         };
         debug!(server = %server, instance = %instance, timeout_ms, "Executing SSRP query");
 
-        let instance_info =
-            ssrp::get_instance_info_ext(&server, &instance, ssrp::SSRP_PORT, timeout_ms)
-                .await
-                .map_err(|e| {
-                    Error::ConnectionError(format!(
-                        "Error Locating Server/Instance Specified [{}\\{}]. \
+        let stage = tracing::info_span!(
+            target: connect_stage::TARGET,
+            connect_stage::INSTANCE_LOOKUP,
+            server = %server,
+            instance = %instance,
+            addresses = tracing::field::Empty,
+            port = tracing::field::Empty,
+            pipe = tracing::field::Empty,
+            result = tracing::field::Empty,
+            os_error = tracing::field::Empty,
+            error = tracing::field::Empty,
+            ok = tracing::field::Empty
+        );
+        let instance_info = ssrp::query_instance(
+            &server,
+            &instance,
+            ssrp::SSRP_PORT,
+            timeout_ms,
+            bound_resolution,
+            |addresses| {
+                if !stage.is_disabled() {
+                    stage.record(
+                        connect_stage::ADDRESSES,
+                        connect_stage::address_list(addresses),
+                    );
+                }
+            },
+        )
+        .await
+        .map_err(|lookup| {
+            if !stage.is_disabled() {
+                stage.record(connect_stage::RESULT, lookup.code());
+                if let Some(code) = lookup.os_error() {
+                    stage.record(connect_stage::OS_ERROR, code);
+                }
+                if let Some(detail) = lookup.detail() {
+                    stage.record(connect_stage::ERROR, detail);
+                }
+                stage.record(connect_stage::OK, false);
+            }
+            let e = Error::from(lookup);
+            Error::ConnectionError(format!(
+                "Error Locating Server/Instance Specified [{}\\{}]. \
                      Ensure the instance name is correct and SQL Server Browser \
                      service is running on the host. ({})",
-                        server, instance, e
-                    ))
-                })?;
+                server, instance, e
+            ))
+        })?;
 
         let transports = ssrp::build_transport_list(instance_info, &server, &instance);
 
@@ -512,6 +784,15 @@ impl TdsConnectionProvider {
         });
 
         if tcp_port.is_none() {
+            #[cfg(windows)]
+            let no_endpoint = pipe_path.is_none();
+            #[cfg(not(windows))]
+            let no_endpoint = true;
+            if no_endpoint {
+                stage.record(connect_stage::RESULT, connect_stage::NO_ENDPOINT);
+                stage.record(connect_stage::OK, false);
+            }
+
             #[cfg(windows)]
             if pipe_path.is_none() {
                 return Err(Error::ConnectionError(format!(
@@ -531,6 +812,7 @@ impl TdsConnectionProvider {
 
         if let Some(port) = tcp_port {
             debug!(port, "SSRP resolved TCP port");
+            stage.record(connect_stage::PORT, port);
             exec_context.store_outcome(ActionOutcome::SsrpResolved { port });
         }
 
@@ -540,9 +822,11 @@ impl TdsConnectionProvider {
             // This avoids SMB round-trips and "Access is denied" errors.
             let pipe = crate::connection::transport::named_pipes::localize_pipe_path(&pipe);
             debug!(pipe = %pipe, "SSRP resolved named pipe path");
+            stage.record(connect_stage::PIPE_PATH, pipe.as_str());
             exec_context.store_outcome(ActionOutcome::SsrpResolvedPipe { pipe_path: pipe });
         }
 
+        stage.record(connect_stage::OK, true);
         Ok(())
     }
 
@@ -555,6 +839,7 @@ impl TdsConnectionProvider {
         context: &ClientContext,
         transport_context: &TransportContext,
         recovery_data: Option<Box<SessionRecoveryData>>,
+        probe: &ConnectProbe,
     ) -> TdsResult<(
         AnyTransport,
         crate::handler::handler_factory::NegotiatedSettings,
@@ -577,8 +862,15 @@ impl TdsConnectionProvider {
             context.keep_alive_interval_in_ms,
             context.multi_subnet_failover,
             connect_timeout_ms,
+            probe,
         )
         .await?;
+
+        if probe.stops_at(DiagnosticStop::Transport) {
+            // Dropping the transport closes it at once; nothing was sent on it.
+            drop(transport);
+            return Err(ConnectProbe::stop_error());
+        }
 
         let factory = HandlerFactory {
             context: context.clone(),
@@ -842,6 +1134,73 @@ mod tests {
         }
     }
 
+    // ── Diagnostic probe tests ──
+
+    #[tokio::test]
+    async fn dropping_the_probe_aborts_the_extra_attempts() {
+        let probe = ConnectProbe::new(DiagnosticProbe::default());
+        let (started, running) = tokio::sync::oneshot::channel::<()>();
+        let (finished, done) = tokio::sync::oneshot::channel::<()>();
+        probe.add_extra_attempt(tokio::spawn(async move {
+            let _finished = finished;
+            let _ = started.send(());
+            std::future::pending::<()>().await;
+        }));
+        running.await.unwrap();
+
+        drop(probe);
+
+        // The task's end drops its sender, which completes `done` with an error.
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), done)
+                .await
+                .expect("the task was not aborted")
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn canceling_the_wait_for_extra_attempts_aborts_them() {
+        let probe = ConnectProbe::new(DiagnosticProbe::default());
+        let (finished, done) = tokio::sync::oneshot::channel::<()>();
+        probe.add_extra_attempt(tokio::spawn(async move {
+            let _finished = finished;
+            std::future::pending::<()>().await;
+        }));
+
+        let waiting =
+            tokio::time::timeout(Duration::from_millis(50), probe.finish_extra_attempts(0)).await;
+        assert!(waiting.is_err(), "the wait has no bound of its own");
+
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), done)
+                .await
+                .expect("the task was left running")
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_subnet_failover_cannot_stop_after_resolution() {
+        let context = ClientContext {
+            multi_subnet_failover: true,
+            ..Default::default()
+        };
+        let error = TdsConnectionProvider::new()
+            .diagnose_client(
+                context,
+                "tcp:127.0.0.1,1",
+                DiagnosticProbe {
+                    stop_after: Some(DiagnosticStop::Resolution),
+                    all_addresses: false,
+                },
+            )
+            .await
+            .err()
+            .expect("the combination is refused");
+        assert!(matches!(error, Error::UsageError(_)), "{error}");
+    }
+
     // ── Connection retry tests ──
 
     /// Helper to build a ClientContext targeting a specific host:port
@@ -987,5 +1346,292 @@ mod tests {
             elapsed.as_secs() < 6,
             "Should respect timeout deadline; took {elapsed:?}"
         );
+    }
+
+    // ── Diagnostic connections ──
+
+    mod diagnostic {
+        use super::*;
+        use crate::connection::connect_stage::{self as stage, tests::StageLog};
+        use std::future::Future;
+
+        /// Runs `attempt` on a current-thread runtime, as connection
+        /// diagnostics do, recording its connect stages.
+        fn observe<F: Future>(attempt: impl FnOnce() -> F) -> (F::Output, StageLog) {
+            let log = StageLog::default();
+            let output = tracing::subscriber::with_default(log.clone(), || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(attempt())
+            });
+            (output, log)
+        }
+
+        fn context() -> ClientContext {
+            let mut context = ClientContext {
+                connect_timeout: 2,
+                login_timeout: Some(2),
+                connect_retry_count: 0,
+                ssrp_timeout_ms: 300,
+                ..Default::default()
+            };
+            context.encryption_options.mode = crate::core::EncryptionSetting::PreferOff;
+            context
+        }
+
+        fn diagnose(
+            datasource: &str,
+            probe: DiagnosticProbe,
+        ) -> (TdsResult<DiagnosticConnection>, StageLog) {
+            diagnose_with(context(), datasource, probe)
+        }
+
+        fn diagnose_with(
+            context: ClientContext,
+            datasource: &str,
+            probe: DiagnosticProbe,
+        ) -> (TdsResult<DiagnosticConnection>, StageLog) {
+            observe(|| async move {
+                TdsConnectionProvider::new()
+                    .diagnose_client(context, datasource, probe)
+                    .await
+            })
+        }
+
+        fn stopped(result: &TdsResult<DiagnosticConnection>) -> Option<DiagnosticStop> {
+            match result {
+                Ok(DiagnosticConnection::Stopped(stop)) => Some(*stop),
+                _ => None,
+            }
+        }
+
+        fn stop_at(stop: DiagnosticStop) -> DiagnosticProbe {
+            DiagnosticProbe {
+                stop_after: Some(stop),
+                all_addresses: false,
+            }
+        }
+
+        /// Accepts connections on 127.0.0.1 and closes each at once.
+        fn closing_listener() -> (std::net::TcpListener, u16) {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            listener.set_nonblocking(true).unwrap();
+            (listener, port)
+        }
+
+        fn accepted(listener: &std::net::TcpListener) -> usize {
+            std::iter::from_fn(|| listener.accept().ok()).count()
+        }
+
+        #[test]
+        fn a_resolution_stop_connects_to_nothing() {
+            let (listener, port) = closing_listener();
+            let (result, log) = diagnose(
+                &format!("tcp:127.0.0.1,{port}"),
+                stop_at(DiagnosticStop::Resolution),
+            );
+            assert_eq!(stopped(&result), Some(DiagnosticStop::Resolution));
+            let dns = log.named(stage::DNS);
+            assert_eq!(dns.len(), 1);
+            assert_eq!(dns[0].field(stage::HOST), Some("127.0.0.1"));
+            assert_eq!(dns[0].field(stage::ADDRESSES), Some("127.0.0.1"));
+            assert_eq!(dns[0].field(stage::OK), Some("true"));
+            assert!(log.named(stage::TCP).is_empty(), "{:#?}", log.stages());
+            assert_eq!(accepted(&listener), 0);
+        }
+
+        #[test]
+        fn a_transport_stop_closes_the_connection_before_prelogin() {
+            let (listener, port) = closing_listener();
+            let (result, log) = diagnose(
+                &format!("tcp:127.0.0.1,{port}"),
+                stop_at(DiagnosticStop::Transport),
+            );
+            assert_eq!(stopped(&result), Some(DiagnosticStop::Transport));
+            let tcp = log.named(stage::TCP);
+            assert_eq!(tcp.len(), 1, "{:#?}", log.stages());
+            assert_eq!(tcp[0].field(stage::ADDRESS), Some("127.0.0.1"));
+            assert_eq!(tcp[0].field(stage::PORT), Some(port.to_string().as_str()));
+            assert_eq!(tcp[0].field(stage::OK), Some("true"));
+            assert!(log.named(stage::PRELOGIN).is_empty(), "{:#?}", log.stages());
+            assert_eq!(accepted(&listener), 1);
+        }
+
+        /// Without a stop, a server that closes the connection fails the
+        /// pre-login, which records that it failed and with what.
+        #[test]
+        fn a_failed_stage_records_ok_false_and_its_error() {
+            let (listener, port) = closing_listener();
+            listener.set_nonblocking(false).unwrap();
+            let server = std::thread::spawn(move || drop(listener.accept()));
+            let (result, log) =
+                diagnose(&format!("tcp:127.0.0.1,{port}"), DiagnosticProbe::default());
+            server.join().unwrap();
+            assert!(result.is_err());
+            let prelogin = log.named(stage::PRELOGIN);
+            assert_eq!(prelogin.len(), 1, "{:#?}", log.stages());
+            assert_eq!(prelogin[0].field(stage::OK), Some("false"));
+            assert!(prelogin[0].field(stage::ERROR).is_some());
+            assert!(log.named(stage::LOGIN).is_empty());
+            assert!(log.stages().iter().all(|s| s.closed));
+        }
+
+        /// A server that never answers: the time limit drops the pre-login,
+        /// which closes without `ok`, abandoned rather than failed.
+        #[test]
+        fn a_stage_the_time_limit_drops_is_abandoned_not_failed() {
+            let (_listener, port) = closing_listener();
+            let (result, log) =
+                diagnose(&format!("tcp:127.0.0.1,{port}"), DiagnosticProbe::default());
+            assert!(matches!(result, Err(Error::TimeoutError(_))));
+            let prelogin = log.named(stage::PRELOGIN);
+            assert_eq!(prelogin.len(), 1, "{:#?}", log.stages());
+            assert!(prelogin[0].closed);
+            assert_eq!(prelogin[0].field(stage::OK), None, "{prelogin:#?}");
+        }
+
+        /// A port nothing listens on: the TCP stage records the refusal.
+        #[test]
+        fn a_refused_connect_records_what_the_operating_system_said() {
+            let (listener, port) = closing_listener();
+            drop(listener);
+            // Windows retries a refused connect for about two seconds.
+            let mut patient = context();
+            patient.connect_timeout = 10;
+            patient.login_timeout = Some(10);
+            let (result, log) = diagnose_with(
+                patient,
+                &format!("tcp:127.0.0.1,{port}"),
+                DiagnosticProbe::default(),
+            );
+            assert!(result.is_err());
+            let tcp = &log.named(stage::TCP)[0];
+            assert_eq!(tcp.field(stage::OK), Some("false"));
+            assert_eq!(tcp.field(stage::IO_KIND), Some("ConnectionRefused"));
+            assert!(tcp.field(stage::OS_ERROR).is_some());
+            assert!(tcp.field(stage::TIMED_OUT).is_none());
+        }
+
+        /// Every address after the one connected to is tried too, each in its
+        /// own `tcp` stage, while the connection goes on; a normal connection
+        /// tries none of them.
+        #[test]
+        fn the_addresses_after_the_one_used_are_tried_in_their_own_stages() {
+            let resolved: Vec<std::net::SocketAddr> =
+                std::net::ToSocketAddrs::to_socket_addrs(&("localhost", 0))
+                    .unwrap()
+                    .collect();
+            let listener = std::net::TcpListener::bind((resolved[0].ip(), 0)).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let mut listeners = vec![listener];
+            for address in &resolved[1..] {
+                if let Ok(listener) = std::net::TcpListener::bind((address.ip(), port)) {
+                    listeners.push(listener);
+                }
+            }
+            if resolved.len() < 2 || listeners.len() < 2 {
+                // This computer gives localhost one address: nothing to try.
+                return;
+            }
+            let all = DiagnosticProbe {
+                stop_after: Some(DiagnosticStop::Transport),
+                all_addresses: true,
+            };
+            let (result, log) = diagnose(&format!("tcp:localhost,{port}"), all);
+            assert_eq!(stopped(&result), Some(DiagnosticStop::Transport));
+            let tcp = log.named(stage::TCP);
+            assert_eq!(tcp.len(), resolved.len(), "{:#?}", log.stages());
+            for attempt in &tcp {
+                assert_eq!(attempt.field(stage::OK), Some("true"), "{attempt:#?}");
+                assert!(attempt.closed, "waited for: {attempt:#?}");
+            }
+
+            let (result, log) = diagnose(
+                &format!("tcp:localhost,{port}"),
+                stop_at(DiagnosticStop::Transport),
+            );
+            assert_eq!(stopped(&result), Some(DiagnosticStop::Transport));
+            assert_eq!(log.named(stage::TCP).len(), 1, "{:#?}", log.stages());
+        }
+
+        /// The diagnostic lookup always asks SQL Server Browser, past the
+        /// instance cache, and records why it failed; a normal connection
+        /// fails with the same message as before.
+        #[test]
+        fn the_instance_lookup_is_recorded_and_its_message_kept() {
+            let instance = "NoSuchDiagnoseInstance";
+            InstanceCache::global()
+                .insert("127.0.0.1", instance, Some(1), None)
+                .unwrap();
+            let datasource = format!("tcp:127.0.0.1\\{instance}");
+            let (result, log) = diagnose(&datasource, stop_at(DiagnosticStop::Resolution));
+            let error = match result {
+                Err(error) => error,
+                Ok(_) => panic!("the lookup cannot succeed: {:#?}", log.stages()),
+            };
+            let lookup = log.named(stage::INSTANCE_LOOKUP);
+            assert_eq!(lookup.len(), 1, "{:#?}", log.stages());
+            assert_eq!(lookup[0].field(stage::SERVER), Some("127.0.0.1"));
+            assert_eq!(lookup[0].field(stage::INSTANCE), Some(instance));
+            assert_eq!(lookup[0].field(stage::ADDRESSES), Some("127.0.0.1"));
+            assert_eq!(lookup[0].field(stage::OK), Some("false"));
+            assert!(lookup[0].field(stage::RESULT).is_some(), "{lookup:#?}");
+            assert!(
+                error.to_string().contains(&format!(
+                    "Error Locating Server/Instance Specified [127.0.0.1\\{instance}]. \
+                     Ensure the instance name is correct and SQL Server Browser service \
+                     is running on the host. ("
+                )),
+                "{error}"
+            );
+        }
+
+        /// A pipe stops before it is opened, and records how its opening
+        /// failed.
+        #[cfg(windows)]
+        #[test]
+        fn a_pipe_is_a_stage_of_its_own() {
+            let pipe = r"\\.\pipe\NoSuchDiagnosePipe\sql\query";
+            let (result, log) =
+                diagnose(&format!("np:{pipe}"), stop_at(DiagnosticStop::Resolution));
+            assert_eq!(stopped(&result), Some(DiagnosticStop::Resolution));
+            assert!(log.stages().is_empty(), "{:#?}", log.stages());
+
+            let (result, log) = diagnose(&format!("np:{pipe}"), DiagnosticProbe::default());
+            assert!(result.is_err());
+            let opened = log.named(stage::PIPE);
+            assert_eq!(opened.len(), 1, "{:#?}", log.stages());
+            assert_eq!(opened[0].field(stage::KIND), Some(stage::KIND_NAMED_PIPE));
+            assert_eq!(opened[0].field(stage::PIPE_PATH), Some(pipe));
+            assert_eq!(opened[0].field(stage::OK), Some("false"));
+            assert_eq!(opened[0].field(stage::OS_ERROR), Some("2"));
+
+            let (result, log) = diagnose("lpc:.", stop_at(DiagnosticStop::Resolution));
+            assert_eq!(stopped(&result), Some(DiagnosticStop::Resolution));
+            assert!(log.stages().is_empty(), "{:#?}", log.stages());
+        }
+
+        /// A normal connection is not stopped and tries no other address.
+        #[test]
+        fn a_normal_connection_has_no_probe() {
+            let (_listener, port) = closing_listener();
+            let (result, log) = observe(|| async move {
+                TdsConnectionProvider::new()
+                    .create_client(context(), &format!("tcp:127.0.0.1,{port}"), None)
+                    .await
+            });
+            assert!(result.is_err());
+            assert_eq!(log.named(stage::TCP).len(), 1);
+            assert_eq!(log.named(stage::PRELOGIN).len(), 1);
+            assert!(!ConnectProbe::default().is_active());
+            assert!(
+                ConnectProbe::default()
+                    .check_stop(DiagnosticStop::Transport)
+                    .is_ok()
+            );
+        }
     }
 }

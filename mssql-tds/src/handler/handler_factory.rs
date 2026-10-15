@@ -1,7 +1,9 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+use crate::connection::blocking::off_runtime_thread;
 use crate::connection::client_context::{ClientContext, TransportContext};
+use crate::connection::connect_stage;
 use crate::connection::session_recovery::SessionRecoveryData;
 use crate::core::{EncryptionSetting, NegotiatedEncryptionSetting, TdsResult, Version};
 use crate::error::{Error, SqlInfoMessage, SqlServerDiagnostics};
@@ -36,10 +38,15 @@ impl HandlerFactory {
         PreloginHandler { factory: self }
     }
 
-    pub(crate) fn login_handler(&self, prelogin_fedauth_supported: bool) -> LoginHandler<'_> {
+    pub(crate) fn login_handler<'a>(
+        &'a self,
+        prelogin_fedauth_supported: bool,
+        login_stage: &'a tracing::Span,
+    ) -> LoginHandler<'a> {
         LoginHandler {
             factory: self,
             prelogin_fedauth_supported,
+            login_stage,
         }
     }
 
@@ -290,20 +297,65 @@ impl<'a, 'b> SessionHandler<'a, 'b> {
         Vec<SqlInfoMessage>,
         Vec<SessionStateToken>,
     )> {
-        let pre_login_result = self.get_pre_login_result(reader_writer).await?;
-        self.validate_prelogin_result(&pre_login_result)?;
+        let prelogin_stage = tracing::info_span!(
+            target: connect_stage::TARGET,
+            connect_stage::PRELOGIN,
+            encryption = tracing::field::Empty,
+            os_error = tracing::field::Empty,
+            io_kind = tracing::field::Empty,
+            error = tracing::field::Empty,
+            ok = tracing::field::Empty
+        );
+        let pre_login_result = self
+            .get_pre_login_result(reader_writer)
+            .await
+            .and_then(|result| self.validate_prelogin_result(&result).map(|()| result))
+            .inspect_err(|e| connect_stage::record_error(&prelogin_stage, e))?;
+        prelogin_stage.record(
+            connect_stage::ENCRYPTION,
+            tracing::field::debug(pre_login_result.encryption_setting),
+        );
+        prelogin_stage.record(connect_stage::OK, true);
+        drop(prelogin_stage);
 
         // Note: This must happen before login because the login process can use the negotiated
         // encryption setting.
         reader_writer.notify_encryption_setting_change(pre_login_result.encryption_setting);
 
+        // Includes the TLS handshake (its own stage) when encryption starts at login.
+        let login_stage = tracing::info_span!(
+            target: connect_stage::TARGET,
+            connect_stage::LOGIN,
+            spn = tracing::field::Empty,
+            os_error = tracing::field::Empty,
+            io_kind = tracing::field::Empty,
+            error = tracing::field::Empty,
+            ok = tracing::field::Empty,
+            redirected = tracing::field::Empty
+        );
         let mut login_result = self
-            .get_login_result(reader_writer, pre_login_result.is_fed_auth_supported)
-            .await?;
-        self.validate_login_result(&mut login_result)?;
-
-        let negotiated_settings =
-            self.infer_negotiated_settings(&pre_login_result, &mut login_result)?;
+            .factory
+            .login_handler(pre_login_result.is_fed_auth_supported, &login_stage)
+            .execute(reader_writer, self.transport_context)
+            .await
+            .inspect_err(|error| {
+                // A routing redirect is not a failed login: the provider
+                // follows it and logs in again there.
+                if matches!(error, Error::Redirection { .. }) {
+                    login_stage.record(connect_stage::REDIRECTED, true);
+                } else {
+                    connect_stage::record_error(&login_stage, error);
+                }
+            })?;
+        self.validate_login_result(&mut login_result)
+            .inspect_err(|e| connect_stage::record_error(&login_stage, e))?;
+        // Inferring the session settings can still reject the response, so
+        // the login stage succeeds only after it.
+        let negotiated_settings = self
+            .infer_negotiated_settings(&pre_login_result, &mut login_result)
+            .inspect_err(|e| connect_stage::record_error(&login_stage, e))?;
+        login_stage.record(connect_stage::OK, true);
+        drop(login_stage);
         let info_messages = std::mem::take(&mut login_result.diagnostics.info_messages);
         let session_state_tokens = std::mem::take(&mut login_result.session_state_tokens);
         reader_writer.notify_session_setting_change(&negotiated_settings.session_settings);
@@ -402,17 +454,6 @@ impl<'a, 'b> SessionHandler<'a, 'b> {
         settings.client_connection_id = prelogin_result.client_connection_id;
 
         Ok(settings)
-    }
-
-    async fn get_login_result<T: TdsTokenStreamReader + NetworkReaderWriter>(
-        &mut self,
-        reader_writer: &mut T,
-        prelogin_fedauth_supported: bool,
-    ) -> TdsResult<LoginResult> {
-        self.factory
-            .login_handler(prelogin_fedauth_supported)
-            .execute(reader_writer, self.transport_context)
-            .await
     }
 }
 
@@ -535,6 +576,8 @@ struct LoginResult {
 pub struct LoginHandler<'a> {
     factory: &'a HandlerFactory,
     prelogin_fedauth_supported: bool,
+    /// The login's connect stage, which records the SPN requested.
+    login_stage: &'a tracing::Span,
 }
 
 impl LoginHandler<'_> {
@@ -549,7 +592,21 @@ impl LoginHandler<'_> {
         {
             // Note: We should not toggle encryption on if Strict is used because it is already,
             // and we shouldn't alter the streams.
-            reader_writer.enable_ssl().await?;
+            let tls_stage = tracing::info_span!(
+                target: connect_stage::TARGET,
+                connect_stage::TLS,
+                os_error = tracing::field::Empty,
+                io_kind = tracing::field::Empty,
+                error = tracing::field::Empty,
+                ok = tracing::field::Empty
+            );
+            reader_writer
+                .enable_ssl()
+                .await
+                .inspect_err(|e| connect_stage::record_error(&tls_stage, e))?;
+            tls_stage.record(connect_stage::OK, true);
+            // Closed here, so the span times the handshake only, not the login.
+            drop(tls_stage);
         }
 
         let (request_model, mut sspi_handler) = self
@@ -719,8 +776,16 @@ impl LoginHandler<'_> {
                 server, port
             );
 
-            let mut handler = SspiAuthHandler::new(&config, &server, port)?;
-            let initial_token = handler.get_initial_token()?;
+            let handler =
+                off_runtime_thread(move || SspiAuthHandler::new(&config, &server, port)).await?;
+            self.login_stage
+                .record(connect_stage::SPN, handler.target_spn());
+            let (handler, initial_token) = off_runtime_thread(move || {
+                let mut handler = handler;
+                let token = handler.get_initial_token()?;
+                Ok((handler, token))
+            })
+            .await?;
 
             debug!(
                 "Generated initial SSPI token ({} bytes) using {}",
