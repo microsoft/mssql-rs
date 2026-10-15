@@ -249,7 +249,10 @@ def test_reporting_uses_trusted_tools_and_immutable_pr_head():
 def test_build_and_download_are_bound_to_expected_provenance():
     steps = {step["name"]: step for step in workflow()["jobs"]["coverage-report"]["steps"]}
     build = steps["Wait for latest ADO coverage artifact"]
-    assert build["env"] == {"PR_NUMBER": "${{ steps.prctx.outputs.pr_number }}"}
+    assert build["env"] == {
+        "PR_NUMBER": "${{ steps.prctx.outputs.pr_number }}",
+        "GH_TOKEN": "${{ github.token }}",
+    }
     assert "python -I tooling/.github/scripts/wait-for-coverage.py" in build["run"]
     assert steps["Download Cobertura coverage artifact"]["env"]["BUILD_ID"] == "${{ steps.build.outputs.build_id }}"
     download = steps["Download Cobertura coverage artifact"]["run"]
@@ -282,7 +285,13 @@ def poll_clock(monkeypatch):
         clock.now += seconds
     monkeypatch.setattr(polling, "time", SimpleNamespace(monotonic=lambda: clock.now, sleep=sleep))
     monkeypatch.setattr(polling.random, "randint", lambda low, high: 300)
+    monkeypatch.setattr(polling, "github_head", lambda pr: "a" * 40)
     return clock
+
+
+def github_heads(monkeypatch, *heads):
+    values = iter(heads)
+    monkeypatch.setattr(polling, "github_head", lambda pr: next(values) * 40)
 
 
 def queued_api(monkeypatch, responses):
@@ -306,6 +315,7 @@ def queued_api(monkeypatch, responses):
 
 
 def test_poll_follows_replacement_build_after_new_commit(monkeypatch, poll_clock):
+    github_heads(monkeypatch, "a", "b", "b", "b", "b")
     old = ado_build()
     canceled = ado_build(status="completed", result="canceled")
     new = ado_build(102, "b" * 40)
@@ -324,6 +334,7 @@ def test_poll_follows_replacement_build_after_new_commit(monkeypatch, poll_clock
 
 
 def test_poll_discards_artifact_if_build_changes_during_request(monkeypatch, poll_clock):
+    github_heads(monkeypatch, "a", "b", "b")
     old = ado_build()
     new = ado_build(102, "b" * 40)
     pending, _ = queued_api(monkeypatch, [
@@ -337,6 +348,7 @@ def test_poll_discards_artifact_if_build_changes_during_request(monkeypatch, pol
 
 
 def test_poll_discards_artifact_if_build_is_canceled_during_request(monkeypatch, poll_clock):
+    github_heads(monkeypatch, "a", "b", "b")
     old = ado_build()
     canceled = ado_build(status="completed", result="canceled")
     new = ado_build(102, "b" * 40)
@@ -364,6 +376,7 @@ def test_poll_does_not_fall_back_to_older_build(monkeypatch, poll_clock):
 
 
 def test_poll_waits_through_missing_and_canceling_builds(monkeypatch, poll_clock):
+    github_heads(monkeypatch, "a", "a", "b", "b")
     build = ado_build(102, "b" * 40)
     pending, _ = queued_api(monkeypatch, [
         ("builds", []),
@@ -422,7 +435,7 @@ def test_poll_validates_selected_build_outputs(monkeypatch, poll_clock, field, v
     else:
         build[field] = value
     pending, calls = queued_api(monkeypatch, [("builds", [build])])
-    with pytest.raises(ValueError, match="Invalid Azure DevOps"):
+    with pytest.raises(ValueError, match="Invalid"):
         polling.wait_for_artifact("710")
     assert len(calls) == 1
     assert not pending
@@ -462,3 +475,68 @@ def test_poll_cli_outputs_matching_build_and_sha(monkeypatch, tmp_path):
     monkeypatch.setattr("sys.argv", ["wait-for-coverage.py", "--pr-number", "710", "--output", str(output)])
     polling.main()
     assert output.read_text() == f"build_id=102\nhead_sha={'b' * 40}\n"
+
+
+@pytest.mark.parametrize("key", ["pr.sourceSha", "pr.sourceCommitId", "pr.headSha"])
+def test_poll_accepts_supported_sha_aliases(monkeypatch, poll_clock, key):
+    build = ado_build()
+    del build["triggerInfo"]["pr.sourceSha"]
+    build["triggerInfo"][key] = "A" * 40
+    pending, _ = queued_api(monkeypatch, [
+        ("builds", [build]), (101, [{"name": "CoberturaCoverage"}]),
+        ("builds", [build]),
+    ])
+    assert polling.wait_for_artifact("710") == (101, "a" * 40)
+    assert build["triggerInfo"]["pr.sourceSha"] == "a" * 40
+    assert not pending
+
+
+@pytest.mark.parametrize("old_result", ["succeeded", "failed"])
+def test_poll_waits_for_current_head_before_replacement_is_queued(monkeypatch, poll_clock, old_result):
+    github_heads(monkeypatch, "b", "b", "b", "b")
+    old = ado_build(status="completed", result=old_result)
+    new = ado_build(102, "b" * 40)
+    pending, calls = queued_api(monkeypatch, [
+        ("builds", [old]),
+        ("builds", [old]),
+        ("builds", [new, old]), (102, [{"name": "CoberturaCoverage"}]),
+        ("builds", [new, old]),
+    ])
+    assert polling.wait_for_artifact("710") == (102, "b" * 40)
+    assert poll_clock.sleeps == [10, 10]
+    assert not any("/101/artifacts" in url for url in calls)
+    assert not pending
+
+
+def test_poll_refreshes_github_head_before_accepting_ready_artifact(monkeypatch, poll_clock):
+    github_heads(monkeypatch, "a", "b", "b", "b", "b")
+    old = ado_build(status="completed", result="succeeded")
+    new = ado_build(102, "b" * 40)
+    pending, calls = queued_api(monkeypatch, [
+        ("builds", [old]), (101, [{"name": "CoberturaCoverage"}]),
+        ("builds", [old]),
+        ("builds", [old]),
+        ("builds", [new, old]), (102, [{"name": "CoberturaCoverage"}]),
+        ("builds", [new, old]),
+    ])
+    assert polling.wait_for_artifact("710") == (102, "b" * 40)
+    assert len([url for url in calls if "/101/artifacts" in url]) == 1
+    assert not pending
+
+
+def test_github_head_uses_read_only_job_token(monkeypatch):
+    monkeypatch.setenv("GH_TOKEN", "fixture-token")
+    def get_json(url, *, headers):
+        assert url == "https://api.github.com/repos/microsoft/mssql-rs/pulls/710"
+        assert headers["Authorization"] == "Bearer fixture-token"
+        return {"head": {"sha": "B" * 40}}
+    monkeypatch.setattr(polling, "get_json", get_json)
+    assert polling.github_head("710") == "b" * 40
+
+
+@pytest.mark.parametrize("sha", [None, "x" * 40, "a" * 40 + "\nINJECTED=1"])
+def test_github_head_rejects_invalid_sha(monkeypatch, sha):
+    monkeypatch.setenv("GH_TOKEN", "fixture-token")
+    monkeypatch.setattr(polling, "get_json", lambda url, **kwargs: {"head": {"sha": sha}})
+    with pytest.raises(ValueError, match="Invalid PR source SHA"):
+        polling.github_head("710")

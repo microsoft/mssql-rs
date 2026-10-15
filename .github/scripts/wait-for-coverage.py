@@ -5,20 +5,39 @@
 
 import argparse
 import json
+import os
 from pathlib import Path
 import random
 import re
 import time
 from urllib.parse import urlencode
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 
 
 BUILD_API = "https://dev.azure.com/sqlclientdrivers/public/_apis/build"
 
 
-def get_json(url: str) -> dict:
-    with urlopen(url, timeout=60) as response:
+def get_json(url: str, *, headers: dict | None = None) -> dict:
+    with urlopen(Request(url, headers=headers or {}), timeout=60) as response:
         return json.load(response)
+
+
+def validate_sha(value: object) -> str:
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", value):
+        raise ValueError("Invalid PR source SHA")
+    return value.lower()
+
+
+def github_head(pr_number: str) -> str:
+    pr = get_json(
+        f"https://api.github.com/repos/microsoft/mssql-rs/pulls/{pr_number}",
+        headers={
+            "Authorization": f"Bearer {os.environ['GH_TOKEN']}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+    )
+    return validate_sha(pr["head"]["sha"])
 
 
 def latest_build(pr_number: str) -> dict | None:
@@ -36,9 +55,11 @@ def latest_build(pr_number: str) -> dict | None:
             continue
         if type(build["id"]) is not int or build["id"] <= 0:
             raise ValueError("Invalid Azure DevOps build ID")
-        sha = trigger.get("pr.sourceSha")
-        if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{40}", sha):
-            raise ValueError("Invalid Azure DevOps PR source SHA")
+        trigger["pr.sourceSha"] = validate_sha(
+            trigger.get("pr.sourceSha")
+            or trigger.get("pr.sourceCommitId")
+            or trigger.get("pr.headSha")
+        )
         return build
     return None
 
@@ -52,10 +73,13 @@ def wait_for_artifact(pr_number: str, timeout: float = 75 * 60) -> tuple[int, st
         raise ValueError("Invalid PR number")
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
+        head_sha = github_head(pr_number)
         build = latest_build(pr_number)
         delay = 10
         if build is None:
             print(f"Waiting for an ADO build for PR #{pr_number}...", flush=True)
+        elif build["triggerInfo"]["pr.sourceSha"] != head_sha:
+            print(f"Waiting for an ADO build for PR #{pr_number} head {head_sha}...", flush=True)
         elif canceled(build):
             print(f"Build {build['id']} was canceled; waiting for its replacement...", flush=True)
         else:
@@ -68,12 +92,13 @@ def wait_for_artifact(pr_number: str, timeout: float = 75 * 60) -> tuple[int, st
             if len(matches) > 1:
                 raise ValueError("Multiple CoberturaCoverage artifacts found")
             if matches:
-                # A push can replace the build while the artifacts API is in flight.
+                # A push can precede its ADO build, including during this request.
                 current = latest_build(pr_number)
                 if (current is not None and current["id"] == build_id
-                        and current["triggerInfo"]["pr.sourceSha"] == build["triggerInfo"]["pr.sourceSha"]
-                        and not canceled(current) and current.get("result") != "failed"):
-                    return build_id, build["triggerInfo"]["pr.sourceSha"]
+                        and current["triggerInfo"]["pr.sourceSha"] == head_sha
+                        and not canceled(current) and current.get("result") != "failed"
+                        and github_head(pr_number) == head_sha):
+                    return build_id, head_sha
                 continue
             delay = random.randint(300, 600)
         remaining = deadline - time.monotonic()

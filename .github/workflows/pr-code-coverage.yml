@@ -9,6 +9,7 @@ name: PR Code Coverage
 # published by that build, and runs `diff-cover` to compute coverage for the
 # lines changed in the PR. The result is posted as a sticky PR comment.
 # Each poll refreshes the latest build, including replacements after a push.
+# Builds must match the current GitHub PR head, even before ADO queues a new run.
 # Checkout follows artifact selection so coverage and source use the same SHA.
 #
 # Triggers:
@@ -140,6 +141,7 @@ jobs:
         id: build
         env:
           PR_NUMBER: ${{ steps.prctx.outputs.pr_number }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           python -I tooling/.github/scripts/wait-for-coverage.py \
             --pr-number "$PR_NUMBER" --output "$GITHUB_OUTPUT"
