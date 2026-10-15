@@ -26,7 +26,30 @@ bump = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(bump)
 
 PIPELINE = ROOT / ".pipeline" / "bump-released-versions.yml"
-BASH = shutil.which("bash")
+
+
+def _working_bash():
+    """Resolve bash only if it actually runs shell logic.
+
+    Windows agents may have no bash at all, or a WSL `bash.EXE` stub that
+    resolves and exits 0 but silently drops variable expansion. Probe with an
+    assignment and expansion so a broken stub is rejected rather than producing
+    confusing failures.
+    """
+    path = shutil.which("bash")
+    if not path:
+        return None
+    try:
+        probe = subprocess.run(
+            [path, "-c", 'V=ok; printf "%s" "$V"'],
+            capture_output=True, text=True, timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return path if probe.returncode == 0 and probe.stdout.strip() == "ok" else None
+
+
+BASH = _working_bash()
 
 
 @pytest.fixture(autouse=True)
@@ -709,6 +732,11 @@ def load_pipeline():
     return yaml.safe_load(PIPELINE.read_text(encoding="utf-8"))
 
 
+def shell_script(step):
+    """The step's script with LF endings, as a Linux agent would see it."""
+    return step["script"].replace("\r\n", "\n").replace("\r", "\n")
+
+
 def test_pipeline_runs_only_on_its_own_schedule():
     pipeline = load_pipeline()
     assert pipeline["trigger"] == "none"
@@ -755,6 +783,7 @@ def test_pipeline_masks_the_token_and_passes_it_to_the_script():
         assert run["env"][key]
 
 
+@pytest.mark.skipif(BASH is None, reason="Bash is required")
 def test_pipeline_token_extraction_finds_the_repo_scoped_key(tmp_path):
     """Run the real sed against real `git config --list` output.
 
@@ -764,7 +793,7 @@ def test_pipeline_token_extraction_finds_the_repo_scoped_key(tmp_path):
     """
     steps = load_pipeline()["steps"]
     extract = next(s for s in steps if "Read GitHub token" in s.get("displayName", ""))
-    sed_line = next(line for line in extract["script"].splitlines() if "extraheader" in line)
+    sed_line = next(line for line in shell_script(extract).splitlines() if "extraheader" in line)
     sed_expression = sed_line.split("|", 1)[1].split("| head", 1)[0].strip()
 
     token = "ghs_realtokenvalue"
@@ -788,6 +817,7 @@ def test_pipeline_token_extraction_finds_the_repo_scoped_key(tmp_path):
     assert f"TOKEN={token}" in result.stdout
 
 
+@pytest.mark.skipif(BASH is None, reason="Bash is required")
 @pytest.mark.parametrize("reason", ["Schedule", "Manual"])
 def test_cadence_guard_selects_the_first_and_third_tuesday(tmp_path, reason):
     """Execute the pipeline's own bash guard for every Tuesday over three years."""
@@ -807,7 +837,7 @@ def test_cadence_guard_selects_the_first_and_third_tuesday(tmp_path, reason):
         script = (
             f"date() {{ echo {tuesday.day}; }}\n"
             f"export BUILD_REASON={reason}\n"
-            + guard["script"]
+            + shell_script(guard)
         )
         result = subprocess.run([BASH, "-c", script], capture_output=True, text=True)
         assert result.returncode == 0, result.stderr
@@ -827,3 +857,32 @@ def test_cadence_guard_selects_the_first_and_third_tuesday(tmp_path, reason):
 def test_pipeline_skips_the_codeql_decorator():
     variables = {v["name"]: v["value"] for v in load_pipeline()["variables"]}
     assert variables["Codeql.SkipTaskAutoInjection"] is True
+
+
+def test_cadence_day_windows_cover_exactly_the_first_and_third_tuesday():
+    """Validate the guard's day bounds without needing bash.
+
+    The bash-executing test above is skipped on agents without bash (the CI
+    Windows agent is one), so the shipped bounds are also parsed out of the
+    script and checked here. A change to either window fails this test.
+    """
+    steps = load_pipeline()["steps"]
+    guard = next(s for s in steps if s.get("displayName") == "Check cadence")
+    condition = next(
+        line for line in guard["script"].splitlines() if 'elif [ "$DAY"' in line
+    )
+    bounds = [int(value) for value in re.findall(r'-[gl]e (\d+)', condition)]
+    assert len(bounds) == 3, f"expected three day bounds, parsed {bounds} from {condition!r}"
+    first_end, third_start, third_end = bounds
+
+    def due(day):
+        return day <= first_end or third_start <= day <= third_end
+
+    start = datetime(2026, 1, 6, 7, 30, tzinfo=timezone.utc)
+    assert start.weekday() == 1
+    span = [start + timedelta(weeks=week) for week in range(157)]
+    tuesdays = [t for t in span if (t.year, t.month) != (span[-1].year, span[-1].month)]
+    selected = [t for t in tuesdays if due(t.day)]
+    # Exactly two per fully covered month, and always the 1st and 3rd.
+    assert set(Counter((t.year, t.month) for t in selected).values()) == {2}
+    assert set(Counter((t.day - 1) // 7 for t in selected)) == {0, 2}
