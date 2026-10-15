@@ -10,6 +10,7 @@
 //! Parsing makes no external call and does not decide whether a connection can
 //! succeed.
 
+use std::borrow::Cow;
 use std::fmt;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Protocol {
@@ -53,10 +54,46 @@ pub struct Target {
 }
 
 impl Target {
+    /// The name the client resolves, as it decides when it parses the server:
+    /// `.`, `(local)`, `localhost` and this computer's name are this machine,
+    /// which over TCP, to the dedicated administrator port or with an
+    /// instance is `localhost`, and otherwise is the computer's own name.
+    /// Explicit IP addresses are left as given.
+    pub fn resolvable_host(&self) -> Cow<'_, str> {
+        if !self.is_local_name() {
+            return Cow::Borrowed(&self.host);
+        }
+        if matches!(self.protocol, Protocol::Tcp | Protocol::Admin) || self.instance.is_some() {
+            return Cow::Borrowed("localhost");
+        }
+        match mssql_tds::connection::this_computer_name() {
+            Some(name) => Cow::Owned(name),
+            None => Cow::Borrowed(&self.host),
+        }
+    }
+
+    /// Whether the host is one of the names for this machine, but not an
+    /// address.
+    fn is_local_name(&self) -> bool {
+        let host = self.host.as_str();
+        host == "."
+            || host.eq_ignore_ascii_case("(local)")
+            || host.eq_ignore_ascii_case("localhost")
+            || mssql_tds::connection::this_computer_name()
+                .is_some_and(|name| host.eq_ignore_ascii_case(&name))
+    }
+
     /// Whether the port must come from SQL Server Browser: a named instance
     /// with no port given.
     pub fn needs_instance_lookup(&self) -> bool {
         self.protocol.uses_tcp() && self.port.is_none() && self.instance.is_some()
+    }
+
+    /// Whether the server is this computer, as the client decides when it
+    /// tries shared memory first: `.`, `(local)`, `localhost`, a loopback
+    /// address, or this computer's name.
+    pub fn is_local(&self) -> bool {
+        matches!(self.host.as_str(), "127.0.0.1" | "::1") || self.is_local_name()
     }
 }
 
@@ -332,6 +369,16 @@ fn parse_pipe(path: &str) -> Result<Target, ParseError> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn this_computer_is_local() {
+        for host in [".", "(local)", "localhost", "LOCALHOST", "127.0.0.1", "::1"] {
+            let target = parse(host).unwrap();
+            assert!(target.is_local(), "{host}");
+        }
+        let remote = parse("db01").unwrap();
+        assert!(!remote.is_local());
+    }
+
     fn target(protocol: Protocol, host: &str, instance: Option<&str>, port: Option<u16>) -> Target {
         Target {
             protocol,
@@ -574,6 +621,39 @@ mod tests {
                 .unwrap()
                 .needs_instance_lookup()
         );
+    }
+
+    #[test]
+    fn this_machine_resolves_as_the_client_resolves_it() {
+        let computer = mssql_tds::connection::this_computer_name();
+        let over_tcp = |server: &str| parse(server).unwrap().resolvable_host().into_owned();
+        assert_eq!(over_tcp("tcp:."), "localhost");
+        assert_eq!(over_tcp("tcp:(local)"), "localhost");
+        assert_eq!(over_tcp("admin:localhost"), "localhost");
+        assert_eq!(over_tcp("db01"), "db01");
+        // An address is left as given, never read as a name for this machine.
+        assert_eq!(over_tcp("tcp:127.0.0.1,1433"), "127.0.0.1");
+        assert_eq!(over_tcp("::1"), "::1");
+        if let Some(computer) = computer {
+            // Over TCP, or with an instance, this computer's name is localhost;
+            // otherwise the client keeps the name.
+            assert_eq!(over_tcp(&format!("tcp:{computer},1433")), "localhost");
+            assert_eq!(over_tcp(&format!("{computer}\\SQL2022")), "localhost");
+            assert_eq!(over_tcp(&computer), computer);
+            assert_eq!(over_tcp("."), computer);
+        }
+    }
+
+    /// The client reads this computer's name from the operating system, not
+    /// from an environment variable that may be unset.
+    #[test]
+    fn this_computers_name_is_local_without_an_environment_variable() {
+        let Some(computer) = mssql_tds::connection::this_computer_name() else {
+            return;
+        };
+        for host in [computer.clone(), computer.to_uppercase()] {
+            assert!(parse(&host).unwrap().is_local(), "{host}");
+        }
     }
 
     #[test]
