@@ -437,7 +437,7 @@ fn best_effort_unprepare_on_free_inner(
 ) {
     // If a cursor is still open, drain it first: `drain_and_release` reads the
     // trailing `@handle` token (capturing it into `prepared`), returns the
-    // client, and clears `active_stmt` — leaving the connection idle so the
+    // client, and releases the wire — leaving the connection idle so the
     // unprepare below can claim it. Without this, a `prepare -> SQLExecute
     // (SELECT) -> SQLFreeHandle` sequence (no `SQLCloseCursor`) would skip the
     // unprepare and leak the handle.
@@ -570,8 +570,8 @@ mod tests {
              not skip the RPC or wait for the eight-second server delay"
         );
         let state = dbc.inner.lock().unwrap();
-        assert_eq!(state.active_stmt, None);
-        assert!(state.client.is_some());
+        assert_eq!(state.wire.statement_owner(), None);
+        assert!(state.wire.client().is_some());
         drop(state);
 
         // The timeout left the client after an ATTENTION; the connection must
@@ -611,8 +611,8 @@ mod tests {
             .inner
             .lock()
             .unwrap()
-            .client
-            .as_mut()
+            .wire
+            .client_mut_for_test()
             .unwrap()
             .register_prepared_handle_for_test(2);
         crate::test_support::arm_pending_unprepare(dbc, stmt);
@@ -627,7 +627,7 @@ mod tests {
         assert_eq!(h.free_extra_stmt(stmt_handle), SQL_SUCCESS);
 
         let state = dbc.inner.lock().unwrap();
-        let client = state.client.as_ref().unwrap();
+        let client = state.wire.client().unwrap();
         for id in [live, orphan] {
             assert_eq!(
                 client.prepared_handle_for_test(id),
@@ -689,8 +689,8 @@ mod tests {
             .inner
             .lock()
             .unwrap()
-            .client
-            .as_mut()
+            .wire
+            .client_mut_for_test()
             .unwrap()
             .register_prepared_handle_for_test(2);
         crate::test_support::arm_pending_unprepare(dbc, stmt);
@@ -1410,8 +1410,9 @@ mod tests {
         // would have nothing to read and would fail rather than quietly pass.
         {
             let mut ds = dbc_ref.inner.lock().unwrap();
-            ds.client = Some(tds_client_from_tokens(Vec::new()));
-            ds.active_stmt = None;
+            ds.wire
+                .put_client_for_test(tds_client_from_tokens(Vec::new()));
+            ds.wire.set_owner_for_test(None);
         }
         {
             let mut ss = stmt_ref.inner.lock().unwrap();
@@ -1422,11 +1423,12 @@ mod tests {
 
         let ds = dbc_ref.inner.lock().unwrap();
         assert!(
-            ds.client.is_some(),
+            ds.wire.client().is_some(),
             "the client must be handed back so the connection is left usable"
         );
         assert_eq!(
-            ds.active_stmt, None,
+            ds.wire.statement_owner(),
+            None,
             "the connection must not be left claimed by a statement being freed"
         );
         drop(ds);
