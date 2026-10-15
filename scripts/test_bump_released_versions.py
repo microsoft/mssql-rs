@@ -454,6 +454,8 @@ def test_open_bump_pr_branches_before_editing_and_creates(tmp_path):
     calls, run = record_git()
     edited_after = []
     with patch.object(bump.subprocess, "run", side_effect=run), patch.object(
+        bump, "remote_branch_tree", return_value=None
+    ), patch.object(
         bump, "github_paged", return_value=[]
     ), patch.object(
         bump, "github_api",
@@ -468,10 +470,10 @@ def test_open_bump_pr_branches_before_editing_and_creates(tmp_path):
     assert edited_after[0] == [["git", "switch", "--force-create", bump.CRATE_BRANCH, "abc123"]]
     assert calls[1] == ["git", "add", "--", "mssql-tds/Cargo.toml"]
     assert calls[2] == ["git", "commit", "--message", "Bump released TDS crates to 0.3.0"]
-    assert calls[3] == [
+    assert [
         "git", "push", "--force", "origin",
         f"{bump.CRATE_BRANCH}:refs/heads/{bump.CRATE_BRANCH}",
-    ]
+    ] in calls
     method, path = api.call_args.args[0], api.call_args.args[1]
     assert (method, path) == ("POST", "/repos/microsoft/mssql-rs/pulls")
     assert api.call_args.args[2]["base"] == "main"
@@ -481,6 +483,8 @@ def test_open_bump_pr_branches_before_editing_and_creates(tmp_path):
 def test_open_bump_pr_updates_existing_pull_request(tmp_path):
     _calls, run = record_git()
     with patch.object(bump.subprocess, "run", side_effect=run), patch.object(
+        bump, "remote_branch_tree", return_value=None
+    ), patch.object(
         bump, "github_paged", return_value=[{"number": 694}]
     ), patch.object(bump, "github_api", return_value=(200, {})) as api:
         assert bump.open_bump_pr(
@@ -488,6 +492,48 @@ def test_open_bump_pr_updates_existing_pull_request(tmp_path):
             lambda root: ["mssql-py-core/pyproject.toml"],
         ) == 694
     assert api.call_args.args[:2] == ("PATCH", "/repos/microsoft/mssql-rs/pulls/694")
+
+
+def test_unchanged_branch_is_not_force_pushed(tmp_path):
+    """A rebuilt commit has a new hash but the same tree; pushing it would
+    restart validation and dismiss reviews on an open bump PR."""
+    calls, run = record_git()
+    with patch.object(bump.subprocess, "run", side_effect=run), patch.object(
+        bump, "git", side_effect=lambda root, *args: (
+            calls.append(["git", *args]) or "sametree\n"
+        )
+    ), patch.object(bump, "remote_branch_tree", return_value="sametree"), patch.object(
+        bump, "github_paged", return_value=[{"number": 724}]
+    ), patch.object(bump, "github_api", return_value=(200, {})):
+        assert bump.open_bump_pr(
+            tmp_path, bump.PYTHON_BRANCH, "abc123", "title", "body",
+            lambda root: ["mssql-py-core/pyproject.toml"],
+        ) == 724
+    assert not any("push" in call for call in calls), calls
+
+
+def test_changed_branch_is_force_pushed(tmp_path):
+    calls = []
+    with patch.object(bump, "git", side_effect=lambda root, *args: (
+        calls.append(["git", *args]) or "newtree\n"
+    )), patch.object(bump, "remote_branch_tree", return_value="oldtree"), patch.object(
+        bump, "github_paged", return_value=[]
+    ), patch.object(
+        bump, "github_api", return_value=(201, {"number": 1, "html_url": "u"})
+    ):
+        bump.open_bump_pr(
+            tmp_path, bump.PYTHON_BRANCH, "abc123", "title", "body",
+            lambda root: ["mssql-py-core/pyproject.toml"],
+        )
+    assert ["git", "push", "--force", "origin",
+            f"{bump.PYTHON_BRANCH}:refs/heads/{bump.PYTHON_BRANCH}"] in calls
+
+
+def test_remote_branch_tree_is_none_for_a_missing_branch(tmp_path):
+    with patch.object(bump.subprocess, "run", return_value=subprocess.CompletedProcess(
+        "git", 128, stdout="", stderr="couldn't find remote ref"
+    )):
+        assert bump.remote_branch_tree(tmp_path, "automation/absent") is None
 
 
 def test_pull_request_body_links_an_issue_for_the_linked_issue_check():

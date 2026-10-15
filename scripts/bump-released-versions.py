@@ -419,6 +419,17 @@ def git(root, *args):
     ).stdout
 
 
+def remote_branch_tree(root, branch):
+    """The tree hash of origin/<branch>, or None when the branch does not exist."""
+    probe = subprocess.run(
+        ["git", "fetch", "--quiet", "origin", branch],
+        cwd=root, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    if probe.returncode != 0:
+        return None
+    return git(root, "rev-parse", "FETCH_HEAD^{tree}").strip()
+
+
 def open_bump_pr(root, branch, base_sha, title, body, apply_changes):
     repo = repository()
     base = os.environ["DEFAULT_BRANCH"]
@@ -428,9 +439,27 @@ def open_bump_pr(root, branch, base_sha, title, body, apply_changes):
     paths = apply_changes(root)
     git(root, "add", "--", *paths)
     git(root, "commit", "--message", title)
-    git(root, "push", "--force", "origin", f"{branch}:refs/heads/{branch}")
+
+    # Every run rebuilds the commit, so its hash differs even when the content is
+    # identical. Push only on a real content change, otherwise an open PR would be
+    # force-updated on every run, restarting its validation and dismissing reviews.
+    if remote_branch_tree(root, branch) == git(root, "rev-parse", "HEAD^{tree}").strip():
+        print(f"{branch} already has these versions; leaving it untouched.")
+    else:
+        git(root, "push", "--force", "origin", f"{branch}:refs/heads/{branch}")
 
     existing = github_paged(f"/repos/{repo}/pulls?state=open&base={base}&head={repo.split('/')[0]}:{branch}")
+    if existing:
+        number = existing[0]["number"]
+        github_api("PATCH", f"/repos/{repo}/pulls/{number}", {"title": title, "body": body})
+        print(f"Updated bump PR #{number}.")
+        return number
+    _status, created = github_api(
+        "POST", f"/repos/{repo}/pulls",
+        {"title": title, "head": branch, "base": base, "body": body, "draft": False},
+    )
+    print(f"Created bump PR #{created['number']} ({created['html_url']}).")
+    return created["number"]
     if existing:
         number = existing[0]["number"]
         github_api("PATCH", f"/repos/{repo}/pulls/{number}", {"title": title, "body": body})
