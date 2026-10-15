@@ -1,0 +1,129 @@
+# THROWAWAY SPIKE - NOT FOR MERGE.
+# Answers one question: can an ADO pipeline, using the existing
+# github.com_microsoft service connection (Azure Pipelines GitHub App
+# installation token), push a branch to GitHub and open a pull request?
+# Cleans up after itself.
+
+trigger: none
+pr: none
+
+variables:
+- name: Codeql.SkipTaskAutoInjection
+  value: true
+
+pool:
+  name: RUST-X64-WUS3
+  demands:
+  - imageOverride -equals RUST-AZL3
+
+steps:
+- checkout: self
+  persistCredentials: true
+  fetchDepth: 0
+
+- script: |
+    set -euo pipefail
+    echo "=== remotes"
+    git remote -v
+    echo "=== http.* config keys (values hidden)"
+    git config --list | sed -n 's/^\(http\.[^=]*\)=.*/\1/p' || echo "(none)"
+  displayName: 1. Inspect persisted credential shape
+
+- script: |
+    set -euo pipefail
+    HEADER="$(git config --get http.https://github.com/.extraheader || true)"
+    if [ -z "$HEADER" ]; then
+      echo "RESULT: NO_EXTRAHEADER - credential is not persisted at the expected key."
+      exit 1
+    fi
+    DECODED="$(printf '%s' "${HEADER##* }" | base64 -d)"
+    TOKEN="${DECODED#*:}"
+    echo "RESULT: credential user part = ${DECODED%%:*}"
+    echo "RESULT: token length = ${#TOKEN}"
+    # ghs_ = App installation token, gho_ = OAuth, ghp_ = classic PAT.
+    echo "RESULT: token prefix = ${TOKEN:0:4}"
+    echo "##vso[task.setvariable variable=ghToken;issecret=true]$TOKEN"
+  displayName: 2. Extract token from git config
+
+- script: |
+    set -euo pipefail
+    echo "=== what does this token think it is?"
+    curl -sS -o /tmp/inst.json -w 'HTTP %{http_code}\n' \
+      -H "Authorization: Bearer $(ghToken)" \
+      -H "Accept: application/vnd.github+json" \
+      https://api.github.com/installation/repositories || true
+    python3 -c "import json;d=json.load(open('/tmp/inst.json'));print('RESULT: repos in installation =',d.get('total_count'));print('RESULT: names =',[r['full_name'] for r in d.get('repositories',[])][:10])" 2>/dev/null || head -c 400 /tmp/inst.json
+  displayName: 3. Probe token scope
+
+- script: |
+    set -euo pipefail
+    BRANCH="spike/ado-probe-$(Build.BuildId)"
+    echo "##vso[task.setvariable variable=probeBranch]$BRANCH"
+    git config user.email "spike@noreply.github.com"
+    git config user.name "ADO Spike Probe"
+    git switch --force-create "$BRANCH"
+    printf 'throwaway probe, build %s\n' "$(Build.BuildId)" > spike-probe.txt
+    git add spike-probe.txt
+    git commit -m "Spike: ADO push probe (throwaway)"
+    git push origin "$BRANCH"
+    echo "RESULT: PUSH_OK branch=$BRANCH"
+  displayName: 4. Probe branch push
+
+- script: |
+    set -euo pipefail
+    BODY=$(printf '{"title":"THROWAWAY ADO spike probe - ignore","head":"%s","base":"main","draft":true,"body":"Automated spike. Closing immediately."}' "$(probeBranch)")
+    CODE=$(curl -sS -o /tmp/pr.json -w '%{http_code}' -X POST \
+      -H "Authorization: Bearer $(ghToken)" \
+      -H "Accept: application/vnd.github+json" \
+      https://api.github.com/repos/microsoft/mssql-rs/pulls -d "$BODY")
+    echo "RESULT: PR create HTTP $CODE"
+    if [ "$CODE" = "201" ]; then
+      NUM=$(python3 -c "import json;print(json.load(open('/tmp/pr.json'))['number'])")
+      echo "RESULT: PR_CREATE_OK number=$NUM"
+      echo "##vso[task.setvariable variable=probePr]$NUM"
+    else
+      echo "RESULT: PR_CREATE_FAILED"
+      head -c 600 /tmp/pr.json
+    fi
+  displayName: 5. Probe pull request creation
+  continueOnError: true
+
+- script: |
+    set -euo pipefail
+    echo "=== can it write issues? (expected to FAIL - App lacks issues:write)"
+    CODE=$(curl -sS -o /tmp/iss.json -w '%{http_code}' -X POST \
+      -H "Authorization: Bearer $(ghToken)" \
+      -H "Accept: application/vnd.github+json" \
+      https://api.github.com/repos/microsoft/mssql-rs/issues \
+      -d '{"title":"THROWAWAY ADO spike issue probe - ignore"}')
+    echo "RESULT: issue create HTTP $CODE"
+    if [ "$CODE" = "201" ]; then
+      NUM=$(python3 -c "import json;print(json.load(open('/tmp/iss.json'))['number'])")
+      echo "RESULT: ISSUE_CREATE_OK number=$NUM (unexpected - App has issues:write)"
+      curl -sS -o /dev/null -X PATCH -H "Authorization: Bearer $(ghToken)" \
+        -H "Accept: application/vnd.github+json" \
+        "https://api.github.com/repos/microsoft/mssql-rs/issues/$NUM" -d '{"state":"closed"}'
+      echo "RESULT: probe issue closed"
+    else
+      echo "RESULT: ISSUE_CREATE_DENIED (expected - use an ADO work item instead)"
+    fi
+  displayName: 6. Probe issue creation
+  continueOnError: true
+
+- script: |
+    set -euo pipefail
+    if [ -n "${PROBE_PR:-}" ]; then
+      curl -sS -o /dev/null -w 'close PR HTTP %{http_code}\n' -X PATCH \
+        -H "Authorization: Bearer $(ghToken)" \
+        -H "Accept: application/vnd.github+json" \
+        "https://api.github.com/repos/microsoft/mssql-rs/pulls/$PROBE_PR" -d '{"state":"closed"}' || true
+    fi
+    if [ -n "${PROBE_BRANCH:-}" ]; then
+      git push origin --delete "$PROBE_BRANCH" || echo "branch delete failed"
+    fi
+    echo "RESULT: cleanup done"
+  displayName: 7. Clean up
+  condition: always()
+  env:
+    PROBE_PR: $(probePr)
+    PROBE_BRANCH: $(probeBranch)
