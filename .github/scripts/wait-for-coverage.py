@@ -23,6 +23,10 @@ class PollingDeadlineExceeded(TimeoutError):
     pass
 
 
+class CoverageBuildChanged(Exception):
+    pass
+
+
 def remaining_time(deadline: float) -> float:
     remaining = deadline - time.monotonic()
     if remaining <= 0:
@@ -144,10 +148,17 @@ def duplicate_coverage(pr_number: str, build: dict, head_sha: str, *, deadline: 
     for prior in builds_for_pr(pr_number, deadline=deadline, successful=True):
         if (prior["id"] != build["id"] and prior["status"] == "completed"
                 and prior.get("result") == "succeeded"
-                and prior["triggerInfo"]["pr.sourceSha"] == head_sha
-                and has_coverage(prior["id"], deadline=deadline)):
-            print(f"Using coverage from build {prior['id']} for duplicate build {build['id']}...", flush=True)
-            return prior["id"]
+                and prior["triggerInfo"]["pr.sourceSha"] == head_sha):
+            if github_head(pr_number, deadline=deadline) != head_sha:
+                raise CoverageBuildChanged
+            current = latest_build(pr_number, deadline=deadline)
+            if (current is None or current["id"] != build["id"]
+                    or current["triggerInfo"]["pr.sourceSha"] != head_sha
+                    or canceled(current) or current.get("result") == "failed"):
+                raise CoverageBuildChanged
+            if has_coverage(prior["id"], deadline=deadline):
+                print(f"Using coverage from build {prior['id']} for duplicate build {build['id']}...", flush=True)
+                return prior["id"]
     return None
 
 
@@ -187,6 +198,10 @@ def wait_for_artifact(pr_number: str, timeout: float = 75 * 60) -> tuple[int, st
                     retry_delay = 10
                     continue
                 delay = random.randint(300, 600)
+        except CoverageBuildChanged:
+            print("PR head or latest build changed during history lookup; refreshing the poll.", flush=True)
+            retry_delay = 10
+            continue
         except PollingDeadlineExceeded:
             raise
         except (HTTPError, TimeoutError) as error:

@@ -1,0 +1,41 @@
+name: Coverage Workflow Tests
+
+# ADO skips .github-only changes, so protect these paths with a lightweight check.
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/pr-code-coverage.yml'
+      - '.github/workflows/coverage-tests.yml'
+      - '.github/scripts/coverage-report.py'
+      - '.github/scripts/wait-for-coverage.py'
+      - '.github/actions/post-coverage-comment/**'
+      - '.github/coverage-requirements.txt'
+      - 'scripts/test_coverage_report.py'
+      - '.pipeline/templates/validation-stages.yml'
+      - '.pipeline/scripts/evaluate-duplicate-pr.py'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: coverage-tests-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  coverage-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - name: Run coverage workflow regressions
+        run: |
+          node --version
+          python -m pip install --quiet pytest pyyaml
+          python -m pytest scripts/test_coverage_report.py -q

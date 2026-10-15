@@ -4,6 +4,7 @@
 """Regression tests for the PR coverage reporting trust boundaries."""
 
 import importlib.util
+from fnmatch import fnmatchcase
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
@@ -228,8 +229,11 @@ def test_only_trusted_posting_job_has_write_permission():
     assert checkouts[0]["with"]["ref"] == "${{ github.workflow_sha }}"
     assert checkouts[0]["with"]["persist-credentials"] is False
     assert not any("run" in step for step in post["steps"])
-    assert "github.event.pull_request.head.repo.full_name == github.repository" in report["if"]
-    assert "github.event_name == 'issue_comment'" in report["if"]
+    authorize = config["jobs"]["authorize"]
+    assert "github.event.pull_request.head.repo.full_name == github.repository" in authorize["if"]
+    assert "github.event_name == 'issue_comment'" in authorize["if"]
+    assert set(authorize["permissions"].values()) == {"read"}
+    assert report["needs"] == "authorize"
 
 
 def test_reporting_uses_trusted_tools_and_immutable_pr_head():
@@ -244,7 +248,7 @@ def test_reporting_uses_trusted_tools_and_immutable_pr_head():
         if step.get("uses", "").startswith("actions/checkout@"):
             assert step["with"]["persist-credentials"] is False
         assert "GITHUB_ENV" not in step.get("run", "")
-    context = steps["Determine PR context"]["with"]["script"]
+    context = workflow()["jobs"]["authorize"]["steps"][0]["with"]["script"]
     assert "getCollaboratorPermissionLevel" in context
     assert "['admin', 'maintain', 'write'].includes(data.permission)" in context
     assert 'python -I tooling/.github/scripts/coverage-report.py' in steps["Run diff-cover"]["run"]
@@ -256,7 +260,7 @@ def test_build_and_download_are_bound_to_expected_provenance():
     steps = {step["name"]: step for step in workflow()["jobs"]["coverage-report"]["steps"]}
     build = steps["Wait for latest ADO coverage artifact"]
     assert build["env"] == {
-        "PR_NUMBER": "${{ steps.prctx.outputs.pr_number }}",
+        "PR_NUMBER": "${{ needs.authorize.outputs.pr_number }}",
         "GH_TOKEN": "${{ github.token }}",
     }
     assert "python -I tooling/.github/scripts/wait-for-coverage.py" in build["run"]
@@ -272,6 +276,136 @@ def test_security_regressions_run_in_validation():
     pipeline = (ROOT / ".pipeline" / "templates" / "validation-stages.yml").read_text(encoding="utf-8")
     command = next(line for line in pipeline.splitlines() if "python -m pytest" in line)
     assert "scripts/test_coverage_report.py" in command.split()
+
+
+def run_workflow_script(script, **values):
+    harness = r"""
+const input = JSON.parse(require('node:fs').readFileSync(0, 'utf8'));
+const outputs = {};
+const notices = [];
+const pr = { number: input.number ?? 710, head: { sha: input.currentHead ?? 'a'.repeat(40) } };
+const context = {
+  eventName: input.eventName ?? 'issue_comment',
+  repo: { owner: 'microsoft', repo: 'mssql-rs' },
+  issue: { number: 710 },
+  payload: { comment: { user: { login: 'test-contributor' }, author_association: input.association } }
+};
+if (context.eventName === 'pull_request') context.payload.pull_request = pr;
+const github = { rest: {
+  repos: { getCollaboratorPermissionLevel: async () => ({ data: { permission: input.permission } }) },
+  pulls: { get: async () => {
+    if (input.apiError) throw new Error('API failed');
+    return { data: pr };
+  } }
+} };
+const core = { setOutput: (key, value) => { outputs[key] = value; }, notice: message => notices.push(message) };
+Object.assign(process.env, input.env ?? {});
+const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+(async () => {
+  try {
+    await new AsyncFunction('context', 'github', 'core', input.script)(context, github, core);
+    console.log(JSON.stringify({ outputs, notices }));
+  } catch (error) {
+    console.log(JSON.stringify({ outputs, notices, error: error.message }));
+  }
+})();
+"""
+    result = subprocess.run(
+        ["node", "-e", harness], input=json.dumps({"script": script, **values}),
+        capture_output=True, text=True, check=True,
+    )
+    return json.loads(result.stdout)
+
+
+@pytest.mark.parametrize("association", ["MEMBER", "COLLABORATOR"])
+@pytest.mark.parametrize("permission", ["read", "triage", "write", "maintain", "admin"])
+def test_comment_authorization_precedes_shared_concurrency(association, permission):
+    config = workflow()
+    authorize = config["jobs"]["authorize"]
+    report = config["jobs"]["coverage-report"]
+    result = run_workflow_script(
+        authorize["steps"][0]["with"]["script"], association=association, permission=permission,
+    )
+    if permission in ("read", "triage"):
+        assert result["error"] == "/coverage requires repository write permission"
+        assert result["outputs"] == {}
+    else:
+        assert "error" not in result
+        assert result["outputs"]["pr_number"] == 710
+    assert "github.event_name == 'issue_comment' && format('-{0}', github.run_id)" in config["concurrency"]["group"]
+    assert report["needs"] == "authorize"
+    assert report.get("if", "success()") == "success()"
+    assert report["concurrency"] == {
+        "group": "pr-coverage-report-${{ needs.authorize.outputs.pr_number }}-${{ github.event_name }}",
+        "cancel-in-progress": True,
+    }
+    assert authorize["outputs"]["pr_number"] == "${{ steps.prctx.outputs.pr_number }}"
+
+
+def test_same_repository_pr_context_remains_automatic():
+    script = workflow()["jobs"]["authorize"]["steps"][0]["with"]["script"]
+    result = run_workflow_script(script, eventName="pull_request")
+    assert result["outputs"] == {"pr_number": 710}
+    assert "error" not in result
+
+
+@pytest.mark.parametrize("current_head,expected", [("a" * 40, True), ("b" * 40, False)])
+def test_posting_skips_head_changed_between_jobs(current_head, expected):
+    config = workflow()
+    report = config["jobs"]["coverage-report"]
+    post = config["jobs"]["post-comment"]
+    guard = post["steps"][-2]
+    comment = post["steps"][-1]
+    assert report["outputs"]["head_sha"] == "${{ steps.build.outputs.head_sha }}"
+    assert guard["env"]["REPORT_HEAD_SHA"] == "${{ needs.coverage-report.outputs.head_sha }}"
+    assert guard["env"]["PR_NUMBER"] == "${{ needs.coverage-report.outputs.pr_number }}"
+    assert comment["if"] == "steps.head.outputs.current == 'true'"
+    result = run_workflow_script(
+        guard["with"]["script"], currentHead=current_head,
+        env={"PR_NUMBER": "710", "REPORT_HEAD_SHA": "a" * 40},
+    )
+    assert result["outputs"] == {"current": expected}
+    assert bool(result["notices"]) is not expected
+
+
+@pytest.mark.parametrize("number,sha", [("0", "a" * 40), ("710", "invalid"), ("710\nINJECTED=1", "a" * 40)])
+def test_posting_rejects_invalid_report_identity(number, sha):
+    script = workflow()["jobs"]["post-comment"]["steps"][-2]["with"]["script"]
+    result = run_workflow_script(script, env={"PR_NUMBER": number, "REPORT_HEAD_SHA": sha})
+    assert "Invalid coverage report" in result["error"]
+    assert result["outputs"] == {}
+
+
+def test_posting_does_not_write_if_head_lookup_fails():
+    script = workflow()["jobs"]["post-comment"]["steps"][-2]["with"]["script"]
+    result = run_workflow_script(
+        script, apiError=True, env={"PR_NUMBER": "710", "REPORT_HEAD_SHA": "a" * 40},
+    )
+    assert result["error"] == "API failed"
+    assert result["outputs"] == {}
+
+
+@pytest.mark.parametrize("path", [
+    ".github/workflows/pr-code-coverage.yml",
+    ".github/workflows/coverage-tests.yml",
+    ".github/scripts/coverage-report.py",
+    ".github/scripts/wait-for-coverage.py",
+    ".github/actions/post-coverage-comment/action.yml",
+    ".github/coverage-requirements.txt",
+    "scripts/test_coverage_report.py",
+    ".pipeline/templates/validation-stages.yml",
+    ".pipeline/scripts/evaluate-duplicate-pr.py",
+])
+def test_coverage_only_changes_trigger_lightweight_regressions(path):
+    config = yaml.load(
+        (ROOT / ".github" / "workflows" / "coverage-tests.yml").read_text(encoding="utf-8"),
+        Loader=yaml.BaseLoader,
+    )
+    assert any(fnmatchcase(path, pattern) for pattern in config["on"]["pull_request"]["paths"])
+    assert config["permissions"] == {"contents": "read"}
+    job = config["jobs"]["coverage-tests"]
+    assert job["steps"][0]["with"]["persist-credentials"] == "false"
+    assert "python -m pytest scripts/test_coverage_report.py -q" in job["steps"][-1]["run"]
 
 
 def ado_build(build_id=101, sha="a" * 40, status="inProgress", result=None, pr="710"):
@@ -573,7 +707,8 @@ def test_poll_reuses_original_coverage_after_duplicate_finishes(monkeypatch, pol
         ("builds", [original]), (101, []),
         ("builds", [duplicate, completed]), (102, []),
         ("timeline:102", duplicate_timeline()),
-        ("successful", [duplicate, completed]), (101, [{"name": "CoberturaCoverage"}]),
+        ("successful", [duplicate, completed]), ("builds", [duplicate]),
+        (101, [{"name": "CoberturaCoverage"}]),
         ("builds", [duplicate, completed]),
     ])
     assert polling.wait_for_artifact("710") == (101, "a" * 40)
@@ -591,7 +726,8 @@ def test_duplicate_lookup_skips_chains_and_other_heads(monkeypatch, poll_clock):
         ("builds", [duplicate]), (103, []),
         ("timeline:103", duplicate_timeline()),
         ("successful", [duplicate, other_head, other_pr, earlier_duplicate, original]),
-        (102, []), (101, [{"name": "CoberturaCoverage"}]),
+        ("builds", [duplicate]), (102, []),
+        ("builds", [duplicate]), (101, [{"name": "CoberturaCoverage"}]),
         ("builds", [duplicate]),
     ])
     assert polling.wait_for_artifact("710") == (101, "a" * 40)
@@ -618,14 +754,15 @@ def test_poll_does_not_reuse_coverage_without_duplicate_stage_results(monkeypatc
 
 
 def test_poll_follows_new_head_after_duplicate_coverage_lookup(monkeypatch, poll_clock):
-    github_heads(monkeypatch, "a", "b", "b", "b")
+    github_heads(monkeypatch, "a", "a", "b", "b", "b")
     original = ado_build(status="completed", result="succeeded")
     duplicate = ado_build(102, status="completed", result="succeeded")
     replacement = ado_build(103, sha="b" * 40)
     pending, _ = queued_api(monkeypatch, [
         ("builds", [duplicate]), (102, []),
         ("timeline:102", duplicate_timeline()),
-        ("successful", [original]), (101, [{"name": "CoberturaCoverage"}]),
+        ("successful", [original]), ("builds", [duplicate]),
+        (101, [{"name": "CoberturaCoverage"}]),
         ("builds", [duplicate]),
         ("builds", [replacement, duplicate]), (103, [{"name": "CoberturaCoverage"}]),
         ("builds", [replacement, duplicate]),
@@ -640,11 +777,49 @@ def test_duplicate_lookup_without_available_coverage_stays_bounded(monkeypatch, 
     pending, _ = queued_api(monkeypatch, [
         ("builds", [duplicate]), (102, []),
         ("timeline:102", duplicate_timeline()),
-        ("successful", [duplicate, original]), (101, []),
+        ("successful", [duplicate, original]), ("builds", [duplicate]), (101, []),
     ])
     with pytest.raises(TimeoutError):
         polling.wait_for_artifact("710", timeout=30)
     assert poll_clock.sleeps == [30]
+    assert not pending
+
+
+@pytest.mark.parametrize("change", ["head", "build"])
+def test_history_scan_follows_replacement_before_next_artifact(monkeypatch, poll_clock, change):
+    duplicate = ado_build(103, status="completed", result="succeeded")
+    history = [
+        ado_build(102, status="completed", result="succeeded"),
+        ado_build(101, status="completed", result="succeeded"),
+    ]
+    replacement_sha = "b" * 40 if change == "head" else "a" * 40
+    replacement = ado_build(104, sha=replacement_sha)
+    if change == "head":
+        github_heads(monkeypatch, "a", "a", "b", "b", "b")
+    responses = [
+        ("builds", [duplicate]), (103, []),
+        ("timeline:103", duplicate_timeline()),
+        ("successful", history),
+        ("builds", [duplicate]), (102, []),
+    ]
+    if change == "build":
+        responses.append(("builds", [replacement]))
+    responses.extend([
+        ("builds", [replacement]), (104, [{"name": "CoberturaCoverage"}]),
+        ("builds", [replacement]),
+    ])
+    pending, calls = queued_api(monkeypatch, responses)
+    has_coverage = polling.has_coverage
+    def slow_first_artifact(build_id, *, deadline):
+        result = has_coverage(build_id, deadline=deadline)
+        if build_id == 102:
+            poll_clock.now += 40
+        return result
+    monkeypatch.setattr(polling, "has_coverage", slow_first_artifact)
+    assert polling.wait_for_artifact("710", timeout=60) == (104, replacement_sha)
+    assert not any("/101/artifacts" in url for url in calls)
+    assert poll_clock.now == 40
+    assert not poll_clock.sleeps
     assert not pending
 
 
