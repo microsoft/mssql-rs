@@ -128,9 +128,10 @@ impl TdsConnectionProvider {
 
         debug!("Connection strategy:\n{}", action_chain.describe());
 
-        // Execute the action chain to get transport contexts
-        self.execute_action_chain(&context, action_chain, cancel_handle)
-            .await
+        // ODBC polls this on the application's stack. Keep the connection
+        // state out of its block_on frames, leaving room for native TLS and
+        // client construction on musl's 128 KiB threads.
+        Box::pin(self.execute_action_chain(&context, action_chain, cancel_handle)).await
     }
 
     /// Execute an action chain to create a client
@@ -701,6 +702,18 @@ fn validate_multi_subnet_failover(
 mod tests {
     use super::*;
     use std::time::Instant;
+
+    #[test]
+    fn connection_future_stays_small() {
+        const MAX: usize = 4096;
+        let provider = TdsConnectionProvider::new();
+        let context = ClientContext::default();
+        let size = std::mem::size_of_val(&provider.create_client(context, "localhost", None));
+        assert!(
+            size <= MAX,
+            "create_client future is {size} B, expected <= {MAX} B"
+        );
+    }
 
     #[test]
     fn transport_attempts_clear_stale_trace_ids_before_connecting() {

@@ -78,6 +78,20 @@ To override the verbose default filter:
 MSSQL_TDS_TRACE_LEVEL="warn,mssqlodbc=trace" ./run_e2e.sh --verbose
 ```
 
+### Small-stack connection regression
+
+On POSIX platforms, `small_stack_connect_test` connects and fetches a row through
+the Driver Manager on an explicitly sized pthread. Its separate executable also
+covers cold driver/TLS initialization. The native stack size of the existing
+`ODBC_TEST_F` workers is unchanged.
+
+`run_e2e.sh --release` and `build_e2e.sh --release` configure a 128 KiB stack,
+matching musl's default application-thread budget. Debug/coverage drivers use
+512 KiB for unoptimized frames. When configuring CMake directly, pass
+`-DODBC_E2E_RELEASE_DRIVER=ON` for a release driver; the default is OFF.
+The regression runs in the normal POSIX suite, including PR validation, rather
+than relying solely on the post-merge Alpine matrix.
+
 ### Comparing against msodbcsql 18
 
 `run_e2e.sh` can rerun the same gtest suite against the Microsoft C++ driver

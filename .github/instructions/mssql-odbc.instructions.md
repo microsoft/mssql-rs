@@ -531,6 +531,12 @@ on; these guarantees were verified against msodbcsql's behavior.
   conversion will materialize (see deviation 7 in the
   [parity decision registry](../../mssql-odbc/docs/parity-deviations.md)).
 - Use `cargo nextest` (via `cargo btest`), not `cargo test`.
+- Small-stack regressions must connect on the constrained application thread,
+  not just execute on it after connecting elsewhere. Include the real Driver
+  Manager and cold TLS initialization: a direct Rust call omits their stack cost.
+  Keep native-stack concurrency tests intact rather than increasing worker stacks
+  to mask an overflow. Use `small_stack_connect_test` with a release driver to
+  enforce the 128 KiB budget.
 
 ## 11. Performance and FFI data movement
 

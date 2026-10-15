@@ -18,6 +18,12 @@ stack use for synchronous adapters such as ODBC on musl's small worker stacks,
 without moving execution to another thread or changing cancellation and timeout
 handling.
 
+Connection establishment boxes the action-chain future once per connection.
+This keeps transport attempts, TLS/login, and client construction out of the
+caller's future, leaving room for the Driver Manager and native TLS on small
+application stacks. The connection is still polled on the calling thread with
+the same cancellation and login deadline; no worker-thread handoff is introduced.
+
 ## SQL string decoding
 
 `SqlString::decode` and `to_utf8_string` use the encoding supplied by TDS metadata,
