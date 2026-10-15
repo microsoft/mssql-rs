@@ -3,11 +3,14 @@
 
 use crate::connection::bulk_copy_state::ATTENTION_TIMEOUT_SECONDS;
 use crate::connection::client_context::{IPAddressPreference, TransportContext};
+use crate::connection::connect_stage;
 use crate::connection::transport::buffers::TdsReadBuffer;
 use crate::connection::transport::extractable_stream;
 use crate::connection::transport::parallel_connect::{ParallelConnectConfig, parallel_connect};
 use crate::connection::transport::ssl_handler::SslHandler;
-use crate::connection_provider::tds_connection_provider::PARSER_REGISTRY;
+use crate::connection_provider::tds_connection_provider::{
+    ConnectProbe, DiagnosticStop, PARSER_REGISTRY,
+};
 use crate::core::{
     CancelHandle, EncryptionOptions, EncryptionSetting, NegotiatedEncryptionSetting, TdsResult,
 };
@@ -187,6 +190,7 @@ pub(crate) const PRE_NEGOTIATED_PACKET_SIZE: u32 = 4096;
 /// * `keep_alive_interval_in_ms` - TCP keep-alive interval in milliseconds
 /// * `multi_subnet_failover` - If true, enables parallel connection mode for TCP
 /// * `connect_timeout_ms` - Connection timeout in milliseconds
+/// * `probe` - What a diagnostic connection asks besides ([`NO_PROBE`](crate::connection_provider::tds_connection_provider::NO_PROBE) otherwise)
 async fn create_base_stream(
     ipaddress_preference: IPAddressPreference,
     transport_context: &TransportContext,
@@ -194,11 +198,14 @@ async fn create_base_stream(
     keep_alive_interval_in_ms: u32,
     multi_subnet_failover: bool,
     connect_timeout_ms: u64,
+    probe: &ConnectProbe,
 ) -> TdsResult<Box<dyn Stream>> {
     match transport_context {
         TransportContext::Tcp { host, port, .. } => {
             if multi_subnet_failover {
-                // Use parallel connection mode for MultiSubnetFailover
+                // Resolving is part of the parallel connect; a diagnostic
+                // attempt cannot stop between the two, which
+                // `diagnose_client` refuses up front.
                 create_base_stream_parallel(
                     host,
                     *port,
@@ -216,6 +223,7 @@ async fn create_base_stream(
                     keep_alive_in_ms,
                     keep_alive_interval_in_ms,
                     connect_timeout_ms,
+                    probe,
                 )
                 .await
             }
@@ -230,9 +238,21 @@ async fn create_base_stream(
                 ));
             }
             info!("Connecting to Named Pipe: {}", pipe_name);
+            probe.check_stop(DiagnosticStop::Resolution)?;
 
+            // A LocalDB instance's pipe, once resolved, is connected to as a
+            // named pipe.
+            let kind = if pipe_name
+                .as_bytes()
+                .windows(LOCALDB_PIPE.len())
+                .any(|part| part.eq_ignore_ascii_case(LOCALDB_PIPE))
+            {
+                connect_stage::KIND_LOCALDB
+            } else {
+                connect_stage::KIND_NAMED_PIPE
+            };
             // Open Named Pipe with retry logic for ERROR_PIPE_BUSY
-            let pipe_client = open_named_pipe_with_retry(pipe_name).await?;
+            let pipe_client = open_pipe_stage(kind, pipe_name).await?;
 
             info!("Connected to Named Pipe: {}", pipe_name);
             Ok(Box::new(pipe_client))
@@ -273,9 +293,11 @@ async fn create_base_stream(
             let pipe_name = format!(r"\\.\pipe\SQLLocal\{actual_instance}");
 
             info!("Connecting to Shared Memory pipe: {}", pipe_name);
+            probe.check_stop(DiagnosticStop::Resolution)?;
 
             // Open Named Pipe with retry logic for ERROR_PIPE_BUSY
-            let pipe_client = open_named_pipe_with_retry(&pipe_name).await?;
+            let pipe_client =
+                open_pipe_stage(connect_stage::KIND_SHARED_MEMORY, &pipe_name).await?;
 
             info!("Connected to Shared Memory (LPC-over-NP): {}", pipe_name);
             Ok(Box::new(pipe_client))
@@ -306,14 +328,43 @@ async fn create_base_stream(
             let pipe_name = resolve_localdb_instance(instance_name).await?;
 
             info!("LocalDB instance resolved to pipe: {}", pipe_name);
+            probe.check_stop(DiagnosticStop::Resolution)?;
 
             // Connect to the named pipe
-            let pipe_client = open_named_pipe_with_retry(&pipe_name).await?;
+            let pipe_client = open_pipe_stage(connect_stage::KIND_LOCALDB, &pipe_name).await?;
 
             info!("Connected to LocalDB instance: {}", instance_name);
             Ok(Box::new(pipe_client))
         }
     }
+}
+
+/// What the pipe of a LocalDB instance has in its path.
+#[cfg(windows)]
+const LOCALDB_PIPE: &[u8] = b"\\pipe\\localdb#";
+
+/// Opens the pipe `pipe_name` (with retry logic for ERROR_PIPE_BUSY) as a
+/// `pipe` connect stage of `kind`.
+#[cfg(windows)]
+async fn open_pipe_stage(
+    kind: &'static str,
+    pipe_name: &str,
+) -> std::io::Result<tokio::net::windows::named_pipe::NamedPipeClient> {
+    let stage = tracing::info_span!(
+        target: connect_stage::TARGET,
+        connect_stage::PIPE,
+        kind = kind,
+        pipe = %pipe_name,
+        os_error = tracing::field::Empty,
+        io_kind = tracing::field::Empty,
+        error = tracing::field::Empty,
+        ok = tracing::field::Empty
+    );
+    let pipe_client = open_named_pipe_with_retry(pipe_name)
+        .await
+        .inspect_err(|e| connect_stage::record_io_error(&stage, e))?;
+    stage.record(connect_stage::OK, true);
+    Ok(pipe_client)
 }
 
 /// Stably sorts resolved addresses per `ipaddress_preference`, keeping the
@@ -340,8 +391,106 @@ fn sort_by_ip_preference(
     }
 }
 
+/// The `tcp` connect stage for a connect to `address`.
+fn tcp_stage(address: &SocketAddr) -> tracing::Span {
+    tracing::info_span!(
+        target: connect_stage::TARGET,
+        connect_stage::TCP,
+        address = %connect_stage::ScopedIp(address),
+        port = address.port(),
+        os_error = tracing::field::Empty,
+        io_kind = tracing::field::Empty,
+        timed_out = tracing::field::Empty,
+        error = tracing::field::Empty,
+        ok = tracing::field::Empty
+    )
+}
+
+/// A TCP socket for `address`, with the client's keep-alive settings.
+fn new_tcp_socket(
+    address: SocketAddr,
+    keep_alive_in_ms: u32,
+    keep_alive_interval_in_ms: u32,
+) -> std::io::Result<net::TcpSocket> {
+    let socket = if address.is_ipv6() {
+        net::TcpSocket::new_v6()?
+    } else {
+        net::TcpSocket::new_v4()?
+    };
+
+    // The defaults for the SQL Server clients are at
+    // https://learn.microsoft.com/en-us/sql/tools/configuration-manager/client-protocols-tcp-ip-properties-protocol-tab?view=sql-server-ver16
+    let keep_alive_settings = socket2::TcpKeepalive::new()
+        .with_time(Duration::from_millis(keep_alive_in_ms as u64))
+        .with_interval(Duration::from_millis(keep_alive_interval_in_ms as u64));
+
+    let socket2_socket = socket2::SockRef::from(&socket);
+    socket2_socket.set_tcp_keepalive(&keep_alive_settings)?;
+    socket2_socket.set_nodelay(true)?;
+    Ok(socket)
+}
+
+/// Connects `socket` to `address` within `connect_timeout_ms`, recording the
+/// result on `stage`, as the connect to the address used does.
+async fn connect_tcp_socket(
+    socket: net::TcpSocket,
+    address: SocketAddr,
+    connect_timeout_ms: u64,
+    stage: &tracing::Span,
+) -> std::io::Result<TcpStream> {
+    // Apply connection timeout to each connection attempt
+    let connect_future = socket.connect(address);
+    let result = match timeout(Duration::from_millis(connect_timeout_ms), connect_future).await {
+        Ok(result) => result,
+        Err(_elapsed) => {
+            stage.record(connect_stage::TIMED_OUT, true);
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "Connection to {} timed out after {}ms",
+                    address, connect_timeout_ms
+                ),
+            ))
+        }
+    };
+    match &result {
+        Ok(_) => {
+            stage.record(connect_stage::OK, true);
+        }
+        Err(e) => connect_stage::record_io_error(stage, e),
+    }
+    result
+}
+
+/// For a diagnostic connection: connects to `address`, an address after the
+/// one the connection uses, in a task of its own, and closes the connection
+/// at once. It has `connect_timeout_ms`, what is left of the connection's own
+/// limit. The probe keeps the task, to wait for it.
+fn spawn_extra_attempt(
+    address: SocketAddr,
+    keep_alive_in_ms: u32,
+    keep_alive_interval_in_ms: u32,
+    connect_timeout_ms: u64,
+    probe: &ConnectProbe,
+) {
+    // Opened here, so the stage is recorded by the subscriber of the
+    // connection attempt, whatever thread the task runs on.
+    let stage = tcp_stage(&address);
+    let attempt = tokio::spawn(async move {
+        match new_tcp_socket(address, keep_alive_in_ms, keep_alive_interval_in_ms) {
+            Ok(socket) => {
+                let _ = connect_tcp_socket(socket, address, connect_timeout_ms, &stage).await;
+            }
+            Err(e) => connect_stage::record_io_error(&stage, &e),
+        }
+    });
+    probe.add_extra_attempt(attempt);
+}
+
 /// Creates a TCP stream using sequential connection mode.
-/// Tries each resolved IP address one at a time until one succeeds.
+/// Tries each resolved IP address one at a time until one succeeds. A
+/// diagnostic connection that asks for every address then connects to the
+/// addresses after it too, without waiting for them.
 async fn create_base_stream_sequential(
     ipaddress_preference: IPAddressPreference,
     host: &str,
@@ -349,6 +498,7 @@ async fn create_base_stream_sequential(
     keep_alive_in_ms: u32,
     keep_alive_interval_in_ms: u32,
     connect_timeout_ms: u64,
+    probe: &ConnectProbe,
 ) -> TdsResult<Box<dyn Stream>> {
     info!(
         "Connecting to TCP transport (sequential): {}:{}",
@@ -360,8 +510,20 @@ async fn create_base_stream_sequential(
     // blocking the calling thread, so a slow or stuck resolver stays subject to the
     // `timeout()`/deadline machinery in the retry loop above this call instead of
     // silently escaping it.
-    let mut socket_addresses: Vec<SocketAddr> =
-        tokio::net::lookup_host((host, port)).await?.collect();
+    let dns_stage = tracing::info_span!(
+        target: connect_stage::TARGET,
+        connect_stage::DNS,
+        host = %host,
+        addresses = tracing::field::Empty,
+        os_error = tracing::field::Empty,
+        io_kind = tracing::field::Empty,
+        error = tracing::field::Empty,
+        ok = tracing::field::Empty
+    );
+    let mut socket_addresses: Vec<SocketAddr> = tokio::net::lookup_host((host, port))
+        .await
+        .inspect_err(|e| connect_stage::record_io_error(&dns_stage, e))?
+        .collect();
 
     let mut last_error = None;
     let mut tcp_stream = None;
@@ -369,23 +531,26 @@ async fn create_base_stream_sequential(
     sort_by_ip_preference(&mut socket_addresses, ipaddress_preference);
 
     info!("Socket addresses: {:?}", socket_addresses);
+    if !dns_stage.is_disabled() {
+        dns_stage.record(
+            connect_stage::ADDRESSES,
+            connect_stage::address_list(&socket_addresses),
+        );
+    }
+    dns_stage.record(connect_stage::OK, !socket_addresses.is_empty());
+    drop(dns_stage);
+    if !socket_addresses.is_empty() {
+        probe.check_stop(DiagnosticStop::Resolution)?;
+    }
+    // The connects, those to the addresses after the one used too, share this
+    // one limit.
+    let connect_deadline = tokio::time::Instant::now() + Duration::from_millis(connect_timeout_ms);
 
-    for socket_address in socket_addresses {
-        let socket = if socket_address.is_ipv6() {
-            net::TcpSocket::new_v6()?
-        } else {
-            net::TcpSocket::new_v4()?
-        };
-
-        // The defaults for the SQL Server clients are at
-        // https://learn.microsoft.com/en-us/sql/tools/configuration-manager/client-protocols-tcp-ip-properties-protocol-tab?view=sql-server-ver16
-        let keep_alive_settings = socket2::TcpKeepalive::new()
-            .with_time(Duration::from_millis(keep_alive_in_ms as u64))
-            .with_interval(Duration::from_millis(keep_alive_interval_in_ms as u64));
-
-        let socket2_socket = socket2::SockRef::from(&socket);
-        socket2_socket.set_tcp_keepalive(&keep_alive_settings)?;
-        socket2_socket.set_nodelay(true)?;
+    let mut remaining = socket_addresses.into_iter();
+    for socket_address in remaining.by_ref() {
+        let tcp_stage = tcp_stage(&socket_address);
+        let socket = new_tcp_socket(socket_address, keep_alive_in_ms, keep_alive_interval_in_ms)
+            .inspect_err(|e| connect_stage::record_io_error(&tcp_stage, e))?;
 
         // Apply connection timeout to each connection attempt
         let connect_future = socket.connect(socket_address);
@@ -393,20 +558,25 @@ async fn create_base_stream_sequential(
         {
             Ok(Ok(stream)) => {
                 info!("Connected to TCP transport: {}:{}", host, port);
+                tcp_stage.record(connect_stage::OK, true);
                 Some(stream)
             }
             Ok(Err(e)) => {
+                connect_stage::record_io_error(&tcp_stage, &e);
                 last_error = Some(e);
                 None
             }
             Err(_elapsed) => {
-                last_error = Some(std::io::Error::new(
+                let e = std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
                     format!(
                         "Connection to {} timed out after {}ms",
                         socket_address, connect_timeout_ms
                     ),
-                ));
+                );
+                tcp_stage.record(connect_stage::TIMED_OUT, true);
+                connect_stage::record_io_error(&tcp_stage, &e);
+                last_error = Some(e);
                 None
             }
         };
@@ -417,6 +587,23 @@ async fn create_base_stream_sequential(
 
     // We don't have a valid TCP stream, so we need to return the last error.
     if let Some(stream) = tcp_stream {
+        if probe.all_addresses() {
+            let remaining_ms = u64::try_from(
+                connect_deadline
+                    .saturating_duration_since(tokio::time::Instant::now())
+                    .as_millis(),
+            )
+            .unwrap_or(u64::MAX);
+            for address in remaining {
+                spawn_extra_attempt(
+                    address,
+                    keep_alive_in_ms,
+                    keep_alive_interval_in_ms,
+                    remaining_ms,
+                    probe,
+                );
+            }
+        }
         Ok(Box::new(stream))
     } else {
         Err(crate::error::Error::from(last_error.unwrap_or_else(|| {
@@ -449,7 +636,25 @@ async fn create_base_stream_parallel(
         keep_alive_interval_in_ms,
     };
 
-    let result = parallel_connect(host, port, &config).await?;
+    let tcp_stage = tracing::info_span!(
+        target: connect_stage::TARGET,
+        connect_stage::TCP,
+        address = tracing::field::Empty,
+        port = port,
+        os_error = tracing::field::Empty,
+        io_kind = tracing::field::Empty,
+        error = tracing::field::Empty,
+        ok = tracing::field::Empty
+    );
+    let result = parallel_connect(host, port, &config)
+        .await
+        .inspect_err(|e| connect_stage::record_error(&tcp_stage, e))?;
+    tcp_stage.record(
+        connect_stage::ADDRESS,
+        tracing::field::display(connect_stage::ScopedIp(&result.connected_address)),
+    );
+    tcp_stage.record(connect_stage::OK, true);
+    drop(tcp_stage);
 
     info!(
         "Parallel connection succeeded to {} (tried {} addresses, {} failed)",
@@ -458,7 +663,6 @@ async fn create_base_stream_parallel(
 
     Ok(Box::new(result.stream))
 }
-
 /// Creates a NetworkTransport configured for the specified TDS version.
 /// This function applies TDS version-specific logic uniformly across all transport types.
 async fn create_transport_for_version(
@@ -491,9 +695,20 @@ async fn create_transport_for_version(
             // Enable TLS immediately for TDS 8.0 (before any TDS packets are exchanged)
             info!("Creating NetworkTransport for TDS 8.0 with immediate TLS");
 
+            let tls_stage = tracing::info_span!(
+                target: connect_stage::TARGET,
+                connect_stage::TLS,
+                os_error = tracing::field::Empty,
+                io_kind = tracing::field::Empty,
+                error = tracing::field::Empty,
+                ok = tracing::field::Empty
+            );
             let encrypted_stream = ssl_handler
                 .enable_ssl_async(stream, NegotiatedEncryptionSetting::Strict)
-                .await?;
+                .await
+                .inspect_err(|e| connect_stage::record_error(&tls_stage, e))?;
+            tls_stage.record(connect_stage::OK, true);
+            drop(tls_stage);
 
             Ok(NetworkTransport::new(
                 encrypted_stream,
@@ -521,6 +736,7 @@ async fn create_transport_for_version(
 /// * `keep_alive_interval_in_ms` - TCP keep-alive interval in milliseconds
 /// * `multi_subnet_failover` - If true, enables parallel connection mode for TCP
 /// * `connect_timeout_ms` - Connection timeout in milliseconds
+/// * `probe` - What a diagnostic connection asks besides ([`NO_PROBE`](crate::connection_provider::tds_connection_provider::NO_PROBE) otherwise)
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn create_transport(
     ipaddress_preference: IPAddressPreference,
@@ -531,6 +747,7 @@ pub(crate) async fn create_transport(
     keep_alive_interval_in_ms: u32,
     multi_subnet_failover: bool,
     connect_timeout_ms: u64,
+    probe: &ConnectProbe,
 ) -> TdsResult<NetworkTransport> {
     let encryption_mode = encryption_options.mode;
 
@@ -542,6 +759,7 @@ pub(crate) async fn create_transport(
         keep_alive_interval_in_ms,
         multi_subnet_failover,
         connect_timeout_ms,
+        probe,
     )
     .await?;
 
@@ -5610,6 +5828,7 @@ pub(crate) mod tests {
             30_000,
             1_000,
             200,
+            &crate::connection_provider::tds_connection_provider::NO_PROBE,
         )
         .await;
 
