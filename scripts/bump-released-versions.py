@@ -12,6 +12,9 @@ Each track files a tracking issue, pushes a branch, and opens one pull request
 bumping to the next minor version. A failure in one track does not stop the other.
 Maintainers own review, validation, and the final release version: push to the
 open PR to choose a different version.
+
+GitHub is reached over the REST API with ``GH_TOKEN`` rather than the ``gh`` CLI,
+so this runs on any agent image without extra tooling.
 """
 
 import json
@@ -38,11 +41,15 @@ PYTHON_BRANCH = "automation/bump-mssql-python-rs"
 
 USER_AGENT = "microsoft/mssql-rs version check (https://github.com/microsoft/mssql-rs)"
 RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+API_ROOT = "https://api.github.com"
 
-# A `version` assignment inside a named TOML table, matching the first such key
-# before the next table header so `[package].version` is never confused with a
-# version requirement in `[dependencies]`.
+
 def table_version_pattern(table):
+    """A `version` assignment inside a named TOML table.
+
+    Anchored to the table header and stopping at the next one, so `[package].version`
+    is never confused with a version requirement in `[dependencies]`.
+    """
     return re.compile(
         rf"^(\[{re.escape(table)}\]\n(?:(?!\[).*\n)*?version = )\"([^\"]+)\"$",
         re.MULTILINE,
@@ -53,6 +60,9 @@ MOCK_TDS_DEPENDENCY = re.compile(
     r"^(mssql-tds = \{ path = \"\.\./mssql-tds\", version = )\"[^\"]+\"",
     re.MULTILINE,
 )
+
+
+# --- registries -------------------------------------------------------------
 
 
 def fetch_registry_json(url, package):
@@ -95,6 +105,65 @@ def pypi_published_versions(distribution):
     if not versions or not all(isinstance(version, str) for version in versions):
         raise ValueError(f"{distribution}: invalid PyPI releases response")
     return versions
+
+
+# --- GitHub REST ------------------------------------------------------------
+
+
+def github_api(method, path, payload=None, allow_status=()):
+    """Call the GitHub REST API. Returns (status, decoded body)."""
+    body = json.dumps(payload).encode() if payload is not None else None
+    request = Request(
+        f"{API_ROOT}{path}",
+        data=body,
+        method=method,
+        headers={
+            "Authorization": f"Bearer {os.environ['GH_TOKEN']}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "Content-Type": "application/json",
+            "User-Agent": USER_AGENT,
+        },
+    )
+    for attempt in range(3):
+        try:
+            with urlopen(request, timeout=30) as response:
+                raw = response.read()
+                return response.status, (json.loads(raw) if raw else None)
+        except HTTPError as error:
+            if error.code in allow_status:
+                return error.code, None
+            if error.code in RETRYABLE_STATUS and attempt < 2:
+                time.sleep(2 ** attempt)
+                continue
+            detail = error.read().decode(errors="replace")[:500]
+            raise RuntimeError(f"{method} {path} failed: HTTP {error.code} {detail}") from error
+        except URLError:
+            if attempt < 2:
+                time.sleep(2 ** attempt)
+                continue
+            raise
+
+
+def github_paged(path):
+    """Fetch every page of a list endpoint."""
+    separator = "&" if "?" in path else "?"
+    items = []
+    for page in range(1, 11):
+        _status, batch = github_api("GET", f"{path}{separator}per_page=100&page={page}")
+        if not batch:
+            break
+        items.extend(batch)
+        if len(batch) < 100:
+            break
+    return items
+
+
+def repository():
+    return os.environ["GITHUB_REPOSITORY"]
+
+
+# --- version planning -------------------------------------------------------
 
 
 def read_table_version(path, table):
@@ -218,24 +287,21 @@ def apply_python_bump(root, changes):
     return [PYPROJECT.as_posix()]
 
 
-def has_open_bump_pr(root, changes, branch):
+# --- pull requests ----------------------------------------------------------
+
+
+def has_open_bump_pr(changes, branch):
     """True when a pull request other than ours already proposes the same transitions."""
-    result = subprocess.run(
-        [
-            "gh", "pr", "list", "--repo", os.environ["GITHUB_REPOSITORY"],
-            "--base", os.environ["DEFAULT_BRANCH"], "--state", "open",
-            "--json", "number,title,body,headRefName", "--limit", "100",
-        ],
-        cwd=root, check=True, stdout=subprocess.PIPE, text=True,
-    )
+    base = os.environ["DEFAULT_BRANCH"]
+    pulls = github_paged(f"/repos/{repository()}/pulls?state=open&base={base}")
     return any(
         all(
             summary_line(package, old, new) in text
             for package, (old, new) in changes.items()
         )
-        for pr in json.loads(result.stdout)
-        if pr.get("headRefName") != branch
-        for text in [f"{pr.get('title') or ''}\n{pr.get('body') or ''}"]
+        for pull in pulls
+        if (pull.get("head") or {}).get("ref") != branch
+        for text in [f"{pull.get('title') or ''}\n{pull.get('body') or ''}"]
     )
 
 
@@ -252,7 +318,7 @@ def issue_body(marker, summary, affected, snippets):
         + affected
         + "\n\n### Alternatives considered\n\nBump the versions manually.\n\n"
         "### Additional context\n\n"
-        "Managed by the Bump Released Versions workflow, which opens the linked pull "
+        "Managed by the Bump Released Versions pipeline, which opens the linked pull "
         "request and regenerates this body while the bump is pending; put maintainer "
         "notes in issue comments. Push to the pull request to choose a different "
         "release version.\n"
@@ -292,28 +358,12 @@ def python_issue_body(summary, changes):
 
 
 def ensure_bump_issue(label, marker, title, body):
-    repository = os.environ["GITHUB_REPOSITORY"]
-    endpoint = f"repos/{repository}/issues"
-    owner, name = repository.split("/")
-    query = """
-    query($owner: String!, $name: String!, $label: String!, $endCursor: String) {
-      repository(owner: $owner, name: $name) {
-        issues(first: 100, after: $endCursor, states: OPEN, labels: [$label]) {
-          nodes { number body }
-          pageInfo { hasNextPage endCursor }
-        }
-      }
-    }
-    """
-    result = subprocess.run(
-        ["gh", "api", "graphql", "-f", f"query={query}", "-f", f"owner={owner}",
-         "-f", f"name={name}", "-f", f"label={label}", "--paginate", "--slurp"],
-        check=True, stdout=subprocess.PIPE, text=True,
-    )
+    repo = repository()
+    # The issues endpoint also returns pull requests; drop those.
+    candidates = github_paged(f"/repos/{repo}/issues?state=open&labels={label}")
     matches = [
-        issue for page in json.loads(result.stdout)
-        for issue in page["data"]["repository"]["issues"]["nodes"]
-        if (issue.get("body") or "").startswith(marker)
+        issue for issue in candidates
+        if "pull_request" not in issue and (issue.get("body") or "").startswith(marker)
     ]
     if len(matches) > 1:
         raise ValueError(f"Multiple open {label} tracking issues; resolve duplicates manually.")
@@ -323,27 +373,25 @@ def ensure_bump_issue(label, marker, title, body):
         print(f"Reusing version bump issue #{number}.")
         return number
 
-    payload = {"body": body}
     if matches:
-        endpoint += f"/{matches[0]['number']}"
-        method = "PATCH"
-    else:
-        subprocess.run(
-            ["gh", "label", "create", label, "--repo", repository,
-             "--color", "0e8a16", "--description", "Tracking issues for automated version bumps",
-             "--force"],
-            check=True, stdout=subprocess.PIPE, text=True,
-        )
-        payload["title"] = title
-        payload["labels"] = [label]
-        method = "POST"
-    result = subprocess.run(
-        ["gh", "api", endpoint, "--method", method, "--input", "-"],
-        input=json.dumps(payload), check=True, stdout=subprocess.PIPE, text=True,
+        number = matches[0]["number"]
+        github_api("PATCH", f"/repos/{repo}/issues/{number}", {"body": body})
+        print(f"Updated version bump issue #{number}.")
+        return number
+
+    # 422 means the label already exists, which is the normal steady state.
+    github_api(
+        "POST", f"/repos/{repo}/labels",
+        {"name": label, "color": "0e8a16",
+         "description": "Tracking issues for automated version bumps"},
+        allow_status=(422,),
     )
-    number = json.loads(result.stdout)["number"]
-    print(f"{'Updated' if matches else 'Created'} version bump issue #{number}.")
-    return number
+    _status, created = github_api(
+        "POST", f"/repos/{repo}/issues",
+        {"title": title, "body": body, "labels": [label]},
+    )
+    print(f"Created version bump issue #{created['number']}.")
+    return created["number"]
 
 
 def pull_request_body(summary, issue_number, extra):
@@ -359,8 +407,8 @@ def pull_request_body(summary, issue_number, extra):
         "- [ ] `cargo btest` passes\n"
         "- [x] New/changed functionality has tests\n"
         "- [x] Public API changes are documented\n\n"
-        "Opened by the Bump Released Versions workflow. Push to this branch to "
-        "release a different version; the workflow only force-updates the branch "
+        "Opened by the Bump Released Versions pipeline. Push to this branch to "
+        "release a different version; the pipeline only force-updates the branch "
         "while the planned versions change.\n"
     )
 
@@ -372,7 +420,7 @@ def git(root, *args):
 
 
 def open_bump_pr(root, branch, base_sha, title, body, apply_changes):
-    repository = os.environ["GITHUB_REPOSITORY"]
+    repo = repository()
     base = os.environ["DEFAULT_BRANCH"]
     # Branch first so each track commits only its own edits, even when an earlier
     # track already left a commit on a different branch.
@@ -381,27 +429,22 @@ def open_bump_pr(root, branch, base_sha, title, body, apply_changes):
     git(root, "add", "--", *paths)
     git(root, "commit", "--message", title)
     git(root, "push", "--force", "origin", f"{branch}:refs/heads/{branch}")
-    existing = json.loads(subprocess.run(
-        ["gh", "pr", "list", "--repo", repository, "--head", branch,
-         "--base", base, "--state", "open", "--json", "number", "--limit", "1"],
-        cwd=root, check=True, stdout=subprocess.PIPE, text=True,
-    ).stdout)
+
+    existing = github_paged(f"/repos/{repo}/pulls?state=open&base={base}&head={repo.split('/')[0]}:{branch}")
     if existing:
         number = existing[0]["number"]
-        subprocess.run(
-            ["gh", "pr", "edit", str(number), "--repo", repository,
-             "--title", title, "--body", body],
-            cwd=root, check=True, stdout=subprocess.PIPE, text=True,
-        )
+        github_api("PATCH", f"/repos/{repo}/pulls/{number}", {"title": title, "body": body})
         print(f"Updated bump PR #{number}.")
         return number
-    url = subprocess.run(
-        ["gh", "pr", "create", "--repo", repository, "--base", base, "--head", branch,
-         "--title", title, "--body", body],
-        cwd=root, check=True, stdout=subprocess.PIPE, text=True,
-    ).stdout.strip()
-    print(f"Created bump PR {url}")
-    return url
+    _status, created = github_api(
+        "POST", f"/repos/{repo}/pulls",
+        {"title": title, "head": branch, "base": base, "body": body, "draft": False},
+    )
+    print(f"Created bump PR #{created['number']} ({created['html_url']}).")
+    return created["number"]
+
+
+# --- tracks -----------------------------------------------------------------
 
 
 def run_crate_track(root, base_sha):
@@ -410,7 +453,7 @@ def run_crate_track(root, base_sha):
     if not changes:
         print("No crate version bumps needed.")
         return
-    if has_open_bump_pr(root, changes, CRATE_BRANCH):
+    if has_open_bump_pr(changes, CRATE_BRANCH):
         print("Another open crate bump PR already proposes these versions; skipping.")
         return
     summary = "\n".join(
@@ -441,7 +484,7 @@ def run_python_track(root, base_sha):
     if not changes:
         print(f"No {PYTHON_DIST} version bump needed.")
         return
-    if has_open_bump_pr(root, changes, PYTHON_BRANCH):
+    if has_open_bump_pr(changes, PYTHON_BRANCH):
         print(f"Another open {PYTHON_DIST} bump PR already proposes this version; skipping.")
         return
     old, new = changes[PYTHON_DIST]

@@ -55,23 +55,27 @@ its platform. Free-threaded CPython is not supported by `abi3`.
 
 ### Scheduled version bumps
 
-The **Bump Released Versions** GitHub workflow opens version bump pull requests
-on the first and third Tuesday of each month at 07:30 UTC (13:00 IST). The cron
-trigger fires every Tuesday and the job then checks the day of month: days 1-7
-hold exactly one Tuesday, as do days 15-21. The ordinal guard lives in the job
-rather than in the cron day-of-month field because cron implementations disagree
-on whether a restricted day of month and day of week combine with AND or OR.
-GitHub may delay or skip scheduled runs. **Run workflow** bypasses the date check
-and still targets the default branch.
+The **Bump Released Versions** Azure DevOps pipeline
+(`.pipeline/bump-released-versions.yml`) opens version bump pull requests against
+GitHub `microsoft/mssql-rs` on the first and third Tuesday of each month at
+07:30 UTC (13:00 IST). The cron trigger (`30 7 * * 2`) fires every Tuesday and
+the job then checks the UTC day of month: days 1-7 hold exactly one Tuesday, as
+do days 15-21. The ordinal guard lives in the job rather than in the cron
+day-of-month field because cron implementations disagree on whether a restricted
+day of month and day of week combine with AND or OR. Azure Pipelines may delay or
+skip scheduled runs. Running the pipeline manually bypasses the date check.
 
-The workflow runs two independent tracks. A failure in one does not stop the
+A scheduled trigger defined in the pipeline settings UI silently overrides the
+YAML schedule, so do not add one.
+
+The pipeline runs two independent tracks. A failure in one does not stop the
 other; the run fails at the end if either track failed.
 
 #### Released Rust crates
 
 `mssql-tds` and `mssql-mock-tds` are checked against crates.io independently. If
 a crate's exact `[package].version` exists among its published versions
-(including older or yanked releases), the workflow bumps it to the next minor
+(including older or yanked releases), the pipeline bumps it to the next minor
 version: `0.1.7` becomes `0.2.0`. Unpublished source versions and crates that
 return HTTP 404 are left alone. Other registry errors fail the track rather than
 assuming a crate is unpublished. If the proposed next minor version is also
@@ -110,40 +114,66 @@ default branch tip and opens a pull request that closes it:
 
 The issue exists because **PR Linked Issue Check** requires every pull request to
 reference a GitHub issue or an ADO work item; the generated PR body carries
-`Fixes #<issue-number>`. The workflow queries only open issues with the track's
-label, then checks the hidden marker in their bodies before reusing or updating
-one. It regenerates the issue body while the bump is pending; put maintainer
-notes in issue comments. The label is created automatically when needed; multiple
-matching open issues fail the track for manual cleanup.
+`Fixes #<issue-number>`. The pipeline queries only open issues with the track's
+label, ignores pull requests returned by the same endpoint, then checks the
+hidden marker in their bodies before reusing or updating one. It regenerates the
+issue body while the bump is pending; put maintainer notes in issue comments. The
+label is created automatically when needed; multiple matching open issues fail
+the track for manual cleanup.
 
-To release a different version, push to the open pull request. The workflow
+To release a different version, push to the open pull request. The pipeline
 force-updates its branch only while the planned versions change, and it skips a
 track entirely when a pull request on some *other* branch already proposes the
 same transitions. When no bump is needed, nothing is written. If a bump becomes
 unnecessary, close the pull request and its issue manually.
 
-Normal validation and review are still required before merging. The workflow
+Normal validation and review are still required before merging. The pipeline
 does not publish crates, merge anything, or change the release pipeline's
 existing version-stamping policy.
 
 #### Credentials
 
-Branch pushes and pull requests use a GitHub App installation token minted from
-the `VERSION_BUMP_APP_ID` and `VERSION_BUMP_APP_PRIVATE_KEY` repository secrets.
-The app installation needs **contents: write** and **pull requests: write** on
-this repository, plus **issues: write** for the tracking issues. The workflow's
-own `GITHUB_TOKEN` stays at `contents: read`.
+No PAT, secret, or variable group is involved. The pipeline's source repository
+is GitHub `microsoft/mssql-rs` through the `github.com_microsoft` service
+connection, so `checkout: self` with `persistCredentials: true` leaves the Azure
+Pipelines GitHub App installation token in the local git config under a
+repo-scoped key such as
+`http.https://github.com/microsoft/mssql-rs.extraheader`. The job discovers that
+key, decodes the basic-auth header, and registers the token as a secret variable
+so it is masked in every downstream log. The same token authenticates both the
+branch push and the GitHub REST calls.
 
-An app token is used rather than `GITHUB_TOKEN` because pull requests opened with
-`GITHUB_TOKEN` create workflow runs in an approval-required state, so every bump
-PR would need a maintainer to click **Approve workflows to run** before CI
-started. If the secrets are missing, the token step fails and no branch is
+That installation token is scoped to the whole `microsoft` organization, not to
+this repository alone. It is short-lived and the pipeline only ever writes to
+this repo, but any step in this job briefly holds a broadly scoped credential.
+A dedicated GitHub App scoped to `mssql-rs` would narrow that, at the cost of
+org-admin setup and two new secrets.
+
+GitHub is reached over the REST API with `urllib` rather than the `gh` CLI, so
+the job does not depend on `gh` being present on the agent image.
+
+If the credential cannot be found or decoded, the step fails before any branch is
 pushed.
+
+#### Creating the pipeline
+
+The YAML alone does nothing until a pipeline definition points at it:
+
+1. Create a new pipeline in the `mssql-rs` Azure DevOps project from the GitHub
+   `microsoft/mssql-rs` repository using the `github.com_microsoft` service
+   connection, with YAML path `.pipeline/bump-released-versions.yml`.
+2. Do not add a schedule in the pipeline settings UI.
+3. Run it manually once to confirm the credential extraction works.
+
+The pipeline runs on a Microsoft-hosted `ubuntu-latest` agent. It only runs git
+and Python, so it does not need the private Rust pools, which require a separate
+pool authorization for any new pipeline.
 
 The shared validation pipeline runs `scripts/test_bump_released_versions.py` in
 its Windows Python test step for both PR validation and main-branch CI. Cargo
-metadata, registry, git, pull request, and issue calls are mocked. No live
-writes are needed.
+metadata, registry, git, pull request, and issue calls are mocked. The cadence
+guard and the credential-key extraction are executed as real `bash`, so the
+shipped shell is covered rather than a Python restatement of it.
 
 ### Python and NuGet versions
 
