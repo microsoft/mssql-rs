@@ -37,6 +37,7 @@ use crate::handles::stmt::{
     DaeParam, PreparedPlan, STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT,
     STMT_STATE_EXEC_STARTED,
 };
+use crate::handles::wire::WireLease;
 use crate::handles::{DescHandle, HandleType, StmtHandle, handle_from_raw};
 
 /// Executes the prepared statement on `statement_handle`.
@@ -651,7 +652,7 @@ fn finish_parameter_array(
     dbc: &crate::handles::DbcHandle,
     stmt: &StmtHandle,
     statement_handle: SqlHandle,
-    mut client: mssql_tds::connection::tds_client::TdsClient,
+    mut client: WireLease,
     result: PreparedBatchResult,
     mut batch: BatchClientResults,
 ) -> SqlReturn {
@@ -2327,7 +2328,7 @@ mod tests {
                 execution.dae_params.iter().any(|param| param.is_buffered()),
                 deferred
             );
-            let client = tds_client_from_tokens(Vec::new());
+            let client = WireLease::detached_for_test(tds_client_from_tokens(Vec::new()), h.stmt);
             let rc = if deferred {
                 park_deferred_dae(
                     stmt,
@@ -2405,7 +2406,7 @@ mod tests {
         materialize_test_plan(h.stmt, id);
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let dbc = stmt.parent_dbc();
-        dbc.inner.lock().unwrap().client = Some(client);
+        dbc.inner.lock().unwrap().wire.put_client_for_test(client);
 
         for length in [16, 24, 32] {
             set_cached_desc_field(h.ipd(), SQL_DESC_LENGTH, length);
@@ -2423,8 +2424,8 @@ mod tests {
                 dbc.inner
                     .lock()
                     .unwrap()
-                    .client
-                    .as_ref()
+                    .wire
+                    .client()
                     .unwrap()
                     .prepared_handle_for_test(id),
                 Some(77)
@@ -2534,14 +2535,14 @@ mod tests {
         materialize_test_plan(h.stmt, id);
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let dbc = stmt.parent_dbc();
-        dbc.inner.lock().unwrap().client = Some(client);
+        dbc.inner.lock().unwrap().wire.put_client_for_test(client);
 
         // The application path: `sql_execute` parks the client on the statement,
         // which is the only moment `claim_connection` snapshots the collation.
         assert_eq!(unsafe { sql_execute(h.stmt) }, SQL_NEED_DATA);
         {
             let state = dbc.inner.lock().unwrap();
-            assert!(state.client.is_none(), "client is parked for DAE");
+            assert!(state.wire.client().is_none(), "client is parked for DAE");
             assert_eq!(state.last_collation_code_page, Some(1252));
         }
 
@@ -2717,12 +2718,16 @@ mod tests {
             );
             let dbc = unsafe { handle_from_raw::<crate::handles::DbcHandle>(h.dbc) };
             let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
-            dbc.inner.lock().unwrap().client = Some(tds_client_from_tokens(vec![
-                done_more_with_count(2),
-                done_more_with_count(1),
-                col_metadata(int_columns(1)),
-                done_no_more(),
-            ]));
+            dbc.inner
+                .lock()
+                .unwrap()
+                .wire
+                .put_client_for_test(tds_client_from_tokens(vec![
+                    done_more_with_count(2),
+                    done_more_with_count(1),
+                    col_metadata(int_columns(1)),
+                    done_no_more(),
+                ]));
 
             let mut input = b'1';
             let mut indicator = SQL_DATA_AT_EXEC;
@@ -3802,7 +3807,13 @@ mod tests {
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         let _mock_server =
             crate::test_support::connect_mock_server(dbc, "SELECT 1", QueryResponse::select_one());
-        let mut client = dbc.inner.lock().unwrap().client.take().unwrap();
+        let mut client = dbc
+            .inner
+            .lock()
+            .unwrap()
+            .wire
+            .clear_client_for_test()
+            .unwrap();
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         stmt.inner.lock().unwrap().parameter_array = Some(BatchClientResults {
             outputs: ParamArrayOutputs {
@@ -3826,7 +3837,7 @@ mod tests {
             stmt.inner.lock().unwrap().diag_records[0].sql_state,
             SQLSTATE_HY000
         );
-        dbc.inner.lock().unwrap().client = Some(client);
+        dbc.inner.lock().unwrap().wire.put_client_for_test(client);
     }
 
     #[test]

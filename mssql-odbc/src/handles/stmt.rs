@@ -9,11 +9,12 @@ use std::sync::{Condvar, Mutex};
 
 use tracing::error;
 
-use mssql_tds::connection::tds_client::{PreparedStatement, StatementId, TdsClient};
+use mssql_tds::connection::tds_client::{PreparedStatement, StatementId};
 use mssql_tds::core::CancelHandle;
 use mssql_tds::error::Error as TdsError;
 
 use super::desc::{DescHandle, DescKind, DescRecord, DescState};
+use super::wire::WireLease;
 use super::{DbcHandle, HandleType, HasObjectType, free_handle, handle_to_raw};
 use crate::api::odbc_types::{
     self, SQL_DESC_ALLOC_AUTO, SqlInteger, SqlLen, SqlPointer, SqlSmallInt, SqlULen, SqlUSmallInt,
@@ -967,11 +968,10 @@ pub(crate) struct DaeProgress {
 /// established and torn down in one move, and so no field can outlive it.
 #[derive(Debug)]
 pub(crate) struct DaeState {
-    /// The streaming client, parked here while the DBC's own `client` is
-    /// `None` and its `active_stmt` keeps the connection busy. Private, with
-    /// `call_in_flight`, so the two can only move together — see
-    /// [`DaeState::checkout_client`].
-    client: Option<TdsClient>,
+    /// The wire lease, parked here while the DBC's wire stays reserved
+    /// by this statement. Private, with `call_in_flight`, so the two can only
+    /// move together — see [`DaeState::checkout_client`].
+    client: Option<WireLease>,
     /// `true` while `SQLPutData` or `SQLParamData` holds the client for network
     /// I/O.
     call_in_flight: bool,
@@ -1018,7 +1018,7 @@ pub(crate) struct DaeState {
 
 impl DaeState {
     pub(crate) fn new(
-        client: TdsClient,
+        client: WireLease,
         prepared: Option<PreparedPlan>,
         orphaned: Option<StatementId>,
         params: Vec<DaeParam>,
@@ -1078,7 +1078,7 @@ impl DaeState {
 
     /// Switches the sequence from collecting to streaming once its RPC is open,
     /// giving each remaining parameter the transcode its chunks need.
-    pub(crate) fn begin_streaming_phase(&mut self, client: TdsClient, collation: SqlCollation) {
+    pub(crate) fn begin_streaming_phase(&mut self, client: WireLease, collation: SqlCollation) {
         for param in &mut self.params {
             if !param.is_buffered() && param.transcode.is_none() {
                 let validates_encoded_input = param
@@ -1134,14 +1134,14 @@ impl DaeState {
     /// I/O. `None` means the sequence has no client to give, which is internal
     /// state corruption. Pairs with [`DaeState::return_client`].
     #[must_use = "a checked-out client must be returned or disposed of"]
-    pub(crate) fn checkout_client(&mut self) -> Option<TdsClient> {
+    pub(crate) fn checkout_client(&mut self) -> Option<WireLease> {
         let client = self.client.take()?;
         self.call_in_flight = true;
         Some(client)
     }
 
     /// Parks the client back on the sequence after a write completes.
-    pub(crate) fn return_client(&mut self, client: TdsClient) {
+    pub(crate) fn return_client(&mut self, client: WireLease) {
         self.client = Some(client);
         self.call_in_flight = false;
     }
@@ -1539,7 +1539,7 @@ impl StmtState {
     /// it — `None` means a `SQLPutData` / `SQLParamData` call has it checked
     /// out and will dispose of it itself.
     #[must_use = "the parked client must be cancelled and returned to the connection"]
-    pub(crate) fn take_dae(&mut self) -> Option<TdsClient> {
+    pub(crate) fn take_dae(&mut self) -> Option<WireLease> {
         let dae = self.dae.take()?;
         self.prepared = dae.prepared;
         self.pending_unprepare = dae.orphaned;
@@ -2004,13 +2004,13 @@ mod tests {
             }
             // A cancellation before token publication must reach this request.
             let handle = stmt.new_execution_cancel().unwrap();
-            let mut client = dbc.inner.lock().unwrap().client.take().unwrap();
+            let mut client = dbc.inner.lock().unwrap().wire.take_lease_for_test(h.stmt);
             let result = dbc.runtime.block_on(client.execute(
                 "SELECT 1".to_string(),
                 mssql_tds::connection::tds_client::ExecuteOptions::new().cancel(&handle),
             ));
             assert!(matches!(result, Err(TdsError::OperationCancelledError(_))));
-            dbc.inner.lock().unwrap().client = Some(client);
+            assert!(dbc.return_lease(client, crate::handles::wire::LeaseReturn::Release));
             assert!(rx.try_recv().is_err());
             drop(stmt.inner.lock().unwrap());
             drop(stmt.parent_dbc().inner.lock().unwrap());
@@ -2021,7 +2021,7 @@ mod tests {
         let next = stmt.begin_operation().unwrap();
         let fresh = stmt.new_execution_cancel().unwrap();
         assert!(!stmt.cancel.lock().unwrap().requested);
-        let mut client = dbc.inner.lock().unwrap().client.take().unwrap();
+        let mut client = dbc.inner.lock().unwrap().wire.take_lease_for_test(h.stmt);
         dbc.runtime.block_on(async {
             client
                 .execute(
@@ -2032,7 +2032,7 @@ mod tests {
                 .unwrap();
             client.close_query().await.unwrap();
         });
-        dbc.inner.lock().unwrap().client = Some(client);
+        assert!(dbc.return_lease(client, crate::handles::wire::LeaseReturn::Release));
         drop(next);
     }
     use crate::api::odbc_types::{SQL_C_CHAR, SQL_C_SLONG, SQL_WVARCHAR};
@@ -2185,7 +2185,10 @@ mod tests {
         let mut dae = DaeState::for_test(vec![buffered, streamed], Some(1));
         dae.deferred = true;
 
-        dae.begin_streaming_phase(tds_client_from_tokens(Vec::new()), SqlCollation::default());
+        dae.begin_streaming_phase(
+            WireLease::detached_for_test(tds_client_from_tokens(Vec::new()), std::ptr::null_mut()),
+            SqlCollation::default(),
+        );
 
         assert!(!dae.deferred);
         assert!(dae.params[0].transcode.is_none());

@@ -528,7 +528,7 @@ fn do_connect(
     // slot; the negotiated value only resizes msodbcsql's own TDS buffer
     // (`TdsHlp.cpp: BATCHCTX::NewPacketSize`), a separate internal detail.
     state.effective_packet_size = Some(resolved_packet_size);
-    state.client = Some(client);
+    state.wire.install(client);
     state.connection_state = ConnectionState::Connected;
     debug!("SQLDriverConnectW: connected successfully");
 
@@ -1436,8 +1436,8 @@ mod tests {
             .inner
             .lock()
             .unwrap()
-            .client
-            .as_ref()
+            .wire
+            .client()
             .expect("connected")
             .packet_size();
         assert_eq!(

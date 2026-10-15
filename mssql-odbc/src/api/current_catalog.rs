@@ -25,7 +25,9 @@ use super::sqlstate::{
     ERR_INVALID_ATTRIBUTE_VALUE, ERR_INVALID_STRING_OR_BUFFER_LENGTH, SQLSTATE_HY024, post_diag,
     post_tds_error_as, post_tds_info_messages,
 };
-use super::txn::{claim_dbc_client, close_all_cursors, exec_batch, release_dbc_client};
+use super::txn::{
+    claim_dbc_client, close_all_cursors, exec_batch, fail_lost_session, release_dbc_client,
+};
 use super::util::{read_utf16_attr, write_wide_attr};
 use crate::error::free_errors;
 use crate::handles::DbcHandle;
@@ -35,8 +37,8 @@ const SET_OP: &str = "SQLSetConnectAttrW(SQL_ATTR_CURRENT_CATALOG)";
 
 pub(super) fn resolved_current_catalog(state: &DbcState) -> String {
     state
-        .client
-        .as_ref()
+        .wire
+        .client()
         .map(|client| client.database())
         .filter(|database| !database.is_empty())
         .map(str::to_string)
@@ -164,7 +166,7 @@ fn decide(dbc: &DbcHandle, name: &str) -> Result<CatalogAction, SqlReturn> {
     // A `USE` cannot be sent while a cursor is streaming, and msodbcsql refuses
     // outright (`CheckBusy` → `IDS_24_000`, `sqlcmisc.cpp:1839`) rather than
     // closing cursors the way the transaction attributes do.
-    if state.active_stmt.is_some() {
+    if state.wire.statement_owner().is_some() {
         error!("{SET_OP}: a cursor is open on this connection");
         post_diag(&mut state, super::sqlstate::ERR_INVALID_CURSOR_STATE);
         return Err(SQL_ERROR);
@@ -175,8 +177,8 @@ fn decide(dbc: &DbcHandle, name: &str) -> Result<CatalogAction, SqlReturn> {
     // SQL Server database names are usually case-insensitive, so `MASTER` and
     // `master` must not produce a needless `USE`.
     let unchanged = state
-        .client
-        .as_ref()
+        .wire
+        .client()
         .is_some_and(|c| c.database().eq_ignore_ascii_case(name));
     if unchanged || name.eq_ignore_ascii_case(DEFAULT_CATALOG) {
         debug!(name, "{SET_OP}: already current");
@@ -205,7 +207,9 @@ fn switch_catalog(dbc: &DbcHandle, name: String, sql: String) -> SqlReturn {
     // context to ..."), which msodbcsql surfaces; draining before the client
     // goes back keeps that record.
     let info_messages = client.take_info_messages();
-    release_dbc_client(dbc, client);
+    if !release_dbc_client(dbc, client) {
+        return fail_lost_session(dbc, SET_OP);
+    }
 
     let Ok(mut state) = dbc.inner.lock() else {
         error!("{SET_OP}: dbc mutex poisoned");
@@ -530,7 +534,11 @@ mod tests {
         h.mark_dbc_connected();
         {
             let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
-            dbc.inner.lock().unwrap().active_stmt = Some(stmt);
+            dbc.inner
+                .lock()
+                .unwrap()
+                .wire
+                .set_owner_for_test(Some(stmt));
         }
         assert_eq!(set_catalog(h.dbc, "master"), SQL_ERROR);
         assert_eq!(sqlstate(h.dbc), "24000");
@@ -540,7 +548,7 @@ mod tests {
         // freeing it here would leave the raw pointer in `extra_stmts` and free
         // it twice.
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
-        dbc.inner.lock().unwrap().active_stmt = None;
+        dbc.inner.lock().unwrap().wire.set_owner_for_test(None);
     }
 
     #[test]

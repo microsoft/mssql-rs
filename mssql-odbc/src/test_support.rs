@@ -18,8 +18,24 @@ use crate::api::odbc_types::{
     SQL_NULL_HANDLE, SQL_OV_ODBC3_80, SQL_SUCCESS, SqlHandle, SqlReturn,
 };
 use crate::api::set_env_attr::sql_set_env_attr;
+use crate::api::sqlstate::DiagMsg;
+use crate::error::DiagRecord;
 use crate::handles::dbc::ConnectionState;
+use crate::handles::wire::{ClaimPolicy, WireLease, WireOwner};
 use crate::handles::{DbcHandle, handle_from_raw};
+
+/// Asserts the last record's SQLSTATE and message text (the driver prefixes the
+/// message, so the text is matched as a substring).
+pub(crate) fn assert_last_diag(records: &[DiagRecord], expected: DiagMsg) {
+    let d = records.last().expect("expected a diagnostic record");
+    assert_eq!(d.sql_state, expected.state, "SQLSTATE mismatch");
+    assert!(
+        d.message.contains(expected.text),
+        "message {:?} did not contain {:?}",
+        d.message,
+        expected.text
+    );
+}
 
 /// Known alignment for tests that deliberately displace application pointers.
 #[repr(align(8))]
@@ -34,6 +50,30 @@ pub(crate) struct AlignedBuffer<T, const N: usize>(pub(crate) [T; N]);
 /// CredScan `SEC101/037` `SqlLegacyCredentials`.
 pub(crate) fn cs(s: &str) -> String {
     s.replace("<PASS>", "PASSWORD").replace("<PW>", "PWD")
+}
+
+/// Parks `client` on `dbc`'s wire and checks it out for `statement`, as an
+/// in-progress call holds it.
+pub(crate) fn lease_for_test(
+    dbc: &DbcHandle,
+    statement: SqlHandle,
+    client: mssql_tds::connection::tds_client::TdsClient,
+) -> WireLease {
+    let mut state = dbc.inner.lock().unwrap();
+    state.wire.put_client_for_test(client);
+    state.wire.take_lease_for_test(statement)
+}
+
+pub(crate) fn connection_lease_for_test(
+    dbc: &DbcHandle,
+    client: mssql_tds::connection::tds_client::TdsClient,
+) -> WireLease {
+    let mut state = dbc.inner.lock().unwrap();
+    state.wire.put_client_for_test(client);
+    state
+        .wire
+        .claim(WireOwner::Connection, ClaimPolicy::IdleOnly)
+        .expect("the fixture installed an idle client")
 }
 
 /// Owns a set of test ODBC handles and frees them on drop.
@@ -383,8 +423,8 @@ pub(crate) fn arm_pending_unprepare(
     let statement_id = {
         let mut dbc_state = dbc.inner.lock().unwrap();
         dbc_state
-            .client
-            .as_mut()
+            .wire
+            .client_mut_for_test()
             .expect("connect_mock_server installs a live client")
             .register_prepared_handle_for_test(1)
     };
@@ -480,7 +520,7 @@ pub(crate) fn connect_mock_server_with_trailing_info(
 
     {
         let mut state = dbc.inner.lock().unwrap();
-        state.client = Some(client);
+        state.wire.put_client_for_test(client);
         state.connection_state = ConnectionState::Connected;
     }
 

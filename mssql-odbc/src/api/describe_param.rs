@@ -34,6 +34,7 @@ use crate::handles::{DescHandle, HandleType, StmtHandle, handle_from_raw};
 use std::sync::{Arc, MutexGuard};
 
 use super::set_desc_field::datetime_interval_code_for;
+use crate::handles::wire::WireLease;
 
 const DESCRIBE_PARAMETERS_PROC: &str = "sp_describe_undeclared_parameters";
 
@@ -750,7 +751,7 @@ fn fail_metadata_response(
     dbc: &crate::handles::DbcHandle,
     stmt: &StmtHandle,
     statement_handle: SqlHandle,
-    mut client: mssql_tds::connection::tds_client::TdsClient,
+    mut client: WireLease,
     message: &str,
 ) -> SqlReturn {
     let info_messages = client.take_info_messages();
@@ -1548,7 +1549,10 @@ mod tests {
                 crate::api::SQLExecDirectW(h.stmt, sql.as_ptr(), i16::try_from(sql.len()).unwrap())
             };
             assert_eq!(SQL_SUCCESS, exec());
-            assert_eq!(dbc.inner.lock().unwrap().active_stmt, Some(h.stmt));
+            assert_eq!(
+                dbc.inner.lock().unwrap().wire.statement_owner(),
+                Some(h.stmt)
+            );
             {
                 let mut state = stmt.inner.lock().unwrap();
                 state.prepared = Some(crate::handles::stmt::PreparedPlan {
@@ -1628,8 +1632,8 @@ mod tests {
             }
             {
                 let state = dbc.inner.lock().unwrap();
-                assert!(state.active_stmt.is_none());
-                assert!(!state.client.as_ref().unwrap().is_connection_dead());
+                assert!(state.wire.owner().is_none());
+                assert!(!state.wire.client().unwrap().is_connection_dead());
             }
             assert_eq!(SQL_SUCCESS, exec());
             for _ in 0..3 {
@@ -1663,7 +1667,7 @@ mod tests {
         ]);
         {
             let mut ds = dbc.inner.lock().unwrap();
-            ds.client = Some(client);
+            ds.wire.put_client_for_test(client);
         }
 
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
@@ -1704,8 +1708,8 @@ mod tests {
         drop(ss);
 
         let ds = dbc.inner.lock().unwrap();
-        assert!(ds.client.is_some());
-        assert_eq!(ds.active_stmt, None);
+        assert!(ds.wire.client().is_some());
+        assert_eq!(ds.wire.statement_owner(), None);
     }
 
     // Pins the branch `ATempTableParameterCannotBeDescribedButStillBinds` can
@@ -1730,7 +1734,7 @@ mod tests {
         ]);
         {
             let mut ds = dbc.inner.lock().unwrap();
-            ds.client = Some(client);
+            ds.wire.put_client_for_test(client);
         }
 
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
@@ -1770,8 +1774,11 @@ mod tests {
         drop(ss);
 
         let ds = dbc.inner.lock().unwrap();
-        assert!(ds.client.is_some(), "the client must come back for reuse");
-        assert_eq!(ds.active_stmt, None);
+        assert!(
+            ds.wire.client().is_some(),
+            "the client must come back for reuse"
+        );
+        assert_eq!(ds.wire.statement_owner(), None);
     }
 
     #[test]
