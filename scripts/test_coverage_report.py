@@ -301,12 +301,21 @@ def queued_api(monkeypatch, responses):
         calls.append(url)
         endpoint, values = pending.pop(0)
         parsed = urlparse(url)
-        if endpoint == "builds":
+        if endpoint in ("builds", "successful"):
             assert parsed.path.endswith("/builds")
             query = parse_qs(parsed.query)
             assert query["definitions"] == ["2267"]
             assert query["branchName"] == ["refs/pull/710/merge"]
-            assert query["queryOrder"] == ["queueTimeDescending"]
+            if endpoint == "successful":
+                assert query["queryOrder"] == ["finishTimeDescending"]
+                assert query["statusFilter"] == ["completed"]
+                assert query["resultFilter"] == ["succeeded"]
+                assert query["$top"] == ["200"]
+            else:
+                assert query["queryOrder"] == ["queueTimeDescending"]
+        elif isinstance(endpoint, str) and endpoint.startswith("timeline:"):
+            assert parsed.path.endswith(f"/builds/{endpoint.split(':')[1]}/timeline")
+            return {"records": values}
         else:
             assert parsed.path.endswith(f"/builds/{endpoint}/artifacts")
         return {"value": values}
@@ -540,3 +549,92 @@ def test_github_head_rejects_invalid_sha(monkeypatch, sha):
     monkeypatch.setattr(polling, "get_json", lambda url, **kwargs: {"head": {"sha": sha}})
     with pytest.raises(ValueError, match="Invalid PR source SHA"):
         polling.github_head("710")
+
+
+def duplicate_timeline(**changes):
+    stages = {"EvaluateDuplicate": "succeeded", "Build": "skipped", "Coverage": "skipped"}
+    stages.update(changes)
+    return [{"type": "Stage", "identifier": name, "result": result} for name, result in stages.items()]
+
+
+def test_poll_reuses_original_coverage_after_duplicate_finishes(monkeypatch, poll_clock):
+    original = ado_build()
+    completed = ado_build(status="completed", result="succeeded")
+    duplicate = ado_build(102, status="completed", result="succeeded")
+    pending, _ = queued_api(monkeypatch, [
+        ("builds", [original]), (101, []),
+        ("builds", [duplicate, completed]), (102, []),
+        ("timeline:102", duplicate_timeline()),
+        ("successful", [duplicate, completed]), (101, [{"name": "CoberturaCoverage"}]),
+        ("builds", [duplicate, completed]),
+    ])
+    assert polling.wait_for_artifact("710") == (101, "a" * 40)
+    assert poll_clock.sleeps == [300]
+    assert not pending
+
+
+def test_duplicate_lookup_skips_chains_and_other_heads(monkeypatch, poll_clock):
+    original = ado_build(status="completed", result="succeeded")
+    duplicate = ado_build(103, status="completed", result="succeeded")
+    earlier_duplicate = ado_build(102, status="completed", result="succeeded")
+    other_head = ado_build(99, sha="b" * 40, status="completed", result="succeeded")
+    other_pr = ado_build(98, status="completed", result="succeeded", pr="711")
+    pending, calls = queued_api(monkeypatch, [
+        ("builds", [duplicate]), (103, []),
+        ("timeline:103", duplicate_timeline()),
+        ("successful", [duplicate, other_head, other_pr, earlier_duplicate, original]),
+        (102, []), (101, [{"name": "CoberturaCoverage"}]),
+        ("builds", [duplicate]),
+    ])
+    assert polling.wait_for_artifact("710") == (101, "a" * 40)
+    assert not any("/99/artifacts" in url or "/98/artifacts" in url for url in calls)
+    assert not pending
+
+
+@pytest.mark.parametrize("changes", [
+    {"EvaluateDuplicate": "skipped"},
+    {"Build": "succeeded"},
+    {"Coverage": "succeeded"},
+    {"Coverage": None},
+])
+def test_poll_does_not_reuse_coverage_without_duplicate_stage_results(monkeypatch, poll_clock, changes):
+    build = ado_build(status="completed", result="succeeded")
+    pending, calls = queued_api(monkeypatch, [
+        ("builds", [build]), (101, []),
+        ("timeline:101", duplicate_timeline(**changes)),
+    ])
+    with pytest.raises(TimeoutError):
+        polling.wait_for_artifact("710", timeout=30)
+    assert len(calls) == 3
+    assert not pending
+
+
+def test_poll_follows_new_head_after_duplicate_coverage_lookup(monkeypatch, poll_clock):
+    github_heads(monkeypatch, "a", "b", "b", "b")
+    original = ado_build(status="completed", result="succeeded")
+    duplicate = ado_build(102, status="completed", result="succeeded")
+    replacement = ado_build(103, sha="b" * 40)
+    pending, _ = queued_api(monkeypatch, [
+        ("builds", [duplicate]), (102, []),
+        ("timeline:102", duplicate_timeline()),
+        ("successful", [original]), (101, [{"name": "CoberturaCoverage"}]),
+        ("builds", [duplicate]),
+        ("builds", [replacement, duplicate]), (103, [{"name": "CoberturaCoverage"}]),
+        ("builds", [replacement, duplicate]),
+    ])
+    assert polling.wait_for_artifact("710") == (103, "b" * 40)
+    assert not pending
+
+
+def test_duplicate_lookup_without_available_coverage_stays_bounded(monkeypatch, poll_clock):
+    duplicate = ado_build(102, status="completed", result="succeeded")
+    original = ado_build(status="completed", result="succeeded")
+    pending, _ = queued_api(monkeypatch, [
+        ("builds", [duplicate]), (102, []),
+        ("timeline:102", duplicate_timeline()),
+        ("successful", [duplicate, original]), (101, []),
+    ])
+    with pytest.raises(TimeoutError):
+        polling.wait_for_artifact("710", timeout=30)
+    assert poll_clock.sleeps == [30]
+    assert not pending

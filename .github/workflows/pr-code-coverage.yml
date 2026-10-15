@@ -10,6 +10,7 @@ name: PR Code Coverage
 # lines changed in the PR. The result is posted as a sticky PR comment.
 # Each poll refreshes the latest build, including replacements after a push.
 # Builds must match the current GitHub PR head, even before ADO queues a new run.
+# Confirmed duplicate-validation skips reuse successful coverage for the same head.
 # Checkout follows artifact selection so coverage and source use the same SHA.
 #
 # Triggers:

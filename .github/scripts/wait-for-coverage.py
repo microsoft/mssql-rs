@@ -4,6 +4,7 @@
 """Follow the PR's latest ADO build until its coverage artifact is available."""
 
 import argparse
+from collections.abc import Iterator
 import json
 import os
 from pathlib import Path
@@ -40,14 +41,22 @@ def github_head(pr_number: str) -> str:
     return validate_sha(pr["head"]["sha"])
 
 
-def latest_build(pr_number: str) -> dict | None:
-    query = urlencode({
+def builds_for_pr(pr_number: str, *, successful: bool = False) -> Iterator[dict]:
+    parameters = {
         "definitions": "2267",
         "branchName": f"refs/pull/{pr_number}/merge",
         "queryOrder": "queueTimeDescending",
         "$top": "10",
         "api-version": "7.1",
-    })
+    }
+    if successful:
+        parameters.update({
+            "statusFilter": "completed",
+            "resultFilter": "succeeded",
+            "queryOrder": "finishTimeDescending",
+            "$top": "200",
+        })
+    query = urlencode(parameters)
     builds = get_json(f"{BUILD_API}/builds?{query}")["value"]
     for build in builds:
         trigger = build.get("triggerInfo", {})
@@ -60,12 +69,44 @@ def latest_build(pr_number: str) -> dict | None:
             or trigger.get("pr.sourceCommitId")
             or trigger.get("pr.headSha")
         )
-        return build
-    return None
+        yield build
+
+
+def latest_build(pr_number: str) -> dict | None:
+    return next(builds_for_pr(pr_number), None)
 
 
 def canceled(build: dict) -> bool:
     return build["status"] == "cancelling" or build.get("result") == "canceled"
+
+
+def has_coverage(build_id: int) -> bool:
+    artifacts = get_json(f"{BUILD_API}/builds/{build_id}/artifacts?api-version=7.1")["value"]
+    matches = [item for item in artifacts if item["name"] == "CoberturaCoverage"]
+    if len(matches) > 1:
+        raise ValueError("Multiple CoberturaCoverage artifacts found")
+    return bool(matches)
+
+
+def duplicate_coverage(pr_number: str, build: dict, head_sha: str) -> int | None:
+    if build["status"] != "completed" or build.get("result") != "succeeded":
+        return None
+    records = get_json(f"{BUILD_API}/builds/{build['id']}/timeline?api-version=7.1")["records"]
+    stages = {record["identifier"]: record.get("result") for record in records if record["type"] == "Stage"}
+    # EvaluateDuplicate succeeds only for ordinary PR validation; its true
+    # output skips both Build and Coverage in validation-stages.yml.
+    if not (stages.get("EvaluateDuplicate") == "succeeded"
+            and stages.get("Build") == "skipped" and stages.get("Coverage") == "skipped"):
+        return None
+    # Match the duplicate guard's bounded history window, skipping duplicate chains.
+    for prior in builds_for_pr(pr_number, successful=True):
+        if (prior["id"] != build["id"] and prior["status"] == "completed"
+                and prior.get("result") == "succeeded"
+                and prior["triggerInfo"]["pr.sourceSha"] == head_sha
+                and has_coverage(prior["id"])):
+            print(f"Using coverage from build {prior['id']} for duplicate build {build['id']}...", flush=True)
+            return prior["id"]
+    return None
 
 
 def wait_for_artifact(pr_number: str, timeout: float = 75 * 60) -> tuple[int, str]:
@@ -87,18 +128,15 @@ def wait_for_artifact(pr_number: str, timeout: float = 75 * 60) -> tuple[int, st
             if build.get("result") == "failed":
                 raise RuntimeError(f"Azure DevOps build {build_id} failed; cannot report coverage")
             print(f"Checking coverage artifact for build {build_id} ({build['status']})...", flush=True)
-            artifacts = get_json(f"{BUILD_API}/builds/{build_id}/artifacts?api-version=7.1")["value"]
-            matches = [item for item in artifacts if item["name"] == "CoberturaCoverage"]
-            if len(matches) > 1:
-                raise ValueError("Multiple CoberturaCoverage artifacts found")
-            if matches:
+            coverage_id = build_id if has_coverage(build_id) else duplicate_coverage(pr_number, build, head_sha)
+            if coverage_id is not None:
                 # A push can precede its ADO build, including during this request.
                 current = latest_build(pr_number)
                 if (current is not None and current["id"] == build_id
                         and current["triggerInfo"]["pr.sourceSha"] == head_sha
                         and not canceled(current) and current.get("result") != "failed"
                         and github_head(pr_number) == head_sha):
-                    return build_id, head_sha
+                    return coverage_id, head_sha
                 continue
             delay = random.randint(300, 600)
         remaining = deadline - time.monotonic()
