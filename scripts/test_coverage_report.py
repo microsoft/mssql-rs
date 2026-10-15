@@ -9,6 +9,7 @@ from pathlib import Path
 import stat
 import subprocess
 from types import SimpleNamespace
+from urllib.error import HTTPError
 from urllib.parse import parse_qs, urlparse
 import xml.etree.ElementTree as ET
 import zipfile
@@ -318,6 +319,8 @@ def queued_api(monkeypatch, responses):
             return {"records": values}
         else:
             assert parsed.path.endswith(f"/builds/{endpoint}/artifacts")
+        if isinstance(values, Exception):
+            raise values
         return {"value": values}
     monkeypatch.setattr(polling, "get_json", get_json)
     return pending, calls
@@ -637,4 +640,77 @@ def test_duplicate_lookup_without_available_coverage_stays_bounded(monkeypatch, 
     with pytest.raises(TimeoutError):
         polling.wait_for_artifact("710", timeout=30)
     assert poll_clock.sleeps == [30]
+    assert not pending
+
+
+@pytest.mark.parametrize("status", [408, 429, 500, 502, 503, 504])
+def test_poll_recovers_from_transient_artifact_errors(monkeypatch, poll_clock, status):
+    old = ado_build()
+    new = ado_build(102)
+    error = HTTPError("https://dev.azure.com/artifacts", status, "temporary", {}, None)
+    pending, _ = queued_api(monkeypatch, [
+        ("builds", [old]), (101, error),
+        ("builds", [new]), (102, [{"name": "CoberturaCoverage"}]),
+        ("builds", [new]),
+    ])
+    assert polling.wait_for_artifact("710") == (102, "a" * 40)
+    assert poll_clock.sleeps == [10]
+    assert not pending
+
+
+def test_poll_retry_backoff_does_not_reset_deadline(monkeypatch, poll_clock):
+    errors = [
+        ("builds", HTTPError("https://dev.azure.com/builds", 503, "temporary", {}, None))
+        for _ in range(8)
+    ]
+    pending, _ = queued_api(monkeypatch, errors)
+    with pytest.raises(TimeoutError, match="within 1000 seconds"):
+        polling.wait_for_artifact("710", timeout=1000)
+    assert poll_clock.sleeps == [10, 20, 40, 80, 160, 300, 300, 90]
+    assert not pending
+
+
+def test_poll_resets_backoff_after_successful_api_calls(monkeypatch, poll_clock):
+    build = ado_build()
+    error = HTTPError("https://dev.azure.com/artifacts", 503, "temporary", {}, None)
+    pending, _ = queued_api(monkeypatch, [
+        ("builds", [build]), (101, error),
+        ("builds", [build]), (101, []),
+        ("builds", [build]), (101, error),
+        ("builds", [build]), (101, [{"name": "CoberturaCoverage"}]),
+        ("builds", [build]),
+    ])
+    assert polling.wait_for_artifact("710") == (101, "a" * 40)
+    assert poll_clock.sleeps == [10, 300, 10]
+    assert not pending
+
+
+def test_poll_recovers_from_request_timeout(monkeypatch, poll_clock):
+    build = ado_build()
+    pending, _ = queued_api(monkeypatch, [
+        ("builds", TimeoutError("request timed out")),
+        ("builds", [build]), (101, [{"name": "CoberturaCoverage"}]),
+        ("builds", [build]),
+    ])
+    assert polling.wait_for_artifact("710") == (101, "a" * 40)
+    assert poll_clock.sleeps == [10]
+    assert not pending
+
+
+@pytest.mark.parametrize("status", [400, 401, 403, 404, 422])
+def test_poll_does_not_retry_permanent_http_errors(monkeypatch, poll_clock, status):
+    error = HTTPError("https://dev.azure.com/builds", status, "permanent", {}, None)
+    pending, _ = queued_api(monkeypatch, [("builds", error)])
+    with pytest.raises(HTTPError):
+        polling.wait_for_artifact("710")
+    assert not poll_clock.sleeps
+    assert not pending
+
+
+def test_poll_does_not_retry_invalid_json(monkeypatch, poll_clock):
+    error = json.JSONDecodeError("invalid", "", 0)
+    pending, _ = queued_api(monkeypatch, [("builds", error)])
+    with pytest.raises(json.JSONDecodeError):
+        polling.wait_for_artifact("710")
+    assert not poll_clock.sleeps
     assert not pending

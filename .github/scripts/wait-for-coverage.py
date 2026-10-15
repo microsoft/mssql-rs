@@ -11,6 +11,7 @@ from pathlib import Path
 import random
 import re
 import time
+from urllib.error import HTTPError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
@@ -113,32 +114,43 @@ def wait_for_artifact(pr_number: str, timeout: float = 75 * 60) -> tuple[int, st
     if not re.fullmatch(r"[1-9][0-9]*", pr_number):
         raise ValueError("Invalid PR number")
     deadline = time.monotonic() + timeout
+    retry_delay = 10
     while time.monotonic() < deadline:
-        head_sha = github_head(pr_number)
-        build = latest_build(pr_number)
         delay = 10
-        if build is None:
-            print(f"Waiting for an ADO build for PR #{pr_number}...", flush=True)
-        elif build["triggerInfo"]["pr.sourceSha"] != head_sha:
-            print(f"Waiting for an ADO build for PR #{pr_number} head {head_sha}...", flush=True)
-        elif canceled(build):
-            print(f"Build {build['id']} was canceled; waiting for its replacement...", flush=True)
+        try:
+            head_sha = github_head(pr_number)
+            build = latest_build(pr_number)
+            if build is None:
+                print(f"Waiting for an ADO build for PR #{pr_number}...", flush=True)
+            elif build["triggerInfo"]["pr.sourceSha"] != head_sha:
+                print(f"Waiting for an ADO build for PR #{pr_number} head {head_sha}...", flush=True)
+            elif canceled(build):
+                print(f"Build {build['id']} was canceled; waiting for its replacement...", flush=True)
+            else:
+                build_id = build["id"]
+                if build.get("result") == "failed":
+                    raise RuntimeError(f"Azure DevOps build {build_id} failed; cannot report coverage")
+                print(f"Checking coverage artifact for build {build_id} ({build['status']})...", flush=True)
+                coverage_id = build_id if has_coverage(build_id) else duplicate_coverage(pr_number, build, head_sha)
+                if coverage_id is not None:
+                    # A push can precede its ADO build, including during this request.
+                    current = latest_build(pr_number)
+                    if (current is not None and current["id"] == build_id
+                            and current["triggerInfo"]["pr.sourceSha"] == head_sha
+                            and not canceled(current) and current.get("result") != "failed"
+                            and github_head(pr_number) == head_sha):
+                        return coverage_id, head_sha
+                    retry_delay = 10
+                    continue
+                delay = random.randint(300, 600)
+        except (HTTPError, TimeoutError) as error:
+            if isinstance(error, HTTPError) and error.code not in (408, 429, 500, 502, 503, 504):
+                raise
+            print(f"Temporary coverage API failure: {error}; retrying within the polling deadline.", flush=True)
+            delay = retry_delay
+            retry_delay = min(retry_delay * 2, 300)
         else:
-            build_id = build["id"]
-            if build.get("result") == "failed":
-                raise RuntimeError(f"Azure DevOps build {build_id} failed; cannot report coverage")
-            print(f"Checking coverage artifact for build {build_id} ({build['status']})...", flush=True)
-            coverage_id = build_id if has_coverage(build_id) else duplicate_coverage(pr_number, build, head_sha)
-            if coverage_id is not None:
-                # A push can precede its ADO build, including during this request.
-                current = latest_build(pr_number)
-                if (current is not None and current["id"] == build_id
-                        and current["triggerInfo"]["pr.sourceSha"] == head_sha
-                        and not canceled(current) and current.get("result") != "failed"
-                        and github_head(pr_number) == head_sha):
-                    return coverage_id, head_sha
-                continue
-            delay = random.randint(300, 600)
+            retry_delay = 10
         remaining = deadline - time.monotonic()
         if remaining > 0:
             time.sleep(min(delay, remaining))
