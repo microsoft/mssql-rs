@@ -1,0 +1,92 @@
+# Opens version bump pull requests against GitHub microsoft/mssql-rs on the
+# first and third Tuesday of each month.
+#
+# The pipeline source is GitHub microsoft/mssql-rs, so the checkout's
+# persistCredentials leaves the Azure Pipelines GitHub App installation token in
+# the local git config. That token is reused to push the bump branches and to
+# call the GitHub REST API, so no PAT or extra secret is required.
+#
+# Prerequisites:
+# - GitHub microsoft/mssql-rs configured as this pipeline's source repository
+#   through the github.com_microsoft service connection.
+# - No scheduled trigger defined in the pipeline settings UI: a UI schedule
+#   silently overrides the YAML schedule below.
+
+trigger: none
+
+pr: none
+
+schedules:
+# Fires every Tuesday; the cadence guard below keeps only the 1st and 3rd. The
+# ordinal check is not expressed in the cron day-of-month field because cron
+# implementations disagree on whether a restricted day of month and day of week
+# combine with AND or OR.
+- cron: '30 7 * * 2'
+  displayName: Tuesdays 07:30 UTC (13:00 IST) - guarded to 1st and 3rd
+  branches:
+    include:
+    - main
+  always: true
+
+variables:
+# This pipeline only edits manifests, moves git refs, and calls the GitHub API;
+# nothing is compiled, so the org decorator's injection only adds job time.
+- name: Codeql.SkipTaskAutoInjection
+  value: true
+
+pool:
+  vmImage: ubuntu-latest
+
+steps:
+- checkout: self
+  # The job pushes new branches, which a shallow clone cannot do reliably.
+  fetchDepth: 0
+  persistCredentials: true
+
+- script: |
+    set -euo pipefail
+    DAY=$(date -u +%-d)
+    # Days 1-7 hold exactly one Tuesday, as do days 15-21.
+    if [ "${BUILD_REASON:-}" != "Schedule" ]; then
+      DUE=true
+      echo "Manual run: skipping the 1st/3rd Tuesday check."
+    elif [ "$DAY" -le 7 ] || { [ "$DAY" -ge 15 ] && [ "$DAY" -le 21 ]; }; then
+      DUE=true
+    else
+      DUE=false
+    fi
+    echo "UTC day of month $DAY, due=$DUE"
+    echo "##vso[task.setvariable variable=due]$DUE"
+  displayName: Check cadence
+
+- script: |
+    set -euo pipefail
+    KEY="$(git config --list | sed -n 's/^\(http\..*\.extraheader\)=.*/\1/p' | head -n1)"
+    if [ -z "$KEY" ]; then
+      echo "No persisted GitHub credential found; cannot push or open pull requests."
+      exit 1
+    fi
+    HEADER="$(git config --get "$KEY")"
+    DECODED="$(printf '%s' "${HEADER##* }" | base64 -d)"
+    TOKEN="${DECODED#*:}"
+    if [ -z "$TOKEN" ]; then
+      echo "Persisted credential at $KEY has no token component."
+      exit 1
+    fi
+    # Register as a secret so it is masked everywhere downstream.
+    echo "##vso[task.setvariable variable=ghToken;issecret=true]$TOKEN"
+    echo "Extracted GitHub token from $KEY."
+  displayName: Read GitHub token from checkout credentials
+  condition: eq(variables['due'], 'true')
+
+- script: python3 scripts/bump-released-versions.py
+  displayName: Open version bump pull requests
+  condition: eq(variables['due'], 'true')
+  env:
+    GH_TOKEN: $(ghToken)
+    GITHUB_REPOSITORY: microsoft/mssql-rs
+    DEFAULT_BRANCH: main
+    GIT_AUTHOR_NAME: Azure Pipelines
+    GIT_AUTHOR_EMAIL: azuredevops@microsoft.com
+    GIT_COMMITTER_NAME: Azure Pipelines
+    GIT_COMMITTER_EMAIL: azuredevops@microsoft.com
