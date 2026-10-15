@@ -17,7 +17,7 @@
 //! Diagnostic output may contain unobfuscated server names, host names, and IP addresses. Review the output before sharing it.
 //!
 //! sqlcmd diagnose: tcp:db01,1433
-//! Depth: Network reachability; SqlPassword login user-1; encrypt mandatory; server certificate trusted (-C)
+//! Depth: Session validation (default); SqlPassword login user-1; encrypt mandatory; server certificate trusted (-C)
 //! Database and user names are shown as labels (database-1, user-1); --local-detail shows them.
 //!
 //!   Check                 Result          Time  Details
@@ -25,9 +25,12 @@
 //!   Name resolution       PASSED          9 ms  db01: 10.0.0.1, 10.0.0.2
 //!   Instance resolution   N/A                   not a named instance
 //!   TCP connect           PASSED          2 ms  port 1433: 10.0.0.1 connected, 10.0.0.2 refused
+//!   Connection attempt    PASSED        160 ms  pre-login <1 ms, TLS 13 ms, login 136 ms; encryption mandatory
+//!   Session validation    PASSED          3 ms  sqlServer (engine edition 3)
 //!
 //! Outcome:   passed (exit code 0: every check at the requested depth passed)
-//! Execution: completed; deepest phase evaluated: Network reachability
+//! Execution: completed; deepest phase evaluated: Session validation
+//! Server:    SQL Server 17.0.4085 (DB01), database database-1, encrypted
 //! ```
 
 use std::fmt::Write;
@@ -36,6 +39,7 @@ use serde::ser::SerializeMap;
 use serde::{Serialize, Serializer};
 
 use super::redact::{Category, Redactor};
+use super::stages::Step;
 use super::target::Protocol;
 use super::{Check, Coverage, Depth, Report, SettingOrigin, SettingSources, Skip};
 use crate::formatter::json::{PLATFORM, to_json_string, utc_timestamp};
@@ -156,6 +160,12 @@ fn redactor(report: &Report) -> Redactor {
             r.name(Category::Address, &attempt.address.to_string());
         }
     }
+    if let Some(server) = &report.server {
+        if let Some(name) = &server.name {
+            r.name(Category::Server, name);
+        }
+        r.name(Category::Database, &server.database);
+    }
     r
 }
 
@@ -179,7 +189,6 @@ fn skip_text(skip: &Skip) -> String {
         ),
         Skip::NotApplicable(why) => (*why).to_string(),
         Skip::Canceled => "canceled before it finished".to_string(),
-        Skip::NotInThisBuild => "not checked by this build".to_string(),
     }
 }
 
@@ -189,7 +198,6 @@ fn skip_reason(skip: &Skip) -> &'static str {
         Skip::PortRequired => "explicitPortRequired",
         Skip::NotApplicable(_) => "notApplicable",
         Skip::Canceled => "canceled",
-        Skip::NotInThisBuild => "notCheckedByThisBuild",
     }
 }
 
@@ -201,6 +209,40 @@ fn ms_text(ms: u64) -> String {
     } else {
         format!("{ms} ms")
     }
+}
+
+/// A phase's status: one with no result (the attempt ended while it was in
+/// progress) failed only when it is the check's `failedPhase`, the one that
+/// ran out of time; otherwise it was abandoned.
+fn phase_status(phase: &Step, failed_phase: Option<&str>) -> &'static str {
+    match phase.ok {
+        Some(true) => "passed",
+        Some(false) => "failed",
+        None if failed_phase == Some(phase.stage.name()) => "failed",
+        None => "abandoned",
+    }
+}
+
+fn phases_text(phases: &[Step], failed_phase: Option<&str>) -> String {
+    phases
+        .iter()
+        .map(|p| {
+            format!(
+                "{} {}{}",
+                p.stage
+                    .title()
+                    .to_lowercase()
+                    .replace("tls handshake", "TLS"),
+                ms_text(p.duration_ms),
+                match phase_status(p, failed_phase) {
+                    "passed" => "",
+                    "failed" => " FAILED",
+                    _ => " ABANDONED",
+                }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn settings_text(sources: &SettingSources) -> Option<String> {
@@ -345,8 +387,48 @@ fn check_text(check: &Check, protocol: Option<Protocol>, r: &mut Redactor) -> St
                 .collect();
             format!("port {}: {}", field("port"), attempts.join(", "))
         }
-        // Not run by this build: skipped, so described above.
-        super::CheckId::ConnectionAttempt | super::CheckId::SessionValidation => String::new(),
+        super::CheckId::ConnectionAttempt => {
+            let mut text = phases_text(&check.subphases, check.field("failedPhase"));
+            if let Some(transport) = check.field("transport") {
+                let pipe = named(r, "pipe");
+                if pipe.is_empty() {
+                    let _ = write!(text, "; over {transport}");
+                } else {
+                    let _ = write!(text, "; over {transport} {}", pipe.join(""));
+                }
+            }
+            if check.field("redirected") == Some("true") {
+                text.push_str("; redirected");
+            }
+            if let Some(encryption) = check.field("encryption") {
+                let _ = write!(text, "; encryption {encryption}");
+            }
+            if let Some(tls) = check.field("tlsFailure") {
+                let _ = write!(text, "; TLS failure: {tls}");
+            }
+            let spn = named(r, "spn");
+            if !spn.is_empty() {
+                let _ = write!(text, "; SPN {}", spn.join(""));
+            }
+            if let Some(cache) = check.field("kerberosTicketCache") {
+                let _ = write!(text, "; ticket cache {cache}");
+            }
+            // With no phase timings the first detail leads the text.
+            text.strip_prefix("; ").map_or(text.clone(), str::to_string)
+        }
+        super::CheckId::SessionValidation => {
+            let mut text = match check.field("targetType") {
+                Some(target) => format!(
+                    "{target} (engine edition {})",
+                    check.field("engineEdition").unwrap_or("?")
+                ),
+                None => String::new(),
+            };
+            if let Some(offset) = check.field("clockOffsetMs") {
+                let _ = write!(text, "; server clock {offset} ms from the client's");
+            }
+            text
+        }
     }
 }
 
@@ -456,6 +538,33 @@ pub fn text(report: &Report) -> String {
             .deepest_phase_evaluated()
             .map_or("none", Depth::title)
     );
+    if let Some(auth) = report.authentication {
+        let _ = writeln!(
+            out,
+            "Login:     {} {}",
+            request.authentication.name(),
+            auth.name()
+        );
+    }
+    if let Some(server) = &report.server {
+        let _ = write!(out, "Server:    SQL Server");
+        if let Some(version) = &server.version {
+            let _ = write!(out, " {version}");
+        }
+        if let Some(name) = &server.name {
+            let _ = write!(out, " ({})", r.name(Category::Server, name));
+        }
+        let _ = write!(
+            out,
+            ", database {}, {}",
+            r.name(Category::Database, &server.database),
+            encrypted_text(report, server.encrypted)
+        );
+        if let Some(target_type) = server.target_type() {
+            let _ = write!(out, ", {target_type}");
+        }
+        out.push('\n');
+    }
 
     if !report.findings.is_empty() {
         out.push_str("\nFindings:\n");
@@ -485,6 +594,12 @@ pub fn text(report: &Report) -> String {
         } else {
             let _ = writeln!(out, " - {SPECIALIST_NOTE}");
         }
+    }
+    if let Some(guide) = report.tracing_guide {
+        let _ = writeln!(
+            out,
+            "Driver tracing can show more than these checks; see {guide}"
+        );
     }
     // A transport the client moved past is in the JSON report only; each line
     // once, wherever it repeats. Without a line to print, no heading either.
@@ -590,6 +705,20 @@ pub fn json(report: &Report, version: &str) -> Result<String, serde_json::Error>
             .iter()
             .map(|check| CheckView::new(check, &request.sources, &mut r))
             .collect(),
+        authentication: report.authentication.map(|auth| AuthenticationView {
+            method: request.authentication.name(),
+            outcome: auth.name(),
+        }),
+        server: report.server.as_ref().map(|server| ServerView {
+            name: server
+                .name
+                .as_deref()
+                .map(|name| r.name(Category::Server, name)),
+            version: server.version.as_deref(),
+            database: r.name(Category::Database, &server.database),
+            encrypted: server.encrypted,
+            target_type: server.target_type(),
+        }),
         findings: report
             .findings
             .iter()
@@ -599,6 +728,7 @@ pub fn json(report: &Report, version: &str) -> Result<String, serde_json::Error>
                 text: r.text(&finding.text),
             })
             .collect(),
+        tracing_guide: report.tracing_guide,
         specialist_domain: report.domain.as_ref().map(|domain| DomainView {
             primary: domain.primary,
             candidates: &domain.candidates,
@@ -637,6 +767,25 @@ pub fn json(report: &Report, version: &str) -> Result<String, serde_json::Error>
     to_json_string(&document, ONE_LINE_DEPTH)
 }
 
+/// The session's encryption: from the mode pre-login negotiated when the
+/// connection attempt recorded it, since an unencrypted session after login
+/// can mean only the login was encrypted or nothing was.
+fn encrypted_text(report: &Report, encrypted: bool) -> &'static str {
+    if encrypted {
+        return "encrypted";
+    }
+    let negotiated = report
+        .checks
+        .iter()
+        .find(|c| c.id == super::CheckId::ConnectionAttempt)
+        .and_then(|c| c.field("encryption"));
+    match negotiated {
+        Some("off") => "not encrypted",
+        Some("loginOnly") => "only the login encrypted",
+        _ => "not encrypted after login",
+    }
+}
+
 /// Whether a finding quotes a message from outside sqlcmd.
 fn quotes_messages(report: &Report) -> bool {
     report.findings.iter().any(|f| f.quotes_message)
@@ -668,7 +817,13 @@ struct ReportView<'a> {
     exit_code: i32,
     exit_category: ExitCategoryView,
     checks: Vec<CheckView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    authentication: Option<AuthenticationView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    server: Option<ServerView<'a>>,
     findings: Vec<FindingView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tracing_guide: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     specialist_domain: Option<DomainView<'a>>,
     errors: Vec<ErrorView<'a>>,
@@ -783,6 +938,22 @@ struct ExitCategoryView {
 }
 
 #[derive(Serialize)]
+struct AuthenticationView {
+    method: &'static str,
+    outcome: &'static str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ServerView<'a> {
+    name: Option<String>,
+    version: Option<&'a str>,
+    database: String,
+    encrypted: bool,
+    target_type: Option<&'static str>,
+}
+
+#[derive(Serialize)]
 struct FindingView {
     certainty: &'static str,
     check: &'static str,
@@ -831,7 +1002,8 @@ fn is_false(value: &bool) -> bool {
 /// One check. Its own fields (`protocol`, `host`, `port`, `addresses`, ...)
 /// vary by check, so the entry is written by hand, in this order: the check,
 /// its depth and status, its duration, why it was skipped, its fields, where
-/// its settings came from (connection input), then its connection attempts.
+/// its settings came from (connection input), then its connection attempts and
+/// handshake phases.
 struct CheckView {
     check: &'static str,
     depth: &'static str,
@@ -842,6 +1014,7 @@ struct CheckView {
     fields: Vec<(&'static str, FieldValue)>,
     sources: Option<SourcesView>,
     attempts: Vec<AttemptView>,
+    phases: Vec<PhaseView>,
 }
 
 enum SkipView {
@@ -858,8 +1031,8 @@ enum SkipView {
     },
 }
 
-/// A check's field: a list for `addresses`, a number for `port` when the
-/// value is one, otherwise text.
+/// A check's field: a list for `addresses`, a number for `port` and
+/// `engineEdition` when the value is one, otherwise text.
 #[derive(Serialize)]
 #[serde(untagged)]
 enum FieldValue {
@@ -876,6 +1049,14 @@ struct AttemptView {
     result: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     os_error: Option<i32>,
+    duration_ms: u64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PhaseView {
+    phase: &'static str,
+    status: &'static str,
     duration_ms: u64,
 }
 
@@ -899,7 +1080,10 @@ impl CheckView {
                 .collect();
             let value = if field.key == "addresses" {
                 FieldValue::List(values)
-            } else if let (true, Ok(number)) = (field.key == "port", values[0].parse::<i64>()) {
+            } else if let (true, Ok(number)) = (
+                matches!(field.key, "port" | "engineEdition" | "clockOffsetMs"),
+                values[0].parse::<i64>(),
+            ) {
                 FieldValue::Number(number)
             } else {
                 FieldValue::Text(values[0].clone())
@@ -936,6 +1120,15 @@ impl CheckView {
                     result: attempt.result.name(),
                     os_error: attempt.os_error,
                     duration_ms: attempt.duration_ms,
+                })
+                .collect(),
+            phases: check
+                .subphases
+                .iter()
+                .map(|phase| PhaseView {
+                    phase: phase.stage.name(),
+                    status: phase_status(phase, check.field("failedPhase")),
+                    duration_ms: phase.duration_ms,
                 })
                 .collect(),
         }
@@ -979,18 +1172,23 @@ impl Serialize for CheckView {
         if !self.attempts.is_empty() {
             map.serialize_entry("attempts", &self.attempts)?;
         }
+        if !self.phases.is_empty() {
+            map.serialize_entry("phases", &self.phases)?;
+        }
         map.end()
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::stages::Stage;
     use super::super::target::{Protocol, Target};
     use super::super::{
-        Certainty, CheckId, DiagnosticOutcome, Domain, ErrorRecord, ExecutionStatus, Field,
-        Finding, TcpAttempt, TcpResult,
+        AuthOutcome, Certainty, CheckId, DiagnosticOutcome, Domain, ErrorRecord, ExecutionStatus,
+        Field, Finding, ServerInfo, TcpAttempt, TcpResult,
     };
     use super::*;
+    use std::time::Instant;
 
     fn check(id: CheckId, coverage: Coverage, ms: u64, fields: Vec<Field>) -> Check {
         Check {
@@ -1000,14 +1198,28 @@ mod tests {
             deadline_ms: None,
             fields,
             attempts: Vec::new(),
+            subphases: Vec::new(),
             skip: None,
             domain: None,
         }
     }
 
+    fn phase(stage: Stage, ms: u64) -> Step {
+        let now = Instant::now();
+        Step {
+            stage,
+            ok: Some(true),
+            duration_ms: ms,
+            details: Vec::new(),
+            started: now,
+            ended: now,
+        }
+    }
+
     fn passing_report() -> Report {
-        let request =
-            crate::diagnostics::tests::request("tcp:db01,1433", Depth::NetworkReachability);
+        let mut request =
+            crate::diagnostics::tests::request("tcp:db01,1433", Depth::SessionValidation);
+        request.depth_selected = false;
         let mut tcp = check(
             CheckId::TcpConnect,
             Coverage::Passed,
@@ -1030,10 +1242,21 @@ mod tests {
                 duration_ms: 1,
             },
         ];
+        let mut attempt = check(
+            CheckId::ConnectionAttempt,
+            Coverage::Passed,
+            150,
+            vec![Field::plain("encryption", "mandatory")],
+        );
+        attempt.subphases = vec![
+            phase(Stage::Prelogin, 1),
+            phase(Stage::Tls, 12),
+            phase(Stage::Login, 130),
+        ];
         Report {
             request,
             start_unix_ms: 1_791_000_000_123,
-            duration_ms: 20,
+            duration_ms: 170,
             target: Some(Target {
                 protocol: Protocol::Tcp,
                 host: "db01".to_string(),
@@ -1070,10 +1293,29 @@ mod tests {
                     )
                 },
                 tcp,
+                attempt,
+                check(
+                    CheckId::SessionValidation,
+                    Coverage::Passed,
+                    3,
+                    vec![
+                        Field::plain("engineEdition", "3"),
+                        Field::plain("targetType", "sqlServer"),
+                    ],
+                ),
             ],
             findings: Vec::new(),
             errors: Vec::new(),
+            authentication: Some(AuthOutcome::Succeeded),
+            server: Some(ServerInfo {
+                name: Some("DB01".to_string()),
+                version: Some("17.0.4085".to_string()),
+                database: "master".to_string(),
+                encrypted: true,
+                engine_edition: Some(3),
+            }),
             domain: None,
+            tracing_guide: None,
             execution_status: ExecutionStatus::Completed,
             outcome: DiagnosticOutcome::Passed,
             limitations: vec!["A limitation.".to_string()],
@@ -1090,6 +1332,8 @@ mod tests {
             CheckId::ConnectionAttempt,
             Skip::BlockedBy(CheckId::TcpConnect),
         ));
+        report.authentication = None;
+        report.server = None;
         report.outcome = DiagnosticOutcome::IssueDetected;
         report.domain = Some(Domain {
             primary: "undetermined",
@@ -1134,7 +1378,7 @@ mod tests {
 Diagnostic output may contain unobfuscated server names, host names, and IP addresses. Review the output before sharing it.
 
 sqlcmd diagnose: tcp:db01,1433
-Depth: Network reachability; SqlPassword login user-1; encrypt mandatory; server certificate trusted (-C)
+Depth: Session validation (default); SqlPassword login user-1; encrypt mandatory; server certificate trusted (-C)
 Database and user names are shown as labels (database-1, user-1); --local-detail shows them.
 
   Check                 Result            Time  Details
@@ -1142,14 +1386,23 @@ Database and user names are shown as labels (database-1, user-1); --local-detail
   Name resolution       PASSED            9 ms  db01: 10.0.0.1, ::1
   Instance resolution   N/A                     not a named instance
   TCP connect           PASSED            2 ms  port 1433: 10.0.0.1 connected, ::1 refused (10061)
+  Connection attempt    PASSED          150 ms  pre-login 1 ms, TLS 12 ms, login 130 ms; encryption mandatory
+  Session validation    PASSED            3 ms  sqlServer (engine edition 3)
 
 Outcome:   passed (exit code 0: every check at the requested depth passed)
-Execution: completed; deepest phase evaluated: Network reachability
+Execution: completed; deepest phase evaluated: Session validation
+Login:     SqlPassword succeeded
+Server:    SQL Server 17.0.4085 (DB01), database database-1, encrypted, sqlServer
 
 Limitations:
   - A limitation.
 ";
         assert_eq!(text, expected);
+        let server = full
+            .lines()
+            .find(|line| line.starts_with("Server:"))
+            .unwrap();
+        assert!(!server.contains("packet size"), "{server}");
     }
 
     /// With only superseded errors, nothing follows the findings to carry the
@@ -1297,11 +1550,18 @@ Limitations:
 
     #[test]
     fn local_detail_shows_database_and_user_names() {
-        let mut report = failing_report();
+        let mut report = passing_report();
         report.request.database = Some("sales".to_string());
+        if let Some(server) = &mut report.server {
+            server.database = "sales".to_string();
+        }
         let default = text(&report);
         assert!(
             default.contains("SqlPassword login user-1; encrypt mandatory; database database-1;"),
+            "{default}"
+        );
+        assert!(
+            default.contains("(DB01), database database-1, encrypted"),
             "{default}"
         );
         let json_default = json(&report, "v").unwrap();
@@ -1325,26 +1585,33 @@ Limitations:
             text.contains("Local detail: database and user names are shown as they are.\n"),
             "{text}"
         );
-        assert!(text.contains("10.0.0.1 refused"), "{text}");
         assert!(
             text.contains("SqlPassword login sa; encrypt mandatory; database sales;"),
             "{text}"
         );
+        assert!(text.contains("(DB01), database sales, encrypted"), "{text}");
         let json = json(&report, "v").unwrap();
         assert!(json.contains("\"localDetail\": true"), "{json}");
         assert!(json.contains("\"server\": \"tcp:db01,1433\""), "{json}");
         assert!(json.contains("\"database\": \"sales\""), "{json}");
         assert!(json.contains("\"user\": \"sa\""), "{json}");
-        // Error text still needs review.
-        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(
-            value["reviewBeforeSharing"],
-            serde_json::json!(["errors[].message"]),
-            "{json}"
-        );
         for rendered in [&text, &json] {
             assert!(!rendered.contains("secret-password"), "{rendered}");
         }
+        // Error text still needs review with local detail.
+        let value: serde_json::Value =
+            serde_json::from_str(&super::json(&failing_report_with_local_detail(), "v").unwrap())
+                .unwrap();
+        assert_eq!(
+            value["reviewBeforeSharing"],
+            serde_json::json!(["errors[].message"])
+        );
+    }
+
+    fn failing_report_with_local_detail() -> Report {
+        let mut report = failing_report();
+        report.request.local_detail = true;
+        report
     }
 
     #[test]
@@ -1355,8 +1622,8 @@ Limitations:
             "\"command\": \"diagnose\"",
             "\"sharingWarning\": \"Diagnostic output may contain unobfuscated server names, host names, and IP addresses. Review the output before sharing it.\"",
             "\"localDetail\": false",
-            "\"requestedDepth\": \"networkReachability\"",
-            "\"deepestPhaseEvaluated\": \"networkReachability\"",
+            "\"requestedDepth\": \"sessionValidation\"",
+            "\"deepestPhaseEvaluated\": \"sessionValidation\"",
             "\"server\": \"tcp:db01,1433\"",
             "\"user\": \"user-1\"",
             "\"executionStatus\": \"completed\"",
@@ -1366,6 +1633,10 @@ Limitations:
             "\"addresses\": [\"10.0.0.1\", \"::1\"]",
             "{ \"check\": \"instanceResolution\", \"depth\": \"endpointResolution\", \"status\": \"notApplicable\", \"reason\": \"notApplicable\", \"detail\": \"not a named instance\" }",
             "{ \"address\": \"::1\", \"port\": 1433, \"result\": \"refused\", \"osError\": 10061, \"durationMs\": 1 }",
+            "\"phases\": [{ \"phase\": \"prelogin\", \"status\": \"passed\", \"durationMs\": 1 }",
+            "\"engineEdition\": 3",
+            "\"name\": \"DB01\"",
+            "\"targetType\": \"sqlServer\"",
             "\"findings\": []",
             "\"errors\": []",
             "\"reviewBeforeSharing\": []",
@@ -1373,6 +1644,7 @@ Limitations:
             assert!(json.contains(expected), "missing {expected} in {json}");
         }
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(value["server"].get("packetSize").is_none(), "{json}");
         assert_eq!(
             value["exitCategory"],
             serde_json::json!({
@@ -1380,27 +1652,12 @@ Limitations:
                 "meaning": "every check at the requested depth passed"
             })
         );
-    }
-
-    /// A check this build does not run yet is skipped, and says so.
-    #[test]
-    fn a_check_this_build_does_not_run_says_so() {
-        let mut report = passing_report();
-        report.checks.push(Check::skipped(
-            CheckId::ConnectionAttempt,
-            Skip::NotInThisBuild,
-        ));
-        assert!(
-            text(&report).contains(
-                "  Connection attempt    SKIPPED                 not checked by this build\n"
-            ),
-            "{}",
-            text(&report)
-        );
-        let json = json(&report, "v").unwrap();
-        assert!(
-            json.contains("{ \"check\": \"connectionAttempt\", \"depth\": \"connectionAttempt\", \"status\": \"skipped\", \"reason\": \"notCheckedByThisBuild\", \"detail\": \"not checked by this build\" }"),
-            "{json}"
+        assert_eq!(
+            value["authentication"],
+            serde_json::json!({
+                "method": "SqlPassword",
+                "outcome": "succeeded"
+            })
         );
     }
 
@@ -1448,11 +1705,37 @@ Limitations:
                 "note": "the area for a support handoff, not a confirmed cause."
             })
         );
-        // Its finding is sqlcmd's own sentence: only the errors.
+        // Its finding is sqlcmd's own sentence, with labels: only the errors.
         assert_eq!(
             value["reviewBeforeSharing"],
             serde_json::json!(["errors[].message"])
         );
+    }
+
+    /// A session unencrypted after login is described by the mode pre-login
+    /// negotiated: `-No` with no encryption is not called login-encrypted.
+    #[test]
+    fn an_unencrypted_session_says_what_was_negotiated() {
+        let mut report = passing_report();
+        report.server.as_mut().unwrap().encrypted = false;
+        for (negotiated, expected) in [
+            (Some("off"), ", not encrypted, "),
+            (Some("loginOnly"), ", only the login encrypted, "),
+            (None, ", not encrypted after login, "),
+        ] {
+            let attempt = report
+                .checks
+                .iter_mut()
+                .find(|c| c.id == CheckId::ConnectionAttempt)
+                .unwrap();
+            attempt.fields.retain(|f| f.key != "encryption");
+            if let Some(mode) = negotiated {
+                attempt.fields.push(Field::plain("encryption", mode));
+            }
+            let text = text(&report);
+            let server = text.lines().find(|l| l.starts_with("Server:")).unwrap();
+            assert!(server.contains(expected), "{negotiated:?}: {server}");
+        }
     }
 
     /// A finding that quotes an outside message is flagged even without
@@ -1541,6 +1824,53 @@ Limitations:
         let value: serde_json::Value = serde_json::from_str(&json(&report, "v").unwrap()).unwrap();
         assert_eq!(value["errors"][0]["superseded"], true);
         assert!(value["errors"][1].get("superseded").is_none(), "{value}");
+    }
+
+    #[test]
+    fn the_connection_attempt_names_a_transport_the_protocol_order_reached() {
+        let mut report = passing_report();
+        {
+            let attempt = report
+                .checks
+                .iter_mut()
+                .find(|c| c.id == CheckId::ConnectionAttempt)
+                .unwrap();
+            attempt.fields.push(Field::plain("transport", "namedPipe"));
+            attempt.fields.push(Field::identifier(
+                "pipe",
+                r"\\db01\pipe\sql\query",
+                Category::Pipe,
+            ));
+        }
+        let shared = text(&report);
+        assert!(
+            shared.contains(r"; over namedPipe \\db01\pipe\sql\query"),
+            "the pipe is shown as it is: {shared}"
+        );
+        report.request.local_detail = true;
+        let local = text(&report);
+        assert!(
+            local.contains(r"; over namedPipe \\db01\pipe\sql\query"),
+            "{local}"
+        );
+        report
+            .checks
+            .iter_mut()
+            .find(|c| c.id == CheckId::ConnectionAttempt)
+            .unwrap()
+            .subphases
+            .clear();
+        report.request.local_detail = false;
+        let no_phase = text(&report);
+        let line = no_phase
+            .lines()
+            .find(|line| line.contains("Connection attempt"))
+            .unwrap();
+        assert!(
+            line.contains(r"  over namedPipe \\db01\pipe\sql\query"),
+            "{line}\n{no_phase}"
+        );
+        assert!(!line.contains("  ; "), "{line}\n{no_phase}");
     }
 
     #[test]
@@ -1643,5 +1973,54 @@ Limitations:
         if cfg!(any(windows, target_os = "linux", target_os = "macos")) {
             assert!(value["client"]["osVersion"].is_string(), "{json}");
         }
+        assert!(value.get("tracingGuide").is_none(), "{json}");
+    }
+
+    /// The SPN names the endpoint: shown as it is.
+    #[test]
+    fn kerberos_evidence_shows_the_spn() {
+        let mut report = passing_report();
+        for check in &mut report.checks {
+            if check.id == CheckId::ConnectionAttempt {
+                check.fields.push(Field::identifier(
+                    "spn",
+                    "MSSQLSvc/db01.contoso.com:1433",
+                    Category::Spn,
+                ));
+                check
+                    .fields
+                    .push(Field::plain("kerberosTicketCache", "notFound"));
+            }
+        }
+        let text = text(&report);
+        assert!(
+            text.contains("; SPN MSSQLSvc/db01.contoso.com:1433; ticket cache notFound"),
+            "{text}"
+        );
+        let json = json(&report, "v").unwrap();
+        assert!(
+            json.contains(
+                "\"spn\": \"MSSQLSvc/db01.contoso.com:1433\", \"kerberosTicketCache\": \"notFound\""
+            ),
+            "{json}"
+        );
+    }
+
+    #[test]
+    fn an_inconclusive_attempt_points_to_driver_tracing() {
+        let mut report = failing_report();
+        report.tracing_guide = Some(crate::diagnostics::TRACING_GUIDE);
+        let text = text(&report);
+        assert!(
+            text.contains(
+                "Driver tracing can show more than these checks; see https://aka.ms/sqlcmd-diagnose-tracing\n"
+            ),
+            "{text}"
+        );
+        let json = json(&report, "v").unwrap();
+        assert!(
+            json.contains("\"tracingGuide\": \"https://aka.ms/sqlcmd-diagnose-tracing\""),
+            "{json}"
+        );
     }
 }
