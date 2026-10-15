@@ -508,7 +508,12 @@ def run_python_track(root, base_sha):
 
 def main():
     root = Path(__file__).resolve().parents[1]
-    base_sha = git(root, "rev-parse", "HEAD").strip()
+    # Branch from the default branch explicitly rather than from HEAD, so a run
+    # on any other ref still produces a bump containing only the version change.
+    base = os.environ["DEFAULT_BRANCH"]
+    git(root, "fetch", "--quiet", "origin", base)
+    base_sha = git(root, "rev-parse", "FETCH_HEAD").strip()
+    print(f"Basing bump branches on origin/{base} at {base_sha}.")
     failures = []
     for name, track in (("crates", run_crate_track), ("python", run_python_track)):
         try:

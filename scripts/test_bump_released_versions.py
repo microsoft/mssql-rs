@@ -607,13 +607,16 @@ def test_issue_api_errors_propagate():
 # --- track orchestration ----------------------------------------------------
 
 
-def test_main_runs_both_tracks_from_one_base_commit(tmp_path, monkeypatch):
+def test_main_runs_both_tracks_from_the_default_branch_tip(tmp_path, monkeypatch):
     monkeypatch.setattr(bump, "__file__", str(tmp_path / "scripts" / "bump.py"))
     with patch.object(bump, "git", return_value="abc123\n") as git, patch.object(
         bump, "run_crate_track"
     ) as crates, patch.object(bump, "run_python_track") as python:
         bump.main()
-    git.assert_called_once_with(tmp_path, "rev-parse", "HEAD")
+    # Bumps must branch from origin/main, not from whatever ref is checked out,
+    # so a run on another branch cannot sweep that branch's commits into the PR.
+    assert git.call_args_list[0].args == (tmp_path, "fetch", "--quiet", "origin", "main")
+    assert git.call_args_list[1].args == (tmp_path, "rev-parse", "FETCH_HEAD")
     crates.assert_called_once_with(tmp_path, "abc123")
     python.assert_called_once_with(tmp_path, "abc123")
 
