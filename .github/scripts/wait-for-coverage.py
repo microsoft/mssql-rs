@@ -11,7 +11,7 @@ from pathlib import Path
 import random
 import re
 import time
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
@@ -19,9 +19,28 @@ from urllib.request import Request, urlopen
 BUILD_API = "https://dev.azure.com/sqlclientdrivers/public/_apis/build"
 
 
-def get_json(url: str, *, headers: dict | None = None) -> dict:
-    with urlopen(Request(url, headers=headers or {}), timeout=60) as response:
-        return json.load(response)
+class PollingDeadlineExceeded(TimeoutError):
+    pass
+
+
+def remaining_time(deadline: float) -> float:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise PollingDeadlineExceeded("Coverage polling deadline exceeded")
+    return remaining
+
+
+def get_json(url: str, *, deadline: float, headers: dict | None = None) -> dict:
+    timeout = min(60, remaining_time(deadline))
+    try:
+        with urlopen(Request(url, headers=headers or {}), timeout=timeout) as response:
+            payload = json.load(response)
+    except URLError as error:
+        if isinstance(error.reason, TimeoutError):
+            raise error.reason from error
+        raise
+    remaining_time(deadline)
+    return payload
 
 
 def validate_sha(value: object) -> str:
@@ -30,9 +49,10 @@ def validate_sha(value: object) -> str:
     return value.lower()
 
 
-def github_head(pr_number: str) -> str:
+def github_head(pr_number: str, *, deadline: float) -> str:
     pr = get_json(
         f"https://api.github.com/repos/microsoft/mssql-rs/pulls/{pr_number}",
+        deadline=deadline,
         headers={
             "Authorization": f"Bearer {os.environ['GH_TOKEN']}",
             "Accept": "application/vnd.github+json",
@@ -42,7 +62,7 @@ def github_head(pr_number: str) -> str:
     return validate_sha(pr["head"]["sha"])
 
 
-def builds_for_pr(pr_number: str, *, successful: bool = False) -> Iterator[dict]:
+def builds_for_pr(pr_number: str, *, deadline: float, successful: bool = False) -> Iterator[dict]:
     parameters = {
         "definitions": "2267",
         "branchName": f"refs/pull/{pr_number}/merge",
@@ -58,8 +78,9 @@ def builds_for_pr(pr_number: str, *, successful: bool = False) -> Iterator[dict]
             "$top": "200",
         })
     query = urlencode(parameters)
-    builds = get_json(f"{BUILD_API}/builds?{query}")["value"]
+    builds = get_json(f"{BUILD_API}/builds?{query}", deadline=deadline)["value"]
     for build in builds:
+        remaining_time(deadline)
         trigger = build.get("triggerInfo", {})
         if str(trigger.get("pr.number")) != pr_number:
             continue
@@ -73,26 +94,26 @@ def builds_for_pr(pr_number: str, *, successful: bool = False) -> Iterator[dict]
         yield build
 
 
-def latest_build(pr_number: str) -> dict | None:
-    return next(builds_for_pr(pr_number), None)
+def latest_build(pr_number: str, *, deadline: float) -> dict | None:
+    return next(builds_for_pr(pr_number, deadline=deadline), None)
 
 
 def canceled(build: dict) -> bool:
     return build["status"] == "cancelling" or build.get("result") == "canceled"
 
 
-def has_coverage(build_id: int) -> bool:
-    artifacts = get_json(f"{BUILD_API}/builds/{build_id}/artifacts?api-version=7.1")["value"]
+def has_coverage(build_id: int, *, deadline: float) -> bool:
+    artifacts = get_json(f"{BUILD_API}/builds/{build_id}/artifacts?api-version=7.1", deadline=deadline)["value"]
     matches = [item for item in artifacts if item["name"] == "CoberturaCoverage"]
     if len(matches) > 1:
         raise ValueError("Multiple CoberturaCoverage artifacts found")
     return bool(matches)
 
 
-def duplicate_coverage(pr_number: str, build: dict, head_sha: str) -> int | None:
+def duplicate_coverage(pr_number: str, build: dict, head_sha: str, *, deadline: float) -> int | None:
     if build["status"] != "completed" or build.get("result") != "succeeded":
         return None
-    records = get_json(f"{BUILD_API}/builds/{build['id']}/timeline?api-version=7.1")["records"]
+    records = get_json(f"{BUILD_API}/builds/{build['id']}/timeline?api-version=7.1", deadline=deadline)["records"]
     stages = {record["identifier"]: record.get("result") for record in records if record["type"] == "Stage"}
     # EvaluateDuplicate succeeds only for ordinary PR validation; its true
     # output skips both Build and Coverage in validation-stages.yml.
@@ -100,11 +121,11 @@ def duplicate_coverage(pr_number: str, build: dict, head_sha: str) -> int | None
             and stages.get("Build") == "skipped" and stages.get("Coverage") == "skipped"):
         return None
     # Match the duplicate guard's bounded history window, skipping duplicate chains.
-    for prior in builds_for_pr(pr_number, successful=True):
+    for prior in builds_for_pr(pr_number, deadline=deadline, successful=True):
         if (prior["id"] != build["id"] and prior["status"] == "completed"
                 and prior.get("result") == "succeeded"
                 and prior["triggerInfo"]["pr.sourceSha"] == head_sha
-                and has_coverage(prior["id"])):
+                and has_coverage(prior["id"], deadline=deadline)):
             print(f"Using coverage from build {prior['id']} for duplicate build {build['id']}...", flush=True)
             return prior["id"]
     return None
@@ -118,8 +139,8 @@ def wait_for_artifact(pr_number: str, timeout: float = 75 * 60) -> tuple[int, st
     while time.monotonic() < deadline:
         delay = 10
         try:
-            head_sha = github_head(pr_number)
-            build = latest_build(pr_number)
+            head_sha = github_head(pr_number, deadline=deadline)
+            build = latest_build(pr_number, deadline=deadline)
             if build is None:
                 print(f"Waiting for an ADO build for PR #{pr_number}...", flush=True)
             elif build["triggerInfo"]["pr.sourceSha"] != head_sha:
@@ -131,18 +152,23 @@ def wait_for_artifact(pr_number: str, timeout: float = 75 * 60) -> tuple[int, st
                 if build.get("result") == "failed":
                     raise RuntimeError(f"Azure DevOps build {build_id} failed; cannot report coverage")
                 print(f"Checking coverage artifact for build {build_id} ({build['status']})...", flush=True)
-                coverage_id = build_id if has_coverage(build_id) else duplicate_coverage(pr_number, build, head_sha)
+                coverage_id = (
+                    build_id if has_coverage(build_id, deadline=deadline)
+                    else duplicate_coverage(pr_number, build, head_sha, deadline=deadline)
+                )
                 if coverage_id is not None:
                     # A push can precede its ADO build, including during this request.
-                    current = latest_build(pr_number)
+                    current = latest_build(pr_number, deadline=deadline)
                     if (current is not None and current["id"] == build_id
                             and current["triggerInfo"]["pr.sourceSha"] == head_sha
                             and not canceled(current) and current.get("result") != "failed"
-                            and github_head(pr_number) == head_sha):
+                            and github_head(pr_number, deadline=deadline) == head_sha):
                         return coverage_id, head_sha
                     retry_delay = 10
                     continue
                 delay = random.randint(300, 600)
+        except PollingDeadlineExceeded:
+            raise
         except (HTTPError, TimeoutError) as error:
             if isinstance(error, HTTPError) and error.code not in (408, 429, 500, 502, 503, 504):
                 raise

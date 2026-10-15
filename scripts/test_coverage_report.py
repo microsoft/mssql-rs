@@ -4,12 +4,13 @@
 """Regression tests for the PR coverage reporting trust boundaries."""
 
 import importlib.util
+import io
 import json
 from pathlib import Path
 import stat
 import subprocess
 from types import SimpleNamespace
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlparse
 import xml.etree.ElementTree as ET
 import zipfile
@@ -286,19 +287,19 @@ def poll_clock(monkeypatch):
         clock.now += seconds
     monkeypatch.setattr(polling, "time", SimpleNamespace(monotonic=lambda: clock.now, sleep=sleep))
     monkeypatch.setattr(polling.random, "randint", lambda low, high: 300)
-    monkeypatch.setattr(polling, "github_head", lambda pr: "a" * 40)
+    monkeypatch.setattr(polling, "github_head", lambda pr, **kwargs: "a" * 40)
     return clock
 
 
 def github_heads(monkeypatch, *heads):
     values = iter(heads)
-    monkeypatch.setattr(polling, "github_head", lambda pr: next(values) * 40)
+    monkeypatch.setattr(polling, "github_head", lambda pr, **kwargs: next(values) * 40)
 
 
 def queued_api(monkeypatch, responses):
     pending = list(responses)
     calls = []
-    def get_json(url):
+    def get_json(url, *, deadline):
         calls.append(url)
         endpoint, values = pending.pop(0)
         parsed = urlparse(url)
@@ -538,12 +539,12 @@ def test_poll_refreshes_github_head_before_accepting_ready_artifact(monkeypatch,
 
 def test_github_head_uses_read_only_job_token(monkeypatch):
     monkeypatch.setenv("GH_TOKEN", "fixture-token")
-    def get_json(url, *, headers):
+    def get_json(url, *, deadline, headers):
         assert url == "https://api.github.com/repos/microsoft/mssql-rs/pulls/710"
         assert headers["Authorization"] == "Bearer fixture-token"
         return {"head": {"sha": "B" * 40}}
     monkeypatch.setattr(polling, "get_json", get_json)
-    assert polling.github_head("710") == "b" * 40
+    assert polling.github_head("710", deadline=polling.time.monotonic() + 60) == "b" * 40
 
 
 @pytest.mark.parametrize("sha", [None, "x" * 40, "a" * 40 + "\nINJECTED=1"])
@@ -551,7 +552,7 @@ def test_github_head_rejects_invalid_sha(monkeypatch, sha):
     monkeypatch.setenv("GH_TOKEN", "fixture-token")
     monkeypatch.setattr(polling, "get_json", lambda url, **kwargs: {"head": {"sha": sha}})
     with pytest.raises(ValueError, match="Invalid PR source SHA"):
-        polling.github_head("710")
+        polling.github_head("710", deadline=polling.time.monotonic() + 60)
 
 
 def duplicate_timeline(**changes):
@@ -714,3 +715,82 @@ def test_poll_does_not_retry_invalid_json(monkeypatch, poll_clock):
         polling.wait_for_artifact("710")
     assert not poll_clock.sleeps
     assert not pending
+
+
+def test_poll_retries_urlerror_wrapped_connection_timeout(monkeypatch, poll_clock):
+    build = ado_build()
+    responses = [
+        URLError(TimeoutError("connection timed out")),
+        {"value": [build]},
+        {"value": [{"name": "CoberturaCoverage"}]},
+        {"value": [build]},
+    ]
+    def urlopen(request, *, timeout):
+        response = responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return io.StringIO(json.dumps(response))
+    monkeypatch.setattr(polling, "urlopen", urlopen)
+    assert polling.wait_for_artifact("710") == (101, "a" * 40)
+    assert poll_clock.sleeps == [10]
+    assert not responses
+
+
+def test_poll_does_not_retry_other_url_errors(monkeypatch, poll_clock):
+    def urlopen(request, *, timeout):
+        raise URLError("certificate verification failed")
+    monkeypatch.setattr(polling, "urlopen", urlopen)
+    with pytest.raises(URLError):
+        polling.wait_for_artifact("710")
+    assert not poll_clock.sleeps
+
+
+def test_request_timeout_is_capped_by_remaining_budget(monkeypatch, poll_clock):
+    poll_clock.now = 58
+    def urlopen(request, *, timeout):
+        assert timeout == 2
+        return io.StringIO("{}")
+    monkeypatch.setattr(polling, "urlopen", urlopen)
+    assert polling.get_json("https://dev.azure.com/builds", deadline=60) == {}
+
+
+def test_expired_deadline_prevents_new_requests(monkeypatch, poll_clock):
+    poll_clock.now = 60
+    def urlopen(*args, **kwargs):
+        pytest.fail("No request may start after the polling deadline")
+    monkeypatch.setattr(polling, "urlopen", urlopen)
+    with pytest.raises(polling.PollingDeadlineExceeded):
+        polling.get_json("https://dev.azure.com/builds", deadline=60)
+
+
+def test_response_arriving_after_deadline_is_not_accepted(monkeypatch, poll_clock):
+    def urlopen(request, *, timeout):
+        poll_clock.now += 61
+        return io.StringIO("{}")
+    monkeypatch.setattr(polling, "urlopen", urlopen)
+    with pytest.raises(polling.PollingDeadlineExceeded):
+        polling.get_json("https://dev.azure.com/builds", deadline=60)
+
+
+def test_duplicate_history_requests_share_the_polling_deadline(monkeypatch, poll_clock):
+    duplicate = ado_build(200, status="completed", result="succeeded")
+    history = [ado_build(build_id, status="completed", result="succeeded") for build_id in range(199, 0, -1)]
+    scanned = []
+    def urlopen(request, *, timeout):
+        parsed = urlparse(request.full_url)
+        if parsed.path.endswith("/builds"):
+            builds = history if "resultFilter" in parse_qs(parsed.query) else [duplicate]
+            return io.StringIO(json.dumps({"value": builds}))
+        if parsed.path.endswith("/timeline"):
+            return io.StringIO(json.dumps({"records": duplicate_timeline()}))
+        build_id = int(parsed.path.split("/")[-2])
+        if build_id != 200:
+            scanned.append((build_id, timeout))
+            poll_clock.now += 40
+        return io.StringIO('{"value":[]}')
+    monkeypatch.setattr(polling, "urlopen", urlopen)
+    with pytest.raises(polling.PollingDeadlineExceeded):
+        polling.wait_for_artifact("710", timeout=120)
+    assert scanned == [(199, 60), (198, 60), (197, 40)]
+    assert poll_clock.now == 120
+    assert not poll_clock.sleeps
