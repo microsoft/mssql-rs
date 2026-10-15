@@ -688,16 +688,21 @@ impl ParsedDataSource {
     /// - `tcp:server\instance` (no port) → SSRP is required
     /// - `tcp:server,port\instance` → SSRP is NOT required (instance is ignored per MDAC behavior)
     /// - `server\instance` (no protocol) → SSRP is required
+    /// - `lpc:server\instance` → SSRP is NOT required (Shared Memory opens the
+    ///   instance's endpoint by name)
     pub fn needs_ssrp(&self) -> bool {
         // SSRP is needed if:
         // 1. Instance name is specified, AND
-        // 2. No explicit port is provided (protocol_parameter is empty or not a valid port)
+        // 2. No explicit port is provided (protocol_parameter is empty or not a valid port), AND
+        // 3. The protocol is not Shared Memory
         //
         // Note: Even with tcp: or np: prefix, if no port/pipe is given, SSRP is
         // required to resolve the instance. The protocol prefix acts as a filter
         // on which resolved endpoint to use (TCP only, NP only, or both).
         // This matches ODBC/SNI behavior.
-        !self.instance_name.is_empty() && self.protocol_parameter.is_empty()
+        !self.instance_name.is_empty()
+            && self.protocol_parameter.is_empty()
+            && self.protocol_name != "lpc"
     }
 
     /// Generate the connection action chain for this data source
@@ -806,7 +811,8 @@ impl ParsedDataSource {
                     }
                 }
                 _ => {
-                    // Other protocols (lpc, admin) don't use SSRP this way
+                    // Other protocols (admin) don't use SSRP this way; lpc
+                    // never reaches here (see needs_ssrp)
                     builder.add_connect_tcp_from_slot(&self.server_name, ResultSlot::ResolvedPort);
                 }
             }
@@ -1462,6 +1468,29 @@ mod tests {
         assert!(matches!(
             actions[1],
             ConnectionAction::ConnectSharedMemory { .. }
+        ));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_lpc_named_instance_does_not_need_ssrp() {
+        let parsed = ParsedDataSource::parse("lpc:.\\SQLEXPRESS", false).unwrap();
+        assert_eq!(parsed.instance_name, "SQLEXPRESS");
+        assert!(!parsed.needs_ssrp());
+
+        let chain = parsed.to_connection_actions(15000);
+        use crate::connection::connection_actions::ConnectionAction;
+        assert!(
+            !chain.actions().iter().any(|a| matches!(
+                a,
+                ConnectionAction::QuerySsrp { .. } | ConnectionAction::ConnectTcpFromSlot { .. }
+            )),
+            "lpc: with an instance must not fall back to SQL Browser and TCP"
+        );
+        assert!(matches!(
+            chain.actions().last(),
+            Some(ConnectionAction::ConnectSharedMemory { instance_name, .. })
+                if instance_name == "SQLEXPRESS"
         ));
     }
 
