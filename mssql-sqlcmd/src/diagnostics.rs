@@ -15,10 +15,7 @@
 //! | Connection attempt | the client also logs in, with its pre-login, TLS and login phases |
 //! | Session validation | a minimal query on the new session (the engine edition and the server's clock) |
 //!
-//! Session validation, the deepest, is the default. This build runs the
-//! checks through network reachability: the client stops once its transport
-//! is open, and the connection attempt and session validation are reported
-//! as skipped, not checked by this build. Checks run best effort: a
+//! Session validation, the deepest, is the default. Checks run best effort: a
 //! failed check skips only the checks that need its result, each skipped check
 //! names what blocked it, and every resolved address is tried. Each check
 //! reports a coverage state (`passed`, `diagnosed`, `classified`,
@@ -50,10 +47,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use mssql_tds::connection::client_context::{ClientContext, TdsAuthenticationMethod};
 use mssql_tds::connection::connect_stage;
+use mssql_tds::connection::tds_client::{ResultSet, StatementResult, TdsClient};
 use mssql_tds::connection_provider::tds_connection_provider::{
     DiagnosticStop, TdsConnectionProvider,
 };
-use mssql_tds::core::{EncryptionOptions, EncryptionSetting};
+use mssql_tds::core::{EncryptionOptions, EncryptionSetting, Version};
+use mssql_tds::datatypes::column_values::ColumnValues;
 use mssql_tds::error::Error;
 use tracing_subscriber::Layer;
 use tracing_subscriber::layer::SubscriberExt;
@@ -276,6 +275,10 @@ impl Request {
 /// and which coverage states each can report.
 pub const COVERAGE_MATRIX_VERSION: &str = "1.0";
 
+/// The Microsoft Learn page on driver tracing for `sqlcmd diagnose`, given when
+/// the client's own evidence cannot explain a failure.
+pub const TRACING_GUIDE: &str = "https://aka.ms/sqlcmd-diagnose-tracing";
+
 /// How long SQL Server Browser has to answer.
 const BROWSER_TIMEOUT_MS: u64 = 2000;
 
@@ -291,6 +294,10 @@ const SHARED_MEMORY_FIRST: &str =
 /// Why the TCP checks do not apply, when TCP did not connect and the pipe
 /// the protocol order moved to opened.
 const NOT_ON_THE_PATH: &str = "sqlcmd's connection did not use TCP";
+
+/// Kerberos rejects tickets whose clock differs from the server's by more than
+/// this, by default.
+const KERBEROS_CLOCK_TOLERANCE_MS: i64 = 5 * 60 * 1000;
 
 /// A check of the connection path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -398,8 +405,6 @@ pub enum Skip {
     NotApplicable(&'static str),
     /// The diagnosis was canceled before the check finished.
     Canceled,
-    /// This build does not run the check yet.
-    NotInThisBuild,
 }
 
 /// The field of a check that names what the user must give before the checks
@@ -527,6 +532,8 @@ pub struct Check {
     pub fields: Vec<Field>,
     /// TCP connect: one per address.
     pub attempts: Vec<TcpAttempt>,
+    /// Connection attempt: its pre-login, TLS and login phases.
+    pub subphases: Vec<Step>,
     pub skip: Option<Skip>,
     /// The handoff area when the check failed.
     pub domain: Option<Domain>,
@@ -541,6 +548,7 @@ impl Check {
             deadline_ms: None,
             fields: Vec::new(),
             attempts: Vec::new(),
+            subphases: Vec::new(),
             skip: None,
             domain: None,
         }
@@ -667,6 +675,57 @@ impl Domain {
     }
 }
 
+/// The outcome of the selected login method.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuthOutcome {
+    Succeeded,
+    Failed,
+    NotEvaluated,
+}
+
+impl AuthOutcome {
+    pub fn name(self) -> &'static str {
+        match self {
+            AuthOutcome::Succeeded => "succeeded",
+            AuthOutcome::Failed => "failed",
+            AuthOutcome::NotEvaluated => "notEvaluated",
+        }
+    }
+}
+
+/// What the server reported about itself.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ServerInfo {
+    /// The instance name the server gave itself (`@@SERVERNAME`).
+    pub name: Option<String>,
+    /// e.g. `17.0.4085`.
+    pub version: Option<String>,
+    pub database: String,
+    /// Whether everything after login stays encrypted.
+    pub encrypted: bool,
+    /// From session validation: `SERVERPROPERTY('EngineEdition')`.
+    pub engine_edition: Option<i32>,
+}
+
+impl ServerInfo {
+    /// The kind of target, from the engine edition (`SERVERPROPERTY('EngineEdition')`).
+    /// Edition 11 is either Azure Synapse serverless SQL pool or Microsoft
+    /// Fabric, which the edition alone cannot tell apart; an edition this
+    /// version does not know is `unknown`, not guessed.
+    pub fn target_type(&self) -> Option<&'static str> {
+        self.engine_edition.map(|edition| match edition {
+            1..=4 => "sqlServer",
+            5 => "azureSqlDatabase",
+            6 => "azureSynapseAnalytics",
+            8 => "azureSqlManagedInstance",
+            9 => "azureSqlEdge",
+            11 => "azureSynapseServerlessOrFabric",
+            12 => "fabricSqlDatabase",
+            _ => "unknown",
+        })
+    }
+}
+
 /// Whether sqlcmd carried out the diagnosis.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExecutionStatus {
@@ -773,7 +832,12 @@ pub struct Report {
     pub checks: Vec<Check>,
     pub findings: Vec<Finding>,
     pub errors: Vec<ErrorRecord>,
+    pub authentication: Option<AuthOutcome>,
+    pub server: Option<ServerInfo>,
     pub domain: Option<Domain>,
+    /// Where to read about driver tracing, when the client's own evidence ran
+    /// out (see [`TRACING_GUIDE`]).
+    pub tracing_guide: Option<&'static str>,
     pub execution_status: ExecutionStatus,
     pub outcome: DiagnosticOutcome,
     pub limitations: Vec<String>,
@@ -931,7 +995,7 @@ fn run_until_on(request: Request, canceled: &dyn Fn() -> bool, windows: bool) ->
                         () = diagnosis.execute() => false,
                     };
                     if stopped {
-                        diagnosis.canceled();
+                        diagnosis.canceled().await;
                     }
                 }),
                 Err(error) => {
@@ -974,11 +1038,19 @@ struct Diagnosis {
     /// alone takes LocalDB, named pipes and shared memory: this platform's,
     /// and either in tests.
     windows: bool,
+    /// How the client's Kerberos ticket cache is looked for: None on
+    /// Windows, which keeps tickets in the logon session; tests set either.
+    ticket_cache: Option<fn() -> (&'static str, String)>,
     recorder: StageRecorder,
     target: Option<Target>,
     checks: Vec<Check>,
     findings: Vec<Finding>,
     errors: Vec<ErrorRecord>,
+    authentication: Option<AuthOutcome>,
+    server: Option<ServerInfo>,
+    /// The SPN the client requested with integrated authentication, as it
+    /// recorded it.
+    spn: Option<String>,
     limitations: Vec<String>,
     status: ExecutionStatus,
 }
@@ -1121,11 +1193,15 @@ impl Diagnosis {
         Self {
             request,
             windows: cfg!(windows),
+            ticket_cache: (!cfg!(windows)).then_some(kerberos_ticket_cache as fn() -> _),
             recorder: StageRecorder::new(),
             target: None,
             checks: Vec::new(),
             findings: Vec::new(),
             errors: Vec::new(),
+            authentication: None,
+            server: None,
+            spn: None,
             limitations: Vec::new(),
             status: ExecutionStatus::Completed,
         }
@@ -1134,16 +1210,16 @@ impl Diagnosis {
     /// The run was canceled: the stages the client finished before the
     /// cancel still give their checks, and every check at the requested
     /// depth that did not finish is skipped as canceled.
-    fn canceled(&mut self) {
+    async fn canceled(&mut self) {
         let steps = self.recorder.steps();
-        self.canceled_after(steps);
+        self.canceled_after(steps).await;
     }
 
     /// [Diagnosis::canceled], with the stages the client recorded before
     /// the cancel.
-    fn canceled_after(&mut self, steps: Vec<Step>) {
+    async fn canceled_after(&mut self, steps: Vec<Step>) {
         self.status = ExecutionStatus::Canceled;
-        self.observe_so_far(steps);
+        self.observe_so_far(steps).await;
         // The cancel decides the status: replaying the stages (a local
         // failure makes a run partial) does not downgrade it.
         self.status = ExecutionStatus::Canceled;
@@ -1172,7 +1248,7 @@ impl Diagnosis {
     /// Reads the checks from the stages the client recorded before a cancel,
     /// when the connection attempt had started and no check past the
     /// connection input was made from it yet.
-    fn observe_so_far(&mut self, steps: Vec<Step>) {
+    async fn observe_so_far(&mut self, steps: Vec<Step>) {
         let Some(target) = self.target.clone() else {
             return;
         };
@@ -1186,7 +1262,7 @@ impl Diagnosis {
         if steps.is_empty() {
             return;
         }
-        self.observe(&target, steps, &Ended::Canceled, 0);
+        Box::pin(self.observe(&target, steps, &Ended::Canceled, 0, None)).await;
     }
     fn wants(&self, depth: Depth) -> bool {
         self.request.depth >= depth
@@ -1246,11 +1322,8 @@ impl Diagnosis {
         let stop_after = match self.request.depth {
             _ if dac_lookup => Some(DiagnosticStop::Resolution),
             Depth::ConnectionInput | Depth::EndpointResolution => Some(DiagnosticStop::Resolution),
-            // This build does not log in: the attempt stops once its
-            // transport is open.
-            Depth::NetworkReachability | Depth::ConnectionAttempt | Depth::SessionValidation => {
-                Some(DiagnosticStop::Transport)
-            }
+            Depth::NetworkReachability => Some(DiagnosticStop::Transport),
+            Depth::ConnectionAttempt | Depth::SessionValidation => None,
         };
         let context = self.client_context();
         let server = self.request.server.trim().to_string();
@@ -1279,10 +1352,18 @@ impl Diagnosis {
             }
             return;
         }
-        self.observe(&target, steps, &ended, attempt_ms);
-        // With a stop the client does not log in; a connection is closed.
-        if let Some(mut client) = client {
-            let _ = client.close_connection().await;
+        Box::pin(self.observe(&target, steps, &ended, attempt_ms, client.as_ref())).await;
+        match client {
+            Some(mut client) => {
+                if self.wants(Depth::SessionValidation) {
+                    self.session_validation(&mut client).await;
+                }
+                let _ = client.close_connection().await;
+            }
+            None => self.skip_rest(
+                CheckId::ConnectionAttempt,
+                &Skip::BlockedBy(CheckId::ConnectionAttempt),
+            ),
         }
     }
 
@@ -1328,13 +1409,35 @@ impl Diagnosis {
     }
 
     /// Reads the checks from the stages the attempt went through (`steps`)
-    /// and how it `ended`. `attempt_ms` is how long it took.
-    fn observe(&mut self, target: &Target, mut steps: Vec<Step>, ended: &Ended, attempt_ms: u64) {
+    /// and how it `ended`. `attempt_ms` is how long it took; `client` is the
+    /// connection when it logged in.
+    async fn observe(
+        &mut self,
+        target: &Target,
+        mut steps: Vec<Step>,
+        ended: &Ended,
+        attempt_ms: u64,
+        client: Option<&TdsClient>,
+    ) {
         steps.sort_by_key(|s| s.started);
         let timed_out = ended.timed_out();
+        // After a routing redirect the client connected again where it was
+        // sent: the checks before the attempt are of the target's connection.
+        let redirect_at = steps
+            .iter()
+            .filter(|s| {
+                s.stage == Stage::Login && s.detail(connect_stage::REDIRECTED) == Some("true")
+            })
+            .map(|s| s.ended)
+            .min();
         let all: Vec<&Step> = steps.iter().collect();
-        let groups = transports(&all);
-        let lookup = all
+        let before: Vec<&Step> = all
+            .iter()
+            .copied()
+            .filter(|s| redirect_at.is_none_or(|at| s.started < at))
+            .collect();
+        let groups = transports(&before);
+        let lookup = before
             .iter()
             .copied()
             .find(|s| s.stage == Stage::InstanceLookup);
@@ -1381,7 +1484,7 @@ impl Diagnosis {
             }
         });
 
-        self.moved_past(&groups, primary_at);
+        self.moved_past(&groups, primary_at, &all);
         let pipe_used = primary.and_then(|g| g.pipe).filter(|p| p.ok == Some(true));
         // A pipe the protocol order moved to opened: the TCP path it moved
         // past is not the connection's, so what failed there does not count.
@@ -1420,12 +1523,17 @@ impl Diagnosis {
             let pipe_failed = primary.filter(|g| !g.is_tcp() && !g.opened());
             match (tcp, blocked, pipe_failed) {
                 (None, None, _) if tcp_not_reached => self.tcp_not_reached(lookup_port, ended),
-                (None, None, Some(pipe)) => self.pipe_not_opened(pipe, ended),
+                // At the connection attempt's depth, that check reports it.
+                (None, None, Some(pipe)) if !self.wants(Depth::ConnectionAttempt) => {
+                    self.pipe_not_opened(pipe, ended)
+                }
                 // The protocol order moved past a failed TCP path to a pipe
                 // that did not open either: the pipe's failure is the
                 // connection's. The TCP path's checks are not on its path,
                 // their errors kept as superseded evidence.
-                (tcp, blocked, Some(pipe)) if tcp_superseded => {
+                (tcp, blocked, Some(pipe))
+                    if tcp_superseded && !self.wants(Depth::ConnectionAttempt) =>
+                {
                     self.tcp_connect(
                         target,
                         tcp,
@@ -1462,40 +1570,62 @@ impl Diagnosis {
             return;
         }
         // The attempt never got a transport to the target: the check that
-        // failed blocks the deeper checks. Otherwise this build does not run
-        // them.
+        // failed blocks it.
         let blocked = match primary {
-            Some(group) if group.is_tcp() && !group.opened() => {
+            Some(group) if group.is_tcp() && !group.opened() && redirect_at.is_none() => {
                 Some(if group.dns.is_some_and(|d| d.ok != Some(true)) {
                     Skip::BlockedBy(CheckId::NameResolution)
                 } else {
                     tcp_blocks.unwrap_or(Skip::BlockedBy(CheckId::TcpConnect))
                 })
             }
-            Some(group) if !group.opened() => tcp_blocks,
             None => lookup_blocks.or(tcp_blocks),
             _ => None,
         };
-        self.skip_rest(
-            CheckId::TcpConnect,
-            &blocked.unwrap_or(Skip::NotInThisBuild),
-        );
+        if let Some(skip) = blocked {
+            self.checks
+                .push(Check::skipped(CheckId::ConnectionAttempt, skip.clone()));
+            self.skip_rest(CheckId::ConnectionAttempt, &skip);
+            return;
+        }
+        if ended.canceled() {
+            // The cancel cut the attempt short: its phases did not fail.
+            self.checks
+                .push(Check::skipped(CheckId::ConnectionAttempt, Skip::Canceled));
+            return;
+        }
+        let all_groups = transports(&all);
+        self.connection_attempt(
+            target,
+            &all,
+            all_groups.last(),
+            redirect_at.is_some(),
+            ended,
+            attempt_ms,
+            client,
+        )
+        .await;
     }
 
     /// The attempt failed before any connect stage (resolving a LocalDB
-    /// instance, say): the failure is the deepest check's.
+    /// instance, say): the failure is the connection attempt's or, below
+    /// that depth, the deepest check's.
     fn failed_before_any_stage(&mut self, target: &Target, error: &Error, attempt_ms: u64) {
         let network = [
             CheckId::NameResolution,
             CheckId::InstanceResolution,
             CheckId::TcpConnect,
         ];
-        let carrier = network
-            .iter()
-            .rev()
-            .copied()
-            .find(|id| self.wants(id.depth()))
-            .unwrap_or(CheckId::NameResolution);
+        let carrier = if self.wants(Depth::ConnectionAttempt) {
+            CheckId::ConnectionAttempt
+        } else {
+            network
+                .iter()
+                .rev()
+                .copied()
+                .find(|id| self.wants(id.depth()))
+                .unwrap_or(CheckId::NameResolution)
+        };
         for id in network {
             if id == carrier || !self.wants(id.depth()) {
                 continue;
@@ -1506,12 +1636,15 @@ impl Diagnosis {
                 Check::skipped(id, Skip::NotApplicable(NOT_TCP))
             });
         }
-        let classified = classify_connection_error(error);
+        let classified = classify_connection_error(error, None, &self.request.authentication);
         let mut check = Check::new(carrier, classified.coverage);
         check.duration_ms = Some(attempt_ms);
         check.deadline_ms = Some(self.request.timeout_ms());
         check.domain = Some(classified.domain);
         self.checks.push(check);
+        if carrier == CheckId::ConnectionAttempt {
+            self.authentication = Some(classified.auth);
+        }
         self.quoting_finding(Certainty::Confirmed, carrier, classified.finding);
         self.errors
             .extend(classified.errors.into_iter().map(|mut record| {
@@ -2156,7 +2289,7 @@ impl Diagnosis {
                 return None;
             }
         };
-        let classified = classify_connection_error(error);
+        let classified = classify_connection_error(error, None, &self.request.authentication);
         let mut check = Check::new(id, Coverage::Inconclusive);
         check.deadline_ms = Some(self.request.timeout_ms());
         if let Some(port) = port {
@@ -2289,7 +2422,7 @@ impl Diagnosis {
     /// that did not open, a TCP path that failed): an informational finding
     /// each, and their errors kept as evidence, marked superseded, as a
     /// normal run reports only the last transport's.
-    fn moved_past(&mut self, groups: &[Transport], current: Option<usize>) {
+    fn moved_past(&mut self, groups: &[Transport], current: Option<usize>, all: &[&Step]) {
         for (index, group) in groups.iter().enumerate() {
             if Some(index) == current {
                 continue;
@@ -2327,12 +2460,53 @@ impl Diagnosis {
                     record.superseded = true;
                     self.errors.push(record);
                 }
-                None => self.finding(
+                None if !group.opened() => self.finding(
                     Certainty::Informational,
                     CheckId::ConnectionAttempt,
-                    "TCP did not connect; without a protocol prefix sqlcmd then tries the \
-                     server's standard pipe.",
+                    if self.wants(Depth::ConnectionAttempt) {
+                        "TCP did not connect; without a protocol prefix sqlcmd then tries named \
+                         pipes, so the connection attempt was made over the server's standard \
+                         pipe."
+                    } else {
+                        "TCP did not connect; without a protocol prefix sqlcmd then tries the \
+                         server's standard pipe."
+                    },
                 ),
+                None => {
+                    // TCP opened, and the attempt over it failed in a way
+                    // the client moves on from.
+                    let from = group.started();
+                    let until = next.and_then(Transport::started);
+                    let failed: Vec<&Step> = all
+                        .iter()
+                        .copied()
+                        .filter(|s| {
+                            matches!(s.stage, Stage::Prelogin | Stage::Tls | Stage::Login)
+                                && s.failed()
+                                && from.is_none_or(|f| s.started >= f)
+                                && until.is_none_or(|u| s.started < u)
+                        })
+                        .collect();
+                    for step in failed {
+                        let mut record = ErrorRecord::new(
+                            "client",
+                            CheckId::ConnectionAttempt,
+                            step.detail(connect_stage::ERROR)
+                                .unwrap_or(step.stage.title())
+                                .to_string(),
+                        );
+                        record.os_error = step.os_error();
+                        record.superseded = true;
+                        self.errors.push(record);
+                    }
+                    self.finding(
+                        Certainty::Informational,
+                        CheckId::ConnectionAttempt,
+                        "The connection attempt over TCP failed; without a protocol prefix \
+                         sqlcmd then tries named pipes, so the connection attempt was made over \
+                         the server's standard pipe.",
+                    );
+                }
             }
         }
     }
@@ -2464,6 +2638,294 @@ impl Diagnosis {
         context
     }
 
+    /// The connection attempt: the pre-login, TLS and login phases on the
+    /// transport the attempt ended on (`last`), and how it `ended`.
+    #[allow(clippy::too_many_arguments)]
+    async fn connection_attempt(
+        &mut self,
+        target: &Target,
+        all: &[&Step],
+        last: Option<&Transport<'_>>,
+        redirected: bool,
+        ended: &Ended,
+        attempt_ms: u64,
+        client: Option<&TdsClient>,
+    ) {
+        let mut check = Check::new(CheckId::ConnectionAttempt, Coverage::Passed);
+        check.duration_ms = Some(attempt_ms);
+        check.deadline_ms = Some(self.request.timeout_ms());
+        // The phases on the last transport: after a routing redirect, those
+        // of the connection the client made where it was sent; after a
+        // transport the protocol order moved past, the next one's.
+        let from = last.and_then(Transport::started);
+        let mut phases: Vec<Step> = all
+            .iter()
+            .filter(|s| matches!(s.stage, Stage::Prelogin | Stage::Tls | Stage::Login))
+            .filter(|s| from.is_none_or(|f| s.started >= f))
+            .map(|s| (*s).clone())
+            .collect();
+        // In the order they ended: login, which contains the TLS handshake
+        // when encryption starts at login, follows it.
+        phases.sort_by_key(|s| s.ended);
+        let redirected = followed_redirect(&mut phases) || redirected;
+        if matches!(ended, Ended::Failed(_)) {
+            drop_enclosing_failures(&mut phases);
+        }
+        check.subphases = phases;
+        if redirected {
+            check.fields.push(Field::plain("redirected", "true"));
+        }
+        // Without a prefix, the protocol order may end on a pipe.
+        if let Some(last) = last
+            && target.protocol == Protocol::Default
+            && last.protocol() != Protocol::Tcp
+        {
+            let transport = last.protocol();
+            check
+                .fields
+                .push(Field::plain("transport", transport.name()));
+            if transport == Protocol::NamedPipe
+                && let Some(pipe) = last.pipe.and_then(|p| p.detail(connect_stage::PIPE_PATH))
+            {
+                check
+                    .fields
+                    .push(Field::identifier("pipe", pipe, Category::Pipe));
+            }
+        }
+        self.spn = all
+            .iter()
+            .rev()
+            .filter(|s| s.stage == Stage::Login)
+            .find_map(|s| s.detail(connect_stage::SPN))
+            .map(str::to_string);
+        self.limitation(
+            "The connection attempt is made with the mssql-tds client, which reports its \
+             pre-login, TLS and login phases; it is not the ODBC driver sqlcmd uses for queries, \
+             so TLS and login behavior can differ from a query run.",
+        );
+        let cache_location = if self.request.authentication == Authentication::Integrated {
+            self.kerberos_evidence(&mut check, self.request.timeout())
+                .await
+        } else {
+            None
+        };
+
+        match (ended, client) {
+            (Ended::Failed(error), _) => {
+                let failed_phase = failed_stage(&check.subphases, ended.timed_out());
+                let classified =
+                    classify_connection_error(error, failed_phase, &self.request.authentication);
+                check.coverage = classified.coverage;
+                check.domain = Some(classified.domain);
+                if let Some(phase) = failed_phase {
+                    check.fields.push(Field::plain("failedPhase", phase.name()));
+                }
+                if let Some(category) = classified.tls_category {
+                    check.fields.push(Field::plain("tlsFailure", category));
+                }
+                let no_ticket_cache = check.field("kerberosTicketCache") == Some("notFound");
+                self.checks.push(check);
+                if no_ticket_cache && failed_phase == Some(Stage::Login) {
+                    self.finding(
+                        Certainty::Suspected,
+                        CheckId::ConnectionAttempt,
+                        no_ticket_cache_finding(cache_location.as_deref()),
+                    );
+                }
+                self.authentication = Some(classified.auth);
+                self.quoting_finding(
+                    Certainty::Confirmed,
+                    CheckId::ConnectionAttempt,
+                    classified.finding,
+                );
+                self.errors.extend(classified.errors);
+                if classified.from_message_text {
+                    self.limitation(
+                        "The TLS failure was classified from the error text; no stable error \
+                         code was available.",
+                    );
+                }
+            }
+            (_, Some(client)) => {
+                if let Some(encryption) = check
+                    .subphases
+                    .iter()
+                    .find(|s| s.stage == Stage::Prelogin)
+                    .and_then(|s| s.detail(connect_stage::ENCRYPTION))
+                {
+                    let encryption = encryption_name(encryption).to_string();
+                    check.fields.push(Field::plain("encryption", encryption));
+                }
+                self.checks.push(check);
+                self.authentication = Some(AuthOutcome::Succeeded);
+                self.server = Some(ServerInfo {
+                    name: client.server_reported_name().map(str::to_string),
+                    version: client.server_version().map(version_text),
+                    database: client.database().to_string(),
+                    encrypted: client.is_encrypted(),
+                    engine_edition: None,
+                });
+            }
+            // Stopped: below this depth, so not reached.
+            (_, None) => self.checks.push(check),
+        }
+    }
+
+    /// The client's side of Kerberos/SSPI: the SPN the attempt requested and,
+    /// off Windows, whether a ticket cache exists. Windows keeps tickets in
+    /// the logon session, which needs no cache. The cache may be on a slow
+    /// (network) path, so it is looked for on a thread of its own within
+    /// `budget`, what is left of the attempt's time limit. Where it looked
+    /// (`KRB5CCNAME`, `default`, or the cache type), when it did.
+    async fn kerberos_evidence(&mut self, check: &mut Check, budget: Duration) -> Option<String> {
+        if let Some(spn) = self.spn.clone() {
+            check
+                .fields
+                .push(Field::identifier("spn", spn, Category::Spn));
+        }
+        let mut looked_in = None;
+        let found = match self.ticket_cache {
+            Some(lookup) => Some(within(budget, lookup).await),
+            None => None,
+        };
+        match found {
+            None => {
+                check
+                    .fields
+                    .push(Field::plain("kerberosTicketCache", "notApplicable"));
+            }
+            Some(Some((state, location))) => {
+                check
+                    .fields
+                    .push(Field::plain("kerberosTicketCache", state));
+                if state == "unverified" {
+                    self.limitation(&format!(
+                        "The Kerberos ticket cache is a {location} cache, which sqlcmd does not \
+                         inspect."
+                    ));
+                } else if location == "default" {
+                    self.limitation(
+                        "Only the default file ticket cache was looked for; a KCM or KEYRING \
+                         cache set in krb5.conf is not inspected.",
+                    );
+                }
+                looked_in = Some(location);
+            }
+            Some(None) => {
+                check
+                    .fields
+                    .push(Field::plain("kerberosTicketCache", "notChecked"));
+                self.limitation(
+                    "The Kerberos ticket cache could not be looked for within the time limit.",
+                );
+            }
+        }
+        self.limitation(
+            "Kerberos encryption types and delegation are not inspected; the SPN is the one the \
+             client requests, not proof that it is registered.",
+        );
+        looked_in
+    }
+    async fn session_validation(&mut self, client: &mut TdsClient) {
+        let mut check = Check::new(CheckId::SessionValidation, Coverage::Passed);
+        check.deadline_ms = Some(self.request.timeout_ms());
+        let sent_unix_ms = unix_ms_now();
+        let started = Instant::now();
+        let result = tokio::time::timeout(self.request.timeout(), session_probe(client)).await;
+        check.duration_ms = Some(millis(started));
+        let received_unix_ms = unix_ms_now();
+        let error = match result {
+            Ok(Ok(probe)) => {
+                self.session_probed(check, &probe, sent_unix_ms, received_unix_ms);
+                return;
+            }
+            Ok(Err(error)) => Some(error),
+            Err(_) => None,
+        };
+        self.session_failed(check, error);
+    }
+
+    /// Session validation passed: what the minimal query (`probe`) read, the
+    /// query sent and answered at `sent_unix_ms` and `received_unix_ms` on
+    /// the client's clock.
+    fn session_probed(
+        &mut self,
+        mut check: Check,
+        probe: &SessionProbe,
+        sent_unix_ms: i64,
+        received_unix_ms: i64,
+    ) {
+        check.fields.push(Field::plain(
+            "engineEdition",
+            probe.engine_edition.to_string(),
+        ));
+        if let Some(server) = &mut self.server {
+            server.engine_edition = Some(probe.engine_edition);
+            if let Some(target_type) = server.target_type() {
+                check.fields.push(Field::plain("targetType", target_type));
+            }
+        }
+        if let Some(server_ms) = probe.server_unix_ms {
+            // The server read its clock while the query was in flight:
+            // compare it with the middle of the round trip.
+            let client_ms = sent_unix_ms + (received_unix_ms - sent_unix_ms) / 2;
+            let offset = server_ms - client_ms;
+            check
+                .fields
+                .push(Field::plain("clockOffsetMs", offset.to_string()));
+            if offset.abs() > KERBEROS_CLOCK_TOLERANCE_MS {
+                self.finding(
+                    Certainty::Informational,
+                    CheckId::SessionValidation,
+                    format!(
+                        "The server's clock is {} s {} the client's, more than the 5 \
+                         minutes Kerberos tolerates by default.",
+                        offset.abs() / 1000,
+                        if offset > 0 { "ahead of" } else { "behind" }
+                    ),
+                );
+            }
+        }
+        self.checks.push(check);
+    }
+
+    /// Session validation failed: the minimal query's `error`, or no answer
+    /// in the time limit (`None`).
+    fn session_failed(&mut self, mut check: Check, error: Option<Error>) {
+        let id = CheckId::SessionValidation;
+        // The error's text is the client's or the server's: the finding
+        // quoting it is flagged for review. The time-limit text is sqlcmd's.
+        let (finding, quotes) = match error {
+            Some(error) => {
+                check.coverage = match error {
+                    Error::SqlServerError { .. } => Coverage::Diagnosed,
+                    _ => Coverage::Inconclusive,
+                };
+                let message =
+                    format!("The session was opened but a minimal query failed: {error}.");
+                self.errors.extend(error_records(&error, id));
+                (message, true)
+            }
+            None => {
+                check.coverage = Coverage::Inconclusive;
+                let message = format!(
+                    "The session was opened but a minimal query had no answer within {} s.",
+                    self.request.timeout().as_secs()
+                );
+                let mut record = ErrorRecord::new("client", id, message.clone());
+                record.code = Some("timedOut".to_string());
+                self.errors.push(record);
+                (message, false)
+            }
+        };
+        check.domain = Some(Domain::specific("target.sqlServer"));
+        self.checks.push(check);
+        if quotes {
+            self.quoting_finding(Certainty::Confirmed, id, finding);
+        } else {
+            self.finding(Certainty::Confirmed, id, finding);
+        }
+    }
     fn finish(mut self, start_unix_ms: u64, duration_ms: u64) -> Report {
         // The report describes the request; the password was only for logging
         // in, so it is not kept.
@@ -2492,6 +2954,17 @@ impl Diagnosis {
             _ if self.checks.is_empty() => DiagnosticOutcome::NotEvaluated,
             _ => aggregate(&self.checks),
         };
+        // The client's evidence ran out where only the driver can see more.
+        let tracing_guide = self
+            .checks
+            .iter()
+            .any(|c| {
+                matches!(
+                    c.id,
+                    CheckId::ConnectionAttempt | CheckId::SessionValidation
+                ) && matches!(c.coverage, Coverage::Inconclusive | Coverage::Classified)
+            })
+            .then_some(TRACING_GUIDE);
         Report {
             request: self.request,
             start_unix_ms,
@@ -2500,7 +2973,10 @@ impl Diagnosis {
             checks: self.checks,
             findings: self.findings,
             errors: self.errors,
+            authentication: self.authentication,
+            server: self.server,
             domain,
+            tracing_guide,
             execution_status: self.status,
             outcome,
             limitations: self.limitations,
@@ -2511,7 +2987,14 @@ impl Diagnosis {
 /// The diagnostic outcome from the checks, in the specification's precedence.
 fn aggregate(checks: &[Check]) -> DiagnosticOutcome {
     let any = |wanted: &[Coverage]| checks.iter().any(|c| wanted.contains(&c.coverage));
-    if any(&[Coverage::Diagnosed, Coverage::Classified]) {
+    let operation_failed = checks.iter().any(|c| {
+        c.coverage == Coverage::Inconclusive
+            && matches!(
+                c.id,
+                CheckId::ConnectionAttempt | CheckId::SessionValidation
+            )
+    });
+    if operation_failed || any(&[Coverage::Diagnosed, Coverage::Classified]) {
         DiagnosticOutcome::IssueDetected
     } else if any(&[Coverage::Inconclusive]) {
         DiagnosticOutcome::Inconclusive
@@ -2553,6 +3036,77 @@ fn dns_result_from(os_error: Option<i32>, message: &str) -> (&'static str, bool)
     }
 }
 
+fn version_text(version: Version) -> String {
+    format!("{}.{}.{}", version.major, version.minor, version.build)
+}
+
+/// The negotiated encryption as `mssql-tds` records it, in sqlcmd's words.
+fn encryption_name(negotiated: &str) -> &str {
+    match negotiated {
+        "Mandatory" => "mandatory",
+        "Strict" => "strict",
+        "LoginOnly" => "loginOnly",
+        "NoEncryption" => "off",
+        other => other,
+    }
+}
+
+/// Whether the user has a Kerberos ticket cache, and where sqlcmd looked:
+/// `KRB5CCNAME`, or the default `/tmp/krb5cc_<uid>`. The path itself is never
+/// reported.
+#[cfg(unix)]
+fn kerberos_ticket_cache() -> (&'static str, String) {
+    let name = std::env::var("KRB5CCNAME").ok();
+    // SAFETY: getuid has no preconditions and cannot fail.
+    let uid = unsafe { libc::getuid() };
+    ticket_cache_state(name.as_deref(), uid, |path| {
+        std::path::Path::new(path).exists()
+    })
+}
+
+#[cfg(not(unix))]
+fn kerberos_ticket_cache() -> (&'static str, String) {
+    ("notApplicable", String::new())
+}
+
+/// The ticket cache's state from `KRB5CCNAME` (or its absence) and the user's
+/// id: `found` or `notFound` for a file cache, `unverified` for another type
+/// (KCM, KEYRING, ...), which sqlcmd cannot inspect. Also where it looked:
+/// `KRB5CCNAME`, `default`, or the cache type.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn ticket_cache_state(
+    krb5ccname: Option<&str>,
+    uid: u32,
+    exists: impl Fn(&str) -> bool,
+) -> (&'static str, String) {
+    let state = |path: &str| if exists(path) { "found" } else { "notFound" };
+    match krb5ccname.filter(|name| !name.is_empty()) {
+        Some(name) => match name.split_once(':') {
+            Some(("FILE", path)) => (state(path), "KRB5CCNAME".to_string()),
+            Some((kind, _)) if !name.starts_with('/') => ("unverified", kind.to_string()),
+            _ => (state(name), "KRB5CCNAME".to_string()),
+        },
+        None => (state(&format!("/tmp/krb5cc_{uid}")), "default".to_string()),
+    }
+}
+
+/// The finding for a login refused with no ticket cache where sqlcmd looked
+/// (`location`, from [`ticket_cache_state`]). Without `KRB5CCNAME` only the
+/// default file cache was looked for: krb5.conf can select another, so no
+/// missing ticket is claimed beyond it.
+fn no_ticket_cache_finding(location: Option<&str>) -> &'static str {
+    match location {
+        Some("KRB5CCNAME") => {
+            "The Kerberos ticket cache KRB5CCNAME names was not found, so the integrated login \
+             had no ticket to present."
+        }
+        _ => {
+            "The default file Kerberos ticket cache was not found for this user; unless \
+             krb5.conf selects another cache (KCM or KEYRING, which sqlcmd does not inspect), \
+             the integrated login had no ticket to present."
+        }
+    }
+}
 /// Whether an operating-system error means this computer would not open the
 /// connection (permissions, no local address, no sockets left), rather than
 /// anything about the target.
@@ -2568,32 +3122,261 @@ fn local_facility_error(code: i32) -> bool {
         matches!(code, 1 | 13 | 23 | 24 | 99 | 105)
     }
 }
+/// What the minimal session operation reads.
+struct SessionProbe {
+    engine_edition: i32,
+    /// The server's UTC clock, in milliseconds since the Unix epoch.
+    server_unix_ms: Option<i64>,
+}
 
-/// Errors from the client, as error-chain records.
+/// The minimal session operation: the engine edition and the server's UTC
+/// clock, in one query. The clock is read as days plus milliseconds, which
+/// every supported version can compute (`DATEDIFF_BIG` needs 2016).
+async fn session_probe(client: &mut TdsClient) -> Result<SessionProbe, Error> {
+    let mut result = client
+        .execute(
+            "SELECT CONVERT(int, SERVERPROPERTY('EngineEdition')), \
+             DATEDIFF(day, '19700101', t.now), \
+             DATEDIFF(millisecond, CONVERT(datetime2, CONVERT(date, t.now)), t.now) \
+             FROM (SELECT SYSUTCDATETIME() AS now) AS t"
+                .to_string(),
+            (),
+        )
+        .await?;
+    let mut probe = None;
+    loop {
+        match result {
+            StatementResult::Rows => {
+                while let Some(row) = client.next_row().await? {
+                    if probe.is_none()
+                        && let Some(ColumnValues::Int(edition)) = row.first()
+                    {
+                        let server_unix_ms = match (row.get(1), row.get(2)) {
+                            (Some(ColumnValues::Int(days)), Some(ColumnValues::Int(ms))) => {
+                                Some(i64::from(*days) * 86_400_000 + i64::from(*ms))
+                            }
+                            _ => None,
+                        };
+                        probe = Some(SessionProbe {
+                            engine_edition: *edition,
+                            server_unix_ms,
+                        });
+                    }
+                }
+            }
+            StatementResult::NoRows { .. } => {}
+            StatementResult::End => break,
+        }
+        result = client.advance().await?;
+    }
+    probe.ok_or_else(|| {
+        Error::ProtocolError("the session validation query returned no row".to_string())
+    })
+}
+
+fn unix_ms_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+/// The failed phase: the innermost failed one, i.e. the failed one that
+/// started last (a TLS handshake that fails inside login fails login too).
+/// A phase that was abandoned did not fail; when a time limit ended the
+/// attempt (`timed_out`) and none failed, it is the innermost abandoned one,
+/// the phase the time ran out in.
+fn failed_stage(steps: &[Step], timed_out: bool) -> Option<Stage> {
+    let innermost = |pick: fn(&Step) -> bool| {
+        steps
+            .iter()
+            .filter(|step| pick(step))
+            .max_by_key(|step| step.started)
+            .map(|step| step.stage)
+    };
+    innermost(Step::failed).or_else(|| {
+        if timed_out {
+            innermost(Step::abandoned)
+        } else {
+            None
+        }
+    })
+}
+
+/// Drops the phases up to the last login a routing redirect ended (the
+/// gateway's connection), so the phases are those of the connection the
+/// client made where it was sent. True when there was such a redirect.
+fn followed_redirect(steps: &mut Vec<Step>) -> bool {
+    let Some(redirect) = steps
+        .iter()
+        .filter(|s| s.stage == Stage::Login && s.detail("redirected") == Some("true"))
+        .map(|s| s.ended)
+        .max()
+    else {
+        return false;
+    };
+    steps.retain(|s| s.started > redirect);
+    true
+}
+/// Removes a failed phase that only failed because a phase inside it did (the
+/// login around a failed TLS handshake), so the report shows one failure.
+fn drop_enclosing_failures(steps: &mut Vec<Step>) {
+    let failed: Vec<(Instant, Instant)> = steps
+        .iter()
+        .filter(|step| step.ok != Some(true))
+        .map(|step| (step.started, step.ended))
+        .collect();
+    steps.retain(|step| {
+        step.ok == Some(true)
+            || !failed.iter().any(|(start, end)| {
+                (*start, *end) != (step.started, step.ended)
+                    && *start >= step.started
+                    && *end <= step.ended
+            })
+    });
+}
+
+/// Errors from the client, as error-chain records, every server error kept.
 fn error_records(error: &Error, check: CheckId) -> Vec<ErrorRecord> {
     match error {
+        Error::SqlServerError { diagnostics } if !diagnostics.errors.is_empty() => diagnostics
+            .errors
+            .iter()
+            .map(|e| {
+                let mut record = ErrorRecord::new("sqlServer", check, e.message.clone());
+                record.number = Some(e.number);
+                record.state = Some(e.state);
+                record.class = Some(e.class);
+                record
+            })
+            .collect(),
         Error::Io(io) => {
             let mut record = ErrorRecord::new("os", check, io.to_string());
             record.os_error = io.raw_os_error();
             record.code = Some(TcpResult::from_io(io).name().to_string());
             vec![record]
         }
+        _ if is_tls_error(error) => vec![ErrorRecord::new("tls", check, error.to_string())],
         _ => vec![ErrorRecord::new("client", check, error.to_string())],
     }
 }
+
+/// Login errors whose cause is the login itself rather than the network.
+const LOGIN_ERRORS: [u32; 6] = [18456, 18452, 18470, 18486, 18487, 18488];
+/// The login succeeded but the database could not be opened.
+const DATABASE_ERRORS: [u32; 2] = [4060, 4064];
 
 /// A connection-attempt failure, classified.
 struct Classified {
     coverage: Coverage,
     domain: Domain,
+    auth: AuthOutcome,
+    tls_category: Option<&'static str>,
+    from_message_text: bool,
     finding: String,
     errors: Vec<ErrorRecord>,
 }
 
-/// A failure before any connect stage: nothing more specific than the
-/// client's error says where it is.
-fn classify_connection_error(error: &Error) -> Classified {
+fn classify_connection_error(
+    error: &Error,
+    phase: Option<Stage>,
+    authentication: &Authentication,
+) -> Classified {
     let errors = error_records(error, CheckId::ConnectionAttempt);
+    let auth_domain = match authentication {
+        Authentication::SqlPassword { .. } => "security.authentication.sql",
+        // Integrated is SSPI on Windows, Kerberos (GSSAPI) elsewhere: the
+        // handoff goes to the area that owns it.
+        Authentication::Integrated if cfg!(windows) => "security.authentication.windows",
+        Authentication::Integrated => "security.authentication.kerberos",
+    };
+    let reached_login = phase == Some(Stage::Login);
+
+    if let Error::SqlServerError { diagnostics } = error {
+        let first = diagnostics.errors.first();
+        let number = first.map_or(0, |e| e.number);
+        let text = first.map_or_else(|| error.to_string(), |e| e.message.clone());
+        let (domain, auth) = if LOGIN_ERRORS.contains(&number) {
+            (Domain::specific(auth_domain), AuthOutcome::Failed)
+        } else if DATABASE_ERRORS.contains(&number) {
+            (Domain::specific("target.sqlServer"), AuthOutcome::Succeeded)
+        } else {
+            (
+                Domain::undetermined(&[auth_domain, "target.sqlServer"]),
+                if reached_login {
+                    AuthOutcome::Failed
+                } else {
+                    AuthOutcome::NotEvaluated
+                },
+            )
+        };
+        let identifiers = first.map_or(String::new(), |e| {
+            format!(" (state {}, class {})", e.state, e.class)
+        });
+        return Classified {
+            coverage: Coverage::Diagnosed,
+            domain,
+            auth,
+            tls_category: None,
+            from_message_text: false,
+            finding: format!("The server ended the login with error {number}{identifiers}: {text}"),
+            errors,
+        };
+    }
+
+    if let Error::Security(security) = error {
+        return Classified {
+            coverage: Coverage::Diagnosed,
+            domain: Domain::specific(auth_domain),
+            auth: AuthOutcome::Failed,
+            tls_category: None,
+            from_message_text: false,
+            finding: format!("Integrated authentication failed on the client: {security}"),
+            errors,
+        };
+    }
+
+    if phase == Some(Stage::Tls) || is_tls_error(error) {
+        let category = tls_category(error);
+        // The client's own certificate errors are definite evidence; a
+        // category read from the error text is weaker.
+        let typed = matches!(
+            error,
+            Error::CertificateExpired | Error::CertificateMismatch | Error::NoServerCertificate
+        );
+        let (coverage, domain) = match category {
+            Some("reset") | None => (
+                Coverage::Inconclusive,
+                Domain::undetermined(&["security.tlsCertificate", "connectivity.network"]),
+            ),
+            Some(_) if typed => (
+                Coverage::Diagnosed,
+                Domain::specific("security.tlsCertificate"),
+            ),
+            Some(_) => (
+                Coverage::Classified,
+                Domain::specific("security.tlsCertificate"),
+            ),
+        };
+        let from_message_text = category.is_some() && !typed;
+        let mut errors = errors;
+        // The records say so too, so the JSON report marks them.
+        for record in &mut errors {
+            record.from_message_text |= from_message_text;
+        }
+        return Classified {
+            coverage,
+            domain,
+            auth: AuthOutcome::NotEvaluated,
+            tls_category: category,
+            from_message_text,
+            finding: format!(
+                "The TLS handshake failed{}: {error}",
+                category.map_or(String::new(), |c| format!(" ({c})"))
+            ),
+            errors,
+        };
+    }
+
     let domain = match error {
         Error::TimeoutError(_) => {
             Domain::undetermined(&["connectivity.network", "target.sqlServer"])
@@ -2604,11 +3387,37 @@ fn classify_connection_error(error: &Error) -> Classified {
     Classified {
         coverage: Coverage::Inconclusive,
         domain,
-        finding: format!("The connection attempt failed: {error}"),
+        auth: if reached_login {
+            AuthOutcome::Failed
+        } else {
+            AuthOutcome::NotEvaluated
+        },
+        tls_category: None,
+        from_message_text: false,
+        finding: format!(
+            "The connection attempt failed{}: {error}",
+            phase.map_or(String::new(), |p| format!(" during {}", p.title()))
+        ),
         errors,
     }
 }
 
+/// Runs `work`, which may block (on DNS, say), on its own thread and waits
+/// for it at most `budget`, without blocking the runtime, so a cancel is
+/// still seen. Work that never finishes leaves its thread behind rather than
+/// the diagnosis.
+async fn within<T: Send + 'static>(
+    budget: Duration,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        let _ = sender.send(work());
+    });
+    tokio::time::timeout(budget, receiver).await.ok()?.ok()
+}
+
+/// Runs the connection attempt for at most `remaining`, what the steps before
 /// it left of the check's time limit (`limit_s`). The client's own limits are
 /// whole seconds rounded up, so they alone cannot keep the check within it.
 async fn bounded<T>(
@@ -2674,10 +3483,82 @@ fn ssrp_problem(code: &str, detail: Option<&str>) -> String {
         _ => detail("the lookup failed"),
     }
 }
+fn is_tls_error(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::TlsError(_)
+            | Error::TlsHandshakeError { .. }
+            | Error::CertificateNotFound { .. }
+            | Error::InvalidCertificateFormat { .. }
+            | Error::CertificateExpired
+            | Error::CertificateMismatch
+            | Error::NoServerCertificate
+    ) || error
+        .to_string()
+        .to_ascii_lowercase()
+        .contains("tls handshake")
+}
+
+/// The kind of TLS failure: `expired`, `trustChain`, `hostnameMismatch`,
+/// `protocol`, `cipher`, or `reset` for a handshake the peer ended. Typed
+/// errors first, then the error text (Schannel and OpenSSL wording).
+fn tls_category(error: &Error) -> Option<&'static str> {
+    match error {
+        Error::CertificateExpired => return Some("expired"),
+        Error::CertificateMismatch => return Some("hostnameMismatch"),
+        Error::NoServerCertificate => return Some("trustChain"),
+        _ => {}
+    }
+    let text = error.to_string().to_ascii_lowercase();
+    let has = |needles: &[&str]| needles.iter().any(|n| text.contains(n));
+    if has(&[
+        "sec_e_cert_expired",
+        "certificate has expired",
+        "cert_e_expired",
+    ]) {
+        Some("expired")
+    } else if has(&[
+        "sec_e_wrong_principal",
+        "cert_e_cn_no_match",
+        "hostname mismatch",
+        "host name mismatch",
+    ]) {
+        Some("hostnameMismatch")
+    } else if has(&[
+        "sec_e_untrusted_root",
+        "cert_e_untrustedroot",
+        "unable to get local issuer",
+        "self-signed certificate",
+        "self signed certificate",
+        "certificate verify failed",
+        "not trusted",
+    ]) {
+        Some("trustChain")
+    } else if has(&[
+        "sec_e_unsupported_function",
+        "unsupported protocol",
+        "wrong version number",
+        "no protocols available",
+    ]) {
+        Some("protocol")
+    } else if has(&["sec_e_algorithm_mismatch", "no shared cipher"]) {
+        Some("cipher")
+    } else if has(&[
+        "peer closed",
+        "connection reset",
+        "forcibly closed",
+        "unexpected eof",
+    ]) {
+        Some("reset")
+    } else {
+        None
+    }
+}
 
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use mssql_tds::error::{SqlErrorInfo, SqlServerDiagnostics};
 
     pub(crate) fn request(server: &str, depth: Depth) -> Request {
         Request {
@@ -2697,6 +3578,210 @@ pub(crate) mod tests {
             invalid: None,
             sources: SettingSources::default(),
         }
+    }
+
+    fn step(stage: Stage, ok: bool, start_ms: u64, end_ms: u64, base: Instant) -> Step {
+        Step {
+            stage,
+            ok: Some(ok),
+            duration_ms: end_ms - start_ms,
+            details: Vec::new(),
+            started: base + Duration::from_millis(start_ms),
+            ended: base + Duration::from_millis(end_ms),
+        }
+    }
+
+    fn server_error(number: u32, message: &str) -> Error {
+        let mut diagnostics = SqlServerDiagnostics::default();
+        diagnostics.errors.push(SqlErrorInfo {
+            message: message.to_string(),
+            state: 1,
+            class: 14,
+            number,
+            server_name: None,
+            proc_name: None,
+            line_number: None,
+        });
+        Error::SqlServerError { diagnostics }
+    }
+
+    /// The target type follows `SERVERPROPERTY('EngineEdition')` as documented;
+    /// Fabric is not reported as SQL Server, and an unknown edition is not guessed.
+    #[test]
+    fn the_engine_edition_names_the_target() {
+        let target = |edition: i32| {
+            ServerInfo {
+                name: None,
+                version: None,
+                database: String::new(),
+                encrypted: true,
+                engine_edition: Some(edition),
+            }
+            .target_type()
+        };
+        for (edition, expected) in [
+            (1, "sqlServer"),
+            (2, "sqlServer"),
+            (3, "sqlServer"),
+            (4, "sqlServer"),
+            (5, "azureSqlDatabase"),
+            (6, "azureSynapseAnalytics"),
+            (8, "azureSqlManagedInstance"),
+            (9, "azureSqlEdge"),
+            (11, "azureSynapseServerlessOrFabric"),
+            (12, "fabricSqlDatabase"),
+            (7, "unknown"),
+            (13, "unknown"),
+        ] {
+            assert_eq!(target(edition), Some(expected), "edition {edition}");
+        }
+    }
+
+    /// A login the gateway redirected is not a failure: the phases reported
+    /// are those of the connection the client made where it was sent.
+    #[test]
+    fn a_redirected_login_reports_the_connection_after_it() {
+        let base = Instant::now();
+        let mut redirected_login = step(Stage::Login, false, 2, 10, base);
+        redirected_login
+            .details
+            .push(("redirected", "true".to_string()));
+        let mut steps = vec![
+            step(Stage::Prelogin, true, 0, 1, base),
+            step(Stage::Tls, true, 1, 2, base),
+            redirected_login,
+            step(Stage::Prelogin, true, 11, 12, base),
+            step(Stage::Tls, true, 12, 14, base),
+            step(Stage::Login, true, 14, 30, base),
+        ];
+        assert!(followed_redirect(&mut steps));
+        assert_eq!(steps.len(), 3);
+        assert!(steps.iter().all(|s| s.ok == Some(true)), "{steps:#?}");
+        assert_eq!(failed_stage(&steps, false), None);
+
+        let mut direct = vec![
+            step(Stage::Prelogin, true, 0, 1, base),
+            step(Stage::Login, false, 1, 5, base),
+        ];
+        assert!(!followed_redirect(&mut direct));
+        assert_eq!(failed_stage(&direct, false), Some(Stage::Login));
+    }
+
+    fn sql_login() -> Authentication {
+        Authentication::SqlPassword {
+            user: "sa".to_string(),
+            password: "x".to_string(),
+        }
+    }
+
+    #[test]
+    fn a_rejected_login_is_diagnosed_as_sql_authentication() {
+        let c = classify_connection_error(
+            &server_error(18456, "Login failed for user 'sa'."),
+            Some(Stage::Login),
+            &sql_login(),
+        );
+        assert_eq!(c.coverage, Coverage::Diagnosed);
+        assert_eq!(c.domain, Domain::specific("security.authentication.sql"));
+        assert_eq!(c.auth, AuthOutcome::Failed);
+        assert_eq!(c.errors[0].number, Some(18456));
+        assert_eq!(c.errors[0].class, Some(14));
+        assert!(
+            c.finding.contains("error 18456 (state 1, class 14)"),
+            "{}",
+            c.finding
+        );
+        // Integrated is SSPI on Windows and Kerberos (GSSAPI) elsewhere.
+        let integrated = classify_connection_error(
+            &server_error(18456, "x"),
+            Some(Stage::Login),
+            &Authentication::Integrated,
+        );
+        let expected = if cfg!(windows) {
+            "security.authentication.windows"
+        } else {
+            "security.authentication.kerberos"
+        };
+        assert_eq!(integrated.domain, Domain::specific(expected));
+    }
+
+    #[test]
+    fn an_unopenable_database_is_a_target_issue_after_a_good_login() {
+        let c = classify_connection_error(
+            &server_error(4060, "Cannot open database"),
+            Some(Stage::Login),
+            &sql_login(),
+        );
+        assert_eq!(c.domain, Domain::specific("target.sqlServer"));
+        assert_eq!(c.auth, AuthOutcome::Succeeded);
+    }
+
+    #[test]
+    fn tls_failures_are_classified_from_types_then_text() {
+        // The client's typed certificate errors are diagnosed; a category
+        // read from the text is only classified.
+        for (error, category) in [
+            (Error::CertificateExpired, "expired"),
+            (Error::CertificateMismatch, "hostnameMismatch"),
+            (Error::NoServerCertificate, "trustChain"),
+        ] {
+            let c = classify_connection_error(&error, Some(Stage::Tls), &sql_login());
+            assert_eq!(
+                (c.coverage, c.tls_category),
+                (Coverage::Diagnosed, Some(category))
+            );
+            assert_eq!(c.domain, Domain::specific("security.tlsCertificate"));
+        }
+        let typed =
+            classify_connection_error(&Error::CertificateExpired, Some(Stage::Tls), &sql_login());
+        assert_eq!(typed.coverage, Coverage::Diagnosed);
+        assert_eq!(typed.tls_category, Some("expired"));
+        assert!(!typed.from_message_text);
+        assert!(typed.errors.iter().all(|e| !e.from_message_text));
+
+        let untrusted = classify_connection_error(
+            &Error::ImplementationError(
+                "Schannel TLS handshake failed: SEC_E_UNTRUSTED_ROOT (status=0x80090325)"
+                    .to_string(),
+            ),
+            Some(Stage::Tls),
+            &sql_login(),
+        );
+        assert_eq!(untrusted.tls_category, Some("trustChain"));
+        assert_eq!(untrusted.coverage, Coverage::Classified);
+        assert_eq!(
+            untrusted.domain,
+            Domain::specific("security.tlsCertificate")
+        );
+        assert!(untrusted.from_message_text);
+        assert!(untrusted.errors.iter().all(|e| e.from_message_text));
+        assert_eq!(untrusted.auth, AuthOutcome::NotEvaluated);
+
+        let reset = classify_connection_error(
+            &Error::ImplementationError(
+                "Schannel TLS handshake failed: peer closed connection during TLS handshake"
+                    .to_string(),
+            ),
+            Some(Stage::Tls),
+            &sql_login(),
+        );
+        assert_eq!(
+            reset.coverage,
+            Coverage::Inconclusive,
+            "a reset is not specific"
+        );
+        assert_eq!(reset.domain.primary, "undetermined");
+    }
+
+    #[test]
+    fn a_generic_timeout_selects_no_specific_domain() {
+        let c = classify_connection_error(
+            &Error::TimeoutError(mssql_tds::error::TimeoutErrorType::String("x".to_string())),
+            Some(Stage::Prelogin),
+            &sql_login(),
+        );
+        assert_eq!(c.coverage, Coverage::Inconclusive);
+        assert_eq!(c.domain.primary, "undetermined");
     }
 
     #[test]
@@ -2753,6 +3838,81 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_failed_handshake_inside_the_login_is_reported_once() {
+        let base = Instant::now();
+        let mut steps = vec![
+            step(Stage::Prelogin, true, 0, 1, base),
+            step(Stage::Tls, false, 2, 9, base),
+            step(Stage::Login, false, 1, 9, base),
+        ];
+        assert_eq!(failed_stage(&steps, false), Some(Stage::Tls));
+        drop_enclosing_failures(&mut steps);
+        let stages: Vec<Stage> = steps.iter().map(|s| s.stage).collect();
+        assert_eq!(stages, [Stage::Prelogin, Stage::Tls]);
+    }
+
+    /// The report, not just the helper, drops the login that failed only
+    /// because the TLS handshake inside it did: the attempt shows pre-login
+    /// and TLS, with TLS the one failed phase, in JSON and text.
+    #[test]
+    fn the_report_shows_a_failed_handshake_inside_the_login_once() {
+        let stages = Stages::new()
+            .add(
+                Stage::Dns,
+                Some(true),
+                0,
+                1,
+                &[(cs::HOST, "db01"), (cs::ADDRESSES, "10.0.0.1")],
+            )
+            .add(
+                Stage::Tcp,
+                Some(true),
+                1,
+                2,
+                &[(cs::ADDRESS, "10.0.0.1"), (cs::PORT, "1433")],
+            )
+            .add(Stage::Prelogin, Some(true), 2, 3, &[])
+            .add(Stage::Login, Some(false), 3, 10, &[])
+            .add(Stage::Tls, Some(false), 4, 9, &[]);
+        let report = observed(
+            request("tcp:db01,1433", Depth::ConnectionAttempt),
+            stages,
+            Ended::Failed(Error::ProtocolError("TLS handshake failed".to_string())),
+        );
+        let attempt = checked(&report, CheckId::ConnectionAttempt);
+        let phases: Vec<Stage> = attempt.subphases.iter().map(|s| s.stage).collect();
+        assert_eq!(phases, [Stage::Prelogin, Stage::Tls], "{attempt:#?}");
+
+        let value: serde_json::Value =
+            serde_json::from_str(&report::json(&report, "v").unwrap()).unwrap();
+        let check = value["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["check"] == "connectionAttempt")
+            .unwrap();
+        let listed: Vec<(&str, &str)> = check["phases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| (p["phase"].as_str().unwrap(), p["status"].as_str().unwrap()))
+            .collect();
+        assert_eq!(
+            listed,
+            [("prelogin", "passed"), ("tls", "failed")],
+            "{check:#}"
+        );
+
+        let text = report::text(&report);
+        let line = text
+            .lines()
+            .find(|l| l.trim_start().starts_with("Connection attempt"))
+            .unwrap();
+        assert_eq!(line.matches("FAILED").count(), 1, "{text}");
+        assert!(!line.contains(", login"), "{text}");
+    }
+
+    #[test]
     fn the_outcome_follows_the_specification_precedence() {
         use Coverage::*;
         let checks = |list: &[(CheckId, Coverage)]| -> Vec<Check> {
@@ -2778,6 +3938,11 @@ pub(crate) mod tests {
                 (CheckId::TcpConnect, Skipped)
             ])),
             DiagnosticOutcome::Inconclusive
+        );
+        assert_eq!(
+            aggregate(&checks(&[(CheckId::ConnectionAttempt, Inconclusive)])),
+            DiagnosticOutcome::IssueDetected,
+            "a known failed operation stays issueDetected"
         );
         assert_eq!(
             aggregate(&checks(&[(CheckId::TcpConnect, Skipped)])),
@@ -3146,12 +4311,21 @@ pub(crate) mod tests {
             assert_eq!(report.exit_code(), 1);
         }
 
-        // Live, on this platform: the connect to port 0 fails at once.
-        let report = run(request("tcp:127.0.0.1,0", Depth::NetworkReachability));
-        assert_eq!(report.checks[0].coverage, Coverage::Passed, "{report:#?}");
-        let check = checked(&report, CheckId::TcpConnect);
-        assert_eq!(check.coverage, Coverage::Diagnosed, "{report:#?}");
-        assert_eq!(report.exit_code(), 1, "{report:#?}");
+        // Live, on this platform: the connect to port 0 fails at once, and
+        // at the default depth the connection attempt is not made.
+        for depth in [Depth::NetworkReachability, Depth::SessionValidation] {
+            let report = run(request("tcp:127.0.0.1,0", depth));
+            assert_eq!(report.checks[0].coverage, Coverage::Passed, "{report:#?}");
+            let check = checked(&report, CheckId::TcpConnect);
+            assert_eq!(check.coverage, Coverage::Diagnosed, "{report:#?}");
+            if depth == Depth::SessionValidation {
+                assert_eq!(
+                    checked(&report, CheckId::ConnectionAttempt).skip,
+                    Some(Skip::BlockedBy(CheckId::TcpConnect))
+                );
+            }
+            assert_eq!(report.exit_code(), 1, "{report:#?}");
+        }
     }
     /// Shared memory to another computer fails Connection input, as the
     /// client refuses it, rather than passing a server the client rejects.
@@ -3348,19 +4522,56 @@ pub(crate) mod tests {
     }
 
     /// A live server over a named pipe, when `MSSQL_SQLCMD_DIAGNOSTICS_PIPE`
-    /// names one, in any case (`\\.\PIPE\sql\query`): the pipe opens.
+    /// names one, in any case (`\\.\PIPE\sql\query`), with the `..._USER`
+    /// and `..._PASSWORD` of the live test: passes through session validation.
     #[cfg(windows)]
     #[test]
     fn a_live_named_pipe_passes_whatever_its_case() {
         let Ok(pipe) = std::env::var("MSSQL_SQLCMD_DIAGNOSTICS_PIPE") else {
             return;
         };
-        let report = run(request(&pipe, Depth::NetworkReachability));
+        let mut live = request(&pipe, Depth::SessionValidation);
+        live.authentication = Authentication::SqlPassword {
+            user: std::env::var("MSSQL_SQLCMD_DIAGNOSTICS_USER").unwrap_or_default(),
+            password: std::env::var("MSSQL_SQLCMD_DIAGNOSTICS_PASSWORD").unwrap_or_default(),
+        };
+        let report = run(live);
         assert_eq!(
             report.outcome,
             DiagnosticOutcome::Passed,
             "{pipe}: {report:#?}"
         );
+    }
+    /// A live server over IPv6, when `MSSQL_SQLCMD_DIAGNOSTICS_IPV6` names a
+    /// bare IPv6 target such as `::1,1433` (with the `..._USER` and
+    /// `..._PASSWORD` of the live test): passes through session validation
+    /// with and without the `tcp:` prefix.
+    /// Without a prefix, on Windows, a name that does not resolve is tried
+    /// over named pipes next, as the client does: name resolution's error is
+    /// kept, marked superseded.
+    #[cfg(windows)]
+    #[test]
+    fn without_a_prefix_a_failed_tcp_path_falls_back_to_named_pipes() {
+        let report = run(request("nosuchhost.invalid", Depth::SessionValidation));
+        let attempt = report
+            .checks
+            .iter()
+            .find(|c| c.id == CheckId::ConnectionAttempt)
+            .unwrap();
+        assert!(attempt.coverage.failed(), "{attempt:#?}");
+        assert_eq!(attempt.field("transport"), Some("namedPipe"));
+        assert_eq!(
+            attempt.field("pipe"),
+            Some(r"\\nosuchhost.invalid\pipe\sql\query")
+        );
+        let resolution = report
+            .errors
+            .iter()
+            .find(|e| e.check == CheckId::NameResolution)
+            .unwrap();
+        assert!(resolution.superseded, "{resolution:#?}");
+        let order: Vec<CheckId> = report.checks.iter().map(|c| c.id).collect();
+        assert_eq!(order, CheckId::ORDER, "checks stay in their order");
     }
 
     /// Elsewhere there is no other transport: the TCP path's failure blocks
@@ -3513,6 +4724,38 @@ pub(crate) mod tests {
         );
     }
 
+    /// A live default instance on this computer, when
+    /// `MSSQL_SQLCMD_DIAGNOSTICS_SHARED_MEMORY` names it without a prefix,
+    /// with a wrong password: SQL Server answered over shared memory, so the
+    /// client tries no other transport and the diagnosis ends there.
+    #[cfg(windows)]
+    #[test]
+    fn a_refused_login_over_shared_memory_ends_the_protocol_order() {
+        let Ok(server) = std::env::var("MSSQL_SQLCMD_DIAGNOSTICS_SHARED_MEMORY") else {
+            return;
+        };
+        let mut live = request(&server, Depth::SessionValidation);
+        live.authentication = Authentication::SqlPassword {
+            user: std::env::var("MSSQL_SQLCMD_DIAGNOSTICS_USER").unwrap_or_default(),
+            password: "not-the-password".to_string(),
+        };
+        let report = run(live);
+        let attempts: Vec<&Check> = report
+            .checks
+            .iter()
+            .filter(|c| c.id == CheckId::ConnectionAttempt)
+            .collect();
+        assert_eq!(attempts.len(), 1, "{:#?}", report.checks);
+        assert_eq!(attempts[0].coverage, Coverage::Diagnosed);
+        assert_eq!(attempts[0].field("transport"), Some("sharedMemory"));
+        let tcp = report
+            .checks
+            .iter()
+            .find(|c| c.id == CheckId::TcpConnect)
+            .unwrap();
+        assert_eq!(tcp.coverage, Coverage::NotApplicable, "{tcp:#?}");
+    }
+
     /// Blocking work the diagnosis started (a name lookup that does not
     /// return) does not hold up the report once the diagnosis ends.
     #[test]
@@ -3556,13 +4799,53 @@ pub(crate) mod tests {
         assert!(!format!("{report:?}").contains("secret-password"));
     }
 
+    /// A live default instance on this computer, when
+    /// `MSSQL_SQLCMD_DIAGNOSTICS_SHARED_MEMORY` names it without a prefix
+    /// (e.g. `localhost`), with the `..._USER` and `..._PASSWORD` of the live
+    /// test: it connects over shared memory and the TCP checks do not apply.
+    #[cfg(windows)]
+    #[test]
+    fn a_live_local_server_without_a_prefix_connects_over_shared_memory() {
+        let Ok(server) = std::env::var("MSSQL_SQLCMD_DIAGNOSTICS_SHARED_MEMORY") else {
+            return;
+        };
+        let mut live = request(&server, Depth::SessionValidation);
+        live.authentication = Authentication::SqlPassword {
+            user: std::env::var("MSSQL_SQLCMD_DIAGNOSTICS_USER").unwrap_or_default(),
+            password: std::env::var("MSSQL_SQLCMD_DIAGNOSTICS_PASSWORD").unwrap_or_default(),
+        };
+        let report = run(live);
+        assert_eq!(report.outcome, DiagnosticOutcome::Passed, "{report:#?}");
+        let attempt = report
+            .checks
+            .iter()
+            .find(|c| c.id == CheckId::ConnectionAttempt)
+            .unwrap();
+        assert_eq!(attempt.field("transport"), Some("sharedMemory"));
+        for id in [
+            CheckId::NameResolution,
+            CheckId::InstanceResolution,
+            CheckId::TcpConnect,
+        ] {
+            let check = report.checks.iter().find(|c| c.id == id).unwrap();
+            assert_eq!(check.coverage, Coverage::NotApplicable, "{check:#?}");
+        }
+        let order: Vec<CheckId> = report.checks.iter().map(|c| c.id).collect();
+        assert_eq!(order, CheckId::ORDER);
+    }
+
     #[test]
     fn a_live_ipv6_server_passes_with_and_without_a_prefix() {
         let Ok(server) = std::env::var("MSSQL_SQLCMD_DIAGNOSTICS_IPV6") else {
             return;
         };
         for target in [server.clone(), format!("tcp:{server}")] {
-            let report = run(request(&target, Depth::NetworkReachability));
+            let mut live = request(&target, Depth::SessionValidation);
+            live.authentication = Authentication::SqlPassword {
+                user: std::env::var("MSSQL_SQLCMD_DIAGNOSTICS_USER").unwrap_or_default(),
+                password: std::env::var("MSSQL_SQLCMD_DIAGNOSTICS_PASSWORD").unwrap_or_default(),
+            };
+            let report = run(live);
             assert_eq!(
                 report.outcome,
                 DiagnosticOutcome::Passed,
@@ -3570,35 +4853,66 @@ pub(crate) mod tests {
             );
         }
     }
-    /// A live server, when `MSSQL_SQLCMD_DIAGNOSTICS_SERVER` names one: every
-    /// check passes, through network reachability, and this build does not
-    /// run the deeper ones.
+    /// A live server, when `MSSQL_SQLCMD_DIAGNOSTICS_SERVER` names one (with
+    /// `..._USER` and `..._PASSWORD`): every check passes, through session
+    /// validation.
     #[test]
     fn a_live_server_passes_every_check() {
         let Ok(server) = std::env::var("MSSQL_SQLCMD_DIAGNOSTICS_SERVER") else {
             return;
         };
-        let mut live = request(&server, Depth::NetworkReachability);
+        let mut live = request(&server, Depth::SessionValidation);
+        live.authentication = Authentication::SqlPassword {
+            user: std::env::var("MSSQL_SQLCMD_DIAGNOSTICS_USER").unwrap_or_default(),
+            password: std::env::var("MSSQL_SQLCMD_DIAGNOSTICS_PASSWORD").unwrap_or_default(),
+        };
         live.login_timeout_seconds = 15;
         let report = run(live);
         assert_eq!(report.outcome, DiagnosticOutcome::Passed, "{report:#?}");
-        for id in [CheckId::NameResolution, CheckId::TcpConnect] {
+        let session = report
+            .checks
+            .iter()
+            .find(|c| c.id == CheckId::SessionValidation)
+            .unwrap();
+        assert_eq!(session.coverage, Coverage::Passed);
+        assert!(report.server.as_ref().unwrap().target_type().is_some());
+        assert_eq!(report.authentication, Some(AuthOutcome::Succeeded));
+        let offset: i64 = session.field("clockOffsetMs").unwrap().parse().unwrap();
+        assert!(offset.abs() < KERBEROS_CLOCK_TOLERANCE_MS, "{offset}");
+        for id in [
+            CheckId::NameResolution,
+            CheckId::TcpConnect,
+            CheckId::ConnectionAttempt,
+            CheckId::SessionValidation,
+        ] {
             let check = report.checks.iter().find(|c| c.id == id).unwrap();
             // An address literal needs no lookup, so has no time limit.
             let expected = (check.field("result") != Some("addressLiteral")).then_some(15_000);
             assert_eq!(check.deadline_ms, expected, "{id:?}");
         }
+        assert_eq!(report.tracing_guide, None);
+    }
 
-        let report = run(request(&server, Depth::SessionValidation));
-        assert_eq!(report.outcome, DiagnosticOutcome::NotEvaluated);
-        for id in [CheckId::ConnectionAttempt, CheckId::SessionValidation] {
+    #[test]
+    fn driver_tracing_is_suggested_only_where_the_client_sees_no_further() {
+        let guide = |id: CheckId, coverage: Coverage| {
+            let mut diagnosis = Diagnosis::new(request("tcp:db01,1433", Depth::SessionValidation));
+            diagnosis.checks.push(Check::new(id, coverage));
+            diagnosis.finish(0, 0).tracing_guide
+        };
+        for coverage in [Coverage::Inconclusive, Coverage::Classified] {
             assert_eq!(
-                checked(&report, id).skip,
-                Some(Skip::NotInThisBuild),
-                "{id:?}"
+                guide(CheckId::ConnectionAttempt, coverage),
+                Some(TRACING_GUIDE)
+            );
+            assert_eq!(
+                guide(CheckId::SessionValidation, coverage),
+                Some(TRACING_GUIDE)
             );
         }
-        assert_eq!(report.exit_code(), 2, "{report:#?}");
+        assert_eq!(guide(CheckId::ConnectionAttempt, Coverage::Diagnosed), None);
+        assert_eq!(guide(CheckId::ConnectionAttempt, Coverage::Passed), None);
+        assert_eq!(guide(CheckId::TcpConnect, Coverage::Inconclusive), None);
     }
 
     #[test]
@@ -3615,18 +4929,15 @@ pub(crate) mod tests {
         assert!(!domain(Coverage::Inconclusive).diagnosed);
     }
     /// A live LocalDB instance, when `MSSQL_SQLCMD_DIAGNOSTICS_LOCALDB` names
-    /// one: its pipe opens as the client opens it, the TCP checks not
-    /// applying.
+    /// one: connected to as the client does (no encryption), it passes through
+    /// session validation, the TCP checks not applying.
     #[cfg(windows)]
     #[test]
     fn a_live_localdb_instance_passes() {
         let Ok(instance) = std::env::var("MSSQL_SQLCMD_DIAGNOSTICS_LOCALDB") else {
             return;
         };
-        let mut localdb = request(
-            &format!("(localdb)\\{instance}"),
-            Depth::NetworkReachability,
-        );
+        let mut localdb = request(&format!("(localdb)\\{instance}"), Depth::SessionValidation);
         localdb.authentication = Authentication::Integrated;
         let report = run(localdb);
         for check in &report.checks {
@@ -3658,6 +4969,24 @@ pub(crate) mod tests {
             Ok::<_, Error>(7)
         }));
         assert_eq!(done.unwrap(), 7);
+    }
+    /// LocalDB is resolved before the attempt (on a thread of its own); an
+    /// instance that does not exist, or no LocalDB at all, fails the attempt.
+    #[cfg(windows)]
+    #[test]
+    fn a_localdb_instance_that_does_not_exist_fails_the_attempt() {
+        let report = run(request(
+            "(localdb)\\NoSuchDiagnoseInstance",
+            Depth::ConnectionAttempt,
+        ));
+        let attempt = report
+            .checks
+            .iter()
+            .find(|c| c.id == CheckId::ConnectionAttempt)
+            .unwrap();
+        assert_eq!(attempt.skip, None, "{report:#?}");
+        assert_ne!(attempt.coverage, Coverage::Passed, "{report:#?}");
+        assert!(!report.errors.is_empty());
     }
 
     /// A cancel counts only for the run in progress: one with no run is not
@@ -3792,6 +5121,64 @@ pub(crate) mod tests {
         assert!(report.limitations.iter().any(|l| l.contains("DAC request")));
         assert_eq!(report.exit_code(), 2, "{report:#?}");
     }
+    /// Work that blocks (a slow DNS server, say) does not block the runtime:
+    /// a cancel racing it is seen at once, and the work gets only its budget.
+    #[test]
+    fn a_slow_lookup_does_not_hold_up_a_cancel() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let slow = || std::thread::sleep(Duration::from_secs(3));
+        let started = Instant::now();
+        let canceled = runtime.block_on(async {
+            tokio::select! {
+                _ = within(Duration::from_secs(3), slow) => false,
+                () = tokio::time::sleep(Duration::from_millis(50)) => true,
+            }
+        });
+        assert!(canceled);
+        assert!(started.elapsed() < Duration::from_secs(1));
+
+        let started = Instant::now();
+        assert_eq!(
+            runtime.block_on(within(Duration::from_millis(50), slow)),
+            None
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(
+            runtime.block_on(within(Duration::from_secs(5), || 7)),
+            Some(7)
+        );
+    }
+    #[test]
+    fn a_ticket_cache_is_looked_for_where_kerberos_keeps_it() {
+        let present = |path: &str| path == "/tmp/krb5cc_1000" || path == "/home/u/cc";
+        assert_eq!(
+            ticket_cache_state(None, 1000, present),
+            ("found", "default".to_string())
+        );
+        assert_eq!(
+            ticket_cache_state(Some(""), 1001, present),
+            ("notFound", "default".to_string())
+        );
+        assert_eq!(
+            ticket_cache_state(Some("FILE:/home/u/cc"), 0, present),
+            ("found", "KRB5CCNAME".to_string())
+        );
+        assert_eq!(
+            ticket_cache_state(Some("/home/u/other"), 0, present),
+            ("notFound", "KRB5CCNAME".to_string())
+        );
+        assert_eq!(
+            ticket_cache_state(Some("KCM:1000"), 0, present),
+            ("unverified", "KCM".to_string())
+        );
+        assert_eq!(
+            ticket_cache_state(Some("KEYRING:persistent:1000"), 0, present),
+            ("unverified", "KEYRING".to_string())
+        );
+    }
 
     #[test]
     fn local_refusals_are_told_apart_from_network_failures() {
@@ -3888,10 +5275,33 @@ pub(crate) mod tests {
 
     /// [`observed`], modeling Windows (`windows`) or another platform.
     fn observed_on(request: Request, stages: Stages, ended: Ended, windows: bool) -> Report {
+        observed_with(request, stages, ended, |diagnosis| {
+            diagnosis.windows = windows
+        })
+    }
+
+    /// [`observed`], with the diagnosis `prepare`d first.
+    fn observed_with(
+        request: Request,
+        stages: Stages,
+        ended: Ended,
+        prepare: impl FnOnce(&mut Diagnosis),
+    ) -> Report {
         let mut diagnosis = Diagnosis::new(request);
-        diagnosis.windows = windows;
+        diagnosis.windows = true;
+        prepare(&mut diagnosis);
         let target = diagnosis.connection_input().unwrap();
-        diagnosis.observe(&target, stages.list, &ended, 10);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(diagnosis.observe(&target, stages.list, &ended, 10, None));
+        if !matches!(ended, Ended::Connected) {
+            diagnosis.skip_rest(
+                CheckId::ConnectionAttempt,
+                &Skip::BlockedBy(CheckId::ConnectionAttempt),
+            );
+        }
         diagnosis.finish(0, 0)
     }
 
@@ -3950,10 +5360,72 @@ pub(crate) mod tests {
     }
 
     /// A stage the client abandoned (a time limit or a cancel dropped it) is
-    /// not a failure: a name lookup it cut short is inconclusive, not
-    /// diagnosed.
+    /// not a failure: only a time limit makes it the phase that failed, and
+    /// a name lookup it cut short is inconclusive, not diagnosed.
     #[test]
     fn an_abandoned_stage_is_not_a_failure() {
+        let session = || {
+            Stages::new()
+                .add(
+                    Stage::Dns,
+                    Some(true),
+                    0,
+                    1,
+                    &[(cs::HOST, "db01"), (cs::ADDRESSES, "10.0.0.1")],
+                )
+                .add(
+                    Stage::Tcp,
+                    Some(true),
+                    1,
+                    2,
+                    &[(cs::ADDRESS, "10.0.0.1"), (cs::PORT, "1433")],
+                )
+                .add(Stage::Prelogin, Some(true), 2, 3, &[])
+                .add(Stage::Login, None, 3, 900, &[])
+        };
+        let protocol = Ended::Failed(Error::ProtocolError("unexpected token".to_string()));
+        let report = observed(
+            request("tcp:db01,1433", Depth::ConnectionAttempt),
+            session(),
+            protocol,
+        );
+        let attempt = checked(&report, CheckId::ConnectionAttempt);
+        assert_eq!(attempt.field("failedPhase"), None, "{attempt:#?}");
+        // Nor is it shown as failed: the attempt ended elsewhere.
+        let phase_status = |report: &Report| {
+            let value: serde_json::Value =
+                serde_json::from_str(&report::json(report, "v").unwrap()).unwrap();
+            let check = value["checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["check"] == "connectionAttempt")
+                .unwrap()
+                .clone();
+            check["phases"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|p| p["phase"] == "login")
+                .unwrap()["status"]
+                .clone()
+        };
+        assert_eq!(phase_status(&report), "abandoned");
+        let text = report::text(&report);
+        assert!(text.contains("login 897 ms ABANDONED"), "{text}");
+        assert!(!text.contains("FAILED"), "{text}");
+
+        let report = observed(
+            request("tcp:db01,1433", Depth::ConnectionAttempt),
+            session(),
+            timed_out(),
+        );
+        let attempt = checked(&report, CheckId::ConnectionAttempt);
+        assert_eq!(attempt.field("failedPhase"), Some("login"), "{attempt:#?}");
+        // The phase that ran out of time failed.
+        assert_eq!(phase_status(&report), "failed");
+        assert!(report::text(&report).contains("login 897 ms FAILED"));
+
         let cut_short = Stages::new().add(Stage::Dns, None, 0, 900, &[(cs::HOST, "db01")]);
         let report = observed(
             request("tcp:db01,1433", Depth::NetworkReachability),
@@ -4142,46 +5614,6 @@ pub(crate) mod tests {
         );
     }
 
-    /// This build stops once the transport is open: past it, every check at
-    /// the depth is reported as not checked by this build.
-    #[test]
-    fn the_checks_past_the_transport_are_not_run_by_this_build() {
-        let stages = Stages::new()
-            .add(
-                Stage::Dns,
-                Some(true),
-                0,
-                1,
-                &[(cs::HOST, "db01"), (cs::ADDRESSES, "10.0.0.1")],
-            )
-            .add(
-                Stage::Tcp,
-                Some(true),
-                1,
-                2,
-                &[(cs::ADDRESS, "10.0.0.1"), (cs::PORT, "1433")],
-            );
-        let report = observed(
-            request("tcp:db01,1433", Depth::SessionValidation),
-            stages,
-            Ended::Stopped,
-        );
-        assert_eq!(
-            checked(&report, CheckId::TcpConnect).coverage,
-            Coverage::Passed
-        );
-        for id in [CheckId::ConnectionAttempt, CheckId::SessionValidation] {
-            let check = checked(&report, id);
-            assert_eq!(check.coverage, Coverage::Skipped, "{id:?}");
-            assert_eq!(check.skip, Some(Skip::NotInThisBuild), "{id:?}");
-        }
-        assert_eq!(report.outcome, DiagnosticOutcome::NotEvaluated);
-        assert_eq!(
-            report.deepest_phase_evaluated(),
-            Some(Depth::NetworkReachability)
-        );
-    }
-
     #[test]
     fn a_link_local_address_keeps_its_scope() {
         let stages = Stages::new()
@@ -4234,6 +5666,219 @@ pub(crate) mod tests {
             refused.message.starts_with("fe80::1%12:1433: "),
             "{refused:#?}"
         );
+    }
+
+    /// A login the gateway redirected: the TCP connect reported is the
+    /// target's, and the phases are those of the connection the client made
+    /// where it was sent.
+    #[test]
+    fn a_redirect_reports_the_connection_after_it() {
+        let stages = Stages::new()
+            .add(
+                Stage::Dns,
+                Some(true),
+                0,
+                1,
+                &[(cs::HOST, "db01"), (cs::ADDRESSES, "10.0.0.1")],
+            )
+            .add(
+                Stage::Tcp,
+                Some(true),
+                1,
+                2,
+                &[(cs::ADDRESS, "10.0.0.1"), (cs::PORT, "1433")],
+            )
+            .add(Stage::Prelogin, Some(true), 2, 3, &[])
+            .add(Stage::Tls, Some(true), 4, 5, &[])
+            .add(Stage::Login, None, 3, 6, &[(cs::REDIRECTED, "true")])
+            .add(
+                Stage::Dns,
+                Some(true),
+                7,
+                8,
+                &[(cs::HOST, "node7"), (cs::ADDRESSES, "10.0.0.9")],
+            )
+            .add(
+                Stage::Tcp,
+                Some(true),
+                8,
+                9,
+                &[(cs::ADDRESS, "10.0.0.9"), (cs::PORT, "11000")],
+            )
+            .add(Stage::Prelogin, Some(true), 9, 10, &[])
+            .add(Stage::Tls, Some(true), 11, 12, &[])
+            .add(Stage::Login, Some(true), 10, 20, &[]);
+        let report = observed(
+            request("tcp:db01,1433", Depth::ConnectionAttempt),
+            stages,
+            Ended::Connected,
+        );
+        let tcp = checked(&report, CheckId::TcpConnect);
+        assert_eq!(tcp.attempts.len(), 1);
+        assert_eq!(tcp.attempts[0].address, "10.0.0.1");
+        let attempt = checked(&report, CheckId::ConnectionAttempt);
+        assert_eq!(attempt.coverage, Coverage::Passed);
+        assert_eq!(attempt.field("redirected"), Some("true"));
+        assert_eq!(attempt.subphases.len(), 3, "{attempt:#?}");
+        assert!(attempt.subphases.iter().all(|s| s.ok == Some(true)));
+        assert_eq!(
+            checked(&report, CheckId::NameResolution).field("host"),
+            Some("db01")
+        );
+    }
+
+    /// Without a prefix the client's protocol order moves on: the transports
+    /// it moved past are evidence, marked superseded, and the attempt is the
+    /// last transport's. A TCP path the pipe that opened replaced does not
+    /// apply.
+    #[test]
+    fn the_protocol_order_is_reported_as_the_client_followed_it() {
+        // A name that does not resolve, then the server's standard pipe.
+        let stages = Stages::new()
+            .add(
+                Stage::Dns,
+                Some(false),
+                0,
+                5,
+                &[
+                    (cs::HOST, "db01"),
+                    (cs::OS_ERROR, "11001"),
+                    (cs::ERROR, "No such host is known."),
+                ],
+            )
+            .add(
+                Stage::Pipe,
+                Some(true),
+                6,
+                7,
+                &[
+                    (cs::KIND, cs::KIND_NAMED_PIPE),
+                    (cs::PIPE_PATH, r"\\db01\pipe\sql\query"),
+                ],
+            )
+            .add(Stage::Prelogin, Some(true), 7, 8, &[])
+            .add(Stage::Login, Some(true), 8, 9, &[]);
+        let report = observed(
+            request("db01", Depth::ConnectionAttempt),
+            stages,
+            Ended::Connected,
+        );
+        for id in [CheckId::NameResolution, CheckId::TcpConnect] {
+            assert_eq!(
+                checked(&report, id).skip,
+                Some(Skip::NotApplicable(NOT_ON_THE_PATH)),
+                "{id:?}"
+            );
+        }
+        assert_eq!(report.outcome, DiagnosticOutcome::Passed);
+        let attempt = checked(&report, CheckId::ConnectionAttempt);
+        assert_eq!(attempt.coverage, Coverage::Passed);
+        assert_eq!(attempt.field("transport"), Some("namedPipe"));
+        assert_eq!(attempt.field("pipe"), Some(r"\\db01\pipe\sql\query"));
+        assert!(
+            report.errors.iter().all(|e| e.superseded),
+            "{:#?}",
+            report.errors
+        );
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.text.starts_with("TCP did not connect")),
+            "{:#?}",
+            report.findings
+        );
+
+        // Shared memory first, which did not open, then TCP.
+        let stages = Stages::new()
+            .add(
+                Stage::Pipe,
+                Some(false),
+                0,
+                1,
+                &[
+                    (cs::KIND, cs::KIND_SHARED_MEMORY),
+                    (cs::PIPE_PATH, r"\\.\pipe\SQLLocal\MSSQLSERVER"),
+                    (cs::OS_ERROR, "2"),
+                    (cs::ERROR, "The system cannot find the file specified."),
+                ],
+            )
+            .add(
+                Stage::Dns,
+                Some(true),
+                2,
+                3,
+                &[(cs::HOST, "localhost"), (cs::ADDRESSES, "127.0.0.1")],
+            )
+            .add(
+                Stage::Tcp,
+                Some(true),
+                3,
+                4,
+                &[(cs::ADDRESS, "127.0.0.1"), (cs::PORT, "1433")],
+            )
+            .add(Stage::Prelogin, Some(true), 4, 5, &[])
+            .add(Stage::Login, Some(true), 5, 6, &[]);
+        let report = observed(
+            request("localhost", Depth::ConnectionAttempt),
+            stages,
+            Ended::Connected,
+        );
+        assert!(
+            report.findings.iter().any(|f| f
+                .text
+                .starts_with("Shared memory to this computer did not open")),
+            "{:#?}",
+            report.findings
+        );
+        let set_aside = report
+            .errors
+            .iter()
+            .find(|e| e.os_error == Some(2))
+            .unwrap();
+        assert!(set_aside.superseded);
+        assert_eq!(
+            checked(&report, CheckId::TcpConnect).coverage,
+            Coverage::Passed
+        );
+        let attempt = checked(&report, CheckId::ConnectionAttempt);
+        assert_eq!(attempt.field("transport"), None, "{attempt:#?}");
+        assert_eq!(report.outcome, DiagnosticOutcome::Passed);
+
+        // Shared memory that answered ends the protocol order there.
+        let stages = Stages::new()
+            .add(
+                Stage::Pipe,
+                Some(true),
+                0,
+                1,
+                &[
+                    (cs::KIND, cs::KIND_SHARED_MEMORY),
+                    (cs::PIPE_PATH, r"\\.\pipe\SQLLocal\MSSQLSERVER"),
+                ],
+            )
+            .add(Stage::Prelogin, Some(true), 1, 2, &[])
+            .add(Stage::Login, Some(false), 2, 3, &[]);
+        let report = observed(
+            request("localhost", Depth::ConnectionAttempt),
+            stages,
+            Ended::Failed(server_error(18456, "Login failed for user 'sa'.")),
+        );
+        for id in [
+            CheckId::NameResolution,
+            CheckId::InstanceResolution,
+            CheckId::TcpConnect,
+        ] {
+            assert_eq!(
+                checked(&report, id).skip,
+                Some(Skip::NotApplicable(SHARED_MEMORY_FIRST)),
+                "{id:?}"
+            );
+        }
+        let attempt = checked(&report, CheckId::ConnectionAttempt);
+        assert_eq!(attempt.coverage, Coverage::Diagnosed);
+        assert_eq!(attempt.field("transport"), Some("sharedMemory"));
+        assert_eq!(attempt.field("failedPhase"), Some("login"));
     }
 
     /// The SQL Server Browser lookup is read from its stage: its port, or why
@@ -4607,6 +6252,227 @@ pub(crate) mod tests {
         assert!(!text.contains("no usable port"), "{text}");
     }
 
+    /// The SPN reported is the one the client recorded requesting.
+    #[test]
+    fn the_reported_spn_is_the_one_the_client_requested() {
+        let mut integrated = request("tcp:db01,1433", Depth::ConnectionAttempt);
+        integrated.authentication = Authentication::Integrated;
+        let stages = Stages::new()
+            .add(
+                Stage::Dns,
+                Some(true),
+                0,
+                1,
+                &[(cs::HOST, "db01"), (cs::ADDRESSES, "10.0.0.1")],
+            )
+            .add(
+                Stage::Tcp,
+                Some(true),
+                1,
+                2,
+                &[(cs::ADDRESS, "10.0.0.1"), (cs::PORT, "1433")],
+            )
+            .add(Stage::Prelogin, Some(true), 2, 3, &[])
+            .add(
+                Stage::Login,
+                Some(false),
+                3,
+                4,
+                &[(cs::SPN, "MSSQLSvc/db01.contoso.com:1433")],
+            );
+        let report = observed(
+            integrated,
+            stages,
+            Ended::Failed(server_error(18456, "Login failed.")),
+        );
+        let attempt = checked(&report, CheckId::ConnectionAttempt);
+        assert_eq!(attempt.field("spn"), Some("MSSQLSvc/db01.contoso.com:1433"));
+    }
+
+    /// A login with integrated authentication that the server refused,
+    /// replayed with the ticket cache lookup giving `state` (looked for in
+    /// `KRB5CCNAME`), failing in `failed` (the login, or before it).
+    fn integrated_login_refused(state: &'static str, failed: Stage) -> Report {
+        let mut integrated = request("tcp:db01,1433", Depth::ConnectionAttempt);
+        integrated.authentication = Authentication::Integrated;
+        let mut stages = Stages::new()
+            .add(
+                Stage::Dns,
+                Some(true),
+                0,
+                1,
+                &[(cs::HOST, "db01"), (cs::ADDRESSES, "10.0.0.1")],
+            )
+            .add(
+                Stage::Tcp,
+                Some(true),
+                1,
+                2,
+                &[(cs::ADDRESS, "10.0.0.1"), (cs::PORT, "1433")],
+            );
+        stages = if failed == Stage::Login {
+            stages.add(Stage::Prelogin, Some(true), 2, 3, &[]).add(
+                Stage::Login,
+                Some(false),
+                3,
+                4,
+                &[],
+            )
+        } else {
+            stages.add(failed, Some(false), 2, 3, &[])
+        };
+        let lookup: fn() -> (&'static str, String) = match state {
+            "notFound" => || ("notFound", "KRB5CCNAME".to_string()),
+            _ => || ("found", "KRB5CCNAME".to_string()),
+        };
+        observed_with(
+            integrated,
+            stages,
+            Ended::Failed(server_error(18456, "Login failed.")),
+            |diagnosis| diagnosis.ticket_cache = Some(lookup),
+        )
+    }
+
+    /// A login refused with integrated authentication, and no ticket cache
+    /// where sqlcmd looked: the connection attempt says so. With a cache, or
+    /// a failure before the login, it does not.
+    #[test]
+    fn a_refused_integrated_login_without_a_ticket_cache_is_suspected() {
+        let suspected = no_ticket_cache_finding(Some("KRB5CCNAME"));
+        let claims = |report: &Report| {
+            report.findings.iter().any(|f| {
+                f.check == CheckId::ConnectionAttempt
+                    && f.certainty == Certainty::Suspected
+                    && f.text == suspected
+            })
+        };
+        let report = integrated_login_refused("notFound", Stage::Login);
+        let attempt = checked(&report, CheckId::ConnectionAttempt);
+        assert_eq!(attempt.field("kerberosTicketCache"), Some("notFound"));
+        assert_eq!(attempt.field("failedPhase"), Some("login"));
+        assert!(claims(&report), "{:#?}", report.findings);
+
+        let report = integrated_login_refused("found", Stage::Login);
+        assert_eq!(
+            checked(&report, CheckId::ConnectionAttempt).field("kerberosTicketCache"),
+            Some("found")
+        );
+        assert!(!claims(&report), "{:#?}", report.findings);
+
+        let report = integrated_login_refused("notFound", Stage::Prelogin);
+        assert_ne!(
+            checked(&report, CheckId::ConnectionAttempt).field("failedPhase"),
+            Some("login")
+        );
+        assert!(!claims(&report), "{:#?}", report.findings);
+    }
+
+    /// The session's clock offset beyond what Kerberos tolerates by default
+    /// is noted; within it, nothing is.
+    #[test]
+    fn a_clock_offset_beyond_the_kerberos_tolerance_is_noted() {
+        let sent = 1_800_000_000_000;
+        let received = sent + 20;
+        let middle = sent + 10;
+        for (offset, noted) in [
+            (KERBEROS_CLOCK_TOLERANCE_MS + 1_000, Some("ahead of")),
+            (-(KERBEROS_CLOCK_TOLERANCE_MS + 60_000), Some("behind")),
+            (KERBEROS_CLOCK_TOLERANCE_MS, None),
+            (-KERBEROS_CLOCK_TOLERANCE_MS + 1, None),
+            (0, None),
+        ] {
+            let mut diagnosis = Diagnosis::new(request("tcp:db01,1433", Depth::SessionValidation));
+            let probe = SessionProbe {
+                engine_edition: 2,
+                server_unix_ms: Some(middle + offset),
+            };
+            diagnosis.session_probed(
+                Check::new(CheckId::SessionValidation, Coverage::Passed),
+                &probe,
+                sent,
+                received,
+            );
+            let report = diagnosis.finish(0, 0);
+            let check = checked(&report, CheckId::SessionValidation);
+            assert_eq!(check.coverage, Coverage::Passed);
+            let expected_offset = offset.to_string();
+            assert_eq!(check.field("clockOffsetMs"), Some(expected_offset.as_str()));
+            let notes: Vec<&Finding> = report
+                .findings
+                .iter()
+                .filter(|f| f.check == CheckId::SessionValidation)
+                .collect();
+            match noted {
+                Some(direction) => {
+                    assert_eq!(notes.len(), 1, "{offset}: {notes:#?}");
+                    assert_eq!(notes[0].certainty, Certainty::Informational);
+                    let seconds = offset.abs() / 1000;
+                    assert_eq!(
+                        notes[0].text,
+                        format!(
+                            "The server's clock is {seconds} s {direction} the client's, more \
+                             than the 5 minutes Kerberos tolerates by default."
+                        )
+                    );
+                }
+                None => assert!(notes.is_empty(), "{offset}: {notes:#?}"),
+            }
+        }
+    }
+
+    /// Every login error the server ends a login with is an authentication
+    /// failure, in the area that owns the authentication used; every
+    /// database error is the server's, after a good login.
+    #[test]
+    fn every_login_and_database_error_is_classified() {
+        let sql = Authentication::SqlPassword {
+            user: "sa".to_string(),
+            password: String::new(),
+        };
+        let integrated_area = if cfg!(windows) {
+            "security.authentication.windows"
+        } else {
+            "security.authentication.kerberos"
+        };
+        assert_eq!(LOGIN_ERRORS, [18456, 18452, 18470, 18486, 18487, 18488]);
+        assert_eq!(DATABASE_ERRORS, [4060, 4064]);
+        for number in LOGIN_ERRORS {
+            for (authentication, area) in [
+                (&sql, "security.authentication.sql"),
+                (&Authentication::Integrated, integrated_area),
+            ] {
+                let classified = classify_connection_error(
+                    &server_error(number, "Login failed."),
+                    Some(Stage::Login),
+                    authentication,
+                );
+                assert_eq!(classified.coverage, Coverage::Diagnosed, "{number}");
+                assert_eq!(classified.domain, Domain::specific(area), "{number}");
+                assert_eq!(classified.auth, AuthOutcome::Failed, "{number}");
+            }
+        }
+        for number in DATABASE_ERRORS {
+            let classified = classify_connection_error(
+                &server_error(number, "Cannot open database."),
+                Some(Stage::Login),
+                &sql,
+            );
+            assert_eq!(classified.coverage, Coverage::Diagnosed, "{number}");
+            assert_eq!(
+                classified.domain,
+                Domain::specific("target.sqlServer"),
+                "{number}"
+            );
+            assert_eq!(classified.auth, AuthOutcome::Succeeded, "{number}");
+        }
+        // Any other server error is not taken for either.
+        let other = classify_connection_error(&server_error(50000, "x"), Some(Stage::Login), &sql);
+        assert_eq!(
+            other.domain,
+            Domain::undetermined(&["security.authentication.sql", "target.sqlServer"])
+        );
+    }
+
     /// The connection is one attempt, without a retry, in the time limit;
     /// SQL Server Browser has its own.
     #[test]
@@ -4625,7 +6491,11 @@ pub(crate) mod tests {
         let mut diagnosis = Diagnosis::new(request);
         diagnosis.windows = true;
         diagnosis.connection_input().unwrap();
-        diagnosis.canceled_after(stages.list);
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(diagnosis.canceled_after(stages.list));
         diagnosis.finish(0, 0)
     }
 
@@ -4767,6 +6637,82 @@ pub(crate) mod tests {
             assert!(report.errors.is_empty(), "{server}: {:#?}", report.errors);
             assert_eq!(report.exit_code(), 4);
         }
+    }
+
+    /// Phases the cancel cut short (pre-login started, not finished) do not
+    /// fail the connection attempt: it is skipped as canceled.
+    #[test]
+    fn a_phase_a_cancel_cut_short_is_not_a_failure() {
+        let stages = Stages::new()
+            .add(
+                Stage::Dns,
+                Some(true),
+                0,
+                1,
+                &[(cs::HOST, "db01"), (cs::ADDRESSES, "10.0.0.1")],
+            )
+            .add(
+                Stage::Tcp,
+                Some(true),
+                1,
+                2,
+                &[(cs::ADDRESS, "10.0.0.1"), (cs::PORT, "1433")],
+            )
+            .add(Stage::Prelogin, None, 2, 900, &[]);
+        let report = canceled_with(request("tcp:db01,1433", Depth::SessionValidation), stages);
+        for id in [CheckId::ConnectionAttempt, CheckId::SessionValidation] {
+            assert_eq!(checked(&report, id).skip, Some(Skip::Canceled), "{id:?}");
+        }
+        assert_eq!(
+            checked(&report, CheckId::TcpConnect).coverage,
+            Coverage::Passed
+        );
+        assert!(report.errors.is_empty(), "{:#?}", report.errors);
+        assert_eq!(report.exit_code(), 4);
+    }
+
+    /// A run canceled while the client waits on the server keeps the checks
+    /// the client already finished: a server that accepts TCP and never
+    /// answers, canceled after a second, passes name resolution and the TCP
+    /// connect, and the connection attempt is skipped as canceled, not failed.
+    #[test]
+    fn a_cancel_during_the_attempt_keeps_the_network_checks() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let _held: Vec<_> = listener.incoming().take(1).collect();
+            std::thread::sleep(Duration::from_secs(10));
+        });
+        let started = Instant::now();
+        let report = run_until(
+            request(&format!("tcp:127.0.0.1,{port}"), Depth::SessionValidation),
+            &|| started.elapsed() > Duration::from_secs(1),
+        );
+        assert_eq!(report.execution_status, ExecutionStatus::Canceled);
+        assert_eq!(
+            checked(&report, CheckId::NameResolution).coverage,
+            Coverage::Passed,
+            "{report:#?}"
+        );
+        assert_eq!(
+            checked(&report, CheckId::TcpConnect).coverage,
+            Coverage::Passed,
+            "{report:#?}"
+        );
+        assert_eq!(
+            checked(&report, CheckId::ConnectionAttempt).skip,
+            Some(Skip::Canceled),
+            "{report:#?}"
+        );
+        assert_eq!(
+            report.deepest_phase_evaluated(),
+            Some(Depth::NetworkReachability)
+        );
+        assert!(
+            report.checks.iter().all(|c| !c.coverage.failed()),
+            "{report:#?}"
+        );
+        assert_eq!(report.exit_code(), 4);
     }
 
     /// A run canceled while the client waits on an address leaves no error
@@ -5070,27 +7016,50 @@ pub(crate) mod tests {
             "{report:#?}"
         );
 
-        // No answer in the time limit: inconclusive; deeper checks blocked.
-        let unanswered = Stages::new().add(
-            Stage::Pipe,
-            None,
-            0,
-            3000,
-            &[(cs::PIPE_PATH, r"\\db01\pipe\sql\query")],
-        );
+        // No answer in the time limit: inconclusive. Deeper, the connection
+        // attempt reports it, once.
+        let unanswered = || {
+            Stages::new().add(
+                Stage::Pipe,
+                None,
+                0,
+                3000,
+                &[(cs::PIPE_PATH, r"\\db01\pipe\sql\query")],
+            )
+        };
         let report = observed(
-            request(r"np:\\db01\pipe\sql\query", Depth::SessionValidation),
-            unanswered,
+            request(r"np:\\db01\pipe\sql\query", Depth::NetworkReachability),
+            unanswered(),
             timed_out(),
         );
         let check = checked(&report, CheckId::TcpConnect);
         assert_eq!(check.coverage, Coverage::Inconclusive, "{report:#?}");
         assert_eq!(check.field("result"), Some("timedOut"));
         assert_eq!(report.exit_code(), 2);
-        assert_eq!(
-            checked(&report, CheckId::ConnectionAttempt).skip,
-            Some(Skip::BlockedBy(CheckId::TcpConnect))
+        let report = observed(
+            request(r"np:\\db01\pipe\sql\query", Depth::SessionValidation),
+            unanswered(),
+            timed_out(),
         );
+        assert_eq!(
+            checked(&report, CheckId::TcpConnect).skip,
+            Some(Skip::NotApplicable(NOT_TCP))
+        );
+        assert!(
+            checked(&report, CheckId::ConnectionAttempt)
+                .coverage
+                .failed(),
+            "{report:#?}"
+        );
+        assert!(
+            report
+                .errors
+                .iter()
+                .all(|e| e.check == CheckId::ConnectionAttempt),
+            "{:#?}",
+            report.errors
+        );
+        assert_ne!(report.exit_code(), 0);
 
         // The pipe's own wait for a free instance timed out (all instances
         // busy, the operating system's semaphore time-out 121) before the
@@ -5143,6 +7112,7 @@ pub(crate) mod tests {
             ),
         ] {
             for depth in [Depth::NetworkReachability, Depth::SessionValidation] {
+                let deeper = depth == Depth::SessionValidation;
                 let mut request = request(server, depth);
                 request.login_timeout_seconds = 15;
                 let failed = std::io::Error::new(std::io::ErrorKind::TimedOut, error);
@@ -5151,37 +7121,49 @@ pub(crate) mod tests {
                     busy(path, kind, os_error, error),
                     Ended::Failed(Error::Io(failed)),
                 );
-                let check = checked(&report, CheckId::TcpConnect);
+                // Deeper, the connection attempt reports it, as it does the
+                // abandoned pipe.
+                let id = if deeper {
+                    assert_eq!(
+                        checked(&report, CheckId::TcpConnect).skip,
+                        Some(Skip::NotApplicable(NOT_TCP)),
+                        "{server}"
+                    );
+                    CheckId::ConnectionAttempt
+                } else {
+                    CheckId::TcpConnect
+                };
+                let check = checked(&report, id);
                 assert_eq!(
                     check.coverage,
                     Coverage::Inconclusive,
                     "{server}: {report:#?}"
                 );
-                assert_eq!(check.field("result"), Some("timedOut"), "{server}");
-                assert_eq!(check.field("pipe"), Some(path), "{server}");
-                assert_eq!(report.outcome, DiagnosticOutcome::Inconclusive, "{server}");
-                assert_eq!(report.exit_code(), 2, "{server}");
                 let errors: Vec<&ErrorRecord> =
                     report.errors.iter().filter(|e| !e.superseded).collect();
                 assert_eq!(errors.len(), 1, "{server}: {:#?}", report.errors);
+                assert_eq!(errors[0].check, id, "{server}");
                 assert_eq!(errors[0].code.as_deref(), Some("timedOut"), "{server}");
                 assert_eq!(errors[0].message, error, "{server}");
-                assert_eq!(
-                    errors[0].os_error,
-                    os_error.map(|c| c.parse().unwrap()),
-                    "{server}"
-                );
                 assert!(
                     report.findings.iter().any(|f| f.text.contains(error)),
                     "{server}: {:#?}",
                     report.findings
                 );
-                if depth == Depth::SessionValidation {
+                if deeper {
+                    // A connection attempt that did not succeed.
+                    assert_eq!(report.outcome, DiagnosticOutcome::IssueDetected, "{server}");
+                    assert_eq!(report.exit_code(), 1, "{server}");
+                } else {
+                    assert_eq!(check.field("result"), Some("timedOut"), "{server}");
+                    assert_eq!(check.field("pipe"), Some(path), "{server}");
                     assert_eq!(
-                        checked(&report, CheckId::ConnectionAttempt).skip,
-                        Some(Skip::BlockedBy(CheckId::TcpConnect)),
+                        errors[0].os_error,
+                        os_error.map(|c| c.parse().unwrap()),
                         "{server}"
                     );
+                    assert_eq!(report.outcome, DiagnosticOutcome::Inconclusive, "{server}");
+                    assert_eq!(report.exit_code(), 2, "{server}");
                 }
             }
         }
@@ -5443,6 +7425,25 @@ pub(crate) mod tests {
         );
         assert_ne!(report.outcome, DiagnosticOutcome::Passed);
         assert_ne!(report.exit_code(), 0);
+
+        // At the default depth the connection attempt reports the pipe.
+        let report = run(request(
+            "pr729-no-such-host.invalid",
+            Depth::SessionValidation,
+        ));
+        let attempt = checked(&report, CheckId::ConnectionAttempt);
+        assert!(attempt.coverage.failed(), "{report:#?}");
+        assert_eq!(
+            attempt.field("transport"),
+            Some("namedPipe"),
+            "{attempt:#?}"
+        );
+        assert!(
+            report.errors.iter().any(|e| !e.superseded),
+            "{:#?}",
+            report.errors
+        );
+        assert_ne!(report.outcome, DiagnosticOutcome::Passed);
     }
 
     /// The same through the stages, for a name that did not resolve and for
@@ -5573,5 +7574,73 @@ pub(crate) mod tests {
         );
         let text = report::text(&report);
         assert!(text.contains(r"db01\SQL2022: port 50001"), "{text}");
+    }
+
+    /// A login refused with no ticket cache claims no missing ticket beyond
+    /// the cache looked for: without `KRB5CCNAME`, only the default file
+    /// cache, as the limitation says.
+    #[test]
+    fn a_missing_ticket_cache_is_claimed_only_where_it_was_looked_for() {
+        let (state, location) = ticket_cache_state(None, 1000, |_| false);
+        assert_eq!((state, location.as_str()), ("notFound", "default"));
+        let default = no_ticket_cache_finding(Some(&location));
+        assert!(
+            default.starts_with("The default file Kerberos ticket cache"),
+            "{default}"
+        );
+        assert!(
+            default.contains("unless krb5.conf selects another cache"),
+            "{default}"
+        );
+        let (state, location) = ticket_cache_state(Some("FILE:/tmp/cc"), 1000, |_| false);
+        assert_eq!((state, location.as_str()), ("notFound", "KRB5CCNAME"));
+        assert_eq!(
+            no_ticket_cache_finding(Some(&location)),
+            "The Kerberos ticket cache KRB5CCNAME names was not found, so the integrated login \
+             had no ticket to present."
+        );
+    }
+
+    /// The session query's error quotes the client's or the server's text:
+    /// its finding is flagged for review before sharing. The time limit's
+    /// finding is sqlcmd's own.
+    #[test]
+    fn a_failed_session_query_is_flagged_for_review() {
+        let failed = |error: Option<Error>| {
+            let mut diagnosis = Diagnosis::new(request("tcp:db01,1433", Depth::SessionValidation));
+            diagnosis.connection_input().unwrap();
+            diagnosis.session_failed(
+                Check::new(CheckId::SessionValidation, Coverage::Passed),
+                error,
+            );
+            diagnosis.finish(0, 0)
+        };
+        let review = |report: &Report| {
+            let value: serde_json::Value =
+                serde_json::from_str(&report::json(report, "v").unwrap()).unwrap();
+            value["reviewBeforeSharing"].clone()
+        };
+        let report = failed(Some(Error::ProtocolError(
+            "the server on db01 closed the session".to_string(),
+        )));
+        let finding = report
+            .findings
+            .iter()
+            .find(|f| f.check == CheckId::SessionValidation)
+            .unwrap();
+        assert!(finding.quotes_message, "{finding:#?}");
+        assert_eq!(
+            review(&report),
+            serde_json::json!(["errors[].message", "findings[].text"])
+        );
+
+        let report = failed(None);
+        let finding = report
+            .findings
+            .iter()
+            .find(|f| f.check == CheckId::SessionValidation)
+            .unwrap();
+        assert!(!finding.quotes_message, "{finding:#?}");
+        assert_eq!(review(&report), serde_json::json!(["errors[].message"]));
     }
 }
