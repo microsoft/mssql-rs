@@ -98,6 +98,19 @@ if(NOT WIN32)
     find_package(Iconv REQUIRED)
     target_link_libraries(odbc_test_lib PUBLIC Iconv::Iconv)
 endif()
+# odbc_concurrent_test.h runs test bodies on std::thread workers, and its hang
+# watchdog writes a minidump through dbghelp on Windows.
+if(TARGET Threads::Threads)
+    target_link_libraries(odbc_test_lib PUBLIC Threads::Threads)
+endif()
+if(WIN32)
+    target_link_libraries(odbc_test_lib PUBLIC dbghelp)
+endif()
+# Each ODBC_TEST_F instantiates every mode runner for its fixture, so a large
+# converted file outgrows MSVC's default object section limit (C1128).
+if(MSVC)
+    target_compile_options(odbc_test_lib PUBLIC /bigobj)
+endif()
 
 # ---------------------------------------------------------------------------
 # Helper function: add a test executable under tests/

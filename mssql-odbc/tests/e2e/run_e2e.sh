@@ -47,6 +47,15 @@
 # connection string and would pin both legs to one driver; the script rejects
 # that in comparison mode.
 #
+# Both legs run with unixODBC Threading=1, registered in one temporary
+# odbcinst.ini (the msodbcsql section is copied from --msodbcsql-ini, which is
+# not modified). Level 1 serializes calls on each handle, as the Windows Driver
+# Manager does, except SQLCancel: unixODBC locks SQLCancel only at level 3, so
+# a cross-thread cancel still reaches the driver while another call runs on
+# that statement. The unixODBC default, 0, takes no lock at all, and its own
+# per-handle diagnostic list then races when two threads use one statement:
+# the ODBC_TEST_F /SharedStmt variants crash inside libodbc with either driver.
+#
 # Rust driver logs are controlled by MSSQL_TDS_TRACE and
 # MSSQL_TDS_TRACE_LEVEL.
 # In --verbose mode, this script defaults to:
@@ -137,6 +146,8 @@ TEST_FILTER=""
 CTEST_ARGS=(--output-on-failure)
 RUST_INI_DIR=""    # tempdir holding our generated odbcinst.ini
 RUST_DRIVER_PATH=""
+# unixODBC thread-protection level for both legs; see the header.
+UNIXODBC_THREADING=1
 
 # ----------------------------------------------------------------------------
 # CLI parsing / help
@@ -289,7 +300,7 @@ register_rust_driver() {
 [$RUST_DRIVER_SECTION]
 Description=Microsoft ODBC Driver 18 for SQL Server (Rust)
 Driver=$RUST_DRIVER_PATH
-Threading=0
+Threading=$UNIXODBC_THREADING
 UsageCount=1
 EOF
     echo "Rust driver registered at: $RUST_INI_DIR/odbcinst.ini"
@@ -326,13 +337,13 @@ validate_compare_preconditions() {
     # Resolve to absolute path so subprocesses see the same file regardless of cwd.
     MSODBCSQL_INI="$(cd "$(dirname "$MSODBCSQL_INI")" && pwd)/$(basename "$MSODBCSQL_INI")"
     echo "msodbcsql ini: $MSODBCSQL_INI"
-    # Keep installed registrations untouched while allowing concurrent driver
-    # calls on both comparison legs.
+    # Copy the reference registration next to ours with the same Threading
+    # level (see the header); the installed file is left untouched.
     printf '\n' >> "$RUST_INI_DIR/odbcinst.ini"
-    awk -v section="[$MSODBCSQL_DRIVER_SECTION]" '
+    awk -v section="[$MSODBCSQL_DRIVER_SECTION]" -v level="$UNIXODBC_THREADING" '
         /^\[/ {
             selected = index($0, section) == 1
-            if (selected) { print; print "Threading=0" }
+            if (selected) { print; print "Threading=" level }
             next
         }
         selected && tolower($0) !~ /^[[:space:]]*threading[[:space:]]*=/ { print }
@@ -351,7 +362,6 @@ setup_dev_sql_env() {
     fi
 
     export ODBC_TEST_SERVER="localhost"
-    export ODBC_TEST_UID="${ODBC_TEST_UID:-sa}"
     export ODBC_TEST_TRUST_CERT="${ODBC_TEST_TRUST_CERT:-Yes}"
 
     if [ -z "${ODBC_TEST_PWD:-}" ]; then
@@ -367,10 +377,16 @@ setup_dev_sql_env() {
     fi
 
     if [ -n "${ODBC_TEST_PWD:-}" ]; then
-        echo "Auto-detected dev SQL Server at localhost:1433 (sa login)"
+        # Default the SQL login only once a password exists; a UID without one
+        # makes the fixture attempt SQL auth with an empty password.
+        export ODBC_TEST_UID="${ODBC_TEST_UID:-sa}"
+        echo "Auto-detected dev SQL Server at localhost:1433 (${ODBC_TEST_UID} login)"
+    elif [ -n "${ODBC_TEST_UID:-}" ]; then
+        echo "Warning: SQL Server detected on localhost:1433 but no password found for ODBC_TEST_UID=${ODBC_TEST_UID}."
+        echo "  Set SQL_PASSWORD or ODBC_TEST_PWD, or unset ODBC_TEST_UID to use integrated auth."
     else
-        echo "Warning: SQL Server detected on localhost:1433 but no password found."
-        echo "  Set SQL_PASSWORD, ODBC_TEST_PWD, or run dev/dev-launchsql.sh first."
+        echo "Warning: SQL Server detected on localhost:1433 but no password found; using integrated auth."
+        echo "  Set SQL_PASSWORD, ODBC_TEST_PWD, or run dev/dev-launchsql.sh first, to use SQL auth."
     fi
 }
 

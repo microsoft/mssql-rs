@@ -14,15 +14,7 @@
 //  10.  ClrUdtColumnsReportSqlSsUdt          - CLR UDT type, size, scale, and nullability
 
 #include "odbc_test_fixture.h"
-
-// SQL Server-specific types not in standard <sqlext.h>.
-#ifndef SQL_SS_TIMESTAMPOFFSET
-#define SQL_SS_TIMESTAMPOFFSET (-155)
-#endif
-
-#ifndef SQL_SS_UDT
-#define SQL_SS_UDT (-151)
-#endif
+#include "odbc_sql_server_types.h"
 
 // SQLDescribeColW with SQL_NULL_HSTMT — DM rejects before driver.
 TEST(DescribeColTest, NullHandle) {
