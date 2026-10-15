@@ -19,7 +19,9 @@ name: PR Code Coverage
 #     pull_request token is read-only). Instead, a maintainer runs the check by
 #     commenting `/coverage` on the PR. The issue_comment event runs in the
 #     base-repo context. Reporting uses a read-only job and trusted tooling;
-#     a separate job posts the result without checking out PR code.
+#     a separate job posts the result without checking out fork code.
+# Same-repository contributors can edit the workflow itself and are trusted.
+# Fork reports use only issue_comment's default-branch workflow revision.
 #
 # Reporting-only: diff-cover is run WITHOUT --fail-under, so this never blocks
 # a merge for low coverage. Report-generation errors still fail the job.

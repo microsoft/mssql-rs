@@ -4,11 +4,13 @@
 """Regression tests for the PR coverage reporting trust boundaries."""
 
 import importlib.util
-import io
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
 import stat
 import subprocess
+import threading
+import time
 from types import SimpleNamespace
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlparse
@@ -226,6 +228,8 @@ def test_only_trusted_posting_job_has_write_permission():
     assert checkouts[0]["with"]["ref"] == "${{ github.workflow_sha }}"
     assert checkouts[0]["with"]["persist-credentials"] is False
     assert not any("run" in step for step in post["steps"])
+    assert "github.event.pull_request.head.repo.full_name == github.repository" in report["if"]
+    assert "github.event_name == 'issue_comment'" in report["if"]
 
 
 def test_reporting_uses_trusted_tools_and_immutable_pr_head():
@@ -717,29 +721,37 @@ def test_poll_does_not_retry_invalid_json(monkeypatch, poll_clock):
     assert not pending
 
 
-def test_poll_retries_urlerror_wrapped_connection_timeout(monkeypatch, poll_clock):
+def curl_response(payload, status=200):
+    return subprocess.CompletedProcess(
+        [], 0 if status < 400 else 22, f"{json.dumps(payload)}\n{status}", ""
+    )
+
+
+@pytest.mark.parametrize("timeout_kind", ["curl", "subprocess"])
+def test_poll_retries_transfer_timeout(monkeypatch, poll_clock, timeout_kind):
     build = ado_build()
     responses = [
-        URLError(TimeoutError("connection timed out")),
+        subprocess.CompletedProcess([], 28, "", "connection timed out")
+        if timeout_kind == "curl" else subprocess.TimeoutExpired("curl", 60),
         {"value": [build]},
         {"value": [{"name": "CoberturaCoverage"}]},
         {"value": [build]},
     ]
-    def urlopen(request, *, timeout):
+    def run(command, **kwargs):
         response = responses.pop(0)
         if isinstance(response, Exception):
             raise response
-        return io.StringIO(json.dumps(response))
-    monkeypatch.setattr(polling, "urlopen", urlopen)
+        return response if isinstance(response, subprocess.CompletedProcess) else curl_response(response)
+    monkeypatch.setattr(polling.subprocess, "run", run)
     assert polling.wait_for_artifact("710") == (101, "a" * 40)
     assert poll_clock.sleeps == [10]
     assert not responses
 
 
 def test_poll_does_not_retry_other_url_errors(monkeypatch, poll_clock):
-    def urlopen(request, *, timeout):
-        raise URLError("certificate verification failed")
-    monkeypatch.setattr(polling, "urlopen", urlopen)
+    def run(command, **kwargs):
+        return subprocess.CompletedProcess([], 60, "", "certificate verification failed")
+    monkeypatch.setattr(polling.subprocess, "run", run)
     with pytest.raises(URLError):
         polling.wait_for_artifact("710")
     assert not poll_clock.sleeps
@@ -747,27 +759,28 @@ def test_poll_does_not_retry_other_url_errors(monkeypatch, poll_clock):
 
 def test_request_timeout_is_capped_by_remaining_budget(monkeypatch, poll_clock):
     poll_clock.now = 58
-    def urlopen(request, *, timeout):
-        assert timeout == 2
-        return io.StringIO("{}")
-    monkeypatch.setattr(polling, "urlopen", urlopen)
+    def run(command, **kwargs):
+        assert kwargs["timeout"] == 2
+        assert command[command.index("--max-time") + 1] == "2"
+        return curl_response({})
+    monkeypatch.setattr(polling.subprocess, "run", run)
     assert polling.get_json("https://dev.azure.com/builds", deadline=60) == {}
 
 
 def test_expired_deadline_prevents_new_requests(monkeypatch, poll_clock):
     poll_clock.now = 60
-    def urlopen(*args, **kwargs):
+    def run(*args, **kwargs):
         pytest.fail("No request may start after the polling deadline")
-    monkeypatch.setattr(polling, "urlopen", urlopen)
+    monkeypatch.setattr(polling.subprocess, "run", run)
     with pytest.raises(polling.PollingDeadlineExceeded):
         polling.get_json("https://dev.azure.com/builds", deadline=60)
 
 
 def test_response_arriving_after_deadline_is_not_accepted(monkeypatch, poll_clock):
-    def urlopen(request, *, timeout):
+    def run(command, **kwargs):
         poll_clock.now += 61
-        return io.StringIO("{}")
-    monkeypatch.setattr(polling, "urlopen", urlopen)
+        return curl_response({})
+    monkeypatch.setattr(polling.subprocess, "run", run)
     with pytest.raises(polling.PollingDeadlineExceeded):
         polling.get_json("https://dev.azure.com/builds", deadline=60)
 
@@ -776,21 +789,82 @@ def test_duplicate_history_requests_share_the_polling_deadline(monkeypatch, poll
     duplicate = ado_build(200, status="completed", result="succeeded")
     history = [ado_build(build_id, status="completed", result="succeeded") for build_id in range(199, 0, -1)]
     scanned = []
-    def urlopen(request, *, timeout):
-        parsed = urlparse(request.full_url)
+    def run(command, **kwargs):
+        parsed = urlparse(command[-1])
         if parsed.path.endswith("/builds"):
             builds = history if "resultFilter" in parse_qs(parsed.query) else [duplicate]
-            return io.StringIO(json.dumps({"value": builds}))
+            return curl_response({"value": builds})
         if parsed.path.endswith("/timeline"):
-            return io.StringIO(json.dumps({"records": duplicate_timeline()}))
+            return curl_response({"records": duplicate_timeline()})
         build_id = int(parsed.path.split("/")[-2])
         if build_id != 200:
-            scanned.append((build_id, timeout))
+            scanned.append((build_id, kwargs["timeout"]))
             poll_clock.now += 40
-        return io.StringIO('{"value":[]}')
-    monkeypatch.setattr(polling, "urlopen", urlopen)
+        return curl_response({"value": []})
+    monkeypatch.setattr(polling.subprocess, "run", run)
     with pytest.raises(polling.PollingDeadlineExceeded):
         polling.wait_for_artifact("710", timeout=120)
     assert scanned == [(199, 60), (198, 60), (197, 40)]
     assert poll_clock.now == 120
     assert not poll_clock.sleeps
+
+
+@pytest.mark.parametrize("status", [429, 503, 401, 404])
+def test_request_preserves_http_error_status(monkeypatch, poll_clock, status):
+    monkeypatch.setattr(polling.subprocess, "run", lambda *args, **kwargs: curl_response({}, status))
+    with pytest.raises(HTTPError) as error:
+        polling.get_json("https://dev.azure.com/builds", deadline=60)
+    assert error.value.code == status
+
+
+def test_request_keeps_authorization_out_of_command_arguments(monkeypatch, poll_clock):
+    def run(command, **kwargs):
+        assert "fixture-token" not in " ".join(command)
+        assert kwargs["input"] == "Authorization: Bearer fixture-token\n"
+        assert command[command.index("--header") + 1] == "@-"
+        return curl_response({})
+    monkeypatch.setattr(polling.subprocess, "run", run)
+    polling.get_json(
+        "https://api.github.com/repos/microsoft/mssql-rs/pulls/710",
+        deadline=60, headers={"Authorization": "Bearer fixture-token"},
+    )
+
+
+def test_request_rejects_header_newlines(monkeypatch, poll_clock):
+    with pytest.raises(ValueError, match="Invalid HTTP header"):
+        polling.get_json("https://dev.azure.com/builds", deadline=60, headers={"Accept": "json\nInjected: value"})
+
+
+def test_request_interrupts_trickling_response():
+    received = threading.Event()
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = b'{"value":[]}'
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            received.set()
+            try:
+                for byte in body:
+                    self.wfile.write(bytes([byte]))
+                    self.wfile.flush()
+                    time.sleep(0.2)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+        def log_message(self, *args):
+            pass
+
+    with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
+        thread = threading.Thread(target=server.serve_forever)
+        thread.start()
+        try:
+            start = time.monotonic()
+            with pytest.raises(TimeoutError):
+                polling.get_json(f"http://127.0.0.1:{server.server_port}/", deadline=start + 0.3)
+            elapsed = time.monotonic() - start
+            assert received.is_set()
+            assert elapsed < 1.0
+        finally:
+            server.shutdown()
+            thread.join()

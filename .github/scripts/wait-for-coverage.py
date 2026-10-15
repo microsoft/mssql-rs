@@ -10,10 +10,10 @@ import os
 from pathlib import Path
 import random
 import re
+import subprocess
 import time
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
-from urllib.request import Request, urlopen
 
 
 BUILD_API = "https://dev.azure.com/sqlclientdrivers/public/_apis/build"
@@ -32,15 +32,35 @@ def remaining_time(deadline: float) -> float:
 
 def get_json(url: str, *, deadline: float, headers: dict | None = None) -> dict:
     timeout = min(60, remaining_time(deadline))
+    for name, value in (headers or {}).items():
+        if any(char in name or char in value for char in "\r\n"):
+            raise ValueError("Invalid HTTP header")
     try:
-        with urlopen(Request(url, headers=headers or {}), timeout=timeout) as response:
-            payload = json.load(response)
-    except URLError as error:
-        if isinstance(error.reason, TimeoutError):
-            raise error.reason from error
-        raise
+        # curl bounds the whole transfer; subprocess also bounds startup and DNS.
+        # Headers travel over stdin, keeping the job token out of process arguments.
+        response = subprocess.run(
+            [
+                "curl", "--disable", "--silent", "--show-error", "--fail",
+                "--proto", "=http,https", "--max-time", str(timeout),
+                "--write-out", "\n%{http_code}", "--header", "@-", "--url", url,
+            ],
+            input="".join(f"{name}: {value}\n" for name, value in (headers or {}).items()),
+            capture_output=True, text=True, encoding="utf-8", timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as error:
+        remaining_time(deadline)
+        raise TimeoutError("Coverage API request timed out") from error
     remaining_time(deadline)
-    return payload
+    if response.returncode == 28:
+        raise TimeoutError(response.stderr.strip())
+    if response.returncode not in (0, 22):
+        raise URLError(f"curl failed ({response.returncode}): {response.stderr.strip()}")
+    body, separator, status = response.stdout.rpartition("\n")
+    if not separator or not re.fullmatch(r"[1-5][0-9]{2}", status):
+        raise ValueError("Missing HTTP status in coverage API response")
+    if response.returncode == 22 or not 200 <= int(status) < 300:
+        raise HTTPError(url, int(status), response.stderr.strip(), {}, None)
+    return json.loads(body)
 
 
 def validate_sha(value: object) -> str:
