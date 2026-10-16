@@ -221,7 +221,9 @@ impl DataClassificationMetadata {
         self.rank
     }
 
-    /// One entry per result-set column, in column order.
+    /// Per-column sensitivity, in column order, as the token sent it. The
+    /// count is not checked against the result set's columns, so index with
+    /// `columns().get(i)` rather than assuming one entry per column.
     pub fn columns(&self) -> &[ColumnSensitivity] {
         &self.columns
     }
