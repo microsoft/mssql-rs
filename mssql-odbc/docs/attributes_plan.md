@@ -543,6 +543,7 @@ the two cannot drift.
 the vendor band have S1 sweep return codes but no *confirmed routing*. They are
 left to S5b rather than wired up on the assumption that they behave like the
 three above — which the `CURRENT_CATALOG` contrast shows is not safe.
+(`MULTISUBNET_FAILOVER` and `TNIR` were routed later, in AB#49293.)
 
 **Size:** M. **Depends on:** S1, S3.
 
@@ -554,9 +555,10 @@ three above — which the `CURRENT_CATALOG` contrast shows is not safe.
 
 **Scope**
 - **Route the remaining keyword-equivalent attributes (F5)**, each one measured
-  first: `AUTHENTICATION`, `APPLICATION_INTENT`, `MULTISUBNET_FAILOVER`, `TNIR`,
-  `CONNECT_RETRY_COUNT`, `CONNECT_RETRY_INTERVAL`, `SERVER_SPN`,
-  `FAILOVER_PARTNER`, `FAILOVER_PARTNER_SPN`, `ATTACHDBFILENAME`, `OLDPWD`.
+  first: `AUTHENTICATION`, `APPLICATION_INTENT`, `CONNECT_RETRY_COUNT`,
+  `CONNECT_RETRY_INTERVAL`, `SERVER_SPN`, `FAILOVER_PARTNER`,
+  `FAILOVER_PARTNER_SPN`, `ATTACHDBFILENAME`, `OLDPWD`. `MULTISUBNET_FAILOVER`
+  and `TNIR` are routed (AB#49293).
 - **Read-only/diagnostic:** `SQL_COPT_SS_CLIENT_CONNECTION_ID`, `SQL_COPT_SS_SPID`,
   `SQL_COPT_SS_USER_DATA`.
 - **Standard leftovers:** `SQL_ATTR_METADATA_ID = SQL_TRUE` (currently `HYC00`

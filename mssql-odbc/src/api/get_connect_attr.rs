@@ -21,10 +21,10 @@ use crate::api::odbc_types::{
     SQL_ATTR_CONNECTION_TIMEOUT, SQL_ATTR_CURRENT_CATALOG, SQL_ATTR_LOGIN_TIMEOUT,
     SQL_ATTR_PACKET_SIZE, SQL_ATTR_TXN_ISOLATION, SQL_AUTOCOMMIT_OFF, SQL_AUTOCOMMIT_ON,
     SQL_CD_FALSE, SQL_CD_TRUE, SQL_COPT_SS_CLIENT_CONNECTION_ID, SQL_COPT_SS_ENCRYPT,
-    SQL_COPT_SS_INTEGRATED_SECURITY, SQL_COPT_SS_TRUST_SERVER_CERTIFICATE,
-    SQL_COPT_SS_TXN_ISOLATION, SQL_COPT_SS_WARN_ON_CP_ERROR, SQL_EN_ON, SQL_ERROR,
-    SQL_INVALID_HANDLE, SQL_SUCCESS, SQL_WARN_NO, SQL_WARN_YES, SqlHandle, SqlInteger, SqlPointer,
-    SqlReturn,
+    SQL_COPT_SS_INTEGRATED_SECURITY, SQL_COPT_SS_MULTISUBNET_FAILOVER, SQL_COPT_SS_TNIR,
+    SQL_COPT_SS_TRUST_SERVER_CERTIFICATE, SQL_COPT_SS_TXN_ISOLATION, SQL_COPT_SS_WARN_ON_CP_ERROR,
+    SQL_EN_ON, SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS, SQL_WARN_NO, SQL_WARN_YES, SqlHandle,
+    SqlInteger, SqlPointer, SqlReturn,
 };
 use crate::api::util::write_if_some;
 use crate::error::{free_errors, post_sql_error};
@@ -227,17 +227,21 @@ fn sql_get_connect_attr_w_safe(
             SQL_SUCCESS
         }
         // The `SQL_COPT_SS_*` forms of Encrypt / TrustServerCertificate /
-        // Trusted_Connection. While connected this reports the resolved setting,
-        // whether it came from the attribute or the keyword -- measured: with no
+        // Trusted_Connection / MultiSubnetFailover / TransparentNetworkIPResolution.
+        // While connected this reports the resolved setting, whether it came
+        // from the attribute or the keyword -- measured for Encrypt: with no
         // attribute set, `Encrypt=no` reads back 0.
         //
         // Before connect there is nothing to resolve, so an unset attribute falls
         // back to the driver defaults (encryption on, no trust, no integrated
-        // auth). That pre-connect case is inferred from the defaults, not
-        // measured, unlike the post-connect behaviour above.
+        // auth, no multi-subnet failover, TNIR on -- msodbcsql seeds the last two
+        // in `InitMappedConnAttrs`). That pre-connect case is inferred from the
+        // defaults, not measured, unlike the post-connect behaviour above.
         SQL_COPT_SS_ENCRYPT
         | SQL_COPT_SS_TRUST_SERVER_CERTIFICATE
-        | SQL_COPT_SS_INTEGRATED_SECURITY => {
+        | SQL_COPT_SS_INTEGRATED_SECURITY
+        | SQL_COPT_SS_MULTISUBNET_FAILOVER
+        | SQL_COPT_SS_TNIR => {
             if value_ptr.is_null() {
                 error!(attribute, "SQLGetConnectAttrW: value pointer is null");
                 post_diag(&mut state, ERR_INVALID_NULL_POINTER);
@@ -254,6 +258,8 @@ fn sql_get_connect_attr_w_safe(
                 SQL_COPT_SS_TRUST_SERVER_CERTIFICATE => {
                     settings.trust_server_certificate.unwrap_or(0)
                 }
+                SQL_COPT_SS_MULTISUBNET_FAILOVER => settings.multi_subnet_failover.unwrap_or(0),
+                SQL_COPT_SS_TNIR => settings.transparent_network_ip_resolution.unwrap_or(1),
                 _ => settings.integrated_security.unwrap_or(0),
             };
             unsafe { write_if_some(value_ptr as *mut u32, value) };
@@ -903,11 +909,14 @@ mod tests {
     #[test]
     fn vendor_attributes_report_driver_defaults_before_connect() {
         // Nothing has resolved yet, so these come from the driver defaults:
-        // encryption on, no trust, no integrated auth.
+        // encryption on, no trust, no integrated auth, no multi-subnet
+        // failover, TNIR on.
         let h = TestHandles::with_env_dbc();
         assert_eq!(get_u32(h.dbc, SQL_COPT_SS_ENCRYPT), SQL_EN_ON as u32);
         assert_eq!(get_u32(h.dbc, SQL_COPT_SS_TRUST_SERVER_CERTIFICATE), 0);
         assert_eq!(get_u32(h.dbc, SQL_COPT_SS_INTEGRATED_SECURITY), 0);
+        assert_eq!(get_u32(h.dbc, SQL_COPT_SS_MULTISUBNET_FAILOVER), 0);
+        assert_eq!(get_u32(h.dbc, SQL_COPT_SS_TNIR), 1);
     }
 
     #[test]
@@ -920,10 +929,14 @@ mod tests {
                 encrypt: Some(0),
                 trust_server_certificate: Some(1),
                 integrated_security: Some(1),
+                multi_subnet_failover: Some(1),
+                transparent_network_ip_resolution: Some(0),
             });
             state.connection_state = ConnectionState::Connected;
         }
         assert_eq!(get_u32(h.dbc, SQL_COPT_SS_ENCRYPT), 0);
+        assert_eq!(get_u32(h.dbc, SQL_COPT_SS_MULTISUBNET_FAILOVER), 1);
+        assert_eq!(get_u32(h.dbc, SQL_COPT_SS_TNIR), 0);
 
         dbc.inner.lock().unwrap().connection_state = ConnectionState::Disconnected;
         assert_eq!(
@@ -931,6 +944,7 @@ mod tests {
             SQL_EN_ON as u32,
             "a disconnected reusable handle reports its explicit override or default"
         );
+        assert_eq!(get_u32(h.dbc, SQL_COPT_SS_TNIR), 1);
     }
 
     #[test]
@@ -940,6 +954,8 @@ mod tests {
             SQL_COPT_SS_ENCRYPT,
             SQL_COPT_SS_TRUST_SERVER_CERTIFICATE,
             SQL_COPT_SS_INTEGRATED_SECURITY,
+            SQL_COPT_SS_MULTISUBNET_FAILOVER,
+            SQL_COPT_SS_TNIR,
         ] {
             let get = unsafe {
                 sql_get_connect_attr_w(

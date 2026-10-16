@@ -235,6 +235,12 @@ fn apply_vendor_overrides(params: &mut ConnectionParams, overrides: &VendorConnO
     if let Some(integrated) = overrides.integrated_security {
         params.trusted_connection = Some(integrated != 0);
     }
+    if let Some(multi_subnet_failover) = overrides.multi_subnet_failover {
+        params.multi_subnet_failover = Some(multi_subnet_failover != 0);
+    }
+    if let Some(tnir) = overrides.transparent_network_ip_resolution {
+        params.transparent_network_ip_resolution = Some(tnir != 0);
+    }
 }
 
 /// Resolves the `Encrypt=` keyword vocabulary onto an mssql-tds setting.
@@ -274,6 +280,10 @@ fn effective_vendor_settings(
         encrypt: Some(encrypt as u32),
         trust_server_certificate: Some(u32::from(trust)),
         integrated_security: Some(u32::from(params.trusted_connection.unwrap_or(false))),
+        multi_subnet_failover: Some(u32::from(params.multi_subnet_failover.unwrap_or(false))),
+        transparent_network_ip_resolution: Some(u32::from(
+            params.transparent_network_ip_resolution.unwrap_or(true),
+        )),
     }
 }
 
@@ -583,6 +593,9 @@ fn apply_connection_params(context: &mut ClientContext, params: &ConnectionParam
     if let Some(multi_subnet_failover) = params.multi_subnet_failover {
         context.multi_subnet_failover = multi_subnet_failover;
     }
+    if let Some(tnir) = params.transparent_network_ip_resolution {
+        context.transparent_network_ip_resolution = tnir;
+    }
     if let Some(count) = params.connect_retry_count {
         context.connect_retry_count = count;
     }
@@ -795,7 +808,10 @@ mod tests {
 
     #[test]
     fn vendor_overrides_displace_the_matching_keyword() {
-        let base = cs("Server=h;UID=u;<PW>=p;Encrypt=no;TrustServerCertificate=yes");
+        let base = cs(
+            "Server=h;UID=u;<PW>=p;Encrypt=no;TrustServerCertificate=yes;\
+             MultiSubnetFailover=yes;TransparentNetworkIPResolution=Enabled",
+        );
         let (params, _) = parse_connection_string(&base).unwrap();
 
         // Nothing set: the connection string is left exactly as parsed.
@@ -807,6 +823,8 @@ mod tests {
             params.trust_server_certificate
         );
         assert_eq!(untouched.trusted_connection, params.trusted_connection);
+        assert_eq!(untouched.multi_subnet_failover, Some(true));
+        assert_eq!(untouched.transparent_network_ip_resolution, Some(true));
 
         // Each attribute wins over the keyword it duplicates.
         let mut overridden = params.clone();
@@ -816,11 +834,15 @@ mod tests {
                 encrypt: Some(2),
                 trust_server_certificate: Some(0),
                 integrated_security: Some(1),
+                multi_subnet_failover: Some(0),
+                transparent_network_ip_resolution: Some(0),
             },
         );
         assert_eq!(overridden.encrypt.as_deref(), Some("strict"));
         assert!(!overridden.trust_server_certificate);
         assert_eq!(overridden.trusted_connection, Some(true));
+        assert_eq!(overridden.multi_subnet_failover, Some(false));
+        assert_eq!(overridden.transparent_network_ip_resolution, Some(false));
     }
 
     #[test]
@@ -835,7 +857,37 @@ mod tests {
                 encrypt: Some(0),
                 trust_server_certificate: Some(0),
                 integrated_security: Some(1),
+                multi_subnet_failover: Some(0),
+                transparent_network_ip_resolution: Some(1),
             }
+        );
+
+        let (params, _) = parse_connection_string(&cs(
+            "Server=h;MultiSubnetFailover=yes;TransparentNetworkIPResolution=Disabled",
+        ))
+        .unwrap();
+        let settings = effective_vendor_settings(&params, false);
+        assert_eq!(settings.multi_subnet_failover, Some(1));
+        assert_eq!(settings.transparent_network_ip_resolution, Some(0));
+    }
+
+    #[test]
+    fn transparent_network_ip_resolution_reaches_the_client_context() {
+        let mut context = ClientContext::default();
+        assert!(context.transparent_network_ip_resolution, "on by default");
+
+        let (params, _) =
+            parse_connection_string(&cs("Server=h;TransparentNetworkIPResolution=Disabled"))
+                .unwrap();
+        apply_connection_params(&mut context, &params);
+        assert!(!context.transparent_network_ip_resolution);
+
+        let (params, _) = parse_connection_string(&cs("Server=h")).unwrap();
+        let mut context = ClientContext::default();
+        apply_connection_params(&mut context, &params);
+        assert!(
+            context.transparent_network_ip_resolution,
+            "an absent keyword keeps TNIR on"
         );
     }
 
