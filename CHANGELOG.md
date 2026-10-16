@@ -8,6 +8,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ### Added
 
+- `mssql-tds`: Transparent Network IP Resolution (TNIR). When a server name
+  resolves to 2 to 64 addresses, the TCP connect tries the first address alone
+  and, if it fails, races every address, following msodbcsql.
+  `ClientContext::transparent_network_ip_resolution` controls it and is on by
+  default; MultiSubnetFailover takes precedence, and a failover partner turns
+  it off (AB#49293).
+
+- `mssql-odbc`: the `TransparentNetworkIPResolution` keyword
+  (`Enabled`/`Disabled`) and the `SQL_COPT_SS_TNIR` and
+  `SQL_COPT_SS_MULTISUBNET_FAILOVER` connection attributes. The attributes
+  outrank their keywords, are set before connecting (`HY011` after, `HY024`
+  above `SQL_IS_ON`), and read back the effective setting. Unlike msodbcsql,
+  `SQL_COPT_SS_TNIR` set to `SQL_IS_OFF` turns TNIR off, and the default reads
+  back as on rather than off on a fresh handle; see parity deviation 33
+  (AB#49293).
+
 - `mssql-odbc`: `SQLGetData` conversions from `varchar(max)` and `nvarchar(max)`
   into supported numeric and date/time C targets, with the existing
   bound-fetch 1 MiB source-data cap (AB#47238).
@@ -61,6 +77,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 - Initial public release of the mssql-rs workspace.
 
 ### Changed
+
+- `mssql-tds`: a TCP connect to a name with 2 to 64 addresses now uses TNIR by
+  default, so once the first address fails the rest are raced rather than tried
+  one at a time. Set `ClientContext::transparent_network_ip_resolution` to
+  `false` for the previous sequence (AB#49293).
+
+- `mssql-odbc`: `TransparentNetworkIPResolution` is no longer ignored. A value
+  other than `Enabled` or `Disabled` now fails the connection, as in msodbcsql
+  (AB#49293).
 
 - `mssql-odbc`: empty character values retrieved as numeric or GUID C targets
   now return success with indicator 0 and leave the value buffer unchanged,
@@ -132,6 +157,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   federated-auth flows.
 
 ### Fixed
+
+- `mssql-tds`: a parallel TCP connect (MultiSubnetFailover, and TNIR once the
+  first address fails) now aborts its remaining attempts when it is cancelled
+  or the login deadline expires. Before, those attempts kept their sockets
+  open until the OS connect timeout (AB#49293).
 
 - `mssql-tds` and bindings: an `IMAGE` value with a present text pointer and a
   zero payload length now decodes as empty instead of NULL (AB#49220). In the

@@ -1069,3 +1069,44 @@ msodbcsql build is measured.
     session's uncommitted `CREATE TYPE` until its 3-second command timeout.
     **Evidence limit:** msodbcsql's busy-path timeout is a source reading only.
     Tracked in AB#48044. Human parity sign-off has not been recorded.
+
+33. **`SQL_COPT_SS_TNIR` means what it reports: `SQL_IS_OFF` turns Transparent
+    Network IP Resolution off, and the default reads `SQL_IS_ON`.** MS Learn
+    documents `SQL_IS_OFF` as the attribute form of
+    `TransparentNetworkIPResolution=Disabled`, and in both drivers an attribute
+    set before connecting outranks the keyword. msodbcsql's
+    `ResolveFromPreconnAttrs` (`connecthelper.hpp`, the `ATTR_VALUE_TYPE_ON_OFF`
+    branch for an explicitly set attribute) writes it into the keyword slot as
+    `Disabled` but marks the slot defaulted (`fDefault = !isOn`), and
+    `sqlcconn.cpp` turns a defaulted slot into `fTnir = 1`. Setting the
+    attribute off therefore leaves TNIR on, and also cancels a
+    `TransparentNetworkIPResolution=Disabled` in the same connection string,
+    while `SQLGetConnectAttr` reports `SQL_IS_OFF`. This driver connects with
+    TNIR off and reports the same value. The connects differ when the server
+    name resolves to 2 to 64 addresses and the first refuses the connection:
+    msodbcsql then races every address, this driver tries the rest in order.
+    Matching would keep an attribute value that does nothing and silently
+    overrides the keyword the application also set.
+    `SQL_COPT_SS_MULTISUBNET_FAILOVER` takes the same path, but its default is
+    off, so `SQL_IS_OFF` disables it in both drivers.
+    The default is reported differently as well. With neither the keyword nor
+    the attribute, both drivers connect with TNIR on, but msodbcsql's stored
+    option starts at zero and only `ResetOptions` (`sqlcconn.cpp`, run by
+    `SQLDisconnect` and by a failed connect) seeds it with `SQL_IS_ON`, so a
+    fresh handle reports `SQL_IS_OFF`. This driver reports `SQL_IS_ON`, the
+    setting in use and the documented default, before and after connecting.
+    Measured by the `--compare-with-msodbcsql` legs on Windows and Linux (ADO
+    build 183601, 2026-10-16) against retail msodbcsql 18.6.2.1 /
+    `SQL_DRIVER_VER` 18.06.0002, the version pinned by `msodbcsqlVersion` in
+    `.pipeline/validation-pipeline.yml`; the harness does not read
+    `SQL_DRIVER_VER` back per leg. A fresh handle connected with neither
+    reports 0, and the keyword or an attribute set before connecting reads
+    back as given: `TnirIsReportedOnByDefault` asserts each driver's value,
+    and `MultiSubnetFailoverAndTnirReportTheEffectiveSetting`
+    (`attributes_test.cpp`) pins the values both report. **Evidence limit:**
+    the connect sequence and the reset on a disconnected handle are a source
+    reading only. Connecting with msodbcsql 18 and `SQL_COPT_SS_TNIR` set to
+    `SQL_IS_OFF` through a name whose first address refuses, whose second never
+    answers, and whose third is live would close the first: the third answers
+    at once only if TNIR is still on. Tracked in AB#49293. Human parity sign-off
+    has not been recorded.

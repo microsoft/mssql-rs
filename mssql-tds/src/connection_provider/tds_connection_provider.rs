@@ -576,7 +576,7 @@ impl TdsConnectionProvider {
             context.encryption_options.clone(),
             context.keep_alive_in_ms,
             context.keep_alive_interval_in_ms,
-            context.multi_subnet_failover,
+            network_transport::TcpConnectMode::for_context(context),
             connect_timeout_ms,
         )
         .await?;

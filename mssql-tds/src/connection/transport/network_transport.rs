@@ -2,10 +2,12 @@
 // Licensed under the MIT License.
 
 use crate::connection::bulk_copy_state::ATTENTION_TIMEOUT_SECONDS;
-use crate::connection::client_context::{IPAddressPreference, TransportContext};
+use crate::connection::client_context::{ClientContext, IPAddressPreference, TransportContext};
 use crate::connection::transport::buffers::TdsReadBuffer;
 use crate::connection::transport::extractable_stream;
-use crate::connection::transport::parallel_connect::{ParallelConnectConfig, parallel_connect};
+use crate::connection::transport::parallel_connect::{
+    MAX_PARALLEL_IPS, ParallelConnectConfig, parallel_connect, parallel_connect_to_addresses,
+};
 use crate::connection::transport::ssl_handler::SslHandler;
 use crate::connection_provider::tds_connection_provider::PARSER_REGISTRY;
 use crate::core::{
@@ -176,6 +178,32 @@ use crate::connection::transport::named_pipes::open_named_pipe_with_retry;
 
 pub(crate) const PRE_NEGOTIATED_PACKET_SIZE: u32 = 4096;
 
+/// How a TCP connect walks the addresses a host name resolves to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TcpConnectMode {
+    /// One address at a time.
+    Sequential,
+    /// The first address alone, then every address in parallel if it fails
+    /// (Transparent Network IP Resolution).
+    FirstThenParallel,
+    /// Every address in parallel (MultiSubnetFailover).
+    Parallel,
+}
+
+impl TcpConnectMode {
+    pub(crate) fn for_context(context: &ClientContext) -> Self {
+        if context.multi_subnet_failover {
+            Self::Parallel
+        } else if context.transparent_network_ip_resolution && context.failover_partner.is_empty() {
+            // msodbcsql turns TNIR off when a failover partner is in use
+            // (`netconn.cpp`).
+            Self::FirstThenParallel
+        } else {
+            Self::Sequential
+        }
+    }
+}
+
 /// Creates a base stream for the specified transport context.
 /// This function handles the transport-specific connection logic (TCP, Named Pipe, Shared Memory)
 /// and returns a boxed Stream that can be used with any TDS version.
@@ -186,16 +214,17 @@ pub(crate) const PRE_NEGOTIATED_PACKET_SIZE: u32 = 4096;
 /// * `transport_context` - The transport context specifying the connection type and parameters
 /// * `keep_alive_in_ms` - TCP keep-alive idle time in milliseconds
 /// * `keep_alive_interval_in_ms` - TCP keep-alive interval in milliseconds
-/// * `multi_subnet_failover` - If true, enables parallel connection mode for TCP
+/// * `connect_mode` - How a TCP connect walks the resolved addresses
 /// * `connect_timeout_ms` - Connection timeout in milliseconds
 async fn create_base_stream(
     ipaddress_preference: IPAddressPreference,
     transport_context: &TransportContext,
     keep_alive_in_ms: u32,
     keep_alive_interval_in_ms: u32,
-    multi_subnet_failover: bool,
+    connect_mode: TcpConnectMode,
     connect_timeout_ms: u64,
 ) -> TdsResult<Box<dyn Stream>> {
+    let multi_subnet_failover = connect_mode == TcpConnectMode::Parallel;
     match transport_context {
         TransportContext::Tcp { host, port, .. } => {
             if multi_subnet_failover {
@@ -209,7 +238,6 @@ async fn create_base_stream(
                 )
                 .await
             } else {
-                // Use sequential connection mode (original behavior)
                 create_base_stream_sequential(
                     ipaddress_preference,
                     host,
@@ -217,6 +245,7 @@ async fn create_base_stream(
                     keep_alive_in_ms,
                     keep_alive_interval_in_ms,
                     connect_timeout_ms,
+                    connect_mode == TcpConnectMode::FirstThenParallel,
                 )
                 .await
             }
@@ -343,6 +372,12 @@ fn sort_by_ip_preference(
 
 /// Creates a TCP stream using sequential connection mode.
 /// Tries each resolved IP address one at a time until one succeeds.
+///
+/// With `first_then_parallel` (Transparent Network IP Resolution) only the first
+/// address is tried this way; if it fails, every address is tried in parallel.
+/// msodbcsql's SNI (`tcp.cpp`) gives that first attempt the whole remaining
+/// timeout and walks a host with more than 64 addresses sequentially instead;
+/// its login retry (`netconn.cpp`, `fTnirRetry`) then switches to parallel.
 async fn create_base_stream_sequential(
     ipaddress_preference: IPAddressPreference,
     host: &str,
@@ -350,6 +385,7 @@ async fn create_base_stream_sequential(
     keep_alive_in_ms: u32,
     keep_alive_interval_in_ms: u32,
     connect_timeout_ms: u64,
+    first_then_parallel: bool,
 ) -> TdsResult<Box<dyn Stream>> {
     info!(
         "Connecting to TCP transport (sequential): {}:{}",
@@ -364,14 +400,45 @@ async fn create_base_stream_sequential(
     let mut socket_addresses: Vec<SocketAddr> =
         tokio::net::lookup_host((host, port)).await?.collect();
 
-    let mut last_error = None;
-    let mut tcp_stream = None;
-
     sort_by_ip_preference(&mut socket_addresses, ipaddress_preference);
 
     info!("Socket addresses: {:?}", socket_addresses);
 
-    for socket_address in socket_addresses {
+    connect_to_resolved_addresses(
+        host,
+        port,
+        socket_addresses,
+        keep_alive_in_ms,
+        keep_alive_interval_in_ms,
+        connect_timeout_ms,
+        first_then_parallel,
+    )
+    .await
+}
+
+/// Connects to `socket_addresses`, already resolved from `host:port` and
+/// ordered by IP preference; see [`create_base_stream_sequential`].
+async fn connect_to_resolved_addresses(
+    host: &str,
+    port: u16,
+    socket_addresses: Vec<SocketAddr>,
+    keep_alive_in_ms: u32,
+    keep_alive_interval_in_ms: u32,
+    connect_timeout_ms: u64,
+    first_then_parallel: bool,
+) -> TdsResult<Box<dyn Stream>> {
+    let mut last_error = None;
+    let mut tcp_stream = None;
+
+    let first_then_parallel =
+        first_then_parallel && (2..=MAX_PARALLEL_IPS).contains(&socket_addresses.len());
+    let sequential_addresses = if first_then_parallel {
+        &socket_addresses[..1]
+    } else {
+        &socket_addresses[..]
+    };
+
+    for &socket_address in sequential_addresses {
         let socket = if socket_address.is_ipv6() {
             net::TcpSocket::new_v6()?
         } else {
@@ -416,17 +483,30 @@ async fn create_base_stream_sequential(
         }
     }
 
-    // We don't have a valid TCP stream, so we need to return the last error.
     if let Some(stream) = tcp_stream {
-        Ok(Box::new(stream))
-    } else {
-        Err(crate::error::Error::from(last_error.unwrap_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::NotConnected,
-                format!("Failed to connect to {host}:{port}"),
-            )
-        })))
+        return Ok(Box::new(stream));
     }
+    if first_then_parallel {
+        info!(
+            error = ?last_error,
+            "First address failed; connecting to all {} addresses in parallel",
+            socket_addresses.len()
+        );
+        let config = ParallelConnectConfig {
+            timeout_ms: connect_timeout_ms,
+            keep_alive_in_ms,
+            keep_alive_interval_in_ms,
+        };
+        let result = parallel_connect_to_addresses(socket_addresses, &config).await?;
+        return Ok(Box::new(result.stream));
+    }
+    // We don't have a valid TCP stream, so we need to return the last error.
+    Err(crate::error::Error::from(last_error.unwrap_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotConnected,
+            format!("Failed to connect to {host}:{port}"),
+        )
+    })))
 }
 
 /// Creates a TCP stream using parallel connection mode (MultiSubnetFailover).
@@ -520,7 +600,7 @@ async fn create_transport_for_version(
 /// * `encryption_options` - Encryption settings for the connection
 /// * `keep_alive_in_ms` - TCP keep-alive idle time in milliseconds
 /// * `keep_alive_interval_in_ms` - TCP keep-alive interval in milliseconds
-/// * `multi_subnet_failover` - If true, enables parallel connection mode for TCP
+/// * `connect_mode` - How a TCP connect walks the resolved addresses
 /// * `connect_timeout_ms` - Connection timeout in milliseconds
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn create_transport(
@@ -530,7 +610,7 @@ pub(crate) async fn create_transport(
     encryption_options: EncryptionOptions,
     keep_alive_in_ms: u32,
     keep_alive_interval_in_ms: u32,
-    multi_subnet_failover: bool,
+    connect_mode: TcpConnectMode,
     connect_timeout_ms: u64,
 ) -> TdsResult<NetworkTransport> {
     let encryption_mode = encryption_options.mode;
@@ -541,7 +621,7 @@ pub(crate) async fn create_transport(
         transport_context,
         keep_alive_in_ms,
         keep_alive_interval_in_ms,
-        multi_subnet_failover,
+        connect_mode,
         connect_timeout_ms,
     )
     .await?;
@@ -5807,6 +5887,7 @@ pub(crate) mod tests {
             30_000,
             1_000,
             200,
+            false,
         )
         .await;
 
@@ -5816,6 +5897,116 @@ pub(crate) mod tests {
             "the heartbeat task never ran while resolving 'localhost' — \
              resolution is blocking the executor instead of awaiting it"
         );
+    }
+
+    #[test]
+    fn tcp_connect_mode_follows_the_context() {
+        let mut context = ClientContext::default();
+        assert_eq!(
+            TcpConnectMode::for_context(&context),
+            TcpConnectMode::FirstThenParallel,
+            "TNIR is on by default"
+        );
+
+        context.failover_partner = "partner.example.com".to_string();
+        assert_eq!(
+            TcpConnectMode::for_context(&context),
+            TcpConnectMode::Sequential,
+            "a failover partner turns TNIR off"
+        );
+
+        context.failover_partner.clear();
+        context.transparent_network_ip_resolution = false;
+        assert_eq!(
+            TcpConnectMode::for_context(&context),
+            TcpConnectMode::Sequential
+        );
+
+        context.multi_subnet_failover = true;
+        context.transparent_network_ip_resolution = true;
+        assert_eq!(
+            TcpConnectMode::for_context(&context),
+            TcpConnectMode::Parallel,
+            "MultiSubnetFailover takes precedence over TNIR"
+        );
+    }
+
+    async fn listener() -> tokio::net::TcpListener {
+        tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap()
+    }
+
+    /// A loopback address nothing listens on.
+    async fn closed_address() -> SocketAddr {
+        listener().await.local_addr().unwrap()
+    }
+
+    async fn was_contacted(listener: &tokio::net::TcpListener, wait_ms: u64) -> bool {
+        timeout(Duration::from_millis(wait_ms), listener.accept())
+            .await
+            .is_ok()
+    }
+
+    async fn connect_resolved(
+        addresses: Vec<SocketAddr>,
+        first_then_parallel: bool,
+    ) -> TdsResult<Box<dyn Stream>> {
+        connect_to_resolved_addresses(
+            "db.example.com",
+            1433,
+            addresses,
+            30_000,
+            1_000,
+            500,
+            first_then_parallel,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn first_then_parallel_contacts_only_the_first_address_when_it_answers() {
+        let (first, second) = (listener().await, listener().await);
+        let addresses = vec![first.local_addr().unwrap(), second.local_addr().unwrap()];
+
+        assert!(connect_resolved(addresses, true).await.is_ok());
+        assert!(was_contacted(&first, 1_000).await);
+        assert!(!was_contacted(&second, 200).await);
+    }
+
+    #[tokio::test]
+    async fn first_then_parallel_races_every_address_once_the_first_fails() {
+        let (second, third) = (listener().await, listener().await);
+        let addresses = vec![
+            closed_address().await,
+            second.local_addr().unwrap(),
+            third.local_addr().unwrap(),
+        ];
+
+        assert!(connect_resolved(addresses, true).await.is_ok());
+        assert!(was_contacted(&second, 1_000).await);
+        assert!(
+            was_contacted(&third, 1_000).await,
+            "after the first address fails, every address is tried at once"
+        );
+    }
+
+    #[tokio::test]
+    async fn sequential_stops_at_the_first_address_that_answers() {
+        let (second, third) = (listener().await, listener().await);
+        let addresses = vec![
+            closed_address().await,
+            second.local_addr().unwrap(),
+            third.local_addr().unwrap(),
+        ];
+
+        assert!(connect_resolved(addresses, false).await.is_ok());
+        assert!(was_contacted(&second, 1_000).await);
+        assert!(!was_contacted(&third, 200).await);
+    }
+
+    #[tokio::test]
+    async fn first_then_parallel_fails_when_every_address_fails() {
+        let addresses = vec![closed_address().await, closed_address().await];
+        assert!(connect_resolved(addresses, true).await.is_err());
     }
 
     /// `skip_bytes` spins the same way, and it runs on the discard path that

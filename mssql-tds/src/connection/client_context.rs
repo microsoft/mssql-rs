@@ -319,6 +319,11 @@ pub struct ClientContext {
     pub mars_enabled: bool,
     /// Enable multi-subnet failover for AlwaysOn availability groups.
     pub multi_subnet_failover: bool,
+    /// Transparent Network IP Resolution: when a host name resolves to several
+    /// addresses, connect to the first one and, if that fails, to all of them
+    /// in parallel. On by default, as in msodbcsql. Has no effect with
+    /// `multi_subnet_failover`, and a `failover_partner` turns it off.
+    pub transparent_network_ip_resolution: bool,
     /// Timeout in milliseconds for SQL Browser (SSRP) instance resolution.
     /// Defaults to 1000ms.
     pub ssrp_timeout_ms: u64,
@@ -572,6 +577,7 @@ impl ClientContext {
             auth_method_map: HashMap::new(),
             mars_enabled: false,
             multi_subnet_failover: false,
+            transparent_network_ip_resolution: true,
             ssrp_timeout_ms: crate::ssrp::DEFAULT_SSRP_TIMEOUT_MS,
             new_password: "".to_string(),
             packet_size: 8000,
@@ -638,6 +644,7 @@ impl ClientContext {
             auth_method_map: HashMap::new(),
             mars_enabled: false,
             multi_subnet_failover: false,
+            transparent_network_ip_resolution: true,
             ssrp_timeout_ms: crate::ssrp::DEFAULT_SSRP_TIMEOUT_MS,
             new_password: "".to_string(),
             packet_size: 8000,
@@ -921,6 +928,7 @@ impl Clone for ClientContext {
             auth_method_map: self.clone_auth_method_map(),
             mars_enabled: self.mars_enabled,
             multi_subnet_failover: self.multi_subnet_failover,
+            transparent_network_ip_resolution: self.transparent_network_ip_resolution,
             ssrp_timeout_ms: self.ssrp_timeout_ms,
             new_password: self.new_password.clone(),
             packet_size: self.packet_size,

@@ -161,6 +161,7 @@ pass both keys directly; mssql-python collapses the group to a single canonical
 | `APP` | `ClientContext::application_name` | verbatim |
 | `ApplicationIntent` | `ClientContext::application_intent` | `ReadOnly` / `ReadWrite` |
 | `MultiSubnetFailover` | `ClientContext::multi_subnet_failover` | `Yes` / `No` |
+| `TransparentNetworkIPResolution` | `ClientContext::transparent_network_ip_resolution` | `Enabled` / `Disabled` |
 | `IpAddressPreference` | `ClientContext::ipaddress_preference` | `IPv4First` / `IPv6First` / `UsePlatformDefault`; unknown → `IPv4First` |
 | `ConnectRetryCount` | `ClientContext::connect_retry_count` | integer 0–255 (rejected if out of range) |
 | `ConnectRetryInterval` | `ClientContext::connect_retry_interval` | integer 1–60 seconds (rejected if out of range) |
@@ -180,6 +181,8 @@ Whole-value, case-insensitive, exact match (not prefix, not `y`/`1`):
   `MultiSubnetFailover`): `Yes` | `No`.
 - **`Encrypt`**: `Yes` | `Mandatory` | `No` | `Optional` | `Strict`.
 - **`ApplicationIntent`**: `ReadOnly` | `ReadWrite`.
+- **`TransparentNetworkIPResolution`**: `Enabled` | `Disabled`, msodbcsql's only
+  Enabled/Disabled keyword.
 - **`IpAddressPreference`**: `IPv4First` | `IPv6First` | `UsePlatformDefault`. Unknown
   values are **not** rejected — they are accepted and fall back to `IPv4First` when
   mapped onto the `ClientContext`, matching msodbcsql.
