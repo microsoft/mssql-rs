@@ -32,10 +32,23 @@ const MAX_PENDING_HOSTS: usize = 256;
 struct Entries {
     /// Hosts a server allowed caching for: the fallback addresses.
     allowed: HashMap<String, Vec<SocketAddr>>,
-    /// Each host's latest resolution, until a server allows it. A disallowing
-    /// verdict leaves it in place, so a concurrent login that allows the same
-    /// host still publishes it.
+    /// Each host's latest resolution, or the cached addresses a login fell
+    /// back to, for an allowing verdict to publish. Verdicts leave it in
+    /// place, so the last verdict decides however logins interleave.
     pending: HashMap<String, Vec<SocketAddr>>,
+}
+
+impl Entries {
+    fn hold(&mut self, key: String, addresses: Vec<SocketAddr>) {
+        if self.pending.len() >= MAX_PENDING_HOSTS && !self.pending.contains_key(&key) {
+            // Any victim will do: losing one only defers caching its host to
+            // that host's next login.
+            if let Some(victim) = self.pending.keys().next().cloned() {
+                self.pending.remove(&victim);
+            }
+        }
+        self.pending.insert(key, addresses);
+    }
 }
 
 /// Process-lifetime host name to address cache.
@@ -96,27 +109,23 @@ impl DnsCache {
         if addresses.is_empty() || host.parse::<IpAddr>().is_ok() {
             return;
         }
-        let key = host.to_ascii_lowercase();
-        let mut entries = self.entries();
-        let pending = &mut entries.pending;
-        if pending.len() >= MAX_PENDING_HOSTS && !pending.contains_key(&key) {
-            // Any victim will do: losing one only defers caching its host to
-            // that host's next login.
-            if let Some(victim) = pending.keys().next().cloned() {
-                pending.remove(&victim);
-            }
-        }
-        pending.insert(key, addresses.to_vec());
+        self.entries()
+            .hold(host.to_ascii_lowercase(), addresses.to_vec());
     }
 
     fn cached(&self, host: &str, port: u16) -> Option<Vec<SocketAddr>> {
-        let entries = self.entries();
-        let addresses = entries.allowed.get(&host.to_ascii_lowercase())?;
+        let key = host.to_ascii_lowercase();
+        let mut entries = self.entries();
+        let addresses = entries.allowed.get(&key)?.clone();
+        // This login's verdict must still be able to publish what it connected
+        // with if another login's verdict removes the entry first.
+        if !entries.pending.contains_key(&key) {
+            entries.hold(key, addresses.clone());
+        }
         Some(
             addresses
-                .iter()
-                .map(|address| {
-                    let mut address = *address;
+                .into_iter()
+                .map(|mut address| {
                     address.set_port(port);
                     address
                 })
@@ -129,7 +138,7 @@ impl DnsCache {
         let key = host.to_ascii_lowercase();
         let mut entries = self.entries();
         if allowed {
-            if let Some(addresses) = entries.pending.remove(&key) {
+            if let Some(addresses) = entries.pending.get(&key).cloned() {
                 entries.allowed.insert(key, addresses);
             }
         } else {
@@ -290,13 +299,62 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn the_last_of_interleaved_verdicts_decides() {
+        let cache = DnsCache::default();
+        // Three logins resolve the host before their verdicts arrive.
+        for _ in 0..3 {
+            resolves_to(
+                &cache,
+                "db.example.com",
+                1433,
+                vec![address("10.0.0.1", 1433)],
+            )
+            .await
+            .unwrap();
+        }
         cache.apply_verdict("db.example.com", true);
-        assert!(
+        cache.apply_verdict("db.example.com", false);
+        cache.apply_verdict("db.example.com", true);
+
+        let resolved = fails_to_resolve(&cache, "db.example.com", 1433)
+            .await
+            .unwrap();
+        assert_eq!(resolved, [address("10.0.0.1", 1433)]);
+    }
+
+    #[tokio::test]
+    async fn logins_through_the_fallback_can_restore_it_after_a_denial() {
+        let cache = DnsCache::default();
+        resolves_to(
+            &cache,
+            "db.example.com",
+            1433,
+            vec![address("10.0.0.1", 1433)],
+        )
+        .await
+        .unwrap();
+        cache.apply_verdict("db.example.com", true);
+        // As if evicted, so only the fallback can tell the coming verdicts what
+        // their logins connected with.
+        cache.entries().pending.clear();
+
+        // During a DNS outage two logins connect through the cache, and their
+        // verdicts arrive deny, then allow.
+        for _ in 0..2 {
             fails_to_resolve(&cache, "db.example.com", 1433)
                 .await
-                .is_err(),
-            "allowing a removed host must not resurrect its addresses"
-        );
+                .unwrap();
+        }
+        cache.apply_verdict("db.example.com", false);
+        cache.apply_verdict("db.example.com", true);
+
+        let resolved = fails_to_resolve(&cache, "db.example.com", 1433)
+            .await
+            .unwrap();
+        assert_eq!(resolved, [address("10.0.0.1", 1433)]);
     }
 
     #[tokio::test]
