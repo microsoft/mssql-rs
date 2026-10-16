@@ -1081,9 +1081,15 @@ impl DaeState {
     pub(crate) fn begin_streaming_phase(&mut self, client: TdsClient, collation: SqlCollation) {
         for param in &mut self.params {
             if !param.is_buffered() && param.transcode.is_none() {
-                let transcode =
+                let validates_encoded_input = param
+                    .length_limit
+                    .is_some_and(|limit| limit.requires_encoded_input());
+                let mut transcode =
                     DaeTranscode::new(param.binding.c_type, param.binding.sql_type, collation);
-                if !transcode.is_passthrough() {
+                if validates_encoded_input {
+                    transcode = transcode.with_passthrough_validation();
+                }
+                if validates_encoded_input || !transcode.is_passthrough() {
                     param.transcode = Some(transcode);
                 }
             }

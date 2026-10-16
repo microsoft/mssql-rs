@@ -2348,8 +2348,10 @@ impl TdsClient {
         self.current_command_ce_setting = column_encryption;
         self.ensure_force_column_encryption_supported(named_params.iter())?;
 
-        let (streamed_params, materialized_params) =
-            Self::split_and_validate_streamed_params(named_params)?;
+        let (streamed_params, materialized_params) = Self::split_and_validate_streamed_params(
+            named_params,
+            &self.negotiated_settings.database_collation,
+        )?;
 
         if streamed_params.is_empty() {
             let result = self
@@ -2472,6 +2474,7 @@ impl TdsClient {
 
     fn split_and_validate_streamed_params(
         named_params: Vec<RpcParameter>,
+        db_collation: &SqlCollation,
     ) -> TdsResult<(Vec<RpcParameter>, Vec<RpcParameter>)> {
         let (streamed_params, materialized_params): (Vec<_>, Vec<_>) = named_params
             .into_iter()
@@ -2481,7 +2484,8 @@ impl TdsClient {
             if param.name.is_none() {
                 return Err(UsageError("Streamed parameters must be named.".to_string()));
             }
-            param.validate_named_before_send()?;
+            param.validate_named_before_send(db_collation)?;
+            param.validate_streamed_configuration()?;
         }
 
         Ok((streamed_params, materialized_params))
@@ -4386,8 +4390,10 @@ impl TdsClient {
         self.current_command_ce_setting = opts.column_encryption;
         self.ensure_force_column_encryption_supported(named_params.iter())?;
 
-        let (streamed_params, materialized_params) =
-            Self::split_and_validate_streamed_params(named_params)?;
+        let (streamed_params, materialized_params) = Self::split_and_validate_streamed_params(
+            named_params,
+            &self.negotiated_settings.database_collation,
+        )?;
 
         if streamed_params.is_empty() {
             let result = self
@@ -4883,6 +4889,7 @@ impl TdsClient {
             if let Some(params) = named_parameters.as_mut() {
                 param_refs.extend(params.iter_mut());
             }
+            let database_collation = self.negotiated_settings.database_collation;
             Self::apply_parameter_encryption(
                 &describe,
                 &providers,
@@ -4890,6 +4897,7 @@ impl TdsClient {
                 &mut param_refs,
                 &mut self.output_param_ceks,
                 &trusted_key_paths,
+                &database_collation,
             )
             .await?;
         }
@@ -6474,6 +6482,7 @@ impl TdsClient {
             .await?;
 
         let (providers, cek_cache, trusted_key_paths) = self.cloned_ce_key_material()?;
+        let database_collation = self.negotiated_settings.database_collation;
         Self::apply_parameter_encryption(
             &describe,
             &providers,
@@ -6481,6 +6490,7 @@ impl TdsClient {
             params,
             &mut self.output_param_ceks,
             &trusted_key_paths,
+            &database_collation,
         )
         .await?;
         Ok(describe)
@@ -6601,6 +6611,7 @@ impl TdsClient {
         params: &mut [&mut RpcParameter],
         output_param_ceks: &mut HashMap<String, Arc<zeroize::Zeroizing<Vec<u8>>>>,
         trusted_key_paths: &[String],
+        database_collation: &SqlCollation,
     ) -> TdsResult<()> {
         use crate::message::parameters::rpc_parameters::RpcEncryptionMetadata;
         use crate::security::encryption::encrypt_parameter;
@@ -6704,14 +6715,15 @@ impl TdsClient {
 
             let param = &mut *params[index];
 
+            let (value, value_had_conversion_loss) =
+                param.value_for_encryption(database_collation)?;
             let ciphertext = encrypt_parameter(
-                param.value()?,
+                &value,
                 plaintext_cek.as_slice(),
                 info.cipher_algorithm_id,
                 info.encryption_type,
                 info.normalization_rule_version,
             )?;
-
             param.set_encrypted(
                 ciphertext,
                 RpcEncryptionMetadata {
@@ -6723,6 +6735,7 @@ impl TdsClient {
                     cek_md_version: cek_entry.cek_md_version,
                     normalization_rule_version: info.normalization_rule_version,
                 },
+                value_had_conversion_loss,
             );
         }
         Ok(())
@@ -8727,9 +8740,10 @@ impl TdsClient {
     /// spans several messages and reports the aggregate across every batch, so
     /// one read after `write_to_server_zerocopy` covers the whole operation.
     ///
-    /// Silent for an Always Encrypted column in either direction: cell
-    /// encryption consumes the value before the narrow serializer runs, so no
-    /// substitution happens and none is reported. See
+    /// Always Encrypted parameters report substitution performed while fitting
+    /// plaintext to the destination collation before encryption. Encrypted
+    /// result values and bulk-copy cells remain silent because their encryption
+    /// paths do not perform narrow conversion. See
     /// [`StreamingBulkLoadWriter::code_page_conversion_loss`](crate::message::bulk_load::StreamingBulkLoadWriter::code_page_conversion_loss).
     pub fn take_code_page_conversion_loss(&mut self) -> bool {
         std::mem::take(&mut self.code_page_conversion_loss)
@@ -17138,6 +17152,12 @@ mod tests {
             &mut params,
             &mut output_param_ceks,
             &[],
+            &SqlCollation {
+                info: 0x0409,
+                lcid_language_id: 0,
+                col_flags: 0,
+                sort_id: 0,
+            },
         )
         .await
         .expect_err("a forced parameter omitted from the describe result must be rejected");
@@ -18553,7 +18573,9 @@ mod tests {
             StreamedSqlType::Udt(UdtTypeName::new(None, None, "x".repeat(256))),
         );
 
-        let error = TdsClient::split_and_validate_streamed_params(vec![param]).unwrap_err();
+        let error =
+            TdsClient::split_and_validate_streamed_params(vec![param], &SqlCollation::default())
+                .unwrap_err();
         assert!(matches!(error, Error::UsageError(_)));
     }
 
@@ -19219,6 +19241,27 @@ mod tests {
             .begin_sp_executesql("INSERT INTO t(v) VALUES (@v)".to_string(), vec![bad], ())
             .await
             .expect_err("unnamed data-at-exec parameter must be rejected");
+        assert!(matches!(err, UsageError(_)));
+        assert!(matches!(
+            client.streamed_write_state,
+            StreamedWriteState::Idle
+        ));
+    }
+
+    #[tokio::test]
+    async fn begin_rejects_encoded_byte_limit_on_data_at_exec_param() {
+        let mut client = create_test_client_with_tokens(vec![]);
+        let bad = RpcParameter::data_at_exec(
+            Some("@v".to_string()),
+            StatusFlags::NONE,
+            StreamedSqlType::VarcharMax,
+        )
+        .with_narrow_string_byte_limit(1);
+
+        let err = client
+            .begin_sp_executesql("INSERT INTO t(v) VALUES (@v)".to_string(), vec![bad], ())
+            .await
+            .expect_err("streamed encoded-byte limits must be rejected before opening the RPC");
         assert!(matches!(err, UsageError(_)));
         assert!(matches!(
             client.streamed_write_state,
@@ -20891,13 +20934,10 @@ mod tests {
         );
     }
 
-    /// Drives a real send site, so removing the retraction from
-    /// `execute_sp_executesql` cannot leave the suite green. Parameter 1 flushes
-    /// a packet; parameter 2 is rejected by `serialize_string` after it.
+    /// Parameter validation covers the complete list before serialization, so
+    /// a late encoded-length failure cannot flush the earlier large parameter.
     #[tokio::test]
-    async fn a_send_site_retracts_when_serialization_fails_after_a_flush() {
-        use crate::message::messages::PacketStatusFlags;
-
+    async fn a_send_site_rejects_encoded_overflow_before_writing() {
         let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
         let big = RpcParameter::new(
             Some("@big".to_string()),
@@ -20917,22 +20957,18 @@ mod tests {
             .execute_sp_executesql("SELECT @big, @bad".to_string(), vec![big, overlong], ())
             .await;
 
-        assert!(result.is_err(), "the over-long value must be rejected");
-
-        let wire = sent.lock().unwrap().clone();
-        let last = &wire[wire.len() - PacketWriter::PACKET_HEADER_SIZE..];
-        assert_eq!(
-            last[1],
-            PacketStatusFlags::Eom as u8 | PacketStatusFlags::Ignore as u8,
-            "the half-sent request must be withdrawn, not dropped"
+        assert_overlong_parameter_error(result.expect_err("the over-long value must be rejected"));
+        assert!(
+            sent.lock().unwrap().is_empty(),
+            "preflight must reject every parameter before writing the RPC"
         );
         assert!(
             !client.is_connection_dead(),
-            "a withdrawn request leaves the connection reusable"
+            "a locally rejected request leaves the connection reusable"
         );
     }
 
-    fn partially_serializable_cursor_params() -> Vec<RpcParameter> {
+    fn cursor_params_with_encoded_overflow() -> Vec<RpcParameter> {
         vec![
             RpcParameter::new(
                 Some("@big".to_string()),
@@ -20977,20 +21013,37 @@ mod tests {
     }
 
     fn assert_overlong_parameter_error(error: crate::error::Error) {
+        assert!(matches!(
+            error,
+            crate::error::Error::EncodedValueTooLong {
+                actual: 10,
+                maximum: 1
+            }
+        ));
+    }
+
+    fn assert_cursor_parameter_preflight_sent_nothing(
+        client: &TdsClient,
+        sent: &Arc<std::sync::Mutex<Vec<u8>>>,
+    ) {
         assert!(
-            error.to_string().contains("exceeds schema size"),
-            "the caller must receive the original serialization error, got {error}"
+            sent.lock().unwrap().is_empty(),
+            "parameter preflight must complete before the cursor RPC is written"
+        );
+        assert!(
+            !client.is_connection_dead(),
+            "a locally rejected cursor RPC must leave the connection reusable"
         );
     }
 
     #[tokio::test]
-    async fn cursor_open_with_params_retracts_a_partial_send() {
+    async fn cursor_open_with_params_rejects_encoded_overflow_before_writing() {
         let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
 
         let error = client
             .cursor_open_with_params(
                 "SELECT @big, @bad",
-                partially_serializable_cursor_params(),
+                cursor_params_with_encoded_overflow(),
                 crate::cursor::CursorScrollOption::FORWARD_ONLY,
                 crate::cursor::CursorConcurrency::READONLY,
                 0,
@@ -21001,7 +21054,7 @@ mod tests {
             .expect_err("the over-long cursor parameter must fail");
 
         assert_overlong_parameter_error(error);
-        assert_cursor_send_was_retracted(&client, &sent);
+        assert_cursor_parameter_preflight_sent_nothing(&client, &sent);
     }
 
     #[tokio::test]
@@ -21085,7 +21138,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn perform_cursor_operation_retracts_a_partial_send() {
+    async fn perform_cursor_operation_rejects_encoded_overflow_before_writing() {
         let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
 
         let error = client
@@ -21094,7 +21147,7 @@ mod tests {
                 crate::cursor::CursorOperation::UPDATE,
                 1,
                 "",
-                partially_serializable_cursor_params(),
+                cursor_params_with_encoded_overflow(),
                 None,
                 None,
             )
@@ -21102,17 +21155,17 @@ mod tests {
             .expect_err("the over-long cursor parameter must fail");
 
         assert_overlong_parameter_error(error);
-        assert_cursor_send_was_retracted(&client, &sent);
+        assert_cursor_parameter_preflight_sent_nothing(&client, &sent);
     }
 
     #[tokio::test]
-    async fn cursor_prepexec_retracts_a_partial_send() {
+    async fn cursor_prepexec_rejects_encoded_overflow_before_writing() {
         let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
 
         let error = client
             .cursor_prepexec(
                 "SELECT @big, @bad",
-                partially_serializable_cursor_params(),
+                cursor_params_with_encoded_overflow(),
                 crate::cursor::CursorScrollOption::FORWARD_ONLY,
                 crate::cursor::CursorConcurrency::READONLY,
                 0,
@@ -21123,17 +21176,17 @@ mod tests {
             .expect_err("the over-long cursor parameter must fail");
 
         assert_overlong_parameter_error(error);
-        assert_cursor_send_was_retracted(&client, &sent);
+        assert_cursor_parameter_preflight_sent_nothing(&client, &sent);
     }
 
     #[tokio::test]
-    async fn cursor_execute_retracts_a_partial_send() {
+    async fn cursor_execute_rejects_encoded_overflow_before_writing() {
         let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
 
         let error = client
             .cursor_execute(
                 1,
-                partially_serializable_cursor_params(),
+                cursor_params_with_encoded_overflow(),
                 crate::cursor::CursorScrollOption::FORWARD_ONLY,
                 crate::cursor::CursorConcurrency::READONLY,
                 0,
@@ -21144,7 +21197,7 @@ mod tests {
             .expect_err("the over-long cursor parameter must fail");
 
         assert_overlong_parameter_error(error);
-        assert_cursor_send_was_retracted(&client, &sent);
+        assert_cursor_parameter_preflight_sent_nothing(&client, &sent);
     }
 
     /// The retraction runs on its own budget, so a request that had a timeout
