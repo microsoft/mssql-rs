@@ -21,7 +21,7 @@ use crate::api::odbc_types::{
 use crate::api::set_desc_field::datetime_interval_code_for;
 use crate::conversion::client_encoding::ClientEncoding;
 use crate::conversion::fetch_convert::TextOutput;
-use crate::conversion::param_convert::{DaeLengthLimit, DaePlan, DaeTranscode};
+use crate::conversion::param_convert::{DaeLengthLimit, DaeTranscode};
 use crate::error::{DiagRecord, HasDiagnostics};
 use crate::handles::desc::UdtNames;
 use crate::params::{BoundParam, ParamSnapshot};
@@ -826,8 +826,8 @@ pub(crate) struct DaeParam {
     /// Total byte count declared by `SQL_LEN_DATA_AT_EXEC(n)`; `None` for
     /// `SQL_DATA_AT_EXEC`, where the application promised no total.
     pub(crate) expected_len: Option<usize>,
-    /// Whether the value streams to the wire or is collected first.
-    pub(crate) plan: DaePlan,
+    /// Whether the value must be collected before the RPC can open.
+    buffered: bool,
     /// `ColumnSize` applied to the accumulated chunk total as the chunks
     /// arrive, so the `22001` lands on the same `SQLPutData` msodbcsql puts it
     /// on. `None` when the bound is left to the close-time conversion.
@@ -850,7 +850,7 @@ impl DaeParam {
     pub(crate) fn new(
         bound_index: usize,
         expected_len: Option<usize>,
-        plan: DaePlan,
+        buffered: bool,
         length_limit: Option<DaeLengthLimit>,
         binding: BoundParam,
         udt_names: Option<Arc<UdtNames>>,
@@ -859,7 +859,7 @@ impl DaeParam {
             bound_index,
             value_ptr: binding.parameter_value_ptr,
             expected_len,
-            plan,
+            buffered,
             length_limit,
             binding,
             udt_names,
@@ -875,7 +875,6 @@ impl DaeParam {
         value_ptr: SqlPointer,
         expected_len: Option<usize>,
     ) -> Self {
-        use mssql_tds::message::parameters::rpc_parameters::StreamedSqlType;
         let binding = BoundParam {
             input_output_type: crate::api::odbc_types::SQL_PARAM_INPUT,
             c_type: crate::api::odbc_types::SQL_C_BINARY,
@@ -889,14 +888,7 @@ impl DaeParam {
             strlen_or_ind_ptr: std::ptr::null_mut(),
             octet_length_ptr: std::ptr::null_mut(),
         };
-        Self::new(
-            bound_index,
-            expected_len,
-            DaePlan::Stream(StreamedSqlType::VarBinaryMax),
-            None,
-            binding,
-            None,
-        )
+        Self::new(bound_index, expected_len, false, None, binding, None)
     }
 
     /// Same, with the binding's C and SQL types set, for the tests that depend
@@ -915,6 +907,15 @@ impl DaeParam {
     pub(crate) fn with_length_limit(mut self, limit: DaeLengthLimit) -> Self {
         self.length_limit = Some(limit);
         self
+    }
+
+    pub(crate) fn is_buffered(&self) -> bool {
+        self.buffered
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_buffered(&mut self, buffered: bool) {
+        self.buffered = buffered;
     }
 }
 
@@ -1067,7 +1068,7 @@ impl DaeState {
             Some(cursor) => self
                 .params
                 .get(cursor..)
-                .is_some_and(|rest| !rest.is_empty() && rest.iter().all(|p| !p.plan.is_buffered())),
+                .is_some_and(|rest| !rest.is_empty() && rest.iter().all(|p| !p.is_buffered())),
             None => false,
         }
     }
@@ -1076,7 +1077,7 @@ impl DaeState {
     /// giving each remaining parameter the transcode its chunks need.
     pub(crate) fn begin_streaming_phase(&mut self, client: TdsClient, collation: SqlCollation) {
         for param in &mut self.params {
-            if !param.plan.is_buffered() && param.transcode.is_none() {
+            if !param.is_buffered() && param.transcode.is_none() {
                 let transcode =
                     DaeTranscode::new(param.binding.c_type, param.binding.sql_type, collation);
                 if !transcode.is_passthrough() {
@@ -2152,7 +2153,7 @@ mod tests {
     #[test]
     fn buffered_phase_completes_only_when_remaining_params_stream() {
         let mut buffered = DaeParam::unbounded(0, std::ptr::null_mut(), None);
-        buffered.plan = DaePlan::Buffer;
+        buffered.set_buffered(true);
         let streamed = DaeParam::unbounded(1, std::ptr::null_mut(), None);
         let mut dae = DaeState::for_test(vec![buffered, streamed], None);
 
@@ -2170,7 +2171,7 @@ mod tests {
         use mssql_tds::test_client_support::tds_client_from_tokens;
 
         let mut buffered = DaeParam::unbounded(0, std::ptr::null_mut(), None);
-        buffered.plan = DaePlan::Buffer;
+        buffered.set_buffered(true);
         let streamed = DaeParam::unbounded(1, std::ptr::null_mut(), None)
             .with_binding_types(SQL_C_CHAR, SQL_WVARCHAR);
         let mut dae = DaeState::for_test(vec![buffered, streamed], Some(1));
