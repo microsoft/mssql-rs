@@ -6005,7 +6005,24 @@ impl TdsClient {
             if let Some(start) = start {
                 self.update_remaining_timeout(start);
             }
-            result.map_err(|error| self.fail_read(error))?
+            match result {
+                Ok(classification) => classification,
+                Err(error) => {
+                    let error = self.fail_read(error);
+                    // The token has no length prefix, so a failure partway
+                    // leaves the reader inside it. Before the first result
+                    // boundary no batch is open yet, so nothing else would
+                    // retire the connection.
+                    if !matches!(
+                        error,
+                        crate::error::Error::TimeoutError(_)
+                            | crate::error::Error::OperationCancelledError(_)
+                    ) {
+                        self.retire_after_failed_drain(&error);
+                    }
+                    return Err(error);
+                }
+            }
         } else {
             None
         };
@@ -9834,6 +9851,13 @@ mod tests {
         /// test can assert which budget a read ran under without waiting for one
         /// to elapse.
         receive_timeouts: Arc<std::sync::Mutex<Vec<Option<Duration>>>>,
+        /// Real time each `receive_data_classification` takes, so a test can
+        /// see whether the client charges it to the request budget.
+        classification_delay: Option<Duration>,
+        classification_calls: usize,
+        /// Returned by the `receive_data_classification` call with this
+        /// zero-based index instead of reading.
+        classification_error: Option<(usize, crate::error::Error)>,
     }
 
     impl TestTransport {
@@ -9864,6 +9888,9 @@ mod tests {
                 sync_columns: VecDeque::new(),
                 encryption_setting: NegotiatedEncryptionSetting::NoEncryption,
                 receive_timeouts: Arc::new(std::sync::Mutex::new(Vec::new())),
+                classification_delay: None,
+                classification_calls: 0,
+                classification_error: None,
             }
         }
 
@@ -9965,10 +9992,26 @@ mod tests {
         async fn receive_data_classification(
             &mut self,
             _context: &ParserContext,
-            _remaining_request_timeout: Option<Duration>,
+            remaining_request_timeout: Option<Duration>,
             cancel_handle: Option<&CancelHandle>,
         ) -> TdsResult<Option<crate::token::data_classification::DataClassificationMetadata>>
         {
+            self.receive_timeouts
+                .lock()
+                .unwrap()
+                .push(remaining_request_timeout);
+            let call = self.classification_calls;
+            self.classification_calls += 1;
+            if let Some(delay) = self.classification_delay {
+                tokio::time::sleep(delay).await;
+            }
+            if self
+                .classification_error
+                .as_ref()
+                .is_some_and(|(index, _)| *index == call)
+            {
+                return Err(self.classification_error.take().unwrap().1);
+            }
             if let Some(handle) = cancel_handle
                 && handle.cancel_token.is_cancelled()
             {
@@ -10863,6 +10906,76 @@ mod tests {
         assert!(client.current_data_classification.is_none());
         assert!(!client.has_open_batch());
         assert!(!client.is_connection_dead());
+    }
+
+    /// The look-ahead reads from the wire, so its time comes out of the
+    /// request budget like any other response read.
+    #[tokio::test]
+    async fn classification_look_ahead_is_charged_to_the_request_timeout() {
+        use crate::token::data_classification::SensitivityRank;
+
+        let delay = Duration::from_millis(50);
+        let mut transport = TestTransport::with_tokens(vec![
+            int_col_metadata(1),
+            ranked_classification(SensitivityRank::High),
+            done_count(CurrentCommand::Select, 0, true),
+            int_col_metadata(1),
+            done_count(CurrentCommand::Select, 0, false),
+        ]);
+        transport.classification_delay = Some(delay);
+        let observed = Arc::clone(&transport.receive_timeouts);
+        let mut client = create_test_client_with_transport(transport);
+
+        client
+            .execute("q".to_string(), ExecuteOptions::new().timeout_secs(10))
+            .await
+            .unwrap();
+        assert_eq!(client.advance().await.unwrap(), StatementResult::Rows);
+
+        let observed = observed.lock().unwrap();
+        let look_ahead = observed[1].expect("the look-ahead runs under the budget");
+        let next_read = observed[2].expect("the next read runs under the budget");
+        assert!(
+            next_read <= look_ahead - delay,
+            "look-ahead time was not charged: {look_ahead:?} then {next_read:?}"
+        );
+    }
+
+    /// A timeout or cancellation during the look-ahead goes through the same
+    /// ATTENTION settlement as any other read: the batch is closed, and a
+    /// settled interruption leaves the connection usable.
+    #[tokio::test]
+    async fn interrupted_classification_look_ahead_settles_without_retiring() {
+        for error in [
+            crate::error::Error::OperationCancelledError("cancelled".to_string()),
+            crate::error::Error::TimeoutError(crate::error::TimeoutErrorType::String(
+                "timed out".to_string(),
+            )),
+        ] {
+            let mut transport = TestTransport::with_tokens(vec![
+                int_col_metadata(1),
+                done_count(CurrentCommand::Select, 0, true),
+                int_col_metadata(1),
+                done_count(CurrentCommand::Select, 0, false),
+            ]);
+            transport.classification_error = Some((1, error));
+            let mut client = create_test_client_with_transport(transport);
+
+            client.execute("q".to_string(), ()).await.unwrap();
+            assert!(client.has_open_batch());
+            let error = client.advance().await.unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    crate::error::Error::OperationCancelledError(_)
+                        | crate::error::Error::TimeoutError(_)
+                ),
+                "{error}"
+            );
+            assert!(!client.has_open_batch());
+            assert!(!client.is_connection_dead());
+            assert!(client.data_classification().is_none());
+        }
     }
 
     /// A batched prepared execution positions its result sets through its own
