@@ -48,6 +48,22 @@ function Assert-SemVer {
     }
 }
 
+function Assert-SupportedSectionStrings {
+    param([Parameter(Mandatory = $true)][string]$Content, [Parameter(Mandatory = $true)][string]$Path)
+
+    if ($Content -match '(?m)^[ \t]*(?:"(?:\\.|[^"\\\r\n])*"|''[^''\r\n]*'')[ \t]*[=.]') {
+        throw "Quoted keys are unsupported in $Path"
+    }
+    # Consume complete comments and single-line strings before looking for a
+    # multiline delimiter, so their literal contents cannot trigger rejection.
+    $tokens = [regex]::Matches($Content, '#[^\r\n]*|(?<multiline>"""|'''''')|"(?:\\.|[^"\\\r\n])*"|''[^''\r\n]*''')
+    foreach ($token in $tokens) {
+        if ($token.Groups['multiline'].Success) {
+            throw "Multiline strings are unsupported in $Path"
+        }
+    }
+}
+
 function Get-PackageVersionMatch {
     param([Parameter(Mandatory = $true)][string]$Content, [Parameter(Mandatory = $true)][string]$Path)
 
@@ -63,9 +79,7 @@ function Get-PackageVersionMatch {
     }
 
     $section = $sections[0]
-    if ($section.Value -match '(?m)^[ \t]*(?:"(?:\\.|[^"\\\r\n])*"|''[^''\r\n]*'')[ \t]*[=.]' -or $section.Value -match '"""|''''''') {
-        throw "Quoted package keys and multiline package strings are unsupported in $Path"
-    }
+    Assert-SupportedSectionStrings -Content $section.Value -Path $Path
     $declarations = [regex]::Matches($section.Value, '(?m)^[ \t]*version\b')
     $versions = [regex]::Matches($section.Value, '(?m)^[ \t]*version[ \t]*=[ \t]*"(?<version>[^"\r\n]*)"[ \t]*(?:#[^\r\n]*)?\r?$')
     if ($declarations.Count -ne 1 -or $versions.Count -ne 1) {
@@ -105,13 +119,11 @@ function Set-MssqlTdsDependencyVersion {
     $dependencySections = [regex]::Matches($Content, '(?ms)^[ \t]*\[[ \t]*(?:target[ \t]*\.[^\]\r\n]+?\.[ \t]*)?(?:dependencies|dev-dependencies|build-dependencies)[ \t]*\][ \t]*(?:#[^\r\n]*)?(?:\r?\n|\z).*?(?=^[ \t]*\[|\z)')
     $declarationCount = 0
     foreach ($dependencySection in $dependencySections) {
-        if ($dependencySection.Value -match '(?m)^[ \t]*(?:"(?:\\.|[^"\\\r\n])*"|''[^''\r\n]*'')[ \t]*[=.]' -or $dependencySection.Value -match '"""|''''''') {
-            throw "Quoted dependency keys and multiline dependency strings are unsupported in $Path"
-        }
+        Assert-SupportedSectionStrings -Content $dependencySection.Value -Path $Path
         $declarationCount += [regex]::Matches($dependencySection.Value, '(?m)^[ \t]*(?:mssql-tds|["'']mssql-tds["''])[ \t]*[=.]').Count
     }
     if ($declarationCount -ne 1 -or $sections.Count -ne 1 -or
-        $Content -match '(?m)^[ \t]*\[[ \t]*(?:target[ \t]*\.[^\]\r\n]+?\.[ \t]*)?(?:dependencies|dev-dependencies|build-dependencies)[ \t]*\.[ \t]*["'']?mssql-tds(?:["'']|[ \t.\]])') {
+        $Content -match '(?m)^[ \t]*\[[ \t]*(?:target[ \t]*\.[^\]\r\n]+?\.[ \t]*)?(?:dependencies|dev-dependencies|build-dependencies)[ \t]*\.[ \t]*(?:["'']|mssql-tds(?:[ \t.\]]))') {
         throw "Expected one inline mssql-tds dependency in [dependencies] in $Path"
     }
 

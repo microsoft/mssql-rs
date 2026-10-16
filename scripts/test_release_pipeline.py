@@ -1988,6 +1988,54 @@ def test_crate_stamp_rejects_nonofficial_build_metadata(stamp_manifests):
     assert_stamp_rejected(stamp_manifests)
 
 
+@pytest.mark.parametrize("section", ["package", "dependencies"])
+@pytest.mark.parametrize("line", [
+    """description = "SQL escaping of ''' sequences" """,
+    """description = 'SQL escaping of \"\"\" sequences' """,
+    """# avoid \"\"\" and ''' strings""",
+    """description = "escaped \\" quote and '''" # \"\"\"""",
+])
+@pytest.mark.parametrize("what_if", [False, True])
+def test_crate_stamp_allows_literal_triple_quotes(stamp_manifests, section, line, what_if):
+    path = stamp_manifests / "mssql-mock-tds" / "Cargo.toml"
+    # Use a dependency inline table for values, but leave comments as comments.
+    if section == "dependencies" and not line.startswith("#"):
+        line = "unrelated = { path = " + line.split("=", 1)[1].split(" #", 1)[0] + " }"
+    content = path.read_text().replace(f"[{section}]", f"[{section}]\n{line}", 1)
+    tomllib.loads(content)
+    path.write_bytes(content.encode())
+    result = run_crate_stamp(stamp_manifests, WhatIf=what_if)
+    assert result.returncode == 0, result.stderr
+    expected = content if what_if else content.replace("0.3.0", "0.3.0-dev.20261015.123")
+    assert path.read_bytes() == expected.encode()
+
+
+@pytest.mark.parametrize("section", ["package", "dependencies"])
+@pytest.mark.parametrize("quote", ['"""', "'''"])
+@pytest.mark.parametrize("what_if", [False, True])
+def test_crate_stamp_still_rejects_multiline_strings(stamp_manifests, section, quote, what_if):
+    path = stamp_manifests / "mssql-mock-tds" / "Cargo.toml"
+    value = f"description = {quote}first\nsecond{quote}"
+    path.write_bytes(path.read_text().replace(f"[{section}]", f"[{section}]\n{value}", 1).encode())
+    assert_stamp_rejected(stamp_manifests, WhatIf=what_if)
+
+
+@pytest.mark.parametrize("table", [
+    'dev-dependencies."mssql\\u002dtds"',
+    'build-dependencies."mssql\\u002dtds"',
+    """target . 'cfg(windows)' . dependencies . "mssql\\u002dtds" """,
+    """target . 'cfg(windows)' . dev-dependencies . "mssql\\u002dtds" """,
+    """target . 'cfg(windows)' . build-dependencies . "mssql\\u002dtds" """,
+])
+@pytest.mark.parametrize("what_if", [False, True])
+def test_crate_stamp_rejects_quoted_dependency_subtables(stamp_manifests, table, what_if):
+    path = stamp_manifests / "mssql-mock-tds" / "Cargo.toml"
+    content = path.read_text() + f'\n[{table}]\npath = "../mssql-tds"\nversion = "0.3.0"\n'
+    tomllib.loads(content)
+    path.write_bytes(content.encode())
+    assert_stamp_rejected(stamp_manifests, WhatIf=what_if)
+
+
 def test_crate_stamp_preserves_crlf_and_indented_declarations(stamp_manifests):
     for path in stamp_manifests.rglob("Cargo.toml"):
         path.write_bytes(path.read_text().replace("version =", "\tversion =").replace("\n", "\r\n").encode())
