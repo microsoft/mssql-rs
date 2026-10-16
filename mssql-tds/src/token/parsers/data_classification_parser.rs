@@ -12,11 +12,11 @@
 //! are reported as `DATACLASSIFICATION` protocol errors.
 //!
 //! The payload is validated while it is parsed: dictionary indexes must be in
-//! range or `0xFFFF`, ranks must be defined values, and the token must fit the
-//! parser's byte budget. SqlClient rejects out-of-range indexes and undefined
-//! ranks the same way. msodbcsql validates nothing because it hands the
-//! application raw bytes; this client exposes typed metadata, which cannot
-//! represent an invalid reference.
+//! range or `0xFFFF`, ranks must be defined values, and the token must fit
+//! [`MAX_DATA_CLASSIFICATION_TOKEN_BYTES`]. SqlClient rejects out-of-range
+//! indexes and undefined ranks the same way. msodbcsql validates nothing
+//! because it hands the application raw bytes; this client exposes typed
+//! metadata, which cannot represent an invalid reference.
 
 use std::fmt;
 
@@ -35,7 +35,24 @@ use crate::token::data_classification::{
 use crate::token::tokens::Tokens;
 
 const NULL_DICTIONARY_INDEX: u16 = u16::MAX;
-const MAX_DATA_CLASSIFICATION_TOKEN_BYTES: usize = 256 * 1024;
+/// Bounds how much a malformed or hostile token can make the parser read.
+/// MS-TDS sets no limit, and msodbcsql, SqlClient and JDBC read the token
+/// without one.
+///
+/// SQL Server deduplicates both dictionaries, so the token only grows when
+/// many result columns have distinct classifications. Labels, information
+/// types and their ids are `sysname`, so at V2 a column with its own label
+/// and information type, all four strings at 128 characters, costs 1,038
+/// bytes; checked against SQL Server 2022, where 252 such columns produce
+/// 261,586 bytes. Across the 4096-column result-set maximum that is
+/// 4,251,658 bytes. Each extra source classification on a derived column
+/// adds 8 bytes, so this allows about four times that worst case rather
+/// than an exact protocol maximum.
+const MAX_DATA_CLASSIFICATION_TOKEN_BYTES: usize = 16 * 1024 * 1024;
+/// Up-front capacity for a counted collection. Larger collections grow as
+/// their entries are read, so a two-byte count cannot by itself make the
+/// parser allocate much.
+const MAX_PREALLOCATED_ENTRIES: usize = 1024;
 
 #[derive(Debug, Default)]
 pub(crate) struct DataClassificationTokenParser;
@@ -91,19 +108,23 @@ impl fmt::Display for Field {
     }
 }
 
-#[derive(Default)]
 struct ParseBudget {
     consumed: usize,
+    limit: usize,
 }
 
 impl ParseBudget {
+    fn new(limit: usize) -> Self {
+        Self { consumed: 0, limit }
+    }
+
     fn claim(&mut self, bytes: usize, field: Field) -> TdsResult<()> {
         // Saturating: a total past the budget is rejected below either way.
         let consumed = self.consumed.saturating_add(bytes);
-        if consumed > MAX_DATA_CLASSIFICATION_TOKEN_BYTES {
+        if consumed > self.limit {
             return Err(classification_error(format!(
-                "{field} exceeds the maximum supported token size of \
-                 {MAX_DATA_CLASSIFICATION_TOKEN_BYTES} bytes"
+                "{field} exceeds the maximum supported token size of {} bytes",
+                self.limit
             )));
         }
         self.consumed = consumed;
@@ -117,7 +138,7 @@ impl ParseBudget {
         field: Field,
     ) -> TdsResult<()> {
         let minimum_bytes = usize::from(count).saturating_mul(minimum_item_bytes);
-        let remaining = MAX_DATA_CLASSIFICATION_TOKEN_BYTES - self.consumed;
+        let remaining = self.limit - self.consumed;
         if minimum_bytes > remaining {
             return Err(classification_error(format!(
                 "{field} {count} requires at least {minimum_bytes} bytes, \
@@ -130,6 +151,10 @@ impl ParseBudget {
 
 fn classification_error(message: impl Into<String>) -> Error {
     Error::ProtocolError(format!("DATACLASSIFICATION: {}", message.into()))
+}
+
+fn preallocated(count: u16) -> usize {
+    usize::from(count).min(MAX_PREALLOCATED_ENTRIES)
 }
 
 async fn read_u8<T: TdsPacketReader + Send + Sync>(
@@ -230,11 +255,24 @@ impl DataClassificationTokenParser {
     where
         T: TdsPacketReader + Send + Sync,
     {
-        let mut budget = ParseBudget::default();
+        self.parse_within(reader, version, MAX_DATA_CLASSIFICATION_TOKEN_BYTES)
+            .await
+    }
+
+    async fn parse_within<T>(
+        &self,
+        reader: &mut T,
+        version: DataClassificationVersion,
+        limit: usize,
+    ) -> TdsResult<DataClassificationMetadata>
+    where
+        T: TdsPacketReader + Send + Sync,
+    {
+        let mut budget = ParseBudget::new(limit);
 
         let label_count = read_u16(reader, &mut budget, Field::LabelCount).await?;
         budget.validate_collection(label_count, 2, Field::LabelCount)?;
-        let mut sensitivity_labels = Vec::with_capacity(usize::from(label_count));
+        let mut sensitivity_labels = Vec::with_capacity(preallocated(label_count));
         for index in 0..label_count {
             sensitivity_labels.push(SensitivityLabel {
                 name: read_b_varchar(reader, &mut budget, Field::LabelName(index)).await?,
@@ -245,7 +283,7 @@ impl DataClassificationTokenParser {
         let information_type_count =
             read_u16(reader, &mut budget, Field::InformationTypeCount).await?;
         budget.validate_collection(information_type_count, 2, Field::InformationTypeCount)?;
-        let mut information_types = Vec::with_capacity(usize::from(information_type_count));
+        let mut information_types = Vec::with_capacity(preallocated(information_type_count));
         for index in 0..information_type_count {
             information_types.push(InformationType {
                 name: read_b_varchar(reader, &mut budget, Field::InformationTypeName(index))
@@ -267,13 +305,13 @@ impl DataClassificationTokenParser {
 
         let column_count = read_u16(reader, &mut budget, Field::ColumnCount).await?;
         budget.validate_collection(column_count, 2, Field::ColumnCount)?;
-        let mut columns = Vec::with_capacity(usize::from(column_count));
+        let mut columns = Vec::with_capacity(preallocated(column_count));
         for column in 0..column_count {
             let count_field = Field::PropertyCount { column };
             let property_count = read_u16(reader, &mut budget, count_field).await?;
             budget.validate_collection(property_count, property_bytes, count_field)?;
 
-            let mut properties = Vec::with_capacity(usize::from(property_count));
+            let mut properties = Vec::with_capacity(preallocated(property_count));
             for property in 0..property_count {
                 let label_field = Field::LabelIndex { column, property };
                 let label_index = read_u16(reader, &mut budget, label_field).await?;
@@ -404,6 +442,19 @@ mod tests {
     ) -> TdsResult<DataClassificationMetadata> {
         DataClassificationTokenParser
             .parse_with_version(&mut MockReader::new(bytes), version)
+            .await
+    }
+
+    /// Small enough that the limit tests do not build megabyte payloads.
+    const TEST_LIMIT: usize = 256 * 1024;
+
+    async fn parse_within(
+        bytes: Vec<u8>,
+        version: DataClassificationVersion,
+        limit: usize,
+    ) -> TdsResult<DataClassificationMetadata> {
+        DataClassificationTokenParser
+            .parse_within(&mut MockReader::new(bytes), version, limit)
             .await
     }
 
@@ -721,7 +772,7 @@ mod tests {
         bytes.extend_from_slice(&1u16.to_le_bytes());
         bytes.extend_from_slice(&u16::MAX.to_le_bytes());
 
-        let error = parse(bytes, DataClassificationVersion::Version1)
+        let error = parse_within(bytes, DataClassificationVersion::Version1, TEST_LIMIT)
             .await
             .unwrap_err();
 
@@ -750,7 +801,7 @@ mod tests {
                 .map(|(name, id)| (name.as_str(), id.as_str()))
                 .collect();
             let bytes = payload(DataClassificationVersion::Version1, &labels, &[], -1, &[]);
-            parse(bytes, DataClassificationVersion::Version1).await
+            parse_within(bytes, DataClassificationVersion::Version1, TEST_LIMIT).await
         }
 
         let at_limit = labels(252);
@@ -762,6 +813,46 @@ mod tests {
             &error,
             "sensitivity label 256 name exceeds the maximum supported token size of 262144 bytes",
         );
+    }
+
+    /// The worst case the limit is sized from: every column of a
+    /// 4096-column result set has its own label and information type, all
+    /// four `sysname` strings at 128 characters.
+    #[tokio::test]
+    async fn the_widest_distinctly_classified_result_set_parses() {
+        let columns = 4096u16;
+        let sysname = "x".repeat(128);
+        let dictionary = vec![(sysname.as_str(), sysname.as_str()); usize::from(columns)];
+        let properties: Vec<_> = (0..columns)
+            .map(|index| {
+                vec![WireProperty {
+                    label: index,
+                    information_type: index,
+                    rank: 30,
+                }]
+            })
+            .collect();
+        let bytes = payload(
+            DataClassificationVersion::Version2,
+            &dictionary,
+            &dictionary,
+            40,
+            &properties,
+        );
+        assert_eq!(bytes.len(), 4_251_658);
+
+        let metadata = parse(bytes, DataClassificationVersion::Version2)
+            .await
+            .unwrap();
+        assert_eq!(metadata.sensitivity_labels.len(), usize::from(columns));
+        assert_eq!(metadata.information_types.len(), usize::from(columns));
+        assert_eq!(metadata.columns.len(), usize::from(columns));
+    }
+
+    #[test]
+    fn counts_preallocate_at_most_the_entry_limit() {
+        assert_eq!(preallocated(3), 3);
+        assert_eq!(preallocated(u16::MAX), MAX_PREALLOCATED_ENTRIES);
     }
 
     #[tokio::test]
