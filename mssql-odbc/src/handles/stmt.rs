@@ -456,6 +456,9 @@ pub(crate) struct StmtState {
     pub(crate) text_output: TextOutput,
     /// Column metadata from the most recent execution.
     pub(crate) column_metadata: Vec<ColumnMetadata>,
+    /// Advances whenever `column_metadata` is replaced or cleared, so a value
+    /// read for one result set without the lock is not applied to the next.
+    pub(crate) result_generation: u64,
     /// UTF-16 column names built once when result metadata changes.
     pub(crate) column_names_utf16: Vec<Vec<u16>>,
     /// Reused by bounded PLP read-ahead so each MAX value does not allocate a
@@ -1425,6 +1428,7 @@ impl StmtState {
     /// command ordinal restarts rather than climbing across executions.
     pub(crate) fn begin_result_set(&mut self, metadata: Vec<ColumnMetadata>) {
         self.column_metadata = metadata;
+        self.result_generation = self.result_generation.wrapping_add(1);
         self.refresh_metadata_caches();
         self.rows_returned = 0;
         self.current_command += 1;
@@ -1443,6 +1447,7 @@ impl StmtState {
     /// Clears result metadata and every cache derived from it.
     pub(crate) fn clear_result_metadata(&mut self) {
         self.column_metadata.clear();
+        self.result_generation = self.result_generation.wrapping_add(1);
         self.column_names_utf16.clear();
     }
 
@@ -1827,6 +1832,7 @@ impl StmtHandle {
                 diag_records: Vec::new(),
                 text_output: TextOutput::UTF8,
                 column_metadata: Vec::new(),
+                result_generation: 0,
                 column_names_utf16: Vec::new(),
                 plp_prefetch_scratch: Vec::new(),
                 result_set_exhausted: false,

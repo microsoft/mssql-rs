@@ -39,13 +39,21 @@
 //   32. VariantExactNumericsReportNumeric - decimal/numeric/money/smallmoney → SQL_C_NUMERIC
 //   33. VariantDecimalStillDeliversAsCharacter - the SQL_C_CHAR read after the attribute
 //   34. VariantBaseTypesMatchMsodbcsql    - every measured-parity base type
+//   35. NameIsReportedWhileTheCursorIsOpen - alias name in both type-name fields
+//   36. NameIsReportedOnceTheRowsAreRead  - the idle session reads the names
+//   37. TypeCreatedAfterTheReadIsNamedAfterADatabaseChange - re-read on a database change
+//   38. LookupOnTheSessionBeginsNoImplicitTransaction - the application's setting is kept
 
+#include "odbc_concurrent_test.h"
 #include "odbc_test_fixture.h"
 #include "odbc_sql_server_types.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <string>
+#include <vector>
 
 class ColAttributeLiveTest : public ODBCTest {
 protected:
@@ -88,6 +96,20 @@ static std::string TextAttr(SQLHSTMT stmt, SQLUSMALLINT col, SQLUSMALLINT field)
         SQLColAttribute(stmt, col, field, value, sizeof(value), &length, nullptr);
     EXPECT_TRUE(SQL_SUCCEEDED(rc)) << "field " << field;
     return ODBCTestUtils::ToNarrow(SqlTString(value));
+}
+
+// Runs a single-value integer query on |stmt| and closes its cursor.
+static SQLINTEGER ScalarInt(SQLHSTMT stmt, const std::string& sql) {
+    SqlTString wide = ODBCTestUtils::ToSqlTStr(sql);
+    EXPECT_SQL_OK(SQLExecDirect(stmt, const_cast<SQLTCHAR*>(wide.c_str()), SQL_NTS),
+                  SQL_HANDLE_STMT, stmt);
+    EXPECT_SQL_OK(SQLFetch(stmt), SQL_HANDLE_STMT, stmt);
+    SQLINTEGER value = -1;
+    SQLLEN indicator = 0;
+    EXPECT_SQL_OK(SQLGetData(stmt, 1, SQL_C_SLONG, &value, sizeof(value), &indicator),
+                  SQL_HANDLE_STMT, stmt);
+    SQLCloseCursor(stmt);
+    return value;
 }
 
 static void ExpectVariantType(SQLHSTMT stmt, SQLUSMALLINT col, SQLLEN expected) {
@@ -165,6 +187,147 @@ TEST_F(ColAttributeLiveTest, ConciseTypePerColumnType) {
     EXPECT_EQ(SQL_WVARCHAR, NumericAttr(stmt_, 3, SQL_DESC_CONCISE_TYPE));
     EXPECT_EQ(SQL_DECIMAL, NumericAttr(stmt_, 4, SQL_DESC_CONCISE_TYPE));
     SQLCloseCursor(stmt_);
+}
+
+// Alias types are numbered per database, so COLMETADATA names one only by its
+// UserType. msodbcsql reads the names from systypes when an alias-typed column
+// is first described and after each database change (sqlccmd.cpp
+// RefreshShilohUDTCache), on the session when it is idle and on a separate
+// login while rows are pending, and reports them for both type-name fields
+// (sqlcdesc.cpp GetIRDField).
+class AliasTypeLiveTest : public ColAttributeLiveTest {
+protected:
+    void TearDown() override {
+        SQLCloseCursor(stmt_);
+        // A transaction left open by a failed run would roll the drops back at
+        // disconnect.
+        ExecDirectIgnoreError("IF @@TRANCOUNT > 0 ROLLBACK; SET IMPLICIT_TRANSACTIONS OFF");
+        for (const std::string& name : typeNames_) {
+            ExecDirectIgnoreError("DROP TYPE dbo." + name);
+        }
+        ColAttributeLiveTest::TearDown();
+    }
+
+    std::string CreateAliasType() {
+        // Concurrent workers share the database, so the time alone could repeat.
+        static std::atomic<unsigned> sequence{0};
+        const std::string name =
+            "mssqlrs_alias_" +
+            std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + "_" +
+            std::to_string(sequence++);
+        ExecDirect("CREATE TYPE dbo." + name + " FROM varchar(17)");
+        typeNames_.push_back(name);
+        return name;
+    }
+
+    // CAST accepts only system types (error 243), so the rows come from a
+    // table variable declared with the alias type.
+    void SelectAliasColumn(const std::string& typeName) {
+        ExecDirect("SET NOCOUNT ON;"
+                   " DECLARE @t TABLE (alias_col " + typeName + ", base_col varchar(5));"
+                   " INSERT @t VALUES ('first', 'x'), ('second', 'y');"
+                   " SELECT alias_col, base_col FROM @t ORDER BY base_col");
+    }
+
+    void FetchAliasValues() {
+        for (const char* expected : {"first", "second"}) {
+            ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+            SQLCHAR value[32] = {};
+            SQLLEN valueLen = 0;
+            ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_CHAR, value, sizeof(value), &valueLen),
+                          SQL_HANDLE_STMT, stmt_);
+            EXPECT_STREQ(expected, reinterpret_cast<const char*>(value));
+        }
+        EXPECT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
+    }
+
+    void SetCatalog(const std::string& name) {
+        SqlTString catalog = ODBCTestUtils::ToSqlTStr(name);
+        ASSERT_SQL_OK(SQLSetConnectAttr(dbc_, SQL_ATTR_CURRENT_CATALOG,
+                                        const_cast<SQLTCHAR*>(catalog.c_str()), SQL_NTS),
+                      SQL_HANDLE_DBC, dbc_);
+    }
+
+private:
+    std::vector<std::string> typeNames_;
+};
+
+// The first description happens with the cursor's rows pending, so the names
+// are read without touching the session that is serving them.
+//
+// Skipped under comparison: parity-deviations entry 31. msodbcsql's separate
+// login takes neither the session's encryption settings nor its DSN's, so
+// against a server that forces encryption with a certificate the client trusts
+// only through TrustServerCertificate, as CI's does, its lookup fails and the
+// column keeps its base type name. Where that login succeeds, msodbcsql 18.6.2.1
+// reports the alias name too.
+ODBC_TEST_F(AliasTypeLiveTest, NameIsReportedWhileTheCursorIsOpen) {
+    SKIP_IF_COMPARING_MSODBCSQL();
+    const std::string typeName = CreateAliasType();
+    SelectAliasColumn(typeName);
+
+    EXPECT_EQ(typeName, TextAttr(stmt_, 1, SQL_DESC_TYPE_NAME));
+    EXPECT_EQ(typeName, TextAttr(stmt_, 1, SQL_DESC_LOCAL_TYPE_NAME));
+    EXPECT_EQ("varchar", TextAttr(stmt_, 2, SQL_DESC_TYPE_NAME));
+    EXPECT_EQ("varchar", TextAttr(stmt_, 2, SQL_DESC_LOCAL_TYPE_NAME));
+    FetchAliasValues();
+}
+
+// Once every row has been read the session is idle and answers itself.
+ODBC_TEST_F(AliasTypeLiveTest, NameIsReportedOnceTheRowsAreRead) {
+    const std::string typeName = CreateAliasType();
+    SelectAliasColumn(typeName);
+    FetchAliasValues();
+
+    EXPECT_EQ(typeName, TextAttr(stmt_, 1, SQL_DESC_TYPE_NAME));
+    EXPECT_EQ(typeName, TextAttr(stmt_, 1, SQL_DESC_LOCAL_TYPE_NAME));
+}
+
+// No supported server sends the "Type added." message msodbcsql also watches
+// for (sqlcerr.cpp), so a type created after the read keeps its base type name
+// until a database change, even one that returns to the same database. Each
+// column is described after its rows are read, so both drivers read the names
+// on the session.
+ODBC_TEST_F(AliasTypeLiveTest, TypeCreatedAfterTheReadIsNamedAfterADatabaseChange) {
+    const std::string earlier = CreateAliasType();
+    SelectAliasColumn(earlier);
+    FetchAliasValues();
+    EXPECT_EQ(earlier, TextAttr(stmt_, 1, SQL_DESC_TYPE_NAME));
+    SQLCloseCursor(stmt_);
+
+    const std::string later = CreateAliasType();
+    SelectAliasColumn(later);
+    FetchAliasValues();
+    EXPECT_EQ("varchar", TextAttr(stmt_, 1, SQL_DESC_TYPE_NAME));
+    SQLCloseCursor(stmt_);
+
+    const std::string database = ODBCTestConfig::Instance().Database();
+    SetCatalog(database == "master" ? "tempdb" : "master");
+    SetCatalog(database);
+    SelectAliasColumn(later);
+    FetchAliasValues();
+    EXPECT_EQ(later, TextAttr(stmt_, 1, SQL_DESC_TYPE_NAME));
+}
+
+// The application can enable implicit transactions itself. msodbcsql reads the
+// names inside sp_executesql with the option turned off there (sqlcstr.cpp
+// g_szSqlUdtQuery), so the lookup on the idle session neither begins a
+// transaction nor changes the application's setting.
+ODBC_TEST_F(AliasTypeLiveTest, LookupOnTheSessionBeginsNoImplicitTransaction) {
+    const std::string typeName = CreateAliasType();
+    SelectAliasColumn(typeName);
+    FetchAliasValues();
+
+    SQLHSTMT other = AllocStmt();
+    SqlTString implicitOn = ODBCTestUtils::ToSqlTStr("SET IMPLICIT_TRANSACTIONS ON");
+    ASSERT_SQL_OK(SQLExecDirect(other, const_cast<SQLTCHAR*>(implicitOn.c_str()), SQL_NTS),
+                  SQL_HANDLE_STMT, other);
+    ASSERT_EQ(0, ScalarInt(other, "SELECT @@TRANCOUNT"));
+
+    EXPECT_EQ(typeName, TextAttr(stmt_, 1, SQL_DESC_TYPE_NAME));
+
+    EXPECT_EQ(0, ScalarInt(other, "SELECT @@TRANCOUNT"));
+    EXPECT_EQ(2, ScalarInt(other, "SELECT @@OPTIONS & 2"));
 }
 
 // Matches retail msodbcsql 18.6.2.1. GetIRDField in

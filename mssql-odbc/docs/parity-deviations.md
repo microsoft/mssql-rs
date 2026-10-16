@@ -1030,3 +1030,65 @@ msodbcsql build is measured.
     avoids a duplicate XML declaration marker, and preserves all non-BOM input.
     Wire-level tests cover an absent BOM, a BOM split across calls, and later
     chunks after BOM classification. Tracked in AB#48349.
+
+31. **A busy connection's alias-type lookup logs in with the session's own
+    authentication and encryption settings.** Both drivers read alias type
+    names for `SQL_DESC_TYPE_NAME` and `SQL_DESC_LOCAL_TYPE_NAME` on the session
+    when it is idle, and on a separate login while rows are pending
+    (`RefreshShilohUDTCache`, `sqlccmd.cpp`). msodbcsql's `SpawnConnection`
+    (`sqlcinfo.cpp`) builds that login from a fixed list of keywords - DSN,
+    server or read-only routing target, failover partner, UID, PWD, current
+    database, language, application intent, multi-subnet failover, TNIR,
+    column encryption, vector support, `ConnectRetryCount=0` - and copies only
+    the login timeout and `SQL_COPT_SS_INTEGRATED_SECURITY` among connection
+    attributes. It carries no `Authentication` keyword, no
+    `SQL_COPT_SS_ACCESS_TOKEN`, and no `Encrypt` or `TrustServerCertificate`;
+    a `TrustServerCertificate=yes` in the session's DSN does not reach it
+    either. An Entra- or token-authenticated session's lookup therefore logs in
+    without its credentials, and against a server that forces encryption with a
+    certificate the client trusts only through `TrustServerCertificate`, the
+    lookup fails the certificate check; either way the column keeps its base
+    type name. This driver logs in from the session's retained login context
+    (`TdsClient::secondary_client_context`), with the current database and
+    connection retry disabled, so the lookup succeeds wherever the session's
+    own login did, for every method that signs in silently. Methods that may
+    prompt (`ActiveDirectoryInteractive`, `ActiveDirectoryDeviceCodeFlow`) are
+    never replayed, which leaves those sessions with msodbcsql's result rather
+    than a sign-in window mid-call. Matching the reference would mean
+    discarding credentials and trust settings the application supplied only to
+    make the lookup fail. `SQL_USER_NAME` never takes this path (AB#48942; see
+    `docs/sql-get-info-plan.md`).
+    Measured with msodbcsql 18.6.2.1 (`SQL_DRIVER_VER` `18.06.0002`), SQL
+    authentication, and `TrustServerCertificate=Yes` against SQL Server 2025,
+    2026-10-15. On a server that does not force encryption (17.00.4025),
+    msodbcsql reports the alias name through the Windows Driver Manager and
+    through unixODBC on Ubuntu 22.04. On one that forces encryption with a
+    self-signed certificate (17.00.4085), it reports `varchar` through both,
+    with the setting in the connection string or, on Ubuntu, in the DSN, as it
+    does against CI's server (`forceencryption = 1`, a certificate from a CA
+    the test container does not trust; build 183236). This driver reports the
+    alias name against both, so
+    `AliasTypeLiveTest.NameIsReportedWhileTheCursorIsOpen` asserts only its
+    leg. **Evidence limit:** the Entra and access-token sessions are a source
+    reading only. The same test on an Entra-authenticated connection with
+    `SQL_DRIVER_VER` recorded would close it. Tracked in AB#48044. Human parity
+    sign-off has not been recorded.
+
+32. **`SQL_ATTR_CONNECTION_TIMEOUT` bounds a busy connection's alias-type
+    lookup, its login included.** msodbcsql bounds the lookup on an idle
+    session with the connection timeout (`GetNetIOTimeOut`), but on a busy one
+    `RefreshShilohUDTCache` (`sqlccmd.cpp`) reads the timeout of the connection
+    it spawned, which `SpawnConnection` (`sqlcinfo.cpp`) never sets: the read
+    is unbounded and the login has only the login timeout it copies. A
+    separate login's `systypes` read waits on the session's own uncommitted
+    `CREATE TYPE`, so describing a column inside that transaction blocks
+    `SQLColAttribute` indefinitely. This driver applies one connection-timeout
+    deadline to the login and the read; past it the column keeps its base type
+    name and the next description retries. With the default timeout of 0 the
+    drivers match: the read is unbounded and the login has the login timeout.
+    `connection_timeout_bounds_a_secondary_login_and_its_read`
+    (`alias_types.rs`) pins the bound. Measured on SQL Server 2025 (17.00.4025),
+    2026-10-15: a second connection's `systypes` read blocked behind another
+    session's uncommitted `CREATE TYPE` until its 3-second command timeout.
+    **Evidence limit:** msodbcsql's busy-path timeout is a source reading only.
+    Tracked in AB#48044. Human parity sign-off has not been recorded.
