@@ -1935,6 +1935,7 @@ def test_crate_stamp_preserves_hyphenated_feature_name(stamp_manifests):
     ("[dependencies.uuid]", 'keywords = [\n "sql",\n "tds",\n]\n[dependencies.uuid]'),
     ("[dependencies]", '[dependencies]\nunrelated = { version = "1", features = [\n "one",\n "two",\n] }\n'),
     ("[dependencies.uuid]", '[features]\nmssql-tds = ["mssql-tds/test-util"]\n[dependencies.uuid]'),
+    ("[dependencies.uuid]", '[dependencies.uuid_alias]\npackage = "uuid"\nversion = "1.19.0"\n[dependencies.uuid]'),
     ("[dependencies]", "[ dependencies ] # mssql-tds is version-aligned"),
     ("default-features = false", 'features = ["tls-schannel-direct-on-windows", "test-util"]'),
     ('path = "../mssql-tds"', """path = '../somewhere, version = "9.9.9", other'"""),
@@ -1967,6 +1968,12 @@ def test_crate_stamp_preserves_supported_toml_values(stamp_manifests, old, new, 
     ('default-features = false', 'path = "duplicate"'),
     ("[dependencies.uuid]", '[target.\'cfg(windows)\'.dependencies]\nmssql-tds = "0.3.0"\n[dependencies.uuid]'),
     ("[dependencies.uuid]", '[dev-dependencies.mssql-tds]\nversion = "0.3.0"\n[dependencies.uuid]'),
+    ("[dependencies.uuid]", '[dev-dependencies]\n"mssql\\u002dtds" = { path = "../mssql-tds", version = "0.3.0" }\n[dependencies.uuid]'),
+    ("[dependencies.uuid]", '[build-dependencies]\n"mssql\\u002dtds" = "0.3.0"\n[dependencies.uuid]'),
+    ("[dependencies.uuid]", '[target . \'cfg(windows)\' . dependencies]\nmssql-tds = "0.3.0"\n[dependencies.uuid]'),
+    ("[dependencies.uuid]", '[target . \'cfg(windows)\' . dev-dependencies]\n"mssql\\u002dtds" = "0.3.0"\n[dependencies.uuid]'),
+    ("[dependencies.uuid]", '[target . \'cfg(windows)\' . dependencies . mssql-tds]\nversion = "0.3.0"\n[dependencies.uuid]'),
+    ("[package]", 'package.version = "0.3.0"\n[package]'),
 ])
 @pytest.mark.parametrize("what_if", [False, True])
 def test_crate_stamp_rejects_ambiguous_dependency_fields(stamp_manifests, old, new, what_if):

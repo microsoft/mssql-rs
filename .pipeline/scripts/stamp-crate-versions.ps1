@@ -52,10 +52,13 @@ function Get-PackageVersionMatch {
     param([Parameter(Mandatory = $true)][string]$Content, [Parameter(Mandatory = $true)][string]$Path)
 
     $sections = [regex]::Matches($Content, '(?ms)^[ \t]*\[[ \t]*package[ \t]*\][ \t]*(?:#[^\r\n]*)?(?:\r?\n|\z).*?(?=^[ \t]*\[|\z)')
+    $firstTable = [regex]::Match($Content, '(?m)^[ \t]*\[')
+    $rootContent = if ($firstTable.Success) { $Content.Substring(0, $firstTable.Index) } else { $Content }
     # Quoted/dotted package keys and multiline strings need a TOML parser; do
     # not let them introduce a second declaration that a line matcher misses.
     if ($sections.Count -ne 1 -or
-        $Content -match '(?m)^[ \t]*(?:\[\[?[ \t]*["'']|\[\[[ \t]*package\b|\[[ \t]*package[ \t]*\.[ \t]*(?:version\b|["''])|package[ \t]*[.=])') {
+        $rootContent -match '(?m)^[ \t]*package[ \t]*[.=]' -or
+        $Content -match '(?m)^[ \t]*(?:\[\[?[ \t]*["'']|\[\[[ \t]*package\b|\[[ \t]*package[ \t]*\.[ \t]*(?:version\b|["'']))') {
         throw "Expected one bare [package] table in $Path"
     }
 
@@ -99,20 +102,20 @@ function Set-MssqlTdsDependencyVersion {
     )
 
     $sections = [regex]::Matches($Content, '(?ms)^[ \t]*\[[ \t]*dependencies[ \t]*\][ \t]*(?:#[^\r\n]*)?(?:\r?\n|\z).*?(?=^[ \t]*\[|\z)')
-    $dependencySections = [regex]::Matches($Content, '(?ms)^[ \t]*\[[ \t]*(?:target\.[^\]\r\n]+?\.[ \t]*)?(?:dependencies|dev-dependencies|build-dependencies)[ \t]*\][ \t]*(?:#[^\r\n]*)?(?:\r?\n|\z).*?(?=^[ \t]*\[|\z)')
+    $dependencySections = [regex]::Matches($Content, '(?ms)^[ \t]*\[[ \t]*(?:target[ \t]*\.[^\]\r\n]+?\.[ \t]*)?(?:dependencies|dev-dependencies|build-dependencies)[ \t]*\][ \t]*(?:#[^\r\n]*)?(?:\r?\n|\z).*?(?=^[ \t]*\[|\z)')
     $declarationCount = 0
     foreach ($dependencySection in $dependencySections) {
+        if ($dependencySection.Value -match '(?m)^[ \t]*(?:"(?:\\.|[^"\\\r\n])*"|''[^''\r\n]*'')[ \t]*[=.]' -or $dependencySection.Value -match '"""|''''''') {
+            throw "Quoted dependency keys and multiline dependency strings are unsupported in $Path"
+        }
         $declarationCount += [regex]::Matches($dependencySection.Value, '(?m)^[ \t]*(?:mssql-tds|["'']mssql-tds["''])[ \t]*[=.]').Count
     }
     if ($declarationCount -ne 1 -or $sections.Count -ne 1 -or
-        $Content -match '(?m)^[ \t]*\[[ \t]*(?:target\.[^\]\r\n]+?\.[ \t]*)?(?:dependencies|dev-dependencies|build-dependencies)[ \t]*\.[ \t]*["'']?mssql-tds(?:["'']|[ \t.\]])') {
+        $Content -match '(?m)^[ \t]*\[[ \t]*(?:target[ \t]*\.[^\]\r\n]+?\.[ \t]*)?(?:dependencies|dev-dependencies|build-dependencies)[ \t]*\.[ \t]*["'']?mssql-tds(?:["'']|[ \t.\]])') {
         throw "Expected one inline mssql-tds dependency in [dependencies] in $Path"
     }
 
     $section = $sections[0]
-    if ($section.Value -match '(?m)^[ \t]*(?:"(?:\\.|[^"\\\r\n])*"|''[^''\r\n]*'')[ \t]*[=.]' -or $section.Value -match '"""|''''''') {
-        throw "Quoted dependency keys and multiline dependency strings are unsupported in $Path"
-    }
     $dependencies = [regex]::Matches($section.Value, '(?m)^[ \t]*mssql-tds[ \t]*=[ \t]*\{(?<fields>[^{}\r\n]*)\}[ \t]*(?:#[^\r\n]*)?\r?$')
     if ($dependencies.Count -ne 1) {
         throw "Expected one single-line mssql-tds inline dependency in $Path"

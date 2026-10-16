@@ -53,8 +53,9 @@ double-quoted, single-line SemVer. Core components must fit Cargo's unsigned
 package keys/table names, multiline package strings and already stamped source
 versions fail explicitly. The mock crate requires one single-line inline
 `mssql-tds` entry in `[dependencies]`, with bare keys, no escaped values and one
-literal SemVer `version`; quoted keys and multiline strings in that section are
-unsupported. Ordinary indentation, comments and LF/CRLF are preserved.
+literal SemVer `version`; quoted keys and multiline strings in any of the mock
+crate's dependency sections (including dev/build and target-specific sections)
+are unsupported. Ordinary indentation, comments and LF/CRLF are preserved.
 Multiline arrays in package fields or unrelated dependencies are supported, as
 are inline feature arrays and comments on table headers. Dependency declarations
 are counted only in dependency tables, not in features or metadata. Inline
