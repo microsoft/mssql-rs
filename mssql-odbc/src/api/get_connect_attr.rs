@@ -234,9 +234,11 @@ fn sql_get_connect_attr_w_safe(
         //
         // Before connect there is nothing to resolve, so an unset attribute falls
         // back to the driver defaults (encryption on, no trust, no integrated
-        // auth, no multi-subnet failover, TNIR on -- msodbcsql seeds the last two
-        // in `InitMappedConnAttrs`). That pre-connect case is inferred from the
-        // defaults, not measured, unlike the post-connect behaviour above.
+        // auth, no multi-subnet failover, TNIR on). That pre-connect case is
+        // inferred from the defaults, not measured, unlike the post-connect
+        // behaviour above. msodbcsql reports TNIR off on a fresh handle although
+        // it connects with TNIR on; this driver reports the setting in use
+        // (parity-deviations entry 33).
         SQL_COPT_SS_ENCRYPT
         | SQL_COPT_SS_TRUST_SERVER_CERTIFICATE
         | SQL_COPT_SS_INTEGRATED_SECURITY

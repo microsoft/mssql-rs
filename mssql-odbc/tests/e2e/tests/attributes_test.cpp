@@ -2136,11 +2136,12 @@ TEST_F(AttributesTest, VendorAttributeGetReportsTheEffectiveSetting) {
 
 // -------------------------------------------------------------------
 // Variation 63 - MultiSubnetFailover and TNIR read back the setting the
-// connection was made with: off and on by default, the
+// connection was made with: MultiSubnetFailover off by default, the
 // TransparentNetworkIPResolution keyword when it is the only source, and the
 // attribute over the keyword in either direction. Both drivers report a TNIR
 // attribute set off as off, though msodbcsql still connects with TNIR on
 // (parity-deviations entry 33); a single-address server cannot show that.
+// The default TNIR report differs and has its own test (variation 64).
 // -------------------------------------------------------------------
 TEST_F(AttributesTest, MultiSubnetFailoverAndTnirReportTheEffectiveSetting) {
     constexpr SQLUINTEGER kUnset = 0xFFFFFFFFu;
@@ -2150,7 +2151,6 @@ TEST_F(AttributesTest, MultiSubnetFailoverAndTnirReportTheEffectiveSetting) {
         SQLUINTEGER expected_tnir;
     };
     const Case cases[] = {
-        {"", kUnset, 1},
         {"TransparentNetworkIPResolution=Disabled;", kUnset, 0},
         {"TransparentNetworkIPResolution=Enabled;", 0, 0},
         {"TransparentNetworkIPResolution=Disabled;", 1, 1},
@@ -2180,4 +2180,29 @@ TEST_F(AttributesTest, MultiSubnetFailoverAndTnirReportTheEffectiveSetting) {
         SQLDisconnect(dbc);
         SQLFreeHandle(SQL_HANDLE_DBC, dbc);
     }
+}
+
+// -------------------------------------------------------------------
+// Variation 64 - with neither the keyword nor the attribute, both drivers
+// connect with TNIR on, but on a fresh handle msodbcsql reports SQL_IS_OFF:
+// its stored option is seeded on only by the reset SQLDisconnect runs. This
+// driver reports the setting in use. Pins parity-deviations entry 33, so each
+// leg asserts its own measured value.
+// -------------------------------------------------------------------
+TEST_F(AttributesTest, TnirIsReportedOnByDefault) {
+    const char* target = std::getenv("ODBC_TEST_TARGET");
+    const bool comparing_msodbcsql = target && std::string(target) == "msodbcsql";
+
+    SQLHDBC dbc = SQL_NULL_HDBC;
+    ASSERT_TRUE(SQL_SUCCEEDED(SQLAllocHandle(SQL_HANDLE_DBC, env_, &dbc)));
+    ASSERT_TRUE(SQL_SUCCEEDED(ConnectWith(dbc, "")))
+        << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_DBC, dbc);
+
+    SQLRETURN rc = SQL_ERROR;
+    EXPECT_EQ(comparing_msodbcsql ? 0u : 1u,
+              GetVendorAttr(dbc, SQL_COPT_SS_TNIR, &rc));
+    EXPECT_TRUE(SQL_SUCCEEDED(rc));
+
+    SQLDisconnect(dbc);
+    SQLFreeHandle(SQL_HANDLE_DBC, dbc);
 }

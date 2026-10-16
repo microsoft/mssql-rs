@@ -20,8 +20,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   `SQL_COPT_SS_MULTISUBNET_FAILOVER` connection attributes. The attributes
   outrank their keywords, are set before connecting (`HY011` after, `HY024`
   above `SQL_IS_ON`), and read back the effective setting. Unlike msodbcsql,
-  `SQL_COPT_SS_TNIR` set to `SQL_IS_OFF` turns TNIR off; see parity deviation
-  33 (AB#49293).
+  `SQL_COPT_SS_TNIR` set to `SQL_IS_OFF` turns TNIR off, and the default reads
+  back as on rather than off on a fresh handle; see parity deviation 33
+  (AB#49293).
 
 - `mssql-odbc`: `SQLGetData` conversions from `varchar(max)` and `nvarchar(max)`
   into supported numeric and date/time C targets, with the existing

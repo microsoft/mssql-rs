@@ -1093,8 +1093,9 @@ msodbcsql build is measured.
     **Evidence limit:** msodbcsql's busy-path timeout is a source reading only.
     Tracked in AB#48044. Human parity sign-off has not been recorded.
 
-33. **`SQL_COPT_SS_TNIR` set to `SQL_IS_OFF` turns Transparent Network IP
-    Resolution off.** MS Learn documents `SQL_IS_OFF` as the attribute form of
+33. **`SQL_COPT_SS_TNIR` means what it reports: `SQL_IS_OFF` turns Transparent
+    Network IP Resolution off, and the default reads `SQL_IS_ON`.** MS Learn
+    documents `SQL_IS_OFF` as the attribute form of
     `TransparentNetworkIPResolution=Disabled`, and in both drivers an attribute
     set before connecting outranks the keyword. msodbcsql's
     `ResolveFromPreconnAttrs` (`connecthelper.hpp`, the `ATTR_VALUE_TYPE_ON_OFF`
@@ -1111,10 +1112,21 @@ msodbcsql build is measured.
     silently overrides the keyword the application also set.
     `SQL_COPT_SS_MULTISUBNET_FAILOVER` takes the same path, but its default is
     off, so `SQL_IS_OFF` disables it in both drivers.
+    The default is reported differently as well. With neither the keyword nor
+    the attribute, both drivers connect with TNIR on, but msodbcsql's stored
+    option starts at zero and only `ResetOptions` (`sqlcconn.cpp`, run by
+    `SQLDisconnect` and by a failed connect) seeds it with `SQL_IS_ON`, so a
+    fresh handle reports `SQL_IS_OFF`. This driver reports `SQL_IS_ON`, the
+    setting in use and the documented default, before and after connecting.
+    Measured with msodbcsql 18.6.2.1 (`SQL_DRIVER_VER` `18.06.0002`) through
+    the Windows Driver Manager and unixODBC, in the PR validation build of
+    2026-10-16 (183594): a fresh handle connected with neither reports 0, and
+    the keyword or an attribute set before connecting reads back as given.
+    `TnirIsReportedOnByDefault` asserts each driver's value, and
     `MultiSubnetFailoverAndTnirReportTheEffectiveSetting` (`attributes_test.cpp`)
-    pins the reported value on both legs. **Evidence limit:** the connect
-    sequence is a source reading only. Connecting with msodbcsql 18 and
-    `SQL_COPT_SS_TNIR` set to `SQL_IS_OFF` through a name whose first address
-    refuses, whose second never answers, and whose third is live would close
-    it: the third answers at once only if TNIR is still on. Tracked in
-    AB#49293. Human parity sign-off has not been recorded.
+    pins the values both report. **Evidence limit:** the connect sequence and
+    the reset on a disconnected handle are a source reading only. Connecting
+    with msodbcsql 18 and `SQL_COPT_SS_TNIR` set to `SQL_IS_OFF` through a name
+    whose first address refuses, whose second never answers, and whose third
+    is live would close the first: the third answers at once only if TNIR is
+    still on. Tracked in AB#49293. Human parity sign-off has not been recorded.
