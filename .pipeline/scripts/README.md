@@ -66,6 +66,10 @@ explicit table headers rather than root dotted or inline assignments.
 Target-parent tables (`[target]` or `[target.'cfg(...)']`) may contain only comments
 and whitespace; put dependency declarations under their explicit dependency
 table headers. These checks do not apply to similarly named metadata keys.
+Package metadata arrays of tables (such as cargo-release replacement arrays)
+are supported; arrays of package/version, dependency, or target tables are not.
+Quoted target selectors may contain closing brackets, and quoted dependency
+paths may contain braces; these characters are not treated as table delimiters.
 Triple-quote text inside ordinary strings or comments is preserved;
 only actual multiline-string delimiters are rejected.
 Multiline arrays in package fields or unrelated dependencies are supported, as

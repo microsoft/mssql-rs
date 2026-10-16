@@ -77,7 +77,7 @@ function Get-PackageVersionMatch {
     # not let them introduce a second declaration that a line matcher misses.
     if ($sections.Count -ne 1 -or
         $rootContent -match '(?m)^[ \t]*(?:package|dependencies|dev-dependencies|build-dependencies|target)[ \t]*[.=]' -or
-        $Content -match '(?m)^[ \t]*(?:\[\[?[ \t]*["'']|\[\[[ \t]*package\b|\[[ \t]*package[ \t]*\.[ \t]*(?:version\b|["'']))') {
+        $Content -match '(?m)^[ \t]*(?:\[\[?[ \t]*["'']|\[\[[ \t]*package[ \t]*\]|\[\[?[ \t]*package[ \t]*\.[ \t]*(?:version\b|["'']))') {
         throw "Expected one bare [package] table in $Path"
     }
 
@@ -118,31 +118,37 @@ function Set-MssqlTdsDependencyVersion {
         [Parameter(Mandatory = $true)][string]$Path
     )
 
+    $quotedString = '(?:"(?:\\.|[^"\\\r\n])*"|''[^''\r\n]*'')'
+    $selector = "(?:$quotedString|[A-Za-z0-9_-]+)"
+    $targetPrefix = "target[ \t]*\.[ \t]*$selector[ \t]*\.[ \t]*"
+    if ($Content -match '(?m)^[ \t]*\[\[[ \t]*(?:dependencies|dev-dependencies|build-dependencies|target)[ \t]*(?:\.|\])') {
+        throw "Dependency and target array-of-table headers are unsupported in $Path"
+    }
     # The target selector may be quoted, but the following table kind must be
     # bare so escaped spellings cannot hide a dependency table or subtable.
-    if ($Content -match '(?m)^[ \t]*\[[ \t]*target[ \t]*\.[ \t]*(?:"(?:\\.|[^"\\\r\n])*"|''[^''\r\n]*''|[A-Za-z0-9_-]+)[ \t]*\.[ \t]*["'']') {
+    if ($Content -match ('(?m)^[ \t]*\[[ \t]*' + $targetPrefix + '["'']')) {
         throw "Quoted target table kinds are unsupported in $Path"
     }
-    $targetParents = [regex]::Matches($Content, '(?ms)^[ \t]*\[[ \t]*target(?:[ \t]*\.[ \t]*(?:"(?:\\.|[^"\\\r\n])*"|''[^''\r\n]*''|[A-Za-z0-9_-]+))?[ \t]*\][ \t]*(?:#[^\r\n]*)?(?:\r?\n|\z)(?<body>.*?)(?=^[ \t]*\[|\z)')
+    $targetParents = [regex]::Matches($Content, "(?ms)^[ \t]*\[[ \t]*target(?:[ \t]*\.[ \t]*$selector)?[ \t]*\][ \t]*(?:#[^\r\n]*)?(?:\r?\n|\z)(?<body>.*?)(?=^[ \t]*\[|\z)")
     foreach ($targetParent in $targetParents) {
         if ($targetParent.Groups['body'].Value -match '(?m)^[ \t]*[^# \t\r\n]') {
             throw "Target parent tables must use explicit dependency table headers in $Path"
         }
     }
     $sections = [regex]::Matches($Content, '(?ms)^[ \t]*\[[ \t]*dependencies[ \t]*\][ \t]*(?:#[^\r\n]*)?(?:\r?\n|\z).*?(?=^[ \t]*\[|\z)')
-    $dependencySections = [regex]::Matches($Content, '(?ms)^[ \t]*\[[ \t]*(?:target[ \t]*\.[^\]\r\n]+?\.[ \t]*)?(?:dependencies|dev-dependencies|build-dependencies)[ \t]*\][ \t]*(?:#[^\r\n]*)?(?:\r?\n|\z).*?(?=^[ \t]*\[|\z)')
+    $dependencySections = [regex]::Matches($Content, "(?ms)^[ \t]*\[[ \t]*(?:$targetPrefix)?(?:dependencies|dev-dependencies|build-dependencies)[ \t]*\][ \t]*(?:#[^\r\n]*)?(?:\r?\n|\z).*?(?=^[ \t]*\[|\z)")
     $declarationCount = 0
     foreach ($dependencySection in $dependencySections) {
         Assert-SupportedSectionStrings -Content $dependencySection.Value -Path $Path
         $declarationCount += [regex]::Matches($dependencySection.Value, '(?m)^[ \t]*(?:mssql-tds|["'']mssql-tds["''])[ \t]*[=.]').Count
     }
     if ($declarationCount -ne 1 -or $sections.Count -ne 1 -or
-        $Content -match '(?m)^[ \t]*\[[ \t]*(?:target[ \t]*\.[^\]\r\n]+?\.[ \t]*)?(?:dependencies|dev-dependencies|build-dependencies)[ \t]*\.[ \t]*(?:["'']|mssql-tds(?:[ \t.\]]))') {
+        $Content -match ('(?m)^[ \t]*\[[ \t]*(?:' + $targetPrefix + ')?(?:dependencies|dev-dependencies|build-dependencies)[ \t]*\.[ \t]*(?:["'']|mssql-tds(?:[ \t.\]]))')) {
         throw "Expected one inline mssql-tds dependency in [dependencies] in $Path"
     }
 
     $section = $sections[0]
-    $dependencies = [regex]::Matches($section.Value, '(?m)^[ \t]*mssql-tds[ \t]*=[ \t]*\{(?<fields>[^{}\r\n]*)\}[ \t]*(?:#[^\r\n]*)?\r?$')
+    $dependencies = [regex]::Matches($section.Value, '(?m)^[ \t]*mssql-tds[ \t]*=[ \t]*\{(?<fields>(?:' + $quotedString + '|[^{}"''\r\n])*)\}[ \t]*(?:#[^\r\n]*)?\r?$')
     if ($dependencies.Count -ne 1) {
         throw "Expected one single-line mssql-tds inline dependency in $Path"
     }

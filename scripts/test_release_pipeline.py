@@ -2059,6 +2059,7 @@ def test_crate_stamp_rejects_quoted_target_table_kinds(stamp_manifests, kind, su
 
 @pytest.mark.parametrize("selector", [
     "'cfg(windows)'", '"cfg(windows)"', "x86_64-pc-windows-msvc",
+    """'cfg(any(windows, target_os = "]"))'""", '"cfg(target_os = \\"]\\")"',
 ])
 def test_crate_stamp_preserves_target_selectors(stamp_manifests, selector):
     path = stamp_manifests / "mssql-mock-tds" / "Cargo.toml"
@@ -2130,6 +2131,84 @@ def test_crate_stamp_preserves_empty_target_parents(stamp_manifests):
     result = run_crate_stamp(stamp_manifests)
     assert result.returncode == 0, result.stderr
     assert path.read_bytes() == content.replace("0.3.0", "0.3.0-dev.20261015.123").encode()
+
+
+@pytest.mark.parametrize("what_if", [False, True])
+def test_crate_stamp_preserves_release_metadata_array(stamp_manifests, what_if):
+    path = stamp_manifests / "mssql-mock-tds" / "Cargo.toml"
+    content = path.read_text() + (
+        '\n[[package.metadata.release.pre-release-replacements]]\n'
+        'file = "README.md"\nsearch = "old"\nreplace = "new"\n'
+    )
+    tomllib.loads(content)
+    path.write_bytes(content.encode())
+    result = run_crate_stamp(stamp_manifests, WhatIf=what_if)
+    assert result.returncode == 0, result.stderr
+    expected = content if what_if else content.replace("0.3.0", "0.3.0-dev.20261015.123")
+    assert path.read_bytes() == expected.encode()
+
+
+@pytest.mark.parametrize("table", [
+    "dependencies", "dev-dependencies", "build-dependencies", "target",
+    "target.'cfg(windows)'.dependencies",
+    "target.'cfg(windows)'.dev-dependencies.mssql-tds",
+    "package", "package.version", 'package."version"',
+])
+@pytest.mark.parametrize("what_if", [False, True])
+def test_crate_stamp_rejects_declaration_array_tables(stamp_manifests, table, what_if):
+    path = stamp_manifests / "mssql-mock-tds" / "Cargo.toml"
+    path.write_bytes(path.read_bytes() + f"\n[[ {table} ]]\n".encode())
+    assert_stamp_rejected(stamp_manifests, WhatIf=what_if)
+
+
+@pytest.mark.parametrize("selector", [
+    """'cfg(any(windows, target_os = "]"))'""",
+    '"cfg(target_os = \\"]\\")"',
+])
+@pytest.mark.parametrize("subtable", [False, True])
+@pytest.mark.parametrize("what_if", [False, True])
+def test_crate_stamp_rejects_extra_dependency_with_bracket_selector(
+    stamp_manifests, selector, subtable, what_if
+):
+    path = stamp_manifests / "mssql-mock-tds" / "Cargo.toml"
+    header = f"target.{selector}.dev-dependencies"
+    if subtable:
+        extra = f'[{header}.mssql-tds]\npath = "../mssql-tds"\nversion = "0.3.0"\n'
+    else:
+        extra = f'[{header}]\nmssql-tds = {{ path = "../mssql-tds", version = "0.3.0" }}\n'
+    content = path.read_text() + "\n" + extra
+    tomllib.loads(content)
+    path.write_bytes(content.encode())
+    assert_stamp_rejected(stamp_manifests, WhatIf=what_if)
+
+
+@pytest.mark.parametrize("quote", ['"', "'"])
+@pytest.mark.parametrize("dependency_path", [
+    "../checkout{local/mssql-tds",
+    "../checkout}local/mssql-tds",
+    "../checkout{local}/mssql-tds",
+])
+@pytest.mark.parametrize("what_if", [False, True])
+def test_crate_stamp_preserves_braces_in_dependency_path(
+    stamp_manifests, quote, dependency_path, what_if
+):
+    path = stamp_manifests / "mssql-mock-tds" / "Cargo.toml"
+    content = path.read_text().replace('"../mssql-tds"', f"{quote}{dependency_path}{quote}", 1)
+    tomllib.loads(content)
+    path.write_bytes(content.encode())
+    result = run_crate_stamp(stamp_manifests, WhatIf=what_if)
+    assert result.returncode == 0, result.stderr
+    expected = content if what_if else content.replace("0.3.0", "0.3.0-dev.20261015.123")
+    assert path.read_bytes() == expected.encode()
+    assert tomllib.loads(path.read_text())["dependencies"]["mssql-tds"]["path"] == dependency_path
+
+
+@pytest.mark.parametrize("what_if", [False, True])
+def test_crate_stamp_still_rejects_nested_dependency_tables(stamp_manifests, what_if):
+    path = stamp_manifests / "mssql-mock-tds" / "Cargo.toml"
+    content = path.read_text().replace('default-features = false', 'extra = { version = "0.3.0" }')
+    path.write_bytes(content.encode())
+    assert_stamp_rejected(stamp_manifests, WhatIf=what_if)
 
 
 def test_crate_stamp_preserves_crlf_and_indented_declarations(stamp_manifests):
