@@ -175,6 +175,45 @@ metadata, registry, git, pull request, and issue calls are mocked. The cadence
 guard and the credential-key extraction are executed as real `bash`, so the
 shipped shell is covered rather than a Python restatement of it.
 
+### Updating `microsoft/mssql-python` after a PyPI release
+
+Pipeline 2332 (`PyPI-Release`) queues the **Bump mssql-python Release Version**
+pipeline only after ESRP successfully publishes the selected official wheels to
+PyPI. The release pipeline passes the published distribution version and its
+build ID to the worker; dry runs do not queue it.
+
+The worker is GitHub-sourced so it can reuse the same short-lived
+`github.com_microsoft` installation token described above. It verifies the exact
+version on PyPI, clones `microsoft/mssql-python`, and opens a draft pull request
+against `main`. The pull request always advances
+`eng/versions/mssql-python-rs.version` when the repository is behind the
+published release.
+
+The clean `mssql-python-rs-wheels` NuGet package is released independently and
+is not guaranteed to exist when PyPI publishing finishes. The worker therefore
+queries the public `mssql-rs_Public` feed for the exact clean version:
+
+- when it exists, `eng/versions/mssql-python-rs-nuget.version` is advanced too;
+- when it does not exist, the NuGet pin is left unchanged;
+- prerelease `-dev` and `-nightly` packages never satisfy the check.
+
+Rerunning the worker for the same version after the clean NuGet package is
+published updates the existing automation pull request. Older release events
+never downgrade either pin, and a branch containing maintainer commits is left
+untouched.
+
+This YAML also requires a permanent pipeline definition after the change reaches
+`main`:
+
+1. Create a GitHub-backed pipeline named **Bump mssql-python Release Version**
+   from `microsoft/mssql-rs` with the `github.com_microsoft` service connection.
+2. Set its YAML path to `.pipeline/bump-mssql-python-release.yml`.
+3. Run it manually with a published version to verify access to
+   `microsoft/mssql-python`.
+
+The exact pipeline name is part of the release contract: pipeline 2332 resolves
+that name through the Azure DevOps API before queueing the worker.
+
 ### Python and NuGet versions
 
 The NuGet transport package and `mssql-python-rs` Python distribution share the

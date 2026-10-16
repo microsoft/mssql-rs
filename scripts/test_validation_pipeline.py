@@ -34,6 +34,7 @@ def load_template(name):
     "selector",
     [
         "scripts/test_bump_released_versions.py",
+        "scripts/test_bump_mssql_python_release.py",
         "scripts/test_validation_pipeline.py",
     ],
 )
