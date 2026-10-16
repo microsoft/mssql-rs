@@ -271,6 +271,16 @@ def test_github_api_retries_transient_status():
             assert bump.github_api("GET", "/x")[1] == {"ok": 1}
 
 
+def test_github_api_does_not_retry_ambiguous_post_failure():
+    error = HTTPError(
+        "https://api.github.com", 502, "bad gateway", {}, io.BytesIO(b"temporary")
+    )
+    with patch.object(bump, "urlopen", side_effect=error) as call:
+        with pytest.raises(RuntimeError, match="HTTP 502"):
+            bump.github_api("POST", "/repos/x/y/issues", {"title": "x"})
+    assert call.call_count == 1
+
+
 def test_github_paged_stops_on_short_page():
     pages = [api_response([{"n": i} for i in range(100)]), api_response([{"n": 100}])]
     with patch.object(bump, "urlopen", side_effect=pages) as call:
@@ -454,7 +464,7 @@ def test_open_bump_pr_branches_before_editing_and_creates(tmp_path):
     calls, run = record_git()
     edited_after = []
     with patch.object(bump.subprocess, "run", side_effect=run), patch.object(
-        bump, "remote_branch_tree", return_value=None
+        bump, "remote_branch_state", return_value=(False, None, True)
     ), patch.object(
         bump, "github_paged", return_value=[]
     ), patch.object(
@@ -466,8 +476,11 @@ def test_open_bump_pr_branches_before_editing_and_creates(tmp_path):
             lambda root: (edited_after.append(list(calls)), ["mssql-tds/Cargo.toml"])[1],
         )
     # Edits must land only after the branch exists, so a previous track's commit
-    # on another branch cannot leak into this one.
-    assert edited_after[0] == [["git", "switch", "--force-create", bump.CRATE_BRANCH, "abc123"]]
+    # on another branch cannot leak into this one. --discard-changes drops any
+    # index left behind by a track that failed after staging.
+    assert edited_after[0] == [
+        ["git", "switch", "--discard-changes", "--force-create", bump.CRATE_BRANCH, "abc123"]
+    ]
     assert calls[1] == ["git", "add", "--", "mssql-tds/Cargo.toml"]
     assert calls[2] == ["git", "commit", "--message", "Bump released TDS crates to 0.3.0"]
     assert [
@@ -478,12 +491,14 @@ def test_open_bump_pr_branches_before_editing_and_creates(tmp_path):
     assert (method, path) == ("POST", "/repos/microsoft/mssql-rs/pulls")
     assert api.call_args.args[2]["base"] == "main"
     assert api.call_args.args[2]["head"] == bump.CRATE_BRANCH
+    # pr-workflow.instructions.md requires draft-first creation.
+    assert api.call_args.args[2]["draft"] is True
 
 
 def test_open_bump_pr_updates_existing_pull_request(tmp_path):
     _calls, run = record_git()
     with patch.object(bump.subprocess, "run", side_effect=run), patch.object(
-        bump, "remote_branch_tree", return_value=None
+        bump, "remote_branch_state", return_value=(True, "oldtree", True)
     ), patch.object(
         bump, "github_paged", return_value=[{"number": 694}]
     ), patch.object(bump, "github_api", return_value=(200, {})) as api:
@@ -497,12 +512,12 @@ def test_open_bump_pr_updates_existing_pull_request(tmp_path):
 def test_unchanged_branch_is_not_force_pushed(tmp_path):
     """A rebuilt commit has a new hash but the same tree; pushing it would
     restart validation and dismiss reviews on an open bump PR."""
-    calls, run = record_git()
-    with patch.object(bump.subprocess, "run", side_effect=run), patch.object(
-        bump, "git", side_effect=lambda root, *args: (
-            calls.append(["git", *args]) or "sametree\n"
-        )
-    ), patch.object(bump, "remote_branch_tree", return_value="sametree"), patch.object(
+    calls = []
+    with patch.object(bump, "git", side_effect=lambda root, *args: (
+        calls.append(["git", *args]) or "sametree\n"
+    )), patch.object(
+        bump, "remote_branch_state", return_value=(True, "sametree", True)
+    ), patch.object(
         bump, "github_paged", return_value=[{"number": 724}]
     ), patch.object(bump, "github_api", return_value=(200, {})):
         assert bump.open_bump_pr(
@@ -516,7 +531,9 @@ def test_changed_branch_is_force_pushed(tmp_path):
     calls = []
     with patch.object(bump, "git", side_effect=lambda root, *args: (
         calls.append(["git", *args]) or "newtree\n"
-    )), patch.object(bump, "remote_branch_tree", return_value="oldtree"), patch.object(
+    )), patch.object(
+        bump, "remote_branch_state", return_value=(True, "oldtree", True)
+    ), patch.object(
         bump, "github_paged", return_value=[]
     ), patch.object(
         bump, "github_api", return_value=(201, {"number": 1, "html_url": "u"})
@@ -529,11 +546,52 @@ def test_changed_branch_is_force_pushed(tmp_path):
             f"{bump.PYTHON_BRANCH}:refs/heads/{bump.PYTHON_BRANCH}"] in calls
 
 
-def test_remote_branch_tree_is_none_for_a_missing_branch(tmp_path):
-    with patch.object(bump.subprocess, "run", return_value=subprocess.CompletedProcess(
+def test_maintainer_edited_branch_is_left_alone(tmp_path):
+    """The generated PR body invites maintainers to push a different version,
+    so automation must not overwrite their commit on the next run."""
+    calls = []
+    edited = []
+    with patch.object(bump, "git", side_effect=lambda root, *args: (
+        calls.append(["git", *args]) or "x\n"
+    )), patch.object(
+        bump, "remote_branch_state", return_value=(True, "theirtree", False)
+    ), patch.object(
+        bump, "github_paged", return_value=[{"number": 724}]
+    ), patch.object(bump, "github_api") as api:
+        assert bump.open_bump_pr(
+            tmp_path, bump.PYTHON_BRANCH, "abc123", "title", "body",
+            lambda root: edited.append("edited") or ["mssql-py-core/pyproject.toml"],
+        ) == 724
+    assert calls == [], "must not touch git at all"
+    assert edited == [], "must not rewrite manifests"
+    api.assert_not_called(), "must not rewrite the PR title or body"
+
+
+@pytest.mark.parametrize(
+    ("commits", "committer", "owned"),
+    [
+        ("a1\n", "Azure Pipelines", True),          # our single commit
+        ("a1\nb2\n", "Azure Pipelines", False),     # maintainer added a commit
+        ("a1\n", "Some Maintainer", False),         # maintainer amended ours
+        ("", "Azure Pipelines", True),              # branch equals base
+    ],
+)
+def test_branch_ownership_detection(tmp_path, monkeypatch, commits, committer, owned):
+    monkeypatch.setenv("GIT_COMMITTER_NAME", "Azure Pipelines")
+    responses = {"rev-parse": "tree1\n", "rev-list": commits, "log": committer + "\n"}
+    with patch.object(bump, "git_try", return_value=subprocess.CompletedProcess("git", 0)), \
+            patch.object(bump, "git", side_effect=lambda root, *a: responses[a[0]]):
+        exists, tree, is_owned = bump.remote_branch_state(tmp_path, "b", "base")
+    assert (exists, tree, is_owned) == (True, "tree1", owned)
+
+
+def test_missing_remote_branch_is_owned(tmp_path):
+    with patch.object(bump, "git_try", return_value=subprocess.CompletedProcess(
         "git", 128, stdout="", stderr="couldn't find remote ref"
     )):
-        assert bump.remote_branch_tree(tmp_path, "automation/absent") is None
+        assert bump.remote_branch_state(tmp_path, "automation/absent", "base") == (
+            False, None, True
+        )
 
 
 def test_pull_request_body_links_an_issue_for_the_linked_issue_check():
@@ -653,18 +711,38 @@ def test_issue_api_errors_propagate():
 # --- track orchestration ----------------------------------------------------
 
 
-def test_main_runs_both_tracks_from_the_default_branch_tip(tmp_path, monkeypatch):
+def test_main_plans_and_branches_from_the_default_branch_tip(tmp_path, monkeypatch):
     monkeypatch.setattr(bump, "__file__", str(tmp_path / "scripts" / "bump.py"))
     with patch.object(bump, "git", return_value="abc123\n") as git, patch.object(
         bump, "run_crate_track"
     ) as crates, patch.object(bump, "run_python_track") as python:
         bump.main()
-    # Bumps must branch from origin/main, not from whatever ref is checked out,
-    # so a run on another branch cannot sweep that branch's commits into the PR.
-    assert git.call_args_list[0].args == (tmp_path, "fetch", "--quiet", "origin", "main")
-    assert git.call_args_list[1].args == (tmp_path, "rev-parse", "FETCH_HEAD")
+    calls = [call.args[1:] for call in git.call_args_list]
+    assert calls[0] == ("fetch", "--quiet", "origin", "main")
+    assert calls[1] == ("rev-parse", "FETCH_HEAD")
+    # Planning must read the base tree, not whatever ref the pipeline ran on,
+    # and must be reset between tracks because each track leaves the worktree
+    # on its own bump branch.
+    assert calls.count(("switch", "--discard-changes", "--detach", "abc123")) == 3
     crates.assert_called_once_with(tmp_path, "abc123")
     python.assert_called_once_with(tmp_path, "abc123")
+
+
+def test_each_track_is_reset_to_base_even_after_a_failure(tmp_path, monkeypatch):
+    monkeypatch.setattr(bump, "__file__", str(tmp_path / "scripts" / "bump.py"))
+    order = []
+    with patch.object(
+        bump, "git", side_effect=lambda root, *args: order.append(args) or "abc123\n"
+    ), patch.object(
+        bump, "run_crate_track", side_effect=lambda *a: order.append(("crate-track",))
+    ), patch.object(
+        bump, "run_python_track", side_effect=lambda *a: order.append(("python-track",))
+    ):
+        bump.main()
+    reset = ("switch", "--discard-changes", "--detach", "abc123")
+    assert order.index(reset) < order.index(("crate-track",))
+    assert order[order.index(("crate-track",)) + 1] == reset
+    assert order.index(("python-track",)) > order.index(("crate-track",))
 
 
 def test_one_failing_track_does_not_block_the_other(tmp_path, monkeypatch, capsys):
@@ -813,7 +891,7 @@ def test_pipeline_gates_every_writing_step_on_the_cadence_check():
     writing = [s for s in steps if s.get("displayName") != "Check cadence" and "script" in s]
     assert writing, "expected steps after the cadence check"
     for step in writing:
-        assert step["condition"] == "eq(variables['due'], 'true')"
+        assert step["condition"] == "and(succeeded(), eq(variables['due'], 'true'))"
 
 
 def test_pipeline_masks_the_token_and_passes_it_to_the_script():

@@ -77,11 +77,11 @@ steps:
     echo "##vso[task.setvariable variable=ghToken;issecret=true]$TOKEN"
     echo "Extracted GitHub token from $KEY."
   displayName: Read GitHub token from checkout credentials
-  condition: eq(variables['due'], 'true')
+  condition: and(succeeded(), eq(variables['due'], 'true'))
 
 - script: python3 scripts/bump-released-versions.py
   displayName: Open version bump pull requests
-  condition: eq(variables['due'], 'true')
+  condition: and(succeeded(), eq(variables['due'], 'true'))
   env:
     GH_TOKEN: $(ghToken)
     GITHUB_REPOSITORY: microsoft/mssql-rs

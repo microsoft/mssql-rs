@@ -40,6 +40,7 @@ def test_version_bump_tests_run_in_shared_validation():
     )
     command = next(line for line in step["pwsh"].splitlines() if "python -m pytest" in line)
     assert "scripts/test_bump_released_versions.py" in command.split()
+    assert "scripts/test_bump_mssql_python_release.py" in command.split()
     assert step.get("condition", "succeeded()") == "succeeded()"
     assert not step.get("continueOnError", False)
 

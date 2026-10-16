@@ -125,7 +125,11 @@ def github_api(method, path, payload=None, allow_status=()):
             "User-Agent": USER_AGENT,
         },
     )
-    for attempt in range(3):
+    # Create requests are not safe to replay after an ambiguous response: the
+    # server may already have created the issue or pull request. A later run
+    # reconciles those resources by label, marker, and branch.
+    attempts = 1 if method == "POST" else 3
+    for attempt in range(attempts):
         try:
             with urlopen(request, timeout=30) as response:
                 raw = response.read()
@@ -133,13 +137,13 @@ def github_api(method, path, payload=None, allow_status=()):
         except HTTPError as error:
             if error.code in allow_status:
                 return error.code, None
-            if error.code in RETRYABLE_STATUS and attempt < 2:
+            if error.code in RETRYABLE_STATUS and attempt + 1 < attempts:
                 time.sleep(2 ** attempt)
                 continue
             detail = error.read().decode(errors="replace")[:500]
             raise RuntimeError(f"{method} {path} failed: HTTP {error.code} {detail}") from error
         except URLError:
-            if attempt < 2:
+            if attempt + 1 < attempts:
                 time.sleep(2 ** attempt)
                 continue
             raise
@@ -419,23 +423,57 @@ def git(root, *args):
     ).stdout
 
 
-def remote_branch_tree(root, branch):
-    """The tree hash of origin/<branch>, or None when the branch does not exist."""
-    probe = subprocess.run(
-        ["git", "fetch", "--quiet", "origin", branch],
-        cwd=root, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+def git_try(root, *args):
+    """Run git without raising; returns the CompletedProcess."""
+    return subprocess.run(
+        ["git", *args], cwd=root,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
     )
-    if probe.returncode != 0:
-        return None
-    return git(root, "rev-parse", "FETCH_HEAD^{tree}").strip()
+
+
+def automation_committer():
+    return os.environ.get("GIT_COMMITTER_NAME", "Azure Pipelines")
+
+
+def remote_branch_state(root, branch, base_sha):
+    """Inspect origin/<branch>.
+
+    Returns (exists, tree, owned). ``owned`` is False when a maintainer has
+    pushed to the branch: either more than the single automation commit sits on
+    top of the base, or the tip was committed by someone else. The generated PR
+    body invites maintainers to push a different release version, so automation
+    must not overwrite that.
+    """
+    if git_try(root, "fetch", "--quiet", "origin", branch).returncode != 0:
+        return False, None, True
+    tree = git(root, "rev-parse", "FETCH_HEAD^{tree}").strip()
+    commits = git(root, "rev-list", f"{base_sha}..FETCH_HEAD").split()
+    committer = git(root, "log", "-1", "--format=%cn", "FETCH_HEAD").strip()
+    owned = len(commits) <= 1 and committer == automation_committer()
+    return True, tree, owned
 
 
 def open_bump_pr(root, branch, base_sha, title, body, apply_changes):
     repo = repository()
     base = os.environ["DEFAULT_BRANCH"]
-    # Branch first so each track commits only its own edits, even when an earlier
-    # track already left a commit on a different branch.
-    git(root, "switch", "--force-create", branch, base_sha)
+    owner = repo.split("/")[0]
+    exists, remote_tree, owned = remote_branch_state(root, branch, base_sha)
+    existing = github_paged(
+        f"/repos/{repo}/pulls?state=open&base={base}&head={owner}:{branch}"
+    )
+
+    if exists and not owned:
+        number = existing[0]["number"] if existing else None
+        print(
+            f"{branch} carries maintainer commits; leaving the branch"
+            + (f" and PR #{number}" if number else "")
+            + " untouched."
+        )
+        return number
+
+    # Branch first, discarding any index or worktree state, so a track that
+    # failed after staging cannot leak its edits into this commit.
+    git(root, "switch", "--discard-changes", "--force-create", branch, base_sha)
     paths = apply_changes(root)
     git(root, "add", "--", *paths)
     git(root, "commit", "--message", title)
@@ -443,31 +481,21 @@ def open_bump_pr(root, branch, base_sha, title, body, apply_changes):
     # Every run rebuilds the commit, so its hash differs even when the content is
     # identical. Push only on a real content change, otherwise an open PR would be
     # force-updated on every run, restarting its validation and dismissing reviews.
-    if remote_branch_tree(root, branch) == git(root, "rev-parse", "HEAD^{tree}").strip():
+    if remote_tree == git(root, "rev-parse", "HEAD^{tree}").strip():
         print(f"{branch} already has these versions; leaving it untouched.")
     else:
         git(root, "push", "--force", "origin", f"{branch}:refs/heads/{branch}")
 
-    existing = github_paged(f"/repos/{repo}/pulls?state=open&base={base}&head={repo.split('/')[0]}:{branch}")
     if existing:
         number = existing[0]["number"]
         github_api("PATCH", f"/repos/{repo}/pulls/{number}", {"title": title, "body": body})
         print(f"Updated bump PR #{number}.")
         return number
+    # Draft-first, per .github/instructions/pr-workflow.instructions.md: a
+    # maintainer marks it ready once validation passes and they have reviewed it.
     _status, created = github_api(
         "POST", f"/repos/{repo}/pulls",
-        {"title": title, "head": branch, "base": base, "body": body, "draft": False},
-    )
-    print(f"Created bump PR #{created['number']} ({created['html_url']}).")
-    return created["number"]
-    if existing:
-        number = existing[0]["number"]
-        github_api("PATCH", f"/repos/{repo}/pulls/{number}", {"title": title, "body": body})
-        print(f"Updated bump PR #{number}.")
-        return number
-    _status, created = github_api(
-        "POST", f"/repos/{repo}/pulls",
-        {"title": title, "head": branch, "base": base, "body": body, "draft": False},
+        {"title": title, "head": branch, "base": base, "body": body, "draft": True},
     )
     print(f"Created bump PR #{created['number']} ({created['html_url']}).")
     return created["number"]
@@ -537,15 +565,22 @@ def run_python_track(root, base_sha):
 
 def main():
     root = Path(__file__).resolve().parents[1]
-    # Branch from the default branch explicitly rather than from HEAD, so a run
-    # on any other ref still produces a bump containing only the version change.
+    # Plan and branch from the default branch tip, never from the checked-out
+    # ref. A manual run can target any branch, and planning against that ref's
+    # manifests would both read the wrong versions and sweep unrelated commits
+    # into the bump PR. Checking it out makes planning and branching agree.
     base = os.environ["DEFAULT_BRANCH"]
     git(root, "fetch", "--quiet", "origin", base)
     base_sha = git(root, "rev-parse", "FETCH_HEAD").strip()
-    print(f"Basing bump branches on origin/{base} at {base_sha}.")
+    git(root, "switch", "--discard-changes", "--detach", base_sha)
+    print(f"Planning and branching from origin/{base} at {base_sha}.")
     failures = []
     for name, track in (("crates", run_crate_track), ("python", run_python_track)):
         try:
+            # Each track plans from the base tree: an earlier track leaves the
+            # worktree on its own bump branch, and a failed one may leave edits
+            # behind.
+            git(root, "switch", "--discard-changes", "--detach", base_sha)
             track(root, base_sha)
         except Exception:
             # Keep the tracks independent: a crates.io outage must not block the
