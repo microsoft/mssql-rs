@@ -166,7 +166,8 @@ mod mock_server_tests {
         };
         if feature_ext_ack {
             // The mock acknowledges Data Classification, but not DNS caching.
-            context.request_data_classification_for_test(2)?;
+            context.requested_data_classification_version =
+                Some(mssql_tds::token::data_classification::DataClassificationVersion::Version2);
         }
 
         let provider = TdsConnectionProvider {};
