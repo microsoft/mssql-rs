@@ -171,7 +171,7 @@ pub struct ScriptedToken(Tokens);
 /// written to the wire. Running out of queued tokens is reported as a closed
 /// connection.
 #[derive(Debug)]
-struct TokenReplayTransport {
+pub(crate) struct TokenReplayTransport {
     pending_tokens: VecDeque<Tokens>,
     pending_rows: VecDeque<VecDeque<i32>>,
     active_row: Option<VecDeque<i32>>,
@@ -182,7 +182,7 @@ struct TokenReplayTransport {
 }
 
 impl TokenReplayTransport {
-    fn new(tokens: Vec<Tokens>) -> Self {
+    pub(crate) fn new(tokens: Vec<Tokens>) -> Self {
         Self {
             pending_tokens: VecDeque::from(tokens),
             pending_rows: VecDeque::new(),

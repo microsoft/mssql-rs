@@ -5,6 +5,7 @@ use crate::connection::client_context::{
     ClientContext, ColumnEncryptionSetting, MAX_LOGIN7_NAME_UNITS, TdsAuthenticationMethod,
     TransportContext, VectorVersion,
 };
+use crate::connection::dns_cache::DnsCache;
 use crate::message::features::jsonfeature::JsonFeature;
 use crate::message::login_options::{
     OptionFlags1, OptionFlags2, OptionFlags3, OptionsValue, TdsVersion, TypeFlags,
@@ -26,6 +27,7 @@ use std::fmt::Debug;
 
 use super::features::always_encrypted::AlwaysEncryptedFeature;
 use super::features::data_classification::DataClassificationFeature;
+use super::features::dns_caching::DnsCachingFeature;
 use super::features::fedauth::FedAuthFeature;
 use super::features::session_recovery::SessionRecoveryFeature;
 use super::features::useragent::UserAgentFeature;
@@ -127,6 +129,12 @@ pub(crate) trait Feature: Send + Sync + Debug {
         None
     }
 
+    /// The host this login resolved and whether the server let the client keep
+    /// it in the DNS cache, once bound to a host. Only SqlDnsCaching does.
+    fn dns_caching_verdict(&self) -> Option<(&str, bool)> {
+        None
+    }
+
     /// Data Classification version the server enabled in FEATUREEXTACK, if this
     /// feature negotiated one. Only DataClassification does.
     fn negotiated_data_classification_version(&self) -> Option<DataClassificationVersion> {
@@ -174,6 +182,11 @@ impl FeaturesRequest {
         features.insert(
             FeatureExtension::Utf8Support,
             Box::new(Utf8Feature::default()),
+        );
+        // msodbcsql always advertises DNS caching (`TdsSend.cpp`).
+        features.insert(
+            FeatureExtension::SqlDnsCaching,
+            Box::new(DnsCachingFeature::default()),
         );
 
         features.insert(FeatureExtension::Json, Box::new(JsonFeature::default()));
@@ -264,6 +277,26 @@ impl FeaturesRequest {
                 );
                 Ok(())
             }
+        }
+    }
+
+    /// Ties the DNS caching acknowledgement to the host this login resolved.
+    pub(crate) fn bind_dns_caching_host(&mut self, host: &str) {
+        self.features.insert(
+            FeatureExtension::SqlDnsCaching,
+            Box::new(DnsCachingFeature::for_host(host)),
+        );
+    }
+
+    /// Settles whether the login's host may stay in the DNS cache. Like SNI,
+    /// every FEATUREEXTACK does, whether or not it acknowledges DNS caching.
+    pub(crate) fn apply_dns_caching_verdict(&self) {
+        if let Some((host, allowed)) = self
+            .features
+            .get(&FeatureExtension::SqlDnsCaching)
+            .and_then(|feature| feature.dns_caching_verdict())
+        {
+            DnsCache::global().apply_verdict(host, allowed);
         }
     }
 
@@ -404,17 +437,21 @@ impl LoginRequestModel<'_> {
     where
         'a: 'b,
     {
+        let mut features_request = FeaturesRequest::from_context_with_recovery(
+            context,
+            pre_login_fedauth_response,
+            recovery_data,
+        );
+        if let TransportContext::Tcp { host, .. } = transport_context {
+            features_request.bind_dns_caching_host(host);
+        }
         LoginRequestModel {
             option_flags1: OptionFlags1::default(),
             option_flags2: context.into(),
             option_flags3: context.into(),
             type_flags: context.into(),
             tds_version: context.tds_version(),
-            features_request: FeaturesRequest::from_context_with_recovery(
-                context,
-                pre_login_fedauth_response,
-                recovery_data,
-            ),
+            features_request,
             user_input: context,
             transport_context,
             client_prog_ver: context.encode_driver_version(),
@@ -746,6 +783,7 @@ impl LoginResponse {
                                     .features
                                     .set_acknowledged(f.0, f.1.as_slice())?;
                             }
+                            response_model.features.apply_dns_caching_verdict();
                         }
                         Tokens::FedAuthInfo(fed_auth_info_token) => {
                             response_model.fed_auth_info = Some(fed_auth_info_token);
@@ -2055,6 +2093,107 @@ mod tests {
         let mut req = make_features_request();
         req.set_acknowledged(FeatureExtension::Json, &[1]).unwrap();
         assert_eq!(req.get_acknowledged_features().len(), 1);
+    }
+
+    // ── DNS caching (feature 0x0B) ──
+
+    fn dns_caching_verdict(request: &FeaturesRequest) -> Option<(&str, bool)> {
+        request
+            .features
+            .get(&FeatureExtension::SqlDnsCaching)
+            .and_then(|feature| feature.dns_caching_verdict())
+    }
+
+    #[test]
+    fn features_request_always_requests_dns_caching() {
+        let request = FeaturesRequest::from((&ClientContext::default(), false));
+        let feature = request
+            .features
+            .get(&FeatureExtension::SqlDnsCaching)
+            .expect("DNS caching is always advertised");
+        assert!(feature.is_requested());
+        assert_eq!(dns_caching_verdict(&request), None);
+    }
+
+    #[test]
+    fn login_request_binds_its_tcp_host_for_dns_caching() {
+        let context = ClientContext::default();
+        let transport_context = TransportContext::Tcp {
+            host: "db.example.com".to_string(),
+            port: 1433,
+            instance_name: None,
+        };
+        let model = LoginRequestModel::from_context(&context, false, &transport_context, None);
+        assert_eq!(
+            dns_caching_verdict(&model.features_request),
+            Some(("db.example.com", false))
+        );
+    }
+
+    async fn login_with_feature_ext_ack(
+        host: &str,
+        acknowledged: Vec<(FeatureExtension, Vec<u8>)>,
+    ) -> TdsResult<LoginResponseModel> {
+        use crate::test_client_support::TokenReplayTransport;
+        use crate::token::tokens::{CurrentCommand, DoneStatus, DoneToken, FeatureExtAckToken};
+
+        let mut request = FeaturesRequest::from((&ClientContext::default(), false));
+        request.bind_dns_caching_host(host);
+        let mut transport = TokenReplayTransport::new(vec![
+            Tokens::FeatureExtAck(FeatureExtAckToken::new(acknowledged)),
+            Tokens::Done(DoneToken {
+                status: DoneStatus::FINAL,
+                cur_cmd: CurrentCommand::None,
+                row_count: 0,
+            }),
+        ]);
+        LoginResponse::new()
+            .deserialize(&mut transport, request)
+            .await
+    }
+
+    async fn resolves_from_cache(host: &str) -> bool {
+        DnsCache::global()
+            .resolve(host, 1433, || async {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "no such host",
+                ))
+            })
+            .await
+            .is_ok()
+    }
+
+    #[tokio::test]
+    async fn feature_ext_ack_settles_dns_caching_for_the_login_host() {
+        let host = "dns-caching-verdict.login.example";
+        DnsCache::global()
+            .resolve(host, 1433, || async {
+                Ok(vec!["10.0.0.7:1433".parse().unwrap()])
+            })
+            .await
+            .unwrap();
+        assert!(
+            !resolves_from_cache(host).await,
+            "not allowed before a login acknowledges"
+        );
+
+        login_with_feature_ext_ack(host, vec![(FeatureExtension::SqlDnsCaching, vec![0x01])])
+            .await
+            .unwrap();
+        assert!(
+            resolves_from_cache(host).await,
+            "allowed by the acknowledgement"
+        );
+
+        // A FEATUREEXTACK without the DNS caching bit removes the entry, as in SNI.
+        login_with_feature_ext_ack(host, vec![(FeatureExtension::Utf8Support, vec![0x01])])
+            .await
+            .unwrap();
+        assert!(
+            !resolves_from_cache(host).await,
+            "removed without an acknowledgement"
+        );
     }
 
     // ── LoginResponseModel::capture_change_property ──

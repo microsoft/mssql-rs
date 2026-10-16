@@ -3,6 +3,7 @@
 
 use crate::connection::bulk_copy_state::ATTENTION_TIMEOUT_SECONDS;
 use crate::connection::client_context::{IPAddressPreference, TransportContext};
+use crate::connection::dns_cache;
 use crate::connection::transport::buffers::TdsReadBuffer;
 use crate::connection::transport::extractable_stream;
 use crate::connection::transport::parallel_connect::{ParallelConnectConfig, parallel_connect};
@@ -360,9 +361,8 @@ async fn create_base_stream_sequential(
     // `std::net::ToSocketAddrs::to_socket_addrs`) awaits the resolution instead of
     // blocking the calling thread, so a slow or stuck resolver stays subject to the
     // `timeout()`/deadline machinery in the retry loop above this call instead of
-    // silently escaping it.
-    let mut socket_addresses: Vec<SocketAddr> =
-        tokio::net::lookup_host((host, port)).await?.collect();
+    // silently escaping it. A failed resolution falls back to the DNS cache.
+    let mut socket_addresses: Vec<SocketAddr> = dns_cache::lookup_host(host, port).await?;
 
     let mut last_error = None;
     let mut tcp_stream = None;

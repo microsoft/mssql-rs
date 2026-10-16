@@ -34,6 +34,7 @@ use tokio::net::{self, TcpStream};
 use tokio::time::timeout;
 use tracing::{debug, info, trace, warn};
 
+use crate::connection::dns_cache;
 use crate::core::TdsResult;
 use crate::error::Error;
 
@@ -132,14 +133,14 @@ pub async fn parallel_connect(
     // Resolve DNS to get all IP addresses. `lookup_host` awaits the resolution
     // instead of blocking the calling thread (unlike `std::net::ToSocketAddrs`),
     // so a slow or stuck resolver stays subject to `deadline` instead of
-    // silently escaping it.
+    // silently escaping it. A failed resolution falls back to the DNS cache.
     let addresses: Vec<SocketAddr> = match timeout(
         deadline.saturating_duration_since(Instant::now()),
-        tokio::net::lookup_host((host, port)),
+        dns_cache::lookup_host(host, port),
     )
     .await
     {
-        Ok(Ok(resolved)) => resolved.take(MAX_PARALLEL_IPS).collect(),
+        Ok(Ok(resolved)) => resolved.into_iter().take(MAX_PARALLEL_IPS).collect(),
         Ok(Err(e)) => return Err(Error::from(e)),
         Err(_elapsed) => {
             warn!(
