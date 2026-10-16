@@ -166,6 +166,8 @@ pub enum TokenType {
 
 /// FedAuth feature extension ID
 pub const FEATURE_EXT_FEDAUTH: u8 = 0x02;
+/// Data Classification feature extension ID
+pub const FEATURE_EXT_DATA_CLASSIFICATION: u8 = 0x09;
 pub const FEATURE_EXT_USER_AGENT: u8 = 0x10;
 /// FedAuth terminator
 pub const FEATURE_EXT_TERMINATOR: u8 = 0xFF;
@@ -186,6 +188,8 @@ pub struct Login7AuthInfo {
     pub server_name: Option<String>,
     /// User Agent string from Login7 packet (if present)
     pub user_agent: Option<String>,
+    /// Data Classification version requested in Login7 feature `0x09` (if present)
+    pub data_classification_version: Option<u8>,
 }
 
 /// Parse Login7 packet to extract FedAuth feature extension with access token
@@ -340,6 +344,8 @@ pub fn parse_login7_auth(packet_data: &[u8]) -> Login7AuthInfo {
                     }
                 }
             }
+        } else if feature_id == FEATURE_EXT_DATA_CLASSIFICATION && feat_len >= 1 {
+            auth_info.data_classification_version = data.get(i + 5).copied();
         } else if feature_id == FEATURE_EXT_USER_AGENT && i + 5 + feat_len <= data.len() {
             let feat_data = &data[i + 5..i + 5 + feat_len];
             if feat_data.len().is_multiple_of(2) {
@@ -491,6 +497,18 @@ pub fn build_feature_ext_ack_fedauth() -> BytesMut {
     // Terminator
     token_data.put_u8(FEATURE_EXT_TERMINATOR);
 
+    token_data
+}
+
+/// Build a FeatureExtAck token enabling Data Classification at `version`.
+pub fn build_feature_ext_ack_data_classification(version: u8) -> BytesMut {
+    let mut token_data = BytesMut::new();
+    token_data.put_u8(TokenType::FeatureExtAck as u8);
+    token_data.put_u8(FEATURE_EXT_DATA_CLASSIFICATION);
+    token_data.put_u32_le(2);
+    token_data.put_u8(version);
+    token_data.put_u8(1); // IsEnabled
+    token_data.put_u8(FEATURE_EXT_TERMINATOR);
     token_data
 }
 
@@ -931,6 +949,17 @@ pub fn build_query_result_with_trailing_info(
     response: &crate::query_response::QueryResponse,
     trailing_info: &[crate::query_response::InfoMessage],
 ) -> BytesMut {
+    build_query_result_with_extras(response, &[], trailing_info)
+}
+
+/// Build a query result with optional raw `data_classification` token bytes
+/// sent right after ColMetadata (where SQL Server sends `0xA3`) and
+/// `trailing_info` tokens after the last row.
+pub fn build_query_result_with_extras(
+    response: &crate::query_response::QueryResponse,
+    data_classification: &[u8],
+    trailing_info: &[crate::query_response::InfoMessage],
+) -> BytesMut {
     let mut result = BytesMut::new();
 
     // A terminal error replaces the result set entirely: no ColMetadata, no
@@ -988,6 +1017,9 @@ pub fn build_query_result_with_trailing_info(
             result.put_u16_le(ch);
         }
     }
+
+    // DATACLASSIFICATION follows COLMETADATA when the query reads classified columns.
+    result.extend_from_slice(data_classification);
 
     // Inject Info tokens between ColMetadata and Rows (Fabric DW behavior)
     for info in &response.info_tokens {
@@ -1358,6 +1390,27 @@ mod tests {
                 .user_agent
                 .expect("user agent should be parsed from the feature extension"),
             "TestAgent"
+        );
+    }
+
+    #[test]
+    fn test_parse_login7_data_classification_and_ack() {
+        let mut payload = BytesMut::zeroed(64);
+        payload[27] = 0x10; // OptionFlags3 (FeatureExt bit)
+        payload[56] = 60; // FeatureExt table entry -> offset 60
+        payload[60..64].copy_from_slice(&64u32.to_le_bytes());
+        payload.put_u8(FEATURE_EXT_DATA_CLASSIFICATION);
+        payload.put_u32_le(1);
+        payload.put_u8(2);
+        payload.put_u8(FEATURE_EXT_TERMINATOR);
+
+        assert_eq!(
+            parse_login7_auth(&payload).data_classification_version,
+            Some(2)
+        );
+        assert_eq!(
+            build_feature_ext_ack_data_classification(2).as_ref(),
+            [0xAE, 0x09, 2, 0, 0, 0, 2, 1, 0xFF]
         );
     }
 

@@ -30,8 +30,12 @@ use crate::handles::{HandleType, StmtHandle, handle_from_raw, process_is_shuttin
 /// - `statement_handle` must be a valid `STMT` handle allocated by
 ///   `SQLAllocHandle`.
 pub(crate) unsafe fn sql_cancel(statement_handle: SqlHandle) -> SqlReturn {
-    debug!(?statement_handle, "SQLCancel called");
-    crate::ffi_entry!("SQLCancel", unsafe { sql_cancel_impl(statement_handle) })
+    crate::ffi_entry!(
+        "SQLCancel",
+        statement_handle,
+        debug!(?statement_handle, "SQLCancel called"),
+        unsafe { sql_cancel_impl(statement_handle) }
+    )
 }
 
 /// # Safety
@@ -53,6 +57,10 @@ unsafe fn sql_cancel_impl(statement_handle: SqlHandle) -> SqlReturn {
         Ok(cancellation) => cancellation,
         Err(rc) => return rc,
     };
+    debug!(
+        interrupted = cancellation.interrupted,
+        "SQLCancel: target settled"
+    );
     if cancellation.interrupted {
         return SQL_SUCCESS;
     }

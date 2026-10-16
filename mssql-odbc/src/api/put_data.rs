@@ -42,15 +42,17 @@ pub(crate) unsafe fn sql_put_data(
     data_ptr: SqlPointer,
     strlen_or_ind: SqlLen,
 ) -> SqlReturn {
-    debug!(
-        ?statement_handle,
-        ?data_ptr,
-        strlen_or_ind,
-        "SQLPutData called"
-    );
-    crate::ffi_entry!("SQLPutData", unsafe {
-        sql_put_data_impl(statement_handle, data_ptr, strlen_or_ind)
-    })
+    crate::ffi_entry!(
+        "SQLPutData",
+        statement_handle,
+        debug!(
+            ?statement_handle,
+            ?data_ptr,
+            strlen_or_ind,
+            "SQLPutData called"
+        ),
+        unsafe { sql_put_data_impl(statement_handle, data_ptr, strlen_or_ind) }
+    )
 }
 
 /// # Safety

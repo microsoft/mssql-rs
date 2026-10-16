@@ -17,47 +17,11 @@
 // builds the struct by hand -- it only shows up against a real server.
 
 #include "odbc_test_fixture.h"
+#include "odbc_sql_server_types.h"
 
 #include <array>
 #include <ctime>
 #include <string>
-
-// SQL Server extension C types. Declared here rather than pulled from
-// msodbcsql.h: this suite builds on Linux and Windows, where that header lives
-// in different places, and adding a platform-conditional include path for two
-// structs is worse than declaring the ABI. Layout copied from msodbcsql.h
-// (tagSS_TIME2_STRUCT / tagSS_TIMESTAMPOFFSET_STRUCT) and cross-checked against
-// the driver's own definitions in api/odbc_types.rs. The static_asserts below
-// fail the build rather than silently misread a buffer if either drifts.
-#ifndef SQL_C_SS_TIME2
-#define SQL_C_TYPES_EXTENDED 0x04000L
-#define SQL_C_SS_TIME2 (SQL_C_TYPES_EXTENDED + 0)
-#define SQL_C_SS_TIMESTAMPOFFSET (SQL_C_TYPES_EXTENDED + 1)
-
-typedef struct tagSS_TIME2_STRUCT {
-    SQLUSMALLINT hour;
-    SQLUSMALLINT minute;
-    SQLUSMALLINT second;
-    SQLUINTEGER fraction;
-} SQL_SS_TIME2_STRUCT;
-
-typedef struct tagSS_TIMESTAMPOFFSET_STRUCT {
-    SQLSMALLINT year;
-    SQLUSMALLINT month;
-    SQLUSMALLINT day;
-    SQLUSMALLINT hour;
-    SQLUSMALLINT minute;
-    SQLUSMALLINT second;
-    SQLUINTEGER fraction;
-    SQLSMALLINT timezone_hour;
-    SQLSMALLINT timezone_minute;
-} SQL_SS_TIMESTAMPOFFSET_STRUCT;
-#endif
-
-static_assert(sizeof(SQL_SS_TIME2_STRUCT) == 12,
-              "SQL_SS_TIME2_STRUCT layout does not match the msodbcsql ABI");
-static_assert(sizeof(SQL_SS_TIMESTAMPOFFSET_STRUCT) == 20,
-              "SQL_SS_TIMESTAMPOFFSET_STRUCT layout does not match the msodbcsql ABI");
 
 class DateTimeTypesLiveTest : public ODBCTest {
 protected:

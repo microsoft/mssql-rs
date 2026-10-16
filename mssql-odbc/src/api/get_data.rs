@@ -78,26 +78,29 @@ pub(crate) unsafe fn sql_get_data(
     buffer_length: SqlLen,
     strlen_or_ind_ptr: *mut SqlLen,
 ) -> SqlReturn {
-    debug!(
-        ?statement_handle,
-        column_number,
-        target_type,
-        ?target_value_ptr,
-        buffer_length,
-        ?strlen_or_ind_ptr,
-        "SQLGetData called",
-    );
-
-    crate::ffi_entry!("SQLGetData", unsafe {
-        sql_get_data_impl(
-            statement_handle,
+    crate::ffi_entry!(
+        "SQLGetData",
+        statement_handle,
+        debug!(
+            ?statement_handle,
             column_number,
             target_type,
-            target_value_ptr,
+            ?target_value_ptr,
             buffer_length,
-            strlen_or_ind_ptr,
-        )
-    })
+            ?strlen_or_ind_ptr,
+            "SQLGetData called",
+        ),
+        unsafe {
+            sql_get_data_impl(
+                statement_handle,
+                column_number,
+                target_type,
+                target_value_ptr,
+                buffer_length,
+                strlen_or_ind_ptr,
+            )
+        }
+    )
 }
 
 /// # Safety

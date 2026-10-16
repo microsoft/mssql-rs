@@ -19,6 +19,7 @@ use crate::message::messages::Request;
 use crate::message::prelogin::{
     EncryptionType, PreloginRequest, PreloginRequestModel, PreloginResponse,
 };
+use crate::token::data_classification::DataClassificationVersion;
 use crate::token::login_ack::LoginAckToken;
 use crate::token::tokens::{SessionStateToken, SqlCollation};
 use tracing::{debug, warn};
@@ -89,6 +90,7 @@ impl HandlerFactory {
 // The settings that can be negotiated during and after the login process as well.
 #[derive(Debug)]
 pub(crate) struct NegotiatedSettings {
+    pub client_connection_id: Uuid,
     pub session_settings: SessionSettings,
     pub database_collation: SqlCollation,
     pub language: String,
@@ -136,6 +138,7 @@ impl NegotiatedSettings {
         login_ack_server_version: Option<Version>,
     ) -> Self {
         NegotiatedSettings {
+            client_connection_id: Uuid::nil(),
             session_settings,
             database_collation,
             login_database: database.clone(),
@@ -208,6 +211,15 @@ pub(crate) struct SessionSettings {
 }
 
 impl SessionSettings {
+    /// Data Classification version the server enabled at login, which fixes
+    /// the `0xA3` token layout for the connection. `None` when the feature was
+    /// not requested, not acknowledged, or acknowledged as disabled.
+    pub(crate) fn data_classification_version(&self) -> Option<DataClassificationVersion> {
+        self.supported_features
+            .iter()
+            .find_map(|f| f.negotiated_data_classification_version())
+    }
+
     // Note that this destructively consumes the features list.
     fn new(
         context: &ClientContext,
@@ -248,6 +260,7 @@ pub(crate) fn create_test_negotiated_settings_internal() -> NegotiatedSettings {
         sort_id: 0,
     };
     NegotiatedSettings {
+        client_connection_id: Uuid::nil(),
         session_settings,
         database_collation,
         language: "us_english".to_string(),
@@ -396,6 +409,7 @@ impl<'a, 'b> SessionHandler<'a, 'b> {
         // response always contains at least the 5701 database-context message.
         settings.server_reported_name =
             server_name_from_login_messages(&login_result.diagnostics.info_messages);
+        settings.client_connection_id = prelogin_result.client_connection_id;
 
         Ok(settings)
     }
@@ -413,6 +427,7 @@ impl<'a, 'b> SessionHandler<'a, 'b> {
 }
 
 struct PreloginResult {
+    client_connection_id: Uuid,
     encryption_setting: NegotiatedEncryptionSetting,
     is_fed_auth_supported: bool,
 }
@@ -429,8 +444,12 @@ impl PreloginHandler<'_> {
         reader_writer: &mut T,
     ) -> TdsResult<PreloginResult> {
         // Create the request.
+        let client_connection_id = Uuid::new_v4();
+        if let Some(trace) = &self.factory.context.connection_trace {
+            trace.begin_attempt(client_connection_id);
+        }
         let request_model = PreloginRequestModel::new(
-            Uuid::new_v4(),
+            client_connection_id,
             Option::from(self.factory.context.mars_enabled),
             Option::from(self.factory.context.encryption_options.mode),
             Option::from(self.factory.context.database_instance.as_str()),
@@ -462,6 +481,7 @@ impl PreloginHandler<'_> {
             // If strict is used, the user is using TDS 8. The server's encryption response is
             // unused and the stream is already (and stays) encrypted.
             return Ok(PreloginResult {
+                client_connection_id,
                 encryption_setting: NegotiatedEncryptionSetting::Strict,
                 is_fed_auth_supported: response_model.federated_auth_supported,
             });
@@ -474,6 +494,7 @@ impl PreloginHandler<'_> {
                 // encryption it will return On and if not returns Unsupported.
                 if request_model.encryption_setting == EncryptionSetting::PreferOff {
                     Ok(PreloginResult {
+                        client_connection_id,
                         encryption_setting: NegotiatedEncryptionSetting::LoginOnly,
                         is_fed_auth_supported: response_model.federated_auth_supported,
                     })
@@ -487,6 +508,7 @@ impl PreloginHandler<'_> {
             EncryptionType::NotSupported => {
                 if request_model.encryption_setting == EncryptionSetting::PreferOff {
                     Ok(PreloginResult {
+                        client_connection_id,
                         encryption_setting: NegotiatedEncryptionSetting::NoEncryption,
                         is_fed_auth_supported: response_model.federated_auth_supported,
                     })
@@ -498,6 +520,7 @@ impl PreloginHandler<'_> {
                 }
             }
             _ => Ok(PreloginResult {
+                client_connection_id,
                 encryption_setting: NegotiatedEncryptionSetting::Mandatory,
                 is_fed_auth_supported: response_model.federated_auth_supported,
             }),
@@ -768,8 +791,10 @@ mod tests {
     };
     use crate::error::SqlInfoMessage;
     use crate::message::features::always_encrypted::AlwaysEncryptedFeature;
+    use crate::message::features::data_classification::DataClassificationFeature;
     use crate::message::features::session_recovery::SessionRecoveryFeature;
     use crate::message::login::Feature;
+    use crate::token::data_classification::DataClassificationVersion;
 
     fn info_message(server_name: Option<&str>) -> SqlInfoMessage {
         SqlInfoMessage {
@@ -861,6 +886,43 @@ mod tests {
     fn is_column_encryption_supported_false_when_feature_absent() {
         let settings = create_test_negotiated_settings_internal();
         assert!(!settings.is_column_encryption_supported());
+    }
+
+    fn settings_with_data_classification(ack: Option<&[u8]>) -> NegotiatedSettings {
+        let mut settings = create_test_negotiated_settings_internal();
+        let mut feature = DataClassificationFeature::new(DataClassificationVersion::Version2);
+        if let Some(payload) = ack {
+            feature.set_acknowledged(true);
+            feature.deserialize(payload).unwrap();
+        }
+        settings
+            .session_settings
+            .supported_features
+            .push(Box::new(feature));
+        settings
+    }
+
+    #[test]
+    fn data_classification_version_reports_the_acknowledged_version() {
+        let settings = settings_with_data_classification(Some(&[0x01, 0x01]));
+        assert_eq!(
+            settings.session_settings.data_classification_version(),
+            Some(DataClassificationVersion::Version1)
+        );
+    }
+
+    #[test]
+    fn data_classification_version_none_when_disabled_unacknowledged_or_absent() {
+        for settings in [
+            settings_with_data_classification(Some(&[0x02, 0x00])),
+            settings_with_data_classification(None),
+            create_test_negotiated_settings_internal(),
+        ] {
+            assert_eq!(
+                settings.session_settings.data_classification_version(),
+                None
+            );
+        }
     }
 
     fn settings_with_session_recovery(acknowledged: bool) -> NegotiatedSettings {

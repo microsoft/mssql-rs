@@ -23,7 +23,9 @@ so tests can be migrated between the two.
 tests/e2e/
 ├── CMakeLists.txt              # Top-level CMake build
 ├── include/
-│   └── odbc_test_fixture.h     # Base test fixture & assertion macros
+│   ├── odbc_test_fixture.h     # Base test fixture & assertion macros
+│   ├── odbc_concurrent_test.h  # ODBC_TEST_F: one test body, single- and multithreaded
+│   └── odbc_sql_server_types.h # SQL Server ODBC extension types and constants
 ├── lib/
 │   ├── odbc_test_fixture.cpp   # ODBCTest fixture (HENV/HDBC/HSTMT lifecycle)
 │   ├── odbc_test_utils.cpp     # Diagnostic helpers
@@ -75,6 +77,20 @@ To override the verbose default filter:
 ```bash
 MSSQL_TDS_TRACE_LEVEL="warn,mssqlodbc=trace" ./run_e2e.sh --verbose
 ```
+
+### Small-stack connection regression
+
+On POSIX platforms, `small_stack_connect_test` connects and fetches a row through
+the Driver Manager on an explicitly sized pthread. Its separate executable also
+covers cold driver/TLS initialization. The native stack size of the existing
+`ODBC_TEST_F` workers is unchanged.
+
+`run_e2e.sh --release` and `build_e2e.sh --release` configure a 128 KiB stack,
+matching musl's default application-thread budget. Debug/coverage drivers use
+512 KiB for unoptimized frames. When configuring CMake directly, pass
+`-DODBC_E2E_RELEASE_DRIVER=ON` for a release driver; the default is OFF.
+The regression runs in the normal POSIX suite, including PR validation, rather
+than relying solely on the post-merge Alpine matrix.
 
 ### Comparing against msodbcsql 18
 
@@ -255,9 +271,11 @@ reusable connection. It needs `ODBC_TEST_SERVER` as a direct TCP endpoint
 (host or host,port); a DSN, full connection-string override, or named instance
 cannot be routed by this proxy and is reported as skipped.
 
-The Unix runner creates temporary registrations with `Threading=0` for both
-drivers, without modifying the installed reference registration. This prevents
-the Driver Manager from serializing away the cross-thread call. Rust tests cover
+The Unix runner creates temporary registrations with `Threading=1` for both
+drivers, without modifying the installed reference registration. unixODBC
+locks `SQLCancel` only at level 3, so at 1 the cross-thread cancel still
+reaches the driver while the other call runs (see "How the scripts register
+the driver"). Rust tests cover
 buffer-only DAE calls, token-publication races, simultaneous cancellers,
 indefinitely stalled writes, and missing acknowledgement deadlines.
 
@@ -305,8 +323,11 @@ set once via the `msodbcsqlVersion` pipeline variable (in
 
 When `ODBC_TEST_SERVER` is unset, a dev SQL Server on `localhost:1433` is
 auto-detected — the password is taken from `ODBC_TEST_PWD`, then `SQL_PASSWORD`,
-then `SQL_PASSWORD=` in `mssql-tds\.env`, falling back to integrated auth. This
-matches `run_e2e.sh`.
+then `SQL_PASSWORD=` in `mssql-tds\.env`. With a password, `ODBC_TEST_UID`
+defaults to `sa`. Without one, an unset `ODBC_TEST_UID` stays unset and the
+fixture uses integrated auth; a `ODBC_TEST_UID` you set yourself is kept, and
+the script warns that the fixture will try SQL auth with an empty password.
+This matches `run_e2e.sh`.
 
 `run_e2e.ps1 -Coverage` builds the Rust driver with LLVM source-based
 instrumentation so the driver code exercised by the C++ tests — which load the
@@ -349,7 +370,12 @@ infrastructure works (`runtests.c`).
   `[ODBC Driver 18 for SQL Server (Rust)]`, and sets `ODBCSYSINI` to point at
   it. The env var is scoped to the script process, so the parent shell is never
   affected. A `trap cleanup EXIT` ensures the temp directory is removed even on
-  failure.
+  failure. With `--compare-with-msodbcsql`, the same file also gets a copy of
+  the msodbcsql section from `--msodbcsql-ini`. Both registrations set
+  `Threading=1`, so unixODBC serializes calls on each handle as the Windows
+  Driver Manager does, except `SQLCancel`, which it locks only at level 3. At
+  the unixODBC default of 0, the `/SharedStmt` variants crash inside
+  `libodbc` with either driver.
 
 - **Windows (`run_e2e.ps1`)**: Writes `Driver` and `Setup` values under
   `HKLM\Software\ODBC\ODBCINST.INI\ODBC Driver 18 for SQL Server (Rust)`, so an
@@ -419,9 +445,12 @@ environment variables to enable them:
 ### Auto-detection
 
 When `ODBC_TEST_SERVER` is not set, `run_e2e.sh` probes `localhost:1433`. If a
-SQL Server is listening, it auto-configures `ODBC_TEST_SERVER=localhost`,
-`ODBC_TEST_UID=sa`, and resolves the password from `ODBC_TEST_PWD`,
-`SQL_PASSWORD`, or `mssql-tds/.env` (in that order).
+SQL Server is listening, it auto-configures `ODBC_TEST_SERVER=localhost` and
+resolves the password from `ODBC_TEST_PWD`, `SQL_PASSWORD`, or `mssql-tds/.env`
+(in that order). If a password is found, `ODBC_TEST_UID` defaults to `sa`.
+Otherwise an unset `ODBC_TEST_UID` stays unset and the fixture uses integrated
+auth; a `ODBC_TEST_UID` you set yourself is kept, with a warning that the
+fixture will try SQL auth with an empty password.
 
 To bring up a local SQL Server in Docker:
 
@@ -470,6 +499,51 @@ add_odbc_test(my_feature_test  tests/my_feature_test.cpp)
 ```bash
 cmake --build build && ctest --test-dir build --output-on-failure
 ```
+
+### 4. Write it with `ODBC_TEST_F` so it also runs multithreaded
+
+Write new behavioral tests with `ODBC_TEST_F` instead of `TEST_F` (include
+`odbc_concurrent_test.h`). The body is unchanged; the macro registers the
+single-threaded test plus `/CrossThread`, `/SharedEnv`, and `/SharedStmt`
+variants that run it across threads. `ODBC_TEST_F_MODES(..., odbc_concurrency::kAllModes)`
+adds `/SharedDbc`. Use `Worker()`, `Iteration()`, and `WorkerToken()` for
+values that must differ per run.
+
+Keep `TEST_F`, or pick the safe modes with `ODBC_TEST_F_MODES`, only when the
+test:
+
+- changes ENV, pooling, or other process-wide state;
+- tests connect, disconnect, or driver loading;
+- creates fixed-name permanent objects;
+- frees or replaces `stmt_` or `dbc_` in the body; or
+- relies on `HasFatalFailure()` (concurrent workers capture failures per
+  thread, so it cannot see them).
+
+A fixture whose `SetUp()` does not `Connect()` — an ENV-only fixture such as
+`smoke_test.cpp`'s `ODBCTest` — has no statement for `/SharedStmt` observers to
+read, so leave that mode out:
+`ODBC_TEST_F_MODES(Fixture, Name, odbc_concurrency::kSingle | odbc_concurrency::kCrossThread | odbc_concurrency::kSharedEnv)`.
+Registering it anyway fails the variant with that advice rather than hanging.
+
+The rule and the `/SharedDbc` conditions are in
+`.github/instructions/mssql-odbc.instructions.md` §10.
+
+```bash
+# 8 threads x 20 iterations, only the multithreaded variants
+MSSQL_ODBC_MT_THREADS=8 MSSQL_ODBC_MT_ITERS=20 \
+  ./build/get_data_test --gtest_filter='*/CrossThread:*/SharedEnv:*/SharedStmt:*/SharedDbc'
+```
+
+`MSSQL_ODBC_MT_THREADS` (default 2) is how many threads run at once,
+`MSSQL_ODBC_MT_ITERS` (default 1) how many times each runs the body, and
+`MSSQL_ODBC_MT_TIMEOUT_SECONDS` (default 300) the hang watchdog, which applies
+separately to a multithreaded variant's fixture `SetUp`, its run, and its
+`TearDown` (the single-threaded test has none, like `TEST_F`). On a hang the
+watchdog writes a minidump on Windows (to `MSSQL_ODBC_MT_DUMP_DIR`, default the
+working directory) or aborts for a core dump elsewhere. It leaves a process
+alone when a debugger is attached or when it cannot tell (detection covers
+Windows, Linux, and macOS). Which tests can use which mode, and why, is in
+[multithreaded-testing-plan.md](../../docs/multithreaded-testing-plan.md).
 
 ## How It Works
 

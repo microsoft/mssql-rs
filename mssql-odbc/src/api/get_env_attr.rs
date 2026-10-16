@@ -27,18 +27,21 @@ pub(crate) unsafe fn sql_get_env_attr(
     _buffer_length: SqlInteger,
     string_length_ptr: *mut SqlInteger,
 ) -> SqlReturn {
-    debug!(
-        ?environment_handle,
-        attribute,
-        ?value_ptr,
-        buffer_length = _buffer_length,
-        ?string_length_ptr,
-        "SQLGetEnvAttr called",
-    );
-
-    crate::ffi_entry!("SQLGetEnvAttr", unsafe {
-        sql_get_env_attr_impl(environment_handle, attribute, value_ptr, string_length_ptr)
-    })
+    crate::ffi_entry!(
+        "SQLGetEnvAttr",
+        environment_handle,
+        debug!(
+            ?environment_handle,
+            attribute,
+            ?value_ptr,
+            buffer_length = _buffer_length,
+            ?string_length_ptr,
+            "SQLGetEnvAttr called",
+        ),
+        unsafe {
+            sql_get_env_attr_impl(environment_handle, attribute, value_ptr, string_length_ptr)
+        }
+    )
 }
 
 /// # Safety

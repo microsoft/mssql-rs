@@ -251,6 +251,11 @@ impl ClientContextValidator for DefaultClientContextValidator {
 /// Construct via [`ClientContext::with_data_source()`] and pass to
 /// [`TdsConnectionProvider::create_client()`](crate::connection_provider::tds_connection_provider::TdsConnectionProvider::create_client).
 pub struct ClientContext {
+    // Follows ClientContext's pinned-box ownership convention. Arc is already
+    // pointer-sized: this adds an allocation on setup/clone, not a size saving.
+    #[allow(clippy::redundant_allocation)]
+    pub(crate) connection_trace:
+        Option<std::pin::Pin<Box<std::sync::Arc<crate::trace_context::ConnectionTrace>>>>,
     /// Read-write or read-only application intent. Default: `ReadWrite`.
     pub application_intent: ApplicationIntent,
     /// Application name reported in the TDS login packet.
@@ -405,6 +410,11 @@ pub struct ClientContext {
     // `ClientContext` so the connect future stays small.
     #[allow(clippy::box_collection)]
     pub(crate) trusted_master_key_paths: Option<Box<HashMap<String, Vec<String>>>>,
+    /// Data Classification version to *request* in LOGIN7 (feature `0x09`).
+    /// `None` (the default) omits the feature. The version the server enables
+    /// arrives in FEATUREEXTACK and may be lower than the one requested here.
+    pub(crate) requested_data_classification_version:
+        Option<crate::token::data_classification::DataClassificationVersion>,
     /// UserAgent telemetry payload components.
     pub user_agent: UserAgent,
 }
@@ -538,6 +548,7 @@ impl ClientContext {
     /// ```
     pub fn with_data_source(data_source: &str) -> ClientContext {
         ClientContext {
+            connection_trace: None,
             application_intent: ApplicationIntent::ReadWrite,
             application_name: "TDSX Rust Client".to_string(),
             attach_db_file: "".to_string(),
@@ -587,6 +598,7 @@ impl ClientContext {
             ),
             cek_cache: std::sync::Arc::new(crate::security::keystore::CekCache::new()),
             trusted_master_key_paths: None,
+            requested_data_classification_version: None,
             user_agent: UserAgent::default(),
         }
     }
@@ -602,6 +614,7 @@ impl ClientContext {
     )]
     pub fn new() -> ClientContext {
         ClientContext {
+            connection_trace: None,
             application_intent: ApplicationIntent::ReadWrite,
             application_name: "TDSX Rust Client".to_string(),
             attach_db_file: "".to_string(),
@@ -651,6 +664,7 @@ impl ClientContext {
             ),
             cek_cache: std::sync::Arc::new(crate::security::keystore::CekCache::new()),
             trusted_master_key_paths: None,
+            requested_data_classification_version: None,
             user_agent: UserAgent::default(),
         }
     }
@@ -661,6 +675,23 @@ impl ClientContext {
             self.tds_authentication_method,
             TdsAuthenticationMethod::SSPI
         )
+    }
+
+    /// Requests Data Classification `version` (1 or 2) in LOGIN7. The setting
+    /// stays crate-private until the public API is designed.
+    #[cfg(any(test, feature = "test-util"))]
+    #[doc(hidden)]
+    pub fn request_data_classification_for_test(&mut self, version: u8) -> TdsResult<()> {
+        self.requested_data_classification_version = Some(version.try_into()?);
+        Ok(())
+    }
+
+    #[doc(hidden)]
+    pub fn set_connection_trace(
+        &mut self,
+        trace: std::sync::Arc<crate::trace_context::ConnectionTrace>,
+    ) {
+        self.connection_trace = Some(Box::pin(trace));
     }
 
     pub(crate) fn tds_version(&self) -> TdsVersion {
@@ -866,6 +897,7 @@ impl ClientContext {
 impl Clone for ClientContext {
     fn clone(&self) -> Self {
         ClientContext {
+            connection_trace: self.connection_trace.clone(),
             application_intent: self.application_intent,
             application_name: self.application_name.clone(),
             attach_db_file: self.attach_db_file.clone(),
@@ -910,6 +942,7 @@ impl Clone for ClientContext {
                 .clone(),
             cek_cache: self.cek_cache.clone(),
             trusted_master_key_paths: self.trusted_master_key_paths.clone(),
+            requested_data_classification_version: self.requested_data_classification_version,
             user_agent: self.user_agent.clone(),
         }
     }

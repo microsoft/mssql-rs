@@ -529,6 +529,23 @@ pub(crate) fn null_sql_type(hint: ParameterHint) -> TdsResult<SqlType> {
     })
 }
 
+/// Constructs a value-free TVP column template.
+///
+/// TVP column definitions carry numeric and temporal metadata separately, so
+/// their templates are not limited to the defaults required by scalar NULLs.
+/// The same template types NULL row cells, whose [`SqlType`] discriminant must
+/// match the column definition for TVP validation.
+pub(crate) fn tvp_column_sql_type(hint: ParameterHint) -> TdsResult<SqlType> {
+    match hint.sql_type {
+        InputSqlType::Numeric => Ok(SqlType::Numeric(None)),
+        InputSqlType::Decimal => Ok(SqlType::Decimal(None)),
+        InputSqlType::Time => Ok(SqlType::Time(None)),
+        InputSqlType::DateTime => Ok(SqlType::DateTime2(None)),
+        InputSqlType::DateTimeOffset => Ok(SqlType::DateTimeOffset(None)),
+        _ => null_sql_type(hint),
+    }
+}
+
 /// Applies caller-specified decimal precision and scale instead of inferring
 /// them from the Python value.
 fn hinted_decimal(py_obj: &Bound<'_, PyAny>, hint: ParameterHint) -> TdsResult<SqlType> {

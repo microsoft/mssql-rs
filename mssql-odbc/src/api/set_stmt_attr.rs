@@ -139,16 +139,18 @@ pub(crate) unsafe fn sql_set_stmt_attr_w(
     value_ptr: SqlPointer,
     string_length: SqlInteger,
 ) -> SqlReturn {
-    debug!(
-        ?statement_handle,
-        attribute,
-        ?value_ptr,
-        string_length,
-        "SQLSetStmtAttrW called",
-    );
-    crate::ffi_entry!("SQLSetStmtAttrW", unsafe {
-        sql_set_stmt_attr_w_impl(statement_handle, attribute, value_ptr, string_length)
-    })
+    crate::ffi_entry!(
+        "SQLSetStmtAttrW",
+        statement_handle,
+        debug!(
+            ?statement_handle,
+            attribute,
+            ?value_ptr,
+            string_length,
+            "SQLSetStmtAttrW called",
+        ),
+        unsafe { sql_set_stmt_attr_w_impl(statement_handle, attribute, value_ptr, string_length) }
+    )
 }
 
 /// # Safety
@@ -891,23 +893,27 @@ pub(crate) unsafe fn sql_get_stmt_attr_w(
     buffer_length: SqlInteger,
     string_length_ptr: *mut SqlInteger,
 ) -> SqlReturn {
-    debug!(
-        ?statement_handle,
-        attribute,
-        ?value_ptr,
-        buffer_length,
-        ?string_length_ptr,
-        "SQLGetStmtAttrW called",
-    );
-    crate::ffi_entry!("SQLGetStmtAttrW", unsafe {
-        sql_get_stmt_attr_w_impl(
-            statement_handle,
+    crate::ffi_entry!(
+        "SQLGetStmtAttrW",
+        statement_handle,
+        debug!(
+            ?statement_handle,
             attribute,
-            value_ptr,
+            ?value_ptr,
             buffer_length,
-            string_length_ptr,
-        )
-    })
+            ?string_length_ptr,
+            "SQLGetStmtAttrW called",
+        ),
+        unsafe {
+            sql_get_stmt_attr_w_impl(
+                statement_handle,
+                attribute,
+                value_ptr,
+                buffer_length,
+                string_length_ptr,
+            )
+        }
+    )
 }
 
 /// # Safety

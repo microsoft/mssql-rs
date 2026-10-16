@@ -23,15 +23,16 @@ pub(crate) unsafe fn sql_num_result_cols(
     statement_handle: SqlHandle,
     column_count_ptr: *mut SqlSmallInt,
 ) -> SqlReturn {
-    debug!(
-        ?statement_handle,
-        ?column_count_ptr,
-        "SQLNumResultCols called",
-    );
-
-    crate::ffi_entry!("SQLNumResultCols", unsafe {
-        sql_num_result_cols_impl(statement_handle, column_count_ptr)
-    })
+    crate::ffi_entry!(
+        "SQLNumResultCols",
+        statement_handle,
+        debug!(
+            ?statement_handle,
+            ?column_count_ptr,
+            "SQLNumResultCols called",
+        ),
+        unsafe { sql_num_result_cols_impl(statement_handle, column_count_ptr) }
+    )
 }
 
 /// # Safety

@@ -24,6 +24,7 @@ pub(crate) enum TokenType {
     AltRow = 0xD3,
     ColMetadata = 0x81,
     ColInfo = 0xA5,
+    DataClassification = 0xA3,
     Done = 0xFD,
     DoneProc = 0xFE,
     DoneInProc = 0xFF,
@@ -53,6 +54,7 @@ impl TryFrom<u8> for TokenType {
             0xD3 => Ok(TokenType::AltRow),
             0x81 => Ok(TokenType::ColMetadata),
             0xA5 => Ok(TokenType::ColInfo),
+            0xA3 => Ok(TokenType::DataClassification),
             0xFD => Ok(TokenType::Done),
             0xFE => Ok(TokenType::DoneProc),
             0xFF => Ok(TokenType::DoneInProc),
@@ -99,6 +101,8 @@ pub(crate) enum Tokens {
     Sspi(SspiToken),
     Row(RowToken),
     ColMetadata(ColMetadataToken),
+    #[allow(dead_code)] // Metadata is read once it is attached to result sets.
+    DataClassification(crate::token::data_classification::DataClassificationMetadata),
     Order(OrderToken),
     ReturnStatus(ReturnStatusToken),
     ReturnValue(ReturnValueToken),
@@ -124,6 +128,8 @@ pub enum Tokens {
     Sspi(SspiToken),
     Row(RowToken),
     ColMetadata(ColMetadataToken),
+    /// Parsed `DATACLASSIFICATION` (0xA3) metadata.
+    DataClassification(crate::token::data_classification::DataClassificationMetadata),
     Order(OrderToken),
     ReturnStatus(ReturnStatusToken),
     ReturnValue(ReturnValueToken),
@@ -170,6 +176,7 @@ impl Token for Tokens {
             Tokens::Sspi(token) => token.token_type(),
             Tokens::Row(token) => token.token_type(),
             Tokens::ColMetadata(token) => token.token_type(),
+            Tokens::DataClassification(_) => TokenType::DataClassification,
             Tokens::Order(token) => token.token_type(),
             Tokens::ReturnStatus(token) => token.token_type(),
             Tokens::ReturnValue(token) => token.token_type(),
@@ -1292,6 +1299,7 @@ mod coverage_tests {
             (0xD3, TokenType::AltRow),
             (0x81, TokenType::ColMetadata),
             (0xA5, TokenType::ColInfo),
+            (0xA3, TokenType::DataClassification),
             (0xFD, TokenType::Done),
             (0xFE, TokenType::DoneProc),
             (0xFF, TokenType::DoneInProc),
@@ -1317,8 +1325,14 @@ mod coverage_tests {
 
     #[test]
     fn token_type_try_from_invalid() {
-        assert!(TokenType::try_from(0x00).is_err());
-        assert!(TokenType::try_from(0x42).is_err());
+        let zero_error = TokenType::try_from(0x00).unwrap_err();
+        let unrelated_error = TokenType::try_from(0x42).unwrap_err();
+        assert!(zero_error.to_string().contains("Unknown token type: 0x0"));
+        assert!(
+            unrelated_error
+                .to_string()
+                .contains("Unknown token type: 0x42")
+        );
     }
 
     // ── SqlCollation accessors ──

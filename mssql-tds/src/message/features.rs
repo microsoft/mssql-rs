@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 pub mod always_encrypted;
+pub mod data_classification;
 pub mod fedauth;
 pub mod jsonfeature;
 pub mod session_recovery;

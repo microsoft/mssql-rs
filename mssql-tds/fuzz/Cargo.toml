@@ -79,3 +79,10 @@ path = "fuzz_targets/fuzz_der_framing.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "fuzz_data_classification"
+path = "fuzz_targets/fuzz_data_classification.rs"
+test = false
+doc = false
+bench = false
