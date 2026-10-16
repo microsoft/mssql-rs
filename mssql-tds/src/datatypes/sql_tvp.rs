@@ -709,7 +709,7 @@ mod tests {
                     b"hello".to_vec(),
                     crate::datatypes::sql_string::EncodingType::Utf8,
                 )),
-                10,
+                5,
             )))]],
         );
         table.validate().unwrap();
