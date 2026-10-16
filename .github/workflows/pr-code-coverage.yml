@@ -203,18 +203,13 @@ jobs:
               echo "⚠️ Invalid JSON from artifacts API (attempt $attempt)"
             fi
 
-            NOW=$(date +%s)
-            if [[ $NOW -ge $DEADLINE ]]; then
+            if [[ $(date +%s) -ge $DEADLINE ]]; then
               echo "❌ Timeout: coverage artifact not found within 130 minutes"
               exit 1
             fi
 
             # Random sleep between 5 and 10 minutes (300-600 seconds).
             SLEEP=$(( (RANDOM % 301) + 300 ))
-            REMAINING=$(( DEADLINE - NOW ))
-            if [[ $SLEEP -gt $REMAINING ]]; then
-              SLEEP=$REMAINING
-            fi
             echo "💤 Sleeping ${SLEEP}s (~$((SLEEP / 60)) min) before next poll..."
             sleep "$SLEEP"
           done
