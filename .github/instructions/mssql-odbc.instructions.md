@@ -279,6 +279,9 @@ on the `master` branch.
   lands after its last read latches the client's token, so the call itself
   abandons the pending response and reports HY008 rather than leaking the
   cancellation into a later call.
+  Publish the operation's reserved trace execution under the same cancellation
+  lock as `active`, before token publication. SQLCancel binds its trace scope
+  when it selects the target under that lock, not from an earlier FFI snapshot.
 
 ### 7.1. Handle hierarchy and locking
 
@@ -390,8 +393,12 @@ on; these guarantees were verified against msodbcsql's behavior.
 
   ```rust
   pub(crate) unsafe fn sql_xxx(/* raw args */) -> SqlReturn {
-      debug!(/* all args */, "SQLXxx called");
-      crate::ffi_entry!("SQLXxx", unsafe { sql_xxx_impl(/* raw args */) })
+      crate::ffi_entry!(
+          "SQLXxx",
+          handle,
+          debug!(/* all args */, "SQLXxx called"),
+          unsafe { sql_xxx_impl(/* raw args */) }
+      )
   }
 
   // Thin unsafe shim: raw pointers -> validated references, then delegate.
@@ -413,8 +420,27 @@ on; these guarantees were verified against msodbcsql's behavior.
 - Check Driver Manager-enforced preconditions with `debug_assert!`; do not turn
   them into release-build error paths. Runtime-check application inputs that the
   Driver Manager does not validate.
-- The first line of every FFI implementation function must be a `debug!` log
-  of every argument (pointers logged with `?` — no deref).
+- Every FFI implementation passes its handle and an entry `debug!` event to
+  `ffi_entry!`. Log every argument (pointers with `?`, no dereference). Do not
+  emit the entry event before the macro: initialization and correlation must
+  precede it, and correlation must survive panic conversion and the return log.
+- New execution paths call `trace_context::activate_execution` only after
+  accepting the statement execution claim; a rejected concurrent call must not
+  replace the active execution's correlation. Propagate context explicitly to
+  blocking/native workers with `trace_context::propagate`. Never retain a
+  thread-local guard across an independently scheduled future; wrap spawned
+  futures with `trace_context::propagate_future`, which scopes each poll.
+  Include internal metadata RPCs such as uncached `SQLDescribeParam` when
+  identifying execution entry points; cached answers must not activate a new
+  result execution.
+  Restrict `continues_execution` to result, streaming, and cleanup APIs;
+  preparation, configuration, and diagnostics must not inherit a prior `exec`.
+  When a successful prepare replaces the result context, clear the stored trace
+  execution as well so metadata probes cannot inherit the replaced command's ID.
+- Verify diagnostic identifiers against wire bytes and the reference driver's
+  API representation. PRELOGIN TRACEID contains connection GUID, activity GUID,
+  then sequence, with Microsoft GUID byte order. The ODBC client-connection-ID
+  attribute is a GUID **string**, not a binary `SQLGUID`.
 - Do not call `crate::init_tracing()` from the `pub extern "C"` wrapper in
   `exports.rs`. `ffi_entry!` already calls it as the first statement inside its
   `catch_unwind` (`src/lib.rs`), so the wrappers stay thin delegates; adding a
@@ -471,6 +497,30 @@ on; these guarantees were verified against msodbcsql's behavior.
   the first of the three reasons the macro is admissible; see §2.1 for the other
   two and for the preference against skipping when the test exists solely to pin
   one registered divergence.
+- Write new behavioral e2e tests with `ODBC_TEST_F` (from
+  `odbc_concurrent_test.h`) instead of `TEST_F`. The body is unchanged; the macro
+  also runs it across threads (`/CrossThread`, `/SharedEnv`, `/SharedStmt`), so
+  concurrency coverage comes without a second copy of the test.
+  - Keep `TEST_F`, or pick the safe modes with `ODBC_TEST_F_MODES`, for tests
+    that change ENV, pooling, or process state, test connect, disconnect, or
+    driver loading, create fixed-name permanent objects, free or replace
+    `stmt_` or `dbc_` in the body, or rely on `HasFatalFailure()` (concurrent
+    workers capture failures per thread, so it cannot see them).
+  - A fixture that allocates no statement (`SetUp()` never calls `Connect()`)
+    must leave `/SharedStmt` out of its modes: observers have nothing to read.
+    The mode fails such a variant with that advice rather than hanging.
+  - Derive values from `WorkerToken()` (or `Worker()` and `Iteration()`) when a
+    result delivered to the wrong connection must fail the test; constant data
+    cannot detect that.
+  - Opt into `/SharedDbc` with `ODBC_TEST_F_MODES(..., odbc_concurrency::kAllModes)`
+    only when the body changes no connection attributes or transactions, gives
+    temporary objects per-worker names, and is safe to rerun after a busy retry.
+    Do not opt in until CI runs that mode
+    nightly only (AB#49263).
+  - Scenarios with no single-threaded meaning (races on one STMT, handle churn,
+    connect races) go under `tests/e2e/tests/multithreaded_tests/`.
+  - A concurrent failure that msodbcsql passes is a driver bug: file it rather
+    than loosen the assertion or the mode.
 - Every new `SQLXxx` function must have at least:
   - A success-path test.
   - A null-output-handle test.
@@ -481,6 +531,12 @@ on; these guarantees were verified against msodbcsql's behavior.
   conversion will materialize (see deviation 7 in the
   [parity decision registry](../../mssql-odbc/docs/parity-deviations.md)).
 - Use `cargo nextest` (via `cargo btest`), not `cargo test`.
+- Small-stack regressions must connect on the constrained application thread,
+  not just execute on it after connecting elsewhere. Include the real Driver
+  Manager and cold TLS initialization: a direct Rust call omits their stack cost.
+  Keep native-stack concurrency tests intact rather than increasing worker stacks
+  to mask an overflow. Use `small_stack_connect_test` with a release driver to
+  enforce the 128 KiB budget.
 
 ## 11. Performance and FFI data movement
 

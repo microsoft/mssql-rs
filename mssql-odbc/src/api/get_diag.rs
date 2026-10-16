@@ -42,47 +42,50 @@ pub(crate) unsafe fn sql_get_diag_rec_w(
     buffer_length: SqlSmallInt,
     text_length_ptr: *mut SqlSmallInt,
 ) -> SqlReturn {
-    debug!(
-        handle_type,
-        ?handle,
-        rec_number,
-        ?sql_state,
-        ?native_error_ptr,
-        ?message_text,
-        buffer_length,
-        ?text_length_ptr,
-        "SQLGetDiagRecW called",
-    );
+    crate::ffi_entry!(
+        "SQLGetDiagRecW",
+        handle,
+        debug!(
+            handle_type,
+            ?handle,
+            rec_number,
+            ?sql_state,
+            ?native_error_ptr,
+            ?message_text,
+            buffer_length,
+            ?text_length_ptr,
+            "SQLGetDiagRecW called",
+        ),
+        {
+            if handle.is_null() {
+                error!("SQLGetDiagRecW: handle is null");
+                return SQL_INVALID_HANDLE;
+            }
+            if rec_number < 1 || buffer_length < 0 {
+                error!(
+                    rec_number,
+                    buffer_length, "SQLGetDiagRecW: invalid argument"
+                );
+                return SQL_ERROR;
+            }
 
-    crate::ffi_entry!("SQLGetDiagRecW", {
-        if handle.is_null() {
-            error!("SQLGetDiagRecW: handle is null");
-            return SQL_INVALID_HANDLE;
+            // Per spec, the text-length out-param is initialized to 0.
+            unsafe { write_if_some(text_length_ptr, 0) };
+
+            // TODO: Do we need to snapshot here? Copy to user buffer directly?
+            let snapshot = match unsafe { snapshot_record(handle_type, handle, rec_number) } {
+                Ok(s) => s,
+                Err(rc) => return rc,
+            };
+            let Some(rec) = snapshot else {
+                return SQL_NO_DATA;
+            };
+
+            unsafe { write_sql_state(sql_state, &rec.sql_state) };
+            unsafe { write_if_some(native_error_ptr, rec.native_error) };
+            unsafe { write_message(message_text, buffer_length, text_length_ptr, &rec.message) }
         }
-        if rec_number < 1 || buffer_length < 0 {
-            error!(
-                rec_number,
-                buffer_length, "SQLGetDiagRecW: invalid argument"
-            );
-            return SQL_ERROR;
-        }
-
-        // Per spec, the text-length out-param is initialized to 0.
-        unsafe { write_if_some(text_length_ptr, 0) };
-
-        // TODO: Do we need to snapshot here? Copy to user buffer directly?
-        let snapshot = match unsafe { snapshot_record(handle_type, handle, rec_number) } {
-            Ok(s) => s,
-            Err(rc) => return rc,
-        };
-        let Some(rec) = snapshot else {
-            return SQL_NO_DATA;
-        };
-
-        unsafe { write_sql_state(sql_state, &rec.sql_state) };
-        unsafe { write_if_some(native_error_ptr, rec.native_error) };
-        unsafe { write_message(message_text, buffer_length, text_length_ptr, &rec.message) }
-    })
+    )
 }
 
 /// Implementation of [`SQLGetDiagFieldW`](super::exports::SQLGetDiagFieldW).
@@ -108,47 +111,50 @@ pub(crate) unsafe fn sql_get_diag_field_w(
     buffer_length: SqlSmallInt,
     string_length_ptr: *mut SqlSmallInt,
 ) -> SqlReturn {
-    debug!(
-        handle_type,
-        ?handle,
-        rec_number,
-        diag_identifier,
-        ?diag_info_ptr,
-        buffer_length,
-        ?string_length_ptr,
-        "SQLGetDiagFieldW called",
-    );
-
-    crate::ffi_entry!("SQLGetDiagFieldW", {
-        if handle.is_null() {
-            error!("SQLGetDiagFieldW: handle is null");
-            return SQL_INVALID_HANDLE;
-        }
-
-        if is_diag_header_field(diag_identifier) {
-            unsafe {
-                handle_header_field(
-                    handle_type,
-                    handle,
-                    rec_number,
-                    diag_identifier,
-                    diag_info_ptr,
-                )
+    crate::ffi_entry!(
+        "SQLGetDiagFieldW",
+        handle,
+        debug!(
+            handle_type,
+            ?handle,
+            rec_number,
+            diag_identifier,
+            ?diag_info_ptr,
+            buffer_length,
+            ?string_length_ptr,
+            "SQLGetDiagFieldW called",
+        ),
+        {
+            if handle.is_null() {
+                error!("SQLGetDiagFieldW: handle is null");
+                return SQL_INVALID_HANDLE;
             }
-        } else {
-            unsafe {
-                handle_record_field(
-                    handle_type,
-                    handle,
-                    rec_number,
-                    diag_identifier,
-                    diag_info_ptr,
-                    buffer_length,
-                    string_length_ptr,
-                )
+
+            if is_diag_header_field(diag_identifier) {
+                unsafe {
+                    handle_header_field(
+                        handle_type,
+                        handle,
+                        rec_number,
+                        diag_identifier,
+                        diag_info_ptr,
+                    )
+                }
+            } else {
+                unsafe {
+                    handle_record_field(
+                        handle_type,
+                        handle,
+                        rec_number,
+                        diag_identifier,
+                        diag_info_ptr,
+                        buffer_length,
+                        string_length_ptr,
+                    )
+                }
             }
         }
-    })
+    )
 }
 
 /// Returns `true` if `diag_identifier` is a header diagnostic field. Header

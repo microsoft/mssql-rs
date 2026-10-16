@@ -543,7 +543,6 @@ function Initialize-DevSqlEnv {
     if (-not $reachable) { return }
 
     $env:ODBC_TEST_SERVER = 'localhost'
-    if (-not $env:ODBC_TEST_UID) { $env:ODBC_TEST_UID = 'sa' }
     if (-not $env:ODBC_TEST_TRUST_CERT) { $env:ODBC_TEST_TRUST_CERT = 'Yes' }
 
     if (-not $env:ODBC_TEST_PWD) {
@@ -562,7 +561,13 @@ function Initialize-DevSqlEnv {
     }
 
     if ($env:ODBC_TEST_PWD) {
+        # Default the SQL login only once a password exists; a UID without one
+        # makes the fixture attempt SQL auth with an empty password.
+        if (-not $env:ODBC_TEST_UID) { $env:ODBC_TEST_UID = 'sa' }
         Write-Host "Auto-detected dev SQL Server at localhost:1433 ($($env:ODBC_TEST_UID) login)"
+    } elseif ($env:ODBC_TEST_UID) {
+        Write-Host "Warning: SQL Server detected on localhost:1433 but no password found for ODBC_TEST_UID=$($env:ODBC_TEST_UID)."
+        Write-Host "  Set SQL_PASSWORD or ODBC_TEST_PWD, or unset ODBC_TEST_UID to use integrated auth."
     } else {
         # Without a password the fixture falls back to Trusted_Connection, which
         # is a valid local setup — warn rather than fail.

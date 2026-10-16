@@ -98,6 +98,8 @@ pub mod security;
 pub(crate) mod sql_identifier;
 pub(crate) mod ssrp;
 pub mod token;
+#[doc(hidden)]
+pub mod trace_context;
 
 // Expose internal APIs for fuzzing
 #[cfg(fuzzing)]

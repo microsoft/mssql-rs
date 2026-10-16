@@ -465,10 +465,10 @@ fn run_interactive_ui(
 
     let worker = std::thread::Builder::new()
         .name("mssql-odbc-interactive-auth".to_string())
-        .spawn(move || {
+        .spawn(mssql_tds::trace_context::propagate(move || {
             let moved = moved;
             unsafe { pump_sign_in_window(api, moved.0, &title, &ui_thread_id) }
-        });
+        }));
 
     // The caller holds the request alive across this whole function, and it
     // owns the acquire lock, so reading the status back here is safe even when
@@ -768,7 +768,7 @@ fn run_windows_authentication(api: &'static MsqaApi, request: HMsqaRequest) -> T
     let moved = RequestHandle(request);
     let worker = std::thread::Builder::new()
         .name("mssql-odbc-integrated-auth".to_string())
-        .spawn(move || {
+        .spawn(mssql_tds::trace_context::propagate(move || {
             let moved = moved;
             let com = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
             if com.is_err() {
@@ -784,7 +784,7 @@ fn run_windows_authentication(api: &'static MsqaApi, request: HMsqaRequest) -> T
             let status = unsafe { (api.get_request_status)(moved.0) };
             unsafe { CoUninitialize() };
             Ok(status)
-        })
+        }))
         .map_err(|e| {
             Error::Security(SecurityError::InternalError(format!(
                 "could not start the integrated authentication thread: {e}"

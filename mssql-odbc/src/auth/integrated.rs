@@ -70,20 +70,21 @@ impl IntegratedTokenFactory {
         let mut wait = Duration::from_millis(100);
         loop {
             let (sts, resource) = (sts_url.clone(), spn.clone());
-            let attempt = tokio::task::spawn_blocking(move || {
-                super::msqa::acquire_integrated_token(
-                    &sts,
-                    &resource,
-                    PUBLIC_CLIENT_ID,
-                    REDIRECT_URI,
-                )
-            })
-            .await
-            .map_err(|e| {
-                Error::Security(SecurityError::InternalError(format!(
-                    "Entra integrated authentication did not run to completion: {e}"
-                )))
-            })?;
+            let attempt =
+                tokio::task::spawn_blocking(mssql_tds::trace_context::propagate(move || {
+                    super::msqa::acquire_integrated_token(
+                        &sts,
+                        &resource,
+                        PUBLIC_CLIENT_ID,
+                        REDIRECT_URI,
+                    )
+                }))
+                .await
+                .map_err(|e| {
+                    Error::Security(SecurityError::InternalError(format!(
+                        "Entra integrated authentication did not run to completion: {e}"
+                    )))
+                })?;
             match attempt {
                 // `msqa` reports only OneAuth's transient statuses as
                 // `ConnectionError`.

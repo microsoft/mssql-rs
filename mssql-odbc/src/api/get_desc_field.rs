@@ -50,25 +50,29 @@ pub(crate) unsafe fn sql_get_desc_field_w(
     buffer_length: SqlInteger,
     string_length_ptr: *mut SqlInteger,
 ) -> SqlReturn {
-    debug!(
-        ?descriptor_handle,
-        record_number,
-        field_identifier,
-        ?value_ptr,
-        buffer_length,
-        ?string_length_ptr,
-        "SQLGetDescFieldW called",
-    );
-    crate::ffi_entry!("SQLGetDescFieldW", unsafe {
-        sql_get_desc_field_w_impl(
-            descriptor_handle,
+    crate::ffi_entry!(
+        "SQLGetDescFieldW",
+        descriptor_handle,
+        debug!(
+            ?descriptor_handle,
             record_number,
             field_identifier,
-            value_ptr,
+            ?value_ptr,
             buffer_length,
-            string_length_ptr,
-        )
-    })
+            ?string_length_ptr,
+            "SQLGetDescFieldW called",
+        ),
+        unsafe {
+            sql_get_desc_field_w_impl(
+                descriptor_handle,
+                record_number,
+                field_identifier,
+                value_ptr,
+                buffer_length,
+                string_length_ptr,
+            )
+        }
+    )
 }
 
 /// # Safety

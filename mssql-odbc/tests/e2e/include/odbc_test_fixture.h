@@ -243,7 +243,18 @@ protected:
         return ODBCTestUtils::GetDiagState(SQL_HANDLE_DBC, dbc_);
     }
 
+    /// Lends handles owned by another fixture, before SetUp(). SetUp() then
+    /// adopts |env| instead of allocating one, and Connect() adopts |dbc|
+    /// (when non-null) instead of connecting; only the statement is new.
+    /// TearDown() never frees lent handles. Used by odbc_concurrent_test.h.
+    void LendHandles(SQLHENV env, SQLHDBC dbc) {
+        lent_env_ = env;
+        lent_dbc_ = dbc;
+    }
+
 private:
+    SQLHENV lent_env_ = SQL_NULL_HENV;
+    SQLHDBC lent_dbc_ = SQL_NULL_HDBC;
     std::vector<SQLHSTMT> extra_stmts_;
     std::chrono::steady_clock::time_point test_start_;
 };

@@ -35,10 +35,12 @@ use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 /// # Safety
 /// `statement_handle` must be a valid `StmtHandle` or null.
 pub(crate) unsafe fn sql_more_results(statement_handle: SqlHandle) -> SqlReturn {
-    debug!(?statement_handle, "SQLMoreResults called");
-    crate::ffi_entry!("SQLMoreResults", unsafe {
-        sql_more_results_impl(statement_handle)
-    })
+    crate::ffi_entry!(
+        "SQLMoreResults",
+        statement_handle,
+        debug!(?statement_handle, "SQLMoreResults called"),
+        unsafe { sql_more_results_impl(statement_handle) }
+    )
 }
 
 /// # Safety

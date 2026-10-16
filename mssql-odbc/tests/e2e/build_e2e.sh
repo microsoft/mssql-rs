@@ -69,7 +69,12 @@ echo "Driver: $DRIVER_PATH"
 # ----------------------------------------------------------------------------
 echo ""
 echo "=== Configuring e2e tests (CMake) ==="
-cmake -S "$SCRIPT_DIR" -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE=Debug
+RELEASE_DRIVER=OFF
+if [ "$BUILD_TYPE" = "release" ]; then
+    RELEASE_DRIVER=ON
+fi
+cmake -S "$SCRIPT_DIR" -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE=Debug \
+    -DODBC_E2E_RELEASE_DRIVER="$RELEASE_DRIVER"
 
 echo ""
 echo "=== Building e2e tests ==="

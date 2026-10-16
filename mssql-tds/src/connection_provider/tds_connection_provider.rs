@@ -128,9 +128,10 @@ impl TdsConnectionProvider {
 
         debug!("Connection strategy:\n{}", action_chain.describe());
 
-        // Execute the action chain to get transport contexts
-        self.execute_action_chain(&context, action_chain, cancel_handle)
-            .await
+        // ODBC polls this on the application's stack. Keep the connection
+        // state out of its block_on frames, leaving room for native TLS and
+        // client construction on musl's 128 KiB threads.
+        Box::pin(self.execute_action_chain(&context, action_chain, cancel_handle)).await
     }
 
     /// Execute an action chain to create a client
@@ -562,6 +563,9 @@ impl TdsConnectionProvider {
         Vec<SqlInfoMessage>,
         Vec<SessionStateToken>,
     )> {
+        if let Some(trace) = &context.connection_trace {
+            trace.begin_transport_attempt();
+        }
         // Create network transport directly
         // Convert connect_timeout from seconds to milliseconds
         let connect_timeout_ms = (context.connect_timeout as u64) * 1000;
@@ -698,6 +702,87 @@ fn validate_multi_subnet_failover(
 mod tests {
     use super::*;
     use std::time::Instant;
+
+    #[test]
+    fn connection_future_stays_small() {
+        const MAX: usize = 4096;
+        let provider = TdsConnectionProvider::new();
+        let context = ClientContext::default();
+        let size = std::mem::size_of_val(&provider.create_client(context, "localhost", None));
+        assert!(
+            size <= MAX,
+            "create_client future is {size} B, expected <= {MAX} B"
+        );
+    }
+
+    #[test]
+    fn transport_attempts_clear_stale_trace_ids_before_connecting() {
+        use crate::trace_context::{self, ConnectionTrace, Context, Snapshot};
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::prelude::*;
+
+        struct TransportEvents(Arc<Mutex<Vec<Snapshot>>>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for TransportEvents {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                if event
+                    .metadata()
+                    .target()
+                    .starts_with("mssql_tds::connection::transport")
+                {
+                    self.0.lock().unwrap().push(trace_context::snapshot());
+                }
+            }
+        }
+
+        trace_context::enable();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(TransportEvents(Arc::clone(&events)));
+        tracing::subscriber::with_default(subscriber, || {
+            let trace = Arc::new(ConnectionTrace::default());
+            let established = uuid::Uuid::new_v4();
+            trace.establish(established);
+            let _scope = Context::connection(Arc::clone(&trace)).enter();
+            let expected_dbc = trace_context::snapshot().dbc;
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            drop(listener);
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let mut context = context_for_retry_test("127.0.0.1", port, 1, 0, 0);
+            context.set_connection_trace(Arc::clone(&trace));
+
+            for _ in 0..2 {
+                trace.begin_attempt(uuid::Uuid::new_v4());
+                let context = context.clone();
+                events.lock().unwrap().clear();
+                let result =
+                    runtime.block_on(TdsConnectionProvider::connect_with_transport_context(
+                        &context,
+                        &context.transport_context,
+                        None,
+                    ));
+                assert!(result.is_err());
+                assert_eq!(trace.client_connection_id(), Some(established));
+                assert_eq!(trace_context::snapshot().cid, None);
+                let events = events.lock().unwrap();
+                assert!(
+                    !events.is_empty(),
+                    "must observe the transport's connect events"
+                );
+                assert!(
+                    events
+                        .iter()
+                        .all(|event| event.dbc == expected_dbc && event.cid.is_none())
+                );
+            }
+        });
+    }
 
     // ── MultiSubnetFailover validation tests ──
 

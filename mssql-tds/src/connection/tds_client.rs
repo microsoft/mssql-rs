@@ -779,6 +779,9 @@ impl TdsClient {
         client_context: ClientContext,
         login_session_state_tokens: Vec<SessionStateToken>,
     ) -> Self {
+        if let Some(trace) = &client_context.connection_trace {
+            trace.establish(negotiated_settings.client_connection_id);
+        }
         let mut recovery_context = RecoveryContext::new();
         recovery_context.initialize(
             client_context,
@@ -1069,6 +1072,14 @@ impl TdsClient {
         // response report the reset as unacknowledged and discard a healthy,
         // brand-new connection.
         self.reset_state = ResetAckState::Idle;
+        if let Some(trace) = self
+            .recovery_context
+            .client_context
+            .as_ref()
+            .and_then(|context| context.connection_trace.as_ref())
+        {
+            trace.establish(self.negotiated_settings.client_connection_id);
+        }
         Ok(())
     }
 
@@ -1166,6 +1177,7 @@ impl TdsClient {
             Tokens::Sspi(_) => "Sspi",
             Tokens::Row(_) => "Row",
             Tokens::ColMetadata(_) => "ColMetadata",
+            Tokens::DataClassification(_) => "DataClassification",
             Tokens::Order(_) => "Order",
             Tokens::ReturnStatus(_) => "ReturnStatus",
             Tokens::ReturnValue(_) => "ReturnValue",
@@ -1381,6 +1393,12 @@ impl TdsClient {
     /// (`@@SERVERNAME`), which is not necessarily the host the client dialled.
     pub fn server_reported_name(&self) -> Option<&str> {
         self.negotiated_settings.server_reported_name.as_deref()
+    }
+
+    /// The GUID sent in PRELOGIN for the current physical connection.
+    /// Changes after transparent recovery, but not after a pool reset.
+    pub fn client_connection_id(&self) -> uuid::Uuid {
+        self.negotiated_settings.client_connection_id
     }
 
     /// Returns the character-set name the server sent in the login
@@ -4919,6 +4937,16 @@ impl TdsClient {
         self.negotiated_settings.database_collation = collation;
     }
 
+    /// Data Classification version negotiated at login, as its wire value.
+    #[cfg(any(test, feature = "test-util"))]
+    #[doc(hidden)]
+    pub fn negotiated_data_classification_version_for_test(&self) -> Option<u8> {
+        self.negotiated_settings
+            .session_settings
+            .data_classification_version()
+            .map(|version| version as u8)
+    }
+
     #[cfg(any(test, feature = "test-util"))]
     #[doc(hidden)]
     pub async fn execute_sp_unprepare_for_test<'a>(
@@ -5757,6 +5785,11 @@ impl TdsClient {
                     continue;
                 }
                 Tokens::TabName | Tokens::ColInfo => {
+                    continue;
+                }
+                // Parsed with the negotiated version; result-set attachment is
+                // not implemented yet, so the metadata is not surfaced.
+                Tokens::DataClassification(_) => {
                     continue;
                 }
                 _ => {
@@ -8294,6 +8327,9 @@ impl TdsClient {
                 Ok(None)
             }
             Tokens::TabName | Tokens::ColInfo => Ok(None),
+            // Sent between COLMETADATA and the first row. Parsed with the
+            // negotiated version; result-set attachment is not implemented yet.
+            Tokens::DataClassification(_) => Ok(None),
             _ => Err(crate::error::Error::ProtocolError(format!(
                 "Unexpected token while finding the next row: {token:?}"
             ))),
@@ -10052,6 +10088,45 @@ mod tests {
     }
 
     #[test]
+    fn client_connection_id_tracks_physical_sessions_not_pool_resets() {
+        use crate::handler::handler_factory::create_test_negotiated_settings_internal;
+        use crate::trace_context::ConnectionTrace;
+
+        let trace = Arc::new(ConnectionTrace::default());
+        let mut context = ClientContext::default();
+        context.set_connection_trace(Arc::clone(&trace));
+        let first = uuid::Uuid::new_v4();
+        let second = uuid::Uuid::new_v4();
+        let mut settings = create_test_negotiated_settings_internal();
+        settings.client_connection_id = first;
+        let mut client = TdsClient::new(
+            AnyTransport::dynamic(TestTransport::new()),
+            settings,
+            ExecutionContext::new(),
+            context,
+            Vec::new(),
+        );
+        assert_eq!(client.client_connection_id(), first);
+        assert_eq!(trace.client_connection_id(), Some(first));
+        client.prepare_reset_connection(false);
+        assert_eq!(client.client_connection_id(), first);
+        assert_eq!(trace.client_connection_id(), Some(first));
+        let mut recovered = create_test_negotiated_settings_internal();
+        recovered.client_connection_id = second;
+        client
+            .adopt_recovered_session(
+                AnyTransport::dynamic(TestTransport::new()),
+                recovered,
+                ExecutionContext::new(),
+                Vec::new(),
+                &[],
+            )
+            .unwrap();
+        assert_eq!(client.client_connection_id(), second);
+        assert_eq!(trace.client_connection_id(), Some(second));
+    }
+
+    #[test]
     fn session_recovery_wiring_from_negotiated_settings() {
         use crate::message::features::session_recovery::SessionRecoveryFeature;
         use crate::message::login::Feature;
@@ -10472,6 +10547,81 @@ mod tests {
         // Ending the request clears it, including when the walk already ended.
         client.close_query().await.unwrap();
         assert_eq!(client.last_result_row_count(), None);
+    }
+
+    /// A DATACLASSIFICATION token follows COLMETADATA. It is parsed but not yet
+    /// attached to the result set, so neither the row loop nor the walk between
+    /// results may treat it as the end of a result or an unexpected token.
+    #[tokio::test]
+    async fn data_classification_tokens_do_not_disturb_result_set_navigation() {
+        use crate::token::data_classification::{
+            DataClassificationMetadata, DataClassificationVersion, SensitivityRank,
+        };
+        fn classification() -> Tokens {
+            Tokens::DataClassification(DataClassificationMetadata {
+                version: DataClassificationVersion::Version2,
+                sensitivity_labels: Vec::new(),
+                information_types: Vec::new(),
+                rank: Some(SensitivityRank::NotDefined),
+                columns: Vec::new(),
+            })
+        }
+
+        let mut client = create_test_client_with_tokens(vec![
+            int_col_metadata(1),
+            classification(),
+            done_count(CurrentCommand::Select, 0, true),
+            classification(),
+            int_col_metadata(1),
+            classification(),
+            done_count(CurrentCommand::Select, 0, false),
+        ]);
+
+        assert_eq!(
+            client.execute("q".to_string(), ()).await.unwrap(),
+            StatementResult::Rows
+        );
+        assert!(client.next_row().await.unwrap().is_none());
+        assert_eq!(client.advance().await.unwrap(), StatementResult::Rows);
+        assert!(client.next_row().await.unwrap().is_none());
+        assert_eq!(client.advance().await.unwrap(), StatementResult::End);
+        assert!(!client.is_connection_dead());
+    }
+
+    /// Closing a classified result set before reading it drains the stream;
+    /// the drain must pass over the DATACLASSIFICATION tokens too.
+    #[tokio::test]
+    async fn close_query_drains_past_data_classification_tokens() {
+        use crate::token::data_classification::{
+            DataClassificationMetadata, DataClassificationVersion,
+        };
+        fn classification() -> Tokens {
+            Tokens::DataClassification(DataClassificationMetadata {
+                version: DataClassificationVersion::Version1,
+                sensitivity_labels: Vec::new(),
+                information_types: Vec::new(),
+                rank: None,
+                columns: Vec::new(),
+            })
+        }
+
+        let mut client = create_test_client_with_tokens(vec![
+            int_col_metadata(1),
+            classification(),
+            done_count(CurrentCommand::Select, 0, true),
+            int_col_metadata(1),
+            classification(),
+            done_count(CurrentCommand::Select, 0, false),
+        ]);
+
+        assert_eq!(
+            client.execute("q".to_string(), ()).await.unwrap(),
+            StatementResult::Rows
+        );
+        client.close_query().await.unwrap();
+
+        assert!(!client.has_open_batch());
+        assert!(!client.is_connection_dead());
     }
 
     /// Under `Continue` one error can be reflected by both the failing

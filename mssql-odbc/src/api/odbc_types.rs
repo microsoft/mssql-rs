@@ -66,6 +66,9 @@ pub const SQL_COPT_SS_INTEGRATED_SECURITY: SqlInteger = 1203;
 pub const SQL_COPT_SS_ENCRYPT: SqlInteger = 1223;
 pub const SQL_COPT_SS_TRUST_SERVER_CERTIFICATE: SqlInteger = 1228;
 
+/// Physical client connection GUID string. Get-only; requires a connection.
+pub const SQL_COPT_SS_CLIENT_CONNECTION_ID: SqlInteger = 1233;
+
 /// `SQL_COPT_SS_WARN_ON_CP_ERROR` (`SQL_COPT_SS_BASE_EX + 3`). Takes
 /// [`SQL_WARN_NO`] / [`SQL_WARN_YES`]; see
 /// [`DbcState::warn_on_cp_error`](crate::handles::dbc::DbcState::warn_on_cp_error).

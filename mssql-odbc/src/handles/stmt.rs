@@ -420,6 +420,7 @@ pub(crate) const STMT_STATE_FETCH_IN_PROGRESS: u32 = 0x0000_2000;
 /// Created by `SQLAllocHandle(SQL_HANDLE_STMT, hdbc, ...)`.
 #[derive(Debug)]
 pub(crate) struct StmtHandle {
+    pub(crate) trace: Option<std::sync::Arc<mssql_tds::trace_context::StatementTrace>>,
     pub(crate) object_type: HandleType,
     /// Back-pointer to the parent DBC handle. Stored as opaque pointer because
     /// the DBC owns the STMT's lifetime, not the other way around.
@@ -1584,6 +1585,7 @@ unsafe impl Sync for StmtHandle {}
 struct StatementCancellation {
     handle: CancelHandle,
     active: bool,
+    trace_execution: Option<u64>,
     requested: bool,
     waiters: usize,
     cancelling: bool,
@@ -1696,6 +1698,10 @@ impl StmtHandle {
                 }
             };
         }
+        state.trace_execution = self
+            .trace
+            .as_ref()
+            .and_then(|trace| trace.operation_execution());
         state.active = true;
         state.requested = false;
         state.handle.set_cancel_timeout_secs(timeout_secs);
@@ -1714,6 +1720,13 @@ impl StmtHandle {
             return Err(odbc_types::SQL_ERROR);
         };
         let interrupted = state.active;
+        if let Some(trace) = &self.trace {
+            trace.correlate_cancellation(if interrupted {
+                state.trace_execution
+            } else {
+                trace.last_execution()
+            });
+        }
         state.handle.set_cancel_timeout_secs(timeout_secs);
         if interrupted {
             state.requested = true;
@@ -1785,6 +1798,7 @@ impl StmtHandle {
     /// zero (msodbcsql `sqlcfunc.cpp:173`).
     pub(crate) fn new(parent_dbc: *mut c_void, query_timeout: u32) -> Self {
         Self {
+            trace: mssql_tds::trace_context::enabled().then(std::sync::Arc::default),
             object_type: HandleType::Stmt,
             parent_dbc,
             ard: handle_to_raw(Box::new(DescHandle::new(

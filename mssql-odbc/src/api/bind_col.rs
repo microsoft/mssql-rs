@@ -47,25 +47,29 @@ pub(crate) unsafe fn sql_bind_col(
     buffer_length: SqlLen,
     strlen_or_ind_ptr: *mut SqlLen,
 ) -> SqlReturn {
-    debug!(
-        ?statement_handle,
-        column_number,
-        target_type,
-        ?target_value_ptr,
-        buffer_length,
-        ?strlen_or_ind_ptr,
-        "SQLBindCol called"
-    );
-    crate::ffi_entry!("SQLBindCol", unsafe {
-        sql_bind_col_impl(
-            statement_handle,
+    crate::ffi_entry!(
+        "SQLBindCol",
+        statement_handle,
+        debug!(
+            ?statement_handle,
             column_number,
             target_type,
-            target_value_ptr,
+            ?target_value_ptr,
             buffer_length,
-            strlen_or_ind_ptr,
-        )
-    })
+            ?strlen_or_ind_ptr,
+            "SQLBindCol called"
+        ),
+        unsafe {
+            sql_bind_col_impl(
+                statement_handle,
+                column_number,
+                target_type,
+                target_value_ptr,
+                buffer_length,
+                strlen_or_ind_ptr,
+            )
+        }
+    )
 }
 
 /// # Safety
@@ -310,16 +314,20 @@ fn unbind_ard_column(ard: SqlHandle, column_number: SqlUSmallInt) -> Result<(), 
 /// # Safety
 /// `statement_handle` must be a valid `StmtHandle` or null.
 pub(crate) unsafe fn sql_free_stmt_unbind(statement_handle: SqlHandle) -> SqlReturn {
-    debug!(?statement_handle, "SQLFreeStmt(SQL_UNBIND) called");
-    crate::ffi_entry!("SQLFreeStmt(SQL_UNBIND)", unsafe {
-        if statement_handle.is_null() {
-            error!("SQLFreeStmt(SQL_UNBIND): statement_handle is null");
-            return SQL_INVALID_HANDLE;
+    crate::ffi_entry!(
+        "SQLFreeStmt(SQL_UNBIND)",
+        statement_handle,
+        debug!(?statement_handle, "SQLFreeStmt(SQL_UNBIND) called"),
+        unsafe {
+            if statement_handle.is_null() {
+                error!("SQLFreeStmt(SQL_UNBIND): statement_handle is null");
+                return SQL_INVALID_HANDLE;
+            }
+            let stmt = handle_from_raw::<StmtHandle>(statement_handle);
+            debug_assert_eq!(stmt.object_type, HandleType::Stmt);
+            sql_free_stmt_unbind_safe(stmt)
         }
-        let stmt = handle_from_raw::<StmtHandle>(statement_handle);
-        debug_assert_eq!(stmt.object_type, HandleType::Stmt);
-        sql_free_stmt_unbind_safe(stmt)
-    })
+    )
 }
 
 fn sql_free_stmt_unbind_safe(stmt: &StmtHandle) -> SqlReturn {

@@ -25,6 +25,7 @@ use std::collections::HashMap;
 use std::fmt::Debug;
 
 use super::features::always_encrypted::AlwaysEncryptedFeature;
+use super::features::data_classification::DataClassificationFeature;
 use super::features::fedauth::FedAuthFeature;
 use super::features::session_recovery::SessionRecoveryFeature;
 use super::features::useragent::UserAgentFeature;
@@ -32,6 +33,7 @@ use super::features::utf8::Utf8Feature;
 use super::features::vectorfeature::VectorFeature;
 use crate::core::TdsResult;
 use crate::io::token_stream::{ParserContext, TdsTokenStreamReader};
+use crate::token::data_classification::DataClassificationVersion;
 use tracing::{Level, debug, event, trace};
 
 pub(crate) const FIXED_LOGIN_RECORD_LENGTH: i32 = 94;
@@ -125,6 +127,12 @@ pub(crate) trait Feature: Send + Sync + Debug {
         None
     }
 
+    /// Data Classification version the server enabled in FEATUREEXTACK, if this
+    /// feature negotiated one. Only DataClassification does.
+    fn negotiated_data_classification_version(&self) -> Option<DataClassificationVersion> {
+        None
+    }
+
     #[allow(dead_code)]
     // This method is not used currently, and exists for completeness.
     fn is_acknowledged(&self) -> bool;
@@ -160,6 +168,7 @@ impl FeaturesRequest {
         vector_version: VectorVersion,
         column_encryption_setting: ColumnEncryptionSetting,
         user_agent_feature: UserAgentFeature,
+        requested_data_classification_version: Option<DataClassificationVersion>,
     ) -> Self {
         let mut features: HashMap<FeatureExtension, Box<dyn Feature>> = HashMap::new();
         features.insert(
@@ -178,6 +187,13 @@ impl FeaturesRequest {
             features.insert(
                 FeatureExtension::AlwaysEncrypted,
                 Box::new(AlwaysEncryptedFeature::default()),
+            );
+        }
+
+        if let Some(version) = requested_data_classification_version {
+            features.insert(
+                FeatureExtension::DataClassification,
+                Box::new(DataClassificationFeature::new(version)),
             );
         }
 
@@ -298,6 +314,7 @@ impl From<(&ClientContext, bool)> for FeaturesRequest {
             context.vector_version,
             context.column_encryption_setting,
             UserAgentFeature::new(context),
+            context.requested_data_classification_version,
         );
 
         warn_if_always_encrypted_has_no_providers(context);
@@ -329,6 +346,7 @@ impl FeaturesRequest {
             context.vector_version,
             context.column_encryption_setting,
             UserAgentFeature::new(context),
+            context.requested_data_classification_version,
         );
 
         warn_if_always_encrypted_has_no_providers(context);
@@ -1421,6 +1439,7 @@ impl ClientContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connection::session_recovery::SessionStateTable;
     use crate::core::Version;
     use crate::io::packet_writer::tests::MockNetworkWriter;
     use crate::message::features::jsonfeature::JsonFeature;
@@ -1432,6 +1451,7 @@ mod tests {
     };
     use byteorder::{LittleEndian, ReadBytesExt};
     use futures::executor::block_on;
+    use std::collections::BTreeMap;
 
     // ── FeatureExtension::as_u8 ──
 
@@ -1759,7 +1779,223 @@ mod tests {
         );
     }
 
+    // ── Data Classification LOGIN7 advertisement (feature 0x09) ──
+
+    const DATA_CLASSIFICATION_ID: u8 = 0x09;
+    const USER_AGENT_ID: u8 = 0x10;
+
+    /// Serializes the LOGIN7 feature-extension block and splits it into
+    /// `(feature id, feature data)` entries in wire order. Asserts the block is
+    /// well framed, ends in a single terminator, and matches `len_bytes()`.
+    fn login7_feature_blocks(
+        context: &ClientContext,
+        recovery_data: Option<&SessionRecoveryData>,
+    ) -> Vec<(u8, Vec<u8>)> {
+        let transport_context = context.transport_context.clone();
+        let model =
+            LoginRequestModel::from_context(context, false, &transport_context, recovery_data);
+        let mut mock = MockNetworkWriter::new(131_072);
+        let mut packet_writer = PacketWriter::new(PacketType::Login7, &mut mock, None, None);
+        block_on(Serializer::new(&model, &mut packet_writer).write_feature_extension_data())
+            .unwrap();
+        let payload = packet_writer.get_payload();
+        let bytes = &payload.get_ref()[PacketWriter::PACKET_HEADER_SIZE..];
+        assert_eq!(bytes.len(), model.features_request.len_bytes());
+
+        let mut blocks = Vec::new();
+        let mut offset = 0;
+        loop {
+            let id = bytes[offset];
+            if id == 0xFF {
+                assert_eq!(offset + 1, bytes.len(), "terminator must be the last byte");
+                return blocks;
+            }
+            let length = u32::from_le_bytes(bytes[offset + 1..offset + 5].try_into().unwrap());
+            let start = offset + 5;
+            let end = start + length as usize;
+            blocks.push((id, bytes[start..end].to_vec()));
+            offset = end;
+        }
+    }
+
+    fn data_classification_blocks(blocks: &[(u8, Vec<u8>)]) -> Vec<&[u8]> {
+        blocks
+            .iter()
+            .filter(|(id, _)| *id == DATA_CLASSIFICATION_ID)
+            .map(|(_, data)| data.as_slice())
+            .collect()
+    }
+
+    fn by_feature_id(blocks: Vec<(u8, Vec<u8>)>) -> BTreeMap<u8, Vec<u8>> {
+        let count = blocks.len();
+        let map: BTreeMap<_, _> = blocks.into_iter().collect();
+        assert_eq!(map.len(), count, "a feature id was serialized twice");
+        map
+    }
+
+    #[test]
+    fn data_classification_is_not_requested_by_default() {
+        #[allow(deprecated)]
+        let contexts = [
+            ClientContext::default(),
+            ClientContext::new(),
+            ClientContext::with_data_source("tcp:localhost,1433"),
+        ];
+        for context in contexts {
+            assert_eq!(context.requested_data_classification_version, None);
+            assert!(
+                !FeaturesRequest::from((&context, false))
+                    .features
+                    .contains_key(&FeatureExtension::DataClassification)
+            );
+            assert!(
+                !FeaturesRequest::from_context_with_recovery(&context, false, None)
+                    .features
+                    .contains_key(&FeatureExtension::DataClassification)
+            );
+            assert!(data_classification_blocks(&login7_feature_blocks(&context, None)).is_empty());
+        }
+    }
+
+    #[test]
+    fn login7_requests_data_classification_version1() {
+        let context = ClientContext {
+            requested_data_classification_version: Some(DataClassificationVersion::Version1),
+            ..ClientContext::default()
+        };
+        let blocks = login7_feature_blocks(&context, None);
+        assert_eq!(data_classification_blocks(&blocks), [[0x01].as_slice()]);
+    }
+
+    #[test]
+    fn login7_requests_data_classification_version2() {
+        let context = ClientContext {
+            requested_data_classification_version: Some(DataClassificationVersion::Version2),
+            ..ClientContext::default()
+        };
+        let blocks = login7_feature_blocks(&context, None);
+        assert_eq!(data_classification_blocks(&blocks), [[0x02].as_slice()]);
+    }
+
+    #[test]
+    fn data_classification_adds_only_its_own_block_to_existing_features() {
+        let baselines = [
+            ClientContext::default(),
+            ClientContext {
+                connect_retry_count: 0,
+                ..ClientContext::default()
+            },
+            ClientContext {
+                column_encryption_setting: ColumnEncryptionSetting::Enabled,
+                vector_version: VectorVersion::V2,
+                tds_authentication_method: TdsAuthenticationMethod::AccessToken,
+                access_token: Some("token".to_string()),
+                ..ClientContext::default()
+            },
+        ];
+        for baseline in baselines {
+            let without = login7_feature_blocks(&baseline, None);
+            for version in [
+                DataClassificationVersion::Version1,
+                DataClassificationVersion::Version2,
+            ] {
+                let with_context = ClientContext {
+                    requested_data_classification_version: Some(version),
+                    ..baseline.clone()
+                };
+                let with = login7_feature_blocks(&with_context, None);
+                assert_eq!(with.first().map(|(id, _)| *id), Some(USER_AGENT_ID));
+
+                let mut expected = by_feature_id(without.clone());
+                expected.insert(DATA_CLASSIFICATION_ID, vec![version as u8]);
+                assert_eq!(by_feature_id(with), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn recovery_rebuild_preserves_requested_data_classification() {
+        let recovery_data = SessionStateTable::new().snapshot(Some("other_db"), None, None);
+        for requested in [
+            None,
+            Some(DataClassificationVersion::Version1),
+            Some(DataClassificationVersion::Version2),
+        ] {
+            let context = ClientContext {
+                requested_data_classification_version: requested,
+                ..ClientContext::default()
+            };
+            let reconnect_context = context.clone();
+            assert_eq!(
+                reconnect_context.requested_data_classification_version,
+                requested
+            );
+
+            let blocks = login7_feature_blocks(&reconnect_context, Some(&recovery_data));
+            assert!(blocks.iter().any(|(id, _)| *id == 0x01));
+            let expected: Vec<Vec<u8>> = requested.map(|v| vec![v as u8]).into_iter().collect();
+            let actual: Vec<Vec<u8>> = data_classification_blocks(&blocks)
+                .into_iter()
+                .map(<[u8]>::to_vec)
+                .collect();
+            assert_eq!(actual, expected);
+        }
+    }
+
     // ── FeaturesRequest::features() ──
+
+    fn negotiated_data_classification(
+        request: &FeaturesRequest,
+    ) -> Option<DataClassificationVersion> {
+        request
+            .get_acknowledged_features()
+            .iter()
+            .find_map(|f| f.negotiated_data_classification_version())
+    }
+
+    #[test]
+    fn featureextack_negotiates_the_server_version_not_the_requested_one() {
+        let context = ClientContext {
+            requested_data_classification_version: Some(DataClassificationVersion::Version2),
+            ..ClientContext::default()
+        };
+        let mut request = FeaturesRequest::from((&context, false));
+        assert_eq!(negotiated_data_classification(&request), None);
+
+        request
+            .set_acknowledged(FeatureExtension::DataClassification, &[0x01, 0x01])
+            .unwrap();
+
+        assert_eq!(
+            negotiated_data_classification(&request),
+            Some(DataClassificationVersion::Version1)
+        );
+    }
+
+    #[test]
+    fn invalid_data_classification_featureextack_fails_login_response_parsing() {
+        let context = ClientContext {
+            requested_data_classification_version: Some(DataClassificationVersion::Version2),
+            ..ClientContext::default()
+        };
+        let mut request = FeaturesRequest::from((&context, false));
+        let error = request
+            .set_acknowledged(FeatureExtension::DataClassification, &[0x03, 0x01])
+            .unwrap_err();
+        assert!(
+            matches!(error, crate::error::Error::ProtocolError(_)),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn unrequested_data_classification_featureextack_negotiates_nothing() {
+        let mut request = FeaturesRequest::from((&ClientContext::default(), false));
+        request
+            .set_acknowledged(FeatureExtension::DataClassification, &[0x02, 0x01])
+            .unwrap();
+        assert_eq!(negotiated_data_classification(&request), None);
+    }
 
     #[test]
     fn features_request_features_returns_all() {

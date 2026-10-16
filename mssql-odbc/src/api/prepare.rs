@@ -37,16 +37,17 @@ pub(crate) unsafe fn sql_prepare_w(
     statement_text: *const SqlWChar,
     text_length: SqlSmallInt,
 ) -> SqlReturn {
-    debug!(
-        ?statement_handle,
-        ?statement_text,
-        text_length,
-        "SQLPrepareW called",
-    );
-
-    crate::ffi_entry!("SQLPrepareW", unsafe {
-        sql_prepare_w_impl(statement_handle, statement_text, text_length)
-    })
+    crate::ffi_entry!(
+        "SQLPrepareW",
+        statement_handle,
+        debug!(
+            ?statement_handle,
+            ?statement_text,
+            text_length,
+            "SQLPrepareW called",
+        ),
+        unsafe { sql_prepare_w_impl(statement_handle, statement_text, text_length) }
+    )
 }
 
 /// # Safety
@@ -143,6 +144,9 @@ fn sql_prepare_w_safe(stmt: &StmtHandle, sql: String) -> SqlReturn {
     stmt_state.clear_result_metadata();
     stmt_state.reset_row_stream();
     stmt_state.clear_state(STMT_STATE_EXEC_CONTEXT);
+    if let Some(trace) = &stmt.trace {
+        trace.clear_execution();
+    }
     stmt_state.call_returns_status = false;
     stmt_state.set_state(STMT_STATE_PREPARED);
     drop(stmt_state);

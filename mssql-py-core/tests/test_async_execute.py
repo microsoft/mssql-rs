@@ -975,6 +975,86 @@ def test_table_valued_parameter_surface_and_validation():
 
 
 @pytest.mark.integration
+def test_table_valued_parameter_preserves_numeric_and_temporal_metadata(client_context):
+    columns = [
+        (3, 12, 2),
+        (2, 38, 10),
+        (92, 0, 3),
+        (93, 0, 3),
+        (-155, 0, 3),
+    ]
+    expected_offset = datetime.timedelta(hours=-5, minutes=-30)
+    populated_row = (
+        Decimal("123.45"),
+        Decimal("123.4500000000"),
+        datetime.time(12, 34, 56, 123000),
+        datetime.datetime(2024, 1, 2, 12, 34, 56, 123000),
+        datetime.datetime(
+            2024,
+            1,
+            2,
+            12,
+            34,
+            56,
+            123000,
+            tzinfo=datetime.timezone(expected_offset),
+        ),
+    )
+
+    async def run():
+        conn = await connect(client_context)
+        type_name = f"PyAsyncTvpMetadata_{uuid.uuid4().hex}"
+        qualified_type_name = f"dbo.{type_name}"
+        cursor = conn.cursor()
+        try:
+            await cursor.execute(f"""
+                CREATE TYPE dbo.[{type_name}] AS TABLE (
+                    decimal_value DECIMAL(12, 2),
+                    numeric_value NUMERIC(38, 10),
+                    time_value TIME(3),
+                    datetime_value DATETIME2(3),
+                    offset_value DATETIMEOFFSET(3)
+                )
+                """)
+
+            populated = mssql_py_core.TableValuedParameter(
+                qualified_type_name, columns, [populated_row]
+            )
+            await cursor.execute("SELECT * FROM ?", populated)
+            description = cursor.description
+            assert description is not None
+            assert [column[5] for column in description] == [2, 10, 3, 3, 3]
+
+            row = await cursor.fetchone()
+            assert row is not None
+            assert row == populated_row
+            assert row[0].as_tuple().exponent == -2
+            assert row[1].as_tuple().exponent == -10
+            assert row[4].utcoffset() == expected_offset
+            assert await cursor.fetchone() is None
+
+            null_cells = mssql_py_core.TableValuedParameter(
+                qualified_type_name, columns, [(None,) * len(columns)]
+            )
+            await cursor.execute("SELECT * FROM ?", null_cells)
+            row = await cursor.fetchone()
+            assert row is not None
+            assert row == (None,) * len(columns)
+            assert await cursor.fetchone() is None
+
+            empty = mssql_py_core.TableValuedParameter(qualified_type_name, columns, [])
+            await cursor.execute("SELECT * FROM ?", empty)
+            assert await cursor.fetchone() is None
+        finally:
+            try:
+                await cursor.execute(f"DROP TYPE IF EXISTS dbo.[{type_name}]")
+            finally:
+                await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
 @pytest.mark.parametrize("use_prepare", [True, False])
 @pytest.mark.parametrize("rows", [[(1, "first"), (2, "second")], [], None])
 def test_execute_binds_table_valued_parameter(client_context, use_prepare, rows):
