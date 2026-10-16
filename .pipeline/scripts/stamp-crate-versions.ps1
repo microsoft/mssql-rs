@@ -48,31 +48,26 @@ function Assert-SemVer {
     }
 }
 
-function Assert-SupportedSectionStrings {
+function Assert-BareSectionKeys {
     param([Parameter(Mandatory = $true)][string]$Content, [Parameter(Mandatory = $true)][string]$Path)
 
     if ($Content -match '(?m)^[ \t]*(?:"(?:\\.|[^"\\\r\n])*"|''[^''\r\n]*'')[ \t]*[=.]') {
         throw "Quoted keys are unsupported in $Path"
     }
-    # Consume complete comments and single-line strings before looking for a
-    # multiline delimiter, so their literal contents cannot trigger rejection.
-    $tokens = [regex]::Matches($Content, '#[^\r\n]*|(?<multiline>"""|'''''')|"(?:\\.|[^"\\\r\n])*"|''[^''\r\n]*''')
+}
+
+function Assert-SupportedManifestStructure {
+    param([Parameter(Mandatory = $true)][string]$Content, [Parameter(Mandatory = $true)][string]$Path)
+
+    # Consume ordinary strings/comments before detecting multiline delimiters.
+    # Whole headers are skipped only outside arrays, before section extraction.
+    $tokens = [regex]::Matches($Content, '#[^\r\n]*|(?<multiline>"""|'''''')|"(?:\\.|[^"\\\r\n])*"|''[^''\r\n]*''|(?<header>(?m:^[ \t]*\[)[^\r\n]*)|(?<open>\[)|(?<close>\])')
+    $arrayDepth = 0
     foreach ($token in $tokens) {
         if ($token.Groups['multiline'].Success) {
             throw "Multiline strings are unsupported in $Path"
         }
-    }
-}
-
-function Assert-NoNestedManifestArrays {
-    param([Parameter(Mandatory = $true)][string]$Content, [Parameter(Mandatory = $true)][string]$Path)
-
-    # Skip strings/comments and whole table headers, but never mistake a header-
-    # shaped line inside an array for the next manifest section.
-    $tokens = [regex]::Matches($Content, '#[^\r\n]*|"""(?:\\[\s\S]|(?!""")[\s\S])*"""|''''''[\s\S]*?''''''|"(?:\\.|[^"\\\r\n])*"|''[^''\r\n]*''|(?<header>(?m:^[ \t]*\[)[^\r\n]*)|(?<open>\[)|(?<close>\])')
-    $arrayDepth = 0
-    foreach ($token in $tokens) {
-        if ($token.Groups['header'].Success) {
+        elseif ($token.Groups['header'].Success) {
             if ($arrayDepth -gt 0) { throw "Nested arrays are unsupported in $Path" }
         }
         elseif ($token.Groups['open'].Success) {
@@ -90,12 +85,12 @@ function Assert-NoNestedManifestArrays {
 function Get-PackageVersionMatch {
     param([Parameter(Mandatory = $true)][string]$Content, [Parameter(Mandatory = $true)][string]$Path)
 
-    Assert-NoNestedManifestArrays -Content $Content -Path $Path
+    Assert-SupportedManifestStructure -Content $Content -Path $Path
     $sections = [regex]::Matches($Content, '(?ms)^[ \t]*\[[ \t]*package[ \t]*\][ \t]*(?:#[^\r\n]*)?(?:\r?\n|\z).*?(?=^[ \t]*\[|\z)')
     $firstTable = [regex]::Match($Content, '(?m)^[ \t]*\[')
     $rootContent = if ($firstTable.Success) { $Content.Substring(0, $firstTable.Index) } else { $Content }
     if (-not [string]::IsNullOrWhiteSpace($rootContent)) {
-        Assert-SupportedSectionStrings -Content $rootContent -Path $Path
+        Assert-BareSectionKeys -Content $rootContent -Path $Path
     }
     # Quoted/dotted package keys and multiline strings need a TOML parser; do
     # not let them introduce a second declaration that a line matcher misses.
@@ -106,7 +101,7 @@ function Get-PackageVersionMatch {
     }
 
     $section = $sections[0]
-    Assert-SupportedSectionStrings -Content $section.Value -Path $Path
+    Assert-BareSectionKeys -Content $section.Value -Path $Path
     $declarations = [regex]::Matches($section.Value, '(?m)^[ \t]*version\b')
     $versions = [regex]::Matches($section.Value, '(?m)^[ \t]*version[ \t]*=[ \t]*"(?<version>[^"\r\n]*)"[ \t]*(?:#[^\r\n]*)?\r?$')
     if ($declarations.Count -ne 1 -or $versions.Count -ne 1) {
@@ -163,7 +158,7 @@ function Set-MssqlTdsDependencyVersion {
     $dependencySections = [regex]::Matches($Content, "(?ms)^[ \t]*\[[ \t]*(?:$targetPrefix)?(?:dependencies|dev-dependencies|build-dependencies)[ \t]*\][ \t]*(?:#[^\r\n]*)?(?:\r?\n|\z).*?(?=^[ \t]*\[|\z)")
     $declarationCount = 0
     foreach ($dependencySection in $dependencySections) {
-        Assert-SupportedSectionStrings -Content $dependencySection.Value -Path $Path
+        Assert-BareSectionKeys -Content $dependencySection.Value -Path $Path
         $declarationCount += [regex]::Matches($dependencySection.Value, '(?m)^[ \t]*(?:mssql-tds|["'']mssql-tds["''])[ \t]*[=.]').Count
     }
     if ($declarationCount -ne 1 -or $sections.Count -ne 1 -or

@@ -2256,6 +2256,37 @@ def test_crate_stamp_still_rejects_basic_string_escapes(stamp_manifests, what_if
     assert_stamp_rejected(stamp_manifests, WhatIf=what_if)
 
 
+@pytest.mark.parametrize("quote", ['"""', "'''"])
+@pytest.mark.parametrize("has_dependency", [False, True])
+@pytest.mark.parametrize("example_header", ["dependencies", "package", "target.'cfg(windows)'"])
+@pytest.mark.parametrize("what_if", [False, True])
+def test_crate_stamp_rejects_multiline_metadata_before_header_detection(
+    stamp_manifests, quote, has_dependency, example_header, what_if
+):
+    path = stamp_manifests / "mssql-mock-tds" / "Cargo.toml"
+    content = path.read_text()
+    if not has_dependency:
+        content = content[:content.index("\n[dependencies]\n")]
+    content += (
+        f"\n[package.metadata]\nexample = {quote}\n[{example_header}]\n"
+        'mssql-tds = { path = "../mssql-tds", version = "0.3.0" }\n'
+        f"# {quote}\n[features]\n"
+    )
+    tomllib.loads(content)
+    path.write_bytes(content.encode())
+    assert_stamp_rejected(stamp_manifests, WhatIf=what_if)
+
+
+@pytest.mark.parametrize("quote", ['"""', "'''"])
+@pytest.mark.parametrize("what_if", [False, True])
+def test_crate_stamp_rejects_plain_multiline_metadata(stamp_manifests, quote, what_if):
+    path = stamp_manifests / "mssql-mock-tds" / "Cargo.toml"
+    content = path.read_text() + f"\n[package.metadata]\nexample = {quote}first\nsecond{quote}\n"
+    tomllib.loads(content)
+    path.write_bytes(content.encode())
+    assert_stamp_rejected(stamp_manifests, WhatIf=what_if)
+
+
 def test_crate_stamp_preserves_crlf_and_indented_declarations(stamp_manifests):
     for path in stamp_manifests.rglob("Cargo.toml"):
         path.write_bytes(path.read_text().replace("version =", "\tversion =").replace("\n", "\r\n").encode())
