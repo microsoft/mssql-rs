@@ -27,6 +27,7 @@ use crate::message::transaction_management::{
     TransactionManagementType,
 };
 use crate::query::result::ReturnValue;
+use crate::token::data_classification::{DataClassificationMetadata, DataClassificationVersion};
 use crate::token::tokens::{SessionStateToken, SqlCollation};
 use crate::{
     connection::execution_context::{ALREADY_EXECUTING_ERROR, ExecutionContext},
@@ -563,6 +564,13 @@ struct BufferedRowSupport {
     prefix_len: Option<usize>,
 }
 
+/// A result set's classification and the metadata allocation it was read with.
+#[derive(Debug)]
+struct ResultSetClassification {
+    metadata: Arc<ColMetadataToken>,
+    classification: DataClassificationMetadata,
+}
+
 /// Active TDS connection to a SQL Server instance.
 ///
 /// Created by [`TdsConnectionProvider::create_client()`](crate::connection_provider::tds_connection_provider::TdsConnectionProvider::create_client).
@@ -581,6 +589,11 @@ pub struct TdsClient {
 
     // pub(crate) batch_result: Option<BatchResult<'static>>,
     pub(crate) current_metadata: Option<Arc<ColMetadataToken>>,
+    /// DATACLASSIFICATION read with a result set's COLMETADATA, paired with
+    /// that metadata. It is surfaced only while that metadata is
+    /// `current_metadata`, so it cannot outlive or move to another result set.
+    /// Boxed to keep the client small.
+    current_data_classification: Option<Box<ResultSetClassification>>,
     /// Memoized cell decryptor for `current_metadata`'s CEK table, paired with
     /// the metadata it was built for so it is rebuilt when the result set
     /// changes. `None` until the first encrypted result set is seen.
@@ -796,6 +809,7 @@ impl TdsClient {
             recovery_context: Box::new(recovery_context),
             reset_state: ResetAckState::Idle,
             current_metadata: None,
+            current_data_classification: None,
             current_decryptor: None,
             buffered_row_support: None,
             count_map: HashMap::new(),
@@ -1030,6 +1044,7 @@ impl TdsClient {
 
         // Reset per-request state
         self.current_metadata = None;
+        self.current_data_classification = None;
         self.count_map.clear();
         self.return_values.clear();
         self.info_messages.clear();
@@ -1465,6 +1480,15 @@ impl TdsClient {
 
     pub(crate) fn get_current_metadata(&self) -> Option<&ColMetadataToken> {
         self.current_metadata.as_deref()
+    }
+
+    /// Data Classification version the server enabled at login, or `None` when
+    /// it was not requested or the server declined it. Result sets carry
+    /// classification only when this is `Some`.
+    pub fn negotiated_data_classification_version(&self) -> Option<DataClassificationVersion> {
+        self.negotiated_settings
+            .session_settings
+            .data_classification_version()
     }
 
     /// Rows affected by the most recently executed statement.
@@ -2133,15 +2157,15 @@ impl TdsClient {
             let token = self.next_response_token(&parser_context).await?;
             match token {
                 Tokens::ColMetadata(metadata) => {
+                    let metadata = Arc::new(metadata);
+                    self.read_result_set_classification(&metadata).await?;
                     if let Some(batch) = self.prepared_batch.as_mut()
                         && let Some(row) = batch.current.as_mut()
                     {
                         row.has_result_set = true;
                     }
                     self.last_rows_affected = -1;
-                    return Ok(
-                        self.apply_result_boundary(ResultBoundaryKind::RowSet(Arc::new(metadata)))
-                    );
+                    return Ok(self.apply_result_boundary(ResultBoundaryKind::RowSet(metadata)));
                 }
                 Tokens::Done(_) | Tokens::DoneProc(_) | Tokens::DoneInProc(_) => {}
                 Tokens::Error(error) => {
@@ -4963,16 +4987,6 @@ impl TdsClient {
         self.negotiated_settings.database_collation = collation;
     }
 
-    /// Data Classification version negotiated at login, as its wire value.
-    #[cfg(any(test, feature = "test-util"))]
-    #[doc(hidden)]
-    pub fn negotiated_data_classification_version_for_test(&self) -> Option<u8> {
-        self.negotiated_settings
-            .session_settings
-            .data_classification_version()
-            .map(|version| version as u8)
-    }
-
     #[cfg(any(test, feature = "test-util"))]
     #[doc(hidden)]
     pub async fn execute_sp_unprepare_for_test<'a>(
@@ -5574,6 +5588,8 @@ impl TdsClient {
             match token {
                 Tokens::ColMetadata(md) => {
                     info!(?md);
+                    let md = Arc::new(md);
+                    self.read_result_set_classification(&md).await?;
                     self.current_result_set_has_been_read_till_end = false;
                     self.current_result_ended_with_done_in_proc = false;
                     // Positioning on a row-returning result: its count is
@@ -5592,7 +5608,7 @@ impl TdsClient {
                     // before the COLMETADATA, and no enclosing DONEPROC flagged),
                     // so an error-flagged DONE from here on is unpaired.
                     self.statement_error_completion_pending = false;
-                    return Ok(ResultBoundaryKind::RowSet(Arc::new(md)));
+                    return Ok(ResultBoundaryKind::RowSet(md));
                 }
                 Tokens::DoneInProc(done) | Tokens::DoneProc(done) | Tokens::Done(done) => {
                     info!(
@@ -5850,8 +5866,9 @@ impl TdsClient {
                 Tokens::TabName | Tokens::ColInfo => {
                     continue;
                 }
-                // Parsed with the negotiated version; result-set attachment is
-                // not implemented yet, so the metadata is not surfaced.
+                // Classification is read with its COLMETADATA (see
+                // `read_result_set_classification`); one reaching here does not
+                // follow a COLMETADATA, so it belongs to no result set.
                 Tokens::DataClassification(_) => {
                     continue;
                 }
@@ -5962,6 +5979,43 @@ impl TdsClient {
             return Err(self.end_walk_on_read_error(error));
         }
         Ok(token)
+    }
+
+    /// Reads the DATACLASSIFICATION that may directly follow `metadata`'s
+    /// COLMETADATA and attaches it to that result set.
+    ///
+    /// Every COLMETADATA that can become `current_metadata` passes through
+    /// here, so an unclassified result set replaces any earlier
+    /// classification with none.
+    async fn read_result_set_classification(
+        &mut self,
+        metadata: &Arc<ColMetadataToken>,
+    ) -> TdsResult<()> {
+        let classification = if self.transport.may_receive_data_classification() {
+            let context = ParserContext::ColumnMetadata(Arc::clone(metadata), None);
+            let start = self.request_timeout_start();
+            // Boxed so only connections that negotiated the feature pay for
+            // this future, rather than every result-set walk carrying it.
+            let result = Box::pin(self.transport.receive_data_classification(
+                &context,
+                self.remaining_request_timeout,
+                self.cancel_handle.as_ref(),
+            ))
+            .await;
+            if let Some(start) = start {
+                self.update_remaining_timeout(start);
+            }
+            result.map_err(|error| self.fail_read(error))?
+        } else {
+            None
+        };
+        self.current_data_classification = classification.map(|classification| {
+            Box::new(ResultSetClassification {
+                metadata: Arc::clone(metadata),
+                classification,
+            })
+        });
+        Ok(())
     }
 
     /// Resolves whether an RPC response has anything left after the no-row
@@ -6126,8 +6180,10 @@ impl TdsClient {
     /// still open; call `advance` again to move past it.
     #[instrument(skip(self), level = "info")]
     pub async fn advance(&mut self) -> TdsResult<StatementResult> {
-        // Moving on ends the previous row set's count, on every path below.
+        // Moving on ends the previous row set's count and classification, on
+        // every path below; the next COLMETADATA brings its own.
         self.last_result_row_count = None;
+        self.current_data_classification = None;
         if !self.has_open_batch() {
             return Ok(StatementResult::End);
         }
@@ -8395,8 +8451,10 @@ impl TdsClient {
                 Ok(None)
             }
             Tokens::TabName | Tokens::ColInfo => Ok(None),
-            // Sent between COLMETADATA and the first row. Parsed with the
-            // negotiated version; result-set attachment is not implemented yet.
+            // Classification is read with its COLMETADATA (see
+            // `read_result_set_classification`); one reaching the row loop was
+            // not attached there, and attaching it now could pair it with rows
+            // already returned.
             Tokens::DataClassification(_) => Ok(None),
             _ => Err(crate::error::Error::ProtocolError(format!(
                 "Unexpected token while finding the next row: {token:?}"
@@ -8629,6 +8687,7 @@ impl TdsClient {
         self.failed_statement_done_pending = false;
         self.take_row_set_errors();
         self.last_result_row_count = None;
+        self.current_data_classification = None;
     }
 
     /// Takes the errors collected inside a row set, resetting the token and
@@ -9345,6 +9404,12 @@ impl ResultSet for TdsClient {
             .unwrap_or(&self.empty_metadata)
     }
 
+    fn data_classification(&self) -> Option<&DataClassificationMetadata> {
+        let entry = self.current_data_classification.as_deref()?;
+        let current = self.current_metadata.as_ref()?;
+        Arc::ptr_eq(current, &entry.metadata).then_some(&entry.classification)
+    }
+
     fn next_row(&mut self) -> impl Future<Output = TdsResult<Option<Vec<ColumnValues>>>> + Send {
         self.get_next_row()
     }
@@ -9632,6 +9697,19 @@ pub trait ResultSet {
     /// This metadata includes information about the columns in the result set.
     fn get_metadata(&self) -> &Vec<ColumnMetadata>;
 
+    /// Returns the sensitivity classification the server sent with this
+    /// result set's column metadata.
+    ///
+    /// `None` when the result set is unclassified, when there is no current
+    /// result set, or when Data Classification was not negotiated at login
+    /// (see
+    /// [`ClientContext::requested_data_classification_version`](crate::connection::client_context::ClientContext::requested_data_classification_version)).
+    /// Available as soon as the result set is positioned, before any row is
+    /// read, and until the next result set, request, or cancellation.
+    fn data_classification(&self) -> Option<&DataClassificationMetadata> {
+        None
+    }
+
     /// Returns the next row of data as a vector of column values.
     /// If there is no more data, it returns None.
     fn next_row(&mut self) -> impl Future<Output = TdsResult<Option<Vec<ColumnValues>>>> + Send;
@@ -9882,6 +9960,32 @@ mod tests {
                 return Err(error);
             }
             Err(crate::error::Error::ConnectionClosed("test".to_string()))
+        }
+
+        async fn receive_data_classification(
+            &mut self,
+            _context: &ParserContext,
+            _remaining_request_timeout: Option<Duration>,
+            cancel_handle: Option<&CancelHandle>,
+        ) -> TdsResult<Option<crate::token::data_classification::DataClassificationMetadata>>
+        {
+            if let Some(handle) = cancel_handle
+                && handle.cancel_token.is_cancelled()
+            {
+                return Err(crate::error::Error::OperationCancelledError(
+                    "Request was cancelled".to_string(),
+                ));
+            }
+            if !matches!(
+                self.pending_tokens.front(),
+                Some(Tokens::DataClassification(_))
+            ) {
+                return Ok(None);
+            }
+            match self.pending_tokens.pop_front() {
+                Some(Tokens::DataClassification(metadata)) => Ok(Some(metadata)),
+                _ => unreachable!("the front token was DATACLASSIFICATION"),
+            }
         }
 
         async fn receive_row_into(
@@ -10648,68 +10752,43 @@ mod tests {
         assert_eq!(client.last_result_row_count(), None);
     }
 
-    /// A DATACLASSIFICATION token follows COLMETADATA. It is parsed but not yet
-    /// attached to the result set, so neither the row loop nor the walk between
-    /// results may treat it as the end of a result or an unexpected token.
-    #[tokio::test]
-    async fn data_classification_tokens_do_not_disturb_result_set_navigation() {
-        use crate::token::data_classification::{
-            DataClassificationMetadata, DataClassificationVersion, SensitivityRank,
-        };
-        fn classification() -> Tokens {
-            Tokens::DataClassification(DataClassificationMetadata {
-                version: DataClassificationVersion::Version2,
-                sensitivity_labels: Vec::new(),
-                information_types: Vec::new(),
-                rank: Some(SensitivityRank::NotDefined),
-                columns: Vec::new(),
-            })
-        }
-
-        let mut client = create_test_client_with_tokens(vec![
-            int_col_metadata(1),
-            classification(),
-            done_count(CurrentCommand::Select, 0, true),
-            classification(),
-            int_col_metadata(1),
-            classification(),
-            done_count(CurrentCommand::Select, 0, false),
-        ]);
-
-        assert_eq!(
-            client.execute("q".to_string(), ()).await.unwrap(),
-            StatementResult::Rows
-        );
-        assert!(client.next_row().await.unwrap().is_none());
-        assert_eq!(client.advance().await.unwrap(), StatementResult::Rows);
-        assert!(client.next_row().await.unwrap().is_none());
-        assert_eq!(client.advance().await.unwrap(), StatementResult::End);
-        assert!(!client.is_connection_dead());
-    }
-
-    /// Closing a classified result set before reading it drains the stream;
-    /// the drain must pass over the DATACLASSIFICATION tokens too.
-    #[tokio::test]
-    async fn close_query_drains_past_data_classification_tokens() {
+    fn ranked_classification(rank: crate::token::data_classification::SensitivityRank) -> Tokens {
         use crate::token::data_classification::{
             DataClassificationMetadata, DataClassificationVersion,
         };
-        fn classification() -> Tokens {
-            Tokens::DataClassification(DataClassificationMetadata {
-                version: DataClassificationVersion::Version1,
-                sensitivity_labels: Vec::new(),
-                information_types: Vec::new(),
-                rank: None,
-                columns: Vec::new(),
-            })
-        }
+        Tokens::DataClassification(DataClassificationMetadata {
+            version: DataClassificationVersion::Version2,
+            sensitivity_labels: Vec::new(),
+            information_types: Vec::new(),
+            rank: Some(rank),
+            columns: Vec::new(),
+        })
+    }
+
+    fn classification_rank(
+        client: &TdsClient,
+    ) -> Option<crate::token::data_classification::SensitivityRank> {
+        client
+            .data_classification()
+            .and_then(|metadata| metadata.rank)
+    }
+
+    /// DATACLASSIFICATION follows the COLMETADATA it classifies. One that does
+    /// not (here between DONE and the next COLMETADATA) belongs to no result
+    /// set, and neither it nor the first set's token may reach the second set.
+    #[tokio::test]
+    async fn classification_is_attached_to_the_result_set_it_follows() {
+        use crate::token::data_classification::SensitivityRank;
 
         let mut client = create_test_client_with_tokens(vec![
             int_col_metadata(1),
-            classification(),
+            ranked_classification(SensitivityRank::High),
+            done_count(CurrentCommand::Select, 0, true),
+            ranked_classification(SensitivityRank::Low),
+            int_col_metadata(1),
             done_count(CurrentCommand::Select, 0, true),
             int_col_metadata(1),
-            classification(),
+            ranked_classification(SensitivityRank::Critical),
             done_count(CurrentCommand::Select, 0, false),
         ]);
 
@@ -10717,10 +10796,108 @@ mod tests {
             client.execute("q".to_string(), ()).await.unwrap(),
             StatementResult::Rows
         );
+        assert_eq!(classification_rank(&client), Some(SensitivityRank::High));
+        assert!(client.next_row().await.unwrap().is_none());
+        assert_eq!(classification_rank(&client), Some(SensitivityRank::High));
+
+        assert_eq!(client.advance().await.unwrap(), StatementResult::Rows);
+        assert_eq!(classification_rank(&client), None);
+
+        assert_eq!(client.advance().await.unwrap(), StatementResult::Rows);
+        assert_eq!(
+            classification_rank(&client),
+            Some(SensitivityRank::Critical)
+        );
+        assert!(client.next_row().await.unwrap().is_none());
+
+        assert_eq!(client.advance().await.unwrap(), StatementResult::End);
+        assert_eq!(classification_rank(&client), None);
+        assert!(!client.is_connection_dead());
+    }
+
+    /// Classification is tied to the metadata allocation it was read with, so
+    /// a path that replaces `current_metadata` without reading a new
+    /// COLMETADATA cannot surface it.
+    #[tokio::test]
+    async fn classification_is_hidden_once_its_metadata_is_not_current() {
+        use crate::token::data_classification::SensitivityRank;
+
+        let mut client = create_test_client_with_tokens(vec![
+            int_col_metadata(1),
+            ranked_classification(SensitivityRank::High),
+            done_count(CurrentCommand::Select, 0, false),
+        ]);
+        client.execute("q".to_string(), ()).await.unwrap();
+        assert_eq!(classification_rank(&client), Some(SensitivityRank::High));
+
+        client.current_metadata = Some(int_column_metadata(1));
+        assert_eq!(classification_rank(&client), None);
+        client.current_metadata = None;
+        assert_eq!(classification_rank(&client), None);
+    }
+
+    /// Closing a classified result set before reading it drains the stream;
+    /// the drain must pass over the DATACLASSIFICATION tokens too, and leave
+    /// no classification behind.
+    #[tokio::test]
+    async fn close_query_drains_past_data_classification_tokens() {
+        use crate::token::data_classification::SensitivityRank;
+
+        let mut client = create_test_client_with_tokens(vec![
+            int_col_metadata(1),
+            ranked_classification(SensitivityRank::Low),
+            done_count(CurrentCommand::Select, 0, true),
+            int_col_metadata(1),
+            ranked_classification(SensitivityRank::Medium),
+            done_count(CurrentCommand::Select, 0, false),
+        ]);
+
+        assert_eq!(
+            client.execute("q".to_string(), ()).await.unwrap(),
+            StatementResult::Rows
+        );
+        assert_eq!(classification_rank(&client), Some(SensitivityRank::Low));
         client.close_query().await.unwrap();
 
+        assert_eq!(classification_rank(&client), None);
+        assert!(client.current_data_classification.is_none());
         assert!(!client.has_open_batch());
         assert!(!client.is_connection_dead());
+    }
+
+    /// A batched prepared execution positions its result sets through its own
+    /// reader, which must attach classification the same way.
+    #[tokio::test]
+    async fn prepared_batch_result_sets_carry_their_classification() {
+        use crate::token::data_classification::SensitivityRank;
+
+        let tokens = vec![
+            empty_col_metadata(),
+            ranked_classification(SensitivityRank::Medium),
+            batch_done_in_proc(1),
+            batch_done_proc(true, false),
+            empty_col_metadata(),
+            batch_done_in_proc(1),
+            batch_done_proc(false, false),
+        ];
+        let (mut client, _) = create_capturing_client(tokens);
+        let statement_id = client.register_prepared_handle_for_test(42);
+        let mut statement = PreparedStatement::materialized_for_test("SELECT @P1", statement_id);
+        client
+            .begin_execute_prepared_batch(
+                &mut statement,
+                vec![Ok((2, Vec::new())), Ok((5, Vec::new()))],
+                &mut None,
+                (),
+            )
+            .await
+            .unwrap();
+        assert!(client.on_rows());
+        assert_eq!(classification_rank(&client), Some(SensitivityRank::Medium));
+
+        assert_eq!(client.advance().await.unwrap(), StatementResult::Rows);
+        assert_eq!(classification_rank(&client), None);
+        assert_eq!(client.advance().await.unwrap(), StatementResult::End);
     }
 
     /// Under `Continue` one error can be reflected by both the failing

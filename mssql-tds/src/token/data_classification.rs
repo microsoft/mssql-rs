@@ -1,14 +1,22 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! Protocol models for TDS `DATACLASSIFICATION` metadata.
+//! Validated TDS `DATACLASSIFICATION` metadata for a result set.
+//!
+//! Request the feature with
+//! [`ClientContext::requested_data_classification_version`](crate::connection::client_context::ClientContext::requested_data_classification_version)
+//! and read a result set's classification through
+//! [`ResultSet::data_classification`](crate::connection::tds_client::ResultSet::data_classification).
+//! Values are only produced by the token parser, which has already checked
+//! every count, dictionary reference, and rank.
 
 use crate::error::Error;
 
 /// Supported `DATACLASSIFICATION` feature versions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
-pub(crate) enum DataClassificationVersion {
+#[non_exhaustive]
+pub enum DataClassificationVersion {
     /// Base labels, information types, and per-column properties.
     Version1 = 1,
     /// Version 1 metadata plus result-set and per-property sensitivity ranks.
@@ -34,11 +42,21 @@ impl TryFrom<u8> for DataClassificationVersion {
 /// A label describes the handling category of data, such as "Confidential".
 /// It is independent of the column's SQL data type.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct SensitivityLabel {
-    /// Human-readable label name.
+pub struct SensitivityLabel {
     pub(crate) name: String,
-    /// Identifier used to link the label to an information protection system.
     pub(crate) id: String,
+}
+
+impl SensitivityLabel {
+    /// Human-readable label name.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Identifier used to link the label to an information protection system.
+    pub fn id(&self) -> &str {
+        &self.id
+    }
 }
 
 /// An information type from the token-level information-type dictionary.
@@ -46,16 +64,28 @@ pub(crate) struct SensitivityLabel {
 /// An information type describes what the data represents, such as a national
 /// identifier. It is independent of both the SQL data type and sensitivity label.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct InformationType {
-    /// Human-readable information-type name.
+pub struct InformationType {
     pub(crate) name: String,
-    /// Identifier used to link the type to an information protection system.
     pub(crate) id: String,
 }
 
+impl InformationType {
+    /// Human-readable information-type name.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Identifier used to link the type to an information protection system.
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+}
+
 /// A validated reference into the sensitivity-label dictionary.
+///
+/// Resolve it with [`DataClassificationMetadata::resolve_label`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum SensitivityLabelReference {
+pub enum SensitivityLabelReference {
     /// The wire index was `0xFFFF`, so no label is associated with the property.
     Unspecified,
     /// Zero-based index into [`DataClassificationMetadata::sensitivity_labels`].
@@ -63,8 +93,10 @@ pub(crate) enum SensitivityLabelReference {
 }
 
 /// A validated reference into the information-type dictionary.
+///
+/// Resolve it with [`DataClassificationMetadata::resolve_information_type`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum InformationTypeReference {
+pub enum InformationTypeReference {
     /// The wire index was `0xFFFF`, so no information type is associated with the property.
     Unspecified,
     /// Zero-based index into [`DataClassificationMetadata::information_types`].
@@ -77,7 +109,8 @@ pub(crate) enum InformationTypeReference {
 /// information type, and is present only in version 2 metadata.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(i32)]
-pub(crate) enum SensitivityRank {
+#[non_exhaustive]
+pub enum SensitivityRank {
     /// No rank was defined.
     NotDefined = -1,
     /// Explicitly non-sensitive.
@@ -112,47 +145,109 @@ impl TryFrom<i32> for SensitivityRank {
 
 /// Classification contributed by one source expression for a result column.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct SensitivityProperty {
-    /// Validated label-dictionary reference.
+pub struct SensitivityProperty {
     pub(crate) sensitivity_label: SensitivityLabelReference,
-    /// Validated information-type-dictionary reference.
     pub(crate) information_type: InformationTypeReference,
-    /// Present only for version 2 metadata.
     pub(crate) rank: Option<SensitivityRank>,
+}
+
+impl SensitivityProperty {
+    /// Validated reference into the label dictionary.
+    pub fn sensitivity_label(&self) -> SensitivityLabelReference {
+        self.sensitivity_label
+    }
+
+    /// Validated reference into the information-type dictionary.
+    pub fn information_type(&self) -> InformationTypeReference {
+        self.information_type
+    }
+
+    /// Present only for version 2 metadata.
+    pub fn rank(&self) -> Option<SensitivityRank> {
+        self.rank
+    }
 }
 
 /// Classification metadata for one result-set column.
 ///
-/// An empty `properties` collection represents an unclassified column. A
-/// derived column can contain multiple properties when it has multiple
-/// classified source expressions.
+/// An empty property list represents an unclassified column. A derived
+/// column can contain multiple properties when it has multiple classified
+/// source expressions.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ColumnSensitivity {
-    /// Classifications contributed by the column's source expressions.
+pub struct ColumnSensitivity {
     pub(crate) properties: Vec<SensitivityProperty>,
 }
 
 impl ColumnSensitivity {
-    // Consumed by result-set integration; until then only tests call it.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn is_classified(&self) -> bool {
+    /// Classifications contributed by the column's source expressions.
+    pub fn properties(&self) -> &[SensitivityProperty] {
+        &self.properties
+    }
+
+    /// Returns whether the column has at least one sensitivity property.
+    pub fn is_classified(&self) -> bool {
         !self.properties.is_empty()
     }
 }
 
 /// Parsed TDS `DATACLASSIFICATION` metadata for a result set.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct DataClassificationMetadata {
-    /// Negotiated version used to parse the token.
+pub struct DataClassificationMetadata {
     pub(crate) version: DataClassificationVersion,
-    /// Token-level sensitivity-label dictionary.
     pub(crate) sensitivity_labels: Vec<SensitivityLabel>,
-    /// Token-level information-type dictionary.
     pub(crate) information_types: Vec<InformationType>,
-    /// Overall result-set rank, present only for version 2.
     pub(crate) rank: Option<SensitivityRank>,
-    /// Entries are in result-set column order.
     pub(crate) columns: Vec<ColumnSensitivity>,
+}
+
+impl DataClassificationMetadata {
+    /// Negotiated version the token was parsed with.
+    pub fn version(&self) -> DataClassificationVersion {
+        self.version
+    }
+
+    /// Token-level sensitivity-label dictionary.
+    pub fn sensitivity_labels(&self) -> &[SensitivityLabel] {
+        &self.sensitivity_labels
+    }
+
+    /// Token-level information-type dictionary.
+    pub fn information_types(&self) -> &[InformationType] {
+        &self.information_types
+    }
+
+    /// Overall result-set rank, present only for version 2.
+    pub fn rank(&self) -> Option<SensitivityRank> {
+        self.rank
+    }
+
+    /// One entry per result-set column, in column order.
+    pub fn columns(&self) -> &[ColumnSensitivity] {
+        &self.columns
+    }
+
+    /// The label a property refers to, or `None` when it is unspecified.
+    pub fn resolve_label(&self, reference: SensitivityLabelReference) -> Option<&SensitivityLabel> {
+        match reference {
+            SensitivityLabelReference::Unspecified => None,
+            SensitivityLabelReference::Index(index) => {
+                self.sensitivity_labels.get(usize::from(index))
+            }
+        }
+    }
+
+    /// The information type a property refers to, or `None` when it is unspecified.
+    pub fn resolve_information_type(
+        &self,
+        reference: InformationTypeReference,
+    ) -> Option<&InformationType> {
+        match reference {
+            InformationTypeReference::Unspecified => None,
+            InformationTypeReference::Index(index) => {
+                self.information_types.get(usize::from(index))
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -202,5 +297,48 @@ mod tests {
                 "{error}"
             );
         }
+    }
+
+    #[test]
+    fn references_resolve_to_their_dictionary_entries() {
+        let metadata = DataClassificationMetadata {
+            version: DataClassificationVersion::Version1,
+            sensitivity_labels: vec![
+                SensitivityLabel {
+                    name: "Public".to_string(),
+                    id: "L0".to_string(),
+                },
+                SensitivityLabel {
+                    name: "Confidential".to_string(),
+                    id: "L1".to_string(),
+                },
+            ],
+            information_types: vec![InformationType {
+                name: "National ID".to_string(),
+                id: "I1".to_string(),
+            }],
+            rank: None,
+            columns: Vec::new(),
+        };
+
+        let label = metadata
+            .resolve_label(SensitivityLabelReference::Index(1))
+            .unwrap();
+        assert_eq!((label.name(), label.id()), ("Confidential", "L1"));
+        let information_type = metadata
+            .resolve_information_type(InformationTypeReference::Index(0))
+            .unwrap();
+        assert_eq!(
+            (information_type.name(), information_type.id()),
+            ("National ID", "I1")
+        );
+        assert_eq!(
+            metadata.resolve_label(SensitivityLabelReference::Unspecified),
+            None
+        );
+        assert_eq!(
+            metadata.resolve_information_type(InformationTypeReference::Unspecified),
+            None
+        );
     }
 }

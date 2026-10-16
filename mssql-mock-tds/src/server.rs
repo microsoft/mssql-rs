@@ -4,15 +4,17 @@
 //! Mock TDS Server implementation
 
 use crate::protocol::{
-    PACKET_HEADER_SIZE, PacketHeader, PacketType, ProtocolError, TM_BEGIN_XACT,
-    build_attention_ack_packet, build_done_token, build_error_response,
-    build_feature_ext_ack_data_classification, build_feature_ext_ack_fedauth,
+    FEATURE_EXT_DATA_CLASSIFICATION, FEATURE_EXT_SESSION_RECOVERY, PACKET_HEADER_SIZE,
+    PacketHeader, PacketType, ProtocolError, TM_BEGIN_XACT, build_attention_ack_packet,
+    build_done_token, build_error_response, build_feature_ext_ack, build_feature_ext_ack_fedauth,
     build_fedauth_challenge_response, build_login_ack, build_prelogin_response,
-    build_prelogin_response_with_fedauth, build_query_result_with_extras, build_routing_response,
+    build_prelogin_response_with_fedauth, build_query_results, build_routing_response,
     build_transaction_manager_response, parse_fedauth_token, parse_login7_auth, parse_sql_batch,
     parse_transaction_descriptor_header, parse_transaction_manager_request,
 };
-use crate::query_response::{LOGIN_DELAY_KEY, QueryRegistry, RPC_DELAY_KEY, TM_BEGIN_DELAY_KEY};
+use crate::query_response::{
+    DataClassificationAck, LOGIN_DELAY_KEY, QueryRegistry, RPC_DELAY_KEY, TM_BEGIN_DELAY_KEY,
+};
 use bytes::BytesMut;
 use native_tls::Identity;
 use std::collections::BTreeMap;
@@ -101,6 +103,14 @@ pub struct ConnectionProcessor {
     /// this connection has sent, in order. See
     /// [`ConnectionInfo::transaction_descriptor_headers`].
     transaction_descriptor_headers: Vec<(u64, u32)>,
+    /// Data Classification version the client requested in Login7, if any.
+    data_classification_requested: Option<u8>,
+    /// Whether Login7 carried session-recovery state, i.e. was a reconnect.
+    recovery_login: bool,
+    /// Set after answering a query registered with
+    /// [`QueryRegistry::close_connection_after`]; the connection loop then
+    /// closes the socket.
+    close_after_response: bool,
 }
 
 impl ConnectionProcessor {
@@ -111,21 +121,7 @@ impl ConnectionProcessor {
         query_registry: Arc<Mutex<QueryRegistry>>,
         connection_store: Option<Arc<Mutex<ConnectionStore>>>,
     ) -> Self {
-        Self {
-            conn_id,
-            addr,
-            is_authenticated: false,
-            received_token: None,
-            user_agent: None,
-            received_server_name: None,
-            fedauth_workflow: None,
-            awaiting_fedauth_token: false,
-            query_registry,
-            buffer: BytesMut::with_capacity(4096),
-            redirection: None,
-            connection_store,
-            transaction_descriptor_headers: Vec::new(),
-        }
+        Self::new_with_redirection(conn_id, addr, query_registry, connection_store, None)
     }
 
     /// Create a new connection processor with redirection configuration
@@ -150,12 +146,20 @@ impl ConnectionProcessor {
             redirection,
             connection_store,
             transaction_descriptor_headers: Vec::new(),
+            data_classification_requested: None,
+            recovery_login: false,
+            close_after_response: false,
         }
     }
 
     /// Get the unique connection id
     pub(crate) fn conn_id(&self) -> u64 {
         self.conn_id
+    }
+
+    /// Whether the connection should close now that its closing query was answered.
+    pub fn close_requested(&self) -> bool {
+        self.close_after_response
     }
 
     /// Get the client address
@@ -351,6 +355,8 @@ impl ConnectionProcessor {
                 // Store the server name for test verification
                 self.received_server_name = auth_info.server_name.clone();
                 self.fedauth_workflow = auth_info.fedauth_workflow;
+                self.data_classification_requested = auth_info.data_classification_version;
+                self.recovery_login = auth_info.is_recovery_login;
 
                 // Check if redirection is configured
                 if let Some(ref redir) = self.redirection {
@@ -410,10 +416,29 @@ impl ConnectionProcessor {
                         response.extend_from_slice(&build_feature_ext_ack_fedauth());
                     }
 
-                    if let Some(version) = auth_info.data_classification_version {
-                        debug!("Including FeatureExtAck for Data Classification v{version}");
-                        response
-                            .extend_from_slice(&build_feature_ext_ack_data_classification(version));
+                    // Session recovery and Data Classification share one
+                    // FEATUREEXTACK token, as SQL Server sends them.
+                    let mut acknowledged: Vec<(u8, Vec<u8>)> = Vec::new();
+                    {
+                        let registry = self.query_registry.lock().await;
+                        if auth_info.session_recovery_requested && registry.session_recovery() {
+                            acknowledged.push((FEATURE_EXT_SESSION_RECOVERY, Vec::new()));
+                        }
+                        if let Some(requested) = auth_info.data_classification_version {
+                            let version = match registry.data_classification_ack() {
+                                DataClassificationAck::Requested => Some(requested),
+                                DataClassificationAck::Version(version) => Some(version),
+                                DataClassificationAck::Omitted => None,
+                            };
+                            if let Some(version) = version {
+                                debug!("Acknowledging Data Classification v{version}");
+                                acknowledged
+                                    .push((FEATURE_EXT_DATA_CLASSIFICATION, vec![version, 1]));
+                            }
+                        }
+                    }
+                    if !acknowledged.is_empty() {
+                        response.extend_from_slice(&build_feature_ext_ack(&acknowledged));
                     }
 
                     response.extend_from_slice(&build_done_token(0));
@@ -502,12 +527,17 @@ impl ConnectionProcessor {
                                     (
                                         r,
                                         registry.data_classification(&sql).to_vec(),
+                                        registry.following_result_sets(&sql).to_vec(),
                                         registry.trailing_info(&sql).to_vec(),
                                     )
                                 })
                             };
-                            if let Some((response_data, data_classification, trailing_info)) =
-                                registered
+                            if let Some((
+                                response_data,
+                                data_classification,
+                                following_result_sets,
+                                trailing_info,
+                            )) = registered
                             {
                                 info!("Found registered response for query");
                                 match self
@@ -518,12 +548,18 @@ impl ConnectionProcessor {
                                     DelayOutcome::Closed => return Ok(None),
                                     DelayOutcome::Elapsed => {}
                                 }
-                                // build_query_result already wraps in a packet, so return directly
-                                let packet = build_query_result_with_extras(
+                                // build_query_results already wraps in a packet, so return directly
+                                let packet = build_query_results(
                                     &response_data,
                                     &data_classification,
+                                    &following_result_sets,
                                     &trailing_info,
                                 );
+                                self.close_after_response = self
+                                    .query_registry
+                                    .lock()
+                                    .await
+                                    .closes_connection_after(&sql);
                                 Some(packet)
                             } else {
                                 info!("No registered response, returning empty result");
@@ -569,16 +605,25 @@ impl ConnectionProcessor {
                     let registered = {
                         let registry = self.query_registry.lock().await;
                         registry
-                            .get_by_contained_utf16_text_with_extras(packet_body)
-                            .map(|(response, data_classification, trailing)| {
-                                (
-                                    response.clone(),
-                                    data_classification.to_vec(),
-                                    trailing.to_vec(),
-                                )
+                            .find_by_contained_utf16_text(packet_body)
+                            .and_then(|query| {
+                                registry.get(query).map(|response| {
+                                    (
+                                        response.clone(),
+                                        registry.data_classification(query).to_vec(),
+                                        registry.following_result_sets(query).to_vec(),
+                                        registry.trailing_info(query).to_vec(),
+                                    )
+                                })
                             })
                     };
-                    if let Some((response_data, data_classification, trailing_info)) = registered {
+                    if let Some((
+                        response_data,
+                        data_classification,
+                        following_result_sets,
+                        trailing_info,
+                    )) = registered
+                    {
                         info!("Found registered response for RPC request");
                         match self
                             .wait_out_delay_or_attention(socket, response_data.delay)
@@ -588,9 +633,10 @@ impl ConnectionProcessor {
                             DelayOutcome::Closed => return Ok(None),
                             DelayOutcome::Elapsed => {}
                         }
-                        Some(build_query_result_with_extras(
+                        Some(build_query_results(
                             &response_data,
                             &data_classification,
+                            &following_result_sets,
                             &trailing_info,
                         ))
                     } else {
@@ -743,6 +789,10 @@ pub struct ConnectionInfo {
     /// (`TransactionDescriptor == 0`) must carry `OutstandingRequestCount ==
     /// 1` — without the mock server itself enforcing it.
     pub transaction_descriptor_headers: Vec<(u64, u32)>,
+    /// Data Classification version the client requested in Login7, if any.
+    pub data_classification_requested: Option<u8>,
+    /// Whether Login7 carried session-recovery state, i.e. was a reconnect.
+    pub recovery_login: bool,
 }
 
 impl ConnectionInfo {
@@ -785,6 +835,8 @@ impl ConnectionStore {
             received_server_name: processor.received_server_name().map(|s| s.to_string()),
             fedauth_workflow: processor.fedauth_workflow(),
             transaction_descriptor_headers: processor.transaction_descriptor_headers().to_vec(),
+            data_classification_requested: processor.data_classification_requested,
+            recovery_login: processor.recovery_login,
         };
         self.connections.insert(processor.conn_id(), info);
     }
@@ -1268,6 +1320,10 @@ async fn handle_strict_encrypted_connection(
             );
             socket.write_all(&response).await?;
         }
+        if processor.close_requested() {
+            debug!("Closing connection {} after its closing query", addr);
+            break;
+        }
     }
 
     // Store connection info for test verification
@@ -1309,6 +1365,10 @@ async fn handle_encrypted_connection(
         while let Some(response) = processor.process_packet(&mut socket).await? {
             debug!("Sending {} encrypted bytes response", response.len());
             socket.write_all(&response).await?;
+        }
+        if processor.close_requested() {
+            debug!("Closing connection {} after its closing query", addr);
+            break;
         }
     }
 
@@ -1361,6 +1421,10 @@ async fn handle_encrypted_tds_wrapped_connection(
             debug!("Sending {} encrypted bytes response", response.len());
             socket.write_all(&response).await?;
         }
+        if processor.close_requested() {
+            debug!("Closing connection {} after its closing query", addr);
+            break;
+        }
     }
 
     // Store connection info for test verification
@@ -1406,6 +1470,10 @@ async fn handle_unencrypted_connection(
         while let Some(response) = processor.process_packet(&mut socket).await? {
             debug!("Sending {} bytes response", response.len());
             socket.write_all(&response).await?;
+        }
+        if processor.close_requested() {
+            debug!("Closing connection {} after its closing query", addr);
+            break;
         }
     }
 
@@ -1509,9 +1577,10 @@ async fn handle_connection(
                                 // Look up query in registry
                                 let registry = query_registry.lock().await;
                                 if let Some(response) = registry.get(&sql) {
-                                    Some(build_query_result_with_extras(
+                                    Some(build_query_results(
                                         response,
                                         registry.data_classification(&sql),
+                                        registry.following_result_sets(&sql),
                                         registry.trailing_info(&sql),
                                     ))
                                 } else if sql.to_uppercase().starts_with("SELECT") {

@@ -30,7 +30,8 @@ use crate::io::token_stream::{
 use crate::message::attention::AttentionRequest;
 use crate::message::login_options::TdsVersion;
 use crate::message::messages::{PacketStatusFlags, PacketType, Request, ResetConnectionMode};
-use crate::token::data_classification::DataClassificationVersion;
+use crate::token::data_classification::{DataClassificationMetadata, DataClassificationVersion};
+use crate::token::parsers::DataClassificationTokenParser;
 use crate::token::tokens::{ColMetadataToken, DoneStatus, TokenType, Tokens};
 use async_trait::async_trait;
 use byteorder::{BigEndian, ByteOrder, LittleEndian};
@@ -835,6 +836,29 @@ where
         None => None,
     };
     InterruptibleRead::Interrupted { error, boundary }
+}
+
+/// Peeks the next token type and parses it only when it is DATACLASSIFICATION.
+async fn receive_data_classification_internal(
+    transport: &mut NetworkTransport,
+    version: DataClassificationVersion,
+) -> TdsResult<Option<DataClassificationMetadata>> {
+    loop {
+        match transport.tds_read_buffer.get_buffered_slice().first() {
+            Some(&kind) if kind == TokenType::DataClassification as u8 => break,
+            Some(_) => return Ok(None),
+            None => transport.refill_for(1).await?,
+        }
+    }
+    log_received_token(
+        &TokenType::DataClassification,
+        TokenType::DataClassification as u8,
+    );
+    transport.tds_read_buffer.consume_bytes(1)?;
+    DataClassificationTokenParser
+        .parse_with_version(transport, version)
+        .await
+        .map(Some)
 }
 
 /// Mutable row-decoding state used while discarding a cancelled response.
@@ -2768,6 +2792,82 @@ impl NetworkTransport {
         Err(*error)
     }
 
+    /// Reads a DATACLASSIFICATION token when it is the next token, leaving any
+    /// other token unread.
+    ///
+    /// SQL Server sends the token directly after the COLMETADATA it
+    /// classifies, before the first row; SqlClient's `TdsParser.TryRun`
+    /// likewise peeks for it right after COLMETADATA. `context` must carry
+    /// that metadata so an interrupted read can skip the result set's rows
+    /// while draining to DONE_ATTN. Nothing is read when the feature was not
+    /// negotiated, which leaves an unexpected token to the parser's rejection.
+    pub(crate) async fn receive_data_classification(
+        &mut self,
+        context: &ParserContext,
+        remaining_request_timeout: Option<Duration>,
+        cancel_handle: Option<&CancelHandle>,
+    ) -> TdsResult<Option<DataClassificationMetadata>> {
+        let Some(version) = self.data_classification_version else {
+            return Ok(None);
+        };
+        self.attention_settlement = None;
+        if !cancel_handle.is_some_and(|handle| handle.cancel_token.is_cancelled())
+            && self
+                .tds_read_buffer
+                .get_buffered_slice()
+                .first()
+                .is_some_and(|&kind| kind != TokenType::DataClassification as u8)
+        {
+            return Ok(None);
+        }
+        let attention_stream = self.stream.as_ref().cloned();
+        let already_dead = self.known_dead;
+        let outcome = {
+            let mut read = std::pin::pin!(receive_data_classification_internal(self, version));
+            read_to_attention_boundary(
+                read.as_mut(),
+                remaining_request_timeout,
+                cancel_handle,
+                attention_stream,
+                already_dead,
+            )
+            .await
+        };
+        let (error, boundary) = match outcome {
+            InterruptibleRead::Completed(result) => return result,
+            InterruptibleRead::Interrupted { error, boundary } => (error, boundary),
+        };
+        let Some((deadline, completed)) = boundary else {
+            self.known_dead = true;
+            return Err(*error);
+        };
+
+        // Either way the reader stops on a token boundary: the classification
+        // is consumed whole or nothing was consumed. It is discarded with the
+        // rest of the cancelled response.
+        match completed {
+            Ok(_) => match self.wait_for_attention_ack(context, None, deadline).await {
+                Ok(true) => {}
+                Ok(false) => self.known_dead = true,
+                Err(attention_error) => {
+                    debug!(
+                        ?attention_error,
+                        "Failed to settle an interrupted classification read"
+                    );
+                    self.known_dead = true;
+                }
+            },
+            Err(attention_error) => {
+                debug!(
+                    ?attention_error,
+                    "Failed to finish an interrupted classification read"
+                );
+                self.known_dead = true;
+            }
+        }
+        Err(*error)
+    }
+
     pub(crate) async fn receive_row_into<W>(
         &mut self,
         context: &ParserContext,
@@ -3040,6 +3140,21 @@ impl TdsTokenStreamReader for NetworkTransport {
     ) -> TdsResult<Tokens> {
         NetworkTransport::receive_token(self, context, remaining_request_timeout, cancel_handle)
             .await
+    }
+
+    async fn receive_data_classification(
+        &mut self,
+        context: &ParserContext,
+        remaining_request_timeout: Option<Duration>,
+        cancel_handle: Option<&CancelHandle>,
+    ) -> TdsResult<Option<DataClassificationMetadata>> {
+        NetworkTransport::receive_data_classification(
+            self,
+            context,
+            remaining_request_timeout,
+            cancel_handle,
+        )
+        .await
     }
 
     async fn receive_row_into(
@@ -3394,6 +3509,106 @@ pub(crate) mod tests {
                 "{:?}",
                 settlement.tokens
             );
+            assert_eq!(settlement.tokens.len(), 1, "only DONE_ATTN is retained");
+        }
+
+        #[tokio::test]
+        async fn reads_the_classification_that_follows_colmetadata() {
+            let version = DataClassificationVersion::Version2;
+            let mut transport = transport_with(&classification_token(version));
+            negotiate(&mut transport, &[0x02, 0x01]);
+
+            let metadata = transport
+                .receive_data_classification(&int4_row_context(1), None, None)
+                .await
+                .unwrap()
+                .expect("the classification after COLMETADATA");
+            assert_eq!(metadata.version, version);
+            assert_eq!(metadata.rank, Some(SensitivityRank::NotDefined));
+
+            let next = transport
+                .receive_token(&ParserContext::None(()), None, None)
+                .await
+                .unwrap();
+            assert!(matches!(next, Tokens::Done(_)), "{next:?}");
+        }
+
+        /// The first look refills an empty buffer; the second sees the
+        /// buffered DONE. Neither may consume it.
+        #[tokio::test]
+        async fn leaves_any_other_token_unread() {
+            let mut transport = transport_with(&[]);
+            negotiate(&mut transport, &[0x02, 0x01]);
+
+            for _ in 0..2 {
+                let classification = transport
+                    .receive_data_classification(&int4_row_context(1), None, None)
+                    .await
+                    .unwrap();
+                assert!(classification.is_none());
+            }
+            let next = transport
+                .receive_token(&ParserContext::None(()), None, None)
+                .await
+                .unwrap();
+            assert!(matches!(next, Tokens::Done(_)), "{next:?}");
+        }
+
+        /// Without the feature nothing is consumed, so the token reaches the
+        /// parser's rejection unchanged.
+        #[tokio::test]
+        async fn reads_nothing_unless_negotiated() {
+            let mut transport =
+                transport_with(&classification_token(DataClassificationVersion::Version2));
+
+            let classification = transport
+                .receive_data_classification(&int4_row_context(1), None, None)
+                .await
+                .unwrap();
+            assert!(classification.is_none());
+
+            let error = transport
+                .receive_token(&ParserContext::None(()), None, None)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("not negotiated"), "{error}");
+        }
+
+        /// The interrupted read drains the result set's row, using the
+        /// metadata in `context`, and keeps nothing but DONE_ATTN.
+        #[tokio::test(start_paused = true)]
+        async fn a_cancelled_classification_read_drains_to_done_attn() {
+            let version = DataClassificationVersion::Version2;
+            let mut stream = TestPacketBuilder::new(PacketType::TabularResult)
+                .continuation()
+                .append_bytes(&classification_token(version))
+                .append_bytes(&[TokenType::Row as u8, 7, 0, 0, 0])
+                .build();
+            stream.extend_from_slice(&done_token_message(DoneStatus::ATTN.bits()));
+            let (mut transport, mut written) =
+                create_network_transport_with_live_peer_capturing_writes(&stream);
+            negotiate(&mut transport, &[0x02, 0x01]);
+
+            let result = timeout(
+                Duration::from_secs(600),
+                transport.receive_data_classification(
+                    &int4_row_context(1),
+                    None,
+                    Some(&cancelled_handle()),
+                ),
+            )
+            .await
+            .expect("the attention drain hung");
+
+            assert!(
+                matches!(result, Err(OperationCancelledError(_))),
+                "{result:?}"
+            );
+            assert!(written.try_recv().is_ok(), "ATTENTION was not sent");
+            assert!(!is_known_dead(&transport));
+            let settlement = transport
+                .take_attention_settlement()
+                .expect("the acknowledgement must produce settlement state");
             assert_eq!(settlement.tokens.len(), 1, "only DONE_ATTN is retained");
         }
     }
@@ -6460,6 +6675,36 @@ pub(crate) mod tests {
         assert!(matches!(result, Err(OperationCancelledError(_))));
         assert!(written.try_recv().is_ok());
         assert!(!is_known_dead(&transport));
+    }
+
+    /// The ATTENTION drain cannot step over a token it has no parser for: the
+    /// token's length is unknown, so it gives up and retires the connection
+    /// rather than look for DONE_ATTN in bytes whose boundaries it has lost.
+    #[tokio::test(start_paused = true)]
+    async fn an_unknown_token_in_the_attention_drain_retires_the_connection() {
+        let mut done_more = vec![TokenType::Done as u8, DoneStatus::MORE.bits() as u8, 0];
+        done_more.extend_from_slice(&[0; 10]);
+        let mut stream = TestPacketBuilder::new(PacketType::TabularResult)
+            .continuation()
+            .append_bytes(&done_more)
+            .append_bytes(&[0xA6, 0x02, 0x00, 0xAA, 0xBB])
+            .build();
+        stream.extend_from_slice(&done_token_message(DoneStatus::ATTN.bits()));
+        let (mut transport, _written) =
+            create_network_transport_with_live_peer_capturing_writes(&stream);
+
+        let result = timeout(
+            Duration::from_secs(600),
+            transport.receive_token(&ParserContext::None(()), None, Some(&cancelled_handle())),
+        )
+        .await
+        .expect("the attention drain hung on an unknown token");
+
+        assert!(
+            matches!(result, Err(OperationCancelledError(_))),
+            "{result:?}"
+        );
+        assert!(is_known_dead(&transport));
     }
 
     /// The check must stay quiet on a healthy cancellation: a server that
