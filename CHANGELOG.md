@@ -58,9 +58,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   columns, allowing Polars DataFrames to load without first converting the
   DataFrame to a PyArrow table.
 
+- `mssql-tds`: Enhanced Routing. LOGIN7 always advertises feature extension
+  `0x0F`, as msodbcsql does, and the client follows ENVCHANGE type 21 to the
+  routed server and logs in to the routed database. A type 21 route without
+  an Enhanced Routing acknowledgement of 1 fails the login, matching msodbcsql
+  (AB#49295).
+
 - Initial public release of the mssql-rs workspace.
 
 ### Changed
+
+- `mssql-tds`: `Error::Redirection` has a new `database` field, set when the
+  server routes the connection with Enhanced Routing. Routing ENVCHANGEs are
+  now acted on after the whole login response is read rather than mid-stream.
 
 - `mssql-odbc`: empty character values retrieved as numeric or GUID C targets
   now return success with indicator 0 and leave the value buffer unchanged,

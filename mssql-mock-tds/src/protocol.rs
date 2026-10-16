@@ -168,6 +168,8 @@ pub enum TokenType {
 pub const FEATURE_EXT_FEDAUTH: u8 = 0x02;
 /// Data Classification feature extension ID
 pub const FEATURE_EXT_DATA_CLASSIFICATION: u8 = 0x09;
+/// Enhanced Routing feature extension ID
+pub const FEATURE_EXT_ENHANCED_ROUTING: u8 = 0x0F;
 pub const FEATURE_EXT_USER_AGENT: u8 = 0x10;
 /// FedAuth terminator
 pub const FEATURE_EXT_TERMINATOR: u8 = 0xFF;
@@ -190,6 +192,25 @@ pub struct Login7AuthInfo {
     pub user_agent: Option<String>,
     /// Data Classification version requested in Login7 feature `0x09` (if present)
     pub data_classification_version: Option<u8>,
+    /// Database requested in the Login7 packet (if any)
+    pub database: Option<String>,
+    /// Every FeatureExt id the Login7 packet carried, in order
+    pub feature_ids: Vec<u8>,
+}
+
+/// Decodes the UTF-16LE string that the Login7 offset/length pair at `entry` points to.
+fn read_login7_string(data: &[u8], entry: usize) -> Option<String> {
+    let offset = u16::from_le_bytes([*data.get(entry)?, *data.get(entry + 1)?]) as usize;
+    let chars = u16::from_le_bytes([*data.get(entry + 2)?, *data.get(entry + 3)?]) as usize;
+    if chars == 0 {
+        return None;
+    }
+    let bytes = data.get(offset..offset + chars * 2)?;
+    let units: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+        .collect();
+    String::from_utf16(&units).ok()
 }
 
 /// Parse Login7 packet to extract FedAuth feature extension with access token
@@ -240,6 +261,9 @@ pub fn parse_login7_auth(packet_data: &[u8]) -> Login7AuthInfo {
             auth_info.server_name = Some(server_name);
         }
     }
+
+    // ibDatabase/cchDatabase is the 9th offset-table entry.
+    auth_info.database = read_login7_string(data, 68);
 
     // Read OptionFlags3 at offset 27
     let option_flags3 = data[27];
@@ -313,6 +337,7 @@ pub fn parse_login7_auth(packet_data: &[u8]) -> Login7AuthInfo {
 
         let feat_len =
             u32::from_le_bytes([data[i + 1], data[i + 2], data[i + 3], data[i + 4]]) as usize;
+        auth_info.feature_ids.push(feature_id);
 
         if feature_id == FEATURE_EXT_FEDAUTH {
             auth_info.has_fedauth = true;
@@ -508,6 +533,17 @@ pub fn build_feature_ext_ack_data_classification(version: u8) -> BytesMut {
     token_data.put_u32_le(2);
     token_data.put_u8(version);
     token_data.put_u8(1); // IsEnabled
+    token_data.put_u8(FEATURE_EXT_TERMINATOR);
+    token_data
+}
+
+/// Build a FeatureExtAck token answering Enhanced Routing with `is_enabled`.
+pub fn build_feature_ext_ack_enhanced_routing(is_enabled: u8) -> BytesMut {
+    let mut token_data = BytesMut::new();
+    token_data.put_u8(TokenType::FeatureExtAck as u8);
+    token_data.put_u8(FEATURE_EXT_ENHANCED_ROUTING);
+    token_data.put_u32_le(1);
+    token_data.put_u8(is_enabled);
     token_data.put_u8(FEATURE_EXT_TERMINATOR);
     token_data
 }
@@ -1195,6 +1231,74 @@ pub fn build_routing_response(redirect_host: &str, redirect_port: u16) -> BytesM
     wrap_in_packet(PacketType::TabularResult, response)
 }
 
+/// EnvChange subtype for Enhanced Routing
+pub const ENVCHANGE_ENHANCED_ROUTING: u8 = 21; // 0x15
+
+/// Build an Enhanced Routing EnvChange token (MS-TDS 2.2.7.9, type 21) that
+/// routes the client to `database` on `redirect_host:redirect_port`.
+pub fn build_enhanced_routing_envchange_token(
+    redirect_host: &str,
+    redirect_port: u16,
+    database: &str,
+) -> BytesMut {
+    let mut routing_data = BytesMut::new();
+    routing_data.put_u8(0x00); // Protocol: TCP
+    routing_data.put_u16_le(redirect_port);
+    for value in [redirect_host, database] {
+        let utf16: Vec<u16> = value.encode_utf16().collect();
+        routing_data.put_u16_le(utf16.len() as u16);
+        for ch in utf16 {
+            routing_data.put_u16_le(ch);
+        }
+    }
+
+    let mut token_data = BytesMut::new();
+    token_data.put_u8(TokenType::EnvChange as u8);
+    // Subtype (1) + RoutingDataValueLength (2) + RoutingDataValue + empty old value (2)
+    token_data.put_u16_le((1 + 2 + routing_data.len() + 2) as u16);
+    token_data.put_u8(ENVCHANGE_ENHANCED_ROUTING);
+    token_data.put_u16_le(routing_data.len() as u16);
+    token_data.extend_from_slice(&routing_data);
+    token_data.put_u16_le(0);
+
+    debug!(
+        "Built enhanced routing EnvChange token: redirect to {}:{} database {}",
+        redirect_host, redirect_port, database
+    );
+
+    token_data
+}
+
+/// Build a login response that routes the client with Enhanced Routing.
+///
+/// Like a real server it sends LOGINACK first. `ack` is the FEATUREEXTACK
+/// `IsEnabled` byte for feature `0x0F` (`None` omits it); servers may send
+/// that acknowledgement before or after the routing token.
+pub fn build_enhanced_routing_response(
+    redirect_host: &str,
+    redirect_port: u16,
+    database: &str,
+    ack: Option<u8>,
+    ack_before_routing: bool,
+) -> BytesMut {
+    let ack_token = ack.map(build_feature_ext_ack_enhanced_routing);
+    let mut response = build_login_ack();
+    if ack_before_routing && let Some(ref token) = ack_token {
+        response.extend_from_slice(token);
+    }
+    response.extend_from_slice(&build_enhanced_routing_envchange_token(
+        redirect_host,
+        redirect_port,
+        database,
+    ));
+    if !ack_before_routing && let Some(ref token) = ack_token {
+        response.extend_from_slice(token);
+    }
+    response.extend_from_slice(&build_done_token(0));
+
+    wrap_in_packet(PacketType::TabularResult, response)
+}
+
 /// Parse a SQL batch from packet data
 pub fn parse_sql_batch(data: &[u8]) -> Result<String, ProtocolError> {
     if data.is_empty() {
@@ -1353,6 +1457,75 @@ mod tests {
 
         // After header, should have EnvChange token (0xE3)
         assert_eq!(response[PACKET_HEADER_SIZE], TokenType::EnvChange as u8);
+    }
+
+    #[test]
+    fn test_enhanced_routing_envchange_token() {
+        let token = build_enhanced_routing_envchange_token("srv", 1433, "db");
+        let routing_data = [
+            0x00, // TCP
+            0x99, 0x05, // port 1433
+            0x03, 0x00, b's', 0, b'r', 0, b'v', 0, // AlternateServer
+            0x02, 0x00, b'd', 0, b'b', 0, // AlternateDatabase
+        ];
+        let mut expected = vec![TokenType::EnvChange as u8];
+        expected.extend_from_slice(&((1 + 2 + routing_data.len() + 2) as u16).to_le_bytes());
+        expected.push(ENVCHANGE_ENHANCED_ROUTING);
+        expected.extend_from_slice(&(routing_data.len() as u16).to_le_bytes());
+        expected.extend_from_slice(&routing_data);
+        expected.extend_from_slice(&[0, 0]); // empty old value
+        assert_eq!(token.as_ref(), expected.as_slice());
+    }
+
+    #[test]
+    fn test_enhanced_routing_response_places_the_acknowledgement() {
+        let ack = build_feature_ext_ack_enhanced_routing(1);
+        assert_eq!(ack.as_ref(), [0xAE, 0x0F, 1, 0, 0, 0, 1, 0xFF]);
+        let routing = build_enhanced_routing_envchange_token("srv", 1433, "db");
+        let position = |response: &BytesMut, needle: &[u8]| {
+            response
+                .windows(needle.len())
+                .position(|window| window == needle)
+        };
+
+        let after = build_enhanced_routing_response("srv", 1433, "db", Some(1), false);
+        assert!(position(&after, &routing) < position(&after, &ack));
+        let before = build_enhanced_routing_response("srv", 1433, "db", Some(1), true);
+        assert!(position(&before, &ack) < position(&before, &routing));
+        let without = build_enhanced_routing_response("srv", 1433, "db", None, false);
+        assert!(position(&without, &routing).is_some());
+        assert_eq!(position(&without, &ack), None);
+    }
+
+    #[test]
+    fn test_parse_login7_database_and_feature_ids() {
+        let database: Vec<u8> = "routed_db"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        let mut payload = BytesMut::zeroed(94);
+        payload[27] = 0x10; // OptionFlags3 (FeatureExt bit)
+        payload[56] = 94; // FeatureExt table entry -> DWORD at offset 94
+        payload[68..70].copy_from_slice(&98u16.to_le_bytes()); // ibDatabase
+        payload[70..72].copy_from_slice(&9u16.to_le_bytes()); // cchDatabase
+        payload.put_u32_le(98 + database.len() as u32); // feature data follows the database
+        payload.put_slice(&database);
+        payload.put_u8(FEATURE_EXT_ENHANCED_ROUTING);
+        payload.put_u32_le(0);
+        payload.put_u8(FEATURE_EXT_DATA_CLASSIFICATION);
+        payload.put_u32_le(1);
+        payload.put_u8(2);
+        payload.put_u8(FEATURE_EXT_TERMINATOR);
+
+        let parsed = parse_login7_auth(&payload);
+        assert_eq!(parsed.database.as_deref(), Some("routed_db"));
+        assert_eq!(
+            parsed.feature_ids,
+            [
+                FEATURE_EXT_ENHANCED_ROUTING,
+                FEATURE_EXT_DATA_CLASSIFICATION
+            ]
+        );
     }
 
     #[test]

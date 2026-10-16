@@ -26,6 +26,7 @@ use std::fmt::Debug;
 
 use super::features::always_encrypted::AlwaysEncryptedFeature;
 use super::features::data_classification::DataClassificationFeature;
+use super::features::enhanced_routing::EnhancedRoutingFeature;
 use super::features::fedauth::FedAuthFeature;
 use super::features::session_recovery::SessionRecoveryFeature;
 use super::features::useragent::UserAgentFeature;
@@ -44,6 +45,9 @@ pub(crate) struct RoutingInfo {
     pub protocol: u8,
     pub port: u16,
     pub server: String,
+    /// Database named by an Enhanced Routing ENVCHANGE (type 21); `None` for
+    /// plain routing (type 20), which keeps the login's own database.
+    pub database: Option<String>,
 }
 
 #[derive(Default, Debug, Clone)]
@@ -68,6 +72,7 @@ pub(crate) enum FeatureExtension {
     SqlDnsCaching,
     Json,
     Vector,
+    EnhancedRouting,
     UserAgent,
     Terminator,
     Unknown(u8),
@@ -86,6 +91,7 @@ impl FeatureExtension {
             FeatureExtension::SqlDnsCaching => 0x0B,
             FeatureExtension::Json => 0x0D,
             FeatureExtension::Vector => 0x0E,
+            FeatureExtension::EnhancedRouting => 0x0F,
             FeatureExtension::UserAgent => 0x10,
             FeatureExtension::Terminator => 0xFF,
             FeatureExtension::Unknown(value) => value,
@@ -106,6 +112,7 @@ impl From<u8> for FeatureExtension {
             0x0B => FeatureExtension::SqlDnsCaching,
             0x0D => FeatureExtension::Json,
             0x0E => FeatureExtension::Vector,
+            0x0F => FeatureExtension::EnhancedRouting,
             0x10 => FeatureExtension::UserAgent,
             0xFF => FeatureExtension::Terminator,
             _ => FeatureExtension::Unknown(value),
@@ -131,6 +138,12 @@ pub(crate) trait Feature: Send + Sync + Debug {
     /// feature negotiated one. Only DataClassification does.
     fn negotiated_data_classification_version(&self) -> Option<DataClassificationVersion> {
         None
+    }
+
+    /// Whether the server acknowledged Enhanced Routing with `IsEnabled = 1`.
+    /// Only EnhancedRouting does.
+    fn enhanced_routing_enabled(&self) -> bool {
+        false
     }
 
     #[allow(dead_code)]
@@ -179,6 +192,11 @@ impl FeaturesRequest {
         features.insert(FeatureExtension::Json, Box::new(JsonFeature::default()));
 
         features.insert(FeatureExtension::UserAgent, Box::new(user_agent_feature));
+        // msodbcsql always advertises Enhanced Routing (`TdsSend.cpp`, "always sent").
+        features.insert(
+            FeatureExtension::EnhancedRouting,
+            Box::new(EnhancedRoutingFeature::default()),
+        );
         if let Some(vector_feature) = Option::<VectorFeature>::from(vector_version) {
             features.insert(FeatureExtension::Vector, Box::new(vector_feature));
         }
@@ -273,6 +291,12 @@ impl FeaturesRequest {
             .filter(|f| f.is_requested())
             .map(|f| f.as_ref())
             .collect()
+    }
+
+    pub fn enhanced_routing_enabled(&self) -> bool {
+        self.features
+            .get(&FeatureExtension::EnhancedRouting)
+            .is_some_and(|f| f.enhanced_routing_enabled())
     }
 
     #[allow(dead_code)]
@@ -558,16 +582,14 @@ impl LoginResponseModel {
                 }
             },
             EnvChangeContainer::RoutingType(routing_change) => {
-                self.change_properties.routing_information = routing_change.new_value().clone();
-                let routing_info = routing_change.new_value().as_ref().ok_or_else(|| {
+                let routing_info = routing_change.new_value().clone().ok_or_else(|| {
                     crate::error::Error::ProtocolError(
                         "Routing env change did not include a redirection target".to_string(),
                     )
                 })?;
-                Err(crate::error::Error::Redirection {
-                    host: routing_info.server.clone(),
-                    port: routing_info.port,
-                })
+                // Acted on by `redirect_if_routed` once the whole response is read.
+                self.change_properties.routing_information = Some(routing_info);
+                Ok(())
             }
             _ => {
                 event!(
@@ -604,6 +626,30 @@ impl LoginResponseModel {
         }
 
         LoginResponseStatus::Error
+    }
+
+    /// Turns a routing ENVCHANGE captured during login into `Error::Redirection`.
+    ///
+    /// Deferred to the end of the login response because an Enhanced Routing
+    /// ENVCHANGE can precede the FEATUREEXTACK that enables it (msodbcsql
+    /// `netconn.cpp`). Without an acknowledgement of 1 the login fails, as in
+    /// msodbcsql; [MS-TDS] 2.2.7.11 would have the client ignore the token.
+    fn redirect_if_routed(&self) -> TdsResult<()> {
+        let Some(routing) = &self.change_properties.routing_information else {
+            return Ok(());
+        };
+        if routing.database.is_some() && !self.features.enhanced_routing_enabled() {
+            return Err(crate::error::Error::ProtocolError(
+                "Received an Enhanced Routing ENVCHANGE without an Enhanced Routing \
+                 feature acknowledgement"
+                    .to_string(),
+            ));
+        }
+        Err(crate::error::Error::Redirection {
+            host: routing.server.clone(),
+            port: routing.port,
+            database: routing.database.clone(),
+        })
     }
 }
 
@@ -714,8 +760,8 @@ impl LoginResponse {
                                 "Received {:?} during login response parsing.",
                                 token_type
                             );
-                            // If the redirection is received, then the error will be unwrapped and surfaced
-                            // to the caller.
+                            // A routing change is recorded here and surfaced as
+                            // `Error::Redirection` after the response is read.
                             response_model.capture_change_property(env_change_token)?;
                         }
                         Tokens::LoginAck(login_ack_token) => {
@@ -797,6 +843,7 @@ impl LoginResponse {
                 }
             }
         }
+        response_model.redirect_if_routed()?;
         Ok(response_model)
     }
 }
@@ -1441,6 +1488,7 @@ mod tests {
     use super::*;
     use crate::connection::session_recovery::SessionStateTable;
     use crate::core::Version;
+    use crate::error::Error;
     use crate::io::packet_writer::tests::MockNetworkWriter;
     use crate::message::features::jsonfeature::JsonFeature;
     use crate::message::features::vectorfeature::VectorFeature;
@@ -1467,6 +1515,7 @@ mod tests {
         assert_eq!(FeatureExtension::SqlDnsCaching.as_u8(), 0x0B);
         assert_eq!(FeatureExtension::Json.as_u8(), 0x0D);
         assert_eq!(FeatureExtension::Vector.as_u8(), 0x0E);
+        assert_eq!(FeatureExtension::EnhancedRouting.as_u8(), 0x0F);
         assert_eq!(FeatureExtension::Terminator.as_u8(), 0xFF);
         assert_eq!(FeatureExtension::Unknown(0xAB).as_u8(), 0xAB);
     }
@@ -1500,6 +1549,10 @@ mod tests {
         );
         assert_eq!(FeatureExtension::from(0x0D), FeatureExtension::Json);
         assert_eq!(FeatureExtension::from(0x0E), FeatureExtension::Vector);
+        assert_eq!(
+            FeatureExtension::from(0x0F),
+            FeatureExtension::EnhancedRouting
+        );
         assert_eq!(FeatureExtension::from(0xFF), FeatureExtension::Terminator);
     }
 
@@ -1514,7 +1567,7 @@ mod tests {
     #[test]
     fn feature_extension_roundtrip() {
         for val in [
-            0x01u8, 0x02, 0x04, 0x05, 0x08, 0x09, 0x0A, 0x0B, 0x0D, 0x0E, 0xFF, 0x42,
+            0x01u8, 0x02, 0x04, 0x05, 0x08, 0x09, 0x0A, 0x0B, 0x0D, 0x0E, 0x0F, 0xFF, 0x42,
         ] {
             assert_eq!(FeatureExtension::from(val).as_u8(), val);
         }
@@ -2137,17 +2190,103 @@ mod tests {
     }
 
     #[test]
-    fn capture_change_property_routing_returns_redirection() {
+    fn capture_change_property_routing_is_recorded_not_raised() {
         let mut model = make_response_model();
         let routing = RoutingInfo {
             protocol: 0,
             server: "redirect.sql.net".to_string(),
             port: 11000,
+            database: None,
         };
-        let token = env_token(EnvChangeTokenSubType::Routing, (None, Some(routing)).into());
+        let token = env_token(
+            EnvChangeTokenSubType::Routing,
+            (None, Some(routing.clone())).into(),
+        );
+        model.capture_change_property(token).unwrap();
+        assert_eq!(model.change_properties.routing_information, Some(routing));
+    }
+
+    #[test]
+    fn capture_change_property_routing_without_target_errors() {
+        let mut model = make_response_model();
+        let token = env_token(
+            EnvChangeTokenSubType::Routing,
+            (None::<RoutingInfo>, None::<RoutingInfo>).into(),
+        );
         let err = model.capture_change_property(token).unwrap_err();
-        assert!(err.to_string().contains("redirect.sql.net"));
-        assert!(model.change_properties.routing_information.is_some());
+        assert!(err.to_string().contains("redirection target"));
+    }
+
+    // ── LoginResponseModel::redirect_if_routed ──
+
+    fn routed_model(database: Option<&str>, acknowledgement: Option<u8>) -> LoginResponseModel {
+        let mut model =
+            LoginResponseModel::new(FeaturesRequest::from((&ClientContext::default(), false)));
+        model.change_properties.routing_information = Some(RoutingInfo {
+            protocol: 0,
+            port: 11000,
+            server: "replica.sql.net".to_string(),
+            database: database.map(str::to_string),
+        });
+        if let Some(value) = acknowledgement {
+            model
+                .features
+                .set_acknowledged(FeatureExtension::EnhancedRouting, &[value])
+                .unwrap();
+        }
+        model
+    }
+
+    #[test]
+    fn features_request_always_requests_enhanced_routing() {
+        let request = FeaturesRequest::from((&ClientContext::default(), false));
+        let feature = request
+            .features
+            .get(&FeatureExtension::EnhancedRouting)
+            .expect("Enhanced Routing is always advertised");
+        assert!(feature.is_requested());
+        assert!(!request.enhanced_routing_enabled());
+    }
+
+    #[test]
+    fn no_routing_does_not_redirect() {
+        let model =
+            LoginResponseModel::new(FeaturesRequest::from((&ClientContext::default(), false)));
+        assert!(model.redirect_if_routed().is_ok());
+    }
+
+    #[test]
+    fn plain_routing_redirects_without_a_database() {
+        let error = routed_model(None, None).redirect_if_routed().unwrap_err();
+        assert!(matches!(
+            error,
+            Error::Redirection { ref host, port: 11000, database: None } if host == "replica.sql.net"
+        ));
+    }
+
+    #[test]
+    fn enhanced_routing_redirects_to_its_database_once_acknowledged() {
+        let error = routed_model(Some("sales"), Some(1))
+            .redirect_if_routed()
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::Redirection { ref host, port: 11000, database: Some(ref database) }
+                if host == "replica.sql.net" && database == "sales"
+        ));
+    }
+
+    #[test]
+    fn enhanced_routing_without_acknowledgement_fails_the_login() {
+        for acknowledgement in [None, Some(0)] {
+            let error = routed_model(Some("sales"), acknowledgement)
+                .redirect_if_routed()
+                .unwrap_err();
+            assert!(
+                matches!(error, Error::ProtocolError(ref message) if message.contains("Enhanced Routing")),
+                "acknowledgement {acknowledgement:?} should fail the login, got {error:?}"
+            );
+        }
     }
 
     #[test]
@@ -2181,6 +2320,7 @@ mod tests {
             protocol: 0,
             server: "s".to_string(),
             port: 1433,
+            database: None,
         });
         assert_eq!(model.get_status(), LoginResponseStatus::Rerouting);
     }
@@ -2263,6 +2403,7 @@ mod tests {
             protocol: 0,
             server: "s".to_string(),
             port: 1433,
+            database: None,
         });
         model.success_token = Some(LoginAckToken {
             interface_type: SqlInterfaceType::TSql,
