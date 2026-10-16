@@ -40,7 +40,7 @@ compactly:
                    { "ordinal": 1, "name": "price", "driverType": "decimal", "precision": 10, "scale": 2, "nullable": true } ],
       "rows": [ ["1", "9.99"], ["2", null] ],
       "rowsAffected": 2 },
-    { "type": "message", "number": 0, "severity": 0, "state": 1, "server": "db01", "line": 2, "sqlState": "01000", "text": "done" }
+    { "type": "message", "text": "done" }
   ]
 }
 ```
@@ -71,13 +71,14 @@ compactly:
   gets its own entry instead, `{ "type": "rowsAffected", "count": 3 }`.
 - **`FOR JSON` / `FOR XML`** output is ordinary result-set rows: one string
   per row the server returned, not parsed, combined or embedded.
-- **Messages and errors** carry what the console shows for them, in its order:
-  `number` (Msg), `severity` (Level), `state`, and when known `server`,
-  `procedure`, `line` and `source` (the driver, e.g. `Microsoft ODBC Driver 18 for
-  SQL Server`, or `Sqlcmd`, when the server did not send it). `sqlState` is the
-  ODBC SQLSTATE (`28000` for a refused login, `08001` for a connection failure,
-  `HYT00` for a timeout), the stable field to classify errors by. `text` is the
-  message itself.
+- **Messages and errors** carry what the console shows for them, in its order,
+  and nothing else. A message (`PRINT`, or severity 10 or less) is
+  `{ "type": "message", "text": ... }`. An error SQL Server sent has the
+  console's `Msg ..., Level ..., State ..., Server ..., Procedure ..., Line ...`
+  header as `number`, `severity`, `state`, `server`, `procedure` and `line`, then
+  its `text`. An error the driver or sqlcmd raised, printed by the console as
+  `Sqlcmd: Error: <source> : <text>`, has `source` (e.g. `Microsoft ODBC Driver
+  18 for SQL Server`, or `Sqlcmd`) and `text`.
 
 The whole document is held in memory until sqlcmd exits, because it begins
 with details only known then (the exit code). Peak memory is a few times the
