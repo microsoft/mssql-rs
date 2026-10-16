@@ -103,17 +103,16 @@ each includes the ones before it, and the deepest is the default:
 | `connectionAttempt` | the client also logs in, with its pre-login, TLS and login phases |
 | `sessionValidation` | a minimal query on the new session: the engine edition and the server's UTC clock |
 
-This build runs the checks through `networkReachability`: at a deeper depth
-the connection attempt and session validation are reported as skipped,
-`notCheckedByThisBuild`.
-
 Checks run best effort: a failed check skips only what needs its result, and
 each skipped check names what blocked it. Each reports a coverage state
 (`passed`, `diagnosed`, `classified`, `inconclusive`, `skipped`,
 `notApplicable`), its duration on a monotonic clock, its time limit (`-l`, or sqlcmd's default login
 timeout of 8 s; 2 s for SQL Server Browser), and what it found: the addresses
-resolved, and the operating system's result for every TCP connect (`refused`,
-`timedOut`, `hostUnreachable`, ...). The report adds:
+resolved, the operating system's result for every TCP connect (`refused`,
+`timedOut`, `hostUnreachable`, ...), the connection's phases, and with `-E` the
+SPN the client requests and, off Windows, whether a Kerberos ticket cache
+exists. Session validation reports how far the server's clock is from the
+client's. The report adds:
 
 - `executionStatus` (`completed`, `partial`, `canceled`, `failed`,
   `invalidInvocation`) and `diagnosticOutcome` (`passed`, `issueDetected`,
@@ -126,20 +125,24 @@ resolved, and the operating system's result for every TCP connect (`refused`,
   skipped as `canceled`;
 - findings marked `confirmed`, `suspected` or `informational`, and no
   remediation advice;
-- the ordered error chain with its identifiers (operating-system error,
-  symbolic code), noting where a classification relied on message text;
+- the ordered error chain with its identifiers (SQL Server error, state and
+  class, operating-system error, symbolic code), noting where a classification
+  relied on message text;
 - the specialist domain for a support handoff (`connectivity.network`,
-  `connectivity.nameResolution`, ..., or `undetermined` with candidates),
-  never presented as a root cause; unless a diagnosed check named it, the
-  text and `specialistDomain.note` say it is the area for a support handoff,
-  not a confirmed cause;
-- limitations;
+  `security.tlsCertificate`, `security.authentication.sql`, ..., or
+  `undetermined` with candidates), never presented as a root cause; unless a
+  diagnosed check named it, the text and `specialistDomain.note` say it is the
+  area for a support handoff, not a confirmed cause;
+- limitations, such as the connection client used;
 - the client's operating system and version;
+- `tracingGuide`, a stable link to the driver-tracing documentation, when the
+  connection attempt or session validation ends where the client's evidence
+  does not reach;
 - `coverageMatrixVersion`, the version of
   [the diagnostic coverage matrix](docs/diagnose-coverage.md) the checks follow.
 
 Output is share-safe by default: server, instance, database, host (the `-F`
-certificate name included), address and user identifiers are replaced with labels (`host-1`, `address-2`) that are
+certificate name included), address, SPN and user identifiers are replaced with labels (`host-1`, `address-2`) that are
 stable within one run only, in the text and JSON report alike, and error text
 is flagged for review before sharing. `--local-detail` shows the values and
 marks the output as not share-safe. The password is never part of the report.
@@ -148,16 +151,17 @@ The checks observe the client's real connection: sqlcmd makes no network call
 of its own. `mssql-tds` makes one connection attempt, as a normal run does,
 through its diagnostic entry point (`TdsConnectionProvider::diagnose_client`):
 it resolves the name, asks SQL Server Browser (always, past its instance
-cache), follows its protocol order and connects. The depth sets where it
-stops: after resolution (`endpointResolution`), or once the transport is
-open, before pre-login (`networkReachability` and deeper, in this build).
-Over TCP, once an address accepts, the client also connects to the addresses
-after it (up to 64), at the same time and each within the time limit,
-closing each connection at once, so every address is reported. The
+cache), follows its protocol order, connects, and logs in. The depth sets
+where it stops: after resolution (`endpointResolution`), or once the
+transport is open, before pre-login (`networkReachability`). Over TCP, once an
+address accepts, the client also connects to the addresses after it (up to
+64), at the same time and each within the time limit, closing each
+connection at once, so every address is reported while the login goes on
+over the first. The
 attempt's connect-stage spans (target `mssql_tds::connect`, see
 `mssql_tds::connection::connect_stage`), recorded by a `tracing` layer that
 enables nothing else, are the evidence: each stage (`dns`, `instance_lookup`,
-`tcp`, `pipe`) records what it found, and whether
+`tcp`, `pipe`, `prelogin`, `tls`, `login`) records what it found, and whether
 it succeeded or failed with what; a stage the time limit cut short was
 abandoned, which is not a failure.
 

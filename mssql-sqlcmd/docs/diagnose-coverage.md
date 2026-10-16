@@ -29,13 +29,18 @@ text), `inconclusive`, `skipped` (with what blocked it), `notApplicable`.
 | `PHASE-DNS` | `nameResolution` (`endpointResolution`) | the client's `dns` stage (or, for a named instance, the addresses its SQL Server Browser lookup resolved): on Windows, the WinSock result code (11001 not found, 11002 temporary failure, 11004 no address); elsewhere Rust does not expose the resolver's code (`EAI_*`), so the result is classified from its message and marked `fromMessageText`; every IPv4/IPv6 address, with its IPv6 scope. `notApplicable` when the client used a pipe or shared memory | passed, diagnosed, inconclusive, notApplicable | all | P1, shipped |
 | `PHASE-NAMED-INSTANCE` | `instanceResolution` (`endpointResolution`) | the client's `instance_lookup` stage: the SQL Server Browser answer (port, pipe, no usable endpoint: `noTcpPort`) or its failure code (`noAnswer`, `receiveFailed`, ...) within the 2 s Browser limit; never a guessed port. `admin:` uses port 1434; `admin:` with a named instance is inconclusive (`dacLookupUnsupported`), because its DAC port needs the Browser's DAC request, which the client does not make. `np:host\instance` reports the pipe the Browser listed or, when it listed none, the instance's standard pipe the client opened (`pipeSource`) | passed, diagnosed, inconclusive, notApplicable | all | P1, shipped |
 | `PHASE-TCP` | `tcpConnect` (`networkReachability`) | the client's `tcp` stages: the operating system's connect result per address (refused, timed out, host/network unreachable, reset) and its error code, the addresses after the one used included; addresses the time limit left untried are `notAttempted`; a local refusal (no sockets, no local address, permission) makes the run `partial`. `notApplicable` when the client used a pipe or shared memory | passed, diagnosed, inconclusive, notApplicable | all | P1, shipped |
+| `PHASE-TLS` | `connectionAttempt` (`connectionAttempt`) | the TLS phase of `mssql-tds`'s connect-stage spans; the typed TLS error, else its text (marked) | passed, diagnosed, classified, inconclusive | all | P1, shipped. Certificate subject/SAN and validity details are not exposed by the client yet. |
+| `PHASE-KERBEROS` | `connectionAttempt` (`connectionAttempt`) | the SPN the client requested, as its `login` stage records it; off Windows, whether a file ticket cache exists (`KRB5CCNAME`, `/tmp/krb5cc_<uid>`); the server/client clock offset from session validation | passed, diagnosed, classified, inconclusive | Windows (SSPI), Linux and macOS (GSSAPI) | P1, partial: encryption types, KCM/KEYRING caches and SPN registration are not inspected. Delegation and gMSA are P2. |
+| `PHASE-SQL-AUTH` | `connectionAttempt` (`connectionAttempt`) | SQL Server error number, state and class (18456, 18452, 18470, 18486-18488) | passed, diagnosed | all | P1, shipped |
 | `PHASE-ENTRA-AUTH` | — | — | — | — | P1, not yet: `-G` is refused by `sqlcmd diagnose`. |
+| `PHASE-DATABASE` | `connectionAttempt` (`connectionAttempt`) | SQL Server errors 4060 and 4064 after a good login | diagnosed | all | P1, shipped |
+| `PHASE-CONNECTION-DEADLINE` | every timed check | each check's `deadlineMs` and `durationMs`; the connection attempt's failed phase | inconclusive | all | P1, shipped |
+| `PHASE-SESSION-TRANSPORT` | `sessionValidation` (`sessionValidation`) | the minimal query's result or SQL Server error, within the time limit | passed, diagnosed, inconclusive | all | P1, shipped. Transport-loss retry counts are not modelled. |
 | `PHASE-COMMAND-DEADLINE` | — | — | — | — | Not part of `sqlcmd diagnose`: it covers user queries, which diagnose does not run. |
 
-Phases past the transport (TLS, Kerberos and SQL authentication, the database, the
-connection deadline and the session) are not checked by this build: at a deeper
-depth diagnose reports the connection attempt and session validation as skipped,
-`notCheckedByThisBuild`.
+When the connection attempt or session validation ends `inconclusive` or
+`classified`, the report gives `tracingGuide`, the stable link to the
+driver-tracing documentation, since the client's own evidence goes no further.
 
 Changes to this matrix bump its version: the minor version for added rows or
 signals, the major version when a row's meaning or states change.
