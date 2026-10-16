@@ -2287,6 +2287,72 @@ def test_crate_stamp_rejects_plain_multiline_metadata(stamp_manifests, quote, wh
     assert_stamp_rejected(stamp_manifests, WhatIf=what_if)
 
 
+@pytest.mark.parametrize("table", [
+    "dependencies", "dev-dependencies", "build-dependencies",
+    "target.'cfg(windows)'.dependencies",
+    "target . 'cfg(windows)' . dev-dependencies",
+    """target.'cfg(target_os = "]")'.build-dependencies""",
+])
+@pytest.mark.parametrize("subtable", [False, True])
+@pytest.mark.parametrize("quote", ['"', "'"])
+@pytest.mark.parametrize("what_if", [False, True])
+def test_crate_stamp_rejects_package_alias(stamp_manifests, table, subtable, quote, what_if):
+    path = stamp_manifests / "mssql-mock-tds" / "Cargo.toml"
+    fields = f'package = {quote}mssql-tds{quote}, path = "../mssql-tds", version = "0.3.0"'
+    content = path.read_text()
+    if subtable:
+        content += f"\n[{table}.tds-alias]\n" + fields.replace(", ", "\n") + "\n"
+    elif table == "dependencies":
+        content = content.replace("[dependencies]", f"[dependencies]\ntds-alias = {{ {fields} }}")
+    else:
+        content += f"\n[{table}]\ntds-alias = {{ {fields} }}\n"
+    tomllib.loads(content)
+    path.write_bytes(content.encode())
+    assert_stamp_rejected(stamp_manifests, WhatIf=what_if)
+
+
+@pytest.mark.parametrize("field", [
+    '"package" = "mssql-tds"',
+    '"pack\\u0061ge" = "mssql-tds"',
+    'package = "mssql\\u002dtds"',
+])
+@pytest.mark.parametrize("subtable", [False, True])
+@pytest.mark.parametrize("what_if", [False, True])
+def test_crate_stamp_rejects_ambiguous_alias_identity(stamp_manifests, field, subtable, what_if):
+    path = stamp_manifests / "mssql-mock-tds" / "Cargo.toml"
+    content = path.read_text()
+    if subtable:
+        content += f'\n[dev-dependencies.tds-alias]\n{field}\nversion = "0.3.0"\n'
+    else:
+        content += f'\n[dev-dependencies]\ntds-alias = {{ {field}, version = "0.3.0" }}\n'
+    tomllib.loads(content)
+    path.write_bytes(content.encode())
+    assert_stamp_rejected(stamp_manifests, WhatIf=what_if)
+
+
+@pytest.mark.parametrize("subtable", [False, True])
+@pytest.mark.parametrize("what_if", [False, True])
+def test_crate_stamp_preserves_unrelated_alias_and_package_text(stamp_manifests, subtable, what_if):
+    path = stamp_manifests / "mssql-mock-tds" / "Cargo.toml"
+    content = path.read_text()
+    if subtable:
+        content += '\n[dev-dependencies.uuid_alias]\npackage = "uuid"\nversion = "1.19.0"\n'
+        content += """path = '../package = "mssql-tds"'\n"""
+    else:
+        content += """\n[dev-dependencies]\nuuid_alias = { package = "uuid", version = "1.19.0", path = '../package = "mssql-tds"' }\n"""
+    content += (
+        '# package = "mssql-tds"\n'
+        '\n[package.metadata]\npackage = "mssql-tds"\n'
+        """example = 'package = "mssql-tds"'\n"""
+    )
+    tomllib.loads(content)
+    path.write_bytes(content.encode())
+    result = run_crate_stamp(stamp_manifests, WhatIf=what_if)
+    assert result.returncode == 0, result.stderr
+    expected = content if what_if else content.replace("0.3.0", "0.3.0-dev.20261015.123")
+    assert path.read_bytes() == expected.encode()
+
+
 def test_crate_stamp_preserves_crlf_and_indented_declarations(stamp_manifests):
     for path in stamp_manifests.rglob("Cargo.toml"):
         path.write_bytes(path.read_text().replace("version =", "\tversion =").replace("\n", "\r\n").encode())

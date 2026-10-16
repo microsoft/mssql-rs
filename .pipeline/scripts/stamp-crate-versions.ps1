@@ -154,6 +154,27 @@ function Set-MssqlTdsDependencyVersion {
             throw "Target parent tables must use explicit dependency table headers in $Path"
         }
     }
+    $dependencyBodies = [regex]::Matches($Content, "(?ms)^[ \t]*\[[ \t]*(?:$targetPrefix)?(?:dependencies|dev-dependencies|build-dependencies)(?:[ \t]*\.[ \t]*[A-Za-z0-9_-]+)*[ \t]*\][ \t]*(?:#[^\r\n]*)?(?:\r?\n|\z)(?<body>.*?)(?=^[ \t]*\[|\z)")
+    foreach ($dependencyBody in $dependencyBodies) {
+        # Consume strings and comments whole: package-like text inside a path or
+        # example must not be interpreted as the identity of a renamed crate.
+        $tokens = [regex]::Matches($dependencyBody.Groups['body'].Value, "#[^\r\n]*|(?<quotedKey>$quotedString)(?=[ \t]*[=.])|(?<package>package)[ \t]*=[ \t]*(?<name>$quotedString)|$quotedString|[A-Za-z0-9_-]+")
+        foreach ($token in $tokens) {
+            if ($token.Groups['quotedKey'].Success) {
+                throw "Quoted dependency field keys are unsupported in $Path"
+            }
+            if ($token.Groups['package'].Success) {
+                $name = $token.Groups['name'].Value
+                $name = $name.Substring(1, $name.Length - 2)
+                if ($name.Contains('\')) {
+                    throw "Escaped dependency package names are unsupported in $Path"
+                }
+                if ($name -ceq 'mssql-tds') {
+                    throw "Renamed mssql-tds dependencies are unsupported in $Path"
+                }
+            }
+        }
+    }
     $sections = [regex]::Matches($Content, '(?ms)^[ \t]*\[[ \t]*dependencies[ \t]*\][ \t]*(?:#[^\r\n]*)?(?:\r?\n|\z).*?(?=^[ \t]*\[|\z)')
     $dependencySections = [regex]::Matches($Content, "(?ms)^[ \t]*\[[ \t]*(?:$targetPrefix)?(?:dependencies|dev-dependencies|build-dependencies)[ \t]*\][ \t]*(?:#[^\r\n]*)?(?:\r?\n|\z).*?(?=^[ \t]*\[|\z)")
     $declarationCount = 0

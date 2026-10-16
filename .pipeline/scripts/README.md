@@ -84,6 +84,11 @@ are inline feature arrays and comments on table headers. Dependency declarations
 are counted only in dependency tables, not in features or metadata. Inline
 dependency fields are separated outside quoted strings and arrays, so a
 version-like substring inside a path is never treated as the version field.
+Renamed dependencies whose `package` is `mssql-tds` are rejected in inline and
+table forms, including dev/build and target-specific dependencies, rather than
+leaving an alias on an incompatible source requirement. Other renamed packages
+remain supported. Dependency field keys must be bare and dependency `package`
+names must be unescaped literals so alternate spellings cannot hide an alias.
 
 All selected source versions and planned replacements are validated before
 printing versions, emitting pipeline variables or writing any manifest. A
