@@ -2353,6 +2353,24 @@ def test_crate_stamp_preserves_unrelated_alias_and_package_text(stamp_manifests,
     assert path.read_bytes() == expected.encode()
 
 
+@pytest.mark.parametrize("package_field", [
+    'package = "uuid"', "package = 'uuid'", 'package = "mssql-tds"',
+    'package = "mssql\\u002dtds"', '"package" = "uuid"',
+    '"pack\\u0061ge" = "uuid"',
+])
+@pytest.mark.parametrize("what_if", [False, True])
+def test_crate_stamp_rejects_package_override_on_direct_key(stamp_manifests, package_field, what_if):
+    path = stamp_manifests / "mssql-mock-tds" / "Cargo.toml"
+    content = path.read_text().replace(
+        'mssql-tds = { path = "../mssql-tds"',
+        f'mssql-tds = {{ {package_field}, path = "../uuid"',
+        1,
+    )
+    tomllib.loads(content)
+    path.write_bytes(content.encode())
+    assert_stamp_rejected(stamp_manifests, WhatIf=what_if)
+
+
 def test_crate_stamp_preserves_crlf_and_indented_declarations(stamp_manifests):
     for path in stamp_manifests.rglob("Cargo.toml"):
         path.write_bytes(path.read_text().replace("version =", "\tversion =").replace("\n", "\r\n").encode())

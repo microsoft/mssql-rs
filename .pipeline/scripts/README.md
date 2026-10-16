@@ -89,6 +89,8 @@ table forms, including dev/build and target-specific dependencies, rather than
 leaving an alias on an incompatible source requirement. Other renamed packages
 remain supported. Dependency field keys must be bare and dependency `package`
 names must be unescaped literals so alternate spellings cannot hide an alias.
+The reserved `mssql-tds` dependency key must not contain a `package` field: it
+must identify `mssql-tds` directly, never rename another package to that key.
 
 All selected source versions and planned replacements are validated before
 printing versions, emitting pipeline variables or writing any manifest. A

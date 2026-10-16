@@ -229,6 +229,9 @@ function Set-MssqlTdsDependencyVersion {
         if (-not $field.Success -or -not $keys.Add($field.Groups['key'].Value)) {
             throw "Expected unique bare inline dependency keys in $Path"
         }
+        if ($field.Groups['key'].Value -ceq 'package') {
+            throw "The mssql-tds dependency key must not override its package in $Path"
+        }
         if ($field.Groups['key'].Value -ceq 'version') {
             $value = $field.Groups['value']
             if ($value.Value -cnotmatch '\A"[^"]+"\z') {
