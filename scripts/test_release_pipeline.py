@@ -2070,6 +2070,68 @@ def test_crate_stamp_preserves_target_selectors(stamp_manifests, selector):
     assert path.read_bytes() == content.replace("0.3.0", "0.3.0-dev.20261015.123").encode()
 
 
+@pytest.mark.parametrize("key", ['"package"', "'package'", '"pack\\u0061ge"'])
+@pytest.mark.parametrize("what_if", [False, True])
+def test_crate_stamp_rejects_quoted_root_package(stamp_manifests, key, what_if):
+    path = stamp_manifests / "mssql-mock-tds" / "Cargo.toml"
+    path.write_bytes(f'{key}.version = "0.4.0"\n'.encode() + path.read_bytes())
+    assert_stamp_rejected(stamp_manifests, WhatIf=what_if)
+
+
+@pytest.mark.parametrize("key", [
+    "dev-dependencies.mssql-tds",
+    '"dev-dependencies".mssql-tds',
+    '"dev\\u002ddependencies"."mssql\\u002dtds"',
+    "build-dependencies.mssql-tds",
+    'dependencies."mssql\\u002dtds"',
+])
+@pytest.mark.parametrize("context", ["root", "target"])
+@pytest.mark.parametrize("what_if", [False, True])
+def test_crate_stamp_rejects_dotted_dependency_declarations(stamp_manifests, key, context, what_if):
+    path = stamp_manifests / "mssql-mock-tds" / "Cargo.toml"
+    declaration = f'{key} = {{ path = "../mssql-tds", version = "0.3.0" }}\n'
+    content = path.read_text()
+    content = declaration + content if context == "root" else content + "\n[target.'cfg(windows)']\n" + declaration
+    path.write_bytes(content.encode())
+    assert_stamp_rejected(stamp_manifests, WhatIf=what_if)
+
+
+@pytest.mark.parametrize("context", ["root", "target"])
+@pytest.mark.parametrize("what_if", [False, True])
+def test_crate_stamp_rejects_dotted_target_declarations(stamp_manifests, context, what_if):
+    path = stamp_manifests / "mssql-mock-tds" / "Cargo.toml"
+    declaration = '\'cfg(windows)\'.dev-dependencies.mssql-tds = { path = "../mssql-tds", version = "0.3.0" }\n'
+    content = path.read_text()
+    content = "target." + declaration + content if context == "root" else content + "\n[target]\n" + declaration
+    tomllib.loads(content)
+    path.write_bytes(content.encode())
+    assert_stamp_rejected(stamp_manifests, WhatIf=what_if)
+
+
+def test_crate_stamp_preserves_dependency_named_metadata(stamp_manifests):
+    path = stamp_manifests / "mssql-mock-tds" / "Cargo.toml"
+    content = path.read_text() + '\n[package.metadata]\n"package".version = "example"\ndev-dependencies.mssql-tds = "example"\n'
+    tomllib.loads(content)
+    path.write_bytes(content.encode())
+    result = run_crate_stamp(stamp_manifests)
+    assert result.returncode == 0, result.stderr
+    assert path.read_bytes() == content.replace("0.3.0", "0.3.0-dev.20261015.123").encode()
+
+
+def test_crate_stamp_preserves_empty_target_parents(stamp_manifests):
+    path = stamp_manifests / "mssql-mock-tds" / "Cargo.toml"
+    content = (
+        'cargo-features = []\n' + path.read_text() +
+        "\n[target]\n# Dependency tables follow.\n[target.'cfg(windows)']\n\n"
+        "[target.'cfg(windows)'.dev-dependencies]\nuuid = \"1.19.0\"\n"
+    )
+    tomllib.loads(content)
+    path.write_bytes(content.encode())
+    result = run_crate_stamp(stamp_manifests)
+    assert result.returncode == 0, result.stderr
+    assert path.read_bytes() == content.replace("0.3.0", "0.3.0-dev.20261015.123").encode()
+
+
 def test_crate_stamp_preserves_crlf_and_indented_declarations(stamp_manifests):
     for path in stamp_manifests.rglob("Cargo.toml"):
         path.write_bytes(path.read_text().replace("version =", "\tversion =").replace("\n", "\r\n").encode())

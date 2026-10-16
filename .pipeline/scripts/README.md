@@ -61,6 +61,11 @@ unsupported. Target table kinds must be bare (for example
 `[target.'cfg(windows)'.dev-dependencies]`, not a quoted `dev-dependencies`
 segment); the target selector itself may still be quoted. This restriction also
 applies to dependency subtables and escaped quoted table-kind spellings.
+Root keys must be bare, and package/dependency/target declarations must use
+explicit table headers rather than root dotted or inline assignments.
+Target-parent tables (`[target]` or `[target.'cfg(...)']`) may contain only comments
+and whitespace; put dependency declarations under their explicit dependency
+table headers. These checks do not apply to similarly named metadata keys.
 Triple-quote text inside ordinary strings or comments is preserved;
 only actual multiline-string delimiters are rejected.
 Multiline arrays in package fields or unrelated dependencies are supported, as

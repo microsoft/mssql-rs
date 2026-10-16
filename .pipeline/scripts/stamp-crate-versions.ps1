@@ -70,10 +70,13 @@ function Get-PackageVersionMatch {
     $sections = [regex]::Matches($Content, '(?ms)^[ \t]*\[[ \t]*package[ \t]*\][ \t]*(?:#[^\r\n]*)?(?:\r?\n|\z).*?(?=^[ \t]*\[|\z)')
     $firstTable = [regex]::Match($Content, '(?m)^[ \t]*\[')
     $rootContent = if ($firstTable.Success) { $Content.Substring(0, $firstTable.Index) } else { $Content }
+    if (-not [string]::IsNullOrWhiteSpace($rootContent)) {
+        Assert-SupportedSectionStrings -Content $rootContent -Path $Path
+    }
     # Quoted/dotted package keys and multiline strings need a TOML parser; do
     # not let them introduce a second declaration that a line matcher misses.
     if ($sections.Count -ne 1 -or
-        $rootContent -match '(?m)^[ \t]*package[ \t]*[.=]' -or
+        $rootContent -match '(?m)^[ \t]*(?:package|dependencies|dev-dependencies|build-dependencies|target)[ \t]*[.=]' -or
         $Content -match '(?m)^[ \t]*(?:\[\[?[ \t]*["'']|\[\[[ \t]*package\b|\[[ \t]*package[ \t]*\.[ \t]*(?:version\b|["'']))') {
         throw "Expected one bare [package] table in $Path"
     }
@@ -119,6 +122,12 @@ function Set-MssqlTdsDependencyVersion {
     # bare so escaped spellings cannot hide a dependency table or subtable.
     if ($Content -match '(?m)^[ \t]*\[[ \t]*target[ \t]*\.[ \t]*(?:"(?:\\.|[^"\\\r\n])*"|''[^''\r\n]*''|[A-Za-z0-9_-]+)[ \t]*\.[ \t]*["'']') {
         throw "Quoted target table kinds are unsupported in $Path"
+    }
+    $targetParents = [regex]::Matches($Content, '(?ms)^[ \t]*\[[ \t]*target(?:[ \t]*\.[ \t]*(?:"(?:\\.|[^"\\\r\n])*"|''[^''\r\n]*''|[A-Za-z0-9_-]+))?[ \t]*\][ \t]*(?:#[^\r\n]*)?(?:\r?\n|\z)(?<body>.*?)(?=^[ \t]*\[|\z)')
+    foreach ($targetParent in $targetParents) {
+        if ($targetParent.Groups['body'].Value -match '(?m)^[ \t]*[^# \t\r\n]') {
+            throw "Target parent tables must use explicit dependency table headers in $Path"
+        }
     }
     $sections = [regex]::Matches($Content, '(?ms)^[ \t]*\[[ \t]*dependencies[ \t]*\][ \t]*(?:#[^\r\n]*)?(?:\r?\n|\z).*?(?=^[ \t]*\[|\z)')
     $dependencySections = [regex]::Matches($Content, '(?ms)^[ \t]*\[[ \t]*(?:target[ \t]*\.[^\]\r\n]+?\.[ \t]*)?(?:dependencies|dev-dependencies|build-dependencies)[ \t]*\][ \t]*(?:#[^\r\n]*)?(?:\r?\n|\z).*?(?=^[ \t]*\[|\z)')
