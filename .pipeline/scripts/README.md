@@ -24,6 +24,89 @@ See `.pipeline/docs/arm-sql-host-design.md` for the full design.
 
 ## Scripts
 
+### stamp-crate-versions.ps1
+
+Stamps the selected crates (by default `mssql-tds` and `mssql-mock-tds`) from the
+first selected crate's source version and aligns the mock crate's inline
+`mssql-tds` dependency. Official builds retain the source SemVer, including
+prerelease/build metadata. Non-official scheduled builds append
+`-nightly.YYYYMMDD`; other non-official builds append `-dev.YYYYMMDD.BuildId`.
+Existing prerelease suffixes are retained. Non-official source build metadata
+is rejected because appending after `+` would not create a prerelease.
+
+```powershell
+.\.pipeline\scripts\stamp-crate-versions.ps1 -BuildReason Manual -BuildId 123 -WhatIf
+```
+
+`BuildId` must be a positive ASCII decimal integer without leading zeroes, even
+on official/scheduled builds. `BuildReason` is an ASCII alphanumeric identifier
+starting with a letter (for example `Manual`, `PullRequest`, or `Schedule`).
+`IsOfficial` accepts only `True`/`False` (case insensitive). Crate directory names
+must be unique bare names containing ASCII letters, digits, `_` or `-`, starting
+with a letter or digit; paths/traversal are not supported. `RepositoryRoot` must
+not contain control characters or Azure logging commands.
+
+The script deliberately supports a restricted manifest layout, not arbitrary
+TOML: one bare `[package]` table with one bare `version` key containing a
+double-quoted, single-line SemVer. Core components must fit Cargo's unsigned
+64-bit representation. Duplicate declarations, inherited versions, quoted
+package keys/table names, multiline package strings and already stamped source
+versions fail explicitly. The mock crate requires one single-line inline
+`mssql-tds` entry in `[dependencies]`, with bare keys, no escaped values and one
+literal SemVer `version`; quoted keys and multiline strings in any of the mock
+crate's dependency sections (including dev/build and target-specific sections)
+are unsupported. Ordinary indentation, comments and LF/CRLF are preserved.
+Quoted dependency-name segments in dependency subtable headers are also
+unsupported. Target table kinds must be bare (for example
+`[target.'cfg(windows)'.dev-dependencies]`, not a quoted `dev-dependencies`
+segment); the target selector itself may still be quoted. This restriction also
+applies to dependency subtables and escaped quoted table-kind spellings.
+Root keys must be bare, and package/dependency/target declarations must use
+explicit table headers rather than root dotted or inline assignments.
+Target-parent tables (`[target]` or `[target.'cfg(...)']`) may contain only comments
+and whitespace; put dependency declarations under their explicit dependency
+table headers. These checks do not apply to similarly named metadata keys.
+Package metadata arrays of tables (such as cargo-release replacement arrays)
+are supported; arrays of package/version, dependency, or target tables are not.
+Quoted target selectors may contain closing brackets, and quoted dependency
+paths may contain braces; these characters are not treated as table delimiters.
+Nested arrays and multiline strings are rejected across the entire manifest
+(including package metadata) before section extraction, so array elements or
+string contents cannot hide or impersonate declarations. Use ordinary strings
+for metadata examples rather than multiline TOML strings. One-dimensional
+arrays remain supported. Backslashes in single-quoted literal dependency paths
+are preserved; escape sequences in double-quoted dependency values remain
+unsupported.
+Triple-quote text inside ordinary strings or comments is preserved;
+only actual multiline-string delimiters are rejected.
+Multiline arrays in package fields or unrelated dependencies are supported, as
+are inline feature arrays and comments on table headers. Dependency declarations
+are counted only in dependency tables, not in features or metadata. Inline
+dependency fields are separated outside quoted strings and arrays, so a
+version-like substring inside a path is never treated as the version field.
+Renamed dependencies whose `package` is `mssql-tds` are rejected in inline and
+table forms, including dev/build and target-specific dependencies, rather than
+leaving an alias on an incompatible source requirement. Other renamed packages
+remain supported. Dependency field keys must be bare and dependency `package`
+names must be unescaped literals so alternate spellings cannot hide an alias.
+The reserved `mssql-tds` dependency key must not contain a `package` field: it
+must identify `mssql-tds` directly, never rename another package to that key.
+
+All selected source versions and planned replacements are validated before
+printing versions, emitting pipeline variables or writing any manifest. A
+validation failure in a later manifest leaves earlier manifests unchanged.
+This is preflight validation, not a filesystem transaction: an I/O failure
+during the write phase can still leave some files updated. `-WhatIf` performs
+the same validation without writing files or emitting pipeline variables.
+Rejected values are not echoed in validation errors. These checks harden
+release inputs and logging; they do not establish a pipeline trust boundary.
+
+The executable regression cases run in the existing release-test CI selector:
+
+```powershell
+python -m pytest scripts/test_release_pipeline.py -k crate_stamp -q
+```
+
 ### clone-mssql-python.sh
 
 Both the macOS cross-repo tests and the full upstream suite against the Rust
