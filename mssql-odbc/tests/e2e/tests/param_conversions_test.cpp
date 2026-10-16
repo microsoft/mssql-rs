@@ -14,6 +14,7 @@
 //
 // Tests that require a live SQL Server are gated by ODBCTestConfig::HasConnection().
 
+#include "odbc_concurrent_test.h"
 #include "odbc_test_fixture.h"
 #include "odbc_sql_server_types.h"
 
@@ -1965,7 +1966,7 @@ TEST_F(ScalarConversionLiveTest, XmlParamRoundTrips) {
 // Benefits-from-mock-tds: assert XML TYPE_INFO followed by an unknown-length
 // PLP opener and incrementally emitted chunks; the final length alone cannot
 // distinguish streaming from whole-value buffering.
-TEST_F(ScalarConversionLiveTest, LargeXmlStreamsThroughDataAtExecution) {
+ODBC_TEST_F(ScalarConversionLiveTest, LargeXmlStreamsThroughDataAtExecution) {
     SKIP_IF_COMPARING_MSODBCSQL();
 
     std::string xml = "<root>";
@@ -2925,7 +2926,7 @@ TEST_F(UdtParamLiveTest, AUdtParameterCanBeSuppliedAtExecution) {
     EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }
 
-TEST_F(UdtParamLiveTest, DataAtExecutionOverflowingColumnSizeIsRejected) {
+ODBC_TEST_F(UdtParamLiveTest, DataAtExecutionOverflowingColumnSizeIsRejected) {
     std::vector<SQLCHAR> payload = SerializedHierarchyId("/1/2/3/4/");
     ASSERT_GT(payload.size(), 1u);
 
@@ -2948,7 +2949,7 @@ TEST_F(UdtParamLiveTest, DataAtExecutionOverflowingColumnSizeIsRejected) {
 
 // Benefits-from-mock-tds: assert the materialized hierarchyid stays ahead of
 // the streamed spatial values and each ordinal's UDT TYPE_INFO carries its own name.
-TEST_F(UdtParamLiveTest, MaterializedAndStreamedUdtParametersKeepTheirOwnNames) {
+ODBC_TEST_F(UdtParamLiveTest, MaterializedAndStreamedUdtParametersKeepTheirOwnNames) {
     std::vector<SQLCHAR> hierarchyid = SerializedHierarchyId("/1/");
     std::vector<SQLCHAR> geometry = SerializedGeometry("POINT (3 4)");
     std::vector<SQLCHAR> geography = SerializedGeography("POINT (-122.349 47.651)");
@@ -2994,7 +2995,7 @@ TEST_F(UdtParamLiveTest, MaterializedAndStreamedUdtParametersKeepTheirOwnNames) 
 
 // Benefits-from-mock-tds: assert the large geometry payload is emitted as
 // successive PLP chunks rather than accumulated and serialized as one value.
-TEST_F(UdtParamLiveTest, LargeUdtStreamsThroughDataAtExecution) {
+ODBC_TEST_F(UdtParamLiveTest, LargeUdtStreamsThroughDataAtExecution) {
     std::string wkt = "LINESTRING(";
     for (int i = 0; i < 1000; ++i) {
         if (i != 0) {
