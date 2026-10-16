@@ -8,6 +8,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ### Added
 
+- `mssql-tds`: `SecurityContextProvider` trait and
+  `ClientContext::security_context_provider` to replace the built-in
+  SSPI/GSSAPI context for integrated auth, e.g. NTLM on Linux/macOS (#707).
+
 - `mssql-odbc`: `SQLGetData` conversions from `varchar(max)` and `nvarchar(max)`
   into supported numeric and date/time C targets, with the existing
   bound-fetch 1 MiB source-data cap (AB#47238).

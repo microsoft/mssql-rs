@@ -729,7 +729,12 @@ impl LoginHandler<'_> {
                 server, port
             );
 
-            let mut handler = SspiAuthHandler::new(&config, &server, port)?;
+            let mut handler = SspiAuthHandler::new(
+                &config,
+                &server,
+                port,
+                context.security_context_provider.as_deref(),
+            )?;
             let initial_token = handler.get_initial_token()?;
 
             debug!(

@@ -375,6 +375,9 @@ pub struct ClientContext {
     ///
     /// `None` writes the dialled address, which is the previous behaviour.
     pub login_server_name: Option<String>,
+    /// Overrides the built-in SSPI/GSSAPI context for integrated auth. Default: `None`.
+    pub security_context_provider:
+        Option<std::sync::Arc<dyn crate::security::SecurityContextProvider>>,
     pub(crate) transport_context: TransportContext,
     /// Protocol vector version for feature negotiation.
     pub vector_version: VectorVersion,
@@ -585,6 +588,7 @@ impl ClientContext {
             user_name: "".to_string(),
             workstation_id: ClientContext::default_workstation_id(hostname::get),
             access_token: None,
+            security_context_provider: None,
             transport_context: TransportContext::Tcp {
                 host: "localhost".to_string(),
                 port: 1433,
@@ -651,6 +655,7 @@ impl ClientContext {
             server_spn: None,
             login_server_name: None,
             access_token: None,
+            security_context_provider: None,
             transport_context: TransportContext::Tcp {
                 host: "localhost".to_string(),
                 port: 1433,
@@ -934,6 +939,7 @@ impl Clone for ClientContext {
             server_spn: self.server_spn.clone(),
             login_server_name: self.login_server_name.clone(),
             access_token: self.access_token.clone(),
+            security_context_provider: self.security_context_provider.clone(),
             transport_context: self.transport_context.clone(),
             vector_version: self.vector_version,
             column_encryption_setting: self.column_encryption_setting,
