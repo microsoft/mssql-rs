@@ -4,15 +4,16 @@
 //! Client-side DNS cache negotiated by LOGIN7 feature extension `0x0B`
 //! (AZURESQLDNSCACHING, [MS-TDS] 2.2.6.4 and 2.2.7.11).
 //!
-//! Behaves like msodbcsql's SNI cache (`dns_cache.cpp`, `GetCachedAddrInfo`):
-//! every connect resolves the host normally and a successful resolution
-//! replaces the host's addresses. The cached addresses are used only when a
-//! later resolution fails, so connections keep working through a DNS outage.
+//! Follows msodbcsql's SNI cache (`dns_cache.cpp`, `GetCachedAddrInfo`): every
+//! connect resolves the host normally, and cached addresses are used only when
+//! that resolution fails, so connections keep working through a DNS outage.
 //!
 //! The server decides whether its host may be cached. Each FEATUREEXTACK
 //! settles it, as `SNI_QUERY_CONN_DNSCACHE` does in SNI: an acknowledgement
-//! with bit 0 set makes the entry usable, and anything else removes it. Unlike
-//! SNI, an entry is never used before a server has allowed it.
+//! with bit 0 set publishes the host's latest resolution, and anything else
+//! removes the host. Unlike SNI, addresses are never used before a server has
+//! allowed them, and a resolution waiting for that verdict is held in a
+//! bounded set, so hosts whose logins never get that far cannot grow the cache.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -22,18 +23,25 @@ use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 
 use tracing::{debug, warn};
 
+/// Most hosts whose latest resolution can wait for a verdict at once.
+const MAX_PENDING_HOSTS: usize = 256;
+
+/// Keys are lowercased host names, because DNS names are case-insensitive.
+/// Addresses keep their IPv6 scope; serving one only replaces the port.
 #[derive(Debug, Default)]
-struct Entry {
-    addresses: Vec<IpAddr>,
-    /// Whether a server reached through this host acknowledged DNS caching.
-    allowed: bool,
+struct Entries {
+    /// Hosts a server allowed caching for: the fallback addresses.
+    allowed: HashMap<String, Vec<SocketAddr>>,
+    /// Each host's latest resolution, until a server allows it. A disallowing
+    /// verdict leaves it in place, so a concurrent login that allows the same
+    /// host still publishes it.
+    pending: HashMap<String, Vec<SocketAddr>>,
 }
 
-/// Process-lifetime host name to address cache. Keys are lowercased because
-/// DNS names are case-insensitive.
+/// Process-lifetime host name to address cache.
 #[derive(Debug, Default)]
 pub(crate) struct DnsCache {
-    entries: Mutex<HashMap<String, Entry>>,
+    entries: Mutex<Entries>,
 }
 
 static GLOBAL_CACHE: OnceLock<DnsCache> = OnceLock::new();
@@ -44,14 +52,15 @@ impl DnsCache {
         GLOBAL_CACHE.get_or_init(DnsCache::default)
     }
 
-    fn entries(&self) -> MutexGuard<'_, HashMap<String, Entry>> {
-        // Every critical section leaves the map consistent, so a poisoned lock
+    fn entries(&self) -> MutexGuard<'_, Entries> {
+        // Every critical section leaves the maps consistent, so a poisoned lock
         // is safe to keep using; the cache is only a fallback.
         self.entries.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Resolves `host` with `lookup`. A successful resolution refreshes the
-    /// host's entry; a failed one falls back to the entry if a server allowed it.
+    /// Resolves `host` with `lookup`. A successful resolution becomes the
+    /// host's pending entry; a failed one falls back to the addresses a server
+    /// allowed.
     pub(crate) async fn resolve<F, Fut>(
         &self,
         host: &str,
@@ -87,22 +96,30 @@ impl DnsCache {
         if addresses.is_empty() || host.parse::<IpAddr>().is_ok() {
             return;
         }
+        let key = host.to_ascii_lowercase();
         let mut entries = self.entries();
-        let entry = entries.entry(host.to_ascii_lowercase()).or_default();
-        entry.addresses.clear();
-        entry.addresses.extend(addresses.iter().map(SocketAddr::ip));
+        let pending = &mut entries.pending;
+        if pending.len() >= MAX_PENDING_HOSTS && !pending.contains_key(&key) {
+            // Any victim will do: losing one only defers caching its host to
+            // that host's next login.
+            if let Some(victim) = pending.keys().next().cloned() {
+                pending.remove(&victim);
+            }
+        }
+        pending.insert(key, addresses.to_vec());
     }
 
     fn cached(&self, host: &str, port: u16) -> Option<Vec<SocketAddr>> {
         let entries = self.entries();
-        let entry = entries
-            .get(&host.to_ascii_lowercase())
-            .filter(|entry| entry.allowed)?;
+        let addresses = entries.allowed.get(&host.to_ascii_lowercase())?;
         Some(
-            entry
-                .addresses
+            addresses
                 .iter()
-                .map(|ip| SocketAddr::new(*ip, port))
+                .map(|address| {
+                    let mut address = *address;
+                    address.set_port(port);
+                    address
+                })
                 .collect(),
         )
     }
@@ -112,11 +129,11 @@ impl DnsCache {
         let key = host.to_ascii_lowercase();
         let mut entries = self.entries();
         if allowed {
-            if let Some(entry) = entries.get_mut(&key) {
-                entry.allowed = true;
+            if let Some(addresses) = entries.pending.remove(&key) {
+                entries.allowed.insert(key, addresses);
             }
         } else {
-            entries.remove(&key);
+            entries.allowed.remove(&key);
         }
         debug!(host, allowed, "Applied DNS caching acknowledgement");
     }
@@ -125,10 +142,19 @@ impl DnsCache {
 /// Resolves `host` for a TCP connect through the process-wide DNS cache.
 pub(crate) async fn lookup_host(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
     DnsCache::global()
-        .resolve(host, port, || async {
-            Ok(tokio::net::lookup_host((host, port)).await?.collect())
-        })
+        .resolve(host, port, || system_lookup(host, port))
         .await
+}
+
+async fn system_lookup(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
+    // Names under `.invalid` never resolve (RFC 6761). Unit tests use them to
+    // reach the fallback through a real connect without depending on the
+    // machine's resolver.
+    #[cfg(test)]
+    if host.ends_with(".invalid") {
+        return Err(io::Error::new(io::ErrorKind::NotFound, "no such host"));
+    }
+    Ok(tokio::net::lookup_host((host, port)).await?.collect())
 }
 
 #[cfg(test)]
@@ -209,7 +235,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn successful_resolution_refreshes_an_allowed_entry() {
+    async fn a_new_resolution_replaces_the_allowed_one_at_the_next_verdict() {
         let cache = DnsCache::default();
         resolves_to(
             &cache,
@@ -229,6 +255,16 @@ mod tests {
         .await
         .unwrap();
 
+        let resolved = fails_to_resolve(&cache, "db.example.com", 1433)
+            .await
+            .unwrap();
+        assert_eq!(
+            resolved,
+            [address("10.0.0.1", 1433)],
+            "a resolution no server has allowed yet is not a fallback"
+        );
+
+        cache.apply_verdict("db.example.com", true);
         let resolved = fails_to_resolve(&cache, "db.example.com", 1433)
             .await
             .unwrap();
@@ -275,6 +311,69 @@ mod tests {
         cache.apply_verdict("10.0.0.1", true);
         cache.apply_verdict("empty.example.com", true);
 
-        assert!(cache.entries().is_empty());
+        let entries = cache.entries();
+        assert!(entries.allowed.is_empty());
+        assert!(entries.pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_cached_ipv6_address_keeps_its_scope() {
+        let scoped = |port| {
+            SocketAddr::V6(std::net::SocketAddrV6::new(
+                "fe80::1".parse().unwrap(),
+                port,
+                0,
+                7,
+            ))
+        };
+        let cache = DnsCache::default();
+        resolves_to(&cache, "db.example.com", 1433, vec![scoped(1433)])
+            .await
+            .unwrap();
+        cache.apply_verdict("db.example.com", true);
+
+        let resolved = fails_to_resolve(&cache, "db.example.com", 11000)
+            .await
+            .unwrap();
+        assert_eq!(resolved, [scoped(11000)]);
+    }
+
+    #[tokio::test]
+    async fn a_disallowing_verdict_does_not_cancel_a_concurrent_allowing_one() {
+        let cache = DnsCache::default();
+        // Two logins resolve the host before either gets its verdict.
+        for _ in 0..2 {
+            resolves_to(
+                &cache,
+                "db.example.com",
+                1433,
+                vec![address("10.0.0.1", 1433)],
+            )
+            .await
+            .unwrap();
+        }
+        cache.apply_verdict("db.example.com", false);
+        cache.apply_verdict("db.example.com", true);
+
+        let resolved = fails_to_resolve(&cache, "db.example.com", 1433)
+            .await
+            .unwrap();
+        assert_eq!(resolved, [address("10.0.0.1", 1433)]);
+    }
+
+    #[tokio::test]
+    async fn resolutions_waiting_for_a_verdict_are_bounded() {
+        let cache = DnsCache::default();
+        let host = |i: usize| format!("host{i}.example.com");
+        for i in 0..MAX_PENDING_HOSTS + 10 {
+            resolves_to(&cache, &host(i), 1433, vec![address("10.0.0.1", 1433)])
+                .await
+                .unwrap();
+        }
+
+        let entries = cache.entries();
+        assert_eq!(entries.pending.len(), MAX_PENDING_HOSTS);
+        assert!(entries.pending.contains_key(&host(MAX_PENDING_HOSTS + 9)));
+        assert!(entries.allowed.is_empty());
     }
 }
