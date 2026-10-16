@@ -2118,6 +2118,12 @@ impl TdsValueSerializer {
                         }
                     })
                 } else {
+                    if bytes.len() > ctx.max_size {
+                        return Err(Error::EncodedValueTooLong {
+                            actual: bytes.len(),
+                            maximum: ctx.max_size,
+                        });
+                    }
                     Some(bytes)
                 }
             }
