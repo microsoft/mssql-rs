@@ -243,6 +243,8 @@ Defines the data structures for configurable query responses:
 - `ColumnDefinition` - Column metadata (name and type)
 - `Row` - A single row of data
 - `QueryResponse` - Complete result set definition
+- `ResultSetResponse` - A further result set, with optional DATACLASSIFICATION token bytes, for `QueryRegistry::register_result_sets`
+- `DataClassificationAck` - How Login7's Data Classification request is acknowledged; with `QueryRegistry::set_session_recovery` and `close_connection_after`, lets tests drive session recovery
 - `QueryRegistry` - Manages query-to-response mappings
 
 ### Server Module (`server.rs`)

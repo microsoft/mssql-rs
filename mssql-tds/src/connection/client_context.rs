@@ -410,10 +410,13 @@ pub struct ClientContext {
     // `ClientContext` so the connect future stays small.
     #[allow(clippy::box_collection)]
     pub(crate) trusted_master_key_paths: Option<Box<HashMap<String, Vec<String>>>>,
-    /// Data Classification version to *request* in LOGIN7 (feature `0x09`).
-    /// `None` (the default) omits the feature. The version the server enables
-    /// arrives in FEATUREEXTACK and may be lower than the one requested here.
-    pub(crate) requested_data_classification_version:
+    /// Data Classification version to request in LOGIN7 (feature `0x09`).
+    ///
+    /// `None` (the default) omits the feature, and the server then sends no
+    /// classification. The version the server enables arrives in
+    /// FEATUREEXTACK and may be lower than the one requested; see
+    /// [`TdsClient::negotiated_data_classification_version`](crate::connection::tds_client::TdsClient::negotiated_data_classification_version).
+    pub requested_data_classification_version:
         Option<crate::token::data_classification::DataClassificationVersion>,
     /// UserAgent telemetry payload components.
     pub user_agent: UserAgent,
@@ -675,15 +678,6 @@ impl ClientContext {
             self.tds_authentication_method,
             TdsAuthenticationMethod::SSPI
         )
-    }
-
-    /// Requests Data Classification `version` (1 or 2) in LOGIN7. The setting
-    /// stays crate-private until the public API is designed.
-    #[cfg(any(test, feature = "test-util"))]
-    #[doc(hidden)]
-    pub fn request_data_classification_for_test(&mut self, version: u8) -> TdsResult<()> {
-        self.requested_data_classification_version = Some(version.try_into()?);
-        Ok(())
     }
 
     #[doc(hidden)]
