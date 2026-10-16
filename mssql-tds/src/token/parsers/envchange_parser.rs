@@ -1003,8 +1003,8 @@ mod tests {
         };
         assert_eq!(value_pair.old_value(), &None);
         assert_eq!(
-            value_pair.new_value(),
-            &Some(RoutingInfo {
+            value_pair.new_value().as_deref(),
+            Some(&RoutingInfo {
                 protocol: 0,
                 port: 11000,
                 server: "replica.sql.net".to_string(),

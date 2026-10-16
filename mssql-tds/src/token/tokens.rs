@@ -192,7 +192,10 @@ pub(crate) enum EnvChangeContainer {
     String(EnvChangeTokenValuePairs<String>),
     SqlCollation(EnvChangeTokenValuePairs<Option<SqlCollation>>),
     UInt32(EnvChangeTokenValuePairs<u32>),
-    RoutingType(EnvChangeTokenValuePairs<Option<RoutingInfo>>),
+    /// Boxed: routing arrives at most once per login, and inline it would be the
+    /// largest token, growing every future that holds one
+    /// (`row_fetch_futures_stay_small`).
+    RoutingType(EnvChangeTokenValuePairs<Option<Box<RoutingInfo>>>),
     BytesType(EnvChangeTokenValuePairs<Vec<u8>>),
     UInt64(EnvChangeTokenValuePairs<u64>),
 }
@@ -219,8 +222,9 @@ impl From<(u32, u32)> for EnvChangeContainer {
 
 impl From<(Option<RoutingInfo>, Option<RoutingInfo>)> for EnvChangeContainer {
     fn from(value: (Option<RoutingInfo>, Option<RoutingInfo>)) -> Self {
-        EnvChangeContainer::RoutingType(EnvChangeTokenValuePairs::<Option<RoutingInfo>>::new(
-            value.0, value.1,
+        EnvChangeContainer::RoutingType(EnvChangeTokenValuePairs::new(
+            value.0.map(Box::new),
+            value.1.map(Box::new),
         ))
     }
 }

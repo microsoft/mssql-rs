@@ -582,13 +582,13 @@ impl LoginResponseModel {
                 }
             },
             EnvChangeContainer::RoutingType(routing_change) => {
-                let routing_info = routing_change.new_value().clone().ok_or_else(|| {
-                    crate::error::Error::ProtocolError(
+                let Some(routing_info) = routing_change.new_value().as_deref() else {
+                    return Err(crate::error::Error::ProtocolError(
                         "Routing env change did not include a redirection target".to_string(),
-                    )
-                })?;
+                    ));
+                };
                 // Acted on by `redirect_if_routed` once the whole response is read.
-                self.change_properties.routing_information = Some(routing_info);
+                self.change_properties.routing_information = Some(routing_info.clone());
                 Ok(())
             }
             _ => {
