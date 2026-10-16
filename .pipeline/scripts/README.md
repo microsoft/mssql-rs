@@ -70,6 +70,11 @@ Package metadata arrays of tables (such as cargo-release replacement arrays)
 are supported; arrays of package/version, dependency, or target tables are not.
 Quoted target selectors may contain closing brackets, and quoted dependency
 paths may contain braces; these characters are not treated as table delimiters.
+Nested arrays are rejected across the manifest before section extraction, so
+array elements cannot hide subsequent version declarations. One-dimensional
+arrays remain supported. Backslashes in single-quoted literal dependency paths
+are preserved; escape sequences in double-quoted dependency values remain
+unsupported.
 Triple-quote text inside ordinary strings or comments is preserved;
 only actual multiline-string delimiters are rejected.
 Multiline arrays in package fields or unrelated dependencies are supported, as

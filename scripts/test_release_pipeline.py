@@ -2211,6 +2211,51 @@ def test_crate_stamp_still_rejects_nested_dependency_tables(stamp_manifests, wha
     assert_stamp_rejected(stamp_manifests, WhatIf=what_if)
 
 
+@pytest.mark.parametrize("duplicate", [False, True])
+@pytest.mark.parametrize("what_if", [False, True])
+def test_crate_stamp_rejects_nested_arrays_before_package_extraction(stamp_manifests, duplicate, what_if):
+    path = stamp_manifests / "mssql-mock-tds" / "Cargo.toml"
+    nested = 'metadata = { matrix = [\n    [1, 2],\n] }\nversion = "0.3.0"'
+    if duplicate:
+        nested = 'version = "0.3.0"\n' + nested
+    content = path.read_text().replace('version = "0.3.0" # source version', nested, 1)
+    if not duplicate:
+        tomllib.loads(content)
+    path.write_bytes(content.encode())
+    assert_stamp_rejected(stamp_manifests, WhatIf=what_if)
+
+
+@pytest.mark.parametrize("nested", ['[[1, 2]]', '[\n ["hidden"]\n]', '[\n [1, 2]\n]'])
+@pytest.mark.parametrize("what_if", [False, True])
+def test_crate_stamp_rejects_nested_dependency_arrays(stamp_manifests, nested, what_if):
+    path = stamp_manifests / "mssql-mock-tds" / "Cargo.toml"
+    content = path.read_text().replace("[dependencies]", f"[dependencies]\nunrelated = {{ features = {nested} }}")
+    path.write_bytes(content.encode())
+    assert_stamp_rejected(stamp_manifests, WhatIf=what_if)
+
+
+@pytest.mark.parametrize("what_if", [False, True])
+def test_crate_stamp_preserves_literal_backslash_path(stamp_manifests, what_if):
+    path = stamp_manifests / "mssql-mock-tds" / "Cargo.toml"
+    content = path.read_text().replace('"../mssql-tds"', "'..\\mssql-tds'", 1)
+    tomllib.loads(content)
+    path.write_bytes(content.encode())
+    result = run_crate_stamp(stamp_manifests, WhatIf=what_if)
+    assert result.returncode == 0, result.stderr
+    expected = content if what_if else content.replace("0.3.0", "0.3.0-dev.20261015.123")
+    assert path.read_bytes() == expected.encode()
+    assert tomllib.loads(path.read_text())["dependencies"]["mssql-tds"]["path"] == "..\\mssql-tds"
+
+
+@pytest.mark.parametrize("what_if", [False, True])
+def test_crate_stamp_still_rejects_basic_string_escapes(stamp_manifests, what_if):
+    path = stamp_manifests / "mssql-mock-tds" / "Cargo.toml"
+    content = path.read_text().replace('"../mssql-tds"', '"..\\\\mssql-tds"', 1)
+    tomllib.loads(content)
+    path.write_bytes(content.encode())
+    assert_stamp_rejected(stamp_manifests, WhatIf=what_if)
+
+
 def test_crate_stamp_preserves_crlf_and_indented_declarations(stamp_manifests):
     for path in stamp_manifests.rglob("Cargo.toml"):
         path.write_bytes(path.read_text().replace("version =", "\tversion =").replace("\n", "\r\n").encode())

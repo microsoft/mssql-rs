@@ -64,9 +64,33 @@ function Assert-SupportedSectionStrings {
     }
 }
 
+function Assert-NoNestedManifestArrays {
+    param([Parameter(Mandatory = $true)][string]$Content, [Parameter(Mandatory = $true)][string]$Path)
+
+    # Skip strings/comments and whole table headers, but never mistake a header-
+    # shaped line inside an array for the next manifest section.
+    $tokens = [regex]::Matches($Content, '#[^\r\n]*|"""(?:\\[\s\S]|(?!""")[\s\S])*"""|''''''[\s\S]*?''''''|"(?:\\.|[^"\\\r\n])*"|''[^''\r\n]*''|(?<header>(?m:^[ \t]*\[)[^\r\n]*)|(?<open>\[)|(?<close>\])')
+    $arrayDepth = 0
+    foreach ($token in $tokens) {
+        if ($token.Groups['header'].Success) {
+            if ($arrayDepth -gt 0) { throw "Nested arrays are unsupported in $Path" }
+        }
+        elseif ($token.Groups['open'].Success) {
+            if ($arrayDepth -gt 0) { throw "Nested arrays are unsupported in $Path" }
+            $arrayDepth++
+        }
+        elseif ($token.Groups['close'].Success) {
+            $arrayDepth--
+            if ($arrayDepth -lt 0) { throw "Unbalanced array delimiters in $Path" }
+        }
+    }
+    if ($arrayDepth -ne 0) { throw "Unterminated array in $Path" }
+}
+
 function Get-PackageVersionMatch {
     param([Parameter(Mandatory = $true)][string]$Content, [Parameter(Mandatory = $true)][string]$Path)
 
+    Assert-NoNestedManifestArrays -Content $Content -Path $Path
     $sections = [regex]::Matches($Content, '(?ms)^[ \t]*\[[ \t]*package[ \t]*\][ \t]*(?:#[^\r\n]*)?(?:\r?\n|\z).*?(?=^[ \t]*\[|\z)')
     $firstTable = [regex]::Match($Content, '(?m)^[ \t]*\[')
     $rootContent = if ($firstTable.Success) { $Content.Substring(0, $firstTable.Index) } else { $Content }
@@ -153,9 +177,6 @@ function Set-MssqlTdsDependencyVersion {
         throw "Expected one single-line mssql-tds inline dependency in $Path"
     }
     $fields = $dependencies[0].Groups['fields']
-    if ($fields.Value.Contains('\')) {
-        throw "Escaped inline dependency values are unsupported in $Path"
-    }
     $quote = [char]0
     $depth = 0
     $start = 0
@@ -167,6 +188,9 @@ function Set-MssqlTdsDependencyVersion {
         if ($i -lt $fields.Length) {
             $character = $fields.Value[$i]
             if ($quote -ne [char]0) {
+                if ($quote -eq '"' -and $character -eq '\') {
+                    throw "Escaped basic-string dependency values are unsupported in $Path"
+                }
                 if ($character -eq $quote) { $quote = [char]0 }
                 continue
             }
