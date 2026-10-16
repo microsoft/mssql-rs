@@ -57,6 +57,7 @@ use mssql_tds::error::Error;
 use tracing_subscriber::Layer;
 use tracing_subscriber::layer::SubscriberExt;
 
+use crate::i18n;
 use redact::Category;
 use stages::{ConnectStagesOnly, Stage, StageRecorder, Step};
 use target::{Protocol, Target};
@@ -220,14 +221,18 @@ impl Depth {
         }
     }
 
-    pub fn title(self) -> &'static str {
-        match self {
-            Depth::ConnectionInput => "Connection input",
-            Depth::EndpointResolution => "Endpoint resolution",
-            Depth::NetworkReachability => "Network reachability",
-            Depth::ConnectionAttempt => "Connection attempt",
-            Depth::SessionValidation => "Session validation",
-        }
+    pub fn title_in(self, locale: &str) -> String {
+        i18n::tr_for_locale(
+            locale,
+            match self {
+                Depth::ConnectionInput => "diagnose.depth.connection_input",
+                Depth::EndpointResolution => "diagnose.depth.endpoint_resolution",
+                Depth::NetworkReachability => "diagnose.depth.network_reachability",
+                Depth::ConnectionAttempt => "diagnose.depth.connection_attempt",
+                Depth::SessionValidation => "diagnose.depth.session_validation",
+            },
+            &[],
+        )
     }
 }
 
@@ -285,12 +290,42 @@ const BROWSER_TIMEOUT_MS: u64 = 2000;
 /// The port the client connects a dedicated administrator connection to.
 const DAC_PORT: u16 = 1434;
 
+/// The list separator of `locale` (`, ` in English).
+fn list_separator(locale: &str) -> String {
+    i18n::tr_for_locale(locale, "diagnose.list.separator", &[])
+}
+
+/// An error about one address: `{address}:{port}: {message}`.
+fn address_message(address: &str, port: u16, message: &LocalizedText) -> LocalizedText {
+    LocalizedText::new_with_args(
+        "diagnose.error.tcp_address_port",
+        format!("{address}:{port}: {}", message.render("en-US")),
+        vec![
+            LocalizedArg::text("address", address.to_string()),
+            LocalizedArg::text("port", port.to_string()),
+            LocalizedArg::localized_text("message", message),
+        ],
+    )
+}
+
 /// Why the TCP checks do not apply, when the client used a pipe.
-const NOT_TCP: &str = "the connection does not use TCP";
+fn not_tcp_skip() -> Skip {
+    Skip::not_applicable(
+        "diagnose.skip.not_tcp",
+        "the connection does not use TCP",
+        vec![],
+    )
+}
+
 /// Why the TCP checks do not apply, when the client used shared memory
 /// without a protocol prefix.
-const SHARED_MEMORY_FIRST: &str =
-    "without a protocol prefix sqlcmd connects to this computer over shared memory first";
+fn shared_memory_first_skip() -> Skip {
+    Skip::not_applicable(
+        "diagnose.skip.shared_memory_first",
+        "without a protocol prefix sqlcmd connects to this computer over shared memory first",
+        vec![],
+    )
+}
 
 /// Kerberos rejects tickets whose clock differs from the server's by more than
 /// this, by default.
@@ -328,15 +363,19 @@ impl CheckId {
         }
     }
 
-    pub fn title(self) -> &'static str {
-        match self {
-            CheckId::ConnectionInput => "Connection input",
-            CheckId::NameResolution => "Name resolution",
-            CheckId::InstanceResolution => "Instance resolution",
-            CheckId::TcpConnect => "TCP connect",
-            CheckId::ConnectionAttempt => "Connection attempt",
-            CheckId::SessionValidation => "Session validation",
-        }
+    pub fn title_in(self, locale: &str) -> String {
+        i18n::tr_for_locale(
+            locale,
+            match self {
+                CheckId::ConnectionInput => "diagnose.check.connection_input",
+                CheckId::NameResolution => "diagnose.check.name_resolution",
+                CheckId::InstanceResolution => "diagnose.check.instance_resolution",
+                CheckId::TcpConnect => "diagnose.check.tcp_connect",
+                CheckId::ConnectionAttempt => "diagnose.check.connection_attempt",
+                CheckId::SessionValidation => "diagnose.check.session_validation",
+            },
+            &[],
+        )
     }
 
     /// The depth the check belongs to.
@@ -348,6 +387,195 @@ impl CheckId {
             CheckId::ConnectionAttempt => Depth::ConnectionAttempt,
             CheckId::SessionValidation => Depth::SessionValidation,
         }
+    }
+}
+
+/// A catalog-backed human string with named display arguments.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocalizedText {
+    id: Option<&'static str>,
+    english: String,
+    args: Vec<LocalizedArg>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LocalizedArg {
+    name: &'static str,
+    value: LocalizedValue,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum LocalizedValue {
+    Text(String),
+    Message {
+        id: &'static str,
+        english: String,
+        args: Vec<LocalizedArg>,
+    },
+    Joined {
+        values: Vec<String>,
+        separator_id: &'static str,
+    },
+}
+
+impl LocalizedArg {
+    fn text(name: &'static str, value: String) -> Self {
+        Self {
+            name,
+            value: LocalizedValue::Text(value),
+        }
+    }
+
+    fn message(name: &'static str, id: &'static str, english: &'static str) -> Self {
+        Self::message_with_args(name, id, english, Vec::new())
+    }
+
+    fn message_with_args(
+        name: &'static str,
+        id: &'static str,
+        english: impl Into<String>,
+        args: Vec<LocalizedArg>,
+    ) -> Self {
+        Self {
+            name,
+            value: LocalizedValue::Message {
+                id,
+                english: english.into(),
+                args,
+            },
+        }
+    }
+
+    fn joined(name: &'static str, values: Vec<String>, separator_id: &'static str) -> Self {
+        Self {
+            name,
+            value: LocalizedValue::Joined {
+                values,
+                separator_id,
+            },
+        }
+    }
+
+    fn localized_text(name: &'static str, text: &LocalizedText) -> Self {
+        match text.id {
+            Some(id) => Self::message_with_args(name, id, text.render("en-US"), text.args.clone()),
+            None => Self::text(name, text.render("en-US")),
+        }
+    }
+
+    fn render(&self, locale: &str) -> String {
+        match &self.value {
+            LocalizedValue::Text(value) => value.clone(),
+            LocalizedValue::Message { id, english, args } => {
+                let rendered = LocalizedText::render_catalog_message(id, args, locale);
+                debug_assert_eq!(
+                    LocalizedText::render_catalog_message(id, args, "en-US"),
+                    english.as_str(),
+                    "inline English for {id} has drifted from the en-US catalog"
+                );
+                rendered
+            }
+            LocalizedValue::Joined {
+                values,
+                separator_id,
+            } => {
+                let separator = i18n::tr_for_locale(locale, separator_id, &[]);
+                values.join(&separator)
+            }
+        }
+    }
+}
+
+impl LocalizedText {
+    pub fn new(
+        id: &'static str,
+        english: impl Into<String>,
+        args: Vec<(&'static str, String)>,
+    ) -> Self {
+        Self::new_with_args(
+            id,
+            english,
+            args.into_iter()
+                .map(|(name, value)| LocalizedArg::text(name, value))
+                .collect(),
+        )
+    }
+
+    fn new_with_args(
+        id: &'static str,
+        english: impl Into<String>,
+        args: Vec<LocalizedArg>,
+    ) -> Self {
+        let english = english.into();
+        debug_assert_eq!(
+            Self::render_catalog_message(id, &args, "en-US"),
+            english,
+            "inline English for {id} has drifted from the en-US catalog"
+        );
+        Self {
+            id: Some(id),
+            english,
+            args,
+        }
+    }
+
+    pub fn literal(text: impl Into<String>) -> Self {
+        Self {
+            id: None,
+            english: text.into(),
+            args: Vec::new(),
+        }
+    }
+
+    pub fn render(&self, locale: &str) -> String {
+        let Some(id) = self.id else {
+            return self.english.clone();
+        };
+        Self::render_catalog_message(id, &self.args, locale)
+    }
+
+    pub fn contains(&self, needle: &str) -> bool {
+        self.render("en-US").contains(needle)
+    }
+
+    fn render_catalog_message(id: &str, args: &[LocalizedArg], locale: &str) -> String {
+        let rendered_args: Vec<String> = args.iter().map(|arg| arg.render(locale)).collect();
+        let args: Vec<(&str, &dyn std::fmt::Display)> = args
+            .iter()
+            .zip(&rendered_args)
+            .map(|(arg, value)| (arg.name, value as &dyn std::fmt::Display))
+            .collect();
+        i18n::tr_for_locale(locale, id, &args)
+    }
+}
+
+impl std::fmt::Display for LocalizedText {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.render("en-US"))
+    }
+}
+
+impl From<String> for LocalizedText {
+    fn from(value: String) -> Self {
+        Self::literal(value)
+    }
+}
+
+impl From<&str> for LocalizedText {
+    fn from(value: &str) -> Self {
+        Self::literal(value)
+    }
+}
+
+impl From<&target::ParseError> for LocalizedText {
+    fn from(error: &target::ParseError) -> Self {
+        let args: Vec<LocalizedArg> = error
+            .message_args()
+            .into_iter()
+            .map(|(name, value)| LocalizedArg::text(name, value))
+            .collect();
+        let english = LocalizedText::render_catalog_message(error.message_id(), &args, "en-US");
+        LocalizedText::new_with_args(error.message_id(), english, args)
     }
 }
 
@@ -397,9 +625,19 @@ pub enum Skip {
     /// A named instance has no confirmed port: SQL Server Browser gave none.
     PortRequired,
     /// Why the check does not apply.
-    NotApplicable(&'static str),
+    NotApplicable(LocalizedText),
     /// The diagnosis was canceled before the check finished.
     Canceled,
+}
+
+impl Skip {
+    fn not_applicable(
+        id: &'static str,
+        english: &'static str,
+        args: Vec<(&'static str, String)>,
+    ) -> Self {
+        Self::NotApplicable(LocalizedText::new(id, english, args))
+    }
 }
 
 /// A value a check found, with the kind of identifier it is, if it is one.
@@ -586,7 +824,7 @@ impl Certainty {
 pub struct Finding {
     pub certainty: Certainty,
     pub check: CheckId,
-    pub text: String,
+    pub text: LocalizedText,
     /// The text quotes a message from outside sqlcmd (the operating system,
     /// the TLS library, the client), which may hold names sqlcmd cannot
     /// recognize and so cannot label.
@@ -607,10 +845,10 @@ pub struct ErrorRecord {
     pub os_error: Option<i32>,
     /// A stable symbolic identifier, e.g. `refused` or `invalidPort`.
     pub code: Option<String>,
-    pub message: String,
+    pub message: LocalizedText,
     /// What a normal sqlcmd run prints for the same event, in the ODBC
     /// driver's wording (see [`driver_text`]); `None` when it has no equivalent.
-    pub text: Option<String>,
+    pub text: Option<LocalizedText>,
     /// From a transport sqlcmd then moved past, without a protocol prefix
     /// (TCP before named pipes): kept as evidence, but a normal run, which
     /// reports only the last transport's errors, would not print it.
@@ -629,7 +867,7 @@ impl ErrorRecord {
             class: None,
             os_error: None,
             code: None,
-            message: message.into(),
+            message: LocalizedText::literal(message.into()),
             text: None,
             superseded: false,
             from_message_text: false,
@@ -798,18 +1036,20 @@ impl ExitCategory {
         }
     }
 
-    pub fn meaning(self) -> &'static str {
-        match self {
-            ExitCategory::Passed => "every check at the requested depth passed",
-            ExitCategory::IssueDetected => "the diagnosis identified an issue",
-            ExitCategory::Inconclusive => {
-                "the diagnosis could not establish whether the connection works"
-            }
-            ExitCategory::Partial => "some checks that should have run could not complete",
-            ExitCategory::Canceled => "the diagnosis was canceled",
-            ExitCategory::Failed => "sqlcmd failed internally; the summary is not trustworthy",
-            ExitCategory::InvalidInvocation => "the request was invalid; nothing ran",
-        }
+    pub fn meaning_in(self, locale: &str) -> String {
+        i18n::tr_for_locale(
+            locale,
+            match self {
+                ExitCategory::Passed => "diagnose.exit.passed",
+                ExitCategory::IssueDetected => "diagnose.exit.issue_detected",
+                ExitCategory::Inconclusive => "diagnose.exit.inconclusive",
+                ExitCategory::Partial => "diagnose.exit.partial",
+                ExitCategory::Canceled => "diagnose.exit.canceled",
+                ExitCategory::Failed => "diagnose.exit.failed",
+                ExitCategory::InvalidInvocation => "diagnose.exit.invalid_invocation",
+            },
+            &[],
+        )
     }
 }
 
@@ -832,7 +1072,7 @@ pub struct Report {
     pub tracing_guide: Option<&'static str>,
     pub execution_status: ExecutionStatus,
     pub outcome: DiagnosticOutcome,
-    pub limitations: Vec<String>,
+    pub limitations: Vec<LocalizedText>,
 }
 
 impl Report {
@@ -982,8 +1222,10 @@ fn run_until(request: Request, canceled: &dyn Fn() -> bool) -> Report {
                 }),
                 Err(error) => {
                     diagnosis.status = ExecutionStatus::Failed;
-                    diagnosis.limitations.push(format!(
-                        "The diagnosis could not start its async runtime: {error}."
+                    diagnosis.limitation_text(LocalizedText::new(
+                        "diagnose.limitation.async_runtime",
+                        format!("The diagnosis could not start its async runtime: {error}."),
+                        vec![("error", error.to_string())],
                     ));
                 }
             }
@@ -1030,7 +1272,7 @@ struct Diagnosis {
     /// protocol order reached (shared memory or named pipes) when it is not
     /// TCP. `None` follows the target's own protocol.
     transport: Option<Protocol>,
-    limitations: Vec<String>,
+    limitations: Vec<LocalizedText>,
     status: ExecutionStatus,
 }
 
@@ -1234,7 +1476,7 @@ impl Diagnosis {
         self.request.depth >= depth
     }
 
-    fn finding(&mut self, certainty: Certainty, check: CheckId, text: impl Into<String>) {
+    fn finding(&mut self, certainty: Certainty, check: CheckId, text: impl Into<LocalizedText>) {
         self.findings.push(Finding {
             certainty,
             check,
@@ -1244,16 +1486,21 @@ impl Diagnosis {
     }
 
     /// A finding whose text quotes a message from outside sqlcmd.
-    fn quoting_finding(&mut self, certainty: Certainty, check: CheckId, text: impl Into<String>) {
+    fn quoting_finding(
+        &mut self,
+        certainty: Certainty,
+        check: CheckId,
+        text: impl Into<LocalizedText>,
+    ) {
         self.finding(certainty, check, text);
         if let Some(finding) = self.findings.last_mut() {
             finding.quotes_message = true;
         }
     }
 
-    fn limitation(&mut self, text: &str) {
-        if !self.limitations.iter().any(|l| l == text) {
-            self.limitations.push(text.to_string());
+    fn limitation_text(&mut self, text: LocalizedText) {
+        if !self.limitations.contains(&text) {
+            self.limitations.push(text);
         }
     }
 
@@ -1367,11 +1614,13 @@ impl Diagnosis {
             "client.driver",
         ]));
         self.checks.push(check);
-        self.limitation(
+        self.limitation_text(LocalizedText::new(
+            "diagnose.limitation.admin_named_instance_dac_unsupported",
             "The dedicated administrator connection to a named instance gets its port from \
              SQL Server Browser's DAC request, which the client does not make, so its endpoint \
              and connection are not checked.",
-        );
+            vec![],
+        ));
         self.skip_rest(
             CheckId::InstanceResolution,
             &Skip::BlockedBy(CheckId::InstanceResolution),
@@ -1448,18 +1697,30 @@ impl Diagnosis {
         };
         let not_tcp = (tcp.is_none() && lookup.is_none()).then(|| {
             if first_pipe == Some(Protocol::SharedMemory) && target.protocol == Protocol::Default {
-                SHARED_MEMORY_FIRST
+                shared_memory_first_skip()
             } else {
-                NOT_TCP
+                not_tcp_skip()
             }
         });
 
         self.moved_past(&groups, primary_at, &all);
-        let name_failed =
-            self.name_resolution(target, tcp, lookup, not_tcp, timed_out, tcp_superseded);
+        let name_failed = self.name_resolution(
+            target,
+            tcp,
+            lookup,
+            not_tcp.clone(),
+            timed_out,
+            tcp_superseded,
+        );
         let pipe_used = primary.and_then(|g| g.pipe).filter(|p| p.ok == Some(true));
-        let lookup_blocks =
-            self.instance_resolution(target, lookup, tcp.is_some(), not_tcp, pipe_used, timed_out);
+        let lookup_blocks = self.instance_resolution(
+            target,
+            lookup,
+            tcp.is_some(),
+            not_tcp.clone(),
+            pipe_used,
+            timed_out,
+        );
         let tcp_blocks = if self.wants(Depth::NetworkReachability) {
             let blocked = lookup_blocks
                 .clone()
@@ -1543,7 +1804,7 @@ impl Diagnosis {
             self.checks.push(if target.protocol.uses_tcp() {
                 Check::skipped(id, Skip::BlockedBy(carrier))
             } else {
-                Check::skipped(id, Skip::NotApplicable(NOT_TCP))
+                Check::skipped(id, not_tcp_skip())
             });
         }
         let classified = classify_connection_error(error, None, &self.request.authentication);
@@ -1571,7 +1832,7 @@ impl Diagnosis {
         target: &Target,
         tcp: Option<&Transport>,
         lookup: Option<&Step>,
-        not_tcp: Option<&'static str>,
+        not_tcp: Option<Skip>,
         timed_out: bool,
         superseded: bool,
     ) -> bool {
@@ -1584,9 +1845,14 @@ impl Diagnosis {
                 self.checks.push(Check::skipped(id, Skip::Canceled));
                 return false;
             }
-            let reason = not_tcp.unwrap_or("the client did not resolve a name");
-            self.checks
-                .push(Check::skipped(id, Skip::NotApplicable(reason)));
+            let skip = not_tcp.unwrap_or_else(|| {
+                Skip::not_applicable(
+                    "diagnose.skip.no_name_resolved",
+                    "the client did not resolve a name",
+                    vec![],
+                )
+            });
+            self.checks.push(Check::skipped(id, skip));
             return false;
         };
         let host = step
@@ -1636,18 +1902,26 @@ impl Diagnosis {
             (
                 "timedOut",
                 false,
-                format!("no answer within {} s", self.request.timeout().as_secs()),
+                LocalizedText::new(
+                    "diagnose.error.no_answer_seconds",
+                    format!("no answer within {} s", self.request.timeout().as_secs()),
+                    vec![("seconds", self.request.timeout().as_secs().to_string())],
+                ),
             )
         } else if no_addresses {
             (
                 "noAddresses",
                 false,
-                "the name resolved to no address".to_string(),
+                LocalizedText::new(
+                    "diagnose.error.name_no_addresses",
+                    "the name resolved to no address",
+                    vec![],
+                ),
             )
         } else {
             let text = error_text.unwrap_or_default();
             let (code, from_text) = dns_result_from(step.os_error(), text);
-            (code, from_text, text.to_string())
+            (code, from_text, LocalizedText::literal(text))
         };
         check.fields.push(Field::plain("result", code));
         // Read from the resolver's message, not its code: weaker evidence.
@@ -1665,19 +1939,33 @@ impl Diagnosis {
         self.quoting_finding(
             Certainty::Confirmed,
             id,
-            format!("Name resolution for {host} failed ({code}): {message}."),
+            LocalizedText::new_with_args(
+                "diagnose.finding.name_resolution_failed",
+                format!(
+                    "Name resolution for {host} failed ({code}): {}.",
+                    message.render("en-US")
+                ),
+                vec![
+                    LocalizedArg::text("host", host.clone()),
+                    LocalizedArg::text("code", code.to_string()),
+                    LocalizedArg::localized_text("message", &message),
+                ],
+            ),
         );
-        let mut record = ErrorRecord::new("os", id, message);
+        let mut record = ErrorRecord::new("os", id, "");
+        record.message = message;
         record.os_error = step.os_error();
         record.code = Some(code.to_string());
         record.from_message_text = from_text;
         record.superseded = superseded;
         self.errors.push(record);
         if from_text {
-            self.limitation(
+            self.limitation_text(LocalizedText::new(
+                "diagnose.limitation.dns_result_from_text",
                 "This platform does not expose the resolver's result code; the name-resolution \
                  result was classified from the resolver's message.",
-            );
+                vec![],
+            ));
         }
         true
     }
@@ -1689,22 +1977,29 @@ impl Diagnosis {
         target: &Target,
         lookup: Option<&Step>,
         over_tcp: bool,
-        not_tcp: Option<&'static str>,
+        not_tcp: Option<Skip>,
         pipe_used: Option<&Step>,
         timed_out: bool,
     ) -> Option<Skip> {
         let id = CheckId::InstanceResolution;
         let Some(step) = lookup else {
-            let reason = match not_tcp {
-                Some(reason) if !over_tcp => reason,
-                _ if target.protocol == Protocol::Admin => {
-                    "the dedicated administrator connection uses port 1434"
+            let skip = match not_tcp {
+                Some(skip) if !over_tcp => skip,
+                _ if target.protocol == Protocol::Admin => Skip::not_applicable(
+                    "diagnose.skip.admin_port_1434",
+                    "the dedicated administrator connection uses port 1434",
+                    vec![],
+                ),
+                _ if target.instance.is_some() && target.port.is_some() => {
+                    Skip::not_applicable("diagnose.skip.port_given", "a port was given", vec![])
                 }
-                _ if target.instance.is_some() && target.port.is_some() => "a port was given",
-                _ => "not a named instance",
+                _ => Skip::not_applicable(
+                    "diagnose.skip.not_named_instance",
+                    "not a named instance",
+                    vec![],
+                ),
             };
-            self.checks
-                .push(Check::skipped(id, Skip::NotApplicable(reason)));
+            self.checks.push(Check::skipped(id, skip));
             return None;
         };
         let host = step
@@ -1772,8 +2067,9 @@ impl Diagnosis {
             None => "failed",
         };
         let os_error = step.os_error();
-        let problem = ssrp_problem(code, step.detail(connect_stage::ERROR));
-        let mut record = ErrorRecord::new("sqlBrowser", id, problem.clone());
+        let problem = ssrp_problem_text(code, step.detail(connect_stage::ERROR));
+        let mut record = ErrorRecord::new("sqlBrowser", id, "");
+        record.message = problem.clone();
         record.code = Some(code.to_string());
         record.os_error = os_error;
         check.fields.push(Field::plain("result", code));
@@ -1786,9 +2082,14 @@ impl Diagnosis {
             self.checks.push(check);
             self.errors.push(record);
             self.status = ExecutionStatus::Partial;
-            self.limitation(&format!(
-                "This computer did not let sqlcmd ask SQL Server Browser for the instance's \
-                 port ({problem}); instance resolution could not be checked."
+            self.limitation_text(LocalizedText::new_with_args(
+                "diagnose.limitation.browser_local_failure",
+                format!(
+                    "This computer did not let sqlcmd ask SQL Server Browser for the \
+                     instance's port ({}); instance resolution could not be checked.",
+                    problem.render("en-US")
+                ),
+                vec![LocalizedArg::localized_text("problem", &problem)],
             ));
             return Some(blocks);
         }
@@ -1807,22 +2108,47 @@ impl Diagnosis {
         self.quoting_finding(
             Certainty::Confirmed,
             id,
-            format!(
-                "SQL Server Browser on {host} gave no usable {} for instance {instance}: \
-                 {problem}.",
-                if target.protocol.uses_tcp() {
-                    "port"
-                } else {
-                    "pipe"
-                }
-            ),
+            if target.protocol.uses_tcp() {
+                LocalizedText::new_with_args(
+                    "diagnose.finding.browser_no_usable_port",
+                    format!(
+                        "SQL Server Browser on {host} gave no usable port for instance \
+                         {instance}: {}.",
+                        problem.render("en-US")
+                    ),
+                    vec![
+                        LocalizedArg::text("host", host),
+                        LocalizedArg::text("instance", instance),
+                        LocalizedArg::localized_text("problem", &problem),
+                    ],
+                )
+            } else {
+                LocalizedText::new_with_args(
+                    "diagnose.finding.browser_no_usable_pipe",
+                    format!(
+                        "SQL Server Browser on {host} gave no usable pipe for instance \
+                         {instance}: {}.",
+                        problem.render("en-US")
+                    ),
+                    vec![
+                        LocalizedArg::text("host", host),
+                        LocalizedArg::text("instance", instance),
+                        LocalizedArg::localized_text("problem", &problem),
+                    ],
+                )
+            },
         );
         if target.protocol.uses_tcp() {
             self.finding(
                 Certainty::Informational,
                 id,
-                "The checks that need a port were not run: sqlcmd does not try port 1433 or any \
-                 other port for a named instance whose port SQL Server Browser did not give.",
+                LocalizedText::new(
+                    "diagnose.finding.named_instance_requires_port",
+                    "The checks that need a port were not run: sqlcmd does not try port 1433 or \
+                     any other port for a named instance whose port SQL Server Browser did not \
+                     give.",
+                    vec![],
+                ),
             );
         }
         self.errors.push(record);
@@ -1836,7 +2162,7 @@ impl Diagnosis {
         target: &Target,
         tcp: Option<&Transport>,
         blocked: Option<Skip>,
-        not_tcp: Option<&'static str>,
+        not_tcp: Option<Skip>,
         superseded: bool,
         canceled: bool,
     ) -> Option<Skip> {
@@ -1848,9 +2174,8 @@ impl Diagnosis {
                     return Some(skip);
                 }
                 _ => {
-                    let reason = not_tcp.unwrap_or(NOT_TCP);
-                    self.checks
-                        .push(Check::skipped(id, Skip::NotApplicable(reason)));
+                    let skip = not_tcp.unwrap_or_else(not_tcp_skip);
+                    self.checks.push(Check::skipped(id, skip));
                     return None;
                 }
             }
@@ -1906,16 +2231,20 @@ impl Diagnosis {
                 Some(false) if step.detail(connect_stage::TIMED_OUT) == Some("true") => (
                     TcpResult::TimedOut,
                     None,
-                    Some(format!("no answer within {} ms", self.request.timeout_ms())),
+                    Some(LocalizedText::new(
+                        "diagnose.error.no_answer_ms",
+                        format!("no answer within {} ms", self.request.timeout_ms()),
+                        vec![("ms", self.request.timeout_ms().to_string())],
+                    )),
                 ),
                 Some(false) => {
                     let result = TcpResult::from_fields(
                         step.detail(connect_stage::IO_KIND),
                         step.os_error(),
                     );
-                    let message = step
-                        .detail(connect_stage::ERROR)
-                        .map_or_else(|| result.name().to_string(), str::to_string);
+                    let message = LocalizedText::literal(
+                        step.detail(connect_stage::ERROR).unwrap_or(result.name()),
+                    );
                     (result, step.os_error(), Some(message))
                 }
                 // Abandoned: the attempt's time limit dropped it before it
@@ -1923,7 +2252,11 @@ impl Diagnosis {
                 None => (
                     TcpResult::TimedOut,
                     None,
-                    Some(format!("no answer within the {budget_s} s time limit")),
+                    Some(LocalizedText::new(
+                        "diagnose.error.no_answer_time_limit",
+                        format!("no answer within the {budget_s} s time limit"),
+                        vec![("seconds", budget_s.to_string())],
+                    )),
                 ),
             };
             check.attempts.push(TcpAttempt {
@@ -1934,7 +2267,8 @@ impl Diagnosis {
                 duration_ms: step.duration_ms,
             });
             if let Some(message) = message {
-                let mut record = ErrorRecord::new("os", id, format!("{address}:{port}: {message}"));
+                let mut record = ErrorRecord::new("os", id, "");
+                record.message = address_message(&address, port, &message);
                 record.os_error = os_error;
                 record.code = Some(result.name().to_string());
                 record.superseded = superseded;
@@ -1958,12 +2292,17 @@ impl Diagnosis {
                     os_error: None,
                     duration_ms: 0,
                 });
-                let mut record = ErrorRecord::new(
-                    "os",
-                    id,
-                    format!(
-                        "{address}:{port}: not tried: the {budget_s} s time limit was spent on \
-                         earlier addresses"
+                let mut record = ErrorRecord::new("os", id, "");
+                record.message = address_message(
+                    &address,
+                    port,
+                    &LocalizedText::new(
+                        "diagnose.error.not_tried_time_spent",
+                        format!(
+                            "not tried: the {budget_s} s time limit was spent on earlier \
+                             addresses"
+                        ),
+                        vec![("seconds", budget_s.to_string())],
                     ),
                 );
                 record.code = Some(TcpResult::NotAttempted.name().to_string());
@@ -2003,10 +2342,18 @@ impl Diagnosis {
             check.domain = Some(Domain::specific("client.platform"));
             self.checks.push(check);
             self.status = ExecutionStatus::Partial;
-            self.limitation(&format!(
-                "This computer did not let sqlcmd open a network connection (operating-system \
-                 error {}); network reachability could not be checked.",
-                codes.join(", ")
+            self.limitation_text(LocalizedText::new_with_args(
+                "diagnose.limitation.local_facility_error",
+                format!(
+                    "This computer did not let sqlcmd open a network connection (operating-system \
+                     error {}); network reachability could not be checked.",
+                    codes.join(&list_separator("en-US"))
+                ),
+                vec![LocalizedArg::joined(
+                    "codes",
+                    codes,
+                    "diagnose.list.separator",
+                )],
             ));
             return blocks;
         }
@@ -2045,16 +2392,27 @@ impl Diagnosis {
         self.finding(
             Certainty::Confirmed,
             id,
-            format!(
-                "No address accepted a TCP connection on port {port}: {}.",
-                summary.join(", ")
+            LocalizedText::new_with_args(
+                "diagnose.finding.no_address_accepted_tcp",
+                format!(
+                    "No address accepted a TCP connection on port {port}: {}.",
+                    summary.join(&list_separator("en-US"))
+                ),
+                vec![
+                    LocalizedArg::text("port", port.to_string()),
+                    LocalizedArg::joined("summary", summary, "diagnose.list.separator"),
+                ],
             ),
         );
         if all(TcpResult::Refused) {
             self.finding(
                 Certainty::Suspected,
                 id,
-                format!("Nothing is listening on port {port} at those addresses."),
+                LocalizedText::new(
+                    "diagnose.finding.no_tcp_listener",
+                    format!("Nothing is listening on port {port} at those addresses."),
+                    vec![("port", port.to_string())],
+                ),
             );
         }
         blocks
@@ -2072,32 +2430,59 @@ impl Diagnosis {
             // Without a next transport, SQL Server Browser was asked next,
             // for the TCP port.
             let next = groups.get(index + 1);
-            let next_name = match next.map(Transport::protocol) {
-                Some(Protocol::Tcp) | None => "TCP",
-                Some(Protocol::SharedMemory) => "shared memory",
-                Some(_) => "named pipes",
+            let (next_id, next_name) = match next.map(Transport::protocol) {
+                Some(Protocol::Tcp) | None => ("diagnose.transport.tcp", "TCP"),
+                Some(Protocol::SharedMemory) => {
+                    ("diagnose.transport.shared_memory", "shared memory")
+                }
+                Some(_) => ("diagnose.transport.named_pipes", "named pipes"),
             };
             match group.pipe {
                 Some(pipe) => {
-                    let reason = pipe
-                        .detail(connect_stage::ERROR)
-                        .unwrap_or("it was not opened")
-                        .to_string();
-                    let what = if group.protocol() == Protocol::SharedMemory {
-                        "Shared memory to this computer".to_string()
+                    let reason = match pipe.detail(connect_stage::ERROR) {
+                        Some(error) => LocalizedText::literal(error),
+                        None => LocalizedText::new(
+                            "diagnose.error.not_opened",
+                            "it was not opened",
+                            vec![],
+                        ),
+                    };
+                    let reason_english = reason.render("en-US");
+                    let next_arg = LocalizedArg::message("next", next_id, next_name);
+                    let reason_arg = LocalizedArg::localized_text("reason", &reason);
+                    let finding = if group.protocol() == Protocol::SharedMemory {
+                        LocalizedText::new_with_args(
+                            "diagnose.finding.shared_memory_not_opened",
+                            format!(
+                                "Shared memory to this computer did not open ({reason_english}); \
+                                 without a protocol prefix sqlcmd then tries {next_name}, \
+                                 checked below."
+                            ),
+                            vec![reason_arg, next_arg],
+                        )
                     } else {
-                        format!("The {} transport", group.protocol().name())
+                        let transport = group.protocol().name();
+                        LocalizedText::new_with_args(
+                            "diagnose.finding.pipe_transport_not_opened",
+                            format!(
+                                "The {transport} transport did not open ({reason_english}); \
+                                 without a protocol prefix sqlcmd then tries {next_name}, \
+                                 checked below."
+                            ),
+                            vec![
+                                LocalizedArg::text("transport", transport.to_string()),
+                                reason_arg,
+                                next_arg,
+                            ],
+                        )
                     };
                     self.quoting_finding(
                         Certainty::Informational,
                         CheckId::ConnectionAttempt,
-                        format!(
-                            "{what} did not open ({reason}); without a protocol prefix sqlcmd \
-                             then tries {next_name}, checked below."
-                        ),
+                        finding,
                     );
-                    let mut record =
-                        ErrorRecord::new("os", CheckId::ConnectionAttempt, reason.clone());
+                    let mut record = ErrorRecord::new("os", CheckId::ConnectionAttempt, "");
+                    record.message = reason;
                     record.os_error = pipe.os_error();
                     record.superseded = true;
                     self.errors.push(record);
@@ -2106,12 +2491,20 @@ impl Diagnosis {
                     Certainty::Informational,
                     CheckId::ConnectionAttempt,
                     if self.wants(Depth::ConnectionAttempt) {
-                        "TCP did not connect; without a protocol prefix sqlcmd then tries named \
-                         pipes, so the connection attempt was made over the server's standard \
-                         pipe."
+                        LocalizedText::new(
+                            "diagnose.finding.named_pipe_fallback",
+                            "TCP did not connect; without a protocol prefix sqlcmd then tries \
+                             named pipes, so the connection attempt was made over the server's \
+                             standard pipe.",
+                            vec![],
+                        )
                     } else {
-                        "TCP did not connect; without a protocol prefix sqlcmd then tries the \
-                         server's standard pipe."
+                        LocalizedText::new(
+                            "diagnose.finding.named_pipe_fallback_untried",
+                            "TCP did not connect; without a protocol prefix sqlcmd then tries the \
+                             server's standard pipe.",
+                            vec![],
+                        )
                     },
                 ),
                 None => {
@@ -2130,13 +2523,15 @@ impl Diagnosis {
                         })
                         .collect();
                     for step in failed {
-                        let mut record = ErrorRecord::new(
-                            "client",
-                            CheckId::ConnectionAttempt,
-                            step.detail(connect_stage::ERROR)
-                                .unwrap_or(step.stage.title())
-                                .to_string(),
-                        );
+                        let mut record = ErrorRecord::new("client", CheckId::ConnectionAttempt, "");
+                        record.message = match step.detail(connect_stage::ERROR) {
+                            Some(error) => LocalizedText::literal(error),
+                            None => LocalizedText::new(
+                                step.stage.title_id(),
+                                step.stage.title_english(),
+                                vec![],
+                            ),
+                        };
                         record.os_error = step.os_error();
                         record.superseded = true;
                         self.errors.push(record);
@@ -2144,9 +2539,13 @@ impl Diagnosis {
                     self.finding(
                         Certainty::Informational,
                         CheckId::ConnectionAttempt,
-                        "The connection attempt over TCP failed; without a protocol prefix \
-                         sqlcmd then tries named pipes, so the connection attempt was made over \
-                         the server's standard pipe.",
+                        LocalizedText::new(
+                            "diagnose.finding.named_pipe_fallback_after_attempt",
+                            "The connection attempt over TCP failed; without a protocol prefix \
+                             sqlcmd then tries named pipes, so the connection attempt was made \
+                             over the server's standard pipe.",
+                            vec![],
+                        ),
                     );
                 }
             }
@@ -2191,7 +2590,11 @@ impl Diagnosis {
                     self.finding(
                         Certainty::Informational,
                         CheckId::ConnectionInput,
-                        "The server includes both an instance name and a port; sqlcmd uses the port and does not look up the instance.",
+                        LocalizedText::new(
+                            "diagnose.finding.instance_port_used",
+                            "The server includes both an instance name and a port; sqlcmd uses the port and does not look up the instance.",
+                            vec![],
+                        ),
                     );
                 }
                 if self.request.trust_server_certificate && self.request.encrypt == Encrypt::Strict
@@ -2199,7 +2602,11 @@ impl Diagnosis {
                     self.finding(
                         Certainty::Informational,
                         CheckId::ConnectionInput,
-                        "-C is ignored with strict encryption (-Ns): the server certificate is validated.",
+                        LocalizedText::new(
+                            "diagnose.finding.trust_ignored_with_strict_encryption",
+                            "-C is ignored with strict encryption (-Ns): the server certificate is validated.",
+                            vec![],
+                        ),
                     );
                 } else if self.request.trust_server_certificate
                     && self
@@ -2211,7 +2618,11 @@ impl Diagnosis {
                     self.finding(
                         Certainty::Informational,
                         CheckId::ConnectionInput,
-                        "The certificate host name from -F is not validated when -C trusts the server certificate.",
+                        LocalizedText::new(
+                            "diagnose.finding.certificate_name_not_validated_when_trusted",
+                            "The certificate host name from -F is not validated when -C trusts the server certificate.",
+                            vec![],
+                        ),
                     );
                 }
                 Some(target)
@@ -2221,13 +2632,24 @@ impl Diagnosis {
                 check.fields.push(Field::plain("error", error.code()));
                 check.domain = Some(Domain::specific("client.inputConfiguration"));
                 self.checks.push(check);
+                let error_text = LocalizedText::from(&error);
+                let error_english = error_text.render("en-US");
                 self.finding(
                     Certainty::Confirmed,
                     CheckId::ConnectionInput,
-                    format!("The server given to -S could not be parsed: {error}."),
+                    LocalizedText::new_with_args(
+                        "diagnose.finding.server_parse_failed",
+                        format!("The server given to -S could not be parsed: {error_english}."),
+                        vec![LocalizedArg::message_with_args(
+                            "error",
+                            error.message_id(),
+                            error_english,
+                            error_text.args.clone(),
+                        )],
+                    ),
                 );
-                let mut record =
-                    ErrorRecord::new("sqlcmd", CheckId::ConnectionInput, error.to_string());
+                let mut record = ErrorRecord::new("sqlcmd", CheckId::ConnectionInput, "");
+                record.message = error_text;
                 record.code = Some(error.code().to_string());
                 self.errors.push(record);
                 self.skip_rest(
@@ -2336,11 +2758,13 @@ impl Diagnosis {
             .filter(|s| s.stage == Stage::Login)
             .find_map(|s| s.detail(connect_stage::SPN))
             .map(str::to_string);
-        self.limitation(
+        self.limitation_text(LocalizedText::new(
+            "diagnose.limitation.mssql_tds",
             "The connection attempt is made with the mssql-tds client, which reports its \
              pre-login, TLS and login phases; it is not the ODBC driver sqlcmd uses for queries, \
              so TLS and login behavior can differ from a query run.",
-        );
+            vec![],
+        ));
         if self.request.authentication == Authentication::Integrated {
             self.kerberos_evidence(&mut check, self.request.timeout())
                 .await;
@@ -2365,8 +2789,12 @@ impl Diagnosis {
                     self.finding(
                         Certainty::Suspected,
                         CheckId::ConnectionAttempt,
-                        "No Kerberos ticket cache was found for this user, so the integrated \
-                         login had no ticket to present.",
+                        LocalizedText::new(
+                            "diagnose.finding.no_kerberos_ticket_cache",
+                            "No Kerberos ticket cache was found for this user, so the integrated \
+                             login had no ticket to present.",
+                            vec![],
+                        ),
                     );
                 }
                 self.authentication = Some(classified.auth);
@@ -2377,10 +2805,12 @@ impl Diagnosis {
                 );
                 self.errors.extend(classified.errors);
                 if classified.from_message_text {
-                    self.limitation(
+                    self.limitation_text(LocalizedText::new(
+                        "diagnose.limitation.tls_classified_from_text",
                         "The TLS failure was classified from the error text; no stable error \
                          code was available.",
-                    );
+                        vec![],
+                    ));
                 }
             }
             (_, Some(client)) => {
@@ -2428,28 +2858,38 @@ impl Diagnosis {
                 .fields
                 .push(Field::plain("kerberosTicketCache", state));
             if state == "unverified" {
-                self.limitation(&format!(
-                    "The Kerberos ticket cache is a {location} cache, which sqlcmd does not \
-                     inspect."
+                self.limitation_text(LocalizedText::new(
+                    "diagnose.limitation.kerberos_cache_unverified",
+                    format!(
+                        "The Kerberos ticket cache is a {location} cache, which sqlcmd does not \
+                         inspect."
+                    ),
+                    vec![("location", location)],
                 ));
             } else if location == "default" {
-                self.limitation(
+                self.limitation_text(LocalizedText::new(
+                    "diagnose.limitation.kerberos_default_cache_only",
                     "Only the default file ticket cache was looked for; a KCM or KEYRING cache \
                      set in krb5.conf is not inspected.",
-                );
+                    vec![],
+                ));
             }
         } else {
             check
                 .fields
                 .push(Field::plain("kerberosTicketCache", "notChecked"));
-            self.limitation(
+            self.limitation_text(LocalizedText::new(
+                "diagnose.limitation.kerberos_cache_not_checked",
                 "The Kerberos ticket cache could not be looked for within the time limit.",
-            );
+                vec![],
+            ));
         }
-        self.limitation(
+        self.limitation_text(LocalizedText::new(
+            "diagnose.limitation.kerberos_spn_not_proof",
             "Kerberos encryption types and delegation are not inspected; the SPN is the one the \
              client requests, not proof that it is registered.",
-        );
+            vec![],
+        ));
     }
     async fn session_validation(&mut self, client: &mut TdsClient) {
         let mut check = Check::new(CheckId::SessionValidation, Coverage::Passed);
@@ -2483,11 +2923,19 @@ impl Diagnosis {
                         self.finding(
                             Certainty::Informational,
                             CheckId::SessionValidation,
-                            format!(
-                                "The server's clock is {} s {} the client's, more than the 5 \
-                                 minutes Kerberos tolerates by default.",
-                                offset.abs() / 1000,
-                                if offset > 0 { "ahead of" } else { "behind" }
+                            LocalizedText::new(
+                                if offset > 0 {
+                                    "diagnose.finding.clock_offset_ahead"
+                                } else {
+                                    "diagnose.finding.clock_offset_behind"
+                                },
+                                format!(
+                                    "The server's clock is {} s {} the client's, more than the 5 \
+                                     minutes Kerberos tolerates by default.",
+                                    offset.abs() / 1000,
+                                    if offset > 0 { "ahead of" } else { "behind" }
+                                ),
+                                vec![("seconds", (offset.abs() / 1000).to_string())],
                             ),
                         );
                     }
@@ -2500,20 +2948,27 @@ impl Diagnosis {
                     Error::SqlServerError { .. } => Coverage::Diagnosed,
                     _ => Coverage::Inconclusive,
                 };
-                let message =
-                    format!("The session was opened but a minimal query failed: {error}.");
+                let message = LocalizedText::new(
+                    "diagnose.finding.session_query_failed",
+                    format!("The session was opened but a minimal query failed: {error}."),
+                    vec![("error", error.to_string())],
+                );
                 self.errors
                     .extend(error_records(&error, CheckId::SessionValidation));
                 message
             }
             Err(_) => {
                 check.coverage = Coverage::Inconclusive;
-                let message = format!(
-                    "The session was opened but a minimal query had no answer within {} s.",
-                    self.request.timeout().as_secs()
+                let message = LocalizedText::new(
+                    "diagnose.finding.session_query_timed_out",
+                    format!(
+                        "The session was opened but a minimal query had no answer within {} s.",
+                        self.request.timeout().as_secs()
+                    ),
+                    vec![("seconds", self.request.timeout().as_secs().to_string())],
                 );
-                let mut record =
-                    ErrorRecord::new("client", CheckId::SessionValidation, message.clone());
+                let mut record = ErrorRecord::new("client", CheckId::SessionValidation, "");
+                record.message = message.clone();
                 record.code = Some("timedOut".to_string());
                 self.errors.push(record);
                 message
@@ -2864,7 +3319,7 @@ struct Classified {
     auth: AuthOutcome,
     tls_category: Option<&'static str>,
     from_message_text: bool,
-    finding: String,
+    finding: LocalizedText,
     errors: Vec<ErrorRecord>,
 }
 
@@ -2901,16 +3356,39 @@ fn classify_connection_error(
                 },
             )
         };
-        let identifiers = first.map_or(String::new(), |e| {
-            format!(" (state {}, class {})", e.state, e.class)
-        });
+        let identifiers = first.map(|e| (e.state, e.class));
         return Classified {
             coverage: Coverage::Diagnosed,
             domain,
             auth,
             tls_category: None,
             from_message_text: false,
-            finding: format!("The server ended the login with error {number}{identifiers}: {text}"),
+            finding: match identifiers {
+                Some((state, class)) => LocalizedText::new_with_args(
+                    "diagnose.finding.server_ended_login_with_identifiers",
+                    format!(
+                        "The server ended the login with error {number} (state {state}, class {class}): {text}"
+                    ),
+                    vec![
+                        LocalizedArg::text("number", number.to_string()),
+                        LocalizedArg::message_with_args(
+                            "identifiers",
+                            "diagnose.error_id.state_class",
+                            format!("state {state}, class {class}"),
+                            vec![
+                                LocalizedArg::text("state", state.to_string()),
+                                LocalizedArg::text("class", class.to_string()),
+                            ],
+                        ),
+                        LocalizedArg::text("text", text),
+                    ],
+                ),
+                None => LocalizedText::new(
+                    "diagnose.finding.server_ended_login",
+                    format!("The server ended the login with error {number}: {text}"),
+                    vec![("number", number.to_string()), ("text", text)],
+                ),
+            },
             errors,
         };
     }
@@ -2922,7 +3400,11 @@ fn classify_connection_error(
             auth: AuthOutcome::Failed,
             tls_category: None,
             from_message_text: false,
-            finding: format!("Integrated authentication failed on the client: {security}"),
+            finding: LocalizedText::new(
+                "diagnose.finding.integrated_auth_client_failed",
+                format!("Integrated authentication failed on the client: {security}"),
+                vec![("error", security.to_string())],
+            ),
             errors,
         };
     }
@@ -2961,10 +3443,21 @@ fn classify_connection_error(
             auth: AuthOutcome::NotEvaluated,
             tls_category: category,
             from_message_text,
-            finding: format!(
-                "The TLS handshake failed{}: {error}",
-                category.map_or(String::new(), |c| format!(" ({c})"))
-            ),
+            finding: match category {
+                Some(category) => LocalizedText::new(
+                    "diagnose.finding.tls_handshake_failed_with_category",
+                    format!("The TLS handshake failed ({category}): {error}"),
+                    vec![
+                        ("category", category.to_string()),
+                        ("error", error.to_string()),
+                    ],
+                ),
+                None => LocalizedText::new(
+                    "diagnose.finding.tls_handshake_failed",
+                    format!("The TLS handshake failed: {error}"),
+                    vec![("error", error.to_string())],
+                ),
+            },
             errors,
         };
     }
@@ -2986,10 +3479,28 @@ fn classify_connection_error(
         },
         tls_category: None,
         from_message_text: false,
-        finding: format!(
-            "The connection attempt failed{}: {error}",
-            phase.map_or(String::new(), |p| format!(" during {}", p.title()))
-        ),
+        finding: match phase {
+            Some(phase) => LocalizedText::new_with_args(
+                "diagnose.finding.connection_attempt_failed_during_phase",
+                format!(
+                    "The connection attempt failed during {}: {error}",
+                    phase.detail_title_english()
+                ),
+                vec![
+                    LocalizedArg::message(
+                        "phase",
+                        phase.detail_title_id(),
+                        phase.detail_title_english(),
+                    ),
+                    LocalizedArg::text("error", error.to_string()),
+                ],
+            ),
+            None => LocalizedText::new(
+                "diagnose.finding.connection_attempt_failed",
+                format!("The connection attempt failed: {error}"),
+                vec![("error", error.to_string())],
+            ),
+        },
         errors,
     }
 }
@@ -3056,23 +3567,64 @@ fn ssrp_local_failure(code: &str, os_error: Option<i32>) -> bool {
 /// What the SQL Server Browser lookup ran into, from its result code and
 /// the underlying error's text (`detail`), as evidence only: the client's
 /// own message also says what to do about it, and names the server.
-fn ssrp_problem(code: &str, detail: Option<&str>) -> String {
-    let detail = |what: &str| match detail {
-        Some(detail) => format!("{what}: {detail}"),
-        None => what.to_string(),
+fn ssrp_problem_text(code: &str, detail: Option<&str>) -> LocalizedText {
+    // A message with the underlying error's text, or without it.
+    let detailed = |with: &'static str, english: &str, plain: &'static str| match detail {
+        Some(detail) => LocalizedText::new(
+            with,
+            format!("{english}: {detail}"),
+            vec![("error", detail.to_string())],
+        ),
+        None => LocalizedText::new(plain, english, vec![]),
     };
     match code {
-        "nameResolutionFailed" => detail("the server name did not resolve"),
-        "noAddresses" => "the server name resolved to no address".into(),
-        "socketFailed" => "no UDP socket could be opened".into(),
-        "sendFailed" => "no UDP request could be sent".into(),
-        "receiveFailed" => detail("receiving the answer failed"),
+        "nameResolutionFailed" => detailed(
+            "diagnose.error.ssrp_resolve_failed",
+            "the server name did not resolve",
+            "diagnose.error.ssrp_resolve_failed_plain",
+        ),
+        "noAddresses" => LocalizedText::new(
+            "diagnose.error.ssrp_no_addresses",
+            "the server name resolved to no address",
+            vec![],
+        ),
+        "socketFailed" => LocalizedText::new(
+            "diagnose.error.ssrp_socket",
+            "no UDP socket could be opened",
+            vec![],
+        ),
+        "sendFailed" => LocalizedText::new(
+            "diagnose.error.ssrp_send",
+            "no UDP request could be sent",
+            vec![],
+        ),
+        "receiveFailed" => detailed(
+            "diagnose.error.ssrp_receive",
+            "receiving the answer failed",
+            "diagnose.error.ssrp_receive_plain",
+        ),
         // No address: it may be one the report does not list, and so not redact.
-        "noAnswer" => "no answer".into(),
-        "timedOut" => "no answer in the time limit".into(),
-        "invalidResponse" => detail("the answer could not be parsed"),
-        "noTcpPort" => "it answered but listed no endpoint the client can use".into(),
-        _ => detail("the lookup failed"),
+        "noAnswer" => LocalizedText::new("diagnose.error.ssrp_no_answer", "no answer", vec![]),
+        "timedOut" => LocalizedText::new(
+            "diagnose.error.ssrp_no_answer_in_time",
+            "no answer in the time limit",
+            vec![],
+        ),
+        "invalidResponse" => detailed(
+            "diagnose.error.ssrp_invalid_response",
+            "the answer could not be parsed",
+            "diagnose.error.ssrp_invalid_response_plain",
+        ),
+        "noTcpPort" => LocalizedText::new(
+            "diagnose.error.ssrp_no_endpoint",
+            "it answered but listed no endpoint the client can use",
+            vec![],
+        ),
+        _ => detailed(
+            "diagnose.error.ssrp_failed",
+            "the lookup failed",
+            "diagnose.error.ssrp_failed_plain",
+        ),
     }
 }
 fn is_tls_error(error: &Error) -> bool {
@@ -3283,6 +3835,10 @@ pub(crate) mod tests {
             "{}",
             c.finding
         );
+        let qps_finding = c.finding.render("qps-ploc");
+        assert!(!qps_finding.contains("state"), "{qps_finding}");
+        assert!(!qps_finding.contains("class"), "{qps_finding}");
+        assert!(qps_finding.contains("[!!!"), "{qps_finding}");
         // Integrated is SSPI on Windows and Kerberos (GSSAPI) elsewhere.
         let integrated = classify_connection_error(
             &server_error(18456, "x"),
@@ -3345,6 +3901,12 @@ pub(crate) mod tests {
             untrusted.domain,
             Domain::specific("security.tlsCertificate")
         );
+        let qps_with_category = untrusted.finding.render("qps-ploc");
+        assert!(
+            qps_with_category.contains("(trustChain)"),
+            "{qps_with_category}"
+        );
+        assert!(qps_with_category.contains("[!!!"), "{qps_with_category}");
         assert!(untrusted.from_message_text);
         assert!(untrusted.errors.iter().all(|e| e.from_message_text));
         assert_eq!(untrusted.auth, AuthOutcome::NotEvaluated);
@@ -3363,6 +3925,21 @@ pub(crate) mod tests {
             "a reset is not specific"
         );
         assert_eq!(reset.domain.primary, "undetermined");
+
+        let unknown = classify_connection_error(
+            &Error::ImplementationError("opaque TLS failure".to_string()),
+            Some(Stage::Tls),
+            &sql_login(),
+        );
+        let qps_without_category = unknown.finding.render("qps-ploc");
+        assert!(
+            !qps_without_category.contains("()"),
+            "{qps_without_category}"
+        );
+        assert!(
+            qps_without_category.contains("[!!!"),
+            "{qps_without_category}"
+        );
     }
 
     #[test]
@@ -3589,6 +4166,27 @@ pub(crate) mod tests {
                 .all(|check| check.get("sources").is_none()),
             "{json}"
         );
+
+        // The sources line starts under the Details column in any language,
+        // whose labels set the column widths.
+        for locale in ["en-US", "qps-ploc"] {
+            let text = report::text_in(&report, locale);
+            let lines: Vec<&str> = text.lines().collect();
+            let row = lines
+                .iter()
+                .position(|line| line.starts_with("  ") && !line.starts_with("   "))
+                .unwrap();
+            let header = lines[row];
+            let details = crate::i18n::tr_for_locale(locale, "diagnose.table.details", &[]);
+            let column = unicode_width::UnicodeWidthStr::width(header)
+                - unicode_width::UnicodeWidthStr::width(details.as_str());
+            let sources_line = lines[row + 2];
+            assert_eq!(
+                sources_line.len() - sources_line.trim_start().len(),
+                column,
+                "{locale}: {text}"
+            );
+        }
     }
 
     #[test]
@@ -3599,7 +4197,11 @@ pub(crate) mod tests {
 
         let report = run(request);
         assert_eq!(report.checks[0].coverage, Coverage::Passed);
-        let findings: Vec<_> = report.findings.iter().map(|f| f.text.as_str()).collect();
+        let findings: Vec<_> = report
+            .findings
+            .iter()
+            .map(|f| f.text.render("en-US"))
+            .collect();
         assert!(
             findings
                 .iter()
@@ -3630,7 +4232,11 @@ pub(crate) mod tests {
         request.host_name_in_certificate = Some("wrong.example.test".to_string());
 
         let report = run(request);
-        let findings: Vec<_> = report.findings.iter().map(|f| f.text.as_str()).collect();
+        let findings: Vec<_> = report
+            .findings
+            .iter()
+            .map(|f| f.text.render("en-US"))
+            .collect();
         assert!(
             findings
                 .iter()
@@ -3689,6 +4295,133 @@ pub(crate) mod tests {
         assert_eq!(report.exit_code(), 1);
     }
 
+    #[test]
+    fn parse_errors_render_in_the_report_locale() {
+        let report = run(request("tcp:127.0.0.1,0", Depth::ConnectionInput));
+        let json = report::json_in(&report, "v", "qps-ploc").unwrap();
+        assert!(
+            !json.contains("is not a port number from 1 to 65535"),
+            "{json}"
+        );
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let finding = value["findings"][0]["text"].as_str().unwrap();
+        let error = value["errors"][0]["message"].as_str().unwrap();
+        assert!(finding.starts_with("[!!!"), "{json}");
+        assert!(error.starts_with("[!!!"), "{json}");
+        assert_eq!(value["errors"][0]["code"], "invalidPort");
+    }
+
+    #[test]
+    fn nested_diagnostic_messages_render_in_the_report_locale() {
+        let name_message = LocalizedText::new(
+            "diagnose.error.name_no_addresses",
+            "the name resolved to no address",
+            vec![],
+        );
+        let browser_problem = LocalizedText::new(
+            "diagnose.error.ssrp_no_endpoint",
+            "it answered but listed no endpoint the client can use",
+            vec![],
+        );
+        let tcp_message = LocalizedText::new(
+            "diagnose.error.no_answer_ms",
+            "no answer within 10 ms",
+            vec![("ms", "10".to_string())],
+        );
+        let mut report = Report {
+            request: request("tcp:db01,1433", Depth::NetworkReachability),
+            start_unix_ms: 0,
+            duration_ms: 0,
+            target: None,
+            checks: Vec::new(),
+            findings: vec![
+                Finding {
+                    certainty: Certainty::Confirmed,
+                    check: CheckId::NameResolution,
+                    text: LocalizedText::new_with_args(
+                        "diagnose.finding.name_resolution_failed",
+                        "Name resolution for db01 failed (noAddresses): the name resolved to no address.",
+                        vec![
+                            LocalizedArg::text("host", "db01".to_string()),
+                            LocalizedArg::text("code", "noAddresses".to_string()),
+                            LocalizedArg::localized_text("message", &name_message),
+                        ],
+                    ),
+                    quotes_message: false,
+                },
+                Finding {
+                    certainty: Certainty::Confirmed,
+                    check: CheckId::InstanceResolution,
+                    text: LocalizedText::new_with_args(
+                        "diagnose.finding.browser_no_usable_port",
+                        "SQL Server Browser on db01 gave no usable port for instance inst: it answered but listed no endpoint the client can use.",
+                        vec![
+                            LocalizedArg::text("host", "db01".to_string()),
+                            LocalizedArg::text("instance", "inst".to_string()),
+                            LocalizedArg::localized_text("problem", &browser_problem),
+                        ],
+                    ),
+                    quotes_message: false,
+                },
+            ],
+            errors: {
+                let mut record = ErrorRecord::new("os", CheckId::TcpConnect, "");
+                record.message = LocalizedText::new_with_args(
+                    "diagnose.error.tcp_address_port",
+                    "10.0.0.1:1433: no answer within 10 ms",
+                    vec![
+                        LocalizedArg::text("address", "10.0.0.1".to_string()),
+                        LocalizedArg::text("port", "1433".to_string()),
+                        LocalizedArg::localized_text("message", &tcp_message),
+                    ],
+                );
+                vec![record]
+            },
+            authentication: None,
+            server: None,
+            domain: None,
+            tracing_guide: None,
+            execution_status: ExecutionStatus::Completed,
+            outcome: DiagnosticOutcome::IssueDetected,
+            limitations: Vec::new(),
+        };
+        let text = report::text_in(&report, "qps-ploc");
+        let json = report::json_in(&report, "v", "qps-ploc").unwrap();
+        for rendered in [&text, &json] {
+            for english in [
+                "the name resolved to no address",
+                "listed no endpoint the client can use",
+                "no answer within",
+            ] {
+                assert!(
+                    !rendered.contains(english),
+                    "{english} survived in {rendered}"
+                );
+            }
+        }
+        // Keep a mutable use so this fixture follows Report if fields are added.
+        report.checks.clear();
+    }
+
+    #[test]
+    fn browser_failure_problem_renders_in_the_report_locale() {
+        let report = run(request(
+            "127.0.0.1\\NoSuchDiagnoseInstance",
+            Depth::EndpointResolution,
+        ));
+        let json = report::json_in(&report, "v", "qps-ploc").unwrap();
+        assert!(json.contains("[!!!"), "{json}");
+        for english in [
+            "no answer",
+            "the server name resolved",
+            "receiving the answer failed",
+            "the answer could not be parsed",
+            "no UDP",
+        ] {
+            assert!(!json.contains(english), "{english} survived in {json}");
+        }
+    }
+
     /// Port 1 on the loopback address refuses at once: name resolution
     /// passes, TCP is diagnosed, and the connection attempt is skipped.
     #[test]
@@ -3705,12 +4438,15 @@ pub(crate) mod tests {
         let expected = vec![Some("refused"), Some("networkRelatedError")];
         assert_eq!(codes, expected, "{:#?}", report.errors);
         let refused = report.errors.iter().find(|e| e.source == "os").unwrap();
-        assert_eq!(refused.text.as_deref(), Some(tcp_text));
+        assert_eq!(
+            refused.text.as_ref().map(|t| t.render("en-US")).as_deref(),
+            Some(tcp_text)
+        );
         let network = report.errors.last().unwrap();
         assert!(
             network
                 .text
-                .as_deref()
+                .as_ref()
                 .is_some_and(|t| t.contains("connection to tcp:127.0.0.1,1. Server is not found")),
             "{network:#?}"
         );
@@ -3800,11 +4536,11 @@ pub(crate) mod tests {
             resolution.superseded && resolution.text.is_none(),
             "{resolution:#?}"
         );
-        let printed: Vec<&str> = report
+        let printed: Vec<String> = report
             .errors
             .iter()
             .filter(|e| !e.superseded)
-            .filter_map(|e| e.text.as_deref())
+            .filter_map(|e| e.text.as_ref().map(|t| t.render("en-US")))
             .collect();
         // The pipe was not found: no time limit ran out, so no timeout line.
         assert_eq!(printed.len(), 2, "{:#?}", report.errors);
@@ -3848,6 +4584,7 @@ pub(crate) mod tests {
                 .iter()
                 .any(|f| f.certainty == Certainty::Informational
                     && f.text
+                        .render("en-US")
                         .starts_with("Shared memory to this computer did not open")),
             "{:#?}",
             report.findings
@@ -4020,6 +4757,26 @@ pub(crate) mod tests {
             );
         }
     }
+
+    #[test]
+    #[ignore]
+    fn print_diagnose_text_for_environment_locale() {
+        let sqlcmd_lang = std::env::var("SQLCMD_LANG").ok();
+        let lc_all = std::env::var("LC_ALL").ok();
+        let lc_messages = std::env::var("LC_MESSAGES").ok();
+        let lang = std::env::var("LANG").ok();
+        let locale = crate::i18n::resolve_from_env_values(
+            sqlcmd_lang.as_deref(),
+            lc_all.as_deref(),
+            lc_messages.as_deref(),
+            lang.as_deref(),
+            None,
+        );
+        println!("resolved locale: {locale}");
+        let report = run(request("tcp:127.0.0.1,1", Depth::NetworkReachability));
+        println!("{}", report::text_in(&report, locale));
+    }
+
     /// A live server, when `MSSQL_SQLCMD_DIAGNOSTICS_SERVER` names one (with
     /// `..._USER` and `..._PASSWORD`): every check passes, through session
     /// validation.
@@ -4544,7 +5301,11 @@ pub(crate) mod tests {
                 .all(|e| e.check == CheckId::ConnectionAttempt)
         );
         assert_eq!(
-            report.errors[1].text.as_deref(),
+            report.errors[1]
+                .text
+                .as_ref()
+                .map(|t| t.render("en-US"))
+                .as_deref(),
             Some("Login timeout expired")
         );
     }
@@ -4739,7 +5500,10 @@ pub(crate) mod tests {
         assert_eq!(shown, [("fe80::1%12", 1433), ("fe80::1%7", 1433)]);
         let refused = report.errors.iter().find(|e| e.source == "os").unwrap();
         assert!(
-            refused.message.starts_with("fe80::1%12:1433: "),
+            refused
+                .message
+                .render("en-US")
+                .starts_with("fe80::1%12:1433: "),
             "{refused:#?}"
         );
     }
@@ -4859,7 +5623,7 @@ pub(crate) mod tests {
             report
                 .findings
                 .iter()
-                .any(|f| f.text.starts_with("TCP did not connect")),
+                .any(|f| f.text.render("en-US").starts_with("TCP did not connect")),
             "{:#?}",
             report.findings
         );
@@ -4902,6 +5666,7 @@ pub(crate) mod tests {
         assert!(
             report.findings.iter().any(|f| f
                 .text
+                .render("en-US")
                 .starts_with("Shared memory to this computer did not open")),
             "{:#?}",
             report.findings
@@ -4946,7 +5711,7 @@ pub(crate) mod tests {
         ] {
             assert_eq!(
                 checked(&report, id).skip,
-                Some(Skip::NotApplicable(SHARED_MEMORY_FIRST)),
+                Some(shared_memory_first_skip()),
                 "{id:?}"
             );
         }
@@ -5337,7 +6102,7 @@ pub(crate) mod tests {
             "receiveFailed",
             "invalidResponse",
         ] {
-            let problem = ssrp_problem(code, None);
+            let problem = ssrp_problem_text(code, None).render("en-US");
             assert!(!problem.is_empty());
             for advice in ["Verify", "Ensure", "Contact", "Check "] {
                 assert!(!problem.contains(advice), "{problem}");
