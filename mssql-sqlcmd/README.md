@@ -2,15 +2,16 @@
 
 sqlcmd components in Rust. Native (ODBC) sqlcmd links this crate as a static
 library and calls it through a C ABI; native sqlcmd still parses the command
-line, connects and runs the batches. `sqlcmd diagnose` checks the connection
-stage by stage through this crate.
+line, connects and runs the batches. The one exception is `sqlcmd diagnose`,
+which connects through this crate (with `mssql-tds`) to check the connection
+stage by stage.
 
 ## Layout
 
 | Path | Purpose |
 |---|---|
 | `src/formatter/` | Output formatters. `json.rs` renders `--format json`. |
-| `src/diagnostics.rs`, `src/diagnostics/` | `sqlcmd diagnose`: the checks, depth by depth; `target.rs` parses `-S`, `redact.rs` makes output share-safe, `report.rs` renders text and JSON. |
+| `src/diagnostics.rs`, `src/diagnostics/` | `sqlcmd diagnose`: the checks, depth by depth, read from the one connection attempt `mssql-tds` makes; `target.rs` parses `-S`, `stages.rs` records the `mssql-tds` connect stages, `redact.rs` makes output share-safe, `report.rs` renders text and JSON. |
 | `src/ffi.rs` | The C ABI native sqlcmd calls, including `mssql_sqlcmd_version()`. |
 | `include/mssql_sqlcmd.h` | C/C++ declarations for that ABI. |
 
@@ -102,44 +103,74 @@ each includes the ones before it, and the deepest is the default:
 | `connectionAttempt` | the client also logs in, with its pre-login, TLS and login phases |
 | `sessionValidation` | a minimal query on the new session: the engine edition and the server's UTC clock |
 
-This build runs the `connectionInput` checks only: at a deeper depth the
-other checks are reported as skipped, `notCheckedByThisBuild`.
+This build runs the checks through `networkReachability`: at a deeper depth
+the connection attempt and session validation are reported as skipped,
+`notCheckedByThisBuild`.
 
 Checks run best effort: a failed check skips only what needs its result, and
 each skipped check names what blocked it. Each reports a coverage state
 (`passed`, `diagnosed`, `classified`, `inconclusive`, `skipped`,
-`notApplicable`), its duration on a monotonic clock, its time limit when it
-has one, and what it found. The report adds:
+`notApplicable`), its duration on a monotonic clock, its time limit (`-l`, or sqlcmd's default login
+timeout of 8 s; 2 s for SQL Server Browser), and what it found: the addresses
+resolved, and the operating system's result for every TCP connect (`refused`,
+`timedOut`, `hostUnreachable`, ...). The report adds:
 
 - `executionStatus` (`completed`, `partial`, `canceled`, `failed`,
   `invalidInvocation`) and `diagnosticOutcome` (`passed`, `issueDetected`,
   `inconclusive`, `notEvaluated`), and an exit code per category: 0 passed,
   1 issue detected, 2 inconclusive, 3 partial, 4 canceled, 5 internal failure,
-  6 invalid invocation. A run is `canceled` when the host cancels it
-  (`mssql_sqlcmd_diagnostics_cancel`; sqlcmd does so on Ctrl+C): the checks
-  that finished are kept and the others are skipped as `canceled`;
+  6 invalid invocation. A run is `partial` when this computer would not let a
+  check run (for example, the operating system refused to open the socket), and
+  `canceled` when the host cancels it (`mssql_sqlcmd_diagnostics_cancel`; sqlcmd
+  does so on Ctrl+C): the checks that finished are kept and the others are
+  skipped as `canceled`;
 - findings marked `confirmed`, `suspected` or `informational`, and no
   remediation advice;
-- the ordered error chain with its identifiers (a symbolic code, such as
-  `invalidPort`);
-- the specialist domain for a support handoff (`client.inputConfiguration`,
-  ..., or `undetermined` with candidates), never presented as a root cause;
-  unless a diagnosed check named it, the text and `specialistDomain.note` say
-  it is the area for a support handoff, not a confirmed cause;
+- the ordered error chain with its identifiers (operating-system error,
+  symbolic code), noting where a classification relied on message text;
+- the specialist domain for a support handoff (`connectivity.network`,
+  `connectivity.nameResolution`, ..., or `undetermined` with candidates),
+  never presented as a root cause; unless a diagnosed check named it, the
+  text and `specialistDomain.note` say it is the area for a support handoff,
+  not a confirmed cause;
 - limitations;
 - the client's operating system and version;
 - `coverageMatrixVersion`, the version of
   [the diagnostic coverage matrix](docs/diagnose-coverage.md) the checks follow.
 
 Output is share-safe by default: server, instance, database, host (the `-F`
-certificate name included) and user identifiers are replaced with labels (`host-1`, `server-1`) that are
+certificate name included), address and user identifiers are replaced with labels (`host-1`, `address-2`) that are
 stable within one run only, in the text and JSON report alike, and error text
 is flagged for review before sharing. `--local-detail` shows the values and
 marks the output as not share-safe. The password is never part of the report.
 
-The checks that connect use `mssql-tds`, which is 64-bit only, so 32-bit
-builds (`win-x86`) leave diagnose out: there `mssql_sqlcmd_diagnostics_run`
-returns `MSSQL_SQLCMD_UNSUPPORTED`.
+The checks observe the client's real connection: sqlcmd makes no network call
+of its own. `mssql-tds` makes one connection attempt, as a normal run does,
+through its diagnostic entry point (`TdsConnectionProvider::diagnose_client`):
+it resolves the name, asks SQL Server Browser (always, past its instance
+cache), follows its protocol order and connects. The depth sets where it
+stops: after resolution (`endpointResolution`), or once the transport is
+open, before pre-login (`networkReachability` and deeper, in this build).
+Over TCP, once an address accepts, the client also connects to the addresses
+after it (up to 64), at the same time and each within the time limit,
+closing each connection at once, so every address is reported. The
+attempt's connect-stage spans (target `mssql_tds::connect`, see
+`mssql_tds::connection::connect_stage`), recorded by a `tracing` layer that
+enables nothing else, are the evidence: each stage (`dns`, `instance_lookup`,
+`tcp`, `pipe`) records what it found, and whether
+it succeeded or failed with what; a stage the time limit cut short was
+abandoned, which is not a failure.
+
+A server given without a protocol prefix or port on Windows follows the
+client's protocol order: shared memory first for this computer (when it
+connects, the TCP checks do not apply), then TCP, then named pipes. The
+errors of a transport the order moved past stay in the JSON report, marked
+`superseded`, as a normal run would not print them. With a port, or
+elsewhere, it is TCP alone, and `lpc:` (on Windows, to this computer only)
+or `np:` diagnoses a transport directly.
+
+`mssql-tds` is 64-bit only, so 32-bit builds (`win-x86`) leave diagnose out:
+there `mssql_sqlcmd_diagnostics_run` returns `MSSQL_SQLCMD_UNSUPPORTED`.
 
 ## Building for native sqlcmd
 
@@ -148,10 +179,11 @@ cargo build -p mssql-sqlcmd --release
 ```
 
 produces `target/release/mssql_sqlcmd.lib` (Windows) or `libmssql_sqlcmd.a`.
-Its Rust dependencies (`serde`, `serde_json`, and on 64-bit targets the
-operating-system bindings diagnose uses) are compiled into the archive, so a
-consumer links no third-party Rust library. The system libraries it needs at
-link time are listed by:
+Its Rust dependencies (`serde`, `serde_json`, and on 64-bit targets `mssql-tds`
+for diagnose) are compiled into the archive, so a consumer links no third-party
+Rust library. `mssql-tds` needs the TLS libraries it uses: Schannel and other
+Win32 libraries on Windows, OpenSSL (`libssl`, `libcrypto`) on Linux. The system
+libraries it needs at link time are listed by:
 
 ```text
 cargo rustc -p mssql-sqlcmd --release --lib -- --print native-static-libs

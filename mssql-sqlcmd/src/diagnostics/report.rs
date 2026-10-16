@@ -14,14 +14,17 @@
 //!
 //! ```text
 //! sqlcmd diagnose: server-1
-//! Depth: Connection input; SqlPassword login user-1; encrypt mandatory; server certificate trusted (-C)
+//! Depth: Network reachability; SqlPassword login user-1; encrypt mandatory; server certificate trusted (-C)
 //! Share-safe: identifiers are shown as labels (host-1, ...); --local-detail shows them.
 //!
 //!   Check                 Result          Time  Details
 //!   Connection input      PASSED         <1 ms  tcp, host host-1, port 1433
+//!   Name resolution       PASSED          9 ms  host-1: address-1, address-2
+//!   Instance resolution   N/A                   not a named instance
+//!   TCP connect           PASSED          2 ms  port 1433: address-1 connected, address-2 refused
 //!
 //! Outcome:   passed (exit code 0: every check at the requested depth passed)
-//! Execution: completed; deepest phase evaluated: Connection input
+//! Execution: completed; deepest phase evaluated: Network reachability
 //! ```
 
 use std::fmt::Write;
@@ -141,6 +144,9 @@ fn redactor(report: &Report) -> Redactor {
                 r.name(category, &field.value);
             }
         }
+        for attempt in &check.attempts {
+            r.name(Category::Address, &attempt.address.to_string());
+        }
     }
     r
 }
@@ -159,6 +165,10 @@ fn status_label(coverage: Coverage) -> &'static str {
 fn skip_text(skip: &Skip) -> String {
     match skip {
         Skip::BlockedBy(check) => format!("blocked by {}", check.title()),
+        Skip::PortRequired => {
+            "needs a confirmed port: give an explicit host,port for the named instance".to_string()
+        }
+        Skip::NotApplicable(why) => (*why).to_string(),
         Skip::Canceled => "canceled before it finished".to_string(),
         Skip::NotInThisBuild => "not checked by this build".to_string(),
     }
@@ -167,6 +177,8 @@ fn skip_text(skip: &Skip) -> String {
 fn skip_reason(skip: &Skip) -> &'static str {
     match skip {
         Skip::BlockedBy(_) => "blockedByPrerequisite",
+        Skip::PortRequired => "explicitPortRequired",
+        Skip::NotApplicable(_) => "notApplicable",
         Skip::Canceled => "canceled",
         Skip::NotInThisBuild => "notCheckedByThisBuild",
     }
@@ -244,12 +256,50 @@ fn check_text(check: &Check, r: &mut Redactor) -> String {
             }
             parts.join(", ")
         }
+        super::CheckId::NameResolution => {
+            let host = named(r, "host").join("");
+            let addresses = named(r, "addresses");
+            if addresses.is_empty() {
+                format!("{host}: {}", field("result"))
+            } else {
+                format!("{host}: {}", addresses.join(", "))
+            }
+        }
+        super::CheckId::InstanceResolution => match check.field("port") {
+            Some(port) => format!(
+                "{}\\{}: port {port}",
+                named(r, "host").join(""),
+                named(r, "instance").join("")
+            ),
+            None if check.field("pipe").is_some() => format!(
+                "{}\\{}: pipe {}",
+                named(r, "host").join(""),
+                named(r, "instance").join(""),
+                named(r, "pipe").join("")
+            ),
+            None => format!(
+                "{}\\{}: no usable port",
+                named(r, "host").join(""),
+                named(r, "instance").join("")
+            ),
+        },
+        super::CheckId::TcpConnect => {
+            let attempts: Vec<String> = check
+                .attempts
+                .iter()
+                .map(|a| {
+                    let os = a.os_error.map_or(String::new(), |e| format!(" ({e})"));
+                    format!(
+                        "{} {}{os}",
+                        r.name(Category::Address, &a.address.to_string()),
+                        a.result.name()
+                    )
+                })
+                .collect();
+            format!("port {}: {}", field("port"), attempts.join(", "))
+        }
         // Not run by this build: skipped, so described above.
-        super::CheckId::NameResolution
-        | super::CheckId::InstanceResolution
-        | super::CheckId::TcpConnect
-        | super::CheckId::ConnectionAttempt
-        | super::CheckId::SessionValidation => String::new(),
+        super::CheckId::ConnectionAttempt | super::CheckId::SessionValidation => String::new(),
     }
 }
 
@@ -722,8 +772,8 @@ fn is_false(value: &bool) -> bool {
 
 /// One check. Its own fields (`protocol`, `host`, `port`, `addresses`, ...)
 /// vary by check, so the entry is written by hand, in this order: the check,
-/// its depth and status, its duration, why it was skipped, its fields, then
-/// where its settings came from (connection input).
+/// its depth and status, its duration, why it was skipped, its fields, where
+/// its settings came from (connection input), then its connection attempts.
 struct CheckView {
     check: &'static str,
     depth: &'static str,
@@ -733,6 +783,7 @@ struct CheckView {
     skip: Option<SkipView>,
     fields: Vec<(&'static str, FieldValue)>,
     sources: Option<SourcesView>,
+    attempts: Vec<AttemptView>,
 }
 
 enum SkipView {
@@ -751,6 +802,17 @@ enum FieldValue {
     List(Vec<String>),
     Number(i64),
     Text(String),
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AttemptView {
+    address: String,
+    port: u16,
+    result: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    os_error: Option<i32>,
+    duration_ms: u64,
 }
 
 impl CheckView {
@@ -797,6 +859,17 @@ impl CheckView {
             sources: (check.id == super::CheckId::ConnectionInput)
                 .then(|| SourcesView::new(sources))
                 .and_then(SourcesView::non_empty),
+            attempts: check
+                .attempts
+                .iter()
+                .map(|attempt| AttemptView {
+                    address: r.name(Category::Address, &attempt.address.to_string()),
+                    port: attempt.port,
+                    result: attempt.result.name(),
+                    os_error: attempt.os_error,
+                    duration_ms: attempt.duration_ms,
+                })
+                .collect(),
         }
     }
 }
@@ -830,6 +903,9 @@ impl Serialize for CheckView {
         if let Some(sources) = &self.sources {
             map.serialize_entry("sources", sources)?;
         }
+        if !self.attempts.is_empty() {
+            map.serialize_entry("attempts", &self.attempts)?;
+        }
         map.end()
     }
 }
@@ -838,7 +914,8 @@ impl Serialize for CheckView {
 mod tests {
     use super::super::target::{Protocol, Target};
     use super::super::{
-        Certainty, CheckId, DiagnosticOutcome, Domain, ExecutionStatus, Field, Finding,
+        Certainty, CheckId, DiagnosticOutcome, Domain, ErrorRecord, ExecutionStatus, Field,
+        Finding, TcpAttempt, TcpResult,
     };
     use super::*;
 
@@ -849,33 +926,78 @@ mod tests {
             duration_ms: Some(ms),
             deadline_ms: None,
             fields,
+            attempts: Vec::new(),
             skip: None,
             domain: None,
         }
     }
 
     fn passing_report() -> Report {
-        let request = crate::diagnostics::tests::request("tcp:db01,1433", Depth::ConnectionInput);
+        let request =
+            crate::diagnostics::tests::request("tcp:db01,1433", Depth::NetworkReachability);
+        let mut tcp = check(
+            CheckId::TcpConnect,
+            Coverage::Passed,
+            2,
+            vec![Field::plain("port", "1433")],
+        );
+        tcp.attempts = vec![
+            TcpAttempt {
+                address: "10.0.0.1".parse().unwrap(),
+                port: 1433,
+                result: TcpResult::Connected,
+                os_error: None,
+                duration_ms: 1,
+            },
+            TcpAttempt {
+                address: "::1".parse().unwrap(),
+                port: 1433,
+                result: TcpResult::Refused,
+                os_error: Some(10061),
+                duration_ms: 1,
+            },
+        ];
         Report {
             request,
             start_unix_ms: 1_791_000_000_123,
-            duration_ms: 1,
+            duration_ms: 20,
             target: Some(Target {
                 protocol: Protocol::Tcp,
                 host: "db01".to_string(),
                 instance: None,
                 port: Some(1433),
             }),
-            checks: vec![check(
-                CheckId::ConnectionInput,
-                Coverage::Passed,
-                0,
-                vec![
-                    Field::plain("protocol", "tcp"),
-                    Field::identifier("host", "db01", Category::Host),
-                    Field::plain("port", "1433"),
-                ],
-            )],
+            checks: vec![
+                check(
+                    CheckId::ConnectionInput,
+                    Coverage::Passed,
+                    0,
+                    vec![
+                        Field::plain("protocol", "tcp"),
+                        Field::identifier("host", "db01", Category::Host),
+                        Field::plain("port", "1433"),
+                    ],
+                ),
+                check(
+                    CheckId::NameResolution,
+                    Coverage::Passed,
+                    9,
+                    vec![
+                        Field::identifier("host", "db01", Category::Host),
+                        Field::plain("result", "resolved"),
+                        Field::identifier("addresses", "10.0.0.1", Category::Address),
+                        Field::identifier("addresses", "::1", Category::Address),
+                    ],
+                ),
+                Check {
+                    duration_ms: None,
+                    ..Check::skipped(
+                        CheckId::InstanceResolution,
+                        Skip::NotApplicable("not a named instance"),
+                    )
+                },
+                tcp,
+            ],
             findings: Vec::new(),
             errors: Vec::new(),
             domain: None,
@@ -885,12 +1007,39 @@ mod tests {
         }
     }
 
-    /// A server sqlcmd cannot parse, as [`crate::diagnostics::run`] reports it.
     fn failing_report() -> Report {
-        crate::diagnostics::run(crate::diagnostics::tests::request(
-            "tcp:db01,99999",
-            Depth::SessionValidation,
-        ))
+        let mut report = passing_report();
+        report.checks.truncate(4);
+        report.checks[3].coverage = Coverage::Diagnosed;
+        report.checks[3].attempts[0].result = TcpResult::Refused;
+        report.checks[3].attempts[0].os_error = Some(10061);
+        report.checks.push(Check::skipped(
+            CheckId::ConnectionAttempt,
+            Skip::BlockedBy(CheckId::TcpConnect),
+        ));
+        report.outcome = DiagnosticOutcome::IssueDetected;
+        report.domain = Some(Domain {
+            primary: "undetermined",
+            candidates: vec!["connectivity.network", "target.sqlServer"],
+            diagnosed: false,
+        });
+        report.findings = vec![Finding {
+            certainty: Certainty::Confirmed,
+            check: CheckId::TcpConnect,
+            text:
+                "No address accepted a TCP connection on port 1433: 10.0.0.1 refused, ::1 refused."
+                    .to_string(),
+            quotes_message: false,
+        }];
+        let mut error = ErrorRecord::new(
+            "os",
+            CheckId::TcpConnect,
+            "10.0.0.1:1433: connection refused by db01",
+        );
+        error.os_error = Some(10061);
+        error.code = Some("refused".to_string());
+        report.errors = vec![error];
+        report
     }
 
     #[test]
@@ -910,14 +1059,17 @@ mod tests {
         let text = full.replacen(&format!("{client}\n"), "", 1);
         let expected = "\
 sqlcmd diagnose: server-1
-Depth: Connection input; SqlPassword login user-1; encrypt mandatory; server certificate trusted (-C)
+Depth: Network reachability; SqlPassword login user-1; encrypt mandatory; server certificate trusted (-C)
 Share-safe: identifiers are shown as labels (host-1, ...); --local-detail shows them.
 
   Check                 Result            Time  Details
   Connection input      PASSED           <1 ms  tcp, host host-1, port 1433
+  Name resolution       PASSED            9 ms  host-1: address-1, address-2
+  Instance resolution   N/A                     not a named instance
+  TCP connect           PASSED            2 ms  port 1433: address-1 connected, address-2 refused (10061)
 
 Outcome:   passed (exit code 0: every check at the requested depth passed)
-Execution: completed; deepest phase evaluated: Connection input
+Execution: completed; deepest phase evaluated: Network reachability
 
 Limitations:
   - A limitation.
@@ -928,19 +1080,40 @@ Limitations:
     #[test]
     fn text_explains_a_failure_without_revealing_names() {
         let text = text(&failing_report());
-        for line in [
-            "  Connection input      DIAGNOSED        <1 ms  invalidPort\n",
-            "  Name resolution       SKIPPED                 blocked by Connection input\n",
-            "Outcome:   issueDetected (exit code 1: the diagnosis identified an issue)\n",
-            "Execution: completed; deepest phase evaluated: Connection input\n",
-            "[confirmed] The server given to -S could not be parsed: `99999` is not a port number from 1 to 65535.\n",
-            "\nSpecialist area: client.inputConfiguration\n",
-            "  sqlcmd [invalidPort]: `99999` is not a port number from 1 to 65535\n",
-            "Review error messages before sharing",
-        ] {
-            assert!(text.contains(line), "missing {line:?} in {text}");
-        }
-        for secret in ["db01", "secret-password", "'sa'"] {
+        assert!(
+            text.contains(
+                "  Connection attempt    SKIPPED                 blocked by TCP connect\n"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "Outcome:   issueDetected (exit code 1: the diagnosis identified an issue)\n"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("Execution: completed; deepest phase evaluated: Network reachability\n"),
+            "{text}"
+        );
+        assert!(text.contains("[confirmed] No address accepted a TCP connection on port 1433: address-1 refused, address-2 refused."), "{text}");
+        assert!(
+            text.contains(
+                "Specialist area: undetermined (candidates: connectivity.network, target.sqlServer) - the area for a support handoff, not a confirmed cause.\n"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "  os [os error 10061; refused]: address-1:1433: connection refused by host-1\n"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("Review error messages before sharing"),
+            "{text}"
+        );
+        for secret in ["db01", "10.0.0.1", "secret-password", "'sa'"] {
             assert!(!text.contains(secret), "{secret} in {text}");
         }
     }
@@ -951,10 +1124,11 @@ Limitations:
         report.request.local_detail = true;
         let text = text(&report);
         assert!(text.contains("NOT SHARE-SAFE"), "{text}");
-        assert!(text.contains("sqlcmd diagnose: tcp:db01,99999\n"), "{text}");
+        assert!(text.contains("10.0.0.1 refused"), "{text}");
+        assert!(!text.contains("secret-password"));
         let json = json(&report, "v").unwrap();
         assert!(json.contains("\"shareSafe\": false"), "{json}");
-        assert!(json.contains("\"server\": \"tcp:db01,99999\""), "{json}");
+        assert!(json.contains("\"server\": \"tcp:db01,1433\""), "{json}");
         assert!(json.contains("\"reviewBeforeSharing\": []"), "{json}");
     }
 
@@ -965,14 +1139,17 @@ Limitations:
             "\"contractVersion\": \"1.0\"",
             "\"command\": \"diagnose\"",
             "\"shareSafe\": true",
-            "\"requestedDepth\": \"connectionInput\"",
-            "\"deepestPhaseEvaluated\": \"connectionInput\"",
+            "\"requestedDepth\": \"networkReachability\"",
+            "\"deepestPhaseEvaluated\": \"networkReachability\"",
             "\"server\": \"server-1\"",
             "\"user\": \"user-1\"",
             "\"executionStatus\": \"completed\"",
             "\"diagnosticOutcome\": \"passed\"",
             "\"exitCode\": 0",
             "{ \"check\": \"connectionInput\", \"depth\": \"connectionInput\", \"status\": \"passed\", \"durationMs\": 0, \"protocol\": \"tcp\", \"host\": \"host-1\", \"port\": 1433 }",
+            "\"addresses\": [\"address-1\", \"address-2\"]",
+            "{ \"check\": \"instanceResolution\", \"depth\": \"endpointResolution\", \"status\": \"notApplicable\", \"reason\": \"notApplicable\", \"detail\": \"not a named instance\" }",
+            "{ \"address\": \"address-2\", \"port\": 1433, \"result\": \"refused\", \"osError\": 10061, \"durationMs\": 1 }",
             "\"findings\": []",
             "\"errors\": []",
             "\"reviewBeforeSharing\": []",
@@ -1009,6 +1186,34 @@ Limitations:
         assert!(
             json.contains("{ \"check\": \"connectionAttempt\", \"depth\": \"connectionAttempt\", \"status\": \"skipped\", \"reason\": \"notCheckedByThisBuild\", \"detail\": \"not checked by this build\" }"),
             "{json}"
+        );
+    }
+
+    #[test]
+    fn json_reports_a_skip_with_what_blocked_it() {
+        let json = json(&failing_report(), "v").unwrap();
+        assert!(
+            json.contains("{ \"check\": \"connectionAttempt\", \"depth\": \"connectionAttempt\", \"status\": \"skipped\", \"reason\": \"blockedByPrerequisite\", \"blockedBy\": \"tcpConnect\" }"),
+            "{json}"
+        );
+        assert!(
+            json.contains("\"diagnosticOutcome\": \"issueDetected\""),
+            "{json}"
+        );
+        assert!(json.contains("{ \"source\": \"os\", \"check\": \"tcpConnect\", \"osError\": 10061, \"code\": \"refused\", \"message\": \"address-1:1433: connection refused by host-1\" }"), "{json}");
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            value["specialistDomain"],
+            serde_json::json!({
+                "primary": "undetermined",
+                "candidates": ["connectivity.network", "target.sqlServer"],
+                "note": "the area for a support handoff, not a confirmed cause."
+            })
+        );
+        // Its finding is sqlcmd's own sentence, with labels: only the errors.
+        assert_eq!(
+            value["reviewBeforeSharing"],
+            serde_json::json!(["errors[].message"])
         );
     }
 
@@ -1066,52 +1271,33 @@ Limitations:
     }
 
     #[test]
-    fn json_reports_a_skip_with_what_blocked_it() {
-        let json = json(&failing_report(), "v").unwrap();
-        assert!(
-            json.contains("{ \"check\": \"nameResolution\", \"depth\": \"endpointResolution\", \"status\": \"skipped\", \"reason\": \"blockedByPrerequisite\", \"blockedBy\": \"connectionInput\" }"),
-            "{json}"
-        );
-        assert!(
-            json.contains("\"diagnosticOutcome\": \"issueDetected\""),
-            "{json}"
-        );
-        assert!(json.contains("{ \"source\": \"sqlcmd\", \"check\": \"connectionInput\", \"code\": \"invalidPort\", \"message\": \"`99999` is not a port number from 1 to 65535\" }"), "{json}");
-        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
-        // Diagnosed: the area is not called unconfirmed.
-        assert_eq!(
-            value["specialistDomain"],
-            serde_json::json!({ "primary": "client.inputConfiguration", "candidates": [] })
-        );
-        // Its finding is sqlcmd's own sentence: only the errors.
-        assert_eq!(
-            value["reviewBeforeSharing"],
-            serde_json::json!(["errors[].message"])
-        );
+    fn json_says_whether_the_depth_was_the_default() {
+        let mut report = passing_report();
+        for selected in [false, true] {
+            report.request.depth_selected = selected;
+            let value: serde_json::Value =
+                serde_json::from_str(&json(&report, "v").unwrap()).unwrap();
+            assert_eq!(value["requestedDepthIsDefault"], !selected);
+            assert_eq!(text(&report).contains("(default)"), !selected);
+        }
     }
 
-    /// Unless a diagnosed check named it, the specialist area is said to be
-    /// the area for a support handoff, not a confirmed cause.
     #[test]
-    fn an_undiagnosed_specialist_area_is_called_unconfirmed() {
+    fn a_superseded_error_is_kept_in_json_and_not_printed() {
         let mut report = failing_report();
-        report.domain = Some(Domain {
-            primary: "undetermined",
-            candidates: vec!["connectivity.network", "target.sqlServer"],
-            diagnosed: false,
-        });
+        report.errors[0].superseded = true;
+        let mut pipe = ErrorRecord::new("os", CheckId::ConnectionAttempt, "pipe not found");
+        pipe.os_error = Some(53);
+        report.errors.push(pipe);
         let text = text(&report);
+        assert!(!text.contains("connection refused by"), "{text}");
         assert!(
-            text.contains(
-                "Specialist area: undetermined (candidates: connectivity.network, target.sqlServer) - the area for a support handoff, not a confirmed cause.\n"
-            ),
+            text.contains("  os [os error 53]: pipe not found\n"),
             "{text}"
         );
         let value: serde_json::Value = serde_json::from_str(&json(&report, "v").unwrap()).unwrap();
-        assert_eq!(
-            value["specialistDomain"]["note"],
-            "the area for a support handoff, not a confirmed cause."
-        );
+        assert_eq!(value["errors"][0]["superseded"], true);
+        assert!(value["errors"][1].get("superseded").is_none(), "{value}");
     }
 
     #[test]
@@ -1126,22 +1312,10 @@ Limitations:
             "{json}"
         );
         assert!(
-            json.contains("\n  \"errors\": [\n    { \"source\": \"sqlcmd\""),
+            json.contains("\n  \"errors\": [\n    { \"source\": \"os\""),
             "{json}"
         );
         assert!(json.contains("\"exitCategory\": {\n    \"name\""), "{json}");
-    }
-
-    #[test]
-    fn json_says_whether_the_depth_was_the_default() {
-        let mut report = passing_report();
-        for selected in [false, true] {
-            report.request.depth_selected = selected;
-            let value: serde_json::Value =
-                serde_json::from_str(&json(&report, "v").unwrap()).unwrap();
-            assert_eq!(value["requestedDepthIsDefault"], !selected);
-            assert_eq!(text(&report).contains("(default)"), !selected);
-        }
     }
 
     #[test]
@@ -1204,20 +1378,23 @@ Limitations:
     #[test]
     fn json_carries_deadlines_the_client_and_the_coverage_matrix() {
         let mut report = passing_report();
-        let json_without = json(&report, "v").unwrap();
-        assert!(
-            json_without.contains("\"check\": \"connectionInput\", \"depth\": \"connectionInput\", \"status\": \"passed\", \"durationMs\": 0, \"protocol\""),
-            "a check without a time limit has no deadline: {json_without}"
-        );
-        report.checks[0].deadline_ms = Some(8000);
+        for check in &mut report.checks {
+            if check.id == CheckId::TcpConnect {
+                check.deadline_ms = Some(8000);
+            }
+        }
         let json = json(&report, "v").unwrap();
         assert!(
             json.contains("\"coverageMatrixVersion\": \"1.0\""),
             "{json}"
         );
         assert!(
-            json.contains("\"status\": \"passed\", \"durationMs\": 0, \"deadlineMs\": 8000,"),
+            json.contains("\"status\": \"passed\", \"durationMs\": 2, \"deadlineMs\": 8000,"),
             "{json}"
+        );
+        assert!(
+            json.contains("\"check\": \"connectionInput\", \"depth\": \"connectionInput\", \"status\": \"passed\", \"durationMs\": 0, \"protocol\""),
+            "a check without a time limit has no deadline: {json}"
         );
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
         if cfg!(any(windows, target_os = "linux", target_os = "macos")) {
