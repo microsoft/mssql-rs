@@ -115,6 +115,11 @@ function Set-MssqlTdsDependencyVersion {
         [Parameter(Mandatory = $true)][string]$Path
     )
 
+    # The target selector may be quoted, but the following table kind must be
+    # bare so escaped spellings cannot hide a dependency table or subtable.
+    if ($Content -match '(?m)^[ \t]*\[[ \t]*target[ \t]*\.[ \t]*(?:"(?:\\.|[^"\\\r\n])*"|''[^''\r\n]*''|[A-Za-z0-9_-]+)[ \t]*\.[ \t]*["'']') {
+        throw "Quoted target table kinds are unsupported in $Path"
+    }
     $sections = [regex]::Matches($Content, '(?ms)^[ \t]*\[[ \t]*dependencies[ \t]*\][ \t]*(?:#[^\r\n]*)?(?:\r?\n|\z).*?(?=^[ \t]*\[|\z)')
     $dependencySections = [regex]::Matches($Content, '(?ms)^[ \t]*\[[ \t]*(?:target[ \t]*\.[^\]\r\n]+?\.[ \t]*)?(?:dependencies|dev-dependencies|build-dependencies)[ \t]*\][ \t]*(?:#[^\r\n]*)?(?:\r?\n|\z).*?(?=^[ \t]*\[|\z)')
     $declarationCount = 0

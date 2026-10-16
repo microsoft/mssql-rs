@@ -2036,6 +2036,40 @@ def test_crate_stamp_rejects_quoted_dependency_subtables(stamp_manifests, table,
     assert_stamp_rejected(stamp_manifests, WhatIf=what_if)
 
 
+@pytest.mark.parametrize("kind", [
+    '"dependencies"', "'dependencies'",
+    '"dev-dependencies"', "'dev-dependencies'",
+    '"build-dependencies"', "'build-dependencies'",
+    '"dev\\u002ddependencies"',
+])
+@pytest.mark.parametrize("subtable", [False, True])
+@pytest.mark.parametrize("what_if", [False, True])
+def test_crate_stamp_rejects_quoted_target_table_kinds(stamp_manifests, kind, subtable, what_if):
+    path = stamp_manifests / "mssql-mock-tds" / "Cargo.toml"
+    header = f"target . 'cfg(windows)' . {kind}"
+    if subtable:
+        extra = f'[{header}.mssql-tds]\npath = "../mssql-tds"\nversion = "0.3.0"\n'
+    else:
+        extra = f'[{header}]\nmssql-tds = {{ path = "../mssql-tds", version = "0.3.0" }}\n'
+    content = path.read_text() + "\n" + extra
+    tomllib.loads(content)
+    path.write_bytes(content.encode())
+    assert_stamp_rejected(stamp_manifests, WhatIf=what_if)
+
+
+@pytest.mark.parametrize("selector", [
+    "'cfg(windows)'", '"cfg(windows)"', "x86_64-pc-windows-msvc",
+])
+def test_crate_stamp_preserves_target_selectors(stamp_manifests, selector):
+    path = stamp_manifests / "mssql-mock-tds" / "Cargo.toml"
+    content = path.read_text() + f'\n[target . {selector} . dev-dependencies]\nuuid = "1.19.0"\n'
+    tomllib.loads(content)
+    path.write_bytes(content.encode())
+    result = run_crate_stamp(stamp_manifests)
+    assert result.returncode == 0, result.stderr
+    assert path.read_bytes() == content.replace("0.3.0", "0.3.0-dev.20261015.123").encode()
+
+
 def test_crate_stamp_preserves_crlf_and_indented_declarations(stamp_manifests):
     for path in stamp_manifests.rglob("Cargo.toml"):
         path.write_bytes(path.read_text().replace("version =", "\tversion =").replace("\n", "\r\n").encode())

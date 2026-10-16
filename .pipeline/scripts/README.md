@@ -57,7 +57,11 @@ literal SemVer `version`; quoted keys and multiline strings in any of the mock
 crate's dependency sections (including dev/build and target-specific sections)
 are unsupported. Ordinary indentation, comments and LF/CRLF are preserved.
 Quoted dependency-name segments in dependency subtable headers are also
-unsupported. Triple-quote text inside ordinary strings or comments is preserved;
+unsupported. Target table kinds must be bare (for example
+`[target.'cfg(windows)'.dev-dependencies]`, not a quoted `dev-dependencies`
+segment); the target selector itself may still be quoted. This restriction also
+applies to dependency subtables and escaped quoted table-kind spellings.
+Triple-quote text inside ordinary strings or comments is preserved;
 only actual multiline-string delimiters are rejected.
 Multiline arrays in package fields or unrelated dependencies are supported, as
 are inline feature arrays and comments on table headers. Dependency declarations
