@@ -58,6 +58,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   columns, allowing Polars DataFrames to load without first converting the
   DataFrame to a PyArrow table.
 
+- `mssql-tds`: DNS caching. LOGIN7 always advertises feature extension `0x0B`,
+  as msodbcsql does. When a server acknowledges it, the host's latest
+  successful resolution is kept in a process-wide cache and used only if a
+  later resolution of that host fails, so connections survive a DNS outage
+  (AB#49294).
+
 - Initial public release of the mssql-rs workspace.
 
 ### Changed
