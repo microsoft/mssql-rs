@@ -690,4 +690,33 @@ mod data_classification_tests {
 
         server.stop().await;
     }
+
+    /// A malformed token on the first result set fails before any batch is
+    /// open, so the look-ahead itself must retire the connection: the reader
+    /// is left inside a token with no length prefix.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn malformed_classification_on_the_first_result_set_retires_the_connection() {
+        const MALFORMED: &str = "SELECT RANK FROM PEOPLE";
+        let version = DataClassificationVersion::Version2;
+        let server = Server::start_recoverable(version).await;
+        server
+            .registry
+            .lock()
+            .await
+            .register_with_data_classification(
+                MALFORMED,
+                int_response(&["rank"], 1),
+                token(version, &[("L", "L")], &[], 99, &[&[(0, UNSPECIFIED, 0)]]),
+            );
+        let mut client = server.connect(Some(version)).await;
+        assert!(client.is_session_recovery_enabled());
+
+        let error = client.execute(MALFORMED.to_string(), ()).await.unwrap_err();
+        assert!(error.to_string().contains("unknown value 99"), "{error}");
+        assert!(client.is_connection_dead());
+        assert!(!client.is_session_recovery_enabled());
+        assert!(client.data_classification().is_none());
+
+        server.stop().await;
+    }
 }
