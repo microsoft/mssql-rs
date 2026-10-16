@@ -608,6 +608,59 @@ pub const MSSQL_SQLCMD_SOURCE_UNKNOWN: i32 = 0;
 pub const MSSQL_SQLCMD_SOURCE_COMMAND_LINE: i32 = 1;
 pub const MSSQL_SQLCMD_SOURCE_ENVIRONMENT: i32 = 2;
 pub const MSSQL_SQLCMD_SOURCE_DEFAULT: i32 = 3;
+/// One diagnostic record of sqlcmd's own driver connection, as sqlcmd reads it.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct MssqlSqlcmdDriverRecord {
+    /// The ODBC SQLSTATE.
+    pub sql_state: MssqlSqlcmdText,
+    /// SQL Server's error number, or the driver's native error (0 for none).
+    pub native_error: i32,
+    /// SQL Server's severity, or -1 for a record the driver raised itself.
+    pub severity: i32,
+    /// SQL Server's state, or -1.
+    pub state: i32,
+    /// The message without the driver's `[vendor][component]` prefix.
+    pub message: MssqlSqlcmdText,
+    /// The line sqlcmd prints for the record; null or empty when it prints none.
+    pub line: MssqlSqlcmdText,
+}
+
+/// What sqlcmd's own driver connection did; filled by the callback.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct MssqlSqlcmdDriverResult {
+    /// Non-zero when the connection succeeded.
+    pub connected: i32,
+    pub connect_ms: i64,
+    /// Non-zero when the query was given, the connection succeeded and the
+    /// query failed.
+    pub query_failed: i32,
+    pub query_ms: i64,
+    /// The query's first row, one text per column; a null `data` is SQL NULL.
+    pub values: *const MssqlSqlcmdText,
+    pub value_count: usize,
+    /// The connection's records, then the query's, in order.
+    pub records: *const MssqlSqlcmdDriverRecord,
+    pub record_count: usize,
+    /// e.g. `Microsoft ODBC Driver 18 for SQL Server`; null or empty if unknown.
+    pub driver_name: MssqlSqlcmdText,
+}
+
+/// sqlcmd's own driver connection: connects with sqlcmd's driver and settings
+/// within `timeout_seconds`, runs `query` when it is not null or empty,
+/// disconnects, and fills `*result`. Returns [`MSSQL_SQLCMD_OK`] (a failed
+/// connection is a result, not an error). Called at most once per diagnosis,
+/// on the thread that called [`mssql_sqlcmd_diagnostics_run`]; what
+/// `*result` points to must stay valid until that call returns.
+pub type MssqlSqlcmdDriverConnect = Option<
+    unsafe extern "C" fn(
+        context: *mut std::ffi::c_void,
+        query: MssqlSqlcmdText,
+        timeout_seconds: i32,
+        result: *mut MssqlSqlcmdDriverResult,
+    ) -> i32,
+>;
 
 /// What `sqlcmd diagnose` checks.
 #[repr(C)]
@@ -657,6 +710,13 @@ pub struct MssqlSqlcmdDiagnosticsRequest {
     pub trust_server_certificate_source_name: MssqlSqlcmdText,
     pub host_name_in_certificate_source_name: MssqlSqlcmdText,
     pub login_timeout_source_name: MssqlSqlcmdText,
+    /// sqlcmd's own driver connection, or null. When given, the connection
+    /// attempt and session validation are made through it and decide the
+    /// result; `mssql-tds` then only adds evidence where the driver's errors
+    /// leave the cause open.
+    pub driver_connect: MssqlSqlcmdDriverConnect,
+    /// Passed to `driver_connect` as it is.
+    pub driver_context: *mut std::ffi::c_void,
 }
 
 /// Diagnoses the connection `request` describes, up to its depth, and renders
@@ -825,6 +885,10 @@ pub unsafe extern "C" fn mssql_sqlcmd_diagnostics_run(
             json: format == MSSQL_SQLCMD_REPORT_JSON,
             #[cfg(target_pointer_width = "64")]
             sources,
+            #[cfg(target_pointer_width = "64")]
+            driver: request
+                .driver_connect
+                .map(|connect| driver_hook(connect, request.driver_context)),
         }
     };
 
@@ -864,6 +928,127 @@ struct DiagnosticsInput {
     json: bool,
     #[cfg(target_pointer_width = "64")]
     sources: SettingSources,
+    #[cfg(target_pointer_width = "64")]
+    driver: Option<diagnostics::driver::DriverHook>,
+}
+
+/// The caller's context pointer, passed back to its callback as it is.
+#[cfg(target_pointer_width = "64")]
+struct DriverContext(*mut std::ffi::c_void);
+
+// SAFETY: the pointer is only handed back to the caller's callback, which the
+// library calls on the thread that called mssql_sqlcmd_diagnostics_run.
+#[cfg(target_pointer_width = "64")]
+unsafe impl Send for DriverContext {}
+// SAFETY: as for Send; the library never dereferences it.
+#[cfg(target_pointer_width = "64")]
+unsafe impl Sync for DriverContext {}
+
+#[cfg(target_pointer_width = "64")]
+impl DriverContext {
+    fn get(&self) -> *mut std::ffi::c_void {
+        self.0
+    }
+}
+
+/// sqlcmd's driver connection callback as a [`DriverHook`].
+#[cfg(target_pointer_width = "64")]
+fn driver_hook(
+    connect: unsafe extern "C" fn(
+        *mut std::ffi::c_void,
+        MssqlSqlcmdText,
+        i32,
+        *mut MssqlSqlcmdDriverResult,
+    ) -> i32,
+    context: *mut std::ffi::c_void,
+) -> diagnostics::driver::DriverHook {
+    let context = DriverContext(context);
+    diagnostics::driver::DriverHook::new(move |query, seconds| {
+        call_driver(connect, context.get(), query, seconds)
+    })
+}
+
+/// Calls the driver connection and reads what it returned.
+#[cfg(target_pointer_width = "64")]
+fn call_driver(
+    connect: unsafe extern "C" fn(
+        *mut std::ffi::c_void,
+        MssqlSqlcmdText,
+        i32,
+        *mut MssqlSqlcmdDriverResult,
+    ) -> i32,
+    context: *mut std::ffi::c_void,
+    query: Option<&str>,
+    seconds: u32,
+) -> diagnostics::driver::DriverOutcome {
+    use diagnostics::driver::{DriverOutcome, DriverRecord};
+    let query: Vec<u16> = query.unwrap_or_default().encode_utf16().collect();
+    let query = MssqlSqlcmdText {
+        data: if query.is_empty() {
+            std::ptr::null()
+        } else {
+            query.as_ptr()
+        },
+        len: query.len(),
+    };
+    let none = MssqlSqlcmdText {
+        data: std::ptr::null(),
+        len: 0,
+    };
+    let mut result = MssqlSqlcmdDriverResult {
+        connected: 0,
+        connect_ms: 0,
+        query_failed: 0,
+        query_ms: 0,
+        values: std::ptr::null(),
+        value_count: 0,
+        records: std::ptr::null(),
+        record_count: 0,
+        driver_name: none,
+    };
+    // SAFETY: the caller of mssql_sqlcmd_diagnostics_run supplied the callback
+    // and its context; the query and result outlive the call.
+    let status = unsafe {
+        connect(
+            context,
+            query,
+            i32::try_from(seconds).unwrap_or(i32::MAX),
+            &mut result,
+        )
+    };
+    if status != MSSQL_SQLCMD_OK {
+        return DriverOutcome {
+            records: vec![DriverRecord {
+                message: format!("sqlcmd's driver connection could not run (status {status})"),
+                ..DriverRecord::default()
+            }],
+            ..DriverOutcome::default()
+        };
+    }
+    // SAFETY: the callback filled *result with arrays and texts valid until
+    // mssql_sqlcmd_diagnostics_run returns.
+    unsafe {
+        let row = read_array(result.values, result.value_count, |value| read_text(value))
+            .unwrap_or_default();
+        let records = read_array(result.records, result.record_count, |r| DriverRecord {
+            sql_state: read_text(r.sql_state).unwrap_or_default(),
+            native_error: r.native_error,
+            severity: (r.severity >= 0).then_some(r.severity),
+            state: (r.state >= 0).then_some(r.state),
+            message: read_text(r.message).unwrap_or_default(),
+            line: read_text(r.line).unwrap_or_default(),
+        })
+        .unwrap_or_default();
+        DriverOutcome {
+            connected: result.connected != 0,
+            connect_ms: u64::try_from(result.connect_ms).unwrap_or(0),
+            query_failed: result.query_failed != 0,
+            query_ms: u64::try_from(result.query_ms).unwrap_or(0),
+            row,
+            records,
+            driver_name: read_optional_text(result.driver_name),
+        }
+    }
 }
 
 /// Runs the diagnosis and renders the report, with sqlcmd's exit code.
@@ -899,6 +1084,7 @@ fn diagnose(input: DiagnosticsInput) -> Option<(String, i32)> {
         local_detail: input.local_detail,
         invalid: input.invalid_reason,
         sources: input.sources,
+        driver: input.driver,
     };
     let report = diagnostics::run(request);
     let text = if input.json {
@@ -1653,6 +1839,8 @@ mod tests {
             trust_server_certificate_source_name: NULL_TEXT,
             host_name_in_certificate_source_name: NULL_TEXT,
             login_timeout_source_name: NULL_TEXT,
+            driver_connect: None,
+            driver_context: std::ptr::null_mut(),
         }
     }
 

@@ -326,6 +326,15 @@ fn check_text(check: &Check, r: &mut Redactor) -> String {
         }
         super::CheckId::ConnectionAttempt => {
             let mut text = phases_text(&check.subphases);
+            // sqlcmd's own connection failed; the phases are the diagnostic
+            // client's, which connected too for evidence.
+            if let Some(outcome) = check.field("diagnosticClient") {
+                text = if text.is_empty() {
+                    format!("mssql-tds {outcome}")
+                } else {
+                    format!("mssql-tds {outcome}: {text}")
+                };
+            }
             if let Some(transport) = check.field("transport") {
                 let pipe = named(r, "pipe");
                 if pipe.is_empty() {
@@ -492,10 +501,12 @@ pub fn text(report: &Report) -> String {
         }
         let _ = write!(
             out,
-            ", database {}, {}",
-            r.name(Category::Database, &server.database),
-            encrypted_text(report, server.encrypted)
+            ", database {}",
+            r.name(Category::Database, &server.database)
         );
+        if let Some(encrypted) = server.encrypted {
+            let _ = write!(out, ", {}", encrypted_text(report, encrypted));
+        }
         if let Some(target_type) = server.target_type() {
             let _ = write!(out, ", {target_type}");
         }
@@ -543,7 +554,12 @@ pub fn text(report: &Report) -> String {
             // As a normal sqlcmd run prints it, when the driver has a wording
             // for the event; one line for the same text from several addresses.
             // A transport the client moved past is in the JSON report only.
-            let line = if let Some(text) = &error.text {
+            let line = if let Some(printed) = &error.printed {
+                format!("  {}", r.text(printed))
+            } else if error.source == "driver" {
+                // A record sqlcmd itself does not print.
+                continue;
+            } else if let Some(text) = &error.text {
                 format!(
                     "  Sqlcmd: Error: {} : {}.",
                     super::driver_text::CLIENT,
@@ -688,6 +704,7 @@ pub fn json(report: &Report, version: &str) -> Result<String, serde_json::Error>
                 class: error.class,
                 os_error: error.os_error,
                 code: error.code.as_deref(),
+                sql_state: error.sql_state.as_deref(),
                 message: r.text(&error.message),
                 text: error.text.as_deref().map(|text| r.text(text)),
                 superseded: error.superseded,
@@ -891,7 +908,8 @@ struct ServerView<'a> {
     name: Option<String>,
     version: Option<&'a str>,
     database: String,
-    encrypted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    encrypted: Option<bool>,
     target_type: Option<&'static str>,
 }
 
@@ -928,6 +946,9 @@ struct ErrorView<'a> {
     os_error: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     code: Option<&'a str>,
+    /// The ODBC SQLSTATE, for a record of sqlcmd's own driver connection.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sql_state: Option<&'a str>,
     message: String,
     /// What a normal sqlcmd run prints for the same event.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1247,7 +1268,7 @@ mod tests {
                 name: Some("DB01".to_string()),
                 version: Some("17.0.4085".to_string()),
                 database: "master".to_string(),
-                encrypted: true,
+                encrypted: Some(true),
                 engine_edition: Some(3),
             }),
             domain: None,
@@ -1474,7 +1495,7 @@ Limitations:
     #[test]
     fn an_unencrypted_session_says_what_was_negotiated() {
         let mut report = passing_report();
-        report.server.as_mut().unwrap().encrypted = false;
+        report.server.as_mut().unwrap().encrypted = Some(false);
         for (negotiated, expected) in [
             (Some("off"), ", not encrypted, "),
             (Some("loginOnly"), ", only the login encrypted, "),
@@ -1628,6 +1649,41 @@ Limitations:
         // JSON keeps both records: each address is evidence.
         let value: serde_json::Value = serde_json::from_str(&json(&report, "v").unwrap()).unwrap();
         assert_eq!(value["errors"].as_array().map(Vec::len), Some(2));
+    }
+
+    #[test]
+    fn a_driver_record_prints_as_sqlcmd_prints_it() {
+        let mut report = failing_report();
+        let mut printed = ErrorRecord::new(
+            "driver",
+            CheckId::ConnectionAttempt,
+            "Login failed for user 'sa'.",
+        );
+        printed.number = Some(18456);
+        printed.sql_state = Some("28000".to_string());
+        printed.printed = Some(
+            "Sqlcmd: Error: Microsoft ODBC Driver 18 for SQL Server : Login failed for user 'sa'.."
+                .to_string(),
+        );
+        let mut silent = ErrorRecord::new(
+            "driver",
+            CheckId::ConnectionAttempt,
+            "Changed database context",
+        );
+        silent.number = Some(5701);
+        report.errors = vec![printed, silent];
+        let text = text(&report);
+        assert!(
+            text.contains(
+                "\n  Sqlcmd: Error: Microsoft ODBC Driver 18 for SQL Server : Login failed for \
+                 user 'user-1'..\n"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("Changed database context"), "{text}");
+        let value: serde_json::Value = serde_json::from_str(&json(&report, "v").unwrap()).unwrap();
+        assert_eq!(value["errors"][0]["sqlState"], "28000");
+        assert_eq!(value["errors"][1]["number"], 5701);
     }
 
     #[test]

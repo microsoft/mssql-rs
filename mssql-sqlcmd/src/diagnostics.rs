@@ -32,9 +32,14 @@
 //! diagnostic entry point, which stops where the depth asks and also connects
 //! to the addresses after the one it uses. Its connect-stage spans
 //! ([`stages`]) are the evidence: the checks are read from them and from how
-//! the attempt ended. The password is used to log in and is never part of the
-//! report.
+//! the attempt ended. When the caller supplies its own driver connection
+//! ([`driver`]), the connection attempt and session validation are made
+//! through it and decide the result, as sqlcmd connects for a query: the
+//! diagnostic connection then stops once its transport is open, and logs in
+//! only to add evidence where the driver's errors leave the cause open. The
+//! password is used to log in and is never part of the report.
 
+pub mod driver;
 pub mod driver_text;
 pub mod redact;
 pub mod report;
@@ -45,7 +50,9 @@ use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use mssql_tds::connection::client_context::{ClientContext, TdsAuthenticationMethod};
+use mssql_tds::connection::client_context::{
+    ClientContext, TdsAuthenticationMethod, TransportContext,
+};
 use mssql_tds::connection::connect_stage;
 use mssql_tds::connection::tds_client::{ResultSet, StatementResult, TdsClient};
 use mssql_tds::connection_provider::tds_connection_provider::{
@@ -255,6 +262,9 @@ pub struct Request {
     pub invalid: Option<String>,
     /// Where resolved non-secret connection settings came from.
     pub sources: SettingSources,
+    /// sqlcmd's own driver connection: when given, it makes the connection
+    /// attempt and session validation, and mssql-tds only adds evidence.
+    pub driver: Option<driver::DriverHook>,
 }
 
 impl Request {
@@ -611,6 +621,11 @@ pub struct ErrorRecord {
     /// What a normal sqlcmd run prints for the same event, in the ODBC
     /// driver's wording (see [`driver_text`]); `None` when it has no equivalent.
     pub text: Option<String>,
+    /// The ODBC SQLSTATE, for a record of sqlcmd's own driver connection.
+    pub sql_state: Option<String>,
+    /// The line sqlcmd prints for a record of its own driver connection,
+    /// printed as it is.
+    pub printed: Option<String>,
     /// From a transport sqlcmd then moved past, without a protocol prefix
     /// (TCP before named pipes): kept as evidence, but a normal run, which
     /// reports only the last transport's errors, would not print it.
@@ -631,6 +646,8 @@ impl ErrorRecord {
             code: None,
             message: message.into(),
             text: None,
+            sql_state: None,
+            printed: None,
             superseded: false,
             from_message_text: false,
         }
@@ -694,7 +711,8 @@ pub struct ServerInfo {
     pub version: Option<String>,
     pub database: String,
     /// Whether everything after login stays encrypted.
-    pub encrypted: bool,
+    /// `None` when it is not known (sqlcmd's own driver does not say).
+    pub encrypted: Option<bool>,
     /// From session validation: `SERVERPROPERTY('EngineEdition')`.
     pub engine_edition: Option<i32>,
 }
@@ -1228,7 +1246,7 @@ impl Diagnosis {
         if steps.is_empty() {
             return;
         }
-        Box::pin(self.observe(&target, steps, &Ended::Canceled, 0, None)).await;
+        Box::pin(self.observe(&target, steps, &Ended::Canceled, 0, None, None)).await;
     }
     fn wants(&self, depth: Depth) -> bool {
         self.request.depth >= depth
@@ -1285,10 +1303,20 @@ impl Diagnosis {
         // A named instance's DAC port comes from SQL Server Browser's DAC
         // request, which the client does not make: only the name is checked.
         let dac_lookup = target.protocol == Protocol::Admin && target.instance.is_some();
+        // sqlcmd's own driver connection, which decides the connection attempt.
+        let driver = self
+            .request
+            .driver
+            .clone()
+            .filter(|_| self.wants(Depth::ConnectionAttempt));
         let stop_after = match self.request.depth {
             _ if dac_lookup => Some(DiagnosticStop::Resolution),
             Depth::ConnectionInput | Depth::EndpointResolution => Some(DiagnosticStop::Resolution),
             Depth::NetworkReachability => Some(DiagnosticStop::Transport),
+            // sqlcmd's own driver makes the connection attempt: the
+            // diagnostic connection gives the network evidence, without
+            // logging in.
+            _ if driver.is_some() => Some(DiagnosticStop::Transport),
             Depth::ConnectionAttempt | Depth::SessionValidation => None,
         };
         let probe = DiagnosticProbe {
@@ -1322,7 +1350,7 @@ impl Diagnosis {
             }
             return;
         }
-        Box::pin(self.observe(&target, steps, &ended, attempt_ms, client.as_ref())).await;
+        Box::pin(self.observe(&target, steps, &ended, attempt_ms, client.as_ref(), driver)).await;
         match client {
             Some(mut client) => {
                 if self.wants(Depth::SessionValidation) {
@@ -1388,6 +1416,7 @@ impl Diagnosis {
         ended: &Ended,
         attempt_ms: u64,
         client: Option<&TdsClient>,
+        driver: Option<driver::DriverHook>,
     ) {
         steps.sort_by_key(|s| s.started);
         let timed_out = ended.timed_out();
@@ -1492,7 +1521,11 @@ impl Diagnosis {
             None => lookup_blocks,
             _ => None,
         };
-        if let Some(skip) = blocked {
+        // Without a prefix, sqlcmd's own driver follows its protocol order
+        // itself: a failed TCP path does not stop it.
+        let protocol_order =
+            cfg!(windows) && target.protocol == Protocol::Default && target.port.is_none();
+        if let Some(skip) = blocked.filter(|_| driver.is_none() || !protocol_order) {
             self.checks
                 .push(Check::skipped(CheckId::ConnectionAttempt, skip.clone()));
             self.skip_rest(CheckId::ConnectionAttempt, &skip);
@@ -1504,12 +1537,48 @@ impl Diagnosis {
                 .push(Check::skipped(CheckId::ConnectionAttempt, Skip::Canceled));
             return;
         }
+        if let Some(driver) = driver {
+            let endpoint = match (ended, primary) {
+                (Ended::Stopped, Some(group)) => spn_endpoint(target, group),
+                _ => None,
+            };
+            Box::pin(self.driver_attempt(driver, target, endpoint)).await;
+            return;
+        }
         let all_groups = transports(&all);
         self.connection_attempt(
             target,
             &all,
             all_groups.last(),
             redirect_at.is_some(),
+            ended,
+            attempt_ms,
+            client,
+        )
+        .await;
+    }
+
+    /// The connection attempt check from the stages of a connection that
+    /// logged in, or tried to.
+    async fn attempt_from_steps(
+        &mut self,
+        target: &Target,
+        mut steps: Vec<Step>,
+        ended: &Ended,
+        attempt_ms: u64,
+        client: Option<&TdsClient>,
+    ) {
+        steps.sort_by_key(|s| s.started);
+        let redirected = steps.iter().any(|s| {
+            s.stage == Stage::Login && s.detail(connect_stage::REDIRECTED) == Some("true")
+        });
+        let all: Vec<&Step> = steps.iter().collect();
+        let all_groups = transports(&all);
+        self.connection_attempt(
+            target,
+            &all,
+            all_groups.last(),
+            redirected,
             ended,
             attempt_ms,
             client,
@@ -2153,6 +2222,374 @@ impl Diagnosis {
         }
     }
 
+    /// The connection attempt and session validation made by sqlcmd itself,
+    /// with its own driver and settings: they decide the result. `endpoint`
+    /// is the host and port the SPN is made from, when `mssql-tds`'s
+    /// diagnostic connection opened its transport. When the driver fails in a
+    /// way its errors leave open (not a refused login or database, not a
+    /// missing driver) and that transport opened, `mssql-tds` logs in too, for
+    /// evidence only: phase timings, the TLS failure, Kerberos; or, when it
+    /// connects where the driver could not, that the problem is in sqlcmd's
+    /// own connection.
+    async fn driver_attempt(
+        &mut self,
+        driver: driver::DriverHook,
+        target: &Target,
+        endpoint: Option<(String, u16)>,
+    ) {
+        let tcp_checked = endpoint.is_some();
+        let started = Instant::now();
+        let query = self
+            .wants(Depth::SessionValidation)
+            .then_some(driver::DRIVER_QUERY);
+        let seconds = u32::try_from(self.request.timeout().as_secs())
+            .unwrap_or(u32::MAX)
+            .max(1);
+        // The driver blocks this thread; a cancel is seen once it returns,
+        // within the time limit it was given.
+        let outcome = driver.connect(query, seconds);
+        let returned_unix_ms = unix_ms_now();
+        let mut check = Check::new(CheckId::ConnectionAttempt, Coverage::Passed);
+        check.duration_ms = Some(outcome.connect_ms.min(millis(started)));
+        check.deadline_ms = Some(self.request.timeout_ms());
+        if let Some(name) = &outcome.driver_name {
+            check.fields.push(Field::plain("driver", name.clone()));
+        }
+        // The client's side of Kerberos/SSPI needs no login: the SPN for the
+        // endpoint (as the driver composes it) and, off Windows, the cache.
+        if self.request.authentication == Authentication::Integrated {
+            let budget = self.request.timeout();
+            if let Some((host, port)) = &endpoint {
+                let spn = self.requested_spn(host, *port, budget).await;
+                self.spn = Some(platform_spn(&spn));
+            }
+            self.kerberos_evidence(&mut check, budget).await;
+        }
+
+        if outcome.connected {
+            let transport = outcome
+                .cell(driver::column::TRANSPORT)
+                .map(driver::transport_name);
+            if let Some(transport) = transport {
+                check.fields.push(Field::plain("transport", transport));
+            }
+
+            self.checks.push(check);
+            self.authentication = Some(AuthOutcome::Succeeded);
+            self.server = Some(ServerInfo {
+                name: outcome
+                    .cell(driver::column::SERVER_NAME)
+                    .map(str::to_string),
+                version: outcome.cell(driver::column::VERSION).map(str::to_string),
+                database: outcome
+                    .cell(driver::column::DATABASE)
+                    .unwrap_or_default()
+                    .to_string(),
+                // ODBC Driver 18 connects encrypted, or not at all, when
+                // encryption is mandatory or strict; otherwise it does not say.
+                encrypted: matches!(self.request.encrypt, Encrypt::Mandatory | Encrypt::Strict)
+                    .then_some(true),
+                engine_edition: None,
+            });
+            // sqlcmd connected over another transport: the TCP path is not
+            // its path, so what was found on it does not count.
+            if transport.is_some_and(|t| t != "tcp") {
+                self.not_on_the_path();
+            }
+            if query.is_some() {
+                self.driver_session(&outcome, returned_unix_ms);
+            }
+            return;
+        }
+
+        let records = driver_records(&outcome, CheckId::ConnectionAttempt);
+        let first = records
+            .iter()
+            .find_map(|r| (!r.message.is_empty()).then(|| r.message.clone()))
+            .unwrap_or_default();
+        let login = |numbers: &[u32]| {
+            records
+                .iter()
+                .any(|r| r.number.is_some_and(|n| numbers.contains(&n)))
+        };
+        let missing_driver = outcome
+            .records
+            .iter()
+            .any(|r| r.sql_state.starts_with("IM"));
+        // SQL Server itself refused the connection: an error the server raised
+        // has its number and a SQLSTATE the driver's own errors (08001, 08S01,
+        // HYT00, IM...) do not use. The driver gives no severity at login.
+        let server_refused = records.iter().any(|r| {
+            r.number.is_some()
+                && (r.class.is_some()
+                    || r.sql_state
+                        .as_deref()
+                        .is_some_and(|s| matches!(s, "28000" | "42000" | "37000" | "08004")))
+        });
+        let (coverage, domain, auth) = if login(&LOGIN_ERRORS) {
+            (
+                Coverage::Diagnosed,
+                Domain::specific(self.authentication_domain()),
+                AuthOutcome::Failed,
+            )
+        } else if login(&DATABASE_ERRORS) {
+            (
+                Coverage::Diagnosed,
+                Domain::specific("target.sqlServer"),
+                AuthOutcome::Succeeded,
+            )
+        } else if missing_driver {
+            (
+                Coverage::Diagnosed,
+                Domain::specific("client.driver"),
+                AuthOutcome::NotEvaluated,
+            )
+        } else if server_refused {
+            (
+                Coverage::Diagnosed,
+                Domain::specific("target.sqlServer"),
+                AuthOutcome::Failed,
+            )
+        } else {
+            (
+                Coverage::Inconclusive,
+                Domain::undetermined(&["connectivity.network", "client.driver"]),
+                AuthOutcome::NotEvaluated,
+            )
+        };
+        check.coverage = coverage;
+        check.domain = Some(domain);
+        self.authentication = Some(auth);
+        let driver_name = outcome
+            .driver_name
+            .clone()
+            .unwrap_or_else(|| "its driver".to_string());
+        self.finding(
+            Certainty::Confirmed,
+            CheckId::ConnectionAttempt,
+            format!("sqlcmd's own connection through {driver_name} failed: {first}"),
+        );
+        self.errors.extend(records);
+
+        let evidence =
+            tcp_checked && !driver::needs_no_evidence(&outcome, &LOGIN_ERRORS, &DATABASE_ERRORS);
+        if evidence {
+            let (checks, errors) = (self.checks.len(), self.errors.len());
+            // The driver's check keeps its own transport. Its SPN is the one
+            // made for the endpoint, unless mssql-tds logged in: then the SPN
+            // the client recorded requesting is the one shown.
+            let (transport, spn) = (self.transport, self.spn.take());
+            let client = Box::pin(self.evidence_attempt(target)).await;
+            self.transport = transport;
+            match self.spn.take() {
+                Some(recorded) => {
+                    match check.fields.iter_mut().find(|f| f.key == "spn") {
+                        Some(field) => field.value.clone_from(&recorded),
+                        None => check.fields.push(Field::identifier(
+                            "spn",
+                            recorded.clone(),
+                            Category::Spn,
+                        )),
+                    }
+                    self.spn = Some(recorded);
+                }
+                None => self.spn = spn,
+            }
+            let tds = self.checks.drain(checks..).next();
+            for error in &mut self.errors[errors..] {
+                error.superseded = true;
+            }
+            // The result is the driver's: mssql-tds's own outcome is evidence.
+            self.authentication = Some(auth);
+            self.server = None;
+            if let Some(tds) = tds {
+                check.subphases = tds.subphases;
+                for key in ["failedPhase", "tlsFailure"] {
+                    if let Some(field) = tds.fields.iter().find(|f| f.key == key) {
+                        check.fields.push(field.clone());
+                    }
+                }
+                check.fields.push(Field::plain(
+                    "diagnosticClient",
+                    if client.is_some() {
+                        "connected"
+                    } else {
+                        "failed"
+                    },
+                ));
+                if let Some(mut client) = client {
+                    let _ = client.close_connection().await;
+                    check.coverage = Coverage::Diagnosed;
+                    if server_refused {
+                        // The server treats the two connections differently.
+                        check.domain = Some(Domain::specific("target.sqlServer"));
+                        self.finding(
+                            Certainty::Confirmed,
+                            CheckId::ConnectionAttempt,
+                            "SQL Server refused sqlcmd's own connection but accepted the \
+                             diagnostic client's (mssql-tds) with the same login and settings: \
+                             the server treats the two connections differently.",
+                        );
+                        self.finding(
+                            Certainty::Suspected,
+                            CheckId::ConnectionAttempt,
+                            "A server-side rule that depends on the client, such as a logon \
+                             trigger or a Resource Governor classifier keyed on the application \
+                             name (sqlcmd sends SQLCMD), refuses sqlcmd's connection.",
+                        );
+                    } else {
+                        check.domain = Some(Domain::specific("client.driver"));
+                        self.finding(
+                            Certainty::Confirmed,
+                            CheckId::ConnectionAttempt,
+                            "The diagnostic client (mssql-tds) connected to the same server with \
+                             the same settings, so the failure is in sqlcmd's own driver \
+                             connection, not in the server or the network.",
+                        );
+                    }
+                } else if tds.coverage.failed() {
+                    // Both failed: mssql-tds's classification is the more precise.
+                    check.coverage = tds.coverage;
+                    check.domain = tds.domain;
+                }
+            }
+        }
+        self.checks.push(check);
+        self.skip_rest(
+            CheckId::ConnectionAttempt,
+            &Skip::BlockedBy(CheckId::ConnectionAttempt),
+        );
+    }
+
+    /// Session validation from the driver's query.
+    fn driver_session(&mut self, outcome: &driver::DriverOutcome, returned_unix_ms: i64) {
+        let mut check = Check::new(CheckId::SessionValidation, Coverage::Passed);
+        check.duration_ms = Some(outcome.query_ms);
+        check.deadline_ms = Some(self.request.timeout_ms());
+        let edition = outcome
+            .cell(driver::column::ENGINE_EDITION)
+            .and_then(|e| e.trim().parse::<i32>().ok());
+        if outcome.query_failed || edition.is_none() {
+            check.coverage = Coverage::Diagnosed;
+            check.domain = Some(Domain::specific("target.sqlServer"));
+            let records = driver_records(outcome, CheckId::SessionValidation);
+            let first = records
+                .iter()
+                .find_map(|r| (!r.message.is_empty()).then(|| r.message.clone()))
+                .unwrap_or_default();
+            self.checks.push(check);
+            self.errors.extend(records);
+            self.finding(
+                Certainty::Confirmed,
+                CheckId::SessionValidation,
+                format!("The session was opened but a minimal query failed: {first}"),
+            );
+            return;
+        }
+        let server_ms = match (
+            outcome
+                .cell(driver::column::DAYS)
+                .and_then(|d| d.trim().parse::<i64>().ok()),
+            outcome
+                .cell(driver::column::MILLISECONDS)
+                .and_then(|m| m.trim().parse::<i64>().ok()),
+        ) {
+            (Some(days), Some(ms)) => Some(days * 86_400_000 + ms),
+            _ => None,
+        };
+        // The server read its clock while the query was in flight.
+        let query_ms = i64::try_from(outcome.query_ms).unwrap_or(0);
+        let client_ms = returned_unix_ms - query_ms / 2;
+        self.note_session(check, edition.unwrap_or_default(), server_ms, client_ms);
+    }
+
+    /// The TCP path's checks, when sqlcmd connected over another transport:
+    /// what failed there is not on its path.
+    fn not_on_the_path(&mut self) {
+        for check in &mut self.checks {
+            if matches!(
+                check.id,
+                CheckId::NameResolution | CheckId::InstanceResolution | CheckId::TcpConnect
+            ) && (check.coverage.failed() || check.coverage == Coverage::Skipped)
+            {
+                *check = Check::skipped(
+                    check.id,
+                    Skip::NotApplicable("sqlcmd's own connection did not use TCP"),
+                );
+            }
+        }
+        for error in &mut self.errors {
+            if matches!(
+                error.check,
+                CheckId::NameResolution | CheckId::InstanceResolution | CheckId::TcpConnect
+            ) {
+                error.superseded = true;
+            }
+        }
+    }
+
+    /// The handoff area for a refused login with the selected method.
+    fn authentication_domain(&self) -> &'static str {
+        match self.request.authentication {
+            Authentication::SqlPassword { .. } => "security.authentication.sql",
+            Authentication::Integrated if cfg!(windows) => "security.authentication.windows",
+            Authentication::Integrated => "security.authentication.kerberos",
+        }
+    }
+
+    /// `mssql-tds` logs in, for evidence, after sqlcmd's own driver failed:
+    /// the connection attempt check as it would report it on its own.
+    async fn evidence_attempt(&mut self, target: &Target) -> Option<TdsClient> {
+        self.recorder.clear();
+        let probe = DiagnosticProbe {
+            stop_after: None,
+            all_addresses: false,
+        };
+        let context = self.client_context();
+        let server = self.request.server.trim().to_string();
+        let started = Instant::now();
+        let attempt = bounded(
+            self.request.timeout() + Duration::from_secs(1),
+            self.request.timeout().as_secs(),
+            // Boxed: the client's connect future is large.
+            Box::pin(TdsConnectionProvider::new().diagnose_client(context, &server, probe)),
+        )
+        .await;
+        let attempt_ms = millis(started);
+        let (client, ended) = match attempt {
+            Ok(DiagnosticConnection::Connected(client)) => (Some(client), Ended::Connected),
+            Ok(DiagnosticConnection::Stopped(_)) => (None, Ended::Stopped),
+            Err(error) => (None, Ended::Failed(error)),
+        };
+        let steps = self.recorder.steps();
+        self.attempt_from_steps(target, steps, &ended, attempt_ms, client.as_ref())
+            .await;
+        client
+    }
+
+    /// The SPN for integrated authentication to `host` and `port`,
+    /// canonicalized once as the client does. That may block on DNS, so it
+    /// runs on a thread of its own for at most `budget`; past it, the host
+    /// name is used as given.
+    async fn requested_spn(&mut self, host: &str, port: u16, budget: Duration) -> String {
+        let lookup_host = host.to_string();
+        let canonicalized = within(budget, move || {
+            mssql_tds::security::make_spn_canonicalized(&lookup_host, None, port)
+        })
+        .await;
+        match canonicalized {
+            Some(spn) => spn,
+            None => {
+                self.limitation(&format!(
+                    "The SPN's host name could not be canonicalized within the {} s time \
+                     limit, so the SPN is requested and shown with the host name as given.",
+                    self.request.timeout().as_secs()
+                ));
+                mssql_tds::security::make_spn(host, None, port)
+            }
+        }
+    }
+
     fn connection_input(&mut self) -> Option<Target> {
         let started = Instant::now();
         let parsed = target::parse(&self.request.server);
@@ -2399,7 +2836,7 @@ impl Diagnosis {
                     name: client.server_reported_name().map(str::to_string),
                     version: client.server_version().map(version_text),
                     database: client.database().to_string(),
-                    encrypted: client.is_encrypted(),
+                    encrypted: Some(client.is_encrypted()),
                     engine_edition: None,
                 });
             }
@@ -2461,38 +2898,10 @@ impl Diagnosis {
         let received_unix_ms = unix_ms_now();
         let error = match result {
             Ok(Ok(probe)) => {
-                check.fields.push(Field::plain(
-                    "engineEdition",
-                    probe.engine_edition.to_string(),
-                ));
-                if let Some(server) = &mut self.server {
-                    server.engine_edition = Some(probe.engine_edition);
-                    if let Some(target_type) = server.target_type() {
-                        check.fields.push(Field::plain("targetType", target_type));
-                    }
-                }
-                if let Some(server_ms) = probe.server_unix_ms {
-                    // The server read its clock while the query was in flight:
-                    // compare it with the middle of the round trip.
-                    let client_ms = sent_unix_ms + (received_unix_ms - sent_unix_ms) / 2;
-                    let offset = server_ms - client_ms;
-                    check
-                        .fields
-                        .push(Field::plain("clockOffsetMs", offset.to_string()));
-                    if offset.abs() > KERBEROS_CLOCK_TOLERANCE_MS {
-                        self.finding(
-                            Certainty::Informational,
-                            CheckId::SessionValidation,
-                            format!(
-                                "The server's clock is {} s {} the client's, more than the 5 \
-                                 minutes Kerberos tolerates by default.",
-                                offset.abs() / 1000,
-                                if offset > 0 { "ahead of" } else { "behind" }
-                            ),
-                        );
-                    }
-                }
-                self.checks.push(check);
+                // The server read its clock while the query was in flight:
+                // compare it with the middle of the round trip.
+                let client_ms = sent_unix_ms + (received_unix_ms - sent_unix_ms) / 2;
+                self.note_session(check, probe.engine_edition, probe.server_unix_ms, client_ms);
                 return;
             }
             Ok(Err(error)) => {
@@ -2523,6 +2932,45 @@ impl Diagnosis {
         self.checks.push(check);
         self.finding(Certainty::Confirmed, CheckId::SessionValidation, error);
     }
+    /// A passed session validation: the engine edition, and the server's
+    /// clock against the client's (`client_ms`, when the server read it).
+    fn note_session(
+        &mut self,
+        mut check: Check,
+        engine_edition: i32,
+        server_ms: Option<i64>,
+        client_ms: i64,
+    ) {
+        check
+            .fields
+            .push(Field::plain("engineEdition", engine_edition.to_string()));
+        if let Some(server) = &mut self.server {
+            server.engine_edition = Some(engine_edition);
+            if let Some(target_type) = server.target_type() {
+                check.fields.push(Field::plain("targetType", target_type));
+            }
+        }
+        if let Some(server_ms) = server_ms {
+            let offset = server_ms - client_ms;
+            check
+                .fields
+                .push(Field::plain("clockOffsetMs", offset.to_string()));
+            if offset.abs() > KERBEROS_CLOCK_TOLERANCE_MS {
+                self.finding(
+                    Certainty::Informational,
+                    CheckId::SessionValidation,
+                    format!(
+                        "The server's clock is {} s {} the client's, more than the 5 minutes \
+                         Kerberos tolerates by default.",
+                        offset.abs() / 1000,
+                        if offset > 0 { "ahead of" } else { "behind" }
+                    ),
+                );
+            }
+        }
+        self.checks.push(check);
+    }
+
     fn finish(mut self, start_unix_ms: u64, duration_ms: u64) -> Report {
         // The report describes the request; the password was only for logging
         // in, so it is not kept.
@@ -2821,6 +3269,24 @@ fn drop_enclosing_failures(steps: &mut Vec<Step>) {
     });
 }
 
+/// The records of sqlcmd's own driver connection, as error-chain records.
+fn driver_records(outcome: &driver::DriverOutcome, check: CheckId) -> Vec<ErrorRecord> {
+    outcome
+        .records
+        .iter()
+        .map(|r| {
+            let mut record = ErrorRecord::new("driver", check, r.message.clone());
+            record.number = u32::try_from(r.native_error).ok().filter(|n| *n != 0);
+            record.state = r.state.and_then(|s| u8::try_from(s).ok());
+            record.class = r.severity;
+            record.sql_state = Some(r.sql_state.clone()).filter(|s| !s.is_empty());
+            record.printed = Some(r.line.trim_end().to_string()).filter(|l| !l.is_empty());
+            record.text = Some(r.message.clone());
+            record
+        })
+        .collect()
+}
+
 /// Errors from the client, as error-chain records, every server error kept.
 fn error_records(error: &Error, check: CheckId) -> Vec<ErrorRecord> {
     match error {
@@ -3028,6 +3494,50 @@ async fn bounded<T>(
         })
 }
 
+/// The host and port the client makes its SPN from, for the transport
+/// `group` opened, as `mssql-tds` does: the TCP host and port, a named
+/// pipe's server, and this machine for shared memory, the pipes with port
+/// 1433.
+fn spn_endpoint(target: &Target, group: &Transport) -> Option<(String, u16)> {
+    match group.pipe {
+        None => {
+            let port = group
+                .tcp
+                .iter()
+                .find(|s| s.ok == Some(true))
+                .and_then(|s| s.detail(connect_stage::PORT)?.parse().ok())?;
+            let host = group
+                .dns
+                .and_then(|d| d.detail(connect_stage::HOST))
+                .map_or_else(|| target.resolvable_host().into_owned(), str::to_string);
+            Some((host, port))
+        }
+        Some(_) if group.protocol() == Protocol::SharedMemory => {
+            Some(("localhost".to_string(), 1433))
+        }
+        Some(pipe) => {
+            let pipe_name = pipe.detail(connect_stage::PIPE_PATH)?.to_string();
+            Some((
+                TransportContext::NamedPipe { pipe_name }.get_server_name(),
+                1433,
+            ))
+        }
+    }
+}
+
+/// An SPN in the form the platform's security package takes: GSSAPI's
+/// host-based `service@host` off Windows, as the client converts the SPNs
+/// it makes.
+fn platform_spn(spn: &str) -> String {
+    if cfg!(unix)
+        && let Some((service, rest)) = spn.split_once('/')
+    {
+        let host = rest.rfind(':').map_or(rest, |at| &rest[..at]);
+        return format!("{service}@{host}");
+    }
+    spn.to_string()
+}
+
 /// The pipe the client opens first for `target` before it has resolved
 /// anything: shared memory to this computer without a prefix (on Windows),
 /// or the target's own pipe transport.
@@ -3169,6 +3679,7 @@ pub(crate) mod tests {
             local_detail: false,
             invalid: None,
             sources: SettingSources::default(),
+            driver: None,
         }
     }
 
@@ -3206,7 +3717,7 @@ pub(crate) mod tests {
                 name: None,
                 version: None,
                 database: String::new(),
-                encrypted: true,
+                encrypted: Some(true),
                 engine_edition: Some(edition),
             }
             .target_type()
@@ -4001,6 +4512,387 @@ pub(crate) mod tests {
         assert_eq!(order, CheckId::ORDER);
     }
 
+    fn fake_driver(
+        outcome: driver::DriverOutcome,
+    ) -> (
+        driver::DriverHook,
+        std::sync::Arc<std::sync::Mutex<Vec<Option<String>>>>,
+    ) {
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = calls.clone();
+        let hook = driver::DriverHook::new(move |query, _seconds| {
+            seen.lock().unwrap().push(query.map(str::to_string));
+            outcome.clone()
+        });
+        (hook, calls)
+    }
+
+    fn driver_row(transport: &str) -> Vec<Option<String>> {
+        [
+            "2",
+            "20738",
+            "3600000",
+            "17.0.4085.2",
+            transport,
+            "db01",
+            "master",
+        ]
+        .iter()
+        .map(|v| Some((*v).to_string()))
+        .collect()
+    }
+
+    fn driver_failure(sql_state: &str, native_error: i32, message: &str) -> driver::DriverOutcome {
+        driver::DriverOutcome {
+            connect_ms: 12,
+            records: vec![driver::DriverRecord {
+                sql_state: sql_state.to_string(),
+                native_error,
+                severity: (native_error > 0).then_some(14),
+                state: (native_error > 0).then_some(1),
+                message: message.to_string(),
+                line: format!(
+                    "Sqlcmd: Error: Microsoft ODBC Driver 18 for SQL Server : {message}."
+                ),
+            }],
+            driver_name: Some("Microsoft ODBC Driver 18 for SQL Server".to_string()),
+            ..driver::DriverOutcome::default()
+        }
+    }
+
+    /// A TCP listener that accepts the connection and never answers.
+    fn silent_listener() -> (std::net::TcpListener, String) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        (listener, format!("tcp:127.0.0.1,{port}"))
+    }
+
+    #[test]
+    fn sqlcmds_own_driver_decides_a_passed_connection() {
+        let (_listener, server) = silent_listener();
+        let (hook, calls) = fake_driver(driver::DriverOutcome {
+            connected: true,
+            connect_ms: 20,
+            query_ms: 3,
+            row: driver_row("TCP"),
+            driver_name: Some("Microsoft ODBC Driver 18 for SQL Server".to_string()),
+            ..driver::DriverOutcome::default()
+        });
+        let mut request = request(&server, Depth::SessionValidation);
+        request.driver = Some(hook);
+        let report = run(request);
+        assert_eq!(report.outcome, DiagnosticOutcome::Passed, "{report:#?}");
+        assert_eq!(
+            *calls.lock().unwrap(),
+            [Some(driver::DRIVER_QUERY.to_string())]
+        );
+        let attempt = report
+            .checks
+            .iter()
+            .find(|c| c.id == CheckId::ConnectionAttempt)
+            .unwrap();
+        assert_eq!(
+            attempt.field("driver"),
+            Some("Microsoft ODBC Driver 18 for SQL Server")
+        );
+        assert_eq!(attempt.field("transport"), Some("tcp"));
+        let session = report
+            .checks
+            .iter()
+            .find(|c| c.id == CheckId::SessionValidation)
+            .unwrap();
+        assert_eq!(session.coverage, Coverage::Passed);
+        assert_eq!(session.field("engineEdition"), Some("2"));
+        assert!(session.field("clockOffsetMs").is_some());
+        assert_eq!(report.authentication, Some(AuthOutcome::Succeeded));
+        assert_eq!(
+            report.server.as_ref().and_then(|s| s.version.as_deref()),
+            Some("17.0.4085.2")
+        );
+        assert!(
+            report.limitations.iter().all(|l| !l.contains("mssql-tds")),
+            "mssql-tds did not connect: {:#?}",
+            report.limitations
+        );
+        // mssql-tds's diagnostic connection opened its transport, which the
+        // silent listener accepted, and stopped there, without logging in.
+        let tcp = report
+            .checks
+            .iter()
+            .find(|c| c.id == CheckId::TcpConnect)
+            .unwrap();
+        assert_eq!(tcp.coverage, Coverage::Passed, "{report:#?}");
+    }
+
+    /// The SPN is made from the endpoint the diagnostic connection opened,
+    /// as the client makes it, in the form the platform takes.
+    #[test]
+    fn the_spn_follows_the_transport_the_diagnostic_connection_opened() {
+        let target = target::parse("tcp:db01,1500").unwrap();
+        let stages = Stages::new()
+            .add(
+                Stage::Dns,
+                Some(true),
+                0,
+                1,
+                &[(cs::HOST, "db01"), (cs::ADDRESSES, "10.0.0.1")],
+            )
+            .add(
+                Stage::Tcp,
+                Some(true),
+                1,
+                2,
+                &[(cs::ADDRESS, "10.0.0.1"), (cs::PORT, "1500")],
+            );
+        let all: Vec<&Step> = stages.list.iter().collect();
+        let groups = transports(&all);
+        assert_eq!(
+            spn_endpoint(&target, &groups[0]),
+            Some(("db01".to_string(), 1500))
+        );
+        let pipe = Stages::new().add(
+            Stage::Pipe,
+            Some(true),
+            0,
+            1,
+            &[
+                (cs::KIND, cs::KIND_NAMED_PIPE),
+                (cs::PIPE_PATH, r"\\db02\pipe\sql\query"),
+            ],
+        );
+        let all: Vec<&Step> = pipe.list.iter().collect();
+        assert_eq!(
+            spn_endpoint(&target, &transports(&all)[0]),
+            Some(("db02".to_string(), 1433))
+        );
+        let shared = Stages::new().add(
+            Stage::Pipe,
+            Some(true),
+            0,
+            1,
+            &[(cs::KIND, cs::KIND_SHARED_MEMORY)],
+        );
+        let all: Vec<&Step> = shared.list.iter().collect();
+        assert_eq!(
+            spn_endpoint(&target, &transports(&all)[0]),
+            Some(("localhost".to_string(), 1433))
+        );
+        let expected = if cfg!(unix) {
+            "MSSQLSvc@fe80::1"
+        } else {
+            "MSSQLSvc/fe80::1:1433"
+        };
+        assert_eq!(platform_spn("MSSQLSvc/fe80::1:1433"), expected);
+    }
+
+    #[test]
+    fn a_login_the_driver_was_refused_is_not_tried_again() {
+        let (_listener, server) = silent_listener();
+        let (hook, calls) = fake_driver(driver_failure(
+            "28000",
+            18456,
+            "Login failed for user 'sa'.",
+        ));
+        let mut request = request(&server, Depth::SessionValidation);
+        request.driver = Some(hook);
+        let started = Instant::now();
+        let report = run(request);
+        assert_eq!(calls.lock().unwrap().len(), 1);
+        let attempt = report
+            .checks
+            .iter()
+            .find(|c| c.id == CheckId::ConnectionAttempt)
+            .unwrap();
+        assert_eq!(attempt.coverage, Coverage::Diagnosed);
+        assert_eq!(
+            attempt.domain.as_ref().map(|d| d.primary),
+            Some("security.authentication.sql")
+        );
+        assert_eq!(report.authentication, Some(AuthOutcome::Failed));
+        assert_eq!(report.outcome, DiagnosticOutcome::IssueDetected);
+        let error = report.errors.iter().find(|e| e.source == "driver").unwrap();
+        assert_eq!(error.number, Some(18456));
+        assert_eq!(error.sql_state.as_deref(), Some("28000"));
+        assert_eq!(
+            error.printed.as_deref(),
+            Some(
+                "Sqlcmd: Error: Microsoft ODBC Driver 18 for SQL Server : Login failed for user \
+                 'sa'.."
+            )
+        );
+        // No second login: mssql-tds never connected (its limitation is absent,
+        // and the silent listener would have held it for the time limit).
+        assert!(report.limitations.iter().all(|l| !l.contains("mssql-tds")));
+        assert!(report.errors.iter().all(|e| !e.superseded));
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_driver_failure_its_errors_leave_open_gets_mssql_tds_evidence() {
+        let (_listener, server) = silent_listener();
+        let (hook, _) = fake_driver(driver_failure("08001", 0, "TCP Provider: Error code 0x102"));
+        let mut request = request(&server, Depth::SessionValidation);
+        request.login_timeout_seconds = 1;
+        request.driver = Some(hook);
+        let report = run(request);
+        let attempts: Vec<&Check> = report
+            .checks
+            .iter()
+            .filter(|c| c.id == CheckId::ConnectionAttempt)
+            .collect();
+        assert_eq!(attempts.len(), 1, "{:#?}", report.checks);
+        assert!(attempts[0].coverage.failed());
+        assert!(report.limitations.iter().any(|l| l.contains("mssql-tds")));
+        let driver = report.errors.iter().find(|e| e.source == "driver").unwrap();
+        assert!(!driver.superseded);
+        let evidence: Vec<&ErrorRecord> = report
+            .errors
+            .iter()
+            .filter(|e| e.source != "driver")
+            .collect();
+        assert!(!evidence.is_empty(), "{:#?}", report.errors);
+        assert!(evidence.iter().all(|e| e.superseded), "{evidence:#?}");
+        assert_eq!(report.outcome, DiagnosticOutcome::IssueDetected);
+        let session = report
+            .checks
+            .iter()
+            .find(|c| c.id == CheckId::SessionValidation)
+            .unwrap();
+        assert_eq!(
+            session.skip,
+            Some(Skip::BlockedBy(CheckId::ConnectionAttempt))
+        );
+    }
+
+    /// The driver found another transport (named pipes, after the name did not
+    /// resolve for TCP): the TCP path was not sqlcmd's path.
+    #[cfg(windows)]
+    #[test]
+    fn with_the_driver_the_tcp_path_it_did_not_use_does_not_count() {
+        let (hook, calls) = fake_driver(driver::DriverOutcome {
+            connected: true,
+            row: driver_row("Named pipe"),
+            ..driver::DriverOutcome::default()
+        });
+        let mut request = request("nosuchhost.invalid", Depth::SessionValidation);
+        request.driver = Some(hook);
+        let report = run(request);
+        assert_eq!(calls.lock().unwrap().len(), 1);
+        assert_eq!(report.outcome, DiagnosticOutcome::Passed, "{report:#?}");
+        let resolution = report
+            .checks
+            .iter()
+            .find(|c| c.id == CheckId::NameResolution)
+            .unwrap();
+        assert_eq!(resolution.coverage, Coverage::NotApplicable);
+        assert!(
+            report.errors.iter().all(|e| e.superseded),
+            "{:#?}",
+            report.errors
+        );
+        let attempt = report
+            .checks
+            .iter()
+            .find(|c| c.id == CheckId::ConnectionAttempt)
+            .unwrap();
+        assert_eq!(attempt.field("transport"), Some("namedPipe"));
+    }
+
+    /// A live server, when `MSSQL_SQLCMD_DIAGNOSTICS_SERVER` names one: a driver
+    /// that cannot connect where mssql-tds can points at sqlcmd's own driver.
+    #[test]
+    fn a_live_server_mssql_tds_reaches_points_a_driver_failure_at_the_driver() {
+        let Ok(server) = std::env::var("MSSQL_SQLCMD_DIAGNOSTICS_SERVER") else {
+            return;
+        };
+        let (hook, _) = fake_driver(driver_failure(
+            "08001",
+            0,
+            "SSL Provider: The certificate chain was issued by an authority that is not trusted",
+        ));
+        let mut live = request(&server, Depth::SessionValidation);
+        live.authentication = Authentication::SqlPassword {
+            user: std::env::var("MSSQL_SQLCMD_DIAGNOSTICS_USER").unwrap_or_default(),
+            password: std::env::var("MSSQL_SQLCMD_DIAGNOSTICS_PASSWORD").unwrap_or_default(),
+        };
+        live.login_timeout_seconds = 15;
+        live.driver = Some(hook);
+        let report = run(live);
+        let attempt = report
+            .checks
+            .iter()
+            .find(|c| c.id == CheckId::ConnectionAttempt)
+            .unwrap();
+        assert_eq!(attempt.coverage, Coverage::Diagnosed, "{report:#?}");
+        assert_eq!(
+            attempt.domain.as_ref().map(|d| d.primary),
+            Some("client.driver")
+        );
+        assert!(
+            report.findings.iter().any(|f| f
+                .text
+                .contains("the failure is in sqlcmd's own driver connection")),
+            "{:#?}",
+            report.findings
+        );
+        assert_eq!(report.outcome, DiagnosticOutcome::IssueDetected);
+        assert_eq!(report.authentication, Some(AuthOutcome::NotEvaluated));
+        assert!(report.server.is_none());
+    }
+
+    /// A live server, when MSSQL_SQLCMD_DIAGNOSTICS_SERVER names one: when
+    /// SQL Server refuses sqlcmd's own connection (a logon trigger, error
+    /// 17892) but accepts mssql-tds's, the server is the area, not the driver.
+    #[test]
+    fn a_live_server_that_refuses_only_sqlcmd_is_the_area() {
+        let Ok(server) = std::env::var("MSSQL_SQLCMD_DIAGNOSTICS_SERVER") else {
+            return;
+        };
+        // As sqlcmd's driver gives it at login: no severity.
+        let mut refused = driver_failure(
+            "42000",
+            17892,
+            "Logon failed for login 'sa' due to trigger execution.",
+        );
+        refused.records[0].severity = None;
+        refused.records[0].state = None;
+        let (hook, _) = fake_driver(refused);
+        let mut live = request(&server, Depth::SessionValidation);
+        live.authentication = Authentication::SqlPassword {
+            user: std::env::var("MSSQL_SQLCMD_DIAGNOSTICS_USER").unwrap_or_default(),
+            password: std::env::var("MSSQL_SQLCMD_DIAGNOSTICS_PASSWORD").unwrap_or_default(),
+        };
+        live.login_timeout_seconds = 15;
+        live.driver = Some(hook);
+        let report = run(live);
+        let attempt = report
+            .checks
+            .iter()
+            .find(|c| c.id == CheckId::ConnectionAttempt)
+            .unwrap();
+        assert_eq!(attempt.coverage, Coverage::Diagnosed, "{report:#?}");
+        assert_eq!(
+            attempt.domain.as_ref().map(|d| d.primary),
+            Some("target.sqlServer")
+        );
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.certainty == Certainty::Suspected && f.text.contains("logon trigger")),
+            "{:#?}",
+            report.findings
+        );
+        assert_eq!(report.authentication, Some(AuthOutcome::Failed));
+        assert_eq!(attempt.field("diagnosticClient"), Some("connected"));
+        let text = report::text(&report);
+        assert!(text.contains("mssql-tds connected: pre-login"), "{text}");
+    }
+
     #[test]
     fn a_live_ipv6_server_passes_with_and_without_a_prefix() {
         let Ok(server) = std::env::var("MSSQL_SQLCMD_DIAGNOSTICS_IPV6") else {
@@ -4431,7 +5323,7 @@ pub(crate) mod tests {
             .enable_all()
             .build()
             .unwrap();
-        runtime.block_on(diagnosis.observe(&target, stages.list, &ended, 10, None));
+        runtime.block_on(diagnosis.observe(&target, stages.list, &ended, 10, None, None));
         if !matches!(ended, Ended::Connected) {
             diagnosis.skip_rest(
                 CheckId::ConnectionAttempt,
