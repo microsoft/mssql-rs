@@ -376,4 +376,162 @@ mod redirection_tests {
         let _ = dest_handle.await;
         let _ = gw_handle.await;
     }
+
+    type ServerHandle = (
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<()>,
+    );
+
+    type Hop = Box<dyn FnOnce(u16) -> mssql_mock_tds::RedirectionConfig>;
+
+    fn start(server: mssql_mock_tds::MockTdsServer) -> ServerHandle {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let handle = tokio::spawn(async move {
+            let _ = server.run_with_shutdown(shutdown_rx).await;
+        });
+        (shutdown_tx, handle)
+    }
+
+    /// Outcome of logging in through a chain of redirecting gateways.
+    struct RoutedLogin {
+        result: Result<(), String>,
+        /// LOGIN7s received by each gateway, then by the destination.
+        logins: Vec<Vec<mssql_mock_tds::ConnectionInfo>>,
+    }
+
+    /// Logs in to the first of `hops` gateways. Each gateway redirects to the
+    /// next one (the last to a destination that accepts the login) with the
+    /// configuration its builder returns for the target port.
+    async fn login_through(hops: Vec<Hop>) -> RoutedLogin {
+        use mssql_mock_tds::MockTdsServer;
+
+        let destination = MockTdsServer::new("127.0.0.1:0").await.unwrap();
+        let mut target_port = destination.local_addr().port();
+        let mut stores = vec![destination.connection_store()];
+        let mut servers = vec![start(destination)];
+        for hop in hops.into_iter().rev() {
+            let gateway =
+                MockTdsServer::new_with_redirection_config("127.0.0.1:0", hop(target_port))
+                    .await
+                    .unwrap();
+            target_port = gateway.local_addr().port();
+            stores.insert(0, gateway.connection_store());
+            servers.push(start(gateway));
+        }
+
+        let result = TdsConnectionProvider {}
+            .create_client(
+                create_test_context(),
+                &format!("127.0.0.1,{target_port}"),
+                None,
+            )
+            .await
+            .map(drop)
+            .map_err(|e| e.to_string());
+        // Let the servers record connections the client has just closed.
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+        let mut logins = Vec::with_capacity(stores.len());
+        for store in &stores {
+            logins.push(store.lock().await.all().values().cloned().collect());
+        }
+        for (shutdown_tx, handle) in servers {
+            let _ = shutdown_tx.send(());
+            let _ = handle.await;
+        }
+        RoutedLogin { result, logins }
+    }
+
+    fn enhanced(database: &'static str) -> Hop {
+        Box::new(move |port| {
+            mssql_mock_tds::RedirectionConfig::enhanced("127.0.0.1", port, database)
+        })
+    }
+
+    fn plain() -> Hop {
+        Box::new(|port| mssql_mock_tds::RedirectionConfig::new("127.0.0.1", port))
+    }
+
+    fn only_database(logins: &[mssql_mock_tds::ConnectionInfo]) -> Option<&str> {
+        assert_eq!(
+            logins.len(),
+            1,
+            "expected exactly one LOGIN7, got {logins:?}"
+        );
+        logins[0].received_database.as_deref()
+    }
+
+    /// Enhanced Routing (ENVCHANGE 21) redirects the login to the routed
+    /// database; the client advertises feature 0x0F so the route is offered.
+    #[tokio::test]
+    async fn test_enhanced_routing_logs_in_to_the_routed_database() {
+        let routed = login_through(vec![enhanced("routed_db")]).await;
+        assert_eq!(routed.result, Ok(()));
+
+        let gateway = &routed.logins[0];
+        assert_eq!(only_database(gateway), Some("master"));
+        assert!(
+            gateway[0]
+                .requested_feature_ids
+                .contains(&mssql_mock_tds::protocol::FEATURE_EXT_ENHANCED_ROUTING),
+            "LOGIN7 must advertise Enhanced Routing, got {:?}",
+            gateway[0].requested_feature_ids
+        );
+        assert_eq!(only_database(&routed.logins[1]), Some("routed_db"));
+    }
+
+    /// Servers may acknowledge the feature before or after the routing token.
+    #[tokio::test]
+    async fn test_enhanced_routing_acknowledged_before_the_routing_token() {
+        let routed = login_through(vec![Box::new(|port| {
+            let mut config =
+                mssql_mock_tds::RedirectionConfig::enhanced("127.0.0.1", port, "routed_db");
+            config.ack_before_routing = true;
+            config
+        })])
+        .await;
+        assert_eq!(routed.result, Ok(()));
+        assert_eq!(only_database(&routed.logins[1]), Some("routed_db"));
+    }
+
+    /// Enhanced Routing without an acknowledgement of 1 fails the login, as in
+    /// msodbcsql, instead of following or ignoring the route.
+    #[tokio::test]
+    async fn test_enhanced_routing_without_acknowledgement_fails_the_login() {
+        for acknowledgement in [None, Some(0)] {
+            let routed = login_through(vec![Box::new(move |port| {
+                let mut config =
+                    mssql_mock_tds::RedirectionConfig::enhanced("127.0.0.1", port, "routed_db");
+                config.enhanced_routing_ack = acknowledgement;
+                config
+            })])
+            .await;
+            assert!(
+                routed.result.is_err(),
+                "acknowledgement {acknowledgement:?} should fail the login"
+            );
+            assert!(
+                routed.logins[1].is_empty(),
+                "the client must not follow the route"
+            );
+        }
+    }
+
+    /// Plain routing (ENVCHANGE 20) keeps the database the application asked for.
+    #[tokio::test]
+    async fn test_plain_routing_keeps_the_login_database() {
+        let routed = login_through(vec![plain()]).await;
+        assert_eq!(routed.result, Ok(()));
+        assert_eq!(only_database(&routed.logins[1]), Some("master"));
+    }
+
+    /// The routed database applies to its own hop only: a later plain route
+    /// logs in to the original database again, as msodbcsql does.
+    #[tokio::test]
+    async fn test_plain_routing_after_enhanced_routing_restores_the_login_database() {
+        let routed = login_through(vec![enhanced("routed_db"), plain()]).await;
+        assert_eq!(routed.result, Ok(()));
+        assert_eq!(only_database(&routed.logins[1]), Some("routed_db"));
+        assert_eq!(only_database(&routed.logins[2]), Some("master"));
+    }
 }

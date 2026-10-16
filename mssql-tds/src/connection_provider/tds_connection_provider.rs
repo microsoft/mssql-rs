@@ -399,8 +399,8 @@ impl TdsConnectionProvider {
                                 client.extend_info_messages(info_messages);
                                 return Ok(client);
                             }
-                            Err(Error::Redirection { host, port }) => {
-                                info!("Redirection to: {:?}, {:?}", host, port);
+                            Err(Error::Redirection { host, port, database }) => {
+                                info!("Redirection to: {:?}, {:?}, database: {:?}", host, port, database);
                                 redirect_count += 1;
                                 if redirect_count > max_redirects {
                                     return Err(Error::ProtocolError(
@@ -409,8 +409,16 @@ impl TdsConnectionProvider {
                                 }
 
                                 let tcp_transport_context = TransportContext::from_routing_token(host, port);
+                                // Enhanced Routing names the database for this hop; plain routing
+                                // logs in to the original one (msodbcsql
+                                // `CRoutingInfo::UpdateLoginStruct`).
+                                let routed_context = database.map(|database| {
+                                    let mut routed = Box::new(context.clone());
+                                    routed.database = database;
+                                    routed
+                                });
                                 let redirect_future = Self::connect_with_transport_context(
-                                    &context,
+                                    routed_context.as_deref().unwrap_or(&context),
                                     &tcp_transport_context,
                                     None,
                                 );
