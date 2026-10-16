@@ -6010,9 +6010,10 @@ impl TdsClient {
                 Err(error) => {
                     let error = self.fail_read(error);
                     // The token has no length prefix, so a failure partway
-                    // leaves the reader inside it. Before the first result
-                    // boundary no batch is open yet, so nothing else would
-                    // retire the connection.
+                    // leaves the reader inside it. Under `BatchErrorMode::Abort`
+                    // nothing else retires the connection for the first result,
+                    // whose batch is not open yet. Under `Continue`, `fail_read`
+                    // has already retired it and this repeats harmlessly.
                     if !matches!(
                         error,
                         crate::error::Error::TimeoutError(_)
