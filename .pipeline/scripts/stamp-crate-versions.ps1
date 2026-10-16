@@ -60,7 +60,7 @@ function Get-PackageVersionMatch {
     }
 
     $section = $sections[0]
-    if ($section.Value -match '(?m)^[ \t]*["'']' -or $section.Value -match '"""|''''''') {
+    if ($section.Value -match '(?m)^[ \t]*(?:"(?:\\.|[^"\\\r\n])*"|''[^''\r\n]*'')[ \t]*[=.]' -or $section.Value -match '"""|''''''') {
         throw "Quoted package keys and multiline package strings are unsupported in $Path"
     }
     $declarations = [regex]::Matches($section.Value, '(?m)^[ \t]*version\b')
@@ -98,15 +98,19 @@ function Set-MssqlTdsDependencyVersion {
         [Parameter(Mandatory = $true)][string]$Path
     )
 
-    $declarations = [regex]::Matches($Content, '(?m)^[ \t]*(?:mssql-tds|["'']mssql-tds["''])[ \t]*[=.]')
-    $sections = [regex]::Matches($Content, '(?ms)^[ \t]*\[dependencies\][ \t]*(?:#[^\r\n]*)?(?:\r?\n|\z).*?(?=^[ \t]*\[|\z)')
-    if ($declarations.Count -ne 1 -or $sections.Count -ne 1 -or
-        $Content -match '(?m)^[ \t]*\[[^\r\n]*mssql-tds') {
+    $sections = [regex]::Matches($Content, '(?ms)^[ \t]*\[[ \t]*dependencies[ \t]*\][ \t]*(?:#[^\r\n]*)?(?:\r?\n|\z).*?(?=^[ \t]*\[|\z)')
+    $dependencySections = [regex]::Matches($Content, '(?ms)^[ \t]*\[[ \t]*(?:target\.[^\]\r\n]+?\.[ \t]*)?(?:dependencies|dev-dependencies|build-dependencies)[ \t]*\][ \t]*(?:#[^\r\n]*)?(?:\r?\n|\z).*?(?=^[ \t]*\[|\z)')
+    $declarationCount = 0
+    foreach ($dependencySection in $dependencySections) {
+        $declarationCount += [regex]::Matches($dependencySection.Value, '(?m)^[ \t]*(?:mssql-tds|["'']mssql-tds["''])[ \t]*[=.]').Count
+    }
+    if ($declarationCount -ne 1 -or $sections.Count -ne 1 -or
+        $Content -match '(?m)^[ \t]*\[[ \t]*(?:target\.[^\]\r\n]+?\.[ \t]*)?(?:dependencies|dev-dependencies|build-dependencies)[ \t]*\.[ \t]*["'']?mssql-tds(?:["'']|[ \t.\]])') {
         throw "Expected one inline mssql-tds dependency in [dependencies] in $Path"
     }
 
     $section = $sections[0]
-    if ($section.Value -match '(?m)^[ \t]*["'']' -or $section.Value -match '"""|''''''') {
+    if ($section.Value -match '(?m)^[ \t]*(?:"(?:\\.|[^"\\\r\n])*"|''[^''\r\n]*'')[ \t]*[=.]' -or $section.Value -match '"""|''''''') {
         throw "Quoted dependency keys and multiline dependency strings are unsupported in $Path"
     }
     $dependencies = [regex]::Matches($section.Value, '(?m)^[ \t]*mssql-tds[ \t]*=[ \t]*\{(?<fields>[^{}\r\n]*)\}[ \t]*(?:#[^\r\n]*)?\r?$')
@@ -114,17 +118,60 @@ function Set-MssqlTdsDependencyVersion {
         throw "Expected one single-line mssql-tds inline dependency in $Path"
     }
     $fields = $dependencies[0].Groups['fields']
-    $keys = [regex]::Matches($fields.Value, '(?:\A|,)[ \t]*version\b')
-    $versions = [regex]::Matches($fields.Value, '(?:\A|,)[ \t]*version[ \t]*=[ \t]*"(?<version>[^"\r\n]*)"[ \t]*(?=,|\z)')
-    if ($keys.Count -ne 1 -or $versions.Count -ne 1 -or
-        $fields.Value -match '(?:\A|,)[ \t]*["'']|\\') {
+    if ($fields.Value.Contains('\')) {
+        throw "Escaped inline dependency values are unsupported in $Path"
+    }
+    $quote = [char]0
+    $depth = 0
+    $start = 0
+    $versionIndex = -1
+    $versionLength = 0
+    $keys = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    # Only commas outside strings and arrays delimit inline-table fields.
+    for ($i = 0; $i -le $fields.Length; $i++) {
+        if ($i -lt $fields.Length) {
+            $character = $fields.Value[$i]
+            if ($quote -ne [char]0) {
+                if ($character -eq $quote) { $quote = [char]0 }
+                continue
+            }
+            if ($character -eq '"' -or $character -eq "'") {
+                $quote = $character
+                continue
+            }
+            if ($character -eq '[') { $depth++; continue }
+            if ($character -eq ']') {
+                $depth--
+                if ($depth -lt 0) { throw "Unbalanced inline dependency array in $Path" }
+                continue
+            }
+            if ($character -ne ',' -or $depth -ne 0) { continue }
+        }
+        if ($quote -ne [char]0 -or $depth -ne 0) {
+            throw "Unterminated inline dependency value in $Path"
+        }
+        $field = [regex]::Match($fields.Value.Substring($start, $i - $start), '\A[ \t]*(?<key>[A-Za-z0-9_-]+)[ \t]*=[ \t]*(?<value>.+?)[ \t]*\z')
+        if (-not $field.Success -or -not $keys.Add($field.Groups['key'].Value)) {
+            throw "Expected unique bare inline dependency keys in $Path"
+        }
+        if ($field.Groups['key'].Value -ceq 'version') {
+            $value = $field.Groups['value']
+            if ($value.Value -cnotmatch '\A"[^"]+"\z') {
+                throw "Expected a double-quoted mssql-tds dependency version in $Path"
+            }
+            $sourceVersion = $value.Value.Substring(1, $value.Length - 2)
+            Assert-SemVer -Version $sourceVersion
+            $versionIndex = $start + $value.Index + 1
+            $versionLength = $sourceVersion.Length
+        }
+        $start = $i + 1
+    }
+    if ($versionIndex -lt 0) {
         throw "Expected one literal mssql-tds dependency version with bare keys in $Path"
     }
-    $versionMatch = $versions[0].Groups['version']
-    Assert-SemVer -Version $versionMatch.Value
-    $index = $section.Index + $fields.Index + $versionMatch.Index
+    $index = $section.Index + $fields.Index + $versionIndex
     return $Content.Substring(0, $index) + $Version +
-        $Content.Substring($index + $versionMatch.Length)
+        $Content.Substring($index + $versionLength)
 }
 
 if ($BuildReason -cnotmatch '\A[A-Za-z][A-Za-z0-9]*\z') {

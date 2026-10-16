@@ -55,6 +55,11 @@ versions fail explicitly. The mock crate requires one single-line inline
 `mssql-tds` entry in `[dependencies]`, with bare keys, no escaped values and one
 literal SemVer `version`; quoted keys and multiline strings in that section are
 unsupported. Ordinary indentation, comments and LF/CRLF are preserved.
+Multiline arrays in package fields or unrelated dependencies are supported, as
+are inline feature arrays and comments on table headers. Dependency declarations
+are counted only in dependency tables, not in features or metadata. Inline
+dependency fields are separated outside quoted strings and arrays, so a
+version-like substring inside a path is never treated as the version field.
 
 All selected source versions and planned replacements are validated before
 printing versions, emitting pipeline variables or writing any manifest. A
