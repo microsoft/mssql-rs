@@ -799,7 +799,7 @@ stages:
         inputs:
           artifactFeed: '$(pythonArtifactFeed)'
 
-      - pwsh: .pipeline/scripts/twine-upload.ps1 -FeedName '$(pythonFeedName)' -ConfigFile '$(PYPIRC_PATH)' -DistDir '$(distDir)'
+      - pwsh: .pipeline/scripts/twine-upload.ps1 -FeedName '$(pythonFeedName)' -ConfigFile '$(PYPIRC_PATH)' -DistDir '$(distDir)' -SimpleIndexUrl '$(pythonSimpleIndex)'
         displayName: 'twine upload to feed'
 
     # The mssql-sqlcmd package was packed by its Build job and is still a NuGet

@@ -59,6 +59,9 @@ variables:
   pythonArtifactFeed: 'public/mssql-rs_Public'
   # Twine repository name matching the .pypirc entry TwineAuthenticate@1 writes.
   pythonFeedName: 'mssql-rs_Public'
+  # Anonymous-read PEP 503 index for the same feed; the upload step reads it to
+  # skip wheels an earlier, partially failed attempt already published.
+  pythonSimpleIndex: 'https://pkgs.dev.azure.com/sqlclientdrivers/public/_packaging/mssql-rs_Public/pypi/simple/'
 
 resources:
   repositories:
@@ -200,7 +203,7 @@ extends:
             inputs:
               artifactFeed: '$(pythonArtifactFeed)'
 
-          - pwsh: .pipeline/scripts/twine-upload.ps1 -FeedName '$(pythonFeedName)' -ConfigFile '$(PYPIRC_PATH)' -DistDir '$(distDir)'
+          - pwsh: .pipeline/scripts/twine-upload.ps1 -FeedName '$(pythonFeedName)' -ConfigFile '$(PYPIRC_PATH)' -DistDir '$(distDir)' -SimpleIndexUrl '$(pythonSimpleIndex)'
             displayName: 'twine upload release wheels'
             workingDirectory: '$(Build.SourcesDirectory)'
 

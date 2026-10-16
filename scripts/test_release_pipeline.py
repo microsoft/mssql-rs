@@ -1398,6 +1398,113 @@ def test_publish_stage_splits_twine_wheels_from_sqlcmd_nuget(build_sqlcmd: bool)
         assert sqlcmd["steps"][0]["artifact"] == "drop_Build_MssqlSqlcmd_Package"
 
 
+_TWINE_UPLOAD = _ROOT / ".pipeline" / "scripts" / "twine-upload.ps1"
+_WHEELS = (
+    "mssql_python_rs-1.0.0.dev1-cp310-abi3-win_amd64.whl",
+    "mssql_python_rs-1.0.0.dev1-cp310-abi3-manylinux_2_34_x86_64.whl",
+    "mssql_python_rs-1.0.0.dev1-cp310-abi3-macosx_15_0_universal2.whl",
+)
+
+
+def _run_twine_upload(tmp_path: Path, published: dict[str, str] | None, status: int = 200):
+    """Run twine-upload.ps1 against a local simple index and a stub twine.
+
+    published maps wheel filename -> sha256 on the fake feed; None means the
+    package page returns `status` with no body (404 = never published).
+    """
+    import http.server
+    import threading
+
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    for name in _WHEELS:
+        (dist / name).write_bytes(name.encode())
+
+    anchors = "".join(
+        f'<a href="https://feed.example/download/{name}#sha256={digest}">{name}</a>\n'
+        for name, digest in (published or {}).items()
+    )
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            ok = published is not None and self.path == "/simple/mssql-python-rs/"
+            self.send_response(200 if ok else status)
+            self.end_headers()
+            if ok:
+                self.wfile.write(f"<html><body>{anchors}</body></html>".encode())
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    log = tmp_path / "twine.log"
+    (bin_dir / "twine.cmd").write_text(f'@echo %* > "{log}"\r\n', encoding="utf-8")
+    posix_stub = bin_dir / "twine"
+    posix_stub.write_text(f'#!/bin/sh\necho "$@" > "{log}"\n', encoding="utf-8")
+    posix_stub.chmod(0o755)
+
+    env = os.environ | {"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"}
+    try:
+        result = subprocess.run(
+            [
+                "pwsh", "-NoProfile", "-File", str(_TWINE_UPLOAD),
+                "-FeedName", "feed", "-ConfigFile", "pypirc", "-DistDir", str(dist),
+                "-SimpleIndexUrl", f"http://127.0.0.1:{server.server_port}/simple/",
+            ],
+            capture_output=True, text=True, env=env, check=False,
+        )
+    finally:
+        server.shutdown()
+    uploaded = sorted(
+        Path(arg).name for arg in log.read_text().split() if arg.endswith(".whl")
+    ) if log.exists() else None
+    return result, uploaded
+
+
+def _sha(name: str) -> str:
+    return hashlib.sha256(name.encode()).hexdigest()
+
+
+def test_twine_upload_uploads_everything_when_package_is_new(tmp_path: Path) -> None:
+    result, uploaded = _run_twine_upload(tmp_path, None, status=404)
+    assert result.returncode == 0, result.stderr
+    assert uploaded == sorted(_WHEELS)
+
+
+def test_twine_upload_resumes_after_partial_upload(tmp_path: Path) -> None:
+    published = {name: _sha(name) for name in _WHEELS[:2]}
+    result, uploaded = _run_twine_upload(tmp_path, published)
+    assert result.returncode == 0, result.stderr
+    assert uploaded == [_WHEELS[2]]
+    assert "Uploading 1 of 3" in result.stdout
+
+
+def test_twine_upload_is_a_no_op_when_everything_is_published(tmp_path: Path) -> None:
+    result, uploaded = _run_twine_upload(tmp_path, {name: _sha(name) for name in _WHEELS})
+    assert result.returncode == 0, result.stderr
+    assert uploaded is None
+    assert "nothing to upload" in result.stdout
+
+
+def test_twine_upload_rejects_published_file_with_different_hash(tmp_path: Path) -> None:
+    published = {_WHEELS[0]: _sha(_WHEELS[0]), _WHEELS[1]: "0" * 64}
+    result, uploaded = _run_twine_upload(tmp_path, published)
+    assert result.returncode != 0
+    assert uploaded is None
+    assert "different SHA-256" in result.stdout + result.stderr
+
+
+def test_twine_upload_fails_closed_when_index_is_unreadable(tmp_path: Path) -> None:
+    result, uploaded = _run_twine_upload(tmp_path, None, status=500)
+    assert result.returncode != 0
+    assert uploaded is None
+    assert "HTTP 500" in result.stdout + result.stderr
+
+
 @pytest.mark.parametrize(
     ("job_name", "image"),
     [
