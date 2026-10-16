@@ -691,6 +691,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn variant_cell_uses_its_own_inner_size() {
+        let table = TvpTableData::new(
+            vec![TvpColumnDef::new(SqlType::Variant(Box::new(SqlType::Int(
+                None,
+            ))))],
+            vec![vec![SqlType::Variant(Box::new(SqlType::Varchar(
+                Some(crate::datatypes::sql_string::SqlString::new(
+                    b"hello".to_vec(),
+                    crate::datatypes::sql_string::EncodingType::Utf8,
+                )),
+                10,
+            )))]],
+        );
+        table.validate().unwrap();
+
+        let bytes = row_bytes(&table.columns, &table.rows).await;
+
+        assert_eq!(
+            bytes,
+            vec![
+                TVP_ROW_TOKEN,
+                14,
+                0,
+                0,
+                0,
+                0xA7,
+                7,
+                9,
+                4,
+                0,
+                0,
+                52,
+                5,
+                0,
+                b'h',
+                b'e',
+                b'l',
+                b'l',
+                b'o',
+                TVP_END_TOKEN,
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn test_serialize_null_tvp() {
         let value = SqlType::Table(
             TvpTypeName::new(Some("dbo".to_string()), "MyType".to_string()),

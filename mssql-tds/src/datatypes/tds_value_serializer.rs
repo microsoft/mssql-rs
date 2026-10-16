@@ -144,45 +144,11 @@ impl TdsValueSerializer {
     where
         'b: 'a,
     {
-        Self::validate_row_narrow_string_length(value, ctx)?;
-        Self::serialize_value_with_narrow_string_byte_limit(writer, value, ctx, None).await
-    }
-
-    fn validate_row_narrow_string_length(
-        value: &ColumnValues,
-        ctx: &TdsTypeContext,
-    ) -> TdsResult<()> {
-        let ColumnValues::String(value) = value else {
-            return Ok(());
-        };
-        if ctx.is_plp {
-            return Ok(());
-        }
-        let is_narrow = matches!(ctx.tds_type, VARCHAR | CHAR | TEXT)
-            || (ctx.tds_type == SQL_VARIANT
-                && matches!(
-                    value.encoding_type(),
-                    EncodingType::Utf8 | EncodingType::LcidBased(_)
-                ));
-        if !is_narrow {
-            return Ok(());
+        if ctx.tds_type == SQL_VARIANT {
+            return Self::serialize_as_variant(writer, value, ctx, false).await;
         }
 
-        let actual = if let Some(bytes) = value.as_raw_wire_bytes() {
-            bytes.len()
-        } else {
-            let text = value.to_utf8_string();
-            Self::encode_narrow_for_wire(&text, ctx.collation)
-                .bytes
-                .len()
-        };
-        if actual > ctx.max_size {
-            return Err(Error::EncodedValueTooLong {
-                actual,
-                maximum: ctx.max_size,
-            });
-        }
-        Ok(())
+        Self::serialize_value_inner(writer, value, ctx, None, false).await
     }
 
     #[inline]
@@ -198,10 +164,10 @@ impl TdsValueSerializer {
         // Check if target column is sql_variant (TDS type SQL_VARIANT)
         // If so, wrap the value with variant wire format
         if ctx.tds_type == SQL_VARIANT {
-            return Self::serialize_as_variant(writer, value, ctx).await;
+            return Self::serialize_as_variant(writer, value, ctx, true).await;
         }
 
-        Self::serialize_value_inner(writer, value, ctx, narrow_string_byte_limit).await
+        Self::serialize_value_inner(writer, value, ctx, narrow_string_byte_limit, true).await
     }
 
     pub(crate) fn validate_narrow_string_length(
@@ -1487,6 +1453,7 @@ impl TdsValueSerializer {
         value: &crate::datatypes::sql_string::SqlString,
         ctx: &TdsTypeContext,
         narrow_string_byte_limit: Option<usize>,
+        fit_narrow_overflow: bool,
     ) -> TdsResult<()>
     where
         'b: 'a,
@@ -1535,6 +1502,7 @@ impl TdsValueSerializer {
                         raw_bytes,
                         ctx,
                         narrow_string_byte_limit,
+                        fit_narrow_overflow,
                     )
                     .await;
                 }
@@ -1564,6 +1532,7 @@ impl TdsValueSerializer {
                         &value.bytes,
                         ctx,
                         narrow_string_byte_limit,
+                        fit_narrow_overflow,
                     )
                     .await;
                 }
@@ -1587,6 +1556,7 @@ impl TdsValueSerializer {
                     &encoded.bytes,
                     ctx,
                     narrow_string_byte_limit,
+                    fit_narrow_overflow,
                 )
                 .await;
                 if result.is_ok() && encoded.had_loss {
@@ -1993,14 +1963,24 @@ impl TdsValueSerializer {
         single_byte_data: &[u8],
         ctx: &TdsTypeContext,
         narrow_string_byte_limit: Option<usize>,
+        fit_narrow_overflow: bool,
     ) -> TdsResult<()>
     where
         'b: 'a,
     {
         let maximum = Self::narrow_string_maximum(ctx, narrow_string_byte_limit);
         let single_byte_data = match maximum {
-            Some(maximum) => Self::fit_narrow_bytes(single_byte_data, maximum)?,
+            Some(maximum) if fit_narrow_overflow => {
+                Self::fit_narrow_bytes(single_byte_data, maximum)?
+            }
+            Some(maximum) if single_byte_data.len() > maximum => {
+                return Err(Error::EncodedValueTooLong {
+                    actual: single_byte_data.len(),
+                    maximum,
+                });
+            }
             None => single_byte_data,
+            Some(_) => single_byte_data,
         };
         let char_count = single_byte_data.len();
         let schema_char_count = ctx.max_size;
@@ -2081,6 +2061,7 @@ impl TdsValueSerializer {
         writer: &'a mut PacketWriter<'b>,
         value: &ColumnValues,
         ctx: &TdsTypeContext,
+        fit_narrow_overflow: bool,
     ) -> TdsResult<()>
     where
         'b: 'a,
@@ -2127,14 +2108,18 @@ impl TdsValueSerializer {
             {
                 let (bytes, had_loss) = Self::resolve_narrow_wire_bytes(s, ctx.collation);
                 narrow_had_loss = had_loss;
-                let fitted_len = Self::fit_narrow_bytes(&bytes, ctx.max_size)?.len();
-                Some(match bytes {
-                    Cow::Borrowed(bytes) => Cow::Borrowed(&bytes[..fitted_len]),
-                    Cow::Owned(mut bytes) => {
-                        bytes.truncate(fitted_len);
-                        Cow::Owned(bytes)
-                    }
-                })
+                if fit_narrow_overflow {
+                    let fitted_len = Self::fit_narrow_bytes(&bytes, ctx.max_size)?.len();
+                    Some(match bytes {
+                        Cow::Borrowed(bytes) => Cow::Borrowed(&bytes[..fitted_len]),
+                        Cow::Owned(mut bytes) => {
+                            bytes.truncate(fitted_len);
+                            Cow::Owned(bytes)
+                        }
+                    })
+                } else {
+                    Some(bytes)
+                }
             }
             _ => None,
         };
@@ -2201,9 +2186,9 @@ impl TdsValueSerializer {
         // inner serializer.
         match &resolved_narrow {
             Some(bytes) => {
-                Self::serialize_char_varchar_direct(writer, bytes, &temp_ctx, None).await?
+                Self::serialize_char_varchar_direct(writer, bytes, &temp_ctx, None, false).await?
             }
-            None => Self::serialize_value_inner(writer, value, &temp_ctx, None).await?,
+            None => Self::serialize_value_inner(writer, value, &temp_ctx, None, false).await?,
         }
 
         if narrow_had_loss {
@@ -2798,6 +2783,7 @@ impl TdsValueSerializer {
         value: &ColumnValues,
         ctx: &TdsTypeContext,
         narrow_string_byte_limit: Option<usize>,
+        fit_narrow_overflow: bool,
     ) -> TdsResult<()>
     where
         'b: 'a,
@@ -2826,7 +2812,14 @@ impl TdsValueSerializer {
             ColumnValues::Bytes(v) => Self::serialize_bytes(writer, v, ctx).await,
             ColumnValues::Json(v) => Self::serialize_json(writer, v, ctx).await,
             ColumnValues::String(v) => {
-                Self::serialize_string(writer, v, ctx, narrow_string_byte_limit).await
+                Self::serialize_string(
+                    writer,
+                    v,
+                    ctx,
+                    narrow_string_byte_limit,
+                    fit_narrow_overflow,
+                )
+                .await
             }
             ColumnValues::Vector(v) => Self::serialize_vector(writer, v, ctx).await,
             ColumnValues::Xml(v) => Self::serialize_xml(writer, v, ctx).await,

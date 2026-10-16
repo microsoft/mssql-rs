@@ -766,6 +766,15 @@ impl RpcParameter {
         db_collation: &SqlCollation,
     ) -> TdsResult<(Cow<'_, SqlType>, bool)> {
         let value = self.value()?;
+        if !matches!(
+            value,
+            SqlType::Char(_, _)
+                | SqlType::Varchar(_, _)
+                | SqlType::VarcharMax(_)
+                | SqlType::Text(_)
+        ) {
+            return Ok((Cow::Borrowed(value), false));
+        }
         let (column_value, context) = value.to_column_value_and_context(db_collation);
         let Some((bytes, had_loss)) = TdsValueSerializer::narrow_string_bytes(
             &column_value,
@@ -1159,6 +1168,26 @@ mod tests {
             panic!("expected a fitted varchar(1)");
         };
         assert_eq!(value.bytes, b"a");
+        assert!(!had_loss);
+    }
+
+    #[test]
+    fn encrypted_non_narrow_value_stays_borrowed() {
+        let collation = SqlCollation {
+            info: 0x0409,
+            lcid_language_id: 0,
+            col_flags: 0,
+            sort_id: 52,
+        };
+        let parameter = RpcParameter::new(
+            Some("@p".to_string()),
+            StatusFlags::NONE,
+            SqlType::VarBinaryMax(Some(vec![1; 8192])),
+        );
+
+        let (value, had_loss) = parameter.value_for_encryption(&collation).unwrap();
+
+        assert!(matches!(value, Cow::Borrowed(_)));
         assert!(!had_loss);
     }
 
