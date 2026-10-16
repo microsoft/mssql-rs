@@ -31,6 +31,8 @@ export async function create_connection(
 }
 
 export class SqlJsConnection {
+  private encoding?: Encoding;
+
   constructor(private internal_connection: Connection) {
     this.internal_connection = internal_connection;
   }
@@ -70,6 +72,9 @@ export class SqlJsConnection {
   }
 
   getEncoding(): Encoding {
+    if (this.encoding !== undefined) {
+      return this.encoding;
+    }
     let db_collation = this.internal_connection.getCollation();
     let encoding: Encoding = 'utf-8';
     if (db_collation != null) {
@@ -83,6 +88,8 @@ export class SqlJsConnection {
     } else {
       encoding = 'utf-8';
     }
+    // The native connection's collation snapshot is immutable.
+    this.encoding = encoding;
     return encoding;
   }
 
@@ -113,8 +120,8 @@ export class SqlJsConnection {
     return this.internal_connection.closeQuery();
   }
 
-  async queryRaw(query: string): Promise<Buffer[]> {
-    return this.internal_connection.queryRaw(query);
+  async queryRaw(query: string, params?: Array<Parameter>): Promise<Buffer[]> {
+    return this.internal_connection.queryRaw(query, params);
   }
 
   async fetchChunk(byteBudget: number): Promise<ChunkResult | null> {

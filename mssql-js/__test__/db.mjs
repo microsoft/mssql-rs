@@ -14,9 +14,14 @@ export async function openConnection(context) {
 }
 
 export async function createContext() {
+  const port = Number(process.env.DB_PORT ?? 1433);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new Error('DB_PORT must be an integer between 1 and 65535');
+  }
+
   const context = {
     serverName: process.env.DB_HOST || 'localhost',
-    port: 1433,
+    port,
     userName: process.env.DB_USER || 'sa',
     password: await getPassword(),
     database: 'master',

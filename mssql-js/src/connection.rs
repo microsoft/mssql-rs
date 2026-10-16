@@ -62,6 +62,19 @@ impl Debug for Connection {
     }
 }
 
+fn input_parameters(params: Vec<Parameter>) -> napi::Result<Vec<RpcParameter>> {
+    params
+        .into_iter()
+        .map(|param| {
+            let name = param.name.clone();
+            let value = param.try_into().map_err(|error| {
+                napi::Error::from_reason(format!("Parameter conversion failed: {error}"))
+            })?;
+            Ok(RpcParameter::new(Some(name), StatusFlags::NONE, value))
+        })
+        .collect()
+}
+
 #[napi]
 impl Connection {
     #[napi]
@@ -95,27 +108,7 @@ impl Connection {
     ) -> napi::Result<()> {
         let mut client = self.tds_client.lock().await;
 
-        let rpc_params: Result<Vec<RpcParameter>, napi::Error> = params
-            .into_iter()
-            .map(|p| {
-                let param_name = p.name.clone();
-                let param_value = match p.try_into() {
-                    Ok(value) => value,
-                    Err(e) => {
-                        return Err(napi::Error::from_reason(format!(
-                            "Parameter conversion failed: {e}"
-                        )));
-                    }
-                };
-                Ok(RpcParameter::new(
-                    Some(param_name),
-                    StatusFlags::NONE,
-                    param_value,
-                ))
-            })
-            .collect();
-
-        let rpc_params = rpc_params?;
+        let rpc_params = input_parameters(params)?;
         let first = client
             .execute_sp_executesql(query, rpc_params, ())
             .await
@@ -183,15 +176,31 @@ impl Connection {
     /// one per result set, avoiding per-row N-API boundary crossings.
     ///
     /// The buffer layout is decoded on the JS side by `decode.ts`.
+    /// Parameters use `sp_executesql` without returning to JS between result stages.
     #[napi]
-    pub async fn query_raw(&self, query: String) -> napi::Result<Vec<Buffer>> {
+    pub async fn query_raw(
+        &self,
+        query: String,
+        params: Option<Vec<Parameter>>,
+    ) -> napi::Result<Vec<Buffer>> {
         let mut client = self.tds_client.lock().await;
 
         // Statement-wise execute, then collapse to row-returning result sets.
-        let first = client
-            .execute(query, ())
-            .await
-            .map_err(|e| napi::Error::from_reason(format!("Failed to execute query: {e}")))?;
+        let first = if let Some(params) = params.filter(|params| !params.is_empty()) {
+            client
+                .execute_sp_executesql(query, input_parameters(params)?, ())
+                .await
+                .map_err(|e| {
+                    napi::Error::from_reason(format!(
+                        "Failed to execute query with parameters: {e}"
+                    ))
+                })?
+        } else {
+            client
+                .execute(query, ())
+                .await
+                .map_err(|e| napi::Error::from_reason(format!("Failed to execute query: {e}")))?
+        };
         let mut has_rows = matches!(first, StatementResult::Rows);
         if !has_rows {
             has_rows = client.advance_to_rows().await.map_err(|e| {
