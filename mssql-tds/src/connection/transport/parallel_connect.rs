@@ -374,8 +374,11 @@ async fn connect_with_keepalive(
 
 /// Races multiple connection futures and returns the first successful one.
 ///
-/// This function spawns all connection attempts as tasks and waits for the first
-/// successful connection. If all connections fail, returns the last error.
+/// Each attempt runs as a task in a `JoinSet`, which aborts every attempt still
+/// pending when the race returns or is dropped. A win, or the login deadline
+/// cancelling the race, therefore closes the other sockets instead of leaving
+/// them to the OS connect timeout. If all connections fail, returns the last
+/// error.
 async fn race_connections(
     connect_futures: Vec<
         impl std::future::Future<
@@ -384,34 +387,10 @@ async fn race_connections(
         + 'static,
     >,
 ) -> Result<(TcpStream, SocketAddr, usize, usize), std::io::Error> {
-    use tokio::sync::mpsc;
-
-    let (tx, mut rx) = mpsc::channel::<Result<(TcpStream, SocketAddr, usize), std::io::Error>>(1);
-    let total = connect_futures.len();
-
-    // Spawn all connection attempts
-    let handles: Vec<_> = connect_futures
-        .into_iter()
-        .map(|fut| {
-            let tx = tx.clone();
-            tokio::spawn(crate::trace_context::propagate_future(async move {
-                let result = fut.await;
-                match result {
-                    Ok((stream, addr, idx)) => {
-                        // Try to send success, ignore if receiver dropped
-                        let _ = tx.send(Ok((stream, addr, idx))).await;
-                    }
-                    Err((e, _addr, _idx)) => {
-                        // Try to send error, ignore if receiver dropped
-                        let _ = tx.send(Err(e)).await;
-                    }
-                }
-            }))
-        })
-        .collect();
-
-    // Drop our sender so channel closes when all spawned tasks complete
-    drop(tx);
+    let mut attempts = tokio::task::JoinSet::new();
+    for fut in connect_futures {
+        attempts.spawn(crate::trace_context::propagate_future(fut));
+    }
 
     let mut failed_attempts = 0;
     let mut last_error = std::io::Error::new(
@@ -419,23 +398,16 @@ async fn race_connections(
         "No connection attempts made",
     );
 
-    // Wait for first success or all failures
-    while let Some(result) = rx.recv().await {
-        match result {
-            Ok((stream, addr, idx)) => {
-                // Success! Abort all other tasks
-                for handle in handles {
-                    handle.abort();
-                }
-                return Ok((stream, addr, idx, failed_attempts));
-            }
-            Err(e) => {
+    while let Some(attempt) = attempts.join_next().await {
+        match attempt {
+            Ok(Ok((stream, addr, idx))) => return Ok((stream, addr, idx, failed_attempts)),
+            Ok(Err((e, _addr, _idx))) => {
                 failed_attempts += 1;
                 last_error = e;
-                if failed_attempts >= total {
-                    // All connections failed
-                    break;
-                }
+            }
+            Err(join_error) => {
+                failed_attempts += 1;
+                last_error = std::io::Error::other(join_error);
             }
         }
     }
@@ -489,6 +461,44 @@ mod tests {
         assert_eq!(worker_context, Snapshot::default());
     }
 
+    /// The login deadline cancels a race by dropping it, so every attempt still
+    /// connecting must go with it rather than keep its socket open.
+    #[tokio::test]
+    async fn a_dropped_race_aborts_every_pending_attempt() {
+        use std::sync::Arc;
+
+        struct Pending(Arc<AtomicUsize>);
+        impl Drop for Pending {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+
+        let pending = Arc::new(AtomicUsize::new(3));
+        let attempts = (0..3)
+            .map(|_| {
+                let guard = Pending(Arc::clone(&pending));
+                async move {
+                    let _guard = guard;
+                    std::future::pending::<
+                        Result<(TcpStream, SocketAddr, usize), (std::io::Error, SocketAddr, usize)>,
+                    >()
+                    .await
+                }
+            })
+            .collect();
+
+        let raced = timeout(Duration::from_millis(50), race_connections(attempts)).await;
+        assert!(raced.is_err(), "no attempt ever finishes");
+        timeout(Duration::from_secs(5), async {
+            while pending.load(Ordering::SeqCst) > 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropping the race aborts every attempt");
+    }
+
     /// Regression coverage for AB#47704: `parallel_connect` used to resolve
     /// DNS via blocking `to_socket_addrs()`, which never yields to the
     /// executor. Timing can't prove the fix — resolving even a nonexistent
@@ -499,7 +509,7 @@ mod tests {
     /// yield at least once; a blocking call never yields, so the heartbeat
     /// gets zero chances to run. Uses a host that fails to resolve so the
     /// call returns from resolution alone, without reaching
-    /// `race_connections` — which spawns tasks and awaits a channel
+    /// `race_connections` — which spawns tasks and awaits their results
     /// regardless of DNS behavior, and would mask the signal. Confirmed by
     /// mutation testing (reverting to `to_socket_addrs()` makes this fail).
     ///

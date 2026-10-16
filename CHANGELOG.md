@@ -157,6 +157,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ### Fixed
 
+- `mssql-tds`: a parallel TCP connect (MultiSubnetFailover, and TNIR once the
+  first address fails) now aborts its remaining attempts when it is cancelled
+  or the login deadline expires. Before, those attempts kept their sockets
+  open until the OS connect timeout (AB#49293).
+
 - `mssql-tds` and bindings: an `IMAGE` value with a present text pointer and a
   zero payload length now decodes as empty instead of NULL (AB#49220). In the
   legacy LOB wire format NULL is a zero *text-pointer* length; the decoder
