@@ -2481,6 +2481,11 @@ mod tests {
             state.diag_records[0].sql_state,
             ERR_MISSING_UDT_TYPE_NAME.state
         );
+        assert!(
+            state.diag_records[0]
+                .message
+                .ends_with(ERR_MISSING_UDT_TYPE_NAME.text)
+        );
         assert!(!state.needs_data());
     }
 
