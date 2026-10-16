@@ -202,8 +202,10 @@ steps:
   displayName: Build in Container
   env:
     SQL_PASSWORD: $(SQL_PASSWORD)
-    CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN)
-    CARGO_REGISTRIES_MSSQL_RS_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_TOKEN)
+    # PR code must not receive feed secrets, even outside the container wrapper.
+    ${{ if ne(variables['Build.Reason'], 'PullRequest') }}:
+      CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN)
+      CARGO_REGISTRIES_MSSQL_RS_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_TOKEN)
 
 - script: |
     BUILD_IMAGE="ghcr.io/microsoft/mssql-rs/build/ubuntu:22.04"
@@ -217,9 +219,6 @@ steps:
       /workspace/.pipeline/scripts/containerized-clippy.sh
   displayName: Run Clippy
   condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
-  env:
-    CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN)
-    CARGO_REGISTRIES_MSSQL_RS_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_TOKEN)
 
 - script: |
     BUILD_IMAGE="ghcr.io/microsoft/mssql-rs/build/ubuntu:22.04"
@@ -233,9 +232,6 @@ steps:
       /workspace/.pipeline/scripts/containerized-format.sh
   displayName: Check Format
   condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
-  env:
-    CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN)
-    CARGO_REGISTRIES_MSSQL_RS_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_TOKEN)
 
 - ${{ if ne(parameters.architecture, 'ARM64') }}:
   - script: |
@@ -258,8 +254,6 @@ steps:
     condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
     env:
       SQL_PASSWORD: $(SQL_PASSWORD)
-      CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN)
-      CARGO_REGISTRIES_MSSQL_RS_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_TOKEN)
 
   # ODBC C++ gtest e2e suite against the same in-network SQL Server (sql1) this
   # job already uses. Runs inside the build container; the containerized script
@@ -295,8 +289,6 @@ steps:
     condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
     env:
       SQL_PASSWORD: $(SQL_PASSWORD)
-      CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN)
-      CARGO_REGISTRIES_MSSQL_RS_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_TOKEN)
 
 # ARM64 runs the same test pass but against the cross-pool SQL host resolved
 # by poll-for-endpoint.sh (DB_HOST/DB_PORT). TRUST_SERVER_CERTIFICATE bypasses
@@ -326,8 +318,6 @@ steps:
       SQL_PASSWORD: $(SQL_PASSWORD)
       DB_HOST: $(DB_HOST)
       DB_PORT: $(DB_PORT)
-      CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN)
-      CARGO_REGISTRIES_MSSQL_RS_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_TOKEN)
 
   # ODBC C++ gtest e2e suite against the cross-pool SQL host (DB_HOST:DB_PORT).
   # TrustServerCertificate=Yes (ODBC_TEST_TRUST_CERT) bypasses cert validation,
@@ -356,8 +346,6 @@ steps:
       SQL_PASSWORD: $(SQL_PASSWORD)
       DB_HOST: $(DB_HOST)
       DB_PORT: $(DB_PORT)
-      CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN)
-      CARGO_REGISTRIES_MSSQL_RS_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_TOKEN)
 
 - task: PublishTestResults@2
   condition: and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'))
@@ -451,8 +439,9 @@ steps:
     displayName: Build JavaScript bindings
     condition: succeeded()
     env:
-      CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN)
-      CARGO_REGISTRIES_MSSQL_RS_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_TOKEN)
+      ${{ if ne(variables['Build.Reason'], 'PullRequest') }}:
+        CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN)
+        CARGO_REGISTRIES_MSSQL_RS_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_TOKEN)
 
 - ${{ if eq(parameters.enableJsTest, true) }}:
   - script: |
@@ -472,8 +461,6 @@ steps:
     condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
     env:
       SQL_PASSWORD: $(SQL_PASSWORD)
-      CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN)
-      CARGO_REGISTRIES_MSSQL_RS_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_TOKEN)
 
   - task: PublishTestResults@2
     condition: and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'))
@@ -498,9 +485,6 @@ steps:
       /workspace/.pipeline/scripts/containerized-pycore-rust-test.sh
   displayName: Run Rust unit tests (mssql-py-core)
   condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'), ne('${{ parameters.architecture }}', 'ARM64'))
-  env:
-    CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN)
-    CARGO_REGISTRIES_MSSQL_RS_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_TOKEN)
 
 - task: PublishTestResults@2
   condition: and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'), ne('${{ parameters.architecture }}', 'ARM64'))
@@ -544,8 +528,6 @@ steps:
   condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
   env:
     SQL_PASSWORD: $(SQL_PASSWORD)
-    CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN)
-    CARGO_REGISTRIES_MSSQL_RS_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_TOKEN)
 
 - task: PublishTestResults@2
   condition: and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'))
