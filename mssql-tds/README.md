@@ -86,6 +86,15 @@ async fn main() -> TdsResult<()> {
 }
 ```
 
+## Cancelling an outstanding response
+
+Use `client.cancel_query(timeout_secs).await` to abandon remaining server work
+after execution has returned a result. Unlike `close_query`, which drains
+normally, this sends ATTENTION and waits for acknowledgement before reuse,
+including when a row or PLP value is partially read. The timeout bounds
+cancellation settlement; zero uses the transport default. Failed settlement
+returns an error and retires the connection.
+
 ## License
 
 MIT

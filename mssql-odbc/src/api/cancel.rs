@@ -75,8 +75,12 @@ fn sql_cancel_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
             return SQL_ERROR;
         };
         if stmt_state.dae.is_none() {
-            let rc =
-                super::close_cursor::free_stmt_close_locked(statement_handle, stmt, stmt_state);
+            let rc = super::close_cursor::free_stmt_close_locked(
+                statement_handle,
+                stmt,
+                stmt_state,
+                true,
+            );
             if !matches!(rc, SQL_SUCCESS | SQL_SUCCESS_WITH_INFO) {
                 return rc;
             }
@@ -689,6 +693,8 @@ mod tests {
         GetDataReadAhead,
         MoreResults,
         Close,
+        Idle,
+        IdlePlp,
     }
 
     fn cancel_cursor_phase(phase: CursorPhase, acknowledge: bool, stall: bool) {
@@ -710,7 +716,10 @@ mod tests {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let dbc = stmt.parent_dbc();
         let server_runtime = tokio::runtime::Runtime::new().unwrap();
-        let response = if matches!(phase, CursorPhase::Plp | CursorPhase::GetDataReadAhead) {
+        let response = if matches!(
+            phase,
+            CursorPhase::Plp | CursorPhase::GetDataReadAhead | CursorPhase::IdlePlp
+        ) {
             QueryResponse::new(
                 vec![ColumnDefinition::new("", SqlDataType::VarBinaryMax)],
                 vec![Row::new(vec![ColumnValue::VarBinaryMax(vec![vec![1; 32]])])],
@@ -866,13 +875,29 @@ mod tests {
         }
         if matches!(
             phase,
-            CursorPhase::GetData | CursorPhase::Plp | CursorPhase::GetDataReadAhead
+            CursorPhase::GetData
+                | CursorPhase::Plp
+                | CursorPhase::GetDataReadAhead
+                | CursorPhase::IdlePlp
         ) {
             assert_eq!(
                 SQL_SUCCESS,
                 unsafe { crate::api::SQLFetch(h.stmt) },
                 "{phase:?}"
             );
+        }
+        if matches!(phase, CursorPhase::IdlePlp) {
+            let mut data = [0u8; 4];
+            assert_eq!(SQL_SUCCESS_WITH_INFO, unsafe {
+                crate::api::SQLGetData(
+                    h.stmt,
+                    1,
+                    SQL_C_BINARY,
+                    data.as_mut_ptr().cast(),
+                    4,
+                    &mut length,
+                )
+            });
         }
         let raw = h.stmt as usize;
         if stall {
@@ -888,9 +913,18 @@ mod tests {
             });
         }
         std::thread::scope(|scope| {
+            let idle = matches!(phase, CursorPhase::Idle | CursorPhase::IdlePlp);
+            let (cancel_tx, cancel_rx) = std::sync::mpsc::channel();
+            let idle_tx = cancel_tx.clone();
+            let cancelled_at = Instant::now();
             let operation = scope.spawn(move || unsafe {
                 let raw = raw as SqlHandle;
                 match phase {
+                    CursorPhase::Idle | CursorPhase::IdlePlp => {
+                        let rc = crate::api::SQLCancel(raw);
+                        idle_tx.send(rc).unwrap();
+                        rc
+                    }
                     CursorPhase::Fetch | CursorPhase::ReadAhead => crate::api::SQLFetch(raw),
                     CursorPhase::MoreResults => crate::api::SQLMoreResults(raw),
                     CursorPhase::Close => crate::api::SQLFreeStmt(raw, SQL_CLOSE),
@@ -928,11 +962,11 @@ mod tests {
                 );
                 std::thread::yield_now();
             }
-            let (cancel_tx, cancel_rx) = std::sync::mpsc::channel();
-            let cancelled_at = Instant::now();
-            let cancel = scope.spawn(move || {
-                let rc = unsafe { crate::api::SQLCancel(raw as SqlHandle) };
-                cancel_tx.send(rc).unwrap();
+            let cancel = (!idle).then(|| {
+                scope.spawn(move || {
+                    let rc = unsafe { crate::api::SQLCancel(raw as SqlHandle) };
+                    cancel_tx.send(rc).unwrap();
+                })
             });
             attention_rx.recv_timeout(Duration::from_secs(2)).unwrap();
             assert!(cancel_rx.recv_timeout(Duration::from_millis(25)).is_err());
@@ -944,7 +978,15 @@ mod tests {
                 ack_tx.send(()).unwrap();
             }
             assert_eq!(
-                SQL_SUCCESS,
+                if idle {
+                    if acknowledge {
+                        SQL_SUCCESS_WITH_INFO
+                    } else {
+                        SQL_ERROR
+                    }
+                } else {
+                    SQL_SUCCESS
+                },
                 cancel_rx.recv_timeout(Duration::from_secs(5)).unwrap()
             );
             if stall {
@@ -957,7 +999,16 @@ mod tests {
                 assert!(!state.has_state(STMT_STATE_CURSOR_OPEN), "{phase:?}");
                 assert!(state.active_plp.is_none());
                 assert!(state.pending_fetch_error.is_none());
-                assert_eq!(state.diag_records[0].sql_state, *b"HY008");
+                if idle {
+                    if acknowledge {
+                        assert_eq!(state.diag_records.last().unwrap().sql_state, *b"01S05");
+                    } else {
+                        assert!(!state.diag_records.is_empty());
+                        assert!(state.diag_records.iter().all(|d| d.sql_state != *b"01S05"));
+                    }
+                } else {
+                    assert_eq!(state.diag_records[0].sql_state, *b"HY008");
+                }
             }
             {
                 let state = dbc.inner.lock().unwrap();
@@ -970,8 +1021,17 @@ mod tests {
             assert_eq!(SQL_SUCCESS, unsafe {
                 crate::api::SQLFreeStmt(h.stmt, SQL_CLOSE)
             });
-            assert_eq!(SQL_ERROR, operation.join().unwrap());
-            cancel.join().unwrap();
+            assert_eq!(
+                if idle && acknowledge {
+                    SQL_SUCCESS_WITH_INFO
+                } else {
+                    SQL_ERROR
+                },
+                operation.join().unwrap()
+            );
+            if let Some(cancel) = cancel {
+                cancel.join().unwrap();
+            }
         });
         if acknowledge {
             assert_eq!(SQL_SUCCESS, unsafe {
@@ -981,6 +1041,18 @@ mod tests {
         }
         // The server task is scoped to this mock, not a shared runtime.
         server.abort();
+    }
+
+    #[test]
+    fn idle_cancel_sends_attention_and_waits_for_acknowledgement() {
+        cancel_cursor_phase(CursorPhase::Idle, true, false);
+        cancel_cursor_phase(CursorPhase::IdlePlp, true, false);
+    }
+
+    #[test]
+    fn idle_cancel_bounds_missing_acknowledgement_and_retires_connection() {
+        cancel_cursor_phase(CursorPhase::Idle, false, false);
+        cancel_cursor_phase(CursorPhase::Idle, false, true);
     }
 
     #[test]

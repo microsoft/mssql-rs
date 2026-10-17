@@ -124,6 +124,38 @@ ODBC_TEST_F(ConnectionBusyLiveTest, IdleCancelPreservesPreparedStatementAndBindi
     ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_RESET_PARAMS), SQL_HANDLE_STMT, stmt_);
 }
 
+// Benefits-from-mock-tds: cancel.rs pins ATTENTION and its acknowledgement;
+// this additionally proves cancellation prevents the delayed server-side write.
+ODBC_TEST_F(ConnectionBusyLiveTest, IdleCancelAbandonsDelayedBatchTail) {
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_QUERY_TIMEOUT, nullptr, 0),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLSetConnectAttr(dbc_, SQL_ATTR_CONNECTION_TIMEOUT,
+                                   reinterpret_cast<SQLPOINTER>(2), 0),
+                  SQL_HANDLE_DBC, dbc_);
+    ASSERT_SQL_OK(Run(stmt_, "CREATE TABLE #idle_cancel_tail(n int)"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_CLOSE), SQL_HANDLE_STMT, stmt_);
+
+    const auto started = std::chrono::steady_clock::now();
+    ASSERT_SQL_OK(Run(stmt_,
+        "SELECT REPLICATE('x',4000) FROM (VALUES(1),(2),(3)) AS v(n); "
+        "WAITFOR DELAY '00:00:05'; INSERT #idle_cancel_tail VALUES(1)"),
+        SQL_HANDLE_STMT, stmt_);
+    ASSERT_LT(std::chrono::steady_clock::now() - started, std::chrono::seconds(3));
+    const auto cancelling = std::chrono::steady_clock::now();
+    ASSERT_SQL_OK(CancelIdleStatement(), SQL_HANDLE_STMT, stmt_);
+    EXPECT_LT(std::chrono::steady_clock::now() - cancelling, std::chrono::seconds(3));
+
+    SQLHSTMT other = AllocStmt();
+    ASSERT_SQL_OK(Run(other, "SELECT COUNT(*) FROM #idle_cancel_tail"), SQL_HANDLE_STMT, other);
+    ASSERT_SQL_OK(SQLFetch(other), SQL_HANDLE_STMT, other);
+    SQLINTEGER count = -1;
+    ASSERT_SQL_OK(SQLGetData(other, 1, SQL_C_SLONG, &count, sizeof(count), nullptr),
+                  SQL_HANDLE_STMT, other);
+    EXPECT_EQ(0, count);
+    ASSERT_SQL_OK(SQLFreeStmt(other, SQL_CLOSE), SQL_HANDLE_STMT, other);
+    ASSERT_SQL_OK(Run(stmt_, "DROP TABLE #idle_cancel_tail"), SQL_HANDLE_STMT, stmt_);
+}
+
 // A first execution of a prepared statement uses sp_prepexec. Its output
 // handle trails the row result on the wire, but it is part of the same RPC
 // response and must not keep the connection claimed after the only row and

@@ -8673,6 +8673,28 @@ impl TdsClient {
         }
     }
 
+    /// Abandons an outstanding response, including a partially read row or PLP
+    /// value, and waits for ATTENTION acknowledgement before permitting reuse.
+    /// `timeout_secs` bounds cancellation settlement, not the original query.
+    /// Zero uses the transport's default settlement timeout.
+    pub async fn cancel_query(&mut self, timeout_secs: u32) -> TdsResult<()> {
+        if !self.has_open_batch() {
+            return Ok(());
+        }
+        let mut cancel = CancelHandle::new();
+        cancel.set_cancel_timeout_secs(timeout_secs);
+        self.cancel_handle = Some(cancel.child_handle());
+        cancel.cancel();
+        match self.close_query().await {
+            Err(crate::error::Error::OperationCancelledError(_))
+                if !self.transport.connection_known_dead() =>
+            {
+                Ok(())
+            }
+            result => result,
+        }
+    }
+
     /// Drains all remaining result sets and resets the client for the next request.
     ///
     /// Any unread rows and result sets are consumed so the TDS stream is left in
@@ -9494,6 +9516,14 @@ mod tests {
     };
     use async_trait::async_trait;
     use std::collections::VecDeque;
+
+    #[tokio::test]
+    async fn cancel_query_without_an_open_batch_does_not_touch_transport() {
+        let mut client = crate::test_client_support::tds_client_from_tokens(vec![]);
+        client.cancel_query(1).await.unwrap();
+        assert!(!client.has_open_batch());
+        assert!(client.cancel_handle.is_none());
+    }
 
     // ── Minimal mock transport for reconnect() unit tests ──
 

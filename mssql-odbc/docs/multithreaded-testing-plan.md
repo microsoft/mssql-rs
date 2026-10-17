@@ -289,6 +289,18 @@ Measured 2026-10-08 on both drivers unless noted.
   msodbcsql can treat cancellation overlapping its diagnostic lock as a no-op.
   The e2e observer gate therefore excludes only those unsafe overlaps while
   keeping the idle-close contract deterministic on both drivers.
+  Idle cancellation now abandons an owned pending response via ATTENTION,
+  using `SQL_ATTR_CONNECTION_TIMEOUT` (zero selects 120 seconds) for settlement.
+  It does not change the normal `SQLFreeStmt(SQL_CLOSE)` drain. The mock tests
+  hold back a response tail and DONE_ATTN independently, cover partially read
+  PLP data, and verify failed settlement retires the connection. The live
+  `IdleCancelAbandonsDelayedBatchTail` case checks that a five-second WAITFOR
+  and trailing INSERT are abandoned rather than completed by the close.
+  Measured on Windows on 2026-10-17 with native `SQL_DRIVER_VER=18.06.0001`
+  and the updated Rust debug DLL (`18.6.2.1`): both returned `01S05` in less
+  than one millisecond and left the temporary table empty. This follows native
+  `Cancel` (`sqlcmisc.cpp:847-851`) into the ATTENTION branch of
+  `ProcessTDSStream` (`sqlccmd.cpp:11718-11731`).
 
 ## Scenarios
 
