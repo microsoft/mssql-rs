@@ -7,11 +7,20 @@ This directory contains scripts used by the Azure DevOps pipeline to configure a
 Boots a SQL Server docker container on an x64 1ES agent so ARM test jobs can
 run against a real SQL Server without depending on a static (ACI) IP address.
 The SQL host job and the ARM test jobs run concurrently and rendezvous through
-pipeline-artifact sentinels; the SA password is derived deterministically from
-the build context so no secret is transported between jobs.
+pipeline-artifact sentinels. `InitializeValidation` generates a cryptographically
+random SA password once and exposes it only as a secret-marked output variable.
+Only cross-pool SQL jobs map that output via `stageDependencies`; standalone
+SQL jobs retain job-local random passwords.
 
-- **start.sh** — Receives the SA password (derived by `derive-sql-password.sh`
-  in the YAML templates), generates certs (adding the host's private VNet IPv4
+- **generate-shared-password.py** — Runs in `InitializeValidation.Initialize`
+  after the PR duplicate check (CI explicitly reports nonduplicate). Produces
+  a SQL-policy prefix plus 192 random bits and an independent nonsecret
+  generation ID. RNG failure fails initialization; there is no fallback.
+- **import-sql-password.sh / Import-SqlPassword.ps1** — Validate explicitly
+  mapped `SHARED_SQL_PASSWORD` and `SQL_CREDENTIAL_GENERATION`, then establish
+  the job's secret `SQL_PASSWORD` and `SQL_PASSWORD_GENERATED` marker. Missing,
+  unresolved, or malformed outputs fail without regenerating a password.
+- **start.sh** — Receives the imported SA password, generates certs (adding the host's private VNet IPv4
   as an extra SAN via `EXTRA_IP_SAN`), starts the SQL container, and publishes
   the `sql-ready-<instanceId>` sentinel carrying the endpoint plus
   `ca.crt`/`mssql.pem`.
@@ -19,6 +28,21 @@ the build context so no secret is transported between jobs.
   by the raw sentinel names the test jobs publish) and releases the SQL host
   once every expected sentinel has been published.
 - **teardown.sh** — Stops and removes the SQL container and network.
+
+Endpoint and teardown artifacts are namespaced by the nonsecret generation ID
+and stage attempt. Endpoints also carry the generation ID; both Linux and
+Windows pollers reject a mismatch before exposing the endpoint. Artifacts never
+contain the credential. Rerun the entire consuming stage to restart its host
+alongside tests, retaining the original initialization output. Do not rerun
+initialization while consumers are active; queue a new run when reinitializing.
+Local tests cover the contract, not Azure Pipelines' output retention or masking
+on retries; those require a scoped live validation.
+
+`scripts/test_shared_sql_credentials.py` runs in both the Windows packaging
+checks and a focused Linux build-job step. The suite requires PowerShell on
+Windows and Bash on Linux, so a missing native shell fails rather than silently
+skipping that platform's executable regressions. The other platform's shell
+cases may skip when its interpreter is unavailable.
 
 See `.pipeline/docs/arm-sql-host-design.md` for the full design.
 

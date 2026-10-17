@@ -11,9 +11,8 @@
 #
 # Required env:
 #   INSTANCE_ID                    Unique id (e.g. "shared", "shared_musl").
-#   SQL_PASSWORD                   SA password (derived from build context
-#                                  by derive-sql-password.sh; matches the
-#                                  test job's derived value).
+#   SQL_PASSWORD                   Imported initialization secret.
+#   SQL_CREDENTIAL_GENERATION      Nonsecret initialization generation ID.
 #   SQL_IMAGE_TAG                  e.g. "2025-latest".
 #   BUILD_ARTIFACTSTAGINGDIRECTORY ADO-provided staging dir for artifacts.
 #
@@ -23,7 +22,7 @@
 #
 # Side effects:
 #   * Writes ${BUILD_ARTIFACTSTAGINGDIRECTORY}/sql-endpoint-${INSTANCE_ID}/endpoint.txt
-#     containing "HOST PORT" on a single line.
+#     containing "HOST PORT DEADLINE_EPOCH GENERATION" on a single line.
 #   * Also emits output variables sqlHost / sqlPort / sqlInstanceId for
 #     diagnostics — they are not consumed by the test jobs.
 #
@@ -40,6 +39,12 @@ set -euo pipefail
 : "${SQL_PASSWORD:?SQL_PASSWORD is required}"
 : "${SQL_IMAGE_TAG:?SQL_IMAGE_TAG is required}"
 : "${BUILD_ARTIFACTSTAGINGDIRECTORY:?BUILD_ARTIFACTSTAGINGDIRECTORY is required}"
+
+if [[ ! "${SQL_PASSWORD}" =~ ^Aa1![0-9a-f]{48}$ ]] \
+    || [[ ! "${SQL_CREDENTIAL_GENERATION:-}" =~ ^[0-9a-f]{32}$ ]]; then
+    echo "ERROR: shared SQL credential output is missing or invalid." >&2
+    exit 1
+fi
 
 SQL_HOST_PORT="${SQL_HOST_PORT:-1433}"
 READINESS_TIMEOUT_SECONDS="${READINESS_TIMEOUT_SECONDS:-180}"
@@ -141,7 +146,7 @@ fi
 ENDPOINT_DIR="${BUILD_ARTIFACTSTAGINGDIRECTORY}/sql-endpoint-${INSTANCE_ID}"
 mkdir -p "${ENDPOINT_DIR}"
 deadline_epoch=$(( $(date +%s) + MAX_LIFETIME_MINUTES * 60 ))
-printf '%s %s %s\n' "${SQL_HOST_IP}" "${SQL_HOST_PORT}" "${deadline_epoch}" \
+printf '%s %s %s %s\n' "${SQL_HOST_IP}" "${SQL_HOST_PORT}" "${deadline_epoch}" "${SQL_CREDENTIAL_GENERATION}" \
     > "${ENDPOINT_DIR}/endpoint.txt"
 # mssql.crt and mssql.pem are identical (generate_cert.sh produces .crt and
 # copies it to .pem). Different distro dockerentry scripts reference one or

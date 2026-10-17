@@ -8,7 +8,7 @@
 # prebuilt driver + ctest binaries via run_e2e.sh --skip-build.
 #
 # See sql-host-template.yml for the cross-job sync rationale (no dependsOn,
-# sql-ready artifact in, teardown sentinel out, derived SA password).
+# sql-ready artifact in, teardown sentinel out, initialization secret output).
 
 parameters:
   - name: poolName
@@ -86,6 +86,9 @@ jobs:
 
     - job: Test_Odbc_Matrix${{ parameters.nameSuffix }}_arm64
       displayName: ODBC e2e Linux arm64
+      variables:
+        SHARED_SQL_PASSWORD: $[ stageDependencies.InitializeValidation.Initialize.outputs['GenerateSqlCredential.SQL_PASSWORD'] ]
+        SQL_CREDENTIAL_GENERATION: $[ stageDependencies.InitializeValidation.Initialize.outputs['GenerateSqlCredential.SQL_CREDENTIAL_GENERATION'] ]
       # Intentionally no `dependsOn`: see sql-host-template.yml header.
       strategy:
         matrix:
@@ -101,12 +104,12 @@ jobs:
       steps:
         - bash: |
             set -euo pipefail
-            bash .pipeline/scripts/sql-host/derive-sql-password.sh
-          displayName: 'Derive shared SQL_PASSWORD from build context'
+            bash .pipeline/scripts/sql-host/import-sql-password.sh
+          displayName: 'Import shared SQL credential'
           workingDirectory: '$(Build.SourcesDirectory)'
           env:
-            BUILD_BUILDID: $(Build.BuildId)
-            SYSTEM_COLLECTIONID: $(System.CollectionId)
+            SHARED_SQL_PASSWORD: $(SHARED_SQL_PASSWORD)
+            SQL_CREDENTIAL_GENERATION: $(SQL_CREDENTIAL_GENERATION)
 
         - task: DockerInstaller@0
           inputs:
@@ -129,7 +132,8 @@ jobs:
           displayName: 'Wait for SQL host endpoint sentinel'
           workingDirectory: '$(Build.SourcesDirectory)'
           env:
-            ARTIFACT_NAME: 'sql-ready-${{ parameters.sqlReadyInstanceId }}-$(System.StageAttempt)'
+            ARTIFACT_NAME: 'sql-ready-${{ parameters.sqlReadyInstanceId }}-$(SQL_CREDENTIAL_GENERATION)-$(System.StageAttempt)'
+            SQL_CREDENTIAL_GENERATION: $(SQL_CREDENTIAL_GENERATION)
             BUILD_BUILDID: $(Build.BuildId)
             BUILD_SOURCESDIRECTORY: $(Build.SourcesDirectory)
             SYSTEM_COLLECTIONURI: $(System.CollectionUri)
@@ -152,7 +156,7 @@ jobs:
               -w /workspace \
               -e "ODBC_TEST_SERVER=$DB_HOST,$DB_PORT" \
               -e "ODBC_TEST_UID=sa" \
-              -e "ODBC_TEST_PWD=$(SQL_PASSWORD)" \
+              -e "ODBC_TEST_PWD=$SQL_PASSWORD" \
               -e "ODBC_TEST_TRUST_CERT=Yes" \
               -e "ODBC_E2E_RETRIES=3" \
               -e "RUST_BACKTRACE=full" \
@@ -188,7 +192,7 @@ jobs:
           condition: always()
           inputs:
             targetPath: '$(Agent.TempDirectory)/teardown'
-            artifact: '$(sentinelName)-$(System.StageAttempt)'
+            artifact: '$(sentinelName)-$(SQL_CREDENTIAL_GENERATION)-$(System.StageAttempt)'
             publishLocation: 'pipeline'
 
   # ------------------------------------------------------------------
@@ -207,6 +211,9 @@ jobs:
 
       - job: Test_Odbc_${{ target.name }}_arm64
         displayName: 'ODBC e2e Linux arm64 ${{ target.name }}'
+        variables:
+          SHARED_SQL_PASSWORD: $[ stageDependencies.InitializeValidation.Initialize.outputs['GenerateSqlCredential.SQL_PASSWORD'] ]
+          SQL_CREDENTIAL_GENERATION: $[ stageDependencies.InitializeValidation.Initialize.outputs['GenerateSqlCredential.SQL_CREDENTIAL_GENERATION'] ]
         # Intentionally no `dependsOn`: see sql-host-template.yml header.
         pool:
           name: ${{ parameters.poolName }}
@@ -215,12 +222,12 @@ jobs:
         steps:
           - bash: |
               set -euo pipefail
-              bash .pipeline/scripts/sql-host/derive-sql-password.sh
-            displayName: 'Derive shared SQL_PASSWORD from build context'
+              bash .pipeline/scripts/sql-host/import-sql-password.sh
+            displayName: 'Import shared SQL credential'
             workingDirectory: '$(Build.SourcesDirectory)'
             env:
-              BUILD_BUILDID: $(Build.BuildId)
-              SYSTEM_COLLECTIONID: $(System.CollectionId)
+              SHARED_SQL_PASSWORD: $(SHARED_SQL_PASSWORD)
+              SQL_CREDENTIAL_GENERATION: $(SQL_CREDENTIAL_GENERATION)
 
           - task: DockerInstaller@0
             inputs:
@@ -243,7 +250,8 @@ jobs:
             displayName: 'Wait for SQL host endpoint sentinel'
             workingDirectory: '$(Build.SourcesDirectory)'
             env:
-              ARTIFACT_NAME: 'sql-ready-${{ parameters.sentinelPrefix }}${{ target.name }}-$(System.StageAttempt)'
+              ARTIFACT_NAME: 'sql-ready-${{ parameters.sentinelPrefix }}${{ target.name }}-$(SQL_CREDENTIAL_GENERATION)-$(System.StageAttempt)'
+              SQL_CREDENTIAL_GENERATION: $(SQL_CREDENTIAL_GENERATION)
               BUILD_BUILDID: $(Build.BuildId)
               BUILD_SOURCESDIRECTORY: $(Build.SourcesDirectory)
               SYSTEM_COLLECTIONURI: $(System.CollectionUri)
@@ -266,7 +274,7 @@ jobs:
                 -w /workspace \
                 -e "ODBC_TEST_SERVER=$DB_HOST,$DB_PORT" \
                 -e "ODBC_TEST_UID=sa" \
-                -e "ODBC_TEST_PWD=$(SQL_PASSWORD)" \
+                -e "ODBC_TEST_PWD=$SQL_PASSWORD" \
                 -e "ODBC_TEST_TRUST_CERT=Yes" \
                 -e "ODBC_E2E_RETRIES=3" \
                 -e "RUST_BACKTRACE=full" \
@@ -302,5 +310,5 @@ jobs:
             condition: always()
             inputs:
               targetPath: '$(Agent.TempDirectory)/teardown'
-              artifact: '${{ parameters.sentinelPrefix }}${{ target.name }}-$(System.StageAttempt)'
+              artifact: '${{ parameters.sentinelPrefix }}${{ target.name }}-$(SQL_CREDENTIAL_GENERATION)-$(System.StageAttempt)'
               publishLocation: 'pipeline'

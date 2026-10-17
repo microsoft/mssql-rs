@@ -139,9 +139,9 @@ def duplicate_coverage(pr_number: str, build: dict, head_sha: str, *, deadline: 
         return None
     records = get_json(f"{BUILD_API}/builds/{build['id']}/timeline?api-version=7.1", deadline=deadline)["records"]
     stages = {record["identifier"]: record.get("result") for record in records if record["type"] == "Stage"}
-    # EvaluateDuplicate succeeds only for ordinary PR validation; its true
+    # InitializeValidation succeeds for ordinary validation; its true duplicate
     # output skips both Build and Coverage in validation-stages.yml.
-    if not (stages.get("EvaluateDuplicate") == "succeeded"
+    if not (stages.get("InitializeValidation") == "succeeded"
             and stages.get("Build") == "skipped" and stages.get("Coverage") == "skipped"):
         return None
     # Match the duplicate guard's bounded history window, skipping duplicate chains.
