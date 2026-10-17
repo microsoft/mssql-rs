@@ -38,6 +38,7 @@ use crate::api::txn::try_claim_idle_dbc_client;
 use crate::api::util::{copy_with_nul, write_if_some};
 use crate::error::free_errors;
 use crate::handles::dbc::{CachedDatabaseUserName, ConnectionState};
+use crate::handles::wire::{LeaseReturn, WireLease};
 use crate::handles::{DbcHandle, HandleType, handle_from_raw};
 use mssql_tds::connection::tds_client::{ExecuteOptions, ResultSet, TdsClient};
 use mssql_tds::datatypes::column_values::ColumnValues;
@@ -956,7 +957,7 @@ fn sql_get_info_w_safe(
             // collation (hence code page) changes on `USE` / catalog switch.
             // While a data-at-execution sequence owns the client, fall back to
             // the value cached when that execution claimed it.
-            let collation = match state.client.as_ref() {
+            let collation = match state.wire.client() {
                 Some(client) => {
                     collation_seq_string(client.collation_code_page(), client.char_set())
                 }
@@ -1039,8 +1040,8 @@ fn sql_get_info_w_safe(
             // Use the version negotiated at login; fall back to a neutral
             // placeholder when the connection has no reported version yet.
             let version = state
-                .client
-                .as_ref()
+                .wire
+                .client()
                 .and_then(|c| c.server_version())
                 .map(|v| format!("{:02}.{:02}.{:04}", v.major, v.minor, v.build))
                 .unwrap_or_else(|| "00.00.0000".to_string());
@@ -1305,7 +1306,7 @@ fn database_user_name(dbc: &DbcHandle) -> String {
             // While another statement holds the client neither can be read, so
             // the entry is taken as current.
             Some(cached)
-                if state.client.as_ref().is_none_or(|client| {
+                if state.wire.client().is_none_or(|client| {
                     client.database() == cached.catalog
                         && client.database_change_count() == cached.database_change_count
                 }) =>
@@ -1415,22 +1416,16 @@ fn database_user_name(dbc: &DbcHandle) -> String {
 /// replacement.
 fn publish_lookup(
     dbc: &DbcHandle,
-    client: TdsClient,
+    client: WireLease,
     generation: u64,
     catalog: String,
     database_change_count: u64,
     cache: Option<String>,
     fallback: String,
 ) -> String {
-    let mut state = match dbc.inner.lock() {
-        Ok(state) => state,
-        Err(mut poisoned) => {
-            // The client cannot be stored, so the DBC must not keep claiming to
-            // be connected — the same correction `release_dbc_client` makes.
-            error!("SQLGetInfoW(SQL_USER_NAME): dbc mutex poisoned; marking DBC disconnected");
-            poisoned.get_mut().connection_state = ConnectionState::Disconnected;
-            return String::new();
-        }
+    let Ok(mut state) = dbc.inner.lock() else {
+        error!("SQLGetInfoW(SQL_USER_NAME): dbc mutex poisoned");
+        return String::new();
     };
 
     if state.session_generation != generation
@@ -1441,7 +1436,7 @@ fn publish_lookup(
         return String::new();
     }
 
-    state.client = Some(client);
+    state.wire.restore(client, LeaseReturn::Release);
     match cache {
         Some(value) => {
             state.database_user_name = Some(CachedDatabaseUserName {
@@ -1510,7 +1505,7 @@ async fn fetch_database_user_name(
         // `begin_command` does not touch `has_open_batch`, so after a failed
         // `execute` the flag still holds whatever it had on entry. It is `true`
         // only when the claimed client already had a batch open —
-        // `try_claim_idle_dbc_client` gates on `active_stmt`, not on batch
+        // `try_claim_idle_dbc_client` gates on the wire reservation, not on batch
         // state, so that is not excluded. Closing it there is what keeps the
         // INVARIANT below true for the one caller that could otherwise inherit
         // someone else's open batch. Not unit-tested: reaching it needs a
@@ -2401,7 +2396,7 @@ mod tests {
             // A data-at-execution sequence has moved the client onto a
             // statement; the DBC stays connected with the collation cached.
             let mut state = dbc_ref.inner.lock().unwrap();
-            assert!(state.client.is_none());
+            assert!(state.wire.client().is_none());
             state.last_collation_code_page = Some(1252);
         }
         let (rc, value, len) = get_wide_str(h.dbc, odbc::SQL_COLLATION_SEQ);
@@ -2752,7 +2747,11 @@ mod tests {
         assert_eq!(get_wide_str(h.dbc, SQL_USER_NAME).1, "dbo");
 
         let stmt = h.alloc_extra_stmt();
-        dbc.inner.lock().unwrap().active_stmt = Some(stmt);
+        dbc.inner
+            .lock()
+            .unwrap()
+            .wire
+            .set_owner_for_test(Some(stmt));
         server.register_query(DATABASE_USER_NAME_QUERY, user_name_row("never_read"));
 
         let (rc, value, _) = get_wide_str(h.dbc, SQL_USER_NAME);
@@ -2766,7 +2765,7 @@ mod tests {
             "the refusal to refresh is internal and must post nothing"
         );
 
-        dbc.inner.lock().unwrap().active_stmt = None;
+        dbc.inner.lock().unwrap().wire.set_owner_for_test(None);
     }
 
     /// The same busy path before anything was cached: an empty string, still
@@ -2777,7 +2776,11 @@ mod tests {
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
 
         let stmt = h.alloc_extra_stmt();
-        dbc.inner.lock().unwrap().active_stmt = Some(stmt);
+        dbc.inner
+            .lock()
+            .unwrap()
+            .wire
+            .set_owner_for_test(Some(stmt));
 
         assert_eq!(
             get_wide_str(h.dbc, SQL_USER_NAME),
@@ -2785,7 +2788,7 @@ mod tests {
         );
         assert!(diag_states(h.dbc).is_empty());
 
-        dbc.inner.lock().unwrap().active_stmt = None;
+        dbc.inner.lock().unwrap().wire.set_owner_for_test(None);
     }
 
     /// A server-side failure leaves the previous answer standing and posts
@@ -2935,8 +2938,14 @@ mod tests {
         // connection" invariant the other failure paths are held to.
         {
             let state = dbc.inner.lock().unwrap();
-            assert!(state.client.is_some(), "the client must go back to the DBC");
-            assert!(state.active_stmt.is_none(), "no cursor claim may be left");
+            assert!(
+                state.wire.client().is_some(),
+                "the client must go back to the DBC"
+            );
+            assert!(
+                state.wire.statement_owner().is_none(),
+                "no cursor claim may be left"
+            );
             assert_eq!(state.connection_state, ConnectionState::Connected);
         }
         server.register_query(DATABASE_USER_NAME_QUERY, user_name_row("recovered"));
@@ -3019,7 +3028,7 @@ mod tests {
                 while std::time::Instant::now() < deadline {
                     {
                         let state = dbc.inner.lock().unwrap();
-                        if state.client.is_none() {
+                        if state.wire.client().is_none() {
                             return Some(state.diag_records.len());
                         }
                     }
@@ -3073,7 +3082,7 @@ mod tests {
                 let dbc_ref = unsafe { handle_from_raw::<DbcHandle>(dbc_ptr as SqlHandle) };
                 let deadline = std::time::Instant::now() + Duration::from_secs(30);
                 while std::time::Instant::now() < deadline {
-                    if dbc_ref.inner.lock().unwrap().client.is_none() {
+                    if dbc_ref.inner.lock().unwrap().wire.client().is_none() {
                         return Some(get_wide_str(dbc_ptr as SqlHandle, odbc::SQL_COLLATION_SEQ).1);
                     }
                     std::thread::sleep(Duration::from_millis(1));
@@ -3221,7 +3230,13 @@ mod tests {
         // lookup was in flight" by publishing a newer generation.
         let (client, generation) = {
             let mut state = dbc.inner.lock().unwrap();
-            let client = state.client.take().expect("fixture installs a client");
+            let client = state
+                .wire
+                .claim(
+                    crate::handles::wire::WireOwner::Connection,
+                    crate::handles::wire::ClaimPolicy::IdleOnly,
+                )
+                .expect("fixture installs an idle client");
             let generation = state.session_generation;
             state.session_generation = generation.wrapping_add(1);
             (client, generation)
@@ -3240,7 +3255,7 @@ mod tests {
         assert_eq!(reported, "", "nothing is known about the new session");
         let state = dbc.inner.lock().unwrap();
         assert!(
-            state.client.is_none(),
+            state.wire.client().is_none(),
             "the stale client must not be installed over the new session"
         );
         assert!(
@@ -3284,7 +3299,7 @@ mod tests {
         assert_eq!(reported, "", "a disconnected handle reports no principal");
         let state = dbc.inner.lock().unwrap();
         assert!(
-            state.client.is_none(),
+            state.wire.client().is_none(),
             "the lookup must not resurrect a client on a disconnected handle"
         );
         assert_eq!(state.connection_state, ConnectionState::Disconnected);
@@ -3417,9 +3432,12 @@ mod tests {
         assert_eq!(get_wide_str(h.dbc, SQL_USER_NAME).1, "dbo");
 
         let state = dbc.inner.lock().unwrap();
-        assert!(state.client.is_some(), "the client must go back to the DBC");
         assert!(
-            state.active_stmt.is_none(),
+            state.wire.client().is_some(),
+            "the client must go back to the DBC"
+        );
+        assert!(
+            state.wire.statement_owner().is_none(),
             "no cursor claim may be left behind"
         );
         assert_eq!(state.connection_state, ConnectionState::Connected);
@@ -3433,8 +3451,8 @@ mod tests {
         // client what actually happened on the wire.
         assert!(
             !state
-                .client
-                .as_ref()
+                .wire
+                .client()
                 .expect("client is present")
                 .has_active_transaction(),
             "the internal lookup must not leave the session in a server transaction"

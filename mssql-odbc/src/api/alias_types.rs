@@ -37,6 +37,7 @@ use tracing::{debug, error};
 use super::txn::try_claim_idle_dbc_client;
 use crate::handles::StmtHandle;
 use crate::handles::dbc::{AliasTypeCache, ConnectionState, DbcHandle};
+use crate::handles::wire::{LeaseReturn, WireLease};
 
 /// msodbcsql's `MIN_REAL_USER_DATATYPE`: lower `UserType` values are system
 /// types.
@@ -109,7 +110,7 @@ pub(super) fn alias_type_name_for_column(
     // While another call has the session checked out, the key cannot be
     // checked: a `USE` in that call may have moved the session to a database
     // where the same `UserType` names another type.
-    let (Some(cache), Some(client)) = (state.alias_types.as_ref(), state.client.as_ref()) else {
+    let (Some(cache), Some(client)) = (state.alias_types.as_ref(), state.wire.client()) else {
         return Ok(None);
     };
     if !is_current(cache, client) {
@@ -139,7 +140,7 @@ fn refresh_alias_types(dbc: &DbcHandle) {
             return;
         }
         // Absent only while another call has the session checked out.
-        let Some(client) = state.client.as_ref() else {
+        let Some(client) = state.wire.client() else {
             return;
         };
         if state
@@ -151,7 +152,7 @@ fn refresh_alias_types(dbc: &DbcHandle) {
         }
         // msodbcsql queries the session itself unless results are pending on
         // it, and only then logs in separately.
-        let route = if state.active_stmt.is_none() {
+        let route = if state.wire.statement_owner().is_none() {
             Route::Session
         } else {
             match client.secondary_client_context() {
@@ -220,21 +221,13 @@ fn refresh_alias_types(dbc: &DbcHandle) {
 /// turned over during the lookup keeps neither.
 fn publish(
     dbc: &DbcHandle,
-    client: Option<TdsClient>,
+    client: Option<WireLease>,
     generation: u64,
     lookup: TdsResult<AliasTypeCache>,
 ) {
-    let mut state = match dbc.inner.lock() {
-        Ok(state) => state,
-        Err(mut poisoned) => {
-            error!("alias-type lookup: dbc mutex poisoned");
-            // A claimed client cannot be stored, so the DBC must not keep
-            // claiming to be connected, as in `release_dbc_client`.
-            if client.is_some() {
-                poisoned.get_mut().connection_state = ConnectionState::Disconnected;
-            }
-            return;
-        }
+    let Ok(mut state) = dbc.inner.lock() else {
+        error!("alias-type lookup: dbc mutex poisoned");
+        return;
     };
     if state.session_generation != generation
         || state.connection_state != ConnectionState::Connected
@@ -242,8 +235,8 @@ fn publish(
         debug!("alias-type lookup: session replaced during the lookup; discarding it");
         return;
     }
-    if client.is_some() {
-        state.client = client;
+    if let Some(client) = client {
+        state.wire.restore(client, LeaseReturn::Release);
     }
     match lookup {
         Ok(cache) => state.alias_types = Some(cache),
@@ -424,11 +417,11 @@ mod tests {
     fn hold_session(h: &TestHandles) {
         let dbc = dbc(h);
         let mut state = dbc.inner.lock().unwrap();
-        let client = state.client.as_mut().unwrap();
+        let client = state.wire.client_mut_for_test().unwrap();
         dbc.runtime
             .block_on(client.execute("SELECT 1".to_string(), ()))
             .unwrap();
-        state.active_stmt = Some(h.stmt);
+        state.wire.set_owner_for_test(Some(h.stmt));
     }
 
     fn type_name(h: &TestHandles, col: SqlUSmallInt, field: SqlUSmallInt) -> String {
@@ -456,7 +449,7 @@ mod tests {
     /// A cache entry keyed to the session's current state.
     fn current_cache(dbc: &DbcHandle, names: &[(u32, &str)]) -> AliasTypeCache {
         let state = dbc.inner.lock().unwrap();
-        let client = state.client.as_ref().unwrap();
+        let client = state.wire.client().unwrap();
         AliasTypeCache {
             catalog: client.database().to_owned(),
             database_change_count: client.database_change_count(),
@@ -487,7 +480,7 @@ mod tests {
         let expected = current_cache(dbc(&h), &[(257, "phone_number")]);
         let state = dbc(&h).inner.lock().unwrap();
         assert_eq!(state.alias_types, Some(expected));
-        assert!(state.active_stmt.is_none());
+        assert!(state.wire.owner().is_none());
     }
 
     #[test]
@@ -508,8 +501,8 @@ mod tests {
         let expected = current_cache(dbc, &[(257, "phone_number")]);
         let state = dbc.inner.lock().unwrap();
         assert_eq!(state.alias_types, Some(expected));
-        assert_eq!(state.active_stmt, Some(h.stmt));
-        let client = state.client.as_ref().unwrap();
+        assert_eq!(state.wire.statement_owner(), Some(h.stmt));
+        let client = state.wire.client().unwrap();
         assert!(client.has_open_batch());
         assert_eq!(
             dbc.trace.client_connection_id(),
@@ -588,7 +581,7 @@ mod tests {
 
         assert_eq!(server.connection_count(), 1, "nothing is read meanwhile");
         assert_eq!(dbc.inner.lock().unwrap().alias_types, Some(stale));
-        release_dbc_client(dbc, client);
+        assert!(release_dbc_client(dbc, client));
     }
 
     /// The lookup runs without the statement lock, so another call can replace
@@ -611,11 +604,11 @@ mod tests {
             let describe =
                 scope.spawn(move || type_name_of(raw as SqlHandle, 1, SQL_DESC_TYPE_NAME));
             let deadline = Instant::now() + Duration::from_secs(2);
-            while dbc.inner.lock().unwrap().client.is_some() && Instant::now() < deadline {
+            while dbc.inner.lock().unwrap().wire.client().is_some() && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(1));
             }
             assert!(
-                dbc.inner.lock().unwrap().client.is_none(),
+                dbc.inner.lock().unwrap().wire.client().is_none(),
                 "the lookup holds the session"
             );
             stmt.inner.lock().unwrap().begin_batch(int_columns(1));
@@ -695,8 +688,8 @@ mod tests {
 
         let mut state = dbc.inner.lock().unwrap();
         assert_eq!(state.alias_types, Some(stale));
-        assert!(state.active_stmt.is_none());
-        let client = state.client.as_mut().unwrap();
+        assert!(state.wire.owner().is_none());
+        let client = state.wire.client_mut_for_test().unwrap();
         assert!(!client.has_open_batch());
         assert!(matches!(
             dbc.runtime
@@ -727,7 +720,7 @@ mod tests {
         );
         let state = dbc.inner.lock().unwrap();
         assert_eq!(state.alias_types, None);
-        assert!(state.client.is_some());
+        assert!(state.wire.client().is_some());
     }
 
     #[test]
@@ -757,8 +750,8 @@ mod tests {
             );
             let state = dbc.inner.lock().unwrap();
             assert_eq!(state.alias_types, None, "{stalled}");
-            assert_eq!(state.active_stmt, Some(h.stmt), "{stalled}");
-            assert!(state.client.as_ref().unwrap().has_open_batch(), "{stalled}");
+            assert_eq!(state.wire.statement_owner(), Some(h.stmt), "{stalled}");
+            assert!(state.wire.client().unwrap().has_open_batch(), "{stalled}");
         }
     }
 

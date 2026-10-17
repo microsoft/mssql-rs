@@ -149,9 +149,9 @@ fn sql_disconnect_safe(dbc: &DbcHandle) -> SqlReturn {
         unsafe { free_handle::<DescHandle>(desc_ptr) };
     }
 
-    // Drop the TDS client (closes the connection) and clear connection-level cursor claim.
-    state.client = None;
-    state.active_stmt = None;
+    // Drop the TDS client (closes the connection) and clear the wire; a lease
+    // still out is now stale and closes its client when returned.
+    drop(state.wire.uninstall());
     state.effective_vendor_settings = None;
     state.effective_packet_size = None;
     state.identity = ConnectionIdentity::default();

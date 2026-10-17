@@ -4,6 +4,7 @@
 //! SQLSTATE constants and the SQL Server error-number → SQLSTATE map.
 
 use crate::error::{HasDiagnostics, post_sql_error};
+use crate::handles::wire::ClaimError;
 use mssql_tds::error::Error as TdsError;
 use mssql_tds::error::SqlInfoMessage;
 
@@ -103,6 +104,15 @@ pub(crate) const ERR_CONNECTION_BUSY: DiagMsg = DiagMsg {
     state: SQLSTATE_HY000,
     text: "Connection is busy with results for another command",
 };
+
+/// All contention maps to the busy error applications retry on.
+pub(crate) fn claim_error_diag(error: ClaimError) -> DiagMsg {
+    match error {
+        ClaimError::Busy(_) => ERR_CONNECTION_BUSY,
+        ClaimError::NoClient => ERR_NO_ACTIVE_TDS_CLIENT,
+    }
+}
+
 pub(crate) const ERR_STATEMENT_UNUSABLE: DiagMsg = DiagMsg {
     state: SQLSTATE_HY000,
     text: "A statement on this connection is unusable and did not receive the attribute",

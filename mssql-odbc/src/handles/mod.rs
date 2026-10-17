@@ -5,6 +5,7 @@ pub(crate) mod dbc;
 pub(crate) mod desc;
 mod env;
 pub(crate) mod stmt;
+pub(crate) mod wire;
 
 pub(crate) use dbc::DbcHandle;
 pub(crate) use desc::DescHandle;

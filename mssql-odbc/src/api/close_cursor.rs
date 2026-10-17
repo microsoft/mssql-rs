@@ -10,11 +10,13 @@
 use tracing::{debug, error};
 
 use super::sqlstate::*;
+use crate::api::exec_common::post_claim_error;
 use crate::api::odbc_types::{
     SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle, SqlReturn,
 };
 use crate::error::free_errors;
 use crate::handles::stmt::{STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT};
+use crate::handles::wire::{ClaimError, ClaimPolicy, LeaseReturn, WireOwner};
 use crate::handles::{HandleType, StmtHandle, handle_from_raw, process_is_shutting_down};
 
 /// Closes the cursor on `statement_handle` and discards any pending rows.
@@ -247,9 +249,9 @@ pub(super) enum DrainOutcome {
     Failed,
 }
 
-/// Takes the TDS client from the DBC, drains any pending tokens, and clears `active_stmt`.
-/// `active_stmt` is kept set until the drain finishes so concurrent threads see the
-/// connection as busy (HY000) throughout — not just until `client` is taken.
+/// Takes the TDS client from the DBC, drains any pending tokens, and releases the wire.
+/// The wire stays reserved for this statement until the drain finishes so concurrent
+/// threads see the connection as busy (HY000) throughout — not just until `client` is taken.
 /// No locks are held during the network I/O.
 ///
 /// Returns a [`DrainOutcome`] so callers can distinguish a clean close from one
@@ -270,34 +272,36 @@ fn drain_and_release_inner(
 ) -> DrainOutcome {
     let dbc = stmt.parent_dbc();
 
-    // Take the client; intentionally leave active_stmt set while draining.
-    let client = {
+    let mut client = {
         let Ok(mut dbc_state) = dbc.inner.lock() else {
             error!("drain_and_release: dbc mutex poisoned");
             return DrainOutcome::Failed;
         };
-        // A fetch may have already released `active_stmt` early once this
+        // A fetch may have already released the wire early once this
         // statement's own result set was exhausted (AB#47508), independently
-        // of `STMT_STATE_CURSOR_OPEN`, which callers here check instead. If a
-        // *different* statement has since claimed the connection, this
-        // statement has nothing left on the wire to drain — taking the client
-        // here would steal and corrupt whatever the other statement is mid-fetch
-        // on. `active_stmt` being `None` (idle) or still `Some(statement_handle)`
-        // is the ordinary case and proceeds as before.
-        match dbc_state.active_stmt {
-            Some(other) if other != statement_handle => return DrainOutcome::Clean,
-            _ => dbc_state.client.take(),
+        // of `STMT_STATE_CURSOR_OPEN`, which callers here check instead. If
+        // another owner has since taken the connection, this statement has
+        // nothing left on the wire to drain — taking the client here would
+        // steal and corrupt whatever that owner is doing. Claiming an idle wire
+        // reserves it for the drain, so a concurrent execute sees it busy
+        // rather than unowned with no client (AB#49225).
+        match dbc_state.wire.claim(
+            WireOwner::Statement(statement_handle),
+            ClaimPolicy::IdleOrOwn,
+        ) {
+            Ok(lease) => lease,
+            Err(ClaimError::Busy(owner)) if owner != WireOwner::Statement(statement_handle) => {
+                return DrainOutcome::Clean;
+            }
+            Err(claim_error) => {
+                error!(
+                    ?claim_error,
+                    "drain_and_release: connection is not available"
+                );
+                post_claim_error(dbc_state, stmt, claim_error);
+                return DrainOutcome::Failed;
+            }
         }
-    };
-
-    let Some(mut client) = client else {
-        error!("drain_and_release: no TDS client to drain — this is a bug");
-        if let Ok(mut ds) = dbc.inner.lock()
-            && ds.active_stmt == Some(statement_handle)
-        {
-            ds.active_stmt = None;
-        }
-        return DrainOutcome::Failed;
     };
 
     // The drain is a server round-trip, so it needs the scheduler's worker to
@@ -310,12 +314,7 @@ fn drain_and_release_inner(
     // teardown runs after this.
     if process_is_shutting_down {
         debug!("drain_and_release: process is exiting — skipping the drain round-trip");
-        if let Ok(mut ds) = dbc.inner.lock() {
-            ds.client = Some(client);
-            if ds.active_stmt == Some(statement_handle) {
-                ds.active_stmt = None;
-            }
-        }
+        dbc.return_lease(client, LeaseReturn::Release);
         return DrainOutcome::Clean;
     }
 
@@ -326,12 +325,7 @@ fn drain_and_release_inner(
         if let Ok(mut stmt_state) = stmt.inner.lock() {
             post_tds_error(&mut stmt_state, &e, SQLSTATE_HY000);
         }
-        if let Ok(mut ds) = dbc.inner.lock() {
-            ds.client = Some(client);
-            if ds.active_stmt == Some(statement_handle) {
-                ds.active_stmt = None;
-            }
-        }
+        dbc.return_lease(client, LeaseReturn::Release);
         return DrainOutcome::Failed;
     }
 
@@ -345,23 +339,13 @@ fn drain_and_release_inner(
         }
         Err(_) => {
             error!("drain_and_release: stmt mutex poisoned while posting info messages");
-            if let Ok(mut dbc_state) = dbc.inner.lock() {
-                dbc_state.client = Some(client);
-                if dbc_state.active_stmt == Some(statement_handle) {
-                    dbc_state.active_stmt = None;
-                }
-            }
+            dbc.return_lease(client, LeaseReturn::Release);
             return DrainOutcome::Failed;
         }
     };
 
     // Drain complete: return client and release busy claim atomically.
-    if let Ok(mut dbc_state) = dbc.inner.lock() {
-        dbc_state.client = Some(client);
-        if dbc_state.active_stmt == Some(statement_handle) {
-            dbc_state.active_stmt = None;
-        }
-    }
+    dbc.return_lease(client, LeaseReturn::Release);
 
     if array_rc == SQL_ERROR {
         DrainOutcome::Failed
@@ -377,6 +361,7 @@ mod tests {
     use super::*;
     use crate::api::odbc_types::SQL_NULL_HANDLE;
     use crate::test_support::TestHandles;
+    use crate::test_support::assert_last_diag;
 
     #[test]
     fn close_cursor_null_handle() {
@@ -498,7 +483,11 @@ mod tests {
         // the assertion to "does a pending fetch error alone force
         // SQL_ERROR", independent of drain success/failure.
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
-        dbc.inner.lock().unwrap().client = Some(tds_client_from_tokens(vec![]));
+        dbc.inner
+            .lock()
+            .unwrap()
+            .wire
+            .put_client_for_test(tds_client_from_tokens(vec![]));
 
         let ret = close_cursor_for_connection_op(stmt, h.stmt);
 
@@ -537,8 +526,8 @@ mod tests {
             .unwrap();
         {
             let mut ds = dbc.inner.lock().unwrap();
-            ds.client = Some(client_b);
-            ds.active_stmt = Some(stmt_b);
+            ds.wire.put_client_for_test(client_b);
+            ds.wire.set_owner_for_test(Some(stmt_b));
         }
         {
             let stmt_a = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
@@ -554,14 +543,40 @@ mod tests {
         assert!(matches!(outcome, DrainOutcome::Clean));
         let ds = dbc.inner.lock().unwrap();
         assert_eq!(
-            ds.active_stmt,
+            ds.wire.statement_owner(),
             Some(stmt_b),
             "B's claim on the connection must be left untouched"
         );
         assert!(
-            ds.client.as_ref().is_some_and(|c| c.has_open_batch()),
+            ds.wire.client().is_some_and(|c| c.has_open_batch()),
             "B's result set must still be open — not drained by A's close"
         );
+    }
+
+    /// An early-released statement has nothing to drain while a
+    /// connection-scoped operation holds the wire.
+    #[test]
+    fn drain_and_release_leaves_a_connection_operations_lease_alone() {
+        use crate::handles::dbc::DbcHandle;
+        use crate::test_support::connection_lease_for_test;
+        use mssql_tds::test_client_support::tds_client_from_tokens;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let lease = connection_lease_for_test(dbc, tds_client_from_tokens(Vec::new()));
+
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        assert!(matches!(
+            drain_and_release(stmt, h.stmt),
+            DrainOutcome::Clean
+        ));
+        assert!(stmt.inner.lock().unwrap().diag_records.is_empty());
+        assert_eq!(
+            dbc.inner.lock().unwrap().wire.owner(),
+            Some(WireOwner::Connection)
+        );
+        dbc.return_lease(lease, LeaseReturn::Release);
     }
 
     /// The AB#47510 guard on the cursor drain. Once the loader has terminated
@@ -589,8 +604,8 @@ mod tests {
             .unwrap();
         {
             let mut ds = dbc.inner.lock().unwrap();
-            ds.client = Some(client);
-            ds.active_stmt = Some(h.stmt);
+            ds.wire.put_client_for_test(client);
+            ds.wire.set_owner_for_test(Some(h.stmt));
         }
 
         let outcome = drain_and_release_inner(
@@ -605,11 +620,12 @@ mod tests {
         );
         let ds = dbc.inner.lock().unwrap();
         assert!(
-            ds.client.as_ref().is_some_and(|c| c.has_open_batch()),
+            ds.wire.client().is_some_and(|c| c.has_open_batch()),
             "the batch must be left undrained — a skipped drain performs no I/O"
         );
         assert_eq!(
-            ds.active_stmt, None,
+            ds.wire.statement_owner(),
+            None,
             "the connection must still be released, or it stays busy forever"
         );
     }
@@ -634,8 +650,8 @@ mod tests {
             .unwrap();
         {
             let mut ds = dbc.inner.lock().unwrap();
-            ds.client = Some(client);
-            ds.active_stmt = Some(h.stmt);
+            ds.wire.put_client_for_test(client);
+            ds.wire.set_owner_for_test(Some(h.stmt));
         }
 
         let _ = drain_and_release_inner(
@@ -646,8 +662,80 @@ mod tests {
 
         let ds = dbc.inner.lock().unwrap();
         assert!(
-            ds.client.as_ref().is_some_and(|c| !c.has_open_batch()),
+            ds.wire.client().is_some_and(|c| !c.has_open_batch()),
             "the live-process path must actually drain the batch"
         );
+    }
+
+    /// AB#49225: closing an early-released cursor (AB#47508) checks the client
+    /// out; an execute in that window must get the busy error. Holding A's
+    /// statement lock parks the close right after its checkout.
+    #[test]
+    fn closing_an_early_released_cursor_reports_busy_to_a_concurrent_execute() {
+        use std::time::{Duration, Instant};
+
+        use crate::api::exec_common::{claim_connection, return_client_idle};
+        use crate::api::odbc_types::{SQL_ERROR, SqlHandle};
+        use crate::handles::dbc::DbcHandle;
+        use mssql_tds::test_client_support::tds_client_from_tokens;
+
+        let mut h = TestHandles::with_env_dbc_stmt();
+        let stmt_b = h.alloc_extra_stmt();
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        // Early-released: client parked, wire unreserved.
+        dbc.inner
+            .lock()
+            .unwrap()
+            .wire
+            .put_client_for_test(tds_client_from_tokens(Vec::new()));
+
+        let stmt_a = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let parked = stmt_a.inner.lock().unwrap();
+
+        // Raw handles are not `Send`; move the address instead.
+        let stmt_a_addr = h.stmt as usize;
+        let closer = std::thread::spawn(move || {
+            let handle = stmt_a_addr as SqlHandle;
+            let stmt_a = unsafe { handle_from_raw::<StmtHandle>(handle) };
+            matches!(drain_and_release(stmt_a, handle), DrainOutcome::Clean)
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !dbc.inner.lock().unwrap().wire.is_checked_out() {
+            assert!(
+                Instant::now() < deadline,
+                "the close never checked the client out"
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            dbc.inner.lock().unwrap().wire.statement_owner(),
+            Some(h.stmt),
+            "the close must reserve the wire for its own statement"
+        );
+
+        let other = unsafe { handle_from_raw::<StmtHandle>(stmt_b) };
+        let claim = claim_connection(dbc, other, stmt_b, "SQLExecDirectW");
+        assert!(matches!(claim, Err(SQL_ERROR)));
+        {
+            let ss = other.inner.lock().unwrap();
+            assert_eq!(ss.diag_records.len(), 1);
+            assert_last_diag(&ss.diag_records, ERR_CONNECTION_BUSY);
+        }
+
+        drop(parked);
+        assert!(
+            closer.join().unwrap(),
+            "the close itself must still succeed"
+        );
+        {
+            let ds = dbc.inner.lock().unwrap();
+            assert_eq!(ds.wire.owner(), None, "the close must release the wire");
+            assert!(ds.wire.client().is_some());
+        }
+        let lease = claim_connection(dbc, other, stmt_b, "SQLExecDirectW")
+            .expect("the other statement can execute once the close finishes");
+        return_client_idle(dbc, stmt_b, lease);
     }
 }

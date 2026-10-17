@@ -378,7 +378,7 @@ local SQL Server:
   concurrent variants, so concurrency failures do not hide parity results.
   Shard executables across parallel jobs.
 - Until AB#49263 adds those filters, every registered variant runs in PR CI, so
-  no test opts into `SharedDbc` (AB#49225 would fail it intermittently).
+  no test opts into `SharedDbc`.
 - Nightly failures need a named triage owner.
 
 ## Validation
@@ -401,13 +401,11 @@ local SQL Server:
 
 ## Known failures
 
-- AB#49225: on a shared DBC, a concurrent execute sometimes fails with `HY000`
-  "No active TDS client" instead of the busy error. Reproduced at 8x20 with the
-  GetData pilot tests opted into `SharedDbc` locally.
 - Divergence, not a bug: msodbcsql aborts an open cursor on an idle `SQLCancel`;
   ODBC 3.5 says it has no effect. Not yet asserted in e2e (AB#49258, below).
 - Fixed: AB#49220 (empty `IMAGE` read as NULL), by PR #700; AB#49219 (`run_e2e`
-  auto-detect used `sa` with no password), in this PR.
+  auto-detect used `sa` with no password), in this PR; AB#49225 (a busy shared
+  DBC reported `HY000` "No active TDS client"), by PR #710.
 
 ## Migration
 

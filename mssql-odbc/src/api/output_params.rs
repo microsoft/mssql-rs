@@ -317,8 +317,10 @@ mod tests {
             }
             {
                 let mut state = dbc.inner.lock().unwrap();
-                state.active_stmt = Some(other);
-                state.client = Some(tds_client_from_tokens(Vec::new()));
+                state.wire.set_owner_for_test(Some(other));
+                state
+                    .wire
+                    .put_client_for_test(tds_client_from_tokens(Vec::new()));
             }
             if reset {
                 assert_eq!(unsafe { sql_free_stmt_reset_params(h.stmt) }, SQL_SUCCESS);
@@ -334,7 +336,10 @@ mod tests {
             assert_eq!(unsafe { sql_more_results(h.stmt) }, SQL_NO_DATA);
             assert_eq!(old, -1);
             assert_eq!(new, if reset { -2 } else { 73 });
-            assert_eq!(dbc.inner.lock().unwrap().active_stmt, Some(other));
+            assert_eq!(
+                dbc.inner.lock().unwrap().wire.statement_owner(),
+                Some(other)
+            );
             new = -3;
             assert_eq!(unsafe { sql_more_results(h.stmt) }, SQL_NO_DATA);
             assert_eq!(new, -3);
