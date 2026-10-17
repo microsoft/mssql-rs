@@ -94,6 +94,8 @@ normally, this sends ATTENTION and waits for acknowledgement before reuse,
 including when a row or PLP value is partially read. The timeout bounds
 cancellation settlement; zero uses the transport default. Failed settlement
 returns an error and retires the connection.
+Discarded rows are consumed without resolving Always Encrypted keys or decoding
+column values, so an external key-store provider cannot delay cancellation.
 
 ## License
 

@@ -200,6 +200,8 @@ on the `master` branch.
   within the connection's cancellation budget, not let remaining server work
   run during a normal drain. Use row-aware cancellation so partially read rows
   and PLP values remain synchronized; test a delayed tail with a side effect.
+  Discarding encrypted results must not resolve keys: a key-store provider can
+  stall independently of the wire cancellation budget.
 - **A success code is a promise about the caller's buffer, so never report
   `SQL_SUCCESS` for a call that wrote less than the indicator claims.** Report
   `SQL_SUCCESS_WITH_INFO` with `01004` when a read truncates, so the caller knows
