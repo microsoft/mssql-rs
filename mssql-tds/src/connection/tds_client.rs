@@ -19,7 +19,7 @@ use crate::io::packet_writer::{PacketWriter, SuspendedMessage, TdsPacketWriter};
 use crate::message::bulk_load::{StreamingBulkLoadWriter, build_insert_bulk_command};
 use crate::message::messages::{PacketType, ResetConnectionMode};
 use crate::message::parameters::rpc_parameters::{
-    RpcParameter, StatusFlags, build_parameter_list_string,
+    RpcParameter, StatusFlags, StreamedSqlType, build_parameter_list_string,
 };
 use crate::message::rpc::{RpcProcs, RpcType, SqlRpc};
 use crate::message::transaction_management::{
@@ -493,6 +493,30 @@ enum StreamedWriteState {
     Active(Box<StreamedWriteContext>),
 }
 
+#[derive(Debug)]
+enum StreamedXmlBomState {
+    NotXml,
+    Pending { prefix: [u8; 2], len: u8 },
+    Written,
+}
+
+impl StreamedXmlBomState {
+    fn for_param(param: &RpcParameter) -> Self {
+        if matches!(param.streamed_sql_type(), Some(StreamedSqlType::Xml)) {
+            Self::Pending {
+                prefix: [0; 2],
+                len: 0,
+            }
+        } else {
+            Self::NotXml
+        }
+    }
+
+    fn has_pending_bytes(&self) -> bool {
+        matches!(self, Self::Pending { len, .. } if *len != 0)
+    }
+}
+
 /// Owned context for a suspended, partially-written streamed RPC.
 #[derive(Debug)]
 struct StreamedWriteContext {
@@ -510,6 +534,9 @@ struct StreamedWriteContext {
     /// has been emitted. The opener is written lazily (on the first chunk) so a
     /// parameter can still resolve to NULL before any data is sent.
     value_opened: bool,
+    /// XML values require exactly one UTF-16LE BOM. The first two caller bytes
+    /// are held until a caller-supplied BOM can be recognized across chunks.
+    xml_bom_state: StreamedXmlBomState,
     /// `true` when the caller has signalled the currently-open parameter is NULL
     /// via [`TdsClient::write_streamed_null`]. Closing the parameter then writes
     /// `PLP_NULL` instead of an opener + terminator, and no chunks may follow.
@@ -1337,6 +1364,24 @@ impl TdsClient {
     /// connection to a request or decide whether a reset is required.
     pub fn language(&self) -> &str {
         &self.negotiated_settings.language
+    }
+
+    /// Returns the login settings for an independent connection to the same
+    /// server and current database, for work that must not disturb this
+    /// session's pending results. Connection retry is disabled on the copy:
+    /// such a connection is short-lived and has no session state to recover.
+    /// The copy does not share this session's connection trace, whose client
+    /// connection ID must keep naming this session.
+    ///
+    /// `None` when the client was built without its login context.
+    pub fn secondary_client_context(&self) -> Option<ClientContext> {
+        let mut context = self.recovery_context.client_context.as_deref()?.clone();
+        context
+            .database
+            .clone_from(&self.negotiated_settings.database);
+        context.connect_retry_count = 0;
+        context.connection_trace = None;
+        Some(context)
     }
 
     /// Returns the negotiated TDS packet size, in bytes.
@@ -2261,11 +2306,11 @@ impl TdsClient {
     /// [`RpcParameter::data_at_exec`] parameters.
     ///
     /// Supported streamed types are listed by [`StreamedSqlType`]. Chunks are
-    /// raw wire bytes and are written verbatim, so the caller owns the encoding:
-    /// `nvarchar(max)` chunks must be UTF-16LE, and `varchar(max)`/
-    /// `varbinary(max)` chunks their corresponding single-byte/binary
-    /// representation. A zero-length stream is a present empty value; use
-    /// [`TdsClient::write_streamed_null`] for SQL `NULL`.
+    /// raw wire bytes, so the caller owns the encoding: `nvarchar(max)` chunks
+    /// must be UTF-16LE, and `varchar(max)`/`varbinary(max)` chunks their
+    /// corresponding single-byte/binary representation. XML's required BOM is
+    /// the only normalization performed here. A zero-length stream is a present
+    /// empty value; use [`TdsClient::write_streamed_null`] for SQL `NULL`.
     ///
     /// The method returns [`StreamedParamStatus::NeedData`] after the RPC
     /// prefix is parked. Supply zero or more chunks and call
@@ -2275,7 +2320,9 @@ impl TdsClient {
     ///
     /// Streamed parameters must be named and must use one of the
     /// [`StreamedSqlType`] variants. Streaming is not supported when Always
-    /// Encrypted is active.
+    /// Encrypted is active. Chunk bytes must use the representation required by
+    /// the selected variant: XML is UTF-16LE (a BOM is optional and the client
+    /// ensures exactly one) and UDT is the opaque CLR-serialized payload.
     ///
     /// # Errors
     /// Returns a usage error for invalid streamed parameters or an active
@@ -2301,8 +2348,10 @@ impl TdsClient {
         self.current_command_ce_setting = column_encryption;
         self.ensure_force_column_encryption_supported(named_params.iter())?;
 
-        let (streamed_params, materialized_params) =
-            Self::split_and_validate_streamed_params(named_params)?;
+        let (streamed_params, materialized_params) = Self::split_and_validate_streamed_params(
+            named_params,
+            &self.negotiated_settings.database_collation,
+        )?;
 
         if streamed_params.is_empty() {
             let result = self
@@ -2425,6 +2474,7 @@ impl TdsClient {
 
     fn split_and_validate_streamed_params(
         named_params: Vec<RpcParameter>,
+        db_collation: &SqlCollation,
     ) -> TdsResult<(Vec<RpcParameter>, Vec<RpcParameter>)> {
         let (streamed_params, materialized_params): (Vec<_>, Vec<_>) = named_params
             .into_iter()
@@ -2434,6 +2484,8 @@ impl TdsClient {
             if param.name.is_none() {
                 return Err(UsageError("Streamed parameters must be named.".to_string()));
             }
+            param.validate_named_before_send(db_collation)?;
+            param.validate_streamed_configuration()?;
         }
 
         Ok((streamed_params, materialized_params))
@@ -2458,6 +2510,7 @@ impl TdsClient {
             .name
             .clone()
             .expect("streamed parameter names validated above");
+        let xml_bom_state = StreamedXmlBomState::for_param(&first);
 
         let mut packet_writer =
             rpc.create_packet_writer(self.transport.as_writer(), timeout_sec, cancel_handle);
@@ -2498,6 +2551,7 @@ impl TdsClient {
             pending,
             db_collation: database_collation,
             value_opened: false,
+            xml_bom_state,
             null_signaled: false,
             timeout_sec,
             prepared: None,
@@ -2516,6 +2570,10 @@ impl TdsClient {
     /// [`end_streamed_param`](Self::end_streamed_param).
     /// Prepared streams use
     /// [`end_execute_prepared_param`](Self::end_execute_prepared_param) instead.
+    ///
+    /// The bytes are written verbatim except that XML chunks must be UTF-16LE
+    /// and are normalized to start with exactly one BOM. UDT chunks must contain
+    /// the opaque CLR-serialized payload.
     ///
     /// Empty chunks are ignored: a zero-length PLP chunk header is the value
     /// terminator, so it must never be emitted mid-value.
@@ -2553,6 +2611,7 @@ impl TdsClient {
             pending,
             db_collation,
             value_opened,
+            mut xml_bom_state,
             null_signaled,
             timeout_sec,
             prepared,
@@ -2571,6 +2630,7 @@ impl TdsClient {
                     pending,
                     db_collation,
                     value_opened,
+                    xml_bom_state,
                     null_signaled,
                     timeout_sec,
                     prepared,
@@ -2591,11 +2651,42 @@ impl TdsClient {
                     pending,
                     db_collation,
                     value_opened,
+                    xml_bom_state,
                     null_signaled,
                     timeout_sec,
                     prepared,
                 }));
             return Ok(());
+        }
+
+        let mut xml_prefix_len = 0;
+        let mut xml_had_bom = false;
+        if let StreamedXmlBomState::Pending { prefix, len } = &mut xml_bom_state {
+            let prefix_len = usize::from(*len);
+            let take = if prefix_len == 0 && chunk.len() > 1 {
+                2u8
+            } else {
+                1u8
+            };
+            *len += take;
+            xml_prefix_len = usize::from(take);
+            prefix[prefix_len..prefix_len + xml_prefix_len]
+                .copy_from_slice(&chunk[..xml_prefix_len]);
+            if usize::from(*len) < prefix.len() {
+                self.streamed_write_state =
+                    StreamedWriteState::Active(Box::new(StreamedWriteContext {
+                        message,
+                        pending,
+                        db_collation,
+                        value_opened,
+                        xml_bom_state,
+                        null_signaled,
+                        timeout_sec,
+                        prepared,
+                    }));
+                return Ok(());
+            }
+            xml_had_bom = *prefix == [0xFF, 0xFE];
         }
 
         let mut packet_writer = PacketWriter::resume(message, self.transport.as_writer());
@@ -2606,8 +2697,27 @@ impl TdsClient {
             if !value_opened {
                 packet_writer.write_u64_async(PLP_UNKNOWN_LEN).await?;
             }
-            packet_writer.write_u32_async(chunk.len() as u32).await?;
-            packet_writer.write_async(chunk).await
+            if let StreamedXmlBomState::Pending { prefix, len } = &xml_bom_state {
+                packet_writer.write_u32_async(2).await?;
+                packet_writer.write_async(&[0xFF, 0xFE]).await?;
+                if !xml_had_bom {
+                    packet_writer.write_u32_async(u32::from(*len)).await?;
+                    packet_writer
+                        .write_async(&prefix[..usize::from(*len)])
+                        .await?;
+                }
+                let remainder = &chunk[xml_prefix_len..];
+                if !remainder.is_empty() {
+                    packet_writer
+                        .write_u32_async(remainder.len() as u32)
+                        .await?;
+                    packet_writer.write_async(remainder).await?;
+                }
+            } else {
+                packet_writer.write_u32_async(chunk.len() as u32).await?;
+                packet_writer.write_async(chunk).await?;
+            }
+            Ok(())
         }
         .await;
         let message = packet_writer.suspend();
@@ -2624,6 +2734,10 @@ impl TdsClient {
                         pending,
                         db_collation,
                         value_opened: true,
+                        xml_bom_state: match xml_bom_state {
+                            StreamedXmlBomState::Pending { .. } => StreamedXmlBomState::Written,
+                            other => other,
+                        },
                         null_signaled: false,
                         timeout_sec,
                         prepared,
@@ -2978,20 +3092,22 @@ impl TdsClient {
             pending,
             db_collation,
             value_opened,
+            xml_bom_state,
             null_signaled: _,
             timeout_sec,
             prepared,
         } = *ctx;
 
-        if value_opened {
-            // Chunks are already on the wire; the value cannot become NULL. Re-park
-            // the (still-clean) message — this is a caller sequencing error.
+        if value_opened || xml_bom_state.has_pending_bytes() {
+            // Data was already supplied, so the value cannot become NULL. Re-park
+            // the message — this is a caller sequencing error.
             self.streamed_write_state =
                 StreamedWriteState::Active(Box::new(StreamedWriteContext {
                     message,
                     pending,
                     db_collation,
                     value_opened,
+                    xml_bom_state,
                     null_signaled: false,
                     timeout_sec,
                     prepared,
@@ -3006,6 +3122,7 @@ impl TdsClient {
             pending,
             db_collation,
             value_opened: false,
+            xml_bom_state,
             null_signaled: true,
             timeout_sec,
             prepared,
@@ -3078,6 +3195,7 @@ impl TdsClient {
             mut pending,
             db_collation,
             value_opened,
+            xml_bom_state,
             null_signaled,
             timeout_sec,
             prepared,
@@ -3100,6 +3218,16 @@ impl TdsClient {
                 if !value_opened {
                     packet_writer.write_u64_async(PLP_UNKNOWN_LEN).await?;
                 }
+                if let StreamedXmlBomState::Pending { prefix, len } = &xml_bom_state {
+                    packet_writer.write_u32_async(2).await?;
+                    packet_writer.write_async(&[0xFF, 0xFE]).await?;
+                    if *len != 0 {
+                        packet_writer.write_u32_async(u32::from(*len)).await?;
+                        packet_writer
+                            .write_async(&prefix[..usize::from(*len)])
+                            .await?;
+                    }
+                }
                 packet_writer.write_u32_async(PLP_TERMINATOR).await?;
             }
             match pending.pop_front() {
@@ -3108,6 +3236,7 @@ impl TdsClient {
                         .name
                         .clone()
                         .expect("streamed parameter names validated at begin");
+                    let next_xml_bom_state = StreamedXmlBomState::for_param(&next);
                     next.serialize(
                         &mut packet_writer,
                         &db_collation,
@@ -3115,7 +3244,7 @@ impl TdsClient {
                         &GenericEncoder::new(),
                     )
                     .await?;
-                    Ok(Some(next_name))
+                    Ok(Some((next_name, next_xml_bom_state)))
                 }
                 None => {
                     packet_writer.finalize().await?;
@@ -3146,7 +3275,7 @@ impl TdsClient {
             write_outcome.and_then(|next| message.check_cancellation().map(|()| next));
         match write_outcome {
             // Another streamed parameter is now open for data.
-            Ok(Some(next_name)) => {
+            Ok(Some((next_name, xml_bom_state))) => {
                 self.streamed_write_state =
                     StreamedWriteState::Active(Box::new(StreamedWriteContext {
                         message,
@@ -3155,6 +3284,7 @@ impl TdsClient {
                         // Fresh parameter: its opener has not been written and it
                         // has not been marked NULL.
                         value_opened: false,
+                        xml_bom_state,
                         null_signaled: false,
                         timeout_sec,
                         prepared,
@@ -4260,8 +4390,10 @@ impl TdsClient {
         self.current_command_ce_setting = opts.column_encryption;
         self.ensure_force_column_encryption_supported(named_params.iter())?;
 
-        let (streamed_params, materialized_params) =
-            Self::split_and_validate_streamed_params(named_params)?;
+        let (streamed_params, materialized_params) = Self::split_and_validate_streamed_params(
+            named_params,
+            &self.negotiated_settings.database_collation,
+        )?;
 
         if streamed_params.is_empty() {
             let result = self
@@ -4757,6 +4889,7 @@ impl TdsClient {
             if let Some(params) = named_parameters.as_mut() {
                 param_refs.extend(params.iter_mut());
             }
+            let database_collation = self.negotiated_settings.database_collation;
             Self::apply_parameter_encryption(
                 &describe,
                 &providers,
@@ -4764,6 +4897,7 @@ impl TdsClient {
                 &mut param_refs,
                 &mut self.output_param_ceks,
                 &trusted_key_paths,
+                &database_collation,
             )
             .await?;
         }
@@ -6348,6 +6482,7 @@ impl TdsClient {
             .await?;
 
         let (providers, cek_cache, trusted_key_paths) = self.cloned_ce_key_material()?;
+        let database_collation = self.negotiated_settings.database_collation;
         Self::apply_parameter_encryption(
             &describe,
             &providers,
@@ -6355,6 +6490,7 @@ impl TdsClient {
             params,
             &mut self.output_param_ceks,
             &trusted_key_paths,
+            &database_collation,
         )
         .await?;
         Ok(describe)
@@ -6475,6 +6611,7 @@ impl TdsClient {
         params: &mut [&mut RpcParameter],
         output_param_ceks: &mut HashMap<String, Arc<zeroize::Zeroizing<Vec<u8>>>>,
         trusted_key_paths: &[String],
+        database_collation: &SqlCollation,
     ) -> TdsResult<()> {
         use crate::message::parameters::rpc_parameters::RpcEncryptionMetadata;
         use crate::security::encryption::encrypt_parameter;
@@ -6578,14 +6715,15 @@ impl TdsClient {
 
             let param = &mut *params[index];
 
+            let (value, value_had_conversion_loss) =
+                param.value_for_encryption(database_collation)?;
             let ciphertext = encrypt_parameter(
-                param.value()?,
+                &value,
                 plaintext_cek.as_slice(),
                 info.cipher_algorithm_id,
                 info.encryption_type,
                 info.normalization_rule_version,
             )?;
-
             param.set_encrypted(
                 ciphertext,
                 RpcEncryptionMetadata {
@@ -6597,6 +6735,7 @@ impl TdsClient {
                     cek_md_version: cek_entry.cek_md_version,
                     normalization_rule_version: info.normalization_rule_version,
                 },
+                value_had_conversion_loss,
             );
         }
         Ok(())
@@ -8601,9 +8740,10 @@ impl TdsClient {
     /// spans several messages and reports the aggregate across every batch, so
     /// one read after `write_to_server_zerocopy` covers the whole operation.
     ///
-    /// Silent for an Always Encrypted column in either direction: cell
-    /// encryption consumes the value before the narrow serializer runs, so no
-    /// substitution happens and none is reported. See
+    /// Always Encrypted parameters report substitution performed while fitting
+    /// plaintext to the destination collation before encryption. Encrypted
+    /// result values and bulk-copy cells remain silent because their encryption
+    /// paths do not perform narrow conversion. See
     /// [`StreamingBulkLoadWriter::code_page_conversion_loss`](crate::message::bulk_load::StreamingBulkLoadWriter::code_page_conversion_loss).
     pub fn take_code_page_conversion_loss(&mut self) -> bool {
         std::mem::take(&mut self.code_page_conversion_loss)
@@ -9497,6 +9637,7 @@ mod tests {
     use crate::connection::transport::tds_transport::TdsTransport;
     use crate::core::{CancelHandle, TdsResult};
     use crate::datatypes::row_writer::RowWriter;
+    use crate::error::Error;
     use crate::io::packet_reader::TdsPacketReader;
     use crate::io::reader_writer::{NetworkReader, NetworkWriter};
     use crate::io::token_stream::{
@@ -14621,6 +14762,67 @@ mod tests {
         );
     }
 
+    #[test]
+    fn secondary_client_context_targets_the_current_database_without_retry() {
+        let mut client_context = ClientContext::with_data_source("tcp:localhost,1433");
+        client_context.database = "login_db".to_string();
+        client_context.user_name = "app_login".to_string();
+        client_context.connect_retry_count = 3;
+        let mut client = TdsClient::new(
+            AnyTransport::dynamic(TestTransport::new()),
+            crate::handler::handler_factory::create_test_negotiated_settings_internal(),
+            crate::connection::execution_context::ExecutionContext::new(),
+            client_context,
+            Vec::new(),
+        );
+        client.negotiated_settings.database = "current_db".to_string();
+
+        let context = client
+            .secondary_client_context()
+            .expect("the login context is retained");
+
+        assert_eq!(context.database, "current_db");
+        assert_eq!(context.connect_retry_count, 0);
+        assert_eq!(context.user_name, "app_login");
+        assert_eq!(context.data_source, "tcp:localhost,1433");
+    }
+
+    #[test]
+    fn a_secondary_login_keeps_the_sessions_client_connection_id() {
+        use crate::handler::handler_factory::create_test_negotiated_settings_internal;
+        use crate::trace_context::ConnectionTrace;
+
+        let trace = Arc::new(ConnectionTrace::default());
+        let mut client_context = ClientContext::with_data_source("tcp:localhost,1433");
+        client_context.set_connection_trace(Arc::clone(&trace));
+        let session_id = uuid::Uuid::new_v4();
+        let mut settings = create_test_negotiated_settings_internal();
+        settings.client_connection_id = session_id;
+        let client = TdsClient::new(
+            AnyTransport::dynamic(TestTransport::new()),
+            settings,
+            crate::connection::execution_context::ExecutionContext::new(),
+            client_context,
+            Vec::new(),
+        );
+
+        let secondary_context = client
+            .secondary_client_context()
+            .expect("the login context is retained");
+        assert!(secondary_context.connection_trace.is_none());
+        let mut secondary_settings = create_test_negotiated_settings_internal();
+        secondary_settings.client_connection_id = uuid::Uuid::new_v4();
+        let _secondary = TdsClient::new(
+            AnyTransport::dynamic(TestTransport::new()),
+            secondary_settings,
+            crate::connection::execution_context::ExecutionContext::new(),
+            secondary_context,
+            Vec::new(),
+        );
+
+        assert_eq!(trace.client_connection_id(), Some(session_id));
+    }
+
     #[tokio::test]
     async fn execute_sp_unprepare_clears_stale_info_messages() {
         // Regression: token-consuming commands beyond the execute*/query family
@@ -16980,6 +17182,12 @@ mod tests {
             &mut params,
             &mut output_param_ceks,
             &[],
+            &SqlCollation {
+                info: 0x0409,
+                lcid_language_id: 0,
+                col_flags: 0,
+                sort_id: 0,
+            },
         )
         .await
         .expect_err("a forced parameter omitted from the describe result must be rejected");
@@ -18377,6 +18585,30 @@ mod tests {
         )
     }
 
+    fn streamed_xml(name: &str) -> RpcParameter {
+        RpcParameter::data_at_exec(
+            Some(name.to_string()),
+            StatusFlags::NONE,
+            StreamedSqlType::Xml,
+        )
+    }
+
+    #[test]
+    fn streamed_udt_metadata_is_validated_before_the_rpc_opens() {
+        use crate::datatypes::sql_udt::UdtTypeName;
+
+        let param = RpcParameter::data_at_exec(
+            Some("@v".to_string()),
+            StatusFlags::NONE,
+            StreamedSqlType::Udt(UdtTypeName::new(None, None, "x".repeat(256))),
+        );
+
+        let error =
+            TdsClient::split_and_validate_streamed_params(vec![param], &SqlCollation::default())
+                .unwrap_err();
+        assert!(matches!(error, Error::UsageError(_)));
+    }
+
     /// A single streamed chunk is framed as `[u32 len][bytes]` and the value is
     /// then closed with the PLP terminator.
     #[tokio::test]
@@ -18420,6 +18652,115 @@ mod tests {
             client.streamed_write_state,
             StreamedWriteState::Idle
         ));
+    }
+
+    #[tokio::test]
+    async fn streamed_xml_adds_bom_before_payload() {
+        let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
+
+        client
+            .begin_sp_executesql("SELECT @v".to_string(), vec![streamed_xml("@v")], ())
+            .await
+            .unwrap();
+        client
+            .write_streamed_chunk(&[b'<', 0, b'r', 0])
+            .await
+            .unwrap();
+        client.end_streamed_param().await.unwrap();
+
+        let payload = reassemble_sent(&sent.lock().unwrap());
+        let pos = find_last(&payload, &PLP_UNKNOWN_LEN_BYTES).unwrap();
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&2u32.to_le_bytes());
+        expected.extend_from_slice(&[0xFF, 0xFE]);
+        expected.extend_from_slice(&2u32.to_le_bytes());
+        expected.extend_from_slice(&[b'<', 0]);
+        expected.extend_from_slice(&2u32.to_le_bytes());
+        expected.extend_from_slice(&[b'r', 0]);
+        expected.extend_from_slice(&PLP_TERMINATOR_BYTES);
+        assert_eq!(
+            &payload[pos + PLP_UNKNOWN_LEN_BYTES.len()..],
+            expected.as_slice()
+        );
+    }
+
+    #[tokio::test]
+    async fn streamed_xml_preserves_one_bom_across_later_chunks() {
+        let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
+
+        client
+            .begin_sp_executesql("SELECT @v".to_string(), vec![streamed_xml("@v")], ())
+            .await
+            .unwrap();
+        client.write_streamed_chunk(&[0xFF]).await.unwrap();
+        client.write_streamed_chunk(&[0xFE, b'<', 0]).await.unwrap();
+        client.write_streamed_chunk(&[b'r', 0]).await.unwrap();
+        client.end_streamed_param().await.unwrap();
+
+        let payload = reassemble_sent(&sent.lock().unwrap());
+        let pos = find_last(&payload, &PLP_UNKNOWN_LEN_BYTES).unwrap();
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&2u32.to_le_bytes());
+        expected.extend_from_slice(&[0xFF, 0xFE]);
+        expected.extend_from_slice(&2u32.to_le_bytes());
+        expected.extend_from_slice(&[b'<', 0]);
+        expected.extend_from_slice(&2u32.to_le_bytes());
+        expected.extend_from_slice(&[b'r', 0]);
+        expected.extend_from_slice(&PLP_TERMINATOR_BYTES);
+        assert_eq!(
+            &payload[pos + PLP_UNKNOWN_LEN_BYTES.len()..],
+            expected.as_slice()
+        );
+    }
+
+    #[tokio::test]
+    async fn streamed_empty_xml_still_writes_bom() {
+        let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
+
+        client
+            .begin_sp_executesql("SELECT @v".to_string(), vec![streamed_xml("@v")], ())
+            .await
+            .unwrap();
+        client.end_streamed_param().await.unwrap();
+
+        let payload = reassemble_sent(&sent.lock().unwrap());
+        let pos = find_last(&payload, &PLP_UNKNOWN_LEN_BYTES).unwrap();
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&2u32.to_le_bytes());
+        expected.extend_from_slice(&[0xFF, 0xFE]);
+        expected.extend_from_slice(&PLP_TERMINATOR_BYTES);
+        assert_eq!(
+            &payload[pos + PLP_UNKNOWN_LEN_BYTES.len()..],
+            expected.as_slice()
+        );
+    }
+
+    #[tokio::test]
+    async fn streamed_xml_pending_byte_prevents_null() {
+        let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
+
+        client
+            .begin_sp_executesql("SELECT @v".to_string(), vec![streamed_xml("@v")], ())
+            .await
+            .unwrap();
+        client.write_streamed_chunk(b"<").await.unwrap();
+
+        let error = client.write_streamed_null().unwrap_err();
+        assert!(matches!(error, UsageError(_)));
+        client.end_streamed_param().await.unwrap();
+
+        let payload = reassemble_sent(&sent.lock().unwrap());
+        let pos = find_last(&payload, &PLP_UNKNOWN_LEN_BYTES).unwrap();
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&2u32.to_le_bytes());
+        expected.extend_from_slice(&[0xFF, 0xFE]);
+        expected.extend_from_slice(&1u32.to_le_bytes());
+        expected.push(b'<');
+        expected.extend_from_slice(&PLP_TERMINATOR_BYTES);
+        assert_eq!(
+            &payload[pos + PLP_UNKNOWN_LEN_BYTES.len()..],
+            expected.as_slice()
+        );
     }
 
     /// A streamed parameter marked NULL (before any chunk) is closed with
@@ -18930,6 +19271,27 @@ mod tests {
             .begin_sp_executesql("INSERT INTO t(v) VALUES (@v)".to_string(), vec![bad], ())
             .await
             .expect_err("unnamed data-at-exec parameter must be rejected");
+        assert!(matches!(err, UsageError(_)));
+        assert!(matches!(
+            client.streamed_write_state,
+            StreamedWriteState::Idle
+        ));
+    }
+
+    #[tokio::test]
+    async fn begin_rejects_encoded_byte_limit_on_data_at_exec_param() {
+        let mut client = create_test_client_with_tokens(vec![]);
+        let bad = RpcParameter::data_at_exec(
+            Some("@v".to_string()),
+            StatusFlags::NONE,
+            StreamedSqlType::VarcharMax,
+        )
+        .with_narrow_string_byte_limit(1);
+
+        let err = client
+            .begin_sp_executesql("INSERT INTO t(v) VALUES (@v)".to_string(), vec![bad], ())
+            .await
+            .expect_err("streamed encoded-byte limits must be rejected before opening the RPC");
         assert!(matches!(err, UsageError(_)));
         assert!(matches!(
             client.streamed_write_state,
@@ -20602,13 +20964,10 @@ mod tests {
         );
     }
 
-    /// Drives a real send site, so removing the retraction from
-    /// `execute_sp_executesql` cannot leave the suite green. Parameter 1 flushes
-    /// a packet; parameter 2 is rejected by `serialize_string` after it.
+    /// Parameter validation covers the complete list before serialization, so
+    /// a late encoded-length failure cannot flush the earlier large parameter.
     #[tokio::test]
-    async fn a_send_site_retracts_when_serialization_fails_after_a_flush() {
-        use crate::message::messages::PacketStatusFlags;
-
+    async fn a_send_site_rejects_encoded_overflow_before_writing() {
         let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
         let big = RpcParameter::new(
             Some("@big".to_string()),
@@ -20628,22 +20987,18 @@ mod tests {
             .execute_sp_executesql("SELECT @big, @bad".to_string(), vec![big, overlong], ())
             .await;
 
-        assert!(result.is_err(), "the over-long value must be rejected");
-
-        let wire = sent.lock().unwrap().clone();
-        let last = &wire[wire.len() - PacketWriter::PACKET_HEADER_SIZE..];
-        assert_eq!(
-            last[1],
-            PacketStatusFlags::Eom as u8 | PacketStatusFlags::Ignore as u8,
-            "the half-sent request must be withdrawn, not dropped"
+        assert_overlong_parameter_error(result.expect_err("the over-long value must be rejected"));
+        assert!(
+            sent.lock().unwrap().is_empty(),
+            "preflight must reject every parameter before writing the RPC"
         );
         assert!(
             !client.is_connection_dead(),
-            "a withdrawn request leaves the connection reusable"
+            "a locally rejected request leaves the connection reusable"
         );
     }
 
-    fn partially_serializable_cursor_params() -> Vec<RpcParameter> {
+    fn cursor_params_with_encoded_overflow() -> Vec<RpcParameter> {
         vec![
             RpcParameter::new(
                 Some("@big".to_string()),
@@ -20688,20 +21043,37 @@ mod tests {
     }
 
     fn assert_overlong_parameter_error(error: crate::error::Error) {
+        assert!(matches!(
+            error,
+            crate::error::Error::EncodedValueTooLong {
+                actual: 10,
+                maximum: 1
+            }
+        ));
+    }
+
+    fn assert_cursor_parameter_preflight_sent_nothing(
+        client: &TdsClient,
+        sent: &Arc<std::sync::Mutex<Vec<u8>>>,
+    ) {
         assert!(
-            error.to_string().contains("exceeds schema size"),
-            "the caller must receive the original serialization error, got {error}"
+            sent.lock().unwrap().is_empty(),
+            "parameter preflight must complete before the cursor RPC is written"
+        );
+        assert!(
+            !client.is_connection_dead(),
+            "a locally rejected cursor RPC must leave the connection reusable"
         );
     }
 
     #[tokio::test]
-    async fn cursor_open_with_params_retracts_a_partial_send() {
+    async fn cursor_open_with_params_rejects_encoded_overflow_before_writing() {
         let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
 
         let error = client
             .cursor_open_with_params(
                 "SELECT @big, @bad",
-                partially_serializable_cursor_params(),
+                cursor_params_with_encoded_overflow(),
                 crate::cursor::CursorScrollOption::FORWARD_ONLY,
                 crate::cursor::CursorConcurrency::READONLY,
                 0,
@@ -20712,7 +21084,7 @@ mod tests {
             .expect_err("the over-long cursor parameter must fail");
 
         assert_overlong_parameter_error(error);
-        assert_cursor_send_was_retracted(&client, &sent);
+        assert_cursor_parameter_preflight_sent_nothing(&client, &sent);
     }
 
     #[tokio::test]
@@ -20796,7 +21168,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn perform_cursor_operation_retracts_a_partial_send() {
+    async fn perform_cursor_operation_rejects_encoded_overflow_before_writing() {
         let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
 
         let error = client
@@ -20805,7 +21177,7 @@ mod tests {
                 crate::cursor::CursorOperation::UPDATE,
                 1,
                 "",
-                partially_serializable_cursor_params(),
+                cursor_params_with_encoded_overflow(),
                 None,
                 None,
             )
@@ -20813,17 +21185,17 @@ mod tests {
             .expect_err("the over-long cursor parameter must fail");
 
         assert_overlong_parameter_error(error);
-        assert_cursor_send_was_retracted(&client, &sent);
+        assert_cursor_parameter_preflight_sent_nothing(&client, &sent);
     }
 
     #[tokio::test]
-    async fn cursor_prepexec_retracts_a_partial_send() {
+    async fn cursor_prepexec_rejects_encoded_overflow_before_writing() {
         let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
 
         let error = client
             .cursor_prepexec(
                 "SELECT @big, @bad",
-                partially_serializable_cursor_params(),
+                cursor_params_with_encoded_overflow(),
                 crate::cursor::CursorScrollOption::FORWARD_ONLY,
                 crate::cursor::CursorConcurrency::READONLY,
                 0,
@@ -20834,17 +21206,17 @@ mod tests {
             .expect_err("the over-long cursor parameter must fail");
 
         assert_overlong_parameter_error(error);
-        assert_cursor_send_was_retracted(&client, &sent);
+        assert_cursor_parameter_preflight_sent_nothing(&client, &sent);
     }
 
     #[tokio::test]
-    async fn cursor_execute_retracts_a_partial_send() {
+    async fn cursor_execute_rejects_encoded_overflow_before_writing() {
         let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
 
         let error = client
             .cursor_execute(
                 1,
-                partially_serializable_cursor_params(),
+                cursor_params_with_encoded_overflow(),
                 crate::cursor::CursorScrollOption::FORWARD_ONLY,
                 crate::cursor::CursorConcurrency::READONLY,
                 0,
@@ -20855,7 +21227,7 @@ mod tests {
             .expect_err("the over-long cursor parameter must fail");
 
         assert_overlong_parameter_error(error);
-        assert_cursor_send_was_retracted(&client, &sent);
+        assert_cursor_parameter_preflight_sent_nothing(&client, &sent);
     }
 
     /// The retraction runs on its own budget, so a request that had a timeout

@@ -1,14 +1,18 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+use std::borrow::Cow;
+
 use bitflags::bitflags;
 
-use crate::datatypes::column_values::DEFAULT_VARTIME_SCALE;
+use crate::datatypes::column_values::{ColumnValues, DEFAULT_VARTIME_SCALE};
 use crate::datatypes::encoder::SqlValueEncoder;
+use crate::datatypes::sql_string::{EncodingType, SqlString};
 use crate::datatypes::sql_tvp::TvpTypeName;
 use crate::datatypes::sql_udt::UdtTypeName;
 use crate::datatypes::sqldatatypes::VectorBaseType;
 use crate::datatypes::sqltypes::SqlType;
+use crate::datatypes::tds_value_serializer::TdsValueSerializer;
 use crate::{
     core::TdsResult,
     datatypes::sqldatatypes::TdsDataType,
@@ -96,25 +100,22 @@ pub(crate) struct EncryptedRpcValue {
     pub(crate) ciphertext: Option<Vec<u8>>,
     /// Cipher metadata describing how the value was encrypted.
     pub(crate) metadata: RpcEncryptionMetadata,
+    /// Whether preparing the plaintext substituted an unmappable character.
+    pub(crate) had_conversion_loss: bool,
 }
 
 /// Wire-type selector for a data-at-execution (streamed) PLP parameter.
 ///
-/// Limited to the MAX types, whose TYPE_INFO is fully determined by the variant
-/// itself and whose value body is plain PLP framing: unknown-length opener,
-/// length-prefixed chunks, terminator. That is what lets the parameter header be
-/// written before the total value length is known. Callers buffer any other type
-/// and send it materialized.
+/// Limited to PLP types whose parameter header can be written before the total
+/// value length is known. UDT carries its server-side identity because that
+/// metadata precedes the PLP body in `TYPE_INFO`.
 ///
 /// This selects the *wire* type only. The `@params` declaration can be narrowed
 /// independently - see [`RpcParameter::with_streamed_declaration`] - so a
 /// `varchar(10)` parameter still streams its body as `varchar(max)`.
 ///
-/// TODO: `xml` and `udt` have no variant here and are buffered by the ODBC
-/// layer instead of streamed - correct on the wire, but it holds the whole
-/// value in memory (AB#48349). `text` / `ntext` / `image` need no variant:
-/// they are already mapped onto the `max` types above.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamedSqlType {
     /// Unicode MAX text.
     NVarcharMax,
@@ -122,6 +123,11 @@ pub enum StreamedSqlType {
     VarcharMax,
     /// MAX binary data.
     VarBinaryMax,
+    /// XML data. Chunks must contain UTF-16LE bytes; the streaming client adds
+    /// a BOM when absent and preserves exactly one when present.
+    Xml,
+    /// CLR user-defined type data. Chunks are the opaque CLR-serialized payload.
+    Udt(UdtTypeName),
 }
 
 impl StreamedSqlType {
@@ -131,15 +137,24 @@ impl StreamedSqlType {
     /// [`RpcParameter::get_sql_name_impl`] on the equivalent materialized
     /// [`SqlType`] rather than duplicating the `nvarchar(MAX)` / `varchar(MAX)`
     /// / `varbinary(MAX)` strings, so the two can't drift apart.
-    fn sql_name(self) -> TdsResult<String> {
+    fn sql_name(&self) -> TdsResult<String> {
         RpcParameter::get_sql_name_impl(&self.as_sql_type(), None)
     }
 
-    fn as_sql_type(self) -> SqlType {
+    fn as_sql_type(&self) -> SqlType {
         match self {
             Self::NVarcharMax => SqlType::NVarcharMax(None),
             Self::VarcharMax => SqlType::VarcharMax(None),
             Self::VarBinaryMax => SqlType::VarBinaryMax(None),
+            Self::Xml => SqlType::Xml(None),
+            Self::Udt(type_name) => SqlType::Udt(type_name.clone(), None),
+        }
+    }
+
+    fn validate(&self) -> TdsResult<()> {
+        match self {
+            Self::Udt(type_name) => type_name.validate(),
+            _ => Ok(()),
         }
     }
 }
@@ -188,6 +203,10 @@ pub struct RpcParameter {
     /// Cold metadata stays boxed to keep ordinary parameter arrays compact.
     streamed_declaration: Option<Box<SqlType>>,
 
+    /// Optional encoded-byte limit imposed by the caller on a narrow string.
+    /// This is independent of PLP framing and the SQL declaration.
+    narrow_string_byte_limit: Option<usize>,
+
     /// When present, the parameter is sent encrypted (Always Encrypted): the
     /// ciphertext is serialized as a BIGVARBINARY with the ENCRYPTED status flag
     /// and a trailing CryptoMetaData block, bypassing the plaintext `value`.
@@ -212,6 +231,7 @@ impl RpcParameter {
             type_metadata: None,
             numeric_declaration: None,
             streamed_declaration: None,
+            narrow_string_byte_limit: None,
             encrypted: None,
             force_column_encryption: false,
         }
@@ -230,6 +250,7 @@ impl RpcParameter {
             type_metadata: None,
             numeric_declaration: None,
             streamed_declaration: None,
+            narrow_string_byte_limit: None,
             encrypted: None,
             force_column_encryption: false,
         }
@@ -252,10 +273,39 @@ impl RpcParameter {
         self
     }
 
+    /// Limits a narrow string value by its encoded wire-byte length.
+    ///
+    /// This remains active for materialized PLP-framed values whose SQL
+    /// declaration is `varchar(max)`, allowing an API layer to enforce its own
+    /// length contract. Streamed values must enforce their running limit while
+    /// supplying chunks and reject this builder at execution setup.
+    pub fn with_narrow_string_byte_limit(mut self, maximum: usize) -> Self {
+        self.narrow_string_byte_limit = Some(maximum);
+        self
+    }
+
     /// Returns `true` if this parameter's value is supplied via the
     /// data-at-execution (streamed) path.
     pub(crate) fn is_data_at_exec(&self) -> bool {
         matches!(self.value, RpcValue::Streamed(_))
+    }
+
+    pub(crate) fn validate_streamed_configuration(&self) -> TdsResult<()> {
+        if self.is_data_at_exec() && self.narrow_string_byte_limit.is_some() {
+            return Err(Error::UsageError(
+                "Encoded-byte limits are not supported on streamed parameters; enforce the \
+                 limit while supplying chunks or send a materialized value."
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn streamed_sql_type(&self) -> Option<&StreamedSqlType> {
+        match &self.value {
+            RpcValue::Streamed(sql_type) => Some(sql_type),
+            RpcValue::Materialized(_) => None,
+        }
     }
 
     /// Returns a usage error if any parameter in `params` is data-at-execution
@@ -554,10 +604,12 @@ impl RpcParameter {
     ///
     /// The name is checked separately by [`Self::validate_named_before_send`],
     /// since only the named path writes it.
-    pub(crate) fn validate_before_send(&self) -> TdsResult<()> {
+    pub(crate) fn validate_before_send(&self, db_collation: &SqlCollation) -> TdsResult<()> {
         match &self.value {
-            RpcValue::Materialized(value) => value.validate_for_send(),
-            RpcValue::Streamed(_) => Ok(()),
+            RpcValue::Materialized(value) => {
+                value.validate_for_send(db_collation, self.narrow_string_byte_limit)
+            }
+            RpcValue::Streamed(streamed) => streamed.validate(),
         }
     }
 
@@ -568,11 +620,11 @@ impl RpcParameter {
     /// the name when it is not positional, so validating it unconditionally
     /// would reject a positional parameter whose unused name happens to be
     /// overlong.
-    pub(crate) fn validate_named_before_send(&self) -> TdsResult<()> {
+    pub(crate) fn validate_named_before_send(&self, db_collation: &SqlCollation) -> TdsResult<()> {
         if let Some(name) = &self.name {
             Self::validate_name_length(name)?;
         }
-        self.validate_before_send()
+        self.validate_before_send(db_collation)
     }
 
     /// Serializes the RPC parameter into the provided `PacketWriter`.
@@ -631,7 +683,7 @@ impl RpcParameter {
         // still resolve to NULL before any data is sent. This is the write
         // analogue of the incremental read's pause point: the same serialize
         // method, parked partway through the value.
-        if let RpcValue::Streamed(st) = self.value {
+        if let RpcValue::Streamed(st) = &self.value {
             if self.encrypted.is_some() {
                 return Err(Error::UsageError(
                     "Encrypted parameters cannot be streamed incrementally.".to_string(),
@@ -663,7 +715,13 @@ impl RpcParameter {
             RpcValue::Streamed(_) => unreachable!("streamed value handled above"),
         };
         encoder
-            .encode_sqlvalue(packet_writer, value, db_collation, self.type_metadata)
+            .encode_sqlvalue(
+                packet_writer,
+                value,
+                db_collation,
+                self.type_metadata,
+                self.narrow_string_byte_limit,
+            )
             .await?;
         Ok(())
     }
@@ -676,10 +734,12 @@ impl RpcParameter {
         &mut self,
         ciphertext: Option<Vec<u8>>,
         metadata: RpcEncryptionMetadata,
+        had_conversion_loss: bool,
     ) {
         self.encrypted = Some(Box::new(EncryptedRpcValue {
             ciphertext,
             metadata,
+            had_conversion_loss,
         }));
     }
 
@@ -699,6 +759,53 @@ impl RpcParameter {
                     .to_string(),
             )),
         }
+    }
+
+    pub(crate) fn value_for_encryption(
+        &self,
+        db_collation: &SqlCollation,
+    ) -> TdsResult<(Cow<'_, SqlType>, bool)> {
+        let value = self.value()?;
+        if !matches!(
+            value,
+            SqlType::Char(_, _)
+                | SqlType::Varchar(_, _)
+                | SqlType::VarcharMax(_)
+                | SqlType::Text(_)
+        ) {
+            return Ok((Cow::Borrowed(value), false));
+        }
+        let (column_value, context) = value.to_column_value_and_context(db_collation);
+        let Some((bytes, had_loss)) = TdsValueSerializer::narrow_string_bytes(
+            &column_value,
+            &context,
+            self.narrow_string_byte_limit,
+        )?
+        else {
+            return Ok((Cow::Borrowed(value), false));
+        };
+
+        let bytes = match bytes {
+            Cow::Borrowed(bytes)
+                if matches!(
+                    &column_value,
+                    ColumnValues::String(original) if bytes.len() == original.bytes.len()
+                ) =>
+            {
+                return Ok((Cow::Borrowed(value), had_loss));
+            }
+            Cow::Borrowed(bytes) => bytes.to_vec(),
+            std::borrow::Cow::Owned(bytes) => bytes,
+        };
+        let sql_string = SqlString::new(bytes, EncodingType::LcidBased(*db_collation));
+        let fitted = match value {
+            SqlType::Varchar(_, length) => SqlType::Varchar(Some(sql_string), *length),
+            SqlType::VarcharMax(_) => SqlType::VarcharMax(Some(sql_string)),
+            SqlType::Char(_, length) => SqlType::Char(Some(sql_string), *length),
+            SqlType::Text(_) => SqlType::Text(Some(sql_string)),
+            _ => return Ok((Cow::Borrowed(value), false)),
+        };
+        Ok((Cow::Owned(fitted), had_loss))
     }
 
     /// Returns `true` when the parameter is passed by reference (an output or
@@ -755,6 +862,9 @@ impl RpcParameter {
             }
         }
         Self::write_crypto_metadata(packet_writer, &encrypted.metadata).await?;
+        if encrypted.had_conversion_loss {
+            packet_writer.note_code_page_conversion_loss();
+        }
         Ok(())
     }
 
@@ -931,6 +1041,9 @@ impl From<&SqlType> for TdsDataType {
 
 #[cfg(test)]
 mod tests {
+    use std::borrow::Cow;
+
+    use crate::datatypes::sql_string::{EncodingType, SqlString};
     use crate::datatypes::sqltypes::SqlType;
     use crate::error::Error;
     use crate::message::parameters::rpc_parameters::{
@@ -945,6 +1058,172 @@ mod tests {
     use crate::message::messages::PacketType;
     use crate::token::tokens::SqlCollation;
     use futures::executor::block_on;
+
+    #[test]
+    fn encrypted_narrow_value_uses_the_fitted_wire_plaintext() {
+        let collation = SqlCollation {
+            info: 0x0409,
+            lcid_language_id: 0,
+            col_flags: 0x40,
+            sort_id: 0,
+        };
+        let parameter = RpcParameter::new(
+            Some("@p".to_string()),
+            StatusFlags::NONE,
+            SqlType::Varchar(
+                Some(crate::datatypes::sql_string::SqlString::from_utf8_string(
+                    "é ".to_string(),
+                )),
+                2,
+            ),
+        );
+
+        let (fitted, had_loss) = parameter.value_for_encryption(&collation).unwrap();
+        assert!(!had_loss);
+        let SqlType::Varchar(Some(value), 2) = fitted.as_ref() else {
+            panic!("expected a fitted varchar(2)");
+        };
+        assert_eq!(value.bytes, "é".as_bytes());
+
+        let SqlType::Varchar(Some(original), 2) = parameter.value().unwrap() else {
+            panic!("expected the original varchar(2)");
+        };
+        assert_eq!(original.to_utf8_string(), "é ");
+    }
+
+    #[test]
+    fn encrypted_narrow_value_preserves_conversion_loss() {
+        let collation = SqlCollation {
+            info: 0x0409,
+            lcid_language_id: 0,
+            col_flags: 0,
+            sort_id: 52,
+        };
+        let parameter = RpcParameter::new(
+            Some("@p".to_string()),
+            StatusFlags::NONE,
+            SqlType::Varchar(
+                Some(crate::datatypes::sql_string::SqlString::from_utf8_string(
+                    "日".to_string(),
+                )),
+                1,
+            ),
+        );
+
+        let (fitted, had_loss) = parameter.value_for_encryption(&collation).unwrap();
+        let SqlType::Varchar(Some(value), 1) = fitted.as_ref() else {
+            panic!("expected a fitted varchar(1)");
+        };
+        assert_eq!(value.bytes, b"?");
+        assert!(had_loss);
+    }
+
+    #[test]
+    fn encrypted_preencoded_narrow_value_stays_borrowed() {
+        let collation = SqlCollation {
+            info: 0x0409,
+            lcid_language_id: 0,
+            col_flags: 0,
+            sort_id: 52,
+        };
+        let parameter = RpcParameter::new(
+            Some("@p".to_string()),
+            StatusFlags::NONE,
+            SqlType::Varchar(
+                Some(SqlString::new(
+                    b"cafe".to_vec(),
+                    EncodingType::LcidBased(collation),
+                )),
+                4,
+            ),
+        );
+
+        let (value, had_loss) = parameter.value_for_encryption(&collation).unwrap();
+        assert!(matches!(value, Cow::Borrowed(_)));
+        assert!(!had_loss);
+    }
+
+    #[test]
+    fn encrypted_preencoded_narrow_value_uses_fitted_prefix() {
+        let collation = SqlCollation {
+            info: 0x0409,
+            lcid_language_id: 0,
+            col_flags: 0,
+            sort_id: 52,
+        };
+        let parameter = RpcParameter::new(
+            Some("@p".to_string()),
+            StatusFlags::NONE,
+            SqlType::Varchar(
+                Some(SqlString::new(
+                    b"a ".to_vec(),
+                    EncodingType::LcidBased(collation),
+                )),
+                1,
+            ),
+        );
+
+        let (value, had_loss) = parameter.value_for_encryption(&collation).unwrap();
+        let SqlType::Varchar(Some(value), 1) = value.as_ref() else {
+            panic!("expected a fitted varchar(1)");
+        };
+        assert_eq!(value.bytes, b"a");
+        assert!(!had_loss);
+    }
+
+    #[test]
+    fn encrypted_non_narrow_value_stays_borrowed() {
+        let collation = SqlCollation {
+            info: 0x0409,
+            lcid_language_id: 0,
+            col_flags: 0,
+            sort_id: 52,
+        };
+        let parameter = RpcParameter::new(
+            Some("@p".to_string()),
+            StatusFlags::NONE,
+            SqlType::VarBinaryMax(Some(vec![1; 8192])),
+        );
+
+        let (value, had_loss) = parameter.value_for_encryption(&collation).unwrap();
+
+        assert!(matches!(value, Cow::Borrowed(_)));
+        assert!(!had_loss);
+    }
+
+    #[test]
+    fn explicit_limit_cannot_relax_rpc_declaration() {
+        let collation = SqlCollation {
+            info: 0,
+            lcid_language_id: 0,
+            col_flags: 0x40,
+            sort_id: 0,
+        };
+        let parameter = RpcParameter::new(
+            Some("@p".to_string()),
+            StatusFlags::NONE,
+            SqlType::Varchar(Some(SqlString::from_utf8_string("ab".to_string())), 1),
+        )
+        .with_narrow_string_byte_limit(2);
+
+        assert!(matches!(
+            parameter.validate_before_send(&collation),
+            Err(Error::EncodedValueTooLong {
+                actual: 2,
+                maximum: 1
+            })
+        ));
+
+        let mut mock = MockNetworkWriter::new(256);
+        let mut writer = PacketWriter::new(PacketType::RpcRequest, &mut mock, None, None);
+        assert!(matches!(
+            block_on(parameter.serialize(&mut writer, &collation, false, &GenericEncoder::new())),
+            Err(Error::EncodedValueTooLong {
+                actual: 2,
+                maximum: 1
+            })
+        ));
+    }
 
     /// A UDT is declared by its own server-side name, not the TDS type name
     /// `udt`, which `sp_executesql` cannot resolve ("Cannot find data type
@@ -1096,7 +1375,7 @@ mod tests {
             StatusFlags::NONE,
             SqlType::Int(Some(5)),
         );
-        param.set_encrypted(Some(vec![0xAA, 0xBB, 0xCC, 0xDD]), sample_metadata());
+        param.set_encrypted(Some(vec![0xAA, 0xBB, 0xCC, 0xDD]), sample_metadata(), false);
 
         let mut expected = vec![0x02, 0x40, 0x00, 0x70, 0x00]; // name: len 2, "@p" UTF-16LE
         expected.push(0x08); // status: ENCRYPTED
@@ -1110,6 +1389,33 @@ mod tests {
         assert_eq!(serialize_param(&param), expected);
     }
 
+    #[test]
+    fn encrypted_conversion_loss_is_carried_by_the_rpc_message() {
+        let mut param = RpcParameter::new(
+            Some("@p".to_string()),
+            StatusFlags::NONE,
+            SqlType::Varchar(
+                Some(crate::datatypes::sql_string::SqlString::from_utf8_string(
+                    "日".to_string(),
+                )),
+                1,
+            ),
+        );
+        param.set_encrypted(Some(vec![0xAA]), sample_metadata(), true);
+
+        let mut mock = MockNetworkWriter::new(256);
+        let mut writer = PacketWriter::new(PacketType::RpcRequest, &mut mock, None, None);
+        block_on(param.serialize(
+            &mut writer,
+            &SqlCollation::default(),
+            false,
+            &GenericEncoder::new(),
+        ))
+        .unwrap();
+
+        assert!(writer.code_page_conversion_loss());
+    }
+
     /// An encrypted `bit` parameter writes its base TYPE_INFO as `BITN(1)`
     /// (0x68, 0x01), not the `INTN(1)` (0x26, 0x01 = tinyint) the normal RPC
     /// path uses. Always Encrypted does no implicit conversion, so an `INTN(1)`
@@ -1121,7 +1427,7 @@ mod tests {
             StatusFlags::NONE,
             SqlType::Bit(Some(true)),
         );
-        param.set_encrypted(Some(vec![0xAA, 0xBB]), sample_metadata());
+        param.set_encrypted(Some(vec![0xAA, 0xBB]), sample_metadata(), false);
 
         let mut expected = vec![0x02, 0x40, 0x00, 0x70, 0x00]; // name: len 2, "@p" UTF-16LE
         expected.push(0x08); // status: ENCRYPTED
@@ -1144,7 +1450,7 @@ mod tests {
             StatusFlags::NONE,
             SqlType::Int(None),
         );
-        param.set_encrypted(None, sample_metadata());
+        param.set_encrypted(None, sample_metadata(), false);
 
         let mut expected = vec![0x02, 0x40, 0x00, 0x70, 0x00];
         expected.push(0x08); // status: ENCRYPTED
@@ -1168,7 +1474,7 @@ mod tests {
             StatusFlags::NONE,
             SqlType::VarBinaryMax(None),
         );
-        param.set_encrypted(Some(ciphertext.clone()), sample_metadata());
+        param.set_encrypted(Some(ciphertext.clone()), sample_metadata(), false);
 
         let mut expected = vec![0x02, 0x40, 0x00, 0x70, 0x00];
         expected.push(0x08); // status: ENCRYPTED
@@ -1193,7 +1499,7 @@ mod tests {
             StatusFlags::BY_REF_VALUE,
             SqlType::Int(Some(5)),
         );
-        param.set_encrypted(Some(vec![0x01]), sample_metadata());
+        param.set_encrypted(Some(vec![0x01]), sample_metadata(), false);
 
         let bytes = serialize_param(&param);
         // Status byte follows the 5-byte name prefix.
@@ -1211,7 +1517,7 @@ mod tests {
             StatusFlags::NONE,
             SqlType::Int(Some(5)),
         );
-        param.set_encrypted(Some(vec![9, 9]), sample_metadata());
+        param.set_encrypted(Some(vec![9, 9]), sample_metadata(), false);
         let stored: &EncryptedRpcValue = param.encrypted.as_ref().expect("encrypted set");
         assert_eq!(stored.ciphertext.as_deref(), Some(&[9u8, 9][..]));
         assert_eq!(stored.metadata.cek_id, 11);
@@ -1514,6 +1820,37 @@ mod tests {
         assert_eq!(streamed_header_bytes(&param, true), expected);
     }
 
+    #[test]
+    fn serialize_data_at_exec_xml_named() {
+        let param = RpcParameter::data_at_exec(
+            Some("@p".to_string()),
+            StatusFlags::NONE,
+            StreamedSqlType::Xml,
+        );
+
+        let mut expected = vec![0x02, 0x40, 0x00, 0x70, 0x00];
+        expected.push(StatusFlags::NONE.bits());
+        expected.extend_from_slice(&type_info_bytes(&SqlType::Xml(None)));
+
+        assert_eq!(streamed_header_bytes(&param, false), expected);
+    }
+
+    #[test]
+    fn serialize_data_at_exec_udt_includes_type_name() {
+        let type_name = UdtTypeName::new(None, Some("dbo".to_string()), "Point".to_string());
+        let param = RpcParameter::data_at_exec(
+            Some("@p".to_string()),
+            StatusFlags::NONE,
+            StreamedSqlType::Udt(type_name.clone()),
+        );
+
+        let mut expected = vec![0x02, 0x40, 0x00, 0x70, 0x00];
+        expected.push(StatusFlags::NONE.bits());
+        expected.extend_from_slice(&type_info_bytes(&SqlType::Udt(type_name, None)));
+
+        assert_eq!(streamed_header_bytes(&param, false), expected);
+    }
+
     /// Every streamed type declares itself in the `sp_executesql` `@params`
     /// string under its own T-SQL name, so the server binds the same type it
     /// sees in TYPE_INFO.
@@ -1523,13 +1860,22 @@ mod tests {
             (StreamedSqlType::NVarcharMax, "nvarchar(MAX)"),
             (StreamedSqlType::VarcharMax, "varchar(MAX)"),
             (StreamedSqlType::VarBinaryMax, "varbinary(MAX)"),
+            (StreamedSqlType::Xml, "xml"),
+            (
+                StreamedSqlType::Udt(UdtTypeName::new(
+                    None,
+                    Some("dbo".to_string()),
+                    "Point".to_string(),
+                )),
+                "[dbo].[Point]",
+            ),
         ];
 
         for (streamed, expected_name) in cases {
             let params = vec![RpcParameter::data_at_exec(
                 Some("@p".to_string()),
                 StatusFlags::NONE,
-                streamed,
+                streamed.clone(),
             )];
             let mut list = String::new();
             build_parameter_list_string(&params, &mut list).unwrap();
@@ -1556,7 +1902,7 @@ mod tests {
             StatusFlags::NONE,
             StreamedSqlType::VarBinaryMax,
         );
-        param.set_encrypted(Some(vec![0x01, 0x02]), sample_metadata());
+        param.set_encrypted(Some(vec![0x01, 0x02]), sample_metadata(), false);
 
         let mut mock = MockNetworkWriter::new(16384);
         let mut w = PacketWriter::new(PacketType::RpcRequest, &mut mock, None, None);

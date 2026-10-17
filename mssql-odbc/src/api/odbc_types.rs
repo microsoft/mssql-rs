@@ -749,6 +749,7 @@ pub const SQL_DESC_AUTO_UNIQUE_VALUE: SqlUSmallInt = 11;
 pub const SQL_DESC_CASE_SENSITIVE: SqlUSmallInt = 12;
 pub const SQL_DESC_SEARCHABLE: SqlUSmallInt = 13;
 pub const SQL_DESC_TYPE_NAME: SqlUSmallInt = 14;
+pub const SQL_DESC_LOCAL_TYPE_NAME: SqlUSmallInt = 29;
 pub const SQL_DESC_TABLE_NAME: SqlUSmallInt = 15;
 pub const SQL_DESC_SCHEMA_NAME: SqlUSmallInt = 16;
 pub const SQL_DESC_CATALOG_NAME: SqlUSmallInt = 17;
