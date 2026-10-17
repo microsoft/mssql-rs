@@ -464,7 +464,7 @@ def test_open_bump_pr_branches_before_editing_and_creates(tmp_path):
     calls, run = record_git()
     edited_after = []
     with patch.object(bump.subprocess, "run", side_effect=run), patch.object(
-        bump, "remote_branch_state", return_value=(False, None, True)
+        bump, "remote_branch_state", return_value=(False, None, None, True)
     ), patch.object(
         bump, "github_paged", return_value=[]
     ), patch.object(
@@ -484,7 +484,9 @@ def test_open_bump_pr_branches_before_editing_and_creates(tmp_path):
     assert calls[1] == ["git", "add", "--", "mssql-tds/Cargo.toml"]
     assert calls[2] == ["git", "commit", "--message", "Bump released TDS crates to 0.3.0"]
     assert [
-        "git", "push", "--force", "origin",
+        "git", "push",
+        f"--force-with-lease=refs/heads/{bump.CRATE_BRANCH}:",
+        "origin",
         f"{bump.CRATE_BRANCH}:refs/heads/{bump.CRATE_BRANCH}",
     ] in calls
     method, path = api.call_args.args[0], api.call_args.args[1]
@@ -498,7 +500,7 @@ def test_open_bump_pr_branches_before_editing_and_creates(tmp_path):
 def test_open_bump_pr_updates_existing_pull_request(tmp_path):
     _calls, run = record_git()
     with patch.object(bump.subprocess, "run", side_effect=run), patch.object(
-        bump, "remote_branch_state", return_value=(True, "oldtree", True)
+        bump, "remote_branch_state", return_value=(True, "oldsha", "oldtree", True)
     ), patch.object(
         bump, "github_paged", return_value=[{"number": 694}]
     ), patch.object(bump, "github_api", return_value=(200, {})) as api:
@@ -516,7 +518,7 @@ def test_unchanged_branch_is_not_force_pushed(tmp_path):
     with patch.object(bump, "git", side_effect=lambda root, *args: (
         calls.append(["git", *args]) or "sametree\n"
     )), patch.object(
-        bump, "remote_branch_state", return_value=(True, "sametree", True)
+        bump, "remote_branch_state", return_value=(True, "oldsha", "sametree", True)
     ), patch.object(
         bump, "github_paged", return_value=[{"number": 724}]
     ), patch.object(bump, "github_api", return_value=(200, {})):
@@ -532,7 +534,7 @@ def test_changed_branch_is_force_pushed(tmp_path):
     with patch.object(bump, "git", side_effect=lambda root, *args: (
         calls.append(["git", *args]) or "newtree\n"
     )), patch.object(
-        bump, "remote_branch_state", return_value=(True, "oldtree", True)
+        bump, "remote_branch_state", return_value=(True, "oldsha", "oldtree", True)
     ), patch.object(
         bump, "github_paged", return_value=[]
     ), patch.object(
@@ -542,8 +544,12 @@ def test_changed_branch_is_force_pushed(tmp_path):
             tmp_path, bump.PYTHON_BRANCH, "abc123", "title", "body",
             lambda root: ["mssql-py-core/pyproject.toml"],
         )
-    assert ["git", "push", "--force", "origin",
-            f"{bump.PYTHON_BRANCH}:refs/heads/{bump.PYTHON_BRANCH}"] in calls
+    assert [
+        "git", "push",
+        f"--force-with-lease=refs/heads/{bump.PYTHON_BRANCH}:oldsha",
+        "origin",
+        f"{bump.PYTHON_BRANCH}:refs/heads/{bump.PYTHON_BRANCH}",
+    ] in calls
 
 
 def test_maintainer_edited_branch_is_left_alone(tmp_path):
@@ -554,7 +560,8 @@ def test_maintainer_edited_branch_is_left_alone(tmp_path):
     with patch.object(bump, "git", side_effect=lambda root, *args: (
         calls.append(["git", *args]) or "x\n"
     )), patch.object(
-        bump, "remote_branch_state", return_value=(True, "theirtree", False)
+        bump, "remote_branch_state",
+        return_value=(True, "theirsha", "theirtree", False),
     ), patch.object(
         bump, "github_paged", return_value=[{"number": 724}]
     ), patch.object(bump, "github_api") as api:
@@ -578,20 +585,79 @@ def test_maintainer_edited_branch_is_left_alone(tmp_path):
 )
 def test_branch_ownership_detection(tmp_path, monkeypatch, commits, committer, owned):
     monkeypatch.setenv("GIT_COMMITTER_NAME", "Azure Pipelines")
-    responses = {"rev-parse": "tree1\n", "rev-list": commits, "log": committer + "\n"}
+    def git_result(root, *args):
+        if args == ("rev-parse", "FETCH_HEAD"):
+            return "sha1\n"
+        if args == ("rev-parse", "FETCH_HEAD^{tree}"):
+            return "tree1\n"
+        if args[0] == "rev-list":
+            return commits
+        if args[0] == "log":
+            return committer + "\n"
+        raise AssertionError(args)
+
     with patch.object(bump, "git_try", return_value=subprocess.CompletedProcess("git", 0)), \
-            patch.object(bump, "git", side_effect=lambda root, *a: responses[a[0]]):
-        exists, tree, is_owned = bump.remote_branch_state(tmp_path, "b", "base")
-    assert (exists, tree, is_owned) == (True, "tree1", owned)
+            patch.object(bump, "git", side_effect=git_result):
+        state = bump.remote_branch_state(tmp_path, "b", "base")
+    assert state == (True, "sha1", "tree1", owned)
 
 
 def test_missing_remote_branch_is_owned(tmp_path):
-    with patch.object(bump, "git_try", return_value=subprocess.CompletedProcess(
-        "git", 128, stdout="", stderr="couldn't find remote ref"
-    )):
+    with patch.object(
+        bump,
+        "git_try",
+        side_effect=[
+            subprocess.CompletedProcess("git", 128, stdout="", stderr="missing"),
+            subprocess.CompletedProcess("git", 2, stdout="", stderr=""),
+        ],
+    ):
         assert bump.remote_branch_state(tmp_path, "automation/absent", "base") == (
-            False, None, True
+            False, None, None, True
         )
+
+
+def test_remote_branch_transport_failure_is_not_treated_as_absent(tmp_path):
+    with patch.object(
+        bump,
+        "git_try",
+        side_effect=[
+            subprocess.CompletedProcess("git", 128, stdout="", stderr="network down"),
+            subprocess.CompletedProcess("git", 128, stdout="", stderr="network down"),
+        ],
+    ):
+        with pytest.raises(RuntimeError, match="network down"):
+            bump.remote_branch_state(tmp_path, "automation/unknown", "base")
+
+
+def test_competing_branch_update_rejects_lease(tmp_path):
+    calls = []
+
+    def git_call(root, *args):
+        calls.append(args)
+        if args[0] == "push":
+            raise subprocess.CalledProcessError(1, ["git", *args])
+        return "newtree\n"
+
+    with patch.object(bump, "git", side_effect=git_call), patch.object(
+        bump,
+        "remote_branch_state",
+        return_value=(True, "inspected-sha", "oldtree", True),
+    ), patch.object(bump, "github_paged", return_value=[]):
+        with pytest.raises(subprocess.CalledProcessError):
+            bump.open_bump_pr(
+                tmp_path,
+                bump.PYTHON_BRANCH,
+                "base",
+                "title",
+                "body",
+                lambda root: ["mssql-py-core/pyproject.toml"],
+            )
+    assert (
+        "push",
+        f"--force-with-lease=refs/heads/{bump.PYTHON_BRANCH}:inspected-sha",
+        "origin",
+        f"{bump.PYTHON_BRANCH}:refs/heads/{bump.PYTHON_BRANCH}",
+    ) in calls
 
 
 def test_pull_request_body_links_an_issue_for_the_linked_issue_check():
@@ -859,6 +925,12 @@ def load_pipeline():
     return yaml.safe_load(PIPELINE.read_text(encoding="utf-8"))
 
 
+def pipeline_steps():
+    pipeline = load_pipeline()
+    deployment = pipeline["stages"][0]["jobs"][0]
+    return deployment["strategy"]["runOnce"]["deploy"]["steps"]
+
+
 def shell_script(step):
     """The step's script with LF endings, as a Linux agent would see it."""
     return step["script"].replace("\r\n", "\n").replace("\r", "\n")
@@ -876,7 +948,7 @@ def test_pipeline_runs_only_on_its_own_schedule():
 
 
 def test_pipeline_checkout_can_push_and_authenticate():
-    steps = load_pipeline()["steps"]
+    steps = pipeline_steps()
     checkout = steps[0]
     assert checkout["checkout"] == "self"
     # Pushing a new branch needs full history and the persisted credential.
@@ -885,7 +957,7 @@ def test_pipeline_checkout_can_push_and_authenticate():
 
 
 def test_pipeline_gates_every_writing_step_on_the_cadence_check():
-    steps = load_pipeline()["steps"]
+    steps = pipeline_steps()
     cadence = next(s for s in steps if s.get("displayName") == "Check cadence")
     assert "condition" not in cadence
     writing = [s for s in steps if s.get("displayName") != "Check cadence" and "script" in s]
@@ -895,7 +967,7 @@ def test_pipeline_gates_every_writing_step_on_the_cadence_check():
 
 
 def test_pipeline_masks_the_token_and_passes_it_to_the_script():
-    steps = load_pipeline()["steps"]
+    steps = pipeline_steps()
     extract = next(s for s in steps if "Read GitHub token" in s.get("displayName", ""))
     # issecret keeps the token out of every downstream log.
     assert "issecret=true" in extract["script"]
@@ -918,7 +990,7 @@ def test_pipeline_token_extraction_finds_the_repo_scoped_key(tmp_path):
     .extraheader), not org-wide. An earlier spike failed against a hardcoded
     org-wide key, so this extraction must discover it.
     """
-    steps = load_pipeline()["steps"]
+    steps = pipeline_steps()
     extract = next(s for s in steps if "Read GitHub token" in s.get("displayName", ""))
     sed_line = next(line for line in shell_script(extract).splitlines() if "extraheader" in line)
     sed_expression = sed_line.split("|", 1)[1].split("| head", 1)[0].strip()
@@ -948,7 +1020,7 @@ def test_pipeline_token_extraction_finds_the_repo_scoped_key(tmp_path):
 @pytest.mark.parametrize("reason", ["Schedule", "Manual"])
 def test_cadence_guard_selects_the_first_and_third_tuesday(tmp_path, reason):
     """Execute the pipeline's own bash guard for every Tuesday over three years."""
-    steps = load_pipeline()["steps"]
+    steps = pipeline_steps()
     guard = next(s for s in steps if s.get("displayName") == "Check cadence")
 
     start = datetime(2026, 1, 6, 7, 30, tzinfo=timezone.utc)
@@ -993,7 +1065,7 @@ def test_cadence_day_windows_cover_exactly_the_first_and_third_tuesday():
     Windows agent is one), so the shipped bounds are also parsed out of the
     script and checked here. A change to either window fails this test.
     """
-    steps = load_pipeline()["steps"]
+    steps = pipeline_steps()
     guard = next(s for s in steps if s.get("displayName") == "Check cadence")
     condition = next(
         line for line in guard["script"].splitlines() if 'elif [ "$DAY"' in line
@@ -1013,3 +1085,11 @@ def test_cadence_day_windows_cover_exactly_the_first_and_third_tuesday():
     # Exactly two per fully covered month, and always the 1st and 3rd.
     assert set(Counter((t.year, t.month) for t in selected).values()) == {2}
     assert set(Counter((t.day - 1) // 7 for t in selected)) == {0, 2}
+
+
+def test_pipeline_serializes_github_writers_with_an_environment_lock():
+    pipeline = load_pipeline()
+    assert pipeline["lockBehavior"] == "sequential"
+    deployment = pipeline["stages"][0]["jobs"][0]
+    assert deployment["deployment"] == "WriteVersionBumps"
+    assert deployment["environment"] == "mssql-rs-version-bump-writer"

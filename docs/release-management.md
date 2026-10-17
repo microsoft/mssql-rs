@@ -127,6 +127,12 @@ track entirely when a pull request on some *other* branch already proposes the
 same transitions. When no bump is needed, nothing is written. If a bump becomes
 unnecessary, close the pull request and its issue manually.
 
+Branch replacement uses `--force-with-lease` against the exact commit inspected
+by the job. A missing branch is confirmed with `git ls-remote`; network and
+server failures abort rather than being treated as an absent automation branch.
+This prevents a maintainer or overlapping run from being overwritten between
+inspection and push.
+
 Normal validation and review are still required before merging. The pipeline
 does not publish crates, merge anything, or change the release pipeline's
 existing version-stamping policy.
@@ -162,8 +168,11 @@ The YAML alone does nothing until a pipeline definition points at it:
 1. Create a new pipeline in the `mssql-rs` Azure DevOps project from the GitHub
    `microsoft/mssql-rs` repository using the `github.com_microsoft` service
    connection, with YAML path `.pipeline/bump-released-versions.yml`.
-2. Do not add a schedule in the pipeline settings UI.
-3. Run it manually once to confirm the credential extraction works.
+2. Add an **Exclusive lock** check to the
+   `mssql-rs-version-bump-writer` environment. The YAML's sequential lock
+   behavior then queues overlapping manual and scheduled runs.
+3. Do not add a schedule in the pipeline settings UI.
+4. Run it manually once to confirm the credential extraction works.
 
 The pipeline runs on a Microsoft-hosted `ubuntu-latest` agent. It only runs git
 and Python, so it does not need the private Rust pools, which require a separate
@@ -199,8 +208,11 @@ queries the public `mssql-rs_Public` feed for the exact clean version:
 
 Rerunning the worker for the same version after the clean NuGet package is
 published updates the existing automation pull request. Older release events
-never downgrade either pin, and a branch containing maintainer commits is left
-untouched.
+never downgrade either pin on `main` or on the pending automation branch. An
+unrelated `main` change does not rebase a pending PR when its two managed pins
+already have the requested values. A branch containing maintainer commits is
+left untouched, and all automation-owned replacements use an exact
+`--force-with-lease`.
 
 This YAML also requires a permanent pipeline definition after the change reaches
 `main`:
@@ -208,7 +220,9 @@ This YAML also requires a permanent pipeline definition after the change reaches
 1. Create a GitHub-backed pipeline named **Bump mssql-python Release Version**
    from `microsoft/mssql-rs` with the `github.com_microsoft` service connection.
 2. Set its YAML path to `.pipeline/bump-mssql-python-release.yml`.
-3. Run it manually with a published version to verify access to
+3. Add an **Exclusive lock** check to the
+   `mssql-python-release-bump-writer` environment.
+4. Run it manually with a published version to verify access to
    `microsoft/mssql-python`.
 
 The exact pipeline name is part of the release contract: pipeline 2332 resolves
