@@ -118,7 +118,10 @@ def test_rng_failure_publishes_no_outputs(monkeypatch, capsys, fail_call):
 
 
 @pytest.mark.parametrize("shell", ["bash", "pwsh"])
-@pytest.mark.parametrize("case", ["valid", "missing", "unresolved", "newline", "invalid-generation"])
+@pytest.mark.parametrize(
+    "case",
+    ["valid", "missing", "unresolved", "newline", "short", "long", "invalid-generation"],
+)
 @pytest.mark.parametrize("marker", ["", "1"])
 def test_import_validates_before_setting_marker(shell, case, marker):
     executable = BASH if shell == "bash" else PWSH
@@ -133,6 +136,10 @@ def test_import_validates_before_setting_marker(shell, case, marker):
         env["SHARED_SQL_PASSWORD"] = "$(SHARED_SQL_PASSWORD)"
     elif case == "newline":
         env["SHARED_SQL_PASSWORD"] += "\n"
+    elif case == "short":
+        env["SHARED_SQL_PASSWORD"] = password[:-1]
+    elif case == "long":
+        env["SHARED_SQL_PASSWORD"] = password + secrets.token_hex(1)[0]
     elif case == "invalid-generation":
         env["SQL_CREDENTIAL_GENERATION"] = "$(SQL_CREDENTIAL_GENERATION)"
     command = (
@@ -151,6 +158,8 @@ def test_import_validates_before_setting_marker(shell, case, marker):
         assert result.returncode != 0
         assert "task.setvariable" not in result.stdout
         assert password not in result.stdout + result.stderr
+        if case in ("short", "long"):
+            assert env["SHARED_SQL_PASSWORD"] not in result.stdout + result.stderr
 
 
 def evaluate(condition, context):
