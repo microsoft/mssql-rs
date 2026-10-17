@@ -210,8 +210,9 @@ def issue_body(version, changes, source_build_id):
         f"`{PYPI_NAME}` {version} was published by {source}. Update the "
         "`mssql-python` dependency pins that have matching released artifacts.\n\n"
         f"{lines}\n\n"
-        f"`{NUGET_PIN.as_posix()}` is changed only when the exact clean "
-        f"`{NUGET_NAME}` version is present in Azure Artifacts.\n"
+        f"`{NUGET_PIN.as_posix()}` advances only to a clean `{NUGET_NAME}` "
+        "version verified by this run, or retains a higher clean version already "
+        "pending on the automation branch.\n"
     )
 
 
@@ -276,8 +277,9 @@ def pull_request_body(root, issue_number, version, changes):
     detail = (
         f"Update released `{PYPI_NAME}` dependency pins to version `{version}`.\n\n"
         f"{summary}\n\n"
-        f"The NuGet pin changes only when `{NUGET_NAME} {version}` is already "
-        "available. This draft does not publish or merge anything."
+        f"The NuGet pin advances only when `{NUGET_NAME} {version}` is available, "
+        "or retains a higher clean version already pending in this draft. This "
+        "draft does not publish or merge anything."
     )
     return template.replace(placeholder, f"{placeholder}\n\n{detail}", 1)
 
@@ -345,9 +347,8 @@ def update_pull_request(root, version, changes, source_build_id):
         for path, value in base_versions.items()
     }
     remote_versions = remote_pin_versions(root, remote_commit) if exists else None
-    if remote_versions and any(
-        version_tuple(value) > version_tuple(version)
-        for value in remote_versions.values()
+    if remote_versions and version_tuple(remote_versions[PYPI_PIN]) > version_tuple(
+        version
     ):
         number = existing[0]["number"] if existing else None
         print(
@@ -355,9 +356,19 @@ def update_pull_request(root, version, changes, source_build_id):
         )
         return number
 
-    issue_number = ensure_issue(version, changes, source_build_id)
+    if remote_versions:
+        for path, pending in remote_versions.items():
+            if version_tuple(pending) > version_tuple(desired[path]):
+                desired[path] = pending
+    effective_changes = {
+        path: (base_value, desired[path])
+        for path, base_value in base_versions.items()
+        if base_value != desired[path]
+    }
+
+    issue_number = ensure_issue(version, effective_changes, source_build_id)
     title = f"CHORE: Update {PYPI_NAME} dependency to {version}"
-    body = pull_request_body(root, issue_number, version, changes)
+    body = pull_request_body(root, issue_number, version, effective_changes)
     if remote_versions == desired:
         print(f"{BRANCH} already contains these dependency versions.")
     else:

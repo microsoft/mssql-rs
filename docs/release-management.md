@@ -214,6 +214,12 @@ already have the requested values. A branch containing maintainer commits is
 left untouched, and all automation-owned replacements use an exact
 `--force-with-lease`.
 
+If a newer PyPI release arrives while the pending automation PR already carries
+a clean NuGet upgrade from an earlier run, the worker advances the PyPI pin and
+retains that higher pending NuGet pin. The regenerated issue and PR summaries
+show both transitions relative to `main`; a PyPI-only event never rolls back an
+already verified clean NuGet package.
+
 This YAML also requires a permanent pipeline definition after the change reaches
 `main`:
 
