@@ -176,6 +176,10 @@ def test_maintainer_owned_branch_is_not_modified(tmp_path):
             subprocess.CompletedProcess("git", 0, stdout="base\n"),
         ]
     ), patch.object(
+        bump,
+        "remote_pin_versions",
+        return_value={bump.PYPI_PIN: "0.3.0", bump.NUGET_PIN: "0.3.0"},
+    ), patch.object(
         bump, "remote_branch_state", return_value=(True, "their-sha", False)
     ), patch.object(
         bump, "github_paged", return_value=[{"number": 99}]
@@ -218,7 +222,10 @@ def test_stale_event_does_not_replace_newer_pending_pins(tmp_path):
     ), patch.object(
         bump,
         "remote_pin_versions",
-        return_value={bump.PYPI_PIN: "0.5.0", bump.NUGET_PIN: "0.5.0"},
+        side_effect=[
+            {bump.PYPI_PIN: "0.3.0", bump.NUGET_PIN: "0.3.0"},
+            {bump.PYPI_PIN: "0.5.0", bump.NUGET_PIN: "0.5.0"},
+        ],
     ), patch.object(
         bump, "github_paged", return_value=[{"number": 99}]
     ), patch.object(bump, "ensure_issue") as issue:
@@ -249,7 +256,10 @@ def test_matching_pending_pins_do_not_rebase_for_unrelated_main_changes(tmp_path
     ), patch.object(
         bump,
         "remote_pin_versions",
-        return_value={bump.PYPI_PIN: "0.4.0", bump.NUGET_PIN: "0.3.0"},
+        side_effect=[
+            {bump.PYPI_PIN: "0.3.0", bump.NUGET_PIN: "0.3.0"},
+            {bump.PYPI_PIN: "0.4.0", bump.NUGET_PIN: "0.3.0"},
+        ],
     ), patch.object(
         bump, "github_paged", return_value=[{"number": 99}]
     ), patch.object(
@@ -281,7 +291,10 @@ def test_changed_pending_pins_use_inspected_sha_as_push_lease(tmp_path):
     ), patch.object(
         bump,
         "remote_pin_versions",
-        return_value={bump.PYPI_PIN: "0.4.0", bump.NUGET_PIN: "0.3.0"},
+        side_effect=[
+            {bump.PYPI_PIN: "0.3.0", bump.NUGET_PIN: "0.3.0"},
+            {bump.PYPI_PIN: "0.4.0", bump.NUGET_PIN: "0.3.0"},
+        ],
     ), patch.object(
         bump, "github_paged", return_value=[{"number": 99}]
     ), patch.object(
@@ -304,6 +317,37 @@ def test_changed_pending_pins_use_inspected_sha_as_push_lease(tmp_path):
         "origin",
         f"{bump.BRANCH}:refs/heads/{bump.BRANCH}",
     ) in calls
+
+
+def test_main_pin_change_during_planning_aborts_before_writing(tmp_path):
+    target_repo(tmp_path)
+    with patch.object(
+        bump,
+        "git",
+        side_effect=[
+            subprocess.CompletedProcess("git", 0),
+            subprocess.CompletedProcess("git", 0, stdout="new-base\n"),
+        ],
+    ), patch.object(
+        bump,
+        "remote_pin_versions",
+        return_value={bump.PYPI_PIN: "0.5.0", bump.NUGET_PIN: "0.5.0"},
+    ), patch.object(bump, "remote_branch_state") as branch, patch.object(
+        bump, "github_paged"
+    ) as pulls, patch.object(bump, "ensure_issue") as issue:
+        with pytest.raises(RuntimeError, match="changed dependency pins"):
+            bump.update_pull_request(
+                tmp_path,
+                "0.4.0",
+                {
+                    bump.PYPI_PIN: ("0.3.0", "0.4.0"),
+                    bump.NUGET_PIN: ("0.3.0", "0.4.0"),
+                },
+                "123",
+            )
+    branch.assert_not_called()
+    pulls.assert_not_called()
+    issue.assert_not_called()
 
 
 def test_worker_pipeline_is_manual_and_uses_persisted_github_credential():
