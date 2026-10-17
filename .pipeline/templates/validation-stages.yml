@@ -354,6 +354,18 @@ stages:
         displayName: Test GHCR parameter handling (Linux)
         env:
           GHCR_TEST_REQUIRE_BASH: '1'
+      - bash: |
+          set -euo pipefail
+          python3 -m pip install --quiet pytest pyyaml
+          python3 -m pytest \
+            scripts/test_bump_released_versions.py::test_required_bash_oracles_have_usable_bash \
+            scripts/test_bump_released_versions.py::test_pipeline_token_extraction_finds_the_repo_scoped_key \
+            scripts/test_bump_released_versions.py::test_cadence_guard_selects_the_first_and_third_tuesday \
+            scripts/test_bump_mssql_python_release.py::test_worker_token_extraction_finds_the_repo_scoped_key \
+            -q
+        displayName: Test release automation Bash oracles
+        env:
+          REQUIRE_BASH_ORACLES: '1'
       - template: build-template-container.yml
         parameters:
           architecture: x64

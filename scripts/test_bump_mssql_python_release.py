@@ -1,10 +1,12 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
+import base64
 import importlib.util
 import io
 import json
 import os
+import shutil
 import subprocess
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -21,6 +23,25 @@ bump = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(bump)
 PIPELINE = ROOT / ".pipeline" / "bump-mssql-python-release.yml"
 PYPI_RELEASE = ROOT / ".pipeline" / "OneBranch" / "PyPIRelease.yml"
+
+
+def _working_bash():
+    path = shutil.which("bash")
+    if not path:
+        return None
+    try:
+        probe = subprocess.run(
+            [path, "-c", 'V=ok; printf "%s" "$V"'],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return path if probe.returncode == 0 and probe.stdout.strip() == "ok" else None
+
+
+BASH = _working_bash()
 
 
 @pytest.fixture(autouse=True)
@@ -60,6 +81,10 @@ def target_repo(tmp_path, python="0.3.0", nuget="0.3.0"):
 def worker_steps(pipeline):
     deployment = pipeline["stages"][0]["jobs"][0]
     return deployment["strategy"]["runOnce"]["deploy"]["steps"]
+
+
+def shell_script(step):
+    return step["script"].replace("\r\n", "\n").replace("\r", "\n")
 
 
 @pytest.mark.parametrize(
@@ -405,6 +430,49 @@ def test_worker_pipeline_is_manual_and_uses_persisted_github_credential():
     assert worker["env"]["RELEASED_VERSION"] == "${{ parameters.releasedVersion }}"
     assert worker["env"]["MSSQL_PYTHON_REPOSITORY"] == "microsoft/mssql-python"
     assert worker["env"]["DEFAULT_BRANCH"] == "main"
+
+
+@pytest.mark.skipif(BASH is None, reason="Bash is required")
+def test_worker_token_extraction_finds_the_repo_scoped_key(tmp_path):
+    pipeline = yaml.safe_load(PIPELINE.read_text(encoding="utf-8"))
+    extract = next(
+        step
+        for step in worker_steps(pipeline)
+        if step.get("displayName") == "Read GitHub token from checkout credentials"
+    )
+
+    token = "ghs_worker_token"
+    encoded = base64.b64encode(f"x-access-token:{token}".encode()).decode()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(
+        [
+            "git",
+            "config",
+            "--local",
+            "http.https://github.com/microsoft/mssql-rs.extraheader",
+            f"AUTHORIZATION: basic {encoded}",
+        ],
+        cwd=repo,
+        check=True,
+    )
+    result = subprocess.run(
+        [BASH, "-c", shell_script(extract)],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert (
+        f"##vso[task.setvariable variable=ghToken;issecret=true]{token}"
+        in result.stdout
+    )
+    assert (
+        "Extracted GitHub token from "
+        "http.https://github.com/microsoft/mssql-rs.extraheader."
+        in result.stdout
+    )
 
 
 def test_worker_serializes_github_writers_with_an_environment_lock():
