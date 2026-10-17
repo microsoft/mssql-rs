@@ -1,14 +1,14 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
+import base64
 import importlib.util
 import io
 import json
+import os
 import re
-import shlex
 import shutil
 import subprocess
-import base64
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -50,6 +50,11 @@ def _working_bash():
 
 
 BASH = _working_bash()
+
+
+def test_required_bash_oracles_have_usable_bash():
+    if os.environ.get("REQUIRE_BASH_ORACLES") == "1":
+        assert BASH is not None, "This validation lane must provide a functional bash"
 
 
 @pytest.fixture(autouse=True)
@@ -984,36 +989,41 @@ def test_pipeline_masks_the_token_and_passes_it_to_the_script():
 
 @pytest.mark.skipif(BASH is None, reason="Bash is required")
 def test_pipeline_token_extraction_finds_the_repo_scoped_key(tmp_path):
-    """Run the real sed against real `git config --list` output.
-
-    The credential key is repo-scoped (http.https://github.com/microsoft/mssql-rs
-    .extraheader), not org-wide. An earlier spike failed against a hardcoded
-    org-wide key, so this extraction must discover it.
-    """
     steps = pipeline_steps()
     extract = next(s for s in steps if "Read GitHub token" in s.get("displayName", ""))
-    sed_line = next(line for line in shell_script(extract).splitlines() if "extraheader" in line)
-    sed_expression = sed_line.split("|", 1)[1].split("| head", 1)[0].strip()
 
     token = "ghs_realtokenvalue"
-    header = f"AUTHORIZATION: basic {base64.b64encode(f'x-access-token:{token}'.encode()).decode()}"
-    config = "\n".join([
-        "http.version=HTTP/1.1",
-        f"http.https://github.com/microsoft/mssql-rs.extraheader={header}",
-        "user.name=someone",
-    ])
-    script = f"""
-    set -euo pipefail
-    KEY="$(printf '%s\\n' {shlex.quote(config)} | {sed_expression} | head -n1)"
-    echo "KEY=$KEY"
-    HEADER={shlex.quote(header)}
-    DECODED="$(printf '%s' "${{HEADER##* }}" | base64 -d)"
-    echo "TOKEN=${{DECODED#*:}}"
-    """
-    result = subprocess.run([BASH, "-c", script], capture_output=True, text=True)
+    encoded = base64.b64encode(f"x-access-token:{token}".encode()).decode()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(
+        [
+            "git",
+            "config",
+            "--local",
+            "http.https://github.com/microsoft/mssql-rs.extraheader",
+            f"AUTHORIZATION: basic {encoded}",
+        ],
+        cwd=repo,
+        check=True,
+    )
+    result = subprocess.run(
+        [BASH, "-c", shell_script(extract)],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+    )
     assert result.returncode == 0, result.stderr
-    assert "KEY=http.https://github.com/microsoft/mssql-rs.extraheader" in result.stdout
-    assert f"TOKEN={token}" in result.stdout
+    assert (
+        f"##vso[task.setvariable variable=ghToken;issecret=true]{token}"
+        in result.stdout
+    )
+    assert (
+        "Extracted GitHub token from "
+        "http.https://github.com/microsoft/mssql-rs.extraheader."
+        in result.stdout
+    )
 
 
 @pytest.mark.skipif(BASH is None, reason="Bash is required")
