@@ -7,6 +7,7 @@
 //! connection-level "busy" claim, allowing other statements on the same DBC
 //! to execute.
 
+use std::sync::MutexGuard;
 use tracing::{debug, error};
 
 use super::sqlstate::*;
@@ -14,7 +15,7 @@ use crate::api::odbc_types::{
     SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle, SqlReturn,
 };
 use crate::error::free_errors;
-use crate::handles::stmt::{STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT};
+use crate::handles::stmt::{STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT, StmtState};
 use crate::handles::{HandleType, StmtHandle, handle_from_raw, process_is_shutting_down};
 
 /// Closes the cursor on `statement_handle` and discards any pending rows.
@@ -131,22 +132,45 @@ fn sql_free_stmt_close_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> S
         Ok(operation) => operation,
         Err(rc) => return rc,
     };
-    let Ok(mut stmt_state) = stmt.inner.lock() else {
+    let Ok(stmt_state) = stmt.inner.lock() else {
         error!("SQLFreeStmt(SQL_CLOSE): stmt mutex poisoned");
         return SQL_ERROR;
     };
+    free_stmt_close_locked(statement_handle, stmt, stmt_state, false)
+}
+
+/// The caller retains an operation or cancellation guard through the drain.
+/// SQLCancel must not begin another operation while holding its cancellation fence.
+pub(super) fn free_stmt_close_locked(
+    statement_handle: SqlHandle,
+    stmt: &StmtHandle,
+    mut stmt_state: MutexGuard<'_, StmtState>,
+    cancel_pending: bool,
+) -> SqlReturn {
     free_errors(&mut stmt_state);
     // No-op if cursor is already closed.
     if !stmt_state.has_state(STMT_STATE_CURSOR_OPEN) {
         return SQL_SUCCESS;
     }
 
+    // An exhausted response has already released the client to other DBC calls.
+    // Parameter arrays still need their completion status published on close.
+    let needs_drain = !stmt_state.batch_exhausted || stmt_state.parameter_array.is_some();
     // See the identical comment in sql_close_cursor_safe.
     let pending_fetch_error = stmt_state.pending_fetch_error.take();
     reset_cursor_state(&mut stmt_state);
     drop(stmt_state);
 
-    let outcome = drain_and_release(stmt, statement_handle);
+    let outcome = if needs_drain {
+        drain_and_release_inner(
+            stmt,
+            statement_handle,
+            process_is_shutting_down(),
+            cancel_pending,
+        )
+    } else {
+        DrainOutcome::Clean
+    };
     if let Some(e) = pending_fetch_error {
         if let Ok(mut stmt_state) = stmt.inner.lock() {
             post_tds_error(&mut stmt_state, &e, SQLSTATE_HY000);
@@ -256,7 +280,7 @@ pub(super) enum DrainOutcome {
 /// that surfaced server INFO messages, and — importantly — from a drain failure,
 /// which must not be reported to the app as success.
 pub(super) fn drain_and_release(stmt: &StmtHandle, statement_handle: SqlHandle) -> DrainOutcome {
-    drain_and_release_inner(stmt, statement_handle, process_is_shutting_down())
+    drain_and_release_inner(stmt, statement_handle, process_is_shutting_down(), false)
 }
 
 /// The body of [`drain_and_release`], with the loader's shutdown flag passed in
@@ -267,11 +291,12 @@ fn drain_and_release_inner(
     stmt: &StmtHandle,
     statement_handle: SqlHandle,
     process_is_shutting_down: bool,
+    cancel_pending: bool,
 ) -> DrainOutcome {
     let dbc = stmt.parent_dbc();
 
     // Take the client; intentionally leave active_stmt set while draining.
-    let client = {
+    let (client, cancel_timeout, owns_wire) = {
         let Ok(mut dbc_state) = dbc.inner.lock() else {
             error!("drain_and_release: dbc mutex poisoned");
             return DrainOutcome::Failed;
@@ -286,7 +311,15 @@ fn drain_and_release_inner(
         // is the ordinary case and proceeds as before.
         match dbc_state.active_stmt {
             Some(other) if other != statement_handle => return DrainOutcome::Clean,
-            _ => dbc_state.client.take(),
+            _ => (
+                dbc_state.client.take(),
+                if dbc_state.connection_timeout == 0 {
+                    120
+                } else {
+                    dbc_state.connection_timeout
+                },
+                dbc_state.active_stmt == Some(statement_handle),
+            ),
         }
     };
 
@@ -319,7 +352,12 @@ fn drain_and_release_inner(
         return DrainOutcome::Clean;
     }
 
-    if let Err(e) = dbc.runtime.block_on(client.close_query()) {
+    let close_result = if cancel_pending && owns_wire && client.has_open_batch() {
+        dbc.runtime.block_on(client.cancel_query(cancel_timeout))
+    } else {
+        dbc.runtime.block_on(client.close_query())
+    };
+    if let Err(e) = close_result {
         error!(%e, "drain_and_release: failed to drain TDS stream — connection may be broken");
         // Surface the failure as a diagnostic so the app is not told the close
         // succeeded when the stream did not drain cleanly.
@@ -597,6 +635,7 @@ mod tests {
             unsafe { handle_from_raw::<StmtHandle>(h.stmt) },
             h.stmt,
             true,
+            false,
         );
 
         assert!(
@@ -641,6 +680,7 @@ mod tests {
         let _ = drain_and_release_inner(
             unsafe { handle_from_raw::<StmtHandle>(h.stmt) },
             h.stmt,
+            false,
             false,
         );
 
