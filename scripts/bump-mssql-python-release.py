@@ -226,10 +226,16 @@ def ensure_issue(version, changes, source_build_id):
     if len(matches) > 1:
         raise ValueError(f"Multiple open {ISSUE_LABEL} issues; resolve them manually")
     body = issue_body(version, changes, source_build_id)
+    title = f"Update {PYPI_NAME} dependency to {version}"
     if matches:
         number = matches[0]["number"]
+        update = {}
+        if matches[0].get("title") != title:
+            update["title"] = title
         if matches[0].get("body") != body:
-            github_api("PATCH", f"/repos/{repo}/issues/{number}", {"body": body})
+            update["body"] = body
+        if update:
+            github_api("PATCH", f"/repos/{repo}/issues/{number}", update)
         return number
 
     github_api(
@@ -246,7 +252,7 @@ def ensure_issue(version, changes, source_build_id):
         "POST",
         f"/repos/{repo}/issues",
         {
-            "title": f"Update {PYPI_NAME} dependency to {version}",
+            "title": title,
             "body": body,
             "labels": [ISSUE_LABEL],
         },
@@ -279,14 +285,34 @@ def pull_request_body(root, issue_number, version, changes):
 def remote_branch_state(root, base_sha):
     fetched = git(root, "fetch", "--quiet", "origin", BRANCH, check=False)
     if fetched.returncode != 0:
-        return False, None, True
-    tree = git(root, "rev-parse", "FETCH_HEAD^{tree}").stdout.strip()
+        probe = git(
+            root,
+            "ls-remote",
+            "--exit-code",
+            "origin",
+            f"refs/heads/{BRANCH}",
+            check=False,
+        )
+        if probe.returncode == 2 and not probe.stdout.strip():
+            return False, None, True
+        detail = (fetched.stderr or probe.stderr).strip()
+        raise RuntimeError(f"Could not inspect origin/{BRANCH}: {detail}")
+    commit = git(root, "rev-parse", "FETCH_HEAD").stdout.strip()
     commits = git(root, "rev-list", f"{base_sha}..FETCH_HEAD").stdout.split()
     committer = git(root, "log", "-1", "--format=%cn", "FETCH_HEAD").stdout.strip()
     owned = len(commits) <= 1 and committer == os.environ.get(
         "GIT_COMMITTER_NAME", "Azure Pipelines"
     )
-    return True, tree, owned
+    return True, commit, owned
+
+
+def remote_pin_versions(root, commit):
+    versions = {}
+    for path in (PYPI_PIN, NUGET_PIN):
+        value = git(root, "show", f"{commit}:{path.as_posix()}").stdout.strip()
+        version_tuple(value)
+        versions[path] = value
+    return versions
 
 
 def update_pull_request(root, version, changes, source_build_id):
@@ -295,7 +321,7 @@ def update_pull_request(root, version, changes, source_build_id):
     owner = repo.split("/", 1)[0]
     git(root, "fetch", "--quiet", "origin", base)
     base_sha = git(root, "rev-parse", "FETCH_HEAD").stdout.strip()
-    exists, remote_tree, owned = remote_branch_state(root, base_sha)
+    exists, remote_commit, owned = remote_branch_state(root, base_sha)
     existing = github_paged(
         f"/repos/{repo}/pulls?state=open&base={base}&head={owner}:{BRANCH}"
     )
@@ -308,20 +334,41 @@ def update_pull_request(root, version, changes, source_build_id):
         )
         return number
 
+    current = {path: read_pin(root, path) for path in (PYPI_PIN, NUGET_PIN)}
+    desired = {
+        path: changes.get(path, (value, value))[1] for path, value in current.items()
+    }
+    remote_versions = remote_pin_versions(root, remote_commit) if exists else None
+    if remote_versions and any(
+        version_tuple(value) > version_tuple(version)
+        for value in remote_versions.values()
+    ):
+        number = existing[0]["number"] if existing else None
+        print(
+            f"Ignoring stale release {version}: {BRANCH} already carries newer pins."
+        )
+        return number
+
     issue_number = ensure_issue(version, changes, source_build_id)
     title = f"CHORE: Update {PYPI_NAME} dependency to {version}"
     body = pull_request_body(root, issue_number, version, changes)
-    git(root, "switch", "--discard-changes", "--force-create", BRANCH, base_sha)
-    for path, (_old, new) in changes.items():
-        write_pin(root, path, new)
-    paths = [path.as_posix() for path in changes]
-    git(root, "add", "--", *paths)
-    git(root, "commit", "--message", f"Update {PYPI_NAME} dependency to {version}")
-    local_tree = git(root, "rev-parse", "HEAD^{tree}").stdout.strip()
-    if local_tree == remote_tree:
+    if remote_versions == desired:
         print(f"{BRANCH} already contains these dependency versions.")
     else:
-        git(root, "push", "--force", "origin", f"{BRANCH}:refs/heads/{BRANCH}")
+        git(root, "switch", "--discard-changes", "--force-create", BRANCH, base_sha)
+        for path, value in desired.items():
+            write_pin(root, path, value)
+        paths = [path.as_posix() for path in desired]
+        git(root, "add", "--", *paths)
+        git(root, "commit", "--message", f"Update {PYPI_NAME} dependency to {version}")
+        expected = remote_commit if exists else ""
+        git(
+            root,
+            "push",
+            f"--force-with-lease=refs/heads/{BRANCH}:{expected}",
+            "origin",
+            f"{BRANCH}:refs/heads/{BRANCH}",
+        )
 
     if existing:
         number = existing[0]["number"]

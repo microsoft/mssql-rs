@@ -57,6 +57,11 @@ def target_repo(tmp_path, python="0.3.0", nuget="0.3.0"):
     return tmp_path
 
 
+def worker_steps(pipeline):
+    deployment = pipeline["stages"][0]["jobs"][0]
+    return deployment["strategy"]["runOnce"]["deploy"]["steps"]
+
+
 @pytest.mark.parametrize(
     ("current_python", "current_nuget", "available", "expected"),
     [
@@ -135,6 +140,34 @@ def test_pr_body_preserves_template_and_links_issue(tmp_path):
     assert "`eng/versions/mssql-python-rs.version`: `0.3.0` -> `0.4.0`" in body
 
 
+def test_reused_issue_title_tracks_the_latest_release():
+    existing = {
+        "number": 42,
+        "title": "Update mssql-python-rs dependency to 0.3.0",
+        "body": f"{bump.ISSUE_MARKER}\n\nold body",
+    }
+    with patch.object(bump, "github_paged", return_value=[existing]), patch.object(
+        bump, "github_api", return_value=(200, {})
+    ) as api:
+        assert bump.ensure_issue(
+            "0.4.0",
+            {bump.PYPI_PIN: ("0.3.0", "0.4.0")},
+            "123",
+        ) == 42
+    assert api.call_args.args == (
+        "PATCH",
+        "/repos/microsoft/mssql-python/issues/42",
+        {
+            "title": "Update mssql-python-rs dependency to 0.4.0",
+            "body": bump.issue_body(
+                "0.4.0",
+                {bump.PYPI_PIN: ("0.3.0", "0.4.0")},
+                "123",
+            ),
+        },
+    )
+
+
 def test_maintainer_owned_branch_is_not_modified(tmp_path):
     target_repo(tmp_path)
     with patch.object(
@@ -143,7 +176,7 @@ def test_maintainer_owned_branch_is_not_modified(tmp_path):
             subprocess.CompletedProcess("git", 0, stdout="base\n"),
         ]
     ), patch.object(
-        bump, "remote_branch_state", return_value=(True, "tree", False)
+        bump, "remote_branch_state", return_value=(True, "their-sha", False)
     ), patch.object(
         bump, "github_paged", return_value=[{"number": 99}]
     ), patch.object(bump, "ensure_issue") as issue:
@@ -157,19 +190,144 @@ def test_maintainer_owned_branch_is_not_modified(tmp_path):
     assert (tmp_path / bump.PYPI_PIN).read_text() == "0.3.0"
 
 
+def test_missing_remote_branch_is_distinguished_from_fetch_failure(tmp_path):
+    missing = subprocess.CompletedProcess("git", 128, stdout="", stderr="missing")
+    absent = subprocess.CompletedProcess("git", 2, stdout="", stderr="")
+    with patch.object(bump, "git", side_effect=[missing, absent]):
+        assert bump.remote_branch_state(tmp_path, "base") == (False, None, True)
+
+
+def test_remote_branch_transport_failure_propagates(tmp_path):
+    failure = subprocess.CompletedProcess("git", 128, stdout="", stderr="network down")
+    with patch.object(bump, "git", side_effect=[failure, failure]):
+        with pytest.raises(RuntimeError, match="network down"):
+            bump.remote_branch_state(tmp_path, "base")
+
+
+def test_stale_event_does_not_replace_newer_pending_pins(tmp_path):
+    target_repo(tmp_path)
+    with patch.object(
+        bump,
+        "git",
+        side_effect=[
+            subprocess.CompletedProcess("git", 0),
+            subprocess.CompletedProcess("git", 0, stdout="base\n"),
+        ],
+    ), patch.object(
+        bump, "remote_branch_state", return_value=(True, "pending-sha", True)
+    ), patch.object(
+        bump,
+        "remote_pin_versions",
+        return_value={bump.PYPI_PIN: "0.5.0", bump.NUGET_PIN: "0.5.0"},
+    ), patch.object(
+        bump, "github_paged", return_value=[{"number": 99}]
+    ), patch.object(bump, "ensure_issue") as issue:
+        assert bump.update_pull_request(
+            tmp_path,
+            "0.4.0",
+            {
+                bump.PYPI_PIN: ("0.3.0", "0.4.0"),
+                bump.NUGET_PIN: ("0.3.0", "0.4.0"),
+            },
+            "123",
+        ) == 99
+    issue.assert_not_called()
+
+
+def test_matching_pending_pins_do_not_rebase_for_unrelated_main_changes(tmp_path):
+    target_repo(tmp_path)
+    calls = []
+
+    def git_call(root, *args, **kwargs):
+        calls.append(args)
+        if args == ("rev-parse", "FETCH_HEAD"):
+            return subprocess.CompletedProcess("git", 0, stdout="base\n")
+        return subprocess.CompletedProcess("git", 0, stdout="")
+
+    with patch.object(bump, "git", side_effect=git_call), patch.object(
+        bump, "remote_branch_state", return_value=(True, "pending-sha", True)
+    ), patch.object(
+        bump,
+        "remote_pin_versions",
+        return_value={bump.PYPI_PIN: "0.4.0", bump.NUGET_PIN: "0.3.0"},
+    ), patch.object(
+        bump, "github_paged", return_value=[{"number": 99}]
+    ), patch.object(
+        bump, "ensure_issue", return_value=42
+    ), patch.object(
+        bump, "github_api", return_value=(200, {})
+    ):
+        assert bump.update_pull_request(
+            tmp_path,
+            "0.4.0",
+            {bump.PYPI_PIN: ("0.3.0", "0.4.0")},
+            "123",
+        ) == 99
+    assert not any(args[0] in {"switch", "commit", "push"} for args in calls)
+
+
+def test_changed_pending_pins_use_inspected_sha_as_push_lease(tmp_path):
+    target_repo(tmp_path)
+    calls = []
+
+    def git_call(root, *args, **kwargs):
+        calls.append(args)
+        if args == ("rev-parse", "FETCH_HEAD"):
+            return subprocess.CompletedProcess("git", 0, stdout="base\n")
+        return subprocess.CompletedProcess("git", 0, stdout="")
+
+    with patch.object(bump, "git", side_effect=git_call), patch.object(
+        bump, "remote_branch_state", return_value=(True, "pending-sha", True)
+    ), patch.object(
+        bump,
+        "remote_pin_versions",
+        return_value={bump.PYPI_PIN: "0.4.0", bump.NUGET_PIN: "0.3.0"},
+    ), patch.object(
+        bump, "github_paged", return_value=[{"number": 99}]
+    ), patch.object(
+        bump, "ensure_issue", return_value=42
+    ), patch.object(
+        bump, "github_api", return_value=(200, {})
+    ):
+        bump.update_pull_request(
+            tmp_path,
+            "0.4.0",
+            {
+                bump.PYPI_PIN: ("0.3.0", "0.4.0"),
+                bump.NUGET_PIN: ("0.3.0", "0.4.0"),
+            },
+            "123",
+        )
+    assert (
+        "push",
+        f"--force-with-lease=refs/heads/{bump.BRANCH}:pending-sha",
+        "origin",
+        f"{bump.BRANCH}:refs/heads/{bump.BRANCH}",
+    ) in calls
+
+
 def test_worker_pipeline_is_manual_and_uses_persisted_github_credential():
     pipeline = yaml.safe_load(PIPELINE.read_text(encoding="utf-8"))
     assert pipeline["trigger"] == "none"
     assert pipeline["pr"] == "none"
-    checkout = next(step for step in pipeline["steps"] if step.get("checkout") == "self")
+    steps = worker_steps(pipeline)
+    checkout = next(step for step in steps if step.get("checkout") == "self")
     assert checkout["persistCredentials"] is True
     worker = next(
-        step for step in pipeline["steps"]
+        step for step in steps
         if step.get("displayName") == "Open mssql-python dependency update pull request"
     )
     assert worker["env"]["RELEASED_VERSION"] == "${{ parameters.releasedVersion }}"
     assert worker["env"]["MSSQL_PYTHON_REPOSITORY"] == "microsoft/mssql-python"
     assert worker["env"]["DEFAULT_BRANCH"] == "main"
+
+
+def test_worker_serializes_github_writers_with_an_environment_lock():
+    pipeline = yaml.safe_load(PIPELINE.read_text(encoding="utf-8"))
+    assert pipeline["lockBehavior"] == "sequential"
+    deployment = pipeline["stages"][0]["jobs"][0]
+    assert deployment["deployment"] == "UpdateMssqlPython"
+    assert deployment["environment"] == "mssql-python-release-bump-writer"
 
 
 def test_pypi_release_queues_worker_only_after_real_publish():

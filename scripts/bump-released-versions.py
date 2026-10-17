@@ -438,26 +438,34 @@ def automation_committer():
 def remote_branch_state(root, branch, base_sha):
     """Inspect origin/<branch>.
 
-    Returns (exists, tree, owned). ``owned`` is False when a maintainer has
-    pushed to the branch: either more than the single automation commit sits on
-    top of the base, or the tip was committed by someone else. The generated PR
-    body invites maintainers to push a different release version, so automation
-    must not overwrite that.
+    Returns (exists, commit, tree, owned). A failed fetch is not evidence that
+    the branch is absent: ls-remote must confirm that separately. ``owned`` is
+    False when a maintainer has pushed to the branch.
     """
-    if git_try(root, "fetch", "--quiet", "origin", branch).returncode != 0:
-        return False, None, True
+    fetched = git_try(root, "fetch", "--quiet", "origin", branch)
+    if fetched.returncode != 0:
+        probe = git_try(
+            root, "ls-remote", "--exit-code", "origin", f"refs/heads/{branch}"
+        )
+        if probe.returncode == 2 and not probe.stdout.strip():
+            return False, None, None, True
+        detail = (fetched.stderr or probe.stderr).strip()
+        raise RuntimeError(f"Could not inspect origin/{branch}: {detail}")
+    commit = git(root, "rev-parse", "FETCH_HEAD").strip()
     tree = git(root, "rev-parse", "FETCH_HEAD^{tree}").strip()
     commits = git(root, "rev-list", f"{base_sha}..FETCH_HEAD").split()
     committer = git(root, "log", "-1", "--format=%cn", "FETCH_HEAD").strip()
     owned = len(commits) <= 1 and committer == automation_committer()
-    return True, tree, owned
+    return True, commit, tree, owned
 
 
 def open_bump_pr(root, branch, base_sha, title, body, apply_changes):
     repo = repository()
     base = os.environ["DEFAULT_BRANCH"]
     owner = repo.split("/")[0]
-    exists, remote_tree, owned = remote_branch_state(root, branch, base_sha)
+    exists, remote_commit, remote_tree, owned = remote_branch_state(
+        root, branch, base_sha
+    )
     existing = github_paged(
         f"/repos/{repo}/pulls?state=open&base={base}&head={owner}:{branch}"
     )
@@ -484,7 +492,14 @@ def open_bump_pr(root, branch, base_sha, title, body, apply_changes):
     if remote_tree == git(root, "rev-parse", "HEAD^{tree}").strip():
         print(f"{branch} already has these versions; leaving it untouched.")
     else:
-        git(root, "push", "--force", "origin", f"{branch}:refs/heads/{branch}")
+        expected = remote_commit if exists else ""
+        git(
+            root,
+            "push",
+            f"--force-with-lease=refs/heads/{branch}:{expected}",
+            "origin",
+            f"{branch}:refs/heads/{branch}",
+        )
 
     if existing:
         number = existing[0]["number"]
