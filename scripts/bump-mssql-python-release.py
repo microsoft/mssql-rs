@@ -319,8 +319,14 @@ def update_pull_request(root, version, changes, source_build_id):
     repo = repository()
     base = os.environ.get("DEFAULT_BRANCH", "main")
     owner = repo.split("/", 1)[0]
+    planned_from = {path: read_pin(root, path) for path in (PYPI_PIN, NUGET_PIN)}
     git(root, "fetch", "--quiet", "origin", base)
     base_sha = git(root, "rev-parse", "FETCH_HEAD").stdout.strip()
+    base_versions = remote_pin_versions(root, base_sha)
+    if base_versions != planned_from:
+        raise RuntimeError(
+            f"origin/{base} changed dependency pins while this run was planning; rerun it"
+        )
     exists, remote_commit, owned = remote_branch_state(root, base_sha)
     existing = github_paged(
         f"/repos/{repo}/pulls?state=open&base={base}&head={owner}:{BRANCH}"
@@ -334,9 +340,9 @@ def update_pull_request(root, version, changes, source_build_id):
         )
         return number
 
-    current = {path: read_pin(root, path) for path in (PYPI_PIN, NUGET_PIN)}
     desired = {
-        path: changes.get(path, (value, value))[1] for path, value in current.items()
+        path: changes.get(path, (value, value))[1]
+        for path, value in base_versions.items()
     }
     remote_versions = remote_pin_versions(root, remote_commit) if exists else None
     if remote_versions and any(
