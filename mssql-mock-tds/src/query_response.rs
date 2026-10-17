@@ -4,7 +4,7 @@
 //! Query response definitions for the mock TDS server
 
 use bytes::{BufMut, BytesMut};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 /// SQL data types supported by the mock server
@@ -349,6 +349,25 @@ impl QueryResponse {
     }
 }
 
+/// A result set that follows a registered response's first result set; see
+/// [`QueryRegistry::register_result_sets`].
+#[derive(Debug, Clone)]
+pub struct ResultSetResponse {
+    pub response: QueryResponse,
+    /// Raw DATACLASSIFICATION (`0xA3`) token bytes sent after this set's
+    /// ColMetadata; empty for an unclassified set.
+    pub data_classification: Vec<u8>,
+}
+
+impl ResultSetResponse {
+    pub fn new(response: QueryResponse, data_classification: Vec<u8>) -> Self {
+        Self {
+            response,
+            data_classification,
+        }
+    }
+}
+
 /// Reserved [`QueryRegistry`] key that delays the mock server's answer to a
 /// TDS Transaction Manager `Begin` request (the implicit transaction begin an
 /// autocommit-off connection issues before its first statement). Not a SQL
@@ -389,6 +408,25 @@ pub struct QueryRegistry {
     /// response's ColMetadata. Kept beside the response for the same reason
     /// as `trailing_info`.
     data_classification: HashMap<String, Vec<u8>>,
+    /// Result sets sent after a registered response's first one, in order.
+    following_result_sets: HashMap<String, Vec<ResultSetResponse>>,
+    /// Queries after whose response the server closes the connection.
+    closing_queries: HashSet<String>,
+    /// Whether Login7's session-recovery request (feature `0x01`) is acknowledged.
+    session_recovery: bool,
+    data_classification_ack: DataClassificationAck,
+}
+
+/// How the mock answers a Login7 that requests Data Classification (feature `0x09`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum DataClassificationAck {
+    /// Enable the requested version.
+    #[default]
+    Requested,
+    /// Enable this version whatever was requested.
+    Version(u8),
+    /// Leave the feature out of FEATUREEXTACK.
+    Omitted,
 }
 
 impl QueryRegistry {
@@ -398,6 +436,10 @@ impl QueryRegistry {
             responses: HashMap::new(),
             trailing_info: HashMap::new(),
             data_classification: HashMap::new(),
+            following_result_sets: HashMap::new(),
+            closing_queries: HashSet::new(),
+            session_recovery: false,
+            data_classification_ack: DataClassificationAck::default(),
         };
 
         // Add default responses
@@ -420,6 +462,81 @@ impl QueryRegistry {
         self.responses.insert(query.clone(), response);
         self.trailing_info.remove(&query);
         self.data_classification.remove(&query);
+        self.following_result_sets.remove(&query);
+        self.closing_queries.remove(&query);
+    }
+
+    /// Closes the connection after answering `query`, which must be registered.
+    /// Models a session killed between requests: the client finds the socket
+    /// closed on its next command, which is what triggers session recovery.
+    /// Applies to SQL batches only.
+    pub fn close_connection_after(&mut self, query: impl Into<String>) {
+        self.closing_queries.insert(query.into().to_uppercase());
+    }
+
+    /// Whether the connection closes after answering `query`.
+    pub fn closes_connection_after(&self, query: &str) -> bool {
+        self.closing_queries.contains(&query.to_uppercase())
+    }
+
+    /// Acknowledge Login7's session-recovery request so clients can reconnect.
+    /// Off by default, which leaves recovery unnegotiated.
+    pub fn set_session_recovery(&mut self, enabled: bool) {
+        self.session_recovery = enabled;
+    }
+
+    /// Whether Login7's session-recovery request is acknowledged.
+    pub fn session_recovery(&self) -> bool {
+        self.session_recovery
+    }
+
+    /// Chooses the Data Classification acknowledgement for later logins,
+    /// including reconnects.
+    pub fn set_data_classification_ack(&mut self, ack: DataClassificationAck) {
+        self.data_classification_ack = ack;
+    }
+
+    /// The Data Classification acknowledgement sent to the next login.
+    pub fn data_classification_ack(&self) -> DataClassificationAck {
+        self.data_classification_ack
+    }
+
+    /// Register a response of several result sets, each with optional raw
+    /// DATACLASSIFICATION token bytes, sent in order with `DONE_MORE` between
+    /// them. Applies to both SQL batch and RPC responses.
+    ///
+    /// Like [`register`](Self::register), this replaces any previous
+    /// registration for `query`.
+    ///
+    /// # Panics
+    ///
+    /// If `result_sets` is empty.
+    pub fn register_result_sets(
+        &mut self,
+        query: impl Into<String>,
+        result_sets: Vec<ResultSetResponse>,
+    ) {
+        let query = query.into().to_uppercase();
+        let mut result_sets = result_sets.into_iter();
+        let first = result_sets
+            .next()
+            .expect("register_result_sets needs at least one result set");
+        self.register_with_data_classification(
+            query.clone(),
+            first.response,
+            first.data_classification,
+        );
+        let following: Vec<_> = result_sets.collect();
+        if !following.is_empty() {
+            self.following_result_sets.insert(query, following);
+        }
+    }
+
+    /// The result sets registered to follow this query's first one, if any.
+    pub fn following_result_sets(&self, query: &str) -> &[ResultSetResponse] {
+        self.following_result_sets
+            .get(&query.to_uppercase())
+            .map_or(&[], Vec::as_slice)
     }
 
     /// Register a query response that carries a DATACLASSIFICATION token,
@@ -522,20 +639,26 @@ impl QueryRegistry {
         &self,
         haystack: &[u8],
     ) -> Option<(&QueryResponse, &[u8], &[InfoMessage])> {
-        self.responses.iter().find_map(|(query, response)| {
+        let query = self.find_by_contained_utf16_text(haystack)?;
+        Some((
+            &self.responses[query],
+            self.data_classification(query),
+            self.trailing_info(query),
+        ))
+    }
+
+    /// The registered (upper-cased) query whose text appears in `haystack` as
+    /// UTF-16LE; see [`get_by_contained_utf16_text`](Self::get_by_contained_utf16_text).
+    /// Use it as the key for [`data_classification`](Self::data_classification),
+    /// [`following_result_sets`](Self::following_result_sets), and
+    /// [`trailing_info`](Self::trailing_info).
+    pub fn find_by_contained_utf16_text(&self, haystack: &[u8]) -> Option<&str> {
+        self.responses.keys().map(String::as_str).find(|query| {
             let needle: Vec<u8> = query
                 .encode_utf16()
                 .flat_map(|unit| unit.to_le_bytes())
                 .collect();
-            (!needle.is_empty() && haystack.windows(needle.len()).any(|w| w == needle)).then(|| {
-                (
-                    response,
-                    self.data_classification
-                        .get(query)
-                        .map_or(&[][..], Vec::as_slice),
-                    self.trailing_info.get(query).map_or(&[][..], Vec::as_slice),
-                )
-            })
+            !needle.is_empty() && haystack.windows(needle.len()).any(|w| w == needle)
         })
     }
 }
@@ -680,5 +803,41 @@ mod tests {
 
         registry.register("SELECT classified", QueryResponse::select_one());
         assert!(registry.data_classification("SELECT classified").is_empty());
+    }
+
+    /// Batch and RPC lookups both find the result sets after the first, and a
+    /// plain re-registration drops them.
+    #[test]
+    fn following_result_sets_reach_batch_and_rpc_lookups() {
+        let mut registry = QueryRegistry::new();
+        registry.register_result_sets(
+            "SELECT a; SELECT b",
+            vec![
+                ResultSetResponse::new(QueryResponse::select_one(), vec![0xA3, 1]),
+                ResultSetResponse::new(QueryResponse::select_one(), vec![0xA3, 2]),
+            ],
+        );
+        let rpc_body: Vec<u8> = "SELECT A; SELECT B"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+
+        assert_eq!(
+            registry.data_classification("select a; select b"),
+            [0xA3, 1]
+        );
+        let query = registry
+            .find_by_contained_utf16_text(&rpc_body)
+            .expect("RPC lookup should match the registered query");
+        let following = registry.following_result_sets(query);
+        assert_eq!(following.len(), 1);
+        assert_eq!(following[0].data_classification, [0xA3, 2]);
+
+        registry.register("SELECT a; SELECT b", QueryResponse::select_one());
+        assert!(
+            registry
+                .following_result_sets("SELECT a; SELECT b")
+                .is_empty()
+        );
     }
 }

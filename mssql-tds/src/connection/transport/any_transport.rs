@@ -12,11 +12,13 @@ use crate::connection::transport::tds_transport::TdsTransport;
 use crate::core::{CancelHandle, TdsResult};
 use crate::datatypes::column_values::ColumnValues;
 use crate::datatypes::row_writer::RowWriter;
+use crate::io::packet_reader::TdsPacketReader;
 use crate::io::reader_writer::NetworkWriter;
 use crate::io::token_stream::{
     ColumnPolicy, ParserContext, PlpPauseState, RowHeader, RowPauseState, RowReadResult,
     TdsTokenStreamReader,
 };
+use crate::token::data_classification::DataClassificationMetadata;
 use crate::token::tokens::Tokens;
 
 /// Result of attempting to fully decode a buffered PLP column in one call.
@@ -70,6 +72,40 @@ impl AnyTransport {
             Self::Dynamic(transport) => {
                 transport
                     .receive_token(context, remaining_request_timeout, cancel_handle)
+                    .await
+            }
+        }
+    }
+
+    /// Whether a DATACLASSIFICATION token can follow COLMETADATA on this
+    /// connection. Lets callers skip the look-ahead, and its future, entirely
+    /// when the feature was not negotiated.
+    pub(crate) fn may_receive_data_classification(&self) -> bool {
+        match self {
+            Self::Network(transport) => {
+                transport.negotiated_data_classification_version().is_some()
+            }
+            #[cfg(any(test, feature = "test-util", fuzzing))]
+            Self::Dynamic(_) => true,
+        }
+    }
+
+    pub(crate) async fn receive_data_classification(
+        &mut self,
+        context: &ParserContext,
+        remaining_request_timeout: Option<Duration>,
+        cancel_handle: Option<&CancelHandle>,
+    ) -> TdsResult<Option<DataClassificationMetadata>> {
+        match self {
+            Self::Network(transport) => {
+                transport
+                    .receive_data_classification(context, remaining_request_timeout, cancel_handle)
+                    .await
+            }
+            #[cfg(any(test, feature = "test-util", fuzzing))]
+            Self::Dynamic(transport) => {
+                transport
+                    .receive_data_classification(context, remaining_request_timeout, cancel_handle)
                     .await
             }
         }
