@@ -282,7 +282,8 @@ Measured 2026-10-08 on both drivers unless noted.
   and the AB#49386 Rust debug build (`18.6.2.1`): direct-DLL calls closed
   unfetched, partially fetched, and exhausted cursors, returned `01S05`, and
   allowed a second statement to execute. The native Driver Manager leg also
-  passed all eight `ConnectionBusyLiveTest.IdleCancel*` variants.
+  passed the eight `ConnectionBusyLiveTest.IdleCancel*` variants present on
+  that date (two bodies, each in four concurrency modes).
   A Linux unixODBC 2.3.9 standalone mock-driver probe reproduced malformed
   diagnostic records through the DM at `Threading=1`, without mssql-odbc or
   SQL Server. Direct-driver observation avoided that DM corruption, but Windows
@@ -301,6 +302,16 @@ Measured 2026-10-08 on both drivers unless noted.
   than one millisecond and left the temporary table empty. This follows native
   `Cancel` (`sqlcmisc.cpp:847-851`) into the ATTENTION branch of
   `ProcessTDSStream` (`sqlccmd.cpp:11718-11731`).
+  The live suite now also covers `IdleCancelAbandonsPartiallyReadPlp`: a
+  `varchar(max)` value is read only through its first truncated `SQLGetData`
+  chunk before cancellation, and a second statement verifies the delayed
+  INSERT never ran. Together with the delayed non-PLP tail case, the suite
+  contains four bodies in four modes (16 variants); the historical eight-case
+  measurement above predates both additions.
+  On 2026-10-17 all 16 variants passed through the Windows DM with native
+  `18.06.0001` (five iterations per concurrent mode). Direct-DLL probes against
+  that native version and Rust `18.6.2.1` also passed the partial-PLP case:
+  truncated `SQLGetData`, `01S05` after cancellation, and no trailing INSERT.
 
 ## Scenarios
 

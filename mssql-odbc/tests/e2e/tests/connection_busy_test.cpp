@@ -156,6 +156,47 @@ ODBC_TEST_F(ConnectionBusyLiveTest, IdleCancelAbandonsDelayedBatchTail) {
     ASSERT_SQL_OK(Run(stmt_, "DROP TABLE #idle_cancel_tail"), SQL_HANDLE_STMT, stmt_);
 }
 
+// Benefits-from-mock-tds: CursorPhase::IdlePlp pins ATTENTION settlement;
+// this verifies partial MAX-value cancellation against the live server.
+ODBC_TEST_F(ConnectionBusyLiveTest, IdleCancelAbandonsPartiallyReadPlp) {
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_QUERY_TIMEOUT, nullptr, 0),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLSetConnectAttr(dbc_, SQL_ATTR_CONNECTION_TIMEOUT,
+                                   reinterpret_cast<SQLPOINTER>(2), 0),
+                  SQL_HANDLE_DBC, dbc_);
+    ASSERT_SQL_OK(Run(stmt_, "CREATE TABLE #idle_cancel_plp(n int)"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_CLOSE), SQL_HANDLE_STMT, stmt_);
+
+    const auto token = WorkerToken("plp");
+    const auto started = std::chrono::steady_clock::now();
+    ASSERT_SQL_OK(Run(stmt_, "SELECT REPLICATE(CAST('" + token +
+        "' AS varchar(max)),16000); WAITFOR DELAY '00:00:05'; "
+        "INSERT #idle_cancel_plp VALUES(1)"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    std::vector<char> prefix(token.size() + 1);
+    SQLLEN length = 0;
+    ASSERT_EQ(SQL_SUCCESS_WITH_INFO,
+              SQLGetData(stmt_, 1, SQL_C_CHAR, prefix.data(),
+                         static_cast<SQLLEN>(prefix.size()), &length));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01004");
+    EXPECT_EQ(token, std::string(prefix.data()));
+    EXPECT_TRUE(length == SQL_NO_TOTAL || length > static_cast<SQLLEN>(token.size()));
+    ASSERT_LT(std::chrono::steady_clock::now() - started, std::chrono::seconds(3));
+
+    const auto cancelling = std::chrono::steady_clock::now();
+    ASSERT_SQL_OK(CancelIdleStatement(), SQL_HANDLE_STMT, stmt_);
+    EXPECT_LT(std::chrono::steady_clock::now() - cancelling, std::chrono::seconds(3));
+    SQLHSTMT other = AllocStmt();
+    ASSERT_SQL_OK(Run(other, "SELECT COUNT(*) FROM #idle_cancel_plp"), SQL_HANDLE_STMT, other);
+    ASSERT_SQL_OK(SQLFetch(other), SQL_HANDLE_STMT, other);
+    SQLINTEGER count = -1;
+    ASSERT_SQL_OK(SQLGetData(other, 1, SQL_C_SLONG, &count, sizeof(count), nullptr),
+                  SQL_HANDLE_STMT, other);
+    EXPECT_EQ(0, count);
+    ASSERT_SQL_OK(SQLFreeStmt(other, SQL_CLOSE), SQL_HANDLE_STMT, other);
+    ASSERT_SQL_OK(Run(stmt_, "DROP TABLE #idle_cancel_plp"), SQL_HANDLE_STMT, stmt_);
+}
+
 // A first execution of a prepared statement uses sp_prepexec. Its output
 // handle trails the row result on the wire, but it is part of the same RPC
 // response and must not keep the connection claimed after the only row and
