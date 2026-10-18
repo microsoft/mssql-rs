@@ -94,6 +94,7 @@ def shell_script(step):
         ("0.3.0", "0.3.0", False, {bump.PYPI_PIN}),
         ("0.4.0", "0.3.0", True, {bump.NUGET_PIN}),
         ("0.4.0", "0.3.0", False, set()),
+        ("0.5.0", "0.3.0", True, {bump.NUGET_PIN}),
         ("0.5.0", "0.5.0", True, set()),
     ],
 )
@@ -383,6 +384,51 @@ def test_pypi_only_release_preserves_pending_clean_nuget_upgrade(tmp_path):
     }
     assert (tmp_path / bump.PYPI_PIN).read_text() == "0.5.0"
     assert (tmp_path / bump.NUGET_PIN).read_text() == "0.4.0"
+
+
+def test_delayed_nuget_release_advances_behind_newer_pending_pypi(tmp_path):
+    target_repo(tmp_path, "0.5.0", "0.3.0")
+    calls = []
+
+    def git_call(root, *args, **kwargs):
+        calls.append(args)
+        if args == ("rev-parse", "FETCH_HEAD"):
+            return subprocess.CompletedProcess("git", 0, stdout="base\n")
+        return subprocess.CompletedProcess("git", 0, stdout="")
+
+    with patch.object(bump, "git", side_effect=git_call), patch.object(
+        bump, "remote_branch_state", return_value=(True, "pending-sha", True)
+    ), patch.object(
+        bump,
+        "remote_pin_versions",
+        side_effect=[
+            {bump.PYPI_PIN: "0.5.0", bump.NUGET_PIN: "0.3.0"},
+            {bump.PYPI_PIN: "0.5.0", bump.NUGET_PIN: "0.3.0"},
+        ],
+    ), patch.object(
+        bump, "github_paged", return_value=[{"number": 99}]
+    ), patch.object(
+        bump, "ensure_issue", return_value=42
+    ) as issue, patch.object(
+        bump, "github_api", return_value=(200, {})
+    ):
+        bump.update_pull_request(
+            tmp_path,
+            "0.4.0",
+            {bump.NUGET_PIN: ("0.3.0", "0.4.0")},
+            "123",
+        )
+    assert issue.call_args.args[1] == {
+        bump.NUGET_PIN: ("0.3.0", "0.4.0"),
+    }
+    assert (tmp_path / bump.PYPI_PIN).read_text() == "0.5.0"
+    assert (tmp_path / bump.NUGET_PIN).read_text() == "0.4.0"
+    assert (
+        "push",
+        f"--force-with-lease=refs/heads/{bump.BRANCH}:pending-sha",
+        "origin",
+        f"{bump.BRANCH}:refs/heads/{bump.BRANCH}",
+    ) in calls
 
 
 def test_main_pin_change_during_planning_aborts_before_writing(tmp_path):

@@ -176,10 +176,9 @@ def planned_changes(root, released_version, nuget_available):
         changes[PYPI_PIN] = (python_current, released_version)
     elif version_tuple(python_current) > released:
         print(
-            f"Ignoring stale release {released_version}: {PYPI_PIN} is already "
-            f"{python_current}."
+            f"Leaving newer {PYPI_PIN} {python_current} unchanged while checking "
+            f"the independently published NuGet package."
         )
-        return {}
 
     if nuget_available and version_tuple(nuget_current) < released:
         changes[NUGET_PIN] = (nuget_current, released_version)
@@ -347,19 +346,14 @@ def update_pull_request(root, version, changes, source_build_id):
         for path, value in base_versions.items()
     }
     remote_versions = remote_pin_versions(root, remote_commit) if exists else None
-    if remote_versions and version_tuple(remote_versions[PYPI_PIN]) > version_tuple(
-        version
-    ):
-        number = existing[0]["number"] if existing else None
-        print(
-            f"Ignoring stale release {version}: {BRANCH} already carries newer pins."
-        )
-        return number
-
     if remote_versions:
         for path, pending in remote_versions.items():
             if version_tuple(pending) > version_tuple(desired[path]):
                 desired[path] = pending
+        if remote_versions == desired:
+            number = existing[0]["number"] if existing else None
+            print(f"{BRANCH} already contains these dependency versions.")
+            return number
     effective_changes = {
         path: (base_value, desired[path])
         for path, base_value in base_versions.items()
@@ -369,23 +363,20 @@ def update_pull_request(root, version, changes, source_build_id):
     issue_number = ensure_issue(version, effective_changes, source_build_id)
     title = f"CHORE: Update {PYPI_NAME} dependency to {version}"
     body = pull_request_body(root, issue_number, version, effective_changes)
-    if remote_versions == desired:
-        print(f"{BRANCH} already contains these dependency versions.")
-    else:
-        git(root, "switch", "--discard-changes", "--force-create", BRANCH, base_sha)
-        for path, value in desired.items():
-            write_pin(root, path, value)
-        paths = [path.as_posix() for path in desired]
-        git(root, "add", "--", *paths)
-        git(root, "commit", "--message", f"Update {PYPI_NAME} dependency to {version}")
-        expected = remote_commit if exists else ""
-        git(
-            root,
-            "push",
-            f"--force-with-lease=refs/heads/{BRANCH}:{expected}",
-            "origin",
-            f"{BRANCH}:refs/heads/{BRANCH}",
-        )
+    git(root, "switch", "--discard-changes", "--force-create", BRANCH, base_sha)
+    for path, value in desired.items():
+        write_pin(root, path, value)
+    paths = [path.as_posix() for path in desired]
+    git(root, "add", "--", *paths)
+    git(root, "commit", "--message", f"Update {PYPI_NAME} dependency to {version}")
+    expected = remote_commit if exists else ""
+    git(
+        root,
+        "push",
+        f"--force-with-lease=refs/heads/{BRANCH}:{expected}",
+        "origin",
+        f"{BRANCH}:refs/heads/{BRANCH}",
+    )
 
     if existing:
         number = existing[0]["number"]
