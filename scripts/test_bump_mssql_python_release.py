@@ -302,6 +302,46 @@ def test_matching_pending_pins_do_not_rebase_for_unrelated_main_changes(tmp_path
     assert not any(args[0] in {"switch", "commit", "push"} for args in calls)
 
 
+def test_matching_branch_without_pull_request_creates_missing_pr(tmp_path):
+    target_repo(tmp_path)
+    calls = []
+
+    def git_call(root, *args, **kwargs):
+        calls.append(args)
+        if args == ("rev-parse", "FETCH_HEAD"):
+            return subprocess.CompletedProcess("git", 0, stdout="base\n")
+        return subprocess.CompletedProcess("git", 0, stdout="")
+
+    with patch.object(bump, "git", side_effect=git_call), patch.object(
+        bump, "remote_branch_state", return_value=(True, "pending-sha", True)
+    ), patch.object(
+        bump,
+        "remote_pin_versions",
+        side_effect=[
+            {bump.PYPI_PIN: "0.3.0", bump.NUGET_PIN: "0.3.0"},
+            {bump.PYPI_PIN: "0.4.0", bump.NUGET_PIN: "0.3.0"},
+        ],
+    ), patch.object(
+        bump, "github_paged", return_value=[]
+    ), patch.object(
+        bump, "ensure_issue", return_value=42
+    ), patch.object(
+        bump, "github_api", return_value=(201, {"number": 100})
+    ) as api:
+        assert bump.update_pull_request(
+            tmp_path,
+            "0.4.0",
+            {bump.PYPI_PIN: ("0.3.0", "0.4.0")},
+            "123",
+        ) == 100
+    assert not any(args[0] in {"switch", "commit", "push"} for args in calls)
+    assert api.call_args.args[0:2] == (
+        "POST",
+        "/repos/microsoft/mssql-python/pulls",
+    )
+    assert api.call_args.args[2]["draft"] is True
+
+
 def test_changed_pending_pins_use_inspected_sha_as_push_lease(tmp_path):
     target_repo(tmp_path)
     calls = []

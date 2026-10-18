@@ -350,8 +350,8 @@ def update_pull_request(root, version, changes, source_build_id):
         for path, pending in remote_versions.items():
             if version_tuple(pending) > version_tuple(desired[path]):
                 desired[path] = pending
-        if remote_versions == desired:
-            number = existing[0]["number"] if existing else None
+        if remote_versions == desired and existing:
+            number = existing[0]["number"]
             print(f"{BRANCH} already contains these dependency versions.")
             return number
     effective_changes = {
@@ -363,20 +363,21 @@ def update_pull_request(root, version, changes, source_build_id):
     issue_number = ensure_issue(version, effective_changes, source_build_id)
     title = f"CHORE: Update {PYPI_NAME} dependency to {version}"
     body = pull_request_body(root, issue_number, version, effective_changes)
-    git(root, "switch", "--discard-changes", "--force-create", BRANCH, base_sha)
-    for path, value in desired.items():
-        write_pin(root, path, value)
-    paths = [path.as_posix() for path in desired]
-    git(root, "add", "--", *paths)
-    git(root, "commit", "--message", f"Update {PYPI_NAME} dependency to {version}")
-    expected = remote_commit if exists else ""
-    git(
-        root,
-        "push",
-        f"--force-with-lease=refs/heads/{BRANCH}:{expected}",
-        "origin",
-        f"{BRANCH}:refs/heads/{BRANCH}",
-    )
+    if remote_versions != desired:
+        git(root, "switch", "--discard-changes", "--force-create", BRANCH, base_sha)
+        for path, value in desired.items():
+            write_pin(root, path, value)
+        paths = [path.as_posix() for path in desired]
+        git(root, "add", "--", *paths)
+        git(root, "commit", "--message", f"Update {PYPI_NAME} dependency to {version}")
+        expected = remote_commit if exists else ""
+        git(
+            root,
+            "push",
+            f"--force-with-lease=refs/heads/{BRANCH}:{expected}",
+            "origin",
+            f"{BRANCH}:refs/heads/{BRANCH}",
+        )
 
     if existing:
         number = existing[0]["number"]
