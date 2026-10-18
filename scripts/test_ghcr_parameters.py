@@ -164,9 +164,11 @@ def test_tests_are_in_shared_validation():
 def test_missing_bash_cannot_silently_skip_enforced_ci(run_pipeline, monkeypatch, required):
     monkeypatch.setattr(sys.modules[__name__], "_BASH", None)
     monkeypatch.setenv("GHCR_TEST_REQUIRE_BASH", "1" if required else "0")
-    with pytest.raises(pytest.fail.Exception if required else pytest.skip.Exception,
-                       match="Bash is required"):
+    expected = pytest.fail.Exception if required else pytest.skip.Exception
+    with pytest.raises((pytest.fail.Exception, pytest.skip.Exception),
+                       match="Bash is required") as raised:
         run_pipeline()
+    assert isinstance(raised.value, expected)
 
 
 @pytest.mark.parametrize("field", ["owner", "user"])
