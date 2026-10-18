@@ -1189,6 +1189,63 @@ mod tests {
         assert!(result_metadata.is_encrypted());
     }
 
+    fn decimal_18_4_type_info() -> TypeInfo {
+        TypeInfo {
+            tds_type: TdsDataType::DecimalN,
+            length: 17,
+            type_info_variant: TypeInfoVariant::VarLenPrecisionScale(
+                VariableLengthTypes::DecimalN,
+                17,
+                18,
+                4,
+            ),
+        }
+    }
+
+    fn create_encrypted_decimal_18_4_column_metadata() -> ColumnMetadata {
+        create_encrypted_test_column_metadata(
+            TdsDataType::BigVarBinary,
+            TypeInfoVariant::VarLen(VariableLengthTypes::BigVarBinary, 65),
+            decimal_18_4_type_info(),
+        )
+    }
+
+    #[test]
+    fn result_column_metadata_uses_logical_scale_when_decrypting() {
+        let metadata = create_encrypted_decimal_18_4_column_metadata();
+        let result_metadata = ResultColumnMetadata::new(metadata, true);
+
+        assert_eq!(result_metadata.data_type(), TdsDataType::DecimalN);
+        assert_eq!(result_metadata.get_precision(), Some(18));
+        assert_eq!(result_metadata.get_scale(), Some(4));
+    }
+
+    #[test]
+    fn result_column_metadata_uses_wire_scale_when_not_decrypting() {
+        let metadata = create_encrypted_decimal_18_4_column_metadata();
+        let result_metadata = ResultColumnMetadata::new(metadata, false);
+
+        assert_eq!(result_metadata.data_type(), TdsDataType::BigVarBinary);
+        assert_eq!(result_metadata.get_precision(), None);
+        assert_eq!(result_metadata.get_scale(), None);
+    }
+
+    #[test]
+    fn result_column_metadata_preserves_unencrypted_scale() {
+        let type_info = decimal_18_4_type_info();
+        let mut metadata = create_test_column_metadata(0x01, type_info.type_info_variant.clone());
+        metadata.data_type = TdsDataType::DecimalN;
+        metadata.type_info = type_info;
+
+        for decrypt_results in [true, false] {
+            let result_metadata = ResultColumnMetadata::new(metadata.clone(), decrypt_results);
+
+            assert_eq!(result_metadata.data_type(), TdsDataType::DecimalN);
+            assert_eq!(result_metadata.get_precision(), Some(18));
+            assert_eq!(result_metadata.get_scale(), Some(4));
+        }
+    }
+
     #[test]
     fn result_column_metadata_preserves_unencrypted_metadata() {
         let metadata =
