@@ -350,9 +350,14 @@ def update_pull_request(root, version, changes, source_build_id):
         for path, pending in remote_versions.items():
             if version_tuple(pending) > version_tuple(desired[path]):
                 desired[path] = pending
-        if remote_versions == desired and existing:
-            number = existing[0]["number"]
-            print(f"{BRANCH} already contains these dependency versions.")
+        event_matches_branch = any(
+            target == remote_versions[path] for path, (_current, target) in changes.items()
+        )
+        if remote_versions == desired and not event_matches_branch:
+            number = existing[0]["number"] if existing else None
+            print(
+                f"Ignoring stale release {version}: {BRANCH} already carries newer pins."
+            )
             return number
     effective_changes = {
         path: (base_value, desired[path])
