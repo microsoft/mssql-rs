@@ -192,22 +192,15 @@ def planned_changes(root, released_version, nuget_available):
     return changes
 
 
-def issue_body(version, changes, source_build_id):
+def issue_body(version, changes, _source_build_id):
     lines = "\n".join(
         f"- `{path.as_posix()}`: `{old}` -> `{new}`"
         for path, (old, new) in changes.items()
     )
-    source = (
-        f"[Azure Pipelines build {source_build_id}]"
-        f"(https://sqlclientdrivers.visualstudio.com/mssql-rs/_build/results"
-        f"?buildId={source_build_id})"
-        if source_build_id
-        else "a manual worker run"
-    )
     return (
         f"{ISSUE_MARKER}\n\n"
-        f"`{PYPI_NAME}` {version} was published by {source}. Update the "
-        "`mssql-python` dependency pins that have matching released artifacts.\n\n"
+        f"Update the `{PYPI_NAME}` dependency pins to the canonical released "
+        f"artifact set headed by version {version}.\n\n"
         f"{lines}\n\n"
         f"`{NUGET_PIN.as_posix()}` advances only to a clean `{NUGET_NAME}` "
         "version verified by this run, or retains a higher clean version already "
@@ -307,6 +300,22 @@ def remote_branch_state(root, base_sha):
     return True, commit, owned
 
 
+def branch_merged_into_base(root, branch_commit, base_sha):
+    merged = git(
+        root,
+        "merge-base",
+        "--is-ancestor",
+        branch_commit,
+        base_sha,
+        check=False,
+    )
+    if merged.returncode not in (0, 1):
+        raise RuntimeError(
+            f"Could not compare {branch_commit} with {base_sha}: {merged.stderr.strip()}"
+        )
+    return merged.returncode == 0
+
+
 def remote_pin_versions(root, commit):
     versions = {}
     for path in (PYPI_PIN, NUGET_PIN):
@@ -333,13 +342,20 @@ def update_pull_request(root, version, changes, source_build_id):
         f"/repos/{repo}/pulls?state=open&base={base}&head={owner}:{BRANCH}"
     )
     if exists and not owned:
-        number = existing[0]["number"] if existing else None
-        print(
-            f"{BRANCH} carries maintainer commits; leaving it"
-            + (f" and PR #{number}" if number else "")
-            + " untouched."
-        )
-        return number
+        if existing:
+            number = existing[0]["number"]
+            print(
+                f"{BRANCH} carries maintainer commits; leaving it and "
+                f"PR #{number} untouched."
+            )
+            return number
+        if not branch_merged_into_base(root, remote_commit, base_sha):
+            raise RuntimeError(
+                f"origin/{BRANCH} carries maintainer commits, has no open PR, and "
+                f"is not merged into origin/{base}; delete or rename that branch "
+                "before rerunning the dependency bump pipeline"
+            )
+        print(f"origin/{BRANCH} is merged; recreating it for the next bump.")
 
     desired = {
         path: changes.get(path, (value, value))[1]
@@ -350,31 +366,28 @@ def update_pull_request(root, version, changes, source_build_id):
         for path, pending in remote_versions.items():
             if version_tuple(pending) > version_tuple(desired[path]):
                 desired[path] = pending
-        event_matches_branch = any(
-            target == remote_versions[path] for path, (_current, target) in changes.items()
-        )
-        if remote_versions == desired and not event_matches_branch:
-            number = existing[0]["number"] if existing else None
-            print(
-                f"Ignoring stale release {version}: {BRANCH} already carries newer pins."
-            )
-            return number
     effective_changes = {
         path: (base_value, desired[path])
         for path, base_value in base_versions.items()
         if base_value != desired[path]
     }
 
-    issue_number = ensure_issue(version, effective_changes, source_build_id)
-    title = f"CHORE: Update {PYPI_NAME} dependency to {version}"
-    body = pull_request_body(root, issue_number, version, effective_changes)
+    metadata_version = desired[PYPI_PIN]
+    issue_number = ensure_issue(metadata_version, effective_changes, source_build_id)
+    title = f"CHORE: Update {PYPI_NAME} dependency to {metadata_version}"
+    body = pull_request_body(root, issue_number, metadata_version, effective_changes)
     if remote_versions != desired:
         git(root, "switch", "--discard-changes", "--force-create", BRANCH, base_sha)
         for path, value in desired.items():
             write_pin(root, path, value)
         paths = [path.as_posix() for path in desired]
         git(root, "add", "--", *paths)
-        git(root, "commit", "--message", f"Update {PYPI_NAME} dependency to {version}")
+        git(
+            root,
+            "commit",
+            "--message",
+            f"Update {PYPI_NAME} dependency to {metadata_version}",
+        )
         expected = remote_commit if exists else ""
         git(
             root,
@@ -386,7 +399,12 @@ def update_pull_request(root, version, changes, source_build_id):
 
     if existing:
         number = existing[0]["number"]
-        github_api("PATCH", f"/repos/{repo}/pulls/{number}", {"title": title, "body": body})
+        if existing[0].get("title") != title or existing[0].get("body") != body:
+            github_api(
+                "PATCH",
+                f"/repos/{repo}/pulls/{number}",
+                {"title": title, "body": body},
+            )
         print(f"Updated microsoft/mssql-python PR #{number}.")
         return number
     _status, created = github_api(

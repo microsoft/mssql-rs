@@ -209,7 +209,11 @@ def test_maintainer_owned_branch_is_not_modified(tmp_path):
         bump, "remote_branch_state", return_value=(True, "their-sha", False)
     ), patch.object(
         bump, "github_paged", return_value=[{"number": 99}]
-    ), patch.object(bump, "ensure_issue") as issue:
+    ), patch.object(
+        bump, "ensure_issue"
+    ) as issue, patch.object(
+        bump, "github_api"
+    ) as api:
         assert bump.update_pull_request(
             tmp_path,
             "0.4.0",
@@ -217,7 +221,77 @@ def test_maintainer_owned_branch_is_not_modified(tmp_path):
             "123",
         ) == 99
     issue.assert_not_called()
+    api.assert_not_called()
     assert (tmp_path / bump.PYPI_PIN).read_text() == "0.3.0"
+
+
+def test_closed_unmerged_maintainer_branch_requires_cleanup(tmp_path):
+    target_repo(tmp_path)
+    with patch.object(
+        bump,
+        "git",
+        side_effect=[
+            subprocess.CompletedProcess("git", 0),
+            subprocess.CompletedProcess("git", 0, stdout="base\n"),
+        ],
+    ), patch.object(
+        bump,
+        "remote_pin_versions",
+        return_value={bump.PYPI_PIN: "0.3.0", bump.NUGET_PIN: "0.3.0"},
+    ), patch.object(
+        bump, "remote_branch_state", return_value=(True, "their-sha", False)
+    ), patch.object(
+        bump, "github_paged", return_value=[]
+    ), patch.object(
+        bump, "branch_merged_into_base", return_value=False
+    ), patch.object(
+        bump, "ensure_issue"
+    ) as issue:
+        with pytest.raises(RuntimeError, match="delete or rename"):
+            bump.update_pull_request(
+                tmp_path,
+                "0.4.0",
+                {bump.PYPI_PIN: ("0.3.0", "0.4.0")},
+                "123",
+            )
+    issue.assert_not_called()
+
+
+def test_closed_merged_maintainer_branch_is_recreated(tmp_path):
+    target_repo(tmp_path)
+    calls = []
+
+    def git_call(root, *args, **kwargs):
+        calls.append(args)
+        if args == ("rev-parse", "FETCH_HEAD"):
+            return subprocess.CompletedProcess("git", 0, stdout="base\n")
+        return subprocess.CompletedProcess("git", 0, stdout="")
+
+    with patch.object(bump, "git", side_effect=git_call), patch.object(
+        bump, "remote_branch_state", return_value=(True, "their-sha", False)
+    ), patch.object(
+        bump,
+        "remote_pin_versions",
+        side_effect=[
+            {bump.PYPI_PIN: "0.3.0", bump.NUGET_PIN: "0.3.0"},
+            {bump.PYPI_PIN: "0.3.0", bump.NUGET_PIN: "0.3.0"},
+        ],
+    ), patch.object(
+        bump, "github_paged", return_value=[]
+    ), patch.object(
+        bump, "branch_merged_into_base", return_value=True
+    ), patch.object(
+        bump, "ensure_issue", return_value=42
+    ), patch.object(
+        bump, "github_api", return_value=(201, {"number": 100})
+    ):
+        assert bump.update_pull_request(
+            tmp_path,
+            "0.4.0",
+            {bump.PYPI_PIN: ("0.3.0", "0.4.0")},
+            "123",
+        ) == 100
+    assert any(args[0] == "push" for args in calls)
 
 
 def test_missing_remote_branch_is_distinguished_from_fetch_failure(tmp_path):
@@ -254,7 +328,11 @@ def test_stale_event_does_not_replace_newer_pending_pins(tmp_path):
         ],
     ), patch.object(
         bump, "github_paged", return_value=[{"number": 99}]
-    ), patch.object(bump, "ensure_issue") as issue:
+    ), patch.object(
+        bump, "ensure_issue", return_value=42
+    ) as issue, patch.object(
+        bump, "github_api", return_value=(200, {})
+    ) as api:
         assert bump.update_pull_request(
             tmp_path,
             "0.4.0",
@@ -264,7 +342,10 @@ def test_stale_event_does_not_replace_newer_pending_pins(tmp_path):
             },
             "123",
         ) == 99
-    issue.assert_not_called()
+    assert issue.call_args.args[0] == "0.5.0"
+    assert api.call_args.args[2]["title"] == (
+        "CHORE: Update mssql-python-rs dependency to 0.5.0"
+    )
 
 
 def test_matching_pending_pins_do_not_rebase_for_unrelated_main_changes(tmp_path):
@@ -382,6 +463,55 @@ def test_matching_branch_repairs_pr_metadata_after_failed_patch(tmp_path):
     assert api.call_args.args[2]["title"] == (
         "CHORE: Update mssql-python-rs dependency to 0.5.0"
     )
+
+
+def test_older_partial_match_keeps_newer_canonical_metadata(tmp_path):
+    target_repo(tmp_path)
+    effective = {
+        bump.PYPI_PIN: ("0.3.0", "0.5.0"),
+        bump.NUGET_PIN: ("0.3.0", "0.4.0"),
+    }
+    canonical_title = "CHORE: Update mssql-python-rs dependency to 0.5.0"
+    canonical_body = bump.pull_request_body(tmp_path, 42, "0.5.0", effective)
+
+    with patch.object(
+        bump,
+        "git",
+        side_effect=[
+            subprocess.CompletedProcess("git", 0),
+            subprocess.CompletedProcess("git", 0, stdout="base\n"),
+        ],
+    ), patch.object(
+        bump, "remote_branch_state", return_value=(True, "pending-sha", True)
+    ), patch.object(
+        bump,
+        "remote_pin_versions",
+        side_effect=[
+            {bump.PYPI_PIN: "0.3.0", bump.NUGET_PIN: "0.3.0"},
+            {bump.PYPI_PIN: "0.5.0", bump.NUGET_PIN: "0.4.0"},
+        ],
+    ), patch.object(
+        bump,
+        "github_paged",
+        return_value=[
+            {"number": 99, "title": canonical_title, "body": canonical_body}
+        ],
+    ), patch.object(
+        bump, "ensure_issue", return_value=42
+    ) as issue, patch.object(
+        bump, "github_api"
+    ) as api:
+        assert bump.update_pull_request(
+            tmp_path,
+            "0.4.0",
+            {
+                bump.PYPI_PIN: ("0.3.0", "0.4.0"),
+                bump.NUGET_PIN: ("0.3.0", "0.4.0"),
+            },
+            "older-build",
+        ) == 99
+    assert issue.call_args.args[0] == "0.5.0"
+    api.assert_not_called()
 
 
 def test_changed_pending_pins_use_inspected_sha_as_push_lease(tmp_path):

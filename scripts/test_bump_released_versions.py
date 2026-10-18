@@ -579,6 +579,63 @@ def test_maintainer_edited_branch_is_left_alone(tmp_path):
     api.assert_not_called(), "must not rewrite the PR title or body"
 
 
+def test_closed_unmerged_maintainer_branch_requires_cleanup(tmp_path):
+    edited = []
+    with patch.object(
+        bump,
+        "remote_branch_state",
+        return_value=(True, "theirsha", "theirtree", False),
+    ), patch.object(
+        bump, "github_paged", return_value=[]
+    ), patch.object(
+        bump, "branch_merged_into_base", return_value=False
+    ), patch.object(
+        bump, "github_api"
+    ) as api:
+        with pytest.raises(RuntimeError, match="delete or rename"):
+            bump.open_bump_pr(
+                tmp_path,
+                bump.PYTHON_BRANCH,
+                "base",
+                "title",
+                "body",
+                lambda root: edited.append("edited") or ["mssql-py-core/pyproject.toml"],
+            )
+    assert edited == []
+    api.assert_not_called()
+
+
+def test_closed_merged_maintainer_branch_is_recreated(tmp_path):
+    calls = []
+
+    def git_call(root, *args):
+        calls.append(args)
+        return "newtree\n"
+
+    with patch.object(bump, "git", side_effect=git_call), patch.object(
+        bump,
+        "remote_branch_state",
+        return_value=(True, "theirsha", "theirtree", False),
+    ), patch.object(
+        bump, "github_paged", return_value=[]
+    ), patch.object(
+        bump, "branch_merged_into_base", return_value=True
+    ), patch.object(
+        bump,
+        "github_api",
+        return_value=(201, {"number": 725, "html_url": "https://example/725"}),
+    ):
+        assert bump.open_bump_pr(
+            tmp_path,
+            bump.PYTHON_BRANCH,
+            "base",
+            "title",
+            "body",
+            lambda root: ["mssql-py-core/pyproject.toml"],
+        ) == 725
+    assert any(args[0] == "push" for args in calls)
+
+
 @pytest.mark.parametrize(
     ("commits", "committer", "owned"),
     [
@@ -829,7 +886,7 @@ def test_one_failing_track_does_not_block_the_other(tmp_path, monkeypatch, capsy
 
 def capture_bump_pr(applied):
     """Invoke the deferred edit callback while module patches are still active."""
-    def recorder(root, branch, base_sha, title, body, apply_changes):
+    def recorder(root, branch, base_sha, title, body, apply_changes, branch_state):
         applied.append(apply_changes(root))
         return 700
     return recorder
@@ -841,6 +898,8 @@ def test_crate_track_opens_a_pull_request(tmp_path):
     with patch.object(bump, "published_versions", return_value={"0.2.0"}), patch.object(
         bump, "planned_bumps", return_value=changes
     ), patch.object(bump, "has_open_bump_pr", return_value=False), patch.object(
+        bump, "inspect_bump_branch", return_value=(False, None, None, True, [])
+    ), patch.object(
         bump, "ensure_bump_issue", return_value=123
     ) as issue, patch.object(
         bump, "apply_crate_bumps", return_value=["mssql-tds/Cargo.toml"]
@@ -863,6 +922,8 @@ def test_python_track_opens_a_pull_request(tmp_path):
     with patch.object(bump, "pypi_published_versions", return_value={"0.3.0"}), patch.object(
         bump, "planned_python_bump", return_value=changes
     ), patch.object(bump, "has_open_bump_pr", return_value=False), patch.object(
+        bump, "inspect_bump_branch", return_value=(False, None, None, True, [])
+    ), patch.object(
         bump, "ensure_bump_issue", return_value=456
     ) as issue, patch.object(
         bump, "apply_python_bump", return_value=["mssql-py-core/pyproject.toml"]
@@ -877,6 +938,35 @@ def test_python_track_opens_a_pull_request(tmp_path):
     assert "Fixes #456" in pull_request.call_args.args[4]
     assert applied == [["mssql-py-core/pyproject.toml"]]
     apply.assert_called_once_with(tmp_path, changes)
+
+
+@pytest.mark.parametrize(
+    ("track", "published_lookup", "planner"),
+    [
+        (bump.run_crate_track, "published_versions", "planned_bumps"),
+        (bump.run_python_track, "pypi_published_versions", "planned_python_bump"),
+    ],
+)
+def test_track_checks_closed_maintainer_branch_before_creating_issue(
+    tmp_path, track, published_lookup, planner
+):
+    changes = (
+        dict.fromkeys(bump.CRATES, ("0.2.0", "0.3.0"))
+        if track is bump.run_crate_track
+        else {bump.PYTHON_DIST: ("0.3.0", "0.4.0")}
+    )
+    with patch.object(bump, published_lookup, return_value={"0.3.0"}), patch.object(
+        bump, planner, return_value=changes
+    ), patch.object(
+        bump, "has_open_bump_pr", return_value=False
+    ), patch.object(
+        bump, "inspect_bump_branch", side_effect=RuntimeError("delete or rename")
+    ), patch.object(
+        bump, "ensure_bump_issue"
+    ) as issue:
+        with pytest.raises(RuntimeError, match="delete or rename"):
+            track(tmp_path, "base")
+    issue.assert_not_called()
 
 
 @pytest.mark.parametrize(("track", "lookup", "planner"), [

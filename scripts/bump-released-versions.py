@@ -459,7 +459,16 @@ def remote_branch_state(root, branch, base_sha):
     return True, commit, tree, owned
 
 
-def open_bump_pr(root, branch, base_sha, title, body, apply_changes):
+def branch_merged_into_base(root, branch_commit, base_sha):
+    merged = git_try(root, "merge-base", "--is-ancestor", branch_commit, base_sha)
+    if merged.returncode not in (0, 1):
+        raise RuntimeError(
+            f"Could not compare {branch_commit} with {base_sha}: {merged.stderr.strip()}"
+        )
+    return merged.returncode == 0
+
+
+def inspect_bump_branch(root, branch, base_sha):
     repo = repository()
     base = os.environ["DEFAULT_BRANCH"]
     owner = repo.split("/")[0]
@@ -469,13 +478,31 @@ def open_bump_pr(root, branch, base_sha, title, body, apply_changes):
     existing = github_paged(
         f"/repos/{repo}/pulls?state=open&base={base}&head={owner}:{branch}"
     )
+    if exists and not owned and not existing:
+        if not branch_merged_into_base(root, remote_commit, base_sha):
+            raise RuntimeError(
+                f"origin/{branch} carries maintainer commits, has no open PR, and "
+                f"is not merged into origin/{base}; delete or rename that branch "
+                "before rerunning the version bump pipeline"
+            )
+        print(f"origin/{branch} is merged; recreating it for the next bump.")
+    return exists, remote_commit, remote_tree, owned, existing
 
-    if exists and not owned:
-        number = existing[0]["number"] if existing else None
+
+def open_bump_pr(
+    root, branch, base_sha, title, body, apply_changes, branch_state=None
+):
+    repo = repository()
+    base = os.environ["DEFAULT_BRANCH"]
+    if branch_state is None:
+        branch_state = inspect_bump_branch(root, branch, base_sha)
+    exists, remote_commit, remote_tree, owned, existing = branch_state
+
+    if exists and not owned and existing:
+        number = existing[0]["number"]
         print(
             f"{branch} carries maintainer commits; leaving the branch"
-            + (f" and PR #{number}" if number else "")
-            + " untouched."
+            f" and PR #{number} untouched."
         )
         return number
 
@@ -528,6 +555,13 @@ def run_crate_track(root, base_sha):
     if has_open_bump_pr(changes, CRATE_BRANCH):
         print("Another open crate bump PR already proposes these versions; skipping.")
         return
+    branch_state = inspect_bump_branch(root, CRATE_BRANCH, base_sha)
+    if branch_state[0] and not branch_state[3] and branch_state[4]:
+        print(
+            f"{CRATE_BRANCH} carries maintainer commits; leaving the branch and "
+            f"PR #{branch_state[4][0]['number']} untouched."
+        )
+        return
     summary = "\n".join(
         summary_line(crate, old, new) for crate, (old, new) in changes.items()
     )
@@ -546,6 +580,7 @@ def run_crate_track(root, base_sha):
             "preserving its path and disabled default features.",
         ),
         lambda branch_root: apply_crate_bumps(branch_root, changes),
+        branch_state,
     )
     print(summary)
 
@@ -558,6 +593,13 @@ def run_python_track(root, base_sha):
         return
     if has_open_bump_pr(changes, PYTHON_BRANCH):
         print(f"Another open {PYTHON_DIST} bump PR already proposes this version; skipping.")
+        return
+    branch_state = inspect_bump_branch(root, PYTHON_BRANCH, base_sha)
+    if branch_state[0] and not branch_state[3] and branch_state[4]:
+        print(
+            f"{PYTHON_BRANCH} carries maintainer commits; leaving the branch and "
+            f"PR #{branch_state[4][0]['number']} untouched."
+        )
         return
     old, new = changes[PYTHON_DIST]
     summary = summary_line(PYTHON_DIST, old, new)
@@ -574,6 +616,7 @@ def run_python_track(root, base_sha):
             "The independently versioned `mssql-py-core` Rust crate is unchanged.",
         ),
         lambda branch_root: apply_python_bump(branch_root, changes),
+        branch_state,
     )
     print(summary)
 
