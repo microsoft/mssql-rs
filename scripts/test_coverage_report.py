@@ -1012,6 +1012,7 @@ def test_request_rejects_header_newlines(monkeypatch, poll_clock):
 
 def test_request_interrupts_trickling_response():
     received = threading.Event()
+    abandoned = threading.Event()
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
             body = b'{"value":[]}'
@@ -1023,7 +1024,8 @@ def test_request_interrupts_trickling_response():
                 for byte in body:
                     self.wfile.write(bytes([byte]))
                     self.wfile.flush()
-                    time.sleep(0.2)
+                    if abandoned.wait(1.0):
+                        return
             except (BrokenPipeError, ConnectionResetError):
                 pass
 
@@ -1034,12 +1036,15 @@ def test_request_interrupts_trickling_response():
         thread = threading.Thread(target=server.serve_forever)
         thread.start()
         try:
+            # The deadline also covers starting curl, which has taken a loaded
+            # Windows agent over 0.3 s; the 12 s trickle still dwarfs it.
             start = time.monotonic()
             with pytest.raises(TimeoutError):
-                polling.get_json(f"http://127.0.0.1:{server.server_port}/", deadline=start + 0.3)
+                polling.get_json(f"http://127.0.0.1:{server.server_port}/", deadline=start + 2.0)
             elapsed = time.monotonic() - start
             assert received.is_set()
-            assert elapsed < 1.0
+            assert elapsed < 4.0
         finally:
+            abandoned.set()
             server.shutdown()
             thread.join()
