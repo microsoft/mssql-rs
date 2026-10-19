@@ -65,8 +65,10 @@ cargo() {
   printf '\n' >> commands.log
 }
 """
+        script_path = tmp_path / "run-step.sh"
+        script_path.write_text(mocks + script, encoding="utf-8", newline="\n")
         result = subprocess.run(
-            [_BASH, "-s"], cwd=tmp_path, input=mocks + script,
+            [_BASH, script_path.name], cwd=tmp_path,
             env={
                 **os.environ,
                 "BUILD_REASON": "Manual",
@@ -86,6 +88,13 @@ cargo() {
         return result, commands
 
     return run
+
+
+def test_bash_script_uses_lf_newlines(run_script, tmp_path):
+    result, _ = run_script("printf 'first\\n'\nprintf 'second\\n'\n")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout == "first\nsecond\n"
+    assert b"\r" not in (tmp_path / "run-step.sh").read_bytes()
 
 
 def test_checkout_and_fetch_precede_repository_execution(steps):
