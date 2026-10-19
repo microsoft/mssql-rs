@@ -10,8 +10,6 @@
 #
 # Test failures and per-file crashes block PRs but warn in CI.
 # A broken harness still fails the job in either mode.
-# A second pass then runs upstream's stress-marked tests; its test failures are
-# advisory everywhere.
 # Every test file runs in its own bounded pytest process
 # (run-mssql-python-odbc-tests.sh), so the job reports results instead of
 # stalling or losing the whole run to one segfault.
@@ -39,18 +37,13 @@ parameters:
   - name: pytestTotalBudget
     type: string
     default: '110m'
-  # Marker expression for the stress pass that runs after the functional suite.
-  # `slow` (the fixed 5-minute sustained-load test) is excluded on PRs; a
-  # scheduled run can pass 'stress' to include it.
-  - name: pytestStressMarker
+  # pytest `-m` expression, replacing upstream pytest.ini's `-m "not stress"`.
+  # 'not slow' adds the stress tests (multithreaded load, pool exhaustion, GIL
+  # release, large result sets) but leaves out the fixed 5-minute sustained-load
+  # test; '' selects every test.
+  - name: pytestMarker
     type: string
-    default: 'stress and not slow'
-  # Wall-clock budget for the stress pass. A healthy run takes ~1.5m;
-  # the budget only bounds a driver that hangs, and keeps publish/cleanup inside
-  # the job timeout.
-  - name: pytestStressTotalBudget
-    type: string
-    default: '20m'
+    default: 'not slow'
 
 steps:
 - template: generate-sql-password-template.yml
@@ -229,6 +222,7 @@ steps:
     rc=0
     docker exec \
       -e DB_CONNECTION_STRING \
+      -e PYTEST_MARK_EXPR="${{ parameters.pytestMarker }}" \
       -e PYTEST_FILE_TIMEOUT="${{ parameters.pytestFileTimeout }}" \
       -e PYTEST_TOTAL_BUDGET="${{ parameters.pytestTotalBudget }}" \
       -e TEST_RESULTS_DIR=/workspace/test-results \
@@ -273,58 +267,14 @@ steps:
   env:
     DB_CONNECTION_STRING: "Server=sqlserver,1433;Database=TestDB;Uid=SA;Pwd=$(SQL_PASSWORD);TrustServerCertificate=yes"
 
-# Upstream's stress-marked tests (multithreaded load, pool exhaustion, GIL
-# release, large result sets) are deselected from the run above by pytest.ini.
-# They have no history against mssql-odbc yet, so test failures are advisory in
-# every mode, PRs included. Harness failures still fail the job.
-- script: |
-    rc=0
-    docker exec \
-      -e DB_CONNECTION_STRING \
-      -e PYTEST_MARK_EXPR="${{ parameters.pytestStressMarker }}" \
-      -e PYTEST_FILE_GREP='mark\.stress' \
-      -e PYTEST_FILE_TIMEOUT="${{ parameters.pytestFileTimeout }}" \
-      -e PYTEST_TOTAL_BUDGET="${{ parameters.pytestStressTotalBudget }}" \
-      -e TEST_RESULTS_DIR=/workspace/test-results-stress \
-      mssql-python-odbc-tests bash -c '
-        source /opt/venv/bin/activate
-        bash /mssql-rs-scripts/run-mssql-python-odbc-tests.sh
-      ' || rc=$?
-
-    case "$rc" in
-      0) ;;
-      1)
-        echo "##vso[task.logissue type=warning]mssql-python stress tests did not fully pass against mssql-odbc (advisory)"
-        echo "##vso[task.complete result=SucceededWithIssues;]"
-        exit 0
-        ;;
-      2)
-        echo "##vso[task.logissue type=error]mssql-python stress test harness could not run (exit 2) - broken test environment, not a driver defect"
-        ;;
-      125|126|127)
-        echo "##vso[task.logissue type=error]docker exec could not launch the stress test harness (exit $rc) - broken test environment, not a driver defect"
-        ;;
-      *)
-        echo "##vso[task.logissue type=error]mssql-python stress tests exited unexpectedly against mssql-odbc (exit $rc)"
-        ;;
-    esac
-    exit "$rc"
-  displayName: Run mssql-python stress tests against mssql-odbc (advisory)
-  # Backstop for a wedged `docker exec`; the runner's own budget is the normal
-  # bound. Must stay below what is left of the job timeout.
-  timeoutInMinutes: 30
-  env:
-    DB_CONNECTION_STRING: "Server=sqlserver,1433;Database=TestDB;Uid=SA;Pwd=$(SQL_PASSWORD);TrustServerCertificate=yes"
-
 - script: |
     set -uo pipefail
     # Stage the JUnit reports under the sources dir: PublishTestResults globs
     # relative to a search folder, so keeping the pattern free of '..' avoids
     # any ambiguity about where it resolves.
-    mkdir -p mssql-python-odbc-test-results mssql-python-odbc-stress-test-results
+    mkdir -p mssql-python-odbc-test-results
     cp ../mssql-python/test-results/*.xml mssql-python-odbc-test-results/ 2>/dev/null || true
-    cp ../mssql-python/test-results-stress/*.xml mssql-python-odbc-stress-test-results/ 2>/dev/null || true
-    ls -la mssql-python-odbc-test-results mssql-python-odbc-stress-test-results || true
+    ls -la mssql-python-odbc-test-results || true
   displayName: Collect test results
   condition: always()
   continueOnError: true
@@ -342,24 +292,11 @@ steps:
     failTaskOnFailedTests: false
     publishRunAttachments: true
 
-- task: PublishTestResults@2
-  displayName: Publish mssql-python stress (mssql-odbc driver) test results
-  condition: always()
-  continueOnError: true
-  inputs:
-    testResultsFormat: JUnit
-    searchFolder: '$(Build.SourcesDirectory)/mssql-python-odbc-stress-test-results'
-    testResultsFiles: '*.xml'
-    testRunTitle: 'mssql-python stress tests on mssql-odbc driver'
-    mergeTestResults: true
-    failTaskOnFailedTests: false
-    publishRunAttachments: true
-
 - script: |
     docker rm -f mssql-python-odbc-tests || true
     docker rm -f sqlserver-odbc-swap || true
     docker network rm mssqlpy-odbc-net || true
     sudo rm -rf ../mssql-python || true
-    sudo rm -rf odbc-swap-drop mssql-python-odbc-test-results mssql-python-odbc-stress-test-results || true
+    sudo rm -rf odbc-swap-drop mssql-python-odbc-test-results || true
   displayName: Cleanup
   condition: always()

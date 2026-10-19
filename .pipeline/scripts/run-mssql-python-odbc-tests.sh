@@ -32,14 +32,9 @@
 #   TEST_RESULTS_DIR         JUnit XML output directory (default: $MSSQL_PYTHON_DIR/test-results).
 #   PYTEST_FILE_TIMEOUT      Per-file wall-clock budget (default: 10m).
 #   PYTEST_TOTAL_BUDGET      Wall-clock budget for the whole loop (default: 110m).
-#   PYTEST_MARK_EXPR         Optional pytest `-m` expression. Upstream pytest.ini's
-#                            addopts carries `-m "not stress"`; a later `-m` on the
-#                            command line replaces it, which is how the stress run
-#                            selects `stress and not slow`.
-#   PYTEST_FILE_GREP         Optional extended regex. Only test files whose contents
-#                            match are run, so a marker-selected run does not spawn
-#                            a pytest process (and a "no tests" report) for every
-#                            file that has none of the selected tests.
+#   PYTEST_MARK_EXPR         pytest `-m` expression. When set (even to ""), it replaces
+#                            the `-m "not stress"` in upstream pytest.ini's addopts;
+#                            "" selects every test. Unset keeps the pytest.ini default.
 #
 # Exit codes:
 #   0  every file passed.
@@ -57,11 +52,9 @@ MSSQL_PYTHON_DIR="${MSSQL_PYTHON_DIR:-/workspace}"
 RESULTS_DIR="${TEST_RESULTS_DIR:-$MSSQL_PYTHON_DIR/test-results}"
 PYTEST_FILE_TIMEOUT="${PYTEST_FILE_TIMEOUT:-10m}"
 PYTEST_TOTAL_BUDGET="${PYTEST_TOTAL_BUDGET:-110m}"
-PYTEST_MARK_EXPR="${PYTEST_MARK_EXPR:-}"
-PYTEST_FILE_GREP="${PYTEST_FILE_GREP:-}"
 
 declare -a MARK_ARGS=()
-if [ -n "$PYTEST_MARK_EXPR" ]; then
+if [ -n "${PYTEST_MARK_EXPR+set}" ]; then
     MARK_ARGS=(-m "$PYTEST_MARK_EXPR")
 fi
 
@@ -117,12 +110,8 @@ report_name() {
 # would otherwise vanish from this job while the summary still looked complete.
 mapfile -t TEST_FILES < <(find tests -name 'test_*.py' -type f | sort)
 
-if [ -n "$PYTEST_FILE_GREP" ] && [ "${#TEST_FILES[@]}" -gt 0 ]; then
-    mapfile -t TEST_FILES < <(grep -lE -- "$PYTEST_FILE_GREP" "${TEST_FILES[@]}" | sort)
-fi
-
 if [ "${#TEST_FILES[@]}" -eq 0 ]; then
-    echo "##[error]No test files found under $MSSQL_PYTHON_DIR/tests${PYTEST_FILE_GREP:+ matching /$PYTEST_FILE_GREP/}"
+    echo "##[error]No test files found under $MSSQL_PYTHON_DIR/tests"
     exit 2
 fi
 
@@ -150,7 +139,7 @@ fi
 
 echo "Running ${#TEST_FILES[@]} mssql-python test files against the mssql-odbc driver"
 echo "Per-file timeout: $PYTEST_FILE_TIMEOUT (${FILE_BUDGET_S}s) | total budget: $PYTEST_TOTAL_BUDGET (${TOTAL_BUDGET_S}s)"
-echo "Marker expression: ${PYTEST_MARK_EXPR:-<pytest.ini default>}"
+echo "Marker expression: ${PYTEST_MARK_EXPR-<pytest.ini default>}"
 
 declare -a SUMMARY=()
 passed=0 failed=0 crashed=0 timedout=0 empty=0 skipped=0

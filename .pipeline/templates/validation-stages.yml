@@ -833,15 +833,14 @@ stages:
   #
   # The time bounds nest deliberately: the runner caps the whole test loop at
   # pytestTotalBudget (110m), the test step backstops a wedged `docker exec` at
-  # 130m, the advisory stress pass adds pytestStressTotalBudget (20m) under a 30m
-  # step backstop, and the job allows 180m so the ~20m left over covers setup
-  # (image pull, apt, cargo build, pybind build) and still guarantees the publish
-  # and cleanup steps run. A job cancelled by the server for timeout skips
+  # 130m, and the job allows 150m so the ~20m left over covers setup (image pull,
+  # apt, cargo build, pybind build) and still guarantees the publish and cleanup
+  # steps run. A job cancelled by the server for timeout skips
   # `condition: always()` steps, which would lose the report this job exists to
   # produce.
   - job: Test_mssql_python_on_mssql_odbc
     displayName: mssql-python suite on mssql-odbc driver (cross-repo)
-    timeoutInMinutes: 180
+    timeoutInMinutes: 150
     pool:
       name: ${{ parameters.poolName }}
       demands:
