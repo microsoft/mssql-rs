@@ -273,6 +273,16 @@ pub(crate) struct DbcState {
     pub(crate) last_char_set: Option<String>,
 }
 
+impl DbcState {
+    pub(crate) fn cancel_timeout_secs(&self) -> u32 {
+        if self.connection_timeout == 0 {
+            120
+        } else {
+            self.connection_timeout
+        }
+    }
+}
+
 /// The connection identity that does not vary by database.
 ///
 /// Deliberately holds no credential: the connection string is never retained,
@@ -445,6 +455,17 @@ mod tests {
     use crate::test_support::TestHandles;
 
     use super::*;
+
+    #[test]
+    fn cancellation_timeout_uses_default_only_for_zero() {
+        let h = TestHandles::with_env_dbc();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let mut state = dbc.inner.lock().unwrap();
+        for (configured, expected) in [(0, 120), (1, 1), (30, 30), (u32::MAX, u32::MAX)] {
+            state.connection_timeout = configured;
+            assert_eq!(state.cancel_timeout_secs(), expected);
+        }
+    }
 
     #[test]
     fn debug_redacts_the_token_and_reports_the_attribute_state() {
