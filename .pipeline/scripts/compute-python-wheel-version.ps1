@@ -6,16 +6,21 @@
   Resolves the mssql-python-rs wheel version ONCE for the whole run.
 
 .DESCRIPTION
-  Reads the base version from mssql-py-core/pyproject.toml and emits the PEP 440
-  version every build job must stamp into the wheel, as the `pyCoreWheelVersion`
+  Reads [project].version from mssql-py-core/pyproject.toml and emits the PEP 440
+  version every build job stamps into the wheel, as the `pyCoreWheelVersion`
   pipeline OUTPUT variable. Computing it once (UTC date resolved here) keeps the
   parallel build jobs on an identical version even across a UTC-midnight boundary.
 
   Channel selection (PyPI feeds store a distribution by the version baked into the
   wheel, so each run needs a unique PEP 440 version):
-    * Official release  -> empty (wheel keeps the committed manifest version)
-    * Nightly schedule  -> base + .dev<date>           (e.g. 0.1.0.dev20260217)
-    * CI / dev builds   -> base + .dev<date><buildId>  (e.g. 0.1.0.dev20260217123456)
+    * Official release  -> committed version as-is      (e.g. 0.3.0)
+    * Nightly schedule  -> base + .dev<date>           (e.g. 0.3.0.dev20260217)
+    * CI / dev builds   -> base + .dev<date><buildId>  (e.g. 0.3.0.dev20260217123456)
+
+  A value is always emitted. Azure Pipelines leaves `$(name)` macros unexpanded when
+  the variable is empty, so an empty output would reach the build and Publish jobs
+  as the literal text `$(pyCoreWheelVersion)`. For official builds the stamp
+  rewrites [project].version with its committed value, which is a no-op.
 
 .PARAMETER PyprojectPath
   Path to the distribution's pyproject.toml (default mssql-py-core/pyproject.toml).
@@ -27,8 +32,7 @@
   $(Build.BuildId), appended to the dev segment to keep CI builds unique.
 
 .PARAMETER IsOfficial
-  'True' leaves the version empty so the build keeps the committed manifest version
-  (the release channel publishes the exact version in source).
+  'True' selects the release channel (the committed version, no .dev segment).
 #>
 [CmdletBinding()]
 param(
@@ -40,24 +44,24 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-if ($IsOfficial -eq 'True') {
-    Write-Host 'Official build: leaving the wheel at its committed manifest version (no stamp).'
-    Write-Host "##vso[task.setvariable variable=pyCoreWheelVersion;isOutput=true]"
-    exit 0
-}
-
 $py = Get-Content $PyprojectPath -Raw
-if ($py -match '(?ms)^\[project\].*?^version\s*=\s*"([^"]+)"') { $base = $Matches[1] }
-else { Write-Error "Could not read [project].version from $PyprojectPath"; exit 1 }
+$section = [regex]::Match($py, '(?ms)^\[project\]\s*$(?<body>.*?)(?=^\[|\z)')
+$field = [regex]::Match($section.Groups['body'].Value, '(?m)^\s*version\s*=\s*"([^"]+)"')
+if (-not $field.Success) {
+    throw "Could not read [project].version from $PyprojectPath"
+}
+$base = $field.Groups[1].Value
 
-$date = [DateTime]::UtcNow.ToString('yyyyMMdd')
-if ($BuildReason -eq 'Schedule') {
-    $ver = "$base.dev$date"          # nightly: one build per day
+if ($IsOfficial -eq 'True') {
+    $ver = $base
+}
+elseif ($BuildReason -eq 'Schedule') {
+    $ver = "$base.dev$([DateTime]::UtcNow.ToString('yyyyMMdd'))"
 }
 else {
-    $ver = "$base.dev$date$BuildId"  # CI/dev: unique per build
+    $ver = "$base.dev$([DateTime]::UtcNow.ToString('yyyyMMdd'))$BuildId"
 }
 
 Write-Host "Resolved wheel version (computed once): $ver"
-Write-Host "Base: $base | Reason: $BuildReason"
+Write-Host "Base: $base | Reason: $BuildReason | Official: $IsOfficial"
 Write-Host "##vso[task.setvariable variable=pyCoreWheelVersion;isOutput=true]$ver"

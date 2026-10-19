@@ -12,6 +12,7 @@ import itertools
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -1326,11 +1327,11 @@ def test_manylinux_repair_does_not_depend_on_odbc(architecture: str, build_odbc:
         ("Schedule", False, ".dev{date}"),
         ("IndividualCI", False, ".dev{date}12345"),
         ("Manual", False, ".dev{date}12345"),
-        ("Manual", True, None),
+        ("Manual", True, ""),
     ],
 )
-def test_nonofficial_wheel_versions_follow_pep440(
-    build_reason: str, is_official: bool, expected_suffix: str | None
+def test_wheel_versions_follow_pep440(
+    build_reason: str, is_official: bool, expected_suffix: str
 ) -> None:
     flags = _stage_flags(
         buildAllTargets=True,
@@ -1363,16 +1364,14 @@ def test_nonofficial_wheel_versions_follow_pep440(
         result.stdout,
     )
     assert match is not None, result.stdout
+    # Never empty: ADO leaves an empty $(pyCoreWheelVersion) macro unexpanded.
     emitted = match.group(1).strip()
-    if expected_suffix is None:
-        assert emitted == "", f"official build must not stamp a version, got {emitted!r}"
-    else:
-        from datetime import datetime, timezone
+    from datetime import datetime, timezone
 
-        date = datetime.now(timezone.utc).strftime("%Y%m%d")
-        pyproject = (_ROOT / "mssql-py-core" / "pyproject.toml").read_text(encoding="utf-8")
-        base = re.search(r'(?ms)^\[project\].*?^version\s*=\s*"([^"]+)"', pyproject).group(1)
-        assert emitted == base + expected_suffix.format(date=date)
+    date = datetime.now(timezone.utc).strftime("%Y%m%d")
+    pyproject = (_ROOT / "mssql-py-core" / "pyproject.toml").read_text(encoding="utf-8")
+    base = re.search(r'(?ms)^\[project\].*?^version\s*=\s*"([^"]+)"', pyproject).group(1)
+    assert emitted == base + expected_suffix.format(date=date)
 
 
 @pytest.mark.parametrize("build_sqlcmd", (False, True))
@@ -1397,6 +1396,135 @@ def test_publish_stage_splits_twine_wheels_from_sqlcmd_nuget(build_sqlcmd: bool)
         assert sqlcmd["variables"]["ob_nugetPublishing_enabled"] is True
         assert "isCustom" not in sqlcmd["pool"]
         assert sqlcmd["steps"][0]["artifact"] == "drop_Build_MssqlSqlcmd_Package"
+
+
+def test_publish_validation_reads_wheel_version_from_env() -> None:
+    flags = _stage_flags(publishToFeed=True)
+    pipeline = expand(yaml.safe_load(_BUILD_STAGES.read_text(encoding="utf-8")), flags)
+    publish = next(stage for stage in pipeline["stages"] if stage["stage"] == "Publish")
+    step = next(
+        step
+        for step in publish["jobs"][0]["steps"]
+        if step.get("displayName") == "Validate wheel metadata and ODBC payloads"
+    )
+    # Inside a pwsh string, "$(pyCoreWheelVersion)" is a subexpression, not text.
+    assert "$(pyCoreWheelVersion)" not in step["pwsh"]
+    assert step["env"]["PY_CORE_WHEEL_VERSION"] == "$(pyCoreWheelVersion)"
+
+
+_STAMP_PYPROJECT = """[build-system]
+requires = ["maturin>=1.0,<2.0"]
+
+[project]
+name = "mssql-python-rs"
+version = "0.3.0"
+requires-python = ">=3.10"
+
+[project.urls]
+Source = "https://github.com/microsoft/mssql-rs"
+
+[tool.example]
+version = "9.9.9"
+"""
+_STAMP_CARGO = """[package]
+name = "mssql-py-core"
+version = "0.1.10"
+
+[dependencies]
+pyo3 = { version = "0.29.0" }
+
+[dependencies.foo]
+version = "2.0"
+"""
+
+
+def _run_stamp(tmp_path: Path, runner: str, version: str, pyproject: str = _STAMP_PYPROJECT):
+    package = tmp_path / "mssql-py-core"
+    package.mkdir(exist_ok=True)
+    (package / "pyproject.toml").write_text(pyproject, encoding="utf-8", newline="\n")
+    (package / "Cargo.toml").write_text(_STAMP_CARGO, encoding="utf-8", newline="\n")
+    if runner == "pwsh":
+        command = [
+            "pwsh", "-NoProfile", "-NonInteractive", "-File",
+            str(_ROOT / ".pipeline" / "scripts" / "stamp-python-wheel-version.ps1"),
+            "-Version", version,
+        ]
+    else:
+        if shutil.which("bash") is None:
+            pytest.skip("bash is not available")
+        # Run from a wrapper file next to the manifests: WSL bash on Windows neither
+        # maps Windows paths nor inherits env, and re-parses `bash -c` arguments.
+        shutil.copy2(
+            _ROOT / ".pipeline" / "scripts" / "stamp-python-wheel-version.sh",
+            tmp_path / "stamp.sh",
+        )
+        (tmp_path / "run.sh").write_text(
+            f"WHEEL_VERSION={shlex.quote(version)} bash stamp.sh\n", encoding="utf-8", newline="\n"
+        )
+        command = ["bash", "run.sh"]
+    result = subprocess.run(
+        command,
+        cwd=tmp_path,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+    return (
+        result,
+        (package / "pyproject.toml").read_text(encoding="utf-8"),
+        (package / "Cargo.toml").read_text(encoding="utf-8"),
+    )
+
+
+@pytest.mark.parametrize("runner", ("pwsh", "bash"))
+def test_stamp_rewrites_only_project_version(tmp_path: Path, runner: str) -> None:
+    result, pyproject, cargo = _run_stamp(tmp_path, runner, "0.3.0.dev2026101912345")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert pyproject == _STAMP_PYPROJECT.replace(
+        'version = "0.3.0"', 'version = "0.3.0.dev2026101912345"'
+    )
+    assert 'version = "9.9.9"' in pyproject
+    assert cargo == _STAMP_CARGO
+
+
+@pytest.mark.parametrize("runner", ("pwsh", "bash"))
+def test_stamp_with_committed_version_is_a_no_op(tmp_path: Path, runner: str) -> None:
+    result, pyproject, cargo = _run_stamp(tmp_path, runner, "0.3.0")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert pyproject == _STAMP_PYPROJECT
+    assert cargo == _STAMP_CARGO
+
+
+@pytest.mark.parametrize("runner", ("pwsh", "bash"))
+@pytest.mark.parametrize("version", ("$(pyCoreWheelVersion)", "", "0.3.0-dev.1"))
+def test_stamp_rejects_values_that_are_not_pep440(tmp_path: Path, runner: str, version: str) -> None:
+    result, pyproject, cargo = _run_stamp(tmp_path, runner, version)
+    assert result.returncode != 0
+    output = result.stdout + result.stderr
+    assert "not a PEP 440 version" in output
+    assert f"'{version}'" in output.replace("\n", "")
+    assert pyproject == _STAMP_PYPROJECT
+    assert cargo == _STAMP_CARGO
+
+
+@pytest.mark.parametrize("runner", ("pwsh", "bash"))
+@pytest.mark.parametrize(
+    "pyproject",
+    (
+        _STAMP_PYPROJECT.replace('version = "0.3.0"\n', ""),
+        _STAMP_PYPROJECT.replace('version = "0.3.0"\n', 'version = "0.3.0"\nversion = "0.4.0"\n'),
+    ),
+    ids=("missing", "duplicate"),
+)
+def test_stamp_requires_exactly_one_project_version(
+    tmp_path: Path, runner: str, pyproject: str
+) -> None:
+    result, after, _ = _run_stamp(tmp_path, runner, "0.3.0.dev1", pyproject)
+    assert result.returncode != 0
+    assert "Expected one version line in [project]" in result.stdout + result.stderr
+    assert after == pyproject
 
 
 _TWINE_UPLOAD = _ROOT / ".pipeline" / "scripts" / "twine-upload.ps1"

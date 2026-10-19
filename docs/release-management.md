@@ -126,14 +126,15 @@ crate with a different version.
 
 The PyPI feed stores each distribution under the version baked into the wheel and
 never accepts the same file twice, so non-official builds stamp a unique PEP 440
-development version into the manifests before building. A `ComputeWheelVersion`
-job resolves it once per run so every platform wheel matches:
+development version into `[project].version` before building (`Cargo.toml` is not
+touched). A `ComputeWheelVersion` job resolves it once per run so every platform
+wheel matches:
 
 | Build Type | Version Format | Example |
 |---|---|---|
 | **Nightly** (scheduled) | `{version}.dev{YYYYMMDD}` | `0.3.0.dev20260217` |
 | **Dev** (CI push / manual non-official) | `{version}.dev{YYYYMMDD}{BuildId}` | `0.3.0.dev20260217140071` |
-| **Release** (official) | `{version}` (committed, not stamped) | `0.3.0` |
+| **Release** (official) | `{version}` (the committed value; stamping it is a no-op) | `0.3.0` |
 | **PR** | Wheels built for validation only — **not published** | — |
 
 Dates are UTC. Always pin an exact version (`==`) when consuming feed builds:
@@ -443,7 +444,7 @@ If a critical bug is found after release:
 | `.pipeline/OneBranch/stages.yml` | Build + Publish stages — wheel version computation, build jobs, twine upload of wheels, `mssql-sqlcmd` NuGet publish |
 | `.pipeline/OneBranch/OfficialPythonWheelsRelease.yml` | Independent opt-in wheel feed upload and Rust crate releases from an existing Official Build, plus optional `mssql-py-core` tagging |
 | `.pipeline/scripts/compute-python-wheel-version.ps1` | Resolves the run's PEP 440 wheel version once |
-| `.pipeline/scripts/stamp-python-wheel-version.ps1` / `.sh` | Stamps that version into `pyproject.toml` and `Cargo.toml` before building |
+| `.pipeline/scripts/stamp-python-wheel-version.ps1` / `.sh` | Stamps that version into `[project].version` of `pyproject.toml` before building |
 | `.pipeline/scripts/twine-upload.ps1` | Uploads wheels missing from the feed; skips identical published files and rejects mismatched ones |
 | `.pipeline/templates/build-python-wheels-template.yml` | Shared wheel build template (manylinux, musllinux, Windows, macOS) |
 | `.pipeline/templates/install-dependencies.yml` | Dependency installation (Rust, Python, etc.) |
