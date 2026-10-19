@@ -10,6 +10,7 @@ use mssql_tds::datatypes::sqldatatypes::TdsDataType;
 use mssql_tds::query::metadata::ColumnMetadata;
 use tracing::{debug, error};
 
+use crate::api::alias_types::alias_type_name_for_column;
 use crate::api::describe_col::{column_size, decimal_digits, odbc_sql_type};
 use crate::api::odbc_types::{
     SQL_ATTR_READWRITE_UNKNOWN, SQL_BIGINT, SQL_C_BINARY, SQL_C_BIT, SQL_C_CHAR, SQL_C_DATE,
@@ -20,13 +21,13 @@ use crate::api::odbc_types::{
     SQL_DATETIME, SQL_DECIMAL, SQL_DESC_AUTO_UNIQUE_VALUE, SQL_DESC_BASE_COLUMN_NAME,
     SQL_DESC_CASE_SENSITIVE, SQL_DESC_CONCISE_TYPE, SQL_DESC_COUNT,
     SQL_DESC_DATETIME_INTERVAL_CODE, SQL_DESC_DISPLAY_SIZE, SQL_DESC_FIXED_PREC_SCALE,
-    SQL_DESC_LABEL, SQL_DESC_LENGTH, SQL_DESC_NAME, SQL_DESC_NULLABLE, SQL_DESC_NUM_PREC_RADIX,
-    SQL_DESC_OCTET_LENGTH, SQL_DESC_PRECISION, SQL_DESC_SCALE, SQL_DESC_SEARCHABLE, SQL_DESC_TYPE,
-    SQL_DESC_TYPE_NAME, SQL_DESC_UNNAMED, SQL_DESC_UNSIGNED, SQL_DESC_UPDATABLE, SQL_DOUBLE,
-    SQL_ERROR, SQL_FLOAT, SQL_INTEGER, SQL_INVALID_HANDLE, SQL_NAMED, SQL_NO_NULLS, SQL_NULLABLE,
-    SQL_NUMERIC, SQL_PRED_BASIC, SQL_PRED_CHAR, SQL_PRED_NONE, SQL_PRED_SEARCHABLE, SQL_REAL,
-    SQL_SMALLINT, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SQL_UNNAMED, SqlHandle, SqlLen, SqlPointer,
-    SqlReturn, SqlSmallInt, SqlUSmallInt, SqlWChar,
+    SQL_DESC_LABEL, SQL_DESC_LENGTH, SQL_DESC_LOCAL_TYPE_NAME, SQL_DESC_NAME, SQL_DESC_NULLABLE,
+    SQL_DESC_NUM_PREC_RADIX, SQL_DESC_OCTET_LENGTH, SQL_DESC_PRECISION, SQL_DESC_SCALE,
+    SQL_DESC_SEARCHABLE, SQL_DESC_TYPE, SQL_DESC_TYPE_NAME, SQL_DESC_UNNAMED, SQL_DESC_UNSIGNED,
+    SQL_DESC_UPDATABLE, SQL_DOUBLE, SQL_ERROR, SQL_FLOAT, SQL_INTEGER, SQL_INVALID_HANDLE,
+    SQL_NAMED, SQL_NO_NULLS, SQL_NULLABLE, SQL_NUMERIC, SQL_PRED_BASIC, SQL_PRED_CHAR,
+    SQL_PRED_NONE, SQL_PRED_SEARCHABLE, SQL_REAL, SQL_SMALLINT, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO,
+    SQL_UNNAMED, SqlHandle, SqlLen, SqlPointer, SqlReturn, SqlSmallInt, SqlUSmallInt, SqlWChar,
 };
 use crate::api::sqlstate::{
     ERR_FUNCTION_SEQUENCE, ERR_INVALID_DESCRIPTOR_FIELD, ERR_INVALID_DESCRIPTOR_INDEX,
@@ -135,6 +136,33 @@ fn sql_col_attribute_w_safe(
     string_length_ptr: *mut SqlSmallInt,
     numeric_attribute_ptr: *mut SqlLen,
 ) -> SqlReturn {
+    // Cleared in a scope of its own, released before the DBC and ENV locks
+    // below, so a call that fails at one of them does not report a previous
+    // call's records.
+    {
+        let Ok(mut stmt_state) = stmt.inner.lock() else {
+            error!("SQLColAttributeW: stmt mutex poisoned");
+            return SQL_ERROR;
+        };
+        free_errors(&mut stmt_state);
+    }
+
+    // Resolved before the stmt lock: the lookup takes the DBC lock first and
+    // may need the session for a round trip.
+    let alias = if matches!(
+        field_identifier,
+        SQL_DESC_TYPE_NAME | SQL_DESC_LOCAL_TYPE_NAME
+    ) {
+        let Ok(alias) =
+            alias_type_name_for_column(stmt.parent_dbc(), stmt, usize::from(column_number))
+        else {
+            return SQL_ERROR;
+        };
+        alias
+    } else {
+        None
+    };
+
     // The declared ODBC version selects the temporal sql_variant C types. Read
     // it before the stmt lock to preserve parent-before-child lock ordering.
     let variant_uses_3_80_types = if field_identifier == SQL_CA_SS_VARIANT_TYPE {
@@ -152,8 +180,6 @@ fn sql_col_attribute_w_safe(
         error!("SQLColAttributeW: stmt mutex poisoned");
         return SQL_ERROR;
     };
-
-    free_errors(&mut stmt_state);
 
     if !stmt_state.has_state(STMT_STATE_EXEC_CONTEXT) {
         post_diag(&mut stmt_state, ERR_FUNCTION_SEQUENCE);
@@ -203,8 +229,12 @@ fn sql_col_attribute_w_safe(
         return SQL_SUCCESS;
     }
 
+    // Another call may have replaced the result while the lookup ran.
+    let alias_type_name = alias
+        .filter(|alias| alias.result_generation == stmt_state.result_generation)
+        .map(|alias| alias.name);
     let meta = &stmt_state.column_metadata[(column_number - 1) as usize];
-    let Some(attr) = column_attribute(meta, field_identifier) else {
+    let Some(attr) = column_attribute(meta, field_identifier, alias_type_name.as_deref()) else {
         post_diag(&mut stmt_state, ERR_INVALID_DESCRIPTOR_FIELD);
         return SQL_ERROR;
     };
@@ -246,7 +276,11 @@ fn sql_col_attribute_w_safe(
 
 /// Maps a field identifier to its value, or `None` when the field is not one
 /// this driver reports.
-fn column_attribute(meta: &ColumnMetadata, field_identifier: SqlUSmallInt) -> Option<Attr> {
+fn column_attribute(
+    meta: &ColumnMetadata,
+    field_identifier: SqlUSmallInt,
+    alias_type_name: Option<&str>,
+) -> Option<Attr> {
     let attr = match field_identifier {
         SQL_DESC_CONCISE_TYPE => Attr::Numeric(SqlLen::from(concise_type(meta))),
         SQL_DESC_TYPE => Attr::Numeric(SqlLen::from(verbose_type(meta))),
@@ -285,7 +319,13 @@ fn column_attribute(meta: &ColumnMetadata, field_identifier: SqlUSmallInt) -> Op
         // is the alias. COLMETADATA carries no base-column name unless the query
         // is FOR BROWSE, so ODBC's "provenance unknown" answer is the right one.
         SQL_DESC_BASE_COLUMN_NAME => Attr::Text(String::new()),
-        SQL_DESC_TYPE_NAME => Attr::Text(type_name(meta).to_string()),
+        // msodbcsql answers both from the alias-type cache, then the base type
+        // (`GetIRDField`, `sqlcdesc.cpp`).
+        SQL_DESC_TYPE_NAME | SQL_DESC_LOCAL_TYPE_NAME => Attr::Text(
+            alias_type_name
+                .unwrap_or_else(|| type_name(meta))
+                .to_string(),
+        ),
         SQL_CA_SS_UDT_CATALOG_NAME => Attr::Text(
             meta.type_info
                 .udt_info()
@@ -1081,6 +1121,7 @@ mod tests {
             retype_column(&h, 1, *ty, *len);
             assert_eq!(numeric(&h, 1, SQL_DESC_NUM_PREC_RADIX), *radix, "{ty:?}");
             assert_eq!(text(&h, 1, SQL_DESC_TYPE_NAME), *name, "{ty:?}");
+            assert_eq!(text(&h, 1, SQL_DESC_LOCAL_TYPE_NAME), *name, "{ty:?}");
         }
     }
 

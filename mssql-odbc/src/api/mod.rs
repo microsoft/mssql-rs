@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+mod alias_types;
 pub(crate) mod alloc_handle;
 mod attributes;
 mod bind_col;

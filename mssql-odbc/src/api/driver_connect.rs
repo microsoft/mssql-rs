@@ -500,13 +500,14 @@ fn do_connect(
             .unwrap_or(params.server.as_str())
             .to_string(),
     };
-    // Belt-and-braces: `sql_disconnect_safe` already clears this, and the DM
+    // Belt-and-braces: `sql_disconnect_safe` already clears these, and the DM
     // rejects a connect on a still-connected handle with `08002`, so no
     // reachable path arrives here with an entry. Kept because this block is
     // where the new session is published, and deliberately *not* pinned by a
     // test — removing it changes no observable behavior, so any test for it
     // would have to write the field by hand and would pin nothing.
     state.database_user_name = None;
+    state.alias_types = None;
     // Bumped on every successful connect, and read by `publish_lookup` to tell
     // whether the session a lookup queried is still the one on the handle. The
     // other half of that check, `connection_state != Connected`, is false in

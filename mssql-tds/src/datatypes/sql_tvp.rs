@@ -571,10 +571,18 @@ pub(crate) async fn write_tvp_rows(
         packet_writer.write_byte_async(TVP_ROW_TOKEN).await?;
 
         for (column, cell) in columns.iter().zip(row.iter()) {
-            // Context from the column definition keeps the encoding aligned with
-            // the declared metadata; the value bytes come from the cell.
-            let (_, ctx) = column.column_type.to_column_value_and_context(db_collation);
-            let (mut value, _) = cell.to_column_value_and_context(db_collation);
+            let (mut value, cell_ctx) = cell.to_column_value_and_context(db_collation);
+            let ctx = if matches!(column.column_type, SqlType::Variant(_)) {
+                cell_ctx
+            } else {
+                // Context from the column definition keeps ordinary values aligned
+                // with the declared metadata. Variant cells carry their own inner
+                // type metadata, which can differ from the column template.
+                column
+                    .column_type
+                    .to_column_value_and_context(db_collation)
+                    .1
+            };
             // Callers must have run `TvpTableData::validate` first: this can
             // reject a value after `TVP_ROW_TOKEN` and earlier cells are already
             // buffered, which would leave a half-written TVP on the wire.
@@ -612,7 +620,7 @@ mod tests {
         let mut mock = MockNetworkWriter::new(4096);
         let mut writer = PacketWriter::new(PacketType::RpcRequest, &mut mock, None, None);
         value
-            .serialize(&mut writer, &collation, None)
+            .serialize_with_narrow_string_byte_limit(&mut writer, &collation, None, None)
             .await
             .unwrap();
         writer.finalize().await.unwrap();
@@ -688,6 +696,87 @@ mod tests {
             0x00,
         ];
         assert_eq!(bytes, expected);
+    }
+
+    #[tokio::test]
+    async fn variant_cell_uses_its_own_inner_size() {
+        let table = TvpTableData::new(
+            vec![TvpColumnDef::new(SqlType::Variant(Box::new(SqlType::Int(
+                None,
+            ))))],
+            vec![vec![SqlType::Variant(Box::new(SqlType::Varchar(
+                Some(crate::datatypes::sql_string::SqlString::new(
+                    b"hello".to_vec(),
+                    crate::datatypes::sql_string::EncodingType::Utf8,
+                )),
+                5,
+            )))]],
+        );
+        table.validate().unwrap();
+
+        let bytes = row_bytes(&table.columns, &table.rows).await;
+
+        assert_eq!(
+            bytes,
+            vec![
+                TVP_ROW_TOKEN,
+                14,
+                0,
+                0,
+                0,
+                0xA7,
+                7,
+                0,
+                0,
+                0,
+                0,
+                0,
+                5,
+                0,
+                b'h',
+                b'e',
+                b'l',
+                b'l',
+                b'o',
+                TVP_END_TOKEN,
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn variant_cell_rejects_its_own_inner_overflow() {
+        let table = TvpTableData::new(
+            vec![TvpColumnDef::new(SqlType::Variant(Box::new(SqlType::Int(
+                None,
+            ))))],
+            vec![vec![SqlType::Variant(Box::new(SqlType::Varchar(
+                Some(crate::datatypes::sql_string::SqlString::new(
+                    b"hello".to_vec(),
+                    crate::datatypes::sql_string::EncodingType::Utf8,
+                )),
+                4,
+            )))]],
+        );
+        table.validate().unwrap();
+
+        let mut mock = MockNetworkWriter::new(4096);
+        let mut writer = PacketWriter::new(PacketType::RpcRequest, &mut mock, None, None);
+        let error = write_tvp_rows(
+            &mut writer,
+            &table.columns,
+            &table.rows,
+            &default_collation(),
+        )
+        .await
+        .expect_err("the cell's varchar(4) declaration must reject five encoded bytes");
+
+        assert!(matches!(
+            error,
+            Error::EncodedValueTooLong {
+                actual: 5,
+                maximum: 4
+            }
+        ));
     }
 
     #[tokio::test]

@@ -1480,11 +1480,12 @@ struct LookupFailure {
 /// alias-type query in one `sp_executesql` (`sqlcstr.cpp:46`). The
 /// `set implicit_transactions off` is there because msodbcsql implements
 /// manual-commit with `SET IMPLICIT_TRANSACTIONS` and must keep this internal
-/// query from opening a transaction (`sqlccmd.cpp` bug #656241); this driver
-/// drives transactions with TDS transaction-manager requests and never enables
-/// implicit transactions, so a bare batch already carries that guarantee. The
-/// alias-type half has no counterpart here — there is no UDT cache to refresh —
-/// which leaves just the `SELECT`.
+/// query from opening a transaction (`sqlccmd.cpp` bug #656241). A bare
+/// `SELECT USER_NAME()` cannot open one: a `SELECT` that reads no table never
+/// begins an implicit transaction, even when the application has enabled them
+/// itself. The alias-type half reads `systypes`, so `alias_types` keeps the
+/// scoped batch, and reads it separately because it may log in separately
+/// while a cursor is open and this lookup does not (AB#48044).
 /// `timeout_secs` is `SQL_ATTR_CONNECTION_TIMEOUT`, with `0` meaning no
 /// deadline; see the call site for why that is the attribute msodbcsql bounds
 /// this query with.
