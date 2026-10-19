@@ -394,7 +394,7 @@ fn sql_execute_operation(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
             // are all in, so the RPC cannot be opened yet: park the sequence
             // with no request in flight and run the execute from the last
             // `SQLParamData`, once every value can be built (AB#47590).
-            if dae_params.iter().any(|param| param.plan.is_buffered()) {
+            if dae_params.iter().any(|param| param.is_buffered()) {
                 return park_deferred_dae(
                     stmt,
                     client,
@@ -1251,12 +1251,12 @@ mod tests {
     use crate::api::bind_param::sql_bind_parameter;
     use crate::api::odbc_types::{
         SQL_ATTR_PARAM_BIND_TYPE, SQL_ATTR_PARAM_OPERATION_PTR, SQL_ATTR_PARAM_STATUS_PTR,
-        SQL_ATTR_PARAMS_PROCESSED_PTR, SQL_BIND_BY_COLUMN, SQL_C_CHAR, SQL_C_SLONG,
+        SQL_ATTR_PARAMS_PROCESSED_PTR, SQL_BIND_BY_COLUMN, SQL_C_BINARY, SQL_C_CHAR, SQL_C_SLONG,
         SQL_DATA_AT_EXEC, SQL_DESC_ARRAY_SIZE, SQL_DESC_ARRAY_STATUS_PTR, SQL_DESC_BIND_OFFSET_PTR,
         SQL_DESC_BIND_TYPE, SQL_DESC_ROWS_PROCESSED_PTR, SQL_INTEGER, SQL_NULL_HANDLE,
         SQL_PARAM_ERROR, SQL_PARAM_IGNORE, SQL_PARAM_INPUT, SQL_PARAM_OUTPUT, SQL_PARAM_PROCEED,
-        SQL_PARAM_UNUSED, SQL_SUCCESS, SQL_VARCHAR, SqlInteger, SqlLen, SqlPointer, SqlSmallInt,
-        SqlULen,
+        SQL_PARAM_UNUSED, SQL_SS_UDT, SQL_SUCCESS, SQL_VARCHAR, SqlInteger, SqlLen, SqlPointer,
+        SqlSmallInt, SqlULen,
     };
     use crate::api::util::rewrite_param_markers;
     use crate::handles::DescHandle;
@@ -2324,10 +2324,7 @@ mod tests {
             let expected = ((!changed).then_some(id), changed.then_some(id));
             assert_eq!((execution.prepared.stmt.id(), execution.orphaned), expected);
             assert_eq!(
-                execution
-                    .dae_params
-                    .iter()
-                    .any(|param| param.plan.is_buffered()),
+                execution.dae_params.iter().any(|param| param.is_buffered()),
                 deferred
             );
             let client = tds_client_from_tokens(Vec::new());
@@ -2454,6 +2451,47 @@ mod tests {
         drop(state);
         set_cached_desc_field(h.ipd(), SQL_DESC_LENGTH, 40);
         assert_eq!(stage_and_restore_plan(h.stmt), (None, Some(new_id)));
+    }
+
+    #[test]
+    fn streamed_udt_without_a_type_name_fails_on_execute_before_need_data() {
+        let h = TestHandles::with_env_dbc_stmt();
+        h.mark_dbc_connected();
+        set_prepared(h.stmt, "SELECT CAST(? AS hierarchyid)");
+        let mut token = 0_u8;
+        let mut indicator = SQL_DATA_AT_EXEC;
+        assert_eq!(
+            unsafe {
+                sql_bind_parameter(
+                    h.stmt,
+                    1,
+                    SQL_PARAM_INPUT,
+                    SQL_C_BINARY,
+                    SQL_SS_UDT,
+                    0,
+                    0,
+                    (&raw mut token).cast(),
+                    0,
+                    &mut indicator,
+                )
+            },
+            SQL_SUCCESS
+        );
+
+        assert_eq!(unsafe { sql_execute(h.stmt) }, SQL_ERROR);
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(state.diag_records.len(), 1);
+        assert_eq!(
+            state.diag_records[0].sql_state,
+            ERR_MISSING_UDT_TYPE_NAME.state
+        );
+        assert!(
+            state.diag_records[0]
+                .message
+                .ends_with(ERR_MISSING_UDT_TYPE_NAME.text)
+        );
+        assert!(!state.needs_data());
     }
 
     #[test]

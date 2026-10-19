@@ -154,7 +154,7 @@ stages:
       # Packaging and artifact gates must be tested even when PR runs skip them.
       - pwsh: |
           python -m pip install --quiet pytest pyyaml packaging
-          python -m pytest scripts/test_inject_odbc.py scripts/test_verify_python_wheels.py scripts/test_release_pipeline.py scripts/test_validation_pipeline.py scripts/test_shared_sql_credentials.py scripts/test_repair_glibc_wheels.py scripts/test_bump_released_crate_versions.py scripts/test_python_wheel_install.py scripts/test_coverage_report.py -q
+          python -m pytest scripts/test_inject_odbc.py scripts/test_verify_python_wheels.py scripts/test_release_pipeline.py scripts/test_validation_pipeline.py scripts/test_shared_sql_credentials.py scripts/test_repair_glibc_wheels.py scripts/test_bump_released_crate_versions.py scripts/test_python_wheel_install.py scripts/test_coverage_report.py scripts/test_ghcr_parameters.py -q
         displayName: 'Unit test packaging scripts and pipeline configuration'
       - template: build-template.yml
         parameters:
@@ -317,6 +317,15 @@ stages:
           "$AGENT_TEMPDIRECTORY/sql-credential-tests/bin/python" -m pip install --quiet pytest pyyaml
           "$AGENT_TEMPDIRECTORY/sql-credential-tests/bin/python" -m pytest scripts/test_shared_sql_credentials.py -q
         displayName: Test shared SQL credential scripts (Linux)
+      - bash: |
+          set -euo pipefail
+          venv="$(Agent.TempDirectory)/ghcr-parameter-tests"
+          python3 -m venv "$venv"
+          "$venv/bin/python" -m pip install --quiet pytest pyyaml
+          "$venv/bin/python" -m pytest scripts/test_ghcr_parameters.py -q -rs
+        displayName: Test GHCR parameter handling (Linux)
+        env:
+          GHCR_TEST_REQUIRE_BASH: '1'
       - template: build-template-container.yml
         parameters:
           architecture: x64
@@ -801,6 +810,7 @@ stages:
   jobs:
   - job: Build_mssql_python_MacOS
     displayName: Build mssql-python macOS (cross-repo)
+    timeoutInMinutes: 120
     pool:
       name: Azure Pipelines
       vmImage: macOS-latest

@@ -13,6 +13,7 @@ pub(crate) trait SqlValueEncoder {
         sql_value: &SqlType,
         db_collation: &SqlCollation,
         type_metadata: Option<RpcTypeMetadata>,
+        narrow_string_byte_limit: Option<usize>,
     ) -> TdsResult<()>;
 }
 
@@ -31,9 +32,15 @@ impl SqlValueEncoder for GenericEncoder {
         sql_value: &SqlType,
         db_collation: &SqlCollation,
         type_metadata: Option<RpcTypeMetadata>,
+        narrow_string_byte_limit: Option<usize>,
     ) -> TdsResult<()> {
         sql_value
-            .serialize(packet_writer, db_collation, type_metadata)
+            .serialize_with_narrow_string_byte_limit(
+                packet_writer,
+                db_collation,
+                type_metadata,
+                narrow_string_byte_limit,
+            )
             .await?;
         Ok(())
     }
