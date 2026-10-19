@@ -4,6 +4,7 @@
 """Benchmark ref handling, executed with mocked network and build commands."""
 
 import os
+import shlex
 import shutil
 import subprocess
 from pathlib import Path
@@ -65,21 +66,26 @@ cargo() {
   printf '\n' >> commands.log
 }
 """
+        inputs = {
+            "BUILD_REASON": "Manual",
+            "PR_TARGET_REF": "$(System.PullRequest.TargetBranch)",
+            "MANUAL_BASELINE_REF": "main",
+            "MOCK_PR_SHA": _PR_SHA,
+            "MOCK_BASELINE_SHA": _BASELINE_SHA,
+            "MOCK_FETCH_STATUS": "0",
+            "MOCK_CHECKOUT_STATUS": "0",
+            **env,
+        }
+        # WSL launchers do not forward arbitrary Windows environment variables.
+        exports = ""
+        for key, value in inputs.items():
+            # Git Bash's igncr option can discard literal CRs even inside quotes.
+            quoted = shlex.quote(value).replace("\r", "'$'\\r''")
+            exports += f"export {key}={quoted}\n"
         script_path = tmp_path / "run-step.sh"
-        script_path.write_text(mocks + script, encoding="utf-8", newline="\n")
+        script_path.write_text(exports + mocks + script, encoding="utf-8", newline="\n")
         result = subprocess.run(
             [_BASH, script_path.name], cwd=tmp_path,
-            env={
-                **os.environ,
-                "BUILD_REASON": "Manual",
-                "PR_TARGET_REF": "$(System.PullRequest.TargetBranch)",
-                "MANUAL_BASELINE_REF": "main",
-                "MOCK_PR_SHA": _PR_SHA,
-                "MOCK_BASELINE_SHA": _BASELINE_SHA,
-                "MOCK_FETCH_STATUS": "0",
-                "MOCK_CHECKOUT_STATUS": "0",
-                **env,
-            },
             capture_output=True, text=True, timeout=30,
         )
         log = tmp_path / "commands.log"
@@ -95,6 +101,27 @@ def test_bash_script_uses_lf_newlines(run_script, tmp_path):
     assert result.returncode == 0, result.stdout + result.stderr
     assert result.stdout == "first\nsecond\n"
     assert b"\r" not in (tmp_path / "run-step.sh").read_bytes()
+
+
+def test_fixture_inputs_survive_launcher_environment_loss(run_script, tmp_path, monkeypatch):
+    original_run = subprocess.run
+
+    def drop_inputs(*args, **kwargs):
+        kwargs["env"] = {
+            key: value for key, value in os.environ.items()
+            if not key.startswith(("BUILD_", "PR_", "MANUAL_", "MOCK_"))
+        }
+        return original_run(*args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", drop_inputs)
+    payload = "'\n$(touch injected); `touch injected`\r\n"
+    result, _ = run_script(
+        'set -eu\nprintf "%s" "$MANUAL_BASELINE_REF" > input.txt\n'
+        'test "$BUILD_REASON" = Manual\ntest "$MOCK_FETCH_STATUS" = 7\n',
+        MANUAL_BASELINE_REF=payload, MOCK_FETCH_STATUS="7",
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (tmp_path / "input.txt").read_bytes() == payload.encode("utf-8")
 
 
 def test_checkout_and_fetch_precede_repository_execution(steps):
