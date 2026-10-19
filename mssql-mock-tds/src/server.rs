@@ -12,7 +12,7 @@ use crate::protocol::{
     build_transaction_manager_response, parse_fedauth_token, parse_login7_auth, parse_sql_batch,
     parse_transaction_descriptor_header, parse_transaction_manager_request,
 };
-use crate::query_response::{QueryRegistry, RPC_DELAY_KEY, TM_BEGIN_DELAY_KEY};
+use crate::query_response::{LOGIN_DELAY_KEY, QueryRegistry, RPC_DELAY_KEY, TM_BEGIN_DELAY_KEY};
 use bytes::BytesMut;
 use native_tls::Identity;
 use std::collections::BTreeMap;
@@ -320,6 +320,18 @@ impl ConnectionProcessor {
         let response = match header.packet_type {
             PacketType::Login7 => {
                 debug!("Handling Login7 from {}", self.addr);
+
+                let delay = self
+                    .query_registry
+                    .lock()
+                    .await
+                    .get(LOGIN_DELAY_KEY)
+                    .and_then(|r| r.delay);
+                match self.wait_out_delay_or_attention(socket, delay).await? {
+                    DelayOutcome::Attention(ack) => return Ok(Some(ack)),
+                    DelayOutcome::Closed => return Ok(None),
+                    DelayOutcome::Elapsed => {}
+                }
 
                 // Parse Login7 packet body (skip header) for authentication info
                 let packet_body = &packet_data[PACKET_HEADER_SIZE..];

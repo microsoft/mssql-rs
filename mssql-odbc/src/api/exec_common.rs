@@ -23,8 +23,10 @@ use super::ird::populate_ird;
 use super::sqlstate::*;
 use crate::api::odbc_types::{
     SQL_DATA_AT_EXEC, SQL_ERROR, SQL_LEN_DATA_AT_EXEC_OFFSET, SQL_NEED_DATA, SQL_NO_DATA,
-    SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle, SqlLen, SqlReturn, SqlULen, SqlUSmallInt,
+    SQL_SS_XML, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle, SqlLen, SqlReturn, SqlULen,
+    SqlUSmallInt,
 };
+use crate::api::type_rules::parameter_column_size_is_valid;
 use crate::conversion::error::ConvOk;
 use crate::conversion::param_convert::{
     DaePlan, DaeTranscode, ParamBuildError, bound_param_to_rpc, buffered_dae_to_rpc,
@@ -250,21 +252,7 @@ pub(super) fn park_dae_client(
     // writes bytes verbatim, so the re-encoding has to happen before them
     // (AB#47590).
     let collation = client.get_collation();
-    for param in &mut dae_params {
-        if !param.plan.is_buffered() {
-            let transcode =
-                DaeTranscode::new(param.binding.c_type, param.binding.sql_type, collation);
-            // A pairing whose buffer bytes already are the wire's bytes keeps
-            // `None`, so `SQLPutData` forwards its chunks borrowed instead of
-            // copying each one through a conversion that would return them
-            // unchanged. Skipping the transcode also skips the close-time
-            // flush, which is right: a passthrough parameter never holds back a
-            // partial character to carry.
-            if !transcode.is_passthrough() {
-                param.transcode = Some(transcode);
-            }
-        }
-    }
+    set_dae_transcodes(&mut dae_params, collation, true);
     let Ok(mut stmt_state) = stmt.inner.lock() else {
         // The client has nowhere to go: the statement that owns it is
         // unreachable and the DBC still records it as busy.
@@ -291,13 +279,14 @@ pub(super) fn park_deferred_dae(
     client: TdsClient,
     prepared: Option<PreparedPlan>,
     orphaned: Option<StatementId>,
-    dae_params: Vec<DaeParam>,
+    mut dae_params: Vec<DaeParam>,
     prebuilt: Vec<RpcParameter>,
     sql: Option<String>,
     timeout_secs: u32,
     fractional_truncated: bool,
     op: &str,
 ) -> SqlReturn {
+    set_dae_transcodes(&mut dae_params, client.get_collation(), false);
     let Ok(mut stmt_state) = stmt.inner.lock() else {
         error!("{op}: stmt mutex poisoned while parking deferred DAE state");
         return SQL_ERROR;
@@ -309,6 +298,28 @@ pub(super) fn park_deferred_dae(
         post_diag(&mut stmt_state, WARN_FRACTIONAL_TRUNCATION);
     }
     SQL_NEED_DATA
+}
+
+fn set_dae_transcodes(
+    dae_params: &mut [DaeParam],
+    collation: mssql_tds::token::tokens::SqlCollation,
+    include_streamed: bool,
+) {
+    for param in dae_params {
+        let validates_encoded_input = param
+            .length_limit
+            .is_some_and(|limit| limit.requires_encoded_input());
+        if (include_streamed && !param.is_buffered()) || validates_encoded_input {
+            let mut transcode =
+                DaeTranscode::new(param.binding.c_type, param.binding.sql_type, collation);
+            if validates_encoded_input {
+                transcode = transcode.with_passthrough_validation();
+            }
+            if validates_encoded_input || !transcode.is_passthrough() {
+                param.transcode = Some(transcode);
+            }
+        }
+    }
 }
 
 /// Aborts a data-at-execution sequence with a diagnostic. Always `SQL_ERROR`.
@@ -1115,12 +1126,12 @@ pub(super) unsafe fn build_named_params_for_row(
             unsafe { crate::conversion::param_convert::data_at_exec_indicator(&bound_param) };
 
         if let Some(indicator) = dae_indicator {
-            let plan = dae_plan(bound_param.c_type, bound_param.sql_type).map_err(|source| {
-                ParamRowBuildError::Conversion {
+            let plan = dae_plan(bound_param.c_type, bound_param.sql_type, udt_names).map_err(
+                |source| ParamRowBuildError::Conversion {
                     parameter: i + 1,
                     source,
-                }
-            })?;
+                },
+            )?;
             let length_limit = dae_length_limit(
                 bound_param.c_type,
                 bound_param.sql_type,
@@ -1130,14 +1141,7 @@ pub(super) unsafe fn build_named_params_for_row(
                 parameter: i + 1,
                 source,
             })?;
-            dae_params.push(DaeParam::new(
-                i,
-                dae_expected_length(indicator),
-                plan,
-                length_limit,
-                bound_param,
-                snapshot.udt_names.clone(),
-            ));
+            let buffered = plan.is_buffered();
             // Nothing to declare for a buffered parameter yet: its bytes are
             // not in, so its type and length are not known. The slot is filled
             // to keep parameter positions lined up and is rebuilt by
@@ -1185,7 +1189,23 @@ pub(super) unsafe fn build_named_params_for_row(
                 }
             };
             params.push(rpc);
+            dae_params.push(DaeParam::new(
+                i,
+                dae_expected_length(indicator),
+                buffered,
+                length_limit,
+                bound_param,
+                snapshot.udt_names.clone(),
+            ));
         } else {
+            if bound_param.sql_type == SQL_SS_XML
+                && !parameter_column_size_is_valid(bound_param.sql_type, bound_param.column_size)
+            {
+                return Err(ParamRowBuildError::Conversion {
+                    parameter: i + 1,
+                    source: ParamBuildError::InvalidParameterSize(bound_param.column_size),
+                });
+            }
             unsafe { crate::conversion::param_convert::stamp_numeric_apd(&bound_param) };
             let (param, outcome) = unsafe { bound_param_to_rpc(name, &bound_param, udt_names) }
                 .map_err(|source| ParamRowBuildError::Conversion {
@@ -1546,8 +1566,8 @@ pub(super) fn finish_execute(
 mod tests {
     use super::*;
     use crate::api::odbc_types::{
-        SQL_C_CHAR, SQL_C_LONG, SQL_DEFAULT_PARAM, SQL_INTEGER, SQL_NTS, SQL_PARAM_INPUT,
-        SQL_VARCHAR, sql_len_data_at_exec,
+        SQL_C_CHAR, SQL_C_LONG, SQL_C_WCHAR, SQL_DEFAULT_PARAM, SQL_INTEGER, SQL_NTS,
+        SQL_PARAM_INPUT, SQL_VARCHAR, SqlLen, sql_len_data_at_exec,
     };
     use crate::handles::handle_from_raw;
     use crate::params::BoundParam;
@@ -1571,6 +1591,64 @@ mod tests {
         assert_eq!(dae_expected_length(sql_len_data_at_exec(0)), None);
         assert_eq!(dae_expected_length(sql_len_data_at_exec(1)), Some(1));
         assert_eq!(dae_expected_length(sql_len_data_at_exec(4)), Some(4));
+    }
+
+    #[test]
+    fn deferred_dae_configures_transcoding_for_encoded_length_limits() {
+        let collation = mssql_tds::token::tokens::SqlCollation {
+            info: 0x0409,
+            lcid_language_id: 0,
+            col_flags: 0,
+            sort_id: 0,
+        };
+        for (c_type, input) in [
+            (SQL_C_CHAR, &[0xC3, 0xA9][..]),
+            (SQL_C_WCHAR, &[0xE9, 0x00][..]),
+        ] {
+            let limit = dae_length_limit(c_type, SQL_VARCHAR, 1).unwrap().unwrap();
+            let mut params = vec![
+                DaeParam::unbounded(0, std::ptr::null_mut(), None)
+                    .with_binding_types(c_type, SQL_VARCHAR)
+                    .with_length_limit(limit),
+            ];
+
+            set_dae_transcodes(&mut params, collation, false);
+
+            let transcode = params[0]
+                .transcode
+                .expect("deferred encoded-byte validation needs a transcoder");
+            let mut carry = Vec::new();
+            assert_eq!(transcode.push(&mut carry, input).bytes, [0xE9]);
+        }
+    }
+
+    #[test]
+    fn encoded_length_validation_repairs_malformed_utf8_before_measuring() {
+        let collation = mssql_tds::token::tokens::SqlCollation {
+            info: 0x0409,
+            lcid_language_id: 0,
+            col_flags: 0x40,
+            sort_id: 0,
+        };
+        let limit = dae_length_limit(SQL_C_CHAR, SQL_VARCHAR, 1)
+            .unwrap()
+            .unwrap();
+        let mut params = vec![
+            DaeParam::unbounded(0, std::ptr::null_mut(), None)
+                .with_binding_types(SQL_C_CHAR, SQL_VARCHAR)
+                .with_length_limit(limit),
+        ];
+
+        set_dae_transcodes(&mut params, collation, false);
+
+        let transcode = params[0]
+            .transcode
+            .expect("encoded-byte validation needs a validating transcoder");
+        let mut carry = Vec::new();
+        assert_eq!(
+            transcode.push(&mut carry, &[0xFF]).bytes,
+            "\u{FFFD}".as_bytes()
+        );
     }
 
     #[test]
@@ -2711,6 +2789,53 @@ mod tests {
         }
     }
 
+    #[test]
+    fn oversized_xml_is_revalidated_when_the_indicator_stops_being_dae() {
+        let mut value = b"<x/>".to_vec();
+        let mut indicator = sql_len_data_at_exec(SqlLen::try_from(value.len()).unwrap());
+        let mut param = char_param(&mut value, &mut indicator);
+        param.sql_type = SQL_SS_XML;
+        param.column_size = 4001;
+        let bound = [snap(param)];
+
+        let Ok(streamed) = (unsafe {
+            build_named_params_for_row(
+                &bound,
+                1,
+                0,
+                crate::api::odbc_types::SQL_BIND_BY_COLUMN,
+                0,
+                true,
+            )
+        }) else {
+            panic!("oversized XML should stream while the indicator is DAE");
+        };
+        assert_eq!(streamed.dae_params.len(), 1);
+
+        unsafe {
+            (&raw mut indicator).write(SqlLen::try_from(value.len()).unwrap());
+        }
+        let Err(error) = (unsafe {
+            build_named_params_for_row(
+                &bound,
+                1,
+                0,
+                crate::api::odbc_types::SQL_BIND_BY_COLUMN,
+                0,
+                true,
+            )
+        }) else {
+            panic!("materialized oversized XML should fail");
+        };
+        assert!(matches!(
+            error,
+            ParamRowBuildError::Conversion {
+                source: ParamBuildError::InvalidParameterSize(4001),
+                ..
+            }
+        ));
+    }
+
     /// The narrow race `snapshot_bound_params`'s liveness check guards
     /// against: `effective_apd` resolves an explicit descriptor under the
     /// STMT lock, which is dropped before the descriptor is actually locked
@@ -2813,7 +2938,7 @@ mod tests {
                 state.bound_params = vec![snap(param)];
                 let built = unsafe { build_named_params(&mut state, 1, 0, "test") }.unwrap();
                 assert_eq!(built.dae_params.len(), 1);
-                assert_eq!(built.dae_params[0].plan, plan);
+                assert_eq!(built.dae_params[0].is_buffered(), plan.is_buffered());
                 assert_eq!(
                     rpc_parameter_status(&built.params[0]).bits(),
                     expected.bits(),
@@ -2996,7 +3121,7 @@ mod tests {
         use crate::api::odbc_types::SQL_DECIMAL;
 
         let mut param = DaeParam::unbounded(bound_index, std::ptr::null_mut(), None);
-        param.plan = DaePlan::Buffer;
+        param.set_buffered(true);
         param.binding.c_type = SQL_C_CHAR;
         param.binding.sql_type = SQL_DECIMAL;
         param.binding.column_size = 5;
@@ -3019,7 +3144,7 @@ mod tests {
         use crate::api::odbc_types::{SQL_C_NUMERIC, SQL_DECIMAL, SqlNumericStruct};
 
         assert!(matches!(
-            dae_plan(SQL_C_NUMERIC, SQL_DECIMAL),
+            dae_plan(SQL_C_NUMERIC, SQL_DECIMAL, None),
             Err(ParamBuildError::UnsupportedCType(SQL_C_NUMERIC))
         ));
 
@@ -3114,6 +3239,32 @@ mod tests {
 
         assert_eq!(result.unwrap_err(), SQL_ERROR);
         assert!(!state.diag_records.is_empty());
+    }
+
+    #[test]
+    fn rebuild_deferred_params_keeps_oversized_dae_xml_unlimited() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let mut state = stmt.inner.lock().unwrap();
+        let mut param = DaeParam::unbounded(0, std::ptr::null_mut(), None)
+            .with_binding_types(SQL_C_CHAR, SQL_SS_XML);
+        param.binding.column_size = 4001;
+        let dae_params = [param];
+
+        for (bytes, is_null) in [(b"<x/>".to_vec(), false), (Vec::new(), true)] {
+            let result = rebuild_deferred_params(
+                &mut state,
+                vec![deferred_slot()],
+                &[(0, bytes, is_null)],
+                &dae_params,
+                "test",
+            );
+            assert!(
+                result.is_ok(),
+                "internal deferral must not change DAE XML validity"
+            );
+            assert!(state.diag_records.is_empty());
+        }
     }
 
     /// `SQL_LEN_DATA_AT_EXEC(n)` promises `n` bytes, which the closing

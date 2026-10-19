@@ -403,7 +403,7 @@ fn sql_exec_direct_w_operation(
         // A buffered parameter cannot be declared until its bytes are all in,
         // so no RPC is opened: the sequence collects its values and runs
         // `sp_executesql` from the last `SQLParamData` (AB#47590).
-        if dae_params.iter().any(|param| param.plan.is_buffered()) {
+        if dae_params.iter().any(|param| param.is_buffered()) {
             return park_deferred_dae(
                 stmt,
                 client,
