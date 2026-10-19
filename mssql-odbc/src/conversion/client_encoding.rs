@@ -7,7 +7,7 @@
 
 use std::borrow::Cow;
 
-use crate::api::sqlstate::{DiagMsg, ERR_INTERNAL_CONVERSION, ERR_INVALID_CHARACTER_VALUE};
+use super::error::ConvError;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ClientEncoding(u32);
@@ -25,8 +25,8 @@ mod tests {
     #[test]
     fn allocation_capacity_overflow_is_a_conversion_error() {
         assert_eq!(
-            zeroed_buffer::<u8>(usize::MAX).unwrap_err().state,
-            ERR_INTERNAL_CONVERSION.state
+            zeroed_buffer::<u8>(usize::MAX).unwrap_err(),
+            ConvError::Internal
         );
         assert!(zeroed_buffer::<u8>(0).unwrap().is_empty());
     }
@@ -73,12 +73,12 @@ mod tests {
         }
         for bytes in [&b"\xff"[..], &b"\xc3"[..], &b"\xed\xa0\x80"[..]] {
             assert_eq!(
-                encoding.decode(bytes).unwrap_err().state,
-                ERR_INVALID_CHARACTER_VALUE.state
+                encoding.decode(bytes).unwrap_err(),
+                ConvError::InvalidCharacterValue
             );
             assert_eq!(
-                encoding.prefix_len(bytes, 1).unwrap_err().state,
-                ERR_INVALID_CHARACTER_VALUE.state
+                encoding.prefix_len(bytes, 1).unwrap_err(),
+                ConvError::InvalidCharacterValue
             );
         }
     }
@@ -172,7 +172,7 @@ mod tests {
                 assert!(decoded.starts_with('A'));
                 assert_eq!(decoded.chars().count(), 2);
             }
-            Err(diag) => assert_eq!(diag.state, ERR_INVALID_CHARACTER_VALUE.state),
+            Err(diag) => assert_eq!(diag, ConvError::InvalidCharacterValue),
         }
     }
 
@@ -220,7 +220,7 @@ impl ClientEncoding {
         self.0 != 12000
     }
 
-    pub(crate) fn encode(self, text: &str) -> Result<ClientEncoded<'_>, DiagMsg> {
+    pub(crate) fn encode(self, text: &str) -> Result<ClientEncoded<'_>, ConvError> {
         if self.is_utf8() || (self.is_ascii_compatible() && text.is_ascii()) {
             return Ok(ClientEncoded {
                 bytes: Cow::Borrowed(text.as_bytes()),
@@ -234,13 +234,13 @@ impl ClientEncoding {
         })
     }
 
-    pub(crate) fn decode(self, bytes: &[u8]) -> Result<Cow<'_, str>, DiagMsg> {
+    pub(crate) fn decode(self, bytes: &[u8]) -> Result<Cow<'_, str>, ConvError> {
         if self.is_utf8() || (self.is_ascii_compatible() && bytes.is_ascii()) {
             return std::str::from_utf8(bytes)
                 .map(Cow::Borrowed)
                 .map_err(|error| {
                     tracing::error!(%error, "Invalid UTF-8 application character value");
-                    ERR_INVALID_CHARACTER_VALUE
+                    ConvError::InvalidCharacterValue
                 });
         }
         platform::decode(self, bytes).map(Cow::Owned)
@@ -253,7 +253,7 @@ impl ClientEncoding {
         self,
         text: &str,
         byte_offset: usize,
-    ) -> Result<usize, DiagMsg> {
+    ) -> Result<usize, ConvError> {
         if byte_offset == 0 {
             return Ok(0);
         }
@@ -271,7 +271,7 @@ impl ClientEncoding {
 
     /// Bound-column truncation only. Resumable SQLGetData byte offsets need not
     /// fall on character boundaries and must not use this operation.
-    pub(crate) fn prefix_len(self, bytes: &[u8], capacity: usize) -> Result<usize, DiagMsg> {
+    pub(crate) fn prefix_len(self, bytes: &[u8], capacity: usize) -> Result<usize, ConvError> {
         let capacity = capacity.min(bytes.len());
         if self.is_utf8() {
             let text = self.decode(bytes)?;
@@ -293,11 +293,11 @@ impl ClientEncoding {
     }
 }
 
-fn zeroed_buffer<T: Default + Clone>(len: usize) -> Result<Vec<T>, DiagMsg> {
+fn zeroed_buffer<T: Default + Clone>(len: usize) -> Result<Vec<T>, ConvError> {
     let mut buffer = Vec::new();
     buffer.try_reserve_exact(len).map_err(|error| {
         tracing::error!(%error, len, "Allocating client encoding buffer failed");
-        ERR_INTERNAL_CONVERSION
+        ConvError::Internal
     })?;
     buffer.resize(len, T::default());
     Ok(buffer)
@@ -327,7 +327,7 @@ mod platform {
         fn iconv_close(cd: libc::iconv_t) -> libc::c_int;
     }
 
-    fn charset(encoding: ClientEncoding, transliterate: bool) -> Result<&'static CStr, DiagMsg> {
+    fn charset(encoding: ClientEncoding, transliterate: bool) -> Result<&'static CStr, ConvError> {
         macro_rules! name {
             ($plain:expr, $translit:expr) => {
                 if cfg!(target_env = "musl") || !transliterate {
@@ -370,7 +370,7 @@ mod platform {
             28599 => name!(c"ISO8859-9", c"ISO8859-9//TRANSLIT"),
             28603 => name!(c"ISO8859-13", c"ISO8859-13//TRANSLIT"),
             28605 => name!(c"ISO8859-15", c"ISO8859-15//TRANSLIT"),
-            _ => return Err(ERR_INTERNAL_CONVERSION),
+            _ => return Err(ConvError::Internal),
         })
     }
 
@@ -450,14 +450,14 @@ mod platform {
     }
 
     impl Converter {
-        fn open(to: &CStr, from: &CStr) -> Result<Self, DiagMsg> {
+        fn open(to: &CStr, from: &CStr) -> Result<Self, ConvError> {
             // SAFETY: Both names are valid NUL-terminated strings. The returned
             // descriptor is owned exclusively by this value and closed in Drop.
             let cd = unsafe { iconv_open(to.as_ptr(), from.as_ptr()) };
             if cd == usize::MAX as libc::iconv_t {
                 let error = std::io::Error::last_os_error();
                 tracing::error!(%error, ?to, ?from, "iconv_open failed");
-                return Err(ERR_INTERNAL_CONVERSION);
+                return Err(ConvError::Internal);
             }
             Ok(Self(cd))
         }
@@ -507,7 +507,7 @@ mod platform {
         to: &CStr,
         from: &CStr,
         source_text: Option<&str>,
-    ) -> Result<(Vec<u8>, bool), DiagMsg> {
+    ) -> Result<(Vec<u8>, bool), ConvError> {
         let mut size = input.len().max(16);
         'retry: loop {
             let mut output = zeroed_buffer(size)?;
@@ -516,8 +516,8 @@ mod platform {
             let mut written = 0;
             let mut loss = false;
             loop {
-                let remaining = input.get(read..).ok_or(ERR_INTERNAL_CONVERSION)?;
-                let tail = output.get_mut(written..).ok_or(ERR_INTERNAL_CONVERSION)?;
+                let remaining = input.get(read..).ok_or(ConvError::Internal)?;
+                let tail = output.get_mut(written..).ok_or(ConvError::Internal)?;
                 let converted = converter.convert(Some(remaining), tail);
                 read += converted.read;
                 written += converted.written;
@@ -526,7 +526,7 @@ mod platform {
                 if let Some(error) = converted.error {
                     if error.raw_os_error() == Some(libc::E2BIG) {
                         // Restart from complete input after growing the output.
-                        size = size.checked_mul(2).ok_or(ERR_INTERNAL_CONVERSION)?;
+                        size = size.checked_mul(2).ok_or(ConvError::Internal)?;
                         continue 'retry;
                     }
                     if error.raw_os_error() == Some(libc::EILSEQ)
@@ -535,17 +535,17 @@ mod platform {
                         let ch = text
                             .get(read..)
                             .and_then(|s| s.chars().next())
-                            .ok_or(ERR_INTERNAL_CONVERSION)?;
+                            .ok_or(ConvError::Internal)?;
                         // Globalization.h EncodingConverter::Convert replaces
                         // one UTF-16 unit at a time if transliteration fails.
                         let replacements = ch.len_utf16();
                         if output.len() - written < replacements {
-                            size = size.checked_mul(2).ok_or(ERR_INTERNAL_CONVERSION)?;
+                            size = size.checked_mul(2).ok_or(ConvError::Internal)?;
                             continue 'retry;
                         }
                         output
                             .get_mut(written..written + replacements)
-                            .ok_or(ERR_INTERNAL_CONVERSION)?
+                            .ok_or(ConvError::Internal)?
                             .fill(b'?');
                         written += replacements;
                         read += ch.len_utf8();
@@ -555,34 +555,37 @@ mod platform {
                     }
                     tracing::error!(%error, ?to, ?from, offset = read, "iconv failed");
                     return Err(match error.raw_os_error() {
-                        Some(libc::EILSEQ | libc::EINVAL) => ERR_INVALID_CHARACTER_VALUE,
-                        _ => ERR_INTERNAL_CONVERSION,
+                        Some(libc::EILSEQ | libc::EINVAL) => ConvError::InvalidCharacterValue,
+                        _ => ConvError::Internal,
                     });
                 }
                 break;
             }
             if read != input.len() {
                 tracing::error!(?to, ?from, "iconv did not consume the complete input");
-                return Err(ERR_INTERNAL_CONVERSION);
+                return Err(ConvError::Internal);
             }
             // CP1258's glibc decoder buffers a base character to combine it
             // with a following tone mark. Flush even these stateless encodings.
-            let tail = output.get_mut(written..).ok_or(ERR_INTERNAL_CONVERSION)?;
+            let tail = output.get_mut(written..).ok_or(ConvError::Internal)?;
             let flushed = converter.convert(None, tail);
             if let Some(error) = flushed.error {
                 if error.raw_os_error() == Some(libc::E2BIG) {
-                    size = size.checked_mul(2).ok_or(ERR_INTERNAL_CONVERSION)?;
+                    size = size.checked_mul(2).ok_or(ConvError::Internal)?;
                     continue;
                 }
                 tracing::error!(%error, ?to, ?from, "iconv flush failed");
-                return Err(ERR_INTERNAL_CONVERSION);
+                return Err(ConvError::Internal);
             }
             output.truncate(written + flushed.written);
             return Ok((output, loss));
         }
     }
 
-    pub(super) fn encode(encoding: ClientEncoding, text: &str) -> Result<(Vec<u8>, bool), DiagMsg> {
+    pub(super) fn encode(
+        encoding: ClientEncoding,
+        text: &str,
+    ) -> Result<(Vec<u8>, bool), ConvError> {
         convert_all(
             text.as_bytes(),
             charset(encoding, true)?,
@@ -591,11 +594,11 @@ mod platform {
         )
     }
 
-    pub(super) fn decode(encoding: ClientEncoding, bytes: &[u8]) -> Result<String, DiagMsg> {
+    pub(super) fn decode(encoding: ClientEncoding, bytes: &[u8]) -> Result<String, ConvError> {
         let (converted, _) = convert_all(bytes, c"UTF-8", charset(encoding, false)?, None)?;
         String::from_utf8(converted).map_err(|error| {
             tracing::error!(%error, code_page = encoding.0, "iconv returned invalid UTF-8");
-            ERR_INVALID_CHARACTER_VALUE
+            ConvError::InvalidCharacterValue
         })
     }
 
@@ -603,7 +606,7 @@ mod platform {
         encoding: ClientEncoding,
         bytes: &[u8],
         capacity: usize,
-    ) -> Result<usize, DiagMsg> {
+    ) -> Result<usize, ConvError> {
         if !matches!(encoding.0, 932 | 936 | 949 | 950 | 54936 | 12000) {
             return Ok(capacity);
         }
@@ -611,9 +614,7 @@ mod platform {
         let mut consumed = 0;
         let mut output = [0_u8; 256];
         while consumed < capacity {
-            let input = bytes
-                .get(consumed..capacity)
-                .ok_or(ERR_INTERNAL_CONVERSION)?;
+            let input = bytes.get(consumed..capacity).ok_or(ConvError::Internal)?;
             let converted = converter.convert(Some(input), &mut output);
             consumed += converted.read;
             match converted.error {
@@ -624,13 +625,13 @@ mod platform {
                         return Ok(consumed);
                     }
                     tracing::error!(%error, code_page = encoding.0, "Incomplete encoded character");
-                    return Err(ERR_INVALID_CHARACTER_VALUE);
+                    return Err(ConvError::InvalidCharacterValue);
                 }
                 Some(error) if error.raw_os_error() == Some(libc::E2BIG) && converted.read != 0 => {
                 }
                 Some(error) => {
                     tracing::error!(%error, code_page = encoding.0, "iconv boundary scan failed");
-                    return Err(ERR_INVALID_CHARACTER_VALUE);
+                    return Err(ConvError::InvalidCharacterValue);
                 }
             }
         }
@@ -683,25 +684,16 @@ mod platform {
                 (c"UTF-8", c"unsupported-client-encoding"),
             ] {
                 assert_eq!(
-                    convert_all(b"A", to, from, None).unwrap_err().state,
-                    ERR_INTERNAL_CONVERSION.state
+                    convert_all(b"A", to, from, None).unwrap_err(),
+                    ConvError::Internal
                 );
             }
             let encoding = ClientEncoding(u32::MAX);
+            assert_eq!(encoding.encode("é").unwrap_err(), ConvError::Internal);
+            assert_eq!(encoding.decode(b"\xe9").unwrap_err(), ConvError::Internal);
             assert_eq!(
-                encoding.encode("é").unwrap_err().state,
-                ERR_INTERNAL_CONVERSION.state
-            );
-            assert_eq!(
-                encoding.decode(b"\xe9").unwrap_err().state,
-                ERR_INTERNAL_CONVERSION.state
-            );
-            assert_eq!(
-                encoding
-                    .utf8_offset_for_client_bytes("é", 1)
-                    .unwrap_err()
-                    .state,
-                ERR_INTERNAL_CONVERSION.state
+                encoding.utf8_offset_for_client_bytes("é", 1).unwrap_err(),
+                ConvError::Internal
             );
         }
 
@@ -710,8 +702,8 @@ mod platform {
             for (code_page, bytes) in [(932, b"A\x82".as_slice()), (12000, b"A\0\0".as_slice())] {
                 let encoding = for_code_page(code_page).unwrap();
                 assert_eq!(
-                    encoding.prefix_len(bytes, bytes.len()).unwrap_err().state,
-                    ERR_INVALID_CHARACTER_VALUE.state
+                    encoding.prefix_len(bytes, bytes.len()).unwrap_err(),
+                    ConvError::InvalidCharacterValue
                 );
             }
             let encoding = for_code_page(12000).unwrap();
@@ -719,13 +711,12 @@ mod platform {
             assert_eq!(
                 encoding
                     .prefix_len(invalid_scalar, invalid_scalar.len())
-                    .unwrap_err()
-                    .state,
-                ERR_INVALID_CHARACTER_VALUE.state
+                    .unwrap_err(),
+                ConvError::InvalidCharacterValue
             );
             assert_eq!(
-                encoding.decode(invalid_scalar).unwrap_err().state,
-                ERR_INVALID_CHARACTER_VALUE.state
+                encoding.decode(invalid_scalar).unwrap_err(),
+                ConvError::InvalidCharacterValue
             );
         }
 
@@ -880,7 +871,7 @@ mod platform {
         ClientEncoding(unsafe { GetACP() })
     }
 
-    fn native_error(operation: &str, encoding: ClientEncoding) -> DiagMsg {
+    fn native_error(operation: &str, encoding: ClientEncoding) -> ConvError {
         // SAFETY: GetLastError takes no arguments and reads thread-local state.
         let error = unsafe { GetLastError() };
         tracing::error!(
@@ -889,17 +880,20 @@ mod platform {
             operation,
             "Client encoding conversion failed"
         );
-        ERR_INTERNAL_CONVERSION
+        ConvError::Internal
     }
 
-    fn check_length(len: usize) -> Result<(), DiagMsg> {
+    fn check_length(len: usize) -> Result<(), ConvError> {
         i32::try_from(len).map(|_| ()).map_err(|error| {
             tracing::error!(%error, len, "Client encoding input exceeds Windows API limit");
-            ERR_INTERNAL_CONVERSION
+            ConvError::Internal
         })
     }
 
-    pub(super) fn encode(encoding: ClientEncoding, text: &str) -> Result<(Vec<u8>, bool), DiagMsg> {
+    pub(super) fn encode(
+        encoding: ClientEncoding,
+        text: &str,
+    ) -> Result<(Vec<u8>, bool), ConvError> {
         let wide_len = text.encode_utf16().count();
         check_length(wide_len)?;
         let mut wide = zeroed_buffer::<u16>(wide_len)?;
@@ -922,8 +916,7 @@ mod platform {
         if required <= 0 {
             return Err(native_error("WideCharToMultiByte sizing", encoding));
         }
-        let mut bytes =
-            zeroed_buffer(usize::try_from(required).map_err(|_| ERR_INTERNAL_CONVERSION)?)?;
+        let mut bytes = zeroed_buffer(usize::try_from(required).map_err(|_| ConvError::Internal)?)?;
         // SAFETY: The destination is exactly the size returned by the same
         // conversion. Default best-fit behavior matches native ODBC.
         let written = unsafe {
@@ -945,12 +938,12 @@ mod platform {
                 written,
                 "Client encoding size changed during conversion"
             );
-            return Err(ERR_INTERNAL_CONVERSION);
+            return Err(ConvError::Internal);
         }
         Ok((bytes, used_default.as_bool()))
     }
 
-    pub(super) fn decode(encoding: ClientEncoding, bytes: &[u8]) -> Result<String, DiagMsg> {
+    pub(super) fn decode(encoding: ClientEncoding, bytes: &[u8]) -> Result<String, ConvError> {
         check_length(bytes.len())?;
         // SAFETY: Input length fits the API's i32 parameter; a missing output
         // slice requests the exact UTF-16 size.
@@ -960,8 +953,7 @@ mod platform {
         if required <= 0 {
             return Err(native_error("MultiByteToWideChar sizing", encoding));
         }
-        let mut wide =
-            zeroed_buffer(usize::try_from(required).map_err(|_| ERR_INTERNAL_CONVERSION)?)?;
+        let mut wide = zeroed_buffer(usize::try_from(required).map_err(|_| ConvError::Internal)?)?;
         // SAFETY: Explicit slice lengths are checked and the output is exactly
         // the size returned by the sizing call. Flags zero retain replacement.
         let written = unsafe {
@@ -981,11 +973,11 @@ mod platform {
                 written,
                 "Client decoding size changed during conversion"
             );
-            return Err(ERR_INTERNAL_CONVERSION);
+            return Err(ConvError::Internal);
         }
         String::from_utf16(&wide).map_err(|error| {
             tracing::error!(%error, code_page = encoding.0, "Windows returned invalid UTF-16");
-            ERR_INVALID_CHARACTER_VALUE
+            ConvError::InvalidCharacterValue
         })
     }
 
@@ -993,12 +985,12 @@ mod platform {
         encoding: ClientEncoding,
         bytes: &[u8],
         capacity: usize,
-    ) -> Result<usize, DiagMsg> {
+    ) -> Result<usize, ConvError> {
         let mut info = CPINFO::default();
         // SAFETY: info is a writable, correctly aligned CPINFO.
         unsafe { GetCPInfo(encoding.0, &mut info) }.map_err(|error| {
             tracing::error!(%error, code_page = encoding.0, "GetCPInfo failed");
-            ERR_INTERNAL_CONVERSION
+            ConvError::Internal
         })?;
         if info.MaxCharSize == 1 {
             return Ok(capacity);
@@ -1008,11 +1000,11 @@ mod platform {
                 code_page = encoding.0,
                 "Unsupported ANSI code page character width"
             );
-            return Err(ERR_INTERNAL_CONVERSION);
+            return Err(ConvError::Internal);
         }
         let mut end = 0;
         while end < capacity {
-            let byte = *bytes.get(end).ok_or(ERR_INTERNAL_CONVERSION)?;
+            let byte = *bytes.get(end).ok_or(ConvError::Internal)?;
             let is_lead = info.LeadByte.chunks_exact(2).any(|range| {
                 matches!(range, [start, stop] if *start != 0 && (*start..=*stop).contains(&byte))
             });
@@ -1049,24 +1041,15 @@ mod platform {
         #[test]
         fn native_conversion_failures_preserve_internal_error_diagnostics() {
             let encoding = ClientEncoding(u32::MAX);
+            assert_eq!(encoding.encode("é").unwrap_err(), ConvError::Internal);
+            assert_eq!(encoding.decode(b"\xe9").unwrap_err(), ConvError::Internal);
             assert_eq!(
-                encoding.encode("é").unwrap_err().state,
-                ERR_INTERNAL_CONVERSION.state
+                encoding.prefix_len(b"\xe9", 1).unwrap_err(),
+                ConvError::Internal
             );
             assert_eq!(
-                encoding.decode(b"\xe9").unwrap_err().state,
-                ERR_INTERNAL_CONVERSION.state
-            );
-            assert_eq!(
-                encoding.prefix_len(b"\xe9", 1).unwrap_err().state,
-                ERR_INTERNAL_CONVERSION.state
-            );
-            assert_eq!(
-                encoding
-                    .utf8_offset_for_client_bytes("é", 1)
-                    .unwrap_err()
-                    .state,
-                ERR_INTERNAL_CONVERSION.state
+                encoding.utf8_offset_for_client_bytes("é", 1).unwrap_err(),
+                ConvError::Internal
             );
         }
 
@@ -1075,18 +1058,16 @@ mod platform {
             let max_length = usize::try_from(i32::MAX).unwrap();
             assert!(check_length(max_length).is_ok());
             assert_eq!(
-                check_length(max_length + 1).unwrap_err().state,
-                ERR_INTERNAL_CONVERSION.state
+                check_length(max_length + 1).unwrap_err(),
+                ConvError::Internal
             );
         }
 
         #[test]
         fn utf8_native_boundary_scan_rejects_unsupported_character_width() {
             assert_eq!(
-                prefix_len(ClientEncoding::UTF8, "é".as_bytes(), 1)
-                    .unwrap_err()
-                    .state,
-                ERR_INTERNAL_CONVERSION.state
+                prefix_len(ClientEncoding::UTF8, "é".as_bytes(), 1).unwrap_err(),
+                ConvError::Internal
             );
         }
     }

@@ -1227,7 +1227,8 @@ fn normalize_captured_plp_suffix(
             let source_offset = state
                 .text_output
                 .encoding
-                .utf8_offset_for_client_bytes(text, byte_offset)?;
+                .utf8_offset_for_client_bytes(text, byte_offset)
+                .map_err(DiagMsg::from)?;
             value.bytes.drain(..source_offset);
         } else {
             value.bytes.drain(..byte_offset.min(value.bytes.len()));
@@ -1481,7 +1482,7 @@ fn write_captured_column(
         let pair_bytes = match stmt_state.text_output.encoding.encode("00") {
             Ok(encoded) => encoded.bytes.len(),
             Err(diag) => {
-                post_diag(stmt_state, diag);
+                post_diag(stmt_state, diag.into());
                 return SQL_ERROR;
             }
         };
@@ -1514,7 +1515,7 @@ fn write_captured_column(
         let encoded = match stmt_state.text_output.encoding.encode(&as_text) {
             Ok(encoded) => encoded,
             Err(diag) => {
-                post_diag(stmt_state, diag);
+                post_diag(stmt_state, diag.into());
                 return SQL_ERROR;
             }
         };
@@ -1536,7 +1537,7 @@ fn write_captured_column(
                 Ok(true) => post_diag(stmt_state, WARN_CODE_PAGE_CONVERSION_LOSS),
                 Ok(false) => {}
                 Err(diag) => {
-                    post_diag(stmt_state, diag);
+                    post_diag(stmt_state, diag.into());
                     return SQL_ERROR;
                 }
             }
@@ -1933,9 +1934,9 @@ fn stream_active_plp_chunk_once<'a>(
             Ok(encoded) => encoded.bytes.len(),
             Err(diag) => {
                 if let Some(state) = retained_stmt_state.as_mut() {
-                    post_diag(&mut **state, diag);
+                    post_diag(&mut **state, diag.into());
                 } else if let Ok(mut state) = stmt.inner.lock() {
-                    post_diag(&mut state, diag);
+                    post_diag(&mut state, diag.into());
                 }
                 return SQL_ERROR;
             }
@@ -2775,9 +2776,9 @@ fn stream_active_plp_chunk_once<'a>(
                     Ok(encoded) => encoded,
                     Err(diag) => {
                         if let Some(state) = retained_stmt_state.as_mut() {
-                            post_diag(&mut **state, diag);
+                            post_diag(&mut **state, diag.into());
                         } else if let Ok(mut state) = stmt.inner.lock() {
-                            post_diag(&mut state, diag);
+                            post_diag(&mut state, diag.into());
                         }
                         return SQL_ERROR;
                     }
@@ -3295,12 +3296,14 @@ fn encode_plp_pending_with_loss(
     payload_capacity: usize,
 ) -> Result<(), DiagMsg> {
     let text = std::str::from_utf8(&pending[start..]).map_err(|_| ERR_INVALID_CHARACTER_VALUE)?;
-    let encoded = encoding.encode(text)?;
+    let encoded = encoding.encode(text).map_err(DiagMsg::from)?;
     if encoded.had_loss {
         let mut offset = start;
         let mut scalar = [0; 4];
         for ch in text.chars() {
-            let character = encoding.encode(ch.encode_utf8(&mut scalar))?;
+            let character = encoding
+                .encode(ch.encode_utf8(&mut scalar))
+                .map_err(DiagMsg::from)?;
             let end = offset.saturating_add(character.bytes.len());
             if character.had_loss {
                 if let Some(previous) = loss_ranges.last_mut().filter(|range| range.end == offset) {
@@ -3381,10 +3384,12 @@ fn append_typed_plp_text(
             let text = std::str::from_utf8(source).map_err(|_| ERR_INVALID_CHARACTER_VALUE)?;
             let offset = stream
                 .pending_bytes_encoding
-                .utf8_offset_for_client_bytes(text, *delivered)?;
+                .utf8_offset_for_client_bytes(text, *delivered)
+                .map_err(DiagMsg::from)?;
             stream
                 .pending_bytes_encoding
-                .encode(&text[..offset])?
+                .encode(&text[..offset])
+                .map_err(DiagMsg::from)?
                 .bytes
                 .len()
                 .saturating_sub(*delivered)
@@ -3394,7 +3399,8 @@ fn append_typed_plp_text(
         };
         let text = stream
             .pending_bytes_encoding
-            .decode(&stream.pending_bytes[skip..])?;
+            .decode(&stream.pending_bytes[skip..])
+            .map_err(DiagMsg::from)?;
         reserve_typed_plp_bytes(bytes, text.len())?;
         bytes.extend_from_slice(text.as_bytes());
     } else {
@@ -4054,37 +4060,8 @@ fn finish_typed_conv(
             post_diag(stmt_state, WARN_FRACTIONAL_TRUNCATION);
             SQL_SUCCESS_WITH_INFO
         }
-        Err(ConvError::OutOfRange) => {
-            post_diag(stmt_state, ERR_NUMERIC_OUT_OF_RANGE);
-            SQL_ERROR
-        }
-        Err(ConvError::InvalidDatetimeFormat) => {
-            post_diag(stmt_state, ERR_INVALID_DATETIME_FORMAT);
-            SQL_ERROR
-        }
-        Err(ConvError::DatetimeFieldOverflow) => {
-            post_diag(stmt_state, ERR_DATETIME_FIELD_OVERFLOW);
-            SQL_ERROR
-        }
-        Err(ConvError::Restricted) => {
-            post_diag(stmt_state, ERR_RESTRICTED_DATA_TYPE);
-            SQL_ERROR
-        }
-        Err(ConvError::InvalidCharacterValue) => {
-            post_diag(stmt_state, ERR_INVALID_CHARACTER_VALUE);
-            SQL_ERROR
-        }
-        Err(ConvError::Internal) => {
-            post_diag(stmt_state, ERR_INTERNAL_CONVERSION);
-            SQL_ERROR
-        }
-        Err(ConvError::NotHandledHere) => {
-            post_sql_error(
-                stmt_state,
-                SQLSTATE_HYC00,
-                0,
-                "Column type conversion not yet implemented",
-            );
+        Err(error) => {
+            post_diag(stmt_state, error.into());
             SQL_ERROR
         }
     }

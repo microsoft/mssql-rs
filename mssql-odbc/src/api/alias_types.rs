@@ -172,7 +172,7 @@ fn refresh_alias_types(dbc: &DbcHandle) {
         // connection it reads that connection's timeout, which is unset, so
         // its lookup can wait forever behind the session's own uncommitted
         // type change (parity-deviations entry 32).
-        (state.session_generation, state.connection_timeout, route)
+        (state.session_generation, dbc.connection_timeout(), route)
     };
 
     match route {
@@ -714,7 +714,7 @@ mod tests {
             ALIAS_TYPE_QUERY,
             lookup_response(&[(257, "phone_number")]).with_delay(Duration::from_secs(10)),
         );
-        dbc.inner.lock().unwrap().connection_timeout = 1;
+        dbc.set_connection_timeout(1);
         describe_columns(&h, &[257]);
 
         let started = Instant::now();
@@ -744,7 +744,7 @@ mod tests {
             if let Some(delay) = login_delay {
                 server.set_login_delay(delay);
             }
-            dbc.inner.lock().unwrap().connection_timeout = 1;
+            dbc.set_connection_timeout(1);
             describe_columns(&h, &[257]);
 
             let started = Instant::now();

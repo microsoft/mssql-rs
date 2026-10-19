@@ -313,7 +313,7 @@ fn drain_and_release_inner(
             Some(other) if other != statement_handle => return DrainOutcome::Clean,
             _ => (
                 dbc_state.client.take(),
-                dbc_state.cancel_timeout_secs(),
+                dbc.cancel_timeout_secs(),
                 dbc_state.active_stmt == Some(statement_handle),
             ),
         }

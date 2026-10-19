@@ -199,7 +199,7 @@ fn sql_get_connect_attr_w_safe(
             }
             let value = match attribute {
                 SQL_ATTR_ACCESS_MODE => state.access_mode,
-                SQL_ATTR_CONNECTION_TIMEOUT => state.connection_timeout,
+                SQL_ATTR_CONNECTION_TIMEOUT => dbc.connection_timeout(),
                 SQL_COPT_SS_WARN_ON_CP_ERROR => {
                     if state.warn_on_cp_error {
                         SQL_WARN_YES as u32
