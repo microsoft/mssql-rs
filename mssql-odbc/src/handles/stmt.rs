@@ -1685,11 +1685,7 @@ impl StmtHandle {
             error!("reading cancellation timeout: dbc mutex poisoned");
             return Err(odbc_types::SQL_ERROR);
         };
-        Ok(if state.connection_timeout == 0 {
-            120
-        } else {
-            state.connection_timeout
-        })
+        Ok(state.cancel_timeout_secs())
     }
 
     /// Track the whole call, including its final client hand-back and state

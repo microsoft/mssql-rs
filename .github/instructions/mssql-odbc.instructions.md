@@ -187,7 +187,21 @@ on the `master` branch.
   Cross-thread `SQLCancel` is an exception: it only signals the execution
   token and must neither clear nor post diagnostics belonging to the
   interrupted call. Cancelling a parked DAE sequence still clears its
-  diagnostics before unwinding.
+  diagnostics before unwinding. An idle `SQLCancel` uses the shared
+  `SQLFreeStmt(SQL_CLOSE)` cleanup and replaces stale diagnostics, appending
+  `01S05` only if close succeeds. Keep its cancellation fence through the drain;
+  do not re-enter `begin_operation` while holding that fence (AB#49386). Once
+  active-operation cancellation is ruled out, wait for brief statement-lock
+  holders rather than skipping idle cleanup on contention.
+  Snapshot exhaustion before resetting cursor state: an exhausted response
+  with no pending parameter-array completion must not claim the client again,
+  because a DBC-scoped call may already own it.
+  For an owned pending response, idle `SQLCancel` must send ATTENTION and settle
+  within the connection's cancellation budget, not let remaining server work
+  run during a normal drain. Use row-aware cancellation so partially read rows
+  and PLP values remain synchronized; test a delayed tail with a side effect.
+  Discarding encrypted results must not resolve keys: a key-store provider can
+  stall independently of the wire cancellation budget.
 - **A success code is a promise about the caller's buffer, so never report
   `SQL_SUCCESS` for a call that wrote less than the indicator claims.** Report
   `SQL_SUCCESS_WITH_INFO` with `01004` when a read truncates, so the caller knows
@@ -521,6 +535,12 @@ on; these guarantees were verified against msodbcsql's behavior.
     connect races) go under `tests/e2e/tests/multithreaded_tests/`.
   - A concurrent failure that msodbcsql passes is a driver bug: file it rather
     than loosen the assertion or the mode.
+  - For idle `SQLCancel`, use `CancelIdleStatement()` so `SharedStmt` diagnostic
+    observers cannot race the DM's unprotected cancellation cleanup. If a body
+    deliberately produces DM errors, hold `diagnostics_mutex_` through those
+    probes and a non-mutating call that clears the DM errors. Keep assertions
+    and the other observer overlaps; pin driver-level cancellation contention
+    in Rust tests rather than relying on this unsafe DM overlap.
 - Every new `SQLXxx` function must have at least:
   - A success-path test.
   - A null-output-handle test.
