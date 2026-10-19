@@ -481,7 +481,8 @@ local SQL Server:
 - **Unix evidence.** Stress runs start each `<name>_mt` entry under gdb
   (`run_mt_test.sh`), which prints every thread's stack into the test log on a
   crash, `abort()`, or watchdog timeout, and keeps the test's exit code.
-  Containers get `SYS_PTRACE`.
+  Docker's default seccomp profile allows this; no extra capability is needed
+  (measured in Ubuntu 24.04 and Alpine 3.21 containers).
 - msodbcsql has failed or exited without a result a few times at 8 x 20 or more
   (one `0xC0000409` in 41 runs; a chunk-fill failure and a silent exit in about
   16 runs at 16 x 50), none reproducible on demand. Dumps will tell a harness
