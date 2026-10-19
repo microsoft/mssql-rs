@@ -12,10 +12,27 @@ parameters:
   nameSuffix: ''
   poolName: 'RUST-X64-WUS3'
   poolImageOverride: 'imageOverride -equals RUST-AZL3'
+  # run_e2e.sh --mt-profile (pr, nightly, weekly). A runtime macro such as
+  # $(odbcMtProfile) works: it is only expanded into the container's environment,
+  # and any value other than the literal 'pr' gets the stress job settings below.
+  mtProfile: 'pr'
+  # ctest until-pass retries; the stress profiles ignore it.
+  retries: 3
+  jobDisplayName: 'ODBC e2e Linux amd64'
+  timeoutInMinutes: 60
 
 jobs:
   - job: Test_Odbc_Matrix${{ parameters.nameSuffix }}
-    displayName: ODBC e2e Linux amd64
+    displayName: ${{ parameters.jobDisplayName }}
+    timeoutInMinutes: ${{ parameters.timeoutInMinutes }}
+    # The stress profiles run each <name>_mt entry under gdb (run_mt_test.sh) so a
+    # crash prints every thread's stack; let the container trace its own child
+    # even where the default seccomp profile or kernel would refuse.
+    variables:
+      ${{ if ne(parameters.mtProfile, 'pr') }}:
+        odbcE2eDockerArgs: '--cap-add=SYS_PTRACE'
+      ${{ else }}:
+        odbcE2eDockerArgs: ''
     strategy:
       matrix: ${{ parameters.matrix }}
     pool:
@@ -110,8 +127,10 @@ jobs:
             -e "ODBC_TEST_UID=sa" \
             -e "ODBC_TEST_PWD=$(SQL_PASSWORD)" \
             -e "ODBC_TEST_TRUST_CERT=Yes" \
-            -e "ODBC_E2E_RETRIES=3" \
+            -e "ODBC_E2E_RETRIES=${{ parameters.retries }}" \
+            -e "ODBC_E2E_MT_PROFILE=${{ parameters.mtProfile }}" \
             -e "RUST_BACKTRACE=full" \
+            $(odbcE2eDockerArgs) \
             --network testnet \
             $(container) /workspace/scripts/dockerentry/$(entry)
         workingDirectory: "$(Build.SourcesDirectory)"

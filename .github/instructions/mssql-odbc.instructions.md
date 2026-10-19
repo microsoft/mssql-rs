@@ -529,8 +529,8 @@ on; these guarantees were verified against msodbcsql's behavior.
   - Opt into `/SharedDbc` with `ODBC_TEST_F_MODES(..., odbc_concurrency::kAllModes)`
     only when the body changes no connection attributes or transactions, gives
     temporary objects per-worker names, and is safe to rerun after a busy retry.
-    Do not opt in until CI runs that mode
-    nightly only (AB#49263).
+    PR validation skips the mode; only the scheduled stress runs execute it
+    (AB#49263), and they will report AB#49225 until it is fixed.
   - Scenarios with no single-threaded meaning (races on one STMT, handle churn,
     connect races) go under `tests/e2e/tests/multithreaded_tests/`.
   - A concurrent failure that msodbcsql passes is a driver bug: file it rather
