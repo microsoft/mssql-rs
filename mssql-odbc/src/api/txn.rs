@@ -150,6 +150,46 @@ pub(super) fn release_dbc_client(dbc: &DbcHandle, client: WireLease) -> bool {
     dbc.return_lease(client, LeaseReturn::Release)
 }
 
+/// Restores a connection-scoped lease and returns the session generation that
+/// was current in the restoration critical section.
+fn release_dbc_client_generation(dbc: &DbcHandle, client: WireLease) -> Option<u64> {
+    dbc.return_lease_generation(client, LeaseReturn::Release)
+}
+
+/// Publishes an operation result only if the session restored by
+/// [`release_dbc_client_generation`] is still current.
+fn publish_dbc_result<R>(
+    dbc: &DbcHandle,
+    generation: u64,
+    op: &str,
+    publish: impl FnOnce(&mut DbcState) -> R,
+) -> Result<R, SqlReturn> {
+    let Ok(mut state) = dbc.inner.lock() else {
+        error!("{op}: dbc mutex poisoned");
+        return Err(SQL_ERROR);
+    };
+    if state.connection_state != ConnectionState::Connected
+        || state.session_generation != generation
+    {
+        error!("{op}: the restored session was replaced before its outcome was recorded");
+        post_diag(&mut state, ERR_CONNECTION_DOES_NOT_EXIST);
+        return Err(SQL_ERROR);
+    }
+    Ok(publish(&mut state))
+}
+
+pub(super) fn release_dbc_client_and_publish<R>(
+    dbc: &DbcHandle,
+    client: WireLease,
+    op: &str,
+    publish: impl FnOnce(&mut DbcState) -> R,
+) -> Result<R, SqlReturn> {
+    let Some(generation) = release_dbc_client_generation(dbc, client) else {
+        return Err(fail_lost_session(dbc, op));
+    };
+    publish_dbc_result(dbc, generation, op, publish)
+}
+
 /// Fails a connection-scoped operation whose lease could not be returned. Its
 /// outcome belonged to a session `SQLDisconnect` has since torn down, so none of
 /// it is recorded: the attributes it would set outlive that session.
@@ -279,34 +319,29 @@ pub(super) fn end_transaction(dbc: &DbcHandle, commit: bool, op: &str) -> SqlRet
         Ok(())
     };
 
-    if !release_dbc_client(dbc, client) {
-        return fail_lost_session(dbc, op);
-    }
+    release_dbc_client_and_publish(dbc, client, op, |state| {
+        // Cleared unconditionally, matching msodbcsql's `Return:` label, so a failed
+        // commit cannot strand the connection permanently un-disconnectable.
+        state.local_tran_started = false;
 
-    let Ok(mut state) = dbc.inner.lock() else {
-        error!("{op}: dbc mutex poisoned");
-        return SQL_ERROR;
-    };
-    // Cleared unconditionally, matching msodbcsql's `Return:` label, so a failed
-    // commit cannot strand the connection permanently un-disconnectable.
-    state.local_tran_started = false;
+        if let Err(e) = result {
+            error!(%e, "{op}: transaction-manager request failed");
+            // 08007 is ODBC's specific state for "connection failure during
+            // transaction": the commit or rollback did not reach the server, so its
+            // outcome is unknown to the application. Neither 08007 nor HY000 puts
+            // the connection into the suspended state, so this is a strictly more
+            // precise diagnostic, not a behavioural change.
+            post_tds_error(state, &e, SQLSTATE_08007);
+            return SQL_ERROR;
+        }
 
-    if let Err(e) = result {
-        error!(%e, "{op}: transaction-manager request failed");
-        // 08007 is ODBC's specific state for "connection failure during
-        // transaction": the commit or rollback did not reach the server, so its
-        // outcome is unknown to the application. Neither 08007 nor HY000 puts
-        // the connection into the suspended state, so this is a strictly more
-        // precise diagnostic, not a behavioural change.
-        post_tds_error(&mut state, &e, SQLSTATE_08007);
-        return SQL_ERROR;
-    }
-
-    debug!(
-        "{op}: transaction {} complete",
-        if commit { "commit" } else { "rollback" }
-    );
-    SQL_SUCCESS
+        debug!(
+            "{op}: transaction {} complete",
+            if commit { "commit" } else { "rollback" }
+        );
+        SQL_SUCCESS
+    })
+    .unwrap_or_else(|ret| ret)
 }
 
 /// Begins a transaction on an already-claimed client when the connection is in
@@ -341,8 +376,12 @@ pub(super) fn begin_transaction_if_manual(
     timeout_secs: u32,
     cancel: &CancelHandle,
 ) -> Result<(), mssql_tds::error::Error> {
-    let (autocommit, already_recorded) = match dbc.inner.lock() {
-        Ok(state) => (state.autocommit, state.local_tran_started),
+    let (autocommit, already_recorded, generation) = match dbc.inner.lock() {
+        Ok(state) => (
+            state.autocommit,
+            state.local_tran_started,
+            state.session_generation,
+        ),
         Err(_) => {
             error!("{op}: dbc mutex poisoned reading autocommit");
             return Err(mssql_tds::error::Error::ImplementationError(
@@ -382,6 +421,13 @@ pub(super) fn begin_transaction_if_manual(
             "connection state is poisoned".to_string(),
         ));
     };
+    if state.connection_state != ConnectionState::Connected
+        || state.session_generation != generation
+    {
+        return Err(mssql_tds::error::Error::ConnectionClosed(
+            "the session ended while beginning a transaction".to_string(),
+        ));
+    }
     state.local_tran_started = client.has_active_transaction();
     result
 }
@@ -575,52 +621,47 @@ pub(super) fn reset_connection(dbc: &DbcHandle, value: u64) -> SqlReturn {
     if result.is_err() {
         client.mark_connection_dead();
     }
-    if !release_dbc_client(dbc, client) {
-        return fail_lost_session(dbc, OP);
-    }
-
-    let Ok(mut state) = dbc.inner.lock() else {
-        error!("{OP}: dbc mutex poisoned");
-        return SQL_ERROR;
-    };
-    if let Err(e) = result {
-        // The rollback failed, so the reset was never armed and the server may
-        // still hold the transaction. Leave `local_tran_started` alone: claiming
-        // no transaction is open would be a lie the next operation acts on.
-        error!(%e, "{OP}: connection reset failed");
-        post_tds_error(&mut state, &e, SQLSTATE_08S01);
-        return SQL_ERROR;
-    }
-    // The reset is armed; the server discards the transaction before it
-    // processes the carrying request, so the driver's view catches up here.
-    state.local_tran_started = false;
-    // The reset restores the login's defaults — security context included, so
-    // an `EXECUTE AS` this borrower ran is undone — but the cached principal
-    // would survive it. The catalog key cannot catch that: the reset returns
-    // the session to the login's default database, which is usually the one
-    // the entry was already keyed to, so the next borrower would get a cache
-    // hit carrying the previous borrower's `USER_NAME()`. Re-asserted here with
-    // the isolation flag; the clear that closes the window is the early one.
-    state.database_user_name = None;
-    // Re-assert the invalidation under the lock that records the completed arm,
-    // and bump the generation. The early set above narrows the window before
-    // arming; this pair is what makes the invalidation stick afterwards. A
-    // checkout SET that claimed the client first and is clearing the flag around
-    // now captured an older generation, so it will leave this newer invalidation
-    // alone instead of short-circuiting the next checkout against a session this
-    // reset just made unknown again.
-    state.server_isolation_unknown = true;
-    state.reset_generation = state.reset_generation.wrapping_add(1);
-    debug!("{OP}: reset armed; it will be carried by the next request");
-    SQL_SUCCESS
+    release_dbc_client_and_publish(dbc, client, OP, |state| {
+        if let Err(e) = result {
+            // The rollback failed, so the reset was never armed and the server may
+            // still hold the transaction. Leave `local_tran_started` alone: claiming
+            // no transaction is open would be a lie the next operation acts on.
+            error!(%e, "{OP}: connection reset failed");
+            post_tds_error(state, &e, SQLSTATE_08S01);
+            return SQL_ERROR;
+        }
+        // The reset is armed; the server discards the transaction before it
+        // processes the carrying request, so the driver's view catches up here.
+        state.local_tran_started = false;
+        // The reset restores the login's defaults — security context included, so
+        // an `EXECUTE AS` this borrower ran is undone — but the cached principal
+        // would survive it. The catalog key cannot catch that: the reset returns
+        // the session to the login's default database, which is usually the one
+        // the entry was already keyed to, so the next borrower would get a cache
+        // hit carrying the previous borrower's `USER_NAME()`. Re-asserted here with
+        // the isolation flag; the clear that closes the window is the early one.
+        state.database_user_name = None;
+        // Re-assert the invalidation under the lock that records the completed arm,
+        // and bump the generation. The early set above narrows the window before
+        // arming; this pair is what makes the invalidation stick afterwards. A
+        // checkout SET that claimed the client first and is clearing the flag around
+        // now captured an older generation, so it will leave this newer invalidation
+        // alone instead of short-circuiting the next checkout against a session this
+        // reset just made unknown again.
+        state.server_isolation_unknown = true;
+        state.reset_generation = state.reset_generation.wrapping_add(1);
+        debug!("{OP}: reset armed; it will be carried by the next request");
+        SQL_SUCCESS
+    })
+    .unwrap_or_else(|ret| ret)
 }
 
 /// Manual-commit → autocommit. Any transaction holding user work is **committed**
 /// with a `01000` warning; a driver-begun piggyback transaction is rolled back
 /// silently (`sqlcconn.cpp:3692-3741`).
 fn switch_to_autocommit(dbc: &DbcHandle, op: &str) -> SqlReturn {
-    let had_user_txn = match dbc.inner.lock() {
-        Ok(state) => state.local_tran_started,
+    let (had_user_txn, generation) = match dbc.inner.lock() {
+        Ok(state) => (state.local_tran_started, state.session_generation),
         Err(_) => {
             error!("{op}: dbc mutex poisoned");
             return SQL_ERROR;
@@ -632,13 +673,12 @@ fn switch_to_autocommit(dbc: &DbcHandle, op: &str) -> SqlReturn {
         if ret != SQL_SUCCESS {
             return ret;
         }
-        let Ok(mut state) = dbc.inner.lock() else {
-            error!("{op}: dbc mutex poisoned");
-            return SQL_ERROR;
-        };
-        state.autocommit = true;
-        post_diag(&mut state, WARN_TRANSACTION_COMMITTED);
-        return SQL_SUCCESS_WITH_INFO;
+        return publish_dbc_result(dbc, generation, op, |state| {
+            state.autocommit = true;
+            post_diag(state, WARN_TRANSACTION_COMMITTED);
+            SQL_SUCCESS_WITH_INFO
+        })
+        .unwrap_or_else(|ret| ret);
     }
 
     if close_all_cursors(dbc) == SQL_ERROR {
@@ -655,22 +695,17 @@ fn switch_to_autocommit(dbc: &DbcHandle, op: &str) -> SqlReturn {
     } else {
         Ok(())
     };
-    if !release_dbc_client(dbc, client) {
-        return fail_lost_session(dbc, op);
-    }
-
-    let Ok(mut state) = dbc.inner.lock() else {
-        error!("{op}: dbc mutex poisoned");
-        return SQL_ERROR;
-    };
-    if let Err(e) = result {
-        error!(%e, "{op}: rollback of driver-begun transaction failed");
-        post_tds_error(&mut state, &e, SQLSTATE_HY000);
-        return SQL_ERROR;
-    }
-    state.autocommit = true;
-    state.local_tran_started = false;
-    SQL_SUCCESS
+    release_dbc_client_and_publish(dbc, client, op, |state| {
+        if let Err(e) = result {
+            error!(%e, "{op}: rollback of driver-begun transaction failed");
+            post_tds_error(state, &e, SQLSTATE_HY000);
+            return SQL_ERROR;
+        }
+        state.autocommit = true;
+        state.local_tran_started = false;
+        SQL_SUCCESS
+    })
+    .unwrap_or_else(|ret| ret)
 }
 
 /// Autocommit → manual-commit. Opens a transaction immediately so `@@TRANCOUNT`
@@ -700,22 +735,17 @@ fn switch_to_manual_commit(dbc: &DbcHandle, op: &str) -> SqlReturn {
         dbc.runtime
             .block_on(client.begin_transaction(TransactionIsolationLevel::NoChange, None))
     };
-    if !release_dbc_client(dbc, client) {
-        return fail_lost_session(dbc, op);
-    }
-
-    let Ok(mut state) = dbc.inner.lock() else {
-        error!("{op}: dbc mutex poisoned");
-        return SQL_ERROR;
-    };
-    if let Err(e) = result {
-        error!(%e, "{op}: could not begin transaction");
-        post_tds_error(&mut state, &e, SQLSTATE_HY000);
-        return SQL_ERROR;
-    }
-    state.autocommit = false;
-    state.local_tran_started = false;
-    SQL_SUCCESS
+    release_dbc_client_and_publish(dbc, client, op, |state| {
+        if let Err(e) = result {
+            error!(%e, "{op}: could not begin transaction");
+            post_tds_error(state, &e, SQLSTATE_HY000);
+            return SQL_ERROR;
+        }
+        state.autocommit = false;
+        state.local_tran_started = false;
+        SQL_SUCCESS
+    })
+    .unwrap_or_else(|ret| ret)
 }
 
 /// Applies `SQL_ATTR_TXN_ISOLATION` (msodbcsql `sqlcmisc.cpp:1754-1827`), and
@@ -811,36 +841,31 @@ pub(super) fn set_txn_isolation(dbc: &DbcHandle, value: u64) -> SqlReturn {
             .runtime
             .block_on(client.begin_transaction(TransactionIsolationLevel::NoChange, None));
     }
-    if !release_dbc_client(dbc, client) {
-        return fail_lost_session(dbc, OP);
-    }
-
-    let Ok(mut state) = dbc.inner.lock() else {
-        error!("{OP}: dbc mutex poisoned");
-        return SQL_ERROR;
-    };
-    if let Err(e) = result {
-        // A failed SET leaves the server's level unknown, so the flag stays set
-        // and the next attempt emits again. If the failure was an armed reset
-        // going unacknowledged, `TdsClient` has already marked the connection
-        // dead and `post_tds_error` maps it to 08S01 so the pool discards it.
-        error!(%e, "{OP}: could not apply isolation level");
-        post_tds_error(&mut state, &e, SQLSTATE_HY000);
-        return SQL_ERROR;
-    }
-    // The batch reached the server, so the cache and the session agree again —
-    // unless a reset was armed while it was in flight, which made the server's
-    // level unknown all over again. That newer invalidation is not this batch's
-    // to clear.
-    if !settle_isolation_invalidation(&mut state, reset_generation) {
-        debug!(
-            "{OP}: a reset was armed while this batch was in flight; the server's isolation level is unknown again"
-        );
-    }
-    // `value` was validated into `level` above.
-    state.txn_isolation = level;
-    debug!(tsql, "{OP}: isolation level applied");
-    SQL_SUCCESS
+    release_dbc_client_and_publish(dbc, client, OP, |state| {
+        if let Err(e) = result {
+            // A failed SET leaves the server's level unknown, so the flag stays set
+            // and the next attempt emits again. If the failure was an armed reset
+            // going unacknowledged, `TdsClient` has already marked the connection
+            // dead and `post_tds_error` maps it to 08S01 so the pool discards it.
+            error!(%e, "{OP}: could not apply isolation level");
+            post_tds_error(state, &e, SQLSTATE_HY000);
+            return SQL_ERROR;
+        }
+        // The batch reached the server, so the cache and the session agree again —
+        // unless a reset was armed while it was in flight, which made the server's
+        // level unknown all over again. That newer invalidation is not this batch's
+        // to clear.
+        if !settle_isolation_invalidation(state, reset_generation) {
+            debug!(
+                "{OP}: a reset was armed while this batch was in flight; the server's isolation level is unknown again"
+            );
+        }
+        // `value` was validated into `level` above.
+        state.txn_isolation = level;
+        debug!(tsql, "{OP}: isolation level applied");
+        SQL_SUCCESS
+    })
+    .unwrap_or_else(|ret| ret)
 }
 
 /// Rolls back a driver-begun transaction that carries no user work, so the
@@ -1041,6 +1066,7 @@ mod tests {
             env_change_begin_transaction, tds_client_from_tokens,
         };
         let h = crate::test_support::TestHandles::with_env_dbc_stmt();
+        h.mark_dbc_connected();
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         dbc.inner.lock().unwrap().autocommit = false;
         let mut client = tds_client_from_tokens(vec![env_change_begin_transaction(42)]);
@@ -1081,6 +1107,53 @@ mod tests {
         for level in [0, 3, 5, 0x10, 0x40, u32::MAX] {
             assert_eq!(txn_isolation_to_tsql(level), None, "level {level:#x}");
         }
+    }
+
+    #[test]
+    fn replaced_session_is_rejected_between_restoration_and_publication() {
+        use std::cell::Cell;
+
+        use crate::api::sqlstate::SQLSTATE_08003;
+        use crate::error::HasDiagnostics;
+        use crate::test_support::TestHandles;
+        use mssql_tds::test_client_support::tds_client_from_tokens;
+
+        let h = TestHandles::with_env_dbc();
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let client = {
+            let mut state = dbc.inner.lock().unwrap();
+            state
+                .wire
+                .put_client_for_test(tds_client_from_tokens(Vec::new()));
+            state
+                .wire
+                .claim(WireOwner::Connection, ClaimPolicy::IdleOnly)
+                .unwrap()
+        };
+        let generation = release_dbc_client_generation(dbc, client).unwrap();
+
+        {
+            let mut state = dbc.inner.lock().unwrap();
+            drop(state.wire.uninstall());
+            state.session_generation = state.session_generation.wrapping_add(1);
+            state.wire.install(tds_client_from_tokens(Vec::new()));
+        }
+        let published = Cell::new(false);
+
+        assert_eq!(
+            publish_dbc_result(dbc, generation, "test", |state| {
+                published.set(true);
+                state.autocommit = false;
+            }),
+            Err(SQL_ERROR)
+        );
+
+        assert!(!published.get());
+        let state = dbc.inner.lock().unwrap();
+        assert!(state.autocommit);
+        assert!(state.wire.client().is_some());
+        assert_eq!(state.diag_records()[0].sql_state, SQLSTATE_08003);
     }
 
     #[test]

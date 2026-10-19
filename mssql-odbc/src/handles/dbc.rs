@@ -440,11 +440,27 @@ impl DbcHandle {
     /// Returns `false`, closing the lease's client, on a poisoned mutex or when
     /// the lease's session was torn down while it was out.
     pub(crate) fn return_lease(&self, lease: WireLease, how: LeaseReturn) -> bool {
+        self.return_lease_generation(lease, how).is_some()
+    }
+
+    /// Returns the restored session's generation under the same lock that
+    /// validates the lease. A caller that publishes connection-scoped state
+    /// after hand-back must compare this generation while holding the DBC lock:
+    /// disconnect/reconnect can replace the restored session before that
+    /// publication lock is acquired.
+    pub(crate) fn return_lease_generation(
+        &self,
+        lease: WireLease,
+        how: LeaseReturn,
+    ) -> Option<u64> {
         let Ok(mut state) = self.inner.lock() else {
             error!(owner = ?lease.owner(), "dbc mutex poisoned returning a wire lease");
-            return false;
+            return None;
         };
-        state.wire.restore(lease, how)
+        state
+            .wire
+            .restore(lease, how)
+            .then_some(state.session_generation)
     }
 }
 

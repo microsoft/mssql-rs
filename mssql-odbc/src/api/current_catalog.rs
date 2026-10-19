@@ -25,9 +25,7 @@ use super::sqlstate::{
     ERR_INVALID_ATTRIBUTE_VALUE, ERR_INVALID_STRING_OR_BUFFER_LENGTH, SQLSTATE_HY024, post_diag,
     post_tds_error_as, post_tds_info_messages,
 };
-use super::txn::{
-    claim_dbc_client, close_all_cursors, exec_batch, fail_lost_session, release_dbc_client,
-};
+use super::txn::{claim_dbc_client, close_all_cursors, exec_batch, release_dbc_client_and_publish};
 use super::util::{read_utf16_attr, write_wide_attr};
 use crate::error::free_errors;
 use crate::handles::DbcHandle;
@@ -207,35 +205,30 @@ fn switch_catalog(dbc: &DbcHandle, name: String, sql: String) -> SqlReturn {
     // context to ..."), which msodbcsql surfaces; draining before the client
     // goes back keeps that record.
     let info_messages = client.take_info_messages();
-    if !release_dbc_client(dbc, client) {
-        return fail_lost_session(dbc, SET_OP);
-    }
+    release_dbc_client_and_publish(dbc, client, SET_OP, |state| {
+        if let Err(e) = result {
+            error!(%e, "{SET_OP}: could not change database");
+            // msodbcsql overwrites the state a failed `USE` would otherwise carry
+            // with `HY024` (`sqlcmisc.cpp:1873-1875`), so "database does not exist"
+            // reaches the application as HY024 + native 911 rather than 08004.
+            post_tds_error_as(state, &e, SQLSTATE_HY024);
+            post_tds_info_messages(state, &info_messages);
+            return SQL_ERROR;
+        }
 
-    let Ok(mut state) = dbc.inner.lock() else {
-        error!("{SET_OP}: dbc mutex poisoned");
-        return SQL_ERROR;
-    };
-    if let Err(e) = result {
-        error!(%e, "{SET_OP}: could not change database");
-        // msodbcsql overwrites the state a failed `USE` would otherwise carry
-        // with `HY024` (`sqlcmisc.cpp:1873-1875`), so "database does not exist"
-        // reaches the application as HY024 + native 911 rather than 08004.
-        post_tds_error_as(&mut state, &e, SQLSTATE_HY024);
-        post_tds_info_messages(&mut state, &info_messages);
-        return SQL_ERROR;
-    }
-
-    state.current_catalog = Some(name);
-    // `SQL_USER_NAME` is database-scoped, so the new database needs a fresh
-    // `USER_NAME()`. The cache is keyed by catalog and would notice this switch
-    // on its own; dropping it here makes the invalidation independent of the
-    // ENVCHANGE the client tracks, matching msodbcsql, which flags the refresh
-    // from both this path and the token (`sqlctokn.cpp:2881`).
-    state.database_user_name = None;
-    if post_tds_info_messages(&mut state, &info_messages) {
-        return SQL_SUCCESS_WITH_INFO;
-    }
-    SQL_SUCCESS
+        state.current_catalog = Some(name);
+        // `SQL_USER_NAME` is database-scoped, so the new database needs a fresh
+        // `USER_NAME()`. The cache is keyed by catalog and would notice this switch
+        // on its own; dropping it here makes the invalidation independent of the
+        // ENVCHANGE the client tracks, matching msodbcsql, which flags the refresh
+        // from both this path and the token (`sqlctokn.cpp:2881`).
+        state.database_user_name = None;
+        if post_tds_info_messages(state, &info_messages) {
+            return SQL_SUCCESS_WITH_INFO;
+        }
+        SQL_SUCCESS
+    })
+    .unwrap_or_else(|ret| ret)
 }
 
 /// Reports `SQL_ATTR_CURRENT_CATALOG`.
