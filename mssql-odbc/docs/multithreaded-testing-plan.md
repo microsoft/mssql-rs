@@ -272,10 +272,14 @@ Measured 2026-10-08 on both drivers unless noted.
   `SQLCancel` preserves the interrupted call's diagnostics.
 - An idle `SQLCancel` performs `SQLFreeStmt(SQL_CLOSE)`, releases the connection,
   and reports `SQL_SUCCESS_WITH_INFO` / `01S05` when close succeeds (AB#49386).
-  The Windows Driver Manager suppresses the warning, so the direct-entry
+  Driver Managers (Windows and unixODBC) suppress the warning, so the direct-entry
   Rust tests assert it while `ConnectionBusyLiveTest.IdleCancel*` checks the
   cursor cleanup and connection reuse through the Driver Manager. Close errors
   remain errors; running-command and parked-DAE cancellation are unchanged.
+  unixODBC's `DriverManager/SQLCancel.c` scans the driver's diagnostic records
+  with `IsDiagRec01S05` and converts `SQL_SUCCESS_WITH_INFO` to `SQL_SUCCESS`
+  when it finds `01S05`. The Windows behavior is measured below; the unixODBC
+  behavior here is source-confirmed and asserted by the Linux/macOS e2e lanes.
   Reference: `ExportImp::SQLCancel`, `odbc/sqlcmisc.cpp:779-791`, idle branch;
   `ExportImp::SQLFreeStmt`, `odbc/sqlccmd.cpp:404-432`, `SQL_CLOSE` branch.
   Measured on Windows on 2026-10-15 with msodbcsql `SQL_DRIVER_VER=18.06.0001`
