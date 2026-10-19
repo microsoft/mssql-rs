@@ -124,8 +124,10 @@ def test_missing_bash_policy(tmp_path, monkeypatch, required):
     monkeypatch.setitem(run_script.__wrapped__.__globals__, "_BASH", None)
     monkeypatch.setenv("REQUIRE_BASH_TESTS", required)
     expected = pytest.fail.Exception if required == "1" else pytest.skip.Exception
-    with pytest.raises(expected, match="Bash is required"):
+    with pytest.raises((pytest.fail.Exception, pytest.skip.Exception),
+                       match="Bash is required") as raised:
         run_script.__wrapped__(tmp_path)
+    assert isinstance(raised.value, expected)
 
 
 @pytest.mark.parametrize(
