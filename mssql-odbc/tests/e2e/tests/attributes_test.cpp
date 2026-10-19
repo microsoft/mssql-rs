@@ -83,6 +83,7 @@
 //   58. QueryNotificationTimeoutCeilingIsIntMax        - INT_MAX, not SQLULEN
 
 #include "odbc_test_fixture.h"
+#include "odbc_concurrent_test.h"
 
 #include <cstdint>
 #include <cstring>
@@ -2216,7 +2217,7 @@ TEST_F(AttributesTest, TnirIsReportedOnByDefault) {
 // the getter's shared tail, sqlcmisc.cpp); GetVendorAttr passes a null
 // length, so the variations above cannot see it.
 // -------------------------------------------------------------------
-TEST_F(AttributesTest, ConnectionIntegerGetsReportTheValueWidth) {
+ODBC_TEST_F(AttributesTest, ConnectionIntegerGetsReportTheValueWidth) {
     const SQLINTEGER attributes[] = {
         SQL_ATTR_ACCESS_MODE,
         SQL_ATTR_AUTOCOMMIT,
