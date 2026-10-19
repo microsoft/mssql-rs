@@ -68,6 +68,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ### Changed
 
+- `mssql-tds`: a routing ENVCHANGE during login now redirects once the rest of
+  the login response has been read through DONE, as MS-TDS requires, rather
+  than immediately. A malformed or truncated response after the routing token
+  now fails the login instead of being skipped (AB#49294).
+
 - `mssql-odbc`: empty character values retrieved as numeric or GUID C targets
   now return success with indicator 0 and leave the value buffer unchanged,
   matching msodbcsql18 for bound and unbound retrieval. Empty date/time

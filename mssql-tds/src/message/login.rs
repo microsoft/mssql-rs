@@ -288,6 +288,14 @@ impl FeaturesRequest {
         );
     }
 
+    /// Forgets an earlier token's DNS caching acknowledgement, so each
+    /// FEATUREEXTACK is judged on its own. Other features keep theirs.
+    pub(crate) fn reset_dns_caching_acknowledgement(&mut self) {
+        if let Some(feature) = self.features.get_mut(&FeatureExtension::SqlDnsCaching) {
+            feature.set_acknowledged(false);
+        }
+    }
+
     /// Settles whether the login's host may stay in the DNS cache. Like SNI,
     /// every FEATUREEXTACK does, whether or not it acknowledges DNS caching.
     pub(crate) fn apply_dns_caching_verdict(&self) {
@@ -731,6 +739,7 @@ impl LoginResponse {
     ) -> TdsResult<LoginResponseModel> {
         let mut response_model = LoginResponseModel::new(requested_features);
         let parser_context = ParserContext::default();
+        let mut redirection = None;
         loop {
             match token_stream_reader
                 .receive_token(&parser_context, None, None)
@@ -751,9 +760,18 @@ impl LoginResponse {
                                 "Received {:?} during login response parsing.",
                                 token_type
                             );
-                            // If the redirection is received, then the error will be unwrapped and surfaced
-                            // to the caller.
-                            response_model.capture_change_property(env_change_token)?;
+                            // A routing ENVCHANGE surfaces as `Error::Redirection`.
+                            // The rest of the response is still read through DONE,
+                            // as MS-TDS requires, so a later FEATUREEXTACK settles
+                            // DNS caching for this host before the redirect.
+                            match response_model.capture_change_property(env_change_token) {
+                                Err(error @ crate::error::Error::Redirection { .. }) => {
+                                    if redirection.is_none() {
+                                        redirection = Some(error);
+                                    }
+                                }
+                                result => result?,
+                            }
                         }
                         Tokens::LoginAck(login_ack_token) => {
                             response_model.success_token = Some(login_ack_token);
@@ -778,6 +796,7 @@ impl LoginResponse {
                             // response is captured, not just the first.
                         }
                         Tokens::FeatureExtAck(_t) => {
+                            response_model.features.reset_dns_caching_acknowledgement();
                             for f in _t.acknowledged_features().iter() {
                                 response_model
                                     .features
@@ -834,6 +853,9 @@ impl LoginResponse {
                     ));
                 }
             }
+        }
+        if let Some(redirection) = redirection {
+            return Err(redirection);
         }
         Ok(response_model)
     }
@@ -2130,26 +2152,42 @@ mod tests {
         );
     }
 
+    async fn login_replaying(host: &str, mut tokens: Vec<Tokens>) -> TdsResult<LoginResponseModel> {
+        use crate::test_client_support::TokenReplayTransport;
+        use crate::token::tokens::{CurrentCommand, DoneStatus, DoneToken};
+
+        let mut request = FeaturesRequest::from((&ClientContext::default(), false));
+        request.bind_dns_caching_host(host);
+        tokens.push(Tokens::Done(DoneToken {
+            status: DoneStatus::FINAL,
+            cur_cmd: CurrentCommand::None,
+            row_count: 0,
+        }));
+        let mut transport = TokenReplayTransport::new(tokens);
+        LoginResponse::new()
+            .deserialize(&mut transport, request)
+            .await
+    }
+
+    fn feature_ext_ack(acknowledged: Vec<(FeatureExtension, Vec<u8>)>) -> Tokens {
+        Tokens::FeatureExtAck(crate::token::tokens::FeatureExtAckToken::new(acknowledged))
+    }
+
     async fn login_with_feature_ext_ack(
         host: &str,
         acknowledged: Vec<(FeatureExtension, Vec<u8>)>,
     ) -> TdsResult<LoginResponseModel> {
-        use crate::test_client_support::TokenReplayTransport;
-        use crate::token::tokens::{CurrentCommand, DoneStatus, DoneToken, FeatureExtAckToken};
+        login_replaying(host, vec![feature_ext_ack(acknowledged)]).await
+    }
 
-        let mut request = FeaturesRequest::from((&ClientContext::default(), false));
-        request.bind_dns_caching_host(host);
-        let mut transport = TokenReplayTransport::new(vec![
-            Tokens::FeatureExtAck(FeatureExtAckToken::new(acknowledged)),
-            Tokens::Done(DoneToken {
-                status: DoneStatus::FINAL,
-                cur_cmd: CurrentCommand::None,
-                row_count: 0,
-            }),
-        ]);
-        LoginResponse::new()
-            .deserialize(&mut transport, request)
+    /// Leaves a resolution of `host` waiting for a verdict.
+    async fn resolve_successfully(host: &str) {
+        DnsCache::global()
+            .resolve(host, 1433, || async {
+                Ok(vec!["10.0.0.7:1433".parse().unwrap()])
+            })
             .await
+            .unwrap();
     }
 
     async fn resolves_from_cache(host: &str) -> bool {
@@ -2167,12 +2205,7 @@ mod tests {
     #[tokio::test]
     async fn feature_ext_ack_settles_dns_caching_for_the_login_host() {
         let host = "dns-caching-verdict.login.example";
-        DnsCache::global()
-            .resolve(host, 1433, || async {
-                Ok(vec!["10.0.0.7:1433".parse().unwrap()])
-            })
-            .await
-            .unwrap();
+        resolve_successfully(host).await;
         assert!(
             !resolves_from_cache(host).await,
             "not allowed before a login acknowledges"
@@ -2194,6 +2227,77 @@ mod tests {
             !resolves_from_cache(host).await,
             "removed without an acknowledgement"
         );
+    }
+
+    #[tokio::test]
+    async fn each_feature_ext_ack_token_settles_dns_caching_on_its_own() {
+        let host = "dns-caching-per-token.login.example";
+        resolve_successfully(host).await;
+
+        login_replaying(
+            host,
+            vec![
+                feature_ext_ack(vec![(FeatureExtension::SqlDnsCaching, vec![0x01])]),
+                feature_ext_ack(vec![(FeatureExtension::Utf8Support, vec![0x01])]),
+            ],
+        )
+        .await
+        .unwrap();
+        assert!(
+            !resolves_from_cache(host).await,
+            "a later token without the acknowledgement revokes an earlier one"
+        );
+
+        login_replaying(
+            host,
+            vec![
+                feature_ext_ack(vec![(FeatureExtension::Utf8Support, vec![0x01])]),
+                feature_ext_ack(vec![(FeatureExtension::SqlDnsCaching, vec![0x01])]),
+            ],
+        )
+        .await
+        .unwrap();
+        assert!(resolves_from_cache(host).await);
+    }
+
+    #[tokio::test]
+    async fn a_routed_login_settles_dns_caching_before_redirecting() {
+        let gateway = "dns-caching-gateway.login.example";
+        resolve_successfully(gateway).await;
+        let routing = RoutingInfo {
+            protocol: 0,
+            server: "replica.sql.net".to_string(),
+            port: 11000,
+        };
+
+        for (flags, allowed) in [(0x01u8, true), (0x00, false)] {
+            let Err(error) = login_replaying(
+                gateway,
+                vec![
+                    Tokens::EnvChange(env_token(
+                        EnvChangeTokenSubType::Routing,
+                        (None, Some(routing.clone())).into(),
+                    )),
+                    feature_ext_ack(vec![(FeatureExtension::SqlDnsCaching, vec![flags])]),
+                ],
+            )
+            .await
+            else {
+                panic!("a routed login must redirect");
+            };
+            assert!(
+                matches!(
+                    &error,
+                    crate::error::Error::Redirection { host, port: 11000 } if host == "replica.sql.net"
+                ),
+                "{error:?}"
+            );
+            assert_eq!(
+                resolves_from_cache(gateway).await,
+                allowed,
+                "acknowledgement flags {flags:#04x}"
+            );
+        }
     }
 
     // ── LoginResponseModel::capture_change_property ──
