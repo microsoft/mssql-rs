@@ -160,6 +160,58 @@ docker compose -f docker-compose-matrix.yml --profile ubuntu22 up -d
 ./run-kerberos-tests.sh ubuntu22
 ```
 
+### Matrix Host Access and Local Diagnostics
+
+`docker-compose-matrix.yml` publishes services only on the container host's IPv4 loopback address (`127.0.0.1`), not its LAN interfaces. This reduces unintended network exposure; it does not replace authentication or host firewall controls. The single-client Compose configuration is unchanged.
+
+| Service | Host endpoint | Container port |
+|---------|---------------|----------------|
+| DNS | `127.0.0.1:8053` (TCP and UDP) | 53 |
+| Kerberos KDC | `127.0.0.1:8888` (TCP and UDP) | 88 |
+| LDAP | `127.0.0.1:8389` (TCP) | 389 |
+| LDAPS | `127.0.0.1:8636` (TCP) | 636 |
+| SQL Server | `127.0.0.1:1433` (TCP) | 1433 |
+
+Clients on `kerberos-net` still use `dc.example.local` (`172.20.0.10`) and `sql.example.local` (`172.20.0.20`) on their original container ports. Their DNS, profiles, and health checks do not depend on host port publication.
+
+Run diagnostics on the container host (commands below assume this directory):
+
+```bash
+docker compose -f docker-compose-matrix.yml --profile ubuntu22 ps
+docker compose -f docker-compose-matrix.yml port mssql 1433
+dig @127.0.0.1 -p 8053 example.local
+dig +tcp @127.0.0.1 -p 8053 example.local
+docker compose -f docker-compose-matrix.yml --profile ubuntu22 exec client-ubuntu22 getent hosts dc.example.local sql.example.local
+```
+
+For host SQL diagnostics, use `127.0.0.1,1433` with the runtime-generated credentials. Keep Kerberos authentication tests inside the client containers using the domain hostnames, rather than a loopback address that does not match the SQL service principal.
+
+#### Intentional Remote Access
+
+Remote access requires an explicit, uncommitted local override and firewall rules limited to trusted sources. Prefer exposing only the service needed. For example, with Docker Compose **2.24.4 or later**, create `$HOME/kerberos-remote.yml` outside the checkout to expose SQL on a specific host IPv4 interface:
+
+```yaml
+services:
+  mssql:
+    ports: !override
+      - "${KERBEROS_REMOTE_HOST:?Set KERBEROS_REMOTE_HOST to a trusted host IPv4 interface}:1433:1433"
+```
+
+Set `KERBEROS_REMOTE_HOST` to that interface's IPv4 address, then validate and apply the override explicitly:
+
+```bash
+docker compose -f docker-compose-matrix.yml -f "$HOME/kerberos-remote.yml" --profile ubuntu22 config --quiet
+docker compose -f docker-compose-matrix.yml -f "$HOME/kerberos-remote.yml" --profile ubuntu22 up -d
+```
+
+`!override` replaces the port list; a plain additional `ports` list can merge with the original bindings instead. If DC access is also needed, add a `dc` service override with `ports: !override`, retaining all six mappings (`8053:53/tcp`, `8053:53/udp`, `8888:88/tcp`, `8888:88/udp`, `8389:389`, `8636:636`) and prefixing each with the chosen host IPv4 address. Do not change the checked-in defaults or bind to all interfaces as a workaround.
+
+To restore loopback-only access, rerun the base Compose command without the override:
+
+```bash
+docker compose -f docker-compose-matrix.yml --profile ubuntu22 up -d
+```
+
 ### Available Profiles (matching CI matrix)
 
 | Profile | Base Image | libc |
