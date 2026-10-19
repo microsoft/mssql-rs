@@ -142,7 +142,7 @@ stages:
       # Packaging and artifact gates must be tested even when PR runs skip them.
       - pwsh: |
           python -m pip install --quiet pytest pyyaml packaging
-          python -m pytest scripts/test_inject_odbc.py scripts/test_verify_python_wheels.py scripts/test_release_pipeline.py scripts/test_validation_pipeline.py scripts/test_repair_glibc_wheels.py scripts/test_bump_released_crate_versions.py scripts/test_python_wheel_install.py scripts/test_coverage_report.py scripts/test_ghcr_parameters.py scripts/test_docker_cargo_run.py -q
+          python -m pytest scripts/test_inject_odbc.py scripts/test_verify_python_wheels.py scripts/test_release_pipeline.py scripts/test_validation_pipeline.py scripts/test_repair_glibc_wheels.py scripts/test_bump_released_crate_versions.py scripts/test_python_wheel_install.py scripts/test_coverage_report.py scripts/test_ghcr_parameters.py scripts/test_sync_pipeline.py scripts/test_docker_cargo_run.py -q
         displayName: 'Unit test packaging scripts and pipeline configuration'
       - template: build-template.yml
         parameters:
@@ -296,6 +296,15 @@ stages:
           set -euo pipefail
           python3 -m unittest discover -s .pipeline/scripts -p 'test_*.py' -v
         displayName: Test pipeline helper scripts
+      # Windows agents may lack Bash; enforce the mocked sync flows on Linux.
+      - bash: |
+          set -euo pipefail
+          python3 -m venv "$AGENT_TEMPDIRECTORY/sync-tests"
+          source "$AGENT_TEMPDIRECTORY/sync-tests/bin/activate"
+          python -m pip install --quiet pytest pyyaml
+          python -c 'import shutil; assert shutil.which("bash"), "Bash is required for sync regression tests"'
+          python -m pytest scripts/test_sync_pipeline.py -q -rs
+        displayName: Test ADO sync pipeline
       - bash: |
           set -euo pipefail
           python3 -m venv "$AGENT_TEMPDIRECTORY/pipeline-script-tests"
