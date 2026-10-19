@@ -30,7 +30,14 @@ def load_template(name):
     return yaml.safe_load((_TEMPLATES / name).read_text(encoding="utf-8"))
 
 
-def test_version_bump_tests_run_in_shared_validation():
+@pytest.mark.parametrize(
+    "selector",
+    [
+        "scripts/test_bump_released_crate_versions.py",
+        "scripts/test_validation_pipeline.py",
+    ],
+)
+def test_pipeline_tests_run_in_shared_validation(selector):
     stages = load_template("validation-stages.yml")["stages"]
     build = next(stage for stage in stages if stage["stage"] == "Build")
     windows = next(job for job in build["jobs"] if job.get("job") == "Build_Windows")
@@ -39,9 +46,40 @@ def test_version_bump_tests_run_in_shared_validation():
         if step.get("displayName") == "Unit test packaging scripts and pipeline configuration"
     )
     command = next(line for line in step["pwsh"].splitlines() if "python -m pytest" in line)
-    assert "scripts/test_bump_released_crate_versions.py" in command.split()
+    assert selector in command.split()
     assert step.get("condition", "succeeded()") == "succeeded()"
     assert not step.get("continueOnError", False)
+
+
+@pytest.mark.parametrize(
+    ("service", "ports"),
+    [
+        ("dc", ["8053:53/tcp", "8053:53/udp", "8888:88/tcp", "8888:88/udp",
+                "8389:389", "8636:636"]),
+        ("mssql", ["1433:1433"]),
+    ],
+)
+def test_kerberos_matrix_preserves_ports_on_loopback(service, ports):
+    compose = yaml.safe_load(
+        (_ROOT / "kerberos-test" / "docker-compose-matrix.yml").read_text(encoding="utf-8")
+    )
+    assert compose["services"][service]["ports"] == [
+        f"127.0.0.1:{port}" for port in ports
+    ]
+
+
+def test_kerberos_matrix_only_publishes_infrastructure_on_loopback():
+    compose = yaml.safe_load(
+        (_ROOT / "kerberos-test" / "docker-compose-matrix.yml").read_text(encoding="utf-8")
+    )
+    published = {
+        name: service["ports"]
+        for name, service in compose["services"].items() if service.get("ports")
+    }
+    assert set(published) == {"dc", "mssql"}
+    for service, ports in published.items():
+        for port in ports:
+            assert isinstance(port, str) and port.startswith("127.0.0.1:"), (service, port)
 
 
 @pytest.mark.parametrize(

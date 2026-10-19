@@ -3,6 +3,11 @@
 # Compares Criterion benchmark results between the PR branch and
 # the target branch to detect performance regressions.
 # Runs on Linux x64 only.
+#
+# Checkout credentials are not retained. Resolve and fetch the public baseline
+# before repository setup/build code runs, then compare pinned commits locally.
+# This does not sandbox PR code: agent isolation and service-token permissions
+# remain deployment responsibilities, not guarantees of this pipeline.
 
 trigger: none
 
@@ -14,6 +19,8 @@ pr:
 parameters:
   - name: baselineBranch
     displayName: 'Baseline branch (for manual runs; PR builds auto-detect target)'
+    # Accept a branch, tag, full ref, or commit SHA using ASCII letters, digits,
+    # underscores, dots, slashes, and hyphens; no refspecs or revision expressions.
     type: string
     default: main
   - name: linuxImage
@@ -38,7 +45,40 @@ stages:
         steps:
           - checkout: self
             fetchDepth: 0
-            persistCredentials: true
+            persistCredentials: false
+
+          - script: |
+              set -euo pipefail
+              if [ "$BUILD_REASON" = "PullRequest" ]; then
+                BASELINE="${PR_TARGET_REF#refs/heads/}"
+              else
+                BASELINE="$MANUAL_BASELINE_REF"
+              fi
+              # Limit logging to inert single-line data and reject Git options/refspecs.
+              if [[ ! "$BASELINE" =~ ^[A-Za-z0-9_][A-Za-z0-9._/-]*$ ]] ||
+                 ! git check-ref-format --allow-onelevel "$BASELINE"; then
+                echo "##vso[task.logissue type=error]Invalid benchmark baseline ref"
+                exit 1
+              fi
+
+              PR_SHA=$(git rev-parse --verify 'HEAD^{commit}')
+              # Use the public URL, not a credential-bearing checkout remote.
+              GIT_TERMINAL_PROMPT=0 git fetch --no-tags -- https://github.com/microsoft/mssql-rs.git "$BASELINE"
+              BASELINE_SHA=$(git rev-parse --verify 'FETCH_HEAD^{commit}')
+              if [[ ! "$PR_SHA" =~ ^[0-9a-f]{40}$ || ! "$BASELINE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+                echo "##vso[task.logissue type=error]Invalid benchmark commit SHA"
+                exit 1
+              fi
+              echo "PR commit: $PR_SHA"
+              echo "Baseline branch: $BASELINE ($BASELINE_SHA)"
+              echo "##vso[task.setvariable variable=PR_SHA;isReadOnly=true]$PR_SHA"
+              echo "##vso[task.setvariable variable=BASELINE_BRANCH;isReadOnly=true]$BASELINE"
+              echo "##vso[task.setvariable variable=BASELINE_SHA;isReadOnly=true]$BASELINE_SHA"
+            displayName: Resolve and fetch benchmark refs
+            env:
+              BUILD_REASON: $(Build.Reason)
+              PR_TARGET_REF: $(System.PullRequest.TargetBranch)
+              MANUAL_BASELINE_REF: ${{ parameters.baselineBranch }}
 
           - template: templates/install-dependencies.yml
             parameters:
@@ -88,30 +128,14 @@ stages:
 
           - script: |
               set -euo pipefail
-              PR_SHA=$(git rev-parse HEAD)
-              echo "PR commit: $PR_SHA"
-              echo "##vso[task.setvariable variable=PR_SHA]$PR_SHA"
-
-              if [ "$(Build.Reason)" = "PullRequest" ]; then
-                RAW="$(System.PullRequest.TargetBranch)"
-                BASELINE="${RAW#refs/heads/}"
-              else
-                BASELINE="${{ parameters.baselineBranch }}"
-              fi
-              echo "Baseline branch: $BASELINE"
-              echo "##vso[task.setvariable variable=BASELINE_BRANCH]$BASELINE"
-            displayName: Resolve branches
-
-          - script: |
-              set -euo pipefail
-              echo "=== Checking out baseline: $(BASELINE_BRANCH) ==="
-              git fetch origin "$(BASELINE_BRANCH)"
-              git checkout FETCH_HEAD
+              echo "=== Checking out baseline: $BASELINE_SHA ==="
+              git checkout --detach "$BASELINE_SHA"
 
               echo "=== Running baseline benchmarks ==="
               cargo bench --package mssql-tds --bench perf -- --save-baseline base
             displayName: 'Baseline benchmarks ($(BASELINE_BRANCH))'
             env:
+              BASELINE_SHA: $(BASELINE_SHA)
               SQL_PASSWORD: $(SQL_PASSWORD)
               DB_HOST: localhost
               DB_PORT: '1433'
@@ -121,13 +145,14 @@ stages:
 
           - script: |
               set -euo pipefail
-              echo "=== Checking out PR commit: $(PR_SHA) ==="
-              git checkout "$(PR_SHA)"
+              echo "=== Checking out PR commit: $PR_SHA ==="
+              git checkout --detach "$PR_SHA"
 
               echo "=== Running PR benchmarks ==="
               cargo bench --package mssql-tds --bench perf -- --save-baseline pr
             displayName: 'PR benchmarks'
             env:
+              PR_SHA: $(PR_SHA)
               SQL_PASSWORD: $(SQL_PASSWORD)
               DB_HOST: localhost
               DB_PORT: '1433'
