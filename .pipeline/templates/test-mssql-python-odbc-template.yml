@@ -44,7 +44,8 @@ parameters:
   # scheduled run can pass 'stress' to include it.
   - name: pytestStressMarker
     type: string
-    default: 'stress and not slow'
+    # TEMPORARY: one-off run including the `slow` tests. Revert before merge.
+    default: 'stress'
   # Wall-clock budget for the stress pass. A healthy run takes ~1.5m;
   # the budget only bounds a driver that hangs, and keeps publish/cleanup inside
   # the job timeout.
