@@ -1,4 +1,4 @@
-use crate::connection::client_context::ClientContext;
+use crate::connection::client_context::{ClientContext, TransportContext};
 use crate::connection::execution_context::ExecutionContext;
 use crate::core::{NegotiatedEncryptionSetting, TdsResult, Version};
 use crate::message::login_options::TdsVersion;
@@ -18,6 +18,11 @@ pub(crate) struct RecoveryContext {
     /// Clone of the original connection configuration, needed for reconnection.
     /// Boxed to avoid inflating async future state machines (ClientContext is ~17KB).
     pub client_context: Option<Box<ClientContext>>,
+    /// Endpoint the live session is on: the transport that won the action
+    /// chain (after SSRP, protocol fallback, or a routing redirect). `None`
+    /// means it was not recorded, and reconnect falls back to
+    /// `client_context.transport_context`.
+    pub connected_transport: Option<TransportContext>,
     /// TDS version from the initial LoginAckToken.
     pub original_tds_version: Option<TdsVersion>,
     /// Server program version from the initial LoginAckToken.
@@ -42,6 +47,7 @@ impl std::fmt::Debug for RecoveryContext {
                 "client_context",
                 &self.client_context.as_ref().map(|_| "<ClientContext>"),
             )
+            .field("connected_transport", &self.connected_transport)
             .field("original_tds_version", &self.original_tds_version)
             .field("original_server_version", &self.original_server_version)
             .field("original_encryption_level", &self.original_encryption_level)
@@ -57,6 +63,7 @@ impl RecoveryContext {
             session_recovery_negotiated: false,
             session_state_table: Box::new(SessionStateTable::new()),
             client_context: None,
+            connected_transport: None,
             original_tds_version: None,
             original_server_version: None,
             original_encryption_level: None,
@@ -92,6 +99,17 @@ impl RecoveryContext {
             login_session_state_tokens,
             negotiated_settings.session_recovery_initial_state(),
         );
+    }
+
+    /// The endpoint a reconnect should target: the one the session was
+    /// actually on, falling back to the parsed data source when none was
+    /// recorded.
+    pub fn reconnect_transport(&self) -> Option<TransportContext> {
+        self.connected_transport.clone().or_else(|| {
+            self.client_context
+                .as_ref()
+                .map(|ctx| ctx.transport_context.clone())
+        })
     }
 
     /// Check whether session recovery can be attempted.
@@ -1014,6 +1032,39 @@ mod tests {
         );
         assert!(!ctx.original_mars_enabled);
         assert_eq!(ctx.recovery_count, 0);
+        assert!(ctx.connected_transport.is_none());
+    }
+
+    #[test]
+    fn reconnect_transport_falls_back_to_the_data_source() {
+        let ctx = make_initialized_context();
+        assert_eq!(
+            ctx.reconnect_transport(),
+            Some(
+                ctx.client_context
+                    .as_ref()
+                    .unwrap()
+                    .transport_context
+                    .clone()
+            )
+        );
+    }
+
+    #[test]
+    fn reconnect_transport_prefers_the_connected_endpoint() {
+        let mut ctx = make_initialized_context();
+        let routed = TransportContext::Tcp {
+            host: "routed.example".to_string(),
+            port: 11000,
+            instance_name: None,
+        };
+        ctx.connected_transport = Some(routed.clone());
+        assert_eq!(ctx.reconnect_transport(), Some(routed));
+    }
+
+    #[test]
+    fn reconnect_transport_is_none_without_a_context() {
+        assert_eq!(RecoveryContext::new().reconnect_transport(), None);
     }
 
     #[test]

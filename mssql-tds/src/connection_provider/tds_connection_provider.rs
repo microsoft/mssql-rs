@@ -34,6 +34,9 @@ use std::sync::LazyLock;
 pub(crate) static PARSER_REGISTRY: LazyLock<GenericTokenParserRegistry> =
     LazyLock::new(GenericTokenParserRegistry::default);
 
+/// Maximum routing redirects followed during a single login.
+const MAX_REDIRECTS: usize = 10;
+
 /// Factory for establishing TDS connections and producing [`TdsClient`] instances.
 pub struct TdsConnectionProvider;
 
@@ -202,6 +205,7 @@ impl TdsConnectionProvider {
                             session_state_tokens,
                         );
                         client.extend_info_messages(info_messages);
+                        client.set_connected_transport(sm_transport);
                         return Ok(client);
                     }
                     Err(err) => {
@@ -352,7 +356,6 @@ impl TdsConnectionProvider {
                 }
 
                 let mut redirect_count = 0;
-                let max_redirects = 10;
 
                 // Try each transport context in order
                 for (transport_ctx, _action_timeout_ms) in &transport_contexts {
@@ -384,6 +387,9 @@ impl TdsConnectionProvider {
                         None => connect_future.await,
                     };
 
+                    // The endpoint the session ends up on; a redirect replaces it.
+                    let mut connected_transport = transport_ctx.clone();
+
                     // Handle redirections
                     loop {
                         match connection_result {
@@ -397,21 +403,22 @@ impl TdsConnectionProvider {
                                     session_state_tokens,
                                 );
                                 client.extend_info_messages(info_messages);
+                                client.set_connected_transport(connected_transport);
                                 return Ok(client);
                             }
                             Err(Error::Redirection { host, port }) => {
                                 info!("Redirection to: {:?}, {:?}", host, port);
                                 redirect_count += 1;
-                                if redirect_count > max_redirects {
+                                if redirect_count > MAX_REDIRECTS {
                                     return Err(Error::ProtocolError(
                                         "Received more redirection tokens than expected.".to_string(),
                                     ));
                                 }
 
-                                let tcp_transport_context = TransportContext::from_routing_token(host, port);
+                                connected_transport = TransportContext::from_routing_token(host, port);
                                 let redirect_future = Self::connect_with_transport_context(
                                     &context,
-                                    &tcp_transport_context,
+                                    &connected_transport,
                                     None,
                                 );
                                 // Recompute remaining time budget for redirected connect
@@ -609,6 +616,45 @@ impl TdsConnectionProvider {
                 Err(err)
             }
         }
+    }
+
+    /// Like [`connect_with_transport_context`](Self::connect_with_transport_context),
+    /// but follows routing redirects (up to [`MAX_REDIRECTS`]) instead of
+    /// surfacing them as `Error::Redirection`. Also returns the endpoint the
+    /// session finally landed on. Used by session recovery.
+    pub(crate) async fn connect_following_redirects(
+        context: &ClientContext,
+        transport_context: &TransportContext,
+        recovery_data: Option<&SessionRecoveryData>,
+    ) -> TdsResult<(
+        (
+            AnyTransport,
+            crate::handler::handler_factory::NegotiatedSettings,
+            crate::connection::execution_context::ExecutionContext,
+            Vec<SqlInfoMessage>,
+            Vec<SessionStateToken>,
+        ),
+        TransportContext,
+    )> {
+        let mut target = transport_context.clone();
+        for _ in 0..=MAX_REDIRECTS {
+            let result = Self::connect_with_transport_context(
+                context,
+                &target,
+                recovery_data.map(|data| Box::new(data.clone())),
+            )
+            .await;
+            match result {
+                Err(Error::Redirection { host, port }) => {
+                    info!("Redirection to: {:?}, {:?}", host, port);
+                    target = TransportContext::from_routing_token(host, port);
+                }
+                other => return other.map(|connection| (connection, target)),
+            }
+        }
+        Err(Error::ProtocolError(
+            "Received more redirection tokens than expected.".to_string(),
+        ))
     }
 
     /// Internal generic method that works with a concrete transport type.
@@ -1000,5 +1046,200 @@ mod tests {
             elapsed.as_secs() < 6,
             "Should respect timeout deadline; took {elapsed:?}"
         );
+    }
+
+    fn mock_login_context() -> ClientContext {
+        let mut context = ClientContext {
+            user_name: "sa".to_string(),
+            password: "TestPassword123!".to_string(),
+            database: "master".to_string(),
+            connect_timeout: 30,
+            ..Default::default()
+        };
+        context.encryption_options.mode = crate::core::EncryptionSetting::PreferOff;
+        context.encryption_options.trust_server_certificate = true;
+        context
+    }
+
+    /// Starts `target` and a server that redirects to it, runs `test` with the
+    /// redirecting server's port, then shuts both down.
+    async fn with_redirect_pair<F, Fut>(test: F)
+    where
+        F: FnOnce(u16, u16) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        use mssql_mock_tds::MockTdsServer;
+        use tokio::sync::oneshot;
+
+        let target = MockTdsServer::new("127.0.0.1:0").await.unwrap();
+        let target_port = target.local_addr().port();
+        let gateway = MockTdsServer::new_with_redirection("127.0.0.1:0", "127.0.0.1", target_port)
+            .await
+            .unwrap();
+        let gateway_port = gateway.local_addr().port();
+
+        let (target_tx, target_rx) = oneshot::channel();
+        let (gateway_tx, gateway_rx) = oneshot::channel();
+        let target_task = tokio::spawn(target.run_with_shutdown(target_rx));
+        let gateway_task = tokio::spawn(gateway.run_with_shutdown(gateway_rx));
+
+        test(gateway_port, target_port).await;
+
+        let _ = gateway_tx.send(());
+        let _ = target_tx.send(());
+        let _ = gateway_task.await;
+        let _ = target_task.await;
+    }
+
+    fn local_tcp(port: u16) -> TransportContext {
+        TransportContext::Tcp {
+            host: "127.0.0.1".to_string(),
+            port,
+            instance_name: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn create_client_records_the_routed_endpoint() {
+        with_redirect_pair(|gateway_port, target_port| async move {
+            let client = Box::pin(TdsConnectionProvider::new().create_client(
+                mock_login_context(),
+                &format!("tcp:127.0.0.1,{gateway_port}"),
+                None,
+            ))
+            .await
+            .expect("connect through redirect");
+
+            assert_eq!(client.connected_transport(), Some(&local_tcp(target_port)));
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn create_client_records_the_direct_endpoint() {
+        with_redirect_pair(|_, target_port| async move {
+            let client = Box::pin(TdsConnectionProvider::new().create_client(
+                mock_login_context(),
+                &format!("tcp:127.0.0.1,{target_port}"),
+                None,
+            ))
+            .await
+            .expect("connect directly");
+
+            assert_eq!(client.connected_transport(), Some(&local_tcp(target_port)));
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn connect_following_redirects_returns_the_final_endpoint() {
+        with_redirect_pair(|gateway_port, target_port| async move {
+            let context = mock_login_context();
+            let (_, landed) = Box::pin(TdsConnectionProvider::connect_following_redirects(
+                &context,
+                &local_tcp(gateway_port),
+                None,
+            ))
+            .await
+            .expect("connect through redirect");
+
+            assert_eq!(landed, local_tcp(target_port));
+        })
+        .await;
+    }
+
+    /// Starts a chain of `redirects` redirecting servers ending in a plain
+    /// one, runs `test` with the first and last ports, then shuts them down.
+    /// Built back to front so each server knows its successor's port.
+    async fn with_redirect_chain<F, Fut>(redirects: usize, test: F)
+    where
+        F: FnOnce(u16, u16) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        use mssql_mock_tds::MockTdsServer;
+        use tokio::sync::oneshot;
+
+        let last = MockTdsServer::new("127.0.0.1:0").await.unwrap();
+        let last_port = last.local_addr().port();
+        let mut servers = vec![last];
+        let mut next_port = last_port;
+        for _ in 0..redirects {
+            let server = MockTdsServer::new_with_redirection("127.0.0.1:0", "127.0.0.1", next_port)
+                .await
+                .unwrap();
+            next_port = server.local_addr().port();
+            servers.push(server);
+        }
+        let first_port = next_port;
+
+        let running: Vec<_> = servers
+            .into_iter()
+            .map(|server| {
+                let (tx, rx) = oneshot::channel();
+                (tx, tokio::spawn(server.run_with_shutdown(rx)))
+            })
+            .collect();
+
+        test(first_port, last_port).await;
+
+        for (tx, task) in running {
+            let _ = tx.send(());
+            let _ = task.await;
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_following_redirects_follows_exactly_max_redirects() {
+        with_redirect_chain(MAX_REDIRECTS, |first_port, last_port| async move {
+            let context = mock_login_context();
+            let (_, landed) = Box::pin(TdsConnectionProvider::connect_following_redirects(
+                &context,
+                &local_tcp(first_port),
+                None,
+            ))
+            .await
+            .expect("MAX_REDIRECTS redirects are within the limit");
+
+            assert_eq!(landed, local_tcp(last_port));
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn connect_following_redirects_rejects_one_redirect_past_the_limit() {
+        with_redirect_chain(MAX_REDIRECTS + 1, |first_port, _| async move {
+            let context = mock_login_context();
+            let result = Box::pin(TdsConnectionProvider::connect_following_redirects(
+                &context,
+                &local_tcp(first_port),
+                None,
+            ))
+            .await;
+
+            match result {
+                Err(Error::ProtocolError(message)) => {
+                    assert!(message.contains("more redirection tokens"), "{message}")
+                }
+                Err(other) => panic!("expected the redirect limit error, got {other:?}"),
+                Ok(_) => panic!("expected the redirect limit error, got a connection"),
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn create_client_follows_exactly_max_redirects() {
+        with_redirect_chain(MAX_REDIRECTS, |first_port, last_port| async move {
+            let client = Box::pin(TdsConnectionProvider::new().create_client(
+                mock_login_context(),
+                &format!("tcp:127.0.0.1,{first_port}"),
+                None,
+            ))
+            .await
+            .expect("MAX_REDIRECTS redirects are within the limit");
+
+            assert_eq!(client.connected_transport(), Some(&local_tcp(last_port)));
+        })
+        .await;
     }
 }

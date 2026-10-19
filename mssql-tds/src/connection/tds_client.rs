@@ -3,7 +3,9 @@
 
 use crate::connection::bulk_copy::{BulkCopyOptions, BulkLoadRow, ResolvedColumnMapping};
 use crate::connection::bulk_copy_state::ATTENTION_TIMEOUT_SECONDS;
-use crate::connection::client_context::{ClientContext, ExecutionColumnEncryptionSetting};
+use crate::connection::client_context::{
+    ClientContext, ExecutionColumnEncryptionSetting, TransportContext,
+};
 use crate::connection::session_recovery::RecoveryContext;
 use crate::connection::transport::any_transport::AnyTransport;
 use crate::datatypes::bulk_copy_metadata::BulkCopyColumnMetadata;
@@ -887,7 +889,12 @@ impl TdsClient {
         let connect_retry_count = client_context.connect_retry_count;
         let connect_retry_interval =
             Duration::from_secs(client_context.connect_retry_interval as u64);
-        let transport_context = client_context.transport_context.clone();
+        // Reconnect to the endpoint the session was on (post-SSRP, protocol
+        // fallback or routing), not the parsed data source.
+        let transport_context = self
+            .recovery_context
+            .reconnect_transport()
+            .unwrap_or_else(|| client_context.transport_context.clone());
 
         let mut last_error: Option<Error> = None;
 
@@ -943,21 +950,24 @@ impl TdsClient {
                 cancel_handle,
                 attempt_within(
                     remaining,
-                    TdsConnectionProvider::connect_with_transport_context(
+                    TdsConnectionProvider::connect_following_redirects(
                         &reconnect_ctx,
                         &transport_context,
-                        Some(Box::new((*snapshot).clone())),
+                        Some(&*snapshot),
                     ),
                 ),
             )
             .await;
             match connect_result {
                 Ok((
-                    new_transport,
-                    new_settings,
-                    new_exec_ctx,
-                    info_messages,
-                    session_state_tokens,
+                    (
+                        new_transport,
+                        new_settings,
+                        new_exec_ctx,
+                        info_messages,
+                        session_state_tokens,
+                    ),
+                    connected_transport,
                 )) => {
                     // Validate reconnection properties match original
                     if let Err(validation_err) =
@@ -978,6 +988,7 @@ impl TdsClient {
                         &session_state_tokens,
                     )?;
 
+                    self.recovery_context.connected_transport = Some(connected_transport);
                     self.recovery_context.recovery_count += 1;
                     info!(
                         recovery_count = self.recovery_context.recovery_count,
@@ -8731,6 +8742,17 @@ impl TdsClient {
         self.info_messages.extend(messages);
     }
 
+    /// Records the endpoint this session actually connected to, so session
+    /// recovery reconnects there rather than to the parsed data source.
+    pub(crate) fn set_connected_transport(&mut self, transport_context: TransportContext) {
+        self.recovery_context.connected_transport = Some(transport_context);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn connected_transport(&self) -> Option<&TransportContext> {
+        self.recovery_context.connected_transport.as_ref()
+    }
+
     /// Records that a streamed chunk was written with a substituted character.
     ///
     /// The materialized path detects this during serialization and carries it on
@@ -15266,6 +15288,47 @@ mod tests {
             err.to_string().contains("Session recovery failed")
                 || err.to_string().contains("attempt"),
             "Expected SessionRecoveryFailed, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconnect_targets_the_connected_endpoint_not_the_data_source() {
+        let session_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let session_port = session_listener.local_addr().unwrap().port();
+        // A data-source port with nothing listening on it.
+        let stale_port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+
+        let mut client = create_test_client();
+        client.recovery_context.session_recovery_negotiated = true;
+        client
+            .recovery_context
+            .client_context
+            .as_mut()
+            .unwrap()
+            .transport_context = TransportContext::Tcp {
+            host: "127.0.0.1".to_string(),
+            port: stale_port,
+            instance_name: None,
+        };
+        client.set_connected_transport(TransportContext::Tcp {
+            host: "127.0.0.1".to_string(),
+            port: session_port,
+            instance_name: None,
+        });
+
+        // The listener never speaks TDS, so the reconnect itself fails; what
+        // matters is which endpoint it dialled.
+        let (result, accepted) = tokio::join!(
+            Box::pin(client.reconnect(Duration::from_secs(2), None)),
+            tokio::time::timeout(Duration::from_secs(2), session_listener.accept()),
+        );
+        assert!(result.is_err());
+        assert!(
+            matches!(accepted, Ok(Ok(_))),
+            "reconnect did not dial the connected endpoint"
         );
     }
 
