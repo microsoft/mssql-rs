@@ -157,6 +157,7 @@ fn sql_disconnect_safe(dbc: &DbcHandle) -> SqlReturn {
     state.identity = ConnectionIdentity::default();
     dbc.trace.clear();
     state.database_user_name = None;
+    state.alias_types = None;
     state.last_collation_code_page = None;
     state.last_char_set = None;
     state.connection_state = ConnectionState::Disconnected;

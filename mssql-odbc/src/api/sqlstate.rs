@@ -11,6 +11,7 @@ pub(crate) const SQLSTATE_01000: [u8; 5] = *b"01000";
 pub(crate) const SQLSTATE_01004: [u8; 5] = *b"01004";
 pub(crate) const SQLSTATE_01S00: [u8; 5] = *b"01S00";
 pub(crate) const SQLSTATE_01S02: [u8; 5] = *b"01S02";
+pub(crate) const SQLSTATE_01S05: [u8; 5] = *b"01S05";
 pub(crate) const SQLSTATE_01S07: [u8; 5] = *b"01S07";
 pub(crate) const SQLSTATE_07002: [u8; 5] = *b"07002";
 pub(crate) const SQLSTATE_07006: [u8; 5] = *b"07006";
@@ -376,6 +377,10 @@ pub(crate) const ERR_INVALID_CONNECTION_STRING_ATTRIBUTE: DiagMsg = DiagMsg {
     state: SQLSTATE_01S00,
     text: "Invalid connection string attribute",
 };
+pub(crate) const WARN_CANCEL_TREATED_AS_CLOSE: DiagMsg = DiagMsg {
+    state: SQLSTATE_01S05,
+    text: "Cancel treated as FreeStmt/Close",
+};
 pub(crate) const ERR_INVALID_STRING_OR_BUFFER_LENGTH: DiagMsg = DiagMsg {
     state: SQLSTATE_HY090,
     text: "Invalid string or buffer length",
@@ -709,6 +714,7 @@ pub(crate) fn post_tds_error(state: &mut impl HasDiagnostics, err: &TdsError, de
     let sqlstate = match err {
         TdsError::ConnectionResetNotAcknowledged => SQLSTATE_08S01,
         TdsError::TimeoutError(_) => SQLSTATE_HYT00,
+        TdsError::EncodedValueTooLong { .. } => SQLSTATE_22001,
         TdsError::OperationCancelledError(_) => SQLSTATE_HY008,
         _ => default,
     };
@@ -959,6 +965,19 @@ mod tests {
         post_tds_error(&mut s, &err, SQLSTATE_HY000);
         assert_eq!(s.records.len(), 1);
         assert_eq!(s.records[0].sql_state, SQLSTATE_HY000);
+        assert_eq!(s.records[0].native_error, 0);
+    }
+
+    #[test]
+    fn encoded_value_overflow_maps_to_22001() {
+        let mut s = FakeState::default();
+        let err = TdsError::EncodedValueTooLong {
+            actual: 5,
+            maximum: 3,
+        };
+        post_tds_error(&mut s, &err, SQLSTATE_HY000);
+        assert_eq!(s.records.len(), 1);
+        assert_eq!(s.records[0].sql_state, SQLSTATE_22001);
         assert_eq!(s.records[0].native_error, 0);
     }
 

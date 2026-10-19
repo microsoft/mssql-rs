@@ -113,6 +113,18 @@ impl TdsTypeContext {
 pub struct TdsValueSerializer;
 
 impl TdsValueSerializer {
+    fn narrow_string_maximum(
+        ctx: &TdsTypeContext,
+        narrow_string_byte_limit: Option<usize>,
+    ) -> Option<usize> {
+        match (narrow_string_byte_limit, ctx.is_plp) {
+            (Some(maximum), false) => Some(maximum.min(ctx.max_size)),
+            (Some(maximum), true) => Some(maximum),
+            (None, false) => Some(ctx.max_size),
+            (None, true) => None,
+        }
+    }
+
     /// Serialize a value using the provided type context.
     ///
     /// This writes ONLY the value portion:
@@ -132,13 +144,76 @@ impl TdsValueSerializer {
     where
         'b: 'a,
     {
+        if ctx.tds_type == SQL_VARIANT {
+            return Self::serialize_as_variant(writer, value, ctx, false).await;
+        }
+
+        Self::serialize_value_inner(writer, value, ctx, None, false).await
+    }
+
+    #[inline]
+    pub(crate) async fn serialize_value_with_narrow_string_byte_limit<'a, 'b>(
+        writer: &'a mut PacketWriter<'b>,
+        value: &ColumnValues,
+        ctx: &TdsTypeContext,
+        narrow_string_byte_limit: Option<usize>,
+    ) -> TdsResult<()>
+    where
+        'b: 'a,
+    {
         // Check if target column is sql_variant (TDS type SQL_VARIANT)
         // If so, wrap the value with variant wire format
         if ctx.tds_type == SQL_VARIANT {
-            return Self::serialize_as_variant(writer, value, ctx).await;
+            return Self::serialize_as_variant(writer, value, ctx, true).await;
         }
 
-        Self::serialize_value_inner(writer, value, ctx).await
+        Self::serialize_value_inner(writer, value, ctx, narrow_string_byte_limit, true).await
+    }
+
+    pub(crate) fn validate_narrow_string_length(
+        value: &ColumnValues,
+        ctx: &TdsTypeContext,
+        narrow_string_byte_limit: Option<usize>,
+    ) -> TdsResult<()> {
+        if !matches!(ctx.tds_type, VARCHAR | CHAR | TEXT) {
+            return Ok(());
+        }
+
+        let Some(maximum) = Self::narrow_string_maximum(ctx, narrow_string_byte_limit) else {
+            return Ok(());
+        };
+        Self::narrow_string_bytes(value, ctx, Some(maximum))?;
+        Ok(())
+    }
+
+    pub(crate) fn narrow_string_bytes<'a>(
+        value: &'a ColumnValues,
+        ctx: &TdsTypeContext,
+        narrow_string_byte_limit: Option<usize>,
+    ) -> TdsResult<Option<(Cow<'a, [u8]>, bool)>> {
+        let ColumnValues::String(value) = value else {
+            return Ok(None);
+        };
+        if !matches!(ctx.tds_type, VARCHAR | CHAR | TEXT) {
+            return Ok(None);
+        }
+
+        let maximum = Self::narrow_string_maximum(ctx, narrow_string_byte_limit);
+        if let Some(bytes) = value.as_raw_wire_bytes() {
+            let bytes = match maximum {
+                Some(maximum) => Self::fit_narrow_bytes(bytes, maximum)?,
+                None => bytes,
+            };
+            return Ok(Some((Cow::Borrowed(bytes), false)));
+        }
+
+        let text = value.to_utf8_string();
+        let mut encoded = Self::encode_narrow_for_wire(&text, ctx.collation);
+        if let Some(maximum) = maximum {
+            let fitted_len = Self::fit_narrow_bytes(&encoded.bytes, maximum)?.len();
+            encoded.bytes.truncate(fitted_len);
+        }
+        Ok(Some((Cow::Owned(encoded.bytes), encoded.had_loss)))
     }
 
     /// Serialize a NULL value using the appropriate NULL marker for the type.
@@ -1377,6 +1452,8 @@ impl TdsValueSerializer {
         writer: &'a mut PacketWriter<'b>,
         value: &crate::datatypes::sql_string::SqlString,
         ctx: &TdsTypeContext,
+        narrow_string_byte_limit: Option<usize>,
+        fit_narrow_overflow: bool,
     ) -> TdsResult<()>
     where
         'b: 'a,
@@ -1420,7 +1497,14 @@ impl TdsValueSerializer {
                 // use them directly without decode→re-encode roundtrip.
                 // This is critical for the RPC path where bytes are pre-encoded.
                 if let Some(raw_bytes) = value.as_raw_wire_bytes() {
-                    return Self::serialize_char_varchar_direct(writer, raw_bytes, ctx).await;
+                    return Self::serialize_char_varchar_direct(
+                        writer,
+                        raw_bytes,
+                        ctx,
+                        narrow_string_byte_limit,
+                        fit_narrow_overflow,
+                    )
+                    .await;
                 }
 
                 // `EncodingType::Utf8` is a declaration, not a guarantee --
@@ -1443,7 +1527,14 @@ impl TdsValueSerializer {
                     _ => None,
                 };
                 if borrowed.is_some() && ctx.collation.is_some_and(|c| c.utf8()) {
-                    return Self::serialize_char_varchar_direct(writer, &value.bytes, ctx).await;
+                    return Self::serialize_char_varchar_direct(
+                        writer,
+                        &value.bytes,
+                        ctx,
+                        narrow_string_byte_limit,
+                        fit_narrow_overflow,
+                    )
+                    .await;
                 }
 
                 // Declared-but-malformed UTF-8 takes the `Owned` arm and still
@@ -1460,7 +1551,14 @@ impl TdsValueSerializer {
                 // Marking first would report loss for bytes that never reached
                 // the wire, which the bulk-load error path then publishes
                 // (AB#47598).
-                let result = Self::serialize_char_varchar_direct(writer, &encoded.bytes, ctx).await;
+                let result = Self::serialize_char_varchar_direct(
+                    writer,
+                    &encoded.bytes,
+                    ctx,
+                    narrow_string_byte_limit,
+                    fit_narrow_overflow,
+                )
+                .await;
                 if result.is_ok() && encoded.had_loss {
                     writer.note_code_page_conversion_loss();
                 }
@@ -1847,24 +1945,45 @@ impl TdsValueSerializer {
     /// Helper to serialize a single-byte string for CHAR/VARCHAR types.
     ///
     /// Takes single-byte encoded data and serializes it according to the TDS type context.
+    fn fit_narrow_bytes(bytes: &[u8], maximum: usize) -> TdsResult<&[u8]> {
+        if bytes.len() <= maximum {
+            return Ok(bytes);
+        }
+        if bytes[maximum..].iter().all(|byte| *byte == b' ') {
+            return Ok(&bytes[..maximum]);
+        }
+        Err(Error::EncodedValueTooLong {
+            actual: bytes.len(),
+            maximum,
+        })
+    }
+
     async fn serialize_char_varchar_direct<'a, 'b>(
         writer: &'a mut PacketWriter<'b>,
         single_byte_data: &[u8],
         ctx: &TdsTypeContext,
+        narrow_string_byte_limit: Option<usize>,
+        fit_narrow_overflow: bool,
     ) -> TdsResult<()>
     where
         'b: 'a,
     {
+        let maximum = Self::narrow_string_maximum(ctx, narrow_string_byte_limit);
+        let single_byte_data = match maximum {
+            Some(maximum) if fit_narrow_overflow => {
+                Self::fit_narrow_bytes(single_byte_data, maximum)?
+            }
+            Some(maximum) if single_byte_data.len() > maximum => {
+                return Err(Error::EncodedValueTooLong {
+                    actual: single_byte_data.len(),
+                    maximum,
+                });
+            }
+            None => single_byte_data,
+            Some(_) => single_byte_data,
+        };
         let char_count = single_byte_data.len();
         let schema_char_count = ctx.max_size;
-
-        // Check for size overflow (skip for PLP types)
-        if !ctx.is_plp && char_count > schema_char_count {
-            return Err(Error::UsageError(format!(
-                "String length ({} characters) exceeds schema size ({} characters)",
-                char_count, schema_char_count
-            )));
-        }
 
         // Serialize based on type classification
         if ctx.tds_type == TEXT {
@@ -1942,6 +2061,7 @@ impl TdsValueSerializer {
         writer: &'a mut PacketWriter<'b>,
         value: &ColumnValues,
         ctx: &TdsTypeContext,
+        fit_narrow_overflow: bool,
     ) -> TdsResult<()>
     where
         'b: 'a,
@@ -1988,7 +2108,24 @@ impl TdsValueSerializer {
             {
                 let (bytes, had_loss) = Self::resolve_narrow_wire_bytes(s, ctx.collation);
                 narrow_had_loss = had_loss;
-                Some(bytes)
+                if fit_narrow_overflow {
+                    let fitted_len = Self::fit_narrow_bytes(&bytes, ctx.max_size)?.len();
+                    Some(match bytes {
+                        Cow::Borrowed(bytes) => Cow::Borrowed(&bytes[..fitted_len]),
+                        Cow::Owned(mut bytes) => {
+                            bytes.truncate(fitted_len);
+                            Cow::Owned(bytes)
+                        }
+                    })
+                } else {
+                    if bytes.len() > ctx.max_size {
+                        return Err(Error::EncodedValueTooLong {
+                            actual: bytes.len(),
+                            maximum: ctx.max_size,
+                        });
+                    }
+                    Some(bytes)
+                }
             }
             _ => None,
         };
@@ -2054,8 +2191,10 @@ impl TdsValueSerializer {
         // other value, including a wide string sent as-is, uses the normal
         // inner serializer.
         match &resolved_narrow {
-            Some(bytes) => Self::serialize_char_varchar_direct(writer, bytes, &temp_ctx).await?,
-            None => Self::serialize_value_inner(writer, value, &temp_ctx).await?,
+            Some(bytes) => {
+                Self::serialize_char_varchar_direct(writer, bytes, &temp_ctx, None, false).await?
+            }
+            None => Self::serialize_value_inner(writer, value, &temp_ctx, None, false).await?,
         }
 
         if narrow_had_loss {
@@ -2649,6 +2788,8 @@ impl TdsValueSerializer {
         writer: &'a mut PacketWriter<'b>,
         value: &ColumnValues,
         ctx: &TdsTypeContext,
+        narrow_string_byte_limit: Option<usize>,
+        fit_narrow_overflow: bool,
     ) -> TdsResult<()>
     where
         'b: 'a,
@@ -2676,7 +2817,16 @@ impl TdsValueSerializer {
             ColumnValues::SmallDateTime(v) => Self::serialize_smalldatetime(writer, v, ctx).await,
             ColumnValues::Bytes(v) => Self::serialize_bytes(writer, v, ctx).await,
             ColumnValues::Json(v) => Self::serialize_json(writer, v, ctx).await,
-            ColumnValues::String(v) => Self::serialize_string(writer, v, ctx).await,
+            ColumnValues::String(v) => {
+                Self::serialize_string(
+                    writer,
+                    v,
+                    ctx,
+                    narrow_string_byte_limit,
+                    fit_narrow_overflow,
+                )
+                .await
+            }
             ColumnValues::Vector(v) => Self::serialize_vector(writer, v, ctx).await,
             ColumnValues::Xml(v) => Self::serialize_xml(writer, v, ctx).await,
             ColumnValues::Uuid(v) => Self::serialize_uuid(writer, v, ctx).await,
@@ -4007,6 +4157,40 @@ mod serializer_tests {
         assert_eq!(&p[13..18], "café".as_bytes());
     }
 
+    #[test]
+    fn variant_varchar_serialization_applies_trailing_space_fitting() {
+        let mut mock = MockNetworkWriter::new(128);
+        let mut writer = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        let mut ctx = nullable_ctx(0x62);
+        ctx.max_size = 1;
+        ctx.collation = Some(crate::token::tokens::SqlCollation {
+            info: 0,
+            lcid_language_id: 0,
+            col_flags: 0x40,
+            sort_id: 0,
+        });
+        let value = ColumnValues::String(crate::datatypes::sql_string::SqlString::new(
+            b"a ".to_vec(),
+            crate::datatypes::sql_string::EncodingType::Utf8,
+        ));
+
+        block_on(
+            TdsValueSerializer::serialize_value_with_narrow_string_byte_limit(
+                &mut writer,
+                &value,
+                &ctx,
+                None,
+            ),
+        )
+        .unwrap();
+
+        let bytes = payload(&writer);
+        assert_eq!(&bytes[0..4], &10u32.to_le_bytes());
+        assert_eq!(bytes[4], 0xA7);
+        assert_eq!(u16::from_le_bytes([bytes[11], bytes[12]]), 1);
+        assert_eq!(&bytes[13..], b"a");
+    }
+
     /// The collation defaulted when none is known must be the same one used
     /// to declare `VARIANT_PROPERTIES` and the one the narrow payload is
     /// actually encoded under -- these were two independently-chosen
@@ -4101,15 +4285,20 @@ mod serializer_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{TdsTypeContext, TdsValueSerializer, VARCHAR};
+    use super::{PLP_TERMINATOR, PLP_UNKNOWN_LEN, TdsTypeContext, TdsValueSerializer, VARCHAR};
     use crate::datatypes::column_values::ColumnValues;
     use crate::datatypes::lcid_encoding::lcid_to_encoding;
     use crate::datatypes::sql_string::encode_narrow;
+    use crate::error::Error;
     use crate::io::packet_writer::PacketWriter;
     use crate::io::packet_writer::tests::MockNetworkWriter;
     use crate::message::messages::PacketType;
     use crate::token::tokens::SqlCollation;
     use futures::executor::block_on;
+
+    fn payload(writer: &PacketWriter) -> Vec<u8> {
+        writer.get_payload().into_inner()[8..].to_vec()
+    }
 
     /// Test that different collations use different encodings for non-ASCII characters
     #[test]
@@ -4468,10 +4657,200 @@ mod tests {
         let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
         let err = block_on(TdsValueSerializer::serialize_value(&mut w, &value, &ctx))
             .expect_err("two encoded bytes do not fit varchar(1)");
-        assert!(
-            err.to_string().contains("exceeds schema size"),
-            "expected the length guard, got: {err}"
+        assert!(matches!(
+            err,
+            Error::EncodedValueTooLong {
+                actual: 2,
+                maximum: 1
+            }
+        ));
+    }
+
+    #[test]
+    fn encoded_length_validation_trims_only_trailing_blanks() {
+        assert_eq!(
+            TdsValueSerializer::fit_narrow_bytes("é ".as_bytes(), 2).unwrap(),
+            "é".as_bytes()
         );
+        assert!(matches!(
+            TdsValueSerializer::fit_narrow_bytes(" é".as_bytes(), 2),
+            Err(Error::EncodedValueTooLong {
+                actual: 3,
+                maximum: 2
+            })
+        ));
+    }
+
+    #[test]
+    fn row_serialization_rejects_trailing_space_overflow() {
+        let value = ColumnValues::String(crate::datatypes::sql_string::SqlString::new(
+            b"a ".to_vec(),
+            crate::datatypes::sql_string::EncodingType::Utf8,
+        ));
+        let ctx = TdsTypeContext {
+            tds_type: VARCHAR,
+            max_size: 1,
+            is_plp: false,
+            is_fixed_length: false,
+            precision: None,
+            scale: None,
+            collation: Some(utf8_collation()),
+            is_nullable: true,
+        };
+
+        let mut row_mock = MockNetworkWriter::new(64);
+        let mut row_writer =
+            PacketWriter::new(PacketType::TabularResult, &mut row_mock, None, None);
+        let err = block_on(TdsValueSerializer::serialize_value(
+            &mut row_writer,
+            &value,
+            &ctx,
+        ))
+        .expect_err("bulk and TVP values must not use RPC trailing-space fitting");
+        assert!(matches!(
+            err,
+            Error::EncodedValueTooLong {
+                actual: 2,
+                maximum: 1
+            }
+        ));
+
+        let mut rpc_mock = MockNetworkWriter::new(64);
+        let mut rpc_writer =
+            PacketWriter::new(PacketType::TabularResult, &mut rpc_mock, None, None);
+        block_on(
+            TdsValueSerializer::serialize_value_with_narrow_string_byte_limit(
+                &mut rpc_writer,
+                &value,
+                &ctx,
+                None,
+            ),
+        )
+        .unwrap();
+        assert_eq!(payload(&rpc_writer), [1, 0, b'a']);
+    }
+
+    #[test]
+    fn explicit_limit_cannot_relax_non_plp_declaration() {
+        let value = ColumnValues::String(crate::datatypes::sql_string::SqlString::new(
+            utf16le("ab"),
+            crate::datatypes::sql_string::EncodingType::Utf16,
+        ));
+        let ctx = TdsTypeContext {
+            tds_type: VARCHAR,
+            max_size: 1,
+            is_plp: false,
+            is_fixed_length: false,
+            precision: None,
+            scale: None,
+            collation: Some(utf8_collation()),
+            is_nullable: true,
+        };
+        assert!(matches!(
+            TdsValueSerializer::validate_narrow_string_length(&value, &ctx, Some(2)),
+            Err(Error::EncodedValueTooLong {
+                actual: 2,
+                maximum: 1
+            })
+        ));
+    }
+
+    #[test]
+    fn explicit_limit_applies_to_plp_narrow_strings() {
+        let value = ColumnValues::String(crate::datatypes::sql_string::SqlString::new(
+            utf16le("é "),
+            crate::datatypes::sql_string::EncodingType::Utf16,
+        ));
+        let ctx = TdsTypeContext {
+            tds_type: VARCHAR,
+            max_size: usize::MAX,
+            is_plp: true,
+            is_fixed_length: false,
+            precision: None,
+            scale: None,
+            collation: Some(utf8_collation()),
+            is_nullable: true,
+        };
+
+        let mut bounded_mock = MockNetworkWriter::new(64);
+        let mut bounded =
+            PacketWriter::new(PacketType::TabularResult, &mut bounded_mock, None, None);
+        block_on(
+            TdsValueSerializer::serialize_value_with_narrow_string_byte_limit(
+                &mut bounded,
+                &value,
+                &ctx,
+                Some(2),
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            payload(&bounded),
+            [
+                PLP_UNKNOWN_LEN.to_le_bytes().as_slice(),
+                2u32.to_le_bytes().as_slice(),
+                "é".as_bytes(),
+                PLP_TERMINATOR.to_le_bytes().as_slice(),
+            ]
+            .concat()
+        );
+
+        let mut unbounded_mock = MockNetworkWriter::new(64);
+        let mut unbounded =
+            PacketWriter::new(PacketType::TabularResult, &mut unbounded_mock, None, None);
+        block_on(TdsValueSerializer::serialize_value(
+            &mut unbounded,
+            &value,
+            &ctx,
+        ))
+        .unwrap();
+        assert_eq!(
+            payload(&unbounded),
+            [
+                PLP_UNKNOWN_LEN.to_le_bytes().as_slice(),
+                3u32.to_le_bytes().as_slice(),
+                "é ".as_bytes(),
+                PLP_TERMINATOR.to_le_bytes().as_slice(),
+            ]
+            .concat()
+        );
+
+        let spaces = ColumnValues::String(crate::datatypes::sql_string::SqlString::new(
+            utf16le("  "),
+            crate::datatypes::sql_string::EncodingType::Utf16,
+        ));
+        let mut spaces_mock = MockNetworkWriter::new(64);
+        let mut spaces_writer =
+            PacketWriter::new(PacketType::TabularResult, &mut spaces_mock, None, None);
+        block_on(
+            TdsValueSerializer::serialize_value_with_narrow_string_byte_limit(
+                &mut spaces_writer,
+                &spaces,
+                &ctx,
+                Some(0),
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            payload(&spaces_writer),
+            [
+                PLP_UNKNOWN_LEN.to_le_bytes().as_slice(),
+                PLP_TERMINATOR.to_le_bytes().as_slice(),
+            ]
+            .concat()
+        );
+
+        let too_long = ColumnValues::String(crate::datatypes::sql_string::SqlString::new(
+            utf16le("éé"),
+            crate::datatypes::sql_string::EncodingType::Utf16,
+        ));
+        assert!(matches!(
+            TdsValueSerializer::validate_narrow_string_length(&too_long, &ctx, Some(3)),
+            Err(Error::EncodedValueTooLong {
+                actual: 4,
+                maximum: 3
+            })
+        ));
     }
 
     /// The UTF-8 passthrough must not forward bytes that are not actually
